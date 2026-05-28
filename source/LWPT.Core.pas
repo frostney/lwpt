@@ -2641,7 +2641,6 @@ end;
   junctioned node_modules). }
 procedure WipeInstalledDep(const APath: string);
 begin
-  if not DirectoryExists(APath) then Exit;
   if IsDirSymlinkOrJunction(APath) then
   begin
     if not RemoveDirLink(APath) then
@@ -2649,6 +2648,7 @@ begin
         'failed to remove existing link at %s before re-install', [APath]);
     Exit;
   end;
+  if not DirectoryExists(APath) then Exit;
   WipeDir(APath);
 end;
 

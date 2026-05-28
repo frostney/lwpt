@@ -32,6 +32,9 @@ program InstallLocalDiamond.Test;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
   Classes,
   StrUtils,
   SysUtils,
@@ -52,6 +55,7 @@ type
     procedure TestInstallProducesCfgWithThreeUnitPaths;
     procedure TestEachModuleTreeExists;
     procedure TestInstallIsIdempotent;
+    procedure TestInstallReplacesBrokenModuleSymlink;
     procedure TestFrozenSucceedsWithoutRewritingLock;
   end;
 
@@ -253,6 +257,26 @@ begin
   Expect<string>(Lock2).ToBe(Lock1);
 end;
 
+procedure TInstallLocalDiamond.TestInstallReplacesBrokenModuleSymlink;
+{$IFDEF UNIX}
+var
+  ModulePath: string;
+begin
+  ModulePath := FRoot + '/.lwpt/modules/branch-a';
+  DiamondRecursiveDelete(ModulePath);
+  Expect<Integer>(FpSymlink(
+    PChar('/tmp/lwpt-missing-branch-a-for-test'),
+    PChar(ModulePath))).ToBe(0);
+
+  CmdInstall('lwpt.toml', False);
+  Expect<Boolean>(FileExists(ModulePath + '/src/BranchA.pas')).ToBe(True);
+end;
+{$ELSE}
+begin
+  Expect<Boolean>(True).ToBe(True);
+end;
+{$ENDIF}
+
 procedure TInstallLocalDiamond.TestFrozenSucceedsWithoutRewritingLock;
 var
   LockBefore, LockAfter: string;
@@ -280,6 +304,14 @@ begin
     TestEachModuleTreeExists);
   Test('install: re-running is idempotent (lockfile byte-equal)',
     TestInstallIsIdempotent);
+  {$IFDEF UNIX}
+  Test('install: broken .lwpt/modules symlink is replaced',
+    TestInstallReplacesBrokenModuleSymlink);
+  {$ELSE}
+  Skip('install: broken .lwpt/modules symlink is replaced',
+    TestInstallReplacesBrokenModuleSymlink,
+    'Unix symlink regression; Windows junction coverage is separate');
+  {$ENDIF}
   Test('install --frozen: succeeds + leaves the lockfile unchanged',
     TestFrozenSucceedsWithoutRewritingLock);
 end;
