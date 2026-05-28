@@ -58,12 +58,7 @@ type
     procedure TestInstallProducesCfgWithThreeUnitPaths;
     procedure TestEachModuleTreeExists;
     procedure TestInstallIsIdempotent;
-    {$IFDEF UNIX}
     procedure TestInstallReplacesBrokenModuleLink;
-    {$ENDIF}
-    {$IFDEF MSWINDOWS}
-    procedure TestInstallReplacesBrokenModuleLink;
-    {$ENDIF}
     procedure TestFrozenSucceedsWithoutRewritingLock;
   end;
 
@@ -265,34 +260,27 @@ begin
   Expect<string>(Lock2).ToBe(Lock1);
 end;
 
-{$IFDEF UNIX}
 procedure TInstallLocalDiamond.TestInstallReplacesBrokenModuleLink;
 var
   ModulePath: string;
+  {$IFDEF MSWINDOWS}
+  TargetPath: string;
+  P: TProcess;
+  {$ENDIF}
 begin
   ModulePath := FRoot + '/.lwpt/modules/branch-a';
   DiamondRecursiveDelete(ModulePath);
+
+  {$IFDEF UNIX}
   Expect<Integer>(FpSymlink(
     PChar('/tmp/lwpt-missing-branch-a-for-test'),
     PChar(ModulePath))).ToBe(0);
+  {$ENDIF}
 
-  CmdInstall('lwpt.toml', False);
-  Expect<Boolean>(FileExists(ModulePath + '/src/BranchA.pas')).ToBe(True);
-end;
-{$ENDIF}
-
-{$IFDEF MSWINDOWS}
-procedure TInstallLocalDiamond.TestInstallReplacesBrokenModuleLink;
-var
-  ModulePath, TargetPath: string;
-  P: TProcess;
-begin
-  ModulePath := FRoot + '/.lwpt/modules/branch-a';
+  {$IFDEF MSWINDOWS}
   TargetPath := FScratch + '/missing-junction-target';
-  DiamondRecursiveDelete(ModulePath);
   DiamondRecursiveDelete(TargetPath);
   ForceDirectories(TargetPath);
-
   P := TProcess.Create(nil);
   try
     P.Executable := 'cmd.exe';
@@ -308,11 +296,11 @@ begin
     P.Free;
   end;
   DiamondRecursiveDelete(TargetPath);
+  {$ENDIF}
 
   CmdInstall('lwpt.toml', False);
   Expect<Boolean>(FileExists(ModulePath + '/src/BranchA.pas')).ToBe(True);
 end;
-{$ENDIF}
 
 procedure TInstallLocalDiamond.TestFrozenSucceedsWithoutRewritingLock;
 var
@@ -341,14 +329,8 @@ begin
     TestEachModuleTreeExists);
   Test('install: re-running is idempotent (lockfile byte-equal)',
     TestInstallIsIdempotent);
-  {$IFDEF UNIX}
-  Test('install: broken .lwpt/modules symlink is replaced',
+  Test('install: broken .lwpt/modules link is replaced',
     TestInstallReplacesBrokenModuleLink);
-  {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Test('install: broken .lwpt/modules junction is replaced',
-    TestInstallReplacesBrokenModuleLink);
-  {$ENDIF}
   Test('install --frozen: succeeds + leaves the lockfile unchanged',
     TestFrozenSucceedsWithoutRewritingLock);
 end;
