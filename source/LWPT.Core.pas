@@ -2571,8 +2571,12 @@ type
 
 function CreateDirLink(const ALink, ATarget: string): Boolean;
 {$IFDEF UNIX}
+var
+  LinkParent, RelativeTarget: string;
 begin
-  Result := FpSymlink(PChar(ExpandFileName(ATarget)), PChar(ALink)) = 0;
+  LinkParent := IncludeTrailingPathDelimiter(ExtractFileDir(ExpandFileName(ALink)));
+  RelativeTarget := ExtractRelativePath(LinkParent, ExpandFileName(ATarget));
+  Result := FpSymlink(PChar(RelativeTarget), PChar(ALink)) = 0;
 end;
 {$ENDIF}
 {$IFDEF MSWINDOWS}

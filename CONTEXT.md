@@ -77,7 +77,7 @@ A dependency source string of the form `"workspace:<spec>"` (e.g. `workspace:*`,
 _Avoid_: "workspace dep" alone (use [Monorepo dep](#monorepo-dep) for the broader concept; this term is specifically about the `workspace:`-prefixed source string).
 
 **Monorepo dep**:
-A `[dependencies]` entry whose resolved local path is under the project root. `lwpt install` materialises it as a symlink (Unix) or NTFS junction (Windows native — no Developer Mode required, no `mklink` shell-out) into `.lwpt/modules/<name>/` rather than copying. Edits to `packages/<name>/source/X.pas` are visible immediately under `.lwpt/modules/<name>/source/X.pas` with no re-install needed. The link is **created via direct OS calls** (`fpSymlink` on Unix; `CreateFileW` + `DeviceIoControl` + `FSCTL_SET_REPARSE_POINT` on Windows). Hash verification on `--frozen` follows the link, so live edits to the source are correctly detected as drift.
+A `[dependencies]` entry whose resolved local path is under the project root. `lwpt install` materialises it as a relative symlink (Unix) or NTFS junction (Windows native — no Developer Mode required, no `mklink` shell-out) into `.lwpt/modules/<name>/` rather than copying. Edits to `packages/<name>/source/X.pas` are visible immediately under `.lwpt/modules/<name>/source/X.pas` with no re-install needed. The link is **created via direct OS calls** (`fpSymlink` on Unix; `CreateFileW` + `DeviceIoControl` + `FSCTL_SET_REPARSE_POINT` on Windows). Hash verification on `--frozen` follows the link, so live edits to the source are correctly detected as drift.
 _Avoid_: "workspace dep" (yarn-specific), "linked dep" (true but underspecified — "monorepo" carries the inside-project-root scope rule).
 
 **External-path dep**:

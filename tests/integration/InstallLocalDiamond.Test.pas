@@ -55,7 +55,9 @@ type
     procedure TestInstallProducesCfgWithThreeUnitPaths;
     procedure TestEachModuleTreeExists;
     procedure TestInstallIsIdempotent;
+    {$IFDEF UNIX}
     procedure TestInstallReplacesBrokenModuleSymlink;
+    {$ENDIF}
     procedure TestFrozenSucceedsWithoutRewritingLock;
   end;
 
@@ -257,8 +259,8 @@ begin
   Expect<string>(Lock2).ToBe(Lock1);
 end;
 
-procedure TInstallLocalDiamond.TestInstallReplacesBrokenModuleSymlink;
 {$IFDEF UNIX}
+procedure TInstallLocalDiamond.TestInstallReplacesBrokenModuleSymlink;
 var
   ModulePath: string;
 begin
@@ -270,10 +272,6 @@ begin
 
   CmdInstall('lwpt.toml', False);
   Expect<Boolean>(FileExists(ModulePath + '/src/BranchA.pas')).ToBe(True);
-end;
-{$ELSE}
-begin
-  Expect<Boolean>(True).ToBe(True);
 end;
 {$ENDIF}
 
@@ -307,10 +305,6 @@ begin
   {$IFDEF UNIX}
   Test('install: broken .lwpt/modules symlink is replaced',
     TestInstallReplacesBrokenModuleSymlink);
-  {$ELSE}
-  Skip('install: broken .lwpt/modules symlink is replaced',
-    TestInstallReplacesBrokenModuleSymlink,
-    'Unix symlink regression; Windows junction coverage is separate');
   {$ENDIF}
   Test('install --frozen: succeeds + leaves the lockfile unchanged',
     TestFrozenSucceedsWithoutRewritingLock);

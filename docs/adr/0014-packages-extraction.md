@@ -118,7 +118,7 @@ The npm-ecosystem precedent informed the implementation choice — npm + pnpm bo
 
 ### Decision
 
-**Local-path deps install as a symlink (Unix) or NTFS junction (Windows) IF the resolved absolute path is inside the project root. Otherwise (external-path deps: `../../X`, `/abs/X`), the existing recursive-copy path is preserved.** Per-dep determination; a single project can have both kinds.
+**Local-path deps install as a symlink (Unix) or NTFS junction (Windows) IF the resolved absolute path is inside the project root. Otherwise (external-path deps: `../../X`, `/abs/X`), the existing recursive-copy path is preserved.** Per-dep determination; a single project can have both kinds. Unix symlink targets are written relative to the link's parent directory (for example `.lwpt/modules/cli -> ../../packages/cli/`), matching the npm/pnpm/Bun-style in-tree link shape and preserving zero-install after a fresh clone in a different absolute path.
 
 **Junction creation on Windows uses direct OS calls — no `mklink /J` shell-out.** `CreateFileW` with `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`, then `DeviceIoControl` with `FSCTL_SET_REPARSE_POINT` carrying an `IO_REPARSE_TAG_MOUNT_POINT` `REPARSE_DATA_BUFFER`. ~80 lines of Windows API in `LWPT.Core.pas`'s `CreateDirLink` function. The TProcess-spawn alternative would have been simpler but adds latency + couples us to `mklink` being present in the PATH (it's a CMD builtin so always is, but the indirection adds nothing).
 
@@ -138,7 +138,7 @@ Documented by pnpm's [issue #10707](https://github.com/pnpm/pnpm/issues/10707): 
 
 ### Consequences
 
-- **`source/LWPT.Core.pas` gains four helpers**: `IsPathInside`, `IsDirSymlinkOrJunction`, `RemoveDirLink`, `CreateDirLink`, plus the orchestrator `WipeInstalledDep`. Each is conditionally compiled per platform (`{$IFDEF UNIX}` / `{$IFDEF MSWINDOWS}`). The Windows path uses `CreateFileW` / `DeviceIoControl` / `RemoveDirectoryW` / `GetFileAttributesW` from FPC's bundled `Windows` unit; no third-party headers.
+- **`source/LWPT.Core.pas` gains four helpers**: `IsPathInside`, `IsDirSymlinkOrJunction`, `RemoveDirLink`, `CreateDirLink`, plus the orchestrator `WipeInstalledDep`. Each is conditionally compiled per platform (`{$IFDEF UNIX}` / `{$IFDEF MSWINDOWS}`). The Unix path creates relative symlinks; the Windows path uses absolute NTFS junction targets via `CreateFileW` / `DeviceIoControl` / `RemoveDirectoryW` / `GetFileAttributesW` from FPC's bundled `Windows` unit; no third-party headers.
 - **`FetchToCache` signature grows by one parameter — `AProjectRoot`** — the absolute directory of the root manifest. `CmdInstall` passes `ExtractFilePath(ExpandFileName(AManifestPath))`. The skLocal branch tests `IsPathInside(AProjectRoot, ExpandedLocalPath)` and picks link-vs-copy accordingly.
 - **`ResolveGraph` signature grows by one parameter too** — propagating `AProjectRoot` to `FetchToCache`.
 - **Per-dep log lines**: `linked httpclient` / `copied my-fork` instead of the silent prior behaviour. The user sees what shape the install took.
