@@ -263,6 +263,9 @@ end;
 procedure TInstallLocalDiamond.TestInstallReplacesBrokenModuleLink;
 var
   ModulePath: string;
+  {$IFDEF UNIX}
+  MissingTargetPath: string;
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   TargetPath: string;
   P: TProcess;
@@ -272,8 +275,12 @@ begin
   DiamondRecursiveDelete(ModulePath);
 
   {$IFDEF UNIX}
+  MissingTargetPath := FScratch + '/missing-branch-a-target';
+  DiamondRecursiveDelete(MissingTargetPath);
+  if FileExists(MissingTargetPath) then
+    DeleteFile(MissingTargetPath);
   Expect<Integer>(FpSymlink(
-    PChar('/tmp/lwpt-missing-branch-a-for-test'),
+    PChar(MissingTargetPath),
     PChar(ModulePath))).ToBe(0);
   {$ENDIF}
 
