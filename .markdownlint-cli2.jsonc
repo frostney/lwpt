@@ -14,6 +14,7 @@
     "MD033": false,   // no-inline-html — we use occasional <details> blocks
     "MD034": false,   // no-bare-urls — install scripts have legitimate bare https://... lines
     "MD041": false,   // first-line-must-be-h1 — ADRs start with their title which IS the H1, fine
+    "MD060": false,   // table-column-style — keep the compact separator style already used across docs
 
     "MD003": { "style": "atx" },           // heading style: # not underline
     "MD007": { "indent": 2 },              // list indent: 2 spaces

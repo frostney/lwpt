@@ -37,7 +37,7 @@ Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), the vendored `TransportS
 
 `lwpt.exe` calls into Windows' Security Service Provider Interface (SSPI) directly via the `Windows` unit + the SChannel constants in `TransportSecurity.pas`. There are no third-party DLLs to ship. The Windows release archive contains exactly:
 
-```
+```text
 lwpt-<version>-windows-x64.zip
 └── lwpt-<version>-windows-x64/
     ├── lwpt.exe
@@ -103,7 +103,8 @@ If `lwpt install` fails with `HTTPS requires OpenSSL but it could not be loaded`
 1. **Tag.** `git tag v0.1.0` on a green `main`. Pre-release tags use the `v0.1.0-rc.1` form (auto-detected by `release.yml` and published as `prerelease: true`).
 2. **`release.yml` triggers.** Mirrors `ci.yml`'s cross-build matrix exactly (same flag set, same toolchain cache key), then packages each target as `tar.gz` (Unix) / `zip` (Windows) plus a SHA-256 checksums file.
 3. **GitHub Release published.** Auto-generated release notes from `.github/release.yml`'s category config, attached: all six archives + the checksums file. Archive naming:
-   ```
+
+   ```text
    lwpt-<version>-macos-arm64.tar.gz
    lwpt-<version>-macos-x64.tar.gz
    lwpt-<version>-linux-x64.tar.gz
@@ -112,6 +113,7 @@ If `lwpt install` fails with `HTTPS requires OpenSSL but it could not be loaded`
    lwpt-<version>-windows-x86.zip
    lwpt-<version>-checksums.txt
    ```
+
 4. **Install scripts** at `scripts/install.sh` (Linux/macOS) + `scripts/install.ps1` (Windows) point at the GitHub Releases asset URLs; both download the per-platform archive + checksums file and verify SHA-256 before installing.
 
 There are no hand-built release artefacts. If `ci.yml` is broken at tag time, fix it first (the `ci.yml` push-to-main run validates the same flag set + matrix that `release.yml` uses).

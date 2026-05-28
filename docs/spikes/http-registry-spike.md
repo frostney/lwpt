@@ -13,7 +13,7 @@ and gives the v2 implementer a working sketch to study.
 
 A flat HTTP registry where each package published an index at:
 
-```
+```text
 <registry>/<name>/index.toml
 ```
 
@@ -26,7 +26,7 @@ versions = ["0.1.0", "0.2.0", "1.0.0", "1.1.0"]
 LWPT would `GET` that index, filter by the dependency's semver range,
 pick the highest satisfying version, then fetch:
 
-```
+```text
 <registry>/<name>/<version>/<name>.tar.gz
 ```
 

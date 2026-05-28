@@ -70,7 +70,7 @@ LWPT manifest string values in `[build].<entry>.<field>`, in every top-level hoo
 
   resolves at manifest load to (on a darwin/aarch64 host):
 
-  ```
+  ```text
   source = source/lwpt.pas
   output = build/lwpt-darwin-aarch64/lwpt
   postbuild.sign.script = scripts/sign.pas

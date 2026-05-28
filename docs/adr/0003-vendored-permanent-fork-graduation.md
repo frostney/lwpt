@@ -8,7 +8,6 @@
 
 ## Original framing (historical — superseded)
 
-
 LWPT vendors ten units from GocciaScript (CLI.Parser/Options/Help, Semver, HTTPClient, TransportSecurity, FileUtils, StringBuffer, TestingPascalLibrary, plus `Shared.inc`). Most stay verbatim. Two named exceptions — the `CLI` namespace and `Semver` — carry consistent `[LWPT patch]` markers because they're being prepared for post-v1 graduation as standalone packages (prefix-strip + dead-code removal in CLI; rename + inline of one constant in Semver). Other vendored files also carry markers where applicable: `[gpm patch]` in `HTTPClient.pas` (byte-safety fixes for binary downloads) and `[LWPT patch]` in `CLI.Parser.pas` (parser widening). We treat the vendored copies as a **permanent fork**: patches stay forever, no `vendored.toml` / `verify-vendor.pas` drift-checking infrastructure, no commitment to follow GocciaScript upstream. Patches will be **submitted upstream as a courtesy**, never as a dependency of the LWPT roadmap. Post-v1, several vendored units **graduate** into their own standalone LWPT-managed Pascal packages: HTTPClient first (it's foundational and self-contained), CLI second, and probably Goccia.Semver and TestingPascalLibrary later. Other Pascal projects consume the graduated packages via their own `lwpt.toml`; LWPT itself keeps a slim bootstrap copy of HTTPClient indefinitely to break the chicken-and-egg ("LWPT needs HTTPS to fetch its own dependencies").
 
 ## Amendment (per ADR-0015) — TestingPascalLibrary graduated early

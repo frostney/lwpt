@@ -64,12 +64,14 @@ ADR-0011's denylist (the explicit set of subcommands that may NOT have hooks) in
 If you depended on `lwpt export testing` to vendor the testing library into your project:
 
 1. Add `testing` to your manifest's `[dependencies]`:
+
    ```toml
    [dependencies]
    testing = "frostney/lwpt-testing@^1.0.0"   # Phase 2 form, post-graduation
    # or, until Phase 2 lands:
    testing = { source = "frostney/lwpt@^0.1.0", include = ["packages/testing/**"] }
    ```
+
 2. Run `lwpt install`.
 3. Delete the earlier extruded `.lwpt/modules/TestingPascalLibrary.pas` + `.lwpt/modules/Shared.inc` (the new symlink at `.lwpt/modules/testing/` supersedes them).
 4. Your `*.Test.pas` files need no changes — `uses TestingPascalLibrary;` resolves through the new path via cfg.

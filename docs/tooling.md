@@ -101,5 +101,5 @@ The v1 pre-commit gate excludes all four. Tracked in [ADR-0006](./adr/0006-stack
 | Item | Status | Comes back in |
 | --- | --- | --- |
 | Changelog automation (`git-cliff` + `cliff.toml` + `CHANGELOG.md`) | Deferred per Q11 | v1.x, when release cadence + commit volume warrant it |
-| Markdown linting (`markdownlint` + `.markdownlint.json`) | Not installed locally; not wired | Adopt when the docs surface stabilizes and we hit the first inconsistency in review |
+| Markdown linting (`markdownlint-cli2` + `.markdownlint-cli2.jsonc`) | Wired in `pr.yml` docs job | Keep blocking; fix Markdown drift rather than making the job advisory |
 | HTTP registry source kind | Deferred to v2 per ADR-0004 | v2; spec lives in `docs/spikes/http-registry-spike.md` as starting point |

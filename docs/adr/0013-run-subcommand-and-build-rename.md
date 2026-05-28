@@ -104,7 +104,7 @@ The subcommand surface, frozen at seven since ADR-0010, expands to eight with `l
 
 - **Reserved-name guard** runs at manifest load. The eight protected names are `install`, `build`, `format`, `test`, `export`, `repair`, `init`, `run`. A section with any of these names + a `script` field raises:
 
-  ```
+  ```text
   section [install] shadows the built-in subcommand and cannot be used
   as a run-script. Rename the section (e.g. [install-task]) or invoke the
   subcommand directly (`lwpt install`). See ADR-0013.

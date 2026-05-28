@@ -78,7 +78,7 @@ A single Ubuntu runner. Mirrors GocciaScript's `pr.yml` shape, and is the **sole
 5. `./build/lwpt format --check`
 6. `./build/lwpt test` (default tier — unit + integration)
 
-E2E tests are skipped via `LWPT_SKIP_NETWORK=1`; they run on every platform post-merge via `ci.yml`. A separate `docs` job runs `markdownlint-cli2` against the Markdown corpus (currently advisory — `continue-on-error: true` until a `.markdownlint-cli2.jsonc` lands).
+E2E tests are skipped via `LWPT_SKIP_NETWORK=1`; they run on every platform post-merge via `ci.yml`. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
 
 The PR workflow deliberately uses the distro FPC (same as the install instructions in `README.md`), so any regression that only shows up with the system FPC's slightly older RTL gets caught before merge.
 

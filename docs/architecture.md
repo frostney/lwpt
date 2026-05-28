@@ -20,7 +20,7 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 
 ## The package-manager-is-the-foundation through-line
 
-```
+```text
                   lwpt.toml  (manifest, hand-edited, single source of truth)
                       │
                       ▼

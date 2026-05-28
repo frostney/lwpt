@@ -145,7 +145,6 @@ The rule: anything ≤ 100 KB is committed; anything larger is seeded. Repo size
 
 The mock server is **necessary** for the byte-truncation regression — only by controlling the response bytes can you embed `#0` in specific positions. Pinned real artefacts can't deterministically reproduce the pathological case.
 
-
 ## Test backlog (all landed)
 
 The original 10-file backlog from the handoff is in place: tier-0 + the headline HTTPClient byte-fetch regression, the manifest + resolver + extractor tests, the failure-mode + hardening tests, and the full E2E tier (CLI subprocess, mock-server fetch-failure, live GitHub/GitLab/Bitbucket, GNU long-name extractor).

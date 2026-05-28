@@ -36,22 +36,22 @@ git merge origin/main --no-edit
 
 Resolve conflicts and commit the merge if needed before continuing.
 
-5. If there is nothing new to commit (aside from an already-finished merge), skip to step 8.
-6. Stage only relevant files. Exclude secrets and unrelated local changes.
-7. Commit with a concise message via HEREDOC.
-8. Push (set upstream if needed):
+1. If there is nothing new to commit (aside from an already-finished merge), skip to step 8.
+2. Stage only relevant files. Exclude secrets and unrelated local changes.
+3. Commit with a concise message via HEREDOC.
+4. Push (set upstream if needed):
 
 ```bash
 git push -u origin HEAD
 ```
 
-9. Reconcile PR title and body with the latest implementation:
+1. Reconcile PR title and body with the latest implementation:
    - Read `.github/pull_request_template.md` or `.github/PULL_REQUEST_TEMPLATE/` if present.
    - `gh pr view --json body,url,title`
    - Align title, Summary, Testing, linked issues, and scope with commits and verification.
    - Update title: `gh pr edit --title "$PR_TITLE"` when stale.
    - Update body: `gh pr edit --body-file <file>` when stale. Keep template structure and reviewer context.
 
-10. Report: commit hash, branch, PR URL, whether title/body changed, and verification performed.
+2. Report: commit hash, branch, PR URL, whether title/body changed, and verification performed.
 
 Do not skip git hooks or verification unless the user explicitly requests it.

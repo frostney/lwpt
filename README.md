@@ -5,7 +5,7 @@ One executable, seven subcommands, driven by a single `lwpt.toml`
 manifest. Zero-install by default — `git clone && fpc @lwpt.cfg`
 builds a project without running `lwpt install` first.
 
-```
+```text
 lwpt init      scaffold a new project (manifest + source dir + sample entry)
 lwpt install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
 lwpt build     compile manifest targets   [--mode dev|release] [--clean]
@@ -82,7 +82,7 @@ when warranted; the per-package roadmap lives in
 
 ## On-disk layout
 
-```
+```text
 my-project/
 ├── lwpt.toml                # manifest (single source of truth)
 ├── lwpt.lock                # lockfile (committed)

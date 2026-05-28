@@ -26,15 +26,15 @@ Explicit permission to commit relevant changes, push the branch, and open a draf
 BASE_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')
 ```
 
-4. If the current branch is the base branch, create a focused branch first. Use the issue number or a change summary; ask when ambiguous.
-5. Stage only relevant files. Exclude secrets and unrelated local changes.
-6. Commit with a concise message passed via HEREDOC.
-7. Push with upstream tracking when needed: `git push -u origin HEAD`.
-8. Resolve the PR template:
+1. If the current branch is the base branch, create a focused branch first. Use the issue number or a change summary; ask when ambiguous.
+2. Stage only relevant files. Exclude secrets and unrelated local changes.
+3. Commit with a concise message passed via HEREDOC.
+4. Push with upstream tracking when needed: `git push -u origin HEAD`.
+5. Resolve the PR template:
    - Read `.github/pull_request_template.md`, or pick the matching template under `.github/PULL_REQUEST_TEMPLATE/` if the repo uses multiple.
    - If none exists, use a minimal structure: Summary, Testing, Linked issues.
    - Fill the template faithfully and preserve its structure.
-9. Open as a **draft** via GraphQL first:
+6. Open as a **draft** via GraphQL first:
 
 ```bash
 gh api graphql \
@@ -57,7 +57,7 @@ gh api graphql \
   -f body="$PR_BODY"
 ```
 
-10. If GraphQL is rate-limited or unavailable, fall back to REST as a **draft**:
+1. If GraphQL is rate-limited or unavailable, fall back to REST as a **draft**:
 
 ```bash
 gh api "repos/$OWNER/$REPO/pulls" \
@@ -69,6 +69,6 @@ gh api "repos/$OWNER/$REPO/pulls" \
   --jq '.html_url'
 ```
 
-11. Return the PR URL.
+1. Return the PR URL.
 
 Do not skip git hooks or verification unless the user explicitly asks.

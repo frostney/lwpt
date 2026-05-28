@@ -74,7 +74,7 @@ gh api graphql \
 
 When labels were selected, append one `-F labelIds[]="$LABEL_ID"` argument per label ID.
 
-9. If GraphQL is rate-limited or unavailable, fall back to REST:
+1. If GraphQL is rate-limited or unavailable, fall back to REST:
 
 ```bash
 gh api "repos/$OWNER/$REPO/issues" \
@@ -85,4 +85,4 @@ gh api "repos/$OWNER/$REPO/issues" \
 
 When labels were selected, append one `-f labels[]="$LABEL_NAME"` argument per label name.
 
-10. Return the issue URL.
+1. Return the issue URL.
