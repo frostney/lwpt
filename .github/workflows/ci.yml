@@ -148,7 +148,7 @@ jobs:
           test -d "$FCL_NET_SRC"
           test -d "$OPENSSL_SRC"
 
-          mkdir -p build
+          mkdir -p build/compiled
 
           # Single entry point: source/lwpt.pas. -Fu / -Fi paths mirror
           # scripts/bootstrap.pas (LWPT's own bootstrap), extended with

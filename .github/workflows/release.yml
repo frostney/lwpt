@@ -143,7 +143,7 @@ jobs:
           FCL_NET_SRC="$PREFIX/share/fpcsrc/packages/fcl-net/src"
           OPENSSL_SRC="$PREFIX/share/fpcsrc/packages/openssl/src"
 
-          mkdir -p build
+          mkdir -p build/compiled
 
           # Release-grade build: -O4 -dPRODUCTION -Xs -CX -XX -B.
           # Same flag set as ci.yml's build stage, so a tagged commit's
