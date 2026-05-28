@@ -4064,6 +4064,32 @@ var
   P : TProcess;
   BuildDir : string;
   i : Integer;
+
+  procedure AddCfgParameters(const APath: string);
+  var
+    Lines : TStringList;
+    Line : string;
+    j : Integer;
+  begin
+    if not FileExists(APath) then
+      Exit;
+
+    Lines := TStringList.Create;
+    try
+      Lines.LoadFromFile(APath);
+      for j := 0 to Lines.Count - 1 do
+      begin
+        Line := Trim(Lines[j]);
+        if Line = '' then
+          Continue;
+        if Line[1] = '#' then
+          Continue;
+        P.Parameters.Add(Line);
+      end;
+    finally
+      Lines.Free;
+    end;
+  end;
 begin
   BuildDir := TestBuildDir(ASrcFile);
   ForceDirectories(BuildDir);
@@ -4087,11 +4113,12 @@ begin
       .lwpt/modules/<name>/source/ and CmdTest's per-test compile
       needs them on -Fu / -Fi — without this, every test that
       transitively uses HTTPClient / CLI / Semver / TOML fails to
-      compile with "can't find unit". The explicit AUnitPaths
+      compile with "can't find unit". Expand the response fragment
+      directly here so test compilation is independent of per-platform
+      FPC response-file parsing. The explicit AUnitPaths
       additions stay for the AUnitPaths-driven callers (preserves
       backwards-compat with non-cfg-based invocations). }
-    if FileExists(CFG_FILE) then
-      P.Parameters.Add('@' + CFG_FILE);
+    AddCfgParameters(CFG_FILE);
     for i := 0 to High(AUnitPaths) do
       if AUnitPaths[i] <> '' then
       begin
