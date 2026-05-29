@@ -653,7 +653,6 @@ const
   SEC_E_OK = SECURITY_STATUS($00000000);
   SEC_I_CONTINUE_NEEDED = SECURITY_STATUS($00090312);
   SEC_I_CONTEXT_EXPIRED = SECURITY_STATUS($00090317);
-  SEC_E_INVALID_TOKEN = SECURITY_STATUS($80090308);
   SEC_E_INCOMPLETE_MESSAGE = SECURITY_STATUS($80090318);
   SEC_I_INCOMPLETE_CREDENTIALS = SECURITY_STATUS($00090320);
   SEC_I_RENEGOTIATE = SECURITY_STATUS($00090321);
@@ -887,12 +886,57 @@ end;
 procedure CloseSChannel(var AConnection: TTransportSecurityConnection);
 var
   Data: TSChannelData;
+  ShutdownToken: LongWord;
+  ShutdownBuffer: TSecBuffer;
+  ShutdownDesc: TSecBufferDesc;
+  InputBuffer: TSecBuffer;
+  InputDesc: TSecBufferDesc;
+  OutputBuffer: TSecBuffer;
+  OutputDesc: TSecBufferDesc;
+  Status: SECURITY_STATUS;
+  ContextAttributes: LongWord;
+  Expiry: SECURITY_INTEGER;
 begin
   Data := TSChannelData(AConnection.BackendData);
   if Assigned(Data) then
   begin
     if Data.HasContext then
+    begin
+      ShutdownToken := SCHANNEL_SHUTDOWN;
+      ShutdownBuffer.cbBuffer := SizeOf(ShutdownToken);
+      ShutdownBuffer.BufferType := SECBUFFER_TOKEN;
+      ShutdownBuffer.pvBuffer := @ShutdownToken;
+      ShutdownDesc.ulVersion := SECBUFFER_VERSION;
+      ShutdownDesc.cBuffers := 1;
+      ShutdownDesc.pBuffers := @ShutdownBuffer;
+      ApplyControlToken(@Data.Context, @ShutdownDesc);
+
+      repeat
+        FillChar(InputBuffer, SizeOf(InputBuffer), 0);
+        InputBuffer.BufferType := SECBUFFER_EMPTY;
+        InputDesc.ulVersion := SECBUFFER_VERSION;
+        InputDesc.cBuffers := 1;
+        InputDesc.pBuffers := @InputBuffer;
+
+        FillChar(OutputBuffer, SizeOf(OutputBuffer), 0);
+        OutputBuffer.BufferType := SECBUFFER_TOKEN;
+        FillChar(OutputDesc, SizeOf(OutputDesc), 0);
+        OutputDesc.ulVersion := SECBUFFER_VERSION;
+        OutputDesc.cBuffers := 1;
+        OutputDesc.pBuffers := @OutputBuffer;
+
+        Status := InitializeSecurityContextW(@Data.Credential, @Data.Context,
+          nil, SChannelRequestFlags, 0, SECURITY_NATIVE_DREP, @InputDesc, 0,
+          @Data.Context, @OutputDesc, @ContextAttributes, @Expiry);
+
+        SendSChannelToken(Data.Socket, OutputBuffer);
+        if Assigned(OutputBuffer.pvBuffer) then
+          FreeContextBuffer(OutputBuffer.pvBuffer);
+      until (Status = SEC_E_OK) or (Status = SEC_I_CONTEXT_EXPIRED) or
+            (Status <> SEC_I_CONTINUE_NEEDED);
+
       DeleteSecurityContext(@Data.Context);
+    end;
     FreeCredentialsHandle(@Data.Credential);
     Data.Free;
   end;
@@ -968,12 +1012,6 @@ begin
     end;
     if Status = SEC_I_CONTEXT_EXPIRED then
     begin
-      Result := 0;
-      Exit;
-    end;
-    if Status = SEC_E_INVALID_TOKEN then
-    begin
-      SetLength(Data.EncryptedInput, 0);
       Result := 0;
       Exit;
     end;
