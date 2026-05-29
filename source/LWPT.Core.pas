@@ -2540,7 +2540,8 @@ begin
 
   FHandle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
     Windows.GENERIC_READ or Windows.GENERIC_WRITE,
-    Windows.FILE_SHARE_READ, nil, Windows.CREATE_NEW,
+    Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+      or Windows.FILE_SHARE_DELETE, nil, Windows.CREATE_NEW,
     Windows.FILE_ATTRIBUTE_NORMAL, 0);
   if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
   begin
@@ -4478,11 +4479,58 @@ begin
   Result := False;
 end;
 
+function RunPascalScript(const AHook: THook; out AError: string): Integer;
+var
+  P: TProcess;
+  j: Integer;
+  {$IFDEF MSWINDOWS}
+  Bin: string;
+  {$ENDIF}
+begin
+  AError := '';
+  {$IFDEF MSWINDOWS}
+  if not CompilePascal(AHook.Script, [], Bin) then
+  begin
+    AError := 'fpc failed to compile ' + AHook.Script;
+    Exit(1);
+  end;
+  {$ENDIF}
+
+  P := TProcess.Create(nil);
+  try
+    {$IFDEF MSWINDOWS}
+    P.Executable := Bin;
+    {$ELSE}
+    P.Executable := InstantFPCExecutable;
+    P.Parameters.Add(AHook.Script);
+    {$ENDIF}
+    for j := 0 to High(AHook.Args) do
+      P.Parameters.Add(AHook.Args[j]);
+    P.Options := [poWaitOnExit];
+    try
+      P.Execute;
+    except
+      on E: Exception do
+      begin
+        {$IFDEF MSWINDOWS}
+        AError := 'compiled script unavailable (' + E.Message + ')';
+        {$ELSE}
+        AError := 'instantfpc unavailable (' + E.Message + ')';
+        {$ENDIF}
+        Exit(127);
+      end;
+    end;
+    Result := P.ExitStatus;
+  finally
+    P.Free;
+  end;
+end;
+
 procedure RunHooks(const APhase: string; const AHooks: THookArray);
 var
-  i, j, Code: Integer;
-  P: TProcess;
+  i, Code: Integer;
   H: THook;
+  ScriptError: string;
 begin
   if Length(AHooks) = 0 then Exit;
   for i := 0 to High(AHooks) do
@@ -4501,33 +4549,15 @@ begin
       raise EManifestError.CreateFmt(
         '[%s] %s: script not found at %s', [APhase, H.Name, H.Script]);
 
-    P := TProcess.Create(nil);
-    try
-      P.Executable := InstantFPCExecutable;
-      P.Parameters.Add(H.Script);
-      for j := 0 to High(H.Args) do
-        P.Parameters.Add(H.Args[j]);
-      { Inherit env + cwd from the lwpt process — Working='' means
-        "use the caller's cwd". Stdout/stderr pass through to the
-        terminal so the user sees what the hook printed. }
-      P.Options := [poWaitOnExit];
-      try
-        P.Execute;
-      except
-        on E: Exception do
-          raise ELWPTError.CreateFmt(
-            'instantfpc unavailable while running [%s] %s (%s). '
-            + 'Install InstantFPC (bundled with FPC) or run %s by hand.',
-            [APhase, H.Name, E.Message, H.Script]);
-      end;
-      Code := P.ExitStatus;
-    finally
-      P.Free;
-    end;
+    Code := RunPascalScript(H, ScriptError);
+    if ScriptError <> '' then
+      raise ELWPTError.CreateFmt(
+        '[%s] %s: %s while running %s',
+        [APhase, H.Name, ScriptError, H.Script]);
 
     if Code <> 0 then
       raise ELWPTError.CreateFmt(
-        '[%s] %s: instantfpc exited %d while running %s',
+        '[%s] %s: script exited %d while running %s',
         [APhase, H.Name, Code, H.Script]);
   end;
 end;
@@ -5385,8 +5415,7 @@ end;
 
 function RunUserScript(const AHook: THook): Integer;
 var
-  P: TProcess;
-  j: Integer;
+  ScriptError: string;
 begin
   if not FileExists(AHook.Script) then
   begin
@@ -5394,27 +5423,11 @@ begin
       AHook.Script);
     Exit(127);
   end;
-  P := TProcess.Create(nil);
-  try
-    P.Executable := InstantFPCExecutable;
-    P.Parameters.Add(AHook.Script);
-    for j := 0 to High(AHook.Args) do
-      P.Parameters.Add(AHook.Args[j]);
-    P.Options := [poWaitOnExit];
-    try
-      P.Execute;
-    except
-      on E: Exception do
-      begin
-        WriteLn(ErrOutput, PROGRAM_NAME, ' run: instantfpc unavailable (',
-          E.Message, '). Install InstantFPC (bundled with FPC) or run ',
-          AHook.Script, ' by hand.');
-        Exit(127);
-      end;
-    end;
-    Result := P.ExitStatus;
-  finally
-    P.Free;
+  Result := RunPascalScript(AHook, ScriptError);
+  if ScriptError <> '' then
+  begin
+    WriteLn(ErrOutput, PROGRAM_NAME, ' run: ', ScriptError, '.');
+    if Result = 0 then Result := 1;
   end;
 end;
 
