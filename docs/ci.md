@@ -37,14 +37,14 @@ The build steps:
 3. Download Linux crosslibs from `LongDirtyAnimAlf/fpcupdeluxe` (Ubuntu 22.04 amd64, Ubuntu 18.04 aarch64).
 4. Compile soft-float units (`softfpu`, `ufloatx80`, `sfpux80`) for the native RTL.
 5. Build cross-compilers `ppcrossx64` (x86_64 → for x86_64-darwin and x86_64-linux) and `ppcross386` (i386 → for i386-win32) by compiling `pp.pas` directly with the native `ppca64`.
-6. Build per-target cross-RTL + the packages LWPT needs: `rtl`, `rtl-objpas` (variants/strutils/dateutils), `rtl-generics` (Generics.Collections), `fcl-process` (Process), and the platform-appropriate socket unit (Sockets on Unix/Darwin, WinSock2 on Windows).
-7. Save the lot — `fpc-cross/`, `cross-binutils/`, `cross-libs/` — under the cache key `lwpt-fpc-cross-3.2.2-macos-arm64-v1`.
+6. Build per-target cross-RTL + the packages LWPT needs: `rtl`, `rtl-objpas` (variants/strutils/dateutils), `rtl-generics` (Generics.Collections), `fcl-process` (Process), `paszlib` (ZStream), and the platform-appropriate socket unit (Sockets on Unix/Darwin, WinSock2 on Windows).
+7. Save the lot — `fpc-cross/`, `cross-binutils/`, `cross-libs/` — under the cache key `lwpt-fpc-cross-3.2.2-macos-arm64-v2`.
 
 The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a cache hit, the workflow exits in seconds with `Toolchain already cached — nothing to build.`.
 
 ### `ci.yml` — build + test
 
-**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, plus the cross-toolchain's RTL + packages). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `AddBuildModeFlags`' release branch. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`.
+**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, `packages/testing/source/`, plus the cross-toolchain's RTL + packages, including `paszlib` for `ZStream`). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `AddBuildModeFlags`' release branch. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`.
 
 **Test stage** (per-platform native runners, six-target matrix → five runners):
 
@@ -149,7 +149,7 @@ A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` a
 
 ## When to bump `CACHE_VERSION`
 
-Bump `toolchain.yml`'s `CACHE_VERSION` env var (currently `v1`) when:
+Bump `toolchain.yml`'s `CACHE_VERSION` env var (currently `v2`) when:
 
 - FPC version changes
 - A new target is added to the matrix

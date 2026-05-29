@@ -17,7 +17,7 @@ on:
 env:
   FPC_VERSION: "3.2.2"
   BINUTILS_VERSION: "2.44"
-  CACHE_VERSION: "v1"
+  CACHE_VERSION: "v2"
 
 jobs:
   build:
@@ -359,6 +359,15 @@ jobs:
             "$cross_fpc" -T"${os}" -O2 -dFPC_SOFT_FPUX80 $pkg_extra_flags \
               -Fu"$rtl_dir" -Fu"$fcl_dir" -FU"$fcl_dir" \
               $process_fi "packages/fcl-process/src/process.pp"
+
+            # paszlib (ZStream — used by LWPT.Core to gunzip archives)
+            echo "--- paszlib for ${target} ---"
+            local paszlib_dir="$PREFIX/lib/fpc/${FPC_VERSION}/units/${target}/paszlib"
+            mkdir -p "$paszlib_dir"
+            # shellcheck disable=SC2086  # $pkg_extra_flags is intentionally word-split
+            "$cross_fpc" -T"${os}" -O2 -dFPC_SOFT_FPUX80 $pkg_extra_flags \
+              -Fu"$rtl_dir" -Fu"$paszlib_dir" -Fupackages/hash/src -FU"$paszlib_dir" \
+              "packages/paszlib/src/zstream.pp"
 
             # Socket units (HTTPClient — Sockets on Unix/Darwin, WinSock2 on Windows)
             local rtl_extra="packages/rtl-extra/src"
