@@ -30,6 +30,7 @@
 
     function RunLwpt(const AArgs; AInDir; AExtraEnv): TLwptResult;
     function LwptBinaryPath: string;
+    function ExpectedExe(const APath: string): string;
     procedure SetLwptBinaryPath(const APath: string);
 }
 
@@ -66,6 +67,7 @@ function RunLwpt(const AArgs: array of string;
   point of the call. Override via SetLwptBinaryPath when running
   from a non-standard layout (e.g. a side-by-side comparison). }
 function LwptBinaryPath: string;
+function ExpectedExe(const APath: string): string;
 procedure SetLwptBinaryPath(const APath: string);
 
 { Quick helper for "is the env saying skip network?". E2E tests that
@@ -82,6 +84,14 @@ function LwptBinaryPath: string;
 begin
   if GLwptBinaryPath <> '' then Exit(GLwptBinaryPath);
   Result := ExpandFileName('build/lwpt');
+end;
+
+function ExpectedExe(const APath: string): string;
+begin
+  Result := APath;
+  {$IFDEF MSWINDOWS}
+  if ExtractFileExt(Result) = '' then Result := Result + '.exe';
+  {$ENDIF}
 end;
 
 procedure SetLwptBinaryPath(const APath: string);

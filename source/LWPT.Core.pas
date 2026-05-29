@@ -2532,6 +2532,7 @@ var
   SL: TStringList;
   PidLine: AnsiString;
   BytesWritten: DWORD;
+  LastErr: DWORD;
   Ov: TOverlapped;
 begin
   FPath := APath;
@@ -2546,6 +2547,13 @@ begin
     Windows.FILE_ATTRIBUTE_NORMAL, 0);
   if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
   begin
+    LastErr := Windows.GetLastError;
+    if (LastErr <> Windows.ERROR_FILE_EXISTS)
+      and (LastErr <> Windows.ERROR_ALREADY_EXISTS) then
+      raise ELWPTError.CreateFmt(
+        'failed to create install lock %s: %s (code %d)',
+        [APath, SysErrorMessage(LastErr), LastErr]);
+
     Holder := 'unknown';
     if FileExists(APath) then
     begin
@@ -2558,10 +2566,11 @@ begin
       end;
     end;
     raise EConcurrencyError.CreateFmt(
-      'another lwpt install is in progress (lock holder PID: %s) — '
+      'another ' + PROGRAM_NAME
+      + ' install is in progress (lock holder PID: %s) — '
       + 'or the previous install crashed without releasing the lock. '
       + 'If you''re certain no other process is running, '
-      + 'run `lwpt repair` to clear the stale lock.',
+      + 'run `' + PROGRAM_NAME + ' repair` to clear the stale lock.',
       [Holder]);
   end;
 
@@ -2589,7 +2598,8 @@ begin
     FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
     DeleteFile(FPath);
     raise EConcurrencyError.Create(
-      'another lwpt install is in progress. Try again when it finishes.');
+      'another ' + PROGRAM_NAME
+      + ' install is in progress. Try again when it finishes.');
   end;
 end;
 

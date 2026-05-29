@@ -90,14 +90,6 @@ begin
   RemoveDir(APath);
 end;
 
-function ExpectedExe(const APath: string): string;
-begin
-  Result := APath;
-  {$IFDEF MSWINDOWS}
-  if ExtractFileExt(Result) = '' then Result := Result + '.exe';
-  {$ENDIF}
-end;
-
 procedure TCLIOptionsE2E.SetupScratchProject;
 begin
   ForceDirectories(FScratch + '/source');
