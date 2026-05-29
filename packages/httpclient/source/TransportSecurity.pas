@@ -713,9 +713,18 @@ end;
 
 procedure PreserveExtraBytes(var ATarget: TBytes; const ASource: Pointer;
   const ALength: Integer);
+var
+  Temporary: TBytes;
 begin
-  SetLength(ATarget, 0);
-  AppendBytes(ATarget, ASource, ALength);
+  if ALength <= 0 then
+  begin
+    SetLength(ATarget, 0);
+    Exit;
+  end;
+
+  SetLength(Temporary, ALength);
+  Move(ASource^, Temporary[0], ALength);
+  ATarget := Temporary;
 end;
 
 function ReceiveIntoBuffer(const ASocket: TSocket; var ABuffer: TBytes): Integer;
