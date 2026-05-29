@@ -19,7 +19,7 @@ Trigger split, mirroring GocciaScript's CI shape:
 
 ### `toolchain.yml` — cross-FPC toolchain build
 
-Runs on `macos-latest`. Seeds native `aarch64-darwin` from Homebrew's FPC 3.2.2 install, then builds the cross-compilation toolchain and reduced unit slices needed for the non-native build targets:
+Runs on `macos-latest`. Seeds native `aarch64-darwin` from Homebrew's FPC 3.2.2 install, then builds the cross-compilation toolchain and FPC packages slice needed for the non-native build targets:
 
 | Target | CPU | OS |
 | --- | --- | --- |
@@ -37,14 +37,14 @@ The build steps:
 3. Download Linux crosslibs from `LongDirtyAnimAlf/fpcupdeluxe` (Ubuntu 22.04 amd64, Ubuntu 18.04 aarch64).
 4. Compile soft-float units (`softfpu`, `ufloatx80`, `sfpux80`) for the native RTL.
 5. Build cross-compilers `ppcrossx64` (x86_64 → for x86_64-darwin and x86_64-linux) and `ppcross386` (i386 → for i386-win32) by compiling `pp.pas` directly with the native `ppca64`.
-6. Build per-target cross-RTL + the packages LWPT needs for the non-native targets: `rtl`, `rtl-objpas` (variants/strutils/dateutils), `rtl-generics` (Generics.Collections), `fcl-process` (Process), `paszlib` (ZStream), and the platform-appropriate socket unit (Sockets on Unix/Darwin, WinSock2 on Windows). Native `aarch64-darwin` keeps Homebrew's package layout, including `hash/crc.ppu` for `ZStream`'s dependency closure and `rtl-extra/sockets.ppu` for socket APIs.
+6. Build the per-target FPC packages slice LWPT needs for the non-native targets: `rtl`, `rtl-objpas` (variants/strutils/dateutils), `rtl-generics` (Generics.Collections), `fcl-process` (Process), `paszlib` (ZStream), and the platform-appropriate socket package coverage (Sockets on Unix/Darwin, WinSock2 on Windows). Native `aarch64-darwin` keeps Homebrew's package layout, including `hash/crc.ppu` for `ZStream`'s dependency closure and `rtl-extra/sockets.ppu` for socket APIs.
 7. Save the lot — `fpc-cross/`, `cross-binutils/`, `cross-libs/` — under the cache key `lwpt-fpc-cross-3.2.2-macos-arm64-v5`.
 
 The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a cache hit, the workflow exits in seconds with `Toolchain already cached — nothing to build.`.
 
 ### `ci.yml` — build + test
 
-**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, `packages/testing/source/`, plus the cross-toolchain's RTL + packages, including `paszlib` for `ZStream`). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `AddBuildModeFlags`' release branch. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`.
+**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, `packages/testing/source/`, plus the target's FPC packages slice, including `paszlib` for `ZStream`). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `AddBuildModeFlags`' release branch. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`.
 
 **Test stage** (per-platform native runners, six-target matrix → five runners):
 
@@ -153,7 +153,7 @@ Bump `toolchain.yml`'s `CACHE_VERSION` env var (currently `v5`) when:
 
 - FPC version changes
 - A new target is added to the matrix
-- A new RTL / package gets baked into the toolchain (e.g. when a future LWPT change requires a unit not in the current set)
+- The FPC packages slice is rescoped (e.g. when a future LWPT change requires a package not in the current set)
 - Toolchain scripts themselves change in a way that affects the binary content of the cache
 
 A bump invalidates the cache on the next workflow run; the toolchain rebuild takes ~30 minutes on macos-latest. Pure consumer changes (LWPT source edits, package additions inside `packages/`, manifest tweaks) do not require a cache bump — the cached cross-toolchain is reused as-is.

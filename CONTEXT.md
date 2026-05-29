@@ -60,6 +60,14 @@ The default property of every LWPT project: after `git clone`, `fpc @lwpt.cfg` b
 The one-time `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) that produces the first `build/lwpt` binary on a fresh clone. After bootstrap, `./build/lwpt build` is the steady-state entry point.
 *Avoid*: "setup", "install" (bootstrap is for the toolkit itself, not for a project's dependencies).
 
+**FPC packages slice**:
+The curated set of FPC packages made available to a LWPT CI build target. Plural by definition: never a single package, and never a subset of a package. A packages-slice rescope adapts this set to the project currently being built; the inherited GocciaScript-shaped slice was valid for GocciaScript, while LWPT's package-manager path needs its own slice. Individual units such as `zstream.ppu`, `crc.ppu`, or `sockets.ppu` are verification points inside the slice, not the thing being sliced. Native targets may use the package layout from the native FPC install; cross targets may use packages built into the cached cross-toolchain.
+*Avoid*: "unit slice", "package slice", "exact RTL units", "completeness bug", "cross-compiled FPC" when the target uses a native FPC package layout.
+
+**Windows SChannel archive-fetch failure**:
+A Windows-only failure in the `HTTPClient` package's SChannel backend while fetching live dependency archives during `lwpt test --tier=e2e`. Specific to LWPT's archive-fetch workload; not a general claim that HTTPS is broken, and not evidence that the FPC packages slice is wrong. GocciaScript's HTTPS smoke exercises a smaller request shape.
+*Avoid*: "SChannel HTTPS issue", "Windows HTTPS is broken", "GocciaScript works but LWPT does not".
+
 **Toolkit state**:
 Everything under `.lwpt/` at a project's root. Three subdirs: `modules/` and `archives/` are committed (zero-install); `tmp/` is gitignored (install workspace). `install.lock` (when present) is the concurrency-control file; also gitignored. Monorepo deps appear under `modules/` as symlinks (Unix) or NTFS junctions (Windows) pointing into the project's `packages/<name>/` tree; external-path + network deps appear as regular copied directories.
 *Avoid*: "node_modules" (npm-specific naming), "vendor dir" alone (`packages/` is the monorepo-internal "where vendored packages live" — see *Package (graduated)*; `.lwpt/modules/` is the per-project installed-tree location, NOT a vendor dir in the historical Delphi/FreePascal sense).
