@@ -17,7 +17,7 @@ on:
 env:
   FPC_VERSION: "3.2.2"
   BINUTILS_VERSION: "2.44"
-  CACHE_VERSION: "v2"
+  CACHE_VERSION: "v3"
 
 jobs:
   build:
@@ -398,6 +398,9 @@ jobs:
                 ;;
             esac
           }
+
+          # macOS aarch64
+          build_target aarch64 darwin
 
           # macOS x86_64
           build_target x86_64 darwin
