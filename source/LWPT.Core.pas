@@ -419,6 +419,29 @@ begin
   {$ENDIF}
 end;
 
+procedure AddEnvUnitPathParameters(AParameters: TStrings);
+var
+  Raw, Part : string;
+  StartAt, i : Integer;
+begin
+  Raw := GetEnvironmentVariable('LWPT_FPC_UNIT_PATHS');
+  if Raw = '' then
+    Exit;
+
+  StartAt := 1;
+  for i := 1 to Length(Raw) + 1 do
+    if (i > Length(Raw)) or (Raw[i] = PathSeparator) then
+    begin
+      Part := Copy(Raw, StartAt, i - StartAt);
+      if Part <> '' then
+      begin
+        AParameters.Add('-Fu' + Part);
+        AParameters.Add('-Fi' + Part);
+      end;
+      StartAt := i + 1;
+    end;
+end;
+
 { ===========================================================================
   TOML helpers — manifest + lockfile readers used to drive their
   own partial reader (TTomlReader / TTomlNode record); after the
@@ -4152,6 +4175,7 @@ begin
       additions stay for the AUnitPaths-driven callers (preserves
       backwards-compat with non-cfg-based invocations). }
     AddCfgParameters(CFG_FILE);
+    AddEnvUnitPathParameters(P.Parameters);
     for i := 0 to High(AUnitPaths) do
       if AUnitPaths[i] <> '' then
       begin
@@ -4499,6 +4523,7 @@ begin
       almost always be present). }
     if FileExists(ResolveCfgFile(AMan)) then
       P.Parameters.Add('@' + ResolveCfgFile(AMan));
+    AddEnvUnitPathParameters(P.Parameters);
     { manifest's own unit dirs — both as unit (-Fu) and include
       (-Fi) search paths. .inc files conventionally live next to
       .pas units, so the same dir serves both. }

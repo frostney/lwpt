@@ -324,6 +324,19 @@ jobs:
           if [ -n "$INSTANTFPC_BIN" ]; then
             echo "LWPT_INSTANTFPC=$INSTANTFPC_BIN" >> "$GITHUB_ENV"
           fi
+          FPC_UNIT_PATHS=""
+          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do
+            UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/i386-win32/${unit_dir}" -type d 2>/dev/null | head -1 || true)
+            if [ -n "$UNIT_PATH" ]; then
+              UNIT_PATH_WIN=$(cygpath -w "$UNIT_PATH")
+              if [ -z "$FPC_UNIT_PATHS" ]; then
+                FPC_UNIT_PATHS="$UNIT_PATH_WIN"
+              else
+                FPC_UNIT_PATHS="${FPC_UNIT_PATHS};${UNIT_PATH_WIN}"
+              fi
+            fi
+          done
+          echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
 
       - name: Download lwpt artefact
         uses: actions/download-artifact@v8
