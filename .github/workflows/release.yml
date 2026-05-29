@@ -144,32 +144,49 @@ jobs:
           FCL_BASE_SRC="$PREFIX/share/fpcsrc/packages/fcl-base/src"
           FCL_NET_SRC="$PREFIX/share/fpcsrc/packages/fcl-net/src"
           OPENSSL_SRC="$PREFIX/share/fpcsrc/packages/openssl/src"
-          HASH_FLAGS=()
+          HASH_FLAGS=""
           if [ -d "$HASH_DIR" ]; then
-            HASH_FLAGS=(-Fu"$HASH_DIR")
+            HASH_FLAGS="-Fu${HASH_DIR}"
             echo "hash units: $(find "$HASH_DIR" -maxdepth 1 -name '*.ppu' | wc -l | tr -d ' ') .ppu files"
           fi
 
-          test -d "$PASZLIB_DIR"
+          require_dir() {
+            local dir="$1"
+            if [ ! -d "$dir" ]; then
+              echo "::error::Missing directory for ${TARGET}: ${dir}"
+              exit 1
+            fi
+          }
+
+          require_unit() {
+            local dir="$1"
+            local unit="$2"
+            if [ ! -f "$dir/${unit}.ppu" ]; then
+              echo "::error::Missing ${unit}.ppu in ${dir} for ${TARGET}"
+              exit 1
+            fi
+          }
+
+          require_dir "$PASZLIB_DIR"
           PASZLIB_COUNT="$(find "$PASZLIB_DIR" -maxdepth 1 -name '*.ppu' | wc -l | tr -d ' ')"
           echo "paszlib units: ${PASZLIB_COUNT} .ppu files"
           for unit in strutils dateutils variants; do
-            test -f "$OBJPAS_DIR/${unit}.ppu"
+            require_unit "$OBJPAS_DIR" "$unit"
           done
           for unit in generics.collections generics.defaults; do
-            test -f "$GEN_DIR/${unit}.ppu"
+            require_unit "$GEN_DIR" "$unit"
           done
           for unit in process pipes; do
-            test -f "$FCL_DIR/${unit}.ppu"
+            require_unit "$FCL_DIR" "$unit"
           done
-          test -f "$PASZLIB_DIR/zstream.ppu"
+          require_unit "$PASZLIB_DIR" zstream
           if [ ! -f "$PASZLIB_DIR/crc.ppu" ] && [ ! -f "$HASH_DIR/crc.ppu" ]; then
             echo "::error::Missing crc.ppu in paszlib/hash unit dirs for ${TARGET}"
             exit 1
           fi
           case "$OS" in
-            win32|win64) test -f "$RTL_DIR/winsock2.ppu" ;;
-            *)           test -f "$RTL_DIR/sockets.ppu" ;;
+            win32|win64) require_unit "$RTL_DIR" winsock2 ;;
+            *)           require_unit "$RTL_DIR" sockets ;;
           esac
 
           mkdir -p build/compiled
@@ -187,7 +204,7 @@ jobs:
             -Fupackages/semver/source     -Fipackages/semver/source \
             -Fupackages/toml/source       -Fipackages/toml/source \
             -Fupackages/testing/source    -Fipackages/testing/source \
-            -Fu"$RTL_DIR" -Fu"$OBJPAS_DIR" -Fu"$GEN_DIR" -Fu"$FCL_DIR" -Fu"$PASZLIB_DIR" "${HASH_FLAGS[@]}" \
+            -Fu"$RTL_DIR" -Fu"$OBJPAS_DIR" -Fu"$GEN_DIR" -Fu"$FCL_DIR" -Fu"$PASZLIB_DIR" $HASH_FLAGS \
             -Fu"$FCL_BASE_SRC" -Fu"$FCL_NET_SRC" -Fu"$OPENSSL_SRC" \
             -FU"build/compiled" -FE"build" \
             $EXTRA_FLAGS \
