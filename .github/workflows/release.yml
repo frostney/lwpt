@@ -136,6 +136,7 @@ jobs:
           esac
 
           RTL_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl"
+          RTL_EXTRA_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-extra"
           OBJPAS_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-objpas"
           GEN_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-generics"
           FCL_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/fcl-process"
@@ -148,6 +149,11 @@ jobs:
           if [ -d "$HASH_DIR" ]; then
             HASH_FLAGS="-Fu${HASH_DIR}"
             echo "hash units: $(find "$HASH_DIR" -maxdepth 1 -name '*.ppu' | wc -l | tr -d ' ') .ppu files"
+          fi
+          RTL_EXTRA_FLAGS=""
+          if [ -d "$RTL_EXTRA_DIR" ]; then
+            RTL_EXTRA_FLAGS="-Fu${RTL_EXTRA_DIR}"
+            echo "rtl-extra units: $(find "$RTL_EXTRA_DIR" -maxdepth 1 -name '*.ppu' | wc -l | tr -d ' ') .ppu files"
           fi
 
           require_dir() {
@@ -186,7 +192,12 @@ jobs:
           fi
           case "$OS" in
             win32|win64) require_unit "$RTL_DIR" winsock2 ;;
-            *)           require_unit "$RTL_DIR" sockets ;;
+            *)
+              if [ ! -f "$RTL_DIR/sockets.ppu" ] && [ ! -f "$RTL_EXTRA_DIR/sockets.ppu" ]; then
+                echo "::error::Missing sockets.ppu in rtl/rtl-extra unit dirs for ${TARGET}"
+                exit 1
+              fi
+              ;;
           esac
 
           mkdir -p build/compiled
@@ -204,7 +215,7 @@ jobs:
             -Fupackages/semver/source     -Fipackages/semver/source \
             -Fupackages/toml/source       -Fipackages/toml/source \
             -Fupackages/testing/source    -Fipackages/testing/source \
-            -Fu"$RTL_DIR" -Fu"$OBJPAS_DIR" -Fu"$GEN_DIR" -Fu"$FCL_DIR" -Fu"$PASZLIB_DIR" $HASH_FLAGS \
+            -Fu"$RTL_DIR" $RTL_EXTRA_FLAGS -Fu"$OBJPAS_DIR" -Fu"$GEN_DIR" -Fu"$FCL_DIR" -Fu"$PASZLIB_DIR" $HASH_FLAGS \
             -Fu"$FCL_BASE_SRC" -Fu"$FCL_NET_SRC" -Fu"$OPENSSL_SRC" \
             -FU"build/compiled" -FE"build" \
             $EXTRA_FLAGS \

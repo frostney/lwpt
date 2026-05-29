@@ -37,7 +37,7 @@ The build steps:
 3. Download Linux crosslibs from `LongDirtyAnimAlf/fpcupdeluxe` (Ubuntu 22.04 amd64, Ubuntu 18.04 aarch64).
 4. Compile soft-float units (`softfpu`, `ufloatx80`, `sfpux80`) for the native RTL.
 5. Build cross-compilers `ppcrossx64` (x86_64 → for x86_64-darwin and x86_64-linux) and `ppcross386` (i386 → for i386-win32) by compiling `pp.pas` directly with the native `ppca64`.
-6. Build per-target cross-RTL + the packages LWPT needs for the non-native targets: `rtl`, `rtl-objpas` (variants/strutils/dateutils), `rtl-generics` (Generics.Collections), `fcl-process` (Process), `paszlib` (ZStream), and the platform-appropriate socket unit (Sockets on Unix/Darwin, WinSock2 on Windows). Native `aarch64-darwin` keeps Homebrew's package layout, including `hash/crc.ppu` for `ZStream`'s dependency closure.
+6. Build per-target cross-RTL + the packages LWPT needs for the non-native targets: `rtl`, `rtl-objpas` (variants/strutils/dateutils), `rtl-generics` (Generics.Collections), `fcl-process` (Process), `paszlib` (ZStream), and the platform-appropriate socket unit (Sockets on Unix/Darwin, WinSock2 on Windows). Native `aarch64-darwin` keeps Homebrew's package layout, including `hash/crc.ppu` for `ZStream`'s dependency closure and `rtl-extra/sockets.ppu` for socket APIs.
 7. Save the lot — `fpc-cross/`, `cross-binutils/`, `cross-libs/` — under the cache key `lwpt-fpc-cross-3.2.2-macos-arm64-v5`.
 
 The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a cache hit, the workflow exits in seconds with `Toolchain already cached — nothing to build.`.
