@@ -2526,6 +2526,7 @@ constructor TInstallLock.Create(const APath: string);
 const
   LOCKFILE_EXCLUSIVE_LOCK_LWPT = $00000002;
   LOCKFILE_FAIL_IMMEDIATELY_LWPT = $00000001;
+  LOCKFILE_LOCK_OFFSET_LWPT = 1024;
 var
   Holder, DstDir: string;
   SL: TStringList;
@@ -2565,6 +2566,7 @@ begin
   end;
 
   FillChar(Ov, SizeOf(Ov), 0);
+  Ov.Offset := LOCKFILE_LOCK_OFFSET_LWPT;
   if not Windows.LockFileEx(FHandle,
     LOCKFILE_EXCLUSIVE_LOCK_LWPT or LOCKFILE_FAIL_IMMEDIATELY_LWPT,
     0, 1, 0, Ov) then
@@ -2583,12 +2585,15 @@ begin
 end;
 
 destructor TInstallLock.Destroy;
+const
+  LOCKFILE_LOCK_OFFSET_LWPT = 1024;
 var
   Ov: TOverlapped;
 begin
   if FHandle <> THandle(Windows.INVALID_HANDLE_VALUE) then
   begin
     FillChar(Ov, SizeOf(Ov), 0);
+    Ov.Offset := LOCKFILE_LOCK_OFFSET_LWPT;
     Windows.UnlockFileEx(FHandle, 0, 1, 0, Ov);
     Windows.CloseHandle(FHandle);
     FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
@@ -4494,6 +4499,8 @@ begin
     AError := 'fpc failed to compile ' + AHook.Script;
     Exit(1);
   end;
+  if (not FileExists(Bin)) and FileExists(Bin + '.exe') then
+    Bin := Bin + '.exe';
   {$ENDIF}
 
   P := TProcess.Create(nil);
