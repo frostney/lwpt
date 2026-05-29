@@ -137,9 +137,15 @@ jobs:
           GEN_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-generics"
           FCL_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/fcl-process"
           PASZLIB_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/paszlib"
+          HASH_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/hash"
           FCL_BASE_SRC="$PREFIX/share/fpcsrc/packages/fcl-base/src"
           FCL_NET_SRC="$PREFIX/share/fpcsrc/packages/fcl-net/src"
           OPENSSL_SRC="$PREFIX/share/fpcsrc/packages/openssl/src"
+          HASH_FLAGS=()
+          if [ -d "$HASH_DIR" ]; then
+            HASH_FLAGS=(-Fu"$HASH_DIR")
+            echo "hash units: $(find "$HASH_DIR" -maxdepth 1 -name '*.ppu' | wc -l | tr -d ' ') .ppu files"
+          fi
 
           echo "RTL units: $(ls "$RTL_DIR"/*.ppu 2>/dev/null | wc -l) .ppu files"
           test -d "$OBJPAS_DIR"
@@ -160,9 +166,11 @@ jobs:
           for unit in process pipes; do
             test -f "$FCL_DIR/${unit}.ppu"
           done
-          for unit in zstream crc; do
-            test -f "$PASZLIB_DIR/${unit}.ppu"
-          done
+          test -f "$PASZLIB_DIR/zstream.ppu"
+          if [ ! -f "$PASZLIB_DIR/crc.ppu" ] && [ ! -f "$HASH_DIR/crc.ppu" ]; then
+            echo "::error::Missing crc.ppu in paszlib/hash unit dirs for ${TARGET}"
+            exit 1
+          fi
           case "$OS" in
             win32|win64) test -f "$RTL_DIR/winsock2.ppu" ;;
             *)           test -f "$RTL_DIR/sockets.ppu" ;;
@@ -183,7 +191,7 @@ jobs:
             -Fupackages/semver/source     -Fipackages/semver/source \
             -Fupackages/toml/source       -Fipackages/toml/source \
             -Fupackages/testing/source    -Fipackages/testing/source \
-            -Fu"$RTL_DIR" -Fu"$OBJPAS_DIR" -Fu"$GEN_DIR" -Fu"$FCL_DIR" -Fu"$PASZLIB_DIR" \
+            -Fu"$RTL_DIR" -Fu"$OBJPAS_DIR" -Fu"$GEN_DIR" -Fu"$FCL_DIR" -Fu"$PASZLIB_DIR" "${HASH_FLAGS[@]}" \
             -Fu"$FCL_BASE_SRC" -Fu"$FCL_NET_SRC" -Fu"$OPENSSL_SRC" \
             -FU"build/compiled" -FE"build" \
             $EXTRA_FLAGS \

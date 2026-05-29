@@ -19,11 +19,11 @@ Trigger split, mirroring GocciaScript's CI shape:
 
 ### `toolchain.yml` — cross-FPC toolchain build
 
-Runs on `macos-latest`. Builds a full cross-compilation FPC 3.2.2 toolchain covering six targets:
+Runs on `macos-latest`. Seeds native `aarch64-darwin` from Homebrew's FPC 3.2.2 install, then builds the cross-compilation toolchain and reduced unit slices needed for the non-native build targets:
 
 | Target | CPU | OS |
 | --- | --- | --- |
-| `aarch64-darwin` | `aarch64` | `darwin` (native on macos-arm64) |
+| `aarch64-darwin` | `aarch64` | `darwin` (native Homebrew-seeded units on macos-arm64) |
 | `x86_64-darwin` | `x86_64` | `darwin` |
 | `x86_64-linux` | `x86_64` | `linux` |
 | `aarch64-linux` | `aarch64` | `linux` |
@@ -37,8 +37,8 @@ The build steps:
 3. Download Linux crosslibs from `LongDirtyAnimAlf/fpcupdeluxe` (Ubuntu 22.04 amd64, Ubuntu 18.04 aarch64).
 4. Compile soft-float units (`softfpu`, `ufloatx80`, `sfpux80`) for the native RTL.
 5. Build cross-compilers `ppcrossx64` (x86_64 → for x86_64-darwin and x86_64-linux) and `ppcross386` (i386 → for i386-win32) by compiling `pp.pas` directly with the native `ppca64`.
-6. Build per-target cross-RTL + the packages LWPT needs: `rtl`, `rtl-objpas` (variants/strutils/dateutils), `rtl-generics` (Generics.Collections), `fcl-process` (Process), `paszlib` (ZStream), and the platform-appropriate socket unit (Sockets on Unix/Darwin, WinSock2 on Windows).
-7. Save the lot — `fpc-cross/`, `cross-binutils/`, `cross-libs/` — under the cache key `lwpt-fpc-cross-3.2.2-macos-arm64-v4`.
+6. Build per-target cross-RTL + the packages LWPT needs for the non-native targets: `rtl`, `rtl-objpas` (variants/strutils/dateutils), `rtl-generics` (Generics.Collections), `fcl-process` (Process), `paszlib` (ZStream), and the platform-appropriate socket unit (Sockets on Unix/Darwin, WinSock2 on Windows). Native `aarch64-darwin` keeps Homebrew's package layout, including `hash/crc.ppu` for `ZStream`'s dependency closure.
+7. Save the lot — `fpc-cross/`, `cross-binutils/`, `cross-libs/` — under the cache key `lwpt-fpc-cross-3.2.2-macos-arm64-v5`.
 
 The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a cache hit, the workflow exits in seconds with `Toolchain already cached — nothing to build.`.
 
@@ -149,7 +149,7 @@ A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` a
 
 ## When to bump `CACHE_VERSION`
 
-Bump `toolchain.yml`'s `CACHE_VERSION` env var (currently `v4`) when:
+Bump `toolchain.yml`'s `CACHE_VERSION` env var (currently `v5`) when:
 
 - FPC version changes
 - A new target is added to the matrix

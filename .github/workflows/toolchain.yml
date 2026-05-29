@@ -1,11 +1,11 @@
 name: Build Cross-Compilation Toolchain
 
 # Mirrors GocciaScript's toolchain.yml (the upstream of LWPT's vendored
-# units). One macos-latest job that compiles a full cross-FPC toolchain
-# for the six matrix targets (aarch64-darwin, x86_64-darwin, x86_64-linux,
-# aarch64-linux, x86_64-win64, i386-win32) and caches the result by
-# CACHE_VERSION. Bump CACHE_VERSION when changing the toolchain shape;
-# leaves the cached blob until then.
+# units). One macos-latest job that seeds the native aarch64-darwin FPC
+# from Homebrew, compiles the cross-FPC toolchain for the non-native
+# matrix targets, and caches the result by CACHE_VERSION. Bump
+# CACHE_VERSION when changing the toolchain shape; leaves the cached
+# blob until then.
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ on:
 env:
   FPC_VERSION: "3.2.2"
   BINUTILS_VERSION: "2.44"
-  CACHE_VERSION: "v4"
+  CACHE_VERSION: "v5"
 
 jobs:
   build:
@@ -399,9 +399,6 @@ jobs:
                 ;;
             esac
           }
-
-          # macOS aarch64
-          build_target aarch64 darwin
 
           # macOS x86_64
           build_target x86_64 darwin
