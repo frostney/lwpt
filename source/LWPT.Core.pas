@@ -2565,6 +2565,20 @@ begin
       [Holder]);
   end;
 
+  PidLine := AnsiString(IntToStr(GetProcessID)) + AnsiChar(#10);
+  if Length(PidLine) > 0 then
+    Windows.WriteFile(FHandle, PidLine[1], Length(PidLine),
+      BytesWritten, nil);
+  Windows.CloseHandle(FHandle);
+  FHandle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+    Windows.GENERIC_READ,
+    Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+      or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING,
+    Windows.FILE_ATTRIBUTE_NORMAL, 0);
+  if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
+    raise EConcurrencyError.CreateFmt(
+      'failed to reopen %s after creating the install lock', [APath]);
+
   FillChar(Ov, SizeOf(Ov), 0);
   Ov.Offset := LOCKFILE_LOCK_OFFSET_LWPT;
   if not Windows.LockFileEx(FHandle,
@@ -2577,11 +2591,6 @@ begin
     raise EConcurrencyError.Create(
       'another lwpt install is in progress. Try again when it finishes.');
   end;
-
-  PidLine := AnsiString(IntToStr(GetProcessID)) + AnsiChar(#10);
-  if Length(PidLine) > 0 then
-    Windows.WriteFile(FHandle, PidLine[1], Length(PidLine),
-      BytesWritten, nil);
 end;
 
 destructor TInstallLock.Destroy;
@@ -4501,6 +4510,7 @@ begin
   end;
   if (not FileExists(Bin)) and FileExists(Bin + '.exe') then
     Bin := Bin + '.exe';
+  Bin := NativePath(ExpandFileName(Bin));
   {$ENDIF}
 
   P := TProcess.Create(nil);
