@@ -307,10 +307,17 @@ jobs:
         if: matrix.fpc-install == 'choco'
         run: |
           choco install -y freepascal
-          # Add the FPC bin to PATH for subsequent steps. Chocolatey
-          # installs to a versioned dir under C:\fpc — find it.
-          FPC_BIN=$(find /c/fpc -name fpc.exe -type f 2>/dev/null | head -1)
+          # Add the FPC bin to PATH for subsequent steps. Chocolatey has
+          # used both C:\fpc and C:\tools\freepascal layouts over time.
+          FPC_BIN=""
+          for candidate_root in /c/tools/freepascal /c/fpc; do
+            if [ -d "$candidate_root" ]; then
+              FPC_BIN=$(find "$candidate_root" -name fpc.exe -type f 2>/dev/null | head -1)
+              if [ -n "$FPC_BIN" ]; then break; fi
+            fi
+          done
           if [ -z "$FPC_BIN" ]; then echo "::error::Chocolatey FPC install: fpc.exe not found"; exit 1; fi
+          echo "Using FPC at $FPC_BIN"
           echo "$(dirname "$FPC_BIN")" >> "$GITHUB_PATH"
 
       - name: Download lwpt artefact
