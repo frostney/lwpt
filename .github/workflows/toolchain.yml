@@ -17,7 +17,7 @@ on:
 env:
   FPC_VERSION: "3.2.2"
   BINUTILS_VERSION: "2.44"
-  CACHE_VERSION: "v3"
+  CACHE_VERSION: "v4"
 
 jobs:
   build:
@@ -108,6 +108,7 @@ jobs:
           cp "$(which fpcres)" "$PREFIX/bin/"
           cp "$BREW_FPC_LIB/ppca64" "$PREFIX/lib/fpc/${FPC_VERSION}/"
           cp -r "$BREW_FPC_LIB/units" "$PREFIX/lib/fpc/${FPC_VERSION}/"
+          chmod -R u+w "$PREFIX/lib/fpc/${FPC_VERSION}/units"
 
           # Keep official package sources available for cross builds.
           # LWPT needs fcl-base (Base64), fcl-net, and openssl (TransportSecurity).

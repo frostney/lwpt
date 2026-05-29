@@ -38,7 +38,7 @@ The build steps:
 4. Compile soft-float units (`softfpu`, `ufloatx80`, `sfpux80`) for the native RTL.
 5. Build cross-compilers `ppcrossx64` (x86_64 → for x86_64-darwin and x86_64-linux) and `ppcross386` (i386 → for i386-win32) by compiling `pp.pas` directly with the native `ppca64`.
 6. Build per-target cross-RTL + the packages LWPT needs: `rtl`, `rtl-objpas` (variants/strutils/dateutils), `rtl-generics` (Generics.Collections), `fcl-process` (Process), `paszlib` (ZStream), and the platform-appropriate socket unit (Sockets on Unix/Darwin, WinSock2 on Windows).
-7. Save the lot — `fpc-cross/`, `cross-binutils/`, `cross-libs/` — under the cache key `lwpt-fpc-cross-3.2.2-macos-arm64-v3`.
+7. Save the lot — `fpc-cross/`, `cross-binutils/`, `cross-libs/` — under the cache key `lwpt-fpc-cross-3.2.2-macos-arm64-v4`.
 
 The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a cache hit, the workflow exits in seconds with `Toolchain already cached — nothing to build.`.
 
@@ -149,7 +149,7 @@ A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` a
 
 ## When to bump `CACHE_VERSION`
 
-Bump `toolchain.yml`'s `CACHE_VERSION` env var (currently `v3`) when:
+Bump `toolchain.yml`'s `CACHE_VERSION` env var (currently `v4`) when:
 
 - FPC version changes
 - A new target is added to the matrix
