@@ -319,10 +319,10 @@ jobs:
           if [ -z "$FPC_BIN" ]; then echo "::error::Chocolatey FPC install: fpc.exe not found"; exit 1; fi
           echo "Using FPC at $FPC_BIN"
           echo "$(dirname "$FPC_BIN")" >> "$GITHUB_PATH"
-          echo "LWPT_FPC=$FPC_BIN" >> "$GITHUB_ENV"
+          echo "LWPT_FPC=$(cygpath -w "$FPC_BIN")" >> "$GITHUB_ENV"
           INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1)
           if [ -n "$INSTANTFPC_BIN" ]; then
-            echo "LWPT_INSTANTFPC=$INSTANTFPC_BIN" >> "$GITHUB_ENV"
+            echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
           fi
           FPC_UNIT_PATHS=""
           for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do

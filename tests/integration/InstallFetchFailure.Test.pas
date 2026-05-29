@@ -128,6 +128,9 @@ begin
   FScratch := ExpandFileName('build/tests/tmp/install-fetch-failure-e2e');
   FRoot    := FScratch + '/root';
   FMissingDep := FScratch + '/this-path-does-not-exist';
+  {$IFDEF MSWINDOWS}
+  FMissingDep := StringReplace(FMissingDep, '\', '/', [rfReplaceAll]);
+  {$ENDIF}
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
   RecursiveDelete(FScratch);
   ForceDirectories(FScratch);

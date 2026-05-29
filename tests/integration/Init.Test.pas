@@ -80,6 +80,14 @@ begin
   end;
 end;
 
+function ExpectedExe(const APath: string): string;
+begin
+  Result := APath;
+  {$IFDEF MSWINDOWS}
+  if ExtractFileExt(Result) = '' then Result := Result + '.exe';
+  {$ENDIF}
+end;
+
 procedure WriteText(const APath, AContent: string);
 var SL: TStringList;
 begin
@@ -187,7 +195,7 @@ begin
     WriteLn('--- build stderr ---'#10, R.Stderr, #10'---');
   Expect<Integer>(R.ExitCode).ToBe(0);
   Exe := FScratch + '/build/my-project';
-  Expect<Boolean>(FileExists(Exe)).ToBe(True);
+  Expect<Boolean>(FileExists(ExpectedExe(Exe))).ToBe(True);
 end;
 
 procedure TInitCommand.TestSecondInitWithoutForceRejects;

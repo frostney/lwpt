@@ -360,21 +360,22 @@ function  SHA256Hex(const AData: TBytes): string;
 procedure VerifyAgainstLockfile(const AResolved: array of TResolved;
   const ALockEntries: array of TResolved);
 
-{ Cross-process install lock (ADR-0002 idempotency consequences). Flock-
-  based on Unix; the lock auto-releases on FD close (process exit), so
-  there's no stale-lock cleanup problem to solve. Construct at the top
-  of a write-sensitive operation; destroy releases. EConcurrencyError
-  if another process holds the lock. A later cycle will add the Windows path.
+{ Cross-process install lock (ADR-0002 idempotency consequences).
+  Construct at the top of a write-sensitive operation; destroy releases.
+  EConcurrencyError if another process holds the lock.
 
-  The lock file holds the holder's PID as a single line of text — used
-  only for diagnostics in the error message (the real synchronization
-  is flock-based, not PID-based). }
+  The lock file holds the holder's PID as a single line of text for
+  diagnostics. File existence is also the stale-lock signal after a crash;
+  `lwpt repair` clears it. }
 type
   TInstallLock = class
   private
     FPath: string;
     {$IFDEF UNIX}
     FFD: LongInt;
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    FHandle: THandle;
     {$ENDIF}
   public
     constructor Create(const APath: string);
@@ -440,6 +441,14 @@ begin
       end;
       StartAt := i + 1;
     end;
+end;
+
+function NativePath(const APath: string): string;
+begin
+  Result := APath;
+  {$IFDEF MSWINDOWS}
+  Result := StringReplace(Result, '/', DirectorySeparator, [rfReplaceAll]);
+  {$ENDIF}
 end;
 
 { ===========================================================================
@@ -591,6 +600,14 @@ begin
         and (Copy(AHaystack, 1, Length(ANeedle)) = ANeedle);
 end;
 
+function LooksLikeWindowsAbsolutePath(const S: string): Boolean; inline;
+begin
+  Result := (Length(S) >= 3)
+        and (S[1] in ['a'..'z', 'A'..'Z'])
+        and (S[2] = ':')
+        and ((S[3] = '/') or (S[3] = '\'));
+end;
+
 function LooksLikeOwnerRepo(const S: string): Boolean;
 var i, Slashes: Integer;
 begin
@@ -629,7 +646,8 @@ begin
   if StartsWithStr(ASource, './')
      or StartsWithStr(ASource, '../')
      or StartsWithStr(ASource, '/')
-     or StartsWithStr(ASource, '~/') then
+     or StartsWithStr(ASource, '~/')
+     or LooksLikeWindowsAbsolutePath(ASource) then
   begin
     AKind := skLocal; ALocator := ASource; Exit;
   end;
@@ -2505,16 +2523,76 @@ begin
 end;
 {$ELSE}
 constructor TInstallLock.Create(const APath: string);
+const
+  LOCKFILE_EXCLUSIVE_LOCK_LWPT = $00000002;
+  LOCKFILE_FAIL_IMMEDIATELY_LWPT = $00000001;
+var
+  Holder, DstDir: string;
+  SL: TStringList;
+  PidLine: AnsiString;
+  BytesWritten: DWORD;
+  Ov: TOverlapped;
 begin
   FPath := APath;
-  { Windows path lands in a later cycle. For now: no-op. Concurrency control on
-    Windows v1 is "convention only" — a second concurrent install
-    could overwrite the first's work. CI on Windows will adopt
-    LockFileEx and turn this into a real lock. }
+  FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
+  DstDir := ExtractFileDir(APath);
+  if DstDir <> '' then ForceDirectories(DstDir);
+
+  FHandle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+    Windows.GENERIC_READ or Windows.GENERIC_WRITE,
+    Windows.FILE_SHARE_READ, nil, Windows.CREATE_NEW,
+    Windows.FILE_ATTRIBUTE_NORMAL, 0);
+  if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
+  begin
+    Holder := 'unknown';
+    if FileExists(APath) then
+    begin
+      SL := TStringList.Create;
+      try
+        SL.LoadFromFile(APath);
+        if SL.Count > 0 then Holder := Trim(SL[0]);
+      finally
+        SL.Free;
+      end;
+    end;
+    raise EConcurrencyError.CreateFmt(
+      'another lwpt install is in progress (lock holder PID: %s) — '
+      + 'or the previous install crashed without releasing the lock. '
+      + 'If you''re certain no other process is running, '
+      + 'run `lwpt repair` to clear the stale lock.',
+      [Holder]);
+  end;
+
+  FillChar(Ov, SizeOf(Ov), 0);
+  if not Windows.LockFileEx(FHandle,
+    LOCKFILE_EXCLUSIVE_LOCK_LWPT or LOCKFILE_FAIL_IMMEDIATELY_LWPT,
+    0, 1, 0, Ov) then
+  begin
+    Windows.CloseHandle(FHandle);
+    FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
+    DeleteFile(FPath);
+    raise EConcurrencyError.Create(
+      'another lwpt install is in progress. Try again when it finishes.');
+  end;
+
+  PidLine := AnsiString(IntToStr(GetProcessID)) + AnsiChar(#10);
+  if Length(PidLine) > 0 then
+    Windows.WriteFile(FHandle, PidLine[1], Length(PidLine),
+      BytesWritten, nil);
 end;
 
 destructor TInstallLock.Destroy;
+var
+  Ov: TOverlapped;
 begin
+  if FHandle <> THandle(Windows.INVALID_HANDLE_VALUE) then
+  begin
+    FillChar(Ov, SizeOf(Ov), 0);
+    Windows.UnlockFileEx(FHandle, 0, 1, 0, Ov);
+    Windows.CloseHandle(FHandle);
+    FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
+    DeleteFile(FPath);
+  end;
   inherited Destroy;
 end;
 {$ENDIF}
@@ -3035,7 +3113,7 @@ begin
         Continue;
       end;
 
-      OutName := IncludeTrailingPathDelimiter(ADest) + RelName;
+      OutName := NativePath(IncludeTrailingPathDelimiter(ADest) + RelName);
 
       case Chr(TypeFlag) of
         '5':   { directory }
@@ -5100,7 +5178,8 @@ begin
   SetLength(Wanted, 3);
   Wanted[0] := '.lwpt/tmp/';
   Wanted[1] := '.lwpt/install.lock';
-  Wanted[2] := IncludeTrailingPathDelimiter(ABuildDir);
+  Wanted[2] := StringReplace(IncludeTrailingPathDelimiter(ABuildDir),
+    DirectorySeparator, '/', [rfReplaceAll]);
   Existed := FileExists(APath);
   SL := TStringList.Create;
   try

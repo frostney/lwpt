@@ -292,10 +292,9 @@ begin
   try
     P.Executable := 'cmd.exe';
     P.Parameters.Add('/C');
-    P.Parameters.Add('mklink');
-    P.Parameters.Add('/J');
-    P.Parameters.Add(ModulePath);
-    P.Parameters.Add(TargetPath);
+    P.Parameters.Add('mklink /J "' +
+      StringReplace(ModulePath, '/', '\', [rfReplaceAll]) + '" "' +
+      StringReplace(TargetPath, '/', '\', [rfReplaceAll]) + '"');
     P.Options := [poWaitOnExit];
     P.Execute;
     Expect<Integer>(P.ExitStatus).ToBe(0);

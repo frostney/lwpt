@@ -65,7 +65,6 @@ end;
 procedure THooksE2E.WriteSentinelScript(const APath, ASentinelName: string);
 begin
   WriteFile(APath,
-    '#!/usr/bin/env instantfpc'#10 +
     'program TouchSentinel;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'uses SysUtils, Classes;'#10 +

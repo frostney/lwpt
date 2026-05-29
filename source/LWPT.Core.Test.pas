@@ -116,6 +116,7 @@ type
     procedure TestLocalDotSlashPath;
     procedure TestLocalParentSlashPath;
     procedure TestLocalAbsolutePath;
+    procedure TestLocalWindowsAbsolutePath;
     procedure TestLocalTildeSlashPath;
     procedure TestLocalExplicitPrefix;
     procedure TestEmptyStringRejected;
@@ -1107,6 +1108,12 @@ begin
   ExpectSource('/abs/path', skLocal, hkGitHub, '/abs/path', Self);
 end;
 
+procedure TParseDependencySource.TestLocalWindowsAbsolutePath;
+begin
+  ExpectSource('C:/work/dep', skLocal, hkGitHub, 'C:/work/dep', Self);
+  ExpectSource('C:\work\dep', skLocal, hkGitHub, 'C:\work\dep', Self);
+end;
+
 procedure TParseDependencySource.TestLocalTildeSlashPath;
 begin
   ExpectSource('~/lib/foo', skLocal, hkGitHub, '~/lib/foo', Self);
@@ -1145,6 +1152,8 @@ begin
   Test('"./path" implicit local', TestLocalDotSlashPath);
   Test('"../path" implicit local', TestLocalParentSlashPath);
   Test('"/abs/path" absolute implicit local', TestLocalAbsolutePath);
+  Test('"C:/path" Windows absolute implicit local',
+    TestLocalWindowsAbsolutePath);
   Test('"~/path" HOME-relative implicit local', TestLocalTildeSlashPath);
   Test('"local:./path" explicit prefix', TestLocalExplicitPrefix);
   Test('empty string rejected', TestEmptyStringRejected);

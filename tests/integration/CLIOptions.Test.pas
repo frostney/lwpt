@@ -90,6 +90,14 @@ begin
   RemoveDir(APath);
 end;
 
+function ExpectedExe(const APath: string): string;
+begin
+  Result := APath;
+  {$IFDEF MSWINDOWS}
+  if ExtractFileExt(Result) = '' then Result := Result + '.exe';
+  {$ENDIF}
+end;
+
 procedure TCLIOptionsE2E.SetupScratchProject;
 begin
   ForceDirectories(FScratch + '/source');
@@ -186,7 +194,7 @@ begin
     behaviour against regression. }
   R := RunLwpt(['build', 'hello', '--mode', 'release'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(FileExists(FScratch + '/build/hello')).ToBe(True);
+  Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/hello'))).ToBe(True);
 end;
 
 procedure TCLIOptionsE2E.TestBuildModeEqualsSeparatedValueParses;
@@ -197,7 +205,7 @@ begin
     is a parser regression. }
   R := RunLwpt(['build', 'hello', '--mode=release'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(FileExists(FScratch + '/build/hello')).ToBe(True);
+  Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/hello'))).ToBe(True);
 end;
 
 procedure TCLIOptionsE2E.TestBuildModeInvalidValueExitsNonZero;

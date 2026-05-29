@@ -95,7 +95,6 @@ begin
     asserts on both. The marker proves the script ran; the exit code
     proves `lwpt run` propagates it. }
   WriteFile(FScratch + '/scripts/hello.pas',
-    '#!/usr/bin/env instantfpc'#10 +
     'program Hello;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'uses SysUtils, Classes;'#10 +
