@@ -319,6 +319,11 @@ jobs:
           if [ -z "$FPC_BIN" ]; then echo "::error::Chocolatey FPC install: fpc.exe not found"; exit 1; fi
           echo "Using FPC at $FPC_BIN"
           echo "$(dirname "$FPC_BIN")" >> "$GITHUB_PATH"
+          echo "LWPT_FPC=$FPC_BIN" >> "$GITHUB_ENV"
+          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1)
+          if [ -n "$INSTANTFPC_BIN" ]; then
+            echo "LWPT_INSTANTFPC=$INSTANTFPC_BIN" >> "$GITHUB_ENV"
+          fi
 
       - name: Download lwpt artefact
         uses: actions/download-artifact@v8

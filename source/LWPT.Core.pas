@@ -391,6 +391,34 @@ procedure ExpandFormatPattern(const APattern: string; AList: TStringList;
 
 implementation
 
+function FPCExecutable: string;
+begin
+  Result := GetEnvironmentVariable('LWPT_FPC');
+  if Result = '' then
+    Result := GetEnvironmentVariable('FPC');
+  if Result <> '' then
+    Exit;
+  {$IFDEF MSWINDOWS}
+  Result := 'fpc.exe';
+  {$ELSE}
+  Result := 'fpc';
+  {$ENDIF}
+end;
+
+function InstantFPCExecutable: string;
+begin
+  Result := GetEnvironmentVariable('LWPT_INSTANTFPC');
+  if Result = '' then
+    Result := GetEnvironmentVariable('INSTANTFPC');
+  if Result <> '' then
+    Exit;
+  {$IFDEF MSWINDOWS}
+  Result := 'instantfpc.exe';
+  {$ELSE}
+  Result := 'instantfpc';
+  {$ENDIF}
+end;
+
 { ===========================================================================
   TOML helpers — manifest + lockfile readers used to drive their
   own partial reader (TTomlReader / TTomlNode record); after the
@@ -4102,7 +4130,7 @@ begin
 
   P := TProcess.Create(nil);
   try
-    P.Executable := 'fpc';
+    P.Executable := FPCExecutable;
     (* Deliberately NOT forcing -M<mode>: each source sets its own mode
        via {$I Shared.inc} or an explicit {$mode delphi}{$H+} header.
        Forcing a mode here would conflict with future vendored test
@@ -4369,7 +4397,7 @@ begin
 
     P := TProcess.Create(nil);
     try
-      P.Executable := 'instantfpc';
+      P.Executable := InstantFPCExecutable;
       P.Parameters.Add(H.Script);
       for j := 0 to High(H.Args) do
         P.Parameters.Add(H.Args[j]);
@@ -4456,7 +4484,7 @@ begin
 
   P := TProcess.Create(nil);
   try
-    P.Executable := 'fpc';
+    P.Executable := FPCExecutable;
     { cross-compile target CPU via env var, same hook as build.pas }
     Arch := GetEnvironmentVariable('FPC_TARGET_CPU');
     if Arch <> '' then P.Parameters.Add('-P' + Arch);
@@ -5260,7 +5288,7 @@ begin
   end;
   P := TProcess.Create(nil);
   try
-    P.Executable := 'instantfpc';
+    P.Executable := InstantFPCExecutable;
     P.Parameters.Add(AHook.Script);
     for j := 0 to High(AHook.Args) do
       P.Parameters.Add(AHook.Args[j]);
