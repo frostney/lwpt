@@ -4085,6 +4085,7 @@ function TestBuildDir(const ASrcFile: string): string;
 var Sanitised: string;
 begin
   Sanitised := ChangeFileExt(ASrcFile, '');
+  Sanitised := StringReplace(Sanitised, ':', '_', [rfReplaceAll]);
   Sanitised := StringReplace(Sanitised, '/', '_', [rfReplaceAll]);
   Sanitised := StringReplace(Sanitised, '\', '_', [rfReplaceAll]);
   Result := 'build/tests/' + Sanitised;
@@ -4188,8 +4189,11 @@ end;
   bypasses the skip. The other tiers (unit + integration) always run.
   See docs/testing.md for the policy table. }
 function IsE2ETestPath(const APath: string): Boolean; inline;
+var Normalised: string;
 begin
-  Result := Pos('tests/e2e/', APath) > 0;
+  Normalised := StringReplace(APath, '\', '/', [rfReplaceAll]);
+  Result := (Pos('/tests/e2e/', Normalised) > 0)
+         or (Pos('tests/e2e/', Normalised) = 1);
 end;
 
 function CmdTest(const AManifestPath: string; AIncludeE2E: Boolean): Integer;
