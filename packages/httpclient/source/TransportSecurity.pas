@@ -667,6 +667,7 @@ const
   SCH_USE_STRONG_CRYPTO = $00400000;
   SCHANNEL_SHUTDOWN = 1;
   SECURITY_NATIVE_DREP = $00000010;
+  SP_PROT_TLS1_2_CLIENT = $00000800;
   UNISP_NAME = 'Microsoft Unified Security Protocol Provider';
 
 function AcquireCredentialsHandleW(APrincipal: PWideChar; APackage: PWideChar;
@@ -775,6 +776,7 @@ begin
 
   FillChar(Credential, SizeOf(Credential), 0);
   Credential.dwVersion := SCHANNEL_CRED_VERSION;
+  Credential.grbitEnabledProtocols := SP_PROT_TLS1_2_CLIENT;
   Credential.dwFlags := SCH_USE_STRONG_CRYPTO;
 
   Status := AcquireCredentialsHandleW(nil, PWideChar(WideString(UNISP_NAME)),
