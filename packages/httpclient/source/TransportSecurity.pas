@@ -660,10 +660,8 @@ const
   ISC_REQ_REPLAY_DETECT = $00000004;
   ISC_REQ_CONFIDENTIALITY = $00000010;
   ISC_REQ_EXTENDED_ERROR = $00004000;
-  ISC_REQ_USE_SUPPLIED_CREDS = $00000080;
   ISC_REQ_ALLOCATE_MEMORY = $00000100;
   ISC_REQ_STREAM = $00008000;
-  SP_PROT_TLS1_2_CLIENT = $00000800;
   SCHANNEL_CRED_VERSION = 4;
   SCH_USE_STRONG_CRYPTO = $00400000;
   SCHANNEL_SHUTDOWN = 1;
@@ -807,7 +805,6 @@ begin
   FillChar(Credential, SizeOf(Credential), 0);
   Credential.dwVersion := SCHANNEL_CRED_VERSION;
   Credential.dwFlags := SCH_USE_STRONG_CRYPTO;
-  Credential.grbitEnabledProtocols := SP_PROT_TLS1_2_CLIENT;
 
   Status := AcquireCredentialsHandleW(nil, PWideChar(WideString(UNISP_NAME)),
     SECPKG_CRED_OUTBOUND, nil, @Credential, nil, nil, @Data.Credential,
@@ -858,13 +855,6 @@ begin
       if Assigned(OutputBuffer.pvBuffer) then
         FreeContextBuffer(OutputBuffer.pvBuffer);
 
-      if (InputDescPointer <> nil) and
-         (SecBufferKind(InputBuffers[1].BufferType) = SECBUFFER_EXTRA) then
-        PreserveExtraBytes(Data.EncryptedInput, InputBuffers[1].pvBuffer,
-          InputBuffers[1].cbBuffer)
-      else
-        SetLength(Data.EncryptedInput, 0);
-
       if Status = SEC_E_INCOMPLETE_MESSAGE then
       begin
         ReceiveCount := ReceiveIntoBuffer(Data.Socket, Data.EncryptedInput);
@@ -874,6 +864,13 @@ begin
           raise ETransportSecurityError.Create(TLS_HANDSHAKE_ERROR);
         Continue;
       end;
+
+      if (InputDescPointer <> nil) and
+         (SecBufferKind(InputBuffers[1].BufferType) = SECBUFFER_EXTRA) then
+        PreserveExtraBytes(Data.EncryptedInput, InputBuffers[1].pvBuffer,
+          InputBuffers[1].cbBuffer)
+      else
+        SetLength(Data.EncryptedInput, 0);
 
       if Status = SEC_I_INCOMPLETE_CREDENTIALS then
         raise ETransportSecurityError.Create(TLS_HANDSHAKE_ERROR);
