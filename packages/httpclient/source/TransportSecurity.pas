@@ -706,6 +706,8 @@ var
 begin
   if ALength <= 0 then
     Exit;
+  if not Assigned(ASource) then
+    raise ETransportSecurityError.Create('SChannel returned a byte buffer without a pointer');
   PreviousLength := Length(ATarget);
   SetLength(ATarget, PreviousLength + ALength);
   Move(ASource^, ATarget[PreviousLength], ALength);
@@ -722,6 +724,8 @@ begin
     Exit;
   end;
 
+  if not Assigned(ASource) then
+    raise ETransportSecurityError.Create('SChannel returned extra bytes without a pointer');
   SetLength(Temporary, ALength);
   Move(ASource^, Temporary[0], ALength);
   ATarget := Temporary;
@@ -945,6 +949,7 @@ var
   I: Integer;
   ReceiveCount: Integer;
   ExtraInput: TBytes;
+  ContextExpired: Boolean;
 begin
   Data := TSChannelData(AConnection.BackendData);
 
@@ -1002,14 +1007,10 @@ begin
       end;
       Continue;
     end;
-    if Status = SEC_I_CONTEXT_EXPIRED then
-    begin
-      Result := 0;
-      Exit;
-    end;
     if Status = SEC_I_RENEGOTIATE then
       raise ETransportSecurityError.Create('SChannel renegotiation is not supported');
-    if Status <> SEC_E_OK then
+    ContextExpired := Status = SEC_I_CONTEXT_EXPIRED;
+    if (Status <> SEC_E_OK) and not ContextExpired then
       raise ETransportSecurityError.CreateFmt('%s: 0x%x',
         [TLS_READ_ERROR, LongWord(Status)]);
 
@@ -1035,6 +1036,12 @@ begin
       Result := Min(Available, ALength);
       Move(Data.DecryptedInput[0], ABuffer[0], Result);
       Data.DecryptedOffset := Result;
+      Exit;
+    end;
+
+    if ContextExpired then
+    begin
+      Result := 0;
       Exit;
     end;
   end;
