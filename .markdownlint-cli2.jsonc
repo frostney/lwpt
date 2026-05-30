@@ -25,6 +25,8 @@
     "build/",
     "node_modules/",
     ".lwpt/",
+    ".agents/",
+    ".claude/",
     "CHANGELOG.md"
   ]
 }
