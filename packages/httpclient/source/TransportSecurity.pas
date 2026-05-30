@@ -951,6 +951,7 @@ var
   QualityOfProtection: LongWord;
   I: Integer;
   ReceiveCount: Integer;
+  ExtraInput: TBytes;
 begin
   Data := TSChannelData(AConnection.BackendData);
 
@@ -1026,11 +1027,14 @@ begin
         AppendBytes(Data.DecryptedInput, Buffers[I].pvBuffer,
           Buffers[I].cbBuffer);
 
-    SetLength(Data.EncryptedInput, 0);
+    { SECBUFFER_EXTRA points into Data.EncryptedInput, so copy it
+      before replacing the array that owns those bytes. }
+    SetLength(ExtraInput, 0);
     for I := 0 to High(Buffers) do
       if Buffers[I].BufferType = SECBUFFER_EXTRA then
-        PreserveExtraBytes(Data.EncryptedInput, Buffers[I].pvBuffer,
+        AppendBytes(ExtraInput, Buffers[I].pvBuffer,
           Buffers[I].cbBuffer);
+    Data.EncryptedInput := ExtraInput;
 
     Available := Length(Data.DecryptedInput);
     if Available > 0 then
