@@ -549,6 +549,8 @@ begin
         if N <= 0 then begin Done := True; Break; end;
         AppendRawBytes(ChunkBuf, Buf[0], N); { Byte-safe — Copy(PAnsiChar) would truncate at the first #0 }
       end;
+      if Done then
+        raise EHTTPError.Create('Invalid HTTP response: truncated chunked body');
 
       BodyLen := Length(Result.Body);
       SetLength(Result.Body, BodyLen + ChunkSize);

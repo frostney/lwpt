@@ -171,6 +171,7 @@ The original 10-file backlog from the handoff is in place: tier-0 + the headline
 | **`tests/e2e/InstallGitHub.E2E.Test.pas`** | 6 tests in 1 suite | Live GitHub fetch of `octocat/Hello-World @ 7fd1a60b…` — the most stable public git ref in existence. Install exits zero, modules tree extracts under `.lwpt/modules/`, archive caches under `.lwpt/archives/<dep>-<ref>.tar.gz`, lockfile records both `archiveHash` and `computedHash`, `--frozen` re-verifies without network, **and** `--frozen` detects an archive byte-tamper (the archive-mismatch path the local-only diamond fixture cannot reach). Honors `LWPT_SKIP_NETWORK=1`. |
 | **`tests/e2e/InstallGitLab.E2E.Test.pas`** | 4 tests in 1 suite | Live GitLab fetch of `gitlab-org/release-cli @ v0.16.0`. Validates the GitLab archive-URL pattern in `FetchURL`. Same shape as the GitHub suite: install exit / modules dir / lockfile contents / frozen reverify. Honors `LWPT_SKIP_NETWORK=1`. |
 | **`tests/e2e/InstallBitbucket.E2E.Test.pas`** | 4 tests in 1 suite | Live Bitbucket fetch of `atlassian/atlaskit @ d7ac1acad54e…`. Validates the Bitbucket archive-URL pattern. Bitbucket strips the top-level dir hash-suffixed; `StripFirstComponent` handles it. Honors `LWPT_SKIP_NETWORK=1`. |
+| **`tests/e2e/InstallDirectArchivesWindows.E2E.Test.pas`** | 3 tests in 1 suite | Windows-only live fetch of direct GitHub codeload + GitLab archive URLs through `lwpt install`. Bypasses source-kind URL construction so the suite specifically exercises the SChannel archive-body read path that previously corrupted `SECBUFFER_EXTRA` leftovers. Honors `LWPT_SKIP_NETWORK=1` and self-skips on non-Windows hosts. |
 
 ### Supporting infrastructure
 
@@ -186,10 +187,10 @@ The original 10-file backlog from the handoff is in place: tier-0 + the headline
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas`) | 5 | 87 |
-| Integration (`tests/integration/*.Test.pas`) | 5 | 34 |
-| E2E (`tests/e2e/*.E2E.Test.pas`) | 3 | 14 |
-| **Total** | **13** | **135** |
+| Unit / package (`source/*.Test.pas`, `packages/*/source/*.Test.pas`) | 5 | 127 |
+| Integration (`tests/integration/*.Test.pas`) | 9 | 51 |
+| E2E (`tests/e2e/*.E2E.Test.pas`) | 4 | 17 |
+| **Total** | **18** | **195** |
 
 ### Deferred to v1.x
 

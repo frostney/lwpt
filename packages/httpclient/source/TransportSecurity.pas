@@ -660,7 +660,6 @@ const
   ISC_REQ_REPLAY_DETECT = $00000004;
   ISC_REQ_CONFIDENTIALITY = $00000010;
   ISC_REQ_EXTENDED_ERROR = $00004000;
-  ISC_REQ_USE_SUPPLIED_CREDS = $00000080;
   ISC_REQ_ALLOCATE_MEMORY = $00000100;
   ISC_REQ_STREAM = $00008000;
   SCHANNEL_CRED_VERSION = 4;
@@ -668,6 +667,7 @@ const
   SCHANNEL_SHUTDOWN = 1;
   SECURITY_NATIVE_DREP = $00000010;
   UNISP_NAME = 'Microsoft Unified Security Protocol Provider';
+  SECBUFFER_ATTRMASK = $F0000000;
 
 function AcquireCredentialsHandleW(APrincipal: PWideChar; APackage: PWideChar;
   ACredentialUse: LongWord; ALogonId: Pointer; AAuthData: Pointer;
@@ -699,6 +699,11 @@ function DeleteSecurityContext(AContext: PCtxtHandle): SECURITY_STATUS; stdcall;
 function FreeCredentialsHandle(ACredential: PCredHandle): SECURITY_STATUS; stdcall;
   external 'secur32.dll' name 'FreeCredentialsHandle';
 
+function SecBufferKind(const ABufferType: LongWord): LongWord; inline;
+begin
+  Result := ABufferType and not SECBUFFER_ATTRMASK;
+end;
+
 procedure AppendBytes(var ATarget: TBytes; const ASource: Pointer;
   const ALength: Integer);
 var
@@ -706,9 +711,33 @@ var
 begin
   if ALength <= 0 then
     Exit;
+  if not Assigned(ASource) then
+    raise ETransportSecurityError.Create('SChannel returned a byte buffer without a pointer');
   PreviousLength := Length(ATarget);
   SetLength(ATarget, PreviousLength + ALength);
   Move(ASource^, ATarget[PreviousLength], ALength);
+end;
+
+procedure AppendExtraBytes(var ATarget: TBytes; const AInput: TBytes;
+  const ASource: Pointer; const ALength: Integer);
+var
+  PreviousLength: Integer;
+  SourceOffset: Integer;
+begin
+  if ALength <= 0 then
+    Exit;
+
+  PreviousLength := Length(ATarget);
+  SetLength(ATarget, PreviousLength + ALength);
+  if Assigned(ASource) then
+    Move(ASource^, ATarget[PreviousLength], ALength)
+  else
+  begin
+    if ALength > Length(AInput) then
+      raise ETransportSecurityError.Create('SChannel reported extra bytes outside the input buffer');
+    SourceOffset := Length(AInput) - ALength;
+    Move(AInput[SourceOffset], ATarget[PreviousLength], ALength);
+  end;
 end;
 
 procedure PreserveExtraBytes(var ATarget: TBytes; const ASource: Pointer;
@@ -722,8 +751,8 @@ begin
     Exit;
   end;
 
-  SetLength(Temporary, ALength);
-  Move(ASource^, Temporary[0], ALength);
+  SetLength(Temporary, 0);
+  AppendExtraBytes(Temporary, ATarget, ASource, ALength);
   ATarget := Temporary;
 end;
 
@@ -746,7 +775,7 @@ function SChannelRequestFlags: LongWord;
 begin
   Result := ISC_REQ_SEQUENCE_DETECT or ISC_REQ_REPLAY_DETECT or
     ISC_REQ_CONFIDENTIALITY or ISC_REQ_EXTENDED_ERROR or
-    ISC_REQ_USE_SUPPLIED_CREDS or ISC_REQ_ALLOCATE_MEMORY or ISC_REQ_STREAM;
+    ISC_REQ_ALLOCATE_MEMORY or ISC_REQ_STREAM;
 end;
 
 procedure StartSChannel(var AConnection: TTransportSecurityConnection;
@@ -826,12 +855,6 @@ begin
       if Assigned(OutputBuffer.pvBuffer) then
         FreeContextBuffer(OutputBuffer.pvBuffer);
 
-      if (InputDescPointer <> nil) and (InputBuffers[1].BufferType = SECBUFFER_EXTRA) then
-        PreserveExtraBytes(Data.EncryptedInput, InputBuffers[1].pvBuffer,
-          InputBuffers[1].cbBuffer)
-      else
-        SetLength(Data.EncryptedInput, 0);
-
       if Status = SEC_E_INCOMPLETE_MESSAGE then
       begin
         ReceiveCount := ReceiveIntoBuffer(Data.Socket, Data.EncryptedInput);
@@ -841,6 +864,13 @@ begin
           raise ETransportSecurityError.Create(TLS_HANDSHAKE_ERROR);
         Continue;
       end;
+
+      if (InputDescPointer <> nil) and
+         (SecBufferKind(InputBuffers[1].BufferType) = SECBUFFER_EXTRA) then
+        PreserveExtraBytes(Data.EncryptedInput, InputBuffers[1].pvBuffer,
+          InputBuffers[1].cbBuffer)
+      else
+        SetLength(Data.EncryptedInput, 0);
 
       if Status = SEC_I_INCOMPLETE_CREDENTIALS then
         raise ETransportSecurityError.Create(TLS_HANDSHAKE_ERROR);
@@ -887,8 +917,6 @@ var
   ShutdownToken: LongWord;
   ShutdownBuffer: TSecBuffer;
   ShutdownDesc: TSecBufferDesc;
-  InputBuffer: TSecBuffer;
-  InputDesc: TSecBufferDesc;
   OutputBuffer: TSecBuffer;
   OutputDesc: TSecBufferDesc;
   Status: SECURITY_STATUS;
@@ -907,15 +935,9 @@ begin
       ShutdownDesc.ulVersion := SECBUFFER_VERSION;
       ShutdownDesc.cBuffers := 1;
       ShutdownDesc.pBuffers := @ShutdownBuffer;
-      ApplyControlToken(@Data.Context, @ShutdownDesc);
-
-      repeat
-        FillChar(InputBuffer, SizeOf(InputBuffer), 0);
-        InputBuffer.BufferType := SECBUFFER_EMPTY;
-        InputDesc.ulVersion := SECBUFFER_VERSION;
-        InputDesc.cBuffers := 1;
-        InputDesc.pBuffers := @InputBuffer;
-
+      Status := ApplyControlToken(@Data.Context, @ShutdownDesc);
+      if Status = SEC_E_OK then
+      begin
         FillChar(OutputBuffer, SizeOf(OutputBuffer), 0);
         OutputBuffer.BufferType := SECBUFFER_TOKEN;
         FillChar(OutputDesc, SizeOf(OutputDesc), 0);
@@ -924,14 +946,15 @@ begin
         OutputDesc.pBuffers := @OutputBuffer;
 
         Status := InitializeSecurityContextW(@Data.Credential, @Data.Context,
-          nil, SChannelRequestFlags, 0, SECURITY_NATIVE_DREP, @InputDesc, 0,
+          nil, SChannelRequestFlags, 0, SECURITY_NATIVE_DREP, nil, 0,
           @Data.Context, @OutputDesc, @ContextAttributes, @Expiry);
 
-        SendSChannelToken(Data.Socket, OutputBuffer);
+        if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) or
+           (Status = SEC_I_CONTEXT_EXPIRED) then
+          SendSChannelToken(Data.Socket, OutputBuffer);
         if Assigned(OutputBuffer.pvBuffer) then
           FreeContextBuffer(OutputBuffer.pvBuffer);
-      until (Status = SEC_E_OK) or (Status = SEC_I_CONTEXT_EXPIRED) or
-            (Status <> SEC_I_CONTINUE_NEEDED);
+      end;
 
       DeleteSecurityContext(@Data.Context);
     end;
@@ -951,6 +974,8 @@ var
   QualityOfProtection: LongWord;
   I: Integer;
   ReceiveCount: Integer;
+  ExtraInput: TBytes;
+  ContextExpired: Boolean;
 begin
   Data := TSChannelData(AConnection.BackendData);
 
@@ -1008,29 +1033,29 @@ begin
       end;
       Continue;
     end;
-    if Status = SEC_I_CONTEXT_EXPIRED then
-    begin
-      Result := 0;
-      Exit;
-    end;
     if Status = SEC_I_RENEGOTIATE then
       raise ETransportSecurityError.Create('SChannel renegotiation is not supported');
-    if Status <> SEC_E_OK then
+    ContextExpired := Status = SEC_I_CONTEXT_EXPIRED;
+    if (Status <> SEC_E_OK) and not ContextExpired then
       raise ETransportSecurityError.CreateFmt('%s: 0x%x',
         [TLS_READ_ERROR, LongWord(Status)]);
 
     SetLength(Data.DecryptedInput, 0);
     Data.DecryptedOffset := 0;
     for I := 0 to High(Buffers) do
-      if Buffers[I].BufferType = SECBUFFER_DATA then
+      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
         AppendBytes(Data.DecryptedInput, Buffers[I].pvBuffer,
           Buffers[I].cbBuffer);
 
-    SetLength(Data.EncryptedInput, 0);
+    { SECBUFFER_EXTRA belongs to Data.EncryptedInput. Some SChannel
+      builds report only cbBuffer, so fall back to preserving the input
+      tail before replacing the array that owns those bytes. }
+    SetLength(ExtraInput, 0);
     for I := 0 to High(Buffers) do
-      if Buffers[I].BufferType = SECBUFFER_EXTRA then
-        PreserveExtraBytes(Data.EncryptedInput, Buffers[I].pvBuffer,
-          Buffers[I].cbBuffer);
+      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+    Data.EncryptedInput := ExtraInput;
 
     Available := Length(Data.DecryptedInput);
     if Available > 0 then
@@ -1038,6 +1063,12 @@ begin
       Result := Min(Available, ALength);
       Move(Data.DecryptedInput[0], ABuffer[0], Result);
       Data.DecryptedOffset := Result;
+      Exit;
+    end;
+
+    if ContextExpired then
+    begin
+      Result := 0;
       Exit;
     end;
   end;
