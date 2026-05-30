@@ -887,8 +887,6 @@ var
   ShutdownToken: LongWord;
   ShutdownBuffer: TSecBuffer;
   ShutdownDesc: TSecBufferDesc;
-  InputBuffer: TSecBuffer;
-  InputDesc: TSecBufferDesc;
   OutputBuffer: TSecBuffer;
   OutputDesc: TSecBufferDesc;
   Status: SECURITY_STATUS;
@@ -907,15 +905,9 @@ begin
       ShutdownDesc.ulVersion := SECBUFFER_VERSION;
       ShutdownDesc.cBuffers := 1;
       ShutdownDesc.pBuffers := @ShutdownBuffer;
-      ApplyControlToken(@Data.Context, @ShutdownDesc);
-
-      repeat
-        FillChar(InputBuffer, SizeOf(InputBuffer), 0);
-        InputBuffer.BufferType := SECBUFFER_EMPTY;
-        InputDesc.ulVersion := SECBUFFER_VERSION;
-        InputDesc.cBuffers := 1;
-        InputDesc.pBuffers := @InputBuffer;
-
+      Status := ApplyControlToken(@Data.Context, @ShutdownDesc);
+      if Status = SEC_E_OK then
+      begin
         FillChar(OutputBuffer, SizeOf(OutputBuffer), 0);
         OutputBuffer.BufferType := SECBUFFER_TOKEN;
         FillChar(OutputDesc, SizeOf(OutputDesc), 0);
@@ -924,14 +916,15 @@ begin
         OutputDesc.pBuffers := @OutputBuffer;
 
         Status := InitializeSecurityContextW(@Data.Credential, @Data.Context,
-          nil, SChannelRequestFlags, 0, SECURITY_NATIVE_DREP, @InputDesc, 0,
+          nil, SChannelRequestFlags, 0, SECURITY_NATIVE_DREP, nil, 0,
           @Data.Context, @OutputDesc, @ContextAttributes, @Expiry);
 
-        SendSChannelToken(Data.Socket, OutputBuffer);
+        if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) or
+           (Status = SEC_I_CONTEXT_EXPIRED) then
+          SendSChannelToken(Data.Socket, OutputBuffer);
         if Assigned(OutputBuffer.pvBuffer) then
           FreeContextBuffer(OutputBuffer.pvBuffer);
-      until (Status = SEC_E_OK) or (Status = SEC_I_CONTEXT_EXPIRED) or
-            (Status <> SEC_I_CONTINUE_NEEDED);
+      end;
 
       DeleteSecurityContext(@Data.Context);
     end;

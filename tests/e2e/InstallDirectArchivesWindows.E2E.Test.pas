@@ -34,6 +34,7 @@ type
     FOrigDir, FScratch, FRoot: string;
     FSkipped: Boolean;
     FInstallExitCode: Integer;
+    FInstallStdout: string;
     FInstallStderr: string;
     procedure WriteFile(const APath, AContent: string);
     procedure SetupScratchProject;
@@ -142,6 +143,7 @@ begin
 
   R := RunLwpt(['install'], FRoot);
   FInstallExitCode := R.ExitCode;
+  FInstallStdout := R.Stdout;
   FInstallStderr := R.Stderr;
 end;
 
@@ -158,7 +160,10 @@ begin
     Exit;
   end;
   if FInstallExitCode <> 0 then
+  begin
+    WriteLn('--- install stdout ---'#10, FInstallStdout, #10'---');
     WriteLn('--- install stderr ---'#10, FInstallStderr, #10'---');
+  end;
   Expect<Integer>(FInstallExitCode).ToBe(0);
 end;
 
