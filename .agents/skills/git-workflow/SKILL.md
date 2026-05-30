@@ -7,6 +7,10 @@ description: >-
   squash-merge for all pull requests. Use when running any git action —
   branching, syncing, conflict resolution, committing, pushing, or merging — on
   the user's repos.
+license: Unlicense OR MIT
+compatibility: >-
+  Requires git; pull-request operations also require the GitHub CLI (gh) and
+  network access.
 ---
 
 # Git workflow

@@ -2,7 +2,9 @@
 name: project-structure
 description: >-
   Language-agnostic repo structure conventions used across the user's projects
-  in any language — the docs/ template (application, architecture, code-style,
+  in any language — the user-facing README.md structure (name, logo,
+  description, install, usage, optional background, contribution, references),
+  the docs/ template (application, architecture, code-style,
   quick-start, tooling, deployment), the AGENTS.md template with a Hard
   Constraints section (symlinked to CLAUDE.md), nested area AGENTS.md for
   multi-area repos, optional CONTRIBUTING.md, the pre-commit hook contract
@@ -12,6 +14,7 @@ description: >-
   Stack-specific tools (test runners, linters, generators) live in the
   matching stack skill. Use when scaffolding or restructuring any repo,
   writing AGENTS.md or docs, or laying out folders.
+license: Unlicense OR MIT
 ---
 
 # Project structure
@@ -41,6 +44,26 @@ A repo on this style has these **roles** at the root, named with whatever conven
 | **Generated output** | Build artifacts. Not committed unless the language requires it. | `dist/`, `build/`, `target/`, `out/` |
 
 The **filenames** are language- and ecosystem-specific. The **roles** are constant.
+
+### `README.md` structure
+
+The root `README.md` is the **project intro for a user**, not a contributor manual. It follows this section order. Sections marked optional are left off entirely when they don't apply — **never invent content to fill a section**.
+
+1. **Headline.** A single top-level Markdown heading (`# Project Name`) — not an HTML `<h1>` tag — that is the project name.
+2. **Logo** — shown only if a logo asset exists in the repo. Skip the section entirely when there is none.
+3. **Short description.** Max 350 characters. What the project is and what its features are. Link to in-depth documentation (`docs/`, a docs site) when it exists rather than expanding here.
+4. **Install.** Max 100 characters. The single canonical install line — `npm install <package>`, `brew install <formula>`, `cargo add <crate>`, etc.
+5. **Usage.** How a **user** (not a contributor) uses the project — command-line, code, or a combination. Show the 1–3 most relevant flows and link back to deeper docs (developer flow, full API, configuration) for the rest. Do not document how to work *on* the project here.
+6. **(Optional) Background.** Anything important for understanding the project's design — mission statement, philosophy, core decisions still open. Include only when it adds real understanding; leave off rather than invent.
+7. **Contribution.** Max 150 characters describing how to install the project locally for development and what's required, then link to the detailed `CONTRIBUTING.md` / contributing docs when they exist.
+8. **References.** Links to the agent documentation (`AGENTS.md`) and the license.
+
+Rules:
+
+- The README is **user-facing**; deep developer/build/test detail lives in `docs/` and `CONTRIBUTING.md`, linked from sections 5 and 7 — not inlined.
+- Respect the character caps on sections 3, 4, and 7. When the content doesn't fit, link out instead of overflowing.
+- Optional sections (logo, background) are omitted cleanly when they don't apply; do not emit an empty heading.
+- Markdown linting and the link check (below) apply to `README.md` like any other committed markdown.
 
 ### Tests
 

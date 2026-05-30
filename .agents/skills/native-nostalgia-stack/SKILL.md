@@ -11,6 +11,10 @@ description: >-
   configuration, etc.) belong in that project's own AGENTS.md and docs.
   Use when scaffolding or working in a FreePascal project that follows this
   toolchain.
+license: Unlicense OR MIT
+compatibility: >-
+  Assumes a FreePascal project compiled with FPC in Delphi mode, with Lefthook
+  for pre-commit hooks.
 ---
 
 # Native nostalgia stack
