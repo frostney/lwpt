@@ -668,6 +668,7 @@ const
   SCHANNEL_SHUTDOWN = 1;
   SECURITY_NATIVE_DREP = $00000010;
   UNISP_NAME = 'Microsoft Unified Security Protocol Provider';
+  SECBUFFER_ATTRMASK = $F0000000;
 
 function AcquireCredentialsHandleW(APrincipal: PWideChar; APackage: PWideChar;
   ACredentialUse: LongWord; ALogonId: Pointer; AAuthData: Pointer;
@@ -699,6 +700,11 @@ function DeleteSecurityContext(AContext: PCtxtHandle): SECURITY_STATUS; stdcall;
 function FreeCredentialsHandle(ACredential: PCredHandle): SECURITY_STATUS; stdcall;
   external 'secur32.dll' name 'FreeCredentialsHandle';
 
+function SecBufferKind(const ABufferType: LongWord): LongWord; inline;
+begin
+  Result := ABufferType and not SECBUFFER_ATTRMASK;
+end;
+
 procedure AppendBytes(var ATarget: TBytes; const ASource: Pointer;
   const ALength: Integer);
 var
@@ -713,6 +719,28 @@ begin
   Move(ASource^, ATarget[PreviousLength], ALength);
 end;
 
+procedure AppendExtraBytes(var ATarget: TBytes; const AInput: TBytes;
+  const ASource: Pointer; const ALength: Integer);
+var
+  PreviousLength: Integer;
+  SourceOffset: Integer;
+begin
+  if ALength <= 0 then
+    Exit;
+
+  PreviousLength := Length(ATarget);
+  SetLength(ATarget, PreviousLength + ALength);
+  if Assigned(ASource) then
+    Move(ASource^, ATarget[PreviousLength], ALength)
+  else
+  begin
+    if ALength > Length(AInput) then
+      raise ETransportSecurityError.Create('SChannel reported extra bytes outside the input buffer');
+    SourceOffset := Length(AInput) - ALength;
+    Move(AInput[SourceOffset], ATarget[PreviousLength], ALength);
+  end;
+end;
+
 procedure PreserveExtraBytes(var ATarget: TBytes; const ASource: Pointer;
   const ALength: Integer);
 var
@@ -724,10 +752,8 @@ begin
     Exit;
   end;
 
-  if not Assigned(ASource) then
-    raise ETransportSecurityError.Create('SChannel returned extra bytes without a pointer');
-  SetLength(Temporary, ALength);
-  Move(ASource^, Temporary[0], ALength);
+  SetLength(Temporary, 0);
+  AppendExtraBytes(Temporary, ATarget, ASource, ALength);
   ATarget := Temporary;
 end;
 
@@ -830,7 +856,8 @@ begin
       if Assigned(OutputBuffer.pvBuffer) then
         FreeContextBuffer(OutputBuffer.pvBuffer);
 
-      if (InputDescPointer <> nil) and (InputBuffers[1].BufferType = SECBUFFER_EXTRA) then
+      if (InputDescPointer <> nil) and
+         (SecBufferKind(InputBuffers[1].BufferType) = SECBUFFER_EXTRA) then
         PreserveExtraBytes(Data.EncryptedInput, InputBuffers[1].pvBuffer,
           InputBuffers[1].cbBuffer)
       else
@@ -1017,17 +1044,18 @@ begin
     SetLength(Data.DecryptedInput, 0);
     Data.DecryptedOffset := 0;
     for I := 0 to High(Buffers) do
-      if Buffers[I].BufferType = SECBUFFER_DATA then
+      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
         AppendBytes(Data.DecryptedInput, Buffers[I].pvBuffer,
           Buffers[I].cbBuffer);
 
-    { SECBUFFER_EXTRA points into Data.EncryptedInput, so copy it
-      before replacing the array that owns those bytes. }
+    { SECBUFFER_EXTRA belongs to Data.EncryptedInput. Some SChannel
+      builds report only cbBuffer, so fall back to preserving the input
+      tail before replacing the array that owns those bytes. }
     SetLength(ExtraInput, 0);
     for I := 0 to High(Buffers) do
-      if Buffers[I].BufferType = SECBUFFER_EXTRA then
-        AppendBytes(ExtraInput, Buffers[I].pvBuffer,
-          Buffers[I].cbBuffer);
+      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
     Data.EncryptedInput := ExtraInput;
 
     Available := Length(Data.DecryptedInput);
