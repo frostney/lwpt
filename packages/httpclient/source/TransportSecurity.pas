@@ -777,7 +777,7 @@ function SChannelRequestFlags: LongWord;
 begin
   Result := ISC_REQ_SEQUENCE_DETECT or ISC_REQ_REPLAY_DETECT or
     ISC_REQ_CONFIDENTIALITY or ISC_REQ_EXTENDED_ERROR or
-    ISC_REQ_USE_SUPPLIED_CREDS or ISC_REQ_ALLOCATE_MEMORY or ISC_REQ_STREAM;
+    ISC_REQ_ALLOCATE_MEMORY or ISC_REQ_STREAM;
 end;
 
 procedure StartSChannel(var AConnection: TTransportSecurityConnection;
