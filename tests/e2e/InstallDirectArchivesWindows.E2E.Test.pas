@@ -29,7 +29,7 @@ const
     'release-cli-v0.16.0.tar.gz';
 
 type
-  TInstallDirectArchivesWindowsE2E = class(TTestSuite)
+  TLWPTInstallDirectArchivesWindowsE2E = class(TTestSuite)
   private
     FOrigDir, FScratch, FRoot: string;
     FSkipped: Boolean;
@@ -85,7 +85,7 @@ begin
   end;
 end;
 
-procedure TInstallDirectArchivesWindowsE2E.WriteFile(const APath,
+procedure TLWPTInstallDirectArchivesWindowsE2E.WriteFile(const APath,
   AContent: string);
 var
   SL: TStringList;
@@ -100,7 +100,7 @@ begin
   end;
 end;
 
-procedure TInstallDirectArchivesWindowsE2E.SetupScratchProject;
+procedure TLWPTInstallDirectArchivesWindowsE2E.SetupScratchProject;
 begin
   ForceDirectories(FRoot + '/source');
   WriteFile(FRoot + '/source/main.pas',
@@ -118,7 +118,7 @@ begin
     GITLAB_DEP_NAME + ' = "' + GITLAB_ARCHIVE_URL + '"'#10);
 end;
 
-procedure TInstallDirectArchivesWindowsE2E.BeforeAll;
+procedure TLWPTInstallDirectArchivesWindowsE2E.BeforeAll;
 var
   R: TLwptResult;
 begin
@@ -147,12 +147,12 @@ begin
   FInstallStderr := R.Stderr;
 end;
 
-procedure TInstallDirectArchivesWindowsE2E.AfterAll;
+procedure TLWPTInstallDirectArchivesWindowsE2E.AfterAll;
 begin
   SetCurrentDir(FOrigDir);
 end;
 
-procedure TInstallDirectArchivesWindowsE2E.TestInstallExitsZero;
+procedure TLWPTInstallDirectArchivesWindowsE2E.TestInstallExitsZero;
 begin
   if FSkipped then
   begin
@@ -167,7 +167,7 @@ begin
   Expect<Integer>(FInstallExitCode).ToBe(0);
 end;
 
-procedure TInstallDirectArchivesWindowsE2E.TestArchivesDownloadedAndExtracted;
+procedure TLWPTInstallDirectArchivesWindowsE2E.TestArchivesDownloadedAndExtracted;
 begin
   if FSkipped then
   begin
@@ -190,7 +190,7 @@ begin
   ).ToBe(True);
 end;
 
-procedure TInstallDirectArchivesWindowsE2E.TestLockfileRecordsDirectArchiveURLs;
+procedure TLWPTInstallDirectArchivesWindowsE2E.TestLockfileRecordsDirectArchiveURLs;
 var
   Lock: string;
 begin
@@ -203,9 +203,10 @@ begin
   Expect<Boolean>(Pos('source = "' + GITHUB_ARCHIVE_URL + '"', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('source = "' + GITLAB_ARCHIVE_URL + '"', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('archiveHash = "sha256:', Lock) > 0).ToBe(True);
+  Expect<Boolean>(Pos('extracted-tree = "sha256:', Lock) > 0).ToBe(True);
 end;
 
-procedure TInstallDirectArchivesWindowsE2E.SetupTests;
+procedure TLWPTInstallDirectArchivesWindowsE2E.SetupTests;
 begin
   Test('install exits zero against direct archive URLs',
     TestInstallExitsZero);
@@ -216,7 +217,7 @@ begin
 end;
 
 begin
-  TestRunnerProgram.AddSuite(TInstallDirectArchivesWindowsE2E.Create(
+  TestRunnerProgram.AddSuite(TLWPTInstallDirectArchivesWindowsE2E.Create(
     'install: direct archives via Windows SChannel (E2E)'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
