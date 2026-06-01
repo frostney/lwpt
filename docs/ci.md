@@ -88,7 +88,7 @@ A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 
 
 ### `release.yml` — tag-triggered release pipeline
 
-Triggers on tags matching `v?N.N.N` or `v?N.N.N-*` (e.g. `v0.1.0`, `0.1.0`, `v0.1.0-rc.1`). The leading `v` is optional per [ADR-0009](./adr/0009-semver-source-syntax.md) (semver 2.0.0 form preferred). Pre-release detection: any version containing a hyphen is published as `prerelease: true`.
+Triggers on tags matching `v?N.N.N` or `v?N.N.N-*` (e.g. `0.1.0`, `0.1.0-rc.1` — the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md), which adopts SemVer 2.0.0; the `v`-prefixed form `v0.1.0` is also accepted as a courtesy but not the recommended shape). Pre-release detection: any version containing a hyphen is published as `prerelease: true`.
 
 The pipeline runs:
 
@@ -98,7 +98,7 @@ The pipeline runs:
 
 #### Release artefact naming
 
-| Target | Archive | Asset name (`<version>` = tag with `v` stripped) |
+| Target | Archive | Asset name (`<version>` = the tag value; if a `v` prefix was used, it's stripped) |
 |--------|---------|--------------------------------------------------|
 | `aarch64-darwin` | tar.gz | `lwpt-<version>-macos-arm64.tar.gz` |
 | `x86_64-darwin` | tar.gz | `lwpt-<version>-macos-x64.tar.gz` |
@@ -181,4 +181,4 @@ Per Q23=c, these run on every platform (6 in total per push). Total network traf
 - **No artefact retention beyond 7 days** — set in `upload-artifact`. CI artefacts are debugging aids, not release artefacts. The release artefacts published by `release.yml` are permanent (GitHub Releases).
 - **No Pascal lint beyond `lwpt format --check`** — there's no `flake8`-style linter for FPC. Format check is the closest equivalent.
 - **No `cliff.toml` / git-cliff integration yet** — release notes are GitHub's auto-generated form, binned per [`.github/release.yml`](../.github/release.yml). If a richer changelog is needed later, dropping in `cliff.toml` + swapping to `orhun/git-cliff-action@v4` is a single-commit change.
-- **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped; the manifest's `package.version` is independent (and not automatically kept in lockstep with the tag — there's no enforcement either way yet).
+- **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped (the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) has no `v`; the strip handles the courtesy-accepted prefixed form). The manifest's `package.version` is the canonical source — `lwpt --version` derives `PROGRAM_VERSION` from it at compile time via `scripts/stamp-version.pas`, so the binary's reported version cannot drift from `lwpt.toml`. Whether the *tag* matches `package.version` is the maintainer's responsibility at tag time.

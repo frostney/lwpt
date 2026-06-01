@@ -35,5 +35,5 @@ The first tagged release. Pre-1.0 — the manifest format, lockfile schema, and 
 - Migrated from a spike codebase (formerly `lwptk`) to a production toolkit (`lwpt`). Project name + binary + module dir + cfg file all derive from a single `PROGRAM_NAME` constant per [ADR-0001](./docs/adr/0001-program-name-as-constant.md).
 - 17 ADRs document the architectural decisions that shaped the v1 design. See [`docs/README.md`](./docs/README.md#decision-records) for the index.
 
-[Unreleased]: https://github.com/frostney/lwpt/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/frostney/lwpt/releases/tag/v0.1.0
+[Unreleased]: https://github.com/frostney/lwpt/compare/0.1.0...HEAD
+[0.1.0]: https://github.com/frostney/lwpt/releases/tag/0.1.0
