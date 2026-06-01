@@ -26,7 +26,7 @@ We'll acknowledge the report within **7 days** and aim for a fix-or-decline deci
 |--------------|-----------|
 | Latest minor of the current major (`0.x.y`) | Yes — security fixes go here |
 | Older minors (none yet — LWPT is pre-1.0) | No |
-| Pre-release tags (`v0.x.y-rc.*`) | No — use the matching stable for production |
+| Pre-release tags (`0.x.y-rc.*`) | No — use the matching stable for production |
 
 Once LWPT reaches `1.0`, the policy will extend to the previous major line for a documented overlap window.
 

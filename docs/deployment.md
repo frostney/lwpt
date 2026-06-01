@@ -100,7 +100,7 @@ If `lwpt install` fails with `HTTPS requires OpenSSL but it could not be loaded`
 
 ## Release process
 
-1. **Tag.** `git tag v0.1.0` on a green `main`. Pre-release tags use the `v0.1.0-rc.1` form (auto-detected by `release.yml` and published as `prerelease: true`).
+1. **Tag.** `git tag 0.1.0` on a green `main` (no `v` prefix — SemVer 2.0.0 canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md); `v0.1.0` is also accepted by `release.yml` as a courtesy). Pre-release tags use the `0.1.0-rc.1` form (auto-detected by `release.yml` and published as `prerelease: true`).
 2. **`release.yml` triggers.** Mirrors `ci.yml`'s cross-build matrix exactly (same flag set, same toolchain cache key), then packages each target as `tar.gz` (Unix) / `zip` (Windows) plus a SHA-256 checksums file.
 3. **GitHub Release published.** Auto-generated release notes from `.github/release.yml`'s category config, attached: all six archives + the checksums file. Archive naming:
 
@@ -123,7 +123,7 @@ There are no hand-built release artefacts. If `ci.yml` is broken at tag time, fi
 For an urgent CVE in a vendored unit or in a system TLS backend on Linux:
 
 1. Patch on `main` with the fix + a `*.Test.pas` proving the fix.
-2. Tag the patch version (`v0.1.1`) — go straight from `v0.1.0` to `v0.1.1`, no pre-release.
+2. Tag the patch version (`0.1.1`) — go straight from `0.1.0` to `0.1.1`, no pre-release.
 3. The release notes name the CVE explicitly so downstream users can audit.
 
 System TLS on Windows (SChannel) and macOS (SecureTransport) is updated by the OS vendor; LWPT does not ship those code paths. Linux OpenSSL CVE responses are entirely a distro-package matter — LWPT just consumes whatever `libssl` the system provides.

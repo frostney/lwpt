@@ -7,12 +7,14 @@ name: Release
 #   pr.yml      — fast single-runner PR feedback (system FPC)
 #
 # Triggers on tags matching:
-#   v?[0-9]+.[0-9]+.[0-9]+         e.g.  v0.1.0, 0.1.0, v1.2.3
-#   v?[0-9]+.[0-9]+.[0-9]+-*       e.g.  v0.1.0-rc.1 (pre-releases)
+#   v?[0-9]+.[0-9]+.[0-9]+         e.g.  0.1.0, 1.2.3 (canonical, no v)
+#   v?[0-9]+.[0-9]+.[0-9]+-*       e.g.  0.1.0-rc.1   (canonical pre-release)
 #
-# The version embedded in archive names is the tag with any leading `v`
-# stripped (per ADR-0009 — semver 2.0.0 form). A `v` prefix on the tag
-# itself is accepted but optional.
+# Per ADR-0009, LWPT adopts SemVer 2.0.0 — the canonical tag form has
+# NO leading `v`. The `v` prefix is accepted as a courtesy (so someone
+# tagging `v0.1.0` doesn't hit a failed CI), and the version embedded
+# in archive names strips it: `lwpt-0.1.0-linux-x64.tar.gz` regardless
+# of whether the tag was `0.1.0` or `v0.1.0`.
 #
 # Reuses toolchain.yml (workflow_call) to avoid duplicating the
 # expensive cross-FPC build. The build job mirrors ci.yml's `build`
@@ -20,8 +22,8 @@ name: Release
 # regular CI run would have.
 #
 # Pre-release detection: tags with a hyphen after the version
-# (e.g. `v1.0.0-rc.1`) are published as pre-releases. Stable tags
-# (e.g. `v1.0.0`) are published as full releases.
+# (e.g. `1.0.0-rc.1`) are published as pre-releases. Stable tags
+# (e.g. `1.0.0`) are published as full releases.
 
 on:
   push:
