@@ -203,7 +203,7 @@ begin
   Expect<Boolean>(Pos('source = "' + GITHUB_ARCHIVE_URL + '"', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('source = "' + GITLAB_ARCHIVE_URL + '"', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('archiveHash = "sha256:', Lock) > 0).ToBe(True);
-  Expect<Boolean>(Pos('extracted-tree = "sha256:', Lock) > 0).ToBe(True);
+  Expect<Boolean>(Pos('computedHash = "sha256:', Lock) > 0).ToBe(True);
 end;
 
 procedure TLWPTInstallDirectArchivesWindowsE2E.SetupTests;
