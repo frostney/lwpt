@@ -365,11 +365,16 @@ jobs:
             cp docs/build-system.md "$pkg_dir/docs/" 2>/dev/null || true
 
             cd dist
-            if [[ "$target" == *win* ]]; then
-              zip -qr "${archive_base}.zip" "${archive_base}"
-            else
-              tar -czf "${archive_base}.tar.gz" "${archive_base}"
-            fi
+            # Format per target: zip for Windows, tar.gz for Unix.
+            # Match the target's suffix anchored ("-win64" / "-win32")
+            # rather than the substring "win" — `*win*` accidentally
+            # matches `darwin` because "darwin" contains "win", which
+            # earlier produced .zip artefacts on macOS instead of the
+            # expected .tar.gz the install scripts download.
+            case "$target" in
+              *-win64|*-win32) zip -qr "${archive_base}.zip" "${archive_base}" ;;
+              *)               tar -czf "${archive_base}.tar.gz" "${archive_base}" ;;
+            esac
             cd ..
 
             rm -rf "$pkg_dir"
