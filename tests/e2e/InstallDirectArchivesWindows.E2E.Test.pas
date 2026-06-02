@@ -145,6 +145,16 @@ begin
   FInstallExitCode := R.ExitCode;
   FInstallStdout := R.Stdout;
   FInstallStderr := R.Stderr;
+
+  { Transient third-party downtime (the archive host unreachable at the
+    TCP/DNS layer) is not an LWPT defect — skip rather than fail. A
+    content/hash/parse failure leaves FSkipped False so the assertions
+    below still fail hard. }
+  if (not FSkipped) and IsNetworkUnavailable(R) then
+  begin
+    WriteLn('  [skip] archive host unreachable (transient network); e2e fetch skipped');
+    FSkipped := True;
+  end;
 end;
 
 procedure TLWPTInstallDirectArchivesWindowsE2E.AfterAll;

@@ -175,6 +175,12 @@ The `test --tier=e2e` step runs three live fetches per platform:
 
 Per Q23=c, these run on every platform (6 in total per push). Total network traffic per push: 18 archive fetches. If this becomes a rate-limit concern, the future fallback is `LWPT_SKIP_NETWORK=1` on N-1 of the 6 runners (the env var is respected by every E2E test).
 
+### Transient host downtime skips, it does not fail
+
+A live-network E2E test validates LWPT's fetch → extract → lockfile pipeline against a real host. When the *host* is unreachable — a TCP connect failure or DNS resolution failure to `github.com` / `gitlab.com` / `bitbucket.org` — that is third-party infrastructure flakiness, **not** an LWPT defect, so the affected suite **skips** rather than fails. The detection (`IsNetworkUnavailable` in `tests/support/Tests.LwptSubprocess.pas`) is deliberately narrow: it matches only HTTPClient's two clean pre-transfer errors — `Failed to connect to <host>:<port>` and `Failed to resolve host: <host>` — both of which fire before any byte is fetched or parsed.
+
+Crucially, this is **not** a blanket "ignore e2e failures". An install that *connects* but then produces wrong output — a truncated chunked body, a missing header terminator, a hash mismatch, a missing extracted file — leaves the skip flag unset, so the assertions run and fail hard. That split is the whole point: third-party downtime is noise; an LWPT regression in the fetch/extract/verify path is a real failure that must turn the build red. (The `0.1.0-rc.1` cycle surfaced exactly this: an `i386-win32` runner intermittently failed to reach `bitbucket.org:443`, reddening an otherwise-green main for a reason that had nothing to do with LWPT.)
+
 ## What CI does NOT cover
 
 - **`lwpt build` doesn't run on the test runner** — running it would rebuild `lwpt` with the runner's native FPC, defeating the cross-build verification. The pipeline tests the cross-built binary's *behavior* (install / format / test); the cross-build *itself* is verified by the build-stage compile.

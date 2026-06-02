@@ -14,7 +14,9 @@
     (Note the repo basename in the filename — that's what
     RepoBasename in LWPT.Core constructs.)
 
-  Skip semantics: LWPT_SKIP_NETWORK=1 → tests pass with a "skipped"
+  Skip semantics: LWPT_SKIP_NETWORK=1, OR a clean connect/DNS failure
+  to the host at install time (IsNetworkUnavailable — transient
+  third-party downtime, not an LWPT defect), → tests pass with a "skipped"
   log line. }
 
 program InstallGitLab.E2E.Test;
@@ -140,6 +142,16 @@ begin
   R := RunLwpt(['install'], FRoot);
   FInstallExitCode := R.ExitCode;
   FInstallStderr   := R.Stderr;
+
+  { Transient third-party downtime (gitlab.com unreachable at the
+    TCP/DNS layer) is not an LWPT defect — skip rather than fail. A
+    content/hash/parse failure leaves FSkipped False so the assertions
+    below still fail hard. }
+  if (not FSkipped) and IsNetworkUnavailable(R) then
+  begin
+    WriteLn('  [skip] gitlab.com unreachable (transient network); e2e fetch skipped');
+    FSkipped := True;
+  end;
 end;
 
 procedure TInstallGitLabE2E.AfterAll;
