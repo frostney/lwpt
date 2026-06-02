@@ -187,4 +187,15 @@ Crucially, this is **not** a blanket "ignore e2e failures". An install that *con
 - **No artefact retention beyond 7 days** — set in `upload-artifact`. CI artefacts are debugging aids, not release artefacts. The release artefacts published by `release.yml` are permanent (GitHub Releases).
 - **No Pascal lint beyond `lwpt format --check`** — there's no `flake8`-style linter for FPC. Format check is the closest equivalent.
 - **No `cliff.toml` / git-cliff integration yet** — release notes are GitHub's auto-generated form, binned per [`.github/release.yml`](../.github/release.yml). If a richer changelog is needed later, dropping in `cliff.toml` + swapping to `orhun/git-cliff-action@v4` is a single-commit change.
-- **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped (the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) has no `v`; the strip handles the courtesy-accepted prefixed form). The manifest's `package.version` is the canonical source — `lwpt --version` derives `PROGRAM_VERSION` from it at compile time via `scripts/stamp-version.pas`, so the binary's reported version cannot drift from `lwpt.toml`. Whether the *tag* matches `package.version` is the maintainer's responsibility at tag time.
+- **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped (the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) has no `v`; the strip handles the courtesy-accepted prefixed form).
+
+## Release version stamping
+
+`lwpt --version` reports `PROGRAM_VERSION`, a compile-time constant generated into `source/Version.inc` by `scripts/stamp-version.pas`. The value depends on *how* the binary was built:
+
+- **Dev / local builds** (`./bootstrap.sh`, `lwpt build`): the constant is sourced from `[package].version` in `lwpt.toml`. `Version.Test.pas`'s drift guard asserts `lwpt --version` matches the manifest for these. There is no way for a locally-built binary to disagree with the manifest.
+- **Release builds** (`release.yml`, tag push): the build step exports `LWPT_VERSION_OVERRIDE=<tag-without-v>` and re-runs `stamp-version.pas` before the cross-FPC compile, so the released binary reports **the git tag**. A 0.1.0-rc.3 release reports `lwpt 0.1.0-rc.3`. release.yml then runs the native (`aarch64-darwin`) binary and asserts `lwpt --version == lwpt <tag>` — `Version.inc` is shared across all six targets, so a correct native stamp proves it for the whole matrix.
+
+This split keeps the tag, the archive name, and the binary's self-report consistent for anything a user downloads, while leaving local builds pinned to the manifest version (the dev/unreleased number). The maintainer does **not** need to bump `[package].version` per tag — the release stamps the tag itself.
+
+> Historical note: `0.1.0-rc.1` and `0.1.0-rc.2` were built before this stamping landed, so their binaries report `lwpt 0.1.0` (the manifest version at the time) rather than the tag. The install-script e2e test (`tests/e2e/InstallScript.E2E.Test.pas`) pins to `0.1.0-rc.2` and asserts `lwpt 0.1.0` for exactly this reason; it tightens to `binary == tag` once it re-pins to a stamp-from-tag release.

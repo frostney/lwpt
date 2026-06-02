@@ -204,6 +204,19 @@ jobs:
 
           mkdir -p build/compiled
 
+          # Stamp the release version FROM THE TAG so the binary's
+          # `lwpt --version` matches the release it ships in (e.g. a
+          # 0.1.0-rc.3 release reports `lwpt 0.1.0-rc.3`). release.yml
+          # compiles the cross-FPC directly — it does NOT go through
+          # `lwpt build`, so the [prebuild] stamp-version hook never
+          # fires here; we regenerate Version.inc explicitly. Only on
+          # tag pushes; a manual workflow_dispatch keeps the committed
+          # (manifest) version. See docs/ci.md "Release version stamping".
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            echo "=== Stamping release version from tag ${GITHUB_REF_NAME} ==="
+            LWPT_VERSION_OVERRIDE="${GITHUB_REF_NAME#v}" instantfpc scripts/stamp-version.pas
+          fi
+
           # Release-grade build: -O4 -dPRODUCTION -Xs -CX -XX -B.
           # Same flag set as ci.yml's build stage, so a tagged commit's
           # binary equals what CI produces — single artefact provenance.
@@ -225,6 +238,21 @@ jobs:
             source/lwpt.pas
 
           ls -la build/
+
+          # Validate stamp-from-tag on the native target (the only one
+          # executable on this build host). Version.inc is shared across
+          # all targets, so a correct native stamp proves it for the
+          # whole matrix. Guarded to tag pushes; skipped for cross
+          # targets (can't run a foreign binary) + manual dispatch.
+          if [ "$NATIVE" = "true" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            REPORTED="$(build/lwpt --version | head -1)"
+            EXPECTED="lwpt ${GITHUB_REF_NAME#v}"
+            echo "version check: reported='${REPORTED}' expected='${EXPECTED}'"
+            if [ "$REPORTED" != "$EXPECTED" ]; then
+              echo "::error::Release binary version mismatch: got '${REPORTED}', expected '${EXPECTED}' — stamp-from-tag failed"
+              exit 1
+            fi
+          fi
 
       - name: Stage + strip binary
         run: |
