@@ -1,5 +1,5 @@
 { InstallScript.E2E.Test — exercise scripts/install.sh end-to-end
-  against a published GitHub release.
+  against the current published GitHub release.
 
   This is the test that would have caught the macOS .zip regression:
   release.yml shipped macOS archives as .zip while install.sh downloads
@@ -8,14 +8,24 @@
   against a real release — the script constructs the asset URL, curls
   it from GitHub Releases, verifies the checksum, extracts the archive,
   and installs the binary — then asserts the installed binary reports
-  the expected version. An asset-name mismatch (the .zip bug class)
-  surfaces as a 404, which fails hard here.
+  the resolved tag. An asset-name mismatch (the .zip bug class) surfaces
+  as a 404 against a release we know exists, which fails hard here.
 
-  Fixture: a fixed published pre-release (INSTALL_VERSION below). The
-  pin is an immutable fixture, mirroring how the GitHub/GitLab/Bitbucket
-  suites pin commit SHAs. When 0.1.0 final ships, bump INSTALL_VERSION
-  to it — a stable release won't be garbage-collected the way a
-  pre-release tag can be.
+  No pinned version constant. The test resolves "latest" the same way
+  install.sh does — GET /releases/latest, which returns the newest
+  release NOT flagged `prerelease: true` (see CONTEXT.md "Prerelease":
+  the GitHub flag is orthogonal to pre-1.0; `0.1.0` published without a
+  hyphen IS a normal release and IS returned). The resolved tag is the
+  single source of truth: it is passed to install.sh AND the expected
+  `lwpt --version` is derived from it (binary == tag). Because release
+  binaries stamp the version from the git tag (ADR-0018), that equality
+  holds for every stamp-from-tag release; the assertion is *relative*
+  (the install path works and the binary self-reports its tag), so it
+  never breaks on version drift — only on a genuine install.sh defect.
+
+  Until the first normal (non-prerelease-flagged) release exists,
+  /releases/latest yields nothing and the test skips; the per-release
+  install check in release.yml covers prerelease-flagged rc.x meanwhile.
 
   Unix-only: install.sh is /bin/sh. The Windows install.ps1 smoke test
   is a separate future addition.
@@ -24,10 +34,12 @@
     - non-Unix host                  → skip (install.sh is sh)
     - LWPT_SKIP_NETWORK=1             → skip
     - curl unavailable               → skip (environment, not a defect)
+    - no normal release published    → skip (nothing to smoke yet)
     - clean connect/DNS failure to
       github.com (transient downtime) → skip
-  A 404 / checksum mismatch / missing binary is NOT a network outage
-  and fails hard — that's the regression class this guards. }
+  A 404 / checksum mismatch / missing binary AFTER a tag resolved is NOT
+  a network outage and fails hard — that's the regression class this
+  guards. }
 
 program InstallScript.E2E.Test;
 
@@ -44,25 +56,10 @@ uses
   TestingPascalLibrary,
   Tests.LwptSubprocess;
 
-const
-  { The released tag this test installs. Bump to the stable tag when
-    0.1.0 ships (pre-releases can be deleted; a stable release is the
-    durable fixture). No leading `v` per ADR-0009. }
-  INSTALL_VERSION = '0.1.0-rc.2';
-
-  { What the installed binary's `lwpt --version` is expected to print.
-    For releases built BEFORE release.yml's stamp-from-tag landed, the
-    binary reports the *manifest* version, which diverges from the tag:
-    0.1.0-rc.2 was cut while [package].version was "0.1.0", so its
-    binary says "lwpt 0.1.0". Once a stamp-from-tag release exists
-    (rc.3 / 0.1.0 final), bump INSTALL_VERSION to it AND set this equal
-    to it — they converge (binary == tag) from that release onward. }
-  EXPECTED_REPORTED_VERSION = '0.1.0';
-
 type
   TInstallScriptE2E = class(TTestSuite)
   private
-    FOrigDir, FScratch, FBinDir, FRepoRoot: string;
+    FOrigDir, FScratch, FBinDir, FRepoRoot, FResolvedTag: string;
     FSkipped: Boolean;
     FInstallExitCode: Integer;
     FInstallStderr: string;
@@ -107,6 +104,25 @@ begin
   {$ENDIF}
 end;
 
+{ The GitHub repo install.sh + this test resolve releases from. Honors
+  LWPT_REPO for symmetry with install.sh (default frostney/lwpt). }
+function ReleasesRepo: string;
+begin
+  Result := GetEnvironmentVariable('LWPT_REPO');
+  if Result = '' then Result := 'frostney/lwpt';
+end;
+
+{ SemVer 2.0.0 has no leading `v`; release tags may carry one for git
+  convention (ADR-0009). Strip it so the derived expected matches what
+  the stamped binary prints. }
+function StripLeadingV(const ATag: string): string;
+begin
+  Result := ATag;
+  if (Length(Result) > 1) and (Result[1] = 'v')
+     and (Result[2] >= '0') and (Result[2] <= '9') then
+    Result := Copy(Result, 2, Length(Result));
+end;
+
 { Drain a stream into a string. Assumes the child has exited. }
 function DrainStream(AStream: TStream): string;
 const CHUNK = 4 * 1024;
@@ -125,31 +141,30 @@ begin
   end;
 end;
 
-{ Run `sh <script>` with the given env additions, capturing exit code
-  + stderr. Self-contained (does not go through RunLwpt, which targets
-  the lwpt binary) so this PR touches only this file. }
-function RunInstallScript(const AScriptPath, AVersion, AInstallDir,
-  AInDir: string; out AStderr: string): Integer;
+{ Run a /bin/sh program (script file or `-c` command), capturing exit
+  code + stderr + stdout. Self-contained (does not go through RunLwpt,
+  which targets the lwpt binary). AArgs are the args after /bin/sh. }
+function RunSh(const AArgs: array of string; const AInDir: string;
+  const AExtraEnv: array of string; out AStdout, AStderr: string): Integer;
 var
   P: TProcess;
   i: Integer;
   Outp, Errp: string;
 begin
   Result := -1;
-  AStderr := '';
   Outp := '';
   Errp := '';
   P := TProcess.Create(nil);
   try
     P.Executable := '/bin/sh';
-    P.Parameters.Add(AScriptPath);
+    for i := Low(AArgs) to High(AArgs) do P.Parameters.Add(AArgs[i]);
     P.Options := [poUsePipes];
     if AInDir <> '' then P.CurrentDirectory := AInDir;
 
     for i := 1 to GetEnvironmentVariableCount do
       P.Environment.Add(GetEnvironmentString(i));
-    P.Environment.Add('LWPT_VERSION=' + AVersion);
-    P.Environment.Add('INSTALL_DIR=' + AInstallDir);
+    for i := Low(AExtraEnv) to High(AExtraEnv) do
+      P.Environment.Add(AExtraEnv[i]);
 
     P.Execute;
     while P.Running do
@@ -164,7 +179,21 @@ begin
   finally
     P.Free;
   end;
+  AStdout := Outp;
   AStderr := Errp;
+end;
+
+{ Resolve the newest non-prerelease-flagged release tag, mirroring
+  install.sh's pipeline exactly. Returns '' when no such release exists
+  (404 from /releases/latest) or the host is unreachable — both skip. }
+function ResolveLatestTag(out AStderr: string): string;
+var Cmd, Outp: string;
+begin
+  Cmd := 'curl -fsSL "https://api.github.com/repos/' + ReleasesRepo
+       + '/releases/latest" | grep -E ''"tag_name":'' | head -n1 '
+       + '| sed -E ''s/.*"([^"]+)".*/\1/''';
+  RunSh(['-c', Cmd], '', [], Outp, AStderr);
+  Result := Trim(Outp);
 end;
 
 { Did the install fail because the host was unreachable / curl missing,
@@ -187,6 +216,7 @@ begin
 end;
 
 procedure TInstallScriptE2E.BeforeAll;
+var ResolveErr, InstallOut: string;
 begin
   FOrigDir  := GetCurrentDir;
   FRepoRoot := GetCurrentDir;   { lwpt test sets CWD to the project root }
@@ -208,20 +238,36 @@ begin
     Exit;
   end;
 
+  { Resolve "latest" — the single source of truth. Empty means either no
+    normal release exists yet or the host is unreachable; both skip. }
+  FResolvedTag := ResolveLatestTag(ResolveErr);
+  if FResolvedTag = '' then
+  begin
+    if InstallFailureIsSkippable(ResolveErr) then
+      WriteLn('  [skip] github.com unreachable or curl missing (transient/env); '
+            + 'install-script test skipped')
+    else
+      WriteLn('  [skip] no normal (non-prerelease) release published yet; '
+            + 'release.yml''s per-release install check covers prereleases');
+    FSkipped := True;
+    Exit;
+  end;
+
   RecursiveDelete(FScratch);
   ForceDirectories(FBinDir);
 
-  FInstallExitCode := RunInstallScript(
-    FRepoRoot + '/scripts/install.sh',
-    INSTALL_VERSION,
-    FBinDir,
+  { Pass the resolved tag explicitly so install.sh installs exactly what
+    we resolved (no re-resolution race) and we know the expected version. }
+  FInstallExitCode := RunSh(
+    [FRepoRoot + '/scripts/install.sh'],
     FRepoRoot,
+    ['LWPT_VERSION=' + FResolvedTag, 'INSTALL_DIR=' + FBinDir],
+    InstallOut,
     FInstallStderr);
 
   if (FInstallExitCode <> 0) and InstallFailureIsSkippable(FInstallStderr) then
   begin
-    WriteLn('  [skip] github.com unreachable or curl missing (transient/env); '
-          + 'install-script test skipped');
+    WriteLn('  [skip] github.com unreachable (transient); install-script test skipped');
     FSkipped := True;
   end;
 end;
@@ -253,29 +299,29 @@ var R: TLwptResult;
 begin
   if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
   { Point RunLwpt at the freshly-installed binary + ask its version.
-    Asserts the exact string the pinned release reports — proving the
-    installed binary is the right architecture, not corrupt, and
-    runnable. See EXPECTED_REPORTED_VERSION on why this can differ from
-    the installed tag for pre-stamp-from-tag releases. }
+    Expected is DERIVED from the resolved tag (binary == tag, per the
+    stamp-from-tag policy in ADR-0018) — one source of truth, no second
+    constant to drift. Proves the binary is the right architecture, not
+    corrupt, and runnable. }
   SetLwptBinaryPath(FBinDir + '/lwpt');
   R := RunLwpt(['--version']);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<string>(Trim(R.Stdout)).ToBe('lwpt ' + EXPECTED_REPORTED_VERSION);
+  Expect<string>(Trim(R.Stdout)).ToBe('lwpt ' + StripLeadingV(FResolvedTag));
 end;
 
 procedure TInstallScriptE2E.SetupTests;
 begin
-  Test('install.sh exits zero installing the published release',
+  Test('install.sh exits zero installing the latest published release',
     TestInstallScriptExitsZero);
   Test('binary lands in INSTALL_DIR and is executable',
     TestBinaryInstalledAndExecutable);
-  Test('installed binary reports the expected version',
+  Test('installed binary reports the resolved tag as its version',
     TestInstalledBinaryReportsVersion);
 end;
 
 begin
   TestRunnerProgram.AddSuite(TInstallScriptE2E.Create(
-    'install.sh: published-release smoke (E2E)'));
+    'install.sh: latest-release smoke (E2E)'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

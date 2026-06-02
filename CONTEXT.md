@@ -161,6 +161,10 @@ The earlier inline `{ [gpm patch] }` / `{ [LWPT patch] }` comment convention. Re
 A **relocation event** for a package — leaving LWPT's monorepo for its own standalone repo. NOT a state transition of the package's identity (the package is canonical-at-LWPT before and canonical-at-its-own-repo after; the *thing* doesn't change, only its filesystem location + consumption mechanism). Triggered when warranted by signals like an external contributor base, a release cadence diverging from LWPT's, or CI / docs needs that warrant dedicated workflows. Per ADR-0017, each graduation gets its own ADR documenting trigger + transition plan. Today's five in-monorepo packages (`httpclient`, `cli`, `semver`, `toml`, `testing`) plus the `source/`-resident extraction candidate (`Platform.pas`) are all canonical regardless of where they live; graduation is mechanical, not categorical.
 *Avoid*: "extraction" alone (suggests a one-way pull); "split" (suggests separation; graduation is specifically becoming a peer-located standalone repo).
 
+**Prerelease** (the GitHub-flag sense):
+A per-release boolean on a GitHub Release. `release.yml` sets it from the *tag shape*: a tag containing a hyphen (`0.1.0-rc.2`, `0.2.0-beta`) is published with `prerelease: true`; a plain `MAJOR.MINOR.PATCH` tag (`0.1.0`, `1.4.2`) is a normal release. The GitHub `/releases/latest` API returns the newest **normal** (non-prerelease-flagged) release, ignoring prerelease-flagged ones. This is **orthogonal to "pre-1.0"**: `0.1.0` is a pre-1.0 SemVer version but, published without a hyphen, it is a *normal* release that `/releases/latest` returns. Tooling that resolves "latest" (install scripts, the install-script e2e test) keys off the GitHub flag, not the 1.0 milestone.
+*Avoid*: conflating "prerelease" (the GitHub flag, hyphen-driven) with "pre-1.0" (a `0.x.y` SemVer version) — they are independent; a `0.x.y` can be either flagged or normal.
+
 ## Example dialogue
 
 > **Reviewer**: This PR adds a new dep — why does `lwpt.lock` show two versions of `horse`?

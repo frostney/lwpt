@@ -446,6 +446,48 @@ jobs:
             dist/lwpt-*.zip
             dist/lwpt-*-checksums.txt
 
+  install-smoke:
+    # Post-publish gate: run the REAL install.sh against the release we
+    # just published and assert the installed binary reports the tag.
+    # This validates what the build job's native --version check cannot:
+    # that the uploaded assets are downloadable, correctly named (the
+    # macOS .zip-vs-.tar.gz class, PR #8), checksum-valid, and yield a
+    # runnable binary. Targets the just-cut tag explicitly (no constant),
+    # so it covers prerelease-flagged rc.x too — the everyday e2e
+    # InstallScript test only resolves non-prerelease "latest". See
+    # ADR-0018 for the three-layer install/version validation model.
+    needs: publish
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install published release + verify reported version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then TAG="$INPUT_TAG"; else TAG="${GITHUB_REF_NAME}"; fi
+          VERSION="${TAG#v}"
+
+          SCRATCH="$PWD/install-smoke-bin"
+          rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
+
+          echo "=== Installing ${TAG} via scripts/install.sh ==="
+          LWPT_VERSION="$TAG" INSTALL_DIR="$SCRATCH" sh scripts/install.sh
+
+          REPORTED="$("$SCRATCH/lwpt" --version | head -1)"
+          EXPECTED="lwpt ${VERSION}"
+          echo "version check: reported='${REPORTED}' expected='${EXPECTED}'"
+          if [ "$REPORTED" != "$EXPECTED" ]; then
+            echo "::error::Installed release reports '${REPORTED}', expected '${EXPECTED}'"
+            exit 1
+          fi
+          echo "OK: install.sh installed ${TAG} and the binary reports it"
+
   changelog:
     needs: publish
     if: ${{ needs.publish.result == 'success' }}
