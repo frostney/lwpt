@@ -204,6 +204,19 @@ jobs:
 
           mkdir -p build/compiled
 
+          # Stamp the release version FROM THE TAG so the binary's
+          # `lwpt --version` matches the release it ships in (e.g. a
+          # 0.1.0-rc.3 release reports `lwpt 0.1.0-rc.3`). release.yml
+          # compiles the cross-FPC directly — it does NOT go through
+          # `lwpt build`, so the [prebuild] stamp-version hook never
+          # fires here; we regenerate Version.inc explicitly. Only on
+          # tag pushes; a manual workflow_dispatch keeps the committed
+          # (manifest) version. See docs/ci.md "Release version stamping".
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            echo "=== Stamping release version from tag ${GITHUB_REF_NAME} ==="
+            LWPT_VERSION_OVERRIDE="${GITHUB_REF_NAME#v}" instantfpc scripts/stamp-version.pas
+          fi
+
           # Release-grade build: -O4 -dPRODUCTION -Xs -CX -XX -B.
           # Same flag set as ci.yml's build stage, so a tagged commit's
           # binary equals what CI produces — single artefact provenance.
@@ -225,6 +238,21 @@ jobs:
             source/lwpt.pas
 
           ls -la build/
+
+          # Validate stamp-from-tag on the native target (the only one
+          # executable on this build host). Version.inc is shared across
+          # all targets, so a correct native stamp proves it for the
+          # whole matrix. Guarded to tag pushes; skipped for cross
+          # targets (can't run a foreign binary) + manual dispatch.
+          if [ "$NATIVE" = "true" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            REPORTED="$(build/lwpt --version | head -1)"
+            EXPECTED="lwpt ${GITHUB_REF_NAME#v}"
+            echo "version check: reported='${REPORTED}' expected='${EXPECTED}'"
+            if [ "$REPORTED" != "$EXPECTED" ]; then
+              echo "::error::Release binary version mismatch: got '${REPORTED}', expected '${EXPECTED}' — stamp-from-tag failed"
+              exit 1
+            fi
+          fi
 
       - name: Stage + strip binary
         run: |
@@ -417,6 +445,53 @@ jobs:
             dist/lwpt-*.tar.gz
             dist/lwpt-*.zip
             dist/lwpt-*-checksums.txt
+
+  install-smoke:
+    # Post-publish gate: run the REAL install.sh against the release we
+    # just published and assert the installed binary reports the tag.
+    # This validates what the build job's native --version check cannot:
+    # that the uploaded assets are downloadable, correctly named (the
+    # macOS .zip-vs-.tar.gz class, PR #8), checksum-valid, and yield a
+    # runnable binary. Targets the just-cut tag explicitly (no constant),
+    # so it covers prerelease-flagged rc.x too — the everyday e2e
+    # InstallScript test only resolves non-prerelease "latest". See
+    # ADR-0018 for the three-layer install/version validation model.
+    needs: publish
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # No authenticated git ops here (we only read scripts/install.sh,
+      # then fetch from public GitHub Releases) and the job uploads no
+      # artefacts, so persisted credentials are unneeded — drop them.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install published release + verify reported version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then TAG="$INPUT_TAG"; else TAG="${GITHUB_REF_NAME}"; fi
+          VERSION="${TAG#v}"
+
+          SCRATCH="$PWD/install-smoke-bin"
+          rm -rf "$SCRATCH"; mkdir -p "$SCRATCH"
+
+          echo "=== Installing ${TAG} via scripts/install.sh ==="
+          LWPT_VERSION="$TAG" INSTALL_DIR="$SCRATCH" sh scripts/install.sh
+
+          REPORTED="$("$SCRATCH/lwpt" --version | head -1)"
+          EXPECTED="lwpt ${VERSION}"
+          echo "version check: reported='${REPORTED}' expected='${EXPECTED}'"
+          if [ "$REPORTED" != "$EXPECTED" ]; then
+            echo "::error::Installed release reports '${REPORTED}', expected '${EXPECTED}'"
+            exit 1
+          fi
+          echo "OK: install.sh installed ${TAG} and the binary reports it"
 
   changelog:
     needs: publish
