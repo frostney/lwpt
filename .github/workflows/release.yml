@@ -463,7 +463,12 @@ jobs:
       run:
         shell: bash
     steps:
+      # No authenticated git ops here (we only read scripts/install.sh,
+      # then fetch from public GitHub Releases) and the job uploads no
+      # artefacts, so persisted credentials are unneeded — drop them.
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install published release + verify reported version
         env:
