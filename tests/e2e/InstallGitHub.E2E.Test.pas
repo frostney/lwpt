@@ -14,7 +14,12 @@
   Skip semantics:
     LWPT_SKIP_NETWORK=1 → all tests in this suite count as pass with
     a "skipped" log line, exit code 0. The CI matrix runs the e2e
-    tier with LWPT_SKIP_NETWORK=1 on jobs without internet access. }
+    tier with LWPT_SKIP_NETWORK=1 on jobs without internet access.
+
+    Additionally, a clean connect/DNS failure to the host at install
+    time (IsNetworkUnavailable) flips the suite to skip — transient
+    third-party downtime is not an LWPT defect. A content/hash/parse
+    failure still fails hard. See docs/ci.md. }
 
 program InstallGitHub.E2E.Test;
 
@@ -141,6 +146,16 @@ begin
   R := RunLwpt(['install'], FRoot);
   FInstallExitCode := R.ExitCode;
   FInstallStderr   := R.Stderr;
+
+  { Transient third-party downtime (github.com unreachable at the
+    TCP/DNS layer) is not an LWPT defect — skip rather than fail. A
+    content/hash/parse failure leaves FSkipped False so the assertions
+    below still fail hard. }
+  if (not FSkipped) and IsNetworkUnavailable(R) then
+  begin
+    WriteLn('  [skip] github.com unreachable (transient network); e2e fetch skipped');
+    FSkipped := True;
+  end;
 end;
 
 procedure TInstallGithubE2E.AfterAll;

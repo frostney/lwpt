@@ -75,6 +75,25 @@ procedure SetLwptBinaryPath(const APath: string);
   WriteLn + early-return. }
 function SkipNetworkTests: Boolean;
 
+{ Did a non-zero `lwpt` result fail purely because the network / host
+  was unreachable — as opposed to LWPT producing wrong output? E2E
+  tests call this after their install run and SKIP (rather than FAIL)
+  when it returns True: a TCP connect failure or DNS resolution
+  failure to a third-party host (bitbucket.org, github.com, gitlab.com)
+  is transient infrastructure flakiness, not an LWPT defect.
+
+  Detection is deliberately NARROW — only HTTPClient's two clean
+  pre-transfer failures:
+    - "Failed to connect to <host>:<port>"   (TCP connect failed)
+    - "Failed to resolve host: <host>"        (DNS lookup failed)
+  Both fire before any byte is fetched or parsed. Errors that indicate
+  a real LWPT bug — "truncated chunked body", "no header terminator",
+  a hash mismatch, a missing extracted file — are intentionally NOT
+  matched, so the e2e assertions still fail HARD on those. The split
+  is the whole point: third-party downtime skips; LWPT regressions
+  fail. }
+function IsNetworkUnavailable(const AResult: TLwptResult): Boolean;
+
 implementation
 
 var
@@ -102,6 +121,16 @@ end;
 function SkipNetworkTests: Boolean;
 begin
   Result := GetEnvironmentVariable('LWPT_SKIP_NETWORK') = '1';
+end;
+
+function IsNetworkUnavailable(const AResult: TLwptResult): Boolean;
+var
+  Err: string;
+begin
+  if AResult.ExitCode = 0 then Exit(False);
+  Err := LowerCase(AResult.Stderr);
+  Result := (Pos('failed to connect to', Err) > 0)
+         or (Pos('failed to resolve host', Err) > 0);
 end;
 
 { Drain a stream into a string buffer. Stops at EOF; assumes the

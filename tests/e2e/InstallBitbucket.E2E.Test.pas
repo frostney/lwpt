@@ -16,8 +16,10 @@
     (e.g. `atlassian-atlaskit-d7ac1acad54e/`); StripFirstComponent
     handles whatever the top dir is.
 
-  Skip semantics: LWPT_SKIP_NETWORK=1 → tests pass with a "skipped"
-  log line. }
+  Skip semantics: LWPT_SKIP_NETWORK=1, OR a clean connect/DNS failure
+  to the host at install time (IsNetworkUnavailable — transient
+  third-party downtime, not an LWPT defect), → tests pass with a "skipped"
+  log line. A content/hash/parse failure still fails hard. See docs/ci.md. }
 
 program InstallBitbucket.E2E.Test;
 
@@ -141,6 +143,16 @@ begin
   R := RunLwpt(['install'], FRoot);
   FInstallExitCode := R.ExitCode;
   FInstallStderr   := R.Stderr;
+
+  { Transient third-party downtime (bitbucket.org unreachable at the
+    TCP/DNS layer) is not an LWPT defect — skip rather than fail. A
+    content/hash/parse failure leaves FSkipped False so the assertions
+    below still fail hard. }
+  if (not FSkipped) and IsNetworkUnavailable(R) then
+  begin
+    WriteLn('  [skip] bitbucket.org unreachable (transient network); e2e fetch skipped');
+    FSkipped := True;
+  end;
 end;
 
 procedure TInstallBitbucketE2E.AfterAll;

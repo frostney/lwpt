@@ -403,7 +403,6 @@ var
   BodyBytes: TBytes;
   BodyLen: Integer;
   ChunkBuf: AnsiString;
-  Done: Boolean;
   Remaining: Integer;
 begin
   Result.StatusCode := 0;
@@ -520,18 +519,16 @@ begin
     if Length(BodyBytes) > 0 then
       Move(BodyBytes[0], ChunkBuf[1], Length(BodyBytes));
     SetLength(Result.Body, 0);
-    Done := False;
 
-    while not Done do
+    while True do
     begin
       while Pos(CRLF, string(ChunkBuf)) = 0 do
       begin
         N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE);
-        if N <= 0 then begin Done := True; Break; end;
+        if N <= 0 then
+          raise EHTTPError.Create('Invalid HTTP response: truncated chunked body');
         AppendRawBytes(ChunkBuf, Buf[0], N); { Byte-safe — Copy(PAnsiChar) would truncate at the first #0 }
       end;
-      if Done then Break;
-
       I := Pos(CRLF, string(ChunkBuf));
       Line := Copy(string(ChunkBuf), 1, I - 1);
       Delete(ChunkBuf, 1, I + 1);
@@ -546,7 +543,8 @@ begin
       while Length(ChunkBuf) < ChunkSize + 2 do
       begin
         N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE);
-        if N <= 0 then begin Done := True; Break; end;
+        if N <= 0 then
+          raise EHTTPError.Create('Invalid HTTP response: truncated chunked body');
         AppendRawBytes(ChunkBuf, Buf[0], N); { Byte-safe — Copy(PAnsiChar) would truncate at the first #0 }
       end;
 

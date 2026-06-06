@@ -175,10 +175,33 @@ The `test --tier=e2e` step runs three live fetches per platform:
 
 Per Q23=c, these run on every platform (6 in total per push). Total network traffic per push: 18 archive fetches. If this becomes a rate-limit concern, the future fallback is `LWPT_SKIP_NETWORK=1` on N-1 of the 6 runners (the env var is respected by every E2E test).
 
+### Transient host downtime skips, it does not fail
+
+A live-network E2E test validates LWPT's fetch → extract → lockfile pipeline against a real host. When the *host* is unreachable — a TCP connect failure or DNS resolution failure to `github.com` / `gitlab.com` / `bitbucket.org` — that is third-party infrastructure flakiness, **not** an LWPT defect, so the affected suite **skips** rather than fails. The detection (`IsNetworkUnavailable` in `tests/support/Tests.LwptSubprocess.pas`) is deliberately narrow: it matches only HTTPClient's two clean pre-transfer errors — `Failed to connect to <host>:<port>` and `Failed to resolve host: <host>` — both of which fire before any byte is fetched or parsed.
+
+Crucially, this is **not** a blanket "ignore e2e failures". An install that *connects* but then produces wrong output — a truncated chunked body, a missing header terminator, a hash mismatch, a missing extracted file — leaves the skip flag unset, so the assertions run and fail hard. That split is the whole point: third-party downtime is noise; an LWPT regression in the fetch/extract/verify path is a real failure that must turn the build red. (The `0.1.0-rc.1` cycle surfaced exactly this: an `i386-win32` runner intermittently failed to reach `bitbucket.org:443`, reddening an otherwise-green main for a reason that had nothing to do with LWPT.)
+
 ## What CI does NOT cover
 
 - **`lwpt build` doesn't run on the test runner** — running it would rebuild `lwpt` with the runner's native FPC, defeating the cross-build verification. The pipeline tests the cross-built binary's *behavior* (install / format / test); the cross-build *itself* is verified by the build-stage compile.
 - **No artefact retention beyond 7 days** — set in `upload-artifact`. CI artefacts are debugging aids, not release artefacts. The release artefacts published by `release.yml` are permanent (GitHub Releases).
 - **No Pascal lint beyond `lwpt format --check`** — there's no `flake8`-style linter for FPC. Format check is the closest equivalent.
 - **No `cliff.toml` / git-cliff integration yet** — release notes are GitHub's auto-generated form, binned per [`.github/release.yml`](../.github/release.yml). If a richer changelog is needed later, dropping in `cliff.toml` + swapping to `orhun/git-cliff-action@v4` is a single-commit change.
-- **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped (the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) has no `v`; the strip handles the courtesy-accepted prefixed form). The manifest's `package.version` is the canonical source — `lwpt --version` derives `PROGRAM_VERSION` from it at compile time via `scripts/stamp-version.pas`, so the binary's reported version cannot drift from `lwpt.toml`. Whether the *tag* matches `package.version` is the maintainer's responsibility at tag time.
+- **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped (the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) has no `v`; the strip handles the courtesy-accepted prefixed form).
+
+## Release version stamping
+
+`lwpt --version` reports `PROGRAM_VERSION`, a compile-time constant generated into `source/Version.inc` by `scripts/stamp-version.pas`. The value depends on *how* the binary was built:
+
+- **Dev / local builds** (`./bootstrap.sh`, `lwpt build`): the constant is sourced from `[package].version` in `lwpt.toml`. `Version.Test.pas`'s drift guard asserts `lwpt --version` matches the manifest for these. There is no way for a locally-built binary to disagree with the manifest.
+- **Release builds** (`release.yml`, tag push): the build step exports `LWPT_VERSION_OVERRIDE=<tag-without-v>` and re-runs `stamp-version.pas` before the cross-FPC compile, so the released binary reports **the git tag**. A 0.1.0-rc.3 release reports `lwpt 0.1.0-rc.3`.
+
+This split keeps the tag, the archive name, and the binary's self-report consistent for anything a user downloads, while leaving local builds pinned to the manifest version (the dev/unreleased number). The maintainer does **not** need to bump `[package].version` per tag — the release stamps the tag itself. The rationale and rejected alternatives live in [ADR-0018](./adr/0018-release-version-stamp-from-tag.md).
+
+Three independent layers keep the tag, archive name, and binary self-report in agreement — each catches what the others can't:
+
+1. **Build-job native check (pre-publish gate).** `release.yml` runs the freshly cross-built native (`aarch64-darwin`) binary and asserts `lwpt --version == lwpt <tag>`. `Version.inc` is shared across all six targets, so a correct native stamp proves it for the whole matrix. Runs before publish — a stamping failure ships nothing.
+2. **Post-publish install-smoke job.** Runs the real `install.sh` against the just-published tag (explicit `LWPT_VERSION`, so it covers prerelease-flagged `rc.x`) and asserts the *installed* binary reports the tag. Validates the uploaded assets are downloadable, correctly named (the macOS `.zip`-vs-`.tar.gz` class, PR #8), and checksum-valid.
+3. **Everyday install-script e2e test.** `tests/e2e/InstallScript.E2E.Test.pas` resolves non-prerelease "latest" and derives the expected version from it (no pinned constant), catching `install.sh` regressions between releases.
+
+> Historical note: `0.1.0-rc.1` and `0.1.0-rc.2` were built before this stamping landed, so their binaries report `lwpt 0.1.0` (the manifest version at the time) rather than the tag. They are prerelease-flagged, so the everyday install-script test (which resolves non-prerelease "latest") never installs them; the per-release install-smoke job is what validated them at tag-cut time.
