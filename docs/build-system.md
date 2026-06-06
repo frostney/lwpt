@@ -6,7 +6,7 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 
 - **The contract:** single entry point from repo root (`./build/lwpt build`), default target = clean dev build of every binary, named targets as positional args, `--mode dev` (default) / `--mode release`, `--clean` flag, single `build/` output directory.
 - **Self-host.** LWPT's own `lwpt.toml` declares `lwpt` as a `[build]` entry; `lwpt build` rebuilds the binary that just ran. See [ADR-0005](./adr/0005-self-host-build.md).
-- **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev branch of `AddBuildModeFlags` in `LWPT.Core`.
+- **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev branch of `AddBuildModeFlags` in `LWPT.Command.Build`.
 - **Build outputs land under `build/`.** Gitignored. FPC intermediates (`.o`, `.ppu`) live there via `-FE build/`.
 - **Cross-compile via `FPC_TARGET_CPU`** env var; `lwpt build` translates this into FPC's `-P` flag.
 - **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with staleness gating (output older than any input → re-run). The earlier `[generated]` shape is no longer parsed.
@@ -47,7 +47,7 @@ lwpt = { source = "source/lwpt.pas", output = "build/lwpt" }
 - `-o build/lwpt` (the target's output)
 - `source/lwpt.pas`
 
-The full mode-flag sets are in `LWPT.Core.AddBuildModeFlags`:
+The full mode-flag sets are in `LWPT.Command.Build.AddBuildModeFlags`:
 
 | Mode | Flags |
 | --- | --- |

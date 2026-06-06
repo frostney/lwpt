@@ -42,6 +42,8 @@ type
     procedure TestUserScriptInvokesAndPropagatesExitCode;
     procedure TestAliasInstallSubcommand;
     procedure TestAliasWithFlagPassthrough;
+    procedure TestListModeOmitsRetiredExport;
+    procedure TestExportCanBeUserScriptName;
     procedure TestUnknownNameExitsNonZero;
   end;
 
@@ -159,6 +161,53 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
 end;
 
+procedure TRunE2E.TestListModeOmitsRetiredExport;
+var R: TLwptResult;
+begin
+  R := RunLwpt(['run'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('install', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('export', R.Stdout) = 0).ToBe(True);
+end;
+
+procedure TRunE2E.TestExportCanBeUserScriptName;
+var
+  R: TLwptResult;
+  ExportScratch: string;
+begin
+  ExportScratch := FScratch + '-export-script';
+  RecursiveDelete(ExportScratch);
+  ForceDirectories(ExportScratch + '/scripts');
+
+  WriteFile(ExportScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "run-export-script"'#10 +
+    'version = "0.0.0"'#10 +
+    'units = ["scripts"]'#10 +
+    ''#10 +
+    '[export]'#10 +
+    'script = "scripts/export.pas"'#10);
+
+  WriteFile(ExportScratch + '/scripts/export.pas',
+    'program ExportScript;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'uses SysUtils, Classes;'#10 +
+    'var SL: TStringList;'#10 +
+    'begin'#10 +
+    '  SL := TStringList.Create;'#10 +
+    '  try'#10 +
+    '    SL.Add(''export-script-ran'');'#10 +
+    '    SL.SaveToFile(''export-marker.txt'');'#10 +
+    '  finally'#10 +
+    '    SL.Free;'#10 +
+    '  end;'#10 +
+    'end.'#10);
+
+  R := RunLwpt(['run', 'export'], ExportScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(ExportScratch + '/export-marker.txt')).ToBe(True);
+end;
+
 procedure TRunE2E.TestUnknownNameExitsNonZero;
 var R: TLwptResult;
 begin
@@ -174,6 +223,10 @@ begin
     TestAliasInstallSubcommand);
   Test('run install --frozen passes flags through to the aliased subcommand',
     TestAliasWithFlagPassthrough);
+  Test('run lists aliases without the retired export subcommand',
+    TestListModeOmitsRetiredExport);
+  Test('export is available as a user-declared run-script name',
+    TestExportCanBeUserScriptName);
   Test('run <unknown> exits non-zero with a useful error',
     TestUnknownNameExitsNonZero);
 end;

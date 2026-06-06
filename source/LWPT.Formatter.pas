@@ -1,11 +1,11 @@
-{ LWPT.Format — uses-clause + identifier formatter.
+{ LWPT.Formatter — uses-clause + identifier formatter.
 
   The canonical entry point is FormatFile(path, mode). In rmCheck mode
   the function returns True when the file would change (without writing
   anything); in rmFormat mode it returns True after rewriting the file
-  in place. The caller (LWPT.Core.CmdFormat) handles file discovery
+  in place. The caller (LWPT.Command.Format.CmdFormat) handles file discovery
   per the manifest's [format] scope, summary stats, and exit code. }
-unit LWPT.Format;
+unit LWPT.Formatter;
 
 {$mode delphi}{$H+}
 

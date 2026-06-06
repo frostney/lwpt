@@ -14,7 +14,7 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 ## Tech stack
 
 - **Compiler:** FreePascal 3.2.2 (`fpc -iV` verified live; see `tooling.md`).
-- **Mode:** `delphi` everywhere. Project-owned units (`lwpt.pas`, the `LWPT.*` family, the `CLI.*` family) and the remaining vendored units (`Semver`, `HTTPClient`, etc) all flow through `{$I Shared.inc}` which sets `{$mode delphi} {$H+}`. `LWPT.Core.pas` additionally enables `{$modeswitch nestedcomments+}` so documentation prose can contain literal placeholder strings (the `{user}` / `{repository}` / `{ref}` substrings) without prematurely closing the surrounding `{ ... }` block.
+- **Mode:** `delphi` everywhere. Project-owned units (`lwpt.pas`, the `LWPT.*` family, the `CLI.*` family) and the remaining vendored units (`Semver`, `HTTPClient`, etc) all flow through `{$I Shared.inc}` which sets `{$mode delphi} {$H+}`. Several LWPT units additionally enable `{$modeswitch nestedcomments+}` so documentation prose can contain literal placeholder strings (the `{user}` / `{repository}` / `{ref}` substrings) without prematurely closing the surrounding `{ ... }` block.
 - **Runtime:** RTL only. No fcl-web, no fphttpclient, no third-party packages. HTTPS depends on system OpenSSL via the vendored `HTTPClient` + `TransportSecurity`.
 - **Scripts:** Pascal via InstantFPC (`scripts/bootstrap.pas`). Shell wrappers (`bootstrap.sh`, `bootstrap.bat`) fall back to direct `fpc` when InstantFPC is absent.
 
@@ -48,7 +48,7 @@ The arrow from `lwpt install` to `lwpt.cfg` is the through-line. Every other sub
 
 ## Manifest model
 
-`lwpt.toml` is partial-TOML — the reader in `LWPT.Core` deliberately omits datetimes, multiline strings, and array-of-tables (which is why `[build]` is a table-of-inline-tables, not `[[build]]`). Every section is described in [`code-style.md`](./code-style.md) and the example in the root [`README.md`](../README.md).
+`lwpt.toml` is partial-TOML — the reader consumed by `LWPT.Manifest` deliberately omits datetimes, multiline strings, and array-of-tables (which is why `[build]` is a table-of-inline-tables, not `[[build]]`). Every section is described in [`code-style.md`](./code-style.md) and the example in the root [`README.md`](../README.md).
 
 Sections currently supported:
 
@@ -69,7 +69,7 @@ Dependency source shapes (per [ADR-0009](./adr/0009-source-syntax-and-tag-resolu
 
 ## Resolver shape
 
-The resolver in `LWPT.Core` is a breadth-first walk starting at the root manifest's `[dependencies]`. For each dependency:
+The resolver in `LWPT.Install` is a breadth-first walk starting at the root manifest's `[dependencies]`. For each dependency:
 
 1. Look up the node in the resolution graph (`FindNode` + `TouchNode`).
 2. If new, fetch into `.lwpt/archives/<dep>-<version>.tar.gz`, extract into `.lwpt/modules/<dep>/`, and read that dep's own `lwpt.toml`.
@@ -143,7 +143,7 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 
 ## Vendored code
 
-`source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`, `LWPT.Format.pas`, `LWPT.GitProtocol.pas`) plus a small remainder of utility units (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` — live under `packages/<name>/` per [ADR-0014](./adr/0014-packages-extraction.md) + [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) + [ADR-0017](./adr/0017-packages-lwpt-canonical.md). Each is a standalone Pascal project with its own `lwpt.toml`, `source/`, tests, version, and bundled `Shared.inc`; LWPT's root manifest auto-discovers them via `[workspaces] include = ["packages/*"]`. [`packages.md`](./packages.md) is the table of the package set, the divergence vs GocciaScript's older copies, the bootstrap chicken-and-egg story, and the graduation roadmap. The Hard Constraint in `AGENTS.md` is "Packages own their contents" — the root LWPT manifest does not modify a package's source from outside, and each package owns its own versioning + format scope + lifecycle hooks + public surface.
+`source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`, `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.Command.*.pas`, `LWPT.Formatter.pas`, `LWPT.GitProtocol.pas`) plus a small remainder of utility units (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` — live under `packages/<name>/` per [ADR-0014](./adr/0014-packages-extraction.md) + [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) + [ADR-0017](./adr/0017-packages-lwpt-canonical.md). Each is a standalone Pascal project with its own `lwpt.toml`, `source/`, tests, version, and bundled `Shared.inc`; LWPT's root manifest auto-discovers them via `[workspaces] include = ["packages/*"]`. [`packages.md`](./packages.md) is the table of the package set, the divergence vs GocciaScript's older copies, the bootstrap chicken-and-egg story, and the graduation roadmap. The Hard Constraint in `AGENTS.md` is "Packages own their contents" — the root LWPT manifest does not modify a package's source from outside, and each package owns its own versioning + format scope + lifecycle hooks + public surface.
 
 ## Deferred contracts
 

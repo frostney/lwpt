@@ -1,12 +1,12 @@
-{ LWPT.Format.Test — formatter idempotence + nested-declarations
+{ LWPT.Formatter.Test — formatter idempotence + nested-declarations
   regression. Covers the bug fixed in a later cycle where the formatter A-prefixed
   parameter names in signatures but failed to propagate the rename
   through bodies of functions containing nested `type record` or
   nested `procedure`/`function` declarations. The fix lives in
-  LWPT.Format.FindFuncEnd (recursive descent + `record` in the depth-up
+  LWPT.Formatter.FindFuncEnd (recursive descent + `record` in the depth-up
   set); this test exercises every shape that broke before. }
 
-program LWPT.Format.Test;
+program LWPT.Formatter.Test;
 
 {$mode delphi}{$H+}
 
@@ -14,8 +14,9 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.Command.Format,
   LWPT.Core,
-  LWPT.Format,
+  LWPT.Formatter,
   TestingPascalLibrary;
 
 type
@@ -531,9 +532,9 @@ begin
 end;
 
 begin
-  TestRunnerProgram.AddSuite(TFormatIdempotence.Create('LWPT.Format: idempotence'));
-  TestRunnerProgram.AddSuite(TFormatParamRename.Create('LWPT.Format: param-rename regression'));
-  TestRunnerProgram.AddSuite(TFormatScopeExpansion.Create('LWPT.Format: scope expansion (ADR-0007)'));
+  TestRunnerProgram.AddSuite(TFormatIdempotence.Create('LWPT.Formatter: idempotence'));
+  TestRunnerProgram.AddSuite(TFormatParamRename.Create('LWPT.Formatter: param-rename regression'));
+  TestRunnerProgram.AddSuite(TFormatScopeExpansion.Create('LWPT.Formatter: scope expansion (ADR-0007)'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

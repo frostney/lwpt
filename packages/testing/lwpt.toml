@@ -3,7 +3,7 @@
 # Vendored from GocciaScript verbatim (no patches). Graduated into a
 # standalone LWPT package per ADR-0015 (replaces the earlier embedded-
 # blob + `lwpt export testing` model with regular workspace-package
-# consumption). The CmdTest discovery loop in LWPT.Core finds tests
+# consumption). The CmdTest discovery loop in LWPT.Command.Testing finds tests
 # via this package's units once `lwpt install` has linked it into
 # `.lwpt/modules/testing/` — same path as every other workspace dep.
 #

@@ -1,4 +1,4 @@
-{ ExtractPathological.Test — integration test for LWPT.Core.ExtractArchive
+{ ExtractPathological.Test — integration test for LWPT.Install.ExtractArchive
   against the specific tar shapes that motivated lwpt's custom ustar
   reader instead of FPC's bundled libtar.
 
@@ -30,6 +30,7 @@ uses
   SysUtils,
 
   LWPT.Core,
+  LWPT.Install,
   TestingPascalLibrary,
   Tests.TarSynth;
 

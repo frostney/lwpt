@@ -19,6 +19,8 @@ uses
 
   LWPT.Core,
   LWPT.GitProtocol,
+  LWPT.Install,
+  LWPT.Manifest,
   TestingPascalLibrary;
 
 type
@@ -72,16 +74,6 @@ type
     procedure TestSchemaV1RaisesWithMigrationHint;
     procedure TestEmptyPackageTableReturnsEmptyArray;
     procedure TestPackageEntriesRoundTripFields;
-  end;
-
-  { TInstallLock cross-process behaviour. Second-acquire raises;
-    release deletes the lock file so subsequent acquires succeed. }
-  TInstallLockBehavior = class(TTestSuite)
-  public
-    procedure SetupTests; override;
-    procedure TestFirstAcquireWritesPidFile;
-    procedure TestSecondAcquireRaisesEConcurrencyError;
-    procedure TestThirdAcquireSucceedsAfterFirstReleases;
   end;
 
   { VerifyAgainstLockfile cross-checks. Exercises every mismatch
@@ -817,79 +809,6 @@ begin
     TestEmptyPackageTableReturnsEmptyArray);
   Test('package entries round-trip every field',
     TestPackageEntriesRoundTripFields);
-end;
-
-{ ── TInstallLockBehavior ──────────────────────────────────────── }
-
-const
-  LOCK_PATH = 'build/tests/tmp/install-lock.tmp';
-
-procedure TInstallLockBehavior.TestFirstAcquireWritesPidFile;
-var Lock: TInstallLock; SL: TStringList;
-begin
-  DeleteFile(LOCK_PATH);
-  ForceDirectories(ExtractFileDir(LOCK_PATH));
-  Lock := TInstallLock.Create(LOCK_PATH);
-  try
-    Expect<Boolean>(FileExists(LOCK_PATH)).ToBe(True);
-    SL := TStringList.Create;
-    try
-      SL.LoadFromFile(LOCK_PATH);
-      { File contains a PID line. Don't assert on the exact value
-        (varies per run); assert it's at least a positive integer. }
-      Expect<Boolean>(StrToIntDef(Trim(SL.Text), -1) > 0).ToBe(True);
-    finally
-      SL.Free;
-    end;
-  finally
-    Lock.Free;
-  end;
-  { Lock release deletes the file. }
-  Expect<Boolean>(FileExists(LOCK_PATH)).ToBe(False);
-end;
-
-procedure TInstallLockBehavior.TestSecondAcquireRaisesEConcurrencyError;
-var First, Second: TInstallLock; Raised: Boolean;
-begin
-  DeleteFile(LOCK_PATH);
-  First := TInstallLock.Create(LOCK_PATH);
-  try
-    Raised := False;
-    try
-      Second := TInstallLock.Create(LOCK_PATH);
-      Second.Free;
-    except
-      on E: EConcurrencyError do Raised := True;
-    end;
-    Expect<Boolean>(Raised).ToBe(True);
-  finally
-    First.Free;
-  end;
-end;
-
-procedure TInstallLockBehavior.TestThirdAcquireSucceedsAfterFirstReleases;
-var Lock: TInstallLock;
-begin
-  DeleteFile(LOCK_PATH);
-  Lock := TInstallLock.Create(LOCK_PATH);
-  Lock.Free;
-  { Second acquire after first released — should succeed cleanly. }
-  Lock := TInstallLock.Create(LOCK_PATH);
-  try
-    Expect<Boolean>(FileExists(LOCK_PATH)).ToBe(True);
-  finally
-    Lock.Free;
-  end;
-end;
-
-procedure TInstallLockBehavior.SetupTests;
-begin
-  Test('first acquire writes the lock file with our PID',
-    TestFirstAcquireWritesPidFile);
-  Test('second acquire raises EConcurrencyError naming the holder',
-    TestSecondAcquireRaisesEConcurrencyError);
-  Test('lock can be re-acquired after first instance is freed',
-    TestThirdAcquireSucceedsAfterFirstReleases);
 end;
 
 { ── TVerifyAgainstLockfile ────────────────────────────────────── }
@@ -1835,25 +1754,23 @@ begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
     'LWPT.Core: SHA-256 NIST vectors'));
   TestRunnerProgram.AddSuite(TLoadManifestHappy.Create(
-    'LWPT.Core: LoadManifest happy path'));
+    'LWPT.Manifest: LoadManifest happy path'));
   TestRunnerProgram.AddSuite(TLoadManifestValidation.Create(
-    'LWPT.Core: LoadManifest validation'));
+    'LWPT.Manifest: LoadManifest validation'));
   TestRunnerProgram.AddSuite(TLoadManifestExtensions.Create(
-    'LWPT.Core: LoadManifest extensions ([lwpt] / [format] / [generated])'));
+    'LWPT.Manifest: LoadManifest extensions ([lwpt] / [format] / [generated])'));
   TestRunnerProgram.AddSuite(TLockfileLoading.Create(
-    'LWPT.Core: LoadLockfile'));
-  TestRunnerProgram.AddSuite(TInstallLockBehavior.Create(
-    'LWPT.Core: TInstallLock behaviour'));
+    'LWPT.Install: LoadLockfile'));
   TestRunnerProgram.AddSuite(TVerifyAgainstLockfile.Create(
-    'LWPT.Core: VerifyAgainstLockfile'));
+    'LWPT.Install: VerifyAgainstLockfile'));
   TestRunnerProgram.AddSuite(TParseDependencySource.Create(
-    'LWPT.Core: ParseDependencySource'));
+    'LWPT.Manifest: ParseDependencySource'));
   TestRunnerProgram.AddSuite(TParseVersionSpec.Create(
-    'LWPT.Core: ParseVersionSpec'));
+    'LWPT.Manifest: ParseVersionSpec'));
   TestRunnerProgram.AddSuite(TGitProtocolParsing.Create(
     'LWPT.GitProtocol: ParseInfoRefs'));
   TestRunnerProgram.AddSuite(TCustomSources.Create(
-    'LWPT.Core: Custom [sources]'));
+    'LWPT.Manifest: Custom [sources]'));
   TestRunnerProgram.AddSuite(TPathGlobMatching.Create(
     'LWPT.Core: MatchPathGlob'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
