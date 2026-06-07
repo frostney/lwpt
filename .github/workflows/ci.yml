@@ -348,7 +348,14 @@ jobs:
         if: matrix.bootstrap-check == true
         shell: cmd
         run: |
-          for %%I in ("%LWPT_FPC%") do set "PATH=%%~dpI;%PATH%"
+          rem Exercise bootstrap.bat's direct-fpc fallback path. Chocolatey's
+          rem instantfpc does not inherit the package paths needed to compile
+          rem scripts\bootstrap.pas on this runner.
+          set "BOOTSTRAP_PATH=%RUNNER_TEMP%\lwpt-bootstrap-path"
+          if not exist "%BOOTSTRAP_PATH%" mkdir "%BOOTSTRAP_PATH%"
+          > "%BOOTSTRAP_PATH%\fpc.cmd" echo @echo off
+          >> "%BOOTSTRAP_PATH%\fpc.cmd" echo "%LWPT_FPC%" %%*
+          set "PATH=%BOOTSTRAP_PATH%;%PATH%"
           call bootstrap.bat
           if errorlevel 1 exit /b %errorlevel%
           build\lwpt.exe --help
