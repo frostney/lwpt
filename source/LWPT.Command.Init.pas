@@ -59,19 +59,24 @@ begin
   end;
 end;
 
-{ Pascal identifiers can't contain hyphens, but package names + entry
-  names happily do (npm convention; LWPT inherits it). The `program
-  X;` declaration must be a valid identifier, so we sanitise by
-  replacing hyphens with underscores. The filename + target name +
+{ Package names + entry names follow LWPT's project-name grammar, while
+  `program X;` must be a Pascal identifier. The filename + target name +
   greeting text keep the original spelling — FPC doesn't require the
-  program name to match the filename, so this stays out of the user's
-  way. }
+  program name to match the filename, so this stays out of the user's way. }
 function SanitisePascalIdent(const S: string): string;
 var i: Integer;
 begin
-  Result := S;
-  for i := 1 to Length(Result) do
-    if Result[i] = '-' then Result[i] := '_';
+  Result := '';
+  for i := 1 to Length(S) do
+    if (S[i] in ['a'..'z']) or (S[i] in ['A'..'Z'])
+       or (S[i] in ['0'..'9']) or (S[i] = '_') then
+      Result := Result + S[i]
+    else
+      Result := Result + '_';
+  if Result = '' then
+    Result := '_';
+  if Result[1] in ['0'..'9'] then
+    Result := '_' + Result;
 end;
 
 procedure WriteHelloProgram(const APath, AEntryName: string);
@@ -218,13 +223,14 @@ begin
     Exit;
   end;
 
-  if PromptYesNo('run `lwpt install` and `lwpt build` now?', True) then
+  if PromptYesNo('run `' + PROGRAM_NAME + ' install` and `'
+    + PROGRAM_NAME + ' build` now?', True) then
   begin
     WriteLn;
-    WriteLn('--- lwpt install ---');
+    WriteLn('--- ', PROGRAM_NAME, ' install ---');
     CmdInstall(MANIFEST_FILE, False);
     WriteLn;
-    WriteLn('--- lwpt build ---');
+    WriteLn('--- ', PROGRAM_NAME, ' build ---');
     CmdBuild(MANIFEST_FILE, '', False, False);
     WriteLn;
     WriteLn('Run ./', BuildDir, '/', EntryName, ' to try it.');

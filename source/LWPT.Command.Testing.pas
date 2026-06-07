@@ -151,7 +151,9 @@ begin
     if Tests.Count = 0 then
     begin
       WriteLn('no *.Test.pas files found');
-      Exit(0);
+      Result := 0;
+      RunHooks('posttest', Man.PostTest);
+      Exit;
     end;
 
     WriteLn('discovered ', Tests.Count, ' test file(s)');

@@ -104,7 +104,7 @@ type
     procedure TestGithubPrefixExplicit;
     procedure TestUnknownPrefixRejected;
     procedure TestHttpsURLIsURLKind;
-    procedure TestHttpURLIsURLKind;
+    procedure TestHttpURLRejected;
     procedure TestLocalDotSlashPath;
     procedure TestLocalParentSlashPath;
     procedure TestLocalAbsolutePath;
@@ -206,6 +206,8 @@ type
     procedure TestArchiveTemplateMissingRefPlaceholderRejected;
     procedure TestArchiveTemplateMissingUserPlaceholderRejected;
     procedure TestGitTemplateMissingRepositoryPlaceholderRejected;
+    procedure TestArchiveTemplateHttpRejected;
+    procedure TestGitTemplateHttpRejected;
     procedure TestShadowingBuiltinPrefixRejected;
     procedure TestDepWithCustomPrefixRoutes;
     procedure TestDepWithUndeclaredCustomPrefixRejected;
@@ -1006,10 +1008,9 @@ begin
     'https://example.com/foo.tar.gz', Self);
 end;
 
-procedure TParseDependencySource.TestHttpURLIsURLKind;
+procedure TParseDependencySource.TestHttpURLRejected;
 begin
-  ExpectSource('http://internal/foo.tar.gz', skURL, hkGitHub,
-    'http://internal/foo.tar.gz', Self);
+  ExpectSourceRejected('http://internal/foo.tar.gz', 'plain HTTP', Self);
 end;
 
 procedure TParseDependencySource.TestLocalDotSlashPath;
@@ -1067,7 +1068,8 @@ begin
     TestUnknownPrefixRejected);
   Test('"https://..." is skURL with the URL as locator',
     TestHttpsURLIsURLKind);
-  Test('"http://..." also treated as skURL', TestHttpURLIsURLKind);
+  Test('"http://..." is rejected; dependency URLs must use HTTPS',
+    TestHttpURLRejected);
   Test('"./path" implicit local', TestLocalDotSlashPath);
   Test('"../path" implicit local', TestLocalParentSlashPath);
   Test('"/abs/path" absolute implicit local', TestLocalAbsolutePath);
@@ -1655,6 +1657,36 @@ begin
     'must contain both {user} and {repository}', Self);
 end;
 
+procedure TCustomSources.TestArchiveTemplateHttpRejected;
+begin
+  ExpectManifestLoadError(WriteCustomSourceManifest('http-archive',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'gitea = { '
+    + 'archive = "http://git.example.com/{user}/{repository}/archive/{ref}.tar.gz", '
+    + 'git = "https://git.example.com/{user}/{repository}.git"'
+    + ' }'#10),
+    'must use https://', Self);
+end;
+
+procedure TCustomSources.TestGitTemplateHttpRejected;
+begin
+  ExpectManifestLoadError(WriteCustomSourceManifest('http-git',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'gitea = { '
+    + 'archive = "https://git.example.com/{user}/{repository}/archive/{ref}.tar.gz", '
+    + 'git = "http://git.example.com/{user}/{repository}.git"'
+    + ' }'#10),
+    'must use https://', Self);
+end;
+
 procedure TCustomSources.TestShadowingBuiltinPrefixRejected;
 begin
   ExpectManifestLoadError(WriteCustomSourceManifest('shadow-github',
@@ -1740,6 +1772,10 @@ begin
     TestArchiveTemplateMissingUserPlaceholderRejected);
   Test('git template missing {repository} placeholder hard-errors',
     TestGitTemplateMissingRepositoryPlaceholderRejected);
+  Test('archive template using plain HTTP hard-errors',
+    TestArchiveTemplateHttpRejected);
+  Test('git template using plain HTTP hard-errors',
+    TestGitTemplateHttpRejected);
   Test('[sources] entry shadowing a built-in name hard-errors',
     TestShadowingBuiltinPrefixRejected);
   Test('dep with custom prefix routes to hkCustom + correct host name',

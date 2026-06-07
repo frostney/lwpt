@@ -17,48 +17,46 @@ uses
   LWPT.Core,
   LWPT.Manifest;
 
-procedure WipeDirContents(const ADir: string);
-var SR: TSearchRec; Base, FullPath: string;
+function LooksLikeAbsolutePath(const APath: string): Boolean;
 begin
-  if not DirectoryExists(ADir) then Exit;
-  Base := IncludeTrailingPathDelimiter(ADir);
-  if FindFirst(Base + '*', faAnyFile, SR) = 0 then
-  begin
-    repeat
-      if (SR.Name = '.') or (SR.Name = '..') then Continue;
-      FullPath := Base + SR.Name;
-      if (SR.Attr and faDirectory) <> 0 then
-      begin
-        WipeDirContents(FullPath);
-        RemoveDir(FullPath);
-      end
-      else
-        DeleteFile(FullPath);
-    until FindNext(SR) <> 0;
-    FindClose(SR);
-  end;
+  Result := (APath <> '') and ((APath[1] = '/') or (APath[1] = '\'));
+  if Result then Exit;
+  Result := (Length(APath) >= 2)
+        and (APath[1] in ['a'..'z', 'A'..'Z'])
+        and (APath[2] = ':');
+end;
+
+function ResolveRepairPath(const AProjectRoot, APath: string): string;
+begin
+  if APath = '' then Exit('');
+  if LooksLikeAbsolutePath(APath) then
+    Exit(ExpandFileName(APath));
+  Result := ExpandFileName(IncludeTrailingPathDelimiter(AProjectRoot) + APath);
 end;
 
 procedure CmdRepair(const AManifestPath: string);
 var
-  Man : TManifest;
-  TmpRoot : string;
+  Ctx : TManifestContext;
+  TmpRoot, LockPath : string;
 begin
-  Man := LoadManifest(AManifestPath);
-  TmpRoot := ResolveTmpDir(Man);
+  Ctx := LoadManifestContext(AManifestPath);
+  TmpRoot := ResolveRepairPath(Ctx.ProjectRoot, ResolveTmpDir(Ctx.Manifest));
+  LockPath := ResolveRepairPath(Ctx.ProjectRoot, INSTALL_LOCK);
 
   if DirectoryExists(TmpRoot) then
   begin
-    WipeDirContents(TmpRoot);
+    WipeDir(TmpRoot);
     WriteLn('repair: cleaned ', TmpRoot, '/');
   end
   else
     WriteLn('repair: no ', TmpRoot, '/ to clean');
 
-  if FileExists(INSTALL_LOCK) then
+  if FileExists(LockPath) then
   begin
-    DeleteFile(INSTALL_LOCK);
-    WriteLn('repair: removed stale ', INSTALL_LOCK);
+    if not DeleteFile(LockPath) then
+      raise EConcurrencyError.CreateFmt(
+        'repair: failed to remove stale install lock at %s', [LockPath]);
+    WriteLn('repair: removed stale ', LockPath);
   end
   else
     WriteLn('repair: no install lock to remove');

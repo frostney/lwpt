@@ -314,6 +314,13 @@ procedure TInstallLocalDiamond.TestManifestPathInstallUsesManifestDirectory;
 var
   OldDir, Cfg: string;
 begin
+  DiamondRecursiveDelete(FRoot + '/.lwpt');
+  DiamondRecursiveDelete(FScratch + '/.lwpt');
+  if FileExists(FRoot + '/lwpt.lock') then DeleteFile(FRoot + '/lwpt.lock');
+  if FileExists(FRoot + '/lwpt.cfg') then DeleteFile(FRoot + '/lwpt.cfg');
+  if FileExists(FScratch + '/lwpt.lock') then DeleteFile(FScratch + '/lwpt.lock');
+  if FileExists(FScratch + '/lwpt.cfg') then DeleteFile(FScratch + '/lwpt.cfg');
+
   OldDir := GetCurrentDir;
   try
     SetCurrentDir(FScratch);
@@ -326,6 +333,9 @@ begin
   Expect<Boolean>(FileExists(FRoot + '/lwpt.cfg')).ToBe(True);
   Expect<Boolean>(DirectoryExists(FRoot + '/.lwpt/modules/branch-a'))
     .ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/lwpt.lock')).ToBe(False);
+  Expect<Boolean>(FileExists(FScratch + '/lwpt.cfg')).ToBe(False);
+  Expect<Boolean>(DirectoryExists(FScratch + '/.lwpt/modules')).ToBe(False);
 
   Cfg := ReadFileText(FRoot + '/lwpt.cfg');
   Expect<Boolean>(Pos(FRoot, Cfg) = 0).ToBe(True);

@@ -80,6 +80,14 @@ function  HashTree(const APathOrArchive: string): string;
 
 implementation
 
+uses
+  {$IFDEF UNIX}
+  BaseUnix
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows
+  {$ENDIF};
+
 function FPCExecutable: string;
 begin
   Result := GetEnvironmentVariable('LWPT_FPC');
@@ -373,21 +381,38 @@ begin
   S := IncludeTrailingPathDelimiter(ASrc);
   D := IncludeTrailingPathDelimiter(ADst);
   if FindFirst(S + '*', faAnyFile, SR) = 0 then
-  begin
-    repeat
-      if (SR.Name = '.') or (SR.Name = '..') then Continue;
-      if (SR.Attr and faDirectory) <> 0 then
-        CopyDirTree(S + SR.Name, D + SR.Name)
-      else
-        CopyFileContent(S + SR.Name, D + SR.Name);
-    until FindNext(SR) <> 0;
-    FindClose(SR);
-  end;
+    try
+      repeat
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        if (SR.Attr and faDirectory) <> 0 then
+          CopyDirTree(S + SR.Name, D + SR.Name)
+        else if not CopyFileContent(S + SR.Name, D + SR.Name) then
+          raise EExtractError.CreateFmt(
+            'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
+      until FindNext(SR) <> 0;
+    finally
+      FindClose(SR);
+    end;
 end;
 
 function ProcessIdStr: string;
 begin
   Result := IntToStr(GetProcessID);
+end;
+
+function MakeSiblingTmpPath(const APath, ATag: string): string;
+var
+  Dir, Base: string;
+  Counter: Int64;
+begin
+  Dir := ExtractFileDir(APath);
+  Base := ExtractFileName(APath);
+  repeat
+    Counter := Round(Now * 1000000);
+    Result := IncludeTrailingPathDelimiter(Dir)
+            + Base + '.' + ATag + '.' + ProcessIdStr + '.'
+            + IntToStr(Counter) + '.tmp';
+  until (not FileExists(Result)) and (not DirectoryExists(Result));
 end;
 
 function MakeTmpPath(const ATmpRoot, AHint: string): string;
@@ -399,9 +424,64 @@ begin
           + AHint + '.' + ProcessIdStr + '.' + IntToStr(Counter) + '.tmp';
 end;
 
+function IsDirSymlinkOrJunction(const APath: string): Boolean;
+{$IFDEF UNIX}
+var Info: BaseUnix.Stat;
+begin
+  if FpLstat(APath, Info) <> 0 then Exit(False);
+  Result := FpS_ISLNK(Info.st_mode);
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var Attrs: Cardinal;
+begin
+  Attrs := Windows.GetFileAttributesW(PWideChar(UnicodeString(APath)));
+  if Attrs = $FFFFFFFF then Exit(False);
+  Result := (Attrs and $400) <> 0;  { FILE_ATTRIBUTE_REPARSE_POINT }
+end;
+{$ENDIF}
+
+function RemoveDirLink(const APath: string): Boolean;
+{$IFDEF UNIX}
+begin
+  Result := FpUnlink(APath) = 0;
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+begin
+  Result := Windows.RemoveDirectoryW(PWideChar(UnicodeString(APath)));
+end;
+{$ENDIF}
+
+function PathExists(const APath: string): Boolean; inline;
+begin
+  Result := FileExists(APath) or DirectoryExists(APath)
+        or IsDirSymlinkOrJunction(APath);
+end;
+
+procedure RemovePath(const APath: string);
+begin
+  if IsDirSymlinkOrJunction(APath) then
+  begin
+    if not RemoveDirLink(APath) then
+      raise EExtractError.CreateFmt('failed to remove link "%s"', [APath]);
+    Exit;
+  end;
+  if DirectoryExists(APath) then
+    WipeDir(APath)
+  else if FileExists(APath) and not DeleteFile(APath) then
+    raise EExtractError.CreateFmt('failed to delete "%s"', [APath]);
+end;
+
 procedure WipeDir(const APath: string);
 var SR: TSearchRec; Base, Full: string;
 begin
+  if IsDirSymlinkOrJunction(APath) then
+  begin
+    if not RemoveDirLink(APath) then
+      raise EExtractError.CreateFmt('failed to remove link "%s"', [APath]);
+    Exit;
+  end;
   if not DirectoryExists(APath) then Exit;
   Base := IncludeTrailingPathDelimiter(APath);
   if FindFirst(Base + '*', faAnyFile, SR) = 0 then
@@ -411,51 +491,114 @@ begin
         Full := Base + SR.Name;
         if (SR.Attr and faDirectory) <> 0 then
           WipeDir(Full)
-        else
-          DeleteFile(Full);
+        else if not DeleteFile(Full) then
+          raise EExtractError.CreateFmt('failed to delete "%s"', [Full]);
       until FindNext(SR) <> 0;
     finally
       FindClose(SR);
     end;
-  RemoveDir(APath);
+  if not RemoveDir(APath) then
+    raise EExtractError.CreateFmt('failed to remove directory "%s"', [APath]);
 end;
 
 function AtomicMoveFile(const ASrc, ADst: string): Boolean;
-var DstDir: string;
+var
+  DstDir, Backup: string;
+
+  procedure RestoreBackup;
+  begin
+    if Backup = '' then Exit;
+    if FileExists(ADst) then DeleteFile(ADst);
+    if FileExists(Backup) then RenameFile(Backup, ADst);
+  end;
+
 begin
   if not FileExists(ASrc) then Exit(False);
-  if FileExists(ADst) then DeleteFile(ADst);
   DstDir := ExtractFileDir(ADst);
   if DstDir <> '' then ForceDirectories(DstDir);
-  Result := RenameFile(ASrc, ADst);
-  if Result then Exit;
-  { Rename failed — most commonly EXDEV (cross-filesystem). Fall back
-    to copy-then-delete; the source is untouched until the copy is
-    fully written, so a crash mid-copy still leaves the source intact
-    for retry. }
-  if CopyFileContent(ASrc, ADst) then
+  Backup := '';
+  Result := False;
+
+  if FileExists(ADst) then
   begin
-    DeleteFile(ASrc);
-    Result := True;
+    Backup := MakeSiblingTmpPath(ADst, 'old');
+    if not RenameFile(ADst, Backup) then Exit(False);
+  end;
+
+  try
+    Result := RenameFile(ASrc, ADst);
+    if not Result then
+    begin
+      { Rename failed — most commonly EXDEV (cross-filesystem). Fall back
+        to copy-then-delete; the old destination is held aside and restored
+        if the copy cannot be completed. }
+      if CopyFileContent(ASrc, ADst) then
+      begin
+        DeleteFile(ASrc);
+        Result := True;
+      end;
+    end;
+
+    if Result then
+    begin
+      if Backup <> '' then DeleteFile(Backup);
+      Exit;
+    end;
+
+    RestoreBackup;
+  except
+    RestoreBackup;
+    raise;
   end;
 end;
 
 function AtomicMoveDir(const ASrc, ADst: string): Boolean;
-var DstDir: string;
+var
+  DstDir, Backup: string;
+
+  procedure RestoreBackup;
+  begin
+    if Backup = '' then Exit;
+    if PathExists(ADst) then RemovePath(ADst);
+    if PathExists(Backup) then RenameFile(Backup, ADst);
+  end;
+
 begin
   if not DirectoryExists(ASrc) then Exit(False);
-  WipeDir(ADst);   { idempotent: tolerates the dst not existing }
   DstDir := ExtractFileDir(ExcludeTrailingPathDelimiter(ADst));
   if DstDir <> '' then ForceDirectories(DstDir);
-  Result := RenameFile(ASrc, ADst);
-  if Result then Exit;
-  { EXDEV path: recursive copy + wipe-source. Slower, not strictly
-    atomic against crashes mid-copy, but the partial-state isn't worse
-    than what we started with — repair recovers. }
-  ForceDirectories(ADst);
-  CopyDirTree(ASrc, ADst);
-  WipeDir(ASrc);
-  Result := DirectoryExists(ADst);
+  Backup := '';
+  Result := False;
+
+  if PathExists(ADst) then
+  begin
+    Backup := MakeSiblingTmpPath(ExcludeTrailingPathDelimiter(ADst), 'old');
+    if not RenameFile(ADst, Backup) then Exit(False);
+  end;
+
+  try
+    Result := RenameFile(ASrc, ADst);
+    if not Result then
+    begin
+      { EXDEV path: recursive copy + wipe-source. The old destination
+        remains recoverable until the copy finishes. }
+      ForceDirectories(ADst);
+      CopyDirTree(ASrc, ADst);
+      WipeDir(ASrc);
+      Result := DirectoryExists(ADst);
+    end;
+
+    if Result then
+    begin
+      if Backup <> '' then RemovePath(Backup);
+      Exit;
+    end;
+
+    RestoreBackup;
+  except
+    RestoreBackup;
+    raise;
+  end;
 end;
 
 procedure EnsureDstDir(const ADst: string);

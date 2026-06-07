@@ -85,14 +85,17 @@ begin
   {$ENDIF}
   if ExtractFileDir(OutBin) <> '' then
     ForceDirectories(ExtractFileDir(OutBin));
+  ForceDirectories('build');
 
-  { clean build: remove the stale binary and the FPC artefacts next to the
-    source so nothing is reused }
+  { clean build: remove the stale binary and FPC artefacts from both the
+    old source-adjacent location and the canonical build output dir. }
   if AClean then
   begin
     if FileExists(OutBin) then DeleteFile(OutBin);
     DeleteFile(ChangeFileExt(T.Source, '.o'));
     DeleteFile(ChangeFileExt(T.Source, '.ppu'));
+    DeleteFile('build/' + ExtractFileName(ChangeFileExt(T.Source, '.o')));
+    DeleteFile('build/' + ExtractFileName(ChangeFileExt(T.Source, '.ppu')));
   end;
 
   Write('  building ', T.Name, ' (', T.Source, ') ... ');
@@ -105,6 +108,7 @@ begin
     if Arch <> '' then P.Parameters.Add('-P' + Arch);
 
     P.Parameters.Add('-Sh');
+    P.Parameters.Add('-FEbuild');
     { resolved dependency search paths: the manifest-resolved cfg path,
       if install has run (zero-install repos commit it, so this should
       almost always be present). }

@@ -229,6 +229,7 @@ begin
     skGitHost : Result := 'githost';
     skURL     : Result := 'url';
     skLocal   : Result := 'local';
+    skWorkspace : Result := 'workspace';
   end;
 end;
 
@@ -344,8 +345,12 @@ begin
   if ASource = '' then
     raise EManifestError.Create('dependency source is empty');
 
-  if StartsWithStr(ASource, 'https://')
-     or StartsWithStr(ASource, 'http://') then
+  if StartsWithStr(ASource, 'http://') then
+    raise EManifestError.CreateFmt(
+      'dependency source "%s" uses plain HTTP; use an https:// URL',
+      [ASource]);
+
+  if StartsWithStr(ASource, 'https://') then
   begin
     AKind := skURL; ALocator := ASource; Exit;
   end;
@@ -999,7 +1004,7 @@ end;
 procedure DiscoverWorkspaces(const AIncludes, AExcludes: array of string;
   const ABaseDir: string; out AWorkspaces: TWorkspaceArray);
 var
-  Candidates : TStringList;
+  Candidates, UniqueCandidates : TStringList;
   i, j, n : Integer;
   Manifest : string;
   Excluded : Boolean;
@@ -1014,9 +1019,16 @@ begin
     for i := Low(AIncludes) to High(AIncludes) do
       CollectWorkspaceCandidates(AIncludes[i], ABaseDir, Candidates);
     { Dedupe + sort for deterministic ordering across runs. }
-    Candidates.Sorted := True;
-    Candidates.Duplicates := dupIgnore;
-    { Re-add via temp list to apply dedupe. }
+    UniqueCandidates := TStringList.Create;
+    try
+      UniqueCandidates.Sorted := True;
+      UniqueCandidates.Duplicates := dupIgnore;
+      for i := 0 to Candidates.Count - 1 do
+        UniqueCandidates.Add(Candidates[i]);
+      Candidates.Assign(UniqueCandidates);
+    finally
+      UniqueCandidates.Free;
+    end;
     n := Candidates.Count;
 
     for i := 0 to n - 1 do
@@ -1202,6 +1214,14 @@ begin
             + '%s. See ADR-0009.',
             [CS.Name, PLACEHOLDER_USER, PLACEHOLDER_REPOSITORY,
              PLACEHOLDER_REF]);
+        if not StartsWithStr(CS.ArchiveTemplate, 'https://') then
+          raise EManifestError.CreateFmt(
+            '[sources] %s: archive template "%s" must use https://',
+            [CS.Name, CS.ArchiveTemplate]);
+        if not StartsWithStr(CS.GitTemplate, 'https://') then
+          raise EManifestError.CreateFmt(
+            '[sources] %s: git template "%s" must use https://',
+            [CS.Name, CS.GitTemplate]);
         { The archive template needs {ref} (the git template doesn't
           — it points at the smart-HTTP info/refs endpoint, which
           we then list to discover refs). Catch missing {user} /

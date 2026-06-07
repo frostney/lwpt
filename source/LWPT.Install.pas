@@ -92,52 +92,6 @@ begin
   else Result := S;
 end;
 
-{ Build the download URL for a network-sourced dependency. }
-{ Byte-for-byte file copy. Returns False on failure. }
-function CopyFileContent(const ASrc, ADst: string): Boolean;
-var SrcS, DstS: TFileStream;
-begin
-  Result := False;
-  if not FileExists(ASrc) then Exit;
-  try
-    SrcS := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
-    try
-      DstS := TFileStream.Create(ADst, fmCreate);
-      try
-        if SrcS.Size > 0 then DstS.CopyFrom(SrcS, SrcS.Size);
-      finally
-        DstS.Free;
-      end;
-    finally
-      SrcS.Free;
-    end;
-    Result := True;
-  except
-    Result := False;
-  end;
-end;
-
-{ Recursive directory copy. Used for the local source and for resolving
-  directory symlinks during extraction. }
-procedure CopyDirTree(const ASrc, ADst: string);
-var SR: TSearchRec; S, D: string;
-begin
-  ForceDirectories(ADst);
-  S := IncludeTrailingPathDelimiter(ASrc);
-  D := IncludeTrailingPathDelimiter(ADst);
-  if FindFirst(S + '*', faAnyFile, SR) = 0 then
-  begin
-    repeat
-      if (SR.Name = '.') or (SR.Name = '..') then Continue;
-      if (SR.Attr and faDirectory) <> 0 then
-        CopyDirTree(S + SR.Name, D + SR.Name)
-      else
-        CopyFileContent(S + SR.Name, D + SR.Name);
-    until FindNext(SR) <> 0;
-    FindClose(SR);
-  end;
-end;
-
 { Repo basename from an owner/repo slug — needed for GitLab's archive URL,
   which embeds the repo name in the filename. }
 function RepoBasename(const ASlug: string): string;
@@ -405,120 +359,6 @@ end;
 const
   LOCKFILE_SCHEMA_VERSION = 3;
 
-function ProcessIdStr: string;
-begin
-  Result := IntToStr(GetProcessID);
-end;
-
-function MakeTmpPath(const ATmpRoot, AHint: string): string;
-var Counter: Int64;
-begin
-  ForceDirectories(ATmpRoot);
-  Counter := Round(Now * 1000000);   { microseconds since epoch-ish; unique enough }
-  Result := IncludeTrailingPathDelimiter(ATmpRoot)
-          + AHint + '.' + ProcessIdStr + '.' + IntToStr(Counter) + '.tmp';
-end;
-
-procedure WipeDir(const APath: string);
-var SR: TSearchRec; Base, Full: string;
-begin
-  if not DirectoryExists(APath) then Exit;
-  Base := IncludeTrailingPathDelimiter(APath);
-  if FindFirst(Base + '*', faAnyFile, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        Full := Base + SR.Name;
-        if (SR.Attr and faDirectory) <> 0 then
-          WipeDir(Full)
-        else
-          DeleteFile(Full);
-      until FindNext(SR) <> 0;
-    finally
-      FindClose(SR);
-    end;
-  RemoveDir(APath);
-end;
-
-function AtomicMoveFile(const ASrc, ADst: string): Boolean;
-var DstDir: string;
-begin
-  if not FileExists(ASrc) then Exit(False);
-  if FileExists(ADst) then DeleteFile(ADst);
-  DstDir := ExtractFileDir(ADst);
-  if DstDir <> '' then ForceDirectories(DstDir);
-  Result := RenameFile(ASrc, ADst);
-  if Result then Exit;
-  { Rename failed — most commonly EXDEV (cross-filesystem). Fall back
-    to copy-then-delete; the source is untouched until the copy is
-    fully written, so a crash mid-copy still leaves the source intact
-    for retry. }
-  if CopyFileContent(ASrc, ADst) then
-  begin
-    DeleteFile(ASrc);
-    Result := True;
-  end;
-end;
-
-function AtomicMoveDir(const ASrc, ADst: string): Boolean;
-var DstDir: string;
-begin
-  if not DirectoryExists(ASrc) then Exit(False);
-  WipeDir(ADst);   { idempotent: tolerates the dst not existing }
-  DstDir := ExtractFileDir(ExcludeTrailingPathDelimiter(ADst));
-  if DstDir <> '' then ForceDirectories(DstDir);
-  Result := RenameFile(ASrc, ADst);
-  if Result then Exit;
-  { EXDEV path: recursive copy + wipe-source. Slower, not strictly
-    atomic against crashes mid-copy, but the partial-state isn't worse
-    than what we started with — repair recovers. }
-  ForceDirectories(ADst);
-  CopyDirTree(ASrc, ADst);
-  WipeDir(ASrc);
-  Result := DirectoryExists(ADst);
-end;
-
-procedure EnsureDstDir(const ADst: string);
-var D: string;
-begin
-  D := ExtractFileDir(ADst);
-  if D <> '' then ForceDirectories(D);
-end;
-
-procedure AtomicWriteText(const ADst: string;
-  const ATmpRoot: string; const AContent: TStringList);
-var Tmp: string;
-begin
-  Tmp := MakeTmpPath(ATmpRoot, 'write-' + ExtractFileName(ADst));
-  EnsureDstDir(ADst);
-  AContent.SaveToFile(Tmp);
-  if not AtomicMoveFile(Tmp, ADst) then
-  begin
-    DeleteFile(Tmp);
-    raise EExtractError.CreateFmt(
-      'atomic write of "%s" failed (could not commit tmp file)', [ADst]);
-  end;
-end;
-
-procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
-var Tmp: string; Stream: TFileStream;
-begin
-  Tmp := MakeTmpPath(ATmpRoot, 'write-' + ExtractFileName(ADst));
-  EnsureDstDir(ADst);
-  Stream := TFileStream.Create(Tmp, fmCreate);
-  try
-    if Length(ABytes) > 0 then Stream.WriteBuffer(ABytes[0], Length(ABytes));
-  finally
-    Stream.Free;
-  end;
-  if not AtomicMoveFile(Tmp, ADst) then
-  begin
-    DeleteFile(Tmp);
-    raise EExtractError.CreateFmt(
-      'atomic write of "%s" failed (could not commit tmp file)', [ADst]);
-  end;
-end;
-
 { Sha256 of a TBytes for the [resolved].archiveHash field. The same hex
   shape as HashTree ('sha256:<hex>') so callers can compare directly. }
 function SHA256BytesPrefixed(const ABytes: TBytes): string;
@@ -771,40 +611,6 @@ begin
   {$ENDIF}
 end;
 
-{ Detect: is APath a symlink (Unix) / junction or symlink (Windows)?
-  Used by WipeInstalledDep to choose unlink-the-link vs recurse-and-delete. }
-function IsDirSymlinkOrJunction(const APath: string): Boolean;
-{$IFDEF UNIX}
-var Info: BaseUnix.Stat;
-begin
-  if FpLstat(APath, Info) <> 0 then Exit(False);
-  Result := FpS_ISLNK(Info.st_mode);
-end;
-{$ENDIF}
-{$IFDEF MSWINDOWS}
-var Attrs: Cardinal;
-begin
-  Attrs := Windows.GetFileAttributesW(PWideChar(UnicodeString(APath)));
-  if Attrs = $FFFFFFFF then Exit(False);  { INVALID_FILE_ATTRIBUTES }
-  Result := (Attrs and $400) <> 0;  { FILE_ATTRIBUTE_REPARSE_POINT }
-end;
-{$ENDIF}
-
-{ Remove the link itself; never follow into the target. }
-function RemoveDirLink(const APath: string): Boolean;
-{$IFDEF UNIX}
-begin
-  Result := FpUnlink(APath) = 0;
-end;
-{$ENDIF}
-{$IFDEF MSWINDOWS}
-begin
-  { RemoveDirectoryW on a junction removes the reparse point (the link
-    itself), NOT the target — this is the documented + safe call. }
-  Result := Windows.RemoveDirectoryW(PWideChar(UnicodeString(APath)));
-end;
-{$ENDIF}
-
 { Native junction creation on Windows — no `mklink /J` shell-out, no
   Developer Mode required (junctions need only write permission to the
   parent dir). Uses CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT +
@@ -900,23 +706,31 @@ begin
 end;
 {$ENDIF}
 
-{ Wipe a previously-installed dep before re-installing. CRITICAL: if the
-  prior install was a link (symlink/junction), we must unlink — never
-  recurse, which would delete the link's TARGET (i.e. the source
-  packages/ tree). pnpm's well-publicised data-loss incident was caused
-  by exactly this footgun applied externally (PowerShell rm -rf on a
-  junctioned node_modules). }
-procedure WipeInstalledDep(const APath: string);
+function SafeArchiveTag(const ARef: string): string;
+var
+  i: Integer;
 begin
-  if IsDirSymlinkOrJunction(APath) then
-  begin
-    if not RemoveDirLink(APath) then
-      raise EFetchError.CreateFmt(
-        'failed to remove existing link at %s before re-install', [APath]);
-    Exit;
-  end;
-  if not DirectoryExists(APath) then Exit;
-  WipeDir(APath);
+  Result := '';
+  for i := 1 to Length(ARef) do
+    if (ARef[i] in ['a'..'z']) or (ARef[i] in ['A'..'Z'])
+       or (ARef[i] in ['0'..'9']) or (ARef[i] in ['.', '_', '-']) then
+      Result := Result + ARef[i]
+    else
+      Result := Result + '_';
+  if Result = '' then
+    Result := 'ref';
+end;
+
+function ArchivePathForRef(const AArchivesRoot, AName: string;
+  ASrcKind: TSourceKind; const AResolvedRef: string): string;
+var ArchiveTag: string;
+begin
+  if ASrcKind = skURL then
+    ArchiveTag := 'url'
+  else
+    ArchiveTag := SafeArchiveTag(AResolvedRef);
+  Result := IncludeTrailingPathDelimiter(AArchivesRoot)
+          + AName + '-' + ArchiveTag + '.tar.gz';
 end;
 
 function FetchToCache(const ADep: TDependency;
@@ -929,11 +743,32 @@ var
   URL, LocalPath : string;
   Resp : THTTPResponse;
   NoHeaders : THTTPHeaders;
-  ArchiveTag : string;
   EffectiveDep : TDependency;
   k : Integer;
   WSPath : string;
   AvailableNames : string;
+  StagePath : string;
+
+  procedure StageLocalCopy(const AMessage: string);
+  begin
+    StagePath := MakeTmpPath(ATmpRoot, 'local-' + ADep.Name);
+    ForceDirectories(StagePath);
+    try
+      CopyDirTree(LocalPath, StagePath);
+      if not AtomicMoveDir(StagePath, AUnitDir) then
+        raise EFetchError.CreateFmt(
+          'failed to commit local source "%s" into %s',
+          [LocalPath, AUnitDir]);
+    except
+      on E: Exception do
+      begin
+        if DirectoryExists(StagePath) then
+          WipeDir(StagePath);
+        raise;
+      end;
+    end;
+    WriteLn('  copied ', ADep.Name, AMessage);
+  end;
 begin
   Result := False;
   AUnitDir := IncludeTrailingPathDelimiter(AModulesRoot) + ADep.Name;
@@ -995,11 +830,23 @@ begin
       independently. Per-dep decision; AProjectRoot is the dir of the
       root manifest. See ADR-0014 amendment §"Symlink/junction for
       monorepo deps". }
-    WipeInstalledDep(AUnitDir);
     if (AProjectRoot <> '')
        and IsPathInside(AProjectRoot, LocalPath) then
     begin
-      if not CreateDirLink(AUnitDir, LocalPath) then
+      StagePath := MakeTmpPath(ATmpRoot, 'link-' + ADep.Name);
+      if CreateDirLink(StagePath, LocalPath) then
+      begin
+        if not AtomicMoveDir(StagePath, AUnitDir) then
+        begin
+          if DirectoryExists(StagePath) then
+            WipeDir(StagePath);
+          raise EFetchError.CreateFmt(
+            'failed to commit link for "%s" into %s',
+            [ADep.Name, AUnitDir]);
+        end;
+        WriteLn('  linked ', ADep.Name);
+      end
+      else
       begin
         { Link creation failed (rare — Windows without junction
           permission, FS that doesn't support links, etc). Fall back
@@ -1007,19 +854,15 @@ begin
           the failure cue and the recovery. }
         WriteLn(ErrOutput, '  warning: link failed for ', ADep.Name,
           '; falling back to copy');
-        ForceDirectories(AUnitDir);
-        CopyDirTree(LocalPath, AUnitDir);
-        WriteLn('  copied ', ADep.Name, ' (link fallback)');
-      end
-      else
-        WriteLn('  linked ', ADep.Name);
+        if DirectoryExists(StagePath) then
+          WipeDir(StagePath);
+        StageLocalCopy(' (link fallback)');
+      end;
     end
     else
     begin
       { External-path dep — always copy. }
-      ForceDirectories(AUnitDir);
-      CopyDirTree(LocalPath, AUnitDir);
-      WriteLn('  copied ', ADep.Name);
+      StageLocalCopy('');
     end;
     Exit(True);
   end;
@@ -1037,15 +880,10 @@ begin
     raise EFetchError.CreateFmt('fetch %s failed: HTTP %d %s',
       [URL, Resp.StatusCode, Resp.StatusText]);
 
-  { Archive filename uses the resolved ref for git-host sources, or
-    a derived tag for URL sources (the URL's basename without the
-    .tar.gz / .zip extension). }
-  if ADep.SrcKind = skGitHost then
-    ArchiveTag := AResolvedRef
-  else
-    ArchiveTag := 'url';
-  AArchive := IncludeTrailingPathDelimiter(AArchivesRoot)
-             + ADep.Name + '-' + ArchiveTag + '.tar.gz';
+  { Archive filename uses an escaped resolved ref for git-host sources,
+    or the stable "url" tag for direct archive URLs. }
+  AArchive := ArchivePathForRef(AArchivesRoot, ADep.Name, ADep.SrcKind,
+    AResolvedRef);
   AArchiveHash := SHA256BytesPrefixed(Resp.Body);
   AtomicWriteBytes(AArchive, ATmpRoot, Resp.Body);
   Result := True;
@@ -1133,6 +971,80 @@ begin
     Result := Copy(AStrippedPath, Length(Pfx) + 1, MaxInt)
   else
     Result := '';   { outside the requested subsection — skip }
+end;
+
+function LooksLikeAbsoluteArchivePath(const APath: string): Boolean;
+begin
+  Result := (APath <> '') and ((APath[1] = '/') or (APath[1] = '\'));
+  if Result then Exit;
+  Result := (Length(APath) >= 2)
+        and (APath[1] in ['a'..'z', 'A'..'Z'])
+        and (APath[2] = ':');
+end;
+
+function PathIsInsideRoot(const ARoot, APath: string): Boolean;
+var
+  Root, Candidate: string;
+begin
+  Root := IncludeTrailingPathDelimiter(ExpandFileName(ARoot));
+  Candidate := ExpandFileName(APath);
+  {$IFDEF MSWINDOWS}
+  Result := SameText(Copy(Candidate, 1, Length(Root)), Root);
+  {$ELSE}
+  Result := Copy(Candidate, 1, Length(Root)) = Root;
+  {$ENDIF}
+end;
+
+function ArchiveRelPathHasParentSegment(const ARelPath: string): Boolean;
+var
+  S, Part: string;
+  StartAt, i: Integer;
+begin
+  Result := False;
+  S := StringReplace(ARelPath, '\', '/', [rfReplaceAll]);
+  StartAt := 1;
+  for i := 1 to Length(S) + 1 do
+    if (i > Length(S)) or (S[i] = '/') then
+    begin
+      Part := Copy(S, StartAt, i - StartAt);
+      if Part = '..' then Exit(True);
+      StartAt := i + 1;
+    end;
+end;
+
+function ResolveArchiveOutputPath(const ADest, ARelName: string): string;
+var
+  Rel, Candidate: string;
+begin
+  Rel := StringReplace(ARelName, '\', '/', [rfReplaceAll]);
+  if (Rel = '') or LooksLikeAbsoluteArchivePath(Rel)
+     or ArchiveRelPathHasParentSegment(Rel) then
+    raise EExtractError.CreateFmt(
+      'archive entry path escapes extraction root: %s', [ARelName]);
+  Candidate := ExpandFileName(IncludeTrailingPathDelimiter(ADest) + Rel);
+  if not PathIsInsideRoot(ADest, Candidate) then
+    raise EExtractError.CreateFmt(
+      'archive entry path escapes extraction root: %s', [ARelName]);
+  Result := NativePath(Candidate);
+end;
+
+function ResolveArchiveLinkTarget(const ADest, ALinkPath,
+  ATargetName, AFromRel: string): string;
+var
+  Target, Candidate: string;
+begin
+  Target := StringReplace(ATargetName, '\', '/', [rfReplaceAll]);
+  if LooksLikeAbsoluteArchivePath(Target) then
+    raise EExtractError.CreateFmt(
+      'archive link target escapes extraction root: %s -> %s',
+      [AFromRel, ATargetName]);
+  Candidate := ExpandFileName(
+    IncludeTrailingPathDelimiter(ExtractFileDir(ALinkPath)) + Target);
+  if not PathIsInsideRoot(ADest, Candidate) then
+    raise EExtractError.CreateFmt(
+      'archive link target escapes extraction root: %s -> %s',
+      [AFromRel, ATargetName]);
+  Result := NativePath(Candidate);
 end;
 
 function ExtractArchive(const AArchivePath, ADest: string;
@@ -1247,7 +1159,7 @@ begin
         Continue;
       end;
 
-      OutName := NativePath(IncludeTrailingPathDelimiter(ADest) + RelName);
+      OutName := ResolveArchiveOutputPath(ADest, RelName);
 
       case Chr(TypeFlag) of
         '5':   { directory }
@@ -1298,9 +1210,9 @@ begin
   { Deferred pass: resolve links now that all real files exist. }
   for li := 0 to High(PendingLinks) do
   begin
-    ResolvedTarget := ExpandFileName(
-      IncludeTrailingPathDelimiter(ExtractFileDir(PendingLinks[li].LinkPath))
-      + PendingLinks[li].TargetName);
+    ResolvedTarget := ResolveArchiveLinkTarget(ADest,
+      PendingLinks[li].LinkPath, PendingLinks[li].TargetName,
+      PendingLinks[li].FromRel);
     if FileExists(ResolvedTarget) then
     begin
       OutDir := ExtractFileDir(PendingLinks[li].LinkPath);
@@ -1911,7 +1823,11 @@ procedure ResolveGraph(const ARootMan: TManifest; var R: TResolution;
   const AWorkspaces: TWorkspaceArray;
   AFrozen: Boolean);
 type
-  TWorkItem = record Dep: TDependency; RequiredBy: string; end;
+  TWorkItem = record
+    Dep: TDependency;
+    RequiredBy: string;
+    CustomSources: TCustomSourceArray;
+  end;
 var
   Queue : array of TWorkItem;
   Head  : Integer;
@@ -1922,19 +1838,31 @@ var
     ExtractTmp : string;
   ChildMan : TManifest;
 
-  procedure Enqueue(const D: TDependency; const ABy: string);
+  procedure CopyCustomSources(const ASrc: TCustomSourceArray;
+    out ADst: TCustomSourceArray);
+  var
+    k: Integer;
+  begin
+    SetLength(ADst, Length(ASrc));
+    for k := 0 to High(ASrc) do
+      ADst[k] := ASrc[k];
+  end;
+
+  procedure Enqueue(const D: TDependency; const ABy: string;
+    const ACustomSources: TCustomSourceArray);
   var q: Integer;
   begin
     q := Length(Queue);
     SetLength(Queue, q + 1);
     Queue[q].Dep := D;
     Queue[q].RequiredBy := ABy;
+    CopyCustomSources(ACustomSources, Queue[q].CustomSources);
   end;
 
 begin
   { seed the queue with the root manifest's direct deps }
   for i := 0 to High(ARootMan.Deps) do
-    Enqueue(ARootMan.Deps[i], ARootMan.Name);
+    Enqueue(ARootMan.Deps[i], ARootMan.Name, ARootMan.CustomSources);
 
   Head := 0;
   while Head < Length(Queue) do
@@ -1978,17 +1906,16 @@ begin
     else
     begin
       { Resolve the concrete ref before fetching. For vkNone (local
-        sources), ResolveDepRef returns ''. Custom prefixes are
-        looked up against the ROOT manifest's [sources] table;
-        child manifests declaring their own [sources] is a v1.x
-        consideration. }
+        sources), ResolveDepRef returns ''. Custom prefixes are looked
+        up against the [sources] table from the manifest that declared
+        this dependency. }
       R.Nodes[idx].Version := ResolveDepRef(Item.Dep,
-        ARootMan.CustomSources);
+        Item.CustomSources);
       WriteLn('  fetching ', Item.Dep.Name, ' @ ', R.Nodes[idx].Version,
               '  (required by ', Item.RequiredBy, ')');
       FetchToCache(Item.Dep, R.Nodes[idx].Version,
                    AModulesRoot, AArchivesRoot, ATmpRoot, AProjectRoot,
-                   ARootMan.CustomSources, AWorkspaces,
+                   Item.CustomSources, AWorkspaces,
                    UnitDir, Archive, ArchiveHash, ResolvedURL);
       if (Archive <> '') and FileExists(Archive) then
       begin
@@ -2049,7 +1976,7 @@ begin
       for i := 0 to High(ChildMan.Units) do
         R.Nodes[idx].UnitSubdirs[i] := ChildMan.Units[i];
       for i := 0 to High(ChildMan.Deps) do
-        Enqueue(ChildMan.Deps[i], Item.Dep.Name);
+        Enqueue(ChildMan.Deps[i], Item.Dep.Name, ChildMan.CustomSources);
     end;
   end;
 end;
@@ -2155,12 +2082,8 @@ begin
     begin
       Lock := ALockEntries[k];
       if Lock.SrcKind = skLocal then Exit;
-      Archive := IncludeTrailingPathDelimiter(AArchivesRoot)
-               + AGraphEntry.Name + '-';
-      if Lock.SrcKind = skURL then
-        Archive := Archive + 'url.tar.gz'
-      else
-        Archive := Archive + Lock.Version + '.tar.gz';
+      Archive := ArchivePathForRef(AArchivesRoot, AGraphEntry.Name,
+        Lock.SrcKind, Lock.Version);
       if FileExists(Archive) then
         AGraphEntry.ArchiveHash := 'sha256:' + SHA256File(Archive);
       Exit;
