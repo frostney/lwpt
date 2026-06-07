@@ -836,15 +836,15 @@ begin
       StagePath := MakeTmpPath(ATmpRoot, 'link-' + ADep.Name);
       if CreateDirLink(StagePath, LocalPath) then
       begin
-        if not AtomicMoveDir(StagePath, AUnitDir) then
+        if AtomicMoveDir(StagePath, AUnitDir) then
+          WriteLn('  linked ', ADep.Name)
+        else
         begin
-          if DirectoryExists(StagePath) then
-            WipeDir(StagePath);
-          raise EFetchError.CreateFmt(
-            'failed to commit link for "%s" into %s',
-            [ADep.Name, AUnitDir]);
+          WipeDir(StagePath);
+          WriteLn(ErrOutput, '  warning: link commit failed for ', ADep.Name,
+            '; falling back to copy');
+          StageLocalCopy(' (link commit fallback)');
         end;
-        WriteLn('  linked ', ADep.Name);
       end
       else
       begin
