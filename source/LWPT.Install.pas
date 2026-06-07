@@ -440,7 +440,7 @@ begin
   begin
     FpClose(FFD);
     FFD := -1;
-    DeleteFile(FPath);   { release: file existence == lock held }
+    SysUtils.DeleteFile(FPath);   { release: file existence == lock held }
   end;
   inherited Destroy;
 end;
@@ -519,7 +519,7 @@ begin
   begin
     Windows.CloseHandle(FHandle);
     FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
-    DeleteFile(FPath);
+    SysUtils.DeleteFile(FPath);
     raise EConcurrencyError.Create(
       'another ' + PROGRAM_NAME
       + ' install is in progress. Try again when it finishes.');
@@ -539,7 +539,7 @@ begin
     Windows.UnlockFileEx(FHandle, 0, 1, 0, Ov);
     Windows.CloseHandle(FHandle);
     FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
-    DeleteFile(FPath);
+    SysUtils.DeleteFile(FPath);
   end;
   inherited Destroy;
 end;
@@ -556,7 +556,7 @@ end;
 function ExpandLocalPath(const APath: string): string;
 begin
   if (Length(APath) >= 2) and (APath[1] = '~') and (APath[2] = '/') then
-    Result := IncludeTrailingPathDelimiter(GetEnvironmentVariable('HOME'))
+    Result := IncludeTrailingPathDelimiter(SysUtils.GetEnvironmentVariable('HOME'))
               + Copy(APath, 3, MaxInt)
   else
     Result := APath;
@@ -1225,7 +1225,7 @@ begin
     end
     else if DirectoryExists(ResolvedTarget) then
     begin
-      DeleteFile(PendingLinks[li].LinkPath);
+      SysUtils.DeleteFile(PendingLinks[li].LinkPath);
       CopyDirTree(ResolvedTarget, PendingLinks[li].LinkPath);
     end
     else
@@ -1233,7 +1233,7 @@ begin
               PendingLinks[li].FromRel, ' -> ', PendingLinks[li].TargetName);
   end;
 
-  DeleteFile(TarPath);   { temp .tar no longer needed }
+  SysUtils.DeleteFile(TarPath);   { temp .tar no longer needed }
 end;
 
 { ===========================================================================
@@ -1612,7 +1612,7 @@ procedure CollectFiles(const ARoot, ARel: string; AList: TStringList);
 var SR: TSearchRec; Path, RelPath: string;
 begin
   Path := IncludeTrailingPathDelimiter(ARoot + ARel);
-  if FindFirst(Path + '*', faAnyFile, SR) = 0 then
+  if SysUtils.FindFirst(Path + '*', faAnyFile, SR) = 0 then
   begin
     repeat
       if (SR.Name = '.') or (SR.Name = '..') then Continue;
@@ -1621,8 +1621,8 @@ begin
         CollectFiles(ARoot, RelPath + PathDelim, AList)
       else
         AList.Add(RelPath);
-    until FindNext(SR) <> 0;
-    FindClose(SR);
+    until SysUtils.FindNext(SR) <> 0;
+    SysUtils.FindClose(SR);
   end;
 end;
 
@@ -1986,10 +1986,10 @@ function FileSizeBytes(const APath: string): string;
 var SR: TSearchRec;
 begin
   Result := '0';
-  if FindFirst(APath, faAnyFile, SR) = 0 then
+  if SysUtils.FindFirst(APath, faAnyFile, SR) = 0 then
   begin
     Result := IntToStr(SR.Size);
-    FindClose(SR);
+    SysUtils.FindClose(SR);
   end;
 end;
 
