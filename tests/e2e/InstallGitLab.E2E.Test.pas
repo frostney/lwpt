@@ -3,11 +3,12 @@
   pattern was wired from GitLab's docs in a later cycle but never live-tested
   per the handoff's "honest gaps" item).
 
-  Fixture: gitlab-org/release-cli @ tag v0.16.0
+  Fixture: gitlab-examples/ci-debug-trace @ commit
+  dd648b2e48ce6518303b0bb580b2ee32fadaf045
 
-    GitLab's own CLI tool for managing releases. Small (~55 KB
-    archive), public, and pinned to a tagged release that
-    gitlab-org has been treating as immutable. URL pattern:
+    GitLab's CI debug-trace example project. Tiny (< 1 KB archive),
+    public, and pinned to an immutable commit SHA so the archive's
+    contents stay stable. URL pattern:
 
       https://gitlab.com/<slug>/-/archive/<ref>/<repo>-<ref>.tar.gz
 
@@ -31,9 +32,9 @@ uses
   Tests.LwptSubprocess;
 
 const
-  REPO_SLUG = 'gitlab-org/release-cli';
-  REPO_REF  = 'v0.16.0';
-  DEP_NAME  = 'release-cli';
+  REPO_SLUG = 'gitlab-examples/ci-debug-trace';
+  REPO_REF  = 'dd648b2e48ce6518303b0bb580b2ee32fadaf045';
+  DEP_NAME  = 'ci-debug-trace';
 
 type
   TInstallGitLabE2E = class(TTestSuite)
@@ -114,9 +115,8 @@ begin
     'units = ["source"]'#10 +
     ''#10 +
     '[dependencies]'#10 +
-    { gitlab: prefix shape. REPO_REF is "v0.16.0" — vkLiteralTag,
-      direct fetch. (SemVer-shaped "0.16.0" would resolve to the
-      same tag via the vkSemverExact fallback path.) }
+    { gitlab: prefix shape. REPO_REF is a full commit SHA, so the
+      resolver treats it as a direct immutable ref. }
     DEP_NAME + ' = "gitlab:' + REPO_SLUG + '@' + REPO_REF + '"'#10);
 end;
 
@@ -173,12 +173,11 @@ begin
   if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
   ModuleDir := FRoot + '/.lwpt/modules/' + DEP_NAME;
   Expect<Boolean>(DirectoryExists(ModuleDir)).ToBe(True);
-  { release-cli ships a Makefile + README.md in its archive root;
+  { ci-debug-trace ships a README.md + .gitlab-ci.yml in its archive root;
     we don't pin to specific filenames (GitLab may evolve), just
     assert SOMETHING extracted under the modules dir. }
   Expect<Boolean>(FileExists(ModuleDir + '/README.md')
-               or FileExists(ModuleDir + '/Makefile')
-               or FileExists(ModuleDir + '/go.mod')).ToBe(True);
+               or FileExists(ModuleDir + '/.gitlab-ci.yml')).ToBe(True);
 end;
 
 procedure TInstallGitLabE2E.TestLockfileRecordsArchiveAndTreeHashes;
@@ -188,7 +187,7 @@ begin
   Lock := ReadFileText(FRoot + '/lwpt.lock');
   Expect<Boolean>(Pos('[package.' + DEP_NAME + ']', Lock) > 0).ToBe(True);
   { Schema v3: the `source` field is the verbatim manifest
-    string ("gitlab:gitlab-org/release-cli") — the gitlab: prefix
+    string ("gitlab:gitlab-examples/ci-debug-trace") — the gitlab: prefix
     encodes the host. No more lossy `sourceType = "github"` for all
     three hosts. The host is also recoverable from the resolvedURL. }
   Expect<Boolean>(Pos('source = "gitlab:' + REPO_SLUG + '"', Lock) > 0).ToBe(True);

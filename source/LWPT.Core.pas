@@ -90,9 +90,9 @@ uses
 
 function FPCExecutable: string;
 begin
-  Result := GetEnvironmentVariable('LWPT_FPC');
+  Result := SysUtils.GetEnvironmentVariable('LWPT_FPC');
   if Result = '' then
-    Result := GetEnvironmentVariable('FPC');
+    Result := SysUtils.GetEnvironmentVariable('FPC');
   if Result <> '' then
     Exit;
   {$IFDEF MSWINDOWS}
@@ -104,9 +104,9 @@ end;
 
 function InstantFPCExecutable: string;
 begin
-  Result := GetEnvironmentVariable('LWPT_INSTANTFPC');
+  Result := SysUtils.GetEnvironmentVariable('LWPT_INSTANTFPC');
   if Result = '' then
-    Result := GetEnvironmentVariable('INSTANTFPC');
+    Result := SysUtils.GetEnvironmentVariable('INSTANTFPC');
   if Result <> '' then
     Exit;
   {$IFDEF MSWINDOWS}
@@ -121,7 +121,7 @@ var
   Raw, Part : string;
   StartAt, i : Integer;
 begin
-  Raw := GetEnvironmentVariable('LWPT_FPC_UNIT_PATHS');
+  Raw := SysUtils.GetEnvironmentVariable('LWPT_FPC_UNIT_PATHS');
   if Raw = '' then
     Exit;
 
@@ -320,7 +320,7 @@ procedure ApplyIncludeExclude(const ARoot: string;
   begin
     Result := 0;
     Base := IncludeTrailingPathDelimiter(ADir);
-    if FindFirst(Base + '*', faAnyFile, SR) = 0 then
+    if SysUtils.FindFirst(Base + '*', faAnyFile, SR) = 0 then
       try
         repeat
           if (SR.Name = '.') or (SR.Name = '..') then Continue;
@@ -330,17 +330,17 @@ procedure ApplyIncludeExclude(const ARoot: string;
           if (SR.Attr and faDirectory) <> 0 then
           begin
             if WalkAndPrune(Full, RelPath) = 0 then
-              RemoveDir(Full)
+              SysUtils.RemoveDir(Full)
             else
               Inc(Result);
           end
           else if ShouldKeep(RelPath) then
             Inc(Result)
           else
-            DeleteFile(Full);
-        until FindNext(SR) <> 0;
+            SysUtils.DeleteFile(Full);
+        until SysUtils.FindNext(SR) <> 0;
       finally
-        FindClose(SR);
+        SysUtils.FindClose(SR);
       end;
   end;
 
@@ -380,7 +380,7 @@ begin
   ForceDirectories(ADst);
   S := IncludeTrailingPathDelimiter(ASrc);
   D := IncludeTrailingPathDelimiter(ADst);
-  if FindFirst(S + '*', faAnyFile, SR) = 0 then
+  if SysUtils.FindFirst(S + '*', faAnyFile, SR) = 0 then
     try
       repeat
         if (SR.Name = '.') or (SR.Name = '..') then Continue;
@@ -389,9 +389,9 @@ begin
         else if not CopyFileContent(S + SR.Name, D + SR.Name) then
           raise EExtractError.CreateFmt(
             'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
-      until FindNext(SR) <> 0;
+      until SysUtils.FindNext(SR) <> 0;
     finally
-      FindClose(SR);
+      SysUtils.FindClose(SR);
     end;
 end;
 
@@ -469,7 +469,7 @@ begin
   end;
   if DirectoryExists(APath) then
     WipeDir(APath)
-  else if FileExists(APath) and not DeleteFile(APath) then
+  else if FileExists(APath) and not SysUtils.DeleteFile(APath) then
     raise EExtractError.CreateFmt('failed to delete "%s"', [APath]);
 end;
 
@@ -484,20 +484,20 @@ begin
   end;
   if not DirectoryExists(APath) then Exit;
   Base := IncludeTrailingPathDelimiter(APath);
-  if FindFirst(Base + '*', faAnyFile, SR) = 0 then
+  if SysUtils.FindFirst(Base + '*', faAnyFile, SR) = 0 then
     try
       repeat
         if (SR.Name = '.') or (SR.Name = '..') then Continue;
         Full := Base + SR.Name;
         if (SR.Attr and faDirectory) <> 0 then
           WipeDir(Full)
-        else if not DeleteFile(Full) then
+        else if not SysUtils.DeleteFile(Full) then
           raise EExtractError.CreateFmt('failed to delete "%s"', [Full]);
-      until FindNext(SR) <> 0;
+      until SysUtils.FindNext(SR) <> 0;
     finally
-      FindClose(SR);
+      SysUtils.FindClose(SR);
     end;
-  if not RemoveDir(APath) then
+  if not SysUtils.RemoveDir(APath) then
     raise EExtractError.CreateFmt('failed to remove directory "%s"', [APath]);
 end;
 
@@ -508,8 +508,8 @@ var
   procedure RestoreBackup;
   begin
     if Backup = '' then Exit;
-    if FileExists(ADst) then DeleteFile(ADst);
-    if FileExists(Backup) then RenameFile(Backup, ADst);
+    if FileExists(ADst) then SysUtils.DeleteFile(ADst);
+    if FileExists(Backup) then SysUtils.RenameFile(Backup, ADst);
   end;
 
 begin
@@ -522,11 +522,11 @@ begin
   if FileExists(ADst) then
   begin
     Backup := MakeSiblingTmpPath(ADst, 'old');
-    if not RenameFile(ADst, Backup) then Exit(False);
+    if not SysUtils.RenameFile(ADst, Backup) then Exit(False);
   end;
 
   try
-    Result := RenameFile(ASrc, ADst);
+    Result := SysUtils.RenameFile(ASrc, ADst);
     if not Result then
     begin
       { Rename failed — most commonly EXDEV (cross-filesystem). Fall back
@@ -534,14 +534,14 @@ begin
         if the copy cannot be completed. }
       if CopyFileContent(ASrc, ADst) then
       begin
-        DeleteFile(ASrc);
+        SysUtils.DeleteFile(ASrc);
         Result := True;
       end;
     end;
 
     if Result then
     begin
-      if Backup <> '' then DeleteFile(Backup);
+      if Backup <> '' then SysUtils.DeleteFile(Backup);
       Exit;
     end;
 
@@ -560,7 +560,7 @@ var
   begin
     if Backup = '' then Exit;
     if PathExists(ADst) then RemovePath(ADst);
-    if PathExists(Backup) then RenameFile(Backup, ADst);
+    if PathExists(Backup) then SysUtils.RenameFile(Backup, ADst);
   end;
 
 begin
@@ -573,11 +573,11 @@ begin
   if PathExists(ADst) then
   begin
     Backup := MakeSiblingTmpPath(ExcludeTrailingPathDelimiter(ADst), 'old');
-    if not RenameFile(ADst, Backup) then Exit(False);
+    if not SysUtils.RenameFile(ADst, Backup) then Exit(False);
   end;
 
   try
-    Result := RenameFile(ASrc, ADst);
+    Result := SysUtils.RenameFile(ASrc, ADst);
     if not Result then
     begin
       { EXDEV path: recursive copy + wipe-source. The old destination
@@ -617,7 +617,7 @@ begin
   AContent.SaveToFile(Tmp);
   if not AtomicMoveFile(Tmp, ADst) then
   begin
-    DeleteFile(Tmp);
+    SysUtils.DeleteFile(Tmp);
     raise EExtractError.CreateFmt(
       'atomic write of "%s" failed (could not commit tmp file)', [ADst]);
   end;
@@ -636,7 +636,7 @@ begin
   end;
   if not AtomicMoveFile(Tmp, ADst) then
   begin
-    DeleteFile(Tmp);
+    SysUtils.DeleteFile(Tmp);
     raise EExtractError.CreateFmt(
       'atomic write of "%s" failed (could not commit tmp file)', [ADst]);
   end;
@@ -779,7 +779,7 @@ procedure CollectFiles(const ARoot, ARel: string; AList: TStringList);
 var SR: TSearchRec; Path, RelPath: string;
 begin
   Path := IncludeTrailingPathDelimiter(ARoot + ARel);
-  if FindFirst(Path + '*', faAnyFile, SR) = 0 then
+  if SysUtils.FindFirst(Path + '*', faAnyFile, SR) = 0 then
   begin
     repeat
       if (SR.Name = '.') or (SR.Name = '..') then Continue;
@@ -788,8 +788,8 @@ begin
         CollectFiles(ARoot, RelPath + PathDelim, AList)
       else
         AList.Add(RelPath);
-    until FindNext(SR) <> 0;
-    FindClose(SR);
+    until SysUtils.FindNext(SR) <> 0;
+    SysUtils.FindClose(SR);
   end;
 end;
 
