@@ -348,9 +348,9 @@ jobs:
         if: matrix.bootstrap-check == true
         shell: cmd
         run: |
-          rem Exercise bootstrap.bat's direct-fpc fallback path. Chocolatey's
-          rem instantfpc does not inherit the package paths needed to compile
-          rem scripts\bootstrap.pas on this runner.
+          rem Exercise bootstrap.bat's direct-fpc fallback path. This cmd
+          rem smoke runs outside the Git Bash setup context, so pass the
+          rem CI-discovered FPC unit paths through a temporary wrapper.
           set "BOOTSTRAP_PATH=%RUNNER_TEMP%\lwpt-bootstrap-path"
           if not exist "%BOOTSTRAP_PATH%" mkdir "%BOOTSTRAP_PATH%"
           > "%BOOTSTRAP_PATH%\fpc.cmd" echo @echo off
