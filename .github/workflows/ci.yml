@@ -346,10 +346,13 @@ jobs:
 
       - name: bootstrap.bat (Windows cold build)
         if: matrix.bootstrap-check == true
+        shell: cmd
         run: |
-          cmd.exe /c bootstrap.bat
-          ./build/lwpt.exe --help
-          rm -rf build
+          call bootstrap.bat
+          if errorlevel 1 exit /b %errorlevel%
+          build\lwpt.exe --help
+          if errorlevel 1 exit /b %errorlevel%
+          rmdir /s /q build
 
       - name: Download lwpt artefact
         uses: actions/download-artifact@v8
