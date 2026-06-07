@@ -47,7 +47,7 @@ begin
     SL.Add('');
     SL.Add('# [dependencies]');
     SL.Add('# horse = "HashLoad/horse@^4.0.0"               # GitHub by default');
-    SL.Add('# release-cli = "gitlab:gitlab-org/release-cli@v0.16.0"');
+    SL.Add('# ci-debug = "gitlab:gitlab-examples/ci-debug-trace@dd648b2e48ce6518303b0bb580b2ee32fadaf045"');
     SL.Add('# leaf = "../leaf"                               # local path');
     SL.Add('# See ADR-0009 for the full source-spec syntax.');
     SL.Add('');

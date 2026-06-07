@@ -170,7 +170,7 @@ A bump invalidates the cache on the next workflow run; the toolchain rebuild tak
 The `test --tier=e2e` step runs three live fetches per platform:
 
 - `octocat/Hello-World @ 7fd1a60b…` from GitHub (stable historical commit)
-- `gitlab-org/release-cli @ v0.16.0` from GitLab
+- `gitlab-examples/ci-debug-trace @ dd648b2e48ce6518303b0bb580b2ee32fadaf045` from GitLab
 - `atlassian/atlaskit @ d7ac1acad54e…` from Bitbucket
 
 Per Q23=c, these run on every platform (6 in total per push). Total network traffic per push: 18 archive fetches. If this becomes a rate-limit concern, the future fallback is `LWPT_SKIP_NETWORK=1` on N-1 of the 6 runners (the env var is respected by every E2E test).

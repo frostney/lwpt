@@ -25,8 +25,9 @@ const
     'https://codeload.github.com/octocat/Hello-World/tar.gz/' +
     '7fd1a60b01f91b314f59955a4e4d4e80d8edf11d';
   GITLAB_ARCHIVE_URL =
-    'https://gitlab.com/gitlab-org/release-cli/-/archive/v0.16.0/' +
-    'release-cli-v0.16.0.tar.gz';
+    'https://gitlab.com/gitlab-examples/ci-debug-trace/-/archive/' +
+    'dd648b2e48ce6518303b0bb580b2ee32fadaf045/' +
+    'ci-debug-trace-dd648b2e48ce6518303b0bb580b2ee32fadaf045.tar.gz';
 
 type
   TLWPTInstallDirectArchivesWindowsE2E = class(TTestSuite)
@@ -196,7 +197,7 @@ begin
   ).ToBe(True);
   Expect<Boolean>(
     FileExists(FRoot + '/.lwpt/modules/' + GITLAB_DEP_NAME + '/README.md') or
-    FileExists(FRoot + '/.lwpt/modules/' + GITLAB_DEP_NAME + '/Makefile')
+    FileExists(FRoot + '/.lwpt/modules/' + GITLAB_DEP_NAME + '/.gitlab-ci.yml')
   ).ToBe(True);
 end;
 
