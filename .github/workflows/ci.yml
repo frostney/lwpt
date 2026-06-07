@@ -354,7 +354,10 @@ jobs:
           set "BOOTSTRAP_PATH=%RUNNER_TEMP%\lwpt-bootstrap-path"
           if not exist "%BOOTSTRAP_PATH%" mkdir "%BOOTSTRAP_PATH%"
           > "%BOOTSTRAP_PATH%\fpc.cmd" echo @echo off
-          >> "%BOOTSTRAP_PATH%\fpc.cmd" echo "%LWPT_FPC%" %%*
+          >> "%BOOTSTRAP_PATH%\fpc.cmd" echo setlocal enabledelayedexpansion
+          >> "%BOOTSTRAP_PATH%\fpc.cmd" echo set "UNIT_ARGS="
+          >> "%BOOTSTRAP_PATH%\fpc.cmd" echo if defined LWPT_FPC_UNIT_PATHS for %%%%D in ("!LWPT_FPC_UNIT_PATHS:;=" "!") do set "UNIT_ARGS=!UNIT_ARGS! -Fu%%%%~D"
+          >> "%BOOTSTRAP_PATH%\fpc.cmd" echo "%LWPT_FPC%" !UNIT_ARGS! %%*
           set "PATH=%BOOTSTRAP_PATH%;%PATH%"
           call bootstrap.bat
           if errorlevel 1 exit /b %errorlevel%
