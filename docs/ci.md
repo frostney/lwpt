@@ -57,7 +57,7 @@ The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a
 | `x86_64-win64` | `windows-latest` |
 | `i386-win32` | `windows-latest` |
 
-Each runner installs FPC natively (`brew` / `apt` / `choco`), downloads the cross-built `lwpt` binary, then runs the full pipeline:
+Each runner installs FPC natively (`brew` / `apt` / `choco`), then the `x86_64-win64` leg runs a one-off `bootstrap.bat` cold-build smoke and deletes `build/` again so the rest of the stage still validates the downloaded cross-built artefact. After that, every runner downloads the cross-built `lwpt` binary and runs the full pipeline:
 
 1. **Sanity** — `lwpt --help` (does the binary even load?)
 2. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
