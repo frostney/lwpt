@@ -31,6 +31,13 @@ uses
 
   CLI.Options,
   CLI.Subcommands,
+  LWPT.Command.Build,
+  LWPT.Command.Format,
+  LWPT.Command.Init,
+  LWPT.Command.Install,
+  LWPT.Command.Repair,
+  LWPT.Command.Run,
+  LWPT.Command.Testing,
   LWPT.Core;
 
 function ErrPrefix(const ASubcommand: string): string; inline;

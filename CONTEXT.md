@@ -49,8 +49,12 @@ Two requirers of the same package whose semver ranges have no intersection. Hard
 ### Install + builds
 
 **Frozen**:
-The `lwpt install --frozen` mode that refuses to update the lockfile, refuses network, and verifies hashes against the lockfile. CI's safety floor. Different from "offline" — offline is the *default* (zero-install means the on-disk state IS the offline state).
+The `lwpt install --frozen` mode that refuses to update the lockfile, refuses network, and verifies hashes against the lockfile. CI's safety floor. Different from "offline" — offline is the *default* (zero-install means the on-disk state IS the offline state). Frozen is verification-only for toolkit state: it does not re-materialise missing modules from committed archives.
 *Avoid*: "locked", "strict", "ci mode". Frozen is the specific term.
+
+**Install transaction**:
+The single `lwpt install` operation that, under the install lock, resolves dependencies, materialises toolkit state, verifies frozen state when requested, and commits lockfile/cfg changes as one coherent update. It is LWPT's atomic-ish toolkit-state update, not a database transaction.
+*Avoid*: "install process", "install pipeline", "transaction" alone.
 
 **Zero-install**:
 The default property of every LWPT project: after `git clone`, `fpc @lwpt.cfg` builds the project without running `lwpt install` first. Achieved by committing `.lwpt/modules/` and `.lwpt/archives/`. See ADR-0002.
@@ -78,7 +82,7 @@ A project topology where the root `lwpt.toml` declares one or more local-path de
 
 <a id="workspace"></a>
 **Workspace**:
-A directory under the project root that contains its own `lwpt.toml` and is discovered by the root manifest's `[workspaces]` include globs. Each workspace is a self-contained LWPT package — its own `[package]`, `[build]`, `[dependencies]`, and (optionally) its own tests. `lwpt install` auto-installs every discovered workspace as a [Monorepo dep](#monorepo-dep). Two workspaces with the same `[package].name` are a hard error at discovery time. Workspaces are root-manifest only; dep manifests' `[workspaces]` sections are silently dropped (same supply-chain stance as hooks). Mirrors the npm/yarn/pnpm/bun `workspaces` convention; `[workspaces].include` is the LWPT analogue of JS's top-level `workspaces` array. See [ADR-0014 amendment "Workspaces"](./docs/adr/0014-packages-extraction.md#amendment-workspace-auto-discovery).
+A directory under a manifest-bearing project that contains its own `lwpt.toml` and is discovered by that manifest's `[workspaces]` include globs. Each workspace is a self-contained LWPT package — its own `[package]`, `[build]`, `[dependencies]`, and (optionally) its own tests. `lwpt install` auto-installs every discovered workspace as a [Monorepo dep](#monorepo-dep). Two workspaces with the same `[package].name` in the same discovery set are a hard error. Dependency manifests may also declare `[workspaces]`; those nested workspaces are enqueued by the resolver like any other local-path dep. Mirrors the npm/yarn/pnpm/bun `workspaces` convention; `[workspaces].include` is the LWPT analogue of JS's top-level `workspaces` array. See [ADR-0014 amendment "Workspaces"](./docs/adr/0014-packages-extraction.md#amendment-workspace-auto-discovery).
 *Avoid*: "workspace" applied loosely to any local-path dep — the term is reserved for [workspaces]-discovered packages specifically.
 
 **`workspace:` protocol**:
@@ -102,7 +106,7 @@ A LWPT-invoked script with one or more lifecycle attachment points. A hook entry
 *Avoid*: "script" alone (overloaded — see *Script*), "trigger" (suggests event-listener semantics).
 
 **Lifecycle phase**:
-The point at which a hook section attaches to a subcommand run. Six top-level sections — `[preinstall]`, `[postinstall]`, `[prebuild]`, `[postbuild]`, `[pretest]`, `[posttest]` — plus the `prebuild` and `postbuild` fields available on each `[build].<entry>` inline table (per-item, build only). `format`, `export`, `repair`, `init`, and `run` deliberately have no hook surface; the rationale for each refusal lives in the lifecycle ADR.
+The point at which a hook section attaches to a subcommand run. Six top-level sections — `[preinstall]`, `[postinstall]`, `[prebuild]`, `[postbuild]`, `[pretest]`, `[posttest]` — plus the `prebuild` and `postbuild` fields available on each `[build].<entry>` inline table (per-item, build only). `format`, `repair`, `init`, and `run` deliberately have no hook surface; the rationale for each refusal lives in the lifecycle ADR.
 *Avoid*: "lifecycle event" (suggests dynamic dispatch), "build phase" (subcommand-specific; we mean any of the three phased subcommands — install/build/test).
 
 **Build entry** (build item):
@@ -115,7 +119,7 @@ A user-declared callable section in the manifest, addressable via `lwpt run <nam
 *Avoid*: "command" (overloaded with shell), "task" (Cargo / Gradle parallel that doesn't fit LWPT's surface), "recipe" (Just-specific).
 
 **Run**:
-The eighth LWPT subcommand — `lwpt run <name>`. Two behaviours under one verb: if `<name>` matches a registered subcommand (install/build/format/test/export/repair/init), aliases to that subcommand with the remaining args (`lwpt run install --frozen` ≡ `lwpt install --frozen`); otherwise looks up `<name>` in the manifest's [Script](#script-run-script) entries and invokes it. `lwpt run` alone lists every callable name. The aliasing layer is in the CLI dispatcher, not in the run-handler — option parsing for subcommands works unchanged.
+The seventh LWPT subcommand — `lwpt run <name>`. Two behaviours under one verb: if `<name>` matches a registered subcommand (install/build/format/test/repair/init), aliases to that subcommand with the remaining args (`lwpt run install --frozen` ≡ `lwpt install --frozen`); otherwise looks up `<name>` in the manifest's [Script](#script-run-script) entries and invokes it. `lwpt run` alone lists every callable name. The aliasing layer is in the CLI dispatcher, not in the run-handler — option parsing for subcommands works unchanged.
 *Avoid*: "exec" (executes-into-this connotation; lwpt run is dispatch + spawn).
 
 ### Manifest interpolation

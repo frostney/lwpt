@@ -46,6 +46,7 @@ type
     procedure TestPrebuildStalenessGateSkipsSecondRun;
     procedure TestPostbuildRunsAfterBuild;
     procedure TestPretestRunsBeforeTest;
+    procedure TestPosttestRunsWhenNoTestsDiscovered;
     procedure TestDepManifestHookSilentlyDropped;
   end;
 
@@ -214,6 +215,20 @@ begin
   Expect<Boolean>(SentinelExists('sentinel-pretest.txt')).ToBe(True);
 end;
 
+procedure THooksE2E.TestPosttestRunsWhenNoTestsDiscovered;
+var R: TLwptResult;
+begin
+  SetupScratchProject(
+    '[posttest]'#10 +
+    'touch = "scripts/touch-posttest.pas"'#10);
+  WriteSentinelScript(FScratch + '/scripts/touch-posttest.pas',
+    'sentinel-posttest.txt');
+
+  R := RunLwpt(['test'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(SentinelExists('sentinel-posttest.txt')).ToBe(True);
+end;
+
 procedure THooksE2E.TestDepManifestHookSilentlyDropped;
 var R: TLwptResult;
 begin
@@ -275,6 +290,8 @@ begin
     TestPostbuildRunsAfterBuild);
   Test('[pretest] runs before lwpt test',
     TestPretestRunsBeforeTest);
+  Test('[posttest] runs after lwpt test even when no tests are discovered',
+    TestPosttestRunsWhenNoTestsDiscovered);
   Test('dep manifest hook is silently dropped (supply-chain guard)',
     TestDepManifestHookSilentlyDropped);
 end;

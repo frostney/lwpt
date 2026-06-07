@@ -47,7 +47,7 @@ The graduation arc from [ADR-0003](./0003-vendored-permanent-fork-graduation.md)
   - `source/` (the `.pas` files moved out of LWPT's `source/`, plus bundled shared utils + `Shared.inc`)
   - Tests where they exist — `HTTPClient.Test.pas`, `Tests.HTTPMockServer.pas`, `Semver.Test.pas` move with their package.
 
-- **`source/` slims down to LWPT-owned units + the not-yet-graduated remainder**: `lwpt.pas`, `LWPT.Core.pas`, `LWPT.Format.pas`, `LWPT.GitProtocol.pas`, `Platform.pas`, `TestingPascalLibrary.pas`, the embedded testing-library `.inc`, `LWPT.Core.Test.pas`, `LWPT.Format.Test.pas`, `Tests.TestingPascalLibrary.Canary.Test.pas`, `Shared.inc`.
+- **`source/` slims down to LWPT-owned units + the not-yet-graduated remainder**: `lwpt.pas`, `LWPT.Core.pas`, `LWPT.Formatter.pas`, `LWPT.GitProtocol.pas`, `Platform.pas`, `TestingPascalLibrary.pas`, the embedded testing-library `.inc`, `LWPT.Core.Test.pas`, `LWPT.Formatter.Test.pas`, `Tests.TestingPascalLibrary.Canary.Test.pas`, `Shared.inc`.
 
 - **Root `lwpt.toml` declares the packages as local-path deps**:
 

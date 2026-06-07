@@ -2,7 +2,7 @@
   CLI.Options.
 
   The parser ships option handling for ONE program. LWPT has several
-  subcommands (install, build, test, format, export, repair, init),
+  subcommands (install, build, test, format, repair, init, run),
   each with its own option set. This unit is the generalisation: a
   registry of named subcommands, each carrying a handler and its own
   TOptionArray. Run reads argv[1] as the subcommand name, then hands

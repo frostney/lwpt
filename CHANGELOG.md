@@ -31,5 +31,3 @@ All notable changes to LWPT are documented in this file. The format follows [Kee
 - Rescope CI FPC packages slice for LWPT (#2)
 - Initial version
 - Initial commit
-
-

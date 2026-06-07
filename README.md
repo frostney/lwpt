@@ -56,8 +56,11 @@ for the full rationale.
 | File | Origin | Role |
 |------|--------|------|
 | `source/lwpt.pas` | new | program entry: registers subcommands |
-| `source/LWPT.Core.pas` | new | toolkit core — manifest, TOML, resolver, fetch/extract, build, test, repair |
-| `source/LWPT.Format.pas` | converted from GocciaScript `format.pas` | formatter logic as a unit |
+| `source/LWPT.Core.pas` | new | project identity, error hierarchy, and shared low-level helpers |
+| `source/LWPT.Manifest.pas` | new | manifest model, intake, source/version parsing, and manifest path context |
+| `source/LWPT.Install.pas` | new | install transaction: resolve, fetch, extract, lockfile/cfg, frozen verification |
+| `source/LWPT.Command.*.pas` | new | command-level behavior for each subcommand |
+| `source/LWPT.Formatter.pas` | converted from GocciaScript `format.pas` | formatter engine used by `LWPT.Command.Format` |
 | `source/LWPT.GitProtocol.pas` | new | git smart-HTTP tag listing for `<source>@<spec>` resolution |
 | `source/Platform.pas` | LWPT-canonical | host OS / CPU detection for `{platform.*}` placeholders (extraction candidate for `packages/platform/`) |
 | `source/Shared.inc` | LWPT-canonical | include file (`{$mode delphi} {$H+}` baseline; each `packages/<name>/source/` has its own bundled copy) |

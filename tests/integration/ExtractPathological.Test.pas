@@ -1,4 +1,4 @@
-{ ExtractPathological.Test — integration test for LWPT.Core.ExtractArchive
+{ ExtractPathological.Test — integration test for LWPT.Install.ExtractArchive
   against the specific tar shapes that motivated lwpt's custom ustar
   reader instead of FPC's bundled libtar.
 
@@ -30,6 +30,7 @@ uses
   SysUtils,
 
   LWPT.Core,
+  LWPT.Install,
   TestingPascalLibrary,
   Tests.TarSynth;
 
@@ -62,6 +63,9 @@ type
     procedure TestTruncatedGzipRaises;
     procedure TestInvalidGzipMagicRaises;
     procedure TestTarTruncatedMidEntryRaises;
+    procedure TestParentTraversalPathRejected;
+    procedure TestAbsoluteTraversalPathRejected;
+    procedure TestLinkTargetOutsideDestRejected;
   end;
 
 { ── helpers ───────────────────────────────────────────────────────── }
@@ -396,6 +400,79 @@ begin
     Expect<Boolean>(True).ToBe(True);   { absent is the cleanest outcome }
 end;
 
+procedure TExtractFailureModes.TestParentTraversalPathRejected;
+var
+  Archive, Dest, OutsidePath: string;
+  Raised: Boolean;
+begin
+  Archive := FScratch + '/parent-traversal.tar.gz';
+  Dest := FScratch + '/parent-traversal-out';
+  OutsidePath := FScratch + '/escaped.txt';
+  ForceDirectories(Dest);
+  WriteBytesToFile(OutsidePath, BytesOf('original'));
+  WriteBytesToFile(Archive, Gzip(BuildTar(
+    [MakeRegularFileEntry('top/../escaped.txt', BytesOf('evil'))])));
+
+  Raised := False;
+  try
+    ExtractArchive(Archive, Dest);
+  except
+    on E: EExtractError do Raised := True;
+  end;
+
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(BytesEqual(ReadFileBytes(OutsidePath), BytesOf('original')))
+    .ToBe(True);
+end;
+
+procedure TExtractFailureModes.TestAbsoluteTraversalPathRejected;
+var
+  Archive, Dest: string;
+  Raised: Boolean;
+begin
+  Archive := FScratch + '/absolute-traversal.tar.gz';
+  Dest := FScratch + '/absolute-traversal-out';
+  ForceDirectories(Dest);
+  WriteBytesToFile(Archive, Gzip(BuildTar(
+    [MakeRegularFileEntry('top//escaped.txt', BytesOf('evil'))])));
+
+  Raised := False;
+  try
+    ExtractArchive(Archive, Dest);
+  except
+    on E: EExtractError do Raised := True;
+  end;
+
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(FileExists(Dest + '/escaped.txt')).ToBe(False);
+end;
+
+procedure TExtractFailureModes.TestLinkTargetOutsideDestRejected;
+var
+  Archive, Dest, OutsidePath: string;
+  Raised: Boolean;
+begin
+  Archive := FScratch + '/link-outside.tar.gz';
+  Dest := FScratch + '/link-outside-out';
+  OutsidePath := FScratch + '/outside.txt';
+  ForceDirectories(Dest);
+  WriteBytesToFile(OutsidePath, BytesOf('outside host file'));
+  WriteBytesToFile(Archive, Gzip(BuildTar([
+    MakeDirectoryEntry('top/dir'),
+    MakeSymlinkEntry('top/dir/link.txt', '../../outside.txt')
+  ])));
+
+  Raised := False;
+  try
+    ExtractArchive(Archive, Dest);
+  except
+    on E: EExtractError do Raised := True;
+  end;
+
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(FileExists(Dest + '/dir/link.txt')).ToBe(False);
+end;
+
 procedure TExtractFailureModes.SetupTests;
 begin
   Test('missing archive path raises EExtractError',
@@ -406,6 +483,12 @@ begin
     TestInvalidGzipMagicRaises);
   Test('tar truncated mid-entry raises or extracts nothing',
     TestTarTruncatedMidEntryRaises);
+  Test('archive entry with parent traversal is rejected',
+    TestParentTraversalPathRejected);
+  Test('archive entry with absolute post-strip path is rejected',
+    TestAbsoluteTraversalPathRejected);
+  Test('archive link target outside extraction root is rejected',
+    TestLinkTargetOutsideDestRejected);
 end;
 
 begin

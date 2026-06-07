@@ -40,6 +40,7 @@ type
     procedure TestInitYesDoesNotCreateLockfile;
     procedure TestInitYesScaffoldedManifestParses;
     procedure TestInitYesScaffoldedEntryIsValidPascal;
+    procedure TestInitYesLeadingDigitEntryIsValidPascal;
     procedure TestInitYesGitignoreHasLwptAndBuildEntries;
     procedure TestInitYesPackageNameIsScratchBasename;
     procedure TestInitYesEntryRunsAfterInstallAndBuild;
@@ -188,6 +189,25 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
   Exe := FScratch + '/build/my-project';
   Expect<Boolean>(FileExists(ExpectedExe(Exe))).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/source/my-project.o')).ToBe(False);
+  Expect<Boolean>(FileExists(FScratch + '/source/my-project.ppu')).ToBe(False);
+end;
+
+procedure TInitCommand.TestInitYesLeadingDigitEntryIsValidPascal;
+var
+  DigitScratch, Entry: string;
+  R: TLwptResult;
+begin
+  DigitScratch := ExpandFileName('build/tests/tmp/init-test/123-app');
+  RecursiveDelete(DigitScratch);
+  ForceDirectories(DigitScratch);
+
+  R := RunLwpt(['init', '--yes'], DigitScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+
+  Entry := ReadFileText(DigitScratch + '/source/123-app.pas');
+  Expect<Boolean>(Pos('program _123_app;', Entry) > 0).ToBe(True);
+  Expect<Boolean>(Pos('hello from 123-app', Entry) > 0).ToBe(True);
 end;
 
 procedure TInitCommand.TestSecondInitWithoutForceRejects;
@@ -259,6 +279,8 @@ begin
     TestInitYesScaffoldedManifestParses);
   Test('scaffolded entry .pas is valid Pascal (program + WriteLn + delphi mode)',
     TestInitYesScaffoldedEntryIsValidPascal);
+  Test('leading-digit entry name is sanitised into a valid Pascal program id',
+    TestInitYesLeadingDigitEntryIsValidPascal);
   Test('.gitignore contains the LWPT-internal paths + the build dir',
     TestInitYesGitignoreHasLwptAndBuildEntries);
   Test('manifest reflects scratch basename + [build] for the entry',

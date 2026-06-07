@@ -19,6 +19,8 @@ uses
 
   LWPT.Core,
   LWPT.GitProtocol,
+  LWPT.Install,
+  LWPT.Manifest,
   TestingPascalLibrary;
 
 type
@@ -74,16 +76,6 @@ type
     procedure TestPackageEntriesRoundTripFields;
   end;
 
-  { TInstallLock cross-process behaviour. Second-acquire raises;
-    release deletes the lock file so subsequent acquires succeed. }
-  TInstallLockBehavior = class(TTestSuite)
-  public
-    procedure SetupTests; override;
-    procedure TestFirstAcquireWritesPidFile;
-    procedure TestSecondAcquireRaisesEConcurrencyError;
-    procedure TestThirdAcquireSucceedsAfterFirstReleases;
-  end;
-
   { VerifyAgainstLockfile cross-checks. Exercises every mismatch
     path that --frozen guards against, without requiring a network
     source. Local-source diamond's frozen-tamper integration test
@@ -112,7 +104,7 @@ type
     procedure TestGithubPrefixExplicit;
     procedure TestUnknownPrefixRejected;
     procedure TestHttpsURLIsURLKind;
-    procedure TestHttpURLIsURLKind;
+    procedure TestHttpURLRejected;
     procedure TestLocalDotSlashPath;
     procedure TestLocalParentSlashPath;
     procedure TestLocalAbsolutePath;
@@ -214,6 +206,8 @@ type
     procedure TestArchiveTemplateMissingRefPlaceholderRejected;
     procedure TestArchiveTemplateMissingUserPlaceholderRejected;
     procedure TestGitTemplateMissingRepositoryPlaceholderRejected;
+    procedure TestArchiveTemplateHttpRejected;
+    procedure TestGitTemplateHttpRejected;
     procedure TestShadowingBuiltinPrefixRejected;
     procedure TestDepWithCustomPrefixRoutes;
     procedure TestDepWithUndeclaredCustomPrefixRejected;
@@ -819,79 +813,6 @@ begin
     TestPackageEntriesRoundTripFields);
 end;
 
-{ ── TInstallLockBehavior ──────────────────────────────────────── }
-
-const
-  LOCK_PATH = 'build/tests/tmp/install-lock.tmp';
-
-procedure TInstallLockBehavior.TestFirstAcquireWritesPidFile;
-var Lock: TInstallLock; SL: TStringList;
-begin
-  DeleteFile(LOCK_PATH);
-  ForceDirectories(ExtractFileDir(LOCK_PATH));
-  Lock := TInstallLock.Create(LOCK_PATH);
-  try
-    Expect<Boolean>(FileExists(LOCK_PATH)).ToBe(True);
-    SL := TStringList.Create;
-    try
-      SL.LoadFromFile(LOCK_PATH);
-      { File contains a PID line. Don't assert on the exact value
-        (varies per run); assert it's at least a positive integer. }
-      Expect<Boolean>(StrToIntDef(Trim(SL.Text), -1) > 0).ToBe(True);
-    finally
-      SL.Free;
-    end;
-  finally
-    Lock.Free;
-  end;
-  { Lock release deletes the file. }
-  Expect<Boolean>(FileExists(LOCK_PATH)).ToBe(False);
-end;
-
-procedure TInstallLockBehavior.TestSecondAcquireRaisesEConcurrencyError;
-var First, Second: TInstallLock; Raised: Boolean;
-begin
-  DeleteFile(LOCK_PATH);
-  First := TInstallLock.Create(LOCK_PATH);
-  try
-    Raised := False;
-    try
-      Second := TInstallLock.Create(LOCK_PATH);
-      Second.Free;
-    except
-      on E: EConcurrencyError do Raised := True;
-    end;
-    Expect<Boolean>(Raised).ToBe(True);
-  finally
-    First.Free;
-  end;
-end;
-
-procedure TInstallLockBehavior.TestThirdAcquireSucceedsAfterFirstReleases;
-var Lock: TInstallLock;
-begin
-  DeleteFile(LOCK_PATH);
-  Lock := TInstallLock.Create(LOCK_PATH);
-  Lock.Free;
-  { Second acquire after first released — should succeed cleanly. }
-  Lock := TInstallLock.Create(LOCK_PATH);
-  try
-    Expect<Boolean>(FileExists(LOCK_PATH)).ToBe(True);
-  finally
-    Lock.Free;
-  end;
-end;
-
-procedure TInstallLockBehavior.SetupTests;
-begin
-  Test('first acquire writes the lock file with our PID',
-    TestFirstAcquireWritesPidFile);
-  Test('second acquire raises EConcurrencyError naming the holder',
-    TestSecondAcquireRaisesEConcurrencyError);
-  Test('lock can be re-acquired after first instance is freed',
-    TestThirdAcquireSucceedsAfterFirstReleases);
-end;
-
 { ── TVerifyAgainstLockfile ────────────────────────────────────── }
 
 function MakeResolved(const AName, AVersion, ATreeHash, AArchiveHash: string;
@@ -1087,10 +1008,9 @@ begin
     'https://example.com/foo.tar.gz', Self);
 end;
 
-procedure TParseDependencySource.TestHttpURLIsURLKind;
+procedure TParseDependencySource.TestHttpURLRejected;
 begin
-  ExpectSource('http://internal/foo.tar.gz', skURL, hkGitHub,
-    'http://internal/foo.tar.gz', Self);
+  ExpectSourceRejected('http://internal/foo.tar.gz', 'plain HTTP', Self);
 end;
 
 procedure TParseDependencySource.TestLocalDotSlashPath;
@@ -1148,7 +1068,8 @@ begin
     TestUnknownPrefixRejected);
   Test('"https://..." is skURL with the URL as locator',
     TestHttpsURLIsURLKind);
-  Test('"http://..." also treated as skURL', TestHttpURLIsURLKind);
+  Test('"http://..." is rejected; dependency URLs must use HTTPS',
+    TestHttpURLRejected);
   Test('"./path" implicit local', TestLocalDotSlashPath);
   Test('"../path" implicit local', TestLocalParentSlashPath);
   Test('"/abs/path" absolute implicit local', TestLocalAbsolutePath);
@@ -1736,6 +1657,36 @@ begin
     'must contain both {user} and {repository}', Self);
 end;
 
+procedure TCustomSources.TestArchiveTemplateHttpRejected;
+begin
+  ExpectManifestLoadError(WriteCustomSourceManifest('http-archive',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'gitea = { '
+    + 'archive = "http://git.example.com/{user}/{repository}/archive/{ref}.tar.gz", '
+    + 'git = "https://git.example.com/{user}/{repository}.git"'
+    + ' }'#10),
+    'must use https://', Self);
+end;
+
+procedure TCustomSources.TestGitTemplateHttpRejected;
+begin
+  ExpectManifestLoadError(WriteCustomSourceManifest('http-git',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'gitea = { '
+    + 'archive = "https://git.example.com/{user}/{repository}/archive/{ref}.tar.gz", '
+    + 'git = "http://git.example.com/{user}/{repository}.git"'
+    + ' }'#10),
+    'must use https://', Self);
+end;
+
 procedure TCustomSources.TestShadowingBuiltinPrefixRejected;
 begin
   ExpectManifestLoadError(WriteCustomSourceManifest('shadow-github',
@@ -1821,6 +1772,10 @@ begin
     TestArchiveTemplateMissingUserPlaceholderRejected);
   Test('git template missing {repository} placeholder hard-errors',
     TestGitTemplateMissingRepositoryPlaceholderRejected);
+  Test('archive template using plain HTTP hard-errors',
+    TestArchiveTemplateHttpRejected);
+  Test('git template using plain HTTP hard-errors',
+    TestGitTemplateHttpRejected);
   Test('[sources] entry shadowing a built-in name hard-errors',
     TestShadowingBuiltinPrefixRejected);
   Test('dep with custom prefix routes to hkCustom + correct host name',
@@ -1835,25 +1790,23 @@ begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
     'LWPT.Core: SHA-256 NIST vectors'));
   TestRunnerProgram.AddSuite(TLoadManifestHappy.Create(
-    'LWPT.Core: LoadManifest happy path'));
+    'LWPT.Manifest: LoadManifest happy path'));
   TestRunnerProgram.AddSuite(TLoadManifestValidation.Create(
-    'LWPT.Core: LoadManifest validation'));
+    'LWPT.Manifest: LoadManifest validation'));
   TestRunnerProgram.AddSuite(TLoadManifestExtensions.Create(
-    'LWPT.Core: LoadManifest extensions ([lwpt] / [format] / [generated])'));
+    'LWPT.Manifest: LoadManifest extensions ([lwpt] / [format] / [generated])'));
   TestRunnerProgram.AddSuite(TLockfileLoading.Create(
-    'LWPT.Core: LoadLockfile'));
-  TestRunnerProgram.AddSuite(TInstallLockBehavior.Create(
-    'LWPT.Core: TInstallLock behaviour'));
+    'LWPT.Install: LoadLockfile'));
   TestRunnerProgram.AddSuite(TVerifyAgainstLockfile.Create(
-    'LWPT.Core: VerifyAgainstLockfile'));
+    'LWPT.Install: VerifyAgainstLockfile'));
   TestRunnerProgram.AddSuite(TParseDependencySource.Create(
-    'LWPT.Core: ParseDependencySource'));
+    'LWPT.Manifest: ParseDependencySource'));
   TestRunnerProgram.AddSuite(TParseVersionSpec.Create(
-    'LWPT.Core: ParseVersionSpec'));
+    'LWPT.Manifest: ParseVersionSpec'));
   TestRunnerProgram.AddSuite(TGitProtocolParsing.Create(
     'LWPT.GitProtocol: ParseInfoRefs'));
   TestRunnerProgram.AddSuite(TCustomSources.Create(
-    'LWPT.Core: Custom [sources]'));
+    'LWPT.Manifest: Custom [sources]'));
   TestRunnerProgram.AddSuite(TPathGlobMatching.Create(
     'LWPT.Core: MatchPathGlob'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
