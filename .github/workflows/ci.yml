@@ -348,6 +348,7 @@ jobs:
         if: matrix.bootstrap-check == true
         shell: cmd
         run: |
+          for %%I in ("%LWPT_FPC%") do set "PATH=%%~dpI;%PATH%"
           call bootstrap.bat
           if errorlevel 1 exit /b %errorlevel%
           build\lwpt.exe --help
