@@ -53,6 +53,7 @@ function  FPCExecutable: string;
 function  InstantFPCExecutable: string;
 procedure AddEnvUnitPathParameters(AParameters: TStrings);
 function  NativePath(const APath: string): string;
+function  SanitisePathSegment(const AValue: string): string;
 
 function  TomlGet(ANode: TTOMLNode; const AKey: string): TTOMLNode;
 function  TomlIsString(ANode: TTOMLNode): Boolean;
@@ -145,6 +146,17 @@ begin
   {$IFDEF MSWINDOWS}
   Result := StringReplace(Result, '/', DirectorySeparator, [rfReplaceAll]);
   {$ENDIF}
+end;
+
+{ Flatten an arbitrary string into a single path segment: separators
+  and drive colons become '_'. Distinct inputs can collide ("a:b" and
+  "a_b" both yield "a_b") — callers that key directories off the
+  result must detect collisions themselves. }
+function SanitisePathSegment(const AValue: string): string;
+begin
+  Result := StringReplace(AValue, ':', '_', [rfReplaceAll]);
+  Result := StringReplace(Result, '/', '_', [rfReplaceAll]);
+  Result := StringReplace(Result, '\', '_', [rfReplaceAll]);
 end;
 
 { ===========================================================================
@@ -380,10 +392,11 @@ end;
   duplicating the tree once per nesting level into the destination.
   Skipping them (the link is not reproduced either) matches
   CollectFiles/HashTree, so a staged copy hashes identically to the
-  tree it was copied from. File symlinks are still copied through
-  (target bytes), as before. faSymLink must be in the FindFirst mask
-  or the attribute is not reported and links look like plain
-  directories.
+  tree it was copied from. File symlinks are copied through (target
+  bytes) when the target resolves and skipped when dangling — again
+  mirroring CollectFiles. faSymLink must be in the FindFirst mask or
+  the attribute is not reported and links look like plain
+  directories (or, dangling, vanish entirely).
 
   A destination inside (or equal to) the source is the other
   unbounded-recursion shape — each level re-enumerates what the
@@ -406,11 +419,16 @@ begin
     try
       repeat
         if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) <> 0 then
+        if (SR.Attr and faSymLink) <> 0 then
         begin
-          if (SR.Attr and faSymLink) = 0 then
-            CopyDirTree(S + SR.Name, D + SR.Name);
+          if ((SR.Attr and faDirectory) = 0)
+             and FileExists(S + SR.Name)
+             and not CopyFileContent(S + SR.Name, D + SR.Name) then
+            raise EExtractError.CreateFmt(
+              'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
         end
+        else if (SR.Attr and faDirectory) <> 0 then
+          CopyDirTree(S + SR.Name, D + SR.Name)
         else if not CopyFileContent(S + SR.Name, D + SR.Name) then
           raise EExtractError.CreateFmt(
             'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
@@ -498,6 +516,13 @@ begin
     raise EExtractError.CreateFmt('failed to delete "%s"', [APath]);
 end;
 
+{ faSymLink must be in the FindFirst mask: without it the enumeration
+  stats THROUGH each link, so a dangling link (target already deleted —
+  which the wipe itself produces when a link's target dir is wiped
+  before the link's own entry comes up) is not returned at all,
+  survives the wipe, and the final RemoveDir fails on the non-empty
+  dir. Links are unlinked, never followed — wiping through one would
+  destroy content outside APath. }
 procedure WipeDir(const APath: string);
 var SR: TSearchRec; Base, Full: string;
 begin
@@ -509,12 +534,6 @@ begin
   end;
   if not DirectoryExists(APath) then Exit;
   Base := IncludeTrailingPathDelimiter(APath);
-  { faSymLink must be in the FindFirst mask: without it a DANGLING
-    symlink (including one whose target this very loop just deleted)
-    is filtered out of the enumeration entirely, the link survives
-    the wipe, and the final RemoveDir fails on a non-empty dir.
-    Link entries are unlinked directly — never followed: a link to a
-    directory outside APath must not have its target's contents wiped. }
   if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
     try
       repeat
@@ -522,12 +541,14 @@ begin
         Full := Base + SR.Name;
         if (SR.Attr and faSymLink) <> 0 then
         begin
-          { dir-style link first (Windows junctions need
-            RemoveDirectory), then plain unlink for file links }
-          if not RemoveDirLink(Full)
-             and not SysUtils.DeleteFile(Full) then
-            raise EExtractError.CreateFmt(
-              'failed to remove link "%s"', [Full]);
+          if (SR.Attr and faDirectory) <> 0 then
+          begin
+            if not RemoveDirLink(Full) then
+              raise EExtractError.CreateFmt(
+                'failed to remove link "%s"', [Full]);
+          end
+          else if not SysUtils.DeleteFile(Full) then
+            raise EExtractError.CreateFmt('failed to delete "%s"', [Full]);
         end
         else if (SR.Attr and faDirectory) <> 0 then
           WipeDir(Full)
@@ -819,27 +840,34 @@ end;
   Directory symlinks are never descended into: a link cycle would recurse
   forever, and the linked bytes are hashed where they really live. File
   symlinks still contribute (their target's bytes are read through the
-  link, as before). faSymLink must be in the FindFirst mask or the
-  attribute is not reported and links look like plain directories. }
+  link, as before) — but only when the target resolves: a dangling link
+  was invisible to the old faAnyFile-only enumeration, so it must stay
+  excluded or HashTree fails opening it. faSymLink must be in the
+  FindFirst mask or the attribute is not reported and links look like
+  plain directories (or, dangling, vanish entirely). }
 procedure CollectFiles(const ARoot, ARel: string; AList: TStringList);
 var SR: TSearchRec; Path, RelPath: string;
 begin
   Path := IncludeTrailingPathDelimiter(ARoot + ARel);
   if SysUtils.FindFirst(Path + '*', faAnyFile or faSymLink, SR) = 0 then
-  begin
-    repeat
-      if (SR.Name = '.') or (SR.Name = '..') then Continue;
-      RelPath := ARel + SR.Name;
-      if (SR.Attr and faDirectory) <> 0 then
-      begin
-        if (SR.Attr and faSymLink) = 0 then
-          CollectFiles(ARoot, RelPath + PathDelim, AList);
-      end
-      else
-        AList.Add(RelPath);
-    until SysUtils.FindNext(SR) <> 0;
-    SysUtils.FindClose(SR);
-  end;
+    try
+      repeat
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        RelPath := ARel + SR.Name;
+        if (SR.Attr and faSymLink) <> 0 then
+        begin
+          if ((SR.Attr and faDirectory) = 0)
+             and FileExists(Path + SR.Name) then
+            AList.Add(RelPath);
+        end
+        else if (SR.Attr and faDirectory) <> 0 then
+          CollectFiles(ARoot, RelPath + PathDelim, AList)
+        else
+          AList.Add(RelPath);
+      until SysUtils.FindNext(SR) <> 0;
+    finally
+      SysUtils.FindClose(SR);
+    end;
 end;
 
 function HashTree(const APathOrArchive: string): string;
