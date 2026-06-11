@@ -1040,24 +1040,6 @@ begin
   Result := NativePath(Candidate);
 end;
 
-{ True when ALinkPath sits inside (or is) ATargetDir. Such a link
-  cannot be materialized as a copy: CopyDirTree would copy the
-  directory into its own subtree and recurse until the OS path-length
-  limit. The escape check above cannot catch this shape — the target
-  is a parent of the link, still inside the extraction root. }
-function LinkTargetContainsLink(const ATargetDir, ALinkPath: string): Boolean;
-var
-  Target, Link: string;
-begin
-  Target := IncludeTrailingPathDelimiter(ExpandFileName(ATargetDir));
-  Link   := IncludeTrailingPathDelimiter(ExpandFileName(ALinkPath));
-  {$IFDEF MSWINDOWS}
-  Result := SameText(Copy(Link, 1, Length(Target)), Target);
-  {$ELSE}
-  Result := Copy(Link, 1, Length(Target)) = Target;
-  {$ENDIF}
-end;
-
 function ExtractArchive(const AArchivePath, ADest: string;
   const ASubDir: string = ''): Integer;
 type
@@ -1238,10 +1220,12 @@ begin
     begin
       { A directory link whose target is its own parent (or any
         ancestor) would copy the directory into its own subtree and
-        recurse until the path-length limit. Skip it — the link is
+        recurse until the path-length limit. The escape check in
+        ResolveArchiveLinkTarget cannot catch this shape — the target
+        is still inside the extraction root. Skip it — the link is
         unmaterializable junk, and skipping keeps the extracted tree
         (and so its computedHash) deterministic. }
-      if LinkTargetContainsLink(ResolvedTarget, PendingLinks[li].LinkPath) then
+      if PathContains(ResolvedTarget, PendingLinks[li].LinkPath) then
         WriteLn(ErrOutput,
                 '  warning: link target contains the link itself, skipped: ',
                 PendingLinks[li].FromRel, ' -> ', PendingLinks[li].TargetName)

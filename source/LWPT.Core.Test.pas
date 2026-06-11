@@ -197,6 +197,7 @@ type
     procedure TestDanglingFileSymlinkSkipped;
     procedure TestDstInsideSrcRaises;
     procedure TestDstEqualsSrcRaises;
+    procedure TestPathContainsBoundaries;
   end;
 
   { WipeDir against symlink entries. The dangling case is the
@@ -287,6 +288,22 @@ begin
   try
     SL.Text := AContent;
     SL.SaveToFile(Result);
+  finally
+    SL.Free;
+  end;
+end;
+
+{ Plant one fixture file, creating parent dirs. Shared by the
+  tree-planting suites (TApplyIncludeExclude, TCopyDirTreeGuards). }
+procedure WriteFixtureFile(const APath, AText: string);
+var
+  SL: TStringList;
+begin
+  ForceDirectories(ExtractFileDir(APath));
+  SL := TStringList.Create;
+  try
+    SL.Text := AText;
+    SL.SaveToFile(APath);
   finally
     SL.Free;
   end;
@@ -1390,16 +1407,9 @@ end;
 procedure TApplyIncludeExclude.PlantTree;
 
   procedure W(const ARel: string);
-  var SL: TStringList;
   begin
-    ForceDirectories(ExtractFileDir(FScratch + '/' + ARel));
-    SL := TStringList.Create;
-    try
-      SL.Text := 'placeholder content for ' + ARel;
-      SL.SaveToFile(FScratch + '/' + ARel);
-    finally
-      SL.Free;
-    end;
+    WriteFixtureFile(FScratch + '/' + ARel,
+      'placeholder content for ' + ARel);
   end;
 
 begin
@@ -1542,16 +1552,8 @@ end;
 procedure TCopyDirTreeGuards.ResetScratch;
 
   procedure W(const ARel: string);
-  var SL: TStringList;
   begin
-    ForceDirectories(ExtractFileDir(Src + '/' + ARel));
-    SL := TStringList.Create;
-    try
-      SL.Text := 'content of ' + ARel;
-      SL.SaveToFile(Src + '/' + ARel);
-    finally
-      SL.Free;
-    end;
+    WriteFixtureFile(Src + '/' + ARel, 'content of ' + ARel);
   end;
 
 begin
@@ -1661,6 +1663,17 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
 end;
 
+procedure TCopyDirTreeGuards.TestPathContainsBoundaries;
+begin
+  { The compare CopyDirTree's guard and the extractor's link-cycle
+    skip both ride on: equality counts as contained, and a sibling
+    sharing a name prefix does not. }
+  Expect<Boolean>(PathContains(Src, Src)).ToBe(True);
+  Expect<Boolean>(PathContains(Src, Src + '/sub')).ToBe(True);
+  Expect<Boolean>(PathContains(Src, Src + 'ling')).ToBe(False);
+  Expect<Boolean>(PathContains(Src + '/sub', Src)).ToBe(False);
+end;
+
 procedure TCopyDirTreeGuards.SetupTests;
 begin
   Test('copies a nested tree (baseline)', TestCopiesNestedTree);
@@ -1674,6 +1687,8 @@ begin
     TestDstInsideSrcRaises);
   Test('destination equal to source raises EExtractError',
     TestDstEqualsSrcRaises);
+  Test('PathContains: equality contained, prefix-sibling not',
+    TestPathContainsBoundaries);
 end;
 
 { ── TWipeDirSymlinks ───────────────────────────────────────────── }
@@ -1705,19 +1720,12 @@ begin
 end;
 
 procedure TWipeDirSymlinks.TestLinkTargetOutsideTreeSurvives;
-var SL: TStringList;
 begin
   {$IFDEF UNIX}
   ResetScratch;
-  ForceDirectories(FScratch + '/outside');
   ForceDirectories(FScratch + '/victim');
-  SL := TStringList.Create;
-  try
-    SL.Text := 'must survive the wipe';
-    SL.SaveToFile(FScratch + '/outside/keep.txt');
-  finally
-    SL.Free;
-  end;
+  WriteFixtureFile(FScratch + '/outside/keep.txt',
+    'must survive the wipe');
   if FpSymlink('../outside',
        PAnsiChar(FScratch + '/victim/link')) <> 0 then
     raise Exception.Create('fixture: FpSymlink failed for outside link');
@@ -1725,8 +1733,7 @@ begin
   Expect<Boolean>(DirectoryExists(FScratch + '/victim')).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/outside/keep.txt')).ToBe(True);
   {$ELSE}
-  SL := nil;
-  if SL = nil then Expect<Boolean>(True).ToBe(True);
+  Expect<Boolean>(True).ToBe(True);
   {$ENDIF}
 end;
 

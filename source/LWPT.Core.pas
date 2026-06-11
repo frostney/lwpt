@@ -67,6 +67,7 @@ function  MatchPathGlob(const APath, APattern: string): Boolean;
 procedure ApplyIncludeExclude(const ARoot: string; const AIncludes, AExcludes: TStringArray);
 
 function  CopyFileContent(const ASrc, ADst: string): Boolean;
+function  PathContains(const AParent, AChild: string): Boolean;
 procedure CopyDirTree(const ASrc, ADst: string);
 function  MakeTmpPath(const ATmpRoot, AHint: string): string;
 procedure WipeDir(const APath: string);
@@ -384,6 +385,26 @@ begin
   end;
 end;
 
+{ True when AChild sits inside (or is) the directory AParent. Both
+  sides are normalized via ExpandFileName (idempotent on already-
+  absolute paths) and compared with a trailing delimiter appended, so
+  'a/bc' is not inside 'a/b' and equality counts as contained.
+  Case-insensitive on Windows. Purely lexical — symlinks are not
+  resolved. This is the one home for the containment compare; the
+  copy-cycle guards below and in the extractor's deferred-link pass
+  must not grow their own variants. }
+function PathContains(const AParent, AChild: string): Boolean;
+var P, C: string;
+begin
+  P := IncludeTrailingPathDelimiter(ExpandFileName(AParent));
+  C := IncludeTrailingPathDelimiter(ExpandFileName(AChild));
+  {$IFDEF MSWINDOWS}
+  Result := SameText(Copy(C, 1, Length(P)), P);
+  {$ELSE}
+  Result := Copy(C, 1, Length(P)) = P;
+  {$ENDIF}
+end;
+
 { Recursive directory copy. Used for the local source and for resolving
   directory symlinks during extraction.
 
@@ -405,15 +426,11 @@ end;
 procedure CopyDirTree(const ASrc, ADst: string);
 var SR: TSearchRec; S, D: string;
 begin
-  S := IncludeTrailingPathDelimiter(ExpandFileName(ASrc));
-  D := IncludeTrailingPathDelimiter(ExpandFileName(ADst));
-  {$IFDEF MSWINDOWS}
-  if SameText(Copy(D, 1, Length(S)), S) then
-  {$ELSE}
-  if Copy(D, 1, Length(S)) = S then
-  {$ENDIF}
+  if PathContains(ASrc, ADst) then
     raise EExtractError.CreateFmt(
       'refusing to copy "%s" into itself ("%s")', [ASrc, ADst]);
+  S := IncludeTrailingPathDelimiter(ASrc);
+  D := IncludeTrailingPathDelimiter(ADst);
   ForceDirectories(ADst);
   if SysUtils.FindFirst(S + '*', faAnyFile or faSymLink, SR) = 0 then
     try
