@@ -1612,8 +1612,11 @@ end;
   Directory symlinks are never descended into: a link cycle would recurse
   forever, and the linked bytes are hashed where they really live. File
   symlinks still contribute (their target's bytes are read through the
-  link, as before). faSymLink must be in the FindFirst mask or the
-  attribute is not reported and links look like plain directories.
+  link, as before) — but only when the target resolves: a dangling link
+  was invisible to the old faAnyFile-only enumeration, so it must stay
+  excluded or HashTree fails opening it. faSymLink must be in the
+  FindFirst mask or the attribute is not reported and links look like
+  plain directories (or, dangling, vanish entirely).
   MUST stay in lockstep with LWPT.Core's CollectFiles — install writes
   computedHash with this copy, and the two may not disagree. }
 procedure CollectFiles(const ARoot, ARel: string; AList: TStringList);
@@ -1625,11 +1628,14 @@ begin
     repeat
       if (SR.Name = '.') or (SR.Name = '..') then Continue;
       RelPath := ARel + SR.Name;
-      if (SR.Attr and faDirectory) <> 0 then
+      if (SR.Attr and faSymLink) <> 0 then
       begin
-        if (SR.Attr and faSymLink) = 0 then
-          CollectFiles(ARoot, RelPath + PathDelim, AList);
+        if ((SR.Attr and faDirectory) = 0)
+           and FileExists(Path + SR.Name) then
+          AList.Add(RelPath);
       end
+      else if (SR.Attr and faDirectory) <> 0 then
+        CollectFiles(ARoot, RelPath + PathDelim, AList)
       else
         AList.Add(RelPath);
     until SysUtils.FindNext(SR) <> 0;

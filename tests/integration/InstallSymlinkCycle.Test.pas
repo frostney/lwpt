@@ -16,6 +16,11 @@
      to manifest-less behavior — the dep's units dirs and transitive
      deps are lost. This is the deterministic regression assertion:
      pre-guard the cfg loses the -Fu for the nested units dir.
+  3. dangling -> does-not-exist : invisible to a faAnyFile-only
+     FindFirst (the enumeration stats through the link and skips it),
+     so WipeDir left it behind and failed on the non-empty dir — the
+     suite could never re-run over its own scratch. CollectFiles must
+     also keep excluding it (a dangling link cannot be opened/hashed).
 
   Unix-only in substance: the links are created with FpSymlink. On
   Windows the fixture degrades to a plain nested-manifest dep, which
@@ -28,6 +33,7 @@
     root/vendor/cyclic/packages/leaf/src/CycLeaf.pas
     root/vendor/cyclic/loop -> .                 the cycle (Unix only)
     root/vendor/cyclic/mirror -> packages        the duplicate view
+    root/vendor/cyclic/dangling -> does-not-exist  the wipe survivor
     root/lwpt.toml                               cyclic = "./vendor/cyclic" }
 
 program InstallSymlinkCycle.Test;
@@ -116,6 +122,9 @@ begin
   if FpSymlink('packages',
        PAnsiChar(FRoot + '/vendor/cyclic/mirror')) <> 0 then
     raise Exception.Create('fixture: FpSymlink failed for mirror link');
+  if FpSymlink('does-not-exist',
+       PAnsiChar(FRoot + '/vendor/cyclic/dangling')) <> 0 then
+    raise Exception.Create('fixture: FpSymlink failed for dangling link');
   {$ENDIF}
 
   WriteTextFile(FRoot + '/lwpt.toml',
