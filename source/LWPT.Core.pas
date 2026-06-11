@@ -807,23 +807,24 @@ var SR: TSearchRec; Path, RelPath: string;
 begin
   Path := IncludeTrailingPathDelimiter(ARoot + ARel);
   if SysUtils.FindFirst(Path + '*', faAnyFile or faSymLink, SR) = 0 then
-  begin
-    repeat
-      if (SR.Name = '.') or (SR.Name = '..') then Continue;
-      RelPath := ARel + SR.Name;
-      if (SR.Attr and faSymLink) <> 0 then
-      begin
-        if ((SR.Attr and faDirectory) = 0)
-           and FileExists(Path + SR.Name) then
+    try
+      repeat
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        RelPath := ARel + SR.Name;
+        if (SR.Attr and faSymLink) <> 0 then
+        begin
+          if ((SR.Attr and faDirectory) = 0)
+             and FileExists(Path + SR.Name) then
+            AList.Add(RelPath);
+        end
+        else if (SR.Attr and faDirectory) <> 0 then
+          CollectFiles(ARoot, RelPath + PathDelim, AList)
+        else
           AList.Add(RelPath);
-      end
-      else if (SR.Attr and faDirectory) <> 0 then
-        CollectFiles(ARoot, RelPath + PathDelim, AList)
-      else
-        AList.Add(RelPath);
-    until SysUtils.FindNext(SR) <> 0;
-    SysUtils.FindClose(SR);
-  end;
+      until SysUtils.FindNext(SR) <> 0;
+    finally
+      SysUtils.FindClose(SR);
+    end;
 end;
 
 function HashTree(const APathOrArchive: string): string;

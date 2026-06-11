@@ -104,7 +104,7 @@ begin
   { Local dep INSIDE the project root → installed via symlink, so the
     walkers see the real tree below. Manifest is nested (packages/leaf)
     so the BFS has to walk past the cycle entry to find it. }
-  WriteTextFile(FRoot + '/vendor/cyclic/packages/leaf/lwpt.toml',
+  WriteTextFile(FRoot + '/vendor/cyclic/packages/leaf/' + MANIFEST_FILE,
       '[package]'#10
     + 'name = "cyclic"'#10
     + 'version = "1.0.0"'#10
@@ -127,7 +127,7 @@ begin
     raise Exception.Create('fixture: FpSymlink failed for dangling link');
   {$ENDIF}
 
-  WriteTextFile(FRoot + '/lwpt.toml',
+  WriteTextFile(FRoot + '/' + MANIFEST_FILE,
       '[package]'#10
     + 'name = "cycle-root"'#10
     + 'version = "0.0.0"'#10
@@ -140,7 +140,7 @@ begin
 
   SetCurrentDir(FRoot);
   { The regression assertion: this returns at all. }
-  CmdInstall('lwpt.toml', False);
+  CmdInstall(MANIFEST_FILE, False);
 end;
 
 procedure TInstallSymlinkCycle.AfterAll;
@@ -153,22 +153,23 @@ end;
 
 procedure TInstallSymlinkCycle.TestInstallTerminatesAndLinksModule;
 begin
-  Expect<Boolean>(DirectoryExists(FRoot + '/.lwpt/modules/cyclic'))
+  Expect<Boolean>(DirectoryExists(FRoot + '/' + MODULES_DIR + '/cyclic'))
     .ToBe(True);
   Expect<Boolean>(FileExists(FRoot
-    + '/.lwpt/modules/cyclic/packages/leaf/lwpt.toml')).ToBe(True);
+    + '/' + MODULES_DIR + '/cyclic/packages/leaf/' + MANIFEST_FILE))
+    .ToBe(True);
 end;
 
 procedure TInstallSymlinkCycle.TestNestedManifestFoundDespiteCycle;
 var Cfg: string;
 begin
-  Expect<Boolean>(FileExists(FRoot + '/lwpt.cfg')).ToBe(True);
-  Cfg := ReadFileText(FRoot + '/lwpt.cfg');
+  Expect<Boolean>(FileExists(FRoot + '/' + CFG_FILE)).ToBe(True);
+  Cfg := ReadFileText(FRoot + '/' + CFG_FILE);
   { The BFS must skip the cycle link and still find the nested
     manifest — and must NOT see it twice through the link (which
     would read as ambiguous and fall back to the module root). }
   Expect<Boolean>(
-    Pos('-Fu.lwpt/modules/cyclic/packages/leaf/src', Cfg) > 0)
+    Pos('-Fu' + MODULES_DIR + '/cyclic/packages/leaf/src', Cfg) > 0)
     .ToBe(True);
 end;
 
@@ -177,8 +178,8 @@ var Lock: string;
 begin
   { HashTree ran over the cycle-bearing tree and terminated with a
     real digest. }
-  Expect<Boolean>(FileExists(FRoot + '/lwpt.lock')).ToBe(True);
-  Lock := ReadFileText(FRoot + '/lwpt.lock');
+  Expect<Boolean>(FileExists(FRoot + '/' + LOCKFILE)).ToBe(True);
+  Lock := ReadFileText(FRoot + '/' + LOCKFILE);
   Expect<Boolean>(Pos('[package.cyclic]', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('sha256:', Lock) > 0).ToBe(True);
 end;
