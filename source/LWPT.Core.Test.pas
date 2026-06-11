@@ -14,6 +14,9 @@ program LWPT.Core.Test;
 {$modeswitch nestedcomments+}
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
   Classes,
   SysUtils,
 
@@ -169,6 +172,48 @@ type
     procedure TestBothCombines;
     procedure TestEmptyDirectoriesReaped;
     procedure TestExcludeOverridesInclude;
+  end;
+
+  { CopyDirTree's recursion guards: directory symlinks are never
+    followed (a link cycle would recurse until the OS path-length
+    limit), file symlinks are copied through, and a destination
+    inside the source raises instead of recursing forever. The link
+    fixtures are Unix-only (FpSymlink); the dst-inside-src cases run
+    everywhere. }
+  TCopyDirTreeGuards = class(TTestSuite)
+  private
+    FScratch: string;
+    function  Src: string;
+    function  Dst: string;
+    procedure ResetScratch;
+  protected
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestCopiesNestedTree;
+    procedure TestDirSymlinkCycleTerminatesAndIsNotCopied;
+    procedure TestFileSymlinkCopiedThrough;
+    procedure TestDstInsideSrcRaises;
+    procedure TestDstEqualsSrcRaises;
+  end;
+
+  { WipeDir against symlink entries. The dangling case is the
+    regression: without faSymLink in the FindFirst mask a dangling
+    link (including one whose target the wipe itself just deleted)
+    is invisible to the enumeration, survives, and the final
+    RemoveDir fails. Links must also never be followed — a link to a
+    directory outside the wiped tree must lose the link, not the
+    target's contents. Unix-only fixtures (FpSymlink). }
+  TWipeDirSymlinks = class(TTestSuite)
+  private
+    FScratch: string;
+    procedure ResetScratch;
+  protected
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestDanglingLinkIsRemoved;
+    procedure TestLinkTargetOutsideTreeSurvives;
   end;
 
   { MatchPathGlob: path-vs-glob matching for [dependencies]
@@ -1442,6 +1487,198 @@ begin
     TestExcludeOverridesInclude);
 end;
 
+{ ── TCopyDirTreeGuards ─────────────────────────────────────────── }
+
+function TCopyDirTreeGuards.Src: string;
+begin
+  Result := FScratch + '/src';
+end;
+
+function TCopyDirTreeGuards.Dst: string;
+begin
+  Result := FScratch + '/dst';
+end;
+
+procedure TCopyDirTreeGuards.ResetScratch;
+
+  procedure W(const ARel: string);
+  var SL: TStringList;
+  begin
+    ForceDirectories(ExtractFileDir(Src + '/' + ARel));
+    SL := TStringList.Create;
+    try
+      SL.Text := 'content of ' + ARel;
+      SL.SaveToFile(Src + '/' + ARel);
+    finally
+      SL.Free;
+    end;
+  end;
+
+begin
+  { WipeDir (not a naive recursive delete) — fixtures plant symlinks,
+    and the wipe must remove the link, not follow it. }
+  WipeDir(FScratch);
+  ForceDirectories(FScratch);
+  W('a.txt');
+  W('sub/b.txt');
+end;
+
+procedure TCopyDirTreeGuards.BeforeAll;
+begin
+  FScratch := ExpandFileName('build/tests/tmp/copy-dir-tree-guards');
+end;
+
+procedure TCopyDirTreeGuards.TestCopiesNestedTree;
+begin
+  ResetScratch;
+  CopyDirTree(Src, Dst);
+  Expect<Boolean>(FileExists(Dst + '/a.txt')).ToBe(True);
+  Expect<Boolean>(FileExists(Dst + '/sub/b.txt')).ToBe(True);
+end;
+
+procedure TCopyDirTreeGuards.TestDirSymlinkCycleTerminatesAndIsNotCopied;
+begin
+  {$IFDEF UNIX}
+  ResetScratch;
+  { loop -> . resolves to its own parent: the minimal directory cycle. }
+  if FpSymlink('.', PAnsiChar(Src + '/loop')) <> 0 then
+    raise Exception.Create('fixture: FpSymlink failed for cycle link');
+  { The regression assertion: this returns at all. }
+  CopyDirTree(Src, Dst);
+  Expect<Boolean>(FileExists(Dst + '/a.txt')).ToBe(True);
+  Expect<Boolean>(FileExists(Dst + '/sub/b.txt')).ToBe(True);
+  Expect<Boolean>(DirectoryExists(Dst + '/loop')).ToBe(False);
+  {$ELSE}
+  { The symlink fixture needs FpSymlink; the guard itself is portable. }
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TCopyDirTreeGuards.TestFileSymlinkCopiedThrough;
+var SL: TStringList;
+begin
+  {$IFDEF UNIX}
+  ResetScratch;
+  if FpSymlink('a.txt', PAnsiChar(Src + '/link.txt')) <> 0 then
+    raise Exception.Create('fixture: FpSymlink failed for file link');
+  CopyDirTree(Src, Dst);
+  Expect<Boolean>(FileExists(Dst + '/link.txt')).ToBe(True);
+  SL := TStringList.Create;
+  try
+    SL.LoadFromFile(Dst + '/link.txt');
+    Expect<Boolean>(Pos('content of a.txt', SL.Text) > 0).ToBe(True);
+  finally
+    SL.Free;
+  end;
+  {$ELSE}
+  SL := nil;
+  if SL = nil then Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TCopyDirTreeGuards.TestDstInsideSrcRaises;
+var Raised: Boolean;
+begin
+  ResetScratch;
+  Raised := False;
+  try
+    CopyDirTree(Src, Src + '/sub/dst');
+  except
+    on E: EExtractError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  { Nothing was written before the guard fired. }
+  Expect<Boolean>(DirectoryExists(Src + '/sub/dst')).ToBe(False);
+end;
+
+procedure TCopyDirTreeGuards.TestDstEqualsSrcRaises;
+var Raised: Boolean;
+begin
+  ResetScratch;
+  Raised := False;
+  try
+    CopyDirTree(Src, Src);
+  except
+    on E: EExtractError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TCopyDirTreeGuards.SetupTests;
+begin
+  Test('copies a nested tree (baseline)', TestCopiesNestedTree);
+  Test('terminates on a directory-symlink cycle; link not copied',
+    TestDirSymlinkCycleTerminatesAndIsNotCopied);
+  Test('file symlink is copied through (target bytes)',
+    TestFileSymlinkCopiedThrough);
+  Test('destination inside source raises EExtractError',
+    TestDstInsideSrcRaises);
+  Test('destination equal to source raises EExtractError',
+    TestDstEqualsSrcRaises);
+end;
+
+{ ── TWipeDirSymlinks ───────────────────────────────────────────── }
+
+procedure TWipeDirSymlinks.ResetScratch;
+begin
+  WipeDir(FScratch);
+  ForceDirectories(FScratch);
+end;
+
+procedure TWipeDirSymlinks.BeforeAll;
+begin
+  FScratch := ExpandFileName('build/tests/tmp/wipe-dir-symlinks');
+end;
+
+procedure TWipeDirSymlinks.TestDanglingLinkIsRemoved;
+begin
+  {$IFDEF UNIX}
+  ResetScratch;
+  ForceDirectories(FScratch + '/victim');
+  if FpSymlink('no-such-target',
+       PAnsiChar(FScratch + '/victim/dangling')) <> 0 then
+    raise Exception.Create('fixture: FpSymlink failed for dangling link');
+  WipeDir(FScratch + '/victim');
+  Expect<Boolean>(DirectoryExists(FScratch + '/victim')).ToBe(False);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TWipeDirSymlinks.TestLinkTargetOutsideTreeSurvives;
+var SL: TStringList;
+begin
+  {$IFDEF UNIX}
+  ResetScratch;
+  ForceDirectories(FScratch + '/outside');
+  ForceDirectories(FScratch + '/victim');
+  SL := TStringList.Create;
+  try
+    SL.Text := 'must survive the wipe';
+    SL.SaveToFile(FScratch + '/outside/keep.txt');
+  finally
+    SL.Free;
+  end;
+  if FpSymlink('../outside',
+       PAnsiChar(FScratch + '/victim/link')) <> 0 then
+    raise Exception.Create('fixture: FpSymlink failed for outside link');
+  WipeDir(FScratch + '/victim');
+  Expect<Boolean>(DirectoryExists(FScratch + '/victim')).ToBe(False);
+  Expect<Boolean>(FileExists(FScratch + '/outside/keep.txt')).ToBe(True);
+  {$ELSE}
+  SL := nil;
+  if SL = nil then Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TWipeDirSymlinks.SetupTests;
+begin
+  Test('dangling symlink entry is removed (wipe completes)',
+    TestDanglingLinkIsRemoved);
+  Test('link to a directory outside the tree: link dies, target survives',
+    TestLinkTargetOutsideTreeSurvives);
+end;
+
 { ── TPathGlobMatching ──────────────────────────────────────────── }
 
 procedure ExpectMatch(const APath, APattern: string;
@@ -1811,6 +2048,10 @@ begin
     'LWPT.Core: MatchPathGlob'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
     'LWPT.Core: ApplyIncludeExclude'));
+  TestRunnerProgram.AddSuite(TCopyDirTreeGuards.Create(
+    'LWPT.Core: CopyDirTree recursion guards'));
+  TestRunnerProgram.AddSuite(TWipeDirSymlinks.Create(
+    'LWPT.Core: WipeDir symlink handling'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

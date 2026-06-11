@@ -373,19 +373,44 @@ begin
 end;
 
 { Recursive directory copy. Used for the local source and for resolving
-  directory symlinks during extraction. }
+  directory symlinks during extraction.
+
+  Directory symlinks are never followed: a link cycle in the source
+  tree would otherwise recurse until the OS path-length limit,
+  duplicating the tree once per nesting level into the destination.
+  Skipping them (the link is not reproduced either) matches
+  CollectFiles/HashTree, so a staged copy hashes identically to the
+  tree it was copied from. File symlinks are still copied through
+  (target bytes), as before. faSymLink must be in the FindFirst mask
+  or the attribute is not reported and links look like plain
+  directories.
+
+  A destination inside (or equal to) the source is the other
+  unbounded-recursion shape — each level re-enumerates what the
+  previous one wrote. That is always a caller bug, so it raises
+  rather than being silently skipped. }
 procedure CopyDirTree(const ASrc, ADst: string);
 var SR: TSearchRec; S, D: string;
 begin
+  S := IncludeTrailingPathDelimiter(ExpandFileName(ASrc));
+  D := IncludeTrailingPathDelimiter(ExpandFileName(ADst));
+  {$IFDEF MSWINDOWS}
+  if SameText(Copy(D, 1, Length(S)), S) then
+  {$ELSE}
+  if Copy(D, 1, Length(S)) = S then
+  {$ENDIF}
+    raise EExtractError.CreateFmt(
+      'refusing to copy "%s" into itself ("%s")', [ASrc, ADst]);
   ForceDirectories(ADst);
-  S := IncludeTrailingPathDelimiter(ASrc);
-  D := IncludeTrailingPathDelimiter(ADst);
-  if SysUtils.FindFirst(S + '*', faAnyFile, SR) = 0 then
+  if SysUtils.FindFirst(S + '*', faAnyFile or faSymLink, SR) = 0 then
     try
       repeat
         if (SR.Name = '.') or (SR.Name = '..') then Continue;
         if (SR.Attr and faDirectory) <> 0 then
-          CopyDirTree(S + SR.Name, D + SR.Name)
+        begin
+          if (SR.Attr and faSymLink) = 0 then
+            CopyDirTree(S + SR.Name, D + SR.Name);
+        end
         else if not CopyFileContent(S + SR.Name, D + SR.Name) then
           raise EExtractError.CreateFmt(
             'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
@@ -484,12 +509,27 @@ begin
   end;
   if not DirectoryExists(APath) then Exit;
   Base := IncludeTrailingPathDelimiter(APath);
-  if SysUtils.FindFirst(Base + '*', faAnyFile, SR) = 0 then
+  { faSymLink must be in the FindFirst mask: without it a DANGLING
+    symlink (including one whose target this very loop just deleted)
+    is filtered out of the enumeration entirely, the link survives
+    the wipe, and the final RemoveDir fails on a non-empty dir.
+    Link entries are unlinked directly — never followed: a link to a
+    directory outside APath must not have its target's contents wiped. }
+  if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
     try
       repeat
         if (SR.Name = '.') or (SR.Name = '..') then Continue;
         Full := Base + SR.Name;
-        if (SR.Attr and faDirectory) <> 0 then
+        if (SR.Attr and faSymLink) <> 0 then
+        begin
+          { dir-style link first (Windows junctions need
+            RemoveDirectory), then plain unlink for file links }
+          if not RemoveDirLink(Full)
+             and not SysUtils.DeleteFile(Full) then
+            raise EExtractError.CreateFmt(
+              'failed to remove link "%s"', [Full]);
+        end
+        else if (SR.Attr and faDirectory) <> 0 then
           WipeDir(Full)
         else if not SysUtils.DeleteFile(Full) then
           raise EExtractError.CreateFmt('failed to delete "%s"', [Full]);
