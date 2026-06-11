@@ -209,6 +209,17 @@ var
   FpcArgs : TStringArray;
   Arch, OutBin, TargetRoot, UnitOutDir, OutText : string;
   i, FpcExit : Integer;
+
+  { --clean delete that must not fail silently: a file that exists but
+    cannot be removed raises, because proceeding would keep exactly
+    the stale state --clean promised to remove (DeleteFile alone also
+    returns False for a merely-missing file, which is fine). }
+  procedure CleanDelete(const APath: string);
+  begin
+    if FileExists(APath) and (not SysUtils.DeleteFile(APath)) then
+      raise ELWPTError.CreateFmt(
+        'clean: could not remove stale "%s"', [APath]);
+  end;
 begin
   if T.Source = '' then
   begin
@@ -243,14 +254,15 @@ begin
     Strays elsewhere under build/ (pre-isolation layout, bootstrap,
     per-test dirs) were already removed by CmdBuild's one whole-tree
     sweep before the target loop.
-    A wipe failure (locked file, permissions) raises; the per-target
-    containment in CmdBuild's loop turns it into a failed target. }
+    A failed wipe or delete (locked file, permissions) raises; the
+    per-target containment in CmdBuild's loop turns it into a failed
+    target. }
   if AClean then
   begin
-    if FileExists(OutBin) then DeleteFile(OutBin);
+    CleanDelete(OutBin);
     WipeDir(TargetRoot);
-    DeleteFile(ChangeFileExt(T.Source, '.o'));
-    DeleteFile(ChangeFileExt(T.Source, '.ppu'));
+    CleanDelete(ChangeFileExt(T.Source, '.o'));
+    CleanDelete(ChangeFileExt(T.Source, '.ppu'));
   end;
   ForceDirectories(UnitOutDir);
 
