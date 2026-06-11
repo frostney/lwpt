@@ -359,13 +359,6 @@ end;
 const
   LOCKFILE_SCHEMA_VERSION = 3;
 
-{ Sha256 of a TBytes for the [resolved].archiveHash field. The same hex
-  shape as HashTree ('sha256:<hex>') so callers can compare directly. }
-function SHA256BytesPrefixed(const ABytes: TBytes): string;
-begin
-  Result := 'sha256:' + SHA256Hex(ABytes);
-end;
-
 { ── TInstallLock ──────────────────────────────────────────────────── }
 
 { Cross-process install lock. Uses O_CREAT|O_EXCL for atomic create-
@@ -1225,8 +1218,22 @@ begin
     end
     else if DirectoryExists(ResolvedTarget) then
     begin
-      SysUtils.DeleteFile(PendingLinks[li].LinkPath);
-      CopyDirTree(ResolvedTarget, PendingLinks[li].LinkPath);
+      { A directory link whose target is its own parent (or any
+        ancestor) would copy the directory into its own subtree and
+        recurse until the path-length limit. The escape check in
+        ResolveArchiveLinkTarget cannot catch this shape — the target
+        is still inside the extraction root. Skip it — the link is
+        unmaterializable junk, and skipping keeps the extracted tree
+        (and so its computedHash) deterministic. }
+      if PathContains(ResolvedTarget, PendingLinks[li].LinkPath) then
+        WriteLn(ErrOutput,
+                '  warning: link target contains the link itself, skipped: ',
+                PendingLinks[li].FromRel, ' -> ', PendingLinks[li].TargetName)
+      else
+      begin
+        SysUtils.DeleteFile(PendingLinks[li].LinkPath);
+        CopyDirTree(ResolvedTarget, PendingLinks[li].LinkPath);
+      end;
     end
     else
       WriteLn(ErrOutput, '  warning: link target missing, skipped: ',
@@ -1473,223 +1480,6 @@ end;
   deps and demonstrate the conflict check on the (name, range) pairs. The
   transitive walk is structurally a queue over FetchToCache results.
   =========================================================================== }
-{ ===========================================================================
-  SHA-256  (self-contained, public-domain algorithm)
-
-  FPC 3.2.2's `hash` package ships md5 and sha1 but NOT sha256, and the
-  spike must run on 3.2.2. SHA-1 was rejected: it is dated for content
-  integrity and skills-lock.json's `computedHash` field already commits to
-  SHA-256-shaped values. So SHA-256 is inlined here. Validated below
-  against the canonical "abc" test vector.
-  =========================================================================== }
-type
-  TSHA256Digest = array[0..31] of Byte;
-
-{ SHA-256 performs intentional modular arithmetic on 32-bit values
-  (Cardinals): the compression loop's `temp1 := h + s1 + ch + K[t] + W[t]`
-  and `W[t] := W[t-16] + s0 + W[t-7] + s1` deliberately wrap on
-  overflow — that's how the algorithm produces correct hashes. FPC's
-  range check ({$R+}) detects the intermediate Int64-promoted sums
-  exceeding Cardinal's range and raises EangeError. Disable range
-  checking inside this function so the modular arithmetic runs as
-  written. The unit tests (NIST vectors) don't catch this because
-  the test compiler doesn't pass -Cr; lwpt's dev build does, and the
-  network-source archive-hash path was the first call site to hit
-  it after the matching ADR. }
-{$PUSH}{$R-}{$Q-}
-function SHA256Bytes(const AData: TBytes): TSHA256Digest;
-const
-  K: array[0..63] of Cardinal = (
-    $428a2f98,$71374491,$b5c0fbcf,$e9b5dba5,$3956c25b,$59f111f1,$923f82a4,$ab1c5ed5,
-    $d807aa98,$12835b01,$243185be,$550c7dc3,$72be5d74,$80deb1fe,$9bdc06a7,$c19bf174,
-    $e49b69c1,$efbe4786,$0fc19dc6,$240ca1cc,$2de92c6f,$4a7484aa,$5cb0a9dc,$76f988da,
-    $983e5152,$a831c66d,$b00327c8,$bf597fc7,$c6e00bf3,$d5a79147,$06ca6351,$14292967,
-    $27b70a85,$2e1b2138,$4d2c6dfc,$53380d13,$650a7354,$766a0abb,$81c2c92e,$92722c85,
-    $a2bfe8a1,$a81a664b,$c24b8b70,$c76c51a3,$d192e819,$d6990624,$f40e3585,$106aa070,
-    $19a4c116,$1e376c08,$2748774c,$34b0bcb5,$391c0cb3,$4ed8aa4a,$5b9cca4f,$682e6ff3,
-    $748f82ee,$78a5636f,$84c87814,$8cc70208,$90befffa,$a4506ceb,$bef9a3f7,$c67178f2);
-var
-  HV: array[0..7] of Cardinal;
-  W: array[0..63] of Cardinal;
-  Msg: TBytes;
-  BitLen: QWord;
-  i, t, ChunkStart: Integer;
-  a,b,c,d,e,f,g,h, s0,s1, ch, maj, temp1, temp2: Cardinal;
-
-  function RotR(x: Cardinal; n: Byte): Cardinal; inline;
-  begin
-    Result := (x shr n) or (x shl (32 - n));
-  end;
-
-begin
-  HV[0]:=$6a09e667; HV[1]:=$bb67ae85; HV[2]:=$3c6ef372; HV[3]:=$a54ff53a;
-  HV[4]:=$510e527f; HV[5]:=$9b05688c; HV[6]:=$1f83d9ab; HV[7]:=$5be0cd19;
-
-  BitLen := QWord(Length(AData)) * 8;
-  { pad: 0x80, then zeros, then 64-bit big-endian length }
-  Msg := Copy(AData, 0, Length(AData));
-  SetLength(Msg, Length(Msg) + 1);
-  Msg[High(Msg)] := $80;
-  while (Length(Msg) mod 64) <> 56 do
-    SetLength(Msg, Length(Msg) + 1);
-  SetLength(Msg, Length(Msg) + 8);
-  for i := 0 to 7 do
-    Msg[Length(Msg) - 1 - i] := Byte((BitLen shr (8 * i)) and $FF);
-
-  ChunkStart := 0;
-  while ChunkStart < Length(Msg) do
-  begin
-    for t := 0 to 15 do
-      W[t] := (Cardinal(Msg[ChunkStart + t*4    ]) shl 24) or
-              (Cardinal(Msg[ChunkStart + t*4 + 1]) shl 16) or
-              (Cardinal(Msg[ChunkStart + t*4 + 2]) shl 8) or
-              (Cardinal(Msg[ChunkStart + t*4 + 3]));
-    for t := 16 to 63 do
-    begin
-      s0 := RotR(W[t-15],7) xor RotR(W[t-15],18) xor (W[t-15] shr 3);
-      s1 := RotR(W[t-2],17) xor RotR(W[t-2],19) xor (W[t-2] shr 10);
-      W[t] := W[t-16] + s0 + W[t-7] + s1;
-    end;
-
-    a:=HV[0]; b:=HV[1]; c:=HV[2]; d:=HV[3];
-    e:=HV[4]; f:=HV[5]; g:=HV[6]; h:=HV[7];
-
-    for t := 0 to 63 do
-    begin
-      s1   := RotR(e,6) xor RotR(e,11) xor RotR(e,25);
-      ch   := (e and f) xor ((not e) and g);
-      temp1:= h + s1 + ch + K[t] + W[t];
-      s0   := RotR(a,2) xor RotR(a,13) xor RotR(a,22);
-      maj  := (a and b) xor (a and c) xor (b and c);
-      temp2:= s0 + maj;
-      h:=g; g:=f; f:=e; e:=d + temp1;
-      d:=c; c:=b; b:=a; a:=temp1 + temp2;
-    end;
-
-    Inc(HV[0],a); Inc(HV[1],b); Inc(HV[2],c); Inc(HV[3],d);
-    Inc(HV[4],e); Inc(HV[5],f); Inc(HV[6],g); Inc(HV[7],h);
-    Inc(ChunkStart, 64);
-  end;
-
-  for i := 0 to 7 do
-  begin
-    Result[i*4    ] := Byte((HV[i] shr 24) and $FF);
-    Result[i*4 + 1] := Byte((HV[i] shr 16) and $FF);
-    Result[i*4 + 2] := Byte((HV[i] shr 8) and $FF);
-    Result[i*4 + 3] := Byte( HV[i]         and $FF);
-  end;
-end;
-{$POP}
-
-function SHA256Hex(const AData: TBytes): string;
-var D: TSHA256Digest; i: Integer;
-begin
-  D := SHA256Bytes(AData);
-  Result := '';
-  for i := 0 to 31 do
-    Result := Result + LowerCase(IntToHex(D[i], 2));
-end;
-
-function SHA256File(const APath: string): string;
-var FS: TFileStream; Buf: TBytes;
-begin
-  if not FileExists(APath) then Exit('');
-  FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
-  try
-    SetLength(Buf, FS.Size);
-    if FS.Size > 0 then FS.ReadBuffer(Buf[0], FS.Size);
-  finally
-    FS.Free;
-  end;
-  Result := SHA256Hex(Buf);
-end;
-
-{ Hash of an installed package: SHA-256 over every extracted file's bytes,
-  visited in sorted relative-path order so the digest is stable regardless
-  of filesystem enumeration order or which mirror served the archive.
-  This is the value that goes in lwpt.lock's computedHash.
-
-  Directory symlinks are never descended into: a link cycle would recurse
-  forever, and the linked bytes are hashed where they really live. File
-  symlinks still contribute (their target's bytes are read through the
-  link, as before) — but only when the target resolves: a dangling link
-  was invisible to the old faAnyFile-only enumeration, so it must stay
-  excluded or HashTree fails opening it. faSymLink must be in the
-  FindFirst mask or the attribute is not reported and links look like
-  plain directories (or, dangling, vanish entirely).
-  MUST stay in lockstep with LWPT.Core's CollectFiles — install writes
-  computedHash with this copy, and the two may not disagree. }
-procedure CollectFiles(const ARoot, ARel: string; AList: TStringList);
-var SR: TSearchRec; Path, RelPath: string;
-begin
-  Path := IncludeTrailingPathDelimiter(ARoot + ARel);
-  if SysUtils.FindFirst(Path + '*', faAnyFile or faSymLink, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        RelPath := ARel + SR.Name;
-        if (SR.Attr and faSymLink) <> 0 then
-        begin
-          if ((SR.Attr and faDirectory) = 0)
-             and FileExists(Path + SR.Name) then
-            AList.Add(RelPath);
-        end
-        else if (SR.Attr and faDirectory) <> 0 then
-          CollectFiles(ARoot, RelPath + PathDelim, AList)
-        else
-          AList.Add(RelPath);
-      until SysUtils.FindNext(SR) <> 0;
-    finally
-      SysUtils.FindClose(SR);
-    end;
-end;
-
-function HashTree(const APathOrArchive: string): string;
-var
-  Files : TStringList;
-  Acc   : TBytes;
-  i, n  : Integer;
-  Chunk : TBytes;
-  FS    : TFileStream;
-  FullPath : string;
-begin
-  { directory: hash the sorted file tree }
-  if DirectoryExists(APathOrArchive) then
-  begin
-    Files := TStringList.Create;
-    try
-      CollectFiles(IncludeTrailingPathDelimiter(APathOrArchive), '', Files);
-      Files.Sort;
-      SetLength(Acc, 0);
-      for i := 0 to Files.Count - 1 do
-      begin
-        { fold the relative path in too, so renames change the hash }
-        Chunk := BytesOf(Files[i] + #10);
-        n := Length(Acc);
-        SetLength(Acc, n + Length(Chunk));
-        if Length(Chunk) > 0 then Move(Chunk[0], Acc[n], Length(Chunk));
-
-        FullPath := IncludeTrailingPathDelimiter(APathOrArchive) + Files[i];
-        FS := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
-        try
-          n := Length(Acc);
-          SetLength(Acc, n + FS.Size);
-          if FS.Size > 0 then FS.ReadBuffer(Acc[n], FS.Size);
-        finally
-          FS.Free;
-        end;
-      end;
-      Result := 'sha256:' + SHA256Hex(Acc);
-    finally
-      Files.Free;
-    end;
-  end
-  { file (e.g. the archive itself): hash its bytes }
-  else if FileExists(APathOrArchive) then
-    Result := 'sha256:' + SHA256File(APathOrArchive)
-  else
-    Result := 'sha256:' + SHA256Hex(BytesOf(APathOrArchive));
-end;
 
 { ---------------------------------------------------------------------------
   Transitive BFS resolver.

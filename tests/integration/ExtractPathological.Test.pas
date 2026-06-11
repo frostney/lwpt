@@ -46,6 +46,9 @@ type
     procedure TestRegularFileWithShortPath;
     procedure TestRegularFileWithPrefixSplitPath;
     procedure TestSymlinkResolvesToFileContent;
+    procedure TestDirLinkToSiblingMaterialized;
+    procedure TestLinkTargetIsOwnParentSkipped;
+    procedure TestLinkTargetIsAncestorSkipped;
     procedure TestGnuLongNameOverridesHeaderName;
   end;
 
@@ -226,6 +229,90 @@ begin
   Expect<Boolean>(BytesEqual(ExtractedBytes, Body)).ToBe(True);
 end;
 
+procedure TExtractPathological.TestDirLinkToSiblingMaterialized;
+{ The legitimate directory-link shape: a link to a sibling directory
+  is materialized as a recursive copy. Pins that the cycle guard
+  below does not over-block the supported case. }
+var
+  Archive, Dest: string;
+  Body: TBytes;
+begin
+  Body := BytesOf('reachable through the alias');
+  Archive := FScratch + '/dir-link.tar.gz';
+  Dest := FScratch + '/dir-link-out';
+  ForceDirectories(Dest);
+  WriteBytesToFile(Archive, Gzip(BuildTar([
+    MakeDirectoryEntry('top/real'),
+    MakeRegularFileEntry('top/real/data.txt', Body),
+    MakeSymlinkEntry('top/alias', 'real')
+  ])));
+
+  ExtractArchive(Archive, Dest);
+
+  Expect<Boolean>(FileExists(Dest + '/alias/data.txt')).ToBe(True);
+  Expect<Boolean>(BytesEqual(
+    ReadFileBytes(Dest + '/alias/data.txt'), Body)).ToBe(True);
+end;
+
+procedure TExtractPathological.TestLinkTargetIsOwnParentSkipped;
+{ A link whose target resolves to its own parent directory is still
+  inside the extraction root, so the escape check passes — but
+  materializing it would copy the directory into its own subtree and
+  recurse until the OS path-length limit. The extractor must skip the
+  link, finish, and leave the sibling file intact. }
+var
+  Archive, Dest: string;
+  Body: TBytes;
+  Count: Integer;
+begin
+  Body := BytesOf('survives the cycle link');
+  Archive := FScratch + '/link-own-parent.tar.gz';
+  Dest := FScratch + '/link-own-parent-out';
+  ForceDirectories(Dest);
+  WriteBytesToFile(Archive, Gzip(BuildTar([
+    MakeDirectoryEntry('top/dir'),
+    MakeRegularFileEntry('top/dir/keep.txt', Body),
+    MakeSymlinkEntry('top/dir/link', '.')
+  ])));
+
+  { The regression assertion: this returns at all. }
+  Count := ExtractArchive(Archive, Dest);
+
+  Expect<Integer>(Count).ToBe(1);
+  Expect<Boolean>(FileExists(Dest + '/dir/keep.txt')).ToBe(True);
+  Expect<Boolean>(BytesEqual(
+    ReadFileBytes(Dest + '/dir/keep.txt'), Body)).ToBe(True);
+  Expect<Boolean>(DirectoryExists(Dest + '/dir/link')).ToBe(False);
+  Expect<Boolean>(FileExists(Dest + '/dir/link')).ToBe(False);
+end;
+
+procedure TExtractPathological.TestLinkTargetIsAncestorSkipped;
+{ Same shape one level deeper: the target ('..') is a strict ancestor
+  of the link, not just its immediate parent. }
+var
+  Archive, Dest: string;
+  Body: TBytes;
+  Count: Integer;
+begin
+  Body := BytesOf('survives the ancestor link');
+  Archive := FScratch + '/link-ancestor.tar.gz';
+  Dest := FScratch + '/link-ancestor-out';
+  ForceDirectories(Dest);
+  WriteBytesToFile(Archive, Gzip(BuildTar([
+    MakeDirectoryEntry('top/dir'),
+    MakeDirectoryEntry('top/dir/sub'),
+    MakeRegularFileEntry('top/dir/keep.txt', Body),
+    MakeSymlinkEntry('top/dir/sub/link', '..')
+  ])));
+
+  Count := ExtractArchive(Archive, Dest);
+
+  Expect<Integer>(Count).ToBe(1);
+  Expect<Boolean>(FileExists(Dest + '/dir/keep.txt')).ToBe(True);
+  Expect<Boolean>(DirectoryExists(Dest + '/dir/sub/link')).ToBe(False);
+  Expect<Boolean>(FileExists(Dest + '/dir/sub/link')).ToBe(False);
+end;
+
 procedure TExtractPathological.TestGnuLongNameOverridesHeaderName;
 { The third pathological case: GNU 'L' long-name entries. When a
   path exceeds 255 bytes (the ustar prefix-split ceiling), GNU tar
@@ -287,6 +374,12 @@ begin
     TestRegularFileWithPrefixSplitPath);
   Test('symlink resolves to its target''s bytes (deferred-link pass)',
     TestSymlinkResolvesToFileContent);
+  Test('directory link to a sibling is materialized as a copy',
+    TestDirLinkToSiblingMaterialized);
+  Test('link targeting its own parent is skipped, extraction completes',
+    TestLinkTargetIsOwnParentSkipped);
+  Test('link targeting an ancestor is skipped, extraction completes',
+    TestLinkTargetIsAncestorSkipped);
   Test('GNU L long-name entry overrides truncated header name',
     TestGnuLongNameOverridesHeaderName);
 end;
