@@ -68,6 +68,7 @@ function  MatchPathGlob(const APath, APattern: string): Boolean;
 procedure ApplyIncludeExclude(const ARoot: string; const AIncludes, AExcludes: TStringArray);
 
 function  CopyFileContent(const ASrc, ADst: string): Boolean;
+function  PathContains(const AParent, AChild: string): Boolean;
 procedure CopyDirTree(const ASrc, ADst: string);
 function  MakeTmpPath(const ATmpRoot, AHint: string): string;
 procedure WipeDir(const APath: string);
@@ -404,27 +405,158 @@ begin
   end;
 end;
 
-{ Recursive directory copy. Used for the local source and for resolving
-  directory symlinks during extraction. }
-procedure CopyDirTree(const ASrc, ADst: string);
-var SR: TSearchRec; S, D: string;
+{ True when AChild sits inside (or is) the directory AParent. Both
+  sides are normalized via ExpandFileName (idempotent on already-
+  absolute paths) and compared with a trailing delimiter appended, so
+  'a/bc' is not inside 'a/b' and equality counts as contained.
+  Case-insensitive on Windows. Purely lexical — symlinks are not
+  resolved. This is the one home for the containment compare; the
+  copy-cycle guards below and in the extractor's deferred-link pass
+  must not grow their own variants. }
+function PathContains(const AParent, AChild: string): Boolean;
+var P, C: string;
 begin
-  ForceDirectories(ADst);
-  S := IncludeTrailingPathDelimiter(ASrc);
-  D := IncludeTrailingPathDelimiter(ADst);
-  if SysUtils.FindFirst(S + '*', faAnyFile, SR) = 0 then
+  P := IncludeTrailingPathDelimiter(ExpandFileName(AParent));
+  C := IncludeTrailingPathDelimiter(ExpandFileName(AChild));
+  {$IFDEF MSWINDOWS}
+  Result := SameText(Copy(C, 1, Length(P)), P);
+  {$ELSE}
+  Result := Copy(C, 1, Length(P)) = P;
+  {$ENDIF}
+end;
+
+{ True when A and B name the same physical directory, with symlinks
+  and junctions followed: dev+inode on Unix, volume serial + file
+  index on Windows. False when either path does not resolve. This is
+  the stat-level complement to the lexical PathContains. }
+{$IFDEF UNIX}
+function IsSameDirectory(const A, B: string): Boolean;
+var SA, SB: BaseUnix.Stat;
+begin
+  if FpStat(A, SA) <> 0 then Exit(False);
+  if FpStat(B, SB) <> 0 then Exit(False);
+  Result := (SA.st_dev = SB.st_dev) and (SA.st_ino = SB.st_ino);
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+function IsSameDirectory(const A, B: string): Boolean;
+
+  function OpenDir(const APath: string): THandle;
+  begin
+    { zero access: metadata only. FILE_FLAG_BACKUP_SEMANTICS is
+      required to open a directory handle; reparse points are
+      followed so the identity is the final target's. }
+    Result := Windows.CreateFileW(PWideChar(UnicodeString(APath)), 0,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
+  end;
+
+var
+  HA, HB: THandle;
+  IA, IB: TByHandleFileInformation;
+begin
+  Result := False;
+  HA := OpenDir(A);
+  if HA = INVALID_HANDLE_VALUE then Exit;
+  try
+    HB := OpenDir(B);
+    if HB = INVALID_HANDLE_VALUE then Exit;
     try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) <> 0 then
-          CopyDirTree(S + SR.Name, D + SR.Name)
-        else if not CopyFileContent(S + SR.Name, D + SR.Name) then
-          raise EExtractError.CreateFmt(
-            'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
-      until SysUtils.FindNext(SR) <> 0;
+      if Windows.GetFileInformationByHandle(HA, IA)
+         and Windows.GetFileInformationByHandle(HB, IB) then
+        Result := (IA.dwVolumeSerialNumber = IB.dwVolumeSerialNumber)
+              and (IA.nFileIndexHigh = IB.nFileIndexHigh)
+              and (IA.nFileIndexLow = IB.nFileIndexLow);
     finally
-      SysUtils.FindClose(SR);
+      Windows.CloseHandle(HB);
     end;
+  finally
+    Windows.CloseHandle(HA);
+  end;
+end;
+{$ENDIF}
+
+{ Recursive directory copy. Used for the local source and for resolving
+  directory symlinks during extraction.
+
+  Directory symlinks are never followed: a link cycle in the source
+  tree would otherwise recurse until the OS path-length limit,
+  duplicating the tree once per nesting level into the destination.
+  Skipping them (the link is not reproduced either) matches
+  CollectFiles/HashTree, so a staged copy hashes identically to the
+  tree it was copied from. File symlinks are copied through (target
+  bytes) when the target resolves and skipped when dangling — again
+  mirroring CollectFiles. faSymLink must be in the FindFirst mask or
+  the attribute is not reported and links look like plain
+  directories (or, dangling, vanish entirely).
+
+  A destination inside (or equal to) the source is the other
+  unbounded-recursion shape — each level re-enumerates what the
+  previous one wrote. That is always a caller bug, so it raises
+  rather than being silently skipped. The lexical PathContains check
+  catches the plain case before any filesystem work; it cannot see
+  ALIASED containment (the source reached through a symlink or
+  junction while the destination names the real tree, or a
+  case-folding filesystem spelling the same directory two ways), so
+  the destination's existing ancestors are additionally compared
+  against the source by physical directory identity. Copying FROM an
+  aliased root into a disjoint destination stays legal. }
+procedure CopyDirTree(const ASrc, ADst: string);
+
+  procedure CopyRec(const ASrcDir, ADstDir: string);
+  var SR: TSearchRec; S, D: string;
+  begin
+    S := IncludeTrailingPathDelimiter(ASrcDir);
+    D := IncludeTrailingPathDelimiter(ADstDir);
+    ForceDirectories(ADstDir);
+    if SysUtils.FindFirst(S + '*', faAnyFile or faSymLink, SR) = 0 then
+      try
+        repeat
+          if (SR.Name = '.') or (SR.Name = '..') then Continue;
+          if (SR.Attr and faSymLink) <> 0 then
+          begin
+            if ((SR.Attr and faDirectory) = 0)
+               and FileExists(S + SR.Name)
+               and not CopyFileContent(S + SR.Name, D + SR.Name) then
+              raise EExtractError.CreateFmt(
+                'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
+          end
+          else if (SR.Attr and faDirectory) <> 0 then
+            CopyRec(S + SR.Name, D + SR.Name)
+          else if not CopyFileContent(S + SR.Name, D + SR.Name) then
+            raise EExtractError.CreateFmt(
+              'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
+        until SysUtils.FindNext(SR) <> 0;
+      finally
+        SysUtils.FindClose(SR);
+      end;
+  end;
+
+var
+  Anc, Parent: string;
+begin
+  if PathContains(ASrc, ADst) then
+    raise EExtractError.CreateFmt(
+      'refusing to copy "%s" into itself ("%s")', [ASrc, ADst]);
+  { Physical containment walk: if any existing ancestor of the
+    destination IS the source directory (same dev+inode / volume+file
+    index), the destination resolves into the source even though the
+    spellings differ. Checked once up front — before ForceDirectories
+    pollutes the source — and not re-checked per recursion level:
+    children of a disjoint pair stay disjoint because directory
+    symlinks are never followed. }
+  Anc := ExcludeTrailingPathDelimiter(ExpandFileName(ADst));
+  while Anc <> '' do
+  begin
+    if IsSameDirectory(ASrc, Anc) then
+      raise EExtractError.CreateFmt(
+        'refusing to copy "%s" into itself ("%s" resolves into it)',
+        [ASrc, ADst]);
+    Parent := ExtractFileDir(Anc);
+    if Parent = Anc then Break;
+    Anc := Parent;
+  end;
+  CopyRec(ASrc, ADst);
 end;
 
 function ProcessIdStr: string;
