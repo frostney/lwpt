@@ -50,6 +50,7 @@ type
     procedure TestDepWithHttpSourceRejected;
     procedure TestUnknownSourceKindRejected;
     procedure TestMissingManifestRejected;
+    procedure TestBuildTargetTraversalNameRootOnly;
   end;
 
   TLoadManifestExtensions = class(TTestSuite)
@@ -189,6 +190,17 @@ type
     procedure TestTrailingDoubleStar;
     procedure TestLeadingDoubleStar;
     procedure TestNoMatchOnDifferentFile;
+  end;
+
+  { SanitisePathSegment — the shared flattener behind per-target
+    artefact dirs (TargetBuildRoot) and per-test build dirs
+    (TestBuildDir). }
+  TSanitisePathSegmentSuite = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestPlainNameUnchanged;
+    procedure TestSeparatorsFlattened;
+    procedure TestDistinctInputsCanCollide;
   end;
 
   { [sources] custom-prefix declaration with placeholder URL
@@ -483,6 +495,31 @@ begin
     Self);
 end;
 
+procedure TLoadManifestValidation.TestBuildTargetTraversalNameRootOnly;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "traversal"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    '".." = { source = "src/x.pas" }'#10;
+var
+  Path : string;
+  Man  : TManifest;
+begin
+  { Root manifest: ".." would make build/targets/.. resolve to build/
+    itself — rejected at load. }
+  Path := WriteManifest('traversal-build-name', INPUT);
+  ExpectManifestLoadError(Path, 'invalid [build] target name', Self);
+
+  { Dependency manifest (AIsRoot=False): its targets are never built
+    by the consumer (parse-and-drop posture, ADR-0011) — a broken or
+    hostile dep manifest must not block `lwpt install`. }
+  Man := LoadManifest(Path, False);
+  Expect<Integer>(Length(Man.Targets)).ToBe(1);
+end;
+
 procedure TLoadManifestValidation.SetupTests;
 begin
   Test('bare-string dep shorthand rejected (ADR-0004 migration)',
@@ -492,6 +529,8 @@ begin
     TestDepWithHttpSourceRejected);
   Test('unknown source kind rejected',      TestUnknownSourceKindRejected);
   Test('missing manifest path rejected',    TestMissingManifestRejected);
+  Test('traversal [build] name rejected for root, tolerated for deps',
+    TestBuildTargetTraversalNameRootOnly);
 end;
 
 { ── TLoadManifestExtensions ───────────────────────────────────────── }
@@ -1786,6 +1825,39 @@ begin
     TestLockfilePermissiveOnUnknownPrefix);
 end;
 
+{ ── TSanitisePathSegmentSuite ─────────────────────────────────────── }
+
+procedure TSanitisePathSegmentSuite.TestPlainNameUnchanged;
+begin
+  Expect<string>(SanitisePathSegment('alpha')).ToBe('alpha');
+  Expect<string>(SanitisePathSegment('my-tool_2')).ToBe('my-tool_2');
+end;
+
+procedure TSanitisePathSegmentSuite.TestSeparatorsFlattened;
+begin
+  Expect<string>(SanitisePathSegment('a/b')).ToBe('a_b');
+  Expect<string>(SanitisePathSegment('a\b')).ToBe('a_b');
+  Expect<string>(SanitisePathSegment('C:tool')).ToBe('C_tool');
+  Expect<string>(SanitisePathSegment('a/b\c:d')).ToBe('a_b_c_d');
+end;
+
+procedure TSanitisePathSegmentSuite.TestDistinctInputsCanCollide;
+begin
+  { Documented contract: callers keying dirs off the result must
+    detect collisions themselves (CmdBuild does). }
+  Expect<string>(SanitisePathSegment('a:b'))
+    .ToBe(SanitisePathSegment('a_b'));
+end;
+
+procedure TSanitisePathSegmentSuite.SetupTests;
+begin
+  Test('plain names pass through unchanged', TestPlainNameUnchanged);
+  Test('separators and colons flatten to underscores',
+    TestSeparatorsFlattened);
+  Test('distinct inputs can collide (callers must guard)',
+    TestDistinctInputsCanCollide);
+end;
+
 begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
     'LWPT.Core: SHA-256 NIST vectors'));
@@ -1809,6 +1881,8 @@ begin
     'LWPT.Manifest: Custom [sources]'));
   TestRunnerProgram.AddSuite(TPathGlobMatching.Create(
     'LWPT.Core: MatchPathGlob'));
+  TestRunnerProgram.AddSuite(TSanitisePathSegmentSuite.Create(
+    'LWPT.Core: SanitisePathSegment'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
     'LWPT.Core: ApplyIncludeExclude'));
   TestRunnerProgram.Run;
