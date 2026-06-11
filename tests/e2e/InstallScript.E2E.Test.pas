@@ -54,7 +54,7 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.Fixtures,
+  Tests.Scratch,
   Tests.LwptSubprocess;
 
 type

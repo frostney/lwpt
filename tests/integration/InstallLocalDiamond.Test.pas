@@ -45,7 +45,7 @@ uses
   LWPT.Command.Install,
   LWPT.Core,
   TestingPascalLibrary,
-  Tests.Fixtures;
+  Tests.Scratch;
 
 type
   TInstallLocalDiamond = class(TTestSuite)

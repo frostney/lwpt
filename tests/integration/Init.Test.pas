@@ -24,8 +24,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.Fixtures,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 type
   TInitCommand = class(TTestSuite)

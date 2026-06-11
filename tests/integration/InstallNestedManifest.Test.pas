@@ -37,7 +37,7 @@ uses
   LWPT.Command.Install,
   LWPT.Core,
   TestingPascalLibrary,
-  Tests.Fixtures;
+  Tests.Scratch;
 
 type
   TInstallNestedManifest = class(TTestSuite)
@@ -53,19 +53,6 @@ type
     procedure TestTransitiveDepOfNestedManifestResolved;
     procedure TestAmbiguousManifestsFallBackToModuleRoot;
   end;
-
-procedure WriteTextFile(const APath, AContent: string);
-var SL: TStringList;
-begin
-  ForceDirectories(ExtractFileDir(APath));
-  SL := TStringList.Create;
-  try
-    SL.Text := AContent;
-    SL.SaveToFile(APath);
-  finally
-    SL.Free;
-  end;
-end;
 
 function ReadFileText(const APath: string): string;
 var SL: TStringList;

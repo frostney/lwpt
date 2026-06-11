@@ -29,8 +29,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.Fixtures,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 const
   REPO_SLUG = 'gitlab-examples/ci-debug-trace';
@@ -71,11 +71,11 @@ end;
 procedure TInstallGitLabE2E.SetupScratchProject;
 begin
   ForceDirectories(FRoot + '/source');
-  WriteTestFile(FRoot + '/source/main.pas',
+  WriteTextFile(FRoot + '/source/main.pas',
     'program main;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'begin end.'#10);
-  WriteTestFile(FRoot + '/lwpt.toml',
+  WriteTextFile(FRoot + '/lwpt.toml',
     '[package]'#10 +
     'name = "gitlab-e2e"'#10 +
     'version = "0.0.0"'#10 +

@@ -56,7 +56,9 @@ The full mode-flag sets are in `LWPT.Command.Build.AddBuildModeFlags`:
 | `dev` (default) | `-O- -gw -godwarfsets -gl -Ct -Cr -Sa` |
 | `release` (`--mode release`) | `-O4 -dPRODUCTION -Xs -CX -XX -B` |
 
-`--clean` deletes the prior binary, the target's whole artefact dir `build/targets/<name>/` (both modes), and the `.o` / `.ppu` next to the source before invoking FPC. It also prunes orphaned `build/targets/` subdirs left behind by renamed or deleted targets. Combined with dev mode it also adds `-B` to force a full rebuild (release mode includes `-B` already).
+`--clean` first prunes orphaned `build/targets/` subdirs (renamed or deleted targets), then does one recursive sweep of `build/`, deleting FPC intermediate artefacts by extension (`.ppu`, `.o`, `.or`, `.res`, `.reslst`) — binaries and anything else under `build/` survive. Symlinks are never followed (a symlinked dir is treated as a leaf, so the sweep cannot escape `build/`), and artefacts that cannot be removed (e.g. locked files on Windows) are reported on stderr rather than silently skipped. Per target it additionally deletes the prior binary, the target's whole artefact dir `build/targets/<name>/` (both modes), and the `.o` / `.ppu` next to the source. Combined with dev mode it also adds `-B` to force a full rebuild (release mode includes `-B` already).
+
+When a build fails with output matching a stale-artefact signature (internal compiler exception, resource-compile errors, missing `.reslst`), `lwpt build` prints a hint to retry with `--clean`. The signature heuristic lives in `LWPT.Command.Build.HasStaleArtefactSignature`.
 
 ### The current-executable special-case
 
@@ -112,7 +114,7 @@ The isolation exists because FPC reuses a `.ppu` without re-checking the conditi
 
 The trade-off is deliberate: shared units compile once per target instead of once per run. Correctness over warm-cache sharing — FPC is fast enough that this does not hurt.
 
-When you run `lwpt build --clean`, the binary at `output` is deleted along with the target's whole `build/targets/<name>/` dir, and orphaned `build/targets/` subdirs (renamed or deleted targets) are pruned. The `.o` / `.ppu` next to the source are also deleted — that pair is load-bearing, not cosmetic: source dirs sit on `-Fu`, so a stale `.ppu` there (from a raw `fpc @lwpt.cfg` run) would poison rebuilds. Leftover artefacts in the `build/` root (pre-isolation layout, bootstrap) are deliberately *not* swept: `build/` is on no unit search path, so they are inert.
+When you run `lwpt build --clean`, the binary at `output` is deleted along with the target's whole `build/targets/<name>/` dir, and orphaned `build/targets/` subdirs (renamed or deleted targets) are pruned. The `.o` / `.ppu` next to the source are also deleted — that pair is load-bearing, not cosmetic: source dirs sit on `-Fu`, so a stale `.ppu` there (from a raw `fpc @lwpt.cfg` run) would poison rebuilds. Leftover artefacts elsewhere under `build/` (pre-isolation layout, bootstrap output at the root, per-test dirs) are inert for `lwpt build` itself — `build/` is on no unit search path — but they still affect bootstrap re-runs and `lwpt test` compiles, so the whole-tree extension sweep (see above) removes them too.
 
 ## Cross-compile
 

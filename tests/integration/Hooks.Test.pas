@@ -27,8 +27,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.Fixtures,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 type
   THooksE2E = class(TTestSuite)
@@ -52,7 +52,7 @@ type
 
 procedure THooksE2E.WriteSentinelScript(const APath, ASentinelName: string);
 begin
-  WriteTestFile(APath,
+  WriteTextFile(APath,
     'program TouchSentinel;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'uses SysUtils, Classes;'#10 +
@@ -79,7 +79,7 @@ begin
   ForceDirectories(FScratch + '/source');
   ForceDirectories(FScratch + '/scripts');
 
-  WriteTestFile(FScratch + '/lwpt.toml',
+  WriteTextFile(FScratch + '/lwpt.toml',
     '[package]'#10 +
     'name = "hooks-e2e"'#10 +
     'version = "0.0.0"'#10 +
@@ -90,7 +90,7 @@ begin
     ''#10 +
     AManifestBody);
 
-  WriteTestFile(FScratch + '/source/tinybin.pas',
+  WriteTextFile(FScratch + '/source/tinybin.pas',
     'program tinybin;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'begin'#10 +
@@ -210,7 +210,7 @@ begin
   ForceDirectories(FScratch + '/evildep/source');
   ForceDirectories(FScratch + '/evildep/scripts');
 
-  WriteTestFile(FScratch + '/lwpt.toml',
+  WriteTextFile(FScratch + '/lwpt.toml',
     '[package]'#10 +
     'name = "supply-chain-e2e"'#10 +
     'version = "0.0.0"'#10 +
@@ -219,10 +219,10 @@ begin
     '[dependencies]'#10 +
     'evildep = "./evildep"'#10);
 
-  WriteTestFile(FScratch + '/source/dummy.pas',
+  WriteTextFile(FScratch + '/source/dummy.pas',
     'unit Dummy;'#10'{$mode delphi}{$H+}'#10'interface'#10'implementation'#10'end.'#10);
 
-  WriteTestFile(FScratch + '/evildep/lwpt.toml',
+  WriteTextFile(FScratch + '/evildep/lwpt.toml',
     '[package]'#10 +
     'name = "evildep"'#10 +
     'version = "0.0.0"'#10 +
@@ -231,7 +231,7 @@ begin
     '[preinstall]'#10 +
     'attack = "scripts/attack.pas"'#10);
 
-  WriteTestFile(FScratch + '/evildep/source/dep.pas',
+  WriteTextFile(FScratch + '/evildep/source/dep.pas',
     'unit Dep;'#10'{$mode delphi}{$H+}'#10'interface'#10'implementation'#10'end.'#10);
 
   { The attack script touches a sentinel in the consuming project's

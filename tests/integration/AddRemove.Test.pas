@@ -31,8 +31,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.Fixtures,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 type
   TAddRemoveE2E = class(TTestSuite)
@@ -68,14 +68,14 @@ end;
 
 procedure TAddRemoveE2E.SetupScratchProject;
 begin
-  WriteTestFile(FScratch + '/lwpt.toml',
+  WriteTextFile(FScratch + '/lwpt.toml',
     '# scratch manifest — this comment must survive every edit'#10 +
     '[package]'#10 +
     'name = "addremove-e2e"'#10 +
     'version = "0.0.0"'#10 +
     'units = ["source"]'#10);
 
-  WriteTestFile(FScratch + '/source/Dummy.pas',
+  WriteTextFile(FScratch + '/source/Dummy.pas',
     'unit Dummy;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'interface'#10 +
@@ -85,13 +85,13 @@ begin
   { The local dep `lwpt add` will install. Lives inside the project
     root, so the installer links rather than copies — which makes the
     prune-must-not-follow-the-link assertion meaningful. }
-  WriteTestFile(FScratch + '/vendor/leaf/lwpt.toml',
+  WriteTextFile(FScratch + '/vendor/leaf/lwpt.toml',
     '[package]'#10 +
     'name = "leaf"'#10 +
     'version = "0.1.0"'#10 +
     'units = ["source"]'#10);
 
-  WriteTestFile(FScratch + '/vendor/leaf/source/Leaf.pas',
+  WriteTextFile(FScratch + '/vendor/leaf/source/Leaf.pas',
     'unit Leaf;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'interface'#10 +
@@ -187,7 +187,7 @@ begin
     manifest untouched. }
   Dir := ExpandFileName('build/tests/tmp/addremove-dotted');
   RecursiveDelete(Dir);
-  WriteTestFile(Dir + '/lwpt.toml',
+  WriteTextFile(Dir + '/lwpt.toml',
     '[package]'#10 +
     'name = "addremove-dotted"'#10 +
     'version = "0.0.0"'#10 +
@@ -195,18 +195,18 @@ begin
     #10 +
     '[dependencies.leaf]'#10 +
     'source = "./vendor/leaf"'#10);
-  WriteTestFile(Dir + '/source/Dummy.pas',
+  WriteTextFile(Dir + '/source/Dummy.pas',
     'unit Dummy;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'interface'#10 +
     'implementation'#10 +
     'end.'#10);
-  WriteTestFile(Dir + '/vendor/leaf/lwpt.toml',
+  WriteTextFile(Dir + '/vendor/leaf/lwpt.toml',
     '[package]'#10 +
     'name = "leaf"'#10 +
     'version = "0.1.0"'#10 +
     'units = ["source"]'#10);
-  WriteTestFile(Dir + '/vendor/leaf/source/Leaf.pas',
+  WriteTextFile(Dir + '/vendor/leaf/source/Leaf.pas',
     'unit Leaf;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'interface'#10 +

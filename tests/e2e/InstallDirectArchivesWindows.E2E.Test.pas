@@ -16,8 +16,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.Fixtures,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 const
   GITHUB_DEP_NAME = 'github-archive';
@@ -65,11 +65,11 @@ end;
 procedure TLWPTInstallDirectArchivesWindowsE2E.SetupScratchProject;
 begin
   ForceDirectories(FRoot + '/source');
-  WriteTestFile(FRoot + '/source/main.pas',
+  WriteTextFile(FRoot + '/source/main.pas',
     'program main;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'begin end.'#10);
-  WriteTestFile(FRoot + '/lwpt.toml',
+  WriteTextFile(FRoot + '/lwpt.toml',
     '[package]'#10 +
     'name = "direct-archives-windows-e2e"'#10 +
     'version = "0.0.0"'#10 +

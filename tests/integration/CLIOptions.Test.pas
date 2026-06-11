@@ -36,8 +36,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.Fixtures,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 type
   TCLIOptionsE2E = class(TTestSuite)
@@ -61,7 +61,7 @@ procedure TCLIOptionsE2E.SetupScratchProject;
 begin
   ForceDirectories(FScratch + '/source');
 
-  WriteTestFile(FScratch + '/lwpt.toml',
+  WriteTextFile(FScratch + '/lwpt.toml',
     '[package]'#10 +
     'name = "cli-e2e"'#10 +
     'version = "0.0.0"'#10 +
@@ -71,7 +71,7 @@ begin
     'source = "source/hello.pas"'#10 +
     'output = "build/hello"'#10);
 
-  WriteTestFile(FScratch + '/source/hello.pas',
+  WriteTextFile(FScratch + '/source/hello.pas',
     'program hello;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'begin'#10 +

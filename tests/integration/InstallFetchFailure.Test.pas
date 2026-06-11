@@ -26,8 +26,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.Fixtures,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 type
   TInstallFetchFailureE2E = class(TTestSuite)
@@ -66,7 +66,7 @@ begin
   ForceDirectories(FRoot + '/source');
   { Tiny program file so the manifest parses + units = ["source"]
     resolves to an existing directory. }
-  WriteTestFile(FRoot + '/source/main.pas',
+  WriteTextFile(FRoot + '/source/main.pas',
     'program main;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'begin'#10 +
@@ -76,7 +76,7 @@ begin
   { Manifest with one local-source dep pointing at a path that does
     not exist. lwpt install must fail with EFetchError naming the dep
     and the missing path. }
-  WriteTestFile(FRoot + '/lwpt.toml',
+  WriteTextFile(FRoot + '/lwpt.toml',
     '[package]'#10 +
     'name = "fetch-failure-e2e"'#10 +
     'version = "0.0.0"'#10 +
