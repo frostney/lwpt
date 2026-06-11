@@ -24,7 +24,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 type
   TBuildMultiTarget = class(TTestSuite)
@@ -39,41 +40,6 @@ type
     procedure TestUnknownTargetNameFailsBeforeBuildingAnything;
     procedure TestNoNamesStillBuildsAllTargets;
   end;
-
-procedure WriteTextFile(const APath, AContent: string);
-var SL: TStringList;
-begin
-  ForceDirectories(ExtractFileDir(APath));
-  SL := TStringList.Create;
-  try
-    SL.Text := AContent;
-    SL.SaveToFile(APath);
-  finally
-    SL.Free;
-  end;
-end;
-
-procedure RecursiveDelete(const APath: string);
-var
-  SR: TSearchRec;
-  Base: string;
-begin
-  if not DirectoryExists(APath) then Exit;
-  Base := IncludeTrailingPathDelimiter(APath);
-  if FindFirst(Base + '*', faAnyFile, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) <> 0 then
-          RecursiveDelete(Base + SR.Name)
-        else
-          DeleteFile(Base + SR.Name);
-      until FindNext(SR) <> 0;
-    finally
-      FindClose(SR);
-    end;
-  RemoveDir(APath);
-end;
 
 procedure TBuildMultiTarget.BeforeAll;
 const

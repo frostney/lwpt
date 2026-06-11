@@ -47,8 +47,13 @@ end;
   binaries and anything a postbuild hook placed under build/ survive.
   A stale dependency .ppu left by an older FPC run poisons every target
   that uses the unit — the per-target deletes only ever covered the
-  target's own source, which is why this sweeps the whole tree once. }
-function SweepBuildArtefacts(const ADir: string): Integer;
+  target's own source, which is why this sweeps the whole tree once.
+  ARemoved/AFailed accumulate across the recursion; a failed delete
+  (locked file on Windows, permissions) must be surfaced, because a
+  sweep that silently leaves the stale artefact behind makes the
+  --clean retry hint a dead end. }
+procedure SweepBuildArtefacts(const ADir: string;
+  var ARemoved, AFailed: Integer);
 const
   ARTEFACT_EXTS: array[0..4] of string
     = ('.ppu', '.o', '.or', '.res', '.reslst');
@@ -57,22 +62,31 @@ var
   Base, Ext: string;
   i: Integer;
 begin
-  Result := 0;
   if not DirectoryExists(ADir) then Exit;
   Base := IncludeTrailingPathDelimiter(ADir);
-  if SysUtils.FindFirst(Base + '*', faAnyFile, SR) = 0 then
+  { faSymLink in the mask makes FindFirst report links as links
+    (lstat); without it a symlink-to-dir is indistinguishable from a
+    real dir and the recursion would escape build/ — deleting
+    artefacts outside the tree or looping forever on a cyclic link.
+    Links are never followed; one whose own name matches an artefact
+    extension is merely unlinked. }
+  if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
     try
       repeat
         if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) <> 0 then
-          Inc(Result, SweepBuildArtefacts(Base + SR.Name))
+        if ((SR.Attr and faDirectory) <> 0)
+           and ((SR.Attr and faSymLink) = 0) then
+          SweepBuildArtefacts(Base + SR.Name, ARemoved, AFailed)
         else
         begin
           Ext := LowerCase(ExtractFileExt(SR.Name));
           for i := 0 to High(ARTEFACT_EXTS) do
             if Ext = ARTEFACT_EXTS[i] then
             begin
-              if SysUtils.DeleteFile(Base + SR.Name) then Inc(Result);
+              if SysUtils.DeleteFile(Base + SR.Name) then
+                Inc(ARemoved)
+              else
+                Inc(AFailed);
               Break;
             end;
         end;
@@ -80,6 +94,53 @@ begin
     finally
       SysUtils.FindClose(SR);
     end;
+end;
+
+{ Run FPC with the given arguments, echoing its output live (chunk by
+  chunk, as the old inherited-stdio path did) while also accumulating
+  it for the stale-artefact inspection on failure. Returns False only
+  when the executable could not be started at all. SetString carries
+  an explicit length, so the accumulation is byte-safe regardless of
+  chunk content. }
+function RunFPCEchoed(const AArgs: TStringArray; out AOutput: string;
+  out AExitCode: Integer): Boolean;
+var
+  P: TProcess;
+  Buf: array[0..4095] of Byte;
+  Chunk: string;
+  i, N: Integer;
+begin
+  AOutput := '';
+  AExitCode := -1;
+  P := TProcess.Create(nil);
+  try
+    P.Executable := FPCExecutable;
+    for i := 0 to High(AArgs) do
+      P.Parameters.Add(AArgs[i]);
+    P.Options := [poUsePipes, poStderrToOutPut];
+    try
+      P.Execute;
+    except
+      Exit(False);
+    end;
+    { Blocking read until EOF: drains the pipe as FPC produces output,
+      so large compiles can neither deadlock the pipe nor go silent. }
+    repeat
+      N := P.Output.Read(Buf[0], SizeOf(Buf));
+      if N > 0 then
+      begin
+        SetString(Chunk, PAnsiChar(@Buf[0]), N);
+        Write(Chunk);
+        Flush(Output);
+        AOutput := AOutput + Chunk;
+      end;
+    until N <= 0;
+    P.WaitOnExit;
+    AExitCode := P.ExitStatus;
+    Result := True;
+  finally
+    P.Free;
+  end;
 end;
 
 { FPC failure output that points at stale build artefacts rather than a
@@ -200,11 +261,7 @@ begin
     Args.Free;
   end;
 
-  { Captured rather than inherited stdio so a failure's output can be
-    inspected for the stale-artefact signature below. }
-  FpcExit := -1;
-  RanOk := RunCommandInDir('', FPCExecutable, FpcArgs, OutText, FpcExit,
-    [poStderrToOutPut]) = 0;
+  RanOk := RunFPCEchoed(FpcArgs, OutText, FpcExit);
   Result := RanOk and (FpcExit = 0);
 
   if Result then
@@ -213,9 +270,6 @@ begin
     WriteLn('FAILED (fpc exit ', FpcExit, ')')
   else
     WriteLn('FAILED (could not run ', FPCExecutable, ')');
-
-  OutText := TrimRight(OutText);
-  if OutText <> '' then WriteLn(OutText);
 
   if (not Result) and (not AClean)
      and HasStaleArtefactSignature(OutText) then
@@ -239,7 +293,7 @@ function CmdBuild(const AManifestPath: string;
   const ATargetNames: array of string; ARelease, AClean: Boolean): Integer;
 var
   Man : TManifest;
-  i, j, Built, Failed, Unknown, Swept : Integer;
+  i, j, Built, Failed, Unknown, Swept, SweepFailed : Integer;
   Matched : Boolean;
   ModeStr : string;
 begin
@@ -281,11 +335,16 @@ begin
     swept away. }
   if AClean then
   begin
-    Swept := SweepBuildArtefacts('build');
-    if Swept = 0 then
+    Swept := 0;
+    SweepFailed := 0;
+    SweepBuildArtefacts('build', Swept, SweepFailed);
+    if (Swept = 0) and (SweepFailed = 0) then
       WriteLn('  clean: no FPC artefacts under build/')
     else
       WriteLn('  clean: removed ', Swept, ' FPC artefact file(s) from build/');
+    if SweepFailed > 0 then
+      WriteLn(ErrOutput, '  clean: ', SweepFailed, ' artefact file(s) could',
+        ' not be removed (locked?) — stale state may persist');
   end;
 
   { Whole-build prebuild hooks (ADR-0011). Fires once before the

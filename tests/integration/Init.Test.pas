@@ -24,13 +24,13 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 type
   TInitCommand = class(TTestSuite)
   private
     FOrigDir, FScratch: string;
-    procedure RecursiveDelete(const APath: string);
   protected
     procedure BeforeAll; override;
     procedure AfterAll;  override;
@@ -48,26 +48,6 @@ type
     procedure TestSecondInitWithForceOverwrites;
     procedure TestExistingGitignoreIsNotDuplicated;
   end;
-
-procedure TInitCommand.RecursiveDelete(const APath: string);
-var SR: TSearchRec; Base: string;
-begin
-  if not DirectoryExists(APath) then Exit;
-  Base := IncludeTrailingPathDelimiter(APath);
-  if FindFirst(Base + '*', faAnyFile, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) <> 0 then
-          RecursiveDelete(Base + SR.Name)
-        else
-          DeleteFile(Base + SR.Name);
-      until FindNext(SR) <> 0;
-    finally
-      FindClose(SR);
-    end;
-  RemoveDir(APath);
-end;
 
 function ReadFileText(const APath: string): string;
 var SL: TStringList;

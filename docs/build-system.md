@@ -54,7 +54,7 @@ The full mode-flag sets are in `LWPT.Command.Build.AddBuildModeFlags`:
 | `dev` (default) | `-O- -gw -godwarfsets -gl -Ct -Cr -Sa` |
 | `release` (`--mode release`) | `-O4 -dPRODUCTION -Xs -CX -XX -B` |
 
-`--clean` does one recursive sweep of `build/` before any target compiles, deleting FPC intermediate artefacts by extension (`.ppu`, `.o`, `.or`, `.res`, `.reslst`) — binaries and anything else under `build/` survive. Per target it additionally deletes the prior binary and the legacy `.o` / `.ppu` next to the source. Combined with dev mode it also adds `-B` to force a full rebuild (release mode includes `-B` already).
+`--clean` does one recursive sweep of `build/` before any target compiles, deleting FPC intermediate artefacts by extension (`.ppu`, `.o`, `.or`, `.res`, `.reslst`) — binaries and anything else under `build/` survive. Symlinks are never followed (a symlinked dir is treated as a leaf, so the sweep cannot escape `build/`), and artefacts that cannot be removed (e.g. locked files on Windows) are reported on stderr rather than silently skipped. Per target it additionally deletes the prior binary and the legacy `.o` / `.ppu` next to the source. Combined with dev mode it also adds `-B` to force a full rebuild (release mode includes `-B` already).
 
 When a build fails with output matching a stale-artefact signature (internal compiler exception, resource-compile errors, missing `.reslst`), `lwpt build` prints a hint to retry with `--clean`. The signature heuristic lives in `LWPT.Command.Build.HasStaleArtefactSignature`.
 

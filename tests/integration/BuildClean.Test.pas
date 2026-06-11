@@ -10,6 +10,8 @@
     build --clean   leaves non-artefact files under build/ alone
     build --clean   with no build/ dir at all succeeds (nothing to
                     clean is not an error)
+    build --clean   treats symlinks as leaves — the sweep must never
+                    delete artefacts outside build/ through a link
 
   Goes through the real binary via Tests.LwptSubprocess so the flag
   parsing AND the sweep ordering inside CmdBuild are both covered.
@@ -22,11 +24,15 @@ program BuildClean.Test;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
   Classes,
   SysUtils,
 
   TestingPascalLibrary,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 type
   TBuildClean = class(TTestSuite)
@@ -41,42 +47,8 @@ type
     procedure TestCleanSweepsArtefactsEverywhereUnderBuild;
     procedure TestCleanKeepsNonArtefactFiles;
     procedure TestCleanWithoutBuildDirSucceeds;
+    procedure TestCleanDoesNotFollowSymlinkedDirs;
   end;
-
-procedure WriteTextFile(const APath, AContent: string);
-var SL: TStringList;
-begin
-  ForceDirectories(ExtractFileDir(APath));
-  SL := TStringList.Create;
-  try
-    SL.Text := AContent;
-    SL.SaveToFile(APath);
-  finally
-    SL.Free;
-  end;
-end;
-
-procedure RecursiveDelete(const APath: string);
-var
-  SR: TSearchRec;
-  Base: string;
-begin
-  if not DirectoryExists(APath) then Exit;
-  Base := IncludeTrailingPathDelimiter(APath);
-  if FindFirst(Base + '*', faAnyFile, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) <> 0 then
-          RecursiveDelete(Base + SR.Name)
-        else
-          DeleteFile(Base + SR.Name);
-      until FindNext(SR) <> 0;
-    finally
-      FindClose(SR);
-    end;
-  RemoveDir(APath);
-end;
 
 procedure TBuildClean.BeforeAll;
 const
@@ -157,6 +129,34 @@ begin
   Expect<Boolean>(Pos('clean: no FPC artefacts', R.Stdout) > 0).ToBe(True);
 end;
 
+{ The sweep must treat a symlink as a leaf: following one would delete
+  artefacts OUTSIDE build/ (or loop forever on a cyclic link). Unix
+  only — Windows symlink creation needs privileges and the sweep's
+  link handling is byte-identical across platforms. }
+procedure TBuildClean.TestCleanDoesNotFollowSymlinkedDirs;
+{$IFDEF UNIX}
+var R: TLwptResult;
+begin
+  WipeOutputs;
+  RecursiveDelete(FScratch + '/outside');
+  WriteTextFile(FScratch + '/outside/Precious.ppu', '');
+  ForceDirectories(FScratch + '/build');
+  Expect<Boolean>(fpSymlink(
+    PAnsiChar(FScratch + '/outside'),
+    PAnsiChar(FScratch + '/build/escape')) = 0).ToBe(True);
+  R := RunLwpt(['build', '--clean'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  { the artefact behind the link survives — the sweep stayed inside
+    build/ }
+  Expect<Boolean>(FileExists(FScratch + '/outside/Precious.ppu'))
+    .ToBe(True);
+end;
+{$ELSE}
+begin
+  { no-op on Windows; see comment above }
+end;
+{$ENDIF}
+
 procedure TBuildClean.SetupTests;
 begin
   Test('build --clean sweeps artefacts across the whole build/ tree',
@@ -165,6 +165,8 @@ begin
     TestCleanKeepsNonArtefactFiles);
   Test('build --clean with no build/ dir still succeeds',
     TestCleanWithoutBuildDirSucceeds);
+  Test('build --clean does not follow symlinked dirs out of build/',
+    TestCleanDoesNotFollowSymlinkedDirs);
 end;
 
 begin
