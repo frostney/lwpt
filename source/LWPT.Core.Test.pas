@@ -191,6 +191,17 @@ type
     procedure TestNoMatchOnDifferentFile;
   end;
 
+  { SanitisePathSegment — the shared flattener behind per-target
+    artefact dirs (TargetBuildRoot) and per-test build dirs
+    (TestBuildDir). }
+  TSanitisePathSegmentSuite = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestPlainNameUnchanged;
+    procedure TestSeparatorsFlattened;
+    procedure TestDistinctInputsCanCollide;
+  end;
+
   { [sources] custom-prefix declaration with placeholder URL
     templates + LoadManifest validation + dep parsing against
     custom-source context + URL rendering. Per ADR-0009: each entry
@@ -1786,6 +1797,39 @@ begin
     TestLockfilePermissiveOnUnknownPrefix);
 end;
 
+{ ── TSanitisePathSegmentSuite ─────────────────────────────────────── }
+
+procedure TSanitisePathSegmentSuite.TestPlainNameUnchanged;
+begin
+  Expect<string>(SanitisePathSegment('alpha')).ToBe('alpha');
+  Expect<string>(SanitisePathSegment('my-tool_2')).ToBe('my-tool_2');
+end;
+
+procedure TSanitisePathSegmentSuite.TestSeparatorsFlattened;
+begin
+  Expect<string>(SanitisePathSegment('a/b')).ToBe('a_b');
+  Expect<string>(SanitisePathSegment('a\b')).ToBe('a_b');
+  Expect<string>(SanitisePathSegment('C:tool')).ToBe('C_tool');
+  Expect<string>(SanitisePathSegment('a/b\c:d')).ToBe('a_b_c_d');
+end;
+
+procedure TSanitisePathSegmentSuite.TestDistinctInputsCanCollide;
+begin
+  { Documented contract: callers keying dirs off the result must
+    detect collisions themselves (CmdBuild does). }
+  Expect<string>(SanitisePathSegment('a:b'))
+    .ToBe(SanitisePathSegment('a_b'));
+end;
+
+procedure TSanitisePathSegmentSuite.SetupTests;
+begin
+  Test('plain names pass through unchanged', TestPlainNameUnchanged);
+  Test('separators and colons flatten to underscores',
+    TestSeparatorsFlattened);
+  Test('distinct inputs can collide (callers must guard)',
+    TestDistinctInputsCanCollide);
+end;
+
 begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
     'LWPT.Core: SHA-256 NIST vectors'));
@@ -1809,6 +1853,8 @@ begin
     'LWPT.Manifest: Custom [sources]'));
   TestRunnerProgram.AddSuite(TPathGlobMatching.Create(
     'LWPT.Core: MatchPathGlob'));
+  TestRunnerProgram.AddSuite(TSanitisePathSegmentSuite.Create(
+    'LWPT.Core: SanitisePathSegment'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
     'LWPT.Core: ApplyIncludeExclude'));
   TestRunnerProgram.Run;

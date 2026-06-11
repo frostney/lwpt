@@ -53,6 +53,7 @@ function  FPCExecutable: string;
 function  InstantFPCExecutable: string;
 procedure AddEnvUnitPathParameters(AParameters: TStrings);
 function  NativePath(const APath: string): string;
+function  SanitisePathSegment(const AValue: string): string;
 
 function  TomlGet(ANode: TTOMLNode; const AKey: string): TTOMLNode;
 function  TomlIsString(ANode: TTOMLNode): Boolean;
@@ -145,6 +146,17 @@ begin
   {$IFDEF MSWINDOWS}
   Result := StringReplace(Result, '/', DirectorySeparator, [rfReplaceAll]);
   {$ENDIF}
+end;
+
+{ Flatten an arbitrary string into a single path segment: separators
+  and drive colons become '_'. Distinct inputs can collide ("a:b" and
+  "a_b" both yield "a_b") — callers that key directories off the
+  result must detect collisions themselves. }
+function SanitisePathSegment(const AValue: string): string;
+begin
+  Result := StringReplace(AValue, ':', '_', [rfReplaceAll]);
+  Result := StringReplace(Result, '/', '_', [rfReplaceAll]);
+  Result := StringReplace(Result, '\', '_', [rfReplaceAll]);
 end;
 
 { ===========================================================================

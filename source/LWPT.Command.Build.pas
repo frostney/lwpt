@@ -64,12 +64,29 @@ begin
   WriteLn('  generated ', AMan.VersionIncOut);
 end;
 
+{ Root of one target's private artefact dir: build/targets/<name>.
+  Target names are TOML keys, not validated path segments — sanitise
+  separators defensively. Names that would resolve outside
+  build/targets/ ("", ".", "..") are rejected at manifest load by
+  ValidateTargetName; the raise here is the backstop for any future
+  caller that bypasses the manifest. Sanitisation can collide two
+  distinct names — CmdBuild rejects such manifests up front. }
+function TargetBuildRoot(const ATargetName: string): string;
+var Safe: string;
+begin
+  Safe := SanitisePathSegment(ATargetName);
+  if (Safe = '') or (Safe = '.') or (Safe = '..') then
+    raise ELWPTError.CreateFmt(
+      'unsafe build target name "%s"', [ATargetName]);
+  Result := 'build/targets/' + Safe;
+end;
+
 { Compile one build target. Returns True on success. }
 function BuildOneTarget(const AMan: TManifest; const T: TBuildTarget;
   ARelease, AClean: Boolean): Boolean;
 var
   P : TProcess;
-  Arch, OutBin : string;
+  Arch, OutBin, TargetRoot, UnitOutDir : string;
   i : Integer;
 begin
   if T.Source = '' then
@@ -88,16 +105,42 @@ begin
     ForceDirectories(ExtractFileDir(OutBin));
   ForceDirectories('build');
 
-  { clean build: remove the stale binary and FPC artefacts from both the
-    old source-adjacent location and the canonical build output dir. }
+  { Per-target, per-mode unit-output dir. Units compiled for one target
+    (or one mode of it) must never be reused by another: per-target
+    prebuild hooks can regenerate shared sources between targets, and
+    FPC does not re-check conditional defines when reusing a .ppu. }
+  TargetRoot := TargetBuildRoot(T.Name);
+  if ARelease then
+    UnitOutDir := TargetRoot + '/release'
+  else
+    UnitOutDir := TargetRoot + '/dev';
+
+  { clean build: remove the stale binary, the target's whole artefact
+    dir (both modes), and source-adjacent FPC artefacts. The latter
+    are load-bearing, not cosmetic: source dirs sit on -Fu, so a stale
+    .ppu there (from a raw `fpc @lwpt.cfg` run) poisons rebuilds.
+    Artefacts in the build/ root (pre-isolation layout, bootstrap) are
+    NOT swept — build/ is on no search path, so they are inert.
+    A wipe failure (locked file, permissions) fails THIS target only:
+    the per-target loop in CmdBuild must keep going so postbuild hooks
+    fire and the remaining targets still build (ADR-0011). }
   if AClean then
   begin
     if FileExists(OutBin) then DeleteFile(OutBin);
+    try
+      WipeDir(TargetRoot);
+    except
+      on E: Exception do
+      begin
+        WriteLn(ErrOutput, '  target "', T.Name, '" clean failed: ',
+          E.Message);
+        Exit(False);
+      end;
+    end;
     DeleteFile(ChangeFileExt(T.Source, '.o'));
     DeleteFile(ChangeFileExt(T.Source, '.ppu'));
-    DeleteFile('build/' + ExtractFileName(ChangeFileExt(T.Source, '.o')));
-    DeleteFile('build/' + ExtractFileName(ChangeFileExt(T.Source, '.ppu')));
   end;
+  ForceDirectories(UnitOutDir);
 
   Write('  building ', T.Name, ' (', T.Source, ') ... ');
 
@@ -109,7 +152,11 @@ begin
     if Arch <> '' then P.Parameters.Add('-P' + Arch);
 
     P.Parameters.Add('-Sh');
+    { -FE is the exe fallback for outputs without a dir component;
+      -FU overrides it for units only, isolating .ppu/.o per
+      target + mode while -o keeps the binary at the manifest path. }
     P.Parameters.Add('-FEbuild');
+    P.Parameters.Add('-FU' + UnitOutDir);
     { resolved dependency search paths: the manifest-resolved cfg path,
       if install has run (zero-install repos commit it, so this should
       almost always be present). }
@@ -145,6 +192,64 @@ begin
   end;
 end;
 
+{ Two distinct target names that sanitise to the same artefact dir
+  would silently share unit output — exactly the poisoning the
+  per-target split exists to prevent. Rejected up front in CmdBuild.
+  SameText: artefact dirs land on case-insensitive filesystems on
+  Windows and macOS. }
+function FindArtefactDirCollision(const ATargets: array of TBuildTarget;
+  out AFirst, ASecond: string): Boolean;
+var i, j: Integer;
+begin
+  for i := 0 to High(ATargets) do
+    for j := i + 1 to High(ATargets) do
+      if SameText(TargetBuildRoot(ATargets[i].Name),
+                  TargetBuildRoot(ATargets[j].Name)) then
+      begin
+        AFirst  := ATargets[i].Name;
+        ASecond := ATargets[j].Name;
+        Exit(True);
+      end;
+  Result := False;
+end;
+
+{ Remove build/targets/ subdirs no current target owns — leftovers
+  from renamed or deleted [build] entries. Best-effort: an
+  undeletable orphan warns and stays; it is inert either way. }
+procedure PruneOrphanTargetDirs(const ATargets: array of TBuildTarget);
+var
+  SR    : TSearchRec;
+  i     : Integer;
+  Full  : string;
+  Owned : Boolean;
+begin
+  if FindFirst('build/targets/*', faDirectory, SR) <> 0 then Exit;
+  try
+    repeat
+      if (SR.Name = '.') or (SR.Name = '..') then Continue;
+      if (SR.Attr and faDirectory) = 0 then Continue;
+      Full := 'build/targets/' + SR.Name;
+      Owned := False;
+      for i := 0 to High(ATargets) do
+        if SameText(TargetBuildRoot(ATargets[i].Name), Full) then
+        begin
+          Owned := True;
+          Break;
+        end;
+      if Owned then Continue;
+      try
+        WipeDir(Full);
+        WriteLn('  pruned ', Full, ' (no matching target)');
+      except
+        on E: Exception do
+          WriteLn(ErrOutput, '  could not prune ', Full, ': ', E.Message);
+      end;
+    until FindNext(SR) <> 0;
+  finally
+    FindClose(SR);
+  end;
+end;
+
 { Does any entry of ANames match AName (case-insensitive)? }
 function NameListed(const AName: string;
   const ANames: array of string): Boolean;
@@ -161,7 +266,7 @@ var
   Man : TManifest;
   i, j, Built, Failed, Unknown : Integer;
   Matched : Boolean;
-  ModeStr : string;
+  ModeStr, CollA, CollB : string;
 begin
   Man := LoadManifest(AManifestPath);
 
@@ -192,9 +297,22 @@ begin
   end;
   if Unknown > 0 then Exit(1);
 
+  if FindArtefactDirCollision(Man.Targets, CollA, CollB) then
+  begin
+    WriteLn(ErrOutput, 'targets "', CollA, '" and "', CollB,
+      '" map to the same artefact dir ', TargetBuildRoot(CollA),
+      ' — rename one');
+    Exit(1);
+  end;
+
   if ARelease then ModeStr := 'release' else ModeStr := 'dev';
   if AClean then ModeStr := ModeStr + ', clean';
   WriteLn('build mode: ', ModeStr);
+
+  { Renamed/deleted targets leave artefact dirs behind; a clean run
+    is the natural moment to reclaim them. }
+  if AClean then
+    PruneOrphanTargetDirs(Man.Targets);
 
   { Whole-build prebuild hooks (ADR-0011). Fires once before the
     target loop. Replaces the old RunGenerators call — staleness-

@@ -27,13 +27,8 @@ uses
   LWPT.Core;
 
 function TestBuildDir(const ASrcFile: string): string;
-var Sanitised: string;
 begin
-  Sanitised := ChangeFileExt(ASrcFile, '');
-  Sanitised := StringReplace(Sanitised, ':', '_', [rfReplaceAll]);
-  Sanitised := StringReplace(Sanitised, '/', '_', [rfReplaceAll]);
-  Sanitised := StringReplace(Sanitised, '\', '_', [rfReplaceAll]);
-  Result := 'build/tests/' + Sanitised;
+  Result := 'build/tests/' + SanitisePathSegment(ChangeFileExt(ASrcFile, ''));
 end;
 
 function CompilePascal(const ASrcFile: string; const AUnitPaths: array of string;
