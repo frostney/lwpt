@@ -60,6 +60,12 @@ jobs:
       - name: lwpt --help (binary loads?)
         run: ./build/lwpt --help
 
+      # Frozen check runs BEFORE the plain install: plain install
+      # rewrites lwpt.lock on the runner, so it can never detect a
+      # committed lockfile that drifted from the committed trees.
+      - name: lwpt install --frozen (committed lockfile matches committed trees?)
+        run: ./build/lwpt install --frozen
+
       - name: lwpt install (workspace auto-discovery + symlinks)
         run: ./build/lwpt install
 
