@@ -1092,6 +1092,21 @@ begin
   end;
 end;
 
+{ [build] target names become path segments under build/targets/.
+  Quoted TOML keys can be any string, so reject the names that would
+  resolve elsewhere: "" and "." map onto build/targets/ itself, ".."
+  escapes it entirely (build/targets/.. == build/). Root manifests
+  only: a dependency's [build] targets are never built by the
+  consumer (parse-and-drop posture, ADR-0011), so a broken or hostile
+  dep manifest must not block `lwpt install`. }
+procedure ValidateTargetName(const AName: string);
+begin
+  if (AName = '') or (AName = '.') or (AName = '..') then
+    raise EManifestError.CreateFmt(
+      'invalid [build] target name "%s" — a target name must not be '
+      + 'empty, ".", or ".."', [AName]);
+end;
+
 function LoadManifest(const APath: string; AIsRoot: Boolean): TManifest;
 const
   { Recognised top-level sections — anything else either becomes a
@@ -1378,6 +1393,7 @@ begin
           name; output defaults to "build/<name>" when absent. }
         T := Default(TBuildTarget);
         T.Name   := Result.Name;
+        if AIsRoot then ValidateTargetName(T.Name);
         T.Source := TomlStr(TgtsNode, 'source', '');
         T.Output := TomlStr(TgtsNode, 'output', '');
         if T.Output = '' then T.Output := 'build/' + Result.Name;
@@ -1394,6 +1410,7 @@ begin
           TgtNode := Pair.Value;
           T := Default(TBuildTarget);
           T.Name := Pair.Key;
+          if AIsRoot then ValidateTargetName(T.Name);
           if TomlIsString(TgtNode) then
             T.Source := TgtNode.ScalarText  { item-name = "path.pas" }
           else if TomlIsTable(TgtNode) then
