@@ -157,6 +157,34 @@ begin
   end;
 end;
 
+{ Name part of a NAME=value environment entry. Windows env blocks can
+  contain entries starting with '=' (drive-letter cwd entries); those
+  yield an empty name and never match an override. }
+function EnvEntryName(const AEntry: string): string;
+var EqPos: Integer;
+begin
+  EqPos := Pos('=', AEntry);
+  if EqPos = 0 then
+    Result := AEntry
+  else
+    Result := Copy(AEntry, 1, EqPos - 1);
+end;
+
+function EnvEntryOverridden(const AEntry: string;
+  const AOverrides: array of string): Boolean;
+var i: Integer;
+begin
+  for i := 0 to High(AOverrides) do
+    {$IFDEF MSWINDOWS}
+    { Windows environment variable names are case-insensitive. }
+    if SameText(EnvEntryName(AEntry), EnvEntryName(AOverrides[i])) then
+    {$ELSE}
+    if EnvEntryName(AEntry) = EnvEntryName(AOverrides[i]) then
+    {$ENDIF}
+      Exit(True);
+  Result := False;
+end;
+
 function RunLwpt(const AArgs: array of string;
   const AInDir: string): TLwptResult;
 var Empty: array of string;
@@ -186,12 +214,18 @@ begin
 
     { Environment: TProcess inherits the parent env when P.Environment
       is empty. To add extras, we have to copy the parent env first
-      and then add ours. SysUtils.GetEnvironmentString(i) lets us walk
-      the parent's env. }
+      and then add ours — SKIPPING any parent entry an override
+      redefines. Duplicate names in the child's env block resolve to
+      the FIRST occurrence on every platform, so appending alone lets
+      the parent's value silently win: the CI Windows runners export
+      LWPT_FPC for the whole job, which made the missing-compiler
+      test's LWPT_FPC override a no-op there (real fpc found, build
+      succeeded, test red on Windows only). }
     if Length(AExtraEnv) > 0 then
     begin
       for i := 1 to GetEnvironmentVariableCount do
-        P.Environment.Add(GetEnvironmentString(i));
+        if not EnvEntryOverridden(GetEnvironmentString(i), AExtraEnv) then
+          P.Environment.Add(GetEnvironmentString(i));
       for i := 0 to High(AExtraEnv) do
         P.Environment.Add(AExtraEnv[i]);
     end;
