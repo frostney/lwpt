@@ -10,6 +10,10 @@ interface
 function CmdBuild(const AManifestPath: string;
   const ATargetNames: array of string; ARelease, AClean: Boolean): Integer;
 
+{ Exposed for unit tests: does this FPC failure output look like stale
+  build artefacts (worth a --clean retry) rather than a source error? }
+function HasStaleArtefactSignature(const AOutput: string): Boolean;
+
 implementation
 
 uses
@@ -36,6 +40,62 @@ begin
     AArgs.Add('-O-');  AArgs.Add('-gw'); AArgs.Add('-godwarfsets');
     AArgs.Add('-gl');  AArgs.Add('-Ct'); AArgs.Add('-Cr'); AArgs.Add('-Sa');
   end;
+end;
+
+{ --clean sweep: recursively remove FPC intermediate artefacts from the
+  build output dir. Extension-based (.ppu/.o/.or/.res/.reslst) so target
+  binaries and anything a postbuild hook placed under build/ survive.
+  A stale dependency .ppu left by an older FPC run poisons every target
+  that uses the unit — the per-target deletes only ever covered the
+  target's own source, which is why this sweeps the whole tree once. }
+function SweepBuildArtefacts(const ADir: string): Integer;
+const
+  ARTEFACT_EXTS: array[0..4] of string
+    = ('.ppu', '.o', '.or', '.res', '.reslst');
+var
+  SR: TSearchRec;
+  Base, Ext: string;
+  i: Integer;
+begin
+  Result := 0;
+  if not DirectoryExists(ADir) then Exit;
+  Base := IncludeTrailingPathDelimiter(ADir);
+  if SysUtils.FindFirst(Base + '*', faAnyFile, SR) = 0 then
+    try
+      repeat
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        if (SR.Attr and faDirectory) <> 0 then
+          Inc(Result, SweepBuildArtefacts(Base + SR.Name))
+        else
+        begin
+          Ext := LowerCase(ExtractFileExt(SR.Name));
+          for i := 0 to High(ARTEFACT_EXTS) do
+            if Ext = ARTEFACT_EXTS[i] then
+            begin
+              if SysUtils.DeleteFile(Base + SR.Name) then Inc(Result);
+              Break;
+            end;
+        end;
+      until FindNext(SR) <> 0;
+    finally
+      SysUtils.FindClose(SR);
+    end;
+end;
+
+{ FPC failure output that points at stale build artefacts rather than a
+  source error — the cases where a --clean retry actually helps. }
+function HasStaleArtefactSignature(const AOutput: string): Boolean;
+var
+  Lower: string;
+begin
+  Lower := LowerCase(AOutput);
+  Result :=
+    (Pos('compilation raised exception internally', Lower) > 0) or
+    (Pos('error while compiling resources', Lower) > 0) or
+    ((Pos('.reslst', Lower) > 0) and
+     ((Pos('cannot open', Lower) > 0) or
+      (Pos('not found', Lower) > 0) or
+      (Pos('no such file', Lower) > 0)));
 end;
 
 { Optional version-baking: write a generated .inc with the manifest version.
@@ -68,9 +128,11 @@ end;
 function BuildOneTarget(const AMan: TManifest; const T: TBuildTarget;
   ARelease, AClean: Boolean): Boolean;
 var
-  P : TProcess;
-  Arch, OutBin : string;
-  i : Integer;
+  Args : TStringList;
+  FpcArgs : TStringArray;
+  Arch, OutBin, OutText : string;
+  i, FpcExit : Integer;
+  RanOk : Boolean;
 begin
   if T.Source = '' then
   begin
@@ -88,60 +150,78 @@ begin
     ForceDirectories(ExtractFileDir(OutBin));
   ForceDirectories('build');
 
-  { clean build: remove the stale binary and FPC artefacts from both the
-    old source-adjacent location and the canonical build output dir. }
+  { clean build: remove the stale binary plus the legacy source-adjacent
+    artefacts (pre--FEbuild FPC defaults). build/ itself was already
+    swept once by CmdBuild before the target loop. }
   if AClean then
   begin
     if FileExists(OutBin) then DeleteFile(OutBin);
     DeleteFile(ChangeFileExt(T.Source, '.o'));
     DeleteFile(ChangeFileExt(T.Source, '.ppu'));
-    DeleteFile('build/' + ExtractFileName(ChangeFileExt(T.Source, '.o')));
-    DeleteFile('build/' + ExtractFileName(ChangeFileExt(T.Source, '.ppu')));
   end;
 
   Write('  building ', T.Name, ' (', T.Source, ') ... ');
 
-  P := TProcess.Create(nil);
+  Args := TStringList.Create;
   try
-    P.Executable := FPCExecutable;
     { cross-compile target CPU via env var, same hook as build.pas }
     Arch := GetEnvironmentVariable('FPC_TARGET_CPU');
-    if Arch <> '' then P.Parameters.Add('-P' + Arch);
+    if Arch <> '' then Args.Add('-P' + Arch);
 
-    P.Parameters.Add('-Sh');
-    P.Parameters.Add('-FEbuild');
+    Args.Add('-Sh');
+    Args.Add('-FEbuild');
     { resolved dependency search paths: the manifest-resolved cfg path,
       if install has run (zero-install repos commit it, so this should
       almost always be present). }
     if FileExists(ResolveCfgFile(AMan)) then
-      P.Parameters.Add('@' + ResolveCfgFile(AMan));
-    AddEnvUnitPathParameters(P.Parameters);
+      Args.Add('@' + ResolveCfgFile(AMan));
+    AddEnvUnitPathParameters(Args);
     { manifest's own unit dirs — both as unit (-Fu) and include
       (-Fi) search paths. .inc files conventionally live next to
       .pas units, so the same dir serves both. }
     for i := 0 to High(AMan.Units) do
       if AMan.Units[i] <> '' then
       begin
-        P.Parameters.Add('-Fu' + AMan.Units[i]);
-        P.Parameters.Add('-Fi' + AMan.Units[i]);
+        Args.Add('-Fu' + AMan.Units[i]);
+        Args.Add('-Fi' + AMan.Units[i]);
       end;
-    AddBuildModeFlags(P.Parameters, ARelease);
+    AddBuildModeFlags(Args, ARelease);
     { -B forces a full rebuild, ignoring up-to-date units. Release mode
       already adds -B; only add it here for a clean dev build. }
     if AClean and (not ARelease) then
-      P.Parameters.Add('-B');
-    P.Parameters.Add('-o' + OutBin);
-    P.Parameters.Add(T.Source);
+      Args.Add('-B');
+    Args.Add('-o' + OutBin);
+    Args.Add(T.Source);
 
-    P.Options := [poWaitOnExit];
-    P.Execute;
-    Result := P.ExitStatus = 0;
-    if Result then
-      WriteLn('ok -> ', OutBin)
-    else
-      WriteLn('FAILED (fpc exit ', P.ExitStatus, ')');
+    SetLength(FpcArgs, Args.Count);
+    for i := 0 to Args.Count - 1 do
+      FpcArgs[i] := Args[i];
   finally
-    P.Free;
+    Args.Free;
+  end;
+
+  { Captured rather than inherited stdio so a failure's output can be
+    inspected for the stale-artefact signature below. }
+  FpcExit := -1;
+  RanOk := RunCommandInDir('', FPCExecutable, FpcArgs, OutText, FpcExit,
+    [poStderrToOutPut]) = 0;
+  Result := RanOk and (FpcExit = 0);
+
+  if Result then
+    WriteLn('ok -> ', OutBin)
+  else if RanOk then
+    WriteLn('FAILED (fpc exit ', FpcExit, ')')
+  else
+    WriteLn('FAILED (could not run ', FPCExecutable, ')');
+
+  OutText := TrimRight(OutText);
+  if OutText <> '' then WriteLn(OutText);
+
+  if (not Result) and (not AClean)
+     and HasStaleArtefactSignature(OutText) then
+  begin
+    WriteLn('  hint: stale FPC build artefacts can cause this error.');
+    WriteLn('  retry with: ', PROGRAM_NAME, ' build ', T.Name, ' --clean');
   end;
 end;
 
@@ -159,7 +239,7 @@ function CmdBuild(const AManifestPath: string;
   const ATargetNames: array of string; ARelease, AClean: Boolean): Integer;
 var
   Man : TManifest;
-  i, j, Built, Failed, Unknown : Integer;
+  i, j, Built, Failed, Unknown, Swept : Integer;
   Matched : Boolean;
   ModeStr : string;
 begin
@@ -195,6 +275,18 @@ begin
   if ARelease then ModeStr := 'release' else ModeStr := 'dev';
   if AClean then ModeStr := ModeStr + ', clean';
   WriteLn('build mode: ', ModeStr);
+
+  { --clean: one whole-tree sweep before anything compiles. Runs ahead
+    of the prebuild hooks so a hook output written this run is never
+    swept away. }
+  if AClean then
+  begin
+    Swept := SweepBuildArtefacts('build');
+    if Swept = 0 then
+      WriteLn('  clean: no FPC artefacts under build/')
+    else
+      WriteLn('  clean: removed ', Swept, ' FPC artefact file(s) from build/');
+  end;
 
   { Whole-build prebuild hooks (ADR-0011). Fires once before the
     target loop. Replaces the old RunGenerators call — staleness-

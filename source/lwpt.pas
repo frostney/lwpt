@@ -285,7 +285,7 @@ begin
     BuildOpts[0] := TStringOption.Create('mode',
       'Build mode: dev (default) or release');
     BuildOpts[1] := TFlagOption.Create('clean',
-      'Remove prior build artefacts and force a full rebuild');
+      'Sweep FPC artefacts from build/ and force a full rebuild');
     Registry.Add(TSubcommand.Create('build',
       'Compile manifest targets', '[target...] [--mode dev|release] [--clean]',
       @HandleBuild, BuildOpts));
