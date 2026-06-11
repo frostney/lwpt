@@ -47,7 +47,9 @@ type
     procedure TestCleanSweepsArtefactsEverywhereUnderBuild;
     procedure TestCleanKeepsNonArtefactFiles;
     procedure TestCleanWithoutBuildDirSucceeds;
+    {$IFDEF UNIX}
     procedure TestCleanDoesNotFollowSymlinkedDirs;
+    {$ENDIF}
   end;
 
 procedure TBuildClean.BeforeAll;
@@ -132,9 +134,12 @@ end;
 { The sweep must treat a symlink as a leaf: following one would delete
   artefacts OUTSIDE build/ (or loop forever on a cyclic link). Unix
   only — Windows symlink creation needs privileges and the sweep's
-  link handling is byte-identical across platforms. }
-procedure TBuildClean.TestCleanDoesNotFollowSymlinkedDirs;
+  link handling is byte-identical across platforms. Compiled out
+  rather than an empty body: the test runner counts a test that runs
+  zero assertions as a failure ("Test has no assertions"), which is
+  exactly what reddened the Windows CI legs after this test landed. }
 {$IFDEF UNIX}
+procedure TBuildClean.TestCleanDoesNotFollowSymlinkedDirs;
 var R: TLwptResult;
 begin
   WipeOutputs;
@@ -151,10 +156,6 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/outside/Precious.ppu'))
     .ToBe(True);
 end;
-{$ELSE}
-begin
-  { no-op on Windows; see comment above }
-end;
 {$ENDIF}
 
 procedure TBuildClean.SetupTests;
@@ -165,8 +166,10 @@ begin
     TestCleanKeepsNonArtefactFiles);
   Test('build --clean with no build/ dir still succeeds',
     TestCleanWithoutBuildDirSucceeds);
+  {$IFDEF UNIX}
   Test('build --clean does not follow symlinked dirs out of build/',
     TestCleanDoesNotFollowSymlinkedDirs);
+  {$ENDIF}
 end;
 
 begin

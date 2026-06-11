@@ -3,8 +3,9 @@ name: CI
 # Two stages, mirroring the GocciaScript CI pattern (the upstream of
 # LWPT's vendored units). Sister workflows:
 #
-#   pr.yml      — every PR: full cross-build + per-platform native test
-#                 matrix (the authoritative pre-merge gate)
+#   pr.yml      — every PR: Ubuntu native bootstrap + build + test,
+#                 plus a win64 leg (cross-compile + native offline
+#                 test run; the pre-merge gate)
 #   release.yml — tag-triggered cross-build + package + publish
 #
 # ci.yml runs ONLY on push to main + manual dispatch. PRs do not
@@ -42,9 +43,6 @@ on:
 permissions:
   contents: read
 
-env:
-  FPC_VERSION: "3.2.2"
-
 jobs:
   toolchain:
     uses: ./.github/workflows/toolchain.yml
@@ -52,6 +50,10 @@ jobs:
   build:
     needs: toolchain
     runs-on: macos-latest
+    env:
+      # Sourced from toolchain.yml (the single source of truth) so the
+      # paths probed below always match the restored cache.
+      FPC_VERSION: ${{ needs.toolchain.outputs.fpc-version }}
     strategy:
       fail-fast: false
       matrix:
@@ -76,12 +78,13 @@ jobs:
             cpu: i386
             os: win32
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Restore toolchain cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             fpc-cross
@@ -210,6 +213,9 @@ jobs:
           # Single entry point: source/lwpt.pas. -Fu / -Fi paths mirror
           # scripts/bootstrap.pas (LWPT's own bootstrap), extended with
           # the cross-toolchain RTL + packages.
+          # Mirrored by release.yml's build job AND pr.yml's
+          # windows-cross-compile job (win64 leg) — flag or unit-path
+          # changes here must be copied to both.
           echo ""
           echo "=== Building lwpt for ${TARGET} ==="
           "$CROSS_FPC" -T"${OS}" -O4 -dPRODUCTION -Xs -CX -XX -B \
@@ -251,7 +257,7 @@ jobs:
           ls -la ci-artifacts/
 
       - name: Upload build artefact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lwpt-${{ matrix.target }}
           retention-days: 7
@@ -288,9 +294,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install FPC (brew)
         if: matrix.fpc-install == 'brew'
@@ -305,6 +312,8 @@ jobs:
           sudo apt-get install -y fpc
           fpc -iV
 
+      # Copied verbatim into pr.yml's windows-test job — when this
+      # step changes, change that copy too.
       - name: Install FPC (choco)
         if: matrix.fpc-install == 'choco'
         run: |
@@ -366,7 +375,7 @@ jobs:
           rmdir /s /q build
 
       - name: Download lwpt artefact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: lwpt-${{ matrix.target }}
           path: build/
