@@ -87,6 +87,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Restore toolchain cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -310,9 +311,14 @@ jobs:
       run:
         shell: bash
     steps:
+      # persist-credentials: false — packaging + the gh-release action
+      # authenticate via the job token env, not workspace git config.
+      # The changelog job below is the one checkout that KEEPS
+      # credentials: it pushes the changelog branch.
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve tag + version
         id: ver
