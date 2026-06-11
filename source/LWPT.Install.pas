@@ -1607,23 +1607,41 @@ end;
 { Hash of an installed package: SHA-256 over every extracted file's bytes,
   visited in sorted relative-path order so the digest is stable regardless
   of filesystem enumeration order or which mirror served the archive.
-  This is the value that goes in lwpt.lock's computedHash. }
+  This is the value that goes in lwpt.lock's computedHash.
+
+  Directory symlinks are never descended into: a link cycle would recurse
+  forever, and the linked bytes are hashed where they really live. File
+  symlinks still contribute (their target's bytes are read through the
+  link, as before) — but only when the target resolves: a dangling link
+  was invisible to the old faAnyFile-only enumeration, so it must stay
+  excluded or HashTree fails opening it. faSymLink must be in the
+  FindFirst mask or the attribute is not reported and links look like
+  plain directories (or, dangling, vanish entirely).
+  MUST stay in lockstep with LWPT.Core's CollectFiles — install writes
+  computedHash with this copy, and the two may not disagree. }
 procedure CollectFiles(const ARoot, ARel: string; AList: TStringList);
 var SR: TSearchRec; Path, RelPath: string;
 begin
   Path := IncludeTrailingPathDelimiter(ARoot + ARel);
-  if SysUtils.FindFirst(Path + '*', faAnyFile, SR) = 0 then
-  begin
-    repeat
-      if (SR.Name = '.') or (SR.Name = '..') then Continue;
-      RelPath := ARel + SR.Name;
-      if (SR.Attr and faDirectory) <> 0 then
-        CollectFiles(ARoot, RelPath + PathDelim, AList)
-      else
-        AList.Add(RelPath);
-    until SysUtils.FindNext(SR) <> 0;
-    SysUtils.FindClose(SR);
-  end;
+  if SysUtils.FindFirst(Path + '*', faAnyFile or faSymLink, SR) = 0 then
+    try
+      repeat
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        RelPath := ARel + SR.Name;
+        if (SR.Attr and faSymLink) <> 0 then
+        begin
+          if ((SR.Attr and faDirectory) = 0)
+             and FileExists(Path + SR.Name) then
+            AList.Add(RelPath);
+        end
+        else if (SR.Attr and faDirectory) <> 0 then
+          CollectFiles(ARoot, RelPath + PathDelim, AList)
+        else
+          AList.Add(RelPath);
+      until SysUtils.FindNext(SR) <> 0;
+    finally
+      SysUtils.FindClose(SR);
+    end;
 end;
 
 function HashTree(const APathOrArchive: string): string;
@@ -1821,15 +1839,22 @@ end;
   at the same minimal depth are ambiguous — there is no defensible
   winner, so we return False and the caller falls back to the
   manifest-less behavior (emit the module root, walk no deps).
-  Hidden dirs (leading '.') are not descended into. On success,
-  ARelDir is the manifest's directory relative to AUnitDir with '/'
-  separators ('' when the manifest sits at the module root). }
+  Hidden dirs (leading '.') and directory symlinks are not descended
+  into — skLocal trees can contain links, and walking through one
+  invites cycles plus duplicate (falsely "ambiguous") sightings of the
+  same manifest. Depth is additionally capped at MAX_MANIFEST_SCAN_DEPTH
+  as a backstop for link flavors FindFirst does not report (past the cap
+  the module falls back to manifest-less behavior). On success, ARelDir
+  is the manifest's directory relative to AUnitDir with '/' separators
+  ('' when the manifest sits at the module root). }
 function FindModuleManifest(const AUnitDir: string;
   out ARelDir: string): Boolean;
+const
+  MAX_MANIFEST_SCAN_DEPTH = 16;
 var
   Current, Next, Hits: TStringList;
   SR: TSearchRec;
-  i: Integer;
+  i, Depth: Integer;
   Base, RelPrefix: string;
 begin
   Result := False;
@@ -1841,7 +1866,8 @@ begin
   Hits    := TStringList.Create;
   try
     Current.Add('');
-    while Current.Count > 0 do
+    Depth := 0;
+    while (Current.Count > 0) and (Depth < MAX_MANIFEST_SCAN_DEPTH) do
     begin
       Hits.Clear;
       Next.Clear;
@@ -1853,19 +1879,20 @@ begin
           Base := Base + RelPrefix + '/';
         if FileExists(Base + MANIFEST_FILE) then
           Hits.Add(RelPrefix);
-        if FindFirst(Base + '*', faAnyFile, SR) = 0 then
+        if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
           try
             repeat
-              if (SR.Name = '.') or (SR.Name = '..') then Continue;
+              { leading '.' also covers the '.' and '..' entries }
               if (SR.Name <> '') and (SR.Name[1] = '.') then Continue;
+              if (SR.Attr and faSymLink) <> 0 then Continue;
               if (SR.Attr and faDirectory) = 0 then Continue;
               if RelPrefix = '' then
                 Next.Add(SR.Name)
               else
                 Next.Add(RelPrefix + '/' + SR.Name);
-            until FindNext(SR) <> 0;
+            until SysUtils.FindNext(SR) <> 0;
           finally
-            FindClose(SR);
+            SysUtils.FindClose(SR);
           end;
       end;
       if Hits.Count = 1 then
@@ -1875,6 +1902,7 @@ begin
       end;
       if Hits.Count > 1 then Exit(False);
       Current.Assign(Next);
+      Inc(Depth);
     end;
   finally
     Current.Free;

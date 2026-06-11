@@ -74,6 +74,27 @@ uses
   LWPT.Core;
 ```
 
+### The `Windows` unit shadows SysUtils
+
+In any unit whose uses clause names `Windows` (always under
+`{$IFDEF MSWINDOWS}`, and always in the implementation section — so it
+resolves *after* the interface's `SysUtils`), Win32 declarations shadow
+same-named SysUtils identifiers. The collisions that bite:
+
+- `FindClose` — `Windows.FindClose(THandle)` shadows
+  `SysUtils.FindClose(var TSearchRec)`. An unqualified call compiles fine
+  on macOS/Linux and breaks only the win32/win64 builds — and the PR
+  workflow builds on Linux only, so the break lands on `main` first.
+- `DeleteFile` — `Windows.DeleteFile(PChar)` shadows
+  `SysUtils.DeleteFile(string)`; same Windows-only failure mode.
+
+**Rule:** in a `Windows`-using unit, qualify the whole
+`SysUtils.FindFirst` / `SysUtils.FindNext` / `SysUtils.FindClose` family
+and `SysUtils.DeleteFile`. FindFirst/FindNext have no Win32 collision,
+but the family travels together so the pattern stays greppable and
+consistent. Units without `Windows` in their uses clause are unaffected
+and stay unqualified.
+
 ## Formatter contract
 
 `lwpt format` enforces the rules above plus:
