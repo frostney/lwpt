@@ -197,6 +197,8 @@ type
     procedure TestDanglingFileSymlinkSkipped;
     procedure TestDstInsideSrcRaises;
     procedure TestDstEqualsSrcRaises;
+    procedure TestDstInsideAliasedSrcRaises;
+    procedure TestAliasedSrcToDisjointDstCopies;
     procedure TestPathContainsBoundaries;
   end;
 
@@ -1663,6 +1665,48 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
 end;
 
+procedure TCopyDirTreeGuards.TestDstInsideAliasedSrcRaises;
+var Raised: Boolean;
+begin
+  {$IFDEF UNIX}
+  ResetScratch;
+  { alias -> src: the source reached through a link while the
+    destination names the real tree. Lexically disjoint, physically
+    dst-inside-src — the shape the PathContains check cannot see. }
+  if FpSymlink('src', PAnsiChar(FScratch + '/alias')) <> 0 then
+    raise Exception.Create('fixture: FpSymlink failed for alias link');
+  Raised := False;
+  try
+    CopyDirTree(FScratch + '/alias', Src + '/sub/dst');
+  except
+    on E: EExtractError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  { The guard fired before ForceDirectories polluted the source. }
+  Expect<Boolean>(DirectoryExists(Src + '/sub/dst')).ToBe(False);
+  {$ELSE}
+  Raised := False;
+  if not Raised then Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TCopyDirTreeGuards.TestAliasedSrcToDisjointDstCopies;
+begin
+  {$IFDEF UNIX}
+  ResetScratch;
+  { Copying FROM a symlinked root into a disjoint destination is
+    legal and must keep working — the identity walk only rejects
+    destinations that resolve into the source. }
+  if FpSymlink('src', PAnsiChar(FScratch + '/alias')) <> 0 then
+    raise Exception.Create('fixture: FpSymlink failed for alias link');
+  CopyDirTree(FScratch + '/alias', Dst);
+  Expect<Boolean>(FileExists(Dst + '/a.txt')).ToBe(True);
+  Expect<Boolean>(FileExists(Dst + '/sub/b.txt')).ToBe(True);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TCopyDirTreeGuards.TestPathContainsBoundaries;
 begin
   { The compare CopyDirTree's guard and the extractor's link-cycle
@@ -1687,6 +1731,10 @@ begin
     TestDstInsideSrcRaises);
   Test('destination equal to source raises EExtractError',
     TestDstEqualsSrcRaises);
+  Test('destination inside symlink-aliased source raises (identity walk)',
+    TestDstInsideAliasedSrcRaises);
+  Test('symlink-aliased source root copies to a disjoint destination',
+    TestAliasedSrcToDisjointDstCopies);
   Test('PathContains: equality contained, prefix-sibling not',
     TestPathContainsBoundaries);
 end;
