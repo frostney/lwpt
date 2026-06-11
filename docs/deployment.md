@@ -6,7 +6,7 @@ Platform support tiers, the per-platform TLS backend story, the release process,
 
 - **Six release targets** map to the matrix in [`docs/ci.md`](./ci.md): `aarch64-darwin` + `x86_64-darwin` + `x86_64-linux` + `aarch64-linux` + `x86_64-win64` + `i386-win32`. All six tested natively on every push to `main` (per `ci.yml`); all six published per release tag (per `release.yml`).
 - **TLS backend is platform-native.** SChannel on Windows, SecureTransport on macOS, OpenSSL on Linux. Per [ADR-0016](./adr/0016-tls-backend-per-platform.md). Windows and macOS releases ship the binary alone — no OpenSSL DLLs. Linux relies on the distro's libssl package.
-- **A CI guard** in both `ci.yml` (test job, Windows runners) and `release.yml` (build job, Windows targets) hard-fails if `lwpt.exe` references `libssl` / `libcrypto`, mirroring [GocciaScript's same guard](https://github.com/frostney/GocciaScript/blob/main/.github/workflows/ci.yml).
+- **A CI guard** in `pr.yml` (windows-cross-compile job), `ci.yml` (test job, Windows runners), and `release.yml` (build job, Windows targets) hard-fails if `lwpt.exe` references `libssl` / `libcrypto`, mirroring [GocciaScript's same guard](https://github.com/frostney/GocciaScript/blob/main/.github/workflows/ci.yml).
 - **No codesigning for v1.** macOS users see the "unidentified developer" warning; documented workaround is `xattr -d com.apple.quarantine ./lwpt`. Promote to Apple Developer ID + notarisation only on demonstrated demand.
 - **Release artefacts come from CI.** Tag → `release.yml` → cross-build on macos-latest → package → GitHub Releases. No hand-built releases; ever.
 
@@ -55,12 +55,13 @@ Earlier docs claimed the archive bundled `libssl-3-x64.dll` + `libcrypto-3-x64.d
 
 #### CI guard
 
-To prevent a future regression (someone adds `uses OpenSSL` under a Windows-active codepath; the unit's source registers DLL names as string literals for `LoadLibrary`), both `ci.yml` and `release.yml` include a guard step that fails the build if the cross-built `lwpt.exe` contains `libssl` or `libcrypto` substrings:
+To prevent a future regression (someone adds `uses OpenSSL` under a Windows-active codepath; the unit's source registers DLL names as string literals for `LoadLibrary`), `pr.yml`, `ci.yml`, and `release.yml` each include a guard step that fails the build if the cross-built `lwpt.exe` contains `libssl` or `libcrypto` substrings:
 
+- `pr.yml` windows-cross-compile job: bash `grep -ao libssl\|libcrypto` against the freshly cross-built `lwpt.exe` on the macOS runner. The only pre-merge guard — catches the release-blocker on the PR itself.
 - `ci.yml` test job: PowerShell read-bytes-as-Latin1 scan, gated on `runner.os == 'Windows'`. Mirrors GocciaScript's same guard step.
 - `release.yml` build job: bash `grep -ao libssl\|libcrypto`, gated on Windows targets. Runs on the macOS cross-build runner against the staged binary.
 
-The guards are independent (different shells, different binaries — cross-built artefact vs staged-for-release artefact); both must pass.
+The guards are independent (different shells, different binaries — PR cross-build vs post-merge cross-built artefact vs staged-for-release artefact); all must pass.
 
 ### macOS: SecureTransport (no Homebrew dependency)
 

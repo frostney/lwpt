@@ -2,9 +2,9 @@ name: Release
 
 # Tag-triggered release pipeline. Companion to ci.yml:
 #
-#   ci.yml      — push/PR validation (build + test on every platform)
+#   ci.yml      — push to main: build + test on every platform
 #   release.yml — tag push: cross-build → package → publish GitHub Release
-#   pr.yml      — fast single-runner PR feedback (system FPC)
+#   pr.yml      — fast PR feedback (system FPC + one win64 cross-compile)
 #
 # Triggers on tags matching:
 #   v?[0-9]+.[0-9]+.[0-9]+         e.g.  0.1.0, 1.2.3 (canonical, no v)

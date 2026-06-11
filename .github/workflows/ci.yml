@@ -3,8 +3,9 @@ name: CI
 # Two stages, mirroring the GocciaScript CI pattern (the upstream of
 # LWPT's vendored units). Sister workflows:
 #
-#   pr.yml      — every PR: full cross-build + per-platform native test
-#                 matrix (the authoritative pre-merge gate)
+#   pr.yml      — every PR: Ubuntu native bootstrap + build + test,
+#                 plus one x86_64-win64 cross-compile (Windows
+#                 compile signal; the pre-merge gate)
 #   release.yml — tag-triggered cross-build + package + publish
 #
 # ci.yml runs ONLY on push to main + manual dispatch. PRs do not

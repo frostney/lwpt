@@ -6,13 +6,13 @@ Four GitHub Actions workflows, mirroring the GocciaScript pattern that LWPT's ve
 |----------|---------|---------|
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch` | Build + cache the cross-FPC toolchain |
 | `ci.yml` | `push` to `main`, `workflow_dispatch` | Post-merge confirmation: full 6-target cross-build + native test matrix on the merged main tree |
-| `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: fast single-runner Ubuntu (typical wall-clock < 5 min) |
+| `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: fast Ubuntu runner + one `x86_64-win64` cross-compile (typical wall-clock < 5 min) |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`), `workflow_dispatch` | Cross-build → package → publish GitHub Release |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
-- **PRs go through `pr.yml` only** — a single Ubuntu runner, no cross-build. Cheap signal so PR authors aren't blocked on a 30-minute matrix per push.
-- **`ci.yml` runs only on `push` to `main`** — i.e. after merge. This is where the heavyweight 6-target cross-build + native test matrix lives. A PR that introduces a platform-specific regression (Windows path quirk, aarch64-only behaviour) will pass `pr.yml` and fail the post-merge `ci.yml` run; the maintainer then reverts or forwards-fixes from `main`. The trade-off is conscious: cheap PR feedback over pre-merge cross-platform certainty.
+- **PRs go through `pr.yml` only** — an Ubuntu runner plus a single `x86_64-win64` cross-compile (compile signal only, no Windows tests). Cheap signal so PR authors aren't blocked on a 30-minute matrix per push.
+- **`ci.yml` runs only on `push` to `main`** — i.e. after merge. This is where the heavyweight 6-target cross-build + native test matrix lives. A PR that introduces a platform-specific *runtime* regression (Windows path quirk, aarch64-only behaviour) will pass `pr.yml` and fail the post-merge `ci.yml` run; the maintainer then reverts or forwards-fixes from `main`. The trade-off is conscious: cheap PR feedback over pre-merge cross-platform certainty. Windows-only *compile* errors are the one carve-out — they're caught pre-merge by `pr.yml`'s win64 cross-compile job (added after PR #17 merged green with a `SysUtils.FindClose` vs `Windows.FindClose` shadowing break that PR #21 had to fix on `main`).
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
 ## Workflows
@@ -69,7 +69,7 @@ Per [Q22=b](./adr/0014-packages-extraction.md), the runner side compiles tests a
 
 ### `pr.yml` — pre-merge PR gate
 
-A single Ubuntu runner. Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR sees (because `ci.yml` doesn't trigger on PRs):
+Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR sees (because `ci.yml` doesn't trigger on PRs). The main `build-and-test` job is a single Ubuntu runner:
 
 1. Install FPC via `apt`
 2. `./bootstrap.sh` — cold build of `build/lwpt` from a freshly-cloned repo
@@ -82,9 +82,15 @@ E2E tests are skipped via `LWPT_SKIP_NETWORK=1`; they run on every platform post
 
 The PR workflow deliberately uses the distro FPC (same as the install instructions in `README.md`), so any regression that only shows up with the system FPC's slightly older RTL gets caught before merge.
 
-#### Why not cross-platform on PRs?
+#### Windows compile signal (`windows-cross-compile`)
 
-A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 min cold), per PR push. Multiplied across the typical commit-amend-push-amend-push PR cycle, that's an order of magnitude more CI minutes than a single Ubuntu run. GocciaScript made the same trade-off: cheap iteration on PRs, exhaustive verification on the merged main tree. Platform-specific regressions that slip through pr.yml surface in the post-merge ci.yml run on `main`; the maintainer reverts the offending commit or rolls a forward-fix PR.
+A second job reuses `toolchain.yml` (`workflow_call`, exactly like `ci.yml`) and cross-compiles `source/lwpt.pas` for **`x86_64-win64` only**, mirroring `ci.yml`'s build-stage flags and unit paths. It exists because `{$IFDEF WINDOWS}` codepaths never compile on the Ubuntu runner: PR #17 merged green while breaking `main` with a `SysUtils.FindClose` vs `Windows.FindClose` unit-shadowing error that PR #21 then had to fix. One target suffices — win32 and win64 share the same `{$IFDEF WINDOWS}` sources, and the failure class is compile-time. The job also runs the ADR-0016 no-OpenSSL guard against the produced `lwpt.exe`, surfacing that release-blocker on the PR instead of post-merge. No Windows tests run here; runtime behaviour stays in `ci.yml`'s native test matrix.
+
+Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`) has no branch component, and GitHub Actions lets PR runs restore caches created on the base branch — so PR runs hit the toolchain that `ci.yml` pushes to `main` keep warm, and the `toolchain` job is a seconds-long cache lookup. On eviction, the PR run rebuilds the toolchain (~30 min) into its own cache scope (not shared across PRs); the next `main` push repopulates the shared copy.
+
+#### Why not fully cross-platform on PRs?
+
+A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 min cold), per PR push. Multiplied across the typical commit-amend-push-amend-push PR cycle, that's an order of magnitude more CI minutes than a single Ubuntu run. GocciaScript made the same trade-off: cheap iteration on PRs, exhaustive verification on the merged main tree. Platform-specific *runtime* regressions that slip through pr.yml surface in the post-merge ci.yml run on `main`; the maintainer reverts the offending commit or rolls a forward-fix PR. The win64 cross-compile is the deliberate exception — a single extra compile job (~2 min on warm cache) buys back the most common post-merge breakage class without paying for the full matrix.
 
 ### `release.yml` — tag-triggered release pipeline
 
@@ -143,9 +149,9 @@ The scripts mirror the shape of [GocciaScript's installers](https://gocciascript
 - `ci.yml`: `push` to `main`, `workflow_dispatch`
 - `pr.yml`: `pull_request` to `main`, `workflow_dispatch`
 - `release.yml`: `push` of a `v?N.N.N` or `v?N.N.N-*` tag, `workflow_dispatch`
-- `toolchain.yml`: invoked by `ci.yml` and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming
+- `toolchain.yml`: invoked by `ci.yml`, `pr.yml`, and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming
 
-A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` after merge, OR `release.yml` after tag), not both. PRs trigger only the cheap `pr.yml`.
+A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` after merge, OR `release.yml` after tag), not both. PRs trigger only the cheap `pr.yml` (whose single win64 cross-compile rides the cached toolchain).
 
 ## When to bump `CACHE_VERSION`
 

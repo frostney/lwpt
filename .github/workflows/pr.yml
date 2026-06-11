@@ -1,23 +1,31 @@
 name: PR
 
-# Fast single-runner PR gate (Ubuntu native). Mirrors the
-# GocciaScript pattern: ci.yml runs only on push to main, so
-# pr.yml is the sole pre-merge signal a PR sees.
+# Fast PR gate. Mirrors the GocciaScript pattern: ci.yml runs only
+# on push to main, so pr.yml is the sole pre-merge signal a PR sees.
 #
 #   pr.yml      — every PR: Ubuntu native bootstrap + install +
-#                 format --check + build + test (no e2e, no
-#                 cross-build). Typical wall-clock < 5 min.
+#                 format --check + build + test (no e2e), plus one
+#                 x86_64-win64 cross-compile for Windows compile
+#                 signal. Typical wall-clock < 5 min.
 #   ci.yml      — push to main only: full 6-target cross-build +
 #                 per-platform native test runs (incl. e2e).
 #                 Post-merge confirmation, not a PR gate.
 #   release.yml — tag-triggered cross-build + package + publish.
 #
 # Trade-off, deliberate: a PR that introduces a platform-specific
-# regression (Windows path quirk, aarch64-only behaviour, etc.)
-# will pass pr.yml and only fail on the main-branch ci.yml run.
-# The maintainer reverts/forwards-fixes from main. This trades
+# *runtime* regression (Windows path quirk, aarch64-only behaviour,
+# etc.) will pass pr.yml and only fail on the main-branch ci.yml
+# run. The maintainer reverts/forwards-fixes from main. This trades
 # pre-merge cross-platform certainty for cheap PR feedback, which
 # is the conscious GocciaScript design choice we mirror.
+#
+# One carve-out from that trade-off: Windows-only COMPILE errors.
+# {$IFDEF WINDOWS} codepaths never compile on the Ubuntu runner, so
+# a unit-shadowing mistake (the SysUtils.FindClose vs
+# Windows.FindClose class — introduced by PR #17, fixed by PR #21)
+# used to merge green and break main. The windows-cross-compile job
+# below closes exactly that gap: one win64 cross-compile, no tests,
+# reusing the toolchain cache that main runs keep warm.
 #
 # The Ubuntu native build deliberately uses the distro FPC (same
 # as the install instructions in README.md), so a regression that
@@ -32,6 +40,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  FPC_VERSION: "3.2.2"
 
 jobs:
   build-and-test:
@@ -87,3 +98,129 @@ jobs:
         uses: DavidAnson/markdownlint-cli2-action@v19
         with:
           globs: "**/*.md"
+
+  # Reuses toolchain.yml exactly like ci.yml/release.yml do. The cache
+  # key (lwpt-fpc-cross-<fpc>-macos-arm64-<n>) has no branch or ref
+  # component, and GitHub Actions lets PR runs restore caches created
+  # on the base branch — so PR runs hit the toolchain that ci.yml's
+  # main pushes keep warm and this job is a few-second cache lookup.
+  # Cold cache (eviction) ⇒ the PR run rebuilds it (~30 min, saved to
+  # the PR's own cache scope); the next main push repopulates the
+  # shared copy.
+  toolchain:
+    uses: ./.github/workflows/toolchain.yml
+
+  # Windows compile signal, pre-merge. ci.yml's full cross-build
+  # matrix runs only on push to main, so without this job a
+  # Windows-only compile error inside {$IFDEF WINDOWS} blocks merges
+  # green and breaks main (see the header comment). One target is
+  # enough: win32 and win64 share the same {$IFDEF WINDOWS} sources,
+  # and the failure class is compile-time. No tests run here —
+  # Windows runtime behaviour stays post-merge in ci.yml's native
+  # test matrix.
+  #
+  # The compile step mirrors ci.yml's build stage (x86_64-win64 leg):
+  # same cross-FPC, same flags, same unit paths — minus the
+  # Linux/Darwin branches that don't apply to win64. When ci.yml's
+  # build flags change, change them here too.
+  windows-cross-compile:
+    needs: toolchain
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Restore toolchain cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            fpc-cross
+            cross-binutils
+            cross-libs
+          key: ${{ needs.toolchain.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Cross-compile lwpt for x86_64-win64
+        run: |
+          set -euo pipefail
+          PREFIX="$PWD/fpc-cross"
+          export PATH="$PREFIX/bin:$PATH"
+
+          TARGET="x86_64-win64"
+          CROSS_FPC="$PREFIX/lib/fpc/${FPC_VERSION}/ppcrossx64"
+          if [ ! -f "$CROSS_FPC" ]; then
+            echo "::error::ppcrossx64 missing from the restored toolchain cache"
+            exit 1
+          fi
+
+          # RTL + package paths, same slice as ci.yml's build stage.
+          RTL_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl"
+          RTL_EXTRA_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-extra"
+          OBJPAS_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-objpas"
+          GEN_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-generics"
+          FCL_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/fcl-process"
+          PASZLIB_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/paszlib"
+          HASH_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/hash"
+          FCL_BASE_SRC="$PREFIX/share/fpcsrc/packages/fcl-base/src"
+          FCL_NET_SRC="$PREFIX/share/fpcsrc/packages/fcl-net/src"
+          OPENSSL_SRC="$PREFIX/share/fpcsrc/packages/openssl/src"
+
+          for dir in "$RTL_DIR" "$OBJPAS_DIR" "$GEN_DIR" "$FCL_DIR" "$PASZLIB_DIR" \
+                     "$FCL_BASE_SRC" "$FCL_NET_SRC" "$OPENSSL_SRC"; do
+            if [ ! -d "$dir" ]; then
+              echo "::error::Missing directory for ${TARGET}: ${dir}"
+              exit 1
+            fi
+          done
+          if [ ! -f "$RTL_DIR/winsock2.ppu" ]; then
+            echo "::error::Missing winsock2.ppu in ${RTL_DIR} for ${TARGET}"
+            exit 1
+          fi
+
+          HASH_FLAGS=""
+          if [ -d "$HASH_DIR" ]; then
+            HASH_FLAGS="-Fu${HASH_DIR}"
+          fi
+          RTL_EXTRA_FLAGS=""
+          if [ -d "$RTL_EXTRA_DIR" ]; then
+            RTL_EXTRA_FLAGS="-Fu${RTL_EXTRA_DIR}"
+          fi
+
+          mkdir -p build/compiled
+
+          echo "=== Building lwpt for ${TARGET} ==="
+          # shellcheck disable=SC2086  # RTL_EXTRA_FLAGS / HASH_FLAGS are intentionally word-split
+          "$CROSS_FPC" -Twin64 -O4 -dPRODUCTION -Xs -CX -XX -B \
+            -Sh \
+            -Fusource -Fisource \
+            -Fupackages/httpclient/source -Fipackages/httpclient/source \
+            -Fupackages/cli/source        -Fipackages/cli/source \
+            -Fupackages/semver/source     -Fipackages/semver/source \
+            -Fupackages/toml/source       -Fipackages/toml/source \
+            -Fupackages/testing/source    -Fipackages/testing/source \
+            -Fu"$RTL_DIR" $RTL_EXTRA_FLAGS -Fu"$OBJPAS_DIR" -Fu"$GEN_DIR" -Fu"$FCL_DIR" -Fu"$PASZLIB_DIR" $HASH_FLAGS \
+            -Fu"$FCL_BASE_SRC" -Fu"$FCL_NET_SRC" -Fu"$OPENSSL_SRC" \
+            -FU"build/compiled" -FE"build" \
+            -dFPC_SOFT_FPUX80 \
+            source/lwpt.pas
+
+          if [ ! -f build/lwpt.exe ]; then
+            echo "::error::Cross-compile produced no build/lwpt.exe"
+            exit 1
+          fi
+          ls -la build/
+
+      - name: Check Windows TLS dependencies (SChannel only, no OpenSSL)
+        run: |
+          # Per ADR-0016: Windows uses SChannel for TLS — lwpt.exe must
+          # NOT pull in FPC's openssl unit (which embeds libssl /
+          # libcrypto DLL-name strings for runtime LoadLibrary). ci.yml
+          # and release.yml carry the same guard post-merge / at tag
+          # time; this copy makes the release-blocker visible on the PR.
+          if LC_ALL=C grep -ao 'libssl\|libcrypto' build/lwpt.exe | head -1 | grep -q .; then
+            echo "::error::lwpt.exe references libssl/libcrypto — must use SChannel only on Windows (ADR-0016)"
+            exit 1
+          fi
+          echo "OK: no libssl/libcrypto references in build/lwpt.exe"
