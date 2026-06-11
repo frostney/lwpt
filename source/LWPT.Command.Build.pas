@@ -121,22 +121,12 @@ begin
     .ppu there (from a raw `fpc @lwpt.cfg` run) poisons rebuilds.
     Artefacts in the build/ root (pre-isolation layout, bootstrap) are
     NOT swept — build/ is on no search path, so they are inert.
-    A wipe failure (locked file, permissions) fails THIS target only:
-    the per-target loop in CmdBuild must keep going so postbuild hooks
-    fire and the remaining targets still build (ADR-0011). }
+    A wipe failure (locked file, permissions) raises; the per-target
+    containment in CmdBuild's loop turns it into a failed target. }
   if AClean then
   begin
     if FileExists(OutBin) then DeleteFile(OutBin);
-    try
-      WipeDir(TargetRoot);
-    except
-      on E: Exception do
-      begin
-        WriteLn(ErrOutput, '  target "', T.Name, '" clean failed: ',
-          E.Message);
-        Exit(False);
-      end;
-    end;
+    WipeDir(TargetRoot);
     DeleteFile(ChangeFileExt(T.Source, '.o'));
     DeleteFile(ChangeFileExt(T.Source, '.ppu'));
   end;
@@ -332,10 +322,25 @@ begin
       fpc invocation (e.g. version-stamp, codegen for this target). }
     RunHooks('prebuild:' + Man.Targets[i].Name,
       Man.Targets[i].PreBuild);
-    if BuildOneTarget(Man, Man.Targets[i], ARelease, AClean) then
-      Inc(Built)
-    else
-      Inc(Failed);
+    { Per-target failure containment: any exception out of the
+      compile step — a failed clean wipe, a missing compiler
+      (EProcess) — fails THIS target only, so postbuild hooks still
+      fire and the remaining targets still build (ADR-0011). Hook
+      failures above are deliberately NOT contained: hooks abort the
+      run on first non-zero exit by design. }
+    try
+      if BuildOneTarget(Man, Man.Targets[i], ARelease, AClean) then
+        Inc(Built)
+      else
+        Inc(Failed);
+    except
+      on E: Exception do
+      begin
+        WriteLn(ErrOutput, '  target "', Man.Targets[i].Name,
+          '" failed: ', E.Message);
+        Inc(Failed);
+      end;
+    end;
     { Per-target postbuild fires regardless of compile success;
       we want sign/strip/package even on a stale binary. }
     RunHooks('postbuild:' + Man.Targets[i].Name,

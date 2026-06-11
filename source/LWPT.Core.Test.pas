@@ -50,6 +50,7 @@ type
     procedure TestDepWithHttpSourceRejected;
     procedure TestUnknownSourceKindRejected;
     procedure TestMissingManifestRejected;
+    procedure TestBuildTargetTraversalNameRootOnly;
   end;
 
   TLoadManifestExtensions = class(TTestSuite)
@@ -494,6 +495,31 @@ begin
     Self);
 end;
 
+procedure TLoadManifestValidation.TestBuildTargetTraversalNameRootOnly;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "traversal"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    '".." = { source = "src/x.pas" }'#10;
+var
+  Path : string;
+  Man  : TManifest;
+begin
+  { Root manifest: ".." would make build/targets/.. resolve to build/
+    itself — rejected at load. }
+  Path := WriteManifest('traversal-build-name', INPUT);
+  ExpectManifestLoadError(Path, 'invalid [build] target name', Self);
+
+  { Dependency manifest (AIsRoot=False): its targets are never built
+    by the consumer (parse-and-drop posture, ADR-0011) — a broken or
+    hostile dep manifest must not block `lwpt install`. }
+  Man := LoadManifest(Path, False);
+  Expect<Integer>(Length(Man.Targets)).ToBe(1);
+end;
+
 procedure TLoadManifestValidation.SetupTests;
 begin
   Test('bare-string dep shorthand rejected (ADR-0004 migration)',
@@ -503,6 +529,8 @@ begin
     TestDepWithHttpSourceRejected);
   Test('unknown source kind rejected',      TestUnknownSourceKindRejected);
   Test('missing manifest path rejected',    TestMissingManifestRejected);
+  Test('traversal [build] name rejected for root, tolerated for deps',
+    TestBuildTargetTraversalNameRootOnly);
 end;
 
 { ── TLoadManifestExtensions ───────────────────────────────────────── }

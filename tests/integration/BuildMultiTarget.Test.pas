@@ -51,6 +51,7 @@ type
     procedure TestTraversalTargetNameRejectedAtLoad;
     procedure TestCollidingArtefactDirsRejected;
     procedure TestCleanPrunesOrphanTargetDirs;
+    procedure TestMissingCompilerFailsTargetsButLoopContinues;
     {$IFDEF UNIX}
     procedure TestCleanFailureFailsTargetButBuildContinues;
     {$ENDIF}
@@ -300,6 +301,21 @@ begin
     .ToBe(True);
 end;
 
+procedure TBuildMultiTarget.TestMissingCompilerFailsTargetsButLoopContinues;
+var R: TLwptResult;
+begin
+  { An exception out of the compile step (here: EProcess because the
+    compiler binary doesn't exist) must fail each target individually,
+    not abort the loop — the summary line still prints. }
+  WipeOutputs;
+  R := RunLwpt(['build', 'alpha', 'beta'], FScratch,
+    ['LWPT_FPC=' + FScratch + '/no-such-fpc']);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('target "alpha" failed:', R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('target "beta" failed:', R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('0 built, 2 failed', R.Stdout) > 0).ToBe(True);
+end;
+
 {$IFDEF UNIX}
 procedure TBuildMultiTarget.TestCleanFailureFailsTargetButBuildContinues;
 var
@@ -320,7 +336,7 @@ begin
     FpChmod(Locked, &755);
   end;
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
-  Expect<Boolean>(Pos('clean failed', R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('target "alpha" failed:', R.Stderr) > 0).ToBe(True);
   { beta still built, and the summary line still printed. }
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/beta')))
     .ToBe(True);
@@ -346,6 +362,8 @@ begin
     TestCollidingArtefactDirsRejected);
   Test('--clean prunes orphaned target artefact dirs',
     TestCleanPrunesOrphanTargetDirs);
+  Test('missing compiler fails targets individually, loop continues',
+    TestMissingCompilerFailsTargetsButLoopContinues);
   {$IFDEF UNIX}
   Test('clean failure fails the target, build continues',
     TestCleanFailureFailsTargetButBuildContinues);

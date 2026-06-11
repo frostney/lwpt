@@ -100,7 +100,7 @@ shortform = "src/quicktool.pas"                   # bare-string shorthand
 
 - `source` (required): the program/`.dpr`/`.pas` file FPC compiles.
 - `output` (optional): the binary path; defaults to `ChangeFileExt(source, '')`. On Windows, `.exe` is appended automatically when missing.
-- Target names become path segments under `build/targets/`, so the names `""`, `"."`, and `".."` (expressible as quoted TOML keys) are rejected at manifest load. Path separators and `:` in a name are sanitised to `_` for the artefact dir, and two targets whose names sanitise to the same dir (e.g. `"a:b"` and `a_b`) are rejected before anything builds.
+- Target names become path segments under `build/targets/`, so the names `""`, `"."`, and `".."` (expressible as quoted TOML keys) are rejected at manifest load — for the project's own manifest only; a dependency's `[build]` section is parse-and-dropped and never built, so it is not validated (a broken dep manifest must not block `lwpt install`). Path separators and `:` in a name are sanitised to `_` for the artefact dir, and two targets whose names sanitise to the same dir (e.g. `"a:b"` and `a_b`) are rejected before anything builds.
 
 LWPT's own `lwpt.toml` is the reference: one `lwpt` target.
 
