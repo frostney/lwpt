@@ -12,7 +12,11 @@
   build --clean symlink regression test) cannot make the wipe escape
   the tree or recurse forever. Windows directory symlinks/junctions
   are not handled (DeleteFile cannot remove them) — no test creates
-  them there. }
+  them there.
+
+  A wipe that cannot complete raises, naming the path: a test that
+  silently proceeds on a half-wiped scratch dir turns into stale-state
+  flakiness that is far harder to diagnose than a loud setup error. }
 
 unit Tests.Scratch;
 
@@ -60,13 +64,18 @@ begin
         if ((SR.Attr and faDirectory) <> 0)
            and ((SR.Attr and faSymLink) = 0) then
           RecursiveDelete(Base + SR.Name)
-        else
-          DeleteFile(Base + SR.Name);
+        else if not DeleteFile(Base + SR.Name) then
+          raise Exception.CreateFmt(
+            'RecursiveDelete: failed to delete "%s": %s',
+            [Base + SR.Name, SysErrorMessage(GetLastOSError)]);
       until FindNext(SR) <> 0;
     finally
       FindClose(SR);
     end;
-  RemoveDir(APath);
+  if not RemoveDir(APath) then
+    raise Exception.CreateFmt(
+      'RecursiveDelete: failed to remove directory "%s": %s',
+      [APath, SysErrorMessage(GetLastOSError)]);
 end;
 
 end.
