@@ -25,7 +25,6 @@ uses
   LWPT.Core,
   LWPT.Manifest;
 
-function  ValidPackageName(const S: string): Boolean;
 function  DeriveDependencyName(const ADep: TDependency): string;
 function  HasDirectDep(const AMan: TManifest; const AName: string): Boolean;
 procedure RequireNotWorkspacePackage(const AMan: TManifest; const AName: string);
@@ -38,17 +37,8 @@ implementation
 const
   DEPENDENCIES_SECTION = 'dependencies';
 
-function ValidPackageName(const S: string): Boolean;
-var i: Integer;
-begin
-  Result := False;
-  if S = '' then Exit;
-  for i := 1 to Length(S) do
-    if not ((S[i] in ['a'..'z']) or (S[i] in ['A'..'Z'])
-            or (S[i] in ['0'..'9']) or (S[i] = '-') or (S[i] = '_')) then
-      Exit;
-  Result := True;
-end;
+{ ValidPackageName lives in LWPT.Manifest — the name grammar is the
+  manifest's, shared with init's prompts and install's prune guard. }
 
 { Default dependency name from a parsed source: the repo half of a
   git-host "owner/repo" slug, or the basename of a local path. URL and

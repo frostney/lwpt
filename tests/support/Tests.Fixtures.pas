@@ -26,7 +26,9 @@ procedure WriteTestFile(const APath, AContent: string);
 
 { Delete APath and everything under it. No-op when the directory does
   not exist, so it is safe as both setup (clear stale state) and
-  teardown. }
+  teardown. Symlinks and Windows junctions are removed as nodes,
+  never traversed — fixture trees can contain links into live package
+  sources (the installer's monorepo link path). }
 procedure RecursiveDelete(const APath: string);
 
 implementation
@@ -49,18 +51,32 @@ begin
 end;
 
 procedure RecursiveDelete(const APath: string);
-var SR: TSearchRec; Base: string;
+var SR: TSearchRec; Base, Full: string;
 begin
   if not DirectoryExists(APath) then Exit;
   Base := IncludeTrailingPathDelimiter(APath);
-  if FindFirst(Base + '*', faAnyFile, SR) = 0 then
+  { faSymLink in the filter makes FindFirst report links via lstat
+    instead of their targets; the same $400 bit is
+    FILE_ATTRIBUTE_REPARSE_POINT on Windows, so junctions carry it
+    too. Without it, a dir symlink stats as a plain directory and the
+    recursion would wipe the link TARGET. }
+  if FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
     try
       repeat
         if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) <> 0 then
-          RecursiveDelete(Base + SR.Name)
+        Full := Base + SR.Name;
+        if (SR.Attr and faSymLink) <> 0 then
+        begin
+          { remove the link node itself; never descend }
+          if (SR.Attr and faDirectory) <> 0 then
+            RemoveDir(Full)      { Windows junction / dir reparse point }
+          else
+            DeleteFile(Full);    { Unix symlink (any target), file link }
+        end
+        else if (SR.Attr and faDirectory) <> 0 then
+          RecursiveDelete(Full)
         else
-          DeleteFile(Base + SR.Name);
+          DeleteFile(Full);
       until FindNext(SR) <> 0;
     finally
       FindClose(SR);

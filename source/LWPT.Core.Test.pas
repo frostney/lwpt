@@ -239,6 +239,7 @@ type
     procedure TestKindChangeToLocalPrunesOldArchive;
     procedure TestVersionBumpPrunesStaleArchive;
     procedure TestUnchangedEntryPrunesNothing;
+    procedure TestUnsafeLockfileKeyRefusesToPrune;
   end;
 
 const
@@ -1971,6 +1972,33 @@ begin
   Expect<Boolean>(DirectoryExists(Modules + '/foo')).ToBe(True);
 end;
 
+procedure TPruneOrphans.TestUnsafeLockfileKeyRefusesToPrune;
+var
+  Modules, Archives, Marker: string;
+  OldLock, NewLock: TResolvedArray;
+  Raised: Boolean;
+begin
+  { A crafted lockfile key must never become a deletion path — the
+    prune refuses the whole lockfile rather than WipeDir-ing outside
+    the modules root. }
+  SetupPruneDirs('unsafe', Modules, Archives);
+  Marker := TMP_DIR + '/prune-unsafe-sibling';
+  ForceDirectories(Marker);
+
+  SetLength(OldLock, 1);
+  OldLock[0] := MakeEntry('../prune-unsafe-sibling', skGitHost, 'v1.0.0');
+  NewLock := nil;
+
+  Raised := False;
+  try
+    PruneOrphanedPackages(OldLock, NewLock, Modules, Archives);
+  except
+    on ELockfileError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(DirectoryExists(Marker)).ToBe(True);
+end;
+
 procedure TPruneOrphans.SetupTests;
 begin
   Test('a removed package loses its modules tree and archive',
@@ -1981,6 +2009,8 @@ begin
     TestVersionBumpPrunesStaleArchive);
   Test('an unchanged entry prunes nothing',
     TestUnchangedEntryPrunesNothing);
+  Test('an unsafe lockfile key refuses to prune (ELockfileError)',
+    TestUnsafeLockfileKeyRefusesToPrune);
 end;
 
 { ── TSanitisePathSegmentSuite ─────────────────────────────────────── }

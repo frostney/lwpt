@@ -211,6 +211,7 @@ procedure ParseDependencySourceCore(const ASource: string; const ACustomSources:
 procedure ParseDependencySource(const ASource: string; out AKind: TSourceKind; out AHost: THostKind; out ALocator: string);
 procedure ParseVersionSpec(const ASpec: string; out AKind: TVersionKind; out AValue: string);
 procedure ParseBareDepString(const ABare: string; const ACustomSources: TCustomSourceArray; var ADep: TDependency);
+function  ValidPackageName(const S: string): Boolean;
 function  LoadManifest(const APath: string): TManifest; overload;
 function  LoadManifest(const APath: string; AIsRoot: Boolean): TManifest; overload;
 function  LoadManifestContext(const APath: string): TManifestContext;
@@ -519,6 +520,23 @@ begin
   end;
 
   AKind := vkLiteralTag;
+end;
+
+{ The package-name grammar — one definition for every consumer:
+  `lwpt init`'s prompts, `lwpt add`'s derived/--name validation, and
+  the installer's refuse-to-prune guard against unsafe lockfile keys.
+  Deliberately path-hostile: no separators, no dots, so a name can
+  never traverse out of .lwpt/modules/ or .lwpt/archives/. }
+function ValidPackageName(const S: string): Boolean;
+var i: Integer;
+begin
+  Result := False;
+  if S = '' then Exit;
+  for i := 1 to Length(S) do
+    if not ((S[i] in ['a'..'z']) or (S[i] in ['A'..'Z'])
+            or (S[i] in ['0'..'9']) or (S[i] = '-') or (S[i] = '_')) then
+      Exit;
+  Result := True;
 end;
 
 { ===========================================================================

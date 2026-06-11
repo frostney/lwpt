@@ -2234,6 +2234,16 @@ begin
   Result := 0;
   for i := 0 to High(AOldLock) do
   begin
+    { The names steer WipeDir/DeleteFile under .lwpt/. lwpt.lock is
+      machine-written, but it sits on disk and is committed — a
+      crafted key like "../.." must never become a deletion path.
+      A name outside the package grammar was not written by LWPT:
+      refuse loudly rather than skip silently. }
+    if not ValidPackageName(AOldLock[i].Name) then
+      raise ELockfileError.CreateFmt(
+        'lockfile contains unsafe package key "%s"; refusing to prune',
+        [AOldLock[i].Name]);
+
     if FindNewEntry(AOldLock[i].Name, Kept) then
     begin
       { Still in the graph — but an updated spec may have moved it to a

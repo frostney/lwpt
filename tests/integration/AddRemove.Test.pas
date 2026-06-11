@@ -2,7 +2,9 @@
 
   Offline by design: the scratch project's dependency is a local path
   (vendor/leaf inside the project), so the install transaction never
-  touches the network. The contract under test:
+  touches the network. Each test gets a FRESH scratch project
+  (BeforeEach) and runs its own preconditions, so the cases are
+  order-independent. The contract under test:
 
     add:
       1. Writes `name = "<spec>"` into [dependencies] (creating the
@@ -40,6 +42,7 @@ type
     procedure SetupScratchProject;
   protected
     procedure BeforeAll; override;
+    procedure BeforeEach; override;
   public
     procedure SetupTests; override;
     procedure TestAddWritesManifestLockAndModules;
@@ -100,11 +103,14 @@ procedure TAddRemoveE2E.BeforeAll;
 begin
   FScratch := ExpandFileName('build/tests/tmp/addremove-e2e');
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
+end;
 
+procedure TAddRemoveE2E.BeforeEach;
+begin
+  { Fresh project per test — no case depends on another's mutations. }
   RecursiveDelete(FScratch);
   ForceDirectories(FScratch);
   SetupScratchProject;
-
   RunLwpt(['install'], FScratch);
 end;
 
@@ -133,6 +139,10 @@ var
   Manifest: string;
   First: Integer;
 begin
+  { precondition: leaf already added once }
+  R := RunLwpt(['add', './vendor/leaf'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+
   R := RunLwpt(['add', './vendor/leaf'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('updated leaf', R.Stdout) > 0).ToBe(True);
@@ -216,6 +226,12 @@ var
   R: TLwptResult;
   Manifest, Lock: string;
 begin
+  { precondition: leaf installed via add }
+  R := RunLwpt(['add', './vendor/leaf'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(DirectoryExists(FScratch + '/.lwpt/modules/leaf'))
+    .ToBe(True);
+
   R := RunLwpt(['remove', 'leaf'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
 

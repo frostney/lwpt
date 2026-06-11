@@ -19,7 +19,7 @@ uses
   LWPT.Command.Build,
   LWPT.Command.Install,
   LWPT.Core,
-  LWPT.ManifestEdit;
+  LWPT.Manifest;
 
 {
   CmdInit (ADR-0010) — scaffold a new LWPT project. Interactive by
@@ -139,9 +139,9 @@ begin
   end;
 end;
 
-{ ValidPackageName lives in LWPT.ManifestEdit — shared with `lwpt add`,
-  which validates derived/--name dependency names against the same
-  grammar. }
+{ ValidPackageName lives in LWPT.Manifest — the package-name grammar
+  shared with `lwpt add`'s name validation and the installer's
+  prune guard. }
 
 procedure CmdInit(AYes, AForce: Boolean);
 const
