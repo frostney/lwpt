@@ -4,32 +4,37 @@ name: PR
 # on push to main, so pr.yml is the sole pre-merge signal a PR sees.
 #
 #   pr.yml      — every PR: Ubuntu native bootstrap + install +
-#                 format --check + build + test (no e2e), plus one
-#                 x86_64-win64 cross-compile for Windows compile
-#                 signal. Typical wall-clock < 5 min on a warm
-#                 toolchain cache.
+#                 format --check + build + test (no e2e), plus a
+#                 win64 leg: cross-compile on macOS, then the
+#                 offline default test tier natively on
+#                 windows-latest. Typical wall-clock < 5 min on a
+#                 warm toolchain cache.
 #   ci.yml      — push to main only: full 6-target cross-build +
 #                 per-platform native test runs (incl. e2e).
 #                 Post-merge confirmation, not a PR gate.
 #   release.yml — tag-triggered cross-build + package + publish.
 #
 # Trade-off, deliberate: a PR that introduces a platform-specific
-# *runtime* regression (Windows path quirk, aarch64-only behaviour,
-# etc.) will pass pr.yml and only fail on the main-branch ci.yml
-# run. The maintainer reverts/forwards-fixes from main. This trades
-# pre-merge cross-platform certainty for cheap PR feedback, which
-# is the conscious GocciaScript design choice we mirror.
+# regression outside the win64 leg (aarch64-only behaviour, a
+# darwin-only path quirk, etc.) will pass pr.yml and only fail on
+# the main-branch ci.yml run. The maintainer reverts/forwards-fixes
+# from main. This trades pre-merge cross-platform certainty for
+# cheap PR feedback, which is the conscious GocciaScript design
+# choice we mirror.
 #
-# One carve-out from that trade-off: Windows-only COMPILE errors.
+# One carve-out from that trade-off: Windows, via the win64 leg.
 # {$IFDEF WINDOWS} codepaths never compile on the Ubuntu runner, so
 # a unit-shadowing mistake (the SysUtils.FindClose vs
 # Windows.FindClose class — introduced by PR #17, fixed by PR #21)
-# used to merge green and break main. The windows-cross-compile job
-# below closes exactly that gap: one win64 cross-compile, no tests,
-# reusing the toolchain cache that main runs keep warm. Scope: the
-# shipped binary's unit closure — Windows-only breaks in test
-# sources (*.Test.pas, tests/) still compile at run time on ci.yml's
-# native Windows runners, i.e. post-merge.
+# used to merge green and break main. windows-cross-compile closes
+# the compile gap (one win64 cross-compile reusing the toolchain
+# cache main runs keep warm); windows-test then runs the offline
+# default test tier natively against that binary, catching
+# Windows-only runtime breaks (junction installs, path handling,
+# process env) and compile breaks in test sources, which lwpt test
+# compiles with the native FPC. Still post-merge only: the
+# i386-win32 leg, the live-network e2e tier, bootstrap.bat, and
+# every non-Windows platform.
 #
 # The Ubuntu native build deliberately uses the distro FPC (same
 # as the install instructions in README.md), so a regression that
@@ -123,9 +128,10 @@ jobs:
   # Windows-only compile error inside {$IFDEF WINDOWS} blocks merges
   # green and breaks main (see the header comment). One target is
   # enough: win32 and win64 share the same {$IFDEF WINDOWS} sources,
-  # and the failure class is compile-time. No tests run here —
-  # Windows runtime behaviour stays post-merge in ci.yml's native
-  # test matrix.
+  # and the failure class is compile-time. The produced lwpt.exe is
+  # uploaded for the windows-test job below, which runs the default
+  # test tier against it natively (same build-once / test-natively
+  # split as ci.yml).
   #
   # The compile step mirrors ci.yml's build stage (x86_64-win64 leg):
   # same cross-FPC, same flags, same unit paths — minus the
@@ -234,3 +240,90 @@ jobs:
             exit 1
           fi
           echo "OK: no libssl/libcrypto references in build/lwpt.exe"
+
+      - name: Upload lwpt.exe for the native test job
+        uses: actions/upload-artifact@v7
+        with:
+          name: lwpt-pr-x86_64-win64
+          retention-days: 1
+          path: build/lwpt.exe
+
+  # Native Windows test run, pre-merge. Downloads the cross-built
+  # lwpt.exe and runs the offline default tier on windows-latest:
+  # lwpt install + lwpt test. This catches what a compile alone
+  # cannot — Windows-only runtime regressions in lwpt itself
+  # (junction-vs-symlink installs, path handling, subprocess
+  # environment handling) and compile breaks in test sources, which
+  # lwpt test compiles with the native FPC at run time (Q22=b).
+  # Post-merge ci.yml still owns the i386-win32 leg, the
+  # live-network e2e tier, and the bootstrap.bat smoke.
+  windows-test:
+    needs: windows-cross-compile
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The default tier is offline by design; this also keeps any
+      # future network-touching test out of the PR gate (mirrors the
+      # build-and-test job).
+      LWPT_SKIP_NETWORK: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      # Verbatim copy of ci.yml's "Install FPC (choco)" step (test
+      # matrix) — lwpt test compiles *.Test.pas with the native FPC,
+      # so this runner needs the same compiler + unit-path discovery.
+      # When ci.yml's copy changes, change this one too.
+      - name: Install FPC (choco)
+        run: |
+          choco install -y freepascal
+          # Add the FPC bin to PATH for subsequent steps. Chocolatey has
+          # used both C:\fpc and C:\tools\freepascal layouts over time.
+          FPC_BIN=""
+          for candidate_root in /c/tools/freepascal /c/fpc; do
+            if [ -d "$candidate_root" ]; then
+              FPC_BIN=$(find "$candidate_root" -name fpc.exe -type f 2>/dev/null | head -1)
+              if [ -n "$FPC_BIN" ]; then break; fi
+            fi
+          done
+          if [ -z "$FPC_BIN" ]; then echo "::error::Chocolatey FPC install: fpc.exe not found"; exit 1; fi
+          echo "Using FPC at $FPC_BIN"
+          echo "$(dirname "$FPC_BIN")" >> "$GITHUB_PATH"
+          echo "LWPT_FPC=$(cygpath -w "$FPC_BIN")" >> "$GITHUB_ENV"
+          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1)
+          if [ -n "$INSTANTFPC_BIN" ]; then
+            echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
+          fi
+          FPC_UNIT_PATHS=""
+          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do
+            UNIT_PATH=""
+            for unit_target in i386-win32 x86_64-win64; do
+              UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
+              if [ -n "$UNIT_PATH" ]; then break; fi
+            done
+            if [ -n "$UNIT_PATH" ]; then
+              UNIT_PATH_WIN=$(cygpath -w "$UNIT_PATH")
+              if [ -z "$FPC_UNIT_PATHS" ]; then
+                FPC_UNIT_PATHS="$UNIT_PATH_WIN"
+              else
+                FPC_UNIT_PATHS="${FPC_UNIT_PATHS};${UNIT_PATH_WIN}"
+              fi
+            fi
+          done
+          echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
+
+      - name: Download lwpt artefact
+        uses: actions/download-artifact@v8
+        with:
+          name: lwpt-pr-x86_64-win64
+          path: build/
+
+      - name: Sanity check — lwpt --help
+        run: ./build/lwpt.exe --help
+
+      - name: lwpt install (workspace auto-discovery + junctions)
+        run: ./build/lwpt.exe install
+
+      - name: lwpt test (default tier — unit + integration)
+        run: ./build/lwpt.exe test

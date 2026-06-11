@@ -4,8 +4,8 @@ name: CI
 # LWPT's vendored units). Sister workflows:
 #
 #   pr.yml      — every PR: Ubuntu native bootstrap + build + test,
-#                 plus one x86_64-win64 cross-compile (Windows
-#                 compile signal; the pre-merge gate)
+#                 plus a win64 leg (cross-compile + native offline
+#                 test run; the pre-merge gate)
 #   release.yml — tag-triggered cross-build + package + publish
 #
 # ci.yml runs ONLY on push to main + manual dispatch. PRs do not
@@ -310,6 +310,8 @@ jobs:
           sudo apt-get install -y fpc
           fpc -iV
 
+      # Copied verbatim into pr.yml's windows-test job — when this
+      # step changes, change that copy too.
       - name: Install FPC (choco)
         if: matrix.fpc-install == 'choco'
         run: |

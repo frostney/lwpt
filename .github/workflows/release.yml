@@ -4,7 +4,8 @@ name: Release
 #
 #   ci.yml      — push to main: build + test on every platform
 #   release.yml — tag push: cross-build → package → publish GitHub Release
-#   pr.yml      — fast PR feedback (system FPC + one win64 cross-compile)
+#   pr.yml      — fast PR feedback (system FPC + win64 cross-compile
+#                 + native offline Windows test run)
 #
 # Triggers on tags matching:
 #   v?[0-9]+.[0-9]+.[0-9]+         e.g.  0.1.0, 1.2.3 (canonical, no v)
