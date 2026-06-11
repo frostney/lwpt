@@ -45,7 +45,7 @@ end;
 procedure TStaleArtefactSignature.TestMissingReslstMatches;
 begin
   Expect<Boolean>(HasStaleArtefactSignature(
-    'fpcres: Error: Cannot open file build/lwpt.reslst')).ToBe(True);
+    'fpcres: Error: Cannot open file build/app.reslst')).ToBe(True);
 end;
 
 procedure TStaleArtefactSignature.TestOrdinarySourceErrorDoesNotMatch;
@@ -59,7 +59,7 @@ procedure TStaleArtefactSignature.TestReslstMentionAloneDoesNotMatch;
 begin
   { .reslst only signals staleness together with an open/read failure }
   Expect<Boolean>(HasStaleArtefactSignature(
-    'Writing resource list build/lwpt.reslst')).ToBe(False);
+    'Writing resource list build/app.reslst')).ToBe(False);
 end;
 
 procedure TStaleArtefactSignature.TestEmptyOutputDoesNotMatch;

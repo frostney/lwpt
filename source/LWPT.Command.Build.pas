@@ -264,18 +264,23 @@ begin
   RanOk := RunFPCEchoed(FpcArgs, OutText, FpcExit);
   Result := RanOk and (FpcExit = 0);
 
+  { The streamed compiler output above follows fpc's own channel
+    (fpc emits its messages on stdout); lwpt's own failure banner and
+    hint are errors and belong on stderr. }
   if Result then
     WriteLn('ok -> ', OutBin)
   else if RanOk then
-    WriteLn('FAILED (fpc exit ', FpcExit, ')')
+    WriteLn(ErrOutput, 'FAILED (fpc exit ', FpcExit, ')')
   else
-    WriteLn('FAILED (could not run ', FPCExecutable, ')');
+    WriteLn(ErrOutput, 'FAILED (could not run ', FPCExecutable, ')');
 
   if (not Result) and (not AClean)
      and HasStaleArtefactSignature(OutText) then
   begin
-    WriteLn('  hint: stale FPC build artefacts can cause this error.');
-    WriteLn('  retry with: ', PROGRAM_NAME, ' build ', T.Name, ' --clean');
+    WriteLn(ErrOutput,
+      '  hint: stale FPC build artefacts can cause this error.');
+    WriteLn(ErrOutput,
+      '  retry with: ', PROGRAM_NAME, ' build ', T.Name, ' --clean');
   end;
 end;
 
