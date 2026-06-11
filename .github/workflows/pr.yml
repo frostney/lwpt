@@ -6,7 +6,8 @@ name: PR
 #   pr.yml      — every PR: Ubuntu native bootstrap + install +
 #                 format --check + build + test (no e2e), plus one
 #                 x86_64-win64 cross-compile for Windows compile
-#                 signal. Typical wall-clock < 5 min.
+#                 signal. Typical wall-clock < 5 min on a warm
+#                 toolchain cache.
 #   ci.yml      — push to main only: full 6-target cross-build +
 #                 per-platform native test runs (incl. e2e).
 #                 Post-merge confirmation, not a PR gate.
@@ -25,7 +26,10 @@ name: PR
 # Windows.FindClose class — introduced by PR #17, fixed by PR #21)
 # used to merge green and break main. The windows-cross-compile job
 # below closes exactly that gap: one win64 cross-compile, no tests,
-# reusing the toolchain cache that main runs keep warm.
+# reusing the toolchain cache that main runs keep warm. Scope: the
+# shipped binary's unit closure — Windows-only breaks in test
+# sources (*.Test.pas, tests/) still compile at run time on ci.yml's
+# native Windows runners, i.e. post-merge.
 #
 # The Ubuntu native build deliberately uses the distro FPC (same
 # as the install instructions in README.md), so a regression that
@@ -41,8 +45,12 @@ on:
 permissions:
   contents: read
 
-env:
-  FPC_VERSION: "3.2.2"
+# The commit-amend-push PR cycle is the canonical cancel-in-progress
+# case: a superseded push should not keep burning the macOS runner
+# (or, on a cold cache, a ~30-min toolchain rebuild).
+concurrency:
+  group: pr-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
@@ -126,6 +134,11 @@ jobs:
   windows-cross-compile:
     needs: toolchain
     runs-on: macos-latest
+    env:
+      # Single source of truth is toolchain.yml's FPC_VERSION (called
+      # workflows do not inherit caller env); consuming the output
+      # keeps this job in lockstep with the cache it restores.
+      FPC_VERSION: ${{ needs.toolchain.outputs.fpc-version }}
     defaults:
       run:
         shell: bash
@@ -156,13 +169,16 @@ jobs:
           fi
 
           # RTL + package paths, same slice as ci.yml's build stage.
+          # ci.yml's conditional rtl-extra / hash -Fu additions are
+          # omitted on purpose: toolchain.yml never produces those
+          # unit dirs for cross targets (win64's crc.ppu lands in
+          # paszlib/, winsock2.ppu in rtl/) — they exist only in the
+          # brew-seeded aarch64-darwin units.
           RTL_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl"
-          RTL_EXTRA_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-extra"
           OBJPAS_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-objpas"
           GEN_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/rtl-generics"
           FCL_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/fcl-process"
           PASZLIB_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/paszlib"
-          HASH_DIR="$PREFIX/lib/fpc/${FPC_VERSION}/units/${TARGET}/hash"
           FCL_BASE_SRC="$PREFIX/share/fpcsrc/packages/fcl-base/src"
           FCL_NET_SRC="$PREFIX/share/fpcsrc/packages/fcl-net/src"
           OPENSSL_SRC="$PREFIX/share/fpcsrc/packages/openssl/src"
@@ -179,19 +195,9 @@ jobs:
             exit 1
           fi
 
-          HASH_FLAGS=""
-          if [ -d "$HASH_DIR" ]; then
-            HASH_FLAGS="-Fu${HASH_DIR}"
-          fi
-          RTL_EXTRA_FLAGS=""
-          if [ -d "$RTL_EXTRA_DIR" ]; then
-            RTL_EXTRA_FLAGS="-Fu${RTL_EXTRA_DIR}"
-          fi
-
           mkdir -p build/compiled
 
           echo "=== Building lwpt for ${TARGET} ==="
-          # shellcheck disable=SC2086  # RTL_EXTRA_FLAGS / HASH_FLAGS are intentionally word-split
           "$CROSS_FPC" -Twin64 -O4 -dPRODUCTION -Xs -CX -XX -B \
             -Sh \
             -Fusource -Fisource \
@@ -200,7 +206,7 @@ jobs:
             -Fupackages/semver/source     -Fipackages/semver/source \
             -Fupackages/toml/source       -Fipackages/toml/source \
             -Fupackages/testing/source    -Fipackages/testing/source \
-            -Fu"$RTL_DIR" $RTL_EXTRA_FLAGS -Fu"$OBJPAS_DIR" -Fu"$GEN_DIR" -Fu"$FCL_DIR" -Fu"$PASZLIB_DIR" $HASH_FLAGS \
+            -Fu"$RTL_DIR" -Fu"$OBJPAS_DIR" -Fu"$GEN_DIR" -Fu"$FCL_DIR" -Fu"$PASZLIB_DIR" \
             -Fu"$FCL_BASE_SRC" -Fu"$FCL_NET_SRC" -Fu"$OPENSSL_SRC" \
             -FU"build/compiled" -FE"build" \
             -dFPC_SOFT_FPUX80 \
@@ -219,7 +225,11 @@ jobs:
           # libcrypto DLL-name strings for runtime LoadLibrary). ci.yml
           # and release.yml carry the same guard post-merge / at tag
           # time; this copy makes the release-blocker visible on the PR.
-          if LC_ALL=C grep -ao 'libssl\|libcrypto' build/lwpt.exe | head -1 | grep -q .; then
+          # grep -q, not `grep -ao | head -1 | grep -q .`: this job's
+          # shell runs with pipefail, where head closing the pipe can
+          # SIGPIPE the left grep (exit 141) and silently pass the
+          # guard exactly when matches are plentiful.
+          if LC_ALL=C grep -aq 'libssl\|libcrypto' build/lwpt.exe; then
             echo "::error::lwpt.exe references libssl/libcrypto — must use SChannel only on Windows (ADR-0016)"
             exit 1
           fi

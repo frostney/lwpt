@@ -9,12 +9,24 @@ name: Build Cross-Compilation Toolchain
 
 on:
   workflow_dispatch:
+  # Weekly cache-warming run on the default branch. PR-scoped rebuilds
+  # cannot repopulate the shared cache (per-PR cache scopes are not
+  # readable across PRs), so after an eviction every open PR pays the
+  # ~30-min rebuild until a main-scoped run saves a fresh copy — this
+  # cron bounds that window. On a warm cache it exits in seconds.
+  schedule:
+    - cron: '0 5 * * 1'
   workflow_call:
     outputs:
       cache-key:
         value: ${{ jobs.build.outputs.cache-key }}
+      fpc-version:
+        value: ${{ jobs.build.outputs.fpc-version }}
 
 env:
+  # Single source of truth for the toolchain's FPC version. Consumers
+  # (ci.yml, pr.yml, release.yml) read the fpc-version output instead
+  # of carrying their own copy, so a bump here propagates everywhere.
   FPC_VERSION: "3.2.2"
   BINUTILS_VERSION: "2.44"
   CACHE_VERSION: "v5"
@@ -24,6 +36,7 @@ jobs:
     runs-on: macos-latest
     outputs:
       cache-key: lwpt-fpc-cross-${{ env.FPC_VERSION }}-macos-arm64-${{ env.CACHE_VERSION }}
+      fpc-version: ${{ env.FPC_VERSION }}
 
     steps:
       - name: Check cache

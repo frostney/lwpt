@@ -42,9 +42,6 @@ on:
 permissions:
   contents: write   # softprops/action-gh-release needs this to create the release
 
-env:
-  FPC_VERSION: "3.2.2"
-
 jobs:
   toolchain:
     uses: ./.github/workflows/toolchain.yml
@@ -52,6 +49,10 @@ jobs:
   build:
     needs: toolchain
     runs-on: macos-latest
+    env:
+      # Sourced from toolchain.yml (the single source of truth) so the
+      # paths probed below always match the restored cache.
+      FPC_VERSION: ${{ needs.toolchain.outputs.fpc-version }}
     strategy:
       fail-fast: false
       matrix:
@@ -220,6 +221,8 @@ jobs:
           # Release-grade build: -O4 -dPRODUCTION -Xs -CX -XX -B.
           # Same flag set as ci.yml's build stage, so a tagged commit's
           # binary equals what CI produces — single artefact provenance.
+          # pr.yml's windows-cross-compile job mirrors the win64 leg of
+          # the same flag set — keep all three in sync.
           echo "=== Building lwpt for ${TARGET} (release) ==="
           # shellcheck disable=SC2086  # $EXTRA_FLAGS is intentionally word-split
           "$CROSS_FPC" -T"${OS}" -O4 -dPRODUCTION -Xs -CX -XX -B \
@@ -282,7 +285,11 @@ jobs:
           # Mirrors GocciaScript's same guard and ci.yml's test-job
           # check; release.yml needs its own copy because tag pushes
           # do not trigger ci.yml.
-          if LC_ALL=C grep -ao 'libssl\|libcrypto' staged/lwpt.exe | head -1 | grep -q .; then
+          # grep -q, not `grep -ao | head -1 | grep -q .`: under a
+          # pipefail shell, head closing the pipe can SIGPIPE the left
+          # grep (exit 141) and silently pass the guard exactly when
+          # matches are plentiful. -q is immune either way.
+          if LC_ALL=C grep -aq 'libssl\|libcrypto' staged/lwpt.exe; then
             echo "::error::lwpt.exe references libssl/libcrypto — must use SChannel only on Windows (ADR-0016)"
             exit 1
           fi

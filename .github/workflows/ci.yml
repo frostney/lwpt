@@ -43,9 +43,6 @@ on:
 permissions:
   contents: read
 
-env:
-  FPC_VERSION: "3.2.2"
-
 jobs:
   toolchain:
     uses: ./.github/workflows/toolchain.yml
@@ -53,6 +50,10 @@ jobs:
   build:
     needs: toolchain
     runs-on: macos-latest
+    env:
+      # Sourced from toolchain.yml (the single source of truth) so the
+      # paths probed below always match the restored cache.
+      FPC_VERSION: ${{ needs.toolchain.outputs.fpc-version }}
     strategy:
       fail-fast: false
       matrix:
@@ -211,6 +212,9 @@ jobs:
           # Single entry point: source/lwpt.pas. -Fu / -Fi paths mirror
           # scripts/bootstrap.pas (LWPT's own bootstrap), extended with
           # the cross-toolchain RTL + packages.
+          # Mirrored by release.yml's build job AND pr.yml's
+          # windows-cross-compile job (win64 leg) — flag or unit-path
+          # changes here must be copied to both.
           echo ""
           echo "=== Building lwpt for ${TARGET} ==="
           "$CROSS_FPC" -T"${OS}" -O4 -dPRODUCTION -Xs -CX -XX -B \

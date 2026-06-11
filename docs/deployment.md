@@ -57,9 +57,9 @@ Earlier docs claimed the archive bundled `libssl-3-x64.dll` + `libcrypto-3-x64.d
 
 To prevent a future regression (someone adds `uses OpenSSL` under a Windows-active codepath; the unit's source registers DLL names as string literals for `LoadLibrary`), `pr.yml`, `ci.yml`, and `release.yml` each include a guard step that fails the build if the cross-built `lwpt.exe` contains `libssl` or `libcrypto` substrings:
 
-- `pr.yml` windows-cross-compile job: bash `grep -ao libssl\|libcrypto` against the freshly cross-built `lwpt.exe` on the macOS runner. The only pre-merge guard — catches the release-blocker on the PR itself.
+- `pr.yml` windows-cross-compile job: bash `grep -aq libssl\|libcrypto` against the freshly cross-built `lwpt.exe` on the macOS runner. The only pre-merge guard — catches the release-blocker on the PR itself.
 - `ci.yml` test job: PowerShell read-bytes-as-Latin1 scan, gated on `runner.os == 'Windows'`. Mirrors GocciaScript's same guard step.
-- `release.yml` build job: bash `grep -ao libssl\|libcrypto`, gated on Windows targets. Runs on the macOS cross-build runner against the staged binary.
+- `release.yml` build job: bash `grep -aq libssl\|libcrypto`, gated on Windows targets. Runs on the macOS cross-build runner against the staged binary.
 
 The guards are independent (different shells, different binaries — PR cross-build vs post-merge cross-built artefact vs staged-for-release artefact); all must pass.
 

@@ -6,13 +6,13 @@ Four GitHub Actions workflows, mirroring the GocciaScript pattern that LWPT's ve
 |----------|---------|---------|
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch` | Build + cache the cross-FPC toolchain |
 | `ci.yml` | `push` to `main`, `workflow_dispatch` | Post-merge confirmation: full 6-target cross-build + native test matrix on the merged main tree |
-| `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: fast Ubuntu runner + one `x86_64-win64` cross-compile (typical wall-clock < 5 min) |
+| `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: fast Ubuntu runner + one `x86_64-win64` cross-compile (typical wall-clock < 5 min on a warm toolchain cache) |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`), `workflow_dispatch` | Cross-build → package → publish GitHub Release |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
 - **PRs go through `pr.yml` only** — an Ubuntu runner plus a single `x86_64-win64` cross-compile (compile signal only, no Windows tests). Cheap signal so PR authors aren't blocked on a 30-minute matrix per push.
-- **`ci.yml` runs only on `push` to `main`** — i.e. after merge. This is where the heavyweight 6-target cross-build + native test matrix lives. A PR that introduces a platform-specific *runtime* regression (Windows path quirk, aarch64-only behaviour) will pass `pr.yml` and fail the post-merge `ci.yml` run; the maintainer then reverts or forwards-fixes from `main`. The trade-off is conscious: cheap PR feedback over pre-merge cross-platform certainty. Windows-only *compile* errors are the one carve-out — they're caught pre-merge by `pr.yml`'s win64 cross-compile job (added after PR #17 merged green with a `SysUtils.FindClose` vs `Windows.FindClose` shadowing break that PR #21 had to fix on `main`).
+- **`ci.yml` runs only on `push` to `main`** — i.e. after merge. This is where the heavyweight 6-target cross-build + native test matrix lives. A PR that introduces a platform-specific *runtime* regression (Windows path quirk, aarch64-only behaviour) will pass `pr.yml` and fail the post-merge `ci.yml` run; the maintainer then reverts or forwards-fixes from `main`. The trade-off is conscious: cheap PR feedback over pre-merge cross-platform certainty. Windows-only *compile* errors in the shipped binary's sources are the one carve-out — they're caught pre-merge by `pr.yml`'s win64 cross-compile job (added after PR #17 merged green with a `SysUtils.FindClose` vs `Windows.FindClose` shadowing break that PR #21 had to fix on `main`). Test sources (`*.Test.pas`, `tests/`) compile at run time on the native runners per Q22=b, so a Windows-only break there still surfaces post-merge.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
 ## Workflows
@@ -86,7 +86,12 @@ The PR workflow deliberately uses the distro FPC (same as the install instructio
 
 A second job reuses `toolchain.yml` (`workflow_call`, exactly like `ci.yml`) and cross-compiles `source/lwpt.pas` for **`x86_64-win64` only**, mirroring `ci.yml`'s build-stage flags and unit paths. It exists because `{$IFDEF WINDOWS}` codepaths never compile on the Ubuntu runner: PR #17 merged green while breaking `main` with a `SysUtils.FindClose` vs `Windows.FindClose` unit-shadowing error that PR #21 then had to fix. One target suffices — win32 and win64 share the same `{$IFDEF WINDOWS}` sources, and the failure class is compile-time. The job also runs the ADR-0016 no-OpenSSL guard against the produced `lwpt.exe`, surfacing that release-blocker on the PR instead of post-merge. No Windows tests run here; runtime behaviour stays in `ci.yml`'s native test matrix.
 
-Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`) has no branch component, and GitHub Actions lets PR runs restore caches created on the base branch — so PR runs hit the toolchain that `ci.yml` pushes to `main` keep warm, and the `toolchain` job is a seconds-long cache lookup. On eviction, the PR run rebuilds the toolchain (~30 min) into its own cache scope (not shared across PRs); the next `main` push repopulates the shared copy.
+Two deliberate scope limits:
+
+- **Binary closure only.** The job compiles the `source/lwpt.pas` unit closure. Test sources compile at run time on the native runners (Q22=b), so a Windows-only compile break inside `*.Test.pas` or `tests/` still merges green and surfaces in the post-merge `ci.yml` run.
+- **Windows only.** `{$IFDEF DARWIN}`-gated code (e.g. the SecureTransport backend) is the same never-compiles-on-Ubuntu class but stays post-merge for now — Windows is where this class has actually bitten. If a darwin incident ever lands, the cheap extension is a second compile in the same job (`ppca64` is the native compiler in the same restored cache; no cross-binutils needed).
+
+Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`) has no branch component, and GitHub Actions lets PR runs restore caches created on the base branch — so PR runs hit the toolchain that `ci.yml` pushes to `main` keep warm, and the `toolchain` job is a seconds-long cache lookup. On eviction, the PR run rebuilds the toolchain (~30 min) into its own cache scope (not shared across PRs); a weekly `schedule` cron on `toolchain.yml` re-warms the default-branch copy so that window is bounded even when `main` is quiet. `pr.yml` also sets `concurrency` with `cancel-in-progress`, so a superseded push doesn't keep burning the macOS runner.
 
 #### Why not fully cross-platform on PRs?
 
@@ -149,7 +154,7 @@ The scripts mirror the shape of [GocciaScript's installers](https://gocciascript
 - `ci.yml`: `push` to `main`, `workflow_dispatch`
 - `pr.yml`: `pull_request` to `main`, `workflow_dispatch`
 - `release.yml`: `push` of a `v?N.N.N` or `v?N.N.N-*` tag, `workflow_dispatch`
-- `toolchain.yml`: invoked by `ci.yml`, `pr.yml`, and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming
+- `toolchain.yml`: invoked by `ci.yml`, `pr.yml`, and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming and a weekly `schedule` cron (Mondays 05:00 UTC) that keeps the default-branch cache warm
 
 A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` after merge, OR `release.yml` after tag), not both. PRs trigger only the cheap `pr.yml` (whose single win64 cross-compile rides the cached toolchain).
 
@@ -157,7 +162,7 @@ A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` a
 
 Bump `toolchain.yml`'s `CACHE_VERSION` env var (currently `v5`) when:
 
-- FPC version changes
+- FPC version changes (`FPC_VERSION` lives **only** in `toolchain.yml`; `ci.yml`, `pr.yml`, and `release.yml` consume it via the workflow's `fpc-version` output, so one edit covers all consumers)
 - A new target is added to the matrix
 - The FPC packages slice is rescoped (e.g. when a future LWPT change requires a package not in the current set)
 - Toolchain scripts themselves change in a way that affects the binary content of the cache
