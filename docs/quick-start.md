@@ -46,7 +46,7 @@ Both code paths are dev-mode only; release builds always go through `./build/lwp
 After bootstrap:
 
 ```sh
-./build/lwpt --help     # top-level help; lists the 7 subcommands
+./build/lwpt --help     # top-level help; lists the 9 subcommands
 ```
 
 ## Daily commands
@@ -64,6 +64,8 @@ After bootstrap:
 
 ./build/lwpt install            # fetch any new deps; rewrite lwpt.lock + lwpt.cfg
 ./build/lwpt install --frozen   # CI: verify, refuse to update
+./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
+./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt repair             # clean .lwpt/tmp/ + stale install lock
 ```
 
@@ -81,20 +83,20 @@ If you genuinely need to bypass (rare), see [`tooling.md`](./tooling.md) — but
 
 ## Adding a dependency
 
-Edit `lwpt.toml`:
+```sh
+./build/lwpt add HashLoad/horse@^4.0.0   # writes the [dependencies] entry + installs
+git add .lwpt/ lwpt.lock lwpt.cfg lwpt.toml
+git commit -m "feat: add horse v4.0.0"
+```
+
+The dependency name defaults to the repo / path basename (`horse` here); pass `--name <name>` to override it (required for `https://` tarball sources). The manifest is only written after the install succeeded, so a typo'd repo or dead tag leaves `lwpt.toml` untouched. Equivalent manual path: edit `lwpt.toml` yourself —
 
 ```toml
 [dependencies]
 horse = "HashLoad/horse@^4.0.0"   # see ADR-0009 for the full source-spec syntax
 ```
 
-Then:
-
-```sh
-./build/lwpt install        # fetches into .lwpt/archives/ + .lwpt/modules/
-git add .lwpt/ lwpt.lock lwpt.cfg lwpt.toml
-git commit -m "feat: add horse v3.0.0"
-```
+— then run `./build/lwpt install`. The inverse is `./build/lwpt remove horse`, which deletes the manifest entry, regenerates `lwpt.lock` + `lwpt.cfg`, and prunes `.lwpt/modules/horse/` + its cached archive (see [ADR-0019](./adr/0019-add-remove-subcommands.md)).
 
 `.lwpt/modules/horse/` and `.lwpt/archives/horse-v3.0.0.tar.gz` are committed because of zero-install (ADR-0002). The next contributor's `git clone` doesn't need to run `lwpt install` — `./build/lwpt build` reads the already-committed `lwpt.cfg` and compiles directly.
 

@@ -38,6 +38,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0016](./adr/0016-tls-backend-per-platform.md) | TLS backend is platform-native (SChannel on Windows, SecureTransport on macOS, OpenSSL on Linux); CI guard prevents OpenSSL DLL dependency on Windows |
 | [0017](./adr/0017-packages-lwpt-canonical.md) | Packages are LWPT-canonical workspace projects; GocciaScript is the first named adopter committed to Path A (full toolchain adoption); supersedes [0003](./adr/0003-vendored-permanent-fork-graduation.md) |
 | [0018](./adr/0018-install-transaction-module.md) | Install transaction moves behind a dedicated `LWPT.Install` module; hooks stay outside, frozen remains verification-only, and lockfile/cfg commits are owned by the transaction seam |
+| [0019](./adr/0019-add-remove-subcommands.md) | `lwpt add` + `lwpt remove` as manifest-editing frontends to the install transaction; install-before-write ordering; lockfile-diff pruning of orphaned modules + archives; subcommand surface 7 → 9 |
 
 ## Spikes
 

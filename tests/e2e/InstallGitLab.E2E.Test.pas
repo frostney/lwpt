@@ -29,6 +29,7 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
+  Tests.Fixtures,
   Tests.LwptSubprocess;
 
 const
@@ -43,7 +44,6 @@ type
     FSkipped: Boolean;
     FInstallExitCode: Integer;
     FInstallStderr: string;
-    procedure WriteFile(const APath, AContent: string);
     procedure SetupScratchProject;
   protected
     procedure BeforeAll; override;
@@ -55,39 +55,6 @@ type
     procedure TestLockfileRecordsArchiveAndTreeHashes;
     procedure TestFrozenVerifiesWithoutNetwork;
   end;
-
-procedure TInstallGitLabE2E.WriteFile(const APath, AContent: string);
-var SL: TStringList;
-begin
-  ForceDirectories(ExtractFileDir(APath));
-  SL := TStringList.Create;
-  try
-    SL.Text := AContent;
-    SL.SaveToFile(APath);
-  finally
-    SL.Free;
-  end;
-end;
-
-procedure RecursiveDelete(const APath: string);
-var SR: TSearchRec; Base: string;
-begin
-  if not DirectoryExists(APath) then Exit;
-  Base := IncludeTrailingPathDelimiter(APath);
-  if FindFirst(Base + '*', faAnyFile, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) <> 0 then
-          RecursiveDelete(Base + SR.Name)
-        else
-          DeleteFile(Base + SR.Name);
-      until FindNext(SR) <> 0;
-    finally
-      FindClose(SR);
-    end;
-  RemoveDir(APath);
-end;
 
 function ReadFileText(const APath: string): string;
 var SL: TStringList;
@@ -104,11 +71,11 @@ end;
 procedure TInstallGitLabE2E.SetupScratchProject;
 begin
   ForceDirectories(FRoot + '/source');
-  WriteFile(FRoot + '/source/main.pas',
+  WriteTestFile(FRoot + '/source/main.pas',
     'program main;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'begin end.'#10);
-  WriteFile(FRoot + '/lwpt.toml',
+  WriteTestFile(FRoot + '/lwpt.toml',
     '[package]'#10 +
     'name = "gitlab-e2e"'#10 +
     'version = "0.0.0"'#10 +

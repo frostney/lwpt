@@ -210,6 +210,7 @@ function  ResolveCfgFile(const AMan: TManifest): string;
 procedure ParseDependencySourceCore(const ASource: string; const ACustomSources: TCustomSourceArray; APermissive: Boolean; out AKind: TSourceKind; out AHost: THostKind; out AHostName: string; out ALocator: string);
 procedure ParseDependencySource(const ASource: string; out AKind: TSourceKind; out AHost: THostKind; out ALocator: string);
 procedure ParseVersionSpec(const ASpec: string; out AKind: TVersionKind; out AValue: string);
+procedure ParseBareDepString(const ABare: string; const ACustomSources: TCustomSourceArray; var ADep: TDependency);
 function  LoadManifest(const APath: string): TManifest; overload;
 function  LoadManifest(const APath: string; AIsRoot: Boolean): TManifest; overload;
 function  LoadManifestContext(const APath: string): TManifestContext;
@@ -1116,9 +1117,9 @@ const
         anyway because KNOWN_SECTIONS is checked first, but this
         list makes the intent explicit). 'run' itself is included
         because `lwpt run run` is the nonsense case. }
-  RESERVED_SUBCOMMAND_NAMES: array[0..14] of string = (
+  RESERVED_SUBCOMMAND_NAMES: array[0..16] of string = (
     { subcommands }
-    'install', 'build', 'format', 'test',
+    'install', 'add', 'remove', 'build', 'format', 'test',
     'repair', 'init', 'run',
     { configuration section names — defensive: ensure 'workspaces',
       'package', 'dependencies' etc can NEVER end up registered as

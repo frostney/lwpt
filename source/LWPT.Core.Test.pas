@@ -214,6 +214,21 @@ type
     procedure TestLockfilePermissiveOnUnknownPrefix;
   end;
 
+  { ADR-0019 — lockfile-diff pruning behind `lwpt add` / `lwpt remove`. }
+  TPruneOrphans = class(TTestSuite)
+  private
+    function  SetupPruneDirs(const ASuffix: string;
+      out AModules, AArchives: string): string;
+    function  MakeEntry(const AName: string; AKind: TSourceKind;
+      const AVersion: string): TResolved;
+  public
+    procedure SetupTests; override;
+    procedure TestRemovedPackagePrunesModulesAndArchive;
+    procedure TestKindChangeToLocalPrunesOldArchive;
+    procedure TestVersionBumpPrunesStaleArchive;
+    procedure TestUnchangedEntryPrunesNothing;
+  end;
+
 const
   TMP_DIR = 'build/tests/fixtures/core';
 
@@ -1786,6 +1801,149 @@ begin
     TestLockfilePermissiveOnUnknownPrefix);
 end;
 
+{ ── TPruneOrphans ─────────────────────────────────────────────────── }
+
+function TPruneOrphans.SetupPruneDirs(const ASuffix: string;
+  out AModules, AArchives: string): string;
+begin
+  Result := TMP_DIR + '/prune-' + ASuffix;
+  AModules  := Result + '/modules';
+  AArchives := Result + '/archives';
+  if DirectoryExists(Result) then WipeDir(Result);
+  ForceDirectories(AModules);
+  ForceDirectories(AArchives);
+end;
+
+function TPruneOrphans.MakeEntry(const AName: string; AKind: TSourceKind;
+  const AVersion: string): TResolved;
+begin
+  Result := Default(TResolved);
+  Result.Name    := AName;
+  Result.SrcKind := AKind;
+  Result.Version := AVersion;
+end;
+
+procedure TPruneOrphans.TestRemovedPackagePrunesModulesAndArchive;
+var
+  Modules, Archives, Archive: string;
+  OldLock, NewLock: TResolvedArray;
+begin
+  SetupPruneDirs('removed', Modules, Archives);
+  ForceDirectories(Modules + '/foo/source');
+  Archive := Archives + '/foo-v1.0.0.tar.gz';
+  with TStringList.Create do
+  try
+    Text := 'fake tarball';
+    SaveToFile(Archive);
+  finally
+    Free;
+  end;
+
+  SetLength(OldLock, 1);
+  OldLock[0] := MakeEntry('foo', skGitHost, 'v1.0.0');
+  NewLock := nil;
+
+  Expect<Integer>(
+    PruneOrphanedPackages(OldLock, NewLock, Modules, Archives)).ToBe(1);
+  Expect<Boolean>(DirectoryExists(Modules + '/foo')).ToBe(False);
+  Expect<Boolean>(FileExists(Archive)).ToBe(False);
+end;
+
+procedure TPruneOrphans.TestKindChangeToLocalPrunesOldArchive;
+var
+  Modules, Archives, Archive: string;
+  OldLock, NewLock: TResolvedArray;
+begin
+  { Re-pointing a dep from a git host to a local path: the old cached
+    archive must go, the (re-materialized) modules tree must stay. }
+  SetupPruneDirs('kindchange', Modules, Archives);
+  ForceDirectories(Modules + '/foo');
+  Archive := Archives + '/foo-v1.0.0.tar.gz';
+  with TStringList.Create do
+  try
+    Text := 'fake tarball';
+    SaveToFile(Archive);
+  finally
+    Free;
+  end;
+
+  SetLength(OldLock, 1);
+  OldLock[0] := MakeEntry('foo', skGitHost, 'v1.0.0');
+  SetLength(NewLock, 1);
+  NewLock[0] := MakeEntry('foo', skLocal, '');
+
+  Expect<Integer>(
+    PruneOrphanedPackages(OldLock, NewLock, Modules, Archives)).ToBe(0);
+  Expect<Boolean>(FileExists(Archive)).ToBe(False);
+  Expect<Boolean>(DirectoryExists(Modules + '/foo')).ToBe(True);
+end;
+
+procedure TPruneOrphans.TestVersionBumpPrunesStaleArchive;
+var
+  Modules, Archives, OldArchive, NewArchive: string;
+  OldLock, NewLock: TResolvedArray;
+begin
+  SetupPruneDirs('bump', Modules, Archives);
+  OldArchive := Archives + '/foo-v1.0.0.tar.gz';
+  NewArchive := Archives + '/foo-v2.0.0.tar.gz';
+  with TStringList.Create do
+  try
+    Text := 'fake tarball';
+    SaveToFile(OldArchive);
+    SaveToFile(NewArchive);
+  finally
+    Free;
+  end;
+
+  SetLength(OldLock, 1);
+  OldLock[0] := MakeEntry('foo', skGitHost, 'v1.0.0');
+  SetLength(NewLock, 1);
+  NewLock[0] := MakeEntry('foo', skGitHost, 'v2.0.0');
+
+  Expect<Integer>(
+    PruneOrphanedPackages(OldLock, NewLock, Modules, Archives)).ToBe(0);
+  Expect<Boolean>(FileExists(OldArchive)).ToBe(False);
+  Expect<Boolean>(FileExists(NewArchive)).ToBe(True);
+end;
+
+procedure TPruneOrphans.TestUnchangedEntryPrunesNothing;
+var
+  Modules, Archives, Archive: string;
+  OldLock, NewLock: TResolvedArray;
+begin
+  SetupPruneDirs('unchanged', Modules, Archives);
+  ForceDirectories(Modules + '/foo');
+  Archive := Archives + '/foo-v1.0.0.tar.gz';
+  with TStringList.Create do
+  try
+    Text := 'fake tarball';
+    SaveToFile(Archive);
+  finally
+    Free;
+  end;
+
+  SetLength(OldLock, 1);
+  OldLock[0] := MakeEntry('foo', skGitHost, 'v1.0.0');
+  NewLock := Copy(OldLock);
+
+  Expect<Integer>(
+    PruneOrphanedPackages(OldLock, NewLock, Modules, Archives)).ToBe(0);
+  Expect<Boolean>(FileExists(Archive)).ToBe(True);
+  Expect<Boolean>(DirectoryExists(Modules + '/foo')).ToBe(True);
+end;
+
+procedure TPruneOrphans.SetupTests;
+begin
+  Test('a removed package loses its modules tree and archive',
+    TestRemovedPackagePrunesModulesAndArchive);
+  Test('a git-host → local re-point prunes the old archive',
+    TestKindChangeToLocalPrunesOldArchive);
+  Test('a version bump prunes the stale old archive only',
+    TestVersionBumpPrunesStaleArchive);
+  Test('an unchanged entry prunes nothing',
+    TestUnchangedEntryPrunesNothing);
+end;
+
 begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
     'LWPT.Core: SHA-256 NIST vectors'));
@@ -1811,6 +1969,8 @@ begin
     'LWPT.Core: MatchPathGlob'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
     'LWPT.Core: ApplyIncludeExclude'));
+  TestRunnerProgram.AddSuite(TPruneOrphans.Create(
+    'LWPT.Install: PruneOrphanedPackages'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

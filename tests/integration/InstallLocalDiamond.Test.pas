@@ -44,7 +44,8 @@ uses
 
   LWPT.Command.Install,
   LWPT.Core,
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  Tests.Fixtures;
 
 type
   TInstallLocalDiamond = class(TTestSuite)
@@ -120,34 +121,12 @@ begin
   end;
 end;
 
-procedure DiamondRecursiveDelete(const APath: string);
-var
-  SR: TSearchRec;
-  Base: string;
-begin
-  if not DirectoryExists(APath) then Exit;
-  Base := IncludeTrailingPathDelimiter(APath);
-  if FindFirst(Base + '*', faAnyFile, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) <> 0 then
-          DiamondRecursiveDelete(Base + SR.Name)
-        else
-          DeleteFile(Base + SR.Name);
-      until FindNext(SR) <> 0;
-    finally
-      FindClose(SR);
-    end;
-  RemoveDir(APath);
-end;
-
 procedure DiamondInstallToScratch(const ARepoRoot, AScratch, ARoot: string);
 const
   PKGS: array[0..3] of string = ('root', 'a', 'b', 'c');
 var i: Integer;
 begin
-  DiamondRecursiveDelete(AScratch);
+  RecursiveDelete(AScratch);
   ForceDirectories(AScratch);
   for i := Low(PKGS) to High(PKGS) do
     DiamondRecursiveCopy(
@@ -274,11 +253,11 @@ var
   {$ENDIF}
 begin
   ModulePath := FRoot + '/.lwpt/modules/branch-a';
-  DiamondRecursiveDelete(ModulePath);
+  RecursiveDelete(ModulePath);
 
   {$IFDEF UNIX}
   MissingTargetPath := FScratch + '/missing-branch-a-target';
-  DiamondRecursiveDelete(MissingTargetPath);
+  RecursiveDelete(MissingTargetPath);
   if FileExists(MissingTargetPath) then
     DeleteFile(MissingTargetPath);
   Expect<Integer>(FpSymlink(
@@ -288,7 +267,7 @@ begin
 
   {$IFDEF MSWINDOWS}
   TargetPath := FScratch + '/missing-junction-target';
-  DiamondRecursiveDelete(TargetPath);
+  RecursiveDelete(TargetPath);
   ForceDirectories(TargetPath);
   P := TProcess.Create(nil);
   try
@@ -303,7 +282,7 @@ begin
   finally
     P.Free;
   end;
-  DiamondRecursiveDelete(TargetPath);
+  RecursiveDelete(TargetPath);
   {$ENDIF}
 
   CmdInstall('lwpt.toml', False);
@@ -314,8 +293,8 @@ procedure TInstallLocalDiamond.TestManifestPathInstallUsesManifestDirectory;
 var
   OldDir, Cfg: string;
 begin
-  DiamondRecursiveDelete(FRoot + '/.lwpt');
-  DiamondRecursiveDelete(FScratch + '/.lwpt');
+  RecursiveDelete(FRoot + '/.lwpt');
+  RecursiveDelete(FScratch + '/.lwpt');
   if FileExists(FRoot + '/lwpt.lock') then DeleteFile(FRoot + '/lwpt.lock');
   if FileExists(FRoot + '/lwpt.cfg') then DeleteFile(FRoot + '/lwpt.cfg');
   if FileExists(FScratch + '/lwpt.lock') then DeleteFile(FScratch + '/lwpt.lock');

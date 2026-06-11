@@ -54,6 +54,7 @@ function  InstantFPCExecutable: string;
 procedure AddEnvUnitPathParameters(AParameters: TStrings);
 function  NativePath(const APath: string): string;
 
+function  TomlEscape(const S: string): string;
 function  TomlGet(ANode: TTOMLNode; const AKey: string): TTOMLNode;
 function  TomlIsString(ANode: TTOMLNode): Boolean;
 function  TomlIsInt(ANode: TTOMLNode): Boolean;
@@ -158,6 +159,25 @@ end;
   (record pointer). Lookup uses TOrderedStringMap.TryGetValue which
   is O(1) average and preserves insertion order for iteration.
   =========================================================================== }
+{ TOML basic-string escaping for every LWPT writer (lockfile, manifest
+  edits). One implementation so escaping rules can't drift between the
+  machine-written and user-edited files. }
+function TomlEscape(const S: string): string;
+var i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+    case S[i] of
+      '"' : Result := Result + '\"';
+      '\' : Result := Result + '\\';
+      #9  : Result := Result + '\t';
+      #10 : Result := Result + '\n';
+      #13 : Result := Result + '\r';
+    else
+      Result := Result + S[i];
+    end;
+end;
+
 function TomlGet(ANode: TTOMLNode; const AKey: string): TTOMLNode;
 begin
   Result := nil;

@@ -1,13 +1,15 @@
 # LWPT — lightweight Pascal toolkit
 
 A small, dependency-light toolkit for FreePascal / Delphi projects.
-One executable, seven subcommands, driven by a single `lwpt.toml`
+One executable, nine subcommands, driven by a single `lwpt.toml`
 manifest. Zero-install by default — `git clone && fpc @lwpt.cfg`
 builds a project without running `lwpt install` first.
 
 ```text
 lwpt init      scaffold a new project (manifest + source dir + sample entry)
 lwpt install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
+lwpt add       add a dependency to lwpt.toml + install it   [--name <name>]
+lwpt remove    remove dependencies from lwpt.toml + prune their modules
 lwpt build     compile manifest targets   [--mode dev|release] [--clean]
 lwpt format    format uses-clauses + identifiers   [--check]
 lwpt test      discover, compile and run *.Test.pas files
@@ -41,6 +43,8 @@ bootstrap.bat      # Windows
 ./build/lwpt test               # discover/compile/run *.Test.pas
 ./build/lwpt install            # fetch any new deps
 ./build/lwpt install --frozen   # CI: verify, refuse to update
+./build/lwpt add owner/repo@^1.0    # add a dependency + install it
+./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt repair             # recover from a crashed install
 ```
 

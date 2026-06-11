@@ -1,9 +1,11 @@
 { LWPT — lightweight Pascal toolkit.
 
-  One executable, seven subcommands sharing a common core (manifest,
+  One executable, nine subcommands sharing a common core (manifest,
   TOML, resolver, cfg emitter):
     init      scaffold a new project (manifest + source dir + sample entry)
     install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
+    add       add a dependency to lwpt.toml + install it (ADR-0019)
+    remove    remove dependencies from lwpt.toml + prune their modules
     build     compile manifest [build] entries
     format    format uses-clauses and identifiers (--check to verify only)
     test      discover + compile + run *.Test.pas files
@@ -31,10 +33,12 @@ uses
 
   CLI.Options,
   CLI.Subcommands,
+  LWPT.Command.Add,
   LWPT.Command.Build,
   LWPT.Command.Format,
   LWPT.Command.Init,
   LWPT.Command.Install,
+  LWPT.Command.Remove,
   LWPT.Command.Repair,
   LWPT.Command.Run,
   LWPT.Command.Testing,
@@ -64,6 +68,64 @@ begin
     on E: Exception do
     begin
       WriteLn(ErrOutput, ErrPrefix('install'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
+{ --- add (ADR-0019) ------------------------------------------------------ }
+function HandleAdd(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  NameOverride : string;
+  i : Integer;
+begin
+  if APositionals.Count <> 1 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('add'),
+      'expected exactly one <source[@version]> argument');
+    Exit(1);
+  end;
+  NameOverride := '';
+  for i := 0 to High(AOptions) do
+    if SameText(AOptions[i].LongName, 'name')
+       and (AOptions[i] is TStringOption) then
+      NameOverride := TStringOption(AOptions[i]).ValueOr('');
+  try
+    CmdAdd(MANIFEST_FILE, APositionals[0], NameOverride);
+    Result := 0;
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('add'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
+{ --- remove (ADR-0019) --------------------------------------------------- }
+function HandleRemove(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  Names : array of string;
+  i : Integer;
+begin
+  if APositionals.Count = 0 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('remove'),
+      'expected at least one dependency name');
+    Exit(1);
+  end;
+  SetLength(Names, APositionals.Count);
+  for i := 0 to APositionals.Count - 1 do
+    Names[i] := APositionals[i];
+  try
+    CmdRemove(MANIFEST_FILE, Names);
+    Result := 0;
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('remove'), E.Message);
       Result := 1;
     end;
   end;
@@ -263,8 +325,8 @@ end;
 { --- registration -------------------------------------------------------- }
 var
   Registry : TSubcommandRegistry;
-  InstallOpts, TestOpts, BuildOpts, InitOpts, RunOpts,
-    FormatOpts, RepairOpts : TOptionArray;
+  InstallOpts, AddOpts, RemoveOpts, TestOpts, BuildOpts, InitOpts,
+    RunOpts, FormatOpts, RepairOpts : TOptionArray;
 begin
   if HandleTopLevelFlags then
   begin
@@ -280,6 +342,20 @@ begin
     Registry.Add(TSubcommand.Create('install',
       'Resolve and fetch dependencies', '[--frozen]',
       @HandleInstall, InstallOpts));
+
+    SetLength(AddOpts, 1);
+    AddOpts[0] := TStringOption.Create('name',
+      'Dependency name in the manifest (default: the source''s last path segment)');
+    Registry.Add(TSubcommand.Create('add',
+      'Add a dependency to the manifest and install it',
+      '<source[@version]> [--name <name>]',
+      @HandleAdd, AddOpts));
+
+    SetLength(RemoveOpts, 0);
+    Registry.Add(TSubcommand.Create('remove',
+      'Remove dependencies from the manifest and prune their modules',
+      '<name> [<name>...]',
+      @HandleRemove, RemoveOpts));
 
     SetLength(BuildOpts, 2);
     BuildOpts[0] := TStringOption.Create('mode',

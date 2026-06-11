@@ -43,12 +43,15 @@ type
     PackageCount : Integer;
     LockfilePath : string;
     CfgPath      : string;
+    Resolved     : TResolvedArray;  { the materialized/verified graph }
   end;
 
 function  LoadLockfile(const APath: string): TResolvedArray;
 function  ExtractArchive(const AArchivePath, ADest: string; const ASubDir: string = ''): Integer;
 procedure VerifyAgainstLockfile(const AResolved: array of TResolved; const ALockEntries: array of TResolved);
+function  PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved; const AModulesRoot, AArchivesRoot: string): Integer;
 function  RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode): TInstallTransactionResult;
+function  RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
 
 implementation
 
@@ -1241,21 +1244,8 @@ end;
   Mirrors skills-lock.json field names. Round-trips through the TOML reader
   above, so `gpm install --frozen` can re-read it with no extra parser.)
   =========================================================================== }
-function TomlEscape(const S: string): string;
-var i: Integer;
-begin
-  Result := '';
-  for i := 1 to Length(S) do
-    case S[i] of
-      '"' : Result := Result + '\"';
-      '\' : Result := Result + '\\';
-      #9  : Result := Result + '\t';
-      #10 : Result := Result + '\n';
-      #13 : Result := Result + '\r';
-    else
-      Result := Result + S[i];
-    end;
-end;
+{ TomlEscape lives in LWPT.Core — shared with LWPT.ManifestEdit so the
+  lockfile writer and the manifest editor can't drift apart. }
 
 procedure WriteLock(const APath, ATmpRoot: string;
   const AResolved: array of TResolved);
@@ -2177,12 +2167,96 @@ begin
     end;
 end;
 
-function RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode): TInstallTransactionResult;
+{ Lockfile-diff pruning (ADR-0019). The install transaction regenerates
+  lwpt.lock + lwpt.cfg from the manifest but never deletes module trees,
+  so a dep leaving the graph would otherwise stay in the committed
+  .lwpt/ state forever. `lwpt add` / `lwpt remove` call this after their
+  transaction with the previous + freshly written lockfile entries:
+  a name present before and absent now loses its modules tree and its
+  cached archive; a name whose resolved ref changed loses the stale old
+  archive. Lives here (not in the command units) because the archive
+  naming scheme is ArchivePathForRef's private knowledge. }
+function PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved;
+  const AModulesRoot, AArchivesRoot: string): Integer;
+
+  function FindNewEntry(const AName: string; out AOut: TResolved): Boolean;
+  var k: Integer;
+  begin
+    for k := 0 to High(ANewLock) do
+      if SameText(ANewLock[k].Name, AName) then
+      begin
+        AOut := ANewLock[k];
+        Exit(True);
+      end;
+    Result := False;
+  end;
+
+  procedure DeleteArchiveIfPresent(const APath: string);
+  begin
+    if (APath <> '') and FileExists(APath) then
+      if SysUtils.DeleteFile(APath) then
+        WriteLn('pruned ', APath);
+  end;
+
+var
+  i: Integer;
+  Kept: TResolved;
+  ModDir, OldArchive, NewArchive: string;
+begin
+  Result := 0;
+  for i := 0 to High(AOldLock) do
+  begin
+    if FindNewEntry(AOldLock[i].Name, Kept) then
+    begin
+      { Still in the graph — but an updated spec may have moved it to a
+        new resolved ref (or to a local path, which has no archive at
+        all), leaving the old version's archive behind. Only the OLD
+        side must be non-local for there to be anything to reap. }
+      if AOldLock[i].SrcKind = skLocal then Continue;
+      OldArchive := ArchivePathForRef(AArchivesRoot, AOldLock[i].Name,
+        AOldLock[i].SrcKind, AOldLock[i].Version);
+      if Kept.SrcKind = skLocal then
+        NewArchive := ''
+      else
+        NewArchive := ArchivePathForRef(AArchivesRoot, Kept.Name,
+          Kept.SrcKind, Kept.Version);
+      if OldArchive <> NewArchive then
+        DeleteArchiveIfPresent(OldArchive);
+      Continue;
+    end;
+
+    { Gone from the graph — reap the extracted tree (or monorepo link;
+      WipeDir removes a symlink/junction without traversing it) + the
+      cached archive. }
+    ModDir := IncludeTrailingPathDelimiter(AModulesRoot) + AOldLock[i].Name;
+    if DirectoryExists(ModDir) then
+    begin
+      WipeDir(ModDir);
+      WriteLn('pruned ', ModDir);
+    end;
+    if AOldLock[i].SrcKind <> skLocal then
+      DeleteArchiveIfPresent(ArchivePathForRef(AArchivesRoot,
+        AOldLock[i].Name, AOldLock[i].SrcKind, AOldLock[i].Version));
+    Inc(Result);
+  end;
+end;
+
+{ The shared transaction body. AManifestLines <> nil is the manifest-
+  mutation flow (ADR-0019, `lwpt add` / `lwpt remove`): the previous
+  lockfile is snapshotted right after the lock is acquired, the edited
+  lwpt.toml is committed (atomically) after lockfile + cfg, and the
+  lockfile diff prunes orphaned module trees + archives — all INSIDE
+  the cross-process install lock, so a concurrent install can neither
+  observe a manifest/lockfile mismatch nor race the prune deletions.
+  AManifestLines = nil is the plain `lwpt install` flow. }
+function RunInstallTransactionCore(const AContext: TManifestContext;
+  const AMode: TInstallTransactionMode;
+  const AManifestLines: TStringList): TInstallTransactionResult;
 var
   Man : TManifest;
   R   : TResolution;
-  Resolved : array of TResolved;
-  LockEntries : TResolvedArray;
+  Resolved : TResolvedArray;
+  LockEntries, OldLock : TResolvedArray;
   Lock : TInstallLock;
   ModulesRoot, ArchivesRoot, TmpRoot, CfgPath, LockPath, LockfilePath : string;
   i, j : Integer;
@@ -2202,6 +2276,12 @@ begin
   try
     if DirectoryExists(TmpRoot) then
       WipeDir(TmpRoot);
+
+    { Mutation flow: snapshot the pre-transaction lock entries for the
+      orphan diff before WriteLock overwrites them. }
+    OldLock := nil;
+    if (AManifestLines <> nil) and FileExists(LockfilePath) then
+      OldLock := LoadLockfile(LockfilePath);
 
     R := Default(TResolution);
     WriteLn('resolving dependency graph (', Length(Man.Deps), ' direct)...');
@@ -2251,6 +2331,7 @@ begin
       Result.PackageCount := Length(Resolved);
       Result.LockfilePath := LockfilePath;
       Result.CfgPath := CfgPath;
+      Result.Resolved := Resolved;
       Exit;
     end;
 
@@ -2258,12 +2339,30 @@ begin
     WriteCfg(CfgPath, TmpRoot, Resolved, Man, AContext.ProjectRoot);
     WriteLn('wrote ', LWPT.Core.LOCKFILE, ' (', Length(Resolved),
             ' packages) and ', CfgPath);
+
+    if AManifestLines <> nil then
+    begin
+      AtomicWriteText(ExpandFileName(AContext.Path), TmpRoot, AManifestLines);
+      PruneOrphanedPackages(OldLock, Resolved, ModulesRoot, ArchivesRoot);
+    end;
+
     Result.PackageCount := Length(Resolved);
     Result.LockfilePath := LockfilePath;
     Result.CfgPath := CfgPath;
+    Result.Resolved := Resolved;
   finally
     Lock.Free;
   end;
+end;
+
+function RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode): TInstallTransactionResult;
+begin
+  Result := RunInstallTransactionCore(AContext, AMode, nil);
+end;
+
+function RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
+begin
+  Result := RunInstallTransactionCore(AContext, itmMaterialize, AManifestLines);
 end;
 
 end.
