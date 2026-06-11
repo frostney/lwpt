@@ -74,7 +74,8 @@ function HandleBuild(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
   Release, Clean : Boolean;
-  TargetName, ModeVal : string;
+  ModeVal : string;
+  TargetNames : array of string;
   i : Integer;
 begin
   Release := False;          { dev is the default }
@@ -98,11 +99,11 @@ begin
       end;
     end;
   end;
-  TargetName := '';
-  if APositionals.Count > 0 then
-    TargetName := APositionals[0];
+  SetLength(TargetNames, APositionals.Count);
+  for i := 0 to APositionals.Count - 1 do
+    TargetNames[i] := APositionals[i];
   try
-    Result := CmdBuild(MANIFEST_FILE, TargetName, Release, Clean);
+    Result := CmdBuild(MANIFEST_FILE, TargetNames, Release, Clean);
   except
     on E: Exception do
     begin
@@ -286,7 +287,7 @@ begin
     BuildOpts[1] := TFlagOption.Create('clean',
       'Remove prior build artefacts and force a full rebuild');
     Registry.Add(TSubcommand.Create('build',
-      'Compile manifest targets', '[target] [--mode dev|release] [--clean]',
+      'Compile manifest targets', '[target...] [--mode dev|release] [--clean]',
       @HandleBuild, BuildOpts));
 
     SetLength(FormatOpts, 1);

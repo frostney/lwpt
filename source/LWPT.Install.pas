@@ -1808,6 +1808,81 @@ begin
     end;
 end;
 
+{ Locate a module's own manifest inside its extracted/copied tree.
+
+  Include-filtered deps keep their repo-relative path prefix (the
+  filter never re-roots the tree — committed zero-install state stays
+  byte-identical to what the filter produced), so a monorepo package
+  fetched via include = ["packages/<name>/**"] carries its lwpt.toml
+  at <UnitDir>/packages/<name>/lwpt.toml, not at the module root.
+
+  The module's manifest is the SHALLOWEST lwpt.toml in the tree
+  (breadth-first; the root wins outright when present). Two manifests
+  at the same minimal depth are ambiguous — there is no defensible
+  winner, so we return False and the caller falls back to the
+  manifest-less behavior (emit the module root, walk no deps).
+  Hidden dirs (leading '.') are not descended into. On success,
+  ARelDir is the manifest's directory relative to AUnitDir with '/'
+  separators ('' when the manifest sits at the module root). }
+function FindModuleManifest(const AUnitDir: string;
+  out ARelDir: string): Boolean;
+var
+  Current, Next, Hits: TStringList;
+  SR: TSearchRec;
+  i: Integer;
+  Base, RelPrefix: string;
+begin
+  Result := False;
+  ARelDir := '';
+  if not DirectoryExists(AUnitDir) then Exit;
+
+  Current := TStringList.Create;
+  Next    := TStringList.Create;
+  Hits    := TStringList.Create;
+  try
+    Current.Add('');
+    while Current.Count > 0 do
+    begin
+      Hits.Clear;
+      Next.Clear;
+      for i := 0 to Current.Count - 1 do
+      begin
+        Base := IncludeTrailingPathDelimiter(AUnitDir);
+        RelPrefix := Current[i];
+        if RelPrefix <> '' then
+          Base := Base + RelPrefix + '/';
+        if FileExists(Base + MANIFEST_FILE) then
+          Hits.Add(RelPrefix);
+        if FindFirst(Base + '*', faAnyFile, SR) = 0 then
+          try
+            repeat
+              if (SR.Name = '.') or (SR.Name = '..') then Continue;
+              if (SR.Name <> '') and (SR.Name[1] = '.') then Continue;
+              if (SR.Attr and faDirectory) = 0 then Continue;
+              if RelPrefix = '' then
+                Next.Add(SR.Name)
+              else
+                Next.Add(RelPrefix + '/' + SR.Name);
+            until FindNext(SR) <> 0;
+          finally
+            FindClose(SR);
+          end;
+      end;
+      if Hits.Count = 1 then
+      begin
+        ARelDir := Hits[0];
+        Exit(True);
+      end;
+      if Hits.Count > 1 then Exit(False);
+      Current.Assign(Next);
+    end;
+  finally
+    Current.Free;
+    Next.Free;
+    Hits.Free;
+  end;
+end;
+
 { The BFS itself. Mutates R; fetches+extracts each new package unless
   Frozen. ModulesRoot is where extracted dep trees land
   (.lwpt/modules/<dep>/ by default); ArchivesRoot is where the source
@@ -1835,7 +1910,7 @@ var
   IsNew : Boolean;
   Item  : TWorkItem;
   UnitDir, Archive, ArchiveHash, ResolvedURL, ChildManifestPath,
-    ExtractTmp : string;
+    ManifestRelDir, ExtractTmp : string;
   ChildMan : TManifest;
 
   procedure CopyCustomSources(const ASrc: TCustomSourceArray;
@@ -1958,10 +2033,16 @@ begin
     if DirectoryExists(UnitDir) then
       R.Nodes[idx].Hash := HashTree(UnitDir);
 
-    { read the fetched package's own manifest and enqueue ITS deps }
-    ChildManifestPath := IncludeTrailingPathDelimiter(UnitDir) + MANIFEST_FILE;
-    if FileExists(ChildManifestPath) then
+    { read the fetched package's own manifest and enqueue ITS deps.
+      The manifest is the shallowest lwpt.toml in the module tree —
+      include-filtered deps keep their repo-relative prefix, so it
+      may sit below the module root (see FindModuleManifest). }
+    if FindModuleManifest(UnitDir, ManifestRelDir) then
     begin
+      ChildManifestPath := IncludeTrailingPathDelimiter(UnitDir);
+      if ManifestRelDir <> '' then
+        ChildManifestPath := ChildManifestPath + ManifestRelDir + '/';
+      ChildManifestPath := ChildManifestPath + MANIFEST_FILE;
       { AIsRoot=False — supply-chain defense per ADR-0011 §"Supply-
         chain posture". Dep manifests' hook sections are silently
         dropped; unknown-section warnings are suppressed (CI noise
@@ -1971,10 +2052,16 @@ begin
       { Copy the dep's units list into the resolved node so the cfg
         emitter knows which subdirs hold the .pas files. Without
         this, -Fu would point at UnitDir's top level and miss the
-        units in <UnitDir>/source/ (or wherever the dep declared). }
+        units in <UnitDir>/source/ (or wherever the dep declared).
+        A nested manifest's units dirs are relative to ITS directory,
+        so the emitted subdirs carry the manifest's prefix. }
       SetLength(R.Nodes[idx].UnitSubdirs, Length(ChildMan.Units));
       for i := 0 to High(ChildMan.Units) do
-        R.Nodes[idx].UnitSubdirs[i] := ChildMan.Units[i];
+        if ManifestRelDir = '' then
+          R.Nodes[idx].UnitSubdirs[i] := ChildMan.Units[i]
+        else
+          R.Nodes[idx].UnitSubdirs[i] :=
+            ManifestRelDir + '/' + ChildMan.Units[i];
       for i := 0 to High(ChildMan.Deps) do
         Enqueue(ChildMan.Deps[i], Item.Dep.Name, ChildMan.CustomSources);
     end;

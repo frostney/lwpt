@@ -53,6 +53,29 @@ type
     procedure TestGlobMatchingZeroFilesIsSilent;
     procedure TestHiddenFilesSkipped;
     procedure TestNonFormattableExtensionsFiltered;
+    procedure TestExplicitDotSegmentReachesHiddenDir;
+    procedure TestExplicitDotFileGlobReachesHiddenDir;
+    procedure TestWildcardSegmentsStillSkipHiddenDirs;
+  end;
+
+  { [format].exclude must subtract files regardless of how they
+    entered the scope — including the [package].units seed. The
+    motivating case is a units entry pointing into .lwpt/ (vendored
+    module sources a consumer compiles directly): an exclude glob
+    spelled ".lwpt/**" must carve those seeded files back out, which
+    requires the glob walker to enter the hidden dir it explicitly
+    names. Runs the full CmdFormat composition in check mode against
+    a scratch project. }
+  TFormatUnitsSeedExclude = class(TTestSuite)
+  private
+    FOrigDir, FScratch: string;
+  protected
+    procedure BeforeAll; override;
+    procedure AfterAll;  override;
+  public
+    procedure SetupTests; override;
+    procedure TestSeededHiddenFileIsInScopeWithoutExclude;
+    procedure TestExcludeCarvesUnitsSeededHiddenFile;
   end;
 
 const
@@ -330,6 +353,8 @@ begin
   WriteTextFile(SCOPE_FIXTURE + '/.hidden.pas',            'unit Hidden; end.'#10);
   WriteTextFile(SCOPE_FIXTURE + '/sub/middle.pas',         'unit Middle; end.'#10);
   WriteTextFile(SCOPE_FIXTURE + '/sub/deep/leaf.pas',      'unit Leaf; end.'#10);
+  WriteTextFile(SCOPE_FIXTURE + '/.lwpt/modules/dep/source/Vendored.pas',
+                'unit Vendored; end.'#10);
 end;
 
 function CountSuffix(const AList: TStringList; const ASuffix: string): Integer;
@@ -507,6 +532,48 @@ begin
   end;
 end;
 
+procedure TFormatScopeExpansion.TestExplicitDotSegmentReachesHiddenDir;
+var List: TStringList;
+begin
+  List := TStringList.Create;
+  try
+    { A pattern segment that itself starts with '.' names the hidden
+      dir explicitly — the walker must enter it. Matches shell glob
+      convention (`*` hides dotfiles; `.lwpt/*` does not). }
+    ExpandFormatPattern(SCOPE_FIXTURE + '/.lwpt/**', List, True);
+    Expect<Boolean>(ListContainsSuffix(List, 'Vendored.pas')).ToBe(True);
+  finally
+    List.Free;
+  end;
+end;
+
+procedure TFormatScopeExpansion.TestExplicitDotFileGlobReachesHiddenDir;
+var List: TStringList;
+begin
+  List := TStringList.Create;
+  try
+    ExpandFormatPattern(SCOPE_FIXTURE + '/.lwpt/**/*.pas', List, True);
+    Expect<Boolean>(ListContainsSuffix(List, 'Vendored.pas')).ToBe(True);
+  finally
+    List.Free;
+  end;
+end;
+
+procedure TFormatScopeExpansion.TestWildcardSegmentsStillSkipHiddenDirs;
+var List: TStringList;
+begin
+  List := TStringList.Create;
+  try
+    { Without the explicit dot, hidden dirs stay invisible: a plain
+      recursive glob never descends into .lwpt/. }
+    ExpandFormatPattern(SCOPE_FIXTURE + '/**/*.pas', List, True);
+    Expect<Boolean>(ListContainsSuffix(List, 'Vendored.pas')).ToBe(False);
+    Expect<Boolean>(ListContainsSuffix(List, '.hidden.pas')).ToBe(False);
+  finally
+    List.Free;
+  end;
+end;
+
 procedure TFormatScopeExpansion.SetupTests;
 begin
   Test('plain dir shorthand: tests → tests/*.{pas,inc,dpr,lpr}, no recursion',
@@ -529,12 +596,95 @@ begin
     TestHiddenFilesSkipped);
   Test('non-formattable extensions filtered after glob match',
     TestNonFormattableExtensionsFiltered);
+  Test('explicit .dir segment enters the hidden dir it names',
+    TestExplicitDotSegmentReachesHiddenDir);
+  Test('explicit .dir segment composes with trailing file globs',
+    TestExplicitDotFileGlobReachesHiddenDir);
+  Test('wildcard segments still skip hidden dirs',
+    TestWildcardSegmentsStillSkipHiddenDirs);
+end;
+
+{ ───────── TFormatUnitsSeedExclude ───────── }
+
+procedure TFormatUnitsSeedExclude.BeforeAll;
+const
+  NEEDS_FORMAT =
+    'unit Vendored;'#10#10
+    + 'interface'#10#10
+    + 'uses'#10
+    + '  SysUtils,'#10
+    + '  Classes;'#10#10
+    + 'implementation'#10#10
+    + 'end.'#10;
+  ALREADY_FORMATTED =
+    'unit Good;'#10#10
+    + 'interface'#10#10
+    + 'uses'#10
+    + '  Classes,'#10
+    + '  SysUtils;'#10#10
+    + 'implementation'#10#10
+    + 'end.'#10;
+begin
+  FOrigDir  := GetCurrentDir;
+  FScratch  := ExpandFileName(
+    FOrigDir + '/build/tests/fixtures/format-units-exclude');
+
+  { Same project twice: one manifest with the exclude, one without.
+    The exclude-less variant proves the vendored file genuinely needs
+    formatting AND is seeded into scope by [package].units — so the
+    exclude test can't pass vacuously. }
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "format-units-exclude"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src", ".lwpt/modules/dep/source"]'#10
+    + #10
+    + '[format]'#10
+    + 'exclude = [".lwpt/**"]'#10);
+  WriteTextFile(FScratch + '/lwpt-noexclude.toml',
+      '[package]'#10
+    + 'name = "format-units-exclude"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src", ".lwpt/modules/dep/source"]'#10);
+  WriteTextFile(FScratch + '/src/Good.pas', ALREADY_FORMATTED);
+  WriteTextFile(FScratch + '/.lwpt/modules/dep/source/Vendored.pas',
+    NEEDS_FORMAT);
+
+  SetCurrentDir(FScratch);
+end;
+
+procedure TFormatUnitsSeedExclude.AfterAll;
+begin
+  SetCurrentDir(FOrigDir);
+end;
+
+procedure TFormatUnitsSeedExclude.TestSeededHiddenFileIsInScopeWithoutExclude;
+begin
+  { Sanity: the units seed reaches into .lwpt/ and the vendored file
+    needs formatting — check mode exits 1. }
+  Expect<Integer>(CmdFormat('lwpt-noexclude.toml', True)).ToBe(1);
+end;
+
+procedure TFormatUnitsSeedExclude.TestExcludeCarvesUnitsSeededHiddenFile;
+begin
+  { With exclude = [".lwpt/**"] the seeded vendored file leaves the
+    scope; only the already-formatted src/Good.pas remains → exit 0. }
+  Expect<Integer>(CmdFormat('lwpt.toml', True)).ToBe(0);
+end;
+
+procedure TFormatUnitsSeedExclude.SetupTests;
+begin
+  Test('units seed reaching into .lwpt/ is in scope without exclude',
+    TestSeededHiddenFileIsInScopeWithoutExclude);
+  Test('[format].exclude carves units-seeded files out of scope',
+    TestExcludeCarvesUnitsSeededHiddenFile);
 end;
 
 begin
   TestRunnerProgram.AddSuite(TFormatIdempotence.Create('LWPT.Formatter: idempotence'));
   TestRunnerProgram.AddSuite(TFormatParamRename.Create('LWPT.Formatter: param-rename regression'));
   TestRunnerProgram.AddSuite(TFormatScopeExpansion.Create('LWPT.Formatter: scope expansion (ADR-0007)'));
+  TestRunnerProgram.AddSuite(TFormatUnitsSeedExclude.Create('LWPT.Formatter: [format].exclude vs units seed'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

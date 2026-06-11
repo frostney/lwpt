@@ -143,7 +143,8 @@ Plain dir names are shorthand for `<dir>/*.{pas,inc,dpr,lpr}` — **top-level on
 | Literal dir path that exists | Expanded via plain-dir shorthand |
 | Literal path that doesn't exist | Hard error (`EManifestError`) — literals assert presence |
 | Glob with zero matches | Silent — globs validly resolve to nothing |
-| Hidden file (`.foo.pas`) | Skipped (matches shell convention) |
+| Hidden file/dir reached via a wildcard segment (`*`, `**`, `?`) | Skipped (matches shell convention) |
+| Hidden file/dir named explicitly by a dot-prefixed segment (`.lwpt/**`) | Matched — naming the dot opts in (shell convention; lets `exclude = [".lwpt/**"]` carve out `[package].units` entries that point into `.lwpt/`) |
 | Case sensitivity | Case-sensitive everywhere |
 
 #### Composition

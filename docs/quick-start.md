@@ -112,6 +112,8 @@ testing = "frostney/lwpt-testing@^1.0.0"   # Phase 2 form, post-graduation
 testing = { source = "frostney/lwpt@^0.1.0", include = ["packages/testing/**"] }
 ```
 
+Include filters keep the repo-relative path prefix, so the filtered tree lands at `.lwpt/modules/testing/packages/testing/…`. That's fine: the resolver finds the package's `lwpt.toml` wherever it sits in the module tree (the shallowest one wins), reads its `units` array, and emits `-Fu`/`-Fi` paths relative to the module root — no extra configuration in the consumer manifest.
+
 ```toml
 # lwpt.toml — monorepo: packages/testing/ already discovered
 [workspaces]

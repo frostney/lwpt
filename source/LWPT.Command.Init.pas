@@ -231,7 +231,7 @@ begin
     CmdInstall(MANIFEST_FILE, False);
     WriteLn;
     WriteLn('--- ', PROGRAM_NAME, ' build ---');
-    CmdBuild(MANIFEST_FILE, '', False, False);
+    CmdBuild(MANIFEST_FILE, [], False, False);
     WriteLn;
     WriteLn('Run ./', BuildDir, '/', EntryName, ' to try it.');
   end

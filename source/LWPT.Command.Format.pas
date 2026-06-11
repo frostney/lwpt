@@ -42,7 +42,11 @@ uses
     literal (no glob chars) → either a file or a dir-shorthand expansion
 
   Plain dir shorthand: `tests` ≡ `tests/` ≡ `tests/*.{pas,inc,dpr,lpr}`
-  (top-level only). Hidden files / dirs (leading `.`) are always skipped.
+  (top-level only). Hidden files / dirs (leading `.`) are skipped by
+  wildcard segments; a segment that itself starts with `.` names the
+  hidden entry explicitly and matches it (shell glob convention —
+  needed so `exclude = [".lwpt/**"]` can carve out units entries that
+  point into .lwpt/).
 
   Missing literal paths → EManifestError. Missing glob matches → silent.
   =========================================================================== }
@@ -180,12 +184,17 @@ begin
     Exit;
   end;
 
-  { Plain segment (may contain * / ?). Match against entries at ABase. }
+  { Plain segment (may contain * / ?). Match against entries at ABase.
+    Hidden entries are skipped UNLESS the segment itself starts with
+    '.' — naming the hidden dir/file explicitly opts in, matching
+    shell glob convention (`*` hides dotfiles; `.lwpt/*` does not).
+    This is what lets [format].exclude carve [package].units entries
+    that point into .lwpt/ back out of the scope. }
   if FindFirst(IncludeTrailingPathDelimiter(ABase) + '*', faAnyFile, SR) = 0 then
     try
       repeat
         if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if IsHiddenName(SR.Name) then Continue;
+        if IsHiddenName(SR.Name) and not IsHiddenName(Seg) then Continue;
         if not MatchSegment(Seg, SR.Name) then Continue;
         EntryPath := IncludeTrailingPathDelimiter(ABase) + SR.Name;
         IsDir := (SR.Attr and faDirectory) <> 0;

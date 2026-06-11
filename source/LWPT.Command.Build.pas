@@ -7,7 +7,8 @@ unit LWPT.Command.Build;
 
 interface
 
-function CmdBuild(const AManifestPath, ATargetName: string; ARelease, AClean: Boolean): Integer;
+function CmdBuild(const AManifestPath: string;
+  const ATargetNames: array of string; ARelease, AClean: Boolean): Integer;
 
 implementation
 
@@ -144,11 +145,21 @@ begin
   end;
 end;
 
-function CmdBuild(const AManifestPath, ATargetName: string;
-  ARelease, AClean: Boolean): Integer;
+{ Does any entry of ANames match AName (case-insensitive)? }
+function NameListed(const AName: string;
+  const ANames: array of string): Boolean;
+var i: Integer;
+begin
+  for i := 0 to High(ANames) do
+    if SameText(ANames[i], AName) then Exit(True);
+  Result := False;
+end;
+
+function CmdBuild(const AManifestPath: string;
+  const ATargetNames: array of string; ARelease, AClean: Boolean): Integer;
 var
   Man : TManifest;
-  i, Built, Failed : Integer;
+  i, j, Built, Failed, Unknown : Integer;
   Matched : Boolean;
   ModeStr : string;
 begin
@@ -159,6 +170,27 @@ begin
     WriteLn('no [build] entries defined in ', AManifestPath);
     Exit(1);
   end;
+
+  { Validate every requested name BEFORE any hook or compile runs —
+    a typo in one of several names must not half-build the list. }
+  Unknown := 0;
+  for j := 0 to High(ATargetNames) do
+  begin
+    Matched := False;
+    for i := 0 to High(Man.Targets) do
+      if SameText(ATargetNames[j], Man.Targets[i].Name) then
+      begin
+        Matched := True;
+        Break;
+      end;
+    if not Matched then
+    begin
+      WriteLn(ErrOutput, 'no target named "', ATargetNames[j], '" in ',
+        AManifestPath);
+      Inc(Unknown);
+    end;
+  end;
+  if Unknown > 0 then Exit(1);
 
   if ARelease then ModeStr := 'release' else ModeStr := 'dev';
   if AClean then ModeStr := ModeStr + ', clean';
@@ -171,14 +203,13 @@ begin
 
   GenerateVersionInclude(Man);
 
-  Built := 0; Failed := 0; Matched := False;
+  Built := 0; Failed := 0;
   for i := 0 to High(Man.Targets) do
   begin
-    { if a target name was given, build only that one }
-    if (ATargetName <> '')
-       and (not SameText(ATargetName, Man.Targets[i].Name)) then
+    { if target names were given, build only those (manifest order) }
+    if (Length(ATargetNames) > 0)
+       and (not NameListed(Man.Targets[i].Name, ATargetNames)) then
       Continue;
-    Matched := True;
     { Per-target prebuild — fires immediately before this target's
       fpc invocation (e.g. version-stamp, codegen for this target). }
     RunHooks('prebuild:' + Man.Targets[i].Name,
@@ -191,12 +222,6 @@ begin
       we want sign/strip/package even on a stale binary. }
     RunHooks('postbuild:' + Man.Targets[i].Name,
       Man.Targets[i].PostBuild);
-  end;
-
-  if (ATargetName <> '') and (not Matched) then
-  begin
-    WriteLn(ErrOutput, 'no target named "', ATargetName, '" in ', AManifestPath);
-    Exit(1);
   end;
 
   { Whole-build postbuild — last thing before we exit. Fires even
