@@ -117,17 +117,31 @@ begin
     ALines.TextLineBreakStyle := tlbsLF;
 end;
 
-{ The [dependencies] header, allowing trailing whitespace + comment.
-  A commented-out header (init's "# [dependencies]" scaffold hint) is
-  not a header — Trim leaves the '#' in front. }
+{ The [dependencies] header in any TOML-equivalent spelling the parser
+  accepts: whitespace inside the brackets ("[ dependencies ]") and a
+  quoted key ('["dependencies"]'), plus trailing whitespace + comment.
+  Missing an equivalent form would make SetDependencyLine append a
+  SECOND [dependencies] table — a duplicate definition the next parse
+  hard-errors on. A commented-out header (init's "# [dependencies]"
+  scaffold hint) is not a header — Trim leaves the '#' in front. A
+  dotted header ([dependencies.x]) is not this section. }
 function IsDependenciesHeader(const ALine: string): Boolean;
-var T, Rest: string;
+var
+  T, Inner, Rest: string;
+  CloseIdx: Integer;
 begin
+  Result := False;
   T := Trim(ALine);
-  Result := Copy(T, 1, Length(DEPENDENCIES_SECTION) + 2)
-          = '[' + DEPENDENCIES_SECTION + ']';
-  if not Result then Exit;
-  Rest := Trim(Copy(T, Length(DEPENDENCIES_SECTION) + 3, MaxInt));
+  if (T = '') or (T[1] <> '[') then Exit;
+  CloseIdx := Pos(']', T);
+  if CloseIdx = 0 then Exit;
+  Inner := Trim(Copy(T, 2, CloseIdx - 2));
+  if (Length(Inner) >= 2)
+     and (((Inner[1] = '"') and (Inner[Length(Inner)] = '"'))
+          or ((Inner[1] = '''') and (Inner[Length(Inner)] = ''''))) then
+    Inner := Copy(Inner, 2, Length(Inner) - 2);
+  if Inner <> DEPENDENCIES_SECTION then Exit;
+  Rest := Trim(Copy(T, CloseIdx + 1, MaxInt));
   Result := (Rest = '') or (Rest[1] = '#');
 end;
 

@@ -30,6 +30,8 @@ type
     procedure TestReplacesExistingEntry;
     procedure TestMatchesQuotedKey;
     procedure TestRefusesInlineTableEntry;
+    procedure TestRecognisesSpacedHeader;
+    procedure TestRecognisesQuotedHeader;
     procedure TestEscapesBackslashesInSpec;
     procedure TestEscapesControlCharactersInSpec;
     procedure TestPreservesTrailingCommentOnReplace;
@@ -211,6 +213,43 @@ begin
   end;
 end;
 
+procedure TSetDependencyLineSuite.TestRecognisesSpacedHeader;
+var
+  SL: TStringList;
+  Replaced: Boolean;
+begin
+  { "[ dependencies ]" is TOML-equivalent to "[dependencies]" — missing
+    it would append a duplicate table the next parse rejects. }
+  SL := TStringList.Create;
+  try
+    SL.Add('[ dependencies ]');
+    SL.Add('leaf = "a/leaf@^1.0"');
+    SetDependencyLine(SL, 'leaf', 'a/leaf@^2.0', Replaced);
+    Expect<Boolean>(Replaced).ToBe(True);
+    Expect<Integer>(SL.Count).ToBe(2);
+    Expect<string>(SL[1]).ToBe('leaf = "a/leaf@^2.0"');
+  finally
+    SL.Free;
+  end;
+end;
+
+procedure TSetDependencyLineSuite.TestRecognisesQuotedHeader;
+var
+  SL: TStringList;
+  Replaced: Boolean;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Add('["dependencies"]');
+    SetDependencyLine(SL, 'leaf', 'a/leaf@^1.0', Replaced);
+    Expect<Boolean>(Replaced).ToBe(False);
+    Expect<Integer>(SL.Count).ToBe(2);
+    Expect<string>(SL[1]).ToBe('leaf = "a/leaf@^1.0"');
+  finally
+    SL.Free;
+  end;
+end;
+
 procedure TSetDependencyLineSuite.TestEscapesControlCharactersInSpec;
 var
   SL: TStringList;
@@ -278,6 +317,10 @@ begin
   Test('matches a quoted key', TestMatchesQuotedKey);
   Test('refuses to replace an inline-table entry',
     TestRefusesInlineTableEntry);
+  Test('recognises the "[ dependencies ]" spelling',
+    TestRecognisesSpacedHeader);
+  Test('recognises the quoted-key header spelling',
+    TestRecognisesQuotedHeader);
   Test('escapes backslashes in the written spec',
     TestEscapesBackslashesInSpec);
   Test('escapes control characters in the written spec',

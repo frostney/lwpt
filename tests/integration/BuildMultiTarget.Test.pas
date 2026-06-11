@@ -58,19 +58,6 @@ type
     {$ENDIF}
   end;
 
-procedure WriteTextFile(const APath, AContent: string);
-var SL: TStringList;
-begin
-  ForceDirectories(ExtractFileDir(APath));
-  SL := TStringList.Create;
-  try
-    SL.Text := AContent;
-    SL.SaveToFile(APath);
-  finally
-    SL.Free;
-  end;
-end;
-
 procedure TBuildMultiTarget.BeforeAll;
 const
   { Each program uses a shared unit so unit artefacts (.ppu) exist
@@ -82,7 +69,7 @@ begin
     GetCurrentDir + '/build/tests/tmp/build-multi-target');
   RecursiveDelete(FScratch);
 
-  WriteTextFile(FScratch + '/lwpt.toml',
+  WriteTestFile(FScratch + '/lwpt.toml',
       '[package]'#10
     + 'name = "multitarget"'#10
     + 'version = "0.0.0"'#10
@@ -92,12 +79,12 @@ begin
     + 'alpha = { source = "src/alpha.pas", output = "build/alpha" }'#10
     + 'beta = { source = "src/beta.pas", output = "build/beta" }'#10
     + 'gamma = { source = "src/gamma.pas", output = "build/gamma" }'#10);
-  WriteTextFile(FScratch + '/src/common.pas',
+  WriteTestFile(FScratch + '/src/common.pas',
       'unit common;'#10'{$mode delphi}{$H+}'#10'interface'#10
     + 'const GREETING = ''hi'';'#10'implementation'#10'end.'#10);
-  WriteTextFile(FScratch + '/src/alpha.pas', 'program alpha;'#10 + TRIVIAL);
-  WriteTextFile(FScratch + '/src/beta.pas',  'program beta;'#10  + TRIVIAL);
-  WriteTextFile(FScratch + '/src/gamma.pas', 'program gamma;'#10 + TRIVIAL);
+  WriteTestFile(FScratch + '/src/alpha.pas', 'program alpha;'#10 + TRIVIAL);
+  WriteTestFile(FScratch + '/src/beta.pas',  'program beta;'#10  + TRIVIAL);
+  WriteTestFile(FScratch + '/src/gamma.pas', 'program gamma;'#10 + TRIVIAL);
 end;
 
 procedure TBuildMultiTarget.WipeOutputs;
@@ -182,7 +169,7 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
   { Plant a stale file inside the target's artefact dir; --clean must
     wipe the whole dir (both modes) before rebuilding. }
-  WriteTextFile(FScratch + '/build/targets/alpha/dev/stale.sentinel', 'x');
+  WriteTestFile(FScratch + '/build/targets/alpha/dev/stale.sentinel', 'x');
   R := RunLwpt(['build', '--clean', 'alpha'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(
@@ -204,7 +191,7 @@ begin
   Bad := ExpandFileName(
     GetCurrentDir + '/build/tests/tmp/build-traversal-name');
   RecursiveDelete(Bad);
-  WriteTextFile(Bad + '/lwpt.toml',
+  WriteTestFile(Bad + '/lwpt.toml',
       '[package]'#10
     + 'name = "traversal"'#10
     + 'version = "0.0.0"'#10
@@ -212,9 +199,9 @@ begin
     + #10
     + '[build]'#10
     + '".." = { source = "src/alpha.pas", output = "build/alpha" }'#10);
-  WriteTextFile(Bad + '/src/alpha.pas',
+  WriteTestFile(Bad + '/src/alpha.pas',
     'program alpha;'#10'begin'#10'end.'#10);
-  WriteTextFile(Bad + '/build/survivor.txt', 'must not be wiped');
+  WriteTestFile(Bad + '/build/survivor.txt', 'must not be wiped');
 
   R := RunLwpt(['build', '--clean'], Bad);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
@@ -236,7 +223,7 @@ begin
   Bad := ExpandFileName(
     GetCurrentDir + '/build/tests/tmp/build-colliding-names');
   RecursiveDelete(Bad);
-  WriteTextFile(Bad + '/lwpt.toml',
+  WriteTestFile(Bad + '/lwpt.toml',
       '[package]'#10
     + 'name = "colliding"'#10
     + 'version = "0.0.0"'#10
@@ -245,7 +232,7 @@ begin
     + '[build]'#10
     + '"a:b" = { source = "src/alpha.pas", output = "build/one" }'#10
     + 'a_b = { source = "src/alpha.pas", output = "build/two" }'#10);
-  WriteTextFile(Bad + '/src/alpha.pas',
+  WriteTestFile(Bad + '/src/alpha.pas',
     'program alpha;'#10'begin'#10'end.'#10);
 
   R := RunLwpt(['build'], Bad);
@@ -264,7 +251,7 @@ begin
     reclaimed on --clean — and only on --clean. }
   WipeOutputs;
   Ghost := FScratch + '/build/targets/ghost';
-  WriteTextFile(Ghost + '/dev/stale.ppu', 'x');
+  WriteTestFile(Ghost + '/dev/stale.ppu', 'x');
 
   R := RunLwpt(['build', 'alpha'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
