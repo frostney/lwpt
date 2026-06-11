@@ -774,18 +774,27 @@ end;
 { Hash of an installed package: SHA-256 over every extracted file's bytes,
   visited in sorted relative-path order so the digest is stable regardless
   of filesystem enumeration order or which mirror served the archive.
-  This is the value that goes in lwpt.lock's computedHash. }
+  This is the value that goes in lwpt.lock's computedHash.
+
+  Directory symlinks are never descended into: a link cycle would recurse
+  forever, and the linked bytes are hashed where they really live. File
+  symlinks still contribute (their target's bytes are read through the
+  link, as before). faSymLink must be in the FindFirst mask or the
+  attribute is not reported and links look like plain directories. }
 procedure CollectFiles(const ARoot, ARel: string; AList: TStringList);
 var SR: TSearchRec; Path, RelPath: string;
 begin
   Path := IncludeTrailingPathDelimiter(ARoot + ARel);
-  if SysUtils.FindFirst(Path + '*', faAnyFile, SR) = 0 then
+  if SysUtils.FindFirst(Path + '*', faAnyFile or faSymLink, SR) = 0 then
   begin
     repeat
       if (SR.Name = '.') or (SR.Name = '..') then Continue;
       RelPath := ARel + SR.Name;
       if (SR.Attr and faDirectory) <> 0 then
-        CollectFiles(ARoot, RelPath + PathDelim, AList)
+      begin
+        if (SR.Attr and faSymLink) = 0 then
+          CollectFiles(ARoot, RelPath + PathDelim, AList);
+      end
       else
         AList.Add(RelPath);
     until SysUtils.FindNext(SR) <> 0;
