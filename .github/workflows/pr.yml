@@ -68,9 +68,14 @@ jobs:
       # in ci.yml on every platform — Q23=c — and are the slow tier.
       LWPT_SKIP_NETWORK: "1"
     steps:
-      - uses: actions/checkout@v5
+      # persist-credentials: false on every pr.yml checkout: these jobs
+      # build and EXECUTE the PR's own code (bootstrap, lwpt, tests),
+      # so no git auth material should sit in the workspace git config.
+      # No step here performs authenticated git operations.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install FPC
         run: |
@@ -105,10 +110,12 @@ jobs:
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
 
       - name: Lint Markdown
-        uses: DavidAnson/markdownlint-cli2-action@v19
+        uses: DavidAnson/markdownlint-cli2-action@05f32210e84442804257b2a6f20b273450ec8265 # v19.1.0
         with:
           globs: "**/*.md"
 
@@ -149,10 +156,12 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
 
       - name: Restore toolchain cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             fpc-cross
@@ -242,7 +251,7 @@ jobs:
           echo "OK: no libssl/libcrypto references in build/lwpt.exe"
 
       - name: Upload lwpt.exe for the native test job
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lwpt-pr-x86_64-win64
           retention-days: 1
@@ -269,7 +278,12 @@ jobs:
       # build-and-test job).
       LWPT_SKIP_NETWORK: "1"
     steps:
-      - uses: actions/checkout@v5
+      # persist-credentials: false — this job downloads and EXECUTES
+      # the PR-built lwpt.exe; keep git auth material out of the
+      # workspace git config. No step here needs authenticated git.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
 
       # Verbatim copy of ci.yml's "Install FPC (choco)" step (test
       # matrix) — lwpt test compiles *.Test.pas with the native FPC,
@@ -314,7 +328,7 @@ jobs:
           echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
 
       - name: Download lwpt artefact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: lwpt-pr-x86_64-win64
           path: build/
