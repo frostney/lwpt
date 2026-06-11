@@ -1853,7 +1853,7 @@ begin
           Base := Base + RelPrefix + '/';
         if FileExists(Base + MANIFEST_FILE) then
           Hits.Add(RelPrefix);
-        if FindFirst(Base + '*', faAnyFile, SR) = 0 then
+        if SysUtils.FindFirst(Base + '*', faAnyFile, SR) = 0 then
           try
             repeat
               if (SR.Name = '.') or (SR.Name = '..') then Continue;
@@ -1863,9 +1863,9 @@ begin
                 Next.Add(SR.Name)
               else
                 Next.Add(RelPrefix + '/' + SR.Name);
-            until FindNext(SR) <> 0;
+            until SysUtils.FindNext(SR) <> 0;
           finally
-            FindClose(SR);
+            SysUtils.FindClose(SR);
           end;
       end;
       if Hits.Count = 1 then
