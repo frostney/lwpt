@@ -86,7 +86,11 @@ begin
               if SysUtils.DeleteFile(Base + SR.Name) then
                 Inc(ARemoved)
               else
+              begin
+                WriteLn(ErrOutput, '  clean: could not remove ',
+                  Base + SR.Name);
                 Inc(AFailed);
+              end;
               Break;
             end;
         end;
