@@ -101,9 +101,11 @@ If `lwpt install` fails with `HTTPS requires OpenSSL but it could not be loaded`
 
 ## Release process
 
-1. **Tag.** `git tag 0.1.0` on a green `main` (no `v` prefix — SemVer 2.0.0 canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md); `v0.1.0` is also accepted by `release.yml` as a courtesy). Pre-release tags use the `0.1.0-rc.1` form (auto-detected by `release.yml` and published as `prerelease: true`).
-2. **`release.yml` triggers.** Mirrors `ci.yml`'s cross-build matrix exactly (same flag set, same toolchain cache key), then packages each target as `tar.gz` (Unix) / `zip` (Windows) plus a SHA-256 checksums file.
-3. **GitHub Release published.** Auto-generated release notes from `.github/release.yml`'s category config, attached: all six archives + the checksums file. Archive naming:
+1. **Release PR.** Create `release/<version>` from green `main`, run `git-cliff --tag <version> -o CHANGELOG.md`, bump `[package].version`, regenerate `source/Version.inc`, validate, and open a draft PR titled `chore(release): <version>`.
+2. **Squash-merge the PR.** The merge commit on `main` must already contain the changelog and version bump. Use the squash message `chore(release): <version>`.
+3. **Tag the merge commit.** `git tag -a 0.1.0 -m 0.1.0` on the post-merge `main` commit (no `v` prefix — SemVer 2.0.0 canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md); `v0.1.0` is also accepted by `release.yml` as a courtesy). Pre-release tags use the `0.1.0-rc.1` form (auto-detected by `release.yml` and published as `prerelease: true`).
+4. **`release.yml` triggers.** Mirrors `ci.yml`'s cross-build matrix exactly (same flag set, same toolchain cache key), then packages each target as `tar.gz` (Unix) / `zip` (Windows) plus a SHA-256 checksums file.
+5. **GitHub Release published.** Release notes are extracted from the committed `CHANGELOG.md` section for the tag, with all six archives + the checksums file attached. Archive naming:
 
    ```text
    lwpt-<version>-macos-arm64.tar.gz
@@ -115,7 +117,7 @@ If `lwpt install` fails with `HTTPS requires OpenSSL but it could not be loaded`
    lwpt-<version>-checksums.txt
    ```
 
-4. **Install scripts** at `scripts/install.sh` (Linux/macOS) + `scripts/install.ps1` (Windows) point at the GitHub Releases asset URLs; both download the per-platform archive + checksums file and verify SHA-256 before installing.
+6. **Install scripts** at `scripts/install.sh` (Linux/macOS) + `scripts/install.ps1` (Windows) point at the GitHub Releases asset URLs; both download the per-platform archive + checksums file and verify SHA-256 before installing.
 
 There are no hand-built release artefacts. If `ci.yml` is broken at tag time, fix it first (the `ci.yml` push-to-main run validates the same flag set + matrix that `release.yml` uses).
 

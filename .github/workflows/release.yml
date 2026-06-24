@@ -313,8 +313,6 @@ jobs:
     steps:
       # persist-credentials: false — packaging + the gh-release action
       # authenticate via the job token env, not workspace git config.
-      # The changelog job below is the one checkout that KEEPS
-      # credentials: it pushes the changelog branch.
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 0
@@ -446,6 +444,26 @@ jobs:
           mv "$sums_tmp" "lwpt-${{ steps.ver.outputs.version }}-checksums.txt"
           cat "lwpt-${{ steps.ver.outputs.version }}-checksums.txt"
 
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          awk -v version="$VERSION" '
+            /^## \[/ {
+              if (capture) exit
+              if (index($0, "## [" version "]") == 1) {
+                capture = 1
+                print
+              }
+              next
+            }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md does not contain a section for ${VERSION}"
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
@@ -453,7 +471,7 @@ jobs:
           name: ${{ steps.ver.outputs.tag }}
           prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
           draft: false
-          generate_release_notes: true
+          body_path: release-notes.md
           fail_on_unmatched_files: true
           files: |
             dist/lwpt-*.tar.gz
@@ -506,54 +524,3 @@ jobs:
             exit 1
           fi
           echo "OK: install.sh installed ${TAG} and the binary reports it"
-
-  changelog:
-    needs: publish
-    if: ${{ needs.publish.result == 'success' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Generate full changelog
-        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
-        with:
-          config: cliff.toml
-          args: -o CHANGELOG.md
-        env:
-          GITHUB_REPO: ${{ github.repository }}
-
-      - name: Open changelog PR
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
-          BRANCH="changelog/${VERSION}"
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$BRANCH" origin/main
-          git add CHANGELOG.md
-          if git diff --cached --quiet; then
-            echo "No changelog changes to PR."
-            exit 0
-          fi
-          git commit -m "Update CHANGELOG.md for ${VERSION}"
-          git push --force-with-lease origin "$BRANCH"
-          if gh pr view "$BRANCH" --json state --jq .state 2>/dev/null | grep -q OPEN; then
-            echo "PR already exists for $BRANCH; updated branch."
-          else
-            gh pr create \
-              --title "Update CHANGELOG.md for ${VERSION}" \
-              --body "Auto-generated changelog update for the ${VERSION} release. Mirrors the entries that landed in the GitHub Release notes; the difference is that this PR commits them to \`CHANGELOG.md\` on \`main\`." \
-              --base main \
-              --head "$BRANCH"
-          fi

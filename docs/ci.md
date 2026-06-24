@@ -108,7 +108,7 @@ The pipeline runs:
 
 1. **`toolchain`** — reuses `toolchain.yml` via `workflow_call`. Cache hit ⇒ instant; cold ⇒ ~30 min rebuild on `macos-latest`.
 2. **`build`** — six-target matrix, identical to `ci.yml`'s `build` stage, so the tagged binary equals the CI-validated binary.
-3. **`publish`** — packages each target as an archive, generates SHA-256 checksums, and creates the GitHub Release with auto-generated notes (see [`.github/release.yml`](../.github/release.yml) for the category config) plus all archives + the checksums file attached.
+3. **`publish`** — packages each target as an archive, generates SHA-256 checksums, extracts that tag's notes from the committed `CHANGELOG.md`, and creates the GitHub Release with all archives + the checksums file attached.
 
 #### Release artefact naming
 
@@ -200,7 +200,7 @@ Crucially, this is **not** a blanket "ignore e2e failures". An install that *con
 - **`lwpt build` doesn't run on the test runner** — running it would rebuild `lwpt` with the runner's native FPC, defeating the cross-build verification. The pipeline tests the cross-built binary's *behavior* (install / format / test); the cross-build *itself* is verified by the build-stage compile.
 - **No artefact retention beyond 7 days** — set in `upload-artifact`. CI artefacts are debugging aids, not release artefacts. The release artefacts published by `release.yml` are permanent (GitHub Releases).
 - **No Pascal lint beyond `lwpt format --check`** — there's no `flake8`-style linter for FPC. Format check is the closest equivalent.
-- **No `cliff.toml` / git-cliff integration yet** — release notes are GitHub's auto-generated form, binned per [`.github/release.yml`](../.github/release.yml). If a richer changelog is needed later, dropping in `cliff.toml` + swapping to `orhun/git-cliff-action@v4` is a single-commit change.
+- **No post-tag changelog PR** — `CHANGELOG.md` is generated on the release branch before the tag exists, so the tag points at a commit that already contains its own changelog. `release.yml` publishes artifacts from that tag; it does not commit back to `main`.
 - **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped (the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) has no `v`; the strip handles the courtesy-accepted prefixed form).
 
 ## Release version stamping
@@ -210,7 +210,7 @@ Crucially, this is **not** a blanket "ignore e2e failures". An install that *con
 - **Dev / local builds** (`./bootstrap.sh`, `lwpt build`): the constant is sourced from `[package].version` in `lwpt.toml`. `Version.Test.pas`'s drift guard asserts `lwpt --version` matches the manifest for these. There is no way for a locally-built binary to disagree with the manifest.
 - **Release builds** (`release.yml`, tag push): the build step exports `LWPT_VERSION_OVERRIDE=<tag-without-v>` and re-runs `stamp-version.pas` before the cross-FPC compile, so the released binary reports **the git tag**. A 0.1.0-rc.3 release reports `lwpt 0.1.0-rc.3`.
 
-This split keeps the tag, the archive name, and the binary's self-report consistent for anything a user downloads, while leaving local builds pinned to the manifest version (the dev/unreleased number). The maintainer does **not** need to bump `[package].version` per tag — the release stamps the tag itself. The rationale and rejected alternatives live in [ADR-0018](./adr/0018-release-version-stamp-from-tag.md).
+This split keeps the tag, the archive name, and the binary's self-report consistent for anything a user downloads, while leaving local builds pinned to the manifest version (the dev/unreleased number). Release PRs still bump `[package].version` so local builds, `CHANGELOG.md`, and the eventual release tag move together, but the tag remains the source of truth for published binaries. The rationale and rejected alternatives live in [ADR-0018](./adr/0018-release-version-stamp-from-tag.md).
 
 Three independent layers keep the tag, archive name, and binary self-report in agreement — each catches what the others can't:
 
