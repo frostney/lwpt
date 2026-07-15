@@ -8,7 +8,7 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 - **Zero-install by default.** `.lwpt/modules/` (extracted) and `.lwpt/archives/` (verification) are committed; a fresh clone is buildable with `fpc @lwpt.cfg` before `lwpt install` is ever run. See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md).
 - **Self-hosting from day one.** LWPT builds LWPT through `lwpt build` against the repo's own manifest; the one-time `scripts/bootstrap.pas` resolves the chicken-and-egg. See [ADR-0005](./adr/0005-self-host-build.md).
 - **RTL-only with LWPT-canonical packages.** No third-party FPC dependencies in the binary; HTTPS is `HTTPClient` from LWPT's `packages/httpclient/`. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for HTTPClient, CLI, Semver, TOML, and TestingPascalLibrary — all consumed as workspace packages via the root manifest's `[workspaces]` glob (Phase 1 done per ADR-0014 + ADR-0015). GocciaScript is the first named consumer and commits to Path A adoption; Phase 2 graduates individual packages to standalone repos when warranted.
-- **v1 ships with deliberate deferrals.** HTTP registry source kind (ADR-0004), and the link / duplication / codebase-health / architectural-drift stack contracts (ADR-0006) are each tracked on their own follow-up workstreams rather than shipped half-built.
+- **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29), while the link / duplication / codebase-health contracts originally deferred by ADR-0006 remain separate workstreams rather than half-built features. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
 - **Error handling is production-grade.** Every multi-step write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL), `--frozen` verifies both the archive hash and the extracted tree hash against the lockfile, and crash recovery wipes `.lwpt/tmp/` orphans on the next install. See ADR-0002 + ADR-0008.
 
 ## Tech stack
@@ -76,7 +76,7 @@ The resolver in `LWPT.Install` is a breadth-first walk starting at the root mani
 3. Enqueue every dep from the child manifest.
 4. Record the constraint (range + requirer) on the node.
 
-After the BFS finishes, `CheckNodeConstraints` walks each node and asserts that every accumulated range *pairwise intersects* via the vendored `Semver.RangeIntersects` (a full node-semver port that handles compound ranges and `||` unions). If any pair fails, the resolver hard-errors with both requirers named — the manifest tree is editable to resolve the conflict.
+After the BFS finishes, `CheckNodeConstraints` walks each node and asserts that every accumulated range *pairwise intersects* via the vendored `Semver.RangeIntersects` (a full node-semver port that handles compound ranges and `||` unions). If any pair fails, the resolver hard-errors with both requirers named — the manifest tree is editable to resolve the conflict. Pairwise overlap does not prove that one concrete version satisfies the whole node; graph-wide single-version selection and complete conflict diagnostics are tracked in [issue #36](https://github.com/frostney/lwpt/issues/36).
 
 The flat-graph + hard-error policy is deliberate: FPC has one global unit namespace; two versions of the same package cannot coexist. There is no nested versioning to fall back on.
 
@@ -143,18 +143,17 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 
 ## Vendored code
 
-`source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`, `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.Command.*.pas`, `LWPT.Formatter.pas`, `LWPT.GitProtocol.pas`) plus a small remainder of utility units (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` — live under `packages/<name>/` per [ADR-0014](./adr/0014-packages-extraction.md) + [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) + [ADR-0017](./adr/0017-packages-lwpt-canonical.md). Each is a standalone Pascal project with its own `lwpt.toml`, `source/`, tests, version, and bundled `Shared.inc`; LWPT's root manifest auto-discovers them via `[workspaces] include = ["packages/*"]`. [`packages.md`](./packages.md) is the table of the package set, the divergence vs GocciaScript's older copies, the bootstrap chicken-and-egg story, and the graduation roadmap. The Hard Constraint in `AGENTS.md` is "Packages own their contents" — the root LWPT manifest does not modify a package's source from outside, and each package owns its own versioning + format scope + lifecycle hooks + public surface.
+`source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`, `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.Command.*.pas`, `LWPT.Formatter.pas`, `LWPT.GitProtocol.pas`) plus a small remainder of utility units (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` — live under `packages/<name>/` per [ADR-0014](./adr/0014-packages-extraction.md) + [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) + [ADR-0017](./adr/0017-packages-lwpt-canonical.md). Each is a standalone Object Pascal project with its own `lwpt.toml`, `source/`, tests, version, and bundled `Shared.inc`; LWPT's root manifest auto-discovers them via `[workspaces] include = ["packages/*"]`. [`packages.md`](./packages.md) is the table of the package set, the divergence vs GocciaScript's older copies, the bootstrap chicken-and-egg story, and the graduation roadmap. The Hard Constraint in `AGENTS.md` is "Packages own their contents" — the root LWPT manifest does not modify a package's source from outside, and each package owns its own versioning + format scope + lifecycle hooks + public surface.
 
 ## Deferred contracts
 
-Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), the four `project-structure` contracts beyond build-system and formatter (codebase-health, duplication, link-check, architectural-drift) are deferred from v1:
+Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), three customer-facing `project-structure` contracts beyond build-system and formatter are deferred from v1:
 
-- **link-check** — graduates from GocciaScript as a standalone LWPT package.
-- **duplication** — becomes a `lwpt duplication` subcommand; prototype exists outside this workstream.
-- **codebase-health** — becomes a `lwpt health` subcommand; prototype exists outside this workstream.
-- **architectural-drift** — defer to v2.
+- **link-check** — graduates from GocciaScript as a standalone LWPT package in [issue #31](https://github.com/frostney/lwpt/issues/31).
+- **duplication** — becomes a `lwpt duplication` subcommand in [issue #32](https://github.com/frostney/lwpt/issues/32).
+- **codebase-health** — becomes a `lwpt health` subcommand in [issue #33](https://github.com/frostney/lwpt/issues/33).
 
-The v1 pre-commit gate is `lwpt format --check` + `lwpt build` + `lwpt test` only. The longer-term hook is heavier.
+The v1 pre-commit gate is `lwpt format --check` + `lwpt build` + `lwpt test` only. Architecture drift is checked across LWPT's own source, tests, manifests, workflows, documentation, ADRs, and domain context during release preparation. It is not a consumer-project responsibility or an LWPT subcommand.
 
 ## Production-readiness checklist (v1)
 

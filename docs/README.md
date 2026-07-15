@@ -46,7 +46,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 
 | Spike | Topic |
 | --- | --- |
-| [`http-registry-spike.md`](./spikes/http-registry-spike.md) | The HTTP registry consumer that lived in the spike; removed from v1 per ADR-0004; v2 starting point |
+| [`http-registry-spike.md`](./spikes/http-registry-spike.md) | The removed spike consumer, preserved as prior art for [issue #29](https://github.com/frostney/lwpt/issues/29) |
 
 ## Conventions
 
@@ -55,10 +55,12 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 - **ADRs are immutable** once accepted. Cross-links to other docs may be edited when a target is renamed, but the substance does not change.
 - **Spikes are snapshots** — not updated after creation. A new investigation produces a new file.
 
-## Deferred from v1 documentation
+## Planned documentation
 
-These are *not* in v1's `docs/` set; each has a follow-up workstream:
+These documents are created with their implementation work rather than written
+as speculative contracts:
 
-- `CHANGELOG.md` + `cliff.toml` — changelog automation via `git-cliff` deferred per Q11.
-- `docs/registry-spec.md` — the spec for a v2 HTTP registry, derived from `spikes/http-registry-spike.md`.
+- `docs/registry-spec.md` — the registry protocol specified and implemented by
+  [issue #29](https://github.com/frostney/lwpt/issues/29), informed by the
+  archived `spikes/http-registry-spike.md`.
 - `docs/decision-log.md` — the optional append-only decision log; not needed yet (ADRs cover what we need).

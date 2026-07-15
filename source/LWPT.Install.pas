@@ -335,12 +335,12 @@ begin
 end;
 
 { ===========================================================================
-  Registry version negotiation (http source) — DEFERRED TO v2
+  Registry version negotiation (http source) — tracked in GitHub issue #29
 
   The skHttp source kind and the registry consumer (NegotiateVersion,
   PickFromIndex) were removed from v1 per ADR-0004. The spike code is
-  archived at docs/spikes/http-registry-spike.md as prior art for the
-  v2 work that will spec the registry format and re-derive the
+  archived at docs/spikes/http-registry-spike.md as prior art for issue #29,
+  which will spec the registry format and re-derive the
   consumer against the spec.
   =========================================================================== }
 

@@ -6,10 +6,10 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 
 - **FPC 3.2.2 is pinned for v1.** Verify live with `fpc -iV` before any change that depends on FPC behavior — memory and prior conversation are not acceptable sources.
 - **Lefthook 2.x runs the pre-commit hook.** Local pre-commit runs `lwpt format` (auto-fix, with `stage_fixed: true`); the heavyweight gates (`lwpt build` + `lwpt test` + `lwpt format --check`) run on the PR workflow in CI. Install with `lefthook install`.
-- **Three environment variables matter today.** `LWPT_CACHE_DIR` (reserved for opt-in global cache; not used in v1), `FPC_TARGET_CPU` (cross-compile via FPC's `-P` flag), and `PATH` (must contain `fpc`, `instantfpc`, `lefthook`).
+- **Three environment variables matter today.** `LWPT_CACHE_DIR` (reserved for the cache work in issue #30; currently ignored), `FPC_TARGET_CPU` (cross-compile via FPC's `-P` flag), and `PATH` (must contain `fpc`, `instantfpc`, `lefthook`).
 - **TLS backend is platform-native.** SChannel on Windows, SecureTransport on macOS — both built into the OS, no DLLs to bundle. Linux uses the distro's libssl package (system OpenSSL via `dlopen`). Per [ADR-0016](./adr/0016-tls-backend-per-platform.md).
 - **EXDEV-rename failures fall back to copy-then-delete.** When `.lwpt/tmp/` and `.lwpt/modules/` end up on different filesystems (Docker bind mounts, network drives), the atomic-rename helpers (`AtomicMoveFile`, `AtomicMoveDir`) automatically fall back to a copy followed by delete.
-- **Four stack contracts are owed but deferred.** Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), the link-check, duplication, codebase-health, and architectural-drift contracts each have a follow-up workstream; the v1 pre-commit gate intentionally does not include them.
+- **Three customer-facing stack contracts are owed but deferred.** Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), link-check, duplication, and codebase-health each have a follow-up workstream. Architecture drift is instead a project-local release-preparation check for LWPT itself; it is not a customer feature.
 
 ## Pinned versions
 
@@ -18,7 +18,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 | FreePascal | 3.2.2 | `fpc -iV` |
 | InstantFPC | bundled with FPC | `instantfpc --help` |
 | Lefthook | 2.x | `lefthook version` |
-| git-cliff | (deferred to v1.x) | n/a — see "Deferred" below |
+| git-cliff | Verify the installed release live | `git-cliff --version` |
 | OpenSSL (Linux runtime only) | 3.x via distro libssl | `openssl version` (Windows + macOS use SChannel / SecureTransport instead) |
 
 When you touch code that depends on the version, **verify it live, not from memory.** The Hard Constraint in `AGENTS.md` is explicit about this. If you bump a version, the new pin lives in this file and in the relevant CI workflow.
@@ -46,7 +46,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 
 | Variable | Effect | Default |
 | --- | --- | --- |
-| `LWPT_CACHE_DIR` | (Reserved.) When the opt-in global cache lands post-v1, this overrides its location. Today: ignored. | `$XDG_CACHE_HOME/lwpt` on Unix, `%APPDATA%\lwpt\cache` on Windows |
+| `LWPT_CACHE_DIR` | Reserved for [issue #30](https://github.com/frostney/lwpt/issues/30). Today: ignored. | n/a until the cache implementation lands |
 | `FPC_TARGET_CPU` | When set, `lwpt build` passes `-P<value>` to FPC for cross-compilation | unset (host CPU) |
 | `PATH` | Must contain `fpc`, `instantfpc`, `lefthook` | system default |
 
@@ -85,21 +85,19 @@ At the start of every install, `.lwpt/tmp/` is wiped — any orphans from a prev
 
 ## Deferred from v1
 
-The four stack contracts from `project-structure` beyond build-system and formatter:
+The three customer-facing stack contracts from `project-structure` beyond build-system and formatter:
 
 | Contract | Workstream | Notes |
 | --- | --- | --- |
-| **Codebase-health** (`lwpt health`) | Separate workstream; existing prototype | Cyclomatic + cognitive complexity; non-zero exit on threshold breach. Per-file aggregate signal + hotspot detection from git churn. |
-| **Duplication** (`lwpt duplication`) | Separate workstream; existing prototype | Cross-file and within-file copy-paste reporting. |
-| **Link-check** | Graduates from GocciaScript as a standalone LWPT package | Markdown link validation; offline + online modes. |
-| **Architectural-drift** | Defer to v2 | Docs-vs-code, claims-vs-reality across six surfaces. |
+| **Codebase-health** (`lwpt health`) | [Issue #33](https://github.com/frostney/lwpt/issues/33) | Cyclomatic + cognitive complexity; non-zero exit on threshold breach. Per-file aggregate signal + hotspot detection from git churn. |
+| **Duplication** (`lwpt duplication`) | [Issue #32](https://github.com/frostney/lwpt/issues/32) | Cross-file and within-file copy-paste reporting. |
+| **Link-check** | [Issue #31](https://github.com/frostney/lwpt/issues/31) | Graduates from GocciaScript as a standalone LWPT package; offline + explicit online modes. |
 
-The v1 pre-commit gate excludes all four. Tracked in [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md).
+The v1 pre-commit gate excludes all three. ADR-0006 records the original deferral. Architecture drift is checked across LWPT's source, tests, manifests, workflows, documentation, ADRs, and domain context during release preparation; it is not exposed to consumer projects.
 
 ## Other deferrals
 
 | Item | Status | Comes back in |
 | --- | --- | --- |
-| Changelog automation (`git-cliff` + `cliff.toml` + `CHANGELOG.md`) | Deferred per Q11 | v1.x, when release cadence + commit volume warrant it |
 | Markdown linting (`markdownlint-cli2` + `.markdownlint-cli2.jsonc`) | Wired in `pr.yml` docs job | Keep blocking; fix Markdown drift rather than making the job advisory |
-| HTTP registry source kind | Deferred to v2 per ADR-0004 | v2; spec lives in `docs/spikes/http-registry-spike.md` as starting point |
+| Self-hosted origin-and-mirror HTTP registry | Tracked in [issue #29](https://github.com/frostney/lwpt/issues/29) | The archived `docs/spikes/http-registry-spike.md` is consumer prior art, not the planned protocol |

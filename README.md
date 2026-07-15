@@ -20,12 +20,20 @@ lwpt run       invoke a user-declared run-script (or alias a subcommand)
 ## Status
 
 LWPT is pre-1.0. The package model, install pipeline, formatter, test
-runner, and release flow are in place; the deferred contracts (link-check,
-duplication, codebase-health, architectural-drift) are tracked separately
-per [ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md). See
+runner, and release flow are in place; the deferred customer-facing contracts
+[link-check](https://github.com/frostney/lwpt/issues/31),
+[duplication](https://github.com/frostney/lwpt/issues/32), and
+[codebase-health](https://github.com/frostney/lwpt/issues/33) are tracked
+separately from the project-only release architecture check originally deferred by
+[ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md). See
 [`AGENTS.md`](./AGENTS.md) for the full operating manual and
 [`docs/adr/`](./docs/adr/) for the architectural decisions that shape
 the v1 design.
+
+The project's durable direction and delivery gates live in
+[`VISION.md`](./VISION.md),
+[`DEFINITION_OF_READY.md`](./DEFINITION_OF_READY.md), and
+[`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md).
 
 ## Quick start
 
@@ -240,7 +248,8 @@ story.
   the canonical source of truth while `docs/` is still being built out).
 - [`docs/adr/`](./docs/adr/) — architectural decision records.
 - [`docs/spikes/`](./docs/spikes/) — point-in-time snapshots of
-  investigations (e.g. the deferred HTTP registry).
+  investigations (e.g. the archived HTTP registry spike that informs
+  [issue #29](https://github.com/frostney/lwpt/issues/29)).
 
 - [`docs/`](./docs/) — full set of canonical docs: `architecture.md`,
   `quick-start.md`, `tooling.md`, `code-style.md`, `build-system.md`,

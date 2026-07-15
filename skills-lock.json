@@ -43,6 +43,12 @@
       "skillPath": "skills/engineering/grill-with-docs/SKILL.md",
       "computedHash": "9c460cbd94fd3c63cdef967dbdb6e66ca687103cdc380cd37834e4d10b738f78"
     },
+    "implement-idea": {
+      "source": "frostney/known-good-route",
+      "sourceType": "github",
+      "skillPath": "implement-idea/SKILL.md",
+      "computedHash": "d1bc0e238eecf450819688054d92331c150409c0ee8e13b3ea3caceaee1ea8b5"
+    },
     "implement-issue": {
       "source": "frostney/known-good-route",
       "sourceType": "github",

@@ -4,6 +4,8 @@ LWPT is a single-binary Pascal toolkit driven by a single `lwpt.toml` manifest. 
 
 This file is the operating manual for AI assistants and the canonical contract for what agents may not violate. Detailed how-to material lives under [`docs/`](./docs/); when this file mentions a topic in a sentence or two, the canonical home is one link away.
 
+Product direction and delivery quality are defined separately in [`VISION.md`](./VISION.md), [`DEFINITION_OF_READY.md`](./DEFINITION_OF_READY.md), and [`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md). Do not duplicate those documents here.
+
 ## Hard Constraints
 
 These would silently corrupt the project if violated.
@@ -34,7 +36,7 @@ Pre-commit gate (`lefthook.yml`): `lwpt format` (with `stage_fixed`). The heavyw
 [`docs/architecture.md`](./docs/architecture.md) is the canonical layout reference. Quick version:
 
 - **`source/`** — Pascal sources. Project-owned units are `LWPT.<Subsys>.pas` (dotted, acronym uppercase); plus a handful of LWPT-internal utility units (`Platform.pas`, `Shared.inc`) that aren't (yet) extracted into `packages/`.
-- **`packages/<name>/`** — LWPT-canonical workspace packages per [ADR-0017](./docs/adr/0017-packages-lwpt-canonical.md). Each is a standalone Pascal project (own `lwpt.toml`, own `source/`, own tests, own version). Auto-discovered via `[workspaces]` glob in the root manifest.
+- **`packages/<name>/`** — LWPT-canonical workspace packages per [ADR-0017](./docs/adr/0017-packages-lwpt-canonical.md). Each is a standalone Object Pascal project (own `lwpt.toml`, own `source/`, own tests, own version). Auto-discovered via `[workspaces]` glob in the root manifest.
 - **`scripts/`** — InstantFPC scripts (`bootstrap.pas`).
 - **`tests/`** — `integration/`, `e2e/`, `fixtures/`, `support/`. Unit tests are co-located in `source/` as `*.Test.pas`. See [`docs/testing.md`](./docs/testing.md).
 - **`docs/`** — Authoritative documentation; one home per topic.
@@ -64,19 +66,18 @@ Unit-naming, formatter rules, vendored exclusion policy, and line-ending convent
 
 What LWPT **is**: a single-binary, RTL-only Pascal toolkit. Init / install / add / remove / build / format / test / repair / run — driven by one TOML manifest. Zero-install per consumer project. The package manager is the foundation; everything else consumes the cfg the resolver emits.
 
-What LWPT **is not**: not an IDE plugin, not a system-wide package installer (the fppkg / OPM / GetIt model), not a registry host, not a build orchestrator for non-Pascal sources. The npm / Cargo / Yarn aesthetics are deliberate (per-project state, lockfile-driven, zero-install) — the implementation is Pascal-native (no Node, no Rust, no external runtime).
+What LWPT **is not**: not an IDE plugin, not a system-wide package installer (the fppkg / OPM / GetIt model), not a required central registry service, not a build orchestrator for non-Object-Pascal sources. The npm / Cargo / Yarn aesthetics are deliberate (per-project state, lockfile-driven, zero-install) — the implementation is Pascal-native (no Node, no Rust, no external runtime).
 
 Packages + ownership model: HTTPClient, CLI, Semver, TOML, and TestingPascalLibrary live as workspace packages under `packages/<name>/` (Phase 1 per [ADR-0014](./docs/adr/0014-packages-extraction.md) + [ADR-0015](./docs/adr/0015-drop-export-testing-becomes-workspace-package.md)). LWPT is the **canonical source** for all of them per [ADR-0017](./docs/adr/0017-packages-lwpt-canonical.md); GocciaScript is the first named consumer and commits to Path A adoption (full toolchain migration). Phase 2 (per-package graduation to standalone repos when warranted) happens individually; the bootstrap chicken-and-egg keeps `packages/httpclient/` in LWPT's repo until/unless a Phase-2 ADR decides otherwise.
 
-## Deferred from v1
+## Planned Work
 
 Each tracked on its own workstream — see [`docs/tooling.md`](./docs/tooling.md) for the table and [ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md) for the rationale:
 
-- **Link-check** — graduates from GocciaScript as a standalone LWPT package.
-- **Duplication** + **codebase-health** — become `lwpt duplication` / `lwpt health` subcommands; existing prototype, separate workstream.
-- **Architectural-drift** — defer to v2.
-- **HTTP registry source kind** — defer to v2; spike code at [`docs/spikes/http-registry-spike.md`](./docs/spikes/http-registry-spike.md).
-- **Changelog automation** (`git-cliff`) — defer to v1.x.
+- **Link-check** — graduates from GocciaScript as a standalone LWPT package in [issue #31](https://github.com/frostney/lwpt/issues/31).
+- **Duplication** + **codebase-health** — become `lwpt duplication` / `lwpt health` subcommands in [issue #32](https://github.com/frostney/lwpt/issues/32) and [issue #33](https://github.com/frostney/lwpt/issues/33).
+- **Architectural-drift** — not a customer feature or subcommand. LWPT's own architecture conformance is a project-local release-preparation check; consumer-project analysis belongs in a separate tool.
+- **Self-hosted origin-and-mirror HTTP registry** — tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); the archived consumer spike remains prior art at [`docs/spikes/http-registry-spike.md`](./docs/spikes/http-registry-spike.md).
 
 ## Quick Reference
 

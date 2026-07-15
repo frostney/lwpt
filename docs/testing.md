@@ -198,13 +198,13 @@ The original 10-file backlog from the handoff is in place: tier-0 + the headline
 | E2E (`tests/e2e/*.E2E.Test.pas`) | 5 | 20 |
 | **Total** | **19** | **198** |
 
-### Deferred to v1.x
+### Planned testing work
 
 | Item | Reason | When |
 | --- | --- | --- |
-| **HTTP-failure tests with URL injection** (HTTP 500 / unreachable port / timeout via mock server) | `FetchURL` builds URLs from a hardcoded base prefix per source kind; pointing it at a mock server requires an env-var hook (e.g. `LWPT_GITHUB_BASE_URL`). The fetch-failure contract (EFetchError raised, exit ≠ 0, tmp clean) is already covered via the local-source-missing path in `InstallFetchFailure.Test.pas`; URL-injection is the more thorough but lower-priority follow-up. | v1.x |
+| **HTTP-failure tests with test-scoped URL injection** (HTTP 500 / unreachable port / timeout via mock server) | `FetchURL` builds URLs from a hardcoded base prefix per source kind. The fetch-failure contract (`EFetchError` raised, exit ≠ 0, tmp clean) is already covered via the local-source-missing path in `InstallFetchFailure.Test.pas`; deterministic localhost HTTP coverage is tracked in [issue #34](https://github.com/frostney/lwpt/issues/34). | [Issue #34](https://github.com/frostney/lwpt/issues/34) |
 | **~~Lockfile records host~~** | **Solved.** The v3 lockfile's `source` field is the verbatim manifest string (`gitlab:org/repo`) and `resolvedURL` is the actual archive URL (`https://gitlab.com/...`). Host is recoverable from either. See ADR-0009. | done |
-| **Windows install lock + mock server + subprocess paths** | Install locking is covered through `lwpt install` / `lwpt repair` behavior rather than direct lock-type tests. Tests.HTTPMockServer and Tests.LwptSubprocess still need Windows-native CI coverage for the substantive OS-specific paths. | in progress |
+| **Windows install lock + mock server + subprocess paths** | Install locking is covered through `lwpt install` / `lwpt repair` behavior rather than direct lock-type tests. Native WinSock mock-server regression coverage is tracked in [issue #35](https://github.com/frostney/lwpt/issues/35). | [Issue #35](https://github.com/frostney/lwpt/issues/35) |
 | **`source/CLI.Subcommands.Test.pas`** | `CLIOptions.Test.pas` covers the same surface from the binary side, which is the more realistic shape; pure-Pascal unit tests of the option parser remain redundant. | Not planned |
 
 ## TestingPascalLibrary self-test

@@ -34,7 +34,7 @@ If any check fails on a hook autofix you didn't expect, do not commit with `--no
 
 ## Commit messages
 
-Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`, `perf:`, `build:`, `ci:`, `style:`, `revert:`). Changelog automation (`git-cliff`) is deferred to v1.x per ADR-0006's deferral pattern, but the commit conventions land now so the generator works when it lands.
+Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`, `perf:`, `build:`, `ci:`, `style:`, `revert:`). Release preparation uses the committed `cliff.toml` to generate `CHANGELOG.md`; clear commit messages determine the published categorization.
 
 ## When to write an ADR
 
@@ -48,7 +48,7 @@ If any are missing, skip it. Most PRs do not produce an ADR. Format is in `.agen
 
 ## Workspace packages
 
-LWPT ships five workspace packages under `packages/<name>/` — `httpclient`, `cli`, `semver`, `toml`, `testing`. Each is a standalone Pascal project (own `lwpt.toml`, own `source/`, own tests, own version). Per [ADR-0017](./docs/adr/0017-packages-lwpt-canonical.md), **LWPT is the canonical source** for every package (no upstream to defer to; GocciaScript is a sister project committed to Path A adoption, not an authority).
+LWPT ships five workspace packages under `packages/<name>/` — `httpclient`, `cli`, `semver`, `toml`, `testing`. Each is a standalone Object Pascal project (own `lwpt.toml`, own `source/`, own tests, own version). Per [ADR-0017](./docs/adr/0017-packages-lwpt-canonical.md), **LWPT is the canonical source** for every package (no upstream to defer to; GocciaScript is a sister project committed to Path A adoption, not an authority).
 
 The Hard Constraint is **"Packages own their contents"** — the root LWPT manifest discovers each package via `[workspaces]` and consumes its published API; each package owns its versioning, lifecycle hooks, test policy, and public surface. **Format scope follows the root-owns-by-default rule**: the root's `[format]` walks workspace packages too (the LWPT root's `[format].include` covers `packages/**/*.pas` + `packages/**/*.inc`), and a package can opt out by declaring its own `[format]` section in `packages/<name>/lwpt.toml`.
 
@@ -66,11 +66,14 @@ Per the graduation roadmap in ADR-0017, individual packages will graduate to sta
 
 These are deferred to follow-up workstreams (see ADR-0006). Patches in these areas are welcome but should be coordinated through an issue first, not as drive-by PRs:
 
-- Codebase-health subcommand (`lwpt health`) — prototype exists; integration is a separate workstream.
-- Duplication subcommand (`lwpt duplication`) — same.
-- Architectural-drift check — defer to v2.
-- Markdown link-check — graduates from GocciaScript as a standalone LWPT package.
-- HTTP registry source kind — defer to v2; see `docs/spikes/http-registry-spike.md`.
+- Codebase-health subcommand (`lwpt health`) — tracked in [issue #33](https://github.com/frostney/lwpt/issues/33).
+- Duplication subcommand (`lwpt duplication`) — tracked in [issue #32](https://github.com/frostney/lwpt/issues/32).
+- Markdown link-check — graduates from GocciaScript as a standalone LWPT package in [issue #31](https://github.com/frostney/lwpt/issues/31).
+- Self-hosted origin-and-mirror HTTP registry — tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); see `docs/spikes/http-registry-spike.md` for archived consumer prior art.
+
+Architecture drift is not a customer feature. LWPT's own architecture
+conformance is checked during release preparation, as required by
+[`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md).
 
 ## Reporting issues
 
