@@ -133,14 +133,18 @@ end;
 procedure TLWPTBuildSessionTests.TestSuccessfulSessionIsRemoved;
 var
   Session: TLWPTBuildSession;
-  Root: string;
+  OwnerPath, Root: string;
 begin
   ResetScratch;
   Session := TLWPTBuildSession.Create(FScratch);
   Root := Session.SessionRoot;
+  OwnerPath := FScratch + '/' + BUILD_SESSIONS_DIR + '/locks/owners/'
+    + Session.SessionID + '.lock';
+  Expect<Boolean>(FileExists(OwnerPath)).ToBe(True);
   Session.Finish(True);
   Session.Free;
   Expect<Boolean>(DirectoryExists(Root)).ToBe(False);
+  Expect<Boolean>(FileExists(OwnerPath)).ToBe(False);
 end;
 
 procedure TLWPTBuildSessionTests.TestStaleCandidateDoesNotReplacePublicOutput;
@@ -545,7 +549,7 @@ end;
 procedure TLWPTBuildSessionTests.TestRepairRemovesInactiveAndKeepsLiveSessions;
 var
   LiveSession, FailedSession: TLWPTBuildSession;
-  LiveRoot, FailedRoot: string;
+  LiveRoot, FailedRoot, FailedOwnerPath: string;
   Removed, Retained: Integer;
 begin
   ResetScratch;
@@ -553,14 +557,18 @@ begin
   FailedSession := TLWPTBuildSession.Create(FScratch);
   LiveRoot := LiveSession.SessionRoot;
   FailedRoot := FailedSession.SessionRoot;
+  FailedOwnerPath := FScratch + '/' + BUILD_SESSIONS_DIR + '/locks/owners/'
+    + FailedSession.SessionID + '.lock';
   FailedSession.Finish(False, 'failed');
   FailedSession.Free;
+  Expect<Boolean>(FileExists(FailedOwnerPath)).ToBe(True);
   WriteText(LiveRoot + '/session.state', 'unreadable live state');
 
   RepairBuildSessions(FScratch, Removed, Retained);
   Expect<Integer>(Removed).ToBe(1);
   Expect<Integer>(Retained).ToBe(1);
   Expect<Boolean>(DirectoryExists(FailedRoot)).ToBe(False);
+  Expect<Boolean>(FileExists(FailedOwnerPath)).ToBe(False);
   Expect<Boolean>(DirectoryExists(LiveRoot)).ToBe(True);
 
   LiveSession.Finish(True);

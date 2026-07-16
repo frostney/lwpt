@@ -100,7 +100,7 @@ See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) for the full design ra
 | `.lwpt/archives/<dep>-<version>.tar.gz` | **Committed** | Source-of-truth tarballs. Used for hash verification on `--frozen`. |
 | `.lwpt/tmp/` | Gitignored | Install workspace. Every write to a committed path goes through here first; atomic rename moves the staged file/dir into place. EXDEV fallback (copy-then-delete) handles cross-filesystem renames. Wiped at the start of every `lwpt install` to reap crash orphans. |
 | `.lwpt/install.lock` | Gitignored | Cross-process install lock. Created with O_CREAT\|O_EXCL by the first `lwpt install`; a second concurrent install fails with `EConcurrencyError` naming the lock holder's PID. Deleted by the normally-completing install; a crashed install leaves it for the user to clear via `lwpt repair`. Windows lock uses `LockFileEx`. |
-| `.lwpt/sessions/<session-id>/` | Gitignored | Build/test compiler staging. Every invocation owns distinct, bounded, hash-qualified job, unit, executable, and hook-compile paths. Successful sessions disappear; failed/crashed sessions remain private until `lwpt repair`. The sibling `locks/` directory contains stable files whose OS-held advisory locks are paired with keyed in-process critical sections for the short publication window. |
+| `.lwpt/sessions/<session-id>/` | Gitignored | Build/test compiler staging. Every invocation owns distinct, bounded, hash-qualified job, unit, executable, and hook-compile paths. Successful sessions disappear; failed/crashed sessions remain private until `lwpt repair`. The sibling `locks/` directory contains stable publication-lock files and per-session owner guards. |
 
 ### ⚠️ Windows safe-deletion warning
 

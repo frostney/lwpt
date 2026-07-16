@@ -47,6 +47,7 @@ type
     FProjectRoot: string;
     FSessionID: string;
     FSessionRoot: string;
+    FSessionOwnerGuardPath: string;
     FSessionOwnerGuard: TObject;
     FFinished: Boolean;
     procedure WriteState(const AState: string);
@@ -527,6 +528,10 @@ begin
   inherited Create;
   FPath := APath;
   FLocked := False;
+  if not EnsureDirectory(ExtractFileDir(FPath)) then
+    raise ELWPTError.CreateFmt(
+      'could not create build session owner guard directory %s',
+      [ExtractFileDir(FPath)]);
   {$IFDEF UNIX}
   FDescriptor := -1;
   {$ENDIF}
@@ -846,28 +851,11 @@ begin
   Result := FormatDateTime('yyyymmddhhnnsszzz', Now);
 end;
 
-procedure WipeOwnedSessionContents(const ASessionRoot, AOwnerPath: string);
-var
-  Search: TSearchRec;
-  Base, Full: string;
+function SessionOwnerGuardPath(const ASessionsRoot,
+  ASessionID: string): string;
 begin
-  Base := IncludeTrailingPathDelimiter(ASessionRoot);
-  if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, Search) <> 0 then
-    Exit;
-  try
-    repeat
-      if (Search.Name = '.') or (Search.Name = '..') then Continue;
-      Full := Base + Search.Name;
-      if SamePath(Full, AOwnerPath) then Continue;
-      if (Search.Attr and faDirectory) <> 0 then
-        WipeDir(Full)
-      else if not SysUtils.DeleteFile(Full) then
-        raise ELWPTError.CreateFmt(
-          'could not remove build session entry %s', [Full]);
-    until SysUtils.FindNext(Search) <> 0;
-  finally
-    SysUtils.FindClose(Search);
-  end;
+  Result := IncludeTrailingPathDelimiter(ASessionsRoot)
+    + 'locks/owners/' + ASessionID + '.lock';
 end;
 
 constructor TLWPTBuildSession.Create(const AProjectRoot: string);
@@ -878,6 +866,7 @@ var
 begin
   inherited Create;
   FProjectRoot := ExpandFileName(AProjectRoot);
+  FSessionOwnerGuardPath := '';
   FSessionOwnerGuard := nil;
   BaseRoot := RootedPath(FProjectRoot, BUILD_SESSIONS_DIR);
   if not EnsureDirectory(BaseRoot) then
@@ -901,9 +890,10 @@ begin
       'could not create build session directory %s', [PendingRoot]);
   FFinished := False;
   FSessionRoot := PendingRoot;
+  FSessionOwnerGuardPath := SessionOwnerGuardPath(BaseRoot, FSessionID);
   try
     FSessionOwnerGuard := TLWPTSessionOwnerGuard.Create(
-      PendingRoot + '/owner.lock');
+      FSessionOwnerGuardPath);
     WriteState('active');
     if not SysUtils.RenameFile(PendingRoot,
       IncludeTrailingPathDelimiter(BaseRoot) + FSessionID) then
@@ -912,6 +902,8 @@ begin
     FSessionRoot := IncludeTrailingPathDelimiter(BaseRoot) + FSessionID;
   except
     FreeAndNil(FSessionOwnerGuard);
+    if FileExists(FSessionOwnerGuardPath) then
+      SysUtils.DeleteFile(FSessionOwnerGuardPath);
     if DirectoryExists(PendingRoot) then WipeDir(PendingRoot);
     if DirectoryExists(IncludeTrailingPathDelimiter(BaseRoot) + FSessionID) then
       WipeDir(IncludeTrailingPathDelimiter(BaseRoot) + FSessionID);
@@ -962,24 +954,20 @@ end;
 procedure TLWPTBuildSession.Finish(ASuccess: Boolean; const ADetail: string);
 var
   Lines: TStringList;
-  OwnerPath: string;
 begin
   if FFinished then Exit;
   if ASuccess then
   begin
-    { Keep the owner guard observable while every other entry is removed.
-      Close it only when the guard file and empty directory are all that
-      remain, so repair cannot mistake an active cleanup for an orphan. }
+    { The guard lives beside session directories, so it remains observable
+      while the entire private session tree is removed on every platform. }
     WriteState('completing');
-    OwnerPath := FSessionRoot + '/owner.lock';
-    WipeOwnedSessionContents(FSessionRoot, OwnerPath);
+    WipeDir(FSessionRoot);
     FreeAndNil(FSessionOwnerGuard);
-    if FileExists(OwnerPath) and (not SysUtils.DeleteFile(OwnerPath)) then
+    if FileExists(FSessionOwnerGuardPath)
+      and (not SysUtils.DeleteFile(FSessionOwnerGuardPath)) then
       raise ELWPTError.CreateFmt(
-        'could not remove build session owner guard %s', [OwnerPath]);
-    if DirectoryExists(FSessionRoot) and (not RemoveDir(FSessionRoot)) then
-      raise ELWPTError.CreateFmt(
-        'could not remove build session directory %s', [FSessionRoot]);
+        'could not remove build session owner guard %s',
+        [FSessionOwnerGuardPath]);
     FFinished := True;
     Exit;
   end;
@@ -1057,7 +1045,7 @@ end;
 procedure RepairBuildSessions(const AProjectRoot: string;
   out ARemoved, ARetained: Integer);
 var
-  Root, SessionPath, StatePath, AgePath: string;
+  Root, SessionPath, SessionID, StatePath, AgePath, OwnerPath: string;
   Search: TSearchRec;
   PID: LongInt;
   State: string;
@@ -1072,10 +1060,14 @@ var
         if (Search.Name = '.') or (Search.Name = '..') then Continue;
         if (Search.Attr and faDirectory) = 0 then Continue;
         SessionPath := Root + '/' + Search.Name;
+        SessionID := Search.Name;
+        if Copy(SessionID, 1, Length('.creating-')) = '.creating-' then
+          Delete(SessionID, 1, Length('.creating-'));
+        OwnerPath := SessionOwnerGuardPath(Root, SessionID);
         StatePath := SessionPath + '/session.state';
         PID := ReadPID(StatePath);
         State := ReadSessionState(StatePath);
-        OwnerHeld := SessionOwnerGuardHeld(SessionPath + '/owner.lock');
+        OwnerHeld := SessionOwnerGuardHeld(OwnerPath);
         if FileExists(StatePath) then AgePath := StatePath
         else AgePath := SessionPath;
         if OwnerHeld then
@@ -1087,6 +1079,7 @@ var
         else
         begin
           WipeDir(SessionPath);
+          if FileExists(OwnerPath) then SysUtils.DeleteFile(OwnerPath);
           Inc(ARemoved);
         end;
       until SysUtils.FindNext(Search) <> 0;
