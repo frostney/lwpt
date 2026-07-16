@@ -1,0 +1,6 @@
+schema = "lwpt-registry-key-v1"
+origin = "https://registry.example.test/lwpt"
+key_id = "ed25519:21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9"
+algorithm = "ed25519"
+public_key = "hex:d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+valid_from_sequence = 1

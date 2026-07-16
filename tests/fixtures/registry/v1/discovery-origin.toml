@@ -1,0 +1,9 @@
+schema = "lwpt-registry-discovery-v1"
+protocol = 1
+origin = "https://registry.example.test/lwpt"
+base_url = "https://registry.example.test/lwpt"
+role = "origin"
+api = "https://registry.example.test/lwpt/v1"
+capabilities = "https://registry.example.test/lwpt/v1/capabilities"
+checkpoint = "https://registry.example.test/lwpt/v1/checkpoints/latest.toml"
+rotations = "https://registry.example.test/lwpt/v1/rotations"

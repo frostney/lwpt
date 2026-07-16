@@ -1,0 +1,6 @@
+schema = "lwpt-registry-snapshot-v1"
+origin = "https://registry.example.test/lwpt"
+sequence = 2
+published_at = "2026-01-02T00:00:00Z"
+previous = "sha256:d2dde0cae212bc793c9a312e55198c65167876aa0722f8cfcbf2f38a5bf5796b"
+records = ["sha256:3ed9d3d8a3bff9426cc4dd548336f16692fdc756ffbd577dceeb6305a4cc8903", "sha256:6b464cebeb83b982d076b52f4152b05623fa410fef78c0ce159422097eff4948"]

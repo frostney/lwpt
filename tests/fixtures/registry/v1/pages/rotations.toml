@@ -1,0 +1,4 @@
+schema = "lwpt-registry-rotation-page-v1"
+origin = "https://registry.example.test/lwpt"
+items = [{ effective_sequence = 2, rotation = "https://registry.example.test/lwpt/v1/rotations/2.toml", old_signature = "https://registry.example.test/lwpt/v1/rotations/2.old.sig.toml", new_signature = "https://registry.example.test/lwpt/v1/rotations/2.new.sig.toml" }]
+next_cursor = ""

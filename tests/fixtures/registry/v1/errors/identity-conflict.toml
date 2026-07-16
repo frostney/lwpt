@@ -1,0 +1,5 @@
+schema = "lwpt-registry-error-v1"
+code = "identity_conflict"
+message = "package identity already has different immutable content"
+request_id = "01j00000000000000000000002"
+retryable = false

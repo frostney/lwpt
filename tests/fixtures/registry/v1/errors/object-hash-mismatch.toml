@@ -1,0 +1,5 @@
+schema = "lwpt-registry-error-v1"
+code = "object_hash_mismatch"
+message = "uploaded object does not match its requested sha256"
+request_id = "01j00000000000000000000000"
+retryable = false

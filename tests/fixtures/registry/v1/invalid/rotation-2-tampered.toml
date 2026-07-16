@@ -1,0 +1,6 @@
+schema = "lwpt-registry-key-rotation-v1"
+origin = "https://registry.example.test/lwpt"
+from_key = "ed25519:21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9"
+to_key = "ed25519:39f713d0a644253f04529421b9f51b9b08979d08295959c4f3990ee617f5139f"
+to_public_key = "hex:3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+effective_sequence = 3

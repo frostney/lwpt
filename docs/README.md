@@ -13,6 +13,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [`ci.md`](./ci.md) | CI workflow shape (`ci.yml` / `pr.yml` / `release.yml` / `toolchain.yml`), trigger split, cross-build toolchain cache, install scripts |
 | [`testing.md`](./testing.md) | Four-tier test policy, fixture strategy, mock HTTP server, the binary-fetch regression, test backlog |
 | [`packages.md`](./packages.md) | The package set, divergence vs GocciaScript-older-copies, bootstrap chicken-and-egg, graduation roadmap (per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)) |
+| [`registry-spec.md`](./registry-spec.md) | Open origin-and-mirror HTTP registry protocol: stable identity, immutable records/objects, signed snapshots, publication, synchronization, and conformance fixtures |
 
 ## Decision records
 
@@ -57,10 +58,5 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 
 ## Planned documentation
 
-These documents are created with their implementation work rather than written
-as speculative contracts:
-
-- `docs/registry-spec.md` — the registry protocol to be specified and
-  implemented under [issue #29](https://github.com/frostney/lwpt/issues/29),
-  informed by the archived `spikes/http-registry-spike.md`.
-- `docs/decision-log.md` — the optional append-only decision log; not needed yet (ADRs cover what we need).
+- `docs/decision-log.md` — the optional append-only decision log; not needed yet
+  (ADRs cover what we need).

@@ -1,0 +1,9 @@
+schema = "lwpt-registry-package-v1"
+origin = "https://registry.example.test/lwpt"
+name = "example-lib"
+version = "1.1.0"
+archive = "sha256:977b719b477c0ee865cffc04fece1aab3edcdd7924d170a3f9755778688d91d4"
+archive_size = 261
+published_at = "2026-01-04T00:00:00Z"
+yanked = true
+dependencies = []

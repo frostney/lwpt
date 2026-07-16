@@ -100,4 +100,4 @@ The v1 pre-commit gate excludes all three. ADR-0006 records the original deferra
 | Item | Status | Comes back in |
 | --- | --- | --- |
 | Markdown linting (`markdownlint-cli2` + `.markdownlint-cli2.jsonc`) | Wired in `pr.yml` docs job | Keep blocking; fix Markdown drift rather than making the job advisory |
-| Self-hosted origin-and-mirror HTTP registry | Tracked in [issue #29](https://github.com/frostney/lwpt/issues/29) | The archived `docs/spikes/http-registry-spike.md` is consumer prior art, not the planned protocol |
+| Self-hosted origin-and-mirror HTTP registry | Protocol specified in [`registry-spec.md`](./registry-spec.md); implementation tracked in [issue #29](https://github.com/frostney/lwpt/issues/29) | The archived `docs/spikes/http-registry-spike.md` is consumer prior art, not the current protocol |

@@ -1,0 +1,9 @@
+schema = "lwpt-registry-discovery-v1"
+protocol = 1
+origin = "https://registry.example.test/lwpt"
+base_url = "http://127.0.0.1:8080/lwpt"
+role = "mirror"
+api = "http://127.0.0.1:8080/lwpt/v1"
+capabilities = "http://127.0.0.1:8080/lwpt/v1/capabilities"
+checkpoint = "http://127.0.0.1:8080/lwpt/v1/checkpoints/latest.toml"
+rotations = "http://127.0.0.1:8080/lwpt/v1/rotations"

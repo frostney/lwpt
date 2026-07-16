@@ -1,0 +1,5 @@
+schema = "lwpt-registry-error-v1"
+code = "snapshot_conflict"
+message = "cursor does not belong to the requested snapshot"
+request_id = "01j00000000000000000000004"
+retryable = false

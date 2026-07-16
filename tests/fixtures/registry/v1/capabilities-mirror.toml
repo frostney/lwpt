@@ -1,0 +1,8 @@
+schema = "lwpt-registry-capabilities-v1"
+protocol = 1
+hashes = ["sha256"]
+signatures = ["ed25519"]
+schemas = ["lwpt-registry-capabilities-v1", "lwpt-registry-checkpoint-v1", "lwpt-registry-discovery-v1", "lwpt-registry-error-v1", "lwpt-registry-key-rotation-v1", "lwpt-registry-key-v1", "lwpt-registry-package-v1", "lwpt-registry-page-v1", "lwpt-registry-rotation-page-v1", "lwpt-registry-signature-v1", "lwpt-registry-snapshot-v1"]
+features = ["package-list-v1", "rotation-chain-v1", "snapshot-sync-v1"]
+auth_schemes = []
+max_page_size = 100

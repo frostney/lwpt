@@ -1,0 +1,7 @@
+schema = "lwpt-registry-checkpoint-v1"
+origin = "https://registry.example.test/lwpt"
+sequence = 5
+snapshot = "sha256:35484bbec8948d7808542a5bcd9dde00ed2685eb76ae3b3ec9e3df236138c15c"
+published_at = "2026-01-05T00:00:00Z"
+expires_at = "2026-01-12T00:00:00Z"
+key_id = "ed25519:39f713d0a644253f04529421b9f51b9b08979d08295959c4f3990ee617f5139f"

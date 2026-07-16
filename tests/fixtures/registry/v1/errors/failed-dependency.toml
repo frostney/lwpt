@@ -1,0 +1,5 @@
+schema = "lwpt-registry-error-v1"
+code = "failed_dependency"
+message = "referenced archive object is not present"
+request_id = "01j00000000000000000000003"
+retryable = false

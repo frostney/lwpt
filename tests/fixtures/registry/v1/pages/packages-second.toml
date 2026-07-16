@@ -1,0 +1,5 @@
+schema = "lwpt-registry-page-v1"
+origin = "https://registry.example.test/lwpt"
+snapshot = "sha256:8c5f75ccea53bd5af230b1a736ac21ac45b9c0aa805fce5958d2ff8ee27536f5"
+items = [{ name = "example-lib", version = "1.1.0", record = "sha256:3ed9d3d8a3bff9426cc4dd548336f16692fdc756ffbd577dceeb6305a4cc8903" }]
+next_cursor = ""
