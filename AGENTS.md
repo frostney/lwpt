@@ -31,6 +31,10 @@ Daily-driver commands are in the [Quick Reference](#quick-reference) table below
 
 Pre-commit gate (`lefthook.yml`): `lwpt format` (with `stage_fixed`). The heavyweight checks (`lwpt build` + `lwpt test`) run on the PR workflow rather than every local commit. Do not bypass with `--no-verify` unless explicitly asked.
 
+## Agent Workflows
+
+Use the project-local [`/prepare-release`](./.agents/skills/prepare-release/SKILL.md) workflow before cutting a release. It runs the complete project and E2E gates, checks cross-platform CI evidence, audits LWPT's architecture conformance, and previews the changelog. It stops before version selection, changelog generation, tagging, and publishing.
+
 ## Code Organization
 
 [`docs/architecture.md`](./docs/architecture.md) is the canonical layout reference. Quick version:
@@ -62,22 +66,9 @@ Unit-naming, formatter rules, vendored exclusion policy, and line-ending convent
 - **No secrets in fixtures.** Test artefacts pin specific tagged releases of small public repos; never include credentials, tokens, or anything touching a private endpoint.
 - **Network operations are explicit.** `lwpt install` and its manifest-editing frontends `lwpt add` / `lwpt remove` (both run the install transaction per [ADR-0019](./docs/adr/0019-add-remove-subcommands.md)) are the only subcommands that hit the network in the default install mode. All other subcommands (including `lwpt test` without `--tier=e2e`) are offline.
 
-## Product Positioning
+## Product and Roadmap Boundaries
 
-What LWPT **is**: a single-binary, RTL-only Pascal toolkit. Init / install / add / remove / build / format / test / repair / run — driven by one TOML manifest. Zero-install per consumer project. The package manager is the foundation; everything else consumes the cfg the resolver emits.
-
-What LWPT **is not**: not an IDE plugin, not a system-wide package installer (the fppkg / OPM / GetIt model), not a required central registry service, not a build orchestrator for non-Object-Pascal sources. The npm / Cargo / Yarn aesthetics are deliberate (per-project state, lockfile-driven, zero-install) — the implementation is Pascal-native (no Node, no Rust, no external runtime).
-
-Packages + ownership model: HTTPClient, CLI, Semver, TOML, and TestingPascalLibrary live as workspace packages under `packages/<name>/` (Phase 1 per [ADR-0014](./docs/adr/0014-packages-extraction.md) + [ADR-0015](./docs/adr/0015-drop-export-testing-becomes-workspace-package.md)). LWPT is the **canonical source** for all of them per [ADR-0017](./docs/adr/0017-packages-lwpt-canonical.md); GocciaScript is the first named consumer and commits to Path A adoption (full toolchain migration). Phase 2 (per-package graduation to standalone repos when warranted) happens individually; the bootstrap chicken-and-egg keeps `packages/httpclient/` in LWPT's repo until/unless a Phase-2 ADR decides otherwise.
-
-## Planned Work
-
-Each tracked on its own workstream — see [`docs/tooling.md`](./docs/tooling.md) for the table and [ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md) for the rationale:
-
-- **Link-check** — graduates from GocciaScript as a standalone LWPT package in [issue #31](https://github.com/frostney/lwpt/issues/31).
-- **Duplication** + **codebase-health** — become `lwpt duplication` / `lwpt health` subcommands in [issue #32](https://github.com/frostney/lwpt/issues/32) and [issue #33](https://github.com/frostney/lwpt/issues/33).
-- **Architectural-drift** — not a customer feature or subcommand. LWPT's own architecture conformance is a project-local release-preparation check; consumer-project analysis belongs in a separate tool.
-- **Self-hosted origin-and-mirror HTTP registry** — tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); the archived consumer spike remains prior art at [`docs/spikes/http-registry-spike.md`](./docs/spikes/http-registry-spike.md).
+[`VISION.md`](./VISION.md) is the canonical product direction. GitHub issues and milestones are the roadmap source of truth; do not duplicate their planned scope or scheduling in repository documentation. Current documentation describes shipped behavior and links to investigated issues where a known gap matters.
 
 ## Quick Reference
 

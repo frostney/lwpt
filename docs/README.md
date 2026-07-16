@@ -60,7 +60,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 These documents are created with their implementation work rather than written
 as speculative contracts:
 
-- `docs/registry-spec.md` — the registry protocol specified and implemented by
-  [issue #29](https://github.com/frostney/lwpt/issues/29), informed by the
-  archived `spikes/http-registry-spike.md`.
+- `docs/registry-spec.md` — the registry protocol to be specified and
+  implemented under [issue #29](https://github.com/frostney/lwpt/issues/29),
+  informed by the archived `spikes/http-registry-spike.md`.
 - `docs/decision-log.md` — the optional append-only decision log; not needed yet (ADRs cover what we need).

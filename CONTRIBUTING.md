@@ -62,18 +62,9 @@ If you need to change a package:
 
 Per the graduation roadmap in ADR-0017, individual packages will graduate to standalone repos when warranted. If your change touches HTTPClient or CLI substantially, mention the graduation context in the PR description.
 
-## What is *not* in scope for v1
+## Planned work
 
-These are deferred to follow-up workstreams (see ADR-0006). Patches in these areas are welcome but should be coordinated through an issue first, not as drive-by PRs:
-
-- Codebase-health subcommand (`lwpt health`) — tracked in [issue #33](https://github.com/frostney/lwpt/issues/33).
-- Duplication subcommand (`lwpt duplication`) — tracked in [issue #32](https://github.com/frostney/lwpt/issues/32).
-- Markdown link-check — graduates from GocciaScript as a standalone LWPT package in [issue #31](https://github.com/frostney/lwpt/issues/31).
-- Self-hosted origin-and-mirror HTTP registry — tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); see `docs/spikes/http-registry-spike.md` for archived consumer prior art.
-
-Architecture drift is not a customer feature. LWPT's own architecture
-conformance is checked during release preparation, as required by
-[`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md).
+[`VISION.md`](./VISION.md) owns product direction; GitHub issues and milestones own planned scope and scheduling. Coordinate work on the [registry](https://github.com/frostney/lwpt/issues/29), [link checking](https://github.com/frostney/lwpt/issues/31), [duplication](https://github.com/frostney/lwpt/issues/32), or [codebase health](https://github.com/frostney/lwpt/issues/33) through those issues rather than a drive-by PR. [`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md) owns the project-local release and architecture-conformance gate.
 
 ## Reporting issues
 
