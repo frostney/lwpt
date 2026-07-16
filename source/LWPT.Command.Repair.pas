@@ -14,6 +14,7 @@ implementation
 uses
   SysUtils,
 
+  LWPT.BuildSession,
   LWPT.Core,
   LWPT.Manifest;
 
@@ -38,6 +39,7 @@ procedure CmdRepair(const AManifestPath: string);
 var
   Ctx : TManifestContext;
   TmpRoot, LockPath : string;
+  SessionsRemoved, SessionsRetained: Integer;
 begin
   Ctx := LoadManifestContext(AManifestPath);
   TmpRoot := ResolveRepairPath(Ctx.ProjectRoot, ResolveTmpDir(Ctx.Manifest));
@@ -60,6 +62,10 @@ begin
   end
   else
     WriteLn('repair: no install lock to remove');
+
+  RepairBuildSessions(Ctx.ProjectRoot, SessionsRemoved, SessionsRetained);
+  WriteLn('repair: removed ', SessionsRemoved, ' abandoned build session(s), ',
+    SessionsRetained, ' live session(s) retained');
 
   WriteLn('repair complete. Committed state under ', LWPT_DIR,
           '/modules/ and ', LWPT_DIR, '/archives/ was not modified.');

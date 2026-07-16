@@ -40,6 +40,7 @@ type
     procedure TestRepairOnCleanTreeIsNoop;
     procedure TestRepairClearsStaleInstallLock;
     procedure TestRepairCleansTmpButLeavesCommittedState;
+    procedure TestRepairReclaimsFailedBuildSession;
   end;
 
 procedure TRepairE2E.SetupScratchProject;
@@ -129,6 +130,24 @@ begin
   Expect<Boolean>(FileExists(ModulesMarker)).ToBe(True);
 end;
 
+procedure TRepairE2E.TestRepairReclaimsFailedBuildSession;
+var
+  SessionPath: string;
+  R: TLwptResult;
+begin
+  SessionPath := FScratch + '/.lwpt/sessions/session-failed-test';
+  WriteTextFile(SessionPath + '/session.state',
+    '999999'#10'failed'#10'1'#10);
+  WriteTextFile(SessionPath + '/jobs/app/private-output', 'incomplete');
+
+  R := RunLwpt(['repair'], FScratch);
+
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(DirectoryExists(SessionPath)).ToBe(False);
+  Expect<Boolean>(Pos('removed 1 abandoned build session', R.Stdout) > 0)
+    .ToBe(True);
+end;
+
 procedure TRepairE2E.SetupTests;
 begin
   Test('repair on a clean tree is a no-op exit 0',
@@ -137,6 +156,8 @@ begin
     TestRepairClearsStaleInstallLock);
   Test('repair cleans .lwpt/tmp/ but leaves .lwpt/modules/ untouched',
     TestRepairCleansTmpButLeavesCommittedState);
+  Test('repair reclaims failed build-session staging',
+    TestRepairReclaimsFailedBuildSession);
 end;
 
 begin

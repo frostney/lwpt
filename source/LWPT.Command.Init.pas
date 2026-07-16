@@ -108,10 +108,11 @@ var
   Existed, HasEntry: Boolean;
   Added: Integer;
 begin
-  SetLength(Wanted, 3);
+  SetLength(Wanted, 4);
   Wanted[0] := '.lwpt/tmp/';
   Wanted[1] := '.lwpt/install.lock';
-  Wanted[2] := StringReplace(IncludeTrailingPathDelimiter(ABuildDir),
+  Wanted[2] := '.lwpt/sessions/';
+  Wanted[3] := StringReplace(IncludeTrailingPathDelimiter(ABuildDir),
     DirectorySeparator, '/', [rfReplaceAll]);
   Existed := FileExists(APath);
   SL := TStringList.Create;

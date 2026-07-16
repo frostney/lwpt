@@ -1110,13 +1110,10 @@ begin
   end;
 end;
 
-{ [build] target names become path segments under build/targets/.
-  Quoted TOML keys can be any string, so reject the names that would
-  resolve elsewhere: "" and "." map onto build/targets/ itself, ".."
-  escapes it entirely (build/targets/.. == build/). Root manifests
-  only: a dependency's [build] targets are never built by the
-  consumer (parse-and-drop posture, ADR-0011), so a broken or hostile
-  dep manifest must not block `lwpt install`. }
+{ [build] target names become path segments inside private build
+  sessions. Quoted TOML keys can be any string, so reject empty and
+  dot segments before staging. Root manifests only: a dependency's
+  [build] targets are never built by the consumer. }
 procedure ValidateTargetName(const AName: string);
 begin
   if (AName = '') or (AName = '.') or (AName = '..') then

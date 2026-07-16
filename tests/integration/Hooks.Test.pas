@@ -1,13 +1,17 @@
 { Hooks.Test — pins lifecycle-hook execution semantics (ADR-0011).
 
-  Five assertions:
+  Eight assertions:
     1. [prebuild] hook (bare-string shorthand) runs before `lwpt build`.
     2. [prebuild] hook with inputs/output (the staleness gate) skips
        on the second invocation when the output is fresher than every
        input.
     3. [postbuild] hook runs after `lwpt build` completes.
-    4. [pretest] hook runs before `lwpt test`.
-    5. Supply-chain guard: a dep manifest's [preinstall] hook is
+    4. A per-target [postbuild] hook sees the private candidate before
+       the public output exists.
+    5. A failing per-target [postbuild] hook leaves no public output.
+    6. [pretest] hook runs before `lwpt test`.
+    7. [posttest] hook runs even when no tests are discovered.
+    8. Supply-chain guard: a dep manifest's [preinstall] hook is
        silently dropped during `lwpt install`. The hook would write a
        sentinel file in the consuming project; the test asserts that
        file does NOT exist after install. This is the most important
@@ -45,6 +49,8 @@ type
     procedure TestPrebuildShorthandRuns;
     procedure TestPrebuildStalenessGateSkipsSecondRun;
     procedure TestPostbuildRunsAfterBuild;
+    procedure TestTargetPostbuildUsesPrivateCandidate;
+    procedure TestFailingTargetPostbuildDoesNotPublish;
     procedure TestPretestRunsBeforeTest;
     procedure TestPosttestRunsWhenNoTestsDiscovered;
     procedure TestDepManifestHookSilentlyDropped;
@@ -167,6 +173,67 @@ begin
   Expect<Boolean>(SentinelExists('sentinel-postbuild.txt')).ToBe(True);
 end;
 
+procedure THooksE2E.TestTargetPostbuildUsesPrivateCandidate;
+var R: TLwptResult;
+begin
+  SetupScratchProject('');
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "hooks-e2e"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[build]'#10
+    + 'tinybin = { source = "source/tinybin.pas", '
+    + 'output = "build/tinybin", '
+    + 'postbuild = { probe = { script = "scripts/probe-output.pas", '
+    + 'args = ["{item.output}"] } } }'#10);
+  WriteTextFile(FScratch + '/scripts/probe-output.pas',
+      'program ProbeOutput;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses SysUtils;'#10
+    + 'begin'#10
+    + '  if ParamStr(1) <> GetEnvironmentVariable('
+    + '''LWPT_BUILD_OUTPUT'') then Halt(3);'#10
+    + '  if not FileExists(GetEnvironmentVariable('
+    + '''LWPT_BUILD_OUTPUT'')) then Halt(1);'#10
+    + '  if FileExists(GetEnvironmentVariable('
+    + '''LWPT_BUILD_PUBLIC_OUTPUT'')) then Halt(2);'#10
+    + 'end.'#10);
+
+  R := RunLwpt(['build'], FScratch);
+
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/tinybin')))
+    .ToBe(True);
+end;
+
+procedure THooksE2E.TestFailingTargetPostbuildDoesNotPublish;
+var R: TLwptResult;
+begin
+  SetupScratchProject('');
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "hooks-e2e"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[build]'#10
+    + 'tinybin = { source = "source/tinybin.pas", '
+    + 'output = "build/tinybin", '
+    + 'postbuild = { fail = "scripts/fail-postbuild.pas" } }'#10);
+  WriteTextFile(FScratch + '/scripts/fail-postbuild.pas',
+      'program FailPostbuild;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'begin Halt(7); end.'#10);
+
+  R := RunLwpt(['build'], FScratch);
+
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/tinybin')))
+    .ToBe(False);
+end;
+
 procedure THooksE2E.TestPretestRunsBeforeTest;
 var R: TLwptResult;
 begin
@@ -255,6 +322,10 @@ begin
     TestPrebuildStalenessGateSkipsSecondRun);
   Test('[postbuild] runs after lwpt build completes',
     TestPostbuildRunsAfterBuild);
+  Test('target postbuild receives the private candidate before publication',
+    TestTargetPostbuildUsesPrivateCandidate);
+  Test('failing target postbuild leaves the public output untouched',
+    TestFailingTargetPostbuildDoesNotPublish);
   Test('[pretest] runs before lwpt test',
     TestPretestRunsBeforeTest);
   Test('[posttest] runs after lwpt test even when no tests are discovered',

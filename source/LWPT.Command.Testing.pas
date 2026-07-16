@@ -16,6 +16,7 @@ uses
   Process,
   SysUtils,
 
+  LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.Core,
   LWPT.Manifest;
@@ -100,41 +101,42 @@ var
   ModulesRoot : string;
   i, n, Passed, Failed, Skipped, CompileFailed, Code : Integer;
   Bin : string;
+  Session: TLWPTBuildSession;
 begin
   Man := LoadManifest(AManifestPath);
-
-  { [pretest] hooks fire before test discovery. Same conceptual
-    role as [prebuild] but tied to test compilation; ADR-0011 lets
-    an entry be authored in BOTH [prebuild] AND [pretest] when a
-    project-level prep step needs to run for either phase (the
-    staleness gate ensures it runs at most once per source edit). }
-  RunHooks('pretest', Man.PreTest);
+  Session := TLWPTBuildSession.Create(
+    ExtractFileDir(ExpandFileName(AManifestPath)));
+  try
+    WriteLn('test session: ', Session.SessionID);
+    { Hook compilation on Windows shares this invocation's private
+      staging rather than the former deterministic build/tests path. }
+    RunHooks('pretest', Man.PreTest, Session.HookRoot);
 
   { Per ADR-0015, TestingPascalLibrary is consumed via the `testing`
     workspace package — no extrude step here. The modules dir + each
     workspace package's source/ are already on the cfg's -Fu / -Fi
     paths courtesy of CmdInstall + WriteCfg. }
-  ModulesRoot := ResolveModulesDir(Man);
+    ModulesRoot := ResolveModulesDir(Man);
 
-  SetLength(UnitPaths, 0);
-  for i := 0 to High(Man.Units) do
-  begin
-    n := Length(UnitPaths); SetLength(UnitPaths, n + 1);
-    UnitPaths[n] := Man.Units[i];
-  end;
-  n := Length(UnitPaths); SetLength(UnitPaths, n + 1);
-  UnitPaths[n] := ModulesRoot;
-  if DirectoryExists(TESTS_SUPPORT_DIR) then
-  begin
-    n := Length(UnitPaths); SetLength(UnitPaths, n + 1);
-    UnitPaths[n] := TESTS_SUPPORT_DIR;
-  end;
-
-  Tests := TStringList.Create;
-  try
+    SetLength(UnitPaths, 0);
     for i := 0 to High(Man.Units) do
-      CollectTestFiles(Man.Units[i], Tests);
-    CollectTestFiles('.', Tests);
+    begin
+      n := Length(UnitPaths); SetLength(UnitPaths, n + 1);
+      UnitPaths[n] := Man.Units[i];
+    end;
+    n := Length(UnitPaths); SetLength(UnitPaths, n + 1);
+    UnitPaths[n] := ModulesRoot;
+    if DirectoryExists(TESTS_SUPPORT_DIR) then
+    begin
+      n := Length(UnitPaths); SetLength(UnitPaths, n + 1);
+      UnitPaths[n] := TESTS_SUPPORT_DIR;
+    end;
+
+    Tests := TStringList.Create;
+    try
+      for i := 0 to High(Man.Units) do
+        CollectTestFiles(Man.Units[i], Tests);
+      CollectTestFiles('.', Tests);
 
     { dedupe: a unit dir under '.' is walked twice — collapse by
       canonical absolute path }
@@ -148,13 +150,14 @@ begin
       Dec(i);
     end;
 
-    if Tests.Count = 0 then
-    begin
-      WriteLn('no *.Test.pas files found');
-      Result := 0;
-      RunHooks('posttest', Man.PostTest);
-      Exit;
-    end;
+      if Tests.Count = 0 then
+      begin
+        WriteLn('no *.Test.pas files found');
+        Result := 0;
+        RunHooks('posttest', Man.PostTest, Session.HookRoot);
+        Session.Finish(True);
+        Exit;
+      end;
 
     WriteLn('discovered ', Tests.Count, ' test file(s)');
     if not AIncludeE2E then
@@ -169,7 +172,8 @@ begin
         Continue;
       end;
       Write('  ', ExtractFileName(Tests[i]), ' ... ');
-      if not CompilePascal(Tests[i], UnitPaths, Bin) then
+      if not CompilePascal(Tests[i], UnitPaths, Bin,
+        Session.JobRoot('test-programs')) then
       begin
         WriteLn('COMPILE FAILED');
         Inc(CompileFailed);
@@ -198,15 +202,17 @@ begin
       Result := 0
     else
       Result := 1;
-  finally
-    Tests.Free;
-  end;
+    finally
+      Tests.Free;
+    end;
 
-  { [posttest] hooks fire after the test suite finishes regardless
-    of pass/fail — handy for coverage upload, test-result archival,
-    etc. The function's Result (0 = all pass) is set above and
-    propagates to the caller's exit code unmodified. }
-  RunHooks('posttest', Man.PostTest);
+    RunHooks('posttest', Man.PostTest, Session.HookRoot);
+    Session.Finish(Result = 0,
+      IntToStr(Failed) + ' failed, ' + IntToStr(CompileFailed)
+      + ' did not compile');
+  finally
+    Session.Free;
+  end;
 end;
 
 end.

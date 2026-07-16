@@ -241,9 +241,8 @@ type
     procedure TestNoMatchOnDifferentFile;
   end;
 
-  { SanitisePathSegment — the shared flattener behind per-target
-    artefact dirs (TargetBuildRoot) and per-test build dirs
-    (TestBuildDir). }
+  { SanitisePathSegment — the shared flattener behind session-private
+    build jobs and per-test build dirs. }
   TSanitisePathSegmentSuite = class(TTestSuite)
   public
     procedure SetupTests; override;
