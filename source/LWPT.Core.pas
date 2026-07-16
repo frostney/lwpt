@@ -92,6 +92,11 @@ uses
   Windows
   {$ENDIF};
 
+const
+  {$IFDEF MSWINDOWS}
+  MOVEFILE_WRITE_THROUGH_LWPT = $00000008;
+  {$ENDIF}
+
 function FPCExecutable: string;
 begin
   Result := SysUtils.GetEnvironmentVariable('LWPT_FPC');
@@ -802,7 +807,7 @@ begin
   Result := Windows.MoveFileExW(
     PWideChar(UnicodeString(ASrc)),
     PWideChar(UnicodeString(ADst)),
-    Windows.MOVEFILE_REPLACE_EXISTING or Windows.MOVEFILE_WRITE_THROUGH);
+    Windows.MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH_LWPT);
   {$ENDIF}
 end;
 

@@ -75,6 +75,7 @@ implementation
 uses
   {$IFDEF UNIX}
   BaseUnix,
+  Unix,
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Windows,
