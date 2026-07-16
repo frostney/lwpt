@@ -9,11 +9,13 @@
   install crashes mid-run; it must be safe on a clean tree and
   effective on a dirty one.
 
-  Three assertions:
+  Five assertions:
     1. Repair on a clean tree is a no-op exit 0 (idempotent).
     2. Stale .lwpt/install.lock is removed.
     3. .lwpt/tmp/ contents are removed; the directory itself stays.
-       .lwpt/modules/ and .lwpt/archives/ contents are untouched. }
+       .lwpt/modules/ and .lwpt/archives/ contents are untouched.
+    4. Failed build-session staging is reclaimed.
+    5. Dead machine-wide worker requests are reclaimed and diagnosed. }
 
 program Repair.Test;
 
@@ -30,8 +32,9 @@ uses
 type
   TRepairE2E = class(TTestSuite)
   private
-    FOrigDir, FScratch: string;
+    FOrigDir, FScratch, FWorkerState: string;
     procedure SetupScratchProject;
+    function RunRepair: TLwptResult;
   protected
     procedure BeforeAll; override;
     procedure AfterAll;  override;
@@ -41,6 +44,7 @@ type
     procedure TestRepairClearsStaleInstallLock;
     procedure TestRepairCleansTmpButLeavesCommittedState;
     procedure TestRepairReclaimsFailedBuildSession;
+    procedure TestRepairReclaimsWorkerRequests;
   end;
 
 procedure TRepairE2E.SetupScratchProject;
@@ -61,10 +65,49 @@ begin
     'end.'#10);
 end;
 
+function TRepairE2E.RunRepair: TLwptResult;
+begin
+  Result := RunLwpt(['repair'], FScratch, [
+    'LWPT_WORKER_STATE_DIR=' + FWorkerState,
+    'LWPT_WORKER_BUDGET=1'
+  ]);
+end;
+
+procedure TRepairE2E.TestRepairReclaimsWorkerRequests;
+var
+  StateRoot, RequestPath : string;
+  R : TLwptResult;
+begin
+  StateRoot := FWorkerState;
+  RequestPath := StateRoot + '/dead-agent.request';
+  ForceDirectories(StateRoot);
+  WriteTextFile(RequestPath,
+    'schema=3'#10
+    + 'session=dead-agent'#10
+    + 'pid=999999'#10
+    + 'requested=1'#10
+    + 'granted=1'#10
+    + 'waiting=0'#10
+    + 'started=1'#10
+    + 'heartbeat=1'#10
+    + 'lease-started=1'#10
+    + 'wait-ticket=0'#10
+    + 'lease-tokens=' + StringOfChar('a', 64) + #10
+    + 'delegations='#10);
+
+  R := RunRepair;
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(RequestPath)).ToBe(False);
+  Expect<Boolean>(Pos('reclaimed 1 abandoned worker invocation',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('worker budget: 1 total', R.Stdout) > 0).ToBe(True);
+end;
+
 procedure TRepairE2E.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
   FScratch := ExpandFileName('build/tests/tmp/repair-e2e');
+  FWorkerState := FScratch + '/worker-state';
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 
   RecursiveDelete(FScratch);
@@ -83,7 +126,7 @@ end;
 procedure TRepairE2E.TestRepairOnCleanTreeIsNoop;
 var R: TLwptResult;
 begin
-  R := RunLwpt(['repair'], FScratch);
+  R := RunRepair;
   Expect<Integer>(R.ExitCode).ToBe(0);
 end;
 
@@ -99,7 +142,7 @@ begin
   WriteTextFile(LockPath, '99999');
   Expect<Boolean>(FileExists(LockPath)).ToBe(True);
 
-  R := RunLwpt(['repair'], FScratch);
+  R := RunRepair;
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(LockPath)).ToBe(False);
 end;
@@ -123,7 +166,7 @@ begin
   WriteTextFile(ModulesMarker, 'committed state, must survive');
   Expect<Boolean>(FileExists(ModulesMarker)).ToBe(True);
 
-  R := RunLwpt(['repair'], FScratch);
+  R := RunRepair;
   Expect<Integer>(R.ExitCode).ToBe(0);
 
   Expect<Boolean>(FileExists(TmpOrphan)).ToBe(False);
@@ -140,7 +183,7 @@ begin
     '999999'#10'failed'#10'1'#10);
   WriteTextFile(SessionPath + '/jobs/app/private-output', 'incomplete');
 
-  R := RunLwpt(['repair'], FScratch);
+  R := RunRepair;
 
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(DirectoryExists(SessionPath)).ToBe(False);
@@ -158,6 +201,8 @@ begin
     TestRepairCleansTmpButLeavesCommittedState);
   Test('repair reclaims failed build-session staging',
     TestRepairReclaimsFailedBuildSession);
+  Test('repair reclaims dead machine-wide worker requests',
+    TestRepairReclaimsWorkerRequests);
 end;
 
 begin

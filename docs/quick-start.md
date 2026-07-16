@@ -66,7 +66,7 @@ After bootstrap:
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
-./build/lwpt repair             # reclaim install + build-session residue
+./build/lwpt repair             # reclaim install, build, and worker residue
 ```
 
 [`build-system.md`](./build-system.md) covers each in depth.
@@ -198,6 +198,7 @@ bar = { source = "owner/bar", version = "^1.0", subdir = "src" }   # inline-tabl
 ```
 
 Cleans `.lwpt/tmp/`, any stale install lock, and abandoned or failed
-`.lwpt/sessions/` staging. Live build/test sessions are retained. Repair never
-touches `.lwpt/modules/`, `.lwpt/archives/`, or the last successfully
-published build output.
+`.lwpt/sessions/` staging, then reclaims abandoned per-user worker requests and
+reports the remaining budget state. Live build/test sessions are retained.
+Repair never touches `.lwpt/modules/`, `.lwpt/archives/`, or the last
+successfully published build output.

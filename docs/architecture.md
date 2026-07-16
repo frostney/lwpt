@@ -40,8 +40,8 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
                        run *.Test.pas) check sources)  user-defined
                                                        script)
 
-   ↑ lwpt repair operates on .lwpt/tmp/, .lwpt/install.lock, and abandoned
-     .lwpt/sessions/ staging orthogonally.
+   ↑ lwpt repair operates on project residue, abandoned .lwpt/sessions/
+     staging, and the per-user worker coordinator orthogonally.
    ↑ lwpt init scaffolds a new project (manifest, source dir, optional install/build).
 ```
 
@@ -87,6 +87,7 @@ The flat-graph + hard-error policy is deliberate: FPC has one global unit namesp
 - **Extract:** gunzip (zstream) + a direct ustar reader. The bundled FPC `libtar` has a bug — it ignores the 155-byte `prefix` field at offset 345, so paths longer than 100 bytes get silently dropped. LWPT's reader joins `prefix + '/' + name` correctly and also follows GNU `'L'`/`'K'` long-name entries.
 - **Build:** `BuildOneTarget` invokes FPC with `-FE`, `-FU`, and `-o` paths below a unique session. It snapshots a versioned compiler-neutral publication request, the implicit source directory, declared inputs, and postbuild hook contributors before compilation. Per-target postbuild hooks receive the private candidate through `LWPT_BUILD_OUTPUT`, and existing `{item.output}` references are retargeted to it; only after hooks succeed does LWPT take a short thread-and-process lock derived from the destination's filesystem identity, revalidate the snapshot, and atomically replace the public executable when it is still current. Search-root fingerprints follow workspace directory links with cycle protection and exclude unrelated declared outputs, while explicit file inputs remain hashed.
 - **Test:** Each `*.Test.pas` is a self-contained program using `TestingPascalLibrary`. LWPT compiles and runs each from private session paths and reads the process exit code. No output parsing — see [`testing.md`](./testing.md).
+- **Worker coordination:** `LWPT.WorkerBudget` owns the per-user machine-capacity seam. Invocations register owner-guarded requests and acquire FIFO, reclaimable leases under a short cross-platform transaction lock. Nested LWPT subprocesses consume a one-shot opaque delegation that transfers one grant to the child's own guarded request instead of consuming another slot. `lwpt repair` reclaims requests only when their OS-held owner guard is absent; stale heartbeats remain diagnostic. Build and test scheduling consume this module in their own workstreams.
 
 ## `.lwpt/` layout
 
@@ -112,7 +113,8 @@ LWPT's own internal cleanup (e.g. `WipeInstalledDep` during re-install) detects 
 
 ## Error model
 
-`LWPT.Core` declares `ELWPTError` (base) + six subclasses:
+`LWPT.Core` declares `ELWPTError` (base) + six subclasses; worker coordination
+adds one module-specific subclass:
 
 | Class | Raised for |
 | --- | --- |
@@ -122,6 +124,7 @@ LWPT's own internal cleanup (e.g. `WipeInstalledDep` during re-install) detects 
 | `ELockfileError` | Corrupt TOML in `lwpt.lock`, schema version mismatch (v1 → v2), missing lockfile when `--frozen` |
 | `EManifestError` | TOML errors, missing required keys, unsatisfiable constraints, unknown source kinds |
 | `EConcurrencyError` | Concurrent `lwpt install` — second process fails fast naming the first's PID |
+| `ELWPTWorkerBudgetError` | Invalid worker-budget configuration, ownership, lease, or delegation state |
 
 Each error class carries an `Operation` and a `Recovery` field. The subcommand wrappers in `source/lwpt.pas` print `<program> <subcommand>: <message>` and the `Recovery` hint when set. Hash mismatches under `--frozen` print exactly which side mismatched (archive vs tree) and which dep is affected, so the recovery action is obvious from the message itself.
 
@@ -145,7 +148,7 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 
 ## Vendored code
 
-`source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`, `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.Command.*.pas`, `LWPT.Formatter.pas`, `LWPT.GitProtocol.pas`) plus a small remainder of utility units (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` — live under `packages/<name>/` per [ADR-0014](./adr/0014-packages-extraction.md) + [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) + [ADR-0017](./adr/0017-packages-lwpt-canonical.md). Each is a standalone Object Pascal project with its own `lwpt.toml`, `source/`, tests, version, and bundled `Shared.inc`; LWPT's root manifest auto-discovers them via `[workspaces] include = ["packages/*"]`. [`packages.md`](./packages.md) is the table of the package set, the divergence vs GocciaScript's older copies, the bootstrap chicken-and-egg story, and the graduation roadmap. The Hard Constraint in `AGENTS.md` is "Packages own their contents" — the root LWPT manifest does not modify a package's source from outside, and each package owns its own versioning + format scope + lifecycle hooks + public surface.
+`source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`, `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.WorkerBudget.pas`, `LWPT.Command.*.pas`, `LWPT.Formatter.pas`, `LWPT.GitProtocol.pas`) plus a small remainder of utility units (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` — live under `packages/<name>/` per [ADR-0014](./adr/0014-packages-extraction.md) + [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) + [ADR-0017](./adr/0017-packages-lwpt-canonical.md). Each is a standalone Object Pascal project with its own `lwpt.toml`, `source/`, tests, version, and bundled `Shared.inc`; LWPT's root manifest auto-discovers them via `[workspaces] include = ["packages/*"]`. [`packages.md`](./packages.md) is the table of the package set, the divergence vs GocciaScript's older copies, the bootstrap chicken-and-egg story, and the graduation roadmap. The Hard Constraint in `AGENTS.md` is "Packages own their contents" — the root LWPT manifest does not modify a package's source from outside, and each package owns its own versioning + format scope + lifecycle hooks + public surface.
 
 ## Deferred contracts
 
