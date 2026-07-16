@@ -18,8 +18,12 @@ type
     function CountSessionDirs: Integer;
     function CountSessionJobRoots: Integer;
     function CountReadyFiles(const ADir: string): Integer;
+    function TargetReady(const ADir, ATarget: string): Boolean;
     function StartBuildWithEnv(const AProject, ATarget: string;
       const AExtraEnv: array of string): TProcess;
+    function StartBuildWithArgs(const AProject: string;
+      const AArgs, AExtraEnv: array of string): TProcess;
+    procedure WriteGraphProject(const AProject: string);
     procedure WriteAppSource(AChanged: Boolean);
   protected
     procedure BeforeAll; override;
@@ -30,6 +34,9 @@ type
     procedure TestFailedBuildPreservesLastSuccessfulOutput;
     procedure TestInFlightSourceChangeRefusesPublication;
     procedure TestInFlightWorkspaceChangeRefusesPublication;
+    procedure TestOneInvocationRunsReadyTargetsInParallel;
+    procedure TestJobsOneRunsTargetsSequentially;
+    procedure TestFailedPrerequisiteBlocksOnlyDependants;
   end;
 
 function SlowUnitName(AIndex: Integer): string;
@@ -183,6 +190,14 @@ begin
   end;
 end;
 
+function TBuildSessions.TargetReady(const ADir, ATarget: string): Boolean;
+var Search: TSearchRec;
+begin
+  Result := FindFirst(IncludeTrailingPathDelimiter(ADir) + 'ready-'
+    + ATarget + '-*', faAnyFile, Search) = 0;
+  if Result then FindClose(Search);
+end;
+
 function EnvName(const AEntry: string): string;
 var
   EqualsAt: Integer;
@@ -210,13 +225,18 @@ end;
 function TBuildSessions.StartBuildWithEnv(
   const AProject, ATarget: string;
   const AExtraEnv: array of string): TProcess;
+begin
+  Result := StartBuildWithArgs(AProject, ['build', ATarget], AExtraEnv);
+end;
+
+function TBuildSessions.StartBuildWithArgs(const AProject: string;
+  const AArgs, AExtraEnv: array of string): TProcess;
 var
   i: Integer;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := LwptBinaryPath;
-  Result.Parameters.Add('build');
-  Result.Parameters.Add(ATarget);
+  for i := 0 to High(AArgs) do Result.Parameters.Add(AArgs[i]);
   Result.CurrentDirectory := AProject;
   Result.Options := [];
   if Length(AExtraEnv) > 0 then
@@ -228,6 +248,27 @@ begin
       Result.Environment.Add(AExtraEnv[i]);
   end;
   Result.Execute;
+end;
+
+procedure TBuildSessions.WriteGraphProject(const AProject: string);
+begin
+  RecursiveDelete(AProject);
+  WriteTextFile(AProject + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "graph-app"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[build]'#10
+    + 'alpha = { source = "source/alpha.pas", output = "build/alpha" }'#10
+    + 'beta = { source = "source/beta.pas", output = "build/beta" }'#10
+    + 'app = { source = "source/app.pas", output = "build/app", depends = ["alpha", "beta"] }'#10);
+  WriteTextFile(AProject + '/source/alpha.pas',
+    'program alpha; begin end.'#10);
+  WriteTextFile(AProject + '/source/beta.pas',
+    'program beta; begin end.'#10);
+  WriteTextFile(AProject + '/source/app.pas',
+    'program app; begin end.'#10);
 end;
 
 procedure TBuildSessions.TestConcurrentBuildsUseDistinctSessions;
@@ -246,12 +287,15 @@ begin
   ReleasePath := FScratch + '/control/concurrent-release';
   RecursiveDelete(FScratch + '/control');
   RealFPC := TestCompilerExecutable;
-  SetLength(Env, 5);
+  SetLength(Env, 7);
   Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
   Env[1] := 'LWPT_TEST_FPC_PROXY=1';
   Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
   Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
   Env[4] := 'LWPT_TEST_FPC_RELEASE=' + ReleasePath;
+  Env[5] := 'LWPT_WORKER_STATE_DIR=' + FScratch
+    + '/control/concurrent-worker-state';
+  Env[6] := 'LWPT_WORKER_BUDGET=2';
   First := StartBuildWithEnv(FScratch, 'app', Env);
   Second := StartBuildWithEnv(FScratch, 'app', Env);
   try
@@ -320,12 +364,15 @@ begin
   WriteTextFile(Project + '/second.pas',
     'program second; begin end.'#10);
   RealFPC := TestCompilerExecutable;
-  SetLength(Env, 5);
+  SetLength(Env, 7);
   Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
   Env[1] := 'LWPT_TEST_FPC_PROXY=1';
   Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
   Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
   Env[4] := 'LWPT_TEST_FPC_RELEASE=' + ReleasePath;
+  Env[5] := 'LWPT_WORKER_STATE_DIR=' + FScratch
+    + '/control/distinct-worker-state';
+  Env[6] := 'LWPT_WORKER_BUDGET=2';
   First := StartBuildWithEnv(Project, 'first', Env);
   Second := StartBuildWithEnv(Project, 'second', Env);
   try
@@ -532,6 +579,177 @@ begin
   end;
 end;
 
+procedure TBuildSessions.TestOneInvocationRunsReadyTargetsInParallel;
+var
+  Project, ReadyDir, ReleaseDir, RealFPC: string;
+  Build: TProcess;
+  Started: TDateTime;
+  Env: array of string;
+begin
+  Project := FScratch + '-parallel-graph';
+  ReadyDir := Project + '/control/ready';
+  ReleaseDir := Project + '/control/release';
+  WriteGraphProject(Project);
+  RealFPC := TestCompilerExecutable;
+  SetLength(Env, 7);
+  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
+  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
+  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
+  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
+  Env[4] := 'LWPT_TEST_FPC_RELEASE_DIR=' + ReleaseDir;
+  Env[5] := 'LWPT_WORKER_STATE_DIR=' + Project + '/worker-state';
+  Env[6] := 'LWPT_WORKER_BUDGET=4';
+  Build := StartBuildWithArgs(Project, ['build', 'app'], Env);
+  try
+    Started := Now;
+    while Build.Running
+      and not (TargetReady(ReadyDir, 'alpha')
+        and TargetReady(ReadyDir, 'beta')) do
+    begin
+      if (Now - Started) * 86400 > 10 then Break;
+      Sleep(10);
+    end;
+    Expect<Boolean>(TargetReady(ReadyDir, 'alpha')).ToBe(True);
+    Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(True);
+    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
+
+    { Complete in reverse manifest order. The dependent still cannot start
+      until both prerequisite publications have succeeded. }
+    WriteTextFile(ReleaseDir + '/beta', 'release');
+    Sleep(50);
+    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
+    WriteTextFile(ReleaseDir + '/alpha', 'release');
+    Started := Now;
+    while Build.Running and not TargetReady(ReadyDir, 'app') do
+    begin
+      if (Now - Started) * 86400 > 10 then Break;
+      Sleep(10);
+    end;
+    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(True);
+    Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/alpha')))
+      .ToBe(True);
+    Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/beta')))
+      .ToBe(True);
+    WriteTextFile(ReleaseDir + '/app', 'release');
+    Build.WaitOnExit;
+    Expect<Integer>(Build.ExitCode).ToBe(0);
+    Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/app')))
+      .ToBe(True);
+  finally
+    WriteTextFile(ReleaseDir + '/alpha', 'release');
+    WriteTextFile(ReleaseDir + '/beta', 'release');
+    WriteTextFile(ReleaseDir + '/app', 'release');
+    if Build.Running then Build.WaitOnExit;
+    Build.Free;
+    RecursiveDelete(Project);
+  end;
+end;
+
+procedure TBuildSessions.TestJobsOneRunsTargetsSequentially;
+var
+  Project, ReadyDir, ReleaseDir, RealFPC: string;
+  Build: TProcess;
+  Started: TDateTime;
+  Env: array of string;
+begin
+  Project := FScratch + '-sequential-graph';
+  ReadyDir := Project + '/control/ready';
+  ReleaseDir := Project + '/control/release';
+  WriteGraphProject(Project);
+  RealFPC := TestCompilerExecutable;
+  SetLength(Env, 7);
+  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
+  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
+  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
+  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
+  Env[4] := 'LWPT_TEST_FPC_RELEASE_DIR=' + ReleaseDir;
+  Env[5] := 'LWPT_WORKER_STATE_DIR=' + Project + '/worker-state';
+  Env[6] := 'LWPT_WORKER_BUDGET=4';
+  Build := StartBuildWithArgs(Project,
+    ['build', 'app', '--jobs=1'], Env);
+  try
+    Started := Now;
+    while Build.Running and not TargetReady(ReadyDir, 'alpha') do
+    begin
+      if (Now - Started) * 86400 > 10 then Break;
+      Sleep(10);
+    end;
+    Expect<Boolean>(TargetReady(ReadyDir, 'alpha')).ToBe(True);
+    Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(False);
+    WriteTextFile(ReleaseDir + '/alpha', 'release');
+    Started := Now;
+    while Build.Running and not TargetReady(ReadyDir, 'beta') do
+    begin
+      if (Now - Started) * 86400 > 10 then Break;
+      Sleep(10);
+    end;
+    Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(True);
+    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
+    WriteTextFile(ReleaseDir + '/beta', 'release');
+    Started := Now;
+    while Build.Running and not TargetReady(ReadyDir, 'app') do
+    begin
+      if (Now - Started) * 86400 > 10 then Break;
+      Sleep(10);
+    end;
+    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(True);
+    WriteTextFile(ReleaseDir + '/app', 'release');
+    Build.WaitOnExit;
+    Expect<Integer>(Build.ExitCode).ToBe(0);
+  finally
+    WriteTextFile(ReleaseDir + '/alpha', 'release');
+    WriteTextFile(ReleaseDir + '/beta', 'release');
+    WriteTextFile(ReleaseDir + '/app', 'release');
+    if Build.Running then Build.WaitOnExit;
+    Build.Free;
+    RecursiveDelete(Project);
+  end;
+end;
+
+procedure TBuildSessions.TestFailedPrerequisiteBlocksOnlyDependants;
+var
+  Project, ReadyDir, ReleaseDir, RealFPC: string;
+  Env: array of string;
+  R: TLwptResult;
+  AlphaAt, BetaAt, AppAt: Integer;
+begin
+  Project := FScratch + '-failed-graph';
+  ReadyDir := Project + '/control/ready';
+  ReleaseDir := Project + '/control/release';
+  WriteGraphProject(Project);
+  WriteTextFile(ReleaseDir + '/alpha', 'release');
+  WriteTextFile(ReleaseDir + '/beta', 'release');
+  WriteTextFile(ReleaseDir + '/app', 'release');
+  RealFPC := TestCompilerExecutable;
+  SetLength(Env, 8);
+  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
+  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
+  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
+  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
+  Env[4] := 'LWPT_TEST_FPC_RELEASE_DIR=' + ReleaseDir;
+  Env[5] := 'LWPT_TEST_FPC_FAIL_TARGET=alpha';
+  Env[6] := 'LWPT_WORKER_STATE_DIR=' + Project + '/worker-state';
+  Env[7] := 'LWPT_WORKER_BUDGET=4';
+  try
+    R := RunLwpt(['build'], Project, Env);
+    Expect<Integer>(R.ExitCode).ToBe(1);
+    Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/beta')))
+      .ToBe(True);
+    Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/app')))
+      .ToBe(False);
+    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
+    Expect<Boolean>(Pos('blocked by failed prerequisite "alpha"',
+      R.Stderr) > 0).ToBe(True);
+    AlphaAt := Pos('building alpha', R.Stdout);
+    BetaAt := Pos('building beta', R.Stdout);
+    AppAt := Pos('building app', R.Stdout);
+    Expect<Boolean>((AlphaAt > 0) and (AlphaAt < BetaAt)
+      and (BetaAt < AppAt)).ToBe(True);
+  finally
+    RecursiveDelete(Project);
+  end;
+end;
+
 procedure TBuildSessions.SetupTests;
 begin
   Test('concurrent builds use distinct private sessions',
@@ -544,11 +762,18 @@ begin
     TestInFlightSourceChangeRefusesPublication);
   Test('in-flight workspace changes refuse stale publication',
     TestInFlightWorkspaceChangeRefusesPublication);
+  Test('one invocation overlaps independent ready targets',
+    TestOneInvocationRunsReadyTargetsInParallel);
+  Test('--jobs=1 runs ready targets sequentially',
+    TestJobsOneRunsTargetsSequentially);
+  Test('failed prerequisite blocks only its dependants',
+    TestFailedPrerequisiteBlocksOnlyDependants);
 end;
 
 function RunCompilerProxy: Integer;
 var
-  Compiler, ReadyDir, ReleasePath: string;
+  Compiler, ReadyDir, ReleasePath, ReleaseDir, TargetName,
+    FailTarget: string;
   IsVersionQuery: Boolean;
   Process: TProcess;
   Started: TDateTime;
@@ -557,14 +782,19 @@ begin
   Compiler := GetEnvironmentVariable('LWPT_TEST_REAL_FPC');
   ReadyDir := GetEnvironmentVariable('LWPT_TEST_FPC_READY_DIR');
   ReleasePath := GetEnvironmentVariable('LWPT_TEST_FPC_RELEASE');
+  ReleaseDir := GetEnvironmentVariable('LWPT_TEST_FPC_RELEASE_DIR');
+  FailTarget := GetEnvironmentVariable('LWPT_TEST_FPC_FAIL_TARGET');
   IsVersionQuery := False;
   for i := 1 to ParamCount do
     if ParamStr(i) = '-iV' then IsVersionQuery := True;
   if not IsVersionQuery then
   begin
+    TargetName := ChangeFileExt(ExtractFileName(ParamStr(ParamCount)), '');
     ForceDirectories(ReadyDir);
     WriteTextFile(IncludeTrailingPathDelimiter(ReadyDir)
-      + 'ready-' + IntToStr(GetProcessID), 'ready');
+      + 'ready-' + TargetName + '-' + IntToStr(GetProcessID), 'ready');
+    if ReleaseDir <> '' then
+      ReleasePath := IncludeTrailingPathDelimiter(ReleaseDir) + TargetName;
     Started := Now;
     while not FileExists(ReleasePath) do
     begin
@@ -575,6 +805,7 @@ begin
       end;
       Sleep(10);
     end;
+    if SameText(TargetName, FailTarget) then Exit(17);
   end;
 
   Process := TProcess.Create(nil);

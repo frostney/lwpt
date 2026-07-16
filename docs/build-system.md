@@ -12,7 +12,10 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   atomically published to its manifest `output` only after its declared inputs
   are revalidated.
 - **Cross-compile via `FPC_TARGET_CPU`** env var; `lwpt build` translates this into FPC's `-P` flag.
-- **Machine capacity foundation.** `LWPT.WorkerBudget` provides fair, reclaimable per-user leases across processes and worktrees. Builds remain sequential until [issue #39](https://github.com/frostney/lwpt/issues/39) consumes that interface.
+- **Dependency-aware parallel builds.** Independent ready targets run in
+  parallel by default, bounded by `--jobs=<n>` and the machine-wide
+  `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See
+  [ADR-0022](./adr/0022-parallel-build-target-scheduler.md).
 - **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with staleness gating (output older than any input → re-run). The earlier `[generated]` shape is no longer parsed.
 
 ## The contract
@@ -24,6 +27,7 @@ Every project on this stack satisfies the build-system contract from `native-nos
 | Single entry point from repo root | `./build/lwpt build` |
 | Default target = clean dev build of every binary | `lwpt build` (no args) builds every `[build]` entry in dev mode |
 | Named targets, positional args | `lwpt build cli` builds only `cli`; multiple targets supported by passing more positionals |
+| Bounded parallelism | Ready targets overlap by default; `--jobs=<n>` sets the invocation ceiling and the machine worker budget may lower it |
 | Dev / prod distinction | `--mode dev` (default) / `--mode release` |
 | `clean` as a target | `--clean` flag; combined: `lwpt build --clean cli` forces a full compile in fresh private staging |
 | Single public output directory | Completed binaries land at `<target>.output`, conventionally under `build/`; compiler intermediates remain session-private |
@@ -113,11 +117,15 @@ The dev-mode flags in `scripts/bootstrap.pas` are the same set as `AddBuildModeF
 [build]
 mybin = { source = "src/app.pas",     output = "build/mybin" }
 cli   = { source = "src/cli/main.pas" }           # output defaults to source path without ext
+app   = { source = "src/app/main.pas", depends = ["mybin", "cli"] }
 shortform = "src/quicktool.pas"                   # bare-string shorthand
 ```
 
 - `source` (required): the program/`.dpr`/`.pas` file FPC compiles.
 - `output` (optional): the binary path; defaults to `ChangeFileExt(source, '')`. On Windows, `.exe` is appended automatically when missing.
+- `depends` (optional): targets that must publish successfully before this
+  target starts. Named builds include transitive prerequisites; unknown names
+  and cycles fail before build work.
 - Target names become job-directory path segments inside a session, so the
   names `""`, `"."`, and `".."` are rejected at manifest load. Each segment
   combines a bounded readable prefix with a hash of the full target identity,
@@ -157,11 +165,12 @@ retargeted to the private candidate at execution time when the expanded path
 is a complete path token. Related paths such as `build/app.json` are not
 rewritten. Hook definitions,
 scripts, and declared inputs participate in publication revalidation. A hook
-failure prevents publication. Whole-build postbuild runs only after every
-selected target compiles and its private hook succeeds, and before any
-candidate is published; artifact transformations therefore belong in the
-per-target hook. An unchanged candidate is then atomically renamed to the
-manifest output.
+failure prevents publication. Dependency-free builds retain whole-build
+postbuild as the final gate before batch publication. A declared graph
+publishes prerequisites progressively so dependants start only after successful
+publication; its whole-build postbuild consequently runs once after all
+selected outputs publish. Artifact transformations therefore belong in the
+per-target hook. See ADR-0022.
 
 Successful sessions are removed immediately. Failed, stale, or interrupted
 sessions remain private and diagnosable. `lwpt repair` removes inactive
@@ -223,9 +232,8 @@ The three deferred customer-facing stack contracts ([link-check #31](https://git
 
 ## Machine-wide worker capacity
 
-The worker-budget coordinator is implemented separately from scheduling.
-Future build schedulers acquire capacity from `LWPT.WorkerBudget` before
-starting compiler processes and release it when each process finishes. The
+The build scheduler acquires capacity from `LWPT.WorkerBudget` before starting
+each compiler process and releases it when that process finishes. The
 coordinator bounds aggregate work from several LWPT invocations and worktrees,
 not just the `--jobs` value of one process.
 

@@ -459,7 +459,7 @@ const
     ''#10 +
     '[build]'#10 +
     'cli = { source = "src/cli.pas", output = "bin/cli" }'#10 +
-    'tool = { source = "src/tool.pas" }'#10;
+    'tool = { source = "src/tool.pas", depends = ["cli"] }'#10;
 var Man: TManifest;
 begin
   Man := LoadManifest(WriteManifest('build-items', INPUT));
@@ -470,6 +470,8 @@ begin
   Expect<string>(Man.Targets[1].Name).ToBe('tool');
   Expect<string>(Man.Targets[1].Source).ToBe('src/tool.pas');
   Expect<string>(Man.Targets[1].Output).ToBe('');
+  Expect<Integer>(Length(Man.Targets[1].Depends)).ToBe(1);
+  Expect<string>(Man.Targets[1].Depends[0]).ToBe('cli');
 end;
 
 procedure TLoadManifestHappy.TestVersionSection;

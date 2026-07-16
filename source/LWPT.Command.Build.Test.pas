@@ -12,10 +12,15 @@ program LWPT.Command.Build.Test;
 {$modeswitch nestedcomments+}
 
 uses
+  {$IFDEF UNIX}
+  cthreads,
+  {$ENDIF}
+  Classes,
   SysUtils,
 
   LWPT.Command.Build,
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  Tests.Scratch;
 
 type
   TStaleArtefactSignature = class(TTestSuite)
@@ -27,7 +32,42 @@ type
     procedure TestOrdinarySourceErrorDoesNotMatch;
     procedure TestReslstMentionAloneDoesNotMatch;
     procedure TestEmptyOutputDoesNotMatch;
+    procedure TestCompilerCancellationCapturesAndReaps;
   end;
+
+  TCompilerRunnerThread = class(TThread)
+  private
+    FRunner: TLWPTCompilerProcess;
+    FMarker: string;
+  protected
+    procedure Execute; override;
+  public
+    Output: string;
+    ErrorMessage: string;
+    ExitCode: Integer;
+    constructor Create(ARunner: TLWPTCompilerProcess;
+      const AMarker: string);
+  end;
+
+constructor TCompilerRunnerThread.Create(ARunner: TLWPTCompilerProcess;
+  const AMarker: string);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FRunner := ARunner;
+  FMarker := AMarker;
+  ExitCode := -1;
+end;
+
+procedure TCompilerRunnerThread.Execute;
+begin
+  try
+    ExitCode := FRunner.Run(
+      ['--lwpt-compiler-process-proxy', FMarker], Output);
+  except
+    on E: Exception do ErrorMessage := E.Message;
+  end;
+end;
 
 procedure TStaleArtefactSignature.TestInternalCompilerExceptionMatches;
 begin
@@ -67,6 +107,42 @@ begin
   Expect<Boolean>(HasStaleArtefactSignature('')).ToBe(False);
 end;
 
+procedure TStaleArtefactSignature.TestCompilerCancellationCapturesAndReaps;
+var
+  Runner: TLWPTCompilerProcess;
+  Worker: TCompilerRunnerThread;
+  Scratch, Marker: string;
+  Started: TDateTime;
+begin
+  Scratch := ExpandFileName('build/tests/tmp/compiler-process-cancel');
+  Marker := Scratch + '/ready';
+  RecursiveDelete(Scratch);
+  Runner := TLWPTCompilerProcess.Create(ExpandFileName(ParamStr(0)));
+  Worker := TCompilerRunnerThread.Create(Runner, Marker);
+  try
+    Worker.Start;
+    Started := Now;
+    while not FileExists(Marker) do
+    begin
+      if (Now - Started) * 86400 > 10 then Break;
+      Sleep(10);
+    end;
+    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+    Runner.Cancel;
+    Worker.WaitFor;
+    Expect<string>(Worker.ErrorMessage).ToBe('');
+    Expect<Boolean>(Worker.ExitCode <> 0).ToBe(True);
+    Expect<Boolean>(Pos('captured-output-', Worker.Output) > 0).ToBe(True);
+    Expect<Boolean>(Length(Worker.Output) > 65536).ToBe(True);
+  finally
+    Runner.Cancel;
+    Worker.WaitFor;
+    Worker.Free;
+    Runner.Free;
+    RecursiveDelete(Scratch);
+  end;
+end;
+
 procedure TStaleArtefactSignature.SetupTests;
 begin
   Test('internal compiler exception matches',
@@ -78,9 +154,24 @@ begin
   Test('.reslst mention alone does not match',
     TestReslstMentionAloneDoesNotMatch);
   Test('empty output does not match', TestEmptyOutputDoesNotMatch);
+  Test('compiler cancellation captures output and reaps the child',
+    TestCompilerCancellationCapturesAndReaps);
+end;
+
+function RunCompilerProcessProxy: Integer;
+var i: Integer;
+begin
+  for i := 1 to 6000 do Write('captured-output-');
+  Flush(Output);
+  WriteTextFile(ParamStr(2), 'ready');
+  Sleep(30000);
+  Result := 0;
 end;
 
 begin
+  if (ParamCount >= 2)
+     and (ParamStr(1) = '--lwpt-compiler-process-proxy') then
+    Halt(RunCompilerProcessProxy);
   TestRunnerProgram.AddSuite(TStaleArtefactSignature.Create(
     'build: stale-artefact failure signature'));
   TestRunnerProgram.Run;

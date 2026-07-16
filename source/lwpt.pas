@@ -138,13 +138,16 @@ end;
 function HandleBuild(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  Release, Clean : Boolean;
+  Release, Clean, JobsPresent : Boolean;
+  Jobs : Integer;
   ModeVal : string;
   TargetNames : array of string;
   i : Integer;
 begin
   Release := False;          { dev is the default }
   Clean   := False;
+  Jobs    := 0;              { auto: bounded by graph + machine budget }
+  JobsPresent := False;
   for i := 0 to High(AOptions) do
   begin
     if SameText(AOptions[i].LongName, 'clean') and AOptions[i].Present then
@@ -163,12 +166,24 @@ begin
         Exit(1);
       end;
     end;
+    if SameText(AOptions[i].LongName, 'jobs')
+       and (AOptions[i] is TIntegerOption) then
+    begin
+      Jobs := TIntegerOption(AOptions[i]).ValueOr(0);
+      JobsPresent := AOptions[i].Present;
+    end;
+  end;
+  if JobsPresent and (Jobs < 1) then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('build'),
+      '--jobs must be a positive integer, got ', Jobs);
+    Exit(1);
   end;
   SetLength(TargetNames, APositionals.Count);
   for i := 0 to APositionals.Count - 1 do
     TargetNames[i] := APositionals[i];
   try
-    Result := CmdBuild(MANIFEST_FILE, TargetNames, Release, Clean);
+    Result := CmdBuild(MANIFEST_FILE, TargetNames, Release, Clean, Jobs);
   except
     on E: Exception do
     begin
@@ -360,13 +375,16 @@ begin
       '<name> [<name>...]',
       @HandleRemove, RemoveOpts));
 
-    SetLength(BuildOpts, 2);
+    SetLength(BuildOpts, 3);
     BuildOpts[0] := TStringOption.Create('mode',
       'Build mode: dev (default) or release');
     BuildOpts[1] := TFlagOption.Create('clean',
       'Force a full rebuild in fresh private staging');
+    BuildOpts[2] := TIntegerOption.Create('jobs',
+      'Maximum concurrent build targets (default: machine budget)');
     Registry.Add(TSubcommand.Create('build',
-      'Compile manifest targets', '[target...] [--mode dev|release] [--clean]',
+      'Compile manifest targets',
+      '[target...] [--mode dev|release] [--clean] [--jobs N]',
       @HandleBuild, BuildOpts));
 
     SetLength(FormatOpts, 1);

@@ -56,6 +56,7 @@ After bootstrap:
 ./build/lwpt build --mode release
 ./build/lwpt build <target>     # single target
 ./build/lwpt build --clean      # force a fresh private-session rebuild
+./build/lwpt build --jobs=1     # force sequential target execution
 
 ./build/lwpt format             # rewrite sources to canonical style
 ./build/lwpt format --check     # exit non-zero on any deviation

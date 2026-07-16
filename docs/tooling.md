@@ -6,7 +6,10 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 
 - **FPC 3.2.2 is pinned for v1.** Verify live with `fpc -iV` before any change that depends on FPC behavior — memory and prior conversation are not acceptable sources.
 - **Lefthook 2.x runs the pre-commit hook.** Local pre-commit runs `lwpt format` (auto-fix, with `stage_fixed: true`); the heavyweight gates (`lwpt build` + `lwpt test` + `lwpt format --check`) run on the PR workflow in CI. Install with `lefthook install`.
-- **Build configuration uses three ambient environment variables today.** `LWPT_CACHE_DIR` (reserved for the cache work in issue #30; currently ignored), `FPC_TARGET_CPU` (cross-compile via FPC's `-P` flag), and `PATH` (must contain `fpc`, `instantfpc`, `lefthook`). LWPT also supplies three read-only context variables to per-target postbuild hooks.
+- **Build configuration uses the worker-budget environment too.** Alongside
+  `LWPT_CACHE_DIR`, `FPC_TARGET_CPU`, and `PATH`, builds consume the
+  `LWPT_WORKER_*` settings below. `--jobs=<n>` is the invocation ceiling; the
+  machine budget remains authoritative across processes and worktrees.
 - **Worker capacity is coordinated across worktrees.** The internal worker-budget module uses per-user, reclaimable filesystem leases. Its default budget is the host's logical processor count; `LWPT_WORKER_BUDGET` overrides it.
 - **TLS backend is platform-native.** SChannel on Windows, SecureTransport on macOS — both built into the OS, no DLLs to bundle. Linux uses the distro's libssl package (system OpenSSL via `dlopen`). Per [ADR-0016](./adr/0016-tls-backend-per-platform.md).
 - **EXDEV-rename failures fall back to copy-then-delete.** When `.lwpt/tmp/` and `.lwpt/modules/` end up on different filesystems (Docker bind mounts, network drives), the atomic-rename helpers (`AtomicMoveFile`, `AtomicMoveDir`) automatically fall back to a copy followed by delete.
@@ -63,9 +66,9 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 
 ## Machine-wide worker budget
 
-`LWPT.WorkerBudget` provides the capacity seam used by the parallel build and
-test schedulers. The coordinator exists now; `lwpt build` and `lwpt test`
-remain sequential until their scheduler issues consume it.
+`LWPT.WorkerBudget` provides the capacity seam used by schedulers. `lwpt build`
+acquires one lease per active target compiler; `lwpt test` remains sequential
+until its scheduler work lands.
 
 Each invocation registers a session request in a per-user state root shared by
 all worktrees. The effective budget is the first invocation's configured
@@ -173,10 +176,10 @@ in `LWPT_BUILD_OUTPUT`, the requested path in `LWPT_BUILD_PUBLIC_OUTPUT`, and
 the target name in `LWPT_BUILD_TARGET`. Runtime retargeting also maps existing
 `{item.output}`-expanded hook fields to the private candidate. Hook failure
 keeps the candidate private, and hook definitions, scripts, and declared
-inputs are revalidated before publication. The whole-build postbuild hook runs
-against all staged outputs after every selected target succeeds, with
-complete-token output references retargeted to their private candidates.
-Publication begins only after that final hook succeeds. Unix lifecycle
+inputs are revalidated before publication. For dependency-free manifests, the
+whole-build postbuild hook runs against all staged outputs and gates batch
+publication. A declared target graph publishes prerequisites progressively;
+its whole-build postbuild runs once after all selected outputs publish. Unix lifecycle
 hooks use an InstantFPC cache below the owning session. Windows compiles those
 hooks directly into the same private hook root. Compiler directories use
 bounded readable prefixes plus hashes of their full source identities, so

@@ -10,7 +10,7 @@ lwpt init      scaffold a new project (manifest + source dir + sample entry)
 lwpt install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
 lwpt add       add a dependency to lwpt.toml + install it   [--name <name>]
 lwpt remove    remove dependencies from lwpt.toml + prune their modules
-lwpt build     compile manifest targets   [--mode dev|release] [--clean]
+lwpt build     compile manifest targets   [--mode dev|release] [--clean] [--jobs N]
 lwpt format    format uses-clauses + identifiers   [--check]
 lwpt test      discover, compile and run *.Test.pas files
 lwpt repair    reclaim install, build-session, and worker-lease residue

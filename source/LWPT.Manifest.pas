@@ -132,6 +132,7 @@ type
     Name      : string;            { logical name, e.g. "cli" }
     Source    : string;            { entry-point .pas/.dpr path }
     Output    : string;            { optional output binary path }
+    Depends   : TStringArray;      { prerequisite target names (ADR-0022) }
     PreBuild  : THookArray;        { per-target prebuild hooks (ADR-0011) }
     PostBuild : THookArray;        { per-target postbuild hooks (ADR-0011) }
   end;
@@ -1451,6 +1452,15 @@ begin
         if AIsRoot then ValidateTargetName(T.Name);
         T.Source := TomlStr(TgtsNode, 'source', '');
         T.Output := TomlStr(TgtsNode, 'output', '');
+        ArrNode := TomlGet(TgtsNode, 'depends');
+        if TomlIsArray(ArrNode) then
+          for i := 0 to ArrNode.Items.Count - 1 do
+            if TomlIsString(ArrNode.Items[i]) then
+            begin
+              n := Length(T.Depends);
+              SetLength(T.Depends, n + 1);
+              T.Depends[n] := ArrNode.Items[i].ScalarText;
+            end;
         if T.Output = '' then T.Output := 'build/' + Result.Name;
         ParseHookSection(TomlGet(TgtsNode, 'prebuild'),
           'build.prebuild', T.PreBuild);
@@ -1472,6 +1482,15 @@ begin
           begin
             T.Source := TomlStr(TgtNode, 'source', '');
             T.Output := TomlStr(TgtNode, 'output', '');
+            ArrNode := TomlGet(TgtNode, 'depends');
+            if TomlIsArray(ArrNode) then
+              for i := 0 to ArrNode.Items.Count - 1 do
+                if TomlIsString(ArrNode.Items[i]) then
+                begin
+                  n := Length(T.Depends);
+                  SetLength(T.Depends, n + 1);
+                  T.Depends[n] := ArrNode.Items[i].ScalarText;
+                end;
             ParseHookSection(TomlGet(TgtNode, 'prebuild'),
               'build.' + T.Name + '.prebuild', T.PreBuild);
             ParseHookSection(TomlGet(TgtNode, 'postbuild'),

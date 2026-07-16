@@ -51,6 +51,8 @@ type
     procedure TestSanitisedTargetNamesRemainDistinct;
     procedure TestCleanLeavesOrphanTargetDirsUntouched;
     procedure TestMissingCompilerFailsTargetsButLoopContinues;
+    procedure TestInvalidJobsFailsBeforeBuildingAnything;
+    procedure TestInvalidDependencyGraphFailsBeforeBuildingAnything;
     {$IFDEF UNIX}
     procedure TestCleanFailureFailsTargetButBuildContinues;
     {$ENDIF}
@@ -277,6 +279,46 @@ begin
   Expect<Boolean>(Pos('0 built, 2 failed', R.Stdout) > 0).ToBe(True);
 end;
 
+procedure TBuildMultiTarget.TestInvalidJobsFailsBeforeBuildingAnything;
+var R: TLwptResult;
+begin
+  WipeOutputs;
+  R := RunLwpt(['build', '--jobs=0'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('--jobs must be a positive integer', R.Stderr) > 0)
+    .ToBe(True);
+  Expect<Boolean>(DirectoryExists(FScratch + '/build')).ToBe(False);
+end;
+
+procedure TBuildMultiTarget.TestInvalidDependencyGraphFailsBeforeBuildingAnything;
+var
+  Bad: string;
+  R: TLwptResult;
+begin
+  Bad := ExpandFileName(
+    GetCurrentDir + '/build/tests/tmp/build-invalid-graph');
+  RecursiveDelete(Bad);
+  WriteTextFile(Bad + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "invalid-graph"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src"]'#10
+    + #10
+    + '[build]'#10
+    + 'alpha = { source = "src/alpha.pas", depends = ["missing"] }'#10);
+  WriteTextFile(Bad + '/src/alpha.pas',
+    'program alpha; begin end.'#10);
+  try
+    R := RunLwpt(['build'], Bad);
+    Expect<Integer>(R.ExitCode).ToBe(1);
+    Expect<Boolean>(Pos('depends on unknown target "missing"',
+      R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(DirectoryExists(Bad + '/.lwpt/sessions')).ToBe(False);
+  finally
+    RecursiveDelete(Bad);
+  end;
+end;
+
 {$IFDEF UNIX}
 procedure TBuildMultiTarget.TestCleanFailureFailsTargetButBuildContinues;
 var
@@ -322,6 +364,10 @@ begin
     TestCleanLeavesOrphanTargetDirsUntouched);
   Test('missing compiler fails targets individually, loop continues',
     TestMissingCompilerFailsTargetsButLoopContinues);
+  Test('invalid --jobs fails before building anything',
+    TestInvalidJobsFailsBeforeBuildingAnything);
+  Test('invalid dependency graph fails before building anything',
+    TestInvalidDependencyGraphFailsBeforeBuildingAnything);
   {$IFDEF UNIX}
   Test('clean ignores locked shared artefact dirs',
     TestCleanFailureFailsTargetButBuildContinues);

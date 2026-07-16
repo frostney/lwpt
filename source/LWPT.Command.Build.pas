@@ -7,8 +7,33 @@ unit LWPT.Command.Build;
 
 interface
 
+uses
+  Classes,
+  Process,
+  SysUtils,
+
+  LWPT.Core;
+
+type
+  { Public so the cross-platform cancellation/reaping contract can be tested
+    directly without launching a full build scheduler. }
+  TLWPTCompilerProcess = class
+  private
+    FExecutable: string;
+    FProcess: TProcess;
+    FCancelled: Boolean;
+    FCriticalSection: TRTLCriticalSection;
+  public
+    constructor Create(const AExecutable: string = '');
+    destructor Destroy; override;
+    function Run(const AArgs: LWPT.Core.TStringArray;
+      out AOutput: string): Integer;
+    procedure Cancel;
+  end;
+
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; ARelease, AClean: Boolean): Integer;
+  const ATargetNames: array of string; ARelease, AClean: Boolean;
+  AJobs: Integer): Integer;
 
 { Exposed for unit tests: does this FPC failure output look like stale
   build artefacts (worth a --clean retry) rather than a source error? }
@@ -17,14 +42,10 @@ function HasStaleArtefactSignature(const AOutput: string): Boolean;
 implementation
 
 uses
-  Classes,
-  Process,
-  SysUtils,
-
   LWPT.BuildSession,
   LWPT.Command.Common,
-  LWPT.Core,
   LWPT.Manifest,
+  LWPT.WorkerBudget,
   Platform;
 
 type
@@ -41,6 +62,47 @@ type
   end;
 
   TLWPTCompiledTargetArray = array of TLWPTCompiledTarget;
+
+  TLWPTBuildJob = class(TThread)
+  private
+    FManifestPath: string;
+    FManifest: TManifest;
+    FManifestContentHash: string;
+    FTarget: TBuildTarget;
+    FRelease: Boolean;
+    FClean: Boolean;
+    FSession: TLWPTBuildSession;
+    FLease: TLWPTWorkerLease;
+    FCompiler: TLWPTCompilerProcess;
+    FCompiled: TLWPTCompiledTarget;
+    FOutput: string;
+    FError: string;
+    FSucceeded: Boolean;
+    FDone: Boolean;
+    FDoneCriticalSection: TRTLCriticalSection;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AManifestPath: string;
+      const AManifest: TManifest; const AManifestContentHash: string;
+      const ATarget: TBuildTarget; ARelease, AClean: Boolean;
+      ASession: TLWPTBuildSession; ALease: TLWPTWorkerLease);
+    destructor Destroy; override;
+    procedure Cancel;
+    function IsDone: Boolean;
+    property Compiled: TLWPTCompiledTarget read FCompiled;
+    property CapturedOutput: string read FOutput;
+    property ErrorMessage: string read FError;
+    property Succeeded: Boolean read FSucceeded;
+  end;
+
+  TLWPTTargetState = (tsUnselected, tsPending, tsRunning, tsCompiled,
+    tsSucceeded, tsFailed, tsBlocked);
+
+  TLWPTTargetStateArray = array of TLWPTTargetState;
+  TLWPTBooleanArray = array of Boolean;
+  TLWPTBuildJobArray = array of TLWPTBuildJob;
+  TLWPTStringArray = array of string;
 
 procedure AddBuildModeFlags(AArgs: TStrings; ARelease: Boolean);
 begin
@@ -59,45 +121,109 @@ begin
   end;
 end;
 
-{ Run FPC with the given arguments, echoing its output live (chunk by
-  chunk, as the old inherited-stdio path did) while also accumulating
-  it for the stale-artefact inspection on failure. Returns the fpc
-  exit code. A compiler that cannot be started raises (EProcess);
-  CmdBuild's per-target containment turns that into a failed target.
-  SetString carries an explicit length, so the accumulation is
-  byte-safe regardless of chunk content. }
-function RunFPCEchoed(const AArgs: TStringArray;
+constructor TLWPTCompilerProcess.Create(const AExecutable: string);
+begin
+  inherited Create;
+  FExecutable := AExecutable;
+  FProcess := nil;
+  FCancelled := False;
+  InitCriticalSection(FCriticalSection);
+end;
+
+destructor TLWPTCompilerProcess.Destroy;
+begin
+  Cancel;
+  DoneCriticalSection(FCriticalSection);
+  inherited Destroy;
+end;
+
+{ Each worker owns one compiler process. Output is drained while the process
+  runs and retained by the worker so the scheduler can replay it in manifest
+  order. Cancel terminates the active child; Run always waits before clearing
+  FProcess, so Unix and Windows both reap the process before the worker ends. }
+function TLWPTCompilerProcess.Run(const AArgs: LWPT.Core.TStringArray;
   out AOutput: string): Integer;
 var
   P: TProcess;
   Buf: array[0..4095] of Byte;
   Chunk: string;
   i, N: Integer;
+  TerminateAfterStart: Boolean;
 begin
   AOutput := '';
   P := TProcess.Create(nil);
   try
-    P.Executable := FPCExecutable;
+    if FExecutable <> '' then
+      P.Executable := FExecutable
+    else
+      P.Executable := FPCExecutable;
     for i := 0 to High(AArgs) do
       P.Parameters.Add(AArgs[i]);
     P.Options := [poUsePipes, poStderrToOutPut];
+    EnterCriticalSection(FCriticalSection);
+    try
+      if FCancelled then
+        raise ELWPTError.Create('compiler process cancelled');
+    finally
+      LeaveCriticalSection(FCriticalSection);
+    end;
     P.Execute;
-    { Blocking read until EOF: drains the pipe as FPC produces output,
-      so large compiles can neither deadlock the pipe nor go silent. }
+    { Cancel may race the small process-start window. Publish the live
+      handle only after Execute, then honour any cancellation that arrived
+      while no terminable child existed. }
+    EnterCriticalSection(FCriticalSection);
+    try
+      FProcess := P;
+      TerminateAfterStart := FCancelled;
+    finally
+      LeaveCriticalSection(FCriticalSection);
+    end;
+    if TerminateAfterStart then
+      try
+        P.Terminate(1);
+      except
+        { The child may already have exited. }
+      end;
     repeat
       N := P.Output.Read(Buf[0], SizeOf(Buf));
       if N > 0 then
       begin
         SetString(Chunk, PAnsiChar(@Buf[0]), N);
-        Write(Chunk);
-        Flush(Output);
         AOutput := AOutput + Chunk;
       end;
     until N <= 0;
     P.WaitOnExit;
-    Result := P.ExitStatus;
+    Result := P.ExitCode;
+    EnterCriticalSection(FCriticalSection);
+    try
+      if FCancelled then Result := 1;
+    finally
+      LeaveCriticalSection(FCriticalSection);
+    end;
   finally
+    EnterCriticalSection(FCriticalSection);
+    try
+      if FProcess = P then FProcess := nil;
+    finally
+      LeaveCriticalSection(FCriticalSection);
+    end;
     P.Free;
+  end;
+end;
+
+procedure TLWPTCompilerProcess.Cancel;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    FCancelled := True;
+    if Assigned(FProcess) then
+      try
+        FProcess.Terminate(1);
+      except
+        { The child may have exited between discovery and termination. }
+      end;
+  finally
+    LeaveCriticalSection(FCriticalSection);
   end;
 end;
 
@@ -381,7 +507,8 @@ end;
 function BuildOneTarget(const AManifestPath: string; const AMan: TManifest;
   const AManifestContentHash: string;
   const T: TBuildTarget; ARelease, AClean: Boolean;
-  ASession: TLWPTBuildSession; out ACompiled: TLWPTCompiledTarget): Boolean;
+  ASession: TLWPTBuildSession; ACompiler: TLWPTCompilerProcess;
+  out ACompiled: TLWPTCompiledTarget; out AOutput: string): Boolean;
 var
   Args : TStringList;
   FpcArgs : TStringArray;
@@ -391,11 +518,9 @@ var
   Request: TLWPTBuildPublicationRequest;
 begin
   ACompiled := Default(TLWPTCompiledTarget);
+  AOutput := '';
   if T.Source = '' then
-  begin
-    WriteLn(ErrOutput, '  target "', T.Name, '" has no source — skipped');
     Exit(False);
-  end;
 
   OutBin := T.Output;
   if OutBin = '' then
@@ -415,8 +540,6 @@ begin
   CandidateBin := BinDir + '/' + ExtractFileName(OutBin);
   ForceDirectories(BinDir);
   ForceDirectories(UnitOutDir);
-
-  Write('  building ', T.Name, ' (', T.Source, ') ... ');
 
   ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
   CfgPath := ResolveCfgFile(AMan);
@@ -493,8 +616,13 @@ begin
     Args.Free;
   end;
 
-  FpcExit := RunFPCEchoed(FpcArgs, OutText);
+  FpcExit := ACompiler.Run(FpcArgs, OutText);
+  AOutput := OutText;
   Result := FpcExit = 0;
+
+  if not Result then
+    AOutput := AOutput + LineEnding + 'FAILED (fpc exit '
+      + IntToStr(FpcExit) + ')' + LineEnding;
 
   if Result then
   begin
@@ -508,19 +636,116 @@ begin
     ACompiled.Request := Request;
   end;
 
-  { The streamed compiler output above follows fpc's own channel
-    (fpc emits its messages on stdout); lwpt's own failure banner and
-    hint are errors and belong on stderr. }
-  if (not Result) and (FpcExit <> 0) then
-    WriteLn(ErrOutput, 'FAILED (fpc exit ', FpcExit, ')');
-
   if (not Result) and (not AClean)
      and HasStaleArtefactSignature(OutText) then
   begin
-    WriteLn(ErrOutput,
-      '  hint: stale FPC build artefacts can cause this error.');
-    WriteLn(ErrOutput,
-      '  retry with: ', PROGRAM_NAME, ' build ', T.Name, ' --clean');
+    AOutput := AOutput + LineEnding
+      + '  hint: stale FPC build artefacts can cause this error.'
+      + LineEnding + '  retry with: ' + PROGRAM_NAME + ' build '
+      + T.Name + ' --clean' + LineEnding;
+  end;
+end;
+
+constructor TLWPTBuildJob.Create(const AManifestPath: string;
+  const AManifest: TManifest; const AManifestContentHash: string;
+  const ATarget: TBuildTarget; ARelease, AClean: Boolean;
+  ASession: TLWPTBuildSession; ALease: TLWPTWorkerLease);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FManifestPath := AManifestPath;
+  FManifest := AManifest;
+  FManifestContentHash := AManifestContentHash;
+  FTarget := ATarget;
+  FRelease := ARelease;
+  FClean := AClean;
+  FSession := ASession;
+  FLease := ALease;
+  FCompiler := TLWPTCompilerProcess.Create;
+  FCompiled := Default(TLWPTCompiledTarget);
+  FOutput := '';
+  FError := '';
+  FSucceeded := False;
+  FDone := False;
+  InitCriticalSection(FDoneCriticalSection);
+end;
+
+destructor TLWPTBuildJob.Destroy;
+begin
+  FCompiler.Free;
+  DoneCriticalSection(FDoneCriticalSection);
+  inherited Destroy;
+end;
+
+procedure TLWPTBuildJob.Execute;
+begin
+  try
+    try
+      FSucceeded := BuildOneTarget(FManifestPath, FManifest,
+        FManifestContentHash, FTarget, FRelease, FClean, FSession,
+        FCompiler, FCompiled, FOutput);
+      if (not FSucceeded) and (FError = '') then
+        if FTarget.Source = '' then
+          FError := 'target has no source'
+        else
+          FError := 'compiler failed';
+    except
+      on E: Exception do
+      begin
+        FSucceeded := False;
+        FError := E.Message;
+      end;
+    end;
+  finally
+    if Assigned(FLease) then
+    begin
+      try
+        try
+          FLease.Release;
+        except
+          on E: Exception do
+          begin
+            FSucceeded := False;
+            if FError = '' then
+              FError := 'worker lease release failed: ' + E.Message;
+          end;
+        end;
+        try
+          FreeAndNil(FLease);
+        except
+          on E: Exception do
+          begin
+            FSucceeded := False;
+            if FError = '' then
+              FError := 'worker lease cleanup failed: ' + E.Message;
+          end;
+        end;
+      finally
+        FLease := nil;
+      end;
+    end;
+    EnterCriticalSection(FDoneCriticalSection);
+    try
+      FDone := True;
+    finally
+      LeaveCriticalSection(FDoneCriticalSection);
+    end;
+  end;
+end;
+
+procedure TLWPTBuildJob.Cancel;
+begin
+  Terminate;
+  FCompiler.Cancel;
+end;
+
+function TLWPTBuildJob.IsDone: Boolean;
+begin
+  EnterCriticalSection(FDoneCriticalSection);
+  try
+    Result := FDone;
+  finally
+    LeaveCriticalSection(FDoneCriticalSection);
   end;
 end;
 
@@ -542,30 +767,191 @@ begin
   Result := False;
 end;
 
-{ Does any entry of ANames match AName (case-insensitive)? }
-function NameListed(const AName: string;
-  const ANames: array of string): Boolean;
+function FindTargetIndex(const ATargets: array of TBuildTarget;
+  const AName: string): Integer;
 var i: Integer;
 begin
-  for i := 0 to High(ANames) do
-    if SameText(ANames[i], AName) then Exit(True);
+  for i := 0 to High(ATargets) do
+    if SameText(ATargets[i].Name, AName) then Exit(i);
+  Result := -1;
+end;
+
+procedure ValidateBuildGraph(const ATargets: array of TBuildTarget);
+var
+  VisitState: array of Byte;
+  i: Integer;
+
+  procedure Visit(AIndex: Integer);
+  var j, DependencyIndex: Integer;
+  begin
+    if VisitState[AIndex] = 2 then Exit;
+    if VisitState[AIndex] = 1 then
+      raise EManifestError.CreateFmt(
+        '[build] dependency cycle reaches target "%s"',
+        [ATargets[AIndex].Name]);
+    VisitState[AIndex] := 1;
+    for j := 0 to High(ATargets[AIndex].Depends) do
+    begin
+      DependencyIndex := FindTargetIndex(ATargets,
+        ATargets[AIndex].Depends[j]);
+      if DependencyIndex < 0 then
+        raise EManifestError.CreateFmt(
+          '[build] target "%s" depends on unknown target "%s"',
+          [ATargets[AIndex].Name, ATargets[AIndex].Depends[j]]);
+      Visit(DependencyIndex);
+    end;
+    VisitState[AIndex] := 2;
+  end;
+
+begin
+  SetLength(VisitState, Length(ATargets));
+  for i := 0 to High(ATargets) do Visit(i);
+end;
+
+procedure SelectTargetClosure(const ATargets: array of TBuildTarget;
+  const ARequestedNames: array of string; var ASelected: TLWPTBooleanArray);
+var i: Integer;
+
+  procedure Select(AIndex: Integer);
+  var j, DependencyIndex: Integer;
+  begin
+    if ASelected[AIndex] then Exit;
+    ASelected[AIndex] := True;
+    for j := 0 to High(ATargets[AIndex].Depends) do
+    begin
+      DependencyIndex := FindTargetIndex(ATargets,
+        ATargets[AIndex].Depends[j]);
+      Select(DependencyIndex);
+    end;
+  end;
+
+begin
+  SetLength(ASelected, Length(ATargets));
+  if Length(ARequestedNames) = 0 then
+    for i := 0 to High(ATargets) do Select(i)
+  else
+    for i := 0 to High(ARequestedNames) do
+      Select(FindTargetIndex(ATargets, ARequestedNames[i]));
+end;
+
+function SelectedGraphHasEdges(const ATargets: array of TBuildTarget;
+  const ASelected: TLWPTBooleanArray): Boolean;
+var i: Integer;
+begin
+  for i := 0 to High(ATargets) do
+    if ASelected[i] and (Length(ATargets[i].Depends) > 0) then Exit(True);
+  Result := False;
+end;
+
+function DependenciesSucceeded(const ATarget: TBuildTarget;
+  const ATargets: array of TBuildTarget;
+  const AStates: TLWPTTargetStateArray): Boolean;
+var i, DependencyIndex: Integer;
+begin
+  for i := 0 to High(ATarget.Depends) do
+  begin
+    DependencyIndex := FindTargetIndex(ATargets, ATarget.Depends[i]);
+    if AStates[DependencyIndex] <> tsSucceeded then Exit(False);
+  end;
+  Result := True;
+end;
+
+function FailedDependency(const ATarget: TBuildTarget;
+  const ATargets: array of TBuildTarget;
+  const AStates: TLWPTTargetStateArray; out AName: string): Boolean;
+var i, DependencyIndex: Integer;
+begin
+  for i := 0 to High(ATarget.Depends) do
+  begin
+    DependencyIndex := FindTargetIndex(ATargets, ATarget.Depends[i]);
+    if AStates[DependencyIndex] in [tsFailed, tsBlocked] then
+    begin
+      AName := ATargets[DependencyIndex].Name;
+      Exit(True);
+    end;
+  end;
   Result := False;
 end;
 
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; ARelease, AClean: Boolean): Integer;
+  const ATargetNames: array of string; ARelease, AClean: Boolean;
+  AJobs: Integer): Integer;
 var
   Man : TManifest;
-  i, j, Built, Failed, Unknown : Integer;
+  i, j, Built, Failed, Unknown, SelectedCount, MaxJobs, Running,
+    Completed : Integer;
   Matched : Boolean;
-  ModeStr, CollA, CollB : string;
+  ModeStr, CollA, CollB, DependencyName : string;
   ManifestContentHash: string;
   Session: TLWPTBuildSession;
-  Compiled: TLWPTCompiledTarget;
-  Pending: TLWPTCompiledTargetArray;
+  WorkerSession: TLWPTWorkerBudgetSession;
+  Lease: TLWPTWorkerLease;
+  Selected: TLWPTBooleanArray;
+  States: TLWPTTargetStateArray;
+  Jobs: TLWPTBuildJobArray;
+  Compiled: TLWPTCompiledTargetArray;
+  CapturedOutputs, Errors: TLWPTStringArray;
   PublicationRequest: TLWPTBuildPublicationRequest;
   WholePostBuild: THookArray;
   HookEnvironment: array of string;
+  HasEdges, MadeProgress: Boolean;
+
+  procedure RunTargetPostBuild(AIndex: Integer);
+  begin
+    SetLength(HookEnvironment, 3);
+    HookEnvironment[0] := 'LWPT_BUILD_TARGET=' + Compiled[AIndex].Name;
+    HookEnvironment[1] := 'LWPT_BUILD_OUTPUT='
+      + Compiled[AIndex].CandidateBin;
+    HookEnvironment[2] := 'LWPT_BUILD_PUBLIC_OUTPUT='
+      + Compiled[AIndex].OutBin;
+    RunHooksWithEnvironment('postbuild:' + Man.Targets[AIndex].Name,
+      Compiled[AIndex].PostBuild, Session.HookRoot, HookEnvironment);
+  end;
+
+  procedure FinalizeTarget(AIndex: Integer; ARunPostBuild: Boolean);
+  begin
+    try
+      if ARunPostBuild then RunTargetPostBuild(AIndex);
+      PublicationRequest := Compiled[AIndex].Request;
+      PublicationRequest.CompilerVersion := QueryFPCVersion;
+      if PublishBuildArtifact(Compiled[AIndex].ProjectRoot,
+        Compiled[AIndex].CandidateBin, Compiled[AIndex].OutBin,
+        Compiled[AIndex].Fingerprint, AManifestPath,
+        Compiled[AIndex].CfgPath, LOCKFILE, Compiled[AIndex].ModulesPath,
+        PublicationRequest) = bprStale then
+      begin
+        States[AIndex] := tsFailed;
+        Errors[AIndex] := 'inputs changed during compilation; private '
+          + 'result was not published';
+        Inc(Failed);
+      end
+      else
+      begin
+        States[AIndex] := tsSucceeded;
+        Inc(Built);
+      end;
+    except
+      on E: Exception do
+      begin
+        States[AIndex] := tsFailed;
+        Errors[AIndex] := E.Message;
+        Inc(Failed);
+      end;
+    end;
+  end;
+
+  procedure StopAndFreeJobs;
+  var k: Integer;
+  begin
+    for k := 0 to High(Jobs) do
+      if Assigned(Jobs[k]) and (not Jobs[k].IsDone) then Jobs[k].Cancel;
+    for k := 0 to High(Jobs) do
+      if Assigned(Jobs[k]) then
+      begin
+        Jobs[k].WaitFor;
+        FreeAndNil(Jobs[k]);
+      end;
+  end;
 begin
   if not FileExists(AManifestPath) then
     raise EManifestError.CreateFmt(
@@ -599,6 +985,12 @@ begin
   end;
   if Unknown > 0 then Exit(1);
 
+  ValidateBuildGraph(Man.Targets);
+  SelectTargetClosure(Man.Targets, ATargetNames, Selected);
+  SelectedCount := 0;
+  for i := 0 to High(Selected) do
+    if Selected[i] then Inc(SelectedCount);
+
   if FindArtefactDirCollision(Man.Targets, CollA, CollB) then
   begin
     WriteLn(ErrOutput, 'targets "', CollA, '" and "', CollB,
@@ -609,6 +1001,9 @@ begin
 
   if ARelease then ModeStr := 'release' else ModeStr := 'dev';
   if AClean then ModeStr := ModeStr + ', clean';
+  MaxJobs := SelectedCount;
+  if (AJobs > 0) and (AJobs < MaxJobs) then MaxJobs := AJobs;
+  if MaxJobs < 1 then MaxJobs := 1;
   WriteLn('build mode: ', ModeStr);
   Session := TLWPTBuildSession.Create(
     ExtractFileDir(ExpandFileName(AManifestPath)));
@@ -620,74 +1015,171 @@ begin
     GenerateVersionInclude(
       ExtractFileDir(ExpandFileName(AManifestPath)), Man);
 
-    Built := 0; Failed := 0;
-    SetLength(Pending, 0);
+    Built := 0;
+    Failed := 0;
+    Running := 0;
+    Completed := 0;
+    HasEdges := SelectedGraphHasEdges(Man.Targets, Selected);
+    SetLength(States, Length(Man.Targets));
+    SetLength(Jobs, Length(Man.Targets));
+    SetLength(Compiled, Length(Man.Targets));
+    SetLength(CapturedOutputs, Length(Man.Targets));
+    SetLength(Errors, Length(Man.Targets));
     for i := 0 to High(Man.Targets) do
-    begin
-      if (Length(ATargetNames) > 0)
-         and (not NameListed(Man.Targets[i].Name, ATargetNames)) then
-        Continue;
-      RunHooks('prebuild:' + Man.Targets[i].Name,
-        Man.Targets[i].PreBuild, Session.HookRoot);
+      if Selected[i] then States[i] := tsPending
+      else States[i] := tsUnselected;
+
+    WorkerSession := TLWPTWorkerBudgetSession.Create(
+      NewWorkerSessionId, MaxJobs);
+    try
+      { A delegated nested invocation owns exactly one transferred lease,
+        regardless of its local --jobs ceiling. Honour the coordinator's
+        effective request so a second ready target waits instead of trying
+        to acquire beyond the inherited grant. }
+      MaxJobs := WorkerSession.RequestedWorkers;
+      WriteLn('build jobs: ', MaxJobs);
       try
-        if BuildOneTarget(AManifestPath, Man, ManifestContentHash,
-          Man.Targets[i],
-          ARelease, AClean, Session, Compiled) then
+        while Completed < SelectedCount do
         begin
-          SetLength(HookEnvironment, 3);
-          HookEnvironment[0] := 'LWPT_BUILD_TARGET=' + Compiled.Name;
-          HookEnvironment[1] := 'LWPT_BUILD_OUTPUT='
-            + Compiled.CandidateBin;
-          HookEnvironment[2] := 'LWPT_BUILD_PUBLIC_OUTPUT='
-            + Compiled.OutBin;
-          RunHooksWithEnvironment('postbuild:' + Man.Targets[i].Name,
-            Compiled.PostBuild, Session.HookRoot, HookEnvironment);
-          j := Length(Pending);
-          SetLength(Pending, j + 1);
-          Pending[j] := Compiled;
-        end
-        else
-          Inc(Failed);
+          MadeProgress := False;
+
+          for i := 0 to High(Man.Targets) do
+            if (States[i] = tsPending)
+               and FailedDependency(Man.Targets[i], Man.Targets, States,
+                 DependencyName) then
+            begin
+              States[i] := tsBlocked;
+              Errors[i] := 'blocked by failed prerequisite "'
+                + DependencyName + '"';
+              Inc(Failed);
+              Inc(Completed);
+              MadeProgress := True;
+            end;
+
+          for i := 0 to High(Man.Targets) do
+          begin
+            if Running >= MaxJobs then Break;
+            if (States[i] <> tsPending)
+               or not DependenciesSucceeded(Man.Targets[i], Man.Targets,
+                 States) then Continue;
+            { Never block the scheduler waiting for a machine slot: an
+              already-running target may be the work that returns it. }
+            Lease := WorkerSession.Acquire(0);
+            if not Assigned(Lease) then Break;
+            try
+              try
+                RunHooks('prebuild:' + Man.Targets[i].Name,
+                  Man.Targets[i].PreBuild, Session.HookRoot);
+                Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
+                  ManifestContentHash, Man.Targets[i], ARelease, AClean,
+                  Session, Lease);
+                Lease := nil;
+                States[i] := tsRunning;
+                Inc(Running);
+                Jobs[i].Start;
+              finally
+                Lease.Free;
+              end;
+            except
+              on E: Exception do
+              begin
+                States[i] := tsFailed;
+                Errors[i] := E.Message;
+                Inc(Failed);
+                Inc(Completed);
+              end;
+            end;
+            MadeProgress := True;
+          end;
+
+          for i := 0 to High(Jobs) do
+            if Assigned(Jobs[i]) and Jobs[i].IsDone then
+            begin
+              Jobs[i].WaitFor;
+              CapturedOutputs[i] := Jobs[i].CapturedOutput;
+              if Jobs[i].Succeeded then
+              begin
+                Compiled[i] := Jobs[i].Compiled;
+                States[i] := tsCompiled;
+              end
+              else
+              begin
+                States[i] := tsFailed;
+                Errors[i] := Jobs[i].ErrorMessage;
+                Inc(Failed);
+              end;
+              FreeAndNil(Jobs[i]);
+              Dec(Running);
+              Inc(Completed);
+              if States[i] = tsCompiled then
+                if HasEdges then
+                  FinalizeTarget(i, True)
+                else
+                  try
+                    RunTargetPostBuild(i);
+                  except
+                    on E: Exception do
+                    begin
+                      States[i] := tsFailed;
+                      Errors[i] := E.Message;
+                      Inc(Failed);
+                    end;
+                  end;
+              MadeProgress := True;
+            end;
+
+          if not MadeProgress then Sleep(10);
+        end;
       except
-        on E: Exception do
-        begin
-          WriteLn(ErrOutput, '  target "', Man.Targets[i].Name,
-            '" failed: ', E.Message);
-          Inc(Failed);
-        end;
+        StopAndFreeJobs;
+        raise;
       end;
-    end;
 
-    if Failed = 0 then
-    begin
-      WholePostBuild := Man.PostBuild;
-      for i := 0 to High(Pending) do
-        WholePostBuild := RetargetPostBuildHooks(WholePostBuild,
-          Pending[i].OutBin, Pending[i].CandidateBin);
-      RunHooks('postbuild', WholePostBuild, Session.HookRoot);
-
-      for i := 0 to High(Pending) do
+      { With no dependency edges, retain ADR-0020's all-target postbuild
+        gate and publish only after every private candidate succeeds. }
+      if (not HasEdges) and (Failed = 0) then
       begin
-        PublicationRequest := Pending[i].Request;
-        PublicationRequest.CompilerVersion := QueryFPCVersion;
-        if PublishBuildArtifact(Pending[i].ProjectRoot,
-          Pending[i].CandidateBin, Pending[i].OutBin,
-          Pending[i].Fingerprint, AManifestPath, Pending[i].CfgPath,
-          LOCKFILE, Pending[i].ModulesPath,
-          PublicationRequest) = bprStale then
-        begin
-          Inc(Failed);
-          WriteLn(ErrOutput, 'STALE (inputs changed during compilation; ',
-            'private result for ', Pending[i].Name,
-            ' was not published)');
-        end
-        else
-        begin
-          Inc(Built);
-          WriteLn('ok -> ', Pending[i].OutBin);
+        WholePostBuild := Man.PostBuild;
+        for i := 0 to High(Man.Targets) do
+          if States[i] = tsCompiled then
+            WholePostBuild := RetargetPostBuildHooks(WholePostBuild,
+              Compiled[i].OutBin, Compiled[i].CandidateBin);
+        RunHooks('postbuild', WholePostBuild, Session.HookRoot);
+        for i := 0 to High(Man.Targets) do
+          if States[i] = tsCompiled then FinalizeTarget(i, False);
+      end
+      else if HasEdges and (Failed = 0) then
+        { Graph builds publish prerequisites before dependants start. The
+          once-per-build posthook therefore observes the published outputs. }
+        try
+          RunHooks('postbuild', Man.PostBuild, Session.HookRoot);
+        except
+          on E: Exception do
+          begin
+            Inc(Failed);
+            WriteLn(ErrOutput, '  whole-build postbuild failed after '
+              + 'graph publication: ', E.Message);
+          end;
         end;
-      end;
+    finally
+      StopAndFreeJobs;
+      WorkerSession.Free;
     end;
+
+    { Replay compiler output and results in manifest order, independent of
+      completion order. Hook output remains at its declared lifecycle point. }
+    for i := 0 to High(Man.Targets) do
+      if Selected[i] then
+      begin
+        WriteLn('  building ', Man.Targets[i].Name, ' (',
+          Man.Targets[i].Source, ')');
+        if CapturedOutputs[i] <> '' then Write(CapturedOutputs[i]);
+        if States[i] = tsSucceeded then
+          WriteLn('ok -> ', Compiled[i].OutBin)
+        else if Errors[i] <> '' then
+          WriteLn(ErrOutput, '  target "', Man.Targets[i].Name,
+            '" failed: ', Errors[i]);
+      end;
     WriteLn;
     WriteLn(Built, ' built, ', Failed, ' failed');
     Result := Ord(Failed <> 0);

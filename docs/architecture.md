@@ -11,6 +11,9 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 - **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry implementation is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); its interoperable wire contract is specified in [`registry-spec.md`](./registry-spec.md). The link / duplication / codebase-health contracts originally deferred by ADR-0006 remain separate workstreams rather than half-built features. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
 - **Compiler work is session-private.** Build/test compiler outputs stay below `.lwpt/sessions/<session-id>/`; successful build outputs are revalidated and atomically published, while test outputs remain private and successful test sessions are discarded. `lwpt repair` reclaims abandoned sessions. See ADR-0020.
+- **Build scheduling follows the manifest DAG.** Ready targets overlap within
+  both the `--jobs` ceiling and machine-wide worker budget; dependants start
+  only after prerequisites publish. See ADR-0022.
 
 ## Tech stack
 
@@ -59,7 +62,7 @@ Sections currently supported:
 | `[package]` | name, version, units (`-Fu` roots from the project's own source) |
 | `[dependencies]` | bare-string `"<source>@<version>"` shorthand or inline-table `{ source = "...", version = "...", subdir = "..." }` — see [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) |
 | `[sources]` | per-project custom git-host declarations. Each entry is an inline table mapping a prefix name to `archive` + `git` URL templates with `{user}` / `{repository}` / `{ref}` placeholders; enables prefixes like `gitea:owner/repo` against the user's self-hosted instance |
-| `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Single-binary shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` |
+| `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Inline entries may declare `depends = ["prerequisite"]`. Single-binary shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` |
 | `[workspaces]` | `include` / `exclude` glob arrays for monorepo workspace auto-discovery (each matched dir with its own `lwpt.toml` is installed as a local-path dep, symlinked or junctioned) |
 | `[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` | Lifecycle hooks per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with optional `inputs` / `output` staleness gating. Plus per-`[build]`-entry inline `prebuild` / `postbuild` fields for per-binary signing / packaging / etc. |
 | Any other top-level section with a `script` field | A user-declared run-script callable via `lwpt run <name>` per [ADR-0013](./adr/0013-run-subcommand-and-build-rename.md) |
