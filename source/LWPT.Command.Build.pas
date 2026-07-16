@@ -564,6 +564,7 @@ var
   Compiled: TLWPTCompiledTarget;
   Pending: TLWPTCompiledTargetArray;
   PublicationRequest: TLWPTBuildPublicationRequest;
+  WholePostBuild: THookArray;
   HookEnvironment: array of string;
 begin
   if not FileExists(AManifestPath) then
@@ -659,6 +660,12 @@ begin
 
     if Failed = 0 then
     begin
+      WholePostBuild := Man.PostBuild;
+      for i := 0 to High(Pending) do
+        WholePostBuild := RetargetPostBuildHooks(WholePostBuild,
+          Pending[i].OutBin, Pending[i].CandidateBin);
+      RunHooks('postbuild', WholePostBuild, Session.HookRoot);
+
       for i := 0 to High(Pending) do
       begin
         PublicationRequest := Pending[i].Request;
@@ -680,8 +687,6 @@ begin
           WriteLn('ok -> ', Pending[i].OutBin);
         end;
       end;
-      if Failed = 0 then
-        RunHooks('postbuild', Man.PostBuild, Session.HookRoot);
     end;
     WriteLn;
     WriteLn(Built, ' built, ', Failed, ' failed');

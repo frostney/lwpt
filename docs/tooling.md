@@ -174,7 +174,9 @@ the target name in `LWPT_BUILD_TARGET`. Runtime retargeting also maps existing
 `{item.output}`-expanded hook fields to the private candidate. Hook failure
 keeps the candidate private, and hook definitions, scripts, and declared
 inputs are revalidated before publication. The whole-build postbuild hook runs
-only after every selected output has published successfully. Unix lifecycle
+against all staged outputs after every selected target succeeds, with
+complete-token output references retargeted to their private candidates.
+Publication begins only after that final hook succeeds. Unix lifecycle
 hooks use an InstantFPC cache below the owning session. Windows compiles those
 hooks directly into the same private hook root. Compiler directories use
 bounded readable prefixes plus hashes of their full source identities, so

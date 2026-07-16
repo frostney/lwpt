@@ -969,14 +969,16 @@ procedure ReadManifestSnapshot(const APath: string; out AContent,
   AContentHash: string);
 var
   Bytes: TBytes;
+  ContentSize: SizeInt;
   Stream: TFileStream;
 begin
   if not FileExists(APath) then
     raise EManifestError.CreateFmt('no manifest at %s', [APath]);
   Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
-    SetLength(Bytes, Stream.Size);
-    if Stream.Size > 0 then Stream.ReadBuffer(Bytes[0], Stream.Size);
+    ContentSize := Stream.Size;
+    SetLength(Bytes, ContentSize);
+    if ContentSize > 0 then Stream.ReadBuffer(Bytes[0], ContentSize);
   finally
     Stream.Free;
   end;

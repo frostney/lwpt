@@ -61,9 +61,11 @@ retaining sessions whose recorded process is alive.
   candidate only when the expanded path is a complete path token; related
   paths such as `build/app.json` remain unchanged. Hook definitions, scripts,
   and declared inputs are publication inputs. Failed hooks prevent
-  publication. Whole-build postbuild runs only after every selected target
-  compiled, its private hook succeeded, and every output was published;
-  artifact transformations belong in per-target postbuild hooks. Arbitrary
+  publication. Whole-build postbuild runs after every selected target
+  compiled and its private hook succeeded, with complete-token public-output
+  references retargeted across all staged candidates. It is the final success
+  gate before any output is published; artifact transformations still belong
+  in per-target postbuild hooks. Arbitrary
   hook filesystem side effects are not sandboxed, but hook
   compilation is session-private:
   Windows compiles directly below the hook root, while Unix gives InstantFPC
