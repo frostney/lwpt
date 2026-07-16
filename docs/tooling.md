@@ -53,7 +53,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `LWPT_CACHE_DIR` | Reserved for [issue #30](https://github.com/frostney/lwpt/issues/30). Today: ignored. | n/a until the cache implementation lands |
 | `LWPT_WORKER_BUDGET` | Maximum aggregate LWPT workers for this user and machine | logical processor count |
 | `LWPT_WORKER_STATE_DIR` | Override the per-user coordinator state root | the platform application-config directory's `workers/` subdirectory |
-| `LWPT_WORKER_LEASE_STALE_SECONDS` | Mark heartbeat diagnostics stale after this interval; values below 3 are rejected. Heartbeat age never authorizes reclamation by itself. | `30` |
+| `LWPT_WORKER_LEASE_STALE_SECONDS` | Mark heartbeat diagnostics stale after this interval; values below 3 are rejected. Heartbeat age never authorises reclamation by itself. | `30` |
 | `LWPT_WORKER_LEASE_TOKEN` | One-shot opaque delegation token added to one nested LWPT subprocess by the worker-budget API; do not configure, reuse, or persist manually | unset |
 | `FPC_TARGET_CPU` | When set, `lwpt build` passes `-P<value>` to FPC for cross-compilation | unset (host CPU) |
 | `PATH` | Must contain `fpc`, `instantfpc`, `lefthook` | system default |
@@ -81,7 +81,7 @@ lease-token hashes, pending delegation verifiers, start time, lease start, and
 heartbeat. Each acquisition gets a new ticket, so releasing and reacquiring
 never jumps ahead of an existing waiter. Owner death releases the guard and
 allows immediate reclamation without relying on the PID, so PID reuse cannot
-preserve a dead request. A stale heartbeat is reported but never authorizes
+preserve a dead request. A stale heartbeat is reported but never authorises
 reclamation while the owner guard remains held. Unreadable, malformed, and
 unknown-schema requests with a live owner guard reserve capacity
 conservatively rather than being deleted.
