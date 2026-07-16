@@ -86,9 +86,11 @@ stores only its verifier and atomically consumes it by transferring one grant
 from the parent request to the child's own owner-guarded request. The parent
 lease becomes locally unavailable and the parent reacquires through the FIFO
 after the child finishes. Reuse and fan-out from one lease fail. The raw token
-is never persisted or logged, and the child remains counted independently if
-the parent exits. Tokens are not command-line arguments, diagnostics, or
-project configuration.
+is never persisted or logged. The child clears the consumed token from its
+process environment before running work, so unrelated descendants do not
+inherit a dead delegation. The child remains counted independently if the
+parent exits. Tokens are not command-line arguments, diagnostics, or project
+configuration.
 
 Session-local lease lists and counters are protected for concurrent scheduler
 threads. Acquisitions join the FIFO queue serially and releases update durable

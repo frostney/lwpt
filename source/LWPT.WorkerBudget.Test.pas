@@ -561,6 +561,8 @@ begin
       Lines.Add('acquired=' + BoolToStr(Lease <> nil, True));
       Lines.Add('active=' + IntToStr(Snapshot.ActiveWorkers));
       Lines.Add('entries=' + IntToStr(Length(Snapshot.Entries)));
+      Lines.Add('token-cleared=' + BoolToStr(
+        GetEnvironmentVariable(WORKER_LEASE_TOKEN_ENV) = '', True));
       Lines.SaveToFile(ParamStr(2));
     finally
       Lease.Free;
@@ -1093,6 +1095,7 @@ begin
     Expect<string>(ChildValues.Values['acquired']).ToBe('True');
     Expect<Integer>(StrToIntDef(ChildValues.Values['active'], 0)).ToBe(1);
     Expect<Integer>(StrToIntDef(ChildValues.Values['entries'], 0)).ToBe(2);
+    Expect<string>(ChildValues.Values['token-cleared']).ToBe('True');
   finally
     ChildValues.Free;
     ParentValues.Free;

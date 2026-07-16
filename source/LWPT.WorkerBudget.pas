@@ -275,6 +275,36 @@ function BCryptGenRandom(AAlgorithm: THandle; ABuffer: Pointer;
   ALength, AFlags: ULONG): LongInt; stdcall;
   external 'bcrypt.dll' name 'BCryptGenRandom';
 {$ENDIF}
+{$IFDEF UNIX}
+function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
+  external name 'unsetenv';
+{$ENDIF}
+
+procedure ClearWorkerLeaseEnvironment;
+{$IFDEF UNIX}
+var
+  Name: AnsiString;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Name: UnicodeString;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Name := AnsiString(WORKER_LEASE_TOKEN_ENV);
+  if CUnsetEnvironmentVariable(PAnsiChar(Name)) <> 0 then
+    raise EWorkerBudgetError.CreateFmt(
+      'failed to clear consumed %s from the process environment',
+      [WORKER_LEASE_TOKEN_ENV]);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Name := UnicodeString(WORKER_LEASE_TOKEN_ENV);
+  if not Windows.SetEnvironmentVariableW(PWideChar(Name), nil) then
+    raise EWorkerBudgetError.CreateFmt(
+      'failed to clear consumed %s from the process environment',
+      [WORKER_LEASE_TOKEN_ENV]);
+  {$ENDIF}
+end;
 
 function NowMilliseconds: Int64;
 var
@@ -1397,6 +1427,7 @@ begin
   finally
     Transaction.Free;
   end;
+  if FInherited then ClearWorkerLeaseEnvironment;
 
   Interval := (StaleSeconds * 1000) div 3;
   if Interval < 1000 then Interval := 1000;

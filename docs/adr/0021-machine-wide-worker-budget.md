@@ -23,8 +23,10 @@ must match a pending verifier in coordinator state. Consumption is atomic and
 transfers one grant from the parent request to a new child-owned, owner-guarded
 request and makes the parent lease locally unavailable. The parent reacquires
 capacity through the normal FIFO after the child finishes. The raw token is
-never written to disk or diagnostics. A token cannot be reused and one lease
-cannot have two pending child delegations. This avoids nested LWPT deadlock
+never written to disk or diagnostics, and the child removes the consumed token
+from its process environment before running work so unrelated descendants do
+not inherit it. A token cannot be reused and one lease cannot have two pending
+child delegations. This avoids nested LWPT deadlock
 when the machine budget is one while ensuring a child remains counted if its
 parent exits.
 
