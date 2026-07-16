@@ -225,10 +225,12 @@ differs from GocciaScript's older copy:
   chunked-body seed-buffer. `Copy(PAnsiChar(...))` truncates
   response bytes at the first `#0`, corrupting binary downloads;
   the byte-safe accumulator avoids the issue.
-- **`packages/cli/source/CLI.Parser.pas`** — space-separated option
-  values (`--mode release`) work for plain string/integer options,
-  not only repeatable ones. Plus the `AStartArg` parameter for
-  `lwpt run <subcommand>` aliasing.
+- **`packages/cli/source/CLI.Parser.pas`** — valued short options support
+  separated values (`-o output`, including values beginning with `-`) and
+  opt-in attached values (`-Fusource`, `-dDEBUG`) with longest-prefix
+  matching. Space-separated long values (`--mode release`) work for plain
+  string/integer options, not only repeatable ones. Plus the `AStartArg`
+  parameter for `lwpt run <subcommand>` aliasing.
 - **`packages/cli/source/CLI.Options.pas`** — `TGoccia*` type-prefix
   stripped from every public type; GocciaScript-engine-specific
   option groups removed as dead code.

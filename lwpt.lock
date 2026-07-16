@@ -5,7 +5,7 @@ version = 3
 source = "workspace:auto"
 resolvedRef = ""
 resolvedURL = ""
-computedHash = "sha256:685365863fc865d27d7d64f37b90bb5e633135bef730b7dad28293d4002603ff"
+computedHash = "sha256:ca220a63d7672fe1a2b4630d81fd3578a33702d420f4eab40192150df56cef9c"
 archiveHash = ""
 
 [package.httpclient]
