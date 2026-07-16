@@ -104,8 +104,14 @@ If `lwpt install` fails with `HTTPS requires OpenSSL but it could not be loaded`
 1. **Release PR.** Create `release/<version>` from green `main`, run `git-cliff --tag <version> -o CHANGELOG.md`, bump `[package].version`, regenerate `source/Version.inc`, validate, and open a draft PR titled `chore(release): <version>`.
 2. **Squash-merge the PR.** The merge commit on `main` must already contain the changelog and version bump. Use the squash message `chore(release): <version>`.
 3. **Tag the merge commit.** `git tag -a 0.1.0 -m 0.1.0` on the post-merge `main` commit (no `v` prefix — SemVer 2.0.0 canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md); `v0.1.0` is also accepted by `release.yml` as a courtesy). Pre-release tags use the `0.1.0-rc.1` form (auto-detected by `release.yml` and published as `prerelease: true`).
-4. **`release.yml` triggers.** Mirrors `ci.yml`'s cross-build matrix exactly (same flag set, same toolchain cache key), then packages each target as `tar.gz` (Unix) / `zip` (Windows) plus a SHA-256 checksums file.
-5. **GitHub Release published.** Release notes are extracted from the committed `CHANGELOG.md` section for the tag, with all six archives + the checksums file attached. Archive naming:
+4. **`release.yml` triggers.** Mirrors `ci.yml`'s cross-build matrix exactly
+   (same flag set, same toolchain cache key). The publish job then waits at the
+   protected `release` environment for explicit approval.
+5. **GitHub Release published by CI.** After approval, the workflow packages
+   each target as `tar.gz` (Unix) / `zip` (Windows), generates a SHA-256
+   checksums file, and extracts release notes from the committed `CHANGELOG.md`
+   section for the tag. Never create the GitHub Release manually. Archive
+   naming:
 
    ```text
    lwpt-<version>-macos-arm64.tar.gz
