@@ -156,6 +156,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | --- | --- | --- |
 | **`packages/httpclient/source/HTTPClient.Test.pas`** (the headline) | 5 tests in 1 suite | Byte-safe `AppendRawBytes` regression. Uses `packages/httpclient/source/Tests.HTTPMockServer.pas` to serve crafted responses with embedded `#0` bytes in body, body-prefix (header-recv path), and chunked frames; asserts the received bytes round-trip byte-perfectly via hex comparison. Includes a 32 KB response that forces multi-recv and exercises the path where header-accumulation has already buffered some body bytes. |
 | **`packages/cli/source/CLI.Parser.Test.pas`** | 9 tests in 1 suite | Self-spawns in child mode so `ParseCommandLine` consumes real argv. Covers separated valued short options (including hyphen-leading values), opt-in attached values, repeatable `-Fu` / `-d` values, exact-before-longest-prefix matching for multi-character names, missing and unknown short-option errors, unchanged valueless flags, and both existing long-value forms. |
+| **`source/LWPT.BuildRequest.Test.pas`** | 7 tests in 1 suite | Pins canonical versioned TOML serialization, parse round-trips, unsupported-schema failures, compiler-independent target tuples, multi-target compiler capabilities, explicit incompatibility reasons, and normalized diagnostics/artifact/dependency result validation. |
 | **`source/LWPT.BuildSession.Test.pas`** | 17 tests in 1 suite | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
 | **`source/LWPT.Command.Build.Test.pas`** | 6 tests in 1 suite | Pins the stale-artefact failure signatures that trigger the `--clean` retry hint while excluding ordinary compiler errors and incidental `.reslst` mentions. |
 | **`source/LWPT.Core.Test.pas`** | 113 tests in 16 suites | **SHA-256 NIST vectors** (empty, "abc", 56-byte block-boundary pad, 1,000,000 "a" multi-block). **LoadManifest happy path / validation / extensions** (bare-string shorthand rejected, http source rejected, `[lwpt]`/`[format]`/`[generated]` parsing). **LoadLockfile** (missing / corrupt-TOML / no-schema / v1-migration-hint / empty-table / round-trip-fields). **VerifyAgainstLockfile** (matching graph + lock passes silently; tree-hash mismatch / archive-hash mismatch / orphan manifest dep / stale lockfile entry each raise `EVerifyError` naming the dep + the side that mismatched; local-source with empty archive-hash on both sides is the legitimate happy path and must not false-mismatch). Also covers source/version parsing, git ref parsing, include/exclude pruning, path globs, and custom source prefixes. |
@@ -209,10 +210,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 10 | 220 |
+| Unit (`source/*.Test.pas` + package self-tests) | 11 | 227 |
 | Integration (`tests/integration/*.Test.pas`) | 15 | 100 |
 | E2E (`tests/e2e/*.E2E.Test.pas`) | 5 | 20 |
-| **Total** | **30** | **340** |
+| **Total** | **31** | **347** |
 
 ### Planned testing work
 

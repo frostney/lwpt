@@ -12,6 +12,7 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   atomically published to its manifest `output` only after its declared inputs
   are revalidated.
 - **Cross-compile via `FPC_TARGET_CPU`** env var; `lwpt build` translates this into FPC's `-P` flag.
+- **Compiler-neutral request first.** Build and test compilation validate a versioned request and target tuple before the current FPC-specific argument adapter runs. Unsupported schemas and capability combinations are hard errors, with no compiler or target fallback.
 - **Machine capacity foundation.** `LWPT.WorkerBudget` provides fair, reclaimable per-user leases across processes and worktrees. Builds remain sequential until [issue #39](https://github.com/frostney/lwpt/issues/39) consumes that interface.
 - **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with staleness gating (output older than any input → re-run). The earlier `[generated]` shape is no longer parsed.
 
@@ -133,9 +134,12 @@ directories contain separate `bin/` and `units/` children used for `-FE`,
 `-FU`, and `-o`. No two processes share writable compiler paths, even when
 they build the same target and mode in the same worktree.
 
-Before compiling, LWPT captures a schema-versioned, compiler-neutral
-publication fingerprint. It covers the source and output request, mode and
-target dimensions, selected compiler identity/executable/live version,
+Before compiling, LWPT creates a schema-versioned `TLWPTBuildRequest` covering
+the source set and entry point, output kind, mode, defines, search paths,
+resources, private output locations, target OS/architecture, and requested
+compiler identity/version. The canonical TOML serialization is embedded in a
+separate publication fingerprint. That fingerprint also covers the selected
+compiler executable/live version,
 the previous public-output content, the implicit source directory, declared
 unit/include/resource inputs,
 manifest, cfg, lockfile, and installed module contents. After compilation it
