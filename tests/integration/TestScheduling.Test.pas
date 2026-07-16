@@ -139,6 +139,7 @@ end;
 procedure TTestScheduling.TestJobsOneRunsInSourceOrder;
 var
   R: TLwptResult;
+  Lines: TStringList;
 begin
   ResetProject(0);
   WriteTextFile(FScratch + '/tests/A.First.Test.pas',
@@ -171,8 +172,15 @@ begin
     + 'end.'#10);
   R := RunTests(['--jobs=1']);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('first'#10 + 'second',
-    ReadBinaryFile(FScratch + '/control/order')) > 0).ToBe(True);
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(FScratch + '/control/order');
+    Expect<Integer>(Lines.Count).ToBe(2);
+    Expect<string>(Lines[0]).ToBe('first');
+    Expect<string>(Lines[1]).ToBe('second');
+  finally
+    Lines.Free;
+  end;
 end;
 
 procedure TTestScheduling.TestBailZeroOverridesManifestAndRunsAll;
