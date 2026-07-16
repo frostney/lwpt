@@ -93,9 +93,9 @@ Canonical URI comparison uses these rules:
 1. Lowercase the scheme and DNS hostname.
 2. Remove the default port (`443` for HTTPS, `80` for permitted HTTP).
 3. Encode IPv4 in dotted-decimal form and IPv6 according to RFC 5952.
-4. Remove dot segments from the path.
-5. Decode percent-encoded unreserved characters and uppercase the hexadecimal
+4. Decode percent-encoded unreserved characters and uppercase the hexadecimal
    digits of every remaining percent encoding.
+5. Remove dot segments from the path.
 6. Remove the trailing slash unless the path is `/`, then represent `/` as an
    empty path.
 
@@ -215,8 +215,9 @@ checkpoint = "https://mirror.example.net/lwpt/v1/checkpoints/latest.toml"
 rotations = "https://mirror.example.net/lwpt/v1/rotations"
 ```
 
-`role` is `origin` or `mirror`. Every URL in the document MUST satisfy the
-transport rules and remain under `base_url`.
+`role` is `origin` or `mirror`. `origin` MUST independently satisfy the
+canonical URI and transport rules. `base_url` and every service endpoint URL
+MUST satisfy those rules and remain under `base_url`.
 
 The capabilities endpoint returns
 `application/vnd.lwpt.registry-capabilities+toml`:
@@ -399,16 +400,20 @@ Clients MUST:
 
 1. Verify canonical checkpoint and signature-envelope bytes.
 2. Hash the checkpoint and compare it to `payload`.
-3. Resolve `key_id` from a trusted key or verified rotation chain.
-4. Verify the Ed25519 signature over the signing input.
-5. Require matching origin identities.
-6. Reject an expired checkpoint.
-7. Reject a sequence lower than the highest sequence already accepted for that
+3. Require `algorithm = "ed25519"` and the signature envelope's `key_id` to
+   equal the checkpoint's `key_id`.
+4. Resolve `key_id` from a trusted key or verified rotation chain.
+5. Verify the Ed25519 signature over the signing input.
+6. Require matching origin identities.
+7. Reject an expired checkpoint.
+8. Reject a sequence lower than the highest sequence already accepted for that
    origin. At the same sequence, accept only the identical snapshot and
    `key_id`; a different value is checkpoint equivocation. A later
    `published_at`, `expires_at`, and valid signature MAY renew an otherwise
    identical checkpoint.
-8. Fetch and hash the snapshot, then validate its sequence and predecessor.
+9. Fetch and hash the snapshot, require its sequence to equal the checkpoint's
+   sequence, then validate its predecessor and sequence against the snapshot
+   chain.
 
 An origin SHOULD issue checkpoints with a validity window of no more than seven
 days. Short expiry limits replay for a client without prior state; persisted
