@@ -287,7 +287,7 @@ end;
 
 function WorkerStateRoot: string;
 begin
-  Result := GetEnvironmentVariable(WORKER_STATE_DIR_ENV);
+  Result := SysUtils.GetEnvironmentVariable(WORKER_STATE_DIR_ENV);
   if Result = '' then
     Result := IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers';
   Result := ExcludeTrailingPathDelimiter(ExpandFileName(Result));
@@ -314,7 +314,7 @@ var
 begin
   Path := RequestPath(ASessionId);
   if DirectoryExists(Path) then WipeDir(Path)
-  else DeleteFile(Path);
+  else SysUtils.DeleteFile(Path);
 end;
 
 function ValidSessionId(const AValue: string): Boolean;
@@ -581,7 +581,7 @@ function ConfiguredBudget: Integer;
 var
   Raw : string;
 begin
-  Raw := Trim(GetEnvironmentVariable(WORKER_BUDGET_ENV));
+  Raw := Trim(SysUtils.GetEnvironmentVariable(WORKER_BUDGET_ENV));
   if Raw <> '' then
   begin
     Result := StrToIntDef(Raw, 0);
@@ -599,7 +599,7 @@ function StaleSeconds: Integer;
 var
   Raw : string;
 begin
-  Raw := Trim(GetEnvironmentVariable(WORKER_STALE_SECONDS_ENV));
+  Raw := Trim(SysUtils.GetEnvironmentVariable(WORKER_STALE_SECONDS_ENV));
   if Raw = '' then
     Exit(DEFAULT_STALE_SECONDS);
   Result := StrToIntDef(Raw, 0);
@@ -1018,9 +1018,9 @@ begin
           if ValidSessionId(SessionId) then
             RemoveRequestPath(SessionId)
           else
-            DeleteFile(StatePath(Search.Name));
+            SysUtils.DeleteFile(StatePath(Search.Name));
           if ValidSessionId(SessionId) then
-            DeleteFile(OwnerPath(SessionId));
+            SysUtils.DeleteFile(OwnerPath(SessionId));
           Inc(AReclaimed);
           Continue;
         end;
@@ -1030,7 +1030,7 @@ begin
       Result[Count] := Entry;
     until FindNext(Search) <> 0;
   finally
-    FindClose(Search);
+    SysUtils.FindClose(Search);
   end;
 end;
 
@@ -1061,7 +1061,7 @@ begin
     begin
       RemoveRequestPath(AEntries[i].SessionId);
       if not OwnerGuardHeld(AEntries[i].SessionId) then
-        DeleteFile(OwnerPath(AEntries[i].SessionId));
+        SysUtils.DeleteFile(OwnerPath(AEntries[i].SessionId));
       Inc(Result);
       Continue;
     end;
@@ -1330,7 +1330,8 @@ begin
   FAcquireCriticalSectionReady := True;
   FLeases := TList.Create;
 
-  InheritedToken := Trim(GetEnvironmentVariable(WORKER_LEASE_TOKEN_ENV));
+  InheritedToken := Trim(
+    SysUtils.GetEnvironmentVariable(WORKER_LEASE_TOKEN_ENV));
   Transaction := TWorkerStateTransaction.Create;
   try
     Entries := LoadEntries;
