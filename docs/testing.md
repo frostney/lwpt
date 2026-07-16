@@ -155,6 +155,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | File | Suites / tests | What it asserts |
 | --- | --- | --- |
 | **`packages/httpclient/source/HTTPClient.Test.pas`** (the headline) | 5 tests in 1 suite | Byte-safe `AppendRawBytes` regression. Uses `packages/httpclient/source/Tests.HTTPMockServer.pas` to serve crafted responses with embedded `#0` bytes in body, body-prefix (header-recv path), and chunked frames; asserts the received bytes round-trip byte-perfectly via hex comparison. Includes a 32 KB response that forces multi-recv and exercises the path where header-accumulation has already buffered some body bytes. |
+| **`packages/cli/source/CLI.Parser.Test.pas`** | 9 tests in 1 suite | Self-spawns in child mode so `ParseCommandLine` consumes real argv. Covers separated valued short options (including hyphen-leading values), opt-in attached values, repeatable `-Fu` / `-d` values, exact-before-longest-prefix matching for multi-character names, missing and unknown short-option errors, unchanged valueless flags, and both existing long-value forms. |
 | **`source/LWPT.Command.Build.Test.pas`** | 6 tests in 1 suite | Pins the stale-artefact failure signatures that trigger the `--clean` retry hint while excluding ordinary compiler errors and incidental `.reslst` mentions. |
 | **`source/LWPT.Core.Test.pas`** | 113 tests in 16 suites | **SHA-256 NIST vectors** (empty, "abc", 56-byte block-boundary pad, 1,000,000 "a" multi-block). **LoadManifest happy path / validation / extensions** (bare-string shorthand rejected, http source rejected, `[lwpt]`/`[format]`/`[generated]` parsing). **LoadLockfile** (missing / corrupt-TOML / no-schema / v1-migration-hint / empty-table / round-trip-fields). **VerifyAgainstLockfile** (matching graph + lock passes silently; tree-hash mismatch / archive-hash mismatch / orphan manifest dep / stale lockfile entry each raise `EVerifyError` naming the dep + the side that mismatched; local-source with empty archive-hash on both sides is the legitimate happy path and must not false-mismatch). Also covers source/version parsing, git ref parsing, include/exclude pruning, path globs, and custom source prefixes. |
 | **`source/LWPT.Formatter.Test.pas`** | 20 tests in 4 suites | Running `lwpt format` twice on the same file is a no-op (the contract `--check` rests on). Plus the canonical shapes that previously broke parameter-rename propagation and scope-expansion coverage for manifest include/exclude glob behavior. |
@@ -202,10 +203,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 8 | 194 |
+| Unit (`source/*.Test.pas` + package self-tests) | 9 | 203 |
 | Integration (`tests/integration/*.Test.pas`) | 14 | 91 |
 | E2E (`tests/e2e/*.E2E.Test.pas`) | 5 | 20 |
-| **Total** | **27** | **305** |
+| **Total** | **28** | **314** |
 
 ### Planned testing work
 
