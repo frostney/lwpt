@@ -4,6 +4,9 @@ program TestScheduling.Test;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}
+  cthreads,
+  {$ENDIF}
   Classes,
   SysUtils,
 
