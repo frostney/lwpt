@@ -9,7 +9,8 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 - **Self-hosting from day one.** LWPT builds LWPT through `lwpt build` against the repo's own manifest; the one-time `scripts/bootstrap.pas` resolves the chicken-and-egg. See [ADR-0005](./adr/0005-self-host-build.md).
 - **RTL-only with LWPT-canonical packages.** No third-party FPC dependencies in the binary; HTTPS is `HTTPClient` from LWPT's `packages/httpclient/`. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for HTTPClient, CLI, Semver, TOML, and TestingPascalLibrary — all consumed as workspace packages via the root manifest's `[workspaces]` glob (Phase 1 done per ADR-0014 + ADR-0015). GocciaScript is the first named consumer and commits to Path A adoption; Phase 2 graduates individual packages to standalone repos when warranted.
 - **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry implementation is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); its interoperable wire contract is specified in [`registry-spec.md`](./registry-spec.md). The link / duplication / codebase-health contracts originally deferred by ADR-0006 remain separate workstreams rather than half-built features. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
-- **Error handling is production-grade.** Every multi-step write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL), `--frozen` verifies both the archive hash and the extracted tree hash against the lockfile, and crash recovery wipes `.lwpt/tmp/` orphans on the next install. See ADR-0002 + ADR-0008.
+- **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
+- **Compiler work is session-private.** Build/test compiler outputs stay below `.lwpt/sessions/<session-id>/`; successful build outputs are revalidated and atomically published, while test outputs remain private and successful test sessions are discarded. `lwpt repair` reclaims abandoned sessions. See ADR-0020.
 
 ## Tech stack
 
@@ -40,8 +41,8 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
                        run *.Test.pas) check sources)  user-defined
                                                        script)
 
-   ↑ lwpt repair operates on project residue and the per-user worker
-     coordinator orthogonally.
+   ↑ lwpt repair operates on project residue, abandoned .lwpt/sessions/
+     staging, and the per-user worker coordinator orthogonally.
    ↑ lwpt init scaffolds a new project (manifest, source dir, optional install/build).
 ```
 
@@ -85,8 +86,8 @@ The flat-graph + hard-error policy is deliberate: FPC has one global unit namesp
 
 - **Fetch:** HTTPS GET via the LWPT-canonical `HTTPClient` package (raw sockets + SChannel on Windows / SecureTransport on macOS / OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md)). The byte-safe `AppendRawBytes` accumulator fixes a header-recv truncation bug that previously corrupted binary downloads. URL templates per source kind live in `FetchURL`.
 - **Extract:** gunzip (zstream) + a direct ustar reader. The bundled FPC `libtar` has a bug — it ignores the 155-byte `prefix` field at offset 345, so paths longer than 100 bytes get silently dropped. LWPT's reader joins `prefix + '/' + name` correctly and also follows GNU `'L'`/`'K'` long-name entries.
-- **Build:** `BuildOneTarget` invokes `fpc -Sh @lwpt.cfg <dev-or-release-flags> -o<target.output> <target.source>`. Mode flags come from `AddBuildModeFlags` (dev = `-O- -gw -godwarfsets -gl -Ct -Cr -Sa`; release = `-O4 -dPRODUCTION -Xs -CX -XX -B`). Cross-compile via the `FPC_TARGET_CPU` env var.
-- **Test:** Each `*.Test.pas` is a self-contained program using `TestingPascalLibrary`. LWPT compiles each, runs it, and reads the process exit code. No output parsing — see [`testing.md`](./testing.md).
+- **Build:** `BuildOneTarget` invokes FPC with `-FE`, `-FU`, and `-o` paths below a unique session. It snapshots a versioned compiler-neutral publication request, the implicit source directory, declared inputs, and postbuild hook contributors before compilation. Per-target postbuild hooks receive the private candidate through `LWPT_BUILD_OUTPUT`, and existing `{item.output}` references are retargeted to it; only after hooks succeed does LWPT take a short thread-and-process lock derived from the destination's filesystem identity, revalidate the snapshot, and atomically replace the public executable when it is still current. Search-root fingerprints follow workspace directory links with cycle protection and exclude unrelated declared outputs, while explicit file inputs remain hashed.
+- **Test:** Each `*.Test.pas` is a self-contained program using `TestingPascalLibrary`. LWPT compiles and runs each from private session paths and reads the process exit code. No output parsing — see [`testing.md`](./testing.md).
 - **Worker coordination:** `LWPT.WorkerBudget` owns the per-user machine-capacity seam. Invocations register owner-guarded requests and acquire FIFO, reclaimable leases under a short cross-platform transaction lock. Nested LWPT subprocesses consume a one-shot opaque delegation that transfers one grant to the child's own guarded request instead of consuming another slot. `lwpt repair` reclaims requests only when their OS-held owner guard is absent; stale heartbeats remain diagnostic. Build and test scheduling consume this module in their own workstreams.
 
 ## `.lwpt/` layout
@@ -99,6 +100,7 @@ See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) for the full design ra
 | `.lwpt/archives/<dep>-<version>.tar.gz` | **Committed** | Source-of-truth tarballs. Used for hash verification on `--frozen`. |
 | `.lwpt/tmp/` | Gitignored | Install workspace. Every write to a committed path goes through here first; atomic rename moves the staged file/dir into place. EXDEV fallback (copy-then-delete) handles cross-filesystem renames. Wiped at the start of every `lwpt install` to reap crash orphans. |
 | `.lwpt/install.lock` | Gitignored | Cross-process install lock. Created with O_CREAT\|O_EXCL by the first `lwpt install`; a second concurrent install fails with `EConcurrencyError` naming the lock holder's PID. Deleted by the normally-completing install; a crashed install leaves it for the user to clear via `lwpt repair`. Windows lock uses `LockFileEx`. |
+| `.lwpt/sessions/<session-id>/` | Gitignored | Build/test compiler staging. Every invocation owns distinct, bounded, hash-qualified job, unit, executable, and hook-compile paths. Successful sessions disappear; failed/crashed sessions remain private until `lwpt repair`. The sibling `locks/` directory contains stable publication-lock files and per-session owner guards. |
 
 ### ⚠️ Windows safe-deletion warning
 

@@ -7,7 +7,10 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 - **The contract:** single entry point from repo root (`./build/lwpt build`), default target = clean dev build of every binary, named targets as positional args, `--mode dev` (default) / `--mode release`, `--clean` flag, single `build/` output directory.
 - **Self-host.** LWPT's own `lwpt.toml` declares `lwpt` as a `[build]` entry; `lwpt build` rebuilds the binary that just ran. See [ADR-0005](./adr/0005-self-host-build.md).
 - **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev branch of `AddBuildModeFlags` in `LWPT.Command.Build`.
-- **Build outputs land under `build/`.** Gitignored. FPC intermediates (`.o`, `.ppu`) are isolated per target and mode under `build/targets/<name>/<mode>/` via `-FU`; binaries land at the manifest `output` path via `-o`.
+- **Compiler output is invocation-private.** FPC executables and intermediates
+  first land under `.lwpt/sessions/<session-id>/`. A completed executable is
+  atomically published to its manifest `output` only after its declared inputs
+  are revalidated.
 - **Cross-compile via `FPC_TARGET_CPU`** env var; `lwpt build` translates this into FPC's `-P` flag.
 - **Machine capacity foundation.** `LWPT.WorkerBudget` provides fair, reclaimable per-user leases across processes and worktrees. Builds remain sequential until [issue #39](https://github.com/frostney/lwpt/issues/39) consumes that interface.
 - **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with staleness gating (output older than any input → re-run). The earlier `[generated]` shape is no longer parsed.
@@ -22,8 +25,8 @@ Every project on this stack satisfies the build-system contract from `native-nos
 | Default target = clean dev build of every binary | `lwpt build` (no args) builds every `[build]` entry in dev mode |
 | Named targets, positional args | `lwpt build cli` builds only `cli`; multiple targets supported by passing more positionals |
 | Dev / prod distinction | `--mode dev` (default) / `--mode release` |
-| `clean` as a target | `--clean` flag; combined: `lwpt build --clean cli` cleans then builds `cli` |
-| Single `build/` output directory | All binaries land at `<target>.output` which is conventionally under `build/`; intermediates per target + mode via `-FU build/targets/<name>/<mode>/` |
+| `clean` as a target | `--clean` flag; combined: `lwpt build --clean cli` forces a full compile in fresh private staging |
+| Single public output directory | Completed binaries land at `<target>.output`, conventionally under `build/`; compiler intermediates remain session-private |
 
 ## Self-host
 
@@ -42,28 +45,40 @@ lwpt = { source = "source/lwpt.pas", output = "build/lwpt" }
 `./build/lwpt build` invokes FPC with:
 
 - `-Sh` (Delphi-compatible string handling; objfpc/delphi-safe)
-- `-FE build` (exe fallback for targets whose `output` has no dir component)
-- `-FU build/targets/lwpt/<mode>` (per-target, per-mode unit output; overrides `-FE` for `.ppu`/`.o` only)
+- `-FE .lwpt/sessions/<session>/jobs/lwpt-<mode>/bin`
+- `-FU .lwpt/sessions/<session>/jobs/lwpt-<mode>/units`
 - `@lwpt.cfg` (the cfg emitted by `lwpt install`; lists `-Fu source` since `units = ["source"]`)
 - `-Fu source` (also added explicitly from `Man.Units`; redundant with the cfg but harmless)
 - The dev-mode flags from `AddBuildModeFlags` (or release flags when `--mode release`)
-- `-o build/lwpt` (the target's output)
+- `-o .lwpt/sessions/<session>/jobs/lwpt-<mode>/bin/lwpt`
 - `source/lwpt.pas`
 
-The full mode-flag sets are in `LWPT.Command.Build.AddBuildModeFlags`:
+After FPC exits successfully, LWPT revalidates the build publication
+fingerprint under a short output-specific lock and atomically replaces
+`build/lwpt`. The full mode-flag sets are in
+`LWPT.Command.Build.AddBuildModeFlags`:
 
 | Mode | Flags |
 | --- | --- |
 | `dev` (default) | `-O- -gw -godwarfsets -gl -Ct -Cr -Sa` |
 | `release` (`--mode release`) | `-O4 -dPRODUCTION -Xs -CX -XX -B` |
 
-`--clean` first prunes orphaned `build/targets/` subdirs (renamed or deleted targets), then does one recursive sweep of `build/`, deleting FPC intermediate artefacts by extension (`.ppu`, `.o`, `.or`, `.res`, `.reslst`) — binaries and anything else under `build/` survive. Symlinks are never followed (a symlinked dir is treated as a leaf, so the sweep cannot escape `build/`), and artefacts that cannot be removed (e.g. locked files on Windows) are reported on stderr rather than silently skipped. Per target it additionally deletes the prior binary, the target's whole artefact dir `build/targets/<name>/` (both modes), and the `.o` / `.ppu` next to the source. Combined with dev mode it also adds `-B` to force a full rebuild (release mode includes `-B` already).
+`--clean` does not delete shared paths. Every invocation already begins with
+empty private staging; clean additionally passes `-B` for dev mode (release
+already includes it) to force recompilation. The last successful executable,
+another live session, legacy `build/targets/` directories, source-adjacent
+artefacts, and the currently running LWPT executable remain untouched.
 
 When a build fails with output matching a stale-artefact signature (internal compiler exception, resource-compile errors, missing `.reslst`), `lwpt build` prints a hint to retry with `--clean`. The signature heuristic lives in `LWPT.Command.Build.HasStaleArtefactSignature`.
 
-### The current-executable special-case
+### The current executable
 
-`lwpt build --clean lwpt` on Windows would try to delete the currently-running `build\lwpt.exe` before rebuilding. Windows file locks prevent that. **(Status: not yet handled; on Unix `unlink(2)` of the running binary works because the inode survives until close, so the rebuild produces a new inode at the same path.)** The special-case for Windows lives in `BuildOneTarget` when needed.
+Clean never deletes the current executable. Publication uses the platform's
+atomic replacement operation (`rename(2)` on Unix and `MoveFileEx` with
+replace/write-through on Windows), after the replacement candidate has
+finished compiling in its session. If the operating system refuses the
+replacement, LWPT reports publication failure and retains the completed
+candidate for diagnosis rather than deleting the last successful executable.
 
 ## Bootstrap
 
@@ -103,19 +118,61 @@ shortform = "src/quicktool.pas"                   # bare-string shorthand
 
 - `source` (required): the program/`.dpr`/`.pas` file FPC compiles.
 - `output` (optional): the binary path; defaults to `ChangeFileExt(source, '')`. On Windows, `.exe` is appended automatically when missing.
-- Target names become path segments under `build/targets/`, so the names `""`, `"."`, and `".."` (expressible as quoted TOML keys) are rejected at manifest load — for the project's own manifest only; a dependency's `[build]` section is parse-and-dropped and never built, so it is not validated (a broken dep manifest must not block `lwpt install`). Path separators and `:` in a name are sanitised to `_` for the artefact dir, and two targets whose names sanitise to the same dir (e.g. `"a:b"` and `a_b`) are rejected before anything builds.
+- Target names become job-directory path segments inside a session, so the
+  names `""`, `"."`, and `".."` are rejected at manifest load. Each segment
+  combines a bounded readable prefix with a hash of the full target identity,
+  preventing sanitisation collisions without creating unbounded paths.
 
 LWPT's own `lwpt.toml` is the reference: one `lwpt` target.
 
-## `build/` output directory
+## Session staging and public outputs
 
-Per the contract, everything generated by the build lands under `build/` and is gitignored. Compiled `.o` + `.ppu` files go to a **per-target, per-mode** unit-output dir, `build/targets/<name>/<mode>/`, via FPC's `-FU` flag (`<mode>` is `dev` or `release`). Binaries from `[build]` entries land at their `output` path via `-o`, which by convention is also under `build/`; `-FE build/` stays as the exe fallback for outputs without a directory component.
+Every `lwpt build` and `lwpt test` invocation creates a unique
+`.lwpt/sessions/session-<pid>-<timestamp>-<counter>/` directory. Target job
+directories contain separate `bin/` and `units/` children used for `-FE`,
+`-FU`, and `-o`. No two processes share writable compiler paths, even when
+they build the same target and mode in the same worktree.
 
-The isolation exists because FPC reuses a `.ppu` without re-checking the conditional defines it was compiled under: per-target `prebuild:<name>` hooks can regenerate shared sources between targets in one run, and a dev build must never silently link units compiled `-O4` by an earlier release build (or vice versa). One target/mode's artefacts are invisible to every other.
+Before compiling, LWPT captures a schema-versioned, compiler-neutral
+publication fingerprint. It covers the source and output request, mode and
+target dimensions, selected compiler identity/executable/live version,
+the previous public-output content, the implicit source directory, declared
+unit/include/resource inputs,
+manifest, cfg, lockfile, and installed module contents. After compilation it
+takes a short output-specific lock, combining an in-process critical section
+with an OS-held lock, and captures the same fingerprint again. Search-root
+hashing excludes `.lwpt/sessions/` and all declared build outputs, so a project
+that declares `units = ["."]` tracks compiler inputs without treating private
+staging or another target's publication as an input. Explicit file inputs are
+still hashed when they are also declared outputs. Workspace-package
+symlinks and junctions are followed, with physical-directory cycle detection.
+`LWPT_FPC_UNIT_PATHS` directories are content-hashed as both unit and include
+inputs. Changed input, compiler version, or the requested public-output
+generation means the result is stale: publication is refused and the candidate
+stays private. Per-target postbuild hooks receive `LWPT_BUILD_OUTPUT` for the
+private candidate, `LWPT_BUILD_PUBLIC_OUTPUT` for the requested manifest path,
+and `LWPT_BUILD_TARGET` for the target name. Existing `{item.output}`
+references in their script, arguments, inputs, and staleness output are
+retargeted to the private candidate at execution time when the expanded path
+is a complete path token. Related paths such as `build/app.json` are not
+rewritten. Hook definitions,
+scripts, and declared inputs participate in publication revalidation. A hook
+failure prevents publication. Whole-build postbuild runs only after every
+selected target compiles and its private hook succeeds, and before any
+candidate is published; artifact transformations therefore belong in the
+per-target hook. An unchanged candidate is then atomically renamed to the
+manifest output.
 
-The trade-off is deliberate: shared units compile once per target instead of once per run. Correctness over warm-cache sharing — FPC is fast enough that this does not hurt.
+Successful sessions are removed immediately. Failed, stale, or interrupted
+sessions remain private and diagnosable. `lwpt repair` removes inactive
+sessions only after their OS-held owner guard is absent; malformed state fails
+closed while its guard remains held. Artifact reuse is deliberately absent
+here and belongs to the content-addressed cache work.
 
-When you run `lwpt build --clean`, the binary at `output` is deleted along with the target's whole `build/targets/<name>/` dir, and orphaned `build/targets/` subdirs (renamed or deleted targets) are pruned. The `.o` / `.ppu` next to the source are also deleted — that pair is load-bearing, not cosmetic: source dirs sit on `-Fu`, so a stale `.ppu` there (from a raw `fpc @lwpt.cfg` run) would poison rebuilds. Leftover artefacts elsewhere under `build/` (pre-isolation layout, bootstrap output at the root, per-test dirs) are inert for `lwpt build` itself — `build/` is on no unit search path — but they still affect bootstrap re-runs and `lwpt test` compiles, so the whole-tree extension sweep (see above) removes them too.
+`[version]` include files are staged beside their destination and generated
+through true same-filesystem replacement before fingerprinting, so concurrent
+builds never expose a missing or partially rewritten
+compiler input.
 
 ## Cross-compile
 
@@ -136,7 +193,7 @@ build-foo = { script = "scripts/bar.pas",
               output = "source/Foo.inc" }
 ```
 
-`lwpt build` (and `lwpt test`, for `[pretest]`) walks each hook before the phase runs. If the output is missing or any input is newer than the output, the script is re-run via InstantFPC. The generator consumes its inputs and rewrites its output; no arguments are passed unless the manifest declares them.
+`lwpt build` (and `lwpt test`, for `[pretest]`) walks each hook before the phase runs. If the output is missing or any input is newer than the output, the script is re-run via InstantFPC. On Unix, LWPT points InstantFPC at a cache below the owning build/test session; Windows compiles the hook directly into that session. The generator consumes its inputs and rewrites its output; no arguments are passed unless the manifest declares them.
 
 If `instantfpc` is not on `PATH`, the failure names the generator script and recommends installing InstantFPC (bundled with FPC).
 

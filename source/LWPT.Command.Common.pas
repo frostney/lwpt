@@ -14,29 +14,37 @@ uses
   LWPT.Manifest;
 
 function  CompilePascal(const ASrcFile: string; const AUnitPaths: array of string;
-  out AOutBin: string): Boolean;
-function  RunPascalScript(const AHook: THook; out AError: string): Integer;
+  out AOutBin: string; const ABuildRoot: string = ''): Boolean;
+function  RunPascalScript(const AHook: THook; out AError: string;
+  const ABuildRoot: string = ''): Integer;
 function  RunUserScript(const AHook: THook): Integer;
-procedure RunHooks(const APhase: string; const AHooks: THookArray);
+procedure RunHooks(const APhase: string; const AHooks: THookArray;
+  const ABuildRoot: string = '');
+procedure RunHooksWithEnvironment(const APhase: string;
+  const AHooks: THookArray; const ABuildRoot: string;
+  const AEnvironment: array of string);
 
 implementation
 
 uses
   Process,
 
+  LWPT.BuildSession,
   LWPT.Core;
 
-function TestBuildDir(const ASrcFile: string): string;
-begin
-  Result := 'build/tests/' + SanitisePathSegment(ChangeFileExt(ASrcFile, ''));
-end;
-
 function CompilePascal(const ASrcFile: string; const AUnitPaths: array of string;
-  out AOutBin: string): Boolean;
+  out AOutBin: string; const ABuildRoot: string): Boolean;
 var
   P : TProcess;
   BuildDir : string;
   i : Integer;
+
+  function SourceBuildKey(const APath: string): string;
+  begin
+    { Keep compiler paths bounded while distinguishing equal basenames and
+      sanitisation collisions by the canonical source path. }
+    Result := BuildSessionPathKey(ExpandFileName(APath));
+  end;
 
   procedure AddCfgParameters(const APath: string);
   var
@@ -64,8 +72,14 @@ var
     end;
   end;
 begin
-  BuildDir := TestBuildDir(ASrcFile);
+  if ABuildRoot <> '' then
+    BuildDir := IncludeTrailingPathDelimiter(ABuildRoot)
+      + SourceBuildKey(ASrcFile)
+  else
+    BuildDir := MakeTmpPath(TMP_DIR,
+      'script-' + SourceBuildKey(ASrcFile));
   ForceDirectories(BuildDir);
+  ForceDirectories(BuildDir + '/units');
   AOutBin := IncludeTrailingPathDelimiter(BuildDir)
            + ChangeFileExt(ExtractFileName(ASrcFile), '');
 
@@ -80,7 +94,8 @@ begin
        (Nested-comment support is per-file via {$MODESWITCH
        NESTEDCOMMENTS+}; FPC has no command-line equivalent.) *)
     P.Parameters.Add('-Sh');
-    P.Parameters.Add('-FE' + BuildDir);   { all intermediates land here }
+    P.Parameters.Add('-FE' + BuildDir);
+    P.Parameters.Add('-FU' + BuildDir + '/units');
     { Inherit dep search paths from lwpt.cfg when present. After
       ADR-0014 (packages extraction), deps' unit subdirs live at
       .lwpt/modules/<name>/source/ and CmdTest's per-test compile
@@ -125,17 +140,23 @@ begin
   Result := False;
 end;
 
-function RunPascalScript(const AHook: THook; out AError: string): Integer;
+function RunPascalScriptWithEnvironment(const AHook: THook;
+  out AError: string; const ABuildRoot: string;
+  const AEnvironment: array of string): Integer;
 var
   P: TProcess;
-  j: Integer;
+  i, j, SeparatorAt: Integer;
+  Existing, ExistingName, ExtraName: string;
+  {$IFDEF UNIX}
+  CacheRoot: string;
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   Bin: string;
   {$ENDIF}
 begin
   AError := '';
   {$IFDEF MSWINDOWS}
-  if not CompilePascal(AHook.Script, [], Bin) then
+  if not CompilePascal(AHook.Script, [], Bin, ABuildRoot) then
   begin
     AError := 'fpc failed to compile ' + AHook.Script;
     Exit(1);
@@ -147,10 +168,45 @@ begin
 
   P := TProcess.Create(nil);
   try
+    if Length(AEnvironment) > 0 then
+    begin
+      for i := 1 to GetEnvironmentVariableCount do
+      begin
+        Existing := GetEnvironmentString(i);
+        SeparatorAt := Pos('=', Existing);
+        if SeparatorAt > 0 then
+          ExistingName := Copy(Existing, 1, SeparatorAt - 1)
+        else
+          ExistingName := Existing;
+        for j := 0 to High(AEnvironment) do
+        begin
+          SeparatorAt := Pos('=', AEnvironment[j]);
+          if SeparatorAt > 0 then
+            ExtraName := Copy(AEnvironment[j], 1, SeparatorAt - 1)
+          else
+            ExtraName := AEnvironment[j];
+          if SameText(ExistingName, ExtraName) then
+          begin
+            Existing := '';
+            Break;
+          end;
+        end;
+        if Existing <> '' then P.Environment.Add(Existing);
+      end;
+      for i := 0 to High(AEnvironment) do
+        P.Environment.Add(AEnvironment[i]);
+    end;
     {$IFDEF MSWINDOWS}
     P.Executable := Bin;
     {$ELSE}
     P.Executable := InstantFPCExecutable;
+    if ABuildRoot <> '' then
+    begin
+      CacheRoot := IncludeTrailingPathDelimiter(ABuildRoot)
+        + 'instantfpc/' + BuildSessionPathKey(ExpandFileName(AHook.Script));
+      ForceDirectories(CacheRoot);
+      P.Parameters.Add('--set-cache=' + CacheRoot);
+    end;
     P.Parameters.Add(AHook.Script);
     {$ENDIF}
     for j := 0 to High(AHook.Args) do
@@ -175,7 +231,15 @@ begin
   end;
 end;
 
-procedure RunHooks(const APhase: string; const AHooks: THookArray);
+function RunPascalScript(const AHook: THook; out AError: string;
+  const ABuildRoot: string): Integer;
+begin
+  Result := RunPascalScriptWithEnvironment(AHook, AError, ABuildRoot, []);
+end;
+
+procedure RunHooksWithEnvironment(const APhase: string;
+  const AHooks: THookArray; const ABuildRoot: string;
+  const AEnvironment: array of string);
 var
   i, Code: Integer;
   H: THook;
@@ -198,7 +262,8 @@ begin
       raise EManifestError.CreateFmt(
         '[%s] %s: script not found at %s', [APhase, H.Name, H.Script]);
 
-    Code := RunPascalScript(H, ScriptError);
+    Code := RunPascalScriptWithEnvironment(H, ScriptError, ABuildRoot,
+      AEnvironment);
     if ScriptError <> '' then
       raise ELWPTError.CreateFmt(
         '[%s] %s: %s while running %s',
@@ -209,6 +274,12 @@ begin
         '[%s] %s: script exited %d while running %s',
         [APhase, H.Name, Code, H.Script]);
   end;
+end;
+
+procedure RunHooks(const APhase: string; const AHooks: THookArray;
+  const ABuildRoot: string);
+begin
+  RunHooksWithEnvironment(APhase, AHooks, ABuildRoot, []);
 end;
 
 function RunUserScript(const AHook: THook): Integer;

@@ -7,8 +7,9 @@
       the scratch dir's basename, version "0.1.0", units = ["source"].
     - lwpt.lock: schema-v3 empty lockfile (no packages, but the
       version header is correct so the next `lwpt install` accepts it).
-    - .gitignore: contains the two LWPT-internal paths
-      (.lwpt/tmp/ + .lwpt/install.lock) — added if absent, never
+    - .gitignore: contains the three LWPT-internal paths
+      (.lwpt/tmp/ + .lwpt/install.lock + .lwpt/sessions/) — added if
+      absent, never
       duplicated if present.
 
   Also covers the refuse-to-clobber semantics: a second run without
@@ -139,6 +140,7 @@ begin
   GI := ReadFileText(FScratch + '/.gitignore');
   Expect<Boolean>(Pos('.lwpt/tmp/',         GI) > 0).ToBe(True);
   Expect<Boolean>(Pos('.lwpt/install.lock', GI) > 0).ToBe(True);
+  Expect<Boolean>(Pos('.lwpt/sessions/',    GI) > 0).ToBe(True);
   Expect<Boolean>(Pos('build/',             GI) > 0).ToBe(True);
 end;
 
@@ -230,7 +232,8 @@ begin
   WriteText(FScratch + '/.gitignore',
     '# existing'#10 +
     '.lwpt/tmp/'#10 +
-    '.lwpt/install.lock'#10);
+    '.lwpt/install.lock'#10 +
+    '.lwpt/sessions/'#10);
   R := RunLwpt(['init', '--yes', '--force'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
 

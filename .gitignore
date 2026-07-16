@@ -7,6 +7,7 @@ build/
 # NOT gitignored (per ADR-0002 zero-install).
 .lwpt/tmp/
 .lwpt/install.lock
+.lwpt/sessions/
 
 # FPC artefacts. These should never appear with -FE build, but defensive
 # in case a contributor runs fpc by hand without the output-dir flag.

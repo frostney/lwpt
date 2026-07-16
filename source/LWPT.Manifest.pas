@@ -214,6 +214,8 @@ procedure ParseBareDepString(const ABare: string; const ACustomSources: TCustomS
 function  ValidPackageName(const S: string): Boolean;
 function  LoadManifest(const APath: string): TManifest; overload;
 function  LoadManifest(const APath: string; AIsRoot: Boolean): TManifest; overload;
+function  LoadManifestSnapshot(const APath: string;
+  out AContentHash: string): TManifest;
 function  LoadManifestContext(const APath: string): TManifestContext;
 
 implementation
@@ -960,6 +962,33 @@ begin
 end;
 
 
+function ParseManifestContent(const APath, AContent: string;
+  AIsRoot: Boolean): TManifest; forward;
+
+procedure ReadManifestSnapshot(const APath: string; out AContent,
+  AContentHash: string);
+var
+  Bytes: TBytes;
+  ContentSize: SizeInt;
+  Stream: TFileStream;
+begin
+  if not FileExists(APath) then
+    raise EManifestError.CreateFmt('no manifest at %s', [APath]);
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    ContentSize := Stream.Size;
+    SetLength(Bytes, ContentSize);
+    if ContentSize > 0 then Stream.ReadBuffer(Bytes[0], ContentSize);
+  finally
+    Stream.Free;
+  end;
+  AContentHash := SHA256Hex(Bytes);
+  if Length(Bytes) = 0 then
+    AContent := ''
+  else
+    SetString(AContent, PAnsiChar(@Bytes[0]), Length(Bytes));
+end;
+
 function LoadManifest(const APath: string): TManifest;
 begin
   { Public wrapper: most callers want root-manifest semantics (full
@@ -967,6 +996,23 @@ begin
     The two-arg overload is for the resolver's dep-manifest walk
     (AIsRoot=False — supply-chain defense per ADR-0011 Q5). }
   Result := LoadManifest(APath, True);
+end;
+
+function LoadManifest(const APath: string; AIsRoot: Boolean): TManifest;
+var
+  Content, ContentHash: string;
+begin
+  ReadManifestSnapshot(APath, Content, ContentHash);
+  Result := ParseManifestContent(APath, Content, AIsRoot);
+end;
+
+function LoadManifestSnapshot(const APath: string;
+  out AContentHash: string): TManifest;
+var
+  Content: string;
+begin
+  ReadManifestSnapshot(APath, Content, AContentHash);
+  Result := ParseManifestContent(APath, Content, True);
 end;
 
 { ===========================================================================
@@ -1110,13 +1156,10 @@ begin
   end;
 end;
 
-{ [build] target names become path segments under build/targets/.
-  Quoted TOML keys can be any string, so reject the names that would
-  resolve elsewhere: "" and "." map onto build/targets/ itself, ".."
-  escapes it entirely (build/targets/.. == build/). Root manifests
-  only: a dependency's [build] targets are never built by the
-  consumer (parse-and-drop posture, ADR-0011), so a broken or hostile
-  dep manifest must not block `lwpt install`. }
+{ [build] target names become path segments inside private build
+  sessions. Quoted TOML keys can be any string, so reject empty and
+  dot segments before staging. Root manifests only: a dependency's
+  [build] targets are never built by the consumer. }
 procedure ValidateTargetName(const AName: string);
 begin
   if (AName = '') or (AName = '.') or (AName = '..') then
@@ -1125,7 +1168,8 @@ begin
       + 'empty, ".", or ".."', [AName]);
 end;
 
-function LoadManifest(const APath: string; AIsRoot: Boolean): TManifest;
+function ParseManifestContent(const APath, AContent: string;
+  AIsRoot: Boolean): TManifest;
 const
   { Recognised top-level sections — anything else either becomes a
     run-script (ADR-0013) when it carries a `script` field, OR
@@ -1164,7 +1208,6 @@ const
     'package', 'dependencies', 'sources', 'workspaces',
     'version', 'lwpt', 'format', 'generated');
 var
-  SL       : TStringList;
   Root, Deps, DepNode, ArrNode : TTOMLNode;
   TgtsNode, TgtNode, VerNode   : TTOMLNode;
   LwptCfgNode, FmtNode, ExclArr : TTOMLNode;
@@ -1190,17 +1233,11 @@ begin
     contents survive + the new parse appends on top). Bites
     transitive-resolver walks that load N child manifests. }
   Result := Default(TManifest);
-  if not FileExists(APath) then
-    raise EManifestError.CreateFmt('no manifest at %s', [APath]);
-
-  SL := TStringList.Create;
   Parser := TTOMLParser.Create;
   Root := nil;
   try
-    SL.LoadFromFile(APath);
-    Root := Parser.ParseDocument(SL.Text);
+    Root := Parser.ParseDocument(AContent);
   finally
-    SL.Free;
     Parser.Free;
   end;
 

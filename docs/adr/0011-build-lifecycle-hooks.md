@@ -8,7 +8,7 @@ LWPT gains a hook surface across three subcommands — `install`, `build`, `test
 
 - **Whole-build only.** Top-level `[prebuild]` / `[postbuild]` arrays running once around the whole `lwpt build` invocation. Rejected because it can't express per-target work (sign one target, package another, skip the third) without the user inventing target-discriminating logic inside the hook script. Simple but expressive-floor too low.
 - **Per-target only.** `prebuild` / `postbuild` fields inside each `[targets].<name>` entry. Rejected because shared prebuild work — like the existing `LWPT.Embedded.TestingLibrary.inc` regen that every test target depends on indirectly — would have to be either duplicated across every target or pushed into one "canonical" target with implicit ordering. Both bad.
-- **Both whole-build and per-target.** *Chosen.* Whole-build for shared prep work that benefits every target; per-target for actions specific to one binary (sign, strip, package). The two surfaces compose cleanly: whole-build prebuild → for each target, per-target prebuild → fpc → per-target postbuild → whole-build postbuild.
+- **Both whole-build and per-target.** *Chosen.* Whole-build for shared prep work that benefits every target; per-target for actions specific to one binary (sign, strip, package). The two surfaces compose cleanly: whole-build prebuild → for each target, per-target prebuild → fpc → per-target postbuild → whole-build postbuild against staged outputs → publish each successful output.
 - **Richer npm-style lifecycle (pre/post for every subcommand).** Rejected as Q4 below.
 
 ### Entry shape (Q2)
@@ -104,7 +104,7 @@ LWPT gains a hook surface across three subcommands — `install`, `build`, `test
 
 - **Hooks fire `install` first, `build` second, `test` third when the subcommands run.** Per-subcommand ordering:
   - `lwpt install`: `[preinstall]` → resolve + fetch + write lockfile + write cfg → `[postinstall]`
-  - `lwpt build`: `[prebuild]` → for each target: per-target `prebuild` → fpc → per-target `postbuild` → `[postbuild]`
+  - `lwpt build`: `[prebuild]` → for each target: per-target `prebuild` → fpc → per-target `postbuild` → `[postbuild]` against all staged outputs → publish all selected outputs
   - `lwpt test`: `[pretest]` → discover + compile + run each `*.Test.pas` → `[posttest]`
 
   Whole-build hooks fire once per `lwpt <verb>` invocation, regardless of how many targets / tests / packages are involved.

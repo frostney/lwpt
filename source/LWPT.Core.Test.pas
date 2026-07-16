@@ -43,6 +43,7 @@ type
     procedure TestPackageUnitsArrayParsed;
     procedure TestTargetsTable;
     procedure TestVersionSection;
+    procedure TestManifestSnapshotBindsParsedBytes;
   end;
 
   TLoadManifestValidation = class(TTestSuite)
@@ -241,9 +242,8 @@ type
     procedure TestNoMatchOnDifferentFile;
   end;
 
-  { SanitisePathSegment — the shared flattener behind per-target
-    artefact dirs (TargetBuildRoot) and per-test build dirs
-    (TestBuildDir). }
+  { SanitisePathSegment — the shared flattener behind session-private
+    build jobs and per-test build dirs. }
   TSanitisePathSegmentSuite = class(TTestSuite)
   public
     procedure SetupTests; override;
@@ -489,12 +489,32 @@ begin
   Expect<string>(Man.VersionPrefix).ToBe('APP');
 end;
 
+procedure TLoadManifestHappy.TestManifestSnapshotBindsParsedBytes;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "snapshot"'#10 +
+    'version = "1.2.3"'#10;
+var
+  ContentHash, Path: string;
+  Man: TManifest;
+begin
+  Path := WriteManifest('snapshot', INPUT);
+  Man := LoadManifestSnapshot(Path, ContentHash);
+
+  Expect<string>(ContentHash).ToBe(SHA256File(Path));
+  Expect<string>(Man.Name).ToBe('snapshot');
+  Expect<string>(Man.Version).ToBe('1.2.3');
+end;
+
 procedure TLoadManifestHappy.SetupTests;
 begin
   Test('minimal manifest: name + version',  TestMinimalManifestNameAndVersion);
   Test('[package] units array parsed',      TestPackageUnitsArrayParsed);
   Test('[build] table with output + bare-source entries', TestTargetsTable);
   Test('[version] section parsed',          TestVersionSection);
+  Test('manifest snapshot hashes the bytes it parses',
+    TestManifestSnapshotBindsParsedBytes);
 end;
 
 { ── TLoadManifestValidation ───────────────────────────────────────── }

@@ -15,6 +15,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.BuildSession,
   LWPT.Core,
   LWPT.Manifest,
   LWPT.WorkerBudget;
@@ -40,6 +41,7 @@ procedure CmdRepair(const AManifestPath: string);
 var
   Ctx : TManifestContext;
   TmpRoot, LockPath : string;
+  SessionsRemoved, SessionsRetained: Integer;
   WorkerLines : TStringList;
   WorkerSnapshot : TLWPTWorkerBudgetSnapshot;
   Reclaimed, i : Integer;
@@ -65,6 +67,10 @@ begin
   end
   else
     WriteLn('repair: no install lock to remove');
+
+  RepairBuildSessions(Ctx.ProjectRoot, SessionsRemoved, SessionsRetained);
+  WriteLn('repair: removed ', SessionsRemoved, ' abandoned build session(s), ',
+    SessionsRetained, ' live session(s) retained');
 
   Reclaimed := RepairWorkerBudget;
   WorkerSnapshot := GetWorkerBudgetSnapshot;

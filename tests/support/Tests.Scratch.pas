@@ -28,6 +28,8 @@ interface
 
 procedure WriteTextFile(const APath, AContent: string);
 procedure RecursiveDelete(const APath: string);
+function ReadBinaryFile(const APath: string): string;
+function TestCompilerExecutable: string;
 
 implementation
 
@@ -47,6 +49,31 @@ begin
   finally
     SL.Free;
   end;
+end;
+
+function ReadBinaryFile(const APath: string): string;
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    SetLength(Result, Stream.Size);
+    if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
+  finally
+    Stream.Free;
+  end;
+end;
+
+function TestCompilerExecutable: string;
+begin
+  Result := GetEnvironmentVariable('LWPT_FPC');
+  if Result = '' then Result := GetEnvironmentVariable('FPC');
+  if Result <> '' then Exit;
+  {$IFDEF MSWINDOWS}
+  Result := 'fpc.exe';
+  {$ELSE}
+  Result := 'fpc';
+  {$ENDIF}
 end;
 
 procedure RecursiveDelete(const APath: string);

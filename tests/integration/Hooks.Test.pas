@@ -1,13 +1,20 @@
 { Hooks.Test — pins lifecycle-hook execution semantics (ADR-0011).
 
-  Five assertions:
+  Ten assertions:
     1. [prebuild] hook (bare-string shorthand) runs before `lwpt build`.
     2. [prebuild] hook with inputs/output (the staleness gate) skips
        on the second invocation when the output is fresher than every
        input.
-    3. [postbuild] hook runs after `lwpt build` completes.
-    4. [pretest] hook runs before `lwpt test`.
-    5. Supply-chain guard: a dep manifest's [preinstall] hook is
+    3. The whole-build [postbuild] hook sees staged outputs before
+       publication.
+    4. A per-target [postbuild] hook sees the private candidate before
+       the public output exists.
+    5. Related paths containing the output name are not retargeted.
+    6. A failing per-target [postbuild] hook leaves no public output.
+    7. A failing whole-build [postbuild] hook leaves no public output.
+    8. [pretest] hook runs before `lwpt test`.
+    9. [posttest] hook runs even when no tests are discovered.
+    10. Supply-chain guard: a dep manifest's [preinstall] hook is
        silently dropped during `lwpt install`. The hook would write a
        sentinel file in the consuming project; the test asserts that
        file does NOT exist after install. This is the most important
@@ -45,6 +52,10 @@ type
     procedure TestPrebuildShorthandRuns;
     procedure TestPrebuildStalenessGateSkipsSecondRun;
     procedure TestPostbuildRunsAfterBuild;
+    procedure TestTargetPostbuildUsesPrivateCandidate;
+    procedure TestTargetPostbuildKeepsRelatedPath;
+    procedure TestFailingTargetPostbuildDoesNotPublish;
+    procedure TestFailingWholePostbuildDoesNotPublish;
     procedure TestPretestRunsBeforeTest;
     procedure TestPosttestRunsWhenNoTestsDiscovered;
     procedure TestDepManifestHookSilentlyDropped;
@@ -158,13 +169,133 @@ var R: TLwptResult;
 begin
   SetupScratchProject(
     '[postbuild]'#10 +
-    'touch = "scripts/touch-post.pas"'#10);
-  WriteSentinelScript(FScratch + '/scripts/touch-post.pas',
-    'sentinel-postbuild.txt');
+    'touch = { script = "scripts/touch-post.pas", '
+    + 'args = ["build/tinybin"] }'#10);
+  WriteTextFile(FScratch + '/scripts/touch-post.pas',
+      'program TouchPostbuild;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, SysUtils;'#10
+    + 'var Lines: TStringList;'#10
+    + 'begin'#10
+    + '  if (ParamStr(1) = '''') or not FileExists(ParamStr(1)) '
+    + 'then Halt(1);'#10
+    + '  if FileExists(''build/tinybin'')'
+    + ' or FileExists(''build/tinybin.exe'') then Halt(2);'#10
+    + '  Lines := TStringList.Create;'#10
+    + '  try Lines.Add(''ok''); '
+    + 'Lines.SaveToFile(''sentinel-postbuild.txt'');'#10
+    + '  finally Lines.Free; end;'#10
+    + 'end.'#10);
 
   R := RunLwpt(['build'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(SentinelExists('sentinel-postbuild.txt')).ToBe(True);
+end;
+
+procedure THooksE2E.TestTargetPostbuildUsesPrivateCandidate;
+var R: TLwptResult;
+begin
+  SetupScratchProject('');
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "hooks-e2e"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[build]'#10
+    + 'tinybin = { source = "source/tinybin.pas", '
+    + 'output = "build/tinybin", '
+    + 'postbuild = { probe = { script = "scripts/probe-output.pas", '
+    + 'args = ["{item.output}"] } } }'#10);
+  WriteTextFile(FScratch + '/scripts/probe-output.pas',
+      'program ProbeOutput;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses SysUtils;'#10
+    + 'begin'#10
+    + '  if ParamStr(1) <> GetEnvironmentVariable('
+    + '''LWPT_BUILD_OUTPUT'') then Halt(3);'#10
+    + '  if not FileExists(GetEnvironmentVariable('
+    + '''LWPT_BUILD_OUTPUT'')) then Halt(1);'#10
+    + '  if FileExists(GetEnvironmentVariable('
+    + '''LWPT_BUILD_PUBLIC_OUTPUT'')) then Halt(2);'#10
+    + 'end.'#10);
+
+  R := RunLwpt(['build'], FScratch);
+
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/tinybin')))
+    .ToBe(True);
+end;
+
+procedure THooksE2E.TestTargetPostbuildKeepsRelatedPath;
+var R: TLwptResult;
+begin
+  SetupScratchProject('');
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "hooks-e2e"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[build]'#10
+    + 'tinybin = { source = "source/tinybin.pas", '
+    + 'output = "build/tinybin", '
+    + 'postbuild = { probe = { script = "scripts/probe-related.pas", '
+    + 'args = ["build/tinybin.json"] } } }'#10);
+  WriteTextFile(FScratch + '/scripts/probe-related.pas',
+      'program ProbeRelated;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'begin'#10
+    + '  if ParamStr(1) <> ''build/tinybin.json'' then Halt(1);'#10
+    + 'end.'#10);
+
+  R := RunLwpt(['build'], FScratch);
+
+  Expect<Integer>(R.ExitCode).ToBe(0);
+end;
+
+procedure THooksE2E.TestFailingTargetPostbuildDoesNotPublish;
+var R: TLwptResult;
+begin
+  SetupScratchProject('');
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "hooks-e2e"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[build]'#10
+    + 'tinybin = { source = "source/tinybin.pas", '
+    + 'output = "build/tinybin", '
+    + 'postbuild = { fail = "scripts/fail-postbuild.pas" } }'#10);
+  WriteTextFile(FScratch + '/scripts/fail-postbuild.pas',
+      'program FailPostbuild;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'begin Halt(7); end.'#10);
+
+  R := RunLwpt(['build'], FScratch);
+
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/tinybin')))
+    .ToBe(False);
+end;
+
+procedure THooksE2E.TestFailingWholePostbuildDoesNotPublish;
+var R: TLwptResult;
+begin
+  SetupScratchProject(
+    '[postbuild]'#10 +
+    'fail = "scripts/fail-postbuild.pas"'#10);
+  WriteTextFile(FScratch + '/scripts/fail-postbuild.pas',
+      'program FailPostbuild;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'begin Halt(7); end.'#10);
+
+  R := RunLwpt(['build'], FScratch);
+
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/tinybin')))
+    .ToBe(False);
 end;
 
 procedure THooksE2E.TestPretestRunsBeforeTest;
@@ -253,8 +384,16 @@ begin
     TestPrebuildShorthandRuns);
   Test('[prebuild] staleness gate skips the second run when output is fresh',
     TestPrebuildStalenessGateSkipsSecondRun);
-  Test('[postbuild] runs after lwpt build completes',
+  Test('[postbuild] sees staged outputs before publication',
     TestPostbuildRunsAfterBuild);
+  Test('target postbuild receives the private candidate before publication',
+    TestTargetPostbuildUsesPrivateCandidate);
+  Test('target postbuild keeps paths that only contain the output name',
+    TestTargetPostbuildKeepsRelatedPath);
+  Test('failing target postbuild leaves the public output untouched',
+    TestFailingTargetPostbuildDoesNotPublish);
+  Test('failing whole-build postbuild leaves the public output untouched',
+    TestFailingWholePostbuildDoesNotPublish);
   Test('[pretest] runs before lwpt test',
     TestPretestRunsBeforeTest);
   Test('[posttest] runs after lwpt test even when no tests are discovered',

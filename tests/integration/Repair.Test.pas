@@ -9,12 +9,13 @@
   install crashes mid-run; it must be safe on a clean tree and
   effective on a dirty one.
 
-  Four assertions:
+  Five assertions:
     1. Repair on a clean tree is a no-op exit 0 (idempotent).
     2. Stale .lwpt/install.lock is removed.
     3. .lwpt/tmp/ contents are removed; the directory itself stays.
        .lwpt/modules/ and .lwpt/archives/ contents are untouched.
-    4. Dead machine-wide worker requests are reclaimed and diagnosed. }
+    4. Failed build-session staging is reclaimed.
+    5. Dead machine-wide worker requests are reclaimed and diagnosed. }
 
 program Repair.Test;
 
@@ -42,6 +43,7 @@ type
     procedure TestRepairOnCleanTreeIsNoop;
     procedure TestRepairClearsStaleInstallLock;
     procedure TestRepairCleansTmpButLeavesCommittedState;
+    procedure TestRepairReclaimsFailedBuildSession;
     procedure TestRepairReclaimsWorkerRequests;
   end;
 
@@ -171,6 +173,24 @@ begin
   Expect<Boolean>(FileExists(ModulesMarker)).ToBe(True);
 end;
 
+procedure TRepairE2E.TestRepairReclaimsFailedBuildSession;
+var
+  SessionPath: string;
+  R: TLwptResult;
+begin
+  SessionPath := FScratch + '/.lwpt/sessions/session-failed-test';
+  WriteTextFile(SessionPath + '/session.state',
+    '999999'#10'failed'#10'1'#10);
+  WriteTextFile(SessionPath + '/jobs/app/private-output', 'incomplete');
+
+  R := RunRepair;
+
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(DirectoryExists(SessionPath)).ToBe(False);
+  Expect<Boolean>(Pos('removed 1 abandoned build session', R.Stdout) > 0)
+    .ToBe(True);
+end;
+
 procedure TRepairE2E.SetupTests;
 begin
   Test('repair on a clean tree is a no-op exit 0',
@@ -179,6 +199,8 @@ begin
     TestRepairClearsStaleInstallLock);
   Test('repair cleans .lwpt/tmp/ but leaves .lwpt/modules/ untouched',
     TestRepairCleansTmpButLeavesCommittedState);
+  Test('repair reclaims failed build-session staging',
+    TestRepairReclaimsFailedBuildSession);
   Test('repair reclaims dead machine-wide worker requests',
     TestRepairReclaimsWorkerRequests);
 end;

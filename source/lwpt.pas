@@ -9,7 +9,7 @@
     build     compile manifest [build] entries
     format    format uses-clauses and identifiers (--check to verify only)
     test      discover + compile + run *.Test.pas files
-    repair    clean project residue and reclaim abandoned worker leases
+    repair    reclaim install, build-session, and worker-lease residue
     run       invoke a user-declared run-script (or alias a subcommand)
 
   earlier (ADR-0015) there was an eighth subcommand, `export`, which
@@ -364,7 +364,7 @@ begin
     BuildOpts[0] := TStringOption.Create('mode',
       'Build mode: dev (default) or release');
     BuildOpts[1] := TFlagOption.Create('clean',
-      'Sweep FPC artefacts from build/ and force a full rebuild');
+      'Force a full rebuild in fresh private staging');
     Registry.Add(TSubcommand.Create('build',
       'Compile manifest targets', '[target...] [--mode dev|release] [--clean]',
       @HandleBuild, BuildOpts));
@@ -385,7 +385,7 @@ begin
 
     SetLength(RepairOpts, 0);
     Registry.Add(TSubcommand.Create('repair',
-      'Clean project residue and reclaim abandoned worker leases', '',
+      'Reclaim install, build-session, and worker-lease residue', '',
       @HandleRepair, RepairOpts));
 
     SetLength(InitOpts, 2);

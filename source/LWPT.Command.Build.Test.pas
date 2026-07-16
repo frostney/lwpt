@@ -1,7 +1,7 @@
 { LWPT.Command.Build.Test — unit-tier coverage for the stale-artefact
   failure heuristic behind the `--clean` retry hint.
 
-  The sweep itself (SweepBuildArtefacts) is covered end-to-end by
+  Non-destructive clean rebuild behaviour is covered end-to-end by
   tests/integration/BuildClean.Test.pas through the real binary; this
   file stays at the unit level: pure string classification, no
   filesystem, no subprocess. }

@@ -74,6 +74,7 @@ function  MakeTmpPath(const ATmpRoot, AHint: string): string;
 procedure WipeDir(const APath: string);
 function  AtomicMoveFile(const ASrc, ADst: string): Boolean;
 function  AtomicMoveDir(const ASrc, ADst: string): Boolean;
+function  AtomicReplaceFile(const ASrc, ADst: string): Boolean;
 procedure AtomicWriteText(const ADst: string; const ATmpRoot: string; const AContent: TStringList);
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
 function  SHA256BytesPrefixed(const ABytes: TBytes): string;
@@ -90,6 +91,11 @@ uses
   {$IFDEF MSWINDOWS}
   Windows
   {$ENDIF};
+
+{$IFDEF MSWINDOWS}
+const
+  MOVEFILE_WRITE_THROUGH_LWPT = $00000008;
+{$ENDIF}
 
 function FPCExecutable: string;
 begin
@@ -781,6 +787,28 @@ begin
     RestoreBackup;
     raise;
   end;
+end;
+
+{ Replace a file in one filesystem operation. Unlike AtomicMoveFile this
+  helper never renames the old destination aside, because doing so creates
+  an observable missing-path window. It is intentionally strict: callers
+  must stage the source on the same filesystem as the destination. }
+function AtomicReplaceFile(const ASrc, ADst: string): Boolean;
+var
+  DstDir: string;
+begin
+  if not FileExists(ASrc) then Exit(False);
+  DstDir := ExtractFileDir(ADst);
+  if DstDir <> '' then ForceDirectories(DstDir);
+  {$IFDEF UNIX}
+  Result := FpRename(PChar(ASrc), PChar(ADst)) = 0;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Result := Windows.MoveFileExW(
+    PWideChar(UnicodeString(ASrc)),
+    PWideChar(UnicodeString(ADst)),
+    Windows.MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH_LWPT);
+  {$ENDIF}
 end;
 
 procedure EnsureDstDir(const ADst: string);

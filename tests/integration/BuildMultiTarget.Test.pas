@@ -9,10 +9,8 @@
                          (names are validated before any compile runs)
     lwpt build           (no names) still builds every target
 
-    unit artefacts (.ppu/.o) land in build/targets/<name>/<mode>/,
-    never in the shared build/ root — one target's (or one mode's)
-    units must not poison another's; --clean wipes the target's
-    whole artefact dir
+    unit artefacts (.ppu/.o) live only in invocation-private sessions;
+    completed binaries are atomically published to their manifest paths
 
   Goes through the real binary via Tests.LwptSubprocess because the
   defect spans the CLI positional handling AND the CmdBuild loop —
@@ -48,10 +46,10 @@ type
     procedure TestUnknownTargetNameFailsBeforeBuildingAnything;
     procedure TestNoNamesStillBuildsAllTargets;
     procedure TestUnitArtefactsIsolatedPerTargetAndMode;
-    procedure TestCleanWipesTargetArtefactDir;
+    procedure TestCleanLeavesTargetArtefactDirUntouched;
     procedure TestTraversalTargetNameRejectedAtLoad;
-    procedure TestCollidingArtefactDirsRejected;
-    procedure TestCleanPrunesOrphanTargetDirs;
+    procedure TestSanitisedTargetNamesRemainDistinct;
+    procedure TestCleanLeavesOrphanTargetDirsUntouched;
     procedure TestMissingCompilerFailsTargetsButLoopContinues;
     {$IFDEF UNIX}
     procedure TestCleanFailureFailsTargetButBuildContinues;
@@ -144,37 +142,37 @@ begin
   { The shared unit's artefacts land in the target's dev dir... }
   Expect<Boolean>(
     FileExists(FScratch + '/build/targets/alpha/dev/common.ppu'))
-    .ToBe(True);
-  { ...not in the shared build/ root, and not in any other target's. }
+    .ToBe(False);
+  { No compiler intermediates are published into shared build paths. }
   Expect<Boolean>(FileExists(FScratch + '/build/common.ppu')).ToBe(False);
   Expect<Boolean>(DirectoryExists(FScratch + '/build/targets/beta'))
     .ToBe(False);
 
-  { Release builds of the same target get their own dir; dev's stays. }
+  { A release build also publishes only the completed executable. }
   R := RunLwpt(['build', 'alpha', '--mode', 'release'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(
     FileExists(FScratch + '/build/targets/alpha/release/common.ppu'))
-    .ToBe(True);
+    .ToBe(False);
   Expect<Boolean>(
     FileExists(FScratch + '/build/targets/alpha/dev/common.ppu'))
-    .ToBe(True);
+    .ToBe(False);
 end;
 
-procedure TBuildMultiTarget.TestCleanWipesTargetArtefactDir;
+procedure TBuildMultiTarget.TestCleanLeavesTargetArtefactDirUntouched;
 var R: TLwptResult;
 begin
   WipeOutputs;
   R := RunLwpt(['build', 'alpha'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  { Plant a stale file inside the target's artefact dir; --clean must
-    wipe the whole dir (both modes) before rebuilding. }
+  { Plant shared state that another process could own; clean must leave
+    it untouched while compiling in fresh private staging. }
   WriteTextFile(FScratch + '/build/targets/alpha/dev/stale.sentinel', 'x');
   R := RunLwpt(['build', '--clean', 'alpha'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(
     FileExists(FScratch + '/build/targets/alpha/dev/stale.sentinel'))
-    .ToBe(False);
+    .ToBe(True);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/alpha')))
     .ToBe(True);
 end;
@@ -211,15 +209,13 @@ begin
   Expect<Boolean>(FileExists(Bad + '/build/survivor.txt')).ToBe(True);
 end;
 
-procedure TBuildMultiTarget.TestCollidingArtefactDirsRejected;
+procedure TBuildMultiTarget.TestSanitisedTargetNamesRemainDistinct;
 var
   Bad : string;
   R   : TLwptResult;
 begin
-  { Sanitisation maps "a:b" and "a_b" onto the same artefact dir —
-    silently sharing unit output would reintroduce the cross-target
-    poisoning the per-target split prevents. Rejected before any
-    hook or compile runs. }
+  { The readable part of both keys sanitises to a_b, but the full-name hash
+    keeps their private compiler output distinct. }
   Bad := ExpandFileName(
     GetCurrentDir + '/build/tests/tmp/build-colliding-names');
   RecursiveDelete(Bad);
@@ -236,19 +232,18 @@ begin
     'program alpha;'#10'begin'#10'end.'#10);
 
   R := RunLwpt(['build'], Bad);
-  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
-  Expect<Boolean>(Pos('same artefact dir', R.Stderr) > 0).ToBe(True);
-  Expect<Boolean>(FileExists(ExpectedExe(Bad + '/build/one'))).ToBe(False);
-  Expect<Boolean>(FileExists(ExpectedExe(Bad + '/build/two'))).ToBe(False);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(ExpectedExe(Bad + '/build/one'))).ToBe(True);
+  Expect<Boolean>(FileExists(ExpectedExe(Bad + '/build/two'))).ToBe(True);
 end;
 
-procedure TBuildMultiTarget.TestCleanPrunesOrphanTargetDirs;
+procedure TBuildMultiTarget.TestCleanLeavesOrphanTargetDirsUntouched;
 var
   R     : TLwptResult;
   Ghost : string;
 begin
-  { build/targets/<name>/ dirs of renamed or deleted targets are
-    reclaimed on --clean — and only on --clean. }
+  { Build sessions cannot infer ownership of legacy/shared directories;
+    repair owns abandoned session reclamation instead. }
   WipeOutputs;
   Ghost := FScratch + '/build/targets/ghost';
   WriteTextFile(Ghost + '/dev/stale.ppu', 'x');
@@ -260,11 +255,11 @@ begin
 
   R := RunLwpt(['build', '--clean', 'alpha'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(DirectoryExists(Ghost)).ToBe(False);
-  { Live targets' dirs survive the prune. }
+  Expect<Boolean>(DirectoryExists(Ghost)).ToBe(True);
+  { No live compiler output is ever placed there. }
   Expect<Boolean>(
     FileExists(FScratch + '/build/targets/alpha/dev/common.ppu'))
-    .ToBe(True);
+    .ToBe(False);
 end;
 
 procedure TBuildMultiTarget.TestMissingCompilerFailsTargetsButLoopContinues;
@@ -288,9 +283,8 @@ var
   R      : TLwptResult;
   Locked : string;
 begin
-  { A wipe failure (locked file, permissions) must fail that target
-    only — postbuild hooks and the remaining targets keep going
-    (ADR-0011). Simulated by making alpha's artefact dir undeletable. }
+  { Clean never touches an undeletable shared path; both targets build
+    in their own session directories. }
   WipeOutputs;
   R := RunLwpt(['build', 'alpha'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
@@ -301,12 +295,10 @@ begin
   finally
     FpChmod(Locked, &755);
   end;
-  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
-  Expect<Boolean>(Pos('target "alpha" failed:', R.Stderr) > 0).ToBe(True);
-  { beta still built, and the summary line still printed. }
+  Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/beta')))
     .ToBe(True);
-  Expect<Boolean>(Pos('1 built, 1 failed', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('2 built, 0 failed', R.Stdout) > 0).ToBe(True);
 end;
 {$ENDIF}
 
@@ -318,20 +310,20 @@ begin
     TestUnknownTargetNameFailsBeforeBuildingAnything);
   Test('build with no names builds every target',
     TestNoNamesStillBuildsAllTargets);
-  Test('unit artefacts isolated per target and mode',
+  Test('unit artefacts remain session-private',
     TestUnitArtefactsIsolatedPerTargetAndMode);
-  Test('--clean wipes the target artefact dir',
-    TestCleanWipesTargetArtefactDir);
+  Test('--clean leaves shared target artefact dirs untouched',
+    TestCleanLeavesTargetArtefactDirUntouched);
   Test('traversal target name ".." is rejected at manifest load',
     TestTraversalTargetNameRejectedAtLoad);
-  Test('target names colliding after sanitisation are rejected',
-    TestCollidingArtefactDirsRejected);
-  Test('--clean prunes orphaned target artefact dirs',
-    TestCleanPrunesOrphanTargetDirs);
+  Test('target names colliding after sanitisation remain distinct',
+    TestSanitisedTargetNamesRemainDistinct);
+  Test('--clean leaves orphaned shared dirs for repair',
+    TestCleanLeavesOrphanTargetDirsUntouched);
   Test('missing compiler fails targets individually, loop continues',
     TestMissingCompilerFailsTargetsButLoopContinues);
   {$IFDEF UNIX}
-  Test('clean failure fails the target, build continues',
+  Test('clean ignores locked shared artefact dirs',
     TestCleanFailureFailsTargetButBuildContinues);
   {$ENDIF}
 end;
