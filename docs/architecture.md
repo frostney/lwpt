@@ -13,7 +13,7 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 - **Compiler work is session-private.** Build/test compiler outputs stay below `.lwpt/sessions/<session-id>/`; successful build outputs are revalidated and atomically published, while test outputs remain private and successful test sessions are discarded. `lwpt repair` reclaims abandoned sessions. See ADR-0020.
 - **Build scheduling follows the manifest DAG.** Ready targets overlap within
   both the `--jobs` ceiling and machine-wide worker budget; dependants start
-  only after prerequisites publish. See ADR-0022.
+  only after prerequisites publish. See ADR-0023.
 
 ## Tech stack
 

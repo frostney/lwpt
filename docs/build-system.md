@@ -15,7 +15,7 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 - **Dependency-aware parallel builds.** Independent ready targets run in
   parallel by default, bounded by `--jobs=<n>` and the machine-wide
   `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See
-  [ADR-0022](./adr/0022-parallel-build-target-scheduler.md).
+  [ADR-0023](./adr/0023-parallel-build-target-scheduler.md).
 - **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with staleness gating (output older than any input → re-run). The earlier `[generated]` shape is no longer parsed.
 
 ## The contract
@@ -170,7 +170,7 @@ postbuild as the final gate before batch publication. A declared graph
 publishes prerequisites progressively so dependants start only after successful
 publication; its whole-build postbuild consequently runs once after all
 selected outputs publish. Artifact transformations therefore belong in the
-per-target hook. See ADR-0022.
+per-target hook. See ADR-0023.
 
 Successful sessions are removed immediately. Failed, stale, or interrupted
 sessions remain private and diagnosable. `lwpt repair` removes inactive

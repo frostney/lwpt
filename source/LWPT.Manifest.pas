@@ -132,7 +132,7 @@ type
     Name      : string;            { logical name, e.g. "cli" }
     Source    : string;            { entry-point .pas/.dpr path }
     Output    : string;            { optional output binary path }
-    Depends   : TStringArray;      { prerequisite target names (ADR-0022) }
+    Depends   : TStringArray;      { prerequisite target names (ADR-0023) }
     PreBuild  : THookArray;        { per-target prebuild hooks (ADR-0011) }
     PostBuild : THookArray;        { per-target postbuild hooks (ADR-0011) }
   end;
