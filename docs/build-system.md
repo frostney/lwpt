@@ -9,6 +9,7 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 - **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev branch of `AddBuildModeFlags` in `LWPT.Command.Build`.
 - **Build outputs land under `build/`.** Gitignored. FPC intermediates (`.o`, `.ppu`) are isolated per target and mode under `build/targets/<name>/<mode>/` via `-FU`; binaries land at the manifest `output` path via `-o`.
 - **Cross-compile via `FPC_TARGET_CPU`** env var; `lwpt build` translates this into FPC's `-P` flag.
+- **Machine capacity foundation.** `LWPT.WorkerBudget` provides fair, reclaimable per-user leases across processes and worktrees. Builds remain sequential until [issue #39](https://github.com/frostney/lwpt/issues/39) consumes that interface.
 - **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with staleness gating (output older than any input → re-run). The earlier `[generated]` shape is no longer parsed.
 
 ## The contract
@@ -162,3 +163,23 @@ The heavyweight gates — `lwpt format --check` + `lwpt build` + `lwpt test` —
 Do **not** bypass with `git commit --no-verify` unless a maintainer explicitly authorises it on the PR.
 
 The three deferred customer-facing stack contracts ([link-check #31](https://github.com/frostney/lwpt/issues/31), [duplication #32](https://github.com/frostney/lwpt/issues/32), and [codebase-health #33](https://github.com/frostney/lwpt/issues/33)) are explicitly *not* in the v1 pre-commit gate per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md). They plug in when their workstreams land. Architecture drift is instead checked for LWPT itself during release preparation; it is not a consumer command. Parallel, process-safe, observable builds and tests are tracked in [issue #28](https://github.com/frostney/lwpt/issues/28).
+
+## Machine-wide worker capacity
+
+The worker-budget coordinator is implemented separately from scheduling.
+Future build schedulers acquire capacity from `LWPT.WorkerBudget` before
+starting compiler processes and release it when each process finishes. The
+coordinator bounds aggregate work from several LWPT invocations and worktrees,
+not just the `--jobs` value of one process.
+
+The module uses reclaimable filesystem leases with a heartbeat rather than a
+permanent counter. A crashed owner therefore cannot leak capacity
+indefinitely. Heartbeat age is diagnostic only, so a healthy compiler that
+runs longer than the stale threshold keeps its lease while its OS-held owner
+guard remains live. FIFO acquisition tickets prevent release/reacquire loops
+from jumping existing waiters, and nested LWPT subprocesses consume a one-shot
+delegation that transfers one grant to their own guarded request instead of
+consuming a second slot. The parent reacquires through the FIFO after the child
+finishes. See
+[`tooling.md`](./tooling.md#machine-wide-worker-budget) for configuration and
+[ADR-0021](./adr/0021-machine-wide-worker-budget.md) for the decision.

@@ -66,7 +66,7 @@ After bootstrap:
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
-./build/lwpt repair             # clean .lwpt/tmp/ + stale install lock
+./build/lwpt repair             # clean project residue + abandoned worker leases
 ```
 
 [`build-system.md`](./build-system.md) covers each in depth.
@@ -197,4 +197,6 @@ bar = { source = "owner/bar", version = "^1.0", subdir = "src" }   # inline-tabl
 ./build/lwpt repair
 ```
 
-Cleans `.lwpt/tmp/` and any stale install lock; never touches `.lwpt/modules/` or `.lwpt/archives/`.
+Cleans `.lwpt/tmp/` and any stale install lock, then reclaims abandoned
+per-user worker requests and reports the remaining budget state. It never
+touches `.lwpt/modules/` or `.lwpt/archives/`.

@@ -12,10 +12,12 @@ procedure CmdRepair(const AManifestPath: string);
 implementation
 
 uses
+  Classes,
   SysUtils,
 
   LWPT.Core,
-  LWPT.Manifest;
+  LWPT.Manifest,
+  LWPT.WorkerBudget;
 
 function LooksLikeAbsolutePath(const APath: string): Boolean;
 begin
@@ -38,6 +40,9 @@ procedure CmdRepair(const AManifestPath: string);
 var
   Ctx : TManifestContext;
   TmpRoot, LockPath : string;
+  WorkerLines : TStringList;
+  WorkerSnapshot : TLWPTWorkerBudgetSnapshot;
+  Reclaimed, i : Integer;
 begin
   Ctx := LoadManifestContext(AManifestPath);
   TmpRoot := ResolveRepairPath(Ctx.ProjectRoot, ResolveTmpDir(Ctx.Manifest));
@@ -60,6 +65,19 @@ begin
   end
   else
     WriteLn('repair: no install lock to remove');
+
+  Reclaimed := RepairWorkerBudget;
+  WorkerSnapshot := GetWorkerBudgetSnapshot;
+  WorkerLines := TStringList.Create;
+  try
+    AppendWorkerBudgetDiagnostics(WorkerLines, WorkerSnapshot);
+    WriteLn('repair: reclaimed ', Reclaimed,
+      ' abandoned worker invocation(s)');
+    for i := 0 to WorkerLines.Count - 1 do
+      WriteLn(WorkerLines[i]);
+  finally
+    WorkerLines.Free;
+  end;
 
   WriteLn('repair complete. Committed state under ', LWPT_DIR,
           '/modules/ and ', LWPT_DIR, '/archives/ was not modified.');

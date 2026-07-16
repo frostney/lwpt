@@ -45,6 +45,7 @@ type
     FGroup: string;
     FPresent: Boolean;
     FFromCommandLine: Boolean;
+    FAllowAttachedShortValue: Boolean;
   public
     constructor Create(const ALongName, AHelpText: string; const AGroup: string = '');
 
@@ -65,6 +66,11 @@ type
 
     property LongName: string read FLongName;
     property ShortName: string read FShortName write FShortName;
+    { When True, a valued short option accepts its value in the same
+      argument (`-dDEBUG`, `-Fusource`). Separated values remain
+      available to every non-flag short option. }
+    property AllowAttachedShortValue: Boolean read FAllowAttachedShortValue
+      write FAllowAttachedShortValue;
     { Alternate name used in config files when different from LongName.
       When empty, config files use LongName as usual. }
     property ConfigName: string read FConfigName write FConfigName;
@@ -207,6 +213,7 @@ begin
   FGroup := AGroup;
   FPresent := False;
   FFromCommandLine := False;
+  FAllowAttachedShortValue := False;
 end;
 
 procedure TOptionBase.MarkFromCommandLine;

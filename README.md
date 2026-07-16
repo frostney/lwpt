@@ -13,7 +13,7 @@ lwpt remove    remove dependencies from lwpt.toml + prune their modules
 lwpt build     compile manifest targets   [--mode dev|release] [--clean]
 lwpt format    format uses-clauses + identifiers   [--check]
 lwpt test      discover, compile and run *.Test.pas files
-lwpt repair    clean .lwpt/tmp/ and stale install lock; recover from crash
+lwpt repair    clean project residue and reclaim abandoned worker leases
 lwpt run       invoke a user-declared run-script (or alias a subcommand)
 ```
 
@@ -53,7 +53,7 @@ bootstrap.bat      # Windows
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
-./build/lwpt repair             # recover from a crashed install
+./build/lwpt repair             # recover install residue and worker leases
 ```
 
 ## Architecture
@@ -225,10 +225,12 @@ differs from GocciaScript's older copy:
   chunked-body seed-buffer. `Copy(PAnsiChar(...))` truncates
   response bytes at the first `#0`, corrupting binary downloads;
   the byte-safe accumulator avoids the issue.
-- **`packages/cli/source/CLI.Parser.pas`** — space-separated option
-  values (`--mode release`) work for plain string/integer options,
-  not only repeatable ones. Plus the `AStartArg` parameter for
-  `lwpt run <subcommand>` aliasing.
+- **`packages/cli/source/CLI.Parser.pas`** — valued short options support
+  separated values (`-o output`, including values beginning with `-`) and
+  opt-in attached values (`-Fusource`, `-dDEBUG`) with longest-prefix
+  matching. Space-separated long values (`--mode release`) work for plain
+  string/integer options, not only repeatable ones. Plus the `AStartArg`
+  parameter for `lwpt run <subcommand>` aliasing.
 - **`packages/cli/source/CLI.Options.pas`** — `TGoccia*` type-prefix
   stripped from every public type; GocciaScript-engine-specific
   option groups removed as dead code.

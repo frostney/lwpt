@@ -6,7 +6,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 
 - **FPC 3.2.2 is pinned for v1.** Verify live with `fpc -iV` before any change that depends on FPC behavior — memory and prior conversation are not acceptable sources.
 - **Lefthook 2.x runs the pre-commit hook.** Local pre-commit runs `lwpt format` (auto-fix, with `stage_fixed: true`); the heavyweight gates (`lwpt build` + `lwpt test` + `lwpt format --check`) run on the PR workflow in CI. Install with `lefthook install`.
-- **Three environment variables matter today.** `LWPT_CACHE_DIR` (reserved for the cache work in issue #30; currently ignored), `FPC_TARGET_CPU` (cross-compile via FPC's `-P` flag), and `PATH` (must contain `fpc`, `instantfpc`, `lefthook`).
+- **Worker capacity is coordinated across worktrees.** The internal worker-budget module uses per-user, reclaimable filesystem leases. Its default budget is the host's logical processor count; `LWPT_WORKER_BUDGET` overrides it.
 - **TLS backend is platform-native.** SChannel on Windows, SecureTransport on macOS — both built into the OS, no DLLs to bundle. Linux uses the distro's libssl package (system OpenSSL via `dlopen`). Per [ADR-0016](./adr/0016-tls-backend-per-platform.md).
 - **EXDEV-rename failures fall back to copy-then-delete.** When `.lwpt/tmp/` and `.lwpt/modules/` end up on different filesystems (Docker bind mounts, network drives), the atomic-rename helpers (`AtomicMoveFile`, `AtomicMoveDir`) automatically fall back to a copy followed by delete.
 - **Three customer-facing stack contracts are owed but deferred.** Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), link-check, duplication, and codebase-health each have a follow-up workstream. Architecture drift is instead a project-local release-preparation check for LWPT itself; it is not a customer feature.
@@ -47,8 +47,61 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | Variable | Effect | Default |
 | --- | --- | --- |
 | `LWPT_CACHE_DIR` | Reserved for [issue #30](https://github.com/frostney/lwpt/issues/30). Today: ignored. | n/a until the cache implementation lands |
+| `LWPT_WORKER_BUDGET` | Maximum aggregate LWPT workers for this user and machine | logical processor count |
+| `LWPT_WORKER_STATE_DIR` | Override the per-user coordinator state root | the platform application-config directory's `workers/` subdirectory |
+| `LWPT_WORKER_LEASE_STALE_SECONDS` | Mark heartbeat diagnostics stale after this interval; values below 3 are rejected. Heartbeat age never authorizes reclamation by itself. | `30` |
+| `LWPT_WORKER_LEASE_TOKEN` | One-shot opaque delegation token added to one nested LWPT subprocess by the worker-budget API; do not configure, reuse, or persist manually | unset |
 | `FPC_TARGET_CPU` | When set, `lwpt build` passes `-P<value>` to FPC for cross-compilation | unset (host CPU) |
 | `PATH` | Must contain `fpc`, `instantfpc`, `lefthook` | system default |
+
+## Machine-wide worker budget
+
+`LWPT.WorkerBudget` provides the capacity seam used by the parallel build and
+test schedulers. The coordinator exists now; `lwpt build` and `lwpt test`
+remain sequential until their scheduler issues consume it.
+
+Each invocation registers a session request in a per-user state root shared by
+all worktrees. The effective budget is the first invocation's configured
+`LWPT_WORKER_BUDGET`, or the logical processor count when unset. Later
+invocations adopt that active budget until all current requests finish. A
+request cannot hold more than its own requested worker count or the effective
+machine budget.
+
+Short state transactions use `fcntl` on Unix and `LockFileEx` on Windows. Each
+active request has a lifetime owner guard held by the operating system and
+records its diagnostic PID, requested and granted workers, FIFO wait ticket,
+lease-token hashes, pending delegation verifiers, start time, lease start, and
+heartbeat. Each acquisition gets a new ticket, so releasing and reacquiring
+never jumps ahead of an existing waiter. Owner death releases the guard and
+allows immediate reclamation without relying on the PID, so PID reuse cannot
+preserve a dead request. A stale heartbeat is reported but never authorizes
+reclamation while the owner guard remains held. Unreadable, malformed, and
+unknown-schema requests with a live owner guard reserve capacity
+conservatively rather than being deleted.
+
+Nested LWPT subprocesses inherit capacity explicitly with
+`AppendWorkerLeaseEnvironment`. It adds a cryptographically random,
+one-shot `LWPT_WORKER_LEASE_TOKEN` to one child environment. The coordinator
+stores only its verifier and atomically consumes it by transferring one grant
+from the parent request to the child's own owner-guarded request. The parent
+lease becomes locally unavailable and the parent reacquires through the FIFO
+after the child finishes. Reuse and fan-out from one lease fail. The raw token
+is never persisted or logged. The child clears the consumed token from its
+process environment before running work, so unrelated descendants do not
+inherit a dead delegation. The child remains counted independently if the
+parent exits. Tokens are not command-line arguments, diagnostics, or project
+configuration.
+
+Session-local lease lists and counters are protected for concurrent scheduler
+threads. Acquisitions join the FIFO queue serially and releases update durable
+coordinator state before changing local state, so an explicit release can be
+retried after a lock or atomic-write failure. Scheduler threads must join before
+destroying their shared session.
+
+`lwpt repair` now reclaims abandoned worker requests and prints diagnostics for
+the remaining coordinator state. The report identifies session IDs, PIDs,
+granted capacity, waiting state, lease age, heartbeat age, effective budget,
+and state-root path.
 
 ## TLS backend per platform
 
