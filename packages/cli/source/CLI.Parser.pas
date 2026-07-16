@@ -11,7 +11,9 @@ uses
 
 { Parses command-line arguments against the given option definitions.
   Returns a TStringList of positional (non-option) arguments; the caller
-  owns the returned list.  Raises TParseError for unknown flags.
+  owns the returned list. Raises TParseError for unknown long flags and
+  unmatched single-character short options. An unmatched multi-character
+  single-dash token remains positional.
 
   A valued short option consumes the following argv (`-o output`) when
   its ShortName matches exactly, including a value that begins with `-`.
