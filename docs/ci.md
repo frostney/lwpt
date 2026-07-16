@@ -62,8 +62,8 @@ Each runner installs FPC natively (`brew` / `apt` / `choco`), then the `x86_64-w
 1. **Sanity** — `lwpt --help` (does the binary even load?)
 2. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
 3. **`lwpt format --check`** — only on `aarch64-darwin` runner (formatting is platform-independent; one check is enough)
-4. **`lwpt test`** — default tier (unit + integration); compiles every `*.Test.pas` via the runner's native FPC, runs them
-5. **`lwpt test --tier=e2e`** — live network tier (Q23 decision: run on every platform to surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
+4. **`lwpt test --bail=1`** — default tier (unit + integration); compiles every `*.Test.pas` via the runner's native FPC, runs them concurrently, and stops quickly on the first failure
+5. **`lwpt test --tier=e2e --bail=1`** — live network tier (Q23 decision: run on every platform to surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
 
 Per [Q22=b](./adr/0014-packages-extraction.md), the runner side compiles tests at runtime via `lwpt test` rather than pre-compiling them on the cross-build stage. This exercises the full LWPT pipeline natively — including the resolver, the per-target cfg emitter, FPC's per-platform `{$IFDEF}` paths, and the install loop's symlink-vs-copy decision (junctions on Windows, symlinks on Unix).
 
@@ -76,7 +76,7 @@ Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR
 3. `./build/lwpt --help` (does the binary even load?)
 4. `./build/lwpt install` (workspace auto-discovery + symlinks)
 5. `./build/lwpt format --check`
-6. `./build/lwpt test` (default tier — unit + integration)
+6. `./build/lwpt test --bail=1` (default tier — unit + integration)
 
 E2E tests are skipped via `LWPT_SKIP_NETWORK=1`; they run on every platform post-merge via `ci.yml`. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
 
@@ -86,7 +86,7 @@ The PR workflow deliberately uses the distro FPC (same as the install instructio
 
 A second job reuses `toolchain.yml` (`workflow_call`, exactly like `ci.yml`) and cross-compiles `source/lwpt.pas` for **`x86_64-win64` only**, mirroring `ci.yml`'s build-stage flags and unit paths. It exists because `{$IFDEF WINDOWS}` codepaths never compile on the Ubuntu runner: PR #17 merged green while breaking `main` with a `SysUtils.FindClose` vs `Windows.FindClose` unit-shadowing error that PR #21 then had to fix. One target suffices — win32 and win64 share the same `{$IFDEF WINDOWS}` sources. The job also runs the ADR-0016 no-OpenSSL guard against the produced `lwpt.exe`, surfacing that release-blocker on the PR instead of post-merge.
 
-The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC via choco (a verbatim copy of `ci.yml`'s step — `lwpt test` compiles `*.Test.pas` with the native FPC at run time per Q22=b), download the binary, then `lwpt install` + `lwpt test` (default tier, offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling) and compile breaks in test sources.
+The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC via choco (a verbatim copy of `ci.yml`'s step — `lwpt test` compiles `*.Test.pas` with the native FPC at run time per Q22=b), download the binary, then `lwpt install` + `lwpt test --bail=1` (default tier, offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
 
 Deliberate scope limits — still post-merge only (`ci.yml`):
 

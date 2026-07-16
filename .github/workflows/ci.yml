@@ -28,8 +28,8 @@ name: CI
 #           full pipeline:
 #             ./build/lwpt install
 #             ./build/lwpt format --check        (one runner is enough)
-#             ./build/lwpt test                  (default tier)
-#             ./build/lwpt test --tier=e2e       (live network, Q23=c)
+#             ./build/lwpt test --bail=1             (default tier)
+#             ./build/lwpt test --tier=e2e --bail=1  (live network, Q23=c)
 #           This exercises lwpt itself + the underlying native FPC on
 #           each platform end-to-end, including live GitHub/GitLab/
 #           Bitbucket fetches.
@@ -424,18 +424,18 @@ jobs:
         run: |
           ./build/lwpt format --check
 
-      - name: lwpt test (default tier)
+      - name: lwpt test --bail=1 (default tier)
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            ./build/lwpt.exe test
+            ./build/lwpt.exe test --bail=1
           else
-            ./build/lwpt test
+            ./build/lwpt test --bail=1
           fi
 
-      - name: lwpt test --tier=e2e (live network — every platform per Q23=c)
+      - name: lwpt test --tier=e2e --bail=1 (live network — every platform per Q23=c)
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            ./build/lwpt.exe test --tier=e2e
+            ./build/lwpt.exe test --tier=e2e --bail=1
           else
-            ./build/lwpt test --tier=e2e
+            ./build/lwpt test --tier=e2e --bail=1
           fi

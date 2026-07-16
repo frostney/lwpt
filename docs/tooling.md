@@ -63,9 +63,10 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 
 ## Machine-wide worker budget
 
-`LWPT.WorkerBudget` provides the capacity seam used by the parallel build and
-test schedulers. The coordinator exists now; `lwpt build` and `lwpt test`
-remain sequential until their scheduler issues consume it.
+`LWPT.WorkerBudget` provides the capacity seam used by parallel schedulers.
+`lwpt test` consumes it now: automatic concurrency requests up to one worker
+per runnable test and is capped by the effective machine budget; `--jobs=N`
+sets a smaller request. The build scheduler remains tracked separately.
 
 Each invocation registers a session request in a per-user state root shared by
 all worktrees. The effective budget is the first invocation's configured

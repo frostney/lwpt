@@ -9,10 +9,14 @@ interface
 
 uses
   Classes,
+  Process,
   SysUtils,
 
   LWPT.Manifest;
 
+function  CreatePascalCompilerProcess(const ASrcFile: string;
+  const AUnitPaths: array of string; out AOutBin: string;
+  const ABuildRoot: string = ''): TProcess;
 function  CompilePascal(const ASrcFile: string; const AUnitPaths: array of string;
   out AOutBin: string; const ABuildRoot: string = ''): Boolean;
 function  RunPascalScript(const AHook: THook; out AError: string;
@@ -27,15 +31,13 @@ procedure RunHooksWithEnvironment(const APhase: string;
 implementation
 
 uses
-  Process,
-
   LWPT.BuildSession,
   LWPT.Core;
 
-function CompilePascal(const ASrcFile: string; const AUnitPaths: array of string;
-  out AOutBin: string; const ABuildRoot: string): Boolean;
+function CreatePascalCompilerProcess(const ASrcFile: string;
+  const AUnitPaths: array of string; out AOutBin: string;
+  const ABuildRoot: string): TProcess;
 var
-  P : TProcess;
   BuildDir : string;
   i : Integer;
 
@@ -65,27 +67,27 @@ var
           Continue;
         if Line[1] = '#' then
           Continue;
-        P.Parameters.Add(Line);
+        Result.Parameters.Add(Line);
       end;
     finally
       Lines.Free;
     end;
   end;
 begin
-  if ABuildRoot <> '' then
-    BuildDir := IncludeTrailingPathDelimiter(ABuildRoot)
-      + SourceBuildKey(ASrcFile)
-  else
-    BuildDir := MakeTmpPath(TMP_DIR,
-      'script-' + SourceBuildKey(ASrcFile));
-  ForceDirectories(BuildDir);
-  ForceDirectories(BuildDir + '/units');
-  AOutBin := IncludeTrailingPathDelimiter(BuildDir)
-           + ChangeFileExt(ExtractFileName(ASrcFile), '');
-
-  P := TProcess.Create(nil);
+  Result := TProcess.Create(nil);
   try
-    P.Executable := FPCExecutable;
+    if ABuildRoot <> '' then
+      BuildDir := IncludeTrailingPathDelimiter(ABuildRoot)
+        + SourceBuildKey(ASrcFile)
+    else
+      BuildDir := MakeTmpPath(TMP_DIR,
+        'script-' + SourceBuildKey(ASrcFile));
+    ForceDirectories(BuildDir);
+    ForceDirectories(BuildDir + '/units');
+    AOutBin := IncludeTrailingPathDelimiter(BuildDir)
+             + ChangeFileExt(ExtractFileName(ASrcFile), '');
+
+    Result.Executable := FPCExecutable;
     (* Deliberately NOT forcing -M<mode>: each source sets its own mode
        via {$I Shared.inc} or an explicit {$mode delphi}{$H+} header.
        Forcing a mode here would conflict with future vendored test
@@ -93,9 +95,9 @@ begin
        delphi/objfpc-compatible string-handling switch, not a mode.
        (Nested-comment support is per-file via {$MODESWITCH
        NESTEDCOMMENTS+}; FPC has no command-line equivalent.) *)
-    P.Parameters.Add('-Sh');
-    P.Parameters.Add('-FE' + BuildDir);
-    P.Parameters.Add('-FU' + BuildDir + '/units');
+    Result.Parameters.Add('-Sh');
+    Result.Parameters.Add('-FE' + BuildDir);
+    Result.Parameters.Add('-FU' + BuildDir + '/units');
     { Inherit dep search paths from lwpt.cfg when present. After
       ADR-0014 (packages extraction), deps' unit subdirs live at
       .lwpt/modules/<name>/source/ and CmdTest's per-test compile
@@ -107,15 +109,29 @@ begin
       additions stay for the AUnitPaths-driven callers (preserves
       backwards-compat with non-cfg-based invocations). }
     AddCfgParameters(CFG_FILE);
-    AddEnvUnitPathParameters(P.Parameters);
+    AddEnvUnitPathParameters(Result.Parameters);
     for i := 0 to High(AUnitPaths) do
       if AUnitPaths[i] <> '' then
       begin
-        P.Parameters.Add('-Fu' + AUnitPaths[i]);
-        P.Parameters.Add('-Fi' + AUnitPaths[i]);
+        Result.Parameters.Add('-Fu' + AUnitPaths[i]);
+        Result.Parameters.Add('-Fi' + AUnitPaths[i]);
       end;
-    P.Parameters.Add('-o' + AOutBin);
-    P.Parameters.Add(ASrcFile);
+    Result.Parameters.Add('-o' + AOutBin);
+    Result.Parameters.Add(ASrcFile);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function CompilePascal(const ASrcFile: string; const AUnitPaths: array of string;
+  out AOutBin: string; const ABuildRoot: string): Boolean;
+var
+  P : TProcess;
+begin
+  P := CreatePascalCompilerProcess(ASrcFile, AUnitPaths, AOutBin,
+    ABuildRoot);
+  try
     P.Options := [poWaitOnExit];
     P.Execute;
     Result := P.ExitStatus = 0;

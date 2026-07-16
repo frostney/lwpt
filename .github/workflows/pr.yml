@@ -104,8 +104,8 @@ jobs:
       - name: lwpt build (compile every [build] entry)
         run: ./build/lwpt build
 
-      - name: lwpt test (default tier — unit + integration)
-        run: ./build/lwpt test
+      - name: lwpt test --bail=1 (default tier — unit + integration)
+        run: ./build/lwpt test --bail=1
 
   docs:
     runs-on: ubuntu-latest
@@ -339,5 +339,5 @@ jobs:
       - name: lwpt install (workspace auto-discovery + junctions)
         run: ./build/lwpt.exe install
 
-      - name: lwpt test (default tier — unit + integration)
-        run: ./build/lwpt.exe test
+      - name: lwpt test --bail=1 (default tier — unit + integration)
+        run: ./build/lwpt.exe test --bail=1

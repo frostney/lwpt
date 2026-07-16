@@ -60,9 +60,30 @@ end.
 `lwpt test`:
 
 1. Discovers every `*.Test.pas` under the manifest's `Units` dirs (plus `.` for the project root) — skipping `.lwpt/`, `build/`, `.git/`.
-2. Compiles each via `fpc -Sh -Fu<units> -Fu.lwpt/modules <file> -o<bin>`.
-3. Runs each binary; reads the exit code (0 = pass; non-zero = fail).
-4. Aggregates: prints per-file pass/fail; exits 1 if any failed or any failed to compile.
+2. Schedules independent programs concurrently through the machine-wide
+   worker budget, compiling each via
+   `fpc -Sh -Fu<units> -Fu.lwpt/modules <file> -o<bin>` in its own
+   session-private output directory.
+3. Runs each successfully compiled binary under the same worker lease and
+   reads the exit code (0 = pass; non-zero = fail).
+4. Aggregates captured diagnostics in sorted source-path order; exits 1 if
+   any failed or any failed to compile.
+
+Concurrency is automatic by default and cannot exceed the shared
+`LWPT_WORKER_BUDGET`. `--jobs=N` sets a smaller invocation ceiling;
+`--jobs=1` provides a deterministic serial lane. Numeric bail counts both
+compiler and runtime failures:
+
+```toml
+[test]
+bail = 0 # default: run the complete queue
+```
+
+`--bail=N` overrides the manifest for one invocation. A positive threshold
+stops new scheduling as soon as that many failures have been observed,
+terminates and reaps active compiler/test children, and reports the remaining
+programs as cancelled. `--bail=0` always runs the complete queue. CI should
+use `--bail=1` for fast feedback.
 
 Each `*.Test.pas` file sets its own compiler mode via its include directives. `lwpt test` does **not** force `-M<mode>` — every test file in this codebase ends up in delphi mode (either via an explicit `{$mode delphi}{$H+}` header or via `{$I Shared.inc}`), and forcing a mode would conflict with future workspace-package test files that ship their own directives.
 
@@ -178,6 +199,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`tests/integration/Repair.Test.pas`** | 5 tests in 1 suite | Spawns `lwpt repair` in scratch projects. Covers clean no-op behavior, stale install-lock removal, `.lwpt/tmp/` cleanup without touching committed module/archive state, failed build-session reclamation, and dead machine-wide worker-request reclamation with diagnostics. |
 | **`tests/integration/BuildSessions.Test.pas`** | 5 tests in 1 suite | Uses the test executable as a controllable FPC proxy to pause simultaneous `lwpt build` subprocesses after session setup. Proves same-output competitors produce exactly one publication, distinct outputs can publish concurrently even with `units = ["."]`, workspace-package changes behind `.lwpt/modules/` links invalidate in-flight builds, ordinary source changes refuse stale publication, and a failed clean build cannot delete or replace the last successful executable. |
 | **`tests/integration/Run.Test.pas`** | 6 tests in 1 suite | Spawns `lwpt run` against scratch projects. Covers user-script execution and exit-code propagation, built-in aliasing with flag passthrough, unknown-script errors, list mode omitting retired `export`, and `export` as an allowed user script name. |
+| **`tests/integration/TestScheduling.Test.pas`** | 5 tests in 1 suite | Cross-platform subprocess coverage for default overlap, deterministic `--jobs=1` ordering, `--bail=0` override, compile failures counting toward bail, and the amended bail contract: stop new work, terminate and reap active children, and print sorted diagnostics. |
 | **`tests/integration/Version.Test.pas`** | 4 tests in 1 suite | Spawns version-reporting forms and verifies output shape plus drift protection against `lwpt.toml`'s `[package].version`. |
 
 ### E2E tier
@@ -198,6 +220,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 - **`tests/support/Tests.Scratch.pas`** — scratch-directory file helpers shared by the integration + E2E test programs: `WriteTextFile` (write a small text file, creating parent dirs) and `RecursiveDelete` (wipe a tree; symlink-aware — links are unlinked, never followed). Replaces the per-test copy-paste of these two helpers.
 - **Testable internals exposure** — `SHA256Hex` remains in `LWPT.Core`; `LoadManifest` and manifest model types live in `LWPT.Manifest`; `LoadLockfile`, `VerifyAgainstLockfile`, and `ExtractArchive` live in `LWPT.Install`. Documented as testable-internal surface, not part of the consumer contract.
 - **`--tier` flag** on `lwpt test` — default tier runs unit + integration; `--tier=e2e` adds the network-touching tier.
+- **Parallel scheduling controls** — `--jobs=N` caps this invocation within
+  the shared worker budget. `[test] bail = N` supplies the project default,
+  and `--bail=N` overrides it. Compile and runtime failures both count;
+  reaching a positive threshold terminates and reaps active children.
 - **Test-artefact placement** — every `lwpt test` invocation owns a unique
   `.lwpt/sessions/<session-id>/` directory. Each test program receives a
   private `-FE`, `-FU`, and executable path below that session. Successful
@@ -210,9 +236,9 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | Tier | Files | Test cases |
 | --- | --- | --- |
 | Unit (`source/*.Test.pas` + package self-tests) | 10 | 220 |
-| Integration (`tests/integration/*.Test.pas`) | 15 | 100 |
+| Integration (`tests/integration/*.Test.pas`) | 16 | 105 |
 | E2E (`tests/e2e/*.E2E.Test.pas`) | 5 | 20 |
-| **Total** | **30** | **340** |
+| **Total** | **31** | **345** |
 
 ### Planned testing work
 
