@@ -34,7 +34,7 @@ If any check fails on a hook autofix you didn't expect, do not commit with `--no
 
 ## Commit messages
 
-Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`, `perf:`, `build:`, `ci:`, `style:`, `revert:`). Release preparation uses the committed `cliff.toml` to generate `CHANGELOG.md`; clear commit messages determine the published categorization.
+Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`, `perf:`, `build:`, `ci:`, `style:`, `revert:`). Release preparation uses the committed `cliff.toml` to preview the unreleased changelog without writing `CHANGELOG.md`; `/create-release` performs the later generation step. Clear commit messages determine the published categorization.
 
 ## When to write an ADR
 
