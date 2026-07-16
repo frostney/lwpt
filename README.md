@@ -13,7 +13,7 @@ lwpt remove    remove dependencies from lwpt.toml + prune their modules
 lwpt build     compile manifest targets   [--mode dev|release] [--clean]
 lwpt format    format uses-clauses + identifiers   [--check]
 lwpt test      discover, compile and run *.Test.pas files
-lwpt repair    clean .lwpt/tmp/ and stale install lock; recover from crash
+lwpt repair    clean project residue and reclaim abandoned worker leases
 lwpt run       invoke a user-declared run-script (or alias a subcommand)
 ```
 
@@ -53,7 +53,7 @@ bootstrap.bat      # Windows
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
-./build/lwpt repair             # recover from a crashed install
+./build/lwpt repair             # recover install residue and worker leases
 ```
 
 ## Architecture

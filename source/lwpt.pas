@@ -9,7 +9,7 @@
     build     compile manifest [build] entries
     format    format uses-clauses and identifiers (--check to verify only)
     test      discover + compile + run *.Test.pas files
-    repair    clean .lwpt/tmp/ + stale install lock; recover from crash
+    repair    clean project residue and reclaim abandoned worker leases
     run       invoke a user-declared run-script (or alias a subcommand)
 
   earlier (ADR-0015) there was an eighth subcommand, `export`, which
@@ -28,6 +28,9 @@ program lwpt;
 {$I Shared.inc}
 
 uses
+  {$IFDEF UNIX}
+  cthreads,
+  {$ENDIF}
   Classes,
   SysUtils,
 
@@ -382,7 +385,7 @@ begin
 
     SetLength(RepairOpts, 0);
     Registry.Add(TSubcommand.Create('repair',
-      'Clean .lwpt/tmp/ and stale install lock; recover from crash', '',
+      'Clean project residue and reclaim abandoned worker leases', '',
       @HandleRepair, RepairOpts));
 
     SetLength(InitOpts, 2);

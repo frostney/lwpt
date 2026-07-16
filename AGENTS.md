@@ -88,6 +88,6 @@ Unit-naming, formatter rules, vendored exclusion policy, and line-ending convent
 | Update a dependency's version spec | `./build/lwpt add <source@new-version>` (same name → entry updated, stale archive pruned) |
 | Remove dependencies (+ prune their modules) | `./build/lwpt remove <name> [<name>...]` |
 | Verify project matches lockfile | `./build/lwpt install --frozen` |
-| Recover from a partial install / crash | `./build/lwpt repair` |
+| Recover install residue or abandoned worker leases | `./build/lwpt repair` |
 | Invoke a user-declared run-script | `./build/lwpt run <script-name>` |
 | Show the version | `./build/lwpt --version` |
