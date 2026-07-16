@@ -85,6 +85,17 @@ uses
 const
   PUBLICATION_LOCK_WAIT_MILLISECONDS = 30000;
   SESSION_PARTIAL_GRACE_MILLISECONDS = 5000;
+  {$IFDEF UNIX}
+  {$IFDEF LINUX}
+  FD_CLOEXEC_LWPT = 1;
+  F_WRLCK_LWPT = 1;
+  F_UNLCK_LWPT = 2;
+  {$ELSE}
+  FD_CLOEXEC_LWPT = FD_CLOEXEC;
+  F_WRLCK_LWPT = F_WRLCK;
+  F_UNLCK_LWPT = F_UNLCK;
+  {$ENDIF}
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   LOCKFILE_EXCLUSIVE_LOCK_LWPT = $00000002;
   LOCKFILE_FAIL_IMMEDIATELY_LWPT = $00000001;
@@ -96,6 +107,14 @@ var
     array[0..63] of TRTLCriticalSection;
 
 type
+  {$IFDEF UNIX}
+  {$IFDEF LINUX}
+  TLWPTFlock = BaseUnix.FLock;
+  {$ELSE}
+  TLWPTFlock = TFlock;
+  {$ENDIF}
+  {$ENDIF}
+
   TPublicationLock = class
   private
     FPath: string;
@@ -461,7 +480,7 @@ end;
 constructor TSessionOwnerGuard.Create(const APath: string);
 {$IFDEF UNIX}
 var
-  LockSpec: TFlock;
+  LockSpec: TLWPTFlock;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
@@ -482,7 +501,7 @@ begin
   if FDescriptor < 0 then
     raise ELWPTError.CreateFmt(
       'could not open build session owner guard %s', [FPath]);
-  if FpFcntl(FDescriptor, F_SETFD, FD_CLOEXEC) <> 0 then
+  if FpFcntl(FDescriptor, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
   begin
     FpClose(FDescriptor);
     FDescriptor := -1;
@@ -491,7 +510,7 @@ begin
       [FPath]);
   end;
   FillChar(LockSpec, SizeOf(LockSpec), 0);
-  LockSpec.l_type := F_WRLCK;
+  LockSpec.l_type := F_WRLCK_LWPT;
   LockSpec.l_whence := SEEK_SET;
   LockSpec.l_start := 0;
   LockSpec.l_len := 1;
@@ -530,7 +549,7 @@ end;
 destructor TSessionOwnerGuard.Destroy;
 {$IFDEF UNIX}
 var
-  LockSpec: TFlock;
+  LockSpec: TLWPTFlock;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
@@ -543,7 +562,7 @@ begin
     if FLocked then
     begin
       FillChar(LockSpec, SizeOf(LockSpec), 0);
-      LockSpec.l_type := F_UNLCK;
+      LockSpec.l_type := F_UNLCK_LWPT;
       LockSpec.l_whence := SEEK_SET;
       LockSpec.l_start := 0;
       LockSpec.l_len := 1;
@@ -574,7 +593,7 @@ function SessionOwnerGuardHeld(const APath: string): Boolean;
 var
   Descriptor: LongInt;
   ErrorCode: Integer;
-  LockSpec: TFlock;
+  LockSpec: TLWPTFlock;
 begin
   Descriptor := FpOpen(PChar(APath), O_RDWR);
   if Descriptor < 0 then
@@ -584,13 +603,13 @@ begin
   end;
   try
     FillChar(LockSpec, SizeOf(LockSpec), 0);
-    LockSpec.l_type := F_WRLCK;
+    LockSpec.l_type := F_WRLCK_LWPT;
     LockSpec.l_whence := SEEK_SET;
     LockSpec.l_start := 0;
     LockSpec.l_len := 1;
     if FpFcntl(Descriptor, F_SetLk, LockSpec) = 0 then
     begin
-      LockSpec.l_type := F_UNLCK;
+      LockSpec.l_type := F_UNLCK_LWPT;
       FpFcntl(Descriptor, F_SetLk, LockSpec);
       Exit(False);
     end;
@@ -640,7 +659,7 @@ var
   Acquired: Boolean;
   i: Integer;
   {$IFDEF UNIX}
-  LockSpec: TFlock;
+  LockSpec: TLWPTFlock;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Written: DWORD;
@@ -674,7 +693,7 @@ begin
       raise EConcurrencyError.CreateFmt(
         'could not open build publication lock %s', [FPath]);
     FillChar(LockSpec, SizeOf(LockSpec), 0);
-    LockSpec.l_type := F_WRLCK;
+    LockSpec.l_type := F_WRLCK_LWPT;
     LockSpec.l_whence := SEEK_SET;
     LockSpec.l_start := 0;
     LockSpec.l_len := 1;
@@ -743,7 +762,7 @@ end;
 destructor TPublicationLock.Destroy;
 {$IFDEF UNIX}
 var
-  LockSpec: TFlock;
+  LockSpec: TLWPTFlock;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
@@ -754,7 +773,7 @@ begin
   if FDescriptor >= 0 then
   begin
     FillChar(LockSpec, SizeOf(LockSpec), 0);
-    LockSpec.l_type := F_UNLCK;
+    LockSpec.l_type := F_UNLCK_LWPT;
     LockSpec.l_whence := SEEK_SET;
     LockSpec.l_start := 0;
     LockSpec.l_len := 1;

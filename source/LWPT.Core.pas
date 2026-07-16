@@ -92,10 +92,10 @@ uses
   Windows
   {$ENDIF};
 
+{$IFDEF MSWINDOWS}
 const
-  {$IFDEF MSWINDOWS}
   MOVEFILE_WRITE_THROUGH_LWPT = $00000008;
-  {$ENDIF}
+{$ENDIF}
 
 function FPCExecutable: string;
 begin
