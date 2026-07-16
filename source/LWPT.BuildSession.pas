@@ -32,6 +32,7 @@ type
     Environment: TStringArray;
     UnitPaths: TStringArray;
     IncludePaths: TStringArray;
+    WorkspacePaths: TStringArray;
     Resources: TStringArray;
     HookDefinition: TStringArray;
     HookInputs: TStringArray;
@@ -380,6 +381,8 @@ begin
       ARequest.ExcludedPaths);
     AddPathArray(Fields, AProjectRoot, 'include-paths',
       ARequest.IncludePaths, ARequest.ExcludedPaths);
+    AddPathArray(Fields, AProjectRoot, 'workspace-paths',
+      ARequest.WorkspacePaths, ARequest.ExcludedPaths);
     AddPathArray(Fields, AProjectRoot, 'resources', ARequest.Resources,
       ARequest.ExcludedPaths);
     AddStringArray(Fields, 'hook-definition', ARequest.HookDefinition);

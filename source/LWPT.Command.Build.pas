@@ -226,10 +226,22 @@ end;
 
 function ReplaceOutputReference(const AValue, APublicOutput,
   ACandidateOutput: string): string;
+{$IFDEF MSWINDOWS}
+var
+  PublicWithoutExtension: string;
+{$ENDIF}
 begin
   if (AValue = '') or (APublicOutput = '') then Exit(AValue);
   Result := StringReplace(AValue, APublicOutput, ACandidateOutput,
     [rfReplaceAll]);
+  {$IFDEF MSWINDOWS}
+  if SameText(ExtractFileExt(APublicOutput), '.exe') then
+  begin
+    PublicWithoutExtension := ChangeFileExt(APublicOutput, '');
+    Result := StringReplace(Result, PublicWithoutExtension,
+      ACandidateOutput, [rfReplaceAll]);
+  end;
+  {$ENDIF}
 end;
 
 function RetargetPostBuildHooks(const AHooks: THookArray;
@@ -387,6 +399,9 @@ begin
     + GetEnvironmentVariable('LWPT_FPC_UNIT_PATHS');
   Request.UnitPaths := Copy(AMan.Units, 0, Length(AMan.Units));
   Request.IncludePaths := Copy(AMan.Includes, 0, Length(AMan.Includes));
+  SetLength(Request.WorkspacePaths, Length(AMan.Workspaces));
+  for i := 0 to High(AMan.Workspaces) do
+    Request.WorkspacePaths[i] := AMan.Workspaces[i].Path;
   AddHookPublicationInputs(T.PostBuild, Request);
   AddHookPublicationInputs(AMan.PostBuild, Request);
   ACompiled.PostBuild := RetargetPostBuildHooks(T.PostBuild,
