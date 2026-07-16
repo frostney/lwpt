@@ -107,7 +107,8 @@ my-project/
 │   │   ├── horse/
 │   │   └── jhonson/
 │   ├── archives/            # *.tar.gz per dep — COMMITTED (verification)
-│   └── tmp/                 # install workspace — GITIGNORED
+│   ├── tmp/                 # install workspace — GITIGNORED
+│   └── sessions/            # private staging; failures retained for repair
 ├── build/                   # FPC output — GITIGNORED
 └── src/
     └── main.pas

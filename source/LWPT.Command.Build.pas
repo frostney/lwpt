@@ -28,7 +28,7 @@ uses
   Platform;
 
 type
-  TCompiledTarget = record
+  TLWPTCompiledTarget = record
     Name: string;
     CandidateBin: string;
     OutBin: string;
@@ -36,11 +36,11 @@ type
     ProjectRoot: string;
     CfgPath: string;
     ModulesPath: string;
-    Request: TBuildPublicationRequest;
+    Request: TLWPTBuildPublicationRequest;
     PostBuild: THookArray;
   end;
 
-  TCompiledTargetArray = array of TCompiledTarget;
+  TLWPTCompiledTargetArray = array of TLWPTCompiledTarget;
 
 procedure AddBuildModeFlags(AArgs: TStrings; ARelease: Boolean);
 begin
@@ -307,7 +307,7 @@ begin
 end;
 
 procedure AddHookPublicationInputs(const AHooks: THookArray;
-  var ARequest: TBuildPublicationRequest);
+  var ARequest: TLWPTBuildPublicationRequest);
 var
   i, j, Count: Integer;
 
@@ -381,16 +381,16 @@ end;
 function BuildOneTarget(const AManifestPath: string; const AMan: TManifest;
   const AManifestContentHash: string;
   const T: TBuildTarget; ARelease, AClean: Boolean;
-  ASession: TLWPTBuildSession; out ACompiled: TCompiledTarget): Boolean;
+  ASession: TLWPTBuildSession; out ACompiled: TLWPTCompiledTarget): Boolean;
 var
   Args : TStringList;
   FpcArgs : TStringArray;
   Arch, OutBin, JobRoot, BinDir, CandidateBin, UnitOutDir, OutText,
     Fingerprint, ProjectRoot, CfgPath, ModulesPath : string;
   i, FpcExit : Integer;
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
 begin
-  ACompiled := Default(TCompiledTarget);
+  ACompiled := Default(TLWPTCompiledTarget);
   if T.Source = '' then
   begin
     WriteLn(ErrOutput, '  target "', T.Name, '" has no source — skipped');
@@ -421,7 +421,7 @@ begin
   ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
   CfgPath := ResolveCfgFile(AMan);
   ModulesPath := ResolveModulesDir(AMan);
-  Request := Default(TBuildPublicationRequest);
+  Request := Default(TLWPTBuildPublicationRequest);
   Request.CompilerID := 'fpc';
   Request.CompilerExecutable := FPCExecutable;
   Request.CompilerVersion := QueryFPCVersion;
@@ -561,19 +561,15 @@ var
   ModeStr, CollA, CollB : string;
   ManifestContentHash: string;
   Session: TLWPTBuildSession;
-  Compiled: TCompiledTarget;
-  Pending: TCompiledTargetArray;
-  PublicationRequest: TBuildPublicationRequest;
+  Compiled: TLWPTCompiledTarget;
+  Pending: TLWPTCompiledTargetArray;
+  PublicationRequest: TLWPTBuildPublicationRequest;
   HookEnvironment: array of string;
 begin
-  ManifestContentHash := SHA256File(AManifestPath);
-  if ManifestContentHash = '' then
+  if not FileExists(AManifestPath) then
     raise EManifestError.CreateFmt(
       'manifest not found at %s', [AManifestPath]);
-  Man := LoadManifest(AManifestPath);
-  if SHA256File(AManifestPath) <> ManifestContentHash then
-    raise EManifestError.Create(
-      'manifest changed while it was being parsed');
+  Man := LoadManifestSnapshot(AManifestPath, ManifestContentHash);
 
   if Length(Man.Targets) = 0 then
   begin
@@ -663,7 +659,6 @@ begin
 
     if Failed = 0 then
     begin
-      RunHooks('postbuild', Man.PostBuild, Session.HookRoot);
       for i := 0 to High(Pending) do
       begin
         PublicationRequest := Pending[i].Request;
@@ -685,6 +680,8 @@ begin
           WriteLn('ok -> ', Pending[i].OutBin);
         end;
       end;
+      if Failed = 0 then
+        RunHooks('postbuild', Man.PostBuild, Session.HookRoot);
     end;
     WriteLn;
     WriteLn(Built, ' built, ', Failed, ' failed');

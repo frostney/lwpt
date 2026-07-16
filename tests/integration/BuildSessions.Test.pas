@@ -7,7 +7,6 @@ uses
   Process,
   SysUtils,
 
-  LWPT.Core,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -246,7 +245,7 @@ begin
   ReadyDir := FScratch + '/control/concurrent-ready';
   ReleasePath := FScratch + '/control/concurrent-release';
   RecursiveDelete(FScratch + '/control');
-  RealFPC := FPCExecutable;
+  RealFPC := TestCompilerExecutable;
   SetLength(Env, 5);
   Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
   Env[1] := 'LWPT_TEST_FPC_PROXY=1';
@@ -320,7 +319,7 @@ begin
     'program first; begin end.'#10);
   WriteTextFile(Project + '/second.pas',
     'program second; begin end.'#10);
-  RealFPC := FPCExecutable;
+  RealFPC := TestCompilerExecutable;
   SetLength(Env, 5);
   Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
   Env[1] := 'LWPT_TEST_FPC_PROXY=1';
@@ -367,19 +366,19 @@ end;
 
 procedure TBuildSessions.TestFailedBuildPreservesLastSuccessfulOutput;
 var
-  BeforeHash, AfterHash: string;
+  BeforeContent, AfterContent: string;
   R: TLwptResult;
 begin
   R := RunLwpt(['build', 'app'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  BeforeHash := SHA256File(ExpectedExe(FScratch + '/build/app'));
+  BeforeContent := ReadBinaryFile(ExpectedExe(FScratch + '/build/app'));
 
   R := RunLwpt(['build', '--clean', 'app'], FScratch,
     ['LWPT_FPC=' + FScratch + '/missing-fpc']);
 
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
-  AfterHash := SHA256File(ExpectedExe(FScratch + '/build/app'));
-  Expect<string>(AfterHash).ToBe(BeforeHash);
+  AfterContent := ReadBinaryFile(ExpectedExe(FScratch + '/build/app'));
+  Expect<string>(AfterContent).ToBe(BeforeContent);
 end;
 
 procedure TBuildSessions.TestInFlightWorkspaceChangeRefusesPublication;
@@ -428,7 +427,7 @@ begin
   InstallResult := RunLwpt(['install'], Project);
   Expect<Integer>(InstallResult.ExitCode).ToBe(0);
 
-  RealFPC := FPCExecutable;
+  RealFPC := TestCompilerExecutable;
   SetLength(Env, 5);
   Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
   Env[1] := 'LWPT_TEST_FPC_PROXY=1';
@@ -492,7 +491,7 @@ begin
   WriteAppSource(False);
   ReadyDir := FScratch + '/control/stale-ready';
   ReleasePath := FScratch + '/control/stale-release';
-  RealFPC := FPCExecutable;
+  RealFPC := TestCompilerExecutable;
   SetLength(Env, 5);
   Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
   Env[1] := 'LWPT_TEST_FPC_PROXY=1';

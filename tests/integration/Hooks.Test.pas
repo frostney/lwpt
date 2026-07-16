@@ -167,8 +167,19 @@ begin
   SetupScratchProject(
     '[postbuild]'#10 +
     'touch = "scripts/touch-post.pas"'#10);
-  WriteSentinelScript(FScratch + '/scripts/touch-post.pas',
-    'sentinel-postbuild.txt');
+  WriteTextFile(FScratch + '/scripts/touch-post.pas',
+      'program TouchPostbuild;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, SysUtils;'#10
+    + 'var Lines: TStringList;'#10
+    + 'begin'#10
+    + '  if not FileExists(''build/tinybin'')'
+    + ' and not FileExists(''build/tinybin.exe'') then Halt(1);'#10
+    + '  Lines := TStringList.Create;'#10
+    + '  try Lines.Add(''ok''); '
+    + 'Lines.SaveToFile(''sentinel-postbuild.txt'');'#10
+    + '  finally Lines.Free; end;'#10
+    + 'end.'#10);
 
   R := RunLwpt(['build'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);

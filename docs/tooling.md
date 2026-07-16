@@ -173,13 +173,15 @@ in `LWPT_BUILD_OUTPUT`, the requested path in `LWPT_BUILD_PUBLIC_OUTPUT`, and
 the target name in `LWPT_BUILD_TARGET`. Runtime retargeting also maps existing
 `{item.output}`-expanded hook fields to the private candidate. Hook failure
 keeps the candidate private, and hook definitions, scripts, and declared
-inputs are revalidated before publication. Unix lifecycle hooks use an
-InstantFPC cache below the owning session. Windows compiles those hooks directly
-into the same private hook root. Compiler directories use bounded readable
-prefixes plus hashes of their full source identities, so different paths cannot
-collide after sanitisation.
+inputs are revalidated before publication. The whole-build postbuild hook runs
+only after every selected output has published successfully. Unix lifecycle
+hooks use an InstantFPC cache below the owning session. Windows compiles those
+hooks directly into the same private hook root. Compiler directories use
+bounded readable prefixes plus hashes of their full source identities, so
+different paths cannot collide after sanitisation.
 
-Each session holds an OS owner guard until its final metadata is complete.
+Each session holds an OS owner guard from before it becomes visible until its
+final metadata and private contents are removed.
 `lwpt repair` removes only unlocked sessions and conservatively retains live
 guards even when their state file is malformed.
 

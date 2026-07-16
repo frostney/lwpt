@@ -15,12 +15,12 @@ uses
   TestingPascalLibrary;
 
 type
-  TBuildSessionTests = class(TTestSuite)
+  TLWPTBuildSessionTests = class(TTestSuite)
   private
     FScratch: string;
     procedure ResetScratch;
     procedure WriteText(const APath, AText: string);
-    function BasicRequest: TBuildPublicationRequest;
+    function BasicRequest: TLWPTBuildPublicationRequest;
   protected
     procedure BeforeAll; override;
     procedure AfterAll; override;
@@ -41,19 +41,20 @@ type
     procedure TestHookInputChangeRefusesPublication;
     {$IFDEF UNIX}
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
+    procedure TestDirectoryAliasesHaveDeterministicFingerprint;
     procedure TestPublicationLockUsesFilesystemIdentity;
     {$ENDIF}
     procedure TestRepairRemovesInactiveAndKeepsLiveSessions;
     procedure TestRepairRemovesInterruptedSessionCreation;
   end;
 
-procedure TBuildSessionTests.ResetScratch;
+procedure TLWPTBuildSessionTests.ResetScratch;
 begin
   if DirectoryExists(FScratch) then WipeDir(FScratch);
   ForceDirectories(FScratch);
 end;
 
-procedure TBuildSessionTests.WriteText(const APath, AText: string);
+procedure TLWPTBuildSessionTests.WriteText(const APath, AText: string);
 var
   Lines: TStringList;
 begin
@@ -67,13 +68,14 @@ begin
   end;
 end;
 
-function TBuildSessionTests.BasicRequest: TBuildPublicationRequest;
+function TLWPTBuildSessionTests.BasicRequest: TLWPTBuildPublicationRequest;
 begin
-  Result := Default(TBuildPublicationRequest);
+  Result := Default(TLWPTBuildPublicationRequest);
   Result.CompilerID := 'test-compiler';
   Result.CompilerExecutable := '/test/compiler';
   Result.CompilerVersion := '1.0.0';
-  Result.ManifestContentHash := SHA256File(FScratch + '/lwpt.toml');
+  Result.ManifestContentHash := SHA256File(
+    FScratch + '/' + MANIFEST_FILE);
   Result.Source := 'source/app.pas';
   Result.Output := 'build/app';
   Result.OutputKind := 'executable';
@@ -82,17 +84,17 @@ begin
   Result.UnitPaths[0] := 'source';
 end;
 
-procedure TBuildSessionTests.BeforeAll;
+procedure TLWPTBuildSessionTests.BeforeAll;
 begin
   FScratch := ExpandFileName('build/tests/tmp/build-session-unit');
 end;
 
-procedure TBuildSessionTests.AfterAll;
+procedure TLWPTBuildSessionTests.AfterAll;
 begin
   if DirectoryExists(FScratch) then WipeDir(FScratch);
 end;
 
-procedure TBuildSessionTests.TestSessionsAreUniqueAndPrivate;
+procedure TLWPTBuildSessionTests.TestSessionsAreUniqueAndPrivate;
 var
   First, Second: TLWPTBuildSession;
 begin
@@ -114,7 +116,7 @@ begin
   end;
 end;
 
-procedure TBuildSessionTests.TestPathKeysAreBoundedAndCollisionResistant;
+procedure TLWPTBuildSessionTests.TestPathKeysAreBoundedAndCollisionResistant;
 var
   First, Second, LongKey: string;
 begin
@@ -128,7 +130,7 @@ begin
   Expect<Boolean>(Length(LongKey) <= 49).ToBe(True);
 end;
 
-procedure TBuildSessionTests.TestSuccessfulSessionIsRemoved;
+procedure TLWPTBuildSessionTests.TestSuccessfulSessionIsRemoved;
 var
   Session: TLWPTBuildSession;
   Root: string;
@@ -141,26 +143,27 @@ begin
   Expect<Boolean>(DirectoryExists(Root)).ToBe(False);
 end;
 
-procedure TBuildSessionTests.TestStaleCandidateDoesNotReplacePublicOutput;
+procedure TLWPTBuildSessionTests.TestStaleCandidateDoesNotReplacePublicOutput;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
   Lines: TStringList;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE,
+    '[package]'#10'name = "app"');
   WriteText(FScratch + '/source/app.pas', 'begin end.');
   WriteText(FScratch + '/build/app', 'old');
   WriteText(FScratch + '/candidate/app', 'new');
   Request := BasicRequest;
-  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   WriteText(FScratch + '/source/app.pas', 'begin WriteLn; end.');
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate/app', 'build/app', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate/app', 'build/app', Fingerprint, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprStale));
   Lines := TStringList.Create;
@@ -173,25 +176,25 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/candidate/app')).ToBe(True);
 end;
 
-procedure TBuildSessionTests.TestCurrentCandidatePublishesAtomically;
+procedure TLWPTBuildSessionTests.TestCurrentCandidatePublishesAtomically;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
   Lines: TStringList;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/source/app.pas', 'begin end.');
   WriteText(FScratch + '/build/app', 'old');
   WriteText(FScratch + '/candidate/app', 'new');
   Request := BasicRequest;
-  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate/app', 'build/app', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate/app', 'build/app', Fingerprint, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprPublished));
   Lines := TStringList.Create;
@@ -204,31 +207,31 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/candidate/app')).ToBe(False);
 end;
 
-procedure TBuildSessionTests.TestCompetingCandidateLosesPublication;
+procedure TLWPTBuildSessionTests.TestCompetingCandidateLosesPublication;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
   Lines: TStringList;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/source/app.pas', 'begin end.');
   WriteText(FScratch + '/build/app', 'old');
   WriteText(FScratch + '/candidate-first/app', 'winner');
   WriteText(FScratch + '/candidate-second/app', 'late');
   Request := BasicRequest;
-  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate-first/app', 'build/app', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate-first/app', 'build/app', Fingerprint,
+    MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprPublished));
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate-second/app', 'build/app', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate-second/app', 'build/app', Fingerprint,
+    MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprStale));
   Lines := TStringList.Create;
   try
@@ -240,21 +243,21 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/candidate-second/app')).ToBe(True);
 end;
 
-procedure TBuildSessionTests.TestParsedManifestChangeRefusesFingerprint;
+procedure TLWPTBuildSessionTests.TestParsedManifestChangeRefusesFingerprint;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Raised: Boolean;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/source/app.pas', 'begin end.');
   Request := BasicRequest;
-  WriteText(FScratch + '/lwpt.toml',
+  WriteText(FScratch + '/' + MANIFEST_FILE,
     '[package]'#10'name = "changed-app"');
   Raised := False;
   try
-    CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-      'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+      CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   except
     on E: ELWPTError do
       Raised := Pos('manifest changed after it was parsed', E.Message) > 0;
@@ -262,16 +265,16 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
 end;
 
-procedure TBuildSessionTests.TestRootUnitPathIgnoresSessionStaging;
+procedure TLWPTBuildSessionTests.TestRootUnitPathIgnoresSessionStaging;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
   Session: TLWPTBuildSession;
   Candidate: string;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/app.pas', 'begin end.');
   Request := BasicRequest;
   Request.Source := 'app.pas';
@@ -281,12 +284,12 @@ begin
   try
     Candidate := Session.JobRoot('app') + '/app';
     WriteText(Candidate, 'new');
-    Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-      'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+      CFG_FILE, LOCKFILE, MODULES_DIR, Request);
     WriteText(Session.JobRoot('app') + '/units/app.ppu', 'private');
 
     Publication := PublishBuildArtifact(FScratch, Candidate, 'build/app',
-      Fingerprint, 'lwpt.toml', 'lwpt.cfg', 'lwpt.lock', '.lwpt/modules',
+      Fingerprint, MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR,
       Request);
 
     Expect<Integer>(Ord(Publication)).ToBe(Ord(bprPublished));
@@ -297,14 +300,14 @@ begin
   end;
 end;
 
-procedure TBuildSessionTests.TestRootUnitPathIgnoresDeclaredOutputs;
+procedure TLWPTBuildSessionTests.TestRootUnitPathIgnoresDeclaredOutputs;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/app.pas', 'begin end.');
   WriteText(FScratch + '/other.pas', 'begin end.');
   WriteText(FScratch + '/candidate/other', 'new');
@@ -316,26 +319,26 @@ begin
   SetLength(Request.ExcludedPaths, 2);
   Request.ExcludedPaths[0] := 'build/app';
   Request.ExcludedPaths[1] := 'build/other';
-  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   WriteText(FScratch + '/build/app', 'unrelated published output');
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate/other', 'build/other', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate/other', 'build/other', Fingerprint, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprPublished));
   Expect<Boolean>(FileExists(FScratch + '/build/other')).ToBe(True);
 end;
 
-procedure TBuildSessionTests.TestSearchPathContentChangeRefusesPublication;
+procedure TLWPTBuildSessionTests.TestSearchPathContentChangeRefusesPublication;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/source/app.pas', 'begin end.');
   WriteText(FScratch + '/extra/SharedUnit.pas', 'unit SharedUnit; end.');
   WriteText(FScratch + '/candidate/app', 'new');
@@ -343,54 +346,54 @@ begin
   SetLength(Request.UnitPaths, 2);
   Request.UnitPaths[0] := 'source';
   Request.UnitPaths[1] := 'extra';
-  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   WriteText(FScratch + '/extra/SharedUnit.pas',
     'unit SharedUnit; interface implementation end.');
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate/app', 'build/app', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate/app', 'build/app', Fingerprint, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprStale));
   Expect<Boolean>(FileExists(FScratch + '/build/app')).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/candidate/app')).ToBe(True);
 end;
 
-procedure TBuildSessionTests.TestSourceDirectoryChangeRefusesPublication;
+procedure TLWPTBuildSessionTests.TestSourceDirectoryChangeRefusesPublication;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/source/app.pas',
     'program app;'#10'{$I sibling.inc}'#10'begin end.');
   WriteText(FScratch + '/source/sibling.inc', 'const Value = 1;');
   WriteText(FScratch + '/candidate/app', 'new');
   Request := BasicRequest;
   SetLength(Request.UnitPaths, 0);
-  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   WriteText(FScratch + '/source/sibling.inc', 'const Value = 2;');
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate/app', 'build/app', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate/app', 'build/app', Fingerprint, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprStale));
   Expect<Boolean>(FileExists(FScratch + '/build/app')).ToBe(False);
 end;
 
-procedure TBuildSessionTests.TestExplicitExcludedResourceChangeRefusesPublication;
+procedure TLWPTBuildSessionTests.TestExplicitExcludedResourceChangeRefusesPublication;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/source/app.pas', 'begin end.');
   WriteText(FScratch + '/build/generated.res', 'first');
   WriteText(FScratch + '/candidate/app', 'new');
@@ -400,26 +403,26 @@ begin
   SetLength(Request.ExcludedPaths, 2);
   Request.ExcludedPaths[0] := 'build/generated.res';
   Request.ExcludedPaths[1] := 'build/app';
-  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   WriteText(FScratch + '/build/generated.res', 'second');
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate/app', 'build/app', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate/app', 'build/app', Fingerprint, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprStale));
   Expect<Boolean>(FileExists(FScratch + '/build/app')).ToBe(False);
 end;
 
-procedure TBuildSessionTests.TestHookInputChangeRefusesPublication;
+procedure TLWPTBuildSessionTests.TestHookInputChangeRefusesPublication;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/source/app.pas', 'begin end.');
   WriteText(FScratch + '/scripts/sign.pas', 'program sign; begin end.');
   WriteText(FScratch + '/scripts/signing-key.txt', 'first');
@@ -431,53 +434,96 @@ begin
   SetLength(Request.HookInputs, 2);
   Request.HookInputs[0] := 'scripts/sign.pas';
   Request.HookInputs[1] := 'scripts/signing-key.txt';
-  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   WriteText(FScratch + '/scripts/signing-key.txt', 'second');
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate/app', 'build/app', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate/app', 'build/app', Fingerprint, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprStale));
   Expect<Boolean>(FileExists(FScratch + '/build/app')).ToBe(False);
 end;
 
 {$IFDEF UNIX}
-procedure TBuildSessionTests.TestSymlinkedSearchRootChangeRefusesPublication;
+procedure TLWPTBuildSessionTests.TestSymlinkedSearchRootChangeRefusesPublication;
 var
-  Request: TBuildPublicationRequest;
+  Request: TLWPTBuildPublicationRequest;
   Fingerprint: string;
-  Publication: TBuildPublicationResult;
+  Publication: TLWPTBuildPublicationResult;
 begin
   ResetScratch;
-  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/source/app.pas', 'begin end.');
   WriteText(FScratch + '/packages/shared/source/SharedUnit.pas',
     'unit SharedUnit; interface implementation end.');
-  ForceDirectories(FScratch + '/.lwpt/modules');
+  ForceDirectories(FScratch + '/' + MODULES_DIR);
   if FpSymlink(PAnsiChar('../../packages/shared'),
-    PAnsiChar(FScratch + '/.lwpt/modules/shared')) <> 0 then
+    PAnsiChar(FScratch + '/' + MODULES_DIR + '/shared')) <> 0 then
     raise Exception.Create('fixture: workspace symlink creation failed');
   if FpSymlink(PAnsiChar('.'),
     PAnsiChar(FScratch + '/packages/shared/loop')) <> 0 then
     raise Exception.Create('fixture: cycle symlink creation failed');
   WriteText(FScratch + '/candidate/app', 'new');
   Request := BasicRequest;
-  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   WriteText(FScratch + '/packages/shared/source/SharedUnit.pas',
     'unit SharedUnit; interface const Changed = True; implementation end.');
 
   Publication := PublishBuildArtifact(FScratch,
-    FScratch + '/candidate/app', 'build/app', Fingerprint, 'lwpt.toml',
-    'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+    FScratch + '/candidate/app', 'build/app', Fingerprint, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Integer>(Ord(Publication)).ToBe(Ord(bprStale));
   Expect<Boolean>(FileExists(FScratch + '/build/app')).ToBe(False);
 end;
 
-procedure TBuildSessionTests.TestPublicationLockUsesFilesystemIdentity;
+procedure TLWPTBuildSessionTests.TestDirectoryAliasesHaveDeterministicFingerprint;
+var
+  FirstRequest: TLWPTBuildPublicationRequest;
+  FirstFingerprint, SecondFingerprint: string;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  WriteText(FScratch + '/modules/real/value.txt', 'same');
+  if FpSymlink(PAnsiChar('real'),
+    PAnsiChar(FScratch + '/modules/z-alias')) <> 0 then
+    raise Exception.Create('fixture: first z alias creation failed');
+  if FpSymlink(PAnsiChar('real'),
+    PAnsiChar(FScratch + '/modules/a-alias')) <> 0 then
+    raise Exception.Create('fixture: first a alias creation failed');
+  FirstRequest := Default(TLWPTBuildPublicationRequest);
+  FirstRequest.CompilerID := 'test-compiler';
+  FirstRequest.CompilerExecutable := '/test/compiler';
+  FirstRequest.CompilerVersion := '1.0.0';
+  FirstRequest.ManifestContentHash := SHA256File(
+    FScratch + '/' + MANIFEST_FILE);
+  FirstRequest.Source := 'source/app.pas';
+  FirstRequest.Output := 'build/app';
+  FirstRequest.OutputKind := 'executable';
+  FirstRequest.Mode := 'dev';
+  SetLength(FirstRequest.UnitPaths, 1);
+  FirstRequest.UnitPaths[0] := 'modules';
+  FirstFingerprint := CaptureBuildPublicationFingerprint(FScratch,
+    MANIFEST_FILE, CFG_FILE, LOCKFILE, 'modules', FirstRequest);
+  SysUtils.DeleteFile(FScratch + '/modules/a-alias');
+  SysUtils.DeleteFile(FScratch + '/modules/z-alias');
+  if FpSymlink(PAnsiChar('real'),
+    PAnsiChar(FScratch + '/modules/a-alias')) <> 0 then
+    raise Exception.Create('fixture: second a alias creation failed');
+  if FpSymlink(PAnsiChar('real'),
+    PAnsiChar(FScratch + '/modules/z-alias')) <> 0 then
+    raise Exception.Create('fixture: second z alias creation failed');
+  SecondFingerprint := CaptureBuildPublicationFingerprint(FScratch,
+    MANIFEST_FILE, CFG_FILE, LOCKFILE, 'modules', FirstRequest);
+
+  Expect<string>(SecondFingerprint).ToBe(FirstFingerprint);
+end;
+
+procedure TLWPTBuildSessionTests.TestPublicationLockUsesFilesystemIdentity;
 var
   PhysicalPath, AliasPath: string;
 begin
@@ -496,7 +542,7 @@ begin
 end;
 {$ENDIF}
 
-procedure TBuildSessionTests.TestRepairRemovesInactiveAndKeepsLiveSessions;
+procedure TLWPTBuildSessionTests.TestRepairRemovesInactiveAndKeepsLiveSessions;
 var
   LiveSession, FailedSession: TLWPTBuildSession;
   LiveRoot, FailedRoot: string;
@@ -521,13 +567,14 @@ begin
   LiveSession.Free;
 end;
 
-procedure TBuildSessionTests.TestRepairRemovesInterruptedSessionCreation;
+procedure TLWPTBuildSessionTests.TestRepairRemovesInterruptedSessionCreation;
 var
   Removed, Retained: Integer;
 begin
   ResetScratch;
   WriteText(FScratch
-    + '/.lwpt/sessions/.creating-session-abandoned/session.state',
+    + '/' + BUILD_SESSIONS_DIR
+    + '/.creating-session-abandoned/session.state',
     '999999999'#10'active'#10'1');
 
   RepairBuildSessions(FScratch, Removed, Retained);
@@ -535,10 +582,11 @@ begin
   Expect<Integer>(Removed).ToBe(1);
   Expect<Integer>(Retained).ToBe(0);
   Expect<Boolean>(DirectoryExists(FScratch
-    + '/.lwpt/sessions/.creating-session-abandoned')).ToBe(False);
+    + '/' + BUILD_SESSIONS_DIR
+    + '/.creating-session-abandoned')).ToBe(False);
 end;
 
-procedure TBuildSessionTests.SetupTests;
+procedure TLWPTBuildSessionTests.SetupTests;
 begin
   Test('sessions have unique private job roots',
     TestSessionsAreUniqueAndPrivate);
@@ -569,6 +617,8 @@ begin
   {$IFDEF UNIX}
   Test('symlinked search roots detect changes and terminate cycles',
     TestSymlinkedSearchRootChangeRefusesPublication);
+  Test('directory aliases produce deterministic fingerprints',
+    TestDirectoryAliasesHaveDeterministicFingerprint);
   Test('publication locks use destination filesystem identity',
     TestPublicationLockUsesFilesystemIdentity);
   {$ENDIF}
@@ -579,7 +629,7 @@ begin
 end;
 
 begin
-  TestRunnerProgram.AddSuite(TBuildSessionTests.Create(
+  TestRunnerProgram.AddSuite(TLWPTBuildSessionTests.Create(
     'build sessions and publication'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;

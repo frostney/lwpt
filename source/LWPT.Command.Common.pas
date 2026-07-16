@@ -76,7 +76,7 @@ begin
     BuildDir := IncludeTrailingPathDelimiter(ABuildRoot)
       + SourceBuildKey(ASrcFile)
   else
-    BuildDir := MakeTmpPath(BUILD_SESSIONS_DIR,
+    BuildDir := MakeTmpPath(TMP_DIR,
       'script-' + SourceBuildKey(ASrcFile));
   ForceDirectories(BuildDir);
   ForceDirectories(BuildDir + '/units');

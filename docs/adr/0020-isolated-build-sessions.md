@@ -1,5 +1,16 @@
 # Isolate compiler output by invocation and publish builds atomically
 
+## Executive Summary
+
+- **Every build and test invocation owns a unique private session.** Compiler
+  outputs cannot collide across concurrent processes or worktrees.
+- **Build publication is short, locked, and revalidated.** LWPT hashes the exact
+  manifest snapshot it parses and publishes only while all declared inputs
+  still match.
+- **Ownership remains observable for the full session lifecycle.** Failed,
+  stale, and interrupted work remains private for `lwpt repair`; successful
+  cleanup retains its OS guard until the private contents are gone.
+
 Each `lwpt build` and `lwpt test` invocation owns a unique project-local
 session under `.lwpt/sessions/`. Compiler executable, unit, object, resource,
 and hook-compilation outputs are written only below that session. A successful
@@ -50,10 +61,10 @@ retaining sessions whose recorded process is alive.
   candidate only when the expanded path is a complete path token; related
   paths such as `build/app.json` remain unchanged. Hook definitions, scripts,
   and declared inputs are publication inputs. Failed hooks prevent
-  publication, and whole-build postbuild runs only
-  after every selected target compiled and its private hook succeeded, but
-  before publication; artifact transformations belong in per-target postbuild
-  hooks. Arbitrary hook filesystem side effects are not sandboxed, but hook
+  publication. Whole-build postbuild runs only after every selected target
+  compiled, its private hook succeeded, and every output was published;
+  artifact transformations belong in per-target postbuild hooks. Arbitrary
+  hook filesystem side effects are not sandboxed, but hook
   compilation is session-private:
   Windows compiles directly below the hook root, while Unix gives InstantFPC
   a cache below that same session. Job and compiler-cache directory names use

@@ -18,7 +18,7 @@ const
   BUILD_SESSIONS_DIR = LWPT_DIR + '/sessions';
 
 type
-  TBuildPublicationRequest = record
+  TLWPTBuildPublicationRequest = record
     CompilerID: string;
     CompilerExecutable: string;
     CompilerVersion: string;
@@ -40,7 +40,7 @@ type
     ExcludedPaths: TStringArray;
   end;
 
-  TBuildPublicationResult = (bprPublished, bprStale);
+  TLWPTBuildPublicationResult = (bprPublished, bprStale);
 
   TLWPTBuildSession = class
   private
@@ -62,13 +62,15 @@ type
 
 function CaptureBuildPublicationFingerprint(
   const AProjectRoot, AManifestPath, ACfgPath, ALockPath,
-  AModulesPath: string; const ARequest: TBuildPublicationRequest): string;
+  AModulesPath: string;
+  const ARequest: TLWPTBuildPublicationRequest): string;
 function BuildSessionPathKey(const AValue: string): string;
 function BuildPublicationLockPath(const AProjectRoot, AOutput: string): string;
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
   ALockPath, AModulesPath: string;
-  const ARequest: TBuildPublicationRequest): TBuildPublicationResult;
+  const ARequest: TLWPTBuildPublicationRequest):
+  TLWPTBuildPublicationResult;
 procedure RepairBuildSessions(const AProjectRoot: string;
   out ARemoved, ARetained: Integer);
 
@@ -109,7 +111,7 @@ var
     array[0..63] of TRTLCriticalSection;
 
 type
-  EParsedManifestChanged = class(ELWPTError);
+  ELWPTParsedManifestChanged = class(ELWPTError);
 
   {$IFDEF UNIX}
   {$IFDEF LINUX}
@@ -119,7 +121,7 @@ type
   {$ENDIF}
   {$ENDIF}
 
-  TPublicationLock = class
+  TLWPTPublicationLock = class
   private
     FPath: string;
     FCriticalSectionIndex: Integer;
@@ -135,7 +137,7 @@ type
     destructor Destroy; override;
   end;
 
-  TSessionOwnerGuard = class
+  TLWPTSessionOwnerGuard = class
   private
     FPath: string;
     FLocked: Boolean;
@@ -242,8 +244,10 @@ var
 
   procedure Collect(const ADir, ARelative: string);
   var
+    Entries: TStringList;
     Search: TSearchRec;
     Base, Full, Relative, Identity: string;
+    Attr, i: Integer;
   begin
     if PathContains(SessionsRoot, ADir) then Exit;
     if PathIsExcluded(AProjectRoot, ADir, AExcludedPaths) then Exit;
@@ -253,15 +257,36 @@ var
       Exit;
     if Identity <> '' then VisitedDirectories.Add(Identity);
     Base := IncludeTrailingPathDelimiter(ADir);
+    Entries := TStringList.Create;
+    Entries.CaseSensitive := True;
     if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, Search) <> 0 then
+    begin
+      Entries.Free;
       Exit;
+    end;
     try
       repeat
-        if (Search.Name = '.') or (Search.Name = '..') then Continue;
-        Full := Base + Search.Name;
-        Relative := ARelative + Search.Name;
+        if (Search.Name <> '.') and (Search.Name <> '..') then
+          Entries.Add(Search.Name);
+      until SysUtils.FindNext(Search) <> 0;
+    finally
+      SysUtils.FindClose(Search);
+    end;
+    Entries.Sort;
+    try
+      for i := 0 to Entries.Count - 1 do
+      begin
+        Full := Base + Entries[i];
+        if SysUtils.FindFirst(Full, faAnyFile or faSymLink, Search) <> 0 then
+          Continue;
+        try
+          Attr := Search.Attr;
+        finally
+          SysUtils.FindClose(Search);
+        end;
+        Relative := ARelative + Entries[i];
         if PathIsExcluded(AProjectRoot, Full, AExcludedPaths) then Continue;
-        if (Search.Attr and faSymLink) <> 0 then
+        if (Attr and faSymLink) <> 0 then
         begin
           if DirectoryExists(Full) then
             Collect(Full, Relative + '/')
@@ -269,7 +294,7 @@ var
             Files.Add(IntToStr(Length(Relative)) + ':' + Relative + '='
               + SHA256File(Full));
         end
-        else if (Search.Attr and faDirectory) <> 0 then
+        else if (Attr and faDirectory) <> 0 then
         begin
           if not PathContains(SessionsRoot, Full) then
             Collect(Full, Relative + '/');
@@ -277,9 +302,9 @@ var
         else
           Files.Add(IntToStr(Length(Relative)) + ':' + Relative + '='
             + SHA256File(Full));
-      until SysUtils.FindNext(Search) <> 0;
+      end;
     finally
-      SysUtils.FindClose(Search);
+      Entries.Free;
     end;
   end;
 
@@ -347,7 +372,8 @@ end;
 
 function CaptureBuildPublicationFingerprint(
   const AProjectRoot, AManifestPath, ACfgPath, ALockPath,
-  AModulesPath: string; const ARequest: TBuildPublicationRequest): string;
+  AModulesPath: string;
+  const ARequest: TLWPTBuildPublicationRequest): string;
 var
   Fields: TStringList;
   EmptyPaths: TStringArray;
@@ -395,7 +421,7 @@ begin
     ManifestFingerprint := PathFingerprint(
       AProjectRoot, AManifestPath, EmptyPaths);
     if ManifestFingerprint <> 'file:' + ARequest.ManifestContentHash then
-      raise EParsedManifestChanged.Create(
+      raise ELWPTParsedManifestChanged.Create(
         'manifest changed after it was parsed');
     AddField(Fields, 'manifest', ManifestFingerprint);
     AddField(Fields, 'cfg',
@@ -488,7 +514,7 @@ begin
   end;
 end;
 
-constructor TSessionOwnerGuard.Create(const APath: string);
+constructor TLWPTSessionOwnerGuard.Create(const APath: string);
 {$IFDEF UNIX}
 var
   LockSpec: TLWPTFlock;
@@ -557,7 +583,7 @@ begin
   {$ENDIF}
 end;
 
-destructor TSessionOwnerGuard.Destroy;
+destructor TLWPTSessionOwnerGuard.Destroy;
 {$IFDEF UNIX}
 var
   LockSpec: TLWPTFlock;
@@ -663,7 +689,7 @@ begin
 end;
 {$ENDIF}
 
-constructor TPublicationLock.Create(const APath: string);
+constructor TLWPTPublicationLock.Create(const APath: string);
 var
   Started: TDateTime;
   PIDLine: AnsiString;
@@ -770,7 +796,7 @@ begin
   end;
 end;
 
-destructor TPublicationLock.Destroy;
+destructor TLWPTPublicationLock.Destroy;
 {$IFDEF UNIX}
 var
   LockSpec: TLWPTFlock;
@@ -820,6 +846,30 @@ begin
   Result := FormatDateTime('yyyymmddhhnnsszzz', Now);
 end;
 
+procedure WipeOwnedSessionContents(const ASessionRoot, AOwnerPath: string);
+var
+  Search: TSearchRec;
+  Base, Full: string;
+begin
+  Base := IncludeTrailingPathDelimiter(ASessionRoot);
+  if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, Search) <> 0 then
+    Exit;
+  try
+    repeat
+      if (Search.Name = '.') or (Search.Name = '..') then Continue;
+      Full := Base + Search.Name;
+      if SamePath(Full, AOwnerPath) then Continue;
+      if (Search.Attr and faDirectory) <> 0 then
+        WipeDir(Full)
+      else if not SysUtils.DeleteFile(Full) then
+        raise ELWPTError.CreateFmt(
+          'could not remove build session entry %s', [Full]);
+    until SysUtils.FindNext(Search) <> 0;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
+
 constructor TLWPTBuildSession.Create(const AProjectRoot: string);
 var
   BaseRoot, PendingRoot: string;
@@ -851,20 +901,20 @@ begin
       'could not create build session directory %s', [PendingRoot]);
   FFinished := False;
   FSessionRoot := PendingRoot;
-  WriteState('active');
-  if not SysUtils.RenameFile(PendingRoot,
-    IncludeTrailingPathDelimiter(BaseRoot) + FSessionID) then
-  begin
-    WipeDir(PendingRoot);
-    raise ELWPTError.CreateFmt(
-      'could not publish build session directory %s', [FSessionID]);
-  end;
-  FSessionRoot := IncludeTrailingPathDelimiter(BaseRoot) + FSessionID;
   try
-    FSessionOwnerGuard := TSessionOwnerGuard.Create(
-      FSessionRoot + '/owner.lock');
+    FSessionOwnerGuard := TLWPTSessionOwnerGuard.Create(
+      PendingRoot + '/owner.lock');
+    WriteState('active');
+    if not SysUtils.RenameFile(PendingRoot,
+      IncludeTrailingPathDelimiter(BaseRoot) + FSessionID) then
+      raise ELWPTError.CreateFmt(
+        'could not publish build session directory %s', [FSessionID]);
+    FSessionRoot := IncludeTrailingPathDelimiter(BaseRoot) + FSessionID;
   except
-    WipeDir(FSessionRoot);
+    FreeAndNil(FSessionOwnerGuard);
+    if DirectoryExists(PendingRoot) then WipeDir(PendingRoot);
+    if DirectoryExists(IncludeTrailingPathDelimiter(BaseRoot) + FSessionID) then
+      WipeDir(IncludeTrailingPathDelimiter(BaseRoot) + FSessionID);
     raise;
   end;
 end;
@@ -912,16 +962,24 @@ end;
 procedure TLWPTBuildSession.Finish(ASuccess: Boolean; const ADetail: string);
 var
   Lines: TStringList;
+  OwnerPath: string;
 begin
   if FFinished then Exit;
   if ASuccess then
   begin
-    { Publish a fresh terminal state before releasing ownership. Repair
-      retains unlocked non-failed sessions during the short grace period,
-      so it cannot race this process while it removes the session tree. }
+    { Keep the owner guard observable while every other entry is removed.
+      Close it only when the guard file and empty directory are all that
+      remain, so repair cannot mistake an active cleanup for an orphan. }
     WriteState('completing');
+    OwnerPath := FSessionRoot + '/owner.lock';
+    WipeOwnedSessionContents(FSessionRoot, OwnerPath);
     FreeAndNil(FSessionOwnerGuard);
-    WipeDir(FSessionRoot);
+    if FileExists(OwnerPath) and (not SysUtils.DeleteFile(OwnerPath)) then
+      raise ELWPTError.CreateFmt(
+        'could not remove build session owner guard %s', [OwnerPath]);
+    if DirectoryExists(FSessionRoot) and (not RemoveDir(FSessionRoot)) then
+      raise ELWPTError.CreateFmt(
+        'could not remove build session directory %s', [FSessionRoot]);
     FFinished := True;
     Exit;
   end;
@@ -966,14 +1024,15 @@ end;
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
   ALockPath, AModulesPath: string;
-  const ARequest: TBuildPublicationRequest): TBuildPublicationResult;
+  const ARequest: TLWPTBuildPublicationRequest):
+  TLWPTBuildPublicationResult;
 var
-  Lock: TPublicationLock;
+  Lock: TLWPTPublicationLock;
   CurrentFingerprint: string;
   Destination: string;
 begin
   Destination := RootedPath(AProjectRoot, ADestinationPath);
-  Lock := TPublicationLock.Create(
+  Lock := TLWPTPublicationLock.Create(
     BuildPublicationLockPath(AProjectRoot, Destination));
   try
     try
@@ -981,7 +1040,7 @@ begin
         AProjectRoot, AManifestPath, ACfgPath, ALockPath, AModulesPath,
         ARequest);
     except
-      on EParsedManifestChanged do Exit(bprStale);
+      on ELWPTParsedManifestChanged do Exit(bprStale);
     end;
     if CurrentFingerprint <> AExpectedFingerprint then
       Exit(bprStale);
