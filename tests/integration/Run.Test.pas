@@ -7,11 +7,9 @@
     (b) a built-in subcommand — `lwpt run install --frozen` aliases to
         `lwpt install --frozen`.
 
-  Four assertions:
-    1. User-script invocation propagates the script's exit code.
-    2. Aliased built-in subcommand runs the subcommand correctly.
-    3. Aliased built-in with flag passthrough works (--frozen).
-    4. Unknown name exits non-zero with a useful message.
+  Key assertions include user-script exit propagation, project-unit imports
+  through lwpt.cfg, built-in aliasing with flag passthrough, list mode, and
+  useful diagnostics for unknown names.
 
   Scratch project: a minimal manifest with one user-defined run-script
   section (`[hello] script = "scripts/hello.pas"`) plus a tiny InstantFPC
@@ -40,6 +38,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestUserScriptInvokesAndPropagatesExitCode;
+    procedure TestUserScriptCanImportProjectUnit;
     procedure TestAliasInstallSubcommand;
     procedure TestAliasWithFlagPassthrough;
     procedure TestListModeOmitsRetiredExport;
@@ -58,7 +57,10 @@ begin
     'units = ["scripts"]'#10 +
     ''#10 +
     '[hello]'#10 +
-    'script = "scripts/hello.pas"'#10);
+    'script = "scripts/hello.pas"'#10 +
+    ''#10 +
+    '[imports]'#10 +
+    'script = "scripts/import-helper.pas"'#10);
 
   { InstantFPC script: writes a sentinel marker + exits 7. The test
     asserts on both. The marker proves the script ran; the exit code
@@ -78,6 +80,20 @@ begin
     '  end;'#10 +
     '  Halt(7);'#10 +
     'end.'#10);
+
+  WriteTextFile(FScratch + '/scripts/RunHelper.pas',
+    'unit RunHelper;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'function Ready: Boolean;'#10 +
+    'implementation'#10 +
+    'function Ready: Boolean; begin Result := True; end;'#10 +
+    'end.'#10);
+  WriteTextFile(FScratch + '/scripts/import-helper.pas',
+    'program ImportHelper;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'uses RunHelper;'#10 +
+    'begin if Ready then Halt(0) else Halt(9); end.'#10);
 end;
 
 procedure TRunE2E.BeforeAll;
@@ -108,6 +124,13 @@ begin
   { Script exits 7; lwpt run must propagate that exit code. }
   Expect<Integer>(R.ExitCode).ToBe(7);
   Expect<Boolean>(FileExists(FScratch + '/marker.txt')).ToBe(True);
+end;
+
+procedure TRunE2E.TestUserScriptCanImportProjectUnit;
+var R: TLwptResult;
+begin
+  R := RunLwpt(['run', 'imports'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
 end;
 
 procedure TRunE2E.TestAliasInstallSubcommand;
@@ -186,6 +209,8 @@ procedure TRunE2E.SetupTests;
 begin
   Test('run <user-script> invokes the script and propagates its exit code',
     TestUserScriptInvokesAndPropagatesExitCode);
+  Test('run <user-script> inherits project unit paths from lwpt.cfg',
+    TestUserScriptCanImportProjectUnit);
   Test('run install aliases to the built-in install subcommand',
     TestAliasInstallSubcommand);
   Test('run install --frozen passes flags through to the aliased subcommand',

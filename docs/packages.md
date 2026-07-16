@@ -8,7 +8,7 @@ transition window, and the bootstrap chicken-and-egg story.
 
 ## Executive Summary
 
-- **Five packages** live in LWPT's monorepo today under `packages/<name>/`: `httpclient`, `cli`, `semver`, `toml`, `testing`. Each is a standalone Object Pascal project — own `lwpt.toml`, own `source/`, own tests, own version (semver 2.0.0). LWPT itself consumes them via the root manifest's `[workspaces] include = ["packages/*"]` glob; `lwpt install` symlinks each into `.lwpt/modules/<name>/`.
+- **Six packages** live in LWPT's monorepo today under `packages/<name>/`: `httpclient`, `cli`, `semver`, `toml`, `testing`, and `linkcheck`. Each is a standalone Object Pascal project — own `lwpt.toml`, own `source/`, own tests, own version (semver 2.0.0). LWPT itself consumes them via the root manifest's `[workspaces] include = ["packages/*"]` glob; `lwpt install` symlinks each into `.lwpt/modules/<name>/`.
 - **Plus a remainder in `source/`**: `Platform.pas` (still LWPT-internal — extraction candidate for `packages/platform/`) and `Shared.inc` (the FPC mode + switches include — kept as a project-root utility, with each package bundling its own copy under `packages/<name>/source/Shared.inc` for self-containment).
 - **LWPT is the canonical source** for every package's content. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md) there is no upstream to defer to: LWPT and GocciaScript are sister projects co-owned; LWPT's packages came from GocciaScript historically but have evolved past those original copies (byte-safety fixes in HTTPClient; prefix-strip + dead-code removal in CLI; rename + inlined deps in Semver; rename + parser-class refactor in TOML; etc.).
 - **GocciaScript is the first named consumer**, committed to Path A adoption (full toolchain migration to `lwpt build / install / test / format`). The migration is GocciaScript-side multi-wave work; ADR-0017 commits to the direction, not the timeline.
@@ -31,6 +31,7 @@ transition window, and the bootstrap chicken-and-egg story.
 | `semver` | `packages/semver/source/Semver.pas`, `Semver.Test.pas` | Renamed from GocciaScript's `Goccia.Semver.pas`. The single needed constant (`MAX_SAFE_INTEGER`) was inlined from the deleted `Goccia.Constants.NumericLimits` dependency. | Diverged (LWPT ahead — rename + prefix-strip + inlined constant) |
 | `toml` | `packages/toml/source/TOML.pas`, `OrderedStringMap.pas`, `BaseMap.pas` | TOML refactored in LWPT (parser-class shape; renamed from `Goccia.TOML.pas`). `OrderedStringMap` + `BaseMap` co-developed unchanged. | `TOML.pas` diverged (LWPT ahead — rename + parser refactor); `OrderedStringMap.pas` + `BaseMap.pas` identical |
 | `testing` | `packages/testing/source/TestingPascalLibrary.pas`, `TestingPascalLibrary.Test.pas` (canary), `Shared.inc` (bundled copy) | Co-developed assertion + suite + runner framework. Was previously an embedded blob inside the LWPT binary served via the (now-retired) `lwpt export testing` subcommand; graduated to a workspace package per [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md). | Identical (no LWPT-side fixes pending) |
+| `linkcheck` | `packages/linkcheck/source/LinkCheck.pas`, `LinkCheck.Test.pas`, `scripts/link-check.pas` | LWPT-original offline-first Markdown link validation with explicit bounded HTTPS mode through the canonical `httpclient` package. | LWPT-only |
 | `source/Platform.pas` | `source/Platform.pas` (LWPT-internal; extraction candidate) | Renamed from GocciaScript's `Goccia.Platform.pas`. `{$I Goccia.inc}` swapped for `{$I Shared.inc}`. **Value vocabulary** (`darwin` / `linux` / `windows` etc.) is mirrored verbatim with GocciaScript's `Goccia.build.os` global per the [ADR-0012](./adr/0012-manifest-placeholder-interpolation.md) platform-placeholder design; the access path diverges (TOML `{platform.os}` ↔ JS `Goccia.build.os`). | Diverged (LWPT ahead — rename + include swap); GocciaScript still has `source/units/Goccia.Platform.pas` |
 | `source/Shared.inc` | `source/Shared.inc` | Co-developed; each `packages/<name>/source/` also vendors its own copy for self-containment per [ADR-0014](./adr/0014-packages-extraction.md)'s bundled-shared-utils decision. | Identical |
 
@@ -76,7 +77,7 @@ Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), graduation is a **relocat
 
 ### Phase 1: In-monorepo `packages/<name>/` — DONE
 
-The five current packages (`httpclient`, `cli`, `semver`, `toml`, `testing`) have all reached Phase 1. LWPT's root `lwpt.toml` auto-discovers them via `[workspaces] include = ["packages/*"]`. `Platform.pas` and `Shared.inc` are the remaining `source/`-resident extraction candidates; they'd move into `packages/platform/` + a bundled-only `Shared.inc` policy when warranted.
+The six current packages (`httpclient`, `cli`, `semver`, `toml`, `testing`, `linkcheck`) have all reached Phase 1. LWPT's root `lwpt.toml` auto-discovers them via `[workspaces] include = ["packages/*"]`. `Platform.pas` and `Shared.inc` are the remaining `source/`-resident extraction candidates; they'd move into `packages/platform/` + a bundled-only `Shared.inc` policy when warranted.
 
 ### Phase 2 onwards: Standalone repo
 

@@ -32,6 +32,27 @@ uses
   LWPT.BuildSession,
   LWPT.Core;
 
+procedure AddCfgParameters(const APath: string; const AParameters: TStrings);
+var
+  Lines: TStringList;
+  Line: string;
+  I: Integer;
+begin
+  if not FileExists(APath) then Exit;
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(APath);
+    for I := 0 to Lines.Count - 1 do
+    begin
+      Line := Trim(Lines[I]);
+      if (Line = '') or (Line[1] = '#') then Continue;
+      AParameters.Add(Line);
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
 function CompilePascal(const ASrcFile: string; const AUnitPaths: array of string;
   out AOutBin: string; const ABuildRoot: string): Boolean;
 var
@@ -46,31 +67,6 @@ var
     Result := BuildSessionPathKey(ExpandFileName(APath));
   end;
 
-  procedure AddCfgParameters(const APath: string);
-  var
-    Lines : TStringList;
-    Line : string;
-    j : Integer;
-  begin
-    if not FileExists(APath) then
-      Exit;
-
-    Lines := TStringList.Create;
-    try
-      Lines.LoadFromFile(APath);
-      for j := 0 to Lines.Count - 1 do
-      begin
-        Line := Trim(Lines[j]);
-        if Line = '' then
-          Continue;
-        if Line[1] = '#' then
-          Continue;
-        P.Parameters.Add(Line);
-      end;
-    finally
-      Lines.Free;
-    end;
-  end;
 begin
   if ABuildRoot <> '' then
     BuildDir := IncludeTrailingPathDelimiter(ABuildRoot)
@@ -106,7 +102,7 @@ begin
       FPC response-file parsing. The explicit AUnitPaths
       additions stay for the AUnitPaths-driven callers (preserves
       backwards-compat with non-cfg-based invocations). }
-    AddCfgParameters(CFG_FILE);
+    AddCfgParameters(CFG_FILE, P.Parameters);
     AddEnvUnitPathParameters(P.Parameters);
     for i := 0 to High(AUnitPaths) do
       if AUnitPaths[i] <> '' then
@@ -207,6 +203,14 @@ begin
       ForceDirectories(CacheRoot);
       P.Parameters.Add('--set-cache=' + CacheRoot);
     end;
+    { Imported package units can change while the script source stays put.
+      Force FPC to re-evaluate that dependency graph instead of letting
+      InstantFPC short-circuit on the script timestamp alone. }
+    P.Parameters.Add('-B');
+    { Match the Windows CompilePascal path: manifest scripts may import units
+      from project or installed workspace roots. Expand lwpt.cfg because
+      InstantFPC only recognises dash-prefixed compiler options itself. }
+    AddCfgParameters(CFG_FILE, P.Parameters);
     P.Parameters.Add(AHook.Script);
     {$ENDIF}
     for j := 0 to High(AHook.Args) do

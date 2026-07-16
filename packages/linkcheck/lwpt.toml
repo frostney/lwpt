@@ -1,0 +1,8 @@
+[package]
+name = "linkcheck"
+version = "0.1.0"
+units = ["source"]
+
+[dependencies]
+httpclient = "workspace:*"
+

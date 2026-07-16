@@ -23,6 +23,12 @@ lwpt = { source = "source/{item.name}.pas", output = "build/{item.name}" }
 [workspaces]
 include = ["packages/*"]
 
+# Explicit because linkcheck consumes this workspace transitively with the
+# versioned workspace protocol. Matching the constraint at the root prevents
+# the resolver from comparing workspace:auto's unversioned edge with `*`.
+[dependencies]
+httpclient = "workspace:*"
+
 # [prebuild] — whole-build hooks (ADR-0011). Each entry runs via
 # InstantFPC before any [build] entry compiles. Staleness-gated by
 # `inputs` + `output`: skips when the output is newer than every input.
@@ -64,3 +70,20 @@ include = [
   "packages/**/*.pas",
   "packages/**/*.inc",
 ]
+
+# Repository documentation uses the canonical linkcheck workspace package.
+# Offline relative-path and anchor validation is the default; the separate
+# script name makes network access explicit at the manifest boundary.
+[links]
+script = ".lwpt/modules/linkcheck/scripts/link-check.pas"
+args = ["--root", ".", "--allowlist", ".linkcheck-allowlist"]
+
+[links-online]
+script = ".lwpt/modules/linkcheck/scripts/link-check.pas"
+args = ["--root", ".", "--allowlist", ".linkcheck-allowlist",
+        "--online", "--jobs", "4", "--timeout-ms", "10000"]
+
+[links-json]
+script = ".lwpt/modules/linkcheck/scripts/link-check.pas"
+args = ["--root", ".", "--allowlist", ".linkcheck-allowlist",
+        "--format", "json"]

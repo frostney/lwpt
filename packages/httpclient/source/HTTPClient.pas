@@ -29,12 +29,23 @@ type
     Redirected: Boolean;
   end;
 
+  THTTPRequestOptions = record
+    { Bounds blocking socket and TLS I/O. Zero preserves the historical
+      platform default for callers that do not opt into a deadline. }
+    TimeoutMs: Integer;
+  end;
+
   EHTTPError = class(Exception);
 
 function HTTPGet(const AURL: string;
-  const AHeaders: THTTPHeaders): THTTPResponse;
+  const AHeaders: THTTPHeaders): THTTPResponse; overload;
+function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse; overload;
 function HTTPHead(const AURL: string;
-  const AHeaders: THTTPHeaders): THTTPResponse;
+  const AHeaders: THTTPHeaders): THTTPResponse; overload;
+function HTTPHead(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse; overload;
+function DefaultHTTPRequestOptions: THTTPRequestOptions;
 
 implementation
 
@@ -200,7 +211,23 @@ end;
 // ---------------------------------------------------------------------------
 
 {$IFDEF UNIX}
-function ConnectSocket(const AHost: string; const APort: Integer): TSocket;
+procedure ApplySocketTimeout(const ASock: TSocket; const ATimeoutMs: Integer);
+var
+  Timeout: TTimeVal;
+begin
+  if ATimeoutMs <= 0 then Exit;
+  Timeout.tv_sec := ATimeoutMs div 1000;
+  Timeout.tv_usec := (ATimeoutMs mod 1000) * 1000;
+  if fpSetSockOpt(ASock, SOL_SOCKET, SO_RCVTIMEO, @Timeout,
+    SizeOf(Timeout)) <> 0 then
+    raise EHTTPError.Create('Failed to set socket receive timeout');
+  if fpSetSockOpt(ASock, SOL_SOCKET, SO_SNDTIMEO, @Timeout,
+    SizeOf(Timeout)) <> 0 then
+    raise EHTTPError.Create('Failed to set socket send timeout');
+end;
+
+function ConnectSocket(const AHost: string; const APort,
+  ATimeoutMs: Integer): TSocket;
 var
   SockAddr: TInetSockAddr;
   HostEntry: THostEntry;
@@ -220,6 +247,8 @@ begin
   if Result < 0 then
     raise EHTTPError.Create('Failed to create socket');
 
+  ApplySocketTimeout(Result, ATimeoutMs);
+
   FillChar(SockAddr, SizeOf(SockAddr), 0);
   SockAddr.sin_family := AF_INET;
   SockAddr.sin_port := htons(APort);
@@ -234,7 +263,22 @@ end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
-function ConnectSocket(const AHost: string; const APort: Integer): TSocket;
+procedure ApplySocketTimeout(const ASock: TSocket; const ATimeoutMs: Integer);
+var
+  Timeout: LongInt;
+begin
+  if ATimeoutMs <= 0 then Exit;
+  Timeout := ATimeoutMs;
+  if WinSock2.setsockopt(ASock, SOL_SOCKET, SO_RCVTIMEO,
+    PAnsiChar(@Timeout), SizeOf(Timeout)) <> 0 then
+    raise EHTTPError.Create('Failed to set socket receive timeout');
+  if WinSock2.setsockopt(ASock, SOL_SOCKET, SO_SNDTIMEO,
+    PAnsiChar(@Timeout), SizeOf(Timeout)) <> 0 then
+    raise EHTTPError.Create('Failed to set socket send timeout');
+end;
+
+function ConnectSocket(const AHost: string; const APort,
+  ATimeoutMs: Integer): TSocket;
 var
   Hints, Res, Cur: PAddrInfo;
   PortStr: AnsiString;
@@ -271,6 +315,8 @@ begin
         Cur := Cur^.ai_next;
         Continue;
       end;
+
+      ApplySocketTimeout(Sock, ATimeoutMs);
 
       if WinSock2.connect(Sock, Cur^.ai_addr, Cur^.ai_addrlen) = 0 then
         Break;
@@ -610,7 +656,8 @@ end;
 
 function DoRequest(const AMethod, AURL: string;
   const AHeaders: THTTPHeaders;
-  const AMaxRedirects: Integer): THTTPResponse;
+  const AMaxRedirects: Integer;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
 var
   Parsed: THTTPParsedURL;
   Sock: TSocket;
@@ -633,7 +680,7 @@ begin
   begin
     Parsed := ParseHTTPURL(CurrentURL);
     FillChar(Transport, SizeOf(Transport), 0);
-    Sock := ConnectSocket(Parsed.Host, Parsed.Port);
+    Sock := ConnectSocket(Parsed.Host, Parsed.Port, AOptions.TimeoutMs);
     try
       if Parsed.Scheme = 'https' then
         StartTransportSecurity(Transport, Sock, Parsed.Host);
@@ -722,14 +769,37 @@ end;
 
 function HTTPGet(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse;
+var
+  Options: THTTPRequestOptions;
 begin
-  Result := DoRequest('GET', AURL, AHeaders, MAX_REDIRECTS);
+  Options := DefaultHTTPRequestOptions;
+  Result := HTTPGet(AURL, AHeaders, Options);
+end;
+
+function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
+begin
+  Result := DoRequest('GET', AURL, AHeaders, MAX_REDIRECTS, AOptions);
 end;
 
 function HTTPHead(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse;
+var
+  Options: THTTPRequestOptions;
 begin
-  Result := DoRequest('HEAD', AURL, AHeaders, MAX_REDIRECTS);
+  Options := DefaultHTTPRequestOptions;
+  Result := HTTPHead(AURL, AHeaders, Options);
+end;
+
+function HTTPHead(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
+begin
+  Result := DoRequest('HEAD', AURL, AHeaders, MAX_REDIRECTS, AOptions);
+end;
+
+function DefaultHTTPRequestOptions: THTTPRequestOptions;
+begin
+  Result.TimeoutMs := 0;
 end;
 
 end.
