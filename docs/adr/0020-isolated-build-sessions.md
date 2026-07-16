@@ -47,8 +47,10 @@ retaining sessions whose recorded process is alive.
   against the private candidate before publication and receive
   `LWPT_BUILD_OUTPUT`, `LWPT_BUILD_PUBLIC_OUTPUT`, and `LWPT_BUILD_TARGET`.
   Existing `{item.output}` references in hook fields are retargeted to the
-  candidate. Hook definitions, scripts, and declared inputs are publication
-  inputs. Failed hooks prevent publication, and whole-build postbuild runs only
+  candidate only when the expanded path is a complete path token; related
+  paths such as `build/app.json` remain unchanged. Hook definitions, scripts,
+  and declared inputs are publication inputs. Failed hooks prevent
+  publication, and whole-build postbuild runs only
   after every selected target compiled and its private hook succeeded, but
   before publication; artifact transformations belong in per-target postbuild
   hooks. Arbitrary hook filesystem side effects are not sandboxed, but hook
@@ -60,6 +62,10 @@ retaining sessions whose recorded process is alive.
 - Publication requires a same-filesystem atomic replacement. If the platform
   refuses replacement, including a locked destination, LWPT leaves the prior
   public artifact intact and retains the candidate for diagnosis.
+- The fingerprint binds the exact manifest bytes loaded before parsing to the
+  parsed request. A manifest change during or after parsing refuses compilation
+  or publication instead of combining new on-disk bytes with stale parsed
+  configuration.
 - Output-specific lock files use the physical destination-parent identity and
   filesystem-appropriate filename casing. They are stable names backed by an
   OS-held advisory

@@ -152,7 +152,9 @@ stays private. Per-target postbuild hooks receive `LWPT_BUILD_OUTPUT` for the
 private candidate, `LWPT_BUILD_PUBLIC_OUTPUT` for the requested manifest path,
 and `LWPT_BUILD_TARGET` for the target name. Existing `{item.output}`
 references in their script, arguments, inputs, and staleness output are
-retargeted to the private candidate at execution time. Hook definitions,
+retargeted to the private candidate at execution time when the expanded path
+is a complete path token. Related paths such as `build/app.json` are not
+rewritten. Hook definitions,
 scripts, and declared inputs participate in publication revalidation. A hook
 failure prevents publication. Whole-build postbuild runs only after every
 selected target compiles and its private hook succeeds, and before any

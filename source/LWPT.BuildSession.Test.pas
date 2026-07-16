@@ -32,6 +32,7 @@ type
     procedure TestStaleCandidateDoesNotReplacePublicOutput;
     procedure TestCurrentCandidatePublishesAtomically;
     procedure TestCompetingCandidateLosesPublication;
+    procedure TestParsedManifestChangeRefusesFingerprint;
     procedure TestRootUnitPathIgnoresSessionStaging;
     procedure TestRootUnitPathIgnoresDeclaredOutputs;
     procedure TestSearchPathContentChangeRefusesPublication;
@@ -72,6 +73,7 @@ begin
   Result.CompilerID := 'test-compiler';
   Result.CompilerExecutable := '/test/compiler';
   Result.CompilerVersion := '1.0.0';
+  Result.ManifestContentHash := SHA256File(FScratch + '/lwpt.toml');
   Result.Source := 'source/app.pas';
   Result.Output := 'build/app';
   Result.OutputKind := 'executable';
@@ -236,6 +238,28 @@ begin
     Lines.Free;
   end;
   Expect<Boolean>(FileExists(FScratch + '/candidate-second/app')).ToBe(True);
+end;
+
+procedure TBuildSessionTests.TestParsedManifestChangeRefusesFingerprint;
+var
+  Request: TBuildPublicationRequest;
+  Raised: Boolean;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/lwpt.toml', '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  Request := BasicRequest;
+  WriteText(FScratch + '/lwpt.toml',
+    '[package]'#10'name = "changed-app"');
+  Raised := False;
+  try
+    CaptureBuildPublicationFingerprint(FScratch, 'lwpt.toml',
+      'lwpt.cfg', 'lwpt.lock', '.lwpt/modules', Request);
+  except
+    on E: ELWPTError do
+      Raised := Pos('manifest changed after it was parsed', E.Message) > 0;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
 end;
 
 procedure TBuildSessionTests.TestRootUnitPathIgnoresSessionStaging;
@@ -528,6 +552,8 @@ begin
     TestCurrentCandidatePublishesAtomically);
   Test('competing candidate loses publication to the winner',
     TestCompetingCandidateLosesPublication);
+  Test('manifest changes after parsing refuse fingerprint capture',
+    TestParsedManifestChangeRefusesFingerprint);
   Test('root unit path excludes changing session staging',
     TestRootUnitPathIgnoresSessionStaging);
   Test('root unit path excludes declared build outputs',

@@ -22,6 +22,7 @@ type
     CompilerID: string;
     CompilerExecutable: string;
     CompilerVersion: string;
+    ManifestContentHash: string;
     Source: string;
     Output: string;
     OutputKind: string;
@@ -108,6 +109,8 @@ var
     array[0..63] of TRTLCriticalSection;
 
 type
+  EParsedManifestChanged = class(ELWPTError);
+
   {$IFDEF UNIX}
   {$IFDEF LINUX}
   TLWPTFlock = BaseUnix.FLock;
@@ -348,7 +351,7 @@ function CaptureBuildPublicationFingerprint(
 var
   Fields: TStringList;
   EmptyPaths: TStringArray;
-  SourceDirectory: string;
+  ManifestFingerprint, SourceDirectory: string;
 begin
   SetLength(EmptyPaths, 0);
   Fields := TStringList.Create;
@@ -358,6 +361,7 @@ begin
     AddField(Fields, 'compiler.id', ARequest.CompilerID);
     AddField(Fields, 'compiler.executable', ARequest.CompilerExecutable);
     AddField(Fields, 'compiler.version', ARequest.CompilerVersion);
+    AddField(Fields, 'manifest.parsed-hash', ARequest.ManifestContentHash);
     AddField(Fields, 'source', ARequest.Source);
     AddField(Fields, 'source.content',
       PathFingerprint(AProjectRoot, ARequest.Source, EmptyPaths));
@@ -388,8 +392,12 @@ begin
     AddStringArray(Fields, 'hook-definition', ARequest.HookDefinition);
     AddPathArray(Fields, AProjectRoot, 'hook-inputs',
       ARequest.HookInputs, ARequest.ExcludedPaths);
-    AddField(Fields, 'manifest',
-      PathFingerprint(AProjectRoot, AManifestPath, EmptyPaths));
+    ManifestFingerprint := PathFingerprint(
+      AProjectRoot, AManifestPath, EmptyPaths);
+    if ManifestFingerprint <> 'file:' + ARequest.ManifestContentHash then
+      raise EParsedManifestChanged.Create(
+        'manifest changed after it was parsed');
+    AddField(Fields, 'manifest', ManifestFingerprint);
     AddField(Fields, 'cfg',
       PathFingerprint(AProjectRoot, ACfgPath, EmptyPaths));
     AddField(Fields, 'lock',
@@ -968,9 +976,13 @@ begin
   Lock := TPublicationLock.Create(
     BuildPublicationLockPath(AProjectRoot, Destination));
   try
-    CurrentFingerprint := CaptureBuildPublicationFingerprint(
-      AProjectRoot, AManifestPath, ACfgPath, ALockPath, AModulesPath,
-      ARequest);
+    try
+      CurrentFingerprint := CaptureBuildPublicationFingerprint(
+        AProjectRoot, AManifestPath, ACfgPath, ALockPath, AModulesPath,
+        ARequest);
+    except
+      on EParsedManifestChanged do Exit(bprStale);
+    end;
     if CurrentFingerprint <> AExpectedFingerprint then
       Exit(bprStale);
     if not AtomicReplaceFile(ACandidatePath, Destination) then

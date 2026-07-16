@@ -224,6 +224,45 @@ begin
   WriteLn('  generated ', AMan.VersionIncOut);
 end;
 
+function IsPathReferenceCharacter(AValue: Char): Boolean;
+begin
+  Result := AValue in ['a'..'z', 'A'..'Z', '0'..'9',
+    '_', '-', '.', '/', '\'];
+end;
+
+function ReplaceOneOutputReference(const AValue, APublicOutput,
+  ACandidateOutput: string): string;
+var
+  AfterMatch, MatchAt, SearchAt: Integer;
+  Prefix, Remaining: string;
+begin
+  Result := '';
+  if (AValue = '') or (APublicOutput = '') then Exit(AValue);
+  SearchAt := 1;
+  while SearchAt <= Length(AValue) do
+  begin
+    Remaining := Copy(AValue, SearchAt, MaxInt);
+    MatchAt := Pos(APublicOutput, Remaining);
+    if MatchAt = 0 then
+    begin
+      Result := Result + Remaining;
+      Exit;
+    end;
+    Inc(MatchAt, SearchAt - 1);
+    AfterMatch := MatchAt + Length(APublicOutput);
+    Prefix := Copy(AValue, SearchAt, MatchAt - SearchAt);
+    Result := Result + Prefix;
+    if ((MatchAt = 1)
+        or not IsPathReferenceCharacter(AValue[MatchAt - 1]))
+       and ((AfterMatch > Length(AValue))
+        or not IsPathReferenceCharacter(AValue[AfterMatch])) then
+      Result := Result + ACandidateOutput
+    else
+      Result := Result + APublicOutput;
+    SearchAt := AfterMatch;
+  end;
+end;
+
 function ReplaceOutputReference(const AValue, APublicOutput,
   ACandidateOutput: string): string;
 {$IFDEF MSWINDOWS}
@@ -231,15 +270,14 @@ var
   PublicWithoutExtension: string;
 {$ENDIF}
 begin
-  if (AValue = '') or (APublicOutput = '') then Exit(AValue);
-  Result := StringReplace(AValue, APublicOutput, ACandidateOutput,
-    [rfReplaceAll]);
+  Result := ReplaceOneOutputReference(
+    AValue, APublicOutput, ACandidateOutput);
   {$IFDEF MSWINDOWS}
   if SameText(ExtractFileExt(APublicOutput), '.exe') then
   begin
     PublicWithoutExtension := ChangeFileExt(APublicOutput, '');
-    Result := StringReplace(Result, PublicWithoutExtension,
-      ACandidateOutput, [rfReplaceAll]);
+    Result := ReplaceOneOutputReference(Result, PublicWithoutExtension,
+      ACandidateOutput);
   end;
   {$ENDIF}
 end;
@@ -341,6 +379,7 @@ end;
 
 { Compile one build target. Returns True on success. }
 function BuildOneTarget(const AManifestPath: string; const AMan: TManifest;
+  const AManifestContentHash: string;
   const T: TBuildTarget; ARelease, AClean: Boolean;
   ASession: TLWPTBuildSession; out ACompiled: TCompiledTarget): Boolean;
 var
@@ -386,6 +425,7 @@ begin
   Request.CompilerID := 'fpc';
   Request.CompilerExecutable := FPCExecutable;
   Request.CompilerVersion := QueryFPCVersion;
+  Request.ManifestContentHash := AManifestContentHash;
   Request.Source := T.Source;
   Request.Output := OutBin;
   Request.OutputKind := 'executable';
@@ -519,13 +559,21 @@ var
   i, j, Built, Failed, Unknown : Integer;
   Matched : Boolean;
   ModeStr, CollA, CollB : string;
+  ManifestContentHash: string;
   Session: TLWPTBuildSession;
   Compiled: TCompiledTarget;
   Pending: TCompiledTargetArray;
   PublicationRequest: TBuildPublicationRequest;
   HookEnvironment: array of string;
 begin
+  ManifestContentHash := SHA256File(AManifestPath);
+  if ManifestContentHash = '' then
+    raise EManifestError.CreateFmt(
+      'manifest not found at %s', [AManifestPath]);
   Man := LoadManifest(AManifestPath);
+  if SHA256File(AManifestPath) <> ManifestContentHash then
+    raise EManifestError.Create(
+      'manifest changed while it was being parsed');
 
   if Length(Man.Targets) = 0 then
   begin
@@ -585,7 +633,8 @@ begin
       RunHooks('prebuild:' + Man.Targets[i].Name,
         Man.Targets[i].PreBuild, Session.HookRoot);
       try
-        if BuildOneTarget(AManifestPath, Man, Man.Targets[i],
+        if BuildOneTarget(AManifestPath, Man, ManifestContentHash,
+          Man.Targets[i],
           ARelease, AClean, Session, Compiled) then
         begin
           SetLength(HookEnvironment, 3);
