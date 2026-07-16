@@ -202,10 +202,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 9 | 206 |
-| Integration (`tests/integration/*.Test.pas`) | 14 | 92 |
+| Unit (`source/*.Test.pas` + package self-tests) | 8 | 194 |
+| Integration (`tests/integration/*.Test.pas`) | 14 | 91 |
 | E2E (`tests/e2e/*.E2E.Test.pas`) | 5 | 20 |
-| **Total** | **28** | **318** |
+| **Total** | **27** | **305** |
 
 ### Planned testing work
 

@@ -112,7 +112,8 @@ LWPT's own internal cleanup (e.g. `WipeInstalledDep` during re-install) detects 
 
 ## Error model
 
-`LWPT.Core` declares `ELWPTError` (base) + six subclasses:
+`LWPT.Core` declares `ELWPTError` (base) + six subclasses; worker coordination
+adds one module-specific subclass:
 
 | Class | Raised for |
 | --- | --- |
@@ -122,6 +123,7 @@ LWPT's own internal cleanup (e.g. `WipeInstalledDep` during re-install) detects 
 | `ELockfileError` | Corrupt TOML in `lwpt.lock`, schema version mismatch (v1 → v2), missing lockfile when `--frozen` |
 | `EManifestError` | TOML errors, missing required keys, unsatisfiable constraints, unknown source kinds |
 | `EConcurrencyError` | Concurrent `lwpt install` — second process fails fast naming the first's PID |
+| `ELWPTWorkerBudgetError` | Invalid worker-budget configuration, ownership, lease, or delegation state |
 
 Each error class carries an `Operation` and a `Recovery` field. The subcommand wrappers in `source/lwpt.pas` print `<program> <subcommand>: <message>` and the `Recovery` hint when set. Hash mismatches under `--frozen` print exactly which side mismatched (archive vs tree) and which dep is affected, so the recovery action is obvious from the message itself.
 

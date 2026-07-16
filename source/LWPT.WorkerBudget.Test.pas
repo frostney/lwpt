@@ -13,6 +13,7 @@ uses
   Process,
   SysUtils,
 
+  LWPT.Core,
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.Scratch;
@@ -40,13 +41,13 @@ const
 type
   TLeaseThread = class(TThread)
   private
-    FSession : TWorkerBudgetSession;
+    FSession : TLWPTWorkerBudgetSession;
     FSuccess : Boolean;
     FError : string;
   protected
     procedure Execute; override;
   public
-    constructor Create(ASession: TWorkerBudgetSession);
+    constructor Create(ASession: TLWPTWorkerBudgetSession);
     property Success: Boolean read FSuccess;
     property ErrorText: string read FError;
   end;
@@ -85,7 +86,7 @@ type
     procedure TestSessionSupportsConcurrentSchedulerThreads;
   end;
 
-constructor TLeaseThread.Create(ASession: TWorkerBudgetSession);
+constructor TLeaseThread.Create(ASession: TLWPTWorkerBudgetSession);
 begin
   FSession := ASession;
   FSuccess := False;
@@ -96,7 +97,7 @@ end;
 
 procedure TLeaseThread.Execute;
 var
-  Lease : TWorkerLease;
+  Lease : TLWPTWorkerLease;
 begin
   Lease := nil;
   try
@@ -145,11 +146,13 @@ end;
 procedure WriteMarker(const APath, AText: string);
 var
   Lines : TStringList;
+  TmpRoot : string;
 begin
   Lines := TStringList.Create;
   try
     Lines.Add(AText);
-    Lines.SaveToFile(APath);
+    TmpRoot := ExtractFileDir(APath) + '/tmp-markers';
+    AtomicWriteText(APath, TmpRoot, Lines);
   finally
     Lines.Free;
   end;
@@ -215,11 +218,11 @@ function RunChildMode: Boolean;
 var
   i, GrantedTotal, Cycles : Integer;
   HasProcess, HasLease, FailedRelease, Refused : Boolean;
-  Session : TWorkerBudgetSession;
-  Lease : TWorkerLease;
+  Session : TLWPTWorkerBudgetSession;
+  Lease : TLWPTWorkerLease;
   AcquiredPath, ReleasePath, OutputPath, ChildOutput, TmpPath,
     DelegationToken, RequestPath, Kind, ParentOutput, ChildRelease : string;
-  Snapshot : TWorkerBudgetSnapshot;
+  Snapshot : TLWPTWorkerBudgetSnapshot;
   Lines, RequestLines, FirstEnvironment, SecondEnvironment : TStringList;
   Reclaimed : Integer;
   Child, FirstChild, SecondChild : TProcess;
@@ -265,7 +268,7 @@ begin
 
   if (ParamCount = 5) and (ParamStr(1) = CORRUPT_OWNER_SWITCH) then
   begin
-    Session := TWorkerBudgetSession.Create(ParamStr(2), 1);
+    Session := TLWPTWorkerBudgetSession.Create(ParamStr(2), 1);
     Lease := nil;
     try
       Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
@@ -297,7 +300,7 @@ begin
     Lines := TStringList.Create;
     FirstEnvironment := TStringList.Create;
     SecondEnvironment := TStringList.Create;
-    Session := TWorkerBudgetSession.Create('fanout-parent', 1);
+    Session := TLWPTWorkerBudgetSession.Create('fanout-parent', 1);
     Lease := nil;
     try
       Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
@@ -306,7 +309,7 @@ begin
       try
         AppendWorkerLeaseEnvironment(SecondEnvironment, Lease);
       except
-        on EWorkerBudgetError do Refused := True;
+        on ELWPTWorkerBudgetError do Refused := True;
       end;
       Lines.Add('first-token-present=' + BoolToStr(EnvValue(
         FirstEnvironment, WORKER_LEASE_TOKEN_ENV) <> '', True));
@@ -329,7 +332,7 @@ begin
   begin
     Lines := TStringList.Create;
     FirstEnvironment := TStringList.Create;
-    Session := TWorkerBudgetSession.Create('reuse-parent', 1);
+    Session := TLWPTWorkerBudgetSession.Create('reuse-parent', 1);
     Lease := nil;
     FirstChild := nil;
     SecondChild := nil;
@@ -376,7 +379,7 @@ begin
 
   if (ParamCount = 3) and (ParamStr(1) = HOLD_CHILD_SWITCH) then
   begin
-    Session := TWorkerBudgetSession.Create('orphan-child', 1);
+    Session := TLWPTWorkerBudgetSession.Create('orphan-child', 1);
     Lease := nil;
     try
       Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
@@ -398,7 +401,7 @@ begin
     ChildOutput := OutputPath + '.child';
     ChildRelease := OutputPath + '.release';
     Lines := TStringList.Create;
-    Session := TWorkerBudgetSession.Create('delegation-parent', 1);
+    Session := TLWPTWorkerBudgetSession.Create('delegation-parent', 1);
     Lease := nil;
     Child := nil;
     try
@@ -461,7 +464,7 @@ begin
     ParentOutput := ParamStr(2);
     ChildOutput := ParamStr(3);
     ChildRelease := ParamStr(4);
-    Session := TWorkerBudgetSession.Create('orphan-parent', 1);
+    Session := TLWPTWorkerBudgetSession.Create('orphan-parent', 1);
     Lease := nil;
     Child := nil;
     try
@@ -488,7 +491,7 @@ begin
   if (ParamCount = 2) and (ParamStr(1) = THREAD_SWITCH) then
   begin
     Lines := TStringList.Create;
-    Session := TWorkerBudgetSession.Create('threaded-session', 2);
+    Session := TLWPTWorkerBudgetSession.Create('threaded-session', 2);
     FirstThread := TLeaseThread.Create(Session);
     SecondThread := TLeaseThread.Create(Session);
     try
@@ -517,7 +520,7 @@ begin
   begin
     OutputPath := ParamStr(2);
     Lines := TStringList.Create;
-    Session := TWorkerBudgetSession.Create('release-retry', 1);
+    Session := TLWPTWorkerBudgetSession.Create('release-retry', 1);
     Lease := nil;
     try
       Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
@@ -553,7 +556,7 @@ begin
   if (ParamCount = 2) and (ParamStr(1) = NESTED_CHILD_SWITCH) then
   begin
     Lines := TStringList.Create;
-    Session := TWorkerBudgetSession.Create('nested-child', 1);
+    Session := TLWPTWorkerBudgetSession.Create('nested-child', 1);
     Lease := nil;
     try
       Lease := Session.Acquire(2000);
@@ -579,7 +582,7 @@ begin
     ChildOutput := OutputPath + '.child';
     Lines := TStringList.Create;
     RequestLines := TStringList.Create;
-    Session := TWorkerBudgetSession.Create('nested-parent', 1);
+    Session := TLWPTWorkerBudgetSession.Create('nested-parent', 1);
     Lease := nil;
     Child := nil;
     try
@@ -625,7 +628,7 @@ begin
     AcquiredPath := ParamStr(4);
     ReleasePath := ParamStr(5);
     Cycles := StrToIntDef(ParamStr(6), 0);
-    Session := TWorkerBudgetSession.Create(ParamStr(2), 1);
+    Session := TLWPTWorkerBudgetSession.Create(ParamStr(2), 1);
     try
       for i := 1 to Cycles do
       begin
@@ -655,7 +658,7 @@ begin
 
   AcquiredPath := ParamStr(4);
   ReleasePath := ParamStr(5);
-  Session := TWorkerBudgetSession.Create(ParamStr(2),
+  Session := TLWPTWorkerBudgetSession.Create(ParamStr(2),
     StrToIntDef(ParamStr(6), 0));
   try
     Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
@@ -966,9 +969,9 @@ end;
 
 procedure TWorkerBudgetProcesses.TestLiveUnreadableRequestsFailClosed;
 var
-  Process : TProcess;
+  Process, Contender : TProcess;
   Kind, SessionId, RequestPath, ReadyPath, ReleasePath, SnapshotPath,
-    RepairPath : string;
+    RepairPath, ContenderAcquired, ContenderRelease : string;
   Values : TStringList;
   KindIndex : Integer;
 const
@@ -984,7 +987,10 @@ begin
     ReleasePath := FScratch + '/' + Kind + '-release';
     SnapshotPath := FScratch + '/' + Kind + '-snapshot';
     RepairPath := FScratch + '/' + Kind + '-repair';
+    ContenderAcquired := FScratch + '/' + Kind + '-contender-acquired';
+    ContenderRelease := FScratch + '/' + Kind + '-contender-release';
     Values := nil;
+    Contender := nil;
     Process := TProcess.Create(nil);
     try
       Process.Executable := ExpandFileName(ParamStr(0));
@@ -1012,11 +1018,23 @@ begin
       Expect<Boolean>(FileExists(RequestPath)
         or DirectoryExists(RequestPath)).ToBe(True);
 
+      Contender := StartChild('contender-' + Kind,
+        FScratch + '/worktree-b', ContenderAcquired, ContenderRelease);
+      Expect<Boolean>(WaitForFile(
+        FScratch + '/state/contender-' + Kind + '.request',
+        WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
+      Sleep(250);
+      Expect<Boolean>(FileExists(ContenderAcquired)).ToBe(False);
+
       WriteMarker(ReleasePath, 'release');
       Process.WaitOnExit;
       Expect<Integer>(Process.ExitStatus).ToBe(0);
+      Expect<Boolean>(WaitForFile(ContenderAcquired,
+        WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
+      WriteMarker(ContenderRelease, 'release');
     finally
       Values.Free;
+      StopChild(Contender);
       StopChild(Process);
     end;
   end;

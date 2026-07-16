@@ -41,7 +41,7 @@ var
   Ctx : TManifestContext;
   TmpRoot, LockPath : string;
   WorkerLines : TStringList;
-  WorkerSnapshot : TWorkerBudgetSnapshot;
+  WorkerSnapshot : TLWPTWorkerBudgetSnapshot;
   Reclaimed, i : Integer;
 begin
   Ctx := LoadManifestContext(AManifestPath);

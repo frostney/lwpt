@@ -26,9 +26,9 @@ const
   WORKER_LEASE_TOKEN_ENV = PROJECT_NAME + '_WORKER_LEASE_TOKEN';
 
 type
-  EWorkerBudgetError = class(ELWPTError);
+  ELWPTWorkerBudgetError = class(ELWPTError);
 
-  TWorkerBudgetEntry = record
+  TLWPTWorkerBudgetEntry = record
     SessionId : string;
     ProcessId : Integer;
     Requested : Integer;
@@ -42,32 +42,32 @@ type
     Delegations : string;
     Uncertain : Boolean;
   end;
-  TWorkerBudgetEntryArray = array of TWorkerBudgetEntry;
+  TLWPTWorkerBudgetEntryArray = array of TLWPTWorkerBudgetEntry;
 
-  TWorkerBudgetSnapshot = record
+  TLWPTWorkerBudgetSnapshot = record
     StateRoot : string;
     EffectiveBudget : Integer;
     ActiveWorkers : Integer;
     WaitingInvocations : Integer;
-    Entries : TWorkerBudgetEntryArray;
+    Entries : TLWPTWorkerBudgetEntryArray;
   end;
 
-  TWorkerBudgetSession = class;
+  TLWPTWorkerBudgetSession = class;
 
-  TWorkerLease = class
+  TLWPTWorkerLease = class
   private
-    FOwner : TWorkerBudgetSession;
+    FOwner : TLWPTWorkerBudgetSession;
     FReleased : Boolean;
     FToken : string;
     FDelegated : Boolean;
     procedure Detach;
   public
-    constructor Create(AOwner: TWorkerBudgetSession; const AToken: string);
+    constructor Create(AOwner: TLWPTWorkerBudgetSession; const AToken: string);
     destructor Destroy; override;
     procedure Release;
   end;
 
-  TWorkerBudgetSession = class
+  TLWPTWorkerBudgetSession = class
   private
     FSessionId : string;
     FRequested : Integer;
@@ -85,15 +85,15 @@ type
     FLocalCriticalSectionReady : Boolean;
     FAcquireCriticalSectionReady : Boolean;
     procedure TouchHeartbeat;
-    procedure ReleaseLease(ALease: TWorkerLease);
-    procedure AbandonLease(ALease: TWorkerLease);
-    function CreateDelegation(ALease: TWorkerLease): string;
+    procedure ReleaseLease(ALease: TLWPTWorkerLease);
+    procedure AbandonLease(ALease: TLWPTWorkerLease);
+    function CreateDelegation(ALease: TLWPTWorkerLease): string;
     function IsClosed: Boolean;
     function GetGrantedWorkers: Integer;
   public
     constructor Create(const ASessionId: string; ARequestedWorkers: Integer);
     destructor Destroy; override;
-    function Acquire(ATimeoutMilliseconds: Integer = -1): TWorkerLease;
+    function Acquire(ATimeoutMilliseconds: Integer = -1): TLWPTWorkerLease;
     property SessionId: string read FSessionId;
     property RequestedWorkers: Integer read FRequested;
     property EffectiveBudget: Integer read FEffectiveBudget;
@@ -102,12 +102,12 @@ type
 
 function NewWorkerSessionId: string;
 function WorkerStateRoot: string;
-function GetWorkerBudgetSnapshot: TWorkerBudgetSnapshot;
+function GetWorkerBudgetSnapshot: TLWPTWorkerBudgetSnapshot;
 function RepairWorkerBudget: Integer;
 procedure AppendWorkerBudgetDiagnostics(AOutput: TStrings;
-  const ASnapshot: TWorkerBudgetSnapshot);
+  const ASnapshot: TLWPTWorkerBudgetSnapshot);
 procedure AppendWorkerLeaseEnvironment(AEnvironment: TStrings;
-  ALease: TWorkerLease);
+  ALease: TLWPTWorkerLease);
 
 implementation
 
@@ -152,7 +152,7 @@ type
   {$ENDIF}
   {$ENDIF}
 
-  TWorkerStateTransaction = class
+  TLWPTWorkerStateTransaction = class
   private
     FCriticalEntered : Boolean;
     FFileLocked : Boolean;
@@ -167,10 +167,11 @@ type
     destructor Destroy; override;
   end;
 
-  TWorkerOwnerGuard = class
+  TLWPTWorkerOwnerGuard = class
   private
     FPath : string;
     FLocked : Boolean;
+    FRegistered : Boolean;
     {$IFDEF UNIX}
     FDescriptor : LongInt;
     {$ENDIF}
@@ -182,14 +183,14 @@ type
     destructor Destroy; override;
   end;
 
-  TWorkerHeartbeat = class(TThread)
+  TLWPTWorkerHeartbeat = class(TThread)
   private
-    FOwner : TWorkerBudgetSession;
+    FOwner : TLWPTWorkerBudgetSession;
     FIntervalMilliseconds : Integer;
   protected
     procedure Execute; override;
   public
-    constructor Create(AOwner: TWorkerBudgetSession;
+    constructor Create(AOwner: TLWPTWorkerBudgetSession;
       AIntervalMilliseconds: Integer);
   end;
 
@@ -214,7 +215,7 @@ begin
   EnterCriticalSection(LocalOwnerCriticalSection);
   try
     if LocalOwnerSessions.IndexOf(ASessionId) >= 0 then
-      raise EWorkerBudgetError.CreateFmt(
+      raise ELWPTWorkerBudgetError.CreateFmt(
         'worker session "%s" already has a live owner', [ASessionId]);
     LocalOwnerSessions.Add(ASessionId);
   finally
@@ -293,14 +294,14 @@ begin
   {$IFDEF UNIX}
   Name := AnsiString(WORKER_LEASE_TOKEN_ENV);
   if CUnsetEnvironmentVariable(PAnsiChar(Name)) <> 0 then
-    raise EWorkerBudgetError.CreateFmt(
+    raise ELWPTWorkerBudgetError.CreateFmt(
       'failed to clear consumed %s from the process environment',
       [WORKER_LEASE_TOKEN_ENV]);
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Name := UnicodeString(WORKER_LEASE_TOKEN_ENV);
   if not Windows.SetEnvironmentVariableW(PWideChar(Name), nil) then
-    raise EWorkerBudgetError.CreateFmt(
+    raise ELWPTWorkerBudgetError.CreateFmt(
       'failed to clear consumed %s from the process environment',
       [WORKER_LEASE_TOKEN_ENV]);
   {$ENDIF}
@@ -388,7 +389,7 @@ begin
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   if BCryptGenRandom(0, @Bytes[0], Length(Bytes), $00000002) <> 0 then
-    raise EWorkerBudgetError.Create(
+    raise ELWPTWorkerBudgetError.Create(
       'failed to obtain secure randomness for worker lease');
   {$ENDIF}
   Result := SHA256Hex(Bytes);
@@ -424,7 +425,7 @@ end;
 function LeaseTokenDigest(const AToken: string): string;
 begin
   if not ValidLeaseToken(AToken) then
-    raise EWorkerBudgetError.Create('invalid worker lease token');
+    raise ELWPTWorkerBudgetError.Create('invalid worker lease token');
   Result := SHA256Hex(BytesOf(AToken));
 end;
 
@@ -440,7 +441,7 @@ var
 begin
   Digest := LeaseTokenDigest(AToken);
   if Pos(',' + Digest + ',', ',' + AValue + ',') > 0 then
-    raise EWorkerBudgetError.Create('duplicate worker lease token');
+    raise ELWPTWorkerBudgetError.Create('duplicate worker lease token');
   if AValue = '' then AValue := Digest
   else AValue := AValue + ',' + Digest;
 end;
@@ -535,7 +536,7 @@ var
   Item : string;
 begin
   if not ValidLeaseToken(ALeaseDigest) then
-    raise EWorkerBudgetError.Create('invalid delegated lease verifier');
+    raise ELWPTWorkerBudgetError.Create('invalid delegated lease verifier');
   Item := LeaseTokenDigest(ADelegationToken) + '=' + ALeaseDigest;
   if AValue = '' then AValue := Item
   else AValue := AValue + ',' + Item;
@@ -616,7 +617,7 @@ begin
   begin
     Result := StrToIntDef(Raw, 0);
     if Result < 1 then
-      raise EWorkerBudgetError.CreateFmt(
+      raise ELWPTWorkerBudgetError.CreateFmt(
         '%s must be a positive integer, got "%s"',
         [WORKER_BUDGET_ENV, Raw]);
     Exit;
@@ -634,12 +635,12 @@ begin
     Exit(DEFAULT_STALE_SECONDS);
   Result := StrToIntDef(Raw, 0);
   if Result < 3 then
-    raise EWorkerBudgetError.CreateFmt(
+    raise ELWPTWorkerBudgetError.CreateFmt(
       '%s must be at least 3 seconds, got "%s"',
       [WORKER_STALE_SECONDS_ENV, Raw]);
 end;
 
-constructor TWorkerStateTransaction.Create;
+constructor TLWPTWorkerStateTransaction.Create;
 var
   LockPath : string;
   {$IFDEF MSWINDOWS}
@@ -663,14 +664,14 @@ begin
     {$IFDEF UNIX}
     FDescriptor := FpOpen(PChar(LockPath), O_RDWR or O_CREAT, &600);
     if FDescriptor < 0 then
-      raise EWorkerBudgetError.CreateFmt(
+      raise ELWPTWorkerBudgetError.CreateFmt(
         'failed to open worker-budget transaction lock at %s',
         [LockPath]);
     if FpFcntl(FDescriptor, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
     begin
       FpClose(FDescriptor);
       FDescriptor := -1;
-      raise EWorkerBudgetError.CreateFmt(
+      raise ELWPTWorkerBudgetError.CreateFmt(
         'failed to protect worker-budget transaction lock from child '
         + 'inheritance at %s', [LockPath]);
     end;
@@ -678,7 +679,7 @@ begin
     begin
       FpClose(FDescriptor);
       FDescriptor := -1;
-      raise EWorkerBudgetError.CreateFmt(
+      raise ELWPTWorkerBudgetError.CreateFmt(
         'failed to acquire worker-budget transaction lock at %s',
         [LockPath]);
     end;
@@ -690,7 +691,7 @@ begin
       FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
       nil, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if FHandle = THandle(INVALID_HANDLE_VALUE) then
-      raise EWorkerBudgetError.CreateFmt(
+      raise ELWPTWorkerBudgetError.CreateFmt(
         'failed to open worker-budget transaction lock at %s',
         [LockPath]);
     FillChar(Overlapped, SizeOf(Overlapped), 0);
@@ -699,7 +700,7 @@ begin
     begin
       CloseHandle(FHandle);
       FHandle := THandle(INVALID_HANDLE_VALUE);
-      raise EWorkerBudgetError.CreateFmt(
+      raise ELWPTWorkerBudgetError.CreateFmt(
         'failed to acquire worker-budget transaction lock at %s',
         [LockPath]);
     end;
@@ -736,7 +737,7 @@ begin
   end;
 end;
 
-destructor TWorkerStateTransaction.Destroy;
+destructor TLWPTWorkerStateTransaction.Destroy;
 {$IFDEF MSWINDOWS}
 var
   Overlapped : TOverlapped;
@@ -771,7 +772,7 @@ begin
   inherited Destroy;
 end;
 
-constructor TWorkerOwnerGuard.Create(const ASessionId: string);
+constructor TLWPTWorkerOwnerGuard.Create(const ASessionId: string);
 {$IFDEF MSWINDOWS}
 var
   Overlapped : TOverlapped;
@@ -780,6 +781,7 @@ begin
   inherited Create;
   FPath := OwnerPath(ASessionId);
   FLocked := False;
+  FRegistered := False;
   {$IFDEF UNIX}
   FDescriptor := -1;
   {$ENDIF}
@@ -790,13 +792,13 @@ begin
   {$IFDEF UNIX}
   FDescriptor := FpOpen(PChar(FPath), O_RDWR or O_CREAT, &600);
   if FDescriptor < 0 then
-    raise EWorkerBudgetError.CreateFmt(
+    raise ELWPTWorkerBudgetError.CreateFmt(
       'failed to open worker owner guard at %s', [FPath]);
   if FpFcntl(FDescriptor, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
   begin
     FpClose(FDescriptor);
     FDescriptor := -1;
-    raise EWorkerBudgetError.CreateFmt(
+    raise ELWPTWorkerBudgetError.CreateFmt(
       'failed to protect worker owner guard from child inheritance at %s',
       [FPath]);
   end;
@@ -804,7 +806,7 @@ begin
   begin
     FpClose(FDescriptor);
     FDescriptor := -1;
-    raise EWorkerBudgetError.CreateFmt(
+    raise ELWPTWorkerBudgetError.CreateFmt(
       'worker session "%s" already has a live owner', [ASessionId]);
   end;
   FLocked := True;
@@ -815,7 +817,7 @@ begin
     FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
     nil, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
   if FHandle = THandle(INVALID_HANDLE_VALUE) then
-    raise EWorkerBudgetError.CreateFmt(
+    raise ELWPTWorkerBudgetError.CreateFmt(
       'failed to open worker owner guard at %s', [FPath]);
   FillChar(Overlapped, SizeOf(Overlapped), 0);
   if not LockFileEx(FHandle,
@@ -824,28 +826,32 @@ begin
   begin
     CloseHandle(FHandle);
     FHandle := THandle(INVALID_HANDLE_VALUE);
-    raise EWorkerBudgetError.CreateFmt(
+    raise ELWPTWorkerBudgetError.CreateFmt(
       'worker session "%s" already has a live owner', [ASessionId]);
   end;
   FLocked := True;
   {$ENDIF}
   RegisterLocalOwner(ASessionId);
+  FRegistered := True;
 end;
 
-destructor TWorkerOwnerGuard.Destroy;
+destructor TLWPTWorkerOwnerGuard.Destroy;
 {$IFDEF MSWINDOWS}
 var
   Overlapped : TOverlapped;
 {$ENDIF}
 begin
-  if FLocked then UnregisterLocalOwner(
+  if FRegistered then UnregisterLocalOwner(
     ChangeFileExt(ExtractFileName(FPath), ''));
   {$IFDEF UNIX}
   if FDescriptor >= 0 then
   begin
-    if FLocked then
+    if FRegistered then
     begin
       SysUtils.DeleteFile(FPath);
+    end;
+    if FLocked then
+    begin
       ReleaseDescriptorLock(FDescriptor);
     end;
     FpClose(FDescriptor);
@@ -855,9 +861,12 @@ begin
   {$IFDEF MSWINDOWS}
   if FHandle <> THandle(INVALID_HANDLE_VALUE) then
   begin
-    if FLocked then
+    if FRegistered then
     begin
       SysUtils.DeleteFile(FPath);
+    end;
+    if FLocked then
+    begin
       FillChar(Overlapped, SizeOf(Overlapped), 0);
       UnlockFileEx(FHandle, 0, 1, 0, Overlapped);
     end;
@@ -865,6 +874,7 @@ begin
     FHandle := THandle(INVALID_HANDLE_VALUE);
   end;
   {$ENDIF}
+  FRegistered := False;
   FLocked := False;
   inherited Destroy;
 end;
@@ -931,12 +941,12 @@ begin
   if AValue then Result := '1' else Result := '0';
 end;
 
-function ReadEntry(const APath: string; out AEntry: TWorkerBudgetEntry): Boolean;
+function ReadEntry(const APath: string; out AEntry: TLWPTWorkerBudgetEntry): Boolean;
 var
   Lines : TStringList;
 begin
   Result := False;
-  AEntry := Default(TWorkerBudgetEntry);
+  AEntry := Default(TLWPTWorkerBudgetEntry);
   Lines := TStringList.Create;
   try
     try
@@ -973,7 +983,7 @@ begin
   end;
 end;
 
-procedure WriteEntry(const AEntry: TWorkerBudgetEntry);
+procedure WriteEntry(const AEntry: TLWPTWorkerBudgetEntry);
 var
   Lines : TStringList;
 begin
@@ -1001,11 +1011,11 @@ end;
 function ReadBudget: Integer; forward;
 
 function ConservativeUnreadableEntry(
-  const ASessionId: string): TWorkerBudgetEntry;
+  const ASessionId: string): TLWPTWorkerBudgetEntry;
 var
   Budget : Integer;
 begin
-  Result := Default(TWorkerBudgetEntry);
+  Result := Default(TLWPTWorkerBudgetEntry);
   Budget := ReadBudget;
   if Budget < 1 then Budget := ConfiguredBudget;
   Result.SessionId := ASessionId;
@@ -1018,10 +1028,10 @@ begin
 end;
 
 function LoadEntriesWithReclaimed(
-  out AReclaimed: Integer): TWorkerBudgetEntryArray;
+  out AReclaimed: Integer): TLWPTWorkerBudgetEntryArray;
 var
   Search : TSearchRec;
-  Entry : TWorkerBudgetEntry;
+  Entry : TLWPTWorkerBudgetEntry;
   Count : Integer;
   SessionId : string;
   EntryValid : Boolean;
@@ -1064,14 +1074,14 @@ begin
   end;
 end;
 
-function LoadEntries: TWorkerBudgetEntryArray;
+function LoadEntries: TLWPTWorkerBudgetEntryArray;
 var
   Ignored : Integer;
 begin
   Result := LoadEntriesWithReclaimed(Ignored);
 end;
 
-function EntryReclaimable(const AEntry: TWorkerBudgetEntry): Boolean;
+function EntryReclaimable(const AEntry: TLWPTWorkerBudgetEntry): Boolean;
 begin
   { Heartbeat age is diagnostic only. Without enforceable fencing, freeing
     capacity while the owner guard remains held could exceed the budget if
@@ -1079,7 +1089,7 @@ begin
   Result := not OwnerGuardHeld(AEntry.SessionId);
 end;
 
-function PruneEntries(var AEntries: TWorkerBudgetEntryArray): Integer;
+function PruneEntries(var AEntries: TLWPTWorkerBudgetEntryArray): Integer;
 var
   i, Kept : Integer;
 begin
@@ -1101,7 +1111,7 @@ begin
   SetLength(AEntries, Kept);
 end;
 
-function FindEntry(const AEntries: TWorkerBudgetEntryArray;
+function FindEntry(const AEntries: TLWPTWorkerBudgetEntryArray;
   const ASessionId: string): Integer;
 var
   i : Integer;
@@ -1111,7 +1121,7 @@ begin
   Result := -1;
 end;
 
-function FindLeaseTokenEntry(const AEntries: TWorkerBudgetEntryArray;
+function FindLeaseTokenEntry(const AEntries: TLWPTWorkerBudgetEntryArray;
   const AToken: string): Integer;
 var
   i : Integer;
@@ -1121,7 +1131,7 @@ begin
   Result := -1;
 end;
 
-function FindDelegationEntry(const AEntries: TWorkerBudgetEntryArray;
+function FindDelegationEntry(const AEntries: TLWPTWorkerBudgetEntryArray;
   const ADelegationToken: string; out ALeaseDigest: string): Integer;
 var
   i : Integer;
@@ -1159,7 +1169,7 @@ begin
   if Result then AValue := Updated;
 end;
 
-function ActiveWorkerCount(const AEntries: TWorkerBudgetEntryArray): Integer;
+function ActiveWorkerCount(const AEntries: TLWPTWorkerBudgetEntryArray): Integer;
 var
   i : Integer;
 begin
@@ -1167,7 +1177,7 @@ begin
   for i := 0 to High(AEntries) do Inc(Result, AEntries[i].Granted);
 end;
 
-function WaitingCount(const AEntries: TWorkerBudgetEntryArray): Integer;
+function WaitingCount(const AEntries: TLWPTWorkerBudgetEntryArray): Integer;
 var
   i : Integer;
 begin
@@ -1242,7 +1252,7 @@ begin
 end;
 
 function NextWaitTicket(
-  const AEntries: TWorkerBudgetEntryArray): Int64;
+  const AEntries: TLWPTWorkerBudgetEntryArray): Int64;
 var
   i : Integer;
 begin
@@ -1251,13 +1261,13 @@ begin
     if AEntries[i].WaitTicket > Result then
       Result := AEntries[i].WaitTicket;
   if Result = High(Int64) then
-    raise EWorkerBudgetError.Create('worker wait-ticket sequence exhausted');
+    raise ELWPTWorkerBudgetError.Create('worker wait-ticket sequence exhausted');
   Inc(Result);
   WriteQueueSequence(Result);
 end;
 
 function ResolveEffectiveBudget(
-  const AEntries: TWorkerBudgetEntryArray): Integer;
+  const AEntries: TLWPTWorkerBudgetEntryArray): Integer;
 begin
   Result := ReadBudget;
   if (Length(AEntries) = 0) or (Result < 1) then
@@ -1268,14 +1278,14 @@ begin
 end;
 
 function BetterCandidate(const ACandidate,
-  ACurrent: TWorkerBudgetEntry): Boolean;
+  ACurrent: TLWPTWorkerBudgetEntry): Boolean;
 begin
   if ACandidate.WaitTicket <> ACurrent.WaitTicket then
     Exit(ACandidate.WaitTicket < ACurrent.WaitTicket);
   Result := ACandidate.SessionId < ACurrent.SessionId;
 end;
 
-function BestWaitingEntry(const AEntries: TWorkerBudgetEntryArray): Integer;
+function BestWaitingEntry(const AEntries: TLWPTWorkerBudgetEntryArray): Integer;
 var
   i : Integer;
 begin
@@ -1291,7 +1301,7 @@ begin
     end;
 end;
 
-constructor TWorkerHeartbeat.Create(AOwner: TWorkerBudgetSession;
+constructor TLWPTWorkerHeartbeat.Create(AOwner: TLWPTWorkerBudgetSession;
   AIntervalMilliseconds: Integer);
 begin
   FOwner := AOwner;
@@ -1300,7 +1310,7 @@ begin
   inherited Create(True);
 end;
 
-procedure TWorkerHeartbeat.Execute;
+procedure TLWPTWorkerHeartbeat.Execute;
 var
   Waited : Integer;
 begin
@@ -1323,12 +1333,12 @@ begin
   end;
 end;
 
-constructor TWorkerBudgetSession.Create(const ASessionId: string;
+constructor TLWPTWorkerBudgetSession.Create(const ASessionId: string;
   ARequestedWorkers: Integer);
 var
-  Transaction : TWorkerStateTransaction;
-  Entries : TWorkerBudgetEntryArray;
-  Entry : TWorkerBudgetEntry;
+  Transaction : TLWPTWorkerStateTransaction;
+  Entries : TLWPTWorkerBudgetEntryArray;
+  Entry : TLWPTWorkerBudgetEntry;
   Index : Integer;
   Current : Int64;
   Interval : Integer;
@@ -1345,10 +1355,10 @@ begin
   FLocalCriticalSectionReady := False;
   FAcquireCriticalSectionReady := False;
   if not ValidSessionId(ASessionId) then
-    raise EWorkerBudgetError.CreateFmt(
+    raise ELWPTWorkerBudgetError.CreateFmt(
       'invalid worker session identity "%s"', [ASessionId]);
   if ARequestedWorkers < 1 then
-    raise EWorkerBudgetError.Create(
+    raise ELWPTWorkerBudgetError.Create(
       'requested worker count must be a positive integer');
 
   FSessionId := ASessionId;
@@ -1362,31 +1372,31 @@ begin
 
   InheritedToken := Trim(
     SysUtils.GetEnvironmentVariable(WORKER_LEASE_TOKEN_ENV));
-  Transaction := TWorkerStateTransaction.Create;
+  Transaction := TLWPTWorkerStateTransaction.Create;
   try
     Entries := LoadEntries;
     PruneEntries(Entries);
     FEffectiveBudget := ResolveEffectiveBudget(Entries);
     if FindEntry(Entries, FSessionId) >= 0 then
-      raise EWorkerBudgetError.CreateFmt(
+      raise ELWPTWorkerBudgetError.CreateFmt(
         'worker session "%s" is already active', [FSessionId]);
-    FOwnerGuard := TWorkerOwnerGuard.Create(FSessionId);
+    FOwnerGuard := TLWPTWorkerOwnerGuard.Create(FSessionId);
     if InheritedToken <> '' then
     begin
       if not ValidLeaseToken(InheritedToken) then
-        raise EWorkerBudgetError.CreateFmt(
+        raise ELWPTWorkerBudgetError.CreateFmt(
           '%s contains an invalid opaque lease token',
           [WORKER_LEASE_TOKEN_ENV]);
       Index := FindDelegationEntry(Entries, InheritedToken, LeaseDigest);
       if Index < 0 then
-        raise EWorkerBudgetError.Create(
+        raise ELWPTWorkerBudgetError.Create(
           'worker lease delegation is invalid, already consumed, or expired');
       if not RemoveLeaseDigest(Entries[Index].LeaseTokens, LeaseDigest) then
-        raise EWorkerBudgetError.Create(
+        raise ELWPTWorkerBudgetError.Create(
           'delegated worker lease is no longer active');
       if not RemoveDelegation(Entries[Index].Delegations,
         InheritedToken) then
-        raise EWorkerBudgetError.Create(
+        raise ELWPTWorkerBudgetError.Create(
           'worker lease delegation disappeared during consumption');
       if Entries[Index].Granted > 0 then Dec(Entries[Index].Granted);
       if Entries[Index].Granted = 0 then
@@ -1397,7 +1407,7 @@ begin
       FInherited := True;
       FInheritedToken := InheritedToken;
       Current := NowMilliseconds;
-      Entry := Default(TWorkerBudgetEntry);
+      Entry := Default(TLWPTWorkerBudgetEntry);
       Entry.SessionId := FSessionId;
       Entry.ProcessId := GetProcessID;
       Entry.Requested := 1;
@@ -1415,7 +1425,7 @@ begin
       if FRequested > FEffectiveBudget then
         FRequested := FEffectiveBudget;
       Current := NowMilliseconds;
-      Entry := Default(TWorkerBudgetEntry);
+      Entry := Default(TLWPTWorkerBudgetEntry);
       Entry.SessionId := FSessionId;
       Entry.ProcessId := GetProcessID;
       Entry.Requested := FRequested;
@@ -1431,14 +1441,14 @@ begin
 
   Interval := (StaleSeconds * 1000) div 3;
   if Interval < 1000 then Interval := 1000;
-  FHeartbeat := TWorkerHeartbeat.Create(Self, Interval);
+  FHeartbeat := TLWPTWorkerHeartbeat.Create(Self, Interval);
   FHeartbeat.Start;
 end;
 
-destructor TWorkerBudgetSession.Destroy;
+destructor TLWPTWorkerBudgetSession.Destroy;
 var
   i : Integer;
-  Transaction : TWorkerStateTransaction;
+  Transaction : TLWPTWorkerStateTransaction;
 begin
   if FLocalCriticalSectionReady then
   begin
@@ -1464,7 +1474,7 @@ begin
   if FRegistered then
   begin
     try
-      Transaction := TWorkerStateTransaction.Create;
+      Transaction := TLWPTWorkerStateTransaction.Create;
       try
         RemoveRequestPath(FSessionId);
       finally
@@ -1481,7 +1491,7 @@ begin
     if FLocalCriticalSectionReady then
       EnterCriticalSection(FLocalCriticalSection);
     for i := 0 to FLeases.Count - 1 do
-      TWorkerLease(FLeases[i]).Detach;
+      TLWPTWorkerLease(FLeases[i]).Detach;
     FLeases.Free;
     FLeases := nil;
     FLocalGranted := 0;
@@ -1507,7 +1517,7 @@ begin
   inherited Destroy;
 end;
 
-function TWorkerBudgetSession.IsClosed: Boolean;
+function TLWPTWorkerBudgetSession.IsClosed: Boolean;
 begin
   if not FLocalCriticalSectionReady then Exit(FClosed);
   EnterCriticalSection(FLocalCriticalSection);
@@ -1518,7 +1528,7 @@ begin
   end;
 end;
 
-function TWorkerBudgetSession.GetGrantedWorkers: Integer;
+function TLWPTWorkerBudgetSession.GetGrantedWorkers: Integer;
 begin
   if not FLocalCriticalSectionReady then Exit(FLocalGranted);
   EnterCriticalSection(FLocalCriticalSection);
@@ -1529,14 +1539,14 @@ begin
   end;
 end;
 
-procedure TWorkerBudgetSession.TouchHeartbeat;
+procedure TLWPTWorkerBudgetSession.TouchHeartbeat;
 var
-  Transaction : TWorkerStateTransaction;
-  Entries : TWorkerBudgetEntryArray;
+  Transaction : TLWPTWorkerStateTransaction;
+  Entries : TLWPTWorkerBudgetEntryArray;
   Index : Integer;
 begin
   if IsClosed then Exit;
-  Transaction := TWorkerStateTransaction.Create;
+  Transaction := TLWPTWorkerStateTransaction.Create;
   try
     Entries := LoadEntries;
     Index := FindEntry(Entries, FSessionId);
@@ -1548,12 +1558,12 @@ begin
   end;
 end;
 
-function TWorkerBudgetSession.Acquire(
-  ATimeoutMilliseconds: Integer): TWorkerLease;
+function TLWPTWorkerBudgetSession.Acquire(
+  ATimeoutMilliseconds: Integer): TLWPTWorkerLease;
 var
   Started : QWord;
-  Transaction : TWorkerStateTransaction;
-  Entries : TWorkerBudgetEntryArray;
+  Transaction : TLWPTWorkerStateTransaction;
+  Entries : TLWPTWorkerBudgetEntryArray;
   Index, Candidate, Active : Integer;
   Granted : Boolean;
   LeaseToken : string;
@@ -1562,26 +1572,26 @@ begin
   EnterCriticalSection(FAcquireCriticalSection);
   try
     if IsClosed then
-      raise EWorkerBudgetError.Create('cannot acquire from a closed session');
+      raise ELWPTWorkerBudgetError.Create('cannot acquire from a closed session');
     if GetGrantedWorkers >= FRequested then
-      raise EWorkerBudgetError.CreateFmt(
+      raise ELWPTWorkerBudgetError.CreateFmt(
         'session "%s" already holds its requested %d worker(s)',
         [FSessionId, FRequested]);
 
     if FInherited then
     begin
-      Transaction := TWorkerStateTransaction.Create;
+      Transaction := TLWPTWorkerStateTransaction.Create;
       try
         Entries := LoadEntries;
         PruneEntries(Entries);
         Index := FindLeaseTokenEntry(Entries, FInheritedToken);
         if Index < 0 then
-          raise EWorkerBudgetError.Create(
+          raise ELWPTWorkerBudgetError.Create(
             'inherited worker lease is no longer active');
       finally
         Transaction.Free;
       end;
-      Result := TWorkerLease.Create(Self, FInheritedToken);
+      Result := TLWPTWorkerLease.Create(Self, FInheritedToken);
       EnterCriticalSection(FLocalCriticalSection);
       try
         FLeases.Add(Result);
@@ -1596,15 +1606,15 @@ begin
     Started := GetTickCount64;
     repeat
       if IsClosed then
-        raise EWorkerBudgetError.Create('cannot acquire from a closed session');
+        raise ELWPTWorkerBudgetError.Create('cannot acquire from a closed session');
       Granted := False;
-      Transaction := TWorkerStateTransaction.Create;
+      Transaction := TLWPTWorkerStateTransaction.Create;
       try
         Entries := LoadEntries;
         PruneEntries(Entries);
         Index := FindEntry(Entries, FSessionId);
         if Index < 0 then
-          raise EWorkerBudgetError.CreateFmt(
+          raise ELWPTWorkerBudgetError.CreateFmt(
             'worker session "%s" disappeared from coordinator state',
             [FSessionId]);
         Entries[Index].HeartbeatAt := NowMilliseconds;
@@ -1634,7 +1644,7 @@ begin
       end;
       if Granted then
       begin
-        Result := TWorkerLease.Create(Self, LeaseToken);
+        Result := TLWPTWorkerLease.Create(Self, LeaseToken);
         EnterCriticalSection(FLocalCriticalSection);
         try
           FLeases.Add(Result);
@@ -1648,7 +1658,7 @@ begin
       if (ATimeoutMilliseconds >= 0)
          and (GetTickCount64 - Started >= QWord(ATimeoutMilliseconds)) then
       begin
-        Transaction := TWorkerStateTransaction.Create;
+        Transaction := TLWPTWorkerStateTransaction.Create;
         try
           Entries := LoadEntries;
           Index := FindEntry(Entries, FSessionId);
@@ -1671,15 +1681,15 @@ begin
   end;
 end;
 
-procedure TWorkerBudgetSession.ReleaseLease(ALease: TWorkerLease);
+procedure TLWPTWorkerBudgetSession.ReleaseLease(ALease: TLWPTWorkerLease);
 var
-  Transaction : TWorkerStateTransaction;
-  Entries : TWorkerBudgetEntryArray;
+  Transaction : TLWPTWorkerStateTransaction;
+  Entries : TLWPTWorkerBudgetEntryArray;
   Index : Integer;
   Removed, LocallyGranted : Boolean;
 begin
   if ALease = nil then Exit;
-  Transaction := TWorkerStateTransaction.Create;
+  Transaction := TLWPTWorkerStateTransaction.Create;
   try
     Entries := LoadEntries;
     PruneEntries(Entries);
@@ -1696,65 +1706,68 @@ begin
       Entries[Index].HeartbeatAt := NowMilliseconds;
       WriteEntry(Entries[Index]);
     end;
+
+    { Keep the coordinator transaction held until the matching local state is
+      updated, so another scheduler thread cannot observe a half-release. }
+    EnterCriticalSection(FLocalCriticalSection);
+    try
+      LocallyGranted := not ALease.FDelegated;
+      Removed := (FLeases <> nil) and (FLeases.Remove(ALease) >= 0);
+      if Removed and LocallyGranted and (FLocalGranted > 0) then
+        Dec(FLocalGranted);
+    finally
+      LeaveCriticalSection(FLocalCriticalSection);
+    end;
   finally
     Transaction.Free;
   end;
-  { The coordinator write above is durable before local state changes. If a
-    previous attempt committed but failed before this point, the missing token
-    is treated as an already-completed release and local cleanup is retried. }
-  EnterCriticalSection(FLocalCriticalSection);
-  try
-    LocallyGranted := not ALease.FDelegated;
-    Removed := (FLeases <> nil) and (FLeases.Remove(ALease) >= 0);
-    if Removed and LocallyGranted and (FLocalGranted > 0) then
-      Dec(FLocalGranted);
-  finally
-    LeaveCriticalSection(FLocalCriticalSection);
-  end;
 end;
 
-function TWorkerBudgetSession.CreateDelegation(
-  ALease: TWorkerLease): string;
+function TLWPTWorkerBudgetSession.CreateDelegation(
+  ALease: TLWPTWorkerLease): string;
 var
-  Transaction : TWorkerStateTransaction;
-  Entries : TWorkerBudgetEntryArray;
+  Transaction : TLWPTWorkerStateTransaction;
+  Entries : TLWPTWorkerBudgetEntryArray;
   Index : Integer;
   LeaseDigest : string;
 begin
   if (ALease = nil) or ALease.FReleased or ALease.FDelegated
      or (ALease.FOwner <> Self) then
-    raise EWorkerBudgetError.Create(
+    raise ELWPTWorkerBudgetError.Create(
       'only an active owned worker lease can be delegated');
   LeaseDigest := LeaseTokenDigest(ALease.FToken);
   Result := NewOpaqueToken;
-  Transaction := TWorkerStateTransaction.Create;
+  Transaction := TLWPTWorkerStateTransaction.Create;
   try
     Entries := LoadEntries;
     PruneEntries(Entries);
     Index := FindEntry(Entries, FSessionId);
     if (Index < 0)
        or not HasLeaseToken(Entries[Index].LeaseTokens, ALease.FToken) then
-      raise EWorkerBudgetError.Create(
+      raise ELWPTWorkerBudgetError.Create(
         'worker lease is no longer active');
     if LeaseHasDelegation(Entries[Index].Delegations, LeaseDigest) then
-      raise EWorkerBudgetError.Create(
+      raise ELWPTWorkerBudgetError.Create(
         'worker lease already has a pending child delegation');
     AddDelegation(Entries[Index].Delegations, Result, LeaseDigest);
     Entries[Index].HeartbeatAt := NowMilliseconds;
     WriteEntry(Entries[Index]);
+
+    { Publish the durable delegation and its local ownership transition as one
+      scheduler-visible operation. }
+    EnterCriticalSection(FLocalCriticalSection);
+    try
+      ALease.FDelegated := True;
+      if FLocalGranted > 0 then Dec(FLocalGranted);
+    finally
+      LeaveCriticalSection(FLocalCriticalSection);
+    end;
   finally
     Transaction.Free;
   end;
-  EnterCriticalSection(FLocalCriticalSection);
-  try
-    ALease.FDelegated := True;
-    if FLocalGranted > 0 then Dec(FLocalGranted);
-  finally
-    LeaveCriticalSection(FLocalCriticalSection);
-  end;
 end;
 
-procedure TWorkerBudgetSession.AbandonLease(ALease: TWorkerLease);
+procedure TLWPTWorkerBudgetSession.AbandonLease(ALease: TLWPTWorkerLease);
 begin
   if not FLocalCriticalSectionReady then Exit;
   EnterCriticalSection(FLocalCriticalSection);
@@ -1767,7 +1780,7 @@ begin
   end;
 end;
 
-constructor TWorkerLease.Create(AOwner: TWorkerBudgetSession;
+constructor TLWPTWorkerLease.Create(AOwner: TLWPTWorkerBudgetSession;
   const AToken: string);
 begin
   inherited Create;
@@ -1777,7 +1790,7 @@ begin
   FDelegated := False;
 end;
 
-destructor TWorkerLease.Destroy;
+destructor TLWPTWorkerLease.Destroy;
 begin
   try
     Release;
@@ -1792,7 +1805,7 @@ begin
   inherited Destroy;
 end;
 
-procedure TWorkerLease.Release;
+procedure TLWPTWorkerLease.Release;
 begin
   if FReleased then Exit;
   if FOwner <> nil then FOwner.ReleaseLease(Self);
@@ -1800,7 +1813,7 @@ begin
   FOwner := nil;
 end;
 
-procedure TWorkerLease.Detach;
+procedure TLWPTWorkerLease.Detach;
 begin
   FOwner := nil;
   FReleased := True;
@@ -1816,30 +1829,30 @@ begin
 end;
 
 procedure AppendWorkerLeaseEnvironment(AEnvironment: TStrings;
-  ALease: TWorkerLease);
+  ALease: TLWPTWorkerLease);
 var
   i : Integer;
   Token : string;
 begin
   if AEnvironment = nil then
-    raise EWorkerBudgetError.Create(
+    raise ELWPTWorkerBudgetError.Create(
       'worker lease environment target is required');
   for i := AEnvironment.Count - 1 downto 0 do
     if SameText(EnvironmentName(AEnvironment[i]), WORKER_LEASE_TOKEN_ENV) then
       AEnvironment.Delete(i);
   if (ALease = nil) or (ALease.FOwner = nil) then
-    raise EWorkerBudgetError.Create(
+    raise ELWPTWorkerBudgetError.Create(
       'active worker lease is required for delegation');
   Token := ALease.FOwner.CreateDelegation(ALease);
   AEnvironment.Add(WORKER_LEASE_TOKEN_ENV + '=' + Token);
 end;
 
-function GetWorkerBudgetSnapshot: TWorkerBudgetSnapshot;
+function GetWorkerBudgetSnapshot: TLWPTWorkerBudgetSnapshot;
 var
-  Transaction : TWorkerStateTransaction;
+  Transaction : TLWPTWorkerStateTransaction;
 begin
-  Result := Default(TWorkerBudgetSnapshot);
-  Transaction := TWorkerStateTransaction.Create;
+  Result := Default(TLWPTWorkerBudgetSnapshot);
+  Transaction := TLWPTWorkerStateTransaction.Create;
   try
     Result.StateRoot := WorkerStateRoot;
     Result.Entries := LoadEntries;
@@ -1854,12 +1867,12 @@ end;
 
 function RepairWorkerBudget: Integer;
 var
-  Transaction : TWorkerStateTransaction;
-  Entries : TWorkerBudgetEntryArray;
+  Transaction : TLWPTWorkerStateTransaction;
+  Entries : TLWPTWorkerBudgetEntryArray;
   TmpRoot : string;
   LoadedReclaimed : Integer;
 begin
-  Transaction := TWorkerStateTransaction.Create;
+  Transaction := TLWPTWorkerStateTransaction.Create;
   try
     Entries := LoadEntriesWithReclaimed(LoadedReclaimed);
     Result := LoadedReclaimed + PruneEntries(Entries);
@@ -1871,7 +1884,7 @@ begin
 end;
 
 procedure AppendWorkerBudgetDiagnostics(AOutput: TStrings;
-  const ASnapshot: TWorkerBudgetSnapshot);
+  const ASnapshot: TLWPTWorkerBudgetSnapshot);
 var
   i : Integer;
   Age, HeartbeatAge : Int64;
