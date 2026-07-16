@@ -1,0 +1,5 @@
+schema = "lwpt-registry-signature-v1"
+algorithm = "ed25519"
+key_id = "ed25519:39f713d0a644253f04529421b9f51b9b08979d08295959c4f3990ee617f5139f"
+payload = "sha256:8ebb385ded5db76aae2a39ccab7a7c1b7f6fdd5e582581e5444eb9aa816b1e21"
+signature = "hex:5e4ca0d7871d2d5c5347ad85cd1672d4f0ba2b775fa9bc741d0f046ebae8776e3647c65bab1f09880f318fc23bcfe7bef5e192d20f003b727257bf40c758af05"

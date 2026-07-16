@@ -28,6 +28,9 @@ data, not credentials. No private key is included.
 
 The cases in `cases.toml` are normative. A conforming client accepts all
 `valid` entries and rejects each `invalid` entry with the named stable reason.
+The invalid-signature case preserves the canonical checkpoint and matching
+payload hash while corrupting only the Ed25519 signature, so conformance
+requires cryptographic signature verification rather than hash checks alone.
 
 The downgrade case is stateful: after accepting checkpoint sequence 2, serving
 the otherwise valid sequence-1 checkpoint must fail with
