@@ -492,16 +492,14 @@ begin
       almost always be present). }
     if FileExists(ResolveCfgFile(AMan)) then
       Args.Add('@' + ResolveCfgFile(AMan));
-    AddEnvUnitPathParameters(Args);
-    { manifest's own unit dirs — both as unit (-Fu) and include
-      (-Fi) search paths. .inc files conventionally live next to
-      .pas units, so the same dir serves both. }
-    for i := 0 to High(AMan.Units) do
-      if AMan.Units[i] <> '' then
-      begin
-        Args.Add('-Fu' + AMan.Units[i]);
-        Args.Add('-Fi' + AMan.Units[i]);
-      end;
+    { Adapt the neutral request's distinct search-path collections to FPC.
+      Environment-provided paths were appended to both collections above. }
+    for i := 0 to High(Request.BuildRequest.Inputs.UnitPaths) do
+      if Request.BuildRequest.Inputs.UnitPaths[i] <> '' then
+        Args.Add('-Fu' + Request.BuildRequest.Inputs.UnitPaths[i]);
+    for i := 0 to High(Request.BuildRequest.Inputs.IncludePaths) do
+      if Request.BuildRequest.Inputs.IncludePaths[i] <> '' then
+        Args.Add('-Fi' + Request.BuildRequest.Inputs.IncludePaths[i]);
     AddBuildModeFlags(Args, ARelease);
     { -B forces a full rebuild, ignoring up-to-date units. Release mode
       already adds -B; only add it here for a clean dev build. }
