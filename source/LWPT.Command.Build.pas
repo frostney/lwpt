@@ -586,8 +586,10 @@ var
   Compiled: TLWPTCompiledTarget;
   Pending: TLWPTCompiledTargetArray;
   PublicationRequest: TLWPTBuildPublicationRequest;
+  PublicationResult: TLWPTBuildPublicationResult;
   WholePostBuild: THookArray;
   HookEnvironment: array of string;
+  CurrentCompilerVersion: string;
 begin
   if not FileExists(AManifestPath) then
     raise EManifestError.CreateFmt(
@@ -691,13 +693,16 @@ begin
       for i := 0 to High(Pending) do
       begin
         PublicationRequest := Pending[i].Request;
-        PublicationRequest.BuildRequest.Compiler.VersionIdentity :=
-          QueryFPCVersion;
-        if PublishBuildArtifact(Pending[i].ProjectRoot,
-          Pending[i].CandidateBin, Pending[i].OutBin,
-          Pending[i].Fingerprint, AManifestPath, Pending[i].CfgPath,
-          LOCKFILE, Pending[i].ModulesPath,
-          PublicationRequest) = bprStale then
+        CurrentCompilerVersion := QueryFPCVersion;
+        if CurrentCompilerVersion
+          <> PublicationRequest.BuildRequest.Compiler.VersionIdentity then
+          PublicationResult := bprStale
+        else
+          PublicationResult := PublishBuildArtifact(Pending[i].ProjectRoot,
+            Pending[i].CandidateBin, Pending[i].OutBin,
+            Pending[i].Fingerprint, AManifestPath, Pending[i].CfgPath,
+            LOCKFILE, Pending[i].ModulesPath, PublicationRequest);
+        if PublicationResult = bprStale then
         begin
           Inc(Failed);
           WriteLn(ErrOutput, 'STALE (inputs changed during compilation; ',
