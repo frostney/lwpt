@@ -124,11 +124,23 @@ Defer to `project-structure` for changelog tooling (git-cliff by default) and co
     Release from the committed changelog, and runs the install smoke test.
     Never run `gh release create` for LWPT: publication and release artifacts
     are CI-owned.
-    - Set `TAG_COMMIT=$(git rev-list -n 1 "$VERSION")`, then find the
-      tag-triggered run with
-      `gh run list --workflow release.yml --commit "$TAG_COMMIT"`.
-    - Wait for the `build` jobs to pass, approve the `release` environment when
-      prompted, then require both `publish` and `install-smoke` to succeed.
+    - Resolve the tag commit and capture the matching tag-triggered run:
+
+      ```bash
+      TAG_COMMIT=$(git rev-list -n 1 "$VERSION")
+      RUN_ID=$(gh run list --workflow release.yml --commit "$TAG_COMMIT" \
+        --event push --limit 1 --json databaseId \
+        --jq '.[0].databaseId // empty')
+      if [ -z "$RUN_ID" ]; then
+        echo "No release.yml run found for $VERSION ($TAG_COMMIT)" >&2
+        exit 1
+      fi
+      ```
+
+    - Watch that exact run with `gh run watch "$RUN_ID" --exit-status`. Wait
+      for the `build` jobs to pass, approve the `release` environment when
+      prompted, and do not proceed unless both `publish` and `install-smoke`
+      succeed.
     - Retrieve the published URL with
       `gh release view "$VERSION" --json url --jq .url`.
 
