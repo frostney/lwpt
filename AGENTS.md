@@ -83,6 +83,7 @@ Unit-naming, formatter rules, vendored exclusion policy, and line-ending convent
 | Format the codebase | `./build/lwpt format` |
 | Check formatting (CI) | `./build/lwpt format --check` |
 | Run all tests | `./build/lwpt test` |
+| Bound test concurrency / stop at first failure | `./build/lwpt test --jobs=4 --bail=1` |
 | Run live-network + CLI-subprocess tests too | `./build/lwpt test --tier=e2e` |
 | Run E2E tier offline (skip live-network tests) | `LWPT_SKIP_NETWORK=1 ./build/lwpt test --tier=e2e` |
 | Add a new dependency | `./build/lwpt add <source[@version]>` (or edit `lwpt.toml`, then `./build/lwpt install`) |

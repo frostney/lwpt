@@ -96,8 +96,12 @@ function IsNetworkUnavailable(const AResult: TLwptResult): Boolean;
 
 implementation
 
+uses
+  LWPT.WorkerBudget;
+
 var
   GLwptBinaryPath: string = '';
+  GForwardWorkerLease: Boolean = True;
 
 function LwptBinaryPath: string;
 begin
@@ -200,6 +204,7 @@ var
   P: TProcess;
   i: Integer;
   SavedDir: string;
+  ForwardedWorkerLease: Boolean;
 begin
   Result.ExitCode := -1;
   Result.Stdout   := '';
@@ -212,23 +217,20 @@ begin
     P.Options := [poUsePipes];
     if AInDir <> '' then P.CurrentDirectory := AInDir;
 
-    { Environment: TProcess inherits the parent env when P.Environment
-      is empty. To add extras, we have to copy the parent env first
-      and then add ours — SKIPPING any parent entry an override
-      redefines. Duplicate names in the child's env block resolve to
-      the FIRST occurrence on every platform, so appending alone lets
-      the parent's value silently win: the CI Windows runners export
-      LWPT_FPC for the whole job, which made the missing-compiler
-      test's LWPT_FPC override a no-op there (real fpc found, build
-      succeeded, test red on Windows only). }
-    if Length(AExtraEnv) > 0 then
-    begin
-      for i := 1 to GetEnvironmentVariableCount do
-        if not EnvEntryOverridden(GetEnvironmentString(i), AExtraEnv) then
-          P.Environment.Add(GetEnvironmentString(i));
-      for i := 0 to High(AExtraEnv) do
-        P.Environment.Add(AExtraEnv[i]);
-    end;
+    { Always materialise the child environment so a consumed one-shot worker
+      token can be omitted from later LWPT children without mutating this test
+      process's own environment. Extras replace matching parent entries. }
+    ForwardedWorkerLease := GForwardWorkerLease
+      and (GetEnvironmentVariable(WORKER_LEASE_TOKEN_ENV) <> '')
+      and not EnvEntryOverridden(WORKER_LEASE_TOKEN_ENV + '=', AExtraEnv);
+    for i := 1 to GetEnvironmentVariableCount do
+      if not EnvEntryOverridden(GetEnvironmentString(i), AExtraEnv)
+         and (GForwardWorkerLease
+           or not SameText(EnvEntryName(GetEnvironmentString(i)),
+             WORKER_LEASE_TOKEN_ENV)) then
+        P.Environment.Add(GetEnvironmentString(i));
+    for i := 0 to High(AExtraEnv) do
+      P.Environment.Add(AExtraEnv[i]);
 
     { Run + drain. We do NOT use poWaitOnExit with poUsePipes; on
       Linux+macOS that pair can deadlock when the child blocks
@@ -255,6 +257,17 @@ begin
         waitpid(2) status word on Unix and the GetExitCodeProcess
         return on Windows. ExitCode is normalised across both. }
       Result.ExitCode := P.ExitCode;
+      { A test process may invoke LWPT more than once. Once a nested build or
+        test scheduler starts, it has consumed the one-shot worker delegation;
+        stop forwarding that stale token so the next command can join the
+        worker queue normally. Validation failures before scheduler creation
+        deliberately leave the still-live delegation available. }
+      if ForwardedWorkerLease
+         and (((Length(AArgs) > 0) and SameText(AArgs[0], 'build')
+           and (Pos('build jobs:', Result.Stdout) > 0))
+         or ((Length(AArgs) > 0) and SameText(AArgs[0], 'test')
+           and (Pos('discovered ', Result.Stdout) > 0))) then
+        GForwardWorkerLease := False;
     finally
       SetCurrentDir(SavedDir);
     end;

@@ -7,6 +7,7 @@ uses
   Process,
   SysUtils,
 
+  LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -23,6 +24,9 @@ type
       const AExtraEnv: array of string): TProcess;
     function StartBuildWithArgs(const AProject: string;
       const AArgs, AExtraEnv: array of string): TProcess;
+    function RunLwptWithWorkerEnv(const AArgs: array of string;
+      const AProject: string;
+      const AExtraEnv: array of string): TLwptResult;
     procedure WriteGraphProject(const AProject: string);
     procedure WriteAppSource(AChanged: Boolean);
   protected
@@ -66,6 +70,11 @@ var
   i: Integer;
   Body: string;
 begin
+  { This suite is an orchestrator: its tests start multiple LWPT processes
+    and account those children independently. Keep the scheduler's worker
+    reservation on the suite process, but do not forward its one-shot token
+    to more than one child. }
+  ClearWorkerLeaseEnvironment;
   FScratch := ExpandFileName('build/tests/tmp/build-sessions');
   RecursiveDelete(FScratch);
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
@@ -222,6 +231,14 @@ begin
   Result := False;
 end;
 
+function IsWorkerEnvironment(const AEntry: string): Boolean;
+begin
+  Result := SameText(EnvName(AEntry), WORKER_STATE_DIR_ENV)
+         or SameText(EnvName(AEntry), WORKER_BUDGET_ENV)
+         or SameText(EnvName(AEntry), WORKER_STALE_SECONDS_ENV)
+         or SameText(EnvName(AEntry), WORKER_LEASE_TOKEN_ENV);
+end;
+
 function TBuildSessions.StartBuildWithEnv(
   const AProject, ATarget: string;
   const AExtraEnv: array of string): TProcess;
@@ -239,15 +256,30 @@ begin
   for i := 0 to High(AArgs) do Result.Parameters.Add(AArgs[i]);
   Result.CurrentDirectory := AProject;
   Result.Options := [];
-  if Length(AExtraEnv) > 0 then
-  begin
-    for i := 1 to GetEnvironmentVariableCount do
-      if not EnvOverridden(GetEnvironmentString(i), AExtraEnv) then
-        Result.Environment.Add(GetEnvironmentString(i));
-    for i := 0 to High(AExtraEnv) do
-      Result.Environment.Add(AExtraEnv[i]);
-  end;
+  for i := 1 to GetEnvironmentVariableCount do
+    if not IsWorkerEnvironment(GetEnvironmentString(i))
+       and not EnvOverridden(GetEnvironmentString(i), AExtraEnv) then
+      Result.Environment.Add(GetEnvironmentString(i));
+  Result.Environment.Add(WORKER_STATE_DIR_ENV + '='
+    + FScratch + '/worker-state');
+  Result.Environment.Add(WORKER_BUDGET_ENV + '=4');
+  for i := 0 to High(AExtraEnv) do
+    Result.Environment.Add(AExtraEnv[i]);
   Result.Execute;
+end;
+
+function TBuildSessions.RunLwptWithWorkerEnv(
+  const AArgs: array of string; const AProject: string;
+  const AExtraEnv: array of string): TLwptResult;
+var
+  Env: array of string;
+  i: Integer;
+begin
+  SetLength(Env, Length(AExtraEnv) + 2);
+  Env[0] := WORKER_STATE_DIR_ENV + '=' + FScratch + '/worker-state';
+  Env[1] := WORKER_BUDGET_ENV + '=4';
+  for i := 0 to High(AExtraEnv) do Env[i + 2] := AExtraEnv[i];
+  Result := RunLwpt(AArgs, AProject, Env);
 end;
 
 procedure TBuildSessions.WriteGraphProject(const AProject: string);
@@ -327,7 +359,7 @@ begin
       .ToBe(True);
     Expect<Integer>(RunProgram(ExpectedExe(FScratch + '/build/app')))
       .ToBe(0);
-    RepairResult := RunLwpt(['repair'], FScratch);
+    RepairResult := RunLwptWithWorkerEnv(['repair'], FScratch, []);
     Expect<Integer>(RepairResult.ExitCode).ToBe(0);
     Expect<Integer>(CountSessionDirs).ToBe(0);
   finally
@@ -416,11 +448,11 @@ var
   BeforeContent, AfterContent: string;
   R: TLwptResult;
 begin
-  R := RunLwpt(['build', 'app'], FScratch);
+  R := RunLwptWithWorkerEnv(['build', 'app'], FScratch, []);
   Expect<Integer>(R.ExitCode).ToBe(0);
   BeforeContent := ReadBinaryFile(ExpectedExe(FScratch + '/build/app'));
 
-  R := RunLwpt(['build', '--clean', 'app'], FScratch,
+  R := RunLwptWithWorkerEnv(['build', '--clean', 'app'], FScratch,
     ['LWPT_FPC=' + FScratch + '/missing-fpc']);
 
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
@@ -471,7 +503,7 @@ begin
       'program app;'#10
     + 'uses WorkspaceUnit;'#10
     + 'begin if Value <> 2 then Halt(1); end.'#10);
-  InstallResult := RunLwpt(['install'], Project);
+  InstallResult := RunLwptWithWorkerEnv(['install'], Project, []);
   Expect<Integer>(InstallResult.ExitCode).ToBe(0);
 
   RealFPC := TestCompilerExecutable;
@@ -513,7 +545,7 @@ begin
     Expect<Integer>(Build.ExitStatus).ToBe(1);
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/app')))
       .ToBe(False);
-    RepairResult := RunLwpt(['repair'], Project);
+    RepairResult := RunLwptWithWorkerEnv(['repair'], Project, []);
     Expect<Integer>(RepairResult.ExitCode).ToBe(0);
   finally
     WriteTextFile(ReleasePath, 'release');
@@ -568,7 +600,7 @@ begin
     Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app')))
       .ToBe(False);
     Expect<Integer>(CountSessionDirs).ToBe(1);
-    RepairResult := RunLwpt(['repair'], FScratch);
+    RepairResult := RunLwptWithWorkerEnv(['repair'], FScratch, []);
     Expect<Integer>(RepairResult.ExitCode).ToBe(0);
     Expect<Integer>(CountSessionDirs).ToBe(0);
   finally
@@ -731,7 +763,7 @@ begin
   Env[6] := 'LWPT_WORKER_STATE_DIR=' + Project + '/worker-state';
   Env[7] := 'LWPT_WORKER_BUDGET=4';
   try
-    R := RunLwpt(['build'], Project, Env);
+    R := RunLwptWithWorkerEnv(['build'], Project, Env);
     Expect<Integer>(R.ExitCode).ToBe(1);
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/beta')))
       .ToBe(True);

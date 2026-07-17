@@ -108,6 +108,7 @@ procedure AppendWorkerBudgetDiagnostics(AOutput: TStrings;
   const ASnapshot: TLWPTWorkerBudgetSnapshot);
 procedure AppendWorkerLeaseEnvironment(AEnvironment: TStrings;
   ALease: TLWPTWorkerLease);
+procedure ClearWorkerLeaseEnvironment;
 
 implementation
 
@@ -1715,6 +1716,15 @@ begin
       Removed := (FLeases <> nil) and (FLeases.Remove(ALease) >= 0);
       if Removed and LocallyGranted and (FLocalGranted > 0) then
         Dec(FLocalGranted);
+      if Removed and FInherited
+         and (ALease.FToken = FInheritedToken) then
+      begin
+        { The transferred grant has now completed. Further work in this
+          still-live nested invocation must rejoin the ordinary FIFO rather
+          than trying to reuse the consumed one-shot token. }
+        FInherited := False;
+        FInheritedToken := '';
+      end;
     finally
       LeaveCriticalSection(FLocalCriticalSection);
     end;

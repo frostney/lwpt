@@ -4,8 +4,9 @@ description: >-
   Cuts a release so the tag always contains its own changelog: computes the next
   version from the conventional commits, writes the changelog and bumps the
   version on a release branch, opens a release pull request, and only after it is
-  squash-merged tags the merge commit and publishes the GitHub release — never a
-  changelog pull request that lands after the tag and isn't in the release. Uses
+  squash-merged tags the merge commit and waits for CI to publish the GitHub
+  release — never a changelog pull request that lands after the tag and isn't in
+  the release. Uses
   a version passed in by the user, or otherwise recommends one from the changes
   since the last release and asks the user to confirm before proceeding. Defaults
   to git-cliff for changelog generation but works with any changelog tool or a
@@ -117,14 +118,43 @@ Defer to `project-structure` for changelog tooling (git-cliff by default) and co
     git push origin "$VERSION"
     ```
 
-12. **Publish the GitHub release** from the tag, with notes from the changelog. With git-cliff: `gh release create "$VERSION" --title "$VERSION" --notes "$(git cliff --latest)"`. Otherwise pass the extracted section via `--notes-file`. Add `--prerelease` for an `-rc`/`-beta` version or `--draft` to stage it first. Attach build artifacts when the project produces them (defer to the deployment docs).
+12. **Wait for CI to publish the GitHub release.** The tag push triggers
+    `.github/workflows/release.yml`, which builds and packages every supported
+    target, pauses at the protected `release` environment, creates the GitHub
+    Release from the committed changelog, and runs the install smoke test.
+    Never run `gh release create` for LWPT: publication and release artifacts
+    are CI-owned.
+    - Resolve the tag commit and capture the matching tag-triggered run:
+
+      ```bash
+      TAG_COMMIT=$(git rev-list -n 1 "$VERSION")
+      RUN_ID=$(gh run list --workflow release.yml --commit "$TAG_COMMIT" \
+        --event push --limit 1 --json databaseId \
+        --jq '.[0].databaseId // empty')
+      if [ -z "$RUN_ID" ]; then
+        echo "No release.yml run found for $VERSION ($TAG_COMMIT)" >&2
+        exit 1
+      fi
+      ```
+
+    - Watch that exact run with `gh run watch "$RUN_ID" --exit-status`. Wait
+      for the `build` jobs to pass, approve the `release` environment when
+      prompted, and do not proceed unless both `publish` and `install-smoke`
+      succeed.
+    - Retrieve the published URL with
+      `gh release view "$VERSION" --json url --jq .url`.
 
 13. **Report:** the version, the tag and the commit SHA it points at, the release PR URL, the GitHub release URL, and confirmation that the tagged commit contains the changelog.
 
 ### Notes
 
-- **Prerelease / draft.** Compute or pass a prerelease version (e.g. `v1.2.0-rc.1`) and pair it with `gh release create --prerelease`/`--draft`.
+- **Prerelease.** Use a prerelease version such as `1.2.0-rc.1`; the
+  tag-triggered workflow detects the suffix and marks the GitHub Release as a
+  prerelease.
 - **Tag-derived versions.** When the version comes from the tag (Go modules, setuptools-scm, etc.), skip the manifest bump in step 6; the release commit carries only the changelog and the ordering invariant still holds.
 - **Monorepo / multiple manifests.** Bump every manifest that declares the version in step 6, and scope the changelog tool (tag pattern, include paths) to the package being released.
 - **Signed tags.** Use `git tag -s` instead of `-a` when the project requires signed release tags.
-- **Optional CI publish.** A tag-triggered workflow that only publishes the GitHub release from the pushed tag (reading the latest changelog section) is fine. It must *not* generate or commit the changelog — that already happened before the tag in steps 5–9, which is what keeps the release self-contained.
+- **CI publication is mandatory for LWPT.** The tag-triggered workflow publishes
+  the GitHub Release from the pushed tag and must not generate or commit the
+  changelog — that already happened before the tag in steps 5–9, which keeps
+  the release self-contained.
