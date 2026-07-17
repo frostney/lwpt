@@ -96,9 +96,6 @@ function IsNetworkUnavailable(const AResult: TLwptResult): Boolean;
 
 implementation
 
-uses
-  LWPT.WorkerBudget;
-
 var
   GLwptBinaryPath: string = '';
   GForwardWorkerLease: Boolean = True;
@@ -189,6 +186,28 @@ begin
   Result := False;
 end;
 
+{ Discover the one-shot worker token by its protocol suffix so this shared
+  subprocess helper stays link-safe for E2E programs. The owning LWPT binary
+  remains the only source of the project-prefixed environment name. }
+function FindWorkerLeaseTokenEnvironment: string;
+const
+  TOKEN_SUFFIX = '_WORKER_LEASE_TOKEN';
+var
+  i: Integer;
+  Name: string;
+begin
+  Result := '';
+  for i := 1 to GetEnvironmentVariableCount do
+  begin
+    Name := EnvEntryName(GetEnvironmentString(i));
+    if (Length(Name) >= Length(TOKEN_SUFFIX))
+       and SameText(Copy(Name, Length(Name) - Length(TOKEN_SUFFIX) + 1,
+         Length(TOKEN_SUFFIX)), TOKEN_SUFFIX)
+       and (GetEnvironmentVariable(Name) <> '') then
+      Exit(Name);
+  end;
+end;
+
 function RunLwpt(const AArgs: array of string;
   const AInDir: string): TLwptResult;
 var Empty: array of string;
@@ -204,6 +223,7 @@ var
   P: TProcess;
   i: Integer;
   SavedDir: string;
+  WorkerLeaseTokenEnvironment: string;
   ForwardedWorkerLease: Boolean;
 begin
   Result.ExitCode := -1;
@@ -220,14 +240,17 @@ begin
     { Always materialise the child environment so a consumed one-shot worker
       token can be omitted from later LWPT children without mutating this test
       process's own environment. Extras replace matching parent entries. }
+    WorkerLeaseTokenEnvironment := FindWorkerLeaseTokenEnvironment;
     ForwardedWorkerLease := GForwardWorkerLease
-      and (GetEnvironmentVariable(WORKER_LEASE_TOKEN_ENV) <> '')
-      and not EnvEntryOverridden(WORKER_LEASE_TOKEN_ENV + '=', AExtraEnv);
+      and (WorkerLeaseTokenEnvironment <> '')
+      and not EnvEntryOverridden(
+        WorkerLeaseTokenEnvironment + '=', AExtraEnv);
     for i := 1 to GetEnvironmentVariableCount do
       if not EnvEntryOverridden(GetEnvironmentString(i), AExtraEnv)
          and (GForwardWorkerLease
+           or (WorkerLeaseTokenEnvironment = '')
            or not SameText(EnvEntryName(GetEnvironmentString(i)),
-             WORKER_LEASE_TOKEN_ENV)) then
+             WorkerLeaseTokenEnvironment)) then
         P.Environment.Add(GetEnvironmentString(i));
     for i := 0 to High(AExtraEnv) do
       P.Environment.Add(AExtraEnv[i]);

@@ -55,6 +55,7 @@ type
     procedure TestUnknownSourceKindRejected;
     procedure TestMissingManifestRejected;
     procedure TestBuildTargetTraversalNameRootOnly;
+    procedure TestBuildDependsMustBeStringArray;
   end;
 
   TLoadManifestExtensions = class(TTestSuite)
@@ -623,6 +624,32 @@ begin
   Expect<Integer>(Length(Man.Targets)).ToBe(1);
 end;
 
+procedure TLoadManifestValidation.TestBuildDependsMustBeStringArray;
+const
+  SINGLE_ENTRY =
+    '[package]'#10 +
+    'name = "single"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'source = "src/single.pas"'#10 +
+    'depends = "base"'#10;
+  NAMED_ENTRY =
+    '[package]'#10 +
+    'name = "named"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'app = { source = "src/app.pas", depends = ["base", 1] }'#10;
+begin
+  ExpectManifestLoadError(
+    WriteManifest('single-build-depends', SINGLE_ENTRY),
+    'build.depends must be an array of strings', Self);
+  ExpectManifestLoadError(
+    WriteManifest('named-build-depends', NAMED_ENTRY),
+    'build.app.depends[1] must be a string', Self);
+end;
+
 procedure TLoadManifestValidation.SetupTests;
 begin
   Test('bare-string dep shorthand rejected (ADR-0004 migration)',
@@ -634,6 +661,8 @@ begin
   Test('missing manifest path rejected',    TestMissingManifestRejected);
   Test('traversal [build] name rejected for root, tolerated for deps',
     TestBuildTargetTraversalNameRootOnly);
+  Test('[build] depends requires only string array values',
+    TestBuildDependsMustBeStringArray);
 end;
 
 { ── TLoadManifestExtensions ───────────────────────────────────────── }

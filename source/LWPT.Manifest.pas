@@ -652,6 +652,29 @@ begin
   end;
 end;
 
+{ Build dependencies affect scheduler correctness, so malformed values must
+  fail instead of silently dropping graph edges. }
+procedure ReadStrictStringArray(ANode: TTOMLNode; const AKey, APath: string;
+  var ATarget: TStringArray);
+var
+  ArrNode: TTOMLNode;
+  i: Integer;
+begin
+  SetLength(ATarget, 0);
+  ArrNode := TomlGet(ANode, AKey);
+  if ArrNode = nil then Exit;
+  if not TomlIsArray(ArrNode) then
+    raise EManifestError.CreateFmt('%s must be an array of strings', [APath]);
+  SetLength(ATarget, ArrNode.Items.Count);
+  for i := 0 to ArrNode.Items.Count - 1 do
+  begin
+    if not TomlIsString(ArrNode.Items[i]) then
+      raise EManifestError.CreateFmt(
+        '%s[%d] must be a string', [APath, i]);
+    ATarget[i] := ArrNode.Items[i].ScalarText;
+  end;
+end;
+
 function HasAnyKey(ANode: TTOMLNode; const AKeys: array of string): string;
 var i: Integer;
 begin
@@ -1475,15 +1498,8 @@ begin
         if AIsRoot then ValidateTargetName(T.Name);
         T.Source := TomlStr(TgtsNode, 'source', '');
         T.Output := TomlStr(TgtsNode, 'output', '');
-        ArrNode := TomlGet(TgtsNode, 'depends');
-        if TomlIsArray(ArrNode) then
-          for i := 0 to ArrNode.Items.Count - 1 do
-            if TomlIsString(ArrNode.Items[i]) then
-            begin
-              n := Length(T.Depends);
-              SetLength(T.Depends, n + 1);
-              T.Depends[n] := ArrNode.Items[i].ScalarText;
-            end;
+        ReadStrictStringArray(TgtsNode, 'depends', 'build.depends',
+          T.Depends);
         if T.Output = '' then T.Output := 'build/' + Result.Name;
         ParseHookSection(TomlGet(TgtsNode, 'prebuild'),
           'build.prebuild', T.PreBuild);
@@ -1505,15 +1521,8 @@ begin
           begin
             T.Source := TomlStr(TgtNode, 'source', '');
             T.Output := TomlStr(TgtNode, 'output', '');
-            ArrNode := TomlGet(TgtNode, 'depends');
-            if TomlIsArray(ArrNode) then
-              for i := 0 to ArrNode.Items.Count - 1 do
-                if TomlIsString(ArrNode.Items[i]) then
-                begin
-                  n := Length(T.Depends);
-                  SetLength(T.Depends, n + 1);
-                  T.Depends[n] := ArrNode.Items[i].ScalarText;
-                end;
+            ReadStrictStringArray(TgtNode, 'depends',
+              'build.' + T.Name + '.depends', T.Depends);
             ParseHookSection(TomlGet(TgtNode, 'prebuild'),
               'build.' + T.Name + '.prebuild', T.PreBuild);
             ParseHookSection(TomlGet(TgtNode, 'postbuild'),

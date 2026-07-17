@@ -48,6 +48,11 @@ uses
   LWPT.WorkerBudget,
   Platform;
 
+const
+  BUILD_TARGET_ENV = PROJECT_NAME + '_BUILD_TARGET';
+  BUILD_OUTPUT_ENV = PROJECT_NAME + '_BUILD_OUTPUT';
+  BUILD_PUBLIC_OUTPUT_ENV = PROJECT_NAME + '_BUILD_PUBLIC_OUTPUT';
+
 type
   TLWPTCompiledTarget = record
     Name: string;
@@ -899,10 +904,10 @@ var
   procedure RunTargetPostBuild(AIndex: Integer);
   begin
     SetLength(HookEnvironment, 3);
-    HookEnvironment[0] := 'LWPT_BUILD_TARGET=' + Compiled[AIndex].Name;
-    HookEnvironment[1] := 'LWPT_BUILD_OUTPUT='
+    HookEnvironment[0] := BUILD_TARGET_ENV + '=' + Compiled[AIndex].Name;
+    HookEnvironment[1] := BUILD_OUTPUT_ENV + '='
       + Compiled[AIndex].CandidateBin;
-    HookEnvironment[2] := 'LWPT_BUILD_PUBLIC_OUTPUT='
+    HookEnvironment[2] := BUILD_PUBLIC_OUTPUT_ENV + '='
       + Compiled[AIndex].OutBin;
     RunHooksWithEnvironment('postbuild:' + Man.Targets[AIndex].Name,
       Compiled[AIndex].PostBuild, Session.HookRoot, HookEnvironment);

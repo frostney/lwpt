@@ -4,13 +4,24 @@ program BuildSessions.Test;
 {$mode delphi}{$H+}
 
 uses
+  Classes,
   Process,
   SysUtils,
 
+  LWPT.Core,
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
+
+const
+  FPC_ENV = PROJECT_NAME + '_FPC';
+  TEST_FPC_PROXY_ENV = PROJECT_NAME + '_TEST_FPC_PROXY';
+  TEST_REAL_FPC_ENV = PROJECT_NAME + '_TEST_REAL_FPC';
+  TEST_FPC_READY_DIR_ENV = PROJECT_NAME + '_TEST_FPC_READY_DIR';
+  TEST_FPC_RELEASE_ENV = PROJECT_NAME + '_TEST_FPC_RELEASE';
+  TEST_FPC_RELEASE_DIR_ENV = PROJECT_NAME + '_TEST_FPC_RELEASE_DIR';
+  TEST_FPC_FAIL_TARGET_ENV = PROJECT_NAME + '_TEST_FPC_FAIL_TARGET';
 
 type
   TBuildSessions = class(TTestSuite)
@@ -216,19 +227,49 @@ begin
   else Result := Copy(AEntry, 1, EqualsAt - 1);
 end;
 
+function SameEnvName(const ALeft, ARight: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := SameText(EnvName(ALeft), EnvName(ARight));
+  {$ELSE}
+  Result := EnvName(ALeft) = EnvName(ARight);
+  {$ENDIF}
+end;
+
 function EnvOverridden(const AEntry: string;
   const AOverrides: array of string): Boolean;
 var
   i: Integer;
 begin
   for i := 0 to High(AOverrides) do
-    {$IFDEF MSWINDOWS}
-    if SameText(EnvName(AEntry), EnvName(AOverrides[i])) then
-    {$ELSE}
-    if EnvName(AEntry) = EnvName(AOverrides[i]) then
-    {$ENDIF}
+    if SameEnvName(AEntry, AOverrides[i]) then
       Exit(True);
   Result := False;
+end;
+
+procedure SetProcessEnv(AEnvironment: TStrings; const AEntry: string);
+var
+  i: Integer;
+begin
+  for i := AEnvironment.Count - 1 downto 0 do
+    if SameEnvName(AEnvironment[i], AEntry) then
+      AEnvironment.Delete(i);
+  AEnvironment.Add(AEntry);
+end;
+
+procedure SetEnv(var AEnvironment: TStringArray; const AEntry: string);
+var
+  i: Integer;
+begin
+  for i := 0 to High(AEnvironment) do
+    if SameEnvName(AEnvironment[i], AEntry) then
+    begin
+      AEnvironment[i] := AEntry;
+      Exit;
+    end;
+  i := Length(AEnvironment);
+  SetLength(AEnvironment, i + 1);
+  AEnvironment[i] := AEntry;
 end;
 
 function IsWorkerEnvironment(const AEntry: string): Boolean;
@@ -260,11 +301,11 @@ begin
     if not IsWorkerEnvironment(GetEnvironmentString(i))
        and not EnvOverridden(GetEnvironmentString(i), AExtraEnv) then
       Result.Environment.Add(GetEnvironmentString(i));
-  Result.Environment.Add(WORKER_STATE_DIR_ENV + '='
+  SetProcessEnv(Result.Environment, WORKER_STATE_DIR_ENV + '='
     + FScratch + '/worker-state');
-  Result.Environment.Add(WORKER_BUDGET_ENV + '=4');
+  SetProcessEnv(Result.Environment, WORKER_BUDGET_ENV + '=4');
   for i := 0 to High(AExtraEnv) do
-    Result.Environment.Add(AExtraEnv[i]);
+    SetProcessEnv(Result.Environment, AExtraEnv[i]);
   Result.Execute;
 end;
 
@@ -272,13 +313,13 @@ function TBuildSessions.RunLwptWithWorkerEnv(
   const AArgs: array of string; const AProject: string;
   const AExtraEnv: array of string): TLwptResult;
 var
-  Env: array of string;
+  Env: TStringArray;
   i: Integer;
 begin
-  SetLength(Env, Length(AExtraEnv) + 2);
-  Env[0] := WORKER_STATE_DIR_ENV + '=' + FScratch + '/worker-state';
-  Env[1] := WORKER_BUDGET_ENV + '=4';
-  for i := 0 to High(AExtraEnv) do Env[i + 2] := AExtraEnv[i];
+  SetLength(Env, 0);
+  SetEnv(Env, WORKER_STATE_DIR_ENV + '=' + FScratch + '/worker-state');
+  SetEnv(Env, WORKER_BUDGET_ENV + '=4');
+  for i := 0 to High(AExtraEnv) do SetEnv(Env, AExtraEnv[i]);
   Result := RunLwpt(AArgs, AProject, Env);
 end;
 
@@ -320,14 +361,14 @@ begin
   RecursiveDelete(FScratch + '/control');
   RealFPC := TestCompilerExecutable;
   SetLength(Env, 7);
-  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
-  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
-  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
-  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
-  Env[4] := 'LWPT_TEST_FPC_RELEASE=' + ReleasePath;
-  Env[5] := 'LWPT_WORKER_STATE_DIR=' + FScratch
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  Env[4] := TEST_FPC_RELEASE_ENV + '=' + ReleasePath;
+  Env[5] := WORKER_STATE_DIR_ENV + '=' + FScratch
     + '/control/concurrent-worker-state';
-  Env[6] := 'LWPT_WORKER_BUDGET=2';
+  Env[6] := WORKER_BUDGET_ENV + '=2';
   First := StartBuildWithEnv(FScratch, 'app', Env);
   Second := StartBuildWithEnv(FScratch, 'app', Env);
   try
@@ -397,14 +438,14 @@ begin
     'program second; begin end.'#10);
   RealFPC := TestCompilerExecutable;
   SetLength(Env, 7);
-  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
-  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
-  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
-  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
-  Env[4] := 'LWPT_TEST_FPC_RELEASE=' + ReleasePath;
-  Env[5] := 'LWPT_WORKER_STATE_DIR=' + FScratch
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  Env[4] := TEST_FPC_RELEASE_ENV + '=' + ReleasePath;
+  Env[5] := WORKER_STATE_DIR_ENV + '=' + FScratch
     + '/control/distinct-worker-state';
-  Env[6] := 'LWPT_WORKER_BUDGET=2';
+  Env[6] := WORKER_BUDGET_ENV + '=2';
   First := StartBuildWithEnv(Project, 'first', Env);
   Second := StartBuildWithEnv(Project, 'second', Env);
   try
@@ -453,7 +494,7 @@ begin
   BeforeContent := ReadBinaryFile(ExpectedExe(FScratch + '/build/app'));
 
   R := RunLwptWithWorkerEnv(['build', '--clean', 'app'], FScratch,
-    ['LWPT_FPC=' + FScratch + '/missing-fpc']);
+    [FPC_ENV + '=' + FScratch + '/missing-fpc']);
 
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   AfterContent := ReadBinaryFile(ExpectedExe(FScratch + '/build/app'));
@@ -508,11 +549,11 @@ begin
 
   RealFPC := TestCompilerExecutable;
   SetLength(Env, 5);
-  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
-  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
-  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
-  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
-  Env[4] := 'LWPT_TEST_FPC_RELEASE=' + ReleasePath;
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  Env[4] := TEST_FPC_RELEASE_ENV + '=' + ReleasePath;
   Build := StartBuildWithEnv(Project, 'app', Env);
   try
     Ready := False;
@@ -572,11 +613,11 @@ begin
   ReleasePath := FScratch + '/control/stale-release';
   RealFPC := TestCompilerExecutable;
   SetLength(Env, 5);
-  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
-  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
-  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
-  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
-  Env[4] := 'LWPT_TEST_FPC_RELEASE=' + ReleasePath;
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  Env[4] := TEST_FPC_RELEASE_ENV + '=' + ReleasePath;
   Build := StartBuildWithEnv(FScratch, 'app', Env);
   try
     Ready := False;
@@ -624,13 +665,13 @@ begin
   WriteGraphProject(Project);
   RealFPC := TestCompilerExecutable;
   SetLength(Env, 7);
-  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
-  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
-  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
-  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
-  Env[4] := 'LWPT_TEST_FPC_RELEASE_DIR=' + ReleaseDir;
-  Env[5] := 'LWPT_WORKER_STATE_DIR=' + Project + '/worker-state';
-  Env[6] := 'LWPT_WORKER_BUDGET=4';
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  Env[4] := TEST_FPC_RELEASE_DIR_ENV + '=' + ReleaseDir;
+  Env[5] := WORKER_STATE_DIR_ENV + '=' + Project + '/worker-state';
+  Env[6] := WORKER_BUDGET_ENV + '=4';
   Build := StartBuildWithArgs(Project, ['build', 'app'], Env);
   try
     Started := Now;
@@ -690,13 +731,13 @@ begin
   WriteGraphProject(Project);
   RealFPC := TestCompilerExecutable;
   SetLength(Env, 7);
-  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
-  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
-  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
-  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
-  Env[4] := 'LWPT_TEST_FPC_RELEASE_DIR=' + ReleaseDir;
-  Env[5] := 'LWPT_WORKER_STATE_DIR=' + Project + '/worker-state';
-  Env[6] := 'LWPT_WORKER_BUDGET=4';
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  Env[4] := TEST_FPC_RELEASE_DIR_ENV + '=' + ReleaseDir;
+  Env[5] := WORKER_STATE_DIR_ENV + '=' + Project + '/worker-state';
+  Env[6] := WORKER_BUDGET_ENV + '=4';
   Build := StartBuildWithArgs(Project,
     ['build', 'app', '--jobs=1'], Env);
   try
@@ -754,14 +795,14 @@ begin
   WriteTextFile(ReleaseDir + '/app', 'release');
   RealFPC := TestCompilerExecutable;
   SetLength(Env, 8);
-  Env[0] := 'LWPT_FPC=' + ExpandFileName(ParamStr(0));
-  Env[1] := 'LWPT_TEST_FPC_PROXY=1';
-  Env[2] := 'LWPT_TEST_REAL_FPC=' + RealFPC;
-  Env[3] := 'LWPT_TEST_FPC_READY_DIR=' + ReadyDir;
-  Env[4] := 'LWPT_TEST_FPC_RELEASE_DIR=' + ReleaseDir;
-  Env[5] := 'LWPT_TEST_FPC_FAIL_TARGET=alpha';
-  Env[6] := 'LWPT_WORKER_STATE_DIR=' + Project + '/worker-state';
-  Env[7] := 'LWPT_WORKER_BUDGET=4';
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  Env[4] := TEST_FPC_RELEASE_DIR_ENV + '=' + ReleaseDir;
+  Env[5] := TEST_FPC_FAIL_TARGET_ENV + '=alpha';
+  Env[6] := WORKER_STATE_DIR_ENV + '=' + Project + '/worker-state';
+  Env[7] := WORKER_BUDGET_ENV + '=4';
   try
     R := RunLwptWithWorkerEnv(['build'], Project, Env);
     Expect<Integer>(R.ExitCode).ToBe(1);
@@ -811,11 +852,11 @@ var
   Started: TDateTime;
   i: Integer;
 begin
-  Compiler := GetEnvironmentVariable('LWPT_TEST_REAL_FPC');
-  ReadyDir := GetEnvironmentVariable('LWPT_TEST_FPC_READY_DIR');
-  ReleasePath := GetEnvironmentVariable('LWPT_TEST_FPC_RELEASE');
-  ReleaseDir := GetEnvironmentVariable('LWPT_TEST_FPC_RELEASE_DIR');
-  FailTarget := GetEnvironmentVariable('LWPT_TEST_FPC_FAIL_TARGET');
+  Compiler := GetEnvironmentVariable(TEST_REAL_FPC_ENV);
+  ReadyDir := GetEnvironmentVariable(TEST_FPC_READY_DIR_ENV);
+  ReleasePath := GetEnvironmentVariable(TEST_FPC_RELEASE_ENV);
+  ReleaseDir := GetEnvironmentVariable(TEST_FPC_RELEASE_DIR_ENV);
+  FailTarget := GetEnvironmentVariable(TEST_FPC_FAIL_TARGET_ENV);
   IsVersionQuery := False;
   for i := 1 to ParamCount do
     if ParamStr(i) = '-iV' then IsVersionQuery := True;
@@ -853,7 +894,7 @@ begin
 end;
 
 begin
-  if GetEnvironmentVariable('LWPT_TEST_FPC_PROXY') = '1' then
+  if GetEnvironmentVariable(TEST_FPC_PROXY_ENV) = '1' then
     Halt(RunCompilerProxy);
   TestRunnerProgram.AddSuite(TBuildSessions.Create(
     'build sessions: subprocess concurrency'));

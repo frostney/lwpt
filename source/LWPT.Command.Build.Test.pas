@@ -19,8 +19,13 @@ uses
   SysUtils,
 
   LWPT.Command.Build,
+  LWPT.Core,
   TestingPascalLibrary,
   Tests.Scratch;
+
+const
+  COMPILER_PROCESS_PROXY_OPTION = '--' + PROGRAM_NAME
+    + '-compiler-process-proxy';
 
 type
   TStaleArtefactSignature = class(TTestSuite)
@@ -62,8 +67,7 @@ end;
 procedure TCompilerRunnerThread.Execute;
 begin
   try
-    ExitCode := FRunner.Run(
-      ['--lwpt-compiler-process-proxy', FMarker], Output);
+    ExitCode := FRunner.Run([COMPILER_PROCESS_PROXY_OPTION, FMarker], Output);
   except
     on E: Exception do ErrorMessage := E.Message;
   end;
@@ -170,7 +174,7 @@ end;
 
 begin
   if (ParamCount >= 2)
-     and (ParamStr(1) = '--lwpt-compiler-process-proxy') then
+     and (ParamStr(1) = COMPILER_PROCESS_PROXY_OPTION) then
     Halt(RunCompilerProcessProxy);
   TestRunnerProgram.AddSuite(TStaleArtefactSignature.Create(
     'build: stale-artefact failure signature'));
