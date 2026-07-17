@@ -68,6 +68,9 @@ Stop and report `BLOCKED` when any of these is true:
 - Any universal, release-mode, E2E, Markdown, frozen-install, or generated-data
   check fails.
 - The latest completed `ci.yml` run for the base commit is not successful.
+- The default-branch ruleset does not require every current `pr.yml` check, the
+  release-tag ruleset is absent, or the protected `release` environment is
+  absent.
 - An architecture-drift finding remains neither fixed nor explicitly waived
   with a rationale.
 - The release workflows and documented target or artifact matrices disagree.
@@ -115,6 +118,11 @@ workflow before selecting the command; verify the tool version live.
 
 - Inspect the latest completed `ci.yml` run for the base commit with `gh`.
 - Require the six-target cross-build and native test matrix to be green.
+- Inspect the active repository rulesets and environments. Require:
+  - the default branch to require every current `pr.yml` check;
+  - SemVer release tags to reject deletion, updates, and unauthorized creation;
+  - the `release.yml` publish job to use a protected `release` environment with
+    an explicit approval gate.
 - Confirm the target list, native-test policy, TLS backends, artifact names,
   and release version stamping agree between `ci.yml`, `release.yml`,
   `toolchain.yml`, `docs/ci.md`, and `docs/deployment.md`.

@@ -7,13 +7,20 @@ Four GitHub Actions workflows, mirroring the GocciaScript pattern that LWPT's ve
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch` | Build + cache the cross-FPC toolchain |
 | `ci.yml` | `push` to `main`, `workflow_dispatch` | Post-merge confirmation: full 6-target cross-build + native test matrix on the merged main tree |
 | `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: fast Ubuntu runner + win64 leg (cross-compile, then native offline test run on `windows-latest`); typical wall-clock < 5 min on a warm toolchain cache |
-| `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`), `workflow_dispatch` | Cross-build → package → publish GitHub Release |
+| `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
 - **PRs go through `pr.yml` only** — an Ubuntu runner plus a win64 leg: cross-compile on macOS, then the offline default test tier natively on `windows-latest`. Cheap signal so PR authors aren't blocked on a 30-minute matrix per push.
 - **`ci.yml` runs only on `push` to `main`** — i.e. after merge. This is where the heavyweight 6-target cross-build + native test matrix lives. A PR that introduces a platform-specific regression outside the win64 leg (aarch64-only behaviour, a darwin-only path quirk) will pass `pr.yml` and fail the post-merge `ci.yml` run; the maintainer then reverts or forwards-fixes from `main`. The trade-off is conscious: cheap PR feedback over pre-merge cross-platform certainty. Windows (win64) is the one carve-out — compile errors *and* offline-tier runtime breaks there are caught pre-merge by `pr.yml`'s `windows-cross-compile` + `windows-test` jobs (added after PR #17 merged green with a `SysUtils.FindClose` vs `Windows.FindClose` shadowing break that PR #21 had to fix on `main`).
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
+
+Repository rules make these workflow contracts enforceable. The default branch
+requires every `pr.yml` job (`build-and-test`, `docs`, `toolchain / build`,
+`windows-cross-compile`, and `windows-test`) before squash merge. A separate
+release-tag ruleset restricts SemVer tag creation to the maintainer and rejects
+tag updates or deletion. The protected `release` environment provides the
+explicit approval gate between successful builds and publication.
 
 ## Workflows
 
@@ -108,7 +115,10 @@ The pipeline runs:
 
 1. **`toolchain`** — reuses `toolchain.yml` via `workflow_call`. Cache hit ⇒ instant; cold ⇒ ~30 min rebuild on `macos-latest`.
 2. **`build`** — six-target matrix, identical to `ci.yml`'s `build` stage, so the tagged binary equals the CI-validated binary.
-3. **`publish`** — packages each target as an archive, generates SHA-256 checksums, extracts that tag's notes from the committed `CHANGELOG.md`, and creates the GitHub Release with all archives + the checksums file attached.
+3. **`publish`** — waits for approval through the protected `release`
+   environment, packages each target as an archive, generates SHA-256
+   checksums, extracts that tag's notes from the committed `CHANGELOG.md`, and
+   creates the GitHub Release with all archives + the checksums file attached.
 
 #### Release artefact naming
 
@@ -156,7 +166,7 @@ The scripts mirror the shape of [GocciaScript's installers](https://gocciascript
 
 - `ci.yml`: `push` to `main`, `workflow_dispatch`
 - `pr.yml`: `pull_request` to `main`, `workflow_dispatch`
-- `release.yml`: `push` of a `v?N.N.N` or `v?N.N.N-*` tag, `workflow_dispatch`
+- `release.yml`: `push` of a `v?N.N.N` or `v?N.N.N-*` tag
 - `toolchain.yml`: invoked by `ci.yml`, `pr.yml`, and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming and a weekly `schedule` cron (Mondays 05:00 UTC) that keeps the default-branch cache warm
 
 A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` after merge, OR `release.yml` after tag), not both. PRs trigger only the cheap `pr.yml` (whose single win64 cross-compile rides the cached toolchain).
@@ -200,7 +210,7 @@ Crucially, this is **not** a blanket "ignore e2e failures". An install that *con
 - **`lwpt build` doesn't run on the test runner** — running it would rebuild `lwpt` with the runner's native FPC, defeating the cross-build verification. The pipeline tests the cross-built binary's *behavior* (install / format / test); the cross-build *itself* is verified by the build-stage compile.
 - **No artefact retention beyond 7 days** — set in `upload-artifact`. CI artefacts are debugging aids, not release artefacts. The release artefacts published by `release.yml` are permanent (GitHub Releases).
 - **No Pascal lint beyond `lwpt format --check`** — there's no `flake8`-style linter for FPC. Format check is the closest equivalent.
-- **No post-tag changelog PR** — `CHANGELOG.md` is generated on the release branch before the tag exists, so the tag points at a commit that already contains its own changelog. `release.yml` publishes artifacts from that tag; it does not commit back to `main`.
+- **No post-tag changelog PR** — `CHANGELOG.md` is generated on the release branch before the tag exists, so the tag points at a commit that already contains its own changelog. `release.yml` publishes artifacts from that tag after protected-environment approval; it does not commit back to `main`.
 - **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped (the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) has no `v`; the strip handles the courtesy-accepted prefixed form).
 
 ## Release version stamping
