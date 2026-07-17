@@ -33,12 +33,6 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
       - '[0-9]+.[0-9]+.[0-9]+'
       - '[0-9]+.[0-9]+.[0-9]+-*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to release (must already exist; leave empty to use refs/tags/* trigger)'
-        required: false
-        default: ''
 
 permissions:
   contents: write   # softprops/action-gh-release needs this to create the release
@@ -307,6 +301,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    environment: release
     defaults:
       run:
         shell: bash
@@ -320,15 +315,9 @@ jobs:
 
       - name: Resolve tag + version
         id: ver
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [ -n "$INPUT_TAG" ]; then
-            TAG="$INPUT_TAG"
-          else
-            TAG="${GITHUB_REF_NAME}"
-          fi
+          TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
 
           # Pre-release iff the version contains a hyphen (`-rc.1`, `-alpha`).
@@ -503,11 +492,9 @@ jobs:
           persist-credentials: false
 
       - name: Install published release + verify reported version
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [ -n "$INPUT_TAG" ]; then TAG="$INPUT_TAG"; else TAG="${GITHUB_REF_NAME}"; fi
+          TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
 
           SCRATCH="$PWD/install-smoke-bin"

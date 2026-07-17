@@ -157,6 +157,9 @@ type
     PostBuild   : THookArray;
     PreTest     : THookArray;
     PostTest    : THookArray;
+    { [test] scheduler policy. Zero means run the complete queue even
+      after failures; positive values stop at that failure count. }
+    TestBail    : Integer;
     { User-defined run-scripts (ADR-0013). Any unrecognised top-
       level section with a `script` field becomes a callable
       script — `lwpt run <section-name>` invokes it. The structural
@@ -1178,9 +1181,9 @@ const
     NOTE: 'generated' + 'targets' are NOT in this list — both were
     removed in earlier waves and now join the unknown-section
     policy on equal footing with [teddybear]. }
-  KNOWN_SECTIONS: array[0..13] of string = (
+  KNOWN_SECTIONS: array[0..14] of string = (
     'package', 'dependencies', 'sources', 'build', 'version',
-    'lwpt', 'format', 'workspaces',
+    'lwpt', 'format', 'test', 'workspaces',
     'preinstall', 'postinstall', 'prebuild', 'postbuild',
     'pretest', 'posttest');
   { Reserved section names — names that, if declared as a top-level
@@ -1210,7 +1213,7 @@ const
 var
   Root, Deps, DepNode, ArrNode : TTOMLNode;
   TgtsNode, TgtNode, VerNode   : TTOMLNode;
-  LwptCfgNode, FmtNode, ExclArr : TTOMLNode;
+  LwptCfgNode, FmtNode, TestNode, BailNode, ExclArr : TTOMLNode;
   SourcesNode, SourceEntry     : TTOMLNode;
   Parser   : TTOMLParser;
   Pair     : TTOMLNodeMap.TKeyValuePair;
@@ -1221,6 +1224,7 @@ var
   Hook     : THook;
   Ctx      : TPlaceholderCtx;
   IsKnown  : Boolean;
+  BailValue: Int64;
   k        : Integer;
   TgtCtx   : TPlaceholderCtx;
   TgtPath  : string;
@@ -1436,6 +1440,25 @@ begin
           SetLength(Result.Deps, j + 1);
           Result.Deps[j] := D;
         end;
+      end;
+    end;
+
+    { [test] — scheduler policy. Configuration supplies the project
+      default; the command-line --bail option can override it. }
+    TestNode := TomlGet(Root, 'test');
+    if TomlIsTable(TestNode) then
+    begin
+      BailNode := TomlGet(TestNode, 'bail');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[test] bail must be a non-negative integer');
+      if BailNode <> nil then
+      begin
+        BailValue := TomlInt(TestNode, 'bail', -1);
+        if (BailValue < 0) or (BailValue > High(Integer)) then
+          raise EManifestError.Create(
+            '[test] bail must be a non-negative integer');
+        Result.TestBail := Integer(BailValue);
       end;
     end;
 

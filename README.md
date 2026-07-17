@@ -12,7 +12,7 @@ lwpt add       add a dependency to lwpt.toml + install it   [--name <name>]
 lwpt remove    remove dependencies from lwpt.toml + prune their modules
 lwpt build     compile manifest targets   [--mode dev|release] [--clean]
 lwpt format    format uses-clauses + identifiers   [--check]
-lwpt test      discover, compile and run *.Test.pas files
+lwpt test      discover, compile and run *.Test.pas files   [--jobs N] [--bail N]
 lwpt repair    reclaim install, build-session, and worker-lease residue
 lwpt run       invoke a user-declared run-script (or alias a subcommand)
 ```
@@ -210,8 +210,13 @@ begin
 end.
 ```
 
-`lwpt test` discovers `*.Test.pas` files, compiles each, runs it, and
-reads the process exit code. Exits 1 if any test or compile fails.
+`lwpt test` discovers `*.Test.pas` files and compiles/runs independent
+programs concurrently within the shared machine worker budget. `--jobs=N`
+sets a lower per-invocation ceiling. `--bail=N` stops after N compile or
+runtime failures, terminates and reaps active children, and leaves later
+programs unstarted; zero runs the complete queue. The project default is
+configured with `[test] bail = N` and defaults to zero. Results are printed
+in source-path order, and the command exits 1 if any test or compile fails.
 
 ## Notable canonical-version choices
 

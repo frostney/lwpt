@@ -207,9 +207,11 @@ function HandleTest(const APositionals: TStringList;
 var
   IncludeE2E : Boolean;
   TierVal : string;
-  i : Integer;
+  Jobs, Bail, i : Integer;
 begin
   IncludeE2E := False;
+  Jobs := 0;
+  Bail := -1;
   for i := 0 to High(AOptions) do
     if SameText(AOptions[i].LongName, 'tier')
        and (AOptions[i] is TStringOption) then
@@ -224,9 +226,31 @@ begin
           '--tier must be "default" or "e2e", got "', TierVal, '"');
         Exit(1);
       end;
+    end
+    else if SameText(AOptions[i].LongName, 'jobs')
+       and (AOptions[i] is TIntegerOption) and AOptions[i].Present then
+    begin
+      Jobs := TIntegerOption(AOptions[i]).Value;
+      if Jobs < 1 then
+      begin
+        WriteLn(ErrOutput, ErrPrefix('test'),
+          '--jobs must be a positive integer');
+        Exit(1);
+      end;
+    end
+    else if SameText(AOptions[i].LongName, 'bail')
+       and (AOptions[i] is TIntegerOption) and AOptions[i].Present then
+    begin
+      Bail := TIntegerOption(AOptions[i]).Value;
+      if Bail < 0 then
+      begin
+        WriteLn(ErrOutput, ErrPrefix('test'),
+          '--bail must be a non-negative integer');
+        Exit(1);
+      end;
     end;
   try
-    Result := CmdTest(MANIFEST_FILE, IncludeE2E);
+    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail);
   except
     on E: Exception do
     begin
@@ -376,11 +400,16 @@ begin
       'Format uses-clauses and identifiers', '[--check]',
       @HandleFormat, FormatOpts));
 
-    SetLength(TestOpts, 1);
+    SetLength(TestOpts, 3);
     TestOpts[0] := TStringOption.Create('tier',
       'Test tier to include: default (unit + integration) or e2e (adds network-touching tier)');
+    TestOpts[1] := TIntegerOption.Create('jobs',
+      'Maximum concurrent test programs (default: shared machine budget)');
+    TestOpts[2] := TIntegerOption.Create('bail',
+      'Stop after N compile or runtime failures; 0 runs the full queue');
     Registry.Add(TSubcommand.Create('test',
-      'Discover and run *.Test.pas files', '[--tier default|e2e]',
+      'Discover and run *.Test.pas files',
+      '[--tier default|e2e] [--jobs N] [--bail N]',
       @HandleTest, TestOpts));
 
     SetLength(RepairOpts, 0);
