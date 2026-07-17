@@ -279,7 +279,11 @@ function BCryptGenRandom(AAlgorithm: THandle; ABuffer: Pointer;
 {$ENDIF}
 {$IFDEF UNIX}
 function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'unsetenv';
+  {$ELSE}
   external name 'unsetenv';
+  {$ENDIF}
 {$ENDIF}
 
 procedure ClearWorkerLeaseEnvironment;
