@@ -63,6 +63,8 @@ type
     procedure RunUtility(const ASwitch, AOutputPath: string);
     procedure RunUtilityWithBudget(const ASwitch, AOutputPath,
       ABudget: string);
+    function WaitForSessionState(const ASession, AState: string;
+      ATimeoutMilliseconds: Integer): Boolean;
     procedure StopChild(AProcess: TProcess);
   protected
     procedure BeforeAll; override;
@@ -182,33 +184,6 @@ begin
     Sleep(25);
   until GetTickCount64 - Started >= QWord(ATimeoutMilliseconds);
   Result := not FileExists(APath) and not DirectoryExists(APath);
-end;
-
-function WaitForFileValue(const APath, AName, AValue: string;
-  ATimeoutMilliseconds: Integer): Boolean;
-var
-  Started : QWord;
-  Values : TStringList;
-begin
-  Started := GetTickCount64;
-  repeat
-    if FileExists(APath) then
-    begin
-      Values := TStringList.Create;
-      try
-        try
-          Values.LoadFromFile(APath);
-          if Values.Values[AName] = AValue then Exit(True);
-        except
-          { Atomic replacement can briefly race a reader on some platforms. }
-        end;
-      finally
-        Values.Free;
-      end;
-    end;
-    Sleep(25);
-  until GetTickCount64 - Started >= QWord(ATimeoutMilliseconds);
-  Result := False;
 end;
 
 procedure AddWorkerEnvironment(AProcess: TProcess;
@@ -778,15 +753,44 @@ begin
   end;
 end;
 
+function TWorkerBudgetProcesses.WaitForSessionState(const ASession,
+  AState: string; ATimeoutMilliseconds: Integer): Boolean;
+var
+  Started : QWord;
+  SnapshotPath, SessionPrefix, StateText : string;
+  Values : TStringList;
+  i : Integer;
+begin
+  Started := GetTickCount64;
+  SnapshotPath := FScratch + '/wait-state-snapshot';
+  SessionPrefix := '  ' + ASession + ':';
+  StateText := ', ' + AState + ',';
+  repeat
+    RunUtility(SNAPSHOT_SWITCH, SnapshotPath);
+    Values := ReadUtilityValues(SnapshotPath);
+    try
+      for i := 0 to Values.Count - 1 do
+        if (Pos(SessionPrefix, Values[i]) = 1)
+           and (Pos(StateText, Values[i]) > 0) then
+          Exit(True);
+    finally
+      Values.Free;
+    end;
+    Sleep(25);
+  until GetTickCount64 - Started >= QWord(ATimeoutMilliseconds);
+  Result := False;
+end;
+
 procedure TWorkerBudgetProcesses.StopChild(AProcess: TProcess);
 begin
   if AProcess = nil then Exit;
   try
     if AProcess.Running then
-    begin
       AProcess.Terminate(1);
-      AProcess.WaitOnExit;
-    end;
+    { Always reap the child. On Windows a process that has begun exiting can
+      retain its current-directory handle after Running changes state; the
+      next test must not wipe that worktree until the handle is closed. }
+    AProcess.WaitOnExit;
   finally
     AProcess.Free;
   end;
@@ -1043,8 +1047,7 @@ end;
 procedure TWorkerBudgetProcesses.TestWaiterPrecedesRepeatedReacquire;
 var
   Reacquirer, Waiter : TProcess;
-  AcquiredPrefix, ReleasePrefix, WaiterAcquired, WaiterRelease,
-    WaiterRequest : string;
+  AcquiredPrefix, ReleasePrefix, WaiterAcquired, WaiterRelease : string;
   Round : Integer;
 begin
   Reacquirer := nil;
@@ -1062,13 +1065,11 @@ begin
       WaiterAcquired := FScratch + '/waiter-acquired-'
         + IntToStr(Round);
       WaiterRelease := FScratch + '/waiter-release-' + IntToStr(Round);
-      WaiterRequest := FScratch + '/state/waiter-'
-        + IntToStr(Round) + '.request';
       Waiter := StartChild('waiter-' + IntToStr(Round),
         FScratch + '/worktree-b', WaiterAcquired, WaiterRelease);
       try
-        Expect<Boolean>(WaitForFileValue(WaiterRequest, 'waiting', '1',
-          WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
+        Expect<Boolean>(WaitForSessionState('waiter-' + IntToStr(Round),
+          'waiting', WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
         WriteMarker(ReleasePrefix + '-' + IntToStr(Round), 'release');
         Expect<Boolean>(WaitForFile(WaiterAcquired,
           WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
