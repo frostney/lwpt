@@ -364,10 +364,7 @@ begin
   if AIndex < 0 then Exit;
   EnterCriticalSection(FCriticalSection);
   try
-    if FCancelled and (AStatus <> tjsCancelled) then
-      FJobs[AIndex].Status := tjsCancelled
-    else
-      FJobs[AIndex].Status := AStatus;
+    FJobs[AIndex].Status := AStatus;
     FJobs[AIndex].ExitCode := AExitCode;
   finally
     LeaveCriticalSection(FCriticalSection);
@@ -399,17 +396,12 @@ procedure TTestScheduler.FailJob(AIndex: Integer;
 begin
   EnterCriticalSection(FCriticalSection);
   try
-    if FCancelled then
-      FJobs[AIndex].Status := tjsCancelled
-    else
-    begin
-      FJobs[AIndex].Status := AStatus;
-      FJobs[AIndex].ExitCode := AExitCode;
-      FJobs[AIndex].ErrorMessage := AMessage;
-      Inc(FFailureCount);
-      if (FBail > 0) and (FFailureCount >= FBail) then
-        CancelPendingAndActiveLocked;
-    end;
+    FJobs[AIndex].Status := AStatus;
+    FJobs[AIndex].ExitCode := AExitCode;
+    FJobs[AIndex].ErrorMessage := AMessage;
+    Inc(FFailureCount);
+    if (FBail > 0) and (FFailureCount >= FBail) then
+      CancelPendingAndActiveLocked;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
