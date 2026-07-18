@@ -127,6 +127,18 @@ begin
   end;
 end;
 
+{ Byte-safe accumulator for pipe reads, mirroring HTTPClient's
+  AppendRawBytes: append N raw bytes without a PAnsiChar round-trip, so
+  large or non-text diagnostics grow the buffer in place. }
+procedure AppendRawBytes(var ADest: string; const ABuf; const N: Integer);
+var Old: Integer;
+begin
+  if N <= 0 then Exit;
+  Old := Length(ADest);
+  SetLength(ADest, Old + N);
+  Move(ABuf, ADest[Old + 1], N);
+end;
+
 constructor TLWPTCompilerProcess.Create(const AExecutable: string);
 begin
   inherited Create;
@@ -152,7 +164,6 @@ function TLWPTCompilerProcess.Run(const AArgs: LWPT.Core.TStringArray;
 var
   P: TProcess;
   Buf: array[0..4095] of Byte;
-  Chunk: string;
   i, N: Integer;
   TerminateAfterStart: Boolean;
 begin
@@ -193,10 +204,7 @@ begin
     repeat
       N := P.Output.Read(Buf[0], SizeOf(Buf));
       if N > 0 then
-      begin
-        SetString(Chunk, PAnsiChar(@Buf[0]), N);
-        AOutput := AOutput + Chunk;
-      end;
+        AppendRawBytes(AOutput, Buf[0], N);
     until N <= 0;
     P.WaitOnExit;
     Result := P.ExitCode;
@@ -699,6 +707,10 @@ end;
 
 destructor TLWPTBuildJob.Destroy;
 begin
+  { Execute releases and nils FLease at the end of every run, so a lease
+    still attached here belongs to a job whose thread never started.
+    Destroying it returns the worker grant. }
+  FLease.Free;
   FCompiler.Free;
   DoneCriticalSection(FDoneCriticalSection);
   inherited Destroy;
@@ -1110,7 +1122,18 @@ begin
                 Lease := nil;
                 States[i] := tsRunning;
                 Inc(Running);
-                Jobs[i].Start;
+                try
+                  Jobs[i].Start;
+                except
+                  { A never-started thread cannot release its lease in
+                    Execute or report through the IsDone poll. Return the
+                    scheduler slot and free the job (its destructor frees
+                    the still-attached lease); the outer handler records
+                    the failure. }
+                  Dec(Running);
+                  FreeAndNil(Jobs[i]);
+                  raise;
+                end;
               finally
                 Lease.Free;
               end;
@@ -1210,6 +1233,12 @@ begin
         if CapturedOutputs[i] <> '' then Write(CapturedOutputs[i]);
         if States[i] = tsSucceeded then
           WriteLn('ok -> ', Compiled[i].OutBin)
+        else if States[i] = tsCompiled then
+          { ADR-0020: the whole-build postbuild gate withholds every
+            publication once any target fails. Still give the compiled
+            target its result line. }
+          WriteLn('  target "', Man.Targets[i].Name,
+            '" compiled; not published because the build failed')
         else if Errors[i] <> '' then
           WriteLn(ErrOutput, '  target "', Man.Targets[i].Name,
             '" failed: ', Errors[i]);
