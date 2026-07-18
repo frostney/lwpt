@@ -10,6 +10,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.BuildRequest,
   LWPT.Core;
 
 const
@@ -19,22 +20,12 @@ const
 
 type
   TLWPTBuildPublicationRequest = record
-    CompilerID: string;
+    BuildRequest: TLWPTBuildRequest;
     CompilerExecutable: string;
-    CompilerVersion: string;
     ManifestContentHash: string;
-    Source: string;
-    Output: string;
-    OutputKind: string;
-    Mode: string;
-    TargetOS: string;
-    TargetCPU: string;
-    Defines: TStringArray;
+    PublicOutput: string;
     Environment: TStringArray;
-    UnitPaths: TStringArray;
-    IncludePaths: TStringArray;
     WorkspacePaths: TStringArray;
-    Resources: TStringArray;
     HookDefinition: TStringArray;
     HookInputs: TStringArray;
     ExcludedPaths: TStringArray;
@@ -385,37 +376,32 @@ begin
   try
     AddField(Fields, 'schema',
       IntToStr(BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION));
-    AddField(Fields, 'compiler.id', ARequest.CompilerID);
+    ValidateBuildRequest(ARequest.BuildRequest);
+    AddField(Fields, 'build-request',
+      SerializeBuildRequest(ARequest.BuildRequest));
     AddField(Fields, 'compiler.executable', ARequest.CompilerExecutable);
-    AddField(Fields, 'compiler.version', ARequest.CompilerVersion);
     AddField(Fields, 'manifest.parsed-hash', ARequest.ManifestContentHash);
-    AddField(Fields, 'source', ARequest.Source);
-    AddField(Fields, 'source.content',
-      PathFingerprint(AProjectRoot, ARequest.Source, EmptyPaths));
+    AddPathArray(Fields, AProjectRoot, 'sources',
+      ARequest.BuildRequest.Inputs.Sources, EmptyPaths);
     SourceDirectory := ExtractFileDir(
-      RootedPath(AProjectRoot, ARequest.Source));
+      RootedPath(AProjectRoot, ARequest.BuildRequest.Inputs.EntryPoint));
     AddField(Fields, 'source-directory', SourceDirectory);
     AddField(Fields, 'source-directory.content',
       PathFingerprint(AProjectRoot, SourceDirectory,
         ARequest.ExcludedPaths));
-    AddField(Fields, 'output', ARequest.Output);
+    AddField(Fields, 'output', ARequest.PublicOutput);
     AddField(Fields, 'output.previous',
-      PathFingerprint(AProjectRoot, ARequest.Output, EmptyPaths));
-    AddField(Fields, 'output-kind', ARequest.OutputKind);
-    AddField(Fields, 'mode', ARequest.Mode);
-    AddField(Fields, 'target-os', ARequest.TargetOS);
-    AddField(Fields, 'target-cpu', ARequest.TargetCPU);
-    AddStringArray(Fields, 'defines', ARequest.Defines);
+      PathFingerprint(AProjectRoot, ARequest.PublicOutput, EmptyPaths));
     AddStringArray(Fields, 'environment', ARequest.Environment);
     AddStringArray(Fields, 'excluded-paths', ARequest.ExcludedPaths);
-    AddPathArray(Fields, AProjectRoot, 'unit-paths', ARequest.UnitPaths,
-      ARequest.ExcludedPaths);
+    AddPathArray(Fields, AProjectRoot, 'unit-paths',
+      ARequest.BuildRequest.Inputs.UnitPaths, ARequest.ExcludedPaths);
     AddPathArray(Fields, AProjectRoot, 'include-paths',
-      ARequest.IncludePaths, ARequest.ExcludedPaths);
+      ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths);
     AddPathArray(Fields, AProjectRoot, 'workspace-paths',
       ARequest.WorkspacePaths, ARequest.ExcludedPaths);
-    AddPathArray(Fields, AProjectRoot, 'resources', ARequest.Resources,
-      ARequest.ExcludedPaths);
+    AddPathArray(Fields, AProjectRoot, 'resources',
+      ARequest.BuildRequest.Inputs.Resources, ARequest.ExcludedPaths);
     AddStringArray(Fields, 'hook-definition', ARequest.HookDefinition);
     AddPathArray(Fields, AProjectRoot, 'hook-inputs',
       ARequest.HookInputs, ARequest.ExcludedPaths);

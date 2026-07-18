@@ -31,8 +31,10 @@ procedure RunHooksWithEnvironment(const APhase: string;
 implementation
 
 uses
+  LWPT.BuildRequest,
   LWPT.BuildSession,
-  LWPT.Core;
+  LWPT.Core,
+  Platform;
 
 function CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths: array of string; out AOutBin: string;
@@ -40,6 +42,7 @@ function CreatePascalCompilerProcess(const ASrcFile: string;
 var
   BuildDir : string;
   i : Integer;
+  Request: TLWPTBuildRequest;
 
   function SourceBuildKey(const APath: string): string;
   begin
@@ -86,6 +89,35 @@ begin
     ForceDirectories(BuildDir + '/units');
     AOutBin := IncludeTrailingPathDelimiter(BuildDir)
              + ChangeFileExt(ExtractFileName(ASrcFile), '');
+
+    { Describe the compilation before adapting it to FPC arguments below.
+      Driver dispatch is intentionally a later seam; validation here keeps
+      current build/test compilation inside the versioned neutral contract. }
+    Request := DefaultBuildRequest;
+    Request.Compiler.ID := 'fpc';
+    Request.Compiler.VersionConstraint := '*';
+    Request.Target.OS := GetEnvironmentVariable('FPC_TARGET_OS');
+    if Request.Target.OS = '' then Request.Target.OS := GetBuildOS;
+    Request.Target.Architecture := GetEnvironmentVariable('FPC_TARGET_CPU');
+    if Request.Target.Architecture = '' then
+      Request.Target.Architecture := GetBuildArch;
+    Request.OutputKind := BUILD_OUTPUT_EXECUTABLE;
+    Request.Mode := BUILD_MODE_DEV;
+    Request.Inputs.EntryPoint := ASrcFile;
+    SetLength(Request.Inputs.Sources, 1);
+    Request.Inputs.Sources[0] := ASrcFile;
+    SetLength(Request.Inputs.UnitPaths, Length(AUnitPaths));
+    SetLength(Request.Inputs.IncludePaths, Length(AUnitPaths));
+    for i := 0 to High(AUnitPaths) do
+    begin
+      Request.Inputs.UnitPaths[i] := AUnitPaths[i];
+      Request.Inputs.IncludePaths[i] := AUnitPaths[i];
+    end;
+    Request.Outputs.Artifact := AOutBin;
+    Request.Outputs.ExecutableDirectory := BuildDir;
+    Request.Outputs.UnitDirectory := BuildDir + '/units';
+    Request.Outputs.ObjectDirectory := BuildDir + '/units';
+    ValidateBuildRequest(Request);
 
     Result.Executable := FPCExecutable;
     (* Deliberately NOT forcing -M<mode>: each source sets its own mode

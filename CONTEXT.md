@@ -100,6 +100,42 @@ A `[dependencies]` entry whose resolved local path **escapes** the project root 
 
 ### Build lifecycle
 
+**Build request**:
+A schema-versioned, compiler-neutral description of one compilation: compiler
+identity or version constraint, target tuple, source set and entry point,
+defines and search paths, resources, output kind, build mode, and private output
+locations. `LWPT.BuildRequest` owns validation and canonical TOML
+serialization. The request says what to build; a compiler driver decides how
+to express it on a compiler command line.
+*Avoid*: "FPC request" (the structure is compiler-neutral), "compiler args"
+(an adapter output), "publication fingerprint" (a separate concurrency
+snapshot that embeds the request).
+
+**Target tuple**:
+The desired output platform carried by a build request: required OS and
+architecture plus optional ABI and execution environment. It is independent
+of both the host running LWPT and the selected compiler. A compiler capability
+set can advertise many native and cross target tuples.
+*Avoid*: "platform" alone (host or target is ambiguous), "compiler target"
+(wrongly attaches the tuple to one compiler installation), "target" alone
+(conflicts with the retired name for a build entry).
+
+**Compiler capabilities**:
+A schema-versioned declaration of one compiler identity and version plus every
+target tuple, output kind, and build mode its driver can accept. Compatibility
+requires matching compiler constraints, target tuple, output kind, and mode;
+failure is explicit and never falls back to another compiler or target.
+*Avoid*: "compiler entry" (suggests duplicating one entry per platform),
+"fallback list" (unsupported requests are errors).
+
+**Build result**:
+A schema-versioned compiler-neutral outcome containing success, normalized
+diagnostics, produced artifacts, and dependency metadata. Compiler-native
+messages and paths are translated at the driver boundary before entering this
+structure.
+*Avoid*: "FPC output" (driver-specific), "process result" (too narrow: the
+contract also carries artifacts and dependency metadata).
+
 <a id="hook"></a>
 **Hook**:
 A LWPT-invoked script with one or more lifecycle attachment points. A hook entry has a required `script` field (InstantFPC path), an optional `args` array, and an optional `inputs`/`output` pair that turns it into a staleness-gated rule — toolkit skips the script when `output` is newer than every `inputs` entry. Bare-string shorthand `"scripts/foo.pas"` is equivalent to `{ script = "scripts/foo.pas" }`. Hooks always run with the project root as cwd, inherit the caller's env, run sequentially in manifest insertion order, and stop the lifecycle phase on the first non-zero exit. Root-manifest only: any hook section in a dependency manifest is silently dropped by the loader.

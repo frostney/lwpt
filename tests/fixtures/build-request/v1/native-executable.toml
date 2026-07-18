@@ -1,0 +1,29 @@
+schema = 1
+output_kind = "executable"
+mode = "release"
+
+[compiler]
+id = "fpc"
+version_constraint = "^3.2.0"
+version_identity = "3.2.2"
+
+[target]
+os = "darwin"
+architecture = "aarch64"
+abi = ""
+environment = ""
+
+[inputs]
+entry_point = "source/app.pas"
+sources = ["source/app.pas", "source/generated.pas"]
+defines = ["PRODUCTION"]
+unit_paths = ["source", ".lwpt/modules/example/source"]
+include_paths = ["source"]
+resources = ["resources/app.res"]
+
+[outputs]
+artifact = ".lwpt/sessions/example/bin/app"
+executable_directory = ".lwpt/sessions/example/bin"
+unit_directory = ".lwpt/sessions/example/units"
+object_directory = ".lwpt/sessions/example/objects"
+resource_directory = ".lwpt/sessions/example/resources"

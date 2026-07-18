@@ -42,6 +42,7 @@ function HasStaleArtefactSignature(const AOutput: string): Boolean;
 implementation
 
 uses
+  LWPT.BuildRequest,
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.Manifest,
@@ -550,23 +551,44 @@ begin
   CfgPath := ResolveCfgFile(AMan);
   ModulesPath := ResolveModulesDir(AMan);
   Request := Default(TLWPTBuildPublicationRequest);
-  Request.CompilerID := 'fpc';
+  Request.BuildRequest := DefaultBuildRequest;
+  Request.BuildRequest.Compiler.ID := 'fpc';
+  Request.BuildRequest.Compiler.VersionConstraint := '*';
+  Request.BuildRequest.Compiler.VersionIdentity := QueryFPCVersion;
   Request.CompilerExecutable := FPCExecutable;
-  Request.CompilerVersion := QueryFPCVersion;
   Request.ManifestContentHash := AManifestContentHash;
-  Request.Source := T.Source;
-  Request.Output := OutBin;
-  Request.OutputKind := 'executable';
-  if ARelease then Request.Mode := 'release' else Request.Mode := 'dev';
-  Request.TargetOS := GetEnvironmentVariable('FPC_TARGET_OS');
-  if Request.TargetOS = '' then Request.TargetOS := GetBuildOS;
-  Request.TargetCPU := GetEnvironmentVariable('FPC_TARGET_CPU');
-  if Request.TargetCPU = '' then Request.TargetCPU := GetBuildArch;
+  Request.PublicOutput := OutBin;
+  Request.BuildRequest.OutputKind := BUILD_OUTPUT_EXECUTABLE;
+  if ARelease then
+  begin
+    Request.BuildRequest.Mode := BUILD_MODE_RELEASE;
+    SetLength(Request.BuildRequest.Inputs.Defines, 1);
+    Request.BuildRequest.Inputs.Defines[0] := 'PRODUCTION';
+  end
+  else
+    Request.BuildRequest.Mode := BUILD_MODE_DEV;
+  Request.BuildRequest.Target.OS :=
+    GetEnvironmentVariable('FPC_TARGET_OS');
+  if Request.BuildRequest.Target.OS = '' then
+    Request.BuildRequest.Target.OS := GetBuildOS;
+  Request.BuildRequest.Target.Architecture :=
+    GetEnvironmentVariable('FPC_TARGET_CPU');
+  if Request.BuildRequest.Target.Architecture = '' then
+    Request.BuildRequest.Target.Architecture := GetBuildArch;
+  Request.BuildRequest.Inputs.EntryPoint := T.Source;
+  SetLength(Request.BuildRequest.Inputs.Sources, 1);
+  Request.BuildRequest.Inputs.Sources[0] := T.Source;
+  Request.BuildRequest.Outputs.Artifact := CandidateBin;
+  Request.BuildRequest.Outputs.ExecutableDirectory := BinDir;
+  Request.BuildRequest.Outputs.UnitDirectory := UnitOutDir;
+  Request.BuildRequest.Outputs.ObjectDirectory := UnitOutDir;
   SetLength(Request.Environment, 1);
   Request.Environment[0] := 'LWPT_FPC_UNIT_PATHS='
     + GetEnvironmentVariable('LWPT_FPC_UNIT_PATHS');
-  Request.UnitPaths := Copy(AMan.Units, 0, Length(AMan.Units));
-  Request.IncludePaths := Copy(AMan.Includes, 0, Length(AMan.Includes));
+  Request.BuildRequest.Inputs.UnitPaths :=
+    Copy(AMan.Units, 0, Length(AMan.Units));
+  Request.BuildRequest.Inputs.IncludePaths :=
+    Copy(AMan.Includes, 0, Length(AMan.Includes));
   SetLength(Request.WorkspacePaths, Length(AMan.Workspaces));
   for i := 0 to High(AMan.Workspaces) do
     Request.WorkspacePaths[i] := AMan.Workspaces[i].Path;
@@ -574,8 +596,10 @@ begin
   AddHookPublicationInputs(AMan.PostBuild, Request);
   ACompiled.PostBuild := RetargetPostBuildHooks(T.PostBuild,
     OutBin, CandidateBin);
-  AppendEnvSearchPaths(Request.UnitPaths, Request.IncludePaths);
+  AppendEnvSearchPaths(Request.BuildRequest.Inputs.UnitPaths,
+    Request.BuildRequest.Inputs.IncludePaths);
   AddDeclaredOutputs(AMan, Request.ExcludedPaths);
+  ValidateBuildRequest(Request.BuildRequest);
   Fingerprint := CaptureBuildPublicationFingerprint(ProjectRoot,
     AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
 
@@ -596,16 +620,14 @@ begin
       almost always be present). }
     if FileExists(ResolveCfgFile(AMan)) then
       Args.Add('@' + ResolveCfgFile(AMan));
-    AddEnvUnitPathParameters(Args);
-    { manifest's own unit dirs — both as unit (-Fu) and include
-      (-Fi) search paths. .inc files conventionally live next to
-      .pas units, so the same dir serves both. }
-    for i := 0 to High(AMan.Units) do
-      if AMan.Units[i] <> '' then
-      begin
-        Args.Add('-Fu' + AMan.Units[i]);
-        Args.Add('-Fi' + AMan.Units[i]);
-      end;
+    { Adapt the neutral request's distinct search-path collections to FPC.
+      Environment-provided paths were appended to both collections above. }
+    for i := 0 to High(Request.BuildRequest.Inputs.UnitPaths) do
+      if Request.BuildRequest.Inputs.UnitPaths[i] <> '' then
+        Args.Add('-Fu' + Request.BuildRequest.Inputs.UnitPaths[i]);
+    for i := 0 to High(Request.BuildRequest.Inputs.IncludePaths) do
+      if Request.BuildRequest.Inputs.IncludePaths[i] <> '' then
+        Args.Add('-Fi' + Request.BuildRequest.Inputs.IncludePaths[i]);
     AddBuildModeFlags(Args, ARelease);
     { -B forces a full rebuild, ignoring up-to-date units. Release mode
       already adds -B; only add it here for a clean dev build. }
@@ -897,9 +919,11 @@ var
   Compiled: TLWPTCompiledTargetArray;
   CapturedOutputs, Errors: TLWPTStringArray;
   PublicationRequest: TLWPTBuildPublicationRequest;
+  PublicationResult: TLWPTBuildPublicationResult;
   WholePostBuild: THookArray;
   HookEnvironment: array of string;
   HasEdges, MadeProgress: Boolean;
+  CurrentCompilerVersion: string;
 
   procedure RunTargetPostBuild(AIndex: Integer);
   begin
@@ -918,12 +942,17 @@ var
     try
       if ARunPostBuild then RunTargetPostBuild(AIndex);
       PublicationRequest := Compiled[AIndex].Request;
-      PublicationRequest.CompilerVersion := QueryFPCVersion;
-      if PublishBuildArtifact(Compiled[AIndex].ProjectRoot,
-        Compiled[AIndex].CandidateBin, Compiled[AIndex].OutBin,
-        Compiled[AIndex].Fingerprint, AManifestPath,
-        Compiled[AIndex].CfgPath, LOCKFILE, Compiled[AIndex].ModulesPath,
-        PublicationRequest) = bprStale then
+      CurrentCompilerVersion := QueryFPCVersion;
+      if CurrentCompilerVersion
+        <> PublicationRequest.BuildRequest.Compiler.VersionIdentity then
+        PublicationResult := bprStale
+      else
+        PublicationResult := PublishBuildArtifact(
+          Compiled[AIndex].ProjectRoot, Compiled[AIndex].CandidateBin,
+          Compiled[AIndex].OutBin, Compiled[AIndex].Fingerprint,
+          AManifestPath, Compiled[AIndex].CfgPath, LOCKFILE,
+          Compiled[AIndex].ModulesPath, PublicationRequest);
+      if PublicationResult = bprStale then
       begin
         States[AIndex] := tsFailed;
         Errors[AIndex] := 'inputs changed during compilation; private '

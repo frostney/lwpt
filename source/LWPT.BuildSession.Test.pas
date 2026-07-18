@@ -10,6 +10,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.BuildRequest,
   LWPT.BuildSession,
   LWPT.Core,
   TestingPascalLibrary;
@@ -71,17 +72,23 @@ end;
 function TLWPTBuildSessionTests.BasicRequest: TLWPTBuildPublicationRequest;
 begin
   Result := Default(TLWPTBuildPublicationRequest);
-  Result.CompilerID := 'test-compiler';
+  Result.BuildRequest := DefaultBuildRequest;
+  Result.BuildRequest.Compiler.ID := 'test-compiler';
+  Result.BuildRequest.Compiler.VersionIdentity := '1.0.0';
   Result.CompilerExecutable := '/test/compiler';
-  Result.CompilerVersion := '1.0.0';
   Result.ManifestContentHash := SHA256File(
     FScratch + '/' + MANIFEST_FILE);
-  Result.Source := 'source/app.pas';
-  Result.Output := 'build/app';
-  Result.OutputKind := 'executable';
-  Result.Mode := 'dev';
-  SetLength(Result.UnitPaths, 1);
-  Result.UnitPaths[0] := 'source';
+  Result.PublicOutput := 'build/app';
+  Result.BuildRequest.Target.OS := 'test-os';
+  Result.BuildRequest.Target.Architecture := 'test-arch';
+  Result.BuildRequest.Inputs.EntryPoint := 'source/app.pas';
+  SetLength(Result.BuildRequest.Inputs.Sources, 1);
+  Result.BuildRequest.Inputs.Sources[0] := 'source/app.pas';
+  Result.BuildRequest.OutputKind := BUILD_OUTPUT_EXECUTABLE;
+  Result.BuildRequest.Mode := BUILD_MODE_DEV;
+  Result.BuildRequest.Outputs.Artifact := 'candidate/app';
+  SetLength(Result.BuildRequest.Inputs.UnitPaths, 1);
+  Result.BuildRequest.Inputs.UnitPaths[0] := 'source';
 end;
 
 procedure TLWPTBuildSessionTests.BeforeAll;
@@ -281,9 +288,10 @@ begin
   WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
   WriteText(FScratch + '/app.pas', 'begin end.');
   Request := BasicRequest;
-  Request.Source := 'app.pas';
-  SetLength(Request.UnitPaths, 1);
-  Request.UnitPaths[0] := '.';
+  Request.BuildRequest.Inputs.EntryPoint := 'app.pas';
+  Request.BuildRequest.Inputs.Sources[0] := 'app.pas';
+  SetLength(Request.BuildRequest.Inputs.UnitPaths, 1);
+  Request.BuildRequest.Inputs.UnitPaths[0] := '.';
   Session := TLWPTBuildSession.Create(FScratch);
   try
     Candidate := Session.JobRoot('app') + '/app';
@@ -316,10 +324,11 @@ begin
   WriteText(FScratch + '/other.pas', 'begin end.');
   WriteText(FScratch + '/candidate/other', 'new');
   Request := BasicRequest;
-  Request.Source := 'other.pas';
-  Request.Output := 'build/other';
-  SetLength(Request.UnitPaths, 1);
-  Request.UnitPaths[0] := '.';
+  Request.BuildRequest.Inputs.EntryPoint := 'other.pas';
+  Request.BuildRequest.Inputs.Sources[0] := 'other.pas';
+  Request.PublicOutput := 'build/other';
+  SetLength(Request.BuildRequest.Inputs.UnitPaths, 1);
+  Request.BuildRequest.Inputs.UnitPaths[0] := '.';
   SetLength(Request.ExcludedPaths, 2);
   Request.ExcludedPaths[0] := 'build/app';
   Request.ExcludedPaths[1] := 'build/other';
@@ -347,9 +356,9 @@ begin
   WriteText(FScratch + '/extra/SharedUnit.pas', 'unit SharedUnit; end.');
   WriteText(FScratch + '/candidate/app', 'new');
   Request := BasicRequest;
-  SetLength(Request.UnitPaths, 2);
-  Request.UnitPaths[0] := 'source';
-  Request.UnitPaths[1] := 'extra';
+  SetLength(Request.BuildRequest.Inputs.UnitPaths, 2);
+  Request.BuildRequest.Inputs.UnitPaths[0] := 'source';
+  Request.BuildRequest.Inputs.UnitPaths[1] := 'extra';
   Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
     CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   WriteText(FScratch + '/extra/SharedUnit.pas',
@@ -377,7 +386,7 @@ begin
   WriteText(FScratch + '/source/sibling.inc', 'const Value = 1;');
   WriteText(FScratch + '/candidate/app', 'new');
   Request := BasicRequest;
-  SetLength(Request.UnitPaths, 0);
+  SetLength(Request.BuildRequest.Inputs.UnitPaths, 0);
   Fingerprint := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
     CFG_FILE, LOCKFILE, MODULES_DIR, Request);
   WriteText(FScratch + '/source/sibling.inc', 'const Value = 2;');
@@ -402,8 +411,8 @@ begin
   WriteText(FScratch + '/build/generated.res', 'first');
   WriteText(FScratch + '/candidate/app', 'new');
   Request := BasicRequest;
-  SetLength(Request.Resources, 1);
-  Request.Resources[0] := 'build/generated.res';
+  SetLength(Request.BuildRequest.Inputs.Resources, 1);
+  Request.BuildRequest.Inputs.Resources[0] := 'build/generated.res';
   SetLength(Request.ExcludedPaths, 2);
   Request.ExcludedPaths[0] := 'build/generated.res';
   Request.ExcludedPaths[1] := 'build/app';
@@ -500,17 +509,23 @@ begin
     PAnsiChar(FScratch + '/modules/a-alias')) <> 0 then
     raise Exception.Create('fixture: first a alias creation failed');
   FirstRequest := Default(TLWPTBuildPublicationRequest);
-  FirstRequest.CompilerID := 'test-compiler';
+  FirstRequest.BuildRequest := DefaultBuildRequest;
+  FirstRequest.BuildRequest.Compiler.ID := 'test-compiler';
+  FirstRequest.BuildRequest.Compiler.VersionIdentity := '1.0.0';
   FirstRequest.CompilerExecutable := '/test/compiler';
-  FirstRequest.CompilerVersion := '1.0.0';
   FirstRequest.ManifestContentHash := SHA256File(
     FScratch + '/' + MANIFEST_FILE);
-  FirstRequest.Source := 'source/app.pas';
-  FirstRequest.Output := 'build/app';
-  FirstRequest.OutputKind := 'executable';
-  FirstRequest.Mode := 'dev';
-  SetLength(FirstRequest.UnitPaths, 1);
-  FirstRequest.UnitPaths[0] := 'modules';
+  FirstRequest.PublicOutput := 'build/app';
+  FirstRequest.BuildRequest.Target.OS := 'test-os';
+  FirstRequest.BuildRequest.Target.Architecture := 'test-arch';
+  FirstRequest.BuildRequest.Inputs.EntryPoint := 'source/app.pas';
+  SetLength(FirstRequest.BuildRequest.Inputs.Sources, 1);
+  FirstRequest.BuildRequest.Inputs.Sources[0] := 'source/app.pas';
+  FirstRequest.BuildRequest.OutputKind := BUILD_OUTPUT_EXECUTABLE;
+  FirstRequest.BuildRequest.Mode := BUILD_MODE_DEV;
+  FirstRequest.BuildRequest.Outputs.Artifact := 'candidate/app';
+  SetLength(FirstRequest.BuildRequest.Inputs.UnitPaths, 1);
+  FirstRequest.BuildRequest.Inputs.UnitPaths[0] := 'modules';
   FirstFingerprint := CaptureBuildPublicationFingerprint(FScratch,
     MANIFEST_FILE, CFG_FILE, LOCKFILE, 'modules', FirstRequest);
   SysUtils.DeleteFile(FScratch + '/modules/a-alias');
