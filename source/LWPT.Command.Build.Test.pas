@@ -3,8 +3,10 @@
 
   Non-destructive clean rebuild behaviour is covered end-to-end by
   tests/integration/BuildClean.Test.pas through the real binary; this
-  file stays at the unit level: pure string classification, no
-  filesystem, no subprocess. }
+  file stays at the unit level: string classification plus the
+  TLWPTCompilerProcess contract (cancellation reaping, exit-code
+  reporting), exercised by re-invoking this test binary as a proxy
+  child instead of launching a full build. }
 
 program LWPT.Command.Build.Test;
 
@@ -26,6 +28,8 @@ uses
 const
   COMPILER_PROCESS_PROXY_OPTION = '--' + PROGRAM_NAME
     + '-compiler-process-proxy';
+  COMPILER_EXIT_PROXY_OPTION = '--' + PROGRAM_NAME
+    + '-compiler-exit-proxy';
 
 type
   TStaleArtefactSignature = class(TTestSuite)
@@ -38,6 +42,7 @@ type
     procedure TestReslstMentionAloneDoesNotMatch;
     procedure TestEmptyOutputDoesNotMatch;
     procedure TestCompilerCancellationCapturesAndReaps;
+    procedure TestCompilerNonZeroExitIsReported;
   end;
 
   TCompilerRunnerThread = class(TThread)
@@ -147,6 +152,33 @@ begin
   end;
 end;
 
+procedure TStaleArtefactSignature.TestCompilerNonZeroExitIsReported;
+var
+  Runner: TLWPTCompilerProcess;
+  OutText: string;
+begin
+  { Regression: on Unix, TProcess.ExitCode reads 0 when WaitOnExit
+    itself reaps the child (FPC 3.2.2 stores the decoded code and
+    ExitCode re-applies wifexited to it), so a failed fpc run was
+    treated as a successful target and publication of a non-existent
+    candidate binary was attempted. Run must surface the child's real
+    exit code no matter which call reaped it. }
+  Runner := TLWPTCompilerProcess.Create(ExpandFileName(ParamStr(0)));
+  try
+    Expect<Integer>(Runner.Run([COMPILER_EXIT_PROXY_OPTION, '7'],
+      OutText)).ToBe(7);
+    Expect<Boolean>(Pos('exit-proxy-output', OutText) > 0).ToBe(True);
+    { 128 is the nastiest edge: its low seven bits are zero, so the
+      double-decode also mistakes it for a clean wifexited status. }
+    Expect<Integer>(Runner.Run([COMPILER_EXIT_PROXY_OPTION, '128'],
+      OutText)).ToBe(128);
+    Expect<Integer>(Runner.Run([COMPILER_EXIT_PROXY_OPTION, '0'],
+      OutText)).ToBe(0);
+  finally
+    Runner.Free;
+  end;
+end;
+
 procedure TStaleArtefactSignature.SetupTests;
 begin
   Test('internal compiler exception matches',
@@ -160,6 +192,8 @@ begin
   Test('empty output does not match', TestEmptyOutputDoesNotMatch);
   Test('compiler cancellation captures output and reaps the child',
     TestCompilerCancellationCapturesAndReaps);
+  Test('nonzero compiler exit is reported, not dropped to 0',
+    TestCompilerNonZeroExitIsReported);
 end;
 
 function RunCompilerProcessProxy: Integer;
@@ -172,10 +206,22 @@ begin
   Result := 0;
 end;
 
+{ Emit a marker (so output capture is asserted alongside the exit
+  code) and terminate with the requested status. }
+function RunCompilerExitProxy: Integer;
+begin
+  WriteLn('exit-proxy-output');
+  Flush(Output);
+  Result := StrToInt(ParamStr(2));
+end;
+
 begin
   if (ParamCount >= 2)
      and (ParamStr(1) = COMPILER_PROCESS_PROXY_OPTION) then
     Halt(RunCompilerProcessProxy);
+  if (ParamCount >= 2)
+     and (ParamStr(1) = COMPILER_EXIT_PROXY_OPTION) then
+    Halt(RunCompilerExitProxy);
   TestRunnerProgram.AddSuite(TStaleArtefactSignature.Create(
     'build: stale-artefact failure signature'));
   TestRunnerProgram.Run;

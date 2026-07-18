@@ -207,7 +207,10 @@ begin
         AppendRawBytes(AOutput, Buf[0], N);
     until N <= 0;
     P.WaitOnExit;
-    Result := P.ExitCode;
+    { Not P.ExitCode directly: WaitOnExit just reaped the child, and on
+      that path Unix ExitCode drops most nonzero exits (see
+      NormalisedExitCode). A failed compile must never read as 0. }
+    Result := NormalisedExitCode(P);
     EnterCriticalSection(FCriticalSection);
     try
       if FCancelled then Result := 1;
