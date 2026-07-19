@@ -270,26 +270,24 @@ jobs:
           done
           ls -la staged/
 
-      - name: Check Windows TLS dependencies (SChannel only, no OpenSSL)
+      - name: Check Windows TLS imports (native client, runtime-loaded server)
         if: matrix.os == 'win64' || matrix.os == 'win32'
         run: |
-          # Per ADR-0016: Windows builds use SChannel for TLS — the
-          # cross-built lwpt.exe must NOT pull in FPC's openssl unit
-          # (which would embed `libssl` / `libcrypto` DLL-name strings
-          # for runtime LoadLibrary). Catches the case where someone
-          # adds `uses OpenSSL` under a Windows-active codepath.
-          # Mirrors GocciaScript's same guard and ci.yml's test-job
-          # check; release.yml needs its own copy because tag pushes
-          # do not trigger ci.yml.
-          # grep -q, not `grep -ao | head -1 | grep -q .`: under a
-          # pipefail shell, head closing the pipe can SIGPIPE the left
-          # grep (exit 141) and silently pass the guard exactly when
-          # matches are plentiful. -q is immune either way.
-          if LC_ALL=C grep -aq 'libssl\|libcrypto' staged/lwpt.exe; then
-            echo "::error::lwpt.exe references libssl/libcrypto — must use SChannel only on Windows (ADR-0016)"
+          # ADR-0016 keeps the Windows client on SChannel; ADR-0024 uses
+          # OpenSSL only through LoadLibrary for server accept. DLL-name
+          # strings are therefore expected, but PE imports are forbidden.
+          # Capture objdump output before grep: this job uses pipefail,
+          # and a producer piped into `grep -q` can receive SIGPIPE and
+          # turn a real match into a false pass (exit 141).
+          if ! imports="$(objdump -p staged/lwpt.exe)"; then
+            echo "::error::objdump could not inspect staged/lwpt.exe imports"
             exit 1
           fi
-          echo "OK: no libssl/libcrypto references in staged/lwpt.exe"
+          if LC_ALL=C grep -Eiq '^[[:space:]]*DLL Name:[[:space:]].*(libssl|libcrypto)' <<<"$imports"; then
+            echo "::error::lwpt.exe import-links libssl/libcrypto — clients use SChannel (ADR-0016) and servers must runtime-load OpenSSL (ADR-0024)"
+            exit 1
+          fi
+          echo "OK: no libssl/libcrypto imports in staged/lwpt.exe"
 
       - name: Upload release artefact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

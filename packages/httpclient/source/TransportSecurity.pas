@@ -5,6 +5,15 @@ unit TransportSecurity;
 
 {$I Shared.inc}
 
+{$IFDEF MSWINDOWS}
+{$DEFINE TRANSPORT_SECURITY_OPENSSL}
+{$ENDIF}
+{$IFDEF UNIX}
+{$IFNDEF DARWIN}
+{$DEFINE TRANSPORT_SECURITY_OPENSSL}
+{$ENDIF}
+{$ENDIF}
+
 interface
 
 uses
@@ -18,6 +27,8 @@ uses
   ;
 
 type
+  ETransportSecurityError = class(Exception);
+
   TTransportSecurityConnection = record
   public
     Active: Boolean;
@@ -27,8 +38,21 @@ type
     BackendData: Pointer;
   end;
 
+  TTransportSecurityServerContext = class
+  private
+    FBackendData: Pointer;
+  public
+    constructor Create(const ACertificatePath, APrivateKeyPath: string);
+    destructor Destroy; override;
+  end;
+
 procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
   const ASocket: TSocket; const AHost: string);
+procedure CloseTransportSecurityServerContext(
+  var AContext: TTransportSecurityServerContext);
+procedure StartTransportSecurityServer(
+  var AConnection: TTransportSecurityConnection;
+  const AContext: TTransportSecurityServerContext; const ASocket: TSocket);
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
 function TransportSecurityRead(var AConnection: TTransportSecurityConnection;
   var ABuffer: array of Byte; const ALength: Integer): Integer;
@@ -40,11 +64,10 @@ implementation
 uses
   {$IFDEF UNIX}
   BaseUnix,
-  {$IFNDEF DARWIN}
-  ctypes,
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   DynLibs,
   OpenSSL,
-  {$ENDIF}
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Windows,
@@ -57,12 +80,13 @@ const
   TSB_SECURE_TRANSPORT = 2;
   TSB_SCHANNEL = 3;
   OPENSSL_LOAD_ERROR = 'HTTPS requires OpenSSL but it could not be loaded';
+  OPENSSL_SERVER_LOAD_ERROR =
+    'TLS server accept requires OpenSSL but it could not be loaded';
+  TLS_SERVER_UNSUPPORTED_ERROR =
+    'TLS server accept is not supported on macOS; use Network.framework for server TLS';
   TLS_HANDSHAKE_ERROR = 'TLS handshake failed';
   TLS_READ_ERROR = 'TLS read failed';
   TLS_WRITE_ERROR = 'TLS write failed';
-
-type
-  ETransportSecurityError = class(Exception);
 
 function SocketSend(const ASock: TSocket; const ABuffer: Pointer;
   const ALength: Integer): Integer; inline;
@@ -327,8 +351,7 @@ begin
 end;
 {$ENDIF}
 
-{$IFDEF UNIX}
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 type
   TOpenSSLData = class
   public
@@ -336,15 +359,31 @@ type
     SSL: PSSL;
   end;
 
-  TSSLSetDefaultVerifyPaths = function(AContext: PSSL_CTX): cint; cdecl;
-  TSSLSetHostName = function(ASSL: PSSL; AHost: PAnsiChar): cint; cdecl;
+  TOpenSSLServerContextData = class
+  public
+    Context: PSSL_CTX;
+  end;
+
+  TSSLSetDefaultVerifyPaths = function(AContext: PSSL_CTX): LongInt; cdecl;
+  TSSLSetHostName = function(ASSL: PSSL; AHost: PAnsiChar): LongInt; cdecl;
   TSSLMethodGetter = function: Pointer; cdecl;
 
 const
-  OPENSSL_VERSION_THREE = '.3';
   SSL_CTRL_SET_MIN_PROTO_VERSION = 123;
   TLS1_2_VERSION = $0303;
+  {$IFDEF MSWINDOWS}
+  {$IFDEF WIN64}
+  OPENSSL_VERSION_THREE_SSL_LIBRARY = 'libssl-3-x64.dll';
+  OPENSSL_VERSION_THREE_CRYPTO_LIBRARY = 'libcrypto-3-x64.dll';
+  {$ELSE}
+  OPENSSL_VERSION_THREE_SSL_LIBRARY = 'libssl-3.dll';
+  OPENSSL_VERSION_THREE_CRYPTO_LIBRARY = 'libcrypto-3.dll';
+  {$ENDIF}
+  {$ELSE}
+  OPENSSL_VERSION_THREE = '.3';
+  {$ENDIF}
 
+{$IFDEF UNIX}
 procedure PreferOpenSSLVersionThree;
 var
   I: Integer;
@@ -370,8 +409,10 @@ begin
     DLLVersions[Low(DLLVersions)] := AVersion;
   end;
 end;
+{$ENDIF}
 
 procedure ConfigureOpenSSLLoading;
+{$IFDEF UNIX}
 const
   DIRECTORIES: array[0..7] of string = (
     '/lib/x86_64-linux-gnu',
@@ -391,13 +432,31 @@ const
 var
   DirectoryIndex: Integer;
   VersionIndex: Integer;
+{$ENDIF}
 begin
+  {$IFDEF MSWINDOWS}
+  DLLSSLName := OPENSSL_VERSION_THREE_SSL_LIBRARY;
+  DLLUtilName := OPENSSL_VERSION_THREE_CRYPTO_LIBRARY;
+  {$ELSE}
   PreferOpenSSLVersionThree;
   for DirectoryIndex := Low(DIRECTORIES) to High(DIRECTORIES) do
     for VersionIndex := Low(VERSIONS) to High(VERSIONS) do
       if TryUseOpenSSLPair(DIRECTORIES[DirectoryIndex],
         VERSIONS[VersionIndex]) then
         Exit;
+  {$ENDIF}
+end;
+
+function TryLoadOpenSSL: Boolean;
+begin
+  if IsSSLloaded then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  ConfigureOpenSSLLoading;
+  Result := InitSSLInterface;
 end;
 
 procedure ConfigureOpenSSLVerification(const AContext: PSSL_CTX;
@@ -446,17 +505,39 @@ begin
   end;
 end;
 
+function CreateOpenSSLServerContext: PSSL_CTX;
+var
+  GetMethod: TSSLMethodGetter;
+begin
+  GetMethod := TSSLMethodGetter(GetProcedureAddress(SSLLibHandle,
+    'TLS_server_method'));
+  if not Assigned(GetMethod) then
+    GetMethod := TSSLMethodGetter(GetProcedureAddress(SSLLibHandle,
+      'TLS_method'));
+  if not Assigned(GetMethod) then
+    raise ETransportSecurityError.Create(
+      'OpenSSL library does not provide a version-flexible TLS server method');
+
+  Result := SslCtxNew(GetMethod());
+  if not Assigned(Result) then
+    raise ETransportSecurityError.Create('Failed to create OpenSSL server context');
+
+  if SslCTXCtrl(Result, SSL_CTRL_SET_MIN_PROTO_VERSION,
+    TLS1_2_VERSION, nil) <= 0 then
+  begin
+    SslCtxFree(Result);
+    raise ETransportSecurityError.Create(
+      'Failed to set minimum OpenSSL server TLS version');
+  end;
+end;
+
 procedure StartOpenSSL(var AConnection: TTransportSecurityConnection;
   const AHost: string);
 var
   Data: TOpenSSLData;
 begin
-  if not IsSSLloaded then
-  begin
-    ConfigureOpenSSLLoading;
-    if not InitSSLInterface then
-      raise ETransportSecurityError.Create(OPENSSL_LOAD_ERROR);
-  end;
+  if not TryLoadOpenSSL then
+    raise ETransportSecurityError.Create(OPENSSL_LOAD_ERROR);
 
   Data := TOpenSSLData.Create;
   Data.Context := nil;
@@ -488,6 +569,51 @@ begin
       SslFree(Data.SSL);
     if Assigned(Data.Context) then
       SslCtxFree(Data.Context);
+    Data.Free;
+    raise;
+  end;
+end;
+
+procedure StartOpenSSLServer(var AConnection: TTransportSecurityConnection;
+  const AContext: TTransportSecurityServerContext);
+var
+  ContextData: TOpenSSLServerContextData;
+  Data: TOpenSSLData;
+  AcceptResult: Integer;
+  ErrorCode: Integer;
+begin
+  ContextData := TOpenSSLServerContextData(AContext.FBackendData);
+  if not Assigned(ContextData) or not Assigned(ContextData.Context) then
+    raise ETransportSecurityError.Create(
+      'TLS server context is not initialized');
+
+  Data := TOpenSSLData.Create;
+  Data.Context := nil;
+  Data.SSL := nil;
+  try
+    Data.SSL := SslNew(ContextData.Context);
+    if not Assigned(Data.SSL) then
+      raise ETransportSecurityError.Create(
+        'Failed to create OpenSSL server session');
+
+    if SslSetFd(Data.SSL, AConnection.Socket) <> 1 then
+      raise ETransportSecurityError.Create(
+        'Failed to bind OpenSSL server session to socket');
+
+    AcceptResult := SslAccept(Data.SSL);
+    if AcceptResult <= 0 then
+    begin
+      ErrorCode := SslGetError(Data.SSL, AcceptResult);
+      raise ETransportSecurityError.CreateFmt(
+        'TLS accept handshake failed: OpenSSL error %d', [ErrorCode]);
+    end;
+
+    AConnection.BackendData := Data;
+    AConnection.Backend := TSB_OPENSSL;
+    AConnection.Active := True;
+  except
+    if Assigned(Data.SSL) then
+      SslFree(Data.SSL);
     Data.Free;
     raise;
   end;
@@ -568,7 +694,6 @@ begin
     end;
   until False;
 end;
-{$ENDIF}
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
@@ -1128,6 +1253,73 @@ begin
 end;
 {$ENDIF}
 
+constructor TTransportSecurityServerContext.Create(
+  const ACertificatePath, APrivateKeyPath: string);
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  Data: TOpenSSLServerContextData;
+{$ENDIF}
+begin
+  inherited Create;
+  FBackendData := nil;
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  if not FileExists(ACertificatePath) then
+    raise ETransportSecurityError.CreateFmt(
+      'TLS certificate PEM file does not exist: "%s"', [ACertificatePath]);
+  if not FileExists(APrivateKeyPath) then
+    raise ETransportSecurityError.CreateFmt(
+      'TLS private-key PEM file does not exist: "%s"', [APrivateKeyPath]);
+  if not TryLoadOpenSSL then
+    raise ETransportSecurityError.Create(OPENSSL_SERVER_LOAD_ERROR);
+
+  Data := TOpenSSLServerContextData.Create;
+  Data.Context := nil;
+  FBackendData := Data;
+  Data.Context := CreateOpenSSLServerContext;
+  if SslCtxUseCertificateChainFile(Data.Context,
+    AnsiString(ACertificatePath)) <> 1 then
+    raise ETransportSecurityError.CreateFmt(
+      'Failed to load TLS certificate chain from PEM file "%s"',
+      [ACertificatePath]);
+  if SslCtxUsePrivateKeyFile(Data.Context, AnsiString(APrivateKeyPath),
+    SSL_FILETYPE_PEM) <> 1 then
+    raise ETransportSecurityError.CreateFmt(
+      'Failed to load TLS private key from PEM file "%s"',
+      [APrivateKeyPath]);
+  if SslCtxCheckPrivateKeyFile(Data.Context) <> 1 then
+    raise ETransportSecurityError.CreateFmt(
+      'TLS private key "%s" does not match certificate "%s"',
+      [APrivateKeyPath, ACertificatePath]);
+  {$ELSE}
+  raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
+  {$ENDIF}
+end;
+
+destructor TTransportSecurityServerContext.Destroy;
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  Data: TOpenSSLServerContextData;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Data := TOpenSSLServerContextData(FBackendData);
+  if Assigned(Data) then
+  begin
+    if Assigned(Data.Context) then
+      SslCtxFree(Data.Context);
+    Data.Free;
+  end;
+  {$ENDIF}
+  FBackendData := nil;
+  inherited Destroy;
+end;
+
+procedure CloseTransportSecurityServerContext(
+  var AContext: TTransportSecurityServerContext);
+begin
+  FreeAndNil(AContext);
+end;
+
 procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
   const ASocket: TSocket; const AHost: string);
 begin
@@ -1146,6 +1338,24 @@ begin
   {$ENDIF}
 end;
 
+procedure StartTransportSecurityServer(
+  var AConnection: TTransportSecurityConnection;
+  const AContext: TTransportSecurityServerContext; const ASocket: TSocket);
+begin
+  FillChar(AConnection, SizeOf(AConnection), 0);
+  AConnection.Socket := ASocket;
+  AConnection.Backend := TSB_NONE;
+
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  if not Assigned(AContext) then
+    raise ETransportSecurityError.Create(
+      'TLS server context is not initialized');
+  StartOpenSSLServer(AConnection, AContext);
+  {$ELSE}
+  raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
+  {$ENDIF}
+end;
+
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
 begin
   if not AConnection.Active then
@@ -1160,11 +1370,9 @@ begin
     TSB_SCHANNEL:
       CloseSChannel(AConnection);
     {$ENDIF}
-    {$IFDEF UNIX}
-    {$IFNDEF DARWIN}
+    {$IFDEF TRANSPORT_SECURITY_OPENSSL}
     TSB_OPENSSL:
       CloseOpenSSL(AConnection);
-    {$ENDIF}
     {$ENDIF}
   end;
 
@@ -1191,11 +1399,9 @@ begin
     TSB_SCHANNEL:
       Result := ReadSChannel(AConnection, ABuffer, ALength);
     {$ENDIF}
-    {$IFDEF UNIX}
-    {$IFNDEF DARWIN}
+    {$IFDEF TRANSPORT_SECURITY_OPENSSL}
     TSB_OPENSSL:
       Result := ReadOpenSSL(AConnection, ABuffer, ALength);
-    {$ENDIF}
     {$ENDIF}
   else
     Result := 0;
@@ -1220,11 +1426,9 @@ begin
     TSB_SCHANNEL:
       Result := WriteSChannel(AConnection, ABuffer, ALength);
     {$ENDIF}
-    {$IFDEF UNIX}
-    {$IFNDEF DARWIN}
+    {$IFDEF TRANSPORT_SECURITY_OPENSSL}
     TSB_OPENSSL:
       Result := WriteOpenSSL(AConnection, ABuffer, ALength);
-    {$ENDIF}
     {$ENDIF}
   else
     Result := 0;

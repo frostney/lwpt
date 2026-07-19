@@ -392,24 +392,22 @@ jobs:
             ./build/lwpt --help
           fi
 
-      - name: Check Windows TLS dependencies (SChannel only, no OpenSSL)
+      - name: Check Windows TLS imports (native client, runtime-loaded server)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Per ADR-0016: TransportSecurity.pas uses SChannel on Windows,
-          # so the cross-built lwpt.exe must NOT pull in FPC's openssl
-          # unit. A presence of `libssl` or `libcrypto` substrings in
-          # the binary means someone accidentally added `uses OpenSSL`
-          # under a Windows-active codepath (the unit registers the DLL
-          # names for runtime LoadLibrary). Mirrors GocciaScript's same
-          # guard verbatim.
+          # ADR-0016 keeps the Windows client on SChannel; ADR-0024 uses
+          # OpenSSL only through LoadLibrary for server accept. Inspect the
+          # PE import table so legitimate runtime-loader strings do not fail.
           $path = "build/lwpt.exe"
-          $bytes = [System.IO.File]::ReadAllBytes($path)
-          $text = [System.Text.Encoding]::Latin1.GetString($bytes)
-          if ($text -match "libssl|libcrypto") {
-            throw "lwpt.exe must not depend on OpenSSL DLLs for HTTPS on Windows (SChannel is the only backend per ADR-0016)"
+          $imports = (& objdump -p $path 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "objdump could not inspect $path imports"
           }
-          Write-Host "OK: no libssl/libcrypto references in lwpt.exe"
+          if ($imports -match "(?im)^\s*DLL Name:\s*.*(libssl|libcrypto)") {
+            throw "lwpt.exe import-links libssl/libcrypto; clients use SChannel (ADR-0016) and servers must runtime-load OpenSSL (ADR-0024)"
+          }
+          Write-Host "OK: no libssl/libcrypto imports in lwpt.exe"
 
       - name: lwpt install (workspace auto-discovery + linking)
         run: |

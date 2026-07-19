@@ -233,22 +233,23 @@ jobs:
           fi
           ls -la build/
 
-      - name: Check Windows TLS dependencies (SChannel only, no OpenSSL)
+      - name: Check Windows TLS imports (native client, runtime-loaded server)
         run: |
-          # Per ADR-0016: Windows uses SChannel for TLS — lwpt.exe must
-          # NOT pull in FPC's openssl unit (which embeds libssl /
-          # libcrypto DLL-name strings for runtime LoadLibrary). ci.yml
-          # and release.yml carry the same guard post-merge / at tag
-          # time; this copy makes the release-blocker visible on the PR.
-          # grep -q, not `grep -ao | head -1 | grep -q .`: this job's
-          # shell runs with pipefail, where head closing the pipe can
-          # SIGPIPE the left grep (exit 141) and silently pass the
-          # guard exactly when matches are plentiful.
-          if LC_ALL=C grep -aq 'libssl\|libcrypto' build/lwpt.exe; then
-            echo "::error::lwpt.exe references libssl/libcrypto — must use SChannel only on Windows (ADR-0016)"
+          # ADR-0016 keeps the Windows client on SChannel; ADR-0024 uses
+          # OpenSSL only through LoadLibrary for server accept. DLL-name
+          # strings are therefore expected, but PE imports are forbidden.
+          # Capture objdump output before grep: this job uses pipefail,
+          # and a producer piped into `grep -q` can receive SIGPIPE and
+          # turn a real match into a false pass (exit 141).
+          if ! imports="$(objdump -p build/lwpt.exe)"; then
+            echo "::error::objdump could not inspect build/lwpt.exe imports"
             exit 1
           fi
-          echo "OK: no libssl/libcrypto references in build/lwpt.exe"
+          if LC_ALL=C grep -Eiq '^[[:space:]]*DLL Name:[[:space:]].*(libssl|libcrypto)' <<<"$imports"; then
+            echo "::error::lwpt.exe import-links libssl/libcrypto — clients use SChannel (ADR-0016) and servers must runtime-load OpenSSL (ADR-0024)"
+            exit 1
+          fi
+          echo "OK: no libssl/libcrypto imports in build/lwpt.exe"
 
       - name: Upload lwpt.exe for the native test job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
