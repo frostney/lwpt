@@ -13,6 +13,7 @@ uses
   SysUtils,
 
   LWPT.Core,
+  LWPT.BuildSession,
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
@@ -52,6 +53,8 @@ type
     procedure RunSignalForwardingTest(ASignal: Integer;
       const AProjectName: string);
     {$ENDIF}
+    function RunTestsWithHeartbeat(const AArgs: array of string;
+      AHeartbeatMilliseconds: Integer): TLwptResult;
   protected
     procedure BeforeAll; override;
     procedure BeforeEach; override;
@@ -68,6 +71,9 @@ type
     procedure TestSIGINTTerminatesActiveProcessTree;
     procedure TestSIGTERMTerminatesActiveProcessTree;
     {$ENDIF}
+    procedure TestSilentJobEmitsHeartbeatAndProgress;
+    procedure TestFailureReplaysAndPreservesIsolatedLog;
+    procedure TestVerboseSuccessLogsNeverInterleave;
   end;
 
 function PascalString(const AValue: string): string;
@@ -194,6 +200,13 @@ begin
 end;
 
 function TTestScheduling.RunTests(const AArgs: array of string): TLwptResult;
+begin
+  Result := RunTestsWithHeartbeat(AArgs, 0);
+end;
+
+function TTestScheduling.RunTestsWithHeartbeat(
+  const AArgs: array of string;
+  AHeartbeatMilliseconds: Integer): TLwptResult;
 var
   Args, Environment: array of string;
   i: Integer;
@@ -201,11 +214,15 @@ begin
   SetLength(Args, Length(AArgs) + 1);
   Args[0] := 'test';
   for i := 0 to High(AArgs) do Args[i + 1] := AArgs[i];
-  SetLength(Environment, 3);
+  if AHeartbeatMilliseconds > 0 then SetLength(Environment, 4)
+  else SetLength(Environment, 3);
   Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
   Environment[1] := WORKER_STATE_DIR_ENV + '='
     + FScratch + '/worker-state';
   Environment[2] := WORKER_BUDGET_ENV + '=2';
+  if AHeartbeatMilliseconds > 0 then
+    Environment[3] := OBSERVABILITY_HEARTBEAT_INTERVAL_ENV + '='
+      + IntToStr(AHeartbeatMilliseconds);
   Result := RunLwpt(Args, FScratch, Environment);
 end;
 
@@ -229,6 +246,122 @@ begin
   Environment[4] := ProcessTreeProxyModeEnvironment + '=' + AProxyMode;
   Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + APIDFile;
   Result := RunLwpt(Args, FScratch, Environment);
+procedure TTestScheduling.TestSilentJobEmitsHeartbeatAndProgress;
+var
+  R: TLwptResult;
+begin
+  ResetProject(0);
+  WriteTextFile(FScratch + '/tests/A.Silent.Test.pas',
+      'program SilentFixture;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses SysUtils;'#10
+    + 'begin Sleep(350) end.'#10);
+  WriteTextFile(FScratch + '/tests/e2e/B.Skip.Test.pas',
+      'program SkipFixture;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'begin end.'#10);
+  R := RunTestsWithHeartbeat([], 75);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('test session: ', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('(.lwpt/sessions/', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('discovered 2 test file(s)', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('effective workers: 1', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('START tests/A.Silent.Test.pas', R.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('HEARTBEAT test elapsed ', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('active: tests/A.Silent.Test.pas', R.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('PASS tests/A.Silent.Test.pas', R.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('SKIP tests/e2e/B.Skip.Test.pas (e2e tier)',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('summary: 1 passed, 0 failed, 0 did not compile, '
+    + '1 skipped, 0 cancelled; elapsed ', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(' ms', R.Stdout) > 0).ToBe(True);
+end;
+
+procedure TTestScheduling.TestFailureReplaysAndPreservesIsolatedLog;
+var
+  R: TLwptResult;
+  SessionSearch, LogSearch: TSearchRec;
+  LogPath: string;
+begin
+  ResetProject(0);
+  WriteTextFile(FScratch + '/tests/A.Fail.Test.pas',
+      'program FailingFixture;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'begin Write(''failure-detail-41''); Halt(7) end.'#10);
+  R := RunTests([]);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('FAIL tests/A.Fail.Test.pas (exit 7;', R.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('failure-detail-41', R.Stdout)
+    > Pos('FAIL tests/A.Fail.Test.pas', R.Stdout)).ToBe(True);
+  LogPath := '';
+  if FindFirst(FScratch + '/.lwpt/sessions/s-*', faDirectory,
+    SessionSearch) = 0 then
+  try
+    repeat
+      if (SessionSearch.Attr and faDirectory) = 0 then Continue;
+      if FindFirst(FScratch + '/.lwpt/sessions/' + SessionSearch.Name
+        + '/logs/*.log', faAnyFile, LogSearch) = 0 then
+      try
+        LogPath := FScratch + '/.lwpt/sessions/' + SessionSearch.Name
+          + '/logs/' + LogSearch.Name;
+      finally
+        FindClose(LogSearch);
+      end;
+    until (LogPath <> '') or (FindNext(SessionSearch) <> 0);
+  finally
+    FindClose(SessionSearch);
+  end;
+  Expect<Boolean>(LogPath <> '').ToBe(True);
+  Expect<Boolean>(Pos('failure-detail-41', ReadBinaryFile(LogPath)) > 0)
+    .ToBe(True);
+end;
+
+procedure TTestScheduling.TestVerboseSuccessLogsNeverInterleave;
+var
+  R: TLwptResult;
+begin
+  ResetProject(0);
+  WriteTextFile(FScratch + '/tests/A.Output.Test.pas',
+      'program OutputA;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses SysUtils;'#10
+    + 'begin Write(''alpha-1|''); Flush(Output); Sleep(120); '
+    + 'Write(''alpha-2|'') end.'#10);
+  WriteTextFile(FScratch + '/tests/B.Output.Test.pas',
+      'program OutputB;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses SysUtils;'#10
+    + 'begin Write(''beta-1|''); Flush(Output); Sleep(80); '
+    + 'Write(''beta-2|'') end.'#10);
+  R := RunTests([]);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('alpha-1|', R.Stdout) = 0).ToBe(True);
+  Expect<Boolean>(Pos('beta-1|', R.Stdout) = 0).ToBe(True);
+  Expect<Boolean>(Pos('HEARTBEAT ', R.Stdout) = 0).ToBe(True);
+
+  ResetProject(0);
+  WriteTextFile(FScratch + '/tests/A.Output.Test.pas',
+      'program OutputA;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses SysUtils;'#10
+    + 'begin Write(''alpha-1|''); Flush(Output); Sleep(120); '
+    + 'Write(''alpha-2|'') end.'#10);
+  WriteTextFile(FScratch + '/tests/B.Output.Test.pas',
+      'program OutputB;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses SysUtils;'#10
+    + 'begin Write(''beta-1|''); Flush(Output); Sleep(80); '
+    + 'Write(''beta-2|'') end.'#10);
+  R := RunTests(['--verbose']);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('alpha-1|alpha-2|', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('beta-1|beta-2|', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('summary: 2 passed, 0 failed, 0 did not compile, '
+    + '0 skipped, 0 cancelled; elapsed ', R.Stdout) > 0).ToBe(True);
 end;
 
 procedure TTestScheduling.TestDefaultJobsOverlap;
@@ -626,6 +759,12 @@ begin
   Test('SIGTERM reaps the active compiler tree',
     TestSIGTERMTerminatesActiveProcessTree);
   {$ENDIF}
+  Test('silent jobs emit heartbeat and serialized progress',
+    TestSilentJobEmitsHeartbeatAndProgress);
+  Test('failures replay output and preserve isolated logs',
+    TestFailureReplaysAndPreservesIsolatedLog);
+  Test('verbose success logs never interleave',
+    TestVerboseSuccessLogsNeverInterleave);
 end;
 
 begin

@@ -17,6 +17,9 @@ const
   BUILD_SESSION_SCHEMA_VERSION = 1;
   BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION = 1;
   BUILD_SESSIONS_DIR = LWPT_DIR + '/sessions';
+  OBSERVABILITY_HEARTBEAT_INTERVAL_ENV = PROJECT_NAME
+    + '_HEARTBEAT_INTERVAL_MS';
+  DEFAULT_OBSERVABILITY_HEARTBEAT_INTERVAL_MS = 30000;
   { FPC's RTL FileRec/TextRec name buffer holds this many characters. The
     compiler writes .s assembly files and link scripts through that API and
     silently truncates longer paths: the assembly lands under a truncated
@@ -53,7 +56,11 @@ type
     constructor Create(const AProjectRoot: string);
     destructor Destroy; override;
     function JobRoot(const AName: string): string;
+    function JobLogPath(const AName: string): string;
+    function JobLogReference(const AName: string): string;
     function HookRoot: string;
+    function SessionReference: string;
+    procedure WriteJobLog(const AName, AOutput: string);
     procedure Finish(ASuccess: Boolean; const ADetail: string = '');
     property SessionID: string read FSessionID;
     property SessionRoot: string read FSessionRoot;
@@ -64,6 +71,8 @@ function CaptureBuildPublicationFingerprint(
   AModulesPath: string;
   const ARequest: TLWPTBuildPublicationRequest): string;
 function BuildSessionPathKey(const AValue: string): string;
+function ObservabilityHeartbeatIntervalMilliseconds: QWord;
+function FormatElapsedMilliseconds(AElapsed: QWord): string;
 procedure AppendUnitDirsFromOptions(const AOptions: TStrings;
   var ADirs: TStringArray);
 procedure AppendUnitDirsFromCfg(const ACfgPath: string;
@@ -192,6 +201,22 @@ begin
   if Length(BaseName) > 16 then SetLength(BaseName, 16);
   Digest := TextHash(AValue);
   Result := BaseName + '-' + Copy(Digest, 8, 12);
+end;
+
+function ObservabilityHeartbeatIntervalMilliseconds: QWord;
+var
+  Raw: string;
+  Parsed: Int64;
+begin
+  Raw := GetEnvironmentVariable(OBSERVABILITY_HEARTBEAT_INTERVAL_ENV);
+  if (Raw <> '') and TryStrToInt64(Raw, Parsed) and (Parsed > 0) then
+    Exit(QWord(Parsed));
+  Result := DEFAULT_OBSERVABILITY_HEARTBEAT_INTERVAL_MS;
+end;
+
+function FormatElapsedMilliseconds(AElapsed: QWord): string;
+begin
+  Result := UIntToStr(AElapsed) + ' ms';
 end;
 
 { Single home for "which directories does this compile search for unit
@@ -1066,10 +1091,43 @@ begin
   ForceDirectories(Result);
 end;
 
+function TLWPTBuildSession.JobLogPath(const AName: string): string;
+begin
+  Result := FSessionRoot + '/logs/' + BuildSessionPathKey(AName) + '.log';
+end;
+
+function TLWPTBuildSession.JobLogReference(const AName: string): string;
+begin
+  Result := SessionReference + '/logs/' + BuildSessionPathKey(AName) + '.log';
+end;
+
 function TLWPTBuildSession.HookRoot: string;
 begin
   Result := FSessionRoot + '/hooks';
   ForceDirectories(Result);
+end;
+
+function TLWPTBuildSession.SessionReference: string;
+begin
+  Result := BUILD_SESSIONS_DIR + '/' + FSessionID;
+end;
+
+procedure TLWPTBuildSession.WriteJobLog(const AName, AOutput: string);
+var
+  LogPath: string;
+  Stream: TFileStream;
+begin
+  LogPath := JobLogPath(AName);
+  if not ForceDirectories(ExtractFileDir(LogPath)) then
+    raise ELWPTError.CreateFmt('could not create session log directory %s',
+      [ExtractFileDir(LogPath)]);
+  Stream := TFileStream.Create(LogPath, fmCreate);
+  try
+    if AOutput <> '' then
+      Stream.WriteBuffer(AOutput[1], Length(AOutput));
+  finally
+    Stream.Free;
+  end;
 end;
 
 procedure TLWPTBuildSession.Finish(ASuccess: Boolean; const ADetail: string);

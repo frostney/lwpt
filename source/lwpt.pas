@@ -139,7 +139,7 @@ end;
 function HandleBuild(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  Release, Clean, JobsPresent : Boolean;
+  Release, Clean, JobsPresent, Verbose : Boolean;
   Jobs : Integer;
   ModeVal : string;
   TargetNames : array of string;
@@ -149,10 +149,14 @@ begin
   Clean   := False;
   Jobs    := 0;              { auto: bounded by graph + machine budget }
   JobsPresent := False;
+  Verbose := False;
   for i := 0 to High(AOptions) do
   begin
     if SameText(AOptions[i].LongName, 'clean') and AOptions[i].Present then
       Clean := True;
+    if SameText(AOptions[i].LongName, 'verbose')
+       and AOptions[i].Present then
+      Verbose := True;
     if SameText(AOptions[i].LongName, 'mode')
        and (AOptions[i] is TStringOption) then
     begin
@@ -184,7 +188,8 @@ begin
   for i := 0 to APositionals.Count - 1 do
     TargetNames[i] := APositionals[i];
   try
-    Result := CmdBuild(MANIFEST_FILE, TargetNames, Release, Clean, Jobs);
+    Result := CmdBuild(MANIFEST_FILE, TargetNames, Release, Clean, Jobs,
+      Verbose);
   except
     on E: Exception do
     begin
@@ -221,11 +226,12 @@ end;
 function HandleTest(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  IncludeE2E : Boolean;
+  IncludeE2E, Verbose : Boolean;
   TierVal : string;
   Jobs, Bail, i : Integer;
 begin
   IncludeE2E := False;
+  Verbose := False;
   Jobs := 0;
   Bail := -1;
   for i := 0 to High(AOptions) do
@@ -243,6 +249,9 @@ begin
         Exit(1);
       end;
     end
+    else if SameText(AOptions[i].LongName, 'verbose')
+       and AOptions[i].Present then
+      Verbose := True
     else if SameText(AOptions[i].LongName, 'jobs')
        and (AOptions[i] is TIntegerOption) and AOptions[i].Present then
     begin
@@ -266,7 +275,7 @@ begin
       end;
     end;
   try
-    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail);
+    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail, Verbose);
   except
     on E: Exception do
     begin
@@ -403,16 +412,18 @@ begin
       '<name> [<name>...]',
       @HandleRemove, RemoveOpts));
 
-    SetLength(BuildOpts, 3);
+    SetLength(BuildOpts, 4);
     BuildOpts[0] := TStringOption.Create('mode',
       'Build mode: dev (default) or release');
     BuildOpts[1] := TFlagOption.Create('clean',
       'Force a full rebuild in fresh private staging');
     BuildOpts[2] := TIntegerOption.Create('jobs',
       'Maximum concurrent build targets (default: machine budget)');
+    BuildOpts[3] := TFlagOption.Create('verbose',
+      'Replay successful target logs');
     Registry.Add(TSubcommand.Create('build',
       'Compile manifest targets',
-      '[target...] [--mode dev|release] [--clean] [--jobs N]',
+      '[target...] [--mode dev|release] [--clean] [--jobs N] [--verbose]',
       @HandleBuild, BuildOpts));
 
     SetLength(FormatOpts, 1);
@@ -422,16 +433,18 @@ begin
       'Format uses-clauses and identifiers', '[--check]',
       @HandleFormat, FormatOpts));
 
-    SetLength(TestOpts, 3);
+    SetLength(TestOpts, 4);
     TestOpts[0] := TStringOption.Create('tier',
       'Test tier to include: default (unit + integration) or e2e (adds network-touching tier)');
     TestOpts[1] := TIntegerOption.Create('jobs',
       'Maximum concurrent test programs (default: shared machine budget)');
     TestOpts[2] := TIntegerOption.Create('bail',
       'Stop after N compile or runtime failures; 0 runs the full queue');
+    TestOpts[3] := TFlagOption.Create('verbose',
+      'Replay successful test logs');
     Registry.Add(TSubcommand.Create('test',
       'Discover and run *.Test.pas files',
-      '[--tier default|e2e] [--jobs N] [--bail N]',
+      '[--tier default|e2e] [--jobs N] [--bail N] [--verbose]',
       @HandleTest, TestOpts));
 
     SetLength(RepairOpts, 0);

@@ -8,6 +8,7 @@ uses
   Process,
   SysUtils,
 
+  LWPT.BuildSession,
   LWPT.Core,
   LWPT.WorkerBudget,
   TestingPascalLibrary,
@@ -22,6 +23,8 @@ const
   TEST_FPC_RELEASE_ENV = PROJECT_NAME + '_TEST_FPC_RELEASE';
   TEST_FPC_RELEASE_DIR_ENV = PROJECT_NAME + '_TEST_FPC_RELEASE_DIR';
   TEST_FPC_FAIL_TARGET_ENV = PROJECT_NAME + '_TEST_FPC_FAIL_TARGET';
+  TEST_FPC_DELAY_MS_ENV = PROJECT_NAME + '_TEST_FPC_DELAY_MS';
+  TEST_FPC_OUTPUT_ENV = PROJECT_NAME + '_TEST_FPC_OUTPUT';
 
 type
   TBuildSessions = class(TTestSuite)
@@ -52,6 +55,8 @@ type
     procedure TestOneInvocationRunsReadyTargetsInParallel;
     procedure TestJobsOneRunsTargetsSequentially;
     procedure TestFailedPrerequisiteBlocksOnlyDependants;
+    procedure TestObservableBuildHeartbeatAndVerboseLogs;
+    procedure TestBuildFailureReplaysAndPreservesIsolatedLog;
   end;
 
 function SlowUnitName(AIndex: Integer): string;
@@ -813,11 +818,122 @@ begin
     Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
     Expect<Boolean>(Pos('blocked by failed prerequisite "alpha"',
       R.Stderr) > 0).ToBe(True);
-    AlphaAt := Pos('building alpha', R.Stdout);
-    BetaAt := Pos('building beta', R.Stdout);
-    AppAt := Pos('building app', R.Stdout);
+    AlphaAt := Pos('START alpha ', R.Stdout);
+    BetaAt := Pos('START beta ', R.Stdout);
+    AppAt := Pos('SKIP app ', R.Stdout);
     Expect<Boolean>((AlphaAt > 0) and (AlphaAt < BetaAt)
       and (BetaAt < AppAt)).ToBe(True);
+  finally
+    RecursiveDelete(Project);
+  end;
+end;
+
+procedure TBuildSessions.TestObservableBuildHeartbeatAndVerboseLogs;
+var
+  Project, RealFPC: string;
+  Env, QuietEnv: array of string;
+  R: TLwptResult;
+begin
+  Project := FScratch + '/observable-graph';
+  WriteGraphProject(Project);
+  RealFPC := TestCompilerExecutable;
+  SetLength(QuietEnv, 6);
+  QuietEnv[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  QuietEnv[1] := TEST_FPC_PROXY_ENV + '=1';
+  QuietEnv[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  QuietEnv[3] := TEST_FPC_DELAY_MS_ENV + '=20';
+  QuietEnv[4] := TEST_FPC_OUTPUT_ENV + '=1';
+  QuietEnv[5] := WORKER_BUDGET_ENV + '=4';
+  SetLength(Env, 7);
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_DELAY_MS_ENV + '=350';
+  Env[4] := TEST_FPC_OUTPUT_ENV + '=1';
+  Env[5] := OBSERVABILITY_HEARTBEAT_INTERVAL_ENV + '=75';
+  Env[6] := WORKER_BUDGET_ENV + '=4';
+  try
+    R := RunLwptWithWorkerEnv(
+      ['build', 'alpha', 'beta'], Project, QuietEnv);
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(Pos('alpha-begin|', R.Stdout) = 0).ToBe(True);
+    Expect<Boolean>(Pos('beta-begin|', R.Stdout) = 0).ToBe(True);
+    Expect<Boolean>(Pos('HEARTBEAT ', R.Stdout) = 0).ToBe(True);
+
+    R := RunLwptWithWorkerEnv(
+      ['build', 'alpha', 'beta', '--verbose'], Project, Env);
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(Pos('discovered 2 build target(s)', R.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('build session: ', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('(.lwpt/sessions/', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('effective workers: 2', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('START alpha ', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('START beta ', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('HEARTBEAT build elapsed ', R.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('active: alpha ', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('PASS alpha -> build/alpha', R.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('PASS beta -> build/beta', R.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('alpha-begin|alpha-end|', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('beta-begin|beta-end|', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('summary: 2 built, 0 failed, 0 skipped; elapsed ',
+      R.Stdout) > 0).ToBe(True);
+  finally
+    RecursiveDelete(Project);
+  end;
+end;
+
+procedure TBuildSessions.TestBuildFailureReplaysAndPreservesIsolatedLog;
+var
+  Project, RealFPC, LogPath: string;
+  Env: array of string;
+  R: TLwptResult;
+  SessionSearch, LogSearch: TSearchRec;
+begin
+  Project := FScratch + '/observable-failure';
+  WriteGraphProject(Project);
+  RealFPC := TestCompilerExecutable;
+  SetLength(Env, 6);
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_DELAY_MS_ENV + '=20';
+  Env[4] := TEST_FPC_OUTPUT_ENV + '=1';
+  Env[5] := TEST_FPC_FAIL_TARGET_ENV + '=alpha';
+  try
+    R := RunLwptWithWorkerEnv(['build', 'alpha'], Project, Env);
+    Expect<Integer>(R.ExitCode).ToBe(1);
+    Expect<Boolean>(Pos('FAIL alpha ', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('alpha-begin|alpha-end|', R.Stdout)
+      > Pos('FAIL alpha ', R.Stdout)).ToBe(True);
+    Expect<Boolean>(Pos('target "alpha" failed: compiler failed',
+      R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos('summary: 0 built, 1 failed, 0 skipped; elapsed ',
+      R.Stdout) > 0).ToBe(True);
+    LogPath := '';
+    if FindFirst(Project + '/.lwpt/sessions/s-*', faDirectory,
+      SessionSearch) = 0 then
+    try
+      repeat
+        if (SessionSearch.Attr and faDirectory) = 0 then Continue;
+        if FindFirst(Project + '/.lwpt/sessions/' + SessionSearch.Name
+          + '/logs/*.log', faAnyFile, LogSearch) = 0 then
+        try
+          LogPath := Project + '/.lwpt/sessions/' + SessionSearch.Name
+            + '/logs/' + LogSearch.Name;
+        finally
+          FindClose(LogSearch);
+        end;
+      until (LogPath <> '') or (FindNext(SessionSearch) <> 0);
+    finally
+      FindClose(SessionSearch);
+    end;
+    Expect<Boolean>(LogPath <> '').ToBe(True);
+    Expect<Boolean>(Pos('alpha-begin|alpha-end|', ReadBinaryFile(LogPath))
+      > 0).ToBe(True);
   finally
     RecursiveDelete(Project);
   end;
@@ -841,6 +957,10 @@ begin
     TestJobsOneRunsTargetsSequentially);
   Test('failed prerequisite blocks only its dependants',
     TestFailedPrerequisiteBlocksOnlyDependants);
+  Test('observable builds heartbeat and serialize verbose logs',
+    TestObservableBuildHeartbeatAndVerboseLogs);
+  Test('build failures replay and preserve isolated logs',
+    TestBuildFailureReplaysAndPreservesIsolatedLog);
 end;
 
 function RunCompilerProxy: Integer;
@@ -850,26 +970,37 @@ var
   IsVersionQuery: Boolean;
   Process: TProcess;
   Started: TDateTime;
-  i: Integer;
+  DelayMilliseconds, i: Integer;
 begin
   Compiler := GetEnvironmentVariable(TEST_REAL_FPC_ENV);
   ReadyDir := GetEnvironmentVariable(TEST_FPC_READY_DIR_ENV);
   ReleasePath := GetEnvironmentVariable(TEST_FPC_RELEASE_ENV);
   ReleaseDir := GetEnvironmentVariable(TEST_FPC_RELEASE_DIR_ENV);
   FailTarget := GetEnvironmentVariable(TEST_FPC_FAIL_TARGET_ENV);
+  DelayMilliseconds := StrToIntDef(
+    GetEnvironmentVariable(TEST_FPC_DELAY_MS_ENV), 0);
   IsVersionQuery := False;
   for i := 1 to ParamCount do
     if ParamStr(i) = '-iV' then IsVersionQuery := True;
   if not IsVersionQuery then
   begin
     TargetName := ChangeFileExt(ExtractFileName(ParamStr(ParamCount)), '');
-    ForceDirectories(ReadyDir);
-    WriteTextFile(IncludeTrailingPathDelimiter(ReadyDir)
-      + 'ready-' + TargetName + '-' + IntToStr(GetProcessID), 'ready');
+    if ReadyDir <> '' then
+    begin
+      ForceDirectories(ReadyDir);
+      WriteTextFile(IncludeTrailingPathDelimiter(ReadyDir)
+        + 'ready-' + TargetName + '-' + IntToStr(GetProcessID), 'ready');
+    end;
     if ReleaseDir <> '' then
       ReleasePath := IncludeTrailingPathDelimiter(ReleaseDir) + TargetName;
+    if GetEnvironmentVariable(TEST_FPC_OUTPUT_ENV) = '1' then
+    begin
+      Write(TargetName, '-begin|');
+      Flush(Output);
+    end;
+    if DelayMilliseconds > 0 then Sleep(DelayMilliseconds);
     Started := Now;
-    while not FileExists(ReleasePath) do
+    while (ReleasePath <> '') and not FileExists(ReleasePath) do
     begin
       if (Now - Started) * 86400 > 15 then
       begin
@@ -877,6 +1008,11 @@ begin
         Exit;
       end;
       Sleep(10);
+    end;
+    if GetEnvironmentVariable(TEST_FPC_OUTPUT_ENV) = '1' then
+    begin
+      Write(TargetName, '-end|');
+      Flush(Output);
     end;
     if SameText(TargetName, FailTarget) then Exit(17);
   end;

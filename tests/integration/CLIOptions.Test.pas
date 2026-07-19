@@ -55,6 +55,7 @@ type
     procedure TestBuildModeSpaceSeparatedValueParses;
     procedure TestBuildModeEqualsSeparatedValueParses;
     procedure TestBuildModeInvalidValueExitsNonZero;
+    procedure TestVerboseFlagIsLongOnly;
   end;
 
 procedure TCLIOptionsE2E.SetupScratchProject;
@@ -177,6 +178,20 @@ begin
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
 end;
 
+procedure TCLIOptionsE2E.TestVerboseFlagIsLongOnly;
+var
+  BuildHelp, TestHelp: TLwptResult;
+begin
+  BuildHelp := RunLwpt(['build', '--help']);
+  TestHelp := RunLwpt(['test', '--help']);
+  Expect<Integer>(BuildHelp.ExitCode).ToBe(0);
+  Expect<Integer>(TestHelp.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('--verbose', BuildHelp.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('--verbose', TestHelp.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('-v, --verbose', BuildHelp.Stdout) = 0).ToBe(True);
+  Expect<Boolean>(Pos('-v, --verbose', TestHelp.Stdout) = 0).ToBe(True);
+end;
+
 procedure TCLIOptionsE2E.SetupTests;
 begin
   Test('lwpt --help lists every subcommand on stdout',
@@ -191,6 +206,8 @@ begin
     TestBuildModeEqualsSeparatedValueParses);
   Test('build --mode invalid (unknown mode value) exits non-zero',
     TestBuildModeInvalidValueExitsNonZero);
+  Test('--verbose is long-only for build and test',
+    TestVerboseFlagIsLongOnly);
 end;
 
 begin

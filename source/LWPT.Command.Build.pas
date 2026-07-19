@@ -35,7 +35,10 @@ type
 
 function CmdBuild(const AManifestPath: string;
   const ATargetNames: array of string; ARelease, AClean: Boolean;
-  AJobs: Integer): Integer;
+  AJobs: Integer): Integer; overload;
+function CmdBuild(const AManifestPath: string;
+  const ATargetNames: array of string; ARelease, AClean: Boolean;
+  AJobs: Integer; AVerbose: Boolean): Integer; overload;
 
 { Exposed for unit tests: does this FPC failure output look like stale
   build artefacts (worth a --clean retry) rather than a source error? }
@@ -949,9 +952,17 @@ end;
 function CmdBuild(const AManifestPath: string;
   const ATargetNames: array of string; ARelease, AClean: Boolean;
   AJobs: Integer): Integer;
+begin
+  Result := CmdBuild(AManifestPath, ATargetNames, ARelease, AClean,
+    AJobs, False);
+end;
+
+function CmdBuild(const AManifestPath: string;
+  const ATargetNames: array of string; ARelease, AClean: Boolean;
+  AJobs: Integer; AVerbose: Boolean): Integer;
 var
   Man : TManifest;
-  i, j, Built, Failed, Unknown, SelectedCount, MaxJobs, Running,
+  i, j, Built, Failed, Skipped, Unknown, SelectedCount, MaxJobs, Running,
     Completed : Integer;
   Matched : Boolean;
   ModeStr, CollA, CollB, DependencyName : string;
@@ -970,6 +981,88 @@ var
   HookEnvironment: array of string;
   HasEdges, MadeProgress: Boolean;
   CurrentCompilerVersion: string;
+  StartedAt, LastHeartbeatAt, HeartbeatInterval, NowTick: QWord;
+  StartTicks: array of QWord;
+  Reported: array of Boolean;
+
+  procedure WriteCapturedOutput(const AOutput: string);
+  begin
+    if AOutput = '' then Exit;
+    Write(AOutput);
+    if not (AOutput[Length(AOutput)] in [#10, #13]) then WriteLn;
+  end;
+
+  function LogIdentity(AIndex: Integer): string;
+  begin
+    Result := 'build:' + Man.Targets[AIndex].Name;
+  end;
+
+  procedure PrintStart(AIndex: Integer);
+  begin
+    StartTicks[AIndex] := GetTickCount64;
+    Session.WriteJobLog(LogIdentity(AIndex), '');
+    WriteLn('START ', Man.Targets[AIndex].Name, ' (',
+      Man.Targets[AIndex].Source, '; log: ',
+      Session.JobLogReference(LogIdentity(AIndex)), ')');
+  end;
+
+  procedure PrintTerminal(AIndex: Integer);
+  var
+    LogOutput, Elapsed, LogReference: string;
+  begin
+    if Reported[AIndex] then Exit;
+    if not (States[AIndex] in [tsSucceeded, tsFailed, tsBlocked]) then Exit;
+    Reported[AIndex] := True;
+    LogOutput := CapturedOutputs[AIndex];
+    if (LogOutput = '') and (Errors[AIndex] <> '') then
+      LogOutput := Errors[AIndex] + LineEnding;
+    Session.WriteJobLog(LogIdentity(AIndex), LogOutput);
+    LogReference := Session.JobLogReference(LogIdentity(AIndex));
+    Elapsed := FormatElapsedMilliseconds(
+      GetTickCount64 - StartTicks[AIndex]);
+    case States[AIndex] of
+      tsSucceeded:
+        begin
+          WriteLn('PASS ', Man.Targets[AIndex].Name, ' -> ',
+            Compiled[AIndex].OutBin, ' (', Elapsed, '; log: ',
+            LogReference, ')');
+          if AVerbose then WriteCapturedOutput(LogOutput);
+        end;
+      tsFailed:
+        begin
+          WriteLn('FAIL ', Man.Targets[AIndex].Name, ' (', Elapsed,
+            '; log: ', LogReference, ')');
+          WriteCapturedOutput(LogOutput);
+          if (Errors[AIndex] <> '')
+             and (Pos(Errors[AIndex], LogOutput) = 0) then
+            WriteLn('  error: ', Errors[AIndex]);
+          if Errors[AIndex] <> '' then
+            WriteLn(ErrOutput, '  target "', Man.Targets[AIndex].Name,
+              '" failed: ', Errors[AIndex]);
+        end;
+      tsBlocked:
+        begin
+          WriteLn('SKIP ', Man.Targets[AIndex].Name, ' (', Errors[AIndex],
+            '; ', Elapsed, '; log: ', LogReference, ')');
+          WriteLn(ErrOutput, '  target "', Man.Targets[AIndex].Name,
+            '" failed: ', Errors[AIndex]);
+        end;
+    end;
+  end;
+
+  function ActiveBuildSummary(ATick: QWord): string;
+  var
+    k: Integer;
+  begin
+    Result := '';
+    for k := 0 to High(Man.Targets) do
+      if States[k] = tsRunning then
+      begin
+        if Result <> '' then Result := Result + ', ';
+        Result := Result + Man.Targets[k].Name + ' ('
+          + FormatElapsedMilliseconds(ATick - StartTicks[k]) + ')';
+      end;
+  end;
 
   procedure RunTargetPostBuild(AIndex: Integer);
   begin
@@ -1046,6 +1139,7 @@ var
       raise ELWPTError.Create(CancellationFailure);
   end;
 begin
+  StartedAt := GetTickCount64;
   if not FileExists(AManifestPath) then
     raise EManifestError.CreateFmt(
       'manifest not found at %s', [AManifestPath]);
@@ -1083,6 +1177,7 @@ begin
   SelectedCount := 0;
   for i := 0 to High(Selected) do
     if Selected[i] then Inc(SelectedCount);
+  WriteLn('discovered ', SelectedCount, ' build target(s)');
 
   if FindArtefactDirCollision(Man.Targets, CollA, CollB) then
   begin
@@ -1101,7 +1196,8 @@ begin
   Session := TLWPTBuildSession.Create(
     ExtractFileDir(ExpandFileName(AManifestPath)));
   try
-    WriteLn('build session: ', Session.SessionID);
+    WriteLn('build session: ', Session.SessionID, ' (',
+      Session.SessionReference, ')');
     { --clean means a forced compile in fresh private staging. It never
       deletes the last successful public output or another live session. }
     RunHooks('prebuild', Man.PreBuild, Session.HookRoot);
@@ -1110,6 +1206,7 @@ begin
 
     Built := 0;
     Failed := 0;
+    Skipped := 0;
     Running := 0;
     Completed := 0;
     HasEdges := SelectedGraphHasEdges(Man.Targets, Selected);
@@ -1118,6 +1215,10 @@ begin
     SetLength(Compiled, Length(Man.Targets));
     SetLength(CapturedOutputs, Length(Man.Targets));
     SetLength(Errors, Length(Man.Targets));
+    SetLength(StartTicks, Length(Man.Targets));
+    SetLength(Reported, Length(Man.Targets));
+    HeartbeatInterval := ObservabilityHeartbeatIntervalMilliseconds;
+    LastHeartbeatAt := GetTickCount64;
     for i := 0 to High(Man.Targets) do
       if Selected[i] then States[i] := tsPending
       else States[i] := tsUnselected;
@@ -1131,6 +1232,7 @@ begin
         to acquire beyond the inherited grant. }
       MaxJobs := WorkerSession.RequestedWorkers;
       WriteLn('build jobs: ', MaxJobs);
+      WriteLn('effective workers: ', MaxJobs);
       try
         while Completed < SelectedCount do
         begin
@@ -1144,8 +1246,11 @@ begin
               States[i] := tsBlocked;
               Errors[i] := 'blocked by failed prerequisite "'
                 + DependencyName + '"';
-              Inc(Failed);
+              Inc(Skipped);
               Inc(Completed);
+              StartTicks[i] := GetTickCount64;
+              Session.WriteJobLog(LogIdentity(i), '');
+              PrintTerminal(i);
               MadeProgress := True;
             end;
 
@@ -1161,6 +1266,7 @@ begin
             if not Assigned(Lease) then Break;
             try
               try
+                PrintStart(i);
                 RunHooks('prebuild:' + Man.Targets[i].Name,
                   Man.Targets[i].PreBuild, Session.HookRoot);
                 Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
@@ -1191,6 +1297,7 @@ begin
                 Errors[i] := E.Message;
                 Inc(Failed);
                 Inc(Completed);
+                PrintTerminal(i);
               end;
             end;
             MadeProgress := True;
@@ -1217,7 +1324,10 @@ begin
               Inc(Completed);
               if States[i] = tsCompiled then
                 if HasEdges then
-                  FinalizeTarget(i, True)
+                begin
+                  FinalizeTarget(i, True);
+                  PrintTerminal(i);
+                end
                 else
                   try
                     RunTargetPostBuild(i);
@@ -1227,11 +1337,22 @@ begin
                       States[i] := tsFailed;
                       Errors[i] := E.Message;
                       Inc(Failed);
+                      PrintTerminal(i);
                     end;
                   end;
+              if States[i] = tsFailed then PrintTerminal(i);
               MadeProgress := True;
             end;
 
+          NowTick := GetTickCount64;
+          if (Running > 0)
+             and (NowTick - LastHeartbeatAt >= HeartbeatInterval) then
+          begin
+            WriteLn('HEARTBEAT build elapsed ',
+              FormatElapsedMilliseconds(NowTick - StartedAt),
+              '; active: ', ActiveBuildSummary(NowTick));
+            LastHeartbeatAt := NowTick;
+          end;
           if not MadeProgress then Sleep(10);
         end;
       except
@@ -1250,7 +1371,11 @@ begin
               Compiled[i].OutBin, Compiled[i].CandidateBin);
         RunHooks('postbuild', WholePostBuild, Session.HookRoot);
         for i := 0 to High(Man.Targets) do
-          if States[i] = tsCompiled then FinalizeTarget(i, False);
+          if States[i] = tsCompiled then
+          begin
+            FinalizeTarget(i, False);
+            PrintTerminal(i);
+          end;
       end
       else if HasEdges and (Failed = 0) then
         { Graph builds publish prerequisites before dependants start. The
@@ -1273,31 +1398,22 @@ begin
       end;
     end;
 
-    { Replay compiler output and results in manifest order, independent of
-      completion order. Hook output remains at its declared lifecycle point. }
+    { Any candidate withheld by the all-target publication gate is a
+      deterministic skip, not a second copy of the target that failed. }
     for i := 0 to High(Man.Targets) do
-      if Selected[i] then
+      if Selected[i] and (States[i] = tsCompiled) then
       begin
-        WriteLn('  building ', Man.Targets[i].Name, ' (',
-          Man.Targets[i].Source, ')');
-        if CapturedOutputs[i] <> '' then Write(CapturedOutputs[i]);
-        if States[i] = tsSucceeded then
-          WriteLn('ok -> ', Compiled[i].OutBin)
-        else if States[i] = tsCompiled then
-          { ADR-0020: the whole-build postbuild gate withholds every
-            publication once any target fails. Still give the compiled
-            target its result line. }
-          WriteLn('  target "', Man.Targets[i].Name,
-            '" compiled; not published because the build failed')
-        else if Errors[i] <> '' then
-          WriteLn(ErrOutput, '  target "', Man.Targets[i].Name,
-            '" failed: ', Errors[i]);
+        States[i] := tsBlocked;
+        Errors[i] := 'compiled; not published because the build failed';
+        Inc(Skipped);
+        PrintTerminal(i);
       end;
-    WriteLn;
-    WriteLn(Built, ' built, ', Failed, ' failed');
     Result := Ord(Failed <> 0);
     Session.Finish(Failed = 0,
       IntToStr(Failed) + ' target(s) failed or became stale');
+    WriteLn('summary: ', Built, ' built, ', Failed, ' failed, ',
+      Skipped, ' skipped; elapsed ',
+      FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
   finally
     Session.Free;
   end;
