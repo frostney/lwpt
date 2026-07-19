@@ -101,7 +101,7 @@ end;
 
 procedure TAddRemoveE2E.BeforeAll;
 begin
-  FScratch := ExpandFileName('build/tests/tmp/addremove-e2e');
+  FScratch := CreateScratchRoot('addremove-e2e');
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 end;
 
@@ -185,7 +185,7 @@ begin
     but is not textually editable. `lwpt add` of the same name must
     hard-error (duplicate-key corruption otherwise) and leave the
     manifest untouched. }
-  Dir := ExpandFileName('build/tests/tmp/addremove-dotted');
+  Dir := FScratch + '/dotted';
   RecursiveDelete(Dir);
   WriteTextFile(Dir + '/lwpt.toml',
     '[package]'#10 +

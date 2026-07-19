@@ -92,7 +92,7 @@ procedure TInstallBitbucketE2E.BeforeAll;
 var R: TLwptResult;
 begin
   FOrigDir := GetCurrentDir;
-  FScratch := ExpandFileName('build/tests/tmp/install-bitbucket-e2e');
+  FScratch := CreateScratchRoot('install-bitbucket-e2e');
   FRoot    := FScratch + '/root';
   FSkipped := SkipNetworkTests;
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));

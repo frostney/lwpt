@@ -78,8 +78,7 @@ procedure TInitCommand.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
-  FScratch := ExpandFileName('build/tests/tmp/init-test/my-project');
-  RecursiveDelete(ExpandFileName('build/tests/tmp/init-test'));
+  FScratch := CreateScratchRoot('init-test') + '/my-project';
   ForceDirectories(FScratch);
 end;
 
@@ -180,7 +179,7 @@ var
   DigitScratch, Entry: string;
   R: TLwptResult;
 begin
-  DigitScratch := ExpandFileName('build/tests/tmp/init-test/123-app');
+  DigitScratch := ExtractFileDir(FScratch) + '/123-app';
   RecursiveDelete(DigitScratch);
   ForceDirectories(DigitScratch);
 

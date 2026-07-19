@@ -85,7 +85,7 @@ var
   R: TLwptResult;
 begin
   FOrigDir := GetCurrentDir;
-  FScratch := ExpandFileName('build/tests/tmp/install-direct-archives-windows-e2e');
+  FScratch := CreateScratchRoot('install-direct-archives-windows-e2e');
   FRoot := FScratch + '/root';
   FSkipped := SkipNetworkTests;
   {$IFNDEF MSWINDOWS}
