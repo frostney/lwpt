@@ -115,6 +115,7 @@ begin
   Expect<Boolean>(Pos('repair',  R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('init',    R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('run',     R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('agents',  R.Stdout) > 0).ToBe(True);
   { Per ADR-0015, `export` is gone — verify it's NOT listed. }
   Expect<Boolean>(Pos('export',  R.Stdout) > 0).ToBe(False);
 end;

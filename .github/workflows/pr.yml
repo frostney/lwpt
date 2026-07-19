@@ -104,6 +104,12 @@ jobs:
       - name: lwpt build (compile every [build] entry)
         run: ./build/lwpt build
 
+      # Runs after `lwpt build` so the freshly compiled binary — i.e.
+      # the PR's own command surface — is what the committed AGENTS.md
+      # block is checked against (ADR-0024).
+      - name: lwpt agents --check (AGENTS.md command reference fresh?)
+        run: ./build/lwpt agents --check
+
       - name: lwpt test --bail=1 (default tier — unit + integration)
         run: ./build/lwpt test --bail=1
 

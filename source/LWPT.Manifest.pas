@@ -122,6 +122,11 @@ type
   THook = record
     Name   : string;
     Script : string;
+    { The script path exactly as declared in the manifest, before
+      placeholder interpolation. Surface-rendering consumers (the
+      agents block) use this so generated docs stay identical across
+      platforms; execution always uses the interpolated Script. }
+    RawScript : string;
     Args   : array of string;
     Inputs : array of string;
     Output : string;
@@ -775,6 +780,7 @@ begin
   begin
     { Bare-string shorthand: name = "scripts/foo.pas" }
     AHook.Script := ANode.ScalarText;
+    AHook.RawScript := AHook.Script;
     Exit;
   end;
 
@@ -784,6 +790,7 @@ begin
       + '{ script = "..." [, args, inputs, output] }', [AContext, AName]);
 
   AHook.Script := TomlStr(ANode, 'script', '');
+  AHook.RawScript := AHook.Script;
   if AHook.Script = '' then
     raise EManifestError.CreateFmt(
       '%s "%s": "script" field is required (path to InstantFPC '
@@ -1221,10 +1228,10 @@ const
         anyway because KNOWN_SECTIONS is checked first, but this
         list makes the intent explicit). 'run' itself is included
         because `lwpt run run` is the nonsense case. }
-  RESERVED_SUBCOMMAND_NAMES: array[0..16] of string = (
+  RESERVED_SUBCOMMAND_NAMES: array[0..17] of string = (
     { subcommands }
     'install', 'add', 'remove', 'build', 'format', 'test',
-    'repair', 'init', 'run',
+    'repair', 'init', 'run', 'agents',
     { configuration section names — defensive: ensure 'workspaces',
       'package', 'dependencies' etc can NEVER end up registered as
       run-scripts even if a future refactor reorders KNOWN_SECTIONS
@@ -1626,8 +1633,13 @@ begin
         if TomlIsTable(Pair.Value)
            and TomlIsString(TomlGet(Pair.Value, 'script')) then
         begin
+          { SameText, not `=`: subcommand dispatch is case-insensitive
+            (the CLI lowercases argv and Find uses SameText), so a
+            case-variant section like [Agents] would list as a script
+            yet be unreachable — `lwpt run Agents` dispatches the
+            built-in. The reservation must match dispatch semantics. }
           for k := Low(RESERVED_SUBCOMMAND_NAMES) to High(RESERVED_SUBCOMMAND_NAMES) do
-            if Pair.Key = RESERVED_SUBCOMMAND_NAMES[k] then
+            if SameText(Pair.Key, RESERVED_SUBCOMMAND_NAMES[k]) then
               raise EManifestError.CreateFmt(
                 'section [%s] shadows the built-in subcommand and '
                 + 'cannot be used as a run-script. Rename the section '

@@ -49,6 +49,13 @@ type
     destructor Destroy; override;
     procedure Add(ASub: TSubcommand);
     function Find(const AName: string): TSubcommand;
+    { Read iteration over the registered subcommands, in registration
+      order. The registry is the single source of truth for the
+      program's command surface; consumers that render that surface
+      (help printers here, agent-facing reference generators in the
+      host program) iterate it rather than keeping their own list. }
+    function Count: Integer;
+    function Item(AIndex: Integer): TSubcommand;
     procedure PrintTopLevelHelp(const AProgramName: string);
     procedure PrintSubcommandHelp(const AProgramName: string;
       ASub: TSubcommand);
@@ -96,6 +103,22 @@ begin
   for i := 0 to High(FItems) do
     if SameText(FItems[i].Name, AName) then
       Exit(FItems[i]);
+end;
+
+function TSubcommandRegistry.Count: Integer;
+begin
+  Result := Length(FItems);
+end;
+
+function TSubcommandRegistry.Item(AIndex: Integer): TSubcommand;
+begin
+  { Explicit bounds guard: production builds compile with range checks
+    off (Shared.inc), so relying on compiler checking would let an
+    out-of-range index return a garbage pointer instead of failing. }
+  if (AIndex < 0) or (AIndex > High(FItems)) then
+    raise EArgumentOutOfRangeException.CreateFmt(
+      'subcommand index %d out of range 0..%d', [AIndex, High(FItems)]);
+  Result := FItems[AIndex];
 end;
 
 procedure TSubcommandRegistry.PrintTopLevelHelp(const AProgramName: string);
