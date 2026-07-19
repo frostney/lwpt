@@ -75,7 +75,7 @@ const
   TmpPathExtension = '.tmp';
 
 function  MakeTmpPath(const ATmpRoot, AHint: string): string;
-function  MakeSiblingTmpPath(const APath, ATag: string): string; inline;
+function  MakeSiblingTmpPath(const APath, ATag: string): string;
 procedure WipeDir(const APath: string);
 function  AtomicMoveFile(const ASrc, ADst: string): Boolean;
 function  AtomicMoveDir(const ASrc, ADst: string): Boolean;
@@ -608,9 +608,17 @@ begin
   until (not FileExists(Result)) and (not DirectoryExists(Result));
 end;
 
-function MakeSiblingTmpPath(const APath, ATag: string): string; inline;
+function MakeSiblingTmpPath(const APath, ATag: string): string;
+var
+  Dir: string;
 begin
-  Result := MakeUniqueTmpPath(ExtractFileDir(APath),
+  { A bare filename has no directory component; ExtractFileDir yields ''
+    and IncludeTrailingPathDelimiter('') would root the sibling at the
+    filesystem root. The sibling of a bare relative path lives in the
+    current directory. }
+  Dir := ExtractFileDir(APath);
+  if Dir = '' then Dir := '.';
+  Result := MakeUniqueTmpPath(Dir,
     ExtractFileName(APath) + TmpPathDelimiter + ATag);
 end;
 

@@ -285,6 +285,28 @@ type
     procedure TestThreadedBurstIsDistinct;
   end;
 
+  { AtomicMoveFile / AtomicMoveDir with a bare relative destination
+    (no directory component). ExtractFileDir of such a path is '',
+    which the sibling tmp-path generator used to expand to the
+    filesystem root, so the rename-aside backup of an existing
+    destination landed at '/<name>.old.…' and the move failed. The
+    suite chdirs into a scratch directory so bare names resolve
+    inside it. }
+  TAtomicMoveBareDestination = class(TTestSuite)
+  private
+    FOrigDir: string;
+    FScratch: string;
+  protected
+    procedure AfterAll; override;
+    procedure BeforeAll; override;
+    procedure BeforeEach; override;
+  public
+    procedure SetupTests; override;
+    procedure TestSiblingOfBareFilenameStaysRelative;
+    procedure TestMoveFileReplacesExistingBareDestination;
+    procedure TestMoveDirReplacesExistingBareDestination;
+  end;
+
   { [sources] custom-prefix declaration with placeholder URL
     templates + LoadManifest validation + dep parsing against
     custom-source context + URL rendering. Per ADR-0009: each entry
@@ -2620,6 +2642,122 @@ begin
     TestSiblingExistingCandidateIsSkipped);
 end;
 
+{ ── TAtomicMoveBareDestination ──────────────────────────────────── }
+
+procedure WriteBareFile(const AName, AText: string);
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Text := AText;
+    SL.SaveToFile(AName);
+  finally
+    SL.Free;
+  end;
+end;
+
+function ReadBareFile(const AName: string): string;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.LoadFromFile(AName);
+    Result := Trim(SL.Text);
+  finally
+    SL.Free;
+  end;
+end;
+
+function CountDirEntries(const APath: string): Integer;
+var
+  SR: TSearchRec;
+begin
+  Result := 0;
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(APath) + '*',
+      faAnyFile or faSymLink, SR) = 0 then
+    try
+      repeat
+        if (SR.Name <> '.') and (SR.Name <> '..') then Inc(Result);
+      until SysUtils.FindNext(SR) <> 0;
+    finally
+      SysUtils.FindClose(SR);
+    end;
+end;
+
+procedure TAtomicMoveBareDestination.BeforeAll;
+begin
+  FOrigDir := GetCurrentDir;
+  { Process-unique root: concurrent test binaries must not wipe each
+    other's fixtures. }
+  FScratch := ExpandFileName('build/tests/tmp/atomic-move-bare-'
+    + IntToStr(GetProcessID));
+  WipeDir(FScratch);
+  ForceDirectories(FScratch);
+end;
+
+procedure TAtomicMoveBareDestination.BeforeEach;
+begin
+  SetCurrentDir(FOrigDir);
+  WipeDir(FScratch);
+  ForceDirectories(FScratch);
+  SetCurrentDir(FScratch);
+end;
+
+procedure TAtomicMoveBareDestination.AfterAll;
+begin
+  SetCurrentDir(FOrigDir);
+  WipeDir(FScratch);
+end;
+
+procedure TAtomicMoveBareDestination.TestSiblingOfBareFilenameStaysRelative;
+var
+  Sibling: string;
+begin
+  Sibling := MakeSiblingTmpPath('target.txt', 'old');
+  Expect<string>(ExtractFileDir(Sibling)).ToBe('.');
+end;
+
+procedure TAtomicMoveBareDestination.TestMoveFileReplacesExistingBareDestination;
+begin
+  WriteBareFile('dest.txt', 'stale');
+  WriteBareFile('incoming.tmp', 'fresh');
+
+  Expect<Boolean>(AtomicMoveFile('incoming.tmp', 'dest.txt')).ToBe(True);
+
+  Expect<string>(ReadBareFile('dest.txt')).ToBe('fresh');
+  Expect<Boolean>(FileExists('incoming.tmp')).ToBe(False);
+  { No rename-aside backup left behind. }
+  Expect<Integer>(CountDirEntries('.')).ToBe(1);
+end;
+
+procedure TAtomicMoveBareDestination.TestMoveDirReplacesExistingBareDestination;
+begin
+  ForceDirectories('destdir');
+  WriteBareFile('destdir/stale.txt', 'stale');
+  ForceDirectories('incoming');
+  WriteBareFile('incoming/fresh.txt', 'fresh');
+
+  Expect<Boolean>(AtomicMoveDir('incoming', 'destdir')).ToBe(True);
+
+  Expect<Boolean>(FileExists('destdir/fresh.txt')).ToBe(True);
+  Expect<Boolean>(FileExists('destdir/stale.txt')).ToBe(False);
+  Expect<Boolean>(DirectoryExists('incoming')).ToBe(False);
+  { No rename-aside backup left behind. }
+  Expect<Integer>(CountDirEntries('.')).ToBe(1);
+end;
+
+procedure TAtomicMoveBareDestination.SetupTests;
+begin
+  Test('sibling of a bare filename resolves under the current directory',
+    TestSiblingOfBareFilenameStaysRelative);
+  Test('bare-filename destination with existing file is replaced',
+    TestMoveFileReplacesExistingBareDestination);
+  Test('bare-dirname destination with existing directory is replaced',
+    TestMoveDirReplacesExistingBareDestination);
+end;
+
 begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
     PROJECT_NAME + '.Core: SHA-256 NIST vectors'));
@@ -2648,6 +2786,8 @@ begin
     PROJECT_NAME + '.Core: SanitisePathSegment'));
   TestRunnerProgram.AddSuite(TMakeTmpPathSuite.Create(
     PROJECT_NAME + '.Core: MakeTmpPath uniqueness'));
+  TestRunnerProgram.AddSuite(TAtomicMoveBareDestination.Create(
+    PROJECT_NAME + '.Core: atomic move, bare relative destination'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
     PROJECT_NAME + '.Core: ApplyIncludeExclude'));
   TestRunnerProgram.AddSuite(TCopyDirTreeGuards.Create(
