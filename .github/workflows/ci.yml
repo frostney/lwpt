@@ -350,7 +350,9 @@ jobs:
             echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
           fi
           FPC_UNIT_PATHS=""
-          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do
+          # openssl (+ its historical fcl-net home): TransportSecurity and its
+          # co-located test `uses OpenSSL`, so `lwpt test` needs the unit path.
+          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process fcl-net openssl paszlib hash; do
             UNIT_PATH=""
             for unit_target in i386-win32 x86_64-win64; do
               UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
