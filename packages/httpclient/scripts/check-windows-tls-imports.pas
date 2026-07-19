@@ -368,6 +368,14 @@ begin
     runtime-loader implementation, not C OpenSSL linkage. }
   if Pos('$', Name) > 0 then
     Exit(False);
+  { Windows thread-local-storage runtime symbols (the PE .tls directory:
+    _tls_index, _tls_used, __tls_start__/__tls_end__) decorate to TLS_*
+    and would otherwise match the OpenSSL "TLS" family. They are FPC /
+    binutils threadvar plumbing, present in every threaded binary — not
+    OpenSSL's TLS_method family. }
+  if (Name = 'TLS_INDEX') or (Name = 'TLS_USED')
+    or (Name = 'TLS_START__') or (Name = 'TLS_END__') then
+    Exit(False);
   for Index := Low(OPENSSL_FAMILIES) to High(OPENSSL_FAMILIES) do
     if StartsWith(Name, OPENSSL_FAMILIES[Index] + '_') then
       Exit(True);
@@ -694,6 +702,13 @@ begin
   if not IsOpenSSLSymbol('OpenSSL_version_num') or
     not IsOpenSSLSymbol('_EVP_DigestInit_ex@8') then
     Fail('decorated-symbol canary was not detected');
+  { Windows thread-local-storage runtime symbols must not be misread as
+    OpenSSL, while a genuine OpenSSL TLS_ symbol still must be. }
+  if IsOpenSSLSymbol('_tls_index') or IsOpenSSLSymbol('___tls_start__') or
+    IsOpenSSLSymbol('___tls_end__') or IsOpenSSLSymbol('_tls_used') then
+    Fail('thread-local-storage symbol was misflagged as OpenSSL linkage');
+  if not IsOpenSSLSymbol('TLS_server_method') then
+    Fail('OpenSSL TLS_ symbol canary was not detected');
   Lines := TStringList.Create;
   Problems := TStringList.Create;
   try
