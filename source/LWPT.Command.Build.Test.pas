@@ -15,28 +15,30 @@ program LWPT.Command.Build.Test;
 
 uses
   {$IFDEF UNIX}
-  BaseUnix,
   cthreads,
   {$ENDIF}
   Classes,
   Process,
   SysUtils,
-  {$IFDEF MSWINDOWS}
-  Windows,
-  {$ENDIF}
 
   LWPT.Command.Build,
   LWPT.Core,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
-  COMPILER_PROCESS_PROXY_OPTION = '--' + PROGRAM_NAME
+  CompilerProcessProxyOption = '--' + PROGRAM_NAME
     + '-compiler-process-proxy';
-  COMPILER_GRANDCHILD_PROXY_OPTION = '--' + PROGRAM_NAME
+  CompilerGrandchildProxyOption = '--' + PROGRAM_NAME
     + '-compiler-grandchild-proxy';
-  COMPILER_EXIT_PROXY_OPTION = '--' + PROGRAM_NAME
+  CompilerExitProxyOption = '--' + PROGRAM_NAME
     + '-compiler-exit-proxy';
+  CompilerProxySleepMilliseconds = 30000;
+  ProcessPollMilliseconds = 10;
+  ProcessStartupTimeoutSeconds = 10;
+  ProcessExitTimeoutSeconds = 3;
+  SecondsPerDay = 86400;
 
 type
   TStaleArtefactSignature = class(TTestSuite)
@@ -76,35 +78,10 @@ begin
   ExitCode := -1;
 end;
 
-function ProcessIsRunning(APID: Integer): Boolean;
-{$IFDEF UNIX}
-begin
-  Result := (APID > 0)
-    and ((FpKill(APID, 0) = 0) or (FpGetErrNo = ESysEPERM));
-end;
-{$ENDIF}
-{$IFDEF MSWINDOWS}
-var
-  Handle: THandle;
-  ExitCode: DWORD;
-begin
-  if APID <= 0 then Exit(False);
-  Handle := Windows.OpenProcess(Windows.PROCESS_QUERY_INFORMATION,
-    False, DWORD(APID));
-  if Handle = 0 then Exit(False);
-  try
-    Result := Windows.GetExitCodeProcess(Handle, ExitCode)
-      and (ExitCode = Windows.STILL_ACTIVE);
-  finally
-    Windows.CloseHandle(Handle);
-  end;
-end;
-{$ENDIF}
-
 procedure TCompilerRunnerThread.Execute;
 begin
   try
-    ExitCode := FRunner.Run([COMPILER_PROCESS_PROXY_OPTION, FMarker], Output);
+    ExitCode := FRunner.Run([CompilerProcessProxyOption, FMarker], Output);
   except
     on E: Exception do ErrorMessage := E.Message;
   end;
@@ -167,8 +144,9 @@ begin
     Started := Now;
     while not FileExists(Marker) do
     begin
-      if (Now - Started) * 86400 > 10 then Break;
-      Sleep(10);
+      if (Now - Started) * SecondsPerDay
+        > ProcessStartupTimeoutSeconds then Break;
+      Sleep(ProcessPollMilliseconds);
     end;
     Expect<Boolean>(FileExists(Marker)).ToBe(True);
     Expect<Boolean>(FileExists(GrandchildPIDPath)).ToBe(True);
@@ -181,7 +159,8 @@ begin
     Expect<Boolean>(Length(Worker.Output) > 65536).ToBe(True);
     Started := Now;
     while ProcessIsRunning(GrandchildPID)
-      and ((Now - Started) * 86400 < 3) do Sleep(10);
+      and ((Now - Started) * SecondsPerDay < ProcessExitTimeoutSeconds) do
+      Sleep(ProcessPollMilliseconds);
     Expect<Boolean>(ProcessIsRunning(GrandchildPID)).ToBe(False);
   finally
     Runner.Cancel;
@@ -205,14 +184,14 @@ begin
     exit code no matter which call reaped it. }
   Runner := TLWPTCompilerProcess.Create(ExpandFileName(ParamStr(0)));
   try
-    Expect<Integer>(Runner.Run([COMPILER_EXIT_PROXY_OPTION, '7'],
+    Expect<Integer>(Runner.Run([CompilerExitProxyOption, '7'],
       OutText)).ToBe(7);
     Expect<Boolean>(Pos('exit-proxy-output', OutText) > 0).ToBe(True);
     { 128 is the nastiest edge: its low seven bits are zero, so the
       double-decode also mistakes it for a clean wifexited status. }
-    Expect<Integer>(Runner.Run([COMPILER_EXIT_PROXY_OPTION, '128'],
+    Expect<Integer>(Runner.Run([CompilerExitProxyOption, '128'],
       OutText)).ToBe(128);
-    Expect<Integer>(Runner.Run([COMPILER_EXIT_PROXY_OPTION, '0'],
+    Expect<Integer>(Runner.Run([CompilerExitProxyOption, '0'],
       OutText)).ToBe(0);
   finally
     Runner.Free;
@@ -247,19 +226,20 @@ begin
   GrandchildPIDPath := ExtractFileDir(ParamStr(2)) + '/grandchild-pid';
   Child := TProcess.Create(nil);
   Child.Executable := ExpandFileName(ParamStr(0));
-  Child.Parameters.Add(COMPILER_GRANDCHILD_PROXY_OPTION);
+  Child.Parameters.Add(CompilerGrandchildProxyOption);
   Child.Parameters.Add(GrandchildPIDPath);
   Child.Execute;
-  while not FileExists(GrandchildPIDPath) do Sleep(10);
+  while not FileExists(GrandchildPIDPath) do
+    Sleep(ProcessPollMilliseconds);
   WriteTextFile(ParamStr(2), 'ready');
-  Sleep(30000);
+  Sleep(CompilerProxySleepMilliseconds);
   Result := 0;
 end;
 
 function RunCompilerGrandchildProxy: Integer;
 begin
   WriteTextFile(ParamStr(2), IntToStr(GetProcessID));
-  Sleep(30000);
+  Sleep(CompilerProxySleepMilliseconds);
   Result := 0;
 end;
 
@@ -274,13 +254,13 @@ end;
 
 begin
   if (ParamCount >= 2)
-     and (ParamStr(1) = COMPILER_PROCESS_PROXY_OPTION) then
+     and (ParamStr(1) = CompilerProcessProxyOption) then
     Halt(RunCompilerProcessProxy);
   if (ParamCount >= 2)
-     and (ParamStr(1) = COMPILER_GRANDCHILD_PROXY_OPTION) then
+     and (ParamStr(1) = CompilerGrandchildProxyOption) then
     Halt(RunCompilerGrandchildProxy);
   if (ParamCount >= 2)
-     and (ParamStr(1) = COMPILER_EXIT_PROXY_OPTION) then
+     and (ParamStr(1) = CompilerExitProxyOption) then
     Halt(RunCompilerExitProxy);
   TestRunnerProgram.AddSuite(TStaleArtefactSignature.Create(
     'build: stale-artefact failure signature'));

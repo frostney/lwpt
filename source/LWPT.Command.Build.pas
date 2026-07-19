@@ -13,7 +13,7 @@ uses
   SysUtils,
 
   LWPT.Core,
-  Platform;
+  LWPT.ProcessTree;
 
 type
   { Public so the cross-platform cancellation/reaping contract can be tested
@@ -48,7 +48,8 @@ uses
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.Manifest,
-  LWPT.WorkerBudget;
+  LWPT.WorkerBudget,
+  Platform;
 
 const
   BUILD_TARGET_ENV = PROJECT_NAME + '_BUILD_TARGET';
@@ -84,6 +85,7 @@ type
     FCompiled: TLWPTCompiledTarget;
     FOutput: string;
     FError: string;
+    FCancellationError: string;
     FSucceeded: Boolean;
     FDone: Boolean;
     FDoneCriticalSection: TRTLCriticalSection;
@@ -99,6 +101,7 @@ type
     function IsDone: Boolean;
     property Compiled: TLWPTCompiledTarget read FCompiled;
     property CapturedOutput: string read FOutput;
+    property CancellationError: string read FCancellationError;
     property ErrorMessage: string read FError;
     property Succeeded: Boolean read FSucceeded;
   end;
@@ -152,7 +155,12 @@ end;
 
 destructor TLWPTCompilerProcess.Destroy;
 begin
-  Cancel;
+  try
+    Cancel;
+  except
+    { Destructors cannot surface cancellation errors safely. The scheduler's
+      explicit Cancel path records them before ownership reaches this point. }
+  end;
   DoneCriticalSection(FCriticalSection);
   inherited Destroy;
 end;
@@ -236,11 +244,7 @@ begin
   try
     FCancelled := True;
     if Assigned(FProcessTree) then
-      try
-        FProcessTree.Terminate;
-      except
-        { The child may have exited between discovery and termination. }
-      end;
+      FProcessTree.Terminate;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
@@ -786,9 +790,26 @@ begin
 end;
 
 procedure TLWPTBuildJob.Cancel;
+var
+  CancellationMessage: string;
 begin
   Terminate;
-  FCompiler.Cancel;
+  try
+    FCompiler.Cancel;
+  except
+    on E: Exception do
+    begin
+      CancellationMessage := 'process-tree termination failed: ' + E.Message;
+      EnterCriticalSection(FDoneCriticalSection);
+      try
+        FCancellationError := CancellationMessage;
+        FSucceeded := False;
+        if FError = '' then FError := CancellationMessage;
+      finally
+        LeaveCriticalSection(FDoneCriticalSection);
+      end;
+    end;
+  end;
 end;
 
 function TLWPTBuildJob.IsDone: Boolean;
@@ -1000,16 +1021,29 @@ var
   end;
 
   procedure StopAndFreeJobs;
-  var k: Integer;
+  var
+    CancellationFailure: string;
+    k: Integer;
   begin
+    CancellationFailure := '';
     for k := 0 to High(Jobs) do
       if Assigned(Jobs[k]) and (not Jobs[k].IsDone) then Jobs[k].Cancel;
     for k := 0 to High(Jobs) do
       if Assigned(Jobs[k]) then
       begin
         Jobs[k].WaitFor;
+        if Jobs[k].CancellationError <> '' then
+        begin
+          if States[k] <> tsFailed then Inc(Failed);
+          States[k] := tsFailed;
+          Errors[k] := Jobs[k].CancellationError;
+          if CancellationFailure = '' then
+            CancellationFailure := Jobs[k].CancellationError;
+        end;
         FreeAndNil(Jobs[k]);
       end;
+    if CancellationFailure <> '' then
+      raise ELWPTError.Create(CancellationFailure);
   end;
 begin
   if not FileExists(AManifestPath) then
@@ -1232,8 +1266,11 @@ begin
           end;
         end;
     finally
-      StopAndFreeJobs;
-      WorkerSession.Free;
+      try
+        StopAndFreeJobs;
+      finally
+        WorkerSession.Free;
+      end;
     end;
 
     { Replay compiler output and results in manifest order, independent of

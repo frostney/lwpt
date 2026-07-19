@@ -21,8 +21,8 @@ uses
   LWPT.Command.Common,
   LWPT.Core,
   LWPT.Manifest,
-  LWPT.WorkerBudget,
-  Platform;
+  LWPT.ProcessTree,
+  LWPT.WorkerBudget;
 
 type
   TTestJobStatus = (tjsPending, tjsCompiling, tjsRunning, tjsPassed,
@@ -379,8 +379,13 @@ begin
   if AIndex < 0 then Exit;
   EnterCriticalSection(FCriticalSection);
   try
-    FJobs[AIndex].Status := AStatus;
-    FJobs[AIndex].ExitCode := AExitCode;
+    { A real process-tree termination failure is a worker error, not a clean
+      cancellation. Preserve it when the reaped worker unwinds afterward. }
+    if FJobs[AIndex].Status <> tjsWorkerError then
+    begin
+      FJobs[AIndex].Status := AStatus;
+      FJobs[AIndex].ExitCode := AExitCode;
+    end;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
@@ -400,8 +405,13 @@ begin
         FJobs[i].ActiveProcessTree.Terminate;
       except
         on E: Exception do
-          if FJobs[i].ErrorMessage = '' then
-            FJobs[i].ErrorMessage := 'termination failed: ' + E.Message;
+        begin
+          FJobs[i].Status := tjsWorkerError;
+          FJobs[i].ErrorMessage := 'process-tree termination failed: '
+            + E.Message;
+          if FInternalError = '' then
+            FInternalError := FJobs[i].ErrorMessage;
+        end;
       end;
   end;
 end;

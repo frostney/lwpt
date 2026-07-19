@@ -45,7 +45,8 @@ uses
   LWPT.Command.Repair,
   LWPT.Command.Run,
   LWPT.Command.Testing,
-  LWPT.Core;
+  LWPT.Core,
+  LWPT.ProcessTree;
 
 function ErrPrefix(const ASubcommand: string): string; inline;
 begin
@@ -370,6 +371,9 @@ var
   InstallOpts, AddOpts, RemoveOpts, TestOpts, BuildOpts, InitOpts,
     RunOpts, FormatOpts, RepairOpts : TOptionArray;
 begin
+  { ADR-0025: a self-pipe coordinator forwards SIGTERM/SIGINT to every active
+    child group before restoring the signal's default outcome. }
+  InstallProcessTreeSignalForwarding;
   if HandleTopLevelFlags then
   begin
     ExitCode := 0;
