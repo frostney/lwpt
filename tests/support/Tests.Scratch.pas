@@ -157,23 +157,27 @@ end;
 {$IFDEF MSWINDOWS}
 var
   Handle: THandle;
-  ExitCode, ErrorCode: DWORD;
+  WaitResult, ErrorCode: DWORD;
 begin
   if APID = 0 then Exit(plDead);
   if APID > QWord(High(DWORD)) then Exit(plDead);
-  Handle := Windows.OpenProcess(
-    Windows.PROCESS_QUERY_INFORMATION, False, DWORD(APID));
+  Handle := Windows.OpenProcess(Windows.SYNCHRONIZE, False, DWORD(APID));
   if Handle = 0 then
   begin
     ErrorCode := Windows.GetLastError;
     if ErrorCode = Windows.ERROR_INVALID_PARAMETER then Exit(plDead);
+    { Like EPERM on Unix: the process exists but is not ours. }
+    if ErrorCode = Windows.ERROR_ACCESS_DENIED then Exit(plAlive);
     Exit(plUnknown);
   end;
   try
-    if not Windows.GetExitCodeProcess(Handle, ExitCode) then
-      Exit(plUnknown);
-    if ExitCode = Windows.STILL_ACTIVE then Result := plAlive
-    else Result := plDead;
+    { GetExitCodeProcess cannot tell a running process from one that
+      exited with code 259 (STILL_ACTIVE); a zero-timeout wait on the
+      process handle has no such ambiguity. }
+    WaitResult := Windows.WaitForSingleObject(Handle, 0);
+    if WaitResult = Windows.WAIT_TIMEOUT then Result := plAlive
+    else if WaitResult = Windows.WAIT_OBJECT_0 then Result := plDead
+    else Result := plUnknown;
   finally
     Windows.CloseHandle(Handle);
   end;
