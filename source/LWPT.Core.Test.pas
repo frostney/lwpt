@@ -15,6 +15,7 @@ program LWPT.Core.Test;
 
 uses
   {$IFDEF UNIX}
+  cthreads,
   BaseUnix,
   {$ENDIF}
   Classes,
@@ -251,6 +252,35 @@ type
     procedure TestPlainNameUnchanged;
     procedure TestSeparatorsFlattened;
     procedure TestDistinctInputsCanCollide;
+  end;
+
+  TMakeTmpPathThread = class(TThread)
+  private
+    FHint: string;
+    FPaths: TStringList;
+    FRoot: string;
+    FErrorText: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const ARoot, AHint: string);
+    destructor Destroy; override;
+    property ErrorText: string read FErrorText;
+    property Paths: TStringList read FPaths;
+  end;
+
+  TMakeTmpPathSuite = class(TTestSuite)
+  private
+    FScratch: string;
+    procedure ResetScratch;
+  protected
+    procedure AfterAll; override;
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestExistingCandidateIsSkipped;
+    procedure TestManyCallsAreDistinct;
+    procedure TestThreadedBurstIsDistinct;
   end;
 
   { [sources] custom-prefix declaration with placeholder URL
@@ -2409,6 +2439,131 @@ begin
     TestDistinctInputsCanCollide);
 end;
 
+{ ── TMakeTmpPathSuite ───────────────────────────────────────────── }
+
+const
+  TMP_PATH_CALL_COUNT = 1000;
+  TMP_PATH_THREAD_COUNT = 4;
+  TMP_PATH_THREAD_CALL_COUNT = 250;
+
+constructor TMakeTmpPathThread.Create(const ARoot, AHint: string);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FRoot := ARoot;
+  FHint := AHint;
+  FPaths := TStringList.Create;
+end;
+
+destructor TMakeTmpPathThread.Destroy;
+begin
+  FPaths.Free;
+  inherited Destroy;
+end;
+
+procedure TMakeTmpPathThread.Execute;
+var
+  i: Integer;
+begin
+  try
+    for i := 1 to TMP_PATH_THREAD_CALL_COUNT do
+      FPaths.Add(MakeTmpPath(FRoot, FHint));
+  except
+    on E: Exception do FErrorText := E.Message;
+  end;
+end;
+
+procedure TMakeTmpPathSuite.ResetScratch;
+begin
+  WipeDir(FScratch);
+  ForceDirectories(FScratch);
+end;
+
+procedure TMakeTmpPathSuite.BeforeAll;
+begin
+  FScratch := ExpandFileName('build/tests/tmp/make-tmp-path');
+  ResetScratch;
+end;
+
+procedure TMakeTmpPathSuite.AfterAll;
+begin
+  WipeDir(FScratch);
+end;
+
+procedure TMakeTmpPathSuite.TestManyCallsAreDistinct;
+var
+  i: Integer;
+  Paths: TStringList;
+begin
+  Paths := TStringList.Create;
+  try
+    Paths.Sorted := True;
+    Paths.Duplicates := dupIgnore;
+    for i := 1 to TMP_PATH_CALL_COUNT do
+      Paths.Add(MakeTmpPath(FScratch, 'burst'));
+    Expect<Integer>(Paths.Count).ToBe(TMP_PATH_CALL_COUNT);
+  finally
+    Paths.Free;
+  end;
+end;
+
+procedure TMakeTmpPathSuite.TestExistingCandidateIsSkipped;
+var
+  Counter, Stem: string;
+  Candidate, First, ResultPath: string;
+  Separator: Integer;
+begin
+  First := MakeTmpPath(FScratch, 'existing');
+  Stem := Copy(First, 1, Length(First) - Length('.tmp'));
+  Separator := LastDelimiter('.', Stem);
+  Counter := Copy(Stem, Separator + 1, MaxInt);
+  Candidate := Copy(Stem, 1, Separator)
+    + IntToStr(StrToInt64(Counter) + 1) + '.tmp';
+  WriteFixtureFile(Candidate, 'occupied');
+
+  ResultPath := MakeTmpPath(FScratch, 'existing');
+
+  Expect<Boolean>(FileExists(Candidate)).ToBe(True);
+  Expect<Boolean>(ResultPath <> Candidate).ToBe(True);
+end;
+
+procedure TMakeTmpPathSuite.TestThreadedBurstIsDistinct;
+var
+  AllPaths: TStringList;
+  i: Integer;
+  Threads: array[0..TMP_PATH_THREAD_COUNT - 1] of TMakeTmpPathThread;
+begin
+  AllPaths := TStringList.Create;
+  try
+    AllPaths.Sorted := True;
+    AllPaths.Duplicates := dupIgnore;
+    for i := 0 to High(Threads) do
+      Threads[i] := TMakeTmpPathThread.Create(FScratch, 'threaded');
+    for i := 0 to High(Threads) do Threads[i].Start;
+    for i := 0 to High(Threads) do Threads[i].WaitFor;
+    for i := 0 to High(Threads) do
+    begin
+      Expect<string>(Threads[i].ErrorText).ToBe('');
+      AllPaths.AddStrings(Threads[i].Paths);
+    end;
+    Expect<Integer>(AllPaths.Count)
+      .ToBe(TMP_PATH_THREAD_COUNT * TMP_PATH_THREAD_CALL_COUNT);
+  finally
+    for i := 0 to High(Threads) do Threads[i].Free;
+    AllPaths.Free;
+  end;
+end;
+
+procedure TMakeTmpPathSuite.SetupTests;
+begin
+  Test('tight loop with one root and hint returns distinct paths',
+    TestManyCallsAreDistinct);
+  Test('pre-existing candidate is skipped',
+    TestExistingCandidateIsSkipped);
+  Test('multi-threaded burst returns distinct paths',
+    TestThreadedBurstIsDistinct);
+end;
+
 begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
     'LWPT.Core: SHA-256 NIST vectors'));
@@ -2434,6 +2589,8 @@ begin
     'LWPT.Core: MatchPathGlob'));
   TestRunnerProgram.AddSuite(TSanitisePathSegmentSuite.Create(
     'LWPT.Core: SanitisePathSegment'));
+  TestRunnerProgram.AddSuite(TMakeTmpPathSuite.Create(
+    'LWPT.Core: MakeTmpPath uniqueness'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
     'LWPT.Core: ApplyIncludeExclude'));
   TestRunnerProgram.AddSuite(TCopyDirTreeGuards.Create(

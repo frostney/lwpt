@@ -97,6 +97,10 @@ const
   MOVEFILE_WRITE_THROUGH_LWPT = $00000008;
 {$ENDIF}
 
+var
+  TmpPathCounter: LongInt;
+  TmpPathStartedAt: Int64;
+
 function FPCExecutable: string;
 begin
   Result := SysUtils.GetEnvironmentVariable('LWPT_FPC');
@@ -570,28 +574,29 @@ begin
   Result := IntToStr(GetProcessID);
 end;
 
-function MakeSiblingTmpPath(const APath, ATag: string): string;
+function MakeUniqueTmpPath(const ARoot, APrefix: string): string;
 var
-  Dir, Base: string;
-  Counter: Int64;
+  Sequence: Cardinal;
 begin
-  Dir := ExtractFileDir(APath);
-  Base := ExtractFileName(APath);
   repeat
-    Counter := Round(Now * 1000000);
-    Result := IncludeTrailingPathDelimiter(Dir)
-            + Base + '.' + ATag + '.' + ProcessIdStr + '.'
-            + IntToStr(Counter) + '.tmp';
+    Sequence := Cardinal(InterlockedIncrement(TmpPathCounter));
+    Result := IncludeTrailingPathDelimiter(ARoot)
+            + APrefix + '.' + ProcessIdStr + '.'
+            + IntToStr(TmpPathStartedAt) + '.'
+            + IntToStr(Int64(Sequence)) + '.tmp';
   until (not FileExists(Result)) and (not DirectoryExists(Result));
 end;
 
+function MakeSiblingTmpPath(const APath, ATag: string): string;
+begin
+  Result := MakeUniqueTmpPath(ExtractFileDir(APath),
+    ExtractFileName(APath) + '.' + ATag);
+end;
+
 function MakeTmpPath(const ATmpRoot, AHint: string): string;
-var Counter: Int64;
 begin
   ForceDirectories(ATmpRoot);
-  Counter := Round(Now * 1000000);   { microseconds since epoch-ish; unique enough }
-  Result := IncludeTrailingPathDelimiter(ATmpRoot)
-          + AHint + '.' + ProcessIdStr + '.' + IntToStr(Counter) + '.tmp';
+  Result := MakeUniqueTmpPath(ATmpRoot, AHint);
 end;
 
 function IsDirSymlinkOrJunction(const APath: string): Boolean;
@@ -1065,5 +1070,11 @@ begin
   else
     Result := 'sha256:' + SHA256Hex(BytesOf(APathOrArchive));
 end;
+
+initialization
+  { Record a millisecond-resolution TDateTime stamp once per process.
+    PID + atomic sequence provide uniqueness; the existence retry
+    defends against a stale path from PID/stamp reuse. }
+  TmpPathStartedAt := Round(Now * MSecsPerDay);
 
 end.
