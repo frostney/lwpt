@@ -236,7 +236,11 @@ jobs:
       - name: Check Windows TLS linkage (native client, runtime-loaded server)
         run: |
           set -euo pipefail
-          export PATH="$PWD/fpc-cross/bin:$PATH"
+          # The checker is a HOST InstantFPC program that only reads the
+          # already-built PE + map. The cross toolchain in fpc-cross/ cannot
+          # link a host binary on this macOS runner (ld: library 'c' not
+          # found), so use a host-linkable FPC (brew puts instantfpc on PATH).
+          brew list fpc >/dev/null 2>&1 || brew install fpc
           instantfpc packages/httpclient/scripts/check-windows-tls-imports.pas \
             --self-test
           instantfpc packages/httpclient/scripts/check-windows-tls-imports.pas \
