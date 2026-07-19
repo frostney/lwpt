@@ -14,8 +14,8 @@ uses
   Tests.Scratch;
 
 const
-  DEAD_LINK_PID_SLUG = 'zik0zi';
-  DEAD_PID_SLUG = 'zik0zj';
+  DeadLinkPIDSlug = 'zik0zi';
+  DeadPIDSlug = 'zik0zj';
 
 type
   TScratch = class(TTestSuite)
@@ -47,12 +47,12 @@ var
 begin
   LiveRoot := CreateScratchRoot('scratch-reaping');
   Base := IncludeTrailingPathDelimiter(ExtractFileDir(LiveRoot));
-  DeadRoot := Base + 'scratch-reaping-' + DEAD_PID_SLUG + '-0';
+  DeadRoot := Base + 'scratch-reaping-' + DeadPIDSlug + '-0';
   ForceDirectories(DeadRoot);
   WriteTextFile(DeadRoot + '/dead', 'dead');
   DeadLink := '';
   {$IFDEF UNIX}
-  DeadLink := Base + 'scratch-reaping-' + DEAD_LINK_PID_SLUG + '-0';
+  DeadLink := Base + 'scratch-reaping-' + DeadLinkPIDSlug + '-0';
   if FpSymlink(PAnsiChar(LiveRoot), PAnsiChar(DeadLink)) <> 0 then
     raise Exception.Create('fixture: FpSymlink failed for stale root');
   {$ENDIF}

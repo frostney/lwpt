@@ -9,11 +9,14 @@
   compile path via LWPT.Command.Testing).
 
   CreateScratchRoot uses a compact base-36 PID + timestamp owner slug.
-  Before allocating it, dead-owner siblings are atomically claimed and
-  removed. PID checks fail closed when liveness is indeterminate; the
-  generous age fallback is used only on platforms without a liveness
-  API. This lets concurrent test invocations coexist while recovering
-  debris from interrupted runs.
+  Before allocating it, stale siblings are atomically claimed and
+  removed. A dead owner's root is reaped only after a short grace
+  period (orphaned descendants of a crashed run can briefly outlive
+  it); a live-looking owner's root still falls to the age ceiling,
+  which bounds PID recycling. PID checks fail closed when liveness is
+  indeterminate; the age ceiling alone is used only on platforms
+  without a liveness API. This lets concurrent test invocations
+  coexist while recovering debris from interrupted runs.
 
   RecursiveDelete is link-aware: a symlink is unlinked and a Windows
   directory symlink/junction is removed as a node (RemoveDir detaches
@@ -54,9 +57,12 @@ uses
   SysUtils;
 
 const
-  SCRATCH_BASE = 'build/tests/tmp';
-  REAP_PREFIX = '.reap-';
-  STALE_AGE_DAYS = 7;
+  ScratchBase = 'build/tests/tmp';
+  ReapPrefix = '.reap-';
+  StaleAgeDays = 7;
+  DeadOwnerGraceMSec = 10 * 60 * 1000;
+  Base36Radix = 36;
+  OwnerSeparator = '-';
 
 type
   TProcessLiveness = (plAlive, plDead, plUnknown, plUnavailable);
@@ -67,35 +73,35 @@ var
 
 function EncodeBase36(AValue: QWord): string;
 const
-  DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz';
+  Digits = '0123456789abcdefghijklmnopqrstuvwxyz';
 begin
   if AValue = 0 then Exit('0');
   Result := '';
   while AValue > 0 do
   begin
-    Result := DIGITS[(AValue mod 36) + 1] + Result;
-    AValue := AValue div 36;
+    Result := Digits[(AValue mod Base36Radix) + 1] + Result;
+    AValue := AValue div Base36Radix;
   end;
 end;
 
 function TryDecodeBase36(const AValue: string; out ADecoded: QWord): Boolean;
 var
-  i: Integer;
+  Index: Integer;
   Digit: QWord;
 begin
   Result := False;
   ADecoded := 0;
   if AValue = '' then Exit;
-  for i := 1 to Length(AValue) do
+  for Index := 1 to Length(AValue) do
   begin
-    case AValue[i] of
-      '0'..'9': Digit := Ord(AValue[i]) - Ord('0');
-      'a'..'z': Digit := Ord(AValue[i]) - Ord('a') + 10;
+    case AValue[Index] of
+      '0'..'9': Digit := Ord(AValue[Index]) - Ord('0');
+      'a'..'z': Digit := Ord(AValue[Index]) - Ord('a') + 10;
     else
       Exit;
     end;
-    if ADecoded > (High(QWord) - Digit) div 36 then Exit;
-    ADecoded := ADecoded * 36 + Digit;
+    if ADecoded > (High(QWord) - Digit) div Base36Radix then Exit;
+    ADecoded := ADecoded * Base36Radix + Digit;
   end;
   Result := True;
 end;
@@ -117,30 +123,31 @@ var
   Search: TSearchRec;
 begin
   if APath = '' then Exit(False);
-  Result := FindFirst(ExcludeTrailingPathDelimiter(APath),
+  Result := SysUtils.FindFirst(ExcludeTrailingPathDelimiter(APath),
     faAnyFile or faSymLink, Search) = 0;
-  if Result then FindClose(Search);
+  if Result then SysUtils.FindClose(Search);
 end;
 
 procedure ValidateSuiteName(const ASuite: string);
 var
-  i: Integer;
+  Index: Integer;
 begin
   if ASuite = '' then
     raise Exception.Create('CreateScratchRoot: suite name cannot be empty');
-  for i := 1 to Length(ASuite) do
-    if not (ASuite[i] in ['a'..'z', '0'..'9', '-']) then
+  for Index := 1 to Length(ASuite) do
+    if not (ASuite[Index] in ['a'..'z', '0'..'9', '-']) then
       raise Exception.CreateFmt(
         'CreateScratchRoot: invalid suite name "%s"', [ASuite]);
 end;
 
-function ProcessLiveness(APID: LongInt): TProcessLiveness;
+function ProcessLiveness(const APID: QWord): TProcessLiveness;
 {$IFDEF UNIX}
 var
   ErrorCode: cint;
 begin
-  if APID <= 0 then Exit(plDead);
-  if FpKill(APID, 0) = 0 then Exit(plAlive);
+  if APID = 0 then Exit(plDead);
+  if APID > QWord(High(LongInt)) then Exit(plUnknown);
+  if FpKill(LongInt(APID), 0) = 0 then Exit(plAlive);
   ErrorCode := fpgeterrno;
   if ErrorCode = ESysESRCH then Exit(plDead);
   if ErrorCode = ESysEPERM then Exit(plAlive);
@@ -152,7 +159,8 @@ var
   Handle: THandle;
   ExitCode, ErrorCode: DWORD;
 begin
-  if APID <= 0 then Exit(plDead);
+  if APID = 0 then Exit(plDead);
+  if APID > QWord(High(DWORD)) then Exit(plDead);
   Handle := Windows.OpenProcess(
     Windows.PROCESS_QUERY_INFORMATION, False, DWORD(APID));
   if Handle = 0 then
@@ -172,68 +180,70 @@ begin
 end;
 {$ELSE}
 begin
-  if APID <= 0 then Exit(plDead);
+  if APID = 0 then Exit(plDead);
   Result := plUnavailable;
 end;
 {$ENDIF}
 {$ENDIF}
 
-function OwnerIsStale(APID: LongInt; ATimestamp: QWord): Boolean;
+function OwnerIsStale(const APID: QWord; const ATimestamp: QWord): Boolean;
 var
-  Current: QWord;
+  Current, Age: QWord;
 begin
-  case ProcessLiveness(APID) of
-    plDead: Exit(True);
-    plAlive, plUnknown: Exit(False);
-  end;
   Current := CurrentScratchTimestamp;
-  Result := (Current > ATimestamp)
-    and (Current - ATimestamp >= QWord(STALE_AGE_DAYS) * MSecsPerDay);
+  if Current > ATimestamp then Age := Current - ATimestamp
+  else Age := 0;
+  case ProcessLiveness(APID) of
+    { A crashed owner's orphaned descendants can briefly outlive it
+      and still write into the root; the grace period outlasts them. }
+    plDead: Exit(Age >= DeadOwnerGraceMSec);
+    { PID recycling can make an abandoned root look owned forever;
+      the age ceiling bounds that. }
+    plAlive, plUnknown: Exit(Age >= QWord(StaleAgeDays) * MSecsPerDay);
+  end;
+  Result := Age >= QWord(StaleAgeDays) * MSecsPerDay;
 end;
 
 function TryParseOwner(const AName, APrefix: string;
-  out APID: LongInt; out ATimestamp: QWord): Boolean;
+  out APID: QWord; out ATimestamp: QWord): Boolean;
 var
   Tail, PIDPart, TimestampPart: string;
   Separator: Integer;
-  PIDValue: QWord;
 begin
   Result := False;
-  APID := -1;
+  APID := 0;
   ATimestamp := 0;
   if Copy(AName, 1, Length(APrefix)) <> APrefix then Exit;
   Tail := Copy(AName, Length(APrefix) + 1, MaxInt);
-  Separator := Pos('-', Tail);
+  Separator := Pos(OwnerSeparator, Tail);
   if Separator = 0 then Exit;
   PIDPart := Copy(Tail, 1, Separator - 1);
   TimestampPart := Copy(Tail, Separator + 1, MaxInt);
-  if Pos('-', TimestampPart) > 0 then Exit;
-  if not TryDecodeBase36(PIDPart, PIDValue) then Exit;
-  if PIDValue > QWord(High(LongInt)) then Exit;
+  if Pos(OwnerSeparator, TimestampPart) > 0 then Exit;
+  if not TryDecodeBase36(PIDPart, APID) then Exit;
   if not TryDecodeBase36(TimestampPart, ATimestamp) then Exit;
-  APID := LongInt(PIDValue);
   Result := True;
 end;
 
 function TryParseReapOwner(const AName: string;
-  out APID: LongInt; out ATimestamp: QWord): Boolean;
+  out APID: QWord; out ATimestamp: QWord): Boolean;
 var
   Tail, OwnerPart, CounterPart: string;
   Separator: Integer;
-  Ignored: QWord;
+  DecodedReapCounter: QWord;
 begin
   Result := False;
-  if Copy(AName, 1, Length(REAP_PREFIX)) <> REAP_PREFIX then Exit;
-  Tail := Copy(AName, Length(REAP_PREFIX) + 1, MaxInt);
-  Separator := LastDelimiter('-', Tail);
+  if Copy(AName, 1, Length(ReapPrefix)) <> ReapPrefix then Exit;
+  Tail := Copy(AName, Length(ReapPrefix) + 1, MaxInt);
+  Separator := LastDelimiter(OwnerSeparator, Tail);
   if Separator = 0 then Exit;
   OwnerPart := Copy(Tail, 1, Separator - 1);
   CounterPart := Copy(Tail, Separator + 1, MaxInt);
-  if not TryDecodeBase36(CounterPart, Ignored) then Exit;
+  if not TryDecodeBase36(CounterPart, DecodedReapCounter) then Exit;
   Result := TryParseOwner(OwnerPart, '', APID, ATimestamp);
 end;
 
-procedure RemoveLink(const APath: string; AAttributes: LongInt);
+procedure RemoveLink(const APath: string; const AAttributes: LongInt);
 begin
   {$IFDEF MSWINDOWS}
   if (AAttributes and faDirectory) <> 0 then
@@ -245,7 +255,7 @@ begin
   end
   else
   {$ENDIF}
-  if not DeleteFile(APath) then
+  if not SysUtils.DeleteFile(APath) then
     raise Exception.CreateFmt(
       'RecursiveDelete: failed to unlink "%s": %s',
       [APath, SysErrorMessage(GetLastOSError)]);
@@ -257,9 +267,9 @@ var
 begin
   repeat
     Inc(ReapCounter);
-    ClaimedPath := ABase + REAP_PREFIX
-      + EncodeBase36(QWord(GetProcessID)) + '-'
-      + EncodeBase36(NextScratchTimestamp) + '-'
+    ClaimedPath := ABase + ReapPrefix
+      + EncodeBase36(QWord(GetProcessID)) + OwnerSeparator
+      + EncodeBase36(NextScratchTimestamp) + OwnerSeparator
       + EncodeBase36(ReapCounter);
   until not PathExists(ClaimedPath);
   if not RenameFile(APath, ClaimedPath) then
@@ -280,31 +290,32 @@ var
   Search: TSearchRec;
   Candidates: TStringList;
   Base, Candidate: string;
-  PID: LongInt;
+  PID: QWord;
   Timestamp: QWord;
-  i: Integer;
+  Index: Integer;
 begin
   Base := IncludeTrailingPathDelimiter(ABase);
   Candidates := TStringList.Create;
   try
-    if FindFirst(Base + '*', faAnyFile or faSymLink, Search) = 0 then
+    if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, Search) = 0 then
       try
         repeat
           if (Search.Name = '.') or (Search.Name = '..') then Continue;
           if (Search.Attr and (faDirectory or faSymLink)) = 0 then Continue;
-          if TryParseOwner(Search.Name, ASuite + '-', PID, Timestamp)
+          if TryParseOwner(Search.Name, ASuite + OwnerSeparator,
+              PID, Timestamp)
             and OwnerIsStale(PID, Timestamp) then
             Candidates.Add(Base + Search.Name)
           else if TryParseReapOwner(Search.Name, PID, Timestamp)
             and OwnerIsStale(PID, Timestamp) then
             Candidates.Add(Base + Search.Name);
-        until FindNext(Search) <> 0;
+        until SysUtils.FindNext(Search) <> 0;
       finally
-        FindClose(Search);
+        SysUtils.FindClose(Search);
       end;
-    for i := 0 to Candidates.Count - 1 do
+    for Index := 0 to Candidates.Count - 1 do
     begin
-      Candidate := Candidates[i];
+      Candidate := Candidates[Index];
       if PathExists(Candidate) then ClaimAndDelete(Candidate, Base);
     end;
   finally
@@ -314,18 +325,19 @@ end;
 
 function CreateScratchRoot(const ASuite: string): string;
 var
-  Base, Owner: string;
+  Base, ProcessIDSlug: string;
 begin
   ValidateSuiteName(ASuite);
-  Base := ExpandFileName(SCRATCH_BASE);
+  Base := ExpandFileName(ScratchBase);
   if not ForceDirectories(Base) and not DirectoryExists(Base) then
     raise Exception.CreateFmt(
       'CreateScratchRoot: failed to create base directory "%s": %s',
       [Base, SysErrorMessage(GetLastOSError)]);
   ReapStaleRoots(Base, ASuite);
-  Owner := EncodeBase36(QWord(GetProcessID));
+  ProcessIDSlug := EncodeBase36(QWord(GetProcessID));
   repeat
-    Result := IncludeTrailingPathDelimiter(Base) + ASuite + '-' + Owner + '-'
+    Result := IncludeTrailingPathDelimiter(Base) + ASuite
+      + OwnerSeparator + ProcessIDSlug + OwnerSeparator
       + EncodeBase36(NextScratchTimestamp);
   until not PathExists(Result);
   if not ForceDirectories(Result) and not DirectoryExists(Result) then
@@ -379,7 +391,7 @@ var
   Base: string;
 begin
   if APath = '' then Exit;
-  if FindFirst(ExcludeTrailingPathDelimiter(APath),
+  if SysUtils.FindFirst(ExcludeTrailingPathDelimiter(APath),
     faAnyFile or faSymLink, RootSearch) <> 0 then Exit;
   try
     if (RootSearch.Attr and faSymLink) <> 0 then
@@ -389,7 +401,7 @@ begin
     end;
     if (RootSearch.Attr and faDirectory) = 0 then Exit;
   finally
-    FindClose(RootSearch);
+    SysUtils.FindClose(RootSearch);
   end;
   Base := IncludeTrailingPathDelimiter(APath);
   { faSymLink in the mask makes FindFirst report links as links (the
@@ -401,7 +413,7 @@ begin
     ENOTDIR — while a Windows junction / directory reparse point is
     the opposite: DeleteFile cannot remove it, RemoveDir detaches it
     without touching the target. }
-  if FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
+  if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
     try
       repeat
         if (SR.Name = '.') or (SR.Name = '..') then Continue;
@@ -409,13 +421,13 @@ begin
           RemoveLink(Base + SR.Name, SR.Attr)
         else if (SR.Attr and faDirectory) <> 0 then
           RecursiveDelete(Base + SR.Name)
-        else if not DeleteFile(Base + SR.Name) then
+        else if not SysUtils.DeleteFile(Base + SR.Name) then
           raise Exception.CreateFmt(
             'RecursiveDelete: failed to delete "%s": %s',
             [Base + SR.Name, SysErrorMessage(GetLastOSError)]);
-      until FindNext(SR) <> 0;
+      until SysUtils.FindNext(SR) <> 0;
     finally
-      FindClose(SR);
+      SysUtils.FindClose(SR);
     end;
   if not RemoveDir(APath) then
     raise Exception.CreateFmt(
