@@ -2442,9 +2442,9 @@ end;
 { ── TMakeTmpPathSuite ───────────────────────────────────────────── }
 
 const
-  TMP_PATH_CALL_COUNT = 1000;
-  TMP_PATH_THREAD_COUNT = 4;
-  TMP_PATH_THREAD_CALL_COUNT = 250;
+  TmpPathCallCount = 1000;
+  TmpPathThreadCount = 4;
+  TmpPathThreadCallCount = 250;
 
 constructor TMakeTmpPathThread.Create(const ARoot, AHint: string);
 begin
@@ -2463,10 +2463,10 @@ end;
 
 procedure TMakeTmpPathThread.Execute;
 var
-  i: Integer;
+  Index: Integer;
 begin
   try
-    for i := 1 to TMP_PATH_THREAD_CALL_COUNT do
+    for Index := 1 to TmpPathThreadCallCount do
       FPaths.Add(MakeTmpPath(FRoot, FHint));
   except
     on E: Exception do FErrorText := E.Message;
@@ -2481,7 +2481,10 @@ end;
 
 procedure TMakeTmpPathSuite.BeforeAll;
 begin
-  FScratch := ExpandFileName('build/tests/tmp/make-tmp-path');
+  { Process-unique root: concurrent test binaries must not wipe each
+    other's occupied-candidate fixtures. }
+  FScratch := ExpandFileName('build/tests/tmp/make-tmp-path-'
+    + IntToStr(GetProcessID));
   ResetScratch;
 end;
 
@@ -2492,16 +2495,16 @@ end;
 
 procedure TMakeTmpPathSuite.TestManyCallsAreDistinct;
 var
-  i: Integer;
+  Index: Integer;
   Paths: TStringList;
 begin
   Paths := TStringList.Create;
   try
     Paths.Sorted := True;
     Paths.Duplicates := dupIgnore;
-    for i := 1 to TMP_PATH_CALL_COUNT do
+    for Index := 1 to TmpPathCallCount do
       Paths.Add(MakeTmpPath(FScratch, 'burst'));
-    Expect<Integer>(Paths.Count).ToBe(TMP_PATH_CALL_COUNT);
+    Expect<Integer>(Paths.Count).ToBe(TmpPathCallCount);
   finally
     Paths.Free;
   end;
@@ -2530,26 +2533,26 @@ end;
 procedure TMakeTmpPathSuite.TestThreadedBurstIsDistinct;
 var
   AllPaths: TStringList;
-  i: Integer;
-  Threads: array[0..TMP_PATH_THREAD_COUNT - 1] of TMakeTmpPathThread;
+  Index: Integer;
+  Threads: array[0..TmpPathThreadCount - 1] of TMakeTmpPathThread;
 begin
   AllPaths := TStringList.Create;
   try
     AllPaths.Sorted := True;
     AllPaths.Duplicates := dupIgnore;
-    for i := 0 to High(Threads) do
-      Threads[i] := TMakeTmpPathThread.Create(FScratch, 'threaded');
-    for i := 0 to High(Threads) do Threads[i].Start;
-    for i := 0 to High(Threads) do Threads[i].WaitFor;
-    for i := 0 to High(Threads) do
+    for Index := 0 to High(Threads) do
+      Threads[Index] := TMakeTmpPathThread.Create(FScratch, 'threaded');
+    for Index := 0 to High(Threads) do Threads[Index].Start;
+    for Index := 0 to High(Threads) do Threads[Index].WaitFor;
+    for Index := 0 to High(Threads) do
     begin
-      Expect<string>(Threads[i].ErrorText).ToBe('');
-      AllPaths.AddStrings(Threads[i].Paths);
+      Expect<string>(Threads[Index].ErrorText).ToBe('');
+      AllPaths.AddStrings(Threads[Index].Paths);
     end;
     Expect<Integer>(AllPaths.Count)
-      .ToBe(TMP_PATH_THREAD_COUNT * TMP_PATH_THREAD_CALL_COUNT);
+      .ToBe(TmpPathThreadCount * TmpPathThreadCallCount);
   finally
-    for i := 0 to High(Threads) do Threads[i].Free;
+    for Index := 0 to High(Threads) do Threads[Index].Free;
     AllPaths.Free;
   end;
 end;

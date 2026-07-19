@@ -574,6 +574,26 @@ begin
   Result := IntToStr(GetProcessID);
 end;
 
+const
+  TmpPathDelimiter = '.';
+  TmpPathExtension = '.tmp';
+
+{ Base36 keeps the once-per-process stamp inside the pre-hardening
+  temp-name length budget; atomic-write callers can sit close to
+  filesystem path limits. }
+function EncodeBase36(AValue: Int64): string;
+const
+  Digits = '0123456789abcdefghijklmnopqrstuvwxyz';
+begin
+  if AValue <= 0 then Exit('0');
+  Result := '';
+  while AValue > 0 do
+  begin
+    Result := Digits[(AValue mod 36) + 1] + Result;
+    AValue := AValue div 36;
+  end;
+end;
+
 function MakeUniqueTmpPath(const ARoot, APrefix: string): string;
 var
   Sequence: Cardinal;
@@ -581,16 +601,16 @@ begin
   repeat
     Sequence := Cardinal(InterlockedIncrement(TmpPathCounter));
     Result := IncludeTrailingPathDelimiter(ARoot)
-            + APrefix + '.' + ProcessIdStr + '.'
-            + IntToStr(TmpPathStartedAt) + '.'
-            + IntToStr(Int64(Sequence)) + '.tmp';
+            + APrefix + TmpPathDelimiter + ProcessIdStr + TmpPathDelimiter
+            + EncodeBase36(TmpPathStartedAt) + TmpPathDelimiter
+            + IntToStr(Int64(Sequence)) + TmpPathExtension;
   until (not FileExists(Result)) and (not DirectoryExists(Result));
 end;
 
-function MakeSiblingTmpPath(const APath, ATag: string): string;
+function MakeSiblingTmpPath(const APath, ATag: string): string; inline;
 begin
   Result := MakeUniqueTmpPath(ExtractFileDir(APath),
-    ExtractFileName(APath) + '.' + ATag);
+    ExtractFileName(APath) + TmpPathDelimiter + ATag);
 end;
 
 function MakeTmpPath(const ATmpRoot, AHint: string): string;
