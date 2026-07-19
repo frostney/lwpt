@@ -1131,19 +1131,20 @@ end;
 procedure TLWPTBuildSession.WriteJobLog(const AName, AOutput: string);
 var
   LogPath: string;
-  Stream: TFileStream;
+  Bytes: TBytes;
 begin
   LogPath := JobLogPath(AName);
   if not ForceDirectories(ExtractFileDir(LogPath)) then
     raise ELWPTError.CreateFmt('could not create session log directory %s',
       [ExtractFileDir(LogPath)]);
-  Stream := TFileStream.Create(LogPath, fmCreate);
-  try
-    if AOutput <> '' then
-      Stream.WriteBuffer(AOutput[1], Length(AOutput));
-  finally
-    Stream.Free;
-  end;
+  { Committed-path write goes through the atomic helper (staged under the
+    session root, atomic rename) — never a raw TFileStream — so an
+    interrupted write cannot leave a truncated log behind JobLogReference.
+    Byte-exact copy: the captured output must not be re-encoded. }
+  SetLength(Bytes, Length(AOutput));
+  if Length(AOutput) > 0 then
+    Move(AOutput[1], Bytes[0], Length(AOutput));
+  AtomicWriteBytes(LogPath, FSessionRoot, Bytes);
 end;
 
 procedure TLWPTBuildSession.Finish(ASuccess: Boolean; const ADetail: string);
