@@ -280,6 +280,8 @@ type
     procedure SetupTests; override;
     procedure TestExistingCandidateIsSkipped;
     procedure TestManyCallsAreDistinct;
+    procedure TestSiblingCallsAreDistinct;
+    procedure TestSiblingExistingCandidateIsSkipped;
     procedure TestThreadedBurstIsDistinct;
   end;
 
@@ -2557,6 +2559,53 @@ begin
   end;
 end;
 
+procedure TMakeTmpPathSuite.TestSiblingCallsAreDistinct;
+var
+  BasePath: string;
+  Index: Integer;
+  Paths: TStringList;
+begin
+  BasePath := IncludeTrailingPathDelimiter(FScratch) + 'target.txt';
+  Paths := TStringList.Create;
+  try
+    Paths.Sorted := True;
+    Paths.Duplicates := dupIgnore;
+    for Index := 1 to TmpPathCallCount do
+      Paths.Add(MakeSiblingTmpPath(BasePath, 'old'));
+    Expect<Integer>(Paths.Count).ToBe(TmpPathCallCount);
+    for Index := 0 to Paths.Count - 1 do
+    begin
+      Expect<string>(ExtractFileDir(Paths[Index]))
+        .ToBe(ExcludeTrailingPathDelimiter(FScratch));
+      Expect<Boolean>(Pos('target.txt.old.', ExtractFileName(Paths[Index])) = 1)
+        .ToBe(True);
+    end;
+  finally
+    Paths.Free;
+  end;
+end;
+
+procedure TMakeTmpPathSuite.TestSiblingExistingCandidateIsSkipped;
+var
+  BasePath, Counter, Stem: string;
+  Candidate, First, ResultPath: string;
+  Separator: Integer;
+begin
+  BasePath := IncludeTrailingPathDelimiter(FScratch) + 'target.txt';
+  First := MakeSiblingTmpPath(BasePath, 'old');
+  Stem := Copy(First, 1, Length(First) - Length('.tmp'));
+  Separator := LastDelimiter('.', Stem);
+  Counter := Copy(Stem, Separator + 1, MaxInt);
+  Candidate := Copy(Stem, 1, Separator)
+    + IntToStr(StrToInt64(Counter) + 1) + '.tmp';
+  WriteFixtureFile(Candidate, 'occupied');
+
+  ResultPath := MakeSiblingTmpPath(BasePath, 'old');
+
+  Expect<Boolean>(FileExists(Candidate)).ToBe(True);
+  Expect<Boolean>(ResultPath <> Candidate).ToBe(True);
+end;
+
 procedure TMakeTmpPathSuite.SetupTests;
 begin
   Test('tight loop with one root and hint returns distinct paths',
@@ -2565,6 +2614,10 @@ begin
     TestExistingCandidateIsSkipped);
   Test('multi-threaded burst returns distinct paths',
     TestThreadedBurstIsDistinct);
+  Test('sibling paths for one base path are distinct',
+    TestSiblingCallsAreDistinct);
+  Test('pre-existing sibling candidate is skipped',
+    TestSiblingExistingCandidateIsSkipped);
 end;
 
 begin

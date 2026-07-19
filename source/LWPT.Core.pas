@@ -71,6 +71,7 @@ function  CopyFileContent(const ASrc, ADst: string): Boolean;
 function  PathContains(const AParent, AChild: string): Boolean;
 procedure CopyDirTree(const ASrc, ADst: string);
 function  MakeTmpPath(const ATmpRoot, AHint: string): string;
+function  MakeSiblingTmpPath(const APath, ATag: string): string; inline;
 procedure WipeDir(const APath: string);
 function  AtomicMoveFile(const ASrc, ADst: string): Boolean;
 function  AtomicMoveDir(const ASrc, ADst: string): Boolean;
