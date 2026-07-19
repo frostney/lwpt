@@ -53,8 +53,7 @@ procedure TBuildClean.BeforeAll;
 const
   TRIVIAL = 'begin'#10'end.'#10;
 begin
-  FScratch := ExpandFileName(
-    GetCurrentDir + '/build/tests/tmp/build-clean');
+  FScratch := CreateScratchRoot('build-clean');
   RecursiveDelete(FScratch);
 
   WriteTextFile(FScratch + '/lwpt.toml',

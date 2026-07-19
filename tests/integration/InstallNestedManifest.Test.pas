@@ -71,8 +71,7 @@ end;
 procedure TInstallNestedManifest.BeforeAll;
 begin
   FOrigDir  := GetCurrentDir;
-  FScratch  := ExpandFileName(
-    FOrigDir + '/build/tests/tmp/install-nested-manifest');
+  FScratch  := CreateScratchRoot('install-nested-manifest');
   FRoot     := FScratch + '/root';
 
   RecursiveDelete(FScratch);

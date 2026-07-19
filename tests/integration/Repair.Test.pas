@@ -106,7 +106,7 @@ end;
 procedure TRepairE2E.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
-  FScratch := ExpandFileName('build/tests/tmp/repair-e2e');
+  FScratch := CreateScratchRoot('repair-e2e');
   FWorkerState := FScratch + '/worker-state';
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 

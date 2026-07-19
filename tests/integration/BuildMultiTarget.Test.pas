@@ -66,8 +66,7 @@ const
   TRIVIAL = 'uses common;'#10'begin'#10
           + '  if GREETING = '''' then Halt(1);'#10'end.'#10;
 begin
-  FScratch := ExpandFileName(
-    GetCurrentDir + '/build/tests/tmp/build-multi-target');
+  FScratch := CreateScratchRoot('build-multi-target');
   RecursiveDelete(FScratch);
 
   WriteTextFile(FScratch + '/lwpt.toml',
@@ -189,8 +188,7 @@ begin
     build/ itself — --clean would wipe every target's artefacts and
     the binary. The manifest loader must reject it before any build
     (or wipe) runs. }
-  Bad := ExpandFileName(
-    GetCurrentDir + '/build/tests/tmp/build-traversal-name');
+  Bad := FScratch + '/traversal-name';
   RecursiveDelete(Bad);
   WriteTextFile(Bad + '/lwpt.toml',
       '[package]'#10
@@ -219,8 +217,7 @@ var
 begin
   { The readable part of both keys sanitises to a_b, but the full-name hash
     keeps their private compiler output distinct. }
-  Bad := ExpandFileName(
-    GetCurrentDir + '/build/tests/tmp/build-colliding-names');
+  Bad := FScratch + '/colliding-names';
   RecursiveDelete(Bad);
   WriteTextFile(Bad + '/lwpt.toml',
       '[package]'#10
@@ -275,8 +272,7 @@ begin
     not compile reached the publish step and failed there with
     "could not atomically publish" instead of reporting the compile
     failure. }
-  Bad := ExpandFileName(
-    GetCurrentDir + '/build/tests/tmp/build-compile-failure');
+  Bad := FScratch + '/compile-failure';
   RecursiveDelete(Bad);
   WriteTextFile(Bad + '/lwpt.toml',
       '[package]'#10
@@ -334,8 +330,7 @@ var
   Bad: string;
   R: TLwptResult;
 begin
-  Bad := ExpandFileName(
-    GetCurrentDir + '/build/tests/tmp/build-invalid-graph');
+  Bad := FScratch + '/invalid-graph';
   RecursiveDelete(Bad);
   WriteTextFile(Bad + '/lwpt.toml',
       '[package]'#10

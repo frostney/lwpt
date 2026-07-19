@@ -44,7 +44,7 @@ end;
 
 procedure TTestScheduling.BeforeAll;
 begin
-  FScratch := ExpandFileName('build/tests/tmp/test-scheduling');
+  FScratch := CreateScratchRoot('test-scheduling');
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 end;
 
