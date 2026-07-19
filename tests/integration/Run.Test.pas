@@ -83,7 +83,7 @@ end;
 procedure TRunE2E.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
-  FScratch := ExpandFileName('build/tests/tmp/run-e2e');
+  FScratch := CreateScratchRoot('run-e2e');
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 
   RecursiveDelete(FScratch);

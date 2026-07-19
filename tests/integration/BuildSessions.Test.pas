@@ -86,7 +86,7 @@ begin
     reservation on the suite process, but do not forward its one-shot token
     to more than one child. }
   ClearWorkerLeaseEnvironment;
-  FScratch := ExpandFileName('build/tests/tmp/build-sessions');
+  FScratch := CreateScratchRoot('build-sessions');
   RecursiveDelete(FScratch);
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 
@@ -418,7 +418,7 @@ var
   Started: TDateTime;
   Env: array of string;
 begin
-  Project := FScratch + '-distinct-outputs';
+  Project := FScratch + '/distinct-outputs';
   ReadyDir := FScratch + '/control/distinct-ready';
   ReleasePath := FScratch + '/control/distinct-release';
   RecursiveDelete(Project);
@@ -510,7 +510,7 @@ var
   Env: array of string;
   InstallResult, RepairResult: TLwptResult;
 begin
-  Project := FScratch + '-workspace';
+  Project := FScratch + '/workspace';
   ReadyDir := FScratch + '/control/workspace-ready';
   ReleasePath := FScratch + '/control/workspace-release';
   RecursiveDelete(Project);
@@ -659,7 +659,7 @@ var
   Started: TDateTime;
   Env: array of string;
 begin
-  Project := FScratch + '-parallel-graph';
+  Project := FScratch + '/parallel-graph';
   ReadyDir := Project + '/control/ready';
   ReleaseDir := Project + '/control/release';
   WriteGraphProject(Project);
@@ -725,7 +725,7 @@ var
   Started: TDateTime;
   Env: array of string;
 begin
-  Project := FScratch + '-sequential-graph';
+  Project := FScratch + '/sequential-graph';
   ReadyDir := Project + '/control/ready';
   ReleaseDir := Project + '/control/release';
   WriteGraphProject(Project);
@@ -786,7 +786,7 @@ var
   R: TLwptResult;
   AlphaAt, BetaAt, AppAt: Integer;
 begin
-  Project := FScratch + '-failed-graph';
+  Project := FScratch + '/failed-graph';
   ReadyDir := Project + '/control/ready';
   ReleaseDir := Project + '/control/release';
   WriteGraphProject(Project);

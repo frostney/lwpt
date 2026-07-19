@@ -18,8 +18,8 @@
 
   Fixtures are synthesised in-test via tests/support/Tests.TarSynth.pas
   (deterministic; controls the wire format exactly), gzipped, written
-  to a per-test scratch dir, and extracted. The scratch dir lives
-  under build/tests/tmp/ and is wiped at the start of each suite. }
+  to an invocation-private scratch dir, and extracted. The scratch dir
+  is wiped at the start of each suite. }
 
 program ExtractPathological.Test;
 
@@ -32,6 +32,7 @@ uses
   LWPT.Core,
   LWPT.Install,
   TestingPascalLibrary,
+  Tests.Scratch,
   Tests.TarSynth;
 
 type
@@ -124,7 +125,7 @@ end;
 
 procedure TExtractPathological.BeforeAll;
 begin
-  FScratch := ExpandFileName('build/tests/tmp/extract-pathological');
+  FScratch := CreateScratchRoot('extract-pathological');
   WipeScratch;
 end;
 
@@ -388,7 +389,7 @@ end;
 
 procedure TExtractFailureModes.BeforeAll;
 begin
-  FScratch := ExpandFileName('build/tests/tmp/extract-failure-modes');
+  FScratch := CreateScratchRoot('extract-failure-modes');
   if not DirectoryExists(FScratch) then ForceDirectories(FScratch);
 end;
 

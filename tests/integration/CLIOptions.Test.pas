@@ -23,9 +23,9 @@
       validated by the build subcommand itself (not the parser), so
       this catches regressions in BOTH parsing + the validation step.
 
-  Scratch project: built in-test under build/tests/tmp/cli-options-e2e/
-  with a minimal lwpt.toml + one trivial source. Not committed; gets
-  wiped + regenerated on each test run. }
+  Scratch project: built in-test under an invocation-private root with
+  a minimal lwpt.toml + one trivial source. Not committed; gets wiped
+  and regenerated on each test run. }
 
 program CLIOptions.Test;
 
@@ -82,7 +82,7 @@ end;
 procedure TCLIOptionsE2E.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
-  FScratch := ExpandFileName('build/tests/tmp/cli-options-e2e');
+  FScratch := CreateScratchRoot('cli-options-e2e');
   { Absolutise the binary path BEFORE we chdir into the scratch dir;
     LwptBinaryPath caches the path the first time SetLwptBinaryPath
     is called, and we want that resolution against the project root,

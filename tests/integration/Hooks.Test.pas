@@ -112,7 +112,7 @@ end;
 procedure THooksE2E.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
-  FScratch := ExpandFileName('build/tests/tmp/hooks-e2e');
+  FScratch := CreateScratchRoot('hooks-e2e');
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 end;
 
