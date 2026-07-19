@@ -91,7 +91,7 @@ procedure TInstallGitLabE2E.BeforeAll;
 var R: TLwptResult;
 begin
   FOrigDir := GetCurrentDir;
-  FScratch := ExpandFileName('build/tests/tmp/install-gitlab-e2e');
+  FScratch := CreateScratchRoot('install-gitlab-e2e');
   FRoot    := FScratch + '/root';
   FSkipped := SkipNetworkTests;
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));

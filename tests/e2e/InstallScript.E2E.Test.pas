@@ -201,7 +201,7 @@ var ResolveErr, InstallOut: string;
 begin
   FOrigDir  := GetCurrentDir;
   FRepoRoot := GetCurrentDir;   { lwpt test sets CWD to the project root }
-  FScratch  := ExpandFileName('build/tests/tmp/install-script-e2e');
+  FScratch  := CreateScratchRoot('install-script-e2e');
   FBinDir   := FScratch + '/bin';
 
   FSkipped := SkipNetworkTests;

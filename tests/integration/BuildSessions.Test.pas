@@ -86,7 +86,7 @@ begin
     reservation on the suite process, but do not forward its one-shot token
     to more than one child. }
   ClearWorkerLeaseEnvironment;
-  FScratch := ExpandFileName('build/tests/tmp/build-sessions');
+  FScratch := CreateScratchRoot('build-sessions');
   RecursiveDelete(FScratch);
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 

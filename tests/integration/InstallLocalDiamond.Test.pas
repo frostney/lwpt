@@ -169,8 +169,7 @@ begin
     The test's binary lives under build/tests/<...>/ and the fixtures
     under tests/fixtures/diamond/<...>/ — both resolved from CWD. }
   FRepoRoot := GetCurrentDir;
-  FScratch  := ExpandFileName(
-    FRepoRoot + '/build/tests/tmp/install-local-diamond');
+  FScratch  := CreateScratchRoot('install-local-diamond');
   FRoot     := FScratch + '/root';
   DiamondInstallToScratch(FRepoRoot, FScratch, FRoot);
 end;
@@ -363,8 +362,7 @@ procedure TFrozenTamperDetection.BeforeAll;
 begin
   FOrigDir  := GetCurrentDir;
   FRepoRoot := GetCurrentDir;
-  FScratch  := ExpandFileName(
-    FRepoRoot + '/build/tests/tmp/install-frozen-tamper');
+  FScratch  := CreateScratchRoot('install-frozen-tamper');
   FRoot     := FScratch + '/root';
   DiamondInstallToScratch(FRepoRoot, FScratch, FRoot);
 end;

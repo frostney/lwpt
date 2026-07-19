@@ -49,7 +49,8 @@ uses
 
   LWPT.Command.Install,
   LWPT.Core,
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  Tests.Scratch;
 
 type
   TInstallSymlinkCycle = class(TTestSuite)
@@ -95,8 +96,7 @@ end;
 procedure TInstallSymlinkCycle.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
-  FScratch := ExpandFileName(
-    FOrigDir + '/build/tests/tmp/install-symlink-cycle');
+  FScratch := CreateScratchRoot('install-symlink-cycle');
   FRoot    := FScratch + '/root';
 
   WipeDir(FScratch);
