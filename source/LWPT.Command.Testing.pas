@@ -323,7 +323,12 @@ begin
     if AProcess.Output.NumBytesAvailable > 0 then
       AOutput := AOutput + DrainProcessOutput(AProcess);
     AProcess.WaitOnExit;
-    Result := AProcess.ExitCode;
+    { The Running poll above usually reaps the child with the raw
+      status, where ExitCode decodes correctly — but a signal death
+      still reads as 0 there, and losing the race to WaitOnExit drops
+      nonzero exits too (see NormalisedExitCode). A crashed test
+      binary must never count as a pass. }
+    Result := NormalisedExitCode(AProcess);
   finally
     FinishProcess(AIndex, AProcess);
   end;

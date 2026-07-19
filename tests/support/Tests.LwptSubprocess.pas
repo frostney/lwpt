@@ -276,10 +276,16 @@ begin
         Result.Stdout := Result.Stdout + DrainStream(P.Output);
       if P.Stderr.NumBytesAvailable > 0 then
         Result.Stderr := Result.Stderr + DrainStream(P.Stderr);
-      { Normalise across platforms: TProcess.ExitStatus is the raw
-        waitpid(2) status word on Unix and the GetExitCodeProcess
-        return on Windows. ExitCode is normalised across both. }
+      { Mirrors LWPT.Command.Common.NormalisedExitCode (this unit must
+        not link LWPT units): on Unix, ExitCode decodes correctly only
+        when the Running poll reaped the raw waitpid(2) status; if
+        WaitOnExit reaps instead it stores the already-decoded code and
+        ExitCode collapses most failures to 0. ExitStatus is nonzero on
+        genuine failure either way, so trust it when ExitCode claims
+        success. }
       Result.ExitCode := P.ExitCode;
+      if (Result.ExitCode = 0) and (P.ExitStatus <> 0) then
+        Result.ExitCode := P.ExitStatus;
       { A test process may invoke LWPT more than once. Once a nested build or
         test scheduler starts, it has consumed the one-shot worker delegation;
         stop forwarding that stale token so the next command can join the

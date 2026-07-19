@@ -50,6 +50,7 @@ type
     procedure TestTraversalTargetNameRejectedAtLoad;
     procedure TestSanitisedTargetNamesRemainDistinct;
     procedure TestCleanLeavesOrphanTargetDirsUntouched;
+    procedure TestCompileFailureReportsFpcExitCode;
     procedure TestMissingCompilerFailsTargetsButLoopContinues;
     procedure TestInvalidJobsFailsBeforeBuildingAnything;
     procedure TestInvalidDependencyGraphFailsBeforeBuildingAnything;
@@ -264,6 +265,44 @@ begin
     .ToBe(False);
 end;
 
+procedure TBuildMultiTarget.TestCompileFailureReportsFpcExitCode;
+var
+  Bad: string;
+  R: TLwptResult;
+begin
+  { Regression: on macOS the child's nonzero exit was dropped to 0 by
+    TProcess.ExitCode after WaitOnExit, so a target whose source does
+    not compile reached the publish step and failed there with
+    "could not atomically publish" instead of reporting the compile
+    failure. }
+  Bad := ExpandFileName(
+    GetCurrentDir + '/build/tests/tmp/build-compile-failure');
+  RecursiveDelete(Bad);
+  WriteTextFile(Bad + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "compile-failure"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src"]'#10
+    + #10
+    + '[build]'#10
+    + 'bad = { source = "src/bad.pas", output = "build/bad" }'#10);
+  WriteTextFile(Bad + '/src/bad.pas',
+    'program bad;'#10'begin'#10'  this is not pascal;'#10'end.'#10);
+  try
+    R := RunLwpt(['build'], Bad);
+    Expect<Integer>(R.ExitCode).ToBe(1);
+    Expect<Boolean>(Pos('FAILED (fpc exit 1)', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('target "bad" failed:', R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos('0 built, 1 failed', R.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('could not atomically publish',
+      R.Stderr) > 0).ToBe(False);
+    Expect<Boolean>(FileExists(ExpectedExe(Bad + '/build/bad')))
+      .ToBe(False);
+  finally
+    RecursiveDelete(Bad);
+  end;
+end;
+
 procedure TBuildMultiTarget.TestMissingCompilerFailsTargetsButLoopContinues;
 var R: TLwptResult;
 begin
@@ -362,6 +401,8 @@ begin
     TestSanitisedTargetNamesRemainDistinct);
   Test('--clean leaves orphaned shared dirs for repair',
     TestCleanLeavesOrphanTargetDirsUntouched);
+  Test('compile failure reports the fpc exit code, publishes nothing',
+    TestCompileFailureReportsFpcExitCode);
   Test('missing compiler fails targets individually, loop continues',
     TestMissingCompilerFailsTargetsButLoopContinues);
   Test('invalid --jobs fails before building anything',

@@ -14,6 +14,18 @@ uses
 
   LWPT.Manifest;
 
+{ Exit code of a finished TProcess, tolerant of which call reaped it.
+  On Unix (FPC 3.2.2) WaitOnExit stores the already-decoded exit code,
+  and ExitCode then re-applies wifexited/wexitstatus to that value —
+  most nonzero exits (and every signal death) collapse to 0. When a
+  Running poll reaps the child instead, the raw waitpid status is
+  stored and ExitCode decodes correctly, so which value is trustworthy
+  depends on a race. ExitStatus returns the stored word verbatim, so
+  genuine failure is nonzero there on either path. Prefer ExitCode
+  (correct on Windows and on the raw-status path), and trust ExitStatus
+  whenever ExitCode claims success but the stored status disagrees. }
+function  NormalisedExitCode(const AProcess: TProcess): Integer;
+
 function  CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths: array of string; out AOutBin: string;
   const ABuildRoot: string = ''): TProcess;
@@ -35,6 +47,13 @@ uses
   LWPT.BuildSession,
   LWPT.Core,
   Platform;
+
+function NormalisedExitCode(const AProcess: TProcess): Integer;
+begin
+  Result := AProcess.ExitCode;
+  if (Result = 0) and (AProcess.ExitStatus <> 0) then
+    Result := AProcess.ExitStatus;
+end;
 
 function CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths: array of string; out AOutBin: string;
