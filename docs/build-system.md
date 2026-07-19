@@ -137,10 +137,15 @@ LWPT's own `lwpt.toml` is the reference: one `lwpt` target.
 ## Session staging and public outputs
 
 Every `lwpt build` and `lwpt test` invocation creates a unique
-`.lwpt/sessions/session-<pid>-<timestamp>-<counter>/` directory. Target job
-directories contain separate `bin/` and `units/` children used for `-FE`,
-`-FU`, and `-o`. No two processes share writable compiler paths, even when
-they build the same target and mode in the same worktree.
+`.lwpt/sessions/s-<pid>-<timestamp>-<counter>-<n>/` directory (PID and
+timestamp base36-encoded — the slug prefixes every compiler staging path,
+and FPC's file API silently truncates paths over 255 characters, so each
+component stays short). Target job directories contain separate `bin/` and
+`units/` children used for `-FE`, `-FU`, and `-o`. No two processes share
+writable compiler paths, even when they build the same target and mode in
+the same worktree. Before compiling, LWPT verifies the staging path plus
+the longest reachable unit name fits the 255-character budget and refuses
+the compile with an explanatory error when it cannot.
 
 Before compiling, LWPT creates a schema-versioned `TLWPTBuildRequest` covering
 the source set and entry point, output kind, mode, defines, search paths,

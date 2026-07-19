@@ -17,6 +17,13 @@ const
   BUILD_SESSION_SCHEMA_VERSION = 1;
   BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION = 1;
   BUILD_SESSIONS_DIR = LWPT_DIR + '/sessions';
+  { FPC's RTL FileRec/TextRec name buffer holds this many characters. The
+    compiler writes .s assembly files and link scripts through that API and
+    silently truncates longer paths: the assembly lands under a truncated
+    name while the assembler command line carries the full path, so clang
+    fails with "no such file or directory: ....s". Session staging must
+    keep every compiler-written path within this budget. }
+  COMPILER_PATH_LIMIT = 255;
 
 type
   TLWPTBuildPublicationRequest = record
@@ -57,6 +64,10 @@ function CaptureBuildPublicationFingerprint(
   AModulesPath: string;
   const ARequest: TLWPTBuildPublicationRequest): string;
 function BuildSessionPathKey(const AValue: string): string;
+function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
+  const AEntrySource: string): Integer;
+procedure EnsureCompilerPathBudget(const AUnitDirectory,
+  AExecutableDirectory: string; ALongestBaseNameLength: Integer);
 function BuildPublicationLockPath(const AProjectRoot, AOutput: string): string;
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
@@ -168,11 +179,72 @@ function BuildSessionPathKey(const AValue: string): string;
 var
   BaseName, Digest: string;
 begin
+  { Keys sit inside compiler staging paths that must stay within
+    COMPILER_PATH_LIMIT, so the readable prefix and the digest are both
+    kept short. 12 hex digits (48 bits) still make accidental collisions
+    between the handful of keys inside one session implausible. }
   BaseName := SanitisePathSegment(ChangeFileExt(ExtractFileName(AValue), ''));
   if BaseName = '' then BaseName := 'job';
-  if Length(BaseName) > 32 then SetLength(BaseName, 32);
+  if Length(BaseName) > 16 then SetLength(BaseName, 16);
   Digest := TextHash(AValue);
-  Result := BaseName + '-' + Copy(Digest, 8, 16);
+  Result := BaseName + '-' + Copy(Digest, 8, 12);
+end;
+
+function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
+  const AEntrySource: string): Integer;
+var
+  i, Len: Integer;
+  Search: TSearchRec;
+  Dir, Ext: string;
+begin
+  { The compiler writes '<unit>.s' into the staging unit directory for the
+    entry program and for every unit it recompiles from the search paths.
+    Scanning the search paths for the longest Pascal base name makes the
+    path budget below exact instead of guessing an allowance. }
+  Result := Length(ChangeFileExt(ExtractFileName(AEntrySource), ''));
+  for i := 0 to High(ADirectories) do
+  begin
+    if ADirectories[i] = '' then Continue;
+    Dir := IncludeTrailingPathDelimiter(ExpandFileName(ADirectories[i]));
+    if SysUtils.FindFirst(Dir + '*', faAnyFile, Search) <> 0 then Continue;
+    try
+      repeat
+        if (Search.Attr and faDirectory) <> 0 then Continue;
+        Ext := LowerCase(ExtractFileExt(Search.Name));
+        if (Ext <> '.pas') and (Ext <> '.pp') then Continue;
+        Len := Length(ChangeFileExt(Search.Name, ''));
+        if Len > Result then Result := Len;
+      until SysUtils.FindNext(Search) <> 0;
+    finally
+      SysUtils.FindClose(Search);
+    end;
+  end;
+end;
+
+procedure EnsureCompilerPathBudget(const AUnitDirectory,
+  AExecutableDirectory: string; ALongestBaseNameLength: Integer);
+const
+  { Longest fixed-name artefact FPC writes beside the executable
+    ('symbol_order.fpc'; 'ppaslink.sh' and 'link.res' are shorter). }
+  LINK_ARTEFACT_LENGTH = 16;
+var
+  UnitDirectory, ExecutableDirectory: string;
+  WorstLength, LinkLength: Integer;
+begin
+  UnitDirectory := ExpandFileName(AUnitDirectory);
+  ExecutableDirectory := ExpandFileName(AExecutableDirectory);
+  WorstLength := Length(UnitDirectory) + 1 + ALongestBaseNameLength
+    + Length('.s');
+  LinkLength := Length(ExecutableDirectory) + 1 + LINK_ARTEFACT_LENGTH;
+  if LinkLength > WorstLength then WorstLength := LinkLength;
+  if WorstLength <= COMPILER_PATH_LIMIT then Exit;
+  raise ELWPTError.CreateFmt(
+    'compiler staging path is too long: files below "%s" would reach %d '
+    + 'characters, but FPC''s file API silently truncates paths over %d '
+    + 'characters and the compile then fails with a missing .s file; '
+    + 'shorten the project path by at least %d characters',
+    [UnitDirectory, WorstLength, COMPILER_PATH_LIMIT,
+     WorstLength - COMPILER_PATH_LIMIT]);
 end;
 
 function SamePath(const AFirst, ASecond: string): Boolean;
@@ -832,9 +904,25 @@ end;
   The operating system releases ownership when the handle closes or the
   process exits; the files themselves remain and are safe to reuse. }
 
+function EncodeBase36(AValue: QWord): string;
+const
+  DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz';
+begin
+  if AValue = 0 then Exit('0');
+  Result := '';
+  while AValue > 0 do
+  begin
+    Result := DIGITS[(AValue mod 36) + 1] + Result;
+    AValue := AValue div 36;
+  end;
+end;
+
 function SessionTimestamp: string;
 begin
-  Result := FormatDateTime('yyyymmddhhnnsszzz', Now);
+  { Base36 milliseconds keep the slug short: session directory names are a
+    fixed prefix of every compiler-written staging path, and each saved
+    character is headroom under COMPILER_PATH_LIMIT. }
+  Result := EncodeBase36(QWord(Round(Now * MSecsPerDay)));
 end;
 
 function SessionOwnerGuardPath(const ASessionsRoot,
@@ -862,7 +950,10 @@ begin
   InvocationCounter := NextSessionCounter;
   CollisionCounter := 0;
   repeat
-    FSessionID := 'session-' + IntToStr(GetProcessID) + '-'
+    { Compact form: the session slug prefixes every compiler staging path,
+      so base36 PID + timestamp keep it well inside COMPILER_PATH_LIMIT
+      even for deeply nested project roots. }
+    FSessionID := 's-' + EncodeBase36(QWord(GetProcessID)) + '-'
       + SessionTimestamp + '-' + UIntToStr(InvocationCounter) + '-'
       + IntToStr(CollisionCounter);
     FSessionRoot := IncludeTrailingPathDelimiter(BaseRoot) + FSessionID;
@@ -1078,10 +1169,14 @@ begin
   ARetained := 0;
   Root := RootedPath(AProjectRoot, BUILD_SESSIONS_DIR);
   if not DirectoryExists(Root) then Exit;
-  ReclaimSessionPattern('session-*');
+  ReclaimSessionPattern('s-*');
   { A process can crash between creating and publishing its visible
     session directory. The hidden creating form has the same state
     record, so repair can retain its live owner or reclaim the orphan. }
+  ReclaimSessionPattern('.creating-s-*');
+  { Sessions left behind by binaries that used the long pre-compaction
+    slug ('session-<pid>-<datetime>-...') remain reclaimable. }
+  ReclaimSessionPattern('session-*');
   ReclaimSessionPattern('.creating-session-*');
 end;
 

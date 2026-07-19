@@ -29,6 +29,8 @@ type
     procedure SetupTests; override;
     procedure TestSessionsAreUniqueAndPrivate;
     procedure TestPathKeysAreBoundedAndCollisionResistant;
+    procedure TestSessionIDsStayCompact;
+    procedure TestCompilerPathBudgetGuard;
     procedure TestSuccessfulSessionIsRemoved;
     procedure TestStaleCandidateDoesNotReplacePublicOutput;
     procedure TestCurrentCandidatePublishesAtomically;
@@ -132,9 +134,89 @@ begin
   LongKey := BuildSessionPathKey(StringOfChar('a', 300) + '.pas');
 
   Expect<Boolean>(First <> Second).ToBe(True);
-  Expect<Boolean>(Length(First) <= 49).ToBe(True);
-  Expect<Boolean>(Length(Second) <= 49).ToBe(True);
-  Expect<Boolean>(Length(LongKey) <= 49).ToBe(True);
+  Expect<Boolean>(Length(First) <= 29).ToBe(True);
+  Expect<Boolean>(Length(Second) <= 29).ToBe(True);
+  Expect<Boolean>(Length(LongKey) <= 29).ToBe(True);
+end;
+
+procedure TLWPTBuildSessionTests.TestSessionIDsStayCompact;
+var
+  Session: TLWPTBuildSession;
+begin
+  ResetScratch;
+  Session := TLWPTBuildSession.Create(FScratch);
+  try
+    { The slug prefixes every compiler staging path; the compact form
+      ('s-<pid36>-<ts36>-<n>-<m>') must stay far below the long
+      pre-compaction 36+ characters. }
+    Expect<string>(Copy(Session.SessionID, 1, 2)).ToBe('s-');
+    Expect<Boolean>(Length(Session.SessionID) <= 28).ToBe(True);
+  finally
+    Session.Finish(False, 'test');
+    Session.Free;
+  end;
+end;
+
+procedure TLWPTBuildSessionTests.TestCompilerPathBudgetGuard;
+var
+  SourceDir, ShortStaging, LongStaging, Padding: string;
+  Longest: Integer;
+  Raised, MentionsTooLong, MentionsAssembly: Boolean;
+  Dirs: TStringArray;
+begin
+  ResetScratch;
+  SourceDir := FScratch + '/budget-src';
+  ForceDirectories(SourceDir);
+  WriteText(SourceDir + '/A.pas', 'unit A; interface implementation end.');
+  WriteText(SourceDir + '/A.Very.Long.Unit.Name.pas',
+    'unit A.Very.Long.Unit.Name; interface implementation end.');
+  SetLength(Dirs, 1);
+  Dirs[0] := SourceDir;
+
+  { Longest name wins over the entry program's name. }
+  Longest := LongestCompiledBaseNameLength(Dirs, SourceDir + '/App.pas');
+  Expect<Integer>(Longest).ToBe(Length('A.Very.Long.Unit.Name'));
+
+  { Missing directories are skipped; the entry name still counts. }
+  Dirs[0] := FScratch + '/does-not-exist';
+  Expect<Integer>(LongestCompiledBaseNameLength(
+    Dirs, SourceDir + '/App.pas')).ToBe(Length('App'));
+
+  { Within budget: '<staging>/<longest>.s' at exactly the limit passes. }
+  Padding := StringOfChar('p',
+    COMPILER_PATH_LIMIT - Length(ExpandFileName(FScratch)) - 1
+      - (1 + Longest + 2));
+  ShortStaging := ExpandFileName(FScratch) + '/' + Padding;
+  EnsureCompilerPathBudget(ShortStaging, ShortStaging, Longest);
+
+  { One character over the limit refuses the compile loudly. }
+  LongStaging := ShortStaging + 'p';
+  Raised := False;
+  MentionsTooLong := False;
+  MentionsAssembly := False;
+  try
+    EnsureCompilerPathBudget(LongStaging, LongStaging, Longest);
+  except
+    on E: ELWPTError do
+    begin
+      Raised := True;
+      MentionsTooLong := Pos('too long', E.Message) > 0;
+      MentionsAssembly := Pos('.s', E.Message) > 0;
+    end;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(MentionsTooLong).ToBe(True);
+  Expect<Boolean>(MentionsAssembly).ToBe(True);
+
+  { The executable directory's fixed link artefacts are budgeted too. }
+  Raised := False;
+  try
+    EnsureCompilerPathBudget(FScratch,
+      ShortStaging + StringOfChar('q', 24), 1);
+  except
+    on E: ELWPTError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
 end;
 
 procedure TLWPTBuildSessionTests.TestSuccessfulSessionIsRemoved;
@@ -613,6 +695,10 @@ procedure TLWPTBuildSessionTests.SetupTests;
 begin
   Test('sessions have unique private job roots',
     TestSessionsAreUniqueAndPrivate);
+  Test('session ids stay compact for path-budget headroom',
+    TestSessionIDsStayCompact);
+  Test('compiler path budget guard refuses over-long staging',
+    TestCompilerPathBudgetGuard);
   Test('path keys are bounded and resist sanitised collisions',
     TestPathKeysAreBoundedAndCollisionResistant);
   Test('successful sessions remove private staging',

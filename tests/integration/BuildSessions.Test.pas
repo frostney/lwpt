@@ -147,7 +147,7 @@ var
   Search: TSearchRec;
 begin
   Result := 0;
-  if FindFirst(FScratch + '/.lwpt/sessions/session-*', faDirectory,
+  if FindFirst(FScratch + '/.lwpt/sessions/s-*', faDirectory,
     Search) <> 0 then Exit;
   try
     repeat
@@ -166,7 +166,7 @@ var
   JobsPath: string;
 begin
   Result := 0;
-  if FindFirst(FScratch + '/.lwpt/sessions/session-*', faDirectory,
+  if FindFirst(FScratch + '/.lwpt/sessions/s-*', faDirectory,
     SessionSearch) <> 0 then Exit;
   try
     repeat

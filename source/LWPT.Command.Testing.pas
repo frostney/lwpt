@@ -441,8 +441,19 @@ var
   Binary, Output: string;
   Code: Integer;
 begin
-  CompilerProcess := CreatePascalCompilerProcess(FJobs[AIndex].Source,
-    FUnitPaths, Binary, FBuildRoot);
+  try
+    CompilerProcess := CreatePascalCompilerProcess(FJobs[AIndex].Source,
+      FUnitPaths, Binary, FBuildRoot);
+  except
+    { A staging path over the compiler's budget fails this one test with
+      the explanatory message instead of aborting the whole scheduler. }
+    on E: ELWPTError do
+    begin
+      SetJobOutput(AIndex, True, E.Message);
+      FailJob(AIndex, tjsCompileFailed, 1, E.Message);
+      Exit;
+    end;
+  end;
   try
     Code := RunProcess(AIndex, CompilerProcess, Output);
   finally
@@ -630,7 +641,7 @@ begin
       if not AIncludeE2E then
         WriteLn('  (e2e tier skipped; pass --tier=e2e to include)');
       Scheduler := TTestScheduler.Create(Tests, AIncludeE2E, UnitPaths,
-        Session.JobRoot('test-programs'), AJobs, ABail);
+        Session.JobRoot('tests'), AJobs, ABail);
       try
         Scheduler.Run;
         Scheduler.PrintResults(ProjectRoot, Passed, Failed, CompileFailed,
