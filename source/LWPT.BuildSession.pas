@@ -17,9 +17,17 @@ const
   BUILD_SESSION_SCHEMA_VERSION = 1;
   BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION = 1;
   BUILD_SESSIONS_DIR = LWPT_DIR + '/sessions';
-  OBSERVABILITY_HEARTBEAT_INTERVAL_ENV = PROJECT_NAME
+  ObservabilityHeartbeatIntervalEnvironment = PROJECT_NAME
     + '_HEARTBEAT_INTERVAL_MS';
-  DEFAULT_OBSERVABILITY_HEARTBEAT_INTERVAL_MS = 30000;
+  ObservabilityStartEvent = 'START ';
+  ObservabilityHeartbeatEvent = 'HEARTBEAT ';
+  ObservabilityPassEvent = 'PASS ';
+  ObservabilityFailEvent = 'FAIL ';
+  ObservabilitySkipEvent = 'SKIP ';
+  ObservabilityBuildIdentityNamespace = 'build:';
+  ObservabilityTestIdentityNamespace = 'test:';
+  ObservabilityLogsDirectory = '/logs/';
+  ObservabilityLogExtension = '.log';
   { FPC's RTL FileRec/TextRec name buffer holds this many characters. The
     compiler writes .s assembly files and link scripts through that API and
     silently truncates longer paths: the assembly lands under a truncated
@@ -51,12 +59,12 @@ type
     FSessionOwnerGuardPath: string;
     FSessionOwnerGuard: TObject;
     FFinished: Boolean;
+    function JobLogPath(const AName: string): string;
     procedure WriteState(const AState: string);
   public
     constructor Create(const AProjectRoot: string);
     destructor Destroy; override;
     function JobRoot(const AName: string): string;
-    function JobLogPath(const AName: string): string;
     function JobLogReference(const AName: string): string;
     function HookRoot: string;
     function SessionReference: string;
@@ -72,7 +80,7 @@ function CaptureBuildPublicationFingerprint(
   const ARequest: TLWPTBuildPublicationRequest): string;
 function BuildSessionPathKey(const AValue: string): string;
 function ObservabilityHeartbeatIntervalMilliseconds: QWord;
-function FormatElapsedMilliseconds(AElapsed: QWord): string;
+function FormatElapsedMilliseconds(const AElapsed: QWord): string;
 procedure AppendUnitDirsFromOptions(const AOptions: TStrings;
   var ADirs: TStringArray);
 procedure AppendUnitDirsFromCfg(const ACfgPath: string;
@@ -103,6 +111,7 @@ uses
   DateUtils;
 
 const
+  DefaultObservabilityHeartbeatIntervalMilliseconds = 30000;
   PUBLICATION_LOCK_WAIT_MILLISECONDS = 30000;
   SESSION_PARTIAL_GRACE_MILLISECONDS = 5000;
   {$IFDEF UNIX}
@@ -208,13 +217,18 @@ var
   Raw: string;
   Parsed: Int64;
 begin
-  Raw := GetEnvironmentVariable(OBSERVABILITY_HEARTBEAT_INTERVAL_ENV);
+  Raw := GetEnvironmentVariable(ObservabilityHeartbeatIntervalEnvironment);
   if (Raw <> '') and TryStrToInt64(Raw, Parsed) and (Parsed > 0) then
-    Exit(QWord(Parsed));
-  Result := DEFAULT_OBSERVABILITY_HEARTBEAT_INTERVAL_MS;
+  begin
+    Result := QWord(Parsed);
+    if Result > DefaultObservabilityHeartbeatIntervalMilliseconds then
+      Result := DefaultObservabilityHeartbeatIntervalMilliseconds;
+    Exit;
+  end;
+  Result := DefaultObservabilityHeartbeatIntervalMilliseconds;
 end;
 
-function FormatElapsedMilliseconds(AElapsed: QWord): string;
+function FormatElapsedMilliseconds(const AElapsed: QWord): string;
 begin
   Result := UIntToStr(AElapsed) + ' ms';
 end;
@@ -1093,12 +1107,14 @@ end;
 
 function TLWPTBuildSession.JobLogPath(const AName: string): string;
 begin
-  Result := FSessionRoot + '/logs/' + BuildSessionPathKey(AName) + '.log';
+  Result := FSessionRoot + ObservabilityLogsDirectory
+    + BuildSessionPathKey(AName) + ObservabilityLogExtension;
 end;
 
 function TLWPTBuildSession.JobLogReference(const AName: string): string;
 begin
-  Result := SessionReference + '/logs/' + BuildSessionPathKey(AName) + '.log';
+  Result := SessionReference + ObservabilityLogsDirectory
+    + BuildSessionPathKey(AName) + ObservabilityLogExtension;
 end;
 
 function TLWPTBuildSession.HookRoot: string;
@@ -1132,15 +1148,27 @@ end;
 
 procedure TLWPTBuildSession.Finish(ASuccess: Boolean; const ADetail: string);
 var
+  HasLogs: Boolean;
   Lines: TStringList;
 begin
   if FFinished then Exit;
   if ASuccess then
   begin
     { The guard lives beside session directories, so it remains observable
-      while the entire private session tree is removed on every platform. }
+      while private compiler and hook staging is removed on every platform.
+      Stable job logs remain until lwpt repair reclaims the completed session. }
+    HasLogs := DirectoryExists(FSessionRoot + ObservabilityLogsDirectory);
     WriteState('completing');
-    WipeDir(FSessionRoot);
+    if HasLogs then
+    begin
+      if DirectoryExists(FSessionRoot + '/jobs') then
+        WipeDir(FSessionRoot + '/jobs');
+      if DirectoryExists(FSessionRoot + '/hooks') then
+        WipeDir(FSessionRoot + '/hooks');
+      WriteState('completed');
+    end
+    else
+      WipeDir(FSessionRoot);
     FreeAndNil(FSessionOwnerGuard);
     if FileExists(FSessionOwnerGuardPath)
       and (not SysUtils.DeleteFile(FSessionOwnerGuardPath)) then

@@ -35,14 +35,17 @@ const
   SecondsPerDay = 86400;
   SlowCompilerProxyMode = 'slow';
   WorkerErrorCompilerProxyMode = 'worker-error';
+  TestHeartbeatIntervalMilliseconds = 75;
+  TestHeartbeatJobDurationMilliseconds =
+    TestHeartbeatIntervalMilliseconds * 4;
 
 type
   TTestScheduling = class(TTestSuite)
   private
     FScratch: string;
-    procedure ResetProject(ABail: Integer);
+    procedure ResetProject(const ABail: Integer);
     procedure WriteMarkerProgram(const AFileName, AMarker: string;
-      AExitCode: Integer);
+      const AExitCode: Integer);
     procedure WriteOverlapProgram(const AFileName, AOwnMarker,
       AOtherMarker: string);
     procedure WriteBuildProject(const AProjectRoot: string);
@@ -54,7 +57,7 @@ type
       const AProjectName: string);
     {$ENDIF}
     function RunTestsWithHeartbeat(const AArgs: array of string;
-      AHeartbeatMilliseconds: Integer): TLwptResult;
+      const AHeartbeatMilliseconds: Integer): TLwptResult;
   protected
     procedure BeforeAll; override;
     procedure BeforeEach; override;
@@ -127,7 +130,7 @@ begin
   ForceDirectories(FScratch + '/control');
 end;
 
-procedure TTestScheduling.ResetProject(ABail: Integer);
+procedure TTestScheduling.ResetProject(const ABail: Integer);
 begin
   RecursiveDelete(FScratch + '/tests');
   RecursiveDelete(FScratch + '/.lwpt');
@@ -146,7 +149,7 @@ begin
 end;
 
 procedure TTestScheduling.WriteMarkerProgram(const AFileName,
-  AMarker: string; AExitCode: Integer);
+  AMarker: string; const AExitCode: Integer);
 begin
   WriteTextFile(FScratch + '/tests/' + AFileName,
       'program MarkerFixture;'#10
@@ -206,7 +209,7 @@ end;
 
 function TTestScheduling.RunTestsWithHeartbeat(
   const AArgs: array of string;
-  AHeartbeatMilliseconds: Integer): TLwptResult;
+  const AHeartbeatMilliseconds: Integer): TLwptResult;
 var
   Args, Environment: array of string;
   i: Integer;
@@ -221,7 +224,7 @@ begin
     + FScratch + '/worker-state';
   Environment[2] := WORKER_BUDGET_ENV + '=2';
   if AHeartbeatMilliseconds > 0 then
-    Environment[3] := OBSERVABILITY_HEARTBEAT_INTERVAL_ENV + '='
+    Environment[3] := ObservabilityHeartbeatIntervalEnvironment + '='
       + IntToStr(AHeartbeatMilliseconds);
   Result := RunLwpt(Args, FScratch, Environment);
 end;
@@ -248,41 +251,45 @@ begin
   Result := RunLwpt(Args, FScratch, Environment);
 procedure TTestScheduling.TestSilentJobEmitsHeartbeatAndProgress;
 var
-  R: TLwptResult;
+  RunResult: TLwptResult;
 begin
   ResetProject(0);
   WriteTextFile(FScratch + '/tests/A.Silent.Test.pas',
       'program SilentFixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'uses SysUtils;'#10
-    + 'begin Sleep(350) end.'#10);
+    + 'begin Sleep(' + IntToStr(TestHeartbeatJobDurationMilliseconds)
+    + ') end.'#10);
   WriteTextFile(FScratch + '/tests/e2e/B.Skip.Test.pas',
       'program SkipFixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'begin end.'#10);
-  R := RunTestsWithHeartbeat([], 75);
-  Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('test session: ', R.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('(.lwpt/sessions/', R.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('discovered 2 test file(s)', R.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('effective workers: 1', R.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('START tests/A.Silent.Test.pas', R.Stdout) > 0)
+  RunResult := RunTestsWithHeartbeat([], TestHeartbeatIntervalMilliseconds);
+  Expect<Integer>(RunResult.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('test session: ', RunResult.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('(.lwpt/sessions/', RunResult.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('discovered 2 test file(s)', RunResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('HEARTBEAT test elapsed ', R.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('active: tests/A.Silent.Test.pas', R.Stdout) > 0)
+  Expect<Boolean>(Pos('effective workers: 1', RunResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('PASS tests/A.Silent.Test.pas', R.Stdout) > 0)
+  Expect<Boolean>(Pos('START tests/A.Silent.Test.pas', RunResult.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('HEARTBEAT test elapsed ', RunResult.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('active: tests/A.Silent.Test.pas', RunResult.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('PASS tests/A.Silent.Test.pas', RunResult.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('SKIP tests/e2e/B.Skip.Test.pas (e2e tier)',
-    R.Stdout) > 0).ToBe(True);
+    RunResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('summary: 1 passed, 0 failed, 0 did not compile, '
-    + '1 skipped, 0 cancelled; elapsed ', R.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos(' ms', R.Stdout) > 0).ToBe(True);
+    + '1 skipped, 0 cancelled; elapsed ', RunResult.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(' ms', RunResult.Stdout) > 0).ToBe(True);
 end;
 
 procedure TTestScheduling.TestFailureReplaysAndPreservesIsolatedLog;
 var
-  R: TLwptResult;
+  RunResult: TLwptResult;
   SessionSearch, LogSearch: TSearchRec;
   LogPath: string;
 begin
@@ -291,12 +298,13 @@ begin
       'program FailingFixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'begin Write(''failure-detail-41''); Halt(7) end.'#10);
-  R := RunTests([]);
-  Expect<Integer>(R.ExitCode).ToBe(1);
-  Expect<Boolean>(Pos('FAIL tests/A.Fail.Test.pas (exit 7;', R.Stdout) > 0)
+  RunResult := RunTests([]);
+  Expect<Integer>(RunResult.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('FAIL tests/A.Fail.Test.pas (exit 7;',
+    RunResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('failure-detail-41', R.Stdout)
-    > Pos('FAIL tests/A.Fail.Test.pas', R.Stdout)).ToBe(True);
+  Expect<Boolean>(Pos('failure-detail-41', RunResult.Stdout)
+    > Pos('FAIL tests/A.Fail.Test.pas', RunResult.Stdout)).ToBe(True);
   LogPath := '';
   if FindFirst(FScratch + '/.lwpt/sessions/s-*', faDirectory,
     SessionSearch) = 0 then
@@ -322,7 +330,7 @@ end;
 
 procedure TTestScheduling.TestVerboseSuccessLogsNeverInterleave;
 var
-  R: TLwptResult;
+  RunResult: TLwptResult;
 begin
   ResetProject(0);
   WriteTextFile(FScratch + '/tests/A.Output.Test.pas',
@@ -337,11 +345,11 @@ begin
     + 'uses SysUtils;'#10
     + 'begin Write(''beta-1|''); Flush(Output); Sleep(80); '
     + 'Write(''beta-2|'') end.'#10);
-  R := RunTests([]);
-  Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('alpha-1|', R.Stdout) = 0).ToBe(True);
-  Expect<Boolean>(Pos('beta-1|', R.Stdout) = 0).ToBe(True);
-  Expect<Boolean>(Pos('HEARTBEAT ', R.Stdout) = 0).ToBe(True);
+  RunResult := RunTests([]);
+  Expect<Integer>(RunResult.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('alpha-1|', RunResult.Stdout) = 0).ToBe(True);
+  Expect<Boolean>(Pos('beta-1|', RunResult.Stdout) = 0).ToBe(True);
+  Expect<Boolean>(Pos('HEARTBEAT ', RunResult.Stdout) = 0).ToBe(True);
 
   ResetProject(0);
   WriteTextFile(FScratch + '/tests/A.Output.Test.pas',
@@ -356,12 +364,12 @@ begin
     + 'uses SysUtils;'#10
     + 'begin Write(''beta-1|''); Flush(Output); Sleep(80); '
     + 'Write(''beta-2|'') end.'#10);
-  R := RunTests(['--verbose']);
-  Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('alpha-1|alpha-2|', R.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('beta-1|beta-2|', R.Stdout) > 0).ToBe(True);
+  RunResult := RunTests(['--verbose']);
+  Expect<Integer>(RunResult.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('alpha-1|alpha-2|', RunResult.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('beta-1|beta-2|', RunResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('summary: 2 passed, 0 failed, 0 did not compile, '
-    + '0 skipped, 0 cancelled; elapsed ', R.Stdout) > 0).ToBe(True);
+    + '0 skipped, 0 cancelled; elapsed ', RunResult.Stdout) > 0).ToBe(True);
 end;
 
 procedure TTestScheduling.TestDefaultJobsOverlap;

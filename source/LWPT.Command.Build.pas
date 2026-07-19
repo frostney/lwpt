@@ -34,11 +34,11 @@ type
   end;
 
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; ARelease, AClean: Boolean;
-  AJobs: Integer): Integer; overload;
+  const ATargetNames: array of string; const ARelease, AClean: Boolean;
+  const AJobs: Integer): Integer; overload;
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; ARelease, AClean: Boolean;
-  AJobs: Integer; AVerbose: Boolean): Integer; overload;
+  const ATargetNames: array of string; const ARelease, AClean: Boolean;
+  const AJobs: Integer; const AVerbose: Boolean): Integer; overload;
 
 { Exposed for unit tests: does this FPC failure output look like stale
   build artefacts (worth a --clean retry) rather than a source error? }
@@ -950,16 +950,16 @@ begin
 end;
 
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; ARelease, AClean: Boolean;
-  AJobs: Integer): Integer;
+  const ATargetNames: array of string; const ARelease, AClean: Boolean;
+  const AJobs: Integer): Integer;
 begin
   Result := CmdBuild(AManifestPath, ATargetNames, ARelease, AClean,
     AJobs, False);
 end;
 
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; ARelease, AClean: Boolean;
-  AJobs: Integer; AVerbose: Boolean): Integer;
+  const ATargetNames: array of string; const ARelease, AClean: Boolean;
+  const AJobs: Integer; const AVerbose: Boolean): Integer;
 var
   Man : TManifest;
   i, j, Built, Failed, Skipped, Unknown, SelectedCount, MaxJobs, Running,
@@ -992,21 +992,21 @@ var
     if not (AOutput[Length(AOutput)] in [#10, #13]) then WriteLn;
   end;
 
-  function LogIdentity(AIndex: Integer): string;
+  function LogIdentity(const AIndex: Integer): string;
   begin
-    Result := 'build:' + Man.Targets[AIndex].Name;
+    Result := ObservabilityBuildIdentityNamespace + Man.Targets[AIndex].Name;
   end;
 
-  procedure PrintStart(AIndex: Integer);
+  procedure PrintStart(const AIndex: Integer);
   begin
     StartTicks[AIndex] := GetTickCount64;
     Session.WriteJobLog(LogIdentity(AIndex), '');
-    WriteLn('START ', Man.Targets[AIndex].Name, ' (',
+    WriteLn(ObservabilityStartEvent, Man.Targets[AIndex].Name, ' (',
       Man.Targets[AIndex].Source, '; log: ',
       Session.JobLogReference(LogIdentity(AIndex)), ')');
   end;
 
-  procedure PrintTerminal(AIndex: Integer);
+  procedure PrintTerminal(const AIndex: Integer);
   var
     LogOutput, Elapsed, LogReference: string;
   begin
@@ -1023,14 +1023,15 @@ var
     case States[AIndex] of
       tsSucceeded:
         begin
-          WriteLn('PASS ', Man.Targets[AIndex].Name, ' -> ',
+          WriteLn(ObservabilityPassEvent, Man.Targets[AIndex].Name, ' -> ',
             Compiled[AIndex].OutBin, ' (', Elapsed, '; log: ',
             LogReference, ')');
           if AVerbose then WriteCapturedOutput(LogOutput);
         end;
       tsFailed:
         begin
-          WriteLn('FAIL ', Man.Targets[AIndex].Name, ' (', Elapsed,
+          WriteLn(ObservabilityFailEvent, Man.Targets[AIndex].Name, ' (',
+            Elapsed,
             '; log: ', LogReference, ')');
           WriteCapturedOutput(LogOutput);
           if (Errors[AIndex] <> '')
@@ -1042,29 +1043,33 @@ var
         end;
       tsBlocked:
         begin
-          WriteLn('SKIP ', Man.Targets[AIndex].Name, ' (', Errors[AIndex],
-            '; ', Elapsed, '; log: ', LogReference, ')');
+          WriteLn(ObservabilitySkipEvent, Man.Targets[AIndex].Name, ' (',
+            Errors[AIndex], '; ', Elapsed, '; log: ', LogReference, ')');
           WriteLn(ErrOutput, '  target "', Man.Targets[AIndex].Name,
             '" failed: ', Errors[AIndex]);
         end;
     end;
   end;
 
-  function ActiveBuildSummary(ATick: QWord): string;
+  function ActiveBuildSummary(const ATick: QWord): string;
   var
-    k: Integer;
+    TargetIndex: Integer;
   begin
     Result := '';
-    for k := 0 to High(Man.Targets) do
-      if States[k] = tsRunning then
+    for TargetIndex := 0 to High(Man.Targets) do
+      if States[TargetIndex] in [tsPending, tsRunning] then
       begin
         if Result <> '' then Result := Result + ', ';
-        Result := Result + Man.Targets[k].Name + ' ('
-          + FormatElapsedMilliseconds(ATick - StartTicks[k]) + ')';
+        Result := Result + Man.Targets[TargetIndex].Name;
+        if States[TargetIndex] = tsRunning then
+          Result := Result + ' (' + FormatElapsedMilliseconds(
+            ATick - StartTicks[TargetIndex]) + ')'
+        else
+          Result := Result + ' (queued)';
       end;
   end;
 
-  procedure RunTargetPostBuild(AIndex: Integer);
+  procedure RunTargetPostBuild(const AIndex: Integer);
   begin
     SetLength(HookEnvironment, 3);
     HookEnvironment[0] := BUILD_TARGET_ENV + '=' + Compiled[AIndex].Name;
@@ -1076,7 +1081,8 @@ var
       Compiled[AIndex].PostBuild, Session.HookRoot, HookEnvironment);
   end;
 
-  procedure FinalizeTarget(AIndex: Integer; ARunPostBuild: Boolean);
+  procedure FinalizeTarget(const AIndex: Integer;
+    const ARunPostBuild: Boolean);
   begin
     try
       if ARunPostBuild then RunTargetPostBuild(AIndex);
@@ -1116,40 +1122,49 @@ var
   procedure StopAndFreeJobs;
   var
     CancellationFailure: string;
-    k: Integer;
+    TargetIndex: Integer;
   begin
     CancellationFailure := '';
-    for k := 0 to High(Jobs) do
-      if Assigned(Jobs[k]) and (not Jobs[k].IsDone) then Jobs[k].Cancel;
-    for k := 0 to High(Jobs) do
-      if Assigned(Jobs[k]) then
+    for TargetIndex := 0 to High(Jobs) do
+      if Assigned(Jobs[TargetIndex])
+         and (not Jobs[TargetIndex].IsDone) then
+        Jobs[TargetIndex].Cancel;
+    for TargetIndex := 0 to High(Jobs) do
+      if Assigned(Jobs[TargetIndex]) then
       begin
-        Jobs[k].WaitFor;
-        if Jobs[k].CancellationError <> '' then
+        Jobs[TargetIndex].WaitFor;
+        if Jobs[TargetIndex].CancellationError <> '' then
         begin
-          if States[k] <> tsFailed then Inc(Failed);
-          States[k] := tsFailed;
-          Errors[k] := Jobs[k].CancellationError;
+          if States[TargetIndex] <> tsFailed then Inc(Failed);
+          States[TargetIndex] := tsFailed;
+          Errors[TargetIndex] := Jobs[TargetIndex].CancellationError;
           if CancellationFailure = '' then
-            CancellationFailure := Jobs[k].CancellationError;
+            CancellationFailure := Jobs[TargetIndex].CancellationError;
         end;
-        FreeAndNil(Jobs[k]);
+        FreeAndNil(Jobs[TargetIndex]);
       end;
     if CancellationFailure <> '' then
       raise ELWPTError.Create(CancellationFailure);
   end;
 begin
   StartedAt := GetTickCount64;
-  if not FileExists(AManifestPath) then
-    raise EManifestError.CreateFmt(
-      'manifest not found at %s', [AManifestPath]);
-  Man := LoadManifestSnapshot(AManifestPath, ManifestContentHash);
+  Built := 0;
+  Failed := 0;
+  Skipped := 0;
+  Result := 1;
+  try
+    try
+      if not FileExists(AManifestPath) then
+        raise EManifestError.CreateFmt(
+          'manifest not found at %s', [AManifestPath]);
+      Man := LoadManifestSnapshot(AManifestPath, ManifestContentHash);
 
-  if Length(Man.Targets) = 0 then
-  begin
-    WriteLn('no [build] entries defined in ', AManifestPath);
-    Exit(1);
-  end;
+      if Length(Man.Targets) = 0 then
+      begin
+        WriteLn('no [build] entries defined in ', AManifestPath);
+        Inc(Failed);
+        Exit(1);
+      end;
 
   { Validate every requested name BEFORE any hook or compile runs —
     a typo in one of several names must not half-build the list. }
@@ -1170,7 +1185,11 @@ begin
       Inc(Unknown);
     end;
   end;
-  if Unknown > 0 then Exit(1);
+      if Unknown > 0 then
+      begin
+        Failed := Unknown;
+        Exit(1);
+      end;
 
   ValidateBuildGraph(Man.Targets);
   SelectTargetClosure(Man.Targets, ATargetNames, Selected);
@@ -1184,6 +1203,7 @@ begin
     WriteLn(ErrOutput, 'targets "', CollA, '" and "', CollB,
       '" map to the same session job directory ', TargetJobSegment(CollA),
       ' — rename one');
+    Inc(Failed);
     Exit(1);
   end;
 
@@ -1204,9 +1224,6 @@ begin
     GenerateVersionInclude(
       ExtractFileDir(ExpandFileName(AManifestPath)), Man);
 
-    Built := 0;
-    Failed := 0;
-    Skipped := 0;
     Running := 0;
     Completed := 0;
     HasEdges := SelectedGraphHasEdges(Man.Targets, Selected);
@@ -1345,10 +1362,9 @@ begin
             end;
 
           NowTick := GetTickCount64;
-          if (Running > 0)
-             and (NowTick - LastHeartbeatAt >= HeartbeatInterval) then
+          if NowTick - LastHeartbeatAt >= HeartbeatInterval then
           begin
-            WriteLn('HEARTBEAT build elapsed ',
+            WriteLn(ObservabilityHeartbeatEvent, 'build elapsed ',
               FormatElapsedMilliseconds(NowTick - StartedAt),
               '; active: ', ActiveBuildSummary(NowTick));
             LastHeartbeatAt := NowTick;
@@ -1411,11 +1427,20 @@ begin
     Result := Ord(Failed <> 0);
     Session.Finish(Failed = 0,
       IntToStr(Failed) + ' target(s) failed or became stale');
+  finally
+    Session.Free;
+  end;
+    except
+      on E: Exception do
+      begin
+        Inc(Failed);
+        raise;
+      end;
+    end;
+  finally
     WriteLn('summary: ', Built, ' built, ', Failed, ' failed, ',
       Skipped, ' skipped; elapsed ',
       FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
-  finally
-    Session.Free;
   end;
 end;
 

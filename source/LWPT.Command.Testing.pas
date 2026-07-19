@@ -7,8 +7,8 @@ unit LWPT.Command.Testing;
 
 interface
 
-function CmdTest(const AManifestPath: string; AIncludeE2E: Boolean;
-  AJobs, ABail: Integer; AVerbose: Boolean): Integer;
+function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
+  const AJobs, ABail: Integer; const AVerbose: Boolean): Integer;
 
 implementation
 
@@ -62,7 +62,7 @@ type
   protected
     procedure Execute; override;
   public
-    constructor Create(AScheduler: TTestScheduler);
+    constructor Create(const AScheduler: TTestScheduler);
   end;
 
   TTestScheduler = class
@@ -105,13 +105,14 @@ type
     procedure RunOne(AIndex: Integer; ALease: TLWPTWorkerLease);
     function AllJobsTerminal: Boolean;
     function NextProgressEvent(out AEvent: TTestProgressEvent): Boolean;
-    function ActiveJobSummary(ANow: QWord): string;
+    function ActiveJobSummary(const ANow: QWord): string;
     procedure PrintProgressEvent(const AEvent: TTestProgressEvent);
   public
-    constructor Create(ATests: TStringList; AIncludeE2E: Boolean;
-      const AUnitPaths: TStringArray; const ABuildRoot: string;
-      AJobs, ABail: Integer; ASession: TLWPTBuildSession;
-      const AProjectRoot: string; AVerbose: Boolean);
+    constructor Create(const ATests: TStringList;
+      const AIncludeE2E: Boolean; const AUnitPaths: TStringArray;
+      const ABuildRoot: string; const AJobs, ABail: Integer;
+      const ASession: TLWPTBuildSession; const AProjectRoot: string;
+      const AVerbose: Boolean);
     destructor Destroy; override;
     procedure Run;
     procedure PrintResults(const AProjectRoot: string; out APassed,
@@ -184,7 +185,7 @@ begin
     AEnvironment.Add(GetEnvironmentString(i));
 end;
 
-constructor TTestWorker.Create(AScheduler: TTestScheduler);
+constructor TTestWorker.Create(const AScheduler: TTestScheduler);
 begin
   FScheduler := AScheduler;
   FreeOnTerminate := False;
@@ -219,11 +220,11 @@ begin
   end;
 end;
 
-constructor TTestScheduler.Create(ATests: TStringList;
-  AIncludeE2E: Boolean; const AUnitPaths: TStringArray;
-  const ABuildRoot: string; AJobs, ABail: Integer;
-  ASession: TLWPTBuildSession; const AProjectRoot: string;
-  AVerbose: Boolean);
+constructor TTestScheduler.Create(const ATests: TStringList;
+  const AIncludeE2E: Boolean; const AUnitPaths: TStringArray;
+  const ABuildRoot: string; const AJobs, ABail: Integer;
+  const ASession: TLWPTBuildSession; const AProjectRoot: string;
+  const AVerbose: Boolean);
 var
   i, Runnable, RequestedWorkers: Integer;
 begin
@@ -570,7 +571,7 @@ begin
     IncludeTrailingPathDelimiter(AProjectRoot), ASource);
 end;
 
-function IsTerminalTestStatus(AStatus: TTestJobStatus): Boolean; inline;
+function IsTerminalTestStatus(const AStatus: TTestJobStatus): Boolean; inline;
 begin
   Result := AStatus in [tjsPassed, tjsCompileFailed, tjsRunFailed,
     tjsSkipped, tjsCancelled, tjsWorkerError];
@@ -630,7 +631,7 @@ begin
   end;
 end;
 
-function TTestScheduler.ActiveJobSummary(ANow: QWord): string;
+function TTestScheduler.ActiveJobSummary(const ANow: QWord): string;
 var
   i: Integer;
   DisplayPath: string;
@@ -639,12 +640,16 @@ begin
   EnterCriticalSection(FCriticalSection);
   try
     for i := 0 to High(FJobs) do
-      if FJobs[i].Status in [tjsCompiling, tjsRunning] then
+      if FJobs[i].Status in [tjsPending, tjsCompiling, tjsRunning] then
       begin
         DisplayPath := TestDisplayPath(FProjectRoot, FJobs[i].Source);
         if Result <> '' then Result := Result + ', ';
-        Result := Result + DisplayPath + ' ('
-          + FormatElapsedMilliseconds(ANow - FJobs[i].StartedAt) + ')';
+        Result := Result + DisplayPath;
+        if FJobs[i].StartedAt = 0 then
+          Result := Result + ' (queued)'
+        else
+          Result := Result + ' ('
+            + FormatElapsedMilliseconds(ANow - FJobs[i].StartedAt) + ')';
       end;
   finally
     LeaveCriticalSection(FCriticalSection);
@@ -657,46 +662,51 @@ var
   DisplayPath, LogOutput, LogReference, Elapsed: string;
 begin
   DisplayPath := TestDisplayPath(FProjectRoot, AEvent.Source);
-  LogReference := FSession.JobLogReference('test:' + AEvent.Source);
+  LogReference := FSession.JobLogReference(
+    ObservabilityTestIdentityNamespace + AEvent.Source);
   if AEvent.Kind = tpkStart then
   begin
-    FSession.WriteJobLog('test:' + AEvent.Source, '');
-    WriteLn('START ', DisplayPath, ' (log: ', LogReference, ')');
+    FSession.WriteJobLog(ObservabilityTestIdentityNamespace + AEvent.Source,
+      '');
+    WriteLn(ObservabilityStartEvent, DisplayPath, ' (log: ', LogReference,
+      ')');
     Exit;
   end;
   if AEvent.Status = tjsSkipped then
   begin
-    WriteLn('SKIP ', DisplayPath, ' (e2e tier)');
+    WriteLn(ObservabilitySkipEvent, DisplayPath, ' (e2e tier)');
     Exit;
   end;
   if (AEvent.Status = tjsCancelled) and (AEvent.StartedAt = 0) then
   begin
-    WriteLn('SKIP ', DisplayPath,
+    WriteLn(ObservabilitySkipEvent, DisplayPath,
       ' (bail threshold reached before start)');
     Exit;
   end;
   LogOutput := AEvent.CompileOutput + AEvent.RunOutput;
   if (LogOutput = '') and (AEvent.ErrorMessage <> '') then
     LogOutput := AEvent.ErrorMessage + LineEnding;
-  FSession.WriteJobLog('test:' + AEvent.Source, LogOutput);
+  FSession.WriteJobLog(ObservabilityTestIdentityNamespace + AEvent.Source,
+    LogOutput);
   Elapsed := FormatElapsedMilliseconds(
     GetTickCount64 - AEvent.StartedAt);
   case AEvent.Status of
     tjsPassed:
-      WriteLn('PASS ', DisplayPath, ' (', Elapsed, '; log: ',
+      WriteLn(ObservabilityPassEvent, DisplayPath, ' (', Elapsed, '; log: ',
         LogReference, ')');
     tjsCompileFailed:
-      WriteLn('FAIL ', DisplayPath, ' (compile exit ', AEvent.ExitCode,
-        '; ', Elapsed, '; log: ', LogReference, ')');
+      WriteLn(ObservabilityFailEvent, DisplayPath, ' (compile exit ',
+        AEvent.ExitCode, '; ', Elapsed, '; log: ', LogReference, ')');
     tjsRunFailed:
-      WriteLn('FAIL ', DisplayPath, ' (exit ', AEvent.ExitCode, '; ',
+      WriteLn(ObservabilityFailEvent, DisplayPath, ' (exit ',
+        AEvent.ExitCode, '; ',
         Elapsed, '; log: ', LogReference, ')');
     tjsCancelled:
-      WriteLn('SKIP ', DisplayPath, ' (bail threshold reached; ',
-        Elapsed, '; log: ', LogReference, ')');
+      WriteLn(ObservabilitySkipEvent, DisplayPath,
+        ' (bail threshold reached; ', Elapsed, '; log: ', LogReference, ')');
     tjsWorkerError:
-      WriteLn('FAIL ', DisplayPath, ' (scheduler error; ', Elapsed,
-        '; log: ', LogReference, ')');
+      WriteLn(ObservabilityFailEvent, DisplayPath, ' (scheduler error; ',
+        Elapsed, '; log: ', LogReference, ')');
   end;
   if (AEvent.Status in [tjsCompileFailed, tjsRunFailed, tjsWorkerError])
      or (FVerbose and (AEvent.Status = tjsPassed)) then
@@ -716,7 +726,7 @@ var
   i: Integer;
   Event: TTestProgressEvent;
   InvocationStartedAt, LastHeartbeatAt, NowTick, HeartbeatInterval: QWord;
-  Active: string;
+  ActiveSummary: string;
 begin
   InvocationStartedAt := GetTickCount64;
   LastHeartbeatAt := InvocationStartedAt;
@@ -729,14 +739,11 @@ begin
       NowTick := GetTickCount64;
       if NowTick - LastHeartbeatAt >= HeartbeatInterval then
       begin
-        Active := ActiveJobSummary(NowTick);
-        if Active <> '' then
-        begin
-          WriteLn('HEARTBEAT test elapsed ',
-            FormatElapsedMilliseconds(NowTick - InvocationStartedAt),
-            '; active: ', Active);
-          LastHeartbeatAt := NowTick;
-        end;
+        ActiveSummary := ActiveJobSummary(NowTick);
+        WriteLn(ObservabilityHeartbeatEvent, 'test elapsed ',
+          FormatElapsedMilliseconds(NowTick - InvocationStartedAt),
+          '; active: ', ActiveSummary);
+        LastHeartbeatAt := NowTick;
       end;
       Sleep(10);
     until False;
@@ -832,8 +839,8 @@ begin
   Result := False;
 end;
 
-function CmdTest(const AManifestPath: string; AIncludeE2E: Boolean;
-  AJobs, ABail: Integer; AVerbose: Boolean): Integer;
+function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
+  const AJobs, ABail: Integer; const AVerbose: Boolean): Integer;
 const
   TESTS_SUPPORT_DIR = 'tests/support';
 var
@@ -841,7 +848,8 @@ var
   Tests: TStringList;
   UnitPaths: TStringArray;
   ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond: string;
-  i, n, Passed, Failed, Skipped, CompileFailed, Cancelled: Integer;
+  i, n, Passed, Failed, Skipped, CompileFailed, Cancelled,
+    EffectiveBail: Integer;
   Session: TLWPTBuildSession;
   Scheduler: TTestScheduler;
   StartedAt: QWord;
@@ -852,14 +860,18 @@ begin
   Skipped := 0;
   CompileFailed := 0;
   Cancelled := 0;
-  Man := LoadManifest(AManifestPath);
-  if ABail < 0 then ABail := Man.TestBail;
-  ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
-  Session := TLWPTBuildSession.Create(ProjectRoot);
   try
-    WriteLn('test session: ', Session.SessionID, ' (',
-      Session.SessionReference, ')');
-    RunHooks('pretest', Man.PreTest, Session.HookRoot);
+    try
+      Result := 1;
+      Man := LoadManifest(AManifestPath);
+      if ABail < 0 then EffectiveBail := Man.TestBail
+      else EffectiveBail := ABail;
+      ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
+      Session := TLWPTBuildSession.Create(ProjectRoot);
+      try
+        WriteLn('test session: ', Session.SessionID, ' (',
+          Session.SessionReference, ')');
+        RunHooks('pretest', Man.PreTest, Session.HookRoot);
 
     ModulesRoot := ResolveModulesDir(Man);
     SetLength(UnitPaths, 0);
@@ -898,9 +910,6 @@ begin
         Result := 0;
         RunHooks('posttest', Man.PostTest, Session.HookRoot);
         Session.Finish(True);
-        WriteLn('summary: 0 passed, 0 failed, 0 did not compile, '
-          + '0 skipped, 0 cancelled; elapsed ',
-          FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
         Exit;
       end;
 
@@ -912,6 +921,7 @@ begin
           '" map to the same session staging key ',
           BuildSessionPathKey(CollisionFirst), ' — rename one');
         Result := 1;
+        Inc(Failed);
         { Mirror the other exit paths: posttest cleanup/reporting hooks
           run even when the scheduler never starts. }
         RunHooks('posttest', Man.PostTest, Session.HookRoot);
@@ -923,7 +933,7 @@ begin
       if not AIncludeE2E then
         WriteLn('  (e2e tier skipped; pass --tier=e2e to include)');
       Scheduler := TTestScheduler.Create(Tests, AIncludeE2E, UnitPaths,
-        Session.JobRoot('tests'), AJobs, ABail, Session, ProjectRoot,
+        Session.JobRoot('tests'), AJobs, EffectiveBail, Session, ProjectRoot,
         AVerbose);
       try
         WriteLn('effective workers: ', Scheduler.EffectiveWorkerCount);
@@ -949,12 +959,21 @@ begin
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
       + IntToStr(Cancelled) + ' cancelled');
+      finally
+        Session.Free;
+      end;
+    except
+      on E: Exception do
+      begin
+        Inc(Failed);
+        raise;
+      end;
+    end;
+  finally
     WriteLn('summary: ', Passed, ' passed, ', Failed, ' failed, ',
       CompileFailed, ' did not compile, ', Skipped, ' skipped, ',
       Cancelled, ' cancelled; elapsed ',
       FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
-  finally
-    Session.Free;
   end;
 end;
 
