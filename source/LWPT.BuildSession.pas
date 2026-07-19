@@ -64,6 +64,10 @@ function CaptureBuildPublicationFingerprint(
   AModulesPath: string;
   const ARequest: TLWPTBuildPublicationRequest): string;
 function BuildSessionPathKey(const AValue: string): string;
+procedure AppendUnitDirsFromOptions(const AOptions: TStrings;
+  var ADirs: TStringArray);
+procedure AppendUnitDirsFromCfg(const ACfgPath: string;
+  var ADirs: TStringArray);
 function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
   const AEntrySource: string): Integer;
 procedure EnsureCompilerPathBudget(const AUnitDirectory,
@@ -188,6 +192,42 @@ begin
   if Length(BaseName) > 16 then SetLength(BaseName, 16);
   Digest := TextHash(AValue);
   Result := BaseName + '-' + Copy(Digest, 8, 12);
+end;
+
+{ Single home for "which directories does this compile search for unit
+  sources". Both the target-build flow (cfg passed to FPC unexpanded via
+  @file) and the test/script flow (cfg already expanded onto the parameter
+  list) feed the path-budget check through these two helpers, so the two
+  flows cannot silently diverge in how they extract -Fu directories. }
+procedure AppendUnitDirsFromOptions(const AOptions: TStrings;
+  var ADirs: TStringArray);
+var
+  i, Count: Integer;
+  Line: string;
+begin
+  for i := 0 to AOptions.Count - 1 do
+  begin
+    Line := Trim(AOptions[i]);
+    if Copy(Line, 1, 3) <> '-Fu' then Continue;
+    Count := Length(ADirs);
+    SetLength(ADirs, Count + 1);
+    ADirs[Count] := Copy(Line, 4, MaxInt);
+  end;
+end;
+
+procedure AppendUnitDirsFromCfg(const ACfgPath: string;
+  var ADirs: TStringArray);
+var
+  Lines: TStringList;
+begin
+  if not FileExists(ACfgPath) then Exit;
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ACfgPath);
+    AppendUnitDirsFromOptions(Lines, ADirs);
+  finally
+    Lines.Free;
+  end;
 end;
 
 function LongestCompiledBaseNameLength(const ADirectories: TStringArray;

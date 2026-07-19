@@ -672,6 +672,9 @@ begin
           '" map to the same session staging key ',
           BuildSessionPathKey(CollisionFirst), ' — rename one');
         Result := 1;
+        { Mirror the other exit paths: posttest cleanup/reporting hooks
+          run even when the scheduler never starts. }
+        RunHooks('posttest', Man.PostTest, Session.HookRoot);
         Session.Finish(False, 'test staging key collision');
         Exit;
       end;

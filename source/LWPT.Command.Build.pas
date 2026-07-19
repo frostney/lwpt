@@ -306,33 +306,6 @@ begin
     end;
 end;
 
-{ Unit directories the resolved cfg contributes to a target compile. The
-  cfg is passed to FPC unexpanded (@file), so the path-budget check reads
-  its -Fu lines directly. }
-procedure AppendCfgUnitDirs(const ACfgPath: string;
-  var ADirs: LWPT.Core.TStringArray);
-var
-  Lines: TStringList;
-  j, Count: Integer;
-  Line: string;
-begin
-  if not FileExists(ACfgPath) then Exit;
-  Lines := TStringList.Create;
-  try
-    Lines.LoadFromFile(ACfgPath);
-    for j := 0 to Lines.Count - 1 do
-    begin
-      Line := Trim(Lines[j]);
-      if Copy(Line, 1, 3) <> '-Fu' then Continue;
-      Count := Length(ADirs);
-      SetLength(ADirs, Count + 1);
-      ADirs[Count] := Copy(Line, 4, MaxInt);
-    end;
-  finally
-    Lines.Free;
-  end;
-end;
-
 { FPC failure output that points at stale build artefacts rather than a
   source error — the cases where a --clean retry actually helps. }
 function HasStaleArtefactSignature(const AOutput: string): Boolean;
@@ -639,9 +612,11 @@ begin
     Request.BuildRequest.Inputs.IncludePaths);
   AddDeclaredOutputs(AMan, Request.ExcludedPaths);
   ValidateBuildRequest(Request.BuildRequest);
+  { The cfg reaches FPC unexpanded (@file), so its -Fu lines are read
+    through the same shared extractor the test flow uses. }
   ScanDirs := Copy(Request.BuildRequest.Inputs.UnitPaths, 0,
     Length(Request.BuildRequest.Inputs.UnitPaths));
-  AppendCfgUnitDirs(ResolveCfgFile(AMan), ScanDirs);
+  AppendUnitDirsFromCfg(ResolveCfgFile(AMan), ScanDirs);
   EnsureCompilerPathBudget(UnitOutDir, BinDir,
     LongestCompiledBaseNameLength(ScanDirs, T.Source));
   Fingerprint := CaptureBuildPublicationFingerprint(ProjectRoot,
