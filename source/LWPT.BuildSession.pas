@@ -200,7 +200,11 @@ begin
   { The compiler writes '<unit>.s' into the staging unit directory for the
     entry program and for every unit it recompiles from the search paths.
     Scanning the search paths for the longest Pascal base name makes the
-    path budget below exact instead of guessing an allowance. }
+    path budget below exact instead of guessing an allowance. A long-named
+    unit that the entry never uses still counts — refusing such a compile
+    is deliberate: any unit on a search path is one uses-clause edit away
+    from compiling, and a deterministic setup error beats the truncation
+    failure appearing only once that edit lands. }
   Result := Length(ChangeFileExt(ExtractFileName(AEntrySource), ''));
   for i := 0 to High(ADirectories) do
   begin

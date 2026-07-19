@@ -576,6 +576,28 @@ begin
   end;
 end;
 
+{ Test sources become session staging keys the same way build targets do.
+  Distinct sources sharing one key would silently share compiler staging —
+  the interference the private-session design exists to rule out — so the
+  scheduler refuses the run before any worker starts, mirroring the build
+  path's FindArtefactDirCollision. }
+function FindTestStagingKeyCollision(const ATests: TStringList;
+  out AFirst, ASecond: string): Boolean;
+var
+  i, j: Integer;
+begin
+  for i := 0 to ATests.Count - 1 do
+    for j := i + 1 to ATests.Count - 1 do
+      if SameText(BuildSessionPathKey(ATests[i]),
+                  BuildSessionPathKey(ATests[j])) then
+      begin
+        AFirst := ATests[i];
+        ASecond := ATests[j];
+        Exit(True);
+      end;
+  Result := False;
+end;
+
 function CmdTest(const AManifestPath: string; AIncludeE2E: Boolean;
   AJobs, ABail: Integer): Integer;
 const
@@ -584,7 +606,7 @@ var
   Man: TManifest;
   Tests: TStringList;
   UnitPaths: TStringArray;
-  ModulesRoot, ProjectRoot: string;
+  ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond: string;
   i, n, Passed, Failed, Skipped, CompileFailed, Cancelled: Integer;
   Session: TLWPTBuildSession;
   Scheduler: TTestScheduler;
@@ -634,6 +656,18 @@ begin
         Result := 0;
         RunHooks('posttest', Man.PostTest, Session.HookRoot);
         Session.Finish(True);
+        Exit;
+      end;
+
+      if FindTestStagingKeyCollision(Tests, CollisionFirst,
+        CollisionSecond) then
+      begin
+        WriteLn(ErrOutput, PROGRAM_NAME, ' test: test sources "',
+          CollisionFirst, '" and "', CollisionSecond,
+          '" map to the same session staging key ',
+          BuildSessionPathKey(CollisionFirst), ' — rename one');
+        Result := 1;
+        Session.Finish(False, 'test staging key collision');
         Exit;
       end;
 
