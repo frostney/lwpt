@@ -48,6 +48,8 @@ type
   public
     destructor Destroy; override;
     procedure Add(ASub: TSubcommand);
+    function Count: Integer;
+    function Item(AIndex: Integer): TSubcommand;
     function Find(const AName: string): TSubcommand;
     procedure PrintTopLevelHelp(const AProgramName: string);
     procedure PrintSubcommandHelp(const AProgramName: string;
@@ -87,6 +89,16 @@ procedure TSubcommandRegistry.Add(ASub: TSubcommand);
 begin
   SetLength(FItems, Length(FItems) + 1);
   FItems[High(FItems)] := ASub;
+end;
+
+function TSubcommandRegistry.Count: Integer;
+begin
+  Result := Length(FItems);
+end;
+
+function TSubcommandRegistry.Item(AIndex: Integer): TSubcommand;
+begin
+  Result := FItems[AIndex];
 end;
 
 function TSubcommandRegistry.Find(const AName: string): TSubcommand;
