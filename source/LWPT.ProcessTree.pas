@@ -146,19 +146,6 @@ type
   end;
 {$PACKRECORDS DEFAULT}
 
-type
-  TLWPTConsoleControlForwarder = class(TThread)
-  protected
-    procedure Execute; override;
-  end;
-
-const
-  WindowsControlExitCode = DWORD($C000013A);
-
-var
-  ConsoleControlEvent: THandle = 0;
-  ConsoleControlForwarder: TLWPTConsoleControlForwarder = nil;
-
 function LWPTCreateJobObject(const ASecurityAttributes: Pointer;
   const AName: PWideChar): THandle; stdcall;
   external 'kernel32.dll' name 'CreateJobObjectW';
@@ -723,11 +710,6 @@ begin
     + LineEnding;
   FpWrite(StdErrorHandle, OutputLine[1], Length(OutputLine));
   {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  WriteLn(ErrOutput, 'process-tree console-control forwarding failed: ',
-    AMessage);
-  Flush(ErrOutput);
-  {$ENDIF}
 end;
 
 {$IFDEF UNIX}
@@ -766,33 +748,6 @@ begin
     LongInt write is below PIPE_BUF; if repeated signals fill it, an earlier
     queued signal already guarantees that forwarding will run. }
   FpWrite(SignalPipe[SignalPipeWriteEnd], ASignal, SizeOf(ASignal));
-end;
-{$ENDIF}
-
-{$IFDEF MSWINDOWS}
-procedure TLWPTConsoleControlForwarder.Execute;
-begin
-  Windows.WaitForSingleObject(ConsoleControlEvent, Windows.INFINITE);
-  try
-    TerminateRegisteredProcessTrees(True);
-  except
-    on E: Exception do
-    begin
-      ReportForwardingFailure(E.Message);
-      Windows.ExitProcess(ProcessTreeCancellationExitCode);
-    end;
-  end;
-  Windows.ExitProcess(WindowsControlExitCode);
-end;
-
-function ProcessTreeConsoleControlHandler(AControlType: DWORD): BOOL; stdcall;
-begin
-  Result := False;
-  if (AControlType <> Windows.CTRL_C_EVENT)
-     and (AControlType <> Windows.CTRL_BREAK_EVENT) then Exit;
-  { The OS invokes this callback on an unmanaged thread. Keep it to the
-    async-safe Win32 event operation; an FPC-created thread owns all RTL work. }
-  Result := Windows.SetEvent(ConsoleControlEvent);
 end;
 {$ENDIF}
 
@@ -848,27 +803,9 @@ begin
   end;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  if SignalForwardingInstalled then Exit;
-  ConsoleControlEvent := Windows.CreateEvent(nil, True, False, nil);
-  if ConsoleControlEvent = 0 then RaiseLastOSError;
-  if not Windows.SetConsoleCtrlHandler(@ProcessTreeConsoleControlHandler,
-    True) then
-  begin
-    Windows.CloseHandle(ConsoleControlEvent);
-    ConsoleControlEvent := 0;
-    RaiseLastOSError;
-  end;
-  try
-    ConsoleControlForwarder := TLWPTConsoleControlForwarder.Create(True);
-    ConsoleControlForwarder.FreeOnTerminate := False;
-    ConsoleControlForwarder.Start;
-    SignalForwardingInstalled := True;
-  except
-    Windows.SetConsoleCtrlHandler(@ProcessTreeConsoleControlHandler, False);
-    Windows.CloseHandle(ConsoleControlEvent);
-    ConsoleControlEvent := 0;
-    raise;
-  end;
+  { Console-control forwarding is deferred. Scheduler cancellation continues
+    to terminate each registered Job Object directly. }
+  Exit;
   {$ENDIF}
 end;
 

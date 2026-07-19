@@ -7,9 +7,9 @@
   pipe. A dedicated thread reaps every registered child group before
   re-delivering the signal, using an accelerated path when an ancestor
   forwarded the signal.
-- **Windows cancellation combines console-control forwarding with nested Job
-  Object termination.** A minimal Ctrl-C/Ctrl-Break callback wakes a dedicated
-  thread, which terminates registered jobs before the LWPT process exits.
+- **Windows scheduler cancellation uses nested Job Object termination.** Bail
+  and worker-error paths terminate registered jobs, but console-control
+  forwarding for Ctrl-C and Ctrl-Break is deferred as a tracked follow-up.
 - **Cancellation completes only after the isolated tree is empty.** A
   successful SIGKILL or `TerminateJobObject` call is followed by a bounded
   membership poll; real API failures become scheduler failures after a
@@ -85,14 +85,12 @@ and polls `JobObjectBasicAccountingInformation.ActiveProcesses` until zero.
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is not used: closing an ownership handle
 after successful execution must not introduce cancellation semantics.
 
-Windows installs a `SetConsoleCtrlHandler` callback on the same build/test
-dispatch paths. Because Windows invokes the callback on an operating-system
-thread, the callback only signals a Win32 event and returns handled; an
-FPC-created forwarding thread performs registry traversal, Job Object
-termination, reporting, and process exit. Both Ctrl-C and Ctrl-Break take this
-path. Nested Job Object membership makes job termination include the jobs and
-processes created by nested LWPT invocations, so Windows does not need the Unix
-grace asymmetry.
+Windows console-control forwarding is deferred as a tracked follow-up to this
+decision. Ctrl-C and Ctrl-Break are not yet wired into the process-tree
+registry. Numeric bail and worker-error cancellation still terminate each
+owned Job Object, including the jobs and processes created by nested LWPT
+invocations. Unix SIGINT and SIGTERM forwarding remain implemented as
+described above.
 
 Only an already-empty group or job is a successful no-op. Permission errors,
 unexpected membership-query errors, termination API failures, and bounded
@@ -106,8 +104,9 @@ instead of disguising the error as successful cleanup.
 
 ## Consequences
 
-- A terminal Ctrl-C, an explicit SIGTERM, numeric test bail, worker failure,
-  and ancestor cancellation all follow the same child-tree ownership contract.
+- Unix SIGINT or SIGTERM, numeric test bail, worker failure, and ancestor
+  cancellation all follow the same child-tree ownership contract. Windows
+  Ctrl-C and Ctrl-Break forwarding remain deferred.
 - On Unix, a top-level signal permits one grace interval for nested LWPT to
   forward it; marked inner levels collapse their owned groups immediately and
   finish before that outer grace expires.

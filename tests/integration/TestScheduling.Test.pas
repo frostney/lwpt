@@ -8,9 +8,6 @@ uses
   BaseUnix,
   cthreads,
   {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Windows,
-  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -37,11 +34,6 @@ const
     + '_PROCESS_TREE_TEST_PID_FILE';
   SlowCompilerProxyMode = 'slow';
   WorkerErrorCompilerProxyMode = 'worker-error';
-  {$IFDEF MSWINDOWS}
-  WindowsConsoleControllerOption = '--' + PROGRAM_NAME
-    + '-console-controller';
-  WindowsIgnoreControlCompilerProxyMode = 'ignore-control';
-  {$ENDIF}
   TestHeartbeatIntervalMilliseconds = 75;
   TestHeartbeatJobDurationMilliseconds =
     TestHeartbeatIntervalMilliseconds * 4;
@@ -80,9 +72,6 @@ type
     {$IFDEF UNIX}
     procedure TestSIGINTTerminatesActiveProcessTree;
     procedure TestSIGTERMTerminatesActiveProcessTree;
-    {$ENDIF}
-    {$IFDEF MSWINDOWS}
-    procedure TestCtrlCTerminatesActiveProcessTree;
     {$ENDIF}
     procedure TestSilentJobEmitsHeartbeatAndProgress;
     procedure TestFailureReplaysAndPreservesIsolatedLog;
@@ -700,115 +689,6 @@ begin
 end;
 {$ENDIF}
 
-{$IFDEF MSWINDOWS}
-procedure TerminateWindowsProcess(const APID: Integer);
-var
-  ProcessHandle: THandle;
-begin
-  if not ProcessIsRunning(APID) then Exit;
-  ProcessHandle := Windows.OpenProcess(Windows.PROCESS_TERMINATE, False,
-    DWORD(APID));
-  if ProcessHandle = 0 then Exit;
-  try
-    Windows.TerminateProcess(ProcessHandle, 1);
-  finally
-    Windows.CloseHandle(ProcessHandle);
-  end;
-end;
-
-procedure TTestScheduling.TestCtrlCTerminatesActiveProcessTree;
-var
-  CompilerPID: Integer;
-  Controller: TProcess;
-  PIDFile, ProjectRoot: string;
-  Started: TDateTime;
-begin
-  CompilerPID := -1;
-  ProjectRoot := FScratch + '/console-control';
-  PIDFile := FScratch + '/control/console-control-compiler-pid';
-  WriteBuildProject(ProjectRoot);
-  Controller := TProcess.Create(nil);
-  try
-    Controller.Executable := ExpandFileName(ParamStr(0));
-    Controller.Parameters.Add(WindowsConsoleControllerOption);
-    Controller.Parameters.Add(LwptBinaryPath);
-    Controller.Parameters.Add(ProjectRoot);
-    Controller.Parameters.Add(PIDFile);
-    Controller.Parameters.Add(FScratch + '/console-control-worker-state');
-    Controller.Options := [poNewConsole];
-    Controller.Execute;
-    Started := Now;
-    while Controller.Running
-      and ((Now - Started) * SecondsPerDay
-        < CancellationCompletionCeilingSeconds) do
-      Sleep(ProcessPollMilliseconds);
-    Expect<Boolean>(Controller.Running).ToBe(False);
-    Controller.WaitOnExit;
-    Expect<Integer>(Controller.ExitStatus).ToBe(0);
-    Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
-    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
-    Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
-  finally
-    if Controller.Running then Controller.Terminate(1);
-    TerminateWindowsProcess(CompilerPID);
-    Controller.Free;
-  end;
-end;
-
-function RunWindowsConsoleController: Integer;
-var
-  CompilerPID: Integer;
-  Environment: array of string;
-  LwptProcess: TProcess;
-  Started: TDateTime;
-begin
-  Result := 1;
-  CompilerPID := -1;
-  SetLength(Environment, 6);
-  Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
-  Environment[1] := WORKER_STATE_DIR_ENV + '=' + ParamStr(5);
-  Environment[2] := WORKER_BUDGET_ENV + '=1';
-  Environment[3] := CompilerExecutableEnvironment + '='
-    + ExpandFileName(ParamStr(0));
-  Environment[4] := ProcessTreeProxyModeEnvironment + '='
-    + WindowsIgnoreControlCompilerProxyMode;
-  Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + ParamStr(4);
-  LwptProcess := TProcess.Create(nil);
-  try
-    LwptProcess.Executable := ParamStr(2);
-    LwptProcess.Parameters.Add('build');
-    LwptProcess.CurrentDirectory := ParamStr(3);
-    ConfigureProcessEnvironment(LwptProcess, Environment);
-    LwptProcess.Execute;
-    Started := Now;
-    while (not FileExists(ParamStr(4))) and LwptProcess.Running
-      and ((Now - Started) * SecondsPerDay
-        < ProcessStartupCeilingSeconds) do
-      Sleep(ProcessPollMilliseconds);
-    if not FileExists(ParamStr(4)) then Exit(2);
-    CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(4))));
-    { The controller shares the new console but must survive its own broadcast.
-      The compiler proxy has already installed the same ignore setting before
-      publishing its PID, leaving LWPT as the only Ctrl-C handler under test. }
-    if not Windows.SetConsoleCtrlHandler(nil, True) then Exit(3);
-    if not Windows.GenerateConsoleCtrlEvent(Windows.CTRL_C_EVENT, 0) then
-      Exit(4);
-    Started := Now;
-    while LwptProcess.Running
-      and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
-      Sleep(ProcessPollMilliseconds);
-    if LwptProcess.Running then Exit(5);
-    LwptProcess.WaitOnExit;
-    if ProcessIsRunning(CompilerPID) then Exit(6);
-    Result := 0;
-  finally
-    if LwptProcess.Running then LwptProcess.Terminate(1);
-    TerminateWindowsProcess(CompilerPID);
-    LwptProcess.Free;
-  end;
-end;
-{$ENDIF}
-
 function RunProcessTreeCompilerProxy: Integer;
 var
   Mode, PIDFile, SourceFile: string;
@@ -828,15 +708,8 @@ begin
   if Mode = IgnoreTerminateCompilerProxyMode then
     FpSignal(SIGTERM, SignalHandler(SIG_IGN));
   {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  if Mode = WindowsIgnoreControlCompilerProxyMode then
-    Windows.SetConsoleCtrlHandler(nil, True);
-  {$ENDIF}
   if (Mode = SlowCompilerProxyMode)
      or (Mode = IgnoreTerminateCompilerProxyMode)
-     {$IFDEF MSWINDOWS}
-     or (Mode = WindowsIgnoreControlCompilerProxyMode)
-     {$ENDIF}
      or ((Mode = WorkerErrorCompilerProxyMode)
        and SameText(SourceFile, 'A.Slow.Test.pas')) then
   begin
@@ -879,10 +752,6 @@ begin
   Test('SIGTERM reaps the active compiler tree',
     TestSIGTERMTerminatesActiveProcessTree);
   {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Test('Ctrl-C reaps the active compiler Job Object',
-    TestCtrlCTerminatesActiveProcessTree);
-  {$ENDIF}
   Test('silent jobs emit heartbeat and serialized progress',
     TestSilentJobEmitsHeartbeatAndProgress);
   Test('failures replay output and preserve isolated logs',
@@ -892,11 +761,6 @@ begin
 end;
 
 begin
-  {$IFDEF MSWINDOWS}
-  if (ParamCount = 5)
-     and (ParamStr(1) = WindowsConsoleControllerOption) then
-    Halt(RunWindowsConsoleController);
-  {$ENDIF}
   if GetEnvironmentVariable(ProcessTreeProxyModeEnvironment) <> '' then
     Halt(RunProcessTreeCompilerProxy);
   TestRunnerProgram.AddSuite(TTestScheduling.Create('TestScheduling'));
