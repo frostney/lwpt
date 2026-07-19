@@ -21,7 +21,8 @@ uses
   LWPT.Command.Common,
   LWPT.Core,
   LWPT.Manifest,
-  LWPT.WorkerBudget;
+  LWPT.WorkerBudget,
+  Platform;
 
 type
   TTestJobStatus = (tjsPending, tjsCompiling, tjsRunning, tjsPassed,
@@ -36,7 +37,7 @@ type
     ErrorMessage: string;
     ExitCode: Integer;
     Status: TTestJobStatus;
-    ActiveProcess: TProcess;
+    ActiveProcessTree: TLWPTProcessTree;
   end;
 
   TTestScheduler = class;
@@ -65,8 +66,10 @@ type
     FWorkers: TList;
     function ClaimJob(out AIndex: Integer): Boolean;
     function AcquireLease: TLWPTWorkerLease;
-    function StartProcess(AIndex: Integer; AProcess: TProcess): Boolean;
-    procedure FinishProcess(AIndex: Integer; AProcess: TProcess);
+    function StartProcess(AIndex: Integer;
+      AProcessTree: TLWPTProcessTree): Boolean;
+    procedure FinishProcess(AIndex: Integer;
+      AProcessTree: TLWPTProcessTree);
     function RunProcess(AIndex: Integer; AProcess: TProcess;
       out AOutput: string): Integer;
     procedure SetJobStage(AIndex: Integer; AStatus: TTestJobStatus;
@@ -275,17 +278,17 @@ begin
 end;
 
 function TTestScheduler.StartProcess(AIndex: Integer;
-  AProcess: TProcess): Boolean;
+  AProcessTree: TLWPTProcessTree): Boolean;
 begin
   Result := False;
   EnterCriticalSection(FCriticalSection);
   try
     if FCancelled then Exit;
-    FJobs[AIndex].ActiveProcess := AProcess;
+    FJobs[AIndex].ActiveProcessTree := AProcessTree;
     try
-      AProcess.Execute;
+      AProcessTree.Execute;
     except
-      FJobs[AIndex].ActiveProcess := nil;
+      FJobs[AIndex].ActiveProcessTree := nil;
       raise;
     end;
     Result := True;
@@ -295,12 +298,12 @@ begin
 end;
 
 procedure TTestScheduler.FinishProcess(AIndex: Integer;
-  AProcess: TProcess);
+  AProcessTree: TLWPTProcessTree);
 begin
   EnterCriticalSection(FCriticalSection);
   try
-    if FJobs[AIndex].ActiveProcess = AProcess then
-      FJobs[AIndex].ActiveProcess := nil;
+    if FJobs[AIndex].ActiveProcessTree = AProcessTree then
+      FJobs[AIndex].ActiveProcessTree := nil;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
@@ -308,29 +311,36 @@ end;
 
 function TTestScheduler.RunProcess(AIndex: Integer; AProcess: TProcess;
   out AOutput: string): Integer;
+var
+  ProcessTree: TLWPTProcessTree;
 begin
   Result := 1;
   AOutput := '';
   AProcess.Options := [poUsePipes, poStderrToOutPut];
-  if not StartProcess(AIndex, AProcess) then Exit;
+  ProcessTree := TLWPTProcessTree.Create(AProcess);
   try
-    while AProcess.Running do
-    begin
+    if not StartProcess(AIndex, ProcessTree) then Exit;
+    try
+      while AProcess.Running do
+      begin
+        if AProcess.Output.NumBytesAvailable > 0 then
+          AOutput := AOutput + DrainProcessOutput(AProcess);
+        Sleep(10);
+      end;
       if AProcess.Output.NumBytesAvailable > 0 then
         AOutput := AOutput + DrainProcessOutput(AProcess);
-      Sleep(10);
+      AProcess.WaitOnExit;
+      { The Running poll above usually reaps the child with the raw
+        status, where ExitCode decodes correctly — but a signal death
+        still reads as 0 there, and losing the race to WaitOnExit drops
+        nonzero exits too (see NormalisedExitCode). A crashed test
+        binary must never count as a pass. }
+      Result := NormalisedExitCode(AProcess);
+    finally
+      FinishProcess(AIndex, ProcessTree);
     end;
-    if AProcess.Output.NumBytesAvailable > 0 then
-      AOutput := AOutput + DrainProcessOutput(AProcess);
-    AProcess.WaitOnExit;
-    { The Running poll above usually reaps the child with the raw
-      status, where ExitCode decodes correctly — but a signal death
-      still reads as 0 there, and losing the race to WaitOnExit drops
-      nonzero exits too (see NormalisedExitCode). A crashed test
-      binary must never count as a pass. }
-    Result := NormalisedExitCode(AProcess);
   finally
-    FinishProcess(AIndex, AProcess);
+    ProcessTree.Free;
   end;
 end;
 
@@ -385,9 +395,9 @@ begin
   begin
     if FJobs[i].Status = tjsPending then
       FJobs[i].Status := tjsCancelled;
-    if FJobs[i].ActiveProcess <> nil then
+    if FJobs[i].ActiveProcessTree <> nil then
       try
-        FJobs[i].ActiveProcess.Terminate(1);
+        FJobs[i].ActiveProcessTree.Terminate;
       except
         on E: Exception do
           if FJobs[i].ErrorMessage = '' then

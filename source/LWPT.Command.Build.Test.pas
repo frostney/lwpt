@@ -15,10 +15,15 @@ program LWPT.Command.Build.Test;
 
 uses
   {$IFDEF UNIX}
+  BaseUnix,
   cthreads,
   {$ENDIF}
   Classes,
+  Process,
   SysUtils,
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
 
   LWPT.Command.Build,
   LWPT.Core,
@@ -28,6 +33,8 @@ uses
 const
   COMPILER_PROCESS_PROXY_OPTION = '--' + PROGRAM_NAME
     + '-compiler-process-proxy';
+  COMPILER_GRANDCHILD_PROXY_OPTION = '--' + PROGRAM_NAME
+    + '-compiler-grandchild-proxy';
   COMPILER_EXIT_PROXY_OPTION = '--' + PROGRAM_NAME
     + '-compiler-exit-proxy';
 
@@ -68,6 +75,31 @@ begin
   FMarker := AMarker;
   ExitCode := -1;
 end;
+
+function ProcessIsRunning(APID: Integer): Boolean;
+{$IFDEF UNIX}
+begin
+  Result := (APID > 0)
+    and ((FpKill(APID, 0) = 0) or (FpGetErrNo = ESysEPERM));
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Handle: THandle;
+  ExitCode: DWORD;
+begin
+  if APID <= 0 then Exit(False);
+  Handle := Windows.OpenProcess(Windows.PROCESS_QUERY_INFORMATION,
+    False, DWORD(APID));
+  if Handle = 0 then Exit(False);
+  try
+    Result := Windows.GetExitCodeProcess(Handle, ExitCode)
+      and (ExitCode = Windows.STILL_ACTIVE);
+  finally
+    Windows.CloseHandle(Handle);
+  end;
+end;
+{$ENDIF}
 
 procedure TCompilerRunnerThread.Execute;
 begin
@@ -120,11 +152,13 @@ procedure TStaleArtefactSignature.TestCompilerCancellationCapturesAndReaps;
 var
   Runner: TLWPTCompilerProcess;
   Worker: TCompilerRunnerThread;
-  Scratch, Marker: string;
+  Scratch, Marker, GrandchildPIDPath: string;
+  GrandchildPID: Integer;
   Started: TDateTime;
 begin
   Scratch := ExpandFileName('build/tests/tmp/compiler-process-cancel');
   Marker := Scratch + '/ready';
+  GrandchildPIDPath := Scratch + '/grandchild-pid';
   RecursiveDelete(Scratch);
   Runner := TLWPTCompilerProcess.Create(ExpandFileName(ParamStr(0)));
   Worker := TCompilerRunnerThread.Create(Runner, Marker);
@@ -137,12 +171,18 @@ begin
       Sleep(10);
     end;
     Expect<Boolean>(FileExists(Marker)).ToBe(True);
+    Expect<Boolean>(FileExists(GrandchildPIDPath)).ToBe(True);
+    GrandchildPID := StrToInt(Trim(ReadBinaryFile(GrandchildPIDPath)));
     Runner.Cancel;
     Worker.WaitFor;
     Expect<string>(Worker.ErrorMessage).ToBe('');
     Expect<Boolean>(Worker.ExitCode <> 0).ToBe(True);
     Expect<Boolean>(Pos('captured-output-', Worker.Output) > 0).ToBe(True);
     Expect<Boolean>(Length(Worker.Output) > 65536).ToBe(True);
+    Started := Now;
+    while ProcessIsRunning(GrandchildPID)
+      and ((Now - Started) * 86400 < 3) do Sleep(10);
+    Expect<Boolean>(ProcessIsRunning(GrandchildPID)).ToBe(False);
   finally
     Runner.Cancel;
     Worker.WaitFor;
@@ -197,11 +237,28 @@ begin
 end;
 
 function RunCompilerProcessProxy: Integer;
-var i: Integer;
+var
+  Child: TProcess;
+  i: Integer;
+  GrandchildPIDPath: string;
 begin
   for i := 1 to 6000 do Write('captured-output-');
   Flush(Output);
+  GrandchildPIDPath := ExtractFileDir(ParamStr(2)) + '/grandchild-pid';
+  Child := TProcess.Create(nil);
+  Child.Executable := ExpandFileName(ParamStr(0));
+  Child.Parameters.Add(COMPILER_GRANDCHILD_PROXY_OPTION);
+  Child.Parameters.Add(GrandchildPIDPath);
+  Child.Execute;
+  while not FileExists(GrandchildPIDPath) do Sleep(10);
   WriteTextFile(ParamStr(2), 'ready');
+  Sleep(30000);
+  Result := 0;
+end;
+
+function RunCompilerGrandchildProxy: Integer;
+begin
+  WriteTextFile(ParamStr(2), IntToStr(GetProcessID));
   Sleep(30000);
   Result := 0;
 end;
@@ -219,6 +276,9 @@ begin
   if (ParamCount >= 2)
      and (ParamStr(1) = COMPILER_PROCESS_PROXY_OPTION) then
     Halt(RunCompilerProcessProxy);
+  if (ParamCount >= 2)
+     and (ParamStr(1) = COMPILER_GRANDCHILD_PROXY_OPTION) then
+    Halt(RunCompilerGrandchildProxy);
   if (ParamCount >= 2)
      and (ParamStr(1) = COMPILER_EXIT_PROXY_OPTION) then
     Halt(RunCompilerExitProxy);

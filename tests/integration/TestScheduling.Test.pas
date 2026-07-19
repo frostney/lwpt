@@ -5,10 +5,14 @@ program TestScheduling.Test;
 
 uses
   {$IFDEF UNIX}
+  BaseUnix,
   cthreads,
   {$ENDIF}
   Classes,
   SysUtils,
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
 
   LWPT.WorkerBudget,
   TestingPascalLibrary,
@@ -41,6 +45,31 @@ function PascalString(const AValue: string): string;
 begin
   Result := '''' + StringReplace(AValue, '''', '''''', [rfReplaceAll]) + '''';
 end;
+
+function ProcessIsRunning(APID: Integer): Boolean;
+{$IFDEF UNIX}
+begin
+  Result := (APID > 0)
+    and ((FpKill(APID, 0) = 0) or (FpGetErrNo = ESysEPERM));
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Handle: THandle;
+  ExitCode: DWORD;
+begin
+  if APID <= 0 then Exit(False);
+  Handle := Windows.OpenProcess(Windows.PROCESS_QUERY_INFORMATION,
+    False, DWORD(APID));
+  if Handle = 0 then Exit(False);
+  try
+    Result := Windows.GetExitCodeProcess(Handle, ExitCode)
+      and (ExitCode = Windows.STILL_ACTIVE);
+  finally
+    Windows.CloseHandle(Handle);
+  end;
+end;
+{$ENDIF}
 
 procedure TTestScheduling.BeforeAll;
 begin
@@ -218,13 +247,27 @@ procedure TTestScheduling.TestBailTerminatesActiveAndLeavesPendingUnstarted;
 var
   R: TLwptResult;
   Started: TDateTime;
+  GrandchildPID: Integer;
 begin
-  ResetProject(1);
+  ResetProject(0);
   WriteTextFile(FScratch + '/tests/A.Slow.Test.pas',
       'program SlowFixture;'#10
     + '{$mode delphi}{$H+}'#10
-    + 'uses Classes, SysUtils;'#10
+    + 'uses Classes, Process, SysUtils;'#10
+    + 'var Child: TProcess; PIDFile: TStringList;'#10
     + 'begin'#10
+    + '  if (ParamCount = 1) and (ParamStr(1) = ''--grandchild'') then'#10
+    + '  begin Sleep(15000); Halt(0) end;'#10
+    + '  Child := TProcess.Create(nil);'#10
+    + '  Child.Executable := ParamStr(0);'#10
+    + '  Child.Parameters.Add(''--grandchild'');'#10
+    + '  Child.Execute;'#10
+    + '  PIDFile := TStringList.Create;'#10
+    + '  try'#10
+    + '    PIDFile.Text := IntToStr(Child.ProcessID);'#10
+    + '    PIDFile.SaveToFile('
+    + PascalString(FScratch + '/control/grandchild-pid') + ');'#10
+    + '  finally PIDFile.Free end;'#10
     + '  TFileStream.Create('
     + PascalString(FScratch + '/control/slow-started')
     + ', fmCreate).Free;'#10
@@ -249,12 +292,19 @@ begin
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'pending-ran', 0);
   Started := Now;
-  R := RunTests(['--jobs=2']);
+  R := RunTests(['--jobs=2', '--bail=1']);
   Expect<Integer>(R.ExitCode).ToBe(1);
   Expect<Boolean>((Now - Started) * 86400 < 12).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/slow-started')).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/slow-completed')).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/control/pending-ran')).ToBe(False);
+  Expect<Boolean>(FileExists(FScratch + '/control/grandchild-pid')).ToBe(True);
+  GrandchildPID := StrToInt(Trim(ReadBinaryFile(
+    FScratch + '/control/grandchild-pid')));
+  Started := Now;
+  while ProcessIsRunning(GrandchildPID)
+    and ((Now - Started) * 86400 < 3) do Sleep(10);
+  Expect<Boolean>(ProcessIsRunning(GrandchildPID)).ToBe(False);
   Expect<Boolean>(Pos('A.Slow.Test.pas ... cancelled', R.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('B.Fail.Test.pas ... FAIL (exit 1)', R.Stdout) > 0)

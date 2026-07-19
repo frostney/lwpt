@@ -12,7 +12,8 @@ uses
   Process,
   SysUtils,
 
-  LWPT.Core;
+  LWPT.Core,
+  Platform;
 
 type
   { Public so the cross-platform cancellation/reaping contract can be tested
@@ -21,6 +22,7 @@ type
   private
     FExecutable: string;
     FProcess: TProcess;
+    FProcessTree: TLWPTProcessTree;
     FCancelled: Boolean;
     FCriticalSection: TRTLCriticalSection;
   public
@@ -46,8 +48,7 @@ uses
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.Manifest,
-  LWPT.WorkerBudget,
-  Platform;
+  LWPT.WorkerBudget;
 
 const
   BUILD_TARGET_ENV = PROJECT_NAME + '_BUILD_TARGET';
@@ -144,6 +145,7 @@ begin
   inherited Create;
   FExecutable := AExecutable;
   FProcess := nil;
+  FProcessTree := nil;
   FCancelled := False;
   InitCriticalSection(FCriticalSection);
 end;
@@ -155,20 +157,22 @@ begin
   inherited Destroy;
 end;
 
-{ Each worker owns one compiler process. Output is drained while the process
-  runs and retained by the worker so the scheduler can replay it in manifest
-  order. Cancel terminates the active child; Run always waits before clearing
-  FProcess, so Unix and Windows both reap the process before the worker ends. }
+{ Each worker owns one compiler process tree. Output is drained while the
+  direct process runs and retained by the worker so the scheduler can replay
+  it in manifest order. Cancel terminates the whole tree; Run always waits
+  before clearing FProcess, so both platforms reap the direct process before
+  the worker ends. }
 function TLWPTCompilerProcess.Run(const AArgs: LWPT.Core.TStringArray;
   out AOutput: string): Integer;
 var
   P: TProcess;
+  ProcessTree: TLWPTProcessTree;
   Buf: array[0..4095] of Byte;
   i, N: Integer;
-  TerminateAfterStart: Boolean;
 begin
   AOutput := '';
   P := TProcess.Create(nil);
+  ProcessTree := nil;
   try
     if FExecutable <> '' then
       P.Executable := FExecutable
@@ -177,30 +181,23 @@ begin
     for i := 0 to High(AArgs) do
       P.Parameters.Add(AArgs[i]);
     P.Options := [poUsePipes, poStderrToOutPut];
+    ProcessTree := TLWPTProcessTree.Create(P);
     EnterCriticalSection(FCriticalSection);
     try
       if FCancelled then
         raise ELWPTError.Create('compiler process cancelled');
-    finally
-      LeaveCriticalSection(FCriticalSection);
-    end;
-    P.Execute;
-    { Cancel may race the small process-start window. Publish the live
-      handle only after Execute, then honour any cancellation that arrived
-      while no terminable child existed. }
-    EnterCriticalSection(FCriticalSection);
-    try
       FProcess := P;
-      TerminateAfterStart := FCancelled;
+      FProcessTree := ProcessTree;
+      try
+        ProcessTree.Execute;
+      except
+        FProcess := nil;
+        FProcessTree := nil;
+        raise;
+      end;
     finally
       LeaveCriticalSection(FCriticalSection);
     end;
-    if TerminateAfterStart then
-      try
-        P.Terminate(1);
-      except
-        { The child may already have exited. }
-      end;
     repeat
       N := P.Output.Read(Buf[0], SizeOf(Buf));
       if N > 0 then
@@ -220,10 +217,15 @@ begin
   finally
     EnterCriticalSection(FCriticalSection);
     try
-      if FProcess = P then FProcess := nil;
+      if FProcess = P then
+      begin
+        FProcess := nil;
+        FProcessTree := nil;
+      end;
     finally
       LeaveCriticalSection(FCriticalSection);
     end;
+    ProcessTree.Free;
     P.Free;
   end;
 end;
@@ -233,9 +235,9 @@ begin
   EnterCriticalSection(FCriticalSection);
   try
     FCancelled := True;
-    if Assigned(FProcess) then
+    if Assigned(FProcessTree) then
       try
-        FProcess.Terminate(1);
+        FProcessTree.Terminate;
       except
         { The child may have exited between discovery and termination. }
       end;
