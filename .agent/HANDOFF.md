@@ -2,53 +2,66 @@
 
 ## Current task
 
-Address the nine pre-merge review findings on issue #41 observability without
-disturbing the stacked #73 process-tree changes. Do not commit, push, or open a
-PR.
+Close the residual adversarial orphan window in issue #73 on the combined
+`claude/lwpt-41-observability` branch. Do not commit, push, or open a PR.
 
 ## Completed
 
-- Clamped `LWPT_HEARTBEAT_INTERVAL_MS` to the 30-second default ceiling.
-- Heartbeats now include pending/queued build and test work; a fully contended
-  build regression test passes.
-- Successful job logs remain under their printed session references while
-  compiler and hook staging is removed; the successful-log existence regression
-  passes.
-- Build and test summaries now run from outer `finally` blocks, including setup,
-  hook, cleanup, validation, and collision failures.
-- Applied the requested PascalCase constants, `const` parameters, minimal API,
-  named protocol literals, and test-name/timing cleanup.
-- Preserved the #73 process-tree code and stayed within the requested production
-  and integration-test files.
+- Managed children inherit an internal process-tree marker. A top-level Unix
+  signal retains the graceful SIGTERM, 250 ms grace, SIGKILL path; a marked
+  nested LWPT immediately SIGKILLs every registered group, then polls all of
+  them against one shared 100 ms deadline before re-raising the signal.
+- Per-tree locks no longer cover sleep/poll intervals, allowing forwarded
+  immediate teardown to pre-empt a simultaneous scheduler cancellation.
+- Registered-tree termination now aggregates and reports real failures. Direct
+  build and test cancellation retain failures as build cancellation errors and
+  `tjsWorkerError`, respectively. ADR-0025 records the remaining lack of a
+  cross-process acknowledgement channel.
+- Signal forwarding is installed only on build/test dispatch paths.
+- Windows build/test dispatch installs a minimal `SetConsoleCtrlHandler`
+  callback. It signals a Win32 event; an FPC-created thread performs Job Object
+  teardown and exits. A Windows-only new-console Ctrl-C regression was added.
+- Added the adversarial nested compiler proxy that ignores SIGTERM and asserts
+  the compiler is already gone when the outer command returns.
+- Added the cross-platform normal-exit regression proving that freeing a
+  successful process tree does not kill a still-live descendant.
+- Applied the requested naming, environment-helper, manifest/project constant,
+  self-pipe index, shared timing-constant, and `const` parameter cleanups.
+- Updated ADR-0025. No #41 heartbeat, logging, or summary behavior changed.
 
 ## Verification
 
-- FPC verified live: `3.2.2`.
-- `./build/lwpt install --frozen`: pass, 5 packages verified.
-- `./build/lwpt format`: pass, 0 of 80 files formatted.
-- `./build/lwpt format --check`: pass, 80 files correctly formatted.
+- FPC verified live: `3.2.2` (`aarch64-darwin`).
+- `./build/lwpt install --frozen`: pass; 5 packages and both hashes verified.
+- `./build/lwpt format`: pass; 0 of 82 files formatted.
+- `./build/lwpt format --check`: pass; all 82 files correctly formatted.
 - `./build/lwpt build --clean`: pass with
-  `LWPT_WORKER_STATE_DIR=/private/tmp/lwpt-review-41-workers`; summary was
+  `LWPT_WORKER_STATE_DIR=/private/tmp/lwpt-worker-state-4`; summary:
   `1 built, 0 failed, 0 skipped`.
 - `./build/lwpt test`: completed with the same writable worker-state override;
-  27 passed, 1 failed, 5 skipped. The only failure is the unrelated HTTPClient
-  mock-server suite: all five cases fail at `bind()` because the harness forbids
-  listening sockets. `BuildSessions.Test` passed 11/11 and
-  `TestScheduling.Test` passed 8/8.
+  27 passed, 1 failed, 5 skipped. The only failure remains the unrelated
+  HTTPClient mock-server suite: all five cases fail at `bind()` because this
+  harness forbids listening sockets.
+- `TestScheduling.Test`: 12/12 passed, including
+  `bail reaps nested LWPT compiler that ignores SIGTERM`.
+- `LWPT.Command.Build.Test`: 9/9 passed, including
+  `compiler normal exit leaves a live descendant alone`.
+- `./build/lwpt --version`: pass (`lwpt 0.2.0`), covering a non-spawning command
+  after lazy forwarding installation.
 - `git diff --check`: pass.
-- Manual validation failure check:
-  `build definitely-not-a-target` printed
-  `summary: 0 built, 1 failed, 0 skipped; elapsed 38 ms`.
 
-## Open item
+## Open items
 
-Re-run `./build/lwpt test` in an environment that permits localhost listening
-sockets to obtain a fully green project gate. No code change is indicated by
-the observed HTTPClient failures.
+- Run the Windows CI legs to compile and execute the new console-control path;
+  no Windows cross-compiler is installed in this worktree.
+- Re-run the complete suite in an environment that permits localhost listening
+  sockets to obtain a fully green HTTPClient gate. No code change is indicated
+  by the observed bind failures.
 
 ## Deferred follow-ups
 
-- Extract a shared progress reporter / observability unit.
-- Replace index-aligned scheduler arrays with an execution object.
-- Stream pipe output into logs instead of buffering it.
-- Remove the legacy `CmdBuild` overload if compatibility permits.
+- Typed Windows process-tree state class.
+- Convert `TTestJob` to an object and split scheduling integration coverage.
+- Share the bounded platform poll loop.
+- Add a cross-process cancellation acknowledgement protocol if parents must
+  distinguish nested teardown failure from the requested signal exit.

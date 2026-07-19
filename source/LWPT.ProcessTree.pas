@@ -10,7 +10,9 @@ interface
 
 uses
   Process,
-  SysUtils;
+  SysUtils,
+
+  LWPT.Core;
 
 type
   TLWPTProcessTree = class
@@ -18,12 +20,16 @@ type
     FProcess: TProcess;
     FPlatformState: Pointer;
     FRegistered: Boolean;
+    FImmediateTerminationRequested: LongInt;
     FTerminationCriticalSection: TRTLCriticalSection;
     {$IFDEF UNIX}
     procedure HandleFork(ASender: TObject);
     {$ENDIF}
     procedure RegisterActive;
     procedure UnregisterActive;
+    procedure MarkManagedChild;
+    procedure BeginForwardedTermination;
+    procedure WaitForForwardedTermination(const ADeadline: QWord);
     procedure TryTerminateDirectChild;
     {$IFDEF MSWINDOWS}
     procedure TerminateCreatedProcess;
@@ -52,10 +58,12 @@ const
   ProcessTreeTerminateGraceMilliseconds = 250;
   ProcessTreeTerminatePollMilliseconds = 10;
   ProcessTreeReapTimeoutMilliseconds = 3000;
+  ForwardedReapTimeoutMilliseconds = 100;
   ProcessTreeSetupExitCode = 127;
   ProcessTreeCancellationExitCode = 1;
   SignalExitCodeBase = 128;
   ProcessGroupSetupError = 'process tree isolation setup failed'#10;
+  ManagedProcessTreeEnvironment = PROJECT_NAME + '_PROCESS_TREE_PARENT';
 
   {$IFDEF MSWINDOWS}
   JobObjectBasicAccountingInformationClass = 1;
@@ -65,8 +73,13 @@ const
 var
   ActiveProcessTrees: TList;
   ActiveProcessTreesCriticalSection: TRTLCriticalSection;
+  SignalForwardingInstalled: Boolean = False;
 
 {$IFDEF UNIX}
+const
+  SignalPipeReadEnd = 0;
+  SignalPipeWriteEnd = 1;
+
 type
   TLWPTSignalForwarder = class(TThread)
   protected
@@ -74,7 +87,6 @@ type
   end;
 
 var
-  SignalForwardingInstalled: Boolean = False;
   SignalForwarder: TLWPTSignalForwarder = nil;
   SignalPipe: TFilDes;
 
@@ -127,6 +139,19 @@ type
   end;
 {$PACKRECORDS DEFAULT}
 
+type
+  TLWPTConsoleControlForwarder = class(TThread)
+  protected
+    procedure Execute; override;
+  end;
+
+const
+  WindowsControlExitCode = DWORD($C000013A);
+
+var
+  ConsoleControlEvent: THandle = 0;
+  ConsoleControlForwarder: TLWPTConsoleControlForwarder = nil;
+
 function LWPTCreateJobObject(const ASecurityAttributes: Pointer;
   const AName: PWideChar): THandle; stdcall;
   external 'kernel32.dll' name 'CreateJobObjectW';
@@ -146,6 +171,15 @@ function WindowsProcessTreeState(
 begin
   Result := PLWPTWindowsProcessTreeState(APlatformState);
 end;
+{$ENDIF}
+
+{$IFDEF UNIX}
+function ProcessGroupExists(const AProcessGroupID: LongInt;
+  out AErrorCode: Integer): Boolean; forward;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+function JobHasActiveProcesses(const AJobHandle: THandle): Boolean; forward;
 {$ENDIF}
 
 procedure TLWPTProcessTree.RegisterActive;
@@ -185,6 +219,7 @@ begin
   FProcess := AProcess;
   FPlatformState := nil;
   FRegistered := False;
+  FImmediateTerminationRequested := 0;
   {$IFDEF UNIX}
   FProcess.OnForkEvent := HandleFork;
   {$ENDIF}
@@ -201,6 +236,39 @@ begin
     retaining inherited membership in an enclosing LWPT or host job. }
   FProcess.Options := FProcess.Options + [poRunSuspended];
   {$ENDIF}
+end;
+
+function EnvironmentEntryName(const AEntry: string): string;
+var
+  Separator: Integer;
+begin
+  Separator := Pos('=', AEntry);
+  if Separator = 0 then Result := AEntry
+  else Result := Copy(AEntry, 1, Separator - 1);
+end;
+
+function EnvironmentNamesEqual(const ALeft, ARight: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := SameText(ALeft, ARight);
+  {$ELSE}
+  Result := ALeft = ARight;
+  {$ENDIF}
+end;
+
+procedure TLWPTProcessTree.MarkManagedChild;
+var
+  EnvironmentIndex: Integer;
+begin
+  if FProcess.Environment.Count = 0 then
+    for EnvironmentIndex := 1 to GetEnvironmentVariableCount do
+      FProcess.Environment.Add(GetEnvironmentString(EnvironmentIndex));
+  for EnvironmentIndex := FProcess.Environment.Count - 1 downto 0 do
+    if EnvironmentNamesEqual(
+      EnvironmentEntryName(FProcess.Environment[EnvironmentIndex]),
+      ManagedProcessTreeEnvironment) then
+      FProcess.Environment.Delete(EnvironmentIndex);
+  FProcess.Environment.Add(ManagedProcessTreeEnvironment + '=1');
 end;
 
 destructor TLWPTProcessTree.Destroy;
@@ -272,6 +340,7 @@ var
 begin
   { Registration precedes the spawn. The termination lock then makes a signal
     arriving during Execute wait until the new group/job is fully addressable. }
+  MarkManagedChild;
   RegisterActive;
   try
     EnterCriticalSection(FTerminationCriticalSection);
@@ -320,6 +389,100 @@ begin
     UnregisterActive;
     raise;
   end;
+end;
+
+procedure TLWPTProcessTree.BeginForwardedTermination;
+{$IFDEF UNIX}
+var
+  ErrorCode, ProcessGroupID: Integer;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  ErrorCode: DWORD;
+  State: PLWPTWindowsProcessTreeState;
+{$ENDIF}
+begin
+  InterlockedExchange(FImmediateTerminationRequested, 1);
+  EnterCriticalSection(FTerminationCriticalSection);
+  try
+    {$IFDEF UNIX}
+    ProcessGroupID := FProcess.ProcessID;
+    if ProcessGroupID <= 0 then Exit;
+    if FpKill(-ProcessGroupID, SIGKILL) <> 0 then
+    begin
+      ErrorCode := FpGetErrNo;
+      if ErrorCode = ESysESRCH then Exit;
+      TryTerminateDirectChild;
+      raise EOSError.CreateFmt('could not kill process tree: %s',
+        [SysErrorMessage(ErrorCode)]);
+    end;
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    State := WindowsProcessTreeState(FPlatformState);
+    if not Assigned(State) or (State^.JobHandle = 0) then Exit;
+    if not JobHasActiveProcesses(State^.JobHandle) then Exit;
+    if not LWPTTerminateJobObject(State^.JobHandle,
+      ProcessTreeCancellationExitCode) then
+    begin
+      ErrorCode := Windows.GetLastError;
+      if not JobHasActiveProcesses(State^.JobHandle) then Exit;
+      TryTerminateDirectChild;
+      raise EOSError.CreateFmt('could not terminate process Job Object: %s',
+        [SysErrorMessage(ErrorCode)]);
+    end;
+    {$ENDIF}
+  finally
+    LeaveCriticalSection(FTerminationCriticalSection);
+  end;
+end;
+
+procedure TLWPTProcessTree.WaitForForwardedTermination(
+  const ADeadline: QWord);
+{$IFDEF UNIX}
+var
+  ErrorCode, ProcessGroupID: Integer;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  State: PLWPTWindowsProcessTreeState;
+{$ENDIF}
+begin
+  EnterCriticalSection(FTerminationCriticalSection);
+  try
+    {$IFDEF UNIX}
+    ProcessGroupID := FProcess.ProcessID;
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    State := WindowsProcessTreeState(FPlatformState);
+    {$ENDIF}
+  finally
+    LeaveCriticalSection(FTerminationCriticalSection);
+  end;
+  {$IFDEF UNIX}
+  if ProcessGroupID <= 0 then Exit;
+  while ProcessGroupExists(ProcessGroupID, ErrorCode)
+    and (GetTickCount64 < ADeadline) do
+    Sleep(ProcessTreeTerminatePollMilliseconds);
+  if ProcessGroupExists(ProcessGroupID, ErrorCode) then
+  begin
+    TryTerminateDirectChild;
+    raise EOSError.CreateFmt(
+      'process group %d still had members after forwarded termination',
+      [ProcessGroupID]);
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  if not Assigned(State) or (State^.JobHandle = 0) then Exit;
+  while JobHasActiveProcesses(State^.JobHandle)
+    and (GetTickCount64 < ADeadline) do
+    Sleep(ProcessTreeTerminatePollMilliseconds);
+  if JobHasActiveProcesses(State^.JobHandle) then
+  begin
+    TryTerminateDirectChild;
+    raise EOSError.Create(
+      'process Job Object still had active processes after forwarded termination');
+  end;
+  {$ENDIF}
 end;
 
 procedure TLWPTProcessTree.TryTerminateDirectChild;
@@ -405,7 +568,9 @@ end;
 procedure TLWPTProcessTree.Terminate;
 {$IFDEF UNIX}
 var
-  ErrorCode, ProcessGroupID, WaitedMilliseconds: Integer;
+  ErrorCode, ProcessGroupID, ReapTimeoutMilliseconds,
+    WaitedMilliseconds: Integer;
+  ImmediateTermination: Boolean;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
@@ -418,38 +583,15 @@ begin
     {$IFDEF UNIX}
     ProcessGroupID := FProcess.ProcessID;
     if ProcessGroupID <= 0 then Exit;
-    if FpKill(-ProcessGroupID, SIGTERM) <> 0 then
+    ImmediateTermination := FImmediateTerminationRequested <> 0;
+    if (not ImmediateTermination)
+       and (FpKill(-ProcessGroupID, SIGTERM) <> 0) then
     begin
       ErrorCode := FpGetErrNo;
       if ErrorCode = ESysESRCH then Exit;
       TryTerminateDirectChild;
       raise EOSError.CreateFmt('could not terminate process tree: %s',
         [SysErrorMessage(ErrorCode)]);
-    end;
-
-    WaitedMilliseconds := 0;
-    while ProcessGroupExists(ProcessGroupID, ErrorCode)
-      and (WaitedMilliseconds < ProcessTreeTerminateGraceMilliseconds) do
-    begin
-      Sleep(ProcessTreeTerminatePollMilliseconds);
-      Inc(WaitedMilliseconds, ProcessTreeTerminatePollMilliseconds);
-    end;
-    if not ProcessGroupExists(ProcessGroupID, ErrorCode) then Exit;
-
-    if FpKill(-ProcessGroupID, SIGKILL) <> 0 then
-    begin
-      ErrorCode := FpGetErrNo;
-      if ErrorCode = ESysESRCH then Exit;
-      TryTerminateDirectChild;
-      raise EOSError.CreateFmt('could not kill process tree: %s',
-        [SysErrorMessage(ErrorCode)]);
-    end;
-    try
-      WaitForProcessGroupEmpty(ProcessGroupID,
-        ProcessTreeReapTimeoutMilliseconds);
-    except
-      TryTerminateDirectChild;
-      raise;
     end;
     {$ENDIF}
     {$IFDEF MSWINDOWS}
@@ -465,50 +607,142 @@ begin
       raise EOSError.CreateFmt('could not terminate process Job Object: %s',
         [SysErrorMessage(ErrorCode)]);
     end;
-    try
-      WaitForJobEmpty(State^.JobHandle, ProcessTreeReapTimeoutMilliseconds);
-    except
-      TryTerminateDirectChild;
-      raise;
-    end;
     {$ENDIF}
   finally
     LeaveCriticalSection(FTerminationCriticalSection);
   end;
+  {$IFDEF UNIX}
+  WaitedMilliseconds := 0;
+  while (FImmediateTerminationRequested = 0)
+    and ProcessGroupExists(ProcessGroupID, ErrorCode)
+    and (WaitedMilliseconds < ProcessTreeTerminateGraceMilliseconds) do
+  begin
+    Sleep(ProcessTreeTerminatePollMilliseconds);
+    Inc(WaitedMilliseconds, ProcessTreeTerminatePollMilliseconds);
+  end;
+  if not ProcessGroupExists(ProcessGroupID, ErrorCode) then Exit;
+
+  EnterCriticalSection(FTerminationCriticalSection);
+  try
+    if FpKill(-ProcessGroupID, SIGKILL) <> 0 then
+    begin
+      ErrorCode := FpGetErrNo;
+      if ErrorCode = ESysESRCH then Exit;
+      TryTerminateDirectChild;
+      raise EOSError.CreateFmt('could not kill process tree: %s',
+        [SysErrorMessage(ErrorCode)]);
+    end;
+  finally
+    LeaveCriticalSection(FTerminationCriticalSection);
+  end;
+  ReapTimeoutMilliseconds := ProcessTreeReapTimeoutMilliseconds;
+  if FImmediateTerminationRequested <> 0 then
+    ReapTimeoutMilliseconds := ForwardedReapTimeoutMilliseconds;
+  try
+    WaitForProcessGroupEmpty(ProcessGroupID, ReapTimeoutMilliseconds);
+  except
+    TryTerminateDirectChild;
+    raise;
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  try
+    WaitForJobEmpty(State^.JobHandle, ProcessTreeReapTimeoutMilliseconds);
+  except
+    TryTerminateDirectChild;
+    raise;
+  end;
+  {$ENDIF}
 end;
 
-{$IFDEF UNIX}
-procedure TerminateRegisteredProcessTrees;
+procedure TerminateRegisteredProcessTrees(const AImmediate: Boolean);
 var
+  Deadline: QWord;
+  FirstFailure: string;
   Index: Integer;
+
+  procedure RecordFailure(const AMessage: string);
+  begin
+    if FirstFailure = '' then FirstFailure := AMessage;
+  end;
 begin
-  { This runs on the dedicated self-pipe reader, not in an async handler.
-    Holding the registry lock pins each object until bounded termination ends. }
+  FirstFailure := '';
+  { This runs on a dedicated forwarding thread, not in an async Unix handler.
+    Holding the registry lock pins each object until bounded termination ends.
+    Forwarded teardown kills every tree before polling any one of them, and all
+    polls share one deadline shorter than the ancestor's graceful window. }
   EnterCriticalSection(ActiveProcessTreesCriticalSection);
   try
-    for Index := 0 to ActiveProcessTrees.Count - 1 do
-      try
-        TLWPTProcessTree(ActiveProcessTrees[Index]).Terminate;
-      except
-        { The original signal must retain its default process-level outcome.
-          Continue so one failed tree does not prevent best-effort forwarding
-          to the remaining nested schedulers. }
-      end;
+    if AImmediate then
+    begin
+      Deadline := GetTickCount64 + ForwardedReapTimeoutMilliseconds;
+      for Index := 0 to ActiveProcessTrees.Count - 1 do
+        try
+          TLWPTProcessTree(ActiveProcessTrees[Index])
+            .BeginForwardedTermination;
+        except
+          on E: Exception do RecordFailure(E.Message);
+        end;
+      for Index := 0 to ActiveProcessTrees.Count - 1 do
+        try
+          TLWPTProcessTree(ActiveProcessTrees[Index])
+            .WaitForForwardedTermination(Deadline);
+        except
+          on E: Exception do RecordFailure(E.Message);
+        end;
+    end
+    else
+      for Index := 0 to ActiveProcessTrees.Count - 1 do
+        try
+          TLWPTProcessTree(ActiveProcessTrees[Index]).Terminate;
+        except
+          on E: Exception do RecordFailure(E.Message);
+        end;
   finally
     LeaveCriticalSection(ActiveProcessTreesCriticalSection);
   end;
+  if FirstFailure <> '' then
+    raise EOSError.Create(FirstFailure);
 end;
 
+procedure ReportForwardingFailure(const AMessage: string);
+{$IFDEF UNIX}
+var
+  OutputLine: string;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  OutputLine := 'process-tree signal forwarding failed: ' + AMessage
+    + LineEnding;
+  FpWrite(StdErrorHandle, OutputLine[1], Length(OutputLine));
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  WriteLn(ErrOutput, 'process-tree console-control forwarding failed: ',
+    AMessage);
+  Flush(ErrOutput);
+  {$ENDIF}
+end;
+
+{$IFDEF UNIX}
 procedure TLWPTSignalForwarder.Execute;
 var
   BytesRead, ReceivedSignal: LongInt;
   SignalSet: sigset_t;
 begin
   repeat
-    BytesRead := FpRead(SignalPipe[0], ReceivedSignal,
+    BytesRead := FpRead(SignalPipe[SignalPipeReadEnd], ReceivedSignal,
       SizeOf(ReceivedSignal));
   until BytesRead = SizeOf(ReceivedSignal);
-  TerminateRegisteredProcessTrees;
+  try
+    TerminateRegisteredProcessTrees(
+      GetEnvironmentVariable(ManagedProcessTreeEnvironment) = '1');
+  except
+    on E: Exception do
+    begin
+      ReportForwardingFailure(E.Message);
+      FpExit(ProcessTreeCancellationExitCode);
+    end;
+  end;
   { Restore the default disposition before re-sending the original signal so
     shells and ancestor schedulers observe the original form of death. }
   FpSigEmptySet(SignalSet);
@@ -524,7 +758,34 @@ begin
   { write(2) is async-signal-safe. The pipe is nonblocking, and one complete
     LongInt write is below PIPE_BUF; if repeated signals fill it, an earlier
     queued signal already guarantees that forwarding will run. }
-  FpWrite(SignalPipe[1], ASignal, SizeOf(ASignal));
+  FpWrite(SignalPipe[SignalPipeWriteEnd], ASignal, SizeOf(ASignal));
+end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+procedure TLWPTConsoleControlForwarder.Execute;
+begin
+  Windows.WaitForSingleObject(ConsoleControlEvent, Windows.INFINITE);
+  try
+    TerminateRegisteredProcessTrees(True);
+  except
+    on E: Exception do
+    begin
+      ReportForwardingFailure(E.Message);
+      Windows.ExitProcess(ProcessTreeCancellationExitCode);
+    end;
+  end;
+  Windows.ExitProcess(WindowsControlExitCode);
+end;
+
+function ProcessTreeConsoleControlHandler(AControlType: DWORD): BOOL; stdcall;
+begin
+  Result := False;
+  if (AControlType <> Windows.CTRL_C_EVENT)
+     and (AControlType <> Windows.CTRL_BREAK_EVENT) then Exit;
+  { The OS invokes this callback on an unmanaged thread. Keep it to the
+    async-safe Win32 event operation; an FPC-created thread owns all RTL work. }
+  Result := Windows.SetEvent(ConsoleControlEvent);
 end;
 {$ENDIF}
 
@@ -548,9 +809,9 @@ begin
       [SysErrorMessage(ErrorCode)]);
   end;
   try
-    if (FpFcntl(SignalPipe[0], F_SetFD, FD_CLOEXEC) < 0)
-       or (FpFcntl(SignalPipe[1], F_SetFD, FD_CLOEXEC) < 0)
-       or (FpFcntl(SignalPipe[1], F_SetFl, O_NONBLOCK) < 0) then
+    if (FpFcntl(SignalPipe[SignalPipeReadEnd], F_SetFD, FD_CLOEXEC) < 0)
+       or (FpFcntl(SignalPipe[SignalPipeWriteEnd], F_SetFD, FD_CLOEXEC) < 0)
+       or (FpFcntl(SignalPipe[SignalPipeWriteEnd], F_SetFl, O_NONBLOCK) < 0) then
     begin
       ErrorCode := FpGetErrNo;
       raise EOSError.CreateFmt(
@@ -574,8 +835,31 @@ begin
       CSignal(SIGINT, PreviousInterruptHandler);
     if TerminateHandlerInstalled then
       CSignal(SIGTERM, PreviousTerminateHandler);
-    FpClose(SignalPipe[0]);
-    FpClose(SignalPipe[1]);
+    FpClose(SignalPipe[SignalPipeReadEnd]);
+    FpClose(SignalPipe[SignalPipeWriteEnd]);
+    raise;
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  if SignalForwardingInstalled then Exit;
+  ConsoleControlEvent := Windows.CreateEvent(nil, True, False, nil);
+  if ConsoleControlEvent = 0 then RaiseLastOSError;
+  if not Windows.SetConsoleCtrlHandler(@ProcessTreeConsoleControlHandler,
+    True) then
+  begin
+    Windows.CloseHandle(ConsoleControlEvent);
+    ConsoleControlEvent := 0;
+    RaiseLastOSError;
+  end;
+  try
+    ConsoleControlForwarder := TLWPTConsoleControlForwarder.Create(True);
+    ConsoleControlForwarder.FreeOnTerminate := False;
+    ConsoleControlForwarder.Start;
+    SignalForwardingInstalled := True;
+  except
+    Windows.SetConsoleCtrlHandler(@ProcessTreeConsoleControlHandler, False);
+    Windows.CloseHandle(ConsoleControlEvent);
+    ConsoleControlEvent := 0;
     raise;
   end;
   {$ENDIF}

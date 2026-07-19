@@ -97,8 +97,8 @@ type
   public
     constructor Create(const AManifestPath: string;
       const AManifest: TManifest; const AManifestContentHash: string;
-      const ATarget: TBuildTarget; ARelease, AClean: Boolean;
-      ASession: TLWPTBuildSession; ALease: TLWPTWorkerLease);
+      const ATarget: TBuildTarget; const ARelease, AClean: Boolean;
+      const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease);
     destructor Destroy; override;
     procedure Cancel;
     function IsDone: Boolean;
@@ -179,7 +179,7 @@ var
   P: TProcess;
   ProcessTree: TLWPTProcessTree;
   Buf: array[0..4095] of Byte;
-  i, N: Integer;
+  ArgumentIndex, N: Integer;
 begin
   AOutput := '';
   P := TProcess.Create(nil);
@@ -189,8 +189,8 @@ begin
       P.Executable := FExecutable
     else
       P.Executable := FPCExecutable;
-    for i := 0 to High(AArgs) do
-      P.Parameters.Add(AArgs[i]);
+    for ArgumentIndex := 0 to High(AArgs) do
+      P.Parameters.Add(AArgs[ArgumentIndex]);
     P.Options := [poUsePipes, poStderrToOutPut];
     ProcessTree := TLWPTProcessTree.Create(P);
     EnterCriticalSection(FCriticalSection);
@@ -703,8 +703,8 @@ end;
 
 constructor TLWPTBuildJob.Create(const AManifestPath: string;
   const AManifest: TManifest; const AManifestContentHash: string;
-  const ATarget: TBuildTarget; ARelease, AClean: Boolean;
-  ASession: TLWPTBuildSession; ALease: TLWPTWorkerLease);
+  const ATarget: TBuildTarget; const ARelease, AClean: Boolean;
+  const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
@@ -1122,26 +1122,26 @@ var
   procedure StopAndFreeJobs;
   var
     CancellationFailure: string;
-    TargetIndex: Integer;
+    JobIndex: Integer;
   begin
     CancellationFailure := '';
-    for TargetIndex := 0 to High(Jobs) do
-      if Assigned(Jobs[TargetIndex])
-         and (not Jobs[TargetIndex].IsDone) then
-        Jobs[TargetIndex].Cancel;
-    for TargetIndex := 0 to High(Jobs) do
-      if Assigned(Jobs[TargetIndex]) then
+    for JobIndex := 0 to High(Jobs) do
+      if Assigned(Jobs[JobIndex])
+         and (not Jobs[JobIndex].IsDone) then
+        Jobs[JobIndex].Cancel;
+    for JobIndex := 0 to High(Jobs) do
+      if Assigned(Jobs[JobIndex]) then
       begin
-        Jobs[TargetIndex].WaitFor;
-        if Jobs[TargetIndex].CancellationError <> '' then
+        Jobs[JobIndex].WaitFor;
+        if Jobs[JobIndex].CancellationError <> '' then
         begin
-          if States[TargetIndex] <> tsFailed then Inc(Failed);
-          States[TargetIndex] := tsFailed;
-          Errors[TargetIndex] := Jobs[TargetIndex].CancellationError;
+          if States[JobIndex] <> tsFailed then Inc(Failed);
+          States[JobIndex] := tsFailed;
+          Errors[JobIndex] := Jobs[JobIndex].CancellationError;
           if CancellationFailure = '' then
-            CancellationFailure := Jobs[TargetIndex].CancellationError;
+            CancellationFailure := Jobs[JobIndex].CancellationError;
         end;
-        FreeAndNil(Jobs[TargetIndex]);
+        FreeAndNil(Jobs[JobIndex]);
       end;
     if CancellationFailure <> '' then
       raise ELWPTError.Create(CancellationFailure);

@@ -85,24 +85,27 @@ type
     FTerminalReported: array of Boolean;
     function ClaimJob(out AIndex: Integer): Boolean;
     function AcquireLease: TLWPTWorkerLease;
-    function StartProcess(AIndex: Integer;
-      AProcessTree: TLWPTProcessTree): Boolean;
-    procedure FinishProcess(AIndex: Integer;
-      AProcessTree: TLWPTProcessTree);
-    function RunProcess(AIndex: Integer; AProcess: TProcess;
+    function StartProcess(const AIndex: Integer;
+      const AProcessTree: TLWPTProcessTree): Boolean;
+    procedure FinishProcess(const AIndex: Integer;
+      const AProcessTree: TLWPTProcessTree);
+    function RunProcess(const AIndex: Integer; const AProcess: TProcess;
       out AOutput: string): Integer;
-    procedure SetJobStage(AIndex: Integer; AStatus: TTestJobStatus;
+    procedure SetJobStage(const AIndex: Integer;
+      const AStatus: TTestJobStatus;
       const ABinary: string = '');
-    procedure SetJobOutput(AIndex: Integer; ACompileStage: Boolean;
+    procedure SetJobOutput(const AIndex: Integer;
+      const ACompileStage: Boolean;
       const AOutput: string);
-    procedure CompleteJob(AIndex: Integer; AStatus: TTestJobStatus;
-      AExitCode: Integer = 0);
-    procedure FailJob(AIndex: Integer; AStatus: TTestJobStatus;
-      AExitCode: Integer; const AMessage: string = '');
-    procedure AbortWithError(AIndex: Integer; const AMessage: string);
+    procedure CompleteJob(const AIndex: Integer;
+      const AStatus: TTestJobStatus; const AExitCode: Integer = 0);
+    procedure FailJob(const AIndex: Integer; const AStatus: TTestJobStatus;
+      const AExitCode: Integer; const AMessage: string = '');
+    procedure AbortWithError(const AIndex: Integer; const AMessage: string);
     procedure CancelPendingAndActiveLocked;
     function IsCancelled: Boolean;
-    procedure RunOne(AIndex: Integer; ALease: TLWPTWorkerLease);
+    procedure RunOne(const AIndex: Integer;
+      const ALease: TLWPTWorkerLease);
     function AllJobsTerminal: Boolean;
     function NextProgressEvent(out AEvent: TTestProgressEvent): Boolean;
     function ActiveJobSummary(const ANow: QWord): string;
@@ -311,8 +314,8 @@ begin
   end;
 end;
 
-function TTestScheduler.StartProcess(AIndex: Integer;
-  AProcessTree: TLWPTProcessTree): Boolean;
+function TTestScheduler.StartProcess(const AIndex: Integer;
+  const AProcessTree: TLWPTProcessTree): Boolean;
 begin
   Result := False;
   EnterCriticalSection(FCriticalSection);
@@ -331,8 +334,8 @@ begin
   end;
 end;
 
-procedure TTestScheduler.FinishProcess(AIndex: Integer;
-  AProcessTree: TLWPTProcessTree);
+procedure TTestScheduler.FinishProcess(const AIndex: Integer;
+  const AProcessTree: TLWPTProcessTree);
 begin
   EnterCriticalSection(FCriticalSection);
   try
@@ -343,8 +346,8 @@ begin
   end;
 end;
 
-function TTestScheduler.RunProcess(AIndex: Integer; AProcess: TProcess;
-  out AOutput: string): Integer;
+function TTestScheduler.RunProcess(const AIndex: Integer;
+  const AProcess: TProcess; out AOutput: string): Integer;
 var
   ProcessTree: TLWPTProcessTree;
 begin
@@ -378,8 +381,8 @@ begin
   end;
 end;
 
-procedure TTestScheduler.SetJobStage(AIndex: Integer;
-  AStatus: TTestJobStatus; const ABinary: string);
+procedure TTestScheduler.SetJobStage(const AIndex: Integer;
+  const AStatus: TTestJobStatus; const ABinary: string);
 begin
   EnterCriticalSection(FCriticalSection);
   try
@@ -395,8 +398,8 @@ begin
   end;
 end;
 
-procedure TTestScheduler.SetJobOutput(AIndex: Integer;
-  ACompileStage: Boolean; const AOutput: string);
+procedure TTestScheduler.SetJobOutput(const AIndex: Integer;
+  const ACompileStage: Boolean; const AOutput: string);
 begin
   EnterCriticalSection(FCriticalSection);
   try
@@ -407,8 +410,8 @@ begin
   end;
 end;
 
-procedure TTestScheduler.CompleteJob(AIndex: Integer;
-  AStatus: TTestJobStatus; AExitCode: Integer);
+procedure TTestScheduler.CompleteJob(const AIndex: Integer;
+  const AStatus: TTestJobStatus; const AExitCode: Integer);
 begin
   if AIndex < 0 then Exit;
   EnterCriticalSection(FCriticalSection);
@@ -450,8 +453,9 @@ begin
   end;
 end;
 
-procedure TTestScheduler.FailJob(AIndex: Integer;
-  AStatus: TTestJobStatus; AExitCode: Integer; const AMessage: string);
+procedure TTestScheduler.FailJob(const AIndex: Integer;
+  const AStatus: TTestJobStatus; const AExitCode: Integer;
+  const AMessage: string);
 begin
   EnterCriticalSection(FCriticalSection);
   try
@@ -466,7 +470,7 @@ begin
   end;
 end;
 
-procedure TTestScheduler.AbortWithError(AIndex: Integer;
+procedure TTestScheduler.AbortWithError(const AIndex: Integer;
   const AMessage: string);
 begin
   EnterCriticalSection(FCriticalSection);
@@ -493,8 +497,8 @@ begin
   end;
 end;
 
-procedure TTestScheduler.RunOne(AIndex: Integer;
-  ALease: TLWPTWorkerLease);
+procedure TTestScheduler.RunOne(const AIndex: Integer;
+  const ALease: TLWPTWorkerLease);
 var
   CompilerProcess, TestProcess: TProcess;
   Binary, Output: string;

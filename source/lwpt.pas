@@ -188,6 +188,7 @@ begin
   for i := 0 to APositionals.Count - 1 do
     TargetNames[i] := APositionals[i];
   try
+    InstallProcessTreeSignalForwarding;
     Result := CmdBuild(MANIFEST_FILE, TargetNames, Release, Clean, Jobs,
       Verbose);
   except
@@ -275,6 +276,7 @@ begin
       end;
     end;
   try
+    InstallProcessTreeSignalForwarding;
     Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail, Verbose);
   except
     on E: Exception do
@@ -380,9 +382,6 @@ var
   InstallOpts, AddOpts, RemoveOpts, TestOpts, BuildOpts, InitOpts,
     RunOpts, FormatOpts, RepairOpts : TOptionArray;
 begin
-  { ADR-0025: a self-pipe coordinator forwards SIGTERM/SIGINT to every active
-    child group before restoring the signal's default outcome. }
-  InstallProcessTreeSignalForwarding;
   if HandleTopLevelFlags then
   begin
     ExitCode := 0;

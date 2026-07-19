@@ -5,6 +5,10 @@ unit Tests.ProcessSupport;
 
 interface
 
+const
+  ProcessPollMilliseconds = 10;
+  SecondsPerDay = 86400;
+
 function ProcessIsRunning(const APID: Integer): Boolean;
 
 implementation

@@ -15,7 +15,11 @@ program LWPT.Command.Build.Test;
 
 uses
   {$IFDEF UNIX}
+  BaseUnix,
   cthreads,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
   {$ENDIF}
   Classes,
   Process,
@@ -23,6 +27,7 @@ uses
 
   LWPT.Command.Build,
   LWPT.Core,
+  LWPT.ProcessTree,
   TestingPascalLibrary,
   Tests.ProcessSupport,
   Tests.Scratch;
@@ -34,11 +39,13 @@ const
     + '-compiler-grandchild-proxy';
   CompilerExitProxyOption = '--' + PROGRAM_NAME
     + '-compiler-exit-proxy';
+  CompilerNormalExitProxyOption = '--' + PROGRAM_NAME
+    + '-compiler-normal-exit-proxy';
   CompilerProxySleepMilliseconds = 30000;
-  ProcessPollMilliseconds = 10;
+  CompilerSurvivingDescendantProxyOption = '--' + PROGRAM_NAME
+    + '-compiler-surviving-descendant-proxy';
   ProcessStartupTimeoutSeconds = 10;
   ProcessExitTimeoutSeconds = 3;
-  SecondsPerDay = 86400;
 
 type
   TStaleArtefactSignature = class(TTestSuite)
@@ -51,6 +58,7 @@ type
     procedure TestReslstMentionAloneDoesNotMatch;
     procedure TestEmptyOutputDoesNotMatch;
     procedure TestCompilerCancellationCapturesAndReaps;
+    procedure TestCompilerNormalExitLeavesDescendantAlive;
     procedure TestCompilerNonZeroExitIsReported;
   end;
 
@@ -64,11 +72,11 @@ type
     Output: string;
     ErrorMessage: string;
     ExitCode: Integer;
-    constructor Create(ARunner: TLWPTCompilerProcess;
+    constructor Create(const ARunner: TLWPTCompilerProcess;
       const AMarker: string);
   end;
 
-constructor TCompilerRunnerThread.Create(ARunner: TLWPTCompilerProcess;
+constructor TCompilerRunnerThread.Create(const ARunner: TLWPTCompilerProcess;
   const AMarker: string);
 begin
   inherited Create(True);
@@ -76,6 +84,28 @@ begin
   FRunner := ARunner;
   FMarker := AMarker;
   ExitCode := -1;
+end;
+
+procedure TerminateTestProcess(const APID: Integer);
+{$IFDEF MSWINDOWS}
+var
+  ProcessHandle: THandle;
+{$ENDIF}
+begin
+  if not ProcessIsRunning(APID) then Exit;
+  {$IFDEF UNIX}
+  FpKill(APID, SIGKILL);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  ProcessHandle := Windows.OpenProcess(Windows.PROCESS_TERMINATE, False,
+    DWORD(APID));
+  if ProcessHandle = 0 then Exit;
+  try
+    Windows.TerminateProcess(ProcessHandle, 1);
+  finally
+    Windows.CloseHandle(ProcessHandle);
+  end;
+  {$ENDIF}
 end;
 
 procedure TCompilerRunnerThread.Execute;
@@ -198,6 +228,46 @@ begin
   end;
 end;
 
+procedure TStaleArtefactSignature.TestCompilerNormalExitLeavesDescendantAlive;
+var
+  Child: TProcess;
+  ProcessTree: TLWPTProcessTree;
+  Scratch, DescendantPIDPath: string;
+  DescendantPID: Integer;
+  Started: TDateTime;
+begin
+  Scratch := ExpandFileName('build/tests/tmp/compiler-process-normal-exit');
+  DescendantPIDPath := Scratch + '/descendant-pid';
+  DescendantPID := -1;
+  RecursiveDelete(Scratch);
+  ForceDirectories(Scratch);
+  Child := TProcess.Create(nil);
+  ProcessTree := TLWPTProcessTree.Create(Child);
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    Child.Parameters.Add(CompilerNormalExitProxyOption);
+    Child.Parameters.Add(DescendantPIDPath);
+    ProcessTree.Execute;
+    Child.WaitOnExit;
+    Expect<Integer>(Child.ExitStatus).ToBe(0);
+    Expect<Boolean>(FileExists(DescendantPIDPath)).ToBe(True);
+    DescendantPID := StrToInt(Trim(ReadBinaryFile(DescendantPIDPath)));
+    FreeAndNil(ProcessTree);
+    { Closing a successful tree's Windows Job handle must not act like
+      cancellation; Unix process-group ownership has the same contract. }
+    Expect<Boolean>(ProcessIsRunning(DescendantPID)).ToBe(True);
+  finally
+    ProcessTree.Free;
+    Child.Free;
+    TerminateTestProcess(DescendantPID);
+    Started := Now;
+    while ProcessIsRunning(DescendantPID)
+      and ((Now - Started) * SecondsPerDay < ProcessExitTimeoutSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    RecursiveDelete(Scratch);
+  end;
+end;
+
 procedure TStaleArtefactSignature.SetupTests;
 begin
   Test('internal compiler exception matches',
@@ -211,6 +281,8 @@ begin
   Test('empty output does not match', TestEmptyOutputDoesNotMatch);
   Test('compiler cancellation captures output and reaps the child',
     TestCompilerCancellationCapturesAndReaps);
+  Test('compiler normal exit leaves a live descendant alone',
+    TestCompilerNormalExitLeavesDescendantAlive);
   Test('nonzero compiler exit is reported, not dropped to 0',
     TestCompilerNonZeroExitIsReported);
 end;
@@ -218,10 +290,10 @@ end;
 function RunCompilerProcessProxy: Integer;
 var
   Child: TProcess;
-  i: Integer;
+  OutputIndex: Integer;
   GrandchildPIDPath: string;
 begin
-  for i := 1 to 6000 do Write('captured-output-');
+  for OutputIndex := 1 to 6000 do Write('captured-output-');
   Flush(Output);
   GrandchildPIDPath := ExtractFileDir(ParamStr(2)) + '/grandchild-pid';
   Child := TProcess.Create(nil);
@@ -237,6 +309,41 @@ begin
 end;
 
 function RunCompilerGrandchildProxy: Integer;
+begin
+  WriteTextFile(ParamStr(2), IntToStr(GetProcessID));
+  Sleep(CompilerProxySleepMilliseconds);
+  Result := 0;
+end;
+
+function RunCompilerNormalExitProxy: Integer;
+var
+  Descendant: TProcess;
+  Started: TDateTime;
+begin
+  Result := 2;
+  Descendant := TProcess.Create(nil);
+  try
+    Descendant.Executable := ExpandFileName(ParamStr(0));
+    Descendant.Parameters.Add(CompilerSurvivingDescendantProxyOption);
+    Descendant.Parameters.Add(ParamStr(2));
+    Descendant.Execute;
+    Started := Now;
+    while (not FileExists(ParamStr(2))) and Descendant.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupTimeoutSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if not FileExists(ParamStr(2)) then
+    begin
+      if Descendant.Running then Descendant.Terminate(1);
+      Exit;
+    end;
+    Result := 0;
+  finally
+    Descendant.Free;
+  end;
+end;
+
+function RunCompilerSurvivingDescendantProxy: Integer;
 begin
   WriteTextFile(ParamStr(2), IntToStr(GetProcessID));
   Sleep(CompilerProxySleepMilliseconds);
@@ -262,6 +369,12 @@ begin
   if (ParamCount >= 2)
      and (ParamStr(1) = CompilerExitProxyOption) then
     Halt(RunCompilerExitProxy);
+  if (ParamCount >= 2)
+     and (ParamStr(1) = CompilerNormalExitProxyOption) then
+    Halt(RunCompilerNormalExitProxy);
+  if (ParamCount >= 2)
+     and (ParamStr(1) = CompilerSurvivingDescendantProxyOption) then
+    Halt(RunCompilerSurvivingDescendantProxy);
   TestRunnerProgram.AddSuite(TStaleArtefactSignature.Create(
     'build: stale-artefact failure signature'));
   TestRunnerProgram.Run;

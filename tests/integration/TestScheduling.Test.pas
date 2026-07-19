@@ -8,6 +8,9 @@ uses
   BaseUnix,
   cthreads,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -23,18 +26,22 @@ uses
 const
   CancellationCompletionCeilingSeconds = 12;
   CompilerExecutableEnvironment = PROJECT_NAME + '_FPC';
+  IgnoreTerminateCompilerProxyMode = 'ignore-term';
   LongRunningFixtureMilliseconds = 15000;
   MarkerWaitCeilingSeconds = 5;
   ProcessExitCeilingSeconds = 8;
-  ProcessPollMilliseconds = 10;
   ProcessStartupCeilingSeconds = 10;
   ProcessTreeProxyModeEnvironment = PROJECT_NAME
     + '_PROCESS_TREE_TEST_PROXY_MODE';
   ProcessTreeProxyPIDFileEnvironment = PROJECT_NAME
     + '_PROCESS_TREE_TEST_PID_FILE';
-  SecondsPerDay = 86400;
   SlowCompilerProxyMode = 'slow';
   WorkerErrorCompilerProxyMode = 'worker-error';
+  {$IFDEF MSWINDOWS}
+  WindowsConsoleControllerOption = '--' + PROGRAM_NAME
+    + '-console-controller';
+  WindowsIgnoreControlCompilerProxyMode = 'ignore-control';
+  {$ENDIF}
   TestHeartbeatIntervalMilliseconds = 75;
   TestHeartbeatJobDurationMilliseconds =
     TestHeartbeatIntervalMilliseconds * 4;
@@ -53,7 +60,7 @@ type
     function RunTestsWithCompilerProxy(const AArgs: array of string;
       const AProxyMode, APIDFile: string): TLwptResult;
     {$IFDEF UNIX}
-    procedure RunSignalForwardingTest(ASignal: Integer;
+    procedure RunSignalForwardingTest(const ASignal: Integer;
       const AProjectName: string);
     {$ENDIF}
     function RunTestsWithHeartbeat(const AArgs: array of string;
@@ -68,11 +75,14 @@ type
     procedure TestBailZeroOverridesManifestAndRunsAll;
     procedure TestCompileFailureCountsTowardBail;
     procedure TestBailTerminatesActiveAndLeavesPendingUnstarted;
-    procedure TestBailTerminatesNestedLWPTCompilerTree;
+    procedure TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
     procedure TestWorkerErrorTerminatesActiveProcessTree;
     {$IFDEF UNIX}
     procedure TestSIGINTTerminatesActiveProcessTree;
     procedure TestSIGTERMTerminatesActiveProcessTree;
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    procedure TestCtrlCTerminatesActiveProcessTree;
     {$ENDIF}
     procedure TestSilentJobEmitsHeartbeatAndProgress;
     procedure TestFailureReplaysAndPreservesIsolatedLog;
@@ -82,39 +92,6 @@ type
 function PascalString(const AValue: string): string;
 begin
   Result := '''' + StringReplace(AValue, '''', '''''', [rfReplaceAll]) + '''';
-end;
-
-function EnvironmentEntryName(const AEntry: string): string;
-var
-  Separator: Integer;
-begin
-  Separator := Pos('=', AEntry);
-  if Separator = 0 then Result := AEntry
-  else Result := Copy(AEntry, 1, Separator - 1);
-end;
-
-function EnvironmentEntryIsOverridden(const AEntry: string;
-  const AOverrides: array of string): Boolean;
-var
-  Index: Integer;
-begin
-  for Index := 0 to High(AOverrides) do
-    if SameText(EnvironmentEntryName(AEntry),
-      EnvironmentEntryName(AOverrides[Index])) then Exit(True);
-  Result := False;
-end;
-
-procedure ConfigureProcessEnvironment(AProcess: TProcess;
-  const AOverrides: array of string);
-var
-  Index: Integer;
-begin
-  for Index := 1 to GetEnvironmentVariableCount do
-    if not EnvironmentEntryIsOverridden(GetEnvironmentString(Index),
-      AOverrides) then
-      AProcess.Environment.Add(GetEnvironmentString(Index));
-  for Index := 0 to High(AOverrides) do
-    AProcess.Environment.Add(AOverrides[Index]);
 end;
 
 procedure TTestScheduling.BeforeAll;
@@ -138,7 +115,7 @@ begin
   RecursiveDelete(FScratch + '/control');
   ForceDirectories(FScratch + '/tests');
   ForceDirectories(FScratch + '/control');
-  WriteTextFile(FScratch + '/lwpt.toml',
+  WriteTextFile(FScratch + '/' + MANIFEST_FILE,
       '[package]'#10
     + 'name = "scheduler-fixture"'#10
     + 'version = "0.0.0"'#10
@@ -187,7 +164,7 @@ end;
 procedure TTestScheduling.WriteBuildProject(const AProjectRoot: string);
 begin
   ForceDirectories(AProjectRoot + '/source');
-  WriteTextFile(AProjectRoot + '/lwpt.toml',
+  WriteTextFile(AProjectRoot + '/' + MANIFEST_FILE,
       '[package]'#10
     + 'name = "process-tree-fixture"'#10
     + 'version = "0.0.0"'#10
@@ -212,11 +189,12 @@ function TTestScheduling.RunTestsWithHeartbeat(
   const AHeartbeatMilliseconds: Integer): TLwptResult;
 var
   Args, Environment: array of string;
-  i: Integer;
+  ArgumentIndex: Integer;
 begin
   SetLength(Args, Length(AArgs) + 1);
   Args[0] := 'test';
-  for i := 0 to High(AArgs) do Args[i + 1] := AArgs[i];
+  for ArgumentIndex := 0 to High(AArgs) do
+    Args[ArgumentIndex + 1] := AArgs[ArgumentIndex];
   if AHeartbeatMilliseconds > 0 then SetLength(Environment, 4)
   else SetLength(Environment, 3);
   Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
@@ -234,11 +212,12 @@ function TTestScheduling.RunTestsWithCompilerProxy(
   APIDFile: string): TLwptResult;
 var
   Args, Environment: array of string;
-  i: Integer;
+  ArgumentIndex: Integer;
 begin
   SetLength(Args, Length(AArgs) + 1);
   Args[0] := 'test';
-  for i := 0 to High(AArgs) do Args[i + 1] := AArgs[i];
+  for ArgumentIndex := 0 to High(AArgs) do
+    Args[ArgumentIndex + 1] := AArgs[ArgumentIndex];
   SetLength(Environment, 6);
   Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
   Environment[1] := WORKER_STATE_DIR_ENV + '='
@@ -376,20 +355,20 @@ end;
 
 procedure TTestScheduling.TestDefaultJobsOverlap;
 var
-  R: TLwptResult;
+  CommandResult: TLwptResult;
 begin
   ResetProject(0);
   WriteOverlapProgram('A.First.Test.pas', 'first-started', 'second-started');
   WriteOverlapProgram('B.Second.Test.pas', 'second-started', 'first-started');
-  R := RunTests([]);
-  Expect<Integer>(R.ExitCode).ToBe(0);
+  CommandResult := RunTests([]);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(FScratch + '/control/first-started')).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/second-started')).ToBe(True);
 end;
 
 procedure TTestScheduling.TestJobsOneRunsInSourceOrder;
 var
-  R: TLwptResult;
+  CommandResult: TLwptResult;
   Lines: TStringList;
 begin
   ResetProject(0);
@@ -421,8 +400,8 @@ begin
     + PascalString(FScratch + '/control/order') + ');'#10
     + '  finally Lines.Free end;'#10
     + 'end.'#10);
-  R := RunTests(['--jobs=1']);
-  Expect<Integer>(R.ExitCode).ToBe(0);
+  CommandResult := RunTests(['--jobs=1']);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(0);
   Lines := TStringList.Create;
   try
     Lines.LoadFromFile(FScratch + '/control/order');
@@ -436,38 +415,41 @@ end;
 
 procedure TTestScheduling.TestBailZeroOverridesManifestAndRunsAll;
 var
-  R: TLwptResult;
+  CommandResult: TLwptResult;
 begin
   ResetProject(1);
   WriteMarkerProgram('A.Fail.Test.pas', 'failed-ran', 1);
   WriteMarkerProgram('B.Pass.Test.pas', 'pass-ran', 0);
-  R := RunTests(['--jobs=1', '--bail=0']);
-  Expect<Integer>(R.ExitCode).ToBe(1);
+  CommandResult := RunTests(['--jobs=1', '--bail=0']);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   Expect<Boolean>(FileExists(FScratch + '/control/failed-ran')).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/pass-ran')).ToBe(True);
-  Expect<Boolean>(Pos('1 passed, 1 failed', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('1 passed, 1 failed', CommandResult.Stdout) > 0)
+    .ToBe(True);
 end;
 
 procedure TTestScheduling.TestCompileFailureCountsTowardBail;
 var
-  R: TLwptResult;
+  CommandResult: TLwptResult;
 begin
   ResetProject(0);
   WriteTextFile(FScratch + '/tests/A.Bad.Test.pas',
     'program BadFixture; begin this is not valid pascal end.'#10);
   WriteMarkerProgram('B.Pending.Test.pas', 'pending-ran', 0);
-  R := RunTests(['--jobs=1', '--bail=1']);
-  Expect<Integer>(R.ExitCode).ToBe(1);
+  CommandResult := RunTests(['--jobs=1', '--bail=1']);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   Expect<Boolean>(FileExists(FScratch + '/control/pending-ran')).ToBe(False);
-  Expect<Boolean>(Pos('A.Bad.Test.pas ... COMPILE FAILED', R.Stdout) > 0)
+  Expect<Boolean>(Pos('A.Bad.Test.pas ... COMPILE FAILED',
+    CommandResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('B.Pending.Test.pas ... cancelled', R.Stdout) > 0)
+  Expect<Boolean>(Pos('B.Pending.Test.pas ... cancelled',
+    CommandResult.Stdout) > 0)
     .ToBe(True);
 end;
 
 procedure TTestScheduling.TestBailTerminatesActiveAndLeavesPendingUnstarted;
 var
-  R: TLwptResult;
+  CommandResult: TLwptResult;
   Started: TDateTime;
   GrandchildPID: Integer;
 begin
@@ -517,8 +499,8 @@ begin
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'pending-ran', 0);
   Started := Now;
-  R := RunTests(['--jobs=2', '--bail=1']);
-  Expect<Integer>(R.ExitCode).ToBe(1);
+  CommandResult := RunTests(['--jobs=2', '--bail=1']);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   Expect<Boolean>((Now - Started) * SecondsPerDay
     < CancellationCompletionCeilingSeconds).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/slow-started')).ToBe(True);
@@ -532,26 +514,29 @@ begin
     and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
     Sleep(ProcessPollMilliseconds);
   Expect<Boolean>(ProcessIsRunning(GrandchildPID)).ToBe(False);
-  Expect<Boolean>(Pos('A.Slow.Test.pas ... cancelled', R.Stdout) > 0)
+  Expect<Boolean>(Pos('A.Slow.Test.pas ... cancelled',
+    CommandResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('B.Fail.Test.pas ... FAIL (exit 1)', R.Stdout) > 0)
+  Expect<Boolean>(Pos('B.Fail.Test.pas ... FAIL (exit 1)',
+    CommandResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('C.Pending.Test.pas ... cancelled', R.Stdout) > 0)
+  Expect<Boolean>(Pos('C.Pending.Test.pas ... cancelled',
+    CommandResult.Stdout) > 0)
     .ToBe(True);
 end;
 
-procedure TTestScheduling.TestBailTerminatesNestedLWPTCompilerTree;
+procedure TTestScheduling.TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
 var
   CompilerPID: Integer;
   NestedProject, PIDFile: string;
-  R: TLwptResult;
+  CommandResult: TLwptResult;
 begin
   ResetProject(0);
   NestedProject := FScratch + '/nested-build';
   PIDFile := FScratch + '/control/nested-compiler-pid';
   WriteBuildProject(NestedProject);
   WriteTextFile(FScratch + '/tests/A.Nested.Test.pas',
-      'program NestedLWPTFixture;'#10
+      'program Nested' + PROJECT_NAME + 'Fixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'uses Process, SysUtils;'#10
     + 'var Child: TProcess; Entry: string; Index: Integer;'#10
@@ -581,7 +566,7 @@ begin
       + ExpandFileName(ParamStr(0))) + ');'#10
     + '    Child.Environment.Add('
     + PascalString(ProcessTreeProxyModeEnvironment + '='
-      + SlowCompilerProxyMode) + ');'#10
+      + IgnoreTerminateCompilerProxyMode) + ');'#10
     + '    Child.Environment.Add('
     + PascalString(ProcessTreeProxyPIDFileEnvironment + '=' + PIDFile)
     + ');'#10
@@ -607,17 +592,19 @@ begin
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
 
-  R := RunTests(['--jobs=2', '--bail=1']);
-  Expect<Integer>(R.ExitCode).ToBe(1);
+  CommandResult := RunTests(['--jobs=2', '--bail=1']);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
   CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
   { Reap-until-empty is part of the command-return contract: no retry loop. }
   Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/control/nested-pending-ran'))
     .ToBe(False);
-  Expect<Boolean>(Pos('A.Nested.Test.pas ... cancelled', R.Stdout) > 0)
+  Expect<Boolean>(Pos('A.Nested.Test.pas ... cancelled',
+    CommandResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('B.Fail.Test.pas ... FAIL (exit 1)', R.Stdout) > 0)
+  Expect<Boolean>(Pos('B.Fail.Test.pas ... FAIL (exit 1)',
+    CommandResult.Stdout) > 0)
     .ToBe(True);
 end;
 
@@ -625,7 +612,7 @@ procedure TTestScheduling.TestWorkerErrorTerminatesActiveProcessTree;
 var
   CompilerPID: Integer;
   PIDFile: string;
-  R: TLwptResult;
+  CommandResult: TLwptResult;
 begin
   ResetProject(0);
   PIDFile := FScratch + '/control/worker-error-compiler-pid';
@@ -634,19 +621,20 @@ begin
   WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
     'program MissingRuntimeBinaryInput; begin end.'#10);
 
-  R := RunTestsWithCompilerProxy(['--jobs=2'],
+  CommandResult := RunTestsWithCompilerProxy(['--jobs=2'],
     WorkerErrorCompilerProxyMode, PIDFile);
-  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
   CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
   Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
-  Expect<Boolean>(Pos('B.Error.Test.pas ... ERROR', R.Stdout) > 0)
+  Expect<Boolean>(Pos('B.Error.Test.pas ... ERROR', CommandResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('scheduler error:', R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('scheduler error:', CommandResult.Stderr) > 0)
+    .ToBe(True);
 end;
 
 {$IFDEF UNIX}
-procedure TTestScheduling.RunSignalForwardingTest(ASignal: Integer;
+procedure TTestScheduling.RunSignalForwardingTest(const ASignal: Integer;
   const AProjectName: string);
 var
   CompilerPID: Integer;
@@ -712,6 +700,115 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF MSWINDOWS}
+procedure TerminateWindowsProcess(const APID: Integer);
+var
+  ProcessHandle: THandle;
+begin
+  if not ProcessIsRunning(APID) then Exit;
+  ProcessHandle := Windows.OpenProcess(Windows.PROCESS_TERMINATE, False,
+    DWORD(APID));
+  if ProcessHandle = 0 then Exit;
+  try
+    Windows.TerminateProcess(ProcessHandle, 1);
+  finally
+    Windows.CloseHandle(ProcessHandle);
+  end;
+end;
+
+procedure TTestScheduling.TestCtrlCTerminatesActiveProcessTree;
+var
+  CompilerPID: Integer;
+  Controller: TProcess;
+  PIDFile, ProjectRoot: string;
+  Started: TDateTime;
+begin
+  CompilerPID := -1;
+  ProjectRoot := FScratch + '/console-control';
+  PIDFile := FScratch + '/control/console-control-compiler-pid';
+  WriteBuildProject(ProjectRoot);
+  Controller := TProcess.Create(nil);
+  try
+    Controller.Executable := ExpandFileName(ParamStr(0));
+    Controller.Parameters.Add(WindowsConsoleControllerOption);
+    Controller.Parameters.Add(LwptBinaryPath);
+    Controller.Parameters.Add(ProjectRoot);
+    Controller.Parameters.Add(PIDFile);
+    Controller.Parameters.Add(FScratch + '/console-control-worker-state');
+    Controller.Options := [poNewConsole];
+    Controller.Execute;
+    Started := Now;
+    while Controller.Running
+      and ((Now - Started) * SecondsPerDay
+        < CancellationCompletionCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(Controller.Running).ToBe(False);
+    Controller.WaitOnExit;
+    Expect<Integer>(Controller.ExitStatus).ToBe(0);
+    Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
+    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+    Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+  finally
+    if Controller.Running then Controller.Terminate(1);
+    TerminateWindowsProcess(CompilerPID);
+    Controller.Free;
+  end;
+end;
+
+function RunWindowsConsoleController: Integer;
+var
+  CompilerPID: Integer;
+  Environment: array of string;
+  LwptProcess: TProcess;
+  Started: TDateTime;
+begin
+  Result := 1;
+  CompilerPID := -1;
+  SetLength(Environment, 6);
+  Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
+  Environment[1] := WORKER_STATE_DIR_ENV + '=' + ParamStr(5);
+  Environment[2] := WORKER_BUDGET_ENV + '=1';
+  Environment[3] := CompilerExecutableEnvironment + '='
+    + ExpandFileName(ParamStr(0));
+  Environment[4] := ProcessTreeProxyModeEnvironment + '='
+    + WindowsIgnoreControlCompilerProxyMode;
+  Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + ParamStr(4);
+  LwptProcess := TProcess.Create(nil);
+  try
+    LwptProcess.Executable := ParamStr(2);
+    LwptProcess.Parameters.Add('build');
+    LwptProcess.CurrentDirectory := ParamStr(3);
+    ConfigureProcessEnvironment(LwptProcess, Environment);
+    LwptProcess.Execute;
+    Started := Now;
+    while (not FileExists(ParamStr(4))) and LwptProcess.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if not FileExists(ParamStr(4)) then Exit(2);
+    CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(4))));
+    { The controller shares the new console but must survive its own broadcast.
+      The compiler proxy has already installed the same ignore setting before
+      publishing its PID, leaving LWPT as the only Ctrl-C handler under test. }
+    if not Windows.SetConsoleCtrlHandler(nil, True) then Exit(3);
+    if not Windows.GenerateConsoleCtrlEvent(Windows.CTRL_C_EVENT, 0) then
+      Exit(4);
+    Started := Now;
+    while LwptProcess.Running
+      and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if LwptProcess.Running then Exit(5);
+    LwptProcess.WaitOnExit;
+    if ProcessIsRunning(CompilerPID) then Exit(6);
+    Result := 0;
+  finally
+    if LwptProcess.Running then LwptProcess.Terminate(1);
+    TerminateWindowsProcess(CompilerPID);
+    LwptProcess.Free;
+  end;
+end;
+{$ENDIF}
+
 function RunProcessTreeCompilerProxy: Integer;
 var
   Mode, PIDFile, SourceFile: string;
@@ -727,7 +824,19 @@ begin
   if ParamCount > 0 then SourceFile := ExtractFileName(ParamStr(ParamCount))
   else SourceFile := '';
 
+  {$IFDEF UNIX}
+  if Mode = IgnoreTerminateCompilerProxyMode then
+    FpSignal(SIGTERM, SignalHandler(SIG_IGN));
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  if Mode = WindowsIgnoreControlCompilerProxyMode then
+    Windows.SetConsoleCtrlHandler(nil, True);
+  {$ENDIF}
   if (Mode = SlowCompilerProxyMode)
+     or (Mode = IgnoreTerminateCompilerProxyMode)
+     {$IFDEF MSWINDOWS}
+     or (Mode = WindowsIgnoreControlCompilerProxyMode)
+     {$ENDIF}
      or ((Mode = WorkerErrorCompilerProxyMode)
        and SameText(SourceFile, 'A.Slow.Test.pas')) then
   begin
@@ -759,8 +868,9 @@ begin
     TestCompileFailureCountsTowardBail);
   Test('bail terminates active and leaves pending unstarted',
     TestBailTerminatesActiveAndLeavesPendingUnstarted);
-  Test('bail cascades through nested LWPT compiler trees',
-    TestBailTerminatesNestedLWPTCompilerTree);
+  Test('bail reaps nested ' + PROJECT_NAME
+    + ' compiler that ignores SIGTERM',
+    TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
   Test('worker error terminates another active process tree',
     TestWorkerErrorTerminatesActiveProcessTree);
   {$IFDEF UNIX}
@@ -768,6 +878,10 @@ begin
     TestSIGINTTerminatesActiveProcessTree);
   Test('SIGTERM reaps the active compiler tree',
     TestSIGTERMTerminatesActiveProcessTree);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Test('Ctrl-C reaps the active compiler Job Object',
+    TestCtrlCTerminatesActiveProcessTree);
   {$ENDIF}
   Test('silent jobs emit heartbeat and serialized progress',
     TestSilentJobEmitsHeartbeatAndProgress);
@@ -778,6 +892,11 @@ begin
 end;
 
 begin
+  {$IFDEF MSWINDOWS}
+  if (ParamCount = 5)
+     and (ParamStr(1) = WindowsConsoleControllerOption) then
+    Halt(RunWindowsConsoleController);
+  {$ENDIF}
   if GetEnvironmentVariable(ProcessTreeProxyModeEnvironment) <> '' then
     Halt(RunProcessTreeCompilerProxy);
   TestRunnerProgram.AddSuite(TTestScheduling.Create('TestScheduling'));
