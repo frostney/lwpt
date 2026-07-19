@@ -70,7 +70,12 @@ procedure ApplyIncludeExclude(const ARoot: string; const AIncludes, AExcludes: T
 function  CopyFileContent(const ASrc, ADst: string): Boolean;
 function  PathContains(const AParent, AChild: string): Boolean;
 procedure CopyDirTree(const ASrc, ADst: string);
+const
+  TmpPathDelimiter = '.';
+  TmpPathExtension = '.tmp';
+
 function  MakeTmpPath(const ATmpRoot, AHint: string): string;
+function  MakeSiblingTmpPath(const APath, ATag: string): string; inline;
 procedure WipeDir(const APath: string);
 function  AtomicMoveFile(const ASrc, ADst: string): Boolean;
 function  AtomicMoveDir(const ASrc, ADst: string): Boolean;
@@ -96,6 +101,10 @@ uses
 const
   MOVEFILE_WRITE_THROUGH_LWPT = $00000008;
 {$ENDIF}
+
+var
+  TmpPathCounter: LongInt;
+  TmpPathStartedAt: Int64;
 
 function FPCExecutable: string;
 begin
@@ -570,28 +579,45 @@ begin
   Result := IntToStr(GetProcessID);
 end;
 
-function MakeSiblingTmpPath(const APath, ATag: string): string;
-var
-  Dir, Base: string;
-  Counter: Int64;
+{ Base36 keeps the once-per-process stamp inside the pre-hardening
+  temp-name length budget; atomic-write callers can sit close to
+  filesystem path limits. }
+function EncodeBase36(AValue: Int64): string;
+const
+  Digits = '0123456789abcdefghijklmnopqrstuvwxyz';
 begin
-  Dir := ExtractFileDir(APath);
-  Base := ExtractFileName(APath);
+  if AValue <= 0 then Exit('0');
+  Result := '';
+  while AValue > 0 do
+  begin
+    Result := Digits[(AValue mod 36) + 1] + Result;
+    AValue := AValue div 36;
+  end;
+end;
+
+function MakeUniqueTmpPath(const ARoot, APrefix: string): string;
+var
+  Sequence: Cardinal;
+begin
   repeat
-    Counter := Round(Now * 1000000);
-    Result := IncludeTrailingPathDelimiter(Dir)
-            + Base + '.' + ATag + '.' + ProcessIdStr + '.'
-            + IntToStr(Counter) + '.tmp';
+    Sequence := Cardinal(InterlockedIncrement(TmpPathCounter));
+    Result := IncludeTrailingPathDelimiter(ARoot)
+            + APrefix + TmpPathDelimiter + ProcessIdStr + TmpPathDelimiter
+            + EncodeBase36(TmpPathStartedAt) + TmpPathDelimiter
+            + IntToStr(Int64(Sequence)) + TmpPathExtension;
   until (not FileExists(Result)) and (not DirectoryExists(Result));
 end;
 
+function MakeSiblingTmpPath(const APath, ATag: string): string; inline;
+begin
+  Result := MakeUniqueTmpPath(ExtractFileDir(APath),
+    ExtractFileName(APath) + TmpPathDelimiter + ATag);
+end;
+
 function MakeTmpPath(const ATmpRoot, AHint: string): string;
-var Counter: Int64;
 begin
   ForceDirectories(ATmpRoot);
-  Counter := Round(Now * 1000000);   { microseconds since epoch-ish; unique enough }
-  Result := IncludeTrailingPathDelimiter(ATmpRoot)
-          + AHint + '.' + ProcessIdStr + '.' + IntToStr(Counter) + '.tmp';
+  Result := MakeUniqueTmpPath(ATmpRoot, AHint);
 end;
 
 function IsDirSymlinkOrJunction(const APath: string): Boolean;
@@ -1065,5 +1091,11 @@ begin
   else
     Result := 'sha256:' + SHA256Hex(BytesOf(APathOrArchive));
 end;
+
+initialization
+  { Record a millisecond-resolution TDateTime stamp once per process.
+    PID + atomic sequence provide uniqueness; the existence retry
+    defends against a stale path from PID/stamp reuse. }
+  TmpPathStartedAt := Round(Now * MSecsPerDay);
 
 end.

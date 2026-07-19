@@ -681,10 +681,10 @@ begin
 end;
 
 begin
-  TestRunnerProgram.AddSuite(TFormatIdempotence.Create('LWPT.Formatter: idempotence'));
-  TestRunnerProgram.AddSuite(TFormatParamRename.Create('LWPT.Formatter: param-rename regression'));
-  TestRunnerProgram.AddSuite(TFormatScopeExpansion.Create('LWPT.Formatter: scope expansion (ADR-0007)'));
-  TestRunnerProgram.AddSuite(TFormatUnitsSeedExclude.Create('LWPT.Formatter: [format].exclude vs units seed'));
+  TestRunnerProgram.AddSuite(TFormatIdempotence.Create(PROJECT_NAME + '.Formatter: idempotence'));
+  TestRunnerProgram.AddSuite(TFormatParamRename.Create(PROJECT_NAME + '.Formatter: param-rename regression'));
+  TestRunnerProgram.AddSuite(TFormatScopeExpansion.Create(PROJECT_NAME + '.Formatter: scope expansion (ADR-0007)'));
+  TestRunnerProgram.AddSuite(TFormatUnitsSeedExclude.Create(PROJECT_NAME + '.Formatter: [format].exclude vs units seed'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.
