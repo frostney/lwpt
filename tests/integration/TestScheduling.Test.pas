@@ -83,6 +83,14 @@ begin
   Result := '''' + StringReplace(AValue, '''', '''''', [rfReplaceAll]) + '''';
 end;
 
+{ Scheduler progress lines print discovered test paths with the native
+  separator (tests\A.Test.pas on Windows); normalise so assertions can be
+  written with '/' on every platform. }
+function SlashNorm(const AOutput: string): string;
+begin
+  Result := StringReplace(AOutput, '\', '/', [rfReplaceAll]);
+end;
+
 procedure TTestScheduling.BeforeAll;
 begin
   FScratch := CreateScratchRoot('test-scheduling');
@@ -242,16 +250,16 @@ begin
     .ToBe(True);
   Expect<Boolean>(Pos('effective workers: 1', RunResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('START tests/A.Silent.Test.pas', RunResult.Stdout) > 0)
-    .ToBe(True);
+  Expect<Boolean>(Pos('START tests/A.Silent.Test.pas',
+    SlashNorm(RunResult.Stdout)) > 0).ToBe(True);
   Expect<Boolean>(Pos('HEARTBEAT test elapsed ', RunResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('active: tests/A.Silent.Test.pas', RunResult.Stdout) > 0)
-    .ToBe(True);
-  Expect<Boolean>(Pos('PASS tests/A.Silent.Test.pas', RunResult.Stdout) > 0)
-    .ToBe(True);
+  Expect<Boolean>(Pos('active: tests/A.Silent.Test.pas',
+    SlashNorm(RunResult.Stdout)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('PASS tests/A.Silent.Test.pas',
+    SlashNorm(RunResult.Stdout)) > 0).ToBe(True);
   Expect<Boolean>(Pos('SKIP tests/e2e/B.Skip.Test.pas (e2e tier)',
-    RunResult.Stdout) > 0).ToBe(True);
+    SlashNorm(RunResult.Stdout)) > 0).ToBe(True);
   Expect<Boolean>(Pos('summary: 1 passed, 0 failed, 0 did not compile, '
     + '1 skipped, 0 cancelled; elapsed ', RunResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos(' ms', RunResult.Stdout) > 0).ToBe(True);
@@ -271,10 +279,11 @@ begin
   RunResult := RunTests([]);
   Expect<Integer>(RunResult.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('FAIL tests/A.Fail.Test.pas (exit 7;',
-    RunResult.Stdout) > 0)
+    SlashNorm(RunResult.Stdout)) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('failure-detail-41', RunResult.Stdout)
-    > Pos('FAIL tests/A.Fail.Test.pas', RunResult.Stdout)).ToBe(True);
+  Expect<Boolean>(Pos('failure-detail-41', SlashNorm(RunResult.Stdout))
+    > Pos('FAIL tests/A.Fail.Test.pas', SlashNorm(RunResult.Stdout)))
+    .ToBe(True);
   LogPath := '';
   if FindFirst(FScratch + '/.lwpt/sessions/s-*', faDirectory,
     SessionSearch) = 0 then
