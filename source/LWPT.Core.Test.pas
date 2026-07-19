@@ -2448,6 +2448,20 @@ const
   TmpPathThreadCount = 4;
   TmpPathThreadCallCount = 250;
 
+{ Predicts the generator's next candidate for an occupied-path test by
+  advancing the trailing sequence of a previously returned path. }
+function ComputeNextSequenceCandidate(const APath: string): string;
+var
+  Stem, Counter: string;
+  Separator: Integer;
+begin
+  Stem := Copy(APath, 1, Length(APath) - Length(TmpPathExtension));
+  Separator := LastDelimiter(TmpPathDelimiter, Stem);
+  Counter := Copy(Stem, Separator + 1, MaxInt);
+  Result := Copy(Stem, 1, Separator)
+    + IntToStr(StrToInt64(Counter) + 1) + TmpPathExtension;
+end;
+
 constructor TMakeTmpPathThread.Create(const ARoot, AHint: string);
 begin
   inherited Create(True);
@@ -2514,16 +2528,9 @@ end;
 
 procedure TMakeTmpPathSuite.TestExistingCandidateIsSkipped;
 var
-  Counter, Stem: string;
-  Candidate, First, ResultPath: string;
-  Separator: Integer;
+  Candidate, ResultPath: string;
 begin
-  First := MakeTmpPath(FScratch, 'existing');
-  Stem := Copy(First, 1, Length(First) - Length('.tmp'));
-  Separator := LastDelimiter('.', Stem);
-  Counter := Copy(Stem, Separator + 1, MaxInt);
-  Candidate := Copy(Stem, 1, Separator)
-    + IntToStr(StrToInt64(Counter) + 1) + '.tmp';
+  Candidate := ComputeNextSequenceCandidate(MakeTmpPath(FScratch, 'existing'));
   WriteFixtureFile(Candidate, 'occupied');
 
   ResultPath := MakeTmpPath(FScratch, 'existing');
@@ -2587,17 +2594,10 @@ end;
 
 procedure TMakeTmpPathSuite.TestSiblingExistingCandidateIsSkipped;
 var
-  BasePath, Counter, Stem: string;
-  Candidate, First, ResultPath: string;
-  Separator: Integer;
+  BasePath, Candidate, ResultPath: string;
 begin
   BasePath := IncludeTrailingPathDelimiter(FScratch) + 'target.txt';
-  First := MakeSiblingTmpPath(BasePath, 'old');
-  Stem := Copy(First, 1, Length(First) - Length('.tmp'));
-  Separator := LastDelimiter('.', Stem);
-  Counter := Copy(Stem, Separator + 1, MaxInt);
-  Candidate := Copy(Stem, 1, Separator)
-    + IntToStr(StrToInt64(Counter) + 1) + '.tmp';
+  Candidate := ComputeNextSequenceCandidate(MakeSiblingTmpPath(BasePath, 'old'));
   WriteFixtureFile(Candidate, 'occupied');
 
   ResultPath := MakeSiblingTmpPath(BasePath, 'old');

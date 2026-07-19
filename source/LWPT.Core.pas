@@ -70,6 +70,10 @@ procedure ApplyIncludeExclude(const ARoot: string; const AIncludes, AExcludes: T
 function  CopyFileContent(const ASrc, ADst: string): Boolean;
 function  PathContains(const AParent, AChild: string): Boolean;
 procedure CopyDirTree(const ASrc, ADst: string);
+const
+  TmpPathDelimiter = '.';
+  TmpPathExtension = '.tmp';
+
 function  MakeTmpPath(const ATmpRoot, AHint: string): string;
 function  MakeSiblingTmpPath(const APath, ATag: string): string; inline;
 procedure WipeDir(const APath: string);
@@ -574,10 +578,6 @@ function ProcessIdStr: string;
 begin
   Result := IntToStr(GetProcessID);
 end;
-
-const
-  TmpPathDelimiter = '.';
-  TmpPathExtension = '.tmp';
 
 { Base36 keeps the once-per-process stamp inside the pre-hardening
   temp-name length budget; atomic-write callers can sit close to
