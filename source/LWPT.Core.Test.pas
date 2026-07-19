@@ -15,6 +15,7 @@ program LWPT.Core.Test;
 
 uses
   {$IFDEF UNIX}
+  cthreads,
   BaseUnix,
   {$ENDIF}
   Classes,
@@ -251,6 +252,37 @@ type
     procedure TestPlainNameUnchanged;
     procedure TestSeparatorsFlattened;
     procedure TestDistinctInputsCanCollide;
+  end;
+
+  TMakeTmpPathThread = class(TThread)
+  private
+    FHint: string;
+    FPaths: TStringList;
+    FRoot: string;
+    FErrorText: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const ARoot, AHint: string);
+    destructor Destroy; override;
+    property ErrorText: string read FErrorText;
+    property Paths: TStringList read FPaths;
+  end;
+
+  TMakeTmpPathSuite = class(TTestSuite)
+  private
+    FScratch: string;
+    procedure ResetScratch;
+  protected
+    procedure AfterAll; override;
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestExistingCandidateIsSkipped;
+    procedure TestManyCallsAreDistinct;
+    procedure TestSiblingCallsAreDistinct;
+    procedure TestSiblingExistingCandidateIsSkipped;
+    procedure TestThreadedBurstIsDistinct;
   end;
 
   { [sources] custom-prefix declaration with placeholder URL
@@ -2409,39 +2441,221 @@ begin
     TestDistinctInputsCanCollide);
 end;
 
+{ ── TMakeTmpPathSuite ───────────────────────────────────────────── }
+
+const
+  TmpPathCallCount = 1000;
+  TmpPathThreadCount = 4;
+  TmpPathThreadCallCount = 250;
+
+{ Predicts the generator's next candidate for an occupied-path test by
+  advancing the trailing sequence of a previously returned path. }
+function ComputeNextSequenceCandidate(const APath: string): string;
+var
+  Stem, Counter: string;
+  Separator: Integer;
+begin
+  Stem := Copy(APath, 1, Length(APath) - Length(TmpPathExtension));
+  Separator := LastDelimiter(TmpPathDelimiter, Stem);
+  Counter := Copy(Stem, Separator + 1, MaxInt);
+  Result := Copy(Stem, 1, Separator)
+    + IntToStr(StrToInt64(Counter) + 1) + TmpPathExtension;
+end;
+
+constructor TMakeTmpPathThread.Create(const ARoot, AHint: string);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FRoot := ARoot;
+  FHint := AHint;
+  FPaths := TStringList.Create;
+end;
+
+destructor TMakeTmpPathThread.Destroy;
+begin
+  FPaths.Free;
+  inherited Destroy;
+end;
+
+procedure TMakeTmpPathThread.Execute;
+var
+  Index: Integer;
+begin
+  try
+    for Index := 1 to TmpPathThreadCallCount do
+      FPaths.Add(MakeTmpPath(FRoot, FHint));
+  except
+    on E: Exception do FErrorText := E.Message;
+  end;
+end;
+
+procedure TMakeTmpPathSuite.ResetScratch;
+begin
+  WipeDir(FScratch);
+  ForceDirectories(FScratch);
+end;
+
+procedure TMakeTmpPathSuite.BeforeAll;
+begin
+  { Process-unique root: concurrent test binaries must not wipe each
+    other's occupied-candidate fixtures. }
+  FScratch := ExpandFileName('build/tests/tmp/make-tmp-path-'
+    + IntToStr(GetProcessID));
+  ResetScratch;
+end;
+
+procedure TMakeTmpPathSuite.AfterAll;
+begin
+  WipeDir(FScratch);
+end;
+
+procedure TMakeTmpPathSuite.TestManyCallsAreDistinct;
+var
+  Index: Integer;
+  Paths: TStringList;
+begin
+  Paths := TStringList.Create;
+  try
+    Paths.Sorted := True;
+    Paths.Duplicates := dupIgnore;
+    for Index := 1 to TmpPathCallCount do
+      Paths.Add(MakeTmpPath(FScratch, 'burst'));
+    Expect<Integer>(Paths.Count).ToBe(TmpPathCallCount);
+  finally
+    Paths.Free;
+  end;
+end;
+
+procedure TMakeTmpPathSuite.TestExistingCandidateIsSkipped;
+var
+  Candidate, ResultPath: string;
+begin
+  Candidate := ComputeNextSequenceCandidate(MakeTmpPath(FScratch, 'existing'));
+  WriteFixtureFile(Candidate, 'occupied');
+
+  ResultPath := MakeTmpPath(FScratch, 'existing');
+
+  Expect<Boolean>(FileExists(Candidate)).ToBe(True);
+  Expect<Boolean>(ResultPath <> Candidate).ToBe(True);
+end;
+
+procedure TMakeTmpPathSuite.TestThreadedBurstIsDistinct;
+var
+  AllPaths: TStringList;
+  Index: Integer;
+  Threads: array[0..TmpPathThreadCount - 1] of TMakeTmpPathThread;
+begin
+  AllPaths := TStringList.Create;
+  try
+    AllPaths.Sorted := True;
+    AllPaths.Duplicates := dupIgnore;
+    for Index := 0 to High(Threads) do
+      Threads[Index] := TMakeTmpPathThread.Create(FScratch, 'threaded');
+    for Index := 0 to High(Threads) do Threads[Index].Start;
+    for Index := 0 to High(Threads) do Threads[Index].WaitFor;
+    for Index := 0 to High(Threads) do
+    begin
+      Expect<string>(Threads[Index].ErrorText).ToBe('');
+      AllPaths.AddStrings(Threads[Index].Paths);
+    end;
+    Expect<Integer>(AllPaths.Count)
+      .ToBe(TmpPathThreadCount * TmpPathThreadCallCount);
+  finally
+    for Index := 0 to High(Threads) do Threads[Index].Free;
+    AllPaths.Free;
+  end;
+end;
+
+procedure TMakeTmpPathSuite.TestSiblingCallsAreDistinct;
+var
+  BasePath: string;
+  Index: Integer;
+  Paths: TStringList;
+begin
+  BasePath := IncludeTrailingPathDelimiter(FScratch) + 'target.txt';
+  Paths := TStringList.Create;
+  try
+    Paths.Sorted := True;
+    Paths.Duplicates := dupIgnore;
+    for Index := 1 to TmpPathCallCount do
+      Paths.Add(MakeSiblingTmpPath(BasePath, 'old'));
+    Expect<Integer>(Paths.Count).ToBe(TmpPathCallCount);
+    for Index := 0 to Paths.Count - 1 do
+    begin
+      Expect<string>(ExtractFileDir(Paths[Index]))
+        .ToBe(ExcludeTrailingPathDelimiter(FScratch));
+      Expect<Boolean>(Pos('target.txt.old.', ExtractFileName(Paths[Index])) = 1)
+        .ToBe(True);
+    end;
+  finally
+    Paths.Free;
+  end;
+end;
+
+procedure TMakeTmpPathSuite.TestSiblingExistingCandidateIsSkipped;
+var
+  BasePath, Candidate, ResultPath: string;
+begin
+  BasePath := IncludeTrailingPathDelimiter(FScratch) + 'target.txt';
+  Candidate := ComputeNextSequenceCandidate(MakeSiblingTmpPath(BasePath, 'old'));
+  WriteFixtureFile(Candidate, 'occupied');
+
+  ResultPath := MakeSiblingTmpPath(BasePath, 'old');
+
+  Expect<Boolean>(FileExists(Candidate)).ToBe(True);
+  Expect<Boolean>(ResultPath <> Candidate).ToBe(True);
+end;
+
+procedure TMakeTmpPathSuite.SetupTests;
+begin
+  Test('tight loop with one root and hint returns distinct paths',
+    TestManyCallsAreDistinct);
+  Test('pre-existing candidate is skipped',
+    TestExistingCandidateIsSkipped);
+  Test('multi-threaded burst returns distinct paths',
+    TestThreadedBurstIsDistinct);
+  Test('sibling paths for one base path are distinct',
+    TestSiblingCallsAreDistinct);
+  Test('pre-existing sibling candidate is skipped',
+    TestSiblingExistingCandidateIsSkipped);
+end;
+
 begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
-    'LWPT.Core: SHA-256 NIST vectors'));
+    PROJECT_NAME + '.Core: SHA-256 NIST vectors'));
   TestRunnerProgram.AddSuite(TLoadManifestHappy.Create(
-    'LWPT.Manifest: LoadManifest happy path'));
+    PROJECT_NAME + '.Manifest: LoadManifest happy path'));
   TestRunnerProgram.AddSuite(TLoadManifestValidation.Create(
-    'LWPT.Manifest: LoadManifest validation'));
+    PROJECT_NAME + '.Manifest: LoadManifest validation'));
   TestRunnerProgram.AddSuite(TLoadManifestExtensions.Create(
-    'LWPT.Manifest: LoadManifest extensions ([lwpt] / [format] / [generated])'));
+    PROJECT_NAME + '.Manifest: LoadManifest extensions ([' + PROGRAM_NAME
+    + '] / [format] / [generated])'));
   TestRunnerProgram.AddSuite(TLockfileLoading.Create(
-    'LWPT.Install: LoadLockfile'));
+    PROJECT_NAME + '.Install: LoadLockfile'));
   TestRunnerProgram.AddSuite(TVerifyAgainstLockfile.Create(
-    'LWPT.Install: VerifyAgainstLockfile'));
+    PROJECT_NAME + '.Install: VerifyAgainstLockfile'));
   TestRunnerProgram.AddSuite(TParseDependencySource.Create(
-    'LWPT.Manifest: ParseDependencySource'));
+    PROJECT_NAME + '.Manifest: ParseDependencySource'));
   TestRunnerProgram.AddSuite(TParseVersionSpec.Create(
-    'LWPT.Manifest: ParseVersionSpec'));
+    PROJECT_NAME + '.Manifest: ParseVersionSpec'));
   TestRunnerProgram.AddSuite(TGitProtocolParsing.Create(
-    'LWPT.GitProtocol: ParseInfoRefs'));
+    PROJECT_NAME + '.GitProtocol: ParseInfoRefs'));
   TestRunnerProgram.AddSuite(TCustomSources.Create(
-    'LWPT.Manifest: Custom [sources]'));
+    PROJECT_NAME + '.Manifest: Custom [sources]'));
   TestRunnerProgram.AddSuite(TPathGlobMatching.Create(
-    'LWPT.Core: MatchPathGlob'));
+    PROJECT_NAME + '.Core: MatchPathGlob'));
   TestRunnerProgram.AddSuite(TSanitisePathSegmentSuite.Create(
-    'LWPT.Core: SanitisePathSegment'));
+    PROJECT_NAME + '.Core: SanitisePathSegment'));
+  TestRunnerProgram.AddSuite(TMakeTmpPathSuite.Create(
+    PROJECT_NAME + '.Core: MakeTmpPath uniqueness'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
-    'LWPT.Core: ApplyIncludeExclude'));
+    PROJECT_NAME + '.Core: ApplyIncludeExclude'));
   TestRunnerProgram.AddSuite(TCopyDirTreeGuards.Create(
-    'LWPT.Core: CopyDirTree recursion guards'));
+    PROJECT_NAME + '.Core: CopyDirTree recursion guards'));
   TestRunnerProgram.AddSuite(TWipeDirSymlinks.Create(
-    'LWPT.Core: WipeDir symlink handling'));
+    PROJECT_NAME + '.Core: WipeDir symlink handling'));
   TestRunnerProgram.AddSuite(TPruneOrphans.Create(
-    'LWPT.Install: PruneOrphanedPackages'));
+    PROJECT_NAME + '.Install: PruneOrphanedPackages'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.
