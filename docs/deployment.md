@@ -6,8 +6,8 @@ Platform support tiers, the per-platform TLS backend story, the release process,
 
 - **Six release targets** map to the matrix in [`docs/ci.md`](./ci.md): `aarch64-darwin` + `x86_64-darwin` + `x86_64-linux` + `aarch64-linux` + `x86_64-win64` + `i386-win32`. All six tested natively on every push to `main` (per `ci.yml`); all six published per release tag (per `release.yml`).
 - **Outbound TLS stays platform-native; server accept is asymmetric.** Clients use SChannel on Windows, SecureTransport on macOS, and OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md). Server accept uses runtime-loaded OpenSSL on Windows and Unix-not-Darwin per [ADR-0024](./adr/0024-openssl-server-tls-accept.md); Darwin callers get an actionable Network.framework error.
-- **Windows releases still ship no OpenSSL DLLs.** SChannel clients have no prerequisite. A Windows program that consumes the server-accept interface supplies OpenSSL through the normal DLL search path.
-- **The three Windows CI guards inspect the PE import table.** They reject import-linked `libssl` / `libcrypto` while allowing the DLL-name strings required by the runtime-only server loader.
+- **Windows releases still ship no OpenSSL DLLs.** SChannel clients have no prerequisite. A Windows program that consumes the server-accept interface supplies OpenSSL from an administrator-controlled trusted DLL search directory.
+- **The three Windows CI guards inspect normal and delay PE imports.** They reject import-linked or delay-imported `libssl` / `libcrypto` while allowing the DLL-name strings required by the runtime-only server loader.
 - **No codesigning for v1.** macOS users see the "unidentified developer" warning; documented workaround is `xattr -d com.apple.quarantine ./lwpt`. Promote to Apple Developer ID + notarisation only on demonstrated demand.
 - **Release artefacts come from CI.** Tag → `release.yml` → cross-build on macos-latest → package → GitHub Releases. No hand-built releases; ever.
 
@@ -32,7 +32,7 @@ Per [ADR-0016](./adr/0016-tls-backend-per-platform.md) and [ADR-0024](./adr/0024
 | **macOS** | SecureTransport | Unsupported; use Network.framework | None |
 | **Linux + other Unix** | OpenSSL, runtime-loaded | OpenSSL, runtime-loaded | Distro's libssl package — see "Linux" below |
 
-`HTTPClient` consumes `StartTransportSecurity` for outbound connections. Fd-owning servers create one `TTransportSecurityServerContext` from caller-supplied PEM paths, reuse it across `StartTransportSecurityServer` calls, and then use the same `TransportSecurityRead` / `TransportSecurityWrite` / `CloseTransportSecurity` connection surface. Closing TLS state never closes the caller-owned socket. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for this package.
+`HTTPClient` consumes the blocking `StartTransportSecurity` surface for outbound connections. Fd-owning servers create one `TTransportSecurityServerContext` from a caller-supplied PKCS#12 path + passphrase and keep it alive while its connections exist. `BeginTransportSecurityServer` gives each connection private read/write memory BIOs; the transport feeds receive completions, steps the handshake or plaintext operation once, and offers the retained ciphertext queue through its partial-send contract. Graceful close queues `close_notify`; abortive close just frees TLS state. Neither path owns or closes the transport socket. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for this package.
 
 ### Windows: SChannel clients, OpenSSL servers
 
@@ -52,11 +52,11 @@ lwpt-<version>-windows-x64.zip
         └── build-system.md
 ```
 
-The server-accept interface is separate: a Windows application that invokes it must make compatible OpenSSL DLLs available through the normal Windows loader search path. `ConfigureOpenSSLLoading` prefers the OpenSSL 3 names and retains FreePascal's older fallbacks. LWPT never import-links or ships those DLLs, and `release.yml` does not stage them.
+The server-accept interface is separate: a Windows application that invokes it must make compatible OpenSSL DLLs available in an administrator-controlled trusted loader directory (for example, a locked-down application directory), never a user-writable working directory. `ConfigureOpenSSLLoading` prefers the OpenSSL 3 names and retains FreePascal's older fallbacks. LWPT never import-links or ships those DLLs, and `release.yml` does not stage them. Absolute configured loader paths remain deferred in ADR-0024.
 
 #### CI guard
 
-`pr.yml`, `ci.yml`, and `release.yml` each inspect the PE import table and fail only when `lwpt.exe` import-links `libssl` or `libcrypto`. The server path legitimately embeds those names for `LoadLibrary`, so a raw string scan would be a false positive. The pre-merge and release guards use `objdump -p` on their macOS cross-build runners; the native Windows test guard uses the hosted runner's GNU `objdump`. All three capture the tool output before matching, avoiding a pipefail/SIGPIPE false pass.
+`pr.yml`, `ci.yml`, and `release.yml` each parse both the normal PE import directory and the delay-import directory, failing when either names `libssl` or `libcrypto`. The server path legitimately embeds those names for `LoadLibrary`, so a raw string scan would be a false positive; checking only `objdump -p` would also miss delay imports. All three guards fail closed when the checker is unavailable or cannot parse the binary, and capture its complete output before matching so pipefail/SIGPIPE cannot hide a match.
 
 ### macOS: SecureTransport (no Homebrew dependency)
 
@@ -85,7 +85,7 @@ The judgement is that the user base in v1 is small enough that the quarantine wo
 
 ### Linux: system OpenSSL
 
-The `Unix`-and-not-`Darwin` branch of `TransportSecurity.pas` loads the system shared object at runtime via `DynLibs.LoadLibrary` against standard names (`libssl.so.3` / `libcrypto.so.3` and a small set of fallbacks). The same loaded interface serves outbound clients and server accepts. Users need their distro's libssl package:
+The `Unix`-and-not-`Darwin` branch of `TransportSecurity.pas` loads the system shared object at runtime via `DynLibs.LoadLibrary` against standard names (`libssl.so.3` / `libcrypto.so.3` and a small set of fallbacks). The same loaded interface serves outbound clients and the socket-independent memory-BIO server API. Users need their distro's libssl package:
 
 - Debian / Ubuntu: `apt install libssl3`
 - Fedora / RHEL: `dnf install openssl-libs`

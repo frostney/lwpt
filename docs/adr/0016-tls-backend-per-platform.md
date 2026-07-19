@@ -1,5 +1,11 @@
 # TLS-backend per platform — SChannel on Windows, SecureTransport on macOS, OpenSSL on Linux/Unix
 
+> **Amended by [ADR-0024](./0024-openssl-server-tls-accept.md).** This ADR now
+> governs the outbound blocking client path only. Its historical statements
+> that Windows must never load OpenSSL and that a raw DLL-name string scan is
+> the correct guard are superseded for server accept: Windows servers
+> runtime-load OpenSSL, while CI rejects both normal and delay imports.
+
 The vendored `TransportSecurity` unit ([`packages/httpclient/source/TransportSecurity.pas`](../../packages/httpclient/source/TransportSecurity.pas)) carries one cross-platform abstraction over three OS-native TLS implementations: **SChannel** on Windows, **SecureTransport** on macOS (Darwin), and **OpenSSL** (loaded at runtime via `DynLibs`) on every other Unix. earlier the LWPT docs claimed the opposite: that the Windows release archive had to bundle `libssl-3-x64.dll` + `libcrypto-3-x64.dll` next to `lwpt.exe`, and that macOS expected Homebrew `openssl@3` — both **factually wrong**, contradicted by the actual `{$IFDEF}` switches in the vendored unit, the GocciaScript upstream that LWPT vendors verbatim, and the release.yml workflow itself (which never bundled DLLs in any release). This ADR reconciles the docs with reality and adds a CI guard mirroring [GocciaScript's same check](https://github.com/frostney/GocciaScript/blob/main/.github/workflows/ci.yml) so a future "add `uses OpenSSL` to a Windows codepath" mistake fails at build time instead of corrupting a release. Net effect: no code change (already correct), no release-artefact change (already correct), no consumer-side change (Windows users were never given DLLs to install in the first place). The fix is documentation + CI guard. The previously-documented "OpenSSL on Windows is bundled" Hard Constraint in [`AGENTS.md`](../../AGENTS.md) is retired and replaced with the correct platform-tier statement; [`docs/deployment.md`](../deployment.md), [`docs/quick-start.md`](../quick-start.md), [`docs/tooling.md`](../tooling.md), [`docs/architecture.md`](../architecture.md), and [`docs/README.md`](../README.md) get the matching rewrites.
 
 ## Considered Options

@@ -1,6 +1,11 @@
-# TLS server test certificate
+# TLS server test identity
 
-`localhost-test-cert.pem` and `localhost-test-key.pem` are a throwaway,
-self-signed pair generated only for deterministic loopback TLS tests. The
-certificate is valid for `localhost` and `127.0.0.1`; the private key is not a
-credential and must never be used outside the test suite.
+`localhost-test-identity.p12` is a throwaway, self-signed PKCS#12 identity
+generated only for deterministic in-memory TLS tests. Its passphrase is
+`lwpt-test-only`. The leaf is valid for seven days, has critical `CA:FALSE`,
+has only the `serverAuth` extended-key usage, and names `localhost` plus
+`127.0.0.1`.
+
+The bundle and its private key are public test data, not credentials. Never
+install its certificate in a trust store or use the identity outside this test
+suite.

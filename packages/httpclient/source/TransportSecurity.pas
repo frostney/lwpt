@@ -1,7 +1,9 @@
 unit TransportSecurity;
 
-// Cross-platform TLS transport for blocking sockets.
-// macOS uses SecureTransport, Windows uses SChannel, Unix uses OpenSSL.
+// Cross-platform TLS transport. Blocking clients use SecureTransport on
+// macOS, SChannel on Windows, and OpenSSL on Unix. Nonblocking server accept
+// uses memory-BIO OpenSSL on Windows and Unix-not-Darwin; macOS servers use
+// Network.framework outside this unit.
 
 {$I Shared.inc}
 
@@ -29,6 +31,18 @@ uses
 type
   ETransportSecurityError = class(Exception);
 
+  TTransportSecurityState = (
+    tssDone,
+    tssWantRead,
+    tssWantWrite,
+    tssError
+  );
+
+  TTransportSecurityIOResult = record
+    State: TTransportSecurityState;
+    BytesProcessed: Integer;
+  end;
+
   TTransportSecurityConnection = record
   public
     Active: Boolean;
@@ -42,7 +56,7 @@ type
   private
     FBackendData: Pointer;
   public
-    constructor Create(const ACertificatePath, APrivateKeyPath: string);
+    constructor Create(const APkcs12Path, APkcs12Passphrase: string);
     destructor Destroy; override;
   end;
 
@@ -50,9 +64,31 @@ procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
   const ASocket: TSocket; const AHost: string);
 procedure CloseTransportSecurityServerContext(
   var AContext: TTransportSecurityServerContext);
-procedure StartTransportSecurityServer(
+procedure BeginTransportSecurityServer(
   var AConnection: TTransportSecurityConnection;
-  const AContext: TTransportSecurityServerContext; const ASocket: TSocket);
+  const AContext: TTransportSecurityServerContext);
+function TransportSecurityServerHandshake(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+function TransportSecurityFeedCiphertext(
+  var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
+  const ALength: Integer): Integer;
+function TransportSecurityPendingCiphertext(
+  const AConnection: TTransportSecurityConnection): Integer;
+function TransportSecurityGetCiphertext(
+  var AConnection: TTransportSecurityConnection;
+  out ABuffer: Pointer): Integer;
+procedure TransportSecurityConsumeCiphertext(
+  var AConnection: TTransportSecurityConnection; const ALength: Integer);
+function TransportSecurityServerRead(
+  var AConnection: TTransportSecurityConnection; var ABuffer: array of Byte;
+  const ALength: Integer): TTransportSecurityIOResult;
+function TransportSecurityServerWrite(
+  var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
+  const ALength: Integer): TTransportSecurityIOResult;
+function CloseTransportSecurityServerGracefully(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+procedure AbortTransportSecurityServer(
+  var AConnection: TTransportSecurityConnection);
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
 function TransportSecurityRead(var AConnection: TTransportSecurityConnection;
   var ABuffer: array of Byte; const ALength: Integer): Integer;
@@ -62,6 +98,7 @@ function TransportSecurityWrite(var AConnection: TTransportSecurityConnection;
 implementation
 
 uses
+  Classes,
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
@@ -79,6 +116,7 @@ const
   TSB_OPENSSL = 1;
   TSB_SECURE_TRANSPORT = 2;
   TSB_SCHANNEL = 3;
+  TSB_OPENSSL_SERVER = 4;
   OPENSSL_LOAD_ERROR = 'HTTPS requires OpenSSL but it could not be loaded';
   OPENSSL_SERVER_LOAD_ERROR =
     'TLS server accept requires OpenSSL but it could not be loaded';
@@ -364,13 +402,44 @@ type
     Context: PSSL_CTX;
   end;
 
+  TOpenSSLServerData = class
+  public
+    HandshakeDone: Boolean;
+    Output: TBytes;
+    OutputOffset: Integer;
+    ReadBIO: Pointer;
+    SSL: PSSL;
+    WriteBIO: Pointer;
+  end;
+
   TSSLSetDefaultVerifyPaths = function(AContext: PSSL_CTX): LongInt; cdecl;
   TSSLSetHostName = function(ASSL: PSSL; AHost: PAnsiChar): LongInt; cdecl;
   TSSLMethodGetter = function: Pointer; cdecl;
+  TBIOFree = function(ABIO: Pointer): LongInt; cdecl;
+  TBIONew = function(AMethod: Pointer): Pointer; cdecl;
+  TBIONewMemoryBuffer = function(ABuffer: Pointer;
+    ALength: LongInt): Pointer; cdecl;
+  TBIORead = function(ABIO, ABuffer: Pointer;
+    ALength: LongInt): LongInt; cdecl;
+  TBIOSMemory = function: Pointer; cdecl;
+  TBIOWrite = function(ABIO, ABuffer: Pointer;
+    ALength: LongInt): LongInt; cdecl;
+  TOpenSSLStackFree = procedure(AStack: Pointer); cdecl;
+  TOpenSSLStackNum = function(AStack: Pointer): LongInt; cdecl;
+  TOpenSSLStackValue = function(AStack: Pointer;
+    AIndex: LongInt): Pointer; cdecl;
+  TSSLSetAcceptState = procedure(ASSL: PSSL); cdecl;
+  TSSLSetBIO = procedure(ASSL: PSSL; AReadBIO, AWriteBIO: Pointer); cdecl;
 
 const
   SSL_CTRL_SET_MIN_PROTO_VERSION = 123;
+  SSL_CTRL_CHAIN_CERT = 89;
+  SSL_CTRL_OPTIONS = 32;
+  SSL_OP_NO_RENEGOTIATION = LongInt(1) shl 30;
   TLS1_2_VERSION = $0303;
+  BIO_C_SET_BUF_MEM_EOF_RETURN = 130;
+  BIO_CTRL_PENDING_COMMAND = 10;
+  OPENSSL_OUTPUT_CHUNK_SIZE = 16 * 1024;
   {$IFDEF MSWINDOWS}
   {$IFDEF WIN64}
   OPENSSL_VERSION_THREE_SSL_LIBRARY = 'libssl-3-x64.dll';
@@ -382,6 +451,19 @@ const
   {$ELSE}
   OPENSSL_VERSION_THREE = '.3';
   {$ENDIF}
+
+var
+  OpenSSLBIOFree: TBIOFree;
+  OpenSSLBIONew: TBIONew;
+  OpenSSLBIONewMemoryBuffer: TBIONewMemoryBuffer;
+  OpenSSLBIORead: TBIORead;
+  OpenSSLBIOSMemory: TBIOSMemory;
+  OpenSSLBIOWrite: TBIOWrite;
+  OpenSSLStackFree: TOpenSSLStackFree;
+  OpenSSLStackNum: TOpenSSLStackNum;
+  OpenSSLStackValue: TOpenSSLStackValue;
+  OpenSSLSSLSetAcceptState: TSSLSetAcceptState;
+  OpenSSLSSLSetBIO: TSSLSetBIO;
 
 {$IFDEF UNIX}
 procedure PreferOpenSSLVersionThree;
@@ -459,6 +541,45 @@ begin
   Result := InitSSLInterface;
 end;
 
+procedure LoadOpenSSLServerProcedures;
+begin
+  if Assigned(OpenSSLSSLSetBIO) then
+    Exit;
+
+  OpenSSLBIOFree := TBIOFree(GetProcedureAddress(SSLUtilHandle,
+    'BIO_free'));
+  OpenSSLBIONew := TBIONew(GetProcedureAddress(SSLUtilHandle,
+    'BIO_new'));
+  OpenSSLBIONewMemoryBuffer := TBIONewMemoryBuffer(GetProcedureAddress(
+    SSLUtilHandle, 'BIO_new_mem_buf'));
+  OpenSSLBIORead := TBIORead(GetProcedureAddress(SSLUtilHandle,
+    'BIO_read'));
+  OpenSSLBIOSMemory := TBIOSMemory(GetProcedureAddress(SSLUtilHandle,
+    'BIO_s_mem'));
+  OpenSSLBIOWrite := TBIOWrite(GetProcedureAddress(SSLUtilHandle,
+    'BIO_write'));
+  OpenSSLStackFree := TOpenSSLStackFree(GetProcedureAddress(SSLUtilHandle,
+    'OPENSSL_sk_free'));
+  OpenSSLStackNum := TOpenSSLStackNum(GetProcedureAddress(SSLUtilHandle,
+    'OPENSSL_sk_num'));
+  OpenSSLStackValue := TOpenSSLStackValue(GetProcedureAddress(
+    SSLUtilHandle, 'OPENSSL_sk_value'));
+  OpenSSLSSLSetAcceptState := TSSLSetAcceptState(GetProcedureAddress(
+    SSLLibHandle, 'SSL_set_accept_state'));
+  OpenSSLSSLSetBIO := TSSLSetBIO(GetProcedureAddress(SSLLibHandle,
+    'SSL_set_bio'));
+
+  if not Assigned(OpenSSLBIOFree) or not Assigned(OpenSSLBIONew) or
+     not Assigned(OpenSSLBIONewMemoryBuffer) or
+     not Assigned(OpenSSLBIORead) or not Assigned(OpenSSLBIOSMemory) or
+     not Assigned(OpenSSLBIOWrite) or not Assigned(OpenSSLStackFree) or
+     not Assigned(OpenSSLStackNum) or not Assigned(OpenSSLStackValue) or
+     not Assigned(OpenSSLSSLSetAcceptState) or
+     not Assigned(OpenSSLSSLSetBIO) then
+    raise ETransportSecurityError.Create(
+      'OpenSSL runtime does not provide the required TLS server memory-BIO interface');
+end;
+
 procedure ConfigureOpenSSLVerification(const AContext: PSSL_CTX;
   const ASSL: PSSL; const AHost: string);
 var
@@ -529,6 +650,14 @@ begin
     raise ETransportSecurityError.Create(
       'Failed to set minimum OpenSSL server TLS version');
   end;
+
+  if (SslCTXCtrl(Result, SSL_CTRL_OPTIONS, SSL_OP_NO_RENEGOTIATION,
+    nil) and SSL_OP_NO_RENEGOTIATION) = 0 then
+  begin
+    SslCtxFree(Result);
+    raise ETransportSecurityError.Create(
+      'Failed to disable OpenSSL server renegotiation');
+  end;
 end;
 
 procedure StartOpenSSL(var AConnection: TTransportSecurityConnection;
@@ -574,49 +703,399 @@ begin
   end;
 end;
 
-procedure StartOpenSSLServer(var AConnection: TTransportSecurityConnection;
+procedure FreeOpenSSLServerData(const AData: TOpenSSLServerData);
+begin
+  if not Assigned(AData) then
+    Exit;
+  if Assigned(AData.SSL) then
+    SslFree(AData.SSL);
+  AData.SSL := nil;
+  AData.ReadBIO := nil;
+  AData.WriteBIO := nil;
+  AData.Free;
+end;
+
+procedure ResetTransportSecurityConnection(
+  var AConnection: TTransportSecurityConnection); inline;
+begin
+  AConnection.Active := False;
+  AConnection.Backend := TSB_NONE;
+  AConnection.BackendData := nil;
+end;
+
+procedure PoisonOpenSSLServerConnection(
+  var AConnection: TTransportSecurityConnection);
+var
+  Data: TOpenSSLServerData;
+begin
+  Data := TOpenSSLServerData(AConnection.BackendData);
+  ResetTransportSecurityConnection(AConnection);
+  FreeOpenSSLServerData(Data);
+end;
+
+function OpenSSLServerData(
+  const AConnection: TTransportSecurityConnection): TOpenSSLServerData;
+  inline;
+begin
+  if AConnection.Active and
+     (AConnection.Backend = TSB_OPENSSL_SERVER) then
+    Result := TOpenSSLServerData(AConnection.BackendData)
+  else
+    Result := nil;
+end;
+
+function CollectOpenSSLServerCiphertext(
+  const AData: TOpenSSLServerData): Boolean;
+var
+  ChunkLength: Integer;
+  ExistingLength: Integer;
+  Pending: Int64;
+  PendingLength: Integer;
+  ReadCount: Integer;
+begin
+  Result := False;
+  if not Assigned(AData) or not Assigned(AData.WriteBIO) then
+    Exit;
+
+  PendingLength := Length(AData.Output) - AData.OutputOffset;
+  if (AData.OutputOffset > 0) and (PendingLength > 0) then
+    Move(AData.Output[AData.OutputOffset], AData.Output[0], PendingLength);
+  if AData.OutputOffset > 0 then
+  begin
+    SetLength(AData.Output, PendingLength);
+    AData.OutputOffset := 0;
+  end;
+
+  repeat
+    Pending := BIO_ctrl(AData.WriteBIO, BIO_CTRL_PENDING_COMMAND, 0, nil);
+    if Pending <= 0 then
+      Break;
+    if Pending > OPENSSL_OUTPUT_CHUNK_SIZE then
+      ChunkLength := OPENSSL_OUTPUT_CHUNK_SIZE
+    else
+      ChunkLength := Integer(Pending);
+    ExistingLength := Length(AData.Output);
+    SetLength(AData.Output, ExistingLength + ChunkLength);
+    ReadCount := OpenSSLBIORead(AData.WriteBIO,
+      @AData.Output[ExistingLength], ChunkLength);
+    if ReadCount <= 0 then
+    begin
+      SetLength(AData.Output, ExistingLength);
+      Exit;
+    end;
+    if ReadCount < ChunkLength then
+      SetLength(AData.Output, ExistingLength + ReadCount);
+  until False;
+  Result := True;
+end;
+
+function OpenSSLServerPendingCiphertext(
+  const AData: TOpenSSLServerData): Integer; inline;
+begin
+  if Assigned(AData) then
+    Result := Length(AData.Output) - AData.OutputOffset
+  else
+    Result := 0;
+end;
+
+function OpenSSLServerErrorState(var AConnection: TTransportSecurityConnection;
+  const AData: TOpenSSLServerData; const AErrorCode: Integer;
+  const AZeroReturnState: TTransportSecurityState): TTransportSecurityState;
+begin
+  if (AErrorCode <> SSL_ERROR_WANT_READ) and
+     (AErrorCode <> SSL_ERROR_WANT_WRITE) and
+     (AErrorCode <> SSL_ERROR_ZERO_RETURN) then
+  begin
+    PoisonOpenSSLServerConnection(AConnection);
+    Result := tssError;
+    Exit;
+  end;
+
+  if not CollectOpenSSLServerCiphertext(AData) then
+  begin
+    PoisonOpenSSLServerConnection(AConnection);
+    Result := tssError;
+    Exit;
+  end;
+
+  if OpenSSLServerPendingCiphertext(AData) > 0 then
+  begin
+    Result := tssWantWrite;
+    Exit;
+  end;
+
+  case AErrorCode of
+    SSL_ERROR_WANT_READ:
+      Result := tssWantRead;
+    SSL_ERROR_WANT_WRITE:
+      Result := tssWantWrite;
+    SSL_ERROR_ZERO_RETURN:
+      Result := AZeroReturnState;
+  end;
+end;
+
+procedure BeginOpenSSLServer(var AConnection: TTransportSecurityConnection;
   const AContext: TTransportSecurityServerContext);
 var
+  BIOsOwnedBySSL: Boolean;
   ContextData: TOpenSSLServerContextData;
-  Data: TOpenSSLData;
-  AcceptResult: Integer;
-  ErrorCode: Integer;
+  Data: TOpenSSLServerData;
 begin
   ContextData := TOpenSSLServerContextData(AContext.FBackendData);
   if not Assigned(ContextData) or not Assigned(ContextData.Context) then
     raise ETransportSecurityError.Create(
       'TLS server context is not initialized');
 
-  Data := TOpenSSLData.Create;
-  Data.Context := nil;
-  Data.SSL := nil;
+  Data := TOpenSSLServerData.Create;
+  BIOsOwnedBySSL := False;
   try
     Data.SSL := SslNew(ContextData.Context);
     if not Assigned(Data.SSL) then
       raise ETransportSecurityError.Create(
         'Failed to create OpenSSL server session');
 
-    if SslSetFd(Data.SSL, AConnection.Socket) <> 1 then
+    Data.ReadBIO := OpenSSLBIONew(OpenSSLBIOSMemory());
+    Data.WriteBIO := OpenSSLBIONew(OpenSSLBIOSMemory());
+    if not Assigned(Data.ReadBIO) or not Assigned(Data.WriteBIO) then
       raise ETransportSecurityError.Create(
-        'Failed to bind OpenSSL server session to socket');
+        'Failed to create OpenSSL server memory BIOs');
+    if BIO_ctrl(Data.ReadBIO, BIO_C_SET_BUF_MEM_EOF_RETURN, -1, nil) <= 0 then
+      raise ETransportSecurityError.Create(
+        'Failed to configure OpenSSL server read BIO');
 
-    AcceptResult := SslAccept(Data.SSL);
-    if AcceptResult <= 0 then
-    begin
-      ErrorCode := SslGetError(Data.SSL, AcceptResult);
-      raise ETransportSecurityError.CreateFmt(
-        'TLS accept handshake failed: OpenSSL error %d', [ErrorCode]);
-    end;
+    OpenSSLSSLSetBIO(Data.SSL, Data.ReadBIO, Data.WriteBIO);
+    BIOsOwnedBySSL := True;
+    OpenSSLSSLSetAcceptState(Data.SSL);
 
     AConnection.BackendData := Data;
-    AConnection.Backend := TSB_OPENSSL;
+    AConnection.Backend := TSB_OPENSSL_SERVER;
     AConnection.Active := True;
   except
-    if Assigned(Data.SSL) then
-      SslFree(Data.SSL);
-    Data.Free;
+    if not BIOsOwnedBySSL then
+    begin
+      if Assigned(Data.ReadBIO) then
+        OpenSSLBIOFree(Data.ReadBIO);
+      if Assigned(Data.WriteBIO) then
+        OpenSSLBIOFree(Data.WriteBIO);
+      Data.ReadBIO := nil;
+      Data.WriteBIO := nil;
+    end;
+    FreeOpenSSLServerData(Data);
     raise;
   end;
+end;
+
+function HandshakeOpenSSLServer(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+var
+  AcceptResult: Integer;
+  Data: TOpenSSLServerData;
+  ErrorCode: Integer;
+begin
+  Data := OpenSSLServerData(AConnection);
+  if not Assigned(Data) then
+  begin
+    Result := tssError;
+    Exit;
+  end;
+  if Data.HandshakeDone then
+  begin
+    if OpenSSLServerPendingCiphertext(Data) > 0 then
+      Result := tssWantWrite
+    else
+      Result := tssDone;
+    Exit;
+  end;
+
+  ErrClearError;
+  AcceptResult := SslAccept(Data.SSL);
+  if AcceptResult <= 0 then
+    ErrorCode := SslGetError(Data.SSL, AcceptResult)
+  else
+    ErrorCode := SSL_ERROR_NONE;
+
+  if AcceptResult = 1 then
+  begin
+    Data.HandshakeDone := True;
+    if not CollectOpenSSLServerCiphertext(Data) then
+    begin
+      PoisonOpenSSLServerConnection(AConnection);
+      Result := tssError;
+    end
+    else if OpenSSLServerPendingCiphertext(Data) > 0 then
+      Result := tssWantWrite
+    else
+      Result := tssDone;
+    Exit;
+  end;
+
+  Result := OpenSSLServerErrorState(AConnection, Data, ErrorCode, tssError);
+end;
+
+function FeedOpenSSLServerCiphertext(
+  var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
+  const ALength: Integer): Integer;
+var
+  Data: TOpenSSLServerData;
+begin
+  Data := OpenSSLServerData(AConnection);
+  if not Assigned(Data) then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  if ALength <= 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if not Assigned(ABuffer) then
+    raise ETransportSecurityError.Create(
+      'TLS ciphertext input buffer is nil');
+
+  Result := OpenSSLBIOWrite(Data.ReadBIO, ABuffer, ALength);
+  if Result <= 0 then
+  begin
+    PoisonOpenSSLServerConnection(AConnection);
+    Result := -1;
+  end;
+end;
+
+function ReadOpenSSLServer(var AConnection: TTransportSecurityConnection;
+  var ABuffer: array of Byte;
+  const ALength: Integer): TTransportSecurityIOResult;
+var
+  Data: TOpenSSLServerData;
+  ErrorCode: Integer;
+  ReadLength: Integer;
+begin
+  Result.State := tssError;
+  Result.BytesProcessed := 0;
+  Data := OpenSSLServerData(AConnection);
+  if not Assigned(Data) or not Data.HandshakeDone then
+    Exit;
+
+  ReadLength := ALength;
+  if ReadLength > Length(ABuffer) then
+    ReadLength := Length(ABuffer);
+  if ReadLength <= 0 then
+  begin
+    Result.State := tssDone;
+    Exit;
+  end;
+
+  ErrClearError;
+  Result.BytesProcessed := SslRead(Data.SSL, @ABuffer[0], ReadLength);
+  if Result.BytesProcessed <= 0 then
+    ErrorCode := SslGetError(Data.SSL, Result.BytesProcessed)
+  else
+    ErrorCode := SSL_ERROR_NONE;
+
+  if Result.BytesProcessed > 0 then
+  begin
+    if not CollectOpenSSLServerCiphertext(Data) then
+    begin
+      Result.BytesProcessed := 0;
+      PoisonOpenSSLServerConnection(AConnection);
+      Exit;
+    end;
+    if OpenSSLServerPendingCiphertext(Data) > 0 then
+      Result.State := tssWantWrite
+    else
+      Result.State := tssDone;
+    Exit;
+  end;
+
+  Result.BytesProcessed := 0;
+  Result.State := OpenSSLServerErrorState(AConnection, Data, ErrorCode,
+    tssDone);
+end;
+
+function WriteOpenSSLServer(var AConnection: TTransportSecurityConnection;
+  const ABuffer: Pointer;
+  const ALength: Integer): TTransportSecurityIOResult;
+var
+  Data: TOpenSSLServerData;
+  ErrorCode: Integer;
+begin
+  Result.State := tssError;
+  Result.BytesProcessed := 0;
+  Data := OpenSSLServerData(AConnection);
+  if not Assigned(Data) or not Data.HandshakeDone then
+    Exit;
+  if ALength <= 0 then
+  begin
+    Result.State := tssDone;
+    Exit;
+  end;
+  if not Assigned(ABuffer) then
+    raise ETransportSecurityError.Create(
+      'TLS plaintext output buffer is nil');
+
+  ErrClearError;
+  Result.BytesProcessed := SslWrite(Data.SSL, ABuffer, ALength);
+  if Result.BytesProcessed <= 0 then
+    ErrorCode := SslGetError(Data.SSL, Result.BytesProcessed)
+  else
+    ErrorCode := SSL_ERROR_NONE;
+
+  if Result.BytesProcessed > 0 then
+  begin
+    if not CollectOpenSSLServerCiphertext(Data) then
+    begin
+      Result.BytesProcessed := 0;
+      PoisonOpenSSLServerConnection(AConnection);
+      Exit;
+    end;
+    if OpenSSLServerPendingCiphertext(Data) > 0 then
+      Result.State := tssWantWrite
+    else
+      Result.State := tssDone;
+    Exit;
+  end;
+
+  Result.BytesProcessed := 0;
+  Result.State := OpenSSLServerErrorState(AConnection, Data, ErrorCode,
+    tssDone);
+end;
+
+function CloseOpenSSLServerGracefully(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+var
+  Data: TOpenSSLServerData;
+  ErrorCode: Integer;
+  ShutdownResult: Integer;
+begin
+  Data := OpenSSLServerData(AConnection);
+  if not Assigned(Data) then
+  begin
+    Result := tssError;
+    Exit;
+  end;
+
+  ErrClearError;
+  ShutdownResult := SslShutdown(Data.SSL);
+  if ShutdownResult < 0 then
+    ErrorCode := SslGetError(Data.SSL, ShutdownResult)
+  else
+    ErrorCode := SSL_ERROR_NONE;
+  if not CollectOpenSSLServerCiphertext(Data) then
+  begin
+    PoisonOpenSSLServerConnection(AConnection);
+    Result := tssError;
+    Exit;
+  end;
+  if OpenSSLServerPendingCiphertext(Data) > 0 then
+  begin
+    Result := tssWantWrite;
+    Exit;
+  end;
+  if ShutdownResult = 1 then
+    Result := tssDone
+  else if ShutdownResult = 0 then
+    Result := tssWantRead
+  else
+    Result := OpenSSLServerErrorState(AConnection, Data, ErrorCode, tssDone);
 end;
 
 procedure CloseOpenSSL(var AConnection: TTransportSecurityConnection);
@@ -645,6 +1124,7 @@ var
 begin
   Data := TOpenSSLData(AConnection.BackendData);
   repeat
+    ErrClearError;
     Result := SslRead(Data.SSL, @ABuffer[0], ALength);
     if Result > 0 then
       Exit;
@@ -674,6 +1154,7 @@ var
 begin
   Data := TOpenSSLData(AConnection.BackendData);
   repeat
+    ErrClearError;
     Result := SslWrite(Data.SSL, ABuffer, ALength);
     if Result > 0 then
       Exit;
@@ -693,6 +1174,121 @@ begin
         [TLS_WRITE_ERROR, ErrorCode]);
     end;
   until False;
+end;
+
+function LoadPKCS12Bytes(const APath: string): TBytes;
+var
+  Input: TFileStream;
+begin
+  Result := nil;
+  if not FileExists(APath) then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity file does not exist');
+  try
+    Input := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
+    try
+      if Input.Size <= 0 then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 identity file is empty');
+      if Input.Size > High(Integer) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 identity file is too large');
+      SetLength(Result, Integer(Input.Size));
+      Input.ReadBuffer(Result[0], Length(Result));
+    finally
+      Input.Free;
+    end;
+  except
+    on E: ETransportSecurityError do
+      raise;
+    on E: Exception do
+      raise ETransportSecurityError.Create(
+        'Failed to read configured TLS PKCS#12 identity file');
+  end;
+end;
+
+procedure FreePKCS12Chain(const AChain: Pointer);
+var
+  Certificate: Pointer;
+  I: Integer;
+begin
+  if not Assigned(AChain) then
+    Exit;
+  for I := 0 to OpenSSLStackNum(AChain) - 1 do
+  begin
+    Certificate := OpenSSLStackValue(AChain, I);
+    if Assigned(Certificate) then
+      X509Free(Certificate);
+  end;
+  OpenSSLStackFree(AChain);
+end;
+
+procedure ConfigureOpenSSLServerIdentity(const AContext: PSSL_CTX;
+  const AIdentity: TBytes; const APassphrase: string);
+var
+  Certificate: Pointer;
+  Chain: Pointer;
+  ChainCertificate: Pointer;
+  I: Integer;
+  IdentityBIO: Pointer;
+  Passphrase: AnsiString;
+  PKCS12: Pointer;
+  PrivateKey: Pointer;
+begin
+  Certificate := nil;
+  Chain := nil;
+  IdentityBIO := nil;
+  PKCS12 := nil;
+  PrivateKey := nil;
+  try
+    IdentityBIO := OpenSSLBIONewMemoryBuffer(@AIdentity[0],
+      Length(AIdentity));
+    if not Assigned(IdentityBIO) then
+      raise ETransportSecurityError.Create(
+        'Failed to read configured TLS PKCS#12 identity');
+    PKCS12 := d2iPKCS12bio(IdentityBIO, nil);
+    if not Assigned(PKCS12) then
+      raise ETransportSecurityError.Create(
+        'Failed to parse configured TLS PKCS#12 identity; verify the bundle and passphrase');
+
+    Passphrase := AnsiString(APassphrase);
+    if PKCS12parse(PKCS12, Passphrase, PrivateKey, Certificate, Chain) <> 1 then
+      raise ETransportSecurityError.Create(
+        'Failed to parse configured TLS PKCS#12 identity; verify the bundle and passphrase');
+    if not Assigned(Certificate) or not Assigned(PrivateKey) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must contain a certificate and private key');
+
+    if SslCtxUseCertificate(AContext, Certificate) <> 1 then
+      raise ETransportSecurityError.Create(
+        'Failed to configure the certificate from the TLS PKCS#12 identity');
+    if SslCtxUsePrivateKey(AContext, PrivateKey) <> 1 then
+      raise ETransportSecurityError.Create(
+        'Failed to configure the private key from the TLS PKCS#12 identity');
+    if Assigned(Chain) then
+      for I := 0 to OpenSSLStackNum(Chain) - 1 do
+      begin
+        ChainCertificate := OpenSSLStackValue(Chain, I);
+        if Assigned(ChainCertificate) and
+           (SslCTXCtrl(AContext, SSL_CTRL_CHAIN_CERT, 1,
+           ChainCertificate) <= 0) then
+          raise ETransportSecurityError.Create(
+            'Failed to configure the certificate chain from the TLS PKCS#12 identity');
+      end;
+    if SslCtxCheckPrivateKeyFile(AContext) <> 1 then
+      raise ETransportSecurityError.Create(
+        'The certificate and private key in the TLS PKCS#12 identity do not match');
+  finally
+    FreePKCS12Chain(Chain);
+    if Assigned(Certificate) then
+      X509Free(Certificate);
+    if Assigned(PrivateKey) then
+      EVP_PKEY_free(PrivateKey);
+    if Assigned(PKCS12) then
+      PKCS12free(PKCS12);
+    if Assigned(IdentityBIO) then
+      OpenSSLBIOFree(IdentityBIO);
+  end;
 end;
 {$ENDIF}
 
@@ -1254,42 +1850,27 @@ end;
 {$ENDIF}
 
 constructor TTransportSecurityServerContext.Create(
-  const ACertificatePath, APrivateKeyPath: string);
+  const APkcs12Path, APkcs12Passphrase: string);
 {$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Data: TOpenSSLServerContextData;
+  Identity: TBytes;
 {$ENDIF}
 begin
   inherited Create;
   FBackendData := nil;
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
-  if not FileExists(ACertificatePath) then
-    raise ETransportSecurityError.CreateFmt(
-      'TLS certificate PEM file does not exist: "%s"', [ACertificatePath]);
-  if not FileExists(APrivateKeyPath) then
-    raise ETransportSecurityError.CreateFmt(
-      'TLS private-key PEM file does not exist: "%s"', [APrivateKeyPath]);
   if not TryLoadOpenSSL then
     raise ETransportSecurityError.Create(OPENSSL_SERVER_LOAD_ERROR);
+  LoadOpenSSLServerProcedures;
+  Identity := LoadPKCS12Bytes(APkcs12Path);
 
   Data := TOpenSSLServerContextData.Create;
   Data.Context := nil;
   FBackendData := Data;
   Data.Context := CreateOpenSSLServerContext;
-  if SslCtxUseCertificateChainFile(Data.Context,
-    AnsiString(ACertificatePath)) <> 1 then
-    raise ETransportSecurityError.CreateFmt(
-      'Failed to load TLS certificate chain from PEM file "%s"',
-      [ACertificatePath]);
-  if SslCtxUsePrivateKeyFile(Data.Context, AnsiString(APrivateKeyPath),
-    SSL_FILETYPE_PEM) <> 1 then
-    raise ETransportSecurityError.CreateFmt(
-      'Failed to load TLS private key from PEM file "%s"',
-      [APrivateKeyPath]);
-  if SslCtxCheckPrivateKeyFile(Data.Context) <> 1 then
-    raise ETransportSecurityError.CreateFmt(
-      'TLS private key "%s" does not match certificate "%s"',
-      [APrivateKeyPath, ACertificatePath]);
+  ConfigureOpenSSLServerIdentity(Data.Context, Identity,
+    APkcs12Passphrase);
   {$ELSE}
   raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
   {$ENDIF}
@@ -1338,21 +1919,154 @@ begin
   {$ENDIF}
 end;
 
-procedure StartTransportSecurityServer(
+procedure BeginTransportSecurityServer(
   var AConnection: TTransportSecurityConnection;
-  const AContext: TTransportSecurityServerContext; const ASocket: TSocket);
+  const AContext: TTransportSecurityServerContext);
 begin
   FillChar(AConnection, SizeOf(AConnection), 0);
-  AConnection.Socket := ASocket;
   AConnection.Backend := TSB_NONE;
 
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   if not Assigned(AContext) then
     raise ETransportSecurityError.Create(
       'TLS server context is not initialized');
-  StartOpenSSLServer(AConnection, AContext);
+  BeginOpenSSLServer(AConnection, AContext);
   {$ELSE}
   raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
+  {$ENDIF}
+end;
+
+function TransportSecurityServerHandshake(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Result := HandshakeOpenSSLServer(AConnection);
+  {$ELSE}
+  Result := tssError;
+  {$ENDIF}
+end;
+
+function TransportSecurityFeedCiphertext(
+  var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
+  const ALength: Integer): Integer;
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Result := FeedOpenSSLServerCiphertext(AConnection, ABuffer, ALength);
+  {$ELSE}
+  Result := -1;
+  {$ENDIF}
+end;
+
+function TransportSecurityPendingCiphertext(
+  const AConnection: TTransportSecurityConnection): Integer;
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  Data: TOpenSSLServerData;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Data := OpenSSLServerData(AConnection);
+  Result := OpenSSLServerPendingCiphertext(Data);
+  {$ELSE}
+  Result := 0;
+  {$ENDIF}
+end;
+
+function TransportSecurityGetCiphertext(
+  var AConnection: TTransportSecurityConnection;
+  out ABuffer: Pointer): Integer;
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  Data: TOpenSSLServerData;
+{$ENDIF}
+begin
+  ABuffer := nil;
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Data := OpenSSLServerData(AConnection);
+  Result := OpenSSLServerPendingCiphertext(Data);
+  if Result > 0 then
+    ABuffer := @Data.Output[Data.OutputOffset];
+  {$ELSE}
+  Result := 0;
+  {$ENDIF}
+end;
+
+procedure TransportSecurityConsumeCiphertext(
+  var AConnection: TTransportSecurityConnection; const ALength: Integer);
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  Data: TOpenSSLServerData;
+  Pending: Integer;
+{$ENDIF}
+begin
+  if ALength <= 0 then
+    Exit;
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Data := OpenSSLServerData(AConnection);
+  Pending := OpenSSLServerPendingCiphertext(Data);
+  if not Assigned(Data) or (ALength > Pending) then
+    raise ETransportSecurityError.Create(
+      'TLS ciphertext consumption exceeds the pending output');
+  Inc(Data.OutputOffset, ALength);
+  if Data.OutputOffset = Length(Data.Output) then
+  begin
+    SetLength(Data.Output, 0);
+    Data.OutputOffset := 0;
+  end;
+  {$ELSE}
+  raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
+  {$ENDIF}
+end;
+
+function TransportSecurityServerRead(
+  var AConnection: TTransportSecurityConnection; var ABuffer: array of Byte;
+  const ALength: Integer): TTransportSecurityIOResult;
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Result := ReadOpenSSLServer(AConnection, ABuffer, ALength);
+  {$ELSE}
+  Result.State := tssError;
+  Result.BytesProcessed := 0;
+  {$ENDIF}
+end;
+
+function TransportSecurityServerWrite(
+  var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
+  const ALength: Integer): TTransportSecurityIOResult;
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Result := WriteOpenSSLServer(AConnection, ABuffer, ALength);
+  {$ELSE}
+  Result.State := tssError;
+  Result.BytesProcessed := 0;
+  {$ENDIF}
+end;
+
+function CloseTransportSecurityServerGracefully(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Result := CloseOpenSSLServerGracefully(AConnection);
+  {$ELSE}
+  Result := tssError;
+  {$ENDIF}
+end;
+
+procedure AbortTransportSecurityServer(
+  var AConnection: TTransportSecurityConnection);
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  Data: TOpenSSLServerData;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Data := OpenSSLServerData(AConnection);
+  ResetTransportSecurityConnection(AConnection);
+  FreeOpenSSLServerData(Data);
+  {$ELSE}
+  AConnection.Active := False;
+  AConnection.Backend := TSB_NONE;
+  AConnection.BackendData := nil;
   {$ENDIF}
 end;
 
@@ -1373,6 +2087,8 @@ begin
     {$IFDEF TRANSPORT_SECURITY_OPENSSL}
     TSB_OPENSSL:
       CloseOpenSSL(AConnection);
+    TSB_OPENSSL_SERVER:
+      FreeOpenSSLServerData(TOpenSSLServerData(AConnection.BackendData));
     {$ENDIF}
   end;
 
@@ -1383,8 +2099,13 @@ end;
 
 function TransportSecurityRead(var AConnection: TTransportSecurityConnection;
   var ABuffer: array of Byte; const ALength: Integer): Integer;
+var
+  ReadLength: Integer;
 begin
-  if ALength <= 0 then
+  ReadLength := ALength;
+  if ReadLength > Length(ABuffer) then
+    ReadLength := Length(ABuffer);
+  if ReadLength <= 0 then
   begin
     Result := 0;
     Exit;
@@ -1393,15 +2114,15 @@ begin
   case AConnection.Backend of
     {$IFDEF DARWIN}
     TSB_SECURE_TRANSPORT:
-      Result := ReadSecureTransport(AConnection, ABuffer, ALength);
+      Result := ReadSecureTransport(AConnection, ABuffer, ReadLength);
     {$ENDIF}
     {$IFDEF MSWINDOWS}
     TSB_SCHANNEL:
-      Result := ReadSChannel(AConnection, ABuffer, ALength);
+      Result := ReadSChannel(AConnection, ABuffer, ReadLength);
     {$ENDIF}
     {$IFDEF TRANSPORT_SECURITY_OPENSSL}
     TSB_OPENSSL:
-      Result := ReadOpenSSL(AConnection, ABuffer, ALength);
+      Result := ReadOpenSSL(AConnection, ABuffer, ReadLength);
     {$ENDIF}
   else
     Result := 0;

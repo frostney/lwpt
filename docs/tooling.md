@@ -11,7 +11,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
   `LWPT_WORKER_*` settings below. `--jobs=<n>` is the invocation ceiling; the
   machine budget remains authoritative across processes and worktrees.
 - **Worker capacity is coordinated across worktrees.** The internal worker-budget module uses per-user, reclaimable filesystem leases. Its default budget is the host's logical processor count; `LWPT_WORKER_BUDGET` overrides it.
-- **TLS backend is platform-native.** SChannel on Windows, SecureTransport on macOS — both built into the OS, no DLLs to bundle. Linux uses the distro's libssl package (system OpenSSL via `dlopen`). Per [ADR-0016](./adr/0016-tls-backend-per-platform.md).
+- **TLS clients are platform-native; server accept is asymmetric.** Clients use SChannel on Windows, SecureTransport on macOS, and system OpenSSL on other Unix. The memory-BIO server API runtime-loads OpenSSL on Windows and Unix-not-Darwin; macOS servers use Network.framework. Per [ADR-0016](./adr/0016-tls-backend-per-platform.md) and [ADR-0024](./adr/0024-openssl-server-tls-accept.md).
 - **EXDEV-rename failures fall back to copy-then-delete.** When `.lwpt/tmp/` and `.lwpt/modules/` end up on different filesystems (Docker bind mounts, network drives), the atomic-rename helpers (`AtomicMoveFile`, `AtomicMoveDir`) automatically fall back to a copy followed by delete.
 - **Compiler outputs are session-private.** Build and test invocations write
   below `.lwpt/sessions/<session-id>/`; only a successful, revalidated build
@@ -26,7 +26,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 | InstantFPC | bundled with FPC | `instantfpc --help` |
 | Lefthook | 2.x | `lefthook version` |
 | git-cliff | Verify the installed release live | `git-cliff --version` |
-| OpenSSL (Linux runtime only) | 3.x via distro libssl | `openssl version` (Windows + macOS use SChannel / SecureTransport instead) |
+| OpenSSL (Unix-not-Darwin and Windows server runtime) | 3.x | `openssl version` (Windows clients and macOS use SChannel / SecureTransport) |
 
 When you touch code that depends on the version, **verify it live, not from memory.** The Hard Constraint in `AGENTS.md` is explicit about this. If you bump a version, the new pin lives in this file and in the relevant CI workflow.
 
@@ -118,11 +118,13 @@ and state-root path.
 
 Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), the `TransportSecurity` unit (in `packages/httpclient/source/`) selects the TLS implementation by FPC conditional — each platform uses what ships with the OS:
 
-- **Windows.** **SChannel** via `sspi.dll` / `secur32.dll` (Windows API; built into every Windows install since Windows 2000). No DLLs to install, no DLLs in the release archive. A CI guard (`pr.yml` windows-cross-compile job + `ci.yml` test job + `release.yml` build job) fails the build if `lwpt.exe` accidentally references `libssl` / `libcrypto`.
+- **Windows.** **SChannel** via `sspi.dll` / `secur32.dll` (Windows API; built into every Windows install since Windows 2000) for the client path. No DLLs to install, no DLLs in the release archive. A CI guard (`pr.yml` windows-cross-compile job + `ci.yml` test job + `release.yml` build job) fails the build if `lwpt.exe` normally or delay-imports `libssl` / `libcrypto`; runtime-loader strings remain valid because the memory-BIO server path loads OpenSSL dynamically. See [ADR-0024](./adr/0024-openssl-server-tls-accept.md).
 - **macOS.** **SecureTransport** via Apple's framework (built into every macOS install). No Homebrew dependency, no `DYLD_LIBRARY_PATH` setup.
 - **Linux** (and other Unix-not-Darwin). **System OpenSSL** loaded at runtime via `DynLibs.LoadLibrary`. Install the distro's libssl package: `apt install libssl3` / `dnf install openssl-libs` / `apk add openssl3-libs` / equivalent. No special configuration beyond that — the library is usually already present (every distro pulls it in transitively via `curl`, `git`, `wget`, etc.).
 
-If `lwpt install` fails on Linux with `HTTPS requires OpenSSL but it could not be loaded`, install the distro's libssl package. Windows + macOS never hit this path. Documented in [`quick-start.md`](./quick-start.md).
+The per-platform selection above is the **client** (outbound) story. The **server accept** path added per [ADR-0024](./adr/0024-openssl-server-tls-accept.md) is nonblocking memory-BIO OpenSSL on Unix-not-Darwin and Windows. It loads a PKCS#12 identity once per listener context and exposes explicit want-read/want-write state plus retained ciphertext for partial transport sends. Windows operators supply OpenSSL from a trusted, non-user-writable DLL search directory. macOS servers are out of scope — consumers use Network.framework.
+
+If `lwpt install` fails on Linux with `HTTPS requires OpenSSL but it could not be loaded`, install the distro's libssl package. Windows + macOS never hit this path on the client side. Documented in [`quick-start.md`](./quick-start.md).
 
 ## Atomic writes + EXDEV rename fallback
 
