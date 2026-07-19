@@ -34,9 +34,14 @@ const
   DARWIN_SKIP_REASON =
     'OpenSSL server accept is intentionally unsupported on Darwin; ' +
     'duetto uses Network.framework there';
+  OPENSSL_RUNTIME_SKIP_REASON =
+    'OpenSSL runtime not available on this host';
 
 type
   TTransportSecurityServerTests = class(TTestSuite)
+  private
+    FServerBackendAvailable: Boolean;
+    procedure ServerTest(const AName: string; const AMethod: TTestMethod);
   public
     procedure SetupTests; override;
     procedure TestActiveOnlyAfterHandshake;
@@ -1312,6 +1317,15 @@ begin
   {$ENDIF}
 end;
 
+procedure TTransportSecurityServerTests.ServerTest(const AName: string;
+  const AMethod: TTestMethod);
+begin
+  if FServerBackendAvailable then
+    Test(AName, AMethod)
+  else
+    Skip(AName, AMethod, OPENSSL_RUNTIME_SKIP_REASON);
+end;
+
 procedure TTransportSecurityServerTests.SetupTests;
 begin
   {$IFDEF DARWIN}
@@ -1359,45 +1373,46 @@ begin
   Skip('SSL_write WANT retry retains the original plaintext',
     TestWriteWantRetryRetainsPlaintext, DARWIN_SKIP_REASON);
   {$ELSE}
-  Test('Active becomes true only after the server handshake',
+  FServerBackendAvailable := TransportSecurityServerBackendAvailable;
+  ServerTest('Active becomes true only after the server handshake',
     TestActiveOnlyAfterHandshake);
-  Test('server read clamps oversized lengths on a handshaken connection',
+  ServerTest('server read clamps oversized lengths on a handshaken connection',
     TestBoundsClamp);
-  Test('PKCS#12 chain delivers the intermediate certificate',
+  ServerTest('PKCS#12 chain delivers the intermediate certificate',
     TestCertificateChainDelivered);
   Skip('Darwin server API reports Network.framework alternative',
     TestDarwinReportsUnsupportedServerTLS, 'Darwin-only behavior');
-  Test('empty and UTF-8 PKCS#12 passphrases load',
+  ServerTest('empty and UTF-8 PKCS#12 passphrases load',
     TestEmptyAndUTF8Passphrases);
-  Test('embedded-NUL PKCS#12 passphrase is rejected',
+  ServerTest('embedded-NUL PKCS#12 passphrase is rejected',
     TestEmbeddedNULPassphraseRejected);
-  Test('missing PKCS#12 fails without disclosing path',
+  ServerTest('missing PKCS#12 fails without disclosing path',
     TestMissingPKCS12FailsWithoutPathDisclosure);
-  Test('peer close_notify reports peer-closed and poisons the connection',
+  ServerTest('peer close_notify reports peer-closed and poisons the connection',
     TestPeerCloseNotifyReportsPeerClosed);
-  Test('pending ciphertext pointer stays stable across protocol calls',
+  ServerTest('pending ciphertext pointer stays stable across protocol calls',
     TestPendingCiphertextPointerIsStable);
-  Test('garbage and wrong-pass PKCS#12 fail actionably',
+  ServerTest('garbage and wrong-pass PKCS#12 fail actionably',
     TestPKCS12LoadFailures);
-  Test('PKCS#12 identities above 16 MiB fail without disclosure',
+  ServerTest('PKCS#12 identities above 16 MiB fail without disclosure',
     TestPKCS12SizeLimit);
-  Test('memory-BIO handshake exposes want states and reuses context',
+  ServerTest('memory-BIO handshake exposes want states and reuses context',
     TestHandshakeTransitionsAndContextReuse);
-  Test('plaintext roundtrip retains partial ciphertext',
+  ServerTest('plaintext roundtrip retains partial ciphertext',
     TestPlaintextRoundtripAndPartialCiphertextConsumption);
-  Test('fatal handshake poisons connection',
+  ServerTest('fatal handshake poisons connection',
     TestFatalHandshakePoisonsConnection);
-  Test('fatal shutdown poisons before retaining alert output',
+  ServerTest('fatal shutdown poisons before retaining alert output',
     TestFatalShutdownPoisonsBeforeOutput);
-  Test('graceful close emits close_notify',
+  ServerTest('graceful close emits close_notify',
     TestGracefulCloseProducesCloseNotify);
-  Test('TLS 1.2 renegotiation is refused', TestRenegotiationIsRefused);
-  Test('stale OpenSSL error queue is cleared before server operations',
+  ServerTest('TLS 1.2 renegotiation is refused', TestRenegotiationIsRefused);
+  ServerTest('stale OpenSSL error queue is cleared before server operations',
     TestStaleErrorQueueIsCleared);
-  Test('SSL_ERROR_SYSCALL poisons the connection',
+  ServerTest('SSL_ERROR_SYSCALL poisons the connection',
     TestSyscallErrorPoisonsConnection);
-  Test('TLS floor rejects TLS 1.1', TestTLSFloorRejectsTLS11);
-  Test('SSL_write WANT retry retains the original plaintext',
+  ServerTest('TLS floor rejects TLS 1.1', TestTLSFloorRejectsTLS11);
+  ServerTest('SSL_write WANT retry retains the original plaintext',
     TestWriteWantRetryRetainsPlaintext);
   {$ENDIF}
 end;

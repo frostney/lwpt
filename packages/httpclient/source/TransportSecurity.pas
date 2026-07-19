@@ -66,6 +66,7 @@ procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
   const ASocket: TSocket; const AHost: string);
 procedure CloseTransportSecurityServerContext(
   var AContext: TTransportSecurityServerContext);
+function TransportSecurityServerBackendAvailable: Boolean;
 procedure BeginTransportSecurityServer(
   var AConnection: TTransportSecurityConnection;
   const AContext: TTransportSecurityServerContext);
@@ -2127,6 +2128,23 @@ begin
   end;
 end;
 {$ENDIF}
+
+function TransportSecurityServerBackendAvailable: Boolean;
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Result := TryLoadOpenSSLServer;
+  if not Result then
+    Exit;
+  try
+    LoadOpenSSLServerProcedures;
+  except
+    on E: ETransportSecurityError do
+      Result := False;
+  end;
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
+end;
 
 constructor TTransportSecurityServerContext.Create(
   const APkcs12Path: string; const APkcs12Passphrase: UnicodeString);
