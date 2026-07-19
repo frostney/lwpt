@@ -217,7 +217,7 @@ var
   Raw: string;
   Parsed: Int64;
 begin
-  Raw := GetEnvironmentVariable(ObservabilityHeartbeatIntervalEnvironment);
+  Raw := SysUtils.GetEnvironmentVariable(ObservabilityHeartbeatIntervalEnvironment);
   if (Raw <> '') and TryStrToInt64(Raw, Parsed) and (Parsed > 0) then
   begin
     Result := QWord(Parsed);

@@ -54,6 +54,13 @@ uses
   , Windows
   {$ENDIF};
 
+{$if not declared(FD_CLOEXEC)}
+{ POSIX fixes FD_CLOEXEC at 1; Darwin's BaseUnix declares it but Linux
+  FPC's does not, so define it where the RTL omits it. }
+const
+  FD_CLOEXEC = 1;
+{$endif}
+
 const
   ProcessTreeTerminateGraceMilliseconds = 250;
   ProcessTreeTerminatePollMilliseconds = 10;
@@ -735,7 +742,7 @@ begin
   until BytesRead = SizeOf(ReceivedSignal);
   try
     TerminateRegisteredProcessTrees(
-      GetEnvironmentVariable(ManagedProcessTreeEnvironment) = '1');
+      SysUtils.GetEnvironmentVariable(ManagedProcessTreeEnvironment) = '1');
   except
     on E: Exception do
     begin
