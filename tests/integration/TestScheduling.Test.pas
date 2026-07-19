@@ -249,6 +249,8 @@ begin
   Environment[4] := ProcessTreeProxyModeEnvironment + '=' + AProxyMode;
   Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + APIDFile;
   Result := RunLwpt(Args, FScratch, Environment);
+end;
+
 procedure TTestScheduling.TestSilentJobEmitsHeartbeatAndProgress;
 var
   RunResult: TLwptResult;
