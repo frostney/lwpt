@@ -512,13 +512,13 @@ end;
 
 begin
   TestRunnerProgram.AddSuite(
-    TSetDependencyLineSuite.Create('LWPT.ManifestEdit: SetDependencyLine'));
+    TSetDependencyLineSuite.Create(PROJECT_NAME + '.ManifestEdit: SetDependencyLine'));
   TestRunnerProgram.AddSuite(
-    TRemoveDependencyLineSuite.Create('LWPT.ManifestEdit: RemoveDependencyLine'));
+    TRemoveDependencyLineSuite.Create(PROJECT_NAME + '.ManifestEdit: RemoveDependencyLine'));
   TestRunnerProgram.AddSuite(
-    TDeriveDependencyNameSuite.Create('LWPT.ManifestEdit: DeriveDependencyName'));
+    TDeriveDependencyNameSuite.Create(PROJECT_NAME + '.ManifestEdit: DeriveDependencyName'));
   TestRunnerProgram.AddSuite(
-    TLoadManifestLinesSuite.Create('LWPT.ManifestEdit: LoadManifestLines'));
+    TLoadManifestLinesSuite.Create(PROJECT_NAME + '.ManifestEdit: LoadManifestLines'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

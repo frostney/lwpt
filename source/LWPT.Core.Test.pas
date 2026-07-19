@@ -2622,39 +2622,40 @@ end;
 
 begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
-    'LWPT.Core: SHA-256 NIST vectors'));
+    PROJECT_NAME + '.Core: SHA-256 NIST vectors'));
   TestRunnerProgram.AddSuite(TLoadManifestHappy.Create(
-    'LWPT.Manifest: LoadManifest happy path'));
+    PROJECT_NAME + '.Manifest: LoadManifest happy path'));
   TestRunnerProgram.AddSuite(TLoadManifestValidation.Create(
-    'LWPT.Manifest: LoadManifest validation'));
+    PROJECT_NAME + '.Manifest: LoadManifest validation'));
   TestRunnerProgram.AddSuite(TLoadManifestExtensions.Create(
-    'LWPT.Manifest: LoadManifest extensions ([lwpt] / [format] / [generated])'));
+    PROJECT_NAME + '.Manifest: LoadManifest extensions ([' + PROGRAM_NAME
+    + '] / [format] / [generated])'));
   TestRunnerProgram.AddSuite(TLockfileLoading.Create(
-    'LWPT.Install: LoadLockfile'));
+    PROJECT_NAME + '.Install: LoadLockfile'));
   TestRunnerProgram.AddSuite(TVerifyAgainstLockfile.Create(
-    'LWPT.Install: VerifyAgainstLockfile'));
+    PROJECT_NAME + '.Install: VerifyAgainstLockfile'));
   TestRunnerProgram.AddSuite(TParseDependencySource.Create(
-    'LWPT.Manifest: ParseDependencySource'));
+    PROJECT_NAME + '.Manifest: ParseDependencySource'));
   TestRunnerProgram.AddSuite(TParseVersionSpec.Create(
-    'LWPT.Manifest: ParseVersionSpec'));
+    PROJECT_NAME + '.Manifest: ParseVersionSpec'));
   TestRunnerProgram.AddSuite(TGitProtocolParsing.Create(
-    'LWPT.GitProtocol: ParseInfoRefs'));
+    PROJECT_NAME + '.GitProtocol: ParseInfoRefs'));
   TestRunnerProgram.AddSuite(TCustomSources.Create(
-    'LWPT.Manifest: Custom [sources]'));
+    PROJECT_NAME + '.Manifest: Custom [sources]'));
   TestRunnerProgram.AddSuite(TPathGlobMatching.Create(
-    'LWPT.Core: MatchPathGlob'));
+    PROJECT_NAME + '.Core: MatchPathGlob'));
   TestRunnerProgram.AddSuite(TSanitisePathSegmentSuite.Create(
-    'LWPT.Core: SanitisePathSegment'));
+    PROJECT_NAME + '.Core: SanitisePathSegment'));
   TestRunnerProgram.AddSuite(TMakeTmpPathSuite.Create(
-    'LWPT.Core: MakeTmpPath uniqueness'));
+    PROJECT_NAME + '.Core: MakeTmpPath uniqueness'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
-    'LWPT.Core: ApplyIncludeExclude'));
+    PROJECT_NAME + '.Core: ApplyIncludeExclude'));
   TestRunnerProgram.AddSuite(TCopyDirTreeGuards.Create(
-    'LWPT.Core: CopyDirTree recursion guards'));
+    PROJECT_NAME + '.Core: CopyDirTree recursion guards'));
   TestRunnerProgram.AddSuite(TWipeDirSymlinks.Create(
-    'LWPT.Core: WipeDir symlink handling'));
+    PROJECT_NAME + '.Core: WipeDir symlink handling'));
   TestRunnerProgram.AddSuite(TPruneOrphans.Create(
-    'LWPT.Install: PruneOrphanedPackages'));
+    PROJECT_NAME + '.Install: PruneOrphanedPackages'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.
