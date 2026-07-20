@@ -120,6 +120,18 @@ function CRaise(const ASignal: LongInt): LongInt; cdecl;
   external name 'raise';
   {$ENDIF}
 
+{ Failures of the libc externals above land in libc's errno. On Linux that
+  is a different threadvar from the one FpGetErrNo reads (the RTL maintains
+  its own for its raw-syscall wrappers), so libc errors must be read
+  through libc's accessor -- FpGetErrNo there returns whatever stale code
+  the last RTL call left behind. }
+function CErrnoLocation: PInteger; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name '__errno_location';
+  {$ELSE}
+  external name '__error';
+  {$ENDIF}
+
 function SignalHandlerFailed(const AHandler: Pointer): Boolean; inline;
 begin
   Result := PtrUInt(AHandler) = High(PtrUInt);
@@ -254,9 +266,11 @@ procedure TLWPTProcessTree.MarkManagedChild;
 var
   EnvironmentIndex: Integer;
 begin
+  { AppendProcessEnvironment, not a direct sweep: concurrent job threads
+    materialising here raced the RTL's unsynchronised lazy env count and
+    could truncate a child's environment (see LWPT.Core). }
   if FProcess.Environment.Count = 0 then
-    for EnvironmentIndex := 1 to GetEnvironmentVariableCount do
-      FProcess.Environment.Add(GetEnvironmentString(EnvironmentIndex));
+    AppendProcessEnvironment(FProcess.Environment);
   for EnvironmentIndex := FProcess.Environment.Count - 1 downto 0 do
     if EnvironmentNamesEqual(
       EnvironmentEntryName(FProcess.Environment[EnvironmentIndex]),
@@ -345,7 +359,12 @@ begin
         EACCES proves the child has passed the pre-exec fork handler. }
       if CSetProcessGroup(FProcess.ProcessID, FProcess.ProcessID) <> 0 then
       begin
-        ErrorCode := FpGetErrNo;
+        { CSetProcessGroup is a libc call: read libc's errno, not
+          FpGetErrNo, or the benign post-exec EACCES race reads as a
+          stale unrelated code and kills a healthy child (observed as an
+          intermittent Linux "could not isolate process tree: No such
+          file or directory" scheduler error). }
+        ErrorCode := CErrnoLocation()^;
         if not (ErrorCode in [ESysEACCES, ESysESRCH]) then
         begin
           FProcess.Terminate(ProcessTreeSetupExitCode);

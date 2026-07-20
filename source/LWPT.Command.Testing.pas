@@ -181,11 +181,11 @@ begin
 end;
 
 procedure CopyCurrentEnvironment(AEnvironment: TStrings);
-var
-  i: Integer;
 begin
-  for i := 1 to GetEnvironmentVariableCount do
-    AEnvironment.Add(GetEnvironmentString(i));
+  { Concurrent scheduler workers copy here; a direct sweep raced the RTL's
+    unsynchronised lazy env count and could hand a test binary a truncated
+    environment (see LWPT.Core). }
+  AppendProcessEnvironment(AEnvironment);
 end;
 
 constructor TTestWorker.Create(const AScheduler: TTestScheduler);
