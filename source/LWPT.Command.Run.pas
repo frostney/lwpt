@@ -7,7 +7,8 @@ unit LWPT.Command.Run;
 
 interface
 
-function CmdRun(const AManifestPath, AName: string): Integer;
+function CmdRun(const AManifestPath, AName: string;
+  const AAliasNames: array of string): Integer;
 
 implementation
 
@@ -22,15 +23,19 @@ uses
   CmdRun — invoke a user-declared run-script (ADR-0013).
 
   AName is the section name (the manifest key for the script). When
-  AName is empty, prints a list of every callable name (subcommands
-  first, then user scripts). When AName matches no script and no
-  subcommand, exits 1 with a hint listing both sets.
+  AName is empty, prints a list of every callable name (user scripts,
+  then subcommand aliases). AAliasNames carries the alias set the
+  dispatcher actually accepts — the caller derives it from the live
+  subcommand registry so this listing can never drift from dispatch.
+  When AName matches no script and no subcommand, exits 1 with a hint
+  listing the declared scripts.
 
   Subcommand-aliasing (`lwpt run install` → `lwpt install`) is handled
   upstream in the CLI dispatcher (CLI.Subcommands.Run) — CmdRun is
   only reached for genuine user scripts. }
 
-function CmdRun(const AManifestPath, AName: string): Integer;
+function CmdRun(const AManifestPath, AName: string;
+  const AAliasNames: array of string): Integer;
 var
   Man : TManifest;
   i   : Integer;
@@ -51,7 +56,13 @@ begin
                 Man.Scripts[i].Script);
     WriteLn;
     WriteLn('subcommand aliases (also valid via `', PROGRAM_NAME, ' run <name>`):');
-    WriteLn('  install  build  format  test  repair  init  agents');
+    Write('  ');
+    for i := 0 to High(AAliasNames) do
+    begin
+      if i > 0 then Write('  ');
+      Write(AAliasNames[i]);
+    end;
+    WriteLn;
     Exit(0);
   end;
 

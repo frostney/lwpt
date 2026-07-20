@@ -131,9 +131,15 @@ end;
 procedure TRunE2E.TestListModeOmitsRetiredExport;
 var R: TLwptResult;
 begin
+  { The alias list is rendered from the live subcommand registry, so
+    every registered subcommand — including the ADR-0019 manifest
+    editors add/remove — must appear, and the retired export
+    subcommand must not. }
   R := RunLwpt(['run'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('install', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('add', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('remove', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('export', R.Stdout) = 0).ToBe(True);
 end;
 
@@ -190,7 +196,7 @@ begin
     TestAliasInstallSubcommand);
   Test('run install --frozen passes flags through to the aliased subcommand',
     TestAliasWithFlagPassthrough);
-  Test('run lists aliases without the retired export subcommand',
+  Test('run lists every registered alias without the retired export subcommand',
     TestListModeOmitsRetiredExport);
   Test('export is available as a user-declared run-script name',
     TestExportCanBeUserScriptName);

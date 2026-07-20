@@ -342,10 +342,13 @@ begin
 end;
 
 { --- run (ADR-0013) ------------------------------------------------------ }
+
 function HandleRun(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
   Name : string;
+  Aliases : array of string;
+  i, N : Integer;
 begin
   { Subcommand-aliasing (`lwpt run install`) is intercepted in
     CLI.Subcommands.Run BEFORE this handler is called. So when we
@@ -355,8 +358,19 @@ begin
     Name := ''
   else
     Name := APositionals[0];
+  { Every registered subcommand except run itself is a valid alias
+    (`lwpt run run` would be dispatch recursion, not an alias). }
+  SetLength(Aliases, Registry.Count);
+  N := 0;
+  for i := 0 to Registry.Count - 1 do
+    if not SameText(Registry.Item(i).Name, 'run') then
+    begin
+      Aliases[N] := Registry.Item(i).Name;
+      Inc(N);
+    end;
+  SetLength(Aliases, N);
   try
-    Result := CmdRun(MANIFEST_FILE, Name);
+    Result := CmdRun(MANIFEST_FILE, Name, Aliases);
   except
     on E: Exception do
     begin
