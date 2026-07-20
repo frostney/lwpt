@@ -42,6 +42,14 @@ requirement may be marked not applicable only with a recorded reason.
 - E2E coverage is required for changes affecting networking, installation,
   CLI subprocess behavior, platform integration, or release behavior.
 - The full E2E suite passes during release preparation.
+- A change touching process management, concurrency, platform-specific code,
+  or the CI workflows themselves dispatches the full CI workflow on the
+  branch (`gh workflow run CI --ref <branch>`) and watches it to completion
+  before merge; the PR gate alone is not sufficient evidence for these
+  areas. (Interim gate until #102 extends the PR gate itself.)
+- An intermittent-failure fix names the pinned mechanism and its evidence;
+  timeout bumps, retries, and quarantines are mitigations and link a
+  tracking issue instead.
 
 ## Documentation and decisions
 
