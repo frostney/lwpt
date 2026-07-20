@@ -1214,11 +1214,54 @@ begin
   end;
 end;
 
+{ A build spawns this same binary as its "fpc" compiler and distinguishes that
+  role solely by TEST_FPC_PROXY=1 in the child environment. If that variable
+  ever fails to reach a compiler invocation, the binary silently falls through
+  to the suite path below -- running the whole test suite *as* the compiler,
+  which the parent build then reports as a bare "compiler failed" with an
+  unrelated "Failed: 11" buried in captured output. Detect the misroute and
+  fail loud with the received argv + environment so the cause is pinned rather
+  than cascaded. Compiler invocations always carry an FPC-only argument shape
+  (a "-iV" version probe or an "@response-file"); the suite never does. }
+function InvokedAsCompiler: Boolean;
+var
+  Index: Integer;
+  Argument: string;
+begin
+  Result := False;
+  for Index := 1 to ParamCount do
+  begin
+    Argument := ParamStr(Index);
+    if (Argument = '-iV')
+       or ((Argument <> '') and (Argument[1] = '@')) then
+      Exit(True);
+  end;
+end;
+
+function ReportLostProxyEnvironment: Integer;
+var
+  Index: Integer;
+begin
+  WriteLn(StdErr, 'BuildSessions dispatch: invoked as a compiler but '
+    + TEST_FPC_PROXY_ENV + '=1 is absent -- the proxy environment was lost in '
+    + 'transit. Refusing to run the test suite as a compiler.');
+  WriteLn(StdErr, '  ParamCount=', ParamCount);
+  for Index := 1 to ParamCount do
+    WriteLn(StdErr, '  arg[', Index, ']=', ParamStr(Index));
+  WriteLn(StdErr, '  environment (', GetEnvironmentVariableCount, ' entries):');
+  for Index := 1 to GetEnvironmentVariableCount do
+    WriteLn(StdErr, '    ', GetEnvironmentString(Index));
+  Flush(StdErr);
+  Result := 126;
+end;
+
 begin
   if GetEnvironmentVariable(TestWorkerHolderEnvironment) = '1' then
     Halt(RunWorkerHolder);
   if GetEnvironmentVariable(TEST_FPC_PROXY_ENV) = '1' then
     Halt(RunCompilerProxy);
+  if InvokedAsCompiler then
+    Halt(ReportLostProxyEnvironment);
   TestRunnerProgram.AddSuite(TBuildSessions.Create(
     'build sessions: subprocess concurrency'));
   TestRunnerProgram.Run;
