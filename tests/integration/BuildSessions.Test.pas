@@ -47,7 +47,7 @@ const
     reached and the isolation assertions flake. The happy path exits the
     wait loop as soon as the barrier is seen, so a large ceiling costs
     nothing when the machine is idle. }
-  ConcurrencyBarrierCeilingSeconds = 60;
+  ConcurrencyBarrierCeilingSeconds = 180;
 
 type
   TBuildSessions = class(TTestSuite)
@@ -86,6 +86,35 @@ type
 function SlowUnitName(const AIndex: Integer): string;
 begin
   Result := 'SlowUnit' + Format('%.3d', [AIndex]);
+end;
+
+{ On a barrier timeout the suite's stdout is captured into its isolated
+  log and replayed by the failure path, so these lines surface directly
+  in CI output. They separate "the scheduler never dispatched the
+  target" (no START line in the replayed build output, no ready file)
+  from "the child was dispatched but never signalled ready" (START
+  present, ready file absent) without needing access to the runner. }
+procedure DumpBarrierDiagnostics(const ALabel, AReadyDir: string);
+var
+  Search: TSearchRec;
+  SawAny: Boolean;
+begin
+  WriteLn('BARRIER TIMEOUT [', ALabel, '] ready-dir ', AReadyDir, ':');
+  SawAny := False;
+  if FindFirst(IncludeTrailingPathDelimiter(AReadyDir) + '*',
+    faAnyFile, Search) = 0 then
+  try
+    repeat
+      if (Search.Name <> '.') and (Search.Name <> '..') then
+      begin
+        WriteLn('  ready: ', Search.Name);
+        SawAny := True;
+      end;
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+  if not SawAny then WriteLn('  (no ready files)');
 end;
 
 function RunProgram(const APath: string): Integer;
@@ -436,6 +465,8 @@ begin
     FirstStatus := First.ExitStatus;
     SecondStatus := Second.ExitStatus;
 
+    if not (SawTwoSessions and SawTwoJobRoots) then
+      DumpBarrierDiagnostics('concurrent-sessions', ReadyDir);
     Expect<Boolean>(SawTwoSessions).ToBe(True);
     Expect<Boolean>(SawTwoJobRoots).ToBe(True);
     Expect<Boolean>(((FirstStatus = 0) and (SecondStatus = 1))
@@ -511,6 +542,8 @@ begin
     FirstStatus := First.ExitStatus;
     SecondStatus := Second.ExitStatus;
 
+    if not Ready then
+      DumpBarrierDiagnostics('distinct-outputs', ReadyDir);
     Expect<Boolean>(Ready).ToBe(True);
     Expect<Integer>(FirstStatus).ToBe(0);
     Expect<Integer>(SecondStatus).ToBe(0);
@@ -726,6 +759,9 @@ begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
+    if not (TargetReady(ReadyDir, 'alpha')
+      and TargetReady(ReadyDir, 'beta')) then
+      DumpBarrierDiagnostics('overlap: alpha+beta ready', ReadyDir);
     Expect<Boolean>(TargetReady(ReadyDir, 'alpha')).ToBe(True);
     Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(True);
     Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
@@ -742,6 +778,8 @@ begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
+    if not TargetReady(ReadyDir, 'app') then
+      DumpBarrierDiagnostics('app ready after releases', ReadyDir);
     Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(True);
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/alpha')))
       .ToBe(True);
@@ -809,6 +847,8 @@ begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
+    if not TargetReady(ReadyDir, 'app') then
+      DumpBarrierDiagnostics('app ready after releases', ReadyDir);
     Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(True);
     WriteTextFile(ReleaseDir + '/app', 'release');
     Build.WaitOnExit;
