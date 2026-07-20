@@ -2498,8 +2498,11 @@ const
 var
   { LongInt + Interlocked* (the codebase's cross-thread flag idiom, cf.
     TLWPTProcessTree.FImmediateTerminationRequested) so the start signal
-    does not rely on unsynchronised Boolean visibility. }
+    does not rely on unsynchronised Boolean visibility. The ready counter
+    makes the barrier real: the gate opens only after every thread has
+    checked in, so all copies genuinely start together. }
   EnvironmentCopyGate: LongInt = 0;
+  EnvironmentCopyReady: LongInt = 0;
 
 { Predicts the generator's next candidate for an occupied-path test by
   advancing the trailing sequence of a previously returned path. }
@@ -2676,9 +2679,11 @@ end;
 procedure TEnvironmentCopyThread.Execute;
 begin
   try
-    { Spin until the gate opens so every thread's copy starts inside the
-      same few microseconds -- the shape that raced the RTL's lazy env
-      count before AppendProcessEnvironment serialised the sweep. }
+    { Check in, then spin until the gate opens so every thread's copy
+      starts inside the same few microseconds -- the shape that raced the
+      RTL's lazy env count before AppendProcessEnvironment serialised the
+      sweep. }
+    InterlockedIncrement(EnvironmentCopyReady);
     while InterlockedExchangeAdd(EnvironmentCopyGate, 0) = 0 do
       ThreadSwitch;
     AppendProcessEnvironment(FCopy);
@@ -2698,10 +2703,13 @@ begin
   Reference := TStringList.Create;
   try
     InterlockedExchange(EnvironmentCopyGate, 0);
+    InterlockedExchange(EnvironmentCopyReady, 0);
     for Index := 0 to High(Threads) do
       Threads[Index] := TEnvironmentCopyThread.Create;
     for Index := 0 to High(Threads) do Threads[Index].Start;
-    Sleep(10);
+    while InterlockedExchangeAdd(EnvironmentCopyReady, 0)
+      < EnvironmentCopyThreadCount do
+      ThreadSwitch;
     InterlockedExchange(EnvironmentCopyGate, 1);
     for Index := 0 to High(Threads) do Threads[Index].WaitFor;
 

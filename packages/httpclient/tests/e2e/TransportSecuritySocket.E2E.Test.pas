@@ -50,7 +50,8 @@ type
     FSawFragmentedInput: Boolean;
     FSawShortWrite: Boolean;
     function FlushOneCiphertextFragment(const ASocket: TSocket;
-      var AConnection: TTransportSecurityConnection): Boolean;
+      var AConnection: TTransportSecurityConnection;
+      const AAllowPeerClosed: Boolean = False): Boolean;
     function ReceiveOneCiphertextFragment(const ASocket: TSocket;
       var AConnection: TTransportSecurityConnection): Boolean;
     procedure DriveClose(const ASocket: TSocket;
@@ -155,7 +156,8 @@ end;
 
 function TLoopbackTLSServer.FlushOneCiphertextFragment(
   const ASocket: TSocket;
-  var AConnection: TTransportSecurityConnection): Boolean;
+  var AConnection: TTransportSecurityConnection;
+  const AAllowPeerClosed: Boolean): Boolean;
 var
   Buffer: Pointer;
   Pending: Integer;
@@ -178,7 +180,10 @@ begin
   end
   else if Sent < 0 then
   begin
-    if SocketPeerClosed then
+    { Peer-gone tolerance is close-phase-only: the client cannot have read
+      the full response until every response byte was flushed, so EPIPE
+      during handshake, read, or write still marks a real failure. }
+    if SocketPeerClosed and AAllowPeerClosed then
       FPeerGone := True
     else if not SocketWouldBlock then
       raise Exception.Create('send() failed');
@@ -290,7 +295,7 @@ begin
     raise Exception.Create('TLS server write did not consume the response');
   for Step := 1 to MAX_REACTOR_STEPS do
   begin
-    if (TransportSecurityPendingCiphertext(AConnection) = 0) or FPeerGone then
+    if TransportSecurityPendingCiphertext(AConnection) = 0 then
       Exit;
     FlushOneCiphertextFragment(ASocket, AConnection);
     Sleep(1);
@@ -309,7 +314,7 @@ begin
     if FPeerGone then
       Exit;
     if TransportSecurityPendingCiphertext(AConnection) > 0 then
-      FlushOneCiphertextFragment(ASocket, AConnection)
+      FlushOneCiphertextFragment(ASocket, AConnection, True)
     else
     begin
       State := CloseTransportSecurityServerGracefully(AConnection);
@@ -320,7 +325,7 @@ begin
         tssWantRead:
           ReceiveOneCiphertextFragment(ASocket, AConnection);
         tssWantWrite:
-          FlushOneCiphertextFragment(ASocket, AConnection);
+          FlushOneCiphertextFragment(ASocket, AConnection, True);
       else
         raise Exception.Create('TLS server close failed');
       end;

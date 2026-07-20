@@ -40,6 +40,12 @@ const
   TestWorkerContentionDurationMilliseconds =
     TestHeartbeatIntervalMilliseconds * 8;
   TestShortCompilerDelayMilliseconds = 20;
+  { Compiler-invocation shape shared by the proxy and the fail-fast guard:
+    a version probe or an @response-file argument. Kept as constants so the
+    two recognisers cannot drift apart. }
+  VersionQueryArgument = '-iV';
+  ResponseFilePrefix = '@';
+  LostProxyExitCode = 126;
   { Ceiling for concurrency barriers (both spawned builds reaching a
     ready/handshake point). Deliberately generous: on a CPU-saturated CI
     runner these builds queue behind many other parallel test programs, so
@@ -81,6 +87,7 @@ type
     procedure TestObservableBuildHeartbeatAndVerboseLogs;
     procedure TestFullyContendedBuildEmitsHeartbeat;
     procedure TestBuildFailureReplaysAndPreservesIsolatedLog;
+    procedure TestLostProxyGuardFailsClosed;
   end;
 
 function SlowUnitName(const AIndex: Integer): string;
@@ -129,6 +136,42 @@ begin
     Result := Process.ExitStatus;
   finally
     Process.Free;
+  end;
+end;
+
+{ Re-invokes this binary with an explicit environment and captures the
+  combined output -- how the guard tests exercise the dispatch exactly as
+  a build's compiler spawn would. Drain-while-running, same as RunLwpt:
+  poWaitOnExit + poUsePipes can deadlock once the child fills the pipe. }
+function RunSelfWithEnv(const AArgs, AEnv: array of string;
+  out AOutput: string): Integer;
+var
+  P: TProcess;
+  Buffer: array[0..4095] of Byte;
+  Count, i: Integer;
+  Chunk: string;
+begin
+  AOutput := '';
+  P := TProcess.Create(nil);
+  try
+    P.Executable := ExpandFileName(ParamStr(0));
+    for i := 0 to High(AArgs) do P.Parameters.Add(AArgs[i]);
+    for i := 0 to High(AEnv) do P.Environment.Add(AEnv[i]);
+    P.Options := [poUsePipes, poStderrToOutPut];
+    P.Execute;
+    repeat
+      Count := P.Output.Read(Buffer[0], SizeOf(Buffer));
+      if Count > 0 then
+      begin
+        SetString(Chunk, PAnsiChar(@Buffer[0]), Count);
+        AOutput := AOutput + Chunk;
+      end;
+    until Count <= 0;
+    P.WaitOnExit;
+    Result := P.ExitCode;
+    if (Result = 0) and (P.ExitStatus <> 0) then Result := P.ExitStatus;
+  finally
+    P.Free;
   end;
 end;
 
@@ -1117,6 +1160,37 @@ begin
     TestFullyContendedBuildEmitsHeartbeat);
   Test('build failures replay and preserve isolated logs',
     TestBuildFailureReplaysAndPreservesIsolatedLog);
+  Test('lost proxy environment fails closed with a redacted dump',
+    TestLostProxyGuardFailsClosed);
+end;
+
+procedure TBuildSessions.TestLostProxyGuardFailsClosed;
+var
+  Output: string;
+  Code: Integer;
+begin
+  { Absent proxy variable + response-file argv: the guard refuses to run
+    the suite, reports the observed value, keeps LWPT_* values, and
+    redacts everything else. }
+  Code := RunSelfWithEnv([ResponseFilePrefix + 'missing-response.cfg'],
+    ['SESSION_SECRET=hunter2',
+     TestFPCDelayMillisecondsEnvironment + '=5'], Output);
+  Expect<Integer>(Code).ToBe(LostProxyExitCode);
+  Expect<Boolean>(Pos('Refusing to run the test suite', Output) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('observed ""', Output) > 0).ToBe(True);
+  Expect<Boolean>(Pos('SESSION_SECRET=<redacted>', Output) > 0).ToBe(True);
+  Expect<Boolean>(Pos('hunter2', Output) = 0).ToBe(True);
+  Expect<Boolean>(Pos(TestFPCDelayMillisecondsEnvironment + '=5',
+    Output) > 0).ToBe(True);
+
+  { Malformed value + version-probe argv reports what was observed, and
+    the guard outranks a stale worker-holder flag. }
+  Code := RunSelfWithEnv([VersionQueryArgument],
+    [TEST_FPC_PROXY_ENV + '=0',
+     TestWorkerHolderEnvironment + '=1'], Output);
+  Expect<Integer>(Code).ToBe(LostProxyExitCode);
+  Expect<Boolean>(Pos('observed "0"', Output) > 0).ToBe(True);
 end;
 
 function RunCompilerProxy: Integer;
@@ -1137,7 +1211,7 @@ begin
     GetEnvironmentVariable(TestFPCDelayMillisecondsEnvironment), 0);
   IsVersionQuery := False;
   for i := 1 to ParamCount do
-    if ParamStr(i) = '-iV' then IsVersionQuery := True;
+    if ParamStr(i) = VersionQueryArgument then IsVersionQuery := True;
   if not IsVersionQuery then
   begin
     TargetName := ChangeFileExt(ExtractFileName(ParamStr(ParamCount)), '');
@@ -1232,15 +1306,15 @@ begin
   for Index := 1 to ParamCount do
   begin
     Argument := ParamStr(Index);
-    if (Argument = '-iV')
-       or ((Argument <> '') and (Argument[1] = '@')) then
+    if (Argument = VersionQueryArgument)
+       or ((Argument <> '') and (Argument[1] = ResponseFilePrefix)) then
       Exit(True);
   end;
 end;
 
 function ReportLostProxyEnvironment: Integer;
 var
-  Index, SeparatorAt: Integer;
+  Index: Integer;
   Entry, Name: string;
 begin
   WriteLn(StdErr, 'BuildSessions dispatch: invoked as a compiler but '
@@ -1260,27 +1334,26 @@ begin
   for Index := 1 to GetEnvironmentVariableCount do
   begin
     Entry := GetEnvironmentString(Index);
-    SeparatorAt := Pos('=', Entry);
-    if SeparatorAt > 0 then
-      Name := Copy(Entry, 1, SeparatorAt - 1)
-    else
-      Name := Entry;
+    Name := EnvName(Entry);
     if Pos(PROJECT_NAME + '_', Name) = 1 then
       WriteLn(StdErr, '    ', Entry)
     else
       WriteLn(StdErr, '    ', Name, '=<redacted>');
   end;
   Flush(StdErr);
-  Result := 126;
+  Result := LostProxyExitCode;
 end;
 
 begin
-  if GetEnvironmentVariable(TestWorkerHolderEnvironment) = '1' then
-    Halt(RunWorkerHolder);
+  { The compiler-shaped guard outranks the worker-holder role: a
+    compiler-shaped argv with a stale holder flag but no proxy flag must
+    diagnose the lost proxy environment, not silently run the holder. }
   if GetEnvironmentVariable(TEST_FPC_PROXY_ENV) = '1' then
     Halt(RunCompilerProxy);
   if InvokedAsCompiler then
     Halt(ReportLostProxyEnvironment);
+  if GetEnvironmentVariable(TestWorkerHolderEnvironment) = '1' then
+    Halt(RunWorkerHolder);
   TestRunnerProgram.AddSuite(TBuildSessions.Create(
     'build sessions: subprocess concurrency'));
   TestRunnerProgram.Run;
