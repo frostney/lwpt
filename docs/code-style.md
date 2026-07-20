@@ -182,6 +182,24 @@ When you add a new package under `packages/<name>/`, it's auto-discovered via `[
 - **No patch markers.** Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT-canonical code does not carry `{ [LWPT patch] }` / `{ [gpm patch] }` markers — git history is the canonical record of every change. Inline Pascal comments still document *why* non-obvious code looks the way it does (e.g. why HTTPClient uses a byte-safe `AppendRawBytes` instead of `Copy(PAnsiChar)`).
 - Documentation comments should explain non-obvious intent, trade-offs, or constraints. **Do not narrate what the code does.** Don't write `{ Increment the counter }`. Do write `{ Skip the trailing CRLF — see RFC 7230 §3.5 }`.
 
+## FPC and libc interop
+
+Three idioms, each minted by a real defect (PR #105):
+
+- **After a libc external fails, read errno via libc's accessor**
+  (`__errno_location` on Linux, `__error` elsewhere), never `FpGetErrNo`.
+  On Linux the RTL keeps its own errno threadvar for its raw-syscall
+  wrappers; reading it after a libc call returns a stale, unrelated code.
+  See `CErrnoLocation` in `LWPT.ProcessTree`.
+- **Process-environment sweeps go through `LWPT.Core.AppendProcessEnvironment`**,
+  never a raw `1..GetEnvironmentVariableCount` loop. The RTL lazily
+  initialises its count global without synchronisation, so concurrent
+  sweeps can read a partial count and silently truncate a child's
+  environment.
+- **Cross-thread flags are `LongInt` + `Interlocked*`**, never a bare
+  `Boolean` — see `TLWPTProcessTree.FImmediateTerminationRequested` for
+  the canonical shape.
+
 ## Magic numbers and strings
 
 Extract into named constants in the `interface` section when shared. Examples in `LWPT.Core`:
