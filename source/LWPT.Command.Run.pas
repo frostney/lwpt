@@ -51,7 +51,7 @@ begin
                 Man.Scripts[i].Script);
     WriteLn;
     WriteLn('subcommand aliases (also valid via `', PROGRAM_NAME, ' run <name>`):');
-    WriteLn('  install  build  format  test  repair  init');
+    WriteLn('  install  build  format  test  repair  init  agents');
     Exit(0);
   end;
 

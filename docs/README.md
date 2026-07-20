@@ -43,6 +43,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0020](./adr/0020-isolated-build-sessions.md) | Invocation-private compiler staging, revalidated short-lock publication, session-safe clean, and repair reclamation |
 | [0021](./adr/0021-machine-wide-worker-budget.md) | Per-user machine worker capacity coordinated through fair, reclaimable filesystem leases |
 | [0023](./adr/0023-parallel-build-target-scheduler.md) | Dependency-aware, bounded parallel target scheduling with deterministic reporting and publication |
+| [0025](./adr/0025-cascading-process-tree-cancellation.md) | Cascading process-tree cancellation via Unix signal-forwarding and Windows nested Job Objects |
 
 ## Spikes
 

@@ -1,0 +1,308 @@
+{ LWPT.Command.Agents — agents subcommand entrypoint (ADR-0024).
+
+  Writes (or, with --check, verifies) the agent-facing command
+  reference inside the project's AGENTS.md: a marker-fenced region
+  covering every registered subcommand (summary, usage, options) plus
+  the project's user-declared run-scripts. The region is rendered from
+  the same live TSubcommandRegistry that drives `--help`, so the two
+  surfaces cannot drift apart.
+
+  Region contract (the compat surface pinned by ADR-0024):
+
+    - Fenced by the HTML comments `<!-- lwpt:agents:begin -->` and
+      `<!-- lwpt:agents:end -->` on their own lines. Markers are
+      matched as whole lines only (marker text mid-line is prose) and
+      each may appear at most once. Everything between them is
+      machine-written; everything outside is never touched.
+    - Rendered with LF line endings regardless of platform, and with
+      no version stamp or timestamp, so regeneration is deterministic
+      and a binary upgrade alone never invalidates a committed block.
+    - Missing AGENTS.md → a minimal file (heading + region) is
+      created. Existing file without markers → the region is appended
+      after a blank-line separator, preserving the existing bytes
+      exactly. Markers present → the region between them is replaced
+      in place. A lone, duplicated, or out-of-order marker is a hard
+      error: silently regenerating around corrupt markers could eat
+      hand-written prose.
+    - --check re-renders and byte-compares the whole spliced result;
+      any difference (stale block, missing file, missing markers)
+      exits 1 and writes nothing. }
+unit LWPT.Command.Agents;
+
+{$I Shared.inc}
+
+interface
+
+uses
+  CLI.Subcommands;
+
+function CmdAgents(const AManifestPath: string;
+  const ARegistry: TSubcommandRegistry; ACheck: Boolean): Integer;
+
+implementation
+
+uses
+  Classes,
+  StrUtils,
+  SysUtils,
+
+  CLI.Options,
+  LWPT.Core,
+  LWPT.Manifest;
+
+const
+  { AGENTS.md is the cross-harness agent-instructions convention
+    (agents.md); the filename is the industry standard, not a
+    PROGRAM_NAME derivative. }
+  AGENTS_FILE = 'AGENTS.md';
+
+  MARKER_ID     = PROGRAM_NAME + ':agents';
+  MARKER_BEGIN  = '<!-- ' + MARKER_ID + ':begin -->';
+  MARKER_END    = '<!-- ' + MARKER_ID + ':end -->';
+
+procedure AddLine(var AText: string; const ALine: string);
+begin
+  AText := AText + ALine + #10;
+end;
+
+{ Markdown code span for manifest-controlled text (run-script names and
+  paths). A value containing backticks needs a delimiter longer than
+  its longest backtick run, space-padded, per CommonMark — otherwise
+  the value would terminate the span and corrupt the block's markup. }
+function CodeSpan(const AValue: string): string;
+var
+  LongestRun, Run, i : Integer;
+  Delimiter : string;
+begin
+  LongestRun := 0;
+  Run := 0;
+  for i := 1 to Length(AValue) do
+    if AValue[i] = '`' then
+    begin
+      Inc(Run);
+      if Run > LongestRun then LongestRun := Run;
+    end
+    else
+      Run := 0;
+  if LongestRun = 0 then Exit('`' + AValue + '`');
+  Delimiter := StringOfChar('`', LongestRun + 1);
+  Result := Delimiter + ' ' + AValue + ' ' + Delimiter;
+end;
+
+{ One bullet per subcommand, one nested bullet per option. Usage and
+  help strings come straight from the registry objects — the same
+  data PrintTopLevelHelp / PrintSubcommandHelp render. }
+procedure AddSubcommandLines(var AText: string;
+  const ARegistry: TSubcommandRegistry);
+var
+  i, j : Integer;
+  Sub  : TSubcommand;
+  Line : string;
+begin
+  for i := 0 to ARegistry.Count - 1 do
+  begin
+    Sub := ARegistry.Item(i);
+    Line := '- `' + PROGRAM_NAME + ' ' + Sub.Name;
+    if Sub.UsageArg <> '' then
+      Line := Line + ' ' + Sub.UsageArg;
+    Line := Line + '` — ' + Sub.Summary;
+    AddLine(AText, Line);
+    for j := 0 to High(Sub.Options) do
+      AddLine(AText, '  - `' + Sub.Options[j].FormatForHelp
+        + '` — ' + Sub.Options[j].HelpText);
+  end;
+end;
+
+procedure AddRunScriptLines(var AText: string; const AManifest: TManifest);
+var
+  i : Integer;
+begin
+  if Length(AManifest.Scripts) = 0 then
+  begin
+    AddLine(AText, 'No run-scripts declared in `' + MANIFEST_FILE + '`.');
+    Exit;
+  end;
+  { RawScript, not Script: the loader interpolates placeholders such
+    as platform.os into Script, which would make the committed block
+    differ per platform and flip `--check` in cross-platform CI. }
+  for i := 0 to High(AManifest.Scripts) do
+    AddLine(AText, '- ' + CodeSpan(PROGRAM_NAME + ' run '
+      + AManifest.Scripts[i].Name) + ' — '
+      + CodeSpan(AManifest.Scripts[i].RawScript));
+end;
+
+{ The full marker-fenced region, LF line endings, ending with
+  MARKER_END and no trailing newline (the splice supplies context). }
+function RenderRegion(const ARegistry: TSubcommandRegistry;
+  const AManifest: TManifest): string;
+begin
+  Result := '';
+  AddLine(Result, MARKER_BEGIN);
+  AddLine(Result, '');
+  AddLine(Result, '## `' + PROGRAM_NAME + '` command reference');
+  AddLine(Result, '');
+  AddLine(Result, 'Generated by `' + PROGRAM_NAME + ' agents` from the '
+    + 'toolkit''s command registry and this project''s manifest. '
+    + 'Everything between the `' + MARKER_ID + '` markers is '
+    + 'machine-written: edit outside the markers only, regenerate with '
+    + '`' + PROGRAM_NAME + ' agents`, verify with `' + PROGRAM_NAME
+    + ' agents --check`. Run `' + PROGRAM_NAME + ' <command> --help` '
+    + 'for the same reference in a terminal.');
+  AddLine(Result, '');
+  AddLine(Result, '### Subcommands');
+  AddLine(Result, '');
+  AddSubcommandLines(Result, ARegistry);
+  AddLine(Result, '');
+  AddLine(Result, '### Run-scripts');
+  AddLine(Result, '');
+  AddRunScriptLines(Result, AManifest);
+  AddLine(Result, '');
+  Result := Result + MARKER_END;
+end;
+
+function ReadAllText(const APath: string): string;
+var
+  Stream : TFileStream;
+begin
+  Result := '';
+  if not FileExists(APath) then Exit;
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(Result, Stream.Size);
+    if Stream.Size > 0 then
+      Stream.ReadBuffer(Result[1], Stream.Size);
+  finally
+    Stream.Free;
+  end;
+end;
+
+{ Locate AMarker as a complete line within AText: preceded by
+  start-of-text or a newline, followed by end-of-text or a line break
+  (LF or CRLF). Inline mentions of the marker text mid-line are prose,
+  not markers, and are ignored. Returns the 1-based position of the
+  marker's first character, or 0 when absent. More than one whole-line
+  occurrence raises: splicing against an ambiguous pair could eat
+  hand-written content. }
+function FindMarkerLine(const AText, AMarker: string): Integer;
+var
+  SearchFrom, P, After : Integer;
+  AtLineStart, AtLineEnd : Boolean;
+begin
+  Result := 0;
+  SearchFrom := 1;
+  repeat
+    P := PosEx(AMarker, AText, SearchFrom);
+    if P = 0 then Break;
+    AtLineStart := (P = 1) or (AText[P - 1] = #10);
+    After := P + Length(AMarker);
+    AtLineEnd := (After > Length(AText)) or (AText[After] = #10)
+      or ((AText[After] = #13)
+          and ((After + 1 > Length(AText)) or (AText[After + 1] = #10)));
+    if AtLineStart and AtLineEnd then
+    begin
+      if Result <> 0 then
+        raise ELWPTError.CreateFmt(
+          '%s contains the marker "%s" on more than one line; keep '
+          + 'exactly one %s block (remove the extra markers), then '
+          + 're-run %s agents',
+          [AGENTS_FILE, AMarker, MARKER_ID, PROGRAM_NAME]);
+      Result := P;
+    end;
+    SearchFrom := P + 1;
+  until False;
+end;
+
+{ Does AText end in a blank line (two consecutive line breaks, LF or
+  CRLF)? Drives how much separator the append path must add. }
+function EndsWithBlankLine(const AText: string): Boolean;
+var
+  i : Integer;
+begin
+  i := Length(AText);
+  if (i = 0) or (AText[i] <> #10) then Exit(False);
+  Dec(i);
+  if (i > 0) and (AText[i] = #13) then Dec(i);
+  Result := (i > 0) and (AText[i] = #10);
+end;
+
+{ What AGENTS.md should contain: AExisting with the marker region
+  replaced (or created). Pure so --check and the write path share one
+  definition of "fresh". The append path treats AExisting as an exact
+  byte prefix — hand-written content outside the region is never
+  rewritten, only separated from the new block. }
+function SpliceRegion(const AExisting, ARegion: string): string;
+var
+  BeginPos, EndPos : Integer;
+  Separator : string;
+begin
+  if AExisting = '' then
+    Exit('# Agent Instructions' + #10 + #10 + ARegion + #10);
+
+  BeginPos := FindMarkerLine(AExisting, MARKER_BEGIN);
+  EndPos   := FindMarkerLine(AExisting, MARKER_END);
+
+  if (BeginPos = 0) and (EndPos = 0) then
+  begin
+    if EndsWithBlankLine(AExisting) then
+      Separator := ''
+    else if AExisting[Length(AExisting)] = #10 then
+      Separator := #10
+    else
+      Separator := #10 + #10;
+    Exit(AExisting + Separator + ARegion + #10);
+  end;
+
+  if (BeginPos = 0) or (EndPos = 0) or (EndPos < BeginPos) then
+    raise ELWPTError.CreateFmt(
+      '%s has a corrupt %s marker pair (need "%s" on its own line '
+      + 'before "%s"); restore both markers or remove the block, '
+      + 'then re-run %s agents',
+      [AGENTS_FILE, MARKER_ID, MARKER_BEGIN, MARKER_END, PROGRAM_NAME]);
+
+  Result := Copy(AExisting, 1, BeginPos - 1)
+    + ARegion
+    + Copy(AExisting, EndPos + Length(MARKER_END), MaxInt);
+end;
+
+function CmdAgents(const AManifestPath: string;
+  const ARegistry: TSubcommandRegistry; ACheck: Boolean): Integer;
+var
+  Man      : TManifest;
+  Existing : string;
+  Desired  : string;
+  Bytes    : TBytes;
+begin
+  { Manifest required: agents is a project-scoped subcommand (it lists
+    the project's run-scripts and writes the project's AGENTS.md). }
+  Man := LoadManifest(AManifestPath);
+
+  Existing := ReadAllText(AGENTS_FILE);
+  Desired  := SpliceRegion(Existing, RenderRegion(ARegistry, Man));
+
+  if Desired = Existing then
+  begin
+    WriteLn(AGENTS_FILE, ' agents block is up to date');
+    Exit(0);
+  end;
+
+  if ACheck then
+  begin
+    WriteLn(ErrOutput, AGENTS_FILE, ' agents block is stale — run "',
+      PROGRAM_NAME, ' agents" to refresh it');
+    Exit(1);
+  end;
+
+  SetLength(Bytes, Length(Desired));
+  if Length(Desired) > 0 then
+    Move(Desired[1], Bytes[0], Length(Desired));
+  { Expanded destination path: AtomicMoveFile derives its rename-aside
+    backup from the destination's directory, and a bare filename would
+    make that the filesystem root (same convention as the manifest
+    writer in LWPT.Install). Staging honours the manifest's
+    [lwpt] tmp-dir override, like every other toolkit-state write. }
+  AtomicWriteBytes(ExpandFileName(AGENTS_FILE), ResolveTmpDir(Man), Bytes);
+  WriteLn(AGENTS_FILE, ' agents block updated');
+  Result := 0;
+end;
+
+end.
