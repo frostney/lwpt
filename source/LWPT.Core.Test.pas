@@ -2654,7 +2654,7 @@ begin
     { Spin until the gate opens so every thread's copy starts inside the
       same few microseconds -- the shape that raced the RTL's lazy env
       count before AppendProcessEnvironment serialised the sweep. }
-    while not EnvironmentCopyGate do ;
+    while not EnvironmentCopyGate do;
     AppendProcessEnvironment(FCopy);
   except
     on E: Exception do FErrorText := E.Message;
