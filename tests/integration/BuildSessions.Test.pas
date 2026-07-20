@@ -101,11 +101,11 @@ var
 begin
   WriteLn('BARRIER TIMEOUT [', ALabel, '] ready-dir ', AReadyDir, ':');
   SawAny := False;
-  if FindFirst(IncludeTrailingPathDelimiter(AReadyDir) + '*',
+  if FindFirst(IncludeTrailingPathDelimiter(AReadyDir) + 'ready-*',
     faAnyFile, Search) = 0 then
   try
     repeat
-      if (Search.Name <> '.') and (Search.Name <> '..') then
+      if (Search.Attr and faDirectory) = 0 then
       begin
         WriteLn('  ready: ', Search.Name);
         SawAny := True;
@@ -459,14 +459,17 @@ begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
+    { Diagnostics before the release/wait: a child that hung before
+      signalling ready would never see the release and WaitOnExit would
+      block with the evidence still unflushed. }
+    if not (SawTwoSessions and SawTwoJobRoots) then
+      DumpBarrierDiagnostics('concurrent-sessions', ReadyDir);
     WriteTextFile(ReleasePath, 'release');
     First.WaitOnExit;
     Second.WaitOnExit;
     FirstStatus := First.ExitStatus;
     SecondStatus := Second.ExitStatus;
 
-    if not (SawTwoSessions and SawTwoJobRoots) then
-      DumpBarrierDiagnostics('concurrent-sessions', ReadyDir);
     Expect<Boolean>(SawTwoSessions).ToBe(True);
     Expect<Boolean>(SawTwoJobRoots).ToBe(True);
     Expect<Boolean>(((FirstStatus = 0) and (SecondStatus = 1))
@@ -536,14 +539,16 @@ begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
+    { Diagnostics before the release/wait — see the concurrent-sessions
+      note: a hung child would block WaitOnExit with evidence unflushed. }
+    if not Ready then
+      DumpBarrierDiagnostics('distinct-outputs', ReadyDir);
     WriteTextFile(ReleasePath, 'release');
     First.WaitOnExit;
     Second.WaitOnExit;
     FirstStatus := First.ExitStatus;
     SecondStatus := Second.ExitStatus;
 
-    if not Ready then
-      DumpBarrierDiagnostics('distinct-outputs', ReadyDir);
     Expect<Boolean>(Ready).ToBe(True);
     Expect<Integer>(FirstStatus).ToBe(0);
     Expect<Integer>(SecondStatus).ToBe(0);
@@ -829,6 +834,8 @@ begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
+    if not TargetReady(ReadyDir, 'alpha') then
+      DumpBarrierDiagnostics('sequential: alpha ready', ReadyDir);
     Expect<Boolean>(TargetReady(ReadyDir, 'alpha')).ToBe(True);
     Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(False);
     WriteTextFile(ReleaseDir + '/alpha', 'release');
@@ -838,6 +845,8 @@ begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
+    if not TargetReady(ReadyDir, 'beta') then
+      DumpBarrierDiagnostics('sequential: beta ready', ReadyDir);
     Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(True);
     Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
     WriteTextFile(ReleaseDir + '/beta', 'release');
