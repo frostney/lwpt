@@ -88,6 +88,22 @@ begin
   Result := 'SlowUnit' + Format('%.3d', [AIndex]);
 end;
 
+{ When a nested build exits with an unexpected code, its captured output
+  is the only evidence of why — dump it into the suite's stdout so the
+  failure replay surfaces the cause directly in CI output. }
+procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
+  const AExpectedExit: Integer);
+begin
+  if ARun.ExitCode = AExpectedExit then Exit;
+  WriteLn('RUN FAILURE [', ALabel, '] exit=', ARun.ExitCode,
+    ' expected=', AExpectedExit);
+  WriteLn('--- captured stdout ---');
+  WriteLn(ARun.Stdout);
+  WriteLn('--- captured stderr ---');
+  WriteLn(ARun.Stderr);
+  WriteLn('--- end captured output ---');
+end;
+
 { On a barrier timeout the suite's stdout is captured into its isolated
   log and replayed by the failure path, so these lines surface directly
   in CI output. They separate "the scheduler never dispatched the
@@ -947,6 +963,7 @@ begin
   try
     RunResult := RunLwptWithWorkerEnv(
       ['build', 'alpha', 'beta'], Project, QuietEnvironment);
+    DumpRunFailure('observable: quiet build', RunResult, 0);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
     Expect<Boolean>(Pos('alpha-begin|', RunResult.Stdout) = 0).ToBe(True);
     Expect<Boolean>(Pos('beta-begin|', RunResult.Stdout) = 0).ToBe(True);
@@ -954,6 +971,7 @@ begin
 
     RunResult := RunLwptWithWorkerEnv(
       ['build', 'alpha', 'beta', '--verbose'], Project, Environment);
+    DumpRunFailure('observable: verbose build', RunResult, 0);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
     Expect<Boolean>(Pos('discovered 2 build target(s)', RunResult.Stdout) > 0)
       .ToBe(True);
@@ -1022,6 +1040,7 @@ begin
       + IntToStr(TestHeartbeatIntervalMilliseconds);
     RunResult := RunLwpt(['build', 'alpha'], Project, Environment);
 
+    DumpRunFailure('contended: queued build', RunResult, 0);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
     Expect<Boolean>(Pos('HEARTBEAT build elapsed ', RunResult.Stdout) > 0)
       .ToBe(True);
