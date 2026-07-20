@@ -31,6 +31,10 @@ const
   RECEIVE_FRAGMENT_SIZE = 3;
   SEND_FRAGMENT_SIZE = 7;
   MAX_REACTOR_STEPS = 20000;
+  { MSG_NOSIGNAL keeps send() to an already-closed peer from raising SIGPIPE;
+    the production client closes as soon as it has the full response, so the
+    server can legitimately meet a gone peer while flushing close_notify. }
+  SEND_NOSIGNAL_FLAG = $4000;
 
 type
   TBIONewFile = function(AFilename, AMode: PAnsiChar): Pointer; cdecl;
@@ -40,6 +44,7 @@ type
     FContext: TTransportSecurityServerContext;
     FErrorMessage: string;
     FListenSocket: TSocket;
+    FPeerGone: Boolean;
     FPort: Word;
     FRequest: string;
     FSawFragmentedInput: Boolean;
@@ -89,6 +94,15 @@ end;
 function SocketWouldBlock: Boolean; inline;
 begin
   Result := (FpGetErrno = ESysEAGAIN) or (FpGetErrno = ESysEWOULDBLOCK);
+end;
+
+{ The production client (CloseTransportSecurity) sends its own close_notify and
+  closes the socket without waiting for the server's. A server flush that lands
+  after that close sees EPIPE/ECONNRESET -- a benign end-of-connection here, not
+  a transport failure. }
+function SocketPeerClosed: Boolean; inline;
+begin
+  Result := (FpGetErrno = ESysEPIPE) or (FpGetErrno = ESysECONNRESET);
 end;
 
 constructor TLoopbackTLSServer.Create;
@@ -155,15 +169,20 @@ begin
   SendLength := Pending;
   if SendLength > SEND_FRAGMENT_SIZE then
     SendLength := SEND_FRAGMENT_SIZE;
-  Sent := FpSend(ASocket, Buffer, SendLength, 0);
+  Sent := FpSend(ASocket, Buffer, SendLength, SEND_NOSIGNAL_FLAG);
   if Sent > 0 then
   begin
     TransportSecurityConsumeCiphertext(AConnection, Sent);
     FSawShortWrite := FSawShortWrite or (Sent < Pending);
     Result := True;
   end
-  else if (Sent < 0) and not SocketWouldBlock then
-    raise Exception.Create('send() failed');
+  else if Sent < 0 then
+  begin
+    if SocketPeerClosed then
+      FPeerGone := True
+    else if not SocketWouldBlock then
+      raise Exception.Create('send() failed');
+  end;
 end;
 
 function TLoopbackTLSServer.ReceiveOneCiphertextFragment(
@@ -271,7 +290,7 @@ begin
     raise Exception.Create('TLS server write did not consume the response');
   for Step := 1 to MAX_REACTOR_STEPS do
   begin
-    if TransportSecurityPendingCiphertext(AConnection) = 0 then
+    if (TransportSecurityPendingCiphertext(AConnection) = 0) or FPeerGone then
       Exit;
     FlushOneCiphertextFragment(ASocket, AConnection);
     Sleep(1);
@@ -287,6 +306,8 @@ var
 begin
   for Step := 1 to MAX_REACTOR_STEPS do
   begin
+    if FPeerGone then
+      Exit;
     if TransportSecurityPendingCiphertext(AConnection) > 0 then
       FlushOneCiphertextFragment(ASocket, AConnection)
     else
