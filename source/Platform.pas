@@ -23,51 +23,51 @@ implementation
 
 const
   {$IF DEFINED(DARWIN)}
-  BUILD_OS = 'darwin';
+  BuildOS = 'darwin';
   {$ELSEIF DEFINED(ANDROID)}
-  BUILD_OS = 'android';
+  BuildOS = 'android';
   {$ELSEIF DEFINED(LINUX)}
-  BUILD_OS = 'linux';
+  BuildOS = 'linux';
   {$ELSEIF DEFINED(MSWINDOWS)}
-  BUILD_OS = 'windows';
+  BuildOS = 'windows';
   {$ELSEIF DEFINED(FREEBSD)}
-  BUILD_OS = 'freebsd';
+  BuildOS = 'freebsd';
   {$ELSEIF DEFINED(NETBSD)}
-  BUILD_OS = 'netbsd';
+  BuildOS = 'netbsd';
   {$ELSEIF DEFINED(OPENBSD)}
-  BUILD_OS = 'openbsd';
+  BuildOS = 'openbsd';
   {$ELSEIF DEFINED(AIX)}
-  BUILD_OS = 'aix';
+  BuildOS = 'aix';
   {$ELSEIF DEFINED(SOLARIS)}
-  BUILD_OS = 'solaris';
+  BuildOS = 'solaris';
   {$ELSE}
-  BUILD_OS = 'unknown';
+  BuildOS = 'unknown';
   {$ENDIF}
 
   {$IF DEFINED(CPUX86_64)}
-  BUILD_ARCH = 'x86_64';
+  BuildArchitecture = 'x86_64';
   {$ELSEIF DEFINED(CPUAARCH64)}
-  BUILD_ARCH = 'aarch64';
+  BuildArchitecture = 'aarch64';
   {$ELSEIF DEFINED(CPUI386)}
-  BUILD_ARCH = 'x86';
+  BuildArchitecture = 'x86';
   {$ELSEIF DEFINED(CPUARM)}
-  BUILD_ARCH = 'arm';
+  BuildArchitecture = 'arm';
   {$ELSEIF DEFINED(CPUPOWERPC64)}
-  BUILD_ARCH = 'powerpc64';
+  BuildArchitecture = 'powerpc64';
   {$ELSEIF DEFINED(CPUPOWERPC)}
-  BUILD_ARCH = 'powerpc';
+  BuildArchitecture = 'powerpc';
   {$ELSE}
-  BUILD_ARCH = 'unknown';
+  BuildArchitecture = 'unknown';
   {$ENDIF}
 
 function GetBuildOS: string;
 begin
-  Result := BUILD_OS;
+  Result := BuildOS;
 end;
 
 function GetBuildArch: string;
 begin
-  Result := BUILD_ARCH;
+  Result := BuildArchitecture;
 end;
 
 end.

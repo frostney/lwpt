@@ -69,6 +69,8 @@ function RunLwpt(const AArgs: array of string;
 function LwptBinaryPath: string;
 function ExpectedExe(const APath: string): string;
 procedure SetLwptBinaryPath(const APath: string);
+procedure ConfigureProcessEnvironment(const AProcess: TProcess;
+  const AOverrides: array of string);
 
 { Quick helper for "is the env saying skip network?". E2E tests that
   touch the live internet should consult this and self-skip via a
@@ -161,7 +163,7 @@ end;
 { Name part of a NAME=value environment entry. Windows env blocks can
   contain entries starting with '=' (drive-letter cwd entries); those
   yield an empty name and never match an override. }
-function EnvEntryName(const AEntry: string): string;
+function EnvironmentEntryName(const AEntry: string): string;
 var EqPos: Integer;
 begin
   EqPos := Pos('=', AEntry);
@@ -171,19 +173,38 @@ begin
     Result := Copy(AEntry, 1, EqPos - 1);
 end;
 
-function EnvEntryOverridden(const AEntry: string;
-  const AOverrides: array of string): Boolean;
-var i: Integer;
+function EnvironmentNamesEqual(const ALeft, ARight: string): Boolean;
 begin
-  for i := 0 to High(AOverrides) do
-    {$IFDEF MSWINDOWS}
-    { Windows environment variable names are case-insensitive. }
-    if SameText(EnvEntryName(AEntry), EnvEntryName(AOverrides[i])) then
-    {$ELSE}
-    if EnvEntryName(AEntry) = EnvEntryName(AOverrides[i]) then
-    {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Result := SameText(ALeft, ARight);
+  {$ELSE}
+  Result := ALeft = ARight;
+  {$ENDIF}
+end;
+
+function EnvironmentEntryIsOverridden(const AEntry: string;
+  const AOverrides: array of string): Boolean;
+var
+  EnvironmentIndex: Integer;
+begin
+  for EnvironmentIndex := 0 to High(AOverrides) do
+    if EnvironmentNamesEqual(EnvironmentEntryName(AEntry),
+      EnvironmentEntryName(AOverrides[EnvironmentIndex])) then
       Exit(True);
   Result := False;
+end;
+
+procedure ConfigureProcessEnvironment(const AProcess: TProcess;
+  const AOverrides: array of string);
+var
+  EnvironmentIndex: Integer;
+begin
+  for EnvironmentIndex := 1 to GetEnvironmentVariableCount do
+    if not EnvironmentEntryIsOverridden(
+      GetEnvironmentString(EnvironmentIndex), AOverrides) then
+      AProcess.Environment.Add(GetEnvironmentString(EnvironmentIndex));
+  for EnvironmentIndex := 0 to High(AOverrides) do
+    AProcess.Environment.Add(AOverrides[EnvironmentIndex]);
 end;
 
 { Discover the one-shot worker token by its protocol suffix so this shared
@@ -199,9 +220,10 @@ begin
   Result := '';
   for i := 1 to GetEnvironmentVariableCount do
   begin
-    Name := EnvEntryName(GetEnvironmentString(i));
+    Name := EnvironmentEntryName(GetEnvironmentString(i));
     if (Length(Name) >= Length(TOKEN_SUFFIX))
-       and SameText(Copy(Name, Length(Name) - Length(TOKEN_SUFFIX) + 1,
+       and EnvironmentNamesEqual(Copy(Name,
+         Length(Name) - Length(TOKEN_SUFFIX) + 1,
          Length(TOKEN_SUFFIX)), TOKEN_SUFFIX)
        and (GetEnvironmentVariable(Name) <> '') then
       Exit(Name);
@@ -243,13 +265,14 @@ begin
     WorkerLeaseTokenEnvironment := FindWorkerLeaseTokenEnvironment;
     ForwardedWorkerLease := GForwardWorkerLease
       and (WorkerLeaseTokenEnvironment <> '')
-      and not EnvEntryOverridden(
+      and not EnvironmentEntryIsOverridden(
         WorkerLeaseTokenEnvironment + '=', AExtraEnv);
     for i := 1 to GetEnvironmentVariableCount do
-      if not EnvEntryOverridden(GetEnvironmentString(i), AExtraEnv)
+      if not EnvironmentEntryIsOverridden(GetEnvironmentString(i), AExtraEnv)
          and (GForwardWorkerLease
            or (WorkerLeaseTokenEnvironment = '')
-           or not SameText(EnvEntryName(GetEnvironmentString(i)),
+           or not EnvironmentNamesEqual(
+             EnvironmentEntryName(GetEnvironmentString(i)),
              WorkerLeaseTokenEnvironment)) then
         P.Environment.Add(GetEnvironmentString(i));
     for i := 0 to High(AExtraEnv) do
