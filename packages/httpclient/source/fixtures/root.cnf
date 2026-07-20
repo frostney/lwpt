@@ -1,0 +1,13 @@
+[req]
+distinguished_name = root_name
+prompt = no
+x509_extensions = root_extensions
+
+[root_name]
+CN = TransportSecurity Test Root CA
+
+[root_extensions]
+basicConstraints = critical,CA:true,pathlen:1
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always

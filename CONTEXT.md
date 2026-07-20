@@ -142,7 +142,7 @@ A LWPT-invoked script with one or more lifecycle attachment points. A hook entry
 *Avoid*: "script" alone (overloaded — see *Script*), "trigger" (suggests event-listener semantics).
 
 **Lifecycle phase**:
-The point at which a hook section attaches to a subcommand run. Six top-level sections — `[preinstall]`, `[postinstall]`, `[prebuild]`, `[postbuild]`, `[pretest]`, `[posttest]` — plus the `prebuild` and `postbuild` fields available on each `[build].<entry>` inline table (per-item, build only). `format`, `repair`, `init`, and `run` deliberately have no hook surface; the rationale for each refusal lives in the lifecycle ADR.
+The point at which a hook section attaches to a subcommand run. Six top-level sections — `[preinstall]`, `[postinstall]`, `[prebuild]`, `[postbuild]`, `[pretest]`, `[posttest]` — plus the `prebuild` and `postbuild` fields available on each `[build].<entry>` inline table (per-item, build only). `format`, `repair`, `init`, `run`, and `agents` deliberately have no hook surface; the rationale for each refusal lives in the lifecycle ADR.
 *Avoid*: "lifecycle event" (suggests dynamic dispatch), "build phase" (subcommand-specific; we mean any of the three phased subcommands — install/build/test).
 
 **Build entry** (build item):
@@ -155,8 +155,12 @@ A user-declared callable section in the manifest, addressable via `lwpt run <nam
 *Avoid*: "command" (overloaded with shell), "task" (Cargo / Gradle parallel that doesn't fit LWPT's surface), "recipe" (Just-specific).
 
 **Run**:
-The seventh LWPT subcommand — `lwpt run <name>`. Two behaviours under one verb: if `<name>` matches a registered subcommand (install/build/format/test/repair/init), aliases to that subcommand with the remaining args (`lwpt run install --frozen` ≡ `lwpt install --frozen`); otherwise looks up `<name>` in the manifest's [Script](#script-run-script) entries and invokes it. `lwpt run` alone lists every callable name. The aliasing layer is in the CLI dispatcher, not in the run-handler — option parsing for subcommands works unchanged.
+The `lwpt run <name>` subcommand. Two behaviours under one verb: if `<name>` matches any registered subcommand, aliases to that subcommand with the remaining args (`lwpt run install --frozen` ≡ `lwpt install --frozen`); otherwise looks up `<name>` in the manifest's [Script](#script-run-script) entries and invokes it. `lwpt run` alone lists every callable name. The aliasing layer is in the CLI dispatcher, not in the run-handler — option parsing for subcommands works unchanged.
 *Avoid*: "exec" (executes-into-this connotation; lwpt run is dispatch + spawn).
+
+**Agents block**:
+The marker-fenced region (`<!-- lwpt:agents:begin -->` … `<!-- lwpt:agents:end -->`) inside a project's `AGENTS.md` that `lwpt agents` writes and `lwpt agents --check` verifies (per ADR-0024). Machine-written from the subcommand registry — the same objects that drive `--help` — plus the manifest's [Script](#script-run-script) entries. Byte-deterministic: LF line endings, no version stamp or timestamp, so `--check` fails only on real drift. Everything outside the markers is hand-written and never touched by the toolkit.
+*Avoid*: "generated AGENTS.md" (the file is the host; only the block is generated), "agents section" loosely (the term is specifically the marker-fenced region), "agent docs" (harness-side instruction files like CLAUDE.md are a different layer).
 
 ### Manifest interpolation
 

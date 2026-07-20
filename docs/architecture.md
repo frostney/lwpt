@@ -164,7 +164,7 @@ Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), three customer-f
 - **duplication** — becomes a `lwpt duplication` subcommand in [issue #32](https://github.com/frostney/lwpt/issues/32).
 - **codebase-health** — becomes a `lwpt health` subcommand in [issue #33](https://github.com/frostney/lwpt/issues/33).
 
-The pre-merge CI/PR gate is `lwpt format --check` + `lwpt build` + `lwpt test`; the local pre-commit hook runs the formatter only. Architecture drift is checked across LWPT's own source, tests, manifests, workflows, documentation, ADRs, and domain context during release preparation. It is not a consumer-project responsibility or an LWPT subcommand.
+The pre-merge CI/PR gate is `lwpt format --check` + `lwpt build` + `lwpt agents --check` + `lwpt test`; the local pre-commit hook runs the formatter and the AGENTS.md agents-block refresh only. Architecture drift is checked across LWPT's own source, tests, manifests, workflows, documentation, ADRs, and domain context during release preparation. It is not a consumer-project responsibility or an LWPT subcommand.
 
 ## Production-readiness checklist (v1)
 

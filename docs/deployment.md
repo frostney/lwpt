@@ -5,8 +5,9 @@ Platform support tiers, the per-platform TLS backend story, the release process,
 ## Executive Summary
 
 - **Six release targets** map to the matrix in [`docs/ci.md`](./ci.md): `aarch64-darwin` + `x86_64-darwin` + `x86_64-linux` + `aarch64-linux` + `x86_64-win64` + `i386-win32`. All six tested natively on every push to `main` (per `ci.yml`); all six published per release tag (per `release.yml`).
-- **TLS backend is platform-native.** SChannel on Windows, SecureTransport on macOS, OpenSSL on Linux. Per [ADR-0016](./adr/0016-tls-backend-per-platform.md). Windows and macOS releases ship the binary alone — no OpenSSL DLLs. Linux relies on the distro's libssl package.
-- **A CI guard** in `pr.yml` (windows-cross-compile job), `ci.yml` (test job, Windows runners), and `release.yml` (build job, Windows targets) hard-fails if `lwpt.exe` references `libssl` / `libcrypto`, mirroring [GocciaScript's same guard](https://github.com/frostney/GocciaScript/blob/main/.github/workflows/ci.yml).
+- **Outbound TLS stays platform-native; server accept is asymmetric.** Clients use SChannel on Windows, SecureTransport on macOS, and OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md). Server accept uses runtime-loaded OpenSSL on Windows and Unix-not-Darwin per [ADR-0024](./adr/0024-openssl-server-tls-accept.md); Darwin callers get an actionable Network.framework error.
+- **Windows releases still ship no OpenSSL DLLs.** SChannel clients have no prerequisite. A Windows program that consumes server accept supplies OpenSSL 3 from an administrator-controlled directory covered by the restricted loader search.
+- **The three Windows CI guards fail closed on OpenSSL linkage.** They inspect normal and delay imports, imported symbol families regardless of DLL name, and static-link inputs; canaries prove the parser sees both a prohibited fixture and real system imports.
 - **No codesigning for v1.** macOS users see the "unidentified developer" warning; documented workaround is `xattr -d com.apple.quarantine ./lwpt`. Promote to Apple Developer ID + notarisation only on demonstrated demand.
 - **Release artefacts come from CI.** Tag → `release.yml` → cross-build on macos-latest → package → GitHub Releases. No hand-built releases; ever.
 
@@ -23,19 +24,19 @@ The Tier 1 set matches the six-target cross-build matrix in `toolchain.yml` + `c
 
 ## TLS backends per platform
 
-Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), the vendored `TransportSecurity.pas` ([`packages/httpclient/source/TransportSecurity.pas`](../packages/httpclient/source/TransportSecurity.pas)) carries one cross-platform abstraction over three OS-native TLS backends:
+Per [ADR-0016](./adr/0016-tls-backend-per-platform.md) and [ADR-0024](./adr/0024-openssl-server-tls-accept.md), `TransportSecurity.pas` ([`packages/httpclient/source/TransportSecurity.pas`](../packages/httpclient/source/TransportSecurity.pas)) deliberately selects different backends for peer-verifying clients and certificate-presenting servers:
 
-| Platform | Backend | Where it comes from | User prerequisite |
-|----------|---------|---------------------|-------------------|
-| **Windows** | SChannel | `sspi.dll` / `secur32.dll` (Windows API; built into the OS since Windows 2000) | None — ships with Windows |
-| **macOS** | SecureTransport | Apple's framework (built into every macOS install) | None — ships with macOS |
-| **Linux + other Unix** | OpenSSL | System shared object via `DynLibs.LoadLibrary` at runtime | Distro's libssl package — see "Linux" below |
+| Platform | Outbound client | Server accept | Runtime prerequisite |
+|----------|-----------------|---------------|----------------------|
+| **Windows** | SChannel | OpenSSL 3+, runtime-loaded with restricted search | None for clients; OpenSSL 3 DLLs for server consumers |
+| **macOS** | SecureTransport | Unsupported; use Network.framework | None |
+| **Linux + other Unix** | OpenSSL, runtime-loaded | OpenSSL 3+, runtime-loaded | Distro's libssl package — see "Linux" below |
 
-`HTTPClient` consumes the unified `StartTransportSecurity` / `TransportSecurityRead` / `TransportSecurityWrite` / `CloseTransportSecurity` API; the per-platform branching lives behind that surface. The unit is byte-identical to GocciaScript's older copy (last verified via `diff -q`), reflecting the co-developed history; per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is now the canonical source and the SChannel + SecureTransport branches evolve here going forward.
+`HTTPClient` consumes the blocking `StartTransportSecurity` surface for outbound connections. Fd-owning servers create one `TTransportSecurityServerContext` from a caller-supplied, size-capped PKCS#12 path + passphrase and keep it alive while its connections exist. `BeginTransportSecurityServer` gives each connection a private read memory BIO and bounded write-side BIO pair; `Active` remains false until the handshake authenticates. The transport feeds receive completions, steps one operation at a time, and drains the retained ciphertext queue before any later protocol operation. Returned ciphertext spans remain stable until consumed, and WANT-write plaintext is retained inside the connection for a nil, zero-length resume call. Reads distinguish peer `close_notify` as `tssPeerClosed`. Graceful close queues `close_notify`; abortive or fatal close discards TLS state. Neither path owns or closes the transport socket. The socket owner **must** enforce its own handshake deadline and inbound byte budget. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for this package.
 
-### Windows: SChannel (no DLLs to bundle)
+### Windows: SChannel clients, OpenSSL servers
 
-`lwpt.exe` calls into Windows' Security Service Provider Interface (SSPI) directly via the `Windows` unit + the SChannel constants in `TransportSecurity.pas`. There are no third-party DLLs to ship. The Windows release archive contains exactly:
+Outbound HTTPS calls into Windows' Security Service Provider Interface (SSPI) directly via the `Windows` unit and the SChannel constants in `TransportSecurity.pas`. Running LWPT as a client therefore has no third-party DLL prerequisite. The Windows release archive contains exactly:
 
 ```text
 lwpt-<version>-windows-x64.zip
@@ -51,21 +52,17 @@ lwpt-<version>-windows-x64.zip
         └── build-system.md
 ```
 
-Earlier docs claimed the archive bundled `libssl-3-x64.dll` + `libcrypto-3-x64.dll` — that was a documentation bug corrected by [ADR-0016](./adr/0016-tls-backend-per-platform.md). The release archive never bundled them and it should not — SChannel is the only TLS backend on Windows. The `release.yml` workflow does not stage any DLLs.
+The server-accept interface is separate: a Windows application that invokes it must make OpenSSL 3 DLLs available in an administrator-controlled directory covered by the restricted loader policy. The server uses `LoadLibraryEx` with system/default-directory search flags; it does not use the legacy current-directory or ordinary `PATH` search order and does not fall back to OpenSSL 1.1 names. It verifies the loaded runtime is major version 3 or newer before creating a server context. LWPT never import-links, statically links, or ships those DLLs, and `release.yml` does not stage them.
 
 #### CI guard
 
-To prevent a future regression (someone adds `uses OpenSSL` under a Windows-active codepath; the unit's source registers DLL names as string literals for `LoadLibrary`), `pr.yml`, `ci.yml`, and `release.yml` each include a guard step that fails the build if the cross-built `lwpt.exe` contains `libssl` or `libcrypto` substrings:
-
-- `pr.yml` windows-cross-compile job: bash `grep -aq libssl\|libcrypto` against the freshly cross-built `lwpt.exe` on the macOS runner. The only pre-merge guard — catches the release-blocker on the PR itself.
-- `ci.yml` test job: PowerShell read-bytes-as-Latin1 scan, gated on `runner.os == 'Windows'`. Mirrors GocciaScript's same guard step.
-- `release.yml` build job: bash `grep -aq libssl\|libcrypto`, gated on Windows targets. Runs on the macOS cross-build runner against the staged binary.
-
-The guards are independent (different shells, different binaries — PR cross-build vs post-merge cross-built artefact vs staged-for-release artefact); all must pass.
+`pr.yml`, `ci.yml`, and `release.yml` each parse the normal and delay PE import directories, reject imported OpenSSL symbol families regardless of the DLL filename, and inspect linker-map/archive inputs for static OpenSSL. Matching happens inside the checker, so a missing or failing `grep` cannot be interpreted as clean. A small PE fixture with a prohibited import is the positive detection canary. The real binary must expose at least one known system import, so a parser regression that returns zero imports also fails. Runtime-loader strings remain allowed because they are not linkage.
 
 ### macOS: SecureTransport (no Homebrew dependency)
 
-The `Darwin` branch of `TransportSecurity.pas` calls into Apple's SecureTransport framework, which is built into every macOS install. No `brew install openssl@3`, no `DYLD_LIBRARY_PATH` shenanigans, no library version pinning. macOS release archives ship the binary alone, same shape as the Windows archives (without the `.exe` suffix).
+The `Darwin` client branch of `TransportSecurity.pas` calls into Apple's SecureTransport framework, which is built into every macOS install. No `brew install openssl@3`, no `DYLD_LIBRARY_PATH` shenanigans, no library version pinning. macOS release archives ship the binary alone, same shape as the Windows archives (without the `.exe` suffix).
+
+Server accept is intentionally unsupported on Darwin. Constructing a `TTransportSecurityServerContext` fails cleanly with an error directing the caller to Network.framework, which owns TLS for duetto's macOS server backend. LWPT does not add deprecated, TLS-1.2-capped SecureTransport server mode or a macOS OpenSSL prerequisite.
 
 #### Quarantine workaround
 
@@ -88,7 +85,7 @@ The judgement is that the user base in v1 is small enough that the quarantine wo
 
 ### Linux: system OpenSSL
 
-The `Unix`-and-not-`Darwin` branch of `TransportSecurity.pas` loads the system shared object at runtime via `DynLibs.LoadLibrary` against standard names (`libssl.so.3` / `libcrypto.so.3` and a small set of fallbacks). Users need their distro's libssl package:
+The `Unix`-and-not-`Darwin` branch of `TransportSecurity.pas` loads the system shared object at runtime via `DynLibs.LoadLibrary` against standard names (`libssl.so.3` / `libcrypto.so.3` and client-compatible fallbacks). The same loaded interface serves outbound clients and the socket-independent memory-BIO server API, but server context construction rejects a runtime older than OpenSSL 3. Users need their distro's libssl package:
 
 - Debian / Ubuntu: `apt install libssl3`
 - Fedora / RHEL: `dnf install openssl-libs`
@@ -129,13 +126,13 @@ There are no hand-built release artefacts. If `ci.yml` is broken at tag time, fi
 
 ## Hotfix releases
 
-For an urgent CVE in a vendored unit or in a system TLS backend on Linux:
+For an urgent CVE in an LWPT-canonical package or in a system TLS backend on Linux:
 
 1. Patch on `main` with the fix + a `*.Test.pas` proving the fix.
 2. Tag the patch version (`0.1.1`) — go straight from `0.1.0` to `0.1.1`, no pre-release.
 3. The release notes name the CVE explicitly so downstream users can audit.
 
-System TLS on Windows (SChannel) and macOS (SecureTransport) is updated by the OS vendor; LWPT does not ship those code paths. Linux OpenSSL CVE responses are entirely a distro-package matter — LWPT just consumes whatever `libssl` the system provides.
+Client TLS on Windows (SChannel) and macOS (SecureTransport) is updated by the OS vendor. Linux OpenSSL and Windows server-accept OpenSSL CVE responses belong to the runtime provider; LWPT loads those libraries but does not ship them.
 
 ## Self-hosted runners (Tier 3 path)
 

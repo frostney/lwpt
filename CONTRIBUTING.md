@@ -23,9 +23,9 @@ Install Lefthook hooks once: `lefthook install`.
 
 ## Pull request gate
 
-The pre-commit hook runs `lwpt format` locally (with `stage_fixed: true`, so any rewrites are auto-staged into the same commit). The heavyweight gates — `lwpt format --check`, `lwpt build`, `lwpt test` — run on the PR workflow in CI. A PR is mergeable when:
+The pre-commit hook runs `lwpt format` and `lwpt agents` locally (both with `stage_fixed: true`, so any rewrites are auto-staged into the same commit). The heavyweight gates — `lwpt format --check`, `lwpt build`, `lwpt agents --check`, `lwpt test` — run on the PR workflow in CI. A PR is mergeable when:
 
-1. All three pre-commit commands exit zero on the proposed branch.
+1. All four CI gate commands exit zero on the proposed branch.
 2. CI is green on every Tier 1 platform from [`docs/deployment.md`](./docs/deployment.md).
 3. The change has tests where tests are the right answer (see [`docs/testing.md`](./docs/testing.md) for the policy on when each test tier applies).
 4. Documentation that mentions the changed surface has been updated. The no-duplication rule from [`docs/`](./docs/) applies: edit the *one* canonical document, not five.
