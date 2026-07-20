@@ -5,13 +5,16 @@
 # Dispatch-only; never triggered by pushes. Remove once the root cause lands.
 name: Darwin proxy-env stress
 
+# push-scoped to the diagnostic branch: workflow_dispatch cannot target a
+# workflow that does not exist on the default branch, so the branch push
+# itself is the trigger.
 on:
-  workflow_dispatch:
-    inputs:
-      iterations:
-        description: Number of lwpt test iterations
-        required: false
-        default: "12"
+  push:
+    branches:
+      - claude/lwpt-socket-e2e-fix
+
+env:
+  ITERATIONS: "12"
 
 permissions:
   contents: read
@@ -39,7 +42,6 @@ jobs:
 
       - name: Stress loop
         run: |
-          ITERATIONS="${{ inputs.iterations }}"
           mkdir -p stress-logs
           HITS=0
           FAILS=0
