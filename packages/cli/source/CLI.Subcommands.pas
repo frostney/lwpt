@@ -153,17 +153,21 @@ begin
   WriteLn;
   WriteLn('options:');
 
-  { compute max option-name width for aligned descriptions }
+  { compute max option-token width for aligned descriptions.
+    FormatForHelp (not the bare long name) so valued options show
+    their value shape (--name=<value>, --name=<N>, --name=a|b) and
+    every surface rendered from the registry — this help text and the
+    host program's agents block — stays identical by construction. }
   MaxOptWidth := 0;
   for i := 0 to High(ASub.Options) do
   begin
-    W := Length('--' + ASub.Options[i].LongName);
+    W := Length(ASub.Options[i].FormatForHelp);
     if W > MaxOptWidth then MaxOptWidth := W;
   end;
 
   for i := 0 to High(ASub.Options) do
   begin
-    OptName := '--' + ASub.Options[i].LongName;
+    OptName := ASub.Options[i].FormatForHelp;
     Write('  ', OptName);
     for W := Length(OptName) to MaxOptWidth do Write(' ');
     WriteLn('  ', ASub.Options[i].HelpText);
