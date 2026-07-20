@@ -87,6 +87,19 @@ function  SHA256Hex(const AData: TBytes): string;
 function  SHA256File(const APath: string): string;
 function  HashTree(const APathOrArchive: string): string;
 
+{ Appends every entry of the process environment to ATarget, safe to call
+  from concurrent threads. The RTL's GetEnvironmentVariableCount lazily
+  initialises a shared global without synchronisation (FPC_EnvCount in
+  rtl/objpas/sysutils/osutil.inc, FPC 3.2.2) and counts upward in that
+  global; a thread sweeping while another thread runs the first-ever count
+  can read a partial value and silently truncate its copy. That truncation
+  is how parallel build jobs handed their first compiler children an
+  environment missing the trailing entries. The sweep therefore runs once,
+  under a lock, into a process-lifetime snapshot that every caller copies.
+  The RTL environment view is itself fixed at startup, so the snapshot
+  drops nothing a per-call sweep would see. }
+procedure AppendProcessEnvironment(const ATarget: TStrings);
+
 implementation
 
 uses
@@ -105,6 +118,27 @@ const
 var
   TmpPathCounter: LongInt;
   TmpPathStartedAt: Int64;
+  ProcessEnvironmentSnapshot: TStringList = nil;
+  ProcessEnvironmentCriticalSection: TRTLCriticalSection;
+
+procedure AppendProcessEnvironment(const ATarget: TStrings);
+var
+  EnvironmentIndex: Integer;
+begin
+  EnterCriticalSection(ProcessEnvironmentCriticalSection);
+  try
+    if not Assigned(ProcessEnvironmentSnapshot) then
+    begin
+      ProcessEnvironmentSnapshot := TStringList.Create;
+      for EnvironmentIndex := 1 to GetEnvironmentVariableCount do
+        ProcessEnvironmentSnapshot.Add(
+          GetEnvironmentString(EnvironmentIndex));
+    end;
+    ATarget.AddStrings(ProcessEnvironmentSnapshot);
+  finally
+    LeaveCriticalSection(ProcessEnvironmentCriticalSection);
+  end;
+end;
 
 function FPCExecutable: string;
 begin
@@ -1105,5 +1139,6 @@ initialization
     PID + atomic sequence provide uniqueness; the existence retry
     defends against a stale path from PID/stamp reuse. }
   TmpPathStartedAt := Round(Now * MSecsPerDay);
+  InitCriticalSection(ProcessEnvironmentCriticalSection);
 
 end.

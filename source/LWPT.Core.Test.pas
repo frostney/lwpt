@@ -269,6 +269,19 @@ type
     property Paths: TStringList read FPaths;
   end;
 
+  TEnvironmentCopyThread = class(TThread)
+  private
+    FCopy: TStringList;
+    FErrorText: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    property Copied: TStringList read FCopy;
+    property ErrorText: string read FErrorText;
+  end;
+
   TMakeTmpPathSuite = class(TTestSuite)
   private
     FScratch: string;
@@ -283,6 +296,17 @@ type
     procedure TestSiblingCallsAreDistinct;
     procedure TestSiblingExistingCandidateIsSkipped;
     procedure TestThreadedBurstIsDistinct;
+  end;
+
+  { AppendProcessEnvironment must stay safe under concurrent first use:
+    the RTL's GetEnvironmentVariableCount lazily initialises a shared
+    global without synchronisation, and unsynchronised parallel sweeps
+    truncated child environments (the aarch64-darwin fpc-proxy
+    misroute). Every concurrent copy must be complete and identical. }
+  TAppendProcessEnvironmentSuite = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestConcurrentCopiesAreCompleteAndIdentical;
   end;
 
   { AtomicMoveFile / AtomicMoveDir with a bare relative destination
@@ -2469,6 +2493,13 @@ const
   TmpPathCallCount = 1000;
   TmpPathThreadCount = 4;
   TmpPathThreadCallCount = 250;
+  EnvironmentCopyThreadCount = 8;
+
+var
+  { LongInt + Interlocked* (the codebase's cross-thread flag idiom, cf.
+    TLWPTProcessTree.FImmediateTerminationRequested) so the start signal
+    does not rely on unsynchronised Boolean visibility. }
+  EnvironmentCopyGate: LongInt = 0;
 
 { Predicts the generator's next candidate for an occupied-path test by
   advancing the trailing sequence of a previously returned path. }
@@ -2626,6 +2657,75 @@ begin
 
   Expect<Boolean>(FileExists(Candidate)).ToBe(True);
   Expect<Boolean>(ResultPath <> Candidate).ToBe(True);
+end;
+
+constructor TEnvironmentCopyThread.Create;
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FCopy := TStringList.Create;
+  FErrorText := '';
+end;
+
+destructor TEnvironmentCopyThread.Destroy;
+begin
+  FCopy.Free;
+  inherited Destroy;
+end;
+
+procedure TEnvironmentCopyThread.Execute;
+begin
+  try
+    { Spin until the gate opens so every thread's copy starts inside the
+      same few microseconds -- the shape that raced the RTL's lazy env
+      count before AppendProcessEnvironment serialised the sweep. }
+    while InterlockedExchangeAdd(EnvironmentCopyGate, 0) = 0 do
+      ThreadSwitch;
+    AppendProcessEnvironment(FCopy);
+  except
+    on E: Exception do FErrorText := E.Message;
+  end;
+end;
+
+procedure TAppendProcessEnvironmentSuite
+  .TestConcurrentCopiesAreCompleteAndIdentical;
+var
+  Index: Integer;
+  Reference: TStringList;
+  Threads: array[0..EnvironmentCopyThreadCount - 1] of
+    TEnvironmentCopyThread;
+begin
+  Reference := TStringList.Create;
+  try
+    InterlockedExchange(EnvironmentCopyGate, 0);
+    for Index := 0 to High(Threads) do
+      Threads[Index] := TEnvironmentCopyThread.Create;
+    for Index := 0 to High(Threads) do Threads[Index].Start;
+    Sleep(10);
+    InterlockedExchange(EnvironmentCopyGate, 1);
+    for Index := 0 to High(Threads) do Threads[Index].WaitFor;
+
+    { The reference copy is taken after the burst on purpose: every
+      concurrent copy must already match the settled snapshot. }
+    AppendProcessEnvironment(Reference);
+    Expect<Boolean>(Reference.Count > 0).ToBe(True);
+    for Index := 0 to High(Threads) do
+    begin
+      Expect<string>(Threads[Index].ErrorText).ToBe('');
+      Expect<Integer>(Threads[Index].Copied.Count).ToBe(Reference.Count);
+      Expect<Boolean>(Threads[Index].Copied.Text = Reference.Text)
+        .ToBe(True);
+    end;
+  finally
+    for Index := 0 to High(Threads) do Threads[Index].Free;
+    Reference.Free;
+  end;
+end;
+
+procedure TAppendProcessEnvironmentSuite.SetupTests;
+begin
+  Test('concurrent environment copies are complete and identical',
+    TestConcurrentCopiesAreCompleteAndIdentical);
 end;
 
 procedure TMakeTmpPathSuite.SetupTests;
@@ -2786,6 +2886,8 @@ begin
     PROJECT_NAME + '.Core: SanitisePathSegment'));
   TestRunnerProgram.AddSuite(TMakeTmpPathSuite.Create(
     PROJECT_NAME + '.Core: MakeTmpPath uniqueness'));
+  TestRunnerProgram.AddSuite(TAppendProcessEnvironmentSuite.Create(
+    PROJECT_NAME + '.Core: AppendProcessEnvironment concurrency'));
   TestRunnerProgram.AddSuite(TAtomicMoveBareDestination.Create(
     PROJECT_NAME + '.Core: atomic move, bare relative destination'));
   TestRunnerProgram.AddSuite(TApplyIncludeExclude.Create(
