@@ -243,6 +243,7 @@ begin
     + '{$mode delphi}{$H+}'#10
     + 'begin end.'#10);
   RunResult := RunTestsWithHeartbeat([], TestHeartbeatIntervalMilliseconds);
+  DumpRunFailure('silent heartbeat run', RunResult, 0);
   Expect<Integer>(RunResult.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('test session: ', RunResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('(.lwpt/sessions/', RunResult.Stdout) > 0).ToBe(True);
@@ -325,6 +326,7 @@ begin
     + 'begin Write(''beta-1|''); Flush(Output); Sleep(80); '
     + 'Write(''beta-2|'') end.'#10);
   RunResult := RunTests([]);
+  DumpRunFailure('quiet output run', RunResult, 0);
   Expect<Integer>(RunResult.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('alpha-1|', RunResult.Stdout) = 0).ToBe(True);
   Expect<Boolean>(Pos('beta-1|', RunResult.Stdout) = 0).ToBe(True);
@@ -344,6 +346,7 @@ begin
     + 'begin Write(''beta-1|''); Flush(Output); Sleep(80); '
     + 'Write(''beta-2|'') end.'#10);
   RunResult := RunTests(['--verbose']);
+  DumpRunFailure('verbose output run', RunResult, 0);
   Expect<Integer>(RunResult.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('alpha-1|alpha-2|', RunResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('beta-1|beta-2|', RunResult.Stdout) > 0).ToBe(True);
@@ -359,6 +362,7 @@ begin
   WriteOverlapProgram('A.First.Test.pas', 'first-started', 'second-started');
   WriteOverlapProgram('B.Second.Test.pas', 'second-started', 'first-started');
   CommandResult := RunTests([]);
+  DumpRunFailure('default overlap run', CommandResult, 0);
   Expect<Integer>(CommandResult.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(FScratch + '/control/first-started')).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/second-started')).ToBe(True);
@@ -399,6 +403,7 @@ begin
     + '  finally Lines.Free end;'#10
     + 'end.'#10);
   CommandResult := RunTests(['--jobs=1']);
+  DumpRunFailure('jobs=1 sequential run', CommandResult, 0);
   Expect<Integer>(CommandResult.ExitCode).ToBe(0);
   Lines := TStringList.Create;
   try

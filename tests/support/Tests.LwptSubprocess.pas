@@ -72,6 +72,14 @@ procedure SetLwptBinaryPath(const APath: string);
 procedure ConfigureProcessEnvironment(const AProcess: TProcess;
   const AOverrides: array of string);
 
+{ When a nested lwpt run exits with an unexpected code, its captured
+  output is the only evidence of why. Call this before the exit-code
+  assertion: on mismatch it dumps the captured stdout/stderr into the
+  suite's stdout, which the scheduler's failure replay surfaces
+  directly in CI logs. No-op when the exit code matches. }
+procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
+  const AExpectedExit: Integer);
+
 { Quick helper for "is the env saying skip network?". E2E tests that
   touch the live internet should consult this and self-skip via a
   WriteLn + early-return. }
@@ -326,6 +334,19 @@ begin
   finally
     P.Free;
   end;
+end;
+
+procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
+  const AExpectedExit: Integer);
+begin
+  if ARun.ExitCode = AExpectedExit then Exit;
+  WriteLn('RUN FAILURE [', ALabel, '] exit=', ARun.ExitCode,
+    ' expected=', AExpectedExit);
+  WriteLn('--- captured stdout ---');
+  WriteLn(ARun.Stdout);
+  WriteLn('--- captured stderr ---');
+  WriteLn(ARun.Stderr);
+  WriteLn('--- end captured output ---');
 end;
 
 end.
