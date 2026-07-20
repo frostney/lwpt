@@ -25,9 +25,9 @@ intermediary issue merely to satisfy process.
 - Current behavior has been traced in source and validated where executable
   source is available; documentation or memory alone is not treated as proof.
 - The relevant manifest, lockfile, CLI, filesystem, network, concurrency
-  (runtime-library and libc calls made from concurrent threads have
-  verified, not assumed, thread-safety), package-ownership, compiler,
-  target, and platform contracts have been considered.
+  (the thread-safety of runtime-library and libc calls made from
+  concurrent threads is verified, not assumed), package-ownership,
+  compiler, target, and platform contracts have been considered.
 - Existing tests, documentation, ADRs, and nearby implementation patterns have
   been inspected.
 - The important design questions have been grilled one decision at a time, and
