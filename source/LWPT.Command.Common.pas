@@ -221,6 +221,7 @@ function RunPascalScriptWithEnvironment(const AHook: THook;
   const AEnvironment: array of string): Integer;
 var
   P: TProcess;
+  InheritedEnvironment: TStringList;
   i, j, SeparatorAt: Integer;
   Existing, ExistingName, ExtraName: string;
   {$IFDEF UNIX}
@@ -246,28 +247,37 @@ begin
   try
     if Length(AEnvironment) > 0 then
     begin
-      for i := 1 to GetEnvironmentVariableCount do
-      begin
-        Existing := GetEnvironmentString(i);
-        SeparatorAt := Pos('=', Existing);
-        if SeparatorAt > 0 then
-          ExistingName := Copy(Existing, 1, SeparatorAt - 1)
-        else
-          ExistingName := Existing;
-        for j := 0 to High(AEnvironment) do
+      { Hooks run on the scheduler thread while build jobs materialise
+        their own child environments; sweep via the shared snapshot so
+        this walk cannot race the RTL's lazy env count (see LWPT.Core). }
+      InheritedEnvironment := TStringList.Create;
+      try
+        AppendProcessEnvironment(InheritedEnvironment);
+        for i := 0 to InheritedEnvironment.Count - 1 do
         begin
-          SeparatorAt := Pos('=', AEnvironment[j]);
+          Existing := InheritedEnvironment[i];
+          SeparatorAt := Pos('=', Existing);
           if SeparatorAt > 0 then
-            ExtraName := Copy(AEnvironment[j], 1, SeparatorAt - 1)
+            ExistingName := Copy(Existing, 1, SeparatorAt - 1)
           else
-            ExtraName := AEnvironment[j];
-          if SameText(ExistingName, ExtraName) then
+            ExistingName := Existing;
+          for j := 0 to High(AEnvironment) do
           begin
-            Existing := '';
-            Break;
+            SeparatorAt := Pos('=', AEnvironment[j]);
+            if SeparatorAt > 0 then
+              ExtraName := Copy(AEnvironment[j], 1, SeparatorAt - 1)
+            else
+              ExtraName := AEnvironment[j];
+            if SameText(ExistingName, ExtraName) then
+            begin
+              Existing := '';
+              Break;
+            end;
           end;
+          if Existing <> '' then P.Environment.Add(Existing);
         end;
-        if Existing <> '' then P.Environment.Add(Existing);
+      finally
+        InheritedEnvironment.Free;
       end;
       for i := 0 to High(AEnvironment) do
         P.Environment.Add(AEnvironment[i]);

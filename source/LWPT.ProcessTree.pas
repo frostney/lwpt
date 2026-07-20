@@ -254,9 +254,11 @@ procedure TLWPTProcessTree.MarkManagedChild;
 var
   EnvironmentIndex: Integer;
 begin
+  { AppendProcessEnvironment, not a direct sweep: concurrent job threads
+    materialising here raced the RTL's unsynchronised lazy env count and
+    could truncate a child's environment (see LWPT.Core). }
   if FProcess.Environment.Count = 0 then
-    for EnvironmentIndex := 1 to GetEnvironmentVariableCount do
-      FProcess.Environment.Add(GetEnvironmentString(EnvironmentIndex));
+    AppendProcessEnvironment(FProcess.Environment);
   for EnvironmentIndex := FProcess.Environment.Count - 1 downto 0 do
     if EnvironmentNamesEqual(
       EnvironmentEntryName(FProcess.Environment[EnvironmentIndex]),
