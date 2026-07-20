@@ -628,6 +628,10 @@ begin
     Windows.FreeLibrary(CryptoHandle);
   end;
   {$ELSE}
+  { Run the same directory scan the client load path uses, so the server
+    resolves the same libraries instead of depending on the default loader
+    search path. }
+  ConfigureOpenSSLLoading;
   for I := Low(DLLVersions) to High(DLLVersions) do
   begin
     SavedVersions[I] := DLLVersions[I];

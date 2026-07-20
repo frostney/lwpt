@@ -26,7 +26,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 | InstantFPC | bundled with FPC | `instantfpc --help` |
 | Lefthook | 2.x | `lefthook version` |
 | git-cliff | Verify the installed release live | `git-cliff --version` |
-| OpenSSL (Unix-not-Darwin and Windows server runtime) | 3.x | `openssl version` (Windows clients and macOS use SChannel / SecureTransport) |
+| OpenSSL (Unix-not-Darwin and Windows server runtime) | 3.x | `openssl version` on Unix. The Windows server runtime is validated by the CI PE-import guard plus the runtime loadability probe (per [ADR-0024](./adr/0024-openssl-server-tls-accept.md)), not a version CLI. Windows clients and macOS use SChannel / SecureTransport. |
 
 When you touch code that depends on the version, **verify it live, not from memory.** The Hard Constraint in `AGENTS.md` is explicit about this. If you bump a version, the new pin lives in this file and in the relevant CI workflow.
 
