@@ -2496,7 +2496,10 @@ const
   EnvironmentCopyThreadCount = 8;
 
 var
-  EnvironmentCopyGate: Boolean = False;
+  { LongInt + Interlocked* (the codebase's cross-thread flag idiom, cf.
+    TLWPTProcessTree.FImmediateTerminationRequested) so the start signal
+    does not rely on unsynchronised Boolean visibility. }
+  EnvironmentCopyGate: LongInt = 0;
 
 { Predicts the generator's next candidate for an occupied-path test by
   advancing the trailing sequence of a previously returned path. }
@@ -2676,7 +2679,8 @@ begin
     { Spin until the gate opens so every thread's copy starts inside the
       same few microseconds -- the shape that raced the RTL's lazy env
       count before AppendProcessEnvironment serialised the sweep. }
-    while not EnvironmentCopyGate do;
+    while InterlockedExchangeAdd(EnvironmentCopyGate, 0) = 0 do
+      ThreadSwitch;
     AppendProcessEnvironment(FCopy);
   except
     on E: Exception do FErrorText := E.Message;
@@ -2693,12 +2697,12 @@ var
 begin
   Reference := TStringList.Create;
   try
-    EnvironmentCopyGate := False;
+    InterlockedExchange(EnvironmentCopyGate, 0);
     for Index := 0 to High(Threads) do
       Threads[Index] := TEnvironmentCopyThread.Create;
     for Index := 0 to High(Threads) do Threads[Index].Start;
     Sleep(10);
-    EnvironmentCopyGate := True;
+    InterlockedExchange(EnvironmentCopyGate, 1);
     for Index := 0 to High(Threads) do Threads[Index].WaitFor;
 
     { The reference copy is taken after the burst on purpose: every

@@ -1240,7 +1240,8 @@ end;
 
 function ReportLostProxyEnvironment: Integer;
 var
-  Index: Integer;
+  Index, SeparatorAt: Integer;
+  Entry, Name: string;
 begin
   WriteLn(StdErr, 'BuildSessions dispatch: invoked as a compiler but '
     + TEST_FPC_PROXY_ENV + '=1 is absent -- the proxy environment was lost in '
@@ -1248,9 +1249,25 @@ begin
   WriteLn(StdErr, '  ParamCount=', ParamCount);
   for Index := 1 to ParamCount do
     WriteLn(StdErr, '  arg[', Index, ']=', ParamStr(Index));
-  WriteLn(StdErr, '  environment (', GetEnvironmentVariableCount, ' entries):');
+  { Names + order + count diagnose the loss (truncation cuts a prefix or
+    tail); values stay redacted so an inherited CI secret can never land in
+    a captured log. The PROJECT_NAME-prefixed test variables are the ones
+    under investigation and contain no secrets, so they keep their values. }
+  WriteLn(StdErr, '  environment (', GetEnvironmentVariableCount,
+    ' entries; values redacted outside ', PROJECT_NAME, '_*):');
   for Index := 1 to GetEnvironmentVariableCount do
-    WriteLn(StdErr, '    ', GetEnvironmentString(Index));
+  begin
+    Entry := GetEnvironmentString(Index);
+    SeparatorAt := Pos('=', Entry);
+    if SeparatorAt > 0 then
+      Name := Copy(Entry, 1, SeparatorAt - 1)
+    else
+      Name := Entry;
+    if Pos(PROJECT_NAME + '_', Name) = 1 then
+      WriteLn(StdErr, '    ', Entry)
+    else
+      WriteLn(StdErr, '    ', Name, '=<redacted>');
+  end;
   Flush(StdErr);
   Result := 126;
 end;
