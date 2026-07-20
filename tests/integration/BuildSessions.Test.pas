@@ -40,6 +40,14 @@ const
   TestWorkerContentionDurationMilliseconds =
     TestHeartbeatIntervalMilliseconds * 8;
   TestShortCompilerDelayMilliseconds = 20;
+  { Ceiling for concurrency barriers (both spawned builds reaching a
+    ready/handshake point). Deliberately generous: on a CPU-saturated CI
+    runner these builds queue behind many other parallel test programs, so
+    a tight window (the previous 10 s) times out with the barrier not yet
+    reached and the isolation assertions flake. The happy path exits the
+    wait loop as soon as the barrier is seen, so a large ceiling costs
+    nothing when the machine is idle. }
+  ConcurrencyBarrierCeilingSeconds = 60;
 
 type
   TBuildSessions = class(TTestSuite)
@@ -419,7 +427,7 @@ begin
         SawTwoJobRoots := CountSessionJobRoots >= 2;
         Break;
       end;
-      if (Now - Started) * 86400 > 10 then Break;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
     WriteTextFile(ReleasePath, 'release');
@@ -494,7 +502,7 @@ begin
         Ready := True;
         Break;
       end;
-      if (Now - Started) * 86400 > 10 then Break;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
     WriteTextFile(ReleasePath, 'release');
@@ -601,7 +609,7 @@ begin
         Ready := True;
         Break;
       end;
-      if (Now - Started) * 86400 > 10 then Break;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
     if Ready then
@@ -665,7 +673,7 @@ begin
         Ready := True;
         Break;
       end;
-      if (Now - Started) * 86400 > 10 then Break;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
     if Ready then WriteAppSource(True);
@@ -715,7 +723,7 @@ begin
       and not (TargetReady(ReadyDir, 'alpha')
         and TargetReady(ReadyDir, 'beta')) do
     begin
-      if (Now - Started) * 86400 > 10 then Break;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
     Expect<Boolean>(TargetReady(ReadyDir, 'alpha')).ToBe(True);
@@ -731,7 +739,7 @@ begin
     Started := Now;
     while Build.Running and not TargetReady(ReadyDir, 'app') do
     begin
-      if (Now - Started) * 86400 > 10 then Break;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
     Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(True);
@@ -780,7 +788,7 @@ begin
     Started := Now;
     while Build.Running and not TargetReady(ReadyDir, 'alpha') do
     begin
-      if (Now - Started) * 86400 > 10 then Break;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
     Expect<Boolean>(TargetReady(ReadyDir, 'alpha')).ToBe(True);
@@ -789,7 +797,7 @@ begin
     Started := Now;
     while Build.Running and not TargetReady(ReadyDir, 'beta') do
     begin
-      if (Now - Started) * 86400 > 10 then Break;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
     Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(True);
@@ -798,7 +806,7 @@ begin
     Started := Now;
     while Build.Running and not TargetReady(ReadyDir, 'app') do
     begin
-      if (Now - Started) * 86400 > 10 then Break;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
     Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(True);
@@ -954,7 +962,8 @@ begin
     Holder.Execute;
     StartedAt := GetTickCount64;
     while Holder.Running and not FileExists(ReadyPath)
-      and (GetTickCount64 - StartedAt < 5000) do Sleep(10);
+      and (GetTickCount64 - StartedAt
+        < ConcurrencyBarrierCeilingSeconds * 1000) do Sleep(10);
     Expect<Boolean>(FileExists(ReadyPath)).ToBe(True);
 
     SetLength(Environment, 3);
@@ -1097,7 +1106,7 @@ begin
     Started := Now;
     while (ReleasePath <> '') and not FileExists(ReleasePath) do
     begin
-      if (Now - Started) * 86400 > 15 then
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then
       begin
         Result := 125;
         Exit;
