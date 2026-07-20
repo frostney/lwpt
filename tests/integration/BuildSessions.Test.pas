@@ -1244,8 +1244,10 @@ var
   Entry, Name: string;
 begin
   WriteLn(StdErr, 'BuildSessions dispatch: invoked as a compiler but '
-    + TEST_FPC_PROXY_ENV + '=1 is absent -- the proxy environment was lost in '
-    + 'transit. Refusing to run the test suite as a compiler.');
+    + TEST_FPC_PROXY_ENV + ' is missing or not "1" (observed "'
+    + GetEnvironmentVariable(TEST_FPC_PROXY_ENV) + '") -- the proxy '
+    + 'environment did not arrive intact. Refusing to run the test suite '
+    + 'as a compiler.');
   WriteLn(StdErr, '  ParamCount=', ParamCount);
   for Index := 1 to ParamCount do
     WriteLn(StdErr, '  arg[', Index, ']=', ParamStr(Index));
