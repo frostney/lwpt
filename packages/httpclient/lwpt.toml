@@ -1,4 +1,4 @@
-# HTTPClient — HTTPS client built on Sockets + OpenSSL.
+# HTTPClient — HTTP/TLS transport built on raw sockets.
 #
 # Vendored from GocciaScript (HTTPClient.pas + TransportSecurity.pas)
 # and graduated into a standalone LWPT package per ADR-0014. The
@@ -12,5 +12,5 @@
 
 [package]
 name    = "httpclient"
-version = "0.1.1"
+version = "0.2.0"
 units   = ["source"]

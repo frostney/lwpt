@@ -49,6 +49,13 @@ type
     destructor Destroy; override;
     procedure Add(ASub: TSubcommand);
     function Find(const AName: string): TSubcommand;
+    { Read iteration over the registered subcommands, in registration
+      order. The registry is the single source of truth for the
+      program's command surface; consumers that render that surface
+      (help printers here, agent-facing reference generators in the
+      host program) iterate it rather than keeping their own list. }
+    function Count: Integer;
+    function Item(AIndex: Integer): TSubcommand;
     procedure PrintTopLevelHelp(const AProgramName: string);
     procedure PrintSubcommandHelp(const AProgramName: string;
       ASub: TSubcommand);
@@ -98,6 +105,22 @@ begin
       Exit(FItems[i]);
 end;
 
+function TSubcommandRegistry.Count: Integer;
+begin
+  Result := Length(FItems);
+end;
+
+function TSubcommandRegistry.Item(AIndex: Integer): TSubcommand;
+begin
+  { Explicit bounds guard: production builds compile with range checks
+    off (Shared.inc), so relying on compiler checking would let an
+    out-of-range index return a garbage pointer instead of failing. }
+  if (AIndex < 0) or (AIndex > High(FItems)) then
+    raise EArgumentOutOfRangeException.CreateFmt(
+      'subcommand index %d out of range 0..%d', [AIndex, High(FItems)]);
+  Result := FItems[AIndex];
+end;
+
 procedure TSubcommandRegistry.PrintTopLevelHelp(const AProgramName: string);
 var i: Integer;
 begin
@@ -130,17 +153,21 @@ begin
   WriteLn;
   WriteLn('options:');
 
-  { compute max option-name width for aligned descriptions }
+  { compute max option-token width for aligned descriptions.
+    FormatForHelp (not the bare long name) so valued options show
+    their value shape (--name=<value>, --name=<N>, --name=a|b) and
+    every surface rendered from the registry — this help text and the
+    host program's agents block — stays identical by construction. }
   MaxOptWidth := 0;
   for i := 0 to High(ASub.Options) do
   begin
-    W := Length('--' + ASub.Options[i].LongName);
+    W := Length(ASub.Options[i].FormatForHelp);
     if W > MaxOptWidth then MaxOptWidth := W;
   end;
 
   for i := 0 to High(ASub.Options) do
   begin
-    OptName := '--' + ASub.Options[i].LongName;
+    OptName := ASub.Options[i].FormatForHelp;
     Write('  ', OptName);
     for W := Length(OptName) to MaxOptWidth do Write(' ');
     WriteLn('  ', ASub.Options[i].HelpText);

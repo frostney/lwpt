@@ -8,7 +8,7 @@ The top-to-bottom walkthrough for getting from `git clone` to passing tests on a
 - **No `lwpt install` needed after clone.** Per [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) every LWPT project commits `.lwpt/modules/` and `.lwpt/archives/`; `fpc @lwpt.cfg` works without LWPT being involved.
 - **Two prerequisites:** FPC 3.2.2 (with InstantFPC bundled) and Lefthook for pre-commit hooks. TLS is platform-native (SChannel on Windows, SecureTransport on macOS, system OpenSSL on Linux — per [ADR-0016](./adr/0016-tls-backend-per-platform.md)); no DLLs to bundle.
 - **A new test is one `.Test.pas` file.** Add `testing` to `[dependencies]` (or rely on workspace auto-discovery in a monorepo), run `lwpt install` once, then write `program <Name>.Test;` files using `TestingPascalLibrary`. `lwpt test` discovers and runs them.
-- **Pre-commit auto-formats.** `lwpt format` runs on every commit via Lefthook and re-stages any rewrites (`stage_fixed: true`). The heavyweight gates (`lwpt build`, `lwpt test`, `lwpt format --check`) run on the PR workflow in CI. Install the local hook once with `lefthook install`.
+- **Pre-commit auto-formats.** `lwpt format` and `lwpt agents` run on every commit via Lefthook and re-stage any rewrites (`stage_fixed: true`). The heavyweight gates (`lwpt build`, `lwpt test`, `lwpt format --check`, `lwpt agents --check`) run on the PR workflow in CI. Install the local hook once with `lefthook install`.
 
 ## Prerequisites
 
@@ -46,7 +46,7 @@ Both code paths are dev-mode only; release builds always go through `./build/lwp
 After bootstrap:
 
 ```sh
-./build/lwpt --help     # top-level help; lists the 9 subcommands
+./build/lwpt --help     # top-level help; lists the 10 subcommands
 ```
 
 ## Daily commands
@@ -74,7 +74,7 @@ After bootstrap:
 
 ## Install the pre-commit hook
 
-Lefthook runs `lwpt format` on every `git commit` with `stage_fixed: true` — any files the formatter rewrites are auto-staged into the same commit, so the local hook never blocks. The heavyweight gates (`lwpt build`, `lwpt test`, `lwpt format --check`) run on the PR workflow on every pull request. Install the local hook once per fresh clone:
+Lefthook runs `lwpt format` and `lwpt agents` on every `git commit` with `stage_fixed: true` — any files they rewrite (formatted sources, the refreshed AGENTS.md agents block) are auto-staged into the same commit, so the local hook never blocks. The heavyweight gates (`lwpt build`, `lwpt test`, `lwpt format --check`, `lwpt agents --check`) run on the PR workflow on every pull request. Install the local hook once per fresh clone:
 
 ```sh
 lefthook install
@@ -190,7 +190,7 @@ bar = { source = "owner/bar", version = "^1.0", subdir = "src" }   # inline-tabl
 
 **`[frozen] missing extracted module for "<name>"`** — `lwpt install --frozen` requires `.lwpt/modules/<name>/` to be present. Run `lwpt install` (without `--frozen`) to fetch.
 
-**Pre-commit hook auto-formatted files unexpectedly** — the hook runs `lwpt format` with `stage_fixed: true`, so any drift gets rewritten + re-staged into the same commit. Review the staged diff before pushing.
+**Pre-commit hook auto-formatted files unexpectedly** — the hook runs `lwpt format` and `lwpt agents` with `stage_fixed: true`, so any drift (source formatting, the AGENTS.md agents block) gets rewritten + re-staged into the same commit. Review the staged diff before pushing.
 
 **Recovery from a crashed install:**
 

@@ -104,6 +104,12 @@ jobs:
       - name: lwpt build (compile every [build] entry)
         run: ./build/lwpt build
 
+      # Runs after `lwpt build` so the freshly compiled binary — i.e.
+      # the PR's own command surface — is what the committed AGENTS.md
+      # block is checked against (ADR-0024).
+      - name: lwpt agents --check (AGENTS.md command reference fresh?)
+        run: ./build/lwpt agents --check
+
       - name: lwpt test --bail=1 (default tier — unit + integration)
         run: ./build/lwpt test --bail=1
 
@@ -213,7 +219,7 @@ jobs:
           mkdir -p build/compiled
 
           echo "=== Building lwpt for ${TARGET} ==="
-          "$CROSS_FPC" -Twin64 -O4 -dPRODUCTION -Xs -CX -XX -B \
+          "$CROSS_FPC" -Twin64 -O4 -dPRODUCTION -Xs -Xm -CX -XX -B \
             -Sh \
             -Fusource -Fisource \
             -Fupackages/httpclient/source -Fipackages/httpclient/source \
@@ -233,22 +239,18 @@ jobs:
           fi
           ls -la build/
 
-      - name: Check Windows TLS dependencies (SChannel only, no OpenSSL)
+      - name: Check Windows TLS linkage (native client, runtime-loaded server)
         run: |
-          # Per ADR-0016: Windows uses SChannel for TLS — lwpt.exe must
-          # NOT pull in FPC's openssl unit (which embeds libssl /
-          # libcrypto DLL-name strings for runtime LoadLibrary). ci.yml
-          # and release.yml carry the same guard post-merge / at tag
-          # time; this copy makes the release-blocker visible on the PR.
-          # grep -q, not `grep -ao | head -1 | grep -q .`: this job's
-          # shell runs with pipefail, where head closing the pipe can
-          # SIGPIPE the left grep (exit 141) and silently pass the
-          # guard exactly when matches are plentiful.
-          if LC_ALL=C grep -aq 'libssl\|libcrypto' build/lwpt.exe; then
-            echo "::error::lwpt.exe references libssl/libcrypto — must use SChannel only on Windows (ADR-0016)"
-            exit 1
-          fi
-          echo "OK: no libssl/libcrypto references in build/lwpt.exe"
+          set -euo pipefail
+          # The checker is a HOST InstantFPC program that only reads the
+          # already-built PE + map. The cross toolchain in fpc-cross/ cannot
+          # link a host binary on this macOS runner (ld: library 'c' not
+          # found), so use a host-linkable FPC (brew puts instantfpc on PATH).
+          brew list fpc >/dev/null 2>&1 || brew install fpc
+          instantfpc packages/httpclient/scripts/check-windows-tls-imports.pas \
+            --self-test
+          instantfpc packages/httpclient/scripts/check-windows-tls-imports.pas \
+            build/lwpt.exe --map build/lwpt.map
 
       - name: Upload lwpt.exe for the native test job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -310,7 +312,9 @@ jobs:
             echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
           fi
           FPC_UNIT_PATHS=""
-          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do
+          # openssl (+ its historical fcl-net home): TransportSecurity and its
+          # co-located test `uses OpenSSL`, so `lwpt test` needs the unit path.
+          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process fcl-net openssl paszlib hash; do
             UNIT_PATH=""
             for unit_target in i386-win32 x86_64-win64; do
               UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)

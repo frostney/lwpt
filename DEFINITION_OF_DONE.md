@@ -30,6 +30,7 @@ requirement may be marked not applicable only with a recorded reason.
   ./build/lwpt install --frozen
   ./build/lwpt format --check
   ./build/lwpt build --clean
+  ./build/lwpt agents --check
   ./build/lwpt test
   ```
 

@@ -125,7 +125,7 @@ jobs:
               EXTRA_FLAGS="-XP${CPU}-linux- -Fl${LIBDIR}"
               ;;
             win32|win64)
-              EXTRA_FLAGS=""
+              EXTRA_FLAGS="-Xm"
               ;;
             darwin)
               SDK_ROOT="$(xcrun --show-sdk-path)"
@@ -237,6 +237,20 @@ jobs:
           echo "=== Build artefacts for ${TARGET} ==="
           ls -la build/
 
+      - name: Check Windows TLS linkage (native client, runtime-loaded server)
+        if: matrix.os == 'win64' || matrix.os == 'win32'
+        run: |
+          set -euo pipefail
+          # The checker is a HOST InstantFPC program that only reads the
+          # already-built PE + map. The cross toolchain in fpc-cross/ cannot
+          # link a host binary on this macOS runner (ld: library 'c' not
+          # found), so use a host-linkable FPC (brew puts instantfpc on PATH).
+          brew list fpc >/dev/null 2>&1 || brew install fpc
+          instantfpc packages/httpclient/scripts/check-windows-tls-imports.pas \
+            --self-test
+          instantfpc packages/httpclient/scripts/check-windows-tls-imports.pas \
+            build/lwpt.exe --map build/lwpt.map
+
       - name: Stage artefact
         run: |
           mkdir -p ci-artifacts
@@ -336,7 +350,9 @@ jobs:
             echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
           fi
           FPC_UNIT_PATHS=""
-          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process paszlib hash; do
+          # openssl (+ its historical fcl-net home): TransportSecurity and its
+          # co-located test `uses OpenSSL`, so `lwpt test` needs the unit path.
+          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process fcl-net openssl paszlib hash; do
             UNIT_PATH=""
             for unit_target in i386-win32 x86_64-win64; do
               UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
@@ -391,25 +407,6 @@ jobs:
           else
             ./build/lwpt --help
           fi
-
-      - name: Check Windows TLS dependencies (SChannel only, no OpenSSL)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # Per ADR-0016: TransportSecurity.pas uses SChannel on Windows,
-          # so the cross-built lwpt.exe must NOT pull in FPC's openssl
-          # unit. A presence of `libssl` or `libcrypto` substrings in
-          # the binary means someone accidentally added `uses OpenSSL`
-          # under a Windows-active codepath (the unit registers the DLL
-          # names for runtime LoadLibrary). Mirrors GocciaScript's same
-          # guard verbatim.
-          $path = "build/lwpt.exe"
-          $bytes = [System.IO.File]::ReadAllBytes($path)
-          $text = [System.Text.Encoding]::Latin1.GetString($bytes)
-          if ($text -match "libssl|libcrypto") {
-            throw "lwpt.exe must not depend on OpenSSL DLLs for HTTPS on Windows (SChannel is the only backend per ADR-0016)"
-          }
-          Write-Host "OK: no libssl/libcrypto references in lwpt.exe"
 
       - name: lwpt install (workspace auto-discovery + linking)
         run: |

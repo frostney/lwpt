@@ -1,6 +1,6 @@
 { LWPT — lightweight Pascal toolkit.
 
-  One executable, nine subcommands sharing a common core (manifest,
+  One executable, ten subcommands sharing a common core (manifest,
   TOML, resolver, cfg emitter):
     init      scaffold a new project (manifest + source dir + sample entry)
     install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
@@ -11,6 +11,8 @@
     test      discover + compile + run *.Test.pas files
     repair    reclaim install, build-session, and worker-lease residue
     run       invoke a user-declared run-script (or alias a subcommand)
+    agents    write/verify the agent-facing command reference in
+              AGENTS.md (ADR-0024)
 
   earlier (ADR-0015) there was an eighth subcommand, `export`, which
   extruded the embedded TestingPascalLibrary blob into the consumer's
@@ -37,6 +39,7 @@ uses
   CLI.Options,
   CLI.Subcommands,
   LWPT.Command.Add,
+  LWPT.Command.Agents,
   LWPT.Command.Build,
   LWPT.Command.Format,
   LWPT.Command.Init,
@@ -45,12 +48,19 @@ uses
   LWPT.Command.Repair,
   LWPT.Command.Run,
   LWPT.Command.Testing,
-  LWPT.Core;
+  LWPT.Core,
+  LWPT.ProcessTree;
 
 function ErrPrefix(const ASubcommand: string): string; inline;
 begin
   Result := PROGRAM_NAME + ' ' + ASubcommand + ': ';
 end;
+
+{ Declared ahead of the handlers because HandleAgents renders the
+  command surface from the live registry itself — the registry is the
+  single source of truth for both `--help` and the agents block. }
+var
+  Registry : TSubcommandRegistry;
 
 { --- install ------------------------------------------------------------- }
 function HandleInstall(const APositionals: TStringList;
@@ -138,7 +148,7 @@ end;
 function HandleBuild(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  Release, Clean, JobsPresent : Boolean;
+  Release, Clean, JobsPresent, Verbose : Boolean;
   Jobs : Integer;
   ModeVal : string;
   TargetNames : array of string;
@@ -148,10 +158,14 @@ begin
   Clean   := False;
   Jobs    := 0;              { auto: bounded by graph + machine budget }
   JobsPresent := False;
+  Verbose := False;
   for i := 0 to High(AOptions) do
   begin
     if SameText(AOptions[i].LongName, 'clean') and AOptions[i].Present then
       Clean := True;
+    if SameText(AOptions[i].LongName, 'verbose')
+       and AOptions[i].Present then
+      Verbose := True;
     if SameText(AOptions[i].LongName, 'mode')
        and (AOptions[i] is TStringOption) then
     begin
@@ -183,7 +197,9 @@ begin
   for i := 0 to APositionals.Count - 1 do
     TargetNames[i] := APositionals[i];
   try
-    Result := CmdBuild(MANIFEST_FILE, TargetNames, Release, Clean, Jobs);
+    InstallProcessTreeSignalForwarding;
+    Result := CmdBuild(MANIFEST_FILE, TargetNames, Release, Clean, Jobs,
+      Verbose);
   except
     on E: Exception do
     begin
@@ -220,11 +236,12 @@ end;
 function HandleTest(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  IncludeE2E : Boolean;
+  IncludeE2E, Verbose : Boolean;
   TierVal : string;
   Jobs, Bail, i : Integer;
 begin
   IncludeE2E := False;
+  Verbose := False;
   Jobs := 0;
   Bail := -1;
   for i := 0 to High(AOptions) do
@@ -242,6 +259,9 @@ begin
         Exit(1);
       end;
     end
+    else if SameText(AOptions[i].LongName, 'verbose')
+       and AOptions[i].Present then
+      Verbose := True
     else if SameText(AOptions[i].LongName, 'jobs')
        and (AOptions[i] is TIntegerOption) and AOptions[i].Present then
     begin
@@ -265,7 +285,8 @@ begin
       end;
     end;
   try
-    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail);
+    InstallProcessTreeSignalForwarding;
+    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail, Verbose);
   except
     on E: Exception do
     begin
@@ -345,6 +366,36 @@ begin
   end;
 end;
 
+{ --- agents (ADR-0024) --------------------------------------------------- }
+function HandleAgents(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  Check : Boolean;
+  i : Integer;
+begin
+  if APositionals.Count <> 0 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('agents'),
+      'unexpected argument "', APositionals[0],
+      '" (agents takes no positionals, only --check)');
+    Exit(1);
+  end;
+  Check := False;
+  for i := 0 to High(AOptions) do
+    if SameText(AOptions[i].LongName, 'check')
+       and AOptions[i].Present then
+      Check := True;
+  try
+    Result := CmdAgents(MANIFEST_FILE, Registry, Check);
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('agents'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
 { --- top-level flags ----------------------------------------------------- }
 function HandleTopLevelFlags: Boolean;
 var
@@ -366,9 +417,8 @@ end;
 
 { --- registration -------------------------------------------------------- }
 var
-  Registry : TSubcommandRegistry;
   InstallOpts, AddOpts, RemoveOpts, TestOpts, BuildOpts, InitOpts,
-    RunOpts, FormatOpts, RepairOpts : TOptionArray;
+    RunOpts, FormatOpts, RepairOpts, AgentsOpts : TOptionArray;
 begin
   if HandleTopLevelFlags then
   begin
@@ -399,16 +449,18 @@ begin
       '<name> [<name>...]',
       @HandleRemove, RemoveOpts));
 
-    SetLength(BuildOpts, 3);
+    SetLength(BuildOpts, 4);
     BuildOpts[0] := TStringOption.Create('mode',
       'Build mode: dev (default) or release');
     BuildOpts[1] := TFlagOption.Create('clean',
       'Force a full rebuild in fresh private staging');
     BuildOpts[2] := TIntegerOption.Create('jobs',
       'Maximum concurrent build targets (default: machine budget)');
+    BuildOpts[3] := TFlagOption.Create('verbose',
+      'Replay successful target logs');
     Registry.Add(TSubcommand.Create('build',
       'Compile manifest targets',
-      '[target...] [--mode dev|release] [--clean] [--jobs N]',
+      '[target...] [--mode dev|release] [--clean] [--jobs N] [--verbose]',
       @HandleBuild, BuildOpts));
 
     SetLength(FormatOpts, 1);
@@ -418,16 +470,18 @@ begin
       'Format uses-clauses and identifiers', '[--check]',
       @HandleFormat, FormatOpts));
 
-    SetLength(TestOpts, 3);
+    SetLength(TestOpts, 4);
     TestOpts[0] := TStringOption.Create('tier',
       'Test tier to include: default (unit + integration) or e2e (adds network-touching tier)');
     TestOpts[1] := TIntegerOption.Create('jobs',
       'Maximum concurrent test programs (default: shared machine budget)');
     TestOpts[2] := TIntegerOption.Create('bail',
       'Stop after N compile or runtime failures; 0 runs the full queue');
+    TestOpts[3] := TFlagOption.Create('verbose',
+      'Replay successful test logs');
     Registry.Add(TSubcommand.Create('test',
       'Discover and run *.Test.pas files',
-      '[--tier default|e2e] [--jobs N] [--bail N]',
+      '[--tier default|e2e] [--jobs N] [--bail N] [--verbose]',
       @HandleTest, TestOpts));
 
     SetLength(RepairOpts, 0);
@@ -450,6 +504,14 @@ begin
       'Invoke a user-declared run-script (or a built-in subcommand by name)',
       '<script-name> | <subcommand> [subcommand-args...]',
       @HandleRun, RunOpts));
+
+    SetLength(AgentsOpts, 1);
+    AgentsOpts[0] := TFlagOption.Create('check',
+      'Verify the AGENTS.md block matches the current command surface; exit 1 when stale');
+    Registry.Add(TSubcommand.Create('agents',
+      'Write or verify the agent-facing command reference in AGENTS.md',
+      '[--check]',
+      @HandleAgents, AgentsOpts));
 
     ExitCode := Registry.Run(PROGRAM_NAME);
   finally

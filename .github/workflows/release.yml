@@ -124,7 +124,7 @@ jobs:
               EXTRA_FLAGS="-XP${CPU}-linux- -Fl${LIBDIR}"
               ;;
             win32|win64)
-              EXTRA_FLAGS=""
+              EXTRA_FLAGS="-Xm"
               ;;
             darwin)
               SDK_ROOT="$(xcrun --show-sdk-path)"
@@ -270,26 +270,19 @@ jobs:
           done
           ls -la staged/
 
-      - name: Check Windows TLS dependencies (SChannel only, no OpenSSL)
+      - name: Check Windows TLS linkage (native client, runtime-loaded server)
         if: matrix.os == 'win64' || matrix.os == 'win32'
         run: |
-          # Per ADR-0016: Windows builds use SChannel for TLS — the
-          # cross-built lwpt.exe must NOT pull in FPC's openssl unit
-          # (which would embed `libssl` / `libcrypto` DLL-name strings
-          # for runtime LoadLibrary). Catches the case where someone
-          # adds `uses OpenSSL` under a Windows-active codepath.
-          # Mirrors GocciaScript's same guard and ci.yml's test-job
-          # check; release.yml needs its own copy because tag pushes
-          # do not trigger ci.yml.
-          # grep -q, not `grep -ao | head -1 | grep -q .`: under a
-          # pipefail shell, head closing the pipe can SIGPIPE the left
-          # grep (exit 141) and silently pass the guard exactly when
-          # matches are plentiful. -q is immune either way.
-          if LC_ALL=C grep -aq 'libssl\|libcrypto' staged/lwpt.exe; then
-            echo "::error::lwpt.exe references libssl/libcrypto — must use SChannel only on Windows (ADR-0016)"
-            exit 1
-          fi
-          echo "OK: no libssl/libcrypto references in staged/lwpt.exe"
+          set -euo pipefail
+          # The checker is a HOST InstantFPC program that only reads the
+          # already-built PE + map. The cross toolchain in fpc-cross/ cannot
+          # link a host binary on this macOS runner (ld: library 'c' not
+          # found), so use a host-linkable FPC (brew puts instantfpc on PATH).
+          brew list fpc >/dev/null 2>&1 || brew install fpc
+          instantfpc packages/httpclient/scripts/check-windows-tls-imports.pas \
+            --self-test
+          instantfpc packages/httpclient/scripts/check-windows-tls-imports.pas \
+            staged/lwpt.exe --map build/lwpt.map
 
       - name: Upload release artefact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
