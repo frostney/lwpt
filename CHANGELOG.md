@@ -27,7 +27,7 @@ All notable changes to LWPT are documented in this file. The format follows [Kee
 
 ### Other Changes
 
-- Install-script e2e smoke (latest-resolving) + stamp release version from tag (ADR-0018) (#11)
+- Install-script e2e smoke (latest-resolving) + stamp release version from tag (ADR-0026) (#11)
 - Skip live-network e2e tests on transient host downtime (#10)
 ## [0.1.0-rc.2] - 2026-06-02
 
