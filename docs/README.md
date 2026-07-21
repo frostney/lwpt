@@ -42,8 +42,12 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0019](./adr/0019-add-remove-subcommands.md) | `lwpt add` + `lwpt remove` as manifest-editing frontends to the install transaction; install-before-write ordering; lockfile-diff pruning of orphaned modules + archives; subcommand surface 7 → 9 |
 | [0020](./adr/0020-isolated-build-sessions.md) | Invocation-private compiler staging, revalidated short-lock publication, session-safe clean, and repair reclamation |
 | [0021](./adr/0021-machine-wide-worker-budget.md) | Per-user machine worker capacity coordinated through fair, reclaimable filesystem leases |
+| [0022](./adr/0022-compiler-neutral-build-request.md) | Compiler-neutral versioned build requests, target tuples, capabilities, and normalized results; FPC is the only current adapter |
 | [0023](./adr/0023-parallel-build-target-scheduler.md) | Dependency-aware, bounded parallel target scheduling with deterministic reporting and publication |
+| [0024](./adr/0024-openssl-server-tls-accept.md) | Server-side TLS accept via nonblocking memory-BIO OpenSSL 3 with PKCS#12 identities on Windows and Unix-not-Darwin; macOS servers use Network.framework |
 | [0025](./adr/0025-cascading-process-tree-cancellation.md) | Cascading process-tree cancellation via Unix signal-forwarding and Windows nested Job Objects |
+| [0026](./adr/0026-release-version-stamp-from-tag.md) | Release binaries stamp the version from the git tag; dev builds stamp from the manifest (formerly ADR-0018) |
+| [0027](./adr/0027-agents-subcommand.md) | `lwpt agents` writes/verifies the marker-fenced AGENTS.md command reference; subcommand surface 9 → 10 (formerly ADR-0024) |
 
 ## Spikes
 

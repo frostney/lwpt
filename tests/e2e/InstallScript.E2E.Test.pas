@@ -18,7 +18,7 @@
   hyphen IS a normal release and IS returned). The resolved tag is the
   single source of truth: it is passed to install.sh AND the expected
   `lwpt --version` is derived from it (binary == tag). Because release
-  binaries stamp the version from the git tag (ADR-0018), that equality
+  binaries stamp the version from the git tag (ADR-0026), that equality
   holds for every stamp-from-tag release; the assertion is *relative*
   (the install path works and the binary self-reports its tag), so it
   never breaks on version drift — only on a genuine install.sh defect.
@@ -281,7 +281,7 @@ begin
   if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
   { Point RunLwpt at the freshly-installed binary + ask its version.
     Expected is DERIVED from the resolved tag (binary == tag, per the
-    stamp-from-tag policy in ADR-0018) — one source of truth, no second
+    stamp-from-tag policy in ADR-0026) — one source of truth, no second
     constant to drift. Proves the binary is the right architecture, not
     corrupt, and runnable. }
   SetLwptBinaryPath(FBinDir + '/lwpt');

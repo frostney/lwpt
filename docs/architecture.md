@@ -19,8 +19,8 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 ## Tech stack
 
 - **Compiler:** FreePascal 3.2.2 (`fpc -iV` verified live; see `tooling.md`).
-- **Mode:** `delphi` everywhere. Project-owned units (`lwpt.pas`, the `LWPT.*` family, the `CLI.*` family) and the remaining vendored units (`Semver`, `HTTPClient`, etc) all flow through `{$I Shared.inc}` which sets `{$mode delphi} {$H+}`. Several LWPT units additionally enable `{$modeswitch nestedcomments+}` so documentation prose can contain literal placeholder strings (the `{user}` / `{repository}` / `{ref}` substrings) without prematurely closing the surrounding `{ ... }` block.
-- **Runtime:** RTL only. No fcl-web, no fphttpclient, no third-party packages. HTTPS depends on system OpenSSL via the vendored `HTTPClient` + `TransportSecurity`.
+- **Mode:** `delphi` everywhere. Project-owned units (`lwpt.pas`, the `LWPT.*` family) and the package units (`CLI.*`, `Semver`, `HTTPClient`, etc) flow through `{$I Shared.inc}` which sets `{$mode delphi} {$H+}` (a few test-support units declare their own mode instead). Several LWPT units additionally enable `{$modeswitch nestedcomments+}` so documentation prose can contain literal placeholder strings (the `{user}` / `{repository}` / `{ref}` substrings) without prematurely closing the surrounding `{ ... }` block.
+- **Runtime:** RTL only. No fcl-web, no fphttpclient, no third-party packages. HTTPS goes through the `HTTPClient` package's `TransportSecurity` with platform-native TLS per ADR-0016: SChannel on Windows, SecureTransport on macOS, runtime-loaded system OpenSSL on Unix-not-Darwin.
 - **Scripts:** Pascal via InstantFPC (`scripts/bootstrap.pas`). Shell wrappers (`bootstrap.sh`, `bootstrap.bat`) fall back to direct `fpc` when InstantFPC is absent.
 
 ## The package-manager-is-the-foundation through-line
@@ -69,7 +69,7 @@ Sections currently supported:
 | Any other top-level section with a `script` field | A user-declared run-script callable via `lwpt run <name>` per [ADR-0013](./adr/0013-run-subcommand-and-build-rename.md) |
 | `[version]` | optional version-baking: writes a generated `.inc` with `<prefix>_VERSION` + `<prefix>_BUILD_DATE` |
 | `[lwpt]` | toolkit-state overrides (`modules-dir`, `archives-dir`, `tmp-dir`, `cfg-file`). Defaults match the constants in `LWPT.Core` |
-| `[format]` | `exclude = [...]` — files `lwpt format` must not rewrite (vendored sources, generated files) |
+| `[format]` | `exclude = [...]` — files `lwpt format` must not rewrite (generated files; workspace packages are included by the root walk by default and opt out via their own `[format]` section) |
 
 Dependency source shapes (per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md)): bare `owner/repo` defaults to GitHub; `gitlab:owner/repo` and `bitbucket:owner/repo` prefixes route to those hosts; any `[sources.<name>]` table declares a custom prefix (Gitea, Forgejo, self-hosted GitHub Enterprise / GitLab / Bitbucket Server); `https://...` is an arbitrary tarball URL; paths (`./foo`, `../foo`, `/abs/foo`, `~/foo`, or `local:./foo`) are local sources. Version specs accept SemVer 2.0.0 ranges (`^1.0.0`, `>=1.0.0 <2.0.0`), exact SemVer versions (`1.0.0` — preferred per [semver.org](https://semver.org/#is-v123-a-semantic-version)), commit SHAs (7–40 hex), or arbitrary Git tag names (`v1.0.0`, `release-2024`). SemVer-shaped specs resolve through git smart-HTTP tag listing (uniform across GitHub / GitLab / Bitbucket / Gitea / Forgejo / self-hosted, no JSON, no auth). Explicitly *not* supported: `[[target]]` array-of-tables syntax, the legacy separate `source = "github|gitlab|..." + repo/ref/tag/asset/path` shape (hard-errored with a migration hint), and `git clone` (HTTP archives only — preserves the single-binary RTL-only constraint).
 
@@ -82,7 +82,7 @@ The resolver in `LWPT.Install` is a breadth-first walk starting at the root mani
 3. Enqueue every dep from the child manifest.
 4. Record the constraint (range + requirer) on the node.
 
-After the BFS finishes, `CheckNodeConstraints` walks each node and asserts that every accumulated range *pairwise intersects* via the vendored `Semver.RangeIntersects` (a full node-semver port that handles compound ranges and `||` unions). If any pair fails, the resolver hard-errors with both requirers named — the manifest tree is editable to resolve the conflict. Pairwise overlap does not prove that one concrete version satisfies the whole node; graph-wide single-version selection and complete conflict diagnostics are tracked in [issue #36](https://github.com/frostney/lwpt/issues/36).
+After the BFS finishes, `CheckNodeConstraints` walks each node and asserts that every accumulated range *pairwise intersects* via the `Semver` package's `RangeIntersects` (a full node-semver port that handles compound ranges and `||` unions). If any pair fails, the resolver hard-errors with both requirers named — the manifest tree is editable to resolve the conflict. Pairwise overlap does not prove that one concrete version satisfies the whole node; graph-wide single-version selection and complete conflict diagnostics are tracked in [issue #36](https://github.com/frostney/lwpt/issues/36).
 
 The flat-graph + hard-error policy is deliberate: FPC has one global unit namespace; two versions of the same package cannot coexist. There is no nested versioning to fall back on.
 
@@ -152,7 +152,7 @@ Older lockfile schemas (v1 or v2) fail to load with a clear migration hint: dele
 
 LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/{item.name}.pas"` and `output = "build/{item.name}"` (placeholder interpolation per [ADR-0012](./adr/0012-manifest-placeholder-interpolation.md)). The pre-commit hook runs `./build/lwpt format`; `./build/lwpt build` recompiles LWPT against itself when needed. The bootstrap (`scripts/bootstrap.pas` + `bootstrap.sh` / `bootstrap.bat`) is the once-per-fresh-clone seed that produces the first `build/lwpt`. See [`build-system.md`](./build-system.md) and [ADR-0005](./adr/0005-self-host-build.md).
 
-## Vendored code
+## Source layout and package code
 
 `source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`, `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.WorkerBudget.pas`, `LWPT.Command.*.pas`, `LWPT.Formatter.pas`, `LWPT.GitProtocol.pas`) plus a small remainder of utility units (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` — live under `packages/<name>/` per [ADR-0014](./adr/0014-packages-extraction.md) + [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) + [ADR-0017](./adr/0017-packages-lwpt-canonical.md). Each is a standalone Object Pascal project with its own `lwpt.toml`, `source/`, tests, version, and bundled `Shared.inc`; LWPT's root manifest auto-discovers them via `[workspaces] include = ["packages/*"]`. [`packages.md`](./packages.md) is the table of the package set, the divergence vs GocciaScript's older copies, the bootstrap chicken-and-egg story, and the graduation roadmap. The Hard Constraint in `AGENTS.md` is "Packages own their contents" — the root LWPT manifest does not modify a package's source from outside, and each package owns its own versioning + format scope + lifecycle hooks + public surface.
 

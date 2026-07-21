@@ -12,7 +12,7 @@
     repair    reclaim install, build-session, and worker-lease residue
     run       invoke a user-declared run-script (or alias a subcommand)
     agents    write/verify the agent-facing command reference in
-              AGENTS.md (ADR-0024)
+              AGENTS.md (ADR-0027)
 
   earlier (ADR-0015) there was an eighth subcommand, `export`, which
   extruded the embedded TestingPascalLibrary blob into the consumer's
@@ -380,7 +380,7 @@ begin
   end;
 end;
 
-{ --- agents (ADR-0024) --------------------------------------------------- }
+{ --- agents (ADR-0027) --------------------------------------------------- }
 function HandleAgents(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var

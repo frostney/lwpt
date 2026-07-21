@@ -1,5 +1,10 @@
 # `lwpt agents` is the tenth subcommand: a self-describing command reference for AI harnesses
 
+> Formerly numbered ADR-0024, which collided with
+> [0024-openssl-server-tls-accept](./0024-openssl-server-tls-accept.md);
+> renumbered during 0.3.0 release preparation. Historical references to
+> "ADR-0024" in the changelog may mean either document.
+
 The subcommand surface, frozen at nine since [ADR-0019](./0019-add-remove-subcommands.md) ([Hard Constraint in AGENTS.md](../../AGENTS.md)), expands to ten with `lwpt agents`. The problem it solves: AI coding harnesses discover a project's commands from its `AGENTS.md`, so downstream repos hand-replicate LWPT's command table there — and every LWPT release silently invalidates those copies. `lwpt agents` makes the binary the source of truth: it writes (or, with `--check`, verifies) a marker-fenced region inside the project's `AGENTS.md` containing every registered subcommand (summary, usage line, per-option help) plus the project's user-declared run-scripts. The region is rendered from the same live `TSubcommandRegistry` that drives `--help` — one registry, two views — so the generated reference cannot drift from the real surface. This follows the pattern the ecosystem converged on in 2025/26: Nx's `configure-ai-agents` writes agent-instruction files from the tool itself, the `agents.md` convention is cross-harness, and self-describing binaries (oclif's `manifest`, cobra's `__complete`, `cargo --list`) are the always-accurate substrate. We chose a tool-written static block over an MCP server or a shipped skill because a static reference in `AGENTS.md` is read by every harness with zero tokens of tool-call overhead and zero runtime — Nx's own retreat to "minimal MCP + skills for command knowledge" is the precedent — and over an `init --agents` flag because verification needs a `--check` mode, and `--check` as an `init` flag would be incoherent for every other `init` mode (the flag-pair awkwardness is what priced in this ADR).
 
 ## The region contract

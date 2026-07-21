@@ -81,6 +81,21 @@ commit_parsers = [
   { message = "^Update ",     group = "Internal" },
   { message = "^Bump ",       group = "Internal" },
 
+  # Conventional-commit subjects (the current house style, scoped or
+  # bare). The imperative-English parsers above remain for the
+  # pre-conventional history.
+  { message = "^feat(\\([^()]+\\))?!?: ",      group = "New Features" },
+  { message = "^fix(\\([^()]+\\))?!?: ",       group = "Bug Fixes" },
+  { message = "^perf(\\([^()]+\\))?!?: ",      group = "Performance" },
+  { message = "^docs(\\([^()]+\\))?!?: ",      group = "Documentation" },
+  { message = "^refactor(\\([^()]+\\))?!?: ",  group = "Internal" },
+  { message = "^style(\\([^()]+\\))?!?: ",     group = "Internal" },
+  { message = "^test(\\([^()]+\\))?!?: ",      group = "Internal" },
+  { message = "^build(\\([^()]+\\))?!?: ",     group = "Internal" },
+  { message = "^ci(\\([^()]+\\))?!?: ",        group = "Internal" },
+  { message = "^chore(\\([^()]+\\))?!?: ",     group = "Internal" },
+  { message = "^revert(\\([^()]+\\))?!?: ",    group = "Internal" },
+
   # Fallback for anything else.
   { message = ".*",           group = "Other Changes" },
 ]

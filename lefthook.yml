@@ -29,7 +29,7 @@ pre-commit:
         missing entirely (fresh clone), run ./bootstrap.sh first. See
         docs/quick-start.md.
 
-    # Refresh the generated AGENTS.md command reference (ADR-0024)
+    # Refresh the generated AGENTS.md command reference (ADR-0027)
     # whenever a commit touches something that can change it: Pascal
     # sources (command surface), lwpt.toml (run-scripts), or AGENTS.md
     # itself (any .md edit triggers; a non-AGENTS.md doc commit is a
@@ -43,4 +43,4 @@ pre-commit:
       fail_text: |
         lwpt agents failed. If `build/lwpt` is missing (fresh clone),
         run ./bootstrap.sh first. A corrupt marker pair in AGENTS.md
-        must be repaired by hand — see docs/adr/0024-agents-subcommand.md.
+        must be repaired by hand — see docs/adr/0027-agents-subcommand.md.

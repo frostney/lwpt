@@ -1,6 +1,6 @@
 # HTTPClient — HTTP/TLS transport built on raw sockets.
 #
-# Vendored from GocciaScript (HTTPClient.pas + TransportSecurity.pas)
+# Shared with GocciaScript (HTTPClient.pas + TransportSecurity.pas); LWPT-canonical per ADR-0017
 # and graduated into a standalone LWPT package per ADR-0014. The
 # slim-bootstrap-copy concept from ADR-0003 collapses into this
 # package — there's only ONE copy of HTTPClient now, lives here.

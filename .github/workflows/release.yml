@@ -469,7 +469,7 @@ jobs:
     # runnable binary. Targets the just-cut tag explicitly (no constant),
     # so it covers prerelease-flagged rc.x too — the everyday e2e
     # InstallScript test only resolves non-prerelease "latest". See
-    # ADR-0018 for the three-layer install/version validation model.
+    # ADR-0026 for the three-layer install/version validation model.
     needs: publish
     if: ${{ needs.publish.result == 'success' }}
     runs-on: ubuntu-latest

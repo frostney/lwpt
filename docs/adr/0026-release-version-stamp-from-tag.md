@@ -1,5 +1,10 @@
 # Release binaries stamp the version from the git tag; dev builds stamp from the manifest
 
+> Formerly numbered ADR-0018, which collided with
+> [0018-install-transaction-module](./0018-install-transaction-module.md);
+> renumbered during 0.3.0 release preparation. Historical references to
+> "ADR-0018" in the changelog may mean either document.
+
 `lwpt --version` reads a compile-time constant `PROGRAM_VERSION`, generated into [`source/Version.inc`](../../source/Version.inc) by [`scripts/stamp-version.pas`](../../scripts/stamp-version.pas). The stamp source is **deliberately different for dev builds vs release builds**: a dev/local build stamps `[package].version` from [`lwpt.toml`](../../lwpt.toml) (what the working tree *is* — typically the next, unreleased version), while a **release** build stamps the **git tag being cut** (what the artefact *is being shipped as*). The two intentionally diverge: a working tree at `[package].version = "0.1.0"` produces a local binary reporting `lwpt 0.1.0`, but the `0.1.0-rc.3` release tag produces a release binary reporting `lwpt 0.1.0-rc.3`. This ADR records why the divergence is intentional, how it is enforced, and the three-layer validation that keeps the tag, the archive name, and the binary's self-report in agreement.
 
 This was surfaced by the install-script e2e test ([`tests/e2e/InstallScript.E2E.Test.pas`](../../tests/e2e/InstallScript.E2E.Test.pas)): the `0.1.0-rc.2` release archives reported `lwpt 0.1.0` (the manifest version at the time) rather than `lwpt 0.1.0-rc.2` (the tag), because `PROGRAM_VERSION` was derived from the manifest unconditionally. A user downloading `lwpt-0.1.0-rc.2-linux-x64.tar.gz` and running `lwpt --version` got `0.1.0` — a silent lie about which artefact they were holding.

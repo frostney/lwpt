@@ -198,7 +198,7 @@ compiler input.
 FPC_TARGET_CPU=aarch64 ./build/lwpt build --mode release
 ```
 
-`BuildOneTarget` reads the env var and passes `-P<value>` to FPC. The standard FPC cross-CPU values apply (`x86_64`, `aarch64`, `i386`, `arm`, etc.). Cross-OS via `FPC_TARGET_OS` is **not** wired today; add it if a real use case emerges.
+`BuildOneTarget` reads the env var and passes `-P<value>` to FPC. The standard FPC cross-CPU values apply (`x86_64`, `aarch64`, `i386`, `arm`, etc.). `FPC_TARGET_OS` is read into the build request's target tuple and serialized into the publication fingerprint, but **no `-T` flag is emitted** and the capability-matching model (`BuildRequestIsCompatible`) is not wired into the build or test paths — so it does not perform a cross-OS build; a non-host value only changes the recorded target metadata and fingerprint. Leave it unset unless you are exercising the build-request model itself.
 
 ## Generator hooks (formerly `[generated]`)
 

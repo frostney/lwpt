@@ -59,6 +59,11 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `LWPT_WORKER_LEASE_STALE_SECONDS` | Mark heartbeat diagnostics stale after this interval; values below 3 are rejected. Heartbeat age never authorises reclamation by itself. | `30` |
 | `LWPT_WORKER_LEASE_TOKEN` | One-shot opaque delegation token added to one nested LWPT subprocess by the worker-budget API; do not configure, reuse, or persist manually | unset |
 | `FPC_TARGET_CPU` | When set, `lwpt build` passes `-P<value>` to FPC for cross-compilation | unset (host CPU) |
+| `FPC_TARGET_OS` | Recorded into the build request's target tuple and publication fingerprint only. No `-T` flag is emitted and capability matching is not wired into the build path — this does not perform a cross-OS build (see `build-system.md`). | unset (host OS) |
+| `LWPT_FPC` | Path to the FPC binary; overrides `PATH` lookup. The bare `FPC` variable is honoured as a fallback. | unset (`fpc` on `PATH`) |
+| `LWPT_INSTANTFPC` | Path to the InstantFPC binary; overrides `PATH` lookup. The bare `INSTANTFPC` variable is honoured as a fallback. | unset (`instantfpc` on `PATH`) |
+| `LWPT_FPC_UNIT_PATHS` | Path-separator-delimited unit directories appended as `-Fu`/`-Fi` to every compile (CI uses it for non-standard FPC installs; see the prose below) | unset |
+| `LWPT_HEARTBEAT_INTERVAL_MS` | Diagnostic tuning knob: build/test heartbeat interval; values are clamped to the default ceiling | `30000` |
 | `PATH` | Must contain `fpc`, `instantfpc`, `lefthook` | system default |
 | `LWPT_BUILD_TARGET` | Per-target postbuild hook context: selected target name | supplied by LWPT |
 | `LWPT_BUILD_OUTPUT` | Per-target postbuild hook context: session-private candidate path; transform this file before publication | supplied by LWPT |
