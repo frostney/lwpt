@@ -772,7 +772,8 @@ procedure TLWPTFPCCompilerDriverTests.
 var
   BuildResult: TLWPTBuildResult;
   Driver: TLWPTFPCCompilerDriver;
-  ErrorDiagnosticFound, OriginFound: Boolean;
+  BannerSeen, ErrorDiagnosticFound, OriginExpected, OriginFound,
+    OriginSound: Boolean;
   ExitCode, DiagnosticIndex: Integer;
   Output, Scratch, SourcePath: string;
   Request: TLWPTBuildRequest;
@@ -789,9 +790,9 @@ begin
   try
     ExitCode := RunCompiler(Driver, Request, Output);
     BuildResult := Driver.NormalizeResult(Request, ExitCode, Output);
-    Expect<Boolean>(BuildResult.Success).ToBe(False);
     ErrorDiagnosticFound := False;
     OriginFound := False;
+    OriginSound := True;
     for DiagnosticIndex := 0 to High(BuildResult.Diagnostics) do
       if BuildResult.Diagnostics[DiagnosticIndex].Severity
         = DIAGNOSTIC_ERROR then
@@ -801,36 +802,39 @@ begin
           > 0 then
         begin
           OriginFound := True;
-          Expect<Boolean>(BuildResult.Diagnostics[DiagnosticIndex].Line > 0)
-            .ToBe(True);
-          Expect<Boolean>(
-            BuildResult.Diagnostics[DiagnosticIndex].MessageText <> '')
-            .ToBe(True);
+          OriginSound := OriginSound
+            and (BuildResult.Diagnostics[DiagnosticIndex].Line > 0)
+            and (BuildResult.Diagnostics[DiagnosticIndex].MessageText <> '');
         end;
       end;
-    { Self-diagnose on failure: the raw compiler output names exactly
-      which failure shape this environment produced. }
-    if not ErrorDiagnosticFound then
+    { The file-origin expectation holds only when the compiler reached the
+      semantic error; a config-level Fatal without a source origin is an
+      environment shape, not a parser defect. }
+    OriginExpected := Pos('Broken.pas(', Output) > 0;
+    BannerSeen := Pos('Free Pascal Compiler', Output) > 0;
+    if (not BuildResult.Success) and ErrorDiagnosticFound
+       and ((not OriginExpected) or (OriginFound and OriginSound))
+       and BannerSeen then
+      Expect<Boolean>(True).ToBe(True)
+    else
     begin
-      WriteLn('DIAGNOSTIC PARSE FAILURE; exit=', ExitCode,
-        '; raw compiler output follows:');
+      { Self-diagnose: name the failed condition and dump the evidence. }
+      WriteLn('STRUCTURED-DIAGNOSTIC TEST FAILURE: success=',
+        BuildResult.Success, ' errorFound=', ErrorDiagnosticFound,
+        ' originExpected=', OriginExpected, ' originFound=', OriginFound,
+        ' originSound=', OriginSound, ' bannerSeen=', BannerSeen,
+        ' exit=', ExitCode);
+      WriteLn('parsed diagnostics (', Length(BuildResult.Diagnostics), '):');
+      for DiagnosticIndex := 0 to High(BuildResult.Diagnostics) do
+        WriteLn('  [', BuildResult.Diagnostics[DiagnosticIndex].Severity,
+          '] path="', BuildResult.Diagnostics[DiagnosticIndex].Path,
+          '" line=', BuildResult.Diagnostics[DiagnosticIndex].Line,
+          ' message="',
+          BuildResult.Diagnostics[DiagnosticIndex].MessageText, '"');
+      WriteLn('raw compiler output follows:');
       WriteLn(Output);
+      Expect<Boolean>(False).ToBe(True);
     end;
-    Expect<Boolean>(ErrorDiagnosticFound).ToBe(True);
-    { The file-origin expectation holds only when the compiler reached
-      the semantic error; a config-level Fatal (no source origin) is an
-      environment shape, not a parser defect -- derive the expectation
-      from the actual output. }
-    if Pos('Broken.pas(', Output) > 0 then
-    begin
-      if not OriginFound then
-      begin
-        WriteLn('ORIGIN PARSE FAILURE; raw compiler output follows:');
-        WriteLn(Output);
-      end;
-      Expect<Boolean>(OriginFound).ToBe(True);
-    end;
-    Expect<Boolean>(Pos('Free Pascal Compiler', Output) > 0).ToBe(True);
   finally
     Driver.Free;
     RecursiveDelete(Scratch);
