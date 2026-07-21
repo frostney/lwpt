@@ -88,7 +88,7 @@ Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR
 8. `./build/lwpt agents --check` (generated command-reference drift)
 9. `./build/lwpt test --bail=1` (default tier — unit + integration)
 
-E2E tests are skipped via `LWPT_SKIP_NETWORK=1`; they run on every platform post-merge via `ci.yml`. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
+The live-network e2e tier runs pre-merge on the Linux leg only (a dedicated step with `LWPT_SKIP_NETWORK` unset — added per [issue #102](https://github.com/frostney/lwpt/issues/102) after the #84 TLS-close and #101 timing classes proved invisible to a default-tier-only gate); every platform still runs e2e post-merge via `ci.yml`. A second PR job, `darwin-test`, natively bootstraps on `macos-latest` (brew FPC, independent of the cross-toolchain cache) and runs the default tier — every recent intermittent surfaced on a darwin leg first. Bounded cost: ~5–6 min warm, parallel to `build-and-test`. The remaining `ci.yml`-only legs (`x86_64-darwin`, `aarch64-linux`, `i386-win32`) stay post-merge. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
 
 The PR workflow deliberately uses the distro FPC (same as the install instructions in `README.md`), so any regression that only shows up with the system FPC's slightly older RTL gets caught before merge.
 

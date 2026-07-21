@@ -113,6 +113,19 @@ jobs:
       - name: lwpt test --bail=1 (default tier — unit + integration)
         run: ./build/lwpt test --bail=1
 
+      # PR-gate extension (#102): the live-network e2e tier runs on this
+      # one Linux leg pre-merge. Evidence: the #84 TLS-close regression
+      # was only reachable through the e2e tier, and the higher-
+      # concurrency e2e runs are what flushed the #101-class timing
+      # flakes — both previously invisible to this gate. The tier is
+      # retry-tolerant and self-skips on clean connectivity failure, so
+      # third-party downtime degrades to skips rather than red PRs.
+      # Post-merge ci.yml still runs e2e on every platform.
+      - name: lwpt test --tier=e2e --bail=1 (live network, Linux leg)
+        env:
+          LWPT_SKIP_NETWORK: "0"
+        run: ./build/lwpt test --tier=e2e --bail=1
+
   docs:
     runs-on: ubuntu-latest
     steps:
@@ -124,6 +137,45 @@ jobs:
         uses: DavidAnson/markdownlint-cli2-action@05f32210e84442804257b2a6f20b273450ec8265 # v19.1.0
         with:
           globs: "**/*.md"
+
+  # PR-gate extension (#102): one native aarch64-darwin leg. Every
+  # recent intermittent (the #105 env-race family and its masks) first
+  # surfaced on a darwin leg, and darwin-only runtime breaks (the fpc-
+  # proxy misroute) were invisible to the Linux-only gate. Native
+  # bootstrap via brew keeps this independent of the cross-toolchain
+  # cache. Default tier only; e2e stays on the Linux leg above and on
+  # post-merge ci.yml. Cost bound: ~5-6 min warm (brew fpc ~40 s +
+  # bootstrap ~1 min + default tier). The remaining ci.yml-only legs
+  # (x86_64-darwin, aarch64-linux, i386-win32) stay post-merge: their
+  # unique-catch rate has not justified per-PR cost.
+  darwin-test:
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      LWPT_SKIP_NETWORK: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install FPC (brew)
+        run: |
+          brew list fpc >/dev/null 2>&1 || brew install fpc
+          fpc -iV
+
+      - name: Bootstrap lwpt
+        run: ./bootstrap.sh
+
+      - name: lwpt install --frozen (committed lockfile matches committed trees?)
+        run: ./build/lwpt install --frozen
+
+      - name: lwpt install (workspace auto-discovery + symlinks)
+        run: ./build/lwpt install
+
+      - name: lwpt test --bail=1 (default tier — unit + integration)
+        run: ./build/lwpt test --bail=1
 
   # Reuses toolchain.yml exactly like ci.yml/release.yml do. The cache
   # key (lwpt-fpc-cross-<fpc>-macos-arm64-<n>) has no branch or ref
