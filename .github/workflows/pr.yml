@@ -16,12 +16,14 @@ name: PR
 #                 every platform). Post-merge confirmation.
 #   release.yml — tag-triggered cross-build + package + publish.
 #
-# Trade-off, deliberate: a PR that introduces a platform-specific
-# regression outside the win64 leg (aarch64-only behaviour, a
-# darwin-only path quirk, etc.) will pass pr.yml and only fail on
+# Trade-off, deliberate: a PR that introduces a regression on the
+# legs the gate still omits (x86_64-darwin, aarch64-linux,
+# i386-win32, or non-Linux e2e) will pass pr.yml and only fail on
 # the main-branch ci.yml run. The maintainer reverts/forwards-fixes
-# from main. This trades pre-merge cross-platform certainty for
-# cheap PR feedback, which is the conscious GocciaScript design
+# from main. Pre-merge coverage now spans Linux default+e2e,
+# aarch64-darwin default, and win64 offline (#102 extended the
+# original Ubuntu+win64 gate). This bounded trade keeps PR feedback
+# cheap, which is the conscious GocciaScript design
 # choice we mirror.
 #
 # One carve-out from that trade-off: Windows, via the win64 leg.
@@ -66,8 +68,9 @@ jobs:
       run:
         shell: bash
     env:
-      # Skip live-network E2E tests on the fast PR runner. They run
-      # in ci.yml on every platform — Q23=c — and are the slow tier.
+      # Default-tier steps skip live-network E2E; the dedicated e2e
+      # step below overrides this to "0" for its single run (#102).
+      # Post-merge ci.yml still runs the tier on every platform.
       LWPT_SKIP_NETWORK: "1"
     steps:
       # persist-credentials: false on every pr.yml checkout: these jobs
@@ -324,8 +327,8 @@ jobs:
   # (junction-vs-symlink installs, path handling, subprocess
   # environment handling) and compile breaks in test sources, which
   # lwpt test compiles with the native FPC at run time (Q22=b).
-  # Post-merge ci.yml still owns the i386-win32 leg, the
-  # live-network e2e tier, and the bootstrap.bat smoke.
+  # Post-merge ci.yml still owns the i386-win32 leg, the e2e tier
+  # on non-Linux platforms, and the bootstrap.bat smoke.
   windows-test:
     needs: windows-cross-compile
     runs-on: windows-latest
