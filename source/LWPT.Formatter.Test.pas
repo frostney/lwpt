@@ -64,7 +64,7 @@ type
     sit outside it. An explicit [format].include match overrides that
     default, while [format].exclude remains the final subtraction. Runs
     the full CmdFormat composition in check mode. }
-  TFormatToolkitStateDefault = class(TTestSuite)
+  TLWPTFormatToolkitStateDefault = class(TTestSuite)
   private
     FOrigDir, FScratch: string;
     FCaseDistinctFilesSupported: Boolean;
@@ -623,9 +623,9 @@ begin
     TestWildcardSegmentsStillSkipHiddenDirs);
 end;
 
-{ ───────── TFormatToolkitStateDefault ───────── }
+{ ───────── TLWPTFormatToolkitStateDefault ───────── }
 
-procedure TFormatToolkitStateDefault.BeforeAll;
+procedure TLWPTFormatToolkitStateDefault.BeforeAll;
 const
   NEEDS_FORMAT =
     'unit Vendored;'#10#10
@@ -717,27 +717,27 @@ begin
   SetCurrentDir(FScratch);
 end;
 
-procedure TFormatToolkitStateDefault.AfterAll;
+procedure TLWPTFormatToolkitStateDefault.AfterAll;
 begin
   SetCurrentDir(FOrigDir);
 end;
 
-procedure TFormatToolkitStateDefault.TestSeededToolkitStateIsExcludedByDefault;
+procedure TLWPTFormatToolkitStateDefault.TestSeededToolkitStateIsExcludedByDefault;
 begin
   Expect<Integer>(CmdFormat('default.toml', True)).ToBe(0);
 end;
 
-procedure TFormatToolkitStateDefault.TestExplicitIncludeOverridesDefaultExclusion;
+procedure TLWPTFormatToolkitStateDefault.TestExplicitIncludeOverridesDefaultExclusion;
 begin
   Expect<Integer>(CmdFormat('include.toml', True)).ToBe(1);
 end;
 
-procedure TFormatToolkitStateDefault.TestExplicitExcludeStillWinsOverInclude;
+procedure TLWPTFormatToolkitStateDefault.TestExplicitExcludeStillWinsOverInclude;
 begin
   Expect<Integer>(CmdFormat('include-exclude.toml', True)).ToBe(0);
 end;
 
-procedure TFormatToolkitStateDefault.TestExplicitIncludeMatchIsCaseSensitive;
+procedure TLWPTFormatToolkitStateDefault.TestExplicitIncludeMatchIsCaseSensitive;
 begin
   { Case-insensitive filesystems cannot hold both fixture paths. Linux CI
     exercises the full regression; other platforms report the limitation. }
@@ -751,19 +751,19 @@ begin
   Expect<Integer>(CmdFormat('case-sensitive.toml', True)).ToBe(0);
 end;
 
-procedure TFormatToolkitStateDefault.TestOverriddenModulesDirIsExcludedByDefault;
+procedure TLWPTFormatToolkitStateDefault.TestOverriddenModulesDirIsExcludedByDefault;
 begin
   { [lwpt] modules-dir points outside .lwpt/; the redirected toolkit
     state must be protected exactly like the fixed root. }
   Expect<Integer>(CmdFormat('override.toml', True)).ToBe(0);
 end;
 
-procedure TFormatToolkitStateDefault.TestExplicitIncludeOverridesOverriddenModulesDir;
+procedure TLWPTFormatToolkitStateDefault.TestExplicitIncludeOverridesOverriddenModulesDir;
 begin
   Expect<Integer>(CmdFormat('override-include.toml', True)).ToBe(1);
 end;
 
-procedure TFormatToolkitStateDefault.SetupTests;
+procedure TLWPTFormatToolkitStateDefault.SetupTests;
 begin
   Test('units-seeded .lwpt source is excluded by default',
     TestSeededToolkitStateIsExcludedByDefault);
@@ -783,7 +783,7 @@ begin
   TestRunnerProgram.AddSuite(TFormatIdempotence.Create(PROJECT_NAME + '.Formatter: idempotence'));
   TestRunnerProgram.AddSuite(TFormatParamRename.Create(PROJECT_NAME + '.Formatter: param-rename regression'));
   TestRunnerProgram.AddSuite(TFormatScopeExpansion.Create(PROJECT_NAME + '.Formatter: scope expansion (ADR-0007)'));
-  TestRunnerProgram.AddSuite(TFormatToolkitStateDefault.Create(PROJECT_NAME + '.Formatter: toolkit-state default'));
+  TestRunnerProgram.AddSuite(TLWPTFormatToolkitStateDefault.Create(PROJECT_NAME + '.Formatter: toolkit-state default'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.
