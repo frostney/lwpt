@@ -7,6 +7,9 @@ uses
   Classes,
   Process,
   SysUtils,
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
 
   LWPT.BuildRequest,
   LWPT.Command.Common,
@@ -23,11 +26,17 @@ type
     FProbeCount: Integer;
     FProbeExitCode: Integer;
     FProbeOutput: string;
+    FBareProbeOutput: string;
+    FDispatchedProbeOutput: string;
     FLastArguments: LWPT.Core.TStringArray;
   protected
     function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
       out AOutput: string): Integer; override;
   public
+    property BareProbeOutput: string read FBareProbeOutput
+      write FBareProbeOutput;
+    property DispatchedProbeOutput: string read FDispatchedProbeOutput
+      write FDispatchedProbeOutput;
     property LastArguments: LWPT.Core.TStringArray read FLastArguments;
     property ProbeCount: Integer read FProbeCount;
     property ProbeExitCode: Integer read FProbeExitCode
@@ -49,6 +58,7 @@ type
     procedure SetupTests; override;
     procedure TestProbeCachesPerTargetAndRefreshesOnDemand;
     procedure TestProbeDispatchesOperatingSystemAndMapsWindows;
+    procedure TestBareProbeSatisfactionLeavesDispatchOut;
     procedure TestProbeFailureNamesCompilerAndTargetRequirement;
     procedure TestProbeRejectsUnexpectedTargetTuple;
     procedure TestCapabilitiesAreDefensiveAndDoNotAdvertiseUnits;
@@ -62,12 +72,122 @@ type
     procedure TestWindowsExecutableArtifactPathIsNormalized;
   end;
 
+type
+  TSavedEnvironmentVariable = record
+    Name: string;
+    Value: string;
+    WasSet: Boolean;
+  end;
+
+{$IFDEF UNIX}
+function CSetEnvironmentVariable(AName, AValue: PAnsiChar;
+  AOverwrite: LongInt): LongInt; cdecl; external 'c' name 'setenv';
+function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
+  external 'c' name 'unsetenv';
+{$ENDIF}
+
+function EnvironmentVariableIsSet(const AName: string): Boolean;
+var
+  Entry: string;
+  EnvironmentIndex, SeparatorAt: Integer;
+begin
+  for EnvironmentIndex := 1 to GetEnvironmentVariableCount do
+  begin
+    Entry := GetEnvironmentString(EnvironmentIndex);
+    SeparatorAt := Pos('=', Entry);
+    if (SeparatorAt > 0)
+       and SameText(Copy(Entry, 1, SeparatorAt - 1), AName) then Exit(True);
+  end;
+  Result := False;
+end;
+
+procedure SetTestEnvironmentVariable(const AName, AValue: string;
+  const ASet: Boolean);
+{$IFDEF UNIX}
+var
+  Name, Value: AnsiString;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Name, Value: UnicodeString;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Name := AnsiString(AName);
+  Value := AnsiString(AValue);
+  if ASet then
+    CSetEnvironmentVariable(PAnsiChar(Name), PAnsiChar(Value), 1)
+  else
+    CUnsetEnvironmentVariable(PAnsiChar(Name));
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Name := UnicodeString(AName);
+  Value := UnicodeString(AValue);
+  if ASet then
+    Windows.SetEnvironmentVariableW(PWideChar(Name), PWideChar(Value))
+  else
+    Windows.SetEnvironmentVariableW(PWideChar(Name), nil);
+  {$ENDIF}
+end;
+
+procedure SaveAndClearEnvironmentVariable(const AName: string;
+  out ASaved: TSavedEnvironmentVariable);
+begin
+  ASaved.Name := AName;
+  ASaved.Value := GetEnvironmentVariable(AName);
+  ASaved.WasSet := EnvironmentVariableIsSet(AName);
+  SetTestEnvironmentVariable(AName, '', False);
+end;
+
+procedure RestoreEnvironmentVariable(
+  const ASaved: TSavedEnvironmentVariable);
+begin
+  SetTestEnvironmentVariable(ASaved.Name, ASaved.Value, ASaved.WasSet);
+end;
+
+function FixtureFPCOperatingSystem(const ATarget: TLWPTTarget): string;
+begin
+  Result := ATarget.OS;
+  if ATarget.OS <> 'windows' then Exit;
+  if (ATarget.Architecture = 'x86')
+     or (ATarget.Architecture = 'i386') then
+    Result := 'win32'
+  else
+    Result := 'win64';
+end;
+
+function FixtureFPCProcessor(const ATarget: TLWPTTarget): string;
+begin
+  Result := ATarget.Architecture;
+  if Result = 'x86' then Result := 'i386';
+end;
+
+function FixtureProbeOutput(const AVersion: string;
+  const ATarget: TLWPTTarget): string;
+begin
+  Result := AVersion + ' ' + FixtureFPCOperatingSystem(ATarget) + ' '
+    + FixtureFPCProcessor(ATarget);
+end;
+
+function FixtureArtifactPath(const ARequest: TLWPTBuildRequest): string;
+begin
+  Result := ARequest.Outputs.Artifact;
+  if (ARequest.Target.OS = 'windows') or (ARequest.Target.OS = 'win32')
+     or (ARequest.Target.OS = 'win64') then
+    if ExtractFileExt(Result) = '' then Result := Result + '.exe';
+end;
+
 function TMockFPCCompilerDriver.ExecuteProbe(
   const AArguments: LWPT.Core.TStringArray; out AOutput: string): Integer;
 begin
   Inc(FProbeCount);
   FLastArguments := Copy(AArguments, 0, Length(AArguments));
-  AOutput := FProbeOutput;
+  if (Length(AArguments) > 3) and (FDispatchedProbeOutput <> '') then
+    AOutput := FDispatchedProbeOutput
+  else if (Length(AArguments) = 3) and (FBareProbeOutput <> '') then
+    AOutput := FBareProbeOutput
+  else
+    AOutput := FProbeOutput;
   Result := FProbeExitCode;
 end;
 
@@ -155,8 +275,7 @@ begin
   Target.Architecture := GetBuildArch;
   Driver := TMockFPCCompilerDriver.Create('mock-fpc');
   try
-    Driver.ProbeOutput := '3.2.2 ' + Target.OS + ' '
-      + Target.Architecture;
+    Driver.ProbeOutput := FixtureProbeOutput('3.2.2', Target);
     Capabilities := Driver.ProbeCapabilities(Target);
     Expect<string>(Capabilities.VersionIdentity).ToBe('3.2.2');
     Capabilities.Targets[0].Architecture := 'mutated';
@@ -166,8 +285,7 @@ begin
     Expect<string>(Capabilities.Targets[0].Architecture).ToBe(
       Target.Architecture);
     Expect<string>(Capabilities.OutputKinds[0]).ToBe(BUILD_OUTPUT_EXECUTABLE);
-    Driver.ProbeOutput := '3.3.1 ' + Target.OS + ' '
-      + Target.Architecture;
+    Driver.ProbeOutput := FixtureProbeOutput('3.3.1', Target);
     Capabilities := Driver.ProbeCapabilities(Target, True);
     Expect<Integer>(Driver.ProbeCount).ToBe(2);
     Expect<string>(Capabilities.VersionIdentity).ToBe('3.3.1');
@@ -187,40 +305,48 @@ end;
 procedure TLWPTFPCCompilerDriverTests.
   TestProbeDispatchesOperatingSystemAndMapsWindows;
 var
+  Arguments: LWPT.Core.TStringArray;
   Capabilities: TLWPTCompilerCapabilities;
   Driver: TMockFPCCompilerDriver;
-  OtherOperatingSystem: string;
+  InvocationOptions: TLWPTCompilerInvocationOptions;
   Raised: Boolean;
+  Request: TLWPTBuildRequest;
   Target: TLWPTTarget;
 begin
-  if GetBuildOS = 'linux' then OtherOperatingSystem := 'darwin'
-  else OtherOperatingSystem := 'linux';
   Target := Default(TLWPTTarget);
-  Target.OS := OtherOperatingSystem;
-  Target.Architecture := GetBuildArch;
+  Target.OS := 'windows';
+  Target.Architecture := 'x86_64';
   Driver := TMockFPCCompilerDriver.Create('mock-fpc');
   try
-    Driver.ProbeOutput := '3.2.2 ' + OtherOperatingSystem + ' '
-      + Target.Architecture;
+    Driver.BareProbeOutput := '3.2.2 win32 i386';
+    Driver.DispatchedProbeOutput := '3.2.2 win64 x86_64';
     Capabilities := Driver.ProbeCapabilities(Target);
-    Expect<string>(Capabilities.Targets[0].OS).ToBe(OtherOperatingSystem);
-    Expect<Boolean>(ArgumentsContain(Driver.LastArguments,
-      '-T' + OtherOperatingSystem)).ToBe(True);
+    Expect<string>(Capabilities.Targets[0].OS).ToBe('windows');
+    Expect<Integer>(Driver.ProbeCount).ToBe(2);
+    Expect<Boolean>(ArgumentsContain(Driver.LastArguments, '-Px86_64'))
+      .ToBe(True);
+    Expect<Boolean>(ArgumentsContain(Driver.LastArguments, '-Twin64'))
+      .ToBe(True);
+    Request := FixtureRequest('source/example.pas', 'build/example');
+    Request.Target := Target;
+    InvocationOptions := BuildCompilerInvocationOptions('', False);
+    Arguments := Driver.BuildArguments(Request, InvocationOptions);
+    Expect<Boolean>(ArgumentsContain(Arguments, '-Px86_64')).ToBe(True);
+    Expect<Boolean>(ArgumentsContain(Arguments, '-Twin64')).ToBe(True);
+    Expect<Integer>(Driver.ProbeCount).ToBe(2);
 
     Target.OS := 'windows';
     Target.Architecture := 'x86';
-    Driver.ProbeOutput := '3.2.2 win32 i386';
+    Driver.BareProbeOutput := '3.2.2 linux x86_64';
+    Driver.DispatchedProbeOutput := '3.2.2 win32 i386';
     Capabilities := Driver.ProbeCapabilities(Target);
+    Expect<Boolean>(ArgumentsContain(Driver.LastArguments, '-Pi386'))
+      .ToBe(True);
     Expect<Boolean>(ArgumentsContain(Driver.LastArguments, '-Twin32'))
       .ToBe(True);
 
-    Target.Architecture := 'x86_64';
-    Driver.ProbeOutput := '3.2.2 win64 x86_64';
-    Capabilities := Driver.ProbeCapabilities(Target);
-    Expect<Boolean>(ArgumentsContain(Driver.LastArguments, '-Twin64'))
-      .ToBe(True);
-
     Target.Architecture := 'arm';
+    Driver.BareProbeOutput := '3.2.2 linux x86_64';
     Raised := False;
     try
       Driver.ProbeCapabilities(Target);
@@ -233,23 +359,36 @@ begin
   finally
     Driver.Free;
   end;
+end;
 
-  { The neutral windows OS is architecture-constrained: a win32 probe
-    answer must not satisfy a windows/x86_64 request. A fresh driver
-    avoids the (correct) per-target probe cache from the cases above. }
+procedure TLWPTFPCCompilerDriverTests.
+  TestBareProbeSatisfactionLeavesDispatchOut;
+var
+  Arguments: LWPT.Core.TStringArray;
+  Driver: TMockFPCCompilerDriver;
+  InvocationOptions: TLWPTCompilerInvocationOptions;
+  Request: TLWPTBuildRequest;
+  Target: TLWPTTarget;
+begin
+  Target := Default(TLWPTTarget);
   Target.OS := 'windows';
   Target.Architecture := 'x86_64';
   Driver := TMockFPCCompilerDriver.Create('mock-fpc');
   try
-    Driver.ProbeOutput := '3.2.2 win32 x86_64';
-    Raised := False;
-    try
-      Driver.ProbeCapabilities(Target);
-    except
-      on E: ELWPTCompilerDriverError do
-        Raised := Pos('returned target "win32/x86_64"', E.Message) > 0;
-    end;
-    Expect<Boolean>(Raised).ToBe(True);
+    Driver.BareProbeOutput := '3.2.2 win64 x86_64';
+    Driver.ProbeCapabilities(Target);
+    Expect<Integer>(Driver.ProbeCount).ToBe(1);
+    Expect<Boolean>(ArgumentsContain(Driver.LastArguments, '-Px86_64'))
+      .ToBe(False);
+    Expect<Boolean>(ArgumentsContain(Driver.LastArguments, '-Twin64'))
+      .ToBe(False);
+    Request := FixtureRequest('source/example.pas', 'build/example');
+    Request.Target := Target;
+    InvocationOptions := BuildCompilerInvocationOptions('', False);
+    Arguments := Driver.BuildArguments(Request, InvocationOptions);
+    Expect<Boolean>(ArgumentsContain(Arguments, '-Px86_64')).ToBe(False);
+    Expect<Boolean>(ArgumentsContain(Arguments, '-Twin64')).ToBe(False);
+    Expect<Integer>(Driver.ProbeCount).ToBe(1);
   finally
     Driver.Free;
   end;
@@ -286,13 +425,13 @@ begin
     if not Raised then Fail('probe failure did not name its requirement');
     Expect<string>(Driver.LastArguments[0]).ToBe(
       '-P' + Target.Architecture);
-    Expect<Integer>(Driver.ProbeCount).ToBe(1);
+    Expect<Integer>(Driver.ProbeCount).ToBe(2);
     try
       Driver.ProbeCapabilities(Target);
     except
       on E: ELWPTCompilerDriverError do;
     end;
-    Expect<Integer>(Driver.ProbeCount).ToBe(1);
+    Expect<Integer>(Driver.ProbeCount).ToBe(2);
   finally
     Driver.Free;
   end;
@@ -305,11 +444,12 @@ var
   Target: TLWPTTarget;
 begin
   Target := Default(TLWPTTarget);
-  Target.OS := GetBuildOS;
-  Target.Architecture := GetBuildArch;
+  Target.OS := 'windows';
+  Target.Architecture := 'x86_64';
   Driver := TMockFPCCompilerDriver.Create('mock-fpc');
   try
-    Driver.ProbeOutput := '3.2.2 unexpected-os ' + Target.Architecture;
+    Driver.BareProbeOutput := '3.2.2 win32 i386';
+    Driver.DispatchedProbeOutput := '3.2.2 win32 i386';
     Raised := False;
     try
       Driver.ProbeCapabilities(Target);
@@ -317,31 +457,10 @@ begin
       on E: ELWPTCompilerDriverError do
         Raised := (Pos('compiler "' + FPC_COMPILER_ID + '"', E.Message) > 0)
           and (Pos(Target.OS + '/' + Target.Architecture, E.Message) > 0)
-          and (Pos('returned target "unexpected-os/'
-            + Target.Architecture + '"', E.Message) > 0);
+          and (Pos('returned target "win32/i386"', E.Message) > 0);
     end;
     Expect<Boolean>(Raised).ToBe(True);
-
-  finally
-    Driver.Free;
-  end;
-
-  { The neutral windows OS is architecture-constrained: a win32 probe
-    answer must not satisfy a windows/x86_64 request. A fresh driver
-    avoids the (correct) per-target probe cache from the cases above. }
-  Target.OS := 'windows';
-  Target.Architecture := 'x86_64';
-  Driver := TMockFPCCompilerDriver.Create('mock-fpc');
-  try
-    Driver.ProbeOutput := '3.2.2 win32 x86_64';
-    Raised := False;
-    try
-      Driver.ProbeCapabilities(Target);
-    except
-      on E: ELWPTCompilerDriverError do
-        Raised := Pos('returned target "win32/x86_64"', E.Message) > 0;
-    end;
-    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Integer>(Driver.ProbeCount).ToBe(2);
   finally
     Driver.Free;
   end;
@@ -361,7 +480,7 @@ begin
   Target.Architecture := GetBuildArch;
   Driver := TMockFPCCompilerDriver.Create('mock-fpc');
   try
-    Driver.ProbeOutput := '3.2.2 ' + Target.OS + ' ' + Target.Architecture;
+    Driver.ProbeOutput := FixtureProbeOutput('3.2.2', Target);
     Capabilities := Driver.ProbeCapabilities(Target);
     Expect<Integer>(Length(Capabilities.OutputKinds)).ToBe(2);
     Expect<Boolean>(ArgumentsContain(Capabilities.OutputKinds,
@@ -381,37 +500,19 @@ begin
   finally
     Driver.Free;
   end;
-
-  { The neutral windows OS is architecture-constrained: a win32 probe
-    answer must not satisfy a windows/x86_64 request. A fresh driver
-    avoids the (correct) per-target probe cache from the cases above. }
-  Target.OS := 'windows';
-  Target.Architecture := 'x86_64';
-  Driver := TMockFPCCompilerDriver.Create('mock-fpc');
-  try
-    Driver.ProbeOutput := '3.2.2 win32 x86_64';
-    Raised := False;
-    try
-      Driver.ProbeCapabilities(Target);
-    except
-      on E: ELWPTCompilerDriverError do
-        Raised := Pos('returned target "win32/x86_64"', E.Message) > 0;
-    end;
-    Expect<Boolean>(Raised).ToBe(True);
-  finally
-    Driver.Free;
-  end;
 end;
 
 procedure TLWPTFPCCompilerDriverTests.TestBuildArgumentsPreserveBuildFlagSet;
 var
   Arguments: LWPT.Core.TStringArray;
   BootstrapSource, CrossProcessor: string;
-  Driver: TLWPTFPCCompilerDriver;
+  Driver: TMockFPCCompilerDriver;
   InvocationOptions: TLWPTCompilerInvocationOptions;
   Request: TLWPTBuildRequest;
+  NativeTarget: TLWPTTarget;
 begin
   Request := FixtureRequest('source/app.pas', 'session/bin/app');
+  NativeTarget := Request.Target;
   if GetBuildArch = 'aarch64' then CrossProcessor := 'x86_64'
   else CrossProcessor := 'aarch64';
   Request.Target.Architecture := CrossProcessor;
@@ -423,13 +524,17 @@ begin
   SetLength(Request.Inputs.IncludePaths, 1);
   Request.Inputs.IncludePaths[0] := 'include';
   InvocationOptions := BuildCompilerInvocationOptions('lwpt.cfg', False);
-  Driver := TLWPTFPCCompilerDriver.Create('fpc-under-test');
+  Driver := TMockFPCCompilerDriver.Create('fpc-under-test');
   try
+    Driver.BareProbeOutput := FixtureProbeOutput('3.2.2', NativeTarget);
+    Driver.DispatchedProbeOutput := FixtureProbeOutput('3.2.2',
+      Request.Target);
     Arguments := Driver.BuildArguments(Request, InvocationOptions);
-    ExpectArguments(Arguments, ['-P' + CrossProcessor, '-FEsession/bin',
-      '-FUsession/bin/units', '@lwpt.cfg', '-Fusource', '-Fiinclude', '-Sh',
-      '-O4', '-dPRODUCTION', '-Xs', '-CX', '-XX', '-B', '-osession/bin/app',
-      'source/app.pas']);
+    ExpectArguments(Arguments, ['-P' + CrossProcessor,
+      '-T' + FixtureFPCOperatingSystem(Request.Target), '-FEsession/bin',
+      '-FUsession/bin/units', '@lwpt.cfg', '-Fusource', '-Fiinclude',
+      '-Sh', '-O4', '-dPRODUCTION', '-Xs', '-CX', '-XX', '-B',
+      '-osession/bin/app', 'source/app.pas']);
 
     Request.Target.Architecture := GetBuildArch;
     Request.Mode := BUILD_MODE_DEV;
@@ -470,9 +575,10 @@ procedure TLWPTFPCCompilerDriverTests.
 var
   Arguments: LWPT.Core.TStringArray;
   ConfigurationPath, Scratch: string;
-  Driver: TLWPTFPCCompilerDriver;
+  Driver: TMockFPCCompilerDriver;
   InvocationOptions: TLWPTCompilerInvocationOptions;
   Request: TLWPTBuildRequest;
+  SavedUnitPaths: TSavedEnvironmentVariable;
 begin
   Scratch := ExpandFileName('build/tests/tmp/compiler-driver-arguments');
   RecursiveDelete(Scratch);
@@ -487,13 +593,16 @@ begin
   Request.Inputs.IncludePaths[0] := 'source';
   InvocationOptions := PascalSourceCompilerInvocationOptions(
     ConfigurationPath);
-  Driver := TLWPTFPCCompilerDriver.Create('fpc-under-test');
+  Driver := TMockFPCCompilerDriver.Create('fpc-under-test');
+  SaveAndClearEnvironmentVariable('LWPT_FPC_UNIT_PATHS', SavedUnitPaths);
   try
+    Driver.ProbeOutput := FixtureProbeOutput('3.2.2', Request.Target);
     Arguments := Driver.BuildArguments(Request, InvocationOptions);
     ExpectArguments(Arguments, ['-Sh', '-FEsession',
       '-FUsession/units', '-Fuconfig/unit', '-Ficonfig/include', '-Fusource',
       '-Fisource', '-osession/example', 'source/example.pas']);
   finally
+    RestoreEnvironmentVariable(SavedUnitPaths);
     Driver.Free;
     RecursiveDelete(Scratch);
   end;
@@ -647,7 +756,7 @@ begin
         = DIAGNOSTIC_ERROR).ToBe(False);
     Expect<Integer>(Length(BuildResult.Artifacts)).ToBe(1);
     Expect<string>(BuildResult.Artifacts[0].Path).ToBe(
-      Request.Outputs.Artifact);
+      FixtureArtifactPath(Request));
   finally
     Driver.Free;
     RecursiveDelete(Scratch);
@@ -720,6 +829,8 @@ begin
     TestProbeCachesPerTargetAndRefreshesOnDemand);
   Test('capability probes dispatch operating systems and map Windows',
     TestProbeDispatchesOperatingSystemAndMapsWindows);
+  Test('a satisfying bare probe leaves dispatch flags out',
+    TestBareProbeSatisfactionLeavesDispatchOut);
   Test('probe failure names compiler and target requirement',
     TestProbeFailureNamesCompilerAndTargetRequirement);
   Test('probe rejects a successful response for the wrong target tuple',

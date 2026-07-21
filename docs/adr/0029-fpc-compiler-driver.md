@@ -18,11 +18,14 @@ either the manifest-build or standalone-Pascal-source argument profile plus an
 incremental or forced-rebuild policy; they do not add FPC fields to the
 versioned request.
 
-Capability discovery is an on-demand dispatch probe for the requested target.
-Non-host architectures and operating systems add FPC's `-P` and `-T` switches,
-then one `-iV -iTO -iTP` invocation reports the selected compiler version and
-target. Results and failures are cached per target for the lifetime of the
-driver shared by one build or test invocation. The driver interface requires
+Capability discovery is probe-driven for the requested target. A bare
+`-iV -iTO -iTP` probe first reports the compiler driver's default target. If
+that tuple does not satisfy the request, a second probe supplies explicit FPC
+`-P` and `-T` dispatch switches. The successful probe records whether dispatch
+was required, and argument construction reuses that per-target decision rather
+than comparing the request with LWPT's own compile-time platform. Results and
+failures are cached per target for the lifetime of the driver shared by one
+build or test invocation. The driver interface requires
 implementations to support concurrent worker calls, and the FPC driver's cache
 serializes probes and returns defensive capability copies. Publication deliberately
 bypasses that cache and repeats the probe, preserving ADR-0020's protection
@@ -65,8 +68,9 @@ compilation uses the ordinary FPC driver path before the compiled script runs.
   compiler executable. The version identity now comes from the target-dispatch
   probe rather than a separate host-only `fpc -iV`; cross builds therefore
   fingerprint the compiler that actually handled their target.
-- `FPC_TARGET_OS` now participates in FPC dispatch through `-T` when it differs
-  from the host instead of changing fingerprint metadata alone.
+- `FPC_TARGET_OS` participates in FPC dispatch through `-T` when the bare
+  compiler probe cannot satisfy it instead of changing fingerprint metadata
+  alone.
 - Configuration-fragment handling remains intentionally different at the
   invocation-option level: builds pass `@lwpt.cfg`, while test and Windows hook
   compilation expand it for cross-platform response-file compatibility. The

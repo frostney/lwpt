@@ -23,8 +23,10 @@ type
     FProbeCache: TList;
     FProbeCriticalSection: TRTLCriticalSection;
     function FindProbe(const ATarget: TLWPTTarget): Integer;
-    function ProbeArguments(const ATarget: TLWPTTarget):
+    function ProbeArguments(const ATarget: TLWPTTarget;
+      const ADispatch: Boolean):
       LWPT.Core.TStringArray;
+    function TargetRequiresDispatch(const ATarget: TLWPTTarget): Boolean;
   protected
     function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
       out AOutput: string): Integer; virtual;
@@ -95,11 +97,14 @@ type
   private
     FTarget: TLWPTTarget;
     FCapabilities: TLWPTCompilerCapabilities;
+    FDispatchRequired: Boolean;
     FErrorMessage: string;
   public
     constructor Create(const ATarget: TLWPTTarget);
     function CopyCapabilities: TLWPTCompilerCapabilities;
     procedure StoreCapabilities(const ACapabilities: TLWPTCompilerCapabilities);
+    property DispatchRequired: Boolean read FDispatchRequired
+      write FDispatchRequired;
     property ErrorMessage: string read FErrorMessage write FErrorMessage;
     property Target: TLWPTTarget read FTarget;
   end;
@@ -187,19 +192,15 @@ begin
     [FPC_COMPILER_ID, ATarget.Architecture]);
 end;
 
-procedure AddTargetArguments(const ATarget: TLWPTTarget;
+procedure AddDispatchArguments(const ATarget: TLWPTTarget;
   const AArguments: TStrings);
 begin
-  if not EquivalentProcessor(ATarget.Architecture, GetBuildArch) then
-  begin
-    if ATarget.Architecture = FPC_PROCESSOR_X86 then
-      AArguments.Add(FPC_PROCESSOR_FLAG + FPC_PROCESSOR_I386)
-    else
-      AArguments.Add(FPC_PROCESSOR_FLAG + ATarget.Architecture);
-  end;
-  if not EquivalentOperatingSystem(ATarget, GetBuildOS) then
-    AArguments.Add(FPC_OPERATING_SYSTEM_FLAG
-      + FPCOperatingSystemName(ATarget));
+  if ATarget.Architecture = FPC_PROCESSOR_X86 then
+    AArguments.Add(FPC_PROCESSOR_FLAG + FPC_PROCESSOR_I386)
+  else
+    AArguments.Add(FPC_PROCESSOR_FLAG + ATarget.Architecture);
+  AArguments.Add(FPC_OPERATING_SYSTEM_FLAG
+    + FPCOperatingSystemName(ATarget));
 end;
 
 function CreateFPCBuildRequest(const ASource, AArtifact: string):
@@ -463,8 +464,8 @@ begin
   Result := -1;
 end;
 
-function TLWPTFPCCompilerDriver.ProbeArguments(const ATarget: TLWPTTarget):
-  LWPT.Core.TStringArray;
+function TLWPTFPCCompilerDriver.ProbeArguments(const ATarget: TLWPTTarget;
+  const ADispatch: Boolean): LWPT.Core.TStringArray;
 var
   Arguments: TStringList;
   ArgumentIndex: Integer;
@@ -472,7 +473,7 @@ begin
   Result := nil;
   Arguments := TStringList.Create;
   try
-    AddTargetArguments(ATarget, Arguments);
+    if ADispatch then AddDispatchArguments(ATarget, Arguments);
     Arguments.Add(FPC_PROBE_VERSION_FLAG);
     Arguments.Add(FPC_PROBE_OS_FLAG);
     Arguments.Add(FPC_PROBE_PROCESSOR_FLAG);
@@ -481,6 +482,30 @@ begin
       Result[ArgumentIndex] := Arguments[ArgumentIndex];
   finally
     Arguments.Free;
+  end;
+end;
+
+function TLWPTFPCCompilerDriver.TargetRequiresDispatch(
+  const ATarget: TLWPTTarget): Boolean;
+var
+  CacheIndex: Integer;
+begin
+  ProbeCapabilities(ATarget);
+  EnterCriticalSection(FProbeCriticalSection);
+  try
+    { Read dispatch and error state from one locked snapshot: a
+      concurrent failed refresh between the probe above and this read
+      can rewrite the entry, and a silently-cleared DispatchRequired
+      would drop the -P/-T flags from the build invocation. }
+    CacheIndex := FindProbe(ATarget);
+    if TLWPTFPCProbeCacheEntry(
+      FProbeCache[CacheIndex]).ErrorMessage <> '' then
+      raise ELWPTCompilerDriverError.Create(TLWPTFPCProbeCacheEntry(
+        FProbeCache[CacheIndex]).ErrorMessage);
+    Result := TLWPTFPCProbeCacheEntry(
+      FProbeCache[CacheIndex]).DispatchRequired;
+  finally
+    LeaveCriticalSection(FProbeCriticalSection);
   end;
 end;
 
@@ -521,6 +546,7 @@ var
     Version: string;
   CacheIndex, ExitCode: Integer;
   Arguments: LWPT.Core.TStringArray;
+  DispatchRequired, TargetSatisfied: Boolean;
 begin
   ErrorMessage := '';
   EnterCriticalSection(FProbeCriticalSection);
@@ -542,9 +568,25 @@ begin
       end;
       TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).StoreCapabilities(
         DefaultCompilerCapabilities);
+      TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).DispatchRequired :=
+        False;
       TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).ErrorMessage := '';
-      Arguments := ProbeArguments(ATarget);
+      TargetSatisfied := False;
+      Arguments := ProbeArguments(ATarget, False);
       try
+        ExitCode := ExecuteProbe(Arguments, Output);
+        TargetSatisfied := (ExitCode = 0)
+          and ParseProbeOutput(Output, Version, ActualOperatingSystem,
+            ActualProcessor)
+          and EquivalentOperatingSystem(ATarget, ActualOperatingSystem)
+          and EquivalentProcessor(ATarget.Architecture, ActualProcessor);
+      except
+        on E: Exception do TargetSatisfied := False;
+      end;
+      DispatchRequired := not TargetSatisfied;
+      if DispatchRequired then
+      try
+        Arguments := ProbeArguments(ATarget, True);
         ExitCode := ExecuteProbe(Arguments, Output);
         if ExitCode <> 0 then
           ErrorMessage := 'probe via "' + FExecutableName
@@ -582,6 +624,8 @@ begin
         ValidateCompilerCapabilities(Result);
         TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).StoreCapabilities(
           Result);
+        TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).DispatchRequired :=
+          DispatchRequired;
       end;
       TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).ErrorMessage :=
         ErrorMessage;
@@ -610,7 +654,8 @@ begin
   ValidateBuildRequest(ARequest);
   Arguments := TStringList.Create;
   try
-    AddTargetArguments(ARequest.Target, Arguments);
+    if TargetRequiresDispatch(ARequest.Target) then
+      AddDispatchArguments(ARequest.Target, Arguments);
     ForceRebuildAdded := False;
     if AOptions.ArgumentProfile = capPascalSource then
       Arguments.Add(FPC_SHARED_STRING_FLAG);
