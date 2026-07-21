@@ -772,7 +772,7 @@ procedure TLWPTFPCCompilerDriverTests.
 var
   BuildResult: TLWPTBuildResult;
   Driver: TLWPTFPCCompilerDriver;
-  BannerSeen, ErrorDiagnosticFound, OriginExpected, OriginFound,
+  ErrorDiagnosticFound, OriginExpected, OriginFound,
     OriginSound: Boolean;
   ExitCode, DiagnosticIndex: Integer;
   Output, Scratch, SourcePath: string;
@@ -810,11 +810,12 @@ begin
     { The file-origin expectation holds only when the compiler reached the
       semantic error; a config-level Fatal without a source origin is an
       environment shape, not a parser defect. }
+    { No banner assertion: verbosity config (e.g. choco's fpc.cfg on
+      Windows) legitimately suppresses the compiler banner; the exit
+      code and parsed diagnostics already prove the real compiler ran. }
     OriginExpected := Pos('Broken.pas(', Output) > 0;
-    BannerSeen := Pos('Free Pascal Compiler', Output) > 0;
     if (not BuildResult.Success) and ErrorDiagnosticFound
-       and ((not OriginExpected) or (OriginFound and OriginSound))
-       and BannerSeen then
+       and ((not OriginExpected) or (OriginFound and OriginSound)) then
       Expect<Boolean>(True).ToBe(True)
     else
     begin
@@ -822,8 +823,7 @@ begin
       WriteLn('STRUCTURED-DIAGNOSTIC TEST FAILURE: success=',
         BuildResult.Success, ' errorFound=', ErrorDiagnosticFound,
         ' originExpected=', OriginExpected, ' originFound=', OriginFound,
-        ' originSound=', OriginSound, ' bannerSeen=', BannerSeen,
-        ' exit=', ExitCode);
+        ' originSound=', OriginSound, ' exit=', ExitCode);
       WriteLn('parsed diagnostics (', Length(BuildResult.Diagnostics), '):');
       for DiagnosticIndex := 0 to High(BuildResult.Diagnostics) do
         WriteLn('  [', BuildResult.Diagnostics[DiagnosticIndex].Severity,
