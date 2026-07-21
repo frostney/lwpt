@@ -27,7 +27,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0004](./adr/0004-http-registry-deferred-to-v2.md) | HTTP registry source kind deferred to v2 |
 | [0005](./adr/0005-self-host-build.md) | LWPT builds LWPT (self-host) with a one-time bootstrap script |
 | [0006](./adr/0006-stack-contracts-deferred-from-v1.md) | Four stack contracts (link, duplication, codebase-health, architectural-drift) deferred from v1 |
-| [0007](./adr/0007-formatter-scope-manifest-declared.md) | Formatter scope is manifest-declared (`[package].units` + `[format].include` minus `[format].exclude`, globs + explicit recursion); toolkit-state exception added by ADR-0026 |
+| [0007](./adr/0007-formatter-scope-manifest-declared.md) | Formatter scope is manifest-declared (`[package].units` + `[format].include` minus `[format].exclude`, globs + explicit recursion); toolkit-state exception added by ADR-0028 |
 | [0008](./adr/0008-lockfile-schema-v2-archive-hash.md) | Lockfile schema v2 splits `archiveHash` from `computedHash` for two-hash `--frozen` verification |
 | [0009](./adr/0009-source-syntax-and-tag-resolution.md) | Source syntax (`<source>@<spec>` shorthand; git-host / URL / local kinds) + git smart-HTTP tag resolution; lockfile schema v3 |
 | [0010](./adr/0010-init-subcommand.md) | `lwpt init` interactive scaffold + npm-init-y semantics with `--yes` |
@@ -42,9 +42,13 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0019](./adr/0019-add-remove-subcommands.md) | `lwpt add` + `lwpt remove` as manifest-editing frontends to the install transaction; install-before-write ordering; lockfile-diff pruning of orphaned modules + archives; subcommand surface 7 → 9 |
 | [0020](./adr/0020-isolated-build-sessions.md) | Invocation-private compiler staging, revalidated short-lock publication, session-safe clean, and repair reclamation |
 | [0021](./adr/0021-machine-wide-worker-budget.md) | Per-user machine worker capacity coordinated through fair, reclaimable filesystem leases |
+| [0022](./adr/0022-compiler-neutral-build-request.md) | Compiler-neutral versioned build requests, target tuples, capabilities, and normalized results; FPC is the only current adapter |
 | [0023](./adr/0023-parallel-build-target-scheduler.md) | Dependency-aware, bounded parallel target scheduling with deterministic reporting and publication |
+| [0024](./adr/0024-openssl-server-tls-accept.md) | Server-side TLS accept via nonblocking memory-BIO OpenSSL 3 with PKCS#12 identities on Windows and Unix-not-Darwin; macOS servers use Network.framework |
 | [0025](./adr/0025-cascading-process-tree-cancellation.md) | Cascading process-tree cancellation via Unix signal-forwarding and Windows nested Job Objects |
-| [0026](./adr/0026-default-toolkit-state-format-exclusion.md) | Formatter excludes root `.lwpt/**` by default while explicit includes opt matching files back in |
+| [0026](./adr/0026-release-version-stamp-from-tag.md) | Release binaries stamp the version from the git tag; dev builds stamp from the manifest |
+| [0027](./adr/0027-agents-subcommand.md) | `lwpt agents` writes/verifies the marker-fenced AGENTS.md command reference; subcommand surface 9 → 10 |
+| [0028](./adr/0028-default-toolkit-state-format-exclusion.md) | Formatter excludes root `.lwpt/**` by default while explicit includes opt matching files back in |
 
 ## Spikes
 

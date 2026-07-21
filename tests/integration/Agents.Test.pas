@@ -1,4 +1,4 @@
-{ Agents.Test — pins lwpt agents subcommand semantics (ADR-0024).
+{ Agents.Test — pins lwpt agents subcommand semantics (ADR-0027).
 
   `lwpt agents` writes a marker-fenced, machine-generated command
   reference into the project's AGENTS.md; `--check` verifies the block

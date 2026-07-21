@@ -8,7 +8,7 @@ Naming, file layout, formatter rules, manifest scope with protected toolkit stat
 - **The project name lives in two constants.** `PROGRAM_NAME = 'lwpt'` (lowercase Unix convention; derives filenames and shell commands) and `PROJECT_NAME = 'LWPT'` (uppercase acronym in prose). See [ADR-0001](./adr/0001-program-name-as-constant.md). Never hardcode either spelling.
 - **LWPT-internal units use the dotted `LWPT.<Subsys>.pas` form.** Workspace packages under `packages/<name>/source/` follow their own naming (see [`packages.md`](./packages.md)). The "Packages own their contents" Hard Constraint in `AGENTS.md` keeps the root LWPT formatter + reviewers out of package source.
 - **`lwpt format` is the canonical formatter.** No-flag invocation rewrites in place; `--check` is the CI / pre-commit mode. Rules are encoded in the Pascal source of `LWPT.Formatter`, not in a config file.
-- **Formatter scope is manifest-declared with one safety boundary**: `[package].units` + `[format].include`, root `.lwpt/**` excluded unless explicitly included, then `[format].exclude`. Globs are supported; recursion is explicit via `**`. See [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) and [ADR-0026](./adr/0026-default-toolkit-state-format-exclusion.md). Root LWPT's `[format].include` covers `tests/integration/`, `tests/support/`, `tests/e2e/`, and every workspace package (`packages/**/*.{pas,inc}`) so the canonical style applies across the monorepo. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)'s root-owns-unless-overridden model, a workspace package can opt out by declaring its own `[format]` section in `packages/<name>/lwpt.toml`.
+- **Formatter scope is manifest-declared with one safety boundary**: `[package].units` + `[format].include`, root `.lwpt/**` excluded unless explicitly included, then `[format].exclude`. Globs are supported; recursion is explicit via `**`. See [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) and [ADR-0028](./adr/0028-default-toolkit-state-format-exclusion.md). Root LWPT's `[format].include` covers `tests/integration/`, `tests/support/`, `tests/e2e/`, and every workspace package (`packages/**/*.{pas,inc}`) so the canonical style applies across the monorepo. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)'s root-owns-unless-overridden model, a workspace package can opt out by declaring its own `[format]` section in `packages/<name>/lwpt.toml`.
 - **Line endings: LF everywhere, trailing whitespace stripped.** The two scope additions from Q8; both are zero-controversy.
 
 ## Naming
@@ -121,7 +121,7 @@ What the formatter does *not* do (today):
 
 ### Scope: include + exclude
 
-The format scope is composed from the manifest plus the toolkit-state safety boundary. Full spec in [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) and [ADR-0026](./adr/0026-default-toolkit-state-format-exclusion.md); the short version:
+The format scope is composed from the manifest plus the toolkit-state safety boundary. Full spec in [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) and [ADR-0028](./adr/0028-default-toolkit-state-format-exclusion.md); the short version:
 
 - **Seed**: `[package].units` (each dir, non-recursive, formattable extensions only).
 - **Add**: `[format].include` — array of globs added on top of the seed.

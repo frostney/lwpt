@@ -81,9 +81,12 @@ Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR
 1. Install FPC via `apt`
 2. `./bootstrap.sh` — cold build of `build/lwpt` from a freshly-cloned repo
 3. `./build/lwpt --help` (does the binary even load?)
-4. `./build/lwpt install` (workspace auto-discovery + symlinks)
-5. `./build/lwpt format --check`
-6. `./build/lwpt test --bail=1` (default tier — unit + integration)
+4. `./build/lwpt install --frozen` (committed lockfile matches committed trees — runs *before* plain install so lock drift cannot be masked by regeneration)
+5. `./build/lwpt install` (workspace auto-discovery + symlinks)
+6. `./build/lwpt format --check`
+7. `./build/lwpt build` (manifest-target compile)
+8. `./build/lwpt agents --check` (generated command-reference drift)
+9. `./build/lwpt test --bail=1` (default tier — unit + integration)
 
 E2E tests are skipped via `LWPT_SKIP_NETWORK=1`; they run on every platform post-merge via `ci.yml`. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
 
@@ -220,7 +223,7 @@ Crucially, this is **not** a blanket "ignore e2e failures". An install that *con
 - **Dev / local builds** (`./bootstrap.sh`, `lwpt build`): the constant is sourced from `[package].version` in `lwpt.toml`. `Version.Test.pas`'s drift guard asserts `lwpt --version` matches the manifest for these. There is no way for a locally-built binary to disagree with the manifest.
 - **Release builds** (`release.yml`, tag push): the build step exports `LWPT_VERSION_OVERRIDE=<tag-without-v>` and re-runs `stamp-version.pas` before the cross-FPC compile, so the released binary reports **the git tag**. A 0.1.0-rc.3 release reports `lwpt 0.1.0-rc.3`.
 
-This split keeps the tag, the archive name, and the binary's self-report consistent for anything a user downloads, while leaving local builds pinned to the manifest version (the dev/unreleased number). Release PRs still bump `[package].version` so local builds, `CHANGELOG.md`, and the eventual release tag move together, but the tag remains the source of truth for published binaries. The rationale and rejected alternatives live in [ADR-0018](./adr/0018-release-version-stamp-from-tag.md).
+This split keeps the tag, the archive name, and the binary's self-report consistent for anything a user downloads, while leaving local builds pinned to the manifest version (the dev/unreleased number). Release PRs still bump `[package].version` so local builds, `CHANGELOG.md`, and the eventual release tag move together, but the tag remains the source of truth for published binaries. The rationale and rejected alternatives live in [ADR-0026](./adr/0026-release-version-stamp-from-tag.md).
 
 Three independent layers keep the tag, archive name, and binary self-report in agreement — each catches what the others can't:
 

@@ -5,21 +5,21 @@ version = 3
 source = "workspace:auto"
 resolvedRef = ""
 resolvedURL = ""
-computedHash = "sha256:ba909d9a4409c5e8c43343bb68bf466250b0898655ec25dfc1877f4c93b4ad84"
+computedHash = "sha256:3d193621c7497bd05dd0aa663f6482935c71a732f826ffa4e3089a97d02cd662"
 archiveHash = ""
 
 [package.httpclient]
 source = "workspace:auto"
 resolvedRef = ""
 resolvedURL = ""
-computedHash = "sha256:4d3a6f3834cbf65fc7cfc15ff0349e25b976044b37167e5f126c9ed6847a64ec"
+computedHash = "sha256:eb5ef3ce0bbee81af938eeb39cb03e10146d507afc2e2bfdecb32795236791a2"
 archiveHash = ""
 
 [package.semver]
 source = "workspace:auto"
 resolvedRef = ""
 resolvedURL = ""
-computedHash = "sha256:d32c37fdb0676716b156aaa99035c03ad21a89562dd945b7804a5c871fad0b77"
+computedHash = "sha256:cf0f6ef3882065f0ab508baa6ec4f5c077f08581235ea28865c93afcdcb4d723"
 archiveHash = ""
 
 [package.testing]

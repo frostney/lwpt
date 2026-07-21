@@ -1,13 +1,13 @@
 # Semver — node-semver port for Pascal.
 #
-# Vendored from GocciaScript (Goccia.Semver → Semver in a later cycle's named
+# Shared with GocciaScript, LWPT-canonical per ADR-0017 (Goccia.Semver → Semver in a later cycle's named
 # exception) and graduated into a standalone LWPT package per
 # ADR-0014. Smallest package in the set — self-contained except
 # for the single MAX_SAFE_INTEGER constant inlined from the deleted
 # Goccia.Constants.NumericLimits.
 #
 # Semver.Test.pas ships with the package so a future consumer can
-# `lwpt test` against the vendored API.
+# `lwpt test` against the package API.
 
 [package]
 name    = "semver"

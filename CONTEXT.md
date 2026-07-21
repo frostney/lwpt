@@ -29,7 +29,7 @@ The committed `.tar.gz` at `.lwpt/archives/<dep>-<version>.tar.gz` that produced
 *Avoid*: "tarball" (acceptable in prose, but on disk it's an archive), "cache" (a cache is regenerable; archives are committed).
 
 **Source kind**:
-Where LWPT fetches a dependency from. One of `github`, `gitlab`, `bitbucket`, `release`, `local`. The `http` registry source kind was deferred to v2 (see ADR-0004 and `docs/spikes/http-registry-spike.md`).
+Where LWPT fetches a dependency from. One of `githost` (default host `github`; `gitlab:` / `bitbucket:` prefixes select the others), `url` (any `https://...` tarball), or `local` (path or `local:` prefix), plus the internal `workspace` kind for auto-discovered monorepo packages (see ADR-0009). The `http` registry source kind was deferred to v2 (see ADR-0004 and `docs/spikes/http-registry-spike.md`).
 *Avoid*: "protocol" (HTTPS is the protocol; the source kind is the URL-template + ref semantics), "repository type".
 
 **Subdir**:
@@ -58,7 +58,7 @@ The single `lwpt install` operation that, under the install lock, resolves depen
 
 **Zero-install**:
 The default property of every LWPT project: after `git clone`, `fpc @lwpt.cfg` builds the project without running `lwpt install` first. Achieved by committing `.lwpt/modules/` and `.lwpt/archives/`. See ADR-0002.
-*Avoid*: "checked-in deps" (Yarn's term), "vendored" (LWPT uses "vendored" exclusively for the GocciaScript-origin code inside LWPT itself — see *Vendored*).
+*Avoid*: "checked-in deps" (Yarn's term), "vendored" (retired per ADR-0017 — see *Vendored*).
 
 **Bootstrap**:
 The one-time `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) that produces the first `build/lwpt` binary on a fresh clone. After bootstrap, `./build/lwpt build` is the steady-state entry point.
@@ -74,7 +74,7 @@ A Windows-only failure in the `HTTPClient` package's SChannel backend while fetc
 
 **Toolkit state**:
 Everything under `.lwpt/` at a project's root. Three subdirs: `modules/` and `archives/` are committed (zero-install); `tmp/` is gitignored (install workspace). `install.lock` (when present) is the concurrency-control file; also gitignored. Monorepo deps appear under `modules/` as symlinks (Unix) or NTFS junctions (Windows) pointing into the project's `packages/<name>/` tree; external-path + network deps appear as regular copied directories.
-*Avoid*: "node_modules" (npm-specific naming), "vendor dir" alone (`packages/` is the monorepo-internal "where vendored packages live" — see *Package (graduated)*; `.lwpt/modules/` is the per-project installed-tree location, NOT a vendor dir in the historical Delphi/FreePascal sense).
+*Avoid*: "node_modules" (npm-specific naming), "vendor dir" alone (`packages/` is the monorepo-internal "where packages live" — see *Package (graduated)*; `.lwpt/modules/` is the per-project installed-tree location, NOT a vendor dir in the historical Delphi/FreePascal sense).
 
 **Monorepo**:
 A project topology where the root `lwpt.toml` declares one or more local-path dependencies whose resolved absolute path lives under the directory containing that root `lwpt.toml`. The idiomatic declaration is the `[workspaces]` section (`include = ["packages/*"]`) — each matched dir with its own `lwpt.toml` becomes a [Workspace](#workspace) and is auto-installed as a [Monorepo dep](#monorepo-dep). The older explicit-`[dependencies]`-with-local-paths form (`httpclient = "./packages/httpclient"`) still works but is verbose; `[workspaces]` is the preferred shape post-ADR-0014. LWPT itself is a monorepo by this definition.
@@ -159,7 +159,7 @@ The `lwpt run <name>` subcommand. Two behaviours under one verb: if `<name>` mat
 *Avoid*: "exec" (executes-into-this connotation; lwpt run is dispatch + spawn).
 
 **Agents block**:
-The marker-fenced region (`<!-- lwpt:agents:begin -->` … `<!-- lwpt:agents:end -->`) inside a project's `AGENTS.md` that `lwpt agents` writes and `lwpt agents --check` verifies (per ADR-0024). Machine-written from the subcommand registry — the same objects that drive `--help` — plus the manifest's [Script](#script-run-script) entries. Byte-deterministic: LF line endings, no version stamp or timestamp, so `--check` fails only on real drift. Everything outside the markers is hand-written and never touched by the toolkit.
+The marker-fenced region (`<!-- lwpt:agents:begin -->` … `<!-- lwpt:agents:end -->`) inside a project's `AGENTS.md` that `lwpt agents` writes and `lwpt agents --check` verifies (per ADR-0027). Machine-written from the subcommand registry — the same objects that drive `--help` — plus the manifest's [Script](#script-run-script) entries. Byte-deterministic: LF line endings, no version stamp or timestamp, so `--check` fails only on real drift. Everything outside the markers is hand-written and never touched by the toolkit.
 *Avoid*: "generated AGENTS.md" (the file is the host; only the block is generated), "agents section" loosely (the term is specifically the marker-fenced region), "agent docs" (harness-side instruction files like CLAUDE.md are a different layer).
 
 ### Manifest interpolation
@@ -219,6 +219,6 @@ A per-release boolean on a GitHub Release. `release.yml` sets it from the *tag s
 >
 > **Author**: That's the Z-both pattern from ADR-0002 — archives are the verification belt, modules are what FPC actually reads. The hash in the lockfile checks both on `--frozen`.
 >
-> **Reviewer**: One last thing — the manifest entry uses `source = "github"` but the repo is on GitLab. Won't that break?
+> **Reviewer**: One last thing — the manifest entry says `dep = "octocat/hello@^1"` but the repo is on GitLab. Won't that break?
 >
-> **Author**: It'd break. Should be `source = "gitlab"`. The source kind names the URL template, not the protocol.
+> **Author**: It'd break. Should be `dep = "gitlab:octocat/hello@^1"`. The githost prefix names the URL template, not the protocol.

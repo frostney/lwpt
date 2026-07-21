@@ -1,6 +1,6 @@
 # CLI — option parser, subcommand dispatch, help text, interactive prompts.
 #
-# Vendored from GocciaScript (CLI.Options + CLI.Parser + CLI.Help)
+# Shared with GocciaScript (CLI.Options + CLI.Parser + CLI.Help); LWPT-canonical per ADR-0017
 # with LWPT-original units bolted on (CLI.Subcommands + CLI.Prompts).
 # Graduated into a standalone LWPT package per ADR-0014. The
 # previously-named-exception treatment (TGoccia prefix stripped, dead

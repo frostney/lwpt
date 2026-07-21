@@ -1,4 +1,4 @@
-{ LWPT.Command.Agents — agents subcommand entrypoint (ADR-0024).
+{ LWPT.Command.Agents — agents subcommand entrypoint (ADR-0027).
 
   Writes (or, with --check, verifies) the agent-facing command
   reference inside the project's AGENTS.md: a marker-fenced region
@@ -7,7 +7,7 @@
   the same live TSubcommandRegistry that drives `--help`, so the two
   surfaces cannot drift apart.
 
-  Region contract (the compat surface pinned by ADR-0024):
+  Region contract (the compat surface pinned by ADR-0027):
 
     - Fenced by the HTML comments `<!-- lwpt:agents:begin -->` and
       `<!-- lwpt:agents:end -->` on their own lines. Markers are
