@@ -17,7 +17,7 @@ How LWPT tests itself: the four-tier policy, the mock HTTP server, the binary-fe
 | --- | --- | --- | --- | --- |
 | **Unit** | Never | Co-located in `source/` (`Foo.pas` ↔ `Foo.Test.pas`) | Yes | Yes (via `lwpt test`) |
 | **Integration** | Never (mock server + local fixtures) | `tests/integration/` | Yes | Yes |
-| **E2E** | Sometimes (live hosts or loopback only) | `tests/e2e/` and package-owned `tests/e2e/` | No (post-merge on `main` via `ci.yml`; PRs set `LWPT_SKIP_NETWORK=1`) | No |
+| **E2E** | Sometimes (live hosts or loopback only) | `tests/e2e/` and package-owned `tests/e2e/` | Linux leg only (dedicated `pr.yml` step per #102); every platform post-merge via `ci.yml` | No |
 | **Manual / spike** | N/A | Anywhere maintainer wants | No | No |
 
 `./build/lwpt test` runs Unit + Integration by default. `./build/lwpt test --tier=e2e` includes the live tier.
