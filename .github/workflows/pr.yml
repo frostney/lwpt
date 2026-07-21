@@ -26,9 +26,9 @@ name: PR
 # cheap, which is the conscious GocciaScript design
 # choice we mirror.
 #
-# One carve-out from that trade-off: Windows, via the win64 leg.
-# {$IFDEF WINDOWS} codepaths never compile on the Ubuntu runner, so
-# a unit-shadowing mistake (the SysUtils.FindClose vs
+# The first carve-out from that trade-off was Windows, via the
+# win64 leg. {$IFDEF WINDOWS} codepaths never compile on the Ubuntu
+# runner, so a unit-shadowing mistake (the SysUtils.FindClose vs
 # Windows.FindClose class — introduced by PR #17, fixed by PR #21)
 # used to merge green and break main. windows-cross-compile closes
 # the compile gap (one win64 cross-compile reusing the toolchain
@@ -36,9 +36,11 @@ name: PR
 # default test tier natively against that binary, catching
 # Windows-only runtime breaks (junction installs, path handling,
 # process env) and compile breaks in test sources, which lwpt test
-# compiles with the native FPC. Still post-merge only: the
-# i386-win32 leg, the live-network e2e tier, bootstrap.bat, and
-# every non-Windows platform.
+# compiles with the native FPC. #102 added the next two carve-outs
+# (the Linux e2e step and the darwin-test leg below) after the
+# #84/#105 escape classes. Still post-merge only: the i386-win32
+# leg, the e2e tier on non-Linux platforms, bootstrap.bat, and the
+# x86_64-darwin / aarch64-linux permutations.
 #
 # The Ubuntu native build deliberately uses the distro FPC (same
 # as the install instructions in README.md), so a regression that
