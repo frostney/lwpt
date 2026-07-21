@@ -93,6 +93,30 @@ jobs:
           key: ${{ needs.toolchain.outputs.cache-key }}
           fail-on-cache-miss: true
 
+      - name: Stamp release version from tag
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          # Stamp the release version FROM THE TAG so the binary's
+          # `lwpt --version` matches the release it ships in (e.g. a
+          # 0.1.0-rc.3 release reports `lwpt 0.1.0-rc.3`). release.yml
+          # compiles the cross-FPC directly — it does NOT go through
+          # `lwpt build`, so the [prebuild] stamp-version hook never
+          # fires here; we regenerate Version.inc explicitly. A manual
+          # invocation without a tag keeps the committed (manifest)
+          # version. See docs/ci.md "Release version stamping".
+          #
+          # This is a NATIVE host compile: the cross toolchain in
+          # fpc-cross/ cannot link a host binary on this macOS runner
+          # (ld: library 'c' not found under the current Xcode linker),
+          # so use a host-linkable FPC — the same treatment as the
+          # Windows TLS-linkage checker below. The cache-prefix PATH
+          # export happens inside the cross-compile step, so brew's
+          # instantfpc is unshadowed here.
+          brew list fpc >/dev/null 2>&1 || brew install fpc
+          echo "=== Stamping release version from tag ${GITHUB_REF_NAME} ==="
+          LWPT_VERSION_OVERRIDE="${GITHUB_REF_NAME#v}" instantfpc scripts/stamp-version.pas
+
       - name: Cross-compile lwpt
         run: |
           set -euo pipefail
@@ -200,19 +224,6 @@ jobs:
           esac
 
           mkdir -p build/compiled
-
-          # Stamp the release version FROM THE TAG so the binary's
-          # `lwpt --version` matches the release it ships in (e.g. a
-          # 0.1.0-rc.3 release reports `lwpt 0.1.0-rc.3`). release.yml
-          # compiles the cross-FPC directly — it does NOT go through
-          # `lwpt build`, so the [prebuild] stamp-version hook never
-          # fires here; we regenerate Version.inc explicitly. Only on
-          # tag pushes; a manual workflow_dispatch keeps the committed
-          # (manifest) version. See docs/ci.md "Release version stamping".
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
-            echo "=== Stamping release version from tag ${GITHUB_REF_NAME} ==="
-            LWPT_VERSION_OVERRIDE="${GITHUB_REF_NAME#v}" instantfpc scripts/stamp-version.pas
-          fi
 
           # Release-grade build: -O4 -dPRODUCTION -Xs -CX -XX -B.
           # Same flag set as ci.yml's build stage, so a tagged commit's
