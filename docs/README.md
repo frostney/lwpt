@@ -7,7 +7,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [`architecture.md`](./architecture.md) | Tech stack, the package-manager-is-the-foundation through-line, manifest model, resolver shape, fetch/extract/build/test pipeline, `.lwpt/` layout, error/idempotency model, deferred-contracts note |
 | [`quick-start.md`](./quick-start.md) | Install FPC + InstantFPC + Lefthook, bootstrap, build, write a test, add a dependency, common errors |
 | [`tooling.md`](./tooling.md) | Pinned tool versions, environment variables, lint/format/test commands, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), EXDEV fallback, where each deferred contract lives |
-| [`code-style.md`](./code-style.md) | Naming, file layout, formatter rules, manifest-declared formatter scope, line-endings, design tokens |
+| [`code-style.md`](./code-style.md) | Naming, file layout, formatter rules, manifest scope with protected toolkit state, line-endings, design tokens |
 | [`build-system.md`](./build-system.md) | Bootstrap pattern, `lwpt build` contract, `[build]` section + lifecycle hooks (`[prebuild]` / `[postbuild]` / `[pretest]` / etc.), `build/` output rules, cross-compile |
 | [`deployment.md`](./deployment.md) | Platform tier matrix, release process, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), macOS quarantine, codesigning policy |
 | [`ci.md`](./ci.md) | CI workflow shape (`ci.yml` / `pr.yml` / `release.yml` / `toolchain.yml`), trigger split, cross-build toolchain cache, install scripts |
@@ -27,7 +27,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0004](./adr/0004-http-registry-deferred-to-v2.md) | HTTP registry source kind deferred to v2 |
 | [0005](./adr/0005-self-host-build.md) | LWPT builds LWPT (self-host) with a one-time bootstrap script |
 | [0006](./adr/0006-stack-contracts-deferred-from-v1.md) | Four stack contracts (link, duplication, codebase-health, architectural-drift) deferred from v1 |
-| [0007](./adr/0007-formatter-scope-manifest-declared.md) | Formatter scope is manifest-declared (`[package].units` + `[format].include` minus `[format].exclude`, globs + explicit recursion), not convention-based |
+| [0007](./adr/0007-formatter-scope-manifest-declared.md) | Formatter scope is manifest-declared (`[package].units` + `[format].include` minus `[format].exclude`, globs + explicit recursion); toolkit-state exception added by ADR-0026 |
 | [0008](./adr/0008-lockfile-schema-v2-archive-hash.md) | Lockfile schema v2 splits `archiveHash` from `computedHash` for two-hash `--frozen` verification |
 | [0009](./adr/0009-source-syntax-and-tag-resolution.md) | Source syntax (`<source>@<spec>` shorthand; git-host / URL / local kinds) + git smart-HTTP tag resolution; lockfile schema v3 |
 | [0010](./adr/0010-init-subcommand.md) | `lwpt init` interactive scaffold + npm-init-y semantics with `--yes` |
@@ -44,6 +44,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0021](./adr/0021-machine-wide-worker-budget.md) | Per-user machine worker capacity coordinated through fair, reclaimable filesystem leases |
 | [0023](./adr/0023-parallel-build-target-scheduler.md) | Dependency-aware, bounded parallel target scheduling with deterministic reporting and publication |
 | [0025](./adr/0025-cascading-process-tree-cancellation.md) | Cascading process-tree cancellation via Unix signal-forwarding and Windows nested Job Objects |
+| [0026](./adr/0026-default-toolkit-state-format-exclusion.md) | Formatter excludes root `.lwpt/**` by default while explicit includes opt matching files back in |
 
 ## Spikes
 

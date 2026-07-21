@@ -58,24 +58,23 @@ type
     procedure TestWildcardSegmentsStillSkipHiddenDirs;
   end;
 
-  { [format].exclude must subtract files regardless of how they
-    entered the scope — including the [package].units seed. The
-    motivating case is a units entry pointing into .lwpt/ (vendored
-    module sources a consumer compiles directly): an exclude glob
-    spelled ".lwpt/**" must carve those seeded files back out, which
-    requires the glob walker to enter the hidden dir it explicitly
-    names. Runs the full CmdFormat composition in check mode against
-    a scratch project. }
-  TFormatUnitsSeedExclude = class(TTestSuite)
+  { Toolkit state under .lwpt/ is excluded by default even when a
+    [package].units entry seeds it. An explicit [format].include match
+    overrides that default, while [format].exclude remains the final
+    subtraction. Runs the full CmdFormat composition in check mode. }
+  TFormatToolkitStateDefault = class(TTestSuite)
   private
     FOrigDir, FScratch: string;
+    FCaseDistinctFilesSupported: Boolean;
   protected
     procedure BeforeAll; override;
     procedure AfterAll;  override;
   public
     procedure SetupTests; override;
-    procedure TestSeededHiddenFileIsInScopeWithoutExclude;
-    procedure TestExcludeCarvesUnitsSeededHiddenFile;
+    procedure TestSeededToolkitStateIsExcludedByDefault;
+    procedure TestExplicitIncludeOverridesDefaultExclusion;
+    procedure TestExplicitExcludeStillWinsOverInclude;
+    procedure TestExplicitIncludeMatchIsCaseSensitive;
   end;
 
 const
@@ -124,6 +123,22 @@ end;
 function Contains(const AHaystack, ANeedle: string): Boolean;
 begin
   Result := Pos(ANeedle, AHaystack) > 0;
+end;
+
+function DirectoryHasExactEntry(const ADir, AName: string): Boolean;
+var
+  SearchRec: TSearchRec;
+begin
+  Result := False;
+  if FindFirst(IncludeTrailingPathDelimiter(ADir) + '*', faAnyFile,
+    SearchRec) <> 0 then Exit;
+  try
+    repeat
+      if SearchRec.Name = AName then Exit(True);
+    until FindNext(SearchRec) <> 0;
+  finally
+    FindClose(SearchRec);
+  end;
 end;
 
 { ───────── TFormatIdempotence ─────────
@@ -604,9 +619,9 @@ begin
     TestWildcardSegmentsStillSkipHiddenDirs);
 end;
 
-{ ───────── TFormatUnitsSeedExclude ───────── }
+{ ───────── TFormatToolkitStateDefault ───────── }
 
-procedure TFormatUnitsSeedExclude.BeforeAll;
+procedure TFormatToolkitStateDefault.BeforeAll;
 const
   NEEDS_FORMAT =
     'unit Vendored;'#10#10
@@ -627,64 +642,107 @@ const
 begin
   FOrigDir  := GetCurrentDir;
   FScratch  := ExpandFileName(
-    FOrigDir + '/build/tests/fixtures/format-units-exclude');
+    FOrigDir + '/build/tests/fixtures/format-toolkit-state-default');
 
-  { Same project twice: one manifest with the exclude, one without.
-    The exclude-less variant proves the vendored file genuinely needs
-    formatting AND is seeded into scope by [package].units — so the
-    exclude test can't pass vacuously. }
-  WriteTextFile(FScratch + '/lwpt.toml',
+  { All variants seed the toolkit-state source via [package].units.
+    The source genuinely needs formatting, so exit 0 proves exclusion
+    and exit 1 proves the explicit-include override reached it. }
+  WriteTextFile(FScratch + '/default.toml',
       '[package]'#10
-    + 'name = "format-units-exclude"'#10
+    + 'name = "format-toolkit-state-default"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src", ".lwpt/modules/dep/source"]'#10);
+  WriteTextFile(FScratch + '/include.toml',
+      '[package]'#10
+    + 'name = "format-toolkit-state-include"'#10
     + 'version = "0.0.0"'#10
     + 'units = ["src", ".lwpt/modules/dep/source"]'#10
     + #10
     + '[format]'#10
-    + 'exclude = [".lwpt/**"]'#10);
-  WriteTextFile(FScratch + '/lwpt-noexclude.toml',
+    + 'include = [".lwpt/modules/**"]'#10);
+  WriteTextFile(FScratch + '/include-exclude.toml',
       '[package]'#10
-    + 'name = "format-units-exclude"'#10
+    + 'name = "format-toolkit-state-include-exclude"'#10
     + 'version = "0.0.0"'#10
-    + 'units = ["src", ".lwpt/modules/dep/source"]'#10);
+    + 'units = ["src", ".lwpt/modules/dep/source"]'#10
+    + #10
+    + '[format]'#10
+    + 'include = [".lwpt/modules/**"]'#10
+    + 'exclude = [".lwpt/**"]'#10);
+  WriteTextFile(FScratch + '/case-sensitive.toml',
+      '[package]'#10
+    + 'name = "format-toolkit-state-case-sensitive"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src", ".lwpt/case/source"]'#10
+    + #10
+    + '[format]'#10
+    + 'include = [".lwpt/case/source/Included.pas"]'#10);
   WriteTextFile(FScratch + '/src/Good.pas', ALREADY_FORMATTED);
   WriteTextFile(FScratch + '/.lwpt/modules/dep/source/Vendored.pas',
     NEEDS_FORMAT);
+  WriteTextFile(FScratch + '/.lwpt/case/source/Included.pas',
+    ALREADY_FORMATTED);
+  WriteTextFile(FScratch + '/.lwpt/case/source/included.pas',
+    NEEDS_FORMAT);
+  FCaseDistinctFilesSupported :=
+    DirectoryHasExactEntry(FScratch + '/.lwpt/case/source', 'Included.pas')
+    and DirectoryHasExactEntry(FScratch + '/.lwpt/case/source',
+      'included.pas');
 
   SetCurrentDir(FScratch);
 end;
 
-procedure TFormatUnitsSeedExclude.AfterAll;
+procedure TFormatToolkitStateDefault.AfterAll;
 begin
   SetCurrentDir(FOrigDir);
 end;
 
-procedure TFormatUnitsSeedExclude.TestSeededHiddenFileIsInScopeWithoutExclude;
+procedure TFormatToolkitStateDefault.TestSeededToolkitStateIsExcludedByDefault;
 begin
-  { Sanity: the units seed reaches into .lwpt/ and the vendored file
-    needs formatting — check mode exits 1. }
-  Expect<Integer>(CmdFormat('lwpt-noexclude.toml', True)).ToBe(1);
+  Expect<Integer>(CmdFormat('default.toml', True)).ToBe(0);
 end;
 
-procedure TFormatUnitsSeedExclude.TestExcludeCarvesUnitsSeededHiddenFile;
+procedure TFormatToolkitStateDefault.TestExplicitIncludeOverridesDefaultExclusion;
 begin
-  { With exclude = [".lwpt/**"] the seeded vendored file leaves the
-    scope; only the already-formatted src/Good.pas remains → exit 0. }
-  Expect<Integer>(CmdFormat('lwpt.toml', True)).ToBe(0);
+  Expect<Integer>(CmdFormat('include.toml', True)).ToBe(1);
 end;
 
-procedure TFormatUnitsSeedExclude.SetupTests;
+procedure TFormatToolkitStateDefault.TestExplicitExcludeStillWinsOverInclude;
 begin
-  Test('units seed reaching into .lwpt/ is in scope without exclude',
-    TestSeededHiddenFileIsInScopeWithoutExclude);
-  Test('[format].exclude carves units-seeded files out of scope',
-    TestExcludeCarvesUnitsSeededHiddenFile);
+  Expect<Integer>(CmdFormat('include-exclude.toml', True)).ToBe(0);
+end;
+
+procedure TFormatToolkitStateDefault.TestExplicitIncludeMatchIsCaseSensitive;
+begin
+  { Case-insensitive filesystems cannot hold both fixture paths. Linux CI
+    exercises the full regression; other platforms report the limitation. }
+  if not FCaseDistinctFilesSupported then
+  begin
+    WriteLn('  case-distinct path behavior not exercised: filesystem is case-insensitive');
+    Expect<Boolean>(FCaseDistinctFilesSupported).ToBe(False);
+    Exit;
+  end;
+
+  Expect<Integer>(CmdFormat('case-sensitive.toml', True)).ToBe(0);
+end;
+
+procedure TFormatToolkitStateDefault.SetupTests;
+begin
+  Test('units-seeded .lwpt source is excluded by default',
+    TestSeededToolkitStateIsExcludedByDefault);
+  Test('explicit include overrides the .lwpt default exclusion',
+    TestExplicitIncludeOverridesDefaultExclusion);
+  Test('explicit exclude still wins over an explicit include',
+    TestExplicitExcludeStillWinsOverInclude);
+  Test('explicit include provenance is case-sensitive',
+    TestExplicitIncludeMatchIsCaseSensitive);
 end;
 
 begin
   TestRunnerProgram.AddSuite(TFormatIdempotence.Create(PROJECT_NAME + '.Formatter: idempotence'));
   TestRunnerProgram.AddSuite(TFormatParamRename.Create(PROJECT_NAME + '.Formatter: param-rename regression'));
   TestRunnerProgram.AddSuite(TFormatScopeExpansion.Create(PROJECT_NAME + '.Formatter: scope expansion (ADR-0007)'));
-  TestRunnerProgram.AddSuite(TFormatUnitsSeedExclude.Create(PROJECT_NAME + '.Formatter: [format].exclude vs units seed'));
+  TestRunnerProgram.AddSuite(TFormatToolkitStateDefault.Create(PROJECT_NAME + '.Formatter: toolkit-state default'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

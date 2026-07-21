@@ -1,6 +1,6 @@
 # Code style
 
-Naming, file layout, formatter rules, manifest-declared formatter scope, line-ending normalisation. The conventions inherited from `native-nostalgia-stack` plus the LWPT-specific additions that crystallised over the spike-to-production work.
+Naming, file layout, formatter rules, manifest scope with protected toolkit state, line-ending normalisation. The conventions inherited from `native-nostalgia-stack` plus the LWPT-specific additions that crystallised over the spike-to-production work.
 
 ## Executive Summary
 
@@ -8,7 +8,7 @@ Naming, file layout, formatter rules, manifest-declared formatter scope, line-en
 - **The project name lives in two constants.** `PROGRAM_NAME = 'lwpt'` (lowercase Unix convention; derives filenames and shell commands) and `PROJECT_NAME = 'LWPT'` (uppercase acronym in prose). See [ADR-0001](./adr/0001-program-name-as-constant.md). Never hardcode either spelling.
 - **LWPT-internal units use the dotted `LWPT.<Subsys>.pas` form.** Workspace packages under `packages/<name>/source/` follow their own naming (see [`packages.md`](./packages.md)). The "Packages own their contents" Hard Constraint in `AGENTS.md` keeps the root LWPT formatter + reviewers out of package source.
 - **`lwpt format` is the canonical formatter.** No-flag invocation rewrites in place; `--check` is the CI / pre-commit mode. Rules are encoded in the Pascal source of `LWPT.Formatter`, not in a config file.
-- **Formatter scope is manifest-declared** (`[package].units` + `[format].include` minus `[format].exclude`). Globs supported; recursion is explicit via `**`. See [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) for the resolution algorithm. Root LWPT's `[format].include` covers `tests/integration/`, `tests/support/`, `tests/e2e/`, and every workspace package (`packages/**/*.{pas,inc}`) so the canonical style applies across the monorepo. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)'s root-owns-unless-overridden model, a workspace package can opt out by declaring its own `[format]` section in `packages/<name>/lwpt.toml`.
+- **Formatter scope is manifest-declared with one safety boundary**: `[package].units` + `[format].include`, root `.lwpt/**` excluded unless explicitly included, then `[format].exclude`. Globs are supported; recursion is explicit via `**`. See [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) and [ADR-0026](./adr/0026-default-toolkit-state-format-exclusion.md). Root LWPT's `[format].include` covers `tests/integration/`, `tests/support/`, `tests/e2e/`, and every workspace package (`packages/**/*.{pas,inc}`) so the canonical style applies across the monorepo. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)'s root-owns-unless-overridden model, a workspace package can opt out by declaring its own `[format]` section in `packages/<name>/lwpt.toml`.
 - **Line endings: LF everywhere, trailing whitespace stripped.** The two scope additions from Q8; both are zero-controversy.
 
 ## Naming
@@ -121,10 +121,11 @@ What the formatter does *not* do (today):
 
 ### Scope: include + exclude
 
-The format scope is composed declaratively in the manifest. Full spec in [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md); the short version:
+The format scope is composed from the manifest plus the toolkit-state safety boundary. Full spec in [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) and [ADR-0026](./adr/0026-default-toolkit-state-format-exclusion.md); the short version:
 
 - **Seed**: `[package].units` (each dir, non-recursive, formattable extensions only).
 - **Add**: `[format].include` — array of globs added on top of the seed.
+- **Protect**: root `.lwpt/**` — excluded unless a matching explicit include added the file.
 - **Subtract**: `[format].exclude` — array of globs removed from the resolved set.
 
 Formattable extensions: `.pas`, `.inc`, `.dpr`, `.lpr`.
@@ -165,12 +166,14 @@ Plain dir names are shorthand for `<dir>/*.{pas,inc,dpr,lpr}` — **top-level on
 | Literal path that doesn't exist | Hard error (`EManifestError`) — literals assert presence |
 | Glob with zero matches | Silent — globs validly resolve to nothing |
 | Hidden file/dir reached via a wildcard segment (`*`, `**`, `?`) | Skipped (matches shell convention) |
-| Hidden file/dir named explicitly by a dot-prefixed segment (`.lwpt/**`) | Matched — naming the dot opts in (shell convention; lets `exclude = [".lwpt/**"]` carve out `[package].units` entries that point into `.lwpt/`) |
+| Hidden file/dir named explicitly by a dot-prefixed segment (`.cache/**`) | Matched — naming the dot opts in under the shell convention |
+| File under root `.lwpt/**` contributed only by `[package].units` | Excluded by default to protect committed toolkit state |
+| File under root `.lwpt/**` matched by `[format].include` | Added explicitly; the default exclusion is overridden |
 | Case sensitivity | Case-sensitive everywhere |
 
 #### Composition
 
-Include defines the set; exclude subtracts. There's no precedence game beyond that: every file the include resolution produces is checked against the exclude resolution and removed if matched. Re-running `lwpt format` against an unchanged tree is a no-op (covered by `LWPT.Formatter.Test`'s idempotence suite).
+The units seed and includes define the candidate set. Files under root `.lwpt/**` then leave the set unless an explicit include matched them. Explicit excludes subtract last and therefore still remove a file that was also explicitly included. Re-running `lwpt format` against an unchanged tree is a no-op (covered by `LWPT.Formatter.Test`'s idempotence suite).
 
 Paths are resolved relative to the project root (where `lwpt.toml` lives). Absolute paths in `include` / `exclude` are not supported in v1.
 
