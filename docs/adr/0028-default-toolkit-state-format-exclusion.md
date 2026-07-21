@@ -1,8 +1,10 @@
 # Formatter excludes toolkit state by default, with explicit include override
 
 ADR-0007 established manifest-declared format scope as `[package].units` plus
-`[format].include`, minus `[format].exclude`. This ADR narrows that rule for the
-project-root `.lwpt/` namespace defined by ADR-0002: files under `.lwpt/**` are
+`[format].include`, minus `[format].exclude`. This ADR narrows that rule for
+LWPT-owned toolkit state: files under the project-root `.lwpt/` namespace
+defined by ADR-0002 — and under any `[lwpt]` `modules-dir` / `archives-dir` /
+`tmp-dir` / `cfg-file` override path, which may sit outside `.lwpt/` — are
 excluded from `lwpt format` by default, including files contributed by
 `[package].units`. A matching explicit `[format].include` opts those files back
 in; a matching explicit `[format].exclude` remains the final subtraction and

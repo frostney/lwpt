@@ -33,7 +33,10 @@ uses
   The scope is composed declaratively from the manifest:
     seed     = [package].units (each as plain dir, non-recursive)
     add      = [format].include (globs)
-    protect  = .lwpt/** unless matched by an explicit include
+    protect  = toolkit state (.lwpt/** plus any [lwpt] modules-dir /
+               archives-dir / tmp-dir / cfg-file override paths, which
+               may sit outside .lwpt/) unless matched by an explicit
+               include
     subtract = [format].exclude (globs)
 
   Glob syntax:
@@ -273,9 +276,27 @@ function CmdFormat(const AManifestPath: string; ACheckOnly: Boolean): Integer;
 var
   Man : TManifest;
   Files, ExplicitIncludeSet, ExcludeSet, FinalFiles : TStringList;
+  ProtectedRoots : TStringList;
   i, Changed : Integer;
-  Path, ToolkitStateRoot : string;
+  Path, ProtectedCfgFile : string;
   RunMode : TRunMode;
+
+  procedure AddProtectedRoot(const ADir: string);
+  begin
+    if ADir = '' then Exit;
+    ProtectedRoots.Add(IncludeTrailingPathDelimiter(ExpandFileName(ADir)));
+  end;
+
+  function IsToolkitStatePath(const AAbsPath: string): Boolean;
+  var r: Integer;
+  begin
+    if AAbsPath = ProtectedCfgFile then Exit(True);
+    for r := 0 to ProtectedRoots.Count - 1 do
+      if Copy(AAbsPath, 1, Length(ProtectedRoots[r])) = ProtectedRoots[r] then
+        Exit(True);
+    Result := False;
+  end;
+
 begin
   Man := LoadManifest(AManifestPath);
 
@@ -288,6 +309,7 @@ begin
   ExplicitIncludeSet := TStringList.Create;
   ExcludeSet         := TStringList.Create;
   FinalFiles         := TStringList.Create;
+  ProtectedRoots     := TStringList.Create;
   try
     { Paths and globs are case-sensitive on every platform (ADR-0007).
       TStringList defaults to case-insensitive lookup, so make the
@@ -296,6 +318,7 @@ begin
     ExplicitIncludeSet.CaseSensitive := True;
     ExcludeSet.CaseSensitive         := True;
     FinalFiles.CaseSensitive         := True;
+    ProtectedRoots.CaseSensitive     := True;
 
     { Seed: [package].units (non-recursive — see ADR-0007). }
     for i := 0 to High(Man.Units) do
@@ -319,13 +342,20 @@ begin
     DedupAbsolutePaths(Files);
     DedupAbsolutePaths(ExplicitIncludeSet);
     DedupAbsolutePaths(ExcludeSet);
-    ToolkitStateRoot := IncludeTrailingPathDelimiter(ExpandFileName(LWPT_DIR));
+
+    { [lwpt] can redirect any of these outside .lwpt/, so each resolved
+      path is protected individually alongside the fixed root. }
+    AddProtectedRoot(LWPT_DIR);
+    AddProtectedRoot(ResolveModulesDir(Man));
+    AddProtectedRoot(ResolveArchivesDir(Man));
+    AddProtectedRoot(ResolveTmpDir(Man));
+    ProtectedCfgFile := ExpandFileName(ResolveCfgFile(Man));
 
     for i := 0 to Files.Count - 1 do
     begin
       Path := Files[i];
       if ExcludeSet.IndexOf(Path) >= 0 then Continue;
-      if (Copy(Path, 1, Length(ToolkitStateRoot)) = ToolkitStateRoot)
+      if IsToolkitStatePath(Path)
          and (ExplicitIncludeSet.IndexOf(Path) < 0) then Continue;
       FinalFiles.Add(Path);
     end;
@@ -376,6 +406,7 @@ begin
     ExplicitIncludeSet.Free;
     ExcludeSet.Free;
     FinalFiles.Free;
+    ProtectedRoots.Free;
   end;
 end;
 

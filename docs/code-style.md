@@ -125,7 +125,7 @@ The format scope is composed from the manifest plus the toolkit-state safety bou
 
 - **Seed**: `[package].units` (each dir, non-recursive, formattable extensions only).
 - **Add**: `[format].include` — array of globs added on top of the seed.
-- **Protect**: root `.lwpt/**` — excluded unless a matching explicit include added the file.
+- **Protect**: toolkit state — root `.lwpt/**` plus any `[lwpt]` `modules-dir` / `archives-dir` / `tmp-dir` / `cfg-file` override paths (which may sit outside `.lwpt/`) — excluded unless a matching explicit include added the file.
 - **Subtract**: `[format].exclude` — array of globs removed from the resolved set.
 
 Formattable extensions: `.pas`, `.inc`, `.dpr`, `.lpr`.

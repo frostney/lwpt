@@ -58,10 +58,12 @@ type
     procedure TestWildcardSegmentsStillSkipHiddenDirs;
   end;
 
-  { Toolkit state under .lwpt/ is excluded by default even when a
-    [package].units entry seeds it. An explicit [format].include match
-    overrides that default, while [format].exclude remains the final
-    subtraction. Runs the full CmdFormat composition in check mode. }
+  { Toolkit state is excluded by default even when a [package].units
+    entry seeds it — both the fixed .lwpt/ root and any [lwpt]
+    modules-dir / archives-dir / tmp-dir / cfg-file override paths that
+    sit outside it. An explicit [format].include match overrides that
+    default, while [format].exclude remains the final subtraction. Runs
+    the full CmdFormat composition in check mode. }
   TFormatToolkitStateDefault = class(TTestSuite)
   private
     FOrigDir, FScratch: string;
@@ -75,6 +77,8 @@ type
     procedure TestExplicitIncludeOverridesDefaultExclusion;
     procedure TestExplicitExcludeStillWinsOverInclude;
     procedure TestExplicitIncludeMatchIsCaseSensitive;
+    procedure TestOverriddenModulesDirIsExcludedByDefault;
+    procedure TestExplicitIncludeOverridesOverriddenModulesDir;
   end;
 
 const
@@ -677,8 +681,29 @@ begin
     + #10
     + '[format]'#10
     + 'include = [".lwpt/case/source/Included.pas"]'#10);
+  WriteTextFile(FScratch + '/override.toml',
+      '[package]'#10
+    + 'name = "format-toolkit-state-override"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src", "vendor/modules/dep/source"]'#10
+    + #10
+    + '[lwpt]'#10
+    + 'modules-dir = "vendor/modules"'#10);
+  WriteTextFile(FScratch + '/override-include.toml',
+      '[package]'#10
+    + 'name = "format-toolkit-state-override-include"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src", "vendor/modules/dep/source"]'#10
+    + #10
+    + '[lwpt]'#10
+    + 'modules-dir = "vendor/modules"'#10
+    + #10
+    + '[format]'#10
+    + 'include = ["vendor/modules/**"]'#10);
   WriteTextFile(FScratch + '/src/Good.pas', ALREADY_FORMATTED);
   WriteTextFile(FScratch + '/.lwpt/modules/dep/source/Vendored.pas',
+    NEEDS_FORMAT);
+  WriteTextFile(FScratch + '/vendor/modules/dep/source/Vendored.pas',
     NEEDS_FORMAT);
   WriteTextFile(FScratch + '/.lwpt/case/source/Included.pas',
     ALREADY_FORMATTED);
@@ -726,6 +751,18 @@ begin
   Expect<Integer>(CmdFormat('case-sensitive.toml', True)).ToBe(0);
 end;
 
+procedure TFormatToolkitStateDefault.TestOverriddenModulesDirIsExcludedByDefault;
+begin
+  { [lwpt] modules-dir points outside .lwpt/; the redirected toolkit
+    state must be protected exactly like the fixed root. }
+  Expect<Integer>(CmdFormat('override.toml', True)).ToBe(0);
+end;
+
+procedure TFormatToolkitStateDefault.TestExplicitIncludeOverridesOverriddenModulesDir;
+begin
+  Expect<Integer>(CmdFormat('override-include.toml', True)).ToBe(1);
+end;
+
 procedure TFormatToolkitStateDefault.SetupTests;
 begin
   Test('units-seeded .lwpt source is excluded by default',
@@ -736,6 +773,10 @@ begin
     TestExplicitExcludeStillWinsOverInclude);
   Test('explicit include provenance is case-sensitive',
     TestExplicitIncludeMatchIsCaseSensitive);
+  Test('overridden [lwpt] modules-dir outside .lwpt is excluded by default',
+    TestOverriddenModulesDirIsExcludedByDefault);
+  Test('explicit include overrides the overridden modules-dir exclusion',
+    TestExplicitIncludeOverridesOverriddenModulesDir);
 end;
 
 begin

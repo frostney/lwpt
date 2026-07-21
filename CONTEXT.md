@@ -175,7 +175,7 @@ A LWPT design choice that adopts a value vocabulary co-developed with GocciaScri
 ### Formatter
 
 **Format scope**:
-The set of files `lwpt format` (and `--check`) processes for a project. The seed is `[package].units`, additions come from `[format].include`, toolkit state under the project-root `.lwpt/` is protected by default unless an explicit include matches it, and subtractions come from `[format].exclude`. There is no implicit project-shape convention beyond the toolkit-state safety boundary.
+The set of files `lwpt format` (and `--check`) processes for a project. The seed is `[package].units`, additions come from `[format].include`, toolkit state (the project-root `.lwpt/` plus any `[lwpt]` override paths) is protected by default unless an explicit include matches it, and subtractions come from `[format].exclude`. There is no implicit project-shape convention beyond the toolkit-state safety boundary.
 *Avoid*: "format target" (overloaded with `[targets]`), "format paths" alone (ambiguous about files vs dirs), "files to format" (incomplete — it's a set, not a list).
 
 **Glob**:
@@ -183,7 +183,7 @@ A path pattern used in `[format].include` / `[format].exclude` entries. Syntax: 
 *Avoid*: "regex", "pattern" alone (too generic), "wildcard" (informally fine, but `**` isn't a wildcard in shell tradition — it's a globstar).
 
 **Include / exclude**:
-The composition primitives for format scope. `include` adds globs to the working set and is the explicit override for the default `.lwpt/**` protection; `exclude` removes globs last, including files also named by an include. Both arrays accept files and dirs (via globs); both follow the same recursion rule (explicit via `**`).
+The composition primitives for format scope. `include` adds globs to the working set and is the explicit override for the default toolkit-state protection; `exclude` removes globs last, including files also named by an include. Both arrays accept files and dirs (via globs); both follow the same recursion rule (explicit via `**`).
 *Avoid*: "allowlist / denylist" (suggests gatekeeping; format scope is just set arithmetic), "ignore" (associates with `.gitignore` semantics, which are different).
 
 ### Vendored & graduation
