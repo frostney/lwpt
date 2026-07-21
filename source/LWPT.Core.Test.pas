@@ -562,6 +562,10 @@ procedure THashTreePaths.TestCanonicalPathReplacesSourceDelimiter;
 begin
   Expect<string>(CanonicalTreeHashPath('nested\file.txt', '\'))
     .ToBe('nested' + TREE_HASH_PATH_SEPARATOR + 'file.txt');
+  { A backslash is a legal filename character on POSIX: with '/' as the
+    source delimiter it must survive canonicalisation untouched. }
+  Expect<string>(CanonicalTreeHashPath('nested\file.txt', '/'))
+    .ToBe('nested\file.txt');
 end;
 
 procedure THashTreePaths.SetupTests;
