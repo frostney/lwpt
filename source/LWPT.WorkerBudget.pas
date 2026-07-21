@@ -21,6 +21,7 @@ uses
 const
   WORKER_BUDGET_ENV = PROJECT_NAME + '_WORKER_BUDGET';
   WORKER_STATE_DIR_ENV = PROJECT_NAME + '_WORKER_STATE_DIR';
+  WORKER_STATE_FALLBACK_DIR = LWPT_DIR + '/workers';
   WORKER_STALE_SECONDS_ENV = PROJECT_NAME
     + '_WORKER_LEASE_STALE_SECONDS';
   WORKER_LEASE_TOKEN_ENV = PROJECT_NAME + '_WORKER_LEASE_TOKEN';
@@ -197,6 +198,9 @@ type
 
 var
   WorkerStateCriticalSection : TRTLCriticalSection;
+  WorkerStateRootCriticalSection : TRTLCriticalSection;
+  ResolvedWorkerStateRoot : string;
+  WorkerStateRootResolved : Boolean = False;
   LocalOwnerCriticalSection : TRTLCriticalSection;
   LocalOwnerSessions : TStringList;
   SessionCounter : Integer = 0;
@@ -321,12 +325,70 @@ begin
           + MilliSecondOfTheSecond(Current);
 end;
 
-function WorkerStateRoot: string;
+function DefaultWorkerStateRootWritable(const ARoot: string): Boolean;
+var
+  LockPath : string;
+  {$IFDEF UNIX}
+  Descriptor : LongInt;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Handle : THandle;
+  {$ENDIF}
 begin
-  Result := SysUtils.GetEnvironmentVariable(WORKER_STATE_DIR_ENV);
-  if Result = '' then
-    Result := IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers';
-  Result := ExcludeTrailingPathDelimiter(ExpandFileName(Result));
+  Result := ForceDirectories(ARoot) or DirectoryExists(ARoot);
+  if not Result then Exit;
+  LockPath := IncludeTrailingPathDelimiter(ARoot) + TRANSACTION_LOCK_FILE;
+  {$IFDEF UNIX}
+  Descriptor := FpOpen(PChar(LockPath), O_RDWR or O_CREAT, &600);
+  Result := Descriptor >= 0;
+  if Result then FpClose(Descriptor);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Handle := CreateFileW(PWideChar(UnicodeString(LockPath)),
+    GENERIC_READ or GENERIC_WRITE,
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+    nil, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  Result := Handle <> THandle(INVALID_HANDLE_VALUE);
+  if Result then CloseHandle(Handle);
+  {$ENDIF}
+end;
+
+function WorkerStateRoot: string;
+var
+  ConfiguredRoot, DefaultRoot : string;
+begin
+  EnterCriticalSection(WorkerStateRootCriticalSection);
+  try
+    if not WorkerStateRootResolved then
+    begin
+      ConfiguredRoot := SysUtils.GetEnvironmentVariable(
+        WORKER_STATE_DIR_ENV);
+      if ConfiguredRoot <> '' then
+        ResolvedWorkerStateRoot := ExcludeTrailingPathDelimiter(
+          ExpandFileName(ConfiguredRoot))
+      else
+      begin
+        DefaultRoot := ExcludeTrailingPathDelimiter(ExpandFileName(
+          IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers'));
+        if DefaultWorkerStateRootWritable(DefaultRoot) then
+          ResolvedWorkerStateRoot := DefaultRoot
+        else
+        begin
+          ResolvedWorkerStateRoot := ExcludeTrailingPathDelimiter(
+            ExpandFileName(WORKER_STATE_FALLBACK_DIR));
+          WriteLn(ErrOutput,
+            'warning: worker state default is unwritable; using ',
+            ResolvedWorkerStateRoot,
+            '; cross-worktree budget sharing is forfeited for this invocation; ',
+            'override with ', WORKER_STATE_DIR_ENV);
+        end;
+      end;
+      WorkerStateRootResolved := True;
+    end;
+    Result := ResolvedWorkerStateRoot;
+  finally
+    LeaveCriticalSection(WorkerStateRootCriticalSection);
+  end;
 end;
 
 function StatePath(const AName: string): string;
@@ -1852,12 +1914,15 @@ begin
     raise ELWPTWorkerBudgetError.Create(
       'worker lease environment target is required');
   for i := AEnvironment.Count - 1 downto 0 do
-    if SameText(EnvironmentName(AEnvironment[i]), WORKER_LEASE_TOKEN_ENV) then
+    if SameText(EnvironmentName(AEnvironment[i]), WORKER_LEASE_TOKEN_ENV)
+       or SameText(EnvironmentName(AEnvironment[i]),
+         WORKER_STATE_DIR_ENV) then
       AEnvironment.Delete(i);
   if (ALease = nil) or (ALease.FOwner = nil) then
     raise ELWPTWorkerBudgetError.Create(
       'active worker lease is required for delegation');
   Token := ALease.FOwner.CreateDelegation(ALease);
+  AEnvironment.Add(WORKER_STATE_DIR_ENV + '=' + WorkerStateRoot);
   AEnvironment.Add(WORKER_LEASE_TOKEN_ENV + '=' + Token);
 end;
 
@@ -1935,12 +2000,14 @@ end;
 
 initialization
   InitCriticalSection(WorkerStateCriticalSection);
+  InitCriticalSection(WorkerStateRootCriticalSection);
   InitCriticalSection(LocalOwnerCriticalSection);
   LocalOwnerSessions := TStringList.Create;
 
 finalization
   LocalOwnerSessions.Free;
   DoneCriticalSection(LocalOwnerCriticalSection);
+  DoneCriticalSection(WorkerStateRootCriticalSection);
   DoneCriticalSection(WorkerStateCriticalSection);
 
 end.

@@ -8,6 +8,7 @@ program LWPT.WorkerBudget.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
   Process,
@@ -16,6 +17,7 @@ uses
   LWPT.Core,
   LWPT.WorkerBudget,
   TestingPascalLibrary,
+  Tests.LwptSubprocess,
   Tests.Scratch;
 
 const
@@ -34,11 +36,21 @@ const
   DELEGATION_RELEASE_SWITCH = '--worker-budget-delegation-release';
   SNAPSHOT_SWITCH = '--worker-budget-snapshot';
   REPAIR_SWITCH = '--worker-budget-repair';
+  STATE_ROOT_FALLBACK_SWITCH = '--worker-state-root-fallback';
+  STATE_ROOT_FALLBACK_DELEGATION_SWITCH =
+    '--worker-state-root-fallback-delegation';
+  STATE_ROOT_EXPLICIT_SWITCH = '--worker-state-root-explicit';
+  STATE_ROOT_PROBE_SWITCH = '--worker-state-root-probe';
   TEST_BUDGET = '1';
   TEST_STALE_SECONDS = '3';
   WAIT_TIMEOUT_MILLISECONDS = 10000;
 
 type
+  TStateRootUtilityResult = record
+    ExitCode : Integer;
+    Stderr : string;
+  end;
+
   TLeaseThread = class(TThread)
   private
     FSession : TLWPTWorkerBudgetSession;
@@ -86,6 +98,12 @@ type
     procedure TestParentReleaseDoesNotCreateGhostGrant;
     procedure TestReleaseRetriesAfterWriteFailure;
     procedure TestSessionSupportsConcurrentSchedulerThreads;
+    procedure TestConcurrentFirstProbesUseDefaultRoot;
+    {$IFDEF UNIX}
+    procedure TestDelegationPreservesFallbackRootAcrossWorkingDirectories;
+    procedure TestUnwritableDefaultFallsBackOnce;
+    procedure TestUnwritableExplicitRootFails;
+    {$ENDIF}
   end;
 
 constructor TLeaseThread.Create(ASession: TLWPTWorkerBudgetSession);
@@ -202,7 +220,120 @@ var
   Reclaimed : Integer;
   Child, FirstChild, SecondChild : TProcess;
   FirstThread, SecondThread : TLeaseThread;
+  {$IFDEF UNIX}
+  DefaultRoot : string;
+  {$ENDIF}
 begin
+  if (ParamCount = 4) and (ParamStr(1) = STATE_ROOT_PROBE_SWITCH) then
+  begin
+    ForceDirectories(GetAppConfigDir(False));
+    WriteMarker(ParamStr(3), 'ready');
+    while not FileExists(ParamStr(4)) do Sleep(25);
+    Lines := TStringList.Create;
+    try
+      Lines.Add('root=' + WorkerStateRoot);
+      Lines.SaveToFile(ParamStr(2));
+    finally
+      Lines.Free;
+    end;
+    ExitCode := 0;
+    Exit(True);
+  end;
+
+  {$IFDEF UNIX}
+  if (ParamCount = 2) and (ParamStr(1) = STATE_ROOT_FALLBACK_SWITCH) then
+  begin
+    DefaultRoot := ExcludeTrailingPathDelimiter(ExpandFileName(
+      IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers'));
+    if not ForceDirectories(DefaultRoot) then
+      raise Exception.CreateFmt(
+        'could not create default worker-state test root %s', [DefaultRoot]);
+    if FpChmod(DefaultRoot, &555) <> 0 then
+      raise Exception.CreateFmt(
+        'could not make default worker-state test root read-only: %s',
+        [DefaultRoot]);
+    Session := nil;
+    Lease := nil;
+    Lines := TStringList.Create;
+    try
+      Lines.Add('root-first=' + WorkerStateRoot);
+      Lines.Add('root-second=' + WorkerStateRoot);
+      Session := TLWPTWorkerBudgetSession.Create('fallback-root', 1);
+      Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+      Lines.Add('acquired=' + BoolToStr(Lease <> nil, True));
+      Lines.SaveToFile(ParamStr(2));
+    finally
+      Lease.Free;
+      Session.Free;
+      Lines.Free;
+      FpChmod(DefaultRoot, &755);
+    end;
+    ExitCode := 0;
+    Exit(True);
+  end;
+
+  if (ParamCount = 3)
+     and (ParamStr(1) = STATE_ROOT_FALLBACK_DELEGATION_SWITCH) then
+  begin
+    DefaultRoot := ExcludeTrailingPathDelimiter(ExpandFileName(
+      IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers'));
+    if not ForceDirectories(DefaultRoot) then
+      raise Exception.CreateFmt(
+        'could not create default worker-state test root %s', [DefaultRoot]);
+    if FpChmod(DefaultRoot, &555) <> 0 then
+      raise Exception.CreateFmt(
+        'could not make default worker-state test root read-only: %s',
+        [DefaultRoot]);
+    Session := nil;
+    Lease := nil;
+    Child := nil;
+    Lines := TStringList.Create;
+    try
+      Session := TLWPTWorkerBudgetSession.Create(
+        'fallback-delegation-parent', 1);
+      Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+      ChildOutput := ParamStr(2) + '.child';
+      Child := TProcess.Create(nil);
+      Child.Executable := ExpandFileName(ParamStr(0));
+      Child.Parameters.Add(NESTED_CHILD_SWITCH);
+      Child.Parameters.Add(ChildOutput);
+      Child.CurrentDirectory := ParamStr(3);
+      AppendProcessEnvironment(Child.Environment);
+      Child.Environment.Add(WORKER_STATE_DIR_ENV + '=stale-root');
+      AppendWorkerLeaseEnvironment(Child.Environment, Lease);
+      Lines.Add('parent-root=' + WorkerStateRoot);
+      Lines.Add('child-environment-root=' + EnvValue(
+        Child.Environment, WORKER_STATE_DIR_ENV));
+      Child.Options := [poWaitOnExit];
+      Child.Execute;
+      Lines.Add('child-exit=' + IntToStr(Child.ExitStatus));
+      Lines.Add('child-output=' + ChildOutput);
+      Lines.SaveToFile(ParamStr(2));
+    finally
+      Child.Free;
+      Lease.Free;
+      Session.Free;
+      Lines.Free;
+      FpChmod(DefaultRoot, &755);
+    end;
+    ExitCode := 0;
+    Exit(True);
+  end;
+  {$ENDIF}
+
+  if (ParamCount = 2) and (ParamStr(1) = STATE_ROOT_EXPLICIT_SWITCH) then
+  begin
+    Session := TLWPTWorkerBudgetSession.Create('explicit-root', 1);
+    try
+      Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+      Lease.Free;
+    finally
+      Session.Free;
+    end;
+    ExitCode := 0;
+    Exit(True);
+  end;
+
   if (ParamCount = 2) and (ParamStr(1) = SNAPSHOT_SWITCH) then
   begin
     Snapshot := GetWorkerBudgetSnapshot;
@@ -539,6 +670,7 @@ begin
       Lines.Add('acquired=' + BoolToStr(Lease <> nil, True));
       Lines.Add('active=' + IntToStr(Snapshot.ActiveWorkers));
       Lines.Add('entries=' + IntToStr(Length(Snapshot.Entries)));
+      Lines.Add('root=' + WorkerStateRoot);
       Lines.Add('token-cleared=' + BoolToStr(
         GetEnvironmentVariable(WORKER_LEASE_TOKEN_ENV) = '', True));
       Lease.Release;
@@ -758,6 +890,97 @@ begin
   finally
     Utility.Free;
   end;
+end;
+
+function ReadProcessStream(AStream: TStream): string;
+const
+  CHUNK_SIZE = 4096;
+var
+  Buffer : array[0..CHUNK_SIZE - 1] of Byte;
+  Count, Total : Integer;
+begin
+  Result := '';
+  Total := 0;
+  repeat
+    Count := AStream.Read(Buffer, SizeOf(Buffer));
+    if Count > 0 then
+    begin
+      SetLength(Result, Total + Count);
+      Move(Buffer, Result[Total + 1], Count);
+      Inc(Total, Count);
+    end;
+  until Count <= 0;
+end;
+
+function RunStateRootUtility(const ASwitch, AOutputPath, AWorktree,
+  AConfigHome, AExplicitRoot: string;
+  const AExtraArgument: string = ''): TStateRootUtilityResult;
+var
+  Utility : TProcess;
+begin
+  Result.ExitCode := -1;
+  Result.Stderr := '';
+  Utility := TProcess.Create(nil);
+  try
+    Utility.Executable := ExpandFileName(ParamStr(0));
+    Utility.Parameters.Add(ASwitch);
+    Utility.Parameters.Add(AOutputPath);
+    if AExtraArgument <> '' then
+      Utility.Parameters.Add(AExtraArgument);
+    Utility.CurrentDirectory := AWorktree;
+    ConfigureProcessEnvironment(Utility, [
+      'HOME=' + AConfigHome,
+      'XDG_CONFIG_HOME=' + AConfigHome,
+      WORKER_STATE_DIR_ENV + '=' + AExplicitRoot,
+      WORKER_BUDGET_ENV + '=' + TEST_BUDGET,
+      WORKER_STALE_SECONDS_ENV + '=' + TEST_STALE_SECONDS,
+      WORKER_LEASE_TOKEN_ENV + '=']);
+    Utility.Options := [poWaitOnExit, poUsePipes];
+    Utility.Execute;
+    Result.Stderr := ReadProcessStream(Utility.Stderr);
+    Result.ExitCode := Utility.ExitStatus;
+  finally
+    Utility.Free;
+  end;
+end;
+
+function StartStateRootProbe(const AOutputPath, AReadyPath, AReleasePath,
+  AWorktree, AConfigHome: string): TProcess;
+begin
+  Result := TProcess.Create(nil);
+  try
+    Result.Executable := ExpandFileName(ParamStr(0));
+    Result.Parameters.Add(STATE_ROOT_PROBE_SWITCH);
+    Result.Parameters.Add(AOutputPath);
+    Result.Parameters.Add(AReadyPath);
+    Result.Parameters.Add(AReleasePath);
+    Result.CurrentDirectory := AWorktree;
+    ConfigureProcessEnvironment(Result, [
+      'HOME=' + AConfigHome,
+      'XDG_CONFIG_HOME=' + AConfigHome,
+      WORKER_STATE_DIR_ENV + '=',
+      WORKER_BUDGET_ENV + '=' + TEST_BUDGET,
+      WORKER_STALE_SECONDS_ENV + '=' + TEST_STALE_SECONDS,
+      WORKER_LEASE_TOKEN_ENV + '=']);
+    Result.Execute;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function OccurrenceCount(const ANeedle, AText: string): Integer;
+var
+  Offset, FoundAt : Integer;
+begin
+  Result := 0;
+  Offset := 1;
+  repeat
+    FoundAt := Pos(ANeedle, Copy(AText, Offset, MaxInt));
+    if FoundAt = 0 then Exit;
+    Inc(Result);
+    Inc(Offset, FoundAt + Length(ANeedle) - 1);
+  until False;
 end;
 
 function TWorkerBudgetProcesses.WaitForSessionState(const ASession,
@@ -1296,6 +1519,158 @@ begin
   end;
 end;
 
+procedure TWorkerBudgetProcesses.TestConcurrentFirstProbesUseDefaultRoot;
+var
+  ConfigHome, FirstOutput, SecondOutput, FirstReady, SecondReady,
+    ReleasePath, FirstFallback, SecondFallback : string;
+  FirstProcess, SecondProcess : TProcess;
+  FirstValues, SecondValues : TStringList;
+begin
+  ConfigHome := FScratch + '/probe-config-home';
+  FirstOutput := FScratch + '/probe-first-result';
+  SecondOutput := FScratch + '/probe-second-result';
+  FirstReady := FScratch + '/probe-first-ready';
+  SecondReady := FScratch + '/probe-second-ready';
+  ReleasePath := FScratch + '/probe-release';
+  FirstFallback := FScratch + '/worktree-a/' + WORKER_STATE_FALLBACK_DIR;
+  SecondFallback := FScratch + '/worktree-b/' + WORKER_STATE_FALLBACK_DIR;
+  ForceDirectories(ConfigHome);
+  FirstProcess := nil;
+  SecondProcess := nil;
+  FirstValues := nil;
+  SecondValues := nil;
+  try
+    FirstProcess := StartStateRootProbe(FirstOutput, FirstReady, ReleasePath,
+      FScratch + '/worktree-a', ConfigHome);
+    SecondProcess := StartStateRootProbe(SecondOutput, SecondReady, ReleasePath,
+      FScratch + '/worktree-b', ConfigHome);
+    Expect<Boolean>(WaitForFile(FirstReady,
+      WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
+    Expect<Boolean>(WaitForFile(SecondReady,
+      WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
+    WriteMarker(ReleasePath, 'probe');
+    FirstProcess.WaitOnExit;
+    SecondProcess.WaitOnExit;
+    Expect<Integer>(FirstProcess.ExitStatus).ToBe(0);
+    Expect<Integer>(SecondProcess.ExitStatus).ToBe(0);
+    FirstValues := ReadUtilityValues(FirstOutput);
+    SecondValues := ReadUtilityValues(SecondOutput);
+    Expect<string>(FirstValues.Values['root']).ToBe(
+      SecondValues.Values['root']);
+    Expect<Boolean>(DirectoryExists(
+      FirstValues.Values['root'])).ToBe(True);
+    Expect<Boolean>(DirectoryExists(FirstFallback)).ToBe(False);
+    Expect<Boolean>(DirectoryExists(SecondFallback)).ToBe(False);
+  finally
+    SecondValues.Free;
+    FirstValues.Free;
+    StopChild(SecondProcess);
+    StopChild(FirstProcess);
+  end;
+end;
+
+{$IFDEF UNIX}
+procedure TWorkerBudgetProcesses
+  .TestDelegationPreservesFallbackRootAcrossWorkingDirectories;
+var
+  OutputPath, Worktree, ChildWorktree, ConfigHome, ExpectedRoot : string;
+  UtilityResult : TStateRootUtilityResult;
+  ParentValues, ChildValues : TStringList;
+begin
+  OutputPath := FScratch + '/fallback-delegation-result';
+  Worktree := FScratch + '/worktree-a';
+  ChildWorktree := FScratch + '/worktree-b';
+  ConfigHome := FScratch + '/config-home';
+  ForceDirectories(ConfigHome);
+  UtilityResult := RunStateRootUtility(
+    STATE_ROOT_FALLBACK_DELEGATION_SWITCH, OutputPath, Worktree,
+    ConfigHome, '', ChildWorktree);
+  Expect<Integer>(UtilityResult.ExitCode).ToBe(0);
+  ParentValues := nil;
+  ChildValues := nil;
+  try
+    ParentValues := ReadUtilityValues(OutputPath);
+    ChildValues := ReadUtilityValues(ParentValues.Values['child-output']);
+    ExpectedRoot := ExpandFileName(Worktree + '/'
+      + WORKER_STATE_FALLBACK_DIR);
+    Expect<string>(ParentValues.Values['parent-root']).ToBe(ExpectedRoot);
+    Expect<string>(ParentValues.Values['child-environment-root']).ToBe(
+      ExpectedRoot);
+    Expect<Integer>(StrToIntDef(
+      ParentValues.Values['child-exit'], -1)).ToBe(0);
+    Expect<string>(ChildValues.Values['root']).ToBe(ExpectedRoot);
+    Expect<string>(ChildValues.Values['acquired']).ToBe('True');
+    Expect<Boolean>(DirectoryExists(ChildWorktree + '/'
+      + WORKER_STATE_FALLBACK_DIR)).ToBe(False);
+  finally
+    ChildValues.Free;
+    ParentValues.Free;
+  end;
+end;
+
+procedure TWorkerBudgetProcesses.TestUnwritableDefaultFallsBackOnce;
+var
+  OutputPath, Worktree, ConfigHome, ExpectedRoot : string;
+  UtilityResult : TStateRootUtilityResult;
+  Values : TStringList;
+begin
+  OutputPath := FScratch + '/fallback-result';
+  Worktree := FScratch + '/worktree-a';
+  ConfigHome := FScratch + '/config-home';
+  ForceDirectories(ConfigHome);
+  UtilityResult := RunStateRootUtility(STATE_ROOT_FALLBACK_SWITCH,
+    OutputPath, Worktree, ConfigHome, '');
+  Expect<Integer>(UtilityResult.ExitCode).ToBe(0);
+  Values := ReadUtilityValues(OutputPath);
+  try
+    ExpectedRoot := ExpandFileName(Worktree + '/'
+      + WORKER_STATE_FALLBACK_DIR);
+    Expect<string>(Values.Values['root-first']).ToBe(ExpectedRoot);
+    Expect<string>(Values.Values['root-second']).ToBe(ExpectedRoot);
+    Expect<string>(Values.Values['acquired']).ToBe('True');
+    Expect<Boolean>(DirectoryExists(ExpectedRoot)).ToBe(True);
+    Expect<Integer>(OccurrenceCount(
+      'cross-worktree budget sharing is forfeited for this invocation',
+      UtilityResult.Stderr)).ToBe(1);
+    Expect<Boolean>(Pos(ExpectedRoot, UtilityResult.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos(WORKER_STATE_DIR_ENV,
+      UtilityResult.Stderr) > 0).ToBe(True);
+  finally
+    Values.Free;
+  end;
+end;
+
+procedure TWorkerBudgetProcesses.TestUnwritableExplicitRootFails;
+var
+  OutputPath, Worktree, ConfigHome, ExplicitRoot : string;
+  UtilityResult : TStateRootUtilityResult;
+begin
+  OutputPath := FScratch + '/explicit-result';
+  Worktree := FScratch + '/worktree-a';
+  ConfigHome := FScratch + '/config-home';
+  ExplicitRoot := FScratch + '/explicit-read-only';
+  ForceDirectories(ConfigHome);
+  ForceDirectories(ExplicitRoot);
+  if FpChmod(ExplicitRoot, &555) <> 0 then
+    raise Exception.CreateFmt(
+      'could not make explicit worker-state test root read-only: %s',
+      [ExplicitRoot]);
+  try
+    UtilityResult := RunStateRootUtility(STATE_ROOT_EXPLICIT_SWITCH,
+      OutputPath, Worktree, ConfigHome, ExplicitRoot);
+  finally
+    FpChmod(ExplicitRoot, &755);
+  end;
+  Expect<Boolean>(UtilityResult.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('failed to open worker-budget transaction lock at '
+    + ExplicitRoot, UtilityResult.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('cross-worktree budget sharing is forfeited',
+    UtilityResult.Stderr) = 0).ToBe(True);
+  Expect<Boolean>(DirectoryExists(Worktree + '/'
+    + WORKER_STATE_FALLBACK_DIR)).ToBe(False);
+end;
+{$ENDIF}
+
 procedure TWorkerBudgetProcesses.SetupTests;
 begin
   Test('separate worktrees share one budget and both contenders progress',
@@ -1326,6 +1701,16 @@ begin
     TestReleaseRetriesAfterWriteFailure);
   Test('one session supports concurrent scheduler threads',
     TestSessionSupportsConcurrentSchedulerThreads);
+  Test('concurrent first probes keep the shared default root',
+    TestConcurrentFirstProbesUseDefaultRoot);
+  {$IFDEF UNIX}
+  Test('delegation preserves fallback root across working directories',
+    TestDelegationPreservesFallbackRootAcrossWorkingDirectories);
+  Test('an unwritable default state root falls back once per process',
+    TestUnwritableDefaultFallsBackOnce);
+  Test('an unwritable explicit state root remains a hard failure',
+    TestUnwritableExplicitRootFails);
+  {$ENDIF}
 end;
 
 begin
