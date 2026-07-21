@@ -90,7 +90,7 @@ begin
              + ChangeFileExt(ExtractFileName(ASrcFile), '');
 
     { Describe the compilation before the selected driver adapts it. }
-    ARequest := CreateFPCBuildRequest(ASrcFile, AOutBin);
+    ARequest := CreateFPCBuildRequest(ASrcFile, AOutBin, ADriver);
     AOutBin := ARequest.Outputs.Artifact;
     SetLength(ARequest.Inputs.UnitPaths, Length(AUnitPaths));
     SetLength(ARequest.Inputs.IncludePaths, Length(AUnitPaths));

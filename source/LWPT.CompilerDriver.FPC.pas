@@ -20,6 +20,10 @@ type
   TLWPTFPCCompilerDriver = class(TLWPTCompilerDriver)
   private
     FExecutableName: string;
+    FDefaultTarget: TLWPTTarget;
+    FDefaultTargetError: string;
+    FDefaultTargetProbed: Boolean;
+    FDefaultVersion: string;
     FProbeCache: TList;
     FProbeCriticalSection: TRTLCriticalSection;
     function FindProbe(const ATarget: TLWPTTarget): Integer;
@@ -33,6 +37,7 @@ type
   public
     constructor Create(const AExecutableName: string = '');
     destructor Destroy; override;
+    function DefaultTarget: TLWPTTarget; override;
     function ProbeCapabilities(const ATarget: TLWPTTarget;
       const ARefresh: Boolean = False): TLWPTCompilerCapabilities; override;
     function BuildArguments(const ARequest: TLWPTBuildRequest;
@@ -46,17 +51,15 @@ type
       TLWPTBuildResult; override;
   end;
 
-function CreateFPCBuildRequest(const ASource, AArtifact: string):
-  TLWPTBuildRequest;
+function CreateFPCBuildRequest(const ASource, AArtifact: string;
+  const ADriver: TLWPTCompilerDriver): TLWPTBuildRequest;
 
 implementation
 
 uses
   Process,
   StrUtils,
-  SysUtils,
-
-  Platform;
+  SysUtils;
 
 const
   FPC_PROCESSOR_X86 = 'x86';
@@ -203,17 +206,26 @@ begin
     + FPCOperatingSystemName(ATarget));
 end;
 
-function CreateFPCBuildRequest(const ASource, AArtifact: string):
-  TLWPTBuildRequest;
+function CreateFPCBuildRequest(const ASource, AArtifact: string;
+  const ADriver: TLWPTCompilerDriver): TLWPTBuildRequest;
+var
+  DefaultTarget: TLWPTTarget;
 begin
+  if not Assigned(ADriver) then
+    raise ELWPTCompilerDriverError.Create('compiler driver is required');
   Result := DefaultBuildRequest;
   Result.Compiler.ID := FPC_COMPILER_ID;
   Result.Compiler.VersionConstraint := '*';
-  Result.Target.OS := GetEnvironmentVariable('FPC_TARGET_OS');
-  if Result.Target.OS = '' then Result.Target.OS := GetBuildOS;
-  Result.Target.Architecture := GetEnvironmentVariable('FPC_TARGET_CPU');
-  if Result.Target.Architecture = '' then
-    Result.Target.Architecture := GetBuildArch;
+  Result.Target.OS := SysUtils.GetEnvironmentVariable('FPC_TARGET_OS');
+  Result.Target.Architecture := SysUtils.GetEnvironmentVariable(
+    'FPC_TARGET_CPU');
+  if (Result.Target.OS = '') or (Result.Target.Architecture = '') then
+  begin
+    DefaultTarget := ADriver.DefaultTarget;
+    if Result.Target.OS = '' then Result.Target.OS := DefaultTarget.OS;
+    if Result.Target.Architecture = '' then
+      Result.Target.Architecture := DefaultTarget.Architecture;
+  end;
   Result.OutputKind := BUILD_OUTPUT_EXECUTABLE;
   Result.Mode := BUILD_MODE_DEV;
   Result.Inputs.EntryPoint := ASource;
@@ -536,6 +548,72 @@ begin
   finally
     CompilerProcess.Free;
   end;
+end;
+
+function TLWPTFPCCompilerDriver.DefaultTarget: TLWPTTarget;
+var
+  Arguments: LWPT.Core.TStringArray;
+  CacheIndex, ExitCode: Integer;
+  Capabilities: TLWPTCompilerCapabilities;
+  Output: string;
+begin
+  EnterCriticalSection(FProbeCriticalSection);
+  try
+    if not FDefaultTargetProbed then
+    begin
+      FDefaultTargetProbed := True;
+      Arguments := ProbeArguments(Default(TLWPTTarget), False);
+      try
+        ExitCode := ExecuteProbe(Arguments, Output);
+        if ExitCode <> 0 then
+          FDefaultTargetError := 'probe via "' + FExecutableName
+            + '" failed (exit ' + IntToStr(ExitCode) + '): '
+            + FirstOutputLine(Output)
+        else if not ParseProbeOutput(Output, FDefaultVersion,
+          FDefaultTarget.OS, FDefaultTarget.Architecture) then
+          FDefaultTargetError := 'probe via "' + FExecutableName
+            + '" returned incomplete capability output: '
+            + FirstOutputLine(Output);
+      except
+        on E: Exception do
+          FDefaultTargetError := 'could not execute "' + FExecutableName
+            + '": ' + E.Message;
+      end;
+      if FDefaultTargetError = '' then
+      begin
+        Capabilities := DefaultCompilerCapabilities;
+        Capabilities.CompilerID := FPC_COMPILER_ID;
+        Capabilities.VersionIdentity := FDefaultVersion;
+        SetLength(Capabilities.Targets, 1);
+        Capabilities.Targets[0] := FDefaultTarget;
+        SetLength(Capabilities.OutputKinds, 2);
+        Capabilities.OutputKinds[0] := BUILD_OUTPUT_EXECUTABLE;
+        Capabilities.OutputKinds[1] := BUILD_OUTPUT_LIBRARY;
+        SetLength(Capabilities.Modes, 2);
+        Capabilities.Modes[0] := BUILD_MODE_DEV;
+        Capabilities.Modes[1] := BUILD_MODE_RELEASE;
+        ValidateCompilerCapabilities(Capabilities);
+        CacheIndex := FindProbe(FDefaultTarget);
+        if CacheIndex < 0 then
+        begin
+          CacheIndex := FProbeCache.Count;
+          FProbeCache.Add(TLWPTFPCProbeCacheEntry.Create(FDefaultTarget));
+        end;
+        TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).StoreCapabilities(
+          Capabilities);
+        TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).DispatchRequired :=
+          False;
+        TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).ErrorMessage := '';
+      end;
+    end;
+    Result := FDefaultTarget;
+  finally
+    LeaveCriticalSection(FProbeCriticalSection);
+  end;
+  if FDefaultTargetError <> '' then
+    raise ELWPTCompilerDriverError.CreateFmt(
+      'compiler "%s" cannot determine its default target: %s',
+      [FPC_COMPILER_ID, FDefaultTargetError]);
 end;
 
 function TLWPTFPCCompilerDriver.ProbeCapabilities(

@@ -29,7 +29,6 @@ uses
   Classes,
   SysUtils,
 
-  Platform,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -312,9 +311,8 @@ begin
   MissingCompiler := FScratch + '/no-such-fpc';
   R := RunLwpt(['build', 'alpha', 'beta'], FScratch,
     ['LWPT_FPC=' + MissingCompiler]);
-  RequiredMessage := 'compiler "fpc" cannot satisfy required target "'
-    + GetBuildOS + '/' + GetBuildArch + '": could not execute "'
-    + MissingCompiler + '"';
+  RequiredMessage := 'compiler "fpc" cannot determine its default target: '
+    + 'could not execute "' + MissingCompiler + '"';
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos(RequiredMessage, R.Stderr) > 0).ToBe(True);
   Expect<Boolean>(Pos('compiler "ppc', R.Stderr) > 0).ToBe(False);

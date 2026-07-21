@@ -36,6 +36,7 @@ type
     concurrent calls on one driver instance. }
   TLWPTCompilerDriver = class
   public
+    function DefaultTarget: TLWPTTarget; virtual; abstract;
     function ProbeCapabilities(const ATarget: TLWPTTarget;
       const ARefresh: Boolean = False): TLWPTCompilerCapabilities; virtual;
       abstract;

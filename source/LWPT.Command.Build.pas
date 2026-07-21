@@ -476,7 +476,7 @@ begin
   OutBin := T.Output;
   if OutBin = '' then
     OutBin := ChangeFileExt(T.Source, '');
-  Request.BuildRequest := CreateFPCBuildRequest(T.Source, OutBin);
+  Request.BuildRequest := CreateFPCBuildRequest(T.Source, OutBin, ADriver);
   OutBin := Request.BuildRequest.Outputs.Artifact;
   { Every invocation writes compiler outputs below its unique session.
     The public output path is touched only by PublishBuildArtifact after

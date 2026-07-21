@@ -10,7 +10,6 @@ uses
   Classes,
   SysUtils,
 
-  Platform,
   TestingPascalLibrary,
 
   LWPT.BuildRequest,
@@ -76,7 +75,7 @@ begin
   try
     DriverRequest := BasicRequest;
     DriverRequest.BuildRequest := CreateFPCBuildRequest(
-      'source/app.pas', 'candidate/app');
+      'source/app.pas', 'candidate/app', Driver);
     SetLength(DriverRequest.BuildRequest.Inputs.UnitPaths, 1);
     DriverRequest.BuildRequest.Inputs.UnitPaths[0] := 'source';
     Capabilities := Driver.ProbeCapabilities(DriverRequest.BuildRequest.Target);
@@ -90,8 +89,7 @@ begin
     LegacyRequest.BuildRequest.Compiler.VersionIdentity :=
       Capabilities.VersionIdentity;
     LegacyRequest.CompilerExecutable := Driver.ExecutableName;
-    LegacyRequest.BuildRequest.Target.OS := GetBuildOS;
-    LegacyRequest.BuildRequest.Target.Architecture := GetBuildArch;
+    LegacyRequest.BuildRequest.Target := DriverRequest.BuildRequest.Target;
     LegacyRequest.BuildRequest.Outputs.Artifact :=
       DriverRequest.BuildRequest.Outputs.Artifact;
 

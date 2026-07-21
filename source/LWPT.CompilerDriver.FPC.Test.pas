@@ -59,6 +59,8 @@ type
     procedure TestProbeCachesPerTargetAndRefreshesOnDemand;
     procedure TestProbeDispatchesOperatingSystemAndMapsWindows;
     procedure TestBareProbeSatisfactionLeavesDispatchOut;
+    procedure TestDefaultBuildRequestUsesBareProbeTarget;
+    procedure TestExplicitProcessorOverrideStillDispatches;
     procedure TestProbeFailureNamesCompilerAndTargetRequirement;
     procedure TestProbeRejectsUnexpectedTargetTuple;
     procedure TestCapabilitiesAreDefensiveAndDoNotAdvertiseUnits;
@@ -134,7 +136,7 @@ procedure SaveAndClearEnvironmentVariable(const AName: string;
   out ASaved: TSavedEnvironmentVariable);
 begin
   ASaved.Name := AName;
-  ASaved.Value := GetEnvironmentVariable(AName);
+  ASaved.Value := SysUtils.GetEnvironmentVariable(AName);
   ASaved.WasSet := EnvironmentVariableIsSet(AName);
   SetTestEnvironmentVariable(AName, '', False);
 end;
@@ -391,6 +393,86 @@ begin
     Expect<Integer>(Driver.ProbeCount).ToBe(1);
   finally
     Driver.Free;
+  end;
+end;
+
+procedure TLWPTFPCCompilerDriverTests.
+  TestDefaultBuildRequestUsesBareProbeTarget;
+var
+  Arguments: LWPT.Core.TStringArray;
+  Driver: TMockFPCCompilerDriver;
+  ExpectedOperatingSystem, ExpectedProcessor: string;
+  InvocationOptions: TLWPTCompilerInvocationOptions;
+  Request: TLWPTBuildRequest;
+  SavedOperatingSystem, SavedProcessor: TSavedEnvironmentVariable;
+begin
+  SaveAndClearEnvironmentVariable('FPC_TARGET_OS', SavedOperatingSystem);
+  SaveAndClearEnvironmentVariable('FPC_TARGET_CPU', SavedProcessor);
+  Driver := TMockFPCCompilerDriver.Create('mock-fpc');
+  try
+    if (GetBuildOS = 'windows') and ((GetBuildArch = 'x86')
+       or (GetBuildArch = 'i386')) then
+    begin
+      ExpectedOperatingSystem := 'linux';
+      ExpectedProcessor := 'x86_64';
+    end
+    else
+    begin
+      ExpectedOperatingSystem := 'win32';
+      ExpectedProcessor := 'i386';
+    end;
+    Driver.BareProbeOutput := '3.2.2 ' + ExpectedOperatingSystem + ' '
+      + ExpectedProcessor;
+    Request := CreateFPCBuildRequest('source/example.pas',
+      'build/example', Driver);
+    Expect<Boolean>((Request.Target.OS <> GetBuildOS)
+      or (Request.Target.Architecture <> GetBuildArch)).ToBe(True);
+    Expect<string>(Request.Target.OS).ToBe(ExpectedOperatingSystem);
+    Expect<string>(Request.Target.Architecture).ToBe(ExpectedProcessor);
+    Expect<Integer>(Driver.ProbeCount).ToBe(1);
+    InvocationOptions := BuildCompilerInvocationOptions('', False);
+    Arguments := Driver.BuildArguments(Request, InvocationOptions);
+    Expect<Boolean>(ArgumentsContain(Arguments,
+      '-P' + Request.Target.Architecture)).ToBe(False);
+    Expect<Boolean>(ArgumentsContain(Arguments,
+      '-T' + Request.Target.OS)).ToBe(False);
+    Expect<Integer>(Driver.ProbeCount).ToBe(1);
+  finally
+    Driver.Free;
+    RestoreEnvironmentVariable(SavedProcessor);
+    RestoreEnvironmentVariable(SavedOperatingSystem);
+  end;
+end;
+
+procedure TLWPTFPCCompilerDriverTests.
+  TestExplicitProcessorOverrideStillDispatches;
+var
+  Arguments: LWPT.Core.TStringArray;
+  Driver: TMockFPCCompilerDriver;
+  InvocationOptions: TLWPTCompilerInvocationOptions;
+  Request: TLWPTBuildRequest;
+  SavedOperatingSystem, SavedProcessor: TSavedEnvironmentVariable;
+begin
+  SaveAndClearEnvironmentVariable('FPC_TARGET_OS', SavedOperatingSystem);
+  SaveAndClearEnvironmentVariable('FPC_TARGET_CPU', SavedProcessor);
+  SetTestEnvironmentVariable('FPC_TARGET_CPU', 'aarch64', True);
+  Driver := TMockFPCCompilerDriver.Create('mock-fpc');
+  try
+    Driver.BareProbeOutput := '3.2.2 linux x86_64';
+    Driver.DispatchedProbeOutput := '3.2.2 linux aarch64';
+    Request := CreateFPCBuildRequest('source/example.pas',
+      'build/example', Driver);
+    Expect<string>(Request.Target.OS).ToBe('linux');
+    Expect<string>(Request.Target.Architecture).ToBe('aarch64');
+    InvocationOptions := BuildCompilerInvocationOptions('', False);
+    Arguments := Driver.BuildArguments(Request, InvocationOptions);
+    Expect<Boolean>(ArgumentsContain(Arguments, '-Paarch64')).ToBe(True);
+    Expect<Boolean>(ArgumentsContain(Arguments, '-Tlinux')).ToBe(True);
+    Expect<Integer>(Driver.ProbeCount).ToBe(3);
+  finally
+    Driver.Free;
+    RestoreEnvironmentVariable(SavedProcessor);
+    RestoreEnvironmentVariable(SavedOperatingSystem);
   end;
 end;
 
@@ -831,6 +913,10 @@ begin
     TestProbeDispatchesOperatingSystemAndMapsWindows);
   Test('a satisfying bare probe leaves dispatch flags out',
     TestBareProbeSatisfactionLeavesDispatchOut);
+  Test('default build request uses the compiler bare-probe target',
+    TestDefaultBuildRequestUsesBareProbeTarget);
+  Test('explicit processor override still validates and dispatches',
+    TestExplicitProcessorOverrideStillDispatches);
   Test('probe failure names compiler and target requirement',
     TestProbeFailureNamesCompilerAndTargetRequirement);
   Test('probe rejects a successful response for the wrong target tuple',

@@ -11,9 +11,10 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   first land under `.lwpt/sessions/<session-id>/`. A completed executable is
   atomically published to its manifest `output` only after its declared inputs
   are revalidated.
-- **Cross-compile via `FPC_TARGET_CPU` / `FPC_TARGET_OS`.** The FPC driver
-  translates non-host target dimensions to `-P` / `-T` and probes that dispatch
-  before compiling.
+- **Compiler-default target unless overridden.** A bare probe supplies the
+  request target when `FPC_TARGET_CPU` / `FPC_TARGET_OS` are unset. Explicit
+  overrides are strictly probed and translated to `-P` / `-T` when dispatch is
+  required.
 - **Compiler-neutral request first.** Build, test, and Windows hook compilation
   validate a versioned request against on-demand compiler capabilities before
   `TLWPTFPCCompilerDriver` translates it. The driver also normalizes diagnostics;
@@ -212,8 +213,12 @@ compiler input.
 FPC_TARGET_CPU=aarch64 ./build/lwpt build --mode release
 ```
 
-The FPC driver translates a non-host processor to `-P<value>` and a non-host
-operating system to `-T<value>`. The standard FPC target values apply
+With neither target environment variable set, the request uses the target
+reported by the compiler's bare `-iV -iTO -iTP` probe and compilation stays
+bare. `FPC_TARGET_CPU` and `FPC_TARGET_OS` replace their corresponding default
+dimensions; the completed explicit request is validated strictly. The driver
+adds `-P<value>` and `-T<value>` only when the bare compiler target does not
+satisfy that request. The standard FPC target values apply
 (`x86_64`, `aarch64`, `i386`, `arm`, `darwin`, `linux`, and the values reported
 by `fpc -h`). Before compiling, the driver runs the requested dispatch with
 `-iV -iTO -iTP`, validates the returned version/target through
