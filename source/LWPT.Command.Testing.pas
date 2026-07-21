@@ -17,8 +17,11 @@ uses
   Process,
   SysUtils,
 
+  LWPT.BuildRequest,
   LWPT.BuildSession,
   LWPT.Command.Common,
+  LWPT.CompilerDriver,
+  LWPT.CompilerDriver.FPC,
   LWPT.Core,
   LWPT.Manifest,
   LWPT.ProcessTree,
@@ -79,6 +82,7 @@ type
     FBudgetSession: TLWPTWorkerBudgetSession;
     FWorkers: TList;
     FSession: TLWPTBuildSession;
+    FCompilerDriver: TLWPTCompilerDriver;
     FProjectRoot: string;
     FVerbose: Boolean;
     FStartedReported: array of Boolean;
@@ -166,17 +170,15 @@ end;
 
 function DrainProcessOutput(AProcess: TProcess): string;
 var
-  Buffer: array[0..4095] of Char;
+  Buffer: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
   Count: LongInt;
-  Chunk: string;
 begin
   Result := '';
   while AProcess.Output.NumBytesAvailable > 0 do
   begin
     Count := AProcess.Output.Read(Buffer[0], SizeOf(Buffer));
     if Count <= 0 then Break;
-    SetString(Chunk, PChar(@Buffer[0]), Count);
-    Result := Result + Chunk;
+    AppendRawBytes(Result, Buffer[0], Count);
   end;
 end;
 
@@ -233,6 +235,7 @@ var
 begin
   inherited Create;
   InitCriticalSection(FCriticalSection);
+  FCompilerDriver := TLWPTFPCCompilerDriver.Create;
   FWorkers := TList.Create;
   FBuildRoot := ABuildRoot;
   FSession := ASession;
@@ -276,6 +279,7 @@ begin
   for i := 0 to FWorkers.Count - 1 do TTestWorker(FWorkers[i]).Free;
   FWorkers.Free;
   FBudgetSession.Free;
+  FCompilerDriver.Free;
   DoneCriticalSection(FCriticalSection);
   inherited Destroy;
 end;
@@ -502,11 +506,13 @@ procedure TTestScheduler.RunOne(const AIndex: Integer;
 var
   CompilerProcess, TestProcess: TProcess;
   Binary, Output: string;
+  BuildRequest: TLWPTBuildRequest;
+  BuildResult: TLWPTBuildResult;
   Code: Integer;
 begin
   try
     CompilerProcess := CreatePascalCompilerProcess(FJobs[AIndex].Source,
-      FUnitPaths, Binary, FBuildRoot);
+      FUnitPaths, Binary, BuildRequest, FBuildRoot, FCompilerDriver);
   except
     { A staging path over the compiler's budget fails this one test with
       the explanatory message instead of aborting the whole scheduler. }
@@ -523,21 +529,19 @@ begin
     CompilerProcess.Free;
   end;
   SetJobOutput(AIndex, True, Output);
+  BuildResult := FCompilerDriver.NormalizeResult(BuildRequest, Code, Output);
   if IsCancelled then
   begin
     CompleteJob(AIndex, tjsCancelled);
     Exit;
   end;
-  if Code <> 0 then
+  if not BuildResult.Success then
   begin
-    FailJob(AIndex, tjsCompileFailed, Code);
+    FailJob(AIndex, tjsCompileFailed, Code,
+      BuildResultErrorMessage(BuildResult));
     Exit;
   end;
 
-  {$IFDEF MSWINDOWS}
-  if (not FileExists(Binary)) and FileExists(Binary + '.exe') then
-    Binary := Binary + '.exe';
-  {$ENDIF}
   SetJobStage(AIndex, tjsRunning, Binary);
   if IsCancelled then
   begin

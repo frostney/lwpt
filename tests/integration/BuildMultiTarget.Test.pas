@@ -29,9 +29,10 @@ uses
   Classes,
   SysUtils,
 
+  Platform,
   TestingPascalLibrary,
-  Tests.Scratch,
-  Tests.LwptSubprocess;
+  Tests.LwptSubprocess,
+  Tests.Scratch;
 
 type
   TBuildMultiTarget = class(TTestSuite)
@@ -300,15 +301,23 @@ begin
 end;
 
 procedure TBuildMultiTarget.TestMissingCompilerFailsTargetsButLoopContinues;
-var R: TLwptResult;
+var
+  MissingCompiler, RequiredMessage: string;
+  R: TLwptResult;
 begin
   { An exception out of the compile step (here: EProcess because the
     compiler binary doesn't exist) must fail each target individually,
     not abort the loop — the summary line still prints. }
   WipeOutputs;
+  MissingCompiler := FScratch + '/no-such-fpc';
   R := RunLwpt(['build', 'alpha', 'beta'], FScratch,
-    ['LWPT_FPC=' + FScratch + '/no-such-fpc']);
+    ['LWPT_FPC=' + MissingCompiler]);
+  RequiredMessage := 'compiler "fpc" cannot satisfy required target "'
+    + GetBuildOS + '/' + GetBuildArch + '": could not execute "'
+    + MissingCompiler + '"';
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos(RequiredMessage, R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('compiler "ppc', R.Stderr) > 0).ToBe(False);
   Expect<Boolean>(Pos('target "alpha" failed:', R.Stderr) > 0).ToBe(True);
   Expect<Boolean>(Pos('target "beta" failed:', R.Stderr) > 0).ToBe(True);
   Expect<Boolean>(Pos('0 built, 2 failed', R.Stdout) > 0).ToBe(True);

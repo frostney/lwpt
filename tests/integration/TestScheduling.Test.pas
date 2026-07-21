@@ -12,13 +12,15 @@ uses
   Process,
   SysUtils,
 
-  LWPT.Core,
-  LWPT.BuildSession,
-  LWPT.WorkerBudget,
+  Platform,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.ProcessSupport,
-  Tests.Scratch;
+  Tests.Scratch,
+
+  LWPT.BuildSession,
+  LWPT.Core,
+  LWPT.WorkerBudget;
 
 const
   CancellationCompletionCeilingSeconds = 12;
@@ -89,6 +91,15 @@ end;
 function SlashNorm(const AOutput: string): string;
 begin
   Result := StringReplace(AOutput, '\', '/', [rfReplaceAll]);
+end;
+
+function HasProcessArgument(const AValue: string): Boolean;
+var
+  ArgumentIndex: Integer;
+begin
+  for ArgumentIndex := 1 to ParamCount do
+    if ParamStr(ArgumentIndex) = AValue then Exit(True);
+  Result := False;
 end;
 
 procedure TTestScheduling.BeforeAll;
@@ -708,9 +719,10 @@ var
   Mode, PIDFile, SourceFile: string;
   Started: TDateTime;
 begin
-  if (ParamCount = 1) and (ParamStr(1) = '-iV') then
+  if HasProcessArgument('-iV') and HasProcessArgument('-iTO')
+     and HasProcessArgument('-iTP') then
   begin
-    WriteLn('3.2.2');
+    WriteLn('3.2.2 ', GetBuildOS, ' ', GetBuildArch);
     Exit(0);
   end;
   Mode := GetEnvironmentVariable(ProcessTreeProxyModeEnvironment);

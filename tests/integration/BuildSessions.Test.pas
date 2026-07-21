@@ -1106,7 +1106,7 @@ begin
     Expect<Boolean>(Pos('FAIL alpha ', RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('alpha-begin|alpha-end|', RunResult.Stdout)
       > Pos('FAIL alpha ', RunResult.Stdout)).ToBe(True);
-    Expect<Boolean>(Pos('target "alpha" failed: compiler failed',
+    Expect<Boolean>(Pos('target "alpha" failed: FAILED (fpc exit 17)',
       RunResult.Stderr) > 0).ToBe(True);
     Expect<Boolean>(Pos('summary: 0 built, 1 failed, 0 skipped; elapsed ',
       RunResult.Stdout) > 0).ToBe(True);

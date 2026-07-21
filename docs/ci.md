@@ -51,7 +51,7 @@ The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a
 
 ### `ci.yml` — build + test
 
-**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, `packages/testing/source/`, plus the target's FPC packages slice, including `paszlib` for `ZStream`). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `AddBuildModeFlags`' release branch. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`.
+**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, `packages/testing/source/`, plus the target's FPC packages slice, including `paszlib` for `ZStream`). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `TLWPTFPCCompilerDriver.BuildArguments`' release translation. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`.
 
 **Test stage** (per-platform native runners, six-target matrix → five runners):
 

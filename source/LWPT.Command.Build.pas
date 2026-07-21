@@ -40,19 +40,16 @@ function CmdBuild(const AManifestPath: string;
   const ATargetNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer; const AVerbose: Boolean): Integer; overload;
 
-{ Exposed for unit tests: does this FPC failure output look like stale
-  build artefacts (worth a --clean retry) rather than a source error? }
-function HasStaleArtefactSignature(const AOutput: string): Boolean;
-
 implementation
 
 uses
   LWPT.BuildRequest,
   LWPT.BuildSession,
   LWPT.Command.Common,
+  LWPT.CompilerDriver,
+  LWPT.CompilerDriver.FPC,
   LWPT.Manifest,
-  LWPT.WorkerBudget,
-  Platform;
+  LWPT.WorkerBudget;
 
 const
   BUILD_TARGET_ENV = PROJECT_NAME + '_BUILD_TARGET';
@@ -84,8 +81,10 @@ type
     FClean: Boolean;
     FSession: TLWPTBuildSession;
     FLease: TLWPTWorkerLease;
+    FDriver: TLWPTCompilerDriver;
     FCompiler: TLWPTCompilerProcess;
     FCompiled: TLWPTCompiledTarget;
+    FBuildResult: TLWPTBuildResult;
     FOutput: string;
     FError: string;
     FCancellationError: string;
@@ -98,11 +97,13 @@ type
     constructor Create(const AManifestPath: string;
       const AManifest: TManifest; const AManifestContentHash: string;
       const ATarget: TBuildTarget; const ARelease, AClean: Boolean;
-      const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease);
+      const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
+      const ADriver: TLWPTCompilerDriver);
     destructor Destroy; override;
     procedure Cancel;
     function IsDone: Boolean;
     property Compiled: TLWPTCompiledTarget read FCompiled;
+    property BuildResult: TLWPTBuildResult read FBuildResult;
     property CapturedOutput: string read FOutput;
     property CancellationError: string read FCancellationError;
     property ErrorMessage: string read FError;
@@ -115,36 +116,8 @@ type
   TLWPTTargetStateArray = array of TLWPTTargetState;
   TLWPTBooleanArray = array of Boolean;
   TLWPTBuildJobArray = array of TLWPTBuildJob;
+  TLWPTBuildResultArray = array of TLWPTBuildResult;
   TLWPTStringArray = array of string;
-
-procedure AddBuildModeFlags(AArgs: TStrings; ARelease: Boolean);
-begin
-  { -Sh applies in both modes: ansistrings + H+ string default.
-    Mode + nested-comment support are set per-file via directives. }
-  AArgs.Add('-Sh');
-  if ARelease then
-  begin
-    AArgs.Add('-O4'); AArgs.Add('-dPRODUCTION'); AArgs.Add('-Xs');
-    AArgs.Add('-CX'); AArgs.Add('-XX');          AArgs.Add('-B');
-  end
-  else
-  begin
-    AArgs.Add('-O-');  AArgs.Add('-gw'); AArgs.Add('-godwarfsets');
-    AArgs.Add('-gl');  AArgs.Add('-Ct'); AArgs.Add('-Cr'); AArgs.Add('-Sa');
-  end;
-end;
-
-{ Byte-safe accumulator for pipe reads, mirroring HTTPClient's
-  AppendRawBytes: append N raw bytes without a PAnsiChar round-trip, so
-  large or non-text diagnostics grow the buffer in place. }
-procedure AppendRawBytes(var ADest: string; const ABuf; const N: Integer);
-var Old: Integer;
-begin
-  if N <= 0 then Exit;
-  Old := Length(ADest);
-  SetLength(ADest, Old + N);
-  Move(ABuf, ADest[Old + 1], N);
-end;
 
 constructor TLWPTCompilerProcess.Create(const AExecutable: string);
 begin
@@ -178,7 +151,7 @@ function TLWPTCompilerProcess.Run(const AArgs: LWPT.Core.TStringArray;
 var
   P: TProcess;
   ProcessTree: TLWPTProcessTree;
-  Buf: array[0..4095] of Byte;
+  Buf: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
   ArgumentIndex, N: Integer;
 begin
   AOutput := '';
@@ -253,43 +226,6 @@ begin
   end;
 end;
 
-{ Read the consumer compiler version at build time. LWPT itself may have
-  been compiled by a different FPC installation, so a compile-time
-  constant is not a valid publication input. }
-function QueryFPCVersion: string;
-var
-  P: TProcess;
-  Buf: array[0..255] of Byte;
-  Chunk, Captured: string;
-  N: Integer;
-begin
-  Captured := '';
-  P := TProcess.Create(nil);
-  try
-    P.Executable := FPCExecutable;
-    P.Parameters.Add('-iV');
-    P.Options := [poUsePipes, poStderrToOutPut];
-    P.Execute;
-    repeat
-      N := P.Output.Read(Buf[0], SizeOf(Buf));
-      if N > 0 then
-      begin
-        SetString(Chunk, PAnsiChar(@Buf[0]), N);
-        Captured := Captured + Chunk;
-      end;
-    until N <= 0;
-    P.WaitOnExit;
-    if P.ExitStatus <> 0 then
-      raise ELWPTError.CreateFmt(
-        'could not query compiler version (exit %d)', [P.ExitStatus]);
-    Result := Trim(Captured);
-    if Result = '' then
-      raise ELWPTError.Create('compiler returned an empty version');
-  finally
-    P.Free;
-  end;
-end;
-
 procedure AppendEnvSearchPaths(var AUnitPaths, AIncludePaths: TStringArray);
 var
   Raw, Part: string;
@@ -313,22 +249,6 @@ begin
       end;
       StartAt := i + 1;
     end;
-end;
-
-{ FPC failure output that points at stale build artefacts rather than a
-  source error — the cases where a --clean retry actually helps. }
-function HasStaleArtefactSignature(const AOutput: string): Boolean;
-var
-  Lower: string;
-begin
-  Lower := LowerCase(AOutput);
-  Result :=
-    (Pos('compilation raised exception internally', Lower) > 0) or
-    (Pos('error while compiling resources', Lower) > 0) or
-    ((Pos('.reslst', Lower) > 0) and
-     ((Pos('cannot open', Lower) > 0) or
-      (Pos('not found', Lower) > 0) or
-      (Pos('no such file', Lower) > 0)));
 end;
 
 { Optional version-baking: write a generated .inc with the manifest version.
@@ -534,27 +454,30 @@ function BuildOneTarget(const AManifestPath: string; const AMan: TManifest;
   const AManifestContentHash: string;
   const T: TBuildTarget; ARelease, AClean: Boolean;
   ASession: TLWPTBuildSession; ACompiler: TLWPTCompilerProcess;
-  out ACompiled: TLWPTCompiledTarget; out AOutput: string): Boolean;
+  ADriver: TLWPTCompilerDriver; out ACompiled: TLWPTCompiledTarget;
+  out ABuildResult: TLWPTBuildResult; out AOutput: string): Boolean;
 var
-  Args : TStringList;
   FpcArgs : TStringArray;
-  Arch, OutBin, JobRoot, BinDir, CandidateBin, UnitOutDir, OutText,
+  OutBin, JobRoot, BinDir, CandidateBin, UnitOutDir, OutText,
     Fingerprint, ProjectRoot, CfgPath, ModulesPath : string;
   i, FpcExit : Integer;
+  Capabilities: TLWPTCompilerCapabilities;
+  Failure: TLWPTCompilerFailure;
   Request: TLWPTBuildPublicationRequest;
   ScanDirs: LWPT.Core.TStringArray;
 begin
   ACompiled := Default(TLWPTCompiledTarget);
+  ABuildResult := DefaultBuildResult;
   AOutput := '';
   if T.Source = '' then
     Exit(False);
 
+  Request := Default(TLWPTBuildPublicationRequest);
   OutBin := T.Output;
   if OutBin = '' then
     OutBin := ChangeFileExt(T.Source, '');
-  {$IFDEF MSWINDOWS}
-  if ExtractFileExt(OutBin) = '' then OutBin := OutBin + '.exe';
-  {$ENDIF}
+  Request.BuildRequest := CreateFPCBuildRequest(T.Source, OutBin);
+  OutBin := Request.BuildRequest.Outputs.Artifact;
   { Every invocation writes compiler outputs below its unique session.
     The public output path is touched only by PublishBuildArtifact after
     compilation succeeds and the input snapshot is revalidated. }
@@ -571,15 +494,9 @@ begin
   ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
   CfgPath := ResolveCfgFile(AMan);
   ModulesPath := ResolveModulesDir(AMan);
-  Request := Default(TLWPTBuildPublicationRequest);
-  Request.BuildRequest := DefaultBuildRequest;
-  Request.BuildRequest.Compiler.ID := 'fpc';
-  Request.BuildRequest.Compiler.VersionConstraint := '*';
-  Request.BuildRequest.Compiler.VersionIdentity := QueryFPCVersion;
-  Request.CompilerExecutable := FPCExecutable;
+  Request.CompilerExecutable := ADriver.ExecutableName;
   Request.ManifestContentHash := AManifestContentHash;
   Request.PublicOutput := OutBin;
-  Request.BuildRequest.OutputKind := BUILD_OUTPUT_EXECUTABLE;
   if ARelease then
   begin
     Request.BuildRequest.Mode := BUILD_MODE_RELEASE;
@@ -588,17 +505,6 @@ begin
   end
   else
     Request.BuildRequest.Mode := BUILD_MODE_DEV;
-  Request.BuildRequest.Target.OS :=
-    GetEnvironmentVariable('FPC_TARGET_OS');
-  if Request.BuildRequest.Target.OS = '' then
-    Request.BuildRequest.Target.OS := GetBuildOS;
-  Request.BuildRequest.Target.Architecture :=
-    GetEnvironmentVariable('FPC_TARGET_CPU');
-  if Request.BuildRequest.Target.Architecture = '' then
-    Request.BuildRequest.Target.Architecture := GetBuildArch;
-  Request.BuildRequest.Inputs.EntryPoint := T.Source;
-  SetLength(Request.BuildRequest.Inputs.Sources, 1);
-  Request.BuildRequest.Inputs.Sources[0] := T.Source;
   Request.BuildRequest.Outputs.Artifact := CandidateBin;
   Request.BuildRequest.Outputs.ExecutableDirectory := BinDir;
   Request.BuildRequest.Outputs.UnitDirectory := UnitOutDir;
@@ -621,6 +527,10 @@ begin
     Request.BuildRequest.Inputs.IncludePaths);
   AddDeclaredOutputs(AMan, Request.ExcludedPaths);
   ValidateBuildRequest(Request.BuildRequest);
+  Capabilities := ADriver.ProbeCapabilities(Request.BuildRequest.Target);
+  EnsureBuildRequestCompatible(Request.BuildRequest, Capabilities);
+  Request.BuildRequest.Compiler.VersionIdentity :=
+    Capabilities.VersionIdentity;
   { The cfg reaches FPC unexpanded (@file), so its -Fu lines are read
     through the same shared extractor the test flow uses. }
   ScanDirs := Copy(Request.BuildRequest.Inputs.UnitPaths, 0,
@@ -631,53 +541,20 @@ begin
   Fingerprint := CaptureBuildPublicationFingerprint(ProjectRoot,
     AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
 
-  Args := TStringList.Create;
-  try
-    { cross-compile target CPU via env var, same hook as build.pas }
-    Arch := GetEnvironmentVariable('FPC_TARGET_CPU');
-    if Arch <> '' then Args.Add('-P' + Arch);
-
-    Args.Add('-Sh');
-    { -FE is the exe fallback for outputs without a dir component;
-      -FU overrides it for units only, isolating .ppu/.o per
-      target + mode while -o keeps the binary at the manifest path. }
-    Args.Add('-FE' + BinDir);
-    Args.Add('-FU' + UnitOutDir);
-    { resolved dependency search paths: the manifest-resolved cfg path,
-      if install has run (zero-install repos commit it, so this should
-      almost always be present). }
-    if FileExists(ResolveCfgFile(AMan)) then
-      Args.Add('@' + ResolveCfgFile(AMan));
-    { Adapt the neutral request's distinct search-path collections to FPC.
-      Environment-provided paths were appended to both collections above. }
-    for i := 0 to High(Request.BuildRequest.Inputs.UnitPaths) do
-      if Request.BuildRequest.Inputs.UnitPaths[i] <> '' then
-        Args.Add('-Fu' + Request.BuildRequest.Inputs.UnitPaths[i]);
-    for i := 0 to High(Request.BuildRequest.Inputs.IncludePaths) do
-      if Request.BuildRequest.Inputs.IncludePaths[i] <> '' then
-        Args.Add('-Fi' + Request.BuildRequest.Inputs.IncludePaths[i]);
-    AddBuildModeFlags(Args, ARelease);
-    { -B forces a full rebuild, ignoring up-to-date units. Release mode
-      already adds -B; only add it here for a clean dev build. }
-    if AClean and (not ARelease) then
-      Args.Add('-B');
-    Args.Add('-o' + CandidateBin);
-    Args.Add(T.Source);
-
-    SetLength(FpcArgs, Args.Count);
-    for i := 0 to Args.Count - 1 do
-      FpcArgs[i] := Args[i];
-  finally
-    Args.Free;
-  end;
+  FpcArgs := ADriver.BuildArguments(Request.BuildRequest,
+    BuildCompilerInvocationOptions(CfgPath, AClean));
 
   FpcExit := ACompiler.Run(FpcArgs, OutText);
+  ABuildResult := ADriver.NormalizeResult(Request.BuildRequest,
+    FpcExit, OutText);
   AOutput := OutText;
-  Result := FpcExit = 0;
+  Result := ABuildResult.Success;
 
   if not Result then
-    AOutput := AOutput + LineEnding + 'FAILED (fpc exit '
-      + IntToStr(FpcExit) + ')' + LineEnding;
+  begin
+    Failure := ADriver.ClassifyFailure(FpcExit, OutText);
+    AOutput := AOutput + LineEnding + Failure.Summary + LineEnding;
+  end;
 
   if Result then
   begin
@@ -692,10 +569,10 @@ begin
   end;
 
   if (not Result) and (not AClean)
-     and HasStaleArtefactSignature(OutText) then
+     and (Failure.Kind = cfkStaleArtefact) then
   begin
     AOutput := AOutput + LineEnding
-      + '  hint: stale FPC build artefacts can cause this error.'
+      + '  ' + Failure.Recovery
       + LineEnding + '  retry with: ' + PROGRAM_NAME + ' build '
       + T.Name + ' --clean' + LineEnding;
   end;
@@ -704,7 +581,8 @@ end;
 constructor TLWPTBuildJob.Create(const AManifestPath: string;
   const AManifest: TManifest; const AManifestContentHash: string;
   const ATarget: TBuildTarget; const ARelease, AClean: Boolean;
-  const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease);
+  const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
+  const ADriver: TLWPTCompilerDriver);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
@@ -716,8 +594,10 @@ begin
   FClean := AClean;
   FSession := ASession;
   FLease := ALease;
-  FCompiler := TLWPTCompilerProcess.Create;
+  FDriver := ADriver;
+  FCompiler := TLWPTCompilerProcess.Create(FDriver.ExecutableName);
   FCompiled := Default(TLWPTCompiledTarget);
+  FBuildResult := DefaultBuildResult;
   FOutput := '';
   FError := '';
   FSucceeded := False;
@@ -742,7 +622,7 @@ begin
     try
       FSucceeded := BuildOneTarget(FManifestPath, FManifest,
         FManifestContentHash, FTarget, FRelease, FClean, FSession,
-        FCompiler, FCompiled, FOutput);
+        FCompiler, FDriver, FCompiled, FBuildResult, FOutput);
       if (not FSucceeded) and (FError = '') then
         if FTarget.Source = '' then
           FError := 'target has no source'
@@ -973,14 +853,16 @@ var
   Selected: TLWPTBooleanArray;
   States: TLWPTTargetStateArray;
   Jobs: TLWPTBuildJobArray;
+  BuildResults: TLWPTBuildResultArray;
   Compiled: TLWPTCompiledTargetArray;
   CapturedOutputs, Errors: TLWPTStringArray;
   PublicationRequest: TLWPTBuildPublicationRequest;
   PublicationResult: TLWPTBuildPublicationResult;
+  CompilerDriver: TLWPTCompilerDriver;
+  CurrentCompilerCapabilities: TLWPTCompilerCapabilities;
   WholePostBuild: THookArray;
   HookEnvironment: array of string;
   HasEdges, MadeProgress: Boolean;
-  CurrentCompilerVersion: string;
   StartedAt, LastHeartbeatAt, HeartbeatInterval, NowTick: QWord;
   StartTicks: array of QWord;
   Reported: array of Boolean;
@@ -1087,8 +969,9 @@ var
     try
       if ARunPostBuild then RunTargetPostBuild(AIndex);
       PublicationRequest := Compiled[AIndex].Request;
-      CurrentCompilerVersion := QueryFPCVersion;
-      if CurrentCompilerVersion
+      CurrentCompilerCapabilities := CompilerDriver.ProbeCapabilities(
+        PublicationRequest.BuildRequest.Target, True);
+      if CurrentCompilerCapabilities.VersionIdentity
         <> PublicationRequest.BuildRequest.Compiler.VersionIdentity then
         PublicationResult := bprStale
       else
@@ -1152,6 +1035,7 @@ begin
   Failed := 0;
   Skipped := 0;
   Result := 1;
+  CompilerDriver := TLWPTFPCCompilerDriver.Create;
   try
     try
       if not FileExists(AManifestPath) then
@@ -1229,6 +1113,7 @@ begin
     HasEdges := SelectedGraphHasEdges(Man.Targets, Selected);
     SetLength(States, Length(Man.Targets));
     SetLength(Jobs, Length(Man.Targets));
+    SetLength(BuildResults, Length(Man.Targets));
     SetLength(Compiled, Length(Man.Targets));
     SetLength(CapturedOutputs, Length(Man.Targets));
     SetLength(Errors, Length(Man.Targets));
@@ -1288,7 +1173,7 @@ begin
                   Man.Targets[i].PreBuild, Session.HookRoot);
                 Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
                   ManifestContentHash, Man.Targets[i], ARelease, AClean,
-                  Session, Lease);
+                  Session, Lease, CompilerDriver);
                 Lease := nil;
                 States[i] := tsRunning;
                 Inc(Running);
@@ -1325,15 +1210,20 @@ begin
             begin
               Jobs[i].WaitFor;
               CapturedOutputs[i] := Jobs[i].CapturedOutput;
+              BuildResults[i] := Jobs[i].BuildResult;
               if Jobs[i].Succeeded then
               begin
                 Compiled[i] := Jobs[i].Compiled;
+                if Length(BuildResults[i].Artifacts) > 0 then
+                  Compiled[i].CandidateBin :=
+                    BuildResults[i].Artifacts[0].Path;
                 States[i] := tsCompiled;
               end
               else
               begin
                 States[i] := tsFailed;
-                Errors[i] := Jobs[i].ErrorMessage;
+                Errors[i] := BuildResultErrorMessage(BuildResults[i]);
+                if Errors[i] = '' then Errors[i] := Jobs[i].ErrorMessage;
                 Inc(Failed);
               end;
               FreeAndNil(Jobs[i]);
@@ -1438,6 +1328,7 @@ begin
       end;
     end;
   finally
+    CompilerDriver.Free;
     WriteLn('summary: ', Built, ' built, ', Failed, ' failed, ',
       Skipped, ' skipped; elapsed ',
       FormatElapsedMilliseconds(GetTickCount64 - StartedAt));

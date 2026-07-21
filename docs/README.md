@@ -49,6 +49,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0026](./adr/0026-release-version-stamp-from-tag.md) | Release binaries stamp the version from the git tag; dev builds stamp from the manifest |
 | [0027](./adr/0027-agents-subcommand.md) | `lwpt agents` writes/verifies the marker-fenced AGENTS.md command reference; subcommand surface 9 → 10 |
 | [0028](./adr/0028-default-toolkit-state-format-exclusion.md) | Formatter excludes root `.lwpt/**` by default while explicit includes opt matching files back in |
+| [0029](./adr/0029-fpc-compiler-driver.md) | Neutral compiler-driver seam with on-demand FPC target probes, unified argument translation, failure classification, and normalized diagnostics |
 
 ## Spikes
 
