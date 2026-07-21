@@ -4,14 +4,16 @@ name: PR
 # on push to main, so pr.yml is the sole pre-merge signal a PR sees.
 #
 #   pr.yml      — every PR: Ubuntu native bootstrap + install +
-#                 format --check + build + test (no e2e), plus a
+#                 format --check + build + test, then the live-
+#                 network e2e tier on the same Linux leg (#102);
+#                 a native aarch64-darwin default-tier leg; and a
 #                 win64 leg: cross-compile on macOS, then the
 #                 offline default test tier natively on
-#                 windows-latest. Typical wall-clock < 5 min on a
-#                 warm toolchain cache.
+#                 windows-latest. Typical wall-clock < 10 min on a
+#                 warm toolchain cache (hard caps per job/step).
 #   ci.yml      — push to main only: full 6-target cross-build +
-#                 per-platform native test runs (incl. e2e).
-#                 Post-merge confirmation, not a PR gate.
+#                 per-platform native test runs (incl. e2e on
+#                 every platform). Post-merge confirmation.
 #   release.yml — tag-triggered cross-build + package + publish.
 #
 # Trade-off, deliberate: a PR that introduces a platform-specific
@@ -117,11 +119,13 @@ jobs:
       # one Linux leg pre-merge. Evidence: the #84 TLS-close regression
       # was only reachable through the e2e tier, and the higher-
       # concurrency e2e runs are what flushed the #101-class timing
-      # flakes — both previously invisible to this gate. The tier is
-      # retry-tolerant and self-skips on clean connectivity failure, so
-      # third-party downtime degrades to skips rather than red PRs.
-      # Post-merge ci.yml still runs e2e on every platform.
+      # flakes — both previously invisible to this gate. Clean DNS/
+      # connect failures self-skip (transient third-party downtime);
+      # content, protocol, and TLS failures remain blocking, which is
+      # the point. The step env overrides the job-level skip. Post-
+      # merge ci.yml still runs e2e on every platform.
       - name: lwpt test --tier=e2e --bail=1 (live network, Linux leg)
+        timeout-minutes: 15
         env:
           LWPT_SKIP_NETWORK: "0"
         run: ./build/lwpt test --tier=e2e --bail=1
@@ -138,10 +142,10 @@ jobs:
         with:
           globs: "**/*.md"
 
-  # PR-gate extension (#102): one native aarch64-darwin leg. Every
-  # recent intermittent (the #105 env-race family and its masks) first
-  # surfaced on a darwin leg, and darwin-only runtime breaks (the fpc-
-  # proxy misroute) were invisible to the Linux-only gate. Native
+  # PR-gate extension (#102): one native aarch64-darwin leg. The #105
+  # env-race family and its masks all first surfaced on darwin legs,
+  # and darwin-only runtime breaks (the fpc-proxy misroute) were
+  # invisible to the Linux-only gate. Native
   # bootstrap via brew keeps this independent of the cross-toolchain
   # cache. Default tier only; e2e stays on the Linux leg above and on
   # post-merge ci.yml. Cost bound: ~5-6 min warm (brew fpc ~40 s +
@@ -150,6 +154,7 @@ jobs:
   # unique-catch rate has not justified per-PR cost.
   darwin-test:
     runs-on: macos-latest
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
@@ -158,6 +163,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install FPC (brew)
