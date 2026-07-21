@@ -1,6 +1,50 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.3.0] - 2026-07-21
+
+### Bug Fixes
+
+- fix(test): repair the two post-#84 main failures (Linux TLS close, darwin fpc-proxy misroute) (#105)
+- fix(core): keep sibling tmp paths of bare filenames in current directory (#91)
+- fix(test): surface nested-run failures in TestScheduling via shared diagnostics (#104)
+- fix(test): contention-robust, self-diagnosing BuildSessions concurrency barriers (#103)
+- fix(test): widen BuildSessions concurrency-barrier windows to stop main flaking (#101)
+- fix(core): guarantee fresh MakeTmpPath results under same-window calls (#79)
+- fix(test): isolate integration-test scratch directories per invocation (#80)
+- fix(build): report nonzero compiler exits dropped by TProcess on unix (#69)
+- fix(test): remove Windows worker-budget races (#68)
+
+### Documentation
+
+- docs: 0.3.0 release-preparation truth sync (#110)
+- docs: add retro gates from the PR #105 root-cause session (#106)
+- docs: define product direction and delivery gates (#57)
+
+### Internal
+
+- test: apply codex-review findings on the #105 fixes (#108)
+- refactor(run): derive list-mode subcommand aliases from the live registry (#94)
+- refactor(test): derive suite descriptions from PROJECT_NAME (#82)
+- ci: harden release governance (#63)
+- chore(skills): update project skill set (#26)
+
+### New Features
+
+- feat(agents): add agents subcommand generating the AGENTS.md command reference (#93)
+- feat(build): schedule targets in parallel (#67)
+- feat(build): define compiler-neutral build requests (#66)
+- feat: run test programs in parallel with numeric bail (#65)
+- Support valued and attached short CLI options (#59)
+
+### Other Changes
+
+- Server-side accept TLS: memory-BIO, PKCS#12, nonblocking handshake (#70) (#84)
+- Process-tree cascade termination (#73) + observable parallel work (#41) (#83)
+- Keep compiler staging paths within FPC's 255-character limit (#75)
+- Specify the decentralized HTTP registry protocol (#58)
+- Isolate build sessions and publish outputs atomically (#60)
+- Coordinate a machine-wide worker budget (#61)
 ## [0.2.0] - 2026-06-24
 
 ### Bug Fixes
