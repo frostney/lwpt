@@ -235,7 +235,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
   private `-FE`, `-FU`, and executable path below that session. Successful
   sessions are removed; failed sessions remain private and diagnosable until
   `lwpt repair` reclaims them.
-- **`tests/support/` auto-discovery** — `LWPT.Command.Testing.CmdTest` adds `tests/support` to the FPC `-Fu`/`-Fi` paths automatically when it exists. `LWPT.Command.Format.CmdFormat` walks `tests/` in addition to `Man.Units` so project-owned test helpers are held to the same formatter rules as `source/`.
+- **`tests/support/` auto-discovery** — `LWPT.Command.Testing.CmdTest` adds `tests/support` to the FPC `-Fu`/`-Fi` paths automatically when it exists. `LWPT.Command.Format.CmdFormat` does not walk `tests/` implicitly; the root manifest's `[format].include` globs cover `tests/integration/`, `tests/support/`, and `tests/e2e/` explicitly so project-owned test helpers are held to the same formatter rules as `source/` (see [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md)).
 
 ### Counts
 
