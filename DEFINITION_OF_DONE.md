@@ -45,8 +45,11 @@ requirement may be marked not applicable only with a recorded reason.
 - A change touching process management, concurrency, platform-specific code,
   or the CI workflows themselves dispatches the full CI workflow on the
   branch (`gh workflow run CI --ref <branch>`) and watches it to completion
-  before merge; the PR gate alone is not sufficient evidence for these
-  areas. (Interim gate until #102 extends the PR gate itself.)
+  before merge when the change targets platforms or tiers the PR gate
+  does not cover (post-#102 the gate covers Linux default+e2e,
+  aarch64-darwin default, and win64 offline; `x86_64-darwin`,
+  `aarch64-linux`, `i386-win32`, and non-Linux e2e remain
+  post-merge-only).
 - An intermittent-failure fix names the pinned mechanism and its evidence;
   timeout bumps, retries, and quarantines are mitigations and link a
   tracking issue instead.

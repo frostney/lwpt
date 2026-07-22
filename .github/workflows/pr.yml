@@ -4,27 +4,31 @@ name: PR
 # on push to main, so pr.yml is the sole pre-merge signal a PR sees.
 #
 #   pr.yml      — every PR: Ubuntu native bootstrap + install +
-#                 format --check + build + test (no e2e), plus a
+#                 format --check + build + test, then the live-
+#                 network e2e tier on the same Linux leg (#102);
+#                 a native aarch64-darwin default-tier leg; and a
 #                 win64 leg: cross-compile on macOS, then the
 #                 offline default test tier natively on
-#                 windows-latest. Typical wall-clock < 5 min on a
-#                 warm toolchain cache.
+#                 windows-latest. Typical wall-clock < 10 min on a
+#                 warm toolchain cache (hard caps per job/step).
 #   ci.yml      — push to main only: full 6-target cross-build +
-#                 per-platform native test runs (incl. e2e).
-#                 Post-merge confirmation, not a PR gate.
+#                 per-platform native test runs (incl. e2e on
+#                 every platform). Post-merge confirmation.
 #   release.yml — tag-triggered cross-build + package + publish.
 #
-# Trade-off, deliberate: a PR that introduces a platform-specific
-# regression outside the win64 leg (aarch64-only behaviour, a
-# darwin-only path quirk, etc.) will pass pr.yml and only fail on
+# Trade-off, deliberate: a PR that introduces a regression on the
+# legs the gate still omits (x86_64-darwin, aarch64-linux,
+# i386-win32, or non-Linux e2e) will pass pr.yml and only fail on
 # the main-branch ci.yml run. The maintainer reverts/forwards-fixes
-# from main. This trades pre-merge cross-platform certainty for
-# cheap PR feedback, which is the conscious GocciaScript design
+# from main. Pre-merge coverage now spans Linux default+e2e,
+# aarch64-darwin default, and win64 offline (#102 extended the
+# original Ubuntu+win64 gate). This bounded trade keeps PR feedback
+# cheap, which is the conscious GocciaScript design
 # choice we mirror.
 #
-# One carve-out from that trade-off: Windows, via the win64 leg.
-# {$IFDEF WINDOWS} codepaths never compile on the Ubuntu runner, so
-# a unit-shadowing mistake (the SysUtils.FindClose vs
+# The first carve-out from that trade-off was Windows, via the
+# win64 leg. {$IFDEF WINDOWS} codepaths never compile on the Ubuntu
+# runner, so a unit-shadowing mistake (the SysUtils.FindClose vs
 # Windows.FindClose class — introduced by PR #17, fixed by PR #21)
 # used to merge green and break main. windows-cross-compile closes
 # the compile gap (one win64 cross-compile reusing the toolchain
@@ -32,9 +36,11 @@ name: PR
 # default test tier natively against that binary, catching
 # Windows-only runtime breaks (junction installs, path handling,
 # process env) and compile breaks in test sources, which lwpt test
-# compiles with the native FPC. Still post-merge only: the
-# i386-win32 leg, the live-network e2e tier, bootstrap.bat, and
-# every non-Windows platform.
+# compiles with the native FPC. #102 added the next two carve-outs
+# (the Linux e2e step and the darwin-test leg below) after the
+# #84/#105 escape classes. Still post-merge only: the i386-win32
+# leg, the e2e tier on non-Linux platforms, bootstrap.bat, and the
+# x86_64-darwin / aarch64-linux permutations.
 #
 # The Ubuntu native build deliberately uses the distro FPC (same
 # as the install instructions in README.md), so a regression that
@@ -64,8 +70,9 @@ jobs:
       run:
         shell: bash
     env:
-      # Skip live-network E2E tests on the fast PR runner. They run
-      # in ci.yml on every platform — Q23=c — and are the slow tier.
+      # Default-tier steps skip live-network E2E; the dedicated e2e
+      # step below overrides this to "0" for its single run (#102).
+      # Post-merge ci.yml still runs the tier on every platform.
       LWPT_SKIP_NETWORK: "1"
     steps:
       # persist-credentials: false on every pr.yml checkout: these jobs
@@ -113,6 +120,21 @@ jobs:
       - name: lwpt test --bail=1 (default tier — unit + integration)
         run: ./build/lwpt test --bail=1
 
+      # PR-gate extension (#102): the live-network e2e tier runs on this
+      # one Linux leg pre-merge. Evidence: the #84 TLS-close regression
+      # was only reachable through the e2e tier, and the higher-
+      # concurrency e2e runs are what flushed the #101-class timing
+      # flakes — both previously invisible to this gate. Clean DNS/
+      # connect failures self-skip (transient third-party downtime);
+      # content, protocol, and TLS failures remain blocking, which is
+      # the point. The step env overrides the job-level skip. Post-
+      # merge ci.yml still runs e2e on every platform.
+      - name: lwpt test --tier=e2e --bail=1 (live network, Linux leg)
+        timeout-minutes: 15
+        env:
+          LWPT_SKIP_NETWORK: "0"
+        run: ./build/lwpt test --tier=e2e --bail=1
+
   docs:
     runs-on: ubuntu-latest
     steps:
@@ -124,6 +146,47 @@ jobs:
         uses: DavidAnson/markdownlint-cli2-action@05f32210e84442804257b2a6f20b273450ec8265 # v19.1.0
         with:
           globs: "**/*.md"
+
+  # PR-gate extension (#102): one native aarch64-darwin leg. The #105
+  # env-race family and its masks all first surfaced on darwin legs,
+  # and darwin-only runtime breaks (the fpc-proxy misroute) were
+  # invisible to the Linux-only gate. Native
+  # bootstrap via brew keeps this independent of the cross-toolchain
+  # cache. Default tier only; e2e stays on the Linux leg above and on
+  # post-merge ci.yml. Cost bound: ~5-6 min warm (brew fpc ~40 s +
+  # bootstrap ~1 min + default tier). The remaining ci.yml-only legs
+  # (x86_64-darwin, aarch64-linux, i386-win32) stay post-merge: their
+  # unique-catch rate has not justified per-PR cost.
+  darwin-test:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      LWPT_SKIP_NETWORK: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install FPC (brew)
+        run: |
+          brew list fpc >/dev/null 2>&1 || brew install fpc
+          fpc -iV
+
+      - name: Bootstrap lwpt
+        run: ./bootstrap.sh
+
+      - name: lwpt install --frozen (committed lockfile matches committed trees?)
+        run: ./build/lwpt install --frozen
+
+      - name: lwpt install (workspace auto-discovery + symlinks)
+        run: ./build/lwpt install
+
+      - name: lwpt test --bail=1 (default tier — unit + integration)
+        run: ./build/lwpt test --bail=1
 
   # Reuses toolchain.yml exactly like ci.yml/release.yml do. The cache
   # key (lwpt-fpc-cross-<fpc>-macos-arm64-<n>) has no branch or ref
@@ -266,8 +329,8 @@ jobs:
   # (junction-vs-symlink installs, path handling, subprocess
   # environment handling) and compile breaks in test sources, which
   # lwpt test compiles with the native FPC at run time (Q22=b).
-  # Post-merge ci.yml still owns the i386-win32 leg, the
-  # live-network e2e tier, and the bootstrap.bat smoke.
+  # Post-merge ci.yml still owns the i386-win32 leg, the e2e tier
+  # on non-Linux platforms, and the bootstrap.bat smoke.
   windows-test:
     needs: windows-cross-compile
     runs-on: windows-latest

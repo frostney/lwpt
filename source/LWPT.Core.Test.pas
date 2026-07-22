@@ -37,6 +37,19 @@ type
     procedure TestSpansTwoBlocks;
   end;
 
+  THashTreePaths = class(TTestSuite)
+  private
+    FScratch: string;
+    procedure ResetScratch;
+  protected
+    procedure AfterAll; override;
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestPinnedNestedTreeDigest;
+    procedure TestCanonicalPathReplacesSourceDelimiter;
+  end;
+
   TLoadManifestHappy = class(TTestSuite)
   public
     procedure SetupTests; override;
@@ -406,6 +419,20 @@ begin
   end;
 end;
 
+procedure WriteFixtureBytes(const APath: string; const ABytes: TBytes);
+var
+  FS: TFileStream;
+begin
+  ForceDirectories(ExtractFileDir(APath));
+  FS := TFileStream.Create(APath, fmCreate);
+  try
+    if Length(ABytes) > 0 then
+      FS.WriteBuffer(ABytes[0], Length(ABytes));
+  finally
+    FS.Free;
+  end;
+end;
+
 function StringAsBytes(const S: string): TBytes;
 var i: Integer;
 begin
@@ -494,6 +521,59 @@ begin
   Test('"abc" vector',                         TestAbc);
   Test('56-byte vector (block-boundary pad)',  TestExactlyOneBlock);
   Test('1,000,000 "a" vector (multi-block)',   TestSpansTwoBlocks);
+end;
+
+{ ── THashTreePaths ───────────────────────────────────────────────── }
+
+procedure THashTreePaths.ResetScratch;
+begin
+  WipeDir(FScratch);
+  ForceDirectories(FScratch);
+end;
+
+procedure THashTreePaths.BeforeAll;
+begin
+  FScratch := ExpandFileName('build/tests/tmp/hash-tree-'
+    + IntToStr(GetProcessID));
+  ResetScratch;
+end;
+
+procedure THashTreePaths.AfterAll;
+begin
+  WipeDir(FScratch);
+end;
+
+procedure THashTreePaths.TestPinnedNestedTreeDigest;
+const
+  EXPECTED = 'sha256:5c970f737e82874a0c3c6bde83813385951ef2a78125d709ac4b46f5812ba4d4';
+begin
+  ResetScratch;
+  WriteFixtureBytes(FScratch + PathDelim + 'alpha.txt',
+    StringAsBytes('alpha'));
+  WriteFixtureBytes(FScratch + PathDelim + 'nested' + PathDelim + 'beta.bin',
+    StringAsBytes('beta'));
+  WriteFixtureBytes(FScratch + PathDelim + 'nested' + PathDelim + 'deeper'
+    + PathDelim + 'gamma.txt', StringAsBytes('gamma'));
+
+  Expect<string>(HashTree(FScratch)).ToBe(EXPECTED);
+end;
+
+procedure THashTreePaths.TestCanonicalPathReplacesSourceDelimiter;
+begin
+  Expect<string>(CanonicalTreeHashPath('nested\file.txt', '\'))
+    .ToBe('nested' + TREE_HASH_PATH_SEPARATOR + 'file.txt');
+  { A backslash is a legal filename character on POSIX: with '/' as the
+    source delimiter it must survive canonicalisation untouched. }
+  Expect<string>(CanonicalTreeHashPath('nested\file.txt', '/'))
+    .ToBe('nested\file.txt');
+end;
+
+procedure THashTreePaths.SetupTests;
+begin
+  Test('nested tree digest matches the pinned hash layout',
+    TestPinnedNestedTreeDigest);
+  Test('canonical path replaces the supplied source delimiter',
+    TestCanonicalPathReplacesSourceDelimiter);
 end;
 
 { ── TLoadManifestHappy ────────────────────────────────────────────── }
@@ -2869,6 +2949,8 @@ end;
 begin
   TestRunnerProgram.AddSuite(TSHA256NISTVectors.Create(
     PROJECT_NAME + '.Core: SHA-256 NIST vectors'));
+  TestRunnerProgram.AddSuite(THashTreePaths.Create(
+    PROJECT_NAME + '.Core: HashTree paths'));
   TestRunnerProgram.AddSuite(TLoadManifestHappy.Create(
     PROJECT_NAME + '.Manifest: LoadManifest happy path'));
   TestRunnerProgram.AddSuite(TLoadManifestValidation.Create(
