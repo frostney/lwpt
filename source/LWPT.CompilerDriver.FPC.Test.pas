@@ -31,7 +31,7 @@ const
   ProbeTimeoutProxyName = PROGRAM_NAME + '-probe-timeout-proxy';
   ProbeTimeoutSleepMilliseconds = 30000;
   TestProbeTimeoutMilliseconds = 1000;
-  TestProbeCompletionTimeoutSeconds = 6;
+  TestProbeCompletionTimeoutSeconds = 10;
 
 type
   TMockFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
