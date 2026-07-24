@@ -39,18 +39,28 @@ const
   STATE_ROOT_FALLBACK_SWITCH = '--worker-state-root-fallback';
   STATE_ROOT_EXISTING_LOCK_FALLBACK_SWITCH =
     '--worker-state-root-existing-lock-fallback';
+  STATE_ROOT_UNWRITABLE_FALLBACK_SWITCH =
+    '--worker-state-root-unwritable-fallback';
   STATE_ROOT_FALLBACK_DELEGATION_SWITCH =
     '--worker-state-root-fallback-delegation';
   STATE_ROOT_EXPLICIT_SWITCH = '--worker-state-root-explicit';
   STATE_ROOT_PROBE_SWITCH = '--worker-state-root-probe';
+  STATE_ROOT_CAPTURE_SWITCH = '--worker-state-root-capture';
   TRANSACTION_LOCK_NAME = 'transaction.lock';
   TEST_BUDGET = '1';
   TEST_STALE_SECONDS = '3';
+  CAPTURE_OUTPUT_SIZE = 128 * 1024;
+  CAPTURE_EXIT_CODE = 23;
+  CAPTURE_STDOUT_PREFIX = 'stdout-begin:';
+  CAPTURE_STDOUT_SUFFIX = ':stdout-end';
+  CAPTURE_STDERR_PREFIX = 'stderr-begin:';
+  CAPTURE_STDERR_SUFFIX = ':stderr-end';
   WAIT_TIMEOUT_MILLISECONDS = 10000;
 
 type
   TStateRootUtilityResult = record
     ExitCode : Integer;
+    Stdout : string;
     Stderr : string;
   end;
 
@@ -102,10 +112,12 @@ type
     procedure TestReleaseRetriesAfterWriteFailure;
     procedure TestSessionSupportsConcurrentSchedulerThreads;
     procedure TestConcurrentFirstProbesUseDefaultRoot;
+    procedure TestStateRootUtilityDrainsOutputWhileRunning;
     {$IFDEF UNIX}
     procedure TestDelegationPreservesFallbackRootAcrossWorkingDirectories;
     procedure TestUnwritableDefaultFallsBackOnce;
     procedure TestExistingLockDoesNotMaskUnwritableDefault;
+    procedure TestUnwritableFallbackRequiresExplicitOverride;
     procedure TestUnwritableExplicitRootFails;
     {$ENDIF}
   end;
@@ -225,10 +237,22 @@ var
   Child, FirstChild, SecondChild : TProcess;
   FirstThread, SecondThread : TLeaseThread;
   {$IFDEF UNIX}
-  DefaultRoot, FallbackSessionId : string;
+  DefaultRoot, FallbackRoot, FallbackSessionId : string;
   ExistingTransactionLock : Boolean;
   {$ENDIF}
 begin
+  if (ParamCount = 2) and (ParamStr(1) = STATE_ROOT_CAPTURE_SWITCH) then
+  begin
+    Write(CAPTURE_STDOUT_PREFIX);
+    Write(StringOfChar('o', CAPTURE_OUTPUT_SIZE));
+    Write(CAPTURE_STDOUT_SUFFIX);
+    Write(ErrOutput, CAPTURE_STDERR_PREFIX);
+    Write(ErrOutput, StringOfChar('e', CAPTURE_OUTPUT_SIZE));
+    Write(ErrOutput, CAPTURE_STDERR_SUFFIX);
+    ExitCode := CAPTURE_EXIT_CODE;
+    Exit(True);
+  end;
+
   if (ParamCount = 4) and (ParamStr(1) = STATE_ROOT_PROBE_SWITCH) then
   begin
     ForceDirectories(GetAppConfigDir(False));
@@ -246,6 +270,41 @@ begin
   end;
 
   {$IFDEF UNIX}
+  if (ParamCount = 2)
+     and (ParamStr(1) = STATE_ROOT_UNWRITABLE_FALLBACK_SWITCH) then
+  begin
+    DefaultRoot := ExcludeTrailingPathDelimiter(ExpandFileName(
+      IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers'));
+    FallbackRoot := ExcludeTrailingPathDelimiter(
+      ExpandFileName(WORKER_STATE_FALLBACK_DIR));
+    if not ForceDirectories(DefaultRoot) then
+      raise Exception.CreateFmt(
+        'could not create default worker-state test root %s', [DefaultRoot]);
+    if not ForceDirectories(FallbackRoot) then
+      raise Exception.CreateFmt(
+        'could not create fallback worker-state test root %s',
+        [FallbackRoot]);
+    if FpChmod(DefaultRoot, &555) <> 0 then
+      raise Exception.CreateFmt(
+        'could not make default worker-state test root read-only: %s',
+        [DefaultRoot]);
+    if FpChmod(FallbackRoot, &555) <> 0 then
+    begin
+      FpChmod(DefaultRoot, &755);
+      raise Exception.CreateFmt(
+        'could not make fallback worker-state test root read-only: %s',
+        [FallbackRoot]);
+    end;
+    try
+      WorkerStateRoot;
+    finally
+      FpChmod(FallbackRoot, &755);
+      FpChmod(DefaultRoot, &755);
+    end;
+    ExitCode := 0;
+    Exit(True);
+  end;
+
   if (ParamCount = 2)
      and ((ParamStr(1) = STATE_ROOT_FALLBACK_SWITCH)
        or (ParamStr(1) = STATE_ROOT_EXISTING_LOCK_FALLBACK_SWITCH)) then
@@ -919,24 +978,29 @@ begin
   end;
 end;
 
-function ReadProcessStream(AStream: TStream): string;
+function ReadProcessStream(AStream: TStream;
+  AAvailableBytes: Integer): string;
 const
   CHUNK_SIZE = 4096;
 var
   Buffer : array[0..CHUNK_SIZE - 1] of Byte;
-  Count, Total : Integer;
+  Count, Requested, Total : Integer;
 begin
   Result := '';
   Total := 0;
-  repeat
-    Count := AStream.Read(Buffer, SizeOf(Buffer));
+  while Total < AAvailableBytes do
+  begin
+    Requested := AAvailableBytes - Total;
+    if Requested > SizeOf(Buffer) then Requested := SizeOf(Buffer);
+    Count := AStream.Read(Buffer, Requested);
     if Count > 0 then
     begin
       SetLength(Result, Total + Count);
       Move(Buffer, Result[Total + 1], Count);
       Inc(Total, Count);
     end;
-  until Count <= 0;
+    if Count <= 0 then Break;
+  end;
 end;
 
 function RunStateRootUtility(const ASwitch, AOutputPath, AWorktree,
@@ -944,8 +1008,10 @@ function RunStateRootUtility(const ASwitch, AOutputPath, AWorktree,
   const AExtraArgument: string = ''): TStateRootUtilityResult;
 var
   Utility : TProcess;
+  AvailableBytes : Integer;
 begin
   Result.ExitCode := -1;
+  Result.Stdout := '';
   Result.Stderr := '';
   Utility := TProcess.Create(nil);
   try
@@ -962,10 +1028,31 @@ begin
       WORKER_BUDGET_ENV + '=' + TEST_BUDGET,
       WORKER_STALE_SECONDS_ENV + '=' + TEST_STALE_SECONDS,
       WORKER_LEASE_TOKEN_ENV + '=']);
-    Utility.Options := [poWaitOnExit, poUsePipes];
+    Utility.Options := [poUsePipes];
     Utility.Execute;
-    Result.Stderr := ReadProcessStream(Utility.Stderr);
-    Result.ExitCode := Utility.ExitStatus;
+    while Utility.Running do
+    begin
+      AvailableBytes := Utility.Output.NumBytesAvailable;
+      if AvailableBytes > 0 then
+        Result.Stdout := Result.Stdout
+          + ReadProcessStream(Utility.Output, AvailableBytes);
+      AvailableBytes := Utility.Stderr.NumBytesAvailable;
+      if AvailableBytes > 0 then
+        Result.Stderr := Result.Stderr
+          + ReadProcessStream(Utility.Stderr, AvailableBytes);
+      Sleep(10);
+    end;
+    AvailableBytes := Utility.Output.NumBytesAvailable;
+    if AvailableBytes > 0 then
+      Result.Stdout := Result.Stdout
+        + ReadProcessStream(Utility.Output, AvailableBytes);
+    AvailableBytes := Utility.Stderr.NumBytesAvailable;
+    if AvailableBytes > 0 then
+      Result.Stderr := Result.Stderr
+        + ReadProcessStream(Utility.Stderr, AvailableBytes);
+    Result.ExitCode := Utility.ExitCode;
+    if (Result.ExitCode = 0) and (Utility.ExitStatus <> 0) then
+      Result.ExitCode := Utility.ExitStatus;
   finally
     Utility.Free;
   end;
@@ -1596,6 +1683,25 @@ begin
   end;
 end;
 
+procedure TWorkerBudgetProcesses
+  .TestStateRootUtilityDrainsOutputWhileRunning;
+var
+  UtilityResult : TStateRootUtilityResult;
+begin
+  UtilityResult := RunStateRootUtility(STATE_ROOT_CAPTURE_SWITCH,
+    FScratch + '/capture-result', FScratch + '/worktree-a',
+    FScratch + '/config-home', '');
+  Expect<Integer>(UtilityResult.ExitCode).ToBe(CAPTURE_EXIT_CODE);
+  Expect<Boolean>(Pos(CAPTURE_STDOUT_PREFIX,
+    UtilityResult.Stdout) = 1).ToBe(True);
+  Expect<Boolean>(Pos(CAPTURE_STDOUT_SUFFIX,
+    UtilityResult.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(CAPTURE_STDERR_PREFIX,
+    UtilityResult.Stderr) = 1).ToBe(True);
+  Expect<Boolean>(Pos(CAPTURE_STDERR_SUFFIX,
+    UtilityResult.Stderr) > 0).ToBe(True);
+end;
+
 {$IFDEF UNIX}
 procedure TWorkerBudgetProcesses
   .TestDelegationPreservesFallbackRootAcrossWorkingDirectories;
@@ -1699,6 +1805,31 @@ begin
   end;
 end;
 
+procedure TWorkerBudgetProcesses
+  .TestUnwritableFallbackRequiresExplicitOverride;
+var
+  UtilityResult : TStateRootUtilityResult;
+  OutputPath, Worktree, ConfigHome, ExpectedRoot : string;
+begin
+  OutputPath := FScratch + '/unwritable-fallback-result';
+  Worktree := FScratch + '/worktree-a';
+  ConfigHome := FScratch + '/config-home';
+  ForceDirectories(ConfigHome);
+  UtilityResult := RunStateRootUtility(
+    STATE_ROOT_UNWRITABLE_FALLBACK_SWITCH,
+    OutputPath, Worktree, ConfigHome, '');
+  ExpectedRoot := ExpandFileName(Worktree + '/'
+    + WORKER_STATE_FALLBACK_DIR);
+  Expect<Boolean>(UtilityResult.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos(
+    'worker state default and repository fallback at ' + ExpectedRoot
+    + ' are unwritable', UtilityResult.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('set ' + WORKER_STATE_DIR_ENV
+    + ' to a writable directory', UtilityResult.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('cross-worktree budget sharing is forfeited',
+    UtilityResult.Stderr) = 0).ToBe(True);
+end;
+
 procedure TWorkerBudgetProcesses.TestUnwritableExplicitRootFails;
 var
   OutputPath, Worktree, ConfigHome, ExplicitRoot : string;
@@ -1762,6 +1893,8 @@ begin
     TestSessionSupportsConcurrentSchedulerThreads);
   Test('concurrent first probes keep the shared default root',
     TestConcurrentFirstProbesUseDefaultRoot);
+  Test('state-root utility drains subprocess output while it runs',
+    TestStateRootUtilityDrainsOutputWhileRunning);
   {$IFDEF UNIX}
   Test('delegation preserves fallback root across working directories',
     TestDelegationPreservesFallbackRootAcrossWorkingDirectories);
@@ -1769,6 +1902,8 @@ begin
     TestUnwritableDefaultFallsBackOnce);
   Test('an existing transaction lock does not mask an unwritable default',
     TestExistingLockDoesNotMaskUnwritableDefault);
+  Test('an unwritable fallback requires an explicit writable override',
+    TestUnwritableFallbackRequiresExplicitOverride);
   Test('an unwritable explicit state root remains a hard failure',
     TestUnwritableExplicitRootFails);
   {$ENDIF}

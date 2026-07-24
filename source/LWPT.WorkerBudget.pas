@@ -326,7 +326,7 @@ begin
           + MilliSecondOfTheSecond(Current);
 end;
 
-function DefaultWorkerStateRootWritable(const ARoot: string): Boolean;
+function WorkerStateRootWritable(const ARoot: string): Boolean;
 var
   ProbePath : string;
   {$IFDEF UNIX}
@@ -360,7 +360,7 @@ end;
 
 function WorkerStateRoot: string;
 var
-  ConfiguredRoot, DefaultRoot : string;
+  ConfiguredRoot, DefaultRoot, FallbackRoot : string;
 begin
   EnterCriticalSection(WorkerStateRootCriticalSection);
   try
@@ -375,12 +375,18 @@ begin
       begin
         DefaultRoot := ExcludeTrailingPathDelimiter(ExpandFileName(
           IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers'));
-        if DefaultWorkerStateRootWritable(DefaultRoot) then
+        if WorkerStateRootWritable(DefaultRoot) then
           ResolvedWorkerStateRoot := DefaultRoot
         else
         begin
-          ResolvedWorkerStateRoot := ExcludeTrailingPathDelimiter(
+          FallbackRoot := ExcludeTrailingPathDelimiter(
             ExpandFileName(WORKER_STATE_FALLBACK_DIR));
+          if not WorkerStateRootWritable(FallbackRoot) then
+            raise ELWPTWorkerBudgetError.CreateFmt(
+              'worker state default and repository fallback at %s are '
+              + 'unwritable; set %s to a writable directory',
+              [FallbackRoot, WORKER_STATE_DIR_ENV]);
+          ResolvedWorkerStateRoot := FallbackRoot;
           WriteLn(ErrOutput,
             'warning: worker state default is unwritable; using ',
             ResolvedWorkerStateRoot,

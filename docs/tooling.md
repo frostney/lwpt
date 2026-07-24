@@ -78,10 +78,12 @@ machine budget, and `--jobs=N` sets a smaller invocation request.
 
 Each invocation registers a session request in a per-user state root shared by
 all worktrees. LWPT resolves that root once per process. When the default
-application-config path cannot create and open its transaction lock, LWPT
-prints a one-line notice and uses the current repository's `.lwpt/workers/`
-directory for that invocation. This keeps write-restricted sandboxes working
-but forfeits cross-worktree budget sharing. An explicit
+application-config path cannot create and remove a unique sentinel file, LWPT
+applies the same probe to the current repository's `.lwpt/workers/` directory.
+It prints the fallback notice only after that probe passes. If neither root is
+writable, LWPT fails with an error directing the user to
+`LWPT_WORKER_STATE_DIR`. A valid fallback keeps write-restricted sandboxes
+working but forfeits cross-worktree budget sharing. An explicit
 `LWPT_WORKER_STATE_DIR` remains authoritative and fails if unwritable. The
 effective budget is the first invocation's configured `LWPT_WORKER_BUDGET`, or
 the logical processor count when unset. Later invocations adopt that active
