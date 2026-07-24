@@ -71,3 +71,17 @@ parent exits.
 - The coordinator remains cooperative. Processes that do not acquire a lease
   are outside its authority; this is a worker budget for LWPT invocations, not
   an operating-system resource limit.
+
+## Amendment — 2026-07-21
+
+Write-restricted sandboxes may expose a per-user application-config directory
+that cannot create coordinator files. LWPT now probes the default state root by
+creating the directory and creating then removing a unique sentinel file. If
+that probe fails, the process applies the same probe to the current
+repository's `.lwpt/workers/` directory and emits a one-line notice only after
+that fallback passes. If neither root is writable, LWPT fails with an error
+directing the user to `LWPT_WORKER_STATE_DIR`. The resolved root is fixed for
+the process lifetime. This is a bounded exception to machine-wide,
+cross-worktree coordination: only the affected invocation forfeits
+cross-worktree sharing. An explicit `LWPT_WORKER_STATE_DIR` is never redirected
+and remains a hard error when unwritable.

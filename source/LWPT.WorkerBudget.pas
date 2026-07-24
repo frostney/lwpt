@@ -21,6 +21,7 @@ uses
 const
   WORKER_BUDGET_ENV = PROJECT_NAME + '_WORKER_BUDGET';
   WORKER_STATE_DIR_ENV = PROJECT_NAME + '_WORKER_STATE_DIR';
+  WORKER_STATE_FALLBACK_DIR = LWPT_DIR + '/workers';
   WORKER_STALE_SECONDS_ENV = PROJECT_NAME
     + '_WORKER_LEASE_STALE_SECONDS';
   WORKER_LEASE_TOKEN_ENV = PROJECT_NAME + '_WORKER_LEASE_TOKEN';
@@ -126,6 +127,7 @@ const
   REQUEST_EXTENSION = '.request';
   OWNER_EXTENSION = '.owner';
   TRANSACTION_LOCK_FILE = 'transaction.lock';
+  WRITE_PROBE_PREFIX = '.write-probe-';
   BUDGET_FILE = 'budget';
   QUEUE_FILE = 'queue-sequence';
   STATE_TMP_DIR = 'tmp';
@@ -197,6 +199,9 @@ type
 
 var
   WorkerStateCriticalSection : TRTLCriticalSection;
+  WorkerStateRootCriticalSection : TRTLCriticalSection;
+  ResolvedWorkerStateRoot : string;
+  WorkerStateRootResolved : Boolean = False;
   LocalOwnerCriticalSection : TRTLCriticalSection;
   LocalOwnerSessions : TStringList;
   SessionCounter : Integer = 0;
@@ -321,12 +326,80 @@ begin
           + MilliSecondOfTheSecond(Current);
 end;
 
-function WorkerStateRoot: string;
+function WorkerStateRootWritable(const ARoot: string): Boolean;
+var
+  ProbePath : string;
+  {$IFDEF UNIX}
+  Descriptor : LongInt;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Handle : THandle;
+  {$ENDIF}
 begin
-  Result := SysUtils.GetEnvironmentVariable(WORKER_STATE_DIR_ENV);
-  if Result = '' then
-    Result := IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers';
-  Result := ExcludeTrailingPathDelimiter(ExpandFileName(Result));
+  Result := ForceDirectories(ARoot) or DirectoryExists(ARoot);
+  if not Result then Exit;
+  ProbePath := IncludeTrailingPathDelimiter(ARoot) + WRITE_PROBE_PREFIX
+             + IntToStr(GetProcessID) + '-' + IntToStr(NowMilliseconds);
+  {$IFDEF UNIX}
+  Descriptor := FpOpen(PChar(ProbePath),
+    O_RDWR or O_CREAT or O_EXCL, &600);
+  if Descriptor < 0 then Exit(False);
+  Result := FpClose(Descriptor) = 0;
+  if not SysUtils.DeleteFile(ProbePath) then Result := False;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Handle := CreateFileW(PWideChar(UnicodeString(ProbePath)),
+    GENERIC_READ or GENERIC_WRITE, 0, nil, CREATE_NEW,
+    FILE_ATTRIBUTE_NORMAL, 0);
+  if Handle = THandle(INVALID_HANDLE_VALUE) then Exit(False);
+  Result := CloseHandle(Handle);
+  if not DeleteFileW(PWideChar(UnicodeString(ProbePath))) then
+    Result := False;
+  {$ENDIF}
+end;
+
+function WorkerStateRoot: string;
+var
+  ConfiguredRoot, DefaultRoot, FallbackRoot : string;
+begin
+  EnterCriticalSection(WorkerStateRootCriticalSection);
+  try
+    if not WorkerStateRootResolved then
+    begin
+      ConfiguredRoot := SysUtils.GetEnvironmentVariable(
+        WORKER_STATE_DIR_ENV);
+      if ConfiguredRoot <> '' then
+        ResolvedWorkerStateRoot := ExcludeTrailingPathDelimiter(
+          ExpandFileName(ConfiguredRoot))
+      else
+      begin
+        DefaultRoot := ExcludeTrailingPathDelimiter(ExpandFileName(
+          IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers'));
+        if WorkerStateRootWritable(DefaultRoot) then
+          ResolvedWorkerStateRoot := DefaultRoot
+        else
+        begin
+          FallbackRoot := ExcludeTrailingPathDelimiter(
+            ExpandFileName(WORKER_STATE_FALLBACK_DIR));
+          if not WorkerStateRootWritable(FallbackRoot) then
+            raise ELWPTWorkerBudgetError.CreateFmt(
+              'worker state default and repository fallback at %s are '
+              + 'unwritable; set %s to a writable directory',
+              [FallbackRoot, WORKER_STATE_DIR_ENV]);
+          ResolvedWorkerStateRoot := FallbackRoot;
+          WriteLn(ErrOutput,
+            'warning: worker state default is unwritable; using ',
+            ResolvedWorkerStateRoot,
+            '; cross-worktree budget sharing is forfeited for this invocation; ',
+            'override with ', WORKER_STATE_DIR_ENV);
+        end;
+      end;
+      WorkerStateRootResolved := True;
+    end;
+    Result := ResolvedWorkerStateRoot;
+  finally
+    LeaveCriticalSection(WorkerStateRootCriticalSection);
+  end;
 end;
 
 function StatePath(const AName: string): string;
@@ -1852,12 +1925,15 @@ begin
     raise ELWPTWorkerBudgetError.Create(
       'worker lease environment target is required');
   for i := AEnvironment.Count - 1 downto 0 do
-    if SameText(EnvironmentName(AEnvironment[i]), WORKER_LEASE_TOKEN_ENV) then
+    if SameText(EnvironmentName(AEnvironment[i]), WORKER_LEASE_TOKEN_ENV)
+       or SameText(EnvironmentName(AEnvironment[i]),
+         WORKER_STATE_DIR_ENV) then
       AEnvironment.Delete(i);
   if (ALease = nil) or (ALease.FOwner = nil) then
     raise ELWPTWorkerBudgetError.Create(
       'active worker lease is required for delegation');
   Token := ALease.FOwner.CreateDelegation(ALease);
+  AEnvironment.Add(WORKER_STATE_DIR_ENV + '=' + WorkerStateRoot);
   AEnvironment.Add(WORKER_LEASE_TOKEN_ENV + '=' + Token);
 end;
 
@@ -1935,12 +2011,14 @@ end;
 
 initialization
   InitCriticalSection(WorkerStateCriticalSection);
+  InitCriticalSection(WorkerStateRootCriticalSection);
   InitCriticalSection(LocalOwnerCriticalSection);
   LocalOwnerSessions := TStringList.Create;
 
 finalization
   LocalOwnerSessions.Free;
   DoneCriticalSection(LocalOwnerCriticalSection);
+  DoneCriticalSection(WorkerStateRootCriticalSection);
   DoneCriticalSection(WorkerStateCriticalSection);
 
 end.
