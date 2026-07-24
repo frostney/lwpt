@@ -289,7 +289,8 @@ begin
   SetLwptBinaryPath(ExpandFileName(ParamStr(0)));
   Run := RunLwpt([IsolatedCompilerDriverOption, ACase], '',
     ['FPC_TARGET_OS=', 'FPC_TARGET_CPU=',
-      PROJECT_NAME + '_FPC_UNIT_PATHS=']);
+      PROJECT_NAME + '_FPC_UNIT_PATHS=',
+      PROJECT_NAME + '_WORKER_LEASE_TOKEN=']);
   if Run.ExitCode <> 0 then
   begin
     WriteLn('ISOLATED COMPILER-DRIVER TEST FAILURE: ', ACase);
