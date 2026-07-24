@@ -22,10 +22,16 @@ uses
   LWPT.Core,
   Platform,
   TestingPascalLibrary,
+  Tests.LwptSubprocess,
   Tests.ProcessSupport,
   Tests.Scratch;
 
 const
+  IsolatedCompilerDriverOption = '--' + PROGRAM_NAME
+    + '-isolated-compiler-driver';
+  IsolatedDefaultTargetCase = 'default-target';
+  IsolatedExplicitProcessorCase = 'explicit-processor';
+  IsolatedUnitPathsCase = 'unit-paths';
   ProbeTimeoutGrandchildOption = '--' + PROGRAM_NAME
     + '-probe-timeout-grandchild';
   ProbeTimeoutProxyName = PROGRAM_NAME + '-probe-timeout-proxy';
@@ -72,6 +78,10 @@ type
       const AExpected: string): Boolean;
     function RunCompiler(const ADriver: TLWPTCompilerDriver;
       const ARequest: TLWPTBuildRequest; out AOutput: string): Integer;
+    procedure RunIsolatedCase(const ACase: string);
+    procedure AssertDefaultBuildRequestUsesBareProbeTarget;
+    procedure AssertExplicitProcessorOverrideStillDispatches;
+    procedure AssertBuildArgumentsPreserveTestCompileFlagSet;
   public
     procedure SetupTests; override;
     procedure TestProbeCachesPerTargetAndRefreshesOnDemand;
@@ -92,79 +102,6 @@ type
     procedure TestDiagnosticGrammarRejectsSeverityFalsePositives;
     procedure TestWindowsExecutableArtifactPathIsNormalized;
   end;
-
-type
-  TSavedEnvironmentVariable = record
-    Name: string;
-    Value: string;
-    WasSet: Boolean;
-  end;
-
-{$IFDEF UNIX}
-function CSetEnvironmentVariable(AName, AValue: PAnsiChar;
-  AOverwrite: LongInt): LongInt; cdecl; external 'c' name 'setenv';
-function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
-  external 'c' name 'unsetenv';
-{$ENDIF}
-
-function EnvironmentVariableIsSet(const AName: string): Boolean;
-var
-  Entry: string;
-  EnvironmentIndex, SeparatorAt: Integer;
-begin
-  for EnvironmentIndex := 1 to GetEnvironmentVariableCount do
-  begin
-    Entry := GetEnvironmentString(EnvironmentIndex);
-    SeparatorAt := Pos('=', Entry);
-    if (SeparatorAt > 0)
-       and SameText(Copy(Entry, 1, SeparatorAt - 1), AName) then Exit(True);
-  end;
-  Result := False;
-end;
-
-procedure SetTestEnvironmentVariable(const AName, AValue: string;
-  const ASet: Boolean);
-{$IFDEF UNIX}
-var
-  Name, Value: AnsiString;
-{$ENDIF}
-{$IFDEF MSWINDOWS}
-var
-  Name, Value: UnicodeString;
-{$ENDIF}
-begin
-  {$IFDEF UNIX}
-  Name := AnsiString(AName);
-  Value := AnsiString(AValue);
-  if ASet then
-    CSetEnvironmentVariable(PAnsiChar(Name), PAnsiChar(Value), 1)
-  else
-    CUnsetEnvironmentVariable(PAnsiChar(Name));
-  {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Name := UnicodeString(AName);
-  Value := UnicodeString(AValue);
-  if ASet then
-    Windows.SetEnvironmentVariableW(PWideChar(Name), PWideChar(Value))
-  else
-    Windows.SetEnvironmentVariableW(PWideChar(Name), nil);
-  {$ENDIF}
-end;
-
-procedure SaveAndClearEnvironmentVariable(const AName: string;
-  out ASaved: TSavedEnvironmentVariable);
-begin
-  ASaved.Name := AName;
-  ASaved.Value := SysUtils.GetEnvironmentVariable(AName);
-  ASaved.WasSet := EnvironmentVariableIsSet(AName);
-  SetTestEnvironmentVariable(AName, '', False);
-end;
-
-procedure RestoreEnvironmentVariable(
-  const ASaved: TSavedEnvironmentVariable);
-begin
-  SetTestEnvironmentVariable(ASaved.Name, ASaved.Value, ASaved.WasSet);
-end;
 
 procedure TerminateTestProcess(const APID: Integer);
 {$IFDEF MSWINDOWS}
@@ -345,6 +282,23 @@ begin
   end;
 end;
 
+procedure TLWPTFPCCompilerDriverTests.RunIsolatedCase(const ACase: string);
+var
+  Run: TLwptResult;
+begin
+  SetLwptBinaryPath(ExpandFileName(ParamStr(0)));
+  Run := RunLwpt([IsolatedCompilerDriverOption, ACase], '',
+    ['FPC_TARGET_OS=', 'FPC_TARGET_CPU=',
+      PROJECT_NAME + '_FPC_UNIT_PATHS=']);
+  if Run.ExitCode <> 0 then
+  begin
+    WriteLn('ISOLATED COMPILER-DRIVER TEST FAILURE: ', ACase);
+    if Run.Stdout <> '' then WriteLn(Run.Stdout);
+    if Run.Stderr <> '' then WriteLn(Run.Stderr);
+  end;
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+end;
+
 procedure TLWPTFPCCompilerDriverTests.
   TestProbeCachesPerTargetAndRefreshesOnDemand;
 var
@@ -478,16 +432,19 @@ end;
 
 procedure TLWPTFPCCompilerDriverTests.
   TestDefaultBuildRequestUsesBareProbeTarget;
+begin
+  RunIsolatedCase(IsolatedDefaultTargetCase);
+end;
+
+procedure TLWPTFPCCompilerDriverTests.
+  AssertDefaultBuildRequestUsesBareProbeTarget;
 var
   Arguments: LWPT.Core.TStringArray;
   Driver: TMockFPCCompilerDriver;
   ExpectedOperatingSystem, ExpectedProcessor: string;
   InvocationOptions: TLWPTCompilerInvocationOptions;
   Request: TLWPTBuildRequest;
-  SavedOperatingSystem, SavedProcessor: TSavedEnvironmentVariable;
 begin
-  SaveAndClearEnvironmentVariable('FPC_TARGET_OS', SavedOperatingSystem);
-  SaveAndClearEnvironmentVariable('FPC_TARGET_CPU', SavedProcessor);
   Driver := TMockFPCCompilerDriver.Create('mock-fpc');
   try
     if (GetBuildOS = 'windows') and ((GetBuildArch = 'x86')
@@ -519,22 +476,23 @@ begin
     Expect<Integer>(Driver.ProbeCount).ToBe(1);
   finally
     Driver.Free;
-    RestoreEnvironmentVariable(SavedProcessor);
-    RestoreEnvironmentVariable(SavedOperatingSystem);
   end;
 end;
 
 procedure TLWPTFPCCompilerDriverTests.
   TestExplicitProcessorOverrideStillDispatches;
+begin
+  RunIsolatedCase(IsolatedExplicitProcessorCase);
+end;
+
+procedure TLWPTFPCCompilerDriverTests.
+  AssertExplicitProcessorOverrideStillDispatches;
 var
   Arguments: LWPT.Core.TStringArray;
   Driver: TMockFPCCompilerDriver;
   InvocationOptions: TLWPTCompilerInvocationOptions;
   Request: TLWPTBuildRequest;
-  SavedOperatingSystem, SavedProcessor: TSavedEnvironmentVariable;
 begin
-  SaveAndClearEnvironmentVariable('FPC_TARGET_OS', SavedOperatingSystem);
-  SaveAndClearEnvironmentVariable('FPC_TARGET_CPU', SavedProcessor);
   Driver := TMockFPCCompilerDriver.Create('mock-fpc');
   try
     Driver.BareProbeOutput := '3.2.2 linux x86_64';
@@ -558,8 +516,6 @@ begin
     Expect<Integer>(Driver.ProbeCount).ToBe(2);
   finally
     Driver.Free;
-    RestoreEnvironmentVariable(SavedProcessor);
-    RestoreEnvironmentVariable(SavedOperatingSystem);
   end;
 end;
 
@@ -798,13 +754,18 @@ end;
 
 procedure TLWPTFPCCompilerDriverTests.
   TestBuildArgumentsPreserveTestCompileFlagSet;
+begin
+  RunIsolatedCase(IsolatedUnitPathsCase);
+end;
+
+procedure TLWPTFPCCompilerDriverTests.
+  AssertBuildArgumentsPreserveTestCompileFlagSet;
 var
   Arguments: LWPT.Core.TStringArray;
   ConfigurationPath, Scratch: string;
   Driver: TMockFPCCompilerDriver;
   InvocationOptions: TLWPTCompilerInvocationOptions;
   Request: TLWPTBuildRequest;
-  SavedUnitPaths: TSavedEnvironmentVariable;
 begin
   Scratch := ExpandFileName('build/tests/tmp/compiler-driver-arguments');
   RecursiveDelete(Scratch);
@@ -820,8 +781,6 @@ begin
   InvocationOptions := PascalSourceCompilerInvocationOptions(
     ConfigurationPath);
   Driver := TMockFPCCompilerDriver.Create('fpc-under-test');
-  SaveAndClearEnvironmentVariable(PROJECT_NAME + '_FPC_UNIT_PATHS',
-    SavedUnitPaths);
   try
     Driver.ProbeOutput := FixtureProbeOutput('3.2.2', Request.Target);
     Arguments := Driver.BuildArguments(Request, InvocationOptions);
@@ -829,7 +788,6 @@ begin
       '-FUsession/units', '-Fuconfig/unit', '-Ficonfig/include', '-Fusource',
       '-Fisource', '-osession/example', 'source/example.pas']);
   finally
-    RestoreEnvironmentVariable(SavedUnitPaths);
     Driver.Free;
     RecursiveDelete(Scratch);
   end;
@@ -1112,7 +1070,38 @@ begin
     TestWindowsExecutableArtifactPathIsNormalized);
 end;
 
+function RunIsolatedCompilerDriverCase(const ACase: string): Integer;
+var
+  Suite: TLWPTFPCCompilerDriverTests;
 begin
+  Result := 1;
+  Suite := TLWPTFPCCompilerDriverTests.Create('isolated FPC compiler driver');
+  try
+    try
+      if ACase = IsolatedDefaultTargetCase then
+        Suite.AssertDefaultBuildRequestUsesBareProbeTarget
+      else if ACase = IsolatedExplicitProcessorCase then
+        Suite.AssertExplicitProcessorOverrideStillDispatches
+      else if ACase = IsolatedUnitPathsCase then
+        Suite.AssertBuildArgumentsPreserveTestCompileFlagSet
+      else
+        raise Exception.Create('unknown isolated compiler-driver case "'
+          + ACase + '"');
+      Result := 0;
+    except
+      on E: Exception do
+        WriteLn('isolated compiler-driver case "', ACase, '" failed: ',
+          E.Message);
+    end;
+  finally
+    Suite.Free;
+  end;
+end;
+
+begin
+  if (ParamCount >= 2)
+     and (ParamStr(1) = IsolatedCompilerDriverOption) then
+    Halt(RunIsolatedCompilerDriverCase(ParamStr(2)));
   if (ParamCount >= 2)
      and (ParamStr(1) = ProbeTimeoutGrandchildOption) then
     Halt(RunProbeTimeoutGrandchild);
