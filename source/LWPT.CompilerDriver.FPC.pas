@@ -34,6 +34,7 @@ type
   protected
     function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
       out AOutput: string): Integer; virtual;
+    function ProbeTimeoutMilliseconds: QWord; virtual;
   public
     constructor Create(const AExecutableName: string = '');
     destructor Destroy; override;
@@ -59,7 +60,9 @@ implementation
 uses
   Process,
   StrUtils,
-  SysUtils;
+  SysUtils,
+
+  LWPT.ProcessTree;
 
 const
   FPC_PROCESSOR_X86 = 'x86';
@@ -94,6 +97,9 @@ const
   FPC_CANNOT_OPEN_SIGNATURE = 'cannot open';
   FPC_NOT_FOUND_SIGNATURE = 'not found';
   FPC_NO_SUCH_FILE_SIGNATURE = 'no such file';
+  FPC_PROBE_POLL_MILLISECONDS = 10;
+  FPC_PROBE_TIMEOUT_EXIT_CODE = 124;
+  FPC_PROBE_TIMEOUT_MILLISECONDS = 30000;
 
 type
   TLWPTFPCProbeCacheEntry = class
@@ -111,6 +117,36 @@ type
     property ErrorMessage: string read FErrorMessage write FErrorMessage;
     property Target: TLWPTTarget read FTarget;
   end;
+
+  { Termination must run beside the probe's output/reap loop. On Unix,
+    TLWPTProcessTree waits for the process group to become empty, while the
+    owning thread must keep draining output and reap the direct child. }
+  TLWPTFPCProbeTerminationThread = class(TThread)
+  private
+    FProcessTree: TLWPTProcessTree;
+  protected
+    procedure Execute; override;
+  public
+    ErrorMessage: string;
+    constructor Create(const AProcessTree: TLWPTProcessTree);
+  end;
+
+constructor TLWPTFPCProbeTerminationThread.Create(
+  const AProcessTree: TLWPTProcessTree);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FProcessTree := AProcessTree;
+end;
+
+procedure TLWPTFPCProbeTerminationThread.Execute;
+begin
+  try
+    FProcessTree.Terminate;
+  except
+    on E: Exception do ErrorMessage := E.Message;
+  end;
+end;
 
 function CopyCapabilities(const ACapabilities: TLWPTCompilerCapabilities):
   TLWPTCompilerCapabilities;
@@ -527,27 +563,98 @@ var
   ArgumentIndex, BytesRead: Integer;
   Buffer: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
   CompilerProcess: TProcess;
+  ProcessTree: TLWPTProcessTree;
+  StartedAt, TimeoutMilliseconds: QWord;
+  TerminationThread: TLWPTFPCProbeTerminationThread;
+  TimedOut: Boolean;
 begin
   AOutput := '';
   CompilerProcess := TProcess.Create(nil);
+  ProcessTree := nil;
+  TerminationThread := nil;
   try
     CompilerProcess.Executable := FExecutableName;
     for ArgumentIndex := 0 to High(AArguments) do
       CompilerProcess.Parameters.Add(AArguments[ArgumentIndex]);
     CompilerProcess.Options := [poUsePipes, poStderrToOutPut];
-    CompilerProcess.Execute;
+    ProcessTree := TLWPTProcessTree.Create(CompilerProcess);
+    ProcessTree.Execute;
+    StartedAt := GetTickCount64;
+    TimeoutMilliseconds := ProbeTimeoutMilliseconds;
+    TimedOut := False;
     repeat
+      BytesRead := 0;
+      if CompilerProcess.Output.NumBytesAvailable > 0 then
+      begin
+        BytesRead := CompilerProcess.Output.Read(Buffer[0], SizeOf(Buffer));
+        if BytesRead > 0 then
+          AppendRawBytes(AOutput, Buffer[0], BytesRead);
+      end;
+      if not CompilerProcess.Running then Break;
+      if GetTickCount64 - StartedAt >= TimeoutMilliseconds then
+      begin
+        TimedOut := True;
+        Break;
+      end;
+      if BytesRead = 0 then Sleep(FPC_PROBE_POLL_MILLISECONDS);
+    until False;
+    if TimedOut then
+    begin
+      TerminationThread := TLWPTFPCProbeTerminationThread.Create(ProcessTree);
+      TerminationThread.Start;
+      try
+        while CompilerProcess.Running do
+        begin
+          BytesRead := 0;
+          if CompilerProcess.Output.NumBytesAvailable > 0 then
+          begin
+            BytesRead := CompilerProcess.Output.Read(Buffer[0],
+              SizeOf(Buffer));
+            if BytesRead > 0 then
+              AppendRawBytes(AOutput, Buffer[0], BytesRead);
+          end;
+          if BytesRead = 0 then Sleep(FPC_PROBE_POLL_MILLISECONDS);
+        end;
+        CompilerProcess.WaitOnExit;
+      finally
+        TerminationThread.WaitFor;
+      end;
+      if TerminationThread.ErrorMessage <> '' then
+        raise ELWPTCompilerDriverError.Create(
+          'could not terminate timed-out probe: '
+          + TerminationThread.ErrorMessage);
+    end;
+    while CompilerProcess.Output.NumBytesAvailable > 0 do
+    begin
       BytesRead := CompilerProcess.Output.Read(Buffer[0], SizeOf(Buffer));
-      if BytesRead > 0 then
-        AppendRawBytes(AOutput, Buffer[0], BytesRead);
-    until BytesRead <= 0;
-    CompilerProcess.WaitOnExit;
-    Result := CompilerProcess.ExitCode;
-    if (Result = 0) and (CompilerProcess.ExitStatus <> 0) then
-      Result := CompilerProcess.ExitStatus;
+      if BytesRead <= 0 then Break;
+      AppendRawBytes(AOutput, Buffer[0], BytesRead);
+    end;
+    if not TimedOut then CompilerProcess.WaitOnExit;
+    if TimedOut then
+    begin
+      if (AOutput <> '') and (AOutput[Length(AOutput)] <> #10) then
+        AOutput := AOutput + LineEnding;
+      AOutput := AOutput + 'probe timed out after '
+        + IntToStr(TimeoutMilliseconds) + ' ms';
+      Result := FPC_PROBE_TIMEOUT_EXIT_CODE;
+    end
+    else
+    begin
+      Result := CompilerProcess.ExitCode;
+      if (Result = 0) and (CompilerProcess.ExitStatus <> 0) then
+        Result := CompilerProcess.ExitStatus;
+    end;
   finally
+    TerminationThread.Free;
+    ProcessTree.Free;
     CompilerProcess.Free;
   end;
+end;
+
+function TLWPTFPCCompilerDriver.ProbeTimeoutMilliseconds: QWord;
+begin
+  Result := FPC_PROBE_TIMEOUT_MILLISECONDS;
 end;
 
 function TLWPTFPCCompilerDriver.DefaultTarget: TLWPTTarget;
@@ -624,7 +731,7 @@ var
     Version: string;
   CacheIndex, ExitCode: Integer;
   Arguments: LWPT.Core.TStringArray;
-  DispatchRequired, TargetSatisfied: Boolean;
+  DefaultTargetAvailable, DispatchRequired, TargetSatisfied: Boolean;
 begin
   ErrorMessage := '';
   EnterCriticalSection(FProbeCriticalSection);
@@ -650,16 +757,30 @@ begin
         False;
       TLWPTFPCProbeCacheEntry(FProbeCache[CacheIndex]).ErrorMessage := '';
       TargetSatisfied := False;
-      Arguments := ProbeArguments(ATarget, False);
-      try
-        ExitCode := ExecuteProbe(Arguments, Output);
-        TargetSatisfied := (ExitCode = 0)
-          and ParseProbeOutput(Output, Version, ActualOperatingSystem,
-            ActualProcessor)
-          and EquivalentOperatingSystem(ATarget, ActualOperatingSystem)
+      DefaultTargetAvailable := FDefaultTargetProbed
+        and (FDefaultTargetError = '');
+      if (not ARefresh) and DefaultTargetAvailable then
+      begin
+        Version := FDefaultVersion;
+        ActualOperatingSystem := FDefaultTarget.OS;
+        ActualProcessor := FDefaultTarget.Architecture;
+        TargetSatisfied :=
+          EquivalentOperatingSystem(ATarget, ActualOperatingSystem)
           and EquivalentProcessor(ATarget.Architecture, ActualProcessor);
-      except
-        on E: Exception do TargetSatisfied := False;
+      end
+      else
+      begin
+        Arguments := ProbeArguments(ATarget, False);
+        try
+          ExitCode := ExecuteProbe(Arguments, Output);
+          TargetSatisfied := (ExitCode = 0)
+            and ParseProbeOutput(Output, Version, ActualOperatingSystem,
+              ActualProcessor)
+            and EquivalentOperatingSystem(ATarget, ActualOperatingSystem)
+            and EquivalentProcessor(ATarget.Architecture, ActualProcessor);
+        except
+          on E: Exception do TargetSatisfied := False;
+        end;
       end;
       DispatchRequired := not TargetSatisfied;
       if DispatchRequired then

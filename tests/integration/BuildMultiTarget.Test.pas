@@ -29,6 +29,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.Core,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -310,7 +311,7 @@ begin
   WipeOutputs;
   MissingCompiler := FScratch + '/no-such-fpc';
   R := RunLwpt(['build', 'alpha', 'beta'], FScratch,
-    ['LWPT_FPC=' + MissingCompiler]);
+    [PROJECT_NAME + '_FPC=' + MissingCompiler]);
   RequiredMessage := 'compiler "fpc" cannot determine its default target: '
     + 'could not execute "' + MissingCompiler + '"';
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);

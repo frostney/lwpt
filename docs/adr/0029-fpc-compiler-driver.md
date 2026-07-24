@@ -38,6 +38,11 @@ against a compiler change while a target is building. A missing executable,
 missing cross compiler, unexpected target, or incompatible version fails with
 a compiler-and-requirement error; there is no fallback.
 
+Every real probe runs in a `TLWPTProcessTree` with a 30-second deadline. A
+timeout terminates and reaps the isolated process tree before it becomes a
+probe failure, so one stalled compiler cannot hold the shared driver lock
+indefinitely.
+
 FPC output normalization produces `TLWPTBuildResult` diagnostics with severity,
 message, and source path/line/column when FPC supplies an origin. The caller
 retains the original byte-for-byte output for ordered log replay. Failure

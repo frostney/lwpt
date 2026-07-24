@@ -4,6 +4,10 @@ program LWPT.CompilerDriver.FPC.Test;
 {$J-}
 
 uses
+  {$IFDEF UNIX}
+  cthreads,
+  BaseUnix,
+  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -18,7 +22,16 @@ uses
   LWPT.Core,
   Platform,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.Scratch;
+
+const
+  ProbeTimeoutGrandchildOption = '--' + PROGRAM_NAME
+    + '-probe-timeout-grandchild';
+  ProbeTimeoutProxyName = PROGRAM_NAME + '-probe-timeout-proxy';
+  ProbeTimeoutSleepMilliseconds = 30000;
+  TestProbeTimeoutMilliseconds = 1000;
+  TestProbeCompletionTimeoutSeconds = 6;
 
 type
   TMockFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
@@ -44,6 +57,11 @@ type
     property ProbeOutput: string read FProbeOutput write FProbeOutput;
   end;
 
+  TTimeoutFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
+  protected
+    function ProbeTimeoutMilliseconds: QWord; override;
+  end;
+
   TLWPTFPCCompilerDriverTests = class(TTestSuite)
   private
     function FixtureRequest(const ASource, AArtifact: string):
@@ -62,6 +80,7 @@ type
     procedure TestDefaultBuildRequestUsesBareProbeTarget;
     procedure TestExplicitProcessorOverrideStillDispatches;
     procedure TestProbeFailureNamesCompilerAndTargetRequirement;
+    procedure TestProbeTimeoutTerminatesProcessTree;
     procedure TestProbeRejectsUnexpectedTargetTuple;
     procedure TestCapabilitiesAreDefensiveAndDoNotAdvertiseUnits;
     procedure TestBuildArgumentsPreserveBuildFlagSet;
@@ -147,6 +166,62 @@ begin
   SetTestEnvironmentVariable(ASaved.Name, ASaved.Value, ASaved.WasSet);
 end;
 
+procedure TerminateTestProcess(const APID: Integer);
+{$IFDEF MSWINDOWS}
+var
+  ProcessHandle: THandle;
+{$ENDIF}
+begin
+  if not ProcessIsRunning(APID) then Exit;
+  {$IFDEF UNIX}
+  FpKill(APID, SIGKILL);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  ProcessHandle := Windows.OpenProcess(Windows.PROCESS_TERMINATE, False,
+    DWORD(APID));
+  if ProcessHandle = 0 then Exit;
+  try
+    Windows.TerminateProcess(ProcessHandle, 1);
+  finally
+    Windows.CloseHandle(ProcessHandle);
+  end;
+  {$ENDIF}
+end;
+
+function RunProbeTimeoutGrandchild: Integer;
+begin
+  {$IFDEF UNIX}
+  FpSignal(SIGTERM, SignalHandler(SIG_IGN));
+  {$ENDIF}
+  WriteTextFile(ParamStr(2), IntToStr(GetProcessID));
+  Sleep(ProbeTimeoutSleepMilliseconds);
+  Result := 0;
+end;
+
+function RunProbeTimeoutProxy: Integer;
+var
+  Grandchild: TProcess;
+  GrandchildPIDPath: string;
+begin
+  {$IFDEF UNIX}
+  FpSignal(SIGTERM, SignalHandler(SIG_IGN));
+  {$ENDIF}
+  GrandchildPIDPath := ExtractFileDir(ParamStr(0)) + '/grandchild-pid';
+  Grandchild := TProcess.Create(nil);
+  try
+    Grandchild.Executable := ExpandFileName(ParamStr(0));
+    Grandchild.Parameters.Add(ProbeTimeoutGrandchildOption);
+    Grandchild.Parameters.Add(GrandchildPIDPath);
+    Grandchild.Execute;
+    while not FileExists(GrandchildPIDPath) and Grandchild.Running do
+      Sleep(ProcessPollMilliseconds);
+    Sleep(ProbeTimeoutSleepMilliseconds);
+  finally
+    Grandchild.Free;
+  end;
+  Result := 0;
+end;
+
 function FixtureFPCOperatingSystem(const ATarget: TLWPTTarget): string;
 begin
   Result := ATarget.OS;
@@ -191,6 +266,11 @@ begin
   else
     AOutput := FProbeOutput;
   Result := FProbeExitCode;
+end;
+
+function TTimeoutFPCCompilerDriver.ProbeTimeoutMilliseconds: QWord;
+begin
+  Result := TestProbeTimeoutMilliseconds;
 end;
 
 function TLWPTFPCCompilerDriverTests.ArgumentsContain(
@@ -475,10 +555,68 @@ begin
     Arguments := Driver.BuildArguments(Request, InvocationOptions);
     Expect<Boolean>(ArgumentsContain(Arguments, '-Paarch64')).ToBe(True);
     Expect<Boolean>(ArgumentsContain(Arguments, '-Tlinux')).ToBe(True);
+    Expect<Integer>(Driver.ProbeCount).ToBe(2);
   finally
     Driver.Free;
     RestoreEnvironmentVariable(SavedProcessor);
     RestoreEnvironmentVariable(SavedOperatingSystem);
+  end;
+end;
+
+procedure TLWPTFPCCompilerDriverTests.TestProbeTimeoutTerminatesProcessTree;
+var
+  Driver: TTimeoutFPCCompilerDriver;
+  ElapsedMilliseconds, StartedAt: QWord;
+  GrandchildPID: Integer;
+  ErrorMessage, GrandchildPIDPath, ProxyPath, Scratch: string;
+  Raised: Boolean;
+begin
+  Scratch := ExpandFileName('build/tests/tmp/compiler-driver-probe-timeout');
+  GrandchildPIDPath := Scratch + '/grandchild-pid';
+  ProxyPath := Scratch + '/' + ProbeTimeoutProxyName
+    + ExtractFileExt(ParamStr(0));
+  RecursiveDelete(Scratch);
+  ForceDirectories(Scratch);
+  if not CopyFileContent(ExpandFileName(ParamStr(0)), ProxyPath) then
+    raise Exception.Create('could not create probe-timeout proxy');
+  {$IFDEF UNIX}
+  if FpChmod(PChar(ProxyPath), &755) <> 0 then RaiseLastOSError;
+  {$ENDIF}
+  Driver := TTimeoutFPCCompilerDriver.Create(ProxyPath);
+  GrandchildPID := 0;
+  try
+    Raised := False;
+    ErrorMessage := '';
+    StartedAt := GetTickCount64;
+    try
+      Driver.DefaultTarget;
+    except
+      on E: ELWPTCompilerDriverError do
+      begin
+        ErrorMessage := E.Message;
+        Raised := (Pos('failed (exit 124)', E.Message) > 0)
+          and (Pos('probe timed out after '
+            + IntToStr(TestProbeTimeoutMilliseconds) + ' ms', E.Message) > 0);
+      end;
+    end;
+    ElapsedMilliseconds := GetTickCount64 - StartedAt;
+    if not Raised then
+      WriteLn('PROBE-TIMEOUT TEST FAILURE: elapsed=', ElapsedMilliseconds,
+        ' error="', ErrorMessage, '" proxy="', ProxyPath, '" pidFile=',
+        FileExists(GrandchildPIDPath));
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(ElapsedMilliseconds
+      < QWord(TestProbeCompletionTimeoutSeconds * 1000)).ToBe(True);
+    Expect<Boolean>(FileExists(GrandchildPIDPath)).ToBe(True);
+    if FileExists(GrandchildPIDPath) then
+    begin
+      GrandchildPID := StrToInt(Trim(ReadBinaryFile(GrandchildPIDPath)));
+      Expect<Boolean>(ProcessIsRunning(GrandchildPID)).ToBe(False);
+    end;
+  finally
+    Driver.Free;
+    TerminateTestProcess(GrandchildPID);
+    RecursiveDelete(Scratch);
   end;
 end;
 
@@ -682,7 +820,8 @@ begin
   InvocationOptions := PascalSourceCompilerInvocationOptions(
     ConfigurationPath);
   Driver := TMockFPCCompilerDriver.Create('fpc-under-test');
-  SaveAndClearEnvironmentVariable('LWPT_FPC_UNIT_PATHS', SavedUnitPaths);
+  SaveAndClearEnvironmentVariable(PROJECT_NAME + '_FPC_UNIT_PATHS',
+    SavedUnitPaths);
   try
     Driver.ProbeOutput := FixtureProbeOutput('3.2.2', Request.Target);
     Arguments := Driver.BuildArguments(Request, InvocationOptions);
@@ -949,6 +1088,8 @@ begin
     TestExplicitProcessorOverrideStillDispatches);
   Test('probe failure names compiler and target requirement',
     TestProbeFailureNamesCompilerAndTargetRequirement);
+  Test('probe timeout terminates the isolated process tree',
+    TestProbeTimeoutTerminatesProcessTree);
   Test('probe rejects a successful response for the wrong target tuple',
     TestProbeRejectsUnexpectedTargetTuple);
   Test('capabilities are defensive and do not advertise unit outputs',
@@ -972,6 +1113,12 @@ begin
 end;
 
 begin
+  if (ParamCount >= 2)
+     and (ParamStr(1) = ProbeTimeoutGrandchildOption) then
+    Halt(RunProbeTimeoutGrandchild);
+  if SameText(ChangeFileExt(ExtractFileName(ParamStr(0)), ''),
+    ProbeTimeoutProxyName) then
+    Halt(RunProbeTimeoutProxy);
   TestRunnerProgram.AddSuite(TLWPTFPCCompilerDriverTests.Create(
     'FPC compiler driver'));
   TestRunnerProgram.Run;
