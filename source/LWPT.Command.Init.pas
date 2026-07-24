@@ -20,7 +20,8 @@ uses
   LWPT.Command.Build,
   LWPT.Command.Install,
   LWPT.Core,
-  LWPT.Manifest;
+  LWPT.Manifest,
+  LWPT.WorkerBudget;
 
 {
   CmdInit (ADR-0010) — scaffold a new LWPT project. Interactive by
@@ -109,11 +110,12 @@ var
   Existed, HasEntry: Boolean;
   Added: Integer;
 begin
-  SetLength(Wanted, 4);
-  Wanted[0] := TMP_DIR + '/';
+  SetLength(Wanted, 5);
+  Wanted[0] := GITIGNORE_LINE;
   Wanted[1] := INSTALL_LOCK;
   Wanted[2] := BUILD_SESSIONS_DIR + '/';
-  Wanted[3] := StringReplace(IncludeTrailingPathDelimiter(ABuildDir),
+  Wanted[3] := WORKER_STATE_FALLBACK_DIR + '/';
+  Wanted[4] := StringReplace(IncludeTrailingPathDelimiter(ABuildDir),
     DirectorySeparator, '/', [rfReplaceAll]);
   Existed := FileExists(APath);
   SL := TStringList.Create;

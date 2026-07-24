@@ -55,7 +55,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | --- | --- | --- |
 | `LWPT_CACHE_DIR` | Reserved for [issue #30](https://github.com/frostney/lwpt/issues/30). Today: ignored. | n/a until the cache implementation lands |
 | `LWPT_WORKER_BUDGET` | Maximum aggregate LWPT workers for this user and machine | logical processor count |
-| `LWPT_WORKER_STATE_DIR` | Override the per-user coordinator state root | the platform application-config directory's `workers/` subdirectory |
+| `LWPT_WORKER_STATE_DIR` | Override the worker coordinator state root; an explicit unwritable path fails rather than falling back | the platform application-config directory's `workers/` subdirectory, with automatic fallback to the repository's `.lwpt/workers/` when that default is unwritable |
 | `LWPT_WORKER_LEASE_STALE_SECONDS` | Mark heartbeat diagnostics stale after this interval; values below 3 are rejected. Heartbeat age never authorises reclamation by itself. | `30` |
 | `LWPT_WORKER_LEASE_TOKEN` | One-shot opaque delegation token added to one nested LWPT subprocess by the worker-budget API; do not configure, reuse, or persist manually | unset |
 | `FPC_TARGET_CPU` | Requested compiler target processor. A non-host value is probed and passed as `-P<value>`; unavailable dispatch fails without fallback. | unset (host CPU) |
@@ -77,11 +77,18 @@ requests up to one worker per runnable test. Both are capped by the effective
 machine budget, and `--jobs=N` sets a smaller invocation request.
 
 Each invocation registers a session request in a per-user state root shared by
-all worktrees. The effective budget is the first invocation's configured
-`LWPT_WORKER_BUDGET`, or the logical processor count when unset. Later
-invocations adopt that active budget until all current requests finish. A
-request cannot hold more than its own requested worker count or the effective
-machine budget.
+all worktrees. LWPT resolves that root once per process. When the default
+application-config path cannot create and remove a unique sentinel file, LWPT
+applies the same probe to the current repository's `.lwpt/workers/` directory.
+It prints the fallback notice only after that probe passes. If neither root is
+writable, LWPT fails with an error directing the user to
+`LWPT_WORKER_STATE_DIR`. A valid fallback keeps write-restricted sandboxes
+working but forfeits cross-worktree budget sharing. An explicit
+`LWPT_WORKER_STATE_DIR` remains authoritative and fails if unwritable. The
+effective budget is the first invocation's configured `LWPT_WORKER_BUDGET`, or
+the logical processor count when unset. Later invocations adopt that active
+budget until all current requests finish. A request cannot hold more than its
+own requested worker count or the effective machine budget.
 
 Short state transactions use `fcntl` on Unix and `LockFileEx` on Windows. Each
 active request has a lifetime owner guard held by the operating system and

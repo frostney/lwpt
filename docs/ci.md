@@ -6,18 +6,20 @@ Four GitHub Actions workflows, mirroring the GocciaScript pattern that LWPT's ve
 |----------|---------|---------|
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch` | Build + cache the cross-FPC toolchain |
 | `ci.yml` | `push` to `main`, `workflow_dispatch` | Post-merge confirmation: full 6-target cross-build + native test matrix on the merged main tree |
-| `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: fast Ubuntu runner + win64 leg (cross-compile, then native offline test run on `windows-latest`); typical wall-clock < 5 min on a warm toolchain cache |
+| `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: Ubuntu leg (default tier + live-network e2e per #102), native aarch64-darwin leg (default tier), win64 leg (cross-compile, then native offline test run on `windows-latest`); typical wall-clock < 10 min warm, hard caps 15 min (e2e step) / 20 min (darwin job) |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
-- **PRs go through `pr.yml` only** — an Ubuntu runner plus a win64 leg: cross-compile on macOS, then the offline default test tier natively on `windows-latest`. Cheap signal so PR authors aren't blocked on a 30-minute matrix per push.
-- **`ci.yml` runs only on `push` to `main`** — i.e. after merge. This is where the heavyweight 6-target cross-build + native test matrix lives. A PR that introduces a platform-specific regression outside the win64 leg (aarch64-only behaviour, a darwin-only path quirk) will pass `pr.yml` and fail the post-merge `ci.yml` run; the maintainer then reverts or forwards-fixes from `main`. The trade-off is conscious: cheap PR feedback over pre-merge cross-platform certainty. Windows (win64) is the one carve-out — compile errors *and* offline-tier runtime breaks there are caught pre-merge by `pr.yml`'s `windows-cross-compile` + `windows-test` jobs (added after PR #17 merged green with a `SysUtils.FindClose` vs `Windows.FindClose` shadowing break that PR #21 had to fix on `main`).
+- **PRs go through `pr.yml` only** — an Ubuntu leg (default tier plus the live-network e2e tier per [issue #102](https://github.com/frostney/lwpt/issues/102)), a native aarch64-darwin leg (default tier), and a win64 leg: cross-compile on macOS, then the offline default test tier natively on `windows-latest`. Cheap signal so PR authors aren't blocked on the full 6-target matrix per push.
+- **`ci.yml` runs only on `push` to `main`** — i.e. after merge. This is where the heavyweight 6-target cross-build + native test matrix lives. A PR that introduces a regression on the legs the gate still omits (`x86_64-darwin`, `aarch64-linux`, `i386-win32`, non-Linux e2e) will pass `pr.yml` and fail the post-merge `ci.yml` run; the maintainer then reverts or forwards-fixes from `main`. The trade-off is conscious and has narrowed over time: Windows (win64) was the first carve-out (added after PR #17 merged green with a `SysUtils.FindClose` vs `Windows.FindClose` shadowing break that PR #21 had to fix on `main`), and #102 added the Linux e2e step and the native aarch64-darwin leg after the #84/#105 escape classes.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
 Repository rules make these workflow contracts enforceable. The default branch
-requires every `pr.yml` job (`build-and-test`, `docs`, `toolchain / build`,
-`windows-cross-compile`, and `windows-test`) before squash merge. A separate
+requires every `pr.yml` job (`build-and-test`, `darwin-test`, `docs`,
+`toolchain / build`, `windows-cross-compile`, and `windows-test`) before
+squash merge — a newly added job is not required automatically, so adding a
+`pr.yml` job includes adding its check context to the ruleset. A separate
 release-tag ruleset restricts SemVer tag creation to the maintainer and rejects
 tag updates or deletion. The protected `release` environment provides the
 explicit approval gate between successful builds and publication.
@@ -88,7 +90,7 @@ Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR
 8. `./build/lwpt agents --check` (generated command-reference drift)
 9. `./build/lwpt test --bail=1` (default tier — unit + integration)
 
-E2E tests are skipped via `LWPT_SKIP_NETWORK=1`; they run on every platform post-merge via `ci.yml`. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
+The live-network e2e tier runs pre-merge on the Linux leg only — a dedicated step that overrides the job-level skip with `LWPT_SKIP_NETWORK: "0"` (the harness skips only on the exact value `1`), added per [issue #102](https://github.com/frostney/lwpt/issues/102) after the #84 TLS-close and #101 timing classes proved invisible to a default-tier-only gate; every platform still runs e2e post-merge via `ci.yml`. A second PR job, `darwin-test`, natively bootstraps on `macos-latest` (brew FPC, independent of the cross-toolchain cache) and runs the default tier — the #105 env-race family and its masks all first surfaced on darwin legs. Bounded cost: ~5–6 min warm (hard cap 20 min), parallel to `build-and-test`. The remaining `ci.yml`-only legs (`x86_64-darwin`, `aarch64-linux`, `i386-win32`) stay post-merge. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
 
 The PR workflow deliberately uses the distro FPC (same as the install instructions in `README.md`), so any regression that only shows up with the system FPC's slightly older RTL gets caught before merge.
 
@@ -101,14 +103,14 @@ The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `
 Deliberate scope limits — still post-merge only (`ci.yml`):
 
 - **The `i386-win32` leg** (win32 and win64 share `{$IFDEF WINDOWS}` sources; the 32-bit leg re-verifies, it rarely diverges).
-- **The live-network e2e tier** and the `bootstrap.bat` cold-build smoke.
-- **Non-Windows platform-specific behaviour.** `{$IFDEF DARWIN}`-gated code (e.g. the SecureTransport backend) is the same never-compiles-on-Ubuntu class but stays post-merge — Windows is where this class has actually bitten. If a darwin incident ever lands, the cheap extension is a second compile in the same cross-compile job (`ppca64` is the native compiler in the same restored cache; no cross-binutils needed).
+- **The e2e tier on non-Linux platforms** and the `bootstrap.bat` cold-build smoke (the Linux e2e leg runs pre-merge per #102).
+- **`x86_64-darwin` and `aarch64-linux` runtime.** The aarch64-darwin PR leg covers `{$IFDEF DARWIN}` compile + arm64 runtime pre-merge (added per #102 after the #105 env-race family surfaced on darwin legs first); the intel-mac and arm-linux permutations stay post-merge — their unique-catch rate has not justified per-PR cost.
 
 Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`) has no branch component, and GitHub Actions lets PR runs restore caches created on the base branch — so PR runs hit the toolchain that `ci.yml` pushes to `main` keep warm, and the `toolchain` job is a seconds-long cache lookup. On eviction, the PR run rebuilds the toolchain (~30 min) into its own cache scope (not shared across PRs); a weekly `schedule` cron on `toolchain.yml` re-warms the default-branch copy so that window is bounded even when `main` is quiet. `pr.yml` also sets `concurrency` with `cancel-in-progress`, so a superseded push doesn't keep burning the macOS runner.
 
 #### Why not fully cross-platform on PRs?
 
-A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 min cold), per PR push. Multiplied across the typical commit-amend-push-amend-push PR cycle, that's an order of magnitude more CI minutes than a single Ubuntu run. GocciaScript made the same trade-off: cheap iteration on PRs, exhaustive verification on the merged main tree. Platform-specific *runtime* regressions that slip through pr.yml surface in the post-merge ci.yml run on `main`; the maintainer reverts the offending commit or rolls a forward-fix PR. The win64 leg (cross-compile + native offline test run, ~3 min total on a warm cache) is the deliberate exception — it buys back the most common post-merge breakage class, on the one platform where it has actually bitten, without paying for the full matrix.
+A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 min cold), per PR push. Multiplied across the typical commit-amend-push-amend-push PR cycle, that's an order of magnitude more CI minutes than a single Ubuntu run. GocciaScript made the same trade-off: cheap iteration on PRs, exhaustive verification on the merged main tree. Platform-specific *runtime* regressions that slip through pr.yml surface in the post-merge ci.yml run on `main`; the maintainer reverts the offending commit or rolls a forward-fix PR. The win64 leg (cross-compile + native offline test run, ~3 min total on a warm cache) was the first deliberate exception, buying back the most common post-merge breakage class without paying for the full matrix; #102 extended the same reasoning to the Linux e2e step and the aarch64-darwin leg once those classes had bitten too.
 
 ### `release.yml` — tag-triggered release pipeline
 

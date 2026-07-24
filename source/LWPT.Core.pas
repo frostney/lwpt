@@ -31,6 +31,7 @@ const
   GITIGNORE_LINE = LWPT_DIR + '/tmp/';
 
   PROCESS_OUTPUT_BUFFER_SIZE = 4096;
+  TREE_HASH_PATH_SEPARATOR = '/';
 
   PLACEHOLDER_USER       = '{user}';
   PLACEHOLDER_REPOSITORY = '{repository}';
@@ -89,6 +90,8 @@ procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
 function  SHA256BytesPrefixed(const ABytes: TBytes): string;
 function  SHA256Hex(const AData: TBytes): string;
 function  SHA256File(const APath: string): string;
+function  CanonicalTreeHashPath(const APath: string;
+  const ASourceDelimiter: Char): string;
 function  HashTree(const APathOrArchive: string): string;
 
 { Appends every entry of the process environment to ATarget, safe to call
@@ -1064,6 +1067,15 @@ begin
   Result := SHA256Hex(Buf);
 end;
 
+function CanonicalTreeHashPath(const APath: string;
+  const ASourceDelimiter: Char): string;
+begin
+  { Replace only the caller's native delimiter: backslashes are valid
+    filename characters on POSIX and must remain hash input there. }
+  Result := StringReplace(APath, ASourceDelimiter,
+    TREE_HASH_PATH_SEPARATOR, [rfReplaceAll]);
+end;
+
 { Hash of an installed package: SHA-256 over every extracted file's bytes,
   visited in sorted relative-path order so the digest is stable regardless
   of filesystem enumeration order or which mirror served the archive.
@@ -1090,12 +1102,12 @@ begin
         begin
           if ((SR.Attr and faDirectory) = 0)
              and FileExists(Path + SR.Name) then
-            AList.Add(RelPath);
+            AList.Add(CanonicalTreeHashPath(RelPath, PathDelim));
         end
         else if (SR.Attr and faDirectory) <> 0 then
           CollectFiles(ARoot, RelPath + PathDelim, AList)
         else
-          AList.Add(RelPath);
+          AList.Add(CanonicalTreeHashPath(RelPath, PathDelim));
       until SysUtils.FindNext(SR) <> 0;
     finally
       SysUtils.FindClose(SR);
@@ -1117,6 +1129,8 @@ begin
     Files := TStringList.Create;
     try
       CollectFiles(IncludeTrailingPathDelimiter(APathOrArchive), '', Files);
+      { Keep the existing comparator for lockfile compatibility. Its
+        ordering remains locale-sensitive for non-ASCII filenames. }
       Files.Sort;
       SetLength(Acc, 0);
       for i := 0 to Files.Count - 1 do
@@ -1127,7 +1141,8 @@ begin
         SetLength(Acc, n + Length(Chunk));
         if Length(Chunk) > 0 then Move(Chunk[0], Acc[n], Length(Chunk));
 
-        FullPath := IncludeTrailingPathDelimiter(APathOrArchive) + Files[i];
+        FullPath := NativePath(IncludeTrailingPathDelimiter(APathOrArchive)
+          + Files[i]);
         FS := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
         try
           n := Length(Acc);

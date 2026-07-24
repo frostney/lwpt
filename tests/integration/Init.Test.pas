@@ -7,9 +7,9 @@
       the scratch dir's basename, version "0.1.0", units = ["source"].
     - lwpt.lock: schema-v3 empty lockfile (no packages, but the
       version header is correct so the next `lwpt install` accepts it).
-    - .gitignore: contains the three LWPT-internal paths
-      (.lwpt/tmp/ + .lwpt/install.lock + .lwpt/sessions/) — added if
-      absent, never
+    - .gitignore: contains the four LWPT-internal paths
+      (.lwpt/tmp/ + .lwpt/install.lock + .lwpt/sessions/ + .lwpt/workers/) —
+      added if absent, never
       duplicated if present.
 
   Also covers the refuse-to-clobber semantics: a second run without
@@ -140,6 +140,7 @@ begin
   Expect<Boolean>(Pos('.lwpt/tmp/',         GI) > 0).ToBe(True);
   Expect<Boolean>(Pos('.lwpt/install.lock', GI) > 0).ToBe(True);
   Expect<Boolean>(Pos('.lwpt/sessions/',    GI) > 0).ToBe(True);
+  Expect<Boolean>(Pos('.lwpt/workers/',     GI) > 0).ToBe(True);
   Expect<Boolean>(Pos('build/',             GI) > 0).ToBe(True);
 end;
 
@@ -232,7 +233,8 @@ begin
     '# existing'#10 +
     '.lwpt/tmp/'#10 +
     '.lwpt/install.lock'#10 +
-    '.lwpt/sessions/'#10);
+    '.lwpt/sessions/'#10 +
+    '.lwpt/workers/'#10);
   R := RunLwpt(['init', '--yes', '--force'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
 
@@ -247,6 +249,13 @@ begin
   begin
     Inc(Count);
     GI := StringReplace(GI, '.lwpt/tmp/', '###', []);
+  end;
+  Expect<Integer>(Count).ToBe(1);
+  Count := 0;
+  while Pos('.lwpt/workers/', GI) > 0 do
+  begin
+    Inc(Count);
+    GI := StringReplace(GI, '.lwpt/workers/', '###', []);
   end;
   Expect<Integer>(Count).ToBe(1);
 end;
