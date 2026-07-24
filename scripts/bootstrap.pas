@@ -17,7 +17,7 @@ program Bootstrap;
   is the single fpc invocation below.
 
   Compiler flags here MUST stay in sync with the dev-mode flags in
-  AddBuildModeFlags inside source/LWPT.Command.Build.pas. The bootstrap only
+  TLWPTFPCCompilerDriver.BuildArguments. The bootstrap only
   ever performs a dev build; release builds always go through
   ./build/lwpt build --mode release.
 
@@ -129,7 +129,7 @@ var
 begin
   ForceDirectories(BUILD_DIR);
   WriteLn('bootstrap: compiling ', PROGRAM_SOURCE, ' -> ', OUTPUT_BINARY);
-  { Dev flags only. Mirrors AddBuildModeFlags' dev branch in LWPT.Command.Build;
+  { Dev flags only. Mirrors TLWPTFPCCompilerDriver.BuildArguments' dev path;
     keep in sync until scripts/bootstrap-flags.inc is introduced. }
   Code := RunProcess('fpc',
     [ '-Mdelphi', '-Sh',

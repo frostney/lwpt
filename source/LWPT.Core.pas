@@ -30,6 +30,7 @@ const
 
   GITIGNORE_LINE = LWPT_DIR + '/tmp/';
 
+  PROCESS_OUTPUT_BUFFER_SIZE = 4096;
   TREE_HASH_PATH_SEPARATOR = '/';
 
   PLACEHOLDER_USER       = '{user}';
@@ -56,6 +57,8 @@ function  InstantFPCExecutable: string;
 procedure AddEnvUnitPathParameters(AParameters: TStrings);
 function  NativePath(const APath: string): string;
 function  SanitisePathSegment(const AValue: string): string;
+procedure AppendRawBytes(var ADestination: string; const ABuffer;
+  const ACount: Integer);
 
 function  TomlEscape(const S: string): string;
 function  TomlGet(ANode: TTOMLNode; const AKey: string): TTOMLNode;
@@ -170,6 +173,17 @@ begin
   {$ELSE}
   Result := 'instantfpc';
   {$ENDIF}
+end;
+
+procedure AppendRawBytes(var ADestination: string; const ABuffer;
+  const ACount: Integer);
+var
+  PreviousLength: Integer;
+begin
+  if ACount <= 0 then Exit;
+  PreviousLength := Length(ADestination);
+  SetLength(ADestination, PreviousLength + ACount);
+  Move(ABuffer, ADestination[PreviousLength + 1], ACount);
 end;
 
 procedure AddEnvUnitPathParameters(AParameters: TStrings);

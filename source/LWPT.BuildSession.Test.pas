@@ -10,10 +10,12 @@ uses
   Classes,
   SysUtils,
 
+  TestingPascalLibrary,
+
   LWPT.BuildRequest,
   LWPT.BuildSession,
-  LWPT.Core,
-  TestingPascalLibrary;
+  LWPT.CompilerDriver.FPC,
+  LWPT.Core;
 
 type
   TLWPTBuildSessionTests = class(TTestSuite)
@@ -42,6 +44,7 @@ type
     procedure TestSourceDirectoryChangeRefusesPublication;
     procedure TestExplicitExcludedResourceChangeRefusesPublication;
     procedure TestHookInputChangeRefusesPublication;
+    procedure TestNativeDriverRequestPreservesPublicationFingerprint;
     {$IFDEF UNIX}
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
     procedure TestDirectoryAliasesHaveDeterministicFingerprint;
@@ -55,6 +58,49 @@ procedure TLWPTBuildSessionTests.ResetScratch;
 begin
   if DirectoryExists(FScratch) then WipeDir(FScratch);
   ForceDirectories(FScratch);
+end;
+
+procedure TLWPTBuildSessionTests.
+  TestNativeDriverRequestPreservesPublicationFingerprint;
+var
+  Capabilities: TLWPTCompilerCapabilities;
+  Driver: TLWPTFPCCompilerDriver;
+  DriverRequest, LegacyRequest: TLWPTBuildPublicationRequest;
+  DriverFingerprint, LegacyFingerprint: string;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  Driver := TLWPTFPCCompilerDriver.Create;
+  try
+    DriverRequest := BasicRequest;
+    DriverRequest.BuildRequest := CreateFPCBuildRequest(
+      'source/app.pas', 'candidate/app', Driver);
+    SetLength(DriverRequest.BuildRequest.Inputs.UnitPaths, 1);
+    DriverRequest.BuildRequest.Inputs.UnitPaths[0] := 'source';
+    Capabilities := Driver.ProbeCapabilities(DriverRequest.BuildRequest.Target);
+    DriverRequest.BuildRequest.Compiler.VersionIdentity :=
+      Capabilities.VersionIdentity;
+    DriverRequest.CompilerExecutable := Driver.ExecutableName;
+
+    LegacyRequest := BasicRequest;
+    LegacyRequest.BuildRequest.Compiler.ID := FPC_COMPILER_ID;
+    LegacyRequest.BuildRequest.Compiler.VersionConstraint := '*';
+    LegacyRequest.BuildRequest.Compiler.VersionIdentity :=
+      Capabilities.VersionIdentity;
+    LegacyRequest.CompilerExecutable := Driver.ExecutableName;
+    LegacyRequest.BuildRequest.Target := DriverRequest.BuildRequest.Target;
+    LegacyRequest.BuildRequest.Outputs.Artifact :=
+      DriverRequest.BuildRequest.Outputs.Artifact;
+
+    DriverFingerprint := CaptureBuildPublicationFingerprint(FScratch,
+      MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, DriverRequest);
+    LegacyFingerprint := CaptureBuildPublicationFingerprint(FScratch,
+      MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, LegacyRequest);
+    Expect<string>(DriverFingerprint).ToBe(LegacyFingerprint);
+  finally
+    Driver.Free;
+  end;
 end;
 
 procedure TLWPTBuildSessionTests.WriteText(const APath, AText: string);
@@ -723,6 +769,8 @@ begin
     TestExplicitExcludedResourceChangeRefusesPublication);
   Test('postbuild hook input changes refuse publication',
     TestHookInputChangeRefusesPublication);
+  Test('native driver request preserves the publication fingerprint',
+    TestNativeDriverRequestPreservesPublicationFingerprint);
   {$IFDEF UNIX}
   Test('symlinked search roots detect changes and terminate cycles',
     TestSymlinkedSearchRootChangeRefusesPublication);

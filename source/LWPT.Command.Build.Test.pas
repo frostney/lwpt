@@ -1,12 +1,5 @@
-{ LWPT.Command.Build.Test — unit-tier coverage for the stale-artefact
-  failure heuristic behind the `--clean` retry hint.
-
-  Non-destructive clean rebuild behaviour is covered end-to-end by
-  tests/integration/BuildClean.Test.pas through the real binary; this
-  file stays at the unit level: string classification plus the
-  TLWPTCompilerProcess contract (cancellation reaping, exit-code
-  reporting), exercised by re-invoking this test binary as a proxy
-  child instead of launching a full build. }
+{ LWPT.Command.Build.Test — TLWPTCompilerProcess cancellation, reaping,
+  and exit-code coverage below the compiler-driver seam. }
 
 program LWPT.Command.Build.Test;
 
@@ -48,15 +41,9 @@ const
   ProcessExitTimeoutSeconds = 3;
 
 type
-  TStaleArtefactSignature = class(TTestSuite)
+  TLWPTCompilerProcessTests = class(TTestSuite)
   public
     procedure SetupTests; override;
-    procedure TestInternalCompilerExceptionMatches;
-    procedure TestResourceCompileErrorMatches;
-    procedure TestMissingReslstMatches;
-    procedure TestOrdinarySourceErrorDoesNotMatch;
-    procedure TestReslstMentionAloneDoesNotMatch;
-    procedure TestEmptyOutputDoesNotMatch;
     procedure TestCompilerCancellationCapturesAndReaps;
     procedure TestCompilerNormalExitLeavesDescendantAlive;
     procedure TestCompilerNonZeroExitIsReported;
@@ -117,45 +104,8 @@ begin
   end;
 end;
 
-procedure TStaleArtefactSignature.TestInternalCompilerExceptionMatches;
-begin
-  Expect<Boolean>(HasStaleArtefactSignature(
-    'Fatal: Compilation raised exception internally')).ToBe(True);
-end;
-
-procedure TStaleArtefactSignature.TestResourceCompileErrorMatches;
-begin
-  Expect<Boolean>(HasStaleArtefactSignature(
-    'Error while compiling resources -> compile with -vd for more details'))
-    .ToBe(True);
-end;
-
-procedure TStaleArtefactSignature.TestMissingReslstMatches;
-begin
-  Expect<Boolean>(HasStaleArtefactSignature(
-    'fpcres: Error: Cannot open file build/app.reslst')).ToBe(True);
-end;
-
-procedure TStaleArtefactSignature.TestOrdinarySourceErrorDoesNotMatch;
-begin
-  Expect<Boolean>(HasStaleArtefactSignature(
-    'bad.pas(3,3) Error: Identifier not found "ThisDoesNotExist"'#10
-    + 'Fatal: Compilation aborted')).ToBe(False);
-end;
-
-procedure TStaleArtefactSignature.TestReslstMentionAloneDoesNotMatch;
-begin
-  { .reslst only signals staleness together with an open/read failure }
-  Expect<Boolean>(HasStaleArtefactSignature(
-    'Writing resource list build/app.reslst')).ToBe(False);
-end;
-
-procedure TStaleArtefactSignature.TestEmptyOutputDoesNotMatch;
-begin
-  Expect<Boolean>(HasStaleArtefactSignature('')).ToBe(False);
-end;
-
-procedure TStaleArtefactSignature.TestCompilerCancellationCapturesAndReaps;
+procedure TLWPTCompilerProcessTests.
+  TestCompilerCancellationCapturesAndReaps;
 var
   Runner: TLWPTCompilerProcess;
   Worker: TCompilerRunnerThread;
@@ -201,7 +151,7 @@ begin
   end;
 end;
 
-procedure TStaleArtefactSignature.TestCompilerNonZeroExitIsReported;
+procedure TLWPTCompilerProcessTests.TestCompilerNonZeroExitIsReported;
 var
   Runner: TLWPTCompilerProcess;
   OutText: string;
@@ -228,7 +178,8 @@ begin
   end;
 end;
 
-procedure TStaleArtefactSignature.TestCompilerNormalExitLeavesDescendantAlive;
+procedure TLWPTCompilerProcessTests.
+  TestCompilerNormalExitLeavesDescendantAlive;
 var
   Child: TProcess;
   ProcessTree: TLWPTProcessTree;
@@ -268,17 +219,8 @@ begin
   end;
 end;
 
-procedure TStaleArtefactSignature.SetupTests;
+procedure TLWPTCompilerProcessTests.SetupTests;
 begin
-  Test('internal compiler exception matches',
-    TestInternalCompilerExceptionMatches);
-  Test('resource-compile error matches', TestResourceCompileErrorMatches);
-  Test('missing .reslst matches', TestMissingReslstMatches);
-  Test('ordinary source error does not match',
-    TestOrdinarySourceErrorDoesNotMatch);
-  Test('.reslst mention alone does not match',
-    TestReslstMentionAloneDoesNotMatch);
-  Test('empty output does not match', TestEmptyOutputDoesNotMatch);
   Test('compiler cancellation captures output and reaps the child',
     TestCompilerCancellationCapturesAndReaps);
   Test('compiler normal exit leaves a live descendant alone',
@@ -375,8 +317,8 @@ begin
   if (ParamCount >= 2)
      and (ParamStr(1) = CompilerSurvivingDescendantProxyOption) then
     Halt(RunCompilerSurvivingDescendantProxy);
-  TestRunnerProgram.AddSuite(TStaleArtefactSignature.Create(
-    'build: stale-artefact failure signature'));
+  TestRunnerProgram.AddSuite(TLWPTCompilerProcessTests.Create(
+    'build: compiler process'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

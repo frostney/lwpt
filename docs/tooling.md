@@ -58,8 +58,8 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `LWPT_WORKER_STATE_DIR` | Override the worker coordinator state root; an explicit unwritable path fails rather than falling back | the platform application-config directory's `workers/` subdirectory, with automatic fallback to the repository's `.lwpt/workers/` when that default is unwritable |
 | `LWPT_WORKER_LEASE_STALE_SECONDS` | Mark heartbeat diagnostics stale after this interval; values below 3 are rejected. Heartbeat age never authorises reclamation by itself. | `30` |
 | `LWPT_WORKER_LEASE_TOKEN` | One-shot opaque delegation token added to one nested LWPT subprocess by the worker-budget API; do not configure, reuse, or persist manually | unset |
-| `FPC_TARGET_CPU` | When set, `lwpt build` passes `-P<value>` to FPC for cross-compilation | unset (host CPU) |
-| `FPC_TARGET_OS` | Recorded into the build request's target tuple and publication fingerprint only. No `-T` flag is emitted and capability matching is not wired into the build path — this does not perform a cross-OS build (see `build-system.md`). | unset (host OS) |
+| `FPC_TARGET_CPU` | Requested compiler target processor. A non-host value is probed and passed as `-P<value>`; unavailable dispatch fails without fallback. | unset (host CPU) |
+| `FPC_TARGET_OS` | Requested compiler target operating system. A non-host value is probed and passed as `-T<value>`; unavailable targets fail without fallback. | unset (host OS) |
 | `LWPT_FPC` | Path to the FPC binary; overrides `PATH` lookup. The bare `FPC` variable is honoured as a fallback. | unset (`fpc` on `PATH`) |
 | `LWPT_INSTANTFPC` | Path to the InstantFPC binary; overrides `PATH` lookup. The bare `INSTANTFPC` variable is honoured as a fallback. | unset (`instantfpc` on `PATH`) |
 | `LWPT_FPC_UNIT_PATHS` | Path-separator-delimited unit directories appended as `-Fu`/`-Fi` to every compile (CI uses it for non-standard FPC installs; see the prose below) | unset |

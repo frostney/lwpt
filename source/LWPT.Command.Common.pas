@@ -12,6 +12,8 @@ uses
   Process,
   SysUtils,
 
+  LWPT.BuildRequest,
+  LWPT.CompilerDriver,
   LWPT.Manifest;
 
 { Exit code of a finished TProcess, tolerant of which call reaped it.
@@ -28,9 +30,8 @@ function  NormalisedExitCode(const AProcess: TProcess): Integer;
 
 function  CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths: array of string; out AOutBin: string;
-  const ABuildRoot: string = ''): TProcess;
-function  CompilePascal(const ASrcFile: string; const AUnitPaths: array of string;
-  out AOutBin: string; const ABuildRoot: string = ''): Boolean;
+  out ARequest: TLWPTBuildRequest; const ABuildRoot: string;
+  const ADriver: TLWPTCompilerDriver): TProcess;
 function  RunPascalScript(const AHook: THook; out AError: string;
   const ABuildRoot: string = ''): Integer;
 function  RunUserScript(const AHook: THook): Integer;
@@ -43,10 +44,9 @@ procedure RunHooksWithEnvironment(const APhase: string;
 implementation
 
 uses
-  LWPT.BuildRequest,
   LWPT.BuildSession,
-  LWPT.Core,
-  Platform;
+  LWPT.CompilerDriver.FPC,
+  LWPT.Core;
 
 function NormalisedExitCode(const AProcess: TProcess): Integer;
 begin
@@ -57,11 +57,13 @@ end;
 
 function CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths: array of string; out AOutBin: string;
-  const ABuildRoot: string): TProcess;
+  out ARequest: TLWPTBuildRequest; const ABuildRoot: string;
+  const ADriver: TLWPTCompilerDriver): TProcess;
 var
-  BuildDir : string;
-  i : Integer;
-  Request: TLWPTBuildRequest;
+  Arguments: LWPT.Core.TStringArray;
+  BuildDir: string;
+  Capabilities: TLWPTCompilerCapabilities;
+  i: Integer;
   ScanDirs: TStringArray;
 
   function SourceBuildKey(const APath: string): string;
@@ -71,32 +73,9 @@ var
     Result := BuildSessionPathKey(ExpandFileName(APath));
   end;
 
-  procedure AddCfgParameters(const APath: string);
-  var
-    Lines : TStringList;
-    Line : string;
-    j : Integer;
-  begin
-    if not FileExists(APath) then
-      Exit;
-
-    Lines := TStringList.Create;
-    try
-      Lines.LoadFromFile(APath);
-      for j := 0 to Lines.Count - 1 do
-      begin
-        Line := Trim(Lines[j]);
-        if Line = '' then
-          Continue;
-        if Line[1] = '#' then
-          Continue;
-        Result.Parameters.Add(Line);
-      end;
-    finally
-      Lines.Free;
-    end;
-  end;
 begin
+  if not Assigned(ADriver) then
+    raise ELWPTCompilerDriverError.Create('compiler driver is required');
   Result := TProcess.Create(nil);
   try
     if ABuildRoot <> '' then
@@ -110,66 +89,29 @@ begin
     AOutBin := IncludeTrailingPathDelimiter(BuildDir)
              + ChangeFileExt(ExtractFileName(ASrcFile), '');
 
-    { Describe the compilation before adapting it to FPC arguments below.
-      Driver dispatch is intentionally a later seam; validation here keeps
-      current build/test compilation inside the versioned neutral contract. }
-    Request := DefaultBuildRequest;
-    Request.Compiler.ID := 'fpc';
-    Request.Compiler.VersionConstraint := '*';
-    Request.Target.OS := GetEnvironmentVariable('FPC_TARGET_OS');
-    if Request.Target.OS = '' then Request.Target.OS := GetBuildOS;
-    Request.Target.Architecture := GetEnvironmentVariable('FPC_TARGET_CPU');
-    if Request.Target.Architecture = '' then
-      Request.Target.Architecture := GetBuildArch;
-    Request.OutputKind := BUILD_OUTPUT_EXECUTABLE;
-    Request.Mode := BUILD_MODE_DEV;
-    Request.Inputs.EntryPoint := ASrcFile;
-    SetLength(Request.Inputs.Sources, 1);
-    Request.Inputs.Sources[0] := ASrcFile;
-    SetLength(Request.Inputs.UnitPaths, Length(AUnitPaths));
-    SetLength(Request.Inputs.IncludePaths, Length(AUnitPaths));
+    { Describe the compilation before the selected driver adapts it. }
+    ARequest := CreateFPCBuildRequest(ASrcFile, AOutBin, ADriver);
+    AOutBin := ARequest.Outputs.Artifact;
+    SetLength(ARequest.Inputs.UnitPaths, Length(AUnitPaths));
+    SetLength(ARequest.Inputs.IncludePaths, Length(AUnitPaths));
     for i := 0 to High(AUnitPaths) do
     begin
-      Request.Inputs.UnitPaths[i] := AUnitPaths[i];
-      Request.Inputs.IncludePaths[i] := AUnitPaths[i];
+      ARequest.Inputs.UnitPaths[i] := AUnitPaths[i];
+      ARequest.Inputs.IncludePaths[i] := AUnitPaths[i];
     end;
-    Request.Outputs.Artifact := AOutBin;
-    Request.Outputs.ExecutableDirectory := BuildDir;
-    Request.Outputs.UnitDirectory := BuildDir + '/units';
-    Request.Outputs.ObjectDirectory := BuildDir + '/units';
-    ValidateBuildRequest(Request);
+    ARequest.Outputs.ExecutableDirectory := BuildDir;
+    ARequest.Outputs.UnitDirectory := BuildDir + '/units';
+    ARequest.Outputs.ObjectDirectory := BuildDir + '/units';
+    ValidateBuildRequest(ARequest);
+    Capabilities := ADriver.ProbeCapabilities(ARequest.Target);
+    EnsureBuildRequestCompatible(ARequest, Capabilities);
+    ARequest.Compiler.VersionIdentity := Capabilities.VersionIdentity;
 
-    Result.Executable := FPCExecutable;
-    (* Deliberately NOT forcing -M<mode>: each source sets its own mode
-       via {$I Shared.inc} or an explicit {$mode delphi}{$H+} header.
-       Forcing a mode here would conflict with future vendored test
-       files that ship their own directives. -Sh stays — it is a
-       delphi/objfpc-compatible string-handling switch, not a mode.
-       (Nested-comment support is per-file via {$MODESWITCH
-       NESTEDCOMMENTS+}; FPC has no command-line equivalent.) *)
-    Result.Parameters.Add('-Sh');
-    Result.Parameters.Add('-FE' + BuildDir);
-    Result.Parameters.Add('-FU' + BuildDir + '/units');
-    { Inherit dep search paths from lwpt.cfg when present. After
-      ADR-0014 (packages extraction), deps' unit subdirs live at
-      .lwpt/modules/<name>/source/ and CmdTest's per-test compile
-      needs them on -Fu / -Fi — without this, every test that
-      transitively uses HTTPClient / CLI / Semver / TOML fails to
-      compile with "can't find unit". Expand the response fragment
-      directly here so test compilation is independent of per-platform
-      FPC response-file parsing. The explicit AUnitPaths
-      additions stay for the AUnitPaths-driven callers (preserves
-      backwards-compat with non-cfg-based invocations). }
-    AddCfgParameters(CFG_FILE);
-    AddEnvUnitPathParameters(Result.Parameters);
-    for i := 0 to High(AUnitPaths) do
-      if AUnitPaths[i] <> '' then
-      begin
-        Result.Parameters.Add('-Fu' + AUnitPaths[i]);
-        Result.Parameters.Add('-Fi' + AUnitPaths[i]);
-      end;
-    Result.Parameters.Add('-o' + AOutBin);
-    Result.Parameters.Add(ASrcFile);
+    Arguments := ADriver.BuildArguments(ARequest,
+      PascalSourceCompilerInvocationOptions(CFG_FILE));
+    Result.Executable := ADriver.ExecutableName;
+    for i := 0 to High(Arguments) do
+      Result.Parameters.Add(Arguments[i]);
 
     { Every -Fu directory is now on the parameter list (explicit, cfg and
       environment additions alike), so the staging path budget can be
@@ -185,18 +127,38 @@ begin
 end;
 
 function CompilePascal(const ASrcFile: string; const AUnitPaths: array of string;
-  out AOutBin: string; const ABuildRoot: string): Boolean;
+  out AOutBin: string; out ABuildResult: TLWPTBuildResult;
+  out ARawOutput: string; const ABuildRoot: string): Boolean;
 var
-  P : TProcess;
+  Buffer: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
+  BytesRead, ExitCode: Integer;
+  Driver: TLWPTCompilerDriver;
+  P: TProcess;
+  Request: TLWPTBuildRequest;
 begin
-  P := CreatePascalCompilerProcess(ASrcFile, AUnitPaths, AOutBin,
-    ABuildRoot);
+  ABuildResult := DefaultBuildResult;
+  ARawOutput := '';
+  Driver := TLWPTFPCCompilerDriver.Create;
   try
-    P.Options := [poWaitOnExit];
-    P.Execute;
-    Result := P.ExitStatus = 0;
+    P := CreatePascalCompilerProcess(ASrcFile, AUnitPaths, AOutBin,
+      Request, ABuildRoot, Driver);
+    try
+      P.Options := [poUsePipes, poStderrToOutPut];
+      P.Execute;
+      repeat
+        BytesRead := P.Output.Read(Buffer[0], SizeOf(Buffer));
+        if BytesRead > 0 then
+          AppendRawBytes(ARawOutput, Buffer[0], BytesRead);
+      until BytesRead <= 0;
+      P.WaitOnExit;
+      ExitCode := NormalisedExitCode(P);
+      ABuildResult := Driver.NormalizeResult(Request, ExitCode, ARawOutput);
+      Result := ABuildResult.Success;
+    finally
+      P.Free;
+    end;
   finally
-    P.Free;
+    Driver.Free;
   end;
 end;
 
@@ -228,18 +190,21 @@ var
   CacheRoot: string;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  Bin: string;
+  Bin, CompilerOutput, DiagnosticMessage: string;
+  BuildResult: TLWPTBuildResult;
   {$ENDIF}
 begin
   AError := '';
   {$IFDEF MSWINDOWS}
-  if not CompilePascal(AHook.Script, [], Bin, ABuildRoot) then
+  if not CompilePascal(AHook.Script, [], Bin, BuildResult, CompilerOutput,
+    ABuildRoot) then
   begin
     AError := 'fpc failed to compile ' + AHook.Script;
+    DiagnosticMessage := BuildResultErrorMessage(BuildResult);
+    if DiagnosticMessage <> '' then AError := AError + ': ' + DiagnosticMessage;
+    if CompilerOutput <> '' then AError := AError + LineEnding + CompilerOutput;
     Exit(1);
   end;
-  if (not FileExists(Bin)) and FileExists(Bin + '.exe') then
-    Bin := Bin + '.exe';
   Bin := NativePath(ExpandFileName(Bin));
   {$ENDIF}
 

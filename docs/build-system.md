@@ -6,13 +6,20 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 
 - **The contract:** single entry point from repo root (`./build/lwpt build`), default target = clean dev build of every binary, named targets as positional args, `--mode dev` (default) / `--mode release`, `--clean` flag, single `build/` output directory.
 - **Self-host.** LWPT's own `lwpt.toml` declares `lwpt` as a `[build]` entry; `lwpt build` rebuilds the binary that just ran. See [ADR-0005](./adr/0005-self-host-build.md).
-- **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev branch of `AddBuildModeFlags` in `LWPT.Command.Build`.
+- **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev translation in `TLWPTFPCCompilerDriver.BuildArguments`.
 - **Compiler output is invocation-private.** FPC executables and intermediates
   first land under `.lwpt/sessions/<session-id>/`. A completed executable is
   atomically published to its manifest `output` only after its declared inputs
   are revalidated.
-- **Cross-compile via `FPC_TARGET_CPU`** env var; `lwpt build` translates this into FPC's `-P` flag.
-- **Compiler-neutral request first.** Build and test compilation validate a versioned request and target tuple before the current FPC-specific argument adapter runs. Unsupported schemas and capability combinations are hard errors, with no compiler or target fallback.
+- **Compiler-default target unless overridden.** A bare probe supplies the
+  request target when `FPC_TARGET_CPU` / `FPC_TARGET_OS` are unset. Explicit
+  overrides are strictly probed and translated to `-P` / `-T` when dispatch is
+  required.
+- **Compiler-neutral request first.** Build, test, and Windows hook compilation
+  validate a versioned request against on-demand compiler capabilities before
+  `TLWPTFPCCompilerDriver` translates it. The driver also normalizes diagnostics;
+  raw FPC output remains available for log replay. Unsupported combinations are
+  hard errors, with no compiler or target fallback. See ADR-0029.
 - **Dependency-aware parallel builds.** Independent ready targets run in
   parallel by default, bounded by `--jobs=<n>` and the machine-wide
   `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See
@@ -47,21 +54,22 @@ units = ["source"]
 lwpt = { source = "source/lwpt.pas", output = "build/lwpt" }
 ```
 
-`./build/lwpt build` invokes FPC with:
+`./build/lwpt build` first probes and validates the requested target, then the
+FPC driver produces:
 
 - `-Sh` (Delphi-compatible string handling; objfpc/delphi-safe)
 - `-FE .lwpt/sessions/<session>/jobs/lwpt-<mode>/bin`
 - `-FU .lwpt/sessions/<session>/jobs/lwpt-<mode>/units`
 - `@lwpt.cfg` (the cfg emitted by `lwpt install`; lists `-Fu source` since `units = ["source"]`)
 - `-Fu source` (also added explicitly from `Man.Units`; redundant with the cfg but harmless)
-- The dev-mode flags from `AddBuildModeFlags` (or release flags when `--mode release`)
+- The driver's dev-mode flags (or release flags when `--mode release`)
 - `-o .lwpt/sessions/<session>/jobs/lwpt-<mode>/bin/lwpt`
 - `source/lwpt.pas`
 
 After FPC exits successfully, LWPT revalidates the build publication
 fingerprint under a short output-specific lock and atomically replaces
 `build/lwpt`. The full mode-flag sets are in
-`LWPT.Command.Build.AddBuildModeFlags`:
+`TLWPTFPCCompilerDriver.BuildArguments`:
 
 | Mode | Flags |
 | --- | --- |
@@ -74,7 +82,10 @@ already includes it) to force recompilation. The last successful executable,
 another live session, legacy `build/targets/` directories, source-adjacent
 artefacts, and the currently running LWPT executable remain untouched.
 
-When a build fails with output matching a stale-artefact signature (internal compiler exception, resource-compile errors, missing `.reslst`), `lwpt build` prints a hint to retry with `--clean`. The signature heuristic lives in `LWPT.Command.Build.HasStaleArtefactSignature`.
+When a build fails with output matching a stale-artefact signature (internal
+compiler exception, resource-compile errors, missing `.reslst`), `lwpt build`
+prints a hint to retry with `--clean`. Failure classification and exit-message
+shaping belong to `TLWPTFPCCompilerDriver.ClassifyFailure`.
 
 ### The current executable
 
@@ -110,7 +121,11 @@ Both code paths produce the same binary; the InstantFPC wrapper exists so the bo
 
 ### Flag synchronisation
 
-The dev-mode flags in `scripts/bootstrap.pas` are the same set as `AddBuildModeFlags`'s dev branch. They must stay in sync: when one changes, the other changes in the same commit. A future small refactor will lift them into a shared `scripts/bootstrap-flags.inc` `{$I}`-included from both sites; for now, a comment in `scripts/bootstrap.pas` names the requirement.
+The dev-mode flags in `scripts/bootstrap.pas` are the same set as the dev
+translation in `TLWPTFPCCompilerDriver.BuildArguments`. They must stay in sync:
+when one changes, the other changes in the same commit. A future small refactor
+may lift them into a shared `scripts/bootstrap-flags.inc` `{$I}`-included from
+both sites; for now, a comment in `scripts/bootstrap.pas` names the requirement.
 
 ## `[build]` shape
 
@@ -198,7 +213,20 @@ compiler input.
 FPC_TARGET_CPU=aarch64 ./build/lwpt build --mode release
 ```
 
-`BuildOneTarget` reads the env var and passes `-P<value>` to FPC. The standard FPC cross-CPU values apply (`x86_64`, `aarch64`, `i386`, `arm`, etc.). `FPC_TARGET_OS` is read into the build request's target tuple and serialized into the publication fingerprint, but **no `-T` flag is emitted** and the capability-matching model (`BuildRequestIsCompatible`) is not wired into the build or test paths — so it does not perform a cross-OS build; a non-host value only changes the recorded target metadata and fingerprint. Leave it unset unless you are exercising the build-request model itself.
+With neither target environment variable set, the request uses the target
+reported by the compiler's bare `-iV -iTO -iTP` probe and compilation stays
+bare. `FPC_TARGET_CPU` and `FPC_TARGET_OS` replace their corresponding default
+dimensions; the completed explicit request is validated strictly. The driver
+adds `-P<value>` and `-T<value>` only when the bare compiler target does not
+satisfy that request. The standard FPC target values apply
+(`x86_64`, `aarch64`, `i386`, `arm`, `darwin`, `linux`, and the values reported
+by `fpc -h`). Before compiling, the driver runs the requested dispatch with
+`-iV -iTO -iTP`, validates the returned version/target through
+`BuildRequestIsCompatible`, and caches that result for the invocation. A
+missing `ppcross*` compiler or unsupported target fails with a message naming
+FPC and the requested tuple; LWPT never falls back to the host compiler. The
+publish step refreshes the probe so a compiler change during compilation still
+withholds the candidate.
 
 ## Generator hooks (formerly `[generated]`)
 
