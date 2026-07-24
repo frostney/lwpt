@@ -127,6 +127,7 @@ const
   REQUEST_EXTENSION = '.request';
   OWNER_EXTENSION = '.owner';
   TRANSACTION_LOCK_FILE = 'transaction.lock';
+  WRITE_PROBE_PREFIX = '.write-probe-';
   BUDGET_FILE = 'budget';
   QUEUE_FILE = 'queue-sequence';
   STATE_TMP_DIR = 'tmp';
@@ -327,7 +328,7 @@ end;
 
 function DefaultWorkerStateRootWritable(const ARoot: string): Boolean;
 var
-  LockPath : string;
+  ProbePath : string;
   {$IFDEF UNIX}
   Descriptor : LongInt;
   {$ENDIF}
@@ -337,19 +338,23 @@ var
 begin
   Result := ForceDirectories(ARoot) or DirectoryExists(ARoot);
   if not Result then Exit;
-  LockPath := IncludeTrailingPathDelimiter(ARoot) + TRANSACTION_LOCK_FILE;
+  ProbePath := IncludeTrailingPathDelimiter(ARoot) + WRITE_PROBE_PREFIX
+             + IntToStr(GetProcessID) + '-' + IntToStr(NowMilliseconds);
   {$IFDEF UNIX}
-  Descriptor := FpOpen(PChar(LockPath), O_RDWR or O_CREAT, &600);
-  Result := Descriptor >= 0;
-  if Result then FpClose(Descriptor);
+  Descriptor := FpOpen(PChar(ProbePath),
+    O_RDWR or O_CREAT or O_EXCL, &600);
+  if Descriptor < 0 then Exit(False);
+  Result := FpClose(Descriptor) = 0;
+  if not SysUtils.DeleteFile(ProbePath) then Result := False;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  Handle := CreateFileW(PWideChar(UnicodeString(LockPath)),
-    GENERIC_READ or GENERIC_WRITE,
-    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
-    nil, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
-  Result := Handle <> THandle(INVALID_HANDLE_VALUE);
-  if Result then CloseHandle(Handle);
+  Handle := CreateFileW(PWideChar(UnicodeString(ProbePath)),
+    GENERIC_READ or GENERIC_WRITE, 0, nil, CREATE_NEW,
+    FILE_ATTRIBUTE_NORMAL, 0);
+  if Handle = THandle(INVALID_HANDLE_VALUE) then Exit(False);
+  Result := CloseHandle(Handle);
+  if not DeleteFileW(PWideChar(UnicodeString(ProbePath))) then
+    Result := False;
   {$ENDIF}
 end;
 

@@ -37,10 +37,13 @@ const
   SNAPSHOT_SWITCH = '--worker-budget-snapshot';
   REPAIR_SWITCH = '--worker-budget-repair';
   STATE_ROOT_FALLBACK_SWITCH = '--worker-state-root-fallback';
+  STATE_ROOT_EXISTING_LOCK_FALLBACK_SWITCH =
+    '--worker-state-root-existing-lock-fallback';
   STATE_ROOT_FALLBACK_DELEGATION_SWITCH =
     '--worker-state-root-fallback-delegation';
   STATE_ROOT_EXPLICIT_SWITCH = '--worker-state-root-explicit';
   STATE_ROOT_PROBE_SWITCH = '--worker-state-root-probe';
+  TRANSACTION_LOCK_NAME = 'transaction.lock';
   TEST_BUDGET = '1';
   TEST_STALE_SECONDS = '3';
   WAIT_TIMEOUT_MILLISECONDS = 10000;
@@ -102,6 +105,7 @@ type
     {$IFDEF UNIX}
     procedure TestDelegationPreservesFallbackRootAcrossWorkingDirectories;
     procedure TestUnwritableDefaultFallsBackOnce;
+    procedure TestExistingLockDoesNotMaskUnwritableDefault;
     procedure TestUnwritableExplicitRootFails;
     {$ENDIF}
   end;
@@ -221,7 +225,8 @@ var
   Child, FirstChild, SecondChild : TProcess;
   FirstThread, SecondThread : TLeaseThread;
   {$IFDEF UNIX}
-  DefaultRoot : string;
+  DefaultRoot, FallbackSessionId : string;
+  ExistingTransactionLock : Boolean;
   {$ENDIF}
 begin
   if (ParamCount = 4) and (ParamStr(1) = STATE_ROOT_PROBE_SWITCH) then
@@ -241,26 +246,48 @@ begin
   end;
 
   {$IFDEF UNIX}
-  if (ParamCount = 2) and (ParamStr(1) = STATE_ROOT_FALLBACK_SWITCH) then
+  if (ParamCount = 2)
+     and ((ParamStr(1) = STATE_ROOT_FALLBACK_SWITCH)
+       or (ParamStr(1) = STATE_ROOT_EXISTING_LOCK_FALLBACK_SWITCH)) then
   begin
+    ExistingTransactionLock :=
+      ParamStr(1) = STATE_ROOT_EXISTING_LOCK_FALLBACK_SWITCH;
     DefaultRoot := ExcludeTrailingPathDelimiter(ExpandFileName(
       IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'workers'));
     if not ForceDirectories(DefaultRoot) then
       raise Exception.CreateFmt(
         'could not create default worker-state test root %s', [DefaultRoot]);
+    if ExistingTransactionLock then
+      WriteMarker(IncludeTrailingPathDelimiter(DefaultRoot)
+        + TRANSACTION_LOCK_NAME, 'existing writable lock');
     if FpChmod(DefaultRoot, &555) <> 0 then
       raise Exception.CreateFmt(
         'could not make default worker-state test root read-only: %s',
         [DefaultRoot]);
+    if ExistingTransactionLock then
+      FallbackSessionId := 'fallback-existing-lock'
+    else
+      FallbackSessionId := 'fallback-root';
     Session := nil;
     Lease := nil;
     Lines := TStringList.Create;
     try
       Lines.Add('root-first=' + WorkerStateRoot);
       Lines.Add('root-second=' + WorkerStateRoot);
-      Session := TLWPTWorkerBudgetSession.Create('fallback-root', 1);
+      Session := TLWPTWorkerBudgetSession.Create(FallbackSessionId, 1);
       Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
       Lines.Add('acquired=' + BoolToStr(Lease <> nil, True));
+      Lines.Add('default-root=' + DefaultRoot);
+      Lines.Add('default-request-exists=' + BoolToStr(FileExists(
+        IncludeTrailingPathDelimiter(DefaultRoot) + FallbackSessionId
+        + '.request'), True));
+      Lines.Add('default-owner-exists=' + BoolToStr(FileExists(
+        IncludeTrailingPathDelimiter(DefaultRoot) + FallbackSessionId
+        + '.owner'), True));
+      Lines.Add('default-budget-exists=' + BoolToStr(FileExists(
+        IncludeTrailingPathDelimiter(DefaultRoot) + 'budget'), True));
+      Lines.Add('default-queue-exists=' + BoolToStr(FileExists(
+        IncludeTrailingPathDelimiter(DefaultRoot) + 'queue-sequence'), True));
       Lines.SaveToFile(ParamStr(2));
     finally
       Lease.Free;
@@ -1640,6 +1667,38 @@ begin
   end;
 end;
 
+procedure TWorkerBudgetProcesses
+  .TestExistingLockDoesNotMaskUnwritableDefault;
+var
+  OutputPath, Worktree, ConfigHome, ExpectedRoot : string;
+  UtilityResult : TStateRootUtilityResult;
+  Values : TStringList;
+begin
+  OutputPath := FScratch + '/existing-lock-fallback-result';
+  Worktree := FScratch + '/worktree-a';
+  ConfigHome := FScratch + '/config-home';
+  ForceDirectories(ConfigHome);
+  UtilityResult := RunStateRootUtility(
+    STATE_ROOT_EXISTING_LOCK_FALLBACK_SWITCH,
+    OutputPath, Worktree, ConfigHome, '');
+  Expect<Integer>(UtilityResult.ExitCode).ToBe(0);
+  Values := ReadUtilityValues(OutputPath);
+  try
+    ExpectedRoot := ExpandFileName(Worktree + '/'
+      + WORKER_STATE_FALLBACK_DIR);
+    Expect<string>(Values.Values['root-first']).ToBe(ExpectedRoot);
+    Expect<string>(Values.Values['acquired']).ToBe('True');
+    Expect<Boolean>(FileExists(Values.Values['default-root'] + '/'
+      + TRANSACTION_LOCK_NAME)).ToBe(True);
+    Expect<string>(Values.Values['default-request-exists']).ToBe('False');
+    Expect<string>(Values.Values['default-owner-exists']).ToBe('False');
+    Expect<string>(Values.Values['default-budget-exists']).ToBe('False');
+    Expect<string>(Values.Values['default-queue-exists']).ToBe('False');
+  finally
+    Values.Free;
+  end;
+end;
+
 procedure TWorkerBudgetProcesses.TestUnwritableExplicitRootFails;
 var
   OutputPath, Worktree, ConfigHome, ExplicitRoot : string;
@@ -1708,6 +1767,8 @@ begin
     TestDelegationPreservesFallbackRootAcrossWorkingDirectories);
   Test('an unwritable default state root falls back once per process',
     TestUnwritableDefaultFallsBackOnce);
+  Test('an existing transaction lock does not mask an unwritable default',
+    TestExistingLockDoesNotMaskUnwritableDefault);
   Test('an unwritable explicit state root remains a hard failure',
     TestUnwritableExplicitRootFails);
   {$ENDIF}
