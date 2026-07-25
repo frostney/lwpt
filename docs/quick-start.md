@@ -52,6 +52,9 @@ After bootstrap:
 ## Daily commands
 
 ```sh
+./build/lwpt init --yes         # scaffold a fresh project
+./build/lwpt init --adopt       # adopt an existing manifest
+
 ./build/lwpt build              # dev build, all manifest targets
 ./build/lwpt build --mode release
 ./build/lwpt build <target>     # single target
@@ -71,6 +74,34 @@ After bootstrap:
 ```
 
 [`build-system.md`](./build-system.md) covers each in depth.
+
+## Start or adopt a project
+
+From an empty project directory, `init --yes` writes a default manifest,
+hello-world entry, and `.gitignore` without prompting:
+
+```sh
+./build/lwpt init --yes
+```
+
+When `lwpt.toml` already exists, adoption fills in only the missing standard
+scaffold:
+
+```sh
+./build/lwpt init --adopt
+```
+
+Adoption parses the manifest without rewriting it, creates missing
+project-local directories declared by `[package].units`, and appends missing
+`.gitignore` entries for `.lwpt/tmp/`, `.lwpt/install.lock`,
+`.lwpt/sessions/`, `.lwpt/workers/`, and `build/`. It reports directories as
+created or found and ignore entries as added or found. It does not create a
+sample program, lockfile, cfg, dependency state, or build output.
+
+`--adopt` requires an existing valid manifest and cannot be combined with
+`--force`. A units path that is a file is a conflict. A missing units path
+outside the project is also refused rather than creating directories beyond
+the manifest's project root.
 
 ## Install the pre-commit hook
 

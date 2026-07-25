@@ -195,7 +195,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`tests/integration/ExtractPathological.Test.pas`** | 14 tests in 2 suites | **Pathological ustar shapes** — baseline short path, > 100-char prefix-split, symlink deferred-link pass. **GNU 'L' long-name** — paths > 255 bytes (past ustar's prefix-split ceiling) wrapped in a GNU `'L'` typeflag header + body carrying the real name; the extractor's pending-long-name buffer carries the name across the header boundary. **Failure modes** — missing archive raises `EExtractError`, truncated gzip leaves Dest empty, invalid gzip magic same contract, tar truncated mid-entry never produces a byte-equal file. |
 | **`tests/integration/CLIOptions.Test.pas`** | 7 tests in 1 suite | Spawns `./build/lwpt` with various argv. `--help` + `-h` list every subcommand; unknown verb exits non-zero. Option-parsing regression: `build --mode release` (space-separated value) and `build --mode=release` (equals-separated value) must both parse to "release" and produce the same outcome. Invalid `--mode` value exits non-zero. Scratch project (tiny lwpt.toml + one trivial source) built in-test under `build/tests/tmp/cli-options-e2e/`. |
 | **`tests/integration/InstallFetchFailure.Test.pas`** | 3 tests in 1 suite | Spawns `lwpt install` against a manifest with a local-path source pointing at a non-existent directory. Exit non-zero, error message names both the dep AND the missing path, and `.lwpt/tmp/` is empty after the failure (no orphans). HTTP-failure variants (HTTP 500 / unreachable port / timeout) require a URL-redirect env-var hook and ship in v1.x. |
-| **`tests/integration/Init.Test.pas`** | 11 tests in 1 suite | Spawns `lwpt init --yes` + interactive in scratch dirs. Asserts manifest + hello-world `.pas` + `.gitignore` artefacts, sanitised `program <ident>;` declaration for hyphenated names, that `--yes` does not create a lockfile (install owns it), that `lwpt build` after `init --yes && lwpt install` produces a runnable binary at `<BuildDir>/<EntryName>`, refuse-to-clobber + `--force` semantics, and `.gitignore` idempotence on re-init. |
+| **`tests/integration/Init.Test.pas`** | 20 tests in 1 suite | Spawns fresh and adoption `lwpt init` flows in scratch dirs. Fresh-init coverage asserts manifest + hello-world `.pas` + `.gitignore` artefacts, sanitised `program <ident>;` declarations, no lockfile under `--yes`, a runnable built entry, refuse-to-clobber + `--force` semantics, and `.gitignore` idempotence. Adoption coverage pins byte-for-byte manifest preservation, append-only ignore updates, missing-units directory creation, idempotent found/added reporting, mutually exclusive force, missing/invalid manifests, file-vs-directory conflicts, and refusal to write through external or symlinked paths. |
 | **`tests/integration/Hooks.Test.pas`** | 10 tests in 1 suite | Spawns build/test flows against scratch manifests with lifecycle hooks. Covers prebuild/postbuild/pretest execution, private-candidate postbuild context, path-token-safe output retargeting, failed-hook publication refusal, staleness-gated skip behavior, and dep-manifest hook dropping. |
 | **`tests/integration/InstallNestedManifest.Test.pas`** | 4 tests in 1 suite | Covers nested dependency-manifest discovery, retained repository prefixes, cfg paths, transitive dependencies, and ambiguous equal-depth fallback. |
 | **`tests/integration/InstallSymlinkCycle.Test.pas`** | 3 tests in 1 suite | Pins termination, single manifest discovery, and lockfile hashing when local dependency trees contain directory-symlink cycles. |
@@ -241,10 +241,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 13 | 275 |
-| Integration (`tests/integration/*.Test.pas`) | 18 | 140 |
+| Unit (`source/*.Test.pas` + package self-tests) | 14 | 275 |
+| Integration (`tests/integration/*.Test.pas`) | 18 | 149 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 6 | 21 |
-| **Total** | **37** | **436** |
+| **Total** | **38** | **445** |
 
 ### Planned testing work
 
