@@ -45,6 +45,7 @@ type
     procedure TestSecondInitWithForceOverwrites;
     procedure TestExistingGitignoreIsNotDuplicated;
     procedure TestAdoptPreservesManifestAndAddsMissingScaffold;
+    procedure TestAdoptUsesDeclaredBuildOutputDirectories;
     procedure TestAdoptIsIdempotentAndReportsFoundScaffold;
     procedure TestAdoptRejectsForceWithoutWriting;
     procedure TestAdoptRequiresExistingManifest;
@@ -328,6 +329,43 @@ begin
   Expect<Boolean>(Pos('added .gitignore entry build/', Output) > 0).ToBe(True);
 end;
 
+procedure TInitCommand.TestAdoptUsesDeclaredBuildOutputDirectories;
+var
+  AdoptScratch, Gitignore, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-build-outputs';
+  RecursiveDelete(AdoptScratch);
+  ForceDirectories(AdoptScratch);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "adopt-build-outputs"'#10 +
+    'units = []'#10 +
+    '[build]'#10 +
+    'cli = { source = "source/cli.pas", output = "bin/cli" }'#10 +
+    'helper = { source = "source/helper.pas", '
+      + 'output = "dist/tools/helper" }'#10 +
+    'duplicate = { source = "source/duplicate.pas", '
+      + 'output = "bin/duplicate" }'#10 +
+    'external = { source = "source/external.pas", '
+      + 'output = "../outside/external" }'#10);
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+
+  Gitignore := ReadRawFileText(AdoptScratch + '/.gitignore');
+  Output := R.Stdout + R.Stderr;
+  Expect<Boolean>(Pos('bin/', Gitignore) > 0).ToBe(True);
+  Expect<Boolean>(PosEx('bin/', Gitignore,
+    Pos('bin/', Gitignore) + 1) = 0).ToBe(True);
+  Expect<Boolean>(Pos('dist/tools/', Gitignore) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build/', Gitignore) = 0).ToBe(True);
+  Expect<Boolean>(Pos('../outside/', Gitignore) = 0).ToBe(True);
+  Expect<Boolean>(Pos('added .gitignore entry bin/', Output) > 0).ToBe(True);
+  Expect<Boolean>(Pos('added .gitignore entry dist/tools/',
+    Output) > 0).ToBe(True);
+end;
+
 procedure TInitCommand.TestAdoptIsIdempotentAndReportsFoundScaffold;
 var
   AdoptScratch, ManifestBefore, GitignoreBefore, Output: string;
@@ -564,6 +602,8 @@ begin
     TestExistingGitignoreIsNotDuplicated);
   Test('init --adopt preserves the manifest and adds missing scaffold',
     TestAdoptPreservesManifestAndAddsMissingScaffold);
+  Test('init --adopt uses declared project-local build output directories',
+    TestAdoptUsesDeclaredBuildOutputDirectories);
   Test('init --adopt is idempotent and reports found scaffold',
     TestAdoptIsIdempotentAndReportsFoundScaffold);
   Test('init --adopt rejects --force before writing',

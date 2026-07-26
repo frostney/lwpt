@@ -149,8 +149,8 @@ begin
   end;
 end;
 
-procedure EnsureGitignoreEntries(const APath, ABuildDir: string;
-  AReport: Boolean);
+procedure EnsureGitignoreEntries(const APath: string;
+  const ABuildDirs: array of string; AReport: Boolean);
 var
   Wanted: TStringArray;
   Missing: array of Boolean;
@@ -161,13 +161,15 @@ var
   Stream: TFileStream;
   LastByte: Byte;
 begin
-  SetLength(Wanted, 5);
+  SetLength(Wanted, 4 + Length(ABuildDirs));
   Wanted[0] := GITIGNORE_LINE;
   Wanted[1] := INSTALL_LOCK;
   Wanted[2] := BUILD_SESSIONS_DIR + '/';
   Wanted[3] := WORKER_STATE_FALLBACK_DIR + '/';
-  Wanted[4] := StringReplace(IncludeTrailingPathDelimiter(ABuildDir),
-    DirectorySeparator, '/', [rfReplaceAll]);
+  for i := 0 to High(ABuildDirs) do
+    Wanted[4 + i] := StringReplace(
+      IncludeTrailingPathDelimiter(ABuildDirs[i]),
+      DirectorySeparator, '/', [rfReplaceAll]);
   Existed := FileExists(APath);
   SetLength(Missing, Length(Wanted));
   SL := TStringList.Create;
@@ -221,10 +223,35 @@ begin
   end;
 end;
 
+procedure AddBuildOutputDirectory(const AProjectRoot, AOutput: string;
+  var ABuildDirs: TStringArray);
+var
+  RootPath, OutputDir, RelativeDir: string;
+  i, Count: Integer;
+begin
+  OutputDir := ExtractFileDir(Trim(AOutput));
+  if OutputDir = '' then Exit;
+
+  RootPath := ExcludeTrailingPathDelimiter(ExpandFileName(AProjectRoot));
+  OutputDir := ExcludeTrailingPathDelimiter(ExpandFileName(OutputDir));
+  if not PathContains(RootPath, OutputDir)
+     or PathContains(OutputDir, RootPath) then Exit;
+
+  RelativeDir := Copy(OutputDir, Length(RootPath) + 2, MaxInt);
+  RelativeDir := StringReplace(RelativeDir, DirectorySeparator, '/',
+    [rfReplaceAll]);
+  for i := 0 to High(ABuildDirs) do
+    if ABuildDirs[i] = RelativeDir then Exit;
+
+  Count := Length(ABuildDirs);
+  SetLength(ABuildDirs, Count + 1);
+  ABuildDirs[Count] := RelativeDir;
+end;
+
 procedure AdoptExistingProject(const ACWD: string);
 var
   Man: TManifest;
-  UnitPaths: TStringArray;
+  UnitPaths, BuildDirs: TStringArray;
   UnitDir: string;
   i: Integer;
 begin
@@ -253,6 +280,13 @@ begin
       ValidateWritePath(ACWD, UnitPaths[i],
         '[package].units path "' + Man.Units[i] + '"');
   end;
+  for i := 0 to High(Man.Targets) do
+    AddBuildOutputDirectory(ACWD, Man.Targets[i].Output, BuildDirs);
+  if Length(BuildDirs) = 0 then
+  begin
+    SetLength(BuildDirs, 1);
+    BuildDirs[0] := DEFAULT_BUILD_DIR;
+  end;
 
   WriteLn('adopting existing ', PROJECT_NAME, ' project in ', ACWD);
   WriteLn('  preserved ', MANIFEST_FILE);
@@ -270,7 +304,7 @@ begin
       WriteLn('  created unit directory ', UnitDir);
     end;
   end;
-  EnsureGitignoreEntries('.gitignore', DEFAULT_BUILD_DIR, True);
+  EnsureGitignoreEntries('.gitignore', BuildDirs, True);
 end;
 
 { ValidPackageName lives in LWPT.Manifest — the package-name grammar
@@ -334,7 +368,7 @@ begin
   WriteScaffoldManifest(MANIFEST_FILE, Name, Version,
     SourceDir, BuildDir, EntryName);
   WriteHelloProgram(EntryPath, EntryName);
-  EnsureGitignoreEntries('.gitignore', BuildDir, False);
+  EnsureGitignoreEntries('.gitignore', [BuildDir], False);
 
   WriteLn;
   WriteLn('initialized ', Name, ' v', Version);

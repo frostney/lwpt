@@ -94,9 +94,10 @@ scaffold:
 Adoption parses the manifest without rewriting it, creates missing
 project-local directories declared by `[package].units`, and appends missing
 `.gitignore` entries for `.lwpt/tmp/`, `.lwpt/install.lock`,
-`.lwpt/sessions/`, `.lwpt/workers/`, and `build/`. It reports directories as
-created or found and ignore entries as added or found. It does not create a
-sample program, lockfile, cfg, dependency state, or build output.
+`.lwpt/sessions/`, `.lwpt/workers/`, and the project-local output directories
+declared by `[build]` (`build/` when none is usable). It reports directories
+as created or found and ignore entries as added or found. It does not create
+a sample program, lockfile, cfg, dependency state, or build output.
 
 `--adopt` requires an existing valid manifest and cannot be combined with
 `--force`. A units path that is a file is a conflict. A missing units path
