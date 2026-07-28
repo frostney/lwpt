@@ -55,6 +55,10 @@ type
     procedure TestMissingCompilerFailsTargetsButLoopContinues;
     procedure TestInvalidJobsFailsBeforeBuildingAnything;
     procedure TestInvalidDependencyGraphFailsBeforeBuildingAnything;
+    procedure TestPerTargetCompilerFlagsAreForwarded;
+    {$IFDEF DARWIN}
+    procedure TestClassicLinkerFlagBuildsOnDarwin;
+    {$ENDIF}
     {$IFDEF UNIX}
     procedure TestCleanFailureFailsTargetButBuildContinues;
     {$ENDIF}
@@ -361,6 +365,67 @@ begin
   end;
 end;
 
+procedure TBuildMultiTarget.TestPerTargetCompilerFlagsAreForwarded;
+var
+  R: TLwptResult;
+  Scratch: string;
+begin
+  Scratch := CreateScratchRoot('build-target-flags');
+  RecursiveDelete(Scratch);
+  WriteTextFile(Scratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "build-target-flags"'#10
+    + 'version = "0.0.0"'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app", '
+    + 'flags = ["-dISSUE95_FLAG"] }'#10);
+  WriteTextFile(Scratch + '/source/app.pas',
+      'program app;'#10
+    + '{$ifndef ISSUE95_FLAG}'#10
+    + '  {$fatal ISSUE95_FLAG was not forwarded}'#10
+    + '{$endif}'#10
+    + 'begin'#10
+    + 'end.'#10);
+  try
+    R := RunLwpt(['build'], Scratch);
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(FileExists(ExpectedExe(Scratch + '/build/app')))
+      .ToBe(True);
+  finally
+    RecursiveDelete(Scratch);
+  end;
+end;
+
+{$IFDEF DARWIN}
+procedure TBuildMultiTarget.TestClassicLinkerFlagBuildsOnDarwin;
+var
+  R: TLwptResult;
+  Scratch: string;
+begin
+  Scratch := CreateScratchRoot('build-target-ld-classic');
+  RecursiveDelete(Scratch);
+  WriteTextFile(Scratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "build-target-ld-classic"'#10
+    + 'version = "0.0.0"'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app", '
+    + 'flags = ["-k-ld_classic"] }'#10);
+  WriteTextFile(Scratch + '/source/app.pas',
+    'program app;'#10'begin'#10'end.'#10);
+  try
+    R := RunLwpt(['build'], Scratch);
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(FileExists(ExpectedExe(Scratch + '/build/app')))
+      .ToBe(True);
+  finally
+    RecursiveDelete(Scratch);
+  end;
+end;
+{$ENDIF}
+
 {$IFDEF UNIX}
 procedure TBuildMultiTarget.TestCleanFailureFailsTargetButBuildContinues;
 var
@@ -412,6 +477,12 @@ begin
     TestInvalidJobsFailsBeforeBuildingAnything);
   Test('invalid dependency graph fails before building anything',
     TestInvalidDependencyGraphFailsBeforeBuildingAnything);
+  Test('per-target compiler flags are forwarded as single arguments',
+    TestPerTargetCompilerFlagsAreForwarded);
+  {$IFDEF DARWIN}
+  Test('Darwin builds can select the classic linker per target',
+    TestClassicLinkerFlagBuildsOnDarwin);
+  {$ENDIF}
   {$IFDEF UNIX}
   Test('clean ignores locked shared artefact dirs',
     TestCleanFailureFailsTargetButBuildContinues);

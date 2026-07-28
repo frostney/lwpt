@@ -12,7 +12,7 @@ uses
   LWPT.Core;
 
 const
-  BUILD_REQUEST_SCHEMA_VERSION = 1;
+  BUILD_REQUEST_SCHEMA_VERSION = 2;
   BUILD_RESULT_SCHEMA_VERSION = 1;
   COMPILER_CAPABILITIES_SCHEMA_VERSION = 1;
 
@@ -48,6 +48,7 @@ type
     Sources: TStringArray;
     EntryPoint: string;
     Defines: TStringArray;
+    ExtraArguments: TStringArray;
     UnitPaths: TStringArray;
     IncludePaths: TStringArray;
     Resources: TStringArray;
@@ -218,6 +219,10 @@ begin
     if ARequest.Inputs.Sources[i] = '' then
       raise ELWPTBuildRequestError.CreateFmt(
         'build request source %d must not be empty', [i]);
+  for i := 0 to High(ARequest.Inputs.ExtraArguments) do
+    if ARequest.Inputs.ExtraArguments[i] = '' then
+      raise ELWPTBuildRequestError.CreateFmt(
+        'build request extra argument %d must not be empty', [i]);
   if not StringArrayContains(ARequest.Inputs.Sources,
     ARequest.Inputs.EntryPoint) then
     raise ELWPTBuildRequestError.Create(
@@ -342,6 +347,8 @@ begin
       + TomlEscape(ARequest.Inputs.EntryPoint) + '"');
     Lines.Add('sources = ' + TomlArray(ARequest.Inputs.Sources));
     Lines.Add('defines = ' + TomlArray(ARequest.Inputs.Defines));
+    Lines.Add('extra_arguments = '
+      + TomlArray(ARequest.Inputs.ExtraArguments));
     Lines.Add('unit_paths = ' + TomlArray(ARequest.Inputs.UnitPaths));
     Lines.Add('include_paths = ' + TomlArray(ARequest.Inputs.IncludePaths));
     Lines.Add('resources = ' + TomlArray(ARequest.Inputs.Resources));
@@ -422,6 +429,8 @@ begin
     Result.Inputs.EntryPoint := TomlStr(Section, 'entry_point', '');
     ReadStringArray(Section, 'sources', Result.Inputs.Sources);
     ReadStringArray(Section, 'defines', Result.Inputs.Defines);
+    ReadStringArray(Section, 'extra_arguments',
+      Result.Inputs.ExtraArguments);
     ReadStringArray(Section, 'unit_paths', Result.Inputs.UnitPaths);
     ReadStringArray(Section, 'include_paths', Result.Inputs.IncludePaths);
     ReadStringArray(Section, 'resources', Result.Inputs.Resources);

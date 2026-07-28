@@ -45,6 +45,7 @@ type
     procedure TestExplicitExcludedResourceChangeRefusesPublication;
     procedure TestHookInputChangeRefusesPublication;
     procedure TestNativeDriverRequestPreservesPublicationFingerprint;
+    procedure TestExtraArgumentsChangePublicationFingerprint;
     {$IFDEF UNIX}
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
     procedure TestDirectoryAliasesHaveDeterministicFingerprint;
@@ -101,6 +102,28 @@ begin
   finally
     Driver.Free;
   end;
+end;
+
+procedure TLWPTBuildSessionTests.
+  TestExtraArgumentsChangePublicationFingerprint;
+var
+  FirstFingerprint, SecondFingerprint: string;
+  Request: TLWPTBuildPublicationRequest;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  Request := BasicRequest;
+  SetLength(Request.BuildRequest.Inputs.ExtraArguments, 1);
+  Request.BuildRequest.Inputs.ExtraArguments[0] := '-dFIRST';
+  FirstFingerprint := CaptureBuildPublicationFingerprint(FScratch,
+    MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+
+  Request.BuildRequest.Inputs.ExtraArguments[0] := '-dSECOND';
+  SecondFingerprint := CaptureBuildPublicationFingerprint(FScratch,
+    MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+
+  Expect<Boolean>(FirstFingerprint <> SecondFingerprint).ToBe(True);
 end;
 
 procedure TLWPTBuildSessionTests.WriteText(const APath, AText: string);
@@ -771,6 +794,8 @@ begin
     TestHookInputChangeRefusesPublication);
   Test('native driver request preserves the publication fingerprint',
     TestNativeDriverRequestPreservesPublicationFingerprint);
+  Test('extra compiler arguments change the publication fingerprint',
+    TestExtraArgumentsChangePublicationFingerprint);
   {$IFDEF UNIX}
   Test('symlinked search roots detect changes and terminate cycles',
     TestSymlinkedSearchRootChangeRefusesPublication);
