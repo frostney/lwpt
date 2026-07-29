@@ -27,8 +27,9 @@
   explicit 404 from /releases/latest skips the live smoke; the
   per-release install check in release.yml covers prerelease-flagged
   rc.x meanwhile. Connectivity failures matching the narrow transient
-  matcher also skip. Other curl failures, HTTP errors, and malformed
-  successful responses fail.
+  matcher also skip. GitHub API 403/429 responses skip only when their
+  diagnostic identifies a rate limit. Other curl failures, HTTP errors,
+  and malformed successful responses fail.
 
   Unix-only: install.sh is /bin/sh. The Windows install.ps1 smoke test
   is a separate future addition.
@@ -38,6 +39,7 @@
     - LWPT_SKIP_NETWORK=1             → skip
     - curl unavailable               → skip (environment, not a defect)
     - no normal release published    → skip (nothing to smoke yet)
+    - GitHub API rate limit          → skip (distinct from connectivity)
     - clean connect/DNS failure to
       github.com (transient downtime) → skip
   Resolve-time HTTP/API errors, unclassified curl failures, and empty
@@ -67,6 +69,7 @@ type
     ltoResolved,
     ltoNoRelease,
     ltoTransientFailure,
+    ltoRateLimited,
     ltoFailure
   );
 
@@ -90,6 +93,7 @@ type
     procedure TestSuccessfulResponseResolves;
     procedure TestExplicitNotFoundSkips;
     procedure TestConnectivityFailureSkips;
+    procedure TestRateLimitFailuresSkipDistinctly;
     procedure TestHTTPFailuresFail;
     procedure TestUnclassifiedCurlFailureFails;
     procedure TestInvalidSuccessfulResponseFails;
@@ -255,6 +259,20 @@ begin
          or (Pos('resolving timed out', E) > 0);
 end;
 
+{ GitHub documents rate-limit failures as 403 or 429 plus a primary or
+  secondary rate-limit diagnostic. Keep this separate from the general
+  transient matcher so an unrelated permission failure still fails. }
+function ResolutionIsRateLimited(
+  const AResolution: TLatestTagResolution): Boolean;
+var E: string;
+begin
+  if (AResolution.HTTPStatus <> '403')
+    and (AResolution.HTTPStatus <> '429') then Exit(False);
+  E := LowerCase(AResolution.Stderr);
+  Result := (Pos('api rate limit exceeded', E) > 0)
+         or (Pos('secondary rate limit', E) > 0);
+end;
+
 { Resolve the newest non-prerelease-flagged release tag while keeping
   curl's transport exit, HTTP status, response body, and stderr distinct.
   Positional shell parameters keep the scratch path and repository URL
@@ -271,7 +289,16 @@ begin
 
   Cmd := 'command -v curl >/dev/null 2>&1 '
        + '|| { printf ''curl is required\n'' >&2; exit 127; }; '
-       + 'curl -fsSL -o "$1" -w ''%{http_code}'' "$2"';
+       + 'github_request() { '
+       + 'if [ -n "${GITHUB_TOKEN:-}" ]; then '
+       + 'curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" "$@"; '
+       + 'else curl -sSL "$@"; fi; }; '
+       + 'HTTPStatus=$(github_request -o "$1" '
+       + '-w ''%{http_code}'' "$2"); CurlExit=$?; '
+       + 'printf ''%s'' "$HTTPStatus"; '
+       + 'case "$HTTPStatus" in 403|429) '
+       + '[ -f "$1" ] && cat "$1" >&2 ;; esac; '
+       + 'exit "$CurlExit"';
   Result.CurlExitCode := RunSh(
     ['-c', Cmd, 'resolve-latest', AResponsePath,
      'https://api.github.com/repos/' + ReleasesRepo + '/releases/latest'],
@@ -291,6 +318,7 @@ function LatestTagOutcome(
   const AResolution: TLatestTagResolution): TLatestTagOutcome;
 begin
   if AResolution.HTTPStatus = '404' then Exit(ltoNoRelease);
+  if ResolutionIsRateLimited(AResolution) then Exit(ltoRateLimited);
   if AResolution.CurlExitCode <> 0 then
   begin
     if InstallFailureIsSkippable(AResolution.Stderr) then
@@ -327,7 +355,9 @@ begin
   Result := ResolveLatestTag(
     FScratch + '/response-' + AMode + '.json',
     ['PATH=' + FBinDir + ':' + GetEnvironmentVariable('PATH'),
-     'INSTALL_RESOLVE_MODE=' + AMode]);
+     'INSTALL_RESOLVE_MODE=' + AMode,
+     'GITHUB_TOKEN=',
+     'EXPECTED_AUTHORIZATION=']);
 end;
 
 procedure TLatestTagResolutionTests.BeforeAll;
@@ -347,13 +377,21 @@ begin
   WriteTextFile(FCurlPath,
     '#!/bin/sh'#10 +
     'Output=""'#10 +
+    'Authorization=""'#10 +
     'while [ "$#" -gt 0 ]; do'#10 +
     '  case "$1" in'#10 +
+    '    -H) Authorization="$2"; shift 2 ;;'#10 +
     '    -o) Output="$2"; shift 2 ;;'#10 +
     '    -w) shift 2 ;;'#10 +
     '    *) shift ;;'#10 +
     '  esac'#10 +
     'done'#10 +
+    'if [ "${EXPECTED_AUTHORIZATION+x}" = x ] '
+      + '&& [ "$Authorization" != "$EXPECTED_AUTHORIZATION" ]; then'#10 +
+    '  printf ''unexpected Authorization header: %s\n'' '
+      + '"$Authorization" >&2'#10 +
+    '  exit 97'#10 +
+    'fi'#10 +
     ': > "$Output"'#10 +
     'case "${INSTALL_RESOLVE_MODE:-success}" in'#10 +
     '  success)'#10 +
@@ -361,19 +399,22 @@ begin
     '    printf ''200'' ;;'#10 +
     '  not-found)'#10 +
     '    printf ''%s'' ''{"message":"Not Found"}'' > "$Output"'#10 +
-    '    printf ''404'''#10 +
-    '    printf ''curl: (22) The requested URL returned error: 404\n'' >&2'#10 +
-    '    exit 22 ;;'#10 +
+    '    printf ''404'' ;;'#10 +
     '  forbidden)'#10 +
-    '    printf ''%s'' ''{"message":"rate limit"}'' > "$Output"'#10 +
-    '    printf ''403'''#10 +
-    '    printf ''curl: (22) The requested URL returned error: 403\n'' >&2'#10 +
-    '    exit 22 ;;'#10 +
+    '    printf ''%s'' ''{"message":"Resource not accessible by integration"}'' '
+      + '> "$Output"'#10 +
+    '    printf ''403'' ;;'#10 +
+    '  primary-rate-limit)'#10 +
+    '    printf ''%s'' ''{"message":"API rate limit exceeded for 192.0.2.1."}'' '
+      + '> "$Output"'#10 +
+    '    printf ''403'' ;;'#10 +
+    '  secondary-rate-limit)'#10 +
+    '    printf ''%s'' ''{"message":"You have exceeded a secondary rate limit."}'' '
+      + '> "$Output"'#10 +
+    '    printf ''429'' ;;'#10 +
     '  server-error)'#10 +
     '    printf ''%s'' ''{"message":"server error"}'' > "$Output"'#10 +
-    '    printf ''500'''#10 +
-    '    printf ''curl: (22) The requested URL returned error: 500\n'' >&2'#10 +
-    '    exit 22 ;;'#10 +
+    '    printf ''500'' ;;'#10 +
     '  connectivity)'#10 +
     '    printf ''000'''#10 +
     '    printf ''curl: (6) Could not resolve host: api.github.com\n'' >&2'#10 +
@@ -403,7 +444,12 @@ procedure TLatestTagResolutionTests.TestSuccessfulResponseResolves;
 var Resolution: TLatestTagResolution;
 begin
   if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
-  Resolution := ResolveMode('success');
+  Resolution := ResolveLatestTag(
+    FScratch + '/response-success.json',
+    ['PATH=' + FBinDir + ':' + GetEnvironmentVariable('PATH'),
+     'INSTALL_RESOLVE_MODE=success',
+     'GITHUB_TOKEN=test-token',
+     'EXPECTED_AUTHORIZATION=Authorization: Bearer test-token']);
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoResolved));
   Expect<string>(Resolution.Tag).ToBe('v1.2.3');
 end;
@@ -433,6 +479,20 @@ begin
   Expect<Boolean>(Pos('curl is required', Resolution.Stderr) > 0).ToBe(True);
 end;
 
+procedure TLatestTagResolutionTests.TestRateLimitFailuresSkipDistinctly;
+var Resolution: TLatestTagResolution;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Resolution := ResolveMode('primary-rate-limit');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(
+    Ord(ltoRateLimited));
+  Expect<Boolean>(Pos('API rate limit exceeded', Resolution.Stderr) > 0).ToBe(
+    True);
+  Resolution := ResolveMode('secondary-rate-limit');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(
+    Ord(ltoRateLimited));
+end;
+
 procedure TLatestTagResolutionTests.TestHTTPFailuresFail;
 var Resolution: TLatestTagResolution;
 begin
@@ -441,7 +501,7 @@ begin
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
   Expect<Boolean>(Pos('HTTP 403',
     LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
-  Expect<Boolean>(Pos('returned error: 403',
+  Expect<Boolean>(Pos('Resource not accessible',
     LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
   Resolution := ResolveMode('server-error');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
@@ -479,6 +539,8 @@ begin
     TestExplicitNotFoundSkips);
   Test('narrow connectivity failure is transient',
     TestConnectivityFailureSkips);
+  Test('GitHub API rate limits are a distinct skip',
+    TestRateLimitFailuresSkipDistinctly);
   Test('HTTP 403 and 500 fail resolution',
     TestHTTPFailuresFail);
   Test('unclassified curl failure fails with stderr',
@@ -515,8 +577,9 @@ begin
     Exit;
   end;
 
-  { Resolve "latest" — the single source of truth. Only an explicit 404
-    or a narrowly classified connectivity failure skips. }
+  { Resolve "latest" — the single source of truth. Only an explicit 404,
+    a documented GitHub rate-limit response, or a narrowly classified
+    connectivity failure skips. }
   Resolution := ResolveLatestTag(FScratch + '/latest-release.json', []);
   case LatestTagOutcome(Resolution) of
     ltoNoRelease:
@@ -529,6 +592,13 @@ begin
     ltoTransientFailure:
       begin
         WriteLn('  [skip] github.com unreachable or curl missing (transient/env); '
+              + 'install-script test skipped');
+        FSkipped := True;
+        Exit;
+      end;
+    ltoRateLimited:
+      begin
+        WriteLn('  [skip] GitHub latest-release API rate limit reached; '
               + 'install-script test skipped');
         FSkipped := True;
         Exit;
