@@ -6,7 +6,7 @@ manifest. Zero-install by default — `git clone && fpc @lwpt.cfg`
 builds a project without running `lwpt install` first.
 
 ```text
-lwpt init      scaffold a new project (manifest + source dir + sample entry)
+lwpt init      scaffold a new project or adopt an existing manifest   [--adopt]
 lwpt install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
 lwpt add       add a dependency to lwpt.toml + install it   [--name <name>]
 lwpt remove    remove dependencies from lwpt.toml + prune their modules
@@ -44,6 +44,8 @@ The project's durable direction and delivery gates live in
 bootstrap.bat      # Windows
 
 # Steady state — all driven by the LWPT binary
+./build/lwpt init --yes         # scaffold a fresh project
+./build/lwpt init --adopt       # fill in scaffold around an existing manifest
 ./build/lwpt build              # dev build, all manifest targets
 ./build/lwpt build --mode release
 ./build/lwpt build <target>     # single target
