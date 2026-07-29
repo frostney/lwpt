@@ -46,7 +46,31 @@ type
     Resolved     : TResolvedArray;  { the materialized/verified graph }
   end;
 
+const
+  { Test-only archive-fetch redirection. ARCHIVE_FETCH_ORIGIN_ENV is read
+    at the archive-fetch boundary AFTER canonical URL construction, so the
+    manifest, the host templates in FetchURL, and the resolved path are all
+    exercised exactly as in production; only the origin is swapped. Absent
+    or empty, the canonical URL is used byte for byte.
+
+    The accepted value is a bare `http://<numeric IPv4 loopback>:<port>`
+    origin. Everything else is refused: a remote host, a name that would
+    need DNS (including `localhost`), a missing port, a path, user
+    information, and any non-http scheme. That keeps the seam unable to
+    express an arbitrary insecure download, which is the reason it can
+    live in the shipped binary rather than behind a build flag.
+
+    ARCHIVE_FETCH_TIMEOUT_ENV bounds a single archive read and is honoured
+    only while the origin override is active, so it cannot become a
+    production knob by itself. }
+  ARCHIVE_FETCH_ORIGIN_ENV  = PROJECT_NAME + '_TEST_ARCHIVE_ORIGIN';
+  ARCHIVE_FETCH_TIMEOUT_ENV = PROJECT_NAME + '_TEST_ARCHIVE_TIMEOUT_MS';
+  DEFAULT_ARCHIVE_FETCH_TIMEOUT = 5000;
+  MAXIMUM_ARCHIVE_FETCH_TIMEOUT = 600000;
+
 function  LoadLockfile(const APath: string): TResolvedArray;
+function  ApplyArchiveFetchOrigin(const ACanonicalURL, AOverride: string): string;
+function  ResolveArchiveFetchTimeout(const ARawMilliseconds: string): Integer;
 function  ExtractArchive(const AArchivePath, ADest: string; const ASubDir: string = ''): Integer;
 procedure VerifyAgainstLockfile(const AResolved: array of TResolved; const ALockEntries: array of TResolved);
 function  PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved; const AModulesRoot, AArchivesRoot: string): Integer;
@@ -195,6 +219,168 @@ begin
   else
     Result := '';   { skLocal handled outside this function (no URL) }
   end;
+end;
+
+{ ───────────────────────────────────────────────────────────────────
+  Test-only archive-fetch redirection. See the ARCHIVE_FETCH_*
+  declarations in the interface for the contract this enforces.
+
+  Deliberately NOT a proxy, a mirror, or an origin-selection feature:
+  it rewrites nothing but the origin, refuses every value that is not a
+  numeric loopback plain-HTTP endpoint, and is inert when unset.
+  ─────────────────────────────────────────────────────────────────── }
+const
+  LOOPBACK_FIRST_OCTET = 127;
+  IPV4_GROUP_COUNT     = 4;
+  MAXIMUM_PORT_NUMBER  = 65535;
+
+{ Split "<scheme>://<authority><path>" into its three parts. The path
+  keeps its leading '/' and is '' when the URL carries none. }
+function SplitURLParts(const AURL: string;
+  out AScheme, AAuthority, APath: string): Boolean;
+var
+  SchemeEnd, PathStart: Integer;
+begin
+  AScheme := '';
+  AAuthority := '';
+  APath := '';
+  SchemeEnd := Pos('://', AURL);
+  Result := SchemeEnd > 1;
+  if not Result then Exit;
+  AScheme := LowerCase(Copy(AURL, 1, SchemeEnd - 1));
+  AAuthority := Copy(AURL, SchemeEnd + 3, MaxInt);
+  PathStart := Pos('/', AAuthority);
+  if PathStart > 0 then
+  begin
+    APath := Copy(AAuthority, PathStart, MaxInt);
+    AAuthority := Copy(AAuthority, 1, PathStart - 1);
+  end;
+end;
+
+{ Dotted-quad check with the loopback range baked in. Names are refused
+  on purpose: resolving one would need DNS, and "localhost" is exactly
+  the value that could silently point somewhere else on a given host. }
+function IsNumericLoopbackAddress(const AHost: string): Boolean;
+var
+  Groups, Value, DigitCount, i: Integer;
+  Current: Char;
+begin
+  Result := False;
+  Groups := 0;
+  Value := 0;
+  DigitCount := 0;
+  for i := 1 to Length(AHost) + 1 do
+  begin
+    if i <= Length(AHost) then Current := AHost[i] else Current := '.';
+    if Current = '.' then
+    begin
+      if (DigitCount = 0) or (DigitCount > 3) or (Value > 255) then Exit;
+      Inc(Groups);
+      if (Groups = 1) and (Value <> LOOPBACK_FIRST_OCTET) then Exit;
+      Value := 0;
+      DigitCount := 0;
+    end
+    else if Current in ['0'..'9'] then
+    begin
+      Value := Value * 10 + (Ord(Current) - Ord('0'));
+      Inc(DigitCount);
+    end
+    else
+      Exit;
+  end;
+  Result := Groups = IPV4_GROUP_COUNT;
+end;
+
+{ Digits only, because StrToIntDef would otherwise accept '$7f' and '+80'. }
+function ParseWholeNumber(const AText: string; out AValue: Integer): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  AValue := 0;
+  if (AText = '') or (Length(AText) > 9) then Exit;
+  for i := 1 to Length(AText) do
+  begin
+    if not (AText[i] in ['0'..'9']) then Exit;
+    AValue := AValue * 10 + (Ord(AText[i]) - Ord('0'));
+  end;
+  Result := True;
+end;
+
+procedure RejectArchiveFetchOrigin(const AOverride, AReason: string);
+begin
+  raise EFetchError.CreateFmt(
+    '%s is a test-only archive-fetch override and was refused: %s (got "%s")',
+    [ARCHIVE_FETCH_ORIGIN_ENV, AReason, AOverride]);
+end;
+
+procedure ValidateArchiveFetchOrigin(const AOverride: string);
+var
+  Scheme, Authority, Path, Host, PortText: string;
+  ColonAt, Port: Integer;
+begin
+  if not SplitURLParts(AOverride, Scheme, Authority, Path) then
+    RejectArchiveFetchOrigin(AOverride,
+      'it is not a <scheme>://<host>:<port> origin');
+  if Scheme <> 'http' then
+    RejectArchiveFetchOrigin(AOverride,
+      'only the http scheme is accepted');
+  if (Path <> '') and (Path <> '/') then
+    RejectArchiveFetchOrigin(AOverride,
+      'it must be a bare origin carrying no path');
+  if Pos('@', Authority) > 0 then
+    RejectArchiveFetchOrigin(AOverride,
+      'user information is not accepted');
+  ColonAt := Pos(':', Authority);
+  if ColonAt = 0 then
+    RejectArchiveFetchOrigin(AOverride,
+      'an explicit port is required');
+  Host := Copy(Authority, 1, ColonAt - 1);
+  PortText := Copy(Authority, ColonAt + 1, MaxInt);
+  if not IsNumericLoopbackAddress(Host) then
+    RejectArchiveFetchOrigin(AOverride,
+      'the host must be a numeric IPv4 loopback address inside 127.0.0.0/8');
+  if (not ParseWholeNumber(PortText, Port))
+     or (Port < 1) or (Port > MAXIMUM_PORT_NUMBER) then
+    RejectArchiveFetchOrigin(AOverride, Format(
+      'the port must be a number between 1 and %d', [MAXIMUM_PORT_NUMBER]));
+end;
+
+function ApplyArchiveFetchOrigin(const ACanonicalURL,
+  AOverride: string): string;
+var
+  Scheme, Authority, Path, Origin: string;
+begin
+  { The whole production contract is this early exit: with no override
+    the canonical URL is returned byte for byte. }
+  if AOverride = '' then Exit(ACanonicalURL);
+
+  ValidateArchiveFetchOrigin(AOverride);
+
+  { Fail closed. A canonical URL we cannot split is a bug upstream of
+    here, and returning it unchanged would let a fixture reach the real
+    network instead of the loopback server it asked for. }
+  if not SplitURLParts(ACanonicalURL, Scheme, Authority, Path) then
+    raise EFetchError.CreateFmt(
+      '%s is set but the canonical archive URL "%s" carries no scheme to '
+      + 'redirect', [ARCHIVE_FETCH_ORIGIN_ENV, ACanonicalURL]);
+
+  Origin := AOverride;
+  if (Origin <> '') and (Origin[Length(Origin)] = '/') then
+    Origin := Copy(Origin, 1, Length(Origin) - 1);
+  if Path = '' then Path := '/';
+  Result := Origin + Path;
+end;
+
+function ResolveArchiveFetchTimeout(const ARawMilliseconds: string): Integer;
+begin
+  if ARawMilliseconds = '' then Exit(DEFAULT_ARCHIVE_FETCH_TIMEOUT);
+  if (not ParseWholeNumber(ARawMilliseconds, Result))
+     or (Result < 1) or (Result > MAXIMUM_ARCHIVE_FETCH_TIMEOUT) then
+    raise EFetchError.CreateFmt(
+      '%s must be a whole number of milliseconds between 1 and %d (got "%s")',
+      [ARCHIVE_FETCH_TIMEOUT_ENV, MAXIMUM_ARCHIVE_FETCH_TIMEOUT,
+       ARawMilliseconds]);
 end;
 
 { Build the git smart-HTTP base URL for tag listing. Same host
@@ -740,7 +926,7 @@ function FetchToCache(const ADep: TDependency;
   const AWorkspaces: TWorkspaceArray;
   out AUnitDir, AArchive, AArchiveHash, AResolvedURL: string): Boolean;
 var
-  URL, LocalPath : string;
+  URL, LocalPath, OriginOverride : string;
   Resp : THTTPResponse;
   NoHeaders : THTTPHeaders;
   HTTPOptions : THTTPRequestOptions;
@@ -873,23 +1059,47 @@ begin
     or the verbatim URL for skURL. }
   URL := FetchURL(ADep, AResolvedRef, ACustomSources);
   if URL = '' then Exit(False);
-  AResolvedURL := URL;
 
+  { The archive-fetch boundary, and the only place the test-only origin
+    override applies: canonical construction above is untouched, and the
+    redirect below is inert unless the environment asks for it. }
+  OriginOverride := SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_ORIGIN_ENV);
+  { Record the canonical URL in the lockfile, captured before the redirect.
+    The override only aims the fetch at a loopback mock server; the
+    loopback origin must never persist into lwpt.lock, so AResolvedURL
+    keeps the URL as constructed while URL below carries the rewrite. }
+  AResolvedURL := URL;
+  URL := ApplyArchiveFetchOrigin(URL, OriginOverride);
   NoHeaders := nil;
   HTTPOptions := DefaultHTTPRequestOptions;
   HTTPOptions.MaxResponseBodyBytes := MAX_ARCHIVE_RESPONSE_BYTES;
-  HTTPOptions.RequestTimeoutMilliseconds :=
-    ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;
+  if OriginOverride <> '' then
+    HTTPOptions.RequestTimeoutMilliseconds := ResolveArchiveFetchTimeout(
+      SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_TIMEOUT_ENV))
+  else
+    HTTPOptions.RequestTimeoutMilliseconds :=
+      ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;
+  { Every transport failure below the client (refused connection, read
+    timeout, truncated body, malformed response) arrives here as some
+    HTTPClient-shaped exception whose text names neither the dependency
+    nor what was being attempted. Normalising to EFetchError gives the
+    caller one exception type and one message shape to rely on. The
+    underlying text is appended rather than replaced so the narrow
+    connect/DNS detection the e2e suites use still matches. }
   try
     Resp := HTTPGet(URL, NoHeaders, HTTPOptions);
   except
-    on E: EHTTPError do
-      raise EFetchError.CreateFmt('fetch %s failed: %s',
-        [URL, E.Message]);
+    on E: EFetchError do
+      raise;
+    on E: Exception do
+      raise EFetchError.CreateFmt(
+        'dependency "%s": archive fetch from %s failed: %s',
+        [ADep.Name, URL, E.Message]);
   end;
   if (Resp.StatusCode < 200) or (Resp.StatusCode >= 300) then
-    raise EFetchError.CreateFmt('fetch %s failed: HTTP %d %s',
-      [URL, Resp.StatusCode, Resp.StatusText]);
+    raise EFetchError.CreateFmt(
+      'dependency "%s": archive fetch from %s failed: HTTP %d %s',
+      [ADep.Name, URL, Resp.StatusCode, Resp.StatusText]);
 
   { Archive filename uses an escaped resolved ref for git-host sources,
     or the stable "url" tag for direct archive URLs. }
