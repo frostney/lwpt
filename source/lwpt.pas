@@ -2,7 +2,7 @@
 
   One executable, ten subcommands sharing a common core (manifest,
   TOML, resolver, cfg emitter):
-    init      scaffold a new project (manifest + source dir + sample entry)
+    init      scaffold a new project or adopt an existing manifest
     install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
     add       add a dependency to lwpt.toml + install it (ADR-0019)
     remove    remove dependencies from lwpt.toml + prune their modules
@@ -316,11 +316,12 @@ end;
 function HandleInit(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  Yes, Force : Boolean;
+  Yes, Force, Adopt : Boolean;
   i : Integer;
 begin
   Yes := False;
   Force := False;
+  Adopt := False;
   for i := 0 to High(AOptions) do
   begin
     if (SameText(AOptions[i].LongName, 'yes')
@@ -328,9 +329,11 @@ begin
        and AOptions[i].Present then Yes := True;
     if SameText(AOptions[i].LongName, 'force')
        and AOptions[i].Present then Force := True;
+    if SameText(AOptions[i].LongName, 'adopt')
+       and AOptions[i].Present then Adopt := True;
   end;
   try
-    CmdInit(Yes, Force);
+    CmdInit(Yes, Force, Adopt);
     Result := 0;
   except
     on E: Exception do
@@ -503,14 +506,16 @@ begin
       'Reclaim install, build-session, and worker-lease residue', '',
       @HandleRepair, RepairOpts));
 
-    SetLength(InitOpts, 2);
+    SetLength(InitOpts, 3);
     InitOpts[0] := TFlagOption.Create('yes',
       'Skip prompts and use defaults derived from the directory name');
     InitOpts[1] := TFlagOption.Create('force',
       'Overwrite an existing lwpt.toml without asking');
+    InitOpts[2] := TFlagOption.Create('adopt',
+      'Fill in missing scaffold around an existing manifest without modifying it');
     Registry.Add(TSubcommand.Create('init',
-      'Scaffold a new LWPT project (manifest + source dir + sample entry; optionally runs install + build)',
-      '[--yes] [--force]',
+      'Scaffold a new LWPT project or adopt an existing manifest',
+      '[--yes] [--force] [--adopt]',
       @HandleInit, InitOpts));
 
     SetLength(RunOpts, 0);

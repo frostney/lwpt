@@ -1,25 +1,21 @@
-{ Init.Test — integration test for `lwpt init --yes` (ADR-0010).
+{ Init.Test — integration test for `lwpt init` (ADR-0010).
 
   Spawns the binary in a per-test scratch directory and asserts on
-  the three artefacts the subcommand is responsible for:
+  fresh scaffolding plus non-destructive adoption around an existing
+  manifest.
 
-    - lwpt.toml: a parsable manifest naming a [package] derived from
-      the scratch dir's basename, version "0.1.0", units = ["source"].
-    - lwpt.lock: schema-v3 empty lockfile (no packages, but the
-      version header is correct so the next `lwpt install` accepts it).
-    - .gitignore: contains the four LWPT-internal paths
-      (.lwpt/tmp/ + .lwpt/install.lock + .lwpt/sessions/ + .lwpt/workers/) —
-      added if absent, never
-      duplicated if present.
-
-  Also covers the refuse-to-clobber semantics: a second run without
-  --force fails; with --force succeeds. }
+  Adoption preserves lwpt.toml byte-for-byte, creates missing local
+  [package].units directories, appends only missing .gitignore entries,
+  and rejects conflicts before changing the scaffold. }
 
 program Init.Test;
 
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
   Classes,
   StrUtils,
   SysUtils,
@@ -48,6 +44,16 @@ type
     procedure TestSecondInitWithoutForceRejects;
     procedure TestSecondInitWithForceOverwrites;
     procedure TestExistingGitignoreIsNotDuplicated;
+    procedure TestAdoptPreservesManifestAndAddsMissingScaffold;
+    procedure TestAdoptUsesDeclaredBuildOutputDirectories;
+    procedure TestAdoptIsIdempotentAndReportsFoundScaffold;
+    procedure TestAdoptRejectsForceWithoutWriting;
+    procedure TestAdoptRequiresExistingManifest;
+    procedure TestAdoptRejectsInvalidManifestWithoutWriting;
+    procedure TestAdoptRejectsUnitFileConflictWithoutWriting;
+    procedure TestAdoptRejectsMissingExternalUnitDirectory;
+    procedure TestAdoptRejectsSymlinkedUnitParent;
+    procedure TestAdoptRejectsSymlinkedGitignore;
   end;
 
 function ReadFileText(const APath: string): string;
@@ -59,6 +65,30 @@ begin
     Result := SL.Text;
   finally
     SL.Free;
+  end;
+end;
+
+function ReadRawFileText(const APath: string): string;
+var Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    SetLength(Result, Stream.Size);
+    if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure WriteRawFileText(const APath, AContent: string);
+var Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    if AContent <> '' then
+      Stream.WriteBuffer(AContent[1], Length(AContent));
+  finally
+    Stream.Free;
   end;
 end;
 
@@ -260,6 +290,292 @@ begin
   Expect<Integer>(Count).ToBe(1);
 end;
 
+procedure TInitCommand.TestAdoptPreservesManifestAndAddsMissingScaffold;
+var
+  AdoptScratch, ManifestBefore, ManifestAfter: string;
+  GitignoreBefore, GitignoreAfter, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-project';
+  RecursiveDelete(AdoptScratch);
+  ForceDirectories(AdoptScratch);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "adopt-project"'#10 +
+    'version = "1.2.3"'#10 +
+    'units = ["source", "generated"]'#10);
+  GitignoreBefore := '# user content without a trailing newline';
+  WriteRawFileText(AdoptScratch + '/.gitignore', GitignoreBefore);
+  ManifestBefore := ReadRawFileText(AdoptScratch + '/lwpt.toml');
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+
+  ManifestAfter := ReadRawFileText(AdoptScratch + '/lwpt.toml');
+  GitignoreAfter := ReadRawFileText(AdoptScratch + '/.gitignore');
+  Output := R.Stdout + R.Stderr;
+  Expect<string>(ManifestAfter).ToBe(ManifestBefore);
+  Expect<Boolean>(Copy(GitignoreAfter, 1, Length(GitignoreBefore))
+    = GitignoreBefore).ToBe(True);
+  Expect<Boolean>(DirectoryExists(AdoptScratch + '/source')).ToBe(True);
+  Expect<Boolean>(DirectoryExists(AdoptScratch + '/generated')).ToBe(True);
+  Expect<Boolean>(Pos('.lwpt/tmp/', GitignoreAfter) > 0).ToBe(True);
+  Expect<Boolean>(Pos('.lwpt/install.lock', GitignoreAfter) > 0).ToBe(True);
+  Expect<Boolean>(Pos('.lwpt/sessions/', GitignoreAfter) > 0).ToBe(True);
+  Expect<Boolean>(Pos('.lwpt/workers/', GitignoreAfter) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build/', GitignoreAfter) > 0).ToBe(True);
+  Expect<Boolean>(Pos('preserved lwpt.toml', Output) > 0).ToBe(True);
+  Expect<Boolean>(Pos('created unit directory source', Output) > 0).ToBe(True);
+  Expect<Boolean>(Pos('added .gitignore entry build/', Output) > 0).ToBe(True);
+end;
+
+procedure TInitCommand.TestAdoptUsesDeclaredBuildOutputDirectories;
+var
+  AdoptScratch, Gitignore, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-build-outputs';
+  RecursiveDelete(AdoptScratch);
+  ForceDirectories(AdoptScratch);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "adopt-build-outputs"'#10 +
+    'units = []'#10 +
+    '[build]'#10 +
+    'cli = { source = "source/cli.pas", output = "bin/cli" }'#10 +
+    'helper = { source = "source/helper.pas", '
+      + 'output = "dist/tools/helper" }'#10 +
+    'duplicate = { source = "source/duplicate.pas", '
+      + 'output = "bin/duplicate" }'#10 +
+    'external = { source = "source/external.pas", '
+      + 'output = "../outside/external" }'#10);
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+
+  Gitignore := ReadRawFileText(AdoptScratch + '/.gitignore');
+  Output := R.Stdout + R.Stderr;
+  Expect<Boolean>(Pos('bin/', Gitignore) > 0).ToBe(True);
+  Expect<Boolean>(PosEx('bin/', Gitignore,
+    Pos('bin/', Gitignore) + 1) = 0).ToBe(True);
+  Expect<Boolean>(Pos('dist/tools/', Gitignore) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build/', Gitignore) = 0).ToBe(True);
+  Expect<Boolean>(Pos('../outside/', Gitignore) = 0).ToBe(True);
+  Expect<Boolean>(Pos('added .gitignore entry bin/', Output) > 0).ToBe(True);
+  Expect<Boolean>(Pos('added .gitignore entry dist/tools/',
+    Output) > 0).ToBe(True);
+end;
+
+procedure TInitCommand.TestAdoptIsIdempotentAndReportsFoundScaffold;
+var
+  AdoptScratch, ManifestBefore, GitignoreBefore, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-idempotent';
+  RecursiveDelete(AdoptScratch);
+  ForceDirectories(AdoptScratch);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "adopt-idempotent"'#10 +
+    'version = "0.4.0"'#10 +
+    'units = ["src"]'#10);
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  ManifestBefore := ReadRawFileText(AdoptScratch + '/lwpt.toml');
+  GitignoreBefore := ReadRawFileText(AdoptScratch + '/.gitignore');
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Output := R.Stdout + R.Stderr;
+  Expect<string>(ReadRawFileText(AdoptScratch + '/lwpt.toml'))
+    .ToBe(ManifestBefore);
+  Expect<string>(ReadRawFileText(AdoptScratch + '/.gitignore'))
+    .ToBe(GitignoreBefore);
+  Expect<Boolean>(Pos('found unit directory src', Output) > 0).ToBe(True);
+  Expect<Boolean>(Pos('found .gitignore entry build/', Output) > 0).ToBe(True);
+  Expect<Boolean>(Pos('added .gitignore entry', Output) = 0).ToBe(True);
+end;
+
+procedure TInitCommand.TestAdoptRejectsForceWithoutWriting;
+var
+  AdoptScratch, ManifestBefore, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-force-conflict';
+  RecursiveDelete(AdoptScratch);
+  ForceDirectories(AdoptScratch);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "adopt-force-conflict"'#10 +
+    'units = ["source"]'#10);
+  ManifestBefore := ReadRawFileText(AdoptScratch + '/lwpt.toml');
+
+  R := RunLwpt(['init', '--adopt', '--force'], AdoptScratch);
+  Output := R.Stdout + R.Stderr;
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('--adopt and --force', Output) > 0).ToBe(True);
+  Expect<string>(ReadRawFileText(AdoptScratch + '/lwpt.toml'))
+    .ToBe(ManifestBefore);
+  Expect<Boolean>(DirectoryExists(AdoptScratch + '/source')).ToBe(False);
+  Expect<Boolean>(FileExists(AdoptScratch + '/.gitignore')).ToBe(False);
+end;
+
+procedure TInitCommand.TestAdoptRequiresExistingManifest;
+var
+  AdoptScratch, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-no-manifest';
+  RecursiveDelete(AdoptScratch);
+  ForceDirectories(AdoptScratch);
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Output := R.Stdout + R.Stderr;
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('cannot adopt without an existing lwpt.toml',
+    Output) > 0).ToBe(True);
+  Expect<Boolean>(FileExists(AdoptScratch + '/.gitignore')).ToBe(False);
+end;
+
+procedure TInitCommand.TestAdoptRejectsInvalidManifestWithoutWriting;
+var
+  AdoptScratch, ManifestBefore, GitignoreBefore: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-invalid-manifest';
+  RecursiveDelete(AdoptScratch);
+  ForceDirectories(AdoptScratch);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package'#10 +
+    'name = "broken"'#10);
+  WriteRawFileText(AdoptScratch + '/.gitignore', '# unchanged');
+  ManifestBefore := ReadRawFileText(AdoptScratch + '/lwpt.toml');
+  GitignoreBefore := ReadRawFileText(AdoptScratch + '/.gitignore');
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<string>(ReadRawFileText(AdoptScratch + '/lwpt.toml'))
+    .ToBe(ManifestBefore);
+  Expect<string>(ReadRawFileText(AdoptScratch + '/.gitignore'))
+    .ToBe(GitignoreBefore);
+  Expect<Boolean>(DirectoryExists(AdoptScratch + '/source')).ToBe(False);
+end;
+
+procedure TInitCommand.TestAdoptRejectsUnitFileConflictWithoutWriting;
+var
+  AdoptScratch, ManifestBefore, GitignoreBefore, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-unit-file';
+  RecursiveDelete(AdoptScratch);
+  ForceDirectories(AdoptScratch);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "adopt-unit-file"'#10 +
+    'units = ["source"]'#10);
+  WriteRawFileText(AdoptScratch + '/source', 'not a directory');
+  WriteRawFileText(AdoptScratch + '/.gitignore', '# unchanged');
+  ManifestBefore := ReadRawFileText(AdoptScratch + '/lwpt.toml');
+  GitignoreBefore := ReadRawFileText(AdoptScratch + '/.gitignore');
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Output := R.Stdout + R.Stderr;
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('is a file, not a directory', Output) > 0).ToBe(True);
+  Expect<string>(ReadRawFileText(AdoptScratch + '/lwpt.toml'))
+    .ToBe(ManifestBefore);
+  Expect<string>(ReadRawFileText(AdoptScratch + '/.gitignore'))
+    .ToBe(GitignoreBefore);
+end;
+
+procedure TInitCommand.TestAdoptRejectsMissingExternalUnitDirectory;
+var
+  AdoptScratch, ExternalDir, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-external-unit';
+  ExternalDir := ExtractFileDir(AdoptScratch) + '/outside-source';
+  RecursiveDelete(AdoptScratch);
+  RecursiveDelete(ExternalDir);
+  ForceDirectories(AdoptScratch);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "adopt-external-unit"'#10 +
+    'units = ["../outside-source"]'#10);
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Output := R.Stdout + R.Stderr;
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('refusing to create [package].units path',
+    Output) > 0).ToBe(True);
+  Expect<Boolean>(DirectoryExists(ExternalDir)).ToBe(False);
+  Expect<Boolean>(FileExists(AdoptScratch + '/.gitignore')).ToBe(False);
+end;
+
+procedure TInitCommand.TestAdoptRejectsSymlinkedUnitParent;
+{$IFDEF UNIX}
+var
+  AdoptScratch, ExternalDir, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-linked-unit';
+  ExternalDir := ExtractFileDir(AdoptScratch) + '/linked-unit-target';
+  RecursiveDelete(AdoptScratch);
+  RecursiveDelete(ExternalDir);
+  ForceDirectories(AdoptScratch);
+  ForceDirectories(ExternalDir);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "adopt-linked-unit"'#10 +
+    'units = ["linked-parent/new-dir"]'#10);
+  if FpSymlink(PAnsiChar('../linked-unit-target'),
+    PAnsiChar(AdoptScratch + '/linked-parent')) <> 0 then
+    raise Exception.Create('fixture: FpSymlink failed for unit parent');
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Output := R.Stdout + R.Stderr;
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('through symlink or junction', Output) > 0).ToBe(True);
+  Expect<Boolean>(DirectoryExists(ExternalDir + '/new-dir')).ToBe(False);
+  Expect<Boolean>(FileExists(AdoptScratch + '/.gitignore')).ToBe(False);
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
+procedure TInitCommand.TestAdoptRejectsSymlinkedGitignore;
+{$IFDEF UNIX}
+var
+  AdoptScratch, ExternalFile, ExternalBefore, Output: string;
+  R: TLwptResult;
+begin
+  AdoptScratch := ExtractFileDir(FScratch) + '/adopt-linked-gitignore';
+  ExternalFile := ExtractFileDir(AdoptScratch) + '/outside.gitignore';
+  RecursiveDelete(AdoptScratch);
+  ForceDirectories(AdoptScratch);
+  WriteRawFileText(AdoptScratch + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "adopt-linked-gitignore"'#10 +
+    'units = []'#10);
+  ExternalBefore := '# external content';
+  WriteRawFileText(ExternalFile, ExternalBefore);
+  if FpSymlink(PAnsiChar('../outside.gitignore'),
+    PAnsiChar(AdoptScratch + '/.gitignore')) <> 0 then
+    raise Exception.Create('fixture: FpSymlink failed for .gitignore');
+
+  R := RunLwpt(['init', '--adopt'], AdoptScratch);
+  Output := R.Stdout + R.Stderr;
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('through symlink or junction', Output) > 0).ToBe(True);
+  Expect<string>(ReadRawFileText(ExternalFile)).ToBe(ExternalBefore);
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
 procedure TInitCommand.SetupTests;
 begin
   Test('lwpt init --yes creates lwpt.toml + entry .pas + .gitignore',
@@ -284,6 +600,35 @@ begin
     TestSecondInitWithForceOverwrites);
   Test('existing .gitignore entries are not duplicated on re-init',
     TestExistingGitignoreIsNotDuplicated);
+  Test('init --adopt preserves the manifest and adds missing scaffold',
+    TestAdoptPreservesManifestAndAddsMissingScaffold);
+  Test('init --adopt uses declared project-local build output directories',
+    TestAdoptUsesDeclaredBuildOutputDirectories);
+  Test('init --adopt is idempotent and reports found scaffold',
+    TestAdoptIsIdempotentAndReportsFoundScaffold);
+  Test('init --adopt rejects --force before writing',
+    TestAdoptRejectsForceWithoutWriting);
+  Test('init --adopt requires an existing manifest',
+    TestAdoptRequiresExistingManifest);
+  Test('init --adopt rejects an invalid manifest without writing',
+    TestAdoptRejectsInvalidManifestWithoutWriting);
+  Test('init --adopt rejects a unit-file conflict without writing',
+    TestAdoptRejectsUnitFileConflictWithoutWriting);
+  Test('init --adopt refuses to create a missing external unit directory',
+    TestAdoptRejectsMissingExternalUnitDirectory);
+  {$IFDEF UNIX}
+  Test('init --adopt refuses a symlinked units-directory parent',
+    TestAdoptRejectsSymlinkedUnitParent);
+  Test('init --adopt refuses a symlinked .gitignore',
+    TestAdoptRejectsSymlinkedGitignore);
+  {$ELSE}
+  Skip('init --adopt refuses a symlinked units-directory parent',
+    TestAdoptRejectsSymlinkedUnitParent,
+    'symlink fixture requires a Unix host');
+  Skip('init --adopt refuses a symlinked .gitignore',
+    TestAdoptRejectsSymlinkedGitignore,
+    'symlink fixture requires a Unix host');
+  {$ENDIF}
 end;
 
 begin

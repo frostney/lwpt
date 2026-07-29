@@ -74,6 +74,7 @@ procedure ApplyIncludeExclude(const ARoot: string; const AIncludes, AExcludes: T
 
 function  CopyFileContent(const ASrc, ADst: string): Boolean;
 function  PathContains(const AParent, AChild: string): Boolean;
+function  IsDirSymlinkOrJunction(const APath: string): Boolean;
 procedure CopyDirTree(const ASrc, ADst: string);
 const
   TmpPathDelimiter = '.';
