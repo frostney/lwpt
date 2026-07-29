@@ -52,6 +52,21 @@ type
     procedure TestLargeBodyForcesMultiRecv;
   end;
 
+  { Bounded-failure contract. Both cases are shapes a well-behaved peer
+    never produces and a broken or hostile one does: a fixed-length body
+    cut short mid-transfer, and a peer that accepts the connection then
+    says nothing. Before these, the first returned a zero-padded buffer
+    that looked like a complete body, and the second blocked forever. }
+  THTTPClientBoundedFailures = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestFixedLengthEarlyCloseRaises;
+    procedure TestFixedLengthEarlyCloseNamesTheShortfall;
+    procedure TestCompleteFixedLengthBodyStillSucceeds;
+    procedure TestStalledPeerFailsWithinTheArmedBudget;
+    procedure TestTimeoutIsDisabledByDefault;
+  end;
+
 { ── helpers ───────────────────────────────────────────────────────── }
 
 function MockURL(APort: Word): string;
@@ -183,6 +198,152 @@ begin
   Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(ExpectedBody));
 end;
 
+{ ── THTTPClientBoundedFailures ────────────────────────────────────── }
+
+{ Built by hand rather than through BuildSimpleResponse, which always
+  declares a truthful Content-Length. The declared length deliberately
+  exceeds what is written to the wire, and the mock closes the socket
+  once its bytes are gone. That is the fixed-length early-close shape. }
+function BuildShortFixedLengthResponse(const ASentBody: TBytes;
+  const ADeclaredLength: Integer): TBytes;
+const
+  CRLF = #13#10;
+var
+  Head: TBytes;
+begin
+  Head := BytesOf('HTTP/1.1 200 OK' + CRLF
+    + 'Content-Type: application/octet-stream' + CRLF
+    + 'Content-Length: ' + IntToStr(ADeclaredLength) + CRLF
+    + 'Connection: close' + CRLF
+    + CRLF);
+  SetLength(Result, Length(Head) + Length(ASentBody));
+  if Length(Head) > 0 then Move(Head[0], Result[0], Length(Head));
+  if Length(ASentBody) > 0 then
+    Move(ASentBody[0], Result[Length(Head)], Length(ASentBody));
+end;
+
+{ Serve ARawResponse and return the error text, or '' when the fetch
+  succeeded. }
+function ServeAndCaptureError(const ARawResponse: TBytes): string;
+var
+  Mock: TMockHTTPServer;
+  NoHeaders: THTTPHeaders;
+begin
+  Result := '';
+  Mock := TMockHTTPServer.Create(ARawResponse);
+  try
+    Mock.Start;
+    NoHeaders := nil;
+    try
+      HTTPGet(MockURL(Mock.Port), NoHeaders);
+    except
+      on E: EHTTPError do Result := E.Message;
+    end;
+    Mock.WaitDone;
+  finally
+    Mock.Free;
+  end;
+end;
+
+procedure THTTPClientBoundedFailures.TestFixedLengthEarlyCloseRaises;
+var
+  Message: string;
+begin
+  { Declares 4096 bytes, sends 16, then closes. }
+  Message := ServeAndCaptureError(BuildShortFixedLengthResponse(
+    MakeBytes([$1F, $8B, $08, $00, $00, $00, $00, $00,
+               $00, $03, $AA, $BB, $CC, $DD, $EE, $FF]), 4096));
+  Expect<Boolean>(Message <> '').ToBe(True);
+end;
+
+procedure THTTPClientBoundedFailures.TestFixedLengthEarlyCloseNamesTheShortfall;
+var
+  Message: string;
+begin
+  { The message has to carry both numbers: "the body was short" is not
+    actionable, "16 of 4096" says how short and rules out an off-by-one
+    read as the explanation. }
+  Message := ServeAndCaptureError(BuildShortFixedLengthResponse(
+    MakeBytes([$1F, $8B, $08, $00, $00, $00, $00, $00,
+               $00, $03, $AA, $BB, $CC, $DD, $EE, $FF]), 4096));
+  Expect<Boolean>(Pos('truncated fixed-length body', Message) > 0).ToBe(True);
+  Expect<Boolean>(Pos('16', Message) > 0).ToBe(True);
+  Expect<Boolean>(Pos('4096', Message) > 0).ToBe(True);
+end;
+
+procedure THTTPClientBoundedFailures.TestCompleteFixedLengthBodyStillSucceeds;
+var
+  Body: TBytes;
+begin
+  { The guard must fire on a short transfer only. A truthful
+    Content-Length is the overwhelmingly common case and must be
+    completely unaffected. }
+  Body := MakeBytes([$00, $01, $02, $03, $04, $05, $06, $07]);
+  Expect<string>(BytesToHex(ServeAndFetch(BuildSimpleResponse(Body))))
+    .ToBe(BytesToHex(Body));
+end;
+
+procedure THTTPClientBoundedFailures.TestStalledPeerFailsWithinTheArmedBudget;
+var
+  Mock: TMockHTTPServer;
+  NoHeaders: THTTPHeaders;
+  Message: string;
+  Elapsed: QWord;
+const
+  BUDGET_MS = 250;
+  { Generous ceiling: the assertion is "bounded", not "precisely 250 ms".
+    Scheduler noise on a loaded CI runner must not turn this red. }
+  CEILING_MS = 15000;
+begin
+  { Create binds and listens but does not accept until Start, which is
+    never called here. The connect completes into the kernel's backlog,
+    the request goes out, and no byte ever comes back. That is the
+    stall this budget exists to bound. }
+  Mock := TMockHTTPServer.Create(nil);
+  try
+    Message := '';
+    NoHeaders := nil;
+    SetPlainTransportTimeout(BUDGET_MS);
+    try
+      Elapsed := GetTickCount64;
+      try
+        HTTPGet(MockURL(Mock.Port), NoHeaders);
+      except
+        on E: EHTTPError do Message := E.Message;
+      end;
+      Elapsed := GetTickCount64 - Elapsed;
+    finally
+      SetPlainTransportTimeout(PLAIN_TRANSPORT_TIMEOUT_DISABLED);
+    end;
+    Expect<Boolean>(Pos('timed out', Message) > 0).ToBe(True);
+    Expect<Boolean>(Elapsed < CEILING_MS).ToBe(True);
+  finally
+    Mock.Free;
+  end;
+end;
+
+procedure THTTPClientBoundedFailures.TestTimeoutIsDisabledByDefault;
+begin
+  { Every existing caller gets the historical blocking behaviour until
+    it opts in, and the case above must leave nothing armed behind it. }
+  Expect<Integer>(PlainTransportTimeout)
+    .ToBe(PLAIN_TRANSPORT_TIMEOUT_DISABLED);
+end;
+
+procedure THTTPClientBoundedFailures.SetupTests;
+begin
+  Test('fixed-length early close is reported instead of zero-padded',
+    TestFixedLengthEarlyCloseRaises);
+  Test('fixed-length early close names received and declared lengths',
+    TestFixedLengthEarlyCloseNamesTheShortfall);
+  Test('a truthful Content-Length body still round-trips',
+    TestCompleteFixedLengthBodyStillSucceeds);
+  Test('a stalled peer fails inside the armed read budget',
+    TestStalledPeerFailsWithinTheArmedBudget);
+  Test('the read budget is disabled unless a caller arms it',
+    TestTimeoutIsDisabledByDefault);
+end;
+
 procedure THTTPClientByteFetch.SetupTests;
 begin
   Test('simple response: body starts with #0 (header-accumulation path)',
@@ -207,6 +368,8 @@ begin
 
   TestRunnerProgram.AddSuite(THTTPClientByteFetch.Create(
     'HTTPClient: binary-fetch regression'));
+  TestRunnerProgram.AddSuite(THTTPClientBoundedFailures.Create(
+    'HTTPClient: bounded failure modes'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

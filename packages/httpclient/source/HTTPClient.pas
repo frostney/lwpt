@@ -31,10 +31,25 @@ type
 
   EHTTPError = class(Exception);
 
+const
+  { Disabled by default: a zero timeout keeps the historical blocking
+    read behaviour on every existing caller. }
+  PLAIN_TRANSPORT_TIMEOUT_DISABLED = 0;
+
 function HTTPGet(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse;
 function HTTPHead(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse;
+
+{ Bound how long a single plain-HTTP read may block before the request
+  fails with EHTTPError. Applies to the plain-socket path only, never to
+  a TLS connection: the three TLS backends interpret a short read through
+  their own state machines, and arming a socket-level timeout underneath
+  them would change live-network behaviour that no offline fixture can
+  cover. Pass PLAIN_TRANSPORT_TIMEOUT_DISABLED to restore blocking reads.
+  Process-wide and not thread-safe; set it before issuing requests. }
+procedure SetPlainTransportTimeout(const AMilliseconds: Integer);
+function PlainTransportTimeout: Integer;
 
 implementation
 
@@ -51,6 +66,15 @@ const
   MAX_REDIRECTS   = 20;
   CRLF            = #13#10;
   RECV_BUF_SIZE   = 8192;
+
+  READ_TIMEOUT_ERROR = 'HTTP read timed out after %d ms';
+  TRUNCATED_FIXED_LENGTH_ERROR =
+    'Invalid HTTP response: truncated fixed-length body '
+    + '(%d of %d declared bytes)';
+
+var
+  { Plain-socket read budget in milliseconds; see SetPlainTransportTimeout. }
+  GPlainTransportTimeout: Integer = PLAIN_TRANSPORT_TIMEOUT_DISABLED;
 
 { [gpm vendoring patch] Append N raw bytes from a buffer to an AnsiString.
   The original chunked-read path used Copy(PAnsiChar(@Buf[0]), 1, N), which
@@ -316,6 +340,65 @@ begin
   {$ENDIF}
 end;
 
+{ Did the last failed recv fail because the armed read budget expired,
+  as opposed to a genuine transport error (reset, aborted, bad handle)?
+  Only the former is reported as a timeout; everything else keeps its
+  existing "treat as end of stream" handling. }
+function LastRecvTimedOut: Boolean;
+begin
+  {$IFDEF UNIX}
+  Result := (SocketError = ESysEAGAIN) or (SocketError = ESysEWOULDBLOCK);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  { WinSock reports an expired SO_RCVTIMEO as WSAETIMEDOUT rather than
+    the POSIX EAGAIN/EWOULDBLOCK pair. }
+  Result := WinSock2.WSAGetLastError = WinSock2.WSAETIMEDOUT;
+  {$ENDIF}
+end;
+
+{ Arm the plain-socket read budget. Receive side only: the fixture that
+  motivates this bound stalls after the request is on the wire, and a
+  send-side budget would add an untested failure path. }
+procedure ArmPlainTransportTimeout(const ASock: TSocket);
+{$IFDEF UNIX}
+var
+  Budget: TTimeVal;
+begin
+  if GPlainTransportTimeout <= PLAIN_TRANSPORT_TIMEOUT_DISABLED then Exit;
+  Budget.tv_sec := GPlainTransportTimeout div 1000;
+  Budget.tv_usec := (GPlainTransportTimeout mod 1000) * 1000;
+  fpSetSockOpt(ASock, SOL_SOCKET, SO_RCVTIMEO, @Budget, SizeOf(Budget));
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Budget: LongWord;
+begin
+  if GPlainTransportTimeout <= PLAIN_TRANSPORT_TIMEOUT_DISABLED then Exit;
+  { WinSock takes SO_RCVTIMEO as a 32-bit millisecond count, not a
+    timeval. LongWord rather than DWORD because WinSock2 has no
+    interface uses clause and so does not re-export the Windows types;
+    the explicit Pointer cast picks the one setsockopt overload that
+    takes a typed pointer. }
+  Budget := LongWord(GPlainTransportTimeout);
+  WinSock2.setsockopt(ASock, SOL_SOCKET, SO_RCVTIMEO,
+    Pointer(@Budget), SizeOf(Budget));
+end;
+{$ENDIF}
+
+procedure SetPlainTransportTimeout(const AMilliseconds: Integer);
+begin
+  if AMilliseconds < PLAIN_TRANSPORT_TIMEOUT_DISABLED then
+    GPlainTransportTimeout := PLAIN_TRANSPORT_TIMEOUT_DISABLED
+  else
+    GPlainTransportTimeout := AMilliseconds;
+end;
+
+function PlainTransportTimeout: Integer;
+begin
+  Result := GPlainTransportTimeout;
+end;
+
 procedure SocketClose(const ASock: TSocket); inline;
 begin
   {$IFDEF UNIX}
@@ -356,9 +439,17 @@ function RecvBytes(const ASock: TSocket;
   var ABuf: array of Byte; const ALen: Integer): Integer;
 begin
   if ATransport.Active then
-    Result := TransportSecurityRead(ATransport, ABuf, ALen)
-  else
-    Result := SocketRecv(ASock, @ABuf[0], ALen);
+    Exit(TransportSecurityRead(ATransport, ABuf, ALen));
+
+  Result := SocketRecv(ASock, @ABuf[0], ALen);
+  { A stalled peer is otherwise indistinguishable from a slow one: every
+    caller below treats a non-positive read as end of stream, so without
+    this the request blocks forever. Raising here gives all four read
+    sites the same bounded failure. }
+  if (Result < 0)
+     and (GPlainTransportTimeout > PLAIN_TRANSPORT_TIMEOUT_DISABLED)
+     and LastRecvTimedOut then
+    raise EHTTPError.CreateFmt(READ_TIMEOUT_ERROR, [GPlainTransportTimeout]);
 end;
 
 // ---------------------------------------------------------------------------
@@ -588,6 +679,17 @@ begin
         Move(Buf[0], Result.Body[BodyLen], N);
         Inc(BodyLen, N);
       end;
+
+      { Fixed-length early close. Result.Body was sized to the declared
+        Content-Length up front, so a peer that closes early leaves the
+        unwritten tail as zero bytes and the caller cannot tell a short
+        transfer from a body that genuinely ends in #0. Silently handing
+        back that zero-padded buffer is what let a truncated archive
+        reach the caller's hash + cache step; the chunked branch already
+        raises on its own truncation, so this matches it. }
+      if BodyLen < ContentLen then
+        raise EHTTPError.CreateFmt(TRUNCATED_FIXED_LENGTH_ERROR,
+          [BodyLen, ContentLen]);
     end
     else
     begin
@@ -636,7 +738,9 @@ begin
     Sock := ConnectSocket(Parsed.Host, Parsed.Port);
     try
       if Parsed.Scheme = 'https' then
-        StartTransportSecurity(Transport, Sock, Parsed.Host);
+        StartTransportSecurity(Transport, Sock, Parsed.Host)
+      else
+        ArmPlainTransportTimeout(Sock);
 
       try
         // Build Host header value
