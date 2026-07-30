@@ -516,6 +516,8 @@ begin
     Copy(AMan.Units, 0, Length(AMan.Units));
   Request.BuildRequest.Inputs.IncludePaths :=
     Copy(AMan.Includes, 0, Length(AMan.Includes));
+  Request.BuildRequest.Inputs.ExtraArguments :=
+    Copy(T.Flags, 0, Length(T.Flags));
   SetLength(Request.WorkspacePaths, Length(AMan.Workspaces));
   for i := 0 to High(AMan.Workspaces) do
     Request.WorkspacePaths[i] := AMan.Workspaces[i].Path;

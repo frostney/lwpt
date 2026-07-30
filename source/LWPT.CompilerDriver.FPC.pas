@@ -379,6 +379,49 @@ begin
   end;
 end;
 
+function IsLWPTManagedFPCArgument(const AArgument: string): Boolean;
+begin
+  Result := StartsStr(FPC_PROCESSOR_FLAG, AArgument)
+    or StartsStr(FPC_OPERATING_SYSTEM_FLAG, AArgument)
+    or StartsStr('-Ca', AArgument)
+    or StartsStr('-FC', AArgument)
+    or StartsStr('-FD', AArgument)
+    or StartsStr('-FL', AArgument)
+    or StartsStr('-FR', AArgument)
+    or StartsStr('-XP', AArgument)
+    or StartsStr('-V', AArgument)
+    or StartsStr('-FE', AArgument)
+    or StartsStr('-FU', AArgument)
+    or StartsStr(FPC_OUTPUT_FLAG, AArgument)
+    or StartsStr('-e', AArgument)
+    or StartsStr('-Fe', AArgument)
+    or StartsStr('-FW', AArgument);
+end;
+
+procedure AddExtraArguments(const ARequest: TLWPTBuildRequest;
+  const AArguments: TStrings);
+var
+  ArgumentIndex: Integer;
+begin
+  for ArgumentIndex := 0 to High(ARequest.Inputs.ExtraArguments) do
+  begin
+    if ARequest.Inputs.ExtraArguments[ArgumentIndex][1] <> '-' then
+      raise ELWPTCompilerDriverError.CreateFmt(
+        'compiler "%s" extra argument %d must be an option beginning '
+        + 'with "-"; positional and response-file arguments are not allowed',
+        [FPC_COMPILER_ID, ArgumentIndex]);
+    if IsLWPTManagedFPCArgument(
+      ARequest.Inputs.ExtraArguments[ArgumentIndex]) then
+      raise ELWPTCompilerDriverError.CreateFmt(
+        'compiler "%s" extra argument "%s" is managed by %s and cannot '
+        + 'override the selected compiler, requested target, or private '
+        + 'compiler outputs',
+        [FPC_COMPILER_ID, ARequest.Inputs.ExtraArguments[ArgumentIndex],
+         PROJECT_NAME]);
+    AArguments.Add(ARequest.Inputs.ExtraArguments[ArgumentIndex]);
+  end;
+end;
+
 function FindLastCharacter(const AValue: string; const ACharacter: Char):
   Integer;
 begin
@@ -879,6 +922,7 @@ begin
     end;
     if (AOptions.RebuildPolicy = crpForce) and (not ForceRebuildAdded) then
       Arguments.Add(FPC_FORCE_REBUILD_FLAG);
+    AddExtraArguments(ARequest, Arguments);
     Arguments.Add(FPC_OUTPUT_FLAG + ARequest.Outputs.Artifact);
     Arguments.Add(ARequest.Inputs.EntryPoint);
     SetLength(Result, Arguments.Count);

@@ -103,10 +103,10 @@ A `[dependencies]` entry whose resolved local path **escapes** the project root 
 **Build request**:
 A schema-versioned, compiler-neutral description of one compilation: compiler
 identity or version constraint, target tuple, source set and entry point,
-defines and search paths, resources, output kind, build mode, and private output
-locations. `LWPT.BuildRequest` owns validation and canonical TOML
-serialization. The request says what to build; a compiler driver decides how
-to express it on a compiler command line.
+defines, ordered extra arguments and search paths, resources, output kind,
+build mode, and private output locations. `LWPT.BuildRequest` owns validation
+and canonical TOML serialization. The request says what to build; a compiler
+driver decides how to express it on a compiler command line.
 *Avoid*: "FPC request" (the structure is compiler-neutral), "compiler args"
 (an adapter output), "publication fingerprint" (a separate concurrency
 snapshot that embeds the request).
@@ -146,7 +146,7 @@ The point at which a hook section attaches to a subcommand run. Six top-level se
 *Avoid*: "lifecycle event" (suggests dynamic dispatch), "build phase" (subcommand-specific; we mean any of the three phased subcommands — install/build/test).
 
 **Build entry** (build item):
-A single binary declaration in the `[build]` table — the thing `lwpt build` compiles, one per iteration. Multi-entry form: `[build.cli] source = "..."` (or the TOML-equivalent inline `[build] cli = { source = "..." }`). Single-entry shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` and the output to `build/<entry-name>`. Each entry takes `source` (required), `output` (optional), and optional per-entry `prebuild` / `postbuild` hook tables. Renamed from the pre-ADR-0013 `[targets]`.
+A single binary declaration in the `[build]` table — the thing `lwpt build` compiles, one per iteration. Multi-entry form: `[build.cli] source = "..."` (or the TOML-equivalent inline `[build] cli = { source = "..." }`). Single-entry shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` and the output to `build/<entry-name>`. Each entry takes `source` (required), `output` (optional), ordered `flags` (optional), and optional per-entry `prebuild` / `postbuild` hook tables. Flags are root-manifest behavior; dependency-manifest flags are not retained. Renamed from the pre-ADR-0013 `[targets]`.
 *Avoid*: "target" (pre-ADR-0013 term; overloaded with Bazel/Make vocabulary and doesn't match LWPT's verb-noun pairing).
 
 <a id="script-run-script"></a>

@@ -94,6 +94,7 @@ type
     procedure TestProbeRejectsUnexpectedTargetTuple;
     procedure TestCapabilitiesAreDefensiveAndDoNotAdvertiseUnits;
     procedure TestBuildArgumentsPreserveBuildFlagSet;
+    procedure TestExtraArgumentValidation;
     procedure TestBuildArgumentsPreserveTestCompileFlagSet;
     procedure TestIncompatibleVersionNamesCompilerAndRequirement;
     procedure TestFailureClassification;
@@ -706,6 +707,9 @@ begin
   Request.Inputs.UnitPaths[0] := 'source';
   SetLength(Request.Inputs.IncludePaths, 1);
   Request.Inputs.IncludePaths[0] := 'include';
+  SetLength(Request.Inputs.ExtraArguments, 2);
+  Request.Inputs.ExtraArguments[0] := '-dISSUE95_FLAG';
+  Request.Inputs.ExtraArguments[1] := '-k-ld_classic';
   InvocationOptions := BuildCompilerInvocationOptions('lwpt.cfg', False);
   Driver := TMockFPCCompilerDriver.Create('fpc-under-test');
   try
@@ -714,9 +718,11 @@ begin
       Request.Target);
     Arguments := Driver.BuildArguments(Request, InvocationOptions);
     ExpectArguments(Arguments, ['-P' + CrossProcessor,
-      '-T' + FixtureFPCOperatingSystem(Request.Target), '-FEsession/bin',
-      '-FUsession/bin/units', '@lwpt.cfg', '-Fusource', '-Fiinclude',
+      '-T' + FixtureFPCOperatingSystem(Request.Target),
+      '-FEsession/bin', '-FUsession/bin/units',
+      '@lwpt.cfg', '-Fusource', '-Fiinclude',
       '-Sh', '-O4', '-dPRODUCTION', '-Xs', '-CX', '-XX', '-B',
+      '-dISSUE95_FLAG', '-k-ld_classic',
       '-osession/bin/app', 'source/app.pas']);
 
     Request.Target.Architecture := GetBuildArch;
@@ -726,7 +732,8 @@ begin
     Arguments := Driver.BuildArguments(Request, InvocationOptions);
     ExpectArguments(Arguments, ['-FEsession/bin', '-FUsession/bin/units',
       '@lwpt.cfg', '-Fusource', '-Fiinclude', '-Sh', '-O-', '-gw',
-      '-godwarfsets', '-gl', '-Ct', '-Cr', '-Sa', '-B', '-osession/bin/app',
+      '-godwarfsets', '-gl', '-Ct', '-Cr', '-Sa', '-B',
+      '-dISSUE95_FLAG', '-k-ld_classic', '-osession/bin/app',
       'source/app.pas']);
     BootstrapSource := ReadBinaryFile('scripts/bootstrap.pas');
     Expect<Boolean>(Pos('''-O-''', BootstrapSource) > 0)
@@ -748,6 +755,67 @@ begin
     InvocationOptions.RebuildPolicy := crpForce;
     Arguments := Driver.BuildArguments(Request, InvocationOptions);
     Expect<Boolean>(ArgumentsContain(Arguments, '-B')).ToBe(True);
+  finally
+    Driver.Free;
+  end;
+end;
+
+procedure TLWPTFPCCompilerDriverTests.TestExtraArgumentValidation;
+const
+  ManagedOverrideArguments: array[0..7] of string = (
+    '-FUshared-output',
+    '-Vunprobed',
+    '-CaEABI',
+    '-FCalternate-rc',
+    '-FDalternate-tools',
+    '-FLalternate-linker',
+    '-FRalternate-resource-linker',
+    '-XPalternate-prefix-'
+  );
+var
+  Arguments: LWPT.Core.TStringArray;
+  ArgumentIndex: Integer;
+  Driver: TMockFPCCompilerDriver;
+  ErrorMessage: string;
+  Request: TLWPTBuildRequest;
+begin
+  Request := FixtureRequest('source/app.pas', 'session/bin/app');
+  Driver := TMockFPCCompilerDriver.Create('fpc-under-test');
+  try
+    Driver.ProbeOutput := FixtureProbeOutput('3.2.2', Request.Target);
+    SetLength(Request.Inputs.ExtraArguments, 1);
+    Request.Inputs.ExtraArguments[0] := '@project.fpc.cfg';
+    ErrorMessage := '';
+    try
+      Arguments := Driver.BuildArguments(Request,
+        BuildCompilerInvocationOptions('', False));
+    except
+      on E: ELWPTCompilerDriverError do
+        ErrorMessage := E.Message;
+    end;
+    Expect<string>(ErrorMessage).ToBe(
+      'compiler "fpc" extra argument 0 must be an option beginning with "-"; '
+      + 'positional and response-file arguments are not allowed');
+
+    for ArgumentIndex := Low(ManagedOverrideArguments) to
+      High(ManagedOverrideArguments) do
+    begin
+      Request.Inputs.ExtraArguments[0] :=
+        ManagedOverrideArguments[ArgumentIndex];
+      ErrorMessage := '';
+      try
+        Arguments := Driver.BuildArguments(Request,
+          BuildCompilerInvocationOptions('', False));
+      except
+        on E: ELWPTCompilerDriverError do
+          ErrorMessage := E.Message;
+      end;
+      Expect<string>(ErrorMessage).ToBe(
+        'compiler "fpc" extra argument "'
+        + ManagedOverrideArguments[ArgumentIndex] + '" is managed by LWPT '
+        + 'and cannot override the selected compiler, requested target, or '
+        + 'private compiler outputs');
+    end;
   finally
     Driver.Free;
   end;
@@ -1055,6 +1123,8 @@ begin
     TestCapabilitiesAreDefensiveAndDoNotAdvertiseUnits);
   Test('build argument translation preserves the build flag set',
     TestBuildArgumentsPreserveBuildFlagSet);
+  Test('extra arguments cannot replace driver-owned request fields',
+    TestExtraArgumentValidation);
   Test('build argument translation preserves the test-compile flag set',
     TestBuildArgumentsPreserveTestCompileFlagSet);
   Test('version mismatch names compiler and requirement',

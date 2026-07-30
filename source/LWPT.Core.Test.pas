@@ -70,6 +70,7 @@ type
     procedure TestMissingManifestRejected;
     procedure TestBuildTargetTraversalNameRootOnly;
     procedure TestBuildDependsMustBeStringArray;
+    procedure TestBuildFlagsMustBeStringArrayAndAreRootOnly;
   end;
 
   TLoadManifestExtensions = class(TTestSuite)
@@ -618,7 +619,8 @@ const
     ''#10 +
     '[build]'#10 +
     'cli = { source = "src/cli.pas", output = "bin/cli" }'#10 +
-    'tool = { source = "src/tool.pas", depends = ["cli"] }'#10;
+    'tool = { source = "src/tool.pas", depends = ["cli"], '
+    + 'flags = ["-dTOOL", "-k-ld_classic"] }'#10;
 var Man: TManifest;
 begin
   Man := LoadManifest(WriteManifest('build-items', INPUT));
@@ -631,6 +633,9 @@ begin
   Expect<string>(Man.Targets[1].Output).ToBe('');
   Expect<Integer>(Length(Man.Targets[1].Depends)).ToBe(1);
   Expect<string>(Man.Targets[1].Depends[0]).ToBe('cli');
+  Expect<Integer>(Length(Man.Targets[1].Flags)).ToBe(2);
+  Expect<string>(Man.Targets[1].Flags[0]).ToBe('-dTOOL');
+  Expect<string>(Man.Targets[1].Flags[1]).ToBe('-k-ld_classic');
 end;
 
 procedure TLoadManifestHappy.TestVersionSection;
@@ -808,6 +813,53 @@ begin
     'build.app.depends[1] must be a string', Self);
 end;
 
+procedure TLoadManifestValidation.
+  TestBuildFlagsMustBeStringArrayAndAreRootOnly;
+const
+  SCALAR_FLAGS =
+    '[package]'#10 +
+    'name = "scalar-flags"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'source = "src/app.pas"'#10 +
+    'flags = "-dAPP"'#10;
+  MIXED_FLAGS =
+    '[package]'#10 +
+    'name = "mixed-flags"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'app = { source = "src/app.pas", flags = ["-dAPP", 1] }'#10;
+  EMPTY_FLAGS =
+    '[package]'#10 +
+    'name = "empty-flags"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'app = { source = "src/app.pas", flags = [""] }'#10;
+var
+  Man: TManifest;
+  Path: string;
+begin
+  ExpectManifestLoadError(
+    WriteManifest('scalar-build-flags', SCALAR_FLAGS),
+    'build.flags must be an array of strings', Self);
+  Path := WriteManifest('mixed-build-flags', MIXED_FLAGS);
+  ExpectManifestLoadError(Path,
+    'build.app.flags[1] must be a string', Self);
+  ExpectManifestLoadError(
+    WriteManifest('empty-build-flags', EMPTY_FLAGS),
+    'build.app.flags[0] must not be empty', Self);
+
+  { Dependency build entries never execute in the consuming project.
+    Their flag values are therefore dropped without validation so a
+    dependency cannot widen the root project's compiler argument surface. }
+  Man := LoadManifest(Path, False);
+  Expect<Integer>(Length(Man.Targets)).ToBe(1);
+  Expect<Integer>(Length(Man.Targets[0].Flags)).ToBe(0);
+end;
+
 procedure TLoadManifestValidation.SetupTests;
 begin
   Test('bare-string dep shorthand rejected (ADR-0004 migration)',
@@ -821,6 +873,8 @@ begin
     TestBuildTargetTraversalNameRootOnly);
   Test('[build] depends requires only string array values',
     TestBuildDependsMustBeStringArray);
+  Test('[build] flags are strict root-owned string arrays',
+    TestBuildFlagsMustBeStringArrayAndAreRootOnly);
 end;
 
 { ── TLoadManifestExtensions ───────────────────────────────────────── }
