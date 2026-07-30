@@ -296,7 +296,7 @@ begin
        + 'HTTPStatus=$(github_request -o "$1" '
        + '-w ''%{http_code}'' "$2"); CurlExit=$?; '
        + 'printf ''%s'' "$HTTPStatus"; '
-       + 'case "$HTTPStatus" in 403|429) '
+       + 'case "$HTTPStatus" in 200) ;; *) '
        + '[ -f "$1" ] && cat "$1" >&2 ;; esac; '
        + 'exit "$CurlExit"';
   Result.CurlExitCode := RunSh(
@@ -404,6 +404,12 @@ begin
     '    printf ''%s'' ''{"message":"Resource not accessible by integration"}'' '
       + '> "$Output"'#10 +
     '    printf ''403'' ;;'#10 +
+    '  unauthorized)'#10 +
+    '    printf ''%s'' ''{"message":"Bad credentials"}'' > "$Output"'#10 +
+    '    printf ''401'' ;;'#10 +
+    '  unprocessable)'#10 +
+    '    printf ''%s'' ''{"message":"Validation Failed"}'' > "$Output"'#10 +
+    '    printf ''422'' ;;'#10 +
     '  primary-rate-limit)'#10 +
     '    printf ''%s'' ''{"message":"API rate limit exceeded for 192.0.2.1."}'' '
       + '> "$Output"'#10 +
@@ -503,9 +509,19 @@ begin
     LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
   Expect<Boolean>(Pos('Resource not accessible',
     LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Resolution := ResolveMode('unauthorized');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('Bad credentials',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Resolution := ResolveMode('unprocessable');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('Validation Failed',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
   Resolution := ResolveMode('server-error');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
   Expect<Boolean>(Pos('HTTP 500',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('server error',
     LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
 end;
 
@@ -541,7 +557,7 @@ begin
     TestConnectivityFailureSkips);
   Test('GitHub API rate limits are a distinct skip',
     TestRateLimitFailuresSkipDistinctly);
-  Test('HTTP 403 and 500 fail resolution',
+  Test('non-rate-limit HTTP errors fail with API details',
     TestHTTPFailuresFail);
   Test('unclassified curl failure fails with stderr',
     TestUnclassifiedCurlFailureFails);
