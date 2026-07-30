@@ -134,6 +134,7 @@ both sites; for now, a comment in `scripts/bootstrap.pas` names the requirement.
 mybin = { source = "src/app.pas",     output = "build/mybin" }
 cli   = { source = "src/cli/main.pas" }           # output defaults to source path without ext
 app   = { source = "src/app/main.pas", depends = ["mybin", "cli"] }
+objc  = { source = "src/objc.pas", flags = ["-k-ld_classic"] }
 shortform = "src/quicktool.pas"                   # bare-string shorthand
 ```
 
@@ -142,6 +143,14 @@ shortform = "src/quicktool.pas"                   # bare-string shorthand
 - `depends` (optional): targets that must publish successfully before this
   target starts. Named builds include transitive prerequisites; unknown names
   and cycles fail before build work.
+- `flags` (optional): ordered compiler-driver arguments for this root-manifest
+  entry. Each TOML string is passed as exactly one argument, so values are not
+  shell-split and duplicates remain significant. The field must be an array of
+  non-empty strings. FPC accepts option-shaped values such as
+  `-dISSUE95_FLAG` and `-k-ld_classic`; positional/response-file arguments and
+  options that replace the selected compiler, request target, or
+  session-private output paths are rejected. Build entries discovered in
+  dependency manifests never contribute flags.
 - Target names become job-directory path segments inside a session, so the
   names `""`, `"."`, and `".."` are rejected at manifest load. Each segment
   combines a bounded readable prefix with a hash of the full target identity,
@@ -164,10 +173,11 @@ the compile with an explanatory error when it cannot.
 
 Before compiling, LWPT creates a schema-versioned `TLWPTBuildRequest` covering
 the source set and entry point, output kind, mode, defines, search paths,
-resources, private output locations, target OS/architecture, and requested
-compiler identity/version. The canonical TOML serialization is embedded in a
-separate publication fingerprint. That fingerprint also covers the selected
-compiler executable/live version,
+resources, ordered extra arguments, private output locations, target
+OS/architecture, and requested compiler identity/version. Build-request schema
+v2 adds the `extra_arguments` array. The canonical TOML serialization is
+embedded in a separate publication fingerprint. That fingerprint also covers
+the selected compiler executable/live version,
 the previous public-output content, the implicit source directory, declared
 unit/include/resource inputs,
 manifest, cfg, lockfile, and installed module contents. After compilation it

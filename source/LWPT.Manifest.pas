@@ -138,6 +138,7 @@ type
     Source    : string;            { entry-point .pas/.dpr path }
     Output    : string;            { optional output binary path }
     Depends   : TStringArray;      { prerequisite target names (ADR-0023) }
+    Flags     : TStringArray;      { ordered compiler-driver arguments }
     PreBuild  : THookArray;        { per-target prebuild hooks (ADR-0011) }
     PostBuild : THookArray;        { per-target postbuild hooks (ADR-0011) }
   end;
@@ -678,6 +679,18 @@ begin
         '%s[%d] must be a string', [APath, i]);
     ATarget[i] := ArrNode.Items[i].ScalarText;
   end;
+end;
+
+procedure ReadStrictNonEmptyStringArray(ANode: TTOMLNode;
+  const AKey, APath: string; var ATarget: TStringArray);
+var
+  i: Integer;
+begin
+  ReadStrictStringArray(ANode, AKey, APath, ATarget);
+  for i := 0 to High(ATarget) do
+    if ATarget[i] = '' then
+      raise EManifestError.CreateFmt(
+        '%s[%d] must not be empty', [APath, i]);
 end;
 
 function HasAnyKey(ANode: TTOMLNode; const AKeys: array of string): string;
@@ -1507,6 +1520,9 @@ begin
         T.Output := TomlStr(TgtsNode, 'output', '');
         ReadStrictStringArray(TgtsNode, 'depends', 'build.depends',
           T.Depends);
+        if AIsRoot then
+          ReadStrictNonEmptyStringArray(TgtsNode, 'flags', 'build.flags',
+            T.Flags);
         if T.Output = '' then T.Output := 'build/' + Result.Name;
         ParseHookSection(TomlGet(TgtsNode, 'prebuild'),
           'build.prebuild', T.PreBuild);
@@ -1530,6 +1546,9 @@ begin
             T.Output := TomlStr(TgtNode, 'output', '');
             ReadStrictStringArray(TgtNode, 'depends',
               'build.' + T.Name + '.depends', T.Depends);
+            if AIsRoot then
+              ReadStrictNonEmptyStringArray(TgtNode, 'flags',
+                'build.' + T.Name + '.flags', T.Flags);
             ParseHookSection(TomlGet(TgtNode, 'prebuild'),
               'build.' + T.Name + '.prebuild', T.PreBuild);
             ParseHookSection(TomlGet(TgtNode, 'postbuild'),

@@ -68,7 +68,7 @@ Sections currently supported:
 | `[package]` | name, version, units (`-Fu` roots from the project's own source) |
 | `[dependencies]` | bare-string `"<source>@<version>"` shorthand or inline-table `{ source = "...", version = "...", subdir = "..." }` — see [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) |
 | `[sources]` | per-project custom git-host declarations. Each entry is an inline table mapping a prefix name to `archive` + `git` URL templates with `{user}` / `{repository}` / `{ref}` placeholders; enables prefixes like `gitea:owner/repo` against the user's self-hosted instance |
-| `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Inline entries may declare `depends = ["prerequisite"]`. Single-binary shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` |
+| `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Inline entries may declare `depends = ["prerequisite"]` and ordered `flags = ["-dFEATURE"]`. Single-binary shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` |
 | `[workspaces]` | `include` / `exclude` glob arrays for monorepo workspace auto-discovery (each matched dir with its own `lwpt.toml` is installed as a local-path dep, symlinked or junctioned) |
 | `[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` | Lifecycle hooks per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with optional `inputs` / `output` staleness gating. Plus per-`[build]`-entry inline `prebuild` / `postbuild` fields for per-binary signing / packaging / etc. |
 | Any other top-level section with a `script` field | A user-declared run-script callable via `lwpt run <name>` per [ADR-0013](./adr/0013-run-subcommand-and-build-rename.md) |
@@ -97,7 +97,9 @@ The flat-graph + hard-error policy is deliberate: FPC has one global unit namesp
 - **Extract:** gunzip (zstream) + a direct ustar reader. The bundled FPC `libtar` has a bug — it ignores the 155-byte `prefix` field at offset 345, so paths longer than 100 bytes get silently dropped. LWPT's reader joins `prefix + '/' + name` correctly and also follows GNU `'L'`/`'K'` long-name entries.
 - **Build:** `BuildOneTarget` creates a `TLWPTBuildRequest`, asks the FPC driver
   to probe the requested target, validates the request against those
-  capabilities, and obtains the FPC arguments. `TLWPTCompilerProcess` executes
+  capabilities, and obtains the FPC arguments. Root-manifest per-entry flags
+  become ordered neutral extra arguments before the driver translates them;
+  dependency-manifest flags are dropped. `TLWPTCompilerProcess` executes
   them below the seam. The driver normalizes diagnostics while the scheduler
   retains raw output for ordered log replay. The publication fingerprint embeds
   the deterministic request serialization alongside the implicit source

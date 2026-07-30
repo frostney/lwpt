@@ -22,6 +22,7 @@ type
     procedure TestSerializationMatchesVersionedFixture;
     procedure TestFixtureParsesAndRoundTrips;
     procedure TestUnsupportedSchemaFailsClearly;
+    procedure TestEmptyExtraArgumentFailsClearly;
     procedure TestTargetTupleWorksAcrossCompatibleCompilers;
     procedure TestCompilerCanAdvertiseMultipleTargets;
     procedure TestCompatibilityRejectsUnsupportedDimensions;
@@ -58,6 +59,9 @@ begin
   Result.Inputs.Sources[1] := 'source/generated.pas';
   SetLength(Result.Inputs.Defines, 1);
   Result.Inputs.Defines[0] := 'PRODUCTION';
+  SetLength(Result.Inputs.ExtraArguments, 2);
+  Result.Inputs.ExtraArguments[0] := '-dFEATURE';
+  Result.Inputs.ExtraArguments[1] := '-k-ld_classic';
   SetLength(Result.Inputs.UnitPaths, 2);
   Result.Inputs.UnitPaths[0] := 'source';
   Result.Inputs.UnitPaths[1] := '.lwpt/modules/example/source';
@@ -94,7 +98,7 @@ var
 begin
   Actual := SerializeBuildRequest(FixtureRequest);
   Expected := ReadFixture(
-    'tests/fixtures/build-request/v1/native-executable.toml');
+    'tests/fixtures/build-request/v2/native-executable.toml');
   Expect<string>(Actual).ToBe(Expected);
 end;
 
@@ -104,7 +108,7 @@ var
   Fixture: string;
 begin
   Fixture := ReadFixture(
-    'tests/fixtures/build-request/v1/native-executable.toml');
+    'tests/fixtures/build-request/v2/native-executable.toml');
   Parsed := ParseBuildRequest(Fixture);
   Expect<Integer>(Parsed.SchemaVersion).ToBe(BUILD_REQUEST_SCHEMA_VERSION);
   Expect<string>(Parsed.Compiler.ID).ToBe('fpc');
@@ -121,7 +125,8 @@ var
   BuildResult: TLWPTBuildResult;
 begin
   Invalid := StringReplace(SerializeBuildRequest(FixtureRequest),
-    'schema = 1', 'schema = 99', []);
+    'schema = ' + IntToStr(BUILD_REQUEST_SCHEMA_VERSION),
+    'schema = 99', []);
   Raised := False;
   try
     ParseBuildRequest(Invalid);
@@ -134,6 +139,18 @@ begin
     end;
   end;
   if not Raised then Fail('unsupported schema did not raise');
+  Expect<Boolean>(Raised).ToBe(True);
+
+  Raised := False;
+  try
+    ParseBuildRequest(ReadFixture(
+      'tests/fixtures/build-request/v1/native-executable.toml'));
+  except
+    on E: ELWPTBuildRequestError do
+      Raised := Pos('unsupported build request schema version 1',
+        E.Message) > 0;
+  end;
+  if not Raised then Fail('schema v1 request did not raise');
   Expect<Boolean>(Raised).ToBe(True);
 
   Capabilities := DefaultCompilerCapabilities;
@@ -160,6 +177,24 @@ begin
         E.Message) > 0;
   end;
   if not Raised then Fail('unsupported build-result schema did not raise');
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TLWPTBuildRequestTests.TestEmptyExtraArgumentFailsClearly;
+var
+  Raised: Boolean;
+  Request: TLWPTBuildRequest;
+begin
+  Request := FixtureRequest;
+  SetLength(Request.Inputs.ExtraArguments, 1);
+  Request.Inputs.ExtraArguments[0] := '';
+  Raised := False;
+  try
+    ValidateBuildRequest(Request);
+  except
+    on E: ELWPTBuildRequestError do
+      Raised := Pos('extra argument 0 must not be empty', E.Message) > 0;
+  end;
   Expect<Boolean>(Raised).ToBe(True);
 end;
 
@@ -254,6 +289,8 @@ begin
     TestFixtureParsesAndRoundTrips);
   Test('unsupported request schema fails clearly',
     TestUnsupportedSchemaFailsClearly);
+  Test('empty extra arguments fail request validation',
+    TestEmptyExtraArgumentFailsClearly);
   Test('one target tuple works across compatible compilers',
     TestTargetTupleWorksAcrossCompatibleCompilers);
   Test('one compiler advertises native and cross targets',
