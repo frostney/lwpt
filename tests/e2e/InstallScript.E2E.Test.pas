@@ -23,9 +23,13 @@
   (the install path works and the binary self-reports its tag), so it
   never breaks on version drift — only on a genuine install.sh defect.
 
-  Until the first normal (non-prerelease-flagged) release exists,
-  /releases/latest yields nothing and the test skips; the per-release
-  install check in release.yml covers prerelease-flagged rc.x meanwhile.
+  Until the first normal (non-prerelease-flagged) release exists, an
+  explicit 404 from /releases/latest skips the live smoke; the
+  per-release install check in release.yml covers prerelease-flagged
+  rc.x meanwhile. Connectivity failures matching the narrow transient
+  matcher also skip. GitHub API 403/429 responses skip only when their
+  diagnostic identifies a rate limit. Other curl failures, HTTP errors,
+  and malformed successful responses fail.
 
   Unix-only: install.sh is /bin/sh. The Windows install.ps1 smoke test
   is a separate future addition.
@@ -35,8 +39,11 @@
     - LWPT_SKIP_NETWORK=1             → skip
     - curl unavailable               → skip (environment, not a defect)
     - no normal release published    → skip (nothing to smoke yet)
+    - GitHub API rate limit          → skip (distinct from connectivity)
     - clean connect/DNS failure to
       github.com (transient downtime) → skip
+  Resolve-time HTTP/API errors, unclassified curl failures, and empty
+  or malformed successful responses fail hard.
   A 404 / checksum mismatch / missing binary AFTER a tag resolved is NOT
   a network outage and fails hard — that's the regression class this
   guards. }
@@ -50,6 +57,8 @@ uses
   BaseUnix,
   {$ENDIF}
   Classes,
+  fpjson,
+  jsonparser,
   Process,
   SysUtils,
 
@@ -58,17 +67,53 @@ uses
   Tests.LwptSubprocess;
 
 type
+  TLatestTagOutcome = (
+    ltoResolved,
+    ltoNoRelease,
+    ltoTransientFailure,
+    ltoRateLimited,
+    ltoFailure
+  );
+
+  TLatestTagResolution = record
+    CurlExitCode: Integer;
+    HTTPStatus: string;
+    ResponseBody: string;
+    Tag: string;
+    Stderr: string;
+  end;
+
+  TLatestTagResolutionTests = class(TTestSuite)
+  private
+    FBinDir, FCurlPath, FScratch: string;
+    FSkipped: Boolean;
+    function ResolveMode(const AMode: string): TLatestTagResolution;
+  protected
+    procedure BeforeAll; override;
+    procedure AfterAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestSuccessfulResponseResolves;
+    procedure TestExplicitNotFoundSkips;
+    procedure TestConnectivityFailureSkips;
+    procedure TestRateLimitFailuresSkipDistinctly;
+    procedure TestHTTPFailuresFail;
+    procedure TestUnclassifiedCurlFailureFails;
+    procedure TestInvalidSuccessfulResponseFails;
+  end;
+
   TInstallScriptE2E = class(TTestSuite)
   private
     FOrigDir, FScratch, FBinDir, FRepoRoot, FResolvedTag: string;
     FSkipped: Boolean;
     FInstallExitCode: Integer;
-    FInstallStderr: string;
+    FInstallStderr, FResolveFailure: string;
   protected
     procedure BeforeAll; override;
     procedure AfterAll;  override;
   public
     procedure SetupTests; override;
+    procedure TestLatestReleaseResolved;
     procedure TestInstallScriptExitsZero;
     procedure TestBinaryInstalledAndExecutable;
     procedure TestInstalledBinaryReportsVersion;
@@ -142,10 +187,7 @@ begin
     P.Options := [poUsePipes];
     if AInDir <> '' then P.CurrentDirectory := AInDir;
 
-    for i := 1 to GetEnvironmentVariableCount do
-      P.Environment.Add(GetEnvironmentString(i));
-    for i := Low(AExtraEnv) to High(AExtraEnv) do
-      P.Environment.Add(AExtraEnv[i]);
+    ConfigureProcessEnvironment(P, AExtraEnv);
 
     P.Execute;
     while P.Running do
@@ -164,17 +206,29 @@ begin
   AStderr := Errp;
 end;
 
-{ Resolve the newest non-prerelease-flagged release tag, mirroring
-  install.sh's pipeline exactly. Returns '' when no such release exists
-  (404 from /releases/latest) or the host is unreachable — both skip. }
-function ResolveLatestTag(out AStderr: string): string;
-var Cmd, Outp: string;
+{ Extract tag_name only from a complete JSON object. Parsing the whole
+  response prevents a valid-looking property in a truncated document from
+  turning a malformed HTTP 200 into a resolved release. }
+function ExtractLatestTag(const AResponse: string): string;
+var
+  JSONData, TagData: TJSONData;
 begin
-  Cmd := 'curl -fsSL "https://api.github.com/repos/' + ReleasesRepo
-       + '/releases/latest" | grep -E ''"tag_name":'' | head -n1 '
-       + '| sed -E ''s/.*"([^"]+)".*/\1/''';
-  RunSh(['-c', Cmd], '', [], Outp, AStderr);
-  Result := Trim(Outp);
+  Result := '';
+  JSONData := nil;
+  try
+    try
+      JSONData := GetJSON(AResponse);
+    except
+      Exit;
+    end;
+    if JSONData = nil then Exit;
+    if JSONData.JSONType <> jtObject then Exit;
+    TagData := TJSONObject(JSONData).Find('tag_name');
+    if (TagData = nil) or (TagData.JSONType <> jtString) then Exit;
+    Result := TagData.AsString;
+  finally
+    JSONData.Free;
+  end;
 end;
 
 { Did the install fail because the host was unreachable / curl missing,
@@ -196,8 +250,355 @@ begin
          or (Pos('resolving timed out', E) > 0);
 end;
 
+{ GitHub documents rate-limit failures as 403 or 429 plus a primary or
+  secondary rate-limit diagnostic. Keep this separate from the general
+  transient matcher so an unrelated permission failure still fails. }
+function ResolutionIsRateLimited(
+  const AResolution: TLatestTagResolution): Boolean;
+var E: string;
+begin
+  if (AResolution.HTTPStatus <> '403')
+    and (AResolution.HTTPStatus <> '429') then Exit(False);
+  E := LowerCase(AResolution.ResponseBody);
+  Result := (Pos('api rate limit exceeded', E) > 0)
+         or (Pos('secondary rate limit', E) > 0);
+end;
+
+{ Resolve the newest non-prerelease-flagged release tag while keeping
+  curl's transport exit, HTTP status, response body, and stderr distinct.
+  Positional shell parameters keep the scratch path and repository URL
+  out of shell syntax. }
+function ResolveLatestTag(const AResponsePath: string;
+  const AExtraEnv: array of string): TLatestTagResolution;
+var
+  Cmd, HTTPOutput: string;
+begin
+  Result.CurlExitCode := -1;
+  Result.HTTPStatus := '';
+  Result.ResponseBody := '';
+  Result.Tag := '';
+  Result.Stderr := '';
+
+  Cmd := 'command -v curl >/dev/null 2>&1 '
+       + '|| { printf ''curl is required\n'' >&2; exit 127; }; '
+       + 'github_request() { '
+       + 'if [ -n "${GITHUB_TOKEN:-}" ]; then '
+       + 'curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" "$@"; '
+       + 'else curl -sSL "$@"; fi; }; '
+       + 'HTTPStatus=$(github_request -o "$1" '
+       + '-w ''%{http_code}'' "$2"); CurlExit=$?; '
+       + 'printf ''%s'' "$HTTPStatus"; '
+       + 'exit "$CurlExit"';
+  Result.CurlExitCode := RunSh(
+    ['-c', Cmd, 'resolve-latest', AResponsePath,
+     'https://api.github.com/repos/' + ReleasesRepo + '/releases/latest'],
+    '',
+    AExtraEnv,
+    HTTPOutput,
+    Result.Stderr);
+  Result.HTTPStatus := Trim(HTTPOutput);
+  if FileExists(AResponsePath) then
+  begin
+    Result.ResponseBody := ReadBinaryFile(AResponsePath);
+    Result.Tag := ExtractLatestTag(Result.ResponseBody);
+  end;
+end;
+
+function LatestTagOutcome(
+  const AResolution: TLatestTagResolution): TLatestTagOutcome;
+begin
+  if AResolution.CurlExitCode <> 0 then
+  begin
+    if InstallFailureIsSkippable(AResolution.Stderr) then
+      Exit(ltoTransientFailure);
+    Exit(ltoFailure);
+  end;
+  if AResolution.HTTPStatus = '404' then Exit(ltoNoRelease);
+  if ResolutionIsRateLimited(AResolution) then Exit(ltoRateLimited);
+  if AResolution.HTTPStatus <> '200' then Exit(ltoFailure);
+  if AResolution.Tag = '' then Exit(ltoFailure);
+  Result := ltoResolved;
+end;
+
+function LatestTagFailureMessage(
+  const AResolution: TLatestTagResolution): string;
+begin
+  if AResolution.CurlExitCode <> 0 then
+    Result := Format('curl exited %d while resolving the latest release',
+      [AResolution.CurlExitCode])
+  else if (AResolution.HTTPStatus <> '')
+    and (AResolution.HTTPStatus <> '000')
+    and (AResolution.HTTPStatus <> '200') then
+    Result := 'latest-release API returned HTTP ' + AResolution.HTTPStatus
+  else if (AResolution.HTTPStatus = '')
+    or (AResolution.HTTPStatus = '000') then
+    Result := 'curl did not report an HTTP status for the latest release'
+  else
+    Result := 'latest-release API returned HTTP 200 without a valid tag_name';
+  if Trim(AResolution.ResponseBody) <> '' then
+    Result := Result + LineEnding + Trim(AResolution.ResponseBody);
+  if Trim(AResolution.Stderr) <> '' then
+    Result := Result + LineEnding + Trim(AResolution.Stderr);
+end;
+
+function TLatestTagResolutionTests.ResolveMode(
+  const AMode: string): TLatestTagResolution;
+begin
+  Result := ResolveLatestTag(
+    FScratch + '/response-' + AMode + '.json',
+    ['PATH=' + FBinDir + ':' + GetEnvironmentVariable('PATH'),
+     'INSTALL_RESOLVE_MODE=' + AMode,
+     'GITHUB_TOKEN=',
+     'EXPECTED_AUTHORIZATION=']);
+end;
+
+procedure TLatestTagResolutionTests.BeforeAll;
+begin
+  FSkipped := False;
+  {$IFNDEF UNIX}
+  FSkipped := True;
+  WriteLn('  [skip] latest-release resolver classification requires /bin/sh; '
+        + 'skipped on non-Unix');
+  Exit;
+  {$ENDIF}
+
+  FScratch := CreateScratchRoot('latest-tag-resolution');
+  FBinDir := FScratch + '/bin';
+  FCurlPath := FBinDir + '/curl';
+  ForceDirectories(FBinDir);
+  WriteTextFile(FCurlPath,
+    '#!/bin/sh'#10 +
+    'Output=""'#10 +
+    'Authorization=""'#10 +
+    'while [ "$#" -gt 0 ]; do'#10 +
+    '  case "$1" in'#10 +
+    '    -H) Authorization="$2"; shift 2 ;;'#10 +
+    '    -o) Output="$2"; shift 2 ;;'#10 +
+    '    -w) shift 2 ;;'#10 +
+    '    *) shift ;;'#10 +
+    '  esac'#10 +
+    'done'#10 +
+    'if [ "${EXPECTED_AUTHORIZATION+x}" = x ] '
+      + '&& [ "$Authorization" != "$EXPECTED_AUTHORIZATION" ]; then'#10 +
+    '  printf ''unexpected Authorization header: %s\n'' '
+      + '"$Authorization" >&2'#10 +
+    '  exit 97'#10 +
+    'fi'#10 +
+    ': > "$Output"'#10 +
+    'case "${INSTALL_RESOLVE_MODE:-success}" in'#10 +
+    '  success)'#10 +
+    '    printf ''%s'' ''{"tag_name":"v1.2.3"}'' > "$Output"'#10 +
+    '    printf ''200'' ;;'#10 +
+    '  not-found)'#10 +
+    '    printf ''%s'' ''{"message":"Not Found"}'' > "$Output"'#10 +
+    '    printf ''404'' ;;'#10 +
+    '  not-found-curl-error)'#10 +
+    '    printf ''%s'' ''{"message":"Not Found"}'' > "$Output"'#10 +
+    '    printf ''404'''#10 +
+    '    printf ''curl: (23) Failure writing output\n'' >&2'#10 +
+    '    exit 23 ;;'#10 +
+    '  forbidden)'#10 +
+    '    printf ''%s'' ''{"message":"Resource not accessible by integration"}'' '
+      + '> "$Output"'#10 +
+    '    printf ''403'' ;;'#10 +
+    '  unauthorized)'#10 +
+    '    printf ''%s'' ''{"message":"Bad credentials"}'' > "$Output"'#10 +
+    '    printf ''401'' ;;'#10 +
+    '  unprocessable)'#10 +
+    '    printf ''%s'' ''{"message":"Validation Failed"}'' > "$Output"'#10 +
+    '    printf ''422'' ;;'#10 +
+    '  primary-rate-limit)'#10 +
+    '    printf ''%s'' ''{"message":"API rate limit exceeded for 192.0.2.1."}'' '
+      + '> "$Output"'#10 +
+    '    printf ''403'' ;;'#10 +
+    '  rate-limit-curl-error)'#10 +
+    '    printf ''%s'' ''{"message":"API rate limit exceeded for 192.0.2.1."}'' '
+      + '> "$Output"'#10 +
+    '    printf ''403'''#10 +
+    '    printf ''curl: (23) Failure writing output\n'' >&2'#10 +
+    '    exit 23 ;;'#10 +
+    '  secondary-rate-limit)'#10 +
+    '    printf ''%s'' ''{"message":"You have exceeded a secondary rate limit."}'' '
+      + '> "$Output"'#10 +
+    '    printf ''429'' ;;'#10 +
+    '  server-error)'#10 +
+    '    printf ''%s'' ''{"message":"server error"}'' > "$Output"'#10 +
+    '    printf ''500'' ;;'#10 +
+    '  connectivity)'#10 +
+    '    printf ''000'''#10 +
+    '    printf ''curl: (6) Could not resolve host: api.github.com\n'' >&2'#10 +
+    '    exit 6 ;;'#10 +
+    '  curl-error)'#10 +
+    '    printf ''000'''#10 +
+    '    printf ''curl: (23) Failure writing output\n'' >&2'#10 +
+    '    exit 23 ;;'#10 +
+    '  malformed)'#10 +
+    '    printf ''%s'' ''{"tag_name":'' > "$Output"'#10 +
+    '    printf ''200'' ;;'#10 +
+    '  truncated-object)'#10 +
+    '    printf ''%s'' ''{"tag_name":"v1.2.3"'' > "$Output"'#10 +
+    '    printf ''200'' ;;'#10 +
+    '  empty)'#10 +
+    '    printf ''%s'' ''{}'' > "$Output"'#10 +
+    '    printf ''200'' ;;'#10 +
+    'esac'#10);
+  {$IFDEF UNIX}
+  if FpChmod(PChar(FCurlPath), &755) <> 0 then RaiseLastOSError;
+  {$ENDIF}
+end;
+
+procedure TLatestTagResolutionTests.AfterAll;
+begin
+  if not FSkipped then RecursiveDelete(FScratch);
+end;
+
+procedure TLatestTagResolutionTests.TestSuccessfulResponseResolves;
+var Resolution: TLatestTagResolution;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Resolution := ResolveLatestTag(
+    FScratch + '/response-success.json',
+    ['PATH=' + FBinDir + ':' + GetEnvironmentVariable('PATH'),
+     'INSTALL_RESOLVE_MODE=success',
+     'GITHUB_TOKEN=test-token',
+     'EXPECTED_AUTHORIZATION=Authorization: Bearer test-token']);
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoResolved));
+  Expect<string>(Resolution.ResponseBody).ToBe('{"tag_name":"v1.2.3"}');
+  Expect<string>(Resolution.Tag).ToBe('v1.2.3');
+  Expect<string>(Resolution.Stderr).ToBe('');
+end;
+
+procedure TLatestTagResolutionTests.TestExplicitNotFoundSkips;
+var Resolution: TLatestTagResolution;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Resolution := ResolveMode('not-found');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoNoRelease));
+  Resolution := ResolveMode('not-found-curl-error');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('curl exited 23',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Not Found',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Failure writing output',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+end;
+
+procedure TLatestTagResolutionTests.TestConnectivityFailureSkips;
+var Resolution: TLatestTagResolution;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Resolution := ResolveMode('connectivity');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(
+    Ord(ltoTransientFailure));
+  Expect<Boolean>(Pos('Could not resolve host', Resolution.Stderr) > 0).ToBe(
+    True);
+  Resolution := ResolveLatestTag(
+    FScratch + '/response-missing-curl.json',
+    ['PATH=' + FScratch + '/missing']);
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(
+    Ord(ltoTransientFailure));
+  Expect<Boolean>(Pos('curl is required', Resolution.Stderr) > 0).ToBe(True);
+end;
+
+procedure TLatestTagResolutionTests.TestRateLimitFailuresSkipDistinctly;
+var Resolution: TLatestTagResolution;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Resolution := ResolveMode('primary-rate-limit');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(
+    Ord(ltoRateLimited));
+  Expect<Boolean>(Pos('API rate limit exceeded',
+    Resolution.ResponseBody) > 0).ToBe(True);
+  Expect<string>(Resolution.Stderr).ToBe('');
+  Resolution := ResolveMode('secondary-rate-limit');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(
+    Ord(ltoRateLimited));
+  Resolution := ResolveMode('rate-limit-curl-error');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('curl exited 23',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('API rate limit exceeded',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Failure writing output',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+end;
+
+procedure TLatestTagResolutionTests.TestHTTPFailuresFail;
+var Resolution: TLatestTagResolution;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Resolution := ResolveMode('forbidden');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('Resource not accessible',
+    Resolution.ResponseBody) > 0).ToBe(True);
+  Expect<string>(Resolution.Stderr).ToBe('');
+  Expect<Boolean>(Pos('HTTP 403',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Resource not accessible',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Resolution := ResolveMode('unauthorized');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('Bad credentials',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Resolution := ResolveMode('unprocessable');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('Validation Failed',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Resolution := ResolveMode('server-error');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('HTTP 500',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('server error',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+end;
+
+procedure TLatestTagResolutionTests.TestUnclassifiedCurlFailureFails;
+var Resolution: TLatestTagResolution;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Resolution := ResolveMode('curl-error');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('Failure writing output',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+end;
+
+procedure TLatestTagResolutionTests.TestInvalidSuccessfulResponseFails;
+var Resolution: TLatestTagResolution;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Resolution := ResolveMode('malformed');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('valid tag_name',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Resolution := ResolveMode('empty');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Resolution := ResolveMode('truncated-object');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+end;
+
+procedure TLatestTagResolutionTests.SetupTests;
+begin
+  Test('HTTP 200 with a valid tag resolves',
+    TestSuccessfulResponseResolves);
+  Test('explicit latest-release 404 is no release',
+    TestExplicitNotFoundSkips);
+  Test('narrow connectivity failure is transient',
+    TestConnectivityFailureSkips);
+  Test('GitHub API rate limits are a distinct skip',
+    TestRateLimitFailuresSkipDistinctly);
+  Test('non-rate-limit HTTP errors fail with API details',
+    TestHTTPFailuresFail);
+  Test('unclassified curl failure fails with stderr',
+    TestUnclassifiedCurlFailureFails);
+  Test('empty or malformed HTTP 200 fails resolution',
+    TestInvalidSuccessfulResponseFails);
+end;
+
 procedure TInstallScriptE2E.BeforeAll;
-var ResolveErr, InstallOut: string;
+var
+  InstallOut: string;
+  Resolution: TLatestTagResolution;
 begin
   FOrigDir  := GetCurrentDir;
   FRepoRoot := GetCurrentDir;   { lwpt test sets CWD to the project root }
@@ -205,6 +606,9 @@ begin
   FBinDir   := FScratch + '/bin';
 
   FSkipped := SkipNetworkTests;
+  FInstallExitCode := -1;
+  FInstallStderr := '';
+  FResolveFailure := '';
   {$IFNDEF UNIX}
   FSkipped := True;
   {$ENDIF}
@@ -219,18 +623,44 @@ begin
     Exit;
   end;
 
-  { Resolve "latest" — the single source of truth. Empty means either no
-    normal release exists yet or the host is unreachable; both skip. }
-  FResolvedTag := ResolveLatestTag(ResolveErr);
+  { Resolve "latest" — the single source of truth. Only an explicit 404,
+    a documented GitHub rate-limit response, or a narrowly classified
+    connectivity failure skips. }
+  Resolution := ResolveLatestTag(FScratch + '/latest-release.json', []);
+  case LatestTagOutcome(Resolution) of
+    ltoNoRelease:
+      begin
+        WriteLn('  [skip] no normal (non-prerelease) release published yet; '
+              + 'release.yml''s per-release install check covers prereleases');
+        FSkipped := True;
+        Exit;
+      end;
+    ltoTransientFailure:
+      begin
+        WriteLn('  [skip] github.com unreachable or curl missing (transient/env); '
+              + 'install-script test skipped');
+        FSkipped := True;
+        Exit;
+      end;
+    ltoRateLimited:
+      begin
+        WriteLn('  [skip] GitHub latest-release API rate limit reached; '
+              + 'install-script test skipped');
+        FSkipped := True;
+        Exit;
+      end;
+    ltoFailure:
+      begin
+        FResolveFailure := LatestTagFailureMessage(Resolution);
+        Exit;
+      end;
+    ltoResolved:
+      FResolvedTag := Resolution.Tag;
+  end;
+
   if FResolvedTag = '' then
   begin
-    if InstallFailureIsSkippable(ResolveErr) then
-      WriteLn('  [skip] github.com unreachable or curl missing (transient/env); '
-            + 'install-script test skipped')
-    else
-      WriteLn('  [skip] no normal (non-prerelease) release published yet; '
-            + 'release.yml''s per-release install check covers prereleases');
-    FSkipped := True;
+    FResolveFailure := 'latest-release resolution produced no tag';
     Exit;
   end;
 
@@ -258,9 +688,19 @@ begin
   SetCurrentDir(FOrigDir);
 end;
 
-procedure TInstallScriptE2E.TestInstallScriptExitsZero;
+procedure TInstallScriptE2E.TestLatestReleaseResolved;
 begin
   if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  if FResolveFailure <> '' then
+    WriteLn('--- latest-release resolution failure ---'#10,
+      FResolveFailure, #10'---');
+  Expect<string>(FResolveFailure).ToBe('');
+end;
+
+procedure TInstallScriptE2E.TestInstallScriptExitsZero;
+begin
+  if FSkipped or (FResolveFailure <> '') then
+    begin Expect<Boolean>(True).ToBe(True); Exit; end;
   if FInstallExitCode <> 0 then
     WriteLn('--- install.sh stderr ---'#10, FInstallStderr, #10'---');
   Expect<Integer>(FInstallExitCode).ToBe(0);
@@ -269,7 +709,8 @@ end;
 procedure TInstallScriptE2E.TestBinaryInstalledAndExecutable;
 var BinPath: string;
 begin
-  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  if FSkipped or (FResolveFailure <> '') then
+    begin Expect<Boolean>(True).ToBe(True); Exit; end;
   BinPath := FBinDir + '/lwpt';
   Expect<Boolean>(FileExists(BinPath)).ToBe(True);
   Expect<Boolean>(FileIsExecutable(BinPath)).ToBe(True);
@@ -278,7 +719,8 @@ end;
 procedure TInstallScriptE2E.TestInstalledBinaryReportsVersion;
 var R: TLwptResult;
 begin
-  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  if FSkipped or (FResolveFailure <> '') then
+    begin Expect<Boolean>(True).ToBe(True); Exit; end;
   { Point RunLwpt at the freshly-installed binary + ask its version.
     Expected is DERIVED from the resolved tag (binary == tag, per the
     stamp-from-tag policy in ADR-0026) — one source of truth, no second
@@ -292,6 +734,8 @@ end;
 
 procedure TInstallScriptE2E.SetupTests;
 begin
+  Test('latest published release resolves without hidden failure',
+    TestLatestReleaseResolved);
   Test('install.sh exits zero installing the latest published release',
     TestInstallScriptExitsZero);
   Test('binary lands in INSTALL_DIR and is executable',
@@ -301,6 +745,8 @@ begin
 end;
 
 begin
+  TestRunnerProgram.AddSuite(TLatestTagResolutionTests.Create(
+    'latest-release resolution classification (E2E)'));
   TestRunnerProgram.AddSuite(TInstallScriptE2E.Create(
     'install.sh: latest-release smoke (E2E)'));
   TestRunnerProgram.Run;
