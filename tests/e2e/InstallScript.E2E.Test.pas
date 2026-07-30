@@ -78,6 +78,7 @@ type
   TLatestTagResolution = record
     CurlExitCode: Integer;
     HTTPStatus: string;
+    ResponseBody: string;
     Tag: string;
     Stderr: string;
   end;
@@ -258,7 +259,7 @@ var E: string;
 begin
   if (AResolution.HTTPStatus <> '403')
     and (AResolution.HTTPStatus <> '429') then Exit(False);
-  E := LowerCase(AResolution.Stderr);
+  E := LowerCase(AResolution.ResponseBody);
   Result := (Pos('api rate limit exceeded', E) > 0)
          or (Pos('secondary rate limit', E) > 0);
 end;
@@ -270,10 +271,11 @@ end;
 function ResolveLatestTag(const AResponsePath: string;
   const AExtraEnv: array of string): TLatestTagResolution;
 var
-  Cmd, HTTPOutput, Response: string;
+  Cmd, HTTPOutput: string;
 begin
   Result.CurlExitCode := -1;
   Result.HTTPStatus := '';
+  Result.ResponseBody := '';
   Result.Tag := '';
   Result.Stderr := '';
 
@@ -286,8 +288,6 @@ begin
        + 'HTTPStatus=$(github_request -o "$1" '
        + '-w ''%{http_code}'' "$2"); CurlExit=$?; '
        + 'printf ''%s'' "$HTTPStatus"; '
-       + 'case "$HTTPStatus" in 200) ;; *) '
-       + '[ -f "$1" ] && cat "$1" >&2 ;; esac; '
        + 'exit "$CurlExit"';
   Result.CurlExitCode := RunSh(
     ['-c', Cmd, 'resolve-latest', AResponsePath,
@@ -299,8 +299,8 @@ begin
   Result.HTTPStatus := Trim(HTTPOutput);
   if FileExists(AResponsePath) then
   begin
-    Response := ReadBinaryFile(AResponsePath);
-    Result.Tag := ExtractLatestTag(Response);
+    Result.ResponseBody := ReadBinaryFile(AResponsePath);
+    Result.Tag := ExtractLatestTag(Result.ResponseBody);
   end;
 end;
 
@@ -335,6 +335,8 @@ begin
     Result := 'curl did not report an HTTP status for the latest release'
   else
     Result := 'latest-release API returned HTTP 200 without a valid tag_name';
+  if Trim(AResolution.ResponseBody) <> '' then
+    Result := Result + LineEnding + Trim(AResolution.ResponseBody);
   if Trim(AResolution.Stderr) <> '' then
     Result := Result + LineEnding + Trim(AResolution.Stderr);
 end;
@@ -461,7 +463,9 @@ begin
      'GITHUB_TOKEN=test-token',
      'EXPECTED_AUTHORIZATION=Authorization: Bearer test-token']);
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoResolved));
+  Expect<string>(Resolution.ResponseBody).ToBe('{"tag_name":"v1.2.3"}');
   Expect<string>(Resolution.Tag).ToBe('v1.2.3');
+  Expect<string>(Resolution.Stderr).ToBe('');
 end;
 
 procedure TLatestTagResolutionTests.TestExplicitNotFoundSkips;
@@ -498,8 +502,9 @@ begin
   Resolution := ResolveMode('primary-rate-limit');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(
     Ord(ltoRateLimited));
-  Expect<Boolean>(Pos('API rate limit exceeded', Resolution.Stderr) > 0).ToBe(
-    True);
+  Expect<Boolean>(Pos('API rate limit exceeded',
+    Resolution.ResponseBody) > 0).ToBe(True);
+  Expect<string>(Resolution.Stderr).ToBe('');
   Resolution := ResolveMode('secondary-rate-limit');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(
     Ord(ltoRateLimited));
@@ -513,6 +518,9 @@ begin
   if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
   Resolution := ResolveMode('forbidden');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('Resource not accessible',
+    Resolution.ResponseBody) > 0).ToBe(True);
+  Expect<string>(Resolution.Stderr).ToBe('');
   Expect<Boolean>(Pos('HTTP 403',
     LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
   Expect<Boolean>(Pos('Resource not accessible',
