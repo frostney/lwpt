@@ -383,6 +383,12 @@ function IsLWPTManagedFPCArgument(const AArgument: string): Boolean;
 begin
   Result := StartsStr(FPC_PROCESSOR_FLAG, AArgument)
     or StartsStr(FPC_OPERATING_SYSTEM_FLAG, AArgument)
+    or StartsStr('-Ca', AArgument)
+    or StartsStr('-FC', AArgument)
+    or StartsStr('-FD', AArgument)
+    or StartsStr('-FL', AArgument)
+    or StartsStr('-FR', AArgument)
+    or StartsStr('-XP', AArgument)
     or StartsStr('-V', AArgument)
     or StartsStr('-FE', AArgument)
     or StartsStr('-FU', AArgument)

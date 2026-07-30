@@ -761,8 +761,20 @@ begin
 end;
 
 procedure TLWPTFPCCompilerDriverTests.TestExtraArgumentValidation;
+const
+  ManagedOverrideArguments: array[0..7] of string = (
+    '-FUshared-output',
+    '-Vunprobed',
+    '-CaEABI',
+    '-FCalternate-rc',
+    '-FDalternate-tools',
+    '-FLalternate-linker',
+    '-FRalternate-resource-linker',
+    '-XPalternate-prefix-'
+  );
 var
   Arguments: LWPT.Core.TStringArray;
+  ArgumentIndex: Integer;
   Driver: TMockFPCCompilerDriver;
   ErrorMessage: string;
   Request: TLWPTBuildRequest;
@@ -785,33 +797,25 @@ begin
       'compiler "fpc" extra argument 0 must be an option beginning with "-"; '
       + 'positional and response-file arguments are not allowed');
 
-    Request.Inputs.ExtraArguments[0] := '-FUshared-output';
-    ErrorMessage := '';
-    try
-      Arguments := Driver.BuildArguments(Request,
-        BuildCompilerInvocationOptions('', False));
-    except
-      on E: ELWPTCompilerDriverError do
-        ErrorMessage := E.Message;
+    for ArgumentIndex := Low(ManagedOverrideArguments) to
+      High(ManagedOverrideArguments) do
+    begin
+      Request.Inputs.ExtraArguments[0] :=
+        ManagedOverrideArguments[ArgumentIndex];
+      ErrorMessage := '';
+      try
+        Arguments := Driver.BuildArguments(Request,
+          BuildCompilerInvocationOptions('', False));
+      except
+        on E: ELWPTCompilerDriverError do
+          ErrorMessage := E.Message;
+      end;
+      Expect<string>(ErrorMessage).ToBe(
+        'compiler "fpc" extra argument "'
+        + ManagedOverrideArguments[ArgumentIndex] + '" is managed by LWPT '
+        + 'and cannot override the selected compiler, requested target, or '
+        + 'private compiler outputs');
     end;
-    Expect<string>(ErrorMessage).ToBe(
-      'compiler "fpc" extra argument "-FUshared-output" is managed by LWPT '
-      + 'and cannot override the selected compiler, requested target, or '
-      + 'private compiler outputs');
-
-    Request.Inputs.ExtraArguments[0] := '-Vunprobed';
-    ErrorMessage := '';
-    try
-      Arguments := Driver.BuildArguments(Request,
-        BuildCompilerInvocationOptions('', False));
-    except
-      on E: ELWPTCompilerDriverError do
-        ErrorMessage := E.Message;
-    end;
-    Expect<string>(ErrorMessage).ToBe(
-      'compiler "fpc" extra argument "-Vunprobed" is managed by LWPT and '
-      + 'cannot override the selected compiler, requested target, or private '
-      + 'compiler outputs');
   finally
     Driver.Free;
   end;
