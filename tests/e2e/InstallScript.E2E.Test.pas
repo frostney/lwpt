@@ -323,13 +323,13 @@ end;
 function LatestTagFailureMessage(
   const AResolution: TLatestTagResolution): string;
 begin
-  if (AResolution.HTTPStatus <> '')
+  if AResolution.CurlExitCode <> 0 then
+    Result := Format('curl exited %d while resolving the latest release',
+      [AResolution.CurlExitCode])
+  else if (AResolution.HTTPStatus <> '')
     and (AResolution.HTTPStatus <> '000')
     and (AResolution.HTTPStatus <> '200') then
     Result := 'latest-release API returned HTTP ' + AResolution.HTTPStatus
-  else if AResolution.CurlExitCode <> 0 then
-    Result := Format('curl exited %d while resolving the latest release',
-      [AResolution.CurlExitCode])
   else if (AResolution.HTTPStatus = '')
     or (AResolution.HTTPStatus = '000') then
     Result := 'curl did not report an HTTP status for the latest release'
@@ -476,6 +476,12 @@ begin
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoNoRelease));
   Resolution := ResolveMode('not-found-curl-error');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('curl exited 23',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Not Found',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Failure writing output',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
 end;
 
 procedure TLatestTagResolutionTests.TestConnectivityFailureSkips;
@@ -510,6 +516,12 @@ begin
     Ord(ltoRateLimited));
   Resolution := ResolveMode('rate-limit-curl-error');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Expect<Boolean>(Pos('curl exited 23',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('API rate limit exceeded',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Failure writing output',
+    LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
 end;
 
 procedure TLatestTagResolutionTests.TestHTTPFailuresFail;
