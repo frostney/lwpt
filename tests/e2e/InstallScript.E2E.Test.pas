@@ -57,6 +57,8 @@ uses
   BaseUnix,
   {$ENDIF}
   Classes,
+  fpjson,
+  jsonparser,
   Process,
   SysUtils,
 
@@ -203,41 +205,29 @@ begin
   AStderr := Errp;
 end;
 
-{ Extract tag_name from the GitHub API's JSON response. The release tags
-  LWPT publishes are plain SemVer strings, so an escaped or incomplete
-  JSON string is invalid rather than something to guess through. }
+{ Extract tag_name only from a complete JSON object. Parsing the whole
+  response prevents a valid-looking property in a truncated document from
+  turning a malformed HTTP 200 into a resolved release. }
 function ExtractLatestTag(const AResponse: string): string;
-const
-  TAG_PROPERTY = '"tag_name"';
 var
-  PropertyPosition, ValuePosition, ValueStart: Integer;
+  JSONData, TagData: TJSONData;
 begin
   Result := '';
-  PropertyPosition := Pos(TAG_PROPERTY, AResponse);
-  if PropertyPosition = 0 then Exit;
-  ValuePosition := PropertyPosition + Length(TAG_PROPERTY);
-  while (ValuePosition <= Length(AResponse))
-    and (AResponse[ValuePosition] in [' ', #9, #10, #13]) do
-    Inc(ValuePosition);
-  if (ValuePosition > Length(AResponse))
-    or (AResponse[ValuePosition] <> ':') then Exit;
-  Inc(ValuePosition);
-  while (ValuePosition <= Length(AResponse))
-    and (AResponse[ValuePosition] in [' ', #9, #10, #13]) do
-    Inc(ValuePosition);
-  if (ValuePosition > Length(AResponse))
-    or (AResponse[ValuePosition] <> '"') then Exit;
-  Inc(ValuePosition);
-  ValueStart := ValuePosition;
-  while (ValuePosition <= Length(AResponse))
-    and (AResponse[ValuePosition] <> '"') do
-  begin
-    if AResponse[ValuePosition] = '\' then Exit;
-    Inc(ValuePosition);
+  JSONData := nil;
+  try
+    try
+      JSONData := GetJSON(AResponse);
+    except
+      Exit;
+    end;
+    if JSONData = nil then Exit;
+    if JSONData.JSONType <> jtObject then Exit;
+    TagData := TJSONObject(JSONData).Find('tag_name');
+    if (TagData = nil) or (TagData.JSONType <> jtString) then Exit;
+    Result := TagData.AsString;
+  finally
+    JSONData.Free;
   end;
-  if (ValuePosition > Length(AResponse))
-    or (ValuePosition = ValueStart) then Exit;
-  Result := Copy(AResponse, ValueStart, ValuePosition - ValueStart);
 end;
 
 { Did the install fail because the host was unreachable / curl missing,
@@ -317,14 +307,14 @@ end;
 function LatestTagOutcome(
   const AResolution: TLatestTagResolution): TLatestTagOutcome;
 begin
-  if AResolution.HTTPStatus = '404' then Exit(ltoNoRelease);
-  if ResolutionIsRateLimited(AResolution) then Exit(ltoRateLimited);
   if AResolution.CurlExitCode <> 0 then
   begin
     if InstallFailureIsSkippable(AResolution.Stderr) then
       Exit(ltoTransientFailure);
     Exit(ltoFailure);
   end;
+  if AResolution.HTTPStatus = '404' then Exit(ltoNoRelease);
+  if ResolutionIsRateLimited(AResolution) then Exit(ltoRateLimited);
   if AResolution.HTTPStatus <> '200' then Exit(ltoFailure);
   if AResolution.Tag = '' then Exit(ltoFailure);
   Result := ltoResolved;
@@ -400,6 +390,11 @@ begin
     '  not-found)'#10 +
     '    printf ''%s'' ''{"message":"Not Found"}'' > "$Output"'#10 +
     '    printf ''404'' ;;'#10 +
+    '  not-found-curl-error)'#10 +
+    '    printf ''%s'' ''{"message":"Not Found"}'' > "$Output"'#10 +
+    '    printf ''404'''#10 +
+    '    printf ''curl: (23) Failure writing output\n'' >&2'#10 +
+    '    exit 23 ;;'#10 +
     '  forbidden)'#10 +
     '    printf ''%s'' ''{"message":"Resource not accessible by integration"}'' '
       + '> "$Output"'#10 +
@@ -414,6 +409,12 @@ begin
     '    printf ''%s'' ''{"message":"API rate limit exceeded for 192.0.2.1."}'' '
       + '> "$Output"'#10 +
     '    printf ''403'' ;;'#10 +
+    '  rate-limit-curl-error)'#10 +
+    '    printf ''%s'' ''{"message":"API rate limit exceeded for 192.0.2.1."}'' '
+      + '> "$Output"'#10 +
+    '    printf ''403'''#10 +
+    '    printf ''curl: (23) Failure writing output\n'' >&2'#10 +
+    '    exit 23 ;;'#10 +
     '  secondary-rate-limit)'#10 +
     '    printf ''%s'' ''{"message":"You have exceeded a secondary rate limit."}'' '
       + '> "$Output"'#10 +
@@ -431,6 +432,9 @@ begin
     '    exit 23 ;;'#10 +
     '  malformed)'#10 +
     '    printf ''%s'' ''{"tag_name":'' > "$Output"'#10 +
+    '    printf ''200'' ;;'#10 +
+    '  truncated-object)'#10 +
+    '    printf ''%s'' ''{"tag_name":"v1.2.3"'' > "$Output"'#10 +
     '    printf ''200'' ;;'#10 +
     '  empty)'#10 +
     '    printf ''%s'' ''{}'' > "$Output"'#10 +
@@ -466,6 +470,8 @@ begin
   if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
   Resolution := ResolveMode('not-found');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoNoRelease));
+  Resolution := ResolveMode('not-found-curl-error');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
 end;
 
 procedure TLatestTagResolutionTests.TestConnectivityFailureSkips;
@@ -497,6 +503,8 @@ begin
   Resolution := ResolveMode('secondary-rate-limit');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(
     Ord(ltoRateLimited));
+  Resolution := ResolveMode('rate-limit-curl-error');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
 end;
 
 procedure TLatestTagResolutionTests.TestHTTPFailuresFail;
@@ -544,6 +552,8 @@ begin
   Expect<Boolean>(Pos('valid tag_name',
     LatestTagFailureMessage(Resolution)) > 0).ToBe(True);
   Resolution := ResolveMode('empty');
+  Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
+  Resolution := ResolveMode('truncated-object');
   Expect<Integer>(Ord(LatestTagOutcome(Resolution))).ToBe(Ord(ltoFailure));
 end;
 
