@@ -34,6 +34,7 @@ uses
   {$IFDEF UNIX}
   cthreads,   { must come first so TThread has a driver before
                 Tests.HTTPMockServer's background server starts }
+  BaseUnix,
   {$ENDIF}
   Classes,
   SysUtils,
@@ -52,6 +53,26 @@ type
     procedure TestLargeBodyForcesMultiRecv;
   end;
 
+  THTTPClientResourceBounds = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestChunkedBodyAtLimit;
+    procedure TestChunkedBodyOverLimit;
+    procedure TestChunkSizeFailures;
+    procedure TestCloseDelimitedBodyOverLimit;
+    procedure TestConflictingContentLengths;
+    procedure TestDuplicateContentLengths;
+    procedure TestFixedBodyAtLimit;
+    procedure TestFixedBodyOverLimit;
+    procedure TestHeaderAtLimit;
+    procedure TestHeaderOverLimit;
+    procedure TestInvalidContentLengths;
+    procedure TestRequestDeadlineRejectsIdlePeer;
+    procedure TestRequestDeadlineRejectsSlowDrip;
+    procedure TestTLSHandshakeDeadlineRejectsIdlePeer;
+    procedure TestTruncatedFixedBody;
+  end;
+
 { ── helpers ───────────────────────────────────────────────────────── }
 
 function MockURL(APort: Word): string;
@@ -59,7 +80,30 @@ begin
   Result := 'http://127.0.0.1:' + IntToStr(APort) + '/x';
 end;
 
-function ServeAndFetch(const ARawResponse: TBytes): TBytes;
+function ConcatBytes(const A, B: TBytes): TBytes;
+begin
+  SetLength(Result, Length(A) + Length(B));
+  if Length(A) > 0 then
+    Move(A[0], Result[0], Length(A));
+  if Length(B) > 0 then
+    Move(B[0], Result[Length(A)], Length(B));
+end;
+
+function StringBytes(const S: string): TBytes;
+begin
+  Result := BytesOf(S);
+end;
+
+function TestOptions(const AMaxBodyBytes, AMaxHeaderBytes,
+  ATimeoutMilliseconds: Integer): THTTPRequestOptions;
+begin
+  Result := DefaultHTTPRequestOptions;
+  Result.MaxResponseBodyBytes := AMaxBodyBytes;
+  Result.MaxResponseHeaderBytes := AMaxHeaderBytes;
+  Result.RequestTimeoutMilliseconds := ATimeoutMilliseconds;
+end;
+
+function ServeAndFetch(const ARawResponse: TBytes): TBytes; overload;
 var
   Mock: TMockHTTPServer;
   Resp: THTTPResponse;
@@ -75,6 +119,66 @@ begin
   finally
     Mock.Free;
   end;
+end;
+
+function ServeAndFetch(const ARawResponse: TBytes;
+  const AOptions: THTTPRequestOptions): TBytes; overload;
+var
+  Mock: TMockHTTPServer;
+  NoHeaders: THTTPHeaders;
+  Resp: THTTPResponse;
+begin
+  Mock := TMockHTTPServer.Create(ARawResponse);
+  try
+    Mock.Start;
+    NoHeaders := nil;
+    Resp := HTTPGet(MockURL(Mock.Port), NoHeaders, AOptions);
+    Mock.WaitDone;
+    Result := Resp.Body;
+  finally
+    Mock.Free;
+  end;
+end;
+
+function ServeAndCaptureError(const ARawResponse: TBytes;
+  const AOptions: THTTPRequestOptions;
+  const ABytesPerWrite, AWriteDelayMilliseconds,
+  AInitialDelayMilliseconds: Integer;
+  const AScheme: string = 'http'): string;
+var
+  Mock: TMockHTTPServer;
+  NoHeaders: THTTPHeaders;
+begin
+  Result := '';
+  Mock := TMockHTTPServer.Create(ARawResponse, ABytesPerWrite,
+    AWriteDelayMilliseconds, AInitialDelayMilliseconds);
+  try
+    Mock.Start;
+    NoHeaders := nil;
+    try
+      HTTPGet(AScheme + '://127.0.0.1:' + IntToStr(Mock.Port) + '/x',
+        NoHeaders, AOptions);
+    except
+      on E: EHTTPError do
+        Result := E.Message;
+    end;
+    Mock.WaitDone;
+  finally
+    Mock.Free;
+  end;
+end;
+
+function FixedResponse(const AContentLength: string;
+  const ABody: TBytes): TBytes;
+const
+  CRLF = #13#10;
+var
+  Header: string;
+begin
+  Header := 'HTTP/1.1 200 OK' + CRLF +
+    'Content-Length: ' + AContentLength + CRLF +
+    'Connection: close' + CRLF + CRLF;
+  Result := ConcatBytes(StringBytes(Header), ABody);
 end;
 
 function BytesToHex(const ABytes: TBytes): string;
@@ -183,6 +287,258 @@ begin
   Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(ExpectedBody));
 end;
 
+{ ── THTTPClientResourceBounds ──────────────────────────────────────── }
+
+procedure THTTPClientResourceBounds.TestFixedBodyAtLimit;
+var
+  Body, GotBody: TBytes;
+begin
+  Body := MakeBytes([$00, $01, $02, $03]);
+  GotBody := ServeAndFetch(FixedResponse('4', Body),
+    TestOptions(4, 1024, 1000));
+  Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(Body));
+end;
+
+procedure THTTPClientResourceBounds.TestFixedBodyOverLimit;
+var
+  ErrorMessage: string;
+begin
+  ErrorMessage := ServeAndCaptureError(
+    FixedResponse('5', nil), TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP response body exceeds configured limit of 4 bytes');
+end;
+
+procedure THTTPClientResourceBounds.TestChunkedBodyAtLimit;
+var
+  Body, GotBody: TBytes;
+  Chunks: TByteArrays;
+begin
+  Body := MakeBytes([$00, $01, $02, $03]);
+  SetLength(Chunks, 2);
+  Chunks[0] := Copy(Body, 0, 2);
+  Chunks[1] := Copy(Body, 2, 2);
+  GotBody := ServeAndFetch(BuildChunkedResponse(Chunks),
+    TestOptions(4, 1024, 1000));
+  Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(Body));
+end;
+
+procedure THTTPClientResourceBounds.TestChunkedBodyOverLimit;
+var
+  Body: TBytes;
+  Chunks: TByteArrays;
+  ErrorMessage: string;
+begin
+  Body := MakeBytes([$00, $01, $02, $03, $04]);
+  SetLength(Chunks, 1);
+  Chunks[0] := Body;
+  ErrorMessage := ServeAndCaptureError(BuildChunkedResponse(Chunks),
+    TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP response body exceeds configured limit of 4 bytes');
+end;
+
+procedure THTTPClientResourceBounds.TestChunkSizeFailures;
+const
+  CRLF = #13#10;
+var
+  ErrorMessage: string;
+begin
+  ErrorMessage := ServeAndCaptureError(
+    StringBytes('HTTP/1.1 200 OK' + CRLF +
+      'Transfer-Encoding: chunked' + CRLF + CRLF +
+      'nope' + CRLF),
+    TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe('Invalid HTTP chunk size: nope');
+
+  ErrorMessage := ServeAndCaptureError(
+    StringBytes('HTTP/1.1 200 OK' + CRLF +
+      'Transfer-Encoding: chunked' + CRLF + CRLF +
+      StringOfChar('a', 65) + CRLF),
+    TestOptions(4, 64, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP chunk-size line exceeds configured limit of 64 bytes');
+end;
+
+procedure THTTPClientResourceBounds.TestCloseDelimitedBodyOverLimit;
+const
+  CRLF = #13#10;
+var
+  Raw: TBytes;
+  ErrorMessage: string;
+begin
+  Raw := ConcatBytes(
+    StringBytes('HTTP/1.1 200 OK' + CRLF + 'Connection: close' +
+      CRLF + CRLF),
+    MakeBytes([$00, $01, $02, $03, $04]));
+  ErrorMessage := ServeAndCaptureError(Raw,
+    TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP response body exceeds configured limit of 4 bytes');
+end;
+
+procedure THTTPClientResourceBounds.TestInvalidContentLengths;
+var
+  ErrorMessage: string;
+begin
+  ErrorMessage := ServeAndCaptureError(FixedResponse('-1', nil),
+    TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe('Invalid HTTP Content-Length: -1');
+
+  ErrorMessage := ServeAndCaptureError(FixedResponse('2147483648', nil),
+    TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP response body exceeds configured limit of 4 bytes');
+
+  ErrorMessage := ServeAndCaptureError(FixedResponse('nope', nil),
+    TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe('Invalid HTTP Content-Length: nope');
+
+  ErrorMessage := ServeAndCaptureError(
+    FixedResponse('9223372036854775808', nil),
+    TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'Invalid HTTP Content-Length: 9223372036854775808');
+end;
+
+procedure THTTPClientResourceBounds.TestConflictingContentLengths;
+const
+  CRLF = #13#10;
+var
+  Raw: TBytes;
+  ErrorMessage: string;
+begin
+  Raw := StringBytes('HTTP/1.1 200 OK' + CRLF +
+    'Content-Length: 1' + CRLF + 'Content-Length: 2' + CRLF +
+    'Connection: close' + CRLF + CRLF);
+  ErrorMessage := ServeAndCaptureError(Raw,
+    TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'Invalid HTTP response: conflicting Content-Length headers');
+end;
+
+procedure THTTPClientResourceBounds.TestDuplicateContentLengths;
+const
+  CRLF = #13#10;
+var
+  Raw, GotBody: TBytes;
+begin
+  Raw := ConcatBytes(StringBytes('HTTP/1.1 200 OK' + CRLF +
+    'Content-Length: 1' + CRLF + 'Content-Length: 1' + CRLF +
+    'Connection: close' + CRLF + CRLF), MakeBytes([$7f]));
+  GotBody := ServeAndFetch(Raw, TestOptions(1, 1024, 1000));
+  Expect<string>(BytesToHex(GotBody)).ToBe('7f');
+end;
+
+procedure THTTPClientResourceBounds.TestTruncatedFixedBody;
+var
+  ErrorMessage: string;
+begin
+  ErrorMessage := ServeAndCaptureError(
+    FixedResponse('4', MakeBytes([$00, $01])),
+    TestOptions(4, 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'Invalid HTTP response: truncated fixed-length body');
+end;
+
+procedure THTTPClientResourceBounds.TestHeaderAtLimit;
+const
+  CRLF = #13#10;
+  HEADER_LIMIT = 64;
+var
+  Header, Prefix, Suffix: string;
+  GotBody: TBytes;
+begin
+  Prefix := 'HTTP/1.1 204 No Content' + CRLF + 'X-Pad: ';
+  Suffix := CRLF + CRLF;
+  Header := Prefix + StringOfChar('a',
+    HEADER_LIMIT - Length(Prefix) - Length(Suffix)) + Suffix;
+  GotBody := ServeAndFetch(StringBytes(Header),
+    TestOptions(4, HEADER_LIMIT, 1000));
+  Expect<Integer>(Length(GotBody)).ToBe(0);
+end;
+
+procedure THTTPClientResourceBounds.TestHeaderOverLimit;
+const
+  CRLF = #13#10;
+  HEADER_LIMIT = 64;
+var
+  Header, Prefix, Suffix: string;
+  ErrorMessage: string;
+begin
+  Prefix := 'HTTP/1.1 204 No Content' + CRLF + 'X-Pad: ';
+  Suffix := CRLF + CRLF;
+  Header := Prefix + StringOfChar('a',
+    HEADER_LIMIT - Length(Prefix) - Length(Suffix) + 1) + Suffix;
+  ErrorMessage := ServeAndCaptureError(StringBytes(Header),
+    TestOptions(4, HEADER_LIMIT, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP response headers exceed configured limit of 64 bytes');
+end;
+
+procedure THTTPClientResourceBounds.TestRequestDeadlineRejectsIdlePeer;
+var
+  ErrorMessage: string;
+begin
+  ErrorMessage := ServeAndCaptureError(nil,
+    TestOptions(4, 1024, 100), 0, 0, 300);
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP request deadline exceeded after 100 ms');
+end;
+
+procedure THTTPClientResourceBounds.TestRequestDeadlineRejectsSlowDrip;
+const
+  CRLF = #13#10;
+var
+  SlowHeader: TBytes;
+  ErrorMessage: string;
+begin
+  SlowHeader := StringBytes('HTTP/1.1 200 OK' + CRLF +
+    'X-Slow: ' + StringOfChar('a', 64));
+  ErrorMessage := ServeAndCaptureError(SlowHeader,
+    TestOptions(4, 1024, 100), 1, 25, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP request deadline exceeded after 100 ms');
+end;
+
+procedure THTTPClientResourceBounds.TestTLSHandshakeDeadlineRejectsIdlePeer;
+var
+  ErrorMessage: string;
+begin
+  ErrorMessage := ServeAndCaptureError(nil,
+    TestOptions(4, 1024, 100), 0, 0, 300, 'https');
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP request deadline exceeded after 100 ms');
+end;
+
+procedure THTTPClientResourceBounds.SetupTests;
+begin
+  Test('fixed-length body exactly at limit succeeds', TestFixedBodyAtLimit);
+  Test('fixed-length body over limit fails before allocation',
+    TestFixedBodyOverLimit);
+  Test('chunked body exactly at limit succeeds', TestChunkedBodyAtLimit);
+  Test('chunked body over limit fails', TestChunkedBodyOverLimit);
+  Test('invalid and oversized chunk-size lines fail stably',
+    TestChunkSizeFailures);
+  Test('close-delimited body over limit fails',
+    TestCloseDelimitedBodyOverLimit);
+  Test('invalid Content-Length values fail stably',
+    TestInvalidContentLengths);
+  Test('conflicting Content-Length headers fail stably',
+    TestConflictingContentLengths);
+  Test('identical duplicate Content-Length headers succeed',
+    TestDuplicateContentLengths);
+  Test('truncated fixed-length body fails', TestTruncatedFixedBody);
+  Test('header terminator exactly at limit succeeds', TestHeaderAtLimit);
+  Test('header terminator over limit fails', TestHeaderOverLimit);
+  Test('whole-request deadline rejects fully idle peer',
+    TestRequestDeadlineRejectsIdlePeer);
+  Test('whole-request deadline rejects slow-drip peer',
+    TestRequestDeadlineRejectsSlowDrip);
+  Test('whole-request deadline covers an idle TLS handshake',
+    TestTLSHandshakeDeadlineRejectsIdlePeer);
+end;
+
 procedure THTTPClientByteFetch.SetupTests;
 begin
   Test('simple response: body starts with #0 (header-accumulation path)',
@@ -204,9 +560,14 @@ begin
     'in v1; Windows path lands in a later cycle). Exiting 0 to keep the test gate green.');
   Halt(0);
   {$ENDIF}
+  {$IFDEF UNIX}
+  fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
+  {$ENDIF}
 
   TestRunnerProgram.AddSuite(THTTPClientByteFetch.Create(
     'HTTPClient: binary-fetch regression'));
+  TestRunnerProgram.AddSuite(THTTPClientResourceBounds.Create(
+    'HTTPClient: resource bounds'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

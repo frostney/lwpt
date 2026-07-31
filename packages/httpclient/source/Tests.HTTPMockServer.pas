@@ -47,11 +47,17 @@ type
     {$IFDEF UNIX}
     FListenSock: TSocket;
     {$ENDIF}
+    FBytesPerWrite: Integer;
+    FInitialDelayMilliseconds: Integer;
     FThread: TThread;
+    FWriteDelayMilliseconds: Integer;
     FResponse: TBytes;
     FPort: Word;
   public
-    constructor Create(const ARawResponse: TBytes);
+    constructor Create(const ARawResponse: TBytes); overload;
+    constructor Create(const ARawResponse: TBytes;
+      const ABytesPerWrite, AWriteDelayMilliseconds,
+      AInitialDelayMilliseconds: Integer); overload;
     destructor Destroy; override;
     procedure Start;      { launches the background accept-and-serve thread }
     procedure WaitDone;   { blocks until the thread finishes }
@@ -143,17 +149,27 @@ type
   TMockServerThread = class(TThread)
   private
     FListenSock: TSocket;
+    FBytesPerWrite: Integer;
+    FInitialDelayMilliseconds: Integer;
     FResponse: TBytes;
+    FWriteDelayMilliseconds: Integer;
   protected
     procedure Execute; override;
   public
-    constructor Create(AListenSock: TSocket; const AResponse: TBytes);
+    constructor Create(AListenSock: TSocket; const AResponse: TBytes;
+      const ABytesPerWrite, AWriteDelayMilliseconds,
+      AInitialDelayMilliseconds: Integer);
   end;
 
-constructor TMockServerThread.Create(AListenSock: TSocket; const AResponse: TBytes);
+constructor TMockServerThread.Create(AListenSock: TSocket;
+  const AResponse: TBytes; const ABytesPerWrite, AWriteDelayMilliseconds,
+  AInitialDelayMilliseconds: Integer);
 begin
   FListenSock := AListenSock;
   FResponse := AResponse;
+  FBytesPerWrite := ABytesPerWrite;
+  FWriteDelayMilliseconds := AWriteDelayMilliseconds;
+  FInitialDelayMilliseconds := AInitialDelayMilliseconds;
   FreeOnTerminate := False;
   inherited Create(True);   { suspended; caller invokes Start }
 end;
@@ -164,7 +180,7 @@ var
   ClientAddr: TInetSockAddr;
   ClientAddrLen: TSocklen;
   Buf: array[0..4095] of Byte;
-  Total, Sent, N: Integer;
+  Total, Sent, SendLength, N: Integer;
   P: PByte;
 begin
   ClientAddrLen := SizeOf(ClientAddr);
@@ -179,16 +195,27 @@ begin
     N := fpRecv(ClientSock, @Buf, SizeOf(Buf), 0);
     if N < 0 then N := 0;
 
+    if FInitialDelayMilliseconds > 0 then
+      Sleep(FInitialDelayMilliseconds);
+
     { Send the configured response bytes. Loop until all are out, since
       send() on a TCP socket may return short writes for large buffers. }
     Total := Length(FResponse);
     Sent := 0;
-    P := PByte(@FResponse[0]);
+    if Total > 0 then
+      P := PByte(@FResponse[0])
+    else
+      P := nil;
     while Sent < Total do
     begin
-      N := fpSend(ClientSock, P + Sent, Total - Sent, 0);
+      SendLength := Total - Sent;
+      if (FBytesPerWrite > 0) and (SendLength > FBytesPerWrite) then
+        SendLength := FBytesPerWrite;
+      N := fpSend(ClientSock, P + Sent, SendLength, 0);
       if N <= 0 then Break;
       Inc(Sent, N);
+      if (Sent < Total) and (FWriteDelayMilliseconds > 0) then
+        Sleep(FWriteDelayMilliseconds);
     end;
   finally
     CloseSocket(ClientSock);
@@ -199,6 +226,13 @@ end;
 { ── TMockHTTPServer ───────────────────────────────────────────────── }
 
 constructor TMockHTTPServer.Create(const ARawResponse: TBytes);
+begin
+  Create(ARawResponse, 0, 0, 0);
+end;
+
+constructor TMockHTTPServer.Create(const ARawResponse: TBytes;
+  const ABytesPerWrite, AWriteDelayMilliseconds,
+  AInitialDelayMilliseconds: Integer);
 {$IFDEF UNIX}
 var
   Addr: TInetSockAddr;
@@ -206,6 +240,9 @@ var
   Loopback: in_addr;
 begin
   FResponse := ARawResponse;
+  FBytesPerWrite := ABytesPerWrite;
+  FWriteDelayMilliseconds := AWriteDelayMilliseconds;
+  FInitialDelayMilliseconds := AInitialDelayMilliseconds;
 
   FListenSock := fpSocket(AF_INET, SOCK_STREAM, 0);
   if FListenSock < 0 then
@@ -241,6 +278,9 @@ end;
 {$ELSE}
 begin
   FResponse := ARawResponse;
+  FBytesPerWrite := ABytesPerWrite;
+  FWriteDelayMilliseconds := AWriteDelayMilliseconds;
+  FInitialDelayMilliseconds := AInitialDelayMilliseconds;
   raise EMockServerError.Create(
     'Tests.HTTPMockServer is Unix-only in v1; Windows path lands in a later cycle');
 end;
@@ -263,7 +303,8 @@ end;
 procedure TMockHTTPServer.Start;
 begin
   {$IFDEF UNIX}
-  FThread := TMockServerThread.Create(FListenSock, FResponse);
+  FThread := TMockServerThread.Create(FListenSock, FResponse,
+    FBytesPerWrite, FWriteDelayMilliseconds, FInitialDelayMilliseconds);
   FThread.Start;
   {$ENDIF}
 end;

@@ -49,8 +49,10 @@ type
     Active: Boolean;
   private
     Backend: Integer;
+    Deadline: QWord;
     Socket: TSocket;
     BackendData: Pointer;
+    TimeoutMilliseconds: QWord;
   end;
 
   TTransportSecurityServerContext = class
@@ -63,7 +65,10 @@ type
   end;
 
 procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
-  const ASocket: TSocket; const AHost: string);
+  const ASocket: TSocket; const AHost: string); overload;
+procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
+  const ASocket: TSocket; const AHost: string; const ADeadline,
+  ATimeoutMilliseconds: QWord); overload;
 procedure CloseTransportSecurityServerContext(
   var AContext: TTransportSecurityServerContext);
 function TransportSecurityServerBackendAvailable: Boolean;
@@ -158,8 +163,122 @@ begin
   {$ENDIF}
 end;
 
-procedure SendSocketAll(const ASocket: TSocket; const ABuffer: Pointer;
-  const ALength: Integer);
+function TransportSocketWouldBlock: Boolean; inline;
+var
+  ErrorCode: Integer;
+begin
+  {$IFDEF UNIX}
+  ErrorCode := fpgeterrno;
+  Result := (ErrorCode = ESysEAGAIN) or
+    (ErrorCode = ESysEWOULDBLOCK) or
+    (ErrorCode = ESysEINPROGRESS);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  ErrorCode := WSAGetLastError;
+  Result := (ErrorCode = WSAEWOULDBLOCK) or
+    (ErrorCode = WSAEINPROGRESS);
+  {$ENDIF}
+end;
+
+procedure RaiseTransportDeadline(
+  const AConnection: TTransportSecurityConnection);
+begin
+  raise ETransportSecurityError.CreateFmt(
+    'HTTP request deadline exceeded after %d ms',
+    [AConnection.TimeoutMilliseconds]);
+end;
+
+function RemainingTransportMilliseconds(
+  const AConnection: TTransportSecurityConnection): Integer;
+var
+  NowTick, Remaining: QWord;
+begin
+  NowTick := GetTickCount64;
+  if (AConnection.Deadline = 0) or
+     (NowTick >= AConnection.Deadline) then
+    RaiseTransportDeadline(AConnection);
+  Remaining := AConnection.Deadline - NowTick;
+  if Remaining > QWord(High(Integer)) then
+    Result := High(Integer)
+  else
+    Result := Integer(Remaining);
+  if Result < 1 then
+    Result := 1;
+end;
+
+procedure WaitForTransportSocket(
+  const AConnection: TTransportSecurityConnection;
+  const ARead, AWrite: Boolean);
+{$IFDEF UNIX}
+var
+  ReadSet, WriteSet: TFDSet;
+  ReadSetPointer, WriteSetPointer: PFDSet;
+  Ready: Integer;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  ReadSet, WriteSet: TFDSet;
+  ReadSetPointer, WriteSetPointer: PFDSet;
+  Timeout: TTimeVal;
+  Ready: Integer;
+  Remaining: Integer;
+{$ENDIF}
+begin
+  if not ARead and not AWrite then
+    raise ETransportSecurityError.Create(
+      'TLS socket readiness wait has no requested operation');
+  {$IFDEF UNIX}
+  fpFD_ZERO(ReadSet);
+  fpFD_ZERO(WriteSet);
+  ReadSetPointer := nil;
+  WriteSetPointer := nil;
+  if ARead then
+  begin
+    fpFD_SET(AConnection.Socket, ReadSet);
+    ReadSetPointer := @ReadSet;
+  end;
+  if AWrite then
+  begin
+    fpFD_SET(AConnection.Socket, WriteSet);
+    WriteSetPointer := @WriteSet;
+  end;
+  Ready := fpSelect(AConnection.Socket + 1, ReadSetPointer,
+    WriteSetPointer, nil, RemainingTransportMilliseconds(AConnection));
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  FillChar(ReadSet, SizeOf(ReadSet), 0);
+  FillChar(WriteSet, SizeOf(WriteSet), 0);
+  ReadSetPointer := nil;
+  WriteSetPointer := nil;
+  if ARead then
+  begin
+    ReadSet.fd_count := 1;
+    ReadSet.fd_array[0] := AConnection.Socket;
+    ReadSetPointer := @ReadSet;
+  end;
+  if AWrite then
+  begin
+    WriteSet.fd_count := 1;
+    WriteSet.fd_array[0] := AConnection.Socket;
+    WriteSetPointer := @WriteSet;
+  end;
+  Remaining := RemainingTransportMilliseconds(AConnection);
+  Timeout.tv_sec := Remaining div 1000;
+  Timeout.tv_usec := (Remaining mod 1000) * 1000;
+  Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer, nil,
+    @Timeout);
+  {$ENDIF}
+  if Ready = 0 then
+    RaiseTransportDeadline(AConnection);
+  if Ready < 0 then
+    raise ETransportSecurityError.Create('TLS socket readiness wait failed');
+  if GetTickCount64 >= AConnection.Deadline then
+    RaiseTransportDeadline(AConnection);
+end;
+
+procedure SendSocketAll(
+  const AConnection: TTransportSecurityConnection;
+  const ABuffer: Pointer; const ALength: Integer);
 var
   Sent: Integer;
   Written: Integer;
@@ -167,8 +286,14 @@ begin
   Sent := 0;
   while Sent < ALength do
   begin
-    Written := SocketSend(ASocket, Pointer(PtrUInt(ABuffer) + PtrUInt(Sent)),
-      ALength - Sent);
+    Written := SocketSend(AConnection.Socket,
+      Pointer(PtrUInt(ABuffer) + PtrUInt(Sent)), ALength - Sent);
+    if (Written < 0) and TransportSocketWouldBlock and
+       (AConnection.Deadline <> 0) then
+    begin
+      WaitForTransportSocket(AConnection, False, True);
+      Continue;
+    end;
     if Written <= 0 then
       raise ETransportSecurityError.Create(TLS_WRITE_ERROR);
     Inc(Sent, Written);
@@ -202,6 +327,8 @@ type
   public
     Socket: TSocket;
     Context: SSLContextRef;
+    WantRead: Boolean;
+    WantWrite: Boolean;
   end;
 
   TSecureTransportReadFunc = function(AConnection: SSLConnectionRef;
@@ -254,7 +381,10 @@ begin
     if PtrUInt(ReadCount) = RequestedLength then
       Result := ERR_SEC_SUCCESS
     else
+    begin
+      Data.WantRead := True;
       Result := ERR_SSL_WOULD_BLOCK;
+    end;
   end
   else if ReadCount = 0 then
   begin
@@ -264,7 +394,13 @@ begin
   else
   begin
     ADataLength := 0;
-    Result := ERR_SSL_CLOSED_ABORT;
+    if TransportSocketWouldBlock then
+    begin
+      Data.WantRead := True;
+      Result := ERR_SSL_WOULD_BLOCK
+    end
+    else
+      Result := ERR_SSL_CLOSED_ABORT;
   end;
 end;
 
@@ -284,12 +420,21 @@ begin
     if PtrUInt(Written) = RequestedLength then
       Result := ERR_SEC_SUCCESS
     else
+    begin
+      Data.WantWrite := True;
       Result := ERR_SSL_WOULD_BLOCK;
+    end;
   end
   else
   begin
     ADataLength := 0;
-    Result := ERR_SSL_CLOSED_ABORT;
+    if TransportSocketWouldBlock then
+    begin
+      Data.WantWrite := True;
+      Result := ERR_SSL_WOULD_BLOCK
+    end
+    else
+      Result := ERR_SSL_CLOSED_ABORT;
   end;
 end;
 
@@ -302,6 +447,8 @@ var
 begin
   Data := TSecureTransportData.Create;
   Data.Socket := AConnection.Socket;
+  Data.WantRead := False;
+  Data.WantWrite := False;
   Data.Context := SSLCreateContext(nil, K_SSL_CLIENT_SIDE, K_SSL_STREAM_TYPE);
   if Data.Context = nil then
   begin
@@ -330,7 +477,13 @@ begin
       raise ETransportSecurityError.Create('Failed to set minimum TLS version');
 
     repeat
+      Data.WantRead := False;
+      Data.WantWrite := False;
       Status := SSLHandshake(Data.Context);
+      if (Status = ERR_SSL_WOULD_BLOCK) and
+         (AConnection.Deadline <> 0) then
+        WaitForTransportSocket(AConnection, Data.WantRead,
+          Data.WantWrite);
     until Status <> ERR_SSL_WOULD_BLOCK;
 
     if Status <> ERR_SEC_SUCCESS then
@@ -373,7 +526,13 @@ begin
   Data := TSecureTransportData(AConnection.BackendData);
   Processed := 0;
   repeat
+    Data.WantRead := False;
+    Data.WantWrite := False;
     Status := SSLRead(Data.Context, @ABuffer[0], ALength, Processed);
+    if (Status = ERR_SSL_WOULD_BLOCK) and (Processed = 0) and
+       (AConnection.Deadline <> 0) then
+      WaitForTransportSocket(AConnection, Data.WantRead,
+        Data.WantWrite);
   until (Status <> ERR_SSL_WOULD_BLOCK) or (Processed > 0);
   if (Status <> ERR_SEC_SUCCESS) and (Status <> ERR_SSL_CLOSED_GRACEFUL) and
      (Status <> ERR_SSL_WOULD_BLOCK) then
@@ -391,7 +550,13 @@ begin
   Data := TSecureTransportData(AConnection.BackendData);
   Processed := 0;
   repeat
+    Data.WantRead := False;
+    Data.WantWrite := False;
     Status := SSLWrite(Data.Context, ABuffer, ALength, Processed);
+    if (Status = ERR_SSL_WOULD_BLOCK) and (Processed = 0) and
+       (AConnection.Deadline <> 0) then
+      WaitForTransportSocket(AConnection, Data.WantRead,
+        Data.WantWrite);
   until (Status <> ERR_SSL_WOULD_BLOCK) or (Processed > 0);
   if (Status <> ERR_SEC_SUCCESS) and (Status <> ERR_SSL_WOULD_BLOCK) then
     raise ETransportSecurityError.CreateFmt('%s: %d', [TLS_WRITE_ERROR, Status]);
@@ -821,6 +986,7 @@ procedure StartOpenSSL(var AConnection: TTransportSecurityConnection;
   const AHost: string);
 var
   Data: TOpenSSLData;
+  ConnectResult, ErrorCode: Integer;
 begin
   if not TryLoadOpenSSL then
     raise ETransportSecurityError.Create(OPENSSL_LOAD_ERROR);
@@ -841,8 +1007,27 @@ begin
       TLSEXT_NAMETYPE_host_name, PAnsiChar(AnsiString(AHost)));
 
     SslSetFd(Data.SSL, AConnection.Socket);
-    if SslConnect(Data.SSL) <= 0 then
-      raise ETransportSecurityError.Create(TLS_HANDSHAKE_ERROR);
+    repeat
+      ErrClearError;
+      ConnectResult := SslConnect(Data.SSL);
+      if ConnectResult > 0 then
+        Break;
+      ErrorCode := SslGetError(Data.SSL, ConnectResult);
+      case ErrorCode of
+        SSL_ERROR_WANT_READ:
+          if AConnection.Deadline <> 0 then
+            WaitForTransportSocket(AConnection, True, False)
+          else
+            Continue;
+        SSL_ERROR_WANT_WRITE:
+          if AConnection.Deadline <> 0 then
+            WaitForTransportSocket(AConnection, False, True)
+          else
+            Continue;
+      else
+        raise ETransportSecurityError.Create(TLS_HANDSHAKE_ERROR);
+      end;
+    until False;
 
     if SSLGetVerifyResult(Data.SSL) <> X509_V_OK then
       raise ETransportSecurityError.Create('OpenSSL certificate verification failed');
@@ -1395,7 +1580,13 @@ begin
         end;
       SSL_ERROR_WANT_READ,
       SSL_ERROR_WANT_WRITE:
-        Continue;
+        begin
+          if AConnection.Deadline <> 0 then
+            WaitForTransportSocket(AConnection,
+              ErrorCode = SSL_ERROR_WANT_READ,
+              ErrorCode = SSL_ERROR_WANT_WRITE);
+          Continue;
+        end;
     else
       raise ETransportSecurityError.CreateFmt('%s: %d',
         [TLS_READ_ERROR, ErrorCode]);
@@ -1425,7 +1616,13 @@ begin
         end;
       SSL_ERROR_WANT_READ,
       SSL_ERROR_WANT_WRITE:
-        Continue;
+        begin
+          if AConnection.Deadline <> 0 then
+            WaitForTransportSocket(AConnection,
+              ErrorCode = SSL_ERROR_WANT_READ,
+              ErrorCode = SSL_ERROR_WANT_WRITE);
+          Continue;
+        end;
     else
       raise ETransportSecurityError.CreateFmt('%s: %d',
         [TLS_WRITE_ERROR, ErrorCode]);
@@ -1761,19 +1958,31 @@ begin
   ATarget := Temporary;
 end;
 
-function ReceiveIntoBuffer(const ASocket: TSocket; var ABuffer: TBytes): Integer;
+function ReceiveIntoBuffer(
+  const AConnection: TTransportSecurityConnection;
+  var ABuffer: TBytes): Integer;
 var
   Temporary: array[0..8191] of Byte;
 begin
-  Result := SocketReceive(ASocket, @Temporary[0], Length(Temporary));
+  repeat
+    Result := SocketReceive(AConnection.Socket, @Temporary[0],
+      Length(Temporary));
+    if (Result < 0) and TransportSocketWouldBlock and
+       (AConnection.Deadline <> 0) then
+      WaitForTransportSocket(AConnection, True, False)
+    else
+      Break;
+  until False;
   if Result > 0 then
     AppendBytes(ABuffer, @Temporary[0], Result);
 end;
 
-procedure SendSChannelToken(const ASocket: TSocket; const ABuffer: TSecBuffer);
+procedure SendSChannelToken(
+  const AConnection: TTransportSecurityConnection;
+  const ABuffer: TSecBuffer);
 begin
   if (ABuffer.cbBuffer > 0) and Assigned(ABuffer.pvBuffer) then
-    SendSocketAll(ASocket, ABuffer.pvBuffer, ABuffer.cbBuffer);
+    SendSocketAll(AConnection, ABuffer.pvBuffer, ABuffer.cbBuffer);
 end;
 
 function SChannelRequestFlags: LongWord;
@@ -1856,13 +2065,17 @@ begin
         @ContextAttributes, @Expiry);
       Data.HasContext := True;
 
-      SendSChannelToken(Data.Socket, OutputBuffer);
-      if Assigned(OutputBuffer.pvBuffer) then
-        FreeContextBuffer(OutputBuffer.pvBuffer);
+      try
+        SendSChannelToken(AConnection, OutputBuffer);
+      finally
+        if Assigned(OutputBuffer.pvBuffer) then
+          FreeContextBuffer(OutputBuffer.pvBuffer);
+      end;
 
       if Status = SEC_E_INCOMPLETE_MESSAGE then
       begin
-        ReceiveCount := ReceiveIntoBuffer(Data.Socket, Data.EncryptedInput);
+        ReceiveCount := ReceiveIntoBuffer(AConnection,
+          Data.EncryptedInput);
         if ReceiveCount < 0 then
           raise ETransportSecurityError.Create(TLS_READ_ERROR);
         if ReceiveCount = 0 then
@@ -1884,7 +2097,8 @@ begin
       begin
         if Length(Data.EncryptedInput) = 0 then
         begin
-          ReceiveCount := ReceiveIntoBuffer(Data.Socket, Data.EncryptedInput);
+          ReceiveCount := ReceiveIntoBuffer(AConnection,
+            Data.EncryptedInput);
           if ReceiveCount < 0 then
             raise ETransportSecurityError.Create(TLS_READ_ERROR);
           if ReceiveCount = 0 then
@@ -1954,11 +2168,19 @@ begin
           nil, SChannelRequestFlags, 0, SECURITY_NATIVE_DREP, nil, 0,
           @Data.Context, @OutputDesc, @ContextAttributes, @Expiry);
 
-        if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) or
-           (Status = SEC_I_CONTEXT_EXPIRED) then
-          SendSChannelToken(Data.Socket, OutputBuffer);
-        if Assigned(OutputBuffer.pvBuffer) then
-          FreeContextBuffer(OutputBuffer.pvBuffer);
+        try
+          if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) or
+             (Status = SEC_I_CONTEXT_EXPIRED) then
+            try
+              SendSChannelToken(AConnection, OutputBuffer);
+            except
+              on E: ETransportSecurityError do
+                ; // Best-effort close must not mask the request result.
+            end;
+        finally
+          if Assigned(OutputBuffer.pvBuffer) then
+            FreeContextBuffer(OutputBuffer.pvBuffer);
+        end;
       end;
 
       DeleteSecurityContext(@Data.Context);
@@ -2002,7 +2224,7 @@ begin
   begin
     if Length(Data.EncryptedInput) = 0 then
     begin
-      ReceiveCount := ReceiveIntoBuffer(Data.Socket, Data.EncryptedInput);
+      ReceiveCount := ReceiveIntoBuffer(AConnection, Data.EncryptedInput);
       if ReceiveCount < 0 then
         raise ETransportSecurityError.Create(TLS_READ_ERROR);
       if ReceiveCount = 0 then
@@ -2028,7 +2250,7 @@ begin
       @QualityOfProtection);
     if Status = SEC_E_INCOMPLETE_MESSAGE then
     begin
-      ReceiveCount := ReceiveIntoBuffer(Data.Socket, Data.EncryptedInput);
+      ReceiveCount := ReceiveIntoBuffer(AConnection, Data.EncryptedInput);
       if ReceiveCount < 0 then
         raise ETransportSecurityError.Create(TLS_READ_ERROR);
       if ReceiveCount = 0 then
@@ -2126,7 +2348,7 @@ begin
 
     TotalLength := Buffers[0].cbBuffer + Buffers[1].cbBuffer +
       Buffers[2].cbBuffer;
-    SendSocketAll(Data.Socket, @Message[0], TotalLength);
+    SendSocketAll(AConnection, @Message[0], TotalLength);
     Inc(PlainOffset, ChunkLength);
     Inc(Result, ChunkLength);
   end;
@@ -2206,12 +2428,16 @@ begin
   FreeAndNil(AContext);
 end;
 
-procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
-  const ASocket: TSocket; const AHost: string);
+procedure StartTransportSecurityInternal(
+  var AConnection: TTransportSecurityConnection;
+  const ASocket: TSocket; const AHost: string; const ADeadline,
+  ATimeoutMilliseconds: QWord);
 begin
   FillChar(AConnection, SizeOf(AConnection), 0);
   AConnection.Socket := ASocket;
   AConnection.Backend := TSB_NONE;
+  AConnection.Deadline := ADeadline;
+  AConnection.TimeoutMilliseconds := ATimeoutMilliseconds;
 
   {$IFDEF DARWIN}
   StartSecureTransport(AConnection, AHost);
@@ -2222,6 +2448,20 @@ begin
   StartOpenSSL(AConnection, AHost);
   {$ENDIF}
   {$ENDIF}
+end;
+
+procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
+  const ASocket: TSocket; const AHost: string);
+begin
+  StartTransportSecurityInternal(AConnection, ASocket, AHost, 0, 0);
+end;
+
+procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
+  const ASocket: TSocket; const AHost: string; const ADeadline,
+  ATimeoutMilliseconds: QWord);
+begin
+  StartTransportSecurityInternal(AConnection, ASocket, AHost, ADeadline,
+    ATimeoutMilliseconds);
 end;
 
 procedure BeginTransportSecurityServer(

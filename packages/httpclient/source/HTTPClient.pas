@@ -3,7 +3,7 @@ unit HTTPClient;
 // Minimal HTTP/1.1 client built on raw BSD sockets.
 // Supports GET and HEAD over HTTP and HTTPS.
 // Cross-platform: Unix (macOS, Linux) and Windows.
-// Designed for synchronous use today with a path to non-blocking I/O later.
+// Synchronous API with deadline-aware nonblocking socket I/O.
 
 {$I Shared.inc}
 
@@ -29,12 +29,28 @@ type
     Redirected: Boolean;
   end;
 
+  THTTPRequestOptions = record
+    MaxResponseBodyBytes: Int64;
+    MaxResponseHeaderBytes: Integer;
+    RequestTimeoutMilliseconds: QWord;
+  end;
+
   EHTTPError = class(Exception);
 
+const
+  DEFAULT_MAX_RESPONSE_BODY_BYTES = Int64(64) * 1024 * 1024;
+  DEFAULT_MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
+  DEFAULT_REQUEST_TIMEOUT_MILLISECONDS = 120 * 1000;
+
+function DefaultHTTPRequestOptions: THTTPRequestOptions;
 function HTTPGet(const AURL: string;
-  const AHeaders: THTTPHeaders): THTTPResponse;
+  const AHeaders: THTTPHeaders): THTTPResponse; overload;
+function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse; overload;
 function HTTPHead(const AURL: string;
-  const AHeaders: THTTPHeaders): THTTPResponse;
+  const AHeaders: THTTPHeaders): THTTPResponse; overload;
+function HTTPHead(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse; overload;
 
 implementation
 
@@ -195,16 +211,162 @@ begin
     Result.Path := '/';
 end;
 
+procedure RaiseRequestDeadline(const ATimeoutMilliseconds: QWord);
+begin
+  raise EHTTPError.CreateFmt(
+    'HTTP request deadline exceeded after %d ms',
+    [ATimeoutMilliseconds]);
+end;
+
+procedure CheckRequestDeadline(const ADeadline,
+  ATimeoutMilliseconds: QWord); inline;
+begin
+  if GetTickCount64 >= ADeadline then
+    RaiseRequestDeadline(ATimeoutMilliseconds);
+end;
+
+function RemainingRequestMilliseconds(const ADeadline,
+  ATimeoutMilliseconds: QWord): Integer;
+var
+  NowTick, Remaining: QWord;
+begin
+  NowTick := GetTickCount64;
+  if NowTick >= ADeadline then
+    RaiseRequestDeadline(ATimeoutMilliseconds);
+  Remaining := ADeadline - NowTick;
+  if Remaining > QWord(High(Integer)) then
+    Result := High(Integer)
+  else
+    Result := Integer(Remaining);
+  if Result < 1 then
+    Result := 1;
+end;
+
+function SocketWouldBlock: Boolean; inline;
+{$IFDEF UNIX}
+var
+  ErrorCode: Integer;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  ErrorCode: Integer;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  ErrorCode := fpgeterrno;
+  Result := (ErrorCode = ESysEAGAIN) or
+    (ErrorCode = ESysEWOULDBLOCK) or
+    (ErrorCode = ESysEINPROGRESS);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  ErrorCode := WSAGetLastError;
+  Result := (ErrorCode = WSAEWOULDBLOCK) or
+    (ErrorCode = WSAEINPROGRESS);
+  {$ENDIF}
+end;
+
+procedure SetSocketNonBlocking(const ASock: TSocket);
+{$IFDEF UNIX}
+var
+  Flags: Integer;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Mode: u_long;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Flags := fpFcntl(ASock, F_GETFL, 0);
+  if (Flags < 0) or
+     (fpFcntl(ASock, F_SETFL, Flags or O_NONBLOCK) < 0) then
+    raise EHTTPError.Create('Failed to configure nonblocking HTTP socket');
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Mode := 1;
+  if WinSock2.ioctlsocket(ASock, LongInt(FIONBIO), Mode) <> 0 then
+    raise EHTTPError.Create('Failed to configure nonblocking HTTP socket');
+  {$ENDIF}
+end;
+
+procedure WaitForSocket(const ASock: TSocket; const ARead, AWrite: Boolean;
+  const ADeadline, ATimeoutMilliseconds: QWord);
+{$IFDEF UNIX}
+var
+  ReadSet, WriteSet: TFDSet;
+  ReadSetPointer, WriteSetPointer: PFDSet;
+  Ready: Integer;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  ReadSet, WriteSet: TFDSet;
+  ReadSetPointer, WriteSetPointer: PFDSet;
+  Timeout: TTimeVal;
+  Ready: Integer;
+  Remaining: Integer;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  fpFD_ZERO(ReadSet);
+  fpFD_ZERO(WriteSet);
+  ReadSetPointer := nil;
+  WriteSetPointer := nil;
+  if ARead then
+  begin
+    fpFD_SET(ASock, ReadSet);
+    ReadSetPointer := @ReadSet;
+  end;
+  if AWrite then
+  begin
+    fpFD_SET(ASock, WriteSet);
+    WriteSetPointer := @WriteSet;
+  end;
+  Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
+    RemainingRequestMilliseconds(ADeadline, ATimeoutMilliseconds));
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  FillChar(ReadSet, SizeOf(ReadSet), 0);
+  FillChar(WriteSet, SizeOf(WriteSet), 0);
+  ReadSetPointer := nil;
+  WriteSetPointer := nil;
+  if ARead then
+  begin
+    ReadSet.fd_count := 1;
+    ReadSet.fd_array[0] := ASock;
+    ReadSetPointer := @ReadSet;
+  end;
+  if AWrite then
+  begin
+    WriteSet.fd_count := 1;
+    WriteSet.fd_array[0] := ASock;
+    WriteSetPointer := @WriteSet;
+  end;
+  Remaining := RemainingRequestMilliseconds(ADeadline,
+    ATimeoutMilliseconds);
+  Timeout.tv_sec := Remaining div 1000;
+  Timeout.tv_usec := (Remaining mod 1000) * 1000;
+  Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer, nil, @Timeout);
+  {$ENDIF}
+  if Ready = 0 then
+    RaiseRequestDeadline(ATimeoutMilliseconds);
+  if Ready < 0 then
+    raise EHTTPError.Create('HTTP socket readiness wait failed');
+  CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
+end;
+
 // ---------------------------------------------------------------------------
 // Socket connect (cross-platform)
 // ---------------------------------------------------------------------------
 
 {$IFDEF UNIX}
-function ConnectSocket(const AHost: string; const APort: Integer): TSocket;
+function ConnectSocket(const AHost: string; const APort: Integer;
+  const ADeadline, ATimeoutMilliseconds: QWord): TSocket;
 var
   SockAddr: TInetSockAddr;
   HostEntry: THostEntry;
   Addr: in_addr;
+  ConnectResult: Integer;
+  SocketError: Integer;
+  SocketErrorLength: TSockLen;
 begin
   // Try as numeric IP first
   Addr := StrToNetAddr(AHost);
@@ -215,30 +377,55 @@ begin
       raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
     Addr := HostEntry.Addr;
   end;
+  CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
 
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
   if Result < 0 then
     raise EHTTPError.Create('Failed to create socket');
+  try
+    SetSocketNonBlocking(Result);
+  except
+    CloseSocket(Result);
+    raise;
+  end;
 
   FillChar(SockAddr, SizeOf(SockAddr), 0);
   SockAddr.sin_family := AF_INET;
   SockAddr.sin_port := htons(APort);
   SockAddr.sin_addr := Addr;
 
-  if fpConnect(Result, @SockAddr, SizeOf(SockAddr)) <> 0 then
+  ConnectResult := fpConnect(Result, @SockAddr, SizeOf(SockAddr));
+  if (ConnectResult <> 0) and not SocketWouldBlock then
   begin
     CloseSocket(Result);
     raise EHTTPError.CreateFmt('Failed to connect to %s:%d', [AHost, APort]);
+  end;
+  if ConnectResult <> 0 then
+  begin
+    WaitForSocket(Result, False, True, ADeadline, ATimeoutMilliseconds);
+    SocketError := 0;
+    SocketErrorLength := SizeOf(SocketError);
+    if (fpGetSockOpt(Result, SOL_SOCKET, SO_ERROR, @SocketError,
+       @SocketErrorLength) <> 0) or (SocketError <> 0) then
+    begin
+      CloseSocket(Result);
+      raise EHTTPError.CreateFmt('Failed to connect to %s:%d',
+        [AHost, APort]);
+    end;
   end;
 end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
-function ConnectSocket(const AHost: string; const APort: Integer): TSocket;
+function ConnectSocket(const AHost: string; const APort: Integer;
+  const ADeadline, ATimeoutMilliseconds: QWord): TSocket;
 var
   Hints, Res, Cur: PAddrInfo;
   PortStr: AnsiString;
   Sock: TSocket;
+  ConnectResult: Integer;
+  SocketError: Integer;
+  SocketErrorLength: Integer;
 begin
   EnsureWinSockInit;
 
@@ -258,6 +445,7 @@ begin
   finally
     Dispose(Hints);
   end;
+  CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
 
   try
     Cur := Res;
@@ -272,8 +460,32 @@ begin
         Continue;
       end;
 
-      if WinSock2.connect(Sock, Cur^.ai_addr, Cur^.ai_addrlen) = 0 then
+      try
+        SetSocketNonBlocking(Sock);
+      except
+        WinSock2.closesocket(Sock);
+        raise;
+      end;
+      ConnectResult := WinSock2.connect(Sock, Cur^.ai_addr,
+        Cur^.ai_addrlen);
+      if ConnectResult = 0 then
         Break;
+      if SocketWouldBlock then
+      begin
+        try
+          WaitForSocket(Sock, False, True, ADeadline,
+            ATimeoutMilliseconds);
+          SocketError := 0;
+          SocketErrorLength := SizeOf(SocketError);
+          if (WinSock2.getsockopt(Sock, SOL_SOCKET, SO_ERROR,
+             PChar(@SocketError), SocketErrorLength) = 0) and
+             (SocketError = 0) then
+            Break;
+        except
+          WinSock2.closesocket(Sock);
+          raise;
+        end;
+      end;
 
       WinSock2.closesocket(Sock);
       Sock := INVALID_SOCKET;
@@ -332,7 +544,8 @@ end;
 
 procedure SendAll(const ASock: TSocket;
   var ATransport: TTransportSecurityConnection;
-  const AData: AnsiString);
+  const AData: AnsiString; const ADeadline,
+  ATimeoutMilliseconds: QWord);
 var
   Sent, Total, Len, N: Integer;
 begin
@@ -340,25 +553,45 @@ begin
   Sent := 0;
   while Sent < Total do
   begin
+    CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
     Len := Total - Sent;
     if ATransport.Active then
       N := TransportSecurityWrite(ATransport, @AData[Sent + 1], Len)
     else
       N := SocketSend(ASock, @AData[Sent + 1], Len);
+    if (N < 0) and SocketWouldBlock then
+    begin
+      WaitForSocket(ASock, False, True, ADeadline,
+        ATimeoutMilliseconds);
+      Continue;
+    end;
     if N <= 0 then
       raise EHTTPError.Create('Send failed');
     Inc(Sent, N);
+    CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
   end;
 end;
 
 function RecvBytes(const ASock: TSocket;
   var ATransport: TTransportSecurityConnection;
-  var ABuf: array of Byte; const ALen: Integer): Integer;
+  var ABuf: array of Byte; const ALen: Integer;
+  const ADeadline, ATimeoutMilliseconds: QWord): Integer;
 begin
-  if ATransport.Active then
-    Result := TransportSecurityRead(ATransport, ABuf, ALen)
-  else
-    Result := SocketRecv(ASock, @ABuf[0], ALen);
+  repeat
+    CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
+    if ATransport.Active then
+      Result := TransportSecurityRead(ATransport, ABuf, ALen)
+    else
+      Result := SocketRecv(ASock, @ABuf[0], ALen);
+    if (Result < 0) and SocketWouldBlock then
+      WaitForSocket(ASock, True, False, ADeadline,
+        ATimeoutMilliseconds)
+    else
+    begin
+      CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
+      Exit;
+    end;
+  until False;
 end;
 
 // ---------------------------------------------------------------------------
@@ -389,19 +622,116 @@ begin
     end;
 end;
 
+procedure AppendBodyBytes(var ABody: TBytes; const ASource;
+  const ALength: Integer; const AMaxBodyBytes: Int64);
+var
+  PreviousLength: Integer;
+begin
+  if ALength <= 0 then
+    Exit;
+  PreviousLength := Length(ABody);
+  if (Int64(PreviousLength) > AMaxBodyBytes - ALength) then
+    raise EHTTPError.CreateFmt(
+      'HTTP response body exceeds configured limit of %d bytes',
+      [AMaxBodyBytes]);
+  SetLength(ABody, PreviousLength + ALength);
+  Move(ASource, ABody[PreviousLength], ALength);
+end;
+
+function TryParseUnsignedDecimal(const AValue: string;
+  out AParsed: Int64): Boolean;
+var
+  Digit: Int64;
+  I: Integer;
+begin
+  Result := False;
+  AParsed := 0;
+  if AValue = '' then
+    Exit;
+  for I := 1 to Length(AValue) do
+  begin
+    if not (AValue[I] in ['0'..'9']) then
+      Exit;
+    Digit := Ord(AValue[I]) - Ord('0');
+    if AParsed > (High(Int64) - Digit) div 10 then
+      Exit;
+    AParsed := AParsed * 10 + Digit;
+  end;
+  Result := True;
+end;
+
+function TryParseUnsignedHex(const AValue: string;
+  out AParsed: Int64): Boolean;
+var
+  Digit: Int64;
+  I: Integer;
+begin
+  Result := False;
+  AParsed := 0;
+  if AValue = '' then
+    Exit;
+  for I := 1 to Length(AValue) do
+  begin
+    case AValue[I] of
+      '0'..'9': Digit := Ord(AValue[I]) - Ord('0');
+      'a'..'f': Digit := Ord(AValue[I]) - Ord('a') + 10;
+      'A'..'F': Digit := Ord(AValue[I]) - Ord('A') + 10;
+    else
+      Exit;
+    end;
+    if AParsed > (High(Int64) - Digit) div 16 then
+      Exit;
+    AParsed := AParsed * 16 + Digit;
+  end;
+  Result := True;
+end;
+
+procedure ParseContentLength(const AHeaders: THTTPHeaders;
+  const AMaxBodyBytes: Int64; out AHasContentLength: Boolean;
+  out AContentLength: Int64);
+var
+  I: Integer;
+  ParsedLength: Int64;
+  Value: string;
+begin
+  AHasContentLength := False;
+  AContentLength := 0;
+  for I := 0 to High(AHeaders) do
+    if AHeaders[I].Name = 'content-length' then
+    begin
+      Value := Trim(AHeaders[I].Value);
+      if not TryParseUnsignedDecimal(Value, ParsedLength) then
+        raise EHTTPError.CreateFmt('Invalid HTTP Content-Length: %s',
+          [Value]);
+      if AHasContentLength and (ParsedLength <> AContentLength) then
+        raise EHTTPError.Create(
+          'Invalid HTTP response: conflicting Content-Length headers');
+      AHasContentLength := True;
+      AContentLength := ParsedLength;
+    end;
+
+  if AHasContentLength and (AContentLength > AMaxBodyBytes) then
+    raise EHTTPError.CreateFmt(
+      'HTTP response body exceeds configured limit of %d bytes',
+      [AMaxBodyBytes]);
+end;
+
 function ReadResponse(const ASock: TSocket;
   var ATransport: TTransportSecurityConnection;
-  const AIsHead: Boolean): TRawHTTPResponse;
+  const AIsHead: Boolean;
+  const AOptions: THTTPRequestOptions;
+  const ADeadline: QWord): TRawHTTPResponse;
 var
   Buf: array[0..RECV_BUF_SIZE - 1] of Byte;
   RawHeader: AnsiString;
-  N, HeaderEnd, I, J, ContentLen, ChunkSize: Integer;
+  N, HeaderEnd, HeaderBytes, I, J, ChunkSize: Integer;
+  ChunkSizeValue, ContentLen: Int64;
+  HasContentLength: Boolean;
   Line, HeaderBlock: string;
   Lines: array of string;
   ColonPos: Integer;
   TransferEncoding: string;
   BodyBytes: TBytes;
-  BodyLen: Integer;
   ChunkBuf: AnsiString;
   Remaining: Integer;
 begin
@@ -414,13 +744,26 @@ begin
   RawHeader := '';
   HeaderEnd := 0;
   repeat
-    N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE);
+    N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE, ADeadline,
+      AOptions.RequestTimeoutMilliseconds);
     if N <= 0 then Break;
     AppendRawBytes(RawHeader, Buf[0], N); { Byte-safe accumulator: this
       buffer also holds body-prefix bytes that arrive in the same recv as
       the headers; a Copy(PAnsiChar) cast would truncate them at the first
       #0, corrupting binary downloads. }
     HeaderEnd := Pos(CRLF + CRLF, string(RawHeader));
+    if HeaderEnd > 0 then
+    begin
+      HeaderBytes := HeaderEnd + Length(CRLF + CRLF) - 1;
+      if HeaderBytes > AOptions.MaxResponseHeaderBytes then
+        raise EHTTPError.CreateFmt(
+          'HTTP response headers exceed configured limit of %d bytes',
+          [AOptions.MaxResponseHeaderBytes]);
+    end
+    else if Length(RawHeader) >= AOptions.MaxResponseHeaderBytes then
+      raise EHTTPError.CreateFmt(
+        'HTTP response headers exceed configured limit of %d bytes',
+        [AOptions.MaxResponseHeaderBytes]);
   until HeaderEnd > 0;
 
   if HeaderEnd = 0 then
@@ -524,12 +867,21 @@ begin
     begin
       while Pos(CRLF, string(ChunkBuf)) = 0 do
       begin
-        N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE);
+        if Length(ChunkBuf) >= AOptions.MaxResponseHeaderBytes then
+          raise EHTTPError.CreateFmt(
+            'HTTP chunk-size line exceeds configured limit of %d bytes',
+            [AOptions.MaxResponseHeaderBytes]);
+        N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE, ADeadline,
+          AOptions.RequestTimeoutMilliseconds);
         if N <= 0 then
           raise EHTTPError.Create('Invalid HTTP response: truncated chunked body');
         AppendRawBytes(ChunkBuf, Buf[0], N); { Byte-safe — Copy(PAnsiChar) would truncate at the first #0 }
       end;
       I := Pos(CRLF, string(ChunkBuf));
+      if I - 1 > AOptions.MaxResponseHeaderBytes then
+        raise EHTTPError.CreateFmt(
+          'HTTP chunk-size line exceeds configured limit of %d bytes',
+          [AOptions.MaxResponseHeaderBytes]);
       Line := Copy(string(ChunkBuf), 1, I - 1);
       Delete(ChunkBuf, 1, I + 1);
 
@@ -537,68 +889,79 @@ begin
       if J > 0 then
         Line := Copy(Line, 1, J - 1);
 
-      ChunkSize := StrToIntDef('$' + Trim(Line), 0);
+      Line := Trim(Line);
+      if not TryParseUnsignedHex(Line, ChunkSizeValue) then
+        raise EHTTPError.CreateFmt('Invalid HTTP chunk size: %s', [Line]);
+      if ChunkSizeValue > AOptions.MaxResponseBodyBytes -
+         Length(Result.Body) then
+        raise EHTTPError.CreateFmt(
+          'HTTP response body exceeds configured limit of %d bytes',
+          [AOptions.MaxResponseBodyBytes]);
+      ChunkSize := Integer(ChunkSizeValue);
       if ChunkSize = 0 then Break;
 
       while Length(ChunkBuf) < ChunkSize + 2 do
       begin
-        N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE);
+        N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE, ADeadline,
+          AOptions.RequestTimeoutMilliseconds);
         if N <= 0 then
           raise EHTTPError.Create('Invalid HTTP response: truncated chunked body');
         AppendRawBytes(ChunkBuf, Buf[0], N); { Byte-safe — Copy(PAnsiChar) would truncate at the first #0 }
       end;
 
-      BodyLen := Length(Result.Body);
-      SetLength(Result.Body, BodyLen + ChunkSize);
-      Move(ChunkBuf[1], Result.Body[BodyLen], ChunkSize);
+      AppendBodyBytes(Result.Body, ChunkBuf[1], ChunkSize,
+        AOptions.MaxResponseBodyBytes);
       Delete(ChunkBuf, 1, ChunkSize + 2);
     end;
   end
   else
   begin
-    ContentLen := StrToIntDef(FindHeaderValue(Result.Headers, 'content-length'), -1);
+    ParseContentLength(Result.Headers, AOptions.MaxResponseBodyBytes,
+      HasContentLength, ContentLen);
 
-    if ContentLen >= 0 then
+    if HasContentLength then
     begin
-      SetLength(Result.Body, ContentLen);
-      BodyLen := 0;
+      SetLength(Result.Body, 0);
 
       // Copy bytes already read with headers
       if Length(BodyBytes) > 0 then
       begin
-        if Length(BodyBytes) >= ContentLen then
-        begin
-          Move(BodyBytes[0], Result.Body[0], ContentLen);
-          BodyLen := ContentLen;
-        end
-        else
-        begin
-          Move(BodyBytes[0], Result.Body[0], Length(BodyBytes));
-          BodyLen := Length(BodyBytes);
-        end;
+        Remaining := Integer(ContentLen);
+        N := Length(BodyBytes);
+        if N > Remaining then
+          N := Remaining;
+        if N > 0 then
+          AppendBodyBytes(Result.Body, BodyBytes[0], N,
+            AOptions.MaxResponseBodyBytes);
       end;
 
       // Read remaining
-      while BodyLen < ContentLen do
+      while Int64(Length(Result.Body)) < ContentLen do
       begin
-        N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE);
-        if N <= 0 then Break;
-        Remaining := ContentLen - BodyLen;
+        N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE, ADeadline,
+          AOptions.RequestTimeoutMilliseconds);
+        if N <= 0 then
+          raise EHTTPError.Create(
+            'Invalid HTTP response: truncated fixed-length body');
+        Remaining := Integer(ContentLen - Length(Result.Body));
         if N > Remaining then N := Remaining;
-        Move(Buf[0], Result.Body[BodyLen], N);
-        Inc(BodyLen, N);
+        AppendBodyBytes(Result.Body, Buf[0], N,
+          AOptions.MaxResponseBodyBytes);
       end;
     end
     else
     begin
       // Read until connection close
-      Result.Body := Copy(BodyBytes);
+      SetLength(Result.Body, 0);
+      if Length(BodyBytes) > 0 then
+        AppendBodyBytes(Result.Body, BodyBytes[0], Length(BodyBytes),
+          AOptions.MaxResponseBodyBytes);
       repeat
-        N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE);
+        N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE, ADeadline,
+          AOptions.RequestTimeoutMilliseconds);
         if N <= 0 then Break;
-        BodyLen := Length(Result.Body);
-        SetLength(Result.Body, BodyLen + N);
-        Move(Buf[0], Result.Body[BodyLen], N);
+        AppendBodyBytes(Result.Body, Buf[0], N,
+          AOptions.MaxResponseBodyBytes);
       until False;
     end;
   end;
@@ -608,8 +971,26 @@ end;
 // Core request logic
 // ---------------------------------------------------------------------------
 
+procedure ValidateRequestOptions(const AOptions: THTTPRequestOptions);
+begin
+  if (AOptions.MaxResponseBodyBytes < 0) or
+     (AOptions.MaxResponseBodyBytes > High(Integer)) then
+    raise EHTTPError.Create(
+      'HTTP maximum response body size must be between 0 and High(Integer)');
+  if AOptions.MaxResponseHeaderBytes < Length(CRLF + CRLF) then
+    raise EHTTPError.Create(
+      'HTTP maximum response header size must be at least 4 bytes');
+  if AOptions.MaxResponseHeaderBytes >
+     High(Integer) - RECV_BUF_SIZE then
+    raise EHTTPError.Create(
+      'HTTP maximum response header size is too large');
+  if AOptions.RequestTimeoutMilliseconds = 0 then
+    raise EHTTPError.Create('HTTP request timeout must be greater than zero');
+end;
+
 function DoRequest(const AMethod, AURL: string;
   const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions;
   const AMaxRedirects: Integer): THTTPResponse;
 var
   Parsed: THTTPParsedURL;
@@ -622,7 +1003,14 @@ var
   HasUserAgent: Boolean;
   IsHead: Boolean;
   Method: string;
+  Deadline, StartedAt: QWord;
 begin
+  ValidateRequestOptions(AOptions);
+  StartedAt := GetTickCount64;
+  if AOptions.RequestTimeoutMilliseconds > High(QWord) - StartedAt then
+    Deadline := High(QWord)
+  else
+    Deadline := StartedAt + AOptions.RequestTimeoutMilliseconds;
   CurrentURL := AURL;
   Redirects := 0;
   Result.Redirected := False;
@@ -631,12 +1019,15 @@ begin
 
   while True do
   begin
+    CheckRequestDeadline(Deadline, AOptions.RequestTimeoutMilliseconds);
     Parsed := ParseHTTPURL(CurrentURL);
     FillChar(Transport, SizeOf(Transport), 0);
-    Sock := ConnectSocket(Parsed.Host, Parsed.Port);
+    Sock := ConnectSocket(Parsed.Host, Parsed.Port, Deadline,
+      AOptions.RequestTimeoutMilliseconds);
     try
       if Parsed.Scheme = 'https' then
-        StartTransportSecurity(Transport, Sock, Parsed.Host);
+        StartTransportSecurity(Transport, Sock, Parsed.Host, Deadline,
+          AOptions.RequestTimeoutMilliseconds);
 
       try
         // Build Host header value
@@ -668,8 +1059,11 @@ begin
 
         Request := Request + AnsiString(CRLF);
 
-        SendAll(Sock, Transport, Request);
-        Raw := ReadResponse(Sock, Transport, IsHead);
+        SendAll(Sock, Transport, Request, Deadline,
+          AOptions.RequestTimeoutMilliseconds);
+        Raw := ReadResponse(Sock, Transport, IsHead, AOptions, Deadline);
+        CheckRequestDeadline(Deadline,
+          AOptions.RequestTimeoutMilliseconds);
       finally
         CloseTransportSecurity(Transport);
       end;
@@ -720,16 +1114,46 @@ end;
 // Public API
 // ---------------------------------------------------------------------------
 
+function DefaultHTTPRequestOptions: THTTPRequestOptions;
+begin
+  Result.MaxResponseBodyBytes := DEFAULT_MAX_RESPONSE_BODY_BYTES;
+  Result.MaxResponseHeaderBytes := DEFAULT_MAX_RESPONSE_HEADER_BYTES;
+  Result.RequestTimeoutMilliseconds :=
+    DEFAULT_REQUEST_TIMEOUT_MILLISECONDS;
+end;
+
 function HTTPGet(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse;
 begin
-  Result := DoRequest('GET', AURL, AHeaders, MAX_REDIRECTS);
+  Result := HTTPGet(AURL, AHeaders, DefaultHTTPRequestOptions);
+end;
+
+function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
+begin
+  try
+    Result := DoRequest('GET', AURL, AHeaders, AOptions, MAX_REDIRECTS);
+  except
+    on E: ETransportSecurityError do
+      raise EHTTPError.Create(E.Message);
+  end;
 end;
 
 function HTTPHead(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse;
 begin
-  Result := DoRequest('HEAD', AURL, AHeaders, MAX_REDIRECTS);
+  Result := HTTPHead(AURL, AHeaders, DefaultHTTPRequestOptions);
+end;
+
+function HTTPHead(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
+begin
+  try
+    Result := DoRequest('HEAD', AURL, AHeaders, AOptions, MAX_REDIRECTS);
+  except
+    on E: ETransportSecurityError do
+      raise EHTTPError.Create(E.Message);
+  end;
 end;
 
 end.

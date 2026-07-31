@@ -64,6 +64,10 @@ uses
   TOML,
   zstream;
 
+const
+  MAX_ARCHIVE_RESPONSE_BYTES = Int64(256) * 1024 * 1024;
+  ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS = 5 * 60 * 1000;
+
 type
   TInstallLock = class
   private
@@ -739,6 +743,7 @@ var
   URL, LocalPath : string;
   Resp : THTTPResponse;
   NoHeaders : THTTPHeaders;
+  HTTPOptions : THTTPRequestOptions;
   EffectiveDep : TDependency;
   k : Integer;
   WSPath : string;
@@ -871,7 +876,17 @@ begin
   AResolvedURL := URL;
 
   NoHeaders := nil;
-  Resp := HTTPGet(URL, NoHeaders);
+  HTTPOptions := DefaultHTTPRequestOptions;
+  HTTPOptions.MaxResponseBodyBytes := MAX_ARCHIVE_RESPONSE_BYTES;
+  HTTPOptions.RequestTimeoutMilliseconds :=
+    ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;
+  try
+    Resp := HTTPGet(URL, NoHeaders, HTTPOptions);
+  except
+    on E: EHTTPError do
+      raise EFetchError.CreateFmt('fetch %s failed: %s',
+        [URL, E.Message]);
+  end;
   if (Resp.StatusCode < 200) or (Resp.StatusCode >= 300) then
     raise EFetchError.CreateFmt('fetch %s failed: HTTP %d %s',
       [URL, Resp.StatusCode, Resp.StatusText]);

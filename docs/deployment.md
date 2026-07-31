@@ -34,6 +34,32 @@ Per [ADR-0016](./adr/0016-tls-backend-per-platform.md) and [ADR-0024](./adr/0024
 
 `HTTPClient` consumes the blocking `StartTransportSecurity` surface for outbound connections. Fd-owning servers create one `TTransportSecurityServerContext` from a caller-supplied, size-capped PKCS#12 path + passphrase and keep it alive while its connections exist. `BeginTransportSecurityServer` gives each connection a private read memory BIO and bounded write-side BIO pair; `Active` remains false until the handshake authenticates. The transport feeds receive completions, steps one operation at a time, and drains the retained ciphertext queue before any later protocol operation. Returned ciphertext spans remain stable until consumed, and WANT-write plaintext is retained inside the connection for a nil, zero-length resume call. Reads distinguish peer `close_notify` as `tssPeerClosed`. Graceful close queues `close_notify`; abortive or fatal close discards TLS state. Neither path owns or closes the transport socket. The socket owner **must** enforce its own handshake deadline and inbound byte budget. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for this package.
 
+### Outbound HTTP resource policy
+
+The general-purpose `HTTPClient` API applies conservative defaults to every
+request: a 64 MiB response-body limit, a 64 KiB response-header limit, and a
+120-second whole-request deadline. `THTTPRequestOptions` lets an embedding
+application select tighter or larger positive bounds without replacing the
+default overloads. Fixed-length, chunked, and close-delimited bodies all use
+the same body budget. A fixed-length response is accumulated only as bytes
+arrive; its remote `Content-Length` is validated before any body allocation,
+and negative, overflowing, conflicting, over-limit, or truncated lengths fail
+with `EHTTPError`.
+
+The deadline is monotonic and shared by connect, TLS handshake, request send,
+response headers, response body, and redirects. It is independent of per-read
+idleness, so periodic slow bytes do not reset it. The same contract wraps
+SecureTransport, OpenSSL, and SChannel while retaining each backend's existing
+certificate-chain and hostname checks. System DNS resolution remains
+synchronous; if it returns after the deadline, the request fails immediately
+before connecting.
+
+LWPT's archive fetcher deliberately opts into a 256 MiB body budget and a
+300-second deadline because dependency archives are larger and slower than a
+typical general-purpose HTTP response. Header limits retain the package
+default. HTTP-layer failures are wrapped as `EFetchError` with the requested
+URL, preserving install transaction cleanup and diagnostics.
+
 ### Windows: SChannel clients, OpenSSL servers
 
 Outbound HTTPS calls into Windows' Security Service Provider Interface (SSPI) directly via the `Windows` unit and the SChannel constants in `TransportSecurity.pas`. Running LWPT as a client therefore has no third-party DLL prerequisite. The Windows release archive contains exactly:
