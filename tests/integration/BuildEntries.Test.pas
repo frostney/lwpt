@@ -1,13 +1,13 @@
-{ BuildMultiTarget.Test — `lwpt build` with more than one named target.
+{ BuildEntries.Test — `lwpt build` with more than one named entry.
 
   Contract under test:
 
-    lwpt build <a> <b>   builds BOTH named targets (historically the
+    lwpt build <a> <b>   builds BOTH named entries (historically the
                          second name was silently dropped)
-    lwpt build <a> <x>   where <x> names no target: exits 1, names the
-                         unknown target on stderr, and builds NOTHING
+    lwpt build <a> <x>   where <x> names no entry: exits 1, names the
+                         unknown entry on stderr, and builds NOTHING
                          (names are validated before any compile runs)
-    lwpt build           (no names) still builds every target
+    lwpt build           (no names) still builds every entry
 
     unit artefacts (.ppu/.o) live only in invocation-private sessions;
     completed binaries are atomically published to their manifest paths
@@ -15,10 +15,10 @@
   Goes through the real binary via Tests.LwptSubprocess because the
   defect spans the CLI positional handling AND the CmdBuild loop —
   an API-only test would miss the argv half. The scratch project's
-  targets are three trivial one-line programs so each fpc run is
+  entries are three trivial one-line programs so each fpc run is
   fast and has no dependencies. }
 
-program BuildMultiTarget.Test;
+program BuildEntries.Test;
 
 {$mode delphi}{$H+}
 
@@ -35,7 +35,7 @@ uses
   Tests.Scratch;
 
 type
-  TBuildMultiTarget = class(TTestSuite)
+  TBuildEntries = class(TTestSuite)
   private
     FScratch: string;
     procedure WipeOutputs;
@@ -43,40 +43,40 @@ type
     procedure BeforeAll; override;
   public
     procedure SetupTests; override;
-    procedure TestTwoNamedTargetsBuildBoth;
-    procedure TestUnknownTargetNameFailsBeforeBuildingAnything;
-    procedure TestNoNamesStillBuildsAllTargets;
-    procedure TestUnitArtefactsIsolatedPerTargetAndMode;
-    procedure TestCleanLeavesTargetArtefactDirUntouched;
-    procedure TestTraversalTargetNameRejectedAtLoad;
-    procedure TestSanitisedTargetNamesRemainDistinct;
-    procedure TestCleanLeavesOrphanTargetDirsUntouched;
+    procedure TestTwoNamedEntriesBuildBoth;
+    procedure TestUnknownEntryNameFailsBeforeBuildingAnything;
+    procedure TestNoNamesStillBuildsAllEntries;
+    procedure TestUnitArtefactsIsolatedPerEntryAndMode;
+    procedure TestCleanLeavesEntryArtefactDirUntouched;
+    procedure TestTraversalEntryNameRejectedAtLoad;
+    procedure TestSanitisedEntryNamesRemainDistinct;
+    procedure TestCleanLeavesOrphanEntryDirsUntouched;
     procedure TestCompileFailureReportsFpcExitCode;
-    procedure TestMissingCompilerFailsTargetsButLoopContinues;
+    procedure TestMissingCompilerFailsEntriesButLoopContinues;
     procedure TestInvalidJobsFailsBeforeBuildingAnything;
     procedure TestInvalidDependencyGraphFailsBeforeBuildingAnything;
-    procedure TestPerTargetCompilerFlagsAreForwarded;
+    procedure TestPerEntryCompilerFlagsAreForwarded;
     {$IFDEF DARWIN}
     procedure TestClassicLinkerFlagBuildsOnDarwin;
     {$ENDIF}
     {$IFDEF UNIX}
-    procedure TestCleanFailureFailsTargetButBuildContinues;
+    procedure TestCleanFailureFailsEntryButBuildContinues;
     {$ENDIF}
   end;
 
-procedure TBuildMultiTarget.BeforeAll;
+procedure TBuildEntries.BeforeAll;
 const
   { Each program uses a shared unit so unit artefacts (.ppu) exist
     and their placement can be asserted. }
   TRIVIAL = 'uses common;'#10'begin'#10
           + '  if GREETING = '''' then Halt(1);'#10'end.'#10;
 begin
-  FScratch := CreateScratchRoot('build-multi-target');
+  FScratch := CreateScratchRoot('build-multi-entry');
   RecursiveDelete(FScratch);
 
   WriteTextFile(FScratch + '/lwpt.toml',
       '[package]'#10
-    + 'name = "multitarget"'#10
+    + 'name = "multientry"'#10
     + 'version = "0.0.0"'#10
     + 'units = ["src"]'#10
     + #10
@@ -92,14 +92,14 @@ begin
   WriteTextFile(FScratch + '/src/gamma.pas', 'program gamma;'#10 + TRIVIAL);
 end;
 
-procedure TBuildMultiTarget.WipeOutputs;
+procedure TBuildEntries.WipeOutputs;
 begin
   RecursiveDelete(FScratch + '/build');
 end;
 
 { ── tests ─────────────────────────────────────────────────────────── }
 
-procedure TBuildMultiTarget.TestTwoNamedTargetsBuildBoth;
+procedure TBuildEntries.TestTwoNamedEntriesBuildBoth;
 var R: TLwptResult;
 begin
   WipeOutputs;
@@ -109,24 +109,24 @@ begin
     .ToBe(True);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/beta')))
     .ToBe(True);
-  { The un-named third target stays un-built. }
+  { The un-named third entry stays un-built. }
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/gamma')))
     .ToBe(False);
 end;
 
-procedure TBuildMultiTarget.TestUnknownTargetNameFailsBeforeBuildingAnything;
+procedure TBuildEntries.TestUnknownEntryNameFailsBeforeBuildingAnything;
 var R: TLwptResult;
 begin
   WipeOutputs;
-  R := RunLwpt(['build', 'alpha', 'no-such-target'], FScratch);
+  R := RunLwpt(['build', 'alpha', 'no-such-entry'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
-  Expect<Boolean>(Pos('no-such-target', R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('no-such-entry', R.Stderr) > 0).ToBe(True);
   { Names are validated up front — a typo must not half-build. }
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/alpha')))
     .ToBe(False);
 end;
 
-procedure TBuildMultiTarget.TestNoNamesStillBuildsAllTargets;
+procedure TBuildEntries.TestNoNamesStillBuildsAllEntries;
 var R: TLwptResult;
 begin
   WipeOutputs;
@@ -140,33 +140,33 @@ begin
     .ToBe(True);
 end;
 
-procedure TBuildMultiTarget.TestUnitArtefactsIsolatedPerTargetAndMode;
+procedure TBuildEntries.TestUnitArtefactsIsolatedPerEntryAndMode;
 var R: TLwptResult;
 begin
   WipeOutputs;
   R := RunLwpt(['build', 'alpha'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  { The shared unit's artefacts land in the target's dev dir... }
+  { The shared unit's artefacts land in the entry's dev dir... }
   Expect<Boolean>(
-    FileExists(FScratch + '/build/targets/alpha/dev/common.ppu'))
+    FileExists(FScratch + '/build/entries/alpha/dev/common.ppu'))
     .ToBe(False);
   { No compiler intermediates are published into shared build paths. }
   Expect<Boolean>(FileExists(FScratch + '/build/common.ppu')).ToBe(False);
-  Expect<Boolean>(DirectoryExists(FScratch + '/build/targets/beta'))
+  Expect<Boolean>(DirectoryExists(FScratch + '/build/entries/beta'))
     .ToBe(False);
 
   { A release build also publishes only the completed executable. }
   R := RunLwpt(['build', 'alpha', '--mode', 'release'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(
-    FileExists(FScratch + '/build/targets/alpha/release/common.ppu'))
+    FileExists(FScratch + '/build/entries/alpha/release/common.ppu'))
     .ToBe(False);
   Expect<Boolean>(
-    FileExists(FScratch + '/build/targets/alpha/dev/common.ppu'))
+    FileExists(FScratch + '/build/entries/alpha/dev/common.ppu'))
     .ToBe(False);
 end;
 
-procedure TBuildMultiTarget.TestCleanLeavesTargetArtefactDirUntouched;
+procedure TBuildEntries.TestCleanLeavesEntryArtefactDirUntouched;
 var R: TLwptResult;
 begin
   WipeOutputs;
@@ -174,23 +174,23 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
   { Plant shared state that another process could own; clean must leave
     it untouched while compiling in fresh private staging. }
-  WriteTextFile(FScratch + '/build/targets/alpha/dev/stale.sentinel', 'x');
+  WriteTextFile(FScratch + '/build/entries/alpha/dev/stale.sentinel', 'x');
   R := RunLwpt(['build', '--clean', 'alpha'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(
-    FileExists(FScratch + '/build/targets/alpha/dev/stale.sentinel'))
+    FileExists(FScratch + '/build/entries/alpha/dev/stale.sentinel'))
     .ToBe(True);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/alpha')))
     .ToBe(True);
 end;
 
-procedure TBuildMultiTarget.TestTraversalTargetNameRejectedAtLoad;
+procedure TBuildEntries.TestTraversalEntryNameRejectedAtLoad;
 var
   Bad : string;
   R   : TLwptResult;
 begin
-  { A quoted TOML key ".." would make build/targets/.. resolve to
-    build/ itself — --clean would wipe every target's artefacts and
+  { A quoted TOML key ".." would make build/entries/.. resolve to
+    build/ itself — --clean would wipe every entry's artefacts and
     the binary. The manifest loader must reject it before any build
     (or wipe) runs. }
   Bad := FScratch + '/traversal-name';
@@ -209,13 +209,13 @@ begin
 
   R := RunLwpt(['build', '--clean'], Bad);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
-  Expect<Boolean>(Pos('invalid [build] target name', R.Stderr) > 0)
+  Expect<Boolean>(Pos('invalid [build] entry name', R.Stderr) > 0)
     .ToBe(True);
   { The whole point: nothing under build/ was touched. }
   Expect<Boolean>(FileExists(Bad + '/build/survivor.txt')).ToBe(True);
 end;
 
-procedure TBuildMultiTarget.TestSanitisedTargetNamesRemainDistinct;
+procedure TBuildEntries.TestSanitisedEntryNamesRemainDistinct;
 var
   Bad : string;
   R   : TLwptResult;
@@ -242,7 +242,7 @@ begin
   Expect<Boolean>(FileExists(ExpectedExe(Bad + '/build/two'))).ToBe(True);
 end;
 
-procedure TBuildMultiTarget.TestCleanLeavesOrphanTargetDirsUntouched;
+procedure TBuildEntries.TestCleanLeavesOrphanEntryDirsUntouched;
 var
   R     : TLwptResult;
   Ghost : string;
@@ -250,7 +250,7 @@ begin
   { Build sessions cannot infer ownership of legacy/shared directories;
     repair owns abandoned session reclamation instead. }
   WipeOutputs;
-  Ghost := FScratch + '/build/targets/ghost';
+  Ghost := FScratch + '/build/entries/ghost';
   WriteTextFile(Ghost + '/dev/stale.ppu', 'x');
 
   R := RunLwpt(['build', 'alpha'], FScratch);
@@ -263,17 +263,17 @@ begin
   Expect<Boolean>(DirectoryExists(Ghost)).ToBe(True);
   { No live compiler output is ever placed there. }
   Expect<Boolean>(
-    FileExists(FScratch + '/build/targets/alpha/dev/common.ppu'))
+    FileExists(FScratch + '/build/entries/alpha/dev/common.ppu'))
     .ToBe(False);
 end;
 
-procedure TBuildMultiTarget.TestCompileFailureReportsFpcExitCode;
+procedure TBuildEntries.TestCompileFailureReportsFpcExitCode;
 var
   Bad: string;
   R: TLwptResult;
 begin
   { Regression: on macOS the child's nonzero exit was dropped to 0 by
-    TProcess.ExitCode after WaitOnExit, so a target whose source does
+    TProcess.ExitCode after WaitOnExit, so an entry whose source does
     not compile reached the publish step and failed there with
     "could not atomically publish" instead of reporting the compile
     failure. }
@@ -293,7 +293,7 @@ begin
     R := RunLwpt(['build'], Bad);
     Expect<Integer>(R.ExitCode).ToBe(1);
     Expect<Boolean>(Pos('FAILED (fpc exit 1)', R.Stdout) > 0).ToBe(True);
-    Expect<Boolean>(Pos('target "bad" failed:', R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos('build entry "bad" failed:', R.Stderr) > 0).ToBe(True);
     Expect<Boolean>(Pos('0 built, 1 failed', R.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('could not atomically publish',
       R.Stderr) > 0).ToBe(False);
@@ -304,13 +304,13 @@ begin
   end;
 end;
 
-procedure TBuildMultiTarget.TestMissingCompilerFailsTargetsButLoopContinues;
+procedure TBuildEntries.TestMissingCompilerFailsEntriesButLoopContinues;
 var
   MissingCompiler, RequiredMessage: string;
   R: TLwptResult;
 begin
   { An exception out of the compile step (here: EProcess because the
-    compiler binary doesn't exist) must fail each target individually,
+    compiler binary doesn't exist) must fail each entry individually,
     not abort the loop — the summary line still prints. }
   WipeOutputs;
   MissingCompiler := FScratch + '/no-such-fpc';
@@ -321,12 +321,12 @@ begin
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos(RequiredMessage, R.Stderr) > 0).ToBe(True);
   Expect<Boolean>(Pos('compiler "ppc', R.Stderr) > 0).ToBe(False);
-  Expect<Boolean>(Pos('target "alpha" failed:', R.Stderr) > 0).ToBe(True);
-  Expect<Boolean>(Pos('target "beta" failed:', R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build entry "alpha" failed:', R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build entry "beta" failed:', R.Stderr) > 0).ToBe(True);
   Expect<Boolean>(Pos('0 built, 2 failed', R.Stdout) > 0).ToBe(True);
 end;
 
-procedure TBuildMultiTarget.TestInvalidJobsFailsBeforeBuildingAnything;
+procedure TBuildEntries.TestInvalidJobsFailsBeforeBuildingAnything;
 var R: TLwptResult;
 begin
   WipeOutputs;
@@ -337,7 +337,7 @@ begin
   Expect<Boolean>(DirectoryExists(FScratch + '/build')).ToBe(False);
 end;
 
-procedure TBuildMultiTarget.TestInvalidDependencyGraphFailsBeforeBuildingAnything;
+procedure TBuildEntries.TestInvalidDependencyGraphFailsBeforeBuildingAnything;
 var
   Bad: string;
   R: TLwptResult;
@@ -357,7 +357,7 @@ begin
   try
     R := RunLwpt(['build'], Bad);
     Expect<Integer>(R.ExitCode).ToBe(1);
-    Expect<Boolean>(Pos('depends on unknown target "missing"',
+    Expect<Boolean>(Pos('depends on unknown entry "missing"',
       R.Stderr) > 0).ToBe(True);
     Expect<Boolean>(DirectoryExists(Bad + '/.lwpt/sessions')).ToBe(False);
   finally
@@ -365,16 +365,16 @@ begin
   end;
 end;
 
-procedure TBuildMultiTarget.TestPerTargetCompilerFlagsAreForwarded;
+procedure TBuildEntries.TestPerEntryCompilerFlagsAreForwarded;
 var
   R: TLwptResult;
   Scratch: string;
 begin
-  Scratch := CreateScratchRoot('build-target-flags');
+  Scratch := CreateScratchRoot('build-entry-flags');
   RecursiveDelete(Scratch);
   WriteTextFile(Scratch + '/lwpt.toml',
       '[package]'#10
-    + 'name = "build-target-flags"'#10
+    + 'name = "build-entry-flags"'#10
     + 'version = "0.0.0"'#10
     + #10
     + '[build]'#10
@@ -398,16 +398,16 @@ begin
 end;
 
 {$IFDEF DARWIN}
-procedure TBuildMultiTarget.TestClassicLinkerFlagBuildsOnDarwin;
+procedure TBuildEntries.TestClassicLinkerFlagBuildsOnDarwin;
 var
   R: TLwptResult;
   Scratch: string;
 begin
-  Scratch := CreateScratchRoot('build-target-ld-classic');
+  Scratch := CreateScratchRoot('build-entry-ld-classic');
   RecursiveDelete(Scratch);
   WriteTextFile(Scratch + '/lwpt.toml',
       '[package]'#10
-    + 'name = "build-target-ld-classic"'#10
+    + 'name = "build-entry-ld-classic"'#10
     + 'version = "0.0.0"'#10
     + #10
     + '[build]'#10
@@ -427,17 +427,17 @@ end;
 {$ENDIF}
 
 {$IFDEF UNIX}
-procedure TBuildMultiTarget.TestCleanFailureFailsTargetButBuildContinues;
+procedure TBuildEntries.TestCleanFailureFailsEntryButBuildContinues;
 var
   R      : TLwptResult;
   Locked : string;
 begin
-  { Clean never touches an undeletable shared path; both targets build
+  { Clean never touches an undeletable shared path; both entries build
     in their own session directories. }
   WipeOutputs;
   R := RunLwpt(['build', 'alpha'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Locked := FScratch + '/build/targets/alpha/dev';
+  Locked := FScratch + '/build/entries/alpha/dev';
   FpChmod(Locked, &555);
   try
     R := RunLwpt(['build', '--clean', 'alpha', 'beta'], FScratch);
@@ -451,47 +451,47 @@ begin
 end;
 {$ENDIF}
 
-procedure TBuildMultiTarget.SetupTests;
+procedure TBuildEntries.SetupTests;
 begin
-  Test('build alpha beta: both named targets are built',
-    TestTwoNamedTargetsBuildBoth);
-  Test('build alpha no-such-target: fails fast, builds nothing',
-    TestUnknownTargetNameFailsBeforeBuildingAnything);
-  Test('build with no names builds every target',
-    TestNoNamesStillBuildsAllTargets);
+  Test('build alpha beta: both named entries are built',
+    TestTwoNamedEntriesBuildBoth);
+  Test('build alpha no-such-entry: fails fast, builds nothing',
+    TestUnknownEntryNameFailsBeforeBuildingAnything);
+  Test('build with no names builds every entry',
+    TestNoNamesStillBuildsAllEntries);
   Test('unit artefacts remain session-private',
-    TestUnitArtefactsIsolatedPerTargetAndMode);
-  Test('--clean leaves shared target artefact dirs untouched',
-    TestCleanLeavesTargetArtefactDirUntouched);
-  Test('traversal target name ".." is rejected at manifest load',
-    TestTraversalTargetNameRejectedAtLoad);
-  Test('target names colliding after sanitisation remain distinct',
-    TestSanitisedTargetNamesRemainDistinct);
+    TestUnitArtefactsIsolatedPerEntryAndMode);
+  Test('--clean leaves shared entry artefact dirs untouched',
+    TestCleanLeavesEntryArtefactDirUntouched);
+  Test('traversal entry name ".." is rejected at manifest load',
+    TestTraversalEntryNameRejectedAtLoad);
+  Test('entry names colliding after sanitisation remain distinct',
+    TestSanitisedEntryNamesRemainDistinct);
   Test('--clean leaves orphaned shared dirs for repair',
-    TestCleanLeavesOrphanTargetDirsUntouched);
+    TestCleanLeavesOrphanEntryDirsUntouched);
   Test('compile failure reports the fpc exit code, publishes nothing',
     TestCompileFailureReportsFpcExitCode);
-  Test('missing compiler fails targets individually, loop continues',
-    TestMissingCompilerFailsTargetsButLoopContinues);
+  Test('missing compiler fails entries individually, loop continues',
+    TestMissingCompilerFailsEntriesButLoopContinues);
   Test('invalid --jobs fails before building anything',
     TestInvalidJobsFailsBeforeBuildingAnything);
   Test('invalid dependency graph fails before building anything',
     TestInvalidDependencyGraphFailsBeforeBuildingAnything);
-  Test('per-target compiler flags are forwarded as single arguments',
-    TestPerTargetCompilerFlagsAreForwarded);
+  Test('per-entry compiler flags are forwarded as single arguments',
+    TestPerEntryCompilerFlagsAreForwarded);
   {$IFDEF DARWIN}
-  Test('Darwin builds can select the classic linker per target',
+  Test('Darwin builds can select the classic linker per entry',
     TestClassicLinkerFlagBuildsOnDarwin);
   {$ENDIF}
   {$IFDEF UNIX}
   Test('clean ignores locked shared artefact dirs',
-    TestCleanFailureFailsTargetButBuildContinues);
+    TestCleanFailureFailsEntryButBuildContinues);
   {$ENDIF}
 end;
 
 begin
-  TestRunnerProgram.AddSuite(TBuildMultiTarget.Create(
-    'build: multiple named targets'));
+  TestRunnerProgram.AddSuite(TBuildEntries.Create(
+    'build: multiple named entries'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

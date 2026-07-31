@@ -6,8 +6,8 @@ Naming, file layout, formatter rules, manifest scope with protected toolkit stat
 
 - **Identifiers are PascalCase, no underscores, no abbreviations.** Industry-standard acronyms (HTTP, JSON, UUID, **LWPT**) stay as-is. Type prefix `T`, exception `E`, interface `I`, private field `F`, parameter `A` (when ≥ 2 letters).
 - **The project name lives in two constants.** `PROGRAM_NAME = 'lwpt'` (lowercase Unix convention; derives filenames and shell commands) and `PROJECT_NAME = 'LWPT'` (uppercase acronym in prose). See [ADR-0001](./adr/0001-program-name-as-constant.md). Never hardcode either spelling.
-- **LWPT-internal units use the dotted `LWPT.<Subsys>.pas` form.** Workspace packages under `packages/<name>/source/` follow their own naming (see [`packages.md`](./packages.md)). The "Packages own their contents" Hard Constraint in `AGENTS.md` keeps the root LWPT formatter + reviewers out of package source.
-- **`lwpt format` is the canonical formatter.** No-flag invocation rewrites in place; `--check` is the CI / pre-commit mode. Rules are encoded in the Pascal source of `LWPT.Formatter`, not in a config file.
+- **LWPT-internal units use the dotted `LWPT.<Subsys>.pas` form.** Workspace packages under `packages/<name>/source/` follow their own naming and public-surface contracts (see [`packages.md`](./packages.md)). Root formatting applies across workspace packages by default; a package opts out by declaring its own `[format]` section.
+- **`lwpt format` is the canonical formatter.** No-flag invocation rewrites in place and is used by pre-commit; `--check` is the non-mutating CI form. Rules are encoded in the Pascal source of `LWPT.Formatter`, not in a config file.
 - **Formatter scope is manifest-declared with one safety boundary**: `[package].units` + `[format].include`, root `.lwpt/**` excluded unless explicitly included, then `[format].exclude`. Globs are supported; recursion is explicit via `**`. See [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) and [ADR-0028](./adr/0028-default-toolkit-state-format-exclusion.md). Root LWPT's `[format].include` covers `tests/integration/`, `tests/support/`, `tests/e2e/`, and every workspace package (`packages/**/*.{pas,inc}`) so the canonical style applies across the monorepo. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)'s root-owns-unless-overridden model, a workspace package can opt out by declaring its own `[format]` section in `packages/<name>/lwpt.toml`.
 - **Line endings: LF everywhere, trailing whitespace stripped.** The two scope additions from Q8; both are zero-controversy.
 
@@ -83,8 +83,8 @@ same-named SysUtils identifiers. The collisions that bite:
 
 - `FindClose` — `Windows.FindClose(THandle)` shadows
   `SysUtils.FindClose(var TSearchRec)`. An unqualified call compiles fine
-  on macOS/Linux and breaks only the win32/win64 builds — and the PR
-  workflow builds on Linux only, so the break lands on `main` first.
+  on macOS/Linux and breaks only the win32/win64 builds. The PR workflow's
+  Windows cross-compile and native-test jobs catch this before merge.
 - `DeleteFile` — `Windows.DeleteFile(PChar)` shadows
   `SysUtils.DeleteFile(string)`; same Windows-only failure mode.
 
@@ -117,7 +117,8 @@ What the formatter does *not* do (today):
 ./build/lwpt format --check     # exit non-zero on any deviation; do not write
 ```
 
-`--check` is the form CI and the pre-commit hook use.
+`--check` is the form CI uses; pre-commit runs the rewriting form and stages
+the formatter's fixes.
 
 ### Scope: include + exclude
 
@@ -216,4 +217,3 @@ Extract into named constants in the `interface` section when shared. Examples in
 
 - Shared compiler directives live in `Shared.inc`. Every unit that needs `{$mode delphi}`, `{$H+}`, `{$M+}`, etc. pulls the directives via `{$I Shared.inc}`. Do not repeat directives in each unit. The root project has `source/Shared.inc`; each workspace package has its own bundled copy under `packages/<name>/source/Shared.inc` for self-containment.
 - All project-owned units + the renamed CLI / Semver units flow through `Shared.inc`. There used to be a `Goccia.inc` indirection for the `Goccia.*` namespace; with the prefix-strip (`Semver` is now plain `Semver`; `Goccia.Constants.NumericLimits` was inlined into it), nothing needed the indirection anymore and the file was removed.
-- LWPT's own project-wide directives are declared inline in each unit (we use both `{$mode objfpc}` and `{$mode delphi}` depending on the file's lineage); no separate LWPT include file is needed today.

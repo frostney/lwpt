@@ -34,10 +34,10 @@ type
   end;
 
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; const ARelease, AClean: Boolean;
+  const AEntryNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer): Integer; overload;
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; const ARelease, AClean: Boolean;
+  const AEntryNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer; const AVerbose: Boolean): Integer; overload;
 
 implementation
@@ -52,12 +52,12 @@ uses
   LWPT.WorkerBudget;
 
 const
-  BUILD_TARGET_ENV = PROJECT_NAME + '_BUILD_TARGET';
+  BUILD_ENTRY_ENV = PROJECT_NAME + '_BUILD_ENTRY';
   BUILD_OUTPUT_ENV = PROJECT_NAME + '_BUILD_OUTPUT';
   BUILD_PUBLIC_OUTPUT_ENV = PROJECT_NAME + '_BUILD_PUBLIC_OUTPUT';
 
 type
-  TLWPTCompiledTarget = record
+  TLWPTCompiledEntry = record
     Name: string;
     CandidateBin: string;
     OutBin: string;
@@ -69,21 +69,21 @@ type
     PostBuild: THookArray;
   end;
 
-  TLWPTCompiledTargetArray = array of TLWPTCompiledTarget;
+  TLWPTCompiledEntryArray = array of TLWPTCompiledEntry;
 
   TLWPTBuildJob = class(TThread)
   private
     FManifestPath: string;
     FManifest: TManifest;
     FManifestContentHash: string;
-    FTarget: TBuildTarget;
+    FEntry: TBuildEntry;
     FRelease: Boolean;
     FClean: Boolean;
     FSession: TLWPTBuildSession;
     FLease: TLWPTWorkerLease;
     FDriver: TLWPTCompilerDriver;
     FCompiler: TLWPTCompilerProcess;
-    FCompiled: TLWPTCompiledTarget;
+    FCompiled: TLWPTCompiledEntry;
     FBuildResult: TLWPTBuildResult;
     FOutput: string;
     FError: string;
@@ -96,13 +96,13 @@ type
   public
     constructor Create(const AManifestPath: string;
       const AManifest: TManifest; const AManifestContentHash: string;
-      const ATarget: TBuildTarget; const ARelease, AClean: Boolean;
+      const AEntry: TBuildEntry; const ARelease, AClean: Boolean;
       const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
       const ADriver: TLWPTCompilerDriver);
     destructor Destroy; override;
     procedure Cancel;
     function IsDone: Boolean;
-    property Compiled: TLWPTCompiledTarget read FCompiled;
+    property Compiled: TLWPTCompiledEntry read FCompiled;
     property BuildResult: TLWPTBuildResult read FBuildResult;
     property CapturedOutput: string read FOutput;
     property CancellationError: string read FCancellationError;
@@ -110,10 +110,10 @@ type
     property Succeeded: Boolean read FSucceeded;
   end;
 
-  TLWPTTargetState = (tsUnselected, tsPending, tsRunning, tsCompiled,
-    tsSucceeded, tsFailed, tsBlocked);
+  TLWPTBuildEntryState = (besUnselected, besPending, besRunning, besCompiled,
+    besSucceeded, besFailed, besBlocked);
 
-  TLWPTTargetStateArray = array of TLWPTTargetState;
+  TLWPTBuildEntryStateArray = array of TLWPTBuildEntryState;
   TLWPTBooleanArray = array of Boolean;
   TLWPTBuildJobArray = array of TLWPTBuildJob;
   TLWPTBuildResultArray = array of TLWPTBuildResult;
@@ -415,16 +415,16 @@ begin
   end;
 end;
 
-{ Target names become session job-directory segments. Reject traversal
+{ Build-entry names become session job-directory segments. Reject traversal
   and detect collisions before creating a session. }
-function TargetJobSegment(const ATargetName: string): string;
+function BuildEntryJobSegment(const AEntryName: string): string;
 var Safe: string;
 begin
-  Safe := SanitisePathSegment(ATargetName);
+  Safe := SanitisePathSegment(AEntryName);
   if (Safe = '') or (Safe = '.') or (Safe = '..') then
     raise ELWPTError.CreateFmt(
-      'unsafe build target name "%s"', [ATargetName]);
-  Result := BuildSessionPathKey(ATargetName);
+      'unsafe build entry name "%s"', [AEntryName]);
+  Result := BuildSessionPathKey(AEntryName);
 end;
 
 procedure AddDeclaredOutputs(const AMan: TManifest;
@@ -433,11 +433,11 @@ var
   i, Count: Integer;
   OutputPath: string;
 begin
-  for i := 0 to High(AMan.Targets) do
+  for i := 0 to High(AMan.BuildEntries) do
   begin
-    OutputPath := AMan.Targets[i].Output;
+    OutputPath := AMan.BuildEntries[i].Output;
     if OutputPath = '' then
-      OutputPath := ChangeFileExt(AMan.Targets[i].Source, '');
+      OutputPath := ChangeFileExt(AMan.BuildEntries[i].Source, '');
     {$IFDEF MSWINDOWS}
     if (OutputPath <> '') and (ExtractFileExt(OutputPath) = '') then
       OutputPath := OutputPath + '.exe';
@@ -449,12 +449,12 @@ begin
   end;
 end;
 
-{ Compile one build target. Returns True on success. }
-function BuildOneTarget(const AManifestPath: string; const AMan: TManifest;
+{ Compile one build entry. Returns True on success. }
+function BuildOneEntry(const AManifestPath: string; const AMan: TManifest;
   const AManifestContentHash: string;
-  const T: TBuildTarget; ARelease, AClean: Boolean;
+  const T: TBuildEntry; ARelease, AClean: Boolean;
   ASession: TLWPTBuildSession; ACompiler: TLWPTCompilerProcess;
-  ADriver: TLWPTCompilerDriver; out ACompiled: TLWPTCompiledTarget;
+  ADriver: TLWPTCompilerDriver; out ACompiled: TLWPTCompiledEntry;
   out ABuildResult: TLWPTBuildResult; out AOutput: string): Boolean;
 var
   FpcArgs : TStringArray;
@@ -466,7 +466,7 @@ var
   Request: TLWPTBuildPublicationRequest;
   ScanDirs: LWPT.Core.TStringArray;
 begin
-  ACompiled := Default(TLWPTCompiledTarget);
+  ACompiled := Default(TLWPTCompiledEntry);
   ABuildResult := DefaultBuildResult;
   AOutput := '';
   if T.Source = '' then
@@ -582,7 +582,7 @@ end;
 
 constructor TLWPTBuildJob.Create(const AManifestPath: string;
   const AManifest: TManifest; const AManifestContentHash: string;
-  const ATarget: TBuildTarget; const ARelease, AClean: Boolean;
+  const AEntry: TBuildEntry; const ARelease, AClean: Boolean;
   const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
   const ADriver: TLWPTCompilerDriver);
 begin
@@ -591,14 +591,14 @@ begin
   FManifestPath := AManifestPath;
   FManifest := AManifest;
   FManifestContentHash := AManifestContentHash;
-  FTarget := ATarget;
+  FEntry := AEntry;
   FRelease := ARelease;
   FClean := AClean;
   FSession := ASession;
   FLease := ALease;
   FDriver := ADriver;
   FCompiler := TLWPTCompilerProcess.Create(FDriver.ExecutableName);
-  FCompiled := Default(TLWPTCompiledTarget);
+  FCompiled := Default(TLWPTCompiledEntry);
   FBuildResult := DefaultBuildResult;
   FOutput := '';
   FError := '';
@@ -622,12 +622,12 @@ procedure TLWPTBuildJob.Execute;
 begin
   try
     try
-      FSucceeded := BuildOneTarget(FManifestPath, FManifest,
-        FManifestContentHash, FTarget, FRelease, FClean, FSession,
+      FSucceeded := BuildOneEntry(FManifestPath, FManifest,
+        FManifestContentHash, FEntry, FRelease, FClean, FSession,
         FCompiler, FDriver, FCompiled, FBuildResult, FOutput);
       if (not FSucceeded) and (FError = '') then
-        if FTarget.Source = '' then
-          FError := 'target has no source'
+        if FEntry.Source = '' then
+          FError := 'build entry has no source'
         else
           FError := 'compiler failed';
     except
@@ -707,34 +707,34 @@ begin
   end;
 end;
 
-{ Two target names that sanitise to the same session job segment would
+{ Two build-entry names that sanitise to the same session job segment would
   share private output within one invocation. }
-function FindArtefactDirCollision(const ATargets: array of TBuildTarget;
+function FindArtefactDirCollision(const AEntries: array of TBuildEntry;
   out AFirst, ASecond: string): Boolean;
 var i, j: Integer;
 begin
-  for i := 0 to High(ATargets) do
-    for j := i + 1 to High(ATargets) do
-      if SameText(TargetJobSegment(ATargets[i].Name),
-                  TargetJobSegment(ATargets[j].Name)) then
+  for i := 0 to High(AEntries) do
+    for j := i + 1 to High(AEntries) do
+      if SameText(BuildEntryJobSegment(AEntries[i].Name),
+                  BuildEntryJobSegment(AEntries[j].Name)) then
       begin
-        AFirst  := ATargets[i].Name;
-        ASecond := ATargets[j].Name;
+        AFirst  := AEntries[i].Name;
+        ASecond := AEntries[j].Name;
         Exit(True);
       end;
   Result := False;
 end;
 
-function FindTargetIndex(const ATargets: array of TBuildTarget;
+function FindBuildEntryIndex(const AEntries: array of TBuildEntry;
   const AName: string): Integer;
 var i: Integer;
 begin
-  for i := 0 to High(ATargets) do
-    if SameText(ATargets[i].Name, AName) then Exit(i);
+  for i := 0 to High(AEntries) do
+    if SameText(AEntries[i].Name, AName) then Exit(i);
   Result := -1;
 end;
 
-procedure ValidateBuildGraph(const ATargets: array of TBuildTarget);
+procedure ValidateBuildGraph(const AEntries: array of TBuildEntry);
 var
   VisitState: array of Byte;
   i: Integer;
@@ -745,28 +745,28 @@ var
     if VisitState[AIndex] = 2 then Exit;
     if VisitState[AIndex] = 1 then
       raise EManifestError.CreateFmt(
-        '[build] dependency cycle reaches target "%s"',
-        [ATargets[AIndex].Name]);
+        '[build] dependency cycle reaches entry "%s"',
+        [AEntries[AIndex].Name]);
     VisitState[AIndex] := 1;
-    for j := 0 to High(ATargets[AIndex].Depends) do
+    for j := 0 to High(AEntries[AIndex].Depends) do
     begin
-      DependencyIndex := FindTargetIndex(ATargets,
-        ATargets[AIndex].Depends[j]);
+      DependencyIndex := FindBuildEntryIndex(AEntries,
+        AEntries[AIndex].Depends[j]);
       if DependencyIndex < 0 then
         raise EManifestError.CreateFmt(
-          '[build] target "%s" depends on unknown target "%s"',
-          [ATargets[AIndex].Name, ATargets[AIndex].Depends[j]]);
+          '[build] entry "%s" depends on unknown entry "%s"',
+          [AEntries[AIndex].Name, AEntries[AIndex].Depends[j]]);
       Visit(DependencyIndex);
     end;
     VisitState[AIndex] := 2;
   end;
 
 begin
-  SetLength(VisitState, Length(ATargets));
-  for i := 0 to High(ATargets) do Visit(i);
+  SetLength(VisitState, Length(AEntries));
+  for i := 0 to High(AEntries) do Visit(i);
 end;
 
-procedure SelectTargetClosure(const ATargets: array of TBuildTarget;
+procedure SelectBuildEntryClosure(const AEntries: array of TBuildEntry;
   const ARequestedNames: array of string; var ASelected: TLWPTBooleanArray);
 var i: Integer;
 
@@ -775,56 +775,56 @@ var i: Integer;
   begin
     if ASelected[AIndex] then Exit;
     ASelected[AIndex] := True;
-    for j := 0 to High(ATargets[AIndex].Depends) do
+    for j := 0 to High(AEntries[AIndex].Depends) do
     begin
-      DependencyIndex := FindTargetIndex(ATargets,
-        ATargets[AIndex].Depends[j]);
+      DependencyIndex := FindBuildEntryIndex(AEntries,
+        AEntries[AIndex].Depends[j]);
       Select(DependencyIndex);
     end;
   end;
 
 begin
-  SetLength(ASelected, Length(ATargets));
+  SetLength(ASelected, Length(AEntries));
   if Length(ARequestedNames) = 0 then
-    for i := 0 to High(ATargets) do Select(i)
+    for i := 0 to High(AEntries) do Select(i)
   else
     for i := 0 to High(ARequestedNames) do
-      Select(FindTargetIndex(ATargets, ARequestedNames[i]));
+      Select(FindBuildEntryIndex(AEntries, ARequestedNames[i]));
 end;
 
-function SelectedGraphHasEdges(const ATargets: array of TBuildTarget;
+function SelectedGraphHasEdges(const AEntries: array of TBuildEntry;
   const ASelected: TLWPTBooleanArray): Boolean;
 var i: Integer;
 begin
-  for i := 0 to High(ATargets) do
-    if ASelected[i] and (Length(ATargets[i].Depends) > 0) then Exit(True);
+  for i := 0 to High(AEntries) do
+    if ASelected[i] and (Length(AEntries[i].Depends) > 0) then Exit(True);
   Result := False;
 end;
 
-function DependenciesSucceeded(const ATarget: TBuildTarget;
-  const ATargets: array of TBuildTarget;
-  const AStates: TLWPTTargetStateArray): Boolean;
+function DependenciesSucceeded(const AEntry: TBuildEntry;
+  const AEntries: array of TBuildEntry;
+  const AStates: TLWPTBuildEntryStateArray): Boolean;
 var i, DependencyIndex: Integer;
 begin
-  for i := 0 to High(ATarget.Depends) do
+  for i := 0 to High(AEntry.Depends) do
   begin
-    DependencyIndex := FindTargetIndex(ATargets, ATarget.Depends[i]);
-    if AStates[DependencyIndex] <> tsSucceeded then Exit(False);
+    DependencyIndex := FindBuildEntryIndex(AEntries, AEntry.Depends[i]);
+    if AStates[DependencyIndex] <> besSucceeded then Exit(False);
   end;
   Result := True;
 end;
 
-function FailedDependency(const ATarget: TBuildTarget;
-  const ATargets: array of TBuildTarget;
-  const AStates: TLWPTTargetStateArray; out AName: string): Boolean;
+function FailedDependency(const AEntry: TBuildEntry;
+  const AEntries: array of TBuildEntry;
+  const AStates: TLWPTBuildEntryStateArray; out AName: string): Boolean;
 var i, DependencyIndex: Integer;
 begin
-  for i := 0 to High(ATarget.Depends) do
+  for i := 0 to High(AEntry.Depends) do
   begin
-    DependencyIndex := FindTargetIndex(ATargets, ATarget.Depends[i]);
-    if AStates[DependencyIndex] in [tsFailed, tsBlocked] then
+    DependencyIndex := FindBuildEntryIndex(AEntries, AEntry.Depends[i]);
+    if AStates[DependencyIndex] in [besFailed, besBlocked] then
     begin
-      AName := ATargets[DependencyIndex].Name;
+      AName := AEntries[DependencyIndex].Name;
       Exit(True);
     end;
   end;
@@ -832,15 +832,15 @@ begin
 end;
 
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; const ARelease, AClean: Boolean;
+  const AEntryNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer): Integer;
 begin
-  Result := CmdBuild(AManifestPath, ATargetNames, ARelease, AClean,
+  Result := CmdBuild(AManifestPath, AEntryNames, ARelease, AClean,
     AJobs, False);
 end;
 
 function CmdBuild(const AManifestPath: string;
-  const ATargetNames: array of string; const ARelease, AClean: Boolean;
+  const AEntryNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer; const AVerbose: Boolean): Integer;
 var
   Man : TManifest;
@@ -853,10 +853,10 @@ var
   WorkerSession: TLWPTWorkerBudgetSession;
   Lease: TLWPTWorkerLease;
   Selected: TLWPTBooleanArray;
-  States: TLWPTTargetStateArray;
+  States: TLWPTBuildEntryStateArray;
   Jobs: TLWPTBuildJobArray;
   BuildResults: TLWPTBuildResultArray;
-  Compiled: TLWPTCompiledTargetArray;
+  Compiled: TLWPTCompiledEntryArray;
   CapturedOutputs, Errors: TLWPTStringArray;
   PublicationRequest: TLWPTBuildPublicationRequest;
   PublicationResult: TLWPTBuildPublicationResult;
@@ -878,15 +878,15 @@ var
 
   function LogIdentity(const AIndex: Integer): string;
   begin
-    Result := ObservabilityBuildIdentityNamespace + Man.Targets[AIndex].Name;
+    Result := ObservabilityBuildIdentityNamespace + Man.BuildEntries[AIndex].Name;
   end;
 
   procedure PrintStart(const AIndex: Integer);
   begin
     StartTicks[AIndex] := GetTickCount64;
     Session.WriteJobLog(LogIdentity(AIndex), '');
-    WriteLn(ObservabilityStartEvent, Man.Targets[AIndex].Name, ' (',
-      Man.Targets[AIndex].Source, '; log: ',
+    WriteLn(ObservabilityStartEvent, Man.BuildEntries[AIndex].Name, ' (',
+      Man.BuildEntries[AIndex].Source, '; log: ',
       Session.JobLogReference(LogIdentity(AIndex)), ')');
   end;
 
@@ -895,7 +895,7 @@ var
     LogOutput, Elapsed, LogReference: string;
   begin
     if Reported[AIndex] then Exit;
-    if not (States[AIndex] in [tsSucceeded, tsFailed, tsBlocked]) then Exit;
+    if not (States[AIndex] in [besSucceeded, besFailed, besBlocked]) then Exit;
     Reported[AIndex] := True;
     LogOutput := CapturedOutputs[AIndex];
     if (LogOutput = '') and (Errors[AIndex] <> '') then
@@ -905,16 +905,16 @@ var
     Elapsed := FormatElapsedMilliseconds(
       GetTickCount64 - StartTicks[AIndex]);
     case States[AIndex] of
-      tsSucceeded:
+      besSucceeded:
         begin
-          WriteLn(ObservabilityPassEvent, Man.Targets[AIndex].Name, ' -> ',
+          WriteLn(ObservabilityPassEvent, Man.BuildEntries[AIndex].Name, ' -> ',
             Compiled[AIndex].OutBin, ' (', Elapsed, '; log: ',
             LogReference, ')');
           if AVerbose then WriteCapturedOutput(LogOutput);
         end;
-      tsFailed:
+      besFailed:
         begin
-          WriteLn(ObservabilityFailEvent, Man.Targets[AIndex].Name, ' (',
+          WriteLn(ObservabilityFailEvent, Man.BuildEntries[AIndex].Name, ' (',
             Elapsed,
             '; log: ', LogReference, ')');
           WriteCapturedOutput(LogOutput);
@@ -922,14 +922,14 @@ var
              and (Pos(Errors[AIndex], LogOutput) = 0) then
             WriteLn('  error: ', Errors[AIndex]);
           if Errors[AIndex] <> '' then
-            WriteLn(ErrOutput, '  target "', Man.Targets[AIndex].Name,
+            WriteLn(ErrOutput, '  build entry "', Man.BuildEntries[AIndex].Name,
               '" failed: ', Errors[AIndex]);
         end;
-      tsBlocked:
+      besBlocked:
         begin
-          WriteLn(ObservabilitySkipEvent, Man.Targets[AIndex].Name, ' (',
+          WriteLn(ObservabilitySkipEvent, Man.BuildEntries[AIndex].Name, ' (',
             Errors[AIndex], '; ', Elapsed, '; log: ', LogReference, ')');
-          WriteLn(ErrOutput, '  target "', Man.Targets[AIndex].Name,
+          WriteLn(ErrOutput, '  build entry "', Man.BuildEntries[AIndex].Name,
             '" failed: ', Errors[AIndex]);
         end;
     end;
@@ -937,39 +937,39 @@ var
 
   function ActiveBuildSummary(const ATick: QWord): string;
   var
-    TargetIndex: Integer;
+    EntryIndex: Integer;
   begin
     Result := '';
-    for TargetIndex := 0 to High(Man.Targets) do
-      if States[TargetIndex] in [tsPending, tsRunning] then
+    for EntryIndex := 0 to High(Man.BuildEntries) do
+      if States[EntryIndex] in [besPending, besRunning] then
       begin
         if Result <> '' then Result := Result + ', ';
-        Result := Result + Man.Targets[TargetIndex].Name;
-        if States[TargetIndex] = tsRunning then
+        Result := Result + Man.BuildEntries[EntryIndex].Name;
+        if States[EntryIndex] = besRunning then
           Result := Result + ' (' + FormatElapsedMilliseconds(
-            ATick - StartTicks[TargetIndex]) + ')'
+            ATick - StartTicks[EntryIndex]) + ')'
         else
           Result := Result + ' (queued)';
       end;
   end;
 
-  procedure RunTargetPostBuild(const AIndex: Integer);
+  procedure RunEntryPostBuild(const AIndex: Integer);
   begin
     SetLength(HookEnvironment, 3);
-    HookEnvironment[0] := BUILD_TARGET_ENV + '=' + Compiled[AIndex].Name;
+    HookEnvironment[0] := BUILD_ENTRY_ENV + '=' + Compiled[AIndex].Name;
     HookEnvironment[1] := BUILD_OUTPUT_ENV + '='
       + Compiled[AIndex].CandidateBin;
     HookEnvironment[2] := BUILD_PUBLIC_OUTPUT_ENV + '='
       + Compiled[AIndex].OutBin;
-    RunHooksWithEnvironment('postbuild:' + Man.Targets[AIndex].Name,
+    RunHooksWithEnvironment('postbuild:' + Man.BuildEntries[AIndex].Name,
       Compiled[AIndex].PostBuild, Session.HookRoot, HookEnvironment);
   end;
 
-  procedure FinalizeTarget(const AIndex: Integer;
+  procedure FinalizeEntry(const AIndex: Integer;
     const ARunPostBuild: Boolean);
   begin
     try
-      if ARunPostBuild then RunTargetPostBuild(AIndex);
+      if ARunPostBuild then RunEntryPostBuild(AIndex);
       PublicationRequest := Compiled[AIndex].Request;
       CurrentCompilerCapabilities := CompilerDriver.ProbeCapabilities(
         PublicationRequest.BuildRequest.Target, True);
@@ -984,20 +984,20 @@ var
           Compiled[AIndex].ModulesPath, PublicationRequest);
       if PublicationResult = bprStale then
       begin
-        States[AIndex] := tsFailed;
+        States[AIndex] := besFailed;
         Errors[AIndex] := 'inputs changed during compilation; private '
           + 'result was not published';
         Inc(Failed);
       end
       else
       begin
-        States[AIndex] := tsSucceeded;
+        States[AIndex] := besSucceeded;
         Inc(Built);
       end;
     except
       on E: Exception do
       begin
-        States[AIndex] := tsFailed;
+        States[AIndex] := besFailed;
         Errors[AIndex] := E.Message;
         Inc(Failed);
       end;
@@ -1020,8 +1020,8 @@ var
         Jobs[JobIndex].WaitFor;
         if Jobs[JobIndex].CancellationError <> '' then
         begin
-          if States[JobIndex] <> tsFailed then Inc(Failed);
-          States[JobIndex] := tsFailed;
+          if States[JobIndex] <> besFailed then Inc(Failed);
+          States[JobIndex] := besFailed;
           Errors[JobIndex] := Jobs[JobIndex].CancellationError;
           if CancellationFailure = '' then
             CancellationFailure := Jobs[JobIndex].CancellationError;
@@ -1045,7 +1045,7 @@ begin
           'manifest not found at %s', [AManifestPath]);
       Man := LoadManifestSnapshot(AManifestPath, ManifestContentHash);
 
-      if Length(Man.Targets) = 0 then
+      if Length(Man.BuildEntries) = 0 then
       begin
         WriteLn('no [build] entries defined in ', AManifestPath);
         Inc(Failed);
@@ -1055,18 +1055,18 @@ begin
   { Validate every requested name BEFORE any hook or compile runs —
     a typo in one of several names must not half-build the list. }
   Unknown := 0;
-  for j := 0 to High(ATargetNames) do
+  for j := 0 to High(AEntryNames) do
   begin
     Matched := False;
-    for i := 0 to High(Man.Targets) do
-      if SameText(ATargetNames[j], Man.Targets[i].Name) then
+    for i := 0 to High(Man.BuildEntries) do
+      if SameText(AEntryNames[j], Man.BuildEntries[i].Name) then
       begin
         Matched := True;
         Break;
       end;
     if not Matched then
     begin
-      WriteLn(ErrOutput, 'no target named "', ATargetNames[j], '" in ',
+      WriteLn(ErrOutput, 'no build entry named "', AEntryNames[j], '" in ',
         AManifestPath);
       Inc(Unknown);
     end;
@@ -1077,17 +1077,17 @@ begin
         Exit(1);
       end;
 
-  ValidateBuildGraph(Man.Targets);
-  SelectTargetClosure(Man.Targets, ATargetNames, Selected);
+  ValidateBuildGraph(Man.BuildEntries);
+  SelectBuildEntryClosure(Man.BuildEntries, AEntryNames, Selected);
   SelectedCount := 0;
   for i := 0 to High(Selected) do
     if Selected[i] then Inc(SelectedCount);
-  WriteLn('discovered ', SelectedCount, ' build target(s)');
+  WriteLn('discovered ', SelectedCount, ' build entry(s)');
 
-  if FindArtefactDirCollision(Man.Targets, CollA, CollB) then
+  if FindArtefactDirCollision(Man.BuildEntries, CollA, CollB) then
   begin
-    WriteLn(ErrOutput, 'targets "', CollA, '" and "', CollB,
-      '" map to the same session job directory ', TargetJobSegment(CollA),
+    WriteLn(ErrOutput, 'build entries "', CollA, '" and "', CollB,
+      '" map to the same session job directory ', BuildEntryJobSegment(CollA),
       ' — rename one');
     Inc(Failed);
     Exit(1);
@@ -1112,27 +1112,27 @@ begin
 
     Running := 0;
     Completed := 0;
-    HasEdges := SelectedGraphHasEdges(Man.Targets, Selected);
-    SetLength(States, Length(Man.Targets));
-    SetLength(Jobs, Length(Man.Targets));
-    SetLength(BuildResults, Length(Man.Targets));
-    SetLength(Compiled, Length(Man.Targets));
-    SetLength(CapturedOutputs, Length(Man.Targets));
-    SetLength(Errors, Length(Man.Targets));
-    SetLength(StartTicks, Length(Man.Targets));
-    SetLength(Reported, Length(Man.Targets));
+    HasEdges := SelectedGraphHasEdges(Man.BuildEntries, Selected);
+    SetLength(States, Length(Man.BuildEntries));
+    SetLength(Jobs, Length(Man.BuildEntries));
+    SetLength(BuildResults, Length(Man.BuildEntries));
+    SetLength(Compiled, Length(Man.BuildEntries));
+    SetLength(CapturedOutputs, Length(Man.BuildEntries));
+    SetLength(Errors, Length(Man.BuildEntries));
+    SetLength(StartTicks, Length(Man.BuildEntries));
+    SetLength(Reported, Length(Man.BuildEntries));
     HeartbeatInterval := ObservabilityHeartbeatIntervalMilliseconds;
     LastHeartbeatAt := GetTickCount64;
-    for i := 0 to High(Man.Targets) do
-      if Selected[i] then States[i] := tsPending
-      else States[i] := tsUnselected;
+    for i := 0 to High(Man.BuildEntries) do
+      if Selected[i] then States[i] := besPending
+      else States[i] := besUnselected;
 
     WorkerSession := TLWPTWorkerBudgetSession.Create(
       NewWorkerSessionId, MaxJobs);
     try
       { A delegated nested invocation owns exactly one transferred lease,
         regardless of its local --jobs ceiling. Honour the coordinator's
-        effective request so a second ready target waits instead of trying
+        effective request so a second ready entry waits instead of trying
         to acquire beyond the inherited grant. }
       MaxJobs := WorkerSession.RequestedWorkers;
       WriteLn('build jobs: ', MaxJobs);
@@ -1142,12 +1142,12 @@ begin
         begin
           MadeProgress := False;
 
-          for i := 0 to High(Man.Targets) do
-            if (States[i] = tsPending)
-               and FailedDependency(Man.Targets[i], Man.Targets, States,
+          for i := 0 to High(Man.BuildEntries) do
+            if (States[i] = besPending)
+               and FailedDependency(Man.BuildEntries[i], Man.BuildEntries, States,
                  DependencyName) then
             begin
-              States[i] := tsBlocked;
+              States[i] := besBlocked;
               Errors[i] := 'blocked by failed prerequisite "'
                 + DependencyName + '"';
               Inc(Skipped);
@@ -1158,26 +1158,26 @@ begin
               MadeProgress := True;
             end;
 
-          for i := 0 to High(Man.Targets) do
+          for i := 0 to High(Man.BuildEntries) do
           begin
             if Running >= MaxJobs then Break;
-            if (States[i] <> tsPending)
-               or not DependenciesSucceeded(Man.Targets[i], Man.Targets,
+            if (States[i] <> besPending)
+               or not DependenciesSucceeded(Man.BuildEntries[i], Man.BuildEntries,
                  States) then Continue;
             { Never block the scheduler waiting for a machine slot: an
-              already-running target may be the work that returns it. }
+              already-running entry may be the work that returns it. }
             Lease := WorkerSession.Acquire(0);
             if not Assigned(Lease) then Break;
             try
               try
                 PrintStart(i);
-                RunHooks('prebuild:' + Man.Targets[i].Name,
-                  Man.Targets[i].PreBuild, Session.HookRoot);
+                RunHooks('prebuild:' + Man.BuildEntries[i].Name,
+                  Man.BuildEntries[i].PreBuild, Session.HookRoot);
                 Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
-                  ManifestContentHash, Man.Targets[i], ARelease, AClean,
+                  ManifestContentHash, Man.BuildEntries[i], ARelease, AClean,
                   Session, Lease, CompilerDriver);
                 Lease := nil;
-                States[i] := tsRunning;
+                States[i] := besRunning;
                 Inc(Running);
                 try
                   Jobs[i].Start;
@@ -1197,7 +1197,7 @@ begin
             except
               on E: Exception do
               begin
-                States[i] := tsFailed;
+                States[i] := besFailed;
                 Errors[i] := E.Message;
                 Inc(Failed);
                 Inc(Completed);
@@ -1219,11 +1219,11 @@ begin
                 if Length(BuildResults[i].Artifacts) > 0 then
                   Compiled[i].CandidateBin :=
                     BuildResults[i].Artifacts[0].Path;
-                States[i] := tsCompiled;
+                States[i] := besCompiled;
               end
               else
               begin
-                States[i] := tsFailed;
+                States[i] := besFailed;
                 Errors[i] := BuildResultErrorMessage(BuildResults[i]);
                 if Errors[i] = '' then Errors[i] := Jobs[i].ErrorMessage;
                 Inc(Failed);
@@ -1231,25 +1231,25 @@ begin
               FreeAndNil(Jobs[i]);
               Dec(Running);
               Inc(Completed);
-              if States[i] = tsCompiled then
+              if States[i] = besCompiled then
                 if HasEdges then
                 begin
-                  FinalizeTarget(i, True);
+                  FinalizeEntry(i, True);
                   PrintTerminal(i);
                 end
                 else
                   try
-                    RunTargetPostBuild(i);
+                    RunEntryPostBuild(i);
                   except
                     on E: Exception do
                     begin
-                      States[i] := tsFailed;
+                      States[i] := besFailed;
                       Errors[i] := E.Message;
                       Inc(Failed);
                       PrintTerminal(i);
                     end;
                   end;
-              if States[i] = tsFailed then PrintTerminal(i);
+              if States[i] = besFailed then PrintTerminal(i);
               MadeProgress := True;
             end;
 
@@ -1268,20 +1268,20 @@ begin
         raise;
       end;
 
-      { With no dependency edges, retain ADR-0020's all-target postbuild
+      { With no dependency edges, retain ADR-0020's whole-build postbuild
         gate and publish only after every private candidate succeeds. }
       if (not HasEdges) and (Failed = 0) then
       begin
         WholePostBuild := Man.PostBuild;
-        for i := 0 to High(Man.Targets) do
-          if States[i] = tsCompiled then
+        for i := 0 to High(Man.BuildEntries) do
+          if States[i] = besCompiled then
             WholePostBuild := RetargetPostBuildHooks(WholePostBuild,
               Compiled[i].OutBin, Compiled[i].CandidateBin);
         RunHooks('postbuild', WholePostBuild, Session.HookRoot);
-        for i := 0 to High(Man.Targets) do
-          if States[i] = tsCompiled then
+        for i := 0 to High(Man.BuildEntries) do
+          if States[i] = besCompiled then
           begin
-            FinalizeTarget(i, False);
+            FinalizeEntry(i, False);
             PrintTerminal(i);
           end;
       end
@@ -1306,19 +1306,19 @@ begin
       end;
     end;
 
-    { Any candidate withheld by the all-target publication gate is a
-      deterministic skip, not a second copy of the target that failed. }
-    for i := 0 to High(Man.Targets) do
-      if Selected[i] and (States[i] = tsCompiled) then
+    { Any candidate withheld by the whole-build publication gate is a
+      deterministic skip, not a second copy of the entry that failed. }
+    for i := 0 to High(Man.BuildEntries) do
+      if Selected[i] and (States[i] = besCompiled) then
       begin
-        States[i] := tsBlocked;
+        States[i] := besBlocked;
         Errors[i] := 'compiled; not published because the build failed';
         Inc(Skipped);
         PrintTerminal(i);
       end;
     Result := Ord(Failed <> 0);
     Session.Finish(Failed = 0,
-      IntToStr(Failed) + ' target(s) failed or became stale');
+      IntToStr(Failed) + ' build entry(s) failed or became stale');
   finally
     Session.Free;
   end;

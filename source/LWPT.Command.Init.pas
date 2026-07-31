@@ -70,7 +70,7 @@ begin
 end;
 
 { Package names + entry names follow LWPT's project-name grammar, while
-  `program X;` must be a Pascal identifier. The filename + target name +
+  `program X;` must be a Pascal identifier. The filename + entry name +
   greeting text keep the original spelling — FPC doesn't require the
   program name to match the filename, so this stays out of the user's way. }
 function SanitisePascalIdent(const S: string): string;
@@ -280,8 +280,8 @@ begin
       ValidateWritePath(ACWD, UnitPaths[i],
         '[package].units path "' + Man.Units[i] + '"');
   end;
-  for i := 0 to High(Man.Targets) do
-    AddBuildOutputDirectory(ACWD, Man.Targets[i].Output, BuildDirs);
+  for i := 0 to High(Man.BuildEntries) do
+    AddBuildOutputDirectory(ACWD, Man.BuildEntries[i].Output, BuildDirs);
   if Length(BuildDirs) = 0 then
   begin
     SetLength(BuildDirs, 1);

@@ -55,7 +55,7 @@ type
     procedure SetupTests; override;
     procedure TestMinimalManifestNameAndVersion;
     procedure TestPackageUnitsArrayParsed;
-    procedure TestTargetsTable;
+    procedure TestBuildEntriesTable;
     procedure TestVersionSection;
     procedure TestManifestSnapshotBindsParsedBytes;
   end;
@@ -68,7 +68,7 @@ type
     procedure TestDepWithHttpSourceRejected;
     procedure TestUnknownSourceKindRejected;
     procedure TestMissingManifestRejected;
-    procedure TestBuildTargetTraversalNameRootOnly;
+    procedure TestBuildEntryTraversalNameRootOnly;
     procedure TestBuildDependsMustBeStringArray;
     procedure TestBuildFlagsMustBeStringArrayAndAreRootOnly;
   end;
@@ -81,7 +81,7 @@ type
     procedure TestPrebuildHookEntriesParsed;
     procedure TestHookShorthandStringForm;
     procedure TestHookPairedInputsOutputRequired;
-    procedure TestPerTargetHooksParsed;
+    procedure TestPerEntryHooksParsed;
     procedure TestUnknownSectionEmitsWarning;
   end;
 
@@ -591,7 +591,7 @@ begin
   Expect<string>(Man.Name).ToBe('minimal');
   Expect<string>(Man.Version).ToBe('0.1.2');
   Expect<Integer>(Length(Man.Deps)).ToBe(0);
-  Expect<Integer>(Length(Man.Targets)).ToBe(0);
+  Expect<Integer>(Length(Man.BuildEntries)).ToBe(0);
 end;
 
 procedure TLoadManifestHappy.TestPackageUnitsArrayParsed;
@@ -610,7 +610,7 @@ begin
   Expect<string>(Man.Units[2]).ToBe('tools');
 end;
 
-procedure TLoadManifestHappy.TestTargetsTable;
+procedure TLoadManifestHappy.TestBuildEntriesTable;
 const
   INPUT =
     '[package]'#10 +
@@ -624,18 +624,18 @@ const
 var Man: TManifest;
 begin
   Man := LoadManifest(WriteManifest('build-items', INPUT));
-  Expect<Integer>(Length(Man.Targets)).ToBe(2);
-  Expect<string>(Man.Targets[0].Name).ToBe('cli');
-  Expect<string>(Man.Targets[0].Source).ToBe('src/cli.pas');
-  Expect<string>(Man.Targets[0].Output).ToBe('bin/cli');
-  Expect<string>(Man.Targets[1].Name).ToBe('tool');
-  Expect<string>(Man.Targets[1].Source).ToBe('src/tool.pas');
-  Expect<string>(Man.Targets[1].Output).ToBe('');
-  Expect<Integer>(Length(Man.Targets[1].Depends)).ToBe(1);
-  Expect<string>(Man.Targets[1].Depends[0]).ToBe('cli');
-  Expect<Integer>(Length(Man.Targets[1].Flags)).ToBe(2);
-  Expect<string>(Man.Targets[1].Flags[0]).ToBe('-dTOOL');
-  Expect<string>(Man.Targets[1].Flags[1]).ToBe('-k-ld_classic');
+  Expect<Integer>(Length(Man.BuildEntries)).ToBe(2);
+  Expect<string>(Man.BuildEntries[0].Name).ToBe('cli');
+  Expect<string>(Man.BuildEntries[0].Source).ToBe('src/cli.pas');
+  Expect<string>(Man.BuildEntries[0].Output).ToBe('bin/cli');
+  Expect<string>(Man.BuildEntries[1].Name).ToBe('tool');
+  Expect<string>(Man.BuildEntries[1].Source).ToBe('src/tool.pas');
+  Expect<string>(Man.BuildEntries[1].Output).ToBe('');
+  Expect<Integer>(Length(Man.BuildEntries[1].Depends)).ToBe(1);
+  Expect<string>(Man.BuildEntries[1].Depends[0]).ToBe('cli');
+  Expect<Integer>(Length(Man.BuildEntries[1].Flags)).ToBe(2);
+  Expect<string>(Man.BuildEntries[1].Flags[0]).ToBe('-dTOOL');
+  Expect<string>(Man.BuildEntries[1].Flags[1]).ToBe('-k-ld_classic');
 end;
 
 procedure TLoadManifestHappy.TestVersionSection;
@@ -677,7 +677,7 @@ procedure TLoadManifestHappy.SetupTests;
 begin
   Test('minimal manifest: name + version',  TestMinimalManifestNameAndVersion);
   Test('[package] units array parsed',      TestPackageUnitsArrayParsed);
-  Test('[build] table with output + bare-source entries', TestTargetsTable);
+  Test('[build] table with output + bare-source entries', TestBuildEntriesTable);
   Test('[version] section parsed',          TestVersionSection);
   Test('manifest snapshot hashes the bytes it parses',
     TestManifestSnapshotBindsParsedBytes);
@@ -762,7 +762,7 @@ begin
     Self);
 end;
 
-procedure TLoadManifestValidation.TestBuildTargetTraversalNameRootOnly;
+procedure TLoadManifestValidation.TestBuildEntryTraversalNameRootOnly;
 const
   INPUT =
     '[package]'#10 +
@@ -775,16 +775,16 @@ var
   Path : string;
   Man  : TManifest;
 begin
-  { Root manifest: ".." would make build/targets/.. resolve to build/
+  { Root manifest: ".." would make build/entries/.. resolve to build/
     itself — rejected at load. }
   Path := WriteManifest('traversal-build-name', INPUT);
-  ExpectManifestLoadError(Path, 'invalid [build] target name', Self);
+  ExpectManifestLoadError(Path, 'invalid [build] entry name', Self);
 
-  { Dependency manifest (AIsRoot=False): its targets are never built
+  { Dependency manifest (AIsRoot=False): its build entries are never built
     by the consumer (parse-and-drop posture, ADR-0011) — a broken or
     hostile dep manifest must not block `lwpt install`. }
   Man := LoadManifest(Path, False);
-  Expect<Integer>(Length(Man.Targets)).ToBe(1);
+  Expect<Integer>(Length(Man.BuildEntries)).ToBe(1);
 end;
 
 procedure TLoadManifestValidation.TestBuildDependsMustBeStringArray;
@@ -856,8 +856,8 @@ begin
     Their flag values are therefore dropped without validation so a
     dependency cannot widen the root project's compiler argument surface. }
   Man := LoadManifest(Path, False);
-  Expect<Integer>(Length(Man.Targets)).ToBe(1);
-  Expect<Integer>(Length(Man.Targets[0].Flags)).ToBe(0);
+  Expect<Integer>(Length(Man.BuildEntries)).ToBe(1);
+  Expect<Integer>(Length(Man.BuildEntries[0].Flags)).ToBe(0);
 end;
 
 procedure TLoadManifestValidation.SetupTests;
@@ -870,7 +870,7 @@ begin
   Test('unknown source kind rejected',      TestUnknownSourceKindRejected);
   Test('missing manifest path rejected',    TestMissingManifestRejected);
   Test('traversal [build] name rejected for root, tolerated for deps',
-    TestBuildTargetTraversalNameRootOnly);
+    TestBuildEntryTraversalNameRootOnly);
   Test('[build] depends requires only string array values',
     TestBuildDependsMustBeStringArray);
   Test('[build] flags are strict root-owned string arrays',
@@ -986,7 +986,7 @@ begin
     Self);
 end;
 
-procedure TLoadManifestExtensions.TestPerTargetHooksParsed;
+procedure TLoadManifestExtensions.TestPerEntryHooksParsed;
 const
   INPUT =
     '[package]'#10 +
@@ -1000,16 +1000,16 @@ const
 var Man: TManifest;
 begin
   Man := LoadManifest(WriteManifest('per-item-hooks', INPUT));
-  Expect<Integer>(Length(Man.Targets)).ToBe(1);
-  Expect<Integer>(Length(Man.Targets[0].PreBuild)).ToBe(1);
-  Expect<string>(Man.Targets[0].PreBuild[0].Name).ToBe('stamp');
-  Expect<string>(Man.Targets[0].PreBuild[0].Script).ToBe('scripts/stamp.pas');
-  Expect<Integer>(Length(Man.Targets[0].PostBuild)).ToBe(1);
-  Expect<string>(Man.Targets[0].PostBuild[0].Name).ToBe('sign');
-  Expect<string>(Man.Targets[0].PostBuild[0].Script).ToBe('scripts/sign.pas');
-  Expect<Integer>(Length(Man.Targets[0].PostBuild[0].Args)).ToBe(1);
+  Expect<Integer>(Length(Man.BuildEntries)).ToBe(1);
+  Expect<Integer>(Length(Man.BuildEntries[0].PreBuild)).ToBe(1);
+  Expect<string>(Man.BuildEntries[0].PreBuild[0].Name).ToBe('stamp');
+  Expect<string>(Man.BuildEntries[0].PreBuild[0].Script).ToBe('scripts/stamp.pas');
+  Expect<Integer>(Length(Man.BuildEntries[0].PostBuild)).ToBe(1);
+  Expect<string>(Man.BuildEntries[0].PostBuild[0].Name).ToBe('sign');
+  Expect<string>(Man.BuildEntries[0].PostBuild[0].Script).ToBe('scripts/sign.pas');
+  Expect<Integer>(Length(Man.BuildEntries[0].PostBuild[0].Args)).ToBe(1);
   { {item.output} interpolates to the resolved output value. }
-  Expect<string>(Man.Targets[0].PostBuild[0].Args[0]).ToBe('build/cli');
+  Expect<string>(Man.BuildEntries[0].PostBuild[0].Args[0]).ToBe('build/cli');
 end;
 
 procedure TLoadManifestExtensions.TestUnknownSectionEmitsWarning;
@@ -1049,7 +1049,7 @@ begin
   Test('hook inputs/output is a paired option (half-pair rejected)',
     TestHookPairedInputsOutputRequired);
   Test('[build].<entry>.prebuild / postbuild parsed + {item.output} expanded',
-    TestPerTargetHooksParsed);
+    TestPerEntryHooksParsed);
   Test('unknown top-level section dropped silently with stderr warning',
     TestUnknownSectionEmitsWarning);
 end;

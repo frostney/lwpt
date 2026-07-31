@@ -10,7 +10,7 @@ lwpt init      scaffold a new project or adopt an existing manifest   [--adopt]
 lwpt install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
 lwpt add       add a dependency to lwpt.toml + install it   [--name <name>]
 lwpt remove    remove dependencies from lwpt.toml + prune their modules
-lwpt build     compile manifest targets   [--mode dev|release] [--clean] [--jobs N]
+lwpt build     compile manifest build entries   [--mode dev|release] [--clean] [--jobs N]
 lwpt format    format uses-clauses + identifiers   [--check]
 lwpt test      discover, compile and run *.Test.pas files   [--jobs N] [--bail N]
 lwpt repair    reclaim install, build-session, and worker-lease residue
@@ -46,9 +46,9 @@ bootstrap.bat      # Windows
 # Steady state — all driven by the LWPT binary
 ./build/lwpt init --yes         # scaffold a fresh project
 ./build/lwpt init --adopt       # fill in scaffold around an existing manifest
-./build/lwpt build              # dev build, all manifest targets
+./build/lwpt build              # dev build, all manifest entries
 ./build/lwpt build --mode release
-./build/lwpt build <target>     # single target
+./build/lwpt build <entry>      # single build entry
 ./build/lwpt format             # rewrite project sources to canonical style
 ./build/lwpt format --check     # exit non-zero on any deviation
 ./build/lwpt test               # discover/compile/run *.Test.pas
@@ -175,7 +175,7 @@ include = ["tests/**/*.pas"]
 exclude = ["src/legacy/Vendored.pas"]
 ```
 
-Source kinds: `skGitHost` (default `github`, with `gitlab:` / `bitbucket:` / any user-declared `[sources.<name>]` prefix), `skURL` (any `https://...`), `skLocal` (any path or `local:` prefix). Version specs go through the `Semver` unit (vendored node-semver port, prefix-stripped from upstream) for ranges + exact matches, fall through to literal Git tag / commit-SHA lookup for everything else. Tag listing uses git smart-HTTP `info/refs?service=git-upload-pack` — works against any git host with one URL pattern, no JSON, no auth tokens. Custom hosts (Gitea, Forgejo, self-hosted GitHub Enterprise / GitLab / Bitbucket Server) plug in via the `[sources]` table — no code change needed. See [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md).
+Source kinds: `skGitHost` (default `github`, with `gitlab:` / `bitbucket:` / any user-declared `[sources.<name>]` prefix), `skURL` (any `https://...`), `skLocal` (any path or `local:` prefix). Version specs go through the LWPT-canonical `Semver` unit (a node-semver port adapted from GocciaScript's earlier copy) for ranges + exact matches, then fall through to literal Git tag / commit-SHA lookup. Tag listing uses git smart-HTTP `info/refs?service=git-upload-pack` — works against any git host with one URL pattern, no JSON, no auth tokens. Custom hosts (Gitea, Forgejo, self-hosted GitHub Enterprise / GitLab / Bitbucket Server) plug in via the `[sources]` table — no code change needed. See [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md).
 
 ## Writing tests
 

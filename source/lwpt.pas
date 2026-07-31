@@ -151,7 +151,7 @@ var
   Release, Clean, JobsPresent, Verbose : Boolean;
   Jobs : Integer;
   ModeVal : string;
-  TargetNames : array of string;
+  EntryNames : array of string;
   i : Integer;
 begin
   Release := False;          { dev is the default }
@@ -193,12 +193,12 @@ begin
       '--jobs must be a positive integer, got ', Jobs);
     Exit(1);
   end;
-  SetLength(TargetNames, APositionals.Count);
+  SetLength(EntryNames, APositionals.Count);
   for i := 0 to APositionals.Count - 1 do
-    TargetNames[i] := APositionals[i];
+    EntryNames[i] := APositionals[i];
   try
     InstallProcessTreeSignalForwarding;
-    Result := CmdBuild(MANIFEST_FILE, TargetNames, Release, Clean, Jobs,
+    Result := CmdBuild(MANIFEST_FILE, EntryNames, Release, Clean, Jobs,
       Verbose);
   except
     on E: Exception do
@@ -472,12 +472,12 @@ begin
     BuildOpts[1] := TFlagOption.Create('clean',
       'Force a full rebuild in fresh private staging');
     BuildOpts[2] := TIntegerOption.Create('jobs',
-      'Maximum concurrent build targets (default: machine budget)');
+      'Maximum concurrent build entries (default: machine budget)');
     BuildOpts[3] := TFlagOption.Create('verbose',
-      'Replay successful target logs');
+      'Replay successful build-entry logs');
     Registry.Add(TSubcommand.Create('build',
-      'Compile manifest targets',
-      '[target...] [--mode dev|release] [--clean] [--jobs N] [--verbose]',
+      'Compile manifest build entries',
+      '[entry...] [--mode dev|release] [--clean] [--jobs N] [--verbose]',
       @HandleBuild, BuildOpts));
 
     SetLength(FormatOpts, 1);

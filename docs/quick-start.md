@@ -55,11 +55,11 @@ After bootstrap:
 ./build/lwpt init --yes         # scaffold a fresh project
 ./build/lwpt init --adopt       # adopt an existing manifest
 
-./build/lwpt build              # dev build, all manifest targets
+./build/lwpt build              # dev build, all manifest entries
 ./build/lwpt build --mode release
-./build/lwpt build <target>     # single target
+./build/lwpt build <entry>      # single build entry
 ./build/lwpt build --clean      # force a fresh private-session rebuild
-./build/lwpt build --jobs=1     # force sequential target execution
+./build/lwpt build --jobs=1     # force sequential entry execution
 
 ./build/lwpt format             # rewrite sources to canonical style
 ./build/lwpt format --check     # exit non-zero on any deviation

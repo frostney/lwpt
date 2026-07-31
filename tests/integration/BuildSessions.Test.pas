@@ -25,7 +25,7 @@ const
   TEST_FPC_READY_DIR_ENV = PROJECT_NAME + '_TEST_FPC_READY_DIR';
   TEST_FPC_RELEASE_ENV = PROJECT_NAME + '_TEST_FPC_RELEASE';
   TEST_FPC_RELEASE_DIR_ENV = PROJECT_NAME + '_TEST_FPC_RELEASE_DIR';
-  TEST_FPC_FAIL_TARGET_ENV = PROJECT_NAME + '_TEST_FPC_FAIL_TARGET';
+  TEST_FPC_FAIL_ENTRY_ENV = PROJECT_NAME + '_TEST_FPC_FAIL_ENTRY';
   TestFPCDelayMillisecondsEnvironment = PROJECT_NAME
     + '_TEST_FPC_DELAY_MS';
   TestFPCOutputEnvironment = PROJECT_NAME + '_TEST_FPC_OUTPUT';
@@ -62,8 +62,8 @@ type
     function CountSessionDirs: Integer;
     function CountSessionJobRoots: Integer;
     function CountReadyFiles(const ADir: string): Integer;
-    function TargetReady(const ADir, ATarget: string): Boolean;
-    function StartBuildWithEnv(const AProject, ATarget: string;
+    function EntryReady(const ADir, AEntry: string): Boolean;
+    function StartBuildWithEnv(const AProject, AEntry: string;
       const AExtraEnv: array of string): TProcess;
     function StartBuildWithArgs(const AProject: string;
       const AArgs, AExtraEnv: array of string): TProcess;
@@ -81,8 +81,8 @@ type
     procedure TestFailedBuildPreservesLastSuccessfulOutput;
     procedure TestInFlightSourceChangeRefusesPublication;
     procedure TestInFlightWorkspaceChangeRefusesPublication;
-    procedure TestOneInvocationRunsReadyTargetsInParallel;
-    procedure TestJobsOneRunsTargetsSequentially;
+    procedure TestOneInvocationRunsReadyEntriesInParallel;
+    procedure TestJobsOneRunsEntriesSequentially;
     procedure TestFailedPrerequisiteBlocksOnlyDependants;
     procedure TestObservableBuildHeartbeatAndVerboseLogs;
     procedure TestFullyContendedBuildEmitsHeartbeat;
@@ -98,7 +98,7 @@ end;
 { On a barrier timeout the suite's stdout is captured into its isolated
   log and replayed by the failure path, so these lines surface directly
   in CI output. They separate "the scheduler never dispatched the
-  target" (no START line in the replayed build output, no ready file)
+  build entry" (no START line in the replayed build output, no ready file)
   from "the child was dispatched but never signalled ready" (START
   present, ready file absent) without needing access to the runner. }
 procedure DumpBarrierDiagnostics(const ALabel, AReadyDir: string);
@@ -311,11 +311,11 @@ begin
   end;
 end;
 
-function TBuildSessions.TargetReady(const ADir, ATarget: string): Boolean;
+function TBuildSessions.EntryReady(const ADir, AEntry: string): Boolean;
 var Search: TSearchRec;
 begin
   Result := FindFirst(IncludeTrailingPathDelimiter(ADir) + 'ready-'
-    + ATarget + '-*', faAnyFile, Search) = 0;
+    + AEntry + '-*', faAnyFile, Search) = 0;
   if Result then FindClose(Search);
 end;
 
@@ -382,10 +382,10 @@ begin
 end;
 
 function TBuildSessions.StartBuildWithEnv(
-  const AProject, ATarget: string;
+  const AProject, AEntry: string;
   const AExtraEnv: array of string): TProcess;
 begin
-  Result := StartBuildWithArgs(AProject, ['build', ATarget], AExtraEnv);
+  Result := StartBuildWithArgs(AProject, ['build', AEntry], AExtraEnv);
 end;
 
 function TBuildSessions.StartBuildWithArgs(const AProject: string;
@@ -777,7 +777,7 @@ begin
   end;
 end;
 
-procedure TBuildSessions.TestOneInvocationRunsReadyTargetsInParallel;
+procedure TBuildSessions.TestOneInvocationRunsReadyEntriesInParallel;
 var
   Project, ReadyDir, ReleaseDir, RealFPC: string;
   Build: TProcess;
@@ -801,34 +801,34 @@ begin
   try
     Started := Now;
     while Build.Running
-      and not (TargetReady(ReadyDir, 'alpha')
-        and TargetReady(ReadyDir, 'beta')) do
+      and not (EntryReady(ReadyDir, 'alpha')
+        and EntryReady(ReadyDir, 'beta')) do
     begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
-    if not (TargetReady(ReadyDir, 'alpha')
-      and TargetReady(ReadyDir, 'beta')) then
+    if not (EntryReady(ReadyDir, 'alpha')
+      and EntryReady(ReadyDir, 'beta')) then
       DumpBarrierDiagnostics('overlap: alpha+beta ready', ReadyDir);
-    Expect<Boolean>(TargetReady(ReadyDir, 'alpha')).ToBe(True);
-    Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(True);
-    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
+    Expect<Boolean>(EntryReady(ReadyDir, 'alpha')).ToBe(True);
+    Expect<Boolean>(EntryReady(ReadyDir, 'beta')).ToBe(True);
+    Expect<Boolean>(EntryReady(ReadyDir, 'app')).ToBe(False);
 
     { Complete in reverse manifest order. The dependent still cannot start
       until both prerequisite publications have succeeded. }
     WriteTextFile(ReleaseDir + '/beta', 'release');
     Sleep(50);
-    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
+    Expect<Boolean>(EntryReady(ReadyDir, 'app')).ToBe(False);
     WriteTextFile(ReleaseDir + '/alpha', 'release');
     Started := Now;
-    while Build.Running and not TargetReady(ReadyDir, 'app') do
+    while Build.Running and not EntryReady(ReadyDir, 'app') do
     begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
-    if not TargetReady(ReadyDir, 'app') then
+    if not EntryReady(ReadyDir, 'app') then
       DumpBarrierDiagnostics('app ready after releases', ReadyDir);
-    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(True);
+    Expect<Boolean>(EntryReady(ReadyDir, 'app')).ToBe(True);
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/alpha')))
       .ToBe(True);
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/beta')))
@@ -848,7 +848,7 @@ begin
   end;
 end;
 
-procedure TBuildSessions.TestJobsOneRunsTargetsSequentially;
+procedure TBuildSessions.TestJobsOneRunsEntriesSequentially;
 var
   Project, ReadyDir, ReleaseDir, RealFPC: string;
   Build: TProcess;
@@ -872,36 +872,36 @@ begin
     ['build', 'app', '--jobs=1'], Env);
   try
     Started := Now;
-    while Build.Running and not TargetReady(ReadyDir, 'alpha') do
+    while Build.Running and not EntryReady(ReadyDir, 'alpha') do
     begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
-    if not TargetReady(ReadyDir, 'alpha') then
+    if not EntryReady(ReadyDir, 'alpha') then
       DumpBarrierDiagnostics('sequential: alpha ready', ReadyDir);
-    Expect<Boolean>(TargetReady(ReadyDir, 'alpha')).ToBe(True);
-    Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(False);
+    Expect<Boolean>(EntryReady(ReadyDir, 'alpha')).ToBe(True);
+    Expect<Boolean>(EntryReady(ReadyDir, 'beta')).ToBe(False);
     WriteTextFile(ReleaseDir + '/alpha', 'release');
     Started := Now;
-    while Build.Running and not TargetReady(ReadyDir, 'beta') do
+    while Build.Running and not EntryReady(ReadyDir, 'beta') do
     begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
-    if not TargetReady(ReadyDir, 'beta') then
+    if not EntryReady(ReadyDir, 'beta') then
       DumpBarrierDiagnostics('sequential: beta ready', ReadyDir);
-    Expect<Boolean>(TargetReady(ReadyDir, 'beta')).ToBe(True);
-    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
+    Expect<Boolean>(EntryReady(ReadyDir, 'beta')).ToBe(True);
+    Expect<Boolean>(EntryReady(ReadyDir, 'app')).ToBe(False);
     WriteTextFile(ReleaseDir + '/beta', 'release');
     Started := Now;
-    while Build.Running and not TargetReady(ReadyDir, 'app') do
+    while Build.Running and not EntryReady(ReadyDir, 'app') do
     begin
       if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
       Sleep(10);
     end;
-    if not TargetReady(ReadyDir, 'app') then
+    if not EntryReady(ReadyDir, 'app') then
       DumpBarrierDiagnostics('app ready after releases', ReadyDir);
-    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(True);
+    Expect<Boolean>(EntryReady(ReadyDir, 'app')).ToBe(True);
     WriteTextFile(ReleaseDir + '/app', 'release');
     Build.WaitOnExit;
     Expect<Integer>(Build.ExitCode).ToBe(0);
@@ -936,7 +936,7 @@ begin
   Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
   Env[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
   Env[4] := TEST_FPC_RELEASE_DIR_ENV + '=' + ReleaseDir;
-  Env[5] := TEST_FPC_FAIL_TARGET_ENV + '=alpha';
+  Env[5] := TEST_FPC_FAIL_ENTRY_ENV + '=alpha';
   Env[6] := WORKER_STATE_DIR_ENV + '=' + Project + '/worker-state';
   Env[7] := WORKER_BUDGET_ENV + '=4';
   try
@@ -946,7 +946,7 @@ begin
       .ToBe(True);
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/app')))
       .ToBe(False);
-    Expect<Boolean>(TargetReady(ReadyDir, 'app')).ToBe(False);
+    Expect<Boolean>(EntryReady(ReadyDir, 'app')).ToBe(False);
     Expect<Boolean>(Pos('blocked by failed prerequisite "alpha"',
       R.Stderr) > 0).ToBe(True);
     AlphaAt := Pos('START alpha ', R.Stdout);
@@ -1000,7 +1000,7 @@ begin
       ['build', 'alpha', 'beta', '--verbose'], Project, Environment);
     DumpRunFailure('observable: verbose build', RunResult, 0);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
-    Expect<Boolean>(Pos('discovered 2 build target(s)', RunResult.Stdout) > 0)
+    Expect<Boolean>(Pos('discovered 2 build entry(s)', RunResult.Stdout) > 0)
       .ToBe(True);
     Expect<Boolean>(Pos('build session: ', RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('(.lwpt/sessions/', RunResult.Stdout) > 0).ToBe(True);
@@ -1098,7 +1098,7 @@ begin
   Environment[3] := TestFPCDelayMillisecondsEnvironment + '='
     + IntToStr(TestShortCompilerDelayMilliseconds);
   Environment[4] := TestFPCOutputEnvironment + '=1';
-  Environment[5] := TEST_FPC_FAIL_TARGET_ENV + '=alpha';
+  Environment[5] := TEST_FPC_FAIL_ENTRY_ENV + '=alpha';
   try
     RunResult := RunLwptWithWorkerEnv(['build', 'alpha'], Project,
       Environment);
@@ -1106,7 +1106,7 @@ begin
     Expect<Boolean>(Pos('FAIL alpha ', RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('alpha-begin|alpha-end|', RunResult.Stdout)
       > Pos('FAIL alpha ', RunResult.Stdout)).ToBe(True);
-    Expect<Boolean>(Pos('target "alpha" failed: FAILED (fpc exit 17)',
+    Expect<Boolean>(Pos('build entry "alpha" failed: FAILED (fpc exit 17)',
       RunResult.Stderr) > 0).ToBe(True);
     Expect<Boolean>(Pos('summary: 0 built, 1 failed, 0 skipped; elapsed ',
       RunResult.Stdout) > 0).ToBe(True);
@@ -1148,15 +1148,15 @@ begin
     TestInFlightSourceChangeRefusesPublication);
   Test('in-flight workspace changes refuse stale publication',
     TestInFlightWorkspaceChangeRefusesPublication);
-  Test('one invocation overlaps independent ready targets',
-    TestOneInvocationRunsReadyTargetsInParallel);
-  Test('--jobs=1 runs ready targets sequentially',
-    TestJobsOneRunsTargetsSequentially);
+  Test('one invocation overlaps independent ready entries',
+    TestOneInvocationRunsReadyEntriesInParallel);
+  Test('--jobs=1 runs ready entries sequentially',
+    TestJobsOneRunsEntriesSequentially);
   Test('failed prerequisite blocks only its dependants',
     TestFailedPrerequisiteBlocksOnlyDependants);
   Test('observable builds heartbeat and serialize verbose logs',
     TestObservableBuildHeartbeatAndVerboseLogs);
-  Test('fully contended builds heartbeat while targets are queued',
+  Test('fully contended builds heartbeat while entries are queued',
     TestFullyContendedBuildEmitsHeartbeat);
   Test('build failures replay and preserve isolated logs',
     TestBuildFailureReplaysAndPreservesIsolatedLog);
@@ -1195,8 +1195,8 @@ end;
 
 function RunCompilerProxy: Integer;
 var
-  Compiler, ReadyDir, ReleasePath, ReleaseDir, TargetName,
-    FailTarget: string;
+  Compiler, ReadyDir, ReleasePath, ReleaseDir, EntryName,
+    FailEntry: string;
   IsVersionQuery: Boolean;
   Process: TProcess;
   Started: TDateTime;
@@ -1206,7 +1206,7 @@ begin
   ReadyDir := GetEnvironmentVariable(TEST_FPC_READY_DIR_ENV);
   ReleasePath := GetEnvironmentVariable(TEST_FPC_RELEASE_ENV);
   ReleaseDir := GetEnvironmentVariable(TEST_FPC_RELEASE_DIR_ENV);
-  FailTarget := GetEnvironmentVariable(TEST_FPC_FAIL_TARGET_ENV);
+  FailEntry := GetEnvironmentVariable(TEST_FPC_FAIL_ENTRY_ENV);
   DelayMilliseconds := StrToIntDef(
     GetEnvironmentVariable(TestFPCDelayMillisecondsEnvironment), 0);
   IsVersionQuery := False;
@@ -1214,18 +1214,18 @@ begin
     if ParamStr(i) = VersionQueryArgument then IsVersionQuery := True;
   if not IsVersionQuery then
   begin
-    TargetName := ChangeFileExt(ExtractFileName(ParamStr(ParamCount)), '');
+    EntryName := ChangeFileExt(ExtractFileName(ParamStr(ParamCount)), '');
     if ReadyDir <> '' then
     begin
       ForceDirectories(ReadyDir);
       WriteTextFile(IncludeTrailingPathDelimiter(ReadyDir)
-        + 'ready-' + TargetName + '-' + IntToStr(GetProcessID), 'ready');
+        + 'ready-' + EntryName + '-' + IntToStr(GetProcessID), 'ready');
     end;
     if ReleaseDir <> '' then
-      ReleasePath := IncludeTrailingPathDelimiter(ReleaseDir) + TargetName;
+      ReleasePath := IncludeTrailingPathDelimiter(ReleaseDir) + EntryName;
     if GetEnvironmentVariable(TestFPCOutputEnvironment) = '1' then
     begin
-      Write(TargetName, '-begin|');
+      Write(EntryName, '-begin|');
       Flush(Output);
     end;
     if DelayMilliseconds > 0 then Sleep(DelayMilliseconds);
@@ -1241,10 +1241,10 @@ begin
     end;
     if GetEnvironmentVariable(TestFPCOutputEnvironment) = '1' then
     begin
-      Write(TargetName, '-end|');
+      Write(EntryName, '-end|');
       Flush(Output);
     end;
-    if SameText(TargetName, FailTarget) then Exit(17);
+    if SameText(EntryName, FailEntry) then Exit(17);
   end;
 
   Process := TProcess.Create(nil);

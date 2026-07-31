@@ -48,6 +48,7 @@ commit_parsers = [
   # Skip noise.
   { message = "^Merge branch",        skip = true },
   { message = "^Merge pull request",  skip = true },
+  { message = "^Merge commit from fork",  skip = true },
   { message = "^Update CHANGELOG",    skip = true },
   { message = "^chore\\(release\\):", skip = true },
 
