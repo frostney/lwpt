@@ -56,6 +56,7 @@ const
   CAPTURE_STDERR_PREFIX = 'stderr-begin:';
   CAPTURE_STDERR_SUFFIX = ':stderr-end';
   WAIT_TIMEOUT_MILLISECONDS = 10000;
+  SCRATCH_DELETE_TIMEOUT_MILLISECONDS = 2000;
 
 type
   TStateRootUtilityResult = record
@@ -80,6 +81,7 @@ type
   TWorkerBudgetProcesses = class(TTestSuite)
   private
     FScratch : string;
+    procedure DeleteScratch;
     procedure ResetScratch;
     function StartChild(const ASession, AWorktree, AAcquired,
       ARelease: string; ARequestedWorkers: Integer = 1): TProcess;
@@ -899,9 +901,32 @@ begin
     WORKER_STALE_SECONDS_ENV + '=' + TEST_STALE_SECONDS);
 end;
 
+procedure TWorkerBudgetProcesses.DeleteScratch;
+var
+  Started : QWord;
+begin
+  Started := GetTickCount64;
+  repeat
+    try
+      RecursiveDelete(FScratch);
+      Exit;
+    except
+      on Exception do
+      begin
+        { A reaped Windows process can briefly retain its working-directory
+          handle. Retry that teardown window, but keep persistent leaks fatal. }
+        if GetTickCount64 - Started
+           >= QWord(SCRATCH_DELETE_TIMEOUT_MILLISECONDS) then
+          raise;
+        Sleep(25);
+      end;
+    end;
+  until False;
+end;
+
 procedure TWorkerBudgetProcesses.ResetScratch;
 begin
-  RecursiveDelete(FScratch);
+  DeleteScratch;
   ForceDirectories(FScratch + '/state');
   ForceDirectories(FScratch + '/worktree-a');
   ForceDirectories(FScratch + '/worktree-b');
@@ -1147,7 +1172,7 @@ end;
 
 procedure TWorkerBudgetProcesses.AfterAll;
 begin
-  RecursiveDelete(FScratch);
+  DeleteScratch;
 end;
 
 procedure TWorkerBudgetProcesses.BeforeEach;
