@@ -57,6 +57,7 @@ const
   CAPTURE_STDERR_SUFFIX = ':stderr-end';
   WAIT_TIMEOUT_MILLISECONDS = 10000;
   SCRATCH_DELETE_TIMEOUT_MILLISECONDS = 2000;
+  SCRATCH_DELETE_RETRY_MILLISECONDS = 25;
 
 type
   TStateRootUtilityResult = record
@@ -904,6 +905,8 @@ end;
 procedure TWorkerBudgetProcesses.DeleteScratch;
 var
   Started : QWord;
+  Elapsed : QWord;
+  Remaining : QWord;
 begin
   Started := GetTickCount64;
   repeat
@@ -915,10 +918,17 @@ begin
       begin
         { A reaped Windows process can briefly retain its working-directory
           handle. Retry that teardown window, but keep persistent leaks fatal. }
+        Elapsed := GetTickCount64 - Started;
+        if Elapsed >= QWord(SCRATCH_DELETE_TIMEOUT_MILLISECONDS) then
+          raise;
+        Remaining := QWord(SCRATCH_DELETE_TIMEOUT_MILLISECONDS) - Elapsed;
+        if Remaining > QWord(SCRATCH_DELETE_RETRY_MILLISECONDS) then
+          Sleep(SCRATCH_DELETE_RETRY_MILLISECONDS)
+        else
+          Sleep(Integer(Remaining));
         if GetTickCount64 - Started
            >= QWord(SCRATCH_DELETE_TIMEOUT_MILLISECONDS) then
           raise;
-        Sleep(25);
       end;
     end;
   until False;
