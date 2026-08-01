@@ -5,7 +5,7 @@ description: >-
   pushes scoped fixes, replies inline, and watches for follow-up findings.
 license: MIT
 compatibility: Requires git, gh (GitHub CLI), and Node.js installed.
-allowed-tools: Bash(npx agent-reviews@1.0.2 *) Bash(pnpm dlx agent-reviews@1.0.2 *) Bash(yarn dlx agent-reviews@1.0.2 *) Bash(bunx agent-reviews@1.0.2 *) Bash(gh pr view --json *) Bash(git branch --show-current) Bash(git rev-parse HEAD) Bash(git status --short) Bash(git diff -- *) Bash(git diff --cached -- *) Bash(git add -p -- *)
+allowed-tools: Bash(npx agent-reviews@1.0.2 *) Bash(pnpm dlx agent-reviews@1.0.2 *) Bash(yarn dlx agent-reviews@1.0.2 *) Bash(bunx agent-reviews@1.0.2 *) Bash(gh pr view --json *) Bash(git branch --show-current) Bash(git rev-parse HEAD) Bash(git status --short) Bash(git diff -- *) Bash(git diff --cached -- *) Bash(git add --intent-to-add -- *) Bash(git add -p -- *)
 metadata:
   upstream: https://github.com/pbakaus/agent-reviews
   upstream-skill-version: "1.0.2"
@@ -30,7 +30,9 @@ Use `agent-reviews@1.0.2` for every invocation. The examples use
    that `git branch --show-current` is not the PR base branch, and that
    `git rev-parse HEAD` equals the PR head SHA. Record that SHA.
 2. Capture the pre-review index and worktree state with `git status --short`,
-   `git diff --cached`, and `git diff`. Preserve every pre-existing change.
+   `git diff --cached`, and `git diff`, including every untracked path. If the
+   baseline is not clean, stop before editing and report the exact paths; never
+   absorb pre-existing work into a review-fix commit.
 3. Run `npx agent-reviews@1.0.2 --unanswered --expanded`. In version 1.0.2,
    any reply marks a comment answered; treat that reply as completion for the
    initial filter even when GitHub still displays the thread as unresolved.
@@ -56,14 +58,21 @@ fix reply; report the failed validation instead.
 
 If this review pass changed files:
 
-1. Compare each candidate hunk with the captured pre-review state.
+1. Compare both staged and unstaged candidate diffs with the captured baseline,
+   and record every untracked path created by the review fix.
 2. Stage only review-generated hunks with `git add -p -- <review-fix-files>`.
    Never stage a whole touched path when it contained a pre-existing change.
    Stop if the relevant hunks cannot be separated unambiguously.
-3. Use the project `update-pr` workflow to commit and push the staged review
+3. For a verified new file created by the review fix, obtain explicit user
+   approval, run `git add --intent-to-add -- <new-files>`, and then select its
+   review-generated contents with `git add -p -- <new-files>`.
+4. Inspect `git diff --cached -- <review-fix-files>` and `git status --short`.
+   Proceed only when the index contains all and only verified review fixes and
+   no unrelated staged or untracked path can enter the commit.
+5. Use the project `update-pr` workflow to commit and push the staged review
    fixes. This skill deliberately grants no raw commit or push command.
-4. Never amend, skip hooks, rebase, or force-push.
-5. Capture the commit hash for inline replies.
+6. Never amend, skip hooks, rebase, or force-push.
+7. Capture the commit hash for inline replies.
 
 If every finding was false positive or already addressed, skip staging,
 commit, and push. Replies in that case must not claim a new commit exists.
