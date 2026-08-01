@@ -85,12 +85,6 @@
       "skillPath": "project-structure/SKILL.md",
       "computedHash": "fd37d4c0d0f0d37e9bce9125a231db3622046ad3f891a1ada825643e97f24832"
     },
-    "resolve-reviews": {
-      "source": "pbakaus/agent-reviews",
-      "sourceType": "github",
-      "skillPath": "skills/resolve-reviews/SKILL.md",
-      "computedHash": "69d4d3389e626faa719849ffa52fb17ec96e59be88d658323d534dd8f2a41d4a"
-    },
     "review-pr": {
       "source": "frostney/known-good-route",
       "sourceType": "github",
