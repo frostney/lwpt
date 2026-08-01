@@ -5,7 +5,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 ## Executive Summary
 
 - **FPC 3.2.2 is pinned for v1.** Verify live with `fpc -iV` before any change that depends on FPC behavior — memory and prior conversation are not acceptable sources.
-- **Lefthook 2.x runs the pre-commit hook.** Local pre-commit runs `lwpt format` (auto-fix, with `stage_fixed: true`); the heavyweight gates (`lwpt build` + `lwpt test` + `lwpt format --check`) run on the PR workflow in CI. Install with `lefthook install`.
+- **Lefthook 2.x runs the pre-commit hook.** Local pre-commit runs `lwpt format` and `lwpt agents` with `stage_fixed: true`; the heavyweight gates (`lwpt format --check` + `lwpt build` + `lwpt agents --check` + `lwpt test`) run on the PR workflow in CI. Install with `lefthook install`.
 - **Build configuration uses the worker-budget environment too.** Alongside
   `LWPT_CACHE_DIR`, `FPC_TARGET_CPU`, and `PATH`, builds consume the
   `LWPT_WORKER_*` settings below. `--jobs=<n>` is the invocation ceiling; the
@@ -41,9 +41,13 @@ pre-commit:
       glob: "*.{pas,inc,dpr,toml}"
       run: ./build/lwpt format
       stage_fixed: true
+    agents:
+      glob: "*.{pas,toml,md}"
+      run: ./build/lwpt agents
+      stage_fixed: true
 ```
 
-The local hook runs only the formatter (with `stage_fixed: true` so any rewrite is re-staged into the same commit). The heavyweight checks — `lwpt build` + `lwpt test` — run on the PR workflow rather than every local commit, keeping local commits fast and the pre-merge gate strict.
+The local hook refreshes formatting and the generated `AGENTS.md` command reference; both commands re-stage their changes. The heavyweight checks — `lwpt format --check` + `lwpt build` + `lwpt agents --check` + `lwpt test` — run on the PR workflow rather than every local commit, keeping local commits fast and the pre-merge gate strict.
 
 Install once per fresh clone: `lefthook install`.
 
@@ -65,14 +69,14 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `LWPT_FPC_UNIT_PATHS` | Path-separator-delimited unit directories appended as `-Fu`/`-Fi` to every compile (CI uses it for non-standard FPC installs; see the prose below) | unset |
 | `LWPT_HEARTBEAT_INTERVAL_MS` | Diagnostic tuning knob: build/test heartbeat interval; values are clamped to the default ceiling | `30000` |
 | `PATH` | Must contain `fpc`, `instantfpc`, `lefthook` | system default |
-| `LWPT_BUILD_TARGET` | Per-target postbuild hook context: selected target name | supplied by LWPT |
-| `LWPT_BUILD_OUTPUT` | Per-target postbuild hook context: session-private candidate path; transform this file before publication | supplied by LWPT |
-| `LWPT_BUILD_PUBLIC_OUTPUT` | Per-target postbuild hook context: requested manifest output path | supplied by LWPT |
+| `LWPT_BUILD_ENTRY` | Per-entry postbuild hook context: selected build-entry name | supplied by LWPT |
+| `LWPT_BUILD_OUTPUT` | Per-entry postbuild hook context: session-private candidate path; transform this file before publication | supplied by LWPT |
+| `LWPT_BUILD_PUBLIC_OUTPUT` | Per-entry postbuild hook context: requested manifest output path | supplied by LWPT |
 
 ## Machine-wide worker budget
 
 `LWPT.WorkerBudget` provides the capacity seam used by parallel schedulers.
-`lwpt build` acquires one lease per active target compiler, while `lwpt test`
+`lwpt build` acquires one lease per actively compiling build entry, while `lwpt test`
 requests up to one worker per runnable test. Both are capped by the effective
 machine budget, and `--jobs=N` sets a smaller invocation request.
 
@@ -157,7 +161,7 @@ If EXDEV failures are persistent and the fallback is too slow, ensure `.lwpt/` l
 
 `lwpt install` acquires a cross-process lock at `.lwpt/install.lock` before doing any work. On Unix, the file is created with `O_CREAT|O_EXCL` — the kernel guarantees only one process wins the create. A second concurrent `lwpt install` fails fast with `EConcurrencyError` naming the lock holder's PID. The lock is deleted by the normally-completing install; a crashed install leaves the lock file behind, and `lwpt repair` clears it.
 
-A Windows lock via `LockFileEx` lands alongside the Windows CI work. Until that ships, concurrent installs on Windows can race (the file is created but not enforced); the recommendation is to avoid concurrent installs in the same project.
+On Windows, LWPT opens the lock file and holds an exclusive `LockFileEx` byte-range lock for the transaction. A second concurrent install fails fast under the same `EConcurrencyError` contract; normal completion releases the OS lock and removes the file, while `lwpt repair` clears crash residue.
 
 At the start of every install, `.lwpt/tmp/` is wiped — any orphans from a previous interrupted run are reaped automatically. The orphans are never committed (`.lwpt/tmp/` is gitignored) so this is always safe.
 
@@ -167,7 +171,7 @@ Build and test sessions are project-local and process-owned. Each compiler
 invocation receives private executable and unit-output directories. A build
 captures a schema-versioned, compiler-neutral publication fingerprint covering
 the selected compiler identity, executable, and live version; the requested
-source/output/mode/target dimensions; the previous public-output content; and
+build-entry source/output/mode plus target-tuple dimensions; the previous public-output content; and
 the manifest, cfg, lockfile, implicit source directory,
 source/include/resource paths, and installed modules.
 
@@ -186,24 +190,24 @@ below the session for diagnosis. `--clean` means fresh session staging plus a
 forced compiler rebuild; it does not sweep `build/`, delete the running LWPT
 executable, or remove another process's output.
 
-Per-target postbuild hooks run before publication with the private candidate
+Per-entry postbuild hooks run before publication with the private candidate
 in `LWPT_BUILD_OUTPUT`, the requested path in `LWPT_BUILD_PUBLIC_OUTPUT`, and
-the target name in `LWPT_BUILD_TARGET`. Runtime retargeting also maps existing
+the entry name in `LWPT_BUILD_ENTRY`. Runtime retargeting also maps existing
 `{item.output}`-expanded hook fields to the private candidate. Hook failure
 keeps the candidate private, and hook definitions, scripts, and declared
 inputs are revalidated before publication. For dependency-free manifests, the
 whole-build postbuild hook runs against all staged outputs and gates batch
-publication. A declared target graph publishes prerequisites progressively;
+publication. A declared build-entry graph publishes prerequisites progressively;
 its whole-build postbuild runs once after all selected outputs publish. Unix lifecycle
 hooks use an InstantFPC cache below the owning session. Windows compiles those
 hooks directly into the same private hook root. Compiler directories use
 bounded readable prefixes plus hashes of their full source identities, so
 different paths cannot collide after sanitisation.
 
-Each session holds an OS owner guard from before it becomes visible until its
-final metadata and private contents are removed.
-`lwpt repair` removes only unlocked sessions and conservatively retains live
-guards even when their state file is malformed.
+Each session holds an OS owner guard from before it becomes visible until final
+state is written. Successful completion removes compiler jobs and compiled hooks
+but retains stable job logs; `lwpt repair` removes only unlocked sessions and
+conservatively retains live guards even when their state file is malformed.
 
 ## Deferred from v1
 

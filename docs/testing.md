@@ -1,6 +1,6 @@
 # Testing
 
-How LWPT tests itself: the four-tier policy, the mock HTTP server, the binary-fetch regression that catches the byte-truncation bug, the fixture strategy, and the initial test backlog.
+How LWPT tests itself: the four-tier policy, the mock HTTP server, the binary-fetch regression that catches the byte-truncation bug, the fixture strategy, and the current test inventory.
 
 ## Executive Summary
 
@@ -9,14 +9,14 @@ How LWPT tests itself: the four-tier policy, the mock HTTP server, the binary-fe
 - **The single most important test** is the HTTPClient binary-fetch regression in `packages/httpclient/source/HTTPClient.Test.pas`. It uses the mock HTTP server (`packages/httpclient/source/Tests.HTTPMockServer.pas`) to inject `#0` bytes into response headers and chunked bodies, deterministically pinning HTTPClient's byte-safe `AppendRawBytes` contract against regression.
 - **TestingPascalLibrary is the framework.** Lives in the `testing` workspace package per [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) (an earlier embedded-blob model extruded via `lwpt export testing` is retired). Each `*.Test.pas` is a self-contained program; `lwpt test` discovers it, validates a compiler-neutral request, compiles through the FPC driver, retains raw compiler output, stores normalized diagnostics, then runs a successful binary and reads its exit code.
 - **Fixtures are committed for small inputs (<100 KB).** Large artefacts are generated at test-run time from a deterministic seed so the repo stays small.
-- **Status:** mock server, fixtures, and the initial backlog (~10 files) are in place. The framework canary (tier-0 — "the testing framework itself works") lives in `packages/testing/source/TestingPascalLibrary.Test.pas`.
+- **Status:** the unit, integration, and E2E inventory is listed below; live `lwpt test` discovery is authoritative. The framework canary (tier-0 — "the testing framework itself works") lives in `packages/testing/source/TestingPascalLibrary.Test.pas`.
 
 ## The four tiers
 
 | Tier | Hits network? | Where | Runs in CI on every PR? | Runs in pre-commit hook? |
 | --- | --- | --- | --- | --- |
-| **Unit** | Never | Co-located in `source/` (`Foo.pas` ↔ `Foo.Test.pas`) | Yes | Yes (via `lwpt test`) |
-| **Integration** | Never (mock server + local fixtures) | `tests/integration/` | Yes | Yes |
+| **Unit** | Never | Co-located in `source/` (`Foo.pas` ↔ `Foo.Test.pas`) | Yes | No |
+| **Integration** | Never (mock server + local fixtures) | `tests/integration/` | Yes | No |
 | **E2E** | Sometimes (live hosts or loopback only) | `tests/e2e/` and package-owned `tests/e2e/` | Linux leg only (dedicated `pr.yml` step per #102); every platform post-merge via `ci.yml` | No |
 | **Manual / spike** | N/A | Anywhere maintainer wants | No | No |
 
@@ -191,7 +191,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`packages/testing/source/TestingPascalLibrary.Test.pas`** | 1 test in 1 suite | The framework canary, lives with the package per ADR-0015. Uses TPL at arm's length (one `Expect<Boolean>(True).ToBe(True)`) so that if TPL itself breaks, this file's failure narrows the blame instead of the suite reporting opaquely. Custom exit codes (10/11/12/13/14) for each plausible TPL initialisation failure mode. |
 | **`tests/integration/AddRemove.Test.pas`** | 7 tests in 1 suite | Exercises manifest mutation, install-before-write rollback, source-name derivation errors, update-in-place, and remove pruning without following local dependency links. |
 | **`tests/integration/BuildClean.Test.pas`** | 4 tests in 1 suite | Covers non-destructive clean behavior, preservation of unrelated files, a missing build directory, and Unix symlink boundaries. |
-| **`tests/integration/BuildMultiTarget.Test.pas`** | 13 unconditional tests in 1 suite, plus 1 Unix-only and 1 Darwin-only | Covers named/all-target selection, fail-fast target/graph/`--jobs` validation, per-target compiler-flag forwarding, the Darwin classic-linker path, private target/mode artifacts, collision-resistant job paths, non-destructive clean behavior, and continuing after per-target failures. |
+| **`tests/integration/BuildEntries.Test.pas`** | 13 unconditional tests in 1 suite, plus 1 Unix-only and 1 Darwin-only | Covers named/all-entry selection, fail-fast entry/graph/`--jobs` validation, per-entry compiler-flag forwarding, the Darwin classic-linker path, private entry/mode artifacts, collision-resistant job paths, non-destructive clean behavior, and continuing after per-entry failures. |
 | **`tests/integration/InstallLocalDiamond.Test.pas`** | 9 tests in 2 suites | **Full transitive-resolver run** over the canonical diamond graph (root → branch-a + branch-b → leaf-c) with path-syntax local sources (`"../a"`, `"../b"`, `"../c"`) so no network. Asserts lockfile + cfg + tree shape + idempotence + `--frozen` happy path, plus manifest-path invocation from a different cwd. **Tamper detection** — edits a file under `.lwpt/modules/leaf-c/`, runs `--frozen`, asserts `EVerifyError` naming the tree-hash mismatch + the dep; then re-runs install (non-frozen) and confirms `--frozen` succeeds again (the documented recovery). |
 | **`tests/integration/ExtractPathological.Test.pas`** | 14 tests in 2 suites | **Pathological ustar shapes** — baseline short path, > 100-char prefix-split, symlink deferred-link pass. **GNU 'L' long-name** — paths > 255 bytes (past ustar's prefix-split ceiling) wrapped in a GNU `'L'` typeflag header + body carrying the real name; the extractor's pending-long-name buffer carries the name across the header boundary. **Failure modes** — missing archive raises `EExtractError`, truncated gzip leaves Dest empty, invalid gzip magic same contract, tar truncated mid-entry never produces a byte-equal file. |
 | **`tests/integration/CLIOptions.Test.pas`** | 7 tests in 1 suite | Spawns `./build/lwpt` with various argv. `--help` + `-h` list every subcommand; unknown verb exits non-zero. Option-parsing regression: `build --mode release` (space-separated value) and `build --mode=release` (equals-separated value) must both parse to "release" and produce the same outcome. Invalid `--mode` value exits non-zero. Scratch project (tiny lwpt.toml + one trivial source) built in-test under `build/tests/tmp/cli-options-e2e/`. |
@@ -202,7 +202,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`tests/integration/InstallSymlinkCycle.Test.pas`** | 3 tests in 1 suite | Pins termination, single manifest discovery, and lockfile hashing when local dependency trees contain directory-symlink cycles. |
 | **`tests/integration/Repair.Test.pas`** | 5 tests in 1 suite | Spawns `lwpt repair` in scratch projects. Covers clean no-op behavior, stale install-lock removal, `.lwpt/tmp/` cleanup without touching committed module/archive state, failed build-session reclamation, and dead machine-wide worker-request reclamation with diagnostics. |
 | **`tests/integration/Scratch.Test.pas`** | 2 tests in 1 suite | Covers unique invocation-private scratch roots plus reaping of dead-owner roots without deleting live-owner state. |
-| **`tests/integration/BuildSessions.Test.pas`** | 12 tests in 1 suite | Uses the test executable as a controllable FPC proxy to cover concurrent sessions, stale publication, parallel ready targets, prerequisite publication ordering, `--jobs=1`, failure isolation, deterministic manifest-order results on Unix and Windows, heartbeat observability, and the fail-closed lost-proxy dispatch guard (redacted environment dump, exit 126). |
+| **`tests/integration/BuildSessions.Test.pas`** | 12 tests in 1 suite | Uses the test executable as a controllable FPC proxy to cover concurrent sessions, stale publication, parallel ready entries, prerequisite publication ordering, `--jobs=1`, failure isolation, deterministic manifest-order results on Unix and Windows, heartbeat observability, and the fail-closed lost-proxy dispatch guard (redacted environment dump, exit 126). |
 | **`tests/integration/Agents.Test.pas`** | 14 tests in 1 suite | Covers the `lwpt agents` command-reference generator: section synthesis from the live subcommand registry, `--check` drift detection, marker preservation, and idempotent regeneration. |
 | **`tests/integration/Run.Test.pas`** | 6 tests in 1 suite | Spawns `lwpt run` against scratch projects. Covers user-script execution and exit-code propagation, built-in aliasing with flag passthrough, unknown-script errors, list mode omitting retired `export`, and `export` as an allowed user script name. |
 | **`tests/integration/TestScheduling.Test.pas`** | 12 tests in 1 suite | Cross-platform subprocess coverage for default overlap, deterministic `--jobs=1` ordering, `--bail=0` override, compile failures counting toward bail, and the amended bail contract: stop new work, terminate and reap active children, and print sorted diagnostics. |
@@ -242,10 +242,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 14 | 294 |
-| Integration (`tests/integration/*.Test.pas`) | 18 | 150 |
+| Unit (`source/*.Test.pas` + package self-tests) | 14 | 313 |
+| Integration (`tests/integration/*.Test.pas`) | 18 | 152 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 6 | 29 |
-| **Total** | **38** | **473** |
+| **Total** | **38** | **494** |
 
 ### Planned testing work
 

@@ -4,7 +4,7 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 
 ## Executive Summary
 
-- **The contract:** single entry point from repo root (`./build/lwpt build`), default target = clean dev build of every binary, named targets as positional args, `--mode dev` (default) / `--mode release`, `--clean` flag, single `build/` output directory.
+- **The contract:** single entry point from repo root (`./build/lwpt build`), a clean development build of every binary by default, named build entries as positional args, `--mode dev` (default) / `--mode release`, `--clean` flag, single `build/` output directory.
 - **Self-host.** LWPT's own `lwpt.toml` declares `lwpt` as a `[build]` entry; `lwpt build` rebuilds the binary that just ran. See [ADR-0005](./adr/0005-self-host-build.md).
 - **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev translation in `TLWPTFPCCompilerDriver.BuildArguments`.
 - **Compiler output is invocation-private.** FPC executables and intermediates
@@ -20,7 +20,7 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   `TLWPTFPCCompilerDriver` translates it. The driver also normalizes diagnostics;
   raw FPC output remains available for log replay. Unsupported combinations are
   hard errors, with no compiler or target fallback. See ADR-0029.
-- **Dependency-aware parallel builds.** Independent ready targets run in
+- **Dependency-aware parallel builds.** Independent ready build entries run in
   parallel by default, bounded by `--jobs=<n>` and the machine-wide
   `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See
   [ADR-0023](./adr/0023-parallel-build-target-scheduler.md).
@@ -33,12 +33,12 @@ Every project on this stack satisfies the build-system contract from `native-nos
 | Contract item | How LWPT satisfies it |
 | --- | --- |
 | Single entry point from repo root | `./build/lwpt build` |
-| Default target = clean dev build of every binary | `lwpt build` (no args) builds every `[build]` entry in dev mode |
-| Named targets, positional args | `lwpt build cli` builds only `cli`; multiple targets supported by passing more positionals |
-| Bounded parallelism | Ready targets overlap by default; `--jobs=<n>` sets the invocation ceiling and the machine worker budget may lower it |
+| Clean development build of every binary by default | `lwpt build` (no args) builds every `[build]` entry in dev mode |
+| Named build entries as positional args | `lwpt build cli` builds only `cli`; multiple entries are selected by passing more positionals |
+| Bounded parallelism | Ready entries overlap by default; `--jobs=<n>` sets the invocation ceiling and the machine worker budget may lower it |
 | Dev / prod distinction | `--mode dev` (default) / `--mode release` |
-| `clean` as a target | `--clean` flag; combined: `lwpt build --clean cli` forces a full compile in fresh private staging |
-| Single public output directory | Completed binaries land at `<target>.output`, conventionally under `build/`; compiler intermediates remain session-private |
+| Clean selection | `--clean` flag; combined: `lwpt build --clean cli` forces a full compile in fresh private staging |
+| Single public output directory | Completed binaries land at the selected entry's `output`, conventionally under `build/`; compiler intermediates remain session-private |
 
 ## Self-host
 
@@ -140,8 +140,8 @@ shortform = "src/quicktool.pas"                   # bare-string shorthand
 
 - `source` (required): the program/`.dpr`/`.pas` file FPC compiles.
 - `output` (optional): the binary path; defaults to `ChangeFileExt(source, '')`. On Windows, `.exe` is appended automatically when missing.
-- `depends` (optional): targets that must publish successfully before this
-  target starts. Named builds include transitive prerequisites; unknown names
+- `depends` (optional): entries that must publish successfully before this
+  entry starts. Named builds include transitive prerequisites; unknown names
   and cycles fail before build work.
 - `flags` (optional): ordered compiler-driver arguments for this root-manifest
   entry. Each TOML string is passed as exactly one argument, so values are not
@@ -151,12 +151,12 @@ shortform = "src/quicktool.pas"                   # bare-string shorthand
   options that replace the selected compiler, request target, or
   session-private output paths are rejected. Build entries discovered in
   dependency manifests never contribute flags.
-- Target names become job-directory path segments inside a session, so the
+- Build-entry names become job-directory path segments inside a session, so the
   names `""`, `"."`, and `".."` are rejected at manifest load. Each segment
-  combines a bounded readable prefix with a hash of the full target identity,
+  combines a bounded readable prefix with a hash of the full entry identity,
   preventing sanitisation collisions without creating unbounded paths.
 
-LWPT's own `lwpt.toml` is the reference: one `lwpt` target.
+LWPT's own `lwpt.toml` is the reference: one `lwpt` build entry.
 
 ## Session staging and public outputs
 
@@ -164,9 +164,9 @@ Every `lwpt build` and `lwpt test` invocation creates a unique
 `.lwpt/sessions/s-<pid>-<timestamp>-<counter>-<n>/` directory (PID and
 timestamp base36-encoded — the slug prefixes every compiler staging path,
 and FPC's file API silently truncates paths over 255 characters, so each
-component stays short). Target job directories contain separate `bin/` and
+component stays short). Build-entry job directories contain separate `bin/` and
 `units/` children used for `-FE`, `-FU`, and `-o`. No two processes share
-writable compiler paths, even when they build the same target and mode in
+writable compiler paths, even when they build the same entry and mode in
 the same worktree. Before compiling, LWPT verifies the staging path plus
 the longest reachable unit name fits the 255-character budget and refuses
 the compile with an explanatory error when it cannot.
@@ -185,15 +185,15 @@ takes a short output-specific lock, combining an in-process critical section
 with an OS-held lock, and captures the same fingerprint again. Search-root
 hashing excludes `.lwpt/sessions/` and all declared build outputs, so a project
 that declares `units = ["."]` tracks compiler inputs without treating private
-staging or another target's publication as an input. Explicit file inputs are
+staging or another entry's publication as an input. Explicit file inputs are
 still hashed when they are also declared outputs. Workspace-package
 symlinks and junctions are followed, with physical-directory cycle detection.
 `LWPT_FPC_UNIT_PATHS` directories are content-hashed as both unit and include
 inputs. Changed input, compiler version, or the requested public-output
 generation means the result is stale: publication is refused and the candidate
-stays private. Per-target postbuild hooks receive `LWPT_BUILD_OUTPUT` for the
+stays private. Per-entry postbuild hooks receive `LWPT_BUILD_OUTPUT` for the
 private candidate, `LWPT_BUILD_PUBLIC_OUTPUT` for the requested manifest path,
-and `LWPT_BUILD_TARGET` for the target name. Existing `{item.output}`
+and `LWPT_BUILD_ENTRY` for the entry name. Existing `{item.output}`
 references in their script, arguments, inputs, and staleness output are
 retargeted to the private candidate at execution time when the expanded path
 is a complete path token. Related paths such as `build/app.json` are not
@@ -204,10 +204,11 @@ postbuild as the final gate before batch publication. A declared graph
 publishes prerequisites progressively so dependants start only after successful
 publication; its whole-build postbuild consequently runs once after all
 selected outputs publish. Artifact transformations therefore belong in the
-per-target hook. See ADR-0023.
+per-entry hook. See ADR-0023.
 
-Successful sessions are removed immediately. Failed, stale, or interrupted
-sessions remain private and diagnosable. `lwpt repair` removes inactive
+Successful sessions remove compiler jobs and compiled hooks but retain stable
+job logs and completed state for diagnosis. Failed, stale, or interrupted
+sessions retain their private diagnostics. `lwpt repair` removes inactive
 sessions only after their OS-held owner guard is absent; malformed state fails
 closed while its guard remains held. Artifact reuse is deliberately absent
 here and belongs to the content-addressed cache work.
@@ -253,17 +254,18 @@ build-foo = { script = "scripts/bar.pas",
 
 If `instantfpc` is not on `PATH`, the failure names the generator script and recommends installing InstantFPC (bundled with FPC).
 
-LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) removed the embedded-blob model + the hook; today's root manifest declares no hooks at all.
+LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) removed that embedded-blob hook. The current root manifest instead declares the `[prebuild]` `stamp-version` hook, which derives `source/Version.inc` from `lwpt.toml`.
 
 ## Pre-commit hook (Lefthook)
 
-The pre-commit gate at the repo root in `lefthook.yml` runs one command:
+The pre-commit gate at the repo root in `lefthook.yml` runs two commands:
 
 | Command | Glob | Fires on |
 | --- | --- | --- |
 | `format` | `*.{pas,inc,dpr,toml}` | Any staged Pascal source or manifest |
+| `agents` | `*.{pas,toml,md}` | Anything that can affect the generated `AGENTS.md` command reference |
 
-The hook uses `stage_fixed: true`, so any file the formatter rewrites is auto-staged back into the same commit — local pre-commit never blocks unless the formatter cannot parse a file.
+Both commands use `stage_fixed: true`, so formatter rewrites and generated command-reference refreshes are staged back into the same commit. A missing bootstrap binary or malformed agents marker remains an actionable failure.
 
 Install once per fresh clone:
 
@@ -271,11 +273,11 @@ Install once per fresh clone:
 lefthook install
 ```
 
-The heavyweight gates — `lwpt format --check` + `lwpt build` + `lwpt test` — run on the PR workflow in CI (`.github/workflows/pr.yml`) rather than every local commit. This keeps local commits fast and the pre-merge gate strict.
+The heavyweight gates — `lwpt format --check` + `lwpt build` + `lwpt agents --check` + `lwpt test` — run on the PR workflow in CI (`.github/workflows/pr.yml`) rather than every local commit. This keeps local commits fast and the pre-merge gate strict.
 
 Do **not** bypass with `git commit --no-verify` unless a maintainer explicitly authorises it on the PR.
 
-The three deferred customer-facing stack contracts ([link-check #31](https://github.com/frostney/lwpt/issues/31), [duplication #32](https://github.com/frostney/lwpt/issues/32), and [codebase-health #33](https://github.com/frostney/lwpt/issues/33)) are explicitly *not* in the v1 pre-commit gate per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md). They plug in when their workstreams land. Architecture drift is instead checked for LWPT itself during release preparation; it is not a consumer command. Parallel, process-safe, observable builds and tests are tracked in [issue #28](https://github.com/frostney/lwpt/issues/28).
+The three deferred customer-facing stack contracts ([link-check #31](https://github.com/frostney/lwpt/issues/31), [duplication #32](https://github.com/frostney/lwpt/issues/32), and [codebase-health #33](https://github.com/frostney/lwpt/issues/33)) are explicitly *not* in the v1 pre-commit gate per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md). They plug in when their workstreams land. Architecture drift is instead checked for LWPT itself during release preparation; it is not a consumer command. [Issue #28](https://github.com/frostney/lwpt/issues/28) delivered parallel, process-safe, observable builds and tests through private sessions and the shared worker budget.
 
 ## Machine-wide worker capacity
 

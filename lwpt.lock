@@ -5,33 +5,33 @@ version = 3
 source = "workspace:auto"
 resolvedRef = ""
 resolvedURL = ""
-computedHash = "sha256:3d193621c7497bd05dd0aa663f6482935c71a732f826ffa4e3089a97d02cd662"
+computedHash = "sha256:f3959d1d6338f8d521539bb0e08d8dcd07a0a526b9ffcac1cfb5a393990ac2a7"
 archiveHash = ""
 
 [package.httpclient]
 source = "workspace:auto"
 resolvedRef = ""
 resolvedURL = ""
-computedHash = "sha256:f32788746e8ece9db358bc3f76f05b230a16f3a5a4c681e4b2e2e1b5e17f0b15"
+computedHash = "sha256:583372825c3ea0494f75fae534a0dffaba5e7c42d199e73ad577b129b17be1a6"
 archiveHash = ""
 
 [package.semver]
 source = "workspace:auto"
 resolvedRef = ""
 resolvedURL = ""
-computedHash = "sha256:cf0f6ef3882065f0ab508baa6ec4f5c077f08581235ea28865c93afcdcb4d723"
+computedHash = "sha256:79165ea106001cd802e6034d6184dd040639186ee92b08db5b368cf8f98497b7"
 archiveHash = ""
 
 [package.testing]
 source = "workspace:auto"
 resolvedRef = ""
 resolvedURL = ""
-computedHash = "sha256:84bdec764c00df79bec40d10d3ff8d666e398a18b1aa5bea76f94fae49a82449"
+computedHash = "sha256:976be2ecd2f4a5b67dbc3030b747c39a9edc2a1040d4430816e1a8cbbc0b2d70"
 archiveHash = ""
 
 [package.toml]
 source = "workspace:auto"
 resolvedRef = ""
 resolvedURL = ""
-computedHash = "sha256:9e7759b15a78db47fc3dfc21d73dee1d3e42cec11d26ebc4e8c33c6532d6f5e6"
+computedHash = "sha256:55fa81614de5d62cf9303d46fa9b5c0ac67fe8c925ace116757795757ea22b49"
 archiveHash = ""

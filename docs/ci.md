@@ -1,6 +1,6 @@
 # CI
 
-Four GitHub Actions workflows, mirroring the GocciaScript pattern that LWPT's vendored units came from. The split is **build once on macOS / test natively on every target**.
+Four GitHub Actions workflows, mirroring the GocciaScript pattern used by the packages now canonical in LWPT. The split is **build once on macOS / test natively on every target**.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|

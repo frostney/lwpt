@@ -1870,7 +1870,7 @@ begin
         chain posture". Dep manifests' hook sections are silently
         dropped; unknown-section warnings are suppressed (CI noise
         without a user fix); placeholder expansion is skipped (no
-        per-target context applies to dep-graph traversal). }
+        per-entry context applies to dep-graph traversal). }
       ChildMan := LoadManifest(ChildManifestPath, False);
       { Copy the dep's units list into the resolved node so the cfg
         emitter knows which subdirs hold the .pas files. Without

@@ -825,7 +825,7 @@ begin
   end;
 end;
 
-{ Test sources become session staging keys the same way build targets do.
+{ Test sources become session staging keys the same way build entries do.
   Distinct sources sharing one key would silently share compiler staging —
   the interference the private-session design exists to rule out — so the
   scheduler refuses the run before any worker starts, mirroring the build

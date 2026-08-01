@@ -32,19 +32,19 @@ than weakening or duplicating its gates.
   modifying the tag-triggered release pipeline. Those belong to
   `/create-release` and CI.
 
-## Process safety before issue #28 lands
+## Process safety
 
-LWPT's build and test runners are not yet safe for concurrent agents in one
-worktree. Until GitHub issue #28 is implemented:
+[Issue #28](https://github.com/frostney/lwpt/issues/28) delivered private build
+and test sessions, process-owned publication locks, observable jobs, and a
+shared worker budget across invocations and worktrees.
 
-- Only the root agent may invoke `fpc`, `bootstrap`, `lwpt build`, or
-  `lwpt test` during release preparation.
-- Run compiling commands sequentially, never concurrently.
-- Subagents may perform read-only source, workflow, documentation, and ADR
-  audits. Explicitly forbid them from compiling, testing, formatting, cleaning,
-  or writing files.
-- If another build or test process is already active in this worktree, wait for
-  it to finish before starting the verification gate.
+- Run this workflow's compiling commands sequentially so each reported gate
+  result maps to one exact repository state.
+- Before starting the verification gate, inspect active build/test processes
+  and session paths. Concurrent valid runs are safe, but may consume the shared
+  worker budget; let them finish rather than restarting them as suspected hangs.
+- Never delete or reuse another invocation's session. `lwpt repair` reclaims
+  only residue whose OS-held owner guard is absent.
 
 ## Flow
 

@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+
+fail()
+{
+  printf '%s\n' "current-pr-reviews: $1" >&2
+  exit 1
+}
+
+repository_root=$(git rev-parse --show-toplevel 2>/dev/null) ||
+  fail 'not inside a git repository'
+cd "$repository_root"
+
+current_branch=$(git branch --show-current)
+[ -n "$current_branch" ] || fail 'detached HEAD is not supported'
+
+pr_number=$(gh pr view --json number --jq '.number') ||
+  fail 'no pull request found for the current branch'
+pr_state=$(gh pr view --json state --jq '.state')
+pr_head_branch=$(gh pr view --json headRefName --jq '.headRefName')
+pr_head_sha=$(gh pr view --json headRefOid --jq '.headRefOid')
+pr_base_branch=$(gh pr view --json baseRefName --jq '.baseRefName')
+current_sha=$(git rev-parse HEAD)
+
+[ "$pr_state" = 'OPEN' ] || fail "PR #$pr_number is not open"
+[ "$current_branch" = "$pr_head_branch" ] ||
+  fail "current branch does not match PR #$pr_number"
+[ "$current_branch" != "$pr_base_branch" ] ||
+  fail 'refusing to run on the PR base branch'
+[ "$current_sha" = "$pr_head_sha" ] ||
+  fail "current HEAD does not match PR #$pr_number"
+
+[ "$#" -ge 1 ] || fail 'missing operation'
+operation=$1
+shift
+
+case "$operation" in
+  unanswered)
+    [ "$#" -eq 0 ] || fail 'unanswered takes no arguments'
+    exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --unanswered --expanded
+    ;;
+  unresolved)
+    [ "$#" -eq 0 ] || fail 'unresolved takes no arguments'
+    exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --unresolved --expanded
+    ;;
+  watch)
+    [ "$#" -eq 0 ] || fail 'watch takes no arguments'
+    exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --watch --interval 30 --timeout 600
+    ;;
+  reply)
+    [ "$#" -ge 2 ] || fail 'reply requires an ID and message'
+    [ "$#" -le 3 ] || fail 'reply accepts only ID, message, and --resolve'
+    comment_id=$1
+    message=$2
+    case "$comment_id" in
+      ''|*[!0-9]*) fail 'comment ID must be numeric' ;;
+    esac
+    if [ "$#" -eq 3 ]; then
+      [ "$3" = '--resolve' ] || fail 'the only optional argument is --resolve'
+      exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --reply "$comment_id" "$message" --resolve
+    fi
+    exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --reply "$comment_id" "$message"
+    ;;
+  *)
+    fail 'operation must be unanswered, unresolved, watch, or reply'
+    ;;
+esac

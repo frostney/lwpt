@@ -133,14 +133,14 @@ type
   end;
   THookArray = array of THook;
 
-  TBuildTarget = record
+  TLWPTBuildEntry = record
     Name      : string;            { logical name, e.g. "cli" }
     Source    : string;            { entry-point .pas/.dpr path }
     Output    : string;            { optional output binary path }
-    Depends   : TStringArray;      { prerequisite target names (ADR-0023) }
+    Depends   : TStringArray;      { prerequisite entry names (ADR-0023) }
     Flags     : TStringArray;      { ordered compiler-driver arguments }
-    PreBuild  : THookArray;        { per-target prebuild hooks (ADR-0011) }
-    PostBuild : THookArray;        { per-target postbuild hooks (ADR-0011) }
+    PreBuild  : THookArray;        { per-entry prebuild hooks (ADR-0011) }
+    PostBuild : THookArray;        { per-entry postbuild hooks (ADR-0011) }
   end;
 
   TManifest = record
@@ -150,7 +150,7 @@ type
     Includes: array of string;   { -Fi dirs }
     FpcFlags: array of string;
     Deps    : array of TDependency;
-    Targets : array of TBuildTarget;  { [targets] entries for `lwpt build` }
+    BuildEntries : array of TLWPTBuildEntry; { [build] entries for `lwpt build` }
     VersionIncOut : string;      { [version] output: generated .inc path }
     VersionPrefix : string;      { [version] constant prefix, default BAKED }
     { Whole-build/run lifecycle hooks (ADR-0011). Each pair fires
@@ -634,16 +634,16 @@ begin
 end;
 
 { Read an array-of-strings TOML field from an inline-table node into
-  the target dynamic array (cleared first). Skips non-string entries
+  the output dynamic array (cleared first). Skips non-string entries
   silently; defensive against future reader changes that might admit
   mixed-type arrays. Used by ParseTableDep for include / exclude. }
 procedure ReadGlobArray(ANode: TTOMLNode; const AKey: string;
-  var ATarget: TStringArray);
+  var AValues: TStringArray);
 var
   ArrNode, Item: TTOMLNode;
   i, n: Integer;
 begin
-  SetLength(ATarget, 0);
+  SetLength(AValues, 0);
   ArrNode := TomlGet(ANode, AKey);
   if not TomlIsArray(ArrNode) then Exit;
   for i := 0 to ArrNode.Items.Count - 1 do
@@ -651,9 +651,9 @@ begin
     Item := ArrNode.Items[i];
     if TomlIsString(Item) then
     begin
-      n := Length(ATarget);
-      SetLength(ATarget, n + 1);
-      ATarget[n] := Item.ScalarText;
+      n := Length(AValues);
+      SetLength(AValues, n + 1);
+      AValues[n] := Item.ScalarText;
     end;
   end;
 end;
@@ -661,34 +661,34 @@ end;
 { Build dependencies affect scheduler correctness, so malformed values must
   fail instead of silently dropping graph edges. }
 procedure ReadStrictStringArray(ANode: TTOMLNode; const AKey, APath: string;
-  var ATarget: TStringArray);
+  var AValues: TStringArray);
 var
   ArrNode: TTOMLNode;
   i: Integer;
 begin
-  SetLength(ATarget, 0);
+  SetLength(AValues, 0);
   ArrNode := TomlGet(ANode, AKey);
   if ArrNode = nil then Exit;
   if not TomlIsArray(ArrNode) then
     raise EManifestError.CreateFmt('%s must be an array of strings', [APath]);
-  SetLength(ATarget, ArrNode.Items.Count);
+  SetLength(AValues, ArrNode.Items.Count);
   for i := 0 to ArrNode.Items.Count - 1 do
   begin
     if not TomlIsString(ArrNode.Items[i]) then
       raise EManifestError.CreateFmt(
         '%s[%d] must be a string', [APath, i]);
-    ATarget[i] := ArrNode.Items[i].ScalarText;
+    AValues[i] := ArrNode.Items[i].ScalarText;
   end;
 end;
 
 procedure ReadStrictNonEmptyStringArray(ANode: TTOMLNode;
-  const AKey, APath: string; var ATarget: TStringArray);
+  const AKey, APath: string; var AValues: TStringArray);
 var
   i: Integer;
 begin
-  ReadStrictStringArray(ANode, AKey, APath, ATarget);
-  for i := 0 to High(ATarget) do
-    if ATarget[i] = '' then
+  ReadStrictStringArray(ANode, AKey, APath, AValues);
+  for i := 0 to High(AValues) do
+    if AValues[i] = '' then
       raise EManifestError.CreateFmt(
         '%s[%d] must not be empty', [APath, i]);
 end;
@@ -867,7 +867,7 @@ end;
 { ===========================================================================
   Placeholder interpolation (ADR-0012) — expand {name} tokens in manifest
   string fields after parsing. Two-pass: (1) project + build context
-  everywhere; (2) per-target context inside per-target hook fields.
+  everywhere; (2) per-entry context inside per-entry hook fields.
 
   Syntax: single {ident} braces; doubled {{ }} escapes to a literal { }.
   Unknown placeholder name is a manifest-load error with the field path,
@@ -1203,15 +1203,15 @@ begin
   end;
 end;
 
-{ [build] target names become path segments inside private build
+{ [build] entry names become path segments inside private build
   sessions. Quoted TOML keys can be any string, so reject empty and
   dot segments before staging. Root manifests only: a dependency's
-  [build] targets are never built by the consumer. }
-procedure ValidateTargetName(const AName: string);
+  [build] entries are never built by the consumer. }
+procedure ValidateBuildEntryName(const AName: string);
 begin
   if (AName = '') or (AName = '.') or (AName = '..') then
     raise EManifestError.CreateFmt(
-      'invalid [build] target name "%s" — a target name must not be '
+      'invalid [build] entry name "%s" — an entry name must not be '
       + 'empty, ".", or ".."', [AName]);
 end;
 
@@ -1227,7 +1227,7 @@ const
     policy on equal footing with [teddybear]. }
   KNOWN_SECTIONS: array[0..14] of string = (
     'package', 'dependencies', 'sources', 'build', 'version',
-    'lwpt', 'format', 'test', 'workspaces',
+    PROGRAM_NAME, 'format', 'test', 'workspaces',
     'preinstall', 'postinstall', 'prebuild', 'postbuild',
     'pretest', 'posttest');
   { Reserved section names — names that, if declared as a top-level
@@ -1253,25 +1253,25 @@ const
       [dependencies] (recognised, parsed for all manifests, never
       runnable). }
     'package', 'dependencies', 'sources', 'workspaces',
-    'version', 'lwpt', 'format', 'generated');
+    'version', PROGRAM_NAME, 'format', 'generated');
 var
   Root, Deps, DepNode, ArrNode : TTOMLNode;
-  TgtsNode, TgtNode, VerNode   : TTOMLNode;
+  BuildNode, EntryNode, VerNode   : TTOMLNode;
   LwptCfgNode, FmtNode, TestNode, BailNode, ExclArr : TTOMLNode;
   SourcesNode, SourceEntry     : TTOMLNode;
   Parser   : TTOMLParser;
   Pair     : TTOMLNodeMap.TKeyValuePair;
   i, j, n  : Integer;
   D        : TDependency;
-  T        : TBuildTarget;
+  Entry        : TLWPTBuildEntry;
   CS       : TCustomSource;
   Hook     : THook;
   Ctx      : TPlaceholderCtx;
   IsKnown  : Boolean;
   BailValue: Int64;
   k        : Integer;
-  TgtCtx   : TPlaceholderCtx;
-  TgtPath  : string;
+  EntryCtx   : TPlaceholderCtx;
+  EntryPath  : string;
 begin
   { Reset Result explicitly. Pascal's `function F: TRecord` returns
     by value via a hidden var argument in FPC's calling convention;
@@ -1506,57 +1506,57 @@ begin
       end;
     end;
 
-    TgtsNode := TomlGet(Root, 'build');
-    if TomlIsTable(TgtsNode) then
+    BuildNode := TomlGet(Root, 'build');
+    if TomlIsTable(BuildNode) then
     begin
-      if TomlIsString(TomlGet(TgtsNode, 'source')) then
+      if TomlIsString(TomlGet(BuildNode, 'source')) then
       begin
         { Single-entry shorthand. The item gets name = package
           name; output defaults to "build/<name>" when absent. }
-        T := Default(TBuildTarget);
-        T.Name   := Result.Name;
-        if AIsRoot then ValidateTargetName(T.Name);
-        T.Source := TomlStr(TgtsNode, 'source', '');
-        T.Output := TomlStr(TgtsNode, 'output', '');
-        ReadStrictStringArray(TgtsNode, 'depends', 'build.depends',
-          T.Depends);
+        Entry := Default(TLWPTBuildEntry);
+        Entry.Name   := Result.Name;
+        if AIsRoot then ValidateBuildEntryName(Entry.Name);
+        Entry.Source := TomlStr(BuildNode, 'source', '');
+        Entry.Output := TomlStr(BuildNode, 'output', '');
+        ReadStrictStringArray(BuildNode, 'depends', 'build.depends',
+          Entry.Depends);
         if AIsRoot then
-          ReadStrictNonEmptyStringArray(TgtsNode, 'flags', 'build.flags',
-            T.Flags);
-        if T.Output = '' then T.Output := 'build/' + Result.Name;
-        ParseHookSection(TomlGet(TgtsNode, 'prebuild'),
-          'build.prebuild', T.PreBuild);
-        ParseHookSection(TomlGet(TgtsNode, 'postbuild'),
-          'build.postbuild', T.PostBuild);
-        SetLength(Result.Targets, 1);
-        Result.Targets[0] := T;
+          ReadStrictNonEmptyStringArray(BuildNode, 'flags', 'build.flags',
+            Entry.Flags);
+        if Entry.Output = '' then Entry.Output := 'build/' + Result.Name;
+        ParseHookSection(TomlGet(BuildNode, 'prebuild'),
+          'build.prebuild', Entry.PreBuild);
+        ParseHookSection(TomlGet(BuildNode, 'postbuild'),
+          'build.postbuild', Entry.PostBuild);
+        SetLength(Result.BuildEntries, 1);
+        Result.BuildEntries[0] := Entry;
       end
       else
-        for Pair in TgtsNode.Children do
+        for Pair in BuildNode.Children do
         begin
-          TgtNode := Pair.Value;
-          T := Default(TBuildTarget);
-          T.Name := Pair.Key;
-          if AIsRoot then ValidateTargetName(T.Name);
-          if TomlIsString(TgtNode) then
-            T.Source := TgtNode.ScalarText  { item-name = "path.pas" }
-          else if TomlIsTable(TgtNode) then
+          EntryNode := Pair.Value;
+          Entry := Default(TLWPTBuildEntry);
+          Entry.Name := Pair.Key;
+          if AIsRoot then ValidateBuildEntryName(Entry.Name);
+          if TomlIsString(EntryNode) then
+            Entry.Source := EntryNode.ScalarText  { item-name = "path.pas" }
+          else if TomlIsTable(EntryNode) then
           begin
-            T.Source := TomlStr(TgtNode, 'source', '');
-            T.Output := TomlStr(TgtNode, 'output', '');
-            ReadStrictStringArray(TgtNode, 'depends',
-              'build.' + T.Name + '.depends', T.Depends);
+            Entry.Source := TomlStr(EntryNode, 'source', '');
+            Entry.Output := TomlStr(EntryNode, 'output', '');
+            ReadStrictStringArray(EntryNode, 'depends',
+              'build.' + Entry.Name + '.depends', Entry.Depends);
             if AIsRoot then
-              ReadStrictNonEmptyStringArray(TgtNode, 'flags',
-                'build.' + T.Name + '.flags', T.Flags);
-            ParseHookSection(TomlGet(TgtNode, 'prebuild'),
-              'build.' + T.Name + '.prebuild', T.PreBuild);
-            ParseHookSection(TomlGet(TgtNode, 'postbuild'),
-              'build.' + T.Name + '.postbuild', T.PostBuild);
+              ReadStrictNonEmptyStringArray(EntryNode, 'flags',
+                'build.' + Entry.Name + '.flags', Entry.Flags);
+            ParseHookSection(TomlGet(EntryNode, 'prebuild'),
+              'build.' + Entry.Name + '.prebuild', Entry.PreBuild);
+            ParseHookSection(TomlGet(EntryNode, 'postbuild'),
+              'build.' + Entry.Name + '.postbuild', Entry.PostBuild);
           end;
-          j := Length(Result.Targets);
-          SetLength(Result.Targets, j + 1);
-          Result.Targets[j] := T;
+          j := Length(Result.BuildEntries);
+          SetLength(Result.BuildEntries, j + 1);
+          Result.BuildEntries[j] := Entry;
         end;
     end;
 
@@ -1572,7 +1572,7 @@ begin
 
     { [lwpt] — toolkit-state overrides. Empty string in the slot means
       "use the default" from the LWPT_DIR / MODULES_DIR / ... constants. }
-    LwptCfgNode := TomlGet(Root, 'lwpt');
+    LwptCfgNode := TomlGet(Root, PROGRAM_NAME);
     if TomlIsTable(LwptCfgNode) then
     begin
       Result.ModulesDirOverride  := TomlStr(LwptCfgNode, 'modules-dir', '');
@@ -1678,10 +1678,10 @@ begin
       end;
 
       { Placeholder pass (ADR-0012). Two stages: project + build
-        vars first across targets + whole-build hooks; then per-
-        target vars across each target's per-target hook fields. The
-        per-target source/output gets the project-only namespace
-        (no recursive {target.*} placeholder in its own value). }
+        variables first across entries + whole-build hooks; then per-entry
+        variables across each entry's hook fields. The per-entry
+        source/output gets only {item.name}; its other item fields would be
+        recursive. }
       Ctx := Default(TPlaceholderCtx);
       Ctx.PackageName  := Result.Name;
       Ctx.PackageVer   := Result.Version;
@@ -1693,16 +1693,16 @@ begin
         to {item.source} / {item.output} (those would be circular
         references to the field being resolved). The whole-build
         hooks below get neither. }
-      for i := 0 to High(Result.Targets) do
+      for i := 0 to High(Result.BuildEntries) do
       begin
-        TgtCtx := Ctx;
-        TgtCtx.HasItemName := True;
-        TgtCtx.ItemName    := Result.Targets[i].Name;
-        TgtPath := 'build.' + Result.Targets[i].Name;
-        Result.Targets[i].Source :=
-          ExpandPlaceholders(Result.Targets[i].Source, TgtCtx, TgtPath + '.source');
-        Result.Targets[i].Output :=
-          ExpandPlaceholders(Result.Targets[i].Output, TgtCtx, TgtPath + '.output');
+        EntryCtx := Ctx;
+        EntryCtx.HasItemName := True;
+        EntryCtx.ItemName    := Result.BuildEntries[i].Name;
+        EntryPath := 'build.' + Result.BuildEntries[i].Name;
+        Result.BuildEntries[i].Source :=
+          ExpandPlaceholders(Result.BuildEntries[i].Source, EntryCtx, EntryPath + '.source');
+        Result.BuildEntries[i].Output :=
+          ExpandPlaceholders(Result.BuildEntries[i].Output, EntryCtx, EntryPath + '.output');
       end;
 
       ExpandHookArray(Result.PreInstall,  Ctx, 'preinstall');
@@ -1721,19 +1721,19 @@ begin
         {item.output} all bound to post-pass-1 values). Whole-
         build hooks ran with HasItemName=False so {item.*} was
         a hard error there. }
-      for i := 0 to High(Result.Targets) do
+      for i := 0 to High(Result.BuildEntries) do
       begin
-        TgtCtx := Ctx;
-        TgtCtx.HasItemName   := True;
-        TgtCtx.HasItemFields := True;
-        TgtCtx.ItemName      := Result.Targets[i].Name;
-        TgtCtx.ItemSource    := Result.Targets[i].Source;
-        TgtCtx.ItemOutput    := Result.Targets[i].Output;
-        TgtPath := 'build.' + Result.Targets[i].Name;
-        ExpandHookArray(Result.Targets[i].PreBuild,  TgtCtx,
-          TgtPath + '.prebuild');
-        ExpandHookArray(Result.Targets[i].PostBuild, TgtCtx,
-          TgtPath + '.postbuild');
+        EntryCtx := Ctx;
+        EntryCtx.HasItemName   := True;
+        EntryCtx.HasItemFields := True;
+        EntryCtx.ItemName      := Result.BuildEntries[i].Name;
+        EntryCtx.ItemSource    := Result.BuildEntries[i].Source;
+        EntryCtx.ItemOutput    := Result.BuildEntries[i].Output;
+        EntryPath := 'build.' + Result.BuildEntries[i].Name;
+        ExpandHookArray(Result.BuildEntries[i].PreBuild,  EntryCtx,
+          EntryPath + '.prebuild');
+        ExpandHookArray(Result.BuildEntries[i].PostBuild, EntryCtx,
+          EntryPath + '.postbuild');
       end;
     end;
   finally

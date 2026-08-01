@@ -7,10 +7,10 @@
        input.
     3. The whole-build [postbuild] hook sees staged outputs before
        publication.
-    4. A per-target [postbuild] hook sees the private candidate before
+    4. A per-entry [postbuild] hook sees the private candidate before
        the public output exists.
     5. Related paths containing the output name are not retargeted.
-    6. A failing per-target [postbuild] hook leaves no public output.
+    6. A failing per-entry [postbuild] hook leaves no public output.
     7. A failing whole-build [postbuild] hook leaves no public output.
     8. [pretest] hook runs before `lwpt test`.
     9. [posttest] hook runs even when no tests are discovered.
@@ -52,9 +52,9 @@ type
     procedure TestPrebuildShorthandRuns;
     procedure TestPrebuildStalenessGateSkipsSecondRun;
     procedure TestPostbuildRunsAfterBuild;
-    procedure TestTargetPostbuildUsesPrivateCandidate;
-    procedure TestTargetPostbuildKeepsRelatedPath;
-    procedure TestFailingTargetPostbuildDoesNotPublish;
+    procedure TestEntryPostbuildUsesPrivateCandidate;
+    procedure TestEntryPostbuildKeepsRelatedPath;
+    procedure TestFailingEntryPostbuildDoesNotPublish;
     procedure TestFailingWholePostbuildDoesNotPublish;
     procedure TestPretestRunsBeforeTest;
     procedure TestPosttestRunsWhenNoTestsDiscovered;
@@ -192,7 +192,7 @@ begin
   Expect<Boolean>(SentinelExists('sentinel-postbuild.txt')).ToBe(True);
 end;
 
-procedure THooksE2E.TestTargetPostbuildUsesPrivateCandidate;
+procedure THooksE2E.TestEntryPostbuildUsesPrivateCandidate;
 var R: TLwptResult;
 begin
   SetupScratchProject('');
@@ -227,7 +227,7 @@ begin
     .ToBe(True);
 end;
 
-procedure THooksE2E.TestTargetPostbuildKeepsRelatedPath;
+procedure THooksE2E.TestEntryPostbuildKeepsRelatedPath;
 var R: TLwptResult;
 begin
   SetupScratchProject('');
@@ -254,7 +254,7 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
 end;
 
-procedure THooksE2E.TestFailingTargetPostbuildDoesNotPublish;
+procedure THooksE2E.TestFailingEntryPostbuildDoesNotPublish;
 var R: TLwptResult;
 begin
   SetupScratchProject('');
@@ -386,12 +386,12 @@ begin
     TestPrebuildStalenessGateSkipsSecondRun);
   Test('[postbuild] sees staged outputs before publication',
     TestPostbuildRunsAfterBuild);
-  Test('target postbuild receives the private candidate before publication',
-    TestTargetPostbuildUsesPrivateCandidate);
-  Test('target postbuild keeps paths that only contain the output name',
-    TestTargetPostbuildKeepsRelatedPath);
-  Test('failing target postbuild leaves the public output untouched',
-    TestFailingTargetPostbuildDoesNotPublish);
+  Test('entry postbuild receives the private candidate before publication',
+    TestEntryPostbuildUsesPrivateCandidate);
+  Test('entry postbuild keeps paths that only contain the output name',
+    TestEntryPostbuildKeepsRelatedPath);
+  Test('failing entry postbuild leaves the public output untouched',
+    TestFailingEntryPostbuildDoesNotPublish);
   Test('failing whole-build postbuild leaves the public output untouched',
     TestFailingWholePostbuildDoesNotPublish);
   Test('[pretest] runs before lwpt test',

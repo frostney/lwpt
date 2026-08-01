@@ -500,7 +500,7 @@ begin
     Driver.BareProbeOutput := '3.2.2 linux x86_64';
     Driver.DispatchedProbeOutput := '3.2.2 linux aarch64';
     { The env-to-request wiring is one GetEnvironmentVariable line,
-      integration-covered by BuildMultiTarget with real subprocess
+      integration-covered by BuildEntries with real subprocess
       environment; faking process env here is not portable (on Linux
       the RTL reads its startup snapshot, so setenv is invisible).
       Apply the override to the request directly -- the exact value an

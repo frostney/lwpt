@@ -2,7 +2,7 @@
 #
 # Shared with GocciaScript (CLI.Options + CLI.Parser + CLI.Help); LWPT-canonical per ADR-0017
 # with LWPT-original units bolted on (CLI.Subcommands + CLI.Prompts).
-# Graduated into a standalone LWPT package per ADR-0014. The
+# Established as an in-monorepo LWPT package per ADR-0014. The
 # previously-named-exception treatment (TGoccia prefix stripped, dead
 # code dropped) moves with the units to this package.
 #
