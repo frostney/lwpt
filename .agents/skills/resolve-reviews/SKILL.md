@@ -20,16 +20,17 @@ CLI and scopes every commit to files changed while addressing review findings.
 
 ## Package runner
 
-Use `scripts/current-pr-reviews` for every invocation. The wrapper pins
-`agent-reviews@1.0.2`, rejects arbitrary PR or repository targets, and verifies
-the open PR, current branch, and exact head before the CLI can read or mutate a
-review thread.
+Use `.agents/skills/resolve-reviews/scripts/current-pr-reviews` for every
+invocation. The wrapper pins `agent-reviews@1.0.2`, rejects arbitrary PR or
+repository targets, and verifies the open PR, current branch, and exact head
+before the CLI can read or mutate a review thread.
 
 ## Phase 1: fetch and evaluate
 
-1. Run `scripts/current-pr-reviews unanswered`. Its identity guard verifies an
-   open pull request for the current checkout, a non-base branch, and an exact
-   PR-head match before returning comments. Record that head SHA.
+1. Run `.agents/skills/resolve-reviews/scripts/current-pr-reviews unanswered`.
+   Its identity guard verifies an open pull request for the current checkout, a
+   non-base branch, and an exact PR-head match before returning comments. Record
+   that head SHA.
 2. Capture the pre-review index and worktree state with `git status --short`,
    `git diff --cached`, and `git diff`, including every untracked path. If the
    baseline is not clean, stop before editing and report the exact paths; never
@@ -82,7 +83,7 @@ commit, and push. Replies in that case must not claim a new commit exists.
 ## Phase 3: reply inline
 
 Reply to every processed inline comment with
-`scripts/current-pr-reviews reply <id> "<outcome>"`.
+`.agents/skills/resolve-reviews/scripts/current-pr-reviews reply <id> "<outcome>"`.
 
 - Fresh fix: name the commit and summarize the fix; leave the thread open for
   reviewer verification.
@@ -96,7 +97,7 @@ Reply to every processed inline comment with
 Run:
 
 ```sh
-scripts/current-pr-reviews watch
+.agents/skills/resolve-reviews/scripts/current-pr-reviews watch
 ```
 
 When the watcher finds new comments, repeat the evaluation, validation,

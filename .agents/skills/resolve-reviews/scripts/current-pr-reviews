@@ -37,15 +37,15 @@ shift
 case "$operation" in
   unanswered)
     [ "$#" -eq 0 ] || fail 'unanswered takes no arguments'
-    exec npx --yes agent-reviews@1.0.2 --unanswered --expanded
+    exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --unanswered --expanded
     ;;
   unresolved)
     [ "$#" -eq 0 ] || fail 'unresolved takes no arguments'
-    exec npx --yes agent-reviews@1.0.2 --unresolved --expanded
+    exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --unresolved --expanded
     ;;
   watch)
     [ "$#" -eq 0 ] || fail 'watch takes no arguments'
-    exec npx --yes agent-reviews@1.0.2 --watch --interval 30 --timeout 600
+    exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --watch --interval 30 --timeout 600
     ;;
   reply)
     [ "$#" -ge 2 ] || fail 'reply requires an ID and message'
@@ -57,9 +57,9 @@ case "$operation" in
     esac
     if [ "$#" -eq 3 ]; then
       [ "$3" = '--resolve' ] || fail 'the only optional argument is --resolve'
-      exec npx --yes agent-reviews@1.0.2 --reply "$comment_id" "$message" --resolve
+      exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --reply "$comment_id" "$message" --resolve
     fi
-    exec npx --yes agent-reviews@1.0.2 --reply "$comment_id" "$message"
+    exec npx --yes agent-reviews@1.0.2 --pr "$pr_number" --reply "$comment_id" "$message"
     ;;
   *)
     fail 'operation must be unanswered, unresolved, watch, or reply'
