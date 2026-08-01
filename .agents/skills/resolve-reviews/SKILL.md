@@ -5,7 +5,7 @@ description: >-
   pushes scoped fixes, replies inline, and watches for follow-up findings.
 license: MIT
 compatibility: Requires git, gh (GitHub CLI), and Node.js installed.
-allowed-tools: Bash(npx agent-reviews@1.0.2 *) Bash(pnpm dlx agent-reviews@1.0.2 *) Bash(yarn dlx agent-reviews@1.0.2 *) Bash(bunx agent-reviews@1.0.2 *) Bash(gh pr view --json *) Bash(git branch --show-current) Bash(git rev-parse HEAD) Bash(git status --short) Bash(git diff -- *) Bash(git diff --cached -- *) Bash(git add --intent-to-add -- *) Bash(git add -p -- *)
+allowed-tools: Bash(.agents/skills/resolve-reviews/scripts/current-pr-reviews *) Bash(git status --short) Bash(git diff -- *) Bash(git diff --cached -- *) Bash(git add --intent-to-add -- *) Bash(git add -p -- *)
 metadata:
   upstream: https://github.com/pbakaus/agent-reviews
   upstream-skill-version: "1.0.2"
@@ -20,22 +20,24 @@ CLI and scopes every commit to files changed while addressing review findings.
 
 ## Package runner
 
-Use `agent-reviews@1.0.2` for every invocation. The examples use
-`npx agent-reviews@1.0.2`; substitute the same pinned package with
-`pnpm dlx`, `yarn dlx`, or `bunx` when the project requires another runner.
+Use `scripts/current-pr-reviews` for every invocation. The wrapper pins
+`agent-reviews@1.0.2`, rejects arbitrary PR or repository targets, and verifies
+the open PR, current branch, and exact head before the CLI can read or mutate a
+review thread.
 
 ## Phase 1: fetch and evaluate
 
-1. Verify that `gh pr view` finds an open pull request for the current checkout,
-   that `git branch --show-current` is not the PR base branch, and that
-   `git rev-parse HEAD` equals the PR head SHA. Record that SHA.
+1. Run `scripts/current-pr-reviews unanswered`. Its identity guard verifies an
+   open pull request for the current checkout, a non-base branch, and an exact
+   PR-head match before returning comments. Record that head SHA.
 2. Capture the pre-review index and worktree state with `git status --short`,
    `git diff --cached`, and `git diff`, including every untracked path. If the
    baseline is not clean, stop before editing and report the exact paths; never
    absorb pre-existing work into a review-fix commit.
-3. Run `npx agent-reviews@1.0.2 --unanswered --expanded`. In version 1.0.2,
-   any reply marks a comment answered; treat that reply as completion for the
-   initial filter even when GitHub still displays the thread as unresolved.
+3. Evaluate the expanded unanswered comments returned by the wrapper. In
+   version 1.0.2, any reply marks a comment answered; treat that reply as
+   completion for the initial filter even when GitHub still displays the
+   thread as unresolved.
 4. Read the referenced code and repository contracts before judging each
    comment.
 5. Classify bot comments as true positive, false positive, or uncertain.
@@ -80,7 +82,7 @@ commit, and push. Replies in that case must not claim a new commit exists.
 ## Phase 3: reply inline
 
 Reply to every processed inline comment with
-`npx agent-reviews@1.0.2 --reply <id> "<outcome>"`.
+`scripts/current-pr-reviews reply <id> "<outcome>"`.
 
 - Fresh fix: name the commit and summarize the fix; leave the thread open for
   reviewer verification.
@@ -94,7 +96,7 @@ Reply to every processed inline comment with
 Run:
 
 ```sh
-npx agent-reviews@1.0.2 --watch --interval 30 --timeout 600
+scripts/current-pr-reviews watch
 ```
 
 When the watcher finds new comments, repeat the evaluation, validation,
