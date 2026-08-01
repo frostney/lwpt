@@ -1,6 +1,27 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.4.0] - 2026-08-01
+
+### Bug Fixes
+
+- fix(test): retry transient worker scratch cleanup (#124)
+- fix(test): classify latest-release resolution failures (#119)
+- fix(core): normalize tree-hash path separators for cross-platform lockfiles (#116)
+- fix(format): exclude toolkit state by default (#111)
+
+### Internal
+
+- chore: synchronize release readiness contracts (#125)
+- ci: restore Windows E2E and frozen installs (#123)
+- ci(pr): gate e2e on the Linux leg and add a native aarch64-darwin leg (#115)
+
+### New Features
+
+- feat(build): support per-target compiler flags (#121)
+- feat(init): adopt existing manifests (#120)
+- feat(build): move FPC compilation and capability probing behind the driver seam (#118)
+- feat(workers): fall back to a repo-local state dir when the default is unwritable (#117)
 ## [0.3.0] - 2026-07-21
 
 ### Bug Fixes
