@@ -222,8 +222,8 @@ var
   R : TLwptResult;
   Prefix, StderrText : string;
 begin
-  R := RunLwpt(['agents', '--check']);
-  Prefix := CompletionPrefix('agents', 'completed in ');
+  R := RunLwpt(['build', '--help']);
+  Prefix := CompletionPrefix('build', 'completed in ');
   StderrText := Trim(R.Stderr);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Integer>(CountOccurrences(R.Stderr, Prefix)).ToBe(1);
@@ -247,13 +247,13 @@ end;
 procedure TCLIOptionsE2E.TestRunAliasReportsResolvedCommand;
 var
   R : TLwptResult;
-  AgentsPrefix, RunPrefix : string;
+  BuildPrefix, RunPrefix : string;
 begin
-  R := RunLwpt(['run', 'agents', '--check']);
-  AgentsPrefix := CompletionPrefix('agents', 'completed in ');
+  R := RunLwpt(['run', 'build', '--help']);
+  BuildPrefix := CompletionPrefix('build', 'completed in ');
   RunPrefix := CompletionPrefix('run', 'completed in ');
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Integer>(CountOccurrences(R.Stderr, AgentsPrefix)).ToBe(1);
+  Expect<Integer>(CountOccurrences(R.Stderr, BuildPrefix)).ToBe(1);
   Expect<Integer>(CountOccurrences(R.Stderr, RunPrefix)).ToBe(0);
 end;
 
