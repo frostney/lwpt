@@ -50,6 +50,8 @@ end;
 
 procedure RaiseFromCompletion(const ACompletion: TSubcommandCompletion);
 begin
+  Inc(CompletionCount);
+  CapturedCompletion := ACompletion;
   raise Exception.Create('completion callback failed');
 end;
 
@@ -105,12 +107,19 @@ end;
 function RunRaisingCompletionScenario: Integer;
 var
   Registry : TSubcommandRegistry;
+  RunExitCode : Integer;
 begin
+  CompletionCount := 0;
   Registry := BuildRegistry;
   try
     Registry.Find('alpha').Handler := @NonzeroHandler;
     Registry.OnCommandCompleted := @RaiseFromCompletion;
-    Result := Registry.Run('fixture');
+    RunExitCode := Registry.Run('fixture');
+    if RunExitCode <> NONZERO_HANDLER_EXIT_CODE then Exit(8);
+    if CompletionCount <> 1 then Exit(9);
+    if CapturedCompletion.CommandName <> 'alpha' then Exit(10);
+    if CapturedCompletion.ExitCode <> NONZERO_HANDLER_EXIT_CODE then Exit(11);
+    Result := RunExitCode;
   finally
     Registry.Free;
   end;
