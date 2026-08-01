@@ -51,6 +51,40 @@ uses
   LWPT.Core,
   LWPT.ProcessTree;
 
+const
+  MILLISECONDS_PER_CENTISECOND = 10;
+  CENTISECONDS_PER_SECOND = 100;
+
+function FormatElapsedMilliseconds(const AMilliseconds: QWord): string;
+var
+  TotalCentiseconds, Seconds, Centiseconds : QWord;
+  CentisecondsText : string;
+begin
+  TotalCentiseconds := (AMilliseconds
+    + (MILLISECONDS_PER_CENTISECOND div 2))
+    div MILLISECONDS_PER_CENTISECOND;
+  Seconds := TotalCentiseconds div CENTISECONDS_PER_SECOND;
+  Centiseconds := TotalCentiseconds mod CENTISECONDS_PER_SECOND;
+  CentisecondsText := IntToStr(Centiseconds);
+  if Length(CentisecondsText) = 1 then
+    CentisecondsText := '0' + CentisecondsText;
+  Result := IntToStr(Seconds) + '.' + CentisecondsText + 's';
+end;
+
+procedure ReportCommandCompletion(
+  const ACompletion: TSubcommandCompletion);
+var
+  StatusText : string;
+begin
+  if ACompletion.ExitCode = 0 then
+    StatusText := 'completed in '
+  else
+    StatusText := 'failed after ';
+  Flush(Output);
+  WriteLn(ErrOutput, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
+    StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds));
+end;
+
 function ErrPrefix(const ASubcommand: string): string; inline;
 begin
   Result := PROGRAM_NAME + ' ' + ASubcommand + ': ';
@@ -445,6 +479,8 @@ begin
 
   Registry := TSubcommandRegistry.Create;
   try
+    Registry.OnCommandCompleted := @ReportCommandCompletion;
+
     SetLength(InstallOpts, 1);
     InstallOpts[0] := TFlagOption.Create('frozen',
       'CI mode: refuse to update the lockfile, refuse network, verify hashes');

@@ -14,6 +14,7 @@ program CLI.Subcommands.Test;
 
 uses
   Classes,
+  Process,
   SysUtils,
 
   CLI.Options,
@@ -22,13 +23,26 @@ uses
 
 type
   TSubcommandRegistrySuite = class(TTestSuite)
+  private
+    function RunCompletionChild: Integer;
   public
     procedure SetupTests; override;
     procedure TestCountAndItemFollowRegistrationOrder;
     procedure TestFindReturnsTheRegisteredObject;
     procedure TestItemExposesOptionObjects;
     procedure TestItemOutOfRangeRaises;
+    procedure TestCompletionCallbackReceivesDispatchMetadata;
   end;
+
+var
+  CompletionCount : Integer = 0;
+  CapturedCompletion : TSubcommandCompletion;
+
+procedure CaptureCompletion(const ACompletion: TSubcommandCompletion);
+begin
+  Inc(CompletionCount);
+  CapturedCompletion := ACompletion;
+end;
 
 function StubHandler(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
@@ -49,6 +63,44 @@ begin
     @StubHandler, NoOpts));
   Result.Add(TSubcommand.Create('beta', 'second summary', '',
     @StubHandler, BetaOpts));
+end;
+
+function RunCompletionScenario: Integer;
+var
+  Registry : TSubcommandRegistry;
+  RunExitCode : Integer;
+begin
+  CompletionCount := 0;
+  Registry := BuildRegistry;
+  try
+    Registry.OnCommandCompleted := @CaptureCompletion;
+    RunExitCode := Registry.Run('fixture');
+    if RunExitCode <> 0 then Exit(1);
+    if CompletionCount <> 1 then Exit(2);
+    if CapturedCompletion.CommandName <> 'alpha' then Exit(3);
+    if CapturedCompletion.ExitCode <> 0 then Exit(4);
+    Result := 0;
+  finally
+    Registry.Free;
+  end;
+end;
+
+function TSubcommandRegistrySuite.RunCompletionChild: Integer;
+var
+  ProcessInstance : TProcess;
+begin
+  ProcessInstance := TProcess.Create(nil);
+  try
+    ProcessInstance.Executable := ExpandFileName(ParamStr(0));
+    ProcessInstance.Parameters.Add('alpha');
+    ProcessInstance.Options := [poWaitOnExit];
+    ProcessInstance.Execute;
+    Result := ProcessInstance.ExitCode;
+    if (Result = 0) and (ProcessInstance.ExitStatus <> 0) then
+      Result := ProcessInstance.ExitStatus;
+  finally
+    ProcessInstance.Free;
+  end;
 end;
 
 procedure TSubcommandRegistrySuite.TestCountAndItemFollowRegistrationOrder;
@@ -124,6 +176,11 @@ begin
   end;
 end;
 
+procedure TSubcommandRegistrySuite.TestCompletionCallbackReceivesDispatchMetadata;
+begin
+  Expect<Integer>(RunCompletionChild).ToBe(0);
+end;
+
 procedure TSubcommandRegistrySuite.SetupTests;
 begin
   Test('Count + Item iterate subcommands in registration order',
@@ -134,9 +191,17 @@ begin
     TestItemExposesOptionObjects);
   Test('Item raises EArgumentOutOfRangeException outside 0..Count-1',
     TestItemOutOfRangeRaises);
+  Test('completion callback receives resolved command metadata exactly once',
+    TestCompletionCallbackReceivesDispatchMetadata);
 end;
 
 begin
+  if (ParamCount = 1) and SameText(ParamStr(1), 'alpha') then
+  begin
+    ExitCode := RunCompletionScenario;
+    Exit;
+  end;
+
   TestRunnerProgram.AddSuite(TSubcommandRegistrySuite.Create(
     'CLI.Subcommands: registry iteration'));
   TestRunnerProgram.Run;

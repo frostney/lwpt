@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "code-review": {
+      "source": "frostney/known-good-route",
+      "sourceType": "github",
+      "skillPath": "code-review/SKILL.md",
+      "computedHash": "8d1c3f95d6778eed609c9cd8d567abde214232abdd2fb538bfd646e8609ed996"
+    },
     "codebase-design": {
       "source": "mattpocock/skills",
       "sourceType": "github",

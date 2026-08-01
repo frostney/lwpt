@@ -31,6 +31,17 @@ type
   TSubcommandHandler = function(const APositionals: TStringList;
     const AOptions: TOptionArray): Integer;
 
+  { Neutral dispatch metadata for hosts that need completion reporting.
+    The CLI package owns measurement and resolved command identity; the host
+    decides whether and how to present the result. }
+  TSubcommandCompletion = record
+    CommandName: string;
+    ExitCode: Integer;
+    ElapsedMilliseconds: QWord;
+  end;
+  TSubcommandCompletionHandler = procedure(
+    const ACompletion: TSubcommandCompletion);
+
   TSubcommand = class
   public
     Name     : string;
@@ -45,6 +56,7 @@ type
   TSubcommandRegistry = class
   private
     FItems : array of TSubcommand;
+    FOnCommandCompleted : TSubcommandCompletionHandler;
   public
     destructor Destroy; override;
     procedure Add(ASub: TSubcommand);
@@ -61,6 +73,8 @@ type
       ASub: TSubcommand);
     { Run argv. Returns the process exit code. }
     function Run(const AProgramName: string): Integer;
+    property OnCommandCompleted: TSubcommandCompletionHandler
+      read FOnCommandCompleted write FOnCommandCompleted;
   end;
 
 implementation
@@ -195,6 +209,8 @@ var
   Sub, AliasSub : TSubcommand;
   Positionals : TStringList;
   ParseStart : Integer;
+  StartedAt : QWord;
+  Completion : TSubcommandCompletion;
 begin
   if ParamCount < 1 then
   begin
@@ -217,53 +233,66 @@ begin
     Exit(1);
   end;
 
-  { `lwpt run <subcommand>` subcommand-aliasing (ADR-0013). If the
-    second positional is a registered subcommand, dispatch to THAT
-    subcommand directly with its args starting at argv[3]. The run
-    handler never sees this case — it only fires for user-defined
-    run-scripts (which are forbidden from shadowing subcommand names
-    by the manifest-load guard, so there's no ambiguity here). }
-  ParseStart := 1;
-  if (CmdName = 'run') and (ParamCount >= 2) then
-  begin
-    AliasSub := Find(LowerCase(ParamStr(2)));
-    if AliasSub <> nil then
-    begin
-      Sub := AliasSub;
-      ParseStart := 2;
-      CmdName := LowerCase(ParamStr(2));
-    end;
-  end;
-
-  { Intercept per-subcommand --help / -h before ParseCommandLine sees
-    them and reports "Unknown option". }
-  if WantsHelp then
-  begin
-    PrintSubcommandHelp(AProgramName, Sub);
-    Exit(0);
-  end;
-
-  { ParseCommandLine reads the real argv. We need it to see only argv[2..]
-    for normal dispatch, or argv[3..] for `lwpt run <subcmd>` aliasing.
-    The AStartArg parameter (added to CLI.Parser for this) gates that. }
+  StartedAt := GetTickCount64;
+  Result := 1;
   try
-    Positionals := ParseCommandLine(Sub.Options, ParseStart);
-  except
-    on E: TParseError do
-    begin
-      WriteLn(ErrOutput, AProgramName, ' ', CmdName, ': ', E.Message);
-      Exit(1);
-    end;
-  end;
 
-  try
-    { drop the leading positional (the subcommand name itself) }
-    if (Positionals.Count > 0)
-       and SameText(Positionals[0], CmdName) then
-      Positionals.Delete(0);
-    Result := Sub.Handler(Positionals, Sub.Options);
+    { `lwpt run <subcommand>` subcommand-aliasing (ADR-0013). If the
+      second positional is a registered subcommand, dispatch to THAT
+      subcommand directly with its args starting at argv[3]. The run
+      handler never sees this case — it only fires for user-defined
+      run-scripts (which are forbidden from shadowing subcommand names
+      by the manifest-load guard, so there's no ambiguity here). }
+    ParseStart := 1;
+    if (CmdName = 'run') and (ParamCount >= 2) then
+    begin
+      AliasSub := Find(LowerCase(ParamStr(2)));
+      if AliasSub <> nil then
+      begin
+        Sub := AliasSub;
+        ParseStart := 2;
+        CmdName := LowerCase(ParamStr(2));
+      end;
+    end;
+
+    { Intercept per-subcommand --help / -h before ParseCommandLine sees
+      them and reports "Unknown option". }
+    if WantsHelp then
+    begin
+      PrintSubcommandHelp(AProgramName, Sub);
+      Exit(0);
+    end;
+
+    { ParseCommandLine reads the real argv. We need it to see only argv[2..]
+      for normal dispatch, or argv[3..] for `lwpt run <subcmd>` aliasing.
+      The AStartArg parameter (added to CLI.Parser for this) gates that. }
+    try
+      Positionals := ParseCommandLine(Sub.Options, ParseStart);
+    except
+      on E: TParseError do
+      begin
+        WriteLn(ErrOutput, AProgramName, ' ', CmdName, ': ', E.Message);
+        Exit(1);
+      end;
+    end;
+
+    try
+      { drop the leading positional (the subcommand name itself) }
+      if (Positionals.Count > 0)
+         and SameText(Positionals[0], CmdName) then
+        Positionals.Delete(0);
+      Result := Sub.Handler(Positionals, Sub.Options);
+    finally
+      Positionals.Free;
+    end;
   finally
-    Positionals.Free;
+    if Assigned(FOnCommandCompleted) then
+    begin
+      Completion.CommandName := CmdName;
+      Completion.ExitCode := Result;
+      Completion.ElapsedMilliseconds := GetTickCount64 - StartedAt;
+      FOnCommandCompleted(Completion);
+    end;
   end;
 end;
 
