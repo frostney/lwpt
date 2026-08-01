@@ -39,6 +39,9 @@ var
   CompletionCount : Integer = 0;
   CapturedCompletion : TSubcommandCompletion;
 
+const
+  NONZERO_HANDLER_EXIT_CODE = 7;
+
 procedure CaptureCompletion(const ACompletion: TSubcommandCompletion);
 begin
   Inc(CompletionCount);
@@ -54,6 +57,12 @@ function StubHandler(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 begin
   Result := 0;
+end;
+
+function NonzeroHandler(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+begin
+  Result := NONZERO_HANDLER_EXIT_CODE;
 end;
 
 function BuildRegistry: TSubcommandRegistry;
@@ -77,6 +86,7 @@ var
   RunExitCode : Integer;
 begin
   CompletionCount := 0;
+  CapturedCompletion.ElapsedMilliseconds := High(QWord);
   Registry := BuildRegistry;
   try
     Registry.OnCommandCompleted := @CaptureCompletion;
@@ -85,6 +95,7 @@ begin
     if CompletionCount <> 1 then Exit(2);
     if CapturedCompletion.CommandName <> 'alpha' then Exit(3);
     if CapturedCompletion.ExitCode <> 0 then Exit(4);
+    if CapturedCompletion.ElapsedMilliseconds = High(QWord) then Exit(5);
     Result := 0;
   finally
     Registry.Free;
@@ -97,6 +108,7 @@ var
 begin
   Registry := BuildRegistry;
   try
+    Registry.Find('alpha').Handler := @NonzeroHandler;
     Registry.OnCommandCompleted := @RaiseFromCompletion;
     Result := Registry.Run('fixture');
   finally
@@ -205,7 +217,7 @@ end;
 
 procedure TSubcommandRegistrySuite.TestCompletionCallbackCannotReplaceDispatchResult;
 begin
-  Expect<Integer>(RunCompletionChild(True)).ToBe(0);
+  Expect<Integer>(RunCompletionChild(True)).ToBe(NONZERO_HANDLER_EXIT_CODE);
 end;
 
 procedure TSubcommandRegistrySuite.SetupTests;
