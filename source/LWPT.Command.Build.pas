@@ -76,7 +76,7 @@ type
     FManifestPath: string;
     FManifest: TManifest;
     FManifestContentHash: string;
-    FEntry: TBuildEntry;
+    FEntry: TLWPTBuildEntry;
     FRelease: Boolean;
     FClean: Boolean;
     FSession: TLWPTBuildSession;
@@ -96,7 +96,7 @@ type
   public
     constructor Create(const AManifestPath: string;
       const AManifest: TManifest; const AManifestContentHash: string;
-      const AEntry: TBuildEntry; const ARelease, AClean: Boolean;
+      const AEntry: TLWPTBuildEntry; const ARelease, AClean: Boolean;
       const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
       const ADriver: TLWPTCompilerDriver);
     destructor Destroy; override;
@@ -452,7 +452,7 @@ end;
 { Compile one build entry. Returns True on success. }
 function BuildOneEntry(const AManifestPath: string; const AMan: TManifest;
   const AManifestContentHash: string;
-  const T: TBuildEntry; ARelease, AClean: Boolean;
+  const T: TLWPTBuildEntry; ARelease, AClean: Boolean;
   ASession: TLWPTBuildSession; ACompiler: TLWPTCompilerProcess;
   ADriver: TLWPTCompilerDriver; out ACompiled: TLWPTCompiledEntry;
   out ABuildResult: TLWPTBuildResult; out AOutput: string): Boolean;
@@ -582,7 +582,7 @@ end;
 
 constructor TLWPTBuildJob.Create(const AManifestPath: string;
   const AManifest: TManifest; const AManifestContentHash: string;
-  const AEntry: TBuildEntry; const ARelease, AClean: Boolean;
+  const AEntry: TLWPTBuildEntry; const ARelease, AClean: Boolean;
   const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
   const ADriver: TLWPTCompilerDriver);
 begin
@@ -709,7 +709,7 @@ end;
 
 { Two build-entry names that sanitise to the same session job segment would
   share private output within one invocation. }
-function FindArtefactDirCollision(const AEntries: array of TBuildEntry;
+function FindArtefactDirCollision(const AEntries: array of TLWPTBuildEntry;
   out AFirst, ASecond: string): Boolean;
 var i, j: Integer;
 begin
@@ -725,7 +725,7 @@ begin
   Result := False;
 end;
 
-function FindBuildEntryIndex(const AEntries: array of TBuildEntry;
+function FindBuildEntryIndex(const AEntries: array of TLWPTBuildEntry;
   const AName: string): Integer;
 var i: Integer;
 begin
@@ -734,7 +734,7 @@ begin
   Result := -1;
 end;
 
-procedure ValidateBuildGraph(const AEntries: array of TBuildEntry);
+procedure ValidateBuildGraph(const AEntries: array of TLWPTBuildEntry);
 var
   VisitState: array of Byte;
   i: Integer;
@@ -766,7 +766,7 @@ begin
   for i := 0 to High(AEntries) do Visit(i);
 end;
 
-procedure SelectBuildEntryClosure(const AEntries: array of TBuildEntry;
+procedure SelectBuildEntryClosure(const AEntries: array of TLWPTBuildEntry;
   const ARequestedNames: array of string; var ASelected: TLWPTBooleanArray);
 var i: Integer;
 
@@ -792,7 +792,7 @@ begin
       Select(FindBuildEntryIndex(AEntries, ARequestedNames[i]));
 end;
 
-function SelectedGraphHasEdges(const AEntries: array of TBuildEntry;
+function SelectedGraphHasEdges(const AEntries: array of TLWPTBuildEntry;
   const ASelected: TLWPTBooleanArray): Boolean;
 var i: Integer;
 begin
@@ -801,8 +801,8 @@ begin
   Result := False;
 end;
 
-function DependenciesSucceeded(const AEntry: TBuildEntry;
-  const AEntries: array of TBuildEntry;
+function DependenciesSucceeded(const AEntry: TLWPTBuildEntry;
+  const AEntries: array of TLWPTBuildEntry;
   const AStates: TLWPTBuildEntryStateArray): Boolean;
 var i, DependencyIndex: Integer;
 begin
@@ -814,8 +814,8 @@ begin
   Result := True;
 end;
 
-function FailedDependency(const AEntry: TBuildEntry;
-  const AEntries: array of TBuildEntry;
+function FailedDependency(const AEntry: TLWPTBuildEntry;
+  const AEntries: array of TLWPTBuildEntry;
   const AStates: TLWPTBuildEntryStateArray; out AName: string): Boolean;
 var i, DependencyIndex: Integer;
 begin

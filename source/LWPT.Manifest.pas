@@ -133,7 +133,7 @@ type
   end;
   THookArray = array of THook;
 
-  TBuildEntry = record
+  TLWPTBuildEntry = record
     Name      : string;            { logical name, e.g. "cli" }
     Source    : string;            { entry-point .pas/.dpr path }
     Output    : string;            { optional output binary path }
@@ -150,7 +150,7 @@ type
     Includes: array of string;   { -Fi dirs }
     FpcFlags: array of string;
     Deps    : array of TDependency;
-    BuildEntries : array of TBuildEntry; { [build] entries for `lwpt build` }
+    BuildEntries : array of TLWPTBuildEntry; { [build] entries for `lwpt build` }
     VersionIncOut : string;      { [version] output: generated .inc path }
     VersionPrefix : string;      { [version] constant prefix, default BAKED }
     { Whole-build/run lifecycle hooks (ADR-0011). Each pair fires
@@ -1263,7 +1263,7 @@ var
   Pair     : TTOMLNodeMap.TKeyValuePair;
   i, j, n  : Integer;
   D        : TDependency;
-  Entry        : TBuildEntry;
+  Entry        : TLWPTBuildEntry;
   CS       : TCustomSource;
   Hook     : THook;
   Ctx      : TPlaceholderCtx;
@@ -1513,7 +1513,7 @@ begin
       begin
         { Single-entry shorthand. The item gets name = package
           name; output defaults to "build/<name>" when absent. }
-        Entry := Default(TBuildEntry);
+        Entry := Default(TLWPTBuildEntry);
         Entry.Name   := Result.Name;
         if AIsRoot then ValidateBuildEntryName(Entry.Name);
         Entry.Source := TomlStr(BuildNode, 'source', '');
@@ -1535,7 +1535,7 @@ begin
         for Pair in BuildNode.Children do
         begin
           EntryNode := Pair.Value;
-          Entry := Default(TBuildEntry);
+          Entry := Default(TLWPTBuildEntry);
           Entry.Name := Pair.Key;
           if AIsRoot then ValidateBuildEntryName(Entry.Name);
           if TomlIsString(EntryNode) then
