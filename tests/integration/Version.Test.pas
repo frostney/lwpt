@@ -86,6 +86,7 @@ begin
   R := RunLwpt(['--version']);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('lwpt ', R.Stdout) = 1).ToBe(True);
+  Expect<string>(R.Stderr).ToBe('');
 end;
 
 procedure TVersionE2E.TestShortFlag;

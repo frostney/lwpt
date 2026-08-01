@@ -16,6 +16,9 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 - **Compiler outputs are session-private.** Build and test invocations write
   below `.lwpt/sessions/<session-id>/`; only a successful, revalidated build
   result is atomically published to its manifest output.
+- **Every resolved subcommand reports completion.** A status-aware elapsed-time
+  line is written to stderr after success or failure without changing stdout or
+  the command's exit code.
 - **Three customer-facing stack contracts are owed but deferred.** Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), link-check, duplication, and codebase-health each have a follow-up workstream. Architecture drift is instead a project-local release-preparation check for LWPT itself; it is not a customer feature.
 
 ## Pinned versions
@@ -29,6 +32,24 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 | OpenSSL (Unix-not-Darwin and Windows server runtime) | 3.x | `openssl version` on Unix. The Windows server runtime is validated by the CI PE-import guard plus the runtime loadability probe (per [ADR-0024](./adr/0024-openssl-server-tls-accept.md)), not a version CLI. Windows clients and macOS use SChannel / SecureTransport. |
 
 When you touch code that depends on the version, **verify it live, not from memory.** The Hard Constraint in `AGENTS.md` is explicit about this. If you bump a version, the new pin lives in this file and in the relevant CI workflow.
+
+## Command completion timing
+
+Every registered subcommand invocation ends with one status-aware line on
+stderr:
+
+```text
+lwpt build: completed in 1.24s
+lwpt build: failed after 0.03s
+```
+
+The duration uses an increasing millisecond clock and is rendered in seconds to
+two decimal places. Existing stdout, diagnostics, and exit codes are unchanged.
+`lwpt run <subcommand>` reports the resolved subcommand name, so
+`lwpt run build` ends with `lwpt build: ...`. Top-level help, version output,
+and unknown command names are not resolved subcommand executions and do not get
+a completion line. Output suppression is separate planned work tracked in
+[issue #127](https://github.com/frostney/lwpt/issues/127).
 
 ## Pre-commit hook
 

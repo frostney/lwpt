@@ -56,7 +56,31 @@ type
     procedure TestBuildModeEqualsSeparatedValueParses;
     procedure TestBuildModeInvalidValueExitsNonZero;
     procedure TestVerboseFlagIsLongOnly;
+    procedure TestSuccessfulCommandReportsCompletion;
+    procedure TestFailedCommandReportsCompletion;
+    procedure TestRunAliasReportsResolvedCommand;
   end;
+
+function CompletionPrefix(const ACommand, AStatus: string): string;
+begin
+  Result := ChangeFileExt(ExtractFileName(LwptBinaryPath), '') + ' '
+    + ACommand + ': ' + AStatus;
+end;
+
+function CountOccurrences(const AText, ANeedle: string): Integer;
+var
+  Offset, FoundAt : Integer;
+begin
+  Result := 0;
+  Offset := 1;
+  while Offset <= Length(AText) do
+  begin
+    FoundAt := Pos(ANeedle, Copy(AText, Offset, MaxInt));
+    if FoundAt = 0 then Exit;
+    Inc(Result);
+    Inc(Offset, FoundAt + Length(ANeedle) - 1);
+  end;
+end;
 
 procedure TCLIOptionsE2E.SetupScratchProject;
 begin
@@ -193,6 +217,46 @@ begin
   Expect<Boolean>(Pos('-v, --verbose', TestHelp.Stdout) = 0).ToBe(True);
 end;
 
+procedure TCLIOptionsE2E.TestSuccessfulCommandReportsCompletion;
+var
+  R : TLwptResult;
+  Prefix, StderrText : string;
+begin
+  R := RunLwpt(['build', '--help']);
+  Prefix := CompletionPrefix('build', 'completed in ');
+  StderrText := Trim(R.Stderr);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Integer>(CountOccurrences(R.Stderr, Prefix)).ToBe(1);
+  Expect<Boolean>(Pos(Prefix, StderrText) = 1).ToBe(True);
+  Expect<Boolean>((StderrText <> '')
+    and (StderrText[Length(StderrText)] = 's')).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestFailedCommandReportsCompletion;
+var
+  R : TLwptResult;
+  Prefix : string;
+begin
+  R := RunLwpt(['build', '--mode', 'totally-wrong'], FScratch);
+  Prefix := CompletionPrefix('build', 'failed after ');
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('--mode must be', R.Stderr) > 0).ToBe(True);
+  Expect<Integer>(CountOccurrences(R.Stderr, Prefix)).ToBe(1);
+end;
+
+procedure TCLIOptionsE2E.TestRunAliasReportsResolvedCommand;
+var
+  R : TLwptResult;
+  BuildPrefix, RunPrefix : string;
+begin
+  R := RunLwpt(['run', 'build', '--help']);
+  BuildPrefix := CompletionPrefix('build', 'completed in ');
+  RunPrefix := CompletionPrefix('run', 'completed in ');
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Integer>(CountOccurrences(R.Stderr, BuildPrefix)).ToBe(1);
+  Expect<Integer>(CountOccurrences(R.Stderr, RunPrefix)).ToBe(0);
+end;
+
 procedure TCLIOptionsE2E.SetupTests;
 begin
   Test('lwpt --help lists every subcommand on stdout',
@@ -209,6 +273,12 @@ begin
     TestBuildModeInvalidValueExitsNonZero);
   Test('--verbose is long-only for build and test',
     TestVerboseFlagIsLongOnly);
+  Test('successful subcommand reports one final completion line',
+    TestSuccessfulCommandReportsCompletion);
+  Test('failed subcommand reports its diagnostic and one final completion line',
+    TestFailedCommandReportsCompletion);
+  Test('run alias reports the resolved subcommand name',
+    TestRunAliasReportsResolvedCommand);
 end;
 
 begin
