@@ -33,7 +33,8 @@ type
 
   { Neutral dispatch metadata for hosts that need completion reporting.
     The CLI package owns measurement and resolved command identity; the host
-    decides whether and how to present the result. }
+    decides whether and how to present the result. Completion callbacks are
+    best-effort observers and cannot replace the command's dispatch result. }
   TSubcommandCompletion = record
     CommandName: string;
     ExitCode: Integer;
@@ -291,7 +292,11 @@ begin
       Completion.CommandName := CmdName;
       Completion.ExitCode := Result;
       Completion.ElapsedMilliseconds := GetTickCount64 - StartedAt;
-      FOnCommandCompleted(Completion);
+      try
+        FOnCommandCompleted(Completion);
+      except
+        { Completion observers must not replace the command's exit result. }
+      end;
     end;
   end;
 end;

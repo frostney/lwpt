@@ -24,7 +24,7 @@ uses
 type
   TSubcommandRegistrySuite = class(TTestSuite)
   private
-    function RunCompletionChild: Integer;
+    function RunCompletionChild(const ARaisingCallback: Boolean): Integer;
   public
     procedure SetupTests; override;
     procedure TestCountAndItemFollowRegistrationOrder;
@@ -32,6 +32,7 @@ type
     procedure TestItemExposesOptionObjects;
     procedure TestItemOutOfRangeRaises;
     procedure TestCompletionCallbackReceivesDispatchMetadata;
+    procedure TestCompletionCallbackCannotReplaceDispatchResult;
   end;
 
 var
@@ -42,6 +43,11 @@ procedure CaptureCompletion(const ACompletion: TSubcommandCompletion);
 begin
   Inc(CompletionCount);
   CapturedCompletion := ACompletion;
+end;
+
+procedure RaiseFromCompletion(const ACompletion: TSubcommandCompletion);
+begin
+  raise Exception.Create('completion callback failed');
 end;
 
 function StubHandler(const APositionals: TStringList;
@@ -85,7 +91,21 @@ begin
   end;
 end;
 
-function TSubcommandRegistrySuite.RunCompletionChild: Integer;
+function RunRaisingCompletionScenario: Integer;
+var
+  Registry : TSubcommandRegistry;
+begin
+  Registry := BuildRegistry;
+  try
+    Registry.OnCommandCompleted := @RaiseFromCompletion;
+    Result := Registry.Run('fixture');
+  finally
+    Registry.Free;
+  end;
+end;
+
+function TSubcommandRegistrySuite.RunCompletionChild(
+  const ARaisingCallback: Boolean): Integer;
 var
   ProcessInstance : TProcess;
 begin
@@ -93,6 +113,8 @@ begin
   try
     ProcessInstance.Executable := ExpandFileName(ParamStr(0));
     ProcessInstance.Parameters.Add('alpha');
+    if ARaisingCallback then
+      ProcessInstance.Parameters.Add('raise-callback');
     ProcessInstance.Options := [poWaitOnExit];
     ProcessInstance.Execute;
     Result := ProcessInstance.ExitCode;
@@ -178,7 +200,12 @@ end;
 
 procedure TSubcommandRegistrySuite.TestCompletionCallbackReceivesDispatchMetadata;
 begin
-  Expect<Integer>(RunCompletionChild).ToBe(0);
+  Expect<Integer>(RunCompletionChild(False)).ToBe(0);
+end;
+
+procedure TSubcommandRegistrySuite.TestCompletionCallbackCannotReplaceDispatchResult;
+begin
+  Expect<Integer>(RunCompletionChild(True)).ToBe(0);
 end;
 
 procedure TSubcommandRegistrySuite.SetupTests;
@@ -193,12 +220,17 @@ begin
     TestItemOutOfRangeRaises);
   Test('completion callback receives resolved command metadata exactly once',
     TestCompletionCallbackReceivesDispatchMetadata);
+  Test('completion callback cannot replace the command dispatch result',
+    TestCompletionCallbackCannotReplaceDispatchResult);
 end;
 
 begin
-  if (ParamCount = 1) and SameText(ParamStr(1), 'alpha') then
+  if (ParamCount >= 1) and SameText(ParamStr(1), 'alpha') then
   begin
-    ExitCode := RunCompletionScenario;
+    if (ParamCount = 2) and SameText(ParamStr(2), 'raise-callback') then
+      ExitCode := RunRaisingCompletionScenario
+    else
+      ExitCode := RunCompletionScenario;
     Exit;
   end;
 
