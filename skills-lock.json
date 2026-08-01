@@ -85,12 +85,6 @@
       "skillPath": "project-structure/SKILL.md",
       "computedHash": "fd37d4c0d0f0d37e9bce9125a231db3622046ad3f891a1ada825643e97f24832"
     },
-    "review-pr": {
-      "source": "frostney/known-good-route",
-      "sourceType": "github",
-      "skillPath": "review-pr/SKILL.md",
-      "computedHash": "f4b0b1713b995340711d7c748bed5aa20b643c3dc60a34d473bc2bcd722025b0"
-    },
     "roadmap-review": {
       "source": "frostney/known-good-route",
       "sourceType": "github",

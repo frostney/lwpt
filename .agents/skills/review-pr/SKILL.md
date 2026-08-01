@@ -8,6 +8,9 @@ license: Unlicense OR MIT
 compatibility: >-
   Requires the GitHub CLI (gh) authenticated to the target repository and
   network access.
+metadata:
+  upstream: https://github.com/frostney/known-good-route
+  adaptation: finite automatic-merge convergence deadline
 ---
 
 # Review PR
@@ -46,6 +49,12 @@ reviews, summaries, suggestions, and nitpicks. For CodeRabbit when active, a
 rate limit, quota response, incomplete run, or missing verdict is pending rather
 than passed; apply equivalent evidence-based semantics to other tools.
 
+Automatic convergence has a finite wall-clock budget: 30 minutes from entering
+`automatic-merge` mode unless the user supplies another explicit finite
+deadline. Backoff, CI waits, reviewer waits, and retriggers all consume that
+single budget. At the deadline, stop without merging and report the exact
+nonterminal checks or review tools; never fall back to the host platform limit.
+
 ## Workflow
 
 1. Confirm the branch has an open PR and merge the remote default branch if
@@ -69,11 +78,12 @@ than passed; apply equivalent evidence-based semantics to other tools.
    with bounded backoff for required checks and every active review tool. When a
    tool is incomplete, errored, or rate-limited, use its documented retrigger
    mechanism when current evidence says it is allowed; a required command
-   comment may use the narrow top-level exception. Do not impose a retry-count
-   limit beyond the host platform.
-9. Stop without merging for a material product decision, unrelated failure,
-   unsafe or divergent PR, unavailable terminal external dependency, or
-   unresolved required finding. Report the exact blocker.
+   comment may use the narrow top-level exception. Retrigger only while enough
+   convergence budget remains to observe a terminal result.
+9. Stop without merging for an exhausted convergence budget, material product
+   decision, unrelated failure, unsafe or divergent PR, unavailable terminal
+   external dependency, or unresolved required finding. Report the exact
+   blocker.
 10. Once the current head is ready, every required check is green, every active
     review tool has a completed verdict, and no actionable finding remains,
     squash-merge and delete the source branch through `git-workflow`. Sync the
