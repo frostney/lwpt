@@ -299,8 +299,8 @@ var
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
-  ReadSet, WriteSet: TFDSet;
-  ReadSetPointer, WriteSetPointer: PFDSet;
+  ExceptSet, ReadSet, WriteSet: TFDSet;
+  ExceptSetPointer, ReadSetPointer, WriteSetPointer: PFDSet;
   Timeout: TTimeVal;
   Ready: Integer;
   Remaining: Integer;
@@ -327,8 +327,10 @@ begin
   {$IFDEF MSWINDOWS}
   FillChar(ReadSet, SizeOf(ReadSet), 0);
   FillChar(WriteSet, SizeOf(WriteSet), 0);
+  FillChar(ExceptSet, SizeOf(ExceptSet), 0);
   ReadSetPointer := nil;
   WriteSetPointer := nil;
+  ExceptSetPointer := nil;
   if ARead then
   begin
     ReadSet.fd_count := 1;
@@ -341,11 +343,22 @@ begin
     WriteSet.fd_array[0] := ASock;
     WriteSetPointer := @WriteSet;
   end;
+  if ARead or AWrite then
+  begin
+    { Winsock may report a failed nonblocking connect only through the
+      exception set. Writability alone can therefore wait until the request
+      deadline even though SO_ERROR is already available. Callers still read
+      SO_ERROR or perform their send/receive operation after readiness. }
+    ExceptSet.fd_count := 1;
+    ExceptSet.fd_array[0] := ASock;
+    ExceptSetPointer := @ExceptSet;
+  end;
   Remaining := RemainingRequestMilliseconds(ADeadline,
     ATimeoutMilliseconds);
   Timeout.tv_sec := Remaining div 1000;
   Timeout.tv_usec := (Remaining mod 1000) * 1000;
-  Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer, nil, @Timeout);
+  Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer,
+    ExceptSetPointer, @Timeout);
   {$ENDIF}
   if Ready = 0 then
     RaiseRequestDeadline(ATimeoutMilliseconds);
