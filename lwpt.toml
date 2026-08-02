@@ -16,8 +16,8 @@ lwpt = { source = "source/{item.name}.pas", output = "build/{item.name}" }
 # [workspaces] — monorepo workspace declaration per the ADR-0014
 # amendment "Workspaces" (Q19=b, Q21=a). Each matching dir that
 # carries its own lwpt.toml is auto-discovered + auto-installed
-# as a local-path dep (symlinked into .lwpt/modules/<name>/, since
-# they're inside the project root). No separate [dependencies]
+# as a validated local snapshot in .lwpt/modules/<name>/. No separate
+# [dependencies]
 # block needed — pre-amendment LWPT had four explicit local-path
 # entries here that this single include glob replaces.
 [workspaces]

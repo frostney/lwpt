@@ -18,7 +18,7 @@
          hard error ("edit manually"), never a duplicate insertion.
     remove:
       6. Deletes the entry, regenerates the lockfile without it, and
-         prunes .lwpt/modules/<name>/ — while the link TARGET
+         prunes .lwpt/modules/<name>/ while the local SOURCE
          (vendor/leaf) survives untouched.
       7. An unknown name is a hard error. }
 
@@ -30,6 +30,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.Core,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -50,7 +51,8 @@ type
     procedure TestAddFailedInstallLeavesManifestUntouched;
     procedure TestAddUrlWithoutNameIsRejected;
     procedure TestAddDottedTableFormIsRejected;
-    procedure TestRemovePrunesModulesButKeepsLinkTarget;
+    procedure TestRemovePrunesModulesButKeepsLocalSource;
+    procedure TestRemoveFailureRollsBackManifestAndCommittedGraph;
     procedure TestRemoveUnknownNameFails;
   end;
 
@@ -82,9 +84,8 @@ begin
     'implementation'#10 +
     'end.'#10);
 
-  { The local dep `lwpt add` will install. Lives inside the project
-    root, so the installer links rather than copies — which makes the
-    prune-must-not-follow-the-link assertion meaningful. }
+  { The local dep `lwpt add` will install as a validated snapshot. The
+    source stays independent and must never be pruned with that snapshot. }
   WriteTextFile(FScratch + '/vendor/leaf/lwpt.toml',
     '[package]'#10 +
     'name = "leaf"'#10 +
@@ -221,7 +222,7 @@ begin
   Expect<Boolean>(Before = After).ToBe(True);
 end;
 
-procedure TAddRemoveE2E.TestRemovePrunesModulesButKeepsLinkTarget;
+procedure TAddRemoveE2E.TestRemovePrunesModulesButKeepsLocalSource;
 var
   R: TLwptResult;
   Manifest, Lock: string;
@@ -244,9 +245,33 @@ begin
   Lock := ReadFileText(FScratch + '/lwpt.lock');
   Expect<Integer>(Pos('leaf', Lock)).ToBe(0);
 
-  { pruning removed the LINK, never the linked-to source tree }
+  { pruning removed the committed snapshot, never the local source tree }
   Expect<Boolean>(FileExists(FScratch + '/vendor/leaf/source/Leaf.pas'))
     .ToBe(True);
+end;
+
+procedure TAddRemoveE2E.TestRemoveFailureRollsBackManifestAndCommittedGraph;
+var R: TLwptResult; ManifestBefore, LockBefore, CfgBefore: string;
+begin
+  R := RunLwpt(['add', './vendor/leaf'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  ManifestBefore := ReadFileText(FScratch + '/lwpt.toml');
+  LockBefore := ReadFileText(FScratch + '/lwpt.lock');
+  CfgBefore := ReadFileText(FScratch + '/lwpt.cfg');
+
+  R := RunLwpt(['remove', 'leaf'], FScratch,
+    [PROJECT_NAME + '_TEST_FAIL_AFTER_ORPHAN_RETAIN=1']);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<string>(ReadFileText(FScratch + '/lwpt.toml'))
+    .ToBe(ManifestBefore);
+  Expect<string>(ReadFileText(FScratch + '/lwpt.lock')).ToBe(LockBefore);
+  Expect<string>(ReadFileText(FScratch + '/lwpt.cfg')).ToBe(CfgBefore);
+  Expect<Boolean>(DirectoryExists(FScratch + '/.lwpt/modules/leaf'))
+    .ToBe(True);
+  Expect<Boolean>(FileExists(
+    FScratch + '/.lwpt/modules/leaf/source/Leaf.pas')).ToBe(True);
+  Expect<Boolean>(FileExists(
+    FScratch + '/vendor/leaf/source/Leaf.pas')).ToBe(True);
 end;
 
 procedure TAddRemoveE2E.TestRemoveUnknownNameFails;
@@ -269,8 +294,10 @@ begin
     TestAddUrlWithoutNameIsRejected);
   Test('a [dependencies.<name>] dotted-table dep is a hard error',
     TestAddDottedTableFormIsRejected);
-  Test('remove prunes modules but never the link target',
-    TestRemovePrunesModulesButKeepsLinkTarget);
+  Test('remove prunes modules but never the local source',
+    TestRemovePrunesModulesButKeepsLocalSource);
+  Test('remove failure rolls back manifest lock cfg and pruned graph',
+    TestRemoveFailureRollsBackManifestAndCommittedGraph);
   Test('removing an unknown name is a hard error',
     TestRemoveUnknownNameFails);
 end;
