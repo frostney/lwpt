@@ -54,13 +54,13 @@ const
     or empty, the canonical URL is used byte for byte.
 
     The accepted value is a bare `http://<numeric IPv4 loopback>:<port>`
-    origin. On Windows only, the non-routable `0.0.0.0` address is also
-    accepted so the failure fixture can exercise Winsock's documented
-    immediate WSAEADDRNOTAVAIL path. Everything else is refused: a remote
-    host, a name that would need DNS (including `localhost`), a missing port,
-    a path, user information, and any non-http scheme. That keeps the seam
-    unable to express an arbitrary insecure download, which is the reason it
-    can live in the shipped binary rather than behind a build flag.
+    origin. On Windows only, the non-routable limited-broadcast address is
+    also accepted as a preflighted immediate-failure fallback. Everything
+    else is refused: a remote host, a name that would need DNS (including
+    `localhost`), a missing port, a path, user information, and any non-http
+    scheme. That keeps the seam unable to express an arbitrary insecure
+    download, which is the reason it can live in the shipped binary rather
+    than behind a build flag.
 
     ARCHIVE_FETCH_TIMEOUT_ENV bounds the loopback archive request and is honoured
     only while the origin override is active, so it cannot become a
@@ -340,13 +340,13 @@ begin
   Host := Copy(Authority, 1, ColonAt - 1);
   PortText := Copy(Authority, ColonAt + 1, MaxInt);
   {$IFDEF MSWINDOWS}
-  if (Host <> '0.0.0.0') and not IsNumericLoopbackAddress(Host) then
+  if (Host <> '255.255.255.255') and not IsNumericLoopbackAddress(Host) then
   {$ELSE}
   if not IsNumericLoopbackAddress(Host) then
   {$ENDIF}
     RejectArchiveFetchOrigin(AOverride,
       'the host must be a numeric IPv4 loopback address inside 127.0.0.0/8'
-      {$IFDEF MSWINDOWS} + ' or the Windows unspecified-address test target'
+      {$IFDEF MSWINDOWS} + ' or the Windows limited-broadcast test target'
       {$ENDIF});
   if (not ParseWholeNumber(PortText, Port))
      or (Port < 1) or (Port > MAXIMUM_PORT_NUMBER) then

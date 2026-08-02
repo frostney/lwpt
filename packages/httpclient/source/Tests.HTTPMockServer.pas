@@ -84,8 +84,8 @@ type
   end;
 
   { Prepares an endpoint whose TCP connect fails immediately. Unix retains an
-    ephemeral loopback endpoint in TIME_WAIT. Windows targets the unspecified
-    IPv4 address, which Winsock rejects with WSAEADDRNOTAVAIL before any SYN. }
+    ephemeral loopback endpoint in TIME_WAIT. Windows preflights an unroutable
+    broadcast target through the same nonblocking connect flow as HTTPClient. }
   TMockRefusedEndpoint = class
   private
     FHost: string;
@@ -721,33 +721,57 @@ begin
 end;
 
 {$IFDEF MSWINDOWS}
-function ProbeUnavailableWindowsAddress(const APort: Word): Boolean;
+function ProbeImmediateWindowsFailure(const AHost: AnsiString;
+  const APort: Word; const ATimeoutMilliseconds: Cardinal): Boolean;
 var
   Addr: TSockAddrIn;
-  ErrorCode: Integer;
+  ErrorCode, ErrorLength, Ready: Integer;
+  ExceptSet, WriteSet: TFDSet;
+  Mode: u_long;
   Sock: TMockSocket;
+  Timeout: TTimeVal;
 begin
   Result := False;
   Sock := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
   if not IsValidMockSocket(Sock) then
-    raise EMockServerError.Create('unavailable-address probe socket failed');
+    raise EMockServerError.Create('immediate-failure probe socket failed');
   TrackMockSocketOpened;
   try
+    Mode := 1;
+    if WinSock2.ioctlsocket(Sock, LongInt(FIONBIO), Mode) <> 0 then
+      raise EMockServerError.Create(
+        'immediate-failure probe could not enable nonblocking mode');
     FillChar(Addr, SizeOf(Addr), 0);
     Addr.sin_family := AF_INET;
     Addr.sin_port := WinSock2.htons(APort);
-    { Microsoft documents an all-zero address as an immediate
-      WSAEADDRNOTAVAIL connect failure. This avoids both released-port races
-      and reservation/firewall paths that can blackhole a SYN. }
-    Addr.sin_addr.S_addr := 0;
+    Addr.sin_addr.S_addr := WinSock2.inet_addr(PAnsiChar(AHost));
     if WinSock2.connect(Sock, PSockAddr(@Addr), SizeOf(Addr)) = 0 then
-      raise EMockServerError.Create(
-        'the unspecified Windows address unexpectedly accepted a connection');
+      Exit;
     ErrorCode := WinSock2.WSAGetLastError;
-    if ErrorCode = WSAEADDRNOTAVAIL then Exit(True);
-    if ErrorCode <> WSAEADDRNOTAVAIL then
+    if (ErrorCode <> WSAEWOULDBLOCK) and (ErrorCode <> WSAEINPROGRESS) then
+      Exit(True);
+
+    FillChar(WriteSet, SizeOf(WriteSet), 0);
+    WriteSet.fd_count := 1;
+    WriteSet.fd_array[0] := Sock;
+    FillChar(ExceptSet, SizeOf(ExceptSet), 0);
+    ExceptSet.fd_count := 1;
+    ExceptSet.fd_array[0] := Sock;
+    Timeout.tv_sec := ATimeoutMilliseconds div 1000;
+    Timeout.tv_usec := (ATimeoutMilliseconds mod 1000) * 1000;
+    Ready := WinSock2.select(0, nil, @WriteSet, @ExceptSet, @Timeout);
+    if Ready < 0 then
       raise EMockServerError.CreateFmt(
-        'unavailable-address probe failed with Winsock error %d', [ErrorCode]);
+        'immediate-failure probe select failed with Winsock error %d',
+        [WinSock2.WSAGetLastError]);
+    if Ready = 0 then Exit;
+    ErrorCode := 0;
+    ErrorLength := SizeOf(ErrorCode);
+    if WinSock2.getsockopt(Sock, SOL_SOCKET, SO_ERROR,
+       PChar(@ErrorCode), ErrorLength) <> 0 then
+      raise EMockServerError.Create(
+        'immediate-failure probe could not read the connect result');
+    Result := ErrorCode <> 0;
   finally
     CloseTrackedMockSocket(Sock);
   end;
@@ -821,11 +845,17 @@ begin
         'loopback port was unexpectedly reusable after active close');
     {$ENDIF}
     {$IFDEF MSWINDOWS}
-    FHost := '0.0.0.0';
+    { The loopback-directed broadcast stays inside 127/8. If Winsock does not
+      reject it promptly on a given host, the limited broadcast address is a
+      non-routable TCP fallback. The exact nonblocking path is preflighted so
+      a blackholed target never reaches the subprocess assertion. }
+    FHost := '127.255.255.255';
     FPort := 1;
-    if not ProbeUnavailableWindowsAddress(FPort) then
+    if not ProbeImmediateWindowsFailure(AnsiString(FHost), FPort, 250) then
+      FHost := '255.255.255.255';
+    if not ProbeImmediateWindowsFailure(AnsiString(FHost), FPort, 250) then
       raise EMockServerError.Create(
-        'the unspecified Windows address was not rejected');
+        'no deterministic immediate Windows connect-failure target is available');
     {$ENDIF}
   except
     CloseTrackedMockSocket(ProbeSock);
