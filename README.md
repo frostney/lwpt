@@ -155,7 +155,21 @@ gitea = { archive = "https://git.example.com/{user}/{repository}/archive/{ref}.t
 # entry name to [package].name and the output to build/<entry-name>.
 # Multi-binary form (used here): one inline table per entry.
 cli  = { source = "src/cli.pas",  output = "bin/cli" }
-tool = { source = "src/tool.pas", output = "bin/tool" }
+tool = { source = "src/tool.pas", output = "bin/tool", compiler = "custom" }
+
+[compiler]
+# Optional root-owned policy. Without it, build and test use built-in FPC.
+default = "native"
+
+[compiler.profiles.native]
+driver = "fpc"
+version = "^3.2.0"
+
+[compiler.profiles.custom]
+# External drivers receive versioned canonical TOML on stdin/stdout.
+driver = "my-compiler"
+executable = "tools/my-compiler-driver"
+version = "^1.0.0"
 
 [version]
 output = "src/Version.Generated.inc"
