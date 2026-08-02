@@ -334,37 +334,46 @@ begin
   RunBoundedMockLifecycleChild('connected-silent');
 end;
 
+procedure RunMockResourceBalanceCycle(const AExpectedBody: TBytes);
+var
+  GotBody: TBytes;
+  ErrorMessage: string;
+  Mock: TMockHTTPServer;
+begin
+  GotBody := ServeAndFetch(BuildSimpleResponse(AExpectedBody));
+  Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(AExpectedBody));
+  ErrorMessage := ServeAndCaptureError(
+    StringBytes('not an HTTP response'), TestOptions(16, 1024, 1000),
+    0, 0, 0);
+  Expect<Boolean>(ErrorMessage <> '').ToBe(True);
+  Mock := TMockHTTPServer.Create(nil);
+  try
+    Mock.Start;
+    Mock.ConnectWithoutRequest;
+    Mock.WaitForAccepted;
+  finally
+    Mock.Free;
+  end;
+  Mock := TMockHTTPServer.Create(nil);
+  Mock.Free;
+end;
+
 procedure THTTPMockServerLifecycle.TestRepeatedCyclesBalanceResources;
 const
   ITERATIONS = 16;
 var
   BeforeResources, AfterResources: TMockServerResourceSnapshot;
-  ExpectedBody, GotBody: TBytes;
-  ErrorMessage: string;
-  Mock: TMockHTTPServer;
+  ExpectedBody: TBytes;
   i: Integer;
 begin
-  BeforeResources := GetMockServerResourceSnapshot;
   ExpectedBody := MakeBytes([$00, $7f, $ff]);
+  { Initialize platform networking and thread runtime state before measuring
+    fixture-owned lifecycle deltas. Windows retains some one-time process
+    handles on first use which are not mock-server leaks. }
+  RunMockResourceBalanceCycle(ExpectedBody);
+  BeforeResources := GetMockServerResourceSnapshot;
   for i := 1 to ITERATIONS do
-  begin
-    GotBody := ServeAndFetch(BuildSimpleResponse(ExpectedBody));
-    Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(ExpectedBody));
-    ErrorMessage := ServeAndCaptureError(
-      StringBytes('not an HTTP response'), TestOptions(16, 1024, 1000),
-      0, 0, 0);
-    Expect<Boolean>(ErrorMessage <> '').ToBe(True);
-    Mock := TMockHTTPServer.Create(nil);
-    try
-      Mock.Start;
-      Mock.ConnectWithoutRequest;
-      Mock.WaitForAccepted;
-    finally
-      Mock.Free;
-    end;
-    Mock := TMockHTTPServer.Create(nil);
-    Mock.Free;
-  end;
+    RunMockResourceBalanceCycle(ExpectedBody);
   AfterResources := GetMockServerResourceSnapshot;
   Expect<Integer>(AfterResources.OpenSockets).ToBe(
     BeforeResources.OpenSockets);
