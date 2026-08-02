@@ -67,6 +67,7 @@ type
     procedure TestFactoryIdentityMismatchIsFreedAndRejected;
     procedure TestFactoryVersionMismatchIsRejected;
     procedure TestFactoryDriverIsFreedExactlyOnce;
+    procedure TestFactoriesCannotShadowBuiltInDrivers;
   end;
 
 constructor TFactoryDriver.Create(const AOwner: TFactoryOwner;
@@ -320,6 +321,33 @@ begin
   end;
 end;
 
+procedure TLWPTCompilerRegistryTests.TestFactoriesCannotShadowBuiltInDrivers;
+var
+  Host: TLWPTCompilerHost;
+
+  procedure ExpectRejected(const ADriverID: string);
+  var
+    Raised: Boolean;
+  begin
+    Raised := False;
+    try
+      Host.RegisterFactory(ADriverID, FFactoryOwner.CreateDriver);
+    except
+      on ELWPTCompilerDriverError do Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+  end;
+
+begin
+  Host := TLWPTCompilerHost.Create;
+  try
+    ExpectRejected('fpc');
+    ExpectRejected('DELPHI');
+  finally
+    Host.Free;
+  end;
+end;
+
 procedure TLWPTCompilerRegistryTests.TestBuiltInFallback;
 var
   Manifest: TManifest;
@@ -383,6 +411,8 @@ begin
     TestFactoryVersionMismatchIsRejected);
   Test('selection frees a factory driver exactly once',
     TestFactoryDriverIsFreedExactlyOnce);
+  Test('embedding factories cannot shadow built-in drivers',
+    TestFactoriesCannotShadowBuiltInDrivers);
 end;
 
 begin

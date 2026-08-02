@@ -18,9 +18,10 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 - **Compiler-neutral request first.** Build and test select a root-owned named
   compiler profile, validate a versioned request against on-demand compiler
   capabilities, and normalize the result through the selected driver. FPC is
-  the built-in fallback; external drivers exchange canonical TOML over
-  short-lived child processes. Unsupported combinations are hard errors, with
-  no compiler or target fallback. See ADR-0029 and ADR-0030.
+  the implicit built-in fallback; Delphi is a built-in opt-in profile; external
+  drivers exchange canonical TOML over short-lived child processes.
+  Unsupported combinations are hard errors, with no compiler or target
+  fallback. See ADR-0029 and ADR-0030.
 - **Compiler processes are bounded duplex operations.** A shared runner writes
   request stdin while draining stdout and stderr, retains at most 16 MiB from
   each stream and discards later bytes while drainage continues, owns the
@@ -252,6 +253,72 @@ FPC and the requested tuple; LWPT never falls back to the host compiler. The
 publish step refreshes the probe and repeats the complete compatibility check;
 a changed compiler identity/version, target, output kind, or mode during
 compilation withholds the candidate.
+
+## Delphi compiler profiles
+
+Delphi support is opt-in and applies only to consumer projects; LWPT itself
+remains built and tested with FreePascal. A root profile selects the built-in
+`delphi` driver and one command-line compiler executable:
+
+```toml
+[compiler]
+default = "delphi-win64"
+
+[compiler.profiles.delphi-win64]
+driver = "delphi"
+executable = "C:/Program Files (x86)/Embarcadero/Studio/37.0/bin/dcc64.exe"
+version = ">=36.0.0"
+```
+
+An explicit `executable` may be absolute or project-relative. When it is
+omitted, the driver looks for `dcc32.exe` under `BDSBIN`, then `BDS/bin`, then
+uses `dcc32` from `PATH`. Embarcadero's `rsvars.bat` initializes the normal
+command-line environment. Discovery never selects a different target on the
+user's behalf: configure another profile and executable for each target.
+
+The minimum supported backend is Delphi 12 Athens (compiler `36.0.0`). Every
+concrete build or test operation launches the selected executable with `-h`,
+parses its Embarcadero identity/version/target header, and checks it against
+both the executable name and neutral request. The deterministic contract
+matrix is:
+
+| Executable | Advertised target tuple | LWPT release-platform coverage |
+| --- | --- | --- |
+| `dcc32(.exe)` | `win32/i386` | `i386-win32` |
+| `dcc64(.exe)` | `win64/x86_64` | `x86_64-win64` |
+| `dcclinux64(.exe)` | `linux/x86_64` | `x86_64-linux` |
+| `dccosx64(.exe)` | `darwin/x86_64` | `x86_64-darwin` |
+| `dccosxarm64(.exe)` | `darwin/aarch64` | `aarch64-darwin` |
+
+The version floor, executable names, and target claims follow Embarcadero's
+[compiler-version table](https://docwiki.embarcadero.com/RADStudio/Florence/en/Compiler_Versions_Table),
+[Delphi compiler reference](https://docwiki.embarcadero.com/RADStudio/Florence/en/Delphi_Compiler),
+and [supported-platform table](https://docwiki.embarcadero.com/RADStudio/Florence/en/Supported_Target_Platforms).
+The `BDS`/`BDSBIN` discovery inputs are the vendor's documented
+[environment variables](https://docwiki.embarcadero.com/RADStudio/Florence/en/Defined_Environment_Variables).
+
+Delphi has no advertised `linux/aarch64` compiler in this contract, so
+`aarch64-linux` fails before compilation with the supported and requested
+tuples. Other installed Delphi toolchains are deliberately not inferred or
+advertised until their tuple and translation contract have dedicated
+coverage.
+
+The driver translates neutral defines, unit/include/resource search paths,
+development/release switches, clean rebuilds, private executable/unit/object
+directories, output extension, and ordered extra options. Resource files
+remain source-declared through Delphi's `{$R ...}` directive; neutral resource
+inputs add their containing directories to the command-line resource search
+path. On success the compiler's source-derived output basename is atomically
+moved inside private session staging to the exact requested artifact name
+before normal publication. Delphi diagnostics such as
+`Unit.pas(12,7) Error: E2003 ...` retain path, line, column, code, severity,
+and message in the normalized result.
+
+The ordinary FPC CI lane runs translation, probe-parser, version-floor,
+target-matrix, diagnostic, artifact, and no-fallback fixtures without needing
+a Delphi license. The manual `delphi-native.yml` workflow provides an opt-in,
+non-gating Win64 smoke on a licensed self-hosted runner; it is not a release
+requirement.
 
 ## Generator hooks (formerly `[generated]`)
 

@@ -154,6 +154,7 @@ gitea = { archive = "https://git.example.com/{user}/{repository}/archive/{ref}.t
 # Multi-binary form (used here): one inline table per entry.
 cli  = { source = "src/cli.pas",  output = "bin/cli" }
 tool = { source = "src/tool.pas", output = "bin/tool", compiler = "custom" }
+delphi-tool = { source = "src/tool.dpr", output = "bin/tool.exe", compiler = "delphi-win64" }
 
 [compiler]
 # Optional root-owned policy. Without it, build and test use built-in FPC.
@@ -168,6 +169,12 @@ version = "^3.2.0"
 driver = "my-compiler"
 executable = "tools/my-compiler-driver"
 version = "^1.0.0"
+
+[compiler.profiles.delphi-win64]
+# Built-in, opt-in consumer driver; LWPT itself remains FPC-built.
+driver = "delphi"
+executable = "C:/Program Files (x86)/Embarcadero/Studio/37.0/bin/dcc64.exe"
+version = ">=36.0.0"
 
 [version]
 output = "src/Version.Generated.inc"
