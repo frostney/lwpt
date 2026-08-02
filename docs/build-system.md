@@ -281,8 +281,8 @@ The analysis commands remain outside the v1 pre-commit gate per
 [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md). Codebase health is
 now available on demand through [`lwpt health`](./health.md); link-check and
 duplication remain separate workstreams. Architecture drift is checked for LWPT
-itself during release preparation and is not a consumer command. [Issue
-#28](https://github.com/frostney/lwpt/issues/28) delivered parallel,
+itself during release preparation and is not a consumer command.
+[Issue #28](https://github.com/frostney/lwpt/issues/28) delivered parallel,
 process-safe, observable builds and tests through private sessions and the
 shared worker budget.
 
