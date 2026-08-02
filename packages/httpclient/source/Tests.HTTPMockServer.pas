@@ -83,14 +83,15 @@ type
     property Port: Word read FPort;
   end;
 
-  { Prepares an ephemeral loopback endpoint that refuses a later connection
-    without releasing its port for reuse. Unix retains the endpoint in
-    TIME_WAIT; Windows keeps the port bound without listening. }
+  { Prepares an ephemeral loopback endpoint that actively refuses one later
+    connection without releasing its port for reuse. Unix retains the endpoint
+    in TIME_WAIT; Windows rejects it through Winsock conditional accept. }
   TMockRefusedEndpoint = class
   private
     FHost: string;
     FPort: Word;
     {$IFDEF MSWINDOWS}
+    FRejectThread: TThread;
     FReservationSock: TMockSocket;
     FWinSockStarted: Boolean;
     {$ENDIF}
@@ -721,6 +722,47 @@ begin
   Result := True;
 end;
 
+{$IFDEF MSWINDOWS}
+function RejectMockConnection(ALpCallerId, ALpCallerData: LPWSABUF;
+  ALpSQOS, ALpGQOS: LPQOS; ALpCalleeId, ALpCalleeData: LPWSABUF;
+  g: GROUP; ADwCallbackData: DWORD): Longint; stdcall;
+begin
+  Result := CF_REJECT;
+end;
+
+type
+  TMockRejectThread = class(TThread)
+  private
+    FListenSock: TMockSocket;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AListenSock: TMockSocket);
+  end;
+
+constructor TMockRejectThread.Create(const AListenSock: TMockSocket);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FListenSock := AListenSock;
+  Start;
+end;
+
+procedure TMockRejectThread.Execute;
+var
+  Addr: TSockAddr;
+  AddrLen: Longint;
+  AcceptedSock: TMockSocket;
+begin
+  FillChar(Addr, SizeOf(Addr), 0);
+  AddrLen := SizeOf(Addr);
+  AcceptedSock := WinSock2.WSAAccept(FListenSock, Addr, @AddrLen,
+    @RejectMockConnection, 0);
+  if IsValidMockSocket(AcceptedSock) then
+    WinSock2.closesocket(AcceptedSock);
+end;
+{$ENDIF}
+
 constructor TMockRefusedEndpoint.Create;
 var
   ListenSock, ClientSock, AcceptedSock, ProbeSock: TMockSocket;
@@ -733,6 +775,7 @@ var
   {$IFDEF MSWINDOWS}
   Addr: TSockAddrIn;
   AddrLen: Longint;
+  ConditionalAccept: DWORD;
   WSAData: TWSAData;
   {$ENDIF}
 begin
@@ -742,6 +785,7 @@ begin
   AcceptedSock := InvalidMockSocket;
   ProbeSock := InvalidMockSocket;
   {$IFDEF MSWINDOWS}
+  FRejectThread := nil;
   FReservationSock := InvalidMockSocket;
   if WinSock2.WSAStartup($0202, WSAData) <> 0 then
     raise EMockServerError.Create('WSAStartup failed');
@@ -775,8 +819,14 @@ begin
     {$ENDIF}
     {$IFDEF MSWINDOWS}
     Addr.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
+    ConditionalAccept := 1;
+    if WinSock2.setsockopt(ListenSock, SOL_SOCKET, SO_CONDITIONAL_ACCEPT,
+       @ConditionalAccept, SizeOf(ConditionalAccept)) <> 0 then
+      raise EMockServerError.Create('conditional accept setup failed');
     if WinSock2.bind(ListenSock, PSockAddr(@Addr), SizeOf(Addr)) <> 0 then
       raise EMockServerError.Create('bind() failed');
+    if WinSock2.listen(ListenSock, 1) <> 0 then
+      raise EMockServerError.Create('listen() failed');
     AddrLen := SizeOf(Addr);
     if WinSock2.getsockname(ListenSock, PSockAddr(@Addr)^, AddrLen) <> 0 then
       raise EMockServerError.Create('getsockname() failed');
@@ -818,16 +868,9 @@ begin
         'loopback port was unexpectedly reusable after active close');
     {$ENDIF}
     {$IFDEF MSWINDOWS}
-    { Windows can retain a recently closed loopback connection in a state
-      that blackholes the next SYN until the request deadline. A socket that
-      owns the OS-assigned port but never enters LISTEN instead makes the TCP
-      stack reject the connect while keeping the port unavailable for reuse. }
-    ProbeSock := ConnectLoopback(FPort, FHost);
-    if IsValidMockSocket(ProbeSock) then
-      raise EMockServerError.Create(
-        'bound non-listening loopback port unexpectedly accepted a connection');
     FReservationSock := ListenSock;
     ListenSock := InvalidMockSocket;
+    FRejectThread := TMockRejectThread.Create(FReservationSock);
     {$ENDIF}
   except
     CloseTrackedMockSocket(ProbeSock);
@@ -844,7 +887,14 @@ end;
 destructor TMockRefusedEndpoint.Destroy;
 begin
   {$IFDEF MSWINDOWS}
-  CloseTrackedMockSocket(FReservationSock);
+  if Assigned(FRejectThread) then
+  begin
+    CloseTrackedMockSocket(FReservationSock);
+    FRejectThread.WaitFor;
+    FreeAndNil(FRejectThread);
+  end
+  else
+    CloseTrackedMockSocket(FReservationSock);
   CleanupTrackedWinSock(FWinSockStarted);
   {$ENDIF}
   inherited Destroy;
