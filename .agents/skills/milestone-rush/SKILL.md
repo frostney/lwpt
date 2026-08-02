@@ -34,11 +34,11 @@ not release publication.
   verifiable success criteria.
 - Respect project instructions, Definitions of Ready and Done, branch
   protection, review policy, and the remote default branch. Never amend,
-  rebase, force-push, bypass a gate, or overwrite unrelated work. The sole
-  exception is a user-confirmed GitHub-native stack: `gh stack` may cascade
-  rebase and force-with-lease only branches created by this rush for that
-  stack. Stop on a lease mismatch; never rewrite the default, unrelated, or
-  pre-existing branches.
+  rebase, force-push, bypass a gate, or overwrite unrelated work unless a
+  user-confirmed native-stack plan and project policy explicitly authorize the
+  stack tool's branch-maintenance operations. Any such exception remains
+  limited to branches created by this rush; stop on a lease mismatch and never
+  rewrite the default, unrelated, or pre-existing branches.
 
 ## Reconcile and plan
 
@@ -94,28 +94,31 @@ not release publication.
 ### Native stacked pull requests
 
 When the confirmed plan selects GitHub-native stacked pull requests, preserve
-the dependency graph and use the repository's stack-routing labels:
+the dependency graph and use the repository's declared stack-routing states:
 
-1. Submit every stack member as a draft with `stack:managed`. Draft pushes and
-   cascading synchronization do not consume the expensive PR matrix.
+1. Submit every stack member as a draft in the repository's managed-stack
+   state. Draft pushes and cascading synchronization do not consume the
+   expensive PR matrix.
 2. As each layer becomes stable, run its local project gate and required
-   pre-PR review. Apply `ci:ready`, then mark that PR ready so CI runs once for
-   its current head. An upper layer's CI validates the cumulative stack prefix
-   through that layer; do not wait for the whole stack before validating a
-   stable lower layer.
-3. Only after that current head is green, apply `review:ready`. Request scarce
-   or rate-limited review passes one PR at a time from the bottom upward. A rate
-   limit or incomplete verdict remains pending.
+   pre-PR review. Advance it to the repository's CI-ready state so CI runs once
+   for its current head. An upper layer's CI validates the cumulative stack
+   prefix through that layer; do not wait for the whole stack before validating
+   a stable lower layer.
+3. Only after that current head is green, advance it to the repository's
+   review-ready state. Request scarce or rate-limited review passes one PR at a
+   time from the bottom upward. A rate limit or incomplete verdict remains
+   pending.
 4. Before any fix, rebase, or push, return the changed PR and its affected
-   suffix to draft and remove `ci:ready`, `review:ready`, and `merge:ready`.
-   Revalidate only the affected current heads.
-5. Apply `merge:ready` only after every selected stack member's current head has
-   green required checks, terminal reviewer evidence, and no unresolved
+   suffix to draft and remove every readiness state. Revalidate only the
+   affected current heads.
+5. Advance to merge-ready only after every selected stack member's current head
+   has green required checks, terminal reviewer evidence, and no unresolved
    findings. Merge the complete stack, or a deliberately selected prefix, with
    the repository's required merge method in one all-or-nothing stack merge.
-6. Continuous integration still occurs between stacks: after a complete stack
-   lands, refresh the remote default, synchronize dependent stacks, and repeat
-   their current-head gates. Do not invoke per-PR automatic merge within an
+6. After any atomic merge unit lands, whether a complete stack or a selected
+   prefix, refresh the remote default, synchronize the remaining suffix and
+   every affected dependent stack, remove their stale readiness states, and
+   repeat current-head gates. Do not invoke per-PR automatic merge within an
    atomic stack.
 
 Labels route work; they are not completion evidence. Checks, reviews, and
