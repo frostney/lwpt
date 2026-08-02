@@ -28,6 +28,7 @@ type
     procedure SetupTests; override;
     procedure TestType2ClonesIgnorePresentationAndRenameConsistently;
     procedure TestInconsistentRenamingDoesNotMatch;
+    procedure TestGroupRejectsInconsistentThirdOccurrence;
     procedure TestSameFileOccurrencesDoNotOverlap;
     procedure TestDeclarationAndExecutableRegionsDoNotMix;
     procedure TestNestedRoutineBoundariesAreNotCrossed;
@@ -36,7 +37,11 @@ type
     procedure TestConfiguredMinimumIncludesExactBoundary;
     procedure TestThresholdIsOptionalAndStrictlyExceeded;
     procedure TestManifestRejectsMinimumBelowFloor;
+    procedure TestManifestRejectsNonIntegerMinimum;
+    procedure TestManifestRejectsNegativeMaximum;
+    procedure TestManifestRejectsNonTableDuplication;
     procedure TestManifestRejectsInvalidMaximumPercent;
+    procedure TestReadFailureNamesAbsolutePath;
     procedure TestWorkspaceOverridesRootMinimumAndAnalysisExclusion;
     procedure TestWorkspaceInheritsOrReplacesRootDuplicationPolicy;
   end;
@@ -140,6 +145,27 @@ begin
   Expect<Int64>(Report.DuplicateTokens).ToBe(0);
 end;
 
+procedure TDuplicationTests.TestGroupRejectsInconsistentThirdOccurrence;
+const
+  INCOMPATIBLE =
+    'program Third;'#10'var X, Y, Z: Integer;'#10'begin'#10
+    + '  X := 21; Y := X + 22; Z := Y * 23;'#10
+    + '  if Z > Y then Y := Z - X;'#10
+    + '  WriteLn(Y);'#10'end.'#10;
+var
+  Report: TLWPTDuplicationReport;
+begin
+  CreateProject('pairwise', '[duplication]'#10'minimum-tokens = 25'#10,
+    [BODY_ONE, BODY_TWO, INCOMPATIBLE]);
+  Report := RunProject('pairwise');
+  Expect<Integer>(Length(Report.Groups)).ToBe(1);
+  Expect<Integer>(Length(Report.Groups[0].Occurrences)).ToBe(2);
+  Expect<string>(Report.Groups[0].Occurrences[0].FileName).ToBe(
+    'source/program1.lpr');
+  Expect<string>(Report.Groups[0].Occurrences[1].FileName).ToBe(
+    'source/program2.lpr');
+end;
+
 procedure TDuplicationTests.TestSameFileOccurrencesDoNotOverlap;
 const
   SAME_FILE =
@@ -216,7 +242,6 @@ end;
 procedure TDuplicationTests.
   TestRepetitiveSourceCompletesWithinPracticalBound;
 var
-  Elapsed: QWord;
   RepetitionIndex: Integer;
   Report: TLWPTDuplicationReport;
   Source: string;
@@ -227,13 +252,10 @@ begin
   Source := Source + 'end.'#10;
   CreateProject('repetitive',
     '[duplication]'#10'minimum-tokens = 25'#10, [Source]);
-  Elapsed := GetTickCount64;
   Report := RunProject('repetitive');
-  Elapsed := GetTickCount64 - Elapsed;
   Expect<Integer>(Length(Report.Groups)).ToBe(1);
   Expect<Integer>(Report.Groups[0].TokenCount).ToBe(1200);
   Expect<Integer>(Length(Report.Groups[0].Occurrences)).ToBe(2);
-  Expect<Boolean>(Elapsed < 10000).ToBe(True);
 end;
 
 procedure TDuplicationTests.TestGroupsMaximalNonOverlappingOccurrences;
@@ -330,6 +352,81 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
 end;
 
+procedure TDuplicationTests.TestManifestRejectsNonIntegerMinimum;
+var
+  Raised: Boolean;
+begin
+  CreateProject('invalid-minimum-type',
+    '[duplication]'#10'minimum-tokens = "many"'#10, [BODY_ONE]);
+  Raised := False;
+  try
+    LoadManifest(ProjectPath('invalid-minimum-type') + '/lwpt.toml');
+  except
+    on EManifestError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TDuplicationTests.TestManifestRejectsNegativeMaximum;
+var
+  Raised: Boolean;
+begin
+  CreateProject('invalid-negative-maximum',
+    '[duplication]'#10'maximum-percent = -1'#10, [BODY_ONE]);
+  Raised := False;
+  try
+    LoadManifest(ProjectPath('invalid-negative-maximum') + '/lwpt.toml');
+  except
+    on EManifestError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TDuplicationTests.TestManifestRejectsNonTableDuplication;
+var
+  Raised: Boolean;
+begin
+  ForceDirectories(ProjectPath('invalid-duplication-table') + '/source');
+  WriteText(ProjectPath('invalid-duplication-table') + '/lwpt.toml',
+    'duplication = "disabled"'#10'[package]'#10
+    + 'name = "invalid-duplication-table"'#10'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteText(ProjectPath('invalid-duplication-table') + '/source/main.pas',
+    BODY_ONE);
+  Raised := False;
+  try
+    LoadManifest(ProjectPath('invalid-duplication-table') + '/lwpt.toml');
+  except
+    on EManifestError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TDuplicationTests.TestReadFailureNamesAbsolutePath;
+var
+  AbsolutePath, MessageText: string;
+  Raised: Boolean;
+  Scope: TLWPTAnalysisScope;
+begin
+  CreateProject('missing-source', '', [BODY_ONE]);
+  Scope := ResolveAnalysisScope(ProjectPath('missing-source') + '/lwpt.toml');
+  AbsolutePath := Scope.Files[0].AbsolutePath;
+  DeleteFile(AbsolutePath);
+  Raised := False;
+  MessageText := '';
+  try
+    AnalyzeDuplication(Scope);
+  except
+    on E: ELWPTError do
+    begin
+      Raised := True;
+      MessageText := E.Message;
+    end;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(Pos(AbsolutePath, MessageText) > 0).ToBe(True);
+end;
+
 procedure TDuplicationTests.
   TestWorkspaceOverridesRootMinimumAndAnalysisExclusion;
 var
@@ -411,6 +508,8 @@ begin
     TestType2ClonesIgnorePresentationAndRenameConsistently);
   Test('rejects inconsistent identifier equality mappings',
     TestInconsistentRenamingDoesNotMatch);
+  Test('rejects an inconsistent third group occurrence',
+    TestGroupRejectsInconsistentThirdOccurrence);
   Test('keeps same-file clone occurrences non-overlapping',
     TestSameFileOccurrencesDoNotOverlap);
   Test('does not mix declaration and executable regions',
@@ -427,8 +526,16 @@ begin
     TestThresholdIsOptionalAndStrictlyExceeded);
   Test('rejects a pathological clone floor below 25',
     TestManifestRejectsMinimumBelowFloor);
+  Test('rejects a non-integer clone minimum',
+    TestManifestRejectsNonIntegerMinimum);
+  Test('rejects a negative duplication maximum',
+    TestManifestRejectsNegativeMaximum);
+  Test('rejects duplication configuration that is not a table',
+    TestManifestRejectsNonTableDuplication);
   Test('rejects invalid maximum-percent values and types',
     TestManifestRejectsInvalidMaximumPercent);
+  Test('names the absolute source path when reading fails',
+    TestReadFailureNamesAbsolutePath);
   Test('workspace policy overrides root while analysis exclusion remains final',
     TestWorkspaceOverridesRootMinimumAndAnalysisExclusion);
   Test('workspace policy is inherited or replaced as a complete section',

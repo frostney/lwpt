@@ -1,6 +1,6 @@
 # Tooling
 
-Pinned tool versions, environment variables, lint/format/test commands, OpenSSL stories per platform, EXDEV fallback, and where each deferred stack-contract item lives.
+Pinned tool versions, environment variables, lint/format/test commands, OpenSSL stories per platform, EXDEV fallback, and current stack-contract status.
 
 ## Executive Summary
 
@@ -246,8 +246,9 @@ makes the detector Type-2 rather than text-only.
 
 Candidates are selected by descending normalized length and stable source
 coordinates. The report retains maximal non-overlapping occurrences, including
-same-file and cross-file groups. Aggregate duplication is duplicate tokens
-beyond each group's first occurrence divided by all analyzed region tokens.
+same-file and cross-file groups, and verifies each new occurrence against every
+member already accepted into its clone group. Aggregate duplication is duplicate
+tokens beyond each group's first occurrence divided by all analyzed region tokens.
 The default minimum is 100 normalized tokens:
 
 ```toml
@@ -270,14 +271,15 @@ envelope plus a duplication-owned payload containing effective project policy,
 token totals, clone groups, stable locations, and the threshold outcome. Both
 forms are deterministic and the command performs no network operations.
 
-## Deferred from v1
+## Remaining deferred contract
 
-The three customer-facing stack contracts from `project-structure` beyond build-system and formatter:
+ADR-0006 originally deferred several customer-facing stack contracts beyond the
+build system and formatter. Duplication analysis now ships; one contract remains
+active as deferred work:
 
 | Contract | Workstream | Notes |
 | --- | --- | --- |
 | **Codebase-health** (`lwpt health`) | [Issue #33](https://github.com/frostney/lwpt/issues/33) | Cyclomatic + cognitive complexity; non-zero exit on threshold breach. Per-file aggregate signal + hotspot detection from git churn. |
-| **Link-check** | [Issue #31](https://github.com/frostney/lwpt/issues/31) | Graduates from GocciaScript as a standalone LWPT package; offline + explicit online modes. |
 
 The v1 pre-commit gate excludes the remaining deferred contracts. ADR-0006
 records the original deferral. Architecture drift is checked across LWPT's

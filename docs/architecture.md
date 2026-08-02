@@ -8,7 +8,7 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 - **Zero-install by default.** `.lwpt/modules/` (extracted) and `.lwpt/archives/` (verification) are committed; a fresh clone is buildable with `fpc @lwpt.cfg` before `lwpt install` is ever run. See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md).
 - **Self-hosting from day one.** LWPT builds LWPT through `lwpt build` against the repo's own manifest; the one-time `scripts/bootstrap.pas` resolves the chicken-and-egg. See [ADR-0005](./adr/0005-self-host-build.md).
 - **RTL-only with LWPT-canonical packages.** No third-party FPC dependencies in the binary; HTTPS is `HTTPClient` from LWPT's `packages/httpclient/`. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for HTTPClient, CLI, Semver, TOML, and TestingPascalLibrary — all consumed as workspace packages via the root manifest's `[workspaces]` glob (Phase 1 done per ADR-0014 + ADR-0015). GocciaScript is the first named consumer and commits to Path A adoption; Phase 2 graduates individual packages to standalone repos when warranted.
-- **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry implementation is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); its interoperable wire contract is specified in [`registry-spec.md`](./registry-spec.md). Duplication analysis has landed; the remaining link and codebase-health contracts originally deferred by ADR-0006 stay separate workstreams rather than half-built features. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
+- **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry implementation is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); its interoperable wire contract is specified in [`registry-spec.md`](./registry-spec.md). Duplication analysis has landed; codebase health remains a separate workstream rather than a half-built feature. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
 - **Compiler work is session-private.** Build/test compiler outputs stay below `.lwpt/sessions/<session-id>/`; successful build outputs are revalidated and atomically published, while completed-session logs remain available until `lwpt repair` reclaims the session. See ADR-0020.
 - **Build scheduling follows the manifest DAG.** Ready build entries overlap within
@@ -262,11 +262,12 @@ lifecycle hooks, tests, and public surface. Formatting is the explicit exception
 the root manifest formats workspace packages by default, and a package opts out
 by declaring its own `[format]` section.
 
-## Deferred contracts
+## ADR-0006 contract status
 
-Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), three customer-facing `project-structure` contracts beyond build-system and formatter are deferred from v1:
+ADR-0006 originally deferred customer-facing `project-structure` contracts
+beyond the build system and formatter. Duplication has since shipped; codebase
+health remains deferred:
 
-- **link-check** — graduates from GocciaScript as a standalone LWPT package in [issue #31](https://github.com/frostney/lwpt/issues/31).
 - **duplication** — delivered as the Pascal-native `lwpt duplication`
   subcommand from [issue #32](https://github.com/frostney/lwpt/issues/32).
 - **codebase-health** — becomes a `lwpt health` subcommand in [issue #33](https://github.com/frostney/lwpt/issues/33).

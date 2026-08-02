@@ -29,6 +29,7 @@ type
     array of TLWPTDuplicationConfiguration;
 
   TLWPTCloneOccurrence = record
+    DocumentIndex: Integer; { internal owner; intentionally not serialized }
     FileName: string;
     RegionKind: string;
     StartLine: Integer;
@@ -80,10 +81,16 @@ uses
   LWPT.Analysis.Pascal;
 
 type
+  TIntegerArray = array of Integer;
+  TQWordArray = array of QWord;
+
   TAnalyzedDocument = record
     ProjectIndex: Integer;
     RootRelativePath: string;
     Document: TLWPTPascalDocument;
+    TokenIDs: TIntegerArray;
+    PreviousToken: TIntegerArray;
+    NextToken: TIntegerArray;
   end;
   TAnalyzedDocumentArray = array of TAnalyzedDocument;
 
@@ -114,24 +121,31 @@ type
   end;
   TInternalOccurrenceArray = array of TInternalOccurrence;
   TBooleanArray = array of Boolean;
-  TIntegerArray = array of Integer;
   TDocumentOccupancy = array of TBooleanArray;
-  TTokenMapping = record
-    LeftValue: string;
-    RightValue: string;
+  TParameterizedMatcher = record
+    Generation: Integer;
+    LeftMap: TIntegerArray;
+    RightMap: TIntegerArray;
+    LeftStamp: TIntegerArray;
+    RightStamp: TIntegerArray;
   end;
-  TTokenMappingArray = array of TTokenMapping;
 
 function ReadSourceText(const APath: string): string;
 var
   Stream: TFileStream;
 begin
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
   try
-    SetLength(Result, Stream.Size);
-    if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
-  finally
-    Stream.Free;
+    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
+    try
+      SetLength(Result, Stream.Size);
+      if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
+    finally
+      Stream.Free;
+    end;
+  except
+    on E: Exception do
+      raise ELWPTError.CreateFmt('failed to read analysis source "%s": %s',
+        [APath, E.Message]);
   end;
 end;
 
@@ -246,117 +260,202 @@ begin
   MergeSort(0, High(ASeeds));
 end;
 
-{$PUSH}{$Q-}{$R-}
-procedure HashByte(var AHash: QWord; const AValue: Byte); inline;
-begin
-  AHash := (AHash xor AValue) * QWord(1099511628211);
-end;
-
-procedure HashInteger(var AHash: QWord; const AValue: Integer);
-var
-  Shift: Integer;
-begin
-  for Shift := 0 to 3 do
-    HashByte(AHash, Byte((Cardinal(AValue) shr (Shift * 8)) and $ff));
-end;
-
-procedure HashText(var AHash: QWord; const AValue: string);
-var
-  CharacterIndex: Integer;
-begin
-  HashInteger(AHash, Length(AValue));
-  for CharacterIndex := 1 to Length(AValue) do
-    HashByte(AHash, Byte(AValue[CharacterIndex]));
-end;
-{$POP}
-
 function ParameterizedToken(const AKind: TLWPTPascalTokenKind): Boolean;
 begin
   Result := AKind in [ptIdentifier, ptNumber, ptString];
 end;
 
-function WindowHash(const ADocument: TLWPTPascalDocument;
-  const AStartToken, ATokenCount: Integer): QWord;
-var
-  CanonicalValues: TStringList;
-  CanonicalIndex, TokenIndex: Integer;
-  Token: TLWPTPascalToken;
+function TokenIdentityKey(const AToken: TLWPTPascalToken): string;
 begin
-  Result := QWord(14695981039346656037);
-  CanonicalValues := TStringList.Create;
+  Result := Chr(Ord(AToken.Kind) + 1) + ':' + AToken.Text;
+end;
+
+procedure BuildCanonicalTokenData(var ADocuments: TAnalyzedDocumentArray;
+  out ATokenIDCount: Integer);
+var
+  DocumentIndex, TokenID, TokenIndex: Integer;
+  LastSeen: TIntegerArray;
+  TokenIdentities: TStringList;
+begin
+  TokenIdentities := TStringList.Create;
   try
-    CanonicalValues.CaseSensitive := True;
-    for TokenIndex := AStartToken to AStartToken + ATokenCount - 1 do
+    TokenIdentities.CaseSensitive := True;
+    TokenIdentities.Sorted := True;
+    TokenIdentities.Duplicates := dupIgnore;
+    for DocumentIndex := 0 to High(ADocuments) do
+      for TokenIndex := 0 to High(ADocuments[DocumentIndex].Document.Tokens) do
+        TokenIdentities.Add(TokenIdentityKey(ADocuments[DocumentIndex].
+          Document.Tokens[TokenIndex]));
+    ATokenIDCount := TokenIdentities.Count;
+    SetLength(LastSeen, ATokenIDCount + 1);
+    for DocumentIndex := 0 to High(ADocuments) do
     begin
-      Token := ADocument.Tokens[TokenIndex];
-      HashInteger(Result, Ord(Token.Kind));
-      if ParameterizedToken(Token.Kind) then
+      SetLength(ADocuments[DocumentIndex].TokenIDs,
+        Length(ADocuments[DocumentIndex].Document.Tokens));
+      SetLength(ADocuments[DocumentIndex].PreviousToken,
+        Length(ADocuments[DocumentIndex].Document.Tokens));
+      SetLength(ADocuments[DocumentIndex].NextToken,
+        Length(ADocuments[DocumentIndex].Document.Tokens));
+      FillChar(LastSeen[0], Length(LastSeen) * SizeOf(LastSeen[0]), 0);
+      for TokenIndex := 0 to
+        High(ADocuments[DocumentIndex].Document.Tokens) do
       begin
-        CanonicalIndex := CanonicalValues.IndexOf(
-          IntToStr(Ord(Token.Kind)) + ':' + Token.Text);
-        if CanonicalIndex < 0 then
-        begin
-          CanonicalIndex := CanonicalValues.Count;
-          CanonicalValues.Add(IntToStr(Ord(Token.Kind)) + ':' + Token.Text);
-        end;
-        HashInteger(Result, CanonicalIndex);
-      end
-      else
-        HashText(Result, Token.Text);
+        TokenID := TokenIdentities.IndexOf(TokenIdentityKey(
+          ADocuments[DocumentIndex].Document.Tokens[TokenIndex])) + 1;
+        ADocuments[DocumentIndex].TokenIDs[TokenIndex] := TokenID;
+        ADocuments[DocumentIndex].PreviousToken[TokenIndex] :=
+          LastSeen[TokenID] - 1;
+        LastSeen[TokenID] := TokenIndex + 1;
+      end;
+      FillChar(LastSeen[0], Length(LastSeen) * SizeOf(LastSeen[0]), 0);
+      for TokenIndex := High(ADocuments[DocumentIndex].Document.Tokens)
+        downto 0 do
+      begin
+        TokenID := ADocuments[DocumentIndex].TokenIDs[TokenIndex];
+        ADocuments[DocumentIndex].NextToken[TokenIndex] :=
+          LastSeen[TokenID] - 1;
+        LastSeen[TokenID] := TokenIndex + 1;
+      end;
     end;
   finally
-    CanonicalValues.Free;
+    TokenIdentities.Free;
   end;
 end;
 
-function ParameterizedMatchLength(const ALeftDocument,
-  ARightDocument: TLWPTPascalDocument; const ALeftStart, ALeftLimit,
-  ARightStart, ARightLimit: Integer): Integer;
+function ParameterizedValue(const ADocument: TAnalyzedDocument;
+  const ATokenIndex, AWindowStart: Integer): Integer; inline;
+begin
+  Result := ADocument.PreviousToken[ATokenIndex];
+  if Result < AWindowStart then Result := 0
+  else Result := ATokenIndex - Result;
+end;
+
+function EncodedToken(const ADocument: TAnalyzedDocument;
+  const ATokenIndex, AWindowStart: Integer): QWord; inline;
+begin
+  Result := QWord(Ord(ADocument.Document.Tokens[ATokenIndex].Kind) + 1)
+    shl 32;
+  if ParameterizedToken(ADocument.Document.Tokens[ATokenIndex].Kind) then
+    Result := Result + QWord(ParameterizedValue(ADocument, ATokenIndex,
+      AWindowStart))
+  else
+    Result := Result + QWord(ADocument.TokenIDs[ATokenIndex]);
+end;
+
+const
+  WINDOW_HASH_BASE = QWord(1099511628211);
+
+{$PUSH}{$Q-}{$R-}
+procedure BuildWindowPowers(const ATokenCount: Integer;
+  var APowers: TQWordArray);
 var
-  FoundMapping: Boolean;
-  Mapping: TTokenMappingArray;
-  MappingCount, MappingIndex: Integer;
-  LeftKey, RightKey: string;
+  PowerIndex: Integer;
+begin
+  SetLength(APowers, ATokenCount);
+  APowers[0] := 1;
+  for PowerIndex := 1 to High(APowers) do
+    APowers[PowerIndex] := APowers[PowerIndex - 1] * WINDOW_HASH_BASE;
+end;
+
+function InitialWindowHash(const ADocument: TAnalyzedDocument;
+  const AStartToken, ATokenCount: Integer): QWord;
+var
+  TokenIndex: Integer;
+begin
+  Result := 0;
+  for TokenIndex := AStartToken to AStartToken + ATokenCount - 1 do
+    Result := Result * WINDOW_HASH_BASE
+      + EncodedToken(ADocument, TokenIndex, AStartToken);
+end;
+
+function ShiftWindowHash(const ADocument: TAnalyzedDocument;
+  const AHash: QWord; const AStartToken, ATokenCount: Integer;
+  const APowers: TQWordArray): QWord;
+var
+  Distance, NextOccurrence: Integer;
+begin
+  Result := AHash - EncodedToken(ADocument, AStartToken, AStartToken)
+    * APowers[ATokenCount - 1];
+  if ParameterizedToken(ADocument.Document.Tokens[AStartToken].Kind) then
+  begin
+    NextOccurrence := ADocument.NextToken[AStartToken];
+    if (NextOccurrence >= 0)
+      and (NextOccurrence < AStartToken + ATokenCount) then
+    begin
+      Distance := NextOccurrence - AStartToken;
+      Result := Result - QWord(Distance)
+        * APowers[ATokenCount - 1 - Distance];
+    end;
+  end;
+  Result := Result * WINDOW_HASH_BASE
+    + EncodedToken(ADocument, AStartToken + ATokenCount, AStartToken + 1);
+end;
+{$POP}
+
+procedure InitializeMatcher(var AMatcher: TParameterizedMatcher;
+  const ATokenIDCount: Integer);
+begin
+  AMatcher := Default(TParameterizedMatcher);
+  SetLength(AMatcher.LeftMap, ATokenIDCount + 1);
+  SetLength(AMatcher.RightMap, ATokenIDCount + 1);
+  SetLength(AMatcher.LeftStamp, ATokenIDCount + 1);
+  SetLength(AMatcher.RightStamp, ATokenIDCount + 1);
+end;
+
+procedure BeginMatch(var AMatcher: TParameterizedMatcher);
+begin
+  if AMatcher.Generation = High(Integer) then
+  begin
+    FillChar(AMatcher.LeftStamp[0], Length(AMatcher.LeftStamp)
+      * SizeOf(AMatcher.LeftStamp[0]), 0);
+    FillChar(AMatcher.RightStamp[0], Length(AMatcher.RightStamp)
+      * SizeOf(AMatcher.RightStamp[0]), 0);
+    AMatcher.Generation := 1;
+  end
+  else
+    Inc(AMatcher.Generation);
+end;
+
+function ParameterizedMatchLength(const ALeftDocument,
+  ARightDocument: TAnalyzedDocument; const ALeftStart, ALeftLimit,
+  ARightStart, ARightLimit: Integer;
+  var AMatcher: TParameterizedMatcher): Integer;
+var
+  LeftID, RightID: Integer;
   LeftToken, RightToken: TLWPTPascalToken;
 begin
   Result := 0;
-  SetLength(Mapping, 0);
+  BeginMatch(AMatcher);
   while (ALeftStart + Result < ALeftLimit)
     and (ARightStart + Result < ARightLimit) do
   begin
-    LeftToken := ALeftDocument.Tokens[ALeftStart + Result];
-    RightToken := ARightDocument.Tokens[ARightStart + Result];
+    LeftToken := ALeftDocument.Document.Tokens[ALeftStart + Result];
+    RightToken := ARightDocument.Document.Tokens[ARightStart + Result];
     if LeftToken.Kind <> RightToken.Kind then Exit;
     if not ParameterizedToken(LeftToken.Kind) then
     begin
-      if LeftToken.Text <> RightToken.Text then Exit;
+      if ALeftDocument.TokenIDs[ALeftStart + Result]
+        <> ARightDocument.TokenIDs[ARightStart + Result] then Exit;
       Inc(Result);
       Continue;
     end;
-    LeftKey := IntToStr(Ord(LeftToken.Kind)) + ':' + LeftToken.Text;
-    RightKey := IntToStr(Ord(RightToken.Kind)) + ':' + RightToken.Text;
-    FoundMapping := False;
-    for MappingIndex := 0 to High(Mapping) do
+    LeftID := ALeftDocument.TokenIDs[ALeftStart + Result];
+    RightID := ARightDocument.TokenIDs[ARightStart + Result];
+    if (AMatcher.LeftStamp[LeftID] = AMatcher.Generation)
+      and (AMatcher.LeftMap[LeftID] <> RightID) then Exit;
+    if (AMatcher.RightStamp[RightID] = AMatcher.Generation)
+      and (AMatcher.RightMap[RightID] <> LeftID) then Exit;
+    if AMatcher.LeftStamp[LeftID] <> AMatcher.Generation then
     begin
-      if (Mapping[MappingIndex].LeftValue = LeftKey)
-        and (Mapping[MappingIndex].RightValue <> RightKey) then Exit;
-      if (Mapping[MappingIndex].RightValue = RightKey)
-        and (Mapping[MappingIndex].LeftValue <> LeftKey) then Exit;
-      if Mapping[MappingIndex].LeftValue = LeftKey then
-      begin
-        Inc(Result);
-        FoundMapping := True;
-        Break;
-      end;
+      AMatcher.LeftStamp[LeftID] := AMatcher.Generation;
+      AMatcher.LeftMap[LeftID] := RightID;
     end;
-    if not FoundMapping then
+    if AMatcher.RightStamp[RightID] <> AMatcher.Generation then
     begin
-      MappingCount := Length(Mapping);
-      SetLength(Mapping, MappingCount + 1);
-      Mapping[MappingCount].LeftValue := LeftKey;
-      Mapping[MappingCount].RightValue := RightKey;
-      Inc(Result);
+      AMatcher.RightStamp[RightID] := AMatcher.Generation;
+      AMatcher.RightMap[RightID] := LeftID;
     end;
+    Inc(Result);
   end;
 end;
 
@@ -377,18 +476,28 @@ procedure BuildSeeds(const ADocuments: TAnalyzedDocumentArray;
   const AMinimumTokens: Integer; var ASeeds: TSeedArray);
 var
   DocumentIndex, RegionIndex, StartToken: Integer;
+  Powers: TQWordArray;
   Region: TLWPTPascalRegion;
+  RollingHash: QWord;
 begin
   SetLength(ASeeds, 0);
+  BuildWindowPowers(AMinimumTokens, Powers);
   for DocumentIndex := 0 to High(ADocuments) do
     for RegionIndex := 0 to High(ADocuments[DocumentIndex].Document.Regions) do
     begin
       Region := ADocuments[DocumentIndex].Document.Regions[RegionIndex];
+      if Region.Tokens.EndToken - Region.Tokens.StartToken < AMinimumTokens
+        then Continue;
+      RollingHash := InitialWindowHash(ADocuments[DocumentIndex],
+        Region.Tokens.StartToken, AMinimumTokens);
       for StartToken := Region.Tokens.StartToken to
         Region.Tokens.EndToken - AMinimumTokens do
-        AddSeed(ASeeds, WindowHash(ADocuments[DocumentIndex].Document,
-          StartToken, AMinimumTokens), DocumentIndex, RegionIndex,
-          StartToken);
+      begin
+        AddSeed(ASeeds, RollingHash, DocumentIndex, RegionIndex, StartToken);
+        if StartToken < Region.Tokens.EndToken - AMinimumTokens then
+          RollingHash := ShiftWindowHash(ADocuments[DocumentIndex],
+            RollingHash, StartToken, AMinimumTokens, Powers);
+      end;
     end;
   SortSeeds(ASeeds);
 end;
@@ -431,10 +540,8 @@ end;
 function CompareParameterizedSuffix(const ALeft, ARight: TSeed;
   const ADocuments: TAnalyzedDocumentArray): Integer;
 var
-  LeftCanonical, RightCanonical: TStringList;
   LeftIndex, LeftLimit, LeftValue, RightIndex, RightLimit,
     RightValue: Integer;
-  LeftKey, RightKey: string;
   LeftToken, RightToken: TLWPTPascalToken;
 begin
   LeftIndex := ALeft.StartToken;
@@ -443,54 +550,37 @@ begin
     ALeft.RegionIndex].Tokens.EndToken;
   RightLimit := ADocuments[ARight.DocumentIndex].Document.Regions[
     ARight.RegionIndex].Tokens.EndToken;
-  LeftCanonical := TStringList.Create;
-  RightCanonical := TStringList.Create;
-  try
-    LeftCanonical.CaseSensitive := True;
-    RightCanonical.CaseSensitive := True;
-    while (LeftIndex < LeftLimit) and (RightIndex < RightLimit) do
+  while (LeftIndex < LeftLimit) and (RightIndex < RightLimit) do
+  begin
+    LeftToken := ADocuments[ALeft.DocumentIndex].Document.Tokens[LeftIndex];
+    RightToken := ADocuments[ARight.DocumentIndex].Document.Tokens[
+      RightIndex];
+    if Ord(LeftToken.Kind) < Ord(RightToken.Kind) then Exit(-1);
+    if Ord(LeftToken.Kind) > Ord(RightToken.Kind) then Exit(1);
+    if ParameterizedToken(LeftToken.Kind) then
     begin
-      LeftToken := ADocuments[ALeft.DocumentIndex].Document.Tokens[LeftIndex];
-      RightToken := ADocuments[ARight.DocumentIndex].Document.Tokens[
-        RightIndex];
-      if Ord(LeftToken.Kind) < Ord(RightToken.Kind) then Exit(-1);
-      if Ord(LeftToken.Kind) > Ord(RightToken.Kind) then Exit(1);
-      if ParameterizedToken(LeftToken.Kind) then
-      begin
-        LeftKey := IntToStr(Ord(LeftToken.Kind)) + ':' + LeftToken.Text;
-        RightKey := IntToStr(Ord(RightToken.Kind)) + ':' + RightToken.Text;
-        LeftValue := LeftCanonical.IndexOf(LeftKey);
-        if LeftValue < 0 then
-        begin
-          LeftValue := LeftCanonical.Count;
-          LeftCanonical.Add(LeftKey);
-        end;
-        RightValue := RightCanonical.IndexOf(RightKey);
-        if RightValue < 0 then
-        begin
-          RightValue := RightCanonical.Count;
-          RightCanonical.Add(RightKey);
-        end;
-        if LeftValue < RightValue then Exit(-1);
-        if LeftValue > RightValue then Exit(1);
-      end
-      else
-      begin
-        Result := CompareStr(LeftToken.Text, RightToken.Text);
-        if Result <> 0 then Exit;
-      end;
-      Inc(LeftIndex);
-      Inc(RightIndex);
+      LeftValue := ParameterizedValue(ADocuments[ALeft.DocumentIndex],
+        LeftIndex, ALeft.StartToken);
+      RightValue := ParameterizedValue(ADocuments[ARight.DocumentIndex],
+        RightIndex, ARight.StartToken);
+      if LeftValue < RightValue then Exit(-1);
+      if LeftValue > RightValue then Exit(1);
     end;
-    if LeftIndex < LeftLimit then Exit(1);
-    if RightIndex < RightLimit then Exit(-1);
-    Result := CompareOccurrence(ALeft.DocumentIndex, ALeft.RegionIndex,
-      ALeft.StartToken, ARight.DocumentIndex, ARight.RegionIndex,
-      ARight.StartToken);
-  finally
-    LeftCanonical.Free;
-    RightCanonical.Free;
+    if not ParameterizedToken(LeftToken.Kind) then
+    begin
+      LeftValue := ADocuments[ALeft.DocumentIndex].TokenIDs[LeftIndex];
+      RightValue := ADocuments[ARight.DocumentIndex].TokenIDs[RightIndex];
+      if LeftValue < RightValue then Exit(-1);
+      if LeftValue > RightValue then Exit(1);
+    end;
+    Inc(LeftIndex);
+    Inc(RightIndex);
   end;
+  if LeftIndex < LeftLimit then Exit(1);
+  if RightIndex < RightLimit then Exit(-1);
+  Result := CompareOccurrence(ALeft.DocumentIndex, ALeft.RegionIndex,
+    ALeft.StartToken, ARight.DocumentIndex, ARight.RegionIndex,
+    ARight.StartToken);
 end;
 
 procedure SortSeedSuffixes(var ASeeds: TSeedArray;
@@ -549,13 +639,15 @@ end;
 procedure BuildCandidateBucket(const ADocuments: TAnalyzedDocumentArray;
   const AConfigurations: TLWPTDuplicationConfigurationArray;
   const ASeeds: TSeedArray; const AExecutable: Boolean;
-  var ACandidates: TCandidateArray);
+  var AMatcher: TParameterizedMatcher; var ACandidates: TCandidateArray);
 var
   Bucket: TSeedArray;
-  AdjacentLCP, EarliestSeed, LatestSeed: TIntegerArray;
+  AdjacentLCP, DocumentStamp, EarliestSeed, LatestSeed,
+    TouchedDocuments: TIntegerArray;
   BestDistance, BestDocument, BucketCount, CandidateLength, DocumentIndex,
-    GroupEnd, GroupStart, LCPIndex, MatchLength, MinimumIndex,
-    RequiredMinimum, SeedIndex: Integer;
+    FirstDocumentSeed, GroupEnd, GroupStart, IntervalStamp, LCPIndex,
+    MatchLength, MinimumIndex, RequiredMinimum, SecondDocumentSeed,
+    SeedIndex, TouchedDocumentCount, TouchedIndex: Integer;
   DuplicateInterval: Boolean;
   LeftRegion, RightRegion: TLWPTPascalRegion;
 begin
@@ -587,14 +679,18 @@ begin
     RightRegion := ADocuments[Bucket[SeedIndex + 1].DocumentIndex].Document.
       Regions[Bucket[SeedIndex + 1].RegionIndex];
     AdjacentLCP[SeedIndex] := ParameterizedMatchLength(
-      ADocuments[Bucket[SeedIndex].DocumentIndex].Document,
-      ADocuments[Bucket[SeedIndex + 1].DocumentIndex].Document,
+      ADocuments[Bucket[SeedIndex].DocumentIndex],
+      ADocuments[Bucket[SeedIndex + 1].DocumentIndex],
       Bucket[SeedIndex].StartToken, LeftRegion.Tokens.EndToken,
-      Bucket[SeedIndex + 1].StartToken, RightRegion.Tokens.EndToken);
+      Bucket[SeedIndex + 1].StartToken, RightRegion.Tokens.EndToken,
+      AMatcher);
   end;
 
   SetLength(EarliestSeed, Length(ADocuments));
   SetLength(LatestSeed, Length(ADocuments));
+  SetLength(DocumentStamp, Length(ADocuments));
+  SetLength(TouchedDocuments, Length(ADocuments));
+  IntervalStamp := 0;
   for LCPIndex := 0 to High(AdjacentLCP) do
   begin
     MatchLength := AdjacentLCP[LCPIndex];
@@ -618,45 +714,63 @@ begin
       end;
     if DuplicateInterval then Continue;
 
-    for DocumentIndex := 0 to High(ADocuments) do
-    begin
-      EarliestSeed[DocumentIndex] := -1;
-      LatestSeed[DocumentIndex] := -1;
-    end;
+    Inc(IntervalStamp);
+    TouchedDocumentCount := 0;
     for SeedIndex := GroupStart to GroupEnd + 1 do
     begin
       DocumentIndex := Bucket[SeedIndex].DocumentIndex;
       RequiredMinimum := AConfigurations[ADocuments[DocumentIndex].
         ProjectIndex].MinimumTokens;
       if RequiredMinimum > MatchLength then Continue;
-      if (EarliestSeed[DocumentIndex] < 0) or
+      if DocumentStamp[DocumentIndex] <> IntervalStamp then
+      begin
+        DocumentStamp[DocumentIndex] := IntervalStamp;
+        EarliestSeed[DocumentIndex] := SeedIndex;
+        LatestSeed[DocumentIndex] := SeedIndex;
+        TouchedDocuments[TouchedDocumentCount] := DocumentIndex;
+        Inc(TouchedDocumentCount);
+        Continue;
+      end;
+      if
         (Bucket[SeedIndex].StartToken < Bucket[
           EarliestSeed[DocumentIndex]].StartToken) then
         EarliestSeed[DocumentIndex] := SeedIndex;
-      if (LatestSeed[DocumentIndex] < 0) or
+      if
         (Bucket[SeedIndex].StartToken > Bucket[
           LatestSeed[DocumentIndex]].StartToken) then
         LatestSeed[DocumentIndex] := SeedIndex;
     end;
 
     { Different documents never overlap, so the interval LCP is optimal. }
-    MinimumIndex := -1;
-    SeedIndex := -1;
-    for DocumentIndex := 0 to High(ADocuments) do
-      if EarliestSeed[DocumentIndex] >= 0 then
-      begin
-        if MinimumIndex < 0 then
-          MinimumIndex := EarliestSeed[DocumentIndex]
-        else
-        begin
-          SeedIndex := EarliestSeed[DocumentIndex];
-          Break;
-        end;
-      end;
-    if SeedIndex >= 0 then
+    FirstDocumentSeed := -1;
+    SecondDocumentSeed := -1;
+    for TouchedIndex := 0 to TouchedDocumentCount - 1 do
     begin
-      AddCandidate(ACandidates, Bucket[MinimumIndex], Bucket[SeedIndex],
-        MatchLength);
+      DocumentIndex := TouchedDocuments[TouchedIndex];
+      if (FirstDocumentSeed < 0) or
+        (CompareOccurrence(Bucket[EarliestSeed[DocumentIndex]].DocumentIndex,
+          Bucket[EarliestSeed[DocumentIndex]].RegionIndex,
+          Bucket[EarliestSeed[DocumentIndex]].StartToken,
+          Bucket[FirstDocumentSeed].DocumentIndex,
+          Bucket[FirstDocumentSeed].RegionIndex,
+          Bucket[FirstDocumentSeed].StartToken) < 0) then
+      begin
+        SecondDocumentSeed := FirstDocumentSeed;
+        FirstDocumentSeed := EarliestSeed[DocumentIndex];
+      end
+      else if (SecondDocumentSeed < 0) or
+        (CompareOccurrence(Bucket[EarliestSeed[DocumentIndex]].DocumentIndex,
+          Bucket[EarliestSeed[DocumentIndex]].RegionIndex,
+          Bucket[EarliestSeed[DocumentIndex]].StartToken,
+          Bucket[SecondDocumentSeed].DocumentIndex,
+          Bucket[SecondDocumentSeed].RegionIndex,
+          Bucket[SecondDocumentSeed].StartToken) < 0) then
+        SecondDocumentSeed := EarliestSeed[DocumentIndex];
+    end;
+    if SecondDocumentSeed >= 0 then
+    begin
+      AddCandidate(ACandidates, Bucket[FirstDocumentSeed],
+        Bucket[SecondDocumentSeed], MatchLength);
       Continue;
     end;
 
@@ -664,10 +778,10 @@ begin
       LCP interval the extreme starts maximize min(LCP, distance). }
     BestDistance := -1;
     BestDocument := -1;
-    for DocumentIndex := 0 to High(ADocuments) do
-      if (EarliestSeed[DocumentIndex] >= 0)
-        and (LatestSeed[DocumentIndex] >= 0)
-        and (EarliestSeed[DocumentIndex] <> LatestSeed[DocumentIndex])
+    for TouchedIndex := 0 to TouchedDocumentCount - 1 do
+    begin
+      DocumentIndex := TouchedDocuments[TouchedIndex];
+      if (EarliestSeed[DocumentIndex] <> LatestSeed[DocumentIndex])
         and (Bucket[LatestSeed[DocumentIndex]].StartToken
           - Bucket[EarliestSeed[DocumentIndex]].StartToken >
           BestDistance) then
@@ -676,6 +790,7 @@ begin
           - Bucket[EarliestSeed[DocumentIndex]].StartToken;
         BestDocument := DocumentIndex;
       end;
+    end;
     if BestDocument < 0 then Continue;
     CandidateLength := MatchLength;
     if BestDistance < CandidateLength then CandidateLength := BestDistance;
@@ -689,7 +804,8 @@ end;
 
 procedure BuildCandidates(const ADocuments: TAnalyzedDocumentArray;
   const AConfigurations: TLWPTDuplicationConfigurationArray;
-  const ASeeds: TSeedArray; var ACandidates: TCandidateArray);
+  const ASeeds: TSeedArray; var AMatcher: TParameterizedMatcher;
+  var ACandidates: TCandidateArray);
 var
   GroupEnd, GroupIndex, GroupStart: Integer;
   SeedGroup: TSeedArray;
@@ -705,9 +821,9 @@ begin
     for GroupIndex := GroupStart to GroupEnd - 1 do
       SeedGroup[GroupIndex - GroupStart] := ASeeds[GroupIndex];
     BuildCandidateBucket(ADocuments, AConfigurations, SeedGroup, False,
-      ACandidates);
+      AMatcher, ACandidates);
     BuildCandidateBucket(ADocuments, AConfigurations, SeedGroup, True,
-      ACandidates);
+      AMatcher, ACandidates);
     GroupStart := GroupEnd;
   end;
 end;
@@ -867,6 +983,7 @@ begin
       LastToken];
     with AReport.Groups[GroupIndex].Occurrences[OccurrenceIndex] do
     begin
+      DocumentIndex := Occurrence.DocumentIndex;
       FileName := ADocuments[Occurrence.DocumentIndex].RootRelativePath;
       RegionKind := RegionKindName(ADocuments[Occurrence.DocumentIndex].
         Document.Regions[Occurrence.RegionIndex].Kind);
@@ -880,18 +997,75 @@ begin
     * (Length(AOccurrences) - 1));
 end;
 
+function SeedHashStart(const ASeeds: TSeedArray; const AHash: QWord): Integer;
+var
+  HighIndex, MiddleIndex, LowIndex: Integer;
+begin
+  LowIndex := 0;
+  HighIndex := Length(ASeeds);
+  while LowIndex < HighIndex do
+  begin
+    MiddleIndex := LowIndex + ((HighIndex - LowIndex) div 2);
+    if ASeeds[MiddleIndex].Hash < AHash then LowIndex := MiddleIndex + 1
+    else HighIndex := MiddleIndex;
+  end;
+  Result := LowIndex;
+end;
+
+function SeedHashEnd(const ASeeds: TSeedArray; const AHash: QWord): Integer;
+var
+  HighIndex, MiddleIndex, LowIndex: Integer;
+begin
+  LowIndex := 0;
+  HighIndex := Length(ASeeds);
+  while LowIndex < HighIndex do
+  begin
+    MiddleIndex := LowIndex + ((HighIndex - LowIndex) div 2);
+    if ASeeds[MiddleIndex].Hash <= AHash then LowIndex := MiddleIndex + 1
+    else HighIndex := MiddleIndex;
+  end;
+  Result := LowIndex;
+end;
+
+function MatchesEveryOccurrence(const ADocuments: TAnalyzedDocumentArray;
+  const AOccurrences: TInternalOccurrenceArray;
+  const ACandidateOccurrence: TInternalOccurrence;
+  const ATokenCount: Integer; var AMatcher: TParameterizedMatcher): Boolean;
+var
+  ExistingOccurrence: TInternalOccurrence;
+  MatchLength, OccurrenceIndex: Integer;
+  CandidateRegion, ExistingRegion: TLWPTPascalRegion;
+begin
+  CandidateRegion := ADocuments[ACandidateOccurrence.DocumentIndex].Document.
+    Regions[ACandidateOccurrence.RegionIndex];
+  for OccurrenceIndex := 0 to High(AOccurrences) do
+  begin
+    ExistingOccurrence := AOccurrences[OccurrenceIndex];
+    ExistingRegion := ADocuments[ExistingOccurrence.DocumentIndex].Document.
+      Regions[ExistingOccurrence.RegionIndex];
+    MatchLength := ParameterizedMatchLength(
+      ADocuments[ExistingOccurrence.DocumentIndex],
+      ADocuments[ACandidateOccurrence.DocumentIndex],
+      ExistingOccurrence.StartToken, ExistingRegion.Tokens.EndToken,
+      ACandidateOccurrence.StartToken, CandidateRegion.Tokens.EndToken,
+      AMatcher);
+    if MatchLength < ATokenCount then Exit(False);
+  end;
+  Result := True;
+end;
+
 procedure SelectGroups(const ADocuments: TAnalyzedDocumentArray;
   const AConfigurations: TLWPTDuplicationConfigurationArray;
   const ASeeds: TSeedArray; var ACandidates: TCandidateArray;
-  var AReport: TLWPTDuplicationReport);
+  var AMatcher: TParameterizedMatcher; var AReport: TLWPTDuplicationReport);
 var
   BaseSeed, Seed: TSeed;
-  CandidateIndex, DocumentIndex, MatchLength, SeedIndex: Integer;
+  CandidateIndex, DocumentIndex, SeedEnd, SeedIndex, SeedStart: Integer;
   Candidate: TCandidate;
   Occurrence, RightOccurrence: TInternalOccurrence;
   Occurrences: TInternalOccurrenceArray;
   Occupancy: TDocumentOccupancy;
-  BaseRegion, SeedRegion: TLWPTPascalRegion;
+  SeedRegion: TLWPTPascalRegion;
 begin
   SetLength(Occupancy, Length(ADocuments));
   for DocumentIndex := 0 to High(ADocuments) do
@@ -914,6 +1088,8 @@ begin
       Occurrence.RegionIndex, Occurrence.StartToken);
     if not CanAddOccurrence(Occurrences, RightOccurrence,
       Candidate.TokenCount, Occupancy) then Continue;
+    if not MatchesEveryOccurrence(ADocuments, Occurrences, RightOccurrence,
+      Candidate.TokenCount, AMatcher) then Continue;
     AddInternalOccurrence(Occurrences, RightOccurrence.DocumentIndex,
       RightOccurrence.RegionIndex, RightOccurrence.StartToken);
 
@@ -921,12 +1097,11 @@ begin
     BaseSeed.DocumentIndex := Candidate.LeftDocument;
     BaseSeed.RegionIndex := Candidate.LeftRegion;
     BaseSeed.StartToken := Candidate.LeftStart;
-    BaseRegion := ADocuments[BaseSeed.DocumentIndex].Document.Regions[
-      BaseSeed.RegionIndex];
-    for SeedIndex := 0 to High(ASeeds) do
+    SeedStart := SeedHashStart(ASeeds, Candidate.Hash);
+    SeedEnd := SeedHashEnd(ASeeds, Candidate.Hash);
+    for SeedIndex := SeedStart to SeedEnd - 1 do
     begin
       Seed := ASeeds[SeedIndex];
-      if Seed.Hash <> Candidate.Hash then Continue;
       if CompareOccurrence(Seed.DocumentIndex, Seed.RegionIndex,
         Seed.StartToken, BaseSeed.DocumentIndex, BaseSeed.RegionIndex,
         BaseSeed.StartToken) = 0 then Continue;
@@ -942,12 +1117,8 @@ begin
       if AConfigurations[ADocuments[Seed.DocumentIndex].ProjectIndex].
         MinimumTokens > Candidate.TokenCount then Continue;
       if not SeedsComparable(BaseSeed, Seed, ADocuments) then Continue;
-      MatchLength := ParameterizedMatchLength(
-        ADocuments[BaseSeed.DocumentIndex].Document,
-        ADocuments[Seed.DocumentIndex].Document, BaseSeed.StartToken,
-        BaseRegion.Tokens.EndToken, Seed.StartToken,
-        SeedRegion.Tokens.EndToken);
-      if MatchLength >= Candidate.TokenCount then
+      if MatchesEveryOccurrence(ADocuments, Occurrences, Occurrence,
+        Candidate.TokenCount, AMatcher) then
         AddInternalOccurrence(Occurrences, Seed.DocumentIndex,
           Seed.RegionIndex, Seed.StartToken);
     end;
@@ -988,10 +1159,11 @@ procedure ComputeProjectSummaries(const AScope: TLWPTAnalysisScope;
   const ADocuments: TAnalyzedDocumentArray;
   var AReport: TLWPTDuplicationReport);
 var
-  DocumentIndex, GroupIndex, OccurrenceIndex, ProjectIndex,
-    ProjectOccurrenceCount: Integer;
+  DocumentIndex, GroupIndex, OccurrenceIndex, ProjectIndex: Integer;
+  ProjectOccurrenceCounts: TIntegerArray;
 begin
   SetLength(AReport.Projects, Length(AScope.Projects));
+  SetLength(ProjectOccurrenceCounts, Length(AScope.Projects));
   for ProjectIndex := 0 to High(AScope.Projects) do
     AReport.Projects[ProjectIndex].ProjectName :=
       AScope.Projects[ProjectIndex].Name;
@@ -1001,27 +1173,21 @@ begin
         ADocuments[DocumentIndex].Document.Regions[GroupIndex].Tokens.EndToken
         - ADocuments[DocumentIndex].Document.Regions[GroupIndex].Tokens.StartToken);
   for GroupIndex := 0 to High(AReport.Groups) do
-    for ProjectIndex := 0 to High(AReport.Projects) do
+  begin
+    FillChar(ProjectOccurrenceCounts[0], Length(ProjectOccurrenceCounts)
+      * SizeOf(ProjectOccurrenceCounts[0]), 0);
+    for OccurrenceIndex := 0 to High(AReport.Groups[GroupIndex].Occurrences) do
     begin
-      { Count by resolving the stable report path back through the analyzed
-        document list. The path is unique in the resolved scope. }
-      ProjectOccurrenceCount := 0;
-      for OccurrenceIndex := 0 to
-        High(AReport.Groups[GroupIndex].Occurrences) do
-        for DocumentIndex := 0 to High(ADocuments) do
-          if (ADocuments[DocumentIndex].RootRelativePath =
-            AReport.Groups[GroupIndex].Occurrences[
-              OccurrenceIndex].FileName)
-            and (ADocuments[DocumentIndex].ProjectIndex = ProjectIndex) then
-          begin
-            Inc(ProjectOccurrenceCount);
-            Break;
-          end;
-      if ProjectOccurrenceCount > 1 then
+      DocumentIndex := AReport.Groups[GroupIndex].Occurrences[
+        OccurrenceIndex].DocumentIndex;
+      Inc(ProjectOccurrenceCounts[ADocuments[DocumentIndex].ProjectIndex]);
+    end;
+    for ProjectIndex := 0 to High(AReport.Projects) do
+      if ProjectOccurrenceCounts[ProjectIndex] > 1 then
         Inc(AReport.Projects[ProjectIndex].DuplicateTokens,
           Int64(AReport.Groups[GroupIndex].TokenCount)
-          * (ProjectOccurrenceCount - 1));
-    end;
+          * (ProjectOccurrenceCounts[ProjectIndex] - 1));
+  end;
 end;
 
 procedure EvaluateThresholds(var AReport: TLWPTDuplicationReport);
@@ -1064,7 +1230,8 @@ function AnalyzeDuplication(const AScope: TLWPTAnalysisScope):
 var
   Candidates: TCandidateArray;
   Documents: TAnalyzedDocumentArray;
-  FileIndex, GlobalMinimum, ProjectIndex, RegionIndex: Integer;
+  FileIndex, GlobalMinimum, ProjectIndex, RegionIndex, TokenIDCount: Integer;
+  Matcher: TParameterizedMatcher;
   Seeds: TSeedArray;
 begin
   Result := Default(TLWPTDuplicationReport);
@@ -1090,9 +1257,13 @@ begin
         RegionIndex].Tokens.EndToken - Documents[FileIndex].Document.Regions[
           RegionIndex].Tokens.StartToken);
   end;
+  BuildCanonicalTokenData(Documents, TokenIDCount);
+  InitializeMatcher(Matcher, TokenIDCount);
   BuildSeeds(Documents, GlobalMinimum, Seeds);
-  BuildCandidates(Documents, Result.Configurations, Seeds, Candidates);
-  SelectGroups(Documents, Result.Configurations, Seeds, Candidates, Result);
+  BuildCandidates(Documents, Result.Configurations, Seeds, Matcher,
+    Candidates);
+  SelectGroups(Documents, Result.Configurations, Seeds, Candidates, Matcher,
+    Result);
   ComputeProjectSummaries(AScope, Documents, Result);
   EvaluateThresholds(Result);
 end;

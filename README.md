@@ -23,9 +23,8 @@ lwpt agents    write/verify the agent-facing command reference in AGENTS.md   [-
 
 LWPT is pre-1.0. The package model, install pipeline, formatter, test runner,
 duplication analysis, and release flow are in place; the deferred
-customer-facing contracts
-[link-check](https://github.com/frostney/lwpt/issues/31),
-[codebase-health](https://github.com/frostney/lwpt/issues/33) are tracked
+customer-facing
+[codebase-health](https://github.com/frostney/lwpt/issues/33) contract is tracked
 separately from the project-only release architecture check originally deferred by
 [ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md). See
 [`AGENTS.md`](./AGENTS.md) for the full operating manual and
