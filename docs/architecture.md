@@ -20,6 +20,11 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   argument translation, executable naming, failure classification, and result
   normalization for build, test, and Windows hook compilation. FPC remains the
   only driver and LWPT's own compiler. See ADR-0022 and ADR-0029.
+- **Analysis commands share structure, not policy.** `LWPT.Analysis.Scope`
+  resolves root/workspace ownership, `LWPT.Analysis.Pascal` exposes normalized
+  tokens and typed declaration/executable regions, and `LWPT.Analysis.JSON`
+  wraps command-owned payloads in a deterministic versioned envelope. Matching,
+  scoring, thresholds, and payload schemas remain owned by their commands.
 
 ## Tech stack
 
@@ -75,8 +80,36 @@ Sections currently supported:
 | `[version]` | optional version-baking: writes a generated `.inc` with `<prefix>_VERSION` + `<prefix>_BUILD_DATE` |
 | `[lwpt]` | toolkit-state overrides (`modules-dir`, `archives-dir`, `tmp-dir`, `cfg-file`). Defaults match the constants in `LWPT.Core` |
 | `[format]` | `include = [...]` adds format-scope globs; `exclude = [...]` subtracts them. Toolkit state (root `.lwpt/**` plus any `[lwpt]` override paths) is excluded by default unless an explicit include matches it (ADR-0028). Workspace packages are included by the root walk by default and opt out via their own `[format]` section |
+| `[analysis]` | shared analysis source scope only: `include = [...]` adds Pascal source globs on top of `[package].units` and exact `[build]` sources; `exclude = [...]` subtracts them. Workspaces inherit the root configuration unless they declare their own `[analysis]` table. Command-specific thresholds and policy do not live here. |
 
 Dependency source shapes (per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md)): bare `owner/repo` defaults to GitHub; `gitlab:owner/repo` and `bitbucket:owner/repo` prefixes route to those hosts; any `[sources.<name>]` table declares a custom prefix (Gitea, Forgejo, self-hosted GitHub Enterprise / GitLab / Bitbucket Server); `https://...` is an arbitrary tarball URL; paths (`./foo`, `../foo`, `/abs/foo`, `~/foo`, or `local:./foo`) are local sources. Version specs accept SemVer 2.0.0 ranges (`^1.0.0`, `>=1.0.0 <2.0.0`), exact SemVer versions (`1.0.0` — preferred per [semver.org](https://semver.org/#is-v123-a-semantic-version)), commit SHAs (7–40 hex), or arbitrary Git tag names (`v1.0.0`, `release-2024`). SemVer-shaped specs resolve through git smart-HTTP tag listing (uniform across GitHub / GitLab / Bitbucket / Gitea / Forgejo / self-hosted, no JSON, no auth). Explicitly *not* supported: `[[target]]` array-of-tables syntax, the legacy separate `source = "github|gitlab|..." + repo/ref/tag/asset/path` shape (hard-errored with a migration hint), and `git clone` (HTTP archives only — preserves the single-binary RTL-only constraint).
+
+## Shared analysis foundation
+
+The pre-approved duplication and health commands depend on three neutral deep
+modules. `ResolveAnalysisScope` recursively resolves each declared workspace,
+assigns every Pascal source to its globally deepest discovered project owner,
+skips hidden and linked walks, and returns stable root-relative ordering.
+Package unit roots and exact build entry sources seed the scope;
+`[analysis].include` adds files and `[analysis].exclude` is the final
+subtraction.
+
+`AnalyzePascal` is an RTL-only lexical/structural pass. It strips whitespace and
+comments, retains compiler directives, normalizes case-insensitive tokens, and
+records zero-based byte offsets plus one-based line/column locations. Its typed
+model keeps unit declarations, routine-local declarations, nested routines,
+routine bodies, program bodies, initialization, and finalization separate.
+Consumers therefore choose executable-versus-declaration comparisons explicitly
+instead of inferring them from raw token positions.
+
+`SerializeAnalysisEnvelope` writes a fixed-order LF-delimited JSON envelope with
+an envelope schema/version, command name and independently versioned command
+schema, LWPT name/version, project identity, sorted analyzed-file list, neutral
+effective-configuration name/value entries, threshold outcome, and diagnostics.
+The caller supplies one validated JSON object or array as its payload. Shared
+code does not know duplication matches, health metrics, hotspot scores,
+command-specific configuration schemas, or either command's presentation
+policy.
 
 ## Resolver shape
 
