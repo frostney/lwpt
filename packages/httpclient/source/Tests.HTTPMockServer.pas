@@ -733,18 +733,29 @@ end;
 type
   TMockRejectThread = class(TThread)
   private
+    FErrorCode: LongInt;
     FListenSock: TMockSocket;
+    FRejectionCount: Integer;
+    FRejectedCount: LongInt;
   protected
     procedure Execute; override;
   public
-    constructor Create(const AListenSock: TMockSocket);
+    constructor Create(const AListenSock: TMockSocket;
+      const ARejectionCount: Integer);
+    procedure Stop;
+    procedure WaitForRejection(const AExpectedCount: Integer;
+      const ATimeoutMilliseconds: Cardinal);
   end;
 
-constructor TMockRejectThread.Create(const AListenSock: TMockSocket);
+constructor TMockRejectThread.Create(const AListenSock: TMockSocket;
+  const ARejectionCount: Integer);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
+  FErrorCode := 0;
   FListenSock := AListenSock;
+  FRejectionCount := ARejectionCount;
+  FRejectedCount := 0;
   Start;
 end;
 
@@ -753,13 +764,127 @@ var
   Addr: TSockAddr;
   AddrLen: Longint;
   AcceptedSock: TMockSocket;
+  ErrorCode: Integer;
 begin
-  FillChar(Addr, SizeOf(Addr), 0);
-  AddrLen := SizeOf(Addr);
-  AcceptedSock := WinSock2.WSAAccept(FListenSock, Addr, @AddrLen,
-    @RejectMockConnection, 0);
-  if IsValidMockSocket(AcceptedSock) then
-    WinSock2.closesocket(AcceptedSock);
+  while (not Terminated) and
+    (InterlockedCompareExchange(FRejectedCount, 0, 0) < FRejectionCount) do
+  begin
+    FillChar(Addr, SizeOf(Addr), 0);
+    AddrLen := SizeOf(Addr);
+    AcceptedSock := WinSock2.WSAAccept(FListenSock, Addr, @AddrLen,
+      @RejectMockConnection, 0);
+    if IsValidMockSocket(AcceptedSock) then
+    begin
+      WinSock2.closesocket(AcceptedSock);
+      InterlockedExchange(FErrorCode, -1);
+      Exit;
+    end;
+    ErrorCode := WinSock2.WSAGetLastError;
+    if ErrorCode = WSAECONNREFUSED then
+      InterlockedIncrement(FRejectedCount)
+    else if ErrorCode = WSAEWOULDBLOCK then
+      Sleep(1)
+    else
+    begin
+      InterlockedExchange(FErrorCode, ErrorCode);
+      Exit;
+    end;
+  end;
+end;
+
+procedure TMockRejectThread.Stop;
+begin
+  Terminate;
+end;
+
+procedure TMockRejectThread.WaitForRejection(const AExpectedCount: Integer;
+  const ATimeoutMilliseconds: Cardinal);
+var
+  ErrorCode: LongInt;
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while InterlockedCompareExchange(FRejectedCount, 0, 0) < AExpectedCount do
+  begin
+    ErrorCode := InterlockedCompareExchange(FErrorCode, 0, 0);
+    if ErrorCode <> 0 then
+      raise EMockServerError.CreateFmt(
+        'conditional accept worker failed with Winsock error %d', [ErrorCode]);
+    if Finished then
+      raise EMockServerError.Create(
+        'conditional accept worker stopped before rejecting the probe');
+    if GetTickCount64 - StartedAt >= ATimeoutMilliseconds then
+      raise EMockServerError.Create(
+        'conditional accept worker did not reject the probe in time');
+    Sleep(1);
+  end;
+end;
+
+function ProbeRefusedLoopback(const APort: Word;
+  const ATimeoutMilliseconds: Cardinal): Boolean;
+var
+  Addr: TSockAddrIn;
+  ErrorCode, ErrorLength, Ready: Integer;
+  ExceptSet, WriteSet: TFDSet;
+  Mode: u_long;
+  Elapsed, Remaining, StartedAt: QWord;
+  Sock: TMockSocket;
+  Timeout: TTimeVal;
+begin
+  Result := False;
+  Sock := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
+  if not IsValidMockSocket(Sock) then
+    raise EMockServerError.Create('conditional-accept probe socket failed');
+  TrackMockSocketOpened;
+  try
+    Mode := 1;
+    if WinSock2.ioctlsocket(Sock, LongInt(FIONBIO), Mode) <> 0 then
+      raise EMockServerError.Create(
+        'conditional-accept probe could not enable nonblocking mode');
+    FillChar(Addr, SizeOf(Addr), 0);
+    Addr.sin_family := AF_INET;
+    Addr.sin_port := WinSock2.htons(APort);
+    Addr.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
+    if WinSock2.connect(Sock, PSockAddr(@Addr), SizeOf(Addr)) = 0 then Exit;
+    ErrorCode := WinSock2.WSAGetLastError;
+    if ErrorCode = WSAECONNREFUSED then Exit(True);
+    if (ErrorCode <> WSAEWOULDBLOCK) and (ErrorCode <> WSAEINPROGRESS) then
+      raise EMockServerError.CreateFmt(
+        'conditional-accept probe failed with Winsock error %d', [ErrorCode]);
+
+    StartedAt := GetTickCount64;
+    repeat
+      Elapsed := GetTickCount64 - StartedAt;
+      if Elapsed >= ATimeoutMilliseconds then
+        raise EMockServerError.Create(
+          'conditional-accept probe did not finish in time');
+      Remaining := ATimeoutMilliseconds - Elapsed;
+      FillChar(WriteSet, SizeOf(WriteSet), 0);
+      WriteSet.fd_count := 1;
+      WriteSet.fd_array[0] := Sock;
+      FillChar(ExceptSet, SizeOf(ExceptSet), 0);
+      ExceptSet.fd_count := 1;
+      ExceptSet.fd_array[0] := Sock;
+      Timeout.tv_sec := Remaining div 1000;
+      Timeout.tv_usec := (Remaining mod 1000) * 1000;
+      Ready := WinSock2.select(0, nil, @WriteSet, @ExceptSet, @Timeout);
+      if Ready < 0 then
+        raise EMockServerError.Create('conditional-accept probe select failed');
+      if Ready = 0 then Continue;
+      ErrorCode := 0;
+      ErrorLength := SizeOf(ErrorCode);
+      if WinSock2.getsockopt(Sock, SOL_SOCKET, SO_ERROR,
+         PChar(@ErrorCode), ErrorLength) <> 0 then
+        raise EMockServerError.Create(
+          'conditional-accept probe could not read the connect result');
+      if ErrorCode = WSAECONNREFUSED then Exit(True);
+      if ErrorCode = 0 then Exit;
+      raise EMockServerError.CreateFmt(
+        'conditional-accept probe failed with Winsock error %d', [ErrorCode]);
+    until False;
+  finally
+    CloseTrackedMockSocket(Sock);
+  end;
 end;
 {$ENDIF}
 
@@ -776,6 +901,7 @@ var
   Addr: TSockAddrIn;
   AddrLen: Longint;
   ConditionalAccept: DWORD;
+  NonBlockingMode: u_long;
   WSAData: TWSAData;
   {$ENDIF}
 begin
@@ -827,6 +953,11 @@ begin
       raise EMockServerError.Create('bind() failed');
     if WinSock2.listen(ListenSock, 1) <> 0 then
       raise EMockServerError.Create('listen() failed');
+    NonBlockingMode := 1;
+    if WinSock2.ioctlsocket(ListenSock, LongInt(FIONBIO),
+       NonBlockingMode) <> 0 then
+      raise EMockServerError.Create(
+        'conditional accept could not enable nonblocking mode');
     AddrLen := SizeOf(Addr);
     if WinSock2.getsockname(ListenSock, PSockAddr(@Addr)^, AddrLen) <> 0 then
       raise EMockServerError.Create('getsockname() failed');
@@ -870,7 +1001,15 @@ begin
     {$IFDEF MSWINDOWS}
     FReservationSock := ListenSock;
     ListenSock := InvalidMockSocket;
-    FRejectThread := TMockRejectThread.Create(FReservationSock);
+    { Reject and synchronously observe one setup connection before handing the
+      endpoint to the subprocess. This proves the selected Winsock provider
+      honors conditional accept, while the second rejection is reserved for
+      the install under test. }
+    FRejectThread := TMockRejectThread.Create(FReservationSock, 2);
+    if not ProbeRefusedLoopback(FPort, 2000) then
+      raise EMockServerError.Create(
+        'conditional-accept probe unexpectedly connected');
+    TMockRejectThread(FRejectThread).WaitForRejection(1, 2000);
     {$ENDIF}
   except
     CloseTrackedMockSocket(ProbeSock);
@@ -878,6 +1017,15 @@ begin
     CloseTrackedMockSocket(ClientSock);
     CloseTrackedMockSocket(ListenSock);
     {$IFDEF MSWINDOWS}
+    if Assigned(FRejectThread) then
+    begin
+      TMockRejectThread(FRejectThread).Stop;
+      FRejectThread.WaitFor;
+      FreeAndNil(FRejectThread);
+      CloseTrackedMockSocket(FReservationSock);
+    end
+    else
+      CloseTrackedMockSocket(FReservationSock);
     CleanupTrackedWinSock(FWinSockStarted);
     {$ENDIF}
     raise;
@@ -889,9 +1037,10 @@ begin
   {$IFDEF MSWINDOWS}
   if Assigned(FRejectThread) then
   begin
-    CloseTrackedMockSocket(FReservationSock);
+    TMockRejectThread(FRejectThread).Stop;
     FRejectThread.WaitFor;
     FreeAndNil(FRejectThread);
+    CloseTrackedMockSocket(FReservationSock);
   end
   else
     CloseTrackedMockSocket(FReservationSock);

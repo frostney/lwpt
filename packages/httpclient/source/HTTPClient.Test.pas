@@ -90,7 +90,15 @@ type
 
 const
   MOCK_LIFECYCLE_CHILD = '--mock-lifecycle-child';
+  {$IFDEF MSWINDOWS}
+  { This outer watchdog includes cold child-process startup. Native Windows
+    runners can spend more than two seconds loading the test executable before
+    the fixture exists, so keep the deadlock bound without timing startup as
+    mock-server teardown. }
+  MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS = 5000;
+  {$ELSE}
   MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS = 2000;
+  {$ENDIF}
   MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS = 1000;
 
 { ── helpers ───────────────────────────────────────────────────────── }
@@ -389,9 +397,9 @@ end;
 
 procedure THTTPMockServerLifecycle.SetupTests;
 begin
-  Test('started server without a client tears down within two seconds',
+  Test('started server without a client tears down inside the watchdog',
     TestStartedUnconnectedTeardownIsBounded);
-  Test('connected silent client tears down within two seconds',
+  Test('connected silent client tears down inside the watchdog',
     TestConnectedSilentTeardownIsBounded);
   Test('success, failure, and unstarted cycles balance fixture resources',
     TestRepeatedCyclesBalanceResources);
