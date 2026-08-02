@@ -15,6 +15,15 @@ uses
   TOML;
 
 type
+  TLWPTCompilerProfile = record
+    Name: string;
+    Driver: string;
+    Executable: string;
+    Script: string;
+    VersionConstraint: string;
+  end;
+  TLWPTCompilerProfileArray = array of TLWPTCompilerProfile;
+
   { Source taxonomy after the matching ADR (ADR-0009).
       skGitHost — a git-host archive endpoint; SrcHost selects which
                   host's URL template to use (github / gitlab /
@@ -139,6 +148,7 @@ type
     Output    : string;            { optional output binary path }
     Depends   : TStringArray;      { prerequisite entry names (ADR-0023) }
     Flags     : TStringArray;      { ordered compiler-driver arguments }
+    CompilerProfile: string;       { named root [compiler] profile }
     PreBuild  : THookArray;        { per-entry prebuild hooks (ADR-0011) }
     PostBuild : THookArray;        { per-entry postbuild hooks (ADR-0011) }
   end;
@@ -167,6 +177,9 @@ type
     { [test] scheduler policy. Zero means run the complete queue even
       after failures; positive values stop at that failure count. }
     TestBail    : Integer;
+    { Compiler configuration is executable policy and root-owned. }
+    CompilerDefault: string;
+    CompilerProfiles: TLWPTCompilerProfileArray;
     { User-defined run-scripts (ADR-0013). Any unrecognised top-
       level section with a `script` field becomes a callable
       script — `lwpt run <section-name>` invokes it. The structural
@@ -1229,6 +1242,17 @@ begin
       + 'empty, ".", or ".."', [AName]);
 end;
 
+function CompilerProfileDeclared(
+  const AProfiles: TLWPTCompilerProfileArray;
+  const AName: string): Boolean;
+var
+  ProfileIndex: Integer;
+begin
+  for ProfileIndex := 0 to High(AProfiles) do
+    if SameText(AProfiles[ProfileIndex].Name, AName) then Exit(True);
+  Result := False;
+end;
+
 function ParseManifestContent(const APath, AContent: string;
   AIsRoot: Boolean): TManifest;
 const
@@ -1239,9 +1263,9 @@ const
     NOTE: 'generated' + 'targets' are NOT in this list — both were
     removed in earlier waves and now join the unknown-section
     policy on equal footing with [teddybear]. }
-  KNOWN_SECTIONS: array[0..15] of string = (
+  KNOWN_SECTIONS: array[0..16] of string = (
     'package', 'dependencies', 'sources', 'build', 'version',
-    PROGRAM_NAME, 'format', 'analysis', 'test', 'workspaces',
+    PROGRAM_NAME, 'format', 'analysis', 'test', 'workspaces', 'compiler',
     'preinstall', 'postinstall', 'prebuild', 'postbuild',
     'pretest', 'posttest');
   { Reserved section names — names that, if declared as a top-level
@@ -1255,7 +1279,7 @@ const
         anyway because KNOWN_SECTIONS is checked first, but this
         list makes the intent explicit). 'run' itself is included
         because `lwpt run run` is the nonsense case. }
-  RESERVED_SUBCOMMAND_NAMES: array[0..18] of string = (
+  RESERVED_SUBCOMMAND_NAMES: array[0..19] of string = (
     { subcommands }
     'install', 'add', 'remove', 'build', 'format', 'test',
     'repair', 'init', 'run', 'agents',
@@ -1267,18 +1291,20 @@ const
       [dependencies] (recognised, parsed for all manifests, never
       runnable). }
     'package', 'dependencies', 'sources', 'workspaces',
-    'version', PROGRAM_NAME, 'format', 'analysis', 'generated');
+    'version', PROGRAM_NAME, 'format', 'analysis', 'compiler', 'generated');
 var
   Root, Deps, DepNode, ArrNode : TTOMLNode;
   BuildNode, EntryNode, VerNode   : TTOMLNode;
   LwptCfgNode, FmtNode, AnalysisNode, TestNode, BailNode,
     ExclArr : TTOMLNode;
   SourcesNode, SourceEntry     : TTOMLNode;
+  CompilerNode, ProfilesNode, ProfileNode: TTOMLNode;
   Parser   : TTOMLParser;
   Pair     : TTOMLNodeMap.TKeyValuePair;
   i, j, n  : Integer;
   D        : TDependency;
   Entry        : TLWPTBuildEntry;
+  CompilerProfile: TLWPTCompilerProfile;
   CS       : TCustomSource;
   Hook     : THook;
   Ctx      : TPlaceholderCtx;
@@ -1538,6 +1564,86 @@ begin
       end;
     end;
 
+    { [compiler] profiles can execute root-selected code, so dependency
+      manifests never contribute them. }
+    if AIsRoot then
+    begin
+      CompilerNode := TomlGet(Root, 'compiler');
+      if CompilerNode <> nil then
+      begin
+        if not TomlIsTable(CompilerNode) then
+          raise EManifestError.Create('[compiler] must be a table');
+        if (TomlGet(CompilerNode, 'default') <> nil)
+           and not TomlIsString(TomlGet(CompilerNode, 'default')) then
+          raise EManifestError.Create(
+            '[compiler] default must name a compiler profile');
+        Result.CompilerDefault := TomlStr(CompilerNode, 'default', '');
+        ProfilesNode := TomlGet(CompilerNode, 'profiles');
+        if (ProfilesNode <> nil) and not TomlIsTable(ProfilesNode) then
+          raise EManifestError.Create(
+            '[compiler.profiles] must be a table');
+        if TomlIsTable(ProfilesNode) then
+          for Pair in ProfilesNode.Children do
+          begin
+            ProfileNode := Pair.Value;
+            if not TomlIsTable(ProfileNode) then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles.%s] must be a table', [Pair.Key]);
+            CompilerProfile := Default(TLWPTCompilerProfile);
+            CompilerProfile.Name := Pair.Key;
+            if CompilerProfileDeclared(Result.CompilerProfiles,
+              CompilerProfile.Name) then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles] duplicate profile name "%s" '
+                + '(profile names are case-insensitive)', [Pair.Key]);
+            if (TomlGet(ProfileNode, 'driver') <> nil)
+               and not TomlIsString(TomlGet(ProfileNode, 'driver')) then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles.%s] driver must be a string',
+                [Pair.Key]);
+            if (TomlGet(ProfileNode, 'executable') <> nil)
+               and not TomlIsString(TomlGet(ProfileNode, 'executable')) then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles.%s] executable must be a string',
+                [Pair.Key]);
+            if (TomlGet(ProfileNode, 'script') <> nil)
+               and not TomlIsString(TomlGet(ProfileNode, 'script')) then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles.%s] script must be a string',
+                [Pair.Key]);
+            if (TomlGet(ProfileNode, 'version') <> nil)
+               and not TomlIsString(TomlGet(ProfileNode, 'version')) then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles.%s] version must be a string',
+                [Pair.Key]);
+            CompilerProfile.Driver := TomlStr(ProfileNode, 'driver', '');
+            CompilerProfile.Executable := TomlStr(ProfileNode,
+              'executable', '');
+            CompilerProfile.Script := TomlStr(ProfileNode, 'script', '');
+            CompilerProfile.VersionConstraint := TomlStr(ProfileNode,
+              'version', '*');
+            if CompilerProfile.Name = '' then
+              raise EManifestError.Create(
+                '[compiler.profiles] profile name must not be empty');
+            if CompilerProfile.Driver = '' then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles.%s] driver is required', [Pair.Key]);
+            if CompilerProfile.VersionConstraint = '' then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles.%s] version must not be empty',
+                [Pair.Key]);
+            if (CompilerProfile.Executable <> '')
+               and (CompilerProfile.Script <> '') then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles.%s] executable and script are '
+                + 'mutually exclusive', [Pair.Key]);
+            n := Length(Result.CompilerProfiles);
+            SetLength(Result.CompilerProfiles, n + 1);
+            Result.CompilerProfiles[n] := CompilerProfile;
+          end;
+      end;
+    end;
+
     BuildNode := TomlGet(Root, 'build');
     if TomlIsTable(BuildNode) then
     begin
@@ -1553,8 +1659,15 @@ begin
         ReadStrictStringArray(BuildNode, 'depends', 'build.depends',
           Entry.Depends);
         if AIsRoot then
+        begin
           ReadStrictNonEmptyStringArray(BuildNode, 'flags', 'build.flags',
             Entry.Flags);
+          if (TomlGet(BuildNode, 'compiler') <> nil)
+             and not TomlIsString(TomlGet(BuildNode, 'compiler')) then
+            raise EManifestError.Create(
+              'build.compiler must name a compiler profile');
+          Entry.CompilerProfile := TomlStr(BuildNode, 'compiler', '');
+        end;
         if Entry.Output = '' then Entry.Output := 'build/' + Result.Name;
         ParseHookSection(TomlGet(BuildNode, 'prebuild'),
           'build.prebuild', Entry.PreBuild);
@@ -1579,8 +1692,16 @@ begin
             ReadStrictStringArray(EntryNode, 'depends',
               'build.' + Entry.Name + '.depends', Entry.Depends);
             if AIsRoot then
+            begin
               ReadStrictNonEmptyStringArray(EntryNode, 'flags',
                 'build.' + Entry.Name + '.flags', Entry.Flags);
+              if (TomlGet(EntryNode, 'compiler') <> nil)
+                 and not TomlIsString(TomlGet(EntryNode, 'compiler')) then
+                raise EManifestError.CreateFmt(
+                  'build.%s.compiler must name a compiler profile',
+                  [Entry.Name]);
+              Entry.CompilerProfile := TomlStr(EntryNode, 'compiler', '');
+            end;
             ParseHookSection(TomlGet(EntryNode, 'prebuild'),
               'build.' + Entry.Name + '.prebuild', Entry.PreBuild);
             ParseHookSection(TomlGet(EntryNode, 'postbuild'),
@@ -1590,6 +1711,24 @@ begin
           SetLength(Result.BuildEntries, j + 1);
           Result.BuildEntries[j] := Entry;
         end;
+    end;
+
+    if AIsRoot then
+    begin
+      if (Result.CompilerDefault <> '')
+         and not CompilerProfileDeclared(Result.CompilerProfiles,
+           Result.CompilerDefault) then
+        raise EManifestError.CreateFmt(
+          '[compiler] default names undeclared compiler profile "%s"',
+          [Result.CompilerDefault]);
+      for i := 0 to High(Result.BuildEntries) do
+        if (Result.BuildEntries[i].CompilerProfile <> '')
+           and not CompilerProfileDeclared(Result.CompilerProfiles,
+             Result.BuildEntries[i].CompilerProfile) then
+          raise EManifestError.CreateFmt(
+            'build.%s.compiler names undeclared compiler profile "%s"',
+            [Result.BuildEntries[i].Name,
+             Result.BuildEntries[i].CompilerProfile]);
     end;
 
     { [version] — optional version-baking config }
