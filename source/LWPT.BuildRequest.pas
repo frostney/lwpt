@@ -124,6 +124,7 @@ function DefaultBuildRequest: TLWPTBuildRequest;
 function DefaultBuildResult: TLWPTBuildResult;
 function DefaultCompilerCapabilities: TLWPTCompilerCapabilities;
 function DefaultCompilerProbeRequest: TLWPTCompilerProbeRequest;
+function IsWindowsOperatingSystem(const AOS: string): Boolean;
 procedure ValidateCompilerProbeRequest(
   const ARequest: TLWPTCompilerProbeRequest);
 procedure ValidateBuildRequest(const ARequest: TLWPTBuildRequest);
@@ -153,6 +154,12 @@ uses
 
   Semver,
   TOML;
+
+function IsWindowsOperatingSystem(const AOS: string): Boolean;
+begin
+  Result := SameText(AOS, 'windows') or SameText(AOS, 'win32')
+    or SameText(AOS, 'win64');
+end;
 
 function DefaultBuildRequest: TLWPTBuildRequest;
 begin
@@ -775,7 +782,7 @@ begin
   ValidateBuildRequest(ARequest);
   ValidateCompilerCapabilities(ACapabilities);
   AReason := '';
-  if ARequest.Compiler.ID <> ACapabilities.CompilerID then
+  if not SameText(ARequest.Compiler.ID, ACapabilities.CompilerID) then
     AReason := 'compiler ID is not supported'
   else if (ARequest.Compiler.VersionIdentity <> '')
     and (ARequest.Compiler.VersionIdentity

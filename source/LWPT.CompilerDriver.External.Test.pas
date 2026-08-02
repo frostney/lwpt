@@ -32,6 +32,7 @@ type
     procedure TestProbeRefreshObservesMutation;
     procedure TestMalformedProtocolRetainsStderr;
     procedure TestExtraArtifactOutsideRootsIsRejected;
+    procedure TestForcedRebuildIsRejectedExplicitly;
     procedure TestTimeoutKillsNonReadingProxy;
     procedure TestTimeoutDoesNotWaitForEscapedStdinHolder;
     procedure TestCaptureOverflowRetainsBoundedPrefixAndTerminates;
@@ -250,10 +251,11 @@ var
 begin
   WriteState('probe-mode', '');
   WriteState('probe-version', '1.0.0');
-  Driver := TLWPTExternalCompilerDriver.Create(PROXY_COMPILER_ID,
+  Driver := TLWPTExternalCompilerDriver.Create(UpperCase(PROXY_COMPILER_ID),
     ParamStr(0), '', '*');
   try
     Capabilities := Driver.ProbeCapabilities(Default(TLWPTTarget));
+    Expect<string>(Capabilities.CompilerID).ToBe(PROXY_COMPILER_ID);
     Expect<string>(Capabilities.VersionIdentity).ToBe('1.0.0');
     WriteState('probe-version', '2.0.0');
     Capabilities := Driver.ProbeCapabilities(Default(TLWPTTarget), True);
@@ -379,6 +381,32 @@ begin
   end;
 end;
 
+procedure TLWPTExternalCompilerDriverTests.TestForcedRebuildIsRejectedExplicitly;
+var
+  Driver: TLWPTExternalCompilerDriver;
+  Options: TLWPTCompilerInvocationOptions;
+  Raised: Boolean;
+  Request: TLWPTBuildRequest;
+begin
+  Driver := TLWPTExternalCompilerDriver.Create(PROXY_COMPILER_ID,
+    ParamStr(0), '', '*');
+  try
+    Request := DefaultBuildRequest;
+    Options := BuildCompilerInvocationOptions('', True);
+    Raised := False;
+    try
+      Driver.BuildArguments(Request, Options);
+    except
+      on E: ELWPTCompilerDriverError do
+        Raised := Pos('does not support forced rebuilds requested by --clean',
+          E.Message) > 0;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+  finally
+    Driver.Free;
+  end;
+end;
+
 procedure TLWPTExternalCompilerDriverTests.TestTimeoutKillsNonReadingProxy;
 var
   Options: TLWPTProcessRunOptions;
@@ -459,7 +487,10 @@ begin
       Lines.Free;
     end;
     Expect<Boolean>(Raised).ToBe(True);
-    Expect<Boolean>(GetTickCount64 - StartedAt < 5000).ToBe(True);
+    { The retained read end must not turn the 500 ms operation deadline into
+      an unbounded writer join. Leave room for process-tree and writer cleanup
+      while pinning the complete failure path below three seconds. }
+    Expect<Boolean>(GetTickCount64 - StartedAt < 3000).ToBe(True);
     Expect<Boolean>(P.Running).ToBe(False);
     Expect<Boolean>(EscapedPID > 0).ToBe(True);
     if EscapedPID > 0 then
@@ -488,6 +519,8 @@ begin
     TestMalformedProtocolRetainsStderr);
   Test('an extra artifact outside private roots is rejected',
     TestExtraArtifactOutsideRootsIsRejected);
+  Test('--clean fails explicitly for the external protocol',
+    TestForcedRebuildIsRejectedExplicitly);
   Test('timeout kills a sleeping proxy that never reads stdin',
     TestTimeoutKillsNonReadingProxy);
   Test('timeout does not wait for an escaped descendant retaining stdin',

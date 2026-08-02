@@ -73,6 +73,7 @@ type
     procedure TestBuildEntryTraversalNameRootOnly;
     procedure TestBuildDependsMustBeStringArray;
     procedure TestBuildFlagsMustBeStringArrayAndAreRootOnly;
+    procedure TestUndeclaredCompilerProfilesAreRejected;
   end;
 
   TLoadManifestExtensions = class(TTestSuite)
@@ -922,6 +923,48 @@ begin
   Expect<Integer>(Length(Man.BuildEntries[0].Flags)).ToBe(0);
 end;
 
+procedure TLoadManifestValidation.TestUndeclaredCompilerProfilesAreRejected;
+const
+  UNKNOWN_DEFAULT =
+    '[package]'#10 +
+    'name = "unknown-default"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler]'#10 +
+    'default = "typo"'#10;
+  UNKNOWN_ENTRY =
+    '[package]'#10 +
+    'name = "unknown-entry"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler.profiles.native]'#10 +
+    'driver = "fpc"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'app = { source = "source/app.pas", compiler = "typo" }'#10;
+  DUPLICATE_CASE =
+    '[package]'#10 +
+    'name = "duplicate-profile-case"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler.profiles.Native]'#10 +
+    'driver = "fpc"'#10 +
+    ''#10 +
+    '[compiler.profiles.native]'#10 +
+    'driver = "fpc"'#10;
+begin
+  ExpectManifestLoadError(
+    WriteManifest('unknown-compiler-default', UNKNOWN_DEFAULT),
+    '[compiler] default names undeclared compiler profile "typo"', Self);
+  ExpectManifestLoadError(
+    WriteManifest('unknown-entry-compiler', UNKNOWN_ENTRY),
+    'build.app.compiler names undeclared compiler profile "typo"', Self);
+  ExpectManifestLoadError(
+    WriteManifest('duplicate-compiler-profile-case', DUPLICATE_CASE),
+    '[compiler.profiles] duplicate profile name "native" '
+      + '(profile names are case-insensitive)', Self);
+end;
+
 procedure TLoadManifestValidation.SetupTests;
 begin
   Test('bare-string dep shorthand rejected (ADR-0004 migration)',
@@ -937,6 +980,8 @@ begin
     TestBuildDependsMustBeStringArray);
   Test('[build] flags are strict root-owned string arrays',
     TestBuildFlagsMustBeStringArrayAndAreRootOnly);
+  Test('compiler defaults and build entries name declared profiles',
+    TestUndeclaredCompilerProfilesAreRejected);
 end;
 
 { ── TLoadManifestExtensions ───────────────────────────────────────── }

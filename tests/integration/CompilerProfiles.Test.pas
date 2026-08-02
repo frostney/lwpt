@@ -22,6 +22,7 @@ uses
 
 const
   DRIVER_ID = 'integration-driver';
+  LEASE_OBSERVER_ENV = PROJECT_NAME + '_LEASE_OBSERVER';
 
 type
   TCompilerProfiles = class(TTestSuite)
@@ -41,6 +42,7 @@ type
     procedure TestLiveCapabilityMutationFailsBeforeCompile;
     procedure TestTargetMismatchFails;
     procedure TestMalformedStdoutRetainsStderr;
+    procedure TestMalformedTestResultDoesNotAbortSibling;
     procedure TestCompileTimeoutCleansUp;
     procedure TestExtraArtifactIsRejected;
     procedure TestReorderedArtifactsPublishTheRequestedPrimary;
@@ -104,6 +106,7 @@ var
   TimedOut: Boolean;
   Values: TStringList;
 begin
+  if SysUtils.GetEnvironmentVariable(LEASE_OBSERVER_ENV) <> '' then Exit;
   WriteTextFile(ExpandFileName('.driver-mode'), 'success');
   P := TProcess.Create(nil);
   Runner := nil;
@@ -119,7 +122,8 @@ begin
     P.Parameters.Add('build');
     P.Parameters.Add('--jobs');
     P.Parameters.Add('1');
-    ConfigureProcessEnvironment(P, [WORKER_LEASE_TOKEN_ENV + '=']);
+    ConfigureProcessEnvironment(P, [WORKER_LEASE_TOKEN_ENV + '=',
+      LEASE_OBSERVER_ENV + '=1']);
     Runner := TLWPTDuplexProcessRunner.Create(P);
     Options := DefaultProcessRunOptions('publication lease contender');
     Options.SeparateStandardError := True;
@@ -194,7 +198,10 @@ begin
   if AOperation = 'probe' then
   begin
     ParseCompilerProbeRequest(ReadInput);
-    ProbeCount := IncrementProbeCount;
+    if SysUtils.GetEnvironmentVariable(LEASE_OBSERVER_ENV) <> '' then
+      ProbeCount := 0
+    else
+      ProbeCount := IncrementProbeCount;
     if (Mode = 'publication-lease') and (ProbeCount >= 3) then
       ObservePublicationLease;
     Capabilities := DefaultCompilerCapabilities;
@@ -242,6 +249,13 @@ begin
   end;
   ExitCode := CompileWithFPC(Request, Diagnostic);
   if Diagnostic <> '' then Write(ErrOutput, Diagnostic);
+  if (Mode = 'malformed-test-result')
+     and (Pos('Broken.Test.pas', Request.Inputs.EntryPoint) > 0) then
+  begin
+    WriteLn(ErrOutput, 'malformed sibling raw diagnostic');
+    Write('not = [valid');
+    Halt(0);
+  end;
   BuildResult := DefaultBuildResult;
   BuildResult.Success := ExitCode = 0;
   if BuildResult.Success then
@@ -358,6 +372,14 @@ begin
     + 'uses EnvironmentOnlyUnit, TestingPascalLibrary;'#10
     + 'begin'#10
     + '  if ENVIRONMENT_ONLY_MARKER <> 1 then Halt(2);'#10
+    + '  TestRunnerProgram.Run;'#10
+    + '  ExitCode := TestResultToExitCode;'#10
+    + 'end.'#10);
+  WriteTextFile(FScratch + '/source/Broken.Test.pas',
+      'program Broken.Test;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses TestingPascalLibrary;'#10
+    + 'begin'#10
     + '  TestRunnerProgram.Run;'#10
     + '  ExitCode := TestResultToExitCode;'#10
     + 'end.'#10);
@@ -490,6 +512,29 @@ begin
     R.Stdout + R.Stderr) > 0).ToBe(True);
 end;
 
+procedure TCompilerProfiles.TestMalformedTestResultDoesNotAbortSibling;
+var
+  EnvironmentUnitPaths: string;
+  R: TLwptResult;
+begin
+  SetMode('malformed-test-result');
+  WriteManifest('external');
+  EnvironmentUnitPaths := GetEnvironmentVariable(
+    PROJECT_NAME + '_FPC_UNIT_PATHS');
+  if EnvironmentUnitPaths <> '' then
+    EnvironmentUnitPaths := EnvironmentUnitPaths + PathSeparator;
+  EnvironmentUnitPaths := EnvironmentUnitPaths
+    + FScratch + '/environment-units';
+  R := RunLwpt(['test', '--jobs', '1', '--bail', '0'], FScratch,
+    [PROJECT_NAME + '_FPC_UNIT_PATHS=' + EnvironmentUnitPaths]);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('Broken.Test.pas', R.Stdout + R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Example.Test.pas', R.Stdout + R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('summary: 1 passed, 0 failed, 1 did not compile',
+    R.Stdout + R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('scheduler error', R.Stdout + R.Stderr) = 0).ToBe(True);
+end;
+
 procedure TCompilerProfiles.TestCompileTimeoutCleansUp;
 var
   R: TLwptResult;
@@ -590,6 +635,8 @@ begin
   Test('target mismatch fails explicitly', TestTargetMismatchFails);
   Test('malformed stdout retains stderr in the job log',
     TestMalformedStdoutRetainsStderr);
+  Test('malformed test results fail one test without aborting its sibling',
+    TestMalformedTestResultDoesNotAbortSibling);
   Test('compile timeout terminates and leaves no public artifact',
     TestCompileTimeoutCleansUp);
   Test('extra artifact outside private roots is rejected',

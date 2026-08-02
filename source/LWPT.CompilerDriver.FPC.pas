@@ -217,12 +217,6 @@ begin
     Result := AActual = FPC_OS_WIN64;
 end;
 
-function IsWindowsOperatingSystem(const AOS: string): Boolean;
-begin
-  Result := (AOS = FPC_OS_WINDOWS) or (AOS = FPC_OS_WIN32)
-    or (AOS = FPC_OS_WIN64);
-end;
-
 function FPCOperatingSystemName(const ATarget: TLWPTTarget): string;
 begin
   if ATarget.OS <> FPC_OS_WINDOWS then Exit(ATarget.OS);
@@ -251,6 +245,9 @@ end;
 function CreateFPCBuildRequest(const ASource, AArtifact: string;
   const ADriver: TLWPTCompilerDriver): TLWPTBuildRequest;
 begin
+  if not Assigned(ADriver) then
+    raise ELWPTCompilerDriverError.Create(
+      'cannot create an FPC build request without a compiler driver');
   Result := ADriver.CreateBuildRequest(ASource, AArtifact);
 end;
 

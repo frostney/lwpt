@@ -1228,6 +1228,17 @@ begin
       + 'empty, ".", or ".."', [AName]);
 end;
 
+function CompilerProfileDeclared(
+  const AProfiles: TLWPTCompilerProfileArray;
+  const AName: string): Boolean;
+var
+  ProfileIndex: Integer;
+begin
+  for ProfileIndex := 0 to High(AProfiles) do
+    if SameText(AProfiles[ProfileIndex].Name, AName) then Exit(True);
+  Result := False;
+end;
+
 function ParseManifestContent(const APath, AContent: string;
   AIsRoot: Boolean): TManifest;
 const
@@ -1548,6 +1559,11 @@ begin
                 '[compiler.profiles.%s] must be a table', [Pair.Key]);
             CompilerProfile := Default(TLWPTCompilerProfile);
             CompilerProfile.Name := Pair.Key;
+            if CompilerProfileDeclared(Result.CompilerProfiles,
+              CompilerProfile.Name) then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles] duplicate profile name "%s" '
+                + '(profile names are case-insensitive)', [Pair.Key]);
             if (TomlGet(ProfileNode, 'driver') <> nil)
                and not TomlIsString(TomlGet(ProfileNode, 'driver')) then
               raise EManifestError.CreateFmt(
@@ -1663,6 +1679,24 @@ begin
           SetLength(Result.BuildEntries, j + 1);
           Result.BuildEntries[j] := Entry;
         end;
+    end;
+
+    if AIsRoot then
+    begin
+      if (Result.CompilerDefault <> '')
+         and not CompilerProfileDeclared(Result.CompilerProfiles,
+           Result.CompilerDefault) then
+        raise EManifestError.CreateFmt(
+          '[compiler] default names undeclared compiler profile "%s"',
+          [Result.CompilerDefault]);
+      for i := 0 to High(Result.BuildEntries) do
+        if (Result.BuildEntries[i].CompilerProfile <> '')
+           and not CompilerProfileDeclared(Result.CompilerProfiles,
+             Result.BuildEntries[i].CompilerProfile) then
+          raise EManifestError.CreateFmt(
+            'build.%s.compiler names undeclared compiler profile "%s"',
+            [Result.BuildEntries[i].Name,
+             Result.BuildEntries[i].CompilerProfile]);
     end;
 
     { [version] — optional version-baking config }

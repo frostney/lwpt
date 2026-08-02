@@ -163,7 +163,7 @@ function TLWPTConfiguredCompilerDriver.ProbeCapabilities(
 begin
   Result := FInner.ProbeCapabilities(ATarget, ARefresh);
   ValidateCompilerCapabilities(Result);
-  if Result.CompilerID <> FCompilerID then
+  if not SameText(Result.CompilerID, FCompilerID) then
     raise ELWPTCompilerDriverError.CreateFmt(
       'compiler factory "%s" returned capabilities for "%s"',
       [FCompilerID, Result.CompilerID]);
@@ -305,7 +305,7 @@ var
 begin
   AProfile := Default(TLWPTCompilerProfile);
   for i := 0 to High(FManifest.CompilerProfiles) do
-    if FManifest.CompilerProfiles[i].Name = AName then
+    if SameText(FManifest.CompilerProfiles[i].Name, AName) then
     begin
       AProfile := FManifest.CompilerProfiles[i];
       Exit(True);
@@ -369,7 +369,7 @@ begin
       raise ELWPTCompilerDriverError.CreateFmt(
         'compiler factory "%s" returned no driver', [AProfile.Driver]);
     try
-      if FactoryDriver.CompilerID <> AProfile.Driver then
+      if not SameText(FactoryDriver.CompilerID, AProfile.Driver) then
         raise ELWPTCompilerDriverError.CreateFmt(
           'compiler factory "%s" returned driver identity "%s"',
           [AProfile.Driver, FactoryDriver.CompilerID]);
@@ -386,8 +386,7 @@ begin
     raise ELWPTCompilerDriverError.CreateFmt(
       'compiler profile "%s" selects unavailable driver "%s"',
       [AProfile.Name, AProfile.Driver]);
-  if (ExecutablePath <> '') and IsAbsoluteFilesystemPath(ExecutablePath)
-     and not FileExists(ExecutablePath) then
+  if (ExecutablePath <> '') and not FileExists(ExecutablePath) then
     raise ELWPTCompilerDriverError.CreateFmt(
       'compiler profile "%s" executable not found at %s',
       [AProfile.Name, ExecutablePath]);
@@ -415,7 +414,8 @@ begin
   for i := 0 to FDrivers.Count - 1 do
   begin
     DriverEntry := TDriverEntry(FDrivers[i]);
-    if DriverEntry.ProfileName = ProfileName then Exit(DriverEntry.Driver);
+    if SameText(DriverEntry.ProfileName, ProfileName) then
+      Exit(DriverEntry.Driver);
   end;
 
   if not FindManifestProfile(ProfileName, Profile) then

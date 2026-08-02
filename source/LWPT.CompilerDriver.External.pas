@@ -223,7 +223,7 @@ begin
           + 'document: %s%s', [FCompilerID, E.Message,
             BoundedDiagnosticContext(StandardError)]);
     end;
-    if Result.CompilerID <> FCompilerID then
+    if not SameText(Result.CompilerID, FCompilerID) then
       raise ELWPTCompilerDriverError.CreateFmt(
         'compiler driver "%s" probe returned compiler identity "%s"%s',
         [FCompilerID, Result.CompilerID,
@@ -247,6 +247,10 @@ function TLWPTExternalCompilerDriver.BuildArguments(
   const AOptions: TLWPTCompilerInvocationOptions):
   LWPT.Core.TStringArray;
 begin
+  if AOptions.RebuildPolicy = crpForce then
+    raise ELWPTCompilerDriverError.CreateFmt(
+      'compiler driver "%s" does not support forced rebuilds requested '
+      + 'by --clean', [FCompilerID]);
   SetLength(Result, 1 + Ord(FPrefixArgument <> ''));
   if FPrefixArgument <> '' then
   begin

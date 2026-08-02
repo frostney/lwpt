@@ -52,6 +52,12 @@ must report the requested primary artifact with its exact kind and path; every
 other reported artifact must remain within the request's private executable,
 unit, object, or resource output roots.
 
+The compiler-neutral request intentionally excludes execution-only rebuild
+policy. The built-in FPC driver translates `--clean` to its forced-rebuild
+flag; the version-1 external protocol rejects `--clean` explicitly rather than
+silently compiling incrementally. A later protocol version may add an explicit
+rebuild-policy field when an external backend contract requires it.
+
 ## Considered Options
 
 - **Allow dependency manifests to contribute profiles.** Rejected because

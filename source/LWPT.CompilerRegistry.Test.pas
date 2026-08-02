@@ -63,6 +63,7 @@ type
     procedure TestHostDefaultPrecedesBuiltIn;
     procedure TestBuiltInFallback;
     procedure TestDriversAreCachedByProfile;
+    procedure TestProfileCacheIsCaseInsensitive;
     procedure TestFactoryIdentityMismatchIsFreedAndRejected;
     procedure TestFactoryVersionMismatchIsRejected;
     procedure TestFactoryDriverIsFreedExactlyOnce;
@@ -198,10 +199,13 @@ end;
 
 procedure TLWPTCompilerRegistryTests.TestHostDefaultPrecedesBuiltIn;
 var
+  Capabilities: TLWPTCompilerCapabilities;
+  Driver: TLWPTCompilerDriver;
   Host: TLWPTCompilerHost;
   Manifest: TManifest;
   Selection: TLWPTCompilerSelection;
 begin
+  FFactoryOwner.CompilerIdentity := 'EMBEDDED';
   Manifest := Default(TManifest);
   Host := TLWPTCompilerHost.Create;
   try
@@ -209,13 +213,16 @@ begin
     Host.RegisterFactory('embedded', FFactoryOwner.CreateDriver);
     Selection := TLWPTCompilerSelection.Create(Manifest, GetCurrentDir, Host);
     try
-      Expect<string>(Selection.DriverFor('').ExecutableName)
-        .ToBe('host-driver');
+      Driver := Selection.DriverFor('');
+      Expect<string>(Driver.ExecutableName).ToBe('host-driver');
+      Capabilities := Driver.ProbeCapabilities(Default(TLWPTTarget));
+      Expect<string>(Capabilities.CompilerID).ToBe('EMBEDDED');
     finally
       Selection.Free;
     end;
   finally
     Host.Free;
+    FFactoryOwner.CompilerIdentity := 'embedded';
   end;
 end;
 
@@ -342,6 +349,23 @@ begin
   end;
 end;
 
+procedure TLWPTCompilerRegistryTests.TestProfileCacheIsCaseInsensitive;
+var
+  Manifest: TManifest;
+  Selection: TLWPTCompilerSelection;
+begin
+  Manifest := Default(TManifest);
+  SetLength(Manifest.CompilerProfiles, 1);
+  Manifest.CompilerProfiles[0] := Profile('Mixed', 'mixed-fpc');
+  Selection := TLWPTCompilerSelection.Create(Manifest, GetCurrentDir);
+  try
+    Expect<Boolean>(Selection.DriverFor('mixed') = Selection.DriverFor('MIXED'))
+      .ToBe(True);
+  finally
+    Selection.Free;
+  end;
+end;
+
 procedure TLWPTCompilerRegistryTests.SetupTests;
 begin
   Test('build entry overrides project and embedding defaults',
@@ -351,6 +375,8 @@ begin
   Test('FPC is the built-in fallback', TestBuiltInFallback);
   Test('one invocation caches one driver per profile',
     TestDriversAreCachedByProfile);
+  Test('profile resolution and caching are case-insensitive',
+    TestProfileCacheIsCaseInsensitive);
   Test('factory identity mismatch is freed and rejected',
     TestFactoryIdentityMismatchIsFreedAndRejected);
   Test('factory version constraint is enforced independently',

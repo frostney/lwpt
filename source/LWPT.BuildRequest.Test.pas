@@ -30,6 +30,7 @@ type
     procedure TestProbeRequestRoundTrips;
     procedure TestBuildResultRoundTrips;
     procedure TestCapabilitiesRoundTrip;
+    procedure TestWindowsOperatingSystemNamesAreRecognized;
   end;
 
 function ReadFixture(const APath: string): string;
@@ -214,7 +215,7 @@ begin
   Expect<Boolean>(BuildRequestIsCompatible(Request, FPC, Reason)).ToBe(True);
 
   Request.Compiler.ID := 'lakon';
-  Lakon := NativeCapabilities('lakon', '1.4.0');
+  Lakon := NativeCapabilities('LAKON', '1.4.0');
   Expect<Boolean>(BuildRequestIsCompatible(Request, Lakon, Reason)).ToBe(True);
   Expect<string>(Request.Target.OS).ToBe('darwin');
   Expect<string>(Request.Target.Architecture).ToBe('aarch64');
@@ -336,6 +337,14 @@ begin
   Expect<string>(Parsed.OutputKinds[0]).ToBe(BUILD_OUTPUT_EXECUTABLE);
 end;
 
+procedure TLWPTBuildRequestTests.TestWindowsOperatingSystemNamesAreRecognized;
+begin
+  Expect<Boolean>(IsWindowsOperatingSystem('windows')).ToBe(True);
+  Expect<Boolean>(IsWindowsOperatingSystem('win32')).ToBe(True);
+  Expect<Boolean>(IsWindowsOperatingSystem('WIN64')).ToBe(True);
+  Expect<Boolean>(IsWindowsOperatingSystem('darwin')).ToBe(False);
+end;
+
 procedure TLWPTBuildRequestTests.SetupTests;
 begin
   Test('serialization matches the versioned fixture',
@@ -360,6 +369,8 @@ begin
     TestBuildResultRoundTrips);
   Test('compiler capabilities round-trip through canonical TOML',
     TestCapabilitiesRoundTrip);
+  Test('neutral and concrete Windows target names are recognized',
+    TestWindowsOperatingSystemNamesAreRecognized);
 end;
 
 begin

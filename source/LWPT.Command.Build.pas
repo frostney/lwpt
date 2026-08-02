@@ -976,9 +976,25 @@ var
   end;
 
   function AcquireWorkerLease: TLWPTWorkerLease;
+  var
+    LastWaitReport, WaitStartedAt, WaitTick: QWord;
   begin
     Result := nil;
-    while Result = nil do Result := WorkerSession.Acquire(100);
+    WaitStartedAt := GetTickCount64;
+    LastWaitReport := WaitStartedAt;
+    while Result = nil do
+    begin
+      Result := WorkerSession.Acquire(100);
+      if Assigned(Result) then Break;
+      WaitTick := GetTickCount64;
+      if WaitTick - LastWaitReport >= HeartbeatInterval then
+      begin
+        WriteLn(ObservabilityHeartbeatEvent,
+          'waiting for postbuild worker capacity ',
+          FormatElapsedMilliseconds(WaitTick - WaitStartedAt));
+        LastWaitReport := WaitTick;
+      end;
+    end;
   end;
 
   procedure RunEntryPostBuildWithLease(const AIndex: Integer);

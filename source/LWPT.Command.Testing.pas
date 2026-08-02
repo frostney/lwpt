@@ -512,21 +512,30 @@ begin
     end;
   end;
   try
-    Code := RunProcess(AIndex, CompilerProcess,
-      FCompilerDriver.BuildStandardInput(BuildRequest),
-      FCompilerDriver.SeparateStandardError,
-      FCompilerDriver.CompilationTimeoutMilliseconds,
-      'compiler "' + FCompilerDriver.CompilerID + '" compile',
+    try
+      Code := RunProcess(AIndex, CompilerProcess,
+        FCompilerDriver.BuildStandardInput(BuildRequest),
+        FCompilerDriver.SeparateStandardError,
+        FCompilerDriver.CompilationTimeoutMilliseconds,
+        'compiler "' + FCompilerDriver.CompilerID + '" compile',
+        StandardOutput, StandardError);
+    finally
+      CompilerProcess.Free;
+    end;
+    Output := FCompilerDriver.DisplayOutput(StandardOutput, StandardError);
+    SetJobOutput(AIndex, True, Output);
+    BuildResult := FCompilerDriver.NormalizeExecutionResult(BuildRequest, Code,
       StandardOutput, StandardError);
-  finally
-    CompilerProcess.Free;
+    ValidateReportedArtifacts(FCompilerDriver.CompilerID, BuildRequest,
+      BuildResult);
+  except
+    on E: ELWPTError do
+    begin
+      SetJobOutput(AIndex, True, E.Message);
+      FailJob(AIndex, tjsCompileFailed, 1, E.Message);
+      Exit;
+    end;
   end;
-  Output := FCompilerDriver.DisplayOutput(StandardOutput, StandardError);
-  SetJobOutput(AIndex, True, Output);
-  BuildResult := FCompilerDriver.NormalizeExecutionResult(BuildRequest, Code,
-    StandardOutput, StandardError);
-  ValidateReportedArtifacts(FCompilerDriver.CompilerID, BuildRequest,
-    BuildResult);
   if IsCancelled then
   begin
     CompleteJob(AIndex, tjsCancelled);

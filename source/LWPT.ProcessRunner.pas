@@ -76,9 +76,12 @@ function LWPTCancelSynchronousIo(const AThreadHandle: THandle): BOOL; stdcall;
 type
   TLWPTPipeWriter = class(TThread)
   private
-    FProcess: TProcess;
+    FInputHandle: THandle;
+    FStartAttempted: Boolean;
+    FStarted: Boolean;
     FText: string;
     FErrorMessage: string;
+    procedure CloseOwnedInput;
     procedure RequestCancellation;
     function WaitUntilFinished(const ATimeoutMilliseconds: QWord): Boolean;
   protected
@@ -87,7 +90,8 @@ type
     constructor Create(const AProcess: TProcess;
       const AText: string);
     destructor Destroy; override;
-    procedure CancelAndJoin;
+    function CancelAndJoin: Boolean;
+    function StartWriting: Boolean;
     property ErrorMessage: string read FErrorMessage;
   end;
 
@@ -96,6 +100,7 @@ type
     FProcessTree: TLWPTProcessTree;
     FErrorMessage: string;
     FDone: Boolean;
+    FStarted: Boolean;
     FCriticalSection: TRTLCriticalSection;
   protected
     procedure Execute; override;
@@ -104,15 +109,60 @@ type
     destructor Destroy; override;
     function ErrorMessage: string;
     function IsDone: Boolean;
+    procedure StartTermination;
+    procedure WaitForCompletion;
   end;
+
+var
+  AbandonedPipeWriters: TList;
+  AbandonedPipeWritersCriticalSection: TRTLCriticalSection;
+
+function DuplicatePipeHandle(const AHandle: THandle): THandle;
+{$IFDEF MSWINDOWS}
+var
+  Duplicated: THandle;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Result := FpDup(AHandle);
+  if Result < 0 then RaiseLastOSError;
+  {$ELSE}
+  Duplicated := 0;
+  if not Windows.DuplicateHandle(Windows.GetCurrentProcess, AHandle,
+    Windows.GetCurrentProcess, @Duplicated, 0, False,
+    DUPLICATE_SAME_ACCESS) then
+    RaiseLastOSError;
+  Result := Duplicated;
+  {$ENDIF}
+end;
+
+procedure ClosePipeHandle(var AHandle: THandle);
+var
+  HandleToClose: THandle;
+begin
+  HandleToClose := AHandle;
+  AHandle := THandle(-1);
+  if HandleToClose = THandle(-1) then Exit;
+  {$IFDEF UNIX}
+  FpClose(HandleToClose);
+  {$ELSE}
+  Windows.CloseHandle(HandleToClose);
+  {$ENDIF}
+end;
 
 constructor TLWPTPipeWriter.Create(const AProcess: TProcess;
   const AText: string);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
-  FProcess := AProcess;
+  FInputHandle := THandle(-1);
+  FInputHandle := DuplicatePipeHandle(AProcess.Input.Handle);
   FText := AText;
+end;
+
+procedure TLWPTPipeWriter.CloseOwnedInput;
+begin
+  ClosePipeHandle(FInputHandle);
 end;
 
 procedure TLWPTPipeWriter.Execute;
@@ -120,44 +170,121 @@ procedure TLWPTPipeWriter.Execute;
 var
   ErrorCode, InputFlags, InputHandle, Offset, WriteCount, Written: Integer;
 {$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  ErrorCode, Offset, WriteCount: Integer;
+  Written: DWORD;
+{$ENDIF}
 begin
   try
-    if Terminated then Exit;
-    {$IFDEF UNIX}
-    InputHandle := FProcess.Input.Handle;
-    InputFlags := FpFcntl(InputHandle, F_GETFL, 0);
-    if InputFlags < 0 then RaiseLastOSError;
-    if FpFcntl(InputHandle, F_SETFL, InputFlags or O_NONBLOCK) < 0 then
-      RaiseLastOSError;
-    Offset := 1;
-    while (Offset <= Length(FText)) and (not Terminated) do
-    begin
-      WriteCount := Length(FText) - Offset + 1;
-      if WriteCount > PROCESS_OUTPUT_BUFFER_SIZE then
-        WriteCount := PROCESS_OUTPUT_BUFFER_SIZE;
-      Written := FpWrite(InputHandle, FText[Offset], WriteCount);
-      if Written > 0 then
-        Inc(Offset, Written)
-      else if Written = 0 then
-        Sleep(PROCESS_RUNNER_POLL_MILLISECONDS)
-      else
+    try
+      if Terminated then Exit;
+      {$IFDEF UNIX}
+      InputHandle := FInputHandle;
+      InputFlags := FpFcntl(InputHandle, F_GETFL, 0);
+      if InputFlags < 0 then RaiseLastOSError;
+      if FpFcntl(InputHandle, F_SETFL, InputFlags or O_NONBLOCK) < 0 then
+        RaiseLastOSError;
+      Offset := 1;
+      while (Offset <= Length(FText)) and (not Terminated) do
       begin
-        ErrorCode := FpGetErrNo;
-        if (ErrorCode = ESysEAGAIN) or (ErrorCode = ESysEWOULDBLOCK)
-           or (ErrorCode = ESysEINTR) then
+        WriteCount := Length(FText) - Offset + 1;
+        if WriteCount > PROCESS_OUTPUT_BUFFER_SIZE then
+          WriteCount := PROCESS_OUTPUT_BUFFER_SIZE;
+        Written := FpWrite(InputHandle, FText[Offset], WriteCount);
+        if Written > 0 then
+          Inc(Offset, Written)
+        else if Written = 0 then
           Sleep(PROCESS_RUNNER_POLL_MILLISECONDS)
-        else if not Terminated then
-          raise EOSError.Create(SysErrorMessage(ErrorCode));
+        else
+        begin
+          ErrorCode := FpGetErrNo;
+          if (ErrorCode = ESysEAGAIN) or (ErrorCode = ESysEWOULDBLOCK)
+             or (ErrorCode = ESysEINTR) then
+            Sleep(PROCESS_RUNNER_POLL_MILLISECONDS)
+          else if not Terminated then
+            raise EOSError.Create(SysErrorMessage(ErrorCode));
+        end;
       end;
+      {$ELSE}
+      Offset := 1;
+      while (Offset <= Length(FText)) and (not Terminated) do
+      begin
+        WriteCount := Length(FText) - Offset + 1;
+        if WriteCount > PROCESS_OUTPUT_BUFFER_SIZE then
+          WriteCount := PROCESS_OUTPUT_BUFFER_SIZE;
+        Written := 0;
+        if Windows.WriteFile(FInputHandle, FText[Offset], WriteCount, Written,
+          nil) then
+        begin
+          if Written > 0 then Inc(Offset, Written)
+          else Sleep(PROCESS_RUNNER_POLL_MILLISECONDS);
+        end
+        else if not Terminated then
+        begin
+          ErrorCode := Windows.GetLastError;
+          raise EOSError.Create(SysErrorMessage(ErrorCode));
+        end;
+      end
+      {$ENDIF}
+    except
+      on E: Exception do
+        if not Terminated then FErrorMessage := E.Message;
     end;
-    {$ELSE}
-    if (FText <> '') and (not Terminated) then
-      FProcess.Input.WriteBuffer(FText[1], Length(FText));
-    {$ENDIF}
-    if not Terminated then FProcess.CloseInput;
+  finally
+    CloseOwnedInput;
+  end;
+end;
+
+function TLWPTPipeWriter.StartWriting: Boolean;
+begin
+  FStartAttempted := True;
+  try
+    Start;
+    FStarted := True;
+    Result := True;
   except
     on E: Exception do
-      if not Terminated then FErrorMessage := E.Message;
+    begin
+      FStartAttempted := False;
+      FErrorMessage := 'could not start standard-input writer: ' + E.Message;
+      Terminate;
+      CloseOwnedInput;
+      Result := False;
+    end;
+  end;
+end;
+
+procedure QuarantinePipeWriter(const AWriter: TLWPTPipeWriter);
+begin
+  EnterCriticalSection(AbandonedPipeWritersCriticalSection);
+  try
+    AbandonedPipeWriters.Add(AWriter);
+  finally
+    LeaveCriticalSection(AbandonedPipeWritersCriticalSection);
+  end;
+end;
+
+procedure ReapFinishedPipeWriters;
+var
+  Index: Integer;
+  Writer: TLWPTPipeWriter;
+begin
+  EnterCriticalSection(AbandonedPipeWritersCriticalSection);
+  try
+    Index := AbandonedPipeWriters.Count - 1;
+    while Index >= 0 do
+    begin
+      Writer := TLWPTPipeWriter(AbandonedPipeWriters[Index]);
+      if Writer.Finished then
+      begin
+        AbandonedPipeWriters.Delete(Index);
+        Writer.Free;
+      end;
+      Dec(Index);
+    end;
+  finally
+    LeaveCriticalSection(AbandonedPipeWritersCriticalSection);
   end;
 end;
 
@@ -167,7 +294,8 @@ begin
   {$IFDEF MSWINDOWS}
   { Anonymous-pipe writes are synchronous on Windows. Cancel the writer's
     pending I/O so a surviving descendant cannot pin thread destruction. }
-  if not Finished then LWPTCancelSynchronousIo(Handle);
+  if FStartAttempted and (not Finished) then
+    LWPTCancelSynchronousIo(Handle);
   {$ENDIF}
 end;
 
@@ -189,25 +317,43 @@ begin
   Result := Finished;
 end;
 
-procedure TLWPTPipeWriter.CancelAndJoin;
+function TLWPTPipeWriter.CancelAndJoin: Boolean;
 begin
+  if not FStartAttempted then
+  begin
+    Terminate;
+    CloseOwnedInput;
+    Exit(True);
+  end;
   if not Finished then RequestCancellation;
   if not WaitUntilFinished(PROCESS_RUNNER_WRITER_EXIT_MILLISECONDS) then
-    raise ELWPTProcessRunnerError.Create(
-      'standard-input writer did not stop after cancellation');
-  WaitFor;
-  try
-    FProcess.CloseInput;
-  except
+  begin
+    FErrorMessage :=
+      'standard-input writer did not stop after cancellation';
+    { The writer exclusively owns a duplicated pipe handle and no process
+      object. Quarantine it instead of blocking this invocation or destroying
+      a live thread. }
+    Exit(False);
   end;
+  WaitFor;
+  Result := True;
 end;
 
 destructor TLWPTPipeWriter.Destroy;
 begin
   { Startup and exception cleanup use the same bounded cancellation contract
     as the normal communication path. }
-  if not Finished then CancelAndJoin;
-  inherited Destroy;
+  try
+    if not FStarted then
+    begin
+      Terminate;
+      CloseOwnedInput;
+    end
+    else if not Finished then
+      WaitFor;
+  finally
+    inherited Destroy;
+  end;
 end;
 
 constructor TLWPTProcessTerminationThread.Create(
@@ -221,14 +367,19 @@ end;
 
 destructor TLWPTProcessTerminationThread.Destroy;
 begin
-  WaitFor;
-  DoneCriticalSection(FCriticalSection);
-  inherited Destroy;
+  try
+    if FStarted then WaitFor
+    else Terminate;
+    inherited Destroy;
+  finally
+    DoneCriticalSection(FCriticalSection);
+  end;
 end;
 
 procedure TLWPTProcessTerminationThread.Execute;
 begin
   try
+    if Terminated then Exit;
     try
       FProcessTree.Terminate;
     except
@@ -250,6 +401,31 @@ begin
       LeaveCriticalSection(FCriticalSection);
     end;
   end;
+end;
+
+procedure TLWPTProcessTerminationThread.StartTermination;
+begin
+  try
+    Start;
+    FStarted := True;
+  except
+    on E: Exception do
+    begin
+      EnterCriticalSection(FCriticalSection);
+      try
+        FErrorMessage := 'termination worker did not start: ' + E.Message;
+        FDone := True;
+      finally
+        LeaveCriticalSection(FCriticalSection);
+      end;
+      Terminate;
+    end;
+  end;
+end;
+
+procedure TLWPTProcessTerminationThread.WaitForCompletion;
+begin
+  if FStarted then WaitFor;
 end;
 
 function TLWPTProcessTerminationThread.ErrorMessage: string;
@@ -360,10 +536,12 @@ var
   StandardErrorExceeded, StandardOutputExceeded: Boolean;
   TerminationThread: TLWPTProcessTerminationThread;
   TimedOut: Boolean;
+  WriterAbandoned: Boolean;
   Writer: TLWPTPipeWriter;
 begin
   if not FStarted then
     raise ELWPTProcessRunnerError.Create('process runner is not started');
+  ReapFinishedPipeWriters;
   AStandardOutput := '';
   AStandardError := '';
   FailureMessage := '';
@@ -371,14 +549,44 @@ begin
   TimedOut := False;
   StandardOutputExceeded := False;
   StandardErrorExceeded := False;
-  Writer := TLWPTPipeWriter.Create(FProcess, AStandardInput);
+  WriterAbandoned := False;
+  Writer := nil;
   TerminationThread := nil;
   try
-    StartedAt := GetTickCount64;
-    Writer.Start;
     try
+      Writer := TLWPTPipeWriter.Create(FProcess, AStandardInput);
+    except
+      on E: Exception do
+      begin
+        FailureMessage := 'could not prepare standard-input writer: '
+          + E.Message;
+        try
+          FProcessTree.Terminate;
+        except
+          on TerminationError: Exception do
+            FailureMessage := FailureMessage + '; process-tree termination: '
+              + TerminationError.Message;
+        end;
+        raise ELWPTProcessRunnerError.Create(FailureMessage);
+      end;
+    end;
+    StartedAt := GetTickCount64;
+    try
+      if not Writer.StartWriting then
+        FailureMessage := Writer.ErrorMessage;
+      { The writer owns a duplicated handle. Close TProcess's original copy
+        now so child EOF depends only on the process-independent writer. }
+      try
+        FProcess.CloseInput;
+      except
+        on E: Exception do
+          if FailureMessage = '' then
+            FailureMessage := 'could not close original standard-input '
+              + 'handle: ' + E.Message;
+      end;
       while FProcess.Running do
       begin
+        if FailureMessage <> '' then Break;
         DrainPipe(FProcess.Output, AStandardOutput,
           AOptions.MaximumStandardOutputBytes, StandardOutputExceeded);
         if AOptions.SeparateStandardError then
@@ -412,7 +620,7 @@ begin
         Writer.RequestCancellation;
         TerminationThread := TLWPTProcessTerminationThread.Create(
           FProcessTree);
-        TerminationThread.Start;
+        TerminationThread.StartTermination;
         while FProcess.Running do
         begin
           DrainPipe(FProcess.Output, AStandardOutput,
@@ -455,7 +663,7 @@ begin
           end;
           Sleep(PROCESS_RUNNER_POLL_MILLISECONDS);
         end;
-        TerminationThread.WaitFor;
+        TerminationThread.WaitForCompletion;
         if TerminationFailure = '' then
           TerminationFailure := TerminationThread.ErrorMessage;
       end;
@@ -466,7 +674,7 @@ begin
           AOptions.MaximumStandardErrorBytes, StandardErrorExceeded);
       if not FProcess.Running then FProcess.WaitOnExit;
     finally
-      Writer.CancelAndJoin;
+      WriterAbandoned := not Writer.CancelAndJoin;
     end;
     if TimedOut then
       raise ELWPTProcessRunnerTimeout.CreateFmt('%s timed out after %d ms',
@@ -487,6 +695,11 @@ begin
     Result := NormalisedExitCode(FProcess);
   finally
     TerminationThread.Free;
+    if WriterAbandoned then
+    begin
+      QuarantinePipeWriter(Writer);
+      Writer := nil;
+    end;
     Writer.Free;
   end;
 end;
@@ -506,10 +719,19 @@ begin
 end;
 
 initialization
+  AbandonedPipeWriters := TList.Create;
+  InitCriticalSection(AbandonedPipeWritersCriticalSection);
   {$IFDEF UNIX}
   { A timed-out child may close stdin while the writer thread is blocked.
     Treat that as an ordinary write error instead of terminating LWPT. }
   FpSignal(SIGPIPE, SignalHandler(SIG_IGN));
   {$ENDIF}
+
+finalization
+  { Never wait during unit shutdown. Finished quarantined writers are reaped;
+    a still-blocked writer and its private OS handle are left for process exit. }
+  ReapFinishedPipeWriters;
+  AbandonedPipeWriters.Free;
+  DoneCriticalSection(AbandonedPipeWritersCriticalSection);
 
 end.

@@ -11,7 +11,7 @@ uses
   LWPT.Core;
 
 const
-  COMPILER_TIMEOUT_ENVIRONMENT = 'LWPT_COMPILER_TIMEOUT_MS';
+  COMPILER_TIMEOUT_ENVIRONMENT = PROJECT_NAME + '_COMPILER_TIMEOUT_MS';
   DEFAULT_COMPILER_TIMEOUT_MILLISECONDS = 30 * 60 * 1000;
 
 type
@@ -102,10 +102,9 @@ begin
   SetLength(Result.Inputs.Sources, 1);
   Result.Inputs.Sources[0] := ASource;
   Result.Outputs.Artifact := AArtifact;
-  {$IFDEF MSWINDOWS}
-  if ExtractFileExt(Result.Outputs.Artifact) = '' then
+  if IsWindowsOperatingSystem(Result.Target.OS)
+     and (ExtractFileExt(Result.Outputs.Artifact) = '') then
     Result.Outputs.Artifact := Result.Outputs.Artifact + '.exe';
-  {$ENDIF}
 end;
 
 function TLWPTCompilerDriver.BuildStandardInput(
