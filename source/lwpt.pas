@@ -1,6 +1,6 @@
 { LWPT — lightweight Pascal toolkit.
 
-  One executable, ten subcommands sharing a common core (manifest,
+  One executable, eleven subcommands sharing a common core (manifest,
   TOML, resolver, cfg emitter):
     init      scaffold a new project or adopt an existing manifest
     install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
@@ -8,6 +8,7 @@
     remove    remove dependencies from lwpt.toml + prune their modules
     build     compile manifest [build] entries
     format    format uses-clauses and identifiers (--check to verify only)
+    duplication report manifest-scoped Type-2 Pascal token clones
     test      discover + compile + run *.Test.pas files
     repair    reclaim install, build-session, and worker-lease residue
     run       invoke a user-declared run-script (or alias a subcommand)
@@ -41,6 +42,7 @@ uses
   LWPT.Command.Add,
   LWPT.Command.Agents,
   LWPT.Command.Build,
+  LWPT.Command.Duplication,
   LWPT.Command.Format,
   LWPT.Command.Init,
   LWPT.Command.Install,
@@ -266,6 +268,35 @@ begin
   end;
 end;
 
+{ --- duplication -------------------------------------------------------- }
+function HandleDuplication(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  JSON: Boolean;
+  i: Integer;
+begin
+  if APositionals.Count <> 0 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('duplication'),
+      'unexpected argument "', APositionals[0],
+      '" (duplication takes no positionals, only --json)');
+    Exit(1);
+  end;
+  JSON := False;
+  for i := 0 to High(AOptions) do
+    if SameText(AOptions[i].LongName, 'json') and AOptions[i].Present then
+      JSON := True;
+  try
+    Result := CmdDuplication(MANIFEST_FILE, JSON);
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('duplication'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
 { --- test --------------------------------------------------------------- }
 function HandleTest(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
@@ -469,7 +500,7 @@ end;
 { --- registration -------------------------------------------------------- }
 var
   InstallOpts, AddOpts, RemoveOpts, TestOpts, BuildOpts, InitOpts,
-    RunOpts, FormatOpts, RepairOpts, AgentsOpts : TOptionArray;
+  RunOpts, FormatOpts, DuplicationOpts, RepairOpts, AgentsOpts : TOptionArray;
 begin
   if HandleTopLevelFlags then
   begin
@@ -522,6 +553,13 @@ begin
     Registry.Add(TSubcommand.Create('format',
       'Format uses-clauses and identifiers', '[--check]',
       @HandleFormat, FormatOpts));
+
+    SetLength(DuplicationOpts, 1);
+    DuplicationOpts[0] := TFlagOption.Create('json',
+      'Emit the deterministic machine-readable analysis envelope');
+    Registry.Add(TSubcommand.Create('duplication',
+      'Report manifest-scoped Pascal token clones', '[--json]',
+      @HandleDuplication, DuplicationOpts));
 
     SetLength(TestOpts, 4);
     TestOpts[0] := TStringOption.Create('tier',
