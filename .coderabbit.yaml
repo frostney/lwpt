@@ -3,7 +3,9 @@ reviews:
     # Stack PRs opt into the scarce review pass only after their current head
     # has passed CI. Re-adding the label requests a new review after a fix.
     enabled: false
-    drafts: false
+    # A label is still required, so allowing drafts lets CI-clean ordinary PRs
+    # request review without a ready transition that would duplicate their CI.
+    drafts: true
     labels:
       - review:ready
     # Upper stack PRs target the codex/ branch immediately below them rather
