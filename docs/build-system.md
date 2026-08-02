@@ -277,7 +277,7 @@ The heavyweight gates — `lwpt format --check` + `lwpt build` + `lwpt agents --
 
 Do **not** bypass with `git commit --no-verify` unless a maintainer explicitly authorises it on the PR.
 
-The three deferred customer-facing stack contracts ([link-check #31](https://github.com/frostney/lwpt/issues/31), [duplication #32](https://github.com/frostney/lwpt/issues/32), and [codebase-health #33](https://github.com/frostney/lwpt/issues/33)) are explicitly *not* in the v1 pre-commit gate per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md). They plug in when their workstreams land. Architecture drift is instead checked for LWPT itself during release preparation; it is not a consumer command. [Issue #28](https://github.com/frostney/lwpt/issues/28) delivered parallel, process-safe, observable builds and tests through private sessions and the shared worker budget.
+The remaining deferred customer-facing stack contracts ([link-check #31](https://github.com/frostney/lwpt/issues/31) and [codebase-health #33](https://github.com/frostney/lwpt/issues/33)) are explicitly *not* in the v1 pre-commit gate per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md). Duplication analysis from [issue #32](https://github.com/frostney/lwpt/issues/32) is a user-invoked report and does not widen that gate. Architecture drift is instead checked for LWPT itself during release preparation; it is not a consumer command. [Issue #28](https://github.com/frostney/lwpt/issues/28) delivered parallel, process-safe, observable builds and tests through private sessions and the shared worker budget.
 
 ## Machine-wide worker capacity
 
