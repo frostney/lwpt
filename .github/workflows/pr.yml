@@ -3,14 +3,17 @@ name: PR
 # Fast PR gate. Mirrors the GocciaScript pattern: ci.yml runs only
 # on push to main, so pr.yml is the sole pre-merge signal a PR sees.
 #
-#   pr.yml      — every PR: Ubuntu native bootstrap + install +
-#                 format --check + build + test, then the live-
+#   pr.yml      — every ordinary PR and every ci:ready managed stack PR:
+#                 Ubuntu native bootstrap + install + format --check + build +
+#                 test, then the live-
 #                 network e2e tier on the same Linux leg (#102);
 #                 a native aarch64-darwin default-tier leg; and a
 #                 win64 leg: cross-compile on macOS, then the
 #                 offline default test tier natively on
-#                 windows-latest. Typical wall-clock < 10 min on a
-#                 warm toolchain cache (hard caps per job/step).
+#                 windows-latest. Managed stack PRs remain drafts while work is
+#                 noisy; converted_to_draft cancels an in-flight run. Typical
+#                 wall-clock < 10 min on a warm toolchain cache (hard caps per
+#                 job/step).
 #   ci.yml      — push to main only: full 6-target cross-build +
 #                 per-platform native test runs (incl. e2e on
 #                 every platform). Post-merge confirmation.
@@ -51,6 +54,16 @@ on:
   pull_request:
     branches:
       - main
+      # Native stacked PRs target the branch immediately below them. Rush
+      # branches use the codex/ prefix, so include those bases as well as main.
+      - 'codex/**'
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      # Starting a skipped run cancels an in-flight run for the same PR branch.
+      - converted_to_draft
   workflow_dispatch:
 
 permissions:
@@ -65,6 +78,17 @@ concurrency:
 
 jobs:
   build-and-test:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.action != 'converted_to_draft' &&
+          (
+            contains(github.event.pull_request.labels.*.name, 'stack:managed') == false ||
+            github.event.pull_request.draft == false
+          )
+        )
+      }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -75,6 +99,20 @@ jobs:
       # Post-merge ci.yml still runs the tier on every platform.
       LWPT_SKIP_NETWORK: "1"
     steps:
+      # Keep the guard inside an existing required context. GitHub treats a
+      # conditionally skipped required job as successful, which would otherwise
+      # let a ready managed PR bypass its ci:ready routing state.
+      - name: Require ci:ready for a managed stack PR
+        if: >-
+          ${{
+            github.event_name == 'pull_request' &&
+            contains(github.event.pull_request.labels.*.name, 'stack:managed') &&
+            contains(github.event.pull_request.labels.*.name, 'ci:ready') == false
+          }}
+        run: |
+          echo "::error::Managed stack PRs must carry ci:ready before leaving draft."
+          exit 1
+
       # persist-credentials: false on every pr.yml checkout: these jobs
       # build and EXECUTE the PR's own code (bootstrap, lwpt, tests),
       # so no git auth material should sit in the workspace git config.
@@ -136,6 +174,20 @@ jobs:
         run: ./build/lwpt test --tier=e2e --bail=1
 
   docs:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.action != 'converted_to_draft' &&
+          (
+            contains(github.event.pull_request.labels.*.name, 'stack:managed') == false ||
+            (
+              github.event.pull_request.draft == false &&
+              contains(github.event.pull_request.labels.*.name, 'ci:ready')
+            )
+          )
+        )
+      }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -158,6 +210,20 @@ jobs:
   # (x86_64-darwin, aarch64-linux, i386-win32) stay post-merge: their
   # unique-catch rate has not justified per-PR cost.
   darwin-test:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.action != 'converted_to_draft' &&
+          (
+            contains(github.event.pull_request.labels.*.name, 'stack:managed') == false ||
+            (
+              github.event.pull_request.draft == false &&
+              contains(github.event.pull_request.labels.*.name, 'ci:ready')
+            )
+          )
+        )
+      }}
     runs-on: macos-latest
     timeout-minutes: 20
     defaults:
@@ -197,6 +263,20 @@ jobs:
   # the PR's own cache scope); the next main push repopulates the
   # shared copy.
   toolchain:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.action != 'converted_to_draft' &&
+          (
+            contains(github.event.pull_request.labels.*.name, 'stack:managed') == false ||
+            (
+              github.event.pull_request.draft == false &&
+              contains(github.event.pull_request.labels.*.name, 'ci:ready')
+            )
+          )
+        )
+      }}
     uses: ./.github/workflows/toolchain.yml
 
   # Windows compile signal, pre-merge. ci.yml's full cross-build
@@ -214,6 +294,20 @@ jobs:
   # Linux/Darwin branches that don't apply to win64. When ci.yml's
   # build flags change, change them here too.
   windows-cross-compile:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.action != 'converted_to_draft' &&
+          (
+            contains(github.event.pull_request.labels.*.name, 'stack:managed') == false ||
+            (
+              github.event.pull_request.draft == false &&
+              contains(github.event.pull_request.labels.*.name, 'ci:ready')
+            )
+          )
+        )
+      }}
     needs: toolchain
     runs-on: macos-latest
     env:
@@ -332,6 +426,20 @@ jobs:
   # Post-merge ci.yml still owns the i386-win32 leg, the e2e tier
   # on non-Linux platforms, and the bootstrap.bat smoke.
   windows-test:
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.action != 'converted_to_draft' &&
+          (
+            contains(github.event.pull_request.labels.*.name, 'stack:managed') == false ||
+            (
+              github.event.pull_request.draft == false &&
+              contains(github.event.pull_request.labels.*.name, 'ci:ready')
+            )
+          )
+        )
+      }}
     needs: windows-cross-compile
     runs-on: windows-latest
     defaults:

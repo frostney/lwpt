@@ -34,7 +34,11 @@ not release publication.
   verifiable success criteria.
 - Respect project instructions, Definitions of Ready and Done, branch
   protection, review policy, and the remote default branch. Never amend,
-  rebase, force-push, bypass a gate, or overwrite unrelated work.
+  rebase, force-push, bypass a gate, or overwrite unrelated work. The sole
+  exception is a user-confirmed GitHub-native stack: `gh stack` may cascade
+  rebase and force-with-lease only branches created by this rush for that
+  stack. Stop on a lease mismatch; never rewrite the default, unrelated, or
+  pre-existing branches.
 
 ## Reconcile and plan
 
@@ -86,6 +90,36 @@ not release publication.
 7. When a milestone merge causes an integrated regression, create and implement
    the required repair. Treat unrelated or materially ambiguous failures as
    blockers.
+
+### Native stacked pull requests
+
+When the confirmed plan selects GitHub-native stacked pull requests, preserve
+the dependency graph and use the repository's stack-routing labels:
+
+1. Submit every stack member as a draft with `stack:managed`. Draft pushes and
+   cascading synchronization do not consume the expensive PR matrix.
+2. As each layer becomes stable, run its local project gate and required
+   pre-PR review. Apply `ci:ready`, then mark that PR ready so CI runs once for
+   its current head. An upper layer's CI validates the cumulative stack prefix
+   through that layer; do not wait for the whole stack before validating a
+   stable lower layer.
+3. Only after that current head is green, apply `review:ready`. Request scarce
+   or rate-limited review passes one PR at a time from the bottom upward. A rate
+   limit or incomplete verdict remains pending.
+4. Before any fix, rebase, or push, return the changed PR and its affected
+   suffix to draft and remove `ci:ready`, `review:ready`, and `merge:ready`.
+   Revalidate only the affected current heads.
+5. Apply `merge:ready` only after every selected stack member's current head has
+   green required checks, terminal reviewer evidence, and no unresolved
+   findings. Merge the complete stack, or a deliberately selected prefix, with
+   the repository's required merge method in one all-or-nothing stack merge.
+6. Continuous integration still occurs between stacks: after a complete stack
+   lands, refresh the remote default, synchronize dependent stacks, and repeat
+   their current-head gates. Do not invoke per-PR automatic merge within an
+   atomic stack.
+
+Labels route work; they are not completion evidence. Checks, reviews, and
+recorded SHAs remain authoritative, and every push invalidates prior evidence.
 
 Manage implementation and review workers within the host's shared capacity.
 Keep implementation nodes running while useful work remains, and queue review
