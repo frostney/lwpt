@@ -20,6 +20,7 @@ type
     procedure TestDirectRecursionRequiresSelfCall;
     procedure TestConditionalRoutineBodiesRemainRoutine;
     procedure TestConditionalElseRoutineBodiesBothScore;
+    procedure TestEscapedKeywordsRemainIdentifiers;
     procedure TestSyntheticSectionsContributeToFileTotals;
     procedure TestLimitsAreStrictAndReportEveryViolation;
     procedure TestHotspotNormalizationExposesRawComponents;
@@ -168,6 +169,18 @@ begin
   Expect<Integer>(HealthFile.Metrics[0].Cognitive).ToBe(2);
 end;
 
+procedure THealthMetricTests.TestEscapedKeywordsRemainIdentifiers;
+var
+  HealthFile: TLWPTHealthFile;
+begin
+  HealthFile := AnalyzeSource(
+    'program Demo; procedure Work; var &begin: Boolean; '#10
+    + 'begin &begin := True; end; begin end.');
+  Expect<Integer>(Length(HealthFile.Metrics)).ToBe(2);
+  Expect<Integer>(HealthFile.Metrics[0].Cyclomatic).ToBe(1);
+  Expect<Integer>(HealthFile.Metrics[0].Cognitive).ToBe(0);
+end;
+
 procedure THealthMetricTests.TestSyntheticSectionsContributeToFileTotals;
 var
   HealthFile: TLWPTHealthFile;
@@ -259,6 +272,8 @@ begin
     TestConditionalRoutineBodiesRemainRoutine);
   Test('scores both branches of a conditional routine body',
     TestConditionalElseRoutineBodiesBothScore);
+  Test('does not score escaped keywords as block delimiters',
+    TestEscapedKeywordsRemainIdentifiers);
   Test('sums routines and synthetic executable sections into files',
     TestSyntheticSectionsContributeToFileTotals);
   Test('uses strict maxima and reports every violation',

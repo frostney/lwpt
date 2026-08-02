@@ -27,7 +27,11 @@ uses
   LWPT.Analysis.JSON,
   LWPT.Analysis.Pascal,
   LWPT.Analysis.Scope,
-  LWPT.Manifest;
+  LWPT.Manifest,
+  LWPT.ProcessRunner;
+
+const
+  HEALTH_GIT_TIMEOUT_MILLISECONDS = 30000;
 
 type
   TLWPTHealthProjectConfiguration = record
@@ -71,37 +75,25 @@ end;
 function RunCaptured(const AExecutable: string;
   const AArguments: array of string; out AOutput: string): Integer;
 var
-  Buffer: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
-  BytesRead, ArgumentIndex: Integer;
+  ArgumentIndex: Integer;
+  Options: TLWPTProcessRunOptions;
   ProcessInstance: TProcess;
+  ProcessRunner: TLWPTDuplexProcessRunner;
+  StandardError: string;
 begin
   AOutput := '';
   ProcessInstance := TProcess.Create(nil);
+  ProcessRunner := nil;
   try
     ProcessInstance.Executable := AExecutable;
     for ArgumentIndex := Low(AArguments) to High(AArguments) do
       ProcessInstance.Parameters.Add(AArguments[ArgumentIndex]);
-    ProcessInstance.Options := [poUsePipes, poStderrToOutPut];
-    ProcessInstance.Execute;
-    repeat
-      while ProcessInstance.Output.NumBytesAvailable > 0 do
-      begin
-        BytesRead := ProcessInstance.Output.Read(Buffer[0], SizeOf(Buffer));
-        if BytesRead > 0 then
-          AppendRawBytes(AOutput, Buffer[0], BytesRead);
-      end;
-      if ProcessInstance.Running then Sleep(1);
-    until not ProcessInstance.Running;
-    repeat
-      BytesRead := ProcessInstance.Output.Read(Buffer[0], SizeOf(Buffer));
-      if BytesRead > 0 then
-        AppendRawBytes(AOutput, Buffer[0], BytesRead);
-    until BytesRead <= 0;
-    ProcessInstance.WaitOnExit;
-    Result := ProcessInstance.ExitCode;
-    if (Result = 0) and (ProcessInstance.ExitStatus <> 0) then
-      Result := ProcessInstance.ExitStatus;
+    Options := DefaultProcessRunOptions('health Git query');
+    Options.TimeoutMilliseconds := HEALTH_GIT_TIMEOUT_MILLISECONDS;
+    ProcessRunner := TLWPTDuplexProcessRunner.Create(ProcessInstance);
+    Result := ProcessRunner.Run('', Options, AOutput, StandardError);
   finally
+    ProcessRunner.Free;
     ProcessInstance.Free;
   end;
 end;

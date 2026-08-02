@@ -684,8 +684,7 @@ begin
         Inc(BlockDepth, Delta)
       else if BlockDepth > 0 then
       begin
-        if not HasBody and RoutineDeclarationAt(TokenIndex, Candidate,
-          NestedKind) then
+        if RoutineDeclarationAt(TokenIndex, Candidate, NestedKind) then
           HasRoutine := True;
         if TokenIs(TokenIndex, 'begin') or TokenIs(TokenIndex, 'asm') then
           HasBody := True;

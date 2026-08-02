@@ -17,13 +17,15 @@ type
     FGitRoot, FNonGitRoot, FWorktreeRoot: string;
     procedure RunGit(const AArguments: array of string);
     procedure WriteManifest(const ARoot: string;
-      const AMaxFileCyclomatic: Integer = -1);
+      const AMaxFileCyclomatic: Integer = -1;
+      const AMaxHotspotScore: Integer = -1);
   protected
     procedure BeforeAll; override;
   public
     procedure SetupTests; override;
     procedure TestGitHistoryProducesStableEnrichedJSON;
     procedure TestNonGitProjectDegradesToComplexityOnly;
+    procedure TestHotspotThresholdRequiresGitHistory;
     procedure TestThresholdEqualityPassesAndExcessFails;
   end;
 
@@ -50,15 +52,22 @@ begin
 end;
 
 procedure THealthGitE2E.WriteManifest(const ARoot: string;
-  const AMaxFileCyclomatic: Integer);
+  const AMaxFileCyclomatic, AMaxHotspotScore: Integer);
 var
   Text: string;
 begin
   Text := '[package]'#10'name = "health-e2e"'#10
     + 'version = "1.0.0"'#10'units = ["source"]'#10;
-  if AMaxFileCyclomatic >= 0 then
-    Text := Text + '[health]'#10'max-file-cyclomatic = '
-      + IntToStr(AMaxFileCyclomatic) + #10;
+  if (AMaxFileCyclomatic >= 0) or (AMaxHotspotScore >= 0) then
+  begin
+    Text := Text + '[health]'#10;
+    if AMaxFileCyclomatic >= 0 then
+      Text := Text + 'max-file-cyclomatic = '
+        + IntToStr(AMaxFileCyclomatic) + #10;
+    if AMaxHotspotScore >= 0 then
+      Text := Text + 'max-hotspot-score = '
+        + IntToStr(AMaxHotspotScore) + #10;
+  end;
   WriteTextFile(ARoot + '/lwpt.toml', Text);
 end;
 
@@ -143,6 +152,18 @@ begin
   Expect<Boolean>(Pos('max-file-cyclomatic', Run.Stdout) > 0).ToBe(True);
 end;
 
+procedure THealthGitE2E.TestHotspotThresholdRequiresGitHistory;
+var
+  Run: TLwptResult;
+begin
+  WriteManifest(FNonGitRoot, -1, 10);
+  Run := RunLwpt(['health', '--json'], FNonGitRoot,
+    ['GIT_CEILING_DIRECTORIES=' + FWorktreeRoot]);
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('Git enrichment is unavailable', Run.Stderr) > 0)
+    .ToBe(True);
+end;
+
 procedure THealthGitE2E.SetupTests;
 begin
   Test('reports deterministic JSON from rename-aware local Git history',
@@ -151,6 +172,8 @@ begin
     TestNonGitProjectDegradesToComplexityOnly);
   Test('passes equality and fails only above configured thresholds',
     TestThresholdEqualityPassesAndExcessFails);
+  Test('requires Git history for configured hotspot thresholds',
+    TestHotspotThresholdRequiresGitHistory);
 end;
 
 begin

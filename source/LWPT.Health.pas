@@ -61,6 +61,7 @@ function DefaultHealthLimits: TLWPTHealthLimits;
 function AnalyzeHealthDocument(const ADocument: TLWPTPascalDocument;
   const AProjectName, APath: string): TLWPTHealthFile;
 procedure NormalizeHotspots(var AFiles: TLWPTHealthFileArray);
+{ Appends to AViolations; the caller owns initialization and reset. }
 procedure CollectHealthViolations(const AFile: TLWPTHealthFile;
   const ALimits: TLWPTHealthLimits;
   var AViolations: TLWPTHealthViolationArray);
@@ -139,8 +140,15 @@ begin
 end;
 
 function TLWPTHealthStatementParser.AtToken(const AText: string): Boolean;
+var
+  ExpectedKind: TLWPTPascalTokenKind;
 begin
+  if (AText <> '') and (AText[1] in ['A'..'Z', 'a'..'z', '_']) then
+    ExpectedKind := ptKeyword
+  else
+    ExpectedKind := ptSymbol;
   Result := (FIndex < FEndToken)
+    and (FDocument.Tokens[FIndex].Kind = ExpectedKind)
     and (FDocument.Tokens[FIndex].Text = AText);
 end;
 
