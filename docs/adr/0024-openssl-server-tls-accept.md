@@ -39,6 +39,12 @@ One `TTransportSecurityServerContext` loads a PKCS#12 identity into an
 certificate, private key, and optional intermediate chain. The complete chain
 is installed and OpenSSL verifies that the leaf and private key match.
 
+The context independently fixes each connection's encrypted-input and
+encrypted-output capacities. Each defaults to 64 KiB and is configurable from
+17 KiB through 256 KiB; zero or unlimited capacity is not supported. The input
+low watermark defaults to half the selected input capacity and can be set
+explicitly when `0 <= low < input capacity`.
+
 Context construction enforces a named 16 MiB PKCS#12 size cap before allocating
 or parsing the file. Passphrases are converted deliberately to UTF-8, embedded
 NUL bytes are rejected, and empty and non-ASCII passphrases are supported. The
@@ -52,9 +58,10 @@ construction. TLS 1.3 remains available. The listener owns the context, reuses
 it across connections, and must keep it alive until every connection created
 from it has been torn down.
 
-`BeginTransportSecurityServer` creates one `SSL`, one read memory BIO, and a
-bounded write-side memory BIO pair per connection. `SSL_set_bio` transfers the
-read BIO and the protocol side of the pair to that `SSL`; no server path calls
+`BeginTransportSecurityServer` creates one `SSL`, one capacity-gated read memory
+BIO, and a write-side memory BIO pair with the context's configured output
+capacity per connection. `SSL_set_bio` transfers the read BIO and the protocol
+side of the pair to that `SSL`; no server path calls
 `SSL_set_fd`, reads a socket, writes a socket, or blocks. OpenSSL supports
 concurrent connections through the shared immutable `SSL_CTX`, while the
 consumer serializes access to each individual `SSL`.
@@ -97,7 +104,8 @@ the WANT results; it must not infer authentication from allocation alone.
 
 The ciphertext surface is deliberately peek/consume shaped:
 
-1. `TransportSecurityFeedCiphertext` writes received bytes to the read BIO.
+1. `TransportSecurityFeedCiphertext` accepts the longest prefix that fits the
+   read BIO's configured capacity and returns that accepted length.
 2. An operation runs once and moves write-BIO output into the connection's
    retained ciphertext queue.
 3. `TransportSecurityGetCiphertext` returns the current queue head and length.
@@ -112,6 +120,35 @@ returns `tssWantWrite` without calling OpenSSL or modifying/reallocating the
 queue. A span returned by `TransportSecurityGetCiphertext` is therefore stable
 until its accepted prefix is consumed. TLS record bytes are never discarded or
 regenerated around transport backpressure.
+
+`TransportSecurityServerInputFlow` exposes the connection's high and low
+watermarks, currently buffered encrypted bytes, cumulative accepted and
+OpenSSL-consumed byte counters, and a backpressure signal. Reaching the high
+watermark pauses intake. It remains paused while buffered input is above the
+low watermark, then resumes; this hysteresis avoids a read-ready wakeup for
+every byte OpenSSL consumes. A partial feed accepts only the reported prefix,
+so the reactor retains and retries the unaccepted suffix without loss. The
+backpressure signal stops new socket reads; an already-read suffix may still be
+offered and accepts any newly available capacity, which lets OpenSSL complete a
+partial TLS record even when the configured low watermark is zero.
+
+`TransportSecurityServerOutputFlow` exposes the configured output capacity and
+the exact pending and remaining bytes across retained ciphertext plus any bytes
+still resident in the output BIO. Retained-output precedence means their sum
+never exceeds the configured capacity. `SSL` owns the protocol-side write BIO
+after `SSL_set_bio`; the connection owns and frees the transport-side BIO.
+
+## Consumer deadline and byte budget
+
+The package remains socket- and clock-independent. The reactor starts a
+monotonic handshake deadline immediately after
+`BeginTransportSecurityServer`, counts every ciphertext byte returned by its
+socket reads before offering any prefix to the package, and aborts the TLS
+connection when either its deadline or handshake byte budget is exceeded.
+`Active` marks the end of the handshake budget. The Linux loopback E2E drives a
+one-byte slow-loris peer and proves the caller aborts it within its deadline;
+the in-memory suite proves the package capacity, counters, prefix admission,
+and watermark hysteresis independently of a socket.
 
 When `SSL_write` returns WANT, the connection retains the unaccepted plaintext
 internally. After ciphertext drains, a later write step resumes that exact
@@ -191,15 +228,9 @@ remain permitted because they are not imports.
 
 The following are deliberately outside this package's present contract:
 
-- **Handshake deadline and byte-budget enforcement.** The package does not own
-  the socket, clock, or reactor. Every consumer **MUST** start and enforce a
-  handshake deadline and inbound byte budget from
-  `BeginTransportSecurityServer`; the WANT states and `Active` established flag
-  expose enough state to do so.
-- **Full inbound and outbound flow control.** The PKCS#12 size cap and stable
-  retained-ciphertext queue are implemented, but broader per-connection
-  backpressure, watermarks, and admission policy belong to a future transport
-  flow-control API.
+- **Outbound admission policy.** Per-connection retained output is capacity
+  bounded and lossless across accepted-prefix sends, but listener-wide and
+  application output admission policy remains consumer-owned.
 - **Server-context refcounting for concurrent reload.** A listener must keep
   its context alive until all accepted connections are destroyed. Atomic
   identity reload while accepts race requires reference-counted context
