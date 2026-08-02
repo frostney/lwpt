@@ -482,7 +482,7 @@ begin
     reading the source or re-running under a debugger. }
   Expect<Boolean>(Pos('mock-dep', Combined) > 0).ToBe(True);
   Expect<Boolean>(Pos('archive fetch', Combined) > 0).ToBe(True);
-  Expect<Boolean>(Pos('500', Combined) > 0).ToBe(True);
+  Expect<Boolean>(Pos('HTTP 500', Combined) > 0).ToBe(True);
 end;
 
 procedure TInstallHTTPFetchFailure.TestServerErrorLeavesTheProjectUntouched;
