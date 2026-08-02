@@ -29,6 +29,8 @@ type
     procedure TestSatisfiesCaret;
     procedure TestSatisfiesTilde;
     procedure TestSatisfiesExact;
+    procedure TestSatisfiesCompleteHyphenRange;
+    procedure TestSatisfiesPartialHyphenRange;
     procedure TestPrereleaseExcludedByDefault;
   end;
 
@@ -90,6 +92,20 @@ begin
   Expect<Boolean>(Sat('1.2.4', '1.2.3')).ToBe(False);
 end;
 
+procedure TSemverHappyPath.TestSatisfiesCompleteHyphenRange;
+begin
+  Expect<Boolean>(Sat('1.2.3', '1.2.3 - 2.3.4')).ToBe(True);
+  Expect<Boolean>(Sat('2.3.4', '1.2.3 - 2.3.4')).ToBe(True);
+  Expect<Boolean>(Sat('2.3.5', '1.2.3 - 2.3.4')).ToBe(False);
+end;
+
+procedure TSemverHappyPath.TestSatisfiesPartialHyphenRange;
+begin
+  Expect<Boolean>(Sat('1.2.0', '1.2 - 2.3')).ToBe(True);
+  Expect<Boolean>(Sat('2.3.99', '1.2 - 2.3')).ToBe(True);
+  Expect<Boolean>(Sat('2.4.0', '1.2 - 2.3')).ToBe(False);
+end;
+
 procedure TSemverHappyPath.TestPrereleaseExcludedByDefault;
 begin
   { With the default options, prereleases on one side of the range do
@@ -103,6 +119,8 @@ begin
   Test('satisfies caret happy path', TestSatisfiesCaret);
   Test('satisfies tilde happy path', TestSatisfiesTilde);
   Test('satisfies exact match',     TestSatisfiesExact);
+  Test('satisfies complete hyphen range', TestSatisfiesCompleteHyphenRange);
+  Test('satisfies partial hyphen range', TestSatisfiesPartialHyphenRange);
   Test('prereleases excluded from non-prerelease ranges by default',
     TestPrereleaseExcludedByDefault);
 end;

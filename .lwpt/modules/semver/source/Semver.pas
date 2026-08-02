@@ -1553,6 +1553,86 @@ begin
   Result := ExpandXRangeToken(AToken, AOptions);
 end;
 
+function ExpandHyphenLowerBound(const AToken: string;
+  const AOptions: TSemverOptions): TSemverStringArray;
+var
+  Partial: TPartialSemver;
+  MajorValue, MinorValue, PatchValue: Int64;
+  Suffix: string;
+begin
+  if not TryParsePartialSemver(AToken, AOptions, Partial) then
+    Exit(ExpandComparatorToken('>=' + AToken, AOptions));
+  if not Partial.HasMajor or IsWildcardIdentifier(Partial.MajorText) then
+  begin
+    SetLength(Result, 1);
+    Result[0] := '';
+    Exit;
+  end;
+
+  MajorValue := ParseIntComponent(Partial.MajorText);
+  if Partial.HasMinor and not IsWildcardIdentifier(Partial.MinorText) then
+    MinorValue := ParseIntComponent(Partial.MinorText)
+  else
+    MinorValue := 0;
+  if Partial.HasPatch and not IsWildcardIdentifier(Partial.PatchText) then
+    PatchValue := ParseIntComponent(Partial.PatchText)
+  else
+    PatchValue := 0;
+
+  Suffix := '';
+  if Partial.PrereleaseText <> '' then
+    Suffix := '-' + Partial.PrereleaseText;
+  if Partial.BuildText <> '' then
+    Suffix := Suffix + '+' + Partial.BuildText;
+  SetLength(Result, 1);
+  Result[0] := '>=' + IntToStr(MajorValue) + '.' + IntToStr(MinorValue) +
+    '.' + IntToStr(PatchValue) + Suffix;
+end;
+
+function ExpandHyphenUpperBound(const AToken: string;
+  const AOptions: TSemverOptions): TSemverStringArray;
+var
+  Partial: TPartialSemver;
+  MajorValue, MinorValue, PatchValue: Int64;
+  Suffix: string;
+begin
+  if not TryParsePartialSemver(AToken, AOptions, Partial) then
+    Exit(ExpandComparatorToken('<=' + AToken, AOptions));
+  if not Partial.HasMajor or IsWildcardIdentifier(Partial.MajorText) then
+  begin
+    SetLength(Result, 1);
+    Result[0] := '';
+    Exit;
+  end;
+
+  MajorValue := ParseIntComponent(Partial.MajorText);
+  if not Partial.HasMinor or IsWildcardIdentifier(Partial.MinorText) then
+  begin
+    SetLength(Result, 1);
+    Result[0] := '<' + IntToStr(MajorValue + 1) + '.0.0-0';
+    Exit;
+  end;
+
+  MinorValue := ParseIntComponent(Partial.MinorText);
+  if not Partial.HasPatch or IsWildcardIdentifier(Partial.PatchText) then
+  begin
+    SetLength(Result, 1);
+    Result[0] := '<' + IntToStr(MajorValue) + '.' +
+      IntToStr(MinorValue + 1) + '.0-0';
+    Exit;
+  end;
+
+  PatchValue := ParseIntComponent(Partial.PatchText);
+  Suffix := '';
+  if Partial.PrereleaseText <> '' then
+    Suffix := '-' + Partial.PrereleaseText;
+  if Partial.BuildText <> '' then
+    Suffix := Suffix + '+' + Partial.BuildText;
+  SetLength(Result, 1);
+  Result[0] := '<=' + IntToStr(MajorValue) + '.' + IntToStr(MinorValue) +
+    '.' + IntToStr(PatchValue) + Suffix;
+end;
+
 function ParseRangeSet(const ARangePart: string;
   const AOptions: TSemverOptions): TSemverComparatorArray;
 var
@@ -1565,8 +1645,8 @@ begin
   begin
     LeftPart := Copy(Working, 1, Pos(' - ', Working) - 1);
     RightPart := Copy(Working, Pos(' - ', Working) + 3, MaxInt);
-    Tokens := ExpandComparatorToken(LeftPart, AOptions);
-    ExpandedTokens := ExpandComparatorToken(RightPart, AOptions);
+    Tokens := ExpandHyphenLowerBound(LeftPart, AOptions);
+    ExpandedTokens := ExpandHyphenUpperBound(RightPart, AOptions);
     Tokens := AppendStringArray(Tokens, ExpandedTokens);
   end
   else

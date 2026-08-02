@@ -25,7 +25,8 @@ uses
   LWPT.GitProtocol,
   LWPT.Install,
   LWPT.Manifest,
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  TOML;
 
 type
   TSHA256NISTVectors = class(TTestSuite)
@@ -71,6 +72,7 @@ type
     procedure TestBuildEntryTraversalNameRootOnly;
     procedure TestBuildDependsMustBeStringArray;
     procedure TestBuildFlagsMustBeStringArrayAndAreRootOnly;
+    procedure TestArrayCannotBecomeTablePath;
   end;
 
   TLoadManifestExtensions = class(TTestSuite)
@@ -860,6 +862,55 @@ begin
   Expect<Integer>(Length(Man.BuildEntries[0].Flags)).ToBe(0);
 end;
 
+procedure TLoadManifestValidation.TestArrayCannotBecomeTablePath;
+const
+  REGULAR_TABLE =
+    'a = [1]'#10 +
+    '[a.b]'#10;
+  ARRAY_OF_TABLES =
+    'a = [1]'#10 +
+    '[[a.b]]'#10;
+var
+  Parser: TTOMLParser;
+  Raised: Boolean;
+  Root: TTOMLNode;
+begin
+  Parser := TTOMLParser.Create;
+  try
+    Root := nil;
+    Raised := False;
+    try
+      Root := Parser.ParseDocument(REGULAR_TABLE);
+    except
+      on E: ETOMLParseError do
+      begin
+        Raised := Pos('after assigning it a value', E.Message) > 0;
+        if not Raised then
+          Fail('regular table error did not identify the assigned value');
+      end;
+    end;
+    Root.Free;
+    Expect<Boolean>(Raised).ToBe(True);
+
+    Root := nil;
+    Raised := False;
+    try
+      Root := Parser.ParseDocument(ARRAY_OF_TABLES);
+    except
+      on E: ETOMLParseError do
+      begin
+        Raised := Pos('after assigning it a value', E.Message) > 0;
+        if not Raised then
+          Fail('array-of-tables error did not identify the assigned value');
+      end;
+    end;
+    Root.Free;
+    Expect<Boolean>(Raised).ToBe(True);
+  finally
+    Parser.Free;
+  end;
+end;
+
 procedure TLoadManifestValidation.SetupTests;
 begin
   Test('bare-string dep shorthand rejected (ADR-0004 migration)',
@@ -875,6 +926,8 @@ begin
     TestBuildDependsMustBeStringArray);
   Test('[build] flags are strict root-owned string arrays',
     TestBuildFlagsMustBeStringArrayAndAreRootOnly);
+  Test('value arrays cannot become table paths',
+    TestArrayCannotBecomeTablePath);
 end;
 
 { ── TLoadManifestExtensions ───────────────────────────────────────── }

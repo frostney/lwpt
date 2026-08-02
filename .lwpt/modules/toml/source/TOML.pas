@@ -941,6 +941,9 @@ end;
 procedure TTOMLParser.AttachChild(const ATable: TTOMLNode;
   const AKey: string; const ANode: TTOMLNode);
 begin
+  if not Assigned(ATable) or not Assigned(ATable.Children) then
+    RaiseParseError(Format(
+      'Cannot attach "%s" because its parent is not a table.', [AKey]));
   { Children.Add is the only storage path — the AST is the
     authoritative state. }
   ATable.Children.Add(AKey, ANode);
@@ -978,6 +981,9 @@ begin
       RaiseParseError(Format(
         'Cannot redefine "%s" as a table after assigning it a value.',
         [AKey]));
+    tnkArray:
+      RaiseParseError(Format(
+        'Cannot redefine array "%s" as a table.', [AKey]));
     tnkArrayOfTables:
       RaiseParseError(Format(
         'Cannot extend array of tables "%s" with a dotted key.',
@@ -1059,7 +1065,7 @@ begin
         I = Length(APath) - 1, I <> Length(APath) - 1, False, False);
       AttachChild(Context, APath[I], Existing);
     end
-    else if Existing.Kind = tnkScalar then
+    else if (Existing.Kind = tnkScalar) or (Existing.Kind = tnkArray) then
       RaiseParseError(Format(
         'Cannot redefine "%s" as a table after assigning it a value.',
         [JoinPathPrefix(APath, I + 1)]))
@@ -1118,7 +1124,7 @@ begin
         False, False);
       AttachChild(Context, APath[I], Existing);
     end
-    else if Existing.Kind = tnkScalar then
+    else if (Existing.Kind = tnkScalar) or (Existing.Kind = tnkArray) then
       RaiseParseError(Format(
         'Cannot redefine "%s" as a table after assigning it a value.',
         [JoinPathPrefix(APath, I + 1)]))
