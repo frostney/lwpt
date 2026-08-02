@@ -104,6 +104,12 @@ var
   GMockLiveThreads: Integer = 0;
   GMockWinSockReferences: Integer = 0;
 
+{$IFDEF MSWINDOWS}
+function KernelGetProcessHandleCount(AProcess: THandle;
+  var AHandleCount: DWORD): BOOL; stdcall;
+  external 'kernel32.dll' name 'GetProcessHandleCount';
+{$ENDIF}
+
 function GetMockServerResourceSnapshot: TMockServerResourceSnapshot;
 {$IFDEF MSWINDOWS}
 var
@@ -114,7 +120,7 @@ begin
   Result.LiveThreads := GMockLiveThreads;
   Result.WinSockReferences := GMockWinSockReferences;
   {$IFDEF MSWINDOWS}
-  if not Windows.GetProcessHandleCount(Windows.GetCurrentProcess,
+  if not KernelGetProcessHandleCount(Windows.GetCurrentProcess,
     ProcessHandleCount) then
     RaiseLastOSError;
   Result.ProcessHandles := ProcessHandleCount;
