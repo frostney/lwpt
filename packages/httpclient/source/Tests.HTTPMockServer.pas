@@ -85,7 +85,7 @@ type
 
   { Prepares an ephemeral loopback endpoint that refuses a later connection
     without releasing its port for reuse. Unix retains the endpoint in
-    TIME_WAIT; Windows reserves the port on 127.0.0.1 and targets 127.0.0.2. }
+    TIME_WAIT; Windows keeps the port bound without listening. }
   TMockRefusedEndpoint = class
   private
     FHost: string;
@@ -777,8 +777,6 @@ begin
     Addr.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
     if WinSock2.bind(ListenSock, PSockAddr(@Addr), SizeOf(Addr)) <> 0 then
       raise EMockServerError.Create('bind() failed');
-    if WinSock2.listen(ListenSock, 1) <> 0 then
-      raise EMockServerError.Create('listen() failed');
     AddrLen := SizeOf(Addr);
     if WinSock2.getsockname(ListenSock, PSockAddr(@Addr)^, AddrLen) <> 0 then
       raise EMockServerError.Create('getsockname() failed');
@@ -821,16 +819,13 @@ begin
     {$ENDIF}
     {$IFDEF MSWINDOWS}
     { Windows can retain a recently closed loopback connection in a state
-      that blackholes the next SYN until the request deadline. Keep the
-      OS-assigned port reserved on one numeric loopback address instead and
-      target another address in 127.0.0.0/8. The reservation prevents a
-      wildcard listener from racing into the port, while the distinct address
-      has no listener and therefore rejects the connect immediately. }
-    FHost := '127.0.0.2';
+      that blackholes the next SYN until the request deadline. A socket that
+      owns the OS-assigned port but never enters LISTEN instead makes the TCP
+      stack reject the connect while keeping the port unavailable for reuse. }
     ProbeSock := ConnectLoopback(FPort, FHost);
     if IsValidMockSocket(ProbeSock) then
       raise EMockServerError.Create(
-        'secondary loopback address unexpectedly accepted a connection');
+        'bound non-listening loopback port unexpectedly accepted a connection');
     FReservationSock := ListenSock;
     ListenSock := InvalidMockSocket;
     {$ENDIF}
