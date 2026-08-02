@@ -85,7 +85,8 @@ type
     FOrigDir, FScratch: string;
     function NewProjectRoot(const AName: string): string;
     function InstallAgainstPort(const ARoot: string; const APort: Word;
-      const ATimeoutMilliseconds: string): TLwptResult;
+      const ATimeoutMilliseconds: string;
+      const AWatchdogMilliseconds: QWord = 10000): TLwptResult;
   protected
     procedure BeforeAll; override;
     procedure AfterAll;  override;
@@ -94,6 +95,7 @@ type
     procedure TestServerErrorNamesTheDependencyAndStatus;
     procedure TestServerErrorLeavesTheProjectUntouched;
     procedure TestRefusedConnectionIsReportedAsAFetchFailure;
+    procedure TestRedirectCannotEscapeTheLoopbackFixture;
     procedure TestTruncatedArchiveIsRejectedNotCached;
     procedure TestStalledServerFailsInsideTheRequestBudget;
   end;
@@ -401,21 +403,6 @@ begin
   Result[8] := $00; Result[9] := $03;
 end;
 
-function ClosedLoopbackPort: Word;
-var
-  Mock: TMockHTTPServer;
-begin
-  { Bind an ephemeral port, learn its number, release it. Nothing is
-    listening afterwards, so the connect is refused immediately rather
-    than waiting on anything. }
-  Mock := TMockHTTPServer.Create(nil);
-  try
-    Result := Mock.Port;
-  finally
-    Mock.Free;
-  end;
-end;
-
 function TInstallHTTPFetchFailure.NewProjectRoot(const AName: string): string;
 begin
   { One project per case: each mock server serves a single connection,
@@ -442,11 +429,13 @@ begin
 end;
 
 function TInstallHTTPFetchFailure.InstallAgainstPort(const ARoot: string;
-  const APort: Word; const ATimeoutMilliseconds: string): TLwptResult;
+  const APort: Word; const ATimeoutMilliseconds: string;
+  const AWatchdogMilliseconds: QWord): TLwptResult;
 begin
   Result := RunLwpt(['install'], ARoot,
     [ARCHIVE_FETCH_ORIGIN_ENV + '=http://127.0.0.1:' + IntToStr(APort),
-     ARCHIVE_FETCH_TIMEOUT_ENV + '=' + ATimeoutMilliseconds]);
+     ARCHIVE_FETCH_TIMEOUT_ENV + '=' + ATimeoutMilliseconds],
+    AWatchdogMilliseconds);
 end;
 
 procedure TInstallHTTPFetchFailure.BeforeAll;
@@ -480,6 +469,7 @@ begin
     Mock.Free;
   end;
   Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.TimedOut).ToBe(False);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   { Dependency, operation, and status: enough to act on without
     reading the source or re-running under a debugger. }
@@ -505,6 +495,7 @@ begin
     Mock.Free;
   end;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Run.TimedOut).ToBe(False);
   { A failed fetch commits nothing: no lockfile, no cfg, no cached
     archive, no module tree, and no residue in tmp. }
   ExpectFailedInstallLeavesCommittedStateUntouched(Root);
@@ -512,18 +503,54 @@ end;
 
 procedure TInstallHTTPFetchFailure.TestRefusedConnectionIsReportedAsAFetchFailure;
 var
+  Refused: TMockRefusedEndpoint;
   Root, Combined: string;
   Run: TLwptResult;
 begin
   Root := NewProjectRoot('refused');
-  Run := InstallAgainstPort(Root, ClosedLoopbackPort, HEALTHY_BUDGET);
+  Refused := TMockRefusedEndpoint.Create;
+  try
+    Run := InstallAgainstPort(Root, Refused.Port, HEALTHY_BUDGET);
+  finally
+    Refused.Free;
+  end;
   Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.TimedOut).ToBe(False);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('mock-dep', Combined) > 0).ToBe(True);
   Expect<Boolean>(Pos('archive fetch', Combined) > 0).ToBe(True);
-  { The connect-failure text survives the EFetchError wrapping, which
-    is what keeps the e2e tier's transient-downtime skip working. }
   Expect<Boolean>(Pos('Failed to connect to', Combined) > 0).ToBe(True);
+  ExpectFailedInstallLeavesCommittedStateUntouched(Root);
+end;
+
+procedure TInstallHTTPFetchFailure.
+  TestRedirectCannotEscapeTheLoopbackFixture;
+const
+  CRLF = #13#10;
+var
+  Mock: TMockHTTPServer;
+  Root, Combined: string;
+  Run: TLwptResult;
+begin
+  Root := NewProjectRoot('redirect');
+  Mock := TMockHTTPServer.Create(BytesOf(
+    'HTTP/1.1 302 Found' + CRLF +
+    'Location: http://127.0.0.1:1/escape' + CRLF +
+    'Content-Length: 0' + CRLF + 'Connection: close' + CRLF + CRLF));
+  try
+    Mock.Start;
+    Run := InstallAgainstPort(Root, Mock.Port, HEALTHY_BUDGET);
+    Mock.WaitDone;
+  finally
+    Mock.Free;
+  end;
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.TimedOut).ToBe(False);
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('mock-dep', Combined) > 0).ToBe(True);
+  Expect<Boolean>(Pos('archive fetch', Combined) > 0).ToBe(True);
+  Expect<Boolean>(Pos('HTTP 302', Combined) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Failed to connect to', Combined) = 0).ToBe(True);
   ExpectFailedInstallLeavesCommittedStateUntouched(Root);
 end;
 
@@ -549,6 +576,7 @@ begin
     Mock.Free;
   end;
   Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.TimedOut).ToBe(False);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('mock-dep', Combined) > 0).ToBe(True);
   Expect<Boolean>(Pos('archive fetch', Combined) > 0).ToBe(True);
@@ -574,12 +602,13 @@ begin
   try
     Root := NewProjectRoot('stalled');
     Elapsed := GetTickCount64;
-    Run := InstallAgainstPort(Root, Mock.Port, STALL_BUDGET);
+    Run := InstallAgainstPort(Root, Mock.Port, STALL_BUDGET, 5000);
     Elapsed := GetTickCount64 - Elapsed;
   finally
     Mock.Free;
   end;
   Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.TimedOut).ToBe(False);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('mock-dep', Combined) > 0).ToBe(True);
   Expect<Boolean>(Pos('deadline exceeded', Combined) > 0).ToBe(True);
@@ -595,6 +624,8 @@ begin
     TestServerErrorLeavesTheProjectUntouched);
   Test('a refused connection is reported as an archive-fetch failure',
     TestRefusedConnectionIsReportedAsAFetchFailure);
+  Test('a redirect cannot escape the loopback archive fixture',
+    TestRedirectCannotEscapeTheLoopbackFixture);
   Test('a truncated fixed-length archive is refused and never cached',
     TestTruncatedArchiveIsRejectedNotCached);
   Test('a stalled server fails inside the request budget',

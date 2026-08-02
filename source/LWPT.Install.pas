@@ -1074,8 +1074,12 @@ begin
   HTTPOptions := DefaultHTTPRequestOptions;
   HTTPOptions.MaxResponseBodyBytes := MAX_ARCHIVE_RESPONSE_BYTES;
   if OriginOverride <> '' then
+  begin
     HTTPOptions.RequestTimeoutMilliseconds := ResolveArchiveFetchTimeout(
-      SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_TIMEOUT_ENV))
+      SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_TIMEOUT_ENV));
+    { A loopback fixture must not escape through a remote Location header. }
+    HTTPOptions.MaximumRedirects := 0;
+  end
   else
     HTTPOptions.RequestTimeoutMilliseconds :=
       ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;

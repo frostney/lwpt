@@ -78,7 +78,24 @@ type
     procedure ConnectWithoutRequest;
     procedure Start;      { launches the background accept-and-serve thread }
     procedure WaitForAccepted;
-    procedure WaitDone;   { blocks until the thread finishes }
+    procedure WaitDone; overload;   { bounded wait; raises on timeout }
+    function WaitDone(const ATimeoutMilliseconds: Cardinal): Boolean; overload;
+    property Port: Word read FPort;
+  end;
+
+  { Prepares an ephemeral loopback port whose server-side connection is in
+    TIME_WAIT. The kernel retains that port after the fixture actively closes
+    a setup connection, so a later connect is refused immediately without a
+    released-port reuse race. }
+  TMockRefusedEndpoint = class
+  private
+    FPort: Word;
+    {$IFDEF MSWINDOWS}
+    FWinSockStarted: Boolean;
+    {$ENDIF}
+  public
+    constructor Create;
+    destructor Destroy; override;
     property Port: Word read FPort;
   end;
 
@@ -677,8 +694,142 @@ end;
 
 procedure TMockHTTPServer.WaitDone;
 begin
-  if Assigned(FThread) then
-    FThread.WaitFor;
+  if not WaitDone(2000) then
+    raise EMockServerError.Create('mock server did not finish within 2000 ms');
+end;
+
+function TMockHTTPServer.WaitDone(
+  const ATimeoutMilliseconds: Cardinal): Boolean;
+var
+  StartedAt: QWord;
+begin
+  if not Assigned(FThread) then Exit(True);
+  StartedAt := GetTickCount64;
+  while not FThread.Finished do
+  begin
+    if GetTickCount64 - StartedAt >= ATimeoutMilliseconds then
+    begin
+      TMockServerThread(FThread).Stop;
+      Exit(False);
+    end;
+    Sleep(1);
+  end;
+  FThread.WaitFor;
+  Result := True;
+end;
+
+constructor TMockRefusedEndpoint.Create;
+var
+  ListenSock, ClientSock, AcceptedSock, ProbeSock: TMockSocket;
+  Received: Integer;
+  OneByte: Byte;
+  {$IFDEF UNIX}
+  Addr: TInetSockAddr;
+  AddrLen: TSocklen;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Addr: TSockAddrIn;
+  AddrLen: Longint;
+  WSAData: TWSAData;
+  {$ENDIF}
+begin
+  ListenSock := InvalidMockSocket;
+  ClientSock := InvalidMockSocket;
+  AcceptedSock := InvalidMockSocket;
+  ProbeSock := InvalidMockSocket;
+  {$IFDEF MSWINDOWS}
+  if WinSock2.WSAStartup($0202, WSAData) <> 0 then
+    raise EMockServerError.Create('WSAStartup failed');
+  FWinSockStarted := True;
+  InterlockedIncrement(GMockWinSockReferences);
+  {$ENDIF}
+  try
+    {$IFDEF UNIX}
+    ListenSock := fpSocket(AF_INET, SOCK_STREAM, 0);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    ListenSock := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
+    {$ENDIF}
+    if not IsValidMockSocket(ListenSock) then
+      raise EMockServerError.Create('socket() failed');
+    TrackMockSocketOpened;
+
+    FillChar(Addr, SizeOf(Addr), 0);
+    Addr.sin_family := AF_INET;
+    Addr.sin_port := 0;
+    {$IFDEF UNIX}
+    Addr.sin_addr := StrToNetAddr('127.0.0.1');
+    if fpBind(ListenSock, @Addr, SizeOf(Addr)) <> 0 then
+      raise EMockServerError.Create('bind() failed');
+    if fpListen(ListenSock, 1) <> 0 then
+      raise EMockServerError.Create('listen() failed');
+    AddrLen := SizeOf(Addr);
+    if fpGetsockname(ListenSock, @Addr, @AddrLen) <> 0 then
+      raise EMockServerError.Create('getsockname() failed');
+    FPort := ntohs(Addr.sin_port);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    Addr.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
+    if WinSock2.bind(ListenSock, PSockAddr(@Addr), SizeOf(Addr)) <> 0 then
+      raise EMockServerError.Create('bind() failed');
+    if WinSock2.listen(ListenSock, 1) <> 0 then
+      raise EMockServerError.Create('listen() failed');
+    AddrLen := SizeOf(Addr);
+    if WinSock2.getsockname(ListenSock, PSockAddr(@Addr)^, AddrLen) <> 0 then
+      raise EMockServerError.Create('getsockname() failed');
+    FPort := WinSock2.ntohs(Addr.sin_port);
+    {$ENDIF}
+
+    ClientSock := ConnectLoopback(FPort);
+    if not IsValidMockSocket(ClientSock) then
+      raise EMockServerError.Create('setup client failed to connect');
+    {$IFDEF UNIX}
+    AcceptedSock := fpAccept(ListenSock, @Addr, @AddrLen);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    AcceptedSock := WinSock2.accept(ListenSock, PSockAddr(@Addr), @AddrLen);
+    {$ENDIF}
+    if not IsValidMockSocket(AcceptedSock) then
+      raise EMockServerError.Create('setup accept failed');
+    TrackMockSocketOpened;
+
+    { The server endpoint closes first. Reading its FIN on the setup client
+      and then closing that client leaves the server port in TIME_WAIT. }
+    CloseTrackedMockSocket(AcceptedSock);
+    {$IFDEF UNIX}
+    Received := fpRecv(ClientSock, @OneByte, 1, 0);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    Received := WinSock2.recv(ClientSock, @OneByte, 1, 0);
+    {$ENDIF}
+    if Received <> 0 then
+      raise EMockServerError.Create('setup client did not receive EOF');
+    CloseTrackedMockSocket(ClientSock);
+    CloseTrackedMockSocket(ListenSock);
+
+    { Fail fast if this platform did not retain the TIME_WAIT refusal state. }
+    ProbeSock := ConnectLoopback(FPort);
+    if IsValidMockSocket(ProbeSock) then
+      raise EMockServerError.Create(
+        'loopback port was unexpectedly reusable after active close');
+  except
+    CloseTrackedMockSocket(ProbeSock);
+    CloseTrackedMockSocket(AcceptedSock);
+    CloseTrackedMockSocket(ClientSock);
+    CloseTrackedMockSocket(ListenSock);
+    {$IFDEF MSWINDOWS}
+    CleanupTrackedWinSock(FWinSockStarted);
+    {$ENDIF}
+    raise;
+  end;
+end;
+
+destructor TMockRefusedEndpoint.Destroy;
+begin
+  {$IFDEF MSWINDOWS}
+  CleanupTrackedWinSock(FWinSockStarted);
+  {$ENDIF}
+  inherited Destroy;
 end;
 
 end.
