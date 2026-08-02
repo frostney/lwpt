@@ -102,6 +102,7 @@ type
     procedure TestSuccessfulCompileProducesNoErrorDiagnostics;
     procedure TestDiagnosticGrammarRejectsSeverityFalsePositives;
     procedure TestWindowsExecutableArtifactPathIsNormalized;
+    procedure TestNilDriverBuildRequestIsRejected;
   end;
 
 procedure TerminateTestProcess(const APID: Integer);
@@ -1101,6 +1102,20 @@ begin
   end;
 end;
 
+procedure TLWPTFPCCompilerDriverTests.TestNilDriverBuildRequestIsRejected;
+var
+  Raised: Boolean;
+begin
+  Raised := False;
+  try
+    CreateFPCBuildRequest('source/app.pas', 'build/app', nil);
+  except
+    on E: ELWPTCompilerDriverError do
+      Raised := Pos('without a compiler driver', E.Message) > 0;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
 procedure TLWPTFPCCompilerDriverTests.SetupTests;
 begin
   Test('capability probes cache per target and refresh on demand',
@@ -1139,6 +1154,8 @@ begin
     TestDiagnosticGrammarRejectsSeverityFalsePositives);
   Test('Windows executable artifact paths include the emitted extension',
     TestWindowsExecutableArtifactPathIsNormalized);
+  Test('nil FPC drivers fail with the compiler-driver error contract',
+    TestNilDriverBuildRequestIsRejected);
 end;
 
 function RunIsolatedCompilerDriverCase(const ACase: string): Integer;
