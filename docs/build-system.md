@@ -292,13 +292,12 @@ The heavyweight gates — `lwpt format --check` + `lwpt build` + `lwpt agents --
 Do **not** bypass with `git commit --no-verify` unless a maintainer explicitly authorises it on the PR.
 
 The analysis commands remain outside the v1 pre-commit gate per
-[ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md). Codebase health is
-now available on demand through [`lwpt health`](./health.md); link-check and
-duplication remain separate workstreams. Architecture drift is checked for LWPT
-itself during release preparation and is not a consumer command.
-[Issue #28](https://github.com/frostney/lwpt/issues/28) delivered parallel,
-process-safe, observable builds and tests through private sessions and the
-shared worker budget.
+[ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md). Duplication and
+[`lwpt health`](./health.md) are user-invoked reports and do not widen that
+gate. Architecture drift is checked for LWPT itself during release preparation
+and is not a consumer command. [Issue #28](https://github.com/frostney/lwpt/issues/28)
+delivered parallel, process-safe, observable builds and tests through private
+sessions and the shared worker budget.
 
 ## Machine-wide worker capacity
 
