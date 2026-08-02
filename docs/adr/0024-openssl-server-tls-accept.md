@@ -24,7 +24,7 @@ other Unix systems. Server transports have a different seam. Duetto's Linux
 epoll backend owns a nonblocking file descriptor, its Windows IOCP backend owns
 an overlapped socket that cannot be handed to OpenSSL, and its macOS backend
 already terminates TLS with Network.framework. All three receive the same
-identity shape: a PKCS#12 file plus passphrase.
+identity shape: PKCS#12 bytes or a path plus passphrase.
 
 `TransportSecurity` therefore provides a socket-independent memory-BIO OpenSSL
 server implementation on Windows and Unix-not-Darwin. This ADR amends ADR-0016
@@ -39,6 +39,23 @@ One `TTransportSecurityServerContext` loads a PKCS#12 identity into an
 certificate, private key, and optional intermediate chain. The complete chain
 is installed and OpenSSL verifies that the leaf and private key match.
 
+The primary identity input is caller-supplied PKCS#12 bytes. Construction and
+reload immediately take a private mutable copy, parse synchronously, and wipe
+that copy in `finally`. The convenience path overload opens the file once with
+symbolic-link or reparse-point traversal disabled, verifies from that same
+handle that it is a regular file within the size cap, reads it through that
+handle, and delegates to the byte API. It never performs a separate
+check-then-open sequence.
+
+Strict identity validation is the default for construction and reload. It
+requires the leaf and every bundled issuer to be inside their validity windows;
+an explicit compatible `serverAuth` extended purpose on the leaf; `CA:FALSE`
+basic constraints on the leaf; `CA:TRUE` basic constraints on bundled issuers;
+and a structurally and cryptographically coherent bundled chain. The check
+validates only caller-supplied material and does not consult platform system
+trust. Self-signed development identities use the explicit `tsivPermissive`
+option.
+
 Context construction enforces a named 16 MiB PKCS#12 size cap before allocating
 or parsing the file. Passphrases are converted deliberately to UTF-8, embedded
 NUL bytes are rejected, and empty and non-ASCII passphrases are supported. The
@@ -48,9 +65,13 @@ including the identity path or passphrase.
 
 The context sets TLS 1.2 as its minimum protocol version and applies
 `SSL_OP_NO_RENEGOTIATION`; failure to establish either policy aborts context
-construction. TLS 1.3 remains available. The listener owns the context, reuses
-it across connections, and must keep it alive until every connection created
-from it has been torn down.
+construction. TLS 1.3 remains available. A context holder atomically publishes
+only a completely built and validated immutable `SSL_CTX` snapshot. Each
+accepted connection retains the snapshot from its Begin call, so reload can
+swap in a replacement while old connections continue safely and the old
+snapshot retires only after its final connection reference. A failed reload
+does not alter the active snapshot. The listener still owns the context holder;
+individual connections own their retained snapshot references.
 
 `BeginTransportSecurityServer` creates one `SSL`, one read memory BIO, and a
 bounded write-side memory BIO pair per connection. `SSL_set_bio` transfers the
@@ -200,13 +221,3 @@ The following are deliberately outside this package's present contract:
   retained-ciphertext queue are implemented, but broader per-connection
   backpressure, watermarks, and admission policy belong to a future transport
   flow-control API.
-- **Server-context refcounting for concurrent reload.** A listener must keep
-  its context alive until all accepted connections are destroyed. Atomic
-  identity reload while accepts race requires reference-counted context
-  ownership in a later change.
-- **Certificate policy validation at context creation.** Private-key matching
-  and chain loading are implemented. Expiry, server-purpose, and full
-  chain-sanity policy checks remain deferred.
-- **PKCS#12 file TOCTOU hardening.** The current path-based load has a metadata
-  check/read window. An open-once, no-follow, caller-supplied byte/handle API is
-  deferred.
