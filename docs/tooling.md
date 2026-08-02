@@ -24,6 +24,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
   workspace sources. The remaining deferred stack contracts stay tracked
   separately. Architecture drift is a project-local release-preparation check
   for LWPT itself; it is not a customer feature.
+- **Codebase health is shipped.** `lwpt health` is an offline Pascal complexity report with opt-in local Git hotspots; [`health.md`](./health.md) owns the scoring and configuration contract.
 
 ## Pinned versions
 
@@ -271,20 +272,21 @@ envelope plus a duplication-owned payload containing effective project policy,
 token totals, clone groups, stable locations, and the threshold outcome. Both
 forms are deterministic and the command performs no network operations.
 
-## Remaining deferred contract
+## Analysis command status
 
 ADR-0006 originally deferred several customer-facing stack contracts beyond the
-build system and formatter. Duplication analysis now ships; one contract remains
-active as deferred work:
+build system and formatter. Duplication analysis and codebase health now ship:
 
 | Contract | Workstream | Notes |
 | --- | --- | --- |
-| **Codebase-health** (`lwpt health`) | [Issue #33](https://github.com/frostney/lwpt/issues/33) | Cyclomatic + cognitive complexity; non-zero exit on threshold breach. Per-file aggregate signal + hotspot detection from git churn. |
+| **Codebase-health** (`lwpt health`) | Delivered; see [`health.md`](./health.md) | Deterministic routine/file complexity, optional local Git hotspots, stable JSON, and strict opt-in thresholds. |
+| **Duplication** (`lwpt duplication`) | Delivered from [issue #32](https://github.com/frostney/lwpt/issues/32) | Deterministic Type-2 clone reporting across manifest-owned source scope. |
 
-The v1 pre-commit gate excludes the remaining deferred contracts. ADR-0006
-records the original deferral. Architecture drift is checked across LWPT's
-source, tests, manifests, workflows, documentation, ADRs, and domain context
-during release preparation; it is not exposed to consumer projects.
+The v1 pre-commit gate excludes these analysis commands; they run on demand or
+through an explicit consumer gate. ADR-0006 records the original deferral.
+Architecture drift is checked across LWPT's source, tests, manifests,
+workflows, documentation, ADRs, and domain context during release preparation;
+it is not exposed to consumer projects.
 
 ## Other deferrals
 

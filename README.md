@@ -16,16 +16,16 @@ lwpt duplication report manifest-scoped Pascal token clones   [--json]
 lwpt test      discover, compile and run *.Test.pas files   [--jobs N] [--bail N]
 lwpt repair    reclaim install, build-session, and worker-lease residue
 lwpt run       invoke a user-declared run-script (or alias a subcommand)
+lwpt health    report Pascal complexity and optional Git hotspots   [--json] [--hotspots]
 lwpt agents    write/verify the agent-facing command reference in AGENTS.md   [--check]
 ```
 
 ## Status
 
 LWPT is pre-1.0. The package model, install pipeline, formatter, test runner,
-duplication analysis, and release flow are in place; the deferred
-customer-facing
-[codebase-health](https://github.com/frostney/lwpt/issues/33) contract is tracked
-separately from the project-only release architecture check originally deferred by
+duplication analysis, codebase-health report, and release flow are in place.
+The project-only release architecture check remains separate from the customer
+commands originally deferred by
 [ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md). See
 [`AGENTS.md`](./AGENTS.md) for the full operating manual and
 [`docs/adr/`](./docs/adr/) for the architectural decisions that shape
@@ -59,6 +59,8 @@ bootstrap.bat      # Windows
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt repair             # recover install, build, and worker residue
+./build/lwpt health             # deterministic complexity report
+./build/lwpt health --hotspots  # add local Git churn and hotspot ranking
 ```
 
 ## Architecture
