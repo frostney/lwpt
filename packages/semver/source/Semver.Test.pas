@@ -31,6 +31,7 @@ type
     procedure TestSatisfiesExact;
     procedure TestSatisfiesCompleteHyphenRange;
     procedure TestSatisfiesPartialHyphenRange;
+    procedure TestHyphenRangesIncludePrereleasesWhenRequested;
     procedure TestPrereleaseExcludedByDefault;
   end;
 
@@ -106,6 +107,23 @@ begin
   Expect<Boolean>(Sat('2.4.0', '1.2 - 2.3')).ToBe(False);
 end;
 
+procedure TSemverHappyPath.TestHyphenRangesIncludePrereleasesWhenRequested;
+var
+  Options: TSemverOptions;
+begin
+  Options := DefaultSemverOptions;
+  Options.IncludePrerelease := True;
+  Expect<Boolean>(Satisfies('1.2.3-rc.1', '1.2.3 - 2.3.4', Options)).
+    ToBe(True);
+  Expect<Boolean>(Satisfies('2.3.4-rc.1', '1.2.3 - 2.3.4', Options)).
+    ToBe(True);
+  Expect<Boolean>(Satisfies('2.3.5-0', '1.2.3 - 2.3.4', Options)).
+    ToBe(False);
+  Expect<Boolean>(Satisfies('1.2.0-rc.1', '1.2 - 2.3', Options)).ToBe(True);
+  Expect<Boolean>(Satisfies('2.3.99-rc.1', '1.2 - 2.3', Options)).ToBe(True);
+  Expect<Boolean>(Satisfies('2.4.0-0', '1.2 - 2.3', Options)).ToBe(False);
+end;
+
 procedure TSemverHappyPath.TestPrereleaseExcludedByDefault;
 begin
   { With the default options, prereleases on one side of the range do
@@ -121,6 +139,8 @@ begin
   Test('satisfies exact match',     TestSatisfiesExact);
   Test('satisfies complete hyphen range', TestSatisfiesCompleteHyphenRange);
   Test('satisfies partial hyphen range', TestSatisfiesPartialHyphenRange);
+  Test('hyphen ranges include prereleases only when requested',
+    TestHyphenRangesIncludePrereleasesWhenRequested);
   Test('prereleases excluded from non-prerelease ranges by default',
     TestPrereleaseExcludedByDefault);
 end;

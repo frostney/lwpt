@@ -1582,6 +1582,8 @@ begin
   Suffix := '';
   if Partial.PrereleaseText <> '' then
     Suffix := '-' + Partial.PrereleaseText;
+  if (Suffix = '') and AOptions.IncludePrerelease then
+    Suffix := '-0';
   if Partial.BuildText <> '' then
     Suffix := Suffix + '+' + Partial.BuildText;
   SetLength(Result, 1);
@@ -1629,8 +1631,12 @@ begin
   if Partial.BuildText <> '' then
     Suffix := Suffix + '+' + Partial.BuildText;
   SetLength(Result, 1);
-  Result[0] := '<=' + IntToStr(MajorValue) + '.' + IntToStr(MinorValue) +
-    '.' + IntToStr(PatchValue) + Suffix;
+  if AOptions.IncludePrerelease and (Partial.PrereleaseText = '') then
+    Result[0] := '<' + IntToStr(MajorValue) + '.' + IntToStr(MinorValue) +
+      '.' + IntToStr(PatchValue + 1) + '-0'
+  else
+    Result[0] := '<=' + IntToStr(MajorValue) + '.' + IntToStr(MinorValue) +
+      '.' + IntToStr(PatchValue) + Suffix;
 end;
 
 function ParseRangeSet(const ARangePart: string;

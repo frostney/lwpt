@@ -232,11 +232,14 @@ begin
 end;
 
 procedure TLoopbackTLSServer.Stop;
+var
+  ClientSocket: TSocket;
 begin
   Terminate;
   CloseOwnedSocket(FListenSocket);
-  if FClientSocket >= 0 then
-    FpShutdown(FClientSocket, 2);
+  ClientSocket := InterlockedExchange(FClientSocket, -1);
+  if ClientSocket >= 0 then
+    FpShutdown(ClientSocket, 2);
 end;
 
 function TLoopbackTLSServer.WaitUntilFinished(
@@ -491,6 +494,7 @@ var
   AcceptedSocket: TSocket;
   ClientSocket: TSocket;
   Connection: TTransportSecurityConnection;
+  OwnedSocket: TSocket;
 begin
   AcceptedSocket := -1;
   ClientSocket := -1;
@@ -551,7 +555,11 @@ begin
     AbortTransportSecurityServer(Connection);
     if AcceptedSocket >= 0 then
       CloseSocket(AcceptedSocket);
-    CloseOwnedSocket(FClientSocket);
+    OwnedSocket := InterlockedExchange(FClientSocket, -1);
+    if OwnedSocket >= 0 then
+      CloseSocket(OwnedSocket)
+    else if ClientSocket >= 0 then
+      CloseSocket(ClientSocket);
   end;
 end;
 
