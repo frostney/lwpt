@@ -731,7 +731,7 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(FScratch + '/.blaise-help')).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/.blaise-compile')).ToBe(True);
-  Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app'))).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/build/app')).ToBe(True);
 end;
 
 procedure TCompilerProfiles.SetupTests;
