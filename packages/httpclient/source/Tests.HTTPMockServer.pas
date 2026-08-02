@@ -354,12 +354,20 @@ begin
     ClientSock := FClientSock;
     ListenSock := FListenSock;
     if IsValidMockSocket(ClientSock) then
-      ShutdownMockSocket(ClientSock);
+      FClientSock := InvalidMockSocket;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
 
-  if (not IsValidMockSocket(ClientSock)) and
+  if IsValidMockSocket(ClientSock) then
+  begin
+    { WinSock shutdown alone does not reliably release a blocking recv in
+      another thread. Transfer ownership under the lock, then close the
+      accepted socket so Execute cannot double-close it. }
+    ShutdownMockSocket(ClientSock);
+    CloseTrackedMockSocket(ClientSock);
+  end
+  else if
     IsValidMockSocket(ListenSock) then
   begin
     WakeSock := ConnectLoopback(FPort);
@@ -412,6 +420,7 @@ begin
     N := WinSock2.recv(ClientSock, @Buf, SizeOf(Buf), 0);
     {$ENDIF}
     if N < 0 then N := 0;
+    if Terminated then Exit;
 
     if FInitialDelayMilliseconds > 0 then
       Sleep(FInitialDelayMilliseconds);
@@ -573,6 +582,14 @@ end;
 
 destructor TMockHTTPServer.Destroy;
 begin
+  {$IF DEFINED(UNIX) OR DEFINED(MSWINDOWS)}
+  { A fixture-created silent client is the most reliable cancellation point:
+    close the peer first so a blocking server-side recv observes EOF on every
+    platform. Stop still owns external clients and the accept-registration
+    race. }
+  ShutdownMockSocket(FSilentClientSock);
+  CloseTrackedMockSocket(FSilentClientSock);
+  {$ENDIF}
   if Assigned(FThread) then
   begin
     TMockServerThread(FThread).Stop;
@@ -580,7 +597,6 @@ begin
     FThread.Free;
   end;
   {$IF DEFINED(UNIX) OR DEFINED(MSWINDOWS)}
-  CloseTrackedMockSocket(FSilentClientSock);
   CloseTrackedMockSocket(FListenSock);
   {$ENDIF}
   {$IFDEF MSWINDOWS}
