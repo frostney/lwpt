@@ -52,6 +52,8 @@ type
     procedure TestEmbeddedNULPassphraseRejected;
     procedure TestFatalHandshakePoisonsConnection;
     procedure TestFatalShutdownPoisonsBeforeOutput;
+    procedure TestInputFlowConfiguration;
+    procedure TestInputFlowPrefixAdmissionAndCounters;
     procedure TestGracefulCloseProducesCloseNotify;
     procedure TestHandshakeTransitionsAndContextReuse;
     procedure TestMissingPKCS12FailsWithoutPathDisclosure;
@@ -86,6 +88,29 @@ begin
   end;
   if Result = '' then
     raise Exception.Create('Expected TLS server context creation to fail');
+end;
+
+function CaptureFlowContextError(const AHighWatermark, ALowWatermark,
+  AOutputCapacity: Integer): string;
+var
+  Context: TTransportSecurityServerContext;
+begin
+  Result := '';
+  Context := nil;
+  try
+    try
+      Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+        PKCS12_PASSPHRASE, AHighWatermark, ALowWatermark,
+        AOutputCapacity);
+    except
+      on E: ETransportSecurityError do
+        Result := E.Message;
+    end;
+  finally
+    CloseTransportSecurityServerContext(Context);
+  end;
+  if Result = '' then
+    raise Exception.Create('Expected TLS flow configuration to fail');
 end;
 
 procedure WriteTextFile(const APath, AText: string);
@@ -330,6 +355,28 @@ begin
         raise Exception.Create('Server ciphertext feed failed');
       Inc(Offset, Fed);
     end;
+  until False;
+end;
+
+procedure DrainClientCiphertext(var AClient: TRawOpenSSLClient;
+  out ABuffer: TBytes);
+var
+  ExistingLength: Integer;
+  Pending: Int64;
+  ReadCount: Integer;
+begin
+  SetLength(ABuffer, 0);
+  repeat
+    Pending := BIO_ctrl(AClient.WriteBIO, BIO_CTRL_PENDING_COMMAND, 0, nil);
+    if Pending <= 0 then
+      Exit;
+    ExistingLength := Length(ABuffer);
+    SetLength(ABuffer, ExistingLength + Integer(Pending));
+    ReadCount := RawBIORead(AClient.WriteBIO, @ABuffer[ExistingLength],
+      Integer(Pending));
+    if ReadCount <= 0 then
+      raise Exception.Create('Raw client ciphertext drain failed');
+    SetLength(ABuffer, ExistingLength + ReadCount);
   until False;
 end;
 
@@ -638,6 +685,190 @@ begin
   Expect<Boolean>(Pos('secret-passphrase', ErrorMessage) = 0).ToBe(True);
 end;
 
+procedure TTransportSecurityServerTests.TestInputFlowConfiguration;
+{$IFNDEF DARWIN}
+var
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  ErrorMessage: string;
+  Flow: TTransportSecurityInputFlow;
+  OutputFlow: TTransportSecurityOutputFlow;
+{$ENDIF}
+begin
+  {$IFNDEF DARWIN}
+  FillChar(Connection, SizeOf(Connection), 0);
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Integer>(Flow.HighWatermark).ToBe(
+      TLS_SERVER_DEFAULT_INPUT_CAPACITY);
+    Expect<Integer>(Flow.LowWatermark).ToBe(
+      TLS_SERVER_DEFAULT_INPUT_CAPACITY div 2);
+    Expect<Integer>(Flow.BufferedBytes).ToBe(0);
+    Expect<Int64>(Int64(Flow.AcceptedBytes)).ToBe(0);
+    Expect<Int64>(Int64(Flow.ConsumedBytes)).ToBe(0);
+    Expect<Boolean>(Flow.Backpressured).ToBe(False);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.Capacity).ToBe(
+      TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+    Expect<Integer>(OutputFlow.PendingBytes).ToBe(0);
+    Expect<Integer>(OutputFlow.RemainingBytes).ToBe(
+      TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  finally
+    AbortTransportSecurityServer(Connection);
+    CloseTransportSecurityServerContext(Context);
+  end;
+
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE, TLS_SERVER_MIN_INPUT_CAPACITY,
+    TLS_SERVER_MAX_OUTPUT_CAPACITY);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Integer>(Flow.HighWatermark).ToBe(
+      TLS_SERVER_MIN_INPUT_CAPACITY);
+    Expect<Integer>(Flow.LowWatermark).ToBe(
+      TLS_SERVER_MIN_INPUT_CAPACITY div 2);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.Capacity).ToBe(
+      TLS_SERVER_MAX_OUTPUT_CAPACITY);
+  finally
+    AbortTransportSecurityServer(Connection);
+    CloseTransportSecurityServerContext(Context);
+  end;
+
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE, TLS_SERVER_MAX_INPUT_CAPACITY, 0,
+    TLS_SERVER_MIN_OUTPUT_CAPACITY);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Integer>(Flow.HighWatermark).ToBe(
+      TLS_SERVER_MAX_INPUT_CAPACITY);
+    Expect<Integer>(Flow.LowWatermark).ToBe(0);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.Capacity).ToBe(
+      TLS_SERVER_MIN_OUTPUT_CAPACITY);
+  finally
+    AbortTransportSecurityServer(Connection);
+    CloseTransportSecurityServerContext(Context);
+  end;
+
+  ErrorMessage := CaptureFlowContextError(
+    TLS_SERVER_MIN_INPUT_CAPACITY - 1, 0,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  Expect<Boolean>(Pos('between', ErrorMessage) > 0).ToBe(True);
+  ErrorMessage := CaptureFlowContextError(
+    TLS_SERVER_MAX_INPUT_CAPACITY + 1, 0,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  Expect<Boolean>(Pos('between', ErrorMessage) > 0).ToBe(True);
+  ErrorMessage := CaptureFlowContextError(
+    TLS_SERVER_MIN_INPUT_CAPACITY, -1,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  Expect<Boolean>(Pos('nonnegative', ErrorMessage) > 0).ToBe(True);
+  ErrorMessage := CaptureFlowContextError(
+    TLS_SERVER_MIN_INPUT_CAPACITY, TLS_SERVER_MIN_INPUT_CAPACITY,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  Expect<Boolean>(Pos('below capacity', ErrorMessage) > 0).ToBe(True);
+  ErrorMessage := CaptureFlowContextError(
+    TLS_SERVER_DEFAULT_INPUT_CAPACITY,
+    TLS_SERVER_DEFAULT_INPUT_CAPACITY div 2,
+    TLS_SERVER_MIN_OUTPUT_CAPACITY - 1);
+  Expect<Boolean>(Pos('output capacity', ErrorMessage) > 0).ToBe(True);
+  ErrorMessage := CaptureFlowContextError(
+    TLS_SERVER_DEFAULT_INPUT_CAPACITY,
+    TLS_SERVER_DEFAULT_INPUT_CAPACITY div 2,
+    TLS_SERVER_MAX_OUTPUT_CAPACITY + 1);
+  Expect<Boolean>(Pos('output capacity', ErrorMessage) > 0).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.TestInputFlowPrefixAdmissionAndCounters;
+{$IFNDEF DARWIN}
+const
+  PAYLOAD_LENGTH = 16000;
+var
+  Accepted: Integer;
+  BaselineAccepted: QWord;
+  BaselineConsumed: QWord;
+  Buffer: array[0..PAYLOAD_LENGTH - 1] of Byte;
+  Ciphertext: TBytes;
+  Client: TRawOpenSSLClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Flow: TTransportSecurityInputFlow;
+  Observed: THandshakeObservations;
+  Payload: AnsiString;
+  ReadResult: TTransportSecurityIOResult;
+  Remainder: Integer;
+{$ENDIF}
+begin
+  {$IFNDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE, TLS_SERVER_MIN_INPUT_CAPACITY, 0,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateHandshakenPair(Context, Connection, Client, Observed);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    BaselineAccepted := Flow.AcceptedBytes;
+    BaselineConsumed := Flow.ConsumedBytes;
+    Expect<Int64>(Int64(BaselineAccepted)).ToBe(Int64(BaselineConsumed));
+    Expect<Integer>(Flow.BufferedBytes).ToBe(0);
+    SetLength(Payload, PAYLOAD_LENGTH);
+    FillChar(Payload[1], Length(Payload), Ord('a'));
+    WriteRawClientPlaintext(Client, Payload);
+    FillChar(Payload[1], Length(Payload), Ord('b'));
+    WriteRawClientPlaintext(Client, Payload);
+    DrainClientCiphertext(Client, Ciphertext);
+    Expect<Boolean>(Length(Ciphertext) >
+      TLS_SERVER_MIN_INPUT_CAPACITY).ToBe(True);
+
+    Accepted := TransportSecurityFeedCiphertext(Connection, @Ciphertext[0],
+      Length(Ciphertext));
+    Expect<Integer>(Accepted).ToBe(TLS_SERVER_MIN_INPUT_CAPACITY);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Integer>(Flow.BufferedBytes).ToBe(
+      TLS_SERVER_MIN_INPUT_CAPACITY);
+    Expect<Int64>(Int64(Flow.AcceptedBytes)).ToBe(
+      Int64(BaselineAccepted + TLS_SERVER_MIN_INPUT_CAPACITY));
+    Expect<Int64>(Int64(Flow.ConsumedBytes)).ToBe(Int64(BaselineConsumed));
+    Expect<Boolean>(Flow.Backpressured).ToBe(True);
+    Expect<Integer>(TransportSecurityFeedCiphertext(Connection,
+      @Ciphertext[Accepted], Length(Ciphertext) - Accepted)).ToBe(0);
+
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(PAYLOAD_LENGTH);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Boolean>(Flow.BufferedBytes > 0).ToBe(True);
+    Expect<Boolean>(Flow.ConsumedBytes > 0).ToBe(True);
+    Expect<Boolean>(Flow.Backpressured).ToBe(True);
+
+    Remainder := Length(Ciphertext) - Accepted;
+    Expect<Integer>(TransportSecurityFeedCiphertext(Connection,
+      @Ciphertext[Accepted], Remainder)).ToBe(Remainder);
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(PAYLOAD_LENGTH);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Int64>(Int64(Flow.AcceptedBytes)).ToBe(
+      Int64(BaselineAccepted + QWord(Length(Ciphertext))));
+    Expect<Int64>(Int64(Flow.ConsumedBytes)).ToBe(
+      Int64(BaselineConsumed + QWord(Length(Ciphertext))));
+    Expect<Integer>(Flow.BufferedBytes).ToBe(0);
+    Expect<Boolean>(Flow.Backpressured).ToBe(False);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityServerTests.TestPeerCloseNotifyReportsPeerClosed;
 {$IFNDEF DARWIN}
 var
@@ -868,6 +1099,7 @@ var
   Connection: TTransportSecurityConnection;
   Context: TTransportSecurityServerContext;
   Observed: THandshakeObservations;
+  OutputFlow: TTransportSecurityOutputFlow;
   Partial: Integer;
   Pending: Integer;
   ReadResult: TTransportSecurityIOResult;
@@ -901,12 +1133,22 @@ begin
     Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
     Pending := TransportSecurityGetCiphertext(Connection, Ciphertext);
     Expect<Boolean>(Pending > 1).ToBe(True);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.Capacity).ToBe(
+      TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+    Expect<Integer>(OutputFlow.PendingBytes).ToBe(Pending);
+    Expect<Integer>(OutputFlow.RemainingBytes).ToBe(
+      TLS_SERVER_DEFAULT_OUTPUT_CAPACITY - Pending);
     Partial := Pending div 2;
     Expect<Integer>(RawBIOWrite(Client.ReadBIO, Ciphertext,
       Partial)).ToBe(Partial);
     TransportSecurityConsumeCiphertext(Connection, Partial);
     Expect<Integer>(TransportSecurityPendingCiphertext(Connection)).ToBe(
       Pending - Partial);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.PendingBytes).ToBe(Pending - Partial);
+    Expect<Integer>(OutputFlow.RemainingBytes).ToBe(
+      TLS_SERVER_DEFAULT_OUTPUT_CAPACITY - Pending + Partial);
     PumpServerCiphertext(Connection, Client);
 
     ErrClearError;
@@ -1075,6 +1317,7 @@ var
   I: Integer;
   Observed: THandshakeObservations;
   Offset: Integer;
+  OutputFlow: TTransportSecurityOutputFlow;
   Payload: TBytes;
   ReadCount: Integer;
   Received: TBytes;
@@ -1085,7 +1328,8 @@ var
 begin
   {$IFNDEF DARWIN}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
-    PKCS12_PASSPHRASE);
+    PKCS12_PASSPHRASE, TLS_SERVER_DEFAULT_INPUT_CAPACITY,
+    TLS_SERVER_MIN_OUTPUT_CAPACITY);
   FillChar(Connection, SizeOf(Connection), 0);
   FillChar(Client, SizeOf(Client), 0);
   try
@@ -1099,6 +1343,12 @@ begin
       Length(Payload));
     Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
     Expect<Integer>(WriteResult.BytesProcessed).ToBe(0);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.Capacity).ToBe(
+      TLS_SERVER_MIN_OUTPUT_CAPACITY);
+    Expect<Integer>(OutputFlow.PendingBytes).ToBe(
+      TLS_SERVER_MIN_OUTPUT_CAPACITY);
+    Expect<Integer>(OutputFlow.RemainingBytes).ToBe(0);
     FillChar(Payload[0], Length(Payload), $A5);
 
     WriteCompleted := False;
@@ -1343,6 +1593,10 @@ begin
     TestEmbeddedNULPassphraseRejected, DARWIN_SKIP_REASON);
   Skip('missing PKCS#12 fails without disclosing path',
     TestMissingPKCS12FailsWithoutPathDisclosure, DARWIN_SKIP_REASON);
+  Skip('server input flow validates and publishes watermarks',
+    TestInputFlowConfiguration, DARWIN_SKIP_REASON);
+  Skip('server input flow accepts bounded prefixes and counts consumption',
+    TestInputFlowPrefixAdmissionAndCounters, DARWIN_SKIP_REASON);
   Skip('peer close_notify reports peer-closed and poisons the connection',
     TestPeerCloseNotifyReportsPeerClosed, DARWIN_SKIP_REASON);
   Skip('pending ciphertext pointer stays stable across protocol calls',
@@ -1388,6 +1642,10 @@ begin
     TestEmbeddedNULPassphraseRejected);
   ServerTest('missing PKCS#12 fails without disclosing path',
     TestMissingPKCS12FailsWithoutPathDisclosure);
+  ServerTest('server input flow validates and publishes watermarks',
+    TestInputFlowConfiguration);
+  ServerTest('server input flow accepts bounded prefixes and counts consumption',
+    TestInputFlowPrefixAdmissionAndCounters);
   ServerTest('peer close_notify reports peer-closed and poisons the connection',
     TestPeerCloseNotifyReportsPeerClosed);
   ServerTest('pending ciphertext pointer stays stable across protocol calls',

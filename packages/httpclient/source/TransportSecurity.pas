@@ -28,6 +28,14 @@ uses
   {$ENDIF}
   ;
 
+const
+  TLS_SERVER_DEFAULT_INPUT_CAPACITY = 64 * 1024;
+  TLS_SERVER_MIN_INPUT_CAPACITY = 17 * 1024;
+  TLS_SERVER_MAX_INPUT_CAPACITY = 256 * 1024;
+  TLS_SERVER_DEFAULT_OUTPUT_CAPACITY = 64 * 1024;
+  TLS_SERVER_MIN_OUTPUT_CAPACITY = 17 * 1024;
+  TLS_SERVER_MAX_OUTPUT_CAPACITY = 256 * 1024;
+
 type
   ETransportSecurityError = class(Exception);
 
@@ -44,6 +52,21 @@ type
     BytesProcessed: Integer;
   end;
 
+  TTransportSecurityInputFlow = record
+    AcceptedBytes: QWord;
+    Backpressured: Boolean;
+    BufferedBytes: Integer;
+    ConsumedBytes: QWord;
+    HighWatermark: Integer;
+    LowWatermark: Integer;
+  end;
+
+  TTransportSecurityOutputFlow = record
+    Capacity: Integer;
+    PendingBytes: Integer;
+    RemainingBytes: Integer;
+  end;
+
   TTransportSecurityConnection = record
   public
     Active: Boolean;
@@ -58,9 +81,21 @@ type
   TTransportSecurityServerContext = class
   private
     FBackendData: Pointer;
+    FInputHighWatermark: Integer;
+    FInputLowWatermark: Integer;
+    FOutputCapacity: Integer;
+    procedure Initialize(const APkcs12Path: string;
+      const APkcs12Passphrase: UnicodeString; const AInputHighWatermark,
+      AInputLowWatermark, AOutputCapacity: Integer);
   public
     constructor Create(const APkcs12Path: string;
-      const APkcs12Passphrase: UnicodeString);
+      const APkcs12Passphrase: UnicodeString); overload;
+    constructor Create(const APkcs12Path: string;
+      const APkcs12Passphrase: UnicodeString;
+      const AInputHighWatermark, AOutputCapacity: Integer); overload;
+    constructor Create(const APkcs12Path: string;
+      const APkcs12Passphrase: UnicodeString; const AInputHighWatermark,
+      AInputLowWatermark, AOutputCapacity: Integer); overload;
     destructor Destroy; override;
   end;
 
@@ -80,6 +115,10 @@ function TransportSecurityServerHandshake(
 function TransportSecurityFeedCiphertext(
   var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
   const ALength: Integer): Integer;
+function TransportSecurityServerInputFlow(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityInputFlow;
+function TransportSecurityServerOutputFlow(
+  const AConnection: TTransportSecurityConnection): TTransportSecurityOutputFlow;
 function TransportSecurityPendingCiphertext(
   const AConnection: TTransportSecurityConnection): Integer;
 function TransportSecurityGetCiphertext(
@@ -580,7 +619,14 @@ type
   TOpenSSLServerData = class
   public
     HandshakeDone: Boolean;
+    InputAccepted: QWord;
+    InputBackpressured: Boolean;
+    InputBuffered: Integer;
+    InputConsumed: QWord;
+    InputHighWatermark: Integer;
+    InputLowWatermark: Integer;
     Output: TBytes;
+    OutputCapacity: Integer;
     OutputOffset: Integer;
     PendingPlaintext: TBytes;
     ReadBIO: Pointer;
@@ -624,7 +670,6 @@ const
   BIO_CTRL_PENDING_COMMAND = 10;
   BIO_FLAGS_RETRY_MASK = $0F;
   MAX_PKCS12_IDENTITY_SIZE = 16 * 1024 * 1024;
-  OPENSSL_BIO_PAIR_CAPACITY = 16 * 1024;
   OPENSSL_OUTPUT_CHUNK_SIZE = 16 * 1024;
   {$IFDEF MSWINDOWS}
   {$IFDEF WIN64}
@@ -1145,6 +1190,48 @@ begin
     Result := 0;
 end;
 
+function OpenSSLServerOutputFlow(
+  const AData: TOpenSSLServerData): TTransportSecurityOutputFlow;
+var
+  BIOPending: Int64;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  if not Assigned(AData) then
+    Exit;
+  Result.Capacity := AData.OutputCapacity;
+  BIOPending := 0;
+  if Assigned(AData.WriteBIO) then
+    BIOPending := BIO_ctrl(AData.WriteBIO, BIO_CTRL_PENDING_COMMAND, 0, nil);
+  if BIOPending < 0 then
+    BIOPending := 0;
+  Result.PendingBytes := OpenSSLServerPendingCiphertext(AData) +
+    Integer(BIOPending);
+  Result.RemainingBytes := Result.Capacity - Result.PendingBytes;
+  if Result.RemainingBytes < 0 then
+    Result.RemainingBytes := 0;
+end;
+
+procedure RefreshOpenSSLServerInputFlow(const AData: TOpenSSLServerData);
+var
+  Pending: Int64;
+begin
+  if not Assigned(AData) or not Assigned(AData.ReadBIO) then
+    Exit;
+  Pending := BIO_ctrl(AData.ReadBIO, BIO_CTRL_PENDING_COMMAND, 0, nil);
+  if Pending < 0 then
+    Pending := 0;
+  if Pending > AData.InputHighWatermark then
+    Pending := AData.InputHighWatermark;
+  AData.InputBuffered := Integer(Pending);
+  AData.InputConsumed := AData.InputAccepted - QWord(AData.InputBuffered);
+  if AData.InputBackpressured then
+    AData.InputBackpressured := AData.InputBuffered >
+      AData.InputLowWatermark
+  else
+    AData.InputBackpressured := AData.InputBuffered >=
+      AData.InputHighWatermark;
+end;
+
 type
   TOpenSSLServerOperation = (
     osoHandshake,
@@ -1216,6 +1303,9 @@ begin
   BIOsOwnedBySSL := False;
   SSLWriteBIO := nil;
   try
+    Data.InputHighWatermark := AContext.FInputHighWatermark;
+    Data.InputLowWatermark := AContext.FInputLowWatermark;
+    Data.OutputCapacity := AContext.FOutputCapacity;
     Data.SSL := SslNew(ContextData.Context);
     if not Assigned(Data.SSL) then
       raise ETransportSecurityError.Create(
@@ -1223,8 +1313,8 @@ begin
 
     Data.ReadBIO := OpenSSLBIONew(OpenSSLBIOSMemory());
     if (not Assigned(Data.ReadBIO)) or
-       (OpenSSLBIONewPair(SSLWriteBIO, OPENSSL_BIO_PAIR_CAPACITY,
-       Data.WriteBIO, OPENSSL_BIO_PAIR_CAPACITY) <> 1) then
+       (OpenSSLBIONewPair(SSLWriteBIO, Data.OutputCapacity,
+       Data.WriteBIO, Data.OutputCapacity) <> 1) then
       raise ETransportSecurityError.Create(
         'Failed to create OpenSSL server memory BIOs');
     if BIO_ctrl(Data.ReadBIO, BIO_C_SET_BUF_MEM_EOF_RETURN, -1, nil) <= 0 then
@@ -1314,6 +1404,8 @@ function FeedOpenSSLServerCiphertext(
   var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
   const ALength: Integer): Integer;
 var
+  AcceptedLength: Integer;
+  Available: Integer;
   Data: TOpenSSLServerData;
 begin
   Data := OpenSSLServerData(AConnection);
@@ -1331,12 +1423,27 @@ begin
     raise ETransportSecurityError.Create(
       'TLS ciphertext input buffer is nil');
 
-  Result := OpenSSLBIOWrite(Data.ReadBIO, ABuffer, ALength);
+  RefreshOpenSSLServerInputFlow(Data);
+  Available := Data.InputHighWatermark - Data.InputBuffered;
+  AcceptedLength := ALength;
+  if AcceptedLength > Available then
+    AcceptedLength := Available;
+  if AcceptedLength <= 0 then
+  begin
+    Data.InputBackpressured := True;
+    Result := 0;
+    Exit;
+  end;
+
+  Result := OpenSSLBIOWrite(Data.ReadBIO, ABuffer, AcceptedLength);
   if Result <= 0 then
   begin
     PoisonOpenSSLServerConnection(AConnection);
     Result := -1;
+    Exit;
   end;
+  Inc(Data.InputAccepted, QWord(Result));
+  RefreshOpenSSLServerInputFlow(Data);
 end;
 
 function ReadOpenSSLServer(var AConnection: TTransportSecurityConnection;
@@ -2372,16 +2479,34 @@ begin
   {$ENDIF}
 end;
 
-constructor TTransportSecurityServerContext.Create(
-  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString);
+procedure TTransportSecurityServerContext.Initialize(
+  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
+  const AInputHighWatermark, AInputLowWatermark,
+  AOutputCapacity: Integer);
 {$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Data: TOpenSSLServerContextData;
   Identity: TBytes;
 {$ENDIF}
 begin
-  inherited Create;
   FBackendData := nil;
+  if (AInputHighWatermark < TLS_SERVER_MIN_INPUT_CAPACITY) or
+     (AInputHighWatermark > TLS_SERVER_MAX_INPUT_CAPACITY) then
+    raise ETransportSecurityError.CreateFmt(
+      'TLS server input capacity must be between %d and %d bytes',
+      [TLS_SERVER_MIN_INPUT_CAPACITY, TLS_SERVER_MAX_INPUT_CAPACITY]);
+  if (AInputLowWatermark < 0) or
+     (AInputLowWatermark >= AInputHighWatermark) then
+    raise ETransportSecurityError.Create(
+      'TLS server input low watermark must be nonnegative and below capacity');
+  if (AOutputCapacity < TLS_SERVER_MIN_OUTPUT_CAPACITY) or
+     (AOutputCapacity > TLS_SERVER_MAX_OUTPUT_CAPACITY) then
+    raise ETransportSecurityError.CreateFmt(
+      'TLS server output capacity must be between %d and %d bytes',
+      [TLS_SERVER_MIN_OUTPUT_CAPACITY, TLS_SERVER_MAX_OUTPUT_CAPACITY]);
+  FInputHighWatermark := AInputHighWatermark;
+  FInputLowWatermark := AInputLowWatermark;
+  FOutputCapacity := AOutputCapacity;
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   if not TryLoadOpenSSLServer then
     raise ETransportSecurityError.Create(OPENSSL_SERVER_LOAD_ERROR);
@@ -2401,6 +2526,35 @@ begin
   {$ELSE}
   raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
   {$ENDIF}
+end;
+
+constructor TTransportSecurityServerContext.Create(
+  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString);
+begin
+  inherited Create;
+  Initialize(APkcs12Path, APkcs12Passphrase,
+    TLS_SERVER_DEFAULT_INPUT_CAPACITY,
+    TLS_SERVER_DEFAULT_INPUT_CAPACITY div 2,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+end;
+
+constructor TTransportSecurityServerContext.Create(
+  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
+  const AInputHighWatermark, AOutputCapacity: Integer);
+begin
+  inherited Create;
+  Initialize(APkcs12Path, APkcs12Passphrase, AInputHighWatermark,
+    AInputHighWatermark div 2, AOutputCapacity);
+end;
+
+constructor TTransportSecurityServerContext.Create(
+  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
+  const AInputHighWatermark, AInputLowWatermark,
+  AOutputCapacity: Integer);
+begin
+  inherited Create;
+  Initialize(APkcs12Path, APkcs12Passphrase, AInputHighWatermark,
+    AInputLowWatermark, AOutputCapacity);
 end;
 
 destructor TTransportSecurityServerContext.Destroy;
@@ -2499,6 +2653,42 @@ begin
   Result := FeedOpenSSLServerCiphertext(AConnection, ABuffer, ALength);
   {$ELSE}
   Result := -1;
+  {$ENDIF}
+end;
+
+function TransportSecurityServerInputFlow(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityInputFlow;
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  Data: TOpenSSLServerData;
+{$ENDIF}
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Data := OpenSSLServerData(AConnection);
+  if not Assigned(Data) then
+    Exit;
+  RefreshOpenSSLServerInputFlow(Data);
+  Result.AcceptedBytes := Data.InputAccepted;
+  Result.Backpressured := Data.InputBackpressured;
+  Result.BufferedBytes := Data.InputBuffered;
+  Result.ConsumedBytes := Data.InputConsumed;
+  Result.HighWatermark := Data.InputHighWatermark;
+  Result.LowWatermark := Data.InputLowWatermark;
+  {$ENDIF}
+end;
+
+function TransportSecurityServerOutputFlow(
+  const AConnection: TTransportSecurityConnection): TTransportSecurityOutputFlow;
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  Data: TOpenSSLServerData;
+{$ENDIF}
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  Data := OpenSSLServerData(AConnection);
+  Result := OpenSSLServerOutputFlow(Data);
   {$ENDIF}
 end;
 

@@ -41,7 +41,7 @@ Per the freeze policy (ADR-0017): **all the below are LWPT-canonical; GocciaScri
 | GocciaScript path | LWPT-canonical path | Status | Notes |
 |------|---------------------|--------|-------|
 | `source/shared/HTTPClient.pas` | `packages/httpclient/source/HTTPClient.pas` | **Diverged** (LWPT ahead) | Four byte-safety fixes — header-recv accumulator + chunked-body seed-buffer cast. Without these, every binary download corrupts at the first `#0` byte. |
-| `source/shared/TransportSecurity.pas` | `packages/httpclient/source/TransportSecurity.pas` | Identical | |
+| `source/shared/TransportSecurity.pas` | `packages/httpclient/source/TransportSecurity.pas` | **Diverged** (LWPT ahead) | Independently bounded encrypted-input/output flow, input counters, and watermark admission from #85; the Duetto companion update is tracked separately. |
 | `source/shared/FileUtils.pas` | `packages/httpclient/source/FileUtils.pas` | Identical | |
 | `source/shared/StringBuffer.pas` | `packages/httpclient/source/StringBuffer.pas` + `packages/cli/source/StringBuffer.pas` | Identical | Bundled copy in each consuming package per ADR-0014 |
 | `source/shared/CLI.Options.pas` | `packages/cli/source/CLI.Options.pas` | **Diverged** (LWPT ahead) | `TGoccia*` prefix stripped from every public type; GocciaScript-engine-specific option groups (`TGocciaEngineOptions` / `TGocciaCoverageOptions` / `TGocciaProfilerOptions` and their enums) removed as dead code; options can opt in to attached short values |
