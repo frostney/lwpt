@@ -18,8 +18,9 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   `LWPT.BuildRequest` owns the versioned request, target tuple, capability, and
   normalized result structures. `TLWPTCompilerDriver` owns capability probing,
   argument translation, executable naming, failure classification, and result
-  normalization for build, test, and Windows hook compilation. FPC remains the
-  only driver and LWPT's own compiler. See ADR-0022 and ADR-0029.
+  normalization. Root-owned profiles select built-in FPC, a short-lived
+  external driver, or an embedding-host factory for build and test; lifecycle
+  hook compilation remains on FPC. See ADR-0022, ADR-0029, and ADR-0030.
 - **Analysis commands share structure, not policy.** `LWPT.Analysis.Scope`
   resolves root/workspace ownership, `LWPT.Analysis.Pascal` exposes normalized
   tokens and typed declaration/executable regions, and `LWPT.Analysis.JSON`
@@ -74,7 +75,8 @@ Sections currently supported:
 | `[dependencies]` | bare-string `"<source>@<version>"` shorthand or inline-table `{ source = "...", version = "...", subdir = "..." }` — see [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) |
 | `[sources]` | per-project custom git-host declarations. Each entry is an inline table mapping a prefix name to `archive` + `git` URL templates with `{user}` / `{repository}` / `{ref}` placeholders; enables prefixes like `gitea:owner/repo` against the user's self-hosted instance |
 | `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Inline entries may declare `depends = ["prerequisite"]` and ordered `flags = ["-dFEATURE"]`. Single-binary shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` |
-| `[workspaces]` | `include` / `exclude` glob arrays for monorepo workspace auto-discovery (each matched dir with its own `lwpt.toml` is installed as a local-path dep, symlinked or junctioned) |
+| `[compiler]` / `[compiler.profiles.<name>]` | root-owned compiler policy. `default` names the project profile; profiles select a driver plus optional `version` and either `executable` or `script`. A build entry's `compiler` field overrides the project default. Dependency manifests cannot contribute this policy. |
+| `[workspaces]` | `include` / `exclude` glob arrays for monorepo workspace auto-discovery (each matched dir with its own `lwpt.toml` is installed as a validated local snapshot) |
 | `[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` | Lifecycle hooks per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with optional `inputs` / `output` staleness gating. Plus per-`[build]`-entry inline `prebuild` / `postbuild` fields for per-binary signing / packaging / etc. |
 | Any other top-level section with a `script` field | A user-declared run-script callable via `lwpt run <name>` per [ADR-0013](./adr/0013-run-subcommand-and-build-rename.md) |
 | `[version]` | optional version-baking: writes a generated `.inc` with `<prefix>_VERSION` + `<prefix>_BUILD_DATE` |
@@ -113,24 +115,34 @@ policy.
 
 ## Resolver shape
 
-The resolver in `LWPT.Install` is a breadth-first walk starting at the root manifest's `[dependencies]`. For each dependency:
+Materializing resolution in `LWPT.Install` is a breadth-first graph walk inside
+deterministic fixed-point rounds ([ADR-0031](./adr/0031-fixed-point-single-version-resolution.md)).
+Every candidate archive, extracted tree, and copied local source stays below a
+private `.lwpt/tmp/resolver-plan-*` directory while LWPT:
 
-1. Look up the node in the resolution graph (`FindNode` + `TouchNode`).
-2. If new, fetch into `.lwpt/archives/<dep>-<version>.tar.gz`, extract into `.lwpt/modules/<dep>/`, and read that dep's own `lwpt.toml`.
-3. Enqueue every dep from the child manifest.
-4. Record the constraint (range + requirer) on the node.
+1. accumulates all root and transitive requirements by package name;
+2. rejects different canonical sources for the same name;
+3. selects the highest advertised Git tag satisfying the node's complete
+   SemVer constraint set;
+4. uses lightweight or peeled annotated-tag SHAs to prove tag/SHA identity; and
+5. repeats discovery when a selected candidate changes the transitive graph.
 
-After the BFS finishes, `CheckNodeConstraints` walks each node and asserts that every accumulated range *pairwise intersects* via the `Semver` package's `RangeIntersects` (a full node-semver port that handles compound ranges and `||` unions). If any pair fails, the resolver hard-errors with both requirers named — the manifest tree is editable to resolve the conflict. Pairwise overlap does not prove that one concrete version satisfies the whole node; graph-wide single-version selection and complete conflict diagnostics are tracked in [issue #36](https://github.com/frostney/lwpt/issues/36).
-
-The flat-graph + hard-error policy is deliberate: FPC has one global unit namespace; two versions of the same package cannot coexist. There is no nested versioning to fall back on.
+A repeated selection vector is an error: the resolver does not backtrack
+through lower parent candidates. Once a round is stable, its exact filtered
+module snapshots and archives are published, followed by `lwpt.lock` and
+`lwpt.cfg`; mutable local/workspace sources are not reread during publication.
+Failures before stability leave committed state untouched, and conflict
+diagnostics list every requirer and constraint. The flat-graph hard error is
+deliberate because FPC has one global unit namespace; nested multi-version
+installs are not supported.
 
 ## Fetch / extract / build / test pipeline
 
 - **Fetch:** HTTPS GET via the LWPT-canonical `HTTPClient` package (raw sockets + SChannel on Windows / SecureTransport on macOS / OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md)). The byte-safe `AppendRawBytes` accumulator fixes a header-recv truncation bug that previously corrupted binary downloads. URL templates per source kind live in `FetchURL`.
 - **Extract:** gunzip (zstream) + a direct ustar reader. The bundled FPC `libtar` has a bug — it ignores the 155-byte `prefix` field at offset 345, so paths longer than 100 bytes get silently dropped. LWPT's reader joins `prefix + '/' + name` correctly and also follows GNU `'L'`/`'K'` long-name entries.
-- **Build:** `BuildOneEntry` creates a `TLWPTBuildRequest`, asks the FPC driver
+- **Build:** `BuildOneEntry` creates a `TLWPTBuildRequest`, asks the selected driver
   to probe the requested target, validates the request against those
-  capabilities, and obtains the FPC arguments. Root-manifest per-entry flags
+  capabilities, and obtains its invocation. Root-manifest per-entry flags
   become ordered neutral extra arguments before the driver translates them;
   dependency-manifest flags are dropped. `TLWPTCompilerProcess` executes
   them below the seam. The driver normalizes diagnostics while the scheduler
@@ -146,8 +158,10 @@ The flat-graph + hard-error policy is deliberate: FPC has one global unit namesp
   protection and exclude unrelated declared outputs, while explicit file inputs
   remain hashed.
 - **Test:** Each `*.Test.pas` is a self-contained program using
-  `TestingPascalLibrary`. Test workers share one FPC driver, validate each
-  neutral request, compile into private session paths, retain raw compiler
+  `TestingPascalLibrary`. `lwpt test` resolves the project-scoped compiler
+  driver once and shares it across every test worker; per-entry compiler
+  profiles apply to `lwpt build`, not to individual test files. Workers validate
+  each neutral request, compile into private session paths, retain raw compiler
   output, and store normalized build-result diagnostics before running a
   successful binary. See [`testing.md`](./testing.md).
 - **Worker coordination:** `LWPT.WorkerBudget` owns the per-user machine-capacity seam. Invocations register owner-guarded requests and acquire FIFO, reclaimable leases under a short cross-platform transaction lock. Nested LWPT subprocesses consume a one-shot opaque delegation that transfers one grant to the child's own guarded request instead of consuming another slot. `lwpt repair` reclaims requests only when their OS-held owner guard is absent; stale heartbeats remain diagnostic. Build and test scheduling consume this module in their own workstreams.
@@ -158,21 +172,27 @@ See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) for the full design ra
 
 | Path | Status | Purpose |
 | --- | --- | --- |
-| `.lwpt/modules/<dep>/` | **Committed** | Extracted / linked dependency trees. The thing `-Fu` paths point at. Per [ADR-0014](./adr/0014-packages-extraction.md): monorepo deps (resolved path inside the project root) appear as **symlinks** (Unix) or **NTFS junctions** (Windows native, no Developer Mode needed); external-path + network deps appear as regular copied directories. |
+| `.lwpt/modules/<dep>/` | **Committed** | Exact extracted or copied dependency snapshots from the stable resolver plan. Include/exclude policy has already been applied; the thing `-Fu` paths point at is never a live reread of a mutable local/workspace source. ADR-0031 supersedes ADR-0014's earlier publication-time monorepo-link amendment for materializing installs. |
 | `.lwpt/archives/<dep>-<version>.tar.gz` | **Committed** | Source-of-truth tarballs. Used for hash verification on `--frozen`. |
-| `.lwpt/tmp/` | Gitignored | Install workspace. Every write to a committed path goes through here first; atomic rename moves the staged file/dir into place. EXDEV fallback (copy-then-delete) handles cross-filesystem renames. Wiped at the start of every `lwpt install` to reap crash orphans. |
+| `.lwpt/tmp/` | Gitignored | Install workspace and journaled rollback copies. A materializing install or `lwpt repair` recovers pending state before ordinary residue cleanup. Frozen verification does not mutate it. |
 | `.lwpt/install.lock` | Gitignored | Cross-process install lock. Created with O_CREAT\|O_EXCL by the first `lwpt install`; a second concurrent install fails with `EConcurrencyError` naming the lock holder's PID. Deleted by the normally-completing install; a crashed install leaves it for the user to clear via `lwpt repair`. Windows lock uses `LockFileEx`. |
 | `.lwpt/sessions/<session-id>/` | Gitignored | Build/test compiler staging. Every invocation owns distinct, bounded, hash-qualified job, unit, executable, and hook-compile paths. Completed sessions retain stable job logs until `lwpt repair`; failed/crashed sessions retain their private diagnostics. The sibling `locks/` directory contains stable publication-lock files and per-session owner guards. |
 
 ### ⚠️ Windows safe-deletion warning
 
-`.lwpt/modules/<name>/` is a **junction** on Windows when the dep is a monorepo dep (resolved inside the project root). Standard recursive-delete commands behave dangerously around junctions:
+Older zero-install trees may still contain a **junction** from the superseded
+monorepo-link publication policy. Current materializing installs replace it
+with a validated snapshot, but standard recursive-delete commands remain
+dangerous until that happens:
 
 - **PowerShell** `Remove-Item -Recurse -Force` **follows the junction into the target** and deletes files outside the link. If you run this on `.lwpt/`, you can lose your `packages/<name>/source/*.pas` files. Documented Windows-platform behaviour, not an LWPT bug; bit pnpm hard enough to warrant a public incident report ([pnpm issue #10707](https://github.com/pnpm/pnpm/issues/10707)).
 - **Git Bash / MSYS** `rm -rf` has the same behaviour.
 - **Safe alternative on Windows**: `cmd.exe /c "rmdir /S /Q .lwpt"` — removes junction reparse points as links rather than traversing them.
 
-LWPT's own internal cleanup (e.g. `WipeInstalledDep` during re-install) detects junctions and removes them safely (`RemoveDirectoryW` on the link itself). The hazard is only for *external* tools the user invokes on the `.lwpt/` tree. Unix users are unaffected — symlink-following deletion is a documented Windows quirk.
+LWPT's own `AtomicRemovePath` cleanup detects junctions and removes them safely
+(`RemoveDirectoryW` on the link itself). The hazard is only for *external*
+tools the user invokes on the `.lwpt/` tree. Unix users are unaffected —
+symlink-following deletion is a documented Windows quirk.
 
 ## Error model
 
@@ -201,11 +221,14 @@ Each error class carries an `Operation` and a `Recovery` field. The subcommand w
 | --- | --- | --- |
 | `source` | string | The verbatim source string from the manifest (e.g. `"HashLoad/horse"`, `"gitlab:org/repo"`, `"../path"`). Host + kind are inferable by re-running `ParseDependencySource` on this value. |
 | `resolvedRef` | string | The concrete tag name or commit SHA the resolver picked. Empty for `skLocal` + `skURL`. |
+| `resolvedCommit` | string | The authoritative advertised commit fetched for a Git ref. Newly generated v3 entries record it; compatible early v3 entries remain frozen-verifiable when their existing fields prove an unambiguous identity. |
+| `sourceIdentity` | string | Canonical source plus normalized include/exclude extraction policy. |
+| `constraintFingerprint` | string | Digest of every accumulated requirement and requirer used to select this package. Missing additive evidence in an early v3 entry is accepted only when the remaining identity is unambiguous; mixed named-ref/SHA identity without an authoritative commit requires regeneration. |
 | `resolvedURL` | string | The actual archive URL fetched. Empty for `skLocal`. Self-documents the host: a `gitlab:` dep shows up as `https://gitlab.com/...`. |
 | `computedHash` | string | `sha256:<hex>` of the extracted tree under `.lwpt/modules/<dep>/` |
 | `archiveHash` | string | `sha256:<hex>` of the cached `.tar.gz` under `.lwpt/archives/`; empty for `skLocal` (no archive) |
 
-Older lockfile schemas (v1 or v2) fail to load with a clear migration hint: delete `lwpt.lock` and re-run `lwpt install`. See [ADR-0008](./adr/0008-lockfile-schema-v2-archive-hash.md) for the archiveHash split (v1 → v2) and [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) for the source-syntax + resolvedURL refactor (v2 → v3). v3 is the last lockfile schema break planned for v1.
+Older lockfile schemas (v1 or v2) fail to load with a clear migration hint: delete `lwpt.lock` and re-run `lwpt install`. See [ADR-0008](./adr/0008-lockfile-schema-v2-archive-hash.md) for the archiveHash split (v1 → v2) and [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) for the source-syntax + resolvedURL refactor (v2 → v3). v3 is the last lockfile schema break planned for v1. Early v3 files without the additive authoritative identity fields remain frozen-verifiable when their existing source and ref fields prove an unambiguous identity. Ambiguous mixed named-ref/SHA entries fail with an instruction to run the machine writer; lockfiles must never be hand-edited.
 
 ## Self-host
 
@@ -216,7 +239,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`,
 `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.WorkerBudget.pas`,
 `LWPT.Command.*.pas`, `LWPT.CompilerDriver.pas`,
-`LWPT.CompilerDriver.FPC.pas`, `LWPT.Formatter.pas`,
+`LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.External.pas`,
+`LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
 `LWPT.GitProtocol.pas`) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
 LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` —
@@ -252,7 +276,7 @@ The production gaps the spike's handoff flagged + the current status of each:
 | --- | --- | --- |
 | Self-test suite (HTTPClient regression first) | Done | The single most important test is the mock-server-based binary-fetch regression that pins HTTPClient's byte-safe `AppendRawBytes` contract |
 | Live network tests against GitLab + Bitbucket + fetch-failure-mode tests | Partial | Live GitHub (`octocat/Hello-World`), GitLab (`gitlab-examples/ci-debug-trace`), Bitbucket (`atlassian/atlaskit`) suites ship in the `tests/e2e/` tier. Missing-local-source coverage exists; deterministic HTTP redirect, timeout, malformed-response, and status-failure coverage remains tracked in [issue #34](https://github.com/frostney/lwpt/issues/34). |
-| Error handling hardened | Done | Atomic-via-`.lwpt/tmp/` for archive + tree + lockfile + cfg writes, EXDEV fallback, `O_CREAT\|O_EXCL` cross-process install lock, lockfile schema v3 with `archiveHash` and `resolvedURL`, `--frozen` two-hash verification, crash-recovery wipe of `.lwpt/tmp/` orphans at install startup. |
+| Error handling hardened | Done | Validated journaled rollback under `.lwpt/tmp/`, stable-plan publication, recovery before tmp cleanup, aggregate rollback diagnostics, EXDEV fallback, `O_CREAT\|O_EXCL` cross-process install lock, lockfile schema v3 with `archiveHash` and `resolvedURL`, and read-only `--frozen` two-hash verification. |
 | CI on the platform tier matrix | Partial | Tier 1 cross-build and native-test coverage ships for Linux, Windows, and macOS (see [`deployment.md`](./deployment.md)). Windows install locking (`LockFileEx`) and subprocess paths ship; the WinSock-backed HTTP mock server needed to remove Windows skips remains tracked in [issue #35](https://github.com/frostney/lwpt/issues/35). |
 | Release artifacts | Done | Windows + macOS releases ship the binary alone; Linux relies on distro libssl per [ADR-0016](./adr/0016-tls-backend-per-platform.md). |
 | Embedded testing library refresh wired into `lwpt build` | Retired per [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) | The embedded blob is gone; the testing framework is the workspace `testing` package, consumed via `lwpt install` like any other dep. |

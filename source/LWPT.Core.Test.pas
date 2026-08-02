@@ -25,7 +25,8 @@ uses
   LWPT.GitProtocol,
   LWPT.Install,
   LWPT.Manifest,
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  TOML;
 
 type
   TSHA256NISTVectors = class(TTestSuite)
@@ -58,6 +59,8 @@ type
     procedure TestBuildEntriesTable;
     procedure TestVersionSection;
     procedure TestManifestSnapshotBindsParsedBytes;
+    procedure TestRootCompilerProfilesParsed;
+    procedure TestDependencyCompilerPolicyIgnored;
   end;
 
   TLoadManifestValidation = class(TTestSuite)
@@ -71,6 +74,8 @@ type
     procedure TestBuildEntryTraversalNameRootOnly;
     procedure TestBuildDependsMustBeStringArray;
     procedure TestBuildFlagsMustBeStringArrayAndAreRootOnly;
+    procedure TestUndeclaredCompilerProfilesAreRejected;
+    procedure TestArrayCannotBecomeTablePath;
   end;
 
   TLoadManifestExtensions = class(TTestSuite)
@@ -165,7 +170,7 @@ type
     procedure TestServiceAnnounceIsSkipped;
     procedure TestHeadWithCapabilitiesIsRecognised;
     procedure TestTagsAndBranchesAreSeparated;
-    procedure TestPeelSuffixIsDiscarded;
+    procedure TestPeelSuffixRecordsCommitIdentity;
     procedure TestMultipleTags;
   end;
 
@@ -673,6 +678,62 @@ begin
   Expect<string>(Man.Version).ToBe('1.2.3');
 end;
 
+procedure TLoadManifestHappy.TestRootCompilerProfilesParsed;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "compiler-profiles"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler]'#10 +
+    'default = "native"'#10 +
+    ''#10 +
+    '[compiler.profiles.native]'#10 +
+    'driver = "fpc"'#10 +
+    'executable = "custom-fpc"'#10 +
+    'version = "^3.2.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'source = "source/app.pas"'#10 +
+    'compiler = "native"'#10;
+var
+  Man: TManifest;
+begin
+  Man := LoadManifest(WriteManifest('compiler-profiles', INPUT));
+  Expect<string>(Man.CompilerDefault).ToBe('native');
+  Expect<Integer>(Length(Man.CompilerProfiles)).ToBe(1);
+  Expect<string>(Man.CompilerProfiles[0].Driver).ToBe('fpc');
+  Expect<string>(Man.CompilerProfiles[0].Executable).ToBe('custom-fpc');
+  Expect<string>(Man.CompilerProfiles[0].VersionConstraint).ToBe('^3.2.0');
+  Expect<string>(Man.BuildEntries[0].CompilerProfile).ToBe('native');
+end;
+
+procedure TLoadManifestHappy.TestDependencyCompilerPolicyIgnored;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "dependency-compiler"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler]'#10 +
+    'default = "foreign"'#10 +
+    ''#10 +
+    '[compiler.profiles.foreign]'#10 +
+    'driver = "foreign"'#10 +
+    'executable = "foreign-driver"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'source = "source/app.pas"'#10 +
+    'compiler = "foreign"'#10;
+var
+  Man: TManifest;
+begin
+  Man := LoadManifest(WriteManifest('dependency-compiler', INPUT), False);
+  Expect<string>(Man.CompilerDefault).ToBe('');
+  Expect<Integer>(Length(Man.CompilerProfiles)).ToBe(0);
+  Expect<string>(Man.BuildEntries[0].CompilerProfile).ToBe('');
+end;
+
 procedure TLoadManifestHappy.SetupTests;
 begin
   Test('minimal manifest: name + version',  TestMinimalManifestNameAndVersion);
@@ -681,6 +742,10 @@ begin
   Test('[version] section parsed',          TestVersionSection);
   Test('manifest snapshot hashes the bytes it parses',
     TestManifestSnapshotBindsParsedBytes);
+  Test('root compiler profiles and build selection are parsed',
+    TestRootCompilerProfilesParsed);
+  Test('dependency compiler policy is ignored',
+    TestDependencyCompilerPolicyIgnored);
 end;
 
 { ── TLoadManifestValidation ───────────────────────────────────────── }
@@ -860,6 +925,97 @@ begin
   Expect<Integer>(Length(Man.BuildEntries[0].Flags)).ToBe(0);
 end;
 
+procedure TLoadManifestValidation.TestUndeclaredCompilerProfilesAreRejected;
+const
+  UNKNOWN_DEFAULT =
+    '[package]'#10 +
+    'name = "unknown-default"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler]'#10 +
+    'default = "typo"'#10;
+  UNKNOWN_ENTRY =
+    '[package]'#10 +
+    'name = "unknown-entry"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler.profiles.native]'#10 +
+    'driver = "fpc"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'app = { source = "source/app.pas", compiler = "typo" }'#10;
+  DUPLICATE_CASE =
+    '[package]'#10 +
+    'name = "duplicate-profile-case"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler.profiles.Native]'#10 +
+    'driver = "fpc"'#10 +
+    ''#10 +
+    '[compiler.profiles.native]'#10 +
+    'driver = "fpc"'#10;
+begin
+  ExpectManifestLoadError(
+    WriteManifest('unknown-compiler-default', UNKNOWN_DEFAULT),
+    '[compiler] default names undeclared compiler profile "typo"', Self);
+  ExpectManifestLoadError(
+    WriteManifest('unknown-entry-compiler', UNKNOWN_ENTRY),
+    'build.app.compiler names undeclared compiler profile "typo"', Self);
+  ExpectManifestLoadError(
+    WriteManifest('duplicate-compiler-profile-case', DUPLICATE_CASE),
+    '[compiler.profiles] duplicate profile name "native" '
+      + '(profile names are case-insensitive)', Self);
+end;
+
+procedure TLoadManifestValidation.TestArrayCannotBecomeTablePath;
+const
+  REGULAR_TABLE =
+    'a = [1]'#10 +
+    '[a.b]'#10;
+  ARRAY_OF_TABLES =
+    'a = [1]'#10 +
+    '[[a.b]]'#10;
+var
+  Parser: TTOMLParser;
+  Raised: Boolean;
+  Root: TTOMLNode;
+begin
+  Parser := TTOMLParser.Create;
+  try
+    Root := nil;
+    Raised := False;
+    try
+      Root := Parser.ParseDocument(REGULAR_TABLE);
+    except
+      on E: ETOMLParseError do
+      begin
+        Raised := Pos('after assigning it a value', E.Message) > 0;
+        if not Raised then
+          Fail('regular table error did not identify the assigned value');
+      end;
+    end;
+    Root.Free;
+    Expect<Boolean>(Raised).ToBe(True);
+
+    Root := nil;
+    Raised := False;
+    try
+      Root := Parser.ParseDocument(ARRAY_OF_TABLES);
+    except
+      on E: ETOMLParseError do
+      begin
+        Raised := Pos('after assigning it a value', E.Message) > 0;
+        if not Raised then
+          Fail('array-of-tables error did not identify the assigned value');
+      end;
+    end;
+    Root.Free;
+    Expect<Boolean>(Raised).ToBe(True);
+  finally
+    Parser.Free;
+  end;
+end;
+
 procedure TLoadManifestValidation.SetupTests;
 begin
   Test('bare-string dep shorthand rejected (ADR-0004 migration)',
@@ -875,6 +1031,10 @@ begin
     TestBuildDependsMustBeStringArray);
   Test('[build] flags are strict root-owned string arrays',
     TestBuildFlagsMustBeStringArrayAndAreRootOnly);
+  Test('compiler defaults and build entries name declared profiles',
+    TestUndeclaredCompilerProfilesAreRejected);
+  Test('value arrays cannot become table paths',
+    TestArrayCannotBecomeTablePath);
 end;
 
 { ── TLoadManifestExtensions ───────────────────────────────────────── }
@@ -1609,11 +1769,11 @@ begin
   Expect<string>(Refs[1].Name).ToBe('v1.0.0');
 end;
 
-procedure TGitProtocolParsing.TestPeelSuffixIsDiscarded;
+procedure TGitProtocolParsing.TestPeelSuffixRecordsCommitIdentity;
 const
   (* Both lines refer to the same tag; the ^{} line is the peeled
-     commit SHA. Our parser drops the peel-suffix line so the result
-     contains the tag exactly once. *)
+     commit SHA. The parser keeps one tag and attaches the commit
+     identity advertised by Git. *)
   PAYLOAD =
     '003ebbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/tags/v1.0.0'#10 +
     (* 0x41 = 65: 4 prefix + 40 sha + 1 space + 19-char peel-suffix
@@ -1625,6 +1785,8 @@ begin
   Refs := ParseInfoRefs(PAYLOAD);
   Expect<Integer>(Length(Refs)).ToBe(1);
   Expect<string>(Refs[0].Name).ToBe('v1.0.0');
+  Expect<string>(Refs[0].PeeledSHA)
+    .ToBe('cccccccccccccccccccccccccccccccccccccccc');
 end;
 
 procedure TGitProtocolParsing.TestMultipleTags;
@@ -1652,8 +1814,8 @@ begin
     TestHeadWithCapabilitiesIsRecognised);
   Test('refs/heads/ and refs/tags/ are classified correctly',
     TestTagsAndBranchesAreSeparated);
-  Test('peel-suffix lines are discarded (the unsuffixed line wins)',
-    TestPeelSuffixIsDiscarded);
+  Test('peel-suffix lines attach the authoritative commit identity',
+    TestPeelSuffixRecordsCommitIdentity);
   Test('multiple tags are returned in order',
     TestMultipleTags);
 end;

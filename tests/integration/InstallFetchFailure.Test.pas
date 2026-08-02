@@ -82,7 +82,7 @@ type
 
   TInstallHTTPFetchFailure = class(TTestSuite)
   private
-    FOrigDir, FScratch: string;
+    FOrigDir, FScratch, FGitFixtureRoot: string;
     function NewProjectRoot(const AName: string): string;
     function InstallAgainstPort(const ARoot: string; const APort: Word;
       const ATimeoutMilliseconds: string;
@@ -366,6 +366,7 @@ end;
 
 const
   CRLF = #13#10;
+  MOCK_COMMIT = '1111111111111111111111111111111111111111';
   { The stall case alone needs a short request budget, so a peer that never
     answers fails the test quickly rather than blocking; 250 ms sits well
     under the 60 s ceiling that case asserts. }
@@ -416,9 +417,10 @@ begin
     'begin'#10 +
     '  WriteLn(''noop'');'#10 +
     'end.'#10);
-  { A git-host dep pinned to a literal tag. Literal tags skip remote ref
-    resolution, so the install makes exactly one HTTP request, the
-    archive fetch, which is what a single-connection mock can serve. }
+  { A git-host dep pinned to a literal tag. The fixed-point resolver validates
+    that tag against the file-backed ref advertisement prepared in BeforeAll;
+    only the archive fetch reaches HTTP, so a single-connection mock remains
+    the exact transport boundary under test. }
   WriteTextFile(Result + '/lwpt.toml',
     '[package]'#10 +
     'name = "http-fetch-failure"'#10 +
@@ -435,7 +437,8 @@ function TInstallHTTPFetchFailure.InstallAgainstPort(const ARoot: string;
 begin
   Result := RunLwpt(['install'], ARoot,
     [ARCHIVE_FETCH_ORIGIN_ENV + '=http://' + AHost + ':' + IntToStr(APort),
-     ARCHIVE_FETCH_TIMEOUT_ENV + '=' + ATimeoutMilliseconds],
+     ARCHIVE_FETCH_TIMEOUT_ENV + '=' + ATimeoutMilliseconds,
+     PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FGitFixtureRoot],
     AWatchdogMilliseconds);
 end;
 
@@ -443,9 +446,12 @@ procedure TInstallHTTPFetchFailure.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
   FScratch := CreateScratchRoot('install-http-fetch-failure');
+  FGitFixtureRoot := FScratch + '/git-fixture';
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
   RecursiveDelete(FScratch);
-  ForceDirectories(FScratch);
+  ForceDirectories(FGitFixtureRoot + '/refs');
+  WriteTextFile(FGitFixtureRoot + '/refs/mock-dep.refs',
+    'tag|v1.0.0|' + MOCK_COMMIT + '|'#10);
 end;
 
 procedure TInstallHTTPFetchFailure.AfterAll;

@@ -18,6 +18,9 @@ type
   TResolved = record
     Name         : string;
     Version      : string;       { concrete tag / SHA / branch; '' for local + url }
+    CommitSHA    : string;       { authoritative fetched commit identity }
+    SourceIdentity: string;      { canonical source + extraction policy identity }
+    ConstraintFingerprint: string; { complete graph requirements for frozen }
     SrcOriginal  : string;       { the manifest's source string, verbatim }
     SrcKind      : TSourceKind;
     SrcHost      : THostKind;    { skGitHost only }
@@ -78,6 +81,7 @@ procedure VerifyAgainstLockfile(const AResolved: array of TResolved; const ALock
 function  PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved; const AModulesRoot, AArchivesRoot: string): Integer;
 function  RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode): TInstallTransactionResult;
 function  RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
+procedure RecoverInterruptedInstall(const AContext: TManifestContext);
 
 implementation
 
@@ -86,6 +90,7 @@ uses
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
   HTTPClient,
   LWPT.GitProtocol,
+  LWPT.Resolver,
   Semver,
   TOML,
   zstream;
@@ -443,95 +448,6 @@ begin
     Result := S;
 end;
 
-function FindTagInRefs(const ARefs: TGitRefArray;
-  const AName: string): Integer;
-var i: Integer;
-begin
-  Result := -1;
-  for i := 0 to High(ARefs) do
-    if (ARefs[i].Kind = rkTag) and (ARefs[i].Name = AName) then
-      Exit(i);
-end;
-
-function ResolveDepRef(const ADep: TDependency;
-  const ACustomSources: TCustomSourceArray): string;
-var
-  Refs : TGitRefArray;
-  Candidates : array of string;
-  TagToWire : array of string;
-  i, MatchIdx : Integer;
-  Stripped, Chosen : string;
-begin
-  case ADep.VersionKind of
-    vkNone:
-      Exit('');
-    vkCommitSha:
-      Exit(ADep.VersionSpec);
-    vkLiteralTag:
-      { No tag-list verification — we hand the literal to FetchURL
-        and let the fetch fail with EFetchError if the tag is
-        absent. Keeps this path one-round-trip (the fetch IS the
-        verification). }
-      Exit(ADep.VersionSpec);
-  end;
-
-  { vkSemverRange / vkSemverExact both need the tag list. }
-  if ADep.SrcKind <> skGitHost then
-    raise EFetchError.CreateFmt(
-      'dependency "%s": SemVer version spec "%s" requires a git-host '
-      + 'source; skURL and skLocal sources do not support SemVer '
-      + 'resolution', [ADep.Name, ADep.VersionSpec]);
-
-  WriteLn('  resolving tags for ', ADep.Name, '...');
-  Refs := ListRemoteRefs(GitRepoURL(ADep, ACustomSources));
-
-  if ADep.VersionKind = vkSemverExact then
-  begin
-    { Try the spec verbatim, then v<spec>. First match wins. }
-    MatchIdx := FindTagInRefs(Refs, ADep.VersionSpec);
-    if MatchIdx >= 0 then Exit(Refs[MatchIdx].Name);
-    MatchIdx := FindTagInRefs(Refs, 'v' + ADep.VersionSpec);
-    if MatchIdx >= 0 then Exit(Refs[MatchIdx].Name);
-    raise EFetchError.CreateFmt(
-      'dependency "%s": no tag matching "%s" or "v%s" found in '
-      + 'remote repo (looked at %d tag entries)',
-      [ADep.Name, ADep.VersionSpec, ADep.VersionSpec, Length(Refs)]);
-  end;
-
-  { vkSemverRange — build a parallel array of (stripped-tag, wire-tag)
-    pairs so we can MaxSatisfying on the stripped form and recover
-    the wire name for the URL. }
-  SetLength(Candidates, 0);
-  SetLength(TagToWire, 0);
-  for i := 0 to High(Refs) do
-    if Refs[i].Kind = rkTag then
-    begin
-      Stripped := StripVPrefix(Refs[i].Name);
-      if Valid(Stripped, DefaultSemverOptions) = '' then Continue;
-      SetLength(Candidates,  Length(Candidates) + 1);
-      SetLength(TagToWire,   Length(TagToWire) + 1);
-      Candidates[High(Candidates)] := Stripped;
-      TagToWire[High(TagToWire)]   := Refs[i].Name;
-    end;
-
-  if Length(Candidates) = 0 then
-    raise EFetchError.CreateFmt(
-      'dependency "%s": no SemVer-shaped tags found in remote repo '
-      + '(version spec was "%s"; %d total refs)',
-      [ADep.Name, ADep.VersionSpec, Length(Refs)]);
-
-  Chosen := MaxSatisfying(Candidates, ADep.VersionSpec,
-    DefaultSemverOptions);
-  if Chosen = '' then
-    raise EFetchError.CreateFmt(
-      'dependency "%s": no tag satisfies "%s" (looked at %d SemVer '
-      + 'tags)', [ADep.Name, ADep.VersionSpec, Length(Candidates)]);
-
-  for i := 0 to High(Candidates) do
-    if Candidates[i] = Chosen then Exit(TagToWire[i]);
-  Result := Chosen;  { fall-through shouldn't happen but be safe }
-end;
-
 { ===========================================================================
   Registry version negotiation (http source) — tracked in GitHub issue #29
 
@@ -741,7 +657,7 @@ end;
 
 { FetchToCache writes the archive atomically into
   ArchivesRoot/<name>-<version>.tar.gz via the tmp dir, and sets
-  UnitDir = ModulesRoot/<name>. The caller (ResolveGraph) is responsible
+  UnitDir = ModulesRoot/<name>. The graph resolver is responsible
   for the subsequent ExtractArchive call. Returns the archive's sha256
   in AArchiveHash so the resolver can record it in the lockfile.
 
@@ -782,123 +698,18 @@ begin
   Result := ExpandFileName(IncludeTrailingPathDelimiter(Root) + APath);
 end;
 
-{ ===========================================================================
-  Monorepo link helpers (ADR-0014 amendment "Symlink/junction for monorepo
-  deps"). Local-path deps whose resolved path is INSIDE the project root
-  install via symlink (Unix) or NTFS junction (Windows native), saving disk
-  + propagating edits to packages/<name>/source/ immediately. Outside-the-
-  project local-path deps (../../X, /abs/path/X) install via the existing
-  recursive copy — the link target could disappear / move and we don't
-  want to track that.
-  =========================================================================== }
-
 function IsPathInside(const AParent, AChild: string): Boolean;
 var
   ParentAbs, ChildAbs: string;
 begin
   ParentAbs := IncludeTrailingPathDelimiter(ExpandFileName(AParent));
-  ChildAbs  := IncludeTrailingPathDelimiter(ExpandFileName(AChild));
+  ChildAbs := IncludeTrailingPathDelimiter(ExpandFileName(AChild));
   {$IFDEF MSWINDOWS}
   Result := SameText(Copy(ChildAbs, 1, Length(ParentAbs)), ParentAbs);
   {$ELSE}
   Result := Copy(ChildAbs, 1, Length(ParentAbs)) = ParentAbs;
   {$ENDIF}
 end;
-
-{ Native junction creation on Windows — no `mklink /J` shell-out, no
-  Developer Mode required (junctions need only write permission to the
-  parent dir). Uses CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT +
-  FILE_FLAG_BACKUP_SEMANTICS, then DeviceIoControl with
-  FSCTL_SET_REPARSE_POINT + IO_REPARSE_TAG_MOUNT_POINT. The substitute
-  name needs the "\??\" NT-namespace prefix; the print name is the
-  display path without the prefix. The REPARSE_DATA_BUFFER layout for
-  mount points is the standard one — see SDK winioctl.h. }
-{$IFDEF MSWINDOWS}
-const
-  FSCTL_SET_REPARSE_POINT_LWPT  = $000900A4;
-  IO_REPARSE_TAG_MOUNT_POINT_LWPT = $A0000003;
-  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
-  FILE_FLAG_BACKUP_SEMANTICS_LWPT   = $02000000;
-type
-  TLwptMountPointReparseBuffer = packed record
-    ReparseTag           : DWORD;
-    ReparseDataLength    : Word;
-    Reserved             : Word;
-    SubstituteNameOffset : Word;
-    SubstituteNameLength : Word;
-    PrintNameOffset      : Word;
-    PrintNameLength      : Word;
-    PathBuffer           : array[0..(16 * 1024) div SizeOf(WideChar) - 16] of WideChar;
-  end;
-{$ENDIF}
-
-function CreateDirLink(const ALink, ATarget: string): Boolean;
-{$IFDEF UNIX}
-var
-  LinkParent, RelativeTarget: string;
-begin
-  LinkParent := IncludeTrailingPathDelimiter(ExtractFileDir(ExpandFileName(ALink)));
-  RelativeTarget := ExtractRelativePath(LinkParent, ExpandFileName(ATarget));
-  Result := FpSymlink(PChar(RelativeTarget), PChar(ALink)) = 0;
-end;
-{$ENDIF}
-{$IFDEF MSWINDOWS}
-var
-  Buf: TLwptMountPointReparseBuffer;
-  H: THandle;
-  SubstW, PrintW: UnicodeString;
-  SubstBytes, PrintBytes: Word;
-  Returned: Cardinal;
-begin
-  Result := False;
-  PrintW := UnicodeString(ExpandFileName(ATarget));
-  SubstW := UnicodeString('\??\') + PrintW;
-  SubstBytes := Length(SubstW) * SizeOf(WideChar);
-  PrintBytes := Length(PrintW) * SizeOf(WideChar);
-  { Layout: substitute-name + null-terminator + print-name + null-terminator.
-    Total buffer needs (SubstBytes + 2 + PrintBytes + 2) bytes. Bail early
-    if it doesn't fit (very long path). }
-  if SubstBytes + PrintBytes + 4 > SizeOf(Buf.PathBuffer) then Exit;
-
-  { Junctions go on top of an EXISTING empty dir; create it first. }
-  if not Windows.CreateDirectoryW(PWideChar(UnicodeString(ALink)), nil) then
-    Exit;
-
-  H := Windows.CreateFileW(PWideChar(UnicodeString(ALink)),
-    Windows.GENERIC_WRITE, 0, nil, Windows.OPEN_EXISTING,
-    FILE_FLAG_BACKUP_SEMANTICS_LWPT or FILE_FLAG_OPEN_REPARSE_POINT_LWPT,
-    0);
-  if H = THandle(Windows.INVALID_HANDLE_VALUE) then
-  begin
-    Windows.RemoveDirectoryW(PWideChar(UnicodeString(ALink)));
-    Exit;
-  end;
-
-  FillChar(Buf, SizeOf(Buf), 0);
-  Buf.ReparseTag           := IO_REPARSE_TAG_MOUNT_POINT_LWPT;
-  Buf.SubstituteNameOffset := 0;
-  Buf.SubstituteNameLength := SubstBytes;
-  Buf.PrintNameOffset      := SubstBytes + SizeOf(WideChar);
-  Buf.PrintNameLength      := PrintBytes;
-  Move(SubstW[1], Buf.PathBuffer[0], SubstBytes);
-  Move(PrintW[1],
-    Buf.PathBuffer[(SubstBytes div SizeOf(WideChar)) + 1],
-    PrintBytes);
-  { ReparseDataLength = the four USHORT fields (8 bytes) + the path
-    buffer payload (subst + null + print + null). }
-  Buf.ReparseDataLength := 8 + SubstBytes + SizeOf(WideChar)
-                            + PrintBytes + SizeOf(WideChar);
-  try
-    Result := Windows.DeviceIoControl(H, FSCTL_SET_REPARSE_POINT_LWPT,
-      @Buf, Buf.ReparseDataLength + 8,  { + 8 for ReparseTag/Len/Reserved }
-      nil, 0, Returned, nil);
-    if not Result then
-      Windows.RemoveDirectoryW(PWideChar(UnicodeString(ALink)));
-  finally
-    Windows.CloseHandle(H);
-  end;
-end;
-{$ENDIF}
 
 function SafeArchiveTag(const ARef: string): string;
 var
@@ -927,6 +738,48 @@ begin
           + AName + '-' + ArchiveTag + '.tar.gz';
 end;
 
+function LoadTestFixtureArchive(const ARoot, AName, ARef: string;
+  out ABody: TBytes): Boolean;
+var ArchivePath, RequestPath: string; Stream: TFileStream;
+  RequestBytes: RawByteString;
+begin
+  Result := False;
+  ArchivePath := IncludeTrailingPathDelimiter(ARoot) + 'archives/'
+    + AName + '/' + SafeArchiveTag(ARef) + '.tar.gz';
+  if not FileExists(ArchivePath) then
+    raise EFetchError.CreateFmt(
+      'test git fixture has no immutable archive for %s@%s (%s)',
+      [AName, ARef, ArchivePath]);
+  Stream := TFileStream.Create(ArchivePath, fmOpenRead or fmShareDenyNone);
+  try
+    if Stream.Size > MAX_ARCHIVE_RESPONSE_BYTES then
+      raise EFetchError.CreateFmt(
+        'test git fixture archive exceeds response bound: %s',
+        [ArchivePath]);
+    SetLength(ABody, Stream.Size);
+    if Length(ABody) > 0 then Stream.ReadBuffer(ABody[0], Length(ABody));
+  finally
+    Stream.Free;
+  end;
+  RequestPath := IncludeTrailingPathDelimiter(ARoot) + 'requests.log';
+  ForceDirectories(ExtractFileDir(RequestPath));
+  if FileExists(RequestPath) then
+    Stream := TFileStream.Create(RequestPath,
+      fmOpenReadWrite or fmShareDenyNone)
+  else
+    Stream := TFileStream.Create(RequestPath, fmCreate or fmShareDenyNone);
+  try
+    Stream.Seek(0, soEnd);
+    RequestBytes := RawByteString('archive|' + AName + '|' + ARef
+      + LineEnding);
+    if Length(RequestBytes) > 0 then
+      Stream.WriteBuffer(RequestBytes[1], Length(RequestBytes));
+  finally
+    Stream.Free;
+  end;
+  Result := True;
+end;
+
 function FetchToCache(const ADep: TDependency;
   const AResolvedRef, AModulesRoot, AArchivesRoot, ATmpRoot,
     AProjectRoot: string;
@@ -942,7 +795,7 @@ var
   k : Integer;
   WSPath : string;
   AvailableNames : string;
-  StagePath : string;
+  StagePath, FixtureRoot : string;
 
   procedure StageLocalCopy(const AMessage: string);
   begin
@@ -1017,48 +870,10 @@ begin
     if not DirectoryExists(LocalPath) then
       raise EFetchError.CreateFmt(
         'local source for "%s" not found: %s', [ADep.Name, LocalPath]);
-    { Monorepo deps (resolved path INSIDE AProjectRoot) install via
-      symlink / junction — edits to packages/<name>/source/X.pas are
-      visible immediately under .lwpt/modules/<name>/source/X.pas.
-      External-path deps (../../X, /abs/X) install via the existing
-      recursive copy because the link target could disappear / move
-      independently. Per-dep decision; AProjectRoot is the dir of the
-      root manifest. See ADR-0014 amendment §"Symlink/junction for
-      monorepo deps". }
-    if (AProjectRoot <> '')
-       and IsPathInside(AProjectRoot, LocalPath) then
-    begin
-      StagePath := MakeTmpPath(ATmpRoot, 'link-' + ADep.Name);
-      if CreateDirLink(StagePath, LocalPath) then
-      begin
-        if AtomicMoveDir(StagePath, AUnitDir) then
-          WriteLn('  linked ', ADep.Name)
-        else
-        begin
-          WipeDir(StagePath);
-          WriteLn(ErrOutput, '  warning: link commit failed for ', ADep.Name,
-            '; falling back to copy');
-          StageLocalCopy(' (link commit fallback)');
-        end;
-      end
-      else
-      begin
-        { Link creation failed (rare — Windows without junction
-          permission, FS that doesn't support links, etc). Fall back
-          to copy so the install still completes. The user sees both
-          the failure cue and the recovery. }
-        WriteLn(ErrOutput, '  warning: link failed for ', ADep.Name,
-          '; falling back to copy');
-        if DirectoryExists(StagePath) then
-          WipeDir(StagePath);
-        StageLocalCopy(' (link fallback)');
-      end;
-    end
-    else
-    begin
-      { External-path dep — always copy. }
-      StageLocalCopy('');
-    end;
+    { Every local/workspace dependency is a private copied candidate. The
+      fixed-point resolver filters and validates these exact bytes before
+      publication; no caller can opt back into a live project link. }
+    StageLocalCopy('');
     Exit(True);
   end;
 
@@ -1077,41 +892,58 @@ begin
     loopback origin must never persist into lwpt.lock, so AResolvedURL
     keeps the URL as constructed while URL below carries the rewrite. }
   AResolvedURL := URL;
-  URL := ApplyArchiveFetchOrigin(URL, OriginOverride);
-  NoHeaders := nil;
-  HTTPOptions := DefaultHTTPRequestOptions;
-  HTTPOptions.MaxResponseBodyBytes := MAX_ARCHIVE_RESPONSE_BYTES;
-  if OriginOverride <> '' then
+  FixtureRoot := SysUtils.GetEnvironmentVariable(
+    PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
+  { The ref fixture and archive-origin seams compose deliberately. A fixture
+    root alone remains a completely file-backed git-host fixture; an explicit
+    loopback archive origin keeps ref discovery deterministic while driving
+    the real archive transport boundary. }
+  if (FixtureRoot <> '') and (OriginOverride = '')
+     and (ADep.SrcKind = skGitHost) then
   begin
-    HTTPOptions.RequestTimeoutMilliseconds := ResolveArchiveFetchTimeout(
-      SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_TIMEOUT_ENV));
-    { A loopback fixture must not escape through a remote Location header. }
-    HTTPOptions.MaximumRedirects := 0;
+    Resp := Default(THTTPResponse);
+    LoadTestFixtureArchive(FixtureRoot, ADep.Name, AResolvedRef,
+      Resp.Body);
+    Resp.StatusCode := 200;
   end
   else
-    HTTPOptions.RequestTimeoutMilliseconds :=
-      ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;
-  { Every transport failure below the client (refused connection, read
-    timeout, truncated body, malformed response) arrives here as some
-    HTTPClient-shaped exception whose text names neither the dependency
-    nor what was being attempted. Normalising to EFetchError gives the
-    caller one exception type and one message shape to rely on. The
-    underlying text is appended rather than replaced so the narrow
-    connect/DNS detection the e2e suites use still matches. }
-  try
-    Resp := HTTPGet(URL, NoHeaders, HTTPOptions);
-  except
-    on E: EFetchError do
-      raise;
-    on E: Exception do
+  begin
+    URL := ApplyArchiveFetchOrigin(URL, OriginOverride);
+    NoHeaders := nil;
+    HTTPOptions := DefaultHTTPRequestOptions;
+    HTTPOptions.MaxResponseBodyBytes := MAX_ARCHIVE_RESPONSE_BYTES;
+    if OriginOverride <> '' then
+    begin
+      HTTPOptions.RequestTimeoutMilliseconds := ResolveArchiveFetchTimeout(
+        SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_TIMEOUT_ENV));
+      { A loopback fixture must not escape through a remote Location header. }
+      HTTPOptions.MaximumRedirects := 0;
+    end
+    else
+      HTTPOptions.RequestTimeoutMilliseconds :=
+        ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;
+    { Every transport failure below the client (refused connection, read
+      timeout, truncated body, malformed response) arrives here as some
+      HTTPClient-shaped exception whose text names neither the dependency
+      nor what was being attempted. Normalising to EFetchError gives the
+      caller one exception type and one message shape to rely on. The
+      underlying text is appended rather than replaced so the narrow
+      connect/DNS detection the e2e suites use still matches. }
+    try
+      Resp := HTTPGet(URL, NoHeaders, HTTPOptions);
+    except
+      on E: EFetchError do
+        raise;
+      on E: Exception do
+        raise EFetchError.CreateFmt(
+          'dependency "%s": archive fetch from %s failed: %s',
+          [ADep.Name, URL, E.Message]);
+    end;
+    if (Resp.StatusCode < 200) or (Resp.StatusCode >= 300) then
       raise EFetchError.CreateFmt(
-        'dependency "%s": archive fetch from %s failed: %s',
-        [ADep.Name, URL, E.Message]);
+        'dependency "%s": archive fetch from %s failed: HTTP %d %s',
+        [ADep.Name, URL, Resp.StatusCode, Resp.StatusText]);
   end;
-  if (Resp.StatusCode < 200) or (Resp.StatusCode >= 300) then
-    raise EFetchError.CreateFmt(
-      'dependency "%s": archive fetch from %s failed: HTTP %d %s',
-      [ADep.Name, URL, Resp.StatusCode, Resp.StatusText]);
 
   { Archive filename uses an escaped resolved ref for git-host sources,
     or the stable "url" tag for direct archive URLs. }
@@ -1524,6 +1356,9 @@ begin
           archiveHash   = sha256 of the cached tarball; '' for skLocal. }
       KV('source',       AResolved[i].SrcOriginal);
       KV('resolvedRef',  AResolved[i].Version);
+      KV('resolvedCommit', AResolved[i].CommitSHA);
+      KV('sourceIdentity', AResolved[i].SourceIdentity);
+      KV('constraintFingerprint', AResolved[i].ConstraintFingerprint);
       KV('resolvedURL',  AResolved[i].ResolvedURL);
       KV('computedHash', AResolved[i].Hash);
       KV('archiveHash',  AResolved[i].ArchiveHash);
@@ -1674,6 +1509,10 @@ begin
       Entry.Name        := Pair.Key;
       Entry.SrcOriginal := TomlStr(EntryNode, 'source',      '');
       Entry.Version     := TomlStr(EntryNode, 'resolvedRef', '');
+      Entry.CommitSHA   := TomlStr(EntryNode, 'resolvedCommit', '');
+      Entry.SourceIdentity := TomlStr(EntryNode, 'sourceIdentity', '');
+      Entry.ConstraintFingerprint := TomlStr(EntryNode,
+        'constraintFingerprint', '');
       Entry.ResolvedURL := TomlStr(EntryNode, 'resolvedURL', '');
       Entry.Hash        := TomlStr(EntryNode, 'computedHash', '');
       Entry.ArchiveHash := TomlStr(EntryNode, 'archiveHash',  '');
@@ -1729,9 +1568,15 @@ type
   TResolveNode = record
     Name        : string;
     Specs       : array of string;   { every VersionSpec seen for this name }
+    Kinds       : array of TVersionKind;
     Requirers   : array of string;   { parallel to Specs }
+    SourceIdentities: array of string; { canonical source for each requirement }
     Dep         : TDependency;       { the first source spec seen }
+    CustomSources: TCustomSourceArray;
     Version     : string;            { concrete (resolved ref or SHA) }
+    CommitSHA   : string;            { authoritative advertised identity }
+    SourceIdentity: string;
+    ConstraintFingerprint: string;
     ResolvedURL : string;            { actual archive URL fetched }
     UnitDir     : string;            { the dep's modules root (.lwpt/modules/<name>) }
     UnitSubdirs : array of string;   { from ChildMan.Units — relative paths
@@ -1741,11 +1586,285 @@ type
     Hash        : string;            { tree hash of UnitDir contents }
     ArchiveHash : string;            { sha256 of the .tar.gz; '' for skLocal }
     Archive     : string;            { path to the committed archive; '' for skLocal }
+    PublishedUnit, PublishedArchive: string;
+    UnitBackup, ArchiveBackup: string;
   end;
 
   TResolution = record
     Nodes : array of TResolveNode;
   end;
+
+  TPathRollback = record
+    OriginalPath: string;
+    BackupPath: string;
+  end;
+  TPathRollbackArray = array of TPathRollback;
+
+procedure AppendRollbackFailure(var AFailures: string;
+  const AMessage: string);
+begin
+  if AMessage = '' then Exit;
+  if AFailures <> '' then AFailures := AFailures + LineEnding;
+  AFailures := AFailures + AMessage;
+end;
+
+function TryRollbackRestore(const ABackupPath, ADestination,
+  AFailureMessage: string; var AFailures: string): Boolean;
+begin
+  Result := False;
+  try
+    Result := AtomicRestorePath(ABackupPath, ADestination);
+    if not Result then AppendRollbackFailure(AFailures, AFailureMessage);
+  except
+    on E: Exception do
+      AppendRollbackFailure(AFailures,
+        AFailureMessage + ': ' + E.Message);
+  end;
+end;
+
+procedure WriteTransactionState(const ARollbackRoot, AState: string);
+var Lines: TStringList;
+begin
+  ForceDirectories(ARollbackRoot);
+  Lines := TStringList.Create;
+  try
+    Lines.Add(AState);
+    AtomicWriteText(ARollbackRoot + '/transaction.state',
+      ARollbackRoot, Lines);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure MarkTransactionCommitted(const ARollbackRoot: string);
+var Lines: TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.Add('committed');
+    AtomicWriteText(ARollbackRoot + '/transaction.committed',
+      ARollbackRoot, Lines);
+  finally
+    Lines.Free;
+  end;
+end;
+
+function RollbackRootHasMarkers(const ARollbackRoot: string): Boolean;
+var SR: TSearchRec;
+begin
+  Result := SysUtils.FindFirst(ARollbackRoot + '/*.rollback',
+    faAnyFile, SR) = 0;
+  if Result then SysUtils.FindClose(SR);
+end;
+
+function RecoverRollbackRoot(const ARollbackRoot: string): string;
+var
+  SR: TSearchRec;
+  BackupPath, Destination: string;
+  MarkerIndex: Integer;
+  Markers: TStringList;
+begin
+  Result := '';
+  if FileExists(ARollbackRoot + '/transaction.committed') then
+  begin
+    WipeDir(ARollbackRoot);
+    Exit;
+  end;
+  Markers := TStringList.Create;
+  try
+    Markers.Sorted := True;
+    if SysUtils.FindFirst(ARollbackRoot + '/*.rollback', faAnyFile, SR) = 0 then
+      try
+        repeat
+          if (SR.Name = '.') or (SR.Name = '..') then Continue;
+          Markers.Add(ARollbackRoot + '/'
+            + Copy(SR.Name, 1, Length(SR.Name) - Length('.rollback')));
+        until SysUtils.FindNext(SR) <> 0;
+      finally
+        SysUtils.FindClose(SR);
+      end;
+    for MarkerIndex := 0 to Markers.Count - 1 do
+    begin
+      BackupPath := Markers[MarkerIndex];
+      try
+        Destination := AtomicRetainedDestination(BackupPath);
+        if Destination = '' then
+          AppendRollbackFailure(Result,
+            'rollback metadata is unreadable: ' + BackupPath)
+        else
+          TryRollbackRestore(BackupPath, Destination,
+            'failed to recover "' + Destination + '" from '
+            + BackupPath, Result);
+      except
+        on E: Exception do
+          AppendRollbackFailure(Result,
+            'failed to inspect rollback entry "' + BackupPath
+            + '": ' + E.Message);
+      end;
+    end;
+  finally
+    Markers.Free;
+  end;
+  if Result = '' then WipeDir(ARollbackRoot);
+end;
+
+function RecoverPendingTransactions(const ATmpRoot: string): string;
+var SR: TSearchRec; Candidate, Failures: string;
+begin
+  Result := '';
+  if not DirectoryExists(ATmpRoot) then Exit;
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ATmpRoot) + '*',
+       faAnyFile, SR) = 0 then
+    try
+      repeat
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        if (SR.Attr and faDirectory) = 0 then Continue;
+        Candidate := IncludeTrailingPathDelimiter(ATmpRoot) + SR.Name;
+        if not FileExists(Candidate + '/transaction.state') then Continue;
+        Failures := RecoverRollbackRoot(Candidate);
+        if Failures <> '' then
+          AppendRollbackFailure(Result, Failures);
+      until SysUtils.FindNext(SR) <> 0;
+    finally
+      SysUtils.FindClose(SR);
+    end;
+end;
+
+function CollectOrphanedPackagePaths(
+  const AOldLock, ANewLock: array of TResolved;
+  const AModulesRoot, AArchivesRoot: string;
+  out APaths: TStringArray): Integer; forward;
+
+function CanonicalDependencyIdentity(const ADep: TDependency;
+  const ACustomSources: TCustomSourceArray;
+  const AProjectRoot: string): string;
+var Custom: TCustomSource; Policy: TStringList; k: Integer;
+  LocalPath, RootPath: string;
+begin
+  case ADep.SrcKind of
+    skLocal:
+    begin
+      LocalPath := ResolveProjectPath(AProjectRoot, ADep.SrcLocator);
+      RootPath := ExpandFileName(AProjectRoot);
+      { Workspace discovery normalizes its local paths to absolute paths.
+        Preserve a checkout-independent identity for every source below the
+        project root regardless of how the dependency was spelled. }
+      if (RootPath <> '') and IsPathInside(RootPath, LocalPath) then
+        LocalPath := ExtractRelativePath(
+          IncludeTrailingPathDelimiter(RootPath), LocalPath);
+      Result := 'local|' + StringReplace(LocalPath, '\', '/', [rfReplaceAll]);
+    end;
+    skWorkspace:
+      Result := 'workspace|' + LowerCase(ADep.Name);
+    skURL:
+      Result := 'url|' + ADep.SrcLocator;
+    skGitHost:
+    begin
+      Result := 'git|' + GitRepoURL(ADep, ACustomSources);
+      if ADep.SrcHost = hkCustom then
+      begin
+        ResolveCustomSourceOrDie(ADep, ACustomSources, Custom);
+        Result := Result + '|' + Custom.ArchiveTemplate;
+      end;
+    end;
+  end;
+  Policy := TStringList.Create;
+  try
+    Policy.Sorted := True;
+    Policy.CaseSensitive := True;
+    { Manifest intake canonicalizes each extraction-policy set once. Keep
+      that exact case-sensitive representation for artifact identity. }
+    Policy.Duplicates := dupIgnore;
+    for k := 0 to High(ADep.IncludeGlobs) do
+      Policy.Add('include=' + ADep.IncludeGlobs[k]);
+    for k := 0 to High(ADep.ExcludeGlobs) do
+      Policy.Add('exclude=' + ADep.ExcludeGlobs[k]);
+    for k := 0 to Policy.Count - 1 do Result := Result + '|' + Policy[k];
+  finally
+    Policy.Free;
+  end;
+end;
+
+function FindWorkspace(const AWorkspaces: TWorkspaceArray;
+  const AName: string; out AWorkspace: TWorkspace): Boolean;
+var k: Integer;
+begin
+  for k := 0 to High(AWorkspaces) do
+    if SameText(AWorkspaces[k].Name, AName) then
+    begin
+      AWorkspace := AWorkspaces[k];
+      Exit(True);
+    end;
+  AWorkspace := Default(TWorkspace);
+  Result := False;
+end;
+
+function WorkspaceNames(const AWorkspaces: TWorkspaceArray): string;
+var k: Integer;
+begin
+  Result := '';
+  for k := 0 to High(AWorkspaces) do
+  begin
+    if Result <> '' then Result := Result + ', ';
+    Result := Result + AWorkspaces[k].Name;
+  end;
+  if Result = '' then Result := '(none - no [workspaces] declared)';
+end;
+
+procedure NormalizeWorkspaceDependency(const ADep: TDependency;
+  const ARequiredBy: string; const AWorkspaces: TWorkspaceArray;
+  out ANormalized: TDependency);
+var Workspace: TWorkspace;
+begin
+  ANormalized := ADep;
+  if ADep.SrcKind <> skWorkspace then Exit;
+  if not FindWorkspace(AWorkspaces, ADep.Name, Workspace) then
+    raise EManifestError.CreateFmt(
+      'workspace dependency "%s" required by %s was not found; '
+      + 'available workspaces: %s',
+      [ADep.Name, ARequiredBy, WorkspaceNames(AWorkspaces)]);
+  case ADep.VersionKind of
+    vkNone:;
+    vkSemverRange, vkSemverExact:
+      if (Valid(Workspace.Version, DefaultSemverOptions) = '')
+         or not Satisfies(Workspace.Version, ADep.VersionSpec,
+           DefaultSemverOptions) then
+        raise EManifestError.CreateFmt(
+          'workspace dependency "%s" required by %s wants "%s", '
+          + 'but discovered workspace version is "%s"',
+          [ADep.Name, ARequiredBy, ADep.VersionSpec, Workspace.Version]);
+  else
+    raise EManifestError.CreateFmt(
+      'workspace dependency "%s" required by %s uses unsupported '
+      + 'version requirement "%s"',
+      [ADep.Name, ARequiredBy, ADep.VersionSpec]);
+  end;
+  { A workspace requirement and its auto-discovered root node describe one
+    candidate. Preserve the requirement fields for diagnostics/fingerprints,
+    but normalize the source to the discovered local path before identity
+    comparison, selection, and staging. }
+  ANormalized.SrcKind := skLocal;
+  ANormalized.SrcLocator := Workspace.Path;
+end;
+
+function ConstraintFingerprintForNode(const ANode: TResolveNode;
+  const AProjectRoot: string): string;
+var Lines: TStringList; k: Integer;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.Sorted := True;
+    Lines.Duplicates := dupAccept;
+    for k := 0 to High(ANode.Specs) do
+      Lines.Add(IntToStr(Ord(ANode.Kinds[k])) + '|' + ANode.Specs[k]
+        + '|' + ANode.Requirers[k]);
+    Lines.Add('source|' + CanonicalDependencyIdentity(ANode.Dep,
+      ANode.CustomSources, AProjectRoot));
+    Result := 'sha256:' + SHA256Hex(BytesOf(Lines.Text));
+  finally
+    Lines.Free;
+  end;
+end;
 
 function FindNode(var R: TResolution; const AName: string): Integer;
 var i: Integer;
@@ -1758,7 +1877,8 @@ end;
 { Record a constraint on a package, creating its node if new.
   Returns the node index and whether the node was newly created. }
 function TouchNode(var R: TResolution; const ADep: TDependency;
-  const ARequiredBy: string; out AIsNew: Boolean): Integer;
+  const ARequiredBy, ASourceIdentity: string;
+  out AIsNew: Boolean): Integer;
 var idx, n: Integer;
 begin
   idx := FindNode(R, ADep.Name);
@@ -1774,73 +1894,14 @@ begin
   end;
   n := Length(R.Nodes[idx].Specs);
   SetLength(R.Nodes[idx].Specs, n + 1);
+  SetLength(R.Nodes[idx].Kinds, n + 1);
   SetLength(R.Nodes[idx].Requirers, n + 1);
+  SetLength(R.Nodes[idx].SourceIdentities, n + 1);
   R.Nodes[idx].Specs[n]     := ADep.VersionSpec;
+  R.Nodes[idx].Kinds[n]     := ADep.VersionKind;
   R.Nodes[idx].Requirers[n] := ARequiredBy;
+  R.Nodes[idx].SourceIdentities[n] := ASourceIdentity;
   Result := idx;
-end;
-
-{ Conflict check — FPC has one global unit namespace; two
-  different concrete versions of the same package cannot coexist.
-
-  Currently we use a conservative rule: every constraint pair on the
-  same package must be jointly satisfiable. The check is delegated
-  to SemVer when both sides are SemVer-shaped (range / exact), and
-  falls back to identical-string match for literal tags + SHAs.
-  A smarter resolver (mixed bucket support, multi-version selection)
-  is v1.x work; the conservative rule errs on the side of failing
-  loudly so projects don't silently get the wrong version. }
-procedure CheckNodeConstraints(const ANode: TResolveNode);
-
-  procedure Conflict(i, j: Integer; const AReason: string);
-  begin
-    Flush(Output);
-    WriteLn(ErrOutput);
-    WriteLn(ErrOutput, 'CONFLICT on package "', ANode.Name, '":');
-    WriteLn(ErrOutput, '  ', ANode.Requirers[i], ' wants "',
-            ANode.Specs[i], '"');
-    WriteLn(ErrOutput, '  ', ANode.Requirers[j], ' wants "',
-            ANode.Specs[j], '"');
-    WriteLn(ErrOutput, '  ', AReason);
-    WriteLn(ErrOutput,
-      '  FPC has one global unit namespace — both cannot coexist.');
-    raise EManifestError.CreateFmt(
-      'unresolvable version conflict on "%s"', [ANode.Name]);
-  end;
-
-  function IsSemverShaped(const S: string): Boolean;
-  begin
-    Result := (ValidRange(S, DefaultSemverOptions) <> '')
-           or ((S <> '') and (S[1] <> 'v') and (S[1] <> 'V')
-               and (Valid(S, DefaultSemverOptions) <> ''));
-  end;
-
-var i, j: Integer;
-begin
-  for i := 0 to High(ANode.Specs) do
-    for j := i + 1 to High(ANode.Specs) do
-    begin
-      { Empty spec (vkNone — local sources) always agrees with itself. }
-      if (ANode.Specs[i] = '') and (ANode.Specs[j] = '') then Continue;
-      if (ANode.Specs[i] = '') or (ANode.Specs[j] = '') then
-        Conflict(i, j,
-          'one side is unversioned (local source) and one is not');
-
-      if IsSemverShaped(ANode.Specs[i]) and IsSemverShaped(ANode.Specs[j]) then
-      begin
-        if not RangeIntersects(ANode.Specs[i], ANode.Specs[j],
-                               DefaultSemverOptions) then
-          Conflict(i, j, 'SemVer specs do not intersect.');
-      end
-      else
-      begin
-        { Non-SemVer specs (literal tag / SHA / mixed). Require
-          identical strings — anything else is ambiguous. }
-        if ANode.Specs[i] <> ANode.Specs[j] then
-          Conflict(i, j,
-            'literal-tag / SHA / mixed specs must match exactly.');
-      end;
-    end;
 end;
 
 { Locate a module's own manifest inside its extracted/copied tree.
@@ -1928,20 +1989,13 @@ begin
   end;
 end;
 
-{ The BFS itself. Mutates R; fetches+extracts each new package unless
-  Frozen. ModulesRoot is where extracted dep trees land
-  (.lwpt/modules/<dep>/ by default); ArchivesRoot is where the source
-  .tar.gz files land (.lwpt/archives/<dep>-<version>.tar.gz by default);
-  TmpRoot is the Atomic-write staging dir (.lwpt/tmp/ by default).
-
-  Frozen behavior (post-amendment): skip network fetch. If the dep's modules
-  dir is already present (zero-install committed state), proceed using
+{ Frozen graph walk. If the dep's modules dir is already present
+  (zero-install committed state), proceed using
   it as-is — caller (CmdInstall) then does the hash verification pass.
   Missing modules dir → EFetchError naming the dep + recovery hint. }
-procedure ResolveGraph(const ARootMan: TManifest; var R: TResolution;
-  const AModulesRoot, AArchivesRoot, ATmpRoot, AProjectRoot: string;
-  const AWorkspaces: TWorkspaceArray;
-  AFrozen: Boolean);
+procedure ResolveGraphFrozen(const ARootMan: TManifest; var R: TResolution;
+  const AModulesRoot, AProjectRoot: string;
+  const AWorkspaces: TWorkspaceArray);
 type
   TWorkItem = record
     Dep: TDependency;
@@ -1954,8 +2008,10 @@ var
   i, idx: Integer;
   IsNew : Boolean;
   Item  : TWorkItem;
+  NormalizedDep: TDependency;
+  ItemSourceIdentity: string;
   UnitDir, Archive, ArchiveHash, ResolvedURL, ChildManifestPath,
-    ManifestRelDir, ExtractTmp : string;
+    ManifestRelDir: string;
   ChildMan : TManifest;
 
   procedure CopyCustomSources(const ASrc: TCustomSourceArray;
@@ -1990,86 +2046,41 @@ begin
     Item := Queue[Head];
     Inc(Head);
 
-    idx := TouchNode(R, Item.Dep, Item.RequiredBy, IsNew);
+    NormalizeWorkspaceDependency(Item.Dep, Item.RequiredBy,
+      AWorkspaces, NormalizedDep);
+    Item.Dep := NormalizedDep;
+    ItemSourceIdentity := CanonicalDependencyIdentity(Item.Dep,
+      Item.CustomSources, AProjectRoot);
+    idx := TouchNode(R, Item.Dep, Item.RequiredBy,
+      ItemSourceIdentity, IsNew);
     if not IsNew then
-      Continue;   { already fetched & expanded; constraint recorded above }
+    begin
+      if CanonicalDependencyIdentity(R.Nodes[idx].Dep,
+           R.Nodes[idx].CustomSources, AProjectRoot)
+         <> CanonicalDependencyIdentity(Item.Dep,
+           Item.CustomSources, AProjectRoot) then
+        raise EVerifyError.CreateFmt(
+          '[frozen] requirements for "%s" name different canonical '
+          + 'sources. Run `lwpt install` without --frozen to resolve '
+          + 'the graph again.', [Item.Dep.Name]);
+      Continue;   { already expanded; constraint recorded above }
+    end;
+    CopyCustomSources(Item.CustomSources, R.Nodes[idx].CustomSources);
 
     UnitDir := IncludeTrailingPathDelimiter(AModulesRoot) + Item.Dep.Name;
     Archive := '';
     ArchiveHash := '';
     ResolvedURL := '';
 
-    if AFrozen then
-    begin
-      if not DirectoryExists(UnitDir) then
-        raise EFetchError.CreateFmt(
-          '[frozen] missing extracted module for "%s" at %s '
-          + '(required by %s). Run `lwpt install` without --frozen to '
-          + 'fetch, or restore the committed .lwpt/modules tree.',
-          [Item.Dep.Name, UnitDir, Item.RequiredBy]);
-      WriteLn('  [frozen] ', Item.Dep.Name,
-              '  (required by ', Item.RequiredBy, ')');
-      { Read back the committed archive path/hash so the caller's
-        verification pass can compare to the lockfile. Local-source
-        deps have no archive; ArchiveHash stays ''. The frozen path
-        does not do tag resolution — it trusts the committed
-        modules tree + lockfile pairing. }
-      if Item.Dep.SrcKind <> skLocal then
-      begin
-        { We can't reconstruct the archive name without the resolved
-          ref; in frozen mode we look up the only matching file under
-          the archives dir. }
-        // For now: derive from lockfile during verification
-        // (CmdInstall.VerifyAgainstLockfile does the hash compare).
-      end;
-    end
-    else
-    begin
-      { Resolve the concrete ref before fetching. For vkNone (local
-        sources), ResolveDepRef returns ''. Custom prefixes are looked
-        up against the [sources] table from the manifest that declared
-        this dependency. }
-      R.Nodes[idx].Version := ResolveDepRef(Item.Dep,
-        Item.CustomSources);
-      WriteLn('  fetching ', Item.Dep.Name, ' @ ', R.Nodes[idx].Version,
-              '  (required by ', Item.RequiredBy, ')');
-      FetchToCache(Item.Dep, R.Nodes[idx].Version,
-                   AModulesRoot, AArchivesRoot, ATmpRoot, AProjectRoot,
-                   Item.CustomSources, AWorkspaces,
-                   UnitDir, Archive, ArchiveHash, ResolvedURL);
-      if (Archive <> '') and FileExists(Archive) then
-      begin
-        if (Length(Item.Dep.IncludeGlobs) > 0)
-           or (Length(Item.Dep.ExcludeGlobs) > 0) then
-          WriteLn('    filtering files via include/exclude globs');
-        { Extract into a per-dep tmp dir, then atomic-move the whole
-          extracted tree to .lwpt/modules/<dep>/. A crash mid-extract
-          leaves the orphan in tmp (reaped by lwpt repair or the
-          next install's startup pass), never a half-populated
-          modules tree. include/exclude globs are applied AFTER
-          extraction but BEFORE the atomic move so the modules dir
-          only ever contains the filtered file set. }
-        ExtractTmp := MakeTmpPath(ATmpRoot, 'extract-' + Item.Dep.Name);
-        ForceDirectories(ExtractTmp);
-        try
-          ExtractArchive(Archive, ExtractTmp, '');
-          ApplyIncludeExclude(ExtractTmp,
-            Item.Dep.IncludeGlobs, Item.Dep.ExcludeGlobs);
-          AtomicMoveDir(ExtractTmp, UnitDir);
-        except
-          { Leave the partial in tmp so it's inspectable + clean it
-            up via repair / next install startup. Re-raise as
-            EExtractError with context. }
-          on E: Exception do
-          begin
-            WipeDir(ExtractTmp);
-            raise EExtractError.CreateFmt(
-              'extract failed for "%s" from %s: %s',
-              [Item.Dep.Name, Archive, E.Message]);
-          end;
-        end;
-      end;
-    end;
+    if not DirectoryExists(UnitDir) then
+      raise EFetchError.CreateFmt(
+        '[frozen] missing extracted module for "%s" at %s '
+        + '(required by %s). Run `lwpt install` without --frozen to '
+        + 'fetch, or restore the committed .lwpt/modules tree.',
+        [Item.Dep.Name, UnitDir, Item.RequiredBy]);
+    WriteLn('  [frozen] ', Item.Dep.Name,
+            '  (required by ', Item.RequiredBy, ')');
+    { Archive metadata is recovered from the lockfile during verification. }
 
     R.Nodes[idx].UnitDir     := UnitDir;
     R.Nodes[idx].Archive     := Archive;
@@ -2111,6 +2122,674 @@ begin
         Enqueue(ChildMan.Deps[i], Item.Dep.Name, ChildMan.CustomSources);
     end;
   end;
+end;
+
+{ Materializing resolution is deliberately separate from the frozen walk.
+  Every discovery candidate lives below APlanRoot. A round expands exactly
+  one selected candidate per package, then recomputes selections from the
+  complete accumulated constraint set. Changed selections start a fresh
+  round; a repeated selection vector is an ambiguous oscillation, not an
+  invitation to backtrack through lower parent versions. }
+procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
+  var R: TResolution; const AModulesRoot, AArchivesRoot, ATmpRoot,
+  ARollbackRoot, AProjectRoot: string;
+  const AWorkspaces: TWorkspaceArray);
+type
+  TSelectionState = record
+    Name, SourceIdentity, RefName, CommitSHA: string;
+  end;
+  TSelectionStateArray = array of TSelectionState;
+  TRefCacheEntry = record
+    RepoURL: string;
+    Refs: TGitRefArray;
+  end;
+  TRefCache = array of TRefCacheEntry;
+var
+  Previous, Desired: TSelectionStateArray;
+  RefCache: TRefCache;
+  SeenSignatures: TStringList;
+  PlanRoot, PlanModules, PlanArchives, PlanScratch: string;
+  Round, i, j, idx, Head: Integer;
+  Queue: array of Integer;
+  ChildMan: TManifest;
+  ChildManifestPath, ManifestRelDir, ExtractTmp: string;
+  UnitDir, Archive, ArchiveHash, ResolvedURL, CacheArchive: string;
+  FetchRef, RollbackFailures: string;
+  SelectionDeferred, Stable: Boolean;
+
+  procedure CopyCustomSources(const ASrc: TCustomSourceArray;
+    out ADst: TCustomSourceArray);
+  var k: Integer;
+  begin
+    SetLength(ADst, Length(ASrc));
+    for k := 0 to High(ASrc) do ADst[k] := ASrc[k];
+  end;
+
+  function SourceKey(const ADep: TDependency;
+    const ACustomSources: TCustomSourceArray): string;
+  begin
+    Result := CanonicalDependencyIdentity(ADep, ACustomSources,
+      AProjectRoot);
+  end;
+
+  function NodeConstraintFingerprint(const ANode: TResolveNode): string;
+  begin
+    Result := ConstraintFingerprintForNode(ANode, AProjectRoot);
+  end;
+
+  procedure RaiseNodeConflict(const ANode: TResolveNode;
+    const AExtraRequirer, AExtraSpec, AReason: string);
+  var k: Integer; MessageText: string;
+  begin
+    MessageText := 'unresolvable version conflict on "' + ANode.Name
+      + '":' + LineEnding
+      + '  canonical source: '
+      + SourceKey(ANode.Dep, ANode.CustomSources) + LineEnding;
+    for k := 0 to High(ANode.Specs) do
+      MessageText := MessageText + '  ' + ANode.Requirers[k] + ' wants "'
+        + ANode.Specs[k] + '"' + LineEnding;
+    if AExtraRequirer <> '' then
+      MessageText := MessageText + '  ' + AExtraRequirer + ' wants "'
+        + AExtraSpec + '"' + LineEnding;
+    raise EManifestError.Create(MessageText + '  ' + AReason);
+  end;
+
+  function NodeHasSourceConflict(const ANode: TResolveNode): Boolean;
+  var k: Integer;
+  begin
+    Result := False;
+    for k := 1 to High(ANode.SourceIdentities) do
+      if ANode.SourceIdentities[k] <> ANode.SourceIdentities[0] then
+        Exit(True);
+  end;
+
+  procedure RaiseSourceConflict(const ANode: TResolveNode);
+  var k: Integer; MessageText: string;
+  begin
+    MessageText := 'unresolvable source conflict on "' + ANode.Name
+      + '":' + LineEnding;
+    for k := 0 to High(ANode.Specs) do
+      MessageText := MessageText + '  ' + ANode.Requirers[k] + ' wants "'
+        + ANode.Specs[k] + '" from canonical source: '
+        + ANode.SourceIdentities[k] + LineEnding;
+    raise EManifestError.Create(MessageText
+      + '  requirements name different canonical sources; source '
+      + 'equivalence is never guessed');
+  end;
+
+  function AddRequirement(var AResolution: TResolution;
+    const ADep: TDependency; const ARequiredBy: string;
+    const ACustomSources: TCustomSourceArray): Integer;
+  var IsNew: Boolean; NormalizedDep: TDependency; Identity: string;
+  begin
+    NormalizeWorkspaceDependency(ADep, ARequiredBy, AWorkspaces,
+      NormalizedDep);
+    Identity := SourceKey(NormalizedDep, ACustomSources);
+    Result := TouchNode(AResolution, NormalizedDep, ARequiredBy,
+      Identity, IsNew);
+    if IsNew then
+      CopyCustomSources(ACustomSources,
+        AResolution.Nodes[Result].CustomSources);
+  end;
+
+  function CachedRefs(const ANode: TResolveNode): TGitRefArray;
+  var RepoURL: string; k, n: Integer;
+  begin
+    RepoURL := GitRepoURL(ANode.Dep, ANode.CustomSources);
+    for k := 0 to High(RefCache) do
+      if RefCache[k].RepoURL = RepoURL then Exit(RefCache[k].Refs);
+    WriteLn('  resolving tags for ', ANode.Name, '...');
+    n := Length(RefCache);
+    SetLength(RefCache, n + 1);
+    RefCache[n].RepoURL := RepoURL;
+    RefCache[n].Refs := ListRemoteRefs(RepoURL);
+    Result := RefCache[n].Refs;
+  end;
+
+  function FindSelection(const AStates: TSelectionStateArray;
+    const AName: string): Integer;
+  var k: Integer;
+  begin
+    Result := -1;
+    for k := 0 to High(AStates) do
+      if SameText(AStates[k].Name, AName) then Exit(k);
+  end;
+
+  function NodeWorkspaceVersion(const ANode: TResolveNode;
+    out AVersion: string): Boolean;
+  var Workspace: TWorkspace; NodePath, WorkspacePath: string;
+  begin
+    AVersion := '';
+    Result := False;
+    if (ANode.Dep.SrcKind <> skLocal)
+       or not FindWorkspace(AWorkspaces, ANode.Name, Workspace) then
+      Exit;
+    NodePath := ExcludeTrailingPathDelimiter(
+      ResolveProjectPath(AProjectRoot, ANode.Dep.SrcLocator));
+    WorkspacePath := ExcludeTrailingPathDelimiter(
+      ExpandFileName(Workspace.Path));
+    {$IFDEF MSWINDOWS}
+    Result := SameText(NodePath, WorkspacePath);
+    {$ELSE}
+    Result := NodePath = WorkspacePath;
+    {$ENDIF}
+    if Result then AVersion := Workspace.Version;
+  end;
+
+  function SelectNode(const ANode: TResolveNode): TSelectionState;
+  var
+    Requirements: TResolverRequirementArray;
+    Refs: TGitRefArray;
+    Selection: TResolverSelection;
+    k, Longest: Integer;
+    AllSHA, HasWorkspaceConstraint: Boolean;
+    WorkspaceVersion: string;
+  begin
+    Result := Default(TSelectionState);
+    Result.Name := ANode.Name;
+    Result.SourceIdentity := SourceKey(ANode.Dep, ANode.CustomSources);
+    if ANode.Dep.SrcKind <> skGitHost then
+    begin
+      HasWorkspaceConstraint := False;
+      if NodeWorkspaceVersion(ANode, WorkspaceVersion) then
+      begin
+        for k := 0 to High(ANode.Kinds) do
+          HasWorkspaceConstraint := HasWorkspaceConstraint
+            or (ANode.Kinds[k] <> vkNone);
+        if HasWorkspaceConstraint then Result.RefName := WorkspaceVersion;
+        Exit;
+      end;
+      for k := 0 to High(ANode.Kinds) do
+        if ANode.Kinds[k] <> vkNone then
+          RaiseNodeConflict(ANode, '', '',
+            'only git-host sources support version constraints');
+      Exit;
+    end;
+
+    AllSHA := Length(ANode.Kinds) > 0;
+    Longest := 0;
+    for k := 0 to High(ANode.Kinds) do
+    begin
+      AllSHA := AllSHA and (ANode.Kinds[k] = vkCommitSha);
+      if Length(ANode.Specs[k]) > Length(ANode.Specs[Longest]) then
+        Longest := k;
+    end;
+    if AllSHA then
+    begin
+      for k := 0 to High(ANode.Specs) do
+        if not SameText(ANode.Specs[k],
+             Copy(ANode.Specs[Longest], 1, Length(ANode.Specs[k]))) then
+          RaiseNodeConflict(ANode, '', '',
+            'SHA requirements do not identify the same commit');
+      Result.RefName := ANode.Specs[Longest];
+      Result.CommitSHA := ANode.Specs[Longest];
+      Exit;
+    end;
+
+    SetLength(Requirements, Length(ANode.Specs));
+    for k := 0 to High(Requirements) do
+    begin
+      Requirements[k].Spec := ANode.Specs[k];
+      Requirements[k].Kind := ANode.Kinds[k];
+      Requirements[k].Requirer := ANode.Requirers[k];
+    end;
+    Refs := CachedRefs(ANode);
+    try
+      Selection := SelectHighestRef(ANode.Name, Requirements, Refs);
+    except
+      on E: EResolverConflict do
+        raise EManifestError.Create(E.Message + LineEnding
+          + '  canonical source: '
+          + SourceKey(ANode.Dep, ANode.CustomSources));
+    end;
+    Result.RefName := Selection.RefName;
+    Result.CommitSHA := Selection.CommitSHA;
+  end;
+
+  procedure EnqueueNode(AIndex: Integer);
+  var n: Integer;
+  begin
+    for n := 0 to High(Queue) do
+      if Queue[n] = AIndex then Exit;
+    n := Length(Queue);
+    SetLength(Queue, n + 1);
+    Queue[n] := AIndex;
+  end;
+
+  function SelectionSignature(const AStates: TSelectionStateArray): string;
+  var k: Integer;
+  begin
+    Result := '';
+    for k := 0 to High(AStates) do
+      Result := Result + LowerCase(AStates[k].Name) + '='
+        + AStates[k].RefName + '@' + AStates[k].CommitSHA + ';';
+  end;
+
+  function RollbackPublished: string;
+  var k: Integer;
+  begin
+    Result := '';
+    for k := High(R.Nodes) downto 0 do
+    begin
+      if R.Nodes[k].PublishedUnit <> '' then
+      begin
+        if TryRollbackRestore(R.Nodes[k].UnitBackup,
+             R.Nodes[k].PublishedUnit,
+             'failed to roll back module "' + R.Nodes[k].Name + '"',
+             Result) then
+          R.Nodes[k].UnitBackup := '';
+      end;
+      if R.Nodes[k].PublishedArchive <> '' then
+      begin
+        if TryRollbackRestore(R.Nodes[k].ArchiveBackup,
+             R.Nodes[k].PublishedArchive,
+             'failed to roll back archive "' + R.Nodes[k].Name + '"',
+             Result) then
+          R.Nodes[k].ArchiveBackup := '';
+      end;
+    end;
+  end;
+
+  procedure PublishPlan;
+  var
+    k, w: Integer;
+    FinalUnitDir, FinalArchive, LivePath, RecheckPath: string;
+  begin
+    { Revalidate every mutable local/workspace input immediately before
+      the first committed move. A changed source restarts at the command
+      level without exposing a plan built from mixed snapshots. }
+    for k := 0 to High(R.Nodes) do
+      if R.Nodes[k].Dep.SrcKind in [skLocal, skWorkspace] then
+      begin
+        if R.Nodes[k].Dep.SrcKind = skLocal then
+          LivePath := ResolveProjectPath(AProjectRoot,
+            R.Nodes[k].Dep.SrcLocator)
+        else
+        begin
+          LivePath := '';
+          for w := 0 to High(AWorkspaces) do
+            if SameText(AWorkspaces[w].Name, R.Nodes[k].Name) then
+            begin
+              LivePath := AWorkspaces[w].Path;
+              Break;
+            end;
+        end;
+        RecheckPath := MakeTmpPath(PlanScratch,
+          'preflight-' + R.Nodes[k].Name);
+        ForceDirectories(RecheckPath);
+        CopyDirTree(LivePath, RecheckPath);
+        ApplyIncludeExclude(RecheckPath,
+          R.Nodes[k].Dep.IncludeGlobs, R.Nodes[k].Dep.ExcludeGlobs);
+        try
+      if SameText(SysUtils.GetEnvironmentVariable(
+               PROJECT_NAME + '_TEST_STALE_LOCAL_SNAPSHOT'),
+             R.Nodes[k].Name) then
+            R.Nodes[k].Hash := 'sha256:injected-stale-snapshot';
+          if HashTree(RecheckPath) <> R.Nodes[k].Hash then
+            raise EFetchError.CreateFmt(
+              'local/workspace source "%s" changed during resolution; '
+              + 'no dependency state was published, retry install',
+              [R.Nodes[k].Name]);
+        finally
+          WipeDir(RecheckPath);
+        end;
+      end;
+
+    for k := 0 to High(R.Nodes) do
+    begin
+      FinalUnitDir := IncludeTrailingPathDelimiter(AModulesRoot)
+        + R.Nodes[k].Name;
+      R.Nodes[k].PublishedUnit := FinalUnitDir;
+      if not AtomicRetainPath(FinalUnitDir, ARollbackRoot,
+           'module-' + R.Nodes[k].Name, R.Nodes[k].UnitBackup) then
+        raise EFetchError.CreateFmt(
+          'failed to retain rollback copy for module "%s"',
+          [R.Nodes[k].Name]);
+      if SameText(SysUtils.GetEnvironmentVariable(
+           PROJECT_NAME + '_TEST_HALT_AFTER_MODULE_RETAIN'),
+         R.Nodes[k].Name) then
+        Halt(87);
+      FinalArchive := '';
+      if not (R.Nodes[k].Dep.SrcKind in [skLocal, skWorkspace]) then
+      begin
+        FinalArchive := ArchivePathForRef(AArchivesRoot, R.Nodes[k].Name,
+          R.Nodes[k].Dep.SrcKind, R.Nodes[k].Version);
+        R.Nodes[k].PublishedArchive := FinalArchive;
+        if not AtomicRetainPath(FinalArchive, ARollbackRoot,
+             'archive-' + R.Nodes[k].Name,
+             R.Nodes[k].ArchiveBackup) then
+          raise EFetchError.CreateFmt(
+            'failed to retain rollback copy for archive "%s"',
+            [R.Nodes[k].Name]);
+        if (R.Nodes[k].Archive <> '')
+           and not AtomicMoveFile(R.Nodes[k].Archive, FinalArchive) then
+          raise EFetchError.CreateFmt(
+            'failed to publish archive for "%s"', [R.Nodes[k].Name]);
+      end;
+      { Publish the exact candidate tree whose filtered bytes and child
+        manifest drove resolution and preflight validation. Never reread a
+        mutable live local/workspace source during the commit phase. }
+      if not AtomicMoveDir(R.Nodes[k].UnitDir, FinalUnitDir) then
+        raise EFetchError.CreateFmt(
+          'failed to publish module tree for "%s"', [R.Nodes[k].Name]);
+      R.Nodes[k].UnitDir := FinalUnitDir;
+      if R.Nodes[k].Dep.SrcKind in [skLocal, skWorkspace] then
+        R.Nodes[k].Archive := ''
+      else
+        R.Nodes[k].Archive := FinalArchive;
+      R.Nodes[k].Hash := HashTree(FinalUnitDir);
+      if (SysUtils.GetEnvironmentVariable(
+          PROJECT_NAME + '_TEST_FAIL_PUBLISH_AFTER') <>
+          '') and (StrToIntDef(SysUtils.GetEnvironmentVariable(
+          PROJECT_NAME + '_TEST_FAIL_PUBLISH_AFTER'), -1) = k + 1) then
+        raise EFetchError.CreateFmt(
+          'injected publication failure after package %d', [k + 1]);
+      if (SysUtils.GetEnvironmentVariable(
+          PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER') <>
+          '') and (StrToIntDef(SysUtils.GetEnvironmentVariable(
+          PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER'), -1) = k + 1) then
+        Halt(86);
+    end;
+  end;
+
+begin
+  PlanRoot := MakeTmpPath(ATmpRoot, 'resolver-plan');
+  PlanModules := PlanRoot + '/modules';
+  PlanArchives := PlanRoot + '/archives';
+  PlanScratch := PlanRoot + '/scratch';
+  Previous := nil;
+  RefCache := nil;
+  SeenSignatures := TStringList.Create;
+  try
+    Round := 0;
+    repeat
+      Inc(Round);
+      if Round > 128 then
+        raise EManifestError.Create(
+          'dependency resolution did not reach a fixed point');
+      if DirectoryExists(PlanModules) then WipeDir(PlanModules);
+      if DirectoryExists(PlanArchives) then WipeDir(PlanArchives);
+      if DirectoryExists(PlanScratch) then WipeDir(PlanScratch);
+      ForceDirectories(PlanModules);
+      ForceDirectories(PlanArchives);
+      ForceDirectories(PlanScratch);
+      R := Default(TResolution);
+      Queue := nil;
+
+      { Collect all root requirements before selecting any root candidate. }
+      for i := 0 to High(ARootMan.Deps) do
+        AddRequirement(R, ARootMan.Deps[i], ARootMan.Name,
+          ARootMan.CustomSources);
+      for i := 0 to High(R.Nodes) do EnqueueNode(i);
+
+      Head := 0;
+      while Head < Length(Queue) do
+      begin
+        idx := Queue[Head];
+        Inc(Head);
+        SelectionDeferred := False;
+        if NodeHasSourceConflict(R.Nodes[idx]) then
+          SelectionDeferred := True;
+        try
+          if not SelectionDeferred then
+          begin
+            j := FindSelection(Previous, R.Nodes[idx].Name);
+            if (j >= 0) and (Previous[j].SourceIdentity =
+                 SourceKey(R.Nodes[idx].Dep,
+                   R.Nodes[idx].CustomSources)) then
+            begin
+              R.Nodes[idx].Version := Previous[j].RefName;
+              R.Nodes[idx].CommitSHA := Previous[j].CommitSHA;
+            end
+            else
+            begin
+              Desired := nil;
+              SetLength(Desired, 1);
+              Desired[0] := SelectNode(R.Nodes[idx]);
+              R.Nodes[idx].Version := Desired[0].RefName;
+              R.Nodes[idx].CommitSHA := Desired[0].CommitSHA;
+            end;
+          end;
+        except
+          on E: EManifestError do
+            SelectionDeferred := True;
+        end;
+        { A terminal selection error must be emitted only after the rest of
+          the reachable queue has contributed its requirements. This node
+          cannot become satisfiable as constraints accumulate, so it needs no
+          candidate expansion; the complete-set SelectNode pass below emits
+          the final diagnostic after every independent node was visited. }
+        if SelectionDeferred then Continue;
+
+        WriteLn('  staging ', R.Nodes[idx].Name, ' @ ',
+          R.Nodes[idx].Version, ' for resolver round ', Round);
+        FetchRef := R.Nodes[idx].CommitSHA;
+        if FetchRef = '' then FetchRef := R.Nodes[idx].Version;
+        CacheArchive := PlanRoot + '/candidate-cache/'
+          + SHA256Hex(BytesOf(SourceKey(R.Nodes[idx].Dep,
+          R.Nodes[idx].CustomSources) + '|'
+          + FetchRef)) + '.tar.gz';
+        if (R.Nodes[idx].Dep.SrcKind in [skGitHost, skURL])
+           and FileExists(CacheArchive) then
+        begin
+          UnitDir := IncludeTrailingPathDelimiter(PlanModules)
+            + R.Nodes[idx].Name;
+          Archive := ArchivePathForRef(PlanArchives, R.Nodes[idx].Name,
+            R.Nodes[idx].Dep.SrcKind, FetchRef);
+          ForceDirectories(ExtractFileDir(Archive));
+          if not CopyFileContent(CacheArchive, Archive) then
+            raise EFetchError.CreateFmt(
+              'failed to restore cached resolver candidate "%s"',
+              [R.Nodes[idx].Name]);
+          ArchiveHash := 'sha256:' + SHA256File(Archive);
+          ResolvedURL := FetchURL(R.Nodes[idx].Dep, FetchRef,
+            R.Nodes[idx].CustomSources);
+        end
+        else
+        begin
+          FetchToCache(R.Nodes[idx].Dep, FetchRef,
+            PlanModules, PlanArchives, PlanScratch, AProjectRoot,
+            R.Nodes[idx].CustomSources, AWorkspaces,
+            UnitDir, Archive, ArchiveHash, ResolvedURL);
+          if (Archive <> '') and FileExists(Archive) then
+          begin
+            ForceDirectories(ExtractFileDir(CacheArchive));
+            if not CopyFileContent(Archive, CacheArchive) then
+              raise EFetchError.CreateFmt(
+                'failed to cache resolver candidate "%s"',
+                [R.Nodes[idx].Name]);
+          end;
+        end;
+        if (Archive <> '') and FileExists(Archive) then
+        begin
+          ExtractTmp := MakeTmpPath(PlanScratch,
+            'extract-' + R.Nodes[idx].Name);
+          ForceDirectories(ExtractTmp);
+          try
+            ExtractArchive(Archive, ExtractTmp, '');
+            ApplyIncludeExclude(ExtractTmp,
+              R.Nodes[idx].Dep.IncludeGlobs,
+              R.Nodes[idx].Dep.ExcludeGlobs);
+            if not AtomicMoveDir(ExtractTmp, UnitDir) then
+              raise EExtractError.CreateFmt(
+                'failed to stage module tree for "%s"',
+                [R.Nodes[idx].Name]);
+          except
+            on E: Exception do
+            begin
+              if DirectoryExists(ExtractTmp) then WipeDir(ExtractTmp);
+              raise EExtractError.CreateFmt(
+                'extract failed for "%s" from %s: %s',
+                [R.Nodes[idx].Name, Archive, E.Message]);
+            end;
+          end;
+        end;
+        if (Archive = '') and DirectoryExists(UnitDir)
+           and ((Length(R.Nodes[idx].Dep.IncludeGlobs) > 0)
+             or (Length(R.Nodes[idx].Dep.ExcludeGlobs) > 0)) then
+          ApplyIncludeExclude(UnitDir,
+            R.Nodes[idx].Dep.IncludeGlobs,
+            R.Nodes[idx].Dep.ExcludeGlobs);
+        R.Nodes[idx].UnitDir := UnitDir;
+        R.Nodes[idx].Archive := Archive;
+        R.Nodes[idx].ArchiveHash := ArchiveHash;
+        R.Nodes[idx].ResolvedURL := ResolvedURL;
+        if DirectoryExists(UnitDir) then
+          R.Nodes[idx].Hash := HashTree(UnitDir);
+
+        if FindModuleManifest(UnitDir, ManifestRelDir) then
+        begin
+          ChildManifestPath := IncludeTrailingPathDelimiter(UnitDir);
+          if ManifestRelDir <> '' then
+            ChildManifestPath := ChildManifestPath + ManifestRelDir + '/';
+          ChildManifestPath := ChildManifestPath + MANIFEST_FILE;
+          ChildMan := LoadManifest(ChildManifestPath, False);
+          SetLength(R.Nodes[idx].UnitSubdirs, Length(ChildMan.Units));
+          for i := 0 to High(ChildMan.Units) do
+            if ManifestRelDir = '' then
+              R.Nodes[idx].UnitSubdirs[i] := ChildMan.Units[i]
+            else
+              R.Nodes[idx].UnitSubdirs[i] := ManifestRelDir + '/'
+                + ChildMan.Units[i];
+          for i := 0 to High(ChildMan.Deps) do
+          begin
+            j := AddRequirement(R, ChildMan.Deps[i], R.Nodes[idx].Name,
+              ChildMan.CustomSources);
+            EnqueueNode(j);
+          end;
+        end;
+      end;
+
+      SetLength(Desired, Length(R.Nodes));
+      Stable := True;
+      for i := 0 to High(R.Nodes) do
+      begin
+        if NodeHasSourceConflict(R.Nodes[i]) then
+          RaiseSourceConflict(R.Nodes[i]);
+        Desired[i] := SelectNode(R.Nodes[i]);
+        R.Nodes[i].SourceIdentity := Desired[i].SourceIdentity;
+        R.Nodes[i].ConstraintFingerprint :=
+          NodeConstraintFingerprint(R.Nodes[i]);
+        Stable := Stable
+          and (Desired[i].RefName = R.Nodes[i].Version)
+          and SameText(Desired[i].CommitSHA, R.Nodes[i].CommitSHA);
+      end;
+      if not Stable then
+      begin
+        if SeenSignatures.IndexOf(SelectionSignature(Desired)) >= 0 then
+          raise EManifestError.Create(
+            'dependency resolution oscillates between highest-version '
+            + 'candidate graphs; backtracking is intentionally disabled');
+        SeenSignatures.Add(SelectionSignature(Desired));
+        Previous := Desired;
+      end;
+    until Stable;
+
+    try
+      PublishPlan;
+    except
+      on E: Exception do
+      begin
+        RollbackFailures := RollbackPublished;
+        if RollbackFailures <> '' then
+          raise EExtractError.Create(E.Message + LineEnding
+            + 'rollback failures:' + LineEnding + RollbackFailures);
+        raise;
+      end;
+    end;
+  finally
+    SeenSignatures.Free;
+    if DirectoryExists(PlanRoot) then WipeDir(PlanRoot);
+  end;
+end;
+
+function RollbackResolutionPublication(var R: TResolution): string;
+var i: Integer;
+begin
+  Result := '';
+  for i := High(R.Nodes) downto 0 do
+  begin
+    if R.Nodes[i].PublishedUnit <> '' then
+    begin
+      if TryRollbackRestore(R.Nodes[i].UnitBackup,
+           R.Nodes[i].PublishedUnit,
+           'failed to roll back module "' + R.Nodes[i].Name + '"',
+           Result) then
+        R.Nodes[i].UnitBackup := '';
+    end;
+    if R.Nodes[i].PublishedArchive <> '' then
+    begin
+      if TryRollbackRestore(R.Nodes[i].ArchiveBackup,
+           R.Nodes[i].PublishedArchive,
+           'failed to roll back archive "' + R.Nodes[i].Name + '"',
+           Result) then
+        R.Nodes[i].ArchiveBackup := '';
+    end;
+  end;
+end;
+
+procedure FinalizeResolutionPublication(var R: TResolution);
+var i: Integer;
+begin
+  for i := 0 to High(R.Nodes) do
+  begin
+    if R.Nodes[i].UnitBackup <> '' then
+      AtomicDiscardRetainedPath(R.Nodes[i].UnitBackup);
+    if R.Nodes[i].ArchiveBackup <> '' then
+      AtomicDiscardRetainedPath(R.Nodes[i].ArchiveBackup);
+    R.Nodes[i].UnitBackup := '';
+    R.Nodes[i].ArchiveBackup := '';
+  end;
+end;
+
+procedure RetainOrphanedPackagePaths(
+  const AOldLock, ANewLock: array of TResolved;
+  const AModulesRoot, AArchivesRoot, ATmpRoot: string;
+  out ARollbacks: TPathRollbackArray);
+var Paths: TStringArray; i, n: Integer; Backup: string;
+begin
+  ARollbacks := nil;
+  CollectOrphanedPackagePaths(AOldLock, ANewLock,
+    AModulesRoot, AArchivesRoot, Paths);
+  for i := 0 to High(Paths) do
+  begin
+    Backup := '';
+    if not AtomicRetainPath(Paths[i], ATmpRoot,
+         'orphan-' + IntToStr(i + 1), Backup) then
+      raise EExtractError.CreateFmt(
+        'failed to retain rollback copy for orphan "%s"', [Paths[i]]);
+    if Backup = '' then Continue;
+    n := Length(ARollbacks);
+    SetLength(ARollbacks, n + 1);
+    ARollbacks[n].OriginalPath := Paths[i];
+    ARollbacks[n].BackupPath := Backup;
+    if not AtomicRemovePath(Paths[i]) then
+      raise EExtractError.CreateFmt(
+        'failed to prune retained orphan "%s"', [Paths[i]]);
+    WriteLn('pruned ', Paths[i]);
+  end;
+end;
+
+function RollbackRetainedPaths(var ARollbacks: TPathRollbackArray): string;
+var i: Integer;
+begin
+  Result := '';
+  for i := High(ARollbacks) downto 0 do
+    if TryRollbackRestore(ARollbacks[i].BackupPath,
+         ARollbacks[i].OriginalPath,
+         'failed to restore pruned path "'
+         + ARollbacks[i].OriginalPath + '"', Result) then
+      ARollbacks[i].BackupPath := '';
+  if Result = '' then ARollbacks := nil;
+end;
+
+procedure DiscardRetainedPaths(var ARollbacks: TPathRollbackArray);
+var i: Integer;
+begin
+  for i := 0 to High(ARollbacks) do
+    if ARollbacks[i].BackupPath <> '' then
+      AtomicDiscardRetainedPath(ARollbacks[i].BackupPath);
+  ARollbacks := nil;
 end;
 
 { Size of a file by path, as a string; '0' if absent. }
@@ -2231,8 +2910,10 @@ end;
   cached archive; a name whose resolved ref changed loses the stale old
   archive. Lives here (not in the command units) because the archive
   naming scheme is ArchivePathForRef's private knowledge. }
-function PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved;
-  const AModulesRoot, AArchivesRoot: string): Integer;
+function CollectOrphanedPackagePaths(
+  const AOldLock, ANewLock: array of TResolved;
+  const AModulesRoot, AArchivesRoot: string;
+  out APaths: TStringArray): Integer;
 
   function FindNewEntry(const AName: string; out AOut: TResolved): Boolean;
   var k: Integer;
@@ -2246,11 +2927,15 @@ function PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved;
     Result := False;
   end;
 
-  procedure DeleteArchiveIfPresent(const APath: string);
+  procedure AddPath(const APath: string);
+  var k, n: Integer;
   begin
-    if (APath <> '') and FileExists(APath) then
-      if SysUtils.DeleteFile(APath) then
-        WriteLn('pruned ', APath);
+    if APath = '' then Exit;
+    for k := 0 to High(APaths) do
+      if APaths[k] = APath then Exit;
+    n := Length(APaths);
+    SetLength(APaths, n + 1);
+    APaths[n] := APath;
   end;
 
 var
@@ -2258,6 +2943,7 @@ var
   Kept: TResolved;
   ModDir, OldArchive, NewArchive: string;
 begin
+  APaths := nil;
   Result := 0;
   for i := 0 to High(AOldLock) do
   begin
@@ -2286,24 +2972,35 @@ begin
         NewArchive := ArchivePathForRef(AArchivesRoot, Kept.Name,
           Kept.SrcKind, Kept.Version);
       if OldArchive <> NewArchive then
-        DeleteArchiveIfPresent(OldArchive);
+        AddPath(OldArchive);
       Continue;
     end;
 
-    { Gone from the graph — reap the extracted tree (or monorepo link;
-      WipeDir removes a symlink/junction without traversing it) + the
-      cached archive. }
+    { Gone from the graph — reap the extracted snapshot + cached archive. }
     ModDir := IncludeTrailingPathDelimiter(AModulesRoot) + AOldLock[i].Name;
-    if DirectoryExists(ModDir) then
-    begin
-      WipeDir(ModDir);
-      WriteLn('pruned ', ModDir);
-    end;
+    AddPath(ModDir);
     if AOldLock[i].SrcKind <> skLocal then
-      DeleteArchiveIfPresent(ArchivePathForRef(AArchivesRoot,
-        AOldLock[i].Name, AOldLock[i].SrcKind, AOldLock[i].Version));
+      AddPath(ArchivePathForRef(AArchivesRoot, AOldLock[i].Name,
+        AOldLock[i].SrcKind, AOldLock[i].Version));
     Inc(Result);
   end;
+end;
+
+function PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved;
+  const AModulesRoot, AArchivesRoot: string): Integer;
+var Paths: TStringArray; i: Integer;
+begin
+  Result := CollectOrphanedPackagePaths(AOldLock, ANewLock,
+    AModulesRoot, AArchivesRoot, Paths);
+  for i := 0 to High(Paths) do
+    if FileExists(Paths[i]) or DirectoryExists(Paths[i])
+       or IsDirSymlinkOrJunction(Paths[i]) then
+    begin
+      if not AtomicRemovePath(Paths[i]) then
+        raise EExtractError.CreateFmt(
+          'failed to prune committed package path "%s"', [Paths[i]]);
+      WriteLn('pruned ', Paths[i]);
+    end;
 end;
 
 { The shared transaction body. AManifestLines <> nil is the manifest-
@@ -2323,9 +3020,20 @@ var
   Resolved : TResolvedArray;
   LockEntries, OldLock : TResolvedArray;
   Lock : TInstallLock;
-  ModulesRoot, ArchivesRoot, TmpRoot, CfgPath, LockPath, LockfilePath : string;
-  i, j : Integer;
+  ModulesRoot, ArchivesRoot, TmpRoot, CfgPath, LockPath, LockfilePath,
+    ManifestPath, RollbackRoot, RecoveryFailures, RollbackFailures : string;
+  i, j, k : Integer;
   Frozen : Boolean;
+  FrozenLock: TResolved;
+  LockFound: Boolean;
+  LockedVersionKind: TVersionKind;
+  LockedVersionValue, CurrentSourceIdentity,
+    CurrentConstraintFingerprint: string;
+  HasCommitConstraint: Boolean;
+  PublicationPending: Boolean;
+  LockfileBackup, CfgBackup, ManifestBackup: string;
+  OrphanRollbacks: TPathRollbackArray;
+  TestCorruption: TStringList;
 begin
   Man := AContext.Manifest;
   Frozen := AMode = itmFrozenVerify;
@@ -2336,11 +3044,44 @@ begin
   CfgPath      := ResolveProjectPath(AContext.ProjectRoot, ResolveCfgFile(Man));
   LockPath     := ResolveProjectPath(AContext.ProjectRoot, INSTALL_LOCK);
   LockfilePath := ResolveProjectPath(AContext.ProjectRoot, LWPT.Core.LOCKFILE);
+  ManifestPath := ResolveProjectPath(AContext.ProjectRoot, AContext.Path);
 
   Lock := TInstallLock.Create(LockPath);
   try
-    if DirectoryExists(TmpRoot) then
-      WipeDir(TmpRoot);
+    PublicationPending := False;
+    LockfileBackup := '';
+    CfgBackup := '';
+    ManifestBackup := '';
+    RollbackRoot := '';
+    OrphanRollbacks := nil;
+    try
+    if not Frozen then
+    begin
+      { Recover an interrupted writer before deleting any tmp state. Frozen
+        verification is strictly read-only and never enters this path. }
+      RecoveryFailures := RecoverPendingTransactions(TmpRoot);
+      if RecoveryFailures <> '' then
+        raise EExtractError.Create('could not recover interrupted install:'
+          + LineEnding + RecoveryFailures);
+      if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
+      ForceDirectories(TmpRoot);
+      RollbackRoot := MakeTmpPath(TmpRoot, 'install-transaction');
+      WriteTransactionState(RollbackRoot, 'pending');
+      { Every rollback snapshot belongs to one journaled transaction root.
+        Retention copies and validates the old value without removing it. }
+      if not AtomicRetainPath(LockfilePath, RollbackRoot,
+           'lockfile', LockfileBackup) then
+        raise ELockfileError.Create(
+          'failed to retain lockfile rollback copy');
+      if not AtomicRetainPath(CfgPath, RollbackRoot,
+           'cfg', CfgBackup) then
+        raise EExtractError.Create('failed to retain cfg rollback copy');
+      if AManifestLines <> nil then
+        if not AtomicRetainPath(ManifestPath, RollbackRoot,
+             'manifest', ManifestBackup) then
+          raise EManifestError.Create(
+            'failed to retain manifest rollback copy');
+    end;
 
     { Mutation flow: snapshot the pre-transaction lock entries for the
       orphan diff before WriteLock overwrites them. }
@@ -2350,11 +3091,18 @@ begin
 
     R := Default(TResolution);
     WriteLn('resolving dependency graph (', Length(Man.Deps), ' direct)...');
-    ResolveGraph(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
-                 AContext.ProjectRoot, Man.Workspaces, Frozen);
-
-    for i := 0 to High(R.Nodes) do
-      CheckNodeConstraints(R.Nodes[i]);
+    if Frozen then
+    begin
+      ResolveGraphFrozen(Man, R, ModulesRoot, AContext.ProjectRoot,
+                         Man.Workspaces);
+    end
+    else
+    begin
+      ResolveGraphFixedPoint(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
+                             RollbackRoot, AContext.ProjectRoot,
+                             Man.Workspaces);
+      PublicationPending := True;
+    end;
     WriteLn('resolved ', Length(R.Nodes), ' packages, no conflicts.');
 
     SetLength(Resolved, Length(R.Nodes));
@@ -2363,6 +3111,10 @@ begin
       Resolved[i] := Default(TResolved);
       Resolved[i].Name        := R.Nodes[i].Name;
       Resolved[i].Version     := R.Nodes[i].Version;
+      Resolved[i].CommitSHA   := R.Nodes[i].CommitSHA;
+      Resolved[i].SourceIdentity := R.Nodes[i].SourceIdentity;
+      Resolved[i].ConstraintFingerprint :=
+        R.Nodes[i].ConstraintFingerprint;
       Resolved[i].SrcOriginal := R.Nodes[i].Dep.SrcOriginal;
       Resolved[i].SrcKind     := R.Nodes[i].Dep.SrcKind;
       Resolved[i].SrcHost     := R.Nodes[i].Dep.SrcHost;
@@ -2386,8 +3138,101 @@ begin
       LockEntries := LoadLockfile(LockfilePath);
       for i := 0 to High(Resolved) do
       begin
-        if Resolved[i].SrcKind = skLocal then Continue;
-        FillFrozenArchiveHash(Resolved[i], LockEntries, ArchivesRoot);
+        LockFound := False;
+        FrozenLock := Default(TResolved);
+        for k := 0 to High(LockEntries) do
+          if SameText(LockEntries[k].Name, Resolved[i].Name) then
+          begin
+            FrozenLock := LockEntries[k];
+            LockFound := True;
+            Break;
+          end;
+        if not LockFound then Continue;
+        CurrentSourceIdentity := CanonicalDependencyIdentity(
+          R.Nodes[i].Dep, R.Nodes[i].CustomSources,
+          AContext.ProjectRoot);
+        CurrentConstraintFingerprint := ConstraintFingerprintForNode(
+          R.Nodes[i], AContext.ProjectRoot);
+        Resolved[i].SourceIdentity := CurrentSourceIdentity;
+        Resolved[i].ConstraintFingerprint := CurrentConstraintFingerprint;
+        if FrozenLock.SourceIdentity <> '' then
+        begin
+          if CurrentSourceIdentity <> FrozenLock.SourceIdentity then
+            raise EVerifyError.CreateFmt(
+              '[frozen] source or extraction policy changed for "%s". '
+              + 'Run `lwpt install` without --frozen to resolve again.',
+              [Resolved[i].Name]);
+        end
+        else if FrozenLock.SrcOriginal <> Resolved[i].SrcOriginal then
+          raise EVerifyError.CreateFmt(
+            '[frozen] legacy v3 source evidence is ambiguous for "%s". '
+            + 'Run `lwpt install` without --frozen to regenerate the '
+            + 'machine-written lockfile; do not edit it.',
+            [Resolved[i].Name]);
+        if (FrozenLock.ConstraintFingerprint <> '')
+           and (CurrentConstraintFingerprint <>
+             FrozenLock.ConstraintFingerprint) then
+          raise EVerifyError.CreateFmt(
+            '[frozen] accumulated constraints changed for "%s". '
+            + 'Run `lwpt install` without --frozen to resolve again.',
+            [Resolved[i].Name]);
+        Resolved[i].Version := FrozenLock.Version;
+        Resolved[i].CommitSHA := FrozenLock.CommitSHA;
+        HasCommitConstraint := False;
+        for j := 0 to High(R.Nodes[i].Kinds) do
+          HasCommitConstraint := HasCommitConstraint
+            or (R.Nodes[i].Kinds[j] = vkCommitSha);
+        if (Resolved[i].SrcKind = skGitHost)
+           and (Resolved[i].CommitSHA = '') then
+        begin
+          ParseVersionSpec(FrozenLock.Version, LockedVersionKind,
+            LockedVersionValue);
+          if LockedVersionKind = vkCommitSha then
+            Resolved[i].CommitSHA := LockedVersionValue
+          else if HasCommitConstraint then
+            raise EVerifyError.CreateFmt(
+              '[frozen] legacy v3 lock entry "%s" combines a mutable '
+              + 'or named ref with a SHA constraint but records no '
+              + 'authoritative commit identity. Run `lwpt install` '
+              + 'without --frozen to regenerate the machine-written '
+              + 'lockfile; do not edit it.', [Resolved[i].Name]);
+        end;
+        for j := 0 to High(R.Nodes[i].Kinds) do
+          case R.Nodes[i].Kinds[j] of
+            vkSemverRange:
+              if not Satisfies(StripVPrefix(FrozenLock.Version),
+                   R.Nodes[i].Specs[j], DefaultSemverOptions) then
+                raise EVerifyError.CreateFmt(
+                  '[frozen] locked ref "%s" no longer satisfies "%s" '
+                  + 'for "%s"', [FrozenLock.Version,
+                  R.Nodes[i].Specs[j], Resolved[i].Name]);
+            vkSemverExact:
+              if (FrozenLock.Version <> R.Nodes[i].Specs[j])
+                 and (FrozenLock.Version <> 'v' + R.Nodes[i].Specs[j]) then
+                raise EVerifyError.CreateFmt(
+                  '[frozen] locked ref "%s" does not satisfy exact "%s" '
+                  + 'for "%s"', [FrozenLock.Version,
+                  R.Nodes[i].Specs[j], Resolved[i].Name]);
+            vkCommitSha:
+              if not SameText(R.Nodes[i].Specs[j],
+                   Copy(Resolved[i].CommitSHA, 1,
+                     Length(R.Nodes[i].Specs[j]))) then
+                raise EVerifyError.CreateFmt(
+                  '[frozen] locked commit does not satisfy SHA "%s" '
+                  + 'for "%s"', [R.Nodes[i].Specs[j], Resolved[i].Name]);
+            vkLiteralTag:
+              if (FrozenLock.ConstraintFingerprint = '')
+                 and (FrozenLock.Version <> R.Nodes[i].Specs[j]) then
+                raise EVerifyError.CreateFmt(
+                  '[frozen] legacy v3 locked ref "%s" does not prove '
+                  + 'literal ref "%s" for "%s". Run `lwpt install` '
+                  + 'without --frozen to regenerate authoritative '
+                  + 'identity evidence.', [FrozenLock.Version,
+                  R.Nodes[i].Specs[j], Resolved[i].Name]);
+            vkNone:;
+          end;
+        if Resolved[i].SrcKind <> skLocal then
+          FillFrozenArchiveHash(Resolved[i], LockEntries, ArchivesRoot);
       end;
       VerifyAgainstLockfile(Resolved, LockEntries);
       WriteLn('[frozen] ', Length(Resolved),
@@ -2401,20 +3246,90 @@ begin
     end;
 
     WriteLock(LockfilePath, TmpRoot, Resolved);
+    if SysUtils.GetEnvironmentVariable(
+      PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE') = '1' then
+    begin
+      if SysUtils.GetEnvironmentVariable(
+        PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR') <> '' then
+        for i := 0 to High(R.Nodes) do
+          if SameText(R.Nodes[i].Name,
+               SysUtils.GetEnvironmentVariable(
+                 PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR'))
+             and (R.Nodes[i].UnitBackup <> '') then
+          begin
+            ForceDirectories(R.Nodes[i].UnitBackup);
+            TestCorruption := TStringList.Create;
+            try
+              TestCorruption.Add('corrupt');
+              TestCorruption.SaveToFile(
+                R.Nodes[i].UnitBackup + '/corrupt.txt');
+            finally
+              TestCorruption.Free;
+            end;
+          end;
+      raise ELockfileError.Create(
+        'injected failure after lockfile publication');
+    end;
     WriteCfg(CfgPath, TmpRoot, Resolved, Man, AContext.ProjectRoot);
     WriteLn('wrote ', LWPT.Core.LOCKFILE, ' (', Length(Resolved),
             ' packages) and ', CfgPath);
 
     if AManifestLines <> nil then
     begin
-      AtomicWriteText(ExpandFileName(AContext.Path), TmpRoot, AManifestLines);
-      PruneOrphanedPackages(OldLock, Resolved, ModulesRoot, ArchivesRoot);
+      { Retain stale committed graph paths before publishing the manifest.
+        The manifest is the last fallible publication step: after it lands,
+        only best-effort tmp cleanup remains. }
+      RetainOrphanedPackagePaths(OldLock, Resolved, ModulesRoot,
+        ArchivesRoot, RollbackRoot, OrphanRollbacks);
+      if SysUtils.GetEnvironmentVariable(
+           PROJECT_NAME + '_TEST_FAIL_AFTER_ORPHAN_RETAIN') = '1' then
+        raise EExtractError.Create(
+          'injected failure after orphan retention');
+      AtomicWriteText(ManifestPath, TmpRoot, AManifestLines);
     end;
 
     Result.PackageCount := Length(Resolved);
     Result.LockfilePath := LockfilePath;
     Result.CfgPath := CfgPath;
     Result.Resolved := Resolved;
+    MarkTransactionCommitted(RollbackRoot);
+    FinalizeResolutionPublication(R);
+    PublicationPending := False;
+    DiscardRetainedPaths(OrphanRollbacks);
+    AtomicDiscardRetainedPath(LockfileBackup);
+    AtomicDiscardRetainedPath(CfgBackup);
+    if ManifestBackup <> '' then
+      AtomicDiscardRetainedPath(ManifestBackup);
+    if DirectoryExists(RollbackRoot) then WipeDir(RollbackRoot);
+    except
+      on E: Exception do
+      begin
+        RollbackFailures := '';
+        if PublicationPending then
+          AppendRollbackFailure(RollbackFailures,
+            RollbackResolutionPublication(R));
+        AppendRollbackFailure(RollbackFailures,
+          RollbackRetainedPaths(OrphanRollbacks));
+        if LockfileBackup <> '' then
+          TryRollbackRestore(LockfileBackup, LockfilePath,
+            'failed to restore lockfile', RollbackFailures);
+        if CfgBackup <> '' then
+          TryRollbackRestore(CfgBackup, CfgPath,
+            'failed to restore cfg', RollbackFailures);
+        if ManifestBackup <> '' then
+          TryRollbackRestore(ManifestBackup, ManifestPath,
+            'failed to restore manifest', RollbackFailures);
+        if (RollbackRoot <> '') and DirectoryExists(RollbackRoot)
+           and not RollbackRootHasMarkers(RollbackRoot) then
+          WipeDir(RollbackRoot);
+        if RollbackFailures <> '' then
+          raise EExtractError.Create(E.Message + LineEnding
+            + 'rollback failures:' + LineEnding + RollbackFailures
+            + LineEnding + 'validated recovery state retained under '
+            + RollbackRoot);
+        raise;
+      end;
+    end;
   finally
     Lock.Free;
   end;
@@ -2423,6 +3338,17 @@ end;
 function RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode): TInstallTransactionResult;
 begin
   Result := RunInstallTransactionCore(AContext, AMode, nil);
+end;
+
+procedure RecoverInterruptedInstall(const AContext: TManifestContext);
+var TmpRoot, Failures: string;
+begin
+  TmpRoot := ResolveProjectPath(AContext.ProjectRoot,
+    ResolveTmpDir(AContext.Manifest));
+  Failures := RecoverPendingTransactions(TmpRoot);
+  if Failures <> '' then
+    raise EExtractError.Create('could not recover interrupted install:'
+      + LineEnding + Failures);
 end;
 
 function RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;

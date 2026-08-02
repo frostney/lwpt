@@ -111,6 +111,12 @@ The graduation arc from [ADR-0003](./0003-vendored-permanent-fork-graduation.md)
 
 ## Amendment: Symlink/junction for monorepo deps
 
+> **Historical decision, superseded by
+> [ADR-0031](./0031-fixed-point-single-version-resolution.md):** materializing
+> installs now publish validated snapshots for local and workspace sources.
+> Link-aware cleanup and rollback remain necessary for committed trees made by
+> this earlier policy and for any preexisting link a failed install must restore.
+
 The initial extraction copied each `./packages/<name>/` tree into `.lwpt/modules/<name>/` byte-for-byte. After it landed, two observations made the case for a refinement:
 
 1. **Byte-for-byte duplication is wasteful.** Every file in `packages/httpclient/source/` exists twice on disk (`.lwpt/modules/httpclient/source/`). Edit-then-test cycles require a re-install for the cfg to pick up changes.
@@ -197,15 +203,15 @@ The first two waves (in-repo extraction + symlink/junction for monorepo deps) ma
 
   Each `include` glob walks the project tree relative to the root manifest's directory; each matching dir that contains a `lwpt.toml` becomes a workspace. `exclude` globs subtract from the set (same semantics as `[format].exclude`). Duplicate workspace names (two workspaces with the same `[package].name`) raise `EManifestError` at load.
 
-- **Auto-add to `Result.Deps`**: each discovered workspace not already present in the explicit `[dependencies]` block becomes a virtual local-path entry with `SrcKind = skLocal`, `SrcLocator = <resolved path>`, `SrcOriginal = "workspace:auto"` (for traceability — the lockfile shows the provenance). Explicit entries with the same name take precedence (the user's override wins). The resolver's BFS then handles them like any other local-path dep — symlinked via the ADR-0014-amendment-"Symlink/junction" path since they're inside the project root.
+- **Auto-add to `Result.Deps`**: each discovered workspace not already present in the explicit `[dependencies]` block becomes a virtual local-path entry with `SrcKind = skLocal`, `SrcLocator = <resolved path>`, `SrcOriginal = "workspace:auto"` (for traceability — the lockfile shows the provenance). Explicit entries with the same name take precedence (the user's override wins). This amendment originally published the node through its symlink/junction policy; ADR-0031 now publishes the same auto-discovered node as a validated snapshot.
 
-- **`workspace:<spec>` source protocol**: parsed by the existing `ParseDependencySourceCore` as a new `TSourceKind.skWorkspace` variant. The trailing spec (`*`, `^0.1.0`, exact version) lives in `TDependency.VersionSpec`; `SrcLocator` stays empty until the resolver fills it. At BFS time, `FetchToCache` looks up the dep name in `ARootMan.Workspaces` — found → rewrite to a synthetic `skLocal` dep against the workspace path + recurse into the standard local-install branch (which links). Not found → `EFetchError` naming the available workspaces.
+- **`workspace:<spec>` source protocol**: parsed by `ParseDependencySourceCore` as `TSourceKind.skWorkspace`. The trailing spec (`*`, `^0.1.0`, exact version) lives in `TDependency.VersionSpec`. ADR-0031 now normalizes the requirement through the root's discovered workspace mapping before canonical identity comparison, so it selects the same local candidate as the auto-discovered node and publishes one validated snapshot. A missing workspace remains a hard error naming the available workspaces.
 
 - **`AWorkspaces` plumbed through `ResolveGraph` → `FetchToCache`** signatures. `CmdInstall` passes `Man.Workspaces`. The workspace set is available wherever a dep gets fetched (both for root-declared `workspace:` deps and for sibling-workspace-declared `workspace:` deps, since the resolver visits both root and dep manifests).
 
-- **Migration of the repo's own `lwpt.toml`**: the four explicit `[dependencies]` local-path entries collapse to one `[workspaces] include = ["packages/*"]` line. Same on-disk shape after install (each workspace still symlinks into `.lwpt/modules/<name>/`); same cfg output.
+- **Migration of the repo's own `lwpt.toml`**: the four explicit `[dependencies]` local-path entries collapse to one `[workspaces] include = ["packages/*"]` line. The current ADR-0031 publication policy writes each workspace's validated snapshot into `.lwpt/modules/<name>/`; cfg output remains the same.
 
-- **Version-spec enforcement for `workspace:^X.Y.Z`** is deferred — today's implementation accepts the spec and resolves the workspace by name without checking the workspace's `[package].version` against the range. This is consistent with the resolver's pre-existing treatment of `skLocal` (version specs are forbidden for local-path deps). When the resolver grows version-vs-spec checks for workspaces, the `Result.Workspaces[i].Version` field is already populated for the comparison.
+- **Version-spec enforcement for `workspace:^X.Y.Z`** was deferred in this amendment. ADR-0031 completes it: every inter-workspace range or exact requirement is checked against the discovered workspace's `[package].version` while `workspace:*` remains unconstrained.
 
 - **Cycles between workspaces** are detected by the BFS's existing visited-set logic (TouchNode + IsNew guard). A `workspace:` cycle resolves to the same lookup multiple times but doesn't re-enqueue.
 
