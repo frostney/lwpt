@@ -1,0 +1,12 @@
+[req]
+distinguished_name = intermediate_name
+prompt = no
+
+[intermediate_name]
+CN = TransportSecurity Test Intermediate CA
+
+[intermediate_extensions]
+basicConstraints = critical,CA:true,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
