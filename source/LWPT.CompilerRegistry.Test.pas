@@ -8,6 +8,7 @@ uses
 
   LWPT.BuildRequest,
   LWPT.CompilerDriver,
+  LWPT.CompilerDriver.Lakon,
   LWPT.CompilerRegistry,
   LWPT.Core,
   LWPT.Manifest,
@@ -67,6 +68,9 @@ type
     procedure TestFactoryIdentityMismatchIsFreedAndRejected;
     procedure TestFactoryVersionMismatchIsRejected;
     procedure TestFactoryDriverIsFreedExactlyOnce;
+    procedure TestLakonProfileSelectsBuiltInAdapter;
+    procedure TestLakonEmbeddingFactoryReplacesAdapterAndFPCDefault;
+    procedure TestLakonBuiltInRejectsScripts;
   end;
 
 constructor TFactoryDriver.Create(const AOwner: TFactoryOwner;
@@ -320,6 +324,94 @@ begin
   end;
 end;
 
+procedure TLWPTCompilerRegistryTests.TestLakonProfileSelectsBuiltInAdapter;
+var
+  Driver: TLWPTCompilerDriver;
+  Manifest: TManifest;
+  Selection: TLWPTCompilerSelection;
+begin
+  Manifest := Default(TManifest);
+  Manifest.CompilerDefault := 'wasm';
+  SetLength(Manifest.CompilerProfiles, 1);
+  Manifest.CompilerProfiles[0] := Default(TLWPTCompilerProfile);
+  Manifest.CompilerProfiles[0].Name := 'wasm';
+  Manifest.CompilerProfiles[0].Driver := LAKON_COMPILER_ID;
+  Manifest.CompilerProfiles[0].Executable := 'tools/lakon';
+  Manifest.CompilerProfiles[0].VersionConstraint :=
+    '>=' + LAKON_MINIMUM_VERSION;
+  Selection := TLWPTCompilerSelection.Create(Manifest, GetCurrentDir);
+  try
+    Driver := Selection.DriverFor('');
+    Expect<string>(Driver.CompilerID).ToBe(LAKON_COMPILER_ID);
+    Expect<string>(Driver.ExecutableName)
+      .ToBe(ExpandFileName('tools/lakon'));
+    Expect<string>(Driver.VersionConstraint)
+      .ToBe('>=' + LAKON_MINIMUM_VERSION);
+  finally
+    Selection.Free;
+  end;
+end;
+
+procedure TLWPTCompilerRegistryTests.
+  TestLakonEmbeddingFactoryReplacesAdapterAndFPCDefault;
+var
+  Driver: TLWPTCompilerDriver;
+  Host: TLWPTCompilerHost;
+  Manifest: TManifest;
+  Selection: TLWPTCompilerSelection;
+begin
+  FFactoryOwner.CompilerIdentity := LAKON_COMPILER_ID;
+  FFactoryOwner.DestroyCount := 0;
+  Manifest := Default(TManifest);
+  Host := TLWPTCompilerHost.Create;
+  try
+    Host.DefaultProfile := LAKON_COMPILER_ID;
+    Host.RegisterFactory(LAKON_COMPILER_ID, FFactoryOwner.CreateDriver);
+    Selection := TLWPTCompilerSelection.Create(Manifest, GetCurrentDir, Host);
+    try
+      Driver := Selection.DriverFor('');
+      Expect<string>(Driver.CompilerID).ToBe(LAKON_COMPILER_ID);
+      Expect<string>(Driver.ExecutableName).ToBe('host-driver');
+    finally
+      Selection.Free;
+    end;
+    Expect<Integer>(FFactoryOwner.DestroyCount).ToBe(1);
+  finally
+    Host.Free;
+    FFactoryOwner.CompilerIdentity := 'embedded';
+  end;
+end;
+
+procedure TLWPTCompilerRegistryTests.TestLakonBuiltInRejectsScripts;
+var
+  Manifest: TManifest;
+  Raised: Boolean;
+  Selection: TLWPTCompilerSelection;
+begin
+  Manifest := Default(TManifest);
+  Manifest.CompilerDefault := 'wasm';
+  SetLength(Manifest.CompilerProfiles, 1);
+  Manifest.CompilerProfiles[0] := Default(TLWPTCompilerProfile);
+  Manifest.CompilerProfiles[0].Name := 'wasm';
+  Manifest.CompilerProfiles[0].Driver := LAKON_COMPILER_ID;
+  Manifest.CompilerProfiles[0].Script := 'tools/lakon-driver.pas';
+  Manifest.CompilerProfiles[0].VersionConstraint := '*';
+  Selection := TLWPTCompilerSelection.Create(Manifest, GetCurrentDir);
+  try
+    Raised := False;
+    try
+      Selection.DriverFor('');
+    except
+      on E: ELWPTCompilerDriverError do
+        Raised := Pos('cannot use script with built-in "lakon"',
+          E.Message) > 0;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+  finally
+    Selection.Free;
+  end;
+end;
+
 procedure TLWPTCompilerRegistryTests.TestBuiltInFallback;
 var
   Manifest: TManifest;
@@ -383,6 +475,12 @@ begin
     TestFactoryVersionMismatchIsRejected);
   Test('selection frees a factory driver exactly once',
     TestFactoryDriverIsFreedExactlyOnce);
+  Test('Lakon profiles select the built-in CLI adapter',
+    TestLakonProfileSelectsBuiltInAdapter);
+  Test('a Lakon embedding factory replaces the adapter and FPC default',
+    TestLakonEmbeddingFactoryReplacesAdapterAndFPCDefault);
+  Test('Lakon built-in profiles reject external scripts',
+    TestLakonBuiltInRejectsScripts);
 end;
 
 begin
