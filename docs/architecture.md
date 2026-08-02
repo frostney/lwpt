@@ -148,8 +148,10 @@ The flat-graph + hard-error policy is deliberate: FPC has one global unit namesp
   protection and exclude unrelated declared outputs, while explicit file inputs
   remain hashed.
 - **Test:** Each `*.Test.pas` is a self-contained program using
-  `TestingPascalLibrary`. Test workers share the selected project driver, validate each
-  neutral request, compile into private session paths, retain raw compiler
+  `TestingPascalLibrary`. `lwpt test` resolves the project-scoped compiler
+  driver once and shares it across every test worker; per-entry compiler
+  profiles apply to `lwpt build`, not to individual test files. Workers validate
+  each neutral request, compile into private session paths, retain raw compiler
   output, and store normalized build-result diagnostics before running a
   successful binary. See [`testing.md`](./testing.md).
 - **Worker coordination:** `LWPT.WorkerBudget` owns the per-user machine-capacity seam. Invocations register owner-guarded requests and acquire FIFO, reclaimable leases under a short cross-platform transaction lock. Nested LWPT subprocesses consume a one-shot opaque delegation that transfers one grant to the child's own guarded request instead of consuming another slot. `lwpt repair` reclaims requests only when their OS-held owner guard is absent; stale heartbeats remain diagnostic. Build and test scheduling consume this module in their own workstreams.
