@@ -56,10 +56,12 @@ type
   TLoopbackTLSServer = class(TThread)
   private
     FContext: TTransportSecurityServerContext;
+    FContextOwned: Boolean;
     FCiphertextBytesFed: QWord;
     FCiphertextBytesRead: QWord;
     FErrorMessage: string;
     FHandshakeElapsed: QWord;
+    FHandshakeCiphertextBytesRead: QWord;
     FHandshakeInputByteBudget: QWord;
     FHandshakeInputBudgetExceeded: Boolean;
     FHandshakeStartedAt: QWord;
@@ -70,6 +72,7 @@ type
     FPort: Word;
     FRequest: string;
     FScenario: TServerScenario;
+    FStarted: Boolean;
     FSawFragmentedInput: Boolean;
     FSawShortWrite: Boolean;
     function FlushOneCiphertextFragment(const ASocket: TSocket;
@@ -92,11 +95,14 @@ type
   public
     constructor Create(const AScenario: TServerScenario = ssRoundTrip);
     destructor Destroy; override;
+    procedure Start; reintroduce;
     procedure WaitForCompletion(const ATimeoutMilliseconds: QWord);
     property CiphertextBytesFed: QWord read FCiphertextBytesFed;
     property CiphertextBytesRead: QWord read FCiphertextBytesRead;
     property ErrorMessage: string read FErrorMessage;
     property HandshakeElapsed: QWord read FHandshakeElapsed;
+    property HandshakeCiphertextBytesRead: QWord
+      read FHandshakeCiphertextBytesRead;
     property HandshakeInputBudgetExceeded: Boolean
       read FHandshakeInputBudgetExceeded;
     property HandshakeTimedOut: Boolean read FHandshakeTimedOut;
@@ -110,7 +116,6 @@ type
   public
     procedure SetupTests; override;
     procedure TestHandshakeInputBudgetAbortsBeforeFeed;
-    procedure TestHandshakeLimitsAbortIndependently;
     procedure TestLoopbackAcceptReadWriteClose;
     procedure TestStalledHandshakeAbortsWithinDeadline;
   end;
@@ -167,6 +172,7 @@ begin
   FListenSocket := -1;
   FContext := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
+  FContextOwned := True;
   try
     FListenSocket := FpSocket(AF_INET, SOCK_STREAM, 0);
     if FListenSocket < 0 then
@@ -188,25 +194,49 @@ begin
       CloseSocket(FListenSocket);
     FListenSocket := -1;
     CloseTransportSecurityServerContext(FContext);
+    FContextOwned := False;
     raise;
   end;
 end;
 
 destructor TLoopbackTLSServer.Destroy;
+var
+  StopFailed: Boolean;
 begin
-  Stop;
-  if not WaitUntilFinished(SERVER_STOP_TIMEOUT_MILLISECONDS) then
-    raise Exception.Create('TLS server thread failed to stop during cleanup');
-  WaitFor;
-  CloseTransportSecurityServerContext(FContext);
+  StopFailed := False;
+  if FStarted then
+  begin
+    Stop;
+    StopFailed := not WaitUntilFinished(SERVER_STOP_TIMEOUT_MILLISECONDS);
+    if StopFailed then
+    begin
+      WriteLn(ErrOutput, 'TLS server thread failed to stop during cleanup');
+      Halt(1);
+    end;
+    WaitFor;
+  end
+  else if FListenSocket >= 0 then
+    CloseOwnedSocket(FListenSocket);
+  if FContextOwned then
+  begin
+    CloseTransportSecurityServerContext(FContext);
+    FContextOwned := False;
+  end;
   inherited Destroy;
+end;
+
+procedure TLoopbackTLSServer.Start;
+begin
+  inherited Start;
+  FStarted := True;
 end;
 
 procedure TLoopbackTLSServer.Stop;
 begin
   Terminate;
   CloseOwnedSocket(FListenSocket);
-  CloseOwnedSocket(FClientSocket);
+  if FClientSocket >= 0 then
+    FpShutdown(FClientSocket, 2);
 end;
 
 function TLoopbackTLSServer.WaitUntilFinished(
@@ -298,10 +328,13 @@ begin
   if Received > 0 then
   begin
     Inc(FCiphertextBytesRead, QWord(Received));
-    if (not AConnection.Active) and
-       (FCiphertextBytesRead > FHandshakeInputByteBudget) then
-      raise EHandshakeInputBudgetExceeded.Create(
-        'TLS server handshake byte budget exceeded');
+    if not AConnection.Active then
+    begin
+      Inc(FHandshakeCiphertextBytesRead, QWord(Received));
+      if FHandshakeCiphertextBytesRead > FHandshakeInputByteBudget then
+        raise EHandshakeInputBudgetExceeded.Create(
+          'TLS server handshake byte budget exceeded');
+    end;
     FeedLength := TransportSecurityFeedCiphertext(AConnection, @Buffer[0],
       Received);
     if FeedLength <> Received then
@@ -456,9 +489,11 @@ var
   Address: TInetSockAddr;
   AddressLength: TSocklen;
   AcceptedSocket: TSocket;
+  ClientSocket: TSocket;
   Connection: TTransportSecurityConnection;
 begin
   AcceptedSocket := -1;
+  ClientSocket := -1;
   FillChar(Connection, SizeOf(Connection), 0);
   try
     try
@@ -477,15 +512,16 @@ begin
         Exit;
       end;
       InterlockedExchange(FClientSocket, AcceptedSocket);
+      ClientSocket := AcceptedSocket;
       AcceptedSocket := -1;
       if Terminated then
         Exit;
-      SetNonblocking(FClientSocket);
+      SetNonblocking(ClientSocket);
       BeginTransportSecurityServer(Connection, FContext);
       try
-        DriveHandshake(FClientSocket, Connection);
+        DriveHandshake(ClientSocket, Connection);
       except
-        on E: EHandshakeDeadlineExceeded do
+        on EHandshakeDeadlineExceeded do
           if FScenario = ssStalledHandshake then
           begin
             FHandshakeTimedOut := True;
@@ -493,7 +529,7 @@ begin
           end
           else
             raise;
-        on E: EHandshakeInputBudgetExceeded do
+        on EHandshakeInputBudgetExceeded do
           if FScenario = ssInputBudgetExceeded then
           begin
             FHandshakeInputBudgetExceeded := True;
@@ -504,9 +540,9 @@ begin
       end;
       if FScenario <> ssRoundTrip then
         raise Exception.Create('adversarial TLS handshake unexpectedly completed');
-      DriveRead(FClientSocket, Connection);
-      DriveWrite(FClientSocket, Connection);
-      DriveClose(FClientSocket, Connection);
+      DriveRead(ClientSocket, Connection);
+      DriveWrite(ClientSocket, Connection);
+      DriveClose(ClientSocket, Connection);
     except
       on E: Exception do
         FErrorMessage := E.Message;
@@ -597,7 +633,7 @@ begin
     Expect<Boolean>(Server.CiphertextBytesRead > 0).ToBe(True);
     Expect<Int64>(Int64(Server.CiphertextBytesFed)).ToBe(
       Int64(Server.CiphertextBytesRead));
-    Expect<Boolean>(Server.CiphertextBytesRead <
+    Expect<Boolean>(Server.HandshakeCiphertextBytesRead <
       HANDSHAKE_INPUT_BYTE_BUDGET).ToBe(True);
   finally
     CloseTransportSecurity(Connection);
@@ -653,7 +689,7 @@ end;
 procedure TTransportSecuritySocketE2ETests.TestHandshakeInputBudgetAbortsBeforeFeed;
 var
   Address: TInetSockAddr;
-  BudgetProbe: array[0..BUDGET_PROBE_INPUT_BYTE_BUDGET] of Byte;
+  BudgetProbe: array[1..BUDGET_PROBE_INPUT_BYTE_BUDGET + 1] of Byte;
   ClientSocket: TSocket;
   Sent: Integer;
   Server: TLoopbackTLSServer;
@@ -672,7 +708,7 @@ begin
     if FpConnect(ClientSocket, @Address, SizeOf(Address)) <> 0 then
       raise Exception.Create('budget-probe client connect() failed');
     FillChar(BudgetProbe, SizeOf(BudgetProbe), $16);
-    Sent := FpSend(ClientSocket, @BudgetProbe[0], Length(BudgetProbe),
+    Sent := FpSend(ClientSocket, @BudgetProbe[1], Length(BudgetProbe),
       SEND_NOSIGNAL_FLAG);
     if Sent <> Length(BudgetProbe) then
       raise Exception.Create('budget-probe client send() failed');
@@ -697,18 +733,14 @@ begin
   end;
 end;
 
-procedure TTransportSecuritySocketE2ETests.TestHandshakeLimitsAbortIndependently;
-begin
-  TestHandshakeInputBudgetAbortsBeforeFeed;
-  TestStalledHandshakeAbortsWithinDeadline;
-end;
-
 procedure TTransportSecuritySocketE2ETests.SetupTests;
 begin
   Test('nonblocking loopback accept-read-write-close handles fragments',
     TestLoopbackAcceptReadWriteClose);
-  Test('handshake byte budget and deadline abort independently',
-    TestHandshakeLimitsAbortIndependently);
+  Test('handshake input byte budget aborts before ciphertext feed',
+    TestHandshakeInputBudgetAbortsBeforeFeed);
+  Test('stalled handshake aborts within its deadline',
+    TestStalledHandshakeAbortsWithinDeadline);
 end;
 
 begin
