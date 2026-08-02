@@ -15,11 +15,21 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   request target when `FPC_TARGET_CPU` / `FPC_TARGET_OS` are unset. Explicit
   overrides are strictly probed and translated to `-P` / `-T` when dispatch is
   required.
-- **Compiler-neutral request first.** Build, test, and Windows hook compilation
-  validate a versioned request against on-demand compiler capabilities before
-  `TLWPTFPCCompilerDriver` translates it. The driver also normalizes diagnostics;
-  raw FPC output remains available for log replay. Unsupported combinations are
-  hard errors, with no compiler or target fallback. See ADR-0029.
+- **Compiler-neutral request first.** Build and test select a root-owned named
+  compiler profile, validate a versioned request against on-demand compiler
+  capabilities, and normalize the result through the selected driver. FPC is
+  the built-in fallback; external drivers exchange canonical TOML over
+  short-lived child processes. Unsupported combinations are hard errors, with
+  no compiler or target fallback. See ADR-0029 and ADR-0030.
+- **Compiler processes are bounded duplex operations.** A shared runner writes
+  request stdin while draining stdout and stderr, retains at most 16 MiB from
+  each stream and discards later bytes while drainage continues, owns the
+  complete process tree, and terminates it on timeout or capture failure.
+  Stdin pumping and writer cleanup remain deadline-bounded when an escaped
+  descendant retains the pipe.
+  Capability probes time out after 30 seconds. Compiles
+  default to 30 minutes; `LWPT_COMPILER_TIMEOUT_MS` sets a positive
+  millisecond override for unusually short or long toolchains.
 - **Dependency-aware parallel builds.** Independent ready build entries run in
   parallel by default, bounded by `--jobs=<n>` and the machine-wide
   `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See
@@ -181,8 +191,11 @@ the selected compiler executable/live version,
 the previous public-output content, the implicit source directory, declared
 unit/include/resource inputs,
 manifest, cfg, lockfile, and installed module contents. After compilation it
-takes a short output-specific lock, combining an in-process critical section
-with an OS-held lock, and captures the same fingerprint again. Search-root
+reacquires machine-wide worker capacity and retains it through per-entry
+postbuild, live compiler refresh, fingerprint revalidation, and atomic
+publication. Publication takes a short output-specific lock, combining an
+in-process critical section with an OS-held lock, and captures the same
+fingerprint again. Search-root
 hashing excludes `.lwpt/sessions/` and all declared build outputs, so a project
 that declares `units = ["."]` tracks compiler inputs without treating private
 staging or another entry's publication as an input. Explicit file inputs are
@@ -236,8 +249,9 @@ by `fpc -h`). Before compiling, the driver runs the requested dispatch with
 `BuildRequestIsCompatible`, and caches that result for the invocation. A
 missing `ppcross*` compiler or unsupported target fails with a message naming
 FPC and the requested tuple; LWPT never falls back to the host compiler. The
-publish step refreshes the probe so a compiler change during compilation still
-withholds the candidate.
+publish step refreshes the probe and repeats the complete compatibility check;
+a changed compiler identity/version, target, output kind, or mode during
+compilation withholds the candidate.
 
 ## Generator hooks (formerly `[generated]`)
 
@@ -282,7 +296,11 @@ The three deferred customer-facing stack contracts ([link-check #31](https://git
 ## Machine-wide worker capacity
 
 The build scheduler acquires capacity from `LWPT.WorkerBudget` before starting
-each compiler process and releases it when that process finishes. The
+each compiler process and releases it when that process finishes. Before each
+per-entry or whole-build postbuild path and before revalidation/publication it
+reacquires a lease, so compiler and hook work never runs outside the machine
+budget. Finalization retains its lease until the candidate is either published
+or rejected. The
 coordinator bounds aggregate work from several LWPT invocations and worktrees,
 not just the `--jobs` value of one process.
 

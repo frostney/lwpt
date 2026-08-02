@@ -21,9 +21,10 @@ one process must not be able to corrupt or overwrite another process's work.
 
 LWPT itself remains built with FreePascal. Consumer projects should be able to
 select a compiler independently from their target platform, including
-cross-compilation, without LWPT silently changing that selection. The
-compiler-neutral build direction is tracked as product work; it is not a claim
-about the current implementation.
+cross-compilation, without LWPT silently changing that selection. Root-owned
+named profiles now select built-in, external-process, or embedding-host
+drivers through one versioned compiler-neutral contract; concrete backend
+adapters remain separate product work.
 
 An Object Pascal project must remain buildable and distributable without
 depending on an LWPT-operated central service. Package distribution may use
