@@ -29,10 +29,11 @@ end;
 procedure TAnalysisJSONTests.TestEnvelopeIsStableAndCommandPayloadOwned;
 const
   EXPECTED = '{'#10
-    + '  "schema":"lwpt.analysis",'#10
+    + '  "schema":"' + ANALYSIS_ENVELOPE_SCHEMA + '",'#10
     + '  "schemaVersion":1,'#10
     + '  "command":{"name":"health","schemaVersion":3},'#10
-    + '  "tool":{"name":"lwpt","version":"' + PROGRAM_VERSION + '"},'#10
+    + '  "tool":{"name":"' + PROGRAM_NAME + '","version":"'
+    + PROGRAM_VERSION + '"},'#10
     + '  "project":{"name":"demo","version":"1.2.3"},'#10
     + '  "files":["a.pas","z.pas"],'#10
     + '  "configuration":[{"project":"demo","name":"analysis.exclude","value":"generated/**"},{"project":"demo","name":"analysis.include","value":"source/**"}],'#10

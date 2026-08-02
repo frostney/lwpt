@@ -44,19 +44,29 @@ end;
 procedure TAnalysisScopeTests.BeforeAll;
 begin
   FRoot := ExpandFileName('build/tests/tmp/analysis-scope');
+  if DirectoryExists(FRoot) then WipeDir(FRoot);
   ForceDirectories(FRoot);
   WriteText(FRoot + '/lwpt.toml',
     '[package]'#10'name = "root"'#10'version = "1.0.0"'#10
     + 'units = ["source"]'#10
+    + '[lwpt]'#10'modules-dir = "vendor/modules"'#10
+    + 'archives-dir = "cache/archives"'#10'tmp-dir = "scratch/tmp"'#10
     + '[build.root]'#10'source = "app/main.lpr"'#10
     + '[workspaces]'#10'include = ["packages/*"]'#10
-    + '[analysis]'#10'include = ["tests/**/*.pas"]'#10
+    + '[analysis]'#10'include = ["tests/**/*.pas", "vendor/**/*.pas", '
+    + '"cache/**/*.pas", "scratch/**/*.pas"]'#10
     + 'exclude = ["source/excluded.pas"]'#10);
   WriteText(FRoot + '/source/owned.pas', 'unit Owned; interface end.');
   WriteText(FRoot + '/source/excluded.pas', 'unit Excluded; interface end.');
   WriteText(FRoot + '/app/main.lpr', 'program Main; begin end.');
   WriteText(FRoot + '/tests/deep/extra.pas', 'unit Extra; interface end.');
   WriteText(FRoot + '/unowned.pas', 'unit Unowned; interface end.');
+  WriteText(FRoot + '/vendor/modules/dep/Vendored.pas',
+    'unit Vendored; interface end.');
+  WriteText(FRoot + '/cache/archives/dep/Archived.pas',
+    'unit Archived; interface end.');
+  WriteText(FRoot + '/scratch/tmp/Generated.pas',
+    'unit Generated; interface end.');
 
   WriteText(FRoot + '/packages/inherited/lwpt.toml',
     '[package]'#10'name = "inherited"'#10'version = "1.1.0"'#10
@@ -90,6 +100,7 @@ begin
     '{$define MORE}');
 
   FOverlapRoot := ExpandFileName('build/tests/tmp/analysis-scope-overlap');
+  if DirectoryExists(FOverlapRoot) then WipeDir(FOverlapRoot);
   ForceDirectories(FOverlapRoot);
   WriteText(FOverlapRoot + '/lwpt.toml',
     '[package]'#10'name = "overlap-root"'#10'version = "1.0.0"'#10
@@ -141,10 +152,13 @@ var
   Scope: TLWPTAnalysisScope;
 begin
   Scope := ResolveAnalysisScope(FRoot + '/lwpt.toml');
+  Expect<string>(Scope.Projects[1].Name).ToBe('inherited');
   Expect<Boolean>(Scope.Projects[1].Configuration.Includes[0]
     = 'tests/**/*.pas').ToBe(True);
+  Expect<string>(Scope.Projects[2].Name).ToBe('leaf');
   Expect<Boolean>(Scope.Projects[2].Configuration.Includes[0]
     = 'tests/**/*.pas').ToBe(True);
+  Expect<string>(Scope.Projects[3].Name).ToBe('override');
   Expect<Boolean>(Scope.Projects[3].Configuration.Includes[0]
     = 'extras/**/*.inc').ToBe(True);
   Expect<Boolean>(Scope.Projects[3].Configuration.Excludes[0]

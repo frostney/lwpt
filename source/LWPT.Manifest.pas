@@ -192,8 +192,8 @@ type
       that declares this section replaces the root defaults; otherwise the
       root scope configuration is inherited. }
     AnalysisConfigured  : Boolean;
-    AnalysisIncludes    : array of string;
-    AnalysisExcludes    : array of string;
+    AnalysisIncludes    : TStringArray;
+    AnalysisExcludes    : TStringArray;
     { [sources.<name>] entries — user-declared custom git hosts that
       extend the built-in github/gitlab/bitbucket prefixes. See
       ADR-0009 §"Custom hosts". Empty for projects that only use the

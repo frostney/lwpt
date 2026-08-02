@@ -176,18 +176,54 @@ end;
 
 procedure SortFiles(var AFiles: TLWPTAnalysisFileArray);
 var
-  FileIndex, OtherIndex: Integer;
-  Temporary: TLWPTAnalysisFile;
-begin
-  for FileIndex := 0 to High(AFiles) do
-    for OtherIndex := FileIndex + 1 to High(AFiles) do
-      if AFiles[OtherIndex].RootRelativePath
-        < AFiles[FileIndex].RootRelativePath then
+  Temporary: TLWPTAnalysisFileArray;
+
+  procedure MergeSort(const ALow, AHigh: Integer);
+  var
+    LeftIndex, MiddleIndex, OutputIndex, RightIndex: Integer;
+  begin
+    if ALow >= AHigh then Exit;
+    MiddleIndex := ALow + ((AHigh - ALow) div 2);
+    MergeSort(ALow, MiddleIndex);
+    MergeSort(MiddleIndex + 1, AHigh);
+    LeftIndex := ALow;
+    RightIndex := MiddleIndex + 1;
+    OutputIndex := ALow;
+    while (LeftIndex <= MiddleIndex) and (RightIndex <= AHigh) do
+    begin
+      if AFiles[LeftIndex].RootRelativePath
+        <= AFiles[RightIndex].RootRelativePath then
       begin
-        Temporary := AFiles[FileIndex];
-        AFiles[FileIndex] := AFiles[OtherIndex];
-        AFiles[OtherIndex] := Temporary;
+        Temporary[OutputIndex] := AFiles[LeftIndex];
+        Inc(LeftIndex);
+      end
+      else
+      begin
+        Temporary[OutputIndex] := AFiles[RightIndex];
+        Inc(RightIndex);
       end;
+      Inc(OutputIndex);
+    end;
+    while LeftIndex <= MiddleIndex do
+    begin
+      Temporary[OutputIndex] := AFiles[LeftIndex];
+      Inc(LeftIndex);
+      Inc(OutputIndex);
+    end;
+    while RightIndex <= AHigh do
+    begin
+      Temporary[OutputIndex] := AFiles[RightIndex];
+      Inc(RightIndex);
+      Inc(OutputIndex);
+    end;
+    for OutputIndex := ALow to AHigh do
+      AFiles[OutputIndex] := Temporary[OutputIndex];
+  end;
+
+begin
+  if Length(AFiles) < 2 then Exit;
+  SetLength(Temporary, Length(AFiles));
+  MergeSort(0, High(AFiles));
 end;
 
 procedure AddFile(var AFiles: TLWPTAnalysisFileArray;
@@ -208,6 +244,26 @@ end;
 procedure CollectProjectFiles(const AProjectManifest: TManifest;
   const AProjectRoot, ARoot: string; const AConfiguration:
   TLWPTAnalysisConfiguration; var AFiles: TLWPTAnalysisFileArray);
+var
+  ProtectedRoots: array[0..2] of string;
+
+  function ProjectPath(const APath: string): string;
+  begin
+    if IsAbsoluteFilesystemPath(APath) then
+      Result := ExpandFileName(APath)
+    else
+      Result := ExpandFileName(IncludeTrailingPathDelimiter(AProjectRoot)
+        + APath);
+  end;
+
+  function IsProtectedToolkitPath(const APath: string): Boolean;
+  var
+    ProtectedIndex: Integer;
+  begin
+    for ProtectedIndex := Low(ProtectedRoots) to High(ProtectedRoots) do
+      if PathContains(ProtectedRoots[ProtectedIndex], APath) then Exit(True);
+    Result := False;
+  end;
 
   procedure Walk(const ADirectory: string);
   var
@@ -222,6 +278,7 @@ procedure CollectProjectFiles(const AProjectManifest: TManifest;
         if (Length(Search.Name) > 0) and (Search.Name[1] = '.') then Continue;
         AbsolutePath := IncludeTrailingPathDelimiter(ADirectory)
           + Search.Name;
+        if IsProtectedToolkitPath(AbsolutePath) then Continue;
         if (Search.Attr and faDirectory) <> 0 then
         begin
           if IsDirSymlinkOrJunction(AbsolutePath) then Continue;
@@ -247,6 +304,9 @@ procedure CollectProjectFiles(const AProjectManifest: TManifest;
 
 begin
   SetLength(AFiles, 0);
+  ProtectedRoots[0] := ProjectPath(ResolveModulesDir(AProjectManifest));
+  ProtectedRoots[1] := ProjectPath(ResolveArchivesDir(AProjectManifest));
+  ProtectedRoots[2] := ProjectPath(ResolveTmpDir(AProjectManifest));
   Walk(AProjectRoot);
   SortFiles(AFiles);
 end;
@@ -275,10 +335,10 @@ begin
     begin
       FilePath := AScope.Projects[ProjectIndex].Files[FileIndex].AbsolutePath;
       OwnerIndex := ProjectIndex;
-      OwnerRoot := ExpandFileName(AScope.Projects[OwnerIndex].Root);
+      OwnerRoot := AScope.Projects[OwnerIndex].Root;
       for CandidateIndex := 0 to High(AScope.Projects) do
       begin
-        CandidateRoot := ExpandFileName(AScope.Projects[CandidateIndex].Root);
+        CandidateRoot := AScope.Projects[CandidateIndex].Root;
         if (Length(CandidateRoot) > Length(OwnerRoot))
           and ((FilePath = CandidateRoot)
             or PathContains(CandidateRoot, FilePath)) then

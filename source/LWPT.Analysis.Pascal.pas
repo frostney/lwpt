@@ -71,7 +71,7 @@ function PascalRegionIsExecutable(const AKind: TLWPTPascalRegionKind):
 implementation
 
 const
-  PascalKeywords: array[0..94] of string = (
+  PascalKeywords: array[0..111] of string = (
     'absolute', 'abstract', 'and', 'array', 'as', 'asm', 'assembler',
     'automated', 'begin', 'case', 'cdecl', 'class', 'const',
     'constructor', 'contains', 'default', 'deprecated', 'destructor',
@@ -85,8 +85,10 @@ const
     'out', 'overload', 'override', 'package', 'packed', 'pascal',
     'platform', 'private', 'procedure', 'program', 'property', 'protected',
     'public', 'published', 'raise', 'read', 'record', 'register', 'reintroduce',
-    'repeat', 'requires', 'resourcestring', 'safecall', 'sealed', 'set',
-    'shl', 'shr', 'specialize', 'static');
+    'repeat', 'requires', 'resourcestring', 'safecall', 'sealed', 'self', 'set',
+    'shl', 'shr', 'specialize', 'static', 'strict', 'string', 'then',
+    'threadvar', 'to', 'try', 'type', 'unit', 'until', 'uses', 'var', 'virtual',
+    'while', 'with', 'write', 'xor');
 
 function IsIdentifierStart(const ACharacter: Char): Boolean; inline;
 begin
@@ -101,16 +103,21 @@ end;
 
 function IsKeyword(const AValue: string): Boolean;
 var
-  KeywordIndex: Integer;
+  CompareResult, HighIndex, KeywordIndex, LowIndex: Integer;
 begin
-  for KeywordIndex := Low(PascalKeywords) to High(PascalKeywords) do
-    if AValue = PascalKeywords[KeywordIndex] then Exit(True);
-  Result := (AValue = 'strict') or (AValue = 'then')
-    or (AValue = 'threadvar') or (AValue = 'to') or (AValue = 'try')
-    or (AValue = 'type') or (AValue = 'unit') or (AValue = 'until')
-    or (AValue = 'uses') or (AValue = 'var') or (AValue = 'virtual')
-    or (AValue = 'while') or (AValue = 'with') or (AValue = 'write')
-    or (AValue = 'xor');
+  LowIndex := Low(PascalKeywords);
+  HighIndex := High(PascalKeywords);
+  while LowIndex <= HighIndex do
+  begin
+    KeywordIndex := LowIndex + ((HighIndex - LowIndex) div 2);
+    CompareResult := CompareStr(AValue, PascalKeywords[KeywordIndex]);
+    if CompareResult = 0 then Exit(True);
+    if CompareResult < 0 then
+      HighIndex := KeywordIndex - 1
+    else
+      LowIndex := KeywordIndex + 1;
+  end;
+  Result := False;
 end;
 
 procedure RaiseLexicalError(const ASourceName, AMessage: string;
@@ -127,7 +134,9 @@ end;
 function TokenizePascal(const ASource, ASourceName: string):
   TLWPTPascalTokenArray;
 var
-  Column, Index, Line, StartColumn, StartIndex, StartLine: Integer;
+  Column, Index, Line, StartColumn, StartIndex, StartLine, TokenCapacity,
+    TokenCount: Integer;
+  NestedComments: Boolean;
 
   procedure Advance;
   begin
@@ -155,11 +164,13 @@ var
 
   procedure AddToken(const AKind: TLWPTPascalTokenKind;
     const ANormalize: Boolean = True; const AStripEscape: Boolean = False);
-  var
-    TokenCount: Integer;
   begin
-    TokenCount := Length(Result);
-    SetLength(Result, TokenCount + 1);
+    if TokenCount = TokenCapacity then
+    begin
+      if TokenCapacity = 0 then TokenCapacity := 64
+      else TokenCapacity := TokenCapacity * 2;
+      SetLength(Result, TokenCapacity);
+    end;
     Result[TokenCount].Kind := AKind;
     Result[TokenCount].Text := Copy(ASource, StartIndex, Index - StartIndex);
     if AStripEscape and (Result[TokenCount].Text <> '')
@@ -171,12 +182,51 @@ var
     Result[TokenCount].Length := Index - StartIndex;
     Result[TokenCount].Line := StartLine;
     Result[TokenCount].Column := StartColumn;
+    Inc(TokenCount);
   end;
 
   procedure SkipLineComment;
   begin
     while (Index <= Length(ASource))
       and not (ASource[Index] in [#10, #13]) do Advance;
+  end;
+
+  procedure ApplyCommentDirective(const ADirectiveText: string);
+  var
+    Argument, DirectiveText: string;
+  begin
+    DirectiveText := LowerCase(Trim(ADirectiveText));
+    if Copy(DirectiveText, 1, 2) = '{$' then
+      DirectiveText := Copy(DirectiveText, 3, Length(DirectiveText) - 3)
+    else if Copy(DirectiveText, 1, 3) = '(*$' then
+      DirectiveText := Copy(DirectiveText, 4, Length(DirectiveText) - 5)
+    else
+      Exit;
+    DirectiveText := Trim(StringReplace(DirectiveText, #9, ' ',
+      [rfReplaceAll]));
+    while Pos('  ', DirectiveText) > 0 do
+      DirectiveText := StringReplace(DirectiveText, '  ', ' ',
+        [rfReplaceAll]);
+    if Copy(DirectiveText, 1, 5) = 'mode ' then
+    begin
+      Argument := Trim(Copy(DirectiveText, 6, MaxInt));
+      if (Argument = 'delphi') or (Argument = 'delphiunicode')
+        or (Argument = 'tp') then
+        NestedComments := False
+      else if (Argument = 'fpc') or (Argument = 'objfpc')
+        or (Argument = 'macpas') or (Argument = 'iso')
+        or (Argument = 'extendedpascal') then
+        NestedComments := True;
+      Exit;
+    end;
+    if Copy(DirectiveText, 1, 11) <> 'modeswitch ' then Exit;
+    Argument := Trim(Copy(DirectiveText, 12, MaxInt));
+    if (Argument = 'nestedcomments') or (Argument = 'nestedcomments+')
+      or (Argument = 'nestedcomments on') then
+      NestedComments := True
+    else if (Argument = 'nestedcomments-')
+      or (Argument = 'nestedcomments off') then
+      NestedComments := False;
   end;
 
   procedure ScanComment(const ABraceComment: Boolean;
@@ -194,12 +244,13 @@ var
     end;
     while (Index <= Length(ASource)) and (Depth > 0) do
     begin
-      if ABraceComment and (ASource[Index] = '{') then
+      if NestedComments and ABraceComment and (ASource[Index] = '{') then
       begin
         Inc(Depth);
-        Advance;
+        Advance
       end
-      else if (not ABraceComment) and (ASource[Index] = '(')
+      else if NestedComments and (not ABraceComment)
+        and (ASource[Index] = '(')
         and (Index < Length(ASource))
         and (ASource[Index + 1] = '*') then
       begin
@@ -226,7 +277,11 @@ var
     if Depth > 0 then
       RaiseLexicalError(ASourceName, 'unterminated comment', StartLine,
         StartColumn);
-    if ADirective then AddToken(ptDirective, False);
+    if ADirective then
+    begin
+      ApplyCommentDirective(Copy(ASource, StartIndex, Index - StartIndex));
+      AddToken(ptDirective, False);
+    end;
   end;
 
   procedure ScanString;
@@ -321,6 +376,9 @@ var
   Value: string;
 begin
   SetLength(Result, 0);
+  TokenCapacity := 0;
+  TokenCount := 0;
+  NestedComments := True;
   Index := 1;
   Line := 1;
   Column := 1;
@@ -389,6 +447,7 @@ begin
     end;
     ScanSymbol;
   end;
+  SetLength(Result, TokenCount);
 end;
 
 type

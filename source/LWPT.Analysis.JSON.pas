@@ -11,7 +11,7 @@ uses
   LWPT.Core;
 
 const
-  ANALYSIS_ENVELOPE_SCHEMA = 'lwpt.analysis';
+  ANALYSIS_ENVELOPE_SCHEMA = PROGRAM_NAME + '.analysis';
   ANALYSIS_ENVELOPE_SCHEMA_VERSION = 1;
 
 type
@@ -54,17 +54,56 @@ uses
 
 procedure SortAndDeduplicate(var AValues: TStringArray);
 var
-  ItemIndex, OtherIndex, OutputCount: Integer;
-  Temporary: string;
-begin
-  for ItemIndex := 0 to High(AValues) do
-    for OtherIndex := ItemIndex + 1 to High(AValues) do
-      if AValues[OtherIndex] < AValues[ItemIndex] then
+  ItemIndex, OutputCount: Integer;
+  Temporary: TStringArray;
+
+  procedure MergeSort(const ALow, AHigh: Integer);
+  var
+    LeftIndex, MiddleIndex, OutputIndex, RightIndex: Integer;
+  begin
+    if ALow >= AHigh then Exit;
+    MiddleIndex := ALow + ((AHigh - ALow) div 2);
+    MergeSort(ALow, MiddleIndex);
+    MergeSort(MiddleIndex + 1, AHigh);
+    LeftIndex := ALow;
+    RightIndex := MiddleIndex + 1;
+    OutputIndex := ALow;
+    while (LeftIndex <= MiddleIndex) and (RightIndex <= AHigh) do
+    begin
+      if AValues[LeftIndex] <= AValues[RightIndex] then
       begin
-        Temporary := AValues[ItemIndex];
-        AValues[ItemIndex] := AValues[OtherIndex];
-        AValues[OtherIndex] := Temporary;
+        Temporary[OutputIndex] := AValues[LeftIndex];
+        Inc(LeftIndex);
+      end
+      else
+      begin
+        Temporary[OutputIndex] := AValues[RightIndex];
+        Inc(RightIndex);
       end;
+      Inc(OutputIndex);
+    end;
+    while LeftIndex <= MiddleIndex do
+    begin
+      Temporary[OutputIndex] := AValues[LeftIndex];
+      Inc(LeftIndex);
+      Inc(OutputIndex);
+    end;
+    while RightIndex <= AHigh do
+    begin
+      Temporary[OutputIndex] := AValues[RightIndex];
+      Inc(RightIndex);
+      Inc(OutputIndex);
+    end;
+    for OutputIndex := ALow to AHigh do
+      AValues[OutputIndex] := Temporary[OutputIndex];
+  end;
+
+begin
+  if Length(AValues) > 1 then
+  begin
+    SetLength(Temporary, Length(AValues));
+    MergeSort(0, High(AValues));
+  end;
   OutputCount := 0;
   for ItemIndex := 0 to High(AValues) do
   begin
@@ -91,17 +130,57 @@ end;
 procedure SortAndDeduplicateConfiguration(
   var AValues: TLWPTAnalysisConfigurationValueArray);
 var
-  ItemIndex, OtherIndex, OutputCount: Integer;
-  Temporary: TLWPTAnalysisConfigurationValue;
-begin
-  for ItemIndex := 0 to High(AValues) do
-    for OtherIndex := ItemIndex + 1 to High(AValues) do
-      if CompareConfiguration(AValues[OtherIndex], AValues[ItemIndex]) < 0 then
+  ItemIndex, OutputCount: Integer;
+  Temporary: TLWPTAnalysisConfigurationValueArray;
+
+  procedure MergeSort(const ALow, AHigh: Integer);
+  var
+    LeftIndex, MiddleIndex, OutputIndex, RightIndex: Integer;
+  begin
+    if ALow >= AHigh then Exit;
+    MiddleIndex := ALow + ((AHigh - ALow) div 2);
+    MergeSort(ALow, MiddleIndex);
+    MergeSort(MiddleIndex + 1, AHigh);
+    LeftIndex := ALow;
+    RightIndex := MiddleIndex + 1;
+    OutputIndex := ALow;
+    while (LeftIndex <= MiddleIndex) and (RightIndex <= AHigh) do
+    begin
+      if CompareConfiguration(AValues[LeftIndex], AValues[RightIndex]) <= 0
+        then
       begin
-        Temporary := AValues[ItemIndex];
-        AValues[ItemIndex] := AValues[OtherIndex];
-        AValues[OtherIndex] := Temporary;
+        Temporary[OutputIndex] := AValues[LeftIndex];
+        Inc(LeftIndex);
+      end
+      else
+      begin
+        Temporary[OutputIndex] := AValues[RightIndex];
+        Inc(RightIndex);
       end;
+      Inc(OutputIndex);
+    end;
+    while LeftIndex <= MiddleIndex do
+    begin
+      Temporary[OutputIndex] := AValues[LeftIndex];
+      Inc(LeftIndex);
+      Inc(OutputIndex);
+    end;
+    while RightIndex <= AHigh do
+    begin
+      Temporary[OutputIndex] := AValues[RightIndex];
+      Inc(RightIndex);
+      Inc(OutputIndex);
+    end;
+    for OutputIndex := ALow to AHigh do
+      AValues[OutputIndex] := Temporary[OutputIndex];
+  end;
+
+begin
+  if Length(AValues) > 1 then
+  begin
+    SetLength(Temporary, Length(AValues));
+    MergeSort(0, High(AValues));
+  end;
   OutputCount := 0;
   for ItemIndex := 0 to High(AValues) do
   begin

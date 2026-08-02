@@ -16,8 +16,10 @@ type
     procedure SetupTests; override;
     procedure TestNormalizationAndLocations;
     procedure TestCommentsDisappearAndDirectivesRemain;
-    procedure TestBraceCommentsIgnoreParenDelimiters;
-    procedure TestParenCommentsIgnoreBraceDelimiters;
+    procedure TestBraceCommentsIgnoreOtherDelimiters;
+    procedure TestParenCommentsIgnoreOtherDelimiters;
+    procedure TestReservedWordsAndEscapedIdentifiers;
+    procedure TestCommentNestingFollowsSourceMode;
     procedure TestLexicalErrorsCarrySourceLocations;
   end;
 
@@ -30,6 +32,9 @@ type
     procedure TestForwardCompositeKeepsLaterRoutine;
     procedure TestProgramBodyIsExecutable;
     procedure TestImplicitUnitInitializationIsExecutable;
+    procedure TestAssemblerRoutineBodyIsExecutable;
+    procedure TestRoutineDeclarationKindsAndNoBody;
+    procedure TestEmptyAndInterfaceOnlySources;
   end;
 
 function RegionCount(const ADocument: TLWPTPascalDocument;
@@ -72,22 +77,57 @@ begin
   Expect<string>(Tokens[2].Text).ToBe('beta');
 end;
 
-procedure TPascalTokenizerTests.TestBraceCommentsIgnoreParenDelimiters;
+procedure TPascalTokenizerTests.TestBraceCommentsIgnoreOtherDelimiters;
 var
   Tokens: TLWPTPascalTokenArray;
 begin
-  Tokens := TokenizePascal('{ cross (* remains text } Alpha');
+  Tokens := TokenizePascal('{ comment (* remains text } Alpha');
   Expect<Integer>(Length(Tokens)).ToBe(1);
   Expect<string>(Tokens[0].Text).ToBe('alpha');
+  Tokens := TokenizePascal('{ comment // remains text } Gamma');
+  Expect<Integer>(Length(Tokens)).ToBe(1);
+  Expect<string>(Tokens[0].Text).ToBe('gamma');
 end;
 
-procedure TPascalTokenizerTests.TestParenCommentsIgnoreBraceDelimiters;
+procedure TPascalTokenizerTests.TestParenCommentsIgnoreOtherDelimiters;
 var
   Tokens: TLWPTPascalTokenArray;
 begin
-  Tokens := TokenizePascal('(* cross { remains text *) Beta');
+  Tokens := TokenizePascal('(* comment { remains text *) Beta');
   Expect<Integer>(Length(Tokens)).ToBe(1);
   Expect<string>(Tokens[0].Text).ToBe('beta');
+  Tokens := TokenizePascal('(* comment // remains text *) Delta');
+  Expect<Integer>(Length(Tokens)).ToBe(1);
+  Expect<string>(Tokens[0].Text).ToBe('delta');
+end;
+
+procedure TPascalTokenizerTests.TestReservedWordsAndEscapedIdentifiers;
+var
+  Tokens: TLWPTPascalTokenArray;
+begin
+  Tokens := TokenizePascal('self string &self &string');
+  Expect<Integer>(Length(Tokens)).ToBe(4);
+  Expect<Integer>(Ord(Tokens[0].Kind)).ToBe(Ord(ptKeyword));
+  Expect<Integer>(Ord(Tokens[1].Kind)).ToBe(Ord(ptKeyword));
+  Expect<Integer>(Ord(Tokens[2].Kind)).ToBe(Ord(ptIdentifier));
+  Expect<Integer>(Ord(Tokens[3].Kind)).ToBe(Ord(ptIdentifier));
+  Expect<string>(Tokens[2].Text).ToBe('self');
+  Expect<string>(Tokens[3].Text).ToBe('string');
+end;
+
+procedure TPascalTokenizerTests.TestCommentNestingFollowsSourceMode;
+var
+  Tokens: TLWPTPascalTokenArray;
+begin
+  Tokens := TokenizePascal(
+    '{$mode delphi}{ pass { to open a block } Alpha');
+  Expect<Integer>(Length(Tokens)).ToBe(2);
+  Expect<string>(Tokens[1].Text).ToBe('alpha');
+
+  Tokens := TokenizePascal('{$mode delphi}{$modeswitch nestedcomments+}'
+    + '{ outer { nested } still comment } Beta');
+  Expect<Integer>(Length(Tokens)).ToBe(3);
+  Expect<string>(Tokens[2].Text).ToBe('beta');
 end;
 
 procedure TPascalTokenizerTests.TestLexicalErrorsCarrySourceLocations;
@@ -110,10 +150,14 @@ begin
     TestNormalizationAndLocations);
   Test('drops comments but retains compiler directives',
     TestCommentsDisappearAndDirectivesRemain);
-  Test('brace comments ignore parenthesis-star delimiters',
-    TestBraceCommentsIgnoreParenDelimiters);
-  Test('parenthesis-star comments ignore brace delimiters',
-    TestParenCommentsIgnoreBraceDelimiters);
+  Test('brace comments ignore other comment delimiters',
+    TestBraceCommentsIgnoreOtherDelimiters);
+  Test('parenthesis-star comments ignore other comment delimiters',
+    TestParenCommentsIgnoreOtherDelimiters);
+  Test('classifies reserved words and escaped identifiers',
+    TestReservedWordsAndEscapedIdentifiers);
+  Test('follows source mode when nesting active-style comments',
+    TestCommentNestingFollowsSourceMode);
   Test('reports lexical errors with source locations',
     TestLexicalErrorsCarrySourceLocations);
 end;
@@ -261,6 +305,55 @@ begin
   Expect<Boolean>(PascalRegionIsExecutable(pgInitialization)).ToBe(True);
 end;
 
+procedure TPascalRegionTests.TestAssemblerRoutineBodyIsExecutable;
+var
+  Document: TLWPTPascalDocument;
+begin
+  Document := AnalyzePascal(
+    'program Demo; procedure MachineCode; assembler; asm nop end; '
+    + 'begin MachineCode; end.', 'demo.lpr');
+  Expect<Integer>(Length(Document.Routines)).ToBe(1);
+  Expect<Boolean>(Document.Routines[0].BodyRegion >= 0).ToBe(True);
+  Expect<Integer>(Ord(Document.Regions[
+    Document.Routines[0].BodyRegion].Kind)).ToBe(Ord(pgRoutineBody));
+  Expect<Integer>(RegionCount(Document, pgProgramBody)).ToBe(1);
+end;
+
+procedure TPascalRegionTests.TestRoutineDeclarationKindsAndNoBody;
+const
+  SOURCE =
+    'unit Kinds;'#10'interface'#10'implementation'#10
+    + 'procedure Deferred; forward;'#10
+    + 'procedure Imported; external;'#10
+    + 'constructor TObject.Create; begin end;'#10
+    + 'destructor TObject.Destroy; begin end;'#10
+    + 'operator +(Left, Right: Integer): Integer; begin Result := Left; end;'#10
+    + 'end.';
+var
+  Document: TLWPTPascalDocument;
+begin
+  Document := AnalyzePascal(SOURCE, 'kinds.pas');
+  Expect<Integer>(Length(Document.Routines)).ToBe(5);
+  Expect<Integer>(Document.Routines[0].BodyRegion).ToBe(-1);
+  Expect<Integer>(Document.Routines[1].BodyRegion).ToBe(-1);
+  Expect<Integer>(Ord(Document.Routines[2].Kind)).ToBe(Ord(prConstructor));
+  Expect<Integer>(Ord(Document.Routines[3].Kind)).ToBe(Ord(prDestructor));
+  Expect<Integer>(Ord(Document.Routines[4].Kind)).ToBe(Ord(prOperator));
+end;
+
+procedure TPascalRegionTests.TestEmptyAndInterfaceOnlySources;
+var
+  Document: TLWPTPascalDocument;
+begin
+  Document := AnalyzePascal('', 'empty.pas');
+  Expect<Integer>(Length(Document.Tokens)).ToBe(0);
+  Expect<Integer>(Length(Document.Regions)).ToBe(0);
+  Document := AnalyzePascal(
+    'unit API; interface procedure PublicOnly; end.', 'api.pas');
+  Expect<Integer>(Length(Document.Routines)).ToBe(0);
+  Expect<Integer>(Length(Document.Regions)).ToBe(0);
+end;
+
 procedure TPascalRegionTests.SetupTests;
 begin
   Test('separates nested routine bodies, declarations, and unit sections',
@@ -274,6 +367,12 @@ begin
   Test('types a program main block as executable', TestProgramBodyIsExecutable);
   Test('types an implicit unit initialization block as executable',
     TestImplicitUnitInitializationIsExecutable);
+  Test('types assembler routine bodies as executable',
+    TestAssemblerRoutineBodyIsExecutable);
+  Test('classifies routine kinds and bodyless declarations',
+    TestRoutineDeclarationKindsAndNoBody);
+  Test('handles empty and interface-only source documents',
+    TestEmptyAndInterfaceOnlySources);
 end;
 
 begin
