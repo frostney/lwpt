@@ -51,6 +51,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0028](./adr/0028-default-toolkit-state-format-exclusion.md) | Formatter excludes root `.lwpt/**` by default while explicit includes opt matching files back in |
 | [0029](./adr/0029-fpc-compiler-driver.md) | Neutral compiler-driver seam with on-demand FPC target probes, unified argument translation, failure classification, and normalized diagnostics |
 | [0030](./adr/0030-root-compiler-profiles.md) | Root-owned named compiler profiles, embedding-host factories, deterministic selection precedence, and a short-lived external-driver TOML protocol |
+| [0031](./adr/0031-fixed-point-single-version-resolution.md) | Deterministic fixed-point dependency discovery, authoritative Git ref identity, graph-wide highest-version selection, and publish-after-validation |
 
 ## Spikes
 
