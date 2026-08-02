@@ -460,6 +460,9 @@ type
       const AName: string; const AParentRoutine, AHeaderStart,
       AHeaderEnd: Integer): Integer;
     function CompositeOpening(const AIndex: Integer): Boolean;
+    function ConditionalDirectiveDelta(const AIndex: Integer): Integer;
+    function ExtendConditionalBody(const AHeaderEnd, ABodyEnd,
+      ALimit: Integer): Integer;
     function FindBodyEnd(const AStartToken, ALimit: Integer): Integer;
     function FindHeaderEnd(const AStartToken, ALimit: Integer): Integer;
     function ParseRoutine(const AStartToken, ALimit,
@@ -612,6 +615,89 @@ begin
       and not TokenIs(AIndex + 1, 'operator');
 end;
 
+function TLWPTPascalStructureParser.ConditionalDirectiveDelta(
+  const AIndex: Integer): Integer;
+var
+  DirectiveText, DirectiveWord: string;
+  WordEnd: Integer;
+begin
+  Result := 0;
+  if (AIndex < 0) or (AIndex >= Length(FDocument.Tokens))
+    or (FDocument.Tokens[AIndex].Kind <> ptDirective) then Exit;
+  DirectiveText := LowerCase(Trim(FDocument.Tokens[AIndex].Text));
+  if Copy(DirectiveText, 1, 2) = '{$' then
+    DirectiveText := Copy(DirectiveText, 3, Length(DirectiveText) - 3)
+  else if Copy(DirectiveText, 1, 3) = '(*$' then
+    DirectiveText := Copy(DirectiveText, 4, Length(DirectiveText) - 5)
+  else
+    Exit;
+  DirectiveText := Trim(DirectiveText);
+  WordEnd := 1;
+  while (WordEnd <= Length(DirectiveText))
+    and not (DirectiveText[WordEnd] in [' ', #9]) do Inc(WordEnd);
+  DirectiveWord := Copy(DirectiveText, 1, WordEnd - 1);
+  if (DirectiveWord = 'if') or (DirectiveWord = 'ifdef')
+    or (DirectiveWord = 'ifndef') or (DirectiveWord = 'ifopt') then
+    Result := 1
+  else if (DirectiveWord = 'endif') or (DirectiveWord = 'ifend') then
+    Result := -1;
+end;
+
+function TLWPTPascalStructureParser.ExtendConditionalBody(
+  const AHeaderEnd, ABodyEnd, ALimit: Integer): Integer;
+var
+  BlockDepth, Candidate, Delta, Depth, TokenIndex: Integer;
+  HasBody, HasRoutine: Boolean;
+  NestedKind: TLWPTPascalRoutineKind;
+begin
+  Result := ABodyEnd;
+  Depth := 0;
+  for TokenIndex := AHeaderEnd to ABodyEnd - 1 do
+    Inc(Depth, ConditionalDirectiveDelta(TokenIndex));
+  if Depth <= 0 then Exit;
+
+  TokenIndex := ABodyEnd;
+  while (TokenIndex < ALimit) and (Depth > 0) do
+  begin
+    Inc(Depth, ConditionalDirectiveDelta(TokenIndex));
+    Inc(TokenIndex);
+  end;
+  Result := TokenIndex;
+
+  while Result < ALimit do
+  begin
+    Candidate := Result;
+    while (Candidate < ALimit) and (TokenIs(Candidate, ';')
+      or ((FDocument.Tokens[Candidate].Kind = ptDirective)
+        and (ConditionalDirectiveDelta(Candidate) = 0))) do
+      Inc(Candidate);
+    if ConditionalDirectiveDelta(Candidate) <> 1 then Exit;
+
+    BlockDepth := 0;
+    HasBody := False;
+    HasRoutine := False;
+    TokenIndex := Candidate;
+    while TokenIndex < ALimit do
+    begin
+      Delta := ConditionalDirectiveDelta(TokenIndex);
+      if Delta <> 0 then
+        Inc(BlockDepth, Delta)
+      else if BlockDepth > 0 then
+      begin
+        if not HasBody and RoutineDeclarationAt(TokenIndex, Candidate,
+          NestedKind) then
+          HasRoutine := True;
+        if TokenIs(TokenIndex, 'begin') or TokenIs(TokenIndex, 'asm') then
+          HasBody := True;
+      end;
+      Inc(TokenIndex);
+      if BlockDepth = 0 then Break;
+    end;
+    if (BlockDepth <> 0) or not HasBody or HasRoutine then Exit;
+    Result := TokenIndex;
+  end;
+end;
+
 function TLWPTPascalStructureParser.FindBodyEnd(const AStartToken,
   ALimit: Integer): Integer;
 var
@@ -686,6 +772,7 @@ begin
   if BodyStart < 0 then Exit(TokenIndex);
   AddRegion(pgRoutineDeclarations, RoutineIndex, DeclarationStart, BodyStart);
   BodyEnd := FindBodyEnd(BodyStart, ALimit);
+  BodyEnd := ExtendConditionalBody(HeaderEnd, BodyEnd, ALimit);
   FDocument.Routines[RoutineIndex].BodyRegion := AddRegion(pgRoutineBody,
     RoutineIndex, BodyStart, BodyEnd);
   Result := BodyEnd;

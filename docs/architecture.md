@@ -8,7 +8,7 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 - **Zero-install by default.** `.lwpt/modules/` (extracted) and `.lwpt/archives/` (verification) are committed; a fresh clone is buildable with `fpc @lwpt.cfg` before `lwpt install` is ever run. See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md).
 - **Self-hosting from day one.** LWPT builds LWPT through `lwpt build` against the repo's own manifest; the one-time `scripts/bootstrap.pas` resolves the chicken-and-egg. See [ADR-0005](./adr/0005-self-host-build.md).
 - **RTL-only with LWPT-canonical packages.** No third-party FPC dependencies in the binary; HTTPS is `HTTPClient` from LWPT's `packages/httpclient/`. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for HTTPClient, CLI, Semver, TOML, and TestingPascalLibrary — all consumed as workspace packages via the root manifest's `[workspaces]` glob (Phase 1 done per ADR-0014 + ADR-0015). GocciaScript is the first named consumer and commits to Path A adoption; Phase 2 graduates individual packages to standalone repos when warranted.
-- **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry implementation is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); its interoperable wire contract is specified in [`registry-spec.md`](./registry-spec.md). The link / duplication / codebase-health contracts originally deferred by ADR-0006 remain separate workstreams rather than half-built features. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
+- **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry implementation is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); its interoperable wire contract is specified in [`registry-spec.md`](./registry-spec.md). Link-check and duplication remain separate ADR-0006 workstreams; codebase health is now shipped. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
 - **Compiler work is session-private.** Build/test compiler outputs stay below `.lwpt/sessions/<session-id>/`; successful build outputs are revalidated and atomically published, while completed-session logs remain available until `lwpt repair` reclaims the session. See ADR-0020.
 - **Build scheduling follows the manifest DAG.** Ready build entries overlap within
@@ -81,6 +81,7 @@ Sections currently supported:
 | `[lwpt]` | toolkit-state overrides (`modules-dir`, `archives-dir`, `tmp-dir`, `cfg-file`). Defaults match the constants in `LWPT.Core` |
 | `[format]` | `include = [...]` adds format-scope globs; `exclude = [...]` subtracts them. Toolkit state (root `.lwpt/**` plus any `[lwpt]` override paths) is excluded by default unless an explicit include matches it (ADR-0028). Workspace packages are included by the root walk by default and opt out via their own `[format]` section |
 | `[analysis]` | shared analysis source scope only: `include = [...]` adds Pascal source globs on top of `[package].units` and exact `[build]` sources; `exclude = [...]` subtracts them. Workspaces inherit the root configuration unless they declare their own `[analysis]` table. Command-specific thresholds and policy do not live here. |
+| `[health]` | optional strict maxima for routine/file cyclomatic and cognitive complexity plus the separate `0..100` hotspot score. Workspaces inherit root limits unless they declare their own table. See [`health.md`](./health.md). |
 
 Dependency source shapes (per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md)): bare `owner/repo` defaults to GitHub; `gitlab:owner/repo` and `bitbucket:owner/repo` prefixes route to those hosts; any `[sources.<name>]` table declares a custom prefix (Gitea, Forgejo, self-hosted GitHub Enterprise / GitLab / Bitbucket Server); `https://...` is an arbitrary tarball URL; paths (`./foo`, `../foo`, `/abs/foo`, `~/foo`, or `local:./foo`) are local sources. Version specs accept SemVer 2.0.0 ranges (`^1.0.0`, `>=1.0.0 <2.0.0`), exact SemVer versions (`1.0.0` — preferred per [semver.org](https://semver.org/#is-v123-a-semantic-version)), commit SHAs (7–40 hex), or arbitrary Git tag names (`v1.0.0`, `release-2024`). SemVer-shaped specs resolve through git smart-HTTP tag listing (uniform across GitHub / GitLab / Bitbucket / Gitea / Forgejo / self-hosted, no JSON, no auth). Explicitly *not* supported: `[[target]]` array-of-tables syntax, the legacy separate `source = "github|gitlab|..." + repo/ref/tag/asset/path` shape (hard-errored with a migration hint), and `git clone` (HTTP archives only — preserves the single-binary RTL-only constraint).
 
@@ -110,6 +111,11 @@ The caller supplies one validated JSON object or array as its payload. Shared
 code does not know duplication matches, health metrics, hotspot scores,
 command-specific configuration schemas, or either command's presentation
 policy.
+
+`LWPT.Health` and `LWPT.Command.Health` consume that neutral foundation for the
+shipped `lwpt health` command. The exact structural scoring table, threshold
+contract, 100-commit rename-aware Git window, hotspot formula, and JSON payload
+are documented once in [`health.md`](./health.md).
 
 ## Resolver shape
 
@@ -236,11 +242,15 @@ by declaring its own `[format]` section.
 
 ## Deferred contracts
 
-Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), three customer-facing `project-structure` contracts beyond build-system and formatter are deferred from v1:
+Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), three
+customer-facing `project-structure` contracts beyond build-system and formatter
+were originally deferred from v1. Two remain deferred:
 
 - **link-check** — graduates from GocciaScript as a standalone LWPT package in [issue #31](https://github.com/frostney/lwpt/issues/31).
 - **duplication** — becomes a `lwpt duplication` subcommand in [issue #32](https://github.com/frostney/lwpt/issues/32).
-- **codebase-health** — becomes a `lwpt health` subcommand in [issue #33](https://github.com/frostney/lwpt/issues/33).
+
+Codebase health is now delivered as `lwpt health`; its current contract lives in
+[`health.md`](./health.md). Link-check and duplication remain deferred.
 
 The pre-merge CI/PR gate is `lwpt format --check` + `lwpt build` + `lwpt agents --check` + `lwpt test`; the local pre-commit hook runs the formatter and the AGENTS.md agents-block refresh only. Architecture drift is checked across LWPT's own source, tests, manifests, workflows, documentation, ADRs, and domain context during release preparation. It is not a consumer-project responsibility or an LWPT subcommand.
 

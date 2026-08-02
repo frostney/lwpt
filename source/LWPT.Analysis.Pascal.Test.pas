@@ -30,6 +30,7 @@ type
     procedure TestExplicitExecutableSectionsDoNotOverlapDeclarations;
     procedure TestProceduralTypesRemainDeclarations;
     procedure TestForwardCompositeKeepsLaterRoutine;
+    procedure TestConditionalAlternateRoutineBodiesRemainOneRoutine;
     procedure TestProgramBodyIsExecutable;
     procedure TestImplicitUnitInitializationIsExecutable;
     procedure TestAssemblerRoutineBodyIsExecutable;
@@ -228,6 +229,32 @@ begin
 end;
 
 procedure TPascalRegionTests.
+  TestConditionalAlternateRoutineBodiesRemainOneRoutine;
+const
+  SOURCE =
+    'unit ConditionalBodies;'#10'interface'#10'implementation'#10
+    + 'function OwnerGuardHeld: Boolean;'#10
+    + '{$IFDEF UNIX}'#10'var UnixValue: Boolean;'#10
+    + 'begin Result := UnixValue; end;'#10'{$ENDIF}'#10
+    + '{$IFDEF MSWINDOWS}'#10'var WindowsValue: Boolean;'#10
+    + 'begin Result := WindowsValue; end;'#10'{$ENDIF}'#10
+    + 'function Next: Boolean;'#10'begin Result := True; end;'#10'end.';
+var
+  Document: TLWPTPascalDocument;
+  FirstBody: TLWPTPascalRegion;
+begin
+  Document := AnalyzePascal(SOURCE, 'conditional-bodies.pas');
+  Expect<Integer>(Length(Document.Routines)).ToBe(2);
+  Expect<string>(Document.Routines[0].Name).ToBe('ownerguardheld');
+  Expect<string>(Document.Routines[1].Name).ToBe('next');
+  Expect<Integer>(RegionCount(Document, pgRoutineBody)).ToBe(2);
+  Expect<Integer>(RegionCount(Document, pgInitialization)).ToBe(0);
+  FirstBody := Document.Regions[Document.Routines[0].BodyRegion];
+  Expect<Integer>(FirstBody.Tokens.EndToken).ToBe(
+    Document.Routines[1].Header.StartToken);
+end;
+
+procedure TPascalRegionTests.
   TestExplicitExecutableSectionsDoNotOverlapDeclarations;
 const
   SOURCE =
@@ -364,6 +391,8 @@ begin
     TestProceduralTypesRemainDeclarations);
   Test('keeps routines after forward composite declarations',
     TestForwardCompositeKeepsLaterRoutine);
+  Test('keeps conditional alternate bodies in one routine region',
+    TestConditionalAlternateRoutineBodiesRemainOneRoutine);
   Test('types a program main block as executable', TestProgramBodyIsExecutable);
   Test('types an implicit unit initialization block as executable',
     TestImplicitUnitInitializationIsExecutable);

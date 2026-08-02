@@ -194,6 +194,14 @@ type
     AnalysisConfigured  : Boolean;
     AnalysisIncludes    : TStringArray;
     AnalysisExcludes    : TStringArray;
+    { [health] owns command-specific limits. -1 means absent. Workspaces
+      inherit the root limits unless they declare their own [health] table. }
+    HealthConfigured          : Boolean;
+    HealthMaxRoutineCyclomatic: Integer;
+    HealthMaxRoutineCognitive : Integer;
+    HealthMaxFileCyclomatic   : Integer;
+    HealthMaxFileCognitive    : Integer;
+    HealthMaxHotspotScore     : Integer;
     { [sources.<name>] entries — user-declared custom git hosts that
       extend the built-in github/gitlab/bitbucket prefixes. See
       ADR-0009 §"Custom hosts". Empty for projects that only use the
@@ -1232,9 +1240,9 @@ const
     NOTE: 'generated' + 'targets' are NOT in this list — both were
     removed in earlier waves and now join the unknown-section
     policy on equal footing with [teddybear]. }
-  KNOWN_SECTIONS: array[0..15] of string = (
+  KNOWN_SECTIONS: array[0..16] of string = (
     'package', 'dependencies', 'sources', 'build', 'version',
-    PROGRAM_NAME, 'format', 'analysis', 'test', 'workspaces',
+    PROGRAM_NAME, 'format', 'analysis', 'health', 'test', 'workspaces',
     'preinstall', 'postinstall', 'prebuild', 'postbuild',
     'pretest', 'posttest');
   { Reserved section names — names that, if declared as a top-level
@@ -1248,10 +1256,10 @@ const
         anyway because KNOWN_SECTIONS is checked first, but this
         list makes the intent explicit). 'run' itself is included
         because `lwpt run run` is the nonsense case. }
-  RESERVED_SUBCOMMAND_NAMES: array[0..18] of string = (
+  RESERVED_SUBCOMMAND_NAMES: array[0..20] of string = (
     { subcommands }
     'install', 'add', 'remove', 'build', 'format', 'test',
-    'repair', 'init', 'run', 'agents',
+    'repair', 'init', 'run', 'agents', 'health',
     { configuration section names — defensive: ensure 'workspaces',
       'package', 'dependencies' etc can NEVER end up registered as
       run-scripts even if a future refactor reorders KNOWN_SECTIONS
@@ -1260,11 +1268,11 @@ const
       [dependencies] (recognised, parsed for all manifests, never
       runnable). }
     'package', 'dependencies', 'sources', 'workspaces',
-    'version', PROGRAM_NAME, 'format', 'analysis', 'generated');
+    'version', PROGRAM_NAME, 'format', 'analysis', 'health', 'generated');
 var
   Root, Deps, DepNode, ArrNode : TTOMLNode;
   BuildNode, EntryNode, VerNode   : TTOMLNode;
-  LwptCfgNode, FmtNode, AnalysisNode, TestNode, BailNode,
+  LwptCfgNode, FmtNode, AnalysisNode, HealthNode, TestNode, BailNode,
     ExclArr : TTOMLNode;
   SourcesNode, SourceEntry     : TTOMLNode;
   Parser   : TTOMLParser;
@@ -1289,6 +1297,11 @@ begin
     contents survive + the new parse appends on top). Bites
     transitive-resolver walks that load N child manifests. }
   Result := Default(TManifest);
+  Result.HealthMaxRoutineCyclomatic := -1;
+  Result.HealthMaxRoutineCognitive := -1;
+  Result.HealthMaxFileCyclomatic := -1;
+  Result.HealthMaxFileCognitive := -1;
+  Result.HealthMaxHotspotScore := -1;
   Parser := TTOMLParser.Create;
   Root := nil;
   try
@@ -1510,6 +1523,79 @@ begin
         Result.AnalysisIncludes);
       ReadStrictStringArray(AnalysisNode, 'exclude', 'analysis.exclude',
         Result.AnalysisExcludes);
+    end;
+
+    { [health] limits are strict non-negative integers. Limits are optional;
+      absent values preserve report-only behavior. Hotspot scores use the
+      documented 0..100 normalized scale. }
+    HealthNode := TomlGet(Root, 'health');
+    if HealthNode <> nil then
+    begin
+      if not TomlIsTable(HealthNode) then
+        raise EManifestError.Create('[health] must be a table');
+      Result.HealthConfigured := True;
+      for Pair in HealthNode.Children do
+        if (Pair.Key <> 'max-routine-cyclomatic')
+          and (Pair.Key <> 'max-routine-cognitive')
+          and (Pair.Key <> 'max-file-cyclomatic')
+          and (Pair.Key <> 'max-file-cognitive')
+          and (Pair.Key <> 'max-hotspot-score') then
+          raise EManifestError.CreateFmt(
+            '[health] unknown setting "%s"', [Pair.Key]);
+
+      BailNode := TomlGet(HealthNode, 'max-routine-cyclomatic');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-routine-cyclomatic must be a non-negative integer');
+      BailValue := TomlInt(HealthNode, 'max-routine-cyclomatic', -1);
+      if ((BailNode <> nil) and (BailValue < 0))
+        or (BailValue > High(Integer)) then
+        raise EManifestError.Create(
+          '[health] max-routine-cyclomatic must be a non-negative integer');
+      Result.HealthMaxRoutineCyclomatic := Integer(BailValue);
+
+      BailNode := TomlGet(HealthNode, 'max-routine-cognitive');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-routine-cognitive must be a non-negative integer');
+      BailValue := TomlInt(HealthNode, 'max-routine-cognitive', -1);
+      if ((BailNode <> nil) and (BailValue < 0))
+        or (BailValue > High(Integer)) then
+        raise EManifestError.Create(
+          '[health] max-routine-cognitive must be a non-negative integer');
+      Result.HealthMaxRoutineCognitive := Integer(BailValue);
+
+      BailNode := TomlGet(HealthNode, 'max-file-cyclomatic');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-file-cyclomatic must be a non-negative integer');
+      BailValue := TomlInt(HealthNode, 'max-file-cyclomatic', -1);
+      if ((BailNode <> nil) and (BailValue < 0))
+        or (BailValue > High(Integer)) then
+        raise EManifestError.Create(
+          '[health] max-file-cyclomatic must be a non-negative integer');
+      Result.HealthMaxFileCyclomatic := Integer(BailValue);
+
+      BailNode := TomlGet(HealthNode, 'max-file-cognitive');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-file-cognitive must be a non-negative integer');
+      BailValue := TomlInt(HealthNode, 'max-file-cognitive', -1);
+      if ((BailNode <> nil) and (BailValue < 0))
+        or (BailValue > High(Integer)) then
+        raise EManifestError.Create(
+          '[health] max-file-cognitive must be a non-negative integer');
+      Result.HealthMaxFileCognitive := Integer(BailValue);
+
+      BailNode := TomlGet(HealthNode, 'max-hotspot-score');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-hotspot-score must be an integer from 0 to 100');
+      BailValue := TomlInt(HealthNode, 'max-hotspot-score', -1);
+      if ((BailNode <> nil) and (BailValue < 0)) or (BailValue > 100) then
+        raise EManifestError.Create(
+          '[health] max-hotspot-score must be an integer from 0 to 100');
+      Result.HealthMaxHotspotScore := Integer(BailValue);
     end;
 
     { [test] — scheduler policy. Configuration supplies the project

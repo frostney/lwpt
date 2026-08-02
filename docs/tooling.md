@@ -19,7 +19,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 - **Every resolved subcommand reports completion.** A status-aware elapsed-time
   line is written to stderr after success or failure without changing stdout or
   the command's exit code.
-- **Three customer-facing stack contracts are owed but deferred.** Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), link-check, duplication, and codebase-health each have a follow-up workstream. Architecture drift is instead a project-local release-preparation check for LWPT itself; it is not a customer feature.
+- **Codebase health is shipped.** `lwpt health` is an offline Pascal complexity report with opt-in local Git hotspots; [`health.md`](./health.md) owns the scoring and configuration contract. Link-check and duplication remain deferred. Architecture drift is a project-local release-preparation check.
 
 ## Pinned versions
 
@@ -230,17 +230,21 @@ state is written. Successful completion removes compiler jobs and compiled hooks
 but retains stable job logs; `lwpt repair` removes only unlocked sessions and
 conservatively retains live guards even when their state file is malformed.
 
-## Deferred from v1
+## Stack-contract status
 
 The three customer-facing stack contracts from `project-structure` beyond build-system and formatter:
 
 | Contract | Workstream | Notes |
 | --- | --- | --- |
-| **Codebase-health** (`lwpt health`) | [Issue #33](https://github.com/frostney/lwpt/issues/33) | Cyclomatic + cognitive complexity; non-zero exit on threshold breach. Per-file aggregate signal + hotspot detection from git churn. |
+| **Codebase-health** (`lwpt health`) | Delivered; see [`health.md`](./health.md) | Deterministic routine/file complexity, optional local Git hotspots, stable JSON, and strict opt-in thresholds. |
 | **Duplication** (`lwpt duplication`) | [Issue #32](https://github.com/frostney/lwpt/issues/32) | Cross-file and within-file copy-paste reporting. |
 | **Link-check** | [Issue #31](https://github.com/frostney/lwpt/issues/31) | Graduates from GocciaScript as a standalone LWPT package; offline + explicit online modes. |
 
-The v1 pre-commit gate excludes all three. ADR-0006 records the original deferral. Architecture drift is checked across LWPT's source, tests, manifests, workflows, documentation, ADRs, and domain context during release preparation; it is not exposed to consumer projects.
+The v1 pre-commit gate still excludes these analysis commands; health is run on
+demand or by an explicit consumer gate. ADR-0006 records the original deferral.
+Architecture drift is checked across LWPT's source, tests, manifests,
+workflows, documentation, ADRs, and domain context during release preparation;
+it is not exposed to consumer projects.
 
 ## Other deferrals
 
