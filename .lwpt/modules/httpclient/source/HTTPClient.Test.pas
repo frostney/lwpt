@@ -36,13 +36,25 @@ uses
                 Tests.HTTPMockServer's background server starts }
   BaseUnix,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   Classes,
+  Process,
   SysUtils,
   TestingPascalLibrary,
   HTTPClient,
   Tests.HTTPMockServer;
 
 type
+  THTTPMockServerLifecycle = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestConnectedSilentTeardownIsBounded;
+    procedure TestRepeatedCyclesBalanceResources;
+    procedure TestStartedUnconnectedTeardownIsBounded;
+  end;
+
   THTTPClientByteFetch = class(TTestSuite)
   public
     procedure SetupTests; override;
@@ -51,6 +63,7 @@ type
     procedure TestChunkedResponseChunkStartsWithNul;
     procedure TestChunkedResponseMultipleChunksWithNul;
     procedure TestLargeBodyForcesMultiRecv;
+    procedure TestSegmentedWritesPreserveNul;
   end;
 
   THTTPClientResourceBounds = class(TTestSuite)
@@ -72,6 +85,11 @@ type
     procedure TestTLSHandshakeDeadlineRejectsIdlePeer;
     procedure TestTruncatedFixedBody;
   end;
+
+const
+  MOCK_LIFECYCLE_CHILD = '--mock-lifecycle-child';
+  MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS = 2000;
+  MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS = 1000;
 
 { ── helpers ───────────────────────────────────────────────────────── }
 
@@ -140,6 +158,25 @@ begin
   end;
 end;
 
+function ServeAndFetch(const ARawResponse: TBytes;
+  const ABytesPerWrite: Integer): TBytes; overload;
+var
+  Mock: TMockHTTPServer;
+  NoHeaders: THTTPHeaders;
+  Resp: THTTPResponse;
+begin
+  Mock := TMockHTTPServer.Create(ARawResponse, ABytesPerWrite, 0, 0);
+  try
+    Mock.Start;
+    NoHeaders := nil;
+    Resp := HTTPGet(MockURL(Mock.Port), NoHeaders);
+    Mock.WaitDone;
+    Result := Resp.Body;
+  finally
+    Mock.Free;
+  end;
+end;
+
 function ServeAndCaptureError(const ARawResponse: TBytes;
   const AOptions: THTTPRequestOptions;
   const ABytesPerWrite, AWriteDelayMilliseconds,
@@ -198,6 +235,164 @@ var i: Integer;
 begin
   SetLength(Result, Length(AValues));
   for i := 0 to High(AValues) do Result[i] := AValues[i];
+end;
+
+procedure RunMockLifecycleChild(const AScenario: string);
+var
+  Mock: TMockHTTPServer;
+begin
+  Mock := TMockHTTPServer.Create(nil);
+  try
+    Mock.Start;
+    if AScenario = 'connected-silent' then
+    begin
+      Mock.ConnectWithoutRequest;
+      Mock.WaitForAccepted;
+    end
+    else if AScenario <> 'started-unconnected' then
+      Halt(2);
+  finally
+    Mock.Free;
+  end;
+end;
+
+procedure ForceKillMockLifecycleChild(const AChild: TProcess);
+begin
+  {$IFDEF UNIX}
+  if (FpKill(AChild.ProcessID, SIGKILL) <> 0) and
+    (FpGetErrNo <> ESysESRCH) then
+    RaiseLastOSError;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  if not Windows.TerminateProcess(AChild.ProcessHandle, 1) and
+    (Windows.WaitForSingleObject(AChild.ProcessHandle, 0) <>
+      Windows.WAIT_OBJECT_0) then
+    RaiseLastOSError;
+  {$ENDIF}
+end;
+
+procedure StopMockLifecycleChild(const AChild: TProcess);
+begin
+  if AChild.ProcessID <= 0 then Exit;
+  if not AChild.Running then
+  begin
+    AChild.WaitOnExit;
+    Exit;
+  end;
+  AChild.Terminate(1);
+  if AChild.WaitOnExit(MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS)
+     or not AChild.Running then
+  begin
+    AChild.WaitOnExit;
+    Exit;
+  end;
+  ForceKillMockLifecycleChild(AChild);
+  if not AChild.WaitOnExit(MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS)
+     and AChild.Running then
+    raise Exception.Create('mock lifecycle child did not stop after force kill');
+  AChild.WaitOnExit;
+end;
+
+procedure RunBoundedMockLifecycleChild(const AScenario: string);
+var
+  Child: TProcess;
+  StartedAt: QWord;
+  TimedOut: Boolean;
+begin
+  Child := TProcess.Create(nil);
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    Child.Parameters.Add(MOCK_LIFECYCLE_CHILD);
+    Child.Parameters.Add(AScenario);
+    Child.Execute;
+    StartedAt := GetTickCount64;
+    while Child.Running and
+      (GetTickCount64 - StartedAt <
+        MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS) do
+      Sleep(10);
+    TimedOut := Child.Running;
+    if TimedOut then StopMockLifecycleChild(Child)
+    else
+      Child.WaitOnExit;
+    Expect<Boolean>(TimedOut).ToBe(False);
+    if not TimedOut then Expect<Integer>(Child.ExitStatus).ToBe(0);
+  finally
+    StopMockLifecycleChild(Child);
+    Child.Free;
+  end;
+end;
+
+{ ── THTTPMockServerLifecycle ──────────────────────────────────────── }
+
+procedure THTTPMockServerLifecycle.TestStartedUnconnectedTeardownIsBounded;
+begin
+  RunBoundedMockLifecycleChild('started-unconnected');
+end;
+
+procedure THTTPMockServerLifecycle.TestConnectedSilentTeardownIsBounded;
+begin
+  RunBoundedMockLifecycleChild('connected-silent');
+end;
+
+procedure RunMockResourceBalanceCycle(const AExpectedBody: TBytes);
+var
+  GotBody: TBytes;
+  ErrorMessage: string;
+  Mock: TMockHTTPServer;
+begin
+  GotBody := ServeAndFetch(BuildSimpleResponse(AExpectedBody));
+  Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(AExpectedBody));
+  ErrorMessage := ServeAndCaptureError(
+    StringBytes('not an HTTP response'), TestOptions(16, 1024, 1000),
+    0, 0, 0);
+  Expect<Boolean>(ErrorMessage <> '').ToBe(True);
+  Mock := TMockHTTPServer.Create(nil);
+  try
+    Mock.Start;
+    Mock.ConnectWithoutRequest;
+    Mock.WaitForAccepted;
+  finally
+    Mock.Free;
+  end;
+  Mock := TMockHTTPServer.Create(nil);
+  Mock.Free;
+end;
+
+procedure THTTPMockServerLifecycle.TestRepeatedCyclesBalanceResources;
+const
+  ITERATIONS = 16;
+var
+  BeforeResources, AfterResources: TMockServerResourceSnapshot;
+  ExpectedBody: TBytes;
+  i: Integer;
+begin
+  ExpectedBody := MakeBytes([$00, $7f, $ff]);
+  { Initialize platform networking and thread runtime state before measuring
+    fixture-owned lifecycle deltas. Windows retains some one-time process
+    handles on first use which are not mock-server leaks. }
+  RunMockResourceBalanceCycle(ExpectedBody);
+  BeforeResources := GetMockServerResourceSnapshot;
+  for i := 1 to ITERATIONS do
+    RunMockResourceBalanceCycle(ExpectedBody);
+  AfterResources := GetMockServerResourceSnapshot;
+  Expect<Integer>(AfterResources.OpenSockets).ToBe(
+    BeforeResources.OpenSockets);
+  Expect<Integer>(AfterResources.LiveThreads).ToBe(
+    BeforeResources.LiveThreads);
+  Expect<Integer>(AfterResources.WinSockReferences).ToBe(
+    BeforeResources.WinSockReferences);
+  Expect<Integer>(AfterResources.ProcessHandles).ToBe(
+    BeforeResources.ProcessHandles);
+end;
+
+procedure THTTPMockServerLifecycle.SetupTests;
+begin
+  Test('started server without a client tears down within two seconds',
+    TestStartedUnconnectedTeardownIsBounded);
+  Test('connected silent client tears down within two seconds',
+    TestConnectedSilentTeardownIsBounded);
+  Test('success, failure, and unstarted cycles balance fixture resources',
+    TestRepeatedCyclesBalanceResources);
 end;
 
 { ── THTTPClientByteFetch ──────────────────────────────────────────── }
@@ -284,6 +479,16 @@ begin
   end;
   GotBody := ServeAndFetch(BuildSimpleResponse(ExpectedBody));
   Expect<Integer>(Length(GotBody)).ToBe(Length(ExpectedBody));
+  Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(ExpectedBody));
+end;
+
+procedure THTTPClientByteFetch.TestSegmentedWritesPreserveNul;
+var
+  ExpectedBody, GotBody: TBytes;
+begin
+  ExpectedBody := MakeBytes(
+    [$00, $01, $02, $03, $00, $fd, $fe, $ff, $00]);
+  GotBody := ServeAndFetch(BuildSimpleResponse(ExpectedBody), 1);
   Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(ExpectedBody));
 end;
 
@@ -551,19 +756,27 @@ begin
     TestChunkedResponseMultipleChunksWithNul);
   Test('large body forces multi-recv with #0 scattered through',
     TestLargeBodyForcesMultiRecv);
+  Test('one-byte server writes preserve embedded #0 bytes',
+    TestSegmentedWritesPreserveNul);
 end;
 
 begin
-  {$IFNDEF UNIX}
-  WriteLn(
-    'HTTPClient.Test skipped on this platform (mock server is Unix-only ' +
-    'in v1; Windows path lands in a later cycle). Exiting 0 to keep the test gate green.');
-  Halt(0);
-  {$ENDIF}
   {$IFDEF UNIX}
   fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
   {$ENDIF}
-
+  if (ParamCount = 2) and (ParamStr(1) = MOCK_LIFECYCLE_CHILD) then
+  begin
+    RunMockLifecycleChild(ParamStr(2));
+    Halt(0);
+  end;
+  {$IFNDEF UNIX}
+  {$IFNDEF MSWINDOWS}
+  WriteLn('HTTPClient.Test skipped: no supported mock-server socket backend');
+  Halt(0);
+  {$ENDIF}
+  {$ENDIF}
+  TestRunnerProgram.AddSuite(THTTPMockServerLifecycle.Create(
+    'HTTP mock server: lifecycle'));
   TestRunnerProgram.AddSuite(THTTPClientByteFetch.Create(
     'HTTPClient: binary-fetch regression'));
   TestRunnerProgram.AddSuite(THTTPClientResourceBounds.Create(
