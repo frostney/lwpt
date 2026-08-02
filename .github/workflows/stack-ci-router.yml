@@ -22,6 +22,7 @@ jobs:
       ${{
         github.event.label.name == 'ci:ready' &&
         contains(github.event.pull_request.labels.*.name, 'stack:managed') &&
+        startsWith(github.event.pull_request.head.ref, 'codex/stack-') &&
         github.event.pull_request.head.repo.full_name == github.repository
       }}
     runs-on: ubuntu-latest
@@ -30,12 +31,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           for _ in {1..24}; do
-            RUN="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow pr.yml \
-              --commit "$HEAD_SHA" --event pull_request --limit 1 \
-              --json databaseId,status --jq '.[0] | [.databaseId, .status] | @tsv')"
+            RUN="$(gh api --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/pr.yml/runs" \
+              -f event=pull_request -f per_page=100 \
+              --jq ".workflow_runs[] | select(.head_sha == \"$HEAD_SHA\") | \
+                select(any(.pull_requests[]?; .number == $PR_NUMBER)) | \
+                [.id, .status] | @tsv" | head -n 1)"
             if [ -n "$RUN" ]; then
               RUN_ID="${RUN%%$'\t'*}"
               RUN_STATUS="${RUN#*$'\t'}"
