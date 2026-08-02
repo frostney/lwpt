@@ -96,7 +96,7 @@ Per the graduation roadmap in ADR-0017, individual packages will graduate to sta
 
 ## Planned work
 
-[`VISION.md`](./VISION.md) owns product direction; GitHub issues and milestones own planned scope and scheduling. Coordinate work on the [registry](https://github.com/frostney/lwpt/issues/29), [link checking](https://github.com/frostney/lwpt/issues/31), [duplication](https://github.com/frostney/lwpt/issues/32), or [codebase health](https://github.com/frostney/lwpt/issues/33) through those issues rather than a drive-by PR. [`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md) owns the project-local release and architecture-conformance gate.
+[`VISION.md`](./VISION.md) owns product direction; GitHub issues and milestones own planned scope and scheduling. Coordinate work on the [registry](https://github.com/frostney/lwpt/issues/29), [link checking](https://github.com/frostney/lwpt/issues/31), or [duplication](https://github.com/frostney/lwpt/issues/32) through those issues rather than a drive-by PR. Codebase-health changes follow the shipped contract in [`docs/health.md`](./docs/health.md). [`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md) owns the project-local release and architecture-conformance gate.
 
 ## Reporting issues
 

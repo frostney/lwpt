@@ -1,6 +1,6 @@
 # Agent Instructions
 
-LWPT is a single-binary Pascal toolkit driven by a single `lwpt.toml` manifest. Ten subcommands (`init`, `install`, `add`, `remove`, `build`, `format`, `test`, `repair`, `run`, `agents`) sit on top of a shared core that emits FPC response fragments the rest of the toolkit consumes.
+LWPT is a single-binary Pascal toolkit driven by a single `lwpt.toml` manifest. Twelve subcommands (`init`, `install`, `add`, `remove`, `build`, `format`, `duplication`, `test`, `repair`, `run`, `health`, `agents`) sit on top of a shared core that emits FPC response fragments the rest of the toolkit consumes.
 
 This file is the operating manual for AI assistants and the canonical contract for what agents may not violate. Detailed how-to material lives under [`docs/`](./docs/); when this file mentions a topic in a sentence or two, the canonical home is one link away.
 
@@ -23,7 +23,7 @@ These would silently corrupt the project if violated.
 - **Compiler outputs are invocation-private.** `lwpt build` and `lwpt test` write executables, units, objects, resources, and compiled hooks only below their unique `.lwpt/sessions/<session-id>/` staging. A build may mutate its public manifest output only through fingerprint revalidation plus `AtomicReplaceFile`; `--clean` forces recompilation and never sweeps shared paths. See [ADR-0020](./docs/adr/0020-isolated-build-sessions.md).
 - **`lwpt install` takes a cross-process lock** at `.lwpt/install.lock` (Unix: `O_CREAT|O_EXCL`; Windows: `LockFileEx`). Two concurrent installs in the same project fail fast with `EConcurrencyError` naming the holder's PID. A crashed install leaves the lock file behind; `lwpt repair` clears it. The lock encompasses the full pipeline: crash-recovery cleanup, resolve, fetch, extract, lockfile + cfg write — and, for the `add` / `remove` mutation flow ([ADR-0019](./docs/adr/0019-add-remove-subcommands.md)), the `lwpt.toml` commit + orphan pruning.
 - **`lwpt.lock` is machine-written, schema v3.** Never hand-edit. The schema records the verbatim manifest source string, the resolver's chosen ref (tag/SHA), the actual archive URL, the extracted-tree sha256, and the cached-archive sha256. `--frozen` re-hashes the archive + tree and compares to both stored hashes. v1 and v2 lockfiles fail to load with a clear migration hint. Corrupt lockfile → delete + re-run `lwpt install` to regenerate. See [ADR-0008](./docs/adr/0008-lockfile-schema-v2-archive-hash.md) (v1→v2 archiveHash split) and [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md) (v2→v3 source-syntax refactor; the last lockfile schema break in v1).
-- **Subcommand surface is frozen.** Adding a new subcommand requires an ADR. Current set: `install`, `add` + `remove` ([ADR-0019](./docs/adr/0019-add-remove-subcommands.md) — manifest-editing frontends to the install transaction; install-before-write ordering and lockfile-diff pruning are part of their contract), `build`, `format`, `test`, `repair`, `init` ([ADR-0010](./docs/adr/0010-init-subcommand.md)), `run` ([ADR-0013](./docs/adr/0013-run-subcommand-and-build-rename.md)), `agents` ([ADR-0027](./docs/adr/0027-agents-subcommand.md) — writes/verifies the marker-fenced command reference in `AGENTS.md`; the generated block below is its dogfooded output). An earlier `export` subcommand was retired per [ADR-0015](./docs/adr/0015-drop-export-testing-becomes-workspace-package.md) when the testing framework graduated to `packages/testing/`. Two more (`lwpt health`, `lwpt duplication`) arrive from a separate workstream; both are pre-approved per [ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md).
+- **Subcommand surface is frozen.** Adding a new subcommand requires an ADR. Current set: `install`, `add` + `remove` ([ADR-0019](./docs/adr/0019-add-remove-subcommands.md) — manifest-editing frontends to the install transaction; install-before-write ordering and lockfile-diff pruning are part of their contract), `build`, `format`, `duplication` and `health` ([ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md), with health's shipped contract in [`docs/health.md`](./docs/health.md)), `test`, `repair`, `init` ([ADR-0010](./docs/adr/0010-init-subcommand.md)), `run` ([ADR-0013](./docs/adr/0013-run-subcommand-and-build-rename.md)), and `agents` ([ADR-0027](./docs/adr/0027-agents-subcommand.md) — writes/verifies the marker-fenced command reference in `AGENTS.md`; the generated block below is its dogfooded output). An earlier `export` subcommand was retired per [ADR-0015](./docs/adr/0015-drop-export-testing-becomes-workspace-package.md) when the testing framework graduated to `packages/testing/`.
 - **No new external dependencies** in the LWPT binary distribution. Contributor / CI tooling (when those workstreams land) is separate; documented in [`docs/tooling.md`](./docs/tooling.md).
 
 ## Runtime / Commands
@@ -82,6 +82,7 @@ Workflow knowledge that is not derivable from the command surface. The generated
 | Add a dependency without `lwpt add` | edit `lwpt.toml`, then `./build/lwpt install` |
 | Update a dependency's version spec | `./build/lwpt add <source@new-version>` (same name → entry updated, stale archive pruned) |
 | Show the version | `./build/lwpt --version` |
+| Report Pascal token clones | `./build/lwpt duplication` (`--json` for the machine envelope) |
 
 <!-- lwpt:agents:begin -->
 
@@ -103,6 +104,8 @@ Generated by `lwpt agents` from the toolkit's command registry and this project'
   - `--verbose` — Replay successful build-entry logs
 - `lwpt format [--check]` — Format uses-clauses and identifiers
   - `--check` — Report files needing formatting without rewriting; exit 1 if any
+- `lwpt duplication [--json]` — Report manifest-scoped Pascal token clones
+  - `--json` — Emit the deterministic machine-readable analysis envelope
 - `lwpt test [--tier default|e2e] [--jobs N] [--bail N] [--verbose]` — Discover and run *.Test.pas files
   - `--tier=<value>` — Test tier to include: default (unit + integration) or e2e (adds network-touching tier)
   - `--jobs=<N>` — Maximum concurrent test programs (default: shared machine budget)
@@ -114,6 +117,9 @@ Generated by `lwpt agents` from the toolkit's command registry and this project'
   - `--force` — Overwrite an existing lwpt.toml without asking
   - `--adopt` — Fill in missing scaffold around an existing manifest without modifying it
 - `lwpt run <script-name> | <subcommand> [subcommand-args...]` — Invoke a user-declared run-script (or a built-in subcommand by name)
+- `lwpt health [--json] [--hotspots]` — Report Pascal complexity and optional Git hotspots
+  - `--json` — Write the deterministic machine-readable report
+  - `--hotspots` — Enrich complexity with the latest 100 commits of local Git churn
 - `lwpt agents [--check]` — Write or verify the agent-facing command reference in AGENTS.md
   - `--check` — Verify the AGENTS.md block matches the current command surface; exit 1 when stale
 

@@ -14,6 +14,10 @@ uses
   LWPT.Core,
   TOML;
 
+const
+  MANIFEST_DUPLICATION_DEFAULT_MINIMUM_TOKENS = 100;
+  MANIFEST_DUPLICATION_MINIMUM_TOKEN_FLOOR = 25;
+
 type
   TLWPTCompilerProfile = record
     Name: string;
@@ -207,6 +211,22 @@ type
     AnalysisConfigured  : Boolean;
     AnalysisIncludes    : TStringArray;
     AnalysisExcludes    : TStringArray;
+    { [health] owns command-specific limits. -1 means absent. Workspaces
+      inherit the root limits unless they declare their own [health] table. }
+    HealthConfigured          : Boolean;
+    HealthMaxRoutineCyclomatic: Integer;
+    HealthMaxRoutineCognitive : Integer;
+    HealthMaxFileCyclomatic   : Integer;
+    HealthMaxFileCognitive    : Integer;
+    HealthMaxHotspotScore     : Integer;
+    { [duplication] owns clone-policy settings. A workspace with its own
+      section replaces the inherited root settings; otherwise callers apply
+      the root configuration. Zero MaximumPercent is meaningful, so the
+      separate flag records whether a threshold was authored. }
+    DuplicationConfigured: Boolean;
+    DuplicationMinimumTokens: Integer;
+    DuplicationMaximumPercentConfigured: Boolean;
+    DuplicationMaximumPercent: Integer;
     { [sources.<name>] entries — user-declared custom git hosts that
       extend the built-in github/gitlab/bitbucket prefixes. See
       ADR-0009 §"Custom hosts". Empty for projects that only use the
@@ -1263,9 +1283,11 @@ const
     NOTE: 'generated' + 'targets' are NOT in this list — both were
     removed in earlier waves and now join the unknown-section
     policy on equal footing with [teddybear]. }
-  KNOWN_SECTIONS: array[0..16] of string = (
+  KNOWN_SECTIONS: array[0..18] of string = (
     'package', 'dependencies', 'sources', 'build', 'version',
-    PROGRAM_NAME, 'format', 'analysis', 'test', 'workspaces', 'compiler',
+    PROGRAM_NAME, 'format', 'analysis', 'health', 'duplication', 'test',
+    'workspaces',
+    'compiler',
     'preinstall', 'postinstall', 'prebuild', 'postbuild',
     'pretest', 'posttest');
   { Reserved section names — names that, if declared as a top-level
@@ -1279,10 +1301,10 @@ const
         anyway because KNOWN_SECTIONS is checked first, but this
         list makes the intent explicit). 'run' itself is included
         because `lwpt run run` is the nonsense case. }
-  RESERVED_SUBCOMMAND_NAMES: array[0..19] of string = (
+  RESERVED_SUBCOMMAND_NAMES: array[0..23] of string = (
     { subcommands }
     'install', 'add', 'remove', 'build', 'format', 'test',
-    'repair', 'init', 'run', 'agents',
+    'repair', 'init', 'run', 'agents', 'health', 'duplication',
     { configuration section names — defensive: ensure 'workspaces',
       'package', 'dependencies' etc can NEVER end up registered as
       run-scripts even if a future refactor reorders KNOWN_SECTIONS
@@ -1291,11 +1313,13 @@ const
       [dependencies] (recognised, parsed for all manifests, never
       runnable). }
     'package', 'dependencies', 'sources', 'workspaces',
-    'version', PROGRAM_NAME, 'format', 'analysis', 'compiler', 'generated');
+    'version', PROGRAM_NAME, 'format', 'analysis', 'health', 'duplication',
+    'compiler', 'generated');
 var
   Root, Deps, DepNode, ArrNode : TTOMLNode;
   BuildNode, EntryNode, VerNode   : TTOMLNode;
-  LwptCfgNode, FmtNode, AnalysisNode, TestNode, BailNode,
+  LwptCfgNode, FmtNode, AnalysisNode, HealthNode, DuplicationNode,
+    MinimumTokensNode, MaximumPercentNode, TestNode, BailNode,
     ExclArr : TTOMLNode;
   SourcesNode, SourceEntry     : TTOMLNode;
   CompilerNode, ProfilesNode, ProfileNode: TTOMLNode;
@@ -1309,7 +1333,7 @@ var
   Hook     : THook;
   Ctx      : TPlaceholderCtx;
   IsKnown  : Boolean;
-  BailValue: Int64;
+  BailValue, DuplicationValue: Int64;
   k        : Integer;
   EntryCtx   : TPlaceholderCtx;
   EntryPath  : string;
@@ -1322,6 +1346,13 @@ begin
     contents survive + the new parse appends on top). Bites
     transitive-resolver walks that load N child manifests. }
   Result := Default(TManifest);
+  Result.HealthMaxRoutineCyclomatic := -1;
+  Result.HealthMaxRoutineCognitive := -1;
+  Result.HealthMaxFileCyclomatic := -1;
+  Result.HealthMaxFileCognitive := -1;
+  Result.HealthMaxHotspotScore := -1;
+  Result.DuplicationMinimumTokens :=
+    MANIFEST_DUPLICATION_DEFAULT_MINIMUM_TOKENS;
   Parser := TTOMLParser.Create;
   Root := nil;
   try
@@ -1543,6 +1574,119 @@ begin
         Result.AnalysisIncludes);
       ReadStrictStringArray(AnalysisNode, 'exclude', 'analysis.exclude',
         Result.AnalysisExcludes);
+    end;
+
+    { [health] limits are strict non-negative integers. Limits are optional;
+      absent values preserve report-only behavior. Hotspot scores use the
+      documented 0..100 normalized scale. }
+    HealthNode := TomlGet(Root, 'health');
+    if HealthNode <> nil then
+    begin
+      if not TomlIsTable(HealthNode) then
+        raise EManifestError.Create('[health] must be a table');
+      Result.HealthConfigured := True;
+      for Pair in HealthNode.Children do
+        if (Pair.Key <> 'max-routine-cyclomatic')
+          and (Pair.Key <> 'max-routine-cognitive')
+          and (Pair.Key <> 'max-file-cyclomatic')
+          and (Pair.Key <> 'max-file-cognitive')
+          and (Pair.Key <> 'max-hotspot-score') then
+          raise EManifestError.CreateFmt(
+            '[health] unknown setting "%s"', [Pair.Key]);
+
+      BailNode := TomlGet(HealthNode, 'max-routine-cyclomatic');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-routine-cyclomatic must be a non-negative integer');
+      BailValue := TomlInt(HealthNode, 'max-routine-cyclomatic', -1);
+      if ((BailNode <> nil) and (BailValue < 0))
+        or (BailValue > High(Integer)) then
+        raise EManifestError.Create(
+          '[health] max-routine-cyclomatic must be a non-negative integer');
+      Result.HealthMaxRoutineCyclomatic := Integer(BailValue);
+
+      BailNode := TomlGet(HealthNode, 'max-routine-cognitive');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-routine-cognitive must be a non-negative integer');
+      BailValue := TomlInt(HealthNode, 'max-routine-cognitive', -1);
+      if ((BailNode <> nil) and (BailValue < 0))
+        or (BailValue > High(Integer)) then
+        raise EManifestError.Create(
+          '[health] max-routine-cognitive must be a non-negative integer');
+      Result.HealthMaxRoutineCognitive := Integer(BailValue);
+
+      BailNode := TomlGet(HealthNode, 'max-file-cyclomatic');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-file-cyclomatic must be a non-negative integer');
+      BailValue := TomlInt(HealthNode, 'max-file-cyclomatic', -1);
+      if ((BailNode <> nil) and (BailValue < 0))
+        or (BailValue > High(Integer)) then
+        raise EManifestError.Create(
+          '[health] max-file-cyclomatic must be a non-negative integer');
+      Result.HealthMaxFileCyclomatic := Integer(BailValue);
+
+      BailNode := TomlGet(HealthNode, 'max-file-cognitive');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-file-cognitive must be a non-negative integer');
+      BailValue := TomlInt(HealthNode, 'max-file-cognitive', -1);
+      if ((BailNode <> nil) and (BailValue < 0))
+        or (BailValue > High(Integer)) then
+        raise EManifestError.Create(
+          '[health] max-file-cognitive must be a non-negative integer');
+      Result.HealthMaxFileCognitive := Integer(BailValue);
+
+      BailNode := TomlGet(HealthNode, 'max-hotspot-score');
+      if (BailNode <> nil) and not TomlIsInt(BailNode) then
+        raise EManifestError.Create(
+          '[health] max-hotspot-score must be an integer from 0 to 100');
+      BailValue := TomlInt(HealthNode, 'max-hotspot-score', -1);
+      if ((BailNode <> nil) and (BailValue < 0)) or (BailValue > 100) then
+        raise EManifestError.Create(
+          '[health] max-hotspot-score must be an integer from 0 to 100');
+      Result.HealthMaxHotspotScore := Integer(BailValue);
+    end;
+
+    { [duplication] — command-owned clone floor and optional quality gate.
+      The shared [analysis] section continues to own file inclusion and
+      exclusion. Integer percentages keep comparison and serialization
+      deterministic on every supported RTL. }
+    DuplicationNode := TomlGet(Root, 'duplication');
+    if DuplicationNode <> nil then
+    begin
+      if not TomlIsTable(DuplicationNode) then
+        raise EManifestError.Create('[duplication] must be a table');
+      Result.DuplicationConfigured := True;
+      MinimumTokensNode := TomlGet(DuplicationNode, 'minimum-tokens');
+      if (MinimumTokensNode <> nil) and not TomlIsInt(MinimumTokensNode) then
+        raise EManifestError.CreateFmt(
+          '[duplication] minimum-tokens must be an integer of at least %d',
+          [MANIFEST_DUPLICATION_MINIMUM_TOKEN_FLOOR]);
+      if MinimumTokensNode <> nil then
+      begin
+        DuplicationValue := TomlInt(DuplicationNode, 'minimum-tokens', -1);
+        if (DuplicationValue < MANIFEST_DUPLICATION_MINIMUM_TOKEN_FLOOR)
+          or (DuplicationValue > High(Integer)) then
+          raise EManifestError.CreateFmt(
+            '[duplication] minimum-tokens must be an integer of at least %d',
+            [MANIFEST_DUPLICATION_MINIMUM_TOKEN_FLOOR]);
+        Result.DuplicationMinimumTokens := Integer(DuplicationValue);
+      end;
+      MaximumPercentNode := TomlGet(DuplicationNode, 'maximum-percent');
+      if (MaximumPercentNode <> nil) and not TomlIsInt(MaximumPercentNode) then
+        raise EManifestError.Create(
+          '[duplication] maximum-percent must be an integer from 0 to 100');
+      if MaximumPercentNode <> nil then
+      begin
+        DuplicationValue := TomlInt(DuplicationNode, 'maximum-percent', -1);
+        if (DuplicationValue < 0) or (DuplicationValue > 100) then
+          raise EManifestError.Create(
+            '[duplication] maximum-percent must be an integer from 0 to 100');
+        Result.DuplicationMaximumPercentConfigured := True;
+        Result.DuplicationMaximumPercent := Integer(DuplicationValue);
+      end;
     end;
 
     { [test] — scheduler policy. Configuration supplies the project

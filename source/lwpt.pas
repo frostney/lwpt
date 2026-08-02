@@ -1,6 +1,6 @@
 { LWPT — lightweight Pascal toolkit.
 
-  One executable, ten subcommands sharing a common core (manifest,
+  One executable, eleven subcommands sharing a common core (manifest,
   TOML, resolver, cfg emitter):
     init      scaffold a new project or adopt an existing manifest
     install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
@@ -8,9 +8,11 @@
     remove    remove dependencies from lwpt.toml + prune their modules
     build     compile manifest [build] entries
     format    format uses-clauses and identifiers (--check to verify only)
+    duplication report manifest-scoped Type-2 Pascal token clones
     test      discover + compile + run *.Test.pas files
     repair    reclaim install, build-session, and worker-lease residue
     run       invoke a user-declared run-script (or alias a subcommand)
+    health    report Pascal complexity and optional Git hotspots
     agents    write/verify the agent-facing command reference in
               AGENTS.md (ADR-0027)
 
@@ -41,7 +43,9 @@ uses
   LWPT.Command.Add,
   LWPT.Command.Agents,
   LWPT.Command.Build,
+  LWPT.Command.Duplication,
   LWPT.Command.Format,
+  LWPT.Command.Health,
   LWPT.Command.Init,
   LWPT.Command.Install,
   LWPT.Command.Remove,
@@ -266,6 +270,35 @@ begin
   end;
 end;
 
+{ --- duplication -------------------------------------------------------- }
+function HandleDuplication(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  JSON: Boolean;
+  i: Integer;
+begin
+  if APositionals.Count <> 0 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('duplication'),
+      'unexpected argument "', APositionals[0],
+      '" (duplication takes no positionals, only --json)');
+    Exit(1);
+  end;
+  JSON := False;
+  for i := 0 to High(AOptions) do
+    if SameText(AOptions[i].LongName, 'json') and AOptions[i].Present then
+      JSON := True;
+  try
+    Result := CmdDuplication(MANIFEST_FILE, JSON);
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('duplication'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
 { --- test --------------------------------------------------------------- }
 function HandleTest(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
@@ -417,6 +450,40 @@ begin
   end;
 end;
 
+{ --- health (ADR-0006) -------------------------------------------------- }
+
+function HandleHealth(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  IncludeHotspots, JSON: Boolean;
+  OptionIndex: Integer;
+begin
+  if APositionals.Count <> 0 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('health'),
+      'health takes no positional arguments');
+    Exit(1);
+  end;
+  IncludeHotspots := False;
+  JSON := False;
+  for OptionIndex := 0 to High(AOptions) do
+    if AOptions[OptionIndex].Present then
+    begin
+      if SameText(AOptions[OptionIndex].LongName, 'json') then JSON := True
+      else if SameText(AOptions[OptionIndex].LongName, 'hotspots') then
+        IncludeHotspots := True;
+    end;
+  try
+    Result := CmdHealth(MANIFEST_FILE, JSON, IncludeHotspots);
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('health'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
 { --- agents (ADR-0027) --------------------------------------------------- }
 function HandleAgents(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
@@ -469,7 +536,8 @@ end;
 { --- registration -------------------------------------------------------- }
 var
   InstallOpts, AddOpts, RemoveOpts, TestOpts, BuildOpts, InitOpts,
-    RunOpts, FormatOpts, RepairOpts, AgentsOpts : TOptionArray;
+    RunOpts, FormatOpts, HealthOpts, DuplicationOpts, RepairOpts,
+    AgentsOpts : TOptionArray;
 begin
   if HandleTopLevelFlags then
   begin
@@ -523,6 +591,13 @@ begin
       'Format uses-clauses and identifiers', '[--check]',
       @HandleFormat, FormatOpts));
 
+    SetLength(DuplicationOpts, 1);
+    DuplicationOpts[0] := TFlagOption.Create('json',
+      'Emit the deterministic machine-readable analysis envelope');
+    Registry.Add(TSubcommand.Create('duplication',
+      'Report manifest-scoped Pascal token clones', '[--json]',
+      @HandleDuplication, DuplicationOpts));
+
     SetLength(TestOpts, 4);
     TestOpts[0] := TStringOption.Create('tier',
       'Test tier to include: default (unit + integration) or e2e (adds network-touching tier)');
@@ -559,6 +634,15 @@ begin
       'Invoke a user-declared run-script (or a built-in subcommand by name)',
       '<script-name> | <subcommand> [subcommand-args...]',
       @HandleRun, RunOpts));
+
+    SetLength(HealthOpts, 2);
+    HealthOpts[0] := TFlagOption.Create('json',
+      'Write the deterministic machine-readable report');
+    HealthOpts[1] := TFlagOption.Create('hotspots',
+      'Enrich complexity with the latest 100 commits of local Git churn');
+    Registry.Add(TSubcommand.Create('health',
+      'Report Pascal complexity and optional Git hotspots',
+      '[--json] [--hotspots]', @HandleHealth, HealthOpts));
 
     SetLength(AgentsOpts, 1);
     AgentsOpts[0] := TFlagOption.Create('check',
