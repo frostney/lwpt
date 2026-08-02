@@ -36,6 +36,9 @@ uses
                 Tests.HTTPMockServer's background server starts }
   BaseUnix,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -86,6 +89,7 @@ type
 const
   MOCK_LIFECYCLE_CHILD = '--mock-lifecycle-child';
   MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS = 2000;
+  MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS = 1000;
 
 { ── helpers ───────────────────────────────────────────────────────── }
 
@@ -243,13 +247,50 @@ begin
     if AScenario = 'connected-silent' then
     begin
       Mock.ConnectWithoutRequest;
-      Sleep(50);
+      Mock.WaitForAccepted;
     end
     else if AScenario <> 'started-unconnected' then
       Halt(2);
   finally
     Mock.Free;
   end;
+end;
+
+procedure ForceKillMockLifecycleChild(const AChild: TProcess);
+begin
+  {$IFDEF UNIX}
+  if (FpKill(AChild.ProcessID, SIGKILL) <> 0) and
+    (FpGetErrNo <> ESysESRCH) then
+    RaiseLastOSError;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  if not Windows.TerminateProcess(AChild.ProcessHandle, 1) and
+    (Windows.WaitForSingleObject(AChild.ProcessHandle, 0) <>
+      Windows.WAIT_OBJECT_0) then
+    RaiseLastOSError;
+  {$ENDIF}
+end;
+
+procedure StopMockLifecycleChild(const AChild: TProcess);
+begin
+  if AChild.ProcessID <= 0 then Exit;
+  if not AChild.Running then
+  begin
+    AChild.WaitOnExit;
+    Exit;
+  end;
+  AChild.Terminate(1);
+  if AChild.WaitOnExit(MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS)
+     or not AChild.Running then
+  begin
+    AChild.WaitOnExit;
+    Exit;
+  end;
+  ForceKillMockLifecycleChild(AChild);
+  if not AChild.WaitOnExit(MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS)
+     and AChild.Running then
+    raise Exception.Create('mock lifecycle child did not stop after force kill');
+  AChild.WaitOnExit;
 end;
 
 procedure RunBoundedMockLifecycleChild(const AScenario: string);
@@ -270,12 +311,13 @@ begin
         MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS) do
       Sleep(10);
     TimedOut := Child.Running;
-    if TimedOut then Child.Terminate(1);
-    Child.WaitOnExit;
+    if TimedOut then StopMockLifecycleChild(Child)
+    else
+      Child.WaitOnExit;
     Expect<Boolean>(TimedOut).ToBe(False);
     if not TimedOut then Expect<Integer>(Child.ExitStatus).ToBe(0);
   finally
-    if Child.Running then Child.Terminate(1);
+    StopMockLifecycleChild(Child);
     Child.Free;
   end;
 end;
@@ -313,6 +355,14 @@ begin
       0, 0, 0);
     Expect<Boolean>(ErrorMessage <> '').ToBe(True);
     Mock := TMockHTTPServer.Create(nil);
+    try
+      Mock.Start;
+      Mock.ConnectWithoutRequest;
+      Mock.WaitForAccepted;
+    finally
+      Mock.Free;
+    end;
+    Mock := TMockHTTPServer.Create(nil);
     Mock.Free;
   end;
   AfterResources := GetMockServerResourceSnapshot;
@@ -322,6 +372,8 @@ begin
     BeforeResources.LiveThreads);
   Expect<Integer>(AfterResources.WinSockReferences).ToBe(
     BeforeResources.WinSockReferences);
+  Expect<Integer>(AfterResources.ProcessHandles).ToBe(
+    BeforeResources.ProcessHandles);
 end;
 
 procedure THTTPMockServerLifecycle.SetupTests;

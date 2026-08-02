@@ -36,7 +36,7 @@ uses
   Classes,
   SysUtils
   {$IFDEF UNIX}, Sockets {$ENDIF}
-  {$IFDEF MSWINDOWS}, WinSock2 {$ENDIF};
+  {$IFDEF MSWINDOWS}, Windows, WinSock2 {$ENDIF};
 
 type
   TByteArrays = array of TBytes;
@@ -53,6 +53,7 @@ type
     OpenSockets: Integer;
     LiveThreads: Integer;
     WinSockReferences: Integer;
+    ProcessHandles: Integer;
   end;
 
   TMockHTTPServer = class
@@ -76,6 +77,7 @@ type
     destructor Destroy; override;
     procedure ConnectWithoutRequest;
     procedure Start;      { launches the background accept-and-serve thread }
+    procedure WaitForAccepted;
     procedure WaitDone;   { blocks until the thread finishes }
     property Port: Word read FPort;
   end;
@@ -103,10 +105,22 @@ var
   GMockWinSockReferences: Integer = 0;
 
 function GetMockServerResourceSnapshot: TMockServerResourceSnapshot;
+{$IFDEF MSWINDOWS}
+var
+  ProcessHandleCount: DWORD;
+{$ENDIF}
 begin
   Result.OpenSockets := GMockOpenSockets;
   Result.LiveThreads := GMockLiveThreads;
   Result.WinSockReferences := GMockWinSockReferences;
+  {$IFDEF MSWINDOWS}
+  if not Windows.GetProcessHandleCount(Windows.GetCurrentProcess,
+    ProcessHandleCount) then
+    RaiseLastOSError;
+  Result.ProcessHandles := ProcessHandleCount;
+  {$ELSE}
+  Result.ProcessHandles := 0;
+  {$ENDIF}
 end;
 
 {$IF DEFINED(UNIX) OR DEFINED(MSWINDOWS)}
@@ -279,6 +293,7 @@ type
     FCriticalSection: TRTLCriticalSection;
     FListenSock: TSocket;
     FClientSock: TSocket;
+    FAccepted: LongInt;
     FBytesPerWrite: Integer;
     FInitialDelayMilliseconds: Integer;
     FPort: Word;
@@ -294,6 +309,7 @@ type
       AInitialDelayMilliseconds: Integer);
     destructor Destroy; override;
     procedure Stop;
+    function WaitForAccepted(const ATimeoutMilliseconds: Cardinal): Boolean;
   end;
 
 constructor TMockServerThread.Create(AListenSock: TSocket;
@@ -310,6 +326,7 @@ begin
   end;
   FListenSock := AListenSock;
   FClientSock := InvalidMockSocket;
+  FAccepted := 0;
   FPort := APort;
   FResponse := AResponse;
   FBytesPerWrite := ABytesPerWrite;
@@ -372,6 +389,20 @@ begin
   end;
 end;
 
+function TMockServerThread.WaitForAccepted(
+  const ATimeoutMilliseconds: Cardinal): Boolean;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while InterlockedCompareExchange(FAccepted, 0, 0) = 0 do
+  begin
+    if GetTickCount64 - StartedAt >= ATimeoutMilliseconds then Exit(False);
+    Sleep(1);
+  end;
+  Result := True;
+end;
+
 procedure TMockServerThread.Execute;
 var
   ClientSock: TSocket;
@@ -401,6 +432,7 @@ begin
     EnterCriticalSection(FCriticalSection);
     try
       FClientSock := ClientSock;
+      InterlockedExchange(FAccepted, 1);
     finally
       LeaveCriticalSection(FCriticalSection);
     end;
@@ -624,6 +656,16 @@ begin
     FBytesPerWrite, FWriteDelayMilliseconds, FInitialDelayMilliseconds);
   FListenSock := InvalidMockSocket;
   FThread.Start;
+  {$ENDIF}
+end;
+
+procedure TMockHTTPServer.WaitForAccepted;
+begin
+  {$IF DEFINED(UNIX) OR DEFINED(MSWINDOWS)}
+  if not Assigned(FThread) then
+    raise EMockServerError.Create('mock server is not started');
+  if not TMockServerThread(FThread).WaitForAccepted(2000) then
+    raise EMockServerError.Create('mock server did not accept the client');
   {$ENDIF}
 end;
 
