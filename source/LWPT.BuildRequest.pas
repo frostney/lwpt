@@ -12,6 +12,7 @@ uses
   LWPT.Core;
 
 const
+  COMPILER_PROBE_REQUEST_SCHEMA_VERSION = 1;
   BUILD_REQUEST_SCHEMA_VERSION = 2;
   BUILD_RESULT_SCHEMA_VERSION = 1;
   COMPILER_CAPABILITIES_SCHEMA_VERSION = 1;
@@ -43,6 +44,12 @@ type
     Environment: string;
   end;
   TLWPTTargetArray = array of TLWPTTarget;
+
+  TLWPTCompilerProbeRequest = record
+    SchemaVersion: Integer;
+    Compiler: TLWPTCompilerRequest;
+    Target: TLWPTTarget;
+  end;
 
   TLWPTBuildInputs = record
     Sources: TStringArray;
@@ -116,12 +123,25 @@ type
 function DefaultBuildRequest: TLWPTBuildRequest;
 function DefaultBuildResult: TLWPTBuildResult;
 function DefaultCompilerCapabilities: TLWPTCompilerCapabilities;
+function DefaultCompilerProbeRequest: TLWPTCompilerProbeRequest;
+procedure ValidateCompilerProbeRequest(
+  const ARequest: TLWPTCompilerProbeRequest);
 procedure ValidateBuildRequest(const ARequest: TLWPTBuildRequest);
 procedure ValidateBuildResult(const AResult: TLWPTBuildResult);
 procedure ValidateCompilerCapabilities(
   const ACapabilities: TLWPTCompilerCapabilities);
 function SerializeBuildRequest(const ARequest: TLWPTBuildRequest): string;
 function ParseBuildRequest(const AText: string): TLWPTBuildRequest;
+function SerializeCompilerProbeRequest(
+  const ARequest: TLWPTCompilerProbeRequest): string;
+function ParseCompilerProbeRequest(
+  const AText: string): TLWPTCompilerProbeRequest;
+function SerializeBuildResult(const AResult: TLWPTBuildResult): string;
+function ParseBuildResult(const AText: string): TLWPTBuildResult;
+function SerializeCompilerCapabilities(
+  const ACapabilities: TLWPTCompilerCapabilities): string;
+function ParseCompilerCapabilities(
+  const AText: string): TLWPTCompilerCapabilities;
 function BuildRequestIsCompatible(const ARequest: TLWPTBuildRequest;
   const ACapabilities: TLWPTCompilerCapabilities;
   out AReason: string): Boolean;
@@ -150,6 +170,12 @@ function DefaultCompilerCapabilities: TLWPTCompilerCapabilities;
 begin
   Result := Default(TLWPTCompilerCapabilities);
   Result.SchemaVersion := COMPILER_CAPABILITIES_SCHEMA_VERSION;
+end;
+
+function DefaultCompilerProbeRequest: TLWPTCompilerProbeRequest;
+begin
+  Result := Default(TLWPTCompilerProbeRequest);
+  Result.SchemaVersion := COMPILER_PROBE_REQUEST_SCHEMA_VERSION;
 end;
 
 procedure RequireSupportedSchema(const AName: string;
@@ -187,6 +213,22 @@ begin
   if ATarget.Architecture = '' then
     raise ELWPTBuildRequestError.CreateFmt(
       '%s target architecture must not be empty', [AContext]);
+end;
+
+procedure ValidateCompilerProbeRequest(
+  const ARequest: TLWPTCompilerProbeRequest);
+begin
+  RequireSupportedSchema('compiler probe request', ARequest.SchemaVersion,
+    COMPILER_PROBE_REQUEST_SCHEMA_VERSION);
+  RequireValue('compiler.id', ARequest.Compiler.ID);
+  if (ARequest.Compiler.VersionConstraint = '')
+     and (ARequest.Compiler.VersionIdentity = '') then
+    raise ELWPTBuildRequestError.Create(
+      'compiler probe request needs compiler.version_constraint or '
+      + 'compiler.version_identity');
+  if (ARequest.Target.OS = '') xor (ARequest.Target.Architecture = '') then
+    raise ELWPTBuildRequestError.Create(
+      'compiler probe target needs both OS and architecture or neither');
 end;
 
 procedure ValidateBuildRequest(const ARequest: TLWPTBuildRequest);
@@ -446,6 +488,270 @@ begin
     Result.Outputs.ResourceDirectory :=
       TomlStr(Section, 'resource_directory', '');
     ValidateBuildRequest(Result);
+  finally
+    Root.Free;
+  end;
+end;
+
+function ParseProtocolDocument(const AText, AName: string): TTOMLNode;
+var
+  Parser: TTOMLParser;
+begin
+  Parser := TTOMLParser.Create;
+  try
+    try
+      Result := Parser.ParseDocument(AText);
+    except
+      on E: ETOMLParseError do
+        raise ELWPTBuildRequestError.Create(
+          'invalid ' + AName + ' TOML: ' + E.Message);
+    end;
+  finally
+    Parser.Free;
+  end;
+end;
+
+procedure AddCompilerAndTarget(const ACompiler: TLWPTCompilerRequest;
+  const ATarget: TLWPTTarget; const ALines: TStrings);
+begin
+  ALines.Add('[compiler]');
+  ALines.Add('id = "' + TomlEscape(ACompiler.ID) + '"');
+  ALines.Add('version_constraint = "'
+    + TomlEscape(ACompiler.VersionConstraint) + '"');
+  ALines.Add('version_identity = "'
+    + TomlEscape(ACompiler.VersionIdentity) + '"');
+  ALines.Add('');
+  ALines.Add('[target]');
+  ALines.Add('os = "' + TomlEscape(ATarget.OS) + '"');
+  ALines.Add('architecture = "'
+    + TomlEscape(ATarget.Architecture) + '"');
+  ALines.Add('abi = "' + TomlEscape(ATarget.ABI) + '"');
+  ALines.Add('environment = "' + TomlEscape(ATarget.Environment) + '"');
+end;
+
+function SerializeCompilerProbeRequest(
+  const ARequest: TLWPTCompilerProbeRequest): string;
+var
+  Lines: TStringList;
+begin
+  ValidateCompilerProbeRequest(ARequest);
+  Lines := TStringList.Create;
+  try
+    Lines.LineBreak := #10;
+    Lines.Add('schema = ' + IntToStr(ARequest.SchemaVersion));
+    Lines.Add('');
+    AddCompilerAndTarget(ARequest.Compiler, ARequest.Target, Lines);
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+function ParseCompilerProbeRequest(
+  const AText: string): TLWPTCompilerProbeRequest;
+var
+  Root, Section: TTOMLNode;
+begin
+  Result := DefaultCompilerProbeRequest;
+  Root := ParseProtocolDocument(AText, 'compiler probe request');
+  try
+    Result.SchemaVersion := TomlInt(Root, 'schema', 0);
+    Section := TomlGet(Root, 'compiler');
+    Result.Compiler.ID := TomlStr(Section, 'id', '');
+    Result.Compiler.VersionConstraint := TomlStr(Section,
+      'version_constraint', '');
+    Result.Compiler.VersionIdentity := TomlStr(Section,
+      'version_identity', '');
+    Section := TomlGet(Root, 'target');
+    Result.Target.OS := TomlStr(Section, 'os', '');
+    Result.Target.Architecture := TomlStr(Section, 'architecture', '');
+    Result.Target.ABI := TomlStr(Section, 'abi', '');
+    Result.Target.Environment := TomlStr(Section, 'environment', '');
+    ValidateCompilerProbeRequest(Result);
+  finally
+    Root.Free;
+  end;
+end;
+
+function TomlBoolean(ANode: TTOMLNode; const AKey: string;
+  const ADefault: Boolean): Boolean;
+var
+  ValueNode: TTOMLNode;
+begin
+  ValueNode := TomlGet(ANode, AKey);
+  if (ValueNode = nil) or (ValueNode.Kind <> tnkScalar)
+     or (ValueNode.ScalarKind <> tskBool) then Exit(ADefault);
+  Result := ValueNode.ScalarText = 'true';
+end;
+
+function SerializeCompilerCapabilities(
+  const ACapabilities: TLWPTCompilerCapabilities): string;
+var
+  Lines: TStringList;
+  i: Integer;
+begin
+  ValidateCompilerCapabilities(ACapabilities);
+  Lines := TStringList.Create;
+  try
+    Lines.LineBreak := #10;
+    Lines.Add('schema = ' + IntToStr(ACapabilities.SchemaVersion));
+    Lines.Add('compiler_id = "' + TomlEscape(ACapabilities.CompilerID) + '"');
+    Lines.Add('version_identity = "'
+      + TomlEscape(ACapabilities.VersionIdentity) + '"');
+    Lines.Add('output_kinds = ' + TomlArray(ACapabilities.OutputKinds));
+    Lines.Add('modes = ' + TomlArray(ACapabilities.Modes));
+    for i := 0 to High(ACapabilities.Targets) do
+    begin
+      Lines.Add('');
+      Lines.Add('[[targets]]');
+      Lines.Add('os = "' + TomlEscape(ACapabilities.Targets[i].OS) + '"');
+      Lines.Add('architecture = "'
+        + TomlEscape(ACapabilities.Targets[i].Architecture) + '"');
+      Lines.Add('abi = "' + TomlEscape(ACapabilities.Targets[i].ABI) + '"');
+      Lines.Add('environment = "'
+        + TomlEscape(ACapabilities.Targets[i].Environment) + '"');
+    end;
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+function ParseCompilerCapabilities(
+  const AText: string): TLWPTCompilerCapabilities;
+var
+  Root, Targets, TargetNode: TTOMLNode;
+  i: Integer;
+begin
+  Result := DefaultCompilerCapabilities;
+  Root := ParseProtocolDocument(AText, 'compiler capabilities');
+  try
+    Result.SchemaVersion := TomlInt(Root, 'schema', 0);
+    Result.CompilerID := TomlStr(Root, 'compiler_id', '');
+    Result.VersionIdentity := TomlStr(Root, 'version_identity', '');
+    ReadStringArray(Root, 'output_kinds', Result.OutputKinds);
+    ReadStringArray(Root, 'modes', Result.Modes);
+    Targets := TomlGet(Root, 'targets');
+    if TomlIsArray(Targets) then
+    begin
+      SetLength(Result.Targets, Targets.Items.Count);
+      for i := 0 to Targets.Items.Count - 1 do
+      begin
+        TargetNode := Targets.Items[i];
+        Result.Targets[i].OS := TomlStr(TargetNode, 'os', '');
+        Result.Targets[i].Architecture := TomlStr(TargetNode,
+          'architecture', '');
+        Result.Targets[i].ABI := TomlStr(TargetNode, 'abi', '');
+        Result.Targets[i].Environment := TomlStr(TargetNode,
+          'environment', '');
+      end;
+    end;
+    ValidateCompilerCapabilities(Result);
+  finally
+    Root.Free;
+  end;
+end;
+
+function SerializeBuildResult(const AResult: TLWPTBuildResult): string;
+var
+  Lines: TStringList;
+  i: Integer;
+begin
+  ValidateBuildResult(AResult);
+  Lines := TStringList.Create;
+  try
+    Lines.LineBreak := #10;
+    Lines.Add('schema = ' + IntToStr(AResult.SchemaVersion));
+    if AResult.Success then Lines.Add('success = true')
+    else Lines.Add('success = false');
+    for i := 0 to High(AResult.Diagnostics) do
+    begin
+      Lines.Add('');
+      Lines.Add('[[diagnostics]]');
+      Lines.Add('severity = "'
+        + TomlEscape(AResult.Diagnostics[i].Severity) + '"');
+      Lines.Add('code = "' + TomlEscape(AResult.Diagnostics[i].Code) + '"');
+      Lines.Add('message = "'
+        + TomlEscape(AResult.Diagnostics[i].MessageText) + '"');
+      Lines.Add('path = "' + TomlEscape(AResult.Diagnostics[i].Path) + '"');
+      Lines.Add('line = ' + IntToStr(AResult.Diagnostics[i].Line));
+      Lines.Add('column = ' + IntToStr(AResult.Diagnostics[i].Column));
+    end;
+    for i := 0 to High(AResult.Artifacts) do
+    begin
+      Lines.Add('');
+      Lines.Add('[[artifacts]]');
+      Lines.Add('kind = "' + TomlEscape(AResult.Artifacts[i].Kind) + '"');
+      Lines.Add('path = "' + TomlEscape(AResult.Artifacts[i].Path) + '"');
+      Lines.Add('digest = "' + TomlEscape(AResult.Artifacts[i].Digest) + '"');
+    end;
+    for i := 0 to High(AResult.Dependencies) do
+    begin
+      Lines.Add('');
+      Lines.Add('[[dependencies]]');
+      Lines.Add('name = "'
+        + TomlEscape(AResult.Dependencies[i].Name) + '"');
+      Lines.Add('version = "'
+        + TomlEscape(AResult.Dependencies[i].Version) + '"');
+      Lines.Add('source = "'
+        + TomlEscape(AResult.Dependencies[i].Source) + '"');
+    end;
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+function ParseBuildResult(const AText: string): TLWPTBuildResult;
+var
+  Root, Values, ValueNode: TTOMLNode;
+  i: Integer;
+begin
+  Result := DefaultBuildResult;
+  Root := ParseProtocolDocument(AText, 'build result');
+  try
+    Result.SchemaVersion := TomlInt(Root, 'schema', 0);
+    Result.Success := TomlBoolean(Root, 'success', False);
+    Values := TomlGet(Root, 'diagnostics');
+    if TomlIsArray(Values) then
+    begin
+      SetLength(Result.Diagnostics, Values.Items.Count);
+      for i := 0 to Values.Items.Count - 1 do
+      begin
+        ValueNode := Values.Items[i];
+        Result.Diagnostics[i].Severity := TomlStr(ValueNode, 'severity', '');
+        Result.Diagnostics[i].Code := TomlStr(ValueNode, 'code', '');
+        Result.Diagnostics[i].MessageText := TomlStr(ValueNode, 'message', '');
+        Result.Diagnostics[i].Path := TomlStr(ValueNode, 'path', '');
+        Result.Diagnostics[i].Line := TomlInt(ValueNode, 'line', 0);
+        Result.Diagnostics[i].Column := TomlInt(ValueNode, 'column', 0);
+      end;
+    end;
+    Values := TomlGet(Root, 'artifacts');
+    if TomlIsArray(Values) then
+    begin
+      SetLength(Result.Artifacts, Values.Items.Count);
+      for i := 0 to Values.Items.Count - 1 do
+      begin
+        ValueNode := Values.Items[i];
+        Result.Artifacts[i].Kind := TomlStr(ValueNode, 'kind', '');
+        Result.Artifacts[i].Path := TomlStr(ValueNode, 'path', '');
+        Result.Artifacts[i].Digest := TomlStr(ValueNode, 'digest', '');
+      end;
+    end;
+    Values := TomlGet(Root, 'dependencies');
+    if TomlIsArray(Values) then
+    begin
+      SetLength(Result.Dependencies, Values.Items.Count);
+      for i := 0 to Values.Items.Count - 1 do
+      begin
+        ValueNode := Values.Items[i];
+        Result.Dependencies[i].Name := TomlStr(ValueNode, 'name', '');
+        Result.Dependencies[i].Version := TomlStr(ValueNode, 'version', '');
+        Result.Dependencies[i].Source := TomlStr(ValueNode, 'source', '');
+      end;
+    end;
+    ValidateBuildResult(Result);
   finally
     Root.Free;
   end;

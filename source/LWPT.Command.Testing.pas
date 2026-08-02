@@ -7,8 +7,14 @@ unit LWPT.Command.Testing;
 
 interface
 
+uses
+  LWPT.CompilerRegistry;
+
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
-  const AJobs, ABail: Integer; const AVerbose: Boolean): Integer;
+  const AJobs, ABail: Integer; const AVerbose: Boolean): Integer; overload;
+function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
+  const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const ACompilerHost: TLWPTCompilerHost): Integer; overload;
 
 implementation
 
@@ -21,10 +27,9 @@ uses
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.CompilerDriver,
-  LWPT.CompilerDriver.FPC,
   LWPT.Core,
   LWPT.Manifest,
-  LWPT.ProcessTree,
+  LWPT.ProcessRunner,
   LWPT.WorkerBudget;
 
 type
@@ -41,7 +46,7 @@ type
     ExitCode: Integer;
     Status: TTestJobStatus;
     StartedAt: QWord;
-    ActiveProcessTree: TLWPTProcessTree;
+    ActiveProcessRunner: TLWPTDuplexProcessRunner;
   end;
 
   TTestProgressKind = (tpkStart, tpkTerminal);
@@ -90,11 +95,14 @@ type
     function ClaimJob(out AIndex: Integer): Boolean;
     function AcquireLease: TLWPTWorkerLease;
     function StartProcess(const AIndex: Integer;
-      const AProcessTree: TLWPTProcessTree): Boolean;
+      const AProcessRunner: TLWPTDuplexProcessRunner;
+      const AOptions: TLWPTProcessRunOptions): Boolean;
     procedure FinishProcess(const AIndex: Integer;
-      const AProcessTree: TLWPTProcessTree);
+      const AProcessRunner: TLWPTDuplexProcessRunner);
     function RunProcess(const AIndex: Integer; const AProcess: TProcess;
-      out AOutput: string): Integer;
+      const AStandardInput: string; const ASeparateStandardError: Boolean;
+      const ATimeoutMilliseconds: QWord; const AOperationName: string;
+      out AStandardOutput, AStandardError: string): Integer;
     procedure SetJobStage(const AIndex: Integer;
       const AStatus: TTestJobStatus;
       const ABinary: string = '');
@@ -119,7 +127,7 @@ type
       const AIncludeE2E: Boolean; const AUnitPaths: TStringArray;
       const ABuildRoot: string; const AJobs, ABail: Integer;
       const ASession: TLWPTBuildSession; const AProjectRoot: string;
-      const AVerbose: Boolean);
+      const AVerbose: Boolean; const ACompilerDriver: TLWPTCompilerDriver);
     destructor Destroy; override;
     procedure Run;
     procedure PrintResults(const AProjectRoot: string; out APassed,
@@ -166,20 +174,6 @@ begin
   Normalised := StringReplace(APath, '\', '/', [rfReplaceAll]);
   Result := (Pos('/tests/e2e/', Normalised) > 0)
          or (Pos('tests/e2e/', Normalised) = 1);
-end;
-
-function DrainProcessOutput(AProcess: TProcess): string;
-var
-  Buffer: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
-  Count: LongInt;
-begin
-  Result := '';
-  while AProcess.Output.NumBytesAvailable > 0 do
-  begin
-    Count := AProcess.Output.Read(Buffer[0], SizeOf(Buffer));
-    if Count <= 0 then Break;
-    AppendRawBytes(Result, Buffer[0], Count);
-  end;
 end;
 
 procedure CopyCurrentEnvironment(AEnvironment: TStrings);
@@ -229,13 +223,13 @@ constructor TTestScheduler.Create(const ATests: TStringList;
   const AIncludeE2E: Boolean; const AUnitPaths: TStringArray;
   const ABuildRoot: string; const AJobs, ABail: Integer;
   const ASession: TLWPTBuildSession; const AProjectRoot: string;
-  const AVerbose: Boolean);
+  const AVerbose: Boolean; const ACompilerDriver: TLWPTCompilerDriver);
 var
   i, Runnable, RequestedWorkers: Integer;
 begin
   inherited Create;
   InitCriticalSection(FCriticalSection);
-  FCompilerDriver := TLWPTFPCCompilerDriver.Create;
+  FCompilerDriver := ACompilerDriver;
   FWorkers := TList.Create;
   FBuildRoot := ABuildRoot;
   FSession := ASession;
@@ -279,7 +273,6 @@ begin
   for i := 0 to FWorkers.Count - 1 do TTestWorker(FWorkers[i]).Free;
   FWorkers.Free;
   FBudgetSession.Free;
-  FCompilerDriver.Free;
   DoneCriticalSection(FCriticalSection);
   inherited Destroy;
 end;
@@ -319,17 +312,18 @@ begin
 end;
 
 function TTestScheduler.StartProcess(const AIndex: Integer;
-  const AProcessTree: TLWPTProcessTree): Boolean;
+  const AProcessRunner: TLWPTDuplexProcessRunner;
+  const AOptions: TLWPTProcessRunOptions): Boolean;
 begin
   Result := False;
   EnterCriticalSection(FCriticalSection);
   try
     if FCancelled then Exit;
-    FJobs[AIndex].ActiveProcessTree := AProcessTree;
+    FJobs[AIndex].ActiveProcessRunner := AProcessRunner;
     try
-      AProcessTree.Execute;
+      AProcessRunner.Start(AOptions);
     except
-      FJobs[AIndex].ActiveProcessTree := nil;
+      FJobs[AIndex].ActiveProcessRunner := nil;
       raise;
     end;
     Result := True;
@@ -339,49 +333,43 @@ begin
 end;
 
 procedure TTestScheduler.FinishProcess(const AIndex: Integer;
-  const AProcessTree: TLWPTProcessTree);
+  const AProcessRunner: TLWPTDuplexProcessRunner);
 begin
   EnterCriticalSection(FCriticalSection);
   try
-    if FJobs[AIndex].ActiveProcessTree = AProcessTree then
-      FJobs[AIndex].ActiveProcessTree := nil;
+    if FJobs[AIndex].ActiveProcessRunner = AProcessRunner then
+      FJobs[AIndex].ActiveProcessRunner := nil;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
 end;
 
 function TTestScheduler.RunProcess(const AIndex: Integer;
-  const AProcess: TProcess; out AOutput: string): Integer;
+  const AProcess: TProcess; const AStandardInput: string;
+  const ASeparateStandardError: Boolean; const ATimeoutMilliseconds: QWord;
+  const AOperationName: string; out AStandardOutput, AStandardError: string):
+  Integer;
 var
-  ProcessTree: TLWPTProcessTree;
+  ProcessRunner: TLWPTDuplexProcessRunner;
+  Options: TLWPTProcessRunOptions;
 begin
   Result := 1;
-  AOutput := '';
-  AProcess.Options := [poUsePipes, poStderrToOutPut];
-  ProcessTree := TLWPTProcessTree.Create(AProcess);
+  AStandardOutput := '';
+  AStandardError := '';
+  Options := DefaultProcessRunOptions(AOperationName);
+  Options.SeparateStandardError := ASeparateStandardError;
+  Options.TimeoutMilliseconds := ATimeoutMilliseconds;
+  ProcessRunner := TLWPTDuplexProcessRunner.Create(AProcess);
   try
-    if not StartProcess(AIndex, ProcessTree) then Exit;
+    if not StartProcess(AIndex, ProcessRunner, Options) then Exit;
     try
-      while AProcess.Running do
-      begin
-        if AProcess.Output.NumBytesAvailable > 0 then
-          AOutput := AOutput + DrainProcessOutput(AProcess);
-        Sleep(10);
-      end;
-      if AProcess.Output.NumBytesAvailable > 0 then
-        AOutput := AOutput + DrainProcessOutput(AProcess);
-      AProcess.WaitOnExit;
-      { The Running poll above usually reaps the child with the raw
-        status, where ExitCode decodes correctly — but a signal death
-        still reads as 0 there, and losing the race to WaitOnExit drops
-        nonzero exits too (see NormalisedExitCode). A crashed test
-        binary must never count as a pass. }
-      Result := NormalisedExitCode(AProcess);
+      Result := ProcessRunner.Communicate(AStandardInput, Options,
+        AStandardOutput, AStandardError);
     finally
-      FinishProcess(AIndex, ProcessTree);
+      FinishProcess(AIndex, ProcessRunner);
     end;
   finally
-    ProcessTree.Free;
+    ProcessRunner.Free;
   end;
 end;
 
@@ -441,9 +429,9 @@ begin
   begin
     if FJobs[i].Status = tjsPending then
       FJobs[i].Status := tjsCancelled;
-    if FJobs[i].ActiveProcessTree <> nil then
+    if FJobs[i].ActiveProcessRunner <> nil then
       try
-        FJobs[i].ActiveProcessTree.Terminate;
+        FJobs[i].ActiveProcessRunner.Cancel;
       except
         on E: Exception do
         begin
@@ -505,7 +493,7 @@ procedure TTestScheduler.RunOne(const AIndex: Integer;
   const ALease: TLWPTWorkerLease);
 var
   CompilerProcess, TestProcess: TProcess;
-  Binary, Output: string;
+  Binary, Output, StandardOutput, StandardError: string;
   BuildRequest: TLWPTBuildRequest;
   BuildResult: TLWPTBuildResult;
   Code: Integer;
@@ -524,12 +512,21 @@ begin
     end;
   end;
   try
-    Code := RunProcess(AIndex, CompilerProcess, Output);
+    Code := RunProcess(AIndex, CompilerProcess,
+      FCompilerDriver.BuildStandardInput(BuildRequest),
+      FCompilerDriver.SeparateStandardError,
+      FCompilerDriver.CompilationTimeoutMilliseconds,
+      'compiler "' + FCompilerDriver.CompilerID + '" compile',
+      StandardOutput, StandardError);
   finally
     CompilerProcess.Free;
   end;
+  Output := FCompilerDriver.DisplayOutput(StandardOutput, StandardError);
   SetJobOutput(AIndex, True, Output);
-  BuildResult := FCompilerDriver.NormalizeResult(BuildRequest, Code, Output);
+  BuildResult := FCompilerDriver.NormalizeExecutionResult(BuildRequest, Code,
+    StandardOutput, StandardError);
+  ValidateReportedArtifacts(FCompilerDriver.CompilerID, BuildRequest,
+    BuildResult);
   if IsCancelled then
   begin
     CompleteJob(AIndex, tjsCancelled);
@@ -553,7 +550,8 @@ begin
     TestProcess.Executable := Binary;
     CopyCurrentEnvironment(TestProcess.Environment);
     AppendWorkerLeaseEnvironment(TestProcess.Environment, ALease);
-    Code := RunProcess(AIndex, TestProcess, Output);
+    Code := RunProcess(AIndex, TestProcess, '', False, 0,
+      'test executable', Output, StandardError);
   finally
     TestProcess.Free;
   end;
@@ -849,6 +847,13 @@ end;
 
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
   const AJobs, ABail: Integer; const AVerbose: Boolean): Integer;
+begin
+  Result := CmdTest(AManifestPath, AIncludeE2E, AJobs, ABail, AVerbose, nil);
+end;
+
+function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
+  const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const ACompilerHost: TLWPTCompilerHost): Integer;
 const
   TESTS_SUPPORT_DIR = 'tests/support';
 var
@@ -860,6 +865,8 @@ var
     EffectiveBail: Integer;
   Session: TLWPTBuildSession;
   Scheduler: TTestScheduler;
+  CompilerSelection: TLWPTCompilerSelection;
+  CompilerDriver: TLWPTCompilerDriver;
   StartedAt: QWord;
 begin
   StartedAt := GetTickCount64;
@@ -868,6 +875,7 @@ begin
   Skipped := 0;
   CompileFailed := 0;
   Cancelled := 0;
+  CompilerSelection := nil;
   try
     try
       Result := 1;
@@ -875,6 +883,9 @@ begin
       if ABail < 0 then EffectiveBail := Man.TestBail
       else EffectiveBail := ABail;
       ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
+      CompilerSelection := TLWPTCompilerSelection.Create(Man, ProjectRoot,
+        ACompilerHost);
+      CompilerDriver := CompilerSelection.DriverFor('');
       Session := TLWPTBuildSession.Create(ProjectRoot);
       try
         WriteLn('test session: ', Session.SessionID, ' (',
@@ -942,7 +953,7 @@ begin
         WriteLn('  (e2e tier skipped; pass --tier=e2e to include)');
       Scheduler := TTestScheduler.Create(Tests, AIncludeE2E, UnitPaths,
         Session.JobRoot('tests'), AJobs, EffectiveBail, Session, ProjectRoot,
-        AVerbose);
+        AVerbose, CompilerDriver);
       try
         WriteLn('effective workers: ', Scheduler.EffectiveWorkerCount);
         Scheduler.Run;
@@ -978,6 +989,7 @@ begin
       end;
     end;
   finally
+    CompilerSelection.Free;
     WriteLn('summary: ', Passed, ' passed, ', Failed, ' failed, ',
       CompileFailed, ' did not compile, ', Skipped, ' skipped, ',
       Cancelled, ' cancelled; elapsed ',

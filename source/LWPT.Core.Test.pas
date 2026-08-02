@@ -58,6 +58,8 @@ type
     procedure TestBuildEntriesTable;
     procedure TestVersionSection;
     procedure TestManifestSnapshotBindsParsedBytes;
+    procedure TestRootCompilerProfilesParsed;
+    procedure TestDependencyCompilerPolicyIgnored;
   end;
 
   TLoadManifestValidation = class(TTestSuite)
@@ -673,6 +675,62 @@ begin
   Expect<string>(Man.Version).ToBe('1.2.3');
 end;
 
+procedure TLoadManifestHappy.TestRootCompilerProfilesParsed;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "compiler-profiles"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler]'#10 +
+    'default = "native"'#10 +
+    ''#10 +
+    '[compiler.profiles.native]'#10 +
+    'driver = "fpc"'#10 +
+    'executable = "custom-fpc"'#10 +
+    'version = "^3.2.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'source = "source/app.pas"'#10 +
+    'compiler = "native"'#10;
+var
+  Man: TManifest;
+begin
+  Man := LoadManifest(WriteManifest('compiler-profiles', INPUT));
+  Expect<string>(Man.CompilerDefault).ToBe('native');
+  Expect<Integer>(Length(Man.CompilerProfiles)).ToBe(1);
+  Expect<string>(Man.CompilerProfiles[0].Driver).ToBe('fpc');
+  Expect<string>(Man.CompilerProfiles[0].Executable).ToBe('custom-fpc');
+  Expect<string>(Man.CompilerProfiles[0].VersionConstraint).ToBe('^3.2.0');
+  Expect<string>(Man.BuildEntries[0].CompilerProfile).ToBe('native');
+end;
+
+procedure TLoadManifestHappy.TestDependencyCompilerPolicyIgnored;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "dependency-compiler"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler]'#10 +
+    'default = "foreign"'#10 +
+    ''#10 +
+    '[compiler.profiles.foreign]'#10 +
+    'driver = "foreign"'#10 +
+    'executable = "foreign-driver"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'source = "source/app.pas"'#10 +
+    'compiler = "foreign"'#10;
+var
+  Man: TManifest;
+begin
+  Man := LoadManifest(WriteManifest('dependency-compiler', INPUT), False);
+  Expect<string>(Man.CompilerDefault).ToBe('');
+  Expect<Integer>(Length(Man.CompilerProfiles)).ToBe(0);
+  Expect<string>(Man.BuildEntries[0].CompilerProfile).ToBe('');
+end;
+
 procedure TLoadManifestHappy.SetupTests;
 begin
   Test('minimal manifest: name + version',  TestMinimalManifestNameAndVersion);
@@ -681,6 +739,10 @@ begin
   Test('[version] section parsed',          TestVersionSection);
   Test('manifest snapshot hashes the bytes it parses',
     TestManifestSnapshotBindsParsedBytes);
+  Test('root compiler profiles and build selection are parsed',
+    TestRootCompilerProfilesParsed);
+  Test('dependency compiler policy is ignored',
+    TestDependencyCompilerPolicyIgnored);
 end;
 
 { ── TLoadManifestValidation ───────────────────────────────────────── }

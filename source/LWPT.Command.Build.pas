@@ -12,8 +12,9 @@ uses
   Process,
   SysUtils,
 
+  LWPT.CompilerRegistry,
   LWPT.Core,
-  LWPT.ProcessTree;
+  LWPT.ProcessRunner;
 
 type
   { Public so the cross-platform cancellation/reaping contract can be tested
@@ -21,15 +22,21 @@ type
   TLWPTCompilerProcess = class
   private
     FExecutable: string;
-    FProcess: TProcess;
-    FProcessTree: TLWPTProcessTree;
+    FRunner: TLWPTDuplexProcessRunner;
     FCancelled: Boolean;
     FCriticalSection: TRTLCriticalSection;
   public
     constructor Create(const AExecutable: string = '');
     destructor Destroy; override;
     function Run(const AArgs: LWPT.Core.TStringArray;
-      out AOutput: string): Integer;
+      out AOutput: string): Integer; overload;
+    function Run(const AArgs: LWPT.Core.TStringArray;
+      const AStandardInput: string; const ASeparateStandardError: Boolean;
+      out AStandardOutput, AStandardError: string): Integer; overload;
+    function Run(const AArgs: LWPT.Core.TStringArray;
+      const AStandardInput: string; const ASeparateStandardError: Boolean;
+      const ATimeoutMilliseconds: QWord; const AOperationName: string;
+      out AStandardOutput, AStandardError: string): Integer; overload;
     procedure Cancel;
   end;
 
@@ -39,6 +46,10 @@ function CmdBuild(const AManifestPath: string;
 function CmdBuild(const AManifestPath: string;
   const AEntryNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer; const AVerbose: Boolean): Integer; overload;
+function CmdBuild(const AManifestPath: string;
+  const AEntryNames: array of string; const ARelease, AClean: Boolean;
+  const AJobs: Integer; const AVerbose: Boolean;
+  const ACompilerHost: TLWPTCompilerHost): Integer; overload;
 
 implementation
 
@@ -47,7 +58,6 @@ uses
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.CompilerDriver,
-  LWPT.CompilerDriver.FPC,
   LWPT.Manifest,
   LWPT.WorkerBudget;
 
@@ -123,8 +133,7 @@ constructor TLWPTCompilerProcess.Create(const AExecutable: string);
 begin
   inherited Create;
   FExecutable := AExecutable;
-  FProcess := nil;
-  FProcessTree := nil;
+  FRunner := nil;
   FCancelled := False;
   InitCriticalSection(FCriticalSection);
 end;
@@ -149,14 +158,33 @@ end;
 function TLWPTCompilerProcess.Run(const AArgs: LWPT.Core.TStringArray;
   out AOutput: string): Integer;
 var
-  P: TProcess;
-  ProcessTree: TLWPTProcessTree;
-  Buf: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
-  ArgumentIndex, N: Integer;
+  StandardError: string;
 begin
-  AOutput := '';
+  Result := Run(AArgs, '', False, AOutput, StandardError);
+end;
+
+function TLWPTCompilerProcess.Run(const AArgs: LWPT.Core.TStringArray;
+  const AStandardInput: string; const ASeparateStandardError: Boolean;
+  out AStandardOutput, AStandardError: string): Integer;
+begin
+  Result := Run(AArgs, AStandardInput, ASeparateStandardError, 0,
+    'compiler process', AStandardOutput, AStandardError);
+end;
+
+function TLWPTCompilerProcess.Run(const AArgs: LWPT.Core.TStringArray;
+  const AStandardInput: string; const ASeparateStandardError: Boolean;
+  const ATimeoutMilliseconds: QWord; const AOperationName: string;
+  out AStandardOutput, AStandardError: string): Integer;
+var
+  P: TProcess;
+  Runner: TLWPTDuplexProcessRunner;
+  Options: TLWPTProcessRunOptions;
+  ArgumentIndex: Integer;
+begin
+  AStandardOutput := '';
+  AStandardError := '';
   P := TProcess.Create(nil);
-  ProcessTree := nil;
+  Runner := nil;
   try
     if FExecutable <> '' then
       P.Executable := FExecutable
@@ -164,34 +192,26 @@ begin
       P.Executable := FPCExecutable;
     for ArgumentIndex := 0 to High(AArgs) do
       P.Parameters.Add(AArgs[ArgumentIndex]);
-    P.Options := [poUsePipes, poStderrToOutPut];
-    ProcessTree := TLWPTProcessTree.Create(P);
+    Options := DefaultProcessRunOptions(AOperationName);
+    Options.SeparateStandardError := ASeparateStandardError;
+    Options.TimeoutMilliseconds := ATimeoutMilliseconds;
+    Runner := TLWPTDuplexProcessRunner.Create(P);
     EnterCriticalSection(FCriticalSection);
     try
       if FCancelled then
         raise ELWPTError.Create('compiler process cancelled');
-      FProcess := P;
-      FProcessTree := ProcessTree;
+      FRunner := Runner;
       try
-        ProcessTree.Execute;
+        Runner.Start(Options);
       except
-        FProcess := nil;
-        FProcessTree := nil;
+        FRunner := nil;
         raise;
       end;
     finally
       LeaveCriticalSection(FCriticalSection);
     end;
-    repeat
-      N := P.Output.Read(Buf[0], SizeOf(Buf));
-      if N > 0 then
-        AppendRawBytes(AOutput, Buf[0], N);
-    until N <= 0;
-    P.WaitOnExit;
-    { Not P.ExitCode directly: WaitOnExit just reaped the child, and on
-      that path Unix ExitCode drops most nonzero exits (see
-      NormalisedExitCode). A failed compile must never read as 0. }
-    Result := NormalisedExitCode(P);
+    Result := Runner.Communicate(AStandardInput, Options,
+      AStandardOutput, AStandardError);
     EnterCriticalSection(FCriticalSection);
     try
       if FCancelled then Result := 1;
@@ -201,15 +221,11 @@ begin
   finally
     EnterCriticalSection(FCriticalSection);
     try
-      if FProcess = P then
-      begin
-        FProcess := nil;
-        FProcessTree := nil;
-      end;
+      if FRunner = Runner then FRunner := nil;
     finally
       LeaveCriticalSection(FCriticalSection);
     end;
-    ProcessTree.Free;
+    Runner.Free;
     P.Free;
   end;
 end;
@@ -219,8 +235,7 @@ begin
   EnterCriticalSection(FCriticalSection);
   try
     FCancelled := True;
-    if Assigned(FProcessTree) then
-      FProcessTree.Terminate;
+    if Assigned(FRunner) then FRunner.Cancel;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
@@ -458,7 +473,8 @@ function BuildOneEntry(const AManifestPath: string; const AMan: TManifest;
   out ABuildResult: TLWPTBuildResult; out AOutput: string): Boolean;
 var
   FpcArgs : TStringArray;
-  OutBin, JobRoot, BinDir, CandidateBin, UnitOutDir, OutText,
+  OutBin, JobRoot, BinDir, CandidateBin, UnitOutDir, StandardOutput,
+    StandardError,
     Fingerprint, ProjectRoot, CfgPath, ModulesPath : string;
   i, FpcExit : Integer;
   Capabilities: TLWPTCompilerCapabilities;
@@ -476,7 +492,7 @@ begin
   OutBin := T.Output;
   if OutBin = '' then
     OutBin := ChangeFileExt(T.Source, '');
-  Request.BuildRequest := CreateFPCBuildRequest(T.Source, OutBin, ADriver);
+  Request.BuildRequest := ADriver.CreateBuildRequest(T.Source, OutBin);
   OutBin := Request.BuildRequest.Outputs.Artifact;
   { Every invocation writes compiler outputs below its unique session.
     The public output path is touched only by PublishBuildArtifact after
@@ -529,7 +545,9 @@ begin
     Request.BuildRequest.Inputs.IncludePaths);
   AddDeclaredOutputs(AMan, Request.ExcludedPaths);
   ValidateBuildRequest(Request.BuildRequest);
-  Capabilities := ADriver.ProbeCapabilities(Request.BuildRequest.Target);
+  { A cached default-target discovery never substitutes for live validation
+    of the concrete operation. }
+  Capabilities := ADriver.ProbeCapabilities(Request.BuildRequest.Target, True);
   EnsureBuildRequestCompatible(Request.BuildRequest, Capabilities);
   Request.BuildRequest.Compiler.VersionIdentity :=
     Capabilities.VersionIdentity;
@@ -546,15 +564,22 @@ begin
   FpcArgs := ADriver.BuildArguments(Request.BuildRequest,
     BuildCompilerInvocationOptions(CfgPath, AClean));
 
-  FpcExit := ACompiler.Run(FpcArgs, OutText);
-  ABuildResult := ADriver.NormalizeResult(Request.BuildRequest,
-    FpcExit, OutText);
-  AOutput := OutText;
+  FpcExit := ACompiler.Run(FpcArgs,
+    ADriver.BuildStandardInput(Request.BuildRequest),
+    ADriver.SeparateStandardError,
+    ADriver.CompilationTimeoutMilliseconds,
+    'compiler "' + ADriver.CompilerID + '" compile',
+    StandardOutput, StandardError);
+  AOutput := ADriver.DisplayOutput(StandardOutput, StandardError);
+  ABuildResult := ADriver.NormalizeExecutionResult(Request.BuildRequest,
+    FpcExit, StandardOutput, StandardError);
+  ValidateReportedArtifacts(ADriver.CompilerID, Request.BuildRequest,
+    ABuildResult);
   Result := ABuildResult.Success;
 
   if not Result then
   begin
-    Failure := ADriver.ClassifyFailure(FpcExit, OutText);
+    Failure := ADriver.ClassifyFailure(FpcExit, AOutput);
     AOutput := AOutput + LineEnding + Failure.Summary + LineEnding;
   end;
 
@@ -842,6 +867,15 @@ end;
 function CmdBuild(const AManifestPath: string;
   const AEntryNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer; const AVerbose: Boolean): Integer;
+begin
+  Result := CmdBuild(AManifestPath, AEntryNames, ARelease, AClean,
+    AJobs, AVerbose, nil);
+end;
+
+function CmdBuild(const AManifestPath: string;
+  const AEntryNames: array of string; const ARelease, AClean: Boolean;
+  const AJobs: Integer; const AVerbose: Boolean;
+  const ACompilerHost: TLWPTCompilerHost): Integer;
 var
   Man : TManifest;
   i, j, Built, Failed, Skipped, Unknown, SelectedCount, MaxJobs, Running,
@@ -860,7 +894,8 @@ var
   CapturedOutputs, Errors: TLWPTStringArray;
   PublicationRequest: TLWPTBuildPublicationRequest;
   PublicationResult: TLWPTBuildPublicationResult;
-  CompilerDriver: TLWPTCompilerDriver;
+  CompilerSelection: TLWPTCompilerSelection;
+  EntryDrivers: array of TLWPTCompilerDriver;
   CurrentCompilerCapabilities: TLWPTCompilerCapabilities;
   WholePostBuild: THookArray;
   HookEnvironment: array of string;
@@ -965,42 +1000,80 @@ var
       Compiled[AIndex].PostBuild, Session.HookRoot, HookEnvironment);
   end;
 
+  function AcquireWorkerLease: TLWPTWorkerLease;
+  begin
+    Result := nil;
+    while Result = nil do Result := WorkerSession.Acquire(100);
+  end;
+
+  procedure RunEntryPostBuildWithLease(const AIndex: Integer);
+  var
+    PostBuildLease: TLWPTWorkerLease;
+  begin
+    if Length(Compiled[AIndex].PostBuild) = 0 then Exit;
+    PostBuildLease := AcquireWorkerLease;
+    try
+      RunEntryPostBuild(AIndex);
+    finally
+      PostBuildLease.Free;
+    end;
+  end;
+
+  procedure RunWholePostBuildWithLease(const AHooks: THookArray);
+  var
+    PostBuildLease: TLWPTWorkerLease;
+  begin
+    if Length(AHooks) = 0 then Exit;
+    PostBuildLease := AcquireWorkerLease;
+    try
+      RunHooks('postbuild', AHooks, Session.HookRoot);
+    finally
+      PostBuildLease.Free;
+    end;
+  end;
+
   procedure FinalizeEntry(const AIndex: Integer;
     const ARunPostBuild: Boolean);
+  var
+    FinalizationLease: TLWPTWorkerLease;
   begin
+    FinalizationLease := nil;
     try
-      if ARunPostBuild then RunEntryPostBuild(AIndex);
-      PublicationRequest := Compiled[AIndex].Request;
-      CurrentCompilerCapabilities := CompilerDriver.ProbeCapabilities(
-        PublicationRequest.BuildRequest.Target, True);
-      if CurrentCompilerCapabilities.VersionIdentity
-        <> PublicationRequest.BuildRequest.Compiler.VersionIdentity then
-        PublicationResult := bprStale
-      else
+      FinalizationLease := AcquireWorkerLease;
+      try
+        if ARunPostBuild then RunEntryPostBuild(AIndex);
+        PublicationRequest := Compiled[AIndex].Request;
+        CurrentCompilerCapabilities := EntryDrivers[AIndex].ProbeCapabilities(
+          PublicationRequest.BuildRequest.Target, True);
+        EnsureBuildRequestCompatible(PublicationRequest.BuildRequest,
+          CurrentCompilerCapabilities);
         PublicationResult := PublishBuildArtifact(
           Compiled[AIndex].ProjectRoot, Compiled[AIndex].CandidateBin,
           Compiled[AIndex].OutBin, Compiled[AIndex].Fingerprint,
           AManifestPath, Compiled[AIndex].CfgPath, LOCKFILE,
           Compiled[AIndex].ModulesPath, PublicationRequest);
-      if PublicationResult = bprStale then
-      begin
-        States[AIndex] := besFailed;
-        Errors[AIndex] := 'inputs changed during compilation; private '
-          + 'result was not published';
-        Inc(Failed);
-      end
-      else
-      begin
-        States[AIndex] := besSucceeded;
-        Inc(Built);
+        if PublicationResult = bprStale then
+        begin
+          States[AIndex] := besFailed;
+          Errors[AIndex] := 'inputs changed during compilation; private '
+            + 'result was not published';
+          Inc(Failed);
+        end
+        else
+        begin
+          States[AIndex] := besSucceeded;
+          Inc(Built);
+        end;
+      except
+        on E: Exception do
+        begin
+          States[AIndex] := besFailed;
+          Errors[AIndex] := E.Message;
+          Inc(Failed);
+        end;
       end;
-    except
-      on E: Exception do
-      begin
-        States[AIndex] := besFailed;
-        Errors[AIndex] := E.Message;
-        Inc(Failed);
-      end;
+    finally
+      FinalizationLease.Free;
     end;
   end;
 
@@ -1037,13 +1110,15 @@ begin
   Failed := 0;
   Skipped := 0;
   Result := 1;
-  CompilerDriver := TLWPTFPCCompilerDriver.Create;
+  CompilerSelection := nil;
   try
     try
       if not FileExists(AManifestPath) then
         raise EManifestError.CreateFmt(
           'manifest not found at %s', [AManifestPath]);
       Man := LoadManifestSnapshot(AManifestPath, ManifestContentHash);
+      CompilerSelection := TLWPTCompilerSelection.Create(Man,
+        ExtractFileDir(ExpandFileName(AManifestPath)), ACompilerHost);
 
       if Length(Man.BuildEntries) = 0 then
       begin
@@ -1079,6 +1154,11 @@ begin
 
   ValidateBuildGraph(Man.BuildEntries);
   SelectBuildEntryClosure(Man.BuildEntries, AEntryNames, Selected);
+  SetLength(EntryDrivers, Length(Man.BuildEntries));
+  for i := 0 to High(Man.BuildEntries) do
+    if Selected[i] then
+      EntryDrivers[i] := CompilerSelection.DriverFor(
+        Man.BuildEntries[i].CompilerProfile);
   SelectedCount := 0;
   for i := 0 to High(Selected) do
     if Selected[i] then Inc(SelectedCount);
@@ -1175,7 +1255,7 @@ begin
                   Man.BuildEntries[i].PreBuild, Session.HookRoot);
                 Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
                   ManifestContentHash, Man.BuildEntries[i], ARelease, AClean,
-                  Session, Lease, CompilerDriver);
+                  Session, Lease, EntryDrivers[i]);
                 Lease := nil;
                 States[i] := besRunning;
                 Inc(Running);
@@ -1216,9 +1296,6 @@ begin
               if Jobs[i].Succeeded then
               begin
                 Compiled[i] := Jobs[i].Compiled;
-                if Length(BuildResults[i].Artifacts) > 0 then
-                  Compiled[i].CandidateBin :=
-                    BuildResults[i].Artifacts[0].Path;
                 States[i] := besCompiled;
               end
               else
@@ -1239,7 +1316,7 @@ begin
                 end
                 else
                   try
-                    RunEntryPostBuild(i);
+                    RunEntryPostBuildWithLease(i);
                   except
                     on E: Exception do
                     begin
@@ -1277,7 +1354,7 @@ begin
           if States[i] = besCompiled then
             WholePostBuild := RetargetPostBuildHooks(WholePostBuild,
               Compiled[i].OutBin, Compiled[i].CandidateBin);
-        RunHooks('postbuild', WholePostBuild, Session.HookRoot);
+        RunWholePostBuildWithLease(WholePostBuild);
         for i := 0 to High(Man.BuildEntries) do
           if States[i] = besCompiled then
           begin
@@ -1289,7 +1366,7 @@ begin
         { Graph builds publish prerequisites before dependants start. The
           once-per-build posthook therefore observes the published outputs. }
         try
-          RunHooks('postbuild', Man.PostBuild, Session.HookRoot);
+          RunWholePostBuildWithLease(Man.PostBuild);
         except
           on E: Exception do
           begin
@@ -1330,7 +1407,7 @@ begin
       end;
     end;
   finally
-    CompilerDriver.Free;
+    CompilerSelection.Free;
     WriteLn('summary: ', Built, ' built, ', Failed, ' failed, ',
       Skipped, ' skipped; elapsed ',
       FormatElapsedMilliseconds(GetTickCount64 - StartedAt));

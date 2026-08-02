@@ -27,6 +27,9 @@ type
     procedure TestCompilerCanAdvertiseMultipleTargets;
     procedure TestCompatibilityRejectsUnsupportedDimensions;
     procedure TestNormalisedBuildResultValidates;
+    procedure TestProbeRequestRoundTrips;
+    procedure TestBuildResultRoundTrips;
+    procedure TestCapabilitiesRoundTrip;
   end;
 
 function ReadFixture(const APath: string): string;
@@ -281,6 +284,58 @@ begin
   Expect<Boolean>(BuildResult.Success).ToBe(True);
 end;
 
+procedure TLWPTBuildRequestTests.TestProbeRequestRoundTrips;
+var
+  Parsed: TLWPTCompilerProbeRequest;
+  Probe: TLWPTCompilerProbeRequest;
+begin
+  Probe := DefaultCompilerProbeRequest;
+  Probe.Compiler.ID := 'example';
+  Probe.Compiler.VersionConstraint := '^1.0.0';
+  Probe.Target.OS := 'linux';
+  Probe.Target.Architecture := 'x86_64';
+  Parsed := ParseCompilerProbeRequest(SerializeCompilerProbeRequest(Probe));
+  Expect<string>(Parsed.Compiler.ID).ToBe('example');
+  Expect<string>(Parsed.Compiler.VersionConstraint).ToBe('^1.0.0');
+  Expect<string>(Parsed.Target.OS).ToBe('linux');
+  Expect<string>(Parsed.Target.Architecture).ToBe('x86_64');
+end;
+
+procedure TLWPTBuildRequestTests.TestBuildResultRoundTrips;
+var
+  Parsed: TLWPTBuildResult;
+  BuildResult: TLWPTBuildResult;
+begin
+  BuildResult := DefaultBuildResult;
+  BuildResult.Success := True;
+  SetLength(BuildResult.Diagnostics, 1);
+  BuildResult.Diagnostics[0].Severity := DIAGNOSTIC_WARNING;
+  BuildResult.Diagnostics[0].MessageText := 'careful';
+  BuildResult.Diagnostics[0].Line := 7;
+  SetLength(BuildResult.Artifacts, 1);
+  BuildResult.Artifacts[0].Kind := BUILD_OUTPUT_EXECUTABLE;
+  BuildResult.Artifacts[0].Path := 'build/example';
+  Parsed := ParseBuildResult(SerializeBuildResult(BuildResult));
+  Expect<Boolean>(Parsed.Success).ToBe(True);
+  Expect<string>(Parsed.Diagnostics[0].MessageText).ToBe('careful');
+  Expect<Integer>(Parsed.Diagnostics[0].Line).ToBe(7);
+  Expect<string>(Parsed.Artifacts[0].Path).ToBe('build/example');
+end;
+
+procedure TLWPTBuildRequestTests.TestCapabilitiesRoundTrip;
+var
+  Parsed: TLWPTCompilerCapabilities;
+  Capabilities: TLWPTCompilerCapabilities;
+begin
+  Capabilities := NativeCapabilities('example', '1.2.3');
+  Parsed := ParseCompilerCapabilities(
+    SerializeCompilerCapabilities(Capabilities));
+  Expect<string>(Parsed.CompilerID).ToBe('example');
+  Expect<string>(Parsed.VersionIdentity).ToBe('1.2.3');
+  Expect<string>(Parsed.Targets[0].OS).ToBe('darwin');
+  Expect<string>(Parsed.OutputKinds[0]).ToBe(BUILD_OUTPUT_EXECUTABLE);
+end;
+
 procedure TLWPTBuildRequestTests.SetupTests;
 begin
   Test('serialization matches the versioned fixture',
@@ -299,6 +354,12 @@ begin
     TestCompatibilityRejectsUnsupportedDimensions);
   Test('normalised diagnostics, artifacts, and dependencies validate',
     TestNormalisedBuildResultValidates);
+  Test('compiler probe request round-trips through canonical TOML',
+    TestProbeRequestRoundTrips);
+  Test('build result round-trips through canonical TOML',
+    TestBuildResultRoundTrips);
+  Test('compiler capabilities round-trip through canonical TOML',
+    TestCapabilitiesRoundTrip);
 end;
 
 begin

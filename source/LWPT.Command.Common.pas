@@ -63,7 +63,8 @@ var
   Arguments: LWPT.Core.TStringArray;
   BuildDir: string;
   Capabilities: TLWPTCompilerCapabilities;
-  i: Integer;
+  ConfigurationUnitPaths: TStringArray;
+  i, UnitPathCount: Integer;
   ScanDirs: TStringArray;
 
   function SourceBuildKey(const APath: string): string;
@@ -90,20 +91,32 @@ begin
              + ChangeFileExt(ExtractFileName(ASrcFile), '');
 
     { Describe the compilation before the selected driver adapts it. }
-    ARequest := CreateFPCBuildRequest(ASrcFile, AOutBin, ADriver);
+    ARequest := ADriver.CreateBuildRequest(ASrcFile, AOutBin);
     AOutBin := ARequest.Outputs.Artifact;
-    SetLength(ARequest.Inputs.UnitPaths, Length(AUnitPaths));
-    SetLength(ARequest.Inputs.IncludePaths, Length(AUnitPaths));
+    SetLength(ConfigurationUnitPaths, 0);
+    AppendUnitDirsFromCfg(CFG_FILE, ConfigurationUnitPaths);
+    UnitPathCount := Length(AUnitPaths) + Length(ConfigurationUnitPaths);
+    SetLength(ARequest.Inputs.UnitPaths, UnitPathCount);
+    SetLength(ARequest.Inputs.IncludePaths, UnitPathCount);
     for i := 0 to High(AUnitPaths) do
     begin
       ARequest.Inputs.UnitPaths[i] := AUnitPaths[i];
       ARequest.Inputs.IncludePaths[i] := AUnitPaths[i];
     end;
+    for i := 0 to High(ConfigurationUnitPaths) do
+    begin
+      ARequest.Inputs.UnitPaths[Length(AUnitPaths) + i] :=
+        ConfigurationUnitPaths[i];
+      ARequest.Inputs.IncludePaths[Length(AUnitPaths) + i] :=
+        ConfigurationUnitPaths[i];
+    end;
     ARequest.Outputs.ExecutableDirectory := BuildDir;
     ARequest.Outputs.UnitDirectory := BuildDir + '/units';
     ARequest.Outputs.ObjectDirectory := BuildDir + '/units';
     ValidateBuildRequest(ARequest);
-    Capabilities := ADriver.ProbeCapabilities(ARequest.Target);
+    { A cached discovery result may shape the request, but every concrete
+      compile revalidates live capabilities immediately before translation. }
+    Capabilities := ADriver.ProbeCapabilities(ARequest.Target, True);
     EnsureBuildRequestCompatible(ARequest, Capabilities);
     ARequest.Compiler.VersionIdentity := Capabilities.VersionIdentity;
 

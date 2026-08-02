@@ -18,8 +18,9 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   `LWPT.BuildRequest` owns the versioned request, target tuple, capability, and
   normalized result structures. `TLWPTCompilerDriver` owns capability probing,
   argument translation, executable naming, failure classification, and result
-  normalization for build, test, and Windows hook compilation. FPC remains the
-  only driver and LWPT's own compiler. See ADR-0022 and ADR-0029.
+  normalization. Root-owned profiles select built-in FPC, a short-lived
+  external driver, or an embedding-host factory for build and test; lifecycle
+  hook compilation remains on FPC. See ADR-0022, ADR-0029, and ADR-0030.
 
 ## Tech stack
 
@@ -69,6 +70,7 @@ Sections currently supported:
 | `[dependencies]` | bare-string `"<source>@<version>"` shorthand or inline-table `{ source = "...", version = "...", subdir = "..." }` — see [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) |
 | `[sources]` | per-project custom git-host declarations. Each entry is an inline table mapping a prefix name to `archive` + `git` URL templates with `{user}` / `{repository}` / `{ref}` placeholders; enables prefixes like `gitea:owner/repo` against the user's self-hosted instance |
 | `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Inline entries may declare `depends = ["prerequisite"]` and ordered `flags = ["-dFEATURE"]`. Single-binary shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` |
+| `[compiler]` / `[compiler.profiles.<name>]` | root-owned compiler policy. `default` names the project profile; profiles select a driver plus optional `version` and either `executable` or `script`. A build entry's `compiler` field overrides the project default. Dependency manifests cannot contribute this policy. |
 | `[workspaces]` | `include` / `exclude` glob arrays for monorepo workspace auto-discovery (each matched dir with its own `lwpt.toml` is installed as a local-path dep, symlinked or junctioned) |
 | `[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` | Lifecycle hooks per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with optional `inputs` / `output` staleness gating. Plus per-`[build]`-entry inline `prebuild` / `postbuild` fields for per-binary signing / packaging / etc. |
 | Any other top-level section with a `script` field | A user-declared run-script callable via `lwpt run <name>` per [ADR-0013](./adr/0013-run-subcommand-and-build-rename.md) |
@@ -95,9 +97,9 @@ The flat-graph + hard-error policy is deliberate: FPC has one global unit namesp
 
 - **Fetch:** HTTPS GET via the LWPT-canonical `HTTPClient` package (raw sockets + SChannel on Windows / SecureTransport on macOS / OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md)). The byte-safe `AppendRawBytes` accumulator fixes a header-recv truncation bug that previously corrupted binary downloads. URL templates per source kind live in `FetchURL`.
 - **Extract:** gunzip (zstream) + a direct ustar reader. The bundled FPC `libtar` has a bug — it ignores the 155-byte `prefix` field at offset 345, so paths longer than 100 bytes get silently dropped. LWPT's reader joins `prefix + '/' + name` correctly and also follows GNU `'L'`/`'K'` long-name entries.
-- **Build:** `BuildOneEntry` creates a `TLWPTBuildRequest`, asks the FPC driver
+- **Build:** `BuildOneEntry` creates a `TLWPTBuildRequest`, asks the selected driver
   to probe the requested target, validates the request against those
-  capabilities, and obtains the FPC arguments. Root-manifest per-entry flags
+  capabilities, and obtains its invocation. Root-manifest per-entry flags
   become ordered neutral extra arguments before the driver translates them;
   dependency-manifest flags are dropped. `TLWPTCompilerProcess` executes
   them below the seam. The driver normalizes diagnostics while the scheduler
@@ -113,7 +115,7 @@ The flat-graph + hard-error policy is deliberate: FPC has one global unit namesp
   protection and exclude unrelated declared outputs, while explicit file inputs
   remain hashed.
 - **Test:** Each `*.Test.pas` is a self-contained program using
-  `TestingPascalLibrary`. Test workers share one FPC driver, validate each
+  `TestingPascalLibrary`. Test workers share the selected project driver, validate each
   neutral request, compile into private session paths, retain raw compiler
   output, and store normalized build-result diagnostics before running a
   successful binary. See [`testing.md`](./testing.md).
@@ -183,7 +185,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`,
 `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.WorkerBudget.pas`,
 `LWPT.Command.*.pas`, `LWPT.CompilerDriver.pas`,
-`LWPT.CompilerDriver.FPC.pas`, `LWPT.Formatter.pas`,
+`LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.External.pas`,
+`LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
 `LWPT.GitProtocol.pas`) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
 LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` —

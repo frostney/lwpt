@@ -20,6 +20,7 @@ type
   TLWPTFPCCompilerDriver = class(TLWPTCompilerDriver)
   private
     FExecutableName: string;
+    FVersionConstraint: string;
     FDefaultTarget: TLWPTTarget;
     FDefaultTargetError: string;
     FDefaultTargetProbed: Boolean;
@@ -36,8 +37,13 @@ type
       out AOutput: string): Integer; virtual;
     function ProbeTimeoutMilliseconds: QWord; virtual;
   public
-    constructor Create(const AExecutableName: string = '');
+    constructor Create(const AExecutableName: string = '';
+      const AVersionConstraint: string = '*');
     destructor Destroy; override;
+    function CompilerID: string; override;
+    function VersionConstraint: string; override;
+    function CreateBuildRequest(const ASource, AArtifact: string):
+      TLWPTBuildRequest; override;
     function DefaultTarget: TLWPTTarget; override;
     function ProbeCapabilities(const ATarget: TLWPTTarget;
       const ARefresh: Boolean = False): TLWPTCompilerCapabilities; override;
@@ -244,23 +250,28 @@ end;
 
 function CreateFPCBuildRequest(const ASource, AArtifact: string;
   const ADriver: TLWPTCompilerDriver): TLWPTBuildRequest;
-var
-  DefaultTarget: TLWPTTarget;
 begin
-  if not Assigned(ADriver) then
-    raise ELWPTCompilerDriverError.Create('compiler driver is required');
+  Result := ADriver.CreateBuildRequest(ASource, AArtifact);
+end;
+
+function TLWPTFPCCompilerDriver.CreateBuildRequest(const ASource,
+  AArtifact: string): TLWPTBuildRequest;
+var
+  CompilerDefaultTarget: TLWPTTarget;
+begin
   Result := DefaultBuildRequest;
   Result.Compiler.ID := FPC_COMPILER_ID;
-  Result.Compiler.VersionConstraint := '*';
+  Result.Compiler.VersionConstraint := FVersionConstraint;
   Result.Target.OS := SysUtils.GetEnvironmentVariable('FPC_TARGET_OS');
   Result.Target.Architecture := SysUtils.GetEnvironmentVariable(
     'FPC_TARGET_CPU');
   if (Result.Target.OS = '') or (Result.Target.Architecture = '') then
   begin
-    DefaultTarget := ADriver.DefaultTarget;
-    if Result.Target.OS = '' then Result.Target.OS := DefaultTarget.OS;
+    CompilerDefaultTarget := Self.DefaultTarget;
+    if Result.Target.OS = '' then
+      Result.Target.OS := CompilerDefaultTarget.OS;
     if Result.Target.Architecture = '' then
-      Result.Target.Architecture := DefaultTarget.Architecture;
+      Result.Target.Architecture := CompilerDefaultTarget.Architecture;
   end;
   Result.OutputKind := BUILD_OUTPUT_EXECUTABLE;
   Result.Mode := BUILD_MODE_DEV;
@@ -524,15 +535,27 @@ begin
       (Pos(FPC_NO_SUCH_FILE_SIGNATURE, LowercaseOutput) > 0)));
 end;
 
-constructor TLWPTFPCCompilerDriver.Create(const AExecutableName: string);
+constructor TLWPTFPCCompilerDriver.Create(const AExecutableName: string;
+  const AVersionConstraint: string);
 begin
   inherited Create;
   if AExecutableName <> '' then
     FExecutableName := AExecutableName
   else
     FExecutableName := FPCExecutable;
+  FVersionConstraint := AVersionConstraint;
   FProbeCache := TList.Create;
   InitCriticalSection(FProbeCriticalSection);
+end;
+
+function TLWPTFPCCompilerDriver.CompilerID: string;
+begin
+  Result := FPC_COMPILER_ID;
+end;
+
+function TLWPTFPCCompilerDriver.VersionConstraint: string;
+begin
+  Result := FVersionConstraint;
 end;
 
 destructor TLWPTFPCCompilerDriver.Destroy;
