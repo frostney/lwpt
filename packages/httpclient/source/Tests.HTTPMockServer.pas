@@ -83,19 +83,21 @@ type
     property Port: Word read FPort;
   end;
 
-  { Prepares an ephemeral loopback port whose server-side connection is in
-    TIME_WAIT. The kernel retains that port after the fixture actively closes
-    a setup connection, so a later connect is refused immediately without a
-    released-port reuse race. }
+  { Prepares an ephemeral loopback endpoint that refuses a later connection
+    without releasing its port for reuse. Unix retains the endpoint in
+    TIME_WAIT; Windows reserves the port on 127.0.0.1 and targets 127.0.0.2. }
   TMockRefusedEndpoint = class
   private
+    FHost: string;
     FPort: Word;
     {$IFDEF MSWINDOWS}
+    FReservationSock: TMockSocket;
     FWinSockStarted: Boolean;
     {$ENDIF}
   public
     constructor Create;
     destructor Destroy; override;
+    property Host: string read FHost;
     property Port: Word read FPort;
   end;
 
@@ -202,7 +204,8 @@ begin
   {$ENDIF}
 end;
 
-function ConnectLoopback(const APort: Word): TSocket;
+function ConnectLoopback(const APort: Word;
+  const AHost: string = '127.0.0.1'): TSocket;
 {$IFDEF UNIX}
 var
   Addr: TInetSockAddr;
@@ -213,7 +216,7 @@ begin
   FillChar(Addr, SizeOf(Addr), 0);
   Addr.sin_family := AF_INET;
   Addr.sin_port := htons(APort);
-  Addr.sin_addr := StrToNetAddr('127.0.0.1');
+  Addr.sin_addr := StrToNetAddr(AHost);
   if fpConnect(Result, @Addr, SizeOf(Addr)) <> 0 then
     CloseTrackedMockSocket(Result);
 end;
@@ -228,7 +231,7 @@ begin
   FillChar(Addr, SizeOf(Addr), 0);
   Addr.sin_family := AF_INET;
   Addr.sin_port := WinSock2.htons(APort);
-  Addr.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
+  Addr.sin_addr.S_addr := WinSock2.inet_addr(PAnsiChar(AnsiString(AHost)));
   if WinSock2.connect(Result, PSockAddr(@Addr), SizeOf(Addr)) <> 0 then
     CloseTrackedMockSocket(Result);
 end;
@@ -733,11 +736,13 @@ var
   WSAData: TWSAData;
   {$ENDIF}
 begin
+  FHost := '127.0.0.1';
   ListenSock := InvalidMockSocket;
   ClientSock := InvalidMockSocket;
   AcceptedSock := InvalidMockSocket;
   ProbeSock := InvalidMockSocket;
   {$IFDEF MSWINDOWS}
+  FReservationSock := InvalidMockSocket;
   if WinSock2.WSAStartup($0202, WSAData) <> 0 then
     raise EMockServerError.Create('WSAStartup failed');
   FWinSockStarted := True;
@@ -780,6 +785,7 @@ begin
     FPort := WinSock2.ntohs(Addr.sin_port);
     {$ENDIF}
 
+    {$IFDEF UNIX}
     ClientSock := ConnectLoopback(FPort);
     if not IsValidMockSocket(ClientSock) then
       raise EMockServerError.Create('setup client failed to connect');
@@ -812,6 +818,22 @@ begin
     if IsValidMockSocket(ProbeSock) then
       raise EMockServerError.Create(
         'loopback port was unexpectedly reusable after active close');
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    { Windows can retain a recently closed loopback connection in a state
+      that blackholes the next SYN until the request deadline. Keep the
+      OS-assigned port reserved on one numeric loopback address instead and
+      target another address in 127.0.0.0/8. The reservation prevents a
+      wildcard listener from racing into the port, while the distinct address
+      has no listener and therefore rejects the connect immediately. }
+    FHost := '127.0.0.2';
+    ProbeSock := ConnectLoopback(FPort, FHost);
+    if IsValidMockSocket(ProbeSock) then
+      raise EMockServerError.Create(
+        'secondary loopback address unexpectedly accepted a connection');
+    FReservationSock := ListenSock;
+    ListenSock := InvalidMockSocket;
+    {$ENDIF}
   except
     CloseTrackedMockSocket(ProbeSock);
     CloseTrackedMockSocket(AcceptedSock);
@@ -827,6 +849,7 @@ end;
 destructor TMockRefusedEndpoint.Destroy;
 begin
   {$IFDEF MSWINDOWS}
+  CloseTrackedMockSocket(FReservationSock);
   CleanupTrackedWinSock(FWinSockStarted);
   {$ENDIF}
   inherited Destroy;

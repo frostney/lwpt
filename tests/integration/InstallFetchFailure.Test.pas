@@ -86,7 +86,8 @@ type
     function NewProjectRoot(const AName: string): string;
     function InstallAgainstPort(const ARoot: string; const APort: Word;
       const ATimeoutMilliseconds: string;
-      const AWatchdogMilliseconds: QWord = 10000): TLwptResult;
+      const AWatchdogMilliseconds: QWord = 10000;
+      const AHost: string = '127.0.0.1'): TLwptResult;
   protected
     procedure BeforeAll; override;
     procedure AfterAll;  override;
@@ -430,10 +431,10 @@ end;
 
 function TInstallHTTPFetchFailure.InstallAgainstPort(const ARoot: string;
   const APort: Word; const ATimeoutMilliseconds: string;
-  const AWatchdogMilliseconds: QWord): TLwptResult;
+  const AWatchdogMilliseconds: QWord; const AHost: string): TLwptResult;
 begin
   Result := RunLwpt(['install'], ARoot,
-    [ARCHIVE_FETCH_ORIGIN_ENV + '=http://127.0.0.1:' + IntToStr(APort),
+    [ARCHIVE_FETCH_ORIGIN_ENV + '=http://' + AHost + ':' + IntToStr(APort),
      ARCHIVE_FETCH_TIMEOUT_ENV + '=' + ATimeoutMilliseconds],
     AWatchdogMilliseconds);
 end;
@@ -510,7 +511,8 @@ begin
   Root := NewProjectRoot('refused');
   Refused := TMockRefusedEndpoint.Create;
   try
-    Run := InstallAgainstPort(Root, Refused.Port, HEALTHY_BUDGET);
+    Run := InstallAgainstPort(Root, Refused.Port, HEALTHY_BUDGET, 10000,
+      Refused.Host);
   finally
     Refused.Free;
   end;
