@@ -3,14 +3,17 @@ name: PR
 # Fast PR gate. Mirrors the GocciaScript pattern: ci.yml runs only
 # on push to main, so pr.yml is the sole pre-merge signal a PR sees.
 #
-#   pr.yml      — every PR: Ubuntu native bootstrap + install +
-#                 format --check + build + test, then the live-
+#   pr.yml      — every ordinary PR and every ci:ready managed stack PR:
+#                 Ubuntu native bootstrap + install + format --check + build +
+#                 test, then the live-
 #                 network e2e tier on the same Linux leg (#102);
 #                 a native aarch64-darwin default-tier leg; and a
 #                 win64 leg: cross-compile on macOS, then the
 #                 offline default test tier natively on
-#                 windows-latest. Typical wall-clock < 10 min on a
-#                 warm toolchain cache (hard caps per job/step).
+#                 windows-latest. Managed stack PRs remain drafts while work is
+#                 noisy; their first run stops at a cheap admission gate and
+#                 the ci:ready label reruns that exact head. Typical wall-clock
+#                 < 10 min on a warm toolchain cache (hard caps per job/step).
 #   ci.yml      — push to main only: full 6-target cross-build +
 #                 per-platform native test runs (incl. e2e on
 #                 every platform). Post-merge confirmation.
@@ -51,20 +54,66 @@ on:
   pull_request:
     branches:
       - main
-  workflow_dispatch:
-
+      # Native stacked PRs target the branch immediately below them. Rush
+      # branches use the codex/ prefix, so include those bases as well as main.
+      - 'codex/**'
+    types:
+      - opened
+      - reopened
+      - synchronize
 permissions:
   contents: read
+  pull-requests: read
 
 # The commit-amend-push PR cycle is the canonical cancel-in-progress
 # case: a superseded push should not keep burning the macOS runner
 # (or, on a cold cache, a ~30-min toolchain rebuild).
 concurrency:
-  group: pr-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: pr-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
+  stack-ci-gate:
+    if: >-
+      ${{
+        startsWith(github.head_ref, 'codex/stack-') ||
+        contains(github.event.pull_request.labels.*.name, 'stack:managed')
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a label-authorized rerun of this exact head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_RUN_ATTEMPT" = "1" ]; then
+            echo "::error::Managed stack CI starts only when ci:ready reruns this head."
+            exit 1
+          fi
+
+          CURRENT_HEAD="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha')"
+          if [ "$CURRENT_HEAD" != "$EXPECTED_HEAD" ]; then
+            echo "::error::The admitted stack head is no longer current."
+            exit 1
+          fi
+
+          LABELS="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.labels[].name')"
+          if ! grep -Fxq 'stack:managed' <<<"$LABELS"; then
+            echo "::error::The current head is missing stack:managed."
+            exit 1
+          fi
+          if ! grep -Fxq 'ci:ready' <<<"$LABELS"; then
+            echo "::error::The current head is missing ci:ready."
+            exit 1
+          fi
+
   build-and-test:
+    needs: stack-ci-gate
+    # This existing required context carries admission failures into branch
+    # protection; the platform jobs can still fan out after the cheap gate.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -75,6 +124,19 @@ jobs:
       # Post-merge ci.yml still runs the tier on every platform.
       LWPT_SKIP_NETWORK: "1"
     steps:
+      - name: Propagate a managed stack admission failure
+        if: >-
+          ${{
+            (
+              startsWith(github.head_ref, 'codex/stack-') ||
+              contains(github.event.pull_request.labels.*.name, 'stack:managed')
+            ) &&
+            needs.stack-ci-gate.result != 'success'
+          }}
+        run: |
+          echo "::error::Managed stack head has not passed the CI admission gate."
+          exit 1
+
       # persist-credentials: false on every pr.yml checkout: these jobs
       # build and EXECUTE the PR's own code (bootstrap, lwpt, tests),
       # so no git auth material should sit in the workspace git config.
@@ -136,6 +198,15 @@ jobs:
         run: ./build/lwpt test --tier=e2e --bail=1
 
   docs:
+    needs: stack-ci-gate
+    if: >-
+      ${{
+        always() &&
+        (
+          needs.stack-ci-gate.result == 'success' ||
+          needs.stack-ci-gate.result == 'skipped'
+        )
+      }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -158,6 +229,15 @@ jobs:
   # (x86_64-darwin, aarch64-linux, i386-win32) stay post-merge: their
   # unique-catch rate has not justified per-PR cost.
   darwin-test:
+    needs: stack-ci-gate
+    if: >-
+      ${{
+        always() &&
+        (
+          needs.stack-ci-gate.result == 'success' ||
+          needs.stack-ci-gate.result == 'skipped'
+        )
+      }}
     runs-on: macos-latest
     timeout-minutes: 20
     defaults:
@@ -197,6 +277,15 @@ jobs:
   # the PR's own cache scope); the next main push repopulates the
   # shared copy.
   toolchain:
+    needs: stack-ci-gate
+    if: >-
+      ${{
+        always() &&
+        (
+          needs.stack-ci-gate.result == 'success' ||
+          needs.stack-ci-gate.result == 'skipped'
+        )
+      }}
     uses: ./.github/workflows/toolchain.yml
 
   # Windows compile signal, pre-merge. ci.yml's full cross-build
@@ -214,7 +303,18 @@ jobs:
   # Linux/Darwin branches that don't apply to win64. When ci.yml's
   # build flags change, change them here too.
   windows-cross-compile:
-    needs: toolchain
+    if: >-
+      ${{
+        always() &&
+        needs.toolchain.result == 'success' &&
+        (
+          needs.stack-ci-gate.result == 'success' ||
+          needs.stack-ci-gate.result == 'skipped'
+        )
+      }}
+    needs:
+      - stack-ci-gate
+      - toolchain
     runs-on: macos-latest
     env:
       # Single source of truth is toolchain.yml's FPC_VERSION (called
@@ -332,7 +432,18 @@ jobs:
   # Post-merge ci.yml still owns the i386-win32 leg, the e2e tier
   # on non-Linux platforms, and the bootstrap.bat smoke.
   windows-test:
-    needs: windows-cross-compile
+    if: >-
+      ${{
+        always() &&
+        needs.windows-cross-compile.result == 'success' &&
+        (
+          needs.stack-ci-gate.result == 'success' ||
+          needs.stack-ci-gate.result == 'skipped'
+        )
+      }}
+    needs:
+      - stack-ci-gate
+      - windows-cross-compile
     runs-on: windows-latest
     defaults:
       run:

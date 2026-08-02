@@ -1,0 +1,17 @@
+reviews:
+  auto_review:
+    # Stack PRs opt into the scarce review pass only after their current head
+    # has passed CI.
+    enabled: false
+    # A label is still required, so allowing drafts lets CI-clean ordinary PRs
+    # request review without a ready transition that would duplicate their CI.
+    drafts: true
+    labels:
+      - review:ready
+    # Upper stack PRs target the codex/ branch immediately below them rather
+    # than the default branch, which CodeRabbit includes automatically.
+    base_branches:
+      - 'codex/.*'
+    # Do not spend a review on every push. After the first label-gated pass,
+    # later CI-clean heads request one incremental pass with the review command.
+    auto_incremental_review: false

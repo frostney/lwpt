@@ -32,6 +32,38 @@ The pre-commit hook runs `lwpt format` and `lwpt agents` locally (both with `sta
 
 If any check fails on a hook autofix you didn't expect, do not commit with `--no-verify`. Investigate, then fix.
 
+### GitHub Stack trial
+
+The 0.5.0 milestone uses GitHub-native stacked pull requests as a trial. Labels
+route each stack layer through the expensive gates; GitHub checks and review
+evidence for the current head remain authoritative:
+
+- `stack:managed` marks a draft layer owned by the active milestone rush. Trial
+  branches use the `codex/stack-` prefix so the opening run is gated before the
+  label can be applied. Draft pushes and cascading synchronization stop after
+  the cheap admission job.
+- `ci:ready` means the layer is stable. Applying it reruns the full PR matrix
+  once for that exact head while the PR remains draft. Stable lower
+  layers run CI even while upper layers remain under construction.
+- `review:ready` is applied only after CI passes. It admits one PR at a time to
+  the rate-limited CodeRabbit lane from the bottom upward. The label requests
+  the first pass; after a reviewed head changes, use `@coderabbitai review` once
+  the replacement head has passed CI and regained the label.
+- `merge:ready` is applied only after the current head has green CI, terminal
+  review evidence, and no unresolved findings. Only then mark the PR ready for
+  review. The label is routing state, not proof.
+
+Before changing, rebasing, or pushing any managed layer with readiness state,
+return it and its affected suffix to draft and remove all three readiness
+labels. After an atomic whole-stack or selected-prefix merge, refresh `main`,
+synchronize the remaining suffix and dependent stacks, clear their stale
+readiness labels, and rerun the current-head gates.
+
+For this trial only, the user-approved exception to the ordinary no-rebase and
+no-force-push policy allows `gh stack` to cascade rebase and force-with-lease
+branches created by the 0.5.0 rush. Stop on a lease mismatch. The exception
+never applies to `main`, unrelated branches, or pre-existing branches.
+
 ## Commit messages
 
 Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`, `perf:`, `build:`, `ci:`, `style:`, `revert:`). Release preparation uses the committed `cliff.toml` to preview the unreleased changelog without writing `CHANGELOG.md`; `/create-release` performs the later generation step. Clear commit messages determine the published categorization.
