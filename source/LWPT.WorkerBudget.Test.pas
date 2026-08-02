@@ -1809,7 +1809,8 @@ var
   Probe : TProcess;
   Values : TStringList;
 begin
-  StateRoot := FScratch + '/interrupted-root/a/b/c/d/e/f/g/h/i/j';
+  StateRoot := ExpandFileName(
+    FScratch + '/interrupted-root/a/b/c/d/e/f/g/h/i/j');
   OutputPath := FScratch + '/interrupted-root-result';
   RootCreateReady := FScratch + '/root-create-ready';
   RootCreateRelease := FScratch + '/root-create-release';
