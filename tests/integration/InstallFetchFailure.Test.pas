@@ -624,7 +624,7 @@ begin
     TestServerErrorNamesTheDependencyAndStatus);
   Test('a failed fetch commits no lockfile, cfg, archive, or module tree',
     TestServerErrorLeavesTheProjectUntouched);
-  Test('a refused connection is reported as an archive-fetch failure',
+  Test('an immediate connect failure is reported as an archive-fetch failure',
     TestRefusedConnectionIsReportedAsAFetchFailure);
   Test('a redirect cannot escape the loopback archive fixture',
     TestRedirectCannotEscapeTheLoopbackFixture);
