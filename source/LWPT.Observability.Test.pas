@@ -6,6 +6,7 @@ uses
   SysUtils,
 
   CLI.Events,
+  LWPT.Core,
   LWPT.Observability,
   TestingPascalLibrary;
 
@@ -138,7 +139,7 @@ end;
 
 begin
   TestRunnerProgram.AddSuite(TLWPTObservabilitySuite.Create(
-    'LWPT.Observability: typed payload boundary'));
+    PROJECT_NAME + '.Observability: typed payload boundary'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

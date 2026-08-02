@@ -22,7 +22,9 @@ type
   end;
 
   { Payload is borrowed for the duration of ICLIEventSink.Deliver. A sink that
-    needs longer retention must copy or serialize it before returning. }
+    needs longer retention must copy or serialize it before returning. Deliver
+    runs while the dispatcher holds its ordering lock, so sink implementations
+    must return within a bounded interval and must not perform unbounded I/O. }
   TCLIEventEnvelope = record
     Sequence: QWord;
     Payload: TCLIEventPayload;
@@ -59,6 +61,8 @@ end;
 
 destructor TCLIEventDispatcher.Destroy;
 begin
+  { The owner must stop and join every publisher before destruction begins;
+    this class does not coordinate shutdown with concurrent Publish calls. }
   DoneCriticalSection(FCriticalSection);
   FSink := nil;
   inherited Destroy;
