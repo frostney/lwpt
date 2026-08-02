@@ -83,15 +83,14 @@ type
     property Port: Word read FPort;
   end;
 
-  { Prepares an ephemeral loopback endpoint that actively refuses one later
-    connection without releasing its port for reuse. Unix retains the endpoint
-    in TIME_WAIT; Windows rejects it through Winsock conditional accept. }
+  { Prepares an ephemeral loopback endpoint that refuses later connections
+    without releasing its port for reuse. Unix retains the endpoint in
+    TIME_WAIT; Windows uses a runtime TCP port reservation. }
   TMockRefusedEndpoint = class
   private
     FHost: string;
     FPort: Word;
     {$IFDEF MSWINDOWS}
-    FRejectThread: TThread;
     FReservationSock: TMockSocket;
     FWinSockStarted: Boolean;
     {$ENDIF}
@@ -723,102 +722,22 @@ begin
 end;
 
 {$IFDEF MSWINDOWS}
-function RejectMockConnection(ALpCallerId, ALpCallerData: LPWSABUF;
-  ALpSQOS, ALpGQOS: LPQOS; ALpCalleeId, ALpCalleeData: LPWSABUF;
-  g: GROUP; ADwCallbackData: DWORD): Longint; stdcall;
-begin
-  Result := CF_REJECT;
-end;
+const
+  { Windows SDK: _WSAIOW(IOC_VENDOR, 100). FPC 3.2.2 exposes WSAIoctl
+    but not the Vista-era runtime port-reservation declarations. }
+  SIO_ACQUIRE_PORT_RESERVATION = DWORD($98000064);
 
 type
-  TMockRejectThread = class(TThread)
-  private
-    FErrorCode: LongInt;
-    FListenSock: TMockSocket;
-    FRejectionCount: Integer;
-    FRejectedCount: LongInt;
-  protected
-    procedure Execute; override;
-  public
-    constructor Create(const AListenSock: TMockSocket;
-      const ARejectionCount: Integer);
-    procedure Stop;
-    procedure WaitForRejection(const AExpectedCount: Integer;
-      const ATimeoutMilliseconds: Cardinal);
+  TInetPortRange = packed record
+    StartPort: Word;
+    NumberOfPorts: Word;
   end;
 
-constructor TMockRejectThread.Create(const AListenSock: TMockSocket;
-  const ARejectionCount: Integer);
-begin
-  inherited Create(True);
-  FreeOnTerminate := False;
-  FErrorCode := 0;
-  FListenSock := AListenSock;
-  FRejectionCount := ARejectionCount;
-  FRejectedCount := 0;
-  Start;
-end;
-
-procedure TMockRejectThread.Execute;
-var
-  Addr: TSockAddr;
-  AddrLen: Longint;
-  AcceptedSock: TMockSocket;
-  ErrorCode: Integer;
-begin
-  while (not Terminated) and
-    (InterlockedCompareExchange(FRejectedCount, 0, 0) < FRejectionCount) do
-  begin
-    FillChar(Addr, SizeOf(Addr), 0);
-    AddrLen := SizeOf(Addr);
-    AcceptedSock := WinSock2.WSAAccept(FListenSock, Addr, @AddrLen,
-      @RejectMockConnection, 0);
-    if IsValidMockSocket(AcceptedSock) then
-    begin
-      WinSock2.closesocket(AcceptedSock);
-      InterlockedExchange(FErrorCode, -1);
-      Exit;
-    end;
-    ErrorCode := WinSock2.WSAGetLastError;
-    if ErrorCode = WSAECONNREFUSED then
-      InterlockedIncrement(FRejectedCount)
-    else if ErrorCode = WSAEWOULDBLOCK then
-      Sleep(1)
-    else
-    begin
-      InterlockedExchange(FErrorCode, ErrorCode);
-      Exit;
-    end;
+  TInetPortReservationInstance = packed record
+    Reservation: TInetPortRange;
+    AlignmentPadding: DWORD;
+    Token: QWord;
   end;
-end;
-
-procedure TMockRejectThread.Stop;
-begin
-  Terminate;
-end;
-
-procedure TMockRejectThread.WaitForRejection(const AExpectedCount: Integer;
-  const ATimeoutMilliseconds: Cardinal);
-var
-  ErrorCode: LongInt;
-  StartedAt: QWord;
-begin
-  StartedAt := GetTickCount64;
-  while InterlockedCompareExchange(FRejectedCount, 0, 0) < AExpectedCount do
-  begin
-    ErrorCode := InterlockedCompareExchange(FErrorCode, 0, 0);
-    if ErrorCode <> 0 then
-      raise EMockServerError.CreateFmt(
-        'conditional accept worker failed with Winsock error %d', [ErrorCode]);
-    if Finished then
-      raise EMockServerError.Create(
-        'conditional accept worker stopped before rejecting the probe');
-    if GetTickCount64 - StartedAt >= ATimeoutMilliseconds then
-      raise EMockServerError.Create(
-        'conditional accept worker did not reject the probe in time');
-    Sleep(1);
-  end;
-end;
 
 function ProbeRefusedLoopback(const APort: Word;
   const ATimeoutMilliseconds: Cardinal): Boolean;
@@ -834,13 +753,13 @@ begin
   Result := False;
   Sock := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
   if not IsValidMockSocket(Sock) then
-    raise EMockServerError.Create('conditional-accept probe socket failed');
+    raise EMockServerError.Create('reserved-port probe socket failed');
   TrackMockSocketOpened;
   try
     Mode := 1;
     if WinSock2.ioctlsocket(Sock, LongInt(FIONBIO), Mode) <> 0 then
       raise EMockServerError.Create(
-        'conditional-accept probe could not enable nonblocking mode');
+        'reserved-port probe could not enable nonblocking mode');
     FillChar(Addr, SizeOf(Addr), 0);
     Addr.sin_family := AF_INET;
     Addr.sin_port := WinSock2.htons(APort);
@@ -850,14 +769,14 @@ begin
     if ErrorCode = WSAECONNREFUSED then Exit(True);
     if (ErrorCode <> WSAEWOULDBLOCK) and (ErrorCode <> WSAEINPROGRESS) then
       raise EMockServerError.CreateFmt(
-        'conditional-accept probe failed with Winsock error %d', [ErrorCode]);
+        'reserved-port probe failed with Winsock error %d', [ErrorCode]);
 
     StartedAt := GetTickCount64;
     repeat
       Elapsed := GetTickCount64 - StartedAt;
       if Elapsed >= ATimeoutMilliseconds then
         raise EMockServerError.Create(
-          'conditional-accept probe did not finish in time');
+          'reserved-port probe did not finish in time');
       Remaining := ATimeoutMilliseconds - Elapsed;
       FillChar(WriteSet, SizeOf(WriteSet), 0);
       WriteSet.fd_count := 1;
@@ -869,18 +788,18 @@ begin
       Timeout.tv_usec := (Remaining mod 1000) * 1000;
       Ready := WinSock2.select(0, nil, @WriteSet, @ExceptSet, @Timeout);
       if Ready < 0 then
-        raise EMockServerError.Create('conditional-accept probe select failed');
+        raise EMockServerError.Create('reserved-port probe select failed');
       if Ready = 0 then Continue;
       ErrorCode := 0;
       ErrorLength := SizeOf(ErrorCode);
       if WinSock2.getsockopt(Sock, SOL_SOCKET, SO_ERROR,
          PChar(@ErrorCode), ErrorLength) <> 0 then
         raise EMockServerError.Create(
-          'conditional-accept probe could not read the connect result');
+          'reserved-port probe could not read the connect result');
       if ErrorCode = WSAECONNREFUSED then Exit(True);
       if ErrorCode = 0 then Exit;
       raise EMockServerError.CreateFmt(
-        'conditional-accept probe failed with Winsock error %d', [ErrorCode]);
+        'reserved-port probe failed with Winsock error %d', [ErrorCode]);
     until False;
   finally
     CloseTrackedMockSocket(Sock);
@@ -891,17 +810,16 @@ end;
 constructor TMockRefusedEndpoint.Create;
 var
   ListenSock, ClientSock, AcceptedSock, ProbeSock: TMockSocket;
-  Received: Integer;
-  OneByte: Byte;
   {$IFDEF UNIX}
   Addr: TInetSockAddr;
   AddrLen: TSocklen;
+  Received: Integer;
+  OneByte: Byte;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  Addr: TSockAddrIn;
-  AddrLen: Longint;
-  ConditionalAccept: DWORD;
-  NonBlockingMode: u_long;
+  BytesReturned: DWORD;
+  PortRange: TInetPortRange;
+  Reservation: TInetPortReservationInstance;
   WSAData: TWSAData;
   {$ENDIF}
 begin
@@ -911,7 +829,6 @@ begin
   AcceptedSock := InvalidMockSocket;
   ProbeSock := InvalidMockSocket;
   {$IFDEF MSWINDOWS}
-  FRejectThread := nil;
   FReservationSock := InvalidMockSocket;
   if WinSock2.WSAStartup($0202, WSAData) <> 0 then
     raise EMockServerError.Create('WSAStartup failed');
@@ -921,10 +838,6 @@ begin
   try
     {$IFDEF UNIX}
     ListenSock := fpSocket(AF_INET, SOCK_STREAM, 0);
-    {$ENDIF}
-    {$IFDEF MSWINDOWS}
-    ListenSock := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
-    {$ENDIF}
     if not IsValidMockSocket(ListenSock) then
       raise EMockServerError.Create('socket() failed');
     TrackMockSocketOpened;
@@ -932,7 +845,6 @@ begin
     FillChar(Addr, SizeOf(Addr), 0);
     Addr.sin_family := AF_INET;
     Addr.sin_port := 0;
-    {$IFDEF UNIX}
     Addr.sin_addr := StrToNetAddr('127.0.0.1');
     if fpBind(ListenSock, @Addr, SizeOf(Addr)) <> 0 then
       raise EMockServerError.Create('bind() failed');
@@ -942,38 +854,10 @@ begin
     if fpGetsockname(ListenSock, @Addr, @AddrLen) <> 0 then
       raise EMockServerError.Create('getsockname() failed');
     FPort := ntohs(Addr.sin_port);
-    {$ENDIF}
-    {$IFDEF MSWINDOWS}
-    Addr.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
-    ConditionalAccept := 1;
-    if WinSock2.setsockopt(ListenSock, SOL_SOCKET, SO_CONDITIONAL_ACCEPT,
-       @ConditionalAccept, SizeOf(ConditionalAccept)) <> 0 then
-      raise EMockServerError.Create('conditional accept setup failed');
-    if WinSock2.bind(ListenSock, PSockAddr(@Addr), SizeOf(Addr)) <> 0 then
-      raise EMockServerError.Create('bind() failed');
-    if WinSock2.listen(ListenSock, 1) <> 0 then
-      raise EMockServerError.Create('listen() failed');
-    NonBlockingMode := 1;
-    if WinSock2.ioctlsocket(ListenSock, LongInt(FIONBIO),
-       NonBlockingMode) <> 0 then
-      raise EMockServerError.Create(
-        'conditional accept could not enable nonblocking mode');
-    AddrLen := SizeOf(Addr);
-    if WinSock2.getsockname(ListenSock, PSockAddr(@Addr)^, AddrLen) <> 0 then
-      raise EMockServerError.Create('getsockname() failed');
-    FPort := WinSock2.ntohs(Addr.sin_port);
-    {$ENDIF}
-
-    {$IFDEF UNIX}
     ClientSock := ConnectLoopback(FPort);
     if not IsValidMockSocket(ClientSock) then
       raise EMockServerError.Create('setup client failed to connect');
-    {$IFDEF UNIX}
     AcceptedSock := fpAccept(ListenSock, @Addr, @AddrLen);
-    {$ENDIF}
-    {$IFDEF MSWINDOWS}
-    AcceptedSock := WinSock2.accept(ListenSock, PSockAddr(@Addr), @AddrLen);
-    {$ENDIF}
     if not IsValidMockSocket(AcceptedSock) then
       raise EMockServerError.Create('setup accept failed');
     TrackMockSocketOpened;
@@ -981,12 +865,7 @@ begin
     { The server endpoint closes first. Reading its FIN on the setup client
       and then closing that client leaves the server port in TIME_WAIT. }
     CloseTrackedMockSocket(AcceptedSock);
-    {$IFDEF UNIX}
     Received := fpRecv(ClientSock, @OneByte, 1, 0);
-    {$ENDIF}
-    {$IFDEF MSWINDOWS}
-    Received := WinSock2.recv(ClientSock, @OneByte, 1, 0);
-    {$ENDIF}
     if Received <> 0 then
       raise EMockServerError.Create('setup client did not receive EOF');
     CloseTrackedMockSocket(ClientSock);
@@ -999,17 +878,34 @@ begin
         'loopback port was unexpectedly reusable after active close');
     {$ENDIF}
     {$IFDEF MSWINDOWS}
-    FReservationSock := ListenSock;
-    ListenSock := InvalidMockSocket;
-    { Reject and synchronously observe one setup connection before handing the
-      endpoint to the subprocess. This proves the selected Winsock provider
-      honors conditional accept, while the second rejection is reserved for
-      the install under test. }
-    FRejectThread := TMockRejectThread.Create(FReservationSock, 2);
+    FReservationSock := WinSock2.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if not IsValidMockSocket(FReservationSock) then
+      raise EMockServerError.Create('reservation socket failed');
+    TrackMockSocketOpened;
+    FillChar(PortRange, SizeOf(PortRange), 0);
+    PortRange.NumberOfPorts := 1;
+    FillChar(Reservation, SizeOf(Reservation), 0);
+    BytesReturned := 0;
+    if WinSock2.WSAIoctl(FReservationSock,
+       SIO_ACQUIRE_PORT_RESERVATION, @PortRange, SizeOf(PortRange),
+       @Reservation, SizeOf(Reservation), @BytesReturned, nil, nil) <> 0 then
+      raise EMockServerError.CreateFmt(
+        'runtime TCP port reservation failed with Winsock error %d',
+        [WinSock2.WSAGetLastError]);
+    if BytesReturned < SizeOf(Reservation) then
+      raise EMockServerError.Create(
+        'runtime TCP port reservation returned a short result');
+    FPort := WinSock2.ntohs(Reservation.Reservation.StartPort);
+    if FPort = 0 then
+      raise EMockServerError.Create(
+        'runtime TCP port reservation returned port zero');
+    { A runtime reservation keeps the TCP port unavailable to other sockets,
+      but it is not a bound transport endpoint. With no listener, loopback TCP
+      rejects the SYN instead of blackholing it. Verify that contract before
+      handing the same still-reserved port to the subprocess. }
     if not ProbeRefusedLoopback(FPort, 2000) then
       raise EMockServerError.Create(
-        'conditional-accept probe unexpectedly connected');
-    TMockRejectThread(FRejectThread).WaitForRejection(1, 2000);
+        'reserved TCP port unexpectedly accepted a connection');
     {$ENDIF}
   except
     CloseTrackedMockSocket(ProbeSock);
@@ -1017,15 +913,7 @@ begin
     CloseTrackedMockSocket(ClientSock);
     CloseTrackedMockSocket(ListenSock);
     {$IFDEF MSWINDOWS}
-    if Assigned(FRejectThread) then
-    begin
-      TMockRejectThread(FRejectThread).Stop;
-      FRejectThread.WaitFor;
-      FreeAndNil(FRejectThread);
-      CloseTrackedMockSocket(FReservationSock);
-    end
-    else
-      CloseTrackedMockSocket(FReservationSock);
+    CloseTrackedMockSocket(FReservationSock);
     CleanupTrackedWinSock(FWinSockStarted);
     {$ENDIF}
     raise;
@@ -1035,15 +923,7 @@ end;
 destructor TMockRefusedEndpoint.Destroy;
 begin
   {$IFDEF MSWINDOWS}
-  if Assigned(FRejectThread) then
-  begin
-    TMockRejectThread(FRejectThread).Stop;
-    FRejectThread.WaitFor;
-    FreeAndNil(FRejectThread);
-    CloseTrackedMockSocket(FReservationSock);
-  end
-  else
-    CloseTrackedMockSocket(FReservationSock);
+  CloseTrackedMockSocket(FReservationSock);
   CleanupTrackedWinSock(FWinSockStarted);
   {$ENDIF}
   inherited Destroy;
