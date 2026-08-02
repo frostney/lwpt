@@ -14,6 +14,7 @@ uses
 
   LWPT.BuildRequest,
   LWPT.CompilerDriver,
+  LWPT.Core,
   LWPT.Manifest;
 
 { Exit code of a finished TProcess, tolerant of which call reaped it.
@@ -32,6 +33,8 @@ function  CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths: array of string; out AOutBin: string;
   out ARequest: TLWPTBuildRequest; const ABuildRoot: string;
   const ADriver: TLWPTCompilerDriver): TProcess;
+procedure AppendCompilerEnvironmentSearchPaths(
+  var AUnitPaths, AIncludePaths: TStringArray);
 function  RunPascalScript(const AHook: THook; out AError: string;
   const ABuildRoot: string = ''): Integer;
 function  RunUserScript(const AHook: THook): Integer;
@@ -45,14 +48,39 @@ implementation
 
 uses
   LWPT.BuildSession,
-  LWPT.CompilerDriver.FPC,
-  LWPT.Core;
+  LWPT.CompilerDriver.FPC;
 
 function NormalisedExitCode(const AProcess: TProcess): Integer;
 begin
   Result := AProcess.ExitCode;
   if (Result = 0) and (AProcess.ExitStatus <> 0) then
     Result := AProcess.ExitStatus;
+end;
+
+procedure AppendCompilerEnvironmentSearchPaths(
+  var AUnitPaths, AIncludePaths: TStringArray);
+var
+  Raw, Part: string;
+  StartAt, i, Count: Integer;
+begin
+  Raw := GetEnvironmentVariable(PROJECT_NAME + '_FPC_UNIT_PATHS');
+  if Raw = '' then Exit;
+  StartAt := 1;
+  for i := 1 to Length(Raw) + 1 do
+    if (i > Length(Raw)) or (Raw[i] = PathSeparator) then
+    begin
+      Part := Copy(Raw, StartAt, i - StartAt);
+      if Part <> '' then
+      begin
+        Count := Length(AUnitPaths);
+        SetLength(AUnitPaths, Count + 1);
+        AUnitPaths[Count] := Part;
+        Count := Length(AIncludePaths);
+        SetLength(AIncludePaths, Count + 1);
+        AIncludePaths[Count] := Part;
+      end;
+      StartAt := i + 1;
+    end;
 end;
 
 function CreatePascalCompilerProcess(const ASrcFile: string;
@@ -63,7 +91,8 @@ var
   Arguments: LWPT.Core.TStringArray;
   BuildDir: string;
   Capabilities: TLWPTCompilerCapabilities;
-  i: Integer;
+  ConfigurationUnitPaths: TStringArray;
+  i, UnitPathCount: Integer;
   ScanDirs: TStringArray;
 
   function SourceBuildKey(const APath: string): string;
@@ -90,20 +119,34 @@ begin
              + ChangeFileExt(ExtractFileName(ASrcFile), '');
 
     { Describe the compilation before the selected driver adapts it. }
-    ARequest := CreateFPCBuildRequest(ASrcFile, AOutBin, ADriver);
+    ARequest := ADriver.CreateBuildRequest(ASrcFile, AOutBin);
     AOutBin := ARequest.Outputs.Artifact;
-    SetLength(ARequest.Inputs.UnitPaths, Length(AUnitPaths));
-    SetLength(ARequest.Inputs.IncludePaths, Length(AUnitPaths));
+    SetLength(ConfigurationUnitPaths, 0);
+    AppendUnitDirsFromCfg(CFG_FILE, ConfigurationUnitPaths);
+    UnitPathCount := Length(AUnitPaths) + Length(ConfigurationUnitPaths);
+    SetLength(ARequest.Inputs.UnitPaths, UnitPathCount);
+    SetLength(ARequest.Inputs.IncludePaths, UnitPathCount);
     for i := 0 to High(AUnitPaths) do
     begin
       ARequest.Inputs.UnitPaths[i] := AUnitPaths[i];
       ARequest.Inputs.IncludePaths[i] := AUnitPaths[i];
     end;
+    for i := 0 to High(ConfigurationUnitPaths) do
+    begin
+      ARequest.Inputs.UnitPaths[Length(AUnitPaths) + i] :=
+        ConfigurationUnitPaths[i];
+      ARequest.Inputs.IncludePaths[Length(AUnitPaths) + i] :=
+        ConfigurationUnitPaths[i];
+    end;
+    AppendCompilerEnvironmentSearchPaths(ARequest.Inputs.UnitPaths,
+      ARequest.Inputs.IncludePaths);
     ARequest.Outputs.ExecutableDirectory := BuildDir;
     ARequest.Outputs.UnitDirectory := BuildDir + '/units';
     ARequest.Outputs.ObjectDirectory := BuildDir + '/units';
     ValidateBuildRequest(ARequest);
-    Capabilities := ADriver.ProbeCapabilities(ARequest.Target);
+    { A cached discovery result may shape the request, but every concrete
+      compile revalidates live capabilities immediately before translation. }
+    Capabilities := ADriver.ProbeCapabilities(ARequest.Target, True);
     EnsureBuildRequestCompatible(ARequest, Capabilities);
     ARequest.Compiler.VersionIdentity := Capabilities.VersionIdentity;
 

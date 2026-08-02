@@ -10,6 +10,10 @@ uses
   LWPT.BuildRequest,
   LWPT.Core;
 
+const
+  COMPILER_TIMEOUT_ENVIRONMENT = PROJECT_NAME + '_COMPILER_TIMEOUT_MS';
+  DEFAULT_COMPILER_TIMEOUT_MILLISECONDS = 30 * 60 * 1000;
+
 type
   ELWPTCompilerDriverError = class(ELWPTError);
 
@@ -36,6 +40,10 @@ type
     concurrent calls on one driver instance. }
   TLWPTCompilerDriver = class
   public
+    function CompilerID: string; virtual; abstract;
+    function VersionConstraint: string; virtual;
+    function CreateBuildRequest(const ASource, AArtifact: string):
+      TLWPTBuildRequest; virtual;
     function DefaultTarget: TLWPTTarget; virtual; abstract;
     function ProbeCapabilities(const ATarget: TLWPTTarget;
       const ARefresh: Boolean = False): TLWPTCompilerCapabilities; virtual;
@@ -44,11 +52,20 @@ type
       const AOptions: TLWPTCompilerInvocationOptions):
       LWPT.Core.TStringArray; virtual; abstract;
     function ExecutableName: string; virtual; abstract;
+    function BuildStandardInput(const ARequest: TLWPTBuildRequest): string;
+      virtual;
+    function SeparateStandardError: Boolean; virtual;
+    function CompilationTimeoutMilliseconds: QWord; virtual;
     function ClassifyFailure(const AExitCode: Integer;
       const ARawOutput: string): TLWPTCompilerFailure; virtual; abstract;
     function NormalizeResult(const ARequest: TLWPTBuildRequest;
       const AExitCode: Integer; const ARawOutput: string):
       TLWPTBuildResult; virtual; abstract;
+    function NormalizeExecutionResult(const ARequest: TLWPTBuildRequest;
+      const AExitCode: Integer; const AStandardOutput,
+      AStandardError: string): TLWPTBuildResult; virtual;
+    function DisplayOutput(const AStandardOutput,
+      AStandardError: string): string; virtual;
   end;
 
 function BuildCompilerInvocationOptions(const AConfigurationFile: string;
@@ -58,11 +75,80 @@ function PascalSourceCompilerInvocationOptions(
 procedure EnsureBuildRequestCompatible(const ARequest: TLWPTBuildRequest;
   const ACapabilities: TLWPTCompilerCapabilities);
 function BuildResultErrorMessage(const AResult: TLWPTBuildResult): string;
+procedure ValidateReportedArtifacts(const ACompilerID: string;
+  const ARequest: TLWPTBuildRequest; const AResult: TLWPTBuildResult;
+  const AErrorContext: string = '');
 
 implementation
 
 uses
   SysUtils;
+
+function TLWPTCompilerDriver.VersionConstraint: string;
+begin
+  Result := '*';
+end;
+
+function TLWPTCompilerDriver.CreateBuildRequest(const ASource,
+  AArtifact: string): TLWPTBuildRequest;
+begin
+  Result := DefaultBuildRequest;
+  Result.Compiler.ID := CompilerID;
+  Result.Compiler.VersionConstraint := VersionConstraint;
+  Result.Target := DefaultTarget;
+  Result.OutputKind := BUILD_OUTPUT_EXECUTABLE;
+  Result.Mode := BUILD_MODE_DEV;
+  Result.Inputs.EntryPoint := ASource;
+  SetLength(Result.Inputs.Sources, 1);
+  Result.Inputs.Sources[0] := ASource;
+  Result.Outputs.Artifact := AArtifact;
+  if IsWindowsOperatingSystem(Result.Target.OS)
+     and (ExtractFileExt(Result.Outputs.Artifact) = '') then
+    Result.Outputs.Artifact := Result.Outputs.Artifact + '.exe';
+end;
+
+function TLWPTCompilerDriver.BuildStandardInput(
+  const ARequest: TLWPTBuildRequest): string;
+begin
+  Result := '';
+end;
+
+function TLWPTCompilerDriver.SeparateStandardError: Boolean;
+begin
+  Result := False;
+end;
+
+function TLWPTCompilerDriver.CompilationTimeoutMilliseconds: QWord;
+var
+  Configured: Int64;
+  Value: string;
+begin
+  Value := GetEnvironmentVariable(COMPILER_TIMEOUT_ENVIRONMENT);
+  if Value = '' then Exit(DEFAULT_COMPILER_TIMEOUT_MILLISECONDS);
+  if not TryStrToInt64(Value, Configured) or (Configured <= 0) then
+    raise ELWPTCompilerDriverError.CreateFmt(
+      '%s must be a positive integer number of milliseconds',
+      [COMPILER_TIMEOUT_ENVIRONMENT]);
+  Result := QWord(Configured);
+end;
+
+function TLWPTCompilerDriver.NormalizeExecutionResult(
+  const ARequest: TLWPTBuildRequest; const AExitCode: Integer;
+  const AStandardOutput, AStandardError: string): TLWPTBuildResult;
+begin
+  Result := NormalizeResult(ARequest, AExitCode,
+    DisplayOutput(AStandardOutput, AStandardError));
+end;
+
+function TLWPTCompilerDriver.DisplayOutput(const AStandardOutput,
+  AStandardError: string): string;
+begin
+  Result := AStandardOutput;
+  if AStandardError = '' then Exit;
+  if (Result <> '') and not (Result[Length(Result)] in [#10, #13]) then
+    Result := Result + LineEnding;
+  Result := Result + AStandardError;
+end;
 
 function BuildCompilerInvocationOptions(const AConfigurationFile: string;
   const AForceRebuild: Boolean): TLWPTCompilerInvocationOptions;
@@ -130,6 +216,66 @@ begin
       Result := Result + AResult.Diagnostics[DiagnosticIndex].MessageText;
       Exit;
     end;
+end;
+
+function PathsEqual(const ALeft, ARight: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := SameText(ExpandFileName(ALeft), ExpandFileName(ARight));
+  {$ELSE}
+  Result := ExpandFileName(ALeft) = ExpandFileName(ARight);
+  {$ENDIF}
+end;
+
+function PathWithinRoot(const APath, ARoot: string): Boolean;
+var
+  FullPath, FullRoot: string;
+begin
+  if ARoot = '' then Exit(False);
+  FullPath := ExpandFileName(APath);
+  FullRoot := IncludeTrailingPathDelimiter(ExpandFileName(ARoot));
+  {$IFDEF MSWINDOWS}
+  Result := SameText(Copy(FullPath, 1, Length(FullRoot)), FullRoot);
+  {$ELSE}
+  Result := Copy(FullPath, 1, Length(FullRoot)) = FullRoot;
+  {$ENDIF}
+end;
+
+procedure ValidateReportedArtifacts(const ACompilerID: string;
+  const ARequest: TLWPTBuildRequest; const AResult: TLWPTBuildResult;
+  const AErrorContext: string);
+var
+  ArtifactIndex: Integer;
+  FoundPrimary, InPrivateRoot: Boolean;
+begin
+  FoundPrimary := False;
+  for ArtifactIndex := 0 to High(AResult.Artifacts) do
+  begin
+    if PathsEqual(AResult.Artifacts[ArtifactIndex].Path,
+      ARequest.Outputs.Artifact) then
+    begin
+      if AResult.Artifacts[ArtifactIndex].Kind = ARequest.OutputKind then
+        FoundPrimary := True;
+      Continue;
+    end;
+    InPrivateRoot := PathWithinRoot(AResult.Artifacts[ArtifactIndex].Path,
+      ARequest.Outputs.ExecutableDirectory)
+      or PathWithinRoot(AResult.Artifacts[ArtifactIndex].Path,
+        ARequest.Outputs.UnitDirectory)
+      or PathWithinRoot(AResult.Artifacts[ArtifactIndex].Path,
+        ARequest.Outputs.ObjectDirectory)
+      or PathWithinRoot(AResult.Artifacts[ArtifactIndex].Path,
+        ARequest.Outputs.ResourceDirectory);
+    if not InPrivateRoot then
+      raise ELWPTCompilerDriverError.CreateFmt(
+        'compiler driver "%s" reported artifact outside the declared '
+        + 'private output roots: %s%s',
+        [ACompilerID, AResult.Artifacts[ArtifactIndex].Path, AErrorContext]);
+  end;
+  if AResult.Success and not FoundPrimary then
+    raise ELWPTCompilerDriverError.CreateFmt(
+      'compiler driver "%s" did not report the requested primary artifact '
+      + '%s%s', [ACompilerID, ARequest.Outputs.Artifact, AErrorContext]);
 end;
 
 end.

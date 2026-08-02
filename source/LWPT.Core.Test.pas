@@ -59,6 +59,8 @@ type
     procedure TestBuildEntriesTable;
     procedure TestVersionSection;
     procedure TestManifestSnapshotBindsParsedBytes;
+    procedure TestRootCompilerProfilesParsed;
+    procedure TestDependencyCompilerPolicyIgnored;
   end;
 
   TLoadManifestValidation = class(TTestSuite)
@@ -72,6 +74,7 @@ type
     procedure TestBuildEntryTraversalNameRootOnly;
     procedure TestBuildDependsMustBeStringArray;
     procedure TestBuildFlagsMustBeStringArrayAndAreRootOnly;
+    procedure TestUndeclaredCompilerProfilesAreRejected;
     procedure TestArrayCannotBecomeTablePath;
   end;
 
@@ -675,6 +678,62 @@ begin
   Expect<string>(Man.Version).ToBe('1.2.3');
 end;
 
+procedure TLoadManifestHappy.TestRootCompilerProfilesParsed;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "compiler-profiles"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler]'#10 +
+    'default = "native"'#10 +
+    ''#10 +
+    '[compiler.profiles.native]'#10 +
+    'driver = "fpc"'#10 +
+    'executable = "custom-fpc"'#10 +
+    'version = "^3.2.0"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'source = "source/app.pas"'#10 +
+    'compiler = "native"'#10;
+var
+  Man: TManifest;
+begin
+  Man := LoadManifest(WriteManifest('compiler-profiles', INPUT));
+  Expect<string>(Man.CompilerDefault).ToBe('native');
+  Expect<Integer>(Length(Man.CompilerProfiles)).ToBe(1);
+  Expect<string>(Man.CompilerProfiles[0].Driver).ToBe('fpc');
+  Expect<string>(Man.CompilerProfiles[0].Executable).ToBe('custom-fpc');
+  Expect<string>(Man.CompilerProfiles[0].VersionConstraint).ToBe('^3.2.0');
+  Expect<string>(Man.BuildEntries[0].CompilerProfile).ToBe('native');
+end;
+
+procedure TLoadManifestHappy.TestDependencyCompilerPolicyIgnored;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "dependency-compiler"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler]'#10 +
+    'default = "foreign"'#10 +
+    ''#10 +
+    '[compiler.profiles.foreign]'#10 +
+    'driver = "foreign"'#10 +
+    'executable = "foreign-driver"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'source = "source/app.pas"'#10 +
+    'compiler = "foreign"'#10;
+var
+  Man: TManifest;
+begin
+  Man := LoadManifest(WriteManifest('dependency-compiler', INPUT), False);
+  Expect<string>(Man.CompilerDefault).ToBe('');
+  Expect<Integer>(Length(Man.CompilerProfiles)).ToBe(0);
+  Expect<string>(Man.BuildEntries[0].CompilerProfile).ToBe('');
+end;
+
 procedure TLoadManifestHappy.SetupTests;
 begin
   Test('minimal manifest: name + version',  TestMinimalManifestNameAndVersion);
@@ -683,6 +742,10 @@ begin
   Test('[version] section parsed',          TestVersionSection);
   Test('manifest snapshot hashes the bytes it parses',
     TestManifestSnapshotBindsParsedBytes);
+  Test('root compiler profiles and build selection are parsed',
+    TestRootCompilerProfilesParsed);
+  Test('dependency compiler policy is ignored',
+    TestDependencyCompilerPolicyIgnored);
 end;
 
 { ── TLoadManifestValidation ───────────────────────────────────────── }
@@ -862,6 +925,48 @@ begin
   Expect<Integer>(Length(Man.BuildEntries[0].Flags)).ToBe(0);
 end;
 
+procedure TLoadManifestValidation.TestUndeclaredCompilerProfilesAreRejected;
+const
+  UNKNOWN_DEFAULT =
+    '[package]'#10 +
+    'name = "unknown-default"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler]'#10 +
+    'default = "typo"'#10;
+  UNKNOWN_ENTRY =
+    '[package]'#10 +
+    'name = "unknown-entry"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler.profiles.native]'#10 +
+    'driver = "fpc"'#10 +
+    ''#10 +
+    '[build]'#10 +
+    'app = { source = "source/app.pas", compiler = "typo" }'#10;
+  DUPLICATE_CASE =
+    '[package]'#10 +
+    'name = "duplicate-profile-case"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[compiler.profiles.Native]'#10 +
+    'driver = "fpc"'#10 +
+    ''#10 +
+    '[compiler.profiles.native]'#10 +
+    'driver = "fpc"'#10;
+begin
+  ExpectManifestLoadError(
+    WriteManifest('unknown-compiler-default', UNKNOWN_DEFAULT),
+    '[compiler] default names undeclared compiler profile "typo"', Self);
+  ExpectManifestLoadError(
+    WriteManifest('unknown-entry-compiler', UNKNOWN_ENTRY),
+    'build.app.compiler names undeclared compiler profile "typo"', Self);
+  ExpectManifestLoadError(
+    WriteManifest('duplicate-compiler-profile-case', DUPLICATE_CASE),
+    '[compiler.profiles] duplicate profile name "native" '
+      + '(profile names are case-insensitive)', Self);
+end;
+
 procedure TLoadManifestValidation.TestArrayCannotBecomeTablePath;
 const
   REGULAR_TABLE =
@@ -926,6 +1031,8 @@ begin
     TestBuildDependsMustBeStringArray);
   Test('[build] flags are strict root-owned string arrays',
     TestBuildFlagsMustBeStringArrayAndAreRootOnly);
+  Test('compiler defaults and build entries name declared profiles',
+    TestUndeclaredCompilerProfilesAreRejected);
   Test('value arrays cannot become table paths',
     TestArrayCannotBecomeTablePath);
 end;
