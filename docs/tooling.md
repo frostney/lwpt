@@ -176,7 +176,7 @@ Every committed-path write in LWPT goes through `.lwpt/tmp/` first. The helpers 
 | `AtomicWriteText(Dst, TmpRoot, StringList)` | `WriteLock`, `WriteCfg` |
 | `AtomicWriteBytes(Dst, TmpRoot, Bytes)` | `FetchToCache` (network archive download) |
 | `AtomicMoveFile(Src, Dst)` | The underlying rename for the two helpers above |
-| `AtomicMoveDir(Src, Dst)` | `ResolveGraph` (extracted-tree commit) |
+| `AtomicMoveDir(Src, Dst)` | fixed-point resolver plan publication |
 
 On the same filesystem, `rename(2)` is one syscall. Across filesystems (a Docker bind mount of `.lwpt/` onto a different volume; a network drive; certain remote-pair-programming setups), `rename` fails with `EXDEV`. The helpers detect the failure and fall back to **copy-then-delete**: target copied byte-for-byte to its final location, source deleted. Slower, and the copy itself isn't atomic against crash, but the source remains intact until the copy completes — so a crash mid-copy leaves the source in `.lwpt/tmp/` (cleaned up by `lwpt repair` or the next install's startup pass) and never produces a half-written committed file.
 
@@ -184,11 +184,11 @@ If EXDEV failures are persistent and the fallback is too slow, ensure `.lwpt/` l
 
 ## Install lock + crash recovery
 
-`lwpt install` acquires a cross-process lock at `.lwpt/install.lock` before doing any work. On Unix, the file is created with `O_CREAT|O_EXCL` — the kernel guarantees only one process wins the create. A second concurrent `lwpt install` fails fast with `EConcurrencyError` naming the lock holder's PID. The lock is deleted by the normally-completing install; a crashed install leaves the lock file behind, and `lwpt repair` clears it.
+`lwpt install` acquires a cross-process lock at `.lwpt/install.lock` before doing any work. On Unix, the file is created with `O_CREAT|O_EXCL` — the kernel guarantees only one process wins the create. A second concurrent `lwpt install` fails fast with `EConcurrencyError` naming the lock holder's PID. The lock is deleted by the normally-completing install; a crashed install leaves the lock file behind, and `lwpt repair` clears it only after using the validated pending journal to restore pre-transaction committed state.
 
 On Windows, LWPT opens the lock file and holds an exclusive `LockFileEx` byte-range lock for the transaction. A second concurrent install fails fast under the same `EConcurrencyError` contract; normal completion releases the OS lock and removes the file, while `lwpt repair` clears crash residue.
 
-At the start of every install, `.lwpt/tmp/` is wiped — any orphans from a previous interrupted run are reaped automatically. The orphans are never committed (`.lwpt/tmp/` is gitignored) so this is always safe.
+Before publication, old committed paths are copied and content-validated below one pending transaction directory in `.lwpt/tmp/`; they are not removed merely to create a backup. Retention preserves the exact object type, including raw symlink or junction target data instead of copying through links. Successful publication writes a committed marker before discarding those copies. After a crash, `lwpt repair` restores every pending entry before its ordinary tmp sweep. Rollback validates backups before touching the current path, catches each restore exception independently, attempts all later restores, retains failed evidence, and reports aggregate failures alongside the original error. Frozen verification neither performs recovery nor cleans tmp, keeping failure paths read-only for lockfile, cfg, and modules state.
 
 ## Build sessions and publication
 
