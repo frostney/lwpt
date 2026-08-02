@@ -342,10 +342,11 @@ end;
 
 procedure TCompilerProfiles.BeforeAll;
 var
-  TestingUnitPath: string;
+  EnvironmentUnitPath, TestingUnitPath: string;
 begin
   FScratch := CreateScratchRoot('compiler-profiles');
   RecursiveDelete(FScratch);
+  EnvironmentUnitPath := FScratch + '/environment-units';
   TestingUnitPath := ExpandFileName('.lwpt/modules/testing/source');
   WriteTextFile(FScratch + '/.lwpt-binary', LwptBinaryPath);
   WriteTextFile(FScratch + '/lwpt.cfg', '-Fu' + TestingUnitPath + #10);
@@ -354,10 +355,18 @@ begin
   WriteTextFile(FScratch + '/source/Example.Test.pas',
       'program Example.Test;'#10
     + '{$mode delphi}{$H+}'#10
-    + 'uses TestingPascalLibrary;'#10
+    + 'uses EnvironmentOnlyUnit, TestingPascalLibrary;'#10
     + 'begin'#10
+    + '  if ENVIRONMENT_ONLY_MARKER <> 1 then Halt(2);'#10
     + '  TestRunnerProgram.Run;'#10
     + '  ExitCode := TestResultToExitCode;'#10
+    + 'end.'#10);
+  WriteTextFile(EnvironmentUnitPath + '/EnvironmentOnlyUnit.pas',
+      'unit EnvironmentOnlyUnit;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'interface'#10
+    + 'const ENVIRONMENT_ONLY_MARKER = 1;'#10
+    + 'implementation'#10
     + 'end.'#10);
   WriteTextFile(FScratch + '/scripts/observe-lease.pas',
       'program ObserveLease;'#10
@@ -390,6 +399,7 @@ end;
 
 procedure TCompilerProfiles.TestExternalBuildAndTestSucceed;
 var
+  EnvironmentUnitPaths: string;
   R: TLwptResult;
 begin
   SetMode('success');
@@ -398,7 +408,14 @@ begin
   DumpRunFailure('external build', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app'))).ToBe(True);
-  R := RunLwpt(['test', '--jobs', '1'], FScratch);
+  EnvironmentUnitPaths := GetEnvironmentVariable(
+    PROJECT_NAME + '_FPC_UNIT_PATHS');
+  if EnvironmentUnitPaths <> '' then
+    EnvironmentUnitPaths := EnvironmentUnitPaths + PathSeparator;
+  EnvironmentUnitPaths := EnvironmentUnitPaths
+    + FScratch + '/environment-units';
+  R := RunLwpt(['test', '--jobs', '1'], FScratch,
+    [PROJECT_NAME + '_FPC_UNIT_PATHS=' + EnvironmentUnitPaths]);
   DumpRunFailure('external test', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
 end;

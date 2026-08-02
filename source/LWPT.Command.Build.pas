@@ -241,31 +241,6 @@ begin
   end;
 end;
 
-procedure AppendEnvSearchPaths(var AUnitPaths, AIncludePaths: TStringArray);
-var
-  Raw, Part: string;
-  StartAt, i, Count: Integer;
-begin
-  Raw := GetEnvironmentVariable('LWPT_FPC_UNIT_PATHS');
-  if Raw = '' then Exit;
-  StartAt := 1;
-  for i := 1 to Length(Raw) + 1 do
-    if (i > Length(Raw)) or (Raw[i] = PathSeparator) then
-    begin
-      Part := Copy(Raw, StartAt, i - StartAt);
-      if Part <> '' then
-      begin
-        Count := Length(AUnitPaths);
-        SetLength(AUnitPaths, Count + 1);
-        AUnitPaths[Count] := Part;
-        Count := Length(AIncludePaths);
-        SetLength(AIncludePaths, Count + 1);
-        AIncludePaths[Count] := Part;
-      end;
-      StartAt := i + 1;
-    end;
-end;
-
 { Optional version-baking: write a generated .inc with the manifest version.
   Mirrors build.pas GenerateVersionInclude but path + constant prefix come
   from the [version] manifest section. }
@@ -541,7 +516,7 @@ begin
   AddHookPublicationInputs(AMan.PostBuild, Request);
   ACompiled.PostBuild := RetargetPostBuildHooks(T.PostBuild,
     OutBin, CandidateBin);
-  AppendEnvSearchPaths(Request.BuildRequest.Inputs.UnitPaths,
+  AppendCompilerEnvironmentSearchPaths(Request.BuildRequest.Inputs.UnitPaths,
     Request.BuildRequest.Inputs.IncludePaths);
   AddDeclaredOutputs(AMan, Request.ExcludedPaths);
   ValidateBuildRequest(Request.BuildRequest);
