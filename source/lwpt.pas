@@ -12,6 +12,7 @@
     test      discover + compile + run *.Test.pas files
     repair    reclaim install, build-session, and worker-lease residue
     run       invoke a user-declared run-script (or alias a subcommand)
+    health    report Pascal complexity and optional Git hotspots
     agents    write/verify the agent-facing command reference in
               AGENTS.md (ADR-0027)
 
@@ -44,6 +45,7 @@ uses
   LWPT.Command.Build,
   LWPT.Command.Duplication,
   LWPT.Command.Format,
+  LWPT.Command.Health,
   LWPT.Command.Init,
   LWPT.Command.Install,
   LWPT.Command.Remove,
@@ -448,6 +450,40 @@ begin
   end;
 end;
 
+{ --- health (ADR-0006) -------------------------------------------------- }
+
+function HandleHealth(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  IncludeHotspots, JSON: Boolean;
+  OptionIndex: Integer;
+begin
+  if APositionals.Count <> 0 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('health'),
+      'health takes no positional arguments');
+    Exit(1);
+  end;
+  IncludeHotspots := False;
+  JSON := False;
+  for OptionIndex := 0 to High(AOptions) do
+    if AOptions[OptionIndex].Present then
+    begin
+      if SameText(AOptions[OptionIndex].LongName, 'json') then JSON := True
+      else if SameText(AOptions[OptionIndex].LongName, 'hotspots') then
+        IncludeHotspots := True;
+    end;
+  try
+    Result := CmdHealth(MANIFEST_FILE, JSON, IncludeHotspots);
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('health'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
 { --- agents (ADR-0027) --------------------------------------------------- }
 function HandleAgents(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
@@ -500,7 +536,8 @@ end;
 { --- registration -------------------------------------------------------- }
 var
   InstallOpts, AddOpts, RemoveOpts, TestOpts, BuildOpts, InitOpts,
-  RunOpts, FormatOpts, DuplicationOpts, RepairOpts, AgentsOpts : TOptionArray;
+    RunOpts, FormatOpts, HealthOpts, DuplicationOpts, RepairOpts,
+    AgentsOpts : TOptionArray;
 begin
   if HandleTopLevelFlags then
   begin
@@ -597,6 +634,15 @@ begin
       'Invoke a user-declared run-script (or a built-in subcommand by name)',
       '<script-name> | <subcommand> [subcommand-args...]',
       @HandleRun, RunOpts));
+
+    SetLength(HealthOpts, 2);
+    HealthOpts[0] := TFlagOption.Create('json',
+      'Write the deterministic machine-readable report');
+    HealthOpts[1] := TFlagOption.Create('hotspots',
+      'Enrich complexity with the latest 100 commits of local Git churn');
+    Registry.Add(TSubcommand.Create('health',
+      'Report Pascal complexity and optional Git hotspots',
+      '[--json] [--hotspots]', @HandleHealth, HealthOpts));
 
     SetLength(AgentsOpts, 1);
     AgentsOpts[0] := TFlagOption.Create('check',
