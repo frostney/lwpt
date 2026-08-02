@@ -45,6 +45,7 @@ const
     '--worker-state-root-fallback-delegation';
   STATE_ROOT_EXPLICIT_SWITCH = '--worker-state-root-explicit';
   STATE_ROOT_PROBE_SWITCH = '--worker-state-root-probe';
+  STATE_ROOT_RETRY_PROBE_SWITCH = '--worker-state-root-retry-probe';
   STATE_ROOT_CAPTURE_SWITCH = '--worker-state-root-capture';
   TRANSACTION_LOCK_NAME = 'transaction.lock';
   TEST_BUDGET = '1';
@@ -66,6 +67,7 @@ type
     Stderr : string;
   end;
 
+type
   TLeaseThread = class(TThread)
   private
     FSession : TLWPTWorkerBudgetSession;
@@ -115,6 +117,7 @@ type
     procedure TestReleaseRetriesAfterWriteFailure;
     procedure TestSessionSupportsConcurrentSchedulerThreads;
     procedure TestConcurrentFirstProbesUseDefaultRoot;
+    procedure TestFirstTransactionRetriesInterruptedRootCreation;
     procedure TestStateRootUtilityDrainsOutputWhileRunning;
     {$IFDEF UNIX}
     procedure TestDelegationPreservesFallbackRootAcrossWorkingDirectories;
@@ -124,6 +127,10 @@ type
     procedure TestUnwritableExplicitRootFails;
     {$ENDIF}
   end;
+
+var
+  RootCreateReadyPath : string = '';
+  RootCreateReleasePath : string = '';
 
 constructor TLeaseThread.Create(ASession: TLWPTWorkerBudgetSession);
 begin
@@ -210,6 +217,22 @@ begin
   Result := FileExists(APath);
 end;
 
+function InterruptFirstWorkerStateRootCreate(
+  const ARoot: string): Boolean;
+begin
+  WorkerStateRootCreateTestHook := nil;
+  if DirectoryExists(ARoot) then
+    raise Exception.CreateFmt(
+      'worker-root test expected the root to be absent: %s', [ARoot]);
+  WriteMarker(RootCreateReadyPath, 'ready');
+  if not WaitForFile(RootCreateReleasePath,
+    WAIT_TIMEOUT_MILLISECONDS) then
+    raise Exception.CreateFmt(
+      'timed out waiting for worker-root test release marker at %s',
+      [RootCreateReleasePath]);
+  Result := False;
+end;
+
 function WaitForPathGone(const APath: string;
   ATimeoutMilliseconds: Integer): Boolean;
 var
@@ -262,10 +285,42 @@ begin
     WriteMarker(ParamStr(3), 'ready');
     while not FileExists(ParamStr(4)) do Sleep(25);
     Lines := TStringList.Create;
+    Session := nil;
+    Lease := nil;
     try
+      Session := TLWPTWorkerBudgetSession.Create(NewWorkerSessionId, 1);
+      Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
       Lines.Add('root=' + WorkerStateRoot);
+      Lines.Add('acquired=' + BoolToStr(Assigned(Lease), True));
       Lines.SaveToFile(ParamStr(2));
     finally
+      Lease.Free;
+      Session.Free;
+      Lines.Free;
+    end;
+    ExitCode := 0;
+    Exit(True);
+  end;
+
+  if (ParamCount = 4)
+     and (ParamStr(1) = STATE_ROOT_RETRY_PROBE_SWITCH) then
+  begin
+    RootCreateReadyPath := ParamStr(3);
+    RootCreateReleasePath := ParamStr(4);
+    WorkerStateRootCreateTestHook :=
+      @InterruptFirstWorkerStateRootCreate;
+    Lines := TStringList.Create;
+    Session := nil;
+    Lease := nil;
+    try
+      Session := TLWPTWorkerBudgetSession.Create(NewWorkerSessionId, 1);
+      Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+      Lines.Add('root=' + WorkerStateRoot);
+      Lines.Add('acquired=' + BoolToStr(Assigned(Lease), True));
+      Lines.SaveToFile(ParamStr(2));
+    finally
+      Lease.Free;
+      Session.Free;
       Lines.Free;
     end;
     ExitCode := 0;
@@ -1094,7 +1149,8 @@ begin
 end;
 
 function StartStateRootProbe(const AOutputPath, AReadyPath, AReleasePath,
-  AWorktree, AConfigHome: string): TProcess;
+  AWorktree, AConfigHome: string;
+  const AExplicitRoot: string = ''): TProcess;
 begin
   Result := TProcess.Create(nil);
   try
@@ -1107,7 +1163,33 @@ begin
     ConfigureProcessEnvironment(Result, [
       'HOME=' + AConfigHome,
       'XDG_CONFIG_HOME=' + AConfigHome,
-      WORKER_STATE_DIR_ENV + '=',
+      WORKER_STATE_DIR_ENV + '=' + AExplicitRoot,
+      WORKER_BUDGET_ENV + '=' + TEST_BUDGET,
+      WORKER_STALE_SECONDS_ENV + '=' + TEST_STALE_SECONDS,
+      WORKER_LEASE_TOKEN_ENV + '=']);
+    Result.Execute;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function StartStateRootRetryProbe(const AOutputPath, ACreateReadyPath,
+  ACreateReleasePath, AWorktree, AConfigHome,
+  AExplicitRoot: string): TProcess;
+begin
+  Result := TProcess.Create(nil);
+  try
+    Result.Executable := ExpandFileName(ParamStr(0));
+    Result.Parameters.Add(STATE_ROOT_RETRY_PROBE_SWITCH);
+    Result.Parameters.Add(AOutputPath);
+    Result.Parameters.Add(ACreateReadyPath);
+    Result.Parameters.Add(ACreateReleasePath);
+    Result.CurrentDirectory := AWorktree;
+    ConfigureProcessEnvironment(Result, [
+      'HOME=' + AConfigHome,
+      'XDG_CONFIG_HOME=' + AConfigHome,
+      WORKER_STATE_DIR_ENV + '=' + AExplicitRoot,
       WORKER_BUDGET_ENV + '=' + TEST_BUDGET,
       WORKER_STALE_SECONDS_ENV + '=' + TEST_STALE_SECONDS,
       WORKER_LEASE_TOKEN_ENV + '=']);
@@ -1706,6 +1788,8 @@ begin
     SecondValues := ReadUtilityValues(SecondOutput);
     Expect<string>(FirstValues.Values['root']).ToBe(
       SecondValues.Values['root']);
+    Expect<string>(FirstValues.Values['acquired']).ToBe('True');
+    Expect<string>(SecondValues.Values['acquired']).ToBe('True');
     Expect<Boolean>(DirectoryExists(
       FirstValues.Values['root'])).ToBe(True);
     Expect<Boolean>(DirectoryExists(FirstFallback)).ToBe(False);
@@ -1715,6 +1799,40 @@ begin
     FirstValues.Free;
     StopChild(SecondProcess);
     StopChild(FirstProcess);
+  end;
+end;
+
+procedure TWorkerBudgetProcesses
+  .TestFirstTransactionRetriesInterruptedRootCreation;
+var
+  OutputPath, RootCreateReady, RootCreateRelease, StateRoot : string;
+  Probe : TProcess;
+  Values : TStringList;
+begin
+  StateRoot := FScratch + '/interrupted-root/a/b/c/d/e/f/g/h/i/j';
+  OutputPath := FScratch + '/interrupted-root-result';
+  RootCreateReady := FScratch + '/root-create-ready';
+  RootCreateRelease := FScratch + '/root-create-release';
+  Probe := nil;
+  Values := nil;
+  try
+    Probe := StartStateRootRetryProbe(OutputPath, RootCreateReady,
+      RootCreateRelease, FScratch + '/worktree-a',
+      FScratch + '/config-home', StateRoot);
+    Expect<Boolean>(WaitForFile(RootCreateReady,
+      WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
+    Expect<Boolean>(DirectoryExists(StateRoot)).ToBe(False);
+    WriteMarker(RootCreateRelease, 'retry');
+    Probe.WaitOnExit;
+    Expect<Integer>(Probe.ExitStatus).ToBe(0);
+    Values := ReadUtilityValues(OutputPath);
+    Expect<string>(Values.Values['root']).ToBe(StateRoot);
+    Expect<string>(Values.Values['acquired']).ToBe('True');
+    Expect<Boolean>(FileExists(StateRoot + '/' +
+      TRANSACTION_LOCK_NAME)).ToBe(True);
+  finally
+    Values.Free;
+    StopChild(Probe);
   end;
 end;
 
@@ -1928,6 +2046,8 @@ begin
     TestSessionSupportsConcurrentSchedulerThreads);
   Test('concurrent first probes keep the shared default root',
     TestConcurrentFirstProbesUseDefaultRoot);
+  Test('first transaction retries interrupted state-root creation',
+    TestFirstTransactionRetriesInterruptedRootCreation);
   Test('state-root utility drains subprocess output while it runs',
     TestStateRootUtilityDrainsOutputWhileRunning);
   {$IFDEF UNIX}

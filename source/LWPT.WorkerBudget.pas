@@ -29,6 +29,9 @@ const
 type
   ELWPTWorkerBudgetError = class(ELWPTError);
 
+  TLWPTWorkerStateRootCreateHook = function(
+    const ARoot: string): Boolean;
+
   TLWPTWorkerBudgetEntry = record
     SessionId : string;
     ProcessId : Integer;
@@ -100,6 +103,9 @@ type
     property EffectiveBudget: Integer read FEffectiveBudget;
     property GrantedWorkers: Integer read GetGrantedWorkers;
   end;
+
+var
+  WorkerStateRootCreateTestHook : TLWPTWorkerStateRootCreateHook;
 
 function NewWorkerSessionId: string;
 function WorkerStateRoot: string;
@@ -326,6 +332,32 @@ begin
           + MilliSecondOfTheSecond(Current);
 end;
 
+function TryCreateWorkerStateRoot(const ARoot: string): Boolean;
+begin
+  if Assigned(WorkerStateRootCreateTestHook) then
+    Exit(WorkerStateRootCreateTestHook(ARoot));
+  Result := ForceDirectories(ARoot);
+end;
+
+function EnsureWorkerStateRootExists(const ARoot: string): Boolean;
+var
+  Attempt, Index, MaxAttempts : Integer;
+begin
+  { SysUtils.ForceDirectories is not idempotent across processes when two
+    first users race through a missing directory tree: losing CreateDir on
+    an intermediate component returns False before the leaf exists. Retry
+    once per possible path component; every EEXIST race advances the shared
+    tree, while a genuinely unwritable root still reaches the existing
+    fail-closed open diagnostic. }
+  MaxAttempts := 2;
+  for Index := 1 to Length(ARoot) do
+    if IsPathDelimiter(ARoot, Index) then Inc(MaxAttempts);
+  for Attempt := 1 to MaxAttempts do
+    if TryCreateWorkerStateRoot(ARoot) or DirectoryExists(ARoot) then
+      Exit(True);
+  Result := False;
+end;
+
 function WorkerStateRootWritable(const ARoot: string): Boolean;
 var
   ProbePath : string;
@@ -336,7 +368,7 @@ var
   Handle : THandle;
   {$ENDIF}
 begin
-  Result := ForceDirectories(ARoot) or DirectoryExists(ARoot);
+  Result := EnsureWorkerStateRootExists(ARoot);
   if not Result then Exit;
   ProbePath := IncludeTrailingPathDelimiter(ARoot) + WRITE_PROBE_PREFIX
              + IntToStr(GetProcessID) + '-' + IntToStr(NowMilliseconds);
@@ -737,7 +769,7 @@ begin
   EnterCriticalSection(WorkerStateCriticalSection);
   FCriticalEntered := True;
   try
-    ForceDirectories(WorkerStateRoot);
+    EnsureWorkerStateRootExists(WorkerStateRoot);
     LockPath := StatePath(TRANSACTION_LOCK_FILE);
     {$IFDEF UNIX}
     FDescriptor := FpOpen(PChar(LockPath), O_RDWR or O_CREAT, &600);
@@ -866,7 +898,7 @@ begin
   {$IFDEF MSWINDOWS}
   FHandle := THandle(INVALID_HANDLE_VALUE);
   {$ENDIF}
-  ForceDirectories(WorkerStateRoot);
+  EnsureWorkerStateRootExists(WorkerStateRoot);
   {$IFDEF UNIX}
   FDescriptor := FpOpen(PChar(FPath), O_RDWR or O_CREAT, &600);
   if FDescriptor < 0 then
@@ -2010,6 +2042,7 @@ begin
 end;
 
 initialization
+  WorkerStateRootCreateTestHook := nil;
   InitCriticalSection(WorkerStateCriticalSection);
   InitCriticalSection(WorkerStateRootCriticalSection);
   InitCriticalSection(LocalOwnerCriticalSection);

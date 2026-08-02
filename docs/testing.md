@@ -189,7 +189,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`source/LWPT.Analysis.Scope.Test.pas`** | 5 tests in 1 suite | Covers recursive root/workspace ownership, globally deepest ownership when discovered project roots overlap, inherited versus replaced `[analysis]` configuration, placeholder-expanded exact build sources, additive include/final exclude behavior, relocated toolkit-state exclusion, deterministic root-relative ordering, strict string arrays, and supported Pascal extensions. |
 | **`source/LWPT.Analysis.JSON.Test.pas`** | 4 tests in 1 suite | Pins JSON escaping, fixed byte output, sorted/deduplicated common file/configuration/diagnostic metadata, threshold outcomes, independent command schema versions, caller-owned payloads, and exact one-value validation including malformed, trailing, escaped-string, and excessive-nesting failures. |
 | **`source/LWPT.ManifestEdit.Test.pas`** | 23 tests in 4 suites | Covers dependency insertion, replacement, removal, manifest-line loading, and dependency-name derivation for git-host, local-path, and URL sources. |
-| **`source/LWPT.WorkerBudget.Test.pas`** | 21 tests in 1 suite | Self-spawning cross-process coverage for the per-user worker coordinator: two worktree CWDs share a bounded budget, requests are capped, dead owners are reclaimed, live unreadable/malformed/unknown-schema requests fail closed, repeated release/reacquire cannot jump a waiter, and nested LWPT works at budget 1 through one-shot delegation. Delegation coverage refuses fan-out and token reuse, keeps a child counted after parent death, returns capacity after child failure, and prevents parent release from creating a ghost grant. Failed release writes remain retryable, and two scheduler threads safely share one session. Snapshot assertions cover owner identity, granted capacity, lease age, waiting count, and diagnostics. |
+| **`source/LWPT.WorkerBudget.Test.pas`** | 22 tests in 1 suite | Self-spawning cross-process coverage for the per-user worker coordinator: two worktree CWDs share a bounded budget, first transactions retry interrupted state-root creation, requests are capped, dead owners are reclaimed, live unreadable/malformed/unknown-schema requests fail closed, repeated release/reacquire cannot jump a waiter, and nested LWPT works at budget 1 through one-shot delegation. Delegation coverage refuses fan-out and token reuse, keeps a child counted after parent death, returns capacity after child failure, and prevents parent release from creating a ghost grant. Failed release writes remain retryable, and two scheduler threads safely share one session. Snapshot assertions cover owner identity, granted capacity, lease age, waiting count, and diagnostics. |
 | **`packages/semver/source/Semver.Test.pas`** | 12 tests in 3 suites | `Satisfies` happy path (caret/tilde/exact + prerelease exclusion); `RangeIntersects` matrix the resolver leans on (caret+caret across major boundaries, exact+caret, union ranges); `MaxSatisfying` correctness (highest in range, empty when none match, ignore out-of-range). |
 | **`packages/testing/source/TestingPascalLibrary.Test.pas`** | 1 test in 1 suite | The framework canary, lives with the package per ADR-0015. Uses TPL at arm's length (one `Expect<Boolean>(True).ToBe(True)`) so that if TPL itself breaks, this file's failure narrows the blame instead of the suite reporting opaquely. Custom exit codes (10/11/12/13/14) for each plausible TPL initialisation failure mode. |
 | **`tests/integration/AddRemove.Test.pas`** | 7 tests in 1 suite | Exercises manifest mutation, install-before-write rollback, source-name derivation errors, update-in-place, and remove pruning without following local dependency links. |
@@ -245,10 +245,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 17 | 346 |
+| Unit (`source/*.Test.pas` + package self-tests) | 17 | 347 |
 | Integration (`tests/integration/*.Test.pas`) | 18 | 155 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 6 | 31 |
-| **Total** | **41** | **532** |
+| **Total** | **41** | **533** |
 
 ### Planned testing work
 
