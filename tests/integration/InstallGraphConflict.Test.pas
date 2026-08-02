@@ -204,7 +204,7 @@ begin
   WriteTextFile(Root + '/lwpt.lock', 'old-lock');
   WriteTextFile(Root + '/lwpt.cfg', 'old-cfg');
   Run := RunLwpt(['install'], Root,
-    ['LWPT_TEST_FAIL_AFTER_LOCK_WRITE=1']);
+    [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<string>(ReadText(Root + '/.lwpt/modules/branch-a/old.txt'))
     .ToBe('old-a'#10);
@@ -444,7 +444,7 @@ begin
   ForceDirectories(Root + '/.lwpt/modules/sentinel');
   WriteTextFile(Root + '/.lwpt/modules/sentinel/old.txt', 'old');
   Run := RunLwpt(['install'], Root,
-    ['LWPT_TEST_STALE_LOCAL_SNAPSHOT=branch-a']);
+    [PROJECT_NAME + '_TEST_STALE_LOCAL_SNAPSHOT=branch-a']);
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('changed during resolution', Combined) > 0)
@@ -465,7 +465,7 @@ begin
   ForceDirectories(Root + '/.lwpt/modules/branch-a');
   WriteTextFile(Root + '/.lwpt/modules/branch-a/old.txt', 'old');
   Run := RunLwpt(['install'], Root,
-    ['LWPT_TEST_HALT_PUBLISH_AFTER=1']);
+    [PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER=1']);
   Expect<Integer>(Run.ExitCode).ToBe(86);
   Expect<Boolean>(FileExists(
     Root + '/.lwpt/modules/branch-a/source/branch-a.pas')).ToBe(True);
@@ -488,7 +488,7 @@ begin
   ForceDirectories(Root + '/.lwpt/modules/branch-a');
   WriteTextFile(Root + '/.lwpt/modules/branch-a/old.txt', 'old');
   Run := RunLwpt(['install'], Root,
-    ['LWPT_TEST_HALT_AFTER_MODULE_RETAIN=branch-a']);
+    [PROJECT_NAME + '_TEST_HALT_AFTER_MODULE_RETAIN=branch-a']);
   Expect<Integer>(Run.ExitCode).ToBe(87);
   Expect<string>(ReadText(
     Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old'#10);
@@ -514,8 +514,8 @@ begin
   WriteTextFile(Root + '/lwpt.lock', 'old-lock');
   WriteTextFile(Root + '/lwpt.cfg', 'old-cfg');
   Run := RunLwpt(['install'], Root,
-    ['LWPT_TEST_FAIL_AFTER_LOCK_WRITE=1',
-     'LWPT_TEST_CORRUPT_ROLLBACK_FOR=branch-a']);
+    [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1',
+     PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR=branch-a']);
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('injected failure after lockfile publication',
@@ -545,8 +545,8 @@ begin
   WriteTextFile(Root + '/lwpt.lock', 'old-lock');
   WriteTextFile(Root + '/lwpt.cfg', 'old-cfg');
   Run := RunLwpt(['install'], Root,
-    ['LWPT_TEST_FAIL_AFTER_LOCK_WRITE=1',
-     'LWPT_TEST_THROW_RESTORE_FOR=branch-b']);
+    [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1',
+     PROJECT_NAME + '_TEST_THROW_RESTORE_FOR=branch-b']);
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('injected failure after lockfile publication',
@@ -578,10 +578,10 @@ begin
   WriteTextFile(Root + '/.lwpt/modules/branch-a/old.txt', 'old-a');
   WriteTextFile(Root + '/.lwpt/modules/branch-b/old.txt', 'old-b');
   Run := RunLwpt(['install'], Root,
-    ['LWPT_TEST_HALT_PUBLISH_AFTER=2']);
+    [PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER=2']);
   Expect<Integer>(Run.ExitCode).ToBe(86);
   Run := RunLwpt(['repair'], Root,
-    ['LWPT_TEST_THROW_RESTORE_FOR=branch-a']);
+    [PROJECT_NAME + '_TEST_THROW_RESTORE_FOR=branch-a']);
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('injected restore exception', Combined) > 0).ToBe(True);
@@ -610,7 +610,7 @@ begin
   ModulePath := Root + '/.lwpt/modules/branch-a';
   Expect<Integer>(FpSymlink(PChar(LinkTarget), PChar(ModulePath))).ToBe(0);
   Run := RunLwpt(['install'], Root,
-    ['LWPT_TEST_FAIL_AFTER_LOCK_WRITE=1']);
+    [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(IsDirSymlinkOrJunction(ModulePath)).ToBe(True);
   Expect<string>(ReadSymlinkTarget(ModulePath)).ToBe(LinkTarget);
@@ -648,7 +648,7 @@ begin
     P.Free;
   end;
   Run := RunLwpt(['install'], Root,
-    ['LWPT_TEST_FAIL_AFTER_LOCK_WRITE=1']);
+    [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(IsDirSymlinkOrJunction(ModulePath)).ToBe(True);
   Expect<string>(ReadText(ModulePath + '/old.txt')).ToBe(

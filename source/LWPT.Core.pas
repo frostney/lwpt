@@ -1112,7 +1112,8 @@ end;
 function AtomicRestorePath(const ABackupPath, ADestination: string): Boolean;
 var Meta: TStringList; Expected: string;
 begin
-  if SameText(GetEnvironmentVariable('LWPT_TEST_THROW_RESTORE_FOR'),
+  if SameText(SysUtils.GetEnvironmentVariable(
+       PROJECT_NAME + '_TEST_THROW_RESTORE_FOR'),
        ExtractFileName(ExcludeTrailingPathDelimiter(ADestination))) then
     raise EExtractError.CreateFmt(
       'injected restore exception for "%s"', [ADestination]);

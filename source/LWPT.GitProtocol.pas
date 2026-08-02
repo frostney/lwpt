@@ -49,7 +49,8 @@ uses
   StrUtils,
   SysUtils,
 
-  HTTPClient;
+  HTTPClient,
+  LWPT.Core;
 
 type
   TGitRefKind = (rkTag, rkBranch);
@@ -305,7 +306,8 @@ begin
   if ARepoURL = '' then
     raise EGitProtocolError.Create('ListRemoteRefs: empty repo URL');
 
-  FixtureRoot := GetEnvironmentVariable('LWPT_TEST_GIT_FIXTURE_DIR');
+  FixtureRoot := SysUtils.GetEnvironmentVariable(
+    PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
   if FixtureRoot <> '' then
     Exit(LoadFixtureRefs(FixtureRoot, ARepoURL));
 

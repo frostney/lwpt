@@ -690,7 +690,8 @@ begin
   if URL = '' then Exit(False);
   AResolvedURL := URL;
 
-  FixtureRoot := GetEnvironmentVariable('LWPT_TEST_GIT_FIXTURE_DIR');
+  FixtureRoot := SysUtils.GetEnvironmentVariable(
+    PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
   if (FixtureRoot <> '') and (ADep.SrcKind = skGitHost) then
   begin
     Resp := Default(THTTPResponse);
@@ -2193,8 +2194,9 @@ var
         ApplyIncludeExclude(RecheckPath,
           R.Nodes[k].Dep.IncludeGlobs, R.Nodes[k].Dep.ExcludeGlobs);
         try
-          if SameText(GetEnvironmentVariable(
-               'LWPT_TEST_STALE_LOCAL_SNAPSHOT'), R.Nodes[k].Name) then
+      if SameText(SysUtils.GetEnvironmentVariable(
+               PROJECT_NAME + '_TEST_STALE_LOCAL_SNAPSHOT'),
+             R.Nodes[k].Name) then
             R.Nodes[k].Hash := 'sha256:injected-stale-snapshot';
           if HashTree(RecheckPath) <> R.Nodes[k].Hash then
             raise EFetchError.CreateFmt(
@@ -2216,8 +2218,9 @@ var
         raise EFetchError.CreateFmt(
           'failed to retain rollback copy for module "%s"',
           [R.Nodes[k].Name]);
-      if SameText(GetEnvironmentVariable(
-           'LWPT_TEST_HALT_AFTER_MODULE_RETAIN'), R.Nodes[k].Name) then
+      if SameText(SysUtils.GetEnvironmentVariable(
+           PROJECT_NAME + '_TEST_HALT_AFTER_MODULE_RETAIN'),
+         R.Nodes[k].Name) then
         Halt(87);
       FinalArchive := '';
       if not (R.Nodes[k].Dep.SrcKind in [skLocal, skWorkspace]) then
@@ -2248,14 +2251,16 @@ var
       else
         R.Nodes[k].Archive := FinalArchive;
       R.Nodes[k].Hash := HashTree(FinalUnitDir);
-      if (GetEnvironmentVariable('LWPT_TEST_FAIL_PUBLISH_AFTER') <>
-          '') and (StrToIntDef(GetEnvironmentVariable(
-          'LWPT_TEST_FAIL_PUBLISH_AFTER'), -1) = k + 1) then
+      if (SysUtils.GetEnvironmentVariable(
+          PROJECT_NAME + '_TEST_FAIL_PUBLISH_AFTER') <>
+          '') and (StrToIntDef(SysUtils.GetEnvironmentVariable(
+          PROJECT_NAME + '_TEST_FAIL_PUBLISH_AFTER'), -1) = k + 1) then
         raise EFetchError.CreateFmt(
           'injected publication failure after package %d', [k + 1]);
-      if (GetEnvironmentVariable('LWPT_TEST_HALT_PUBLISH_AFTER') <>
-          '') and (StrToIntDef(GetEnvironmentVariable(
-          'LWPT_TEST_HALT_PUBLISH_AFTER'), -1) = k + 1) then
+      if (SysUtils.GetEnvironmentVariable(
+          PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER') <>
+          '') and (StrToIntDef(SysUtils.GetEnvironmentVariable(
+          PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER'), -1) = k + 1) then
         Halt(86);
     end;
   end;
@@ -3014,12 +3019,15 @@ begin
     end;
 
     WriteLock(LockfilePath, TmpRoot, Resolved);
-    if GetEnvironmentVariable('LWPT_TEST_FAIL_AFTER_LOCK_WRITE') = '1' then
+    if SysUtils.GetEnvironmentVariable(
+      PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE') = '1' then
     begin
-      if GetEnvironmentVariable('LWPT_TEST_CORRUPT_ROLLBACK_FOR') <> '' then
+      if SysUtils.GetEnvironmentVariable(
+        PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR') <> '' then
         for i := 0 to High(R.Nodes) do
           if SameText(R.Nodes[i].Name,
-               GetEnvironmentVariable('LWPT_TEST_CORRUPT_ROLLBACK_FOR'))
+               SysUtils.GetEnvironmentVariable(
+                 PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR'))
              and (R.Nodes[i].UnitBackup <> '') then
           begin
             ForceDirectories(R.Nodes[i].UnitBackup);
@@ -3046,8 +3054,8 @@ begin
         only best-effort tmp cleanup remains. }
       RetainOrphanedPackagePaths(OldLock, Resolved, ModulesRoot,
         ArchivesRoot, RollbackRoot, OrphanRollbacks);
-      if GetEnvironmentVariable(
-           'LWPT_TEST_FAIL_AFTER_ORPHAN_RETAIN') = '1' then
+      if SysUtils.GetEnvironmentVariable(
+           PROJECT_NAME + '_TEST_FAIL_AFTER_ORPHAN_RETAIN') = '1' then
         raise EExtractError.Create(
           'injected failure after orphan retention');
       AtomicWriteText(ManifestPath, TmpRoot, AManifestLines);

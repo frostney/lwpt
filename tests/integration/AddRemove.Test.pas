@@ -30,6 +30,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.Core,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -259,7 +260,7 @@ begin
   CfgBefore := ReadFileText(FScratch + '/lwpt.cfg');
 
   R := RunLwpt(['remove', 'leaf'], FScratch,
-    ['LWPT_TEST_FAIL_AFTER_ORPHAN_RETAIN=1']);
+    [PROJECT_NAME + '_TEST_FAIL_AFTER_ORPHAN_RETAIN=1']);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<string>(ReadFileText(FScratch + '/lwpt.toml'))
     .ToBe(ManifestBefore);

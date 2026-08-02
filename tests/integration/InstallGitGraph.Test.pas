@@ -6,6 +6,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.Core,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch,
@@ -153,7 +154,7 @@ function TInstallGitGraph.RunInstall(const ARoot: string;
   const AArguments: array of string): TLwptResult;
 begin
   Result := RunLwpt(AArguments, ARoot,
-    ['LWPT_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot]);
+    [PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot]);
 end;
 
 function TInstallGitGraph.RequestCount(const ALine: string): Integer;
