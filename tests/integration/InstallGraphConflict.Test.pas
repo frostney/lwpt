@@ -181,9 +181,9 @@ end;
 procedure TInstallGraphConflict.TestPreexistingCommittedStateIsUntouched;
 begin
   Expect<string>(ReadText(FRoot + '/.lwpt/modules/sentinel/keep.txt'))
-    .ToBe('module-sentinel'#10);
+    .ToBe('module-sentinel' + LineEnding);
   Expect<string>(ReadText(FRoot + '/.lwpt/archives/keep.tar.gz'))
-    .ToBe('archive-sentinel'#10);
+    .ToBe('archive-sentinel' + LineEnding);
 end;
 
 procedure TInstallGraphConflict.TestFailureAfterLockWriteRollsBackWholeBatch;
@@ -207,13 +207,15 @@ begin
     [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<string>(ReadText(Root + '/.lwpt/modules/branch-a/old.txt'))
-    .ToBe('old-a'#10);
+    .ToBe('old-a' + LineEnding);
   Expect<string>(ReadText(Root + '/.lwpt/modules/branch-b/old.txt'))
-    .ToBe('old-b'#10);
+    .ToBe('old-b' + LineEnding);
   Expect<string>(ReadText(Root + '/.lwpt/archives/sentinel.tar.gz'))
-    .ToBe('old-archive'#10);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe('old-lock'#10);
-  Expect<string>(ReadText(Root + '/lwpt.cfg')).ToBe('old-cfg'#10);
+    .ToBe('old-archive' + LineEnding);
+  Expect<string>(ReadText(Root + '/lwpt.lock'))
+    .ToBe('old-lock' + LineEnding);
+  Expect<string>(ReadText(Root + '/lwpt.cfg'))
+    .ToBe('old-cfg' + LineEnding);
 end;
 
 procedure TInstallGraphConflict.TestExtractionPolicyParticipatesInIdentity;
@@ -452,7 +454,7 @@ begin
   Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/branch-a'))
     .ToBe(False);
   Expect<string>(ReadText(Root + '/.lwpt/modules/sentinel/old.txt'))
-    .ToBe('old'#10);
+    .ToBe('old' + LineEnding);
 end;
 
 procedure TInstallGraphConflict.TestInterruptedPublicationRecoversBeforeTmpCleanup;
@@ -472,7 +474,7 @@ begin
   Run := RunLwpt(['repair'], Root);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadText(
-    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old'#10);
+    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old' + LineEnding);
   Expect<Boolean>(FileExists(
     Root + '/.lwpt/modules/branch-a/source/branch-a.pas')).ToBe(False);
   Expect<Boolean>(HasRollbackMarker(Root + '/.lwpt/tmp')).ToBe(False);
@@ -491,11 +493,11 @@ begin
     [PROJECT_NAME + '_TEST_HALT_AFTER_MODULE_RETAIN=branch-a']);
   Expect<Integer>(Run.ExitCode).ToBe(87);
   Expect<string>(ReadText(
-    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old'#10);
+    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old' + LineEnding);
   Run := RunLwpt(['repair'], Root);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadText(
-    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old'#10);
+    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old' + LineEnding);
 end;
 
 procedure TInstallGraphConflict.TestRollbackAggregatesFailuresAndRetainsBackup;
@@ -523,9 +525,11 @@ begin
   Expect<Boolean>(Pos('rollback failures:', Combined) > 0).ToBe(True);
   Expect<Boolean>(Pos('module "branch-a"', Combined) > 0).ToBe(True);
   Expect<string>(ReadText(
-    Root + '/.lwpt/modules/branch-b/old.txt')).ToBe('old-b'#10);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe('old-lock'#10);
-  Expect<string>(ReadText(Root + '/lwpt.cfg')).ToBe('old-cfg'#10);
+    Root + '/.lwpt/modules/branch-b/old.txt')).ToBe('old-b' + LineEnding);
+  Expect<string>(ReadText(Root + '/lwpt.lock'))
+    .ToBe('old-lock' + LineEnding);
+  Expect<string>(ReadText(Root + '/lwpt.cfg'))
+    .ToBe('old-cfg' + LineEnding);
   Expect<Boolean>(HasRollbackMarker(Root + '/.lwpt/tmp')).ToBe(True);
 end;
 
@@ -554,14 +558,16 @@ begin
   Expect<Boolean>(Pos('injected restore exception', Combined) > 0).ToBe(True);
   Expect<Boolean>(Pos('module "branch-b"', Combined) > 0).ToBe(True);
   Expect<string>(ReadText(
-    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old-a'#10);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe('old-lock'#10);
-  Expect<string>(ReadText(Root + '/lwpt.cfg')).ToBe('old-cfg'#10);
+    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old-a' + LineEnding);
+  Expect<string>(ReadText(Root + '/lwpt.lock'))
+    .ToBe('old-lock' + LineEnding);
+  Expect<string>(ReadText(Root + '/lwpt.cfg'))
+    .ToBe('old-cfg' + LineEnding);
   Expect<Boolean>(HasRollbackMarker(Root + '/.lwpt/tmp')).ToBe(True);
   Run := RunLwpt(['repair'], Root);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadText(
-    Root + '/.lwpt/modules/branch-b/old.txt')).ToBe('old-b'#10);
+    Root + '/.lwpt/modules/branch-b/old.txt')).ToBe('old-b' + LineEnding);
 end;
 
 procedure TInstallGraphConflict.TestRestoreExceptionContinuesCrashRecovery;
@@ -586,12 +592,12 @@ begin
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('injected restore exception', Combined) > 0).ToBe(True);
   Expect<string>(ReadText(
-    Root + '/.lwpt/modules/branch-b/old.txt')).ToBe('old-b'#10);
+    Root + '/.lwpt/modules/branch-b/old.txt')).ToBe('old-b' + LineEnding);
   Expect<Boolean>(HasRollbackMarker(Root + '/.lwpt/tmp')).ToBe(True);
   Run := RunLwpt(['repair'], Root);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadText(
-    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old-a'#10);
+    Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old-a' + LineEnding);
 end;
 
 {$IFDEF UNIX}
@@ -615,7 +621,7 @@ begin
   Expect<Boolean>(IsDirSymlinkOrJunction(ModulePath)).ToBe(True);
   Expect<string>(ReadSymlinkTarget(ModulePath)).ToBe(LinkTarget);
   Expect<string>(ReadText(ModulePath + '/old.txt')).ToBe(
-    'old-link-target'#10);
+    'old-link-target' + LineEnding);
 end;
 {$ENDIF}
 
@@ -652,7 +658,7 @@ begin
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(IsDirSymlinkOrJunction(ModulePath)).ToBe(True);
   Expect<string>(ReadText(ModulePath + '/old.txt')).ToBe(
-    'old-junction-target'#10);
+    'old-junction-target' + LineEnding);
 end;
 {$ENDIF}
 
