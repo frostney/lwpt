@@ -187,6 +187,13 @@ type
       to [package].units; exclude subtracts from the resolved set. }
     FormatIncludes      : array of string;
     FormatExcludes      : array of string;
+    { [analysis] owns only the shared source scope. Command-specific
+      thresholds and policy remain in their command sections. A workspace
+      that declares this section replaces the root defaults; otherwise the
+      root scope configuration is inherited. }
+    AnalysisConfigured  : Boolean;
+    AnalysisIncludes    : array of string;
+    AnalysisExcludes    : array of string;
     { [sources.<name>] entries — user-declared custom git hosts that
       extend the built-in github/gitlab/bitbucket prefixes. See
       ADR-0009 §"Custom hosts". Empty for projects that only use the
@@ -1225,9 +1232,9 @@ const
     NOTE: 'generated' + 'targets' are NOT in this list — both were
     removed in earlier waves and now join the unknown-section
     policy on equal footing with [teddybear]. }
-  KNOWN_SECTIONS: array[0..14] of string = (
+  KNOWN_SECTIONS: array[0..15] of string = (
     'package', 'dependencies', 'sources', 'build', 'version',
-    PROGRAM_NAME, 'format', 'test', 'workspaces',
+    PROGRAM_NAME, 'format', 'analysis', 'test', 'workspaces',
     'preinstall', 'postinstall', 'prebuild', 'postbuild',
     'pretest', 'posttest');
   { Reserved section names — names that, if declared as a top-level
@@ -1241,7 +1248,7 @@ const
         anyway because KNOWN_SECTIONS is checked first, but this
         list makes the intent explicit). 'run' itself is included
         because `lwpt run run` is the nonsense case. }
-  RESERVED_SUBCOMMAND_NAMES: array[0..17] of string = (
+  RESERVED_SUBCOMMAND_NAMES: array[0..18] of string = (
     { subcommands }
     'install', 'add', 'remove', 'build', 'format', 'test',
     'repair', 'init', 'run', 'agents',
@@ -1253,11 +1260,12 @@ const
       [dependencies] (recognised, parsed for all manifests, never
       runnable). }
     'package', 'dependencies', 'sources', 'workspaces',
-    'version', PROGRAM_NAME, 'format', 'generated');
+    'version', PROGRAM_NAME, 'format', 'analysis', 'generated');
 var
   Root, Deps, DepNode, ArrNode : TTOMLNode;
   BuildNode, EntryNode, VerNode   : TTOMLNode;
-  LwptCfgNode, FmtNode, TestNode, BailNode, ExclArr : TTOMLNode;
+  LwptCfgNode, FmtNode, AnalysisNode, TestNode, BailNode,
+    ExclArr : TTOMLNode;
   SourcesNode, SourceEntry     : TTOMLNode;
   Parser   : TTOMLParser;
   Pair     : TTOMLNodeMap.TKeyValuePair;
@@ -1485,6 +1493,23 @@ begin
           Result.Deps[j] := D;
         end;
       end;
+    end;
+
+    { [analysis] is deliberately limited to shared source selection. The
+      duplication and health commands own their payloads and thresholds in
+      their own sections. Parse this for root and workspace manifests so the
+      scope resolver can apply root defaults unless a workspace opts out with
+      an explicit section. }
+    AnalysisNode := TomlGet(Root, 'analysis');
+    if AnalysisNode <> nil then
+    begin
+      if not TomlIsTable(AnalysisNode) then
+        raise EManifestError.Create('[analysis] must be a table');
+      Result.AnalysisConfigured := True;
+      ReadStrictStringArray(AnalysisNode, 'include', 'analysis.include',
+        Result.AnalysisIncludes);
+      ReadStrictStringArray(AnalysisNode, 'exclude', 'analysis.exclude',
+        Result.AnalysisExcludes);
     end;
 
     { [test] — scheduler policy. Configuration supplies the project
