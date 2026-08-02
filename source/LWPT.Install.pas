@@ -60,7 +60,7 @@ const
     express an arbitrary insecure download, which is the reason it can
     live in the shipped binary rather than behind a build flag.
 
-    ARCHIVE_FETCH_TIMEOUT_ENV bounds a single archive read and is honoured
+    ARCHIVE_FETCH_TIMEOUT_ENV bounds the loopback archive request and is honoured
     only while the origin override is active, so it cannot become a
     production knob by itself. }
   ARCHIVE_FETCH_ORIGIN_ENV  = PROJECT_NAME + '_TEST_ARCHIVE_ORIGIN';

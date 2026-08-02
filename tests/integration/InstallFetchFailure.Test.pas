@@ -95,7 +95,7 @@ type
     procedure TestServerErrorLeavesTheProjectUntouched;
     procedure TestRefusedConnectionIsReportedAsAFetchFailure;
     procedure TestTruncatedArchiveIsRejectedNotCached;
-    procedure TestStalledServerFailsInsideTheReadBudget;
+    procedure TestStalledServerFailsInsideTheRequestBudget;
   end;
 
 function DirIsEmpty(const APath: string): Boolean;
@@ -113,6 +113,17 @@ begin
       FindClose(R);
     end;
   end;
+end;
+
+procedure ExpectFailedInstallLeavesCommittedStateUntouched(
+  const ARoot: string);
+begin
+  Expect<Boolean>(FileExists(ARoot + '/lwpt.lock')).ToBe(False);
+  Expect<Boolean>(FileExists(ARoot + '/lwpt.cfg')).ToBe(False);
+  Expect<Boolean>(DirIsEmpty(ARoot + '/.lwpt/archives')).ToBe(True);
+  Expect<Boolean>(DirIsEmpty(ARoot + '/.lwpt/tmp')).ToBe(True);
+  Expect<Boolean>(DirectoryExists(ARoot + '/.lwpt/modules/mock-dep'))
+    .ToBe(False);
 end;
 
 procedure TInstallFetchFailureE2E.SetupScratchProject;
@@ -342,7 +353,7 @@ begin
     TestOverrideCarryingAPathIsRefused);
   Test('an override carrying user information is refused',
     TestUserInformationIsRefused);
-  Test('the read budget defaults and refuses out-of-range values',
+  Test('the request budget defaults and refuses out-of-range values',
     TestTimeoutDefaultsAndBounds);
 end;
 
@@ -496,12 +507,7 @@ begin
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   { A failed fetch commits nothing: no lockfile, no cfg, no cached
     archive, no module tree, and no residue in tmp. }
-  Expect<Boolean>(FileExists(Root + '/lwpt.lock')).ToBe(False);
-  Expect<Boolean>(FileExists(Root + '/lwpt.cfg')).ToBe(False);
-  Expect<Boolean>(DirIsEmpty(Root + '/.lwpt/archives')).ToBe(True);
-  Expect<Boolean>(DirIsEmpty(Root + '/.lwpt/tmp')).ToBe(True);
-  Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/mock-dep'))
-    .ToBe(False);
+  ExpectFailedInstallLeavesCommittedStateUntouched(Root);
 end;
 
 procedure TInstallHTTPFetchFailure.TestRefusedConnectionIsReportedAsAFetchFailure;
@@ -518,7 +524,7 @@ begin
   { The connect-failure text survives the EFetchError wrapping, which
     is what keeps the e2e tier's transient-downtime skip working. }
   Expect<Boolean>(Pos('Failed to connect to', Combined) > 0).ToBe(True);
-  Expect<Boolean>(DirIsEmpty(Root + '/.lwpt/tmp')).ToBe(True);
+  ExpectFailedInstallLeavesCommittedStateUntouched(Root);
 end;
 
 procedure TInstallHTTPFetchFailure.TestTruncatedArchiveIsRejectedNotCached;
@@ -547,12 +553,10 @@ begin
   Expect<Boolean>(Pos('mock-dep', Combined) > 0).ToBe(True);
   Expect<Boolean>(Pos('archive fetch', Combined) > 0).ToBe(True);
   Expect<Boolean>(Pos('truncated fixed-length body', Combined) > 0).ToBe(True);
-  Expect<Boolean>(DirIsEmpty(Root + '/.lwpt/archives')).ToBe(True);
-  Expect<Boolean>(DirIsEmpty(Root + '/.lwpt/tmp')).ToBe(True);
-  Expect<Boolean>(FileExists(Root + '/lwpt.lock')).ToBe(False);
+  ExpectFailedInstallLeavesCommittedStateUntouched(Root);
 end;
 
-procedure TInstallHTTPFetchFailure.TestStalledServerFailsInsideTheReadBudget;
+procedure TInstallHTTPFetchFailure.TestStalledServerFailsInsideTheRequestBudget;
 var
   Mock: TMockHTTPServer;
   Root, Combined: string;
@@ -561,7 +565,7 @@ var
 const
   { Bounded, not precise: the claim under test is that the install
     stops on its own rather than blocking forever. }
-  CEILING_MS = 60000;
+  CEILING_MS = 10000;
 begin
   { Create binds and listens; Start is deliberately never called, so
     the connect lands in the kernel backlog and nothing is ever
@@ -580,7 +584,7 @@ begin
   Expect<Boolean>(Pos('mock-dep', Combined) > 0).ToBe(True);
   Expect<Boolean>(Pos('deadline exceeded', Combined) > 0).ToBe(True);
   Expect<Boolean>(Elapsed < CEILING_MS).ToBe(True);
-  Expect<Boolean>(DirIsEmpty(Root + '/.lwpt/tmp')).ToBe(True);
+  ExpectFailedInstallLeavesCommittedStateUntouched(Root);
 end;
 
 procedure TInstallHTTPFetchFailure.SetupTests;
@@ -593,8 +597,8 @@ begin
     TestRefusedConnectionIsReportedAsAFetchFailure);
   Test('a truncated fixed-length archive is refused and never cached',
     TestTruncatedArchiveIsRejectedNotCached);
-  Test('a stalled server fails inside the read budget',
-    TestStalledServerFailsInsideTheReadBudget);
+  Test('a stalled server fails inside the request budget',
+    TestStalledServerFailsInsideTheRequestBudget);
 end;
 
 begin

@@ -173,7 +173,7 @@ The mock server is **necessary** for the byte-truncation regression — only by 
 - It is read at the archive-fetch boundary **after** canonical URL construction. The manifest, the host templates, and the resolved path are all exercised exactly as in production; only the origin is swapped, and the canonical path is preserved.
 - Unset or empty, the canonical URL is used byte for byte. That identity is asserted, not assumed.
 - The only accepted shape is a bare `http://<numeric IPv4 loopback>:<port>` origin. A remote host, a name needing DNS (including `localhost`), a missing port, a path, user information, and any non-`http` scheme are all refused with an error naming the variable. The seam therefore cannot express an arbitrary insecure download, which is why it can live in the shipped binary rather than behind a build flag.
-- `LWPT_TEST_ARCHIVE_TIMEOUT_MS` bounds a single archive read and is honoured **only** while the origin override is active, so it cannot become a production knob on its own. It defaults to 5000 ms and accepts 1 to 600000.
+- `LWPT_TEST_ARCHIVE_TIMEOUT_MS` bounds the loopback archive request and is honoured **only** while the origin override is active, so it cannot become a production knob on its own. It defaults to 5000 ms and accepts 1 to 600000.
 
 `tests/integration/InstallFetchFailure.Test.pas` owns both halves: the pure accept/refuse table and the wire-level failure modes driven through the real `lwpt install` subprocess. Both run on Unix and native Windows through the same cross-platform mock server.
 
