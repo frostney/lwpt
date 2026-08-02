@@ -29,6 +29,7 @@ uses
   LWPT.CompilerDriver,
   LWPT.Core,
   LWPT.Manifest,
+  LWPT.Output.Legacy,
   LWPT.ProcessRunner,
   LWPT.WorkerBudget;
 

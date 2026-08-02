@@ -59,6 +59,7 @@ uses
   LWPT.Command.Common,
   LWPT.CompilerDriver,
   LWPT.Manifest,
+  LWPT.Output.Legacy,
   LWPT.WorkerBudget;
 
 const

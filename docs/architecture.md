@@ -185,6 +185,29 @@ installs are not supported.
   successful binary. See [`testing.md`](./testing.md).
 - **Worker coordination:** `LWPT.WorkerBudget` owns the per-user machine-capacity seam. Invocations register owner-guarded requests and acquire FIFO, reclaimable leases under a short cross-platform transaction lock. Nested LWPT subprocesses consume a one-shot opaque delegation that transfers one grant to the child's own guarded request instead of consuming another slot. `lwpt repair` reclaims requests only when their OS-held owner guard is absent; stale heartbeats remain diagnostic. Build and test scheduling consume this module in their own workstreams.
 
+## Output and observability boundary
+
+Output facts cross two deliberately separate layers. The reusable CLI package's
+`CLI.Events` unit owns only a monotonically sequenced envelope and a synchronous
+sink interface. Its dispatcher serializes delivery across producers, owns each
+payload through the delivery call, and reports a failed observer without
+letting that failure replace the command result. It has no LWPT event names,
+terminal streams, rendering, or retention policy.
+
+`LWPT.Observability` supplies the project-specific typed payloads: job
+lifecycle, heartbeat, diagnostic, raw child stdout/stderr, command terminal,
+truncation, and capture-degradation events. Source and correlation tags live on
+those payloads. Retention classification distinguishes ordinary progress from
+protected diagnostics and terminal outcomes, so a host can retain or replay
+events without teaching the generic CLI package about LWPT policy. Raw child
+chunks use `RawByteString` and remain byte-safe across embedded NUL bytes.
+
+The existing build/test human rendering remains unchanged at this foundation
+layer. `LWPT.Output.Legacy` temporarily owns that presentation vocabulary while
+the shared event-backed reporter and the executable host's terminal and
+retention policy build on these types separately; `LWPT.BuildSession` now owns
+session paths and logs rather than the observability vocabulary.
+
 ## `.lwpt/` layout
 
 See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) for the full design rationale.

@@ -53,7 +53,10 @@ two decimal places. Existing stdout, diagnostics, and exit codes are unchanged.
 `lwpt run <subcommand>` reports the resolved subcommand name, so
 `lwpt run build` ends with `lwpt build: ...`. Top-level help, version output,
 and unknown command names are not resolved subcommand executions and do not get
-a completion line. Output suppression is separate planned work tracked in
+a completion line. The output-neutral sequenced event envelope and LWPT's typed
+payload ownership are documented in the
+[architecture guide](./architecture.md#output-and-observability-boundary).
+Output suppression is separate planned work tracked in
 [issue #127](https://github.com/frostney/lwpt/issues/127).
 
 ## Pre-commit hook
