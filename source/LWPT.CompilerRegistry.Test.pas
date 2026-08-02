@@ -8,6 +8,7 @@ uses
 
   LWPT.BuildRequest,
   LWPT.CompilerDriver,
+  LWPT.CompilerDriver.Blaise,
   LWPT.CompilerRegistry,
   LWPT.Core,
   LWPT.Manifest,
@@ -67,6 +68,9 @@ type
     procedure TestFactoryIdentityMismatchIsFreedAndRejected;
     procedure TestFactoryVersionMismatchIsRejected;
     procedure TestFactoryDriverIsFreedExactlyOnce;
+    procedure TestBlaiseProfileSelectsBuiltInDriver;
+    procedure TestBlaiseBuiltInRejectsScripts;
+    procedure TestFactoryCannotShadowBlaise;
   end;
 
 constructor TFactoryDriver.Create(const AOwner: TFactoryOwner;
@@ -320,6 +324,84 @@ begin
   end;
 end;
 
+procedure TLWPTCompilerRegistryTests.TestBlaiseProfileSelectsBuiltInDriver;
+var
+  Driver: TLWPTCompilerDriver;
+  Manifest: TManifest;
+  Selection: TLWPTCompilerSelection;
+begin
+  Manifest := Default(TManifest);
+  Manifest.CompilerDefault := 'modern';
+  SetLength(Manifest.CompilerProfiles, 1);
+  Manifest.CompilerProfiles[0] := Default(TLWPTCompilerProfile);
+  Manifest.CompilerProfiles[0].Name := 'modern';
+  Manifest.CompilerProfiles[0].Driver := BLAISE_COMPILER_ID;
+  Manifest.CompilerProfiles[0].Executable := 'tools/blaise';
+  Manifest.CompilerProfiles[0].VersionConstraint :=
+    '>=' + BLAISE_MINIMUM_VERSION;
+  Selection := TLWPTCompilerSelection.Create(Manifest, GetCurrentDir);
+  try
+    Driver := Selection.DriverFor('');
+    Expect<string>(Driver.CompilerID).ToBe(BLAISE_COMPILER_ID);
+    Expect<string>(Driver.ExecutableName).ToBe(
+      ExpandFileName('tools/blaise'));
+    Expect<string>(Driver.VersionConstraint).ToBe(
+      '>=' + BLAISE_MINIMUM_VERSION);
+  finally
+    Selection.Free;
+  end;
+end;
+
+procedure TLWPTCompilerRegistryTests.TestBlaiseBuiltInRejectsScripts;
+var
+  Manifest: TManifest;
+  Raised: Boolean;
+  Selection: TLWPTCompilerSelection;
+begin
+  Manifest := Default(TManifest);
+  Manifest.CompilerDefault := 'modern';
+  SetLength(Manifest.CompilerProfiles, 1);
+  Manifest.CompilerProfiles[0] := Default(TLWPTCompilerProfile);
+  Manifest.CompilerProfiles[0].Name := 'modern';
+  Manifest.CompilerProfiles[0].Driver := BLAISE_COMPILER_ID;
+  Manifest.CompilerProfiles[0].Script := 'tools/blaise-driver.pas';
+  Manifest.CompilerProfiles[0].VersionConstraint := '*';
+  Selection := TLWPTCompilerSelection.Create(Manifest, GetCurrentDir);
+  try
+    Raised := False;
+    try
+      Selection.DriverFor('');
+    except
+      on E: ELWPTCompilerDriverError do
+        Raised := Pos('cannot use script with built-in "blaise"',
+          E.Message) > 0;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+  finally
+    Selection.Free;
+  end;
+end;
+
+procedure TLWPTCompilerRegistryTests.TestFactoryCannotShadowBlaise;
+var
+  Host: TLWPTCompilerHost;
+  Raised: Boolean;
+begin
+  Host := TLWPTCompilerHost.Create;
+  try
+    Raised := False;
+    try
+      Host.RegisterFactory(BLAISE_COMPILER_ID, FFactoryOwner.CreateDriver);
+    except
+      on E: ELWPTCompilerDriverError do
+        Raised := Pos('cannot shadow built-in "blaise"', E.Message) > 0;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+  finally
+    Host.Free;
+  end;
+end;
+
 procedure TLWPTCompilerRegistryTests.TestBuiltInFallback;
 var
   Manifest: TManifest;
@@ -383,6 +465,12 @@ begin
     TestFactoryVersionMismatchIsRejected);
   Test('selection frees a factory driver exactly once',
     TestFactoryDriverIsFreedExactlyOnce);
+  Test('Blaise profiles select the built-in driver and executable',
+    TestBlaiseProfileSelectsBuiltInDriver);
+  Test('Blaise built-in profiles reject external scripts',
+    TestBlaiseBuiltInRejectsScripts);
+  Test('embedding factories cannot shadow built-in Blaise',
+    TestFactoryCannotShadowBlaise);
 end;
 
 begin

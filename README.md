@@ -163,6 +163,12 @@ default = "native"
 driver = "fpc"
 version = "^3.2.0"
 
+[compiler.profiles.blaise]
+# Built-in opt-in adapter for graemeg/blaise v0.13.0 or newer.
+driver = "blaise"
+executable = "tools/blaise" # optional; otherwise resolved from PATH
+version = ">=0.13.0"
+
 [compiler.profiles.custom]
 # External drivers receive versioned canonical TOML on stdin/stdout.
 driver = "my-compiler"

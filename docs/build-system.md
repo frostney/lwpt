@@ -18,9 +18,10 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 - **Compiler-neutral request first.** Build and test select a root-owned named
   compiler profile, validate a versioned request against on-demand compiler
   capabilities, and normalize the result through the selected driver. FPC is
-  the built-in fallback; external drivers exchange canonical TOML over
-  short-lived child processes. Unsupported combinations are hard errors, with
-  no compiler or target fallback. See ADR-0029 and ADR-0030.
+  the built-in fallback; Blaise is an explicit built-in profile; external
+  drivers exchange canonical TOML over short-lived child processes.
+  Unsupported combinations are hard errors, with no compiler or target
+  fallback. See ADR-0029 and ADR-0030.
 - **Compiler processes are bounded duplex operations.** A shared runner writes
   request stdin while draining stdout and stderr, retains at most 16 MiB from
   each stream and discards later bytes while drainage continues, owns the
@@ -252,6 +253,48 @@ FPC and the requested tuple; LWPT never falls back to the host compiler. The
 publish step refreshes the probe and repeats the complete compatibility check;
 a changed compiler identity/version, target, output kind, or mode during
 compilation withholds the candidate.
+
+## Blaise compiler profile
+
+The opt-in `blaise` driver targets the released
+[`graemeg/blaise` v0.13.0 CLI](https://github.com/graemeg/blaise/releases/tag/v0.13.0)
+or newer. The executable defaults to `blaise` on `PATH`; a root profile can
+pin a project-relative or absolute executable explicitly:
+
+```toml
+[compiler]
+default = "modern"
+
+[compiler.profiles.modern]
+driver = "blaise"
+executable = "tools/blaise"
+version = ">=0.13.0"
+```
+
+Every selection and concrete build operation launches `blaise --help` again.
+The driver requires the `Blaise Compiler v<semver>` identity, enforces the
+v0.13.0 floor, and confirms the supported target names are still present
+before translating the request. It advertises only `linux/x86_64` and
+`freebsd/x86_64`: those are the two targets Blaise v0.13.0 documents as
+self-hosted, bidirectionally cross-compiled, and shipped as release binaries.
+The CLI also parses names for planned targets, but LWPT does not advertise
+those until upstream proves and releases them.
+
+The adapter invokes Blaise's native backend explicitly and translates the
+entry source, artifact, target, unit paths, defines, and private unit/object
+cache. Installed dependency unit paths are extracted from LWPT's generated
+`lwpt.cfg` and translated to repeated `--unit-path` arguments rather than
+passing Blaise an FPC response file. Dev mode adds Blaise's `--debug` runtime
+leak reporting; release mode does not. `--clean` adds
+`--no-incremental`. The current upstream contract produces executables only.
+Additional explicit source inputs, resources, distinct unit/object cache
+directories, and include-only search paths fail with a driver diagnostic.
+Test compilation currently repeats unit paths in the neutral include-path
+field; exact duplicates are accepted because they do not request an additional
+Blaise feature. Profile or entry arguments cannot override the driver-owned
+source, output, target, backend, mode, defines, cache, or RTL selection.
+LWPT never installs Blaise and never falls back to FPC when a Blaise profile
+is selected.
 
 ## Generator hooks (formerly `[generated]`)
 
