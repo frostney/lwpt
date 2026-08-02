@@ -12,4 +12,6 @@ reviews:
     # than the default branch, which CodeRabbit includes automatically.
     base_branches:
       - 'codex/.*'
-    auto_incremental_review: false
+    # The positive label still suppresses review during pushes. Re-adding it
+    # after CI authorizes exactly one incremental pass for the new head.
+    auto_incremental_review: true
