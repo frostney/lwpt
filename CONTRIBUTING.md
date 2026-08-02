@@ -42,8 +42,8 @@ evidence for the current head remain authoritative:
   branches use the `codex/stack-` prefix so the opening run is gated before the
   label can be applied. Draft pushes and cascading synchronization stop after
   the cheap admission job.
-- `ci:ready` means the layer is stable. Applying it dispatches the full PR
-  matrix once for that exact head while the PR remains draft. Stable lower
+- `ci:ready` means the layer is stable. Applying it reruns the full PR matrix
+  once for that exact head while the PR remains draft. Stable lower
   layers run CI even while upper layers remain under construction.
 - `review:ready` is applied only after CI passes. It admits one PR at a time to
   the rate-limited CodeRabbit lane from the bottom upward. The label requests
