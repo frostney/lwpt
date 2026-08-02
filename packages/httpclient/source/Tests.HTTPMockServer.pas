@@ -353,19 +353,16 @@ begin
   try
     ClientSock := FClientSock;
     ListenSock := FListenSock;
-    if IsValidMockSocket(ClientSock) then
-      FClientSock := InvalidMockSocket;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
 
   if IsValidMockSocket(ClientSock) then
   begin
-    { WinSock shutdown alone does not reliably release a blocking recv in
-      another thread. Transfer ownership under the lock, then close the
-      accepted socket so Execute cannot double-close it. }
+    { Cancel the blocking receive without closing a descriptor that Execute
+      may still be using. Execute retains ownership and closes the accepted
+      socket from its finally block after the I/O call returns. }
     ShutdownMockSocket(ClientSock);
-    CloseTrackedMockSocket(ClientSock);
   end
   else if
     IsValidMockSocket(ListenSock) then
@@ -621,6 +618,8 @@ end;
 procedure TMockHTTPServer.Start;
 begin
   {$IF DEFINED(UNIX) OR DEFINED(MSWINDOWS)}
+  if Assigned(FThread) then
+    raise EMockServerError.Create('mock server is already started');
   FThread := TMockServerThread.Create(FListenSock, FPort, FResponse,
     FBytesPerWrite, FWriteDelayMilliseconds, FInitialDelayMilliseconds);
   FListenSock := InvalidMockSocket;

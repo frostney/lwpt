@@ -700,6 +700,9 @@ begin
 end;
 
 begin
+  {$IFDEF UNIX}
+  fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
+  {$ENDIF}
   if (ParamCount = 2) and (ParamStr(1) = MOCK_LIFECYCLE_CHILD) then
   begin
     RunMockLifecycleChild(ParamStr(2));
@@ -711,10 +714,6 @@ begin
   Halt(0);
   {$ENDIF}
   {$ENDIF}
-  {$IFDEF UNIX}
-  fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
-  {$ENDIF}
-
   TestRunnerProgram.AddSuite(THTTPMockServerLifecycle.Create(
     'HTTP mock server: lifecycle'));
   TestRunnerProgram.AddSuite(THTTPClientByteFetch.Create(
