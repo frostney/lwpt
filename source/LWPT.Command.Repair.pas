@@ -17,6 +17,7 @@ uses
 
   LWPT.BuildSession,
   LWPT.Core,
+  LWPT.Install,
   LWPT.Manifest,
   LWPT.WorkerBudget;
 
@@ -50,14 +51,6 @@ begin
   TmpRoot := ResolveRepairPath(Ctx.ProjectRoot, ResolveTmpDir(Ctx.Manifest));
   LockPath := ResolveRepairPath(Ctx.ProjectRoot, INSTALL_LOCK);
 
-  if DirectoryExists(TmpRoot) then
-  begin
-    WipeDir(TmpRoot);
-    WriteLn('repair: cleaned ', TmpRoot, '/');
-  end
-  else
-    WriteLn('repair: no ', TmpRoot, '/ to clean');
-
   if FileExists(LockPath) then
   begin
     if not DeleteFile(LockPath) then
@@ -67,6 +60,18 @@ begin
   end
   else
     WriteLn('repair: no install lock to remove');
+
+  { A crashed writer may have a validated pre-transaction snapshot below
+    tmp. Restore it before the ordinary residue sweep can delete it. }
+  RecoverInterruptedInstall(Ctx);
+  if DirectoryExists(TmpRoot) then
+  begin
+    WipeDir(TmpRoot);
+    WriteLn('repair: recovered interrupted publication and cleaned ',
+      TmpRoot, '/');
+  end
+  else
+    WriteLn('repair: no ', TmpRoot, '/ to clean');
 
   RepairBuildSessions(Ctx.ProjectRoot, SessionsRemoved, SessionsRetained);
   WriteLn('repair: removed ', SessionsRemoved, ' abandoned build session(s), ',
@@ -85,8 +90,8 @@ begin
     WorkerLines.Free;
   end;
 
-  WriteLn('repair complete. Committed state under ', LWPT_DIR,
-          '/modules/ and ', LWPT_DIR, '/archives/ was not modified.');
+  WriteLn('repair complete. Interrupted install state was restored before '
+    + 'temporary residue was removed.');
 end;
 
 end.

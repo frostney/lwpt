@@ -38,15 +38,15 @@ unit LWPT.GitProtocol;
   Filters:
     refs/tags/<name>   → tag entry (Kind = rkTag)
     refs/heads/<name>  → branch entry (Kind = rkBranch)
-    ^{} peel suffix    → swallowed (the inner tag name + its peeled
-                         SHA take precedence over the annotation's
-                         own object SHA)
+    ^{} peel suffix    → attached to the tag as PeeledSHA (the
+                         underlying commit identity advertised by Git)
     HEAD               → ignored (not a useful target for fetches) }
 
 interface
 
 uses
   Classes,
+  StrUtils,
   SysUtils,
 
   HTTPClient;
@@ -57,7 +57,8 @@ type
   TGitRef = record
     Kind : TGitRefKind;
     Name : string;     { tag name or branch name (no refs/tags/ prefix) }
-    SHA  : string;     { 40-char commit hash }
+    SHA  : string;     { 40-char ref object hash }
+    PeeledSHA : string; { annotated-tag target commit; otherwise empty }
   end;
 
   TGitRefArray = array of TGitRef;
@@ -79,6 +80,80 @@ implementation
 
 const
   PKT_PREFIX_LEN = 4;
+
+function FixtureRepositoryName(const ARepoURL: string): string;
+var URL: string; Slash: Integer;
+begin
+  URL := ARepoURL;
+  if Copy(URL, Length(URL) - 3, 4) = '.git' then
+    SetLength(URL, Length(URL) - 4);
+  Slash := LastDelimiter('/', URL);
+  if Slash > 0 then
+    Result := Copy(URL, Slash + 1, MaxInt)
+  else
+    Result := URL;
+end;
+
+procedure AppendFixtureRequest(const ARoot, ALine: string);
+var Stream: TFileStream; Bytes: RawByteString; Path: string;
+begin
+  Path := IncludeTrailingPathDelimiter(ARoot) + 'requests.log';
+  ForceDirectories(ExtractFileDir(Path));
+  if FileExists(Path) then
+    Stream := TFileStream.Create(Path, fmOpenReadWrite or fmShareDenyNone)
+  else
+    Stream := TFileStream.Create(Path, fmCreate or fmShareDenyNone);
+  try
+    Stream.Seek(0, soEnd);
+    Bytes := RawByteString(ALine + LineEnding);
+    if Length(Bytes) > 0 then Stream.WriteBuffer(Bytes[1], Length(Bytes));
+  finally
+    Stream.Free;
+  end;
+end;
+
+function LoadFixtureRefs(const ARoot, ARepoURL: string): TGitRefArray;
+var Lines: TStringList; Path, Line: string; i, p1, p2, p3, n: Integer;
+begin
+  Path := IncludeTrailingPathDelimiter(ARoot) + 'refs/'
+    + FixtureRepositoryName(ARepoURL) + '.refs';
+  if not FileExists(Path) then
+    raise EGitProtocolError.CreateFmt(
+      'test git fixture has no ref advertisement for %s (%s)',
+      [ARepoURL, Path]);
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(Path);
+    SetLength(Result, 0);
+    for i := 0 to Lines.Count - 1 do
+    begin
+      Line := Trim(Lines[i]);
+      if (Line = '') or (Line[1] = '#') then Continue;
+      p1 := Pos('|', Line);
+      p2 := PosEx('|', Line, p1 + 1);
+      p3 := PosEx('|', Line, p2 + 1);
+      if (p1 <= 1) or (p2 <= p1 + 1) or (p3 <= p2 + 1) then
+        raise EGitProtocolError.CreateFmt(
+          'invalid test ref fixture line in %s: %s', [Path, Line]);
+      n := Length(Result);
+      SetLength(Result, n + 1);
+      if Copy(Line, 1, p1 - 1) = 'tag' then
+        Result[n].Kind := rkTag
+      else if Copy(Line, 1, p1 - 1) = 'branch' then
+        Result[n].Kind := rkBranch
+      else
+        raise EGitProtocolError.CreateFmt(
+          'invalid test ref kind in %s: %s', [Path, Line]);
+      Result[n].Name := Copy(Line, p1 + 1, p2 - p1 - 1);
+      Result[n].SHA := Copy(Line, p2 + 1, p3 - p2 - 1);
+      Result[n].PeeledSHA := Copy(Line, p3 + 1, MaxInt);
+    end;
+  finally
+    Lines.Free;
+  end;
+  AppendFixtureRequest(ARoot,
+    'refs|' + FixtureRepositoryName(ARepoURL));
+end;
 
 function HexCharToInt(C: AnsiChar): Integer; inline;
 begin
@@ -132,6 +207,7 @@ var
   SpacePos, NulPos : Integer;
 begin
   Result := False;
+  AOut := Default(TGitRef);
   Trimmed := StripTrailingNewline(APayload);
   if Length(Trimmed) < 41 then Exit;   { sha + space + at least 1 }
 
@@ -147,20 +223,6 @@ begin
     RefName := Copy(RestAfterSha, 1, NulPos - 1)
   else
     RefName := RestAfterSha;
-
-  if (Length(RefName) >= 3) and
-     (RefName[Length(RefName) - 2] = '^') and
-     (RefName[Length(RefName) - 1] = '{') and
-     (RefName[Length(RefName)]     = '}') then
-  begin
-    { Drop the 3-char peel suffix (caret-brace-brace). For an
-      annotated tag, this line carries the SHA of the underlying
-      commit (useful when we want the commit, not the tag object).
-      We could remember it for SHA lookups, but since LWPT fetches
-      by tag NAME (not SHA), the unsuffixed line is enough — skip
-      this one. }
-    Exit;
-  end;
 
   if (Length(RefName) > Length(PREFIX_TAG)) and
      (Copy(RefName, 1, Length(PREFIX_TAG)) = PREFIX_TAG) then
@@ -183,9 +245,10 @@ end;
 
 function ParseInfoRefs(const APayload: string): TGitRefArray;
 var
-  Offset, PktLen, BodyLen, N: Integer;
+  Offset, PktLen, BodyLen, N, i: Integer;
   PktBody: string;
   Ref: TGitRef;
+  PeeledName: string;
 begin
   SetLength(Result, 0);
   Offset := 1;
@@ -211,6 +274,18 @@ begin
 
     if ParseRefLine(PktBody, Ref) then
     begin
+      if (Ref.Kind = rkTag) and (Length(Ref.Name) > 3)
+         and (Copy(Ref.Name, Length(Ref.Name) - 2, 3) = '^{}') then
+      begin
+        PeeledName := Copy(Ref.Name, 1, Length(Ref.Name) - 3);
+        for i := 0 to High(Result) do
+          if (Result[i].Kind = rkTag) and (Result[i].Name = PeeledName) then
+          begin
+            Result[i].PeeledSHA := Ref.SHA;
+            Break;
+          end;
+        Continue;
+      end;
       SetLength(Result, N + 1);
       Result[N] := Ref;
       Inc(N);
@@ -221,6 +296,7 @@ end;
 function ListRemoteRefs(const ARepoURL: string): TGitRefArray;
 var
   URL : string;
+  FixtureRoot: string;
   Resp : THTTPResponse;
   Headers : THTTPHeaders;
   Body : string;
@@ -228,6 +304,10 @@ var
 begin
   if ARepoURL = '' then
     raise EGitProtocolError.Create('ListRemoteRefs: empty repo URL');
+
+  FixtureRoot := GetEnvironmentVariable('LWPT_TEST_GIT_FIXTURE_DIR');
+  if FixtureRoot <> '' then
+    Exit(LoadFixtureRefs(FixtureRoot, ARepoURL));
 
   URL := ARepoURL;
   if Pos('?', URL) > 0 then

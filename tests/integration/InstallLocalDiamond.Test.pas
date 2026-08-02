@@ -63,6 +63,7 @@ type
     procedure TestInstallReplacesBrokenModuleLink;
     procedure TestManifestPathInstallUsesManifestDirectory;
     procedure TestFrozenSucceedsWithoutRewritingLock;
+    procedure TestLegacyV3FrozenSucceeds;
   end;
 
   { --frozen must detect tampered modules trees (and tampered
@@ -157,6 +158,23 @@ begin
   begin
     Inc(Result);
     P := PosEx(ANeedle, AHaystack, P + Length(ANeedle));
+  end;
+end;
+
+procedure RemoveAdditiveIdentityFields(const APath: string);
+var Lines: TStringList; i: Integer;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(APath);
+    for i := Lines.Count - 1 downto 0 do
+      if (Pos('resolvedCommit = ', Lines[i]) = 1)
+         or (Pos('sourceIdentity = ', Lines[i]) = 1)
+         or (Pos('constraintFingerprint = ', Lines[i]) = 1) then
+        Lines.Delete(i);
+    Lines.SaveToFile(APath);
+  finally
+    Lines.Free;
   end;
 end;
 
@@ -338,6 +356,25 @@ begin
   Expect<string>(LockAfter).ToBe(LockBefore);
 end;
 
+procedure TInstallLocalDiamond.TestLegacyV3FrozenSucceeds;
+var LockBefore, LockAfter: string; Raised: Boolean;
+begin
+  { Early schema-v3 locks have complete source/ref/hash evidence but not
+    the later additive resolver identity fields. An unambiguous local graph
+    remains valid and must verify without regeneration. }
+  RemoveAdditiveIdentityFields(FRoot + '/lwpt.lock');
+  LockBefore := ReadFileText(FRoot + '/lwpt.lock');
+  Raised := False;
+  try
+    CmdInstall('lwpt.toml', True);
+  except
+    on E: Exception do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(False);
+  LockAfter := ReadFileText(FRoot + '/lwpt.lock');
+  Expect<string>(LockAfter).ToBe(LockBefore);
+end;
+
 procedure TInstallLocalDiamond.SetupTests;
 begin
   Test('install: lockfile has three packages with the right names',
@@ -354,6 +391,8 @@ begin
     TestManifestPathInstallUsesManifestDirectory);
   Test('install --frozen: succeeds + leaves the lockfile unchanged',
     TestFrozenSucceedsWithoutRewritingLock);
+  Test('install --frozen: accepts an unambiguous early schema-v3 lock',
+    TestLegacyV3FrozenSucceeds);
 end;
 
 { ── TFrozenTamperDetection ────────────────────────────────────── }
@@ -380,6 +419,7 @@ var
   Raised: Boolean;
   MsgContainsTreeMismatch: Boolean;
   Err: Exception;
+  LockBefore, CfgBefore, ModulesBefore, TamperedBefore: string;
 begin
   { Append a byte to an extracted source file under .lwpt/modules/.
     The tree hash is sensitive to every file's bytes, so this must
@@ -395,6 +435,11 @@ begin
   finally
     Stream.Free;
   end;
+
+  LockBefore := ReadFileText(FRoot + '/lwpt.lock');
+  CfgBefore := ReadFileText(FRoot + '/lwpt.cfg');
+  ModulesBefore := HashTree(FRoot + '/.lwpt/modules');
+  TamperedBefore := ReadFileText(Tampered);
 
   Raised := False;
   MsgContainsTreeMismatch := False;
@@ -414,6 +459,10 @@ begin
   try
     Expect<Boolean>(Raised).ToBe(True);
     Expect<Boolean>(MsgContainsTreeMismatch).ToBe(True);
+    Expect<string>(ReadFileText(FRoot + '/lwpt.lock')).ToBe(LockBefore);
+    Expect<string>(ReadFileText(FRoot + '/lwpt.cfg')).ToBe(CfgBefore);
+    Expect<string>(HashTree(FRoot + '/.lwpt/modules')).ToBe(ModulesBefore);
+    Expect<string>(ReadFileText(Tampered)).ToBe(TamperedBefore);
   finally
     Err.Free;
   end;

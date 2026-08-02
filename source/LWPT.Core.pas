@@ -70,6 +70,8 @@ function  TomlStr(ANode: TTOMLNode; const AKey, ADefault: string): string;
 function  TomlInt(ANode: TTOMLNode; const AKey: string; ADefault: Int64): Int64;
 
 function  MatchPathGlob(const APath, APattern: string): Boolean;
+function  CanonicalPathGlob(const AGlob: string): string;
+procedure CanonicalizePathGlobs(var AGlobs: TStringArray);
 procedure ApplyIncludeExclude(const ARoot: string; const AIncludes, AExcludes: TStringArray);
 
 function  CopyFileContent(const ASrc, ADst: string): Boolean;
@@ -85,6 +87,12 @@ function  MakeSiblingTmpPath(const APath, ATag: string): string;
 procedure WipeDir(const APath: string);
 function  AtomicMoveFile(const ASrc, ADst: string): Boolean;
 function  AtomicMoveDir(const ASrc, ADst: string): Boolean;
+function  AtomicRetainPath(const APath, ATmpRoot, AHint: string;
+  out ABackupPath: string): Boolean;
+function  AtomicRestorePath(const ABackupPath, ADestination: string): Boolean;
+function  AtomicRemovePath(const APath: string): Boolean;
+function  AtomicRetainedDestination(const ABackupPath: string): string;
+procedure AtomicDiscardRetainedPath(const ABackupPath: string);
 function  AtomicReplaceFile(const ASrc, ADst: string): Boolean;
 procedure AtomicWriteText(const ADst: string; const ATmpRoot: string; const AContent: TStringList);
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
@@ -121,6 +129,11 @@ uses
 {$IFDEF MSWINDOWS}
 const
   MOVEFILE_WRITE_THROUGH_LWPT = $00000008;
+  FSCTL_GET_REPARSE_POINT_LWPT = $000900A8;
+  FSCTL_SET_REPARSE_POINT_LWPT = $000900A4;
+  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
+  FILE_FLAG_BACKUP_SEMANTICS_LWPT = $02000000;
+  MAX_REPARSE_DATA_BUFFER_SIZE_LWPT = 16 * 1024;
 {$ENDIF}
 
 var
@@ -389,6 +402,31 @@ begin
   PathSegs := SplitPathSegments(APath);
   PatSegs  := SplitPathSegments(APattern);
   Result := DoMatch(0, 0);
+end;
+
+function CanonicalPathGlob(const AGlob: string): string;
+begin
+  { Manifest paths use '/' on every platform. Treat a backslash authored in
+    a glob as the same separator before either identity or matching sees it;
+    character case remains significant. }
+  Result := StringReplace(AGlob, '\', '/', [rfReplaceAll]);
+end;
+
+procedure CanonicalizePathGlobs(var AGlobs: TStringArray);
+var Canonical: TStringList; i: Integer;
+begin
+  Canonical := TStringList.Create;
+  try
+    Canonical.Sorted := True;
+    Canonical.CaseSensitive := True;
+    Canonical.Duplicates := dupIgnore;
+    for i := 0 to High(AGlobs) do
+      Canonical.Add(CanonicalPathGlob(AGlobs[i]));
+    SetLength(AGlobs, Canonical.Count);
+    for i := 0 to Canonical.Count - 1 do AGlobs[i] := Canonical[i];
+  finally
+    Canonical.Free;
+  end;
 end;
 
 { Apply [dependencies].<name>.include / .exclude globs against the
@@ -705,10 +743,120 @@ begin
 end;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
+var Attrs: Cardinal;
 begin
-  Result := Windows.RemoveDirectoryW(PWideChar(UnicodeString(APath)));
+  Attrs := Windows.GetFileAttributesW(PWideChar(UnicodeString(APath)));
+  if Attrs = $FFFFFFFF then Exit(False);
+  if (Attrs and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+    Result := Windows.RemoveDirectoryW(PWideChar(UnicodeString(APath)))
+  else
+    Result := Windows.DeleteFileW(PWideChar(UnicodeString(APath)));
 end;
 {$ENDIF}
+
+function ReadLinkSnapshot(const APath: string; out AData: TBytes;
+  out AIsDirectory: Boolean): Boolean;
+{$IFDEF UNIX}
+var
+  Buffer: array[0..4095] of Char;
+  Count: ssize_t;
+begin
+  AData := nil;
+  AIsDirectory := False;
+  Count := FpReadLink(PChar(APath), @Buffer[0], SizeOf(Buffer));
+  if (Count < 0) or (Count = SizeOf(Buffer)) then Exit(False);
+  SetLength(AData, Count);
+  if Count > 0 then Move(Buffer[0], AData[0], Count);
+  Result := True;
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Attrs, Flags, Returned: Cardinal;
+  Handle: THandle;
+begin
+  AData := nil;
+  AIsDirectory := False;
+  Attrs := Windows.GetFileAttributesW(PWideChar(UnicodeString(APath)));
+  if (Attrs = $FFFFFFFF)
+     or ((Attrs and Windows.FILE_ATTRIBUTE_REPARSE_POINT) = 0) then
+    Exit(False);
+  AIsDirectory := (Attrs and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0;
+  Flags := FILE_FLAG_OPEN_REPARSE_POINT_LWPT;
+  if AIsDirectory then Flags := Flags or FILE_FLAG_BACKUP_SEMANTICS_LWPT;
+  Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)), 0,
+    Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+      or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING, Flags, 0);
+  if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then Exit(False);
+  try
+    SetLength(AData, MAX_REPARSE_DATA_BUFFER_SIZE_LWPT);
+    Result := Windows.DeviceIoControl(Handle,
+      FSCTL_GET_REPARSE_POINT_LWPT, nil, 0, @AData[0], Length(AData),
+      Returned, nil);
+    if Result then SetLength(AData, Returned)
+    else AData := nil;
+  finally
+    Windows.CloseHandle(Handle);
+  end;
+end;
+{$ENDIF}
+
+function WriteLinkSnapshot(const APath: string; const AData: TBytes;
+  const AIsDirectory: Boolean): Boolean;
+{$IFDEF UNIX}
+var Target: string;
+begin
+  if Length(AData) = 0 then Target := ''
+  else SetString(Target, PAnsiChar(@AData[0]), Length(AData));
+  Result := FpSymlink(PChar(Target), PChar(APath)) = 0;
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Flags, Returned: Cardinal;
+  Handle: THandle;
+begin
+  Result := False;
+  if Length(AData) = 0 then Exit;
+  if AIsDirectory then
+  begin
+    if not Windows.CreateDirectoryW(PWideChar(UnicodeString(APath)), nil) then
+      Exit;
+  end
+  else
+  begin
+    Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+      Windows.GENERIC_WRITE, 0, nil, Windows.CREATE_NEW,
+      Windows.FILE_ATTRIBUTE_NORMAL, 0);
+    if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then Exit;
+    Windows.CloseHandle(Handle);
+  end;
+  Flags := FILE_FLAG_OPEN_REPARSE_POINT_LWPT;
+  if AIsDirectory then Flags := Flags or FILE_FLAG_BACKUP_SEMANTICS_LWPT;
+  Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+    Windows.GENERIC_WRITE, 0, nil, Windows.OPEN_EXISTING, Flags, 0);
+  if Handle <> THandle(Windows.INVALID_HANDLE_VALUE) then
+    try
+      Result := Windows.DeviceIoControl(Handle,
+        FSCTL_SET_REPARSE_POINT_LWPT, @AData[0], Length(AData), nil, 0,
+        Returned, nil);
+    finally
+      Windows.CloseHandle(Handle);
+    end;
+  if not Result then
+    if AIsDirectory then
+      Windows.RemoveDirectoryW(PWideChar(UnicodeString(APath)))
+    else
+      Windows.DeleteFileW(PWideChar(UnicodeString(APath)));
+end;
+{$ENDIF}
+
+function CopyLinkObject(const ASrc, ADst: string): Boolean;
+var Data: TBytes; IsDirectory: Boolean;
+begin
+  Result := ReadLinkSnapshot(ASrc, Data, IsDirectory)
+    and WriteLinkSnapshot(ADst, Data, IsDirectory);
+end;
 
 function PathExists(const APath: string): Boolean; inline;
 begin
@@ -830,6 +978,7 @@ end;
 function AtomicMoveDir(const ASrc, ADst: string): Boolean;
 var
   DstDir, Backup: string;
+  SourceIsLink: Boolean;
 
   procedure RestoreBackup;
   begin
@@ -839,7 +988,8 @@ var
   end;
 
 begin
-  if not DirectoryExists(ASrc) then Exit(False);
+  SourceIsLink := IsDirSymlinkOrJunction(ASrc);
+  if (not DirectoryExists(ASrc)) and (not SourceIsLink) then Exit(False);
   DstDir := ExtractFileDir(ExcludeTrailingPathDelimiter(ADst));
   if DstDir <> '' then ForceDirectories(DstDir);
   Backup := '';
@@ -853,7 +1003,7 @@ begin
 
   try
     Result := SysUtils.RenameFile(ASrc, ADst);
-    if not Result then
+    if (not Result) and (not SourceIsLink) then
     begin
       { EXDEV path: recursive copy + wipe-source. The old destination
         remains recoverable until the copy finishes. }
@@ -874,6 +1024,147 @@ begin
     RestoreBackup;
     raise;
   end;
+end;
+
+function SnapshotPathHash(const APath: string): string;
+var LinkData: TBytes; LinkIsDirectory: Boolean;
+begin
+  { A link is a committed filesystem object in its own right. Hash its raw
+    target/reparse data, not the tree currently reached through it, so rollback
+    preserves both the original type and target even when it is dangling. }
+  if IsDirSymlinkOrJunction(APath) then
+  begin
+    if not ReadLinkSnapshot(APath, LinkData, LinkIsDirectory) then
+      raise EExtractError.CreateFmt(
+        'failed to read retained link metadata for "%s"', [APath]);
+    if LinkIsDirectory then Result := 'link-dir:' + SHA256Hex(LinkData)
+    else Result := 'link-file:' + SHA256Hex(LinkData);
+  end
+  else if DirectoryExists(APath) then
+    Result := 'tree:' + HashTree(APath)
+  else if FileExists(APath) then
+    Result := 'file:' + SHA256File(APath)
+  else
+    Result := 'absent';
+end;
+
+{ Copy the current transaction target below the caller-owned rollback root.
+  The live destination remains readable until publication's final swap. A
+  sidecar records both the destination and validated content identity, so an
+  interrupted transaction can be recovered before tmp cleanup. }
+function AtomicRetainPath(const APath, ATmpRoot, AHint: string;
+  out ABackupPath: string): Boolean;
+var Meta: TStringList; Expected, Actual: string;
+begin
+  ABackupPath := MakeTmpPath(ATmpRoot, 'rollback-' + AHint);
+  Expected := SnapshotPathHash(APath);
+  Result := False;
+  try
+    if Expected = 'absent' then
+      Actual := 'absent'
+    else if IsDirSymlinkOrJunction(APath) then
+    begin
+      if not CopyLinkObject(APath, ABackupPath) then Exit;
+      Actual := SnapshotPathHash(ABackupPath);
+    end
+    else if FileExists(APath) and not IsDirSymlinkOrJunction(APath) then
+    begin
+      if not CopyFileContent(APath, ABackupPath) then Exit;
+      Actual := SnapshotPathHash(ABackupPath);
+    end
+    else
+    begin
+      ForceDirectories(ABackupPath);
+      CopyDirTree(APath, ABackupPath);
+      Actual := SnapshotPathHash(ABackupPath);
+    end;
+    if Actual <> Expected then Exit;
+    Meta := TStringList.Create;
+    try
+      Meta.Add(APath);
+      Meta.Add(Expected);
+      AtomicWriteText(ABackupPath + '.rollback', ATmpRoot, Meta);
+    finally
+      Meta.Free;
+    end;
+    Result := True;
+  except
+    AtomicRemovePath(ABackupPath);
+    AtomicRemovePath(ABackupPath + '.rollback');
+    raise;
+  end;
+end;
+
+function AtomicRemovePath(const APath: string): Boolean;
+begin
+  Result := True;
+  if not PathExists(APath) then Exit;
+  try
+    RemovePath(APath);
+  except
+    Result := False;
+  end;
+end;
+
+{ Restore a retained path after validating its sidecar and saved bytes. An
+  `absent` sidecar means the destination did not exist before the transaction,
+  so rollback consists only of removing the replacement. }
+function AtomicRestorePath(const ABackupPath, ADestination: string): Boolean;
+var Meta: TStringList; Expected: string;
+begin
+  if SameText(GetEnvironmentVariable('LWPT_TEST_THROW_RESTORE_FOR'),
+       ExtractFileName(ExcludeTrailingPathDelimiter(ADestination))) then
+    raise EExtractError.CreateFmt(
+      'injected restore exception for "%s"', [ADestination]);
+  Result := False;
+  if not FileExists(ABackupPath + '.rollback') then Exit;
+  Meta := TStringList.Create;
+  try
+    Meta.LoadFromFile(ABackupPath + '.rollback');
+    if Meta.Count < 2 then Exit;
+    if Meta[0] <> ADestination then Exit;
+    Expected := Meta[1];
+  finally
+    Meta.Free;
+  end;
+  if Expected = 'absent' then
+  begin
+    Result := AtomicRemovePath(ADestination);
+    if Result then AtomicRemovePath(ABackupPath + '.rollback');
+    Exit;
+  end;
+  { Validate before touching the published destination. A corrupt or missing
+    backup remains available for diagnosis and never destroys the current
+    readable tree while rollback is already degraded. }
+  if SnapshotPathHash(ABackupPath) <> Expected then Exit;
+  if not AtomicRemovePath(ADestination) then Exit(False);
+  if FileExists(ABackupPath) and not IsDirSymlinkOrJunction(ABackupPath) then
+    Result := AtomicMoveFile(ABackupPath, ADestination)
+  else
+    Result := AtomicMoveDir(ABackupPath, ADestination);
+  if Result then AtomicRemovePath(ABackupPath + '.rollback');
+end;
+
+function AtomicRetainedDestination(const ABackupPath: string): string;
+var Meta: TStringList;
+begin
+  Result := '';
+  if ABackupPath = '' then Exit;
+  if not FileExists(ABackupPath + '.rollback') then Exit;
+  Meta := TStringList.Create;
+  try
+    Meta.LoadFromFile(ABackupPath + '.rollback');
+    if Meta.Count > 0 then Result := Meta[0];
+  finally
+    Meta.Free;
+  end;
+end;
+
+procedure AtomicDiscardRetainedPath(const ABackupPath: string);
+begin
+  if ABackupPath = '' then Exit;
+  AtomicRemovePath(ABackupPath);
+  AtomicRemovePath(ABackupPath + '.rollback');
 end;
 
 { Replace a file in one filesystem operation. Unlike AtomicMoveFile this

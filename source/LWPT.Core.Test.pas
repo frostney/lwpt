@@ -165,7 +165,7 @@ type
     procedure TestServiceAnnounceIsSkipped;
     procedure TestHeadWithCapabilitiesIsRecognised;
     procedure TestTagsAndBranchesAreSeparated;
-    procedure TestPeelSuffixIsDiscarded;
+    procedure TestPeelSuffixRecordsCommitIdentity;
     procedure TestMultipleTags;
   end;
 
@@ -1609,11 +1609,11 @@ begin
   Expect<string>(Refs[1].Name).ToBe('v1.0.0');
 end;
 
-procedure TGitProtocolParsing.TestPeelSuffixIsDiscarded;
+procedure TGitProtocolParsing.TestPeelSuffixRecordsCommitIdentity;
 const
   (* Both lines refer to the same tag; the ^{} line is the peeled
-     commit SHA. Our parser drops the peel-suffix line so the result
-     contains the tag exactly once. *)
+     commit SHA. The parser keeps one tag and attaches the commit
+     identity advertised by Git. *)
   PAYLOAD =
     '003ebbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/tags/v1.0.0'#10 +
     (* 0x41 = 65: 4 prefix + 40 sha + 1 space + 19-char peel-suffix
@@ -1625,6 +1625,8 @@ begin
   Refs := ParseInfoRefs(PAYLOAD);
   Expect<Integer>(Length(Refs)).ToBe(1);
   Expect<string>(Refs[0].Name).ToBe('v1.0.0');
+  Expect<string>(Refs[0].PeeledSHA)
+    .ToBe('cccccccccccccccccccccccccccccccccccccccc');
 end;
 
 procedure TGitProtocolParsing.TestMultipleTags;
@@ -1652,8 +1654,8 @@ begin
     TestHeadWithCapabilitiesIsRecognised);
   Test('refs/heads/ and refs/tags/ are classified correctly',
     TestTagsAndBranchesAreSeparated);
-  Test('peel-suffix lines are discarded (the unsuffixed line wins)',
-    TestPeelSuffixIsDiscarded);
+  Test('peel-suffix lines attach the authoritative commit identity',
+    TestPeelSuffixRecordsCommitIdentity);
   Test('multiple tags are returned in order',
     TestMultipleTags);
 end;

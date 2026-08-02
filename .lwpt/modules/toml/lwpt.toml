@@ -1,0 +1,17 @@
+# TOML — full TOML 1.1 parser.
+#
+# Co-developed with GocciaScript and established as an in-monorepo LWPT
+# package per ADR-0014. Bundles OrderedStringMap + BaseMap as
+# transitive deps — both are tiny utilities that only TOML needs
+# inside LWPT, and shipping them inside the package keeps the unit
+# fully self-contained.
+#
+# No tests bundled yet — TOML is exercised heavily via
+# LWPT.Core.Test.pas's manifest-loading suite (round-trip tests
+# against the parser's output). Dedicated unit tests inside the
+# package land later.
+
+[package]
+name    = "toml"
+version = "0.1.0"
+units   = ["source"]

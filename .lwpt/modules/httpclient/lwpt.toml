@@ -1,0 +1,16 @@
+# HTTPClient — HTTP/TLS transport built on raw sockets.
+#
+# Shared with GocciaScript (HTTPClient.pas + TransportSecurity.pas); LWPT-canonical per ADR-0017
+# and established as an in-monorepo LWPT package per ADR-0014. The
+# slim-bootstrap-copy concept from ADR-0003 collapses into this
+# package — there's only ONE copy of HTTPClient now, lives here.
+#
+# Bundles FileUtils + StringBuffer as transitive deps (per
+# ADR-0014's "bundled shared utils" decision); both stay verbatim
+# from GocciaScript's earlier copy. HTTPClient.Test.pas + the Tests.HTTPMockServer.pas
+# support unit live here too so the package is self-testable.
+
+[package]
+name    = "httpclient"
+version = "0.2.0"
+units   = ["source"]

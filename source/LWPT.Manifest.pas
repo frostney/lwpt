@@ -534,6 +534,29 @@ begin
   AKind := vkLiteralTag;
 end;
 
+procedure NormalizeWorkspaceSource(var ADep: TDependency);
+var
+  WorkspaceSpec: string;
+begin
+  if ADep.SrcKind <> skWorkspace then Exit;
+  if ADep.SrcLocator = '' then
+    raise EManifestError.CreateFmt(
+      'dependency "%s": workspace source needs a spec '
+      + '(`workspace:*` or `workspace:^X.Y.Z`)', [ADep.Name]);
+  if ADep.VersionSpec <> '' then
+    raise EManifestError.CreateFmt(
+      'dependency "%s": workspace source carries its version spec; '
+      + 'remove the separate version spec "%s"',
+      [ADep.Name, ADep.VersionSpec]);
+  WorkspaceSpec := ADep.SrcLocator;
+  ADep.VersionSpec := WorkspaceSpec;
+  if WorkspaceSpec = '*' then
+    ADep.VersionKind := vkNone
+  else
+    ParseVersionSpec(WorkspaceSpec, ADep.VersionKind, ADep.VersionSpec);
+  ADep.SrcLocator := '';  { filled by the resolver }
+end;
+
 { The package-name grammar — one definition for every consumer:
   `lwpt init`'s prompts, `lwpt add`'s derived/--name validation, and
   the installer's refuse-to-prune guard against unsafe lockfile keys.
@@ -611,26 +634,7 @@ begin
       'dependency "%s": local source "%s" cannot have a version spec '
       + '("@%s" not allowed for local paths)',
       [ADep.Name, SrcStr, SpecStr]);
-  { workspace:<spec> per ADR-0014 amendment "Workspaces". The
-    ParseDependencySourceCore call above set SrcKind=skWorkspace and
-    parked the trailing spec (`*`, `^0.1.0`, etc) in SrcLocator. Move
-    it into the conventional VersionSpec field so the resolver's
-    version-check logic finds it; SrcLocator is filled at resolve
-    time with the discovered workspace's path. }
-  if ADep.SrcKind = skWorkspace then
-  begin
-    if ADep.SrcLocator = '' then
-      raise EManifestError.CreateFmt(
-        'dependency "%s": workspace source needs a spec '
-        + '(`workspace:*` or `workspace:^X.Y.Z`)', [ADep.Name]);
-    ADep.VersionSpec := ADep.SrcLocator;
-    if ADep.VersionSpec = '*' then
-      ADep.VersionKind := vkNone
-    else
-      ParseVersionSpec(ADep.VersionSpec,
-        ADep.VersionKind, ADep.VersionSpec);
-    ADep.SrcLocator := '';  { filled by ResolveGraph }
-  end;
+  NormalizeWorkspaceSource(ADep);
 end;
 
 { Read an array-of-strings TOML field from an inline-table node into
@@ -745,6 +749,7 @@ begin
   ParseDependencySourceCore(SrcStr, ACustomSources, False,
     ADep.SrcKind, ADep.SrcHost, ADep.SrcHostName, ADep.SrcLocator);
   ParseVersionSpec(SpecStr, ADep.VersionKind, ADep.VersionSpec);
+  NormalizeWorkspaceSource(ADep);
   if (ADep.SrcKind = skLocal) and (SpecStr <> '') then
     raise EManifestError.CreateFmt(
       'dependency "%s": local source "%s" cannot have a version spec '
@@ -762,6 +767,8 @@ begin
 
   ReadGlobArray(ANode, 'include', ADep.IncludeGlobs);
   ReadGlobArray(ANode, 'exclude', ADep.ExcludeGlobs);
+  CanonicalizePathGlobs(ADep.IncludeGlobs);
+  CanonicalizePathGlobs(ADep.ExcludeGlobs);
 end;
 
 { ===========================================================================
