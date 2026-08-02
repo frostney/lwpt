@@ -136,6 +136,7 @@ begin
   Expect<Boolean>(Pos('install', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('build',   R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('format',  R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('duplication', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('test',    R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('repair',  R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('init',    R.Stdout) > 0).ToBe(True);

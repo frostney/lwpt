@@ -1,6 +1,6 @@
 # Tooling
 
-Pinned tool versions, environment variables, lint/format/test commands, OpenSSL stories per platform, EXDEV fallback, and where each deferred stack-contract item lives.
+Pinned tool versions, environment variables, lint/format/test commands, OpenSSL stories per platform, EXDEV fallback, and current stack-contract status.
 
 ## Executive Summary
 
@@ -19,7 +19,11 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 - **Every resolved subcommand reports completion.** A status-aware elapsed-time
   line is written to stderr after success or failure without changing stdout or
   the command's exit code.
-- **Three customer-facing stack contracts are owed but deferred.** Per [ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md), link-check, duplication, and codebase-health each have a follow-up workstream. Architecture drift is instead a project-local release-preparation check for LWPT itself; it is not a customer feature.
+- **Duplication analysis is Pascal-native and offline.** `lwpt duplication`
+  reports deterministic Type-2 token clones in manifest-owned root and
+  workspace sources. The remaining deferred stack contracts stay tracked
+  separately. Architecture drift is a project-local release-preparation check
+  for LWPT itself; it is not a customer feature.
 
 ## Pinned versions
 
@@ -230,17 +234,57 @@ state is written. Successful completion removes compiler jobs and compiled hooks
 but retains stable job logs; `lwpt repair` removes only unlocked sessions and
 conservatively retains live guards even when their state file is malformed.
 
-## Deferred from v1
+## Duplication analysis
 
-The three customer-facing stack contracts from `project-structure` beyond build-system and formatter:
+`lwpt duplication [--json]` scans only the Pascal files resolved from the
+manifest-owned analysis scope. It compares typed regions so a match never spans
+a routine or unit-section boundary; executable regions compare only with other
+executable regions, and declaration regions only with declarations. Whitespace,
+comments, and Pascal letter case are ignored. Identifiers and literals may be
+renamed when their token kinds and equality pattern remain consistent, which
+makes the detector Type-2 rather than text-only.
+
+Candidates are selected by descending normalized length and stable source
+coordinates. The report retains maximal non-overlapping occurrences, including
+same-file and cross-file groups, and verifies each new occurrence against every
+member already accepted into its clone group. Aggregate duplication is duplicate
+tokens beyond each group's first occurrence divided by all analyzed region tokens.
+The default minimum is 100 normalized tokens:
+
+```toml
+[duplication]
+minimum-tokens = 100
+# maximum-percent = 5
+```
+
+`minimum-tokens` may be lowered to 25, but not below it. `maximum-percent` is
+an optional integer from 0 through 100; the command fails only when the observed
+percentage is strictly greater than that value. Without a maximum it is
+report-only. Root settings are inherited by workspaces; a workspace's own
+`[duplication]` table replaces them. The root maximum gates the complete scope,
+while workspace maxima also gate duplication internal to that package.
+`[analysis].include` and `[analysis].exclude` remain the single source-selection
+policy shared with `lwpt health`.
+
+Human output is the default. `--json` writes the versioned shared analysis
+envelope plus a duplication-owned payload containing effective project policy,
+token totals, clone groups, stable locations, and the threshold outcome. Both
+forms are deterministic and the command performs no network operations.
+
+## Remaining deferred contract
+
+ADR-0006 originally deferred several customer-facing stack contracts beyond the
+build system and formatter. Duplication analysis now ships; one contract remains
+active as deferred work:
 
 | Contract | Workstream | Notes |
 | --- | --- | --- |
 | **Codebase-health** (`lwpt health`) | [Issue #33](https://github.com/frostney/lwpt/issues/33) | Cyclomatic + cognitive complexity; non-zero exit on threshold breach. Per-file aggregate signal + hotspot detection from git churn. |
-| **Duplication** (`lwpt duplication`) | [Issue #32](https://github.com/frostney/lwpt/issues/32) | Cross-file and within-file copy-paste reporting. |
-| **Link-check** | [Issue #31](https://github.com/frostney/lwpt/issues/31) | Graduates from GocciaScript as a standalone LWPT package; offline + explicit online modes. |
 
-The v1 pre-commit gate excludes all three. ADR-0006 records the original deferral. Architecture drift is checked across LWPT's source, tests, manifests, workflows, documentation, ADRs, and domain context during release preparation; it is not exposed to consumer projects.
+The v1 pre-commit gate excludes the remaining deferred contracts. ADR-0006
+records the original deferral. Architecture drift is checked across LWPT's
+source, tests, manifests, workflows, documentation, ADRs, and domain context
+during release preparation; it is not exposed to consumer projects.
 
 ## Other deferrals
 
