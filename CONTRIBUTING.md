@@ -43,8 +43,10 @@ evidence for the current head remain authoritative:
 - `ci:ready` means the layer is stable. Apply it before marking the PR ready;
   the full PR matrix then runs once for that current head. Stable lower layers
   run CI even while upper layers remain under construction.
-- `review:ready` is applied only after CI passes. It requests the label-gated
-  CodeRabbit pass, one PR at a time from the bottom upward.
+- `review:ready` is applied only after CI passes. It admits one PR at a time to
+  the rate-limited CodeRabbit lane from the bottom upward. The label requests
+  the first pass; after a reviewed head changes, use `@coderabbitai review` once
+  the replacement head has passed CI and regained the label.
 - `merge:ready` is applied only after the current head has green CI, terminal
   review evidence, and no unresolved findings. It is routing state, not proof.
 
