@@ -29,6 +29,8 @@ const
 type
   ELWPTWorkerBudgetError = class(ELWPTError);
 
+  { Test-only creation seam. Production code must leave the corresponding
+    hook nil; assigning it bypasses real directory creation entirely. }
   TLWPTWorkerStateRootCreateHook = function(
     const ARoot: string): Boolean;
 
@@ -105,6 +107,8 @@ type
   end;
 
 var
+  { Test-only injection hook; production code must leave this nil. While
+    assigned, TryCreateWorkerStateRoot does not call ForceDirectories. }
   WorkerStateRootCreateTestHook : TLWPTWorkerStateRootCreateHook;
 
 function NewWorkerSessionId: string;
