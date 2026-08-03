@@ -193,7 +193,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`packages/cli/source/CLI.Parser.Test.pas`** | 9 tests in 1 suite | Self-spawns in child mode so `ParseCommandLine` consumes real argv. Covers separated valued short options (including hyphen-leading values), opt-in attached values, repeatable `-Fu` / `-d` values, exact-before-longest-prefix matching for multi-character names, missing and unknown short-option errors, unchanged valueless flags, and both existing long-value forms. |
 | **`packages/cli/source/CLI.Subcommands.Test.pas`** | 6 tests in 1 suite | In-process coverage of the subcommand registry: `Count`/`Item` iterate in registration order, `Find` resolves case-insensitively to the same object, each subcommand exposes its option objects, out-of-range `Item` access raises, and the optional completion callback receives the resolved command name, exit code, and elapsed milliseconds exactly once without being able to replace a nonzero dispatch result — the registry-side complement to the binary-side `CLIOptions.Test.pas`. |
 | **`source/LWPT.BuildRequest.Test.pas`** | 12 tests in 1 suite | Pins canonical versioned TOML serialization and parse round-trips for build, probe, result, and capability documents; unsupported-schema failures; ordered extra arguments; compiler-independent target tuples; Windows target-name recognition; explicit incompatibility reasons; and normalized result validation. |
-| **`source/LWPT.CompilerDriver.External.Test.pas`** | 8 tests in 1 suite | Runs a real short-lived proxy for probe and compile, proving canonical TOML stdin/stdout, live refresh, bounded raw stderr context, result/exit agreement, primary and extra-artifact confinement, explicit `--clean` rejection, timeout cleanup when a sleeping child never reads its large stdin, bounded writer cancellation when an escaped descendant retains stdin, and retain/discard drainage plus tree termination after capture overflow. |
+| **`source/LWPT.CompilerDriver.External.Test.pas`** | 9 tests in 1 suite | Runs a real short-lived proxy for probe and compile, proving canonical TOML stdin/stdout, live refresh, bounded raw stderr context, result/exit agreement, primary and extra-artifact confinement, explicit `--clean` rejection, writer-free empty-input cleanup across repeated short-lived children, timeout cleanup when a sleeping child never reads its large stdin, bounded writer cancellation when an escaped descendant retains stdin, and retain/discard drainage plus tree termination after capture overflow. |
 | **`source/LWPT.CompilerRegistry.Test.pas`** | 11 tests in 1 suite | Covers build-entry/project/embedding/built-in precedence, the FPC fallback, built-in Blaise selection and explicit executable resolution, and case-insensitive per-invocation caching. Factory coverage pins wrong-identity rejection, independent version enforcement, rejected-object cleanup, exactly-once selection ownership, and refusal to shadow built-in drivers. |
 | **`source/LWPT.BuildSession.Test.pas`** | 22 tests in 1 suite | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, compiler-argument fingerprinting, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
 | **`source/LWPT.Command.Build.Test.pas`** | 3 tests in 1 suite | Covers compiler-process cancellation with output capture and child reaping, normal-exit descendant handling, and non-zero exit-code reporting. |
@@ -270,10 +270,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 24 | 434 |
+| Unit (`source/*.Test.pas` + package self-tests) | 24 | 435 |
 | Integration (`tests/integration/*.Test.pas`) | 22 | 215 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 7 | 35 |
-| **Total** | **53** | **684** |
+| **Total** | **53** | **685** |
 
 ### Planned testing work
 
