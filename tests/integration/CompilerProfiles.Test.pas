@@ -22,6 +22,8 @@ uses
 
 const
   DRIVER_ID = 'integration-driver';
+  LAKON_DRIVER_ID = 'lakon';
+  LAKON_MODE = 'lakon-cfg';
   LEASE_OBSERVER_ENV = PROJECT_NAME + '_LEASE_OBSERVER';
 
 type
@@ -29,6 +31,7 @@ type
   private
     FScratch: string;
     procedure SetMode(const AMode: string);
+    procedure WriteLakonManifest;
     procedure WriteManifest(const AEntryCompiler: string = 'external';
       const AObservePostBuildLeases: Boolean = False);
     procedure WriteBlaiseManifest;
@@ -41,6 +44,7 @@ type
     procedure TestIdentityMismatchNeverFallsBack;
     procedure TestVersionMismatchFails;
     procedure TestLiveCapabilityMutationFailsBeforeCompile;
+    procedure TestLakonBuildConsumesCfgUnitPaths;
     procedure TestTargetMismatchFails;
     procedure TestMalformedStdoutRetainsStderr;
     procedure TestMalformedTestResultDoesNotAbortSibling;
@@ -62,6 +66,57 @@ begin
     ReadLn(Line);
     Result := Result + Line + #10;
   end;
+end;
+
+procedure RunLakonDriver;
+var
+  ArgumentIndex: Integer;
+  HasCfgUnitPath: Boolean;
+  OutputPath: string;
+begin
+  if (ParamCount = 1) and (ParamStr(1) = '--version') then
+  begin
+    WriteLn(LAKON_DRIVER_ID, ' 0.1.0');
+    Halt(0);
+  end;
+  if (ParamCount = 1) and (ParamStr(1) = '--help') then
+  begin
+    WriteLn('usage: ', LAKON_DRIVER_ID, ' <command>');
+    WriteLn(LAKON_DRIVER_ID, ' compile <file> - Compile Pascal to WebAssembly');
+    WriteLn('-o <file>');
+    WriteLn('-Fu <dir>');
+    WriteLn('-d <sym>');
+    WriteLn('--no-cache');
+    WriteLn('--verbose-units');
+    WriteLn('--no-inline');
+    WriteLn('--inline-stats');
+    Halt(0);
+  end;
+  if (ParamCount < 2) or (ParamStr(1) <> 'compile') then Halt(2);
+  HasCfgUnitPath := False;
+  OutputPath := '';
+  ArgumentIndex := 3;
+  while ArgumentIndex <= ParamCount do
+  begin
+    if (ParamStr(ArgumentIndex) = '-Fu')
+       and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      if ExpandFileName(ParamStr(ArgumentIndex)) =
+         ExpandFileName('cfg-only-units') then HasCfgUnitPath := True;
+    end
+    else if (ParamStr(ArgumentIndex) = '-o')
+      and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      OutputPath := ParamStr(ArgumentIndex);
+    end;
+    Inc(ArgumentIndex);
+  end;
+  if not HasCfgUnitPath then Halt(3);
+  if OutputPath = '' then Halt(4);
+  WriteTextFile(OutputPath, 'cfg-only unit path reached Lakon');
+  Halt(0);
 end;
 
 function ReadMode: string;
@@ -433,6 +488,26 @@ begin
     + WholePostBuild);
 end;
 
+procedure TCompilerProfiles.WriteLakonManifest;
+begin
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "lakon-cfg-project"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[compiler]'#10
+    + 'default = "' + LAKON_DRIVER_ID + '"'#10
+    + #10
+    + '[compiler.profiles.' + LAKON_DRIVER_ID + ']'#10
+    + 'driver = "' + LAKON_DRIVER_ID + '"'#10
+    + 'executable = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
+    + 'version = "^0.1.0"'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app.wasm" }'#10);
+end;
+
 procedure TCompilerProfiles.WriteBlaiseManifest;
 begin
   WriteTextFile(FScratch + '/lwpt.toml',
@@ -539,6 +614,42 @@ begin
     [PROJECT_NAME + '_FPC_UNIT_PATHS=' + EnvironmentUnitPaths]);
   DumpRunFailure('external test', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
+end;
+
+procedure TCompilerProfiles.TestLakonBuildConsumesCfgUnitPaths;
+var
+  OriginalCfg, UpdatedCfg: TStringList;
+  R: TLwptResult;
+begin
+  SetMode(LAKON_MODE);
+  WriteLakonManifest;
+  WriteTextFile(FScratch + '/source/app.pas',
+    'program app;'#10'uses CfgOnlyUnit;'#10'begin'#10'end.'#10);
+  WriteTextFile(FScratch + '/cfg-only-units/CfgOnlyUnit.pas',
+      'unit CfgOnlyUnit;'#10
+    + 'interface'#10
+    + 'implementation'#10
+    + 'end.'#10);
+  OriginalCfg := TStringList.Create;
+  UpdatedCfg := TStringList.Create;
+  try
+    OriginalCfg.LoadFromFile(FScratch + '/lwpt.cfg');
+    UpdatedCfg.Assign(OriginalCfg);
+    UpdatedCfg.Add('-Fucfg-only-units');
+    AtomicWriteText(FScratch + '/lwpt.cfg', FScratch + '/.lwpt/tmp',
+      UpdatedCfg);
+    R := RunLwpt(['build', '--jobs', '1'], FScratch);
+    DumpRunFailure('Lakon cfg-only unit path', R, 0);
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(FileExists(FScratch + '/build/app.wasm')).ToBe(True);
+  finally
+    AtomicWriteText(FScratch + '/lwpt.cfg', FScratch + '/.lwpt/tmp',
+      OriginalCfg);
+    UpdatedCfg.Free;
+    OriginalCfg.Free;
+    WriteTextFile(FScratch + '/source/app.pas',
+      'program app;'#10'begin'#10'end.'#10);
+  end;
 end;
 
 procedure TCompilerProfiles.TestEntryProfileOverridesProjectDefault;
@@ -738,6 +849,8 @@ procedure TCompilerProfiles.SetupTests;
 begin
   Test('root external profile drives real build and test',
     TestExternalBuildAndTestSucceed);
+  Test('Lakon build consumes cfg-only dependency unit paths',
+    TestLakonBuildConsumesCfgUnitPaths);
   Test('entry profile overrides project default',
     TestEntryProfileOverridesProjectDefault);
   Test('identity mismatch never falls back',
@@ -765,6 +878,7 @@ begin
 end;
 
 begin
+  if ReadMode = LAKON_MODE then RunLakonDriver;
   if (ParamCount > 0)
      and ((ParamStr(1) = '--help') or (ParamStr(1) = '--source')) then
     RunBlaiseProxy;

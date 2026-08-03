@@ -158,6 +158,7 @@ gitea = { archive = "https://git.example.com/{user}/{repository}/archive/{ref}.t
 # Multi-binary form (used here): one inline table per entry.
 cli  = { source = "src/cli.pas",  output = "bin/cli" }
 tool = { source = "src/tool.pas", output = "bin/tool", compiler = "custom" }
+delphi-tool = { source = "src/tool.dpr", output = "bin/tool.exe", compiler = "delphi-win64" }
 
 [compiler]
 # Optional root-owned policy. Without it, build and test use built-in FPC.
@@ -166,6 +167,12 @@ default = "native"
 [compiler.profiles.native]
 driver = "fpc"
 version = "^3.2.0"
+
+[compiler.profiles.wasm]
+# Opt-in adapter for the released frostney/lakon compiler.
+driver = "lakon"
+executable = "tools/lakon" # optional; otherwise resolved from PATH
+version = ">=0.1.0"
 
 [compiler.profiles.blaise]
 # Built-in opt-in adapter for graemeg/blaise v0.13.0 or newer.
@@ -178,6 +185,13 @@ version = ">=0.13.0"
 driver = "my-compiler"
 executable = "tools/my-compiler-driver"
 version = "^1.0.0"
+
+[compiler.profiles.delphi-win64]
+# Built-in, opt-in consumer driver; LWPT itself remains FPC-built.
+driver = "delphi"
+# Replace this placeholder with the installed compiler path.
+executable = "C:/path/to/dcc64.exe"
+version = ">=36.0.0"
 
 [version]
 output = "src/Version.Generated.inc"
