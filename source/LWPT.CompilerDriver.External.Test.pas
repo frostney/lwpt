@@ -33,6 +33,7 @@ type
     procedure TestMalformedProtocolRetainsStderr;
     procedure TestExtraArtifactOutsideRootsIsRejected;
     procedure TestForcedRebuildIsRejectedExplicitly;
+    procedure TestEmptyInputShortLivedChildCycles;
     procedure TestTimeoutKillsNonReadingProxy;
     procedure TestTimeoutDoesNotWaitForEscapedStdinHolder;
     procedure TestCaptureOverflowRetainsBoundedPrefixAndTerminates;
@@ -450,6 +451,40 @@ begin
   end;
 end;
 
+procedure TLWPTExternalCompilerDriverTests.
+  TestEmptyInputShortLivedChildCycles;
+const
+  CYCLE_COUNT = 16;
+var
+  Cycle: Integer;
+  Options: TLWPTProcessRunOptions;
+  P: TProcess;
+  Runner: TLWPTDuplexProcessRunner;
+  StandardError, StandardOutput: string;
+begin
+  for Cycle := 1 to CYCLE_COUNT do
+  begin
+    P := TProcess.Create(nil);
+    Runner := nil;
+    try
+      P.Executable := ParamStr(0);
+      P.Parameters.Add('exit-without-reading');
+      Runner := TLWPTDuplexProcessRunner.Create(P);
+      Options := DefaultProcessRunOptions('empty-input child');
+      Options.SeparateStandardError := True;
+      Options.TimeoutMilliseconds := 5000;
+      Expect<Integer>(Runner.Run('', Options, StandardOutput,
+        StandardError)).ToBe(0);
+      Expect<Boolean>(Runner.UsedStandardInputWriter).ToBe(False);
+      Expect<string>(StandardOutput).ToBe('');
+      Expect<string>(StandardError).ToBe('');
+    finally
+      Runner.Free;
+      P.Free;
+    end;
+  end;
+end;
+
 procedure TLWPTExternalCompilerDriverTests.TestTimeoutKillsNonReadingProxy;
 var
   Options: TLWPTProcessRunOptions;
@@ -564,6 +599,8 @@ begin
     TestExtraArtifactOutsideRootsIsRejected);
   Test('--clean fails explicitly for the external protocol',
     TestForcedRebuildIsRejectedExplicitly);
+  Test('empty input does not race short-lived child cleanup',
+    TestEmptyInputShortLivedChildCycles);
   Test('timeout kills a sleeping proxy that never reads stdin',
     TestTimeoutKillsNonReadingProxy);
   Test('timeout does not wait for an escaped descendant retaining stdin',
@@ -575,6 +612,7 @@ begin
 end;
 
 begin
+  if (ParamCount = 1) and (ParamStr(1) = 'exit-without-reading') then Halt(0);
   if (ParamCount = 1) and (ParamStr(1) = 'sleep-noread') then
   begin
     Sleep(30000);

@@ -37,6 +37,7 @@ type
     FProcess: TProcess;
     FProcessTree: TLWPTProcessTree;
     FStarted: Boolean;
+    FUsedStandardInputWriter: Boolean;
   public
     constructor Create(const AProcess: TProcess);
     destructor Destroy; override;
@@ -48,6 +49,8 @@ type
       const AOptions: TLWPTProcessRunOptions; out AStandardOutput,
       AStandardError: string): Integer;
     procedure Cancel;
+    property UsedStandardInputWriter: Boolean
+      read FUsedStandardInputWriter;
   end;
 
 function DefaultProcessRunOptions(const AOperationName: string):
@@ -574,29 +577,33 @@ begin
   Writer := nil;
   TerminationThread := nil;
   try
-    try
-      Writer := TLWPTPipeWriter.Create(FProcess, AStandardInput);
-    except
-      on E: Exception do
-      begin
-        FailureMessage := 'could not prepare standard-input writer: '
-          + E.Message;
-        try
-          FProcessTree.Terminate;
-        except
-          on TerminationError: Exception do
-            FailureMessage := FailureMessage + '; process-tree termination: '
-              + TerminationError.Message;
+    if AStandardInput <> '' then
+      try
+        Writer := TLWPTPipeWriter.Create(FProcess, AStandardInput);
+        FUsedStandardInputWriter := True;
+      except
+        on E: Exception do
+        begin
+          FailureMessage := 'could not prepare standard-input writer: '
+            + E.Message;
+          try
+            FProcessTree.Terminate;
+          except
+            on TerminationError: Exception do
+              FailureMessage := FailureMessage
+                + '; process-tree termination: '
+                + TerminationError.Message;
+          end;
+          raise ELWPTProcessRunnerError.Create(FailureMessage);
         end;
-        raise ELWPTProcessRunnerError.Create(FailureMessage);
       end;
-    end;
     StartedAt := GetTickCount64;
     try
-      if not Writer.StartWriting then
+      if Assigned(Writer) and (not Writer.StartWriting) then
         FailureMessage := Writer.ErrorMessage;
-      { The writer owns a duplicated handle. Close TProcess's original copy
-        now so child EOF depends only on the process-independent writer. }
+      { A non-empty payload is owned by the independent writer. An empty
+        payload needs only EOF, so close the original pipe directly instead
+        of scheduling a writer thread that has no bytes to publish. }
       try
         FProcess.CloseInput;
       except
@@ -640,7 +647,7 @@ begin
       end;
       if TimedOut or (FailureMessage <> '') then
       begin
-        Writer.RequestCancellation;
+        if Assigned(Writer) then Writer.RequestCancellation;
         TerminationThread := TLWPTProcessTerminationThread.Create(
           FProcessTree);
         TerminationThread.StartTermination;
@@ -703,7 +710,8 @@ begin
           AOptions.OnOutputChunk, True, AOptions.DiscardCapturedOutput);
       if not FProcess.Running then FProcess.WaitOnExit;
     finally
-      WriterAbandoned := not Writer.CancelAndJoin;
+      if Assigned(Writer) then
+        WriterAbandoned := not Writer.CancelAndJoin;
     end;
     if TimedOut then
       raise ELWPTProcessRunnerTimeout.CreateFmt('%s timed out after %d ms',
@@ -718,7 +726,7 @@ begin
     if TerminationFailure <> '' then
       raise ELWPTProcessRunnerError.Create(
         'could not terminate process tree: ' + TerminationFailure);
-    if Writer.ErrorMessage <> '' then
+    if Assigned(Writer) and (Writer.ErrorMessage <> '') then
       raise ELWPTProcessRunnerError.Create(
         'could not write process standard input: ' + Writer.ErrorMessage);
     Result := NormalisedExitCode(FProcess);
