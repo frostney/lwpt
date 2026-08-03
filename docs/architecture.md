@@ -18,9 +18,9 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   `LWPT.BuildRequest` owns the versioned request, target tuple, capability, and
   normalized result structures. `TLWPTCompilerDriver` owns capability probing,
   argument translation, executable naming, failure classification, and result
-  normalization. Root-owned profiles select built-in FPC, Blaise, the opt-in
-  Lakon adapter, a
-  short-lived external driver, or an embedding-host factory for build and
+  normalization. Root-owned profiles select built-in FPC, Delphi, Blaise, the
+  opt-in Lakon adapter, a short-lived external driver, or an embedding-host
+  factory for build and
   test. A registered `lakon` host factory takes precedence over the external
   Lakon adapter so an embedding can replace the implicit FPC default;
   lifecycle hook compilation remains on FPC. See ADR-0022, ADR-0029, and
@@ -258,7 +258,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`,
 `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.WorkerBudget.pas`,
 `LWPT.Command.*.pas`, `LWPT.CompilerDriver.pas`,
-`LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.External.pas`,
+`LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.Delphi.pas`,
+`LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
 `LWPT.GitProtocol.pas`) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
