@@ -228,6 +228,25 @@ type
 
 const
   WindowsControlExitCode = DWORD($C000013A);
+  ToolhelpSnapshotProcesses = DWORD($00000002);
+
+{$PACKRECORDS C}
+type
+  { FPC 3.2.2's Win64 Windows unit omits the Toolhelp process-enumeration
+    surface, so keep the SDK ABI local just like the Job Object imports below. }
+  TLWPTProcessEntry32W = record
+    Size: DWORD;
+    UsageCount: DWORD;
+    ProcessID: DWORD;
+    DefaultHeapID: PtrUInt;
+    ModuleID: DWORD;
+    ThreadCount: DWORD;
+    ParentProcessID: DWORD;
+    BasePriority: LongInt;
+    Flags: DWORD;
+    ExecutableFile: array[0..259] of WideChar;
+  end;
+{$PACKRECORDS DEFAULT}
 
 var
   ConsoleControlEvent: THandle = 0;
@@ -247,6 +266,15 @@ function LWPTQueryInformationJobObject(const AJob: THandle;
   const AInformationClass: DWORD; const AInformation: Pointer;
   const AInformationLength: DWORD; const AReturnLength: PDWORD): BOOL; stdcall;
   external 'kernel32.dll' name 'QueryInformationJobObject';
+function LWPTCreateToolhelp32Snapshot(const AFlags,
+  AProcessID: DWORD): THandle; stdcall;
+  external 'kernel32.dll' name 'CreateToolhelp32Snapshot';
+function LWPTProcess32FirstW(const ASnapshot: THandle;
+  var AEntry: TLWPTProcessEntry32W): BOOL; stdcall;
+  external 'kernel32.dll' name 'Process32FirstW';
+function LWPTProcess32NextW(const ASnapshot: THandle;
+  var AEntry: TLWPTProcessEntry32W): BOOL; stdcall;
+  external 'kernel32.dll' name 'Process32NextW';
 
 constructor TLWPTProcessTree.TWindowsState.Create;
 begin
@@ -1321,7 +1349,7 @@ end;
 function CurrentParentProcessID: QWord;
 {$IFDEF MSWINDOWS}
 var
-  Entry: Windows.PROCESSENTRY32;
+  Entry: TLWPTProcessEntry32W;
   Snapshot: THandle;
 {$ENDIF}
 begin
@@ -1330,17 +1358,16 @@ begin
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Result := 0;
-  Snapshot := Windows.CreateToolhelp32Snapshot(
-    Windows.TH32CS_SNAPPROCESS, 0);
+  Snapshot := LWPTCreateToolhelp32Snapshot(ToolhelpSnapshotProcesses, 0);
   if Snapshot = Windows.INVALID_HANDLE_VALUE then Exit;
   try
     FillChar(Entry, SizeOf(Entry), 0);
-    Entry.dwSize := SizeOf(Entry);
-    if not Windows.Process32First(Snapshot, Entry) then Exit;
+    Entry.Size := SizeOf(Entry);
+    if not LWPTProcess32FirstW(Snapshot, Entry) then Exit;
     repeat
-      if Entry.th32ProcessID = Windows.GetCurrentProcessId then
-        Exit(Entry.th32ParentProcessID);
-    until not Windows.Process32Next(Snapshot, Entry);
+      if Entry.ProcessID = Windows.GetCurrentProcessId then
+        Exit(Entry.ParentProcessID);
+    until not LWPTProcess32NextW(Snapshot, Entry);
   finally
     Windows.CloseHandle(Snapshot);
   end;
