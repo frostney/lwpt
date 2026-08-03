@@ -8,6 +8,9 @@ uses
   BaseUnix,
   cthreads,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -36,6 +39,12 @@ const
     + '_PROCESS_TREE_TEST_PID_FILE';
   SlowCompilerProxyMode = 'slow';
   WorkerErrorCompilerProxyMode = 'worker-error';
+  {$IFDEF MSWINDOWS}
+  WindowsConsoleControllerOption = '--' + PROGRAM_NAME
+    + '-console-controller';
+  WindowsControlExitCode = DWORD($C000013A);
+  WindowsIgnoreControlCompilerProxyMode = 'ignore-control';
+  {$ENDIF}
   TestHeartbeatIntervalMilliseconds = 75;
   TestHeartbeatJobDurationMilliseconds =
     TestHeartbeatIntervalMilliseconds * 4;
@@ -74,6 +83,12 @@ type
     {$IFDEF UNIX}
     procedure TestSIGINTTerminatesActiveProcessTree;
     procedure TestSIGTERMTerminatesActiveProcessTree;
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    procedure RunWindowsConsoleForwardingTest(const AControlType: DWORD;
+      const AProjectName: string);
+    procedure TestCtrlCTerminatesActiveProcessTree;
+    procedure TestCtrlBreakTerminatesActiveProcessTree;
     {$ENDIF}
     procedure TestSilentJobEmitsHeartbeatAndProgress;
     procedure TestFailureReplaysAndPreservesIsolatedLog;
@@ -714,6 +729,140 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF MSWINDOWS}
+procedure TerminateWindowsProcess(const APID: Integer);
+var
+  ProcessHandle: THandle;
+begin
+  if not ProcessIsRunning(APID) then Exit;
+  ProcessHandle := Windows.OpenProcess(Windows.PROCESS_TERMINATE, False,
+    DWORD(APID));
+  if ProcessHandle = 0 then Exit;
+  try
+    Windows.TerminateProcess(ProcessHandle, 1);
+  finally
+    Windows.CloseHandle(ProcessHandle);
+  end;
+end;
+
+function IgnoreWindowsConsoleControl(AControlType: DWORD): BOOL; stdcall;
+begin
+  Result := (AControlType = Windows.CTRL_C_EVENT)
+    or (AControlType = Windows.CTRL_BREAK_EVENT);
+end;
+
+procedure TTestScheduling.RunWindowsConsoleForwardingTest(
+  const AControlType: DWORD; const AProjectName: string);
+var
+  CompilerPID: Integer;
+  Controller: TProcess;
+  PIDFile, ProjectRoot: string;
+  Started: TDateTime;
+begin
+  CompilerPID := -1;
+  ProjectRoot := FScratch + '/' + AProjectName;
+  PIDFile := FScratch + '/control/' + AProjectName + '-compiler-pid';
+  WriteBuildProject(ProjectRoot);
+  Controller := TProcess.Create(nil);
+  try
+    Controller.Executable := ExpandFileName(ParamStr(0));
+    Controller.Parameters.Add(WindowsConsoleControllerOption);
+    Controller.Parameters.Add(IntToStr(AControlType));
+    Controller.Parameters.Add(LwptBinaryPath);
+    Controller.Parameters.Add(ProjectRoot);
+    Controller.Parameters.Add(PIDFile);
+    Controller.Parameters.Add(FScratch + '/' + AProjectName + '-worker-state');
+    Controller.Options := [poNewConsole];
+    Controller.Execute;
+    Started := Now;
+    while Controller.Running
+      and ((Now - Started) * SecondsPerDay
+        < CancellationCompletionCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(Controller.Running).ToBe(False);
+    Controller.WaitOnExit;
+    Expect<Integer>(Controller.ExitStatus).ToBe(0);
+    Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
+    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+    Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+  finally
+    if Controller.Running then Controller.Terminate(1);
+    TerminateWindowsProcess(CompilerPID);
+    Controller.Free;
+  end;
+end;
+
+procedure TTestScheduling.TestCtrlCTerminatesActiveProcessTree;
+begin
+  RunWindowsConsoleForwardingTest(Windows.CTRL_C_EVENT, 'console-control-c');
+end;
+
+procedure TTestScheduling.TestCtrlBreakTerminatesActiveProcessTree;
+begin
+  RunWindowsConsoleForwardingTest(Windows.CTRL_BREAK_EVENT,
+    'console-control-break');
+end;
+
+function RunWindowsConsoleController: Integer;
+var
+  CompilerPID: Integer;
+  ControlType: DWORD;
+  Environment: array of string;
+  LwptProcess: TProcess;
+  Started: TDateTime;
+begin
+  Result := 1;
+  CompilerPID := -1;
+  ControlType := DWORD(StrToInt(ParamStr(2)));
+  if (ControlType <> Windows.CTRL_C_EVENT)
+     and (ControlType <> Windows.CTRL_BREAK_EVENT) then Exit(2);
+  SetLength(Environment, 6);
+  Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
+  Environment[1] := WORKER_STATE_DIR_ENV + '=' + ParamStr(6);
+  Environment[2] := WORKER_BUDGET_ENV + '=1';
+  Environment[3] := CompilerExecutableEnvironment + '='
+    + ExpandFileName(ParamStr(0));
+  Environment[4] := ProcessTreeProxyModeEnvironment + '='
+    + WindowsIgnoreControlCompilerProxyMode;
+  Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + ParamStr(5);
+  LwptProcess := TProcess.Create(nil);
+  try
+    LwptProcess.Executable := ParamStr(3);
+    LwptProcess.Parameters.Add('build');
+    LwptProcess.CurrentDirectory := ParamStr(4);
+    ConfigureProcessEnvironment(LwptProcess, Environment);
+    LwptProcess.Execute;
+    Started := Now;
+    while (not FileExists(ParamStr(5))) and LwptProcess.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if not FileExists(ParamStr(5)) then Exit(3);
+    CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
+    { The controller shares the new console but must survive its own broadcast.
+      Install after spawning LWPT so no ignore policy can be inherited. The
+      compiler proxy installs the same two-event handler before publishing its
+      PID, leaving LWPT as the only process that performs cancellation work. }
+    if not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
+      True) then Exit(4);
+    if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(5);
+    Started := Now;
+    while LwptProcess.Running
+      and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if LwptProcess.Running then Exit(6);
+    LwptProcess.WaitOnExit;
+    if DWORD(LwptProcess.ExitStatus) <> WindowsControlExitCode then Exit(7);
+    if ProcessIsRunning(CompilerPID) then Exit(8);
+    Result := 0;
+  finally
+    if LwptProcess.Running then LwptProcess.Terminate(1);
+    TerminateWindowsProcess(CompilerPID);
+    LwptProcess.Free;
+  end;
+end;
+{$ENDIF}
+
 function RunProcessTreeCompilerProxy: Integer;
 var
   Mode, PIDFile, SourceFile: string;
@@ -734,8 +883,16 @@ begin
   if Mode = IgnoreTerminateCompilerProxyMode then
     FpSignal(SIGTERM, SignalHandler(SIG_IGN));
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  if Mode = WindowsIgnoreControlCompilerProxyMode then
+    if not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
+      True) then Exit(2);
+  {$ENDIF}
   if (Mode = SlowCompilerProxyMode)
      or (Mode = IgnoreTerminateCompilerProxyMode)
+     {$IFDEF MSWINDOWS}
+     or (Mode = WindowsIgnoreControlCompilerProxyMode)
+     {$ENDIF}
      or ((Mode = WorkerErrorCompilerProxyMode)
        and SameText(SourceFile, 'A.Slow.Test.pas')) then
   begin
@@ -778,6 +935,12 @@ begin
   Test('SIGTERM reaps the active compiler tree',
     TestSIGTERMTerminatesActiveProcessTree);
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Test('Ctrl-C reaps the active compiler Job Object',
+    TestCtrlCTerminatesActiveProcessTree);
+  Test('Ctrl-Break reaps the active compiler Job Object',
+    TestCtrlBreakTerminatesActiveProcessTree);
+  {$ENDIF}
   Test('silent jobs emit heartbeat and serialized progress',
     TestSilentJobEmitsHeartbeatAndProgress);
   Test('failures replay output and preserve isolated logs',
@@ -787,6 +950,11 @@ begin
 end;
 
 begin
+  {$IFDEF MSWINDOWS}
+  if (ParamCount = 6)
+     and (ParamStr(1) = WindowsConsoleControllerOption) then
+    Halt(RunWindowsConsoleController);
+  {$ENDIF}
   if GetEnvironmentVariable(ProcessTreeProxyModeEnvironment) <> '' then
     Halt(RunProcessTreeCompilerProxy);
   TestRunnerProgram.AddSuite(TTestScheduling.Create('TestScheduling'));
