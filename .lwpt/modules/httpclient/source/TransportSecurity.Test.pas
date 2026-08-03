@@ -10,8 +10,18 @@ program TransportSecurity.Test;
 {$mode delphi}{$H+}{$codepage utf8}
 
 uses
+  {$IFDEF UNIX}
+  cthreads, { must come first so TThread has a thread driver }
+  {$ENDIF}
   Classes,
   SysUtils,
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Process,
+  Windows,
+  {$ENDIF}
   {$IFNDEF DARWIN}
   DynLibs,
   OpenSSL,
@@ -26,6 +36,27 @@ const
     'packages/httpclient/source/fixtures/localhost-empty-passphrase.p12';
   UTF8_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-utf8-passphrase.p12';
+  FUTURE_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-future-identity.p12';
+  CYCLIC_CHAIN_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-cycle-identity.p12';
+  INCOHERENT_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-incoherent-identity.p12';
+  LEAF_CA_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-leaf-ca-identity.p12';
+  LEAF_NO_BASIC_CONSTRAINTS_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/' +
+    'localhost-no-basic-constraints-identity.p12';
+  NON_CA_ISSUER_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-non-ca-issuer-identity.p12';
+  NO_CERTSIGN_ISSUER_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-no-certsign-identity.p12';
+  PATH_LENGTH_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-pathlen-identity.p12';
+  SELF_SIGNED_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-self-signed-dev.p12';
+  WRONG_PURPOSE_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-wrong-purpose-identity.p12';
   PKCS12_PASSPHRASE = 'test-only';
   UTF8_PKCS12_PASSPHRASE = 'pässword';
   SCRATCH_DIRECTORY = 'build/tests/tmp/transport-security';
@@ -61,13 +92,40 @@ type
     procedure TestPendingCiphertextPointerIsStable;
     procedure TestPKCS12LoadFailures;
     procedure TestPKCS12SizeLimit;
+    procedure TestPKCS12BytesArePrimaryInput;
+    procedure TestPKCS12PathRefusesSymbolicLink;
     procedure TestPlaintextRoundtripAndPartialCiphertextConsumption;
     procedure TestRenegotiationIsRefused;
     procedure TestStaleErrorQueueIsCleared;
+    procedure TestStrictIdentityAllowsLeafWithoutBasicConstraints;
+    procedure TestStrictIdentityValidation;
     procedure TestSyscallErrorPoisonsConnection;
     procedure TestTLSFloorRejectsTLS11;
     procedure TestWriteWantRetryRetainsPlaintext;
+    procedure TestReloadRetainsSnapshotsAndFailedReloadKeepsActive;
   end;
+
+  {$IFNDEF DARWIN}
+  TBeginAbortWorker = class(TThread)
+  private
+    FContext: TTransportSecurityServerContext;
+    FErrorMessage: string;
+    FOperations: LongInt;
+    FStarted: LongInt;
+    FStopRequested: LongInt;
+    function GetOperations: LongInt;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AContext: TTransportSecurityServerContext);
+    procedure RequestStop;
+    function WaitForOperations(const AMinimum: LongInt;
+      const ATimeoutMilliseconds: QWord): Boolean;
+    function WaitUntilStarted(const ATimeoutMilliseconds: QWord): Boolean;
+    property ErrorMessage: string read FErrorMessage;
+    property Operations: LongInt read GetOperations;
+  end;
+  {$ENDIF}
 
 function CaptureContextError(const APath: string;
   const APassphrase: UnicodeString): string;
@@ -89,6 +147,164 @@ begin
   if Result = '' then
     raise Exception.Create('Expected TLS server context creation to fail');
 end;
+
+function LoadFixtureBytes(const APath: string): TBytes;
+var
+  Input: TFileStream;
+begin
+  Result := nil;
+  Input := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    SetLength(Result, Input.Size);
+    if Length(Result) > 0 then
+      Input.ReadBuffer(Result[0], Length(Result));
+  finally
+    Input.Free;
+  end;
+end;
+
+{$IFDEF MSWINDOWS}
+function TryCreateWindowsJunction(const ALinkDirectory,
+  ALinkTarget: string): Boolean;
+var
+  CommandInterpreter: string;
+  ProcessInstance: TProcess;
+begin
+  Result := False;
+  CommandInterpreter := SysUtils.GetEnvironmentVariable('COMSPEC');
+  if CommandInterpreter = '' then
+    CommandInterpreter := 'cmd.exe';
+  ProcessInstance := TProcess.Create(nil);
+  try
+    ProcessInstance.Executable := CommandInterpreter;
+    ProcessInstance.Parameters.Add('/C');
+    ProcessInstance.Parameters.Add('mklink /J "' +
+      StringReplace(ALinkDirectory, '/', '\', [rfReplaceAll]) + '" "' +
+      StringReplace(ALinkTarget, '/', '\', [rfReplaceAll]) + '"');
+    ProcessInstance.Options := [poWaitOnExit];
+    try
+      ProcessInstance.Execute;
+      Result := ProcessInstance.ExitStatus = 0;
+    except
+      Result := False;
+    end;
+  finally
+    ProcessInstance.Free;
+  end;
+end;
+
+procedure RemoveWindowsJunctionIfPresent(const ALinkDirectory: string);
+var
+  ErrorCode: DWORD;
+begin
+  if Windows.RemoveDirectoryW(PWideChar(UnicodeString(ALinkDirectory))) then
+    Exit;
+  ErrorCode := Windows.GetLastError;
+  if ErrorCode in [Windows.ERROR_FILE_NOT_FOUND,
+     Windows.ERROR_PATH_NOT_FOUND] then
+    Exit;
+  raise Exception.CreateFmt(
+    'Failed to remove PKCS#12 junction fixture (%d)', [ErrorCode]);
+end;
+
+function WindowsJunctionTestAvailable: Boolean;
+var
+  LinkDirectory: string;
+  LinkTarget: string;
+begin
+  ForceDirectories(SCRATCH_DIRECTORY);
+  LinkDirectory := SCRATCH_DIRECTORY + '/identity-junction-preflight';
+  LinkTarget := ExtractFileDir(ExpandFileName(PKCS12_PATH));
+  RemoveWindowsJunctionIfPresent(LinkDirectory);
+  Result := TryCreateWindowsJunction(LinkDirectory, LinkTarget);
+  if not Result then
+  begin
+    RemoveWindowsJunctionIfPresent(LinkDirectory);
+    Exit;
+  end;
+  if not Windows.RemoveDirectoryW(
+     PWideChar(UnicodeString(LinkDirectory))) then
+    raise Exception.CreateFmt(
+      'Failed to clean up PKCS#12 junction preflight (%d)',
+      [Windows.GetLastError]);
+end;
+{$ENDIF}
+
+{$IFNDEF DARWIN}
+constructor TBeginAbortWorker.Create(
+  const AContext: TTransportSecurityServerContext);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FContext := AContext;
+  FErrorMessage := '';
+  FOperations := 0;
+  FStarted := 0;
+  FStopRequested := 0;
+end;
+
+procedure TBeginAbortWorker.Execute;
+var
+  Connection: TTransportSecurityConnection;
+begin
+  InterlockedExchange(FStarted, 1);
+  try
+    while InterlockedCompareExchange(FStopRequested, 0, 0) = 0 do
+    begin
+      FillChar(Connection, SizeOf(Connection), 0);
+      try
+        BeginTransportSecurityServer(Connection, FContext);
+      finally
+        AbortTransportSecurityServer(Connection);
+      end;
+      InterlockedIncrement(FOperations);
+    end;
+  except
+    on E: Exception do
+      FErrorMessage := E.ClassName + ': ' + E.Message;
+  end;
+end;
+
+procedure TBeginAbortWorker.RequestStop;
+begin
+  InterlockedExchange(FStopRequested, 1);
+end;
+
+function TBeginAbortWorker.GetOperations: LongInt;
+begin
+  Result := InterlockedCompareExchange(FOperations, 0, 0);
+end;
+
+function TBeginAbortWorker.WaitForOperations(const AMinimum: LongInt;
+  const ATimeoutMilliseconds: QWord): Boolean;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while Operations < AMinimum do
+  begin
+    if GetTickCount64 - StartedAt >= ATimeoutMilliseconds then
+      Exit(False);
+    Sleep(1);
+  end;
+  Result := True;
+end;
+
+function TBeginAbortWorker.WaitUntilStarted(
+  const ATimeoutMilliseconds: QWord): Boolean;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while InterlockedCompareExchange(FStarted, 0, 0) = 0 do
+  begin
+    if GetTickCount64 - StartedAt >= ATimeoutMilliseconds then
+      Exit(False);
+    Sleep(1);
+  end;
+  Result := True;
+end;
+{$ENDIF}
 
 function CaptureFlowContextError(const AHighWatermark, ALowWatermark,
   AOutputCapacity: Integer): string;
@@ -692,6 +908,7 @@ var
   Context: TTransportSecurityServerContext;
   ErrorMessage: string;
   Flow: TTransportSecurityInputFlow;
+  Identity: TBytes;
   OutputFlow: TTransportSecurityOutputFlow;
 {$ENDIF}
 begin
@@ -754,6 +971,29 @@ begin
   finally
     AbortTransportSecurityServer(Connection);
     CloseTransportSecurityServerContext(Context);
+  end;
+
+  Identity := LoadFixtureBytes(SELF_SIGNED_PKCS12_PATH);
+  try
+    Context := TTransportSecurityServerContext.Create(Identity,
+      PKCS12_PASSPHRASE, TLS_SERVER_MAX_INPUT_CAPACITY, 0,
+      TLS_SERVER_MIN_OUTPUT_CAPACITY, tsivPermissive);
+    try
+      BeginTransportSecurityServer(Connection, Context);
+      Flow := TransportSecurityServerInputFlow(Connection);
+      Expect<Integer>(Flow.HighWatermark).ToBe(
+        TLS_SERVER_MAX_INPUT_CAPACITY);
+      Expect<Integer>(Flow.LowWatermark).ToBe(0);
+      OutputFlow := TransportSecurityServerOutputFlow(Connection);
+      Expect<Integer>(OutputFlow.Capacity).ToBe(
+        TLS_SERVER_MIN_OUTPUT_CAPACITY);
+    finally
+      AbortTransportSecurityServer(Connection);
+      CloseTransportSecurityServerContext(Context);
+    end;
+  finally
+    if Length(Identity) > 0 then
+      FillChar(Identity[0], Length(Identity), 0);
   end;
 
   ErrorMessage := CaptureFlowContextError(
@@ -1046,6 +1286,308 @@ begin
   Expect<Boolean>(Pos('16 MiB limit', ErrorMessage) > 0).ToBe(True);
   Expect<Boolean>(Pos(OversizedPath, ErrorMessage) = 0).ToBe(True);
   Expect<Boolean>(Pos(Passphrase, ErrorMessage) = 0).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.TestPKCS12BytesArePrimaryInput;
+{$IFNDEF DARWIN}
+var
+  Client: TRawOpenSSLClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  I: Integer;
+  Identity: TBytes;
+  Observed: THandshakeObservations;
+  OriginalIdentity: TBytes;
+{$ENDIF}
+begin
+  {$IFNDEF DARWIN}
+  Identity := LoadFixtureBytes(PKCS12_PATH);
+  OriginalIdentity := Copy(Identity, 0, Length(Identity));
+  Context := TTransportSecurityServerContext.Create(Identity,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    Expect<Integer>(Length(Identity)).ToBe(Length(OriginalIdentity));
+    for I := 0 to High(Identity) do
+      if Identity[I] <> OriginalIdentity[I] then
+        raise Exception.Create('PKCS#12 byte input was modified by construction');
+    FillChar(Identity[0], Length(Identity), 0);
+    CreateHandshakenPair(Context, Connection, Client, Observed);
+    Expect<Boolean>(Connection.Active).ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.TestPKCS12PathRefusesSymbolicLink;
+{$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
+var
+  Context: TTransportSecurityServerContext;
+  ErrorMessage: string;
+  FifoPath: string;
+  LinkDirectory: string;
+  LinkPath: string;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  ErrorMessage: string;
+  LinkDirectory: string;
+  LinkTarget: string;
+  RemovalSucceeded: Boolean;
+{$ENDIF}
+begin
+  {$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  CloseTransportSecurityServerContext(Context);
+  ForceDirectories(SCRATCH_DIRECTORY);
+  LinkPath := SCRATCH_DIRECTORY + '/identity-link.p12';
+  SysUtils.DeleteFile(LinkPath);
+  if fpSymlink(PChar(ExpandFileName(PKCS12_PATH)), PChar(LinkPath)) <> 0 then
+    raise Exception.Create('Failed to create PKCS#12 symlink fixture');
+  try
+    ErrorMessage := CaptureContextError(LinkPath, PKCS12_PASSPHRASE);
+    Expect<Boolean>(Pos('without following links', ErrorMessage) > 0).ToBe(True);
+    Expect<Boolean>(Pos(LinkPath, ErrorMessage) = 0).ToBe(True);
+  finally
+    SysUtils.DeleteFile(LinkPath);
+  end;
+
+  LinkDirectory := SCRATCH_DIRECTORY + '/identity-parent';
+  SysUtils.DeleteFile(LinkDirectory);
+  if fpSymlink(PChar(ExtractFileDir(ExpandFileName(PKCS12_PATH))),
+     PChar(LinkDirectory)) <> 0 then
+    raise Exception.Create('Failed to create PKCS#12 parent symlink fixture');
+  try
+    ErrorMessage := CaptureContextError(LinkDirectory + '/' +
+      ExtractFileName(PKCS12_PATH), PKCS12_PASSPHRASE);
+    Expect<Boolean>(Pos('without following links', ErrorMessage) > 0).ToBe(True);
+    Expect<Boolean>(Pos(LinkDirectory, ErrorMessage) = 0).ToBe(True);
+  finally
+    SysUtils.DeleteFile(LinkDirectory);
+  end;
+
+  FifoPath := SCRATCH_DIRECTORY + '/identity-fifo.p12';
+  SysUtils.DeleteFile(FifoPath);
+  if fpMkFifo(PChar(FifoPath), &600) <> 0 then
+    raise Exception.Create('Failed to create PKCS#12 FIFO fixture');
+  try
+    ErrorMessage := CaptureContextError(FifoPath, PKCS12_PASSPHRASE);
+    Expect<Boolean>(Pos('must be a regular file', ErrorMessage) > 0).ToBe(True);
+    Expect<Boolean>(Pos(FifoPath, ErrorMessage) = 0).ToBe(True);
+  finally
+    SysUtils.DeleteFile(FifoPath);
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  ForceDirectories(SCRATCH_DIRECTORY);
+  LinkDirectory := SCRATCH_DIRECTORY + '/identity-parent-junction';
+  LinkTarget := ExtractFileDir(ExpandFileName(PKCS12_PATH));
+  RemoveWindowsJunctionIfPresent(LinkDirectory);
+  if not TryCreateWindowsJunction(LinkDirectory, LinkTarget) then
+    raise Exception.Create(
+      'PKCS#12 parent junction creation failed after a successful preflight');
+  RemovalSucceeded := False;
+  try
+    ErrorMessage := CaptureContextError(LinkDirectory + '/' +
+      ExtractFileName(PKCS12_PATH), PKCS12_PASSPHRASE);
+    Expect<Boolean>(Pos('without following reparse points',
+      ErrorMessage) > 0).ToBe(True);
+    Expect<Boolean>(Pos(LinkDirectory, ErrorMessage) = 0).ToBe(True);
+  finally
+    RemovalSucceeded := Windows.RemoveDirectoryW(
+      PWideChar(UnicodeString(LinkDirectory)));
+  end;
+  if not RemovalSucceeded then
+    raise Exception.Create('Failed to remove PKCS#12 parent junction fixture');
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestStrictIdentityAllowsLeafWithoutBasicConstraints;
+{$IFNDEF DARWIN}
+var
+  Context: TTransportSecurityServerContext;
+{$ENDIF}
+begin
+  {$IFNDEF DARWIN}
+  Context := nil;
+  try
+    Context := TTransportSecurityServerContext.Create(
+      LEAF_NO_BASIC_CONSTRAINTS_PKCS12_PATH, PKCS12_PASSPHRASE);
+    Expect<Boolean>(Assigned(Context)).ToBe(True);
+  finally
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.TestStrictIdentityValidation;
+{$IFNDEF DARWIN}
+var
+  Context: TTransportSecurityServerContext;
+  ErrorMessage: string;
+{$ENDIF}
+begin
+  {$IFNDEF DARWIN}
+  ErrorMessage := CaptureContextError(FUTURE_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('validity window', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected future-certificate error: ' +
+      ErrorMessage);
+
+  ErrorMessage := CaptureContextError(WRONG_PURPOSE_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('server authentication', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected wrong-purpose error: ' + ErrorMessage);
+
+  ErrorMessage := CaptureContextError(INCOHERENT_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('structurally or cryptographically incoherent', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected incoherent-chain error: ' + ErrorMessage);
+
+  ErrorMessage := CaptureContextError(CYCLIC_CHAIN_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('certificate cycle', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected cyclic-chain error: ' + ErrorMessage);
+
+  ErrorMessage := CaptureContextError(LEAF_CA_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('leaf certificate must assert CA:FALSE', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected leaf-basic-constraints error: ' +
+      ErrorMessage);
+
+  ErrorMessage := CaptureContextError(NON_CA_ISSUER_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('chain certificate 1 must assert CA:TRUE', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected issuer-basic-constraints error: ' +
+      ErrorMessage);
+
+  ErrorMessage := CaptureContextError(NO_CERTSIGN_ISSUER_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('key usage must permit certificate signing', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected issuer-key-usage error: ' +
+      ErrorMessage);
+
+  ErrorMessage := CaptureContextError(PATH_LENGTH_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('path-length constraint', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected issuer-path-length error: ' +
+      ErrorMessage);
+
+  ErrorMessage := CaptureContextError(SELF_SIGNED_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('permissive validation', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected self-signed error: ' + ErrorMessage);
+
+  Context := TTransportSecurityServerContext.Create(SELF_SIGNED_PKCS12_PATH,
+    PKCS12_PASSPHRASE, tsivPermissive);
+  try
+    Expect<Boolean>(Assigned(Context)).ToBe(True);
+  finally
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestReloadRetainsSnapshotsAndFailedReloadKeepsActive;
+{$IFNDEF DARWIN}
+var
+  Client: TRawOpenSSLClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  ErrorMessage: string;
+  I: Integer;
+  Identity: TBytes;
+  Observed: THandshakeObservations;
+  SecondClient: TRawOpenSSLClient;
+  SecondConnection: TTransportSecurityConnection;
+  SecondObserved: THandshakeObservations;
+  Worker: TBeginAbortWorker;
+  WorkerError: string;
+  WorkerOperations: LongInt;
+  WorkerOperationsBeforeReload: LongInt;
+  WorkerStarted: Boolean;
+{$ENDIF}
+begin
+  {$IFNDEF DARWIN}
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  FillChar(SecondConnection, SizeOf(SecondConnection), 0);
+  FillChar(SecondClient, SizeOf(SecondClient), 0);
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    Identity := LoadFixtureBytes(PKCS12_PATH);
+    Context.Reload(Identity, PKCS12_PASSPHRASE);
+    FillChar(Identity[0], Length(Identity), 0);
+
+    ErrorMessage := '';
+    try
+      Context.Reload(FUTURE_PKCS12_PATH, PKCS12_PASSPHRASE);
+    except
+      on E: ETransportSecurityError do
+        ErrorMessage := E.Message;
+    end;
+    Expect<Boolean>(Pos('validity window', ErrorMessage) > 0).ToBe(True);
+
+    CreateHandshakenPair(Context, SecondConnection, SecondClient,
+      SecondObserved);
+    Expect<Boolean>(SecondConnection.Active).ToBe(True);
+
+    Worker := TBeginAbortWorker.Create(Context);
+    WorkerStarted := False;
+    WorkerError := '';
+    WorkerOperations := 0;
+    try
+      Worker.Start;
+      WorkerStarted := True;
+      if not Worker.WaitUntilStarted(5000) then
+        raise Exception.Create(
+          'Concurrent TLS begin/abort worker did not start in time');
+      if not Worker.WaitForOperations(1, 5000) then
+        raise Exception.Create(
+          'Concurrent TLS begin/abort worker made no progress');
+      WorkerOperationsBeforeReload := Worker.Operations;
+      Identity := LoadFixtureBytes(PKCS12_PATH);
+      try
+        for I := 1 to 64 do
+          Context.Reload(Identity, PKCS12_PASSPHRASE);
+      finally
+        FillChar(Identity[0], Length(Identity), 0);
+      end;
+    finally
+      Worker.RequestStop;
+      if WorkerStarted then
+        Worker.WaitFor;
+      WorkerError := Worker.ErrorMessage;
+      WorkerOperations := Worker.Operations;
+      Worker.Free;
+    end;
+    if WorkerError <> '' then
+      raise Exception.Create('Concurrent TLS begin/abort failed: ' +
+        WorkerError);
+    Expect<Boolean>(WorkerOperations > WorkerOperationsBeforeReload).ToBe(True);
+
+    CloseTransportSecurityServerContext(Context);
+
+    CreateRawClient(Client);
+    DriveHandshake(Connection, Client, Observed);
+    Expect<Boolean>(Connection.Active).ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawClient(Client);
+    AbortTransportSecurityServer(SecondConnection);
+    FreeRawClient(SecondClient);
+    CloseTransportSecurityServerContext(Context);
+  end;
   {$ENDIF}
 end;
 
@@ -1605,6 +2147,18 @@ begin
     TestPKCS12LoadFailures, DARWIN_SKIP_REASON);
   Skip('PKCS#12 identities above 16 MiB fail without disclosure',
     TestPKCS12SizeLimit, DARWIN_SKIP_REASON);
+  Skip('caller PKCS#12 bytes are copied before synchronous parsing',
+    TestPKCS12BytesArePrimaryInput, DARWIN_SKIP_REASON);
+  Skip('PKCS#12 path loading refuses links in every component',
+    TestPKCS12PathRefusesSymbolicLink, DARWIN_SKIP_REASON);
+  Skip('strict identity policy rejects invalid production certificates',
+    TestStrictIdentityValidation, DARWIN_SKIP_REASON);
+  Skip('strict identity allows a leaf without basic constraints',
+    TestStrictIdentityAllowsLeafWithoutBasicConstraints,
+    DARWIN_SKIP_REASON);
+  Skip('identity reload retains immutable connection snapshots',
+    TestReloadRetainsSnapshotsAndFailedReloadKeepsActive,
+    DARWIN_SKIP_REASON);
   Skip('memory-BIO handshake exposes want states and reuses context',
     TestHandshakeTransitionsAndContextReuse, DARWIN_SKIP_REASON);
   Skip('plaintext roundtrip retains partial ciphertext',
@@ -1654,6 +2208,29 @@ begin
     TestPKCS12LoadFailures);
   ServerTest('PKCS#12 identities above 16 MiB fail without disclosure',
     TestPKCS12SizeLimit);
+  ServerTest('caller PKCS#12 bytes are copied before synchronous parsing',
+    TestPKCS12BytesArePrimaryInput);
+  {$IFDEF MSWINDOWS}
+  if not FServerBackendAvailable then
+    ServerTest('PKCS#12 path loading refuses links in every component',
+      TestPKCS12PathRefusesSymbolicLink)
+  else if WindowsJunctionTestAvailable then
+    Test('PKCS#12 path loading refuses links in every component',
+      TestPKCS12PathRefusesSymbolicLink)
+  else
+    Skip('PKCS#12 path loading refuses links in every component',
+      TestPKCS12PathRefusesSymbolicLink,
+      'Windows junction creation is unavailable under host policy');
+  {$ELSE}
+  ServerTest('PKCS#12 path loading refuses links in every component',
+    TestPKCS12PathRefusesSymbolicLink);
+  {$ENDIF}
+  ServerTest('strict identity policy rejects invalid production certificates',
+    TestStrictIdentityValidation);
+  ServerTest('strict identity allows a leaf without basic constraints',
+    TestStrictIdentityAllowsLeafWithoutBasicConstraints);
+  ServerTest('identity reload retains immutable connection snapshots',
+    TestReloadRetainsSnapshotsAndFailedReloadKeepsActive);
   ServerTest('memory-BIO handshake exposes want states and reuses context',
     TestHandshakeTransitionsAndContextReuse);
   ServerTest('plaintext roundtrip retains partial ciphertext',
