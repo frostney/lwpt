@@ -68,9 +68,9 @@ type
     procedure TestFactoryIdentityMismatchIsFreedAndRejected;
     procedure TestFactoryVersionMismatchIsRejected;
     procedure TestFactoryDriverIsFreedExactlyOnce;
+    procedure TestFactoriesCannotShadowBuiltInDrivers;
     procedure TestBlaiseProfileSelectsBuiltInDriver;
     procedure TestBlaiseBuiltInRejectsScripts;
-    procedure TestFactoryCannotShadowBlaise;
   end;
 
 constructor TFactoryDriver.Create(const AOwner: TFactoryOwner;
@@ -324,6 +324,34 @@ begin
   end;
 end;
 
+procedure TLWPTCompilerRegistryTests.TestFactoriesCannotShadowBuiltInDrivers;
+var
+  Host: TLWPTCompilerHost;
+
+  procedure ExpectRejected(const ADriverID: string);
+  var
+    Raised: Boolean;
+  begin
+    Raised := False;
+    try
+      Host.RegisterFactory(ADriverID, FFactoryOwner.CreateDriver);
+    except
+      on ELWPTCompilerDriverError do Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+  end;
+
+begin
+  Host := TLWPTCompilerHost.Create;
+  try
+    ExpectRejected('fpc');
+    ExpectRejected('DELPHI');
+    ExpectRejected(BLAISE_COMPILER_ID);
+  finally
+    Host.Free;
+  end;
+end;
+
 procedure TLWPTCompilerRegistryTests.TestBlaiseProfileSelectsBuiltInDriver;
 var
   Driver: TLWPTCompilerDriver;
@@ -379,26 +407,6 @@ begin
     Expect<Boolean>(Raised).ToBe(True);
   finally
     Selection.Free;
-  end;
-end;
-
-procedure TLWPTCompilerRegistryTests.TestFactoryCannotShadowBlaise;
-var
-  Host: TLWPTCompilerHost;
-  Raised: Boolean;
-begin
-  Host := TLWPTCompilerHost.Create;
-  try
-    Raised := False;
-    try
-      Host.RegisterFactory(BLAISE_COMPILER_ID, FFactoryOwner.CreateDriver);
-    except
-      on E: ELWPTCompilerDriverError do
-        Raised := Pos('cannot shadow built-in "blaise"', E.Message) > 0;
-    end;
-    Expect<Boolean>(Raised).ToBe(True);
-  finally
-    Host.Free;
   end;
 end;
 
@@ -465,12 +473,12 @@ begin
     TestFactoryVersionMismatchIsRejected);
   Test('selection frees a factory driver exactly once',
     TestFactoryDriverIsFreedExactlyOnce);
+  Test('embedding factories cannot shadow built-in drivers',
+    TestFactoriesCannotShadowBuiltInDrivers);
   Test('Blaise profiles select the built-in driver and executable',
     TestBlaiseProfileSelectsBuiltInDriver);
   Test('Blaise built-in profiles reject external scripts',
     TestBlaiseBuiltInRejectsScripts);
-  Test('embedding factories cannot shadow built-in Blaise',
-    TestFactoryCannotShadowBlaise);
 end;
 
 begin
