@@ -28,6 +28,7 @@ uses
   LWPT.Analysis.Pascal,
   LWPT.Analysis.Scope,
   LWPT.Manifest,
+  LWPT.OutputRenderer,
   LWPT.ProcessRunner;
 
 const
@@ -485,8 +486,8 @@ begin
   if BuildHealthReport(AManifestPath, AIncludeHotspots, HumanReport,
     JSONReport, Files, Violations) then Result := 0
   else Result := 1;
-  if AJSON then Write(JSONReport)
-  else Write(HumanReport);
+  if AJSON then WriteCommandResult(JSONReport)
+  else WriteCommandResult(HumanReport);
 end;
 
 end.

@@ -17,15 +17,6 @@ const
   BUILD_SESSION_SCHEMA_VERSION = 1;
   BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION = 1;
   BUILD_SESSIONS_DIR = LWPT_DIR + '/sessions';
-  ObservabilityHeartbeatIntervalEnvironment = PROJECT_NAME
-    + '_HEARTBEAT_INTERVAL_MS';
-  ObservabilityStartEvent = 'START ';
-  ObservabilityHeartbeatEvent = 'HEARTBEAT ';
-  ObservabilityPassEvent = 'PASS ';
-  ObservabilityFailEvent = 'FAIL ';
-  ObservabilitySkipEvent = 'SKIP ';
-  ObservabilityBuildIdentityNamespace = 'build:';
-  ObservabilityTestIdentityNamespace = 'test:';
   ObservabilityLogsDirectory = '/logs/';
   ObservabilityLogExtension = '.log';
   { FPC's RTL FileRec/TextRec name buffer holds this many characters. The
@@ -79,8 +70,6 @@ function CaptureBuildPublicationFingerprint(
   AModulesPath: string;
   const ARequest: TLWPTBuildPublicationRequest): string;
 function BuildSessionPathKey(const AValue: string): string;
-function ObservabilityHeartbeatIntervalMilliseconds: QWord;
-function FormatElapsedMilliseconds(const AElapsed: QWord): string;
 procedure AppendUnitDirsFromOptions(const AOptions: TStrings;
   var ADirs: TStringArray);
 procedure AppendUnitDirsFromCfg(const ACfgPath: string;
@@ -111,7 +100,6 @@ uses
   DateUtils;
 
 const
-  DefaultObservabilityHeartbeatIntervalMilliseconds = 30000;
   PUBLICATION_LOCK_WAIT_MILLISECONDS = 30000;
   SESSION_PARTIAL_GRACE_MILLISECONDS = 5000;
   {$IFDEF UNIX}
@@ -210,27 +198,6 @@ begin
   if Length(BaseName) > 16 then SetLength(BaseName, 16);
   Digest := TextHash(AValue);
   Result := BaseName + '-' + Copy(Digest, 8, 12);
-end;
-
-function ObservabilityHeartbeatIntervalMilliseconds: QWord;
-var
-  Raw: string;
-  Parsed: Int64;
-begin
-  Raw := SysUtils.GetEnvironmentVariable(ObservabilityHeartbeatIntervalEnvironment);
-  if (Raw <> '') and TryStrToInt64(Raw, Parsed) and (Parsed > 0) then
-  begin
-    Result := QWord(Parsed);
-    if Result > DefaultObservabilityHeartbeatIntervalMilliseconds then
-      Result := DefaultObservabilityHeartbeatIntervalMilliseconds;
-    Exit;
-  end;
-  Result := DefaultObservabilityHeartbeatIntervalMilliseconds;
-end;
-
-function FormatElapsedMilliseconds(const AElapsed: QWord): string;
-begin
-  Result := UIntToStr(AElapsed) + ' ms';
 end;
 
 { Single home for "which directories does this compile search for unit

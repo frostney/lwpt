@@ -48,7 +48,16 @@ implementation
 
 uses
   LWPT.BuildSession,
-  LWPT.CompilerDriver.FPC;
+  LWPT.CompilerDriver.FPC,
+  LWPT.OutputRenderer,
+  LWPT.ProcessRunner;
+
+procedure CaptureSilentProcessChunk(const AData: RawByteString;
+  const AStandardError: Boolean);
+begin
+  if AStandardError then CaptureSilentChildOutput('', AData)
+  else CaptureSilentChildOutput(AData, '');
+end;
 
 function NormalisedExitCode(const AProcess: TProcess): Integer;
 begin
@@ -229,6 +238,10 @@ var
   InheritedEnvironment: TStringList;
   i, j, SeparatorAt: Integer;
   Existing, ExistingName, ExtraName: string;
+  CapturedError, CapturedOutput: string;
+  ChildFailed: Boolean;
+  ProcessOptions: TLWPTProcessRunOptions;
+  ProcessRunner: TLWPTDuplexProcessRunner;
   {$IFDEF UNIX}
   CacheRoot: string;
   {$ENDIF}
@@ -305,9 +318,35 @@ begin
     {$ENDIF}
     for j := 0 to High(AHook.Args) do
       P.Parameters.Add(AHook.Args[j]);
-    P.Options := [poWaitOnExit];
     try
-      P.Execute;
+      if SilentOutputActive then
+      begin
+        ProcessRunner := TLWPTDuplexProcessRunner.Create(P);
+        try
+          ProcessOptions := DefaultProcessRunOptions(
+            'script "' + AHook.Name + '"');
+          ProcessOptions.SeparateStandardError := True;
+          ProcessOptions.DiscardCapturedOutput := True;
+          ProcessOptions.OnOutputChunk := @CaptureSilentProcessChunk;
+          BeginSilentChildOperation;
+          ChildFailed := True;
+          try
+            Result := ProcessRunner.Run('', ProcessOptions, CapturedOutput,
+              CapturedError);
+            ChildFailed := Result <> 0;
+          finally
+            FinishSilentChildOperation(ChildFailed);
+          end;
+        finally
+          ProcessRunner.Free;
+        end;
+      end
+      else
+      begin
+        P.Options := [poWaitOnExit];
+        P.Execute;
+        Result := P.ExitStatus;
+      end;
     except
       on E: Exception do
       begin
@@ -319,7 +358,6 @@ begin
         Exit(127);
       end;
     end;
-    Result := P.ExitStatus;
   finally
     P.Free;
   end;

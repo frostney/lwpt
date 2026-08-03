@@ -23,6 +23,7 @@ uses
 
   LWPT.BuildSession,
   LWPT.Core,
+  LWPT.ProgressReporter,
   LWPT.WorkerBudget;
 
 const
@@ -656,6 +657,10 @@ begin
   Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
   CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
   Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+  { AbortWithError must assign the documented internal failure outcome before
+    the reporter accepts the typed terminal event. }
+  Expect<Boolean>(Pos('FAIL tests/B.Error.Test.pas (scheduler error;',
+    SlashNorm(CommandResult.Stdout)) > 0).ToBe(True);
   Expect<Boolean>(Pos('B.Error.Test.pas ... ERROR', CommandResult.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('scheduler error:', CommandResult.Stderr) > 0)

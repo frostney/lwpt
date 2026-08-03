@@ -29,7 +29,9 @@ uses
   LWPT.CompilerDriver,
   LWPT.Core,
   LWPT.Manifest,
+  LWPT.Observability,
   LWPT.ProcessRunner,
+  LWPT.ProgressReporter,
   LWPT.WorkerBudget;
 
 type
@@ -90,6 +92,7 @@ type
     FCompilerDriver: TLWPTCompilerDriver;
     FProjectRoot: string;
     FVerbose: Boolean;
+    FReporter: TLWPTProgressReporter;
     FStartedReported: array of Boolean;
     FTerminalReported: array of Boolean;
     function ClaimJob(out AIndex: Integer): Boolean;
@@ -120,7 +123,6 @@ type
       const ALease: TLWPTWorkerLease);
     function AllJobsTerminal: Boolean;
     function NextProgressEvent(out AEvent: TTestProgressEvent): Boolean;
-    function ActiveJobSummary(const ANow: QWord): string;
     procedure PrintProgressEvent(const AEvent: TTestProgressEvent);
   public
     constructor Create(const ATests: TStringList;
@@ -184,6 +186,9 @@ begin
   AppendProcessEnvironment(AEnvironment);
 end;
 
+function TestDisplayPath(const AProjectRoot, ASource: string): string;
+  forward;
+
 constructor TTestWorker.Create(const AScheduler: TTestScheduler);
 begin
   FScheduler := AScheduler;
@@ -235,6 +240,7 @@ begin
   FSession := ASession;
   FProjectRoot := AProjectRoot;
   FVerbose := AVerbose;
+  FReporter := TLWPTProgressReporter.Create(ASession, lpsTest);
   FBail := ABail;
   FNextIndex := 0;
   FFailureCount := 0;
@@ -248,6 +254,8 @@ begin
   for i := 0 to ATests.Count - 1 do
   begin
     FJobs[i].Source := ATests[i];
+    FReporter.RegisterJob(ObservabilityTestIdentityNamespace + ATests[i],
+      TestDisplayPath(AProjectRoot, ATests[i]));
     if (not AIncludeE2E) and IsE2ETestPath(ATests[i]) then
       FJobs[i].Status := tjsSkipped
     else
@@ -270,6 +278,7 @@ destructor TTestScheduler.Destroy;
 var
   i: Integer;
 begin
+  FReporter.Free;
   for i := 0 to FWorkers.Count - 1 do TTestWorker(FWorkers[i]).Free;
   FWorkers.Free;
   FBudgetSession.Free;
@@ -436,6 +445,7 @@ begin
         on E: Exception do
         begin
           FJobs[i].Status := tjsWorkerError;
+          FJobs[i].ExitCode := ObservabilityInternalErrorExitCode;
           FJobs[i].ErrorMessage := 'process-tree termination failed: '
             + E.Message;
           if FInternalError = '' then
@@ -452,7 +462,11 @@ begin
   EnterCriticalSection(FCriticalSection);
   try
     FJobs[AIndex].Status := AStatus;
-    FJobs[AIndex].ExitCode := AExitCode;
+    { A compiler driver can report a semantic failure after its process exits
+      successfully, for example when the requested artifact is missing. Failed
+      observability events require a nonzero code, so reserve the internal
+      error code for that zero-exit failure while preserving real child exits. }
+    FJobs[AIndex].ExitCode := NormalizeFailureExitCode(AExitCode);
     FJobs[AIndex].ErrorMessage := AMessage;
     Inc(FFailureCount);
     if (FBail > 0) and (FFailureCount >= FBail) then
@@ -470,6 +484,7 @@ begin
     if (AIndex >= 0) and (AIndex <= High(FJobs)) then
     begin
       FJobs[AIndex].Status := tjsWorkerError;
+      FJobs[AIndex].ExitCode := ObservabilityInternalErrorExitCode;
       FJobs[AIndex].ErrorMessage := AMessage;
     end;
     if FInternalError = '' then FInternalError := AMessage;
@@ -573,13 +588,6 @@ begin
     FailJob(AIndex, tjsRunFailed, Code);
 end;
 
-procedure WriteCapturedOutput(const AOutput: string);
-begin
-  if AOutput = '' then Exit;
-  Write(AOutput);
-  if not (AOutput[Length(AOutput)] in [#10, #13]) then WriteLn;
-end;
-
 function TestDisplayPath(const AProjectRoot, ASource: string): string;
 begin
   Result := ExtractRelativePath(
@@ -646,89 +654,89 @@ begin
   end;
 end;
 
-function TTestScheduler.ActiveJobSummary(const ANow: QWord): string;
-var
-  i: Integer;
-  DisplayPath: string;
-begin
-  Result := '';
-  EnterCriticalSection(FCriticalSection);
-  try
-    for i := 0 to High(FJobs) do
-      if FJobs[i].Status in [tjsPending, tjsCompiling, tjsRunning] then
-      begin
-        DisplayPath := TestDisplayPath(FProjectRoot, FJobs[i].Source);
-        if Result <> '' then Result := Result + ', ';
-        Result := Result + DisplayPath;
-        if FJobs[i].StartedAt = 0 then
-          Result := Result + ' (queued)'
-        else
-          Result := Result + ' ('
-            + FormatElapsedMilliseconds(ANow - FJobs[i].StartedAt) + ')';
-      end;
-  finally
-    LeaveCriticalSection(FCriticalSection);
-  end;
-end;
-
 procedure TTestScheduler.PrintProgressEvent(
   const AEvent: TTestProgressEvent);
 var
-  DisplayPath, LogOutput, LogReference, Elapsed: string;
+  Detail, LogOutput, LogReference: string;
+  JobEvent: TLWPTJobEvent;
+  JobState: TLWPTJobState;
 begin
-  DisplayPath := TestDisplayPath(FProjectRoot, AEvent.Source);
   LogReference := FSession.JobLogReference(
     ObservabilityTestIdentityNamespace + AEvent.Source);
   if AEvent.Kind = tpkStart then
   begin
-    FSession.WriteJobLog(ObservabilityTestIdentityNamespace + AEvent.Source,
-      '');
-    WriteLn(ObservabilityStartEvent, DisplayPath, ' (log: ', LogReference,
-      ')');
+    JobEvent := TLWPTJobEvent.Create(
+      ObservabilityTestIdentityNamespace + AEvent.Source,
+      FSession.SessionID, ojsStarted, 0, 0, '', LogReference);
+    try
+      FReporter.ReportJob(JobEvent, '', '', FVerbose, AEvent.StartedAt);
+    finally
+      JobEvent.Free;
+    end;
     Exit;
   end;
   if AEvent.Status = tjsSkipped then
   begin
-    WriteLn(ObservabilitySkipEvent, DisplayPath, ' (e2e tier)');
+    JobEvent := TLWPTJobEvent.Create(
+      ObservabilityTestIdentityNamespace + AEvent.Source,
+      FSession.SessionID, ojsSkipped, 0, 0, 'e2e tier', '');
+    try
+      FReporter.ReportJob(JobEvent, '', '', FVerbose);
+    finally
+      JobEvent.Free;
+    end;
     Exit;
   end;
   if (AEvent.Status = tjsCancelled) and (AEvent.StartedAt = 0) then
   begin
-    WriteLn(ObservabilitySkipEvent, DisplayPath,
-      ' (bail threshold reached before start)');
+    JobEvent := TLWPTJobEvent.Create(
+      ObservabilityTestIdentityNamespace + AEvent.Source,
+      FSession.SessionID, ojsSkipped, 0, 0,
+      'bail threshold reached before start', '');
+    try
+      FReporter.ReportJob(JobEvent, '', '', FVerbose);
+    finally
+      JobEvent.Free;
+    end;
     Exit;
   end;
   LogOutput := AEvent.CompileOutput + AEvent.RunOutput;
-  if (LogOutput = '') and (AEvent.ErrorMessage <> '') then
-    LogOutput := AEvent.ErrorMessage + LineEnding;
-  FSession.WriteJobLog(ObservabilityTestIdentityNamespace + AEvent.Source,
-    LogOutput);
-  Elapsed := FormatElapsedMilliseconds(
-    GetTickCount64 - AEvent.StartedAt);
   case AEvent.Status of
     tjsPassed:
-      WriteLn(ObservabilityPassEvent, DisplayPath, ' (', Elapsed, '; log: ',
-        LogReference, ')');
+      begin
+        JobState := ojsPassed;
+        Detail := '';
+      end;
     tjsCompileFailed:
-      WriteLn(ObservabilityFailEvent, DisplayPath, ' (compile exit ',
-        AEvent.ExitCode, '; ', Elapsed, '; log: ', LogReference, ')');
+      begin
+        JobState := ojsFailed;
+        Detail := 'compile exit ' + IntToStr(AEvent.ExitCode);
+      end;
     tjsRunFailed:
-      WriteLn(ObservabilityFailEvent, DisplayPath, ' (exit ',
-        AEvent.ExitCode, '; ',
-        Elapsed, '; log: ', LogReference, ')');
+      begin
+        JobState := ojsFailed;
+        Detail := 'exit ' + IntToStr(AEvent.ExitCode);
+      end;
     tjsCancelled:
-      WriteLn(ObservabilitySkipEvent, DisplayPath,
-        ' (bail threshold reached; ', Elapsed, '; log: ', LogReference, ')');
+      begin
+        JobState := ojsSkipped;
+        Detail := 'bail threshold reached';
+      end;
     tjsWorkerError:
-      WriteLn(ObservabilityFailEvent, DisplayPath, ' (scheduler error; ',
-        Elapsed, '; log: ', LogReference, ')');
+      begin
+        JobState := ojsFailed;
+        Detail := 'scheduler error';
+      end;
   end;
-  if (AEvent.Status in [tjsCompileFailed, tjsRunFailed, tjsWorkerError])
-     or (FVerbose and (AEvent.Status = tjsPassed)) then
-    WriteCapturedOutput(LogOutput);
-  if (AEvent.ErrorMessage <> '')
-     and (Pos(AEvent.ErrorMessage, LogOutput) = 0) then
-    WriteLn('  error: ', AEvent.ErrorMessage);
+  JobEvent := TLWPTJobEvent.Create(
+    ObservabilityTestIdentityNamespace + AEvent.Source,
+    FSession.SessionID, JobState, GetTickCount64 - AEvent.StartedAt,
+    AEvent.ExitCode, Detail, LogReference);
+  try
+    FReporter.ReportJob(JobEvent, LogOutput, AEvent.ErrorMessage, FVerbose);
+  finally
+    JobEvent.Free;
+  end;
 end;
 
 function TTestScheduler.EffectiveWorkerCount: Integer;
@@ -740,25 +748,26 @@ procedure TTestScheduler.Run;
 var
   i: Integer;
   Event: TTestProgressEvent;
-  InvocationStartedAt, LastHeartbeatAt, NowTick, HeartbeatInterval: QWord;
-  ActiveSummary: string;
+  InvocationStartedAt, NowTick: QWord;
+  HeartbeatEvent: TLWPTHeartbeatEvent;
 begin
   InvocationStartedAt := GetTickCount64;
-  LastHeartbeatAt := InvocationStartedAt;
-  HeartbeatInterval := ObservabilityHeartbeatIntervalMilliseconds;
+  FReporter.StartHeartbeatClock(InvocationStartedAt, InvocationStartedAt);
   for i := 0 to FWorkers.Count - 1 do TTestWorker(FWorkers[i]).Start;
   try
     repeat
       while NextProgressEvent(Event) do PrintProgressEvent(Event);
       if AllJobsTerminal then Break;
       NowTick := GetTickCount64;
-      if NowTick - LastHeartbeatAt >= HeartbeatInterval then
+      if FReporter.HeartbeatDue(NowTick) then
       begin
-        ActiveSummary := ActiveJobSummary(NowTick);
-        WriteLn(ObservabilityHeartbeatEvent, 'test elapsed ',
-          FormatElapsedMilliseconds(NowTick - InvocationStartedAt),
-          '; active: ', ActiveSummary);
-        LastHeartbeatAt := NowTick;
+        HeartbeatEvent := TLWPTHeartbeatEvent.Create('test',
+          FSession.SessionID, NowTick - InvocationStartedAt);
+        try
+          FReporter.ReportHeartbeat(HeartbeatEvent);
+        finally
+          HeartbeatEvent.Free;
+        end;
       end;
       Sleep(10);
     until False;
