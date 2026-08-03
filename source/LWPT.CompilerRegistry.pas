@@ -68,8 +68,10 @@ uses
 
   LWPT.BuildRequest,
   LWPT.CompilerDriver.Blaise,
+  LWPT.CompilerDriver.Delphi,
   LWPT.CompilerDriver.External,
   LWPT.CompilerDriver.FPC,
+  LWPT.CompilerDriver.Lakon,
   LWPT.Core,
   Semver;
 
@@ -261,7 +263,8 @@ begin
     raise ELWPTCompilerDriverError.CreateFmt(
       'embedding compiler factory "%s" is not assigned', [ADriverID]);
   if SameText(ADriverID, FPC_COMPILER_ID)
-     or SameText(ADriverID, BLAISE_COMPILER_ID) then
+     or SameText(ADriverID, BLAISE_COMPILER_ID)
+     or SameText(ADriverID, DELPHI_COMPILER_ID) then
     raise ELWPTCompilerDriverError.Create(
       'embedding compiler factories cannot shadow built-in "'
       + LowerCase(ADriverID) + '"');
@@ -362,6 +365,16 @@ begin
       AProfile.VersionConstraint));
   end;
 
+  if SameText(AProfile.Driver, DELPHI_COMPILER_ID) then
+  begin
+    if ScriptPath <> '' then
+      raise ELWPTCompilerDriverError.CreateFmt(
+        'compiler profile "%s" cannot use script with built-in "delphi"',
+        [AProfile.Name]);
+    Exit(TLWPTDelphiCompilerDriver.Create(ExecutablePath,
+      AProfile.VersionConstraint));
+  end;
+
   if SameText(AProfile.Driver, BLAISE_COMPILER_ID) then
   begin
     if ScriptPath <> '' then
@@ -393,6 +406,16 @@ begin
     finally
       FactoryDriver.Free;
     end;
+  end;
+
+  if SameText(AProfile.Driver, LAKON_COMPILER_ID) then
+  begin
+    if ScriptPath <> '' then
+      raise ELWPTCompilerDriverError.CreateFmt(
+        'compiler profile "%s" cannot use script with built-in "%s"',
+        [AProfile.Name, LAKON_COMPILER_ID]);
+    Exit(TLWPTLakonCompilerDriver.Create(ExecutablePath,
+      AProfile.VersionConstraint));
   end;
 
   if (ExecutablePath = '') and (ScriptPath = '') then
