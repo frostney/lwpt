@@ -7,13 +7,13 @@
   pipe. A dedicated thread reaps every registered child group before
   re-delivering the signal, using an accelerated path when an ancestor
   forwarded the signal.
-- **Windows scheduler cancellation uses nested Job Object termination.** Bail
-  and worker-error paths terminate registered jobs, but console-control
-  forwarding for Ctrl-C and Ctrl-Break is deferred as a tracked follow-up.
+- **Windows cancellation combines console-control forwarding with nested Job
+  Object termination.** A minimal Ctrl-C/Ctrl-Break callback wakes a dedicated
+  thread, which terminates registered jobs before the LWPT process exits.
 - **Cancellation completes only after the isolated tree is empty.** A
   successful SIGKILL or `TerminateJobObject` call is followed by a bounded
-  membership poll; real API failures become scheduler failures after a
-  best-effort direct-child fallback.
+  membership poll and, on Windows, a direct process-exit barrier. Real API
+  failures become scheduler failures after a best-effort direct-child fallback.
 
 LWPT schedulers isolate each direct compiler or test process so cancellation
 can terminate that process and the descendants it launches. A nested LWPT
@@ -83,17 +83,21 @@ the inner job. Windows 8 or later is therefore the minimum supported runtime
 for this ownership model. A typed Windows state object owns the Job Object
 handle and its assign, query, terminate, wait, and cleanup operations;
 `TLWPTProcessTree` retains only orchestration and direct-child fallback.
-Cancellation explicitly calls `TerminateJobObject` and polls
-`JobObjectBasicAccountingInformation.ActiveProcesses` until zero.
+Cancellation explicitly calls `TerminateJobObject`, polls
+`JobObjectBasicAccountingInformation.ActiveProcesses` until zero, and waits
+for the direct child's process handle to become signaled under the same
+deadline. The accounting value is membership evidence, not a process-exit
+completion barrier; returning before the handle is signaled can expose
+`STILL_ACTIVE` and retained child file handles to the caller.
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is not used: closing an ownership handle
 after successful execution must not introduce cancellation semantics.
 
-Windows console-control forwarding is deferred as a tracked follow-up to this
-decision. Ctrl-C and Ctrl-Break are not yet wired into the process-tree
-registry. Numeric bail and worker-error cancellation still terminate each
-owned Job Object, including the jobs and processes created by nested LWPT
-invocations. Unix SIGINT and SIGTERM forwarding remain implemented as
-described above.
+Windows installs a `SetConsoleCtrlHandler` callback on the same build/test
+dispatch paths. Because Windows invokes the callback on an operating-system
+thread, the callback only signals a Win32 event and returns handled. An
+FPC-created forwarding thread performs registry traversal, Job Object
+termination, reporting, and process exit. Both Ctrl-C and Ctrl-Break take this
+path. The callback has no pipe, registry, allocation, or Job Object work.
 
 Only an already-empty group or job is a successful no-op. Permission errors,
 unexpected membership-query errors, termination API failures, and bounded
@@ -107,9 +111,9 @@ instead of disguising the error as successful cleanup.
 
 ## Consequences
 
-- Unix SIGINT or SIGTERM, numeric test bail, worker failure, and ancestor
-  cancellation all follow the same child-tree ownership contract. Windows
-  Ctrl-C and Ctrl-Break forwarding remain deferred.
+- A terminal Ctrl-C or Ctrl-Break, Unix SIGINT or SIGTERM, numeric test bail,
+  worker failure, and ancestor cancellation all follow the same child-tree
+  ownership contract.
 - On Unix, a top-level signal permits one grace interval for nested LWPT to
   forward it; marked inner levels collapse their owned groups immediately and
   finish before that outer grace expires.

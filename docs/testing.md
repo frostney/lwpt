@@ -238,7 +238,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`tests/integration/BuildSessions.Test.pas`** | 13 tests in 1 suite | Uses the test executable as a controllable FPC proxy to cover concurrent sessions, stale publication, parallel ready entries, prerequisite publication ordering, `--jobs=1`, failure isolation, deterministic manifest-order results on Unix and Windows, heartbeat observability including shared wait cadence, state-correct skipped-build diagnostics, and the fail-closed lost-proxy dispatch guard (redacted environment dump, exit 126). |
 | **`tests/integration/Agents.Test.pas`** | 14 tests in 1 suite | Covers the `lwpt agents` command-reference generator: section synthesis from the live subcommand registry, `--check` drift detection, marker preservation, and idempotent regeneration. |
 | **`tests/integration/Run.Test.pas`** | 6 tests in 1 suite | Spawns `lwpt run` against scratch projects. Covers user-script execution and exit-code propagation, built-in aliasing with flag passthrough, unknown-script errors, list mode omitting retired `export`, and `export` as an allowed user script name. |
-| **`tests/integration/TestScheduling.Test.pas`** | 12 tests in 1 suite | Cross-platform subprocess coverage for default overlap, deterministic `--jobs=1` ordering, `--bail=0` override, compile failures counting toward bail, and the amended bail contract: stop new work, terminate and reap active children, and print sorted diagnostics. |
+| **`tests/integration/TestScheduling.Test.pas`** | 11 unconditional tests in 1 suite, plus 2 Unix-only and 2 Windows-only | Cross-platform subprocess coverage for default overlap, deterministic `--jobs=1` ordering, `--bail=0` override, compile failures counting toward bail, and the amended bail contract: stop new work, terminate and reap active children, and print sorted diagnostics. Unix runs native SIGINT/SIGTERM forwarding regressions; Windows runs matching Ctrl-C/Ctrl-Break Job Object reaping regressions. |
 | **`tests/integration/Version.Test.pas`** | 4 tests in 1 suite | Spawns version-reporting forms and verifies output shape plus drift protection against `lwpt.toml`'s `[package].version`. |
 
 ### E2E tier
@@ -277,9 +277,9 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | Tier | Files | Test cases |
 | --- | --- | --- |
 | Unit (`source/*.Test.pas` + package self-tests) | 29 | 490 |
-| Integration (`tests/integration/*.Test.pas`) | 22 | 230 |
+| Integration (`tests/integration/*.Test.pas`) | 22 | 231 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 7 | 35 |
-| **Total** | **58** | **755** |
+| **Total** | **58** | **756** |
 
 ### Planned testing work
 
