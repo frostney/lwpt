@@ -255,6 +255,11 @@ begin
     raise ELWPTCompilerDriverError.CreateFmt(
       'compiler "%s" version "%s" is older than supported minimum "%s"',
       [LAKON_COMPILER_ID, Version, LAKON_MINIMUM_VERSION]);
+  if not Satisfies(Version, FVersionConstraint, DefaultSemverOptions) then
+    raise ELWPTCompilerDriverError.CreateFmt(
+      'compiler "%s" version "%s" does not satisfy configured version '
+      + 'constraint "%s"',
+      [LAKON_COMPILER_ID, Version, FVersionConstraint]);
   if not HelpMatchesReleasedContract(HelpOutput) then
     raise ELWPTCompilerDriverError.CreateFmt(
       'compiler "%s" version "%s" does not advertise the verified '
@@ -287,7 +292,8 @@ function TLWPTLakonCompilerDriver.BuildArguments(
 var
   Arguments: TStringList;
   ArgumentIndex, PathIndex: Integer;
-  ConfigurationUnitPaths: LWPT.Core.TStringArray;
+  AddedConfigurationUnitPaths,
+    ConfigurationUnitPaths: LWPT.Core.TStringArray;
 begin
   Result := nil;
   ValidateBuildRequest(ARequest);
@@ -306,8 +312,8 @@ begin
       [LAKON_COMPILER_ID]);
   if ARequest.Mode <> BUILD_MODE_DEV then
     raise ELWPTCompilerDriverError.CreateFmt(
-      'compiler "%s" version %s has no released translation for mode "%s"',
-      [LAKON_COMPILER_ID, LAKON_MINIMUM_VERSION, ARequest.Mode]);
+      'compiler "%s" has no released translation for mode "%s"',
+      [LAKON_COMPILER_ID, ARequest.Mode]);
   if AOptions.ArgumentProfile = capPascalSource then
     raise ELWPTCompilerDriverError.CreateFmt(
       'compiler "%s" produces WASI modules that %s cannot execute as '
@@ -341,14 +347,23 @@ begin
         AddValueArgument(LAKON_UNIT_PATH_FLAG,
           ARequest.Inputs.UnitPaths[PathIndex], Arguments);
     SetLength(ConfigurationUnitPaths, 0);
+    SetLength(AddedConfigurationUnitPaths, 0);
     AppendUnitDirsFromCfg(AOptions.ConfigurationFile,
       ConfigurationUnitPaths);
     for PathIndex := 0 to High(ConfigurationUnitPaths) do
       if (ConfigurationUnitPaths[PathIndex] <> '')
          and not ArrayContainsPath(ARequest.Inputs.UnitPaths,
+           ConfigurationUnitPaths[PathIndex])
+         and not ArrayContainsPath(AddedConfigurationUnitPaths,
            ConfigurationUnitPaths[PathIndex]) then
+      begin
         AddValueArgument(LAKON_UNIT_PATH_FLAG,
           ConfigurationUnitPaths[PathIndex], Arguments);
+        SetLength(AddedConfigurationUnitPaths,
+          Length(AddedConfigurationUnitPaths) + 1);
+        AddedConfigurationUnitPaths[High(AddedConfigurationUnitPaths)] :=
+          ConfigurationUnitPaths[PathIndex];
+      end;
     for PathIndex := 0 to High(ARequest.Inputs.Defines) do
       if ARequest.Inputs.Defines[PathIndex] <> '' then
         AddValueArgument(LAKON_DEFINE_FLAG,
@@ -363,9 +378,9 @@ begin
         ArgumentIndex]) then
         raise ELWPTCompilerDriverError.CreateFmt(
           'compiler "%s" extra argument "%s" is not in the verified '
-          + '%s CLI contract or is managed by %s',
+          + 'released CLI contract or is managed by %s',
           [LAKON_COMPILER_ID, ARequest.Inputs.ExtraArguments[ArgumentIndex],
-           LAKON_MINIMUM_VERSION, PROJECT_NAME]);
+           PROJECT_NAME]);
       Arguments.Add(ARequest.Inputs.ExtraArguments[ArgumentIndex]);
     end;
     SetLength(Result, Arguments.Count);

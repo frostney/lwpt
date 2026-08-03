@@ -148,6 +148,7 @@ var
   ArgumentIndex: Integer;
 begin
   Expect<Integer>(Length(AActual)).ToBe(Length(AExpected));
+  if Length(AActual) <> Length(AExpected) then Exit;
   for ArgumentIndex := 0 to High(AExpected) do
     Expect<string>(AActual[ArgumentIndex]).ToBe(AExpected[ArgumentIndex]);
 end;
@@ -240,14 +241,21 @@ end;
 
 procedure TLWPTLakonCompilerDriverTests.TestProbeRejectsOldVersion;
 var
-  Driver: TMockLakonCompilerDriver;
+  ConfiguredDriver, Driver: TMockLakonCompilerDriver;
 begin
   Driver := NewDriver;
+  ConfiguredDriver := TMockLakonCompilerDriver.Create('lakon-under-test',
+    '>=0.2.0');
   try
     Driver.VersionOutput := 'lakon 0.0.9';
     ExpectProbeError(Driver, Driver.DefaultTarget,
       'older than supported minimum');
+    ConfiguredDriver.VersionOutput := FixtureText('version.txt');
+    ConfiguredDriver.HelpOutput := FixtureText('help.txt');
+    ExpectProbeError(ConfiguredDriver, ConfiguredDriver.DefaultTarget,
+      'does not satisfy configured version constraint ">=0.2.0"');
   finally
+    ConfiguredDriver.Free;
     Driver.Free;
   end;
 end;

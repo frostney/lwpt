@@ -618,7 +618,7 @@ end;
 
 procedure TCompilerProfiles.TestLakonBuildConsumesCfgUnitPaths;
 var
-  OriginalCfg: TStringList;
+  OriginalCfg, UpdatedCfg: TStringList;
   R: TLwptResult;
 begin
   SetMode(LAKON_MODE);
@@ -631,16 +631,21 @@ begin
     + 'implementation'#10
     + 'end.'#10);
   OriginalCfg := TStringList.Create;
+  UpdatedCfg := TStringList.Create;
   try
     OriginalCfg.LoadFromFile(FScratch + '/lwpt.cfg');
-    WriteTextFile(FScratch + '/lwpt.cfg', OriginalCfg.Text
-      + '-Fucfg-only-units'#10);
+    UpdatedCfg.Assign(OriginalCfg);
+    UpdatedCfg.Add('-Fucfg-only-units');
+    AtomicWriteText(FScratch + '/lwpt.cfg', FScratch + '/.lwpt/tmp',
+      UpdatedCfg);
     R := RunLwpt(['build', '--jobs', '1'], FScratch);
     DumpRunFailure('Lakon cfg-only unit path', R, 0);
     Expect<Integer>(R.ExitCode).ToBe(0);
     Expect<Boolean>(FileExists(FScratch + '/build/app.wasm')).ToBe(True);
   finally
-    OriginalCfg.SaveToFile(FScratch + '/lwpt.cfg');
+    AtomicWriteText(FScratch + '/lwpt.cfg', FScratch + '/.lwpt/tmp',
+      OriginalCfg);
+    UpdatedCfg.Free;
     OriginalCfg.Free;
     WriteTextFile(FScratch + '/source/app.pas',
       'program app;'#10'begin'#10'end.'#10);
