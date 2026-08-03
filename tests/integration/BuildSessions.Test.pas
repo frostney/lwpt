@@ -13,6 +13,8 @@ uses
 
   LWPT.BuildSession,
   LWPT.Core,
+  LWPT.Observability,
+  LWPT.ProgressReporter,
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
@@ -86,6 +88,7 @@ type
     procedure TestFailedPrerequisiteBlocksOnlyDependants;
     procedure TestObservableBuildHeartbeatAndVerboseLogs;
     procedure TestFullyContendedBuildEmitsHeartbeat;
+    procedure TestWaitHeartbeatResetsSharedCadence;
     procedure TestBuildFailureReplaysAndPreservesIsolatedLog;
     procedure TestLostProxyGuardFailsClosed;
   end;
@@ -972,12 +975,52 @@ begin
     Expect<Boolean>(EntryReady(ReadyDir, 'app')).ToBe(False);
     Expect<Boolean>(Pos('blocked by failed prerequisite "alpha"',
       R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos('build entry "app" skipped: blocked by failed '
+      + 'prerequisite "alpha"', R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos('build entry "app" failed:', R.Stderr) = 0)
+      .ToBe(True);
     AlphaAt := Pos('START alpha ', R.Stdout);
     BetaAt := Pos('START beta ', R.Stdout);
     AppAt := Pos('SKIP app ', R.Stdout);
     Expect<Boolean>((AlphaAt > 0) and (AlphaAt < BetaAt)
       and (BetaAt < AppAt)).ToBe(True);
   finally
+    RecursiveDelete(Project);
+  end;
+end;
+
+procedure TBuildSessions.TestWaitHeartbeatResetsSharedCadence;
+var
+  Event: TLWPTHeartbeatEvent;
+  Project: string;
+  Reporter: TLWPTProgressReporter;
+  Session: TLWPTBuildSession;
+  WaitObservedAt: QWord;
+begin
+  Project := FScratch + '/wait-heartbeat-cadence';
+  Session := TLWPTBuildSession.Create(Project);
+  try
+    Reporter := TLWPTProgressReporter.Create(Session, lpsBuild);
+    try
+      WaitObservedAt := 2000;
+      Reporter.StartHeartbeatClock(1000, 1000);
+      Event := TLWPTHeartbeatEvent.Create('build:postbuild-capacity',
+        Session.SessionID, 1000);
+      try
+        Reporter.ReportWaitHeartbeat(Event,
+          'waiting for postbuild worker capacity', WaitObservedAt);
+      finally
+        Event.Free;
+      end;
+      Expect<Boolean>(Reporter.HeartbeatDue(WaitObservedAt
+        + Reporter.HeartbeatIntervalMilliseconds - 1)).ToBe(False);
+      Expect<Boolean>(Reporter.HeartbeatDue(WaitObservedAt
+        + Reporter.HeartbeatIntervalMilliseconds)).ToBe(True);
+    finally
+      Reporter.Free;
+    end;
+  finally
+    Session.Free;
     RecursiveDelete(Project);
   end;
 end;
@@ -1197,6 +1240,8 @@ begin
     TestObservableBuildHeartbeatAndVerboseLogs);
   Test('fully contended builds heartbeat while entries are queued',
     TestFullyContendedBuildEmitsHeartbeat);
+  Test('wait heartbeats reset the shared build cadence',
+    TestWaitHeartbeatResetsSharedCadence);
   Test('build failures replay and preserve isolated logs',
     TestBuildFailureReplaysAndPreservesIsolatedLog);
   Test('lost proxy environment fails closed with a redacted dump',

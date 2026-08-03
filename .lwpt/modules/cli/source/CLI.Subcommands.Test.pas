@@ -33,6 +33,8 @@ type
     procedure TestItemOutOfRangeRaises;
     procedure TestCompletionCallbackReceivesDispatchMetadata;
     procedure TestCompletionCallbackCannotReplaceDispatchResult;
+    procedure TestSharedFlagIsInheritedByExistingAndFutureCommands;
+    procedure TestSharedFlagRejectsCommandOptionCollisions;
   end;
 
 var
@@ -229,6 +231,88 @@ begin
   Expect<Integer>(RunCompletionChild(True)).ToBe(NONZERO_HANDLER_EXIT_CODE);
 end;
 
+procedure TSubcommandRegistrySuite.
+  TestSharedFlagIsInheritedByExistingAndFutureCommands;
+var
+  EmptyOptions: TOptionArray;
+  Registry: TSubcommandRegistry;
+begin
+  SetLength(EmptyOptions, 0);
+  Registry := TSubcommandRegistry.Create;
+  try
+    Registry.Add(TSubcommand.Create('before', 'before', '', nil,
+      EmptyOptions));
+    Registry.AddSharedFlag('silent', 'Suppress ordinary output');
+    SetLength(EmptyOptions, 0);
+    Registry.Add(TSubcommand.Create('after', 'after', '', nil,
+      EmptyOptions));
+
+    Expect<Integer>(Length(Registry.Find('before').Options)).ToBe(1);
+    Expect<Integer>(Length(Registry.Find('after').Options)).ToBe(1);
+    Expect<string>(Registry.Find('before').Options[0].LongName).ToBe(
+      'silent');
+    Expect<string>(Registry.Find('after').Options[0].LongName).ToBe(
+      'silent');
+    Expect<string>(Registry.Find('before').UsageArg).ToBe('[--silent]');
+    Expect<string>(Registry.Find('after').UsageArg).ToBe('[--silent]');
+    Expect<Boolean>(Registry.Find('before').Options[0]
+      <> Registry.Find('after').Options[0]).ToBe(True);
+  finally
+    Registry.Free;
+  end;
+end;
+
+procedure TSubcommandRegistrySuite.
+  TestSharedFlagRejectsCommandOptionCollisions;
+var
+  DuplicateCommand: TSubcommand;
+  DuplicateOptions: TOptionArray;
+  Raised: Boolean;
+  Registry: TSubcommandRegistry;
+begin
+  SetLength(DuplicateOptions, 1);
+  DuplicateOptions[0] := TFlagOption.Create('silent', 'local flag');
+  Registry := TSubcommandRegistry.Create;
+  try
+    Registry.Add(TSubcommand.Create('before', 'before', '', nil,
+      DuplicateOptions));
+    Raised := False;
+    try
+      Registry.AddSharedFlag('silent', 'shared flag');
+    except
+      on EArgumentException do Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Integer>(Length(Registry.Find('before').Options)).ToBe(1);
+  finally
+    Registry.Free;
+  end;
+
+  Registry := TSubcommandRegistry.Create;
+  try
+    Registry.AddSharedFlag('silent', 'shared flag');
+    SetLength(DuplicateOptions, 1);
+    DuplicateOptions[0] := TFlagOption.Create('silent', 'local flag');
+    DuplicateCommand := TSubcommand.Create('after', 'after', '', nil,
+      DuplicateOptions);
+    Raised := False;
+    try
+      Registry.Add(DuplicateCommand);
+    except
+      on EArgumentException do Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+  finally
+    if Raised then
+    begin
+      DuplicateOptions[0].Free;
+      DuplicateCommand.Free;
+      { Add rejected both objects before taking ownership. }
+    end;
+    Registry.Free;
+  end;
+end;
+
 procedure TSubcommandRegistrySuite.SetupTests;
 begin
   Test('Count + Item iterate subcommands in registration order',
@@ -243,6 +327,10 @@ begin
     TestCompletionCallbackReceivesDispatchMetadata);
   Test('completion callback cannot replace the command dispatch result',
     TestCompletionCallbackCannotReplaceDispatchResult);
+  Test('shared flags reach existing and future subcommands independently',
+    TestSharedFlagIsInheritedByExistingAndFutureCommands);
+  Test('shared flags reject existing and future option name collisions',
+    TestSharedFlagRejectsCommandOptionCollisions);
 end;
 
 begin

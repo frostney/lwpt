@@ -43,6 +43,18 @@ type
   TSubcommandCompletionHandler = procedure(
     const ACompletion: TSubcommandCompletion);
 
+  { Neutral host hook after option parsing and alias resolution but before the
+    handler runs. Returning a non-empty message rejects dispatch as a command
+    usage error. Hosts may also install invocation-scoped observers here; the
+    CLI package remains unaware of their output policy. }
+  TSubcommandPreparedHandler = function(const ACommandName: string;
+    const AOptions: TOptionArray): string;
+
+  TSubcommandSharedFlag = record
+    LongName: string;
+    HelpText: string;
+  end;
+
   TSubcommand = class
   public
     Name     : string;
@@ -57,9 +69,12 @@ type
   TSubcommandRegistry = class
   private
     FItems : array of TSubcommand;
+    FSharedFlags : array of TSubcommandSharedFlag;
     FOnCommandCompleted : TSubcommandCompletionHandler;
+    FOnCommandPrepared : TSubcommandPreparedHandler;
   public
     destructor Destroy; override;
+    procedure AddSharedFlag(const ALongName, AHelpText: string);
     procedure Add(ASub: TSubcommand);
     function Find(const AName: string): TSubcommand;
     { Read iteration over the registered subcommands, in registration
@@ -76,6 +91,8 @@ type
     function Run(const AProgramName: string): Integer;
     property OnCommandCompleted: TSubcommandCompletionHandler
       read FOnCommandCompleted write FOnCommandCompleted;
+    property OnCommandPrepared: TSubcommandPreparedHandler
+      read FOnCommandPrepared write FOnCommandPrepared;
   end;
 
 implementation
@@ -106,9 +123,71 @@ begin
 end;
 
 procedure TSubcommandRegistry.Add(ASub: TSubcommand);
+var
+  ExistingOptionIndex, FlagIndex, OptionIndex: Integer;
 begin
+  { Check the complete command surface before appending any shared option so a
+    rejected command remains untouched and owned by its caller. }
+  for FlagIndex := 0 to High(FSharedFlags) do
+    for ExistingOptionIndex := 0 to High(ASub.Options) do
+      if SameText(ASub.Options[ExistingOptionIndex].LongName,
+         FSharedFlags[FlagIndex].LongName) then
+        raise EArgumentException.CreateFmt(
+          'subcommand %s already defines shared flag --%s',
+          [ASub.Name, FSharedFlags[FlagIndex].LongName]);
+
+  for FlagIndex := 0 to High(FSharedFlags) do
+  begin
+    OptionIndex := Length(ASub.Options);
+    SetLength(ASub.Options, OptionIndex + 1);
+    ASub.Options[OptionIndex] := TFlagOption.Create(
+      FSharedFlags[FlagIndex].LongName, FSharedFlags[FlagIndex].HelpText);
+    if ASub.UsageArg <> '' then ASub.UsageArg := ASub.UsageArg + ' ';
+    ASub.UsageArg := ASub.UsageArg + '[--'
+      + FSharedFlags[FlagIndex].LongName + ']';
+  end;
   SetLength(FItems, Length(FItems) + 1);
   FItems[High(FItems)] := ASub;
+end;
+
+procedure TSubcommandRegistry.AddSharedFlag(
+  const ALongName, AHelpText: string);
+var
+  FlagIndex, ItemIndex, OptionIndex: Integer;
+begin
+  if ALongName = '' then
+    raise EArgumentException.Create('shared flag name cannot be empty');
+  for FlagIndex := 0 to High(FSharedFlags) do
+    if SameText(FSharedFlags[FlagIndex].LongName, ALongName) then
+      raise EArgumentException.CreateFmt(
+        'shared flag --%s is already registered', [ALongName]);
+
+  { Validate every existing command before mutating the registry. This keeps a
+    rejected shared flag atomic and prevents ambiguous parser/help entries. }
+  for ItemIndex := 0 to High(FItems) do
+    for OptionIndex := 0 to High(FItems[ItemIndex].Options) do
+      if SameText(FItems[ItemIndex].Options[OptionIndex].LongName,
+         ALongName) then
+        raise EArgumentException.CreateFmt(
+          'subcommand %s already defines shared flag --%s',
+          [FItems[ItemIndex].Name, ALongName]);
+
+  FlagIndex := Length(FSharedFlags);
+  SetLength(FSharedFlags, FlagIndex + 1);
+  FSharedFlags[FlagIndex].LongName := ALongName;
+  FSharedFlags[FlagIndex].HelpText := AHelpText;
+
+  for ItemIndex := 0 to High(FItems) do
+  begin
+    OptionIndex := Length(FItems[ItemIndex].Options);
+    SetLength(FItems[ItemIndex].Options, OptionIndex + 1);
+    FItems[ItemIndex].Options[OptionIndex] := TFlagOption.Create(
+      ALongName, AHelpText);
+    if FItems[ItemIndex].UsageArg <> '' then
+      FItems[ItemIndex].UsageArg := FItems[ItemIndex].UsageArg + ' ';
+    FItems[ItemIndex].UsageArg := FItems[ItemIndex].UsageArg
+      + '[--' + ALongName + ']';
+  end;
 end;
 
 function TSubcommandRegistry.Find(const AName: string): TSubcommand;
@@ -212,6 +291,7 @@ var
   ParseStart : Integer;
   StartedAt : QWord;
   Completion : TSubcommandCompletion;
+  PreparationError : string;
 begin
   if ParamCount < 1 then
   begin
@@ -282,7 +362,17 @@ begin
       if (Positionals.Count > 0)
          and SameText(Positionals[0], CmdName) then
         Positionals.Delete(0);
-      Result := Sub.Handler(Positionals, Sub.Options);
+      PreparationError := '';
+      if Assigned(FOnCommandPrepared) then
+        PreparationError := FOnCommandPrepared(CmdName, Sub.Options);
+      if PreparationError <> '' then
+      begin
+        WriteLn(ErrOutput, AProgramName, ' ', CmdName, ': ',
+          PreparationError);
+        Result := 1;
+      end
+      else
+        Result := Sub.Handler(Positionals, Sub.Options);
     finally
       Positionals.Free;
     end;
