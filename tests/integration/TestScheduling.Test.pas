@@ -20,6 +20,7 @@ uses
 
   LWPT.BuildSession,
   LWPT.Core,
+  LWPT.Output.Legacy,
   LWPT.WorkerBudget;
 
 const
