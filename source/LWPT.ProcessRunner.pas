@@ -19,12 +19,17 @@ type
   ELWPTProcessRunnerError = class(ELWPTError);
   ELWPTProcessRunnerTimeout = class(ELWPTProcessRunnerError);
 
+  TLWPTProcessOutputHandler = procedure(const AData: RawByteString;
+    const AStandardError: Boolean);
+
   TLWPTProcessRunOptions = record
+    DiscardCapturedOutput: Boolean;
     SeparateStandardError: Boolean;
     TimeoutMilliseconds: QWord;
     MaximumStandardOutputBytes: QWord;
     MaximumStandardErrorBytes: QWord;
     OperationName: string;
+    OnOutputChunk: TLWPTProcessOutputHandler;
   end;
 
   TLWPTDuplexProcessRunner = class
@@ -485,9 +490,12 @@ begin
 end;
 
 procedure DrainPipe(const APipe: TInputPipeStream; var AOutput: string;
-  const AMaximumBytes: QWord; var AExceeded: Boolean);
+  const AMaximumBytes: QWord; var AExceeded: Boolean;
+  const AOnOutputChunk: TLWPTProcessOutputHandler;
+  const AStandardError, ADiscardCapturedOutput: Boolean);
 var
   Buffer: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
+  Chunk: RawByteString;
   Available, Count, ReadSize, RetainedCount: Integer;
   Remaining: QWord;
 begin
@@ -502,8 +510,21 @@ begin
     Count := APipe.Read(Buffer[0], ReadSize);
     if Count <= 0 then Exit;
     Dec(Available, Count);
+    if Assigned(AOnOutputChunk) then
+    begin
+      SetLength(Chunk, Count);
+      Move(Buffer[0], Chunk[1], Count);
+      try
+        AOnOutputChunk(Chunk, AStandardError);
+      except
+        { Output observation is best effort. A renderer failure must not
+          replace the child result or interrupt pipe drainage. }
+      end;
+    end;
     RetainedCount := Count;
-    if AExceeded then
+    if ADiscardCapturedOutput then
+      RetainedCount := 0
+    else if AExceeded then
       RetainedCount := 0
     else if AMaximumBytes > 0 then
     begin
@@ -588,10 +609,12 @@ begin
       begin
         if FailureMessage <> '' then Break;
         DrainPipe(FProcess.Output, AStandardOutput,
-          AOptions.MaximumStandardOutputBytes, StandardOutputExceeded);
+          AOptions.MaximumStandardOutputBytes, StandardOutputExceeded,
+          AOptions.OnOutputChunk, False, AOptions.DiscardCapturedOutput);
         if AOptions.SeparateStandardError then
           DrainPipe(FProcess.Stderr, AStandardError,
-            AOptions.MaximumStandardErrorBytes, StandardErrorExceeded);
+            AOptions.MaximumStandardErrorBytes, StandardErrorExceeded,
+            AOptions.OnOutputChunk, True, AOptions.DiscardCapturedOutput);
         if StandardOutputExceeded then
         begin
           FailureMessage := Format(
@@ -624,10 +647,12 @@ begin
         while FProcess.Running do
         begin
           DrainPipe(FProcess.Output, AStandardOutput,
-            AOptions.MaximumStandardOutputBytes, StandardOutputExceeded);
+            AOptions.MaximumStandardOutputBytes, StandardOutputExceeded,
+            AOptions.OnOutputChunk, False, AOptions.DiscardCapturedOutput);
           if AOptions.SeparateStandardError then
             DrainPipe(FProcess.Stderr, AStandardError,
-              AOptions.MaximumStandardErrorBytes, StandardErrorExceeded);
+              AOptions.MaximumStandardErrorBytes, StandardErrorExceeded,
+              AOptions.OnOutputChunk, True, AOptions.DiscardCapturedOutput);
           if TerminationThread.IsDone then
           begin
             TerminationFailure := TerminationThread.ErrorMessage;
@@ -649,11 +674,13 @@ begin
             begin
               DrainPipe(FProcess.Output, AStandardOutput,
                 AOptions.MaximumStandardOutputBytes,
-                StandardOutputExceeded);
+                StandardOutputExceeded, AOptions.OnOutputChunk, False,
+                AOptions.DiscardCapturedOutput);
               if AOptions.SeparateStandardError then
                 DrainPipe(FProcess.Stderr, AStandardError,
                   AOptions.MaximumStandardErrorBytes,
-                  StandardErrorExceeded);
+                  StandardErrorExceeded, AOptions.OnOutputChunk, True,
+                  AOptions.DiscardCapturedOutput);
               Sleep(PROCESS_RUNNER_POLL_MILLISECONDS);
             end;
             if FProcess.Running then
@@ -668,10 +695,12 @@ begin
           TerminationFailure := TerminationThread.ErrorMessage;
       end;
       DrainPipe(FProcess.Output, AStandardOutput,
-        AOptions.MaximumStandardOutputBytes, StandardOutputExceeded);
+        AOptions.MaximumStandardOutputBytes, StandardOutputExceeded,
+        AOptions.OnOutputChunk, False, AOptions.DiscardCapturedOutput);
       if AOptions.SeparateStandardError then
         DrainPipe(FProcess.Stderr, AStandardError,
-          AOptions.MaximumStandardErrorBytes, StandardErrorExceeded);
+          AOptions.MaximumStandardErrorBytes, StandardErrorExceeded,
+          AOptions.OnOutputChunk, True, AOptions.DiscardCapturedOutput);
       if not FProcess.Running then FProcess.WaitOnExit;
     finally
       WriterAbandoned := not Writer.CancelAndJoin;

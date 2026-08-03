@@ -94,6 +94,10 @@ type
   public
     constructor Create(const ASource, ACorrelationID: string;
       const AStream: TLWPTChildOutputStream; const AData: RawByteString);
+      overload;
+    constructor Create(const ASource, ACorrelationID: string;
+      const AStream: TLWPTChildOutputStream; const AData: RawByteString;
+      const ARetention: TLWPTEventRetention); overload;
     function EventName: string; override;
     property Data: RawByteString read FData;
     property Stream: TLWPTChildOutputStream read FStream;
@@ -199,7 +203,15 @@ constructor TLWPTChildOutputEvent.Create(
   const ASource, ACorrelationID: string;
   const AStream: TLWPTChildOutputStream; const AData: RawByteString);
 begin
-  inherited Create(ASource, ACorrelationID, oerOrdinary);
+  Create(ASource, ACorrelationID, AStream, AData, oerOrdinary);
+end;
+
+constructor TLWPTChildOutputEvent.Create(
+  const ASource, ACorrelationID: string;
+  const AStream: TLWPTChildOutputStream; const AData: RawByteString;
+  const ARetention: TLWPTEventRetention);
+begin
+  inherited Create(ASource, ACorrelationID, ARetention);
   FStream := AStream;
   FData := AData;
 end;

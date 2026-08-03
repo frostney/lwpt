@@ -207,7 +207,17 @@ zero; internal scheduler failures use the documented generic failure outcome.
 `LWPT.ProgressReporter` consumes typed job and heartbeat events for build and
 test. It owns their shared heartbeat cadence, active-job assembly, established
 human rendering, and per-job log persistence. The executable host's broader
-terminal and retention policy builds on the same event types separately;
+terminal and retention policy lives in `LWPT.OutputRenderer`. A registry-level
+shared flag gives every command an independent `--silent` option object, while
+the neutral prepared-dispatch hook lets the executable install the renderer
+only after parsing and alias resolution. The renderer routes stdout/stderr and
+continuously drained child chunks through `CLI.Events`, suppresses ordinary
+events in silent mode, and replays protected diagnostics and failed-operation
+output before the terminal failure event. Its normal journal is capped at
+64 MiB; a preallocated 1 MiB emergency ring preserves protected/recent evidence
+when journal creation, writing, capacity, or replay degrades. Observer failure
+never replaces the command exit result. `LWPT.Observability` remains free of
+human strings and stream policy, and
 `LWPT.BuildSession` owns only session-path allocation and atomic log writes.
 
 ## `.lwpt/` layout

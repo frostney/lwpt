@@ -53,11 +53,15 @@ uses
   LWPT.Command.Run,
   LWPT.Command.Testing,
   LWPT.Core,
+  LWPT.OutputRenderer,
   LWPT.ProcessTree;
 
 const
   MILLISECONDS_PER_CENTISECOND = 10;
   CENTISECONDS_PER_SECOND = 100;
+
+var
+  OutputRenderer : TLWPTOutputRenderer;
 
 function FormatElapsedMilliseconds(const AMilliseconds: QWord): string;
 var
@@ -80,13 +84,20 @@ procedure ReportCommandCompletion(
 var
   StatusText : string;
 begin
+  if Assigned(OutputRenderer) and OutputRenderer.Capturing then
+    OutputRenderer.FinishSilent(ACompletion.ExitCode,
+      ACompletion.ElapsedMilliseconds);
+  Flush(Output);
   if ACompletion.ExitCode = 0 then
     StatusText := 'completed in '
   else
     StatusText := 'failed after ';
-  Flush(Output);
-  WriteLn(ErrOutput, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
-    StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds));
+  if ACompletion.ExitCode = 0 then
+    WriteLn(Output, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
+      StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds))
+  else
+    WriteLn(ErrOutput, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
+      StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds));
 end;
 
 function ErrPrefix(const ASubcommand: string): string; inline;
@@ -99,6 +110,32 @@ end;
   single source of truth for both `--help` and the agents block. }
 var
   Registry : TSubcommandRegistry;
+
+function PrepareCommandOutput(const ACommandName: string;
+  const AOptions: TOptionArray): string;
+var
+  HasSilent, HasVerbose: Boolean;
+  OptionIndex: Integer;
+begin
+  Result := '';
+  HasSilent := False;
+  HasVerbose := False;
+  for OptionIndex := 0 to High(AOptions) do
+    if AOptions[OptionIndex].Present then
+      if SameText(AOptions[OptionIndex].LongName, 'silent') then
+        HasSilent := True
+      else if SameText(AOptions[OptionIndex].LongName, 'verbose') then
+        HasVerbose := True;
+  if HasSilent and HasVerbose then
+    Exit('--silent cannot be combined with --verbose');
+  if not HasSilent then Exit;
+  try
+    OutputRenderer.BeginSilent(ACommandName);
+  except
+    on E: Exception do
+      Result := 'cannot start silent mode: ' + E.Message;
+  end;
+end;
 
 { --- install ------------------------------------------------------------- }
 function HandleInstall(const APositionals: TStringList;
@@ -546,7 +583,12 @@ begin
   end;
 
   Registry := TSubcommandRegistry.Create;
+  OutputRenderer := TLWPTOutputRenderer.Create;
+  SetActiveOutputRenderer(OutputRenderer);
   try
+    Registry.AddSharedFlag('silent',
+      'Suppress ordinary output and emit only the final command result');
+    Registry.OnCommandPrepared := @PrepareCommandOutput;
     Registry.OnCommandCompleted := @ReportCommandCompletion;
 
     SetLength(InstallOpts, 1);
@@ -654,6 +696,8 @@ begin
 
     ExitCode := Registry.Run(PROGRAM_NAME);
   finally
+    SetActiveOutputRenderer(nil);
+    OutputRenderer.Free;
     Registry.Free;
   end;
 end.
