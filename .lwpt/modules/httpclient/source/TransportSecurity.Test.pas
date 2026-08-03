@@ -1319,7 +1319,7 @@ begin
   LinkDirectory := SCRATCH_DIRECTORY + '/identity-parent-junction';
   LinkTarget := ExtractFileDir(ExpandFileName(PKCS12_PATH));
   Windows.RemoveDirectoryW(PWideChar(UnicodeString(LinkDirectory)));
-  CommandInterpreter := GetEnvironmentVariable('COMSPEC');
+  CommandInterpreter := SysUtils.GetEnvironmentVariable('COMSPEC');
   if CommandInterpreter = '' then
     CommandInterpreter := 'cmd.exe';
   ProcessInstance := TProcess.Create(nil);
