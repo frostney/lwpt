@@ -6,6 +6,8 @@ build/private dir/app name.wasm
 source dir
 -Fu
 .lwpt/modules/example package
+-Fu
+cfg only dependency
 -d
 FEATURE
 --no-cache

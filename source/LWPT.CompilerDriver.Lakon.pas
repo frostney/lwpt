@@ -53,6 +53,7 @@ uses
   StrUtils,
   SysUtils,
 
+  LWPT.BuildSession,
   LWPT.ProcessRunner,
   Semver;
 
@@ -286,6 +287,7 @@ function TLWPTLakonCompilerDriver.BuildArguments(
 var
   Arguments: TStringList;
   ArgumentIndex, PathIndex: Integer;
+  ConfigurationUnitPaths: LWPT.Core.TStringArray;
 begin
   Result := nil;
   ValidateBuildRequest(ARequest);
@@ -338,6 +340,15 @@ begin
       if ARequest.Inputs.UnitPaths[PathIndex] <> '' then
         AddValueArgument(LAKON_UNIT_PATH_FLAG,
           ARequest.Inputs.UnitPaths[PathIndex], Arguments);
+    SetLength(ConfigurationUnitPaths, 0);
+    AppendUnitDirsFromCfg(AOptions.ConfigurationFile,
+      ConfigurationUnitPaths);
+    for PathIndex := 0 to High(ConfigurationUnitPaths) do
+      if (ConfigurationUnitPaths[PathIndex] <> '')
+         and not ArrayContainsPath(ARequest.Inputs.UnitPaths,
+           ConfigurationUnitPaths[PathIndex]) then
+        AddValueArgument(LAKON_UNIT_PATH_FLAG,
+          ConfigurationUnitPaths[PathIndex], Arguments);
     for PathIndex := 0 to High(ARequest.Inputs.Defines) do
       if ARequest.Inputs.Defines[PathIndex] <> '' then
         AddValueArgument(LAKON_DEFINE_FLAG,

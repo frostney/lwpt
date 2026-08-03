@@ -48,6 +48,7 @@ type
     procedure TestProbeRejectsIncompleteCommandSurface;
     procedure TestProbeRejectsUnsupportedTarget;
     procedure TestBuildTranslationMatchesPinnedFixture;
+    procedure TestConfigurationUnitPathsAreAddedOnce;
     procedure TestCleanTranslationRemainsSessionPrivate;
     procedure TestReleaseModeFailsExplicitly;
     procedure TestNativeTestExecutionFailsExplicitly;
@@ -294,9 +295,35 @@ begin
   Driver := TLWPTLakonCompilerDriver.Create;
   try
     Arguments := Driver.BuildArguments(Request,
-      BuildCompilerInvocationOptions('lwpt.cfg', False));
+      BuildCompilerInvocationOptions(FIXTURE_ROOT + 'lwpt.cfg', False));
     Expected := FixtureArguments('arguments.txt');
     ExpectArguments(Arguments, Expected);
+  finally
+    Driver.Free;
+  end;
+end;
+
+procedure TLWPTLakonCompilerDriverTests.
+  TestConfigurationUnitPathsAreAddedOnce;
+var
+  Arguments: TStringArray;
+  Driver: TLWPTLakonCompilerDriver;
+  Index, ModulePathCount, CfgPathCount: Integer;
+begin
+  Driver := TLWPTLakonCompilerDriver.Create;
+  try
+    Arguments := Driver.BuildArguments(Request,
+      BuildCompilerInvocationOptions(FIXTURE_ROOT + 'lwpt.cfg', False));
+    ModulePathCount := 0;
+    CfgPathCount := 0;
+    for Index := 0 to High(Arguments) do
+    begin
+      if Arguments[Index] = '.lwpt/modules/example package' then
+        Inc(ModulePathCount);
+      if Arguments[Index] = 'cfg only dependency' then Inc(CfgPathCount);
+    end;
+    Expect<Integer>(ModulePathCount).ToBe(1);
+    Expect<Integer>(CfgPathCount).ToBe(1);
   finally
     Driver.Free;
   end;
@@ -529,6 +556,8 @@ begin
     TestProbeRejectsUnsupportedTarget);
   Test('neutral request translation matches the release fixture',
     TestBuildTranslationMatchesPinnedFixture);
+  Test('configuration unit paths are added without duplicates',
+    TestConfigurationUnitPathsAreAddedOnce);
   Test('clean translation keeps the cache session-private',
     TestCleanTranslationRemainsSessionPrivate);
   Test('unreleased release-mode translation fails explicitly',
