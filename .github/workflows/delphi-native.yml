@@ -10,7 +10,6 @@ on:
       compiler:
         description: Absolute path to a Delphi 12+ Win64 compiler
         required: true
-        default: 'C:\Program Files (x86)\Embarcadero\Studio\37.0\bin\dcc64.exe'
 
 permissions:
   contents: read
@@ -41,8 +40,11 @@ jobs:
         env:
           DELPHI_COMPILER: ${{ inputs.compiler }}
         run: |
-          if (-not (Test-Path -LiteralPath $env:DELPHI_COMPILER)) {
-            throw "Configured Delphi compiler does not exist: $env:DELPHI_COMPILER"
+          if (-not [System.IO.Path]::IsPathFullyQualified($env:DELPHI_COMPILER)) {
+            throw "Configured Delphi compiler path must be absolute: $env:DELPHI_COMPILER"
+          }
+          if (-not (Test-Path -LiteralPath $env:DELPHI_COMPILER -PathType Leaf)) {
+            throw "Configured Delphi compiler is not a file: $env:DELPHI_COMPILER"
           }
 
           $root = (Get-Location).Path

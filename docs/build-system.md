@@ -267,15 +267,17 @@ default = "delphi-win64"
 
 [compiler.profiles.delphi-win64]
 driver = "delphi"
-executable = "C:/Program Files (x86)/Embarcadero/Studio/37.0/bin/dcc64.exe"
+executable = "C:/path/to/dcc64.exe"
 version = ">=36.0.0"
 ```
 
-An explicit `executable` may be absolute or project-relative. When it is
-omitted, the driver looks for `dcc32.exe` under `BDSBIN`, then `BDS/bin`, then
-uses `dcc32` from `PATH`. Embarcadero's `rsvars.bat` initializes the normal
-command-line environment. Discovery never selects a different target on the
-user's behalf: configure another profile and executable for each target.
+Replace the placeholder with the installed compiler path; Embarcadero's
+installation directory differs by product version. An explicit `executable`
+may be absolute or project-relative. When it is omitted, the driver looks for
+`dcc32.exe` under `BDSBIN`, then `BDS/bin`, then uses `dcc32` from `PATH`.
+Embarcadero's `rsvars.bat` initializes the normal command-line environment.
+Discovery never selects a different target on the user's behalf: configure
+another profile and executable for each target.
 
 The minimum supported backend is Delphi 12 Athens (compiler `36.0.0`). Every
 concrete build or test operation launches the selected executable with `-h`,

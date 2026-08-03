@@ -21,9 +21,9 @@ type
     FExecutableName: string;
     FVersionConstraint: string;
     function ExecutableTarget: TLWPTTarget;
+  protected
     function GeneratedArtifactPath(const ARequest: TLWPTBuildRequest):
       string;
-  protected
     function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
       out AOutput: string): Integer; virtual;
   public
@@ -435,7 +435,8 @@ begin
   if (ArgumentText <> '') and (ArgumentText[1] = '/') then
     ArgumentText[1] := '-';
   Result := StartsStr(DELPHI_EXECUTABLE_OUTPUT_FLAG, ArgumentText)
-    or StartsStr('-N', ArgumentText)
+    or StartsStr(DELPHI_UNIT_OUTPUT_FLAG, ArgumentText)
+    or StartsStr(DELPHI_OBJECT_OUTPUT_FLAG, ArgumentText)
     or StartsStr(DELPHI_UNIT_PATH_FLAG, ArgumentText)
     or StartsStr(DELPHI_INCLUDE_PATH_FLAG, ArgumentText)
     or StartsStr(DELPHI_RESOURCE_PATH_FLAG, ArgumentText)
@@ -600,7 +601,7 @@ begin
   Result := False;
   for i := 0 to SeverityCount - 1 do
   begin
-    MarkerAt := Pos(' ' + SeverityNames[i], LineText);
+    MarkerAt := Pos(' ' + SeverityNames[i] + ':', LineText);
     if MarkerAt > 0 then
     begin
       Prefix := Trim(Copy(LineText, 1, MarkerAt - 1));
@@ -669,9 +670,10 @@ begin
   if (ExtensionText = '') and IsWindowsOperatingSystem(ARequest.Target.OS)
      and (ARequest.OutputKind = BUILD_OUTPUT_EXECUTABLE) then
     ExtensionText := '.exe';
-  Result := IncludeTrailingPathDelimiter(DirectoryName)
-    + ChangeFileExt(ExtractFileName(ARequest.Inputs.EntryPoint),
-      ExtensionText);
+  Result := ChangeFileExt(ExtractFileName(ARequest.Inputs.EntryPoint),
+    ExtensionText);
+  if DirectoryName <> '' then
+    Result := IncludeTrailingPathDelimiter(DirectoryName) + Result;
 end;
 
 function TLWPTDelphiCompilerDriver.NormalizeResult(

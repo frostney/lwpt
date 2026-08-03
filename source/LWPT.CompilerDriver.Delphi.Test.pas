@@ -26,6 +26,8 @@ type
     function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
       out AOutput: string): Integer; override;
   public
+    function ExposedGeneratedArtifactPath(
+      const ARequest: TLWPTBuildRequest): string;
     property ProbeCount: Integer read FProbeCount;
     property ProbeExitCode: Integer read FProbeExitCode
       write FProbeExitCode;
@@ -65,6 +67,12 @@ begin
   Inc(FProbeCount);
   AOutput := FProbeOutput;
   Result := FProbeExitCode;
+end;
+
+function TMockDelphiCompilerDriver.ExposedGeneratedArtifactPath(
+  const ARequest: TLWPTBuildRequest): string;
+begin
+  Result := GeneratedArtifactPath(ARequest);
 end;
 
 procedure TLWPTDelphiCompilerDriverTests.BeforeAll;
@@ -368,6 +376,7 @@ end;
 procedure TLWPTDelphiCompilerDriverTests.
   TestManagedExtraArgumentsAreRejected;
 var
+  Arguments: LWPT.Core.TStringArray;
   Driver: TLWPTDelphiCompilerDriver;
   Raised: Boolean;
   Request: TLWPTBuildRequest;
@@ -397,6 +406,11 @@ begin
         Raised := Pos('managed by ' + PROJECT_NAME, E.Message) > 0;
     end;
     Expect<Boolean>(Raised).ToBe(True);
+
+    Request.Inputs.ExtraArguments[0] := '-NSSystem';
+    Arguments := Driver.BuildArguments(Request,
+      BuildCompilerInvocationOptions('', False));
+    Expect<Boolean>(ArgumentsContain(Arguments, '-NSSystem')).ToBe(True);
   finally
     Driver.Free;
   end;
@@ -432,6 +446,18 @@ begin
     Expect<string>(Result.Diagnostics[0].Code).ToBe('F2048');
     Expect<string>(Result.Diagnostics[0].MessageText)
       .ToBe('Bad unit format');
+
+    ForceDirectories(Request.Outputs.ExecutableDirectory);
+    WriteTextFile(Request.Outputs.ExecutableDirectory + '/App.exe',
+      'compiled with a warning');
+    Result := Driver.NormalizeResult(Request, 0,
+      'source/Widget.pas(14) Warning: W1000 Error is a field name');
+    Expect<Boolean>(Result.Success).ToBe(True);
+    Expect<Integer>(Length(Result.Diagnostics)).ToBe(1);
+    Expect<string>(Result.Diagnostics[0].Severity).ToBe(DIAGNOSTIC_WARNING);
+    Expect<string>(Result.Diagnostics[0].Code).ToBe('W1000');
+    Expect<string>(Result.Diagnostics[0].MessageText)
+      .ToBe('Error is a field name');
   finally
     Driver.Free;
   end;
@@ -440,11 +466,11 @@ end;
 procedure TLWPTDelphiCompilerDriverTests.
   TestSuccessfulResultMovesArtifactToRequestedName;
 var
-  Driver: TLWPTDelphiCompilerDriver;
+  Driver: TMockDelphiCompilerDriver;
   Request: TLWPTBuildRequest;
   Result: TLWPTBuildResult;
 begin
-  Driver := TLWPTDelphiCompilerDriver.Create('dcc64.exe');
+  Driver := TMockDelphiCompilerDriver.Create('dcc64.exe');
   try
     Request := FixtureRequest(Driver);
     ForceDirectories(Request.Outputs.ExecutableDirectory);
@@ -456,8 +482,14 @@ begin
     Expect<Boolean>(FileExists(Request.Outputs.Artifact)).ToBe(True);
     Expect<Boolean>(FileExists(
       Request.Outputs.ExecutableDirectory + '/App.exe')).ToBe(False);
+    Expect<Integer>(Length(Result.Artifacts)).ToBe(1);
     Expect<string>(Result.Artifacts[0].Path)
       .ToBe(Request.Outputs.Artifact);
+
+    Request.Outputs.ExecutableDirectory := '';
+    Request.Outputs.Artifact := 'BareName.exe';
+    Expect<string>(Driver.ExposedGeneratedArtifactPath(Request))
+      .ToBe('App.exe');
   finally
     Driver.Free;
   end;

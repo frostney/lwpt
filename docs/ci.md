@@ -4,7 +4,7 @@ Six GitHub Actions workflows, mirroring the GocciaScript pattern used by the pac
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch` | Build + cache the cross-FPC toolchain |
+| `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch`, weekly `schedule` | Build + cache the cross-FPC toolchain |
 | `ci.yml` | `push` to `main`, `workflow_dispatch` | Post-merge confirmation: full 6-target cross-build + native test matrix on the merged main tree |
 | `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: Ubuntu leg (default tier + live-network e2e per #102), native aarch64-darwin leg (default tier), win64 leg (cross-compile, then native offline test run on `windows-latest`); typical wall-clock < 10 min warm, hard caps 15 min (e2e step) / 20 min (darwin job) |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |

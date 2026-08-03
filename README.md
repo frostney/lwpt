@@ -183,7 +183,8 @@ version = "^1.0.0"
 [compiler.profiles.delphi-win64]
 # Built-in, opt-in consumer driver; LWPT itself remains FPC-built.
 driver = "delphi"
-executable = "C:/Program Files (x86)/Embarcadero/Studio/37.0/bin/dcc64.exe"
+# Replace this placeholder with the installed compiler path.
+executable = "C:/path/to/dcc64.exe"
 version = ">=36.0.0"
 
 [version]
