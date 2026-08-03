@@ -763,6 +763,11 @@ begin
   try
     EnterCriticalSection(FTerminationCriticalSection);
     try
+      {$IFDEF MSWINDOWS}
+      { Keep assignment-before-resume an Execute-time invariant even when a
+        caller configures additional TProcess options after construction. }
+      FProcess.Options := FProcess.Options + [poRunSuspended];
+      {$ENDIF}
       FProcess.Execute;
       CloseChildAcknowledgementHandles;
       {$IFDEF UNIX}
