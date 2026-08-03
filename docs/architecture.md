@@ -190,9 +190,11 @@ installs are not supported.
 Output facts cross two deliberately separate layers. The reusable CLI package's
 `CLI.Events` unit owns only a monotonically sequenced envelope and a synchronous
 sink interface. Its dispatcher serializes delivery across producers, owns each
-payload through the delivery call, and reports a failed observer without
-letting that failure replace the command result. It has no LWPT event names,
-terminal streams, rendering, or retention policy.
+payload through the delivery call, and frees it after the sink returns. A sink
+borrows the payload only during delivery and must copy or serialize anything it
+needs to retain; successful, missing, and failed sinks follow the same ownership
+rule. Observer failure cannot replace the command result. The generic layer has
+no LWPT event names, terminal streams, rendering, or retention policy.
 
 `LWPT.Observability` supplies the project-specific typed payloads: job
 lifecycle, heartbeat, diagnostic, raw child stdout/stderr, command terminal,

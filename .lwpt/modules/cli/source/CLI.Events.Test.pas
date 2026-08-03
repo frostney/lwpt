@@ -50,6 +50,7 @@ type
     procedure TestConcurrentProducersDeliverInSequence;
     procedure TestSinkFailureDoesNotEscapeOrStopSequence;
     procedure TestMissingSinkStillReleasesPayload;
+    procedure TestNilPayloadIsRejected;
   end;
 
 var
@@ -63,7 +64,7 @@ end;
 
 destructor TTestPayload.Destroy;
 begin
-  Inc(DestroyedPayloads);
+  InterlockedIncrement(DestroyedPayloads);
   inherited Destroy;
 end;
 
@@ -210,6 +211,28 @@ begin
   end;
 end;
 
+procedure TCLIEventSuite.TestNilPayloadIsRejected;
+var
+  Dispatcher: TCLIEventDispatcher;
+  Raised: Boolean;
+begin
+  Raised := False;
+  Dispatcher := TCLIEventDispatcher.Create(nil);
+  try
+    try
+      Dispatcher.Publish(nil);
+    except
+      on EArgumentNilException do
+        Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(Dispatcher.Publish(TTestPayload.Create('after'))).
+      ToBe(False);
+  finally
+    Dispatcher.Free;
+  end;
+end;
+
 procedure TCLIEventSuite.SetupTests;
 begin
   Test('dispatch assigns stable sequence numbers and preserves payload type',
@@ -220,6 +243,8 @@ begin
     TestSinkFailureDoesNotEscapeOrStopSequence);
   Test('missing sink still releases dispatcher-owned payloads',
     TestMissingSinkStillReleasesPayload);
+  Test('nil payloads are rejected without stranding the dispatcher',
+    TestNilPayloadIsRejected);
 end;
 
 begin

@@ -90,9 +90,11 @@ begin
           failure must not replace the command result. }
       end;
   finally
-    APayload.Free;
     LeaveCriticalSection(FCriticalSection);
   end;
+  { The dispatcher owns the payload and releases it outside the ordering
+    lock, so a raising destructor cannot strand the lock. }
+  APayload.Free;
 end;
 
 end.
