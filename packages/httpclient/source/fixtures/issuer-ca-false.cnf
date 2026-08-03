@@ -1,0 +1,12 @@
+[req]
+distinguished_name = issuer_name
+prompt = no
+
+[issuer_name]
+CN = TransportSecurity Invalid Non-CA Issuer
+
+[issuer_extensions]
+basicConstraints = critical,CA:false
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer

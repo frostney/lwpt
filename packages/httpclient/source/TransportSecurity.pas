@@ -52,6 +52,11 @@ type
     BytesProcessed: Integer;
   end;
 
+  TTransportSecurityServerIdentityValidation = (
+    tsivStrict,
+    tsivPermissive
+  );
+
   TTransportSecurityInputFlow = record
     AcceptedBytes: QWord;
     Backpressured: Boolean;
@@ -81,22 +86,53 @@ type
   TTransportSecurityServerContext = class
   private
     FBackendData: Pointer;
+    FCriticalSection: TRTLCriticalSection;
+    FCriticalSectionInitialized: Boolean;
     FInputHighWatermark: Integer;
     FInputLowWatermark: Integer;
     FOutputCapacity: Integer;
-    procedure Initialize(const APkcs12Path: string;
-      const APkcs12Passphrase: UnicodeString; const AInputHighWatermark,
+    function AcquireSnapshot: Pointer;
+    procedure InitializeFlowControl(const AInputHighWatermark,
       AInputLowWatermark, AOutputCapacity: Integer);
+    procedure ReplaceSnapshot(const ANewSnapshot: Pointer);
   public
-    constructor Create(const APkcs12Path: string;
-      const APkcs12Passphrase: UnicodeString); overload;
+    constructor Create(const APkcs12Identity: TBytes;
+      const APkcs12Passphrase: UnicodeString;
+      const AValidation: TTransportSecurityServerIdentityValidation =
+      tsivStrict); overload;
+    constructor Create(const APkcs12Identity: TBytes;
+      const APkcs12Passphrase: UnicodeString; const AInputHighWatermark,
+      AOutputCapacity: Integer;
+      const AValidation: TTransportSecurityServerIdentityValidation =
+      tsivStrict); overload;
+    constructor Create(const APkcs12Identity: TBytes;
+      const APkcs12Passphrase: UnicodeString; const AInputHighWatermark,
+      AInputLowWatermark, AOutputCapacity: Integer;
+      const AValidation: TTransportSecurityServerIdentityValidation =
+      tsivStrict); overload;
     constructor Create(const APkcs12Path: string;
       const APkcs12Passphrase: UnicodeString;
-      const AInputHighWatermark, AOutputCapacity: Integer); overload;
+      const AValidation: TTransportSecurityServerIdentityValidation =
+      tsivStrict); overload;
+    constructor Create(const APkcs12Path: string;
+      const APkcs12Passphrase: UnicodeString;
+      const AInputHighWatermark, AOutputCapacity: Integer;
+      const AValidation: TTransportSecurityServerIdentityValidation =
+      tsivStrict); overload;
     constructor Create(const APkcs12Path: string;
       const APkcs12Passphrase: UnicodeString; const AInputHighWatermark,
-      AInputLowWatermark, AOutputCapacity: Integer); overload;
+      AInputLowWatermark, AOutputCapacity: Integer;
+      const AValidation: TTransportSecurityServerIdentityValidation =
+      tsivStrict); overload;
     destructor Destroy; override;
+    procedure Reload(const APkcs12Identity: TBytes;
+      const APkcs12Passphrase: UnicodeString;
+      const AValidation: TTransportSecurityServerIdentityValidation =
+      tsivStrict); overload;
+    procedure Reload(const APkcs12Path: string;
+      const APkcs12Passphrase: UnicodeString;
+      const AValidation: TTransportSecurityServerIdentityValidation =
+      tsivStrict); overload;
   end;
 
 procedure StartTransportSecurity(var AConnection: TTransportSecurityConnection;
@@ -614,6 +650,10 @@ type
   TOpenSSLServerContextData = class
   public
     Context: PSSL_CTX;
+    References: LongInt;
+    constructor Create(const AContext: PSSL_CTX);
+    procedure Retain;
+    procedure Release;
   end;
 
   TOpenSSLServerData = class
@@ -630,6 +670,7 @@ type
     OutputOffset: Integer;
     PendingPlaintext: TBytes;
     ReadBIO: Pointer;
+    Snapshot: TOpenSSLServerContextData;
     SSL: PSSL;
     WriteBIO: Pointer;
   end;
@@ -656,6 +697,18 @@ type
   TOpenSSLVersionNumber = function: PtrUInt; cdecl;
   TPKCS12Parse = function(APKCS12: Pointer; APassphrase: PAnsiChar;
     out APrivateKey, ACertificate, AChain: Pointer): LongInt; cdecl;
+  TX509CheckPurpose = function(ACertificate: Pointer; APurpose,
+    ACertificateAuthority: LongInt): LongInt; cdecl;
+  TX509CompareCurrentTime = function(ATime: Pointer): LongInt; cdecl;
+  TX509GetExtendedKeyUsage = function(ACertificate: Pointer): Cardinal; cdecl;
+  TX509GetExtensionFlags = function(ACertificate: Pointer): Cardinal; cdecl;
+  TX509GetKeyUsage = function(ACertificate: Pointer): Cardinal; cdecl;
+  TX509GetName = function(ACertificate: Pointer): Pointer; cdecl;
+  TX509GetPathLength = function(ACertificate: Pointer): LongInt; cdecl;
+  TX509GetPublicKey = function(ACertificate: Pointer): Pointer; cdecl;
+  TX509GetTime = function(ACertificate: Pointer): Pointer; cdecl;
+  TX509NameCompare = function(AName, BName: Pointer): LongInt; cdecl;
+  TX509Verify = function(ACertificate, APublicKey: Pointer): LongInt; cdecl;
   TSSLContextSetOptions = function(AContext: PSSL_CTX;
     const AOptions: QWord): QWord; cdecl;
   TSSLSetAcceptState = procedure(ASSL: PSSL); cdecl;
@@ -671,6 +724,18 @@ const
   BIO_FLAGS_RETRY_MASK = $0F;
   MAX_PKCS12_IDENTITY_SIZE = 16 * 1024 * 1024;
   OPENSSL_OUTPUT_CHUNK_SIZE = 16 * 1024;
+  EXFLAG_BCONS = $1;
+  EXFLAG_KUSAGE = $2;
+  EXFLAG_XKUSAGE = $4;
+  EXFLAG_CA = $10;
+  EXFLAG_INVALID = $80;
+  EXFLAG_CRITICAL = $200;
+  EXFLAG_INVALID_POLICY = $800;
+  EXFLAG_NO_FINGERPRINT = $100000;
+  X509_PURPOSE_SSL_SERVER = 2;
+  KU_KEY_CERT_SIGN = $4;
+  XKU_SSL_SERVER = $1;
+  XKU_ANYEKU = $100;
   {$IFDEF MSWINDOWS}
   {$IFDEF WIN64}
   OPENSSL_VERSION_THREE_SSL_LIBRARY = 'libssl-3-x64.dll';
@@ -702,6 +767,41 @@ var
   {$ENDIF}
   OpenSSLSSLSetAcceptState: TSSLSetAcceptState;
   OpenSSLSSLSetBIO: TSSLSetBIO;
+  OpenSSLX509CheckPurpose: TX509CheckPurpose;
+  OpenSSLX509CompareCurrentTime: TX509CompareCurrentTime;
+  OpenSSLX509GetExtendedKeyUsage: TX509GetExtendedKeyUsage;
+  OpenSSLX509GetExtensionFlags: TX509GetExtensionFlags;
+  OpenSSLX509GetIssuerName: TX509GetName;
+  OpenSSLX509GetKeyUsage: TX509GetKeyUsage;
+  OpenSSLX509GetNotAfter: TX509GetTime;
+  OpenSSLX509GetNotBefore: TX509GetTime;
+  OpenSSLX509GetPathLength: TX509GetPathLength;
+  OpenSSLX509GetPublicKey: TX509GetPublicKey;
+  OpenSSLX509GetSubjectName: TX509GetName;
+  OpenSSLX509NameCompare: TX509NameCompare;
+  OpenSSLX509Verify: TX509Verify;
+
+constructor TOpenSSLServerContextData.Create(const AContext: PSSL_CTX);
+begin
+  inherited Create;
+  Context := AContext;
+  References := 1;
+end;
+
+procedure TOpenSSLServerContextData.Retain;
+begin
+  InterlockedIncrement(References);
+end;
+
+procedure TOpenSSLServerContextData.Release;
+begin
+  if InterlockedDecrement(References) <> 0 then
+    Exit;
+  if Assigned(Context) then
+    SslCtxFree(Context);
+  Context := nil;
+  Free;
+end;
 
 {$IFDEF UNIX}
 procedure PreferOpenSSLVersionThree;
@@ -879,6 +979,19 @@ var
   PKCS12Parse: TPKCS12Parse;
   SSLContextSetOptions: TSSLContextSetOptions;
   VersionNumber: TOpenSSLVersionNumber;
+  X509CheckPurpose: TX509CheckPurpose;
+  X509CompareCurrentTime: TX509CompareCurrentTime;
+  X509GetExtendedKeyUsage: TX509GetExtendedKeyUsage;
+  X509GetExtensionFlags: TX509GetExtensionFlags;
+  X509GetIssuerName: TX509GetName;
+  X509GetKeyUsage: TX509GetKeyUsage;
+  X509GetNotAfter: TX509GetTime;
+  X509GetNotBefore: TX509GetTime;
+  X509GetPathLength: TX509GetPathLength;
+  X509GetPublicKey: TX509GetPublicKey;
+  X509GetSubjectName: TX509GetName;
+  X509NameCompare: TX509NameCompare;
+  X509VerifyCertificate: TX509Verify;
 begin
   if OpenSSLServerProceduresLoaded then
     Exit;
@@ -913,6 +1026,32 @@ begin
     SSLLibHandle, 'SSL_set_accept_state'));
   SSLSetBIO := TSSLSetBIO(GetProcedureAddress(SSLLibHandle,
     'SSL_set_bio'));
+  X509CheckPurpose := TX509CheckPurpose(GetProcedureAddress(SSLUtilHandle,
+    'X509_check_purpose'));
+  X509CompareCurrentTime := TX509CompareCurrentTime(GetProcedureAddress(
+    SSLUtilHandle, 'X509_cmp_current_time'));
+  X509GetExtendedKeyUsage := TX509GetExtendedKeyUsage(GetProcedureAddress(
+    SSLUtilHandle, 'X509_get_extended_key_usage'));
+  X509GetExtensionFlags := TX509GetExtensionFlags(GetProcedureAddress(
+    SSLUtilHandle, 'X509_get_extension_flags'));
+  X509GetIssuerName := TX509GetName(GetProcedureAddress(SSLUtilHandle,
+    'X509_get_issuer_name'));
+  X509GetKeyUsage := TX509GetKeyUsage(GetProcedureAddress(SSLUtilHandle,
+    'X509_get_key_usage'));
+  X509GetNotAfter := TX509GetTime(GetProcedureAddress(SSLUtilHandle,
+    'X509_get0_notAfter'));
+  X509GetNotBefore := TX509GetTime(GetProcedureAddress(SSLUtilHandle,
+    'X509_get0_notBefore'));
+  X509GetPathLength := TX509GetPathLength(GetProcedureAddress(SSLUtilHandle,
+    'X509_get_pathlen'));
+  X509GetPublicKey := TX509GetPublicKey(GetProcedureAddress(SSLUtilHandle,
+    'X509_get_pubkey'));
+  X509GetSubjectName := TX509GetName(GetProcedureAddress(SSLUtilHandle,
+    'X509_get_subject_name'));
+  X509NameCompare := TX509NameCompare(GetProcedureAddress(SSLUtilHandle,
+    'X509_NAME_cmp'));
+  X509VerifyCertificate := TX509Verify(GetProcedureAddress(SSLUtilHandle,
+    'X509_verify'));
 
   if not Assigned(BIOFree) or not Assigned(BIONew) or
      not Assigned(BIONewMemoryBuffer) or not Assigned(BIONewPair) or
@@ -922,7 +1061,15 @@ begin
      not Assigned(PKCS12Parse) or
      not Assigned(SSLContextSetOptions) or
      not Assigned(VersionNumber) or not Assigned(SSLSetAcceptState) or
-     not Assigned(SSLSetBIO) then
+     not Assigned(SSLSetBIO) or not Assigned(X509CheckPurpose) or
+     not Assigned(X509CompareCurrentTime) or
+     not Assigned(X509GetExtendedKeyUsage) or
+     not Assigned(X509GetExtensionFlags) or
+     not Assigned(X509GetIssuerName) or not Assigned(X509GetKeyUsage) or
+     not Assigned(X509GetNotAfter) or not Assigned(X509GetNotBefore) or
+     not Assigned(X509GetPathLength) or not Assigned(X509GetPublicKey) or
+     not Assigned(X509GetSubjectName) or not Assigned(X509NameCompare) or
+     not Assigned(X509VerifyCertificate) then
     raise ETransportSecurityError.Create(
       'OpenSSL runtime does not provide the required TLS server memory-BIO interface');
 
@@ -944,6 +1091,19 @@ begin
   OpenSSLSSLContextSetOptions := SSLContextSetOptions;
   OpenSSLSSLSetAcceptState := SSLSetAcceptState;
   OpenSSLSSLSetBIO := SSLSetBIO;
+  OpenSSLX509CheckPurpose := X509CheckPurpose;
+  OpenSSLX509CompareCurrentTime := X509CompareCurrentTime;
+  OpenSSLX509GetExtendedKeyUsage := X509GetExtendedKeyUsage;
+  OpenSSLX509GetExtensionFlags := X509GetExtensionFlags;
+  OpenSSLX509GetIssuerName := X509GetIssuerName;
+  OpenSSLX509GetKeyUsage := X509GetKeyUsage;
+  OpenSSLX509GetNotAfter := X509GetNotAfter;
+  OpenSSLX509GetNotBefore := X509GetNotBefore;
+  OpenSSLX509GetPathLength := X509GetPathLength;
+  OpenSSLX509GetPublicKey := X509GetPublicKey;
+  OpenSSLX509GetSubjectName := X509GetSubjectName;
+  OpenSSLX509NameCompare := X509NameCompare;
+  OpenSSLX509Verify := X509VerifyCertificate;
   OpenSSLServerProceduresLoaded := True;
 end;
 
@@ -1098,8 +1258,11 @@ begin
     SslFree(AData.SSL);
   if Assigned(AData.WriteBIO) then
     OpenSSLBIOFree(AData.WriteBIO);
+  if Assigned(AData.Snapshot) then
+    AData.Snapshot.Release;
   AData.SSL := nil;
   AData.ReadBIO := nil;
+  AData.Snapshot := nil;
   AData.WriteBIO := nil;
   if Length(AData.PendingPlaintext) > 0 then
     FillChar(AData.PendingPlaintext[0], Length(AData.PendingPlaintext), 0);
@@ -1294,15 +1457,25 @@ var
   Data: TOpenSSLServerData;
   SSLWriteBIO: Pointer;
 begin
-  ContextData := TOpenSSLServerContextData(AContext.FBackendData);
+  ContextData := TOpenSSLServerContextData(AContext.AcquireSnapshot);
   if not Assigned(ContextData) or not Assigned(ContextData.Context) then
+  begin
+    if Assigned(ContextData) then
+      ContextData.Release;
     raise ETransportSecurityError.Create(
       'TLS server context is not initialized');
+  end;
 
-  Data := TOpenSSLServerData.Create;
+  try
+    Data := TOpenSSLServerData.Create;
+  except
+    ContextData.Release;
+    raise;
+  end;
   BIOsOwnedBySSL := False;
   SSLWriteBIO := nil;
   try
+    Data.Snapshot := ContextData;
     Data.InputHighWatermark := AContext.FInputHighWatermark;
     Data.InputLowWatermark := AContext.FInputLowWatermark;
     Data.OutputCapacity := AContext.FOutputCapacity;
@@ -1737,36 +1910,396 @@ begin
   until False;
 end;
 
-function LoadPKCS12Bytes(const APath: string): TBytes;
-var
-  Input: TFileStream;
+{$IFDEF UNIX}
+function OpenAt(ADirectoryDescriptor: cint; APath: PChar;
+  AFlags: cint): cint; cdecl; external 'c' name 'openat';
+function FileStatusAt(ADirectoryDescriptor: cint; APath: PChar;
+  var AFileStatus: BaseUnix.Stat; AFlags: cint): cint; cdecl;
+  external 'c' name 'fstatat';
+
+{$IFDEF LINUX}
+type
+  PCIntLWPT = ^cint;
+
+function LinuxErrnoLocation: PCIntLWPT; cdecl;
+  external 'c' name '__errno_location';
+{$ENDIF}
+
+const
+  {$IFDEF LINUX}
+  AT_SYMLINK_NOFOLLOW_LWPT = $00000100;
+  O_NONBLOCK_LWPT = $00000800;
+  { Linux AArch64 overrides the asm-generic directory and no-follow bits.
+    FPC 3.2.2 exposes the asm-generic values on that target, so these values
+    must follow the target UAPI rather than the RTL constants. }
+  {$IFDEF CPUAARCH64}
+  O_DIRECTORY_LWPT = $00004000;
+  O_NOFOLLOW_LWPT = $00008000;
+  {$ELSE}
+  O_DIRECTORY_LWPT = $00010000;
+  O_NOFOLLOW_LWPT = $00020000;
+  {$ENDIF}
+  {$ELSE}
+  {$IFDEF DARWIN}
+  AT_SYMLINK_NOFOLLOW_LWPT = $00000020;
+  O_DIRECTORY_LWPT = $00100000;
+  O_NOFOLLOW_LWPT = $00000100;
+  O_NONBLOCK_LWPT = $00000004;
+  {$ELSE}
+  AT_SYMLINK_NOFOLLOW_LWPT = AT_SYMLINK_NOFOLLOW;
+  O_DIRECTORY_LWPT = O_DIRECTORY;
+  O_NOFOLLOW_LWPT = O_NOFOLLOW;
+  O_NONBLOCK_LWPT = O_NONBLOCK;
+  {$ENDIF}
+  {$ENDIF}
+
+function LastLibcError: cint; inline;
 begin
-  Result := nil;
-  if not FileExists(APath) then
+  {$IFDEF LINUX}
+  Result := LinuxErrnoLocation^;
+  {$ELSE}
+  Result := fpgeterrno;
+  {$ENDIF}
+end;
+
+function OpenPKCS12Descriptor(const APath: string): cint;
+var
+  Component: string;
+  CurrentDescriptor: cint;
+  ErrorCode: cint;
+  IsFinal: Boolean;
+  LinkInfo: BaseUnix.Stat;
+  NextDescriptor: cint;
+  OpenFlags: cint;
+  OpenInfo: BaseUnix.Stat;
+  Position: Integer;
+  Start: Integer;
+begin
+  if APath = '' then
     raise ETransportSecurityError.Create(
       'Configured TLS PKCS#12 identity file does not exist');
+  if APath[1] = '/' then
+    CurrentDescriptor := fpOpen(PChar('/'), O_RDONLY)
+  else
+    CurrentDescriptor := fpOpen(PChar('.'), O_RDONLY);
+  if CurrentDescriptor < 0 then
+    raise ETransportSecurityError.Create(
+      'Failed to open configured TLS PKCS#12 identity without following links');
   try
-    Input := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
-    try
-      if Input.Size <= 0 then
+    Position := 1;
+    while Position <= Length(APath) do
+    begin
+      while (Position <= Length(APath)) and (APath[Position] = '/') do
+        Inc(Position);
+      if Position > Length(APath) then
+        Break;
+      Start := Position;
+      while (Position <= Length(APath)) and (APath[Position] <> '/') do
+        Inc(Position);
+      Component := Copy(APath, Start, Position - Start);
+      while (Position <= Length(APath)) and (APath[Position] = '/') do
+        Inc(Position);
+      IsFinal := Position > Length(APath);
+      if FileStatusAt(CurrentDescriptor, PChar(Component), LinkInfo,
+        AT_SYMLINK_NOFOLLOW_LWPT) <> 0 then
+      begin
+        ErrorCode := LastLibcError;
+        if ErrorCode = ESysENOENT then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 identity file does not exist');
         raise ETransportSecurityError.Create(
-          'Configured TLS PKCS#12 identity file is empty');
-      if Input.Size > MAX_PKCS12_IDENTITY_SIZE then
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      end;
+      if (LinkInfo.st_mode and S_IFMT) = S_IFLNK then
         raise ETransportSecurityError.Create(
-          'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
-      SetLength(Result, Integer(Input.Size));
-      Input.ReadBuffer(Result[0], Length(Result));
-    finally
-      Input.Free;
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      if IsFinal then
+      begin
+        if (LinkInfo.st_mode and S_IFMT) <> S_IFREG then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 identity must be a regular file');
+        OpenFlags := O_RDONLY or O_NOFOLLOW_LWPT or O_NONBLOCK_LWPT;
+      end
+      else
+      begin
+        if (LinkInfo.st_mode and S_IFMT) <> S_IFDIR then
+          raise ETransportSecurityError.Create(
+            'Failed to open configured TLS PKCS#12 identity without following links');
+        OpenFlags := O_RDONLY or O_NOFOLLOW_LWPT or O_NONBLOCK_LWPT or
+          O_DIRECTORY_LWPT;
+      end;
+      NextDescriptor := OpenAt(CurrentDescriptor, PChar(Component),
+        OpenFlags);
+      if NextDescriptor < 0 then
+      begin
+        ErrorCode := LastLibcError;
+        if ErrorCode = ESysENOENT then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 identity file does not exist');
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      end;
+      if (fpFStat(NextDescriptor, OpenInfo) <> 0) or
+         (OpenInfo.st_dev <> LinkInfo.st_dev) or
+         (OpenInfo.st_ino <> LinkInfo.st_ino) or
+         ((OpenInfo.st_mode and S_IFMT) <> (LinkInfo.st_mode and S_IFMT)) then
+      begin
+        fpClose(NextDescriptor);
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      end;
+      fpClose(CurrentDescriptor);
+      CurrentDescriptor := NextDescriptor;
     end;
-  except
-    on E: ETransportSecurityError do
-      raise;
-    on E: Exception do
-      raise ETransportSecurityError.Create(
-        'Failed to read configured TLS PKCS#12 identity file');
+    Result := CurrentDescriptor;
+    CurrentDescriptor := -1;
+  finally
+    if CurrentDescriptor >= 0 then
+      fpClose(CurrentDescriptor);
   end;
 end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+type
+  PPWideCharLWPT = ^PWideChar;
+  TWindowsHandleArray = array of THandle;
+
+function WindowsGetFullPathName(APath: PWideChar; ALength: DWORD;
+  ABuffer: PWideChar; AFilePart: PPWideCharLWPT): DWORD; stdcall;
+  external 'kernel32.dll' name 'GetFullPathNameW';
+
+function NormalizeWindowsPath(const APath: UnicodeString): UnicodeString;
+begin
+  Result := APath;
+  if Copy(Result, 1, 8) = '\\?\UNC\' then
+    Result := '\\' + Copy(Result, 9, MaxInt)
+  else if Copy(Result, 1, 4) = '\\?\' then
+    Delete(Result, 1, 4);
+end;
+
+function WindowsFullPath(const APath: string): UnicodeString;
+var
+  BufferLength: DWORD;
+  FilePart: PWideChar;
+begin
+  Result := '';
+  BufferLength := WindowsGetFullPathName(PWideChar(UnicodeString(APath)),
+    0, nil, nil);
+  if BufferLength = 0 then
+    raise ETransportSecurityError.Create(
+      'Failed to inspect configured TLS PKCS#12 identity');
+  SetLength(Result, BufferLength);
+  BufferLength := WindowsGetFullPathName(PWideChar(UnicodeString(APath)),
+    Length(Result), PWideChar(Result), @FilePart);
+  if (BufferLength = 0) or (BufferLength >= DWORD(Length(Result))) then
+    raise ETransportSecurityError.Create(
+      'Failed to inspect configured TLS PKCS#12 identity');
+  SetLength(Result, BufferLength);
+  Result := NormalizeWindowsPath(Result);
+end;
+
+function WindowsRootLength(const APath: UnicodeString): Integer;
+var
+  Position: Integer;
+begin
+  if (Length(APath) >= 3) and (APath[2] = ':') and (APath[3] = '\') then
+    Exit(3);
+  if (Length(APath) < 5) or (Copy(APath, 1, 2) <> '\\') then
+    Exit(0);
+  Position := 3;
+  while (Position <= Length(APath)) and (APath[Position] <> '\') do
+    Inc(Position);
+  if Position > Length(APath) then
+    Exit(0);
+  Inc(Position);
+  while (Position <= Length(APath)) and (APath[Position] <> '\') do
+    Inc(Position);
+  if Position > Length(APath) then
+    Result := Length(APath)
+  else
+    Result := Position;
+end;
+
+procedure CloseWindowsHandles(var AHandles: TWindowsHandleArray);
+var
+  I: Integer;
+begin
+  for I := High(AHandles) downto 0 do
+    if AHandles[I] <> THandle(Windows.INVALID_HANDLE_VALUE) then
+      Windows.CloseHandle(AHandles[I]);
+  SetLength(AHandles, 0);
+end;
+
+procedure OpenWindowsParentHandles(const APath: UnicodeString;
+  out AHandles: TWindowsHandleArray);
+const
+  FILE_FLAG_BACKUP_SEMANTICS_LWPT = $02000000;
+  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
+  FILE_READ_ATTRIBUTES_LWPT = $00000080;
+var
+  ComponentEnd: Integer;
+  ComponentStart: Integer;
+  FileInfo: TByHandleFileInformation;
+  Handle: THandle;
+  ParentPath: UnicodeString;
+  RootLength: Integer;
+begin
+  SetLength(AHandles, 0);
+  RootLength := WindowsRootLength(APath);
+  if RootLength = 0 then
+    raise ETransportSecurityError.Create(
+      'Failed to inspect configured TLS PKCS#12 identity');
+  ComponentStart := RootLength + 1;
+  while ComponentStart <= Length(APath) do
+  begin
+    ComponentEnd := ComponentStart;
+    while (ComponentEnd <= Length(APath)) and
+      (APath[ComponentEnd] <> '\') do
+      Inc(ComponentEnd);
+    if ComponentEnd > Length(APath) then
+      Break;
+    ParentPath := Copy(APath, 1, ComponentEnd - 1);
+    Handle := Windows.CreateFileW(PWideChar(ParentPath),
+      FILE_READ_ATTRIBUTES_LWPT, Windows.FILE_SHARE_READ, nil,
+      Windows.OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS_LWPT or
+      FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
+    if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
+    begin
+      CloseWindowsHandles(AHandles);
+      raise ETransportSecurityError.Create(
+        'Failed to open configured TLS PKCS#12 identity without following reparse points');
+    end;
+    if not Windows.GetFileInformationByHandle(Handle, FileInfo) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY) = 0) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+    begin
+      Windows.CloseHandle(Handle);
+      CloseWindowsHandles(AHandles);
+      raise ETransportSecurityError.Create(
+        'Failed to open configured TLS PKCS#12 identity without following reparse points');
+    end;
+    SetLength(AHandles, Length(AHandles) + 1);
+    AHandles[High(AHandles)] := Handle;
+    ComponentStart := ComponentEnd + 1;
+  end;
+end;
+{$ENDIF}
+
+function LoadPKCS12Bytes(const APath: string): TBytes;
+{$IFDEF UNIX}
+var
+  BytesRead: Integer;
+  Descriptor: cint;
+  FileInfo: BaseUnix.Stat;
+  Offset: Integer;
+begin
+  Result := nil;
+  Descriptor := OpenPKCS12Descriptor(APath);
+  try
+    if (fpFStat(Descriptor, FileInfo) <> 0) or
+       ((FileInfo.st_mode and S_IFMT) <> S_IFREG) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must be a regular file');
+    if FileInfo.st_size <= 0 then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity file is empty');
+    if FileInfo.st_size > MAX_PKCS12_IDENTITY_SIZE then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
+    SetLength(Result, Integer(FileInfo.st_size));
+    try
+      Offset := 0;
+      while Offset < Length(Result) do
+      begin
+        repeat
+          BytesRead := fpRead(Descriptor, Result[Offset],
+            Length(Result) - Offset);
+        until (BytesRead >= 0) or (fpgeterrno <> ESysEINTR);
+        if BytesRead <= 0 then
+          raise ETransportSecurityError.Create(
+            'Failed to read configured TLS PKCS#12 identity file');
+        Inc(Offset, BytesRead);
+      end;
+    except
+      FillChar(Result[0], Length(Result), 0);
+      Result := nil;
+      raise;
+    end;
+  finally
+    fpClose(Descriptor);
+  end;
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+const
+  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
+var
+  BytesRead: DWORD;
+  ExpectedPath: UnicodeString;
+  FileInfo: TByHandleFileInformation;
+  FileSize: QWord;
+  Handle: THandle;
+  LastError: DWORD;
+  Offset: Integer;
+  ParentHandles: TWindowsHandleArray;
+begin
+  Result := nil;
+  ExpectedPath := WindowsFullPath(APath);
+  Handle := THandle(Windows.INVALID_HANDLE_VALUE);
+  OpenWindowsParentHandles(ExpectedPath, ParentHandles);
+  try
+    Handle := Windows.CreateFileW(PWideChar(ExpectedPath),
+      Windows.GENERIC_READ, Windows.FILE_SHARE_READ, nil,
+      Windows.OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
+    if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
+    begin
+      LastError := Windows.GetLastError;
+      if (LastError = Windows.ERROR_FILE_NOT_FOUND) or
+         (LastError = Windows.ERROR_PATH_NOT_FOUND) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 identity file does not exist');
+      raise ETransportSecurityError.Create(
+        'Failed to open configured TLS PKCS#12 identity without following reparse points');
+    end;
+    if not Windows.GetFileInformationByHandle(Handle, FileInfo) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT)
+       <> 0) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY)
+       <> 0) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must be a regular non-reparse file');
+    FileSize := (QWord(FileInfo.nFileSizeHigh) shl 32) or
+      FileInfo.nFileSizeLow;
+    if FileSize = 0 then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity file is empty');
+    if FileSize > MAX_PKCS12_IDENTITY_SIZE then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
+    SetLength(Result, Integer(FileSize));
+    try
+      Offset := 0;
+      while Offset < Length(Result) do
+      begin
+        if not Windows.ReadFile(Handle, Result[Offset],
+          Length(Result) - Offset, BytesRead, nil) or (BytesRead = 0) then
+          raise ETransportSecurityError.Create(
+            'Failed to read configured TLS PKCS#12 identity file');
+        Inc(Offset, BytesRead);
+      end;
+    except
+      FillChar(Result[0], Length(Result), 0);
+      Result := nil;
+      raise;
+    end;
+  finally
+    if Handle <> THandle(Windows.INVALID_HANDLE_VALUE) then
+      Windows.CloseHandle(Handle);
+    CloseWindowsHandles(ParentHandles);
+  end;
+end;
+{$ENDIF}
 
 procedure WipeBytes(var ABytes: TBytes);
 begin
@@ -1798,8 +2331,208 @@ begin
   OpenSSLStackFree(AChain);
 end;
 
+function CertificateIsSelfIssued(const ACertificate: Pointer): Boolean;
+var
+  IssuerName: Pointer;
+  SubjectName: Pointer;
+begin
+  IssuerName := OpenSSLX509GetIssuerName(ACertificate);
+  SubjectName := OpenSSLX509GetSubjectName(ACertificate);
+  Result := Assigned(IssuerName) and Assigned(SubjectName) and
+    (OpenSSLX509NameCompare(IssuerName, SubjectName) = 0);
+end;
+
+function CertificateWasSignedBy(const ACertificate,
+  AIssuer: Pointer): Boolean;
+var
+  PublicKey: Pointer;
+begin
+  PublicKey := OpenSSLX509GetPublicKey(AIssuer);
+  if not Assigned(PublicKey) then
+    Exit(False);
+  try
+    Result := OpenSSLX509Verify(ACertificate, PublicKey) = 1;
+  finally
+    EVP_PKEY_free(PublicKey);
+  end;
+end;
+
+procedure ValidateCertificateTime(const ACertificate: Pointer;
+  const ADescription: string);
+var
+  NotAfter: Pointer;
+  NotBefore: Pointer;
+begin
+  NotBefore := OpenSSLX509GetNotBefore(ACertificate);
+  NotAfter := OpenSSLX509GetNotAfter(ACertificate);
+  if not Assigned(NotBefore) or not Assigned(NotAfter) or
+     (OpenSSLX509CompareCurrentTime(NotBefore) >= 0) or
+     (OpenSSLX509CompareCurrentTime(NotAfter) <= 0) then
+    raise ETransportSecurityError.CreateFmt(
+      'Configured TLS PKCS#12 %s is outside its validity window',
+      [ADescription]);
+end;
+
+procedure ValidateCertificateConstraints(const ACertificate: Pointer;
+  const ADescription: string; const ACertificateAuthority: Boolean);
+const
+  INVALID_EXTENSION_FLAGS = EXFLAG_INVALID or EXFLAG_CRITICAL or
+    EXFLAG_INVALID_POLICY or EXFLAG_NO_FINGERPRINT;
+var
+  Flags: Cardinal;
+  KeyUsage: Cardinal;
+begin
+  Flags := OpenSSLX509GetExtensionFlags(ACertificate);
+  if (Flags and INVALID_EXTENSION_FLAGS) <> 0 then
+    raise ETransportSecurityError.CreateFmt(
+      'Configured TLS PKCS#12 %s contains invalid certificate extensions',
+      [ADescription]);
+  if ACertificateAuthority and ((Flags and EXFLAG_BCONS) = 0) then
+    raise ETransportSecurityError.CreateFmt(
+      'Configured TLS PKCS#12 %s must include basic constraints',
+      [ADescription]);
+  if ACertificateAuthority <> ((Flags and EXFLAG_CA) <> 0) then
+    if ACertificateAuthority then
+      raise ETransportSecurityError.CreateFmt(
+        'Configured TLS PKCS#12 %s must assert CA:TRUE basic constraints',
+        [ADescription])
+    else
+      raise ETransportSecurityError.CreateFmt(
+        'Configured TLS PKCS#12 %s must assert CA:FALSE basic constraints',
+        [ADescription]);
+  if ACertificateAuthority and ((Flags and EXFLAG_KUSAGE) <> 0) then
+  begin
+    KeyUsage := OpenSSLX509GetKeyUsage(ACertificate);
+    if (KeyUsage and KU_KEY_CERT_SIGN) = 0 then
+      raise ETransportSecurityError.CreateFmt(
+        'Configured TLS PKCS#12 %s key usage must permit certificate signing',
+        [ADescription]);
+  end;
+end;
+
+procedure ValidateOpenSSLServerIdentity(const ACertificate,
+  AChain: Pointer);
+var
+  Candidate: Pointer;
+  CandidateIndex: Integer;
+  CandidateSubjectName: Pointer;
+  ChainCount: Integer;
+  CurrentCertificate: Pointer;
+  ExtendedKeyUsage: Cardinal;
+  FoundIndex: Integer;
+  I: Integer;
+  IssuerName: Pointer;
+  NonSelfIssuedCertificateAuthorities: Integer;
+  PathLength: LongInt;
+  Used: array of Boolean;
+  UsedCount: Integer;
+begin
+  ValidateCertificateTime(ACertificate, 'leaf certificate');
+  if CertificateIsSelfIssued(ACertificate) then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 self-signed identities require permissive validation');
+  ValidateCertificateConstraints(ACertificate, 'leaf certificate', False);
+
+  if (OpenSSLX509GetExtensionFlags(ACertificate) and EXFLAG_XKUSAGE) = 0 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 leaf certificate must include serverAuth extended key usage');
+  ExtendedKeyUsage := OpenSSLX509GetExtendedKeyUsage(ACertificate);
+  if (ExtendedKeyUsage and (XKU_SSL_SERVER or XKU_ANYEKU)) = 0 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 leaf certificate is not valid for server authentication');
+  if OpenSSLX509CheckPurpose(ACertificate, X509_PURPOSE_SSL_SERVER, 0) <> 1 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 leaf certificate has an incompatible server purpose');
+
+  if Assigned(AChain) then
+    ChainCount := OpenSSLStackNum(AChain)
+  else
+    ChainCount := 0;
+  SetLength(Used, ChainCount);
+  for I := 0 to ChainCount - 1 do
+  begin
+    Candidate := OpenSSLStackValue(AChain, I);
+    if not Assigned(Candidate) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 certificate chain contains an empty entry');
+    ValidateCertificateTime(Candidate, Format('chain certificate %d',
+      [I + 1]));
+    ValidateCertificateConstraints(Candidate, Format('chain certificate %d',
+      [I + 1]), True);
+  end;
+
+  CurrentCertificate := ACertificate;
+  NonSelfIssuedCertificateAuthorities := 0;
+  UsedCount := 0;
+  while UsedCount < ChainCount do
+  begin
+    IssuerName := OpenSSLX509GetIssuerName(CurrentCertificate);
+    FoundIndex := -1;
+    for CandidateIndex := 0 to ChainCount - 1 do
+      if not Used[CandidateIndex] then
+      begin
+        Candidate := OpenSSLStackValue(AChain, CandidateIndex);
+        CandidateSubjectName := OpenSSLX509GetSubjectName(Candidate);
+        if Assigned(IssuerName) and
+           Assigned(CandidateSubjectName) and
+           (OpenSSLX509NameCompare(IssuerName, CandidateSubjectName) = 0) and
+           CertificateWasSignedBy(CurrentCertificate, Candidate) then
+        begin
+          if FoundIndex >= 0 then
+            raise ETransportSecurityError.Create(
+              'Configured TLS PKCS#12 certificate chain has ambiguous issuers');
+          FoundIndex := CandidateIndex;
+        end;
+      end;
+    if FoundIndex < 0 then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 certificate chain is structurally or cryptographically incoherent');
+    Candidate := OpenSSLStackValue(AChain, FoundIndex);
+    PathLength := OpenSSLX509GetPathLength(Candidate);
+    if (PathLength >= 0) and
+       (NonSelfIssuedCertificateAuthorities > PathLength) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 certificate chain exceeds an issuer path-length constraint');
+    Used[FoundIndex] := True;
+    Inc(UsedCount);
+    CurrentCertificate := Candidate;
+    if not CertificateIsSelfIssued(CurrentCertificate) then
+      Inc(NonSelfIssuedCertificateAuthorities);
+  end;
+
+  if CertificateIsSelfIssued(CurrentCertificate) then
+  begin
+    if not CertificateWasSignedBy(CurrentCertificate, CurrentCertificate) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 certificate chain has an invalid root signature');
+  end
+  else
+  begin
+    IssuerName := OpenSSLX509GetIssuerName(CurrentCertificate);
+    CandidateSubjectName := OpenSSLX509GetSubjectName(ACertificate);
+    if Assigned(IssuerName) and Assigned(CandidateSubjectName) and
+       (OpenSSLX509NameCompare(IssuerName, CandidateSubjectName) = 0) and
+       CertificateWasSignedBy(CurrentCertificate, ACertificate) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 certificate chain contains a certificate cycle');
+    for I := 0 to ChainCount - 1 do
+    begin
+      Candidate := OpenSSLStackValue(AChain, I);
+      if Candidate = CurrentCertificate then
+        Continue;
+      CandidateSubjectName := OpenSSLX509GetSubjectName(Candidate);
+      if Assigned(IssuerName) and Assigned(CandidateSubjectName) and
+         (OpenSSLX509NameCompare(IssuerName, CandidateSubjectName) = 0) and
+         CertificateWasSignedBy(CurrentCertificate, Candidate) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 certificate chain contains a certificate cycle');
+    end;
+  end;
+end;
+
 procedure ConfigureOpenSSLServerIdentity(const AContext: PSSL_CTX;
-  var AIdentity: TBytes; const APassphrase: UnicodeString);
+  var AIdentity: TBytes; const APassphrase: UnicodeString;
+  const AValidation: TTransportSecurityServerIdentityValidation);
 var
   Certificate: Pointer;
   Chain: Pointer;
@@ -1845,6 +2578,9 @@ begin
       raise ETransportSecurityError.Create(
         'Configured TLS PKCS#12 identity must contain a certificate and private key');
 
+    if AValidation = tsivStrict then
+      ValidateOpenSSLServerIdentity(Certificate, Chain);
+
     if SslCtxUseCertificate(AContext, Certificate) <> 1 then
       raise ETransportSecurityError.Create(
         'Failed to configure the certificate from the TLS PKCS#12 identity');
@@ -1876,6 +2612,37 @@ begin
       OpenSSLBIOFree(IdentityBIO);
     WipeUTF8String(Passphrase);
     WipeBytes(AIdentity);
+  end;
+end;
+
+function CreateOpenSSLServerSnapshot(const APkcs12Identity: TBytes;
+  const APkcs12Passphrase: UnicodeString;
+  const AValidation: TTransportSecurityServerIdentityValidation):
+  TOpenSSLServerContextData;
+var
+  Context: PSSL_CTX;
+  Identity: TBytes;
+begin
+  Result := nil;
+  if Length(APkcs12Identity) = 0 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity is empty');
+  if Length(APkcs12Identity) > MAX_PKCS12_IDENTITY_SIZE then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
+  SetLength(Identity, Length(APkcs12Identity));
+  Move(APkcs12Identity[0], Identity[0], Length(Identity));
+  Context := nil;
+  try
+    Context := CreateOpenSSLServerContext;
+    ConfigureOpenSSLServerIdentity(Context, Identity,
+      APkcs12Passphrase, AValidation);
+    Result := TOpenSSLServerContextData.Create(Context);
+    Context := nil;
+  finally
+    if Assigned(Context) then
+      SslCtxFree(Context);
+    WipeBytes(Identity);
   end;
 end;
 {$ENDIF}
@@ -2479,17 +3246,34 @@ begin
   {$ENDIF}
 end;
 
-procedure TTransportSecurityServerContext.Initialize(
-  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
-  const AInputHighWatermark, AInputLowWatermark,
-  AOutputCapacity: Integer);
+function TTransportSecurityServerContext.AcquireSnapshot: Pointer;
 {$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
-  Data: TOpenSSLServerContextData;
-  Identity: TBytes;
+  Snapshot: TOpenSSLServerContextData;
 {$ENDIF}
 begin
-  FBackendData := nil;
+  Result := nil;
+  if not FCriticalSectionInitialized then
+    Exit;
+  EnterCriticalSection(FCriticalSection);
+  try
+    {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+    Snapshot := TOpenSSLServerContextData(FBackendData);
+    if Assigned(Snapshot) then
+    begin
+      Snapshot.Retain;
+      Result := Snapshot;
+    end;
+    {$ENDIF}
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+end;
+
+procedure TTransportSecurityServerContext.InitializeFlowControl(
+  const AInputHighWatermark, AInputLowWatermark,
+  AOutputCapacity: Integer);
+begin
   if (AInputHighWatermark < TLS_SERVER_MIN_INPUT_CAPACITY) or
      (AInputHighWatermark > TLS_SERVER_MAX_INPUT_CAPACITY) then
     raise ETransportSecurityError.CreateFmt(
@@ -2507,73 +3291,182 @@ begin
   FInputHighWatermark := AInputHighWatermark;
   FInputLowWatermark := AInputLowWatermark;
   FOutputCapacity := AOutputCapacity;
+end;
+
+procedure TTransportSecurityServerContext.ReplaceSnapshot(
+  const ANewSnapshot: Pointer);
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  OldSnapshot: TOpenSSLServerContextData;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  OldSnapshot := nil;
+  if not FCriticalSectionInitialized then
+    raise ETransportSecurityError.Create(
+      'TLS server context is not initialized');
+  EnterCriticalSection(FCriticalSection);
+  try
+    OldSnapshot := TOpenSSLServerContextData(FBackendData);
+    FBackendData := ANewSnapshot;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+  if Assigned(OldSnapshot) then
+    OldSnapshot.Release;
+  {$ELSE}
+  FBackendData := ANewSnapshot;
+  {$ENDIF}
+end;
+
+constructor TTransportSecurityServerContext.Create(
+  const APkcs12Identity: TBytes; const APkcs12Passphrase: UnicodeString;
+  const AValidation: TTransportSecurityServerIdentityValidation);
+begin
+  inherited Create;
+  FBackendData := nil;
+  FCriticalSectionInitialized := False;
+  InitializeFlowControl(TLS_SERVER_DEFAULT_INPUT_CAPACITY,
+    TLS_SERVER_DEFAULT_INPUT_CAPACITY div 2,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  InitCriticalSection(FCriticalSection);
+  FCriticalSectionInitialized := True;
+  Reload(APkcs12Identity, APkcs12Passphrase, AValidation);
+end;
+
+constructor TTransportSecurityServerContext.Create(
+  const APkcs12Identity: TBytes; const APkcs12Passphrase: UnicodeString;
+  const AInputHighWatermark, AOutputCapacity: Integer;
+  const AValidation: TTransportSecurityServerIdentityValidation);
+begin
+  inherited Create;
+  FBackendData := nil;
+  FCriticalSectionInitialized := False;
+  InitializeFlowControl(AInputHighWatermark,
+    AInputHighWatermark div 2, AOutputCapacity);
+  InitCriticalSection(FCriticalSection);
+  FCriticalSectionInitialized := True;
+  Reload(APkcs12Identity, APkcs12Passphrase, AValidation);
+end;
+
+constructor TTransportSecurityServerContext.Create(
+  const APkcs12Identity: TBytes; const APkcs12Passphrase: UnicodeString;
+  const AInputHighWatermark, AInputLowWatermark,
+  AOutputCapacity: Integer;
+  const AValidation: TTransportSecurityServerIdentityValidation);
+begin
+  inherited Create;
+  FBackendData := nil;
+  FCriticalSectionInitialized := False;
+  InitializeFlowControl(AInputHighWatermark, AInputLowWatermark,
+    AOutputCapacity);
+  InitCriticalSection(FCriticalSection);
+  FCriticalSectionInitialized := True;
+  Reload(APkcs12Identity, APkcs12Passphrase, AValidation);
+end;
+
+constructor TTransportSecurityServerContext.Create(
+  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
+  const AValidation: TTransportSecurityServerIdentityValidation);
+begin
+  inherited Create;
+  FBackendData := nil;
+  FCriticalSectionInitialized := False;
+  InitializeFlowControl(TLS_SERVER_DEFAULT_INPUT_CAPACITY,
+    TLS_SERVER_DEFAULT_INPUT_CAPACITY div 2,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  InitCriticalSection(FCriticalSection);
+  FCriticalSectionInitialized := True;
+  Reload(APkcs12Path, APkcs12Passphrase, AValidation);
+end;
+
+constructor TTransportSecurityServerContext.Create(
+  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
+  const AInputHighWatermark, AOutputCapacity: Integer;
+  const AValidation: TTransportSecurityServerIdentityValidation);
+begin
+  inherited Create;
+  FBackendData := nil;
+  FCriticalSectionInitialized := False;
+  InitializeFlowControl(AInputHighWatermark,
+    AInputHighWatermark div 2, AOutputCapacity);
+  InitCriticalSection(FCriticalSection);
+  FCriticalSectionInitialized := True;
+  Reload(APkcs12Path, APkcs12Passphrase, AValidation);
+end;
+
+constructor TTransportSecurityServerContext.Create(
+  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
+  const AInputHighWatermark, AInputLowWatermark,
+  AOutputCapacity: Integer;
+  const AValidation: TTransportSecurityServerIdentityValidation);
+begin
+  inherited Create;
+  FBackendData := nil;
+  FCriticalSectionInitialized := False;
+  InitializeFlowControl(AInputHighWatermark, AInputLowWatermark,
+    AOutputCapacity);
+  InitCriticalSection(FCriticalSection);
+  FCriticalSectionInitialized := True;
+  Reload(APkcs12Path, APkcs12Passphrase, AValidation);
+end;
+
+destructor TTransportSecurityServerContext.Destroy;
+begin
+  if FCriticalSectionInitialized then
+  begin
+    ReplaceSnapshot(nil);
+    DoneCriticalSection(FCriticalSection);
+    FCriticalSectionInitialized := False;
+  end;
+  FBackendData := nil;
+  inherited Destroy;
+end;
+
+procedure TTransportSecurityServerContext.Reload(
+  const APkcs12Identity: TBytes; const APkcs12Passphrase: UnicodeString;
+  const AValidation: TTransportSecurityServerIdentityValidation);
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+var
+  Snapshot: TOpenSSLServerContextData;
+{$ENDIF}
+begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   if not TryLoadOpenSSLServer then
     raise ETransportSecurityError.Create(OPENSSL_SERVER_LOAD_ERROR);
   LoadOpenSSLServerProcedures;
-  Identity := nil;
+  Snapshot := CreateOpenSSLServerSnapshot(APkcs12Identity,
+    APkcs12Passphrase, AValidation);
   try
-    Identity := LoadPKCS12Bytes(APkcs12Path);
-    Data := TOpenSSLServerContextData.Create;
-    Data.Context := nil;
-    FBackendData := Data;
-    Data.Context := CreateOpenSSLServerContext;
-    ConfigureOpenSSLServerIdentity(Data.Context, Identity,
-      APkcs12Passphrase);
+    ReplaceSnapshot(Snapshot);
+    Snapshot := nil;
   finally
-    WipeBytes(Identity);
+    if Assigned(Snapshot) then
+      Snapshot.Release;
   end;
   {$ELSE}
   raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
   {$ENDIF}
 end;
 
-constructor TTransportSecurityServerContext.Create(
-  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString);
-begin
-  inherited Create;
-  Initialize(APkcs12Path, APkcs12Passphrase,
-    TLS_SERVER_DEFAULT_INPUT_CAPACITY,
-    TLS_SERVER_DEFAULT_INPUT_CAPACITY div 2,
-    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
-end;
-
-constructor TTransportSecurityServerContext.Create(
+procedure TTransportSecurityServerContext.Reload(
   const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
-  const AInputHighWatermark, AOutputCapacity: Integer);
-begin
-  inherited Create;
-  Initialize(APkcs12Path, APkcs12Passphrase, AInputHighWatermark,
-    AInputHighWatermark div 2, AOutputCapacity);
-end;
-
-constructor TTransportSecurityServerContext.Create(
-  const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
-  const AInputHighWatermark, AInputLowWatermark,
-  AOutputCapacity: Integer);
-begin
-  inherited Create;
-  Initialize(APkcs12Path, APkcs12Passphrase, AInputHighWatermark,
-    AInputLowWatermark, AOutputCapacity);
-end;
-
-destructor TTransportSecurityServerContext.Destroy;
+  const AValidation: TTransportSecurityServerIdentityValidation);
 {$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
-  Data: TOpenSSLServerContextData;
+  Identity: TBytes;
 {$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
-  Data := TOpenSSLServerContextData(FBackendData);
-  if Assigned(Data) then
-  begin
-    if Assigned(Data.Context) then
-      SslCtxFree(Data.Context);
-    Data.Free;
+  Identity := LoadPKCS12Bytes(APkcs12Path);
+  try
+    Reload(Identity, APkcs12Passphrase, AValidation);
+  finally
+    WipeBytes(Identity);
   end;
+  {$ELSE}
+  raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
   {$ENDIF}
-  FBackendData := nil;
-  inherited Destroy;
 end;
 
 procedure CloseTransportSecurityServerContext(

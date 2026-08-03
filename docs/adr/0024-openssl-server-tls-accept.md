@@ -15,8 +15,9 @@
   drains before another protocol operation, and plaintext for a WANT-write
   retry is retained internally.
 - **Socket policy remains with the consumer.** The reactor must enforce a
-  handshake deadline and byte budget; broader flow control and reload safety
-  remain deferred below.
+  handshake deadline and byte budget. The TLS seam bounds encrypted input and
+  output, while immutable reference-counted snapshots make reload safe after
+  the listener quiesces holder access before close.
 
 [ADR-0016](./0016-tls-backend-per-platform.md) governs outbound clients:
 SChannel on Windows, SecureTransport on macOS, and runtime-loaded OpenSSL on
@@ -24,7 +25,7 @@ other Unix systems. Server transports have a different seam. Duetto's Linux
 epoll backend owns a nonblocking file descriptor, its Windows IOCP backend owns
 an overlapped socket that cannot be handed to OpenSSL, and its macOS backend
 already terminates TLS with Network.framework. All three receive the same
-identity shape: a PKCS#12 file plus passphrase.
+identity shape: PKCS#12 bytes or a path plus passphrase.
 
 `TransportSecurity` therefore provides a socket-independent memory-BIO OpenSSL
 server implementation on Windows and Unix-not-Darwin. This ADR amends ADR-0016
@@ -38,6 +39,34 @@ One `TTransportSecurityServerContext` loads a PKCS#12 identity into an
 `SSL_CTX` created with `TLS_server_method`. The bundle supplies a leaf
 certificate, private key, and optional intermediate chain. The complete chain
 is installed and OpenSSL verifies that the leaf and private key match.
+
+The primary identity input is caller-supplied PKCS#12 bytes. Construction and
+reload immediately take a private mutable copy, parse synchronously, and wipe
+that copy in `finally`. The convenience path overload rejects symbolic-link or
+reparse-point traversal in every path component. Unix inspects each component
+with handle-relative `fstatat(..., AT_SYMLINK_NOFOLLOW)`, opens it relative to
+the retained parent with `openat(..., O_NOFOLLOW)`, requires intermediates to
+be directories, and matches the opened device, inode, and type. Linux selects
+the no-follow and directory bits from the target CPU UAPI because AArch64
+overrides the asm-generic values while FPC 3.2.2 does not. Windows opens
+and validates every parent with `FILE_FLAG_OPEN_REPARSE_POINT`, retains those
+handles without write or delete sharing so they cannot become reparse points
+or be replaced during the walk, and rejects a reparse-point final component.
+The final regular-file and size checks plus all reads use that same handle
+before delegating to the byte API; metadata from one object can never authorize
+reading another.
+
+Strict identity validation is the default for construction and reload. It
+requires the leaf and every bundled issuer to be inside their validity windows;
+an explicit compatible `serverAuth` extended purpose on the leaf; no `CA:TRUE`
+assertion on the leaf (a leaf may omit basic constraints); `CA:TRUE` and
+path-length constraints on bundled issuers; certificate-signing usage when an
+issuer has a key-usage extension; and a structurally and cryptographically
+coherent bundled chain. The `issuer-no-certsign` fixture is rejected because
+its key-usage extension omits `keyCertSign`. The check
+validates only caller-supplied material and does not consult platform system
+trust. Self-signed development identities use the explicit `tsivPermissive`
+option.
 
 The context independently fixes each connection's encrypted-input and
 encrypted-output capacities. Each defaults to 64 KiB and is configurable from
@@ -54,9 +83,15 @@ including the identity path or passphrase.
 
 The context sets TLS 1.2 as its minimum protocol version and applies
 `SSL_OP_NO_RENEGOTIATION`; failure to establish either policy aborts context
-construction. TLS 1.3 remains available. The listener owns the context, reuses
-it across connections, and must keep it alive until every connection created
-from it has been torn down.
+construction. TLS 1.3 remains available. A context holder atomically publishes
+only a completely built and validated immutable `SSL_CTX` snapshot. Each
+accepted connection retains the snapshot from its Begin call, so reload can
+swap in a replacement while old connections continue safely and the old
+snapshot retires only after its final connection reference. A failed reload
+does not alter the active snapshot. The listener still owns the context holder;
+individual connections own their retained snapshot references. Before closing
+the holder, the listener must stop and join every path that can enter `Begin`
+or `Reload`; established connections may outlive it through their snapshots.
 
 `BeginTransportSecurityServer` creates one `SSL`, one capacity-gated read memory
 BIO, and a write-side memory BIO pair with the context's configured output
@@ -228,16 +263,11 @@ remain permitted because they are not imports.
 
 The following are deliberately outside this package's present contract:
 
+- **Handshake deadline and byte-budget enforcement.** The package does not own
+  the socket, clock, or reactor. Every consumer **MUST** start and enforce a
+  handshake deadline and inbound byte budget from
+  `BeginTransportSecurityServer`; the WANT states and `Active` established flag
+  expose enough state to do so.
 - **Outbound admission policy.** Per-connection retained output is capacity
   bounded and lossless across accepted-prefix sends, but listener-wide and
   application output admission policy remains consumer-owned.
-- **Server-context refcounting for concurrent reload.** A listener must keep
-  its context alive until all accepted connections are destroyed. Atomic
-  identity reload while accepts race requires reference-counted context
-  ownership in a later change.
-- **Certificate policy validation at context creation.** Private-key matching
-  and chain loading are implemented. Expiry, server-purpose, and full
-  chain-sanity policy checks remain deferred.
-- **PKCS#12 file TOCTOU hardening.** The current path-based load has a metadata
-  check/read window. An open-once, no-follow, caller-supplied byte/handle API is
-  deferred.
