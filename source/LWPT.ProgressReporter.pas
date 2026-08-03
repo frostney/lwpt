@@ -90,6 +90,8 @@ begin
   if (Raw <> '') and TryStrToInt64(Raw, Parsed) and (Parsed > 0) then
   begin
     Result := QWord(Parsed);
+    { The override may only shorten the cadence; longer values retain the
+      bounded default heartbeat interval. }
     if Result > DefaultObservabilityHeartbeatIntervalMilliseconds then
       Result := DefaultObservabilityHeartbeatIntervalMilliseconds;
     Exit;
@@ -255,6 +257,9 @@ begin
     Job.Active := False;
     Job.Terminal := True;
   end;
+  { A skipped state covers terminal skips whose diagnostics are persisted and
+    tests skipped or cancelled before start. Producers omit LogReference only
+    for the latter no-log case; state alone cannot select rendering policy. }
   if AEvent.LogReference = '' then
   begin
     WriteLn(ObservabilitySkipEvent, DisplayName, ' (', AEvent.Detail, ')');
