@@ -925,18 +925,72 @@ procedure TTestScheduling.TestMissingTerminationAcknowledgementFailsCancellation
 var
   AcknowledgementDeadline, DescendantDeadline: QWord;
   Child: TProcess;
+  ChildReaped: Boolean;
   ChildTree: TLWPTProcessTree;
+  CleanupAbandoned: Boolean;
   CompilerPID: Integer;
   Environment: array of string;
   PIDFile: string;
   Raised: Boolean;
   Started: TDateTime;
-  TerminationCompleted: Boolean;
   WaitThread: TProcessWaitThread;
   WaitThreadStarted: Boolean;
   {$IFDEF MSWINDOWS}
   ChildProcessHandle: THandle;
   {$ENDIF}
+
+  procedure JoinWaitThreadAfterBoundedExit;
+  var
+    ExitStarted: TDateTime;
+    NativeTerminationAttempted, NativeTerminationSucceeded: Boolean;
+  begin
+    ExitStarted := Now;
+    while ProcessIsRunning(CompilerPID)
+      and ((Now - ExitStarted) * SecondsPerDay
+        < ProcessExitCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if ProcessIsRunning(CompilerPID) then
+    begin
+      try
+        ChildTree.Terminate;
+      except
+        { Native termination below is the cleanup fallback. }
+      end;
+      NativeTerminationAttempted := False;
+      NativeTerminationSucceeded := False;
+      if ProcessIsRunning(CompilerPID) then
+      begin
+        NativeTerminationAttempted := True;
+        {$IFDEF UNIX}
+        NativeTerminationSucceeded := FpKill(CompilerPID, SIGKILL) = 0;
+        {$ENDIF}
+        {$IFDEF MSWINDOWS}
+        if ChildProcessHandle <> 0 then
+          NativeTerminationSucceeded :=
+            Windows.TerminateProcess(ChildProcessHandle, 1);
+        {$ENDIF}
+      end;
+      ExitStarted := Now;
+      while ProcessIsRunning(CompilerPID)
+        and ((Now - ExitStarted) * SecondsPerDay
+          < ProcessExitCeilingSeconds) do
+        Sleep(ProcessPollMilliseconds);
+      if ProcessIsRunning(CompilerPID) then
+      begin
+        { WaitThread still owns Child, so a bounded test failure must leave
+          both objects alive rather than enter an unbounded join or free an
+          object that the thread can still access. }
+        CleanupAbandoned := True;
+        Fail('missing-acknowledgement child remained alive after forced cleanup'
+          + ' (native termination attempted: '
+          + BoolToStr(NativeTerminationAttempted, True)
+          + '; succeeded: '
+          + BoolToStr(NativeTerminationSucceeded, True) + ')');
+      end;
+    end;
+    WaitThread.WaitFor;
+    ChildReaped := True;
+  end;
 begin
   PIDFile := FScratch + '/control/missing-acknowledgement-compiler-pid';
   SetLength(Environment, 2);
@@ -945,8 +999,9 @@ begin
   Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + PIDFile;
   Child := TProcess.Create(nil);
   ChildTree := TLWPTProcessTree.Create(Child);
+  ChildReaped := False;
+  CleanupAbandoned := False;
   CompilerPID := 0;
-  TerminationCompleted := False;
   WaitThread := nil;
   WaitThreadStarted := False;
   {$IFDEF MSWINDOWS}
@@ -979,39 +1034,24 @@ begin
     Raised := False;
     try
       ChildTree.CompleteTermination;
-      TerminationCompleted := True;
     except
       on E: EOSError do
-      begin
         Raised := Pos('termination acknowledgement was not received',
           E.Message) > 0;
-        TerminationCompleted := Raised;
-      end;
     end;
-    WaitThread.WaitFor;
+    JoinWaitThreadAfterBoundedExit;
     Expect<Boolean>(Raised).ToBe(True);
     Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   finally
-    if WaitThreadStarted then
+    if not CleanupAbandoned then
     begin
-      if not TerminationCompleted then
-        try
-          ChildTree.Terminate;
-        except
-          {$IFDEF UNIX}
-          if CompilerPID > 0 then FpKill(CompilerPID, SIGKILL);
-          {$ENDIF}
-          {$IFDEF MSWINDOWS}
-          if ChildProcessHandle <> 0 then
-            Windows.TerminateProcess(ChildProcessHandle, 1);
-          {$ENDIF}
-        end;
-      WaitThread.WaitFor;
-    end
-    else if Child.Running then Child.Terminate(1);
-    WaitThread.Free;
-    ChildTree.Free;
-    Child.Free;
+      if WaitThreadStarted and not ChildReaped then
+        JoinWaitThreadAfterBoundedExit
+      else if Child.Running then Child.Terminate(1);
+      WaitThread.Free;
+      ChildTree.Free;
+      Child.Free;
+    end;
   end;
 end;
 
