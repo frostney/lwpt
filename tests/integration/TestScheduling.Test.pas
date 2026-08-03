@@ -966,10 +966,14 @@ var
   ControlType: DWORD;
   Environment: array of string;
   LwptProcess: TProcess;
+  WrongReadHandle, WrongWriteHandle: THandle;
+  SecurityAttributes: Windows.TSecurityAttributes;
   Started: TDateTime;
 begin
   Result := 1;
   CompilerPID := -1;
+  WrongReadHandle := 0;
+  WrongWriteHandle := 0;
   ControlType := DWORD(StrToInt(ParamStr(2)));
   if (ControlType <> Windows.CTRL_C_EVENT)
      and (ControlType <> Windows.CTRL_BREAK_EVENT) then Exit(2);
@@ -982,22 +986,34 @@ begin
   Environment[4] := ProcessTreeProxyModeEnvironment + '='
     + WindowsIgnoreControlCompilerProxyMode;
   Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + ParamStr(5);
-  { Model an intermediate process that copied channel metadata but did not
-    inherit the corresponding pipe handles. }
-  Environment[6] := ProcessTreeStatusHandleEnvironment + '=999999999';
-  Environment[7] := ProcessTreeControlHandleEnvironment + '=999999999';
+  FillChar(SecurityAttributes, SizeOf(SecurityAttributes), 0);
+  SecurityAttributes.nLength := SizeOf(SecurityAttributes);
+  SecurityAttributes.bInheritHandle := True;
+  if not Windows.CreatePipe(WrongReadHandle, WrongWriteHandle,
+    @SecurityAttributes, 4096) then Exit(4);
+  { Both handles are valid, inheritable pipes, but their directions are
+    deliberately reversed. LWPT must reject them and use console fallback. }
+  Environment[6] := ProcessTreeStatusHandleEnvironment + '='
+    + IntToStr(PtrInt(WrongReadHandle));
+  Environment[7] := ProcessTreeControlHandleEnvironment + '='
+    + IntToStr(PtrInt(WrongWriteHandle));
   Environment[8] := ProcessTreeChannelTokenEnvironment
     + '=0123456789abcdef0123456789abcdef';
   LwptProcess := TProcess.Create(nil);
   try
     { Pin the inherited Ctrl-C-ignore case explicitly. Production LWPT must
       restore Ctrl-C delivery before installing its forwarding handler. }
-    if not Windows.SetConsoleCtrlHandler(nil, True) then Exit(4);
+    if not Windows.SetConsoleCtrlHandler(nil, True) then Exit(5);
     LwptProcess.Executable := ParamStr(3);
     LwptProcess.Parameters.Add('build');
     LwptProcess.CurrentDirectory := ParamStr(4);
     ConfigureProcessEnvironment(LwptProcess, Environment);
+    LwptProcess.InheritHandles := True;
     LwptProcess.Execute;
+    Windows.CloseHandle(WrongReadHandle);
+    WrongReadHandle := 0;
+    Windows.CloseHandle(WrongWriteHandle);
+    WrongWriteHandle := 0;
     Started := Now;
     while (not FileExists(ParamStr(5))) and LwptProcess.Running
       and ((Now - Started) * SecondsPerDay
@@ -1009,20 +1025,22 @@ begin
       The compiler proxy installs the same two-event handler before publishing
       its PID, leaving LWPT as the only process that performs cancellation. }
     if not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
-      True) then Exit(5);
-    if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(6);
+      True) then Exit(6);
+    if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(7);
     Started := Now;
     while LwptProcess.Running
       and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    if LwptProcess.Running then Exit(7);
+    if LwptProcess.Running then Exit(8);
     LwptProcess.WaitOnExit;
-    if DWORD(LwptProcess.ExitStatus) <> WindowsControlExitCode then Exit(8);
-    if ProcessIsRunning(CompilerPID) then Exit(9);
+    if DWORD(LwptProcess.ExitStatus) <> WindowsControlExitCode then Exit(9);
+    if ProcessIsRunning(CompilerPID) then Exit(10);
     Result := 0;
   finally
     if LwptProcess.Running then LwptProcess.Terminate(1);
     TerminateWindowsProcess(CompilerPID);
+    if WrongReadHandle <> 0 then Windows.CloseHandle(WrongReadHandle);
+    if WrongWriteHandle <> 0 then Windows.CloseHandle(WrongWriteHandle);
     LwptProcess.Free;
   end;
 end;

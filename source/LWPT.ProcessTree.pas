@@ -246,9 +246,6 @@ function LWPTQueryInformationJobObject(const AJob: THandle;
   const AInformationClass: DWORD; const AInformation: Pointer;
   const AInformationLength: DWORD; const AReturnLength: PDWORD): BOOL; stdcall;
   external 'kernel32.dll' name 'QueryInformationJobObject';
-function LWPTGetHandleInformation(const AHandle: THandle;
-  var AFlags: DWORD): BOOL; stdcall;
-  external 'kernel32.dll' name 'GetHandleInformation';
 
 constructor TLWPTProcessTree.TWindowsState.Create;
 begin
@@ -1319,12 +1316,36 @@ begin
   InheritedControlBuffer := '';
 end;
 
+{$IFDEF MSWINDOWS}
+function ValidInheritedPipeHandle(const AHandle: PtrInt;
+  const ARequiredAccess: DWORD): Boolean;
+var
+  Duplicate: THandle;
+  HandleFlags: DWORD;
+  PipeFlags: DWORD;
+begin
+  Duplicate := 0;
+  if not Windows.GetHandleInformation(THandle(AHandle), @HandleFlags) then
+    Exit(False);
+  if (HandleFlags and Windows.HANDLE_FLAG_INHERIT) = 0 then Exit(False);
+  if not Windows.GetNamedPipeInfo(THandle(AHandle), @PipeFlags, nil, nil,
+    nil) then
+    Exit(False);
+  if (PipeFlags and Windows.PIPE_TYPE_MESSAGE) <> 0 then Exit(False);
+  { Narrow file-data access cannot be added when duplicating a handle. This
+    metadata-only probe stays bounded while distinguishing the status write
+    end from the control read end. }
+  if not Windows.DuplicateHandle(Windows.GetCurrentProcess, THandle(AHandle),
+    Windows.GetCurrentProcess, @Duplicate, ARequiredAccess, False, 0) then
+    Exit(False);
+  Windows.CloseHandle(Duplicate);
+  Result := True;
+end;
+{$ENDIF}
+
 procedure LoadInheritedAcknowledgementChannel;
 var
   ParsedHandle: Int64;
-  {$IFDEF MSWINDOWS}
-  HandleFlags: DWORD;
-  {$ENDIF}
 begin
   ClearInheritedAcknowledgementChannel;
   InheritedChannelToken := SysUtils.GetEnvironmentVariable(
@@ -1350,12 +1371,13 @@ begin
   InheritedControlReadHandle := PtrInt(ParsedHandle);
   {$IFDEF MSWINDOWS}
   { Environment strings outlive inherited handles when an intermediate
-    process forwards its environment without those handles. Reject that stale
-    metadata so console cancellation falls back to this process's own handler. }
-  if not LWPTGetHandleInformation(THandle(InheritedStatusWriteHandle),
-       HandleFlags)
-     or not LWPTGetHandleInformation(THandle(InheritedControlReadHandle),
-       HandleFlags) then
+    process forwards its environment without the matching channel. Require
+    inheritable pipe handles with the exact access direction before suppressing
+    this process's own console handler. }
+  if not ValidInheritedPipeHandle(InheritedStatusWriteHandle,
+       Windows.FILE_WRITE_DATA)
+     or not ValidInheritedPipeHandle(InheritedControlReadHandle,
+       Windows.FILE_READ_DATA) then
     ClearInheritedAcknowledgementChannel;
   {$ENDIF}
   {$IFDEF UNIX}
