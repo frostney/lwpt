@@ -1333,9 +1333,11 @@ begin
 end;
 
 procedure ReportForwardingFailure(const AMessage: string);
-{$IFDEF UNIX}
 var
   OutputLine: string;
+{$IFDEF MSWINDOWS}
+  BytesWritten: DWORD;
+  StandardError: THandle;
 {$ENDIF}
 begin
   {$IFDEF UNIX}
@@ -1344,9 +1346,16 @@ begin
   FpWrite(StdErrorHandle, OutputLine[1], Length(OutputLine));
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  WriteLn(ErrOutput, 'process-tree console-control forwarding failed: ',
-    AMessage);
-  Flush(ErrOutput);
+  OutputLine := 'process-tree console-control forwarding failed: '
+    + AMessage + LineEnding;
+  StandardError := Windows.GetStdHandle(Windows.STD_ERROR_HANDLE);
+  if (StandardError <> 0)
+     and (StandardError <> Windows.INVALID_HANDLE_VALUE) then
+  begin
+    BytesWritten := 0;
+    Windows.WriteFile(StandardError, OutputLine[1], Length(OutputLine),
+      BytesWritten, nil);
+  end;
   {$ENDIF}
 end;
 
@@ -1562,6 +1571,7 @@ var
 begin
   CancellationBuffer := '';
   repeat
+    if Terminated then Exit;
     if ReadProtocolLineBefore(InheritedControlReadHandle,
       GetTickCount64 + ProcessTreeTerminatePollMilliseconds,
       CancellationBuffer, CancellationLine)
@@ -1591,8 +1601,9 @@ end;
 procedure TLWPTConsoleControlForwarder.Execute;
 begin
   Windows.WaitForSingleObject(ConsoleControlEvent, Windows.INFINITE);
+  if Terminated then Exit;
   try
-    TerminateRegisteredProcessTrees(True);
+    TerminateRegisteredProcessTrees(InheritedManagedProcessTree);
   except
     on E: Exception do
     begin
@@ -1706,10 +1717,19 @@ begin
       SendInheritedAcknowledgement(AcknowledgementHello);
   except
     Windows.SetConsoleCtrlHandler(@ProcessTreeConsoleControlHandler, False);
+    if Assigned(InheritedControlForwarder) then
+    begin
+      InheritedControlForwarder.Terminate;
+      FreeAndNil(InheritedControlForwarder);
+    end;
+    if Assigned(ConsoleControlForwarder) then
+    begin
+      ConsoleControlForwarder.Terminate;
+      Windows.SetEvent(ConsoleControlEvent);
+      FreeAndNil(ConsoleControlForwarder);
+    end;
     Windows.CloseHandle(ConsoleControlEvent);
     ConsoleControlEvent := 0;
-    FreeAndNil(ConsoleControlForwarder);
-    FreeAndNil(InheritedControlForwarder);
     raise;
   end;
   {$ENDIF}
