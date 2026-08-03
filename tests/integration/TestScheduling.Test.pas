@@ -52,6 +52,8 @@ const
     + '-console-controller';
   WindowsControlExitCode = DWORD($C000013A);
   WindowsIgnoreControlCompilerProxyMode = 'ignore-control';
+  WindowsManagedProcessTreeEnvironment = PROJECT_NAME
+    + '_PROCESS_TREE_PARENT';
   {$ENDIF}
   TestHeartbeatIntervalMilliseconds = 75;
   TestHeartbeatJobDurationMilliseconds =
@@ -780,6 +782,24 @@ end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
+function TryReadWindowsProcessID(const APath: string;
+  out APID: Integer): Boolean;
+var
+  CandidatePID: Integer;
+begin
+  APID := -1;
+  Result := False;
+  try
+    if not FileExists(APath) then Exit;
+    if not TryStrToInt(Trim(ReadBinaryFile(APath)), CandidatePID) then Exit;
+    APID := CandidatePID;
+    Result := True;
+  except
+    { Cleanup is best-effort; the owning Job Object remains authoritative. }
+    APID := -1;
+  end;
+end;
+
 procedure TerminateWindowsProcess(const APID: Integer);
 var
   ProcessHandle: THandle;
@@ -839,8 +859,8 @@ begin
     CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
     Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   finally
-    if (CompilerPID < 0) and FileExists(PIDFile) then
-      TryStrToInt(Trim(ReadBinaryFile(PIDFile)), CompilerPID);
+    if CompilerPID < 0 then
+      TryReadWindowsProcessID(PIDFile, CompilerPID);
     try
       if Assigned(ControllerTree) then ControllerTree.Terminate;
     finally
@@ -879,7 +899,7 @@ begin
   ControlType := DWORD(StrToInt(ParamStr(2)));
   if (ControlType <> Windows.CTRL_C_EVENT)
      and (ControlType <> Windows.CTRL_BREAK_EVENT) then Exit(2);
-  SetLength(Environment, 6);
+  SetLength(Environment, 7);
   Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
   Environment[1] := WORKER_STATE_DIR_ENV + '=' + ParamStr(6);
   Environment[2] := WORKER_BUDGET_ENV + '=1';
@@ -888,6 +908,9 @@ begin
   Environment[4] := ProcessTreeProxyModeEnvironment + '='
     + WindowsIgnoreControlCompilerProxyMode;
   Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + ParamStr(5);
+  { The outer test Job owns fixture cleanup only. Keep the LWPT process under
+    test on its top-level graceful console-control path. }
+  Environment[6] := WindowsManagedProcessTreeEnvironment + '=';
   LwptProcess := TProcess.Create(nil);
   try
     { Pin the inherited Ctrl-C-ignore case explicitly. Production LWPT must
