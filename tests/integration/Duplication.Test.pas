@@ -24,6 +24,7 @@ type
     procedure TestHumanReportIsReportOnlyByDefault;
     procedure TestJSONEnvelopeIsByteStable;
     procedure TestThresholdFailureUsesNonzeroExit;
+    procedure TestSilentThresholdFailureReplaysReport;
     procedure TestInvalidMinimumIsActionable;
     procedure TestAnalysisExclusionRemovesFileFromScope;
   end;
@@ -67,7 +68,7 @@ begin
   CreateProject('human', '[duplication]'#10'minimum-tokens = 25'#10);
   CreateProject('json', '[duplication]'#10'minimum-tokens = 25'#10);
   CreateProject('threshold', '[duplication]'#10'minimum-tokens = 25'#10
-    + 'maximum-percent = 0'#10);
+    + 'maximum-percent = 0'#10'[unknown-section]'#10'enabled = true'#10);
   CreateProject('invalid', '[duplication]'#10'minimum-tokens = 24'#10);
   CreateProject('excluded', '[analysis]'#10
     + 'exclude = ["source/excluded.lpr"]'#10'[duplication]'#10
@@ -82,6 +83,8 @@ begin
   Expect<Integer>(Result.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('Duplication:', Result.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('Clone 1:', Result.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('lwpt duplication: completed in ', Result.Stdout) = 0)
+    .ToBe(True);
   Expect<Boolean>(Pos('lwpt duplication: completed in ', Result.Stderr) > 0)
     .ToBe(True);
 end;
@@ -95,6 +98,12 @@ begin
   Expect<Integer>(First.ExitCode).ToBe(0);
   Expect<Integer>(Second.ExitCode).ToBe(0);
   Expect<string>(First.Stdout).ToBe(Second.Stdout);
+  Expect<Boolean>(Pos('lwpt duplication: completed in ', First.Stdout) = 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('lwpt duplication: completed in ', First.Stderr) > 0)
+    .ToBe(True);
+  Expect<Boolean>((Trim(First.Stdout) <> '')
+    and (Trim(First.Stdout)[Length(Trim(First.Stdout))] = '}')).ToBe(True);
   Expect<Boolean>(Pos('"schema":"lwpt.analysis"', First.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('"command":{"name":"duplication",'
@@ -113,6 +122,24 @@ begin
     .ToBe(True);
   Expect<Boolean>(Pos('lwpt duplication: failed after ', Result.Stderr) > 0)
     .ToBe(True);
+end;
+
+procedure TDuplicationIntegration.TestSilentThresholdFailureReplaysReport;
+var
+  CompletionPosition, EvidencePosition, WarningPosition: SizeInt;
+  Result: TLwptResult;
+begin
+  Result := RunLwpt(['duplication', '--silent'], ProjectPath('threshold'));
+  Expect<Integer>(Result.ExitCode).ToBe(1);
+  Expect<string>(Result.Stdout).ToBe('');
+  EvidencePosition := Pos('exceeds configured maximum 0%', Result.Stderr);
+  WarningPosition := Pos('warning: unrecognised section [unknown-section]',
+    Result.Stderr);
+  CompletionPosition := Pos('lwpt duplication: failed after ', Result.Stderr);
+  Expect<Boolean>(EvidencePosition > 0).ToBe(True);
+  Expect<Boolean>(WarningPosition > 0).ToBe(True);
+  Expect<Boolean>(EvidencePosition > WarningPosition).ToBe(True);
+  Expect<Boolean>(CompletionPosition > EvidencePosition).ToBe(True);
 end;
 
 procedure TDuplicationIntegration.TestInvalidMinimumIsActionable;
@@ -148,6 +175,8 @@ begin
     TestJSONEnvelopeIsByteStable);
   Test('configured maximum breach exits nonzero',
     TestThresholdFailureUsesNonzeroExit);
+  Test('silent maximum breach replays its stdout-only report before failure',
+    TestSilentThresholdFailureReplaysReport);
   Test('invalid clone floor reports the supported minimum',
     TestInvalidMinimumIsActionable);
   Test('shared analysis exclusion removes files from duplication scope',
