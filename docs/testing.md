@@ -196,7 +196,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`source/LWPT.CompilerDriver.External.Test.pas`** | 8 tests in 1 suite | Runs a real short-lived proxy for probe and compile, proving canonical TOML stdin/stdout, live refresh, bounded raw stderr context, result/exit agreement, primary and extra-artifact confinement, explicit `--clean` rejection, timeout cleanup when a sleeping child never reads its large stdin, bounded writer cancellation when an escaped descendant retains stdin, and retain/discard drainage plus tree termination after capture overflow. |
 | **`source/LWPT.CompilerRegistry.Test.pas`** | 11 tests in 1 suite | Covers build-entry/project/embedding/built-in precedence, the FPC fallback, built-in Blaise selection and explicit executable resolution, and case-insensitive per-invocation caching. Factory coverage pins wrong-identity rejection, independent version enforcement, rejected-object cleanup, exactly-once selection ownership, and refusal to shadow built-in drivers. |
 | **`source/LWPT.BuildSession.Test.pas`** | 22 tests in 1 suite | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, compiler-argument fingerprinting, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
-| **`source/LWPT.Command.Build.Test.pas`** | 3 tests in 1 suite | Covers compiler-process cancellation with output capture and child reaping, normal-exit descendant handling, and non-zero exit-code reporting. |
+| **`source/LWPT.Command.Build.Test.pas`** | 4 tests in 1 suite | Covers compiler-process cancellation with output capture and child reaping, normal-exit descendant handling, non-zero exit-code reporting, and repeated process-tree state teardown without leaking its owned Windows Job Object handle. |
 | **`source/LWPT.CompilerDriver.FPC.Test.pas`** | 19 tests in 1 suite | Covers capability-probe caching, target dispatch, timeout cleanup, request compatibility, build/test argument translation, ordered extra-argument forwarding and validation, nil-driver rejection, version failures, stale-artifact classification, structured diagnostics, and Windows executable-path normalization. |
 | **`source/LWPT.CompilerDriver.Blaise.Test.pas`** | 15 tests in 1 suite | Pins the Blaise v0.13.0 identity/help and exact argument fixtures; proves per-operation live probing, the minimum release floor, verified Linux/FreeBSD x86-64 capability filtering, no target fallback, dev/release/clean translation, managed-argument and output-suppression protection, explicit unsupported-feature diagnostics, and normalized diagnostics/artifacts. |
 | **`source/LWPT.Core.Test.pas`** | 131 tests in 20 suites | **SHA-256 NIST vectors** (empty, "abc", 56-byte block-boundary pad, 1,000,000 "a" multi-block). **HashTree paths** pin the exact nested-tree digest layout and require slash-separated relative paths on every platform. **LoadManifest happy path / validation / extensions** (bare-string shorthand rejected, strict build-dependency arrays, undeclared compiler-profile rejection, http source rejected, value arrays cannot become table paths, `[lwpt]`/`[format]`/`[generated]` parsing). **LoadLockfile** (missing / corrupt-TOML / no-schema / v1-migration-hint / empty-table / round-trip-fields). **VerifyAgainstLockfile** (matching graph + lock entries: passes silently; tree-hash mismatch / archive-hash mismatch / orphan manifest dep / stale lockfile entry each raise `EVerifyError` naming the dep + the side that mismatched; local-source with empty archive-hash on both sides is the legitimate happy path and must not false-mismatch). Also covers source/version parsing, git ref parsing, include/exclude pruning, path globs, and custom source prefixes. |
@@ -270,10 +270,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 24 | 434 |
+| Unit (`source/*.Test.pas` + package self-tests) | 24 | 435 |
 | Integration (`tests/integration/*.Test.pas`) | 22 | 215 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 7 | 35 |
-| **Total** | **53** | **684** |
+| **Total** | **53** | **685** |
 
 ### Planned testing work
 

@@ -17,8 +17,28 @@ uses
 type
   TLWPTProcessTree = class
   private
+    {$IFDEF MSWINDOWS}
+    type
+      TWindowsState = class
+      private
+        FJobHandle: THandle;
+      public
+        constructor Create;
+        destructor Destroy; override;
+        function HasActiveProcesses: Boolean;
+        function TryAssignProcess(const AProcessHandle: THandle;
+          out AErrorCode: LongWord): Boolean;
+        function TryTerminate(const AExitCode: LongWord;
+          out AErrorCode: LongWord): Boolean;
+        procedure WaitUntilEmpty(const ATimeoutMilliseconds: Integer);
+        function WaitUntilEmptyBefore(const ADeadline: QWord): Boolean;
+      end;
+    {$ENDIF}
+  private
     FProcess: TProcess;
-    FPlatformState: Pointer;
+    {$IFDEF MSWINDOWS}
+    FWindowsState: TWindowsState;
+    {$ENDIF}
     FRegistered: Boolean;
     FImmediateTerminationRequested: LongInt;
     FTerminationCriticalSection: TRTLCriticalSection;
@@ -141,11 +161,6 @@ end;
 {$IFDEF MSWINDOWS}
 {$PACKRECORDS C}
 type
-  PLWPTWindowsProcessTreeState = ^TLWPTWindowsProcessTreeState;
-  TLWPTWindowsProcessTreeState = record
-    JobHandle: THandle;
-  end;
-
   TLWPTJobObjectBasicAccountingInformation = record
     TotalUserTime: Int64;
     TotalKernelTime: Int64;
@@ -172,20 +187,81 @@ function LWPTQueryInformationJobObject(const AJob: THandle;
   const AInformationLength: DWORD; const AReturnLength: PDWORD): BOOL; stdcall;
   external 'kernel32.dll' name 'QueryInformationJobObject';
 
-function WindowsProcessTreeState(
-  const APlatformState: Pointer): PLWPTWindowsProcessTreeState; inline;
+constructor TLWPTProcessTree.TWindowsState.Create;
 begin
-  Result := PLWPTWindowsProcessTreeState(APlatformState);
+  inherited Create;
+  FJobHandle := LWPTCreateJobObject(nil, nil);
+  if FJobHandle = 0 then RaiseLastOSError;
+end;
+
+destructor TLWPTProcessTree.TWindowsState.Destroy;
+begin
+  if FJobHandle <> 0 then Windows.CloseHandle(FJobHandle);
+  inherited Destroy;
+end;
+
+function TLWPTProcessTree.TWindowsState.HasActiveProcesses: Boolean;
+var
+  Accounting: TLWPTJobObjectBasicAccountingInformation;
+  ErrorCode: DWORD;
+begin
+  FillChar(Accounting, SizeOf(Accounting), 0);
+  if not LWPTQueryInformationJobObject(FJobHandle,
+    JobObjectBasicAccountingInformationClass, @Accounting,
+    SizeOf(Accounting), nil) then
+  begin
+    ErrorCode := Windows.GetLastError;
+    raise EOSError.CreateFmt('could not inspect process Job Object: %s',
+      [SysErrorMessage(ErrorCode)]);
+  end;
+  Result := Accounting.ActiveProcesses > 0;
+end;
+
+function TLWPTProcessTree.TWindowsState.TryAssignProcess(
+  const AProcessHandle: THandle; out AErrorCode: LongWord): Boolean;
+begin
+  Result := LWPTAssignProcessToJobObject(FJobHandle, AProcessHandle);
+  if Result then AErrorCode := 0
+  else AErrorCode := Windows.GetLastError;
+end;
+
+function TLWPTProcessTree.TWindowsState.TryTerminate(
+  const AExitCode: LongWord; out AErrorCode: LongWord): Boolean;
+begin
+  Result := LWPTTerminateJobObject(FJobHandle, AExitCode);
+  if Result then AErrorCode := 0
+  else AErrorCode := Windows.GetLastError;
+end;
+
+procedure TLWPTProcessTree.TWindowsState.WaitUntilEmpty(
+  const ATimeoutMilliseconds: Integer);
+var
+  WaitedMilliseconds: Integer;
+begin
+  WaitedMilliseconds := 0;
+  while HasActiveProcesses
+    and (WaitedMilliseconds < ATimeoutMilliseconds) do
+  begin
+    Sleep(ProcessTreeTerminatePollMilliseconds);
+    Inc(WaitedMilliseconds, ProcessTreeTerminatePollMilliseconds);
+  end;
+  if HasActiveProcesses then
+    raise EOSError.Create(
+      'process Job Object still had active processes after termination');
+end;
+
+function TLWPTProcessTree.TWindowsState.WaitUntilEmptyBefore(
+  const ADeadline: QWord): Boolean;
+begin
+  while HasActiveProcesses and (GetTickCount64 < ADeadline) do
+    Sleep(ProcessTreeTerminatePollMilliseconds);
+  Result := not HasActiveProcesses;
 end;
 {$ENDIF}
 
 {$IFDEF UNIX}
 function ProcessGroupExists(const AProcessGroupID: LongInt;
   out AErrorCode: Integer): Boolean; forward;
-{$ENDIF}
-
-{$IFDEF MSWINDOWS}
-function JobHasActiveProcesses(const AJobHandle: THandle): Boolean; forward;
 {$ENDIF}
 
 procedure TLWPTProcessTree.RegisterActive;
@@ -213,31 +289,19 @@ begin
 end;
 
 constructor TLWPTProcessTree.Create(const AProcess: TProcess);
-{$IFDEF MSWINDOWS}
-var
-  State: PLWPTWindowsProcessTreeState;
-{$ENDIF}
 begin
   inherited Create;
   InitCriticalSection(FTerminationCriticalSection);
   if not Assigned(AProcess) then
     raise EArgumentNilException.Create('process');
   FProcess := AProcess;
-  FPlatformState := nil;
   FRegistered := False;
   FImmediateTerminationRequested := 0;
   {$IFDEF UNIX}
   FProcess.OnForkEvent := HandleFork;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  New(State);
-  State^.JobHandle := LWPTCreateJobObject(nil, nil);
-  if State^.JobHandle = 0 then
-  begin
-    Dispose(State);
-    RaiseLastOSError;
-  end;
-  FPlatformState := State;
+  FWindowsState := TWindowsState.Create;
   { Windows 8+ permits the suspended child to join this inner job while
     retaining inherited membership in an enclosing LWPT or host job. }
   FProcess.Options := FProcess.Options + [poRunSuspended];
@@ -280,23 +344,13 @@ begin
 end;
 
 destructor TLWPTProcessTree.Destroy;
-{$IFDEF MSWINDOWS}
-var
-  State: PLWPTWindowsProcessTreeState;
-{$ENDIF}
 begin
   UnregisterActive;
   {$IFDEF UNIX}
   if Assigned(FProcess) then FProcess.OnForkEvent := nil;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  State := WindowsProcessTreeState(FPlatformState);
-  if Assigned(State) then
-  begin
-    if State^.JobHandle <> 0 then Windows.CloseHandle(State^.JobHandle);
-    Dispose(State);
-    FPlatformState := nil;
-  end;
+  FreeAndNil(FWindowsState);
   {$ENDIF}
   DoneCriticalSection(FTerminationCriticalSection);
   inherited Destroy;
@@ -343,7 +397,6 @@ var
 var
   ErrorCode: DWORD;
   ErrorSuffix: string;
-  State: PLWPTWindowsProcessTreeState;
 {$ENDIF}
 begin
   { Registration precedes the spawn. The termination lock then makes a signal
@@ -375,11 +428,9 @@ begin
       end;
       {$ENDIF}
       {$IFDEF MSWINDOWS}
-      State := WindowsProcessTreeState(FPlatformState);
-      if not LWPTAssignProcessToJobObject(State^.JobHandle,
-        FProcess.ProcessHandle) then
+      if not FWindowsState.TryAssignProcess(FProcess.ProcessHandle,
+        ErrorCode) then
       begin
-        ErrorCode := Windows.GetLastError;
         TerminateCreatedProcess;
         ErrorSuffix := '';
         if ErrorCode = Windows.ERROR_ACCESS_DENIED then
@@ -412,7 +463,6 @@ var
 {$IFDEF MSWINDOWS}
 var
   ErrorCode: DWORD;
-  State: PLWPTWindowsProcessTreeState;
 {$ENDIF}
 begin
   InterlockedExchange(FImmediateTerminationRequested, 1);
@@ -431,14 +481,12 @@ begin
     end;
     {$ENDIF}
     {$IFDEF MSWINDOWS}
-    State := WindowsProcessTreeState(FPlatformState);
-    if not Assigned(State) or (State^.JobHandle = 0) then Exit;
-    if not JobHasActiveProcesses(State^.JobHandle) then Exit;
-    if not LWPTTerminateJobObject(State^.JobHandle,
-      ProcessTreeCancellationExitCode) then
+    if not Assigned(FWindowsState) then Exit;
+    if not FWindowsState.HasActiveProcesses then Exit;
+    if not FWindowsState.TryTerminate(ProcessTreeCancellationExitCode,
+      ErrorCode) then
     begin
-      ErrorCode := Windows.GetLastError;
-      if not JobHasActiveProcesses(State^.JobHandle) then Exit;
+      if not FWindowsState.HasActiveProcesses then Exit;
       TryTerminateDirectChild;
       raise EOSError.CreateFmt('could not terminate process Job Object: %s',
         [SysErrorMessage(ErrorCode)]);
@@ -457,7 +505,7 @@ var
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
-  State: PLWPTWindowsProcessTreeState;
+  State: TWindowsState;
 {$ENDIF}
 begin
   EnterCriticalSection(FTerminationCriticalSection);
@@ -466,7 +514,7 @@ begin
     ProcessGroupID := FProcess.ProcessID;
     {$ENDIF}
     {$IFDEF MSWINDOWS}
-    State := WindowsProcessTreeState(FPlatformState);
+    State := FWindowsState;
     {$ENDIF}
   finally
     LeaveCriticalSection(FTerminationCriticalSection);
@@ -485,11 +533,8 @@ begin
   end;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  if not Assigned(State) or (State^.JobHandle = 0) then Exit;
-  while JobHasActiveProcesses(State^.JobHandle)
-    and (GetTickCount64 < ADeadline) do
-    Sleep(ProcessTreeTerminatePollMilliseconds);
-  if JobHasActiveProcesses(State^.JobHandle) then
+  if not Assigned(State) then Exit;
+  if not State.WaitUntilEmptyBefore(ADeadline) then
   begin
     TryTerminateDirectChild;
     raise EOSError.Create(
@@ -542,42 +587,6 @@ begin
 end;
 {$ENDIF}
 
-{$IFDEF MSWINDOWS}
-function JobHasActiveProcesses(const AJobHandle: THandle): Boolean;
-var
-  Accounting: TLWPTJobObjectBasicAccountingInformation;
-  ErrorCode: DWORD;
-begin
-  FillChar(Accounting, SizeOf(Accounting), 0);
-  if not LWPTQueryInformationJobObject(AJobHandle,
-    JobObjectBasicAccountingInformationClass, @Accounting,
-    SizeOf(Accounting), nil) then
-  begin
-    ErrorCode := Windows.GetLastError;
-    raise EOSError.CreateFmt('could not inspect process Job Object: %s',
-      [SysErrorMessage(ErrorCode)]);
-  end;
-  Result := Accounting.ActiveProcesses > 0;
-end;
-
-procedure WaitForJobEmpty(const AJobHandle: THandle;
-  const ATimeoutMilliseconds: Integer);
-var
-  WaitedMilliseconds: Integer;
-begin
-  WaitedMilliseconds := 0;
-  while JobHasActiveProcesses(AJobHandle)
-    and (WaitedMilliseconds < ATimeoutMilliseconds) do
-  begin
-    Sleep(ProcessTreeTerminatePollMilliseconds);
-    Inc(WaitedMilliseconds, ProcessTreeTerminatePollMilliseconds);
-  end;
-  if JobHasActiveProcesses(AJobHandle) then
-    raise EOSError.Create(
-      'process Job Object still had active processes after termination');
-end;
-{$ENDIF}
-
 procedure TLWPTProcessTree.Terminate;
 {$IFDEF UNIX}
 var
@@ -588,7 +597,6 @@ var
 {$IFDEF MSWINDOWS}
 var
   ErrorCode: DWORD;
-  State: PLWPTWindowsProcessTreeState;
 {$ENDIF}
 begin
   EnterCriticalSection(FTerminationCriticalSection);
@@ -608,14 +616,12 @@ begin
     end;
     {$ENDIF}
     {$IFDEF MSWINDOWS}
-    State := WindowsProcessTreeState(FPlatformState);
-    if not Assigned(State) or (State^.JobHandle = 0) then Exit;
-    if not JobHasActiveProcesses(State^.JobHandle) then Exit;
-    if not LWPTTerminateJobObject(State^.JobHandle,
-      ProcessTreeCancellationExitCode) then
+    if not Assigned(FWindowsState) then Exit;
+    if not FWindowsState.HasActiveProcesses then Exit;
+    if not FWindowsState.TryTerminate(ProcessTreeCancellationExitCode,
+      ErrorCode) then
     begin
-      ErrorCode := Windows.GetLastError;
-      if not JobHasActiveProcesses(State^.JobHandle) then Exit;
+      if not FWindowsState.HasActiveProcesses then Exit;
       TryTerminateDirectChild;
       raise EOSError.CreateFmt('could not terminate process Job Object: %s',
         [SysErrorMessage(ErrorCode)]);
@@ -660,7 +666,7 @@ begin
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   try
-    WaitForJobEmpty(State^.JobHandle, ProcessTreeReapTimeoutMilliseconds);
+    FWindowsState.WaitUntilEmpty(ProcessTreeReapTimeoutMilliseconds);
   except
     TryTerminateDirectChild;
     raise;
