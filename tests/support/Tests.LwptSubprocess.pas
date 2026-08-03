@@ -86,7 +86,7 @@ procedure ConfigureProcessEnvironment(const AProcess: TProcess;
   suite's stdout, which the scheduler's failure replay surfaces
   directly in CI logs. No-op when the exit code matches. }
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
-  const AExpectedExit: Integer);
+  const AExpectedExit: Integer; const ADiagnostics: TStrings = nil);
 
 { Quick helper for "is the env saying skip network?". E2E tests that
   touch the live internet should consult this and self-skip via a
@@ -386,18 +386,27 @@ begin
   end;
 end;
 
+procedure WriteRunDiagnostic(const ALine: string;
+  const ADiagnostics: TStrings);
+begin
+  if Assigned(ADiagnostics) then ADiagnostics.Add(ALine)
+  else WriteLn(ALine);
+end;
+
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
-  const AExpectedExit: Integer);
+  const AExpectedExit: Integer; const ADiagnostics: TStrings);
 begin
   if ARun.ExitCode = AExpectedExit then Exit;
-  WriteLn('RUN FAILURE [', ALabel, '] exit=', ARun.ExitCode,
-    ' expected=', AExpectedExit, ' process-exit-code=',
-    ARun.ProcessExitCode, ' process-exit-status=', ARun.ProcessExitStatus);
-  WriteLn('--- captured stdout ---');
-  WriteLn(ARun.Stdout);
-  WriteLn('--- captured stderr ---');
-  WriteLn(ARun.Stderr);
-  WriteLn('--- end captured output ---');
+  WriteRunDiagnostic('RUN FAILURE [' + ALabel + '] exit='
+    + IntToStr(ARun.ExitCode) + ' expected=' + IntToStr(AExpectedExit)
+    + ' process-exit-code=' + IntToStr(ARun.ProcessExitCode)
+    + ' process-exit-status=' + IntToStr(ARun.ProcessExitStatus),
+    ADiagnostics);
+  WriteRunDiagnostic('--- captured stdout ---', ADiagnostics);
+  WriteRunDiagnostic(ARun.Stdout, ADiagnostics);
+  WriteRunDiagnostic('--- captured stderr ---', ADiagnostics);
+  WriteRunDiagnostic(ARun.Stderr, ADiagnostics);
+  WriteRunDiagnostic('--- end captured output ---', ADiagnostics);
 end;
 
 end.

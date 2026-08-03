@@ -129,25 +129,33 @@ end;
 
 procedure DumpObservableFailure(const ALabel, AProject,
   AWorkerStateRoot: string; const AWorkerRootExistedBefore,
-  ATransactionLockExistedBefore: Boolean; const ARun: TLwptResult);
+  ATransactionLockExistedBefore: Boolean; const ARun: TLwptResult;
+  const ADiagnostics: TStrings = nil);
+var
+  Diagnostic: string;
 begin
-  DumpRunFailure(ALabel, ARun, 0);
+  DumpRunFailure(ALabel, ARun, 0, ADiagnostics);
   if ARun.ExitCode = 0 then Exit;
   { The two historical failures lost the nested command's identity among
     concurrently replayed build output. Record the read-only roots that
     distinguish a missing-root transaction race from a failure after an
     already-created worker root without mutating either state machine. }
-  WriteLn('RUN STATE [', ALabel, '] worker-root=', AWorkerStateRoot,
-    ' existed-before=', BoolToStr(AWorkerRootExistedBefore, True),
-    ' exists-after=', BoolToStr(DirectoryExists(AWorkerStateRoot), True),
-    ' transaction-lock-before=', BoolToStr(
-      ATransactionLockExistedBefore, True), ' transaction-lock-after=',
-    BoolToStr(FileExists(
+  Diagnostic := 'RUN STATE [' + ALabel + '] worker-root='
+    + AWorkerStateRoot + ' existed-before='
+    + BoolToStr(AWorkerRootExistedBefore, True) + ' exists-after='
+    + BoolToStr(DirectoryExists(AWorkerStateRoot), True)
+    + ' transaction-lock-before='
+    + BoolToStr(ATransactionLockExistedBefore, True)
+    + ' transaction-lock-after=' + BoolToStr(FileExists(
       IncludeTrailingPathDelimiter(AWorkerStateRoot)
-      + 'transaction.lock'), True));
-  WriteLn('RUN STATE [', ALabel, '] sessions-root=', AProject,
-    '/.lwpt/sessions exists=', BoolToStr(DirectoryExists(AProject
-      + '/.lwpt/sessions'), True));
+      + 'transaction.lock'), True);
+  if Assigned(ADiagnostics) then ADiagnostics.Add(Diagnostic)
+  else WriteLn(Diagnostic);
+  Diagnostic := 'RUN STATE [' + ALabel + '] sessions-root=' + AProject
+    + '/.lwpt/sessions exists=' + BoolToStr(DirectoryExists(AProject
+      + '/.lwpt/sessions'), True);
+  if Assigned(ADiagnostics) then ADiagnostics.Add(Diagnostic)
+  else WriteLn(Diagnostic);
 end;
 
 function RunProgram(const APath: string): Integer;
@@ -1165,10 +1173,14 @@ end;
 
 procedure TBuildSessions.TestBuildFailureReplaysAndPreservesIsolatedLog;
 var
-  Project, RealFPC, LogPath: string;
+  DiagnosticText, Project, RealFPC, LogPath, WorkerStateRoot,
+    WorkerTransactionLock: string;
+  Diagnostics: TStringList;
   Environment: array of string;
+  NormalizedExitCode: Integer;
   RunResult: TLwptResult;
   SessionSearch, LogSearch: TSearchRec;
+  TransactionLockExistedBefore, WorkerRootExistedBefore: Boolean;
 begin
   Project := FScratch + '/observable-failure';
   WriteGraphProject(Project);
@@ -1181,10 +1193,42 @@ begin
     + IntToStr(TestShortCompilerDelayMilliseconds);
   Environment[4] := TestFPCOutputEnvironment + '=1';
   Environment[5] := TEST_FPC_FAIL_ENTRY_ENV + '=alpha';
+  WorkerStateRoot := FScratch + '/worker-state';
+  WorkerTransactionLock := IncludeTrailingPathDelimiter(WorkerStateRoot)
+    + 'transaction.lock';
+  Diagnostics := TStringList.Create;
   try
+    WorkerRootExistedBefore := DirectoryExists(WorkerStateRoot);
+    TransactionLockExistedBefore := FileExists(WorkerTransactionLock);
     RunResult := RunLwptWithWorkerEnv(['build', 'alpha'], Project,
       Environment);
+    DumpObservableFailure('observable: controlled failure', Project,
+      WorkerStateRoot, WorkerRootExistedBefore,
+      TransactionLockExistedBefore, RunResult, Diagnostics);
     Expect<Integer>(RunResult.ExitCode).ToBe(1);
+    Expect<Boolean>(RunResult.ProcessExitCode <> -1).ToBe(True);
+    Expect<Boolean>(RunResult.ProcessExitStatus <> -1).ToBe(True);
+    NormalizedExitCode := RunResult.ProcessExitCode;
+    if (NormalizedExitCode = 0) and (RunResult.ProcessExitStatus <> 0) then
+      NormalizedExitCode := RunResult.ProcessExitStatus;
+    Expect<Integer>(NormalizedExitCode).ToBe(RunResult.ExitCode);
+    DiagnosticText := Diagnostics.Text;
+    Expect<Boolean>(Pos('process-exit-code='
+      + IntToStr(RunResult.ProcessExitCode), DiagnosticText) > 0).ToBe(True);
+    Expect<Boolean>(Pos('process-exit-status='
+      + IntToStr(RunResult.ProcessExitStatus), DiagnosticText) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('RUN STATE [observable: controlled failure] '
+      + 'worker-root=' + WorkerStateRoot, DiagnosticText) > 0).ToBe(True);
+    Expect<Boolean>(Pos('existed-before=', DiagnosticText) > 0).ToBe(True);
+    Expect<Boolean>(Pos('exists-after=', DiagnosticText) > 0).ToBe(True);
+    Expect<Boolean>(Pos('transaction-lock-before=', DiagnosticText) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('transaction-lock-after=', DiagnosticText) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('RUN STATE [observable: controlled failure] '
+      + 'sessions-root=' + Project + '/.lwpt/sessions exists=',
+      DiagnosticText) > 0).ToBe(True);
     Expect<Boolean>(Pos('FAIL alpha ', RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('alpha-begin|alpha-end|', RunResult.Stdout)
       > Pos('FAIL alpha ', RunResult.Stdout)).ToBe(True);
@@ -1214,6 +1258,7 @@ begin
     Expect<Boolean>(Pos('alpha-begin|alpha-end|', ReadBinaryFile(LogPath))
       > 0).ToBe(True);
   finally
+    Diagnostics.Free;
     RecursiveDelete(Project);
   end;
 end;
