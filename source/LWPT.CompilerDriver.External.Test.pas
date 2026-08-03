@@ -37,7 +37,17 @@ type
     procedure TestTimeoutKillsNonReadingProxy;
     procedure TestTimeoutDoesNotWaitForEscapedStdinHolder;
     procedure TestCaptureOverflowRetainsBoundedPrefixAndTerminates;
+    procedure TestStreamedOutputCanBeDiscardedWithoutOverflow;
   end;
+
+var
+  StreamedOutputBytes: Integer = 0;
+
+procedure CountStreamedOutput(const AData: RawByteString;
+  const AStandardError: Boolean);
+begin
+  if not AStandardError then Inc(StreamedOutputBytes, Length(AData));
+end;
 
 function ReadStandardInput: string;
 var
@@ -114,6 +124,39 @@ begin
     Expect<Integer>(Length(StandardOutput)).ToBe(CAPTURE_LIMIT);
     Expect<Boolean>(GetTickCount64 - StartedAt < 5000).ToBe(True);
     Expect<Boolean>(P.Running).ToBe(False);
+  finally
+    Runner.Free;
+    P.Free;
+  end;
+end;
+
+procedure TLWPTExternalCompilerDriverTests.
+  TestStreamedOutputCanBeDiscardedWithoutOverflow;
+const
+  CAPTURE_LIMIT = 1024;
+var
+  Options: TLWPTProcessRunOptions;
+  P: TProcess;
+  Runner: TLWPTDuplexProcessRunner;
+  StandardError, StandardOutput: string;
+begin
+  P := TProcess.Create(nil);
+  Runner := nil;
+  try
+    P.Executable := ParamStr(0);
+    P.Parameters.Add('stream-output');
+    Runner := TLWPTDuplexProcessRunner.Create(P);
+    Options := DefaultProcessRunOptions('streaming proxy');
+    Options.SeparateStandardError := True;
+    Options.MaximumStandardOutputBytes := CAPTURE_LIMIT;
+    Options.DiscardCapturedOutput := True;
+    Options.OnOutputChunk := @CountStreamedOutput;
+    StreamedOutputBytes := 0;
+    Expect<Integer>(Runner.Run('', Options, StandardOutput,
+      StandardError)).ToBe(0);
+    Expect<string>(StandardOutput).ToBe('');
+    Expect<string>(StandardError).ToBe('');
+    Expect<Integer>(StreamedOutputBytes).ToBe(64 * 1024);
   finally
     Runner.Free;
     P.Free;
@@ -564,6 +607,8 @@ begin
     TestTimeoutDoesNotWaitForEscapedStdinHolder);
   Test('capture overflow retains a bounded prefix and terminates the proxy',
     TestCaptureOverflowRetainsBoundedPrefixAndTerminates);
+  Test('stream callback drains output without retaining or overflowing',
+    TestStreamedOutputCanBeDiscardedWithoutOverflow);
 end;
 
 begin
@@ -578,6 +623,12 @@ begin
     Write(StringOfChar('x', 64 * 1024));
     Flush(Output);
     Sleep(30000);
+    Halt(0);
+  end;
+  if (ParamCount = 1) and (ParamStr(1) = 'stream-output') then
+  begin
+    Write(StringOfChar('x', 64 * 1024));
+    Flush(Output);
     Halt(0);
   end;
   {$IFDEF UNIX}

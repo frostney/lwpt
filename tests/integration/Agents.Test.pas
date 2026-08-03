@@ -145,9 +145,11 @@ begin
   Expect<Boolean>(Pos(MARKER_BEGIN, Content) > 0).ToBe(True);
   Expect<Boolean>(Pos(MARKER_END, Content) > 0).ToBe(True);
   { Representative built-ins with their usage + option detail. }
-  Expect<Boolean>(Pos('- `lwpt install [--frozen]`', Content) > 0).ToBe(True);
+  Expect<Boolean>(Pos('- `lwpt install [--frozen] [--silent]`', Content) > 0)
+    .ToBe(True);
   Expect<Boolean>(Pos('`--frozen`', Content) > 0).ToBe(True);
-  Expect<Boolean>(Pos('- `lwpt agents [--check]`', Content) > 0).ToBe(True);
+  Expect<Boolean>(Pos('- `lwpt agents [--check] [--silent]`', Content) > 0)
+    .ToBe(True);
   { The manifest's run-script, addressable form. }
   Expect<Boolean>(Pos('- `lwpt run hello` — `scripts/hello.pas`', Content) > 0)
     .ToBe(True);
