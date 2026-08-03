@@ -1,0 +1,14 @@
+[req]
+distinguished_name = leaf_name
+prompt = no
+
+[leaf_name]
+CN = localhost
+
+[leaf_extensions]
+basicConstraints = critical,CA:true,pathlen:0
+keyUsage = critical,digitalSignature,keyEncipherment,keyCertSign
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
