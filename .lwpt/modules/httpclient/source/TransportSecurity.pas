@@ -1928,14 +1928,29 @@ function LinuxErrnoLocation: PCIntLWPT; cdecl;
 const
   {$IFDEF LINUX}
   AT_SYMLINK_NOFOLLOW_LWPT = $00000100;
+  O_NONBLOCK_LWPT = $00000800;
+  { Linux AArch64 overrides the asm-generic directory and no-follow bits.
+    FPC 3.2.2 exposes the asm-generic values on that target, so these values
+    must follow the target UAPI rather than the RTL constants. }
+  {$IFDEF CPUAARCH64}
   O_DIRECTORY_LWPT = $00004000;
   O_NOFOLLOW_LWPT = $00008000;
-  O_NONBLOCK_LWPT = $00000800;
+  {$ELSE}
+  O_DIRECTORY_LWPT = $00010000;
+  O_NOFOLLOW_LWPT = $00020000;
+  {$ENDIF}
+  {$ELSE}
+  {$IFDEF DARWIN}
+  AT_SYMLINK_NOFOLLOW_LWPT = $00000020;
+  O_DIRECTORY_LWPT = $00100000;
+  O_NOFOLLOW_LWPT = $00000100;
+  O_NONBLOCK_LWPT = $00000004;
   {$ELSE}
   AT_SYMLINK_NOFOLLOW_LWPT = AT_SYMLINK_NOFOLLOW;
   O_DIRECTORY_LWPT = O_DIRECTORY;
   O_NOFOLLOW_LWPT = O_NOFOLLOW;
   O_NONBLOCK_LWPT = O_NONBLOCK;
+  {$ENDIF}
   {$ENDIF}
 
 function LastLibcError: cint; inline;

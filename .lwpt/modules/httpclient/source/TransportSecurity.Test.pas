@@ -1256,6 +1256,7 @@ end;
 procedure TTransportSecurityServerTests.TestPKCS12PathRefusesSymbolicLink;
 {$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
 var
+  Context: TTransportSecurityServerContext;
   ErrorMessage: string;
   FifoPath: string;
   LinkDirectory: string;
@@ -1271,6 +1272,9 @@ var
 {$ENDIF}
 begin
   {$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  CloseTransportSecurityServerContext(Context);
   ForceDirectories(SCRATCH_DIRECTORY);
   LinkPath := SCRATCH_DIRECTORY + '/identity-link.p12';
   SysUtils.DeleteFile(LinkPath);

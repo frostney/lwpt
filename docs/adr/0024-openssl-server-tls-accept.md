@@ -45,7 +45,9 @@ that copy in `finally`. The convenience path overload rejects symbolic-link or
 reparse-point traversal in every path component. Unix inspects each component
 with handle-relative `fstatat(..., AT_SYMLINK_NOFOLLOW)`, opens it relative to
 the retained parent with `openat(..., O_NOFOLLOW)`, requires intermediates to
-be directories, and matches the opened device, inode, and type. Windows opens
+be directories, and matches the opened device, inode, and type. Linux selects
+the no-follow and directory bits from the target CPU UAPI because AArch64
+overrides the asm-generic values while FPC 3.2.2 does not. Windows opens
 and validates every parent with `FILE_FLAG_OPEN_REPARSE_POINT`, retains those
 handles without write or delete sharing so they cannot become reparse points
 or be replaced during the walk, and rejects a reparse-point final component.
