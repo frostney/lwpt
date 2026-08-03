@@ -18,9 +18,9 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 - **Compiler-neutral request first.** Build and test select a root-owned named
   compiler profile, validate a versioned request against on-demand compiler
   capabilities, and normalize the result through the selected driver. FPC is
-  the implicit built-in fallback; Delphi and Blaise are explicit built-in
-  profiles; external
-  drivers exchange canonical TOML over short-lived child processes.
+  the implicit built-in fallback; Delphi, Blaise, and Lakon are explicit
+  built-in profiles; external drivers exchange canonical TOML over short-lived
+  child processes.
   Unsupported combinations are hard errors, with no compiler or target
   fallback. See ADR-0029 and ADR-0030.
 - **Compiler processes are bounded duplex operations.** A shared runner writes
@@ -254,6 +254,57 @@ FPC and the requested tuple; LWPT never falls back to the host compiler. The
 publish step refreshes the probe and repeats the complete compatibility check;
 a changed compiler identity/version, target, output kind, or mode during
 compilation withholds the candidate.
+
+## Lakon compiler profile
+
+The opt-in `lakon` driver targets the released
+[`frostney/lakon` 0.1.0 CLI](https://github.com/frostney/lakon/releases/tag/0.1.0)
+or newer. The executable defaults to `lakon` on `PATH`; a root profile can
+pin a project-relative or absolute executable:
+
+```toml
+[compiler]
+default = "wasm"
+
+[compiler.profiles.wasm]
+driver = "lakon"
+executable = "tools/lakon"
+version = ">=0.1.0"
+```
+
+Every selection and concrete build operation launches both `lakon --version`
+and `lakon --help` again. The adapter requires the `lakon <semver>` identity,
+enforces the 0.1.0 floor, and confirms the released compile/options surface
+before translating the request. It advertises only the released
+`wasi/wasm32` target with the `wasip1` environment, executable WebAssembly
+output, and dev mode. Lakon's native lane and a release-mode switch are not
+released, so LWPT does not advertise or infer them.
+
+The adapter translates the entry source, output path, unit paths, defines,
+and the three verified diagnostic options. It always passes `--no-cache`:
+Lakon 0.1.0 roots its `.lku` cache at `build/cache`, outside the neutral
+request's private output roots, so disabling that cache preserves LWPT's
+session-isolation contract and also implements `--clean`. Multiple explicit
+sources, resources, include-only paths, release mode, and unverified extra
+arguments fail with a driver diagnostic. LWPT never installs Lakon and never
+falls back to FPC when a Lakon profile is selected.
+
+The generic `lwpt test` runner executes compiled test artifacts as native
+processes. A Lakon artifact is a WASI module, so the external adapter rejects
+that path explicitly instead of handing a WebAssembly file to the operating
+system. A Lakon-branded embedding host that exposes `test` must own its WASI
+execution path outside the generic native runner; no Node or wasmtime
+dependency is added to the LWPT binary.
+
+An embedding host uses the same public `TLWPTCompilerHost` factory API. It
+registers `LAKON_COMPILER_ID`, optionally sets `DefaultProfile` to that ID,
+and returns a driver consuming the versioned neutral request/result types.
+For the `lakon` ID only, that registered factory takes precedence over the
+external CLI adapter. This lets a Lakon-branded host replace the ordinary
+implicit FPC default without changing the manifest, while explicit project or
+build-entry profiles remain authoritative. Factory identity, configured
+version, live capabilities, and result/artifact validation are enforced by
+the same selection and build paths; a Lakon failure never selects FPC.
 
 ## Delphi compiler profiles
 

@@ -71,6 +71,7 @@ uses
   LWPT.CompilerDriver.Delphi,
   LWPT.CompilerDriver.External,
   LWPT.CompilerDriver.FPC,
+  LWPT.CompilerDriver.Lakon,
   LWPT.Core,
   Semver;
 
@@ -405,6 +406,16 @@ begin
     finally
       FactoryDriver.Free;
     end;
+  end;
+
+  if SameText(AProfile.Driver, LAKON_COMPILER_ID) then
+  begin
+    if ScriptPath <> '' then
+      raise ELWPTCompilerDriverError.CreateFmt(
+        'compiler profile "%s" cannot use script with built-in "%s"',
+        [AProfile.Name, LAKON_COMPILER_ID]);
+    Exit(TLWPTLakonCompilerDriver.Create(ExecutablePath,
+      AProfile.VersionConstraint));
   end;
 
   if (ExecutablePath = '') and (ScriptPath = '') then

@@ -1,0 +1,30 @@
+lakon — Lakon, an Object Pascal native compiler
+
+usage: lakon <source-file.pas>
+       lakon --dump-ast <source-file.pas>
+       lakon compile <source-file.pas> [-o <output.wasm>]
+
+commands:
+  compile      compile the program to a WebAssembly
+               module (default output: source name with .wasm)
+
+options:
+  --dump-ast   parse the source file and print its AST
+  -o           output path for compile
+  -Fu <dir>     additional unit search directory (repeatable)
+  -d <sym>      define a conditional symbol in every
+               compiled file (repeatable; also -d<sym>)
+  --no-cache   ignore and do not write the unit symbol cache
+  --verbose-units
+               report the per-unit compile/cache decisions
+  --no-inline
+               disable the inline-directive optimizer (debugging/bisection;
+               program output is identical either way)
+  --inline-stats
+               report honored/skipped inline routines and expanded call sites
+  --help       show this help
+  --version    print the version and exit
+
+Without a command the source file is lexed and its token
+stream printed, one token per line; --dump-ast parses the
+full grammar and prints the syntax tree.

@@ -168,6 +168,12 @@ default = "native"
 driver = "fpc"
 version = "^3.2.0"
 
+[compiler.profiles.wasm]
+# Opt-in adapter for the released frostney/lakon compiler.
+driver = "lakon"
+executable = "tools/lakon" # optional; otherwise resolved from PATH
+version = ">=0.1.0"
+
 [compiler.profiles.blaise]
 # Built-in opt-in adapter for graemeg/blaise v0.13.0 or newer.
 driver = "blaise"
