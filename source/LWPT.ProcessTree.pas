@@ -142,6 +142,7 @@ var
   InheritedControlReadHandle: PtrInt = -1;
   InheritedChannelToken: string = '';
   InheritedControlBuffer: string = '';
+  InheritedManagedProcessTree: Boolean = False;
 
 {$IFDEF UNIX}
 const
@@ -656,7 +657,7 @@ begin
   if FProcess.Environment.Count = 0 then
     AppendProcessEnvironment(FProcess.Environment);
   SetProcessEnvironmentEntry(FProcess.Environment,
-    ManagedProcessTreeEnvironment, '1');
+    ManagedProcessTreeEnvironment, IntToStr(GetProcessID));
   SetProcessEnvironmentEntry(FProcess.Environment,
     StatusHandleEnvironment, IntToStr(FChildStatusWriteHandle));
   SetProcessEnvironmentEntry(FProcess.Environment,
@@ -1314,6 +1315,36 @@ begin
   InheritedControlReadHandle := -1;
   InheritedChannelToken := '';
   InheritedControlBuffer := '';
+  InheritedManagedProcessTree := False;
+end;
+
+function CurrentParentProcessID: QWord;
+{$IFDEF MSWINDOWS}
+var
+  Entry: Windows.PROCESSENTRY32;
+  Snapshot: THandle;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Result := QWord(FpGetppid);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Result := 0;
+  Snapshot := Windows.CreateToolhelp32Snapshot(
+    Windows.TH32CS_SNAPPROCESS, 0);
+  if Snapshot = Windows.INVALID_HANDLE_VALUE then Exit;
+  try
+    FillChar(Entry, SizeOf(Entry), 0);
+    Entry.dwSize := SizeOf(Entry);
+    if not Windows.Process32First(Snapshot, Entry) then Exit;
+    repeat
+      if Entry.th32ProcessID = Windows.GetCurrentProcessId then
+        Exit(Entry.th32ParentProcessID);
+    until not Windows.Process32Next(Snapshot, Entry);
+  finally
+    Windows.CloseHandle(Snapshot);
+  end;
+  {$ENDIF}
 end;
 
 {$IFDEF MSWINDOWS}
@@ -1345,9 +1376,14 @@ end;
 
 procedure LoadInheritedAcknowledgementChannel;
 var
+  ManagedParentProcessID: QWord;
   ParsedHandle: Int64;
 begin
   ClearInheritedAcknowledgementChannel;
+  if not TryStrToQWord(SysUtils.GetEnvironmentVariable(
+    ManagedProcessTreeEnvironment), ManagedParentProcessID)
+     or (ManagedParentProcessID = 0)
+     or (ManagedParentProcessID <> CurrentParentProcessID) then Exit;
   InheritedChannelToken := SysUtils.GetEnvironmentVariable(
     ChannelTokenEnvironment);
   if not ValidChannelToken(InheritedChannelToken) then
@@ -1384,6 +1420,7 @@ begin
   if FpFcntl(InheritedControlReadHandle, F_SetFl, O_NONBLOCK) < 0 then
     ClearInheritedAcknowledgementChannel;
   {$ENDIF}
+  InheritedManagedProcessTree := InheritedControlReadHandle >= 0;
 end;
 
 function SendInheritedAcknowledgement(const AKind: string): Boolean;
@@ -1430,7 +1467,7 @@ begin
     AcknowledgementDeadline);
   try
     TerminateRegisteredProcessTrees(
-      SysUtils.GetEnvironmentVariable(ManagedProcessTreeEnvironment) = '1',
+      InheritedManagedProcessTree,
       DescendantDeadline, AcknowledgementDeadline);
   except
     on E: Exception do

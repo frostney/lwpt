@@ -40,6 +40,7 @@ const
     + '_PROCESS_TREE_TEST_PROXY_MODE';
   ProcessTreeProxyPIDFileEnvironment = PROJECT_NAME
     + '_PROCESS_TREE_TEST_PID_FILE';
+  ManagedProcessTreeEnvironment = PROJECT_NAME + '_PROCESS_TREE_PARENT';
   ProcessTreeStatusHandleEnvironment = PROJECT_NAME
     + '_PROCESS_TREE_STATUS_HANDLE';
   ProcessTreeControlHandleEnvironment = PROJECT_NAME
@@ -982,7 +983,7 @@ begin
   ControlType := DWORD(StrToInt(ParamStr(2)));
   if (ControlType <> Windows.CTRL_C_EVENT)
      and (ControlType <> Windows.CTRL_BREAK_EVENT) then Exit(2);
-  SetLength(Environment, 9);
+  SetLength(Environment, 10);
   Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
   Environment[1] := WORKER_STATE_DIR_ENV + '=' + ParamStr(6);
   Environment[2] := WORKER_BUDGET_ENV + '=1';
@@ -1004,6 +1005,8 @@ begin
     + IntToStr(PtrInt(WrongWriteHandle));
   Environment[8] := ProcessTreeChannelTokenEnvironment
     + '=0123456789abcdef0123456789abcdef';
+  Environment[9] := ManagedProcessTreeEnvironment + '='
+    + IntToStr(GetProcessID);
   LwptProcess := TProcess.Create(nil);
   try
     { Pin the inherited Ctrl-C-ignore case explicitly. Production LWPT must

@@ -68,7 +68,10 @@ anonymous pipes. The child-to-parent status pipe carries one bounded
 `LWPT-ACK/1` hello frame when a nested LWPT installs forwarding, then exactly
 one terminal `REAPED` or `FAILED` frame during cancellation. Frames must match
 the inherited token; unknown versions, tokens, and frame kinds do not register
-a child. A process that never sends hello remains an arbitrary child and is
+a child. The inherited metadata also names the spawning LWPT process; a nested
+LWPT accepts the channel only when that PID is its current operating-system
+parent, so an intermediate program cannot accidentally forward ownership to a
+grandchild. A process that never sends hello remains an arbitrary child and is
 never ACK-gated. The parent-to-child pipe carries one bounded cancel frame with
 the root-authored absolute monotonic descendant and acknowledgement deadlines.
 On Unix this deadline frame accompanies SIGINT/SIGTERM propagation; on Windows
