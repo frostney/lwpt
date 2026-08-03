@@ -476,6 +476,14 @@ begin
       Expect<Integer>(Runner.Run('', Options, StandardOutput,
         StandardError)).ToBe(0);
       Expect<Boolean>(Runner.UsedStandardInputWriter).ToBe(False);
+      Expect<Boolean>(poUsePipes in P.Options).ToBe(True);
+      {$IFDEF MSWINDOWS}
+      { A short-lived child must remain suspended until ProcessTree assigns it
+        to the owning Job Object. ProcessRunner may add pipe options but must
+        not replace this Windows isolation option. }
+      Expect<Boolean>(poRunSuspended in P.Options).ToBe(True);
+      {$ENDIF}
+      Expect<Boolean>(poStderrToOutPut in P.Options).ToBe(False);
       Expect<string>(StandardOutput).ToBe('');
       Expect<string>(StandardError).ToBe('');
     finally

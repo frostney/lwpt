@@ -31,6 +31,8 @@ const
   MarkerWaitCeilingSeconds = 5;
   ProcessExitCeilingSeconds = 8;
   ProcessStartupCeilingSeconds = 10;
+  ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
+  ProcessCaptureOverflowHoldMilliseconds = 2000;
   ProcessTreeProxyModeEnvironment = PROJECT_NAME
     + '_PROCESS_TREE_TEST_PROXY_MODE';
   ProcessTreeProxyPIDFileEnvironment = PROJECT_NAME
@@ -72,6 +74,7 @@ type
     procedure TestBailTerminatesActiveAndLeavesPendingUnstarted;
     procedure TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
     procedure TestWorkerErrorTerminatesActiveProcessTree;
+    procedure TestProcessFailureSurvivesDelegationCleanupFailure;
     {$IFDEF UNIX}
     procedure TestSIGINTTerminatesActiveProcessTree;
     procedure TestSIGTERMTerminatesActiveProcessTree;
@@ -652,6 +655,43 @@ begin
     .ToBe(True);
 end;
 
+procedure TTestScheduling.TestProcessFailureSurvivesDelegationCleanupFailure;
+var
+  CommandResult: TLwptResult;
+begin
+  ResetProject(0);
+  WriteTextFile(FScratch + '/tests/A.OutputLimit.Test.pas',
+      'program OutputLimitFixture;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, SysUtils;'#10
+    + 'var BlockedTmp: string;'#10
+    + 'begin'#10
+    + '  BlockedTmp := IncludeTrailingPathDelimiter(GetEnvironmentVariable('
+    + PascalString(WORKER_STATE_DIR_ENV) + ')) + ''tmp'';'#10
+    + '  if DirectoryExists(BlockedTmp) and not RemoveDir(BlockedTmp) then'
+    + ' Halt(2);'#10
+    + '  TFileStream.Create(BlockedTmp, fmCreate).Free;'#10
+    + '  Write(StringOfChar(''x'', '
+    + IntToStr(ProcessCaptureOverflowBytes) + '));'#10
+    + '  Flush(Output);'#10
+    + '  Sleep(' + IntToStr(ProcessCaptureOverflowHoldMilliseconds) + ');'#10
+    + 'end.'#10);
+
+  CommandResult := RunTests(['--jobs=1', '--bail=0']);
+  if (CommandResult.ExitCode <> 1)
+     or (Pos('standard output exceeded its 16777216-byte capture limit',
+       CommandResult.Stderr) = 0)
+     or (Pos('Unable to create file', CommandResult.Stderr) > 0) then
+    Fail('delegation-cleanup failure evidence:' + LineEnding
+      + 'stdout:' + LineEnding + CommandResult.Stdout + LineEnding
+      + 'stderr:' + LineEnding + CommandResult.Stderr);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('standard output exceeded its 16777216-byte capture '
+    + 'limit', CommandResult.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Unable to create file', CommandResult.Stderr) = 0)
+    .ToBe(True);
+end;
+
 {$IFDEF UNIX}
 procedure TTestScheduling.RunSignalForwardingTest(const ASignal: Integer;
   const AProjectName: string);
@@ -777,6 +817,8 @@ begin
     TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
   Test('worker error terminates another active process tree',
     TestWorkerErrorTerminatesActiveProcessTree);
+  Test('process failure survives delegation cleanup failure',
+    TestProcessFailureSurvivesDelegationCleanupFailure);
   {$IFDEF UNIX}
   Test('SIGINT reaps the active compiler tree',
     TestSIGINTTerminatesActiveProcessTree);
