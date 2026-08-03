@@ -67,6 +67,7 @@ uses
   SysUtils,
 
   LWPT.BuildRequest,
+  LWPT.CompilerDriver.Blaise,
   LWPT.CompilerDriver.External,
   LWPT.CompilerDriver.FPC,
   LWPT.CompilerDriver.Lakon,
@@ -260,9 +261,11 @@ begin
   if not Assigned(AFactory) then
     raise ELWPTCompilerDriverError.CreateFmt(
       'embedding compiler factory "%s" is not assigned', [ADriverID]);
-  if SameText(ADriverID, FPC_COMPILER_ID) then
+  if SameText(ADriverID, FPC_COMPILER_ID)
+     or SameText(ADriverID, BLAISE_COMPILER_ID) then
     raise ELWPTCompilerDriverError.Create(
-      'embedding compiler factories cannot shadow built-in "fpc"');
+      'embedding compiler factories cannot shadow built-in "'
+      + LowerCase(ADriverID) + '"');
   Index := FindFactory(ADriverID);
   if Index >= 0 then
     raise ELWPTCompilerDriverError.CreateFmt(
@@ -357,6 +360,16 @@ begin
         'compiler profile "%s" cannot use script with built-in "fpc"',
         [AProfile.Name]);
     Exit(TLWPTFPCCompilerDriver.Create(ExecutablePath,
+      AProfile.VersionConstraint));
+  end;
+
+  if SameText(AProfile.Driver, BLAISE_COMPILER_ID) then
+  begin
+    if ScriptPath <> '' then
+      raise ELWPTCompilerDriverError.CreateFmt(
+        'compiler profile "%s" cannot use script with built-in "blaise"',
+        [AProfile.Name]);
+    Exit(TLWPTBlaiseCompilerDriver.Create(ExecutablePath,
       AProfile.VersionConstraint));
   end;
 
