@@ -201,12 +201,14 @@ those payloads. Retention classification distinguishes ordinary progress from
 protected diagnostics and terminal outcomes, so a host can retain or replay
 events without teaching the generic CLI package about LWPT policy. Raw child
 chunks use `RawByteString` and remain byte-safe across embedded NUL bytes.
+Failed job events preserve a child-process exit code when one exists and reject
+zero; internal scheduler failures use the documented generic failure outcome.
 
-The existing build/test human rendering remains unchanged at this foundation
-layer. `LWPT.Output.Legacy` temporarily owns that presentation vocabulary while
-the shared event-backed reporter and the executable host's terminal and
-retention policy build on these types separately; `LWPT.BuildSession` now owns
-session paths and logs rather than the observability vocabulary.
+`LWPT.ProgressReporter` consumes typed job and heartbeat events for build and
+test. It owns their shared heartbeat cadence, active-job assembly, established
+human rendering, and per-job log persistence. The executable host's broader
+terminal and retention policy builds on the same event types separately;
+`LWPT.BuildSession` owns only session-path allocation and atomic log writes.
 
 ## `.lwpt/` layout
 

@@ -292,6 +292,10 @@ begin
   try
     R := RunLwpt(['build'], Bad);
     Expect<Integer>(R.ExitCode).ToBe(1);
+    { The typed failed-job event rejects zero outcomes. Reaching the normal
+      progress line proves the build producer carried the compiler failure
+      through event construction rather than substituting success. }
+    Expect<Boolean>(Pos('FAIL bad (', R.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('FAILED (fpc exit 1)', R.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('build entry "bad" failed:', R.Stderr) > 0).ToBe(True);
     Expect<Boolean>(Pos('0 built, 1 failed', R.Stdout) > 0).ToBe(True);

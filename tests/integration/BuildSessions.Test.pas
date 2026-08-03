@@ -13,7 +13,7 @@ uses
 
   LWPT.BuildSession,
   LWPT.Core,
-  LWPT.Output.Legacy,
+  LWPT.ProgressReporter,
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,

@@ -15,6 +15,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestJobLifecycleRetentionIsTyped;
+    procedure TestFailedJobRequiresNonZeroExitOutcome;
     procedure TestHeartbeatAndDiagnosticRetentionIsTyped;
     procedure TestChildOutputPreservesRawBytesAndTags;
     procedure TestCommandTerminalCarriesOutcome;
@@ -39,6 +40,27 @@ begin
   finally
     Started.Free;
     Failed.Free;
+  end;
+end;
+
+procedure TLWPTObservabilitySuite.TestFailedJobRequiresNonZeroExitOutcome;
+var
+  Event: TLWPTJobEvent;
+  RejectedZero: Boolean;
+begin
+  RejectedZero := False;
+  Event := nil;
+  try
+    try
+      Event := TLWPTJobEvent.Create('test:scheduler', 'invocation-1',
+        ojsFailed, 1, 0, 'scheduler error', 'session/logs/test.log');
+    except
+      on EArgumentException do RejectedZero := True;
+    end;
+    Expect<Boolean>(RejectedZero).ToBe(True);
+    Expect<Boolean>(ObservabilityInternalErrorExitCode <> 0).ToBe(True);
+  finally
+    Event.Free;
   end;
 end;
 
@@ -127,6 +149,8 @@ procedure TLWPTObservabilitySuite.SetupTests;
 begin
   Test('job lifecycle events distinguish ordinary starts from terminals',
     TestJobLifecycleRetentionIsTyped);
+  Test('failed job events require a nonzero exit outcome',
+    TestFailedJobRequiresNonZeroExitOutcome);
   Test('heartbeats are ordinary while diagnostics are protected',
     TestHeartbeatAndDiagnosticRetentionIsTyped);
   Test('child output preserves raw bytes plus source and correlation tags',

@@ -59,7 +59,8 @@ uses
   LWPT.Command.Common,
   LWPT.CompilerDriver,
   LWPT.Manifest,
-  LWPT.Output.Legacy,
+  LWPT.Observability,
+  LWPT.ProgressReporter,
   LWPT.WorkerBudget;
 
 const
@@ -96,6 +97,7 @@ type
     FCompiler: TLWPTCompilerProcess;
     FCompiled: TLWPTCompiledEntry;
     FBuildResult: TLWPTBuildResult;
+    FCompilerExitCode: Integer;
     FOutput: string;
     FError: string;
     FCancellationError: string;
@@ -115,6 +117,7 @@ type
     function IsDone: Boolean;
     property Compiled: TLWPTCompiledEntry read FCompiled;
     property BuildResult: TLWPTBuildResult read FBuildResult;
+    property CompilerExitCode: Integer read FCompilerExitCode;
     property CapturedOutput: string read FOutput;
     property CancellationError: string read FCancellationError;
     property ErrorMessage: string read FError;
@@ -446,7 +449,8 @@ function BuildOneEntry(const AManifestPath: string; const AMan: TManifest;
   const T: TLWPTBuildEntry; ARelease, AClean: Boolean;
   ASession: TLWPTBuildSession; ACompiler: TLWPTCompilerProcess;
   ADriver: TLWPTCompilerDriver; out ACompiled: TLWPTCompiledEntry;
-  out ABuildResult: TLWPTBuildResult; out AOutput: string): Boolean;
+  out ABuildResult: TLWPTBuildResult; out AOutput: string;
+  out ACompilerExitCode: Integer): Boolean;
 var
   FpcArgs : TStringArray;
   OutBin, JobRoot, BinDir, CandidateBin, UnitOutDir, StandardOutput,
@@ -461,6 +465,7 @@ begin
   ACompiled := Default(TLWPTCompiledEntry);
   ABuildResult := DefaultBuildResult;
   AOutput := '';
+  ACompilerExitCode := ObservabilityInternalErrorExitCode;
   if T.Source = '' then
     Exit(False);
 
@@ -546,6 +551,7 @@ begin
     ADriver.CompilationTimeoutMilliseconds,
     'compiler "' + ADriver.CompilerID + '" compile',
     StandardOutput, StandardError);
+  ACompilerExitCode := FpcExit;
   AOutput := ADriver.DisplayOutput(StandardOutput, StandardError);
   ABuildResult := ADriver.NormalizeExecutionResult(Request.BuildRequest,
     FpcExit, StandardOutput, StandardError);
@@ -601,6 +607,7 @@ begin
   FCompiler := TLWPTCompilerProcess.Create(FDriver.ExecutableName);
   FCompiled := Default(TLWPTCompiledEntry);
   FBuildResult := DefaultBuildResult;
+  FCompilerExitCode := ObservabilityInternalErrorExitCode;
   FOutput := '';
   FError := '';
   FSucceeded := False;
@@ -625,7 +632,8 @@ begin
     try
       FSucceeded := BuildOneEntry(FManifestPath, FManifest,
         FManifestContentHash, FEntry, FRelease, FClean, FSession,
-        FCompiler, FDriver, FCompiled, FBuildResult, FOutput);
+        FCompiler, FDriver, FCompiled, FBuildResult, FOutput,
+        FCompilerExitCode);
       if (not FSucceeded) and (FError = '') then
         if FEntry.Source = '' then
           FError := 'build entry has no source'
@@ -866,6 +874,7 @@ var
   States: TLWPTBuildEntryStateArray;
   Jobs: TLWPTBuildJobArray;
   BuildResults: TLWPTBuildResultArray;
+  CompilerExitCodes: array of Integer;
   Compiled: TLWPTCompiledEntryArray;
   CapturedOutputs, Errors: TLWPTStringArray;
   PublicationRequest: TLWPTBuildPublicationRequest;
@@ -876,16 +885,11 @@ var
   WholePostBuild: THookArray;
   HookEnvironment: array of string;
   HasEdges, MadeProgress: Boolean;
-  StartedAt, LastHeartbeatAt, HeartbeatInterval, NowTick: QWord;
+  StartedAt, NowTick: QWord;
   StartTicks: array of QWord;
   Reported: array of Boolean;
-
-  procedure WriteCapturedOutput(const AOutput: string);
-  begin
-    if AOutput = '' then Exit;
-    Write(AOutput);
-    if not (AOutput[Length(AOutput)] in [#10, #13]) then WriteLn;
-  end;
+  Reporter: TLWPTProgressReporter;
+  HeartbeatEvent: TLWPTHeartbeatEvent;
 
   function LogIdentity(const AIndex: Integer): string;
   begin
@@ -893,17 +897,26 @@ var
   end;
 
   procedure PrintStart(const AIndex: Integer);
+  var
+    Event: TLWPTJobEvent;
   begin
     StartTicks[AIndex] := GetTickCount64;
-    Session.WriteJobLog(LogIdentity(AIndex), '');
-    WriteLn(ObservabilityStartEvent, Man.BuildEntries[AIndex].Name, ' (',
-      Man.BuildEntries[AIndex].Source, '; log: ',
-      Session.JobLogReference(LogIdentity(AIndex)), ')');
+    Event := TLWPTJobEvent.Create(LogIdentity(AIndex), Session.SessionID,
+      ojsStarted, 0, 0, Man.BuildEntries[AIndex].Source,
+      Session.JobLogReference(LogIdentity(AIndex)));
+    try
+      Reporter.ReportJob(Event, '', '', AVerbose, StartTicks[AIndex]);
+    finally
+      Event.Free;
+    end;
   end;
 
   procedure PrintTerminal(const AIndex: Integer);
   var
-    LogOutput, Elapsed, LogReference: string;
+    Detail, LogOutput, LogReference: string;
+    Event: TLWPTJobEvent;
+    EventState: TLWPTJobState;
+    EventExitCode: Integer;
   begin
     if Reported[AIndex] then Exit;
     if not (States[AIndex] in [besSucceeded, besFailed, besBlocked]) then Exit;
@@ -911,57 +924,37 @@ var
     LogOutput := CapturedOutputs[AIndex];
     if (LogOutput = '') and (Errors[AIndex] <> '') then
       LogOutput := Errors[AIndex] + LineEnding;
-    Session.WriteJobLog(LogIdentity(AIndex), LogOutput);
     LogReference := Session.JobLogReference(LogIdentity(AIndex));
-    Elapsed := FormatElapsedMilliseconds(
-      GetTickCount64 - StartTicks[AIndex]);
     case States[AIndex] of
       besSucceeded:
         begin
-          WriteLn(ObservabilityPassEvent, Man.BuildEntries[AIndex].Name, ' -> ',
-            Compiled[AIndex].OutBin, ' (', Elapsed, '; log: ',
-            LogReference, ')');
-          if AVerbose then WriteCapturedOutput(LogOutput);
+          EventState := ojsPassed;
+          EventExitCode := 0;
+          Detail := Compiled[AIndex].OutBin;
         end;
       besFailed:
         begin
-          WriteLn(ObservabilityFailEvent, Man.BuildEntries[AIndex].Name, ' (',
-            Elapsed,
-            '; log: ', LogReference, ')');
-          WriteCapturedOutput(LogOutput);
-          if (Errors[AIndex] <> '')
-             and (Pos(Errors[AIndex], LogOutput) = 0) then
-            WriteLn('  error: ', Errors[AIndex]);
-          if Errors[AIndex] <> '' then
-            WriteLn(ErrOutput, '  build entry "', Man.BuildEntries[AIndex].Name,
-              '" failed: ', Errors[AIndex]);
+          EventState := ojsFailed;
+          EventExitCode := CompilerExitCodes[AIndex];
+          if EventExitCode = 0 then
+            EventExitCode := ObservabilityInternalErrorExitCode;
+          Detail := '';
         end;
       besBlocked:
         begin
-          WriteLn(ObservabilitySkipEvent, Man.BuildEntries[AIndex].Name, ' (',
-            Errors[AIndex], '; ', Elapsed, '; log: ', LogReference, ')');
-          WriteLn(ErrOutput, '  build entry "', Man.BuildEntries[AIndex].Name,
-            '" failed: ', Errors[AIndex]);
+          EventState := ojsSkipped;
+          EventExitCode := 0;
+          Detail := Errors[AIndex];
         end;
     end;
-  end;
-
-  function ActiveBuildSummary(const ATick: QWord): string;
-  var
-    EntryIndex: Integer;
-  begin
-    Result := '';
-    for EntryIndex := 0 to High(Man.BuildEntries) do
-      if States[EntryIndex] in [besPending, besRunning] then
-      begin
-        if Result <> '' then Result := Result + ', ';
-        Result := Result + Man.BuildEntries[EntryIndex].Name;
-        if States[EntryIndex] = besRunning then
-          Result := Result + ' (' + FormatElapsedMilliseconds(
-            ATick - StartTicks[EntryIndex]) + ')'
-        else
-          Result := Result + ' (queued)';
-      end;
+    Event := TLWPTJobEvent.Create(LogIdentity(AIndex), Session.SessionID,
+      EventState, GetTickCount64 - StartTicks[AIndex], EventExitCode, Detail,
+      LogReference);
+    try
+      Reporter.ReportJob(Event, LogOutput, Errors[AIndex], AVerbose);
+    finally
+      Event.Free;
+    end;
   end;
 
   procedure RunEntryPostBuild(const AIndex: Integer);
@@ -979,6 +972,7 @@ var
   function AcquireWorkerLease: TLWPTWorkerLease;
   var
     LastWaitReport, WaitStartedAt, WaitTick: QWord;
+    WaitEvent: TLWPTHeartbeatEvent;
   begin
     Result := nil;
     WaitStartedAt := GetTickCount64;
@@ -988,11 +982,17 @@ var
       Result := WorkerSession.Acquire(100);
       if Assigned(Result) then Break;
       WaitTick := GetTickCount64;
-      if WaitTick - LastWaitReport >= HeartbeatInterval then
+      if WaitTick - LastWaitReport >=
+         Reporter.HeartbeatIntervalMilliseconds then
       begin
-        WriteLn(ObservabilityHeartbeatEvent,
-          'waiting for postbuild worker capacity ',
-          FormatElapsedMilliseconds(WaitTick - WaitStartedAt));
+        WaitEvent := TLWPTHeartbeatEvent.Create('build:postbuild-capacity',
+          Session.SessionID, WaitTick - WaitStartedAt);
+        try
+          Reporter.ReportWaitHeartbeat(WaitEvent,
+            'waiting for postbuild worker capacity');
+        finally
+          WaitEvent.Free;
+        end;
         LastWaitReport := WaitTick;
       end;
     end;
@@ -1103,6 +1103,7 @@ begin
   Skipped := 0;
   Result := 1;
   CompilerSelection := nil;
+  Reporter := nil;
   try
     try
       if not FileExists(AManifestPath) then
@@ -1174,6 +1175,7 @@ begin
   Session := TLWPTBuildSession.Create(
     ExtractFileDir(ExpandFileName(AManifestPath)));
   try
+    Reporter := TLWPTProgressReporter.Create(Session, lpsBuild);
     WriteLn('build session: ', Session.SessionID, ' (',
       Session.SessionReference, ')');
     { --clean means a forced compile in fresh private staging. It never
@@ -1188,16 +1190,19 @@ begin
     SetLength(States, Length(Man.BuildEntries));
     SetLength(Jobs, Length(Man.BuildEntries));
     SetLength(BuildResults, Length(Man.BuildEntries));
+    SetLength(CompilerExitCodes, Length(Man.BuildEntries));
     SetLength(Compiled, Length(Man.BuildEntries));
     SetLength(CapturedOutputs, Length(Man.BuildEntries));
     SetLength(Errors, Length(Man.BuildEntries));
     SetLength(StartTicks, Length(Man.BuildEntries));
     SetLength(Reported, Length(Man.BuildEntries));
-    HeartbeatInterval := ObservabilityHeartbeatIntervalMilliseconds;
-    LastHeartbeatAt := GetTickCount64;
+    Reporter.StartHeartbeatClock(StartedAt, GetTickCount64);
     for i := 0 to High(Man.BuildEntries) do
       if Selected[i] then States[i] := besPending
       else States[i] := besUnselected;
+    for i := 0 to High(Man.BuildEntries) do
+      if Selected[i] then Reporter.RegisterJob(LogIdentity(i),
+        Man.BuildEntries[i].Name);
 
     WorkerSession := TLWPTWorkerBudgetSession.Create(
       NewWorkerSessionId, MaxJobs);
@@ -1225,7 +1230,6 @@ begin
               Inc(Skipped);
               Inc(Completed);
               StartTicks[i] := GetTickCount64;
-              Session.WriteJobLog(LogIdentity(i), '');
               PrintTerminal(i);
               MadeProgress := True;
             end;
@@ -1270,6 +1274,7 @@ begin
               on E: Exception do
               begin
                 States[i] := besFailed;
+                CompilerExitCodes[i] := ObservabilityInternalErrorExitCode;
                 Errors[i] := E.Message;
                 Inc(Failed);
                 Inc(Completed);
@@ -1285,10 +1290,12 @@ begin
               Jobs[i].WaitFor;
               CapturedOutputs[i] := Jobs[i].CapturedOutput;
               BuildResults[i] := Jobs[i].BuildResult;
+              CompilerExitCodes[i] := Jobs[i].CompilerExitCode;
               if Jobs[i].Succeeded then
               begin
                 Compiled[i] := Jobs[i].Compiled;
                 States[i] := besCompiled;
+                Reporter.MarkJobInactive(LogIdentity(i));
               end
               else
               begin
@@ -1323,12 +1330,15 @@ begin
             end;
 
           NowTick := GetTickCount64;
-          if NowTick - LastHeartbeatAt >= HeartbeatInterval then
+          if Reporter.HeartbeatDue(NowTick) then
           begin
-            WriteLn(ObservabilityHeartbeatEvent, 'build elapsed ',
-              FormatElapsedMilliseconds(NowTick - StartedAt),
-              '; active: ', ActiveBuildSummary(NowTick));
-            LastHeartbeatAt := NowTick;
+            HeartbeatEvent := TLWPTHeartbeatEvent.Create('build',
+              Session.SessionID, NowTick - StartedAt);
+            try
+              Reporter.ReportHeartbeat(HeartbeatEvent);
+            finally
+              HeartbeatEvent.Free;
+            end;
           end;
           if not MadeProgress then Sleep(10);
         end;
@@ -1389,6 +1399,7 @@ begin
     Session.Finish(Failed = 0,
       IntToStr(Failed) + ' build entry(s) failed or became stale');
   finally
+    Reporter.Free;
     Session.Free;
   end;
     except
