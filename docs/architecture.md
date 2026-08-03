@@ -18,9 +18,13 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   `LWPT.BuildRequest` owns the versioned request, target tuple, capability, and
   normalized result structures. `TLWPTCompilerDriver` owns capability probing,
   argument translation, executable naming, failure classification, and result
-  normalization. Root-owned profiles select built-in FPC, a short-lived
-  external driver, or an embedding-host factory for build and test; lifecycle
-  hook compilation remains on FPC. See ADR-0022, ADR-0029, and ADR-0030.
+  normalization. Root-owned profiles select built-in FPC, Delphi, Blaise, the
+  opt-in Lakon adapter, a short-lived external driver, or an embedding-host
+  factory for build and
+  test. A registered `lakon` host factory takes precedence over the external
+  Lakon adapter so an embedding can replace the implicit FPC default;
+  lifecycle hook compilation remains on FPC. See ADR-0022, ADR-0029, and
+  ADR-0030.
 - **Analysis commands share structure, not policy.** `LWPT.Analysis.Scope`
   resolves root/workspace ownership, `LWPT.Analysis.Pascal` exposes normalized
   tokens and typed declaration/executable regions, and `LWPT.Analysis.JSON`
@@ -75,7 +79,7 @@ Sections currently supported:
 | `[dependencies]` | bare-string `"<source>@<version>"` shorthand or inline-table `{ source = "...", version = "...", subdir = "..." }` — see [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) |
 | `[sources]` | per-project custom git-host declarations. Each entry is an inline table mapping a prefix name to `archive` + `git` URL templates with `{user}` / `{repository}` / `{ref}` placeholders; enables prefixes like `gitea:owner/repo` against the user's self-hosted instance |
 | `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Inline entries may declare `depends = ["prerequisite"]` and ordered `flags = ["-dFEATURE"]`. Single-binary shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` |
-| `[compiler]` / `[compiler.profiles.<name>]` | root-owned compiler policy. `default` names the project profile; profiles select a driver plus optional `version` and either `executable` or `script`. A build entry's `compiler` field overrides the project default. Dependency manifests cannot contribute this policy. |
+| `[compiler]` / `[compiler.profiles.<name>]` | root-owned compiler policy. `default` names the project profile; profiles select a driver plus optional `version` and either `executable` or `script`. Built-in IDs are `fpc`, opt-in `blaise`, and opt-in `lakon`; other IDs resolve through an embedding factory or external protocol executable. An embedding host may register `lakon` explicitly and make it the host default. A build entry's `compiler` field overrides the project default. Dependency manifests cannot contribute this policy. |
 | `[workspaces]` | `include` / `exclude` glob arrays for monorepo workspace auto-discovery (each matched dir with its own `lwpt.toml` is installed as a validated local snapshot) |
 | `[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` | Lifecycle hooks per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with optional `inputs` / `output` staleness gating. Plus per-`[build]`-entry inline `prebuild` / `postbuild` fields for per-binary signing / packaging / etc. |
 | Any other top-level section with a `script` field | A user-declared run-script callable via `lwpt run <name>` per [ADR-0013](./adr/0013-run-subcommand-and-build-rename.md) |
@@ -254,7 +258,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`,
 `LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.WorkerBudget.pas`,
 `LWPT.Command.*.pas`, `LWPT.CompilerDriver.pas`,
-`LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.External.pas`,
+`LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.Delphi.pas`,
+`LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
 `LWPT.GitProtocol.pas`) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five

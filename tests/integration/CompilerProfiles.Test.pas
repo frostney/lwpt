@@ -22,6 +22,8 @@ uses
 
 const
   DRIVER_ID = 'integration-driver';
+  LAKON_DRIVER_ID = 'lakon';
+  LAKON_MODE = 'lakon-cfg';
   LEASE_OBSERVER_ENV = PROJECT_NAME + '_LEASE_OBSERVER';
 
 type
@@ -29,8 +31,10 @@ type
   private
     FScratch: string;
     procedure SetMode(const AMode: string);
+    procedure WriteLakonManifest;
     procedure WriteManifest(const AEntryCompiler: string = 'external';
       const AObservePostBuildLeases: Boolean = False);
+    procedure WriteBlaiseManifest;
   protected
     procedure BeforeAll; override;
   public
@@ -40,6 +44,7 @@ type
     procedure TestIdentityMismatchNeverFallsBack;
     procedure TestVersionMismatchFails;
     procedure TestLiveCapabilityMutationFailsBeforeCompile;
+    procedure TestLakonBuildConsumesCfgUnitPaths;
     procedure TestTargetMismatchFails;
     procedure TestMalformedStdoutRetainsStderr;
     procedure TestMalformedTestResultDoesNotAbortSibling;
@@ -48,6 +53,7 @@ type
     procedure TestReorderedArtifactsPublishTheRequestedPrimary;
     procedure TestPublicationTargetMutationBlocksPublication;
     procedure TestPublicationRevalidationRetainsWorkerCapacity;
+    procedure TestBuiltInBlaiseProfileDispatchesWithoutFallback;
   end;
 
 function ReadInput: string;
@@ -60,6 +66,57 @@ begin
     ReadLn(Line);
     Result := Result + Line + #10;
   end;
+end;
+
+procedure RunLakonDriver;
+var
+  ArgumentIndex: Integer;
+  HasCfgUnitPath: Boolean;
+  OutputPath: string;
+begin
+  if (ParamCount = 1) and (ParamStr(1) = '--version') then
+  begin
+    WriteLn(LAKON_DRIVER_ID, ' 0.1.0');
+    Halt(0);
+  end;
+  if (ParamCount = 1) and (ParamStr(1) = '--help') then
+  begin
+    WriteLn('usage: ', LAKON_DRIVER_ID, ' <command>');
+    WriteLn(LAKON_DRIVER_ID, ' compile <file> - Compile Pascal to WebAssembly');
+    WriteLn('-o <file>');
+    WriteLn('-Fu <dir>');
+    WriteLn('-d <sym>');
+    WriteLn('--no-cache');
+    WriteLn('--verbose-units');
+    WriteLn('--no-inline');
+    WriteLn('--inline-stats');
+    Halt(0);
+  end;
+  if (ParamCount < 2) or (ParamStr(1) <> 'compile') then Halt(2);
+  HasCfgUnitPath := False;
+  OutputPath := '';
+  ArgumentIndex := 3;
+  while ArgumentIndex <= ParamCount do
+  begin
+    if (ParamStr(ArgumentIndex) = '-Fu')
+       and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      if ExpandFileName(ParamStr(ArgumentIndex)) =
+         ExpandFileName('cfg-only-units') then HasCfgUnitPath := True;
+    end
+    else if (ParamStr(ArgumentIndex) = '-o')
+      and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      OutputPath := ParamStr(ArgumentIndex);
+    end;
+    Inc(ArgumentIndex);
+  end;
+  if not HasCfgUnitPath then Halt(3);
+  if OutputPath = '' then Halt(4);
+  WriteTextFile(OutputPath, 'cfg-only unit path reached Lakon');
+  Halt(0);
 end;
 
 function ReadMode: string;
@@ -186,6 +243,79 @@ begin
   end;
 end;
 
+procedure RunBlaiseProxy;
+var
+  Diagnostic, Value: string;
+  Request: TLWPTBuildRequest;
+  ArgumentIndex, Count, ExitCode: Integer;
+begin
+  if ParamStr(1) = '--help' then
+  begin
+    WriteTextFile(ExpandFileName('.blaise-help'), 'probed');
+    WriteLn('Blaise Compiler v0.13.0');
+    WriteLn('Usage:');
+    WriteLn('  blaise --source <file.pas> --output <binary>');
+    WriteLn('Flags:');
+    WriteLn('  --target <os>-<cpu>  Cross-compile target (default: '
+      + 'linux-x86_64, the host).');
+    WriteLn('                         linux-x86_64, freebsd-x86_64');
+    Halt(0);
+  end;
+
+  Request := DefaultBuildRequest;
+  Request.Compiler.ID := 'blaise';
+  Request.Compiler.VersionConstraint := '>=0.13.0';
+  Request.Target.OS := 'linux';
+  Request.Target.Architecture := 'x86_64';
+  Request.OutputKind := BUILD_OUTPUT_EXECUTABLE;
+  Request.Mode := BUILD_MODE_DEV;
+  ArgumentIndex := 1;
+  while ArgumentIndex <= ParamCount do
+  begin
+    Value := ParamStr(ArgumentIndex);
+    if (Value = '--source') and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      Request.Inputs.EntryPoint := ParamStr(ArgumentIndex);
+      SetLength(Request.Inputs.Sources, 1);
+      Request.Inputs.Sources[0] := Request.Inputs.EntryPoint;
+    end
+    else if (Value = '--output') and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      Request.Outputs.Artifact := ParamStr(ArgumentIndex);
+      Request.Outputs.ExecutableDirectory := ExtractFileDir(
+        Request.Outputs.Artifact);
+    end
+    else if (Value = '--unit-path') and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      Count := Length(Request.Inputs.UnitPaths);
+      SetLength(Request.Inputs.UnitPaths, Count + 1);
+      Request.Inputs.UnitPaths[Count] := ParamStr(ArgumentIndex);
+    end
+    else if (Value = '--unit-cache') and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      Request.Outputs.UnitDirectory := ParamStr(ArgumentIndex);
+      Request.Outputs.ObjectDirectory := Request.Outputs.UnitDirectory;
+    end
+    else if ((Value = '--target') or (Value = '--backend')
+      or (Value = '--define')) and (ArgumentIndex < ParamCount) then
+      Inc(ArgumentIndex);
+    Inc(ArgumentIndex);
+  end;
+  if Request.Outputs.UnitDirectory = '' then
+  begin
+    Request.Outputs.UnitDirectory := Request.Outputs.ExecutableDirectory;
+    Request.Outputs.ObjectDirectory := Request.Outputs.UnitDirectory;
+  end;
+  WriteTextFile(ExpandFileName('.blaise-compile'), 'compiled');
+  ExitCode := CompileWithFPC(Request, Diagnostic);
+  if Diagnostic <> '' then Write(ErrOutput, Diagnostic);
+  Halt(ExitCode);
+end;
+
 procedure RunDriver(const AOperation: string);
 var
   BuildResult: TLWPTBuildResult;
@@ -309,6 +439,10 @@ begin
     DeleteFile(FScratch + '/.entry-lease-observed');
   if FileExists(FScratch + '/.whole-lease-observed') then
     DeleteFile(FScratch + '/.whole-lease-observed');
+  if FileExists(FScratch + '/.blaise-help') then
+    DeleteFile(FScratch + '/.blaise-help');
+  if FileExists(FScratch + '/.blaise-compile') then
+    DeleteFile(FScratch + '/.blaise-compile');
   RecursiveDelete(FScratch + '/build');
 end;
 
@@ -352,6 +486,46 @@ begin
     + 'app = { source = "source/app.pas", output = "build/app"'
     + CompilerField + EntryPostBuild + ' }'#10
     + WholePostBuild);
+end;
+
+procedure TCompilerProfiles.WriteLakonManifest;
+begin
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "lakon-cfg-project"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[compiler]'#10
+    + 'default = "' + LAKON_DRIVER_ID + '"'#10
+    + #10
+    + '[compiler.profiles.' + LAKON_DRIVER_ID + ']'#10
+    + 'driver = "' + LAKON_DRIVER_ID + '"'#10
+    + 'executable = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
+    + 'version = "^0.1.0"'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app.wasm" }'#10);
+end;
+
+procedure TCompilerProfiles.WriteBlaiseManifest;
+begin
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "compiler-profile-project"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[compiler]'#10
+    + 'default = "modern"'#10
+    + #10
+    + '[compiler.profiles.modern]'#10
+    + 'driver = "blaise"'#10
+    + 'executable = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
+    + 'version = ">=0.13.0"'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app" }'#10);
 end;
 
 procedure TCompilerProfiles.BeforeAll;
@@ -440,6 +614,42 @@ begin
     [PROJECT_NAME + '_FPC_UNIT_PATHS=' + EnvironmentUnitPaths]);
   DumpRunFailure('external test', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
+end;
+
+procedure TCompilerProfiles.TestLakonBuildConsumesCfgUnitPaths;
+var
+  OriginalCfg, UpdatedCfg: TStringList;
+  R: TLwptResult;
+begin
+  SetMode(LAKON_MODE);
+  WriteLakonManifest;
+  WriteTextFile(FScratch + '/source/app.pas',
+    'program app;'#10'uses CfgOnlyUnit;'#10'begin'#10'end.'#10);
+  WriteTextFile(FScratch + '/cfg-only-units/CfgOnlyUnit.pas',
+      'unit CfgOnlyUnit;'#10
+    + 'interface'#10
+    + 'implementation'#10
+    + 'end.'#10);
+  OriginalCfg := TStringList.Create;
+  UpdatedCfg := TStringList.Create;
+  try
+    OriginalCfg.LoadFromFile(FScratch + '/lwpt.cfg');
+    UpdatedCfg.Assign(OriginalCfg);
+    UpdatedCfg.Add('-Fucfg-only-units');
+    AtomicWriteText(FScratch + '/lwpt.cfg', FScratch + '/.lwpt/tmp',
+      UpdatedCfg);
+    R := RunLwpt(['build', '--jobs', '1'], FScratch);
+    DumpRunFailure('Lakon cfg-only unit path', R, 0);
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(FileExists(FScratch + '/build/app.wasm')).ToBe(True);
+  finally
+    AtomicWriteText(FScratch + '/lwpt.cfg', FScratch + '/.lwpt/tmp',
+      OriginalCfg);
+    UpdatedCfg.Free;
+    OriginalCfg.Free;
+    WriteTextFile(FScratch + '/source/app.pas',
+      'program app;'#10'begin'#10'end.'#10);
+  end;
 end;
 
 procedure TCompilerProfiles.TestEntryProfileOverridesProjectDefault;
@@ -621,10 +831,26 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/.lease-observed')).ToBe(True);
 end;
 
+procedure TCompilerProfiles.TestBuiltInBlaiseProfileDispatchesWithoutFallback;
+var
+  R: TLwptResult;
+begin
+  SetMode('success');
+  WriteBlaiseManifest;
+  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  DumpRunFailure('built-in Blaise build', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(FScratch + '/.blaise-help')).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/.blaise-compile')).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/build/app')).ToBe(True);
+end;
+
 procedure TCompilerProfiles.SetupTests;
 begin
   Test('root external profile drives real build and test',
     TestExternalBuildAndTestSucceed);
+  Test('Lakon build consumes cfg-only dependency unit paths',
+    TestLakonBuildConsumesCfgUnitPaths);
   Test('entry profile overrides project default',
     TestEntryProfileOverridesProjectDefault);
   Test('identity mismatch never falls back',
@@ -647,9 +873,15 @@ begin
     TestPublicationTargetMutationBlocksPublication);
   Test('postbuild and publication revalidation retain worker capacity',
     TestPublicationRevalidationRetainsWorkerCapacity);
+  Test('built-in Blaise profile dispatches without FPC fallback',
+    TestBuiltInBlaiseProfileDispatchesWithoutFallback);
 end;
 
 begin
+  if ReadMode = LAKON_MODE then RunLakonDriver;
+  if (ParamCount > 0)
+     and ((ParamStr(1) = '--help') or (ParamStr(1) = '--source')) then
+    RunBlaiseProxy;
   if (ParamCount = 1)
      and ((ParamStr(1) = 'probe') or (ParamStr(1) = 'compile')) then
     RunDriver(ParamStr(1));
