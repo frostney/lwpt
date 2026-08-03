@@ -32,6 +32,8 @@ const
   REUSE_SWITCH = '--worker-budget-token-reuse';
   ORPHAN_PARENT_SWITCH = '--worker-budget-orphan-parent';
   HOLD_CHILD_SWITCH = '--worker-budget-hold-child';
+  PENDING_CHILD_SWITCH = '--worker-budget-pending-child';
+  UNCONSUMED_CHILD_SWITCH = '--worker-budget-unconsumed-child';
   DELEGATION_CRASH_SWITCH = '--worker-budget-delegation-crash';
   DELEGATION_RELEASE_SWITCH = '--worker-budget-delegation-release';
   DELEGATED_CHILD_SESSION = 'orphan-child';
@@ -271,7 +273,7 @@ var
   Lease : TLWPTWorkerLease;
   AcquiredPath, ReleasePath, OutputPath, ChildOutput, TmpPath,
     DelegationToken, RequestPath, OwnerPath, Kind, ParentOutput,
-    ChildRelease : string;
+    ChildRelease, ChildConsume, ChildAcquired, CancellationError : string;
   Snapshot : TLWPTWorkerBudgetSnapshot;
   Lines, RequestLines, FirstEnvironment, SecondEnvironment : TStringList;
   Reclaimed : Integer;
@@ -282,6 +284,12 @@ var
   ExistingTransactionLock : Boolean;
   {$ENDIF}
 begin
+  if (ParamCount = 1) and (ParamStr(1) = UNCONSUMED_CHILD_SWITCH) then
+  begin
+    ExitCode := 0;
+    Exit(True);
+  end;
+
   if (ParamCount = 2) and (ParamStr(1) = STATE_ROOT_CAPTURE_SWITCH) then
   begin
     Write(CAPTURE_STDOUT_PREFIX);
@@ -663,6 +671,24 @@ begin
     Exit(True);
   end;
 
+  if (ParamCount = 5) and (ParamStr(1) = PENDING_CHILD_SWITCH) then
+  begin
+    WriteMarker(ParamStr(2), 'ready-to-consume');
+    while not FileExists(ParamStr(3)) do Sleep(25);
+    Session := TLWPTWorkerBudgetSession.Create(DELEGATED_CHILD_SESSION, 1);
+    Lease := nil;
+    try
+      Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+      WriteMarker(ParamStr(4), 'acquired');
+      while not FileExists(ParamStr(5)) do Sleep(25);
+    finally
+      Lease.Free;
+      Session.Free;
+    end;
+    ExitCode := 0;
+    Exit(True);
+  end;
+
   if (ParamCount = 2)
      and ((ParamStr(1) = DELEGATION_CRASH_SWITCH)
        or (ParamStr(1) = DELEGATION_RELEASE_SWITCH)) then
@@ -670,6 +696,8 @@ begin
     OutputPath := ParamStr(2);
     ChildOutput := OutputPath + '.child';
     ChildRelease := OutputPath + '.release';
+    ChildConsume := OutputPath + '.consume';
+    ChildAcquired := OutputPath + '.acquired';
     Lines := TStringList.Create;
     Session := TLWPTWorkerBudgetSession.Create('delegation-parent', 1);
     Lease := nil;
@@ -678,9 +706,20 @@ begin
       Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
       Child := TProcess.Create(nil);
       Child.Executable := ExpandFileName(ParamStr(0));
-      Child.Parameters.Add(HOLD_CHILD_SWITCH);
-      Child.Parameters.Add(ChildOutput);
-      Child.Parameters.Add(ChildRelease);
+      if ParamStr(1) = DELEGATION_RELEASE_SWITCH then
+      begin
+        Child.Parameters.Add(PENDING_CHILD_SWITCH);
+        Child.Parameters.Add(ChildOutput);
+        Child.Parameters.Add(ChildConsume);
+        Child.Parameters.Add(ChildAcquired);
+        Child.Parameters.Add(ChildRelease);
+      end
+      else
+      begin
+        Child.Parameters.Add(HOLD_CHILD_SWITCH);
+        Child.Parameters.Add(ChildOutput);
+        Child.Parameters.Add(ChildRelease);
+      end;
       AddWorkerEnvironment(Child, WorkerStateRoot);
       AppendWorkerLeaseEnvironment(Child.Environment, Lease);
       Lines.Add('parent-granted-after-delegation='
@@ -717,6 +756,12 @@ begin
         Lines.Add('child-owner-before-snapshot='
           + BoolToStr(FileExists(OwnerPath), True));
         Snapshot := GetWorkerBudgetSnapshot;
+        Lines.Add('active-before-consumption='
+          + IntToStr(Snapshot.ActiveWorkers));
+        WriteMarker(ChildConsume, 'consume');
+        if not WaitForFile(ChildAcquired, WAIT_TIMEOUT_MILLISECONDS) then
+          raise Exception.Create('delegated child did not consume its lease');
+        Snapshot := GetWorkerBudgetSnapshot;
         Lines.Add('active-during-child='
           + IntToStr(Snapshot.ActiveWorkers));
         Lines.Add('entries-during-child='
@@ -731,11 +776,61 @@ begin
         Snapshot := GetWorkerBudgetSnapshot;
         Lines.Add('active-after-child='
           + IntToStr(Snapshot.ActiveWorkers));
+
+        FreeAndNil(Child);
+        Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+        Child := TProcess.Create(nil);
+        Child.Executable := ExpandFileName(ParamStr(0));
+        Child.Parameters.Add(UNCONSUMED_CHILD_SWITCH);
+        AddWorkerEnvironment(Child, WorkerStateRoot);
+        AppendWorkerLeaseEnvironment(Child.Environment, Lease);
+        Child.Options := [poWaitOnExit];
+        Child.Execute;
+        Lines.Add('unconsumed-child-exit='
+          + IntToStr(Child.ExitStatus));
+        Lease.CancelPendingDelegation;
+        Lease.Release;
+        FreeAndNil(Lease);
+        Snapshot := GetWorkerBudgetSnapshot;
+        Lines.Add('active-after-unconsumed-child='
+          + IntToStr(Snapshot.ActiveWorkers));
+        Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+        Lines.Add('reacquired-after-unconsumed-child='
+          + BoolToStr(Lease <> nil, True));
+        Lease.Release;
+        FreeAndNil(Lease);
+
+        Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+        FirstEnvironment := TStringList.Create;
+        try
+          AppendWorkerLeaseEnvironment(FirstEnvironment, Lease);
+          Lease.Release;
+          Refused := False;
+          CancellationError := '';
+          try
+            Lease.CancelPendingDelegation;
+          except
+            on E: ELWPTWorkerBudgetError do
+            begin
+              Refused := True;
+              CancellationError := E.Message;
+            end;
+          end;
+          Lines.Add('late-cancel-refused=' + BoolToStr(Refused, True));
+          Lines.Add('late-cancel-error=' + CancellationError);
+          Snapshot := GetWorkerBudgetSnapshot;
+          Lines.Add('active-after-late-cancel='
+            + IntToStr(Snapshot.ActiveWorkers));
+        finally
+          FirstEnvironment.Free;
+          FreeAndNil(Lease);
+        end;
       end;
       Lines.SaveToFile(OutputPath);
     finally
       if (Child <> nil) and Child.Running then
       begin
+        WriteMarker(ChildConsume, 'consume');
         WriteMarker(ChildRelease, 'release');
         Child.WaitOnExit;
       end;
@@ -1746,9 +1841,24 @@ begin
     Expect<Integer>(StrToIntDef(
       Values.Values['parent-granted-after-delegation'], -1)).ToBe(0);
     Expect<Integer>(StrToIntDef(
+      Values.Values['active-before-consumption'], 0)).ToBe(1);
+    Expect<Integer>(StrToIntDef(
       Values.Values['active-during-child'], 0)).ToBe(1);
     Expect<Integer>(StrToIntDef(
       Values.Values['active-after-child'], -1)).ToBe(0);
+    Expect<Integer>(StrToIntDef(
+      Values.Values['child-exit-status'], -1)).ToBe(0);
+    Expect<Integer>(StrToIntDef(
+      Values.Values['unconsumed-child-exit'], -1)).ToBe(0);
+    Expect<Integer>(StrToIntDef(
+      Values.Values['active-after-unconsumed-child'], -1)).ToBe(0);
+    Expect<string>(Values.Values[
+      'reacquired-after-unconsumed-child']).ToBe('True');
+    Expect<string>(Values.Values['late-cancel-refused']).ToBe('True');
+    Expect<Boolean>(Pos('must cancel before Release',
+      Values.Values['late-cancel-error']) > 0).ToBe(True);
+    Expect<Integer>(StrToIntDef(
+      Values.Values['active-after-late-cancel'], 0)).ToBe(1);
   finally
     Values.Free;
   end;
