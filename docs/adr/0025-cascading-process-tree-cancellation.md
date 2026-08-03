@@ -80,8 +80,11 @@ On Windows, each direct child is created suspended and assigned to an
 invocation-private Job Object before it resumes. Windows 8 introduced nested
 jobs, allowing a child inherited from an enclosing LWPT or host job to join
 the inner job. Windows 8 or later is therefore the minimum supported runtime
-for this ownership model. Cancellation explicitly calls `TerminateJobObject`
-and polls `JobObjectBasicAccountingInformation.ActiveProcesses` until zero.
+for this ownership model. A typed Windows state object owns the Job Object
+handle and its assign, query, terminate, wait, and cleanup operations;
+`TLWPTProcessTree` retains only orchestration and direct-child fallback.
+Cancellation explicitly calls `TerminateJobObject` and polls
+`JobObjectBasicAccountingInformation.ActiveProcesses` until zero.
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is not used: closing an ownership handle
 after successful execution must not introduce cancellation semantics.
 

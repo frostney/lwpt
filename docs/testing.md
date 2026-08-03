@@ -199,7 +199,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`source/LWPT.CompilerDriver.Delphi.Test.pas`** | 12 tests in 1 suite | Pins the built-in opt-in profile, five verified executable/target tuples, live per-operation identity/version/target probes, bounded failure context, the Delphi 12 version floor, executable/header and requested-target mismatch failures without fallback, neutral argument translation, managed-option rejection, normalized source diagnostics including a zero-exit missing-artifact failure, and exact private artifact renaming without requiring a Delphi installation or license. |
 | **`source/LWPT.CompilerRegistry.Test.pas`** | 14 tests in 1 suite | Covers build-entry/project/embedding/built-in precedence, the FPC fallback, built-in Delphi, Blaise, and Lakon selection, explicit executable resolution, Lakon host-factory precedence and implicit-default replacement, script rejection, and case-insensitive per-invocation caching. Factory coverage pins wrong-identity rejection, independent version enforcement, rejected-object cleanup, exactly-once selection ownership, and refusal to shadow reserved built-in drivers. |
 | **`source/LWPT.BuildSession.Test.pas`** | 22 tests in 1 suite | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, compiler-argument fingerprinting, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
-| **`source/LWPT.Command.Build.Test.pas`** | 3 tests in 1 suite | Covers compiler-process cancellation with output capture and child reaping, normal-exit descendant handling, and non-zero exit-code reporting. |
+| **`source/LWPT.Command.Build.Test.pas`** | 4 tests in 1 suite | Covers compiler-process cancellation with output capture and child reaping, normal-exit descendant handling, non-zero exit-code reporting, and repeated process-tree state teardown without leaking its owned Windows Job Object handle. |
 | **`source/LWPT.CompilerDriver.FPC.Test.pas`** | 19 tests in 1 suite | Covers capability-probe caching, target dispatch, timeout cleanup, request compatibility, build/test argument translation, ordered extra-argument forwarding and validation, nil-driver rejection, version failures, stale-artifact classification, structured diagnostics, and Windows executable-path normalization. |
 | **`source/LWPT.CompilerDriver.Blaise.Test.pas`** | 15 tests in 1 suite | Pins the Blaise v0.13.0 identity/help and exact argument fixtures; proves per-operation live probing, the minimum release floor, verified Linux/FreeBSD x86-64 capability filtering, no target fallback, dev/release/clean translation, managed-argument and output-suppression protection, explicit unsupported-feature diagnostics, and normalized diagnostics/artifacts. |
 | **`source/LWPT.CompilerDriver.Lakon.Test.pas`** | 17 tests in 1 suite | Pins the released Lakon 0.1.0 identity, help, target, and exact argument fixtures; proves two live probes per capability request, the minimum version, WASI-only capabilities, session-private no-cache translation including generated cfg unit paths with stable deduplication, explicit rejection of native test execution without a host runner, unsupported mode/input/argument failures, and normalized diagnostics/artifacts. The executable itself is replaced by deterministic fixtures in normal CI; compiling with a live Lakon checkout is optional and non-gating. |
@@ -276,10 +276,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 29 | 489 |
+| Unit (`source/*.Test.pas` + package self-tests) | 29 | 490 |
 | Integration (`tests/integration/*.Test.pas`) | 22 | 230 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 7 | 35 |
-| **Total** | **58** | **754** |
+| **Total** | **58** | **755** |
 
 ### Planned testing work
 

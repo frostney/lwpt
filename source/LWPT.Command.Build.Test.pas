@@ -47,6 +47,7 @@ type
     procedure TestCompilerCancellationCapturesAndReaps;
     procedure TestCompilerNormalExitLeavesDescendantAlive;
     procedure TestCompilerNonZeroExitIsReported;
+    procedure TestProcessTreeStateReleasesOwnedResources;
   end;
 
   TCompilerRunnerThread = class(TThread)
@@ -62,6 +63,28 @@ type
     constructor Create(const ARunner: TLWPTCompilerProcess;
       const AMarker: string);
   end;
+
+{$IFDEF MSWINDOWS}
+function LWPTGetProcessHandleCount(const AProcess: THandle;
+  var AHandleCount: DWORD): BOOL; stdcall;
+  external 'kernel32.dll' name 'GetProcessHandleCount';
+{$ENDIF}
+
+function CurrentProcessHandleCount: Integer;
+{$IFDEF MSWINDOWS}
+var
+  HandleCount: DWORD;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  if not LWPTGetProcessHandleCount(Windows.GetCurrentProcess,
+    HandleCount) then
+    RaiseLastOSError;
+  Result := HandleCount;
+  {$ELSE}
+  Result := 0;
+  {$ENDIF}
+end;
 
 constructor TCompilerRunnerThread.Create(const ARunner: TLWPTCompilerProcess;
   const AMarker: string);
@@ -219,6 +242,38 @@ begin
   end;
 end;
 
+procedure TLWPTCompilerProcessTests.
+  TestProcessTreeStateReleasesOwnedResources;
+const
+  LifecycleCount = 16;
+var
+  BaselineHandleCount, FinalHandleCount, LifecycleIndex: Integer;
+  Child: TProcess;
+  ProcessTree: TLWPTProcessTree;
+begin
+  { The Windows state owns one Job Object handle. Repeated construction and
+    teardown must return the process to its original handle count. The same
+    lifecycle runs on Unix to keep the platform-neutral owner path covered. }
+  Child := TProcess.Create(nil);
+  ProcessTree := TLWPTProcessTree.Create(Child);
+  ProcessTree.Free;
+  Child.Free;
+  BaselineHandleCount := CurrentProcessHandleCount;
+  for LifecycleIndex := 1 to LifecycleCount do
+  begin
+    Child := TProcess.Create(nil);
+    ProcessTree := TLWPTProcessTree.Create(Child);
+    try
+      Expect<Boolean>(Assigned(ProcessTree)).ToBe(True);
+    finally
+      ProcessTree.Free;
+      Child.Free;
+    end;
+  end;
+  FinalHandleCount := CurrentProcessHandleCount;
+  Expect<Integer>(FinalHandleCount).ToBe(BaselineHandleCount);
+end;
+
 procedure TLWPTCompilerProcessTests.SetupTests;
 begin
   Test('compiler cancellation captures output and reaps the child',
@@ -227,6 +282,8 @@ begin
     TestCompilerNormalExitLeavesDescendantAlive);
   Test('nonzero compiler exit is reported, not dropped to 0',
     TestCompilerNonZeroExitIsReported);
+  Test('process-tree state releases its owned resources',
+    TestProcessTreeStateReleasesOwnedResources);
 end;
 
 function RunCompilerProcessProxy: Integer;
