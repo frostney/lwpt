@@ -305,6 +305,7 @@ implicit FPC default without changing the manifest, while explicit project or
 build-entry profiles remain authoritative. Factory identity, configured
 version, live capabilities, and result/artifact validation are enforced by
 the same selection and build paths; a Lakon failure never selects FPC.
+
 ## Delphi compiler profiles
 
 Delphi support is opt-in and applies only to consumer projects; LWPT itself
