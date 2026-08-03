@@ -438,10 +438,17 @@ var
   procedure RecordCancellationFailure(const AIndex: Integer;
     const AMessage: string);
   begin
-    FJobs[AIndex].Status := tjsWorkerError;
-    FJobs[AIndex].ExitCode := ObservabilityInternalErrorExitCode;
-    FJobs[AIndex].ErrorMessage := 'process-tree termination failed: '
-      + AMessage;
+    { BeginCancel can fail after forwarding termination. CompleteCancel must
+      still run for that runner, but a secondary reap error must not replace
+      the first failure that explains why cancellation became unhealthy. }
+    if (FJobs[AIndex].Status <> tjsWorkerError)
+       or (FJobs[AIndex].ErrorMessage = '') then
+    begin
+      FJobs[AIndex].Status := tjsWorkerError;
+      FJobs[AIndex].ExitCode := ObservabilityInternalErrorExitCode;
+      FJobs[AIndex].ErrorMessage := 'process-tree termination failed: '
+        + AMessage;
+    end;
     if FInternalError = '' then
       FInternalError := FJobs[AIndex].ErrorMessage;
   end;
