@@ -31,6 +31,7 @@ type
     procedure SetMode(const AMode: string);
     procedure WriteManifest(const AEntryCompiler: string = 'external';
       const AObservePostBuildLeases: Boolean = False);
+    procedure WriteBlaiseManifest;
   protected
     procedure BeforeAll; override;
   public
@@ -48,6 +49,7 @@ type
     procedure TestReorderedArtifactsPublishTheRequestedPrimary;
     procedure TestPublicationTargetMutationBlocksPublication;
     procedure TestPublicationRevalidationRetainsWorkerCapacity;
+    procedure TestBuiltInBlaiseProfileDispatchesWithoutFallback;
   end;
 
 function ReadInput: string;
@@ -186,6 +188,79 @@ begin
   end;
 end;
 
+procedure RunBlaiseProxy;
+var
+  Diagnostic, Value: string;
+  Request: TLWPTBuildRequest;
+  ArgumentIndex, Count, ExitCode: Integer;
+begin
+  if ParamStr(1) = '--help' then
+  begin
+    WriteTextFile(ExpandFileName('.blaise-help'), 'probed');
+    WriteLn('Blaise Compiler v0.13.0');
+    WriteLn('Usage:');
+    WriteLn('  blaise --source <file.pas> --output <binary>');
+    WriteLn('Flags:');
+    WriteLn('  --target <os>-<cpu>  Cross-compile target (default: '
+      + 'linux-x86_64, the host).');
+    WriteLn('                         linux-x86_64, freebsd-x86_64');
+    Halt(0);
+  end;
+
+  Request := DefaultBuildRequest;
+  Request.Compiler.ID := 'blaise';
+  Request.Compiler.VersionConstraint := '>=0.13.0';
+  Request.Target.OS := 'linux';
+  Request.Target.Architecture := 'x86_64';
+  Request.OutputKind := BUILD_OUTPUT_EXECUTABLE;
+  Request.Mode := BUILD_MODE_DEV;
+  ArgumentIndex := 1;
+  while ArgumentIndex <= ParamCount do
+  begin
+    Value := ParamStr(ArgumentIndex);
+    if (Value = '--source') and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      Request.Inputs.EntryPoint := ParamStr(ArgumentIndex);
+      SetLength(Request.Inputs.Sources, 1);
+      Request.Inputs.Sources[0] := Request.Inputs.EntryPoint;
+    end
+    else if (Value = '--output') and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      Request.Outputs.Artifact := ParamStr(ArgumentIndex);
+      Request.Outputs.ExecutableDirectory := ExtractFileDir(
+        Request.Outputs.Artifact);
+    end
+    else if (Value = '--unit-path') and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      Count := Length(Request.Inputs.UnitPaths);
+      SetLength(Request.Inputs.UnitPaths, Count + 1);
+      Request.Inputs.UnitPaths[Count] := ParamStr(ArgumentIndex);
+    end
+    else if (Value = '--unit-cache') and (ArgumentIndex < ParamCount) then
+    begin
+      Inc(ArgumentIndex);
+      Request.Outputs.UnitDirectory := ParamStr(ArgumentIndex);
+      Request.Outputs.ObjectDirectory := Request.Outputs.UnitDirectory;
+    end
+    else if ((Value = '--target') or (Value = '--backend')
+      or (Value = '--define')) and (ArgumentIndex < ParamCount) then
+      Inc(ArgumentIndex);
+    Inc(ArgumentIndex);
+  end;
+  if Request.Outputs.UnitDirectory = '' then
+  begin
+    Request.Outputs.UnitDirectory := Request.Outputs.ExecutableDirectory;
+    Request.Outputs.ObjectDirectory := Request.Outputs.UnitDirectory;
+  end;
+  WriteTextFile(ExpandFileName('.blaise-compile'), 'compiled');
+  ExitCode := CompileWithFPC(Request, Diagnostic);
+  if Diagnostic <> '' then Write(ErrOutput, Diagnostic);
+  Halt(ExitCode);
+end;
+
 procedure RunDriver(const AOperation: string);
 var
   BuildResult: TLWPTBuildResult;
@@ -309,6 +384,10 @@ begin
     DeleteFile(FScratch + '/.entry-lease-observed');
   if FileExists(FScratch + '/.whole-lease-observed') then
     DeleteFile(FScratch + '/.whole-lease-observed');
+  if FileExists(FScratch + '/.blaise-help') then
+    DeleteFile(FScratch + '/.blaise-help');
+  if FileExists(FScratch + '/.blaise-compile') then
+    DeleteFile(FScratch + '/.blaise-compile');
   RecursiveDelete(FScratch + '/build');
 end;
 
@@ -352,6 +431,26 @@ begin
     + 'app = { source = "source/app.pas", output = "build/app"'
     + CompilerField + EntryPostBuild + ' }'#10
     + WholePostBuild);
+end;
+
+procedure TCompilerProfiles.WriteBlaiseManifest;
+begin
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "compiler-profile-project"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[compiler]'#10
+    + 'default = "modern"'#10
+    + #10
+    + '[compiler.profiles.modern]'#10
+    + 'driver = "blaise"'#10
+    + 'executable = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
+    + 'version = ">=0.13.0"'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app" }'#10);
 end;
 
 procedure TCompilerProfiles.BeforeAll;
@@ -621,6 +720,20 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/.lease-observed')).ToBe(True);
 end;
 
+procedure TCompilerProfiles.TestBuiltInBlaiseProfileDispatchesWithoutFallback;
+var
+  R: TLwptResult;
+begin
+  SetMode('success');
+  WriteBlaiseManifest;
+  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  DumpRunFailure('built-in Blaise build', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(FScratch + '/.blaise-help')).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/.blaise-compile')).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/build/app')).ToBe(True);
+end;
+
 procedure TCompilerProfiles.SetupTests;
 begin
   Test('root external profile drives real build and test',
@@ -647,9 +760,14 @@ begin
     TestPublicationTargetMutationBlocksPublication);
   Test('postbuild and publication revalidation retain worker capacity',
     TestPublicationRevalidationRetainsWorkerCapacity);
+  Test('built-in Blaise profile dispatches without FPC fallback',
+    TestBuiltInBlaiseProfileDispatchesWithoutFallback);
 end;
 
 begin
+  if (ParamCount > 0)
+     and ((ParamStr(1) = '--help') or (ParamStr(1) = '--source')) then
+    RunBlaiseProxy;
   if (ParamCount = 1)
      and ((ParamStr(1) = 'probe') or (ParamStr(1) = 'compile')) then
     RunDriver(ParamStr(1));
