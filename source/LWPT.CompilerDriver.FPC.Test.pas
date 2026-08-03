@@ -38,6 +38,7 @@ const
   ProbeTimeoutSleepMilliseconds = 30000;
   TestProbeTimeoutMilliseconds = 1000;
   TestProbeCompletionTimeoutSeconds = 10;
+  ProbeTimeoutProxyReleaseMilliseconds = 5000;
 
 type
   TMockFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
@@ -125,6 +126,30 @@ begin
     Windows.CloseHandle(ProcessHandle);
   end;
   {$ENDIF}
+end;
+
+procedure DeleteProbeTimeoutScratch(const AScratch, AProxyPath: string);
+{$IFDEF MSWINDOWS}
+var
+  StartedAt: QWord;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  { TerminateProcess has completed before the driver returns, but Windows can
+    retain the executable image briefly while the process object is reaped.
+    Retry only this known proxy instead of weakening RecursiveDelete for every
+    test fixture. }
+  StartedAt := GetTickCount64;
+  while FileExists(AProxyPath) and not SysUtils.DeleteFile(AProxyPath) do
+  begin
+    if GetTickCount64 - StartedAt >= ProbeTimeoutProxyReleaseMilliseconds then
+      raise Exception.CreateFmt(
+        'probe-timeout proxy remained locked after %d ms: %s',
+        [ProbeTimeoutProxyReleaseMilliseconds, AProxyPath]);
+    Sleep(10);
+  end;
+  {$ENDIF}
+  RecursiveDelete(AScratch);
 end;
 
 function RunProbeTimeoutGrandchild: Integer;
@@ -575,7 +600,7 @@ begin
   finally
     Driver.Free;
     TerminateTestProcess(GrandchildPID);
-    RecursiveDelete(Scratch);
+    DeleteProbeTimeoutScratch(Scratch, ProxyPath);
   end;
 end;
 

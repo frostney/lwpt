@@ -82,13 +82,23 @@ type
     procedure TestInvalidContentLengths;
     procedure TestRequestDeadlineRejectsIdlePeer;
     procedure TestRequestDeadlineRejectsSlowDrip;
+    procedure TestRedirectBudgetDefaultsAndRejectsNegativeValues;
+    procedure TestZeroRedirectBudgetReturnsTheRedirectResponse;
     procedure TestTLSHandshakeDeadlineRejectsIdlePeer;
     procedure TestTruncatedFixedBody;
   end;
 
 const
   MOCK_LIFECYCLE_CHILD = '--mock-lifecycle-child';
+  {$IFDEF MSWINDOWS}
+  { This outer watchdog includes cold child-process startup. Native Windows
+    runners can spend more than two seconds loading the test executable before
+    the fixture exists, so keep the deadlock bound without timing startup as
+    mock-server teardown. }
+  MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS = 5000;
+  {$ELSE}
   MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS = 2000;
+  {$ENDIF}
   MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS = 1000;
 
 { ── helpers ───────────────────────────────────────────────────────── }
@@ -387,9 +397,9 @@ end;
 
 procedure THTTPMockServerLifecycle.SetupTests;
 begin
-  Test('started server without a client tears down within two seconds',
+  Test('started server without a client tears down inside the watchdog',
     TestStartedUnconnectedTeardownIsBounded);
-  Test('connected silent client tears down within two seconds',
+  Test('connected silent client tears down inside the watchdog',
     TestConnectedSilentTeardownIsBounded);
   Test('success, failure, and unstarted cycles balance fixture resources',
     TestRepeatedCyclesBalanceResources);
@@ -706,6 +716,56 @@ begin
     'HTTP request deadline exceeded after 100 ms');
 end;
 
+procedure THTTPClientResourceBounds.
+  TestRedirectBudgetDefaultsAndRejectsNegativeValues;
+var
+  ErrorMessage: string;
+  NoHeaders: THTTPHeaders;
+  Options: THTTPRequestOptions;
+begin
+  Options := DefaultHTTPRequestOptions;
+  Expect<Integer>(Options.MaximumRedirects).ToBe(
+    DEFAULT_MAXIMUM_REDIRECTS);
+  Options.MaximumRedirects := -1;
+  ErrorMessage := '';
+  NoHeaders := nil;
+  try
+    HTTPGet('http://127.0.0.1:1/', NoHeaders, Options);
+  except
+    on E: EHTTPError do ErrorMessage := E.Message;
+  end;
+  Expect<string>(ErrorMessage).ToBe(
+    'HTTP maximum redirects must not be negative');
+end;
+
+procedure THTTPClientResourceBounds.
+  TestZeroRedirectBudgetReturnsTheRedirectResponse;
+const
+  CRLF = #13#10;
+var
+  Mock: TMockHTTPServer;
+  NoHeaders: THTTPHeaders;
+  Options: THTTPRequestOptions;
+  Response: THTTPResponse;
+begin
+  Mock := TMockHTTPServer.Create(StringBytes(
+    'HTTP/1.1 302 Found' + CRLF +
+    'Location: http://127.0.0.1:1/escape' + CRLF +
+    'Content-Length: 0' + CRLF + 'Connection: close' + CRLF + CRLF));
+  try
+    Mock.Start;
+    NoHeaders := nil;
+    Options := TestOptions(4, 1024, 1000);
+    Options.MaximumRedirects := 0;
+    Response := HTTPGet(MockURL(Mock.Port), NoHeaders, Options);
+    Mock.WaitDone;
+    Expect<Integer>(Response.StatusCode).ToBe(302);
+    Expect<Boolean>(Response.Redirected).ToBe(False);
+  finally
+    Mock.Free;
+  end;
+end;
+
 procedure THTTPClientResourceBounds.TestTLSHandshakeDeadlineRejectsIdlePeer;
 var
   ErrorMessage: string;
@@ -740,6 +800,10 @@ begin
     TestRequestDeadlineRejectsIdlePeer);
   Test('whole-request deadline rejects slow-drip peer',
     TestRequestDeadlineRejectsSlowDrip);
+  Test('redirect budget defaults and rejects negative values',
+    TestRedirectBudgetDefaultsAndRejectsNegativeValues);
+  Test('a zero redirect budget returns the redirect response',
+    TestZeroRedirectBudgetReturnsTheRedirectResponse);
   Test('whole-request deadline covers an idle TLS handshake',
     TestTLSHandshakeDeadlineRejectsIdlePeer);
 end;
