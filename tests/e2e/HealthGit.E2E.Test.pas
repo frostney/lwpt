@@ -116,6 +116,13 @@ begin
   SecondRun := RunLwpt(['health', '--hotspots', '--json'], FGitRoot);
   Expect<Integer>(FirstRun.ExitCode).ToBe(0);
   Expect<string>(FirstRun.Stdout).ToBe(SecondRun.Stdout);
+  Expect<Boolean>(Pos('lwpt health: completed in ', FirstRun.Stdout) = 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('lwpt health: completed in ', FirstRun.Stderr) > 0)
+    .ToBe(True);
+  Expect<Boolean>((Trim(FirstRun.Stdout) <> '')
+    and (Trim(FirstRun.Stdout)[Length(Trim(FirstRun.Stdout))] = '}'))
+    .ToBe(True);
   Expect<Boolean>(Pos('"mode":"git-enriched"', FirstRun.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('"historyCommits":100', FirstRun.Stdout) > 0)

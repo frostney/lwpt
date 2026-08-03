@@ -17,8 +17,10 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
   below `.lwpt/sessions/<session-id>/`; only a successful, revalidated build
   result is atomically published to its manifest output.
 - **Every resolved subcommand reports completion.** A status-aware elapsed-time
-  line is written to stderr after success or failure without changing stdout or
-  the command's exit code.
+  line is written to stderr after ordinary success or failure diagnostics.
+  Every command also inherits long-only `--silent` for final-result-only use;
+  silent success writes its sole completion line to stdout, and neither mode
+  changes the command's exit code.
 - **Duplication analysis is Pascal-native and offline.** `lwpt duplication`
   reports deterministic Type-2 token clones in manifest-owned root and
   workspace sources. The remaining deferred stack contracts stay tracked
@@ -40,8 +42,9 @@ When you touch code that depends on the version, **verify it live, not from memo
 
 ## Command completion timing
 
-Every registered subcommand invocation ends with one status-aware line on
-stderr:
+Every registered subcommand invocation ends with one status-aware line.
+Ordinary successful and failed completion are written to stderr, with failure
+following its diagnostics:
 
 ```text
 lwpt build: completed in 1.24s
@@ -49,12 +52,35 @@ lwpt build: failed after 0.03s
 ```
 
 The duration uses an increasing millisecond clock and is rendered in seconds to
-two decimal places. Existing stdout, diagnostics, and exit codes are unchanged.
+two decimal places. Existing diagnostics and exit codes are unchanged.
 `lwpt run <subcommand>` reports the resolved subcommand name, so
 `lwpt run build` ends with `lwpt build: ...`. Top-level help, version output,
 and unknown command names are not resolved subcommand executions and do not get
-a completion line. Output suppression is separate planned work tracked in
-[issue #127](https://github.com/frostney/lwpt/issues/127).
+a completion line. The output-neutral sequenced event envelope and LWPT's typed
+payload ownership are documented in the
+[architecture guide](./architecture.md#output-and-observability-boundary).
+
+Every registered subcommand also inherits the long-only `--silent` flag after
+the command name. Silent success suppresses progress, summaries, and successful
+child output and writes exactly the final completion line to stdout. Silent
+failure suppresses ordinary progress, replays retained diagnostics and failed
+child output in event order, and ends with exactly one failed completion line
+on stderr. `--silent --verbose` is rejected because the two policies
+contradict each other. `init --silent` also requires `--yes` or `--adopt` so an
+invisible prompt cannot block the invocation. Aliases follow the resolved identity, so
+`lwpt run build --silent` finishes as `lwpt build: ...`; there is deliberately
+no `lwpt --silent build`, short alias, or silent top-level help/version mode.
+
+The host retains silent events in a 64 MiB temporary journal while a
+preallocated 1 MiB emergency ring continuously mirrors protected diagnostics
+and recent output. Child output is grouped by invocation and promoted to
+protected evidence only when that child exits unsuccessfully, so a successful
+hook cannot leak into a later compiler failure. Journal creation, write,
+capacity, or replay failure degrades
+to that ring without changing the command's exit code or stopping child-pipe
+drainage. A failed degraded invocation says so before replaying the surviving
+tail. If the emergency reserve cannot be allocated, LWPT fails before invoking
+the selected command.
 
 ## Pre-commit hook
 
