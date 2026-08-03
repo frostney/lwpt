@@ -2085,7 +2085,7 @@ var
 begin
   Result := '';
   BufferLength := WindowsGetFullPathName(PWideChar(UnicodeString(APath)),
-    0, nil, @FilePart);
+    0, nil, nil);
   if BufferLength = 0 then
     raise ETransportSecurityError.Create(
       'Failed to inspect configured TLS PKCS#12 identity');
@@ -2387,7 +2387,7 @@ begin
     raise ETransportSecurityError.CreateFmt(
       'Configured TLS PKCS#12 %s contains invalid certificate extensions',
       [ADescription]);
-  if (Flags and EXFLAG_BCONS) = 0 then
+  if ACertificateAuthority and ((Flags and EXFLAG_BCONS) = 0) then
     raise ETransportSecurityError.CreateFmt(
       'Configured TLS PKCS#12 %s must include basic constraints',
       [ADescription]);
@@ -3302,6 +3302,9 @@ var
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   OldSnapshot := nil;
+  if not FCriticalSectionInitialized then
+    raise ETransportSecurityError.Create(
+      'TLS server context is not initialized');
   EnterCriticalSection(FCriticalSection);
   try
     OldSnapshot := TOpenSSLServerContextData(FBackendData);

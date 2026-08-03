@@ -44,6 +44,9 @@ const
     'packages/httpclient/source/fixtures/localhost-incoherent-identity.p12';
   LEAF_CA_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-leaf-ca-identity.p12';
+  LEAF_NO_BASIC_CONSTRAINTS_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/' +
+    'localhost-no-basic-constraints-identity.p12';
   NON_CA_ISSUER_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-non-ca-issuer-identity.p12';
   NO_CERTSIGN_ISSUER_PKCS12_PATH =
@@ -94,6 +97,7 @@ type
     procedure TestPlaintextRoundtripAndPartialCiphertextConsumption;
     procedure TestRenegotiationIsRefused;
     procedure TestStaleErrorQueueIsCleared;
+    procedure TestStrictIdentityAllowsLeafWithoutBasicConstraints;
     procedure TestStrictIdentityValidation;
     procedure TestSyscallErrorPoisonsConnection;
     procedure TestTLSFloorRejectsTLS11;
@@ -158,6 +162,73 @@ begin
     Input.Free;
   end;
 end;
+
+{$IFDEF MSWINDOWS}
+function TryCreateWindowsJunction(const ALinkDirectory,
+  ALinkTarget: string): Boolean;
+var
+  CommandInterpreter: string;
+  ProcessInstance: TProcess;
+begin
+  Result := False;
+  CommandInterpreter := SysUtils.GetEnvironmentVariable('COMSPEC');
+  if CommandInterpreter = '' then
+    CommandInterpreter := 'cmd.exe';
+  ProcessInstance := TProcess.Create(nil);
+  try
+    ProcessInstance.Executable := CommandInterpreter;
+    ProcessInstance.Parameters.Add('/C');
+    ProcessInstance.Parameters.Add('mklink /J "' +
+      StringReplace(ALinkDirectory, '/', '\', [rfReplaceAll]) + '" "' +
+      StringReplace(ALinkTarget, '/', '\', [rfReplaceAll]) + '"');
+    ProcessInstance.Options := [poWaitOnExit];
+    try
+      ProcessInstance.Execute;
+      Result := ProcessInstance.ExitStatus = 0;
+    except
+      Result := False;
+    end;
+  finally
+    ProcessInstance.Free;
+  end;
+end;
+
+procedure RemoveWindowsJunctionIfPresent(const ALinkDirectory: string);
+var
+  ErrorCode: DWORD;
+begin
+  if Windows.RemoveDirectoryW(PWideChar(UnicodeString(ALinkDirectory))) then
+    Exit;
+  ErrorCode := Windows.GetLastError;
+  if ErrorCode in [Windows.ERROR_FILE_NOT_FOUND,
+     Windows.ERROR_PATH_NOT_FOUND] then
+    Exit;
+  raise Exception.CreateFmt(
+    'Failed to remove PKCS#12 junction fixture (%d)', [ErrorCode]);
+end;
+
+function WindowsJunctionTestAvailable: Boolean;
+var
+  LinkDirectory: string;
+  LinkTarget: string;
+begin
+  ForceDirectories(SCRATCH_DIRECTORY);
+  LinkDirectory := SCRATCH_DIRECTORY + '/identity-junction-preflight';
+  LinkTarget := ExtractFileDir(ExpandFileName(PKCS12_PATH));
+  RemoveWindowsJunctionIfPresent(LinkDirectory);
+  Result := TryCreateWindowsJunction(LinkDirectory, LinkTarget);
+  if not Result then
+  begin
+    RemoveWindowsJunctionIfPresent(LinkDirectory);
+    Exit;
+  end;
+  if not Windows.RemoveDirectoryW(
+     PWideChar(UnicodeString(LinkDirectory))) then
+    raise Exception.CreateFmt(
+      'Failed to clean up PKCS#12 junction preflight (%d)',
+      [Windows.GetLastError]);
+end;
+{$ENDIF}
 
 {$IFNDEF DARWIN}
 constructor TBeginAbortWorker.Create(
@@ -1264,11 +1335,10 @@ var
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
-  CommandInterpreter: string;
   ErrorMessage: string;
   LinkDirectory: string;
   LinkTarget: string;
-  ProcessInstance: TProcess;
+  RemovalSucceeded: Boolean;
 {$ENDIF}
 begin
   {$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
@@ -1318,24 +1388,11 @@ begin
   ForceDirectories(SCRATCH_DIRECTORY);
   LinkDirectory := SCRATCH_DIRECTORY + '/identity-parent-junction';
   LinkTarget := ExtractFileDir(ExpandFileName(PKCS12_PATH));
-  Windows.RemoveDirectoryW(PWideChar(UnicodeString(LinkDirectory)));
-  CommandInterpreter := SysUtils.GetEnvironmentVariable('COMSPEC');
-  if CommandInterpreter = '' then
-    CommandInterpreter := 'cmd.exe';
-  ProcessInstance := TProcess.Create(nil);
-  try
-    ProcessInstance.Executable := CommandInterpreter;
-    ProcessInstance.Parameters.Add('/C');
-    ProcessInstance.Parameters.Add('mklink /J "' +
-      StringReplace(LinkDirectory, '/', '\', [rfReplaceAll]) + '" "' +
-      StringReplace(LinkTarget, '/', '\', [rfReplaceAll]) + '"');
-    ProcessInstance.Options := [poWaitOnExit];
-    ProcessInstance.Execute;
-    if ProcessInstance.ExitStatus <> 0 then
-      raise Exception.Create('Failed to create PKCS#12 parent junction fixture');
-  finally
-    ProcessInstance.Free;
-  end;
+  RemoveWindowsJunctionIfPresent(LinkDirectory);
+  if not TryCreateWindowsJunction(LinkDirectory, LinkTarget) then
+    raise Exception.Create(
+      'PKCS#12 parent junction creation failed after a successful preflight');
+  RemovalSucceeded := False;
   try
     ErrorMessage := CaptureContextError(LinkDirectory + '/' +
       ExtractFileName(PKCS12_PATH), PKCS12_PASSPHRASE);
@@ -1343,8 +1400,29 @@ begin
       ErrorMessage) > 0).ToBe(True);
     Expect<Boolean>(Pos(LinkDirectory, ErrorMessage) = 0).ToBe(True);
   finally
-    if not Windows.RemoveDirectoryW(PWideChar(UnicodeString(LinkDirectory))) then
-      raise Exception.Create('Failed to remove PKCS#12 parent junction fixture');
+    RemovalSucceeded := Windows.RemoveDirectoryW(
+      PWideChar(UnicodeString(LinkDirectory)));
+  end;
+  if not RemovalSucceeded then
+    raise Exception.Create('Failed to remove PKCS#12 parent junction fixture');
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestStrictIdentityAllowsLeafWithoutBasicConstraints;
+{$IFNDEF DARWIN}
+var
+  Context: TTransportSecurityServerContext;
+{$ENDIF}
+begin
+  {$IFNDEF DARWIN}
+  Context := nil;
+  try
+    Context := TTransportSecurityServerContext.Create(
+      LEAF_NO_BASIC_CONSTRAINTS_PKCS12_PATH, PKCS12_PASSPHRASE);
+    Expect<Boolean>(Assigned(Context)).ToBe(True);
+  finally
+    CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
 end;
@@ -2075,6 +2153,9 @@ begin
     TestPKCS12PathRefusesSymbolicLink, DARWIN_SKIP_REASON);
   Skip('strict identity policy rejects invalid production certificates',
     TestStrictIdentityValidation, DARWIN_SKIP_REASON);
+  Skip('strict identity allows a leaf without basic constraints',
+    TestStrictIdentityAllowsLeafWithoutBasicConstraints,
+    DARWIN_SKIP_REASON);
   Skip('identity reload retains immutable connection snapshots',
     TestReloadRetainsSnapshotsAndFailedReloadKeepsActive,
     DARWIN_SKIP_REASON);
@@ -2129,16 +2210,25 @@ begin
     TestPKCS12SizeLimit);
   ServerTest('caller PKCS#12 bytes are copied before synchronous parsing',
     TestPKCS12BytesArePrimaryInput);
-  {$IF DEFINED(UNIX) OR DEFINED(MSWINDOWS)}
+  {$IFDEF MSWINDOWS}
+  if not FServerBackendAvailable then
+    ServerTest('PKCS#12 path loading refuses links in every component',
+      TestPKCS12PathRefusesSymbolicLink)
+  else if WindowsJunctionTestAvailable then
+    Test('PKCS#12 path loading refuses links in every component',
+      TestPKCS12PathRefusesSymbolicLink)
+  else
+    Skip('PKCS#12 path loading refuses links in every component',
+      TestPKCS12PathRefusesSymbolicLink,
+      'Windows junction creation is unavailable under host policy');
+  {$ELSE}
   ServerTest('PKCS#12 path loading refuses links in every component',
     TestPKCS12PathRefusesSymbolicLink);
-  {$ELSE}
-  Skip('PKCS#12 path loading refuses links in every component',
-    TestPKCS12PathRefusesSymbolicLink,
-    'Windows reparse-point creation requires host policy privileges');
   {$ENDIF}
   ServerTest('strict identity policy rejects invalid production certificates',
     TestStrictIdentityValidation);
+  ServerTest('strict identity allows a leaf without basic constraints',
+    TestStrictIdentityAllowsLeafWithoutBasicConstraints);
   ServerTest('identity reload retains immutable connection snapshots',
     TestReloadRetainsSnapshotsAndFailedReloadKeepsActive);
   ServerTest('memory-BIO handshake exposes want states and reuses context',

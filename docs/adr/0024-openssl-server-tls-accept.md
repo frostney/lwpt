@@ -15,8 +15,9 @@
   drains before another protocol operation, and plaintext for a WANT-write
   retry is retained internally.
 - **Socket policy remains with the consumer.** The reactor must enforce a
-  handshake deadline and byte budget; broader flow control and reload safety
-  remain deferred below.
+  handshake deadline and byte budget. The TLS seam bounds encrypted input and
+  output, while immutable reference-counted snapshots make reload safe after
+  the listener quiesces holder access before close.
 
 [ADR-0016](./0016-tls-backend-per-platform.md) governs outbound clients:
 SChannel on Windows, SecureTransport on macOS, and runtime-loaded OpenSSL on
@@ -57,10 +58,12 @@ reading another.
 
 Strict identity validation is the default for construction and reload. It
 requires the leaf and every bundled issuer to be inside their validity windows;
-an explicit compatible `serverAuth` extended purpose on the leaf; `CA:FALSE`
-basic constraints on the leaf; `CA:TRUE`, certificate-signing key usage, and
-path-length constraints on bundled issuers; and a structurally and
-cryptographically coherent bundled chain. The check
+an explicit compatible `serverAuth` extended purpose on the leaf; no `CA:TRUE`
+assertion on the leaf (a leaf may omit basic constraints); `CA:TRUE` and
+path-length constraints on bundled issuers; certificate-signing usage when an
+issuer has a key-usage extension; and a structurally and cryptographically
+coherent bundled chain. The `issuer-no-certsign` fixture is rejected because
+its key-usage extension omits `keyCertSign`. The check
 validates only caller-supplied material and does not consult platform system
 trust. Self-signed development identities use the explicit `tsivPermissive`
 option.
@@ -86,7 +89,9 @@ accepted connection retains the snapshot from its Begin call, so reload can
 swap in a replacement while old connections continue safely and the old
 snapshot retires only after its final connection reference. A failed reload
 does not alter the active snapshot. The listener still owns the context holder;
-individual connections own their retained snapshot references.
+individual connections own their retained snapshot references. Before closing
+the holder, the listener must stop and join every path that can enter `Begin`
+or `Reload`; established connections may outlive it through their snapshots.
 
 `BeginTransportSecurityServer` creates one `SSL`, one capacity-gated read memory
 BIO, and a write-side memory BIO pair with the context's configured output
