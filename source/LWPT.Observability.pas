@@ -11,6 +11,8 @@ unit LWPT.Observability;
 interface
 
 uses
+  SysUtils,
+
   CLI.Events;
 
 const
@@ -21,6 +23,9 @@ const
   ObservabilityCommandTerminalEventName = 'command-terminal';
   ObservabilityTruncationEventName = 'truncation';
   ObservabilityCaptureDegradedEventName = 'capture-degraded';
+  { Internal scheduler/observer failures have no child-process status to
+    preserve. Use the command's generic nonzero failure outcome instead. }
+  ObservabilityInternalErrorExitCode = 1;
 
 type
   TLWPTEventRetention = (oerOrdinary, oerProtected, oerTerminal);
@@ -127,7 +132,15 @@ type
     property Reason: string read FReason;
   end;
 
+function NormalizeFailureExitCode(const AExitCode: Integer): Integer;
+
 implementation
+
+function NormalizeFailureExitCode(const AExitCode: Integer): Integer;
+begin
+  if AExitCode = 0 then Result := ObservabilityInternalErrorExitCode
+  else Result := AExitCode;
+end;
 
 constructor TLWPTObservabilityPayload.Create(
   const ASource, ACorrelationID: string;
@@ -145,6 +158,9 @@ constructor TLWPTJobEvent.Create(const ASource, ACorrelationID: string;
 var
   Retention: TLWPTEventRetention;
 begin
+  if (AState = ojsFailed) and (AExitCode = 0) then
+    raise EArgumentException.Create(
+      'failed job event requires a nonzero exit outcome');
   if AState = ojsStarted then
     Retention := oerOrdinary
   else

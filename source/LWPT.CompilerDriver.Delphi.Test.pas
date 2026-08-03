@@ -426,6 +426,14 @@ begin
   Driver := TLWPTDelphiCompilerDriver.Create('dcc64.exe');
   try
     Request := FixtureRequest(Driver);
+    Result := Driver.NormalizeResult(Request, 0,
+      'Embarcadero Delphi for Win64 compiler version 37.0');
+    Expect<Boolean>(Result.Success).ToBe(False);
+    Expect<Integer>(Length(Result.Diagnostics)).ToBe(1);
+    Expect<string>(Result.Diagnostics[0].Severity).ToBe(DIAGNOSTIC_ERROR);
+    Expect<Boolean>(Pos('did not produce expected artifact',
+      Result.Diagnostics[0].MessageText) > 0).ToBe(True);
+
     Result := Driver.NormalizeResult(Request, 1,
       'source/Widget.pas(12,7) Error: E2003 Undeclared identifier: Foo');
     Expect<Boolean>(Result.Success).ToBe(False);
