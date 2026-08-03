@@ -702,7 +702,9 @@ type
   TX509CompareCurrentTime = function(ATime: Pointer): LongInt; cdecl;
   TX509GetExtendedKeyUsage = function(ACertificate: Pointer): Cardinal; cdecl;
   TX509GetExtensionFlags = function(ACertificate: Pointer): Cardinal; cdecl;
+  TX509GetKeyUsage = function(ACertificate: Pointer): Cardinal; cdecl;
   TX509GetName = function(ACertificate: Pointer): Pointer; cdecl;
+  TX509GetPathLength = function(ACertificate: Pointer): LongInt; cdecl;
   TX509GetPublicKey = function(ACertificate: Pointer): Pointer; cdecl;
   TX509GetTime = function(ACertificate: Pointer): Pointer; cdecl;
   TX509NameCompare = function(AName, BName: Pointer): LongInt; cdecl;
@@ -722,12 +724,8 @@ const
   BIO_FLAGS_RETRY_MASK = $0F;
   MAX_PKCS12_IDENTITY_SIZE = 16 * 1024 * 1024;
   OPENSSL_OUTPUT_CHUNK_SIZE = 16 * 1024;
-  {$IF DEFINED(LINUX) OR DEFINED(SOLARIS)}
-  O_NOFOLLOW_LWPT = $20000;
-  {$ELSE}
-  O_NOFOLLOW_LWPT = $100;
-  {$ENDIF}
   EXFLAG_BCONS = $1;
+  EXFLAG_KUSAGE = $2;
   EXFLAG_XKUSAGE = $4;
   EXFLAG_CA = $10;
   EXFLAG_INVALID = $80;
@@ -735,6 +733,7 @@ const
   EXFLAG_INVALID_POLICY = $800;
   EXFLAG_NO_FINGERPRINT = $100000;
   X509_PURPOSE_SSL_SERVER = 2;
+  KU_KEY_CERT_SIGN = $4;
   XKU_SSL_SERVER = $1;
   XKU_ANYEKU = $100;
   {$IFDEF MSWINDOWS}
@@ -773,8 +772,10 @@ var
   OpenSSLX509GetExtendedKeyUsage: TX509GetExtendedKeyUsage;
   OpenSSLX509GetExtensionFlags: TX509GetExtensionFlags;
   OpenSSLX509GetIssuerName: TX509GetName;
+  OpenSSLX509GetKeyUsage: TX509GetKeyUsage;
   OpenSSLX509GetNotAfter: TX509GetTime;
   OpenSSLX509GetNotBefore: TX509GetTime;
+  OpenSSLX509GetPathLength: TX509GetPathLength;
   OpenSSLX509GetPublicKey: TX509GetPublicKey;
   OpenSSLX509GetSubjectName: TX509GetName;
   OpenSSLX509NameCompare: TX509NameCompare;
@@ -983,8 +984,10 @@ var
   X509GetExtendedKeyUsage: TX509GetExtendedKeyUsage;
   X509GetExtensionFlags: TX509GetExtensionFlags;
   X509GetIssuerName: TX509GetName;
+  X509GetKeyUsage: TX509GetKeyUsage;
   X509GetNotAfter: TX509GetTime;
   X509GetNotBefore: TX509GetTime;
+  X509GetPathLength: TX509GetPathLength;
   X509GetPublicKey: TX509GetPublicKey;
   X509GetSubjectName: TX509GetName;
   X509NameCompare: TX509NameCompare;
@@ -1033,10 +1036,14 @@ begin
     SSLUtilHandle, 'X509_get_extension_flags'));
   X509GetIssuerName := TX509GetName(GetProcedureAddress(SSLUtilHandle,
     'X509_get_issuer_name'));
+  X509GetKeyUsage := TX509GetKeyUsage(GetProcedureAddress(SSLUtilHandle,
+    'X509_get_key_usage'));
   X509GetNotAfter := TX509GetTime(GetProcedureAddress(SSLUtilHandle,
     'X509_get0_notAfter'));
   X509GetNotBefore := TX509GetTime(GetProcedureAddress(SSLUtilHandle,
     'X509_get0_notBefore'));
+  X509GetPathLength := TX509GetPathLength(GetProcedureAddress(SSLUtilHandle,
+    'X509_get_pathlen'));
   X509GetPublicKey := TX509GetPublicKey(GetProcedureAddress(SSLUtilHandle,
     'X509_get_pubkey'));
   X509GetSubjectName := TX509GetName(GetProcedureAddress(SSLUtilHandle,
@@ -1058,8 +1065,9 @@ begin
      not Assigned(X509CompareCurrentTime) or
      not Assigned(X509GetExtendedKeyUsage) or
      not Assigned(X509GetExtensionFlags) or
-     not Assigned(X509GetIssuerName) or not Assigned(X509GetNotAfter) or
-     not Assigned(X509GetNotBefore) or not Assigned(X509GetPublicKey) or
+     not Assigned(X509GetIssuerName) or not Assigned(X509GetKeyUsage) or
+     not Assigned(X509GetNotAfter) or not Assigned(X509GetNotBefore) or
+     not Assigned(X509GetPathLength) or not Assigned(X509GetPublicKey) or
      not Assigned(X509GetSubjectName) or not Assigned(X509NameCompare) or
      not Assigned(X509VerifyCertificate) then
     raise ETransportSecurityError.Create(
@@ -1088,8 +1096,10 @@ begin
   OpenSSLX509GetExtendedKeyUsage := X509GetExtendedKeyUsage;
   OpenSSLX509GetExtensionFlags := X509GetExtensionFlags;
   OpenSSLX509GetIssuerName := X509GetIssuerName;
+  OpenSSLX509GetKeyUsage := X509GetKeyUsage;
   OpenSSLX509GetNotAfter := X509GetNotAfter;
   OpenSSLX509GetNotBefore := X509GetNotBefore;
+  OpenSSLX509GetPathLength := X509GetPathLength;
   OpenSSLX509GetPublicKey := X509GetPublicKey;
   OpenSSLX509GetSubjectName := X509GetSubjectName;
   OpenSSLX509NameCompare := X509NameCompare;
@@ -1900,31 +1910,277 @@ begin
   until False;
 end;
 
+{$IFDEF UNIX}
+function OpenAt(ADirectoryDescriptor: cint; APath: PChar;
+  AFlags: cint): cint; cdecl; external 'c' name 'openat';
+function FileStatusAt(ADirectoryDescriptor: cint; APath: PChar;
+  var AFileStatus: BaseUnix.Stat; AFlags: cint): cint; cdecl;
+  external 'c' name 'fstatat';
+
+{$IFDEF LINUX}
+type
+  PCIntLWPT = ^cint;
+
+function LinuxErrnoLocation: PCIntLWPT; cdecl;
+  external 'c' name '__errno_location';
+{$ENDIF}
+
+const
+  {$IFDEF LINUX}
+  AT_SYMLINK_NOFOLLOW_LWPT = $00000100;
+  O_DIRECTORY_LWPT = $00004000;
+  O_NOFOLLOW_LWPT = $00008000;
+  O_NONBLOCK_LWPT = $00000800;
+  {$ELSE}
+  AT_SYMLINK_NOFOLLOW_LWPT = AT_SYMLINK_NOFOLLOW;
+  O_DIRECTORY_LWPT = O_DIRECTORY;
+  O_NOFOLLOW_LWPT = O_NOFOLLOW;
+  O_NONBLOCK_LWPT = O_NONBLOCK;
+  {$ENDIF}
+
+function LastLibcError: cint; inline;
+begin
+  {$IFDEF LINUX}
+  Result := LinuxErrnoLocation^;
+  {$ELSE}
+  Result := fpgeterrno;
+  {$ENDIF}
+end;
+
+function OpenPKCS12Descriptor(const APath: string): cint;
+var
+  Component: string;
+  CurrentDescriptor: cint;
+  ErrorCode: cint;
+  IsFinal: Boolean;
+  LinkInfo: BaseUnix.Stat;
+  NextDescriptor: cint;
+  OpenFlags: cint;
+  OpenInfo: BaseUnix.Stat;
+  Position: Integer;
+  Start: Integer;
+begin
+  if APath = '' then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity file does not exist');
+  if APath[1] = '/' then
+    CurrentDescriptor := fpOpen(PChar('/'), O_RDONLY)
+  else
+    CurrentDescriptor := fpOpen(PChar('.'), O_RDONLY);
+  if CurrentDescriptor < 0 then
+    raise ETransportSecurityError.Create(
+      'Failed to open configured TLS PKCS#12 identity without following links');
+  try
+    Position := 1;
+    while Position <= Length(APath) do
+    begin
+      while (Position <= Length(APath)) and (APath[Position] = '/') do
+        Inc(Position);
+      if Position > Length(APath) then
+        Break;
+      Start := Position;
+      while (Position <= Length(APath)) and (APath[Position] <> '/') do
+        Inc(Position);
+      Component := Copy(APath, Start, Position - Start);
+      while (Position <= Length(APath)) and (APath[Position] = '/') do
+        Inc(Position);
+      IsFinal := Position > Length(APath);
+      if FileStatusAt(CurrentDescriptor, PChar(Component), LinkInfo,
+        AT_SYMLINK_NOFOLLOW_LWPT) <> 0 then
+      begin
+        ErrorCode := LastLibcError;
+        if ErrorCode = ESysENOENT then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 identity file does not exist');
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      end;
+      if (LinkInfo.st_mode and S_IFMT) = S_IFLNK then
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      if IsFinal then
+      begin
+        if (LinkInfo.st_mode and S_IFMT) <> S_IFREG then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 identity must be a regular file');
+        OpenFlags := O_RDONLY or O_NOFOLLOW_LWPT or O_NONBLOCK_LWPT;
+      end
+      else
+      begin
+        if (LinkInfo.st_mode and S_IFMT) <> S_IFDIR then
+          raise ETransportSecurityError.Create(
+            'Failed to open configured TLS PKCS#12 identity without following links');
+        OpenFlags := O_RDONLY or O_NOFOLLOW_LWPT or O_NONBLOCK_LWPT or
+          O_DIRECTORY_LWPT;
+      end;
+      NextDescriptor := OpenAt(CurrentDescriptor, PChar(Component),
+        OpenFlags);
+      if NextDescriptor < 0 then
+      begin
+        ErrorCode := LastLibcError;
+        if ErrorCode = ESysENOENT then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 identity file does not exist');
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      end;
+      if (fpFStat(NextDescriptor, OpenInfo) <> 0) or
+         (OpenInfo.st_dev <> LinkInfo.st_dev) or
+         (OpenInfo.st_ino <> LinkInfo.st_ino) or
+         ((OpenInfo.st_mode and S_IFMT) <> (LinkInfo.st_mode and S_IFMT)) then
+      begin
+        fpClose(NextDescriptor);
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      end;
+      fpClose(CurrentDescriptor);
+      CurrentDescriptor := NextDescriptor;
+    end;
+    Result := CurrentDescriptor;
+    CurrentDescriptor := -1;
+  finally
+    if CurrentDescriptor >= 0 then
+      fpClose(CurrentDescriptor);
+  end;
+end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+type
+  PPWideCharLWPT = ^PWideChar;
+  TWindowsHandleArray = array of THandle;
+
+function WindowsGetFullPathName(APath: PWideChar; ALength: DWORD;
+  ABuffer: PWideChar; AFilePart: PPWideCharLWPT): DWORD; stdcall;
+  external 'kernel32.dll' name 'GetFullPathNameW';
+
+function NormalizeWindowsPath(const APath: UnicodeString): UnicodeString;
+begin
+  Result := APath;
+  if Copy(Result, 1, 8) = '\\?\UNC\' then
+    Result := '\\' + Copy(Result, 9, MaxInt)
+  else if Copy(Result, 1, 4) = '\\?\' then
+    Delete(Result, 1, 4);
+end;
+
+function WindowsFullPath(const APath: string): UnicodeString;
+var
+  BufferLength: DWORD;
+  FilePart: PWideChar;
+begin
+  Result := '';
+  BufferLength := WindowsGetFullPathName(PWideChar(UnicodeString(APath)),
+    0, nil, @FilePart);
+  if BufferLength = 0 then
+    raise ETransportSecurityError.Create(
+      'Failed to inspect configured TLS PKCS#12 identity');
+  SetLength(Result, BufferLength);
+  BufferLength := WindowsGetFullPathName(PWideChar(UnicodeString(APath)),
+    Length(Result), PWideChar(Result), @FilePart);
+  if (BufferLength = 0) or (BufferLength >= DWORD(Length(Result))) then
+    raise ETransportSecurityError.Create(
+      'Failed to inspect configured TLS PKCS#12 identity');
+  SetLength(Result, BufferLength);
+  Result := NormalizeWindowsPath(Result);
+end;
+
+function WindowsRootLength(const APath: UnicodeString): Integer;
+var
+  Position: Integer;
+begin
+  if (Length(APath) >= 3) and (APath[2] = ':') and (APath[3] = '\') then
+    Exit(3);
+  if (Length(APath) < 5) or (Copy(APath, 1, 2) <> '\\') then
+    Exit(0);
+  Position := 3;
+  while (Position <= Length(APath)) and (APath[Position] <> '\') do
+    Inc(Position);
+  if Position > Length(APath) then
+    Exit(0);
+  Inc(Position);
+  while (Position <= Length(APath)) and (APath[Position] <> '\') do
+    Inc(Position);
+  if Position > Length(APath) then
+    Result := Length(APath)
+  else
+    Result := Position;
+end;
+
+procedure CloseWindowsHandles(var AHandles: TWindowsHandleArray);
+var
+  I: Integer;
+begin
+  for I := High(AHandles) downto 0 do
+    if AHandles[I] <> THandle(Windows.INVALID_HANDLE_VALUE) then
+      Windows.CloseHandle(AHandles[I]);
+  SetLength(AHandles, 0);
+end;
+
+procedure OpenWindowsParentHandles(const APath: UnicodeString;
+  out AHandles: TWindowsHandleArray);
+const
+  FILE_FLAG_BACKUP_SEMANTICS_LWPT = $02000000;
+  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
+  FILE_READ_ATTRIBUTES_LWPT = $00000080;
+var
+  ComponentEnd: Integer;
+  ComponentStart: Integer;
+  FileInfo: TByHandleFileInformation;
+  Handle: THandle;
+  ParentPath: UnicodeString;
+  RootLength: Integer;
+begin
+  SetLength(AHandles, 0);
+  RootLength := WindowsRootLength(APath);
+  if RootLength = 0 then
+    raise ETransportSecurityError.Create(
+      'Failed to inspect configured TLS PKCS#12 identity');
+  ComponentStart := RootLength + 1;
+  while ComponentStart <= Length(APath) do
+  begin
+    ComponentEnd := ComponentStart;
+    while (ComponentEnd <= Length(APath)) and
+      (APath[ComponentEnd] <> '\') do
+      Inc(ComponentEnd);
+    if ComponentEnd > Length(APath) then
+      Break;
+    ParentPath := Copy(APath, 1, ComponentEnd - 1);
+    Handle := Windows.CreateFileW(PWideChar(ParentPath),
+      FILE_READ_ATTRIBUTES_LWPT, Windows.FILE_SHARE_READ, nil,
+      Windows.OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS_LWPT or
+      FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
+    if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
+    begin
+      CloseWindowsHandles(AHandles);
+      raise ETransportSecurityError.Create(
+        'Failed to open configured TLS PKCS#12 identity without following reparse points');
+    end;
+    if not Windows.GetFileInformationByHandle(Handle, FileInfo) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY) = 0) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+    begin
+      Windows.CloseHandle(Handle);
+      CloseWindowsHandles(AHandles);
+      raise ETransportSecurityError.Create(
+        'Failed to open configured TLS PKCS#12 identity without following reparse points');
+    end;
+    SetLength(AHandles, Length(AHandles) + 1);
+    AHandles[High(AHandles)] := Handle;
+    ComponentStart := ComponentEnd + 1;
+  end;
+end;
+{$ENDIF}
+
 function LoadPKCS12Bytes(const APath: string): TBytes;
 {$IFDEF UNIX}
 var
   BytesRead: Integer;
   Descriptor: cint;
   FileInfo: BaseUnix.Stat;
-  LinkInfo: BaseUnix.Stat;
   Offset: Integer;
 begin
   Result := nil;
-  if fpLStat(APath, LinkInfo) <> 0 then
-  begin
-    if fpgeterrno = ESysENOENT then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity file does not exist');
-    raise ETransportSecurityError.Create(
-      'Failed to inspect configured TLS PKCS#12 identity');
-  end;
-  if (LinkInfo.st_mode and S_IFMT) = S_IFLNK then
-    raise ETransportSecurityError.Create(
-      'Failed to open configured TLS PKCS#12 identity without following links');
-  Descriptor := fpOpen(PChar(APath), O_RDONLY or O_NOFOLLOW_LWPT);
-  if Descriptor < 0 then
-    raise ETransportSecurityError.Create(
-      'Failed to open configured TLS PKCS#12 identity without following links');
+  Descriptor := OpenPKCS12Descriptor(APath);
   try
     if (fpFStat(Descriptor, FileInfo) <> 0) or
        ((FileInfo.st_mode and S_IFMT) <> S_IFREG) then
@@ -1965,29 +2221,32 @@ const
   FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
 var
   BytesRead: DWORD;
+  ExpectedPath: UnicodeString;
   FileInfo: TByHandleFileInformation;
   FileSize: QWord;
   Handle: THandle;
   LastError: DWORD;
   Offset: Integer;
+  ParentHandles: TWindowsHandleArray;
 begin
   Result := nil;
-  if Windows.GetFileAttributesW(PWideChar(UnicodeString(APath))) =
-     Windows.INVALID_FILE_ATTRIBUTES then
-  begin
-    LastError := Windows.GetLastError;
-    if (LastError = Windows.ERROR_FILE_NOT_FOUND) or
-       (LastError = Windows.ERROR_PATH_NOT_FOUND) then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity file does not exist');
-  end;
-  Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
-    Windows.GENERIC_READ, Windows.FILE_SHARE_READ, nil,
-    Windows.OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
-  if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
-    raise ETransportSecurityError.Create(
-      'Failed to open configured TLS PKCS#12 identity without following reparse points');
+  ExpectedPath := WindowsFullPath(APath);
+  Handle := THandle(Windows.INVALID_HANDLE_VALUE);
+  OpenWindowsParentHandles(ExpectedPath, ParentHandles);
   try
+    Handle := Windows.CreateFileW(PWideChar(ExpectedPath),
+      Windows.GENERIC_READ, Windows.FILE_SHARE_READ, nil,
+      Windows.OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
+    if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
+    begin
+      LastError := Windows.GetLastError;
+      if (LastError = Windows.ERROR_FILE_NOT_FOUND) or
+         (LastError = Windows.ERROR_PATH_NOT_FOUND) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 identity file does not exist');
+      raise ETransportSecurityError.Create(
+        'Failed to open configured TLS PKCS#12 identity without following reparse points');
+    end;
     if not Windows.GetFileInformationByHandle(Handle, FileInfo) or
        ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT)
        <> 0) or
@@ -2020,7 +2279,9 @@ begin
       raise;
     end;
   finally
-    Windows.CloseHandle(Handle);
+    if Handle <> THandle(Windows.INVALID_HANDLE_VALUE) then
+      Windows.CloseHandle(Handle);
+    CloseWindowsHandles(ParentHandles);
   end;
 end;
 {$ENDIF}
@@ -2104,6 +2365,7 @@ const
     EXFLAG_INVALID_POLICY or EXFLAG_NO_FINGERPRINT;
 var
   Flags: Cardinal;
+  KeyUsage: Cardinal;
 begin
   Flags := OpenSSLX509GetExtensionFlags(ACertificate);
   if (Flags and INVALID_EXTENSION_FLAGS) <> 0 then
@@ -2123,6 +2385,14 @@ begin
       raise ETransportSecurityError.CreateFmt(
         'Configured TLS PKCS#12 %s must assert CA:FALSE basic constraints',
         [ADescription]);
+  if ACertificateAuthority and ((Flags and EXFLAG_KUSAGE) <> 0) then
+  begin
+    KeyUsage := OpenSSLX509GetKeyUsage(ACertificate);
+    if (KeyUsage and KU_KEY_CERT_SIGN) = 0 then
+      raise ETransportSecurityError.CreateFmt(
+        'Configured TLS PKCS#12 %s key usage must permit certificate signing',
+        [ADescription]);
+  end;
 end;
 
 procedure ValidateOpenSSLServerIdentity(const ACertificate,
@@ -2137,6 +2407,8 @@ var
   FoundIndex: Integer;
   I: Integer;
   IssuerName: Pointer;
+  NonSelfIssuedCertificateAuthorities: Integer;
+  PathLength: LongInt;
   Used: array of Boolean;
   UsedCount: Integer;
 begin
@@ -2175,6 +2447,7 @@ begin
   end;
 
   CurrentCertificate := ACertificate;
+  NonSelfIssuedCertificateAuthorities := 0;
   UsedCount := 0;
   while UsedCount < ChainCount do
   begin
@@ -2199,9 +2472,17 @@ begin
     if FoundIndex < 0 then
       raise ETransportSecurityError.Create(
         'Configured TLS PKCS#12 certificate chain is structurally or cryptographically incoherent');
+    Candidate := OpenSSLStackValue(AChain, FoundIndex);
+    PathLength := OpenSSLX509GetPathLength(Candidate);
+    if (PathLength >= 0) and
+       (NonSelfIssuedCertificateAuthorities > PathLength) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 certificate chain exceeds an issuer path-length constraint');
     Used[FoundIndex] := True;
     Inc(UsedCount);
-    CurrentCertificate := OpenSSLStackValue(AChain, FoundIndex);
+    CurrentCertificate := Candidate;
+    if not CertificateIsSelfIssued(CurrentCertificate) then
+      Inc(NonSelfIssuedCertificateAuthorities);
   end;
 
   if CertificateIsSelfIssued(CurrentCertificate) then

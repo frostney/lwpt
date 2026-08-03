@@ -41,17 +41,24 @@ is installed and OpenSSL verifies that the leaf and private key match.
 
 The primary identity input is caller-supplied PKCS#12 bytes. Construction and
 reload immediately take a private mutable copy, parse synchronously, and wipe
-that copy in `finally`. The convenience path overload opens the file once with
-symbolic-link or reparse-point traversal disabled, verifies from that same
-handle that it is a regular file within the size cap, reads it through that
-handle, and delegates to the byte API. It never performs a separate
-check-then-open sequence.
+that copy in `finally`. The convenience path overload rejects symbolic-link or
+reparse-point traversal in every path component. Unix inspects each component
+with handle-relative `fstatat(..., AT_SYMLINK_NOFOLLOW)`, opens it relative to
+the retained parent with `openat(..., O_NOFOLLOW)`, requires intermediates to
+be directories, and matches the opened device, inode, and type. Windows opens
+and validates every parent with `FILE_FLAG_OPEN_REPARSE_POINT`, retains those
+handles without write or delete sharing so they cannot become reparse points
+or be replaced during the walk, and rejects a reparse-point final component.
+The final regular-file and size checks plus all reads use that same handle
+before delegating to the byte API; metadata from one object can never authorize
+reading another.
 
 Strict identity validation is the default for construction and reload. It
 requires the leaf and every bundled issuer to be inside their validity windows;
 an explicit compatible `serverAuth` extended purpose on the leaf; `CA:FALSE`
-basic constraints on the leaf; `CA:TRUE` basic constraints on bundled issuers;
-and a structurally and cryptographically coherent bundled chain. The check
+basic constraints on the leaf; `CA:TRUE`, certificate-signing key usage, and
+path-length constraints on bundled issuers; and a structurally and
+cryptographically coherent bundled chain. The check
 validates only caller-supplied material and does not consult platform system
 trust. Self-signed development identities use the explicit `tsivPermissive`
 option.

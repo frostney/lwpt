@@ -16,6 +16,8 @@ intermediate but not the root.
 | `localhost-cycle-identity.p12` | `test-only` | Strict bundled certificate-cycle rejection |
 | `localhost-leaf-ca-identity.p12` | `test-only` | Strict leaf `CA:FALSE` rejection |
 | `localhost-non-ca-issuer-identity.p12` | `test-only` | Strict issuer `CA:TRUE` rejection |
+| `localhost-no-certsign-identity.p12` | `test-only` | Strict issuer certificate-signing key-usage rejection |
+| `localhost-pathlen-identity.p12` | `test-only` | Strict issuer path-length rejection |
 | `localhost-self-signed-dev.p12` | `test-only` | Explicit permissive-development mode |
 
 The committed PEM keys and certificates are the reproducible source material.
@@ -41,14 +43,17 @@ The strict-policy fixtures reuse the public test keys. Generate their CSRs and
 certificates with OpenSSL 3, setting `LWPT_TLS_FIXTURE_ROOT` to this directory
 and `LWPT_TLS_FIXTURE_STATE` to a private temporary directory containing an
 empty `index.txt`, a writable `serial.txt`, and a `newcerts/` directory. The
-`wrong-purpose-leaf.cnf`, `leaf-ca-true.cnf`, `issuer-ca-false.cnf`, and
-`invalid-dates-ca.cnf` define the invalid extensions and fixed future validity
-window. The non-CA issuer fixture reuses the intermediate private key: its
-invalid issuer certificate is root-signed with `CA:FALSE`, and its leaf is
-signed by that same key. Package the generated leafs with their matching
-issuer as above; package the normal leaf with the test root to produce the
-incoherent-chain bundle, and the test root certificate plus key to produce the
-self-signed development bundle.
+`wrong-purpose-leaf.cnf`, `leaf-ca-true.cnf`, `issuer-ca-false.cnf`,
+`issuer-no-certsign.cnf`, `root-pathlen-zero.cnf`, and `invalid-dates-ca.cnf`
+define the invalid extensions and fixed future validity window. The invalid
+issuer fixtures reuse the intermediate private key: one root-signed issuer
+asserts `CA:FALSE`; another asserts `CA:TRUE` while omitting `keyCertSign`; each
+matching leaf is signed by that same key. The path-length fixture uses the test
+root key for a `pathlen:0` root, then bundles the intermediate it signs plus a
+leaf below that intermediate. Package generated leafs with their matching
+issuer chain as above; package the normal leaf with the test root to produce
+the incoherent-chain bundle, and the test root certificate plus key to produce
+the self-signed development bundle.
 
 The cyclic bundle reuses the test intermediate key for Cycle A and the test
 root key for Cycle B. Cycle A is signed by Cycle B, Cycle B is signed by Cycle

@@ -18,6 +18,10 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Process,
+  Windows,
+  {$ENDIF}
   {$IFNDEF DARWIN}
   DynLibs,
   OpenSSL,
@@ -42,6 +46,10 @@ const
     'packages/httpclient/source/fixtures/localhost-leaf-ca-identity.p12';
   NON_CA_ISSUER_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-non-ca-issuer-identity.p12';
+  NO_CERTSIGN_ISSUER_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-no-certsign-identity.p12';
+  PATH_LENGTH_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-pathlen-identity.p12';
   SELF_SIGNED_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-self-signed-dev.p12';
   WRONG_PURPOSE_PKCS12_PATH =
@@ -1249,7 +1257,17 @@ procedure TTransportSecurityServerTests.TestPKCS12PathRefusesSymbolicLink;
 {$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
 var
   ErrorMessage: string;
+  FifoPath: string;
+  LinkDirectory: string;
   LinkPath: string;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  CommandInterpreter: string;
+  ErrorMessage: string;
+  LinkDirectory: string;
+  LinkTarget: string;
+  ProcessInstance: TProcess;
 {$ENDIF}
 begin
   {$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
@@ -1264,6 +1282,65 @@ begin
     Expect<Boolean>(Pos(LinkPath, ErrorMessage) = 0).ToBe(True);
   finally
     SysUtils.DeleteFile(LinkPath);
+  end;
+
+  LinkDirectory := SCRATCH_DIRECTORY + '/identity-parent';
+  SysUtils.DeleteFile(LinkDirectory);
+  if fpSymlink(PChar(ExtractFileDir(ExpandFileName(PKCS12_PATH))),
+     PChar(LinkDirectory)) <> 0 then
+    raise Exception.Create('Failed to create PKCS#12 parent symlink fixture');
+  try
+    ErrorMessage := CaptureContextError(LinkDirectory + '/' +
+      ExtractFileName(PKCS12_PATH), PKCS12_PASSPHRASE);
+    Expect<Boolean>(Pos('without following links', ErrorMessage) > 0).ToBe(True);
+    Expect<Boolean>(Pos(LinkDirectory, ErrorMessage) = 0).ToBe(True);
+  finally
+    SysUtils.DeleteFile(LinkDirectory);
+  end;
+
+  FifoPath := SCRATCH_DIRECTORY + '/identity-fifo.p12';
+  SysUtils.DeleteFile(FifoPath);
+  if fpMkFifo(PChar(FifoPath), &600) <> 0 then
+    raise Exception.Create('Failed to create PKCS#12 FIFO fixture');
+  try
+    ErrorMessage := CaptureContextError(FifoPath, PKCS12_PASSPHRASE);
+    Expect<Boolean>(Pos('must be a regular file', ErrorMessage) > 0).ToBe(True);
+    Expect<Boolean>(Pos(FifoPath, ErrorMessage) = 0).ToBe(True);
+  finally
+    SysUtils.DeleteFile(FifoPath);
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  ForceDirectories(SCRATCH_DIRECTORY);
+  LinkDirectory := SCRATCH_DIRECTORY + '/identity-parent-junction';
+  LinkTarget := ExtractFileDir(ExpandFileName(PKCS12_PATH));
+  Windows.RemoveDirectoryW(PWideChar(UnicodeString(LinkDirectory)));
+  CommandInterpreter := GetEnvironmentVariable('COMSPEC');
+  if CommandInterpreter = '' then
+    CommandInterpreter := 'cmd.exe';
+  ProcessInstance := TProcess.Create(nil);
+  try
+    ProcessInstance.Executable := CommandInterpreter;
+    ProcessInstance.Parameters.Add('/C');
+    ProcessInstance.Parameters.Add('mklink /J "' +
+      StringReplace(LinkDirectory, '/', '\', [rfReplaceAll]) + '" "' +
+      StringReplace(LinkTarget, '/', '\', [rfReplaceAll]) + '"');
+    ProcessInstance.Options := [poWaitOnExit];
+    ProcessInstance.Execute;
+    if ProcessInstance.ExitStatus <> 0 then
+      raise Exception.Create('Failed to create PKCS#12 parent junction fixture');
+  finally
+    ProcessInstance.Free;
+  end;
+  try
+    ErrorMessage := CaptureContextError(LinkDirectory + '/' +
+      ExtractFileName(PKCS12_PATH), PKCS12_PASSPHRASE);
+    Expect<Boolean>(Pos('without following reparse points',
+      ErrorMessage) > 0).ToBe(True);
+    Expect<Boolean>(Pos(LinkDirectory, ErrorMessage) = 0).ToBe(True);
+  finally
+    if not Windows.RemoveDirectoryW(PWideChar(UnicodeString(LinkDirectory))) then
+      raise Exception.Create('Failed to remove PKCS#12 parent junction fixture');
   end;
   {$ENDIF}
 end;
@@ -1307,6 +1384,18 @@ begin
     PKCS12_PASSPHRASE);
   if Pos('chain certificate 1 must assert CA:TRUE', ErrorMessage) = 0 then
     raise Exception.Create('Unexpected issuer-basic-constraints error: ' +
+      ErrorMessage);
+
+  ErrorMessage := CaptureContextError(NO_CERTSIGN_ISSUER_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('key usage must permit certificate signing', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected issuer-key-usage error: ' +
+      ErrorMessage);
+
+  ErrorMessage := CaptureContextError(PATH_LENGTH_PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  if Pos('path-length constraint', ErrorMessage) = 0 then
+    raise Exception.Create('Unexpected issuer-path-length error: ' +
       ErrorMessage);
 
   ErrorMessage := CaptureContextError(SELF_SIGNED_PKCS12_PATH,
@@ -1978,7 +2067,7 @@ begin
     TestPKCS12SizeLimit, DARWIN_SKIP_REASON);
   Skip('caller PKCS#12 bytes are copied before synchronous parsing',
     TestPKCS12BytesArePrimaryInput, DARWIN_SKIP_REASON);
-  Skip('PKCS#12 path loading refuses symbolic links',
+  Skip('PKCS#12 path loading refuses links in every component',
     TestPKCS12PathRefusesSymbolicLink, DARWIN_SKIP_REASON);
   Skip('strict identity policy rejects invalid production certificates',
     TestStrictIdentityValidation, DARWIN_SKIP_REASON);
@@ -2036,11 +2125,11 @@ begin
     TestPKCS12SizeLimit);
   ServerTest('caller PKCS#12 bytes are copied before synchronous parsing',
     TestPKCS12BytesArePrimaryInput);
-  {$IFDEF UNIX}
-  ServerTest('PKCS#12 path loading refuses symbolic links',
+  {$IF DEFINED(UNIX) OR DEFINED(MSWINDOWS)}
+  ServerTest('PKCS#12 path loading refuses links in every component',
     TestPKCS12PathRefusesSymbolicLink);
   {$ELSE}
-  Skip('PKCS#12 path loading refuses symbolic links',
+  Skip('PKCS#12 path loading refuses links in every component',
     TestPKCS12PathRefusesSymbolicLink,
     'Windows reparse-point creation requires host policy privileges');
   {$ENDIF}

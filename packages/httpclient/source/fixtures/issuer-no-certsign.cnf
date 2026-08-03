@@ -1,0 +1,12 @@
+[req]
+distinguished_name = issuer_name
+prompt = no
+
+[issuer_name]
+CN = TransportSecurity Invalid Key Usage Issuer
+
+[issuer_extensions]
+basicConstraints = critical,CA:true,pathlen:0
+keyUsage = critical,digitalSignature
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
