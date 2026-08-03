@@ -974,11 +974,17 @@ procedure TTestScheduling.TestSuccessfulAcknowledgementHasSeparateReapWindow;
 var
   AcknowledgementDeadline, DescendantDeadline: QWord;
   Child: TProcess;
+  ChildProcessID: Integer;
   ChildTree: TLWPTProcessTree;
   Environment: array of string;
   Marker: string;
   Started: TDateTime;
+  TerminationCompleted: Boolean;
   WaitThread: TProcessWaitThread;
+  WaitThreadStarted: Boolean;
+  {$IFDEF MSWINDOWS}
+  ChildProcessHandle: THandle;
+  {$ENDIF}
 begin
   Marker := FScratch + '/control/delayed-successful-acknowledgement';
   SetLength(Environment, 2);
@@ -987,11 +993,21 @@ begin
   Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + Marker;
   Child := TProcess.Create(nil);
   ChildTree := TLWPTProcessTree.Create(Child);
+  ChildProcessID := 0;
+  TerminationCompleted := False;
   WaitThread := nil;
+  WaitThreadStarted := False;
+  {$IFDEF MSWINDOWS}
+  ChildProcessHandle := 0;
+  {$ENDIF}
   try
     Child.Executable := ExpandFileName(ParamStr(0));
     ConfigureProcessEnvironment(Child, Environment);
     ChildTree.Execute;
+    ChildProcessID := Child.ProcessID;
+    {$IFDEF MSWINDOWS}
+    ChildProcessHandle := Child.ProcessHandle;
+    {$ENDIF}
     Started := Now;
     while (not FileExists(Marker + '-descendant')) and Child.Running
       and ((Now - Started) * SecondsPerDay
@@ -1003,19 +1019,39 @@ begin
       process tree can then distinguish its delayed exit from a live member. }
     WaitThread := TProcessWaitThread.Create(Child);
     WaitThread.Start;
+    WaitThreadStarted := True;
     TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
       AcknowledgementDeadline);
     ChildTree.BeginTermination(DescendantDeadline,
       AcknowledgementDeadline);
     ChildTree.CompleteTermination;
+    TerminationCompleted := True;
     WaitThread.WaitFor;
     Expect<Integer>(Child.ExitStatus).ToBe(0);
   finally
-    if Child.Running then Child.Terminate(1);
-    if Assigned(WaitThread) then
+    if WaitThreadStarted then
     begin
+      if not TerminationCompleted then
+        try
+          ChildTree.Terminate;
+        except
+          {$IFDEF UNIX}
+          if ChildProcessID > 0 then FpKill(ChildProcessID, SIGKILL);
+          {$ENDIF}
+          {$IFDEF MSWINDOWS}
+          if ChildProcessHandle <> 0 then
+            Windows.TerminateProcess(ChildProcessHandle, 1);
+          {$ENDIF}
+        end;
       WaitThread.WaitFor;
       WaitThread.Free;
+      WaitThread := nil;
+    end
+    else
+    begin
+      WaitThread.Free;
+      WaitThread := nil;
+      if Child.Running then Child.Terminate(1);
     end;
     ChildTree.Free;
     Child.Free;
@@ -1164,8 +1200,6 @@ var
 begin
   ResetProject(0);
   PIDFile := FScratch + '/control/sibling-ack-compiler-pid';
-  WriteTextFile(FScratch + '/tests/A.Slow.Test.pas',
-    'program SlowCompilerInputA; begin end.'#10);
   WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
     'program MissingRuntimeBinaryInput; begin end.'#10);
   for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
