@@ -1003,6 +1003,7 @@ procedure TTestScheduling.RunWindowsConsoleForwardingTest(
 var
   CompilerPID: Integer;
   Controller: TProcess;
+  ControllerTree: TLWPTProcessTree;
   PIDFile, ProjectRoot: string;
   Started: TDateTime;
 begin
@@ -1011,7 +1012,9 @@ begin
   PIDFile := FScratch + '/control/' + AProjectName + '-compiler-pid';
   WriteBuildProject(ProjectRoot);
   Controller := TProcess.Create(nil);
+  ControllerTree := nil;
   try
+    ControllerTree := TLWPTProcessTree.Create(Controller);
     Controller.Executable := ExpandFileName(ParamStr(0));
     Controller.Parameters.Add(WindowsConsoleControllerOption);
     Controller.Parameters.Add(IntToStr(AControlType));
@@ -1020,7 +1023,7 @@ begin
     Controller.Parameters.Add(PIDFile);
     Controller.Parameters.Add(FScratch + '/' + AProjectName + '-worker-state');
     Controller.Options := [poNewConsole];
-    Controller.Execute;
+    ControllerTree.Execute;
     Started := Now;
     while Controller.Running
       and ((Now - Started) * SecondsPerDay
@@ -1033,9 +1036,15 @@ begin
     CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
     Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   finally
-    if Controller.Running then Controller.Terminate(1);
-    TerminateWindowsProcess(CompilerPID);
-    Controller.Free;
+    if (CompilerPID < 0) and FileExists(PIDFile) then
+      TryStrToInt(Trim(ReadBinaryFile(PIDFile)), CompilerPID);
+    try
+      if Assigned(ControllerTree) then ControllerTree.Terminate;
+    finally
+      TerminateWindowsProcess(CompilerPID);
+      ControllerTree.Free;
+      Controller.Free;
+    end;
   end;
 end;
 
