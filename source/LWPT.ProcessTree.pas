@@ -246,6 +246,9 @@ function LWPTQueryInformationJobObject(const AJob: THandle;
   const AInformationClass: DWORD; const AInformation: Pointer;
   const AInformationLength: DWORD; const AReturnLength: PDWORD): BOOL; stdcall;
   external 'kernel32.dll' name 'QueryInformationJobObject';
+function LWPTGetHandleInformation(const AHandle: THandle;
+  var AFlags: DWORD): BOOL; stdcall;
+  external 'kernel32.dll' name 'GetHandleInformation';
 
 constructor TLWPTProcessTree.TWindowsState.Create;
 begin
@@ -1308,39 +1311,56 @@ begin
       Exit(False);
 end;
 
+procedure ClearInheritedAcknowledgementChannel;
+begin
+  InheritedStatusWriteHandle := -1;
+  InheritedControlReadHandle := -1;
+  InheritedChannelToken := '';
+  InheritedControlBuffer := '';
+end;
+
 procedure LoadInheritedAcknowledgementChannel;
 var
   ParsedHandle: Int64;
+  {$IFDEF MSWINDOWS}
+  HandleFlags: DWORD;
+  {$ENDIF}
 begin
+  ClearInheritedAcknowledgementChannel;
   InheritedChannelToken := SysUtils.GetEnvironmentVariable(
     ChannelTokenEnvironment);
   if not ValidChannelToken(InheritedChannelToken) then
   begin
-    InheritedChannelToken := '';
+    ClearInheritedAcknowledgementChannel;
     Exit;
   end;
   if not TryStrToInt64(SysUtils.GetEnvironmentVariable(
     StatusHandleEnvironment), ParsedHandle) or (ParsedHandle < 0) then
   begin
-    InheritedChannelToken := '';
+    ClearInheritedAcknowledgementChannel;
     Exit;
   end;
   InheritedStatusWriteHandle := PtrInt(ParsedHandle);
   if not TryStrToInt64(SysUtils.GetEnvironmentVariable(
     ControlHandleEnvironment), ParsedHandle) or (ParsedHandle < 0) then
   begin
-    InheritedStatusWriteHandle := -1;
-    InheritedChannelToken := '';
+    ClearInheritedAcknowledgementChannel;
     Exit;
   end;
   InheritedControlReadHandle := PtrInt(ParsedHandle);
+  {$IFDEF MSWINDOWS}
+  { Environment strings outlive inherited handles when an intermediate
+    process forwards its environment without those handles. Reject that stale
+    metadata so console cancellation falls back to this process's own handler. }
+  if not LWPTGetHandleInformation(THandle(InheritedStatusWriteHandle),
+       HandleFlags)
+     or not LWPTGetHandleInformation(THandle(InheritedControlReadHandle),
+       HandleFlags) then
+    ClearInheritedAcknowledgementChannel;
+  {$ENDIF}
   {$IFDEF UNIX}
   if FpFcntl(InheritedControlReadHandle, F_SetFl, O_NONBLOCK) < 0 then
-  begin
-    InheritedStatusWriteHandle := -1;
-    InheritedControlReadHandle := -1;
-    InheritedChannelToken := '';
-  end;
+    ClearInheritedAcknowledgementChannel;
   {$ENDIF}
 end;
 

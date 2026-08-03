@@ -793,9 +793,9 @@ begin
       + SlowSources[SourceIndex])));
     Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   end;
-  Expect<Boolean>(Pos('tests/A.Slow.Test.pas ... ERROR',
+  Expect<Boolean>(Pos('A.Slow.Test.pas ... ERROR',
     CommandResult.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('tests/C.Slow.Test.pas ... ERROR',
+  Expect<Boolean>(Pos('C.Slow.Test.pas ... ERROR',
     CommandResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(ElapsedMilliseconds < SiblingFanoutCeilingMilliseconds)
     .ToBe(True);
@@ -973,7 +973,7 @@ begin
   ControlType := DWORD(StrToInt(ParamStr(2)));
   if (ControlType <> Windows.CTRL_C_EVENT)
      and (ControlType <> Windows.CTRL_BREAK_EVENT) then Exit(2);
-  SetLength(Environment, 6);
+  SetLength(Environment, 9);
   Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
   Environment[1] := WORKER_STATE_DIR_ENV + '=' + ParamStr(6);
   Environment[2] := WORKER_BUDGET_ENV + '=1';
@@ -982,6 +982,12 @@ begin
   Environment[4] := ProcessTreeProxyModeEnvironment + '='
     + WindowsIgnoreControlCompilerProxyMode;
   Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + ParamStr(5);
+  { Model an intermediate process that copied channel metadata but did not
+    inherit the corresponding pipe handles. }
+  Environment[6] := ProcessTreeStatusHandleEnvironment + '=999999999';
+  Environment[7] := ProcessTreeControlHandleEnvironment + '=999999999';
+  Environment[8] := ProcessTreeChannelTokenEnvironment
+    + '=0123456789abcdef0123456789abcdef';
   LwptProcess := TProcess.Create(nil);
   try
     { Pin the inherited Ctrl-C-ignore case explicitly. Production LWPT must
