@@ -185,6 +185,47 @@ installs are not supported.
   successful binary. See [`testing.md`](./testing.md).
 - **Worker coordination:** `LWPT.WorkerBudget` owns the per-user machine-capacity seam. Invocations register owner-guarded requests and acquire FIFO, reclaimable leases under a short cross-platform transaction lock. Nested LWPT subprocesses consume a one-shot opaque delegation that transfers one grant to the child's own guarded request instead of consuming another slot. `lwpt repair` reclaims requests only when their OS-held owner guard is absent; stale heartbeats remain diagnostic. Build and test scheduling consume this module in their own workstreams.
 
+## Output and observability boundary
+
+Output facts cross two deliberately separate layers. The reusable CLI package's
+`CLI.Events` unit owns only a monotonically sequenced envelope and a synchronous
+sink interface. Its dispatcher serializes delivery across producers, owns each
+payload through the delivery call, and frees it after the sink returns. A sink
+borrows the payload only during delivery and must copy or serialize anything it
+needs to retain; successful, missing, and failed sinks follow the same ownership
+rule. Observer failure cannot replace the command result. The generic layer has
+no LWPT event names, terminal streams, rendering, or retention policy.
+
+`LWPT.Observability` supplies the project-specific typed payloads: job
+lifecycle, heartbeat, diagnostic, raw child stdout/stderr, command terminal,
+truncation, and capture-degradation events. Source and correlation tags live on
+those payloads. Retention classification distinguishes ordinary progress from
+protected diagnostics and terminal outcomes, so a host can retain or replay
+events without teaching the generic CLI package about LWPT policy. Raw child
+chunks use `RawByteString` and remain byte-safe across embedded NUL bytes.
+Failed job events preserve a child-process exit code when one exists and reject
+zero; internal scheduler failures use the documented generic failure outcome.
+
+`LWPT.ProgressReporter` consumes typed job and heartbeat events for build and
+test. It owns their shared heartbeat cadence, active-job assembly, established
+human rendering, and per-job log persistence. The executable host's broader
+terminal and retention policy lives in `LWPT.OutputRenderer`. A registry-level
+shared flag gives every command an independent `--silent` option object, while
+the neutral prepared-dispatch hook lets the executable install the renderer
+only after parsing and alias resolution. The renderer routes stdout/stderr and
+continuously drained child chunks through `CLI.Events`, suppresses ordinary
+events in silent mode, and replays protected diagnostics and failed-operation
+output before the user-visible terminal failure result line. Raw child chunks
+are correlated with their invocation and promoted from ordinary to protected
+retention only when that child exits unsuccessfully; successful hook output
+therefore stays suppressed if a later operation fails. Its normal journal
+is capped at 64 MiB; a preallocated 1 MiB emergency ring preserves
+protected/recent evidence when journal creation, writing, capacity, or replay
+degrades. Observer failure
+never replaces the command exit result. `LWPT.Observability` remains free of
+human strings and stream policy, and
+`LWPT.BuildSession` owns only session-path allocation and atomic log writes.
+
 ## `.lwpt/` layout
 
 See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) for the full design rationale.

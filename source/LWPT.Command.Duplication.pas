@@ -16,7 +16,8 @@ uses
 
   LWPT.Analysis.JSON,
   LWPT.Analysis.Scope,
-  LWPT.Duplication;
+  LWPT.Duplication,
+  LWPT.OutputRenderer;
 
 function CmdDuplication(const AManifestPath: string;
   const AJSON: Boolean): Integer;
@@ -54,11 +55,11 @@ begin
       Metadata.ThresholdOutcome := atoNotConfigured;
     for DiagnosticIndex := 0 to High(Report.Diagnostics) do
       AddAnalysisDiagnostic(Metadata, Report.Diagnostics[DiagnosticIndex]);
-    Write(SerializeAnalysisEnvelope(Metadata,
-      DuplicationReportJSON(Report)));
+    WriteCommandResult(SerializeAnalysisEnvelope(Metadata,
+      DuplicationReportJSON(Report)))
   end
   else
-    Write(DuplicationReportHuman(Report));
+    WriteCommandResult(DuplicationReportHuman(Report));
   if Report.ThresholdFailed then Result := 1 else Result := 0;
 end;
 

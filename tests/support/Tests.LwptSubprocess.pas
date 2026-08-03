@@ -11,8 +11,9 @@
   Design choices:
 
     - Stdout and stderr are captured separately (not merged) so tests
-      can assert on each independently. Most LWPT errors land on
-      stderr; the success summaries land on stdout.
+      can assert on each independently. Ordinary completion summaries
+      and most LWPT errors land on stderr; silent success alone reports
+      its final summary on stdout.
     - The caller's environment is inherited by default; AExtraEnv
       adds or overrides individual variables for that subprocess
       only.
