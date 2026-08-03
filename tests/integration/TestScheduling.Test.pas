@@ -827,6 +827,9 @@ begin
   Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + ParamStr(5);
   LwptProcess := TProcess.Create(nil);
   try
+    { Pin the inherited Ctrl-C-ignore case explicitly. Production LWPT must
+      restore Ctrl-C delivery before installing its forwarding handler. }
+    if not Windows.SetConsoleCtrlHandler(nil, True) then Exit(4);
     LwptProcess.Executable := ParamStr(3);
     LwptProcess.Parameters.Add('build');
     LwptProcess.CurrentDirectory := ParamStr(4);
@@ -839,21 +842,20 @@ begin
       Sleep(ProcessPollMilliseconds);
     if not FileExists(ParamStr(5)) then Exit(3);
     CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
-    { The controller shares the new console but must survive its own broadcast.
-      Install after spawning LWPT so no ignore policy can be inherited. The
-      compiler proxy installs the same two-event handler before publishing its
-      PID, leaving LWPT as the only process that performs cancellation work. }
+    { The controller shares the new console but must survive Ctrl-Break too.
+      The compiler proxy installs the same two-event handler before publishing
+      its PID, leaving LWPT as the only process that performs cancellation. }
     if not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
-      True) then Exit(4);
-    if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(5);
+      True) then Exit(5);
+    if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(6);
     Started := Now;
     while LwptProcess.Running
       and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    if LwptProcess.Running then Exit(6);
+    if LwptProcess.Running then Exit(7);
     LwptProcess.WaitOnExit;
-    if DWORD(LwptProcess.ExitStatus) <> WindowsControlExitCode then Exit(7);
-    if ProcessIsRunning(CompilerPID) then Exit(8);
+    if DWORD(LwptProcess.ExitStatus) <> WindowsControlExitCode then Exit(8);
+    if ProcessIsRunning(CompilerPID) then Exit(9);
     Result := 0;
   finally
     if LwptProcess.Running then LwptProcess.Terminate(1);

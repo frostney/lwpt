@@ -894,6 +894,11 @@ begin
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   if SignalForwardingInstalled then Exit;
+  { CREATE_NEW_PROCESS_GROUP and SetConsoleCtrlHandler(nil, True) both leave
+    an inheritable Ctrl-C-ignore attribute on descendants. LWPT owns its
+    cancellation policy, so restore Ctrl-C delivery before registering the
+    forwarding handler; Ctrl-Break is delivered regardless of this flag. }
+  if not Windows.SetConsoleCtrlHandler(nil, False) then RaiseLastOSError;
   ConsoleControlEvent := Windows.CreateEvent(nil, False, False, nil);
   if ConsoleControlEvent = 0 then RaiseLastOSError;
   if not Windows.SetConsoleCtrlHandler(@ProcessTreeConsoleControlHandler,
