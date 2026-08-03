@@ -1,0 +1,26 @@
+[ca]
+default_ca = test_ca
+
+[test_ca]
+database = $ENV::LWPT_TLS_FIXTURE_STATE/index.txt
+new_certs_dir = $ENV::LWPT_TLS_FIXTURE_STATE/newcerts
+certificate = $ENV::LWPT_TLS_FIXTURE_ROOT/localhost-test-intermediate-cert.pem
+private_key = $ENV::LWPT_TLS_FIXTURE_ROOT/localhost-test-intermediate-key.pem
+serial = $ENV::LWPT_TLS_FIXTURE_STATE/serial.txt
+default_md = sha256
+default_startdate = 20400101000000Z
+default_enddate = 20410101000000Z
+policy = test_policy
+unique_subject = no
+copy_extensions = none
+
+[test_policy]
+commonName = supplied
+
+[leaf_extensions]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer

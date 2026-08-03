@@ -1,0 +1,13 @@
+[req]
+distinguished_name = root_name
+prompt = no
+x509_extensions = root_extensions
+
+[root_name]
+CN = TransportSecurity Invalid Path Length Root
+
+[root_extensions]
+basicConstraints = critical,CA:true,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
