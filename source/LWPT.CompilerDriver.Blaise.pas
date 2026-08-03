@@ -178,13 +178,14 @@ end;
 
 function ManagedArgument(const AArgument: string): Boolean;
 const
-  ManagedCount = 14;
+  ManagedCount = 18;
   Managed: array[0..ManagedCount - 1] of string = (
     BLAISE_SOURCE_FLAG, BLAISE_OUTPUT_FLAG, BLAISE_TARGET_FLAG,
     BLAISE_UNIT_PATH_FLAG, BLAISE_DEFINE_FLAG, BLAISE_BACKEND_FLAG,
     BLAISE_DEBUG_FLAG, BLAISE_UNIT_CACHE_FLAG,
     BLAISE_NO_INCREMENTAL_FLAG, BLAISE_HELP_FLAG, '-h', '--emit-asm',
-    '--dump-ast', '--rtl-src');
+    '--dump-ast', '--rtl-src', '--emit-ir', '--emit-iface',
+    '--skip-dep-codegen', '-d');
 var
   ManagedIndex: Integer;
 begin
@@ -411,7 +412,7 @@ begin
       Arguments.Add(BLAISE_NO_INCREMENTAL_FLAG);
     for ArgumentIndex := 0 to High(ARequest.Inputs.ExtraArguments) do
     begin
-      if ARequest.Inputs.ExtraArguments[ArgumentIndex][1] <> '-' then
+      if not StartsStr('-', ARequest.Inputs.ExtraArguments[ArgumentIndex]) then
         raise ELWPTCompilerDriverError.CreateFmt(
           'compiler "blaise" extra argument %d must be an option; '
           + 'positional arguments are not supported', [ArgumentIndex]);

@@ -271,10 +271,11 @@ executable = "tools/blaise"
 version = ">=0.13.0"
 ```
 
-Every selection and concrete build operation launches `blaise --help` again.
-The driver requires the `Blaise Compiler v<semver>` identity, enforces the
-v0.13.0 floor, and confirms the supported target names are still present
-before translating the request. It advertises only `linux/x86_64` and
+Profile selection constructs and caches the driver; each concrete build or
+test operation launches `blaise --help`. The driver requires the
+`Blaise Compiler v<semver>` identity, enforces the v0.13.0 floor, and confirms
+the supported target names are still present before translating the request.
+It advertises only `linux/x86_64` and
 `freebsd/x86_64`: those are the two targets Blaise v0.13.0 documents as
 self-hosted, bidirectionally cross-compiled, and shipped as release binaries.
 The CLI also parses names for planned targets, but LWPT does not advertise

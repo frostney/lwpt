@@ -134,6 +134,7 @@ var
   ArgumentIndex: Integer;
 begin
   Expect<Integer>(Length(AActual)).ToBe(Length(AExpected));
+  if Length(AActual) <> Length(AExpected) then Exit;
   for ArgumentIndex := 0 to High(AExpected) do
     Expect<string>(AActual[ArgumentIndex]).ToBe(AExpected[ArgumentIndex]);
 end;
@@ -427,9 +428,10 @@ end;
 procedure TLWPTBlaiseCompilerDriverTests.
   TestOutputSuppressingExtraArgumentsFailExplicitly;
 const
-  ArgumentCount = 4;
+  ArgumentCount = 8;
   Arguments: array[0..ArgumentCount - 1] of string = (
-    '--help', '-h', '--emit-asm', '--dump-ast');
+    '--help', '-h', '--emit-asm', '--dump-ast', '--emit-ir', '--emit-iface',
+    '--skip-dep-codegen', '-d');
 var
   ArgumentIndex: Integer;
   Driver: TMockBlaiseCompilerDriver;
