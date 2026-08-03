@@ -33,6 +33,7 @@ type
     MaxResponseBodyBytes: Int64;
     MaxResponseHeaderBytes: Integer;
     RequestTimeoutMilliseconds: QWord;
+    MaximumRedirects: Integer;
   end;
 
   EHTTPError = class(Exception);
@@ -41,6 +42,7 @@ const
   DEFAULT_MAX_RESPONSE_BODY_BYTES = Int64(64) * 1024 * 1024;
   DEFAULT_MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
   DEFAULT_REQUEST_TIMEOUT_MILLISECONDS = 120 * 1000;
+  DEFAULT_MAXIMUM_REDIRECTS = 20;
 
 function DefaultHTTPRequestOptions: THTTPRequestOptions;
 function HTTPGet(const AURL: string;
@@ -64,7 +66,6 @@ uses
   TransportSecurity;
 
 const
-  MAX_REDIRECTS   = 20;
   CRLF            = #13#10;
   RECV_BUF_SIZE   = 8192;
 
@@ -298,8 +299,8 @@ var
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
-  ReadSet, WriteSet: TFDSet;
-  ReadSetPointer, WriteSetPointer: PFDSet;
+  ExceptSet, ReadSet, WriteSet: TFDSet;
+  ExceptSetPointer, ReadSetPointer, WriteSetPointer: PFDSet;
   Timeout: TTimeVal;
   Ready: Integer;
   Remaining: Integer;
@@ -326,8 +327,10 @@ begin
   {$IFDEF MSWINDOWS}
   FillChar(ReadSet, SizeOf(ReadSet), 0);
   FillChar(WriteSet, SizeOf(WriteSet), 0);
+  FillChar(ExceptSet, SizeOf(ExceptSet), 0);
   ReadSetPointer := nil;
   WriteSetPointer := nil;
+  ExceptSetPointer := nil;
   if ARead then
   begin
     ReadSet.fd_count := 1;
@@ -340,11 +343,22 @@ begin
     WriteSet.fd_array[0] := ASock;
     WriteSetPointer := @WriteSet;
   end;
+  if ARead or AWrite then
+  begin
+    { Winsock may report a failed nonblocking connect only through the
+      exception set. Writability alone can therefore wait until the request
+      deadline even though SO_ERROR is already available. Callers still read
+      SO_ERROR or perform their send/receive operation after readiness. }
+    ExceptSet.fd_count := 1;
+    ExceptSet.fd_array[0] := ASock;
+    ExceptSetPointer := @ExceptSet;
+  end;
   Remaining := RemainingRequestMilliseconds(ADeadline,
     ATimeoutMilliseconds);
   Timeout.tv_sec := Remaining div 1000;
   Timeout.tv_usec := (Remaining mod 1000) * 1000;
-  Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer, nil, @Timeout);
+  Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer,
+    ExceptSetPointer, @Timeout);
   {$ENDIF}
   if Ready = 0 then
     RaiseRequestDeadline(ATimeoutMilliseconds);
@@ -986,6 +1000,8 @@ begin
       'HTTP maximum response header size is too large');
   if AOptions.RequestTimeoutMilliseconds = 0 then
     raise EHTTPError.Create('HTTP request timeout must be greater than zero');
+  if AOptions.MaximumRedirects < 0 then
+    raise EHTTPError.Create('HTTP maximum redirects must not be negative');
 end;
 
 function DoRequest(const AMethod, AURL: string;
@@ -1120,6 +1136,7 @@ begin
   Result.MaxResponseHeaderBytes := DEFAULT_MAX_RESPONSE_HEADER_BYTES;
   Result.RequestTimeoutMilliseconds :=
     DEFAULT_REQUEST_TIMEOUT_MILLISECONDS;
+  Result.MaximumRedirects := DEFAULT_MAXIMUM_REDIRECTS;
 end;
 
 function HTTPGet(const AURL: string;
@@ -1132,7 +1149,8 @@ function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions): THTTPResponse;
 begin
   try
-    Result := DoRequest('GET', AURL, AHeaders, AOptions, MAX_REDIRECTS);
+    Result := DoRequest('GET', AURL, AHeaders, AOptions,
+      AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
       raise EHTTPError.Create(E.Message);
@@ -1149,7 +1167,8 @@ function HTTPHead(const AURL: string; const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions): THTTPResponse;
 begin
   try
-    Result := DoRequest('HEAD', AURL, AHeaders, AOptions, MAX_REDIRECTS);
+    Result := DoRequest('HEAD', AURL, AHeaders, AOptions,
+      AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
       raise EHTTPError.Create(E.Message);

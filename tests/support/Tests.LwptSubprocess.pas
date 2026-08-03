@@ -52,6 +52,7 @@ type
     ProcessExitStatus: Integer;
     Stdout:   string;
     Stderr:   string;
+    TimedOut: Boolean;
   end;
 
 { Spawn the lwpt binary with the given arguments. Stdout + stderr are
@@ -64,6 +65,10 @@ function RunLwpt(const AArgs: array of string;
 function RunLwpt(const AArgs: array of string;
   const AInDir: string;
   const AExtraEnv: array of string): TLwptResult; overload;
+function RunLwpt(const AArgs: array of string;
+  const AInDir: string;
+  const AExtraEnv: array of string;
+  const ATimeoutMilliseconds: QWord): TLwptResult; overload;
 
 { Path to the lwpt binary. Defaults to './build/lwpt' resolved at the
   point of the call. Override via SetLwptBinaryPath when running
@@ -251,18 +256,30 @@ end;
 function RunLwpt(const AArgs: array of string;
   const AInDir: string;
   const AExtraEnv: array of string): TLwptResult;
+begin
+  Result := RunLwpt(AArgs, AInDir, AExtraEnv, 0);
+end;
+
+function RunLwpt(const AArgs: array of string;
+  const AInDir: string;
+  const AExtraEnv: array of string;
+  const ATimeoutMilliseconds: QWord): TLwptResult;
 var
   P: TProcess;
   i: Integer;
   SavedDir: string;
   WorkerLeaseTokenEnvironment: string;
   ForwardedWorkerLease: Boolean;
+  StartedAt, TerminatedAt: QWord;
+const
+  TERMINATION_GRACE_MILLISECONDS = 2000;
 begin
   Result.ExitCode := -1;
   Result.ProcessExitCode := -1;
   Result.ProcessExitStatus := -1;
   Result.Stdout   := '';
   Result.Stderr   := '';
+  Result.TimedOut := False;
 
   P := TProcess.Create(nil);
   try
@@ -298,13 +315,39 @@ begin
     SavedDir := GetCurrentDir;
     try
       P.Execute;
+      StartedAt := GetTickCount64;
       while P.Running do
       begin
         if P.Output.NumBytesAvailable > 0 then
           Result.Stdout := Result.Stdout + DrainStream(P.Output);
         if P.Stderr.NumBytesAvailable > 0 then
           Result.Stderr := Result.Stderr + DrainStream(P.Stderr);
+        if (ATimeoutMilliseconds > 0)
+           and (GetTickCount64 - StartedAt >= ATimeoutMilliseconds) then
+        begin
+          Result.TimedOut := True;
+          P.Terminate(1);
+          Break;
+        end;
         Sleep(10);
+      end;
+      if Result.TimedOut then
+      begin
+        TerminatedAt := GetTickCount64;
+        while P.Running
+          and (GetTickCount64 - TerminatedAt <
+            TERMINATION_GRACE_MILLISECONDS) do
+        begin
+          if P.Output.NumBytesAvailable > 0 then
+            Result.Stdout := Result.Stdout + DrainStream(P.Output);
+          if P.Stderr.NumBytesAvailable > 0 then
+            Result.Stderr := Result.Stderr + DrainStream(P.Stderr);
+          Sleep(10);
+        end;
+        if P.Running then
+          raise Exception.CreateFmt(
+            'timed-out lwpt subprocess did not terminate within %d ms',
+            [TERMINATION_GRACE_MILLISECONDS]);
       end;
       { final drain after exit }
       if P.Output.NumBytesAvailable > 0 then
