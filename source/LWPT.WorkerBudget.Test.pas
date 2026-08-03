@@ -273,7 +273,7 @@ var
   Lease : TLWPTWorkerLease;
   AcquiredPath, ReleasePath, OutputPath, ChildOutput, TmpPath,
     DelegationToken, RequestPath, OwnerPath, Kind, ParentOutput,
-    ChildRelease, ChildConsume, ChildAcquired : string;
+    ChildRelease, ChildConsume, ChildAcquired, CancellationError : string;
   Snapshot : TLWPTWorkerBudgetSnapshot;
   Lines, RequestLines, FirstEnvironment, SecondEnvironment : TStringList;
   Reclaimed : Integer;
@@ -799,6 +799,32 @@ begin
           + BoolToStr(Lease <> nil, True));
         Lease.Release;
         FreeAndNil(Lease);
+
+        Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+        FirstEnvironment := TStringList.Create;
+        try
+          AppendWorkerLeaseEnvironment(FirstEnvironment, Lease);
+          Lease.Release;
+          Refused := False;
+          CancellationError := '';
+          try
+            Lease.CancelPendingDelegation;
+          except
+            on E: ELWPTWorkerBudgetError do
+            begin
+              Refused := True;
+              CancellationError := E.Message;
+            end;
+          end;
+          Lines.Add('late-cancel-refused=' + BoolToStr(Refused, True));
+          Lines.Add('late-cancel-error=' + CancellationError);
+          Snapshot := GetWorkerBudgetSnapshot;
+          Lines.Add('active-after-late-cancel='
+            + IntToStr(Snapshot.ActiveWorkers));
+        finally
+          FirstEnvironment.Free;
+          FreeAndNil(Lease);
+        end;
       end;
       Lines.SaveToFile(OutputPath);
     finally
@@ -1828,6 +1854,11 @@ begin
       Values.Values['active-after-unconsumed-child'], -1)).ToBe(0);
     Expect<string>(Values.Values[
       'reacquired-after-unconsumed-child']).ToBe('True');
+    Expect<string>(Values.Values['late-cancel-refused']).ToBe('True');
+    Expect<Boolean>(Pos('must cancel before Release',
+      Values.Values['late-cancel-error']) > 0).ToBe(True);
+    Expect<Integer>(StrToIntDef(
+      Values.Values['active-after-late-cancel'], 0)).ToBe(1);
   finally
     Values.Free;
   end;

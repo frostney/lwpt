@@ -70,7 +70,13 @@ type
   public
     constructor Create(AOwner: TLWPTWorkerBudgetSession; const AToken: string);
     destructor Destroy; override;
+    { Release deliberately preserves a durable child handoff. A failed or
+      unconsumed child launch must cancel its delegation before releasing the
+      parent lease. }
     procedure Release;
+    { Cancel only a failed or unconsumed handoff, and call this before Release.
+      Calling it on an already released delegated wrapper is an ordering
+      error; it is not a pending-state query. }
     procedure CancelPendingDelegation;
   end;
 
@@ -1975,7 +1981,15 @@ end;
 
 procedure TLWPTWorkerLease.CancelPendingDelegation;
 begin
-  if FReleased or (FOwner = nil) or not FDelegated then Exit;
+  if FReleased then
+  begin
+    if FDelegated then
+      raise ELWPTWorkerBudgetError.Create(
+        'cannot cancel a worker delegation after releasing its parent lease; '
+        + 'failed or unconsumed child launches must cancel before Release');
+    Exit;
+  end;
+  if (FOwner = nil) or not FDelegated then Exit;
   FOwner.CancelPendingDelegation(Self);
 end;
 

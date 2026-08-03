@@ -577,12 +577,20 @@ begin
     try
       Code := RunProcess(AIndex, TestProcess, '', False, 0,
         'test executable', Output, StandardError);
-    finally
-      { A child normally consumes the one-shot token during startup. If it
-        never does, return the still-pending grant before this live scheduler
-        asks for another worker. Successful consumption makes this a no-op. }
-      ALease.CancelPendingDelegation;
+    except
+      try
+        ALease.CancelPendingDelegation;
+      except
+        { Preserve the process failure already unwinding this worker. Session
+          teardown remains the bounded fallback for a failed cancellation. }
+      end;
+      raise;
     end;
+    { A child normally consumes the one-shot token during startup. If it never
+      does, return the still-pending grant before this live scheduler asks for
+      another worker. On a normal process return, cancellation failure remains
+      a worker error so a live session cannot strand its remaining queue. }
+    ALease.CancelPendingDelegation;
   finally
     TestProcess.Free;
   end;
