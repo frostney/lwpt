@@ -648,6 +648,11 @@ begin
     Lease := nil;
     try
       Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
+      if Lease = nil then
+      begin
+        ExitCode := 3;
+        Exit(True);
+      end;
       WriteMarker(ParamStr(2), 'pid=' + IntToStr(GetProcessID));
       while not FileExists(ParamStr(3)) do Sleep(25);
     finally
