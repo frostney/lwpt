@@ -977,6 +977,24 @@ end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
+function TryReadWindowsProcessID(const APath: string;
+  out APID: Integer): Boolean;
+var
+  CandidatePID: Integer;
+begin
+  APID := -1;
+  Result := False;
+  try
+    if not FileExists(APath) then Exit;
+    if not TryStrToInt(Trim(ReadBinaryFile(APath)), CandidatePID) then Exit;
+    APID := CandidatePID;
+    Result := True;
+  except
+    { Cleanup is best-effort; the owning Job Object remains authoritative. }
+    APID := -1;
+  end;
+end;
+
 procedure TerminateWindowsProcess(const APID: Integer);
 var
   ProcessHandle: THandle;
@@ -1036,8 +1054,8 @@ begin
     CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
     Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   finally
-    if (CompilerPID < 0) and FileExists(PIDFile) then
-      TryStrToInt(Trim(ReadBinaryFile(PIDFile)), CompilerPID);
+    if CompilerPID < 0 then
+      TryReadWindowsProcessID(PIDFile, CompilerPID);
     try
       if Assigned(ControllerTree) then ControllerTree.Terminate;
     finally
