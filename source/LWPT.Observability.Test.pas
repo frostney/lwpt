@@ -59,6 +59,9 @@ begin
     end;
     Expect<Boolean>(RejectedZero).ToBe(True);
     Expect<Boolean>(ObservabilityInternalErrorExitCode <> 0).ToBe(True);
+    Expect<Integer>(NormalizeFailureExitCode(0)).ToBe(
+      ObservabilityInternalErrorExitCode);
+    Expect<Integer>(NormalizeFailureExitCode(17)).ToBe(17);
   finally
     Event.Free;
   end;
