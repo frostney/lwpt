@@ -34,6 +34,7 @@ const
   HOLD_CHILD_SWITCH = '--worker-budget-hold-child';
   DELEGATION_CRASH_SWITCH = '--worker-budget-delegation-crash';
   DELEGATION_RELEASE_SWITCH = '--worker-budget-delegation-release';
+  DELEGATED_CHILD_SESSION = 'orphan-child';
   SNAPSHOT_SWITCH = '--worker-budget-snapshot';
   REPAIR_SWITCH = '--worker-budget-repair';
   STATE_ROOT_FALLBACK_SWITCH = '--worker-state-root-fallback';
@@ -217,6 +218,19 @@ begin
   Result := FileExists(APath);
 end;
 
+function ReadMarkerText(const APath: string): string;
+var
+  Lines : TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(APath);
+    Result := Trim(Lines.Text);
+  finally
+    Lines.Free;
+  end;
+end;
+
 function InterruptFirstWorkerStateRootCreate(
   const ARoot: string): Boolean;
 begin
@@ -256,7 +270,8 @@ var
   Session : TLWPTWorkerBudgetSession;
   Lease : TLWPTWorkerLease;
   AcquiredPath, ReleasePath, OutputPath, ChildOutput, TmpPath,
-    DelegationToken, RequestPath, Kind, ParentOutput, ChildRelease : string;
+    DelegationToken, RequestPath, OwnerPath, Kind, ParentOutput,
+    ChildRelease : string;
   Snapshot : TLWPTWorkerBudgetSnapshot;
   Lines, RequestLines, FirstEnvironment, SecondEnvironment : TStringList;
   Reclaimed : Integer;
@@ -629,11 +644,16 @@ begin
 
   if (ParamCount = 3) and (ParamStr(1) = HOLD_CHILD_SWITCH) then
   begin
-    Session := TLWPTWorkerBudgetSession.Create('orphan-child', 1);
+    Session := TLWPTWorkerBudgetSession.Create(DELEGATED_CHILD_SESSION, 1);
     Lease := nil;
     try
       Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
-      WriteMarker(ParamStr(2), 'ready');
+      if Lease = nil then
+      begin
+        ExitCode := 3;
+        Exit(True);
+      end;
+      WriteMarker(ParamStr(2), 'pid=' + IntToStr(GetProcessID));
       while not FileExists(ParamStr(3)) do Sleep(25);
     finally
       Lease.Free;
@@ -668,6 +688,8 @@ begin
       Child.Execute;
       if not WaitForFile(ChildOutput, WAIT_TIMEOUT_MILLISECONDS) then
         raise Exception.Create('delegated child did not acquire its lease');
+      Lines.Add('spawned-child-pid=' + IntToStr(Child.ProcessID));
+      Lines.Add('ready-marker=' + ReadMarkerText(ChildOutput));
 
       Lease.Release;
       Lease.Free;
@@ -684,11 +706,28 @@ begin
       end
       else
       begin
+        RequestPath := WorkerStateRoot + '/'
+          + DELEGATED_CHILD_SESSION + '.request';
+        OwnerPath := WorkerStateRoot + '/'
+          + DELEGATED_CHILD_SESSION + '.owner';
+        Lines.Add('child-running-before-snapshot='
+          + BoolToStr(Child.Running, True));
+        Lines.Add('child-request-before-snapshot='
+          + BoolToStr(FileExists(RequestPath), True));
+        Lines.Add('child-owner-before-snapshot='
+          + BoolToStr(FileExists(OwnerPath), True));
         Snapshot := GetWorkerBudgetSnapshot;
         Lines.Add('active-during-child='
           + IntToStr(Snapshot.ActiveWorkers));
+        Lines.Add('entries-during-child='
+          + IntToStr(Length(Snapshot.Entries)));
+        Lines.Add('child-request-after-snapshot='
+          + BoolToStr(FileExists(RequestPath), True));
+        Lines.Add('child-owner-after-snapshot='
+          + BoolToStr(FileExists(OwnerPath), True));
         WriteMarker(ChildRelease, 'release');
         Child.WaitOnExit;
+        Lines.Add('child-exit-status=' + IntToStr(Child.ExitStatus));
         Snapshot := GetWorkerBudgetSnapshot;
         Lines.Add('active-after-child='
           + IntToStr(Snapshot.ActiveWorkers));
@@ -1699,6 +1738,11 @@ begin
   try
     RunUtility(DELEGATION_RELEASE_SWITCH, OutputPath);
     Values := ReadUtilityValues(OutputPath);
+    if (StrToIntDef(
+      Values.Values['parent-granted-after-delegation'], -1) <> 0)
+       or (StrToIntDef(Values.Values['active-during-child'], 0) <> 1)
+       or (StrToIntDef(Values.Values['active-after-child'], -1) <> 0) then
+      Fail('worker delegation evidence:' + LineEnding + Values.Text);
     Expect<Integer>(StrToIntDef(
       Values.Values['parent-granted-after-delegation'], -1)).ToBe(0);
     Expect<Integer>(StrToIntDef(
