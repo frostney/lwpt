@@ -988,7 +988,7 @@ var
           Session.SessionID, WaitTick - WaitStartedAt);
         try
           Reporter.ReportWaitHeartbeat(WaitEvent,
-            'waiting for postbuild worker capacity');
+            'waiting for postbuild worker capacity', WaitTick);
         finally
           WaitEvent.Free;
         end;

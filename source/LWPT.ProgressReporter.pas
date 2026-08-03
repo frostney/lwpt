@@ -50,7 +50,7 @@ type
     function ActiveJobSummary(const ANow: QWord): string;
     procedure ReportHeartbeat(const AEvent: TLWPTHeartbeatEvent);
     procedure ReportWaitHeartbeat(const AEvent: TLWPTHeartbeatEvent;
-      const AMessage: string);
+      const AMessage: string; const AObservedAt: QWord);
     procedure ReportJob(const AEvent: TLWPTJobEvent;
       const AOutput, AErrorMessage: string; const AVerbose: Boolean;
       const AStartedAt: QWord = 0);
@@ -213,10 +213,12 @@ begin
 end;
 
 procedure TLWPTProgressReporter.ReportWaitHeartbeat(
-  const AEvent: TLWPTHeartbeatEvent; const AMessage: string);
+  const AEvent: TLWPTHeartbeatEvent; const AMessage: string;
+  const AObservedAt: QWord);
 begin
   WriteLn(ObservabilityHeartbeatEvent, AMessage, ' ',
     FormatElapsedMilliseconds(AEvent.ElapsedMilliseconds));
+  FLastHeartbeatAt := AObservedAt;
 end;
 
 procedure TLWPTProgressReporter.WriteCapturedOutput(const AOutput: string);
@@ -295,10 +297,15 @@ begin
     WriteCapturedOutput(LogOutput);
   if (AErrorMessage <> '') and (Pos(AErrorMessage, LogOutput) = 0) then
     WriteLn('  error: ', AErrorMessage);
-  if (FStyle = lpsBuild) and (AEvent.State in [ojsFailed, ojsSkipped])
-     and (AErrorMessage <> '') then
-    WriteLn(ErrOutput, '  build entry "', DisplayName, '" failed: ',
-      AErrorMessage);
+  if (FStyle = lpsBuild) and (AErrorMessage <> '') then
+    case AEvent.State of
+      ojsFailed:
+        WriteLn(ErrOutput, '  build entry "', DisplayName, '" failed: ',
+          AErrorMessage);
+      ojsSkipped:
+        WriteLn(ErrOutput, '  build entry "', DisplayName, '" skipped: ',
+          AErrorMessage);
+    end;
 end;
 
 end.
