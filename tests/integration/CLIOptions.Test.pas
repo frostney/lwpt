@@ -123,14 +123,14 @@ begin
     'end.'#10);
 
   WriteTextFile(FScratch + '/scripts/child-success.pas',
-    '#!/usr/bin/env instantfpc'#10 +
     'program ChildSuccess;'#10 +
+    '{$mode delphi}{$H+}'#10 +
     'begin'#10 +
     '  WriteLn(''successful-child-output'');'#10 +
     'end.'#10);
   WriteTextFile(FScratch + '/scripts/child-failure.pas',
-    '#!/usr/bin/env instantfpc'#10 +
     'program ChildFailure;'#10 +
+    '{$mode delphi}{$H+}'#10 +
     'begin'#10 +
     '  Write(''failed-child-output'');'#10 +
     '  Halt(7);'#10 +
