@@ -31,6 +31,7 @@ uses
   LWPT.Manifest,
   LWPT.Observability,
   LWPT.ProcessRunner,
+  LWPT.ProcessTree,
   LWPT.ProgressReporter,
   LWPT.WorkerBudget;
 
@@ -431,28 +432,49 @@ end;
 
 procedure TTestScheduler.CancelPendingAndActiveLocked;
 var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
   i: Integer;
+
+  procedure RecordCancellationFailure(const AIndex: Integer;
+    const AMessage: string);
+  begin
+    { BeginCancel can fail after forwarding termination. CompleteCancel must
+      still run for that runner, but a secondary reap error must not replace
+      the first failure that explains why cancellation became unhealthy. }
+    if (FJobs[AIndex].Status <> tjsWorkerError)
+       or (FJobs[AIndex].ErrorMessage = '') then
+    begin
+      FJobs[AIndex].Status := tjsWorkerError;
+      FJobs[AIndex].ExitCode := ObservabilityInternalErrorExitCode;
+      FJobs[AIndex].ErrorMessage := 'process-tree termination failed: '
+        + AMessage;
+    end;
+    if FInternalError = '' then
+      FInternalError := FJobs[AIndex].ErrorMessage;
+  end;
 begin
   FCancelled := True;
+  TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
+    AcknowledgementDeadline);
   for i := 0 to High(FJobs) do
   begin
     if FJobs[i].Status = tjsPending then
       FJobs[i].Status := tjsCancelled;
     if FJobs[i].ActiveProcessRunner <> nil then
       try
-        FJobs[i].ActiveProcessRunner.Cancel;
+        FJobs[i].ActiveProcessRunner.BeginCancel(DescendantDeadline,
+          AcknowledgementDeadline);
       except
-        on E: Exception do
-        begin
-          FJobs[i].Status := tjsWorkerError;
-          FJobs[i].ExitCode := ObservabilityInternalErrorExitCode;
-          FJobs[i].ErrorMessage := 'process-tree termination failed: '
-            + E.Message;
-          if FInternalError = '' then
-            FInternalError := FJobs[i].ErrorMessage;
-        end;
+        on E: Exception do RecordCancellationFailure(i, E.Message);
       end;
   end;
+  for i := 0 to High(FJobs) do
+    if FJobs[i].ActiveProcessRunner <> nil then
+      try
+        FJobs[i].ActiveProcessRunner.CompleteCancel;
+      except
+        on E: Exception do RecordCancellationFailure(i, E.Message);
+      end;
 end;
 
 procedure TTestScheduler.FailJob(const AIndex: Integer;

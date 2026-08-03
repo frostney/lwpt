@@ -50,7 +50,8 @@ uses
   LWPT.BuildSession,
   LWPT.CompilerDriver.FPC,
   LWPT.OutputRenderer,
-  LWPT.ProcessRunner;
+  LWPT.ProcessRunner,
+  LWPT.ProcessTree;
 
 procedure CaptureSilentProcessChunk(const AData: RawByteString;
   const AStandardError: Boolean);
@@ -196,7 +197,7 @@ begin
       Request, ABuildRoot, Driver);
     try
       P.Options := [poUsePipes, poStderrToOutPut];
-      P.Execute;
+      ExecuteUnmanagedProcess(P);
       repeat
         BytesRead := P.Output.Read(Buffer[0], SizeOf(Buffer));
         if BytesRead > 0 then
@@ -343,8 +344,8 @@ begin
       end
       else
       begin
-        P.Options := [poWaitOnExit];
-        P.Execute;
+        ExecuteUnmanagedProcess(P);
+        P.WaitOnExit;
         Result := P.ExitStatus;
       end;
     except
