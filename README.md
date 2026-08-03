@@ -1,7 +1,7 @@
 # LWPT — lightweight Pascal toolkit
 
 A small, dependency-light toolkit for FreePascal / Delphi projects.
-One executable, ten subcommands, driven by a single `lwpt.toml`
+One executable, eleven subcommands, driven by a single `lwpt.toml`
 manifest. Zero-install by default — `git clone && fpc @lwpt.cfg`
 builds a project without running `lwpt install` first.
 
@@ -12,20 +12,20 @@ lwpt add       add a dependency to lwpt.toml + install it   [--name <name>]
 lwpt remove    remove dependencies from lwpt.toml + prune their modules
 lwpt build     compile manifest build entries   [--mode dev|release] [--clean] [--jobs N]
 lwpt format    format uses-clauses + identifiers   [--check]
+lwpt duplication report manifest-scoped Pascal token clones   [--json]
 lwpt test      discover, compile and run *.Test.pas files   [--jobs N] [--bail N]
 lwpt repair    reclaim install, build-session, and worker-lease residue
 lwpt run       invoke a user-declared run-script (or alias a subcommand)
+lwpt health    report Pascal complexity and optional Git hotspots   [--json] [--hotspots]
 lwpt agents    write/verify the agent-facing command reference in AGENTS.md   [--check]
 ```
 
 ## Status
 
-LWPT is pre-1.0. The package model, install pipeline, formatter, test
-runner, and release flow are in place; the deferred customer-facing contracts
-[link-check](https://github.com/frostney/lwpt/issues/31),
-[duplication](https://github.com/frostney/lwpt/issues/32), and
-[codebase-health](https://github.com/frostney/lwpt/issues/33) are tracked
-separately from the project-only release architecture check originally deferred by
+LWPT is pre-1.0. The package model, install pipeline, formatter, test runner,
+duplication analysis, codebase-health report, and release flow are in place.
+The project-only release architecture check remains separate from the customer
+commands originally deferred by
 [ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md). See
 [`AGENTS.md`](./AGENTS.md) for the full operating manual and
 [`docs/adr/`](./docs/adr/) for the architectural decisions that shape
@@ -51,12 +51,16 @@ bootstrap.bat      # Windows
 ./build/lwpt build <entry>      # single build entry
 ./build/lwpt format             # rewrite project sources to canonical style
 ./build/lwpt format --check     # exit non-zero on any deviation
+./build/lwpt duplication        # deterministic human clone report
+./build/lwpt duplication --json # versioned machine-readable envelope
 ./build/lwpt test               # discover/compile/run *.Test.pas
 ./build/lwpt install            # fetch any new deps
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt repair             # recover install, build, and worker residue
+./build/lwpt health             # deterministic complexity report
+./build/lwpt health --hotspots  # add local Git churn and hotspot ranking
 ```
 
 ## Architecture

@@ -136,10 +136,12 @@ begin
   Expect<Boolean>(Pos('install', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('build',   R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('format',  R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('duplication', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('test',    R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('repair',  R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('init',    R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('run',     R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('health',  R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('agents',  R.Stdout) > 0).ToBe(True);
   { Per ADR-0015, `export` is gone — verify it's NOT listed. }
   Expect<Boolean>(Pos('export',  R.Stdout) > 0).ToBe(False);

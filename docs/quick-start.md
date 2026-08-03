@@ -46,7 +46,7 @@ Both code paths are dev-mode only; release builds always go through `./build/lwp
 After bootstrap:
 
 ```sh
-./build/lwpt --help     # top-level help; lists the 10 subcommands
+./build/lwpt --help     # top-level help; lists the 11 subcommands
 ```
 
 ## Daily commands
@@ -63,6 +63,9 @@ After bootstrap:
 
 ./build/lwpt format             # rewrite sources to canonical style
 ./build/lwpt format --check     # exit non-zero on any deviation
+
+./build/lwpt duplication        # report manifest-scoped Pascal clones
+./build/lwpt duplication --json # emit the deterministic analysis envelope
 
 ./build/lwpt test               # discover/compile/run *.Test.pas
 
