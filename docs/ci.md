@@ -1,17 +1,20 @@
 # CI
 
-Four GitHub Actions workflows, mirroring the GocciaScript pattern used by the packages now canonical in LWPT. The split is **build once on macOS / test natively on every target**.
+Six GitHub Actions workflows, mirroring the GocciaScript pattern used by the packages now canonical in LWPT. The primary split is **build once on macOS / test natively on every target**; two supplementary workflows route stacked-PR admission and provide a manual licensed-backend smoke.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch` | Build + cache the cross-FPC toolchain |
+| `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch`, weekly `schedule` | Build + cache the cross-FPC toolchain |
 | `ci.yml` | `push` to `main`, `workflow_dispatch` | Post-merge confirmation: full 6-target cross-build + native test matrix on the merged main tree |
 | `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: Ubuntu leg (default tier + live-network e2e per #102), native aarch64-darwin leg (default tier), win64 leg (cross-compile, then native offline test run on `windows-latest`); typical wall-clock < 10 min warm, hard caps 15 min (e2e step) / 20 min (darwin job) |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
+| `stack-ci-router.yml` | `pull_request` label event | Rerun `pr.yml` for an exact same-repository `codex/stack-*` head only after `stack:managed` and `ci:ready` admit it |
+| `delphi-native.yml` | `workflow_dispatch` | Optional Delphi 12+ Win64 smoke on a licensed self-hosted runner; never a required gate |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
 - **PRs go through `pr.yml` only** — an Ubuntu leg (default tier plus the live-network e2e tier per [issue #102](https://github.com/frostney/lwpt/issues/102)), a native aarch64-darwin leg (default tier), and a win64 leg: cross-compile on macOS, then the offline default test tier natively on `windows-latest`. Cheap signal so PR authors aren't blocked on the full 6-target matrix per push.
+- **Managed stacks admit CI explicitly** — the first `pr.yml` run skips its expensive matrix until a same-repository `codex/stack-*` PR has both `stack:managed` and `ci:ready`. `stack-ci-router.yml` then reruns that completed workflow for the exact admitted head; unrelated labels, forks, and ordinary PRs cannot use the router.
 - **`ci.yml` runs only on `push` to `main`** — i.e. after merge. This is where the heavyweight 6-target cross-build + native test matrix lives. A PR that introduces a regression on the legs the gate still omits (`x86_64-darwin`, `aarch64-linux`, `i386-win32`, non-Linux e2e) will pass `pr.yml` and fail the post-merge `ci.yml` run; the maintainer then reverts or forwards-fixes from `main`. The trade-off is conscious and has narrowed over time: Windows (win64) was the first carve-out (added after PR #17 merged green with a `SysUtils.FindClose` vs `Windows.FindClose` shadowing break that PR #21 had to fix on `main`), and #102 added the Linux e2e step and the native aarch64-darwin leg after the #84/#105 escape classes.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
@@ -25,6 +28,13 @@ tag updates or deletion. The protected `release` environment provides the
 explicit approval gate between successful builds and publication.
 
 ## Workflows
+
+### `stack-ci-router.yml` — managed-stack admission
+
+The router handles no pull-request code itself. On the `ci:ready` label event,
+it verifies the managed-stack label, same-repository ownership, and
+`codex/stack-*` branch boundary, then reruns the completed `pr.yml` workflow
+whose head SHA and pull-request number exactly match the admitted PR.
 
 ### `toolchain.yml` — cross-FPC toolchain build
 
@@ -175,6 +185,19 @@ The scripts mirror the shape of [GocciaScript's installers](https://gocciascript
 - `toolchain.yml`: invoked by `ci.yml`, `pr.yml`, and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming and a weekly `schedule` cron (Mondays 05:00 UTC) that keeps the default-branch cache warm
 
 A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` after merge, OR `release.yml` after tag), not both. PRs trigger only the cheap `pr.yml` (whose single win64 cross-compile rides the cached toolchain).
+
+### `delphi-native.yml` — licensed backend smoke
+
+The Delphi driver is covered in ordinary CI by deterministic translation,
+probing, target-matrix, diagnostic, and artifact-publication fixtures. A real
+compiler invocation needs a licensed installation, so native execution is a
+manual, non-required workflow on a maintainer-provisioned runner carrying the
+`self-hosted`, `windows`, and `delphi` labels. The dispatcher supplies the
+absolute `dcc64.exe` path. The workflow verifies FPC 3.2.2 for LWPT's own
+bootstrap, builds a scratch Win64 console project through the `delphi` profile,
+and runs the resulting executable. It does not run on pull requests, pushes,
+tags, or schedules and cannot consume hosted-runner minutes while no licensed
+runner is available.
 
 ## When to bump `CACHE_VERSION`
 

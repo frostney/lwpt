@@ -1,0 +1,14 @@
+compile
+source dir/main file.pas
+-o
+build/private dir/app name.wasm
+-Fu
+source dir
+-Fu
+.lwpt/modules/example package
+-Fu
+cfg only dependency
+-d
+FEATURE
+--no-cache
+--no-inline

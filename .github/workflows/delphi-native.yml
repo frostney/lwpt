@@ -1,0 +1,93 @@
+name: Delphi native smoke
+
+# Delphi is an opt-in backend and licensed tooling is not available on GitHub's
+# hosted runners. This manual, non-required workflow runs only on a maintainer-
+# provisioned Windows runner carrying the self-hosted, windows, and delphi
+# labels. It never participates in the ordinary PR, main, or release gates.
+on:
+  workflow_dispatch:
+    inputs:
+      compiler:
+        description: Absolute path to a Delphi 12+ Win64 compiler
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  native-smoke:
+    runs-on: [self-hosted, windows, delphi]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Verify the LWPT bootstrap compiler
+        shell: pwsh
+        run: |
+          $version = (& fpc -iV).Trim()
+          if ($version -ne '3.2.2') {
+            throw "LWPT requires FPC 3.2.2 for this smoke; found $version"
+          }
+
+      - name: Bootstrap LWPT
+        shell: cmd
+        run: bootstrap.bat
+
+      - name: Compile and run a Delphi Win64 consumer
+        shell: pwsh
+        env:
+          DELPHI_COMPILER: ${{ inputs.compiler }}
+        run: |
+          if (-not [System.IO.Path]::IsPathFullyQualified($env:DELPHI_COMPILER)) {
+            throw "Configured Delphi compiler path must be absolute: $env:DELPHI_COMPILER"
+          }
+          if (-not (Test-Path -LiteralPath $env:DELPHI_COMPILER -PathType Leaf)) {
+            throw "Configured Delphi compiler is not a file: $env:DELPHI_COMPILER"
+          }
+
+          $root = (Get-Location).Path
+          $project = Join-Path $root 'build\delphi-native-smoke'
+          $source = Join-Path $project 'source'
+          New-Item -ItemType Directory -Force -Path $source | Out-Null
+          @'
+          program Hello;
+          begin
+            Writeln('delphi-native-ok');
+          end.
+          '@ | Set-Content -LiteralPath (Join-Path $source 'Hello.dpr') -Encoding utf8
+
+          $compiler = $env:DELPHI_COMPILER.Replace('\', '/')
+          @"
+          [package]
+          name = "delphi-native-smoke"
+          version = "0.0.0"
+          units = ["source"]
+
+          [build]
+          hello = { source = "source/Hello.dpr", output = "build/hello.exe" }
+
+          [compiler]
+          default = "delphi-win64"
+
+          [compiler.profiles.delphi-win64]
+          driver = "delphi"
+          executable = "$compiler"
+          version = ">=36.0.0"
+          "@ | Set-Content -LiteralPath (Join-Path $project 'lwpt.toml') -Encoding utf8
+
+          Push-Location $project
+          try {
+            & (Join-Path $root 'build\lwpt.exe') build --clean
+            if ($LASTEXITCODE -ne 0) {
+              throw "Delphi-backed LWPT build failed with exit code $LASTEXITCODE"
+            }
+            $output = (& '.\build\hello.exe').Trim()
+            if ($output -ne 'delphi-native-ok') {
+              throw "Unexpected Delphi smoke output: $output"
+            }
+          }
+          finally {
+            Pop-Location
+          }
