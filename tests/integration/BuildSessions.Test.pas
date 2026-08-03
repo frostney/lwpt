@@ -124,6 +124,29 @@ begin
   if not SawAny then WriteLn('  (no ready files)');
 end;
 
+procedure DumpObservableFailure(const ALabel, AProject,
+  AWorkerStateRoot: string; const AWorkerRootExistedBefore,
+  ATransactionLockExistedBefore: Boolean; const ARun: TLwptResult);
+begin
+  DumpRunFailure(ALabel, ARun, 0);
+  if ARun.ExitCode = 0 then Exit;
+  { The two historical failures lost the nested command's identity among
+    concurrently replayed build output. Record the read-only roots that
+    distinguish a missing-root transaction race from a failure after an
+    already-created worker root without mutating either state machine. }
+  WriteLn('RUN STATE [', ALabel, '] worker-root=', AWorkerStateRoot,
+    ' existed-before=', BoolToStr(AWorkerRootExistedBefore, True),
+    ' exists-after=', BoolToStr(DirectoryExists(AWorkerStateRoot), True),
+    ' transaction-lock-before=', BoolToStr(
+      ATransactionLockExistedBefore, True), ' transaction-lock-after=',
+    BoolToStr(FileExists(
+      IncludeTrailingPathDelimiter(AWorkerStateRoot)
+      + 'transaction.lock'), True));
+  WriteLn('RUN STATE [', ALabel, '] sessions-root=', AProject,
+    '/.lwpt/sessions exists=', BoolToStr(DirectoryExists(AProject
+      + '/.lwpt/sessions'), True));
+end;
+
 function RunProgram(const APath: string): Integer;
 var
   Process: TProcess;
@@ -964,7 +987,8 @@ var
   Project, RealFPC: string;
   Environment, QuietEnvironment: array of string;
   RunResult: TLwptResult;
-  LogReference: string;
+  LogReference, WorkerStateRoot, WorkerTransactionLock: string;
+  WorkerRootExistedBefore, TransactionLockExistedBefore: Boolean;
 begin
   Project := FScratch + '/observable-graph';
   WriteGraphProject(Project);
@@ -987,19 +1011,34 @@ begin
   Environment[5] := ObservabilityHeartbeatIntervalEnvironment + '='
     + IntToStr(TestHeartbeatIntervalMilliseconds);
   Environment[6] := WORKER_BUDGET_ENV + '=4';
+  WorkerStateRoot := FScratch + '/worker-state';
+  WorkerTransactionLock := IncludeTrailingPathDelimiter(WorkerStateRoot)
+    + 'transaction.lock';
   try
+    WorkerRootExistedBefore := DirectoryExists(WorkerStateRoot);
+    TransactionLockExistedBefore := FileExists(WorkerTransactionLock);
     RunResult := RunLwptWithWorkerEnv(
       ['build', 'alpha', 'beta'], Project, QuietEnvironment);
-    DumpRunFailure('observable: quiet build', RunResult, 0);
+    DumpObservableFailure('observable: quiet build', Project,
+      WorkerStateRoot, WorkerRootExistedBefore,
+      TransactionLockExistedBefore, RunResult);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
+    Expect<Integer>(RunResult.ProcessExitCode).ToBe(0);
+    Expect<Integer>(RunResult.ProcessExitStatus).ToBe(0);
     Expect<Boolean>(Pos('alpha-begin|', RunResult.Stdout) = 0).ToBe(True);
     Expect<Boolean>(Pos('beta-begin|', RunResult.Stdout) = 0).ToBe(True);
     Expect<Boolean>(Pos('HEARTBEAT ', RunResult.Stdout) = 0).ToBe(True);
 
+    WorkerRootExistedBefore := DirectoryExists(WorkerStateRoot);
+    TransactionLockExistedBefore := FileExists(WorkerTransactionLock);
     RunResult := RunLwptWithWorkerEnv(
       ['build', 'alpha', 'beta', '--verbose'], Project, Environment);
-    DumpRunFailure('observable: verbose build', RunResult, 0);
+    DumpObservableFailure('observable: verbose build', Project,
+      WorkerStateRoot, WorkerRootExistedBefore,
+      TransactionLockExistedBefore, RunResult);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
+    Expect<Integer>(RunResult.ProcessExitCode).ToBe(0);
+    Expect<Integer>(RunResult.ProcessExitStatus).ToBe(0);
     Expect<Boolean>(Pos('discovered 2 build entry(s)', RunResult.Stdout) > 0)
       .ToBe(True);
     Expect<Boolean>(Pos('build session: ', RunResult.Stdout) > 0).ToBe(True);

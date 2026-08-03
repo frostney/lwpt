@@ -48,6 +48,8 @@ uses
 type
   TLwptResult = record
     ExitCode: Integer;
+    ProcessExitCode: Integer;
+    ProcessExitStatus: Integer;
     Stdout:   string;
     Stderr:   string;
   end;
@@ -257,6 +259,8 @@ var
   ForwardedWorkerLease: Boolean;
 begin
   Result.ExitCode := -1;
+  Result.ProcessExitCode := -1;
+  Result.ProcessExitStatus := -1;
   Result.Stdout   := '';
   Result.Stderr   := '';
 
@@ -314,9 +318,11 @@ begin
         ExitCode collapses most failures to 0. ExitStatus is nonzero on
         genuine failure either way, so trust it when ExitCode claims
         success. }
-      Result.ExitCode := P.ExitCode;
-      if (Result.ExitCode = 0) and (P.ExitStatus <> 0) then
-        Result.ExitCode := P.ExitStatus;
+      Result.ProcessExitCode := P.ExitCode;
+      Result.ProcessExitStatus := P.ExitStatus;
+      Result.ExitCode := Result.ProcessExitCode;
+      if (Result.ExitCode = 0) and (Result.ProcessExitStatus <> 0) then
+        Result.ExitCode := Result.ProcessExitStatus;
       { A test process may invoke LWPT more than once. Once a nested build or
         test scheduler starts, it has consumed the one-shot worker delegation;
         stop forwarding that stale token so the next command can join the
@@ -341,7 +347,8 @@ procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
 begin
   if ARun.ExitCode = AExpectedExit then Exit;
   WriteLn('RUN FAILURE [', ALabel, '] exit=', ARun.ExitCode,
-    ' expected=', AExpectedExit);
+    ' expected=', AExpectedExit, ' process-exit-code=',
+    ARun.ProcessExitCode, ' process-exit-status=', ARun.ProcessExitStatus);
   WriteLn('--- captured stdout ---');
   WriteLn(ARun.Stdout);
   WriteLn('--- captured stderr ---');
