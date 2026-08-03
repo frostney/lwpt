@@ -923,25 +923,136 @@ end;
 
 procedure TTestScheduling.TestMissingTerminationAcknowledgementFailsCancellation;
 var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
+  Child: TProcess;
+  ChildReaped: Boolean;
+  ChildTree: TLWPTProcessTree;
+  CleanupAbandoned: Boolean;
   CompilerPID: Integer;
+  Environment: array of string;
   PIDFile: string;
-  CommandResult: TLwptResult;
-begin
-  ResetProject(0);
-  PIDFile := FScratch + '/control/missing-acknowledgement-compiler-pid';
-  WriteTextFile(FScratch + '/tests/A.Slow.Test.pas',
-    'program SlowCompilerInput; begin end.'#10);
-  WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
-    'program MissingRuntimeBinaryInput; begin end.'#10);
+  Raised: Boolean;
+  Started: TDateTime;
+  WaitThread: TProcessWaitThread;
+  WaitThreadStarted: Boolean;
+  {$IFDEF MSWINDOWS}
+  ChildProcessHandle: THandle;
+  {$ENDIF}
 
-  CommandResult := RunTestsWithCompilerProxy(['--jobs=2'],
-    MissingAcknowledgementCompilerProxyMode, PIDFile);
-  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
-  CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
-  Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
-  Expect<Boolean>(Pos('termination acknowledgement was not received',
-    CommandResult.Stdout) > 0).ToBe(True);
+  procedure JoinWaitThreadAfterBoundedExit;
+  var
+    ExitStarted: TDateTime;
+    NativeTerminationAttempted, NativeTerminationSucceeded: Boolean;
+  begin
+    ExitStarted := Now;
+    while ProcessIsRunning(CompilerPID)
+      and ((Now - ExitStarted) * SecondsPerDay
+        < ProcessExitCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if ProcessIsRunning(CompilerPID) then
+    begin
+      try
+        ChildTree.Terminate;
+      except
+        { Native termination below is the cleanup fallback. }
+      end;
+      NativeTerminationAttempted := False;
+      NativeTerminationSucceeded := False;
+      if ProcessIsRunning(CompilerPID) then
+      begin
+        NativeTerminationAttempted := True;
+        {$IFDEF UNIX}
+        NativeTerminationSucceeded := FpKill(CompilerPID, SIGKILL) = 0;
+        {$ENDIF}
+        {$IFDEF MSWINDOWS}
+        if ChildProcessHandle <> 0 then
+          NativeTerminationSucceeded :=
+            Windows.TerminateProcess(ChildProcessHandle, 1);
+        {$ENDIF}
+      end;
+      ExitStarted := Now;
+      while ProcessIsRunning(CompilerPID)
+        and ((Now - ExitStarted) * SecondsPerDay
+          < ProcessExitCeilingSeconds) do
+        Sleep(ProcessPollMilliseconds);
+      if ProcessIsRunning(CompilerPID) then
+      begin
+        { WaitThread still owns Child, so a bounded test failure must leave
+          both objects alive rather than enter an unbounded join or free an
+          object that the thread can still access. }
+        CleanupAbandoned := True;
+        Fail('missing-acknowledgement child remained alive after forced cleanup'
+          + ' (native termination attempted: '
+          + BoolToStr(NativeTerminationAttempted, True)
+          + '; succeeded: '
+          + BoolToStr(NativeTerminationSucceeded, True) + ')');
+      end;
+    end;
+    WaitThread.WaitFor;
+    ChildReaped := True;
+  end;
+begin
+  PIDFile := FScratch + '/control/missing-acknowledgement-compiler-pid';
+  SetLength(Environment, 2);
+  Environment[0] := ProcessTreeProxyModeEnvironment + '='
+    + MissingAcknowledgementCompilerProxyMode;
+  Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + PIDFile;
+  Child := TProcess.Create(nil);
+  ChildTree := TLWPTProcessTree.Create(Child);
+  ChildReaped := False;
+  CleanupAbandoned := False;
+  CompilerPID := 0;
+  WaitThread := nil;
+  WaitThreadStarted := False;
+  {$IFDEF MSWINDOWS}
+  ChildProcessHandle := 0;
+  {$ENDIF}
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    Child.Parameters.Add('A.Slow.Test.pas');
+    ConfigureProcessEnvironment(Child, Environment);
+    ChildTree.Execute;
+    Started := Now;
+    while (not FileExists(PIDFile)) and Child.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if not FileExists(PIDFile) then
+      Fail('missing-acknowledgement child did not publish its PID');
+    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+    {$IFDEF MSWINDOWS}
+    ChildProcessHandle := Child.ProcessHandle;
+    {$ENDIF}
+
+    WaitThread := TProcessWaitThread.Create(Child);
+    WaitThread.Start;
+    WaitThreadStarted := True;
+    TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
+      AcknowledgementDeadline);
+    ChildTree.BeginTermination(DescendantDeadline,
+      AcknowledgementDeadline);
+    Raised := False;
+    try
+      ChildTree.CompleteTermination;
+    except
+      on E: EOSError do
+        Raised := Pos('termination acknowledgement was not received',
+          E.Message) > 0;
+    end;
+    JoinWaitThreadAfterBoundedExit;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+  finally
+    if not CleanupAbandoned then
+    begin
+      if WaitThreadStarted and not ChildReaped then
+        JoinWaitThreadAfterBoundedExit
+      else if Child.Running then Child.Terminate(1);
+      WaitThread.Free;
+      ChildTree.Free;
+      Child.Free;
+    end;
+  end;
 end;
 
 procedure TTestScheduling.TestSuccessfulTerminationAcknowledgementCompletesCancellation;
