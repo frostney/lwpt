@@ -8,6 +8,9 @@ uses
   BaseUnix,
   cthreads,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -20,28 +23,113 @@ uses
 
   LWPT.BuildSession,
   LWPT.Core,
+  LWPT.ProcessTree,
   LWPT.ProgressReporter,
   LWPT.WorkerBudget;
 
 const
   CancellationCompletionCeilingSeconds = 12;
+  AcknowledgementSuccessExitDelayMilliseconds = 300;
   CompilerExecutableEnvironment = PROJECT_NAME + '_FPC';
   IgnoreTerminateCompilerProxyMode = 'ignore-term';
   LongRunningFixtureMilliseconds = 15000;
   MarkerWaitCeilingSeconds = 5;
   ProcessExitCeilingSeconds = 8;
   ProcessStartupCeilingSeconds = 10;
+  WindowsControllerCompletionCeilingSeconds =
+    ProcessStartupCeilingSeconds + ProcessExitCeilingSeconds + 2;
+  ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
+  ProcessCaptureOverflowHoldMilliseconds = 2000;
+  SiblingFanoutCeilingMilliseconds = 1500;
   ProcessTreeProxyModeEnvironment = PROJECT_NAME
     + '_PROCESS_TREE_TEST_PROXY_MODE';
   ProcessTreeProxyPIDFileEnvironment = PROJECT_NAME
     + '_PROCESS_TREE_TEST_PID_FILE';
+  ManagedProcessTreeEnvironment = PROJECT_NAME + '_PROCESS_TREE_PARENT';
+  ProcessTreeStatusHandleEnvironment = PROJECT_NAME
+    + '_PROCESS_TREE_STATUS_HANDLE';
+  ProcessTreeControlHandleEnvironment = PROJECT_NAME
+    + '_PROCESS_TREE_CONTROL_HANDLE';
+  ProcessTreeChannelTokenEnvironment = PROJECT_NAME
+    + '_PROCESS_TREE_CHANNEL_TOKEN';
+  ProcessTreeAcknowledgementProtocol = PROJECT_NAME + '-ACK/1';
+  SiblingCancellationStartedSuffix = '-cancellation-started';
+  SiblingSlowSources: array[0..5] of string = (
+    'A.Slow.Test.pas', 'C.Slow.Test.pas', 'D.Slow.Test.pas',
+    'E.Slow.Test.pas', 'F.Slow.Test.pas', 'G.Slow.Test.pas');
   SlowCompilerProxyMode = 'slow';
   WorkerErrorCompilerProxyMode = 'worker-error';
+  SuccessfulAcknowledgementCompilerProxyMode = 'successful-acknowledgement';
+  FailedAcknowledgementCompilerProxyMode = 'failed-acknowledgement';
+  CleanAcknowledgementExitProxyMode = 'clean-acknowledgement-exit';
+  MissingAcknowledgementCompilerProxyMode = 'missing-acknowledgement';
+  MissingAcknowledgementSiblingCompilerProxyMode =
+    'missing-acknowledgement-siblings';
+  ImmediateAcknowledgementLeafProxyMode = 'immediate-acknowledgement-leaf';
+  InheritedChannelProbeProxyMode = 'inherited-channel-probe';
+  SuccessfulAcknowledgementLeafProxyMode = 'successful-acknowledgement-leaf';
+  FailedAcknowledgementLeafProxyMode = 'failed-acknowledgement-leaf';
+  {$IFDEF MSWINDOWS}
+  WindowsConsoleControllerOption = '--' + PROGRAM_NAME
+    + '-console-controller';
+  WindowsControlExitCode = DWORD($C000013A);
+  WindowsIgnoreControlCompilerProxyMode = 'ignore-control';
+  {$ENDIF}
   TestHeartbeatIntervalMilliseconds = 75;
   TestHeartbeatJobDurationMilliseconds =
     TestHeartbeatIntervalMilliseconds * 4;
 
 type
+  TProcessWaitThread = class(TThread)
+  private
+    FProcess: TProcess;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AProcess: TProcess);
+  end;
+
+  TBlockingProcess = class(TProcess)
+  private
+    FCriticalSection: TRTLCriticalSection;
+    FEntered: Boolean;
+    FReleased: Boolean;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Execute; override;
+    function Entered: Boolean;
+    procedure Release;
+  end;
+
+  TNotifyingProcess = class(TProcess)
+  private
+    FCriticalSection: TRTLCriticalSection;
+    FEntered: Boolean;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Execute; override;
+    function Entered: Boolean;
+  end;
+
+  TSpawnThread = class(TThread)
+  private
+    FCriticalSection: TRTLCriticalSection;
+    FErrorMessage: string;
+    FAttempted: Boolean;
+    FProcess: TProcess;
+    FProcessTree: TLWPTProcessTree;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AProcess: TProcess;
+      const AProcessTree: TLWPTProcessTree);
+    destructor Destroy; override;
+    function Attempted: Boolean;
+    property ErrorMessage: string read FErrorMessage;
+  end;
+
   TTestScheduling = class(TTestSuite)
   private
     FScratch: string;
@@ -53,7 +141,8 @@ type
     procedure WriteBuildProject(const AProjectRoot: string);
     function RunTests(const AArgs: array of string): TLwptResult;
     function RunTestsWithCompilerProxy(const AArgs: array of string;
-      const AProxyMode, APIDFile: string): TLwptResult;
+      const AProxyMode, APIDFile: string;
+      const ABudget: Integer = 2): TLwptResult;
     {$IFDEF UNIX}
     procedure RunSignalForwardingTest(const ASignal: Integer;
       const AProjectName: string);
@@ -72,9 +161,27 @@ type
     procedure TestBailTerminatesActiveAndLeavesPendingUnstarted;
     procedure TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
     procedure TestWorkerErrorTerminatesActiveProcessTree;
+    procedure TestSuccessfulTerminationAcknowledgementCompletesCancellation;
+    procedure TestSuccessfulAcknowledgementHasSeparateReapWindow;
+    procedure TestManagedAndUnmanagedSpawnsShareCriticalSection;
+    procedure TestExitedRegisteredProcessTreeIsSuccessfulNoOp;
+    procedure TestFailedNestedTerminationAcknowledgementFailsCancellation;
+    procedure TestMissingTerminationAcknowledgementFailsCancellation;
+    procedure TestSiblingTerminationAcknowledgementsShareFanout;
+    procedure TestProtocolFramingIsBoundedAndIncremental;
+    procedure TestProcessFailureSurvivesDelegationCleanupFailure;
     {$IFDEF UNIX}
     procedure TestSIGINTTerminatesActiveProcessTree;
     procedure TestSIGTERMTerminatesActiveProcessTree;
+    procedure TestInheritedChannelRejectsRegularFiles;
+    procedure TestInheritedChannelRejectsWrongPipeDirection;
+    procedure TestAcknowledgementControlReadIsBounded;
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    procedure RunWindowsConsoleForwardingTest(const AControlType: DWORD;
+      const AProjectName: string);
+    procedure TestCtrlCTerminatesActiveProcessTree;
+    procedure TestCtrlBreakTerminatesActiveProcessTree;
     {$ENDIF}
     procedure TestSilentJobEmitsHeartbeatAndProgress;
     procedure TestFailureReplaysAndPreservesIsolatedLog;
@@ -85,6 +192,168 @@ function PascalString(const AValue: string): string;
 begin
   Result := '''' + StringReplace(AValue, '''', '''''', [rfReplaceAll]) + '''';
 end;
+
+constructor TProcessWaitThread.Create(const AProcess: TProcess);
+begin
+  inherited Create(True);
+  FProcess := AProcess;
+end;
+
+procedure TProcessWaitThread.Execute;
+begin
+  FProcess.WaitOnExit;
+end;
+
+constructor TBlockingProcess.Create;
+begin
+  inherited Create(nil);
+  InitCriticalSection(FCriticalSection);
+end;
+
+destructor TBlockingProcess.Destroy;
+begin
+  DoneCriticalSection(FCriticalSection);
+  inherited Destroy;
+end;
+
+function TBlockingProcess.Entered: Boolean;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    Result := FEntered;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+end;
+
+procedure TBlockingProcess.Execute;
+var
+  Released: Boolean;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    FEntered := True;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+  repeat
+    EnterCriticalSection(FCriticalSection);
+    try
+      Released := FReleased;
+    finally
+      LeaveCriticalSection(FCriticalSection);
+    end;
+    if not Released then Sleep(ProcessPollMilliseconds);
+  until Released;
+end;
+
+procedure TBlockingProcess.Release;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    FReleased := True;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+end;
+
+constructor TNotifyingProcess.Create;
+begin
+  inherited Create(nil);
+  InitCriticalSection(FCriticalSection);
+end;
+
+destructor TNotifyingProcess.Destroy;
+begin
+  DoneCriticalSection(FCriticalSection);
+  inherited Destroy;
+end;
+
+function TNotifyingProcess.Entered: Boolean;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    Result := FEntered;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+end;
+
+procedure TNotifyingProcess.Execute;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    FEntered := True;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+  inherited Execute;
+end;
+
+constructor TSpawnThread.Create(const AProcess: TProcess;
+  const AProcessTree: TLWPTProcessTree);
+begin
+  inherited Create(True);
+  InitCriticalSection(FCriticalSection);
+  FProcess := AProcess;
+  FProcessTree := AProcessTree;
+end;
+
+destructor TSpawnThread.Destroy;
+begin
+  DoneCriticalSection(FCriticalSection);
+  inherited Destroy;
+end;
+
+function TSpawnThread.Attempted: Boolean;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    Result := FAttempted;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+end;
+
+procedure TSpawnThread.Execute;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    FAttempted := True;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+  try
+    if Assigned(FProcessTree) then FProcessTree.Execute
+    else ExecuteUnmanagedProcess(FProcess);
+  except
+    on E: Exception do FErrorMessage := E.Message;
+  end;
+end;
+
+{$IFDEF UNIX}
+function ReadAcknowledgementControlBefore(const AHandle: PtrInt;
+  const ADeadline: QWord): Boolean;
+var
+  Buffer: array[0..511] of Byte;
+  BytesRead, ControlFlags, ErrorCode: LongInt;
+begin
+  Result := False;
+  ControlFlags := FpFcntl(AHandle, F_GetFl);
+  if (ControlFlags < 0)
+     or (FpFcntl(AHandle, F_SetFl,
+       ControlFlags or O_NONBLOCK) < 0) then Exit;
+  repeat
+    BytesRead := FpRead(AHandle, Buffer, SizeOf(Buffer));
+    if BytesRead > 0 then Exit(True);
+    if BytesRead = 0 then Exit;
+    ErrorCode := FpGetErrNo;
+    if not (ErrorCode in [ESysEINTR, ESysEAGAIN]) then Exit;
+    if GetTickCount64 >= ADeadline then Exit;
+    Sleep(ProcessPollMilliseconds);
+  until False;
+end;
+{$ENDIF}
 
 { Scheduler progress lines print discovered test paths with the native
   separator (tests\A.Test.pas on Windows); normalise so assertions can be
@@ -218,7 +487,7 @@ end;
 
 function TTestScheduling.RunTestsWithCompilerProxy(
   const AArgs: array of string; const AProxyMode,
-  APIDFile: string): TLwptResult;
+  APIDFile: string; const ABudget: Integer): TLwptResult;
 var
   Args, Environment: array of string;
   ArgumentIndex: Integer;
@@ -231,7 +500,7 @@ begin
   Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
   Environment[1] := WORKER_STATE_DIR_ENV + '='
     + FScratch + '/worker-state';
-  Environment[2] := WORKER_BUDGET_ENV + '=2';
+  Environment[2] := WORKER_BUDGET_ENV + '=' + IntToStr(ABudget);
   Environment[3] := CompilerExecutableEnvironment + '='
     + ExpandFileName(ParamStr(0));
   Environment[4] := ProcessTreeProxyModeEnvironment + '=' + AProxyMode;
@@ -652,6 +921,482 @@ begin
     .ToBe(True);
 end;
 
+procedure TTestScheduling.TestMissingTerminationAcknowledgementFailsCancellation;
+var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
+  Child: TProcess;
+  ChildReaped: Boolean;
+  ChildTree: TLWPTProcessTree;
+  CleanupAbandoned: Boolean;
+  CompilerPID: Integer;
+  Environment: array of string;
+  PIDFile: string;
+  Raised: Boolean;
+  Started: TDateTime;
+  WaitThread: TProcessWaitThread;
+  WaitThreadStarted: Boolean;
+  {$IFDEF MSWINDOWS}
+  ChildProcessHandle: THandle;
+  {$ENDIF}
+
+  procedure JoinWaitThreadAfterBoundedExit;
+  var
+    ExitStarted: TDateTime;
+    NativeTerminationAttempted, NativeTerminationSucceeded: Boolean;
+  begin
+    ExitStarted := Now;
+    while ProcessIsRunning(CompilerPID)
+      and ((Now - ExitStarted) * SecondsPerDay
+        < ProcessExitCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if ProcessIsRunning(CompilerPID) then
+    begin
+      try
+        ChildTree.Terminate;
+      except
+        { Native termination below is the cleanup fallback. }
+      end;
+      NativeTerminationAttempted := False;
+      NativeTerminationSucceeded := False;
+      if ProcessIsRunning(CompilerPID) then
+      begin
+        NativeTerminationAttempted := True;
+        {$IFDEF UNIX}
+        NativeTerminationSucceeded := FpKill(CompilerPID, SIGKILL) = 0;
+        {$ENDIF}
+        {$IFDEF MSWINDOWS}
+        if ChildProcessHandle <> 0 then
+          NativeTerminationSucceeded :=
+            Windows.TerminateProcess(ChildProcessHandle, 1);
+        {$ENDIF}
+      end;
+      ExitStarted := Now;
+      while ProcessIsRunning(CompilerPID)
+        and ((Now - ExitStarted) * SecondsPerDay
+          < ProcessExitCeilingSeconds) do
+        Sleep(ProcessPollMilliseconds);
+      if ProcessIsRunning(CompilerPID) then
+      begin
+        { WaitThread still owns Child, so a bounded test failure must leave
+          both objects alive rather than enter an unbounded join or free an
+          object that the thread can still access. }
+        CleanupAbandoned := True;
+        Fail('missing-acknowledgement child remained alive after forced cleanup'
+          + ' (native termination attempted: '
+          + BoolToStr(NativeTerminationAttempted, True)
+          + '; succeeded: '
+          + BoolToStr(NativeTerminationSucceeded, True) + ')');
+      end;
+    end;
+    WaitThread.WaitFor;
+    ChildReaped := True;
+  end;
+begin
+  PIDFile := FScratch + '/control/missing-acknowledgement-compiler-pid';
+  SetLength(Environment, 2);
+  Environment[0] := ProcessTreeProxyModeEnvironment + '='
+    + MissingAcknowledgementCompilerProxyMode;
+  Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + PIDFile;
+  Child := TProcess.Create(nil);
+  ChildTree := TLWPTProcessTree.Create(Child);
+  ChildReaped := False;
+  CleanupAbandoned := False;
+  CompilerPID := 0;
+  WaitThread := nil;
+  WaitThreadStarted := False;
+  {$IFDEF MSWINDOWS}
+  ChildProcessHandle := 0;
+  {$ENDIF}
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    Child.Parameters.Add('A.Slow.Test.pas');
+    ConfigureProcessEnvironment(Child, Environment);
+    ChildTree.Execute;
+    Started := Now;
+    while (not FileExists(PIDFile)) and Child.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if not FileExists(PIDFile) then
+      Fail('missing-acknowledgement child did not publish its PID');
+    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+    {$IFDEF MSWINDOWS}
+    ChildProcessHandle := Child.ProcessHandle;
+    {$ENDIF}
+
+    WaitThread := TProcessWaitThread.Create(Child);
+    WaitThread.Start;
+    WaitThreadStarted := True;
+    TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
+      AcknowledgementDeadline);
+    ChildTree.BeginTermination(DescendantDeadline,
+      AcknowledgementDeadline);
+    Raised := False;
+    try
+      ChildTree.CompleteTermination;
+    except
+      on E: EOSError do
+        Raised := Pos('termination acknowledgement was not received',
+          E.Message) > 0;
+    end;
+    JoinWaitThreadAfterBoundedExit;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+  finally
+    if not CleanupAbandoned then
+    begin
+      if WaitThreadStarted and not ChildReaped then
+        JoinWaitThreadAfterBoundedExit
+      else if Child.Running then Child.Terminate(1);
+      WaitThread.Free;
+      ChildTree.Free;
+      Child.Free;
+    end;
+  end;
+end;
+
+procedure TTestScheduling.TestSuccessfulTerminationAcknowledgementCompletesCancellation;
+var
+  DescendantPID, OwnerPID: Integer;
+  PIDFile: string;
+  CommandResult: TLwptResult;
+begin
+  ResetProject(0);
+  PIDFile := FScratch + '/control/successful-acknowledgement-compiler-pid';
+  WriteTextFile(FScratch + '/tests/A.Slow.Test.pas',
+    'program SlowCompilerInput; begin end.'#10);
+  WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
+    'program MissingRuntimeBinaryInput; begin end.'#10);
+
+  CommandResult := RunTestsWithCompilerProxy(['--jobs=2'],
+    SuccessfulAcknowledgementCompilerProxyMode, PIDFile);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
+  Expect<Boolean>(FileExists(PIDFile + '-owner')).ToBe(True);
+  Expect<Boolean>(FileExists(PIDFile + '-descendant')).ToBe(True);
+  OwnerPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-owner')));
+  DescendantPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-descendant')));
+  Expect<Boolean>(ProcessIsRunning(OwnerPID)).ToBe(False);
+  Expect<Boolean>(ProcessIsRunning(DescendantPID)).ToBe(False);
+  Expect<Boolean>(Pos('process-tree termination failed',
+    CommandResult.Stdout) = 0).ToBe(True);
+end;
+
+procedure TTestScheduling.TestSuccessfulAcknowledgementHasSeparateReapWindow;
+var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
+  Child: TProcess;
+  ChildProcessID: Integer;
+  ChildTree: TLWPTProcessTree;
+  Environment: array of string;
+  Marker: string;
+  Started: TDateTime;
+  TerminationCompleted: Boolean;
+  WaitThread: TProcessWaitThread;
+  WaitThreadStarted: Boolean;
+  {$IFDEF MSWINDOWS}
+  ChildProcessHandle: THandle;
+  {$ENDIF}
+begin
+  Marker := FScratch + '/control/delayed-successful-acknowledgement';
+  SetLength(Environment, 2);
+  Environment[0] := ProcessTreeProxyModeEnvironment + '='
+    + SuccessfulAcknowledgementLeafProxyMode;
+  Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + Marker;
+  Child := TProcess.Create(nil);
+  ChildTree := TLWPTProcessTree.Create(Child);
+  ChildProcessID := 0;
+  TerminationCompleted := False;
+  WaitThread := nil;
+  WaitThreadStarted := False;
+  {$IFDEF MSWINDOWS}
+  ChildProcessHandle := 0;
+  {$ENDIF}
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    ConfigureProcessEnvironment(Child, Environment);
+    ChildTree.Execute;
+    ChildProcessID := Child.ProcessID;
+    {$IFDEF MSWINDOWS}
+    ChildProcessHandle := Child.ProcessHandle;
+    {$ENDIF}
+    Started := Now;
+    while (not FileExists(Marker + '-descendant')) and Child.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(FileExists(Marker + '-descendant')).ToBe(True);
+
+    { Reap the direct child concurrently, as the production runner does. The
+      process tree can then distinguish its delayed exit from a live member. }
+    WaitThread := TProcessWaitThread.Create(Child);
+    WaitThread.Start;
+    WaitThreadStarted := True;
+    TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
+      AcknowledgementDeadline);
+    ChildTree.BeginTermination(DescendantDeadline,
+      AcknowledgementDeadline);
+    ChildTree.CompleteTermination;
+    TerminationCompleted := True;
+    WaitThread.WaitFor;
+    Expect<Integer>(Child.ExitStatus).ToBe(0);
+  finally
+    if WaitThreadStarted then
+    begin
+      if not TerminationCompleted then
+        try
+          ChildTree.Terminate;
+        except
+          {$IFDEF UNIX}
+          if ChildProcessID > 0 then FpKill(ChildProcessID, SIGKILL);
+          {$ENDIF}
+          {$IFDEF MSWINDOWS}
+          if ChildProcessHandle <> 0 then
+            Windows.TerminateProcess(ChildProcessHandle, 1);
+          {$ENDIF}
+        end;
+      WaitThread.WaitFor;
+      WaitThread.Free;
+      WaitThread := nil;
+    end
+    else
+    begin
+      WaitThread.Free;
+      WaitThread := nil;
+      if Child.Running then Child.Terminate(1);
+    end;
+    ChildTree.Free;
+    Child.Free;
+  end;
+end;
+
+procedure TTestScheduling.TestManagedAndUnmanagedSpawnsShareCriticalSection;
+var
+  Blocker: TBlockingProcess;
+  BlockerThread, ManagedThread: TSpawnThread;
+  Environment: array of string;
+  ManagedProcess: TNotifyingProcess;
+  ManagedTree: TLWPTProcessTree;
+  Marker: string;
+  Started: TDateTime;
+  BlockerThreadStarted, ManagedThreadStarted: Boolean;
+begin
+  Marker := FScratch + '/control/serialized-managed-spawn';
+  Blocker := TBlockingProcess.Create;
+  ManagedProcess := TNotifyingProcess.Create;
+  ManagedTree := TLWPTProcessTree.Create(ManagedProcess);
+  BlockerThread := TSpawnThread.Create(Blocker, nil);
+  ManagedThread := TSpawnThread.Create(ManagedProcess, ManagedTree);
+  BlockerThreadStarted := False;
+  ManagedThreadStarted := False;
+  try
+    SetLength(Environment, 2);
+    Environment[0] := ProcessTreeProxyModeEnvironment + '='
+      + CleanAcknowledgementExitProxyMode;
+    Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + Marker;
+    ManagedProcess.Executable := ExpandFileName(ParamStr(0));
+    ConfigureProcessEnvironment(ManagedProcess, Environment);
+
+    BlockerThread.Start;
+    BlockerThreadStarted := True;
+    Started := Now;
+    while (not Blocker.Entered)
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(Blocker.Entered).ToBe(True);
+    ManagedThread.Start;
+    ManagedThreadStarted := True;
+    Started := Now;
+    while (not ManagedThread.Attempted)
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(ManagedThread.Attempted).ToBe(True);
+    Expect<Boolean>(ManagedProcess.Entered).ToBe(False);
+
+    Blocker.Release;
+    BlockerThread.WaitFor;
+    ManagedThread.WaitFor;
+    Expect<string>(BlockerThread.ErrorMessage).ToBe('');
+    Expect<string>(ManagedThread.ErrorMessage).ToBe('');
+    Expect<Boolean>(ManagedProcess.Entered).ToBe(True);
+    ManagedProcess.WaitOnExit;
+    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+  finally
+    Blocker.Release;
+    if BlockerThreadStarted then BlockerThread.WaitFor;
+    if ManagedThreadStarted then ManagedThread.WaitFor;
+    if ManagedThreadStarted and ManagedProcess.Running then
+      ManagedProcess.Terminate(1);
+    BlockerThread.Free;
+    ManagedThread.Free;
+    ManagedTree.Free;
+    ManagedProcess.Free;
+    Blocker.Free;
+  end;
+end;
+
+procedure TTestScheduling.TestExitedRegisteredProcessTreeIsSuccessfulNoOp;
+var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
+  Child: TProcess;
+  ChildTree: TLWPTProcessTree;
+  Environment: array of string;
+  Marker: string;
+  Started: TDateTime;
+begin
+  Marker := FScratch + '/control/clean-acknowledgement-exit';
+  SetLength(Environment, 2);
+  Environment[0] := ProcessTreeProxyModeEnvironment + '='
+    + CleanAcknowledgementExitProxyMode;
+  Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + Marker;
+  Child := TProcess.Create(nil);
+  ChildTree := TLWPTProcessTree.Create(Child);
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    ConfigureProcessEnvironment(Child, Environment);
+    ChildTree.Execute;
+    Started := Now;
+    while Child.Running and ((Now - Started) * SecondsPerDay
+      < ProcessExitCeilingSeconds) do Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(Child.Running).ToBe(False);
+    Child.WaitOnExit;
+    Expect<Integer>(Child.ExitStatus).ToBe(0);
+    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+
+    TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
+      AcknowledgementDeadline);
+    ChildTree.BeginTermination(DescendantDeadline,
+      AcknowledgementDeadline);
+    ChildTree.CompleteTermination;
+  finally
+    if Child.Running then Child.Terminate(1);
+    ChildTree.Free;
+    Child.Free;
+  end;
+end;
+
+procedure TTestScheduling.TestFailedNestedTerminationAcknowledgementFailsCancellation;
+var
+  DescendantPID, OwnerPID: Integer;
+  PIDFile: string;
+  CommandResult: TLwptResult;
+begin
+  ResetProject(0);
+  PIDFile := FScratch + '/control/failed-acknowledgement-compiler-pid';
+  WriteTextFile(FScratch + '/tests/A.Slow.Test.pas',
+    'program SlowCompilerInput; begin end.'#10);
+  WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
+    'program MissingRuntimeBinaryInput; begin end.'#10);
+
+  CommandResult := RunTestsWithCompilerProxy(['--jobs=2'],
+    FailedAcknowledgementCompilerProxyMode, PIDFile);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
+  Expect<Boolean>(FileExists(PIDFile + '-owner')).ToBe(True);
+  Expect<Boolean>(FileExists(PIDFile + '-descendant')).ToBe(True);
+  OwnerPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-owner')));
+  DescendantPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-descendant')));
+  Expect<Boolean>(ProcessIsRunning(OwnerPID)).ToBe(False);
+  Expect<Boolean>(ProcessIsRunning(DescendantPID)).ToBe(False);
+  Expect<Boolean>(Pos('nested process reported failed process-tree '
+    + 'termination', CommandResult.Stdout) > 0).ToBe(True);
+end;
+
+procedure TTestScheduling.TestSiblingTerminationAcknowledgementsShareFanout;
+var
+  CompilerPID, SourceIndex: Integer;
+  CancellationStartedAt, ElapsedMilliseconds: QWord;
+  PIDFile: string;
+  CommandResult: TLwptResult;
+begin
+  ResetProject(0);
+  PIDFile := FScratch + '/control/sibling-ack-compiler-pid';
+  WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
+    'program MissingRuntimeBinaryInput; begin end.'#10);
+  for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+    WriteTextFile(FScratch + '/tests/' + SiblingSlowSources[SourceIndex],
+      'program SlowCompilerInput; begin end.'#10);
+
+  CommandResult := RunTestsWithCompilerProxy(['--jobs=7'],
+    MissingAcknowledgementSiblingCompilerProxyMode, PIDFile, 7);
+  Expect<Boolean>(FileExists(PIDFile + SiblingCancellationStartedSuffix))
+    .ToBe(True);
+  CancellationStartedAt := StrToQWord(Trim(ReadBinaryFile(PIDFile
+    + SiblingCancellationStartedSuffix)));
+  ElapsedMilliseconds := GetTickCount64 - CancellationStartedAt;
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
+  for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+  begin
+    Expect<Boolean>(FileExists(PIDFile + '-'
+      + SiblingSlowSources[SourceIndex])).ToBe(True);
+    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-'
+      + SiblingSlowSources[SourceIndex])));
+    Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+  end;
+  Expect<Boolean>(Pos('A.Slow.Test.pas ... ERROR',
+    CommandResult.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('C.Slow.Test.pas ... ERROR',
+    CommandResult.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(ElapsedMilliseconds < SiblingFanoutCeilingMilliseconds)
+    .ToBe(True);
+end;
+
+procedure TTestScheduling.TestProtocolFramingIsBoundedAndIncremental;
+var
+  Buffer, Line: string;
+begin
+  Buffer := '';
+  Expect<TLWPTProtocolReadResult>(FeedProcessTreeProtocol(Buffer,
+    ProcessTreeAcknowledgementProtocol + ' token ', Line)).ToBe(prrPending);
+  Expect<TLWPTProtocolReadResult>(FeedProcessTreeProtocol(Buffer,
+    'CANCEL 100 250'#10'TRAILING'#10, Line)).ToBe(prrFrame);
+  Expect<string>(Line).ToBe(ProcessTreeAcknowledgementProtocol
+    + ' token CANCEL 100 250');
+  Expect<TLWPTProtocolReadResult>(FeedProcessTreeProtocol(Buffer, '', Line))
+    .ToBe(prrFrame);
+  Expect<string>(Line).ToBe('TRAILING');
+  Expect<TLWPTProtocolReadResult>(FeedProcessTreeProtocol(Buffer,
+    StringOfChar('x', 4097), Line)).ToBe(prrRejected);
+  Expect<string>(Buffer).ToBe('');
+end;
+
+procedure TTestScheduling.TestProcessFailureSurvivesDelegationCleanupFailure;
+var
+  CommandResult: TLwptResult;
+begin
+  ResetProject(0);
+  WriteTextFile(FScratch + '/tests/A.OutputLimit.Test.pas',
+      'program OutputLimitFixture;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, SysUtils;'#10
+    + 'var BlockedTmp: string;'#10
+    + 'begin'#10
+    + '  BlockedTmp := IncludeTrailingPathDelimiter(GetEnvironmentVariable('
+    + PascalString(WORKER_STATE_DIR_ENV) + ')) + ''tmp'';'#10
+    + '  if DirectoryExists(BlockedTmp) and not RemoveDir(BlockedTmp) then'
+    + ' Halt(2);'#10
+    + '  TFileStream.Create(BlockedTmp, fmCreate).Free;'#10
+    + '  Write(StringOfChar(''x'', '
+    + IntToStr(ProcessCaptureOverflowBytes) + '));'#10
+    + '  Flush(Output);'#10
+    + '  Sleep(' + IntToStr(ProcessCaptureOverflowHoldMilliseconds) + ');'#10
+    + 'end.'#10);
+
+  CommandResult := RunTests(['--jobs=1', '--bail=0']);
+  if (CommandResult.ExitCode <> 1)
+     or (Pos('standard output exceeded its 16777216-byte capture limit',
+       CommandResult.Stderr) = 0)
+     or (Pos('Unable to create file', CommandResult.Stderr) > 0) then
+    Fail('delegation-cleanup failure evidence:' + LineEnding
+      + 'stdout:' + LineEnding + CommandResult.Stdout + LineEnding
+      + 'stderr:' + LineEnding + CommandResult.Stderr);
+  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('standard output exceeded its 16777216-byte capture '
+    + 'limit', CommandResult.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Unable to create file', CommandResult.Stderr) = 0)
+    .ToBe(True);
+end;
+
 {$IFDEF UNIX}
 procedure TTestScheduling.RunSignalForwardingTest(const ASignal: Integer;
   const AProjectName: string);
@@ -717,7 +1462,489 @@ procedure TTestScheduling.TestSIGTERMTerminatesActiveProcessTree;
 begin
   RunSignalForwardingTest(SIGTERM, 'signal-term');
 end;
+
+procedure TTestScheduling.TestInheritedChannelRejectsRegularFiles;
+const
+  ChannelToken = '0123456789abcdef0123456789abcdef';
+var
+  ChannelFile: TFileStream;
+  Child: TProcess;
+  Environment: array of string;
+  Marker: string;
+  Started: TDateTime;
+begin
+  Marker := FScratch + '/control/regular-channel-probe';
+  ChannelFile := TFileStream.Create(Marker + '.channel', fmCreate);
+  Child := TProcess.Create(nil);
+  try
+    SetLength(Environment, 6);
+    Environment[0] := ProcessTreeProxyModeEnvironment + '='
+      + InheritedChannelProbeProxyMode;
+    Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + Marker;
+    Environment[2] := ManagedProcessTreeEnvironment + '='
+      + IntToStr(GetProcessID);
+    Environment[3] := ProcessTreeStatusHandleEnvironment + '='
+      + IntToStr(ChannelFile.Handle);
+    Environment[4] := ProcessTreeControlHandleEnvironment + '='
+      + IntToStr(ChannelFile.Handle);
+    Environment[5] := ProcessTreeChannelTokenEnvironment + '=' + ChannelToken;
+    Child.Executable := ExpandFileName(ParamStr(0));
+    ConfigureProcessEnvironment(Child, Environment);
+    Child.Execute;
+    Started := Now;
+    while (not FileExists(Marker)) and Child.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+    Expect<Int64>(ChannelFile.Size).ToBe(0);
+  finally
+    if Child.Running then Child.Terminate(1);
+    Child.WaitOnExit;
+    Child.Free;
+    ChannelFile.Free;
+  end;
+end;
+
+procedure TTestScheduling.TestInheritedChannelRejectsWrongPipeDirection;
+const
+  ChannelToken = '0123456789abcdef0123456789abcdef';
+var
+  Buffer: array[0..255] of Byte;
+  BytesRead, OpenFlags: LongInt;
+  Child: TProcess;
+  ControlPipe, StatusPipe: TFilDes;
+  Environment: array of string;
+  Marker: string;
+  Started: TDateTime;
+begin
+  StatusPipe[0] := -1;
+  StatusPipe[1] := -1;
+  ControlPipe[0] := -1;
+  ControlPipe[1] := -1;
+  Child := TProcess.Create(nil);
+  try
+    if FpPipe(StatusPipe) <> 0 then RaiseLastOSError;
+    if FpPipe(ControlPipe) <> 0 then RaiseLastOSError;
+    Marker := FScratch + '/control/direction-channel-probe';
+    SetLength(Environment, 6);
+    Environment[0] := ProcessTreeProxyModeEnvironment + '='
+      + InheritedChannelProbeProxyMode;
+    Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + Marker;
+    Environment[2] := ManagedProcessTreeEnvironment + '='
+      + IntToStr(GetProcessID);
+    Environment[3] := ProcessTreeStatusHandleEnvironment + '='
+      + IntToStr(StatusPipe[1]);
+    { The status end is valid, but a control write end cannot receive CANCEL. }
+    Environment[4] := ProcessTreeControlHandleEnvironment + '='
+      + IntToStr(ControlPipe[1]);
+    Environment[5] := ProcessTreeChannelTokenEnvironment + '=' + ChannelToken;
+    Child.Executable := ExpandFileName(ParamStr(0));
+    ConfigureProcessEnvironment(Child, Environment);
+    Child.Execute;
+    Started := Now;
+    while (not FileExists(Marker)) and Child.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+    OpenFlags := FpFcntl(StatusPipe[0], F_GetFl);
+    if (OpenFlags < 0)
+       or (FpFcntl(StatusPipe[0], F_SetFl,
+         OpenFlags or O_NONBLOCK) < 0) then RaiseLastOSError;
+    BytesRead := FpRead(StatusPipe[0], Buffer, SizeOf(Buffer));
+    Expect<Boolean>(BytesRead <= 0).ToBe(True);
+  finally
+    if Child.Running then Child.Terminate(1);
+    Child.WaitOnExit;
+    Child.Free;
+    if StatusPipe[0] >= 0 then FpClose(StatusPipe[0]);
+    if StatusPipe[1] >= 0 then FpClose(StatusPipe[1]);
+    if ControlPipe[0] >= 0 then FpClose(ControlPipe[0]);
+    if ControlPipe[1] >= 0 then FpClose(ControlPipe[1]);
+  end;
+end;
+
+procedure TTestScheduling.TestAcknowledgementControlReadIsBounded;
+var
+  ByteValue: Byte;
+  ControlPipe: TFilDes;
+  StartedAt: QWord;
+begin
+  ControlPipe[0] := -1;
+  ControlPipe[1] := -1;
+  try
+    if FpPipe(ControlPipe) <> 0 then RaiseLastOSError;
+    FpClose(ControlPipe[1]);
+    ControlPipe[1] := -1;
+    StartedAt := GetTickCount64;
+    Expect<Boolean>(ReadAcknowledgementControlBefore(ControlPipe[0],
+      StartedAt + 50)).ToBe(False);
+    Expect<Boolean>(GetTickCount64 - StartedAt < 500).ToBe(True);
+    FpClose(ControlPipe[0]);
+    ControlPipe[0] := -1;
+
+    if FpPipe(ControlPipe) <> 0 then RaiseLastOSError;
+    StartedAt := GetTickCount64;
+    Expect<Boolean>(ReadAcknowledgementControlBefore(ControlPipe[0],
+      StartedAt + 50)).ToBe(False);
+    Expect<Boolean>(GetTickCount64 - StartedAt < 500).ToBe(True);
+
+    ByteValue := 1;
+    Expect<Int64>(FpWrite(ControlPipe[1], ByteValue,
+      SizeOf(ByteValue))).ToBe(SizeOf(ByteValue));
+    Expect<Boolean>(ReadAcknowledgementControlBefore(ControlPipe[0],
+      GetTickCount64 + 50)).ToBe(True);
+  finally
+    if ControlPipe[0] >= 0 then FpClose(ControlPipe[0]);
+    if ControlPipe[1] >= 0 then FpClose(ControlPipe[1]);
+  end;
+end;
 {$ENDIF}
+
+{$IFDEF MSWINDOWS}
+function TryReadWindowsProcessID(const APath: string;
+  out APID: Integer): Boolean;
+var
+  CandidatePID: Integer;
+begin
+  APID := -1;
+  Result := False;
+  try
+    if not FileExists(APath) then Exit;
+    if not TryStrToInt(Trim(ReadBinaryFile(APath)), CandidatePID) then Exit;
+    APID := CandidatePID;
+    Result := True;
+  except
+    { Cleanup is best-effort; the owning Job Object remains authoritative. }
+    APID := -1;
+  end;
+end;
+
+procedure TerminateWindowsProcess(const APID: Integer);
+var
+  ProcessHandle: THandle;
+begin
+  if not ProcessIsRunning(APID) then Exit;
+  ProcessHandle := Windows.OpenProcess(Windows.PROCESS_TERMINATE, False,
+    DWORD(APID));
+  if ProcessHandle = 0 then Exit;
+  try
+    Windows.TerminateProcess(ProcessHandle, 1);
+  finally
+    Windows.CloseHandle(ProcessHandle);
+  end;
+end;
+
+function IgnoreWindowsConsoleControl(AControlType: DWORD): BOOL; stdcall;
+begin
+  Result := (AControlType = Windows.CTRL_C_EVENT)
+    or (AControlType = Windows.CTRL_BREAK_EVENT);
+end;
+
+procedure TTestScheduling.RunWindowsConsoleForwardingTest(
+  const AControlType: DWORD; const AProjectName: string);
+var
+  CompilerPID: Integer;
+  Controller: TProcess;
+  ControllerTree: TLWPTProcessTree;
+  PIDFile, ProjectRoot: string;
+  Started: TDateTime;
+begin
+  CompilerPID := -1;
+  ProjectRoot := FScratch + '/' + AProjectName;
+  PIDFile := FScratch + '/control/' + AProjectName + '-compiler-pid';
+  WriteBuildProject(ProjectRoot);
+  Controller := TProcess.Create(nil);
+  ControllerTree := nil;
+  try
+    ControllerTree := TLWPTProcessTree.Create(Controller);
+    Controller.Executable := ExpandFileName(ParamStr(0));
+    Controller.Parameters.Add(WindowsConsoleControllerOption);
+    Controller.Parameters.Add(IntToStr(AControlType));
+    Controller.Parameters.Add(LwptBinaryPath);
+    Controller.Parameters.Add(ProjectRoot);
+    Controller.Parameters.Add(PIDFile);
+    Controller.Parameters.Add(FScratch + '/' + AProjectName + '-worker-state');
+    Controller.Options := [poNewConsole];
+    ControllerTree.Execute;
+    Started := Now;
+    while Controller.Running
+      and ((Now - Started) * SecondsPerDay
+        < WindowsControllerCompletionCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(Controller.Running).ToBe(False);
+    Controller.WaitOnExit;
+    Expect<Integer>(Controller.ExitStatus).ToBe(0);
+    Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
+    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+    Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+  finally
+    if CompilerPID < 0 then
+      TryReadWindowsProcessID(PIDFile, CompilerPID);
+    try
+      if Assigned(ControllerTree) then ControllerTree.Terminate;
+    finally
+      TerminateWindowsProcess(CompilerPID);
+      ControllerTree.Free;
+      Controller.Free;
+    end;
+  end;
+end;
+
+procedure TTestScheduling.TestCtrlCTerminatesActiveProcessTree;
+begin
+  RunWindowsConsoleForwardingTest(Windows.CTRL_C_EVENT, 'console-control-c');
+end;
+
+procedure TTestScheduling.TestCtrlBreakTerminatesActiveProcessTree;
+begin
+  RunWindowsConsoleForwardingTest(Windows.CTRL_BREAK_EVENT,
+    'console-control-break');
+end;
+
+function RunWindowsConsoleController: Integer;
+var
+  CompilerPID: Integer;
+  ControlType: DWORD;
+  Environment: array of string;
+  LwptProcess: TProcess;
+  WrongReadHandle, WrongWriteHandle: THandle;
+  SecurityAttributes: Windows.TSecurityAttributes;
+  Started: TDateTime;
+begin
+  Result := 1;
+  CompilerPID := -1;
+  WrongReadHandle := 0;
+  WrongWriteHandle := 0;
+  { Controller failures: 2 invalid control type; 3 missing compiler PID;
+    4 acknowledgement pipe creation; 5 inherited Ctrl-C-ignore setup;
+    6 controller ignore handler; 7 control broadcast; 8 LWPT exit timeout;
+    9 unexpected LWPT exit status; 10 compiler process still active. }
+  ControlType := DWORD(StrToInt(ParamStr(2)));
+  if (ControlType <> Windows.CTRL_C_EVENT)
+     and (ControlType <> Windows.CTRL_BREAK_EVENT) then Exit(2);
+  SetLength(Environment, 10);
+  Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
+  Environment[1] := WORKER_STATE_DIR_ENV + '=' + ParamStr(6);
+  Environment[2] := WORKER_BUDGET_ENV + '=1';
+  Environment[3] := CompilerExecutableEnvironment + '='
+    + ExpandFileName(ParamStr(0));
+  Environment[4] := ProcessTreeProxyModeEnvironment + '='
+    + WindowsIgnoreControlCompilerProxyMode;
+  Environment[5] := ProcessTreeProxyPIDFileEnvironment + '=' + ParamStr(5);
+  FillChar(SecurityAttributes, SizeOf(SecurityAttributes), 0);
+  SecurityAttributes.nLength := SizeOf(SecurityAttributes);
+  SecurityAttributes.bInheritHandle := True;
+  if not Windows.CreatePipe(WrongReadHandle, WrongWriteHandle,
+    @SecurityAttributes, 4096) then Exit(4);
+  { Both handles are valid, inheritable pipes, but their directions are
+    deliberately reversed. LWPT must reject them and use console fallback. }
+  Environment[6] := ProcessTreeStatusHandleEnvironment + '='
+    + IntToStr(PtrInt(WrongReadHandle));
+  Environment[7] := ProcessTreeControlHandleEnvironment + '='
+    + IntToStr(PtrInt(WrongWriteHandle));
+  Environment[8] := ProcessTreeChannelTokenEnvironment
+    + '=0123456789abcdef0123456789abcdef';
+  Environment[9] := ManagedProcessTreeEnvironment + '='
+    + IntToStr(GetProcessID);
+  LwptProcess := TProcess.Create(nil);
+  try
+    { Pin the inherited Ctrl-C-ignore case explicitly. Production LWPT must
+      restore Ctrl-C delivery before installing its forwarding handler. }
+    if not Windows.SetConsoleCtrlHandler(nil, True) then Exit(5);
+    LwptProcess.Executable := ParamStr(3);
+    LwptProcess.Parameters.Add('build');
+    LwptProcess.CurrentDirectory := ParamStr(4);
+    ConfigureProcessEnvironment(LwptProcess, Environment);
+    LwptProcess.InheritHandles := True;
+    LwptProcess.Execute;
+    Windows.CloseHandle(WrongReadHandle);
+    WrongReadHandle := 0;
+    Windows.CloseHandle(WrongWriteHandle);
+    WrongWriteHandle := 0;
+    Started := Now;
+    while (not FileExists(ParamStr(5))) and LwptProcess.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if not FileExists(ParamStr(5)) then Exit(3);
+    CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
+    { The controller shares the new console but must survive Ctrl-Break too.
+      The compiler proxy installs the same two-event handler before publishing
+      its PID, leaving LWPT as the only process that performs cancellation. }
+    if not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
+      True) then Exit(6);
+    if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(7);
+    Started := Now;
+    while LwptProcess.Running
+      and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if LwptProcess.Running then Exit(8);
+    LwptProcess.WaitOnExit;
+    if DWORD(LwptProcess.ExitStatus) <> WindowsControlExitCode then Exit(9);
+    if ProcessIsRunning(CompilerPID) then Exit(10);
+    Result := 0;
+  finally
+    if LwptProcess.Running then LwptProcess.Terminate(1);
+    TerminateWindowsProcess(CompilerPID);
+    if WrongReadHandle <> 0 then Windows.CloseHandle(WrongReadHandle);
+    if WrongWriteHandle <> 0 then Windows.CloseHandle(WrongWriteHandle);
+    LwptProcess.Free;
+  end;
+end;
+{$ENDIF}
+
+function RunAcknowledgementLeaf(const AMode, APIDFile: string): Integer;
+var
+  ChannelToken, ControlHandleText, Frame, StatusHandleText: string;
+  ControlHandle, StatusHandle: PtrInt;
+  {$IFDEF MSWINDOWS}
+  Buffer: array[0..511] of Byte;
+  BytesRead, BytesWritten: DWORD;
+  {$ENDIF}
+begin
+  if AMode = CleanAcknowledgementExitProxyMode then
+  begin
+    InstallProcessTreeSignalForwarding;
+    WriteTextFile(APIDFile, IntToStr(GetProcessID));
+    Exit(0);
+  end;
+  StatusHandleText := GetEnvironmentVariable(
+    ProcessTreeStatusHandleEnvironment);
+  ControlHandleText := GetEnvironmentVariable(
+    ProcessTreeControlHandleEnvironment);
+  ChannelToken := GetEnvironmentVariable(
+    ProcessTreeChannelTokenEnvironment);
+  StatusHandle := StrToInt64(StatusHandleText);
+  ControlHandle := StrToInt64(ControlHandleText);
+  Frame := ProcessTreeAcknowledgementProtocol + ' ' + ChannelToken
+    + ' HELLO' + LineEnding;
+  {$IFDEF UNIX}
+  FpSignal(SIGTERM, SignalHandler(SIG_IGN));
+  if FpWrite(StatusHandle, Frame[1], Length(Frame)) <> Length(Frame) then
+    Exit(2);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  BytesWritten := 0;
+  if not Windows.WriteFile(THandle(StatusHandle), Frame[1], Length(Frame),
+    BytesWritten, nil) or (BytesWritten <> DWORD(Length(Frame))) then
+    Exit(2);
+  {$ENDIF}
+  WriteTextFile(APIDFile + '-descendant', IntToStr(GetProcessID));
+  {$IFDEF UNIX}
+  if not ReadAcknowledgementControlBefore(ControlHandle,
+    GetTickCount64 + QWord(ProcessExitCeilingSeconds) * 1000) then Exit(3);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  BytesRead := 0;
+  if not Windows.ReadFile(THandle(ControlHandle), Buffer[0], SizeOf(Buffer),
+    BytesRead, nil) or (BytesRead = 0) then Exit(3);
+  {$ENDIF}
+  if (AMode = SuccessfulAcknowledgementLeafProxyMode)
+     or (AMode = ImmediateAcknowledgementLeafProxyMode) then
+    Frame := ProcessTreeAcknowledgementProtocol + ' ' + ChannelToken
+      + ' REAPED' + LineEnding
+  else
+    Frame := ProcessTreeAcknowledgementProtocol + ' ' + ChannelToken
+      + ' FAILED' + LineEnding;
+  {$IFDEF UNIX}
+  if FpWrite(StatusHandle, Frame[1], Length(Frame)) <> Length(Frame) then
+    Exit(4);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  BytesWritten := 0;
+  if not Windows.WriteFile(THandle(StatusHandle), Frame[1], Length(Frame),
+    BytesWritten, nil) or (BytesWritten <> DWORD(Length(Frame))) then
+    Exit(4);
+  {$ENDIF}
+  if AMode = SuccessfulAcknowledgementLeafProxyMode then
+  begin
+    { A successful terminal frame precedes process exit. Keep the leaf alive
+      past the acknowledgement deadline to pin the separate final reap window. }
+    Sleep(AcknowledgementSuccessExitDelayMilliseconds);
+  end
+  else if AMode <> ImmediateAcknowledgementLeafProxyMode then
+    Exit(1);
+  Result := 0;
+end;
+
+procedure CloseInheritedStatusHandle;
+var
+  StatusHandleText: string;
+begin
+  StatusHandleText := GetEnvironmentVariable(
+    ProcessTreeStatusHandleEnvironment);
+  if StatusHandleText <> '' then
+  begin
+    {$IFDEF UNIX}
+    FpClose(StrToInt(StatusHandleText));
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    Windows.CloseHandle(THandle(StrToInt64(StatusHandleText)));
+    {$ENDIF}
+  end;
+end;
+
+function RunAcknowledgementOwner(const AMode, APIDFile: string): Integer;
+var
+  Child: TProcess;
+  ChildTree: TLWPTProcessTree;
+  Environment: array of string;
+  Started: TDateTime;
+begin
+  Result := 1;
+  InstallProcessTreeSignalForwarding;
+  SetLength(Environment, 2);
+  if AMode = SuccessfulAcknowledgementCompilerProxyMode then
+    Environment[0] := ProcessTreeProxyModeEnvironment + '='
+      + ImmediateAcknowledgementLeafProxyMode
+  else
+    Environment[0] := ProcessTreeProxyModeEnvironment + '='
+      + FailedAcknowledgementLeafProxyMode;
+  Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + APIDFile;
+  Child := TProcess.Create(nil);
+  ChildTree := TLWPTProcessTree.Create(Child);
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    ConfigureProcessEnvironment(Child, Environment);
+    ChildTree.Execute;
+    Started := Now;
+    while (not FileExists(APIDFile + '-descendant')) and Child.Running
+      and ((Now - Started) * SecondsPerDay
+        < ProcessStartupCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    if not FileExists(APIDFile + '-descendant') then Exit(2);
+    WriteTextFile(APIDFile + '-owner', IntToStr(GetProcessID));
+    while Child.Running do Sleep(ProcessPollMilliseconds);
+    Child.WaitOnExit;
+    { The forwarding thread owns the cancellation decision, while this main
+      thread reaps the fixture child so Unix process-group membership can
+      become empty before the inherited absolute deadline. }
+    Sleep(LongRunningFixtureMilliseconds);
+    Result := 0;
+  finally
+    if Child.Running then
+      try
+        ChildTree.Terminate;
+      except
+        Child.Terminate(1);
+      end;
+    ChildTree.Free;
+    Child.Free;
+  end;
+end;
+
+function SiblingAcknowledgementMarkersReady(const APIDFile: string): Boolean;
+var
+  SourceIndex: Integer;
+begin
+  for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+    if not FileExists(APIDFile + '-'
+      + SiblingSlowSources[SourceIndex]) then
+      Exit(False);
+  Result := True;
+end;
 
 function RunProcessTreeCompilerProxy: Integer;
 var
@@ -735,28 +1962,85 @@ begin
   if ParamCount > 0 then SourceFile := ExtractFileName(ParamStr(ParamCount))
   else SourceFile := '';
 
+  if (Mode = SuccessfulAcknowledgementLeafProxyMode)
+     or (Mode = ImmediateAcknowledgementLeafProxyMode)
+     or (Mode = FailedAcknowledgementLeafProxyMode)
+     or (Mode = CleanAcknowledgementExitProxyMode) then
+    Exit(RunAcknowledgementLeaf(Mode, PIDFile));
+  if Mode = InheritedChannelProbeProxyMode then
+  begin
+    InstallProcessTreeSignalForwarding;
+    WriteTextFile(PIDFile, IntToStr(GetProcessID));
+    Sleep(LongRunningFixtureMilliseconds);
+    Exit(0);
+  end;
+  if ((Mode = SuccessfulAcknowledgementCompilerProxyMode)
+      or (Mode = FailedAcknowledgementCompilerProxyMode))
+     and SameText(SourceFile, 'A.Slow.Test.pas') then
+    Exit(RunAcknowledgementOwner(Mode, PIDFile));
+  if (Mode = SuccessfulAcknowledgementCompilerProxyMode)
+     or (Mode = FailedAcknowledgementCompilerProxyMode) then
+  begin
+    Started := Now;
+    while ((not FileExists(PIDFile + '-owner'))
+      or (not FileExists(PIDFile + '-descendant')))
+      and ((Now - Started) * SecondsPerDay
+        < MarkerWaitCeilingSeconds) do
+      Sleep(ProcessPollMilliseconds);
+    Exit(0);
+  end;
+
   {$IFDEF UNIX}
   if Mode = IgnoreTerminateCompilerProxyMode then
     FpSignal(SIGTERM, SignalHandler(SIG_IGN));
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  if Mode = WindowsIgnoreControlCompilerProxyMode then
+    if not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
+      True) then Exit(2);
+  {$ENDIF}
+  if (Mode = MissingAcknowledgementCompilerProxyMode)
+     or (Mode = MissingAcknowledgementSiblingCompilerProxyMode) then
+  begin
+    InstallProcessTreeSignalForwarding;
+    CloseInheritedStatusHandle;
+  end;
   if (Mode = SlowCompilerProxyMode)
      or (Mode = IgnoreTerminateCompilerProxyMode)
+     or ((Mode = MissingAcknowledgementCompilerProxyMode)
+       and SameText(SourceFile, 'A.Slow.Test.pas'))
+     or ((Mode = MissingAcknowledgementSiblingCompilerProxyMode)
+       and not SameText(SourceFile, 'B.Error.Test.pas'))
+     {$IFDEF MSWINDOWS}
+     or (Mode = WindowsIgnoreControlCompilerProxyMode)
+     {$ENDIF}
      or ((Mode = WorkerErrorCompilerProxyMode)
        and SameText(SourceFile, 'A.Slow.Test.pas')) then
   begin
+    if Mode = MissingAcknowledgementSiblingCompilerProxyMode then
+      PIDFile := PIDFile + '-' + SourceFile;
     WriteTextFile(PIDFile, IntToStr(GetProcessID));
     Sleep(LongRunningFixtureMilliseconds);
     Exit(0);
   end;
 
-  if Mode = WorkerErrorCompilerProxyMode then
+  if (Mode = WorkerErrorCompilerProxyMode)
+     or (Mode = MissingAcknowledgementCompilerProxyMode)
+     or (Mode = MissingAcknowledgementSiblingCompilerProxyMode) then
   begin
     { Returning compiler success without creating B.Error's binary makes its
       runtime TProcess.Execute raise, driving AbortWithError while A is live. }
     Started := Now;
-    while (not FileExists(PIDFile))
-      and ((Now - Started) * SecondsPerDay < MarkerWaitCeilingSeconds) do
+    while (((Mode = MissingAcknowledgementSiblingCompilerProxyMode)
+      and not SiblingAcknowledgementMarkersReady(PIDFile))
+      or ((Mode <> MissingAcknowledgementSiblingCompilerProxyMode)
+        and (not FileExists(PIDFile))))
+    and ((Now - Started) * SecondsPerDay < MarkerWaitCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
+    if (Mode = MissingAcknowledgementSiblingCompilerProxyMode)
+       and SiblingAcknowledgementMarkersReady(PIDFile) then
+      WriteTextFile(PIDFile + SiblingCancellationStartedSuffix,
+        UIntToStr(GetTickCount64));
     Exit(0);
   end;
   Result := 1;
@@ -777,11 +2061,41 @@ begin
     TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
   Test('worker error terminates another active process tree',
     TestWorkerErrorTerminatesActiveProcessTree);
+  Test('successful nested termination acknowledgement completes cancellation',
+    TestSuccessfulTerminationAcknowledgementCompletesCancellation);
+  Test('successful acknowledgement has a separate final reap window',
+    TestSuccessfulAcknowledgementHasSeparateReapWindow);
+  Test('managed and unmanaged spawns share one critical section',
+    TestManagedAndUnmanagedSpawnsShareCriticalSection);
+  Test('already-exited registered process tree is a successful no-op',
+    TestExitedRegisteredProcessTreeIsSuccessfulNoOp);
+  Test('failed descendant termination acknowledgement propagates to ancestor',
+    TestFailedNestedTerminationAcknowledgementFailsCancellation);
+  Test('missing nested termination acknowledgement fails cancellation',
+    TestMissingTerminationAcknowledgementFailsCancellation);
+  Test('registered sibling cancellations share one fanout',
+    TestSiblingTerminationAcknowledgementsShareFanout);
+  Test('process-tree protocol framing is bounded and incremental',
+    TestProtocolFramingIsBoundedAndIncremental);
+  Test('process failure survives delegation cleanup failure',
+    TestProcessFailureSurvivesDelegationCleanupFailure);
   {$IFDEF UNIX}
   Test('SIGINT reaps the active compiler tree',
     TestSIGINTTerminatesActiveProcessTree);
   Test('SIGTERM reaps the active compiler tree',
     TestSIGTERMTerminatesActiveProcessTree);
+  Test('inherited acknowledgement channel rejects regular files',
+    TestInheritedChannelRejectsRegularFiles);
+  Test('inherited acknowledgement channel rejects wrong pipe direction',
+    TestInheritedChannelRejectsWrongPipeDirection);
+  Test('acknowledgement control read is bounded for EOF and no data',
+    TestAcknowledgementControlReadIsBounded);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Test('Ctrl-C reaps the active compiler Job Object',
+    TestCtrlCTerminatesActiveProcessTree);
+  Test('Ctrl-Break reaps the active compiler Job Object',
+    TestCtrlBreakTerminatesActiveProcessTree);
   {$ENDIF}
   Test('silent jobs emit heartbeat and serialized progress',
     TestSilentJobEmitsHeartbeatAndProgress);
@@ -792,6 +2106,11 @@ begin
 end;
 
 begin
+  {$IFDEF MSWINDOWS}
+  if (ParamCount = 6)
+     and (ParamStr(1) = WindowsConsoleControllerOption) then
+    Halt(RunWindowsConsoleController);
+  {$ENDIF}
   if GetEnvironmentVariable(ProcessTreeProxyModeEnvironment) <> '' then
     Halt(RunProcessTreeCompilerProxy);
   TestRunnerProgram.AddSuite(TTestScheduling.Create('TestScheduling'));

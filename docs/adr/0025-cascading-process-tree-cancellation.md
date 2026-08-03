@@ -7,13 +7,17 @@
   pipe. A dedicated thread reaps every registered child group before
   re-delivering the signal, using an accelerated path when an ancestor
   forwarded the signal.
-- **Windows scheduler cancellation uses nested Job Object termination.** Bail
-  and worker-error paths terminate registered jobs, but console-control
-  forwarding for Ctrl-C and Ctrl-Break is deferred as a tracked follow-up.
+- **Windows cancellation combines console-control forwarding with nested Job
+  Object termination.** A minimal Ctrl-C/Ctrl-Break callback wakes a dedicated
+  thread, which terminates registered jobs before the LWPT process exits.
 - **Cancellation completes only after the isolated tree is empty.** A
   successful SIGKILL or `TerminateJobObject` call is followed by a bounded
-  membership poll; real API failures become scheduler failures after a
-  best-effort direct-child fallback.
+  membership poll and, on Windows, a direct process-exit barrier. Real API
+  failures become scheduler failures after a best-effort direct-child fallback.
+- **Nested LWPT completion is positively acknowledged.** A token-bound,
+  versioned status-pipe protocol distinguishes a registered nested LWPT from
+  an arbitrary child and reports reaped or failed teardown before the ancestor
+  accepts cancellation as complete.
 
 LWPT schedulers isolate each direct compiler or test process so cancellation
 can terminate that process and the descendants it launches. A nested LWPT
@@ -59,6 +63,22 @@ either command can create a managed tree. Commands such as `--version`, help,
 format, and install do not create the pipe or forwarding thread and cannot fail
 because those resources are unavailable.
 
+Every managed tree receives a random 128-bit channel token and two inherited
+anonymous pipes. The child-to-parent status pipe carries one bounded
+`LWPT-ACK/1` hello frame when a nested LWPT installs forwarding, then exactly
+one terminal `REAPED` or `FAILED` frame during cancellation. Frames must match
+the inherited token; unknown versions, tokens, and frame kinds do not register
+a child. The inherited metadata also names the spawning LWPT process; a nested
+LWPT accepts the channel only when that PID is its current operating-system
+parent, so an intermediate program cannot accidentally forward ownership to a
+grandchild. A process that never sends hello remains an arbitrary child and is
+never ACK-gated. The parent-to-child pipe carries one bounded cancel frame with
+the root-authored absolute monotonic descendant and acknowledgement deadlines.
+On Unix this deadline frame accompanies SIGINT/SIGTERM propagation; on Windows
+it is also the cooperative cancellation request. The channel is internal,
+inherited only through the process tree, and introduces no manifest or public
+command surface.
+
 Unix process-tree cancellation sends SIGTERM to the process group, waits a
 short grace period, sends SIGKILL if members remain, then polls
 `kill(-pgid, 0)` until it returns ESRCH. EPERM proves that members still exist;
@@ -67,30 +87,49 @@ failure.
 
 That graceful path applies to direct scheduler cancellation, including numeric
 test bail and worker or build failure, and to an external signal received by a
-top-level LWPT. Each managed child inherits an internal environment marker.
-When a marked, nested LWPT receives a forwarded signal, it skips SIGTERM grace:
-it first sends SIGKILL to every registered group, then polls every group against
-one shared 100 ms deadline before re-delivering the original signal. Per-tree
-locks cover process state and signal operations but not sleep intervals, so
-this immediate request can pre-empt a concurrent graceful cancellation. The
-accelerated bound is shorter than the ancestor's 250 ms grace, ensuring that a
-nested compiler group collapses before the ancestor can kill the nested LWPT.
+top-level LWPT. A registered nested LWPT receives the cancel frame before its
+process group receives SIGTERM. It immediately fans the same absolute
+deadlines to all registered nested children, hard-kills arbitrary children,
+and acknowledges its direct parent only after every owned tree and descendant
+ACK succeeds. A missing, failed, or late ACK makes the owner SIGKILL the group
+and report cancellation failure. Per-tree locks cover process state and signal
+operations but not sleep intervals, so an ancestor request can pre-empt a
+concurrent graceful cancellation.
 
 On Windows, each direct child is created suspended and assigned to an
 invocation-private Job Object before it resumes. Windows 8 introduced nested
 jobs, allowing a child inherited from an enclosing LWPT or host job to join
 the inner job. Windows 8 or later is therefore the minimum supported runtime
-for this ownership model. Cancellation explicitly calls `TerminateJobObject`
-and polls `JobObjectBasicAccountingInformation.ActiveProcesses` until zero.
+for this ownership model. A typed Windows state object owns the Job Object
+handle and its assign, query, terminate, wait, and cleanup operations;
+`TLWPTProcessTree` retains only orchestration and direct-child fallback.
+Cancellation explicitly calls `TerminateJobObject`, polls
+`JobObjectBasicAccountingInformation.ActiveProcesses` until zero, and waits
+for the direct child's process handle to become signaled under the same
+deadline. The accounting value is membership evidence, not a process-exit
+completion barrier; returning before the handle is signaled can expose
+`STILL_ACTIVE` and retained child file handles to the caller.
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is not used: closing an ownership handle
 after successful execution must not introduce cancellation semantics.
 
-Windows console-control forwarding is deferred as a tracked follow-up to this
-decision. Ctrl-C and Ctrl-Break are not yet wired into the process-tree
-registry. Numeric bail and worker-error cancellation still terminate each
-owned Job Object, including the jobs and processes created by nested LWPT
-invocations. Unix SIGINT and SIGTERM forwarding remain implemented as
-described above.
+Windows installs a `SetConsoleCtrlHandler` callback on the same build/test
+dispatch paths. Because Windows invokes the callback on an operating-system
+thread, the callback only signals a Win32 event and returns handled. An
+FPC-created forwarding thread performs registry traversal, Job Object
+termination, reporting, and process exit. Both Ctrl-C and Ctrl-Break take this
+path. The callback has no pipe, registry, allocation, or Job Object work.
+For a registered nested LWPT, the owner writes the cancel frame through the
+paired control pipe instead of immediately terminating its Job Object. The
+nested control thread fans cancellation through its own jobs and writes the
+terminal status frame. A missing, failed, or late terminal frame escalates to
+`TerminateJobObject`. Nested console callbacks acknowledge the broadcast but
+leave pipe, registry, and Job Object work to that control thread.
+
+The root fixes the descendant-reap deadline at 100 ms and the ancestor ACK
+deadline at 250 ms. Every level forwards those absolute `GetTickCount64`
+values unchanged, so depth cannot restart either allowance. Each level fans
+out before it waits, aggregating completion hop by hop. Hard escalation retains
+the existing 3,000 ms membership/process-exit verification bound.
 
 Only an already-empty group or job is a successful no-op. Permission errors,
 unexpected membership-query errors, termination API failures, and bounded
@@ -104,12 +143,12 @@ instead of disguising the error as successful cleanup.
 
 ## Consequences
 
-- Unix SIGINT or SIGTERM, numeric test bail, worker failure, and ancestor
-  cancellation all follow the same child-tree ownership contract. Windows
-  Ctrl-C and Ctrl-Break forwarding remain deferred.
+- A terminal Ctrl-C or Ctrl-Break, Unix SIGINT or SIGTERM, numeric test bail,
+  worker failure, and ancestor cancellation all follow the same child-tree
+  ownership contract.
 - On Unix, a top-level signal permits one grace interval for nested LWPT to
-  forward it; marked inner levels collapse their owned groups immediately and
-  finish before that outer grace expires.
+  forward it; registered inner levels confirm descendant teardown before that
+  outer grace expires.
 - Scheduler cancellation can take the configured grace period plus a bounded
   reap interval. Returning earlier would reintroduce the file-handle and rerun
   race this contract prevents.
@@ -119,8 +158,7 @@ instead of disguising the error as successful cleanup.
 - Closing a Windows Job Object after normal completion is now observationally
   equivalent to releasing bookkeeping; descendants are terminated only by an
   explicit cancellation request.
-- There is no cross-process acknowledgement channel. A failing LWPT level
-  reports its own teardown error, but an ancestor already cancelling it cannot
-  reliably distinguish that failure from the requested signal exit. Adding an
-  acknowledgement protocol is a separate design problem; this decision closes
-  the in-process error-discarding gap without claiming cross-process delivery.
+- Nested LWPT teardown failure is visible at every ownership boundary. Missing,
+  malformed, token-mismatched, failed, and late acknowledgements fail closed
+  and trigger owner-local hard escalation; arbitrary child programs retain the
+  ordinary group/job cancellation path without an acknowledgement requirement.
