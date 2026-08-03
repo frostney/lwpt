@@ -559,8 +559,15 @@ begin
     TestProcess.Executable := Binary;
     CopyCurrentEnvironment(TestProcess.Environment);
     AppendWorkerLeaseEnvironment(TestProcess.Environment, ALease);
-    Code := RunProcess(AIndex, TestProcess, '', False, 0,
-      'test executable', Output, StandardError);
+    try
+      Code := RunProcess(AIndex, TestProcess, '', False, 0,
+        'test executable', Output, StandardError);
+    finally
+      { A child normally consumes the one-shot token during startup. If it
+        never does, return the still-pending grant before this live scheduler
+        asks for another worker. Successful consumption makes this a no-op. }
+      ALease.CancelPendingDelegation;
+    end;
   finally
     TestProcess.Free;
   end;

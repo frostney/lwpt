@@ -71,6 +71,7 @@ type
     constructor Create(AOwner: TLWPTWorkerBudgetSession; const AToken: string);
     destructor Destroy; override;
     procedure Release;
+    procedure CancelPendingDelegation;
   end;
 
   TLWPTWorkerBudgetSession = class
@@ -92,6 +93,7 @@ type
     FAcquireCriticalSectionReady : Boolean;
     procedure TouchHeartbeat;
     procedure ReleaseLease(ALease: TLWPTWorkerLease);
+    procedure CancelPendingDelegation(ALease: TLWPTWorkerLease);
     procedure AbandonLease(ALease: TLWPTWorkerLease);
     function CreateDelegation(ALease: TLWPTWorkerLease): string;
     function IsClosed: Boolean;
@@ -1808,7 +1810,11 @@ begin
     Entries := LoadEntries;
     PruneEntries(Entries);
     Index := FindEntry(Entries, FSessionId);
-    if (Index >= 0)
+    { CreateDelegation transfers local ownership to a durable one-shot token.
+      Releasing the parent-side wrapper must not revoke that token while the
+      child is between process start and delegation consumption. The owning
+      session still bounds the pending grant and reclaims it on teardown. }
+    if (not ALease.FDelegated) and (Index >= 0)
        and HasLeaseToken(Entries[Index].LeaseTokens, ALease.FToken) then
     begin
       RemoveDelegationsForLease(Entries[Index].Delegations,
@@ -1841,6 +1847,37 @@ begin
     finally
       LeaveCriticalSection(FLocalCriticalSection);
     end;
+  finally
+    Transaction.Free;
+  end;
+end;
+
+procedure TLWPTWorkerBudgetSession.CancelPendingDelegation(
+  ALease: TLWPTWorkerLease);
+var
+  Transaction : TLWPTWorkerStateTransaction;
+  Entries : TLWPTWorkerBudgetEntryArray;
+  Index : Integer;
+  LeaseDigest : string;
+begin
+  if (ALease = nil) or not ALease.FDelegated then Exit;
+  LeaseDigest := LeaseTokenDigest(ALease.FToken);
+  Transaction := TLWPTWorkerStateTransaction.Create;
+  try
+    Entries := LoadEntries;
+    PruneEntries(Entries);
+    Index := FindEntry(Entries, FSessionId);
+    if (Index < 0)
+       or not HasLeaseToken(Entries[Index].LeaseTokens, ALease.FToken)
+       or not LeaseHasDelegation(
+         Entries[Index].Delegations, LeaseDigest) then Exit;
+    RemoveDelegationsForLease(Entries[Index].Delegations, LeaseDigest);
+    RemoveLeaseToken(Entries[Index].LeaseTokens, ALease.FToken);
+    if Entries[Index].Granted > 0 then Dec(Entries[Index].Granted);
+    if Entries[Index].Granted = 0 then
+      Entries[Index].LeaseStartedAt := 0;
+    Entries[Index].HeartbeatAt := NowMilliseconds;
+    WriteEntry(Entries[Index]);
   finally
     Transaction.Free;
   end;
@@ -1934,6 +1971,12 @@ begin
   if FOwner <> nil then FOwner.ReleaseLease(Self);
   FReleased := True;
   FOwner := nil;
+end;
+
+procedure TLWPTWorkerLease.CancelPendingDelegation;
+begin
+  if FReleased or (FOwner = nil) or not FDelegated then Exit;
+  FOwner.CancelPendingDelegation(Self);
 end;
 
 procedure TLWPTWorkerLease.Detach;
