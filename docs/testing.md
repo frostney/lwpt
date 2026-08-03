@@ -235,7 +235,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`tests/integration/BuildSessions.Test.pas`** | 12 tests in 1 suite | Uses the test executable as a controllable FPC proxy to cover concurrent sessions, stale publication, parallel ready entries, prerequisite publication ordering, `--jobs=1`, failure isolation, deterministic manifest-order results on Unix and Windows, heartbeat observability, and the fail-closed lost-proxy dispatch guard (redacted environment dump, exit 126). |
 | **`tests/integration/Agents.Test.pas`** | 14 tests in 1 suite | Covers the `lwpt agents` command-reference generator: section synthesis from the live subcommand registry, `--check` drift detection, marker preservation, and idempotent regeneration. |
 | **`tests/integration/Run.Test.pas`** | 6 tests in 1 suite | Spawns `lwpt run` against scratch projects. Covers user-script execution and exit-code propagation, built-in aliasing with flag passthrough, unknown-script errors, list mode omitting retired `export`, and `export` as an allowed user script name. |
-| **`tests/integration/TestScheduling.Test.pas`** | 12 tests in 1 suite | Cross-platform subprocess coverage for default overlap, deterministic `--jobs=1` ordering, `--bail=0` override, compile failures counting toward bail, and the amended bail contract: stop new work, terminate and reap active children, and print sorted diagnostics. Unix runs native SIGINT/SIGTERM forwarding regressions; Windows runs matching Ctrl-C/Ctrl-Break Job Object reaping regressions. |
+| **`tests/integration/TestScheduling.Test.pas`** | 17 tests in 1 suite | Cross-platform subprocess coverage for default overlap, deterministic `--jobs=1` ordering, `--bail=0` override, compile failures counting toward bail, and the amended bail contract: stop new work, fan cancellation to active siblings under one absolute deadline, terminate and reap active children, and print sorted diagnostics. Unix runs native SIGINT/SIGTERM forwarding regressions; Windows runs matching Ctrl-C/Ctrl-Break Job Object reaping regressions. A nested owner-and-descendant fixture proves successful hop-by-hop acknowledgement and propagated `FAILED`; separate fixtures pin missing terminal acknowledgement and bounded incremental/trailing protocol framing. |
 | **`tests/integration/Version.Test.pas`** | 4 tests in 1 suite | Spawns version-reporting forms and verifies output shape plus drift protection against `lwpt.toml`'s `[package].version`. |
 
 ### E2E tier
@@ -274,9 +274,9 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | Tier | Files | Test cases |
 | --- | --- | --- |
 | Unit (`source/*.Test.pas` + package self-tests) | 26 | 475 |
-| Integration (`tests/integration/*.Test.pas`) | 22 | 218 |
+| Integration (`tests/integration/*.Test.pas`) | 22 | 223 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 7 | 35 |
-| **Total** | **55** | **728** |
+| **Total** | **55** | **733** |
 
 ### Planned testing work
 

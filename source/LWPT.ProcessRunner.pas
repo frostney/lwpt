@@ -43,7 +43,10 @@ type
     function Run(const AStandardInput: string;
       const AOptions: TLWPTProcessRunOptions; out AStandardOutput,
       AStandardError: string): Integer;
+    procedure BeginCancel(const ADescendantDeadline,
+      AAcknowledgementDeadline: QWord);
     procedure Cancel;
+    procedure CompleteCancel;
     property UsedStandardInputWriter: Boolean
       read FUsedStandardInputWriter;
   end;
@@ -724,6 +727,18 @@ end;
 procedure TLWPTDuplexProcessRunner.Cancel;
 begin
   if FStarted then FProcessTree.Terminate;
+end;
+
+procedure TLWPTDuplexProcessRunner.BeginCancel(
+  const ADescendantDeadline, AAcknowledgementDeadline: QWord);
+begin
+  if FStarted then FProcessTree.BeginTermination(ADescendantDeadline,
+    AAcknowledgementDeadline);
+end;
+
+procedure TLWPTDuplexProcessRunner.CompleteCancel;
+begin
+  if FStarted then FProcessTree.CompleteTermination;
 end;
 
 initialization

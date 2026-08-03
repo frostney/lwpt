@@ -14,7 +14,8 @@ uses
 
   LWPT.CompilerRegistry,
   LWPT.Core,
-  LWPT.ProcessRunner;
+  LWPT.ProcessRunner,
+  LWPT.ProcessTree;
 
 type
   { Public so the cross-platform cancellation/reaping contract can be tested
@@ -37,7 +38,10 @@ type
       const AStandardInput: string; const ASeparateStandardError: Boolean;
       const ATimeoutMilliseconds: QWord; const AOperationName: string;
       out AStandardOutput, AStandardError: string): Integer; overload;
+    procedure BeginCancel(const ADescendantDeadline,
+      AAcknowledgementDeadline: QWord);
     procedure Cancel;
+    procedure CompleteCancel;
   end;
 
 function CmdBuild(const AManifestPath: string;
@@ -110,7 +114,10 @@ type
       const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
       const ADriver: TLWPTCompilerDriver);
     destructor Destroy; override;
+    procedure BeginCancel(const ADescendantDeadline,
+      AAcknowledgementDeadline: QWord);
     procedure Cancel;
+    procedure CompleteCancel;
     function IsDone: Boolean;
     property Compiled: TLWPTCompiledEntry read FCompiled;
     property BuildResult: TLWPTBuildResult read FBuildResult;
@@ -231,11 +238,33 @@ begin
 end;
 
 procedure TLWPTCompilerProcess.Cancel;
+var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
+begin
+  TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
+    AcknowledgementDeadline);
+  BeginCancel(DescendantDeadline, AcknowledgementDeadline);
+  CompleteCancel;
+end;
+
+procedure TLWPTCompilerProcess.BeginCancel(const ADescendantDeadline,
+  AAcknowledgementDeadline: QWord);
 begin
   EnterCriticalSection(FCriticalSection);
   try
     FCancelled := True;
-    if Assigned(FRunner) then FRunner.Cancel;
+    if Assigned(FRunner) then FRunner.BeginCancel(ADescendantDeadline,
+      AAcknowledgementDeadline);
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+end;
+
+procedure TLWPTCompilerProcess.CompleteCancel;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    if Assigned(FRunner) then FRunner.CompleteCancel;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
@@ -676,11 +705,44 @@ end;
 
 procedure TLWPTBuildJob.Cancel;
 var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
+begin
+  TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
+    AcknowledgementDeadline);
+  BeginCancel(DescendantDeadline, AcknowledgementDeadline);
+  CompleteCancel;
+end;
+
+procedure TLWPTBuildJob.BeginCancel(const ADescendantDeadline,
+  AAcknowledgementDeadline: QWord);
+var
   CancellationMessage: string;
 begin
   Terminate;
   try
-    FCompiler.Cancel;
+    FCompiler.BeginCancel(ADescendantDeadline, AAcknowledgementDeadline);
+  except
+    on E: Exception do
+    begin
+      CancellationMessage := 'process-tree termination failed: ' + E.Message;
+      EnterCriticalSection(FDoneCriticalSection);
+      try
+        FCancellationError := CancellationMessage;
+        FSucceeded := False;
+        if FError = '' then FError := CancellationMessage;
+      finally
+        LeaveCriticalSection(FDoneCriticalSection);
+      end;
+    end;
+  end;
+end;
+
+procedure TLWPTBuildJob.CompleteCancel;
+var
+  CancellationMessage: string;
+begin
+  try
+    FCompiler.CompleteCancel;
   except
     on E: Exception do
     begin
@@ -1070,14 +1132,26 @@ var
 
   procedure StopAndFreeJobs;
   var
+    AcknowledgementDeadline, DescendantDeadline: QWord;
     CancellationFailure: string;
+    CancellationStarted: array of Boolean;
     JobIndex: Integer;
   begin
     CancellationFailure := '';
+    SetLength(CancellationStarted, Length(Jobs));
+    TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
+      AcknowledgementDeadline);
     for JobIndex := 0 to High(Jobs) do
       if Assigned(Jobs[JobIndex])
          and (not Jobs[JobIndex].IsDone) then
-        Jobs[JobIndex].Cancel;
+      begin
+        Jobs[JobIndex].BeginCancel(DescendantDeadline,
+          AcknowledgementDeadline);
+        CancellationStarted[JobIndex] := True;
+      end;
+    for JobIndex := 0 to High(Jobs) do
+      if CancellationStarted[JobIndex] then
+        Jobs[JobIndex].CompleteCancel;
     for JobIndex := 0 to High(Jobs) do
       if Assigned(Jobs[JobIndex]) then
       begin

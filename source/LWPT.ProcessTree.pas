@@ -15,6 +15,8 @@ uses
   LWPT.Core;
 
 type
+  TLWPTProtocolReadResult = (prrPending, prrFrame, prrRejected);
+
   TLWPTProcessTree = class
   private
     {$IFDEF MSWINDOWS}
@@ -41,26 +43,53 @@ type
     FRegistered: Boolean;
     FImmediateTerminationRequested: LongInt;
     FTerminationCriticalSection: TRTLCriticalSection;
+    FCriticalSectionInitialized: Boolean;
+    FStatusReadHandle: PtrInt;
+    FChildStatusWriteHandle: PtrInt;
+    FControlWriteHandle: PtrInt;
+    FChildControlReadHandle: PtrInt;
+    FChannelToken: string;
+    FStatusBuffer: string;
+    FAcknowledgementRegistered: Boolean;
+    FAcknowledgementFinished: Boolean;
+    FAcknowledgementSucceeded: Boolean;
+    FCancellationStarted: Boolean;
+    FCancellationAcknowledgementRequired: Boolean;
+    FCancellationAcknowledgementDeadline: QWord;
     {$IFDEF UNIX}
     procedure HandleFork(ASender: TObject);
     {$ENDIF}
     procedure RegisterActive;
     procedure UnregisterActive;
+    procedure CreateAcknowledgementChannels;
+    procedure CloseAcknowledgementChannels;
+    procedure CloseChildAcknowledgementHandles;
     procedure MarkManagedChild;
-    procedure BeginForwardedTermination;
+    procedure DrainAcknowledgementFrames;
+    function SendCancellationFrame(const ADescendantDeadline,
+      AAcknowledgementDeadline: QWord): Boolean;
+    procedure BeginForwardedTermination(const ADescendantDeadline,
+      AAcknowledgementDeadline: QWord);
     procedure WaitForForwardedTermination(const ADeadline: QWord);
     procedure TryTerminateDirectChild;
     {$IFDEF MSWINDOWS}
     procedure TerminateCreatedProcess;
     {$ENDIF}
   public
+    class procedure NewTerminationDeadlines(out ADescendantDeadline,
+      AAcknowledgementDeadline: QWord); static;
     constructor Create(const AProcess: TProcess);
     destructor Destroy; override;
+    procedure BeginTermination(const ADescendantDeadline,
+      AAcknowledgementDeadline: QWord);
+    procedure CompleteTermination;
     procedure Execute;
     procedure Terminate;
   end;
 
 procedure InstallProcessTreeSignalForwarding;
+function FeedProcessTreeProtocol(var ABuffer: string;
+  const ABytes: string; out ALine: string): TLWPTProtocolReadResult;
 
 implementation
 
@@ -90,6 +119,15 @@ const
   SignalExitCodeBase = 128;
   ProcessGroupSetupError = 'process tree isolation setup failed'#10;
   ManagedProcessTreeEnvironment = PROJECT_NAME + '_PROCESS_TREE_PARENT';
+  StatusHandleEnvironment = PROJECT_NAME + '_PROCESS_TREE_STATUS_HANDLE';
+  ControlHandleEnvironment = PROJECT_NAME + '_PROCESS_TREE_CONTROL_HANDLE';
+  ChannelTokenEnvironment = PROJECT_NAME + '_PROCESS_TREE_CHANNEL_TOKEN';
+  AcknowledgementProtocol = 'LWPT-ACK/1';
+  AcknowledgementHello = 'HELLO';
+  AcknowledgementCancel = 'CANCEL';
+  AcknowledgementReaped = 'REAPED';
+  AcknowledgementFailed = 'FAILED';
+  ProtocolBufferCapacity = 4096;
 
   {$IFDEF MSWINDOWS}
   JobObjectBasicAccountingInformationClass = 1;
@@ -100,6 +138,10 @@ var
   ActiveProcessTrees: TList;
   ActiveProcessTreesCriticalSection: TRTLCriticalSection;
   SignalForwardingInstalled: Boolean = False;
+  InheritedStatusWriteHandle: PtrInt = -1;
+  InheritedControlReadHandle: PtrInt = -1;
+  InheritedChannelToken: string = '';
+  InheritedControlBuffer: string = '';
 
 {$IFDEF UNIX}
 const
@@ -178,12 +220,18 @@ type
     procedure Execute; override;
   end;
 
+  TLWPTInheritedControlForwarder = class(TThread)
+  protected
+    procedure Execute; override;
+  end;
+
 const
   WindowsControlExitCode = DWORD($C000013A);
 
 var
   ConsoleControlEvent: THandle = 0;
   ConsoleControlForwarder: TLWPTConsoleControlForwarder = nil;
+  InheritedControlForwarder: TLWPTInheritedControlForwarder = nil;
 
 function LWPTCreateJobObject(const ASecurityAttributes: Pointer;
   const AName: PWideChar): THandle; stdcall;
@@ -272,10 +320,243 @@ begin
 end;
 {$ENDIF}
 
+function ProtocolFrame(const AToken, AKind: string): string;
+begin
+  Result := AcknowledgementProtocol + ' ' + AToken + ' ' + AKind
+    + LineEnding;
+end;
+
+function CancellationFrame(const AToken: string;
+  const ADescendantDeadline, AAcknowledgementDeadline: QWord): string;
+begin
+  Result := AcknowledgementProtocol + ' ' + AToken + ' '
+    + AcknowledgementCancel + ' ' + UIntToStr(ADescendantDeadline) + ' '
+    + UIntToStr(AAcknowledgementDeadline) + LineEnding;
+end;
+
+function WriteProtocolFrame(const AHandle: PtrInt;
+  const AFrame: string): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  BytesWritten: DWORD;
+{$ENDIF}
+begin
+  if (AHandle < 0) or (AFrame = '') then Exit(False);
+  {$IFDEF UNIX}
+  Result := FpWrite(AHandle, AFrame[1], Length(AFrame)) = Length(AFrame);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  BytesWritten := 0;
+  Result := Windows.WriteFile(THandle(AHandle), AFrame[1], Length(AFrame),
+    BytesWritten, nil) and (BytesWritten = DWORD(Length(AFrame)));
+  {$ENDIF}
+end;
+
+procedure CloseProtocolHandle(var AHandle: PtrInt);
+begin
+  if AHandle < 0 then Exit;
+  {$IFDEF UNIX}
+  FpClose(AHandle);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows.CloseHandle(THandle(AHandle));
+  {$ENDIF}
+  AHandle := -1;
+end;
+
+function NewChannelToken: string;
+var
+  ChannelID: TGUID;
+begin
+  if CreateGUID(ChannelID) <> 0 then
+    raise EOSError.Create('could not create process-tree channel token');
+  Result := GUIDToString(ChannelID);
+  Result := StringReplace(Result, '{', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '}', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '-', '', [rfReplaceAll]);
+end;
+
 {$IFDEF UNIX}
 function ProcessGroupExists(const AProcessGroupID: LongInt;
   out AErrorCode: Integer): Boolean; forward;
 {$ENDIF}
+
+function TryReadProtocolBytes(const AHandle: PtrInt;
+  out ABytes: string): Boolean;
+const
+  ReadCapacity = 512;
+{$IFDEF UNIX}
+var
+  Buffer: array[0..ReadCapacity - 1] of Byte;
+  BytesRead: LongInt;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Available, BytesRead: DWORD;
+  Buffer: array[0..ReadCapacity - 1] of Byte;
+{$ENDIF}
+begin
+  Result := False;
+  ABytes := '';
+  if AHandle < 0 then Exit;
+  {$IFDEF UNIX}
+  BytesRead := FpRead(AHandle, Buffer, SizeOf(Buffer));
+  if BytesRead <= 0 then Exit;
+  SetLength(ABytes, BytesRead);
+  Move(Buffer[0], ABytes[1], BytesRead);
+  Result := True;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Available := 0;
+  if not Windows.PeekNamedPipe(THandle(AHandle), nil, 0, nil,
+    @Available, nil) then Exit;
+  if Available = 0 then Exit;
+  if Available > SizeOf(Buffer) then Available := SizeOf(Buffer);
+  BytesRead := 0;
+  if not Windows.ReadFile(THandle(AHandle), Buffer[0], Available,
+    BytesRead, nil) or (BytesRead = 0) then Exit;
+  SetLength(ABytes, BytesRead);
+  Move(Buffer[0], ABytes[1], BytesRead);
+  Result := True;
+  {$ENDIF}
+end;
+
+function FeedProcessTreeProtocol(var ABuffer: string;
+  const ABytes: string; out ALine: string): TLWPTProtocolReadResult;
+var
+  NewlinePosition: Integer;
+begin
+  ALine := '';
+  ABuffer := ABuffer + ABytes;
+  if Length(ABuffer) > ProtocolBufferCapacity then
+  begin
+    ABuffer := '';
+    Exit(prrRejected);
+  end;
+  NewlinePosition := Pos(#10, ABuffer);
+  if NewlinePosition = 0 then Exit(prrPending);
+  ALine := Trim(Copy(ABuffer, 1, NewlinePosition - 1));
+  Delete(ABuffer, 1, NewlinePosition);
+  Result := prrFrame;
+end;
+
+function ReadProtocolLineBefore(const AHandle: PtrInt;
+  const ADeadline: QWord; var ABuffer: string;
+  out ALine: string): Boolean;
+var
+  Bytes: string;
+  ReadResult: TLWPTProtocolReadResult;
+begin
+  ReadResult := FeedProcessTreeProtocol(ABuffer, '', ALine);
+  if ReadResult <> prrPending then Exit(True);
+  repeat
+    if TryReadProtocolBytes(AHandle, Bytes) then
+      ReadResult := FeedProcessTreeProtocol(ABuffer, Bytes, ALine)
+    else
+    begin
+      Sleep(ProcessTreeTerminatePollMilliseconds);
+      ReadResult := prrPending;
+    end;
+  until (ReadResult <> prrPending) or (GetTickCount64 >= ADeadline);
+  Result := ReadResult <> prrPending;
+end;
+
+function ParseCancellationFrame(const ALine, AToken: string;
+  out ADescendantDeadline, AAcknowledgementDeadline: QWord): Boolean;
+var
+  Fields: TStringList;
+begin
+  Result := False;
+  ADescendantDeadline := 0;
+  AAcknowledgementDeadline := 0;
+  Fields := TStringList.Create;
+  try
+    Fields.Delimiter := ' ';
+    Fields.StrictDelimiter := True;
+    Fields.DelimitedText := ALine;
+    if (Fields.Count <> 5)
+       or (Fields[0] <> AcknowledgementProtocol)
+       or (Fields[1] <> AToken)
+       or (Fields[2] <> AcknowledgementCancel) then Exit;
+    if not TryStrToQWord(Fields[3], ADescendantDeadline) then Exit;
+    if not TryStrToQWord(Fields[4], AAcknowledgementDeadline) then Exit;
+    Result := (ADescendantDeadline > 0)
+      and (AAcknowledgementDeadline >= ADescendantDeadline);
+  finally
+    Fields.Free;
+  end;
+end;
+
+procedure TLWPTProcessTree.CreateAcknowledgementChannels;
+{$IFDEF UNIX}
+var
+  ControlPipe, StatusPipe: TFilDes;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  ControlRead, ControlWrite, StatusRead, StatusWrite: THandle;
+  SecurityAttributes: Windows.TSecurityAttributes;
+{$ENDIF}
+begin
+  FStatusReadHandle := -1;
+  FChildStatusWriteHandle := -1;
+  FControlWriteHandle := -1;
+  FChildControlReadHandle := -1;
+  {$IFDEF UNIX}
+  if FpPipe(StatusPipe) <> 0 then RaiseLastOSError;
+  FStatusReadHandle := StatusPipe[0];
+  FChildStatusWriteHandle := StatusPipe[1];
+  try
+    if FpPipe(ControlPipe) <> 0 then RaiseLastOSError;
+    FChildControlReadHandle := ControlPipe[0];
+    FControlWriteHandle := ControlPipe[1];
+    if (FpFcntl(FStatusReadHandle, F_SetFD, FD_CLOEXEC) < 0)
+       or (FpFcntl(FControlWriteHandle, F_SetFD, FD_CLOEXEC) < 0)
+       or (FpFcntl(FStatusReadHandle, F_SetFl, O_NONBLOCK) < 0)
+       or (FpFcntl(FControlWriteHandle, F_SetFl, O_NONBLOCK) < 0) then
+      RaiseLastOSError;
+  except
+    CloseAcknowledgementChannels;
+    raise;
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  FillChar(SecurityAttributes, SizeOf(SecurityAttributes), 0);
+  SecurityAttributes.nLength := SizeOf(SecurityAttributes);
+  SecurityAttributes.bInheritHandle := True;
+  if not Windows.CreatePipe(StatusRead, StatusWrite, @SecurityAttributes,
+    4096) then RaiseLastOSError;
+  FStatusReadHandle := PtrInt(StatusRead);
+  FChildStatusWriteHandle := PtrInt(StatusWrite);
+  try
+    if not Windows.CreatePipe(ControlRead, ControlWrite,
+      @SecurityAttributes, 4096) then RaiseLastOSError;
+    FChildControlReadHandle := PtrInt(ControlRead);
+    FControlWriteHandle := PtrInt(ControlWrite);
+    if not Windows.SetHandleInformation(StatusRead,
+      Windows.HANDLE_FLAG_INHERIT, 0)
+       or not Windows.SetHandleInformation(ControlWrite,
+      Windows.HANDLE_FLAG_INHERIT, 0) then RaiseLastOSError;
+  except
+    CloseAcknowledgementChannels;
+    raise;
+  end;
+  {$ENDIF}
+end;
+
+procedure TLWPTProcessTree.CloseChildAcknowledgementHandles;
+begin
+  CloseProtocolHandle(FChildStatusWriteHandle);
+  CloseProtocolHandle(FChildControlReadHandle);
+end;
+
+procedure TLWPTProcessTree.CloseAcknowledgementChannels;
+begin
+  CloseProtocolHandle(FStatusReadHandle);
+  CloseProtocolHandle(FChildStatusWriteHandle);
+  CloseProtocolHandle(FControlWriteHandle);
+  CloseProtocolHandle(FChildControlReadHandle);
+end;
 
 procedure TLWPTProcessTree.RegisterActive;
 begin
@@ -304,12 +585,27 @@ end;
 constructor TLWPTProcessTree.Create(const AProcess: TProcess);
 begin
   inherited Create;
-  InitCriticalSection(FTerminationCriticalSection);
+  FProcess := nil;
+  FStatusReadHandle := -1;
+  FChildStatusWriteHandle := -1;
+  FControlWriteHandle := -1;
+  FChildControlReadHandle := -1;
+  FCriticalSectionInitialized := False;
   if not Assigned(AProcess) then
     raise EArgumentNilException.Create('process');
   FProcess := AProcess;
+  FChannelToken := NewChannelToken;
+  InitCriticalSection(FTerminationCriticalSection);
+  FCriticalSectionInitialized := True;
   FRegistered := False;
   FImmediateTerminationRequested := 0;
+  FAcknowledgementRegistered := False;
+  FAcknowledgementFinished := False;
+  FAcknowledgementSucceeded := False;
+  FCancellationStarted := False;
+  FCancellationAcknowledgementRequired := False;
+  FCancellationAcknowledgementDeadline := 0;
+  CreateAcknowledgementChannels;
   {$IFDEF UNIX}
   FProcess.OnForkEvent := HandleFork;
   {$ENDIF}
@@ -317,6 +613,7 @@ begin
   FWindowsState := TWindowsState.Create;
   { Windows 8+ permits the suspended child to join this inner job while
     retaining inherited membership in an enclosing LWPT or host job. }
+  FProcess.InheritHandles := True;
   FProcess.Options := FProcess.Options + [poRunSuspended];
   {$ENDIF}
 end;
@@ -339,33 +636,50 @@ begin
   {$ENDIF}
 end;
 
-procedure TLWPTProcessTree.MarkManagedChild;
+procedure SetProcessEnvironmentEntry(const AEnvironment: TStrings;
+  const AName, AValue: string);
 var
   EnvironmentIndex: Integer;
+begin
+  for EnvironmentIndex := AEnvironment.Count - 1 downto 0 do
+    if EnvironmentNamesEqual(
+      EnvironmentEntryName(AEnvironment[EnvironmentIndex]), AName) then
+      AEnvironment.Delete(EnvironmentIndex);
+  AEnvironment.Add(AName + '=' + AValue);
+end;
+
+procedure TLWPTProcessTree.MarkManagedChild;
 begin
   { AppendProcessEnvironment, not a direct sweep: concurrent job threads
     materialising here raced the RTL's unsynchronised lazy env count and
     could truncate a child's environment (see LWPT.Core). }
   if FProcess.Environment.Count = 0 then
     AppendProcessEnvironment(FProcess.Environment);
-  for EnvironmentIndex := FProcess.Environment.Count - 1 downto 0 do
-    if EnvironmentNamesEqual(
-      EnvironmentEntryName(FProcess.Environment[EnvironmentIndex]),
-      ManagedProcessTreeEnvironment) then
-      FProcess.Environment.Delete(EnvironmentIndex);
-  FProcess.Environment.Add(ManagedProcessTreeEnvironment + '=1');
+  SetProcessEnvironmentEntry(FProcess.Environment,
+    ManagedProcessTreeEnvironment, '1');
+  SetProcessEnvironmentEntry(FProcess.Environment,
+    StatusHandleEnvironment, IntToStr(FChildStatusWriteHandle));
+  SetProcessEnvironmentEntry(FProcess.Environment,
+    ControlHandleEnvironment, IntToStr(FChildControlReadHandle));
+  SetProcessEnvironmentEntry(FProcess.Environment,
+    ChannelTokenEnvironment, FChannelToken);
 end;
 
 destructor TLWPTProcessTree.Destroy;
 begin
   UnregisterActive;
+  CloseAcknowledgementChannels;
   {$IFDEF UNIX}
   if Assigned(FProcess) then FProcess.OnForkEvent := nil;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   FreeAndNil(FWindowsState);
   {$ENDIF}
-  DoneCriticalSection(FTerminationCriticalSection);
+  if FCriticalSectionInitialized then
+  begin
+    DoneCriticalSection(FTerminationCriticalSection);
+    FCriticalSectionInitialized := False;
+  end;
   inherited Destroy;
 end;
 
@@ -376,7 +690,8 @@ begin
     and signal(3) are async-signal-safe in this post-fork path. }
   if (CSetProcessGroup(0, 0) = 0)
      and not SignalHandlerFailed(CSignal(SIGTERM, nil))
-     and not SignalHandlerFailed(CSignal(SIGINT, nil)) then Exit;
+     and not SignalHandlerFailed(CSignal(SIGINT, nil))
+     and not SignalHandlerFailed(CSignal(SIGPIPE, nil)) then Exit;
   FpWrite(StdErrorHandle, ProcessGroupSetupError[1],
     Length(ProcessGroupSetupError));
   FpExit(ProcessTreeSetupExitCode);
@@ -420,6 +735,7 @@ begin
     EnterCriticalSection(FTerminationCriticalSection);
     try
       FProcess.Execute;
+      CloseChildAcknowledgementHandles;
       {$IFDEF UNIX}
       { Close the parent/child race: either this call creates the group, or
         EACCES proves the child has passed the pre-exec fork handler. }
@@ -463,12 +779,87 @@ begin
       LeaveCriticalSection(FTerminationCriticalSection);
     end;
   except
+    CloseChildAcknowledgementHandles;
     UnregisterActive;
     raise;
   end;
 end;
 
-procedure TLWPTProcessTree.BeginForwardedTermination;
+procedure TLWPTProcessTree.DrainAcknowledgementFrames;
+var
+  Bytes, ExpectedPrefix, FrameKind, Line: string;
+  NewlinePosition, ReadCount: Integer;
+begin
+  ReadCount := 0;
+  while (ReadCount < 8)
+    and TryReadProtocolBytes(FStatusReadHandle, Bytes) do
+  begin
+    FStatusBuffer := FStatusBuffer + Bytes;
+    Inc(ReadCount);
+  end;
+  if Length(FStatusBuffer) > ProtocolBufferCapacity then
+    Delete(FStatusBuffer, 1,
+      Length(FStatusBuffer) - ProtocolBufferCapacity);
+  ExpectedPrefix := AcknowledgementProtocol + ' ' + FChannelToken + ' ';
+  NewlinePosition := Pos(#10, FStatusBuffer);
+  while NewlinePosition > 0 do
+  begin
+    Line := Trim(Copy(FStatusBuffer, 1, NewlinePosition - 1));
+    Delete(FStatusBuffer, 1, NewlinePosition);
+    if Copy(Line, 1, Length(ExpectedPrefix)) = ExpectedPrefix then
+    begin
+      FrameKind := Copy(Line, Length(ExpectedPrefix) + 1, MaxInt);
+      if FrameKind = AcknowledgementHello then
+        FAcknowledgementRegistered := True
+      else if FAcknowledgementRegistered
+        and (FrameKind = AcknowledgementReaped) then
+      begin
+        FAcknowledgementFinished := True;
+        FAcknowledgementSucceeded := True;
+      end
+      else if FAcknowledgementRegistered
+        and (FrameKind = AcknowledgementFailed) then
+      begin
+        FAcknowledgementFinished := True;
+        FAcknowledgementSucceeded := False;
+      end;
+    end;
+    NewlinePosition := Pos(#10, FStatusBuffer);
+  end;
+end;
+
+function TLWPTProcessTree.SendCancellationFrame(
+  const ADescendantDeadline, AAcknowledgementDeadline: QWord): Boolean;
+begin
+  if FCancellationStarted then
+  begin
+    if (FCancellationAcknowledgementDeadline = 0)
+       or (AAcknowledgementDeadline
+         < FCancellationAcknowledgementDeadline) then
+      FCancellationAcknowledgementDeadline := AAcknowledgementDeadline;
+    Exit(False);
+  end;
+  FCancellationStarted := True;
+  { Registration is a property of this cancellation transaction. A HELLO that
+    races in after Begin must not turn an already hard-killed arbitrary child
+    into an ACK-gated child that never received CANCEL. }
+  FCancellationAcknowledgementRequired := FAcknowledgementRegistered;
+  FCancellationAcknowledgementDeadline := AAcknowledgementDeadline;
+  FAcknowledgementFinished := False;
+  FAcknowledgementSucceeded := False;
+  if FCancellationAcknowledgementRequired
+     and not WriteProtocolFrame(FControlWriteHandle,
+    CancellationFrame(FChannelToken, ADescendantDeadline,
+      AAcknowledgementDeadline)) then
+  begin
+    FAcknowledgementFinished := True;
+    FAcknowledgementSucceeded := False;
+  end;
+  Result := True;
+end;
+
+procedure TLWPTProcessTree.BeginForwardedTermination(
+  const ADescendantDeadline, AAcknowledgementDeadline: QWord);
 {$IFDEF UNIX}
 var
   ErrorCode, ProcessGroupID: Integer;
@@ -481,21 +872,27 @@ begin
   InterlockedExchange(FImmediateTerminationRequested, 1);
   EnterCriticalSection(FTerminationCriticalSection);
   try
+    DrainAcknowledgementFrames;
+    if not SendCancellationFrame(ADescendantDeadline,
+      AAcknowledgementDeadline) then Exit;
     {$IFDEF UNIX}
     ProcessGroupID := FProcess.ProcessID;
     if ProcessGroupID <= 0 then Exit;
-    if FpKill(-ProcessGroupID, SIGKILL) <> 0 then
+    if FCancellationAcknowledgementRequired then
     begin
-      ErrorCode := FpGetErrNo;
-      if ErrorCode = ESysESRCH then Exit;
-      TryTerminateDirectChild;
-      raise EOSError.CreateFmt('could not kill process tree: %s',
-        [SysErrorMessage(ErrorCode)]);
-    end;
+      if FpKill(-ProcessGroupID, SIGTERM) = 0 then Exit;
+    end
+    else if FpKill(-ProcessGroupID, SIGKILL) = 0 then Exit;
+    ErrorCode := FpGetErrNo;
+    if ErrorCode = ESysESRCH then Exit;
+    TryTerminateDirectChild;
+    raise EOSError.CreateFmt('could not signal process tree: %s',
+      [SysErrorMessage(ErrorCode)]);
     {$ENDIF}
     {$IFDEF MSWINDOWS}
     if not Assigned(FWindowsState) then Exit;
     if not FWindowsState.HasActiveProcesses then Exit;
+    if FCancellationAcknowledgementRequired then Exit;
     if not FWindowsState.TryTerminate(ProcessTreeCancellationExitCode,
       ErrorCode) then
     begin
@@ -512,15 +909,79 @@ end;
 
 procedure TLWPTProcessTree.WaitForForwardedTermination(
   const ADeadline: QWord);
-{$IFDEF UNIX}
 var
+  AcknowledgementDeadline: QWord;
+  AcknowledgementFailure: string;
+  AcknowledgementFinished, AcknowledgementRegistered,
+    AcknowledgementSucceeded: Boolean;
+  EffectiveDeadline: QWord;
+{$IFDEF UNIX}
   ErrorCode, ProcessGroupID: Integer;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
-var
+  ErrorCode: DWORD;
   State: TWindowsState;
 {$ENDIF}
 begin
+  AcknowledgementFailure := '';
+  EffectiveDeadline := ADeadline;
+  EnterCriticalSection(FTerminationCriticalSection);
+  try
+    DrainAcknowledgementFrames;
+    AcknowledgementRegistered := FCancellationAcknowledgementRequired;
+    AcknowledgementFinished := FAcknowledgementFinished;
+    AcknowledgementSucceeded := FAcknowledgementSucceeded;
+    AcknowledgementDeadline := FCancellationAcknowledgementDeadline;
+  finally
+    LeaveCriticalSection(FTerminationCriticalSection);
+  end;
+  if AcknowledgementRegistered then
+  begin
+    while (not AcknowledgementFinished)
+      and (GetTickCount64 < AcknowledgementDeadline) do
+    begin
+      Sleep(ProcessTreeTerminatePollMilliseconds);
+      EnterCriticalSection(FTerminationCriticalSection);
+      try
+        DrainAcknowledgementFrames;
+        AcknowledgementFinished := FAcknowledgementFinished;
+        AcknowledgementSucceeded := FAcknowledgementSucceeded;
+        AcknowledgementDeadline := FCancellationAcknowledgementDeadline;
+      finally
+        LeaveCriticalSection(FTerminationCriticalSection);
+      end;
+    end;
+    if not AcknowledgementFinished then
+      AcknowledgementFailure :=
+        'nested process termination acknowledgement was not received'
+    else if not AcknowledgementSucceeded then
+      AcknowledgementFailure :=
+        'nested process reported failed process-tree termination';
+    EffectiveDeadline := AcknowledgementDeadline;
+    if AcknowledgementFailure <> '' then
+    begin
+      EnterCriticalSection(FTerminationCriticalSection);
+      try
+        {$IFDEF UNIX}
+        ProcessGroupID := FProcess.ProcessID;
+        if (ProcessGroupID > 0) and (FpKill(-ProcessGroupID, SIGKILL) <> 0)
+           and (FpGetErrNo <> ESysESRCH) then
+          TryTerminateDirectChild;
+        {$ENDIF}
+        {$IFDEF MSWINDOWS}
+        State := FWindowsState;
+        if Assigned(State) and State.HasActiveProcesses
+           and not State.TryTerminate(ProcessTreeCancellationExitCode,
+             ErrorCode) then
+          TryTerminateDirectChild;
+        {$ENDIF}
+      finally
+        LeaveCriticalSection(FTerminationCriticalSection);
+      end;
+      EffectiveDeadline := GetTickCount64
+        + ProcessTreeReapTimeoutMilliseconds;
+    end;
+  end;
   EnterCriticalSection(FTerminationCriticalSection);
   try
     {$IFDEF UNIX}
@@ -535,7 +996,7 @@ begin
   {$IFDEF UNIX}
   if ProcessGroupID <= 0 then Exit;
   while ProcessGroupExists(ProcessGroupID, ErrorCode)
-    and (GetTickCount64 < ADeadline) do
+    and (GetTickCount64 < EffectiveDeadline) do
     Sleep(ProcessTreeTerminatePollMilliseconds);
   if ProcessGroupExists(ProcessGroupID, ErrorCode) then
   begin
@@ -547,7 +1008,7 @@ begin
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   if not Assigned(State) then Exit;
-  if not State.WaitUntilEmptyBefore(ADeadline) then
+  if not State.WaitUntilEmptyBefore(EffectiveDeadline) then
   begin
     TryTerminateDirectChild;
     raise EOSError.Create(
@@ -557,13 +1018,15 @@ begin
     barrier for the direct child's process object. Wait for the process handle
     too, so callers cannot observe STILL_ACTIVE or retained file handles after
     the forwarding process exits. }
-  if not ProcessExitedBefore(FProcess.ProcessHandle, ADeadline) then
+  if not ProcessExitedBefore(FProcess.ProcessHandle, EffectiveDeadline) then
   begin
     TryTerminateDirectChild;
     raise EOSError.Create(
       'direct child was still active after forwarded Job Object termination');
   end;
   {$ENDIF}
+  if AcknowledgementFailure <> '' then
+    raise EOSError.Create(AcknowledgementFailure);
 end;
 
 procedure TLWPTProcessTree.TryTerminateDirectChild;
@@ -610,21 +1073,34 @@ begin
 end;
 {$ENDIF}
 
-procedure TLWPTProcessTree.Terminate;
+class procedure TLWPTProcessTree.NewTerminationDeadlines(
+  out ADescendantDeadline, AAcknowledgementDeadline: QWord);
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  ADescendantDeadline := StartedAt + ForwardedReapTimeoutMilliseconds;
+  AAcknowledgementDeadline := StartedAt
+    + ProcessTreeTerminateGraceMilliseconds;
+end;
+
+procedure TLWPTProcessTree.BeginTermination(const ADescendantDeadline,
+  AAcknowledgementDeadline: QWord);
 {$IFDEF UNIX}
 var
-  ErrorCode, ProcessGroupID, ReapTimeoutMilliseconds,
-    WaitedMilliseconds: Integer;
+  ErrorCode, ProcessGroupID: Integer;
   ImmediateTermination: Boolean;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
-  Deadline: QWord;
   ErrorCode: DWORD;
 {$ENDIF}
 begin
   EnterCriticalSection(FTerminationCriticalSection);
   try
+    DrainAcknowledgementFrames;
+    if not SendCancellationFrame(ADescendantDeadline,
+      AAcknowledgementDeadline) then Exit;
     {$IFDEF UNIX}
     ProcessGroupID := FProcess.ProcessID;
     if ProcessGroupID <= 0 then Exit;
@@ -642,8 +1118,9 @@ begin
     {$IFDEF MSWINDOWS}
     if not Assigned(FWindowsState) then Exit;
     if not FWindowsState.HasActiveProcesses then Exit;
-    if not FWindowsState.TryTerminate(ProcessTreeCancellationExitCode,
-      ErrorCode) then
+    if (not FCancellationAcknowledgementRequired)
+       and not FWindowsState.TryTerminate(ProcessTreeCancellationExitCode,
+         ErrorCode) then
     begin
       if not FWindowsState.HasActiveProcesses then Exit;
       TryTerminateDirectChild;
@@ -654,7 +1131,35 @@ begin
   finally
     LeaveCriticalSection(FTerminationCriticalSection);
   end;
+end;
+
+procedure TLWPTProcessTree.CompleteTermination;
+var
+  AcknowledgementDeadline: QWord;
+  AcknowledgementRegistered: Boolean;
+{$IFDEF UNIX}
+  ErrorCode, ProcessGroupID, ReapTimeoutMilliseconds,
+    WaitedMilliseconds: Integer;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+  ReapDeadline: QWord;
+{$ENDIF}
+begin
+  EnterCriticalSection(FTerminationCriticalSection);
+  try
+    AcknowledgementRegistered := FCancellationAcknowledgementRequired;
+    AcknowledgementDeadline := FCancellationAcknowledgementDeadline;
+  finally
+    LeaveCriticalSection(FTerminationCriticalSection);
+  end;
+  if AcknowledgementRegistered then
+  begin
+    WaitForForwardedTermination(AcknowledgementDeadline);
+    Exit;
+  end;
   {$IFDEF UNIX}
+  ProcessGroupID := FProcess.ProcessID;
+  if ProcessGroupID <= 0 then Exit;
   WaitedMilliseconds := 0;
   while (FImmediateTerminationRequested = 0)
     and ProcessGroupExists(ProcessGroupID, ErrorCode)
@@ -689,14 +1194,14 @@ begin
   end;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  Deadline := GetTickCount64 + ProcessTreeReapTimeoutMilliseconds;
-  if not FWindowsState.WaitUntilEmptyBefore(Deadline) then
+  ReapDeadline := GetTickCount64 + ProcessTreeReapTimeoutMilliseconds;
+  if not FWindowsState.WaitUntilEmptyBefore(ReapDeadline) then
   begin
     TryTerminateDirectChild;
     raise EOSError.Create(
       'process Job Object still had active processes after termination');
   end;
-  if not ProcessExitedBefore(FProcess.ProcessHandle, Deadline) then
+  if not ProcessExitedBefore(FProcess.ProcessHandle, ReapDeadline) then
   begin
     TryTerminateDirectChild;
     raise EOSError.Create(
@@ -705,9 +1210,20 @@ begin
   {$ENDIF}
 end;
 
-procedure TerminateRegisteredProcessTrees(const AImmediate: Boolean);
+procedure TLWPTProcessTree.Terminate;
 var
-  Deadline: QWord;
+  AcknowledgementDeadline, DescendantDeadline: QWord;
+begin
+  NewTerminationDeadlines(DescendantDeadline, AcknowledgementDeadline);
+  BeginTermination(DescendantDeadline, AcknowledgementDeadline);
+  CompleteTermination;
+end;
+
+procedure TerminateRegisteredProcessTrees(const AImmediate: Boolean;
+  const AInheritedDescendantDeadline: QWord = 0;
+  const AInheritedAcknowledgementDeadline: QWord = 0);
+var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
   FirstFailure: string;
   Index: Integer;
 
@@ -725,18 +1241,26 @@ begin
   try
     if AImmediate then
     begin
-      Deadline := GetTickCount64 + ForwardedReapTimeoutMilliseconds;
+      DescendantDeadline := AInheritedDescendantDeadline;
+      if DescendantDeadline = 0 then
+        DescendantDeadline := GetTickCount64
+          + ForwardedReapTimeoutMilliseconds;
+      AcknowledgementDeadline := AInheritedAcknowledgementDeadline;
+      if AcknowledgementDeadline = 0 then
+        AcknowledgementDeadline := GetTickCount64
+          + ProcessTreeTerminateGraceMilliseconds;
       for Index := 0 to ActiveProcessTrees.Count - 1 do
         try
           TLWPTProcessTree(ActiveProcessTrees[Index])
-            .BeginForwardedTermination;
+            .BeginForwardedTermination(DescendantDeadline,
+              AcknowledgementDeadline);
         except
           on E: Exception do RecordFailure(E.Message);
         end;
       for Index := 0 to ActiveProcessTrees.Count - 1 do
         try
           TLWPTProcessTree(ActiveProcessTrees[Index])
-            .WaitForForwardedTermination(Deadline);
+            .WaitForForwardedTermination(DescendantDeadline);
         except
           on E: Exception do RecordFailure(E.Message);
         end;
@@ -773,25 +1297,113 @@ begin
   {$ENDIF}
 end;
 
+function ValidChannelToken(const AToken: string): Boolean;
+var
+  CharacterIndex: Integer;
+begin
+  Result := Length(AToken) = 32;
+  if not Result then Exit;
+  for CharacterIndex := 1 to Length(AToken) do
+    if not (AToken[CharacterIndex] in ['0'..'9', 'A'..'F', 'a'..'f']) then
+      Exit(False);
+end;
+
+procedure LoadInheritedAcknowledgementChannel;
+var
+  ParsedHandle: Int64;
+begin
+  InheritedChannelToken := SysUtils.GetEnvironmentVariable(
+    ChannelTokenEnvironment);
+  if not ValidChannelToken(InheritedChannelToken) then
+  begin
+    InheritedChannelToken := '';
+    Exit;
+  end;
+  if not TryStrToInt64(SysUtils.GetEnvironmentVariable(
+    StatusHandleEnvironment), ParsedHandle) or (ParsedHandle < 0) then
+  begin
+    InheritedChannelToken := '';
+    Exit;
+  end;
+  InheritedStatusWriteHandle := PtrInt(ParsedHandle);
+  if not TryStrToInt64(SysUtils.GetEnvironmentVariable(
+    ControlHandleEnvironment), ParsedHandle) or (ParsedHandle < 0) then
+  begin
+    InheritedStatusWriteHandle := -1;
+    InheritedChannelToken := '';
+    Exit;
+  end;
+  InheritedControlReadHandle := PtrInt(ParsedHandle);
+  {$IFDEF UNIX}
+  if FpFcntl(InheritedControlReadHandle, F_SetFl, O_NONBLOCK) < 0 then
+  begin
+    InheritedStatusWriteHandle := -1;
+    InheritedControlReadHandle := -1;
+    InheritedChannelToken := '';
+  end;
+  {$ENDIF}
+end;
+
+function SendInheritedAcknowledgement(const AKind: string): Boolean;
+begin
+  Result := (InheritedStatusWriteHandle >= 0)
+    and WriteProtocolFrame(InheritedStatusWriteHandle,
+      ProtocolFrame(InheritedChannelToken, AKind));
+end;
+
+procedure IncomingCancellationDeadlines(out ADescendantDeadline,
+  AAcknowledgementDeadline: QWord);
+var
+  CancellationLine: string;
+  ParsedAcknowledgementDeadline, ParsedDescendantDeadline: QWord;
+begin
+  ADescendantDeadline := GetTickCount64
+    + ForwardedReapTimeoutMilliseconds;
+  AAcknowledgementDeadline := GetTickCount64
+    + ProcessTreeTerminateGraceMilliseconds;
+  if (InheritedControlReadHandle >= 0)
+     and ReadProtocolLineBefore(InheritedControlReadHandle,
+       GetTickCount64 + ProcessTreeTerminatePollMilliseconds,
+       InheritedControlBuffer, CancellationLine) then
+    if ParseCancellationFrame(CancellationLine, InheritedChannelToken,
+      ParsedDescendantDeadline, ParsedAcknowledgementDeadline) then
+    begin
+      ADescendantDeadline := ParsedDescendantDeadline;
+      AAcknowledgementDeadline := ParsedAcknowledgementDeadline;
+    end;
+end;
+
 {$IFDEF UNIX}
 procedure TLWPTSignalForwarder.Execute;
 var
   BytesRead, ReceivedSignal: LongInt;
+  AcknowledgementDeadline, DescendantDeadline: QWord;
   SignalSet: sigset_t;
 begin
   repeat
     BytesRead := FpRead(SignalPipe[SignalPipeReadEnd], ReceivedSignal,
       SizeOf(ReceivedSignal));
   until BytesRead = SizeOf(ReceivedSignal);
+  IncomingCancellationDeadlines(DescendantDeadline,
+    AcknowledgementDeadline);
   try
     TerminateRegisteredProcessTrees(
-      SysUtils.GetEnvironmentVariable(ManagedProcessTreeEnvironment) = '1');
+      SysUtils.GetEnvironmentVariable(ManagedProcessTreeEnvironment) = '1',
+      DescendantDeadline, AcknowledgementDeadline);
   except
     on E: Exception do
     begin
+      SendInheritedAcknowledgement(AcknowledgementFailed);
       ReportForwardingFailure(E.Message);
       FpExit(ProcessTreeCancellationExitCode);
     end;
+  end;
+  if (InheritedStatusWriteHandle >= 0)
+     and not SendInheritedAcknowledgement(AcknowledgementReaped) then
+  begin
+    ReportForwardingFailure(
+      'could not send process-tree termination acknowledgement');
+    FpExit(ProcessTreeCancellationExitCode);
   end;
   { Restore the default disposition before re-sending the original signal so
     shells and ancestor schedulers observe the original form of death. }
@@ -813,6 +1425,39 @@ end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
+procedure TLWPTInheritedControlForwarder.Execute;
+var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
+  CancellationBuffer, CancellationLine: string;
+begin
+  CancellationBuffer := '';
+  repeat
+    if ReadProtocolLineBefore(InheritedControlReadHandle,
+      GetTickCount64 + ProcessTreeTerminatePollMilliseconds,
+      CancellationBuffer, CancellationLine)
+       and ParseCancellationFrame(CancellationLine, InheritedChannelToken,
+         DescendantDeadline, AcknowledgementDeadline) then Break;
+  until False;
+  try
+    TerminateRegisteredProcessTrees(True, DescendantDeadline,
+      AcknowledgementDeadline);
+  except
+    on E: Exception do
+    begin
+      SendInheritedAcknowledgement(AcknowledgementFailed);
+      ReportForwardingFailure(E.Message);
+      Windows.ExitProcess(ProcessTreeCancellationExitCode);
+    end;
+  end;
+  if not SendInheritedAcknowledgement(AcknowledgementReaped) then
+  begin
+    ReportForwardingFailure(
+      'could not send process-tree termination acknowledgement');
+    Windows.ExitProcess(ProcessTreeCancellationExitCode);
+  end;
+  Windows.ExitProcess(WindowsControlExitCode);
+end;
+
 procedure TLWPTConsoleControlForwarder.Execute;
 begin
   Windows.WaitForSingleObject(ConsoleControlEvent, Windows.INFINITE);
@@ -833,6 +1478,7 @@ begin
   Result := False;
   if (AControlType <> Windows.CTRL_C_EVENT)
      and (AControlType <> Windows.CTRL_BREAK_EVENT) then Exit;
+  if InheritedControlReadHandle >= 0 then Exit(True);
   { Windows invokes this callback on an operating-system thread. It may only
     wake the FPC-owned forwarder; registry traversal, Job Object work,
     reporting, and process exit all remain on that dedicated thread. }
@@ -849,10 +1495,15 @@ var
   InterruptHandlerInstalled, TerminateHandlerInstalled: Boolean;
 {$ENDIF}
 begin
-  {$IFDEF UNIX}
   if SignalForwardingInstalled then Exit;
+  LoadInheritedAcknowledgementChannel;
+  {$IFDEF UNIX}
   InterruptHandlerInstalled := False;
   TerminateHandlerInstalled := False;
+  { POSIX fixes SIG_IGN at address 1. Protocol writes report EPIPE instead of
+    allowing a vanished nested reader to terminate its ancestor with SIGPIPE. }
+  if SignalHandlerFailed(CSignal(SIGPIPE, Pointer(1))) then
+    RaiseLastOSError;
   if FpPipe(SignalPipe) <> 0 then
   begin
     ErrorCode := FpGetErrNo;
@@ -882,6 +1533,8 @@ begin
     SignalForwarder.FreeOnTerminate := False;
     SignalForwarder.Start;
     SignalForwardingInstalled := True;
+    if InheritedStatusWriteHandle >= 0 then
+      SendInheritedAcknowledgement(AcknowledgementHello);
   except
     if InterruptHandlerInstalled then
       CSignal(SIGINT, PreviousInterruptHandler);
@@ -912,12 +1565,21 @@ begin
     ConsoleControlForwarder := TLWPTConsoleControlForwarder.Create(True);
     ConsoleControlForwarder.FreeOnTerminate := False;
     ConsoleControlForwarder.Start;
+    if InheritedControlReadHandle >= 0 then
+    begin
+      InheritedControlForwarder := TLWPTInheritedControlForwarder.Create(True);
+      InheritedControlForwarder.FreeOnTerminate := False;
+      InheritedControlForwarder.Start;
+    end;
     SignalForwardingInstalled := True;
+    if InheritedStatusWriteHandle >= 0 then
+      SendInheritedAcknowledgement(AcknowledgementHello);
   except
     Windows.SetConsoleCtrlHandler(@ProcessTreeConsoleControlHandler, False);
     Windows.CloseHandle(ConsoleControlEvent);
     ConsoleControlEvent := 0;
     FreeAndNil(ConsoleControlForwarder);
+    FreeAndNil(InheritedControlForwarder);
     raise;
   end;
   {$ENDIF}
