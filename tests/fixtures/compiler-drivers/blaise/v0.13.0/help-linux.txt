@@ -1,0 +1,40 @@
+Blaise Compiler v0.13.0
+Copyright (c) 2026 Graeme Geldenhuys
+
+Usage:
+  blaise --source <file.pas> --output <binary>
+  blaise --source <file.pas> --emit-ir
+
+Flags:
+  --source <path>   Pascal source file
+  --output <path>   Output binary path
+  --unit-path <dir> Add directory to unit search path (repeatable)
+  --rtl-src <dir>   RTL source directory (default: beside the binary; or $BLAISE_RTL_SRC).
+                    Needed when the binary is moved away from its source tree.
+  --define <sym> | -d <sym> Define a conditional-compilation symbol (repeatable)
+  --backend <id>    qbe (deprecated) | native (default)
+  --target <os>-<cpu> Cross-compile target (default: linux-x86_64, the host).
+                    linux-x86_64, linux-i386, linux-arm64, freebsd-x86_64,
+                    windows-x86_64, macos-arm64
+  --emit-ir         Print QBE IR to stdout and exit
+  --emit-asm        Print native assembly to stdout (requires --backend native)
+  --assembler <id>  internal | external (default: internal)
+  --linker <id>     internal | external (default: internal)
+  --emit-iface <dir> Write each unit's TUnitInterface as <dir>/<unit>.bif
+  --skip-dep-codegen Omit dep unit bodies from emitted IR (separate-compilation path)
+  --no-incremental  Disable per-unit .o emission; build a single whole-program object
+  --unit-cache <dir> Where per-unit .o files are written (default: alongside output)
+  --dump-ast        Print the resolved AST to stdout after semantic analysis
+  --debug           Enable runtime memory leak reporting on exit
+  --debug-opdf      Emit OPDF debug info (.opdf.s companion file)
+
+Configuration:
+  blaise.cfg (next to the binary, then ~/.blaise.cfg) can set, one
+  per line: unit-path=<dir> (repeatable) and rtl-src=<dir>. A relative
+  path is resolved against the config file's directory; --rtl-src on
+  the command line overrides rtl-src= in the config.
+
+Environment:
+  BLAISE_BACKEND=<id> selects the backend when --backend is not given
+  (qbe (deprecated) | native (default)). An explicit --backend flag takes
+  precedence; an unrecognised value warns and uses the default.
