@@ -1115,7 +1115,7 @@ begin
 
       if Length(Man.BuildEntries) = 0 then
       begin
-        WriteLn('no [build] entries defined in ', AManifestPath);
+        WriteLn(ErrOutput, 'no [build] entries defined in ', AManifestPath);
         Inc(Failed);
         Exit(1);
       end;

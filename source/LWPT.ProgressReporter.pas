@@ -234,7 +234,7 @@ procedure TLWPTProgressReporter.ReportJob(const AEvent: TLWPTJobEvent;
   const AOutput, AErrorMessage: string; const AVerbose: Boolean;
   const AStartedAt: QWord);
 var
-  DisplayName, LogOutput, Metadata: string;
+  DisplayName, LogOutput, Metadata, TerminalLine: string;
   Job: TLWPTProgressJob;
 begin
   DisplayName := JobDisplayName(AEvent.Source);
@@ -283,7 +283,10 @@ begin
     ojsFailed:
       begin
         if AEvent.Detail <> '' then Metadata := AEvent.Detail + '; ' + Metadata;
-        WriteLn(ObservabilityFailEvent, DisplayName, ' (', Metadata, ')');
+        TerminalLine := ObservabilityFailEvent + DisplayName + ' ('
+          + Metadata + ')';
+        if SilentOutputActive then WriteCommandResultLine(TerminalLine)
+        else WriteLn(TerminalLine);
       end;
     ojsSkipped:
       begin

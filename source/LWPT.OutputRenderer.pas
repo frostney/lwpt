@@ -63,6 +63,8 @@ type
 
 procedure CaptureSilentChildOutput(const AStandardOutput,
   AStandardError: RawByteString);
+procedure BeginSilentChildOperation;
+procedure FinishSilentChildOperation(const AFailed: Boolean);
 function SilentOutputActive: Boolean;
 procedure SetActiveOutputRenderer(ARenderer: TLWPTOutputRenderer);
 procedure WriteCommandResult(const AText: string);
@@ -81,6 +83,7 @@ type
   TLWPTJournalEntry = record
     DataLength: LongInt;
     DataOffset: Int64;
+    OperationID: QWord;
     Retention: TLWPTEventRetention;
     Sequence: QWord;
     Stream: TLWPTChildOutputStream;
@@ -93,18 +96,21 @@ type
     FEmergencyRing: TLWPTEmergencyRing;
     FEntries: array of TLWPTJournalEntry;
     FJournalPath: string;
-    FProtectedCount: Integer;
+    FNextOperationID: QWord;
     FStream: TFileStream;
     procedure AppendEmergency(const AData: RawByteString);
     procedure Degrade(const AReason: string);
     procedure Retain(const ASequence: QWord;
       const AStream: TLWPTChildOutputStream;
       const ARetention: TLWPTEventRetention;
-      const AData: RawByteString);
+      const AOperationID: QWord; const AData: RawByteString);
   public
     constructor Create;
     destructor Destroy; override;
+    function BeginChildOperation: QWord;
     procedure Deliver(const AEvent: TCLIEventEnvelope);
+    procedure FinishChildOperation(const AOperationID: QWord;
+      const AFailed: Boolean);
     procedure ReplayFailure;
   end;
 
@@ -128,6 +134,9 @@ type
 var
   ActiveRenderer: TLWPTOutputRenderer = nil;
 
+threadvar
+  ActiveSilentChildOperationID: QWord;
+
 procedure SetActiveOutputRenderer(ARenderer: TLWPTOutputRenderer);
 begin
   ActiveRenderer := ARenderer;
@@ -136,6 +145,31 @@ end;
 function SilentOutputActive: Boolean;
 begin
   Result := Assigned(ActiveRenderer) and ActiveRenderer.Capturing;
+end;
+
+procedure BeginSilentChildOperation;
+begin
+  if not SilentOutputActive then Exit;
+  if ActiveSilentChildOperationID <> 0 then
+    raise ELWPTOutputRendererError.Create(
+      'silent child-output operation is already active');
+  ActiveSilentChildOperationID :=
+    TLWPTSilentJournal(ActiveRenderer.FJournal).BeginChildOperation;
+end;
+
+procedure FinishSilentChildOperation(const AFailed: Boolean);
+var
+  OperationID: QWord;
+begin
+  OperationID := ActiveSilentChildOperationID;
+  if OperationID = 0 then Exit;
+  try
+    if SilentOutputActive then
+      TLWPTSilentJournal(ActiveRenderer.FJournal).FinishChildOperation(
+        OperationID, AFailed);
+  finally
+    ActiveSilentChildOperationID := 0;
+  end;
 end;
 
 procedure WriteCommandResult(const AText: string);
@@ -265,13 +299,13 @@ end;
 
 procedure TLWPTSilentJournal.Retain(const ASequence: QWord;
   const AStream: TLWPTChildOutputStream;
-  const ARetention: TLWPTEventRetention; const AData: RawByteString);
+  const ARetention: TLWPTEventRetention; const AOperationID: QWord;
+  const AData: RawByteString);
 var
   EntryIndex: Integer;
 begin
   if AData = '' then Exit;
   AppendEmergency(AData);
-  if ARetention <> oerOrdinary then Inc(FProtectedCount);
   if FDegraded then Exit;
   if QWord(FStream.Size) + QWord(Length(AData))
      > SilentJournalMaximumBytes then
@@ -285,12 +319,32 @@ begin
     FEntries[EntryIndex].Sequence := ASequence;
     FEntries[EntryIndex].Stream := AStream;
     FEntries[EntryIndex].Retention := ARetention;
+    FEntries[EntryIndex].OperationID := AOperationID;
     FEntries[EntryIndex].DataOffset := FStream.Position;
     FEntries[EntryIndex].DataLength := Length(AData);
     FStream.WriteBuffer(AData[1], Length(AData));
   except
     on E: Exception do Degrade('temporary journal write failed: ' + E.Message);
   end;
+end;
+
+function TLWPTSilentJournal.BeginChildOperation: QWord;
+begin
+  Inc(FNextOperationID);
+  if FNextOperationID = 0 then Inc(FNextOperationID);
+  Result := FNextOperationID;
+end;
+
+procedure TLWPTSilentJournal.FinishChildOperation(
+  const AOperationID: QWord; const AFailed: Boolean);
+var
+  EntryIndex: Integer;
+begin
+  if not AFailed then Exit;
+  for EntryIndex := 0 to High(FEntries) do
+    if (FEntries[EntryIndex].OperationID = AOperationID)
+       and (FEntries[EntryIndex].Retention = oerOrdinary) then
+      FEntries[EntryIndex].Retention := oerProtected;
 end;
 
 procedure TLWPTSilentJournal.Deliver(const AEvent: TCLIEventEnvelope);
@@ -302,13 +356,14 @@ begin
     if AEvent.Payload is TLWPTChildOutputEvent then
     begin
       Child := TLWPTChildOutputEvent(AEvent.Payload);
-      Retain(AEvent.Sequence, Child.Stream, Child.Retention, Child.Data);
+      Retain(AEvent.Sequence, Child.Stream, Child.Retention,
+        ActiveSilentChildOperationID, Child.Data);
     end
     else if AEvent.Payload is TLWPTDiagnosticEvent then
     begin
       Diagnostic := TLWPTDiagnosticEvent(AEvent.Payload);
       Retain(AEvent.Sequence, ocosStderr, Diagnostic.Retention,
-        RawByteString(Diagnostic.MessageText));
+        0, RawByteString(Diagnostic.MessageText));
     end;
   except
     on E: Exception do
@@ -339,11 +394,10 @@ begin
   LastByte := #0;
   try
     for EntryIndex := 0 to High(FEntries) do
-      { Protected events are the precise failure evidence when available.
-        Some report-style commands express their only diagnostic on stdout;
-        replay ordinary events only when there is no protected evidence. }
-      if (FProtectedCount = 0) or
-         (FEntries[EntryIndex].Retention <> oerOrdinary) then
+      { Only protected evidence survives normal silent failure replay.
+        Failed child operations are promoted after their exit status is known;
+        successful child output and ordinary progress remain suppressed. }
+      if FEntries[EntryIndex].Retention <> oerOrdinary then
       begin
         FStream.Position := FEntries[EntryIndex].DataOffset;
         SetLength(Data, FEntries[EntryIndex].DataLength);
@@ -499,6 +553,7 @@ procedure TLWPTOutputRenderer.PublishChild(const AStandardOutput,
   AStandardError: RawByteString);
 var
   Dispatcher: TCLIEventDispatcher;
+  Retention: TLWPTEventRetention;
 begin
   if not FCapturing then Exit;
   { TextRec buffers direct host writes. Drain both before a child/result event
@@ -506,13 +561,15 @@ begin
   Flush(Output);
   Flush(ErrOutput);
   Dispatcher := TCLIEventDispatcher(FDispatcher);
+  if ActiveSilentChildOperationID = 0 then Retention := oerProtected
+  else Retention := oerOrdinary;
   try
     if AStandardOutput <> '' then
       Dispatcher.Publish(TLWPTChildOutputEvent.Create(FCommandName,
-        FCorrelationID, ocosStdout, AStandardOutput, oerProtected));
+        FCorrelationID, ocosStdout, AStandardOutput, Retention));
     if AStandardError <> '' then
       Dispatcher.Publish(TLWPTChildOutputEvent.Create(FCommandName,
-        FCorrelationID, ocosStderr, AStandardError, oerProtected));
+        FCorrelationID, ocosStderr, AStandardError, Retention));
   except
     { Child drainage and its exit result are authoritative. }
   end;

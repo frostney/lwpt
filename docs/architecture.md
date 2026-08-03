@@ -215,7 +215,10 @@ the neutral prepared-dispatch hook lets the executable install the renderer
 only after parsing and alias resolution. The renderer routes stdout/stderr and
 continuously drained child chunks through `CLI.Events`, suppresses ordinary
 events in silent mode, and replays protected diagnostics and failed-operation
-output before the user-visible terminal failure result line. Its normal journal
+output before the user-visible terminal failure result line. Raw child chunks
+are correlated with their invocation and promoted from ordinary to protected
+retention only when that child exits unsuccessfully; successful hook output
+therefore stays suppressed if a later operation fails. Its normal journal
 is capped at 64 MiB; a preallocated 1 MiB emergency ring preserves
 protected/recent evidence when journal creation, writing, capacity, or replay
 degrades. Observer failure

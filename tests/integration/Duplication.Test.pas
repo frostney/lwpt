@@ -41,18 +41,6 @@ const
     + '  if Total > Left then Right := Total - Left;'#10
     + '  WriteLn(Right);'#10'end.'#10;
 
-function OutputBeforeCompletion(const AOutput, ACommand: string): string;
-var
-  CompletionAt: SizeInt;
-  CompletionPrefix: string;
-begin
-  CompletionPrefix := ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
-    + ' ' + ACommand + ': completed in ';
-  CompletionAt := Pos(CompletionPrefix, AOutput);
-  if CompletionAt = 0 then Exit(AOutput);
-  Result := Copy(AOutput, 1, CompletionAt - 1);
-end;
-
 function TDuplicationIntegration.ProjectPath(const AName: string): string;
 begin
   Result := FRoot + '/' + AName;
@@ -95,7 +83,9 @@ begin
   Expect<Integer>(Result.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('Duplication:', Result.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('Clone 1:', Result.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('lwpt duplication: completed in ', Result.Stdout) > 0)
+  Expect<Boolean>(Pos('lwpt duplication: completed in ', Result.Stdout) = 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('lwpt duplication: completed in ', Result.Stderr) > 0)
     .ToBe(True);
 end;
 
@@ -107,8 +97,13 @@ begin
   Second := RunLwpt(['duplication', '--json'], ProjectPath('json'));
   Expect<Integer>(First.ExitCode).ToBe(0);
   Expect<Integer>(Second.ExitCode).ToBe(0);
-  Expect<string>(OutputBeforeCompletion(First.Stdout, 'duplication')).ToBe(
-    OutputBeforeCompletion(Second.Stdout, 'duplication'));
+  Expect<string>(First.Stdout).ToBe(Second.Stdout);
+  Expect<Boolean>(Pos('lwpt duplication: completed in ', First.Stdout) = 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('lwpt duplication: completed in ', First.Stderr) > 0)
+    .ToBe(True);
+  Expect<Boolean>((Trim(First.Stdout) <> '')
+    and (Trim(First.Stdout)[Length(Trim(First.Stdout))] = '}')).ToBe(True);
   Expect<Boolean>(Pos('"schema":"lwpt.analysis"', First.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('"command":{"name":"duplication",'

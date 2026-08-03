@@ -68,6 +68,8 @@ type
     procedure TestSilentRunScriptSuppressesSuccessfulChildOutput;
     procedure TestSilentRunScriptReplaysFailedChildOutput;
     procedure TestSilentBuildReplaysFailedCompilerOutputOnly;
+    procedure TestSilentNoBuildEntriesRetainsFailureAfterWarning;
+    procedure TestSilentInteractiveInitIsRejected;
   end;
 
 function CompletionPrefix(const ACommand, AStatus: string): string;
@@ -111,6 +113,9 @@ begin
     ''#10 +
     '[child-failure]'#10 +
     'script = "scripts/child-failure.pas"'#10 +
+    ''#10 +
+    '[prebuild]'#10 +
+    'successful = "scripts/child-success.pas"'#10 +
     ''#10 +
     '[unknown-section]'#10 +
     'enabled = true'#10);
@@ -271,18 +276,18 @@ end;
 
 procedure TCLIOptionsE2E.TestSuccessfulCommandReportsCompletion;
 var
-  R : TLwptResult;
-  Prefix, StdoutText : string;
+  R: TLwptResult;
+  Prefix, StderrText: string;
 begin
   R := RunLwpt(['build', '--help']);
   Prefix := CompletionPrefix('build', 'completed in ');
-  StdoutText := Trim(R.Stdout);
+  StderrText := Trim(R.Stderr);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Integer>(CountOccurrences(R.Stdout, Prefix)).ToBe(1);
-  Expect<Integer>(CountOccurrences(R.Stderr, Prefix)).ToBe(0);
-  Expect<Boolean>(Pos(Prefix, StdoutText) > 0).ToBe(True);
-  Expect<Boolean>((StdoutText <> '')
-    and (StdoutText[Length(StdoutText)] = 's')).ToBe(True);
+  Expect<Integer>(CountOccurrences(R.Stdout, Prefix)).ToBe(0);
+  Expect<Integer>(CountOccurrences(R.Stderr, Prefix)).ToBe(1);
+  Expect<Boolean>(Pos(Prefix, StderrText) > 0).ToBe(True);
+  Expect<Boolean>((StderrText <> '')
+    and (StderrText[Length(StderrText)] = 's')).ToBe(True);
 end;
 
 procedure TCLIOptionsE2E.TestFailedCommandReportsCompletion;
@@ -306,8 +311,8 @@ begin
   BuildPrefix := CompletionPrefix('build', 'completed in ');
   RunPrefix := CompletionPrefix('run', 'completed in ');
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Integer>(CountOccurrences(R.Stdout, BuildPrefix)).ToBe(1);
-  Expect<Integer>(CountOccurrences(R.Stdout, RunPrefix)).ToBe(0);
+  Expect<Integer>(CountOccurrences(R.Stderr, BuildPrefix)).ToBe(1);
+  Expect<Integer>(CountOccurrences(R.Stderr, RunPrefix)).ToBe(0);
 end;
 
 procedure TCLIOptionsE2E.TestSilentSuccessEmitsOnlyCompletion;
@@ -454,6 +459,7 @@ begin
     Expect<string>(R.Stdout).ToBe('');
     Expect<Boolean>((Pos('Fatal:', R.Stderr) > 0)
       or (Pos('Error:', R.Stderr) > 0)).ToBe(True);
+    Expect<Boolean>(Pos('successful-child-output', R.Stderr) = 0).ToBe(True);
     Expect<Boolean>(Pos('discovered ', R.Stderr) = 0).ToBe(True);
     Expect<Boolean>(Pos('START hello', R.Stderr) = 0).ToBe(True);
     Expect<Integer>(CountOccurrences(R.Stderr,
@@ -466,6 +472,52 @@ begin
       '  WriteLn(''hello e2e'');'#10 +
       'end.'#10);
   end;
+end;
+
+procedure TCLIOptionsE2E.TestSilentNoBuildEntriesRetainsFailureAfterWarning;
+var
+  EvidenceAt, FinalAt, WarningAt: Integer;
+  ProjectPath: string;
+  R: TLwptResult;
+begin
+  ProjectPath := FScratch + '/no-build';
+  ForceDirectories(ProjectPath + '/source');
+  WriteTextFile(ProjectPath + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "no-build"'#10 +
+    'version = "0.0.0"'#10 +
+    'units = ["source"]'#10 +
+    ''#10 +
+    '[unknown-section]'#10 +
+    'enabled = true'#10);
+  R := RunLwpt(['build', '--silent'], ProjectPath);
+  WarningAt := Pos('warning: unrecognised section [unknown-section]',
+    R.Stderr);
+  EvidenceAt := Pos('no [build] entries defined in lwpt.toml', R.Stderr);
+  FinalAt := Pos(CompletionPrefix('build', 'failed after '), R.Stderr);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<string>(R.Stdout).ToBe('');
+  Expect<Boolean>(WarningAt > 0).ToBe(True);
+  Expect<Boolean>(EvidenceAt > WarningAt).ToBe(True);
+  Expect<Boolean>(FinalAt > EvidenceAt).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestSilentInteractiveInitIsRejected;
+var
+  InitPath: string;
+  R: TLwptResult;
+begin
+  InitPath := FScratch + '/interactive-init';
+  ForceDirectories(InitPath);
+  R := RunLwpt(['init', '--silent'], InitPath, [], 1000);
+  Expect<Boolean>(R.TimedOut).ToBe(False);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<string>(R.Stdout).ToBe('');
+  Expect<Boolean>(Pos('--silent requires --yes or --adopt for '
+    + 'non-interactive init', R.Stderr) > 0).ToBe(True);
+  Expect<Integer>(CountOccurrences(R.Stderr,
+    CompletionPrefix('init', 'failed after '))).ToBe(1);
+  Expect<Boolean>(FileExists(InitPath + '/lwpt.toml')).ToBe(False);
 end;
 
 procedure TCLIOptionsE2E.SetupTests;
@@ -508,6 +560,10 @@ begin
     TestSilentRunScriptReplaysFailedChildOutput);
   Test('silent failed build replays compiler output without progress',
     TestSilentBuildReplaysFailedCompilerOutputOnly);
+  Test('silent no-build failure survives an unrelated manifest warning',
+    TestSilentNoBuildEntriesRetainsFailureAfterWarning);
+  Test('silent interactive init is rejected without waiting for input',
+    TestSilentInteractiveInitIsRejected);
 end;
 
 begin

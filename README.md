@@ -264,7 +264,9 @@ On success it suppresses progress and child output and prints only the final
 `lwpt <command>: completed in ...` line on stdout. On failure it replays the
 retained diagnostic and failed child output before one final failure line on
 stderr. `--silent` cannot be combined with `--verbose`; aliases such as
-`lwpt run build --silent` report the resolved `build` identity.
+`lwpt run build --silent` report the resolved `build` identity. Because silent
+mode cannot display prompts, `lwpt init --silent` additionally requires
+`--yes` or `--adopt`.
 
 ## Notable canonical-version choices
 

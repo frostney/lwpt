@@ -462,7 +462,11 @@ begin
   EnterCriticalSection(FCriticalSection);
   try
     FJobs[AIndex].Status := AStatus;
-    FJobs[AIndex].ExitCode := AExitCode;
+    { A compiler driver can report a semantic failure after its process exits
+      successfully, for example when the requested artifact is missing. Failed
+      observability events require a nonzero code, so reserve the internal
+      error code for that zero-exit failure while preserving real child exits. }
+    FJobs[AIndex].ExitCode := NormalizeFailureExitCode(AExitCode);
     FJobs[AIndex].ErrorMessage := AMessage;
     Inc(FFailureCount);
     if (FBail > 0) and (FFailureCount >= FBail) then

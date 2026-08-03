@@ -29,18 +29,6 @@ type
     procedure TestThresholdEqualityPassesAndExcessFails;
   end;
 
-function OutputBeforeCompletion(const AOutput, ACommand: string): string;
-var
-  CompletionAt: SizeInt;
-  CompletionPrefix: string;
-begin
-  CompletionPrefix := ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
-    + ' ' + ACommand + ': completed in ';
-  CompletionAt := Pos(CompletionPrefix, AOutput);
-  if CompletionAt = 0 then Exit(AOutput);
-  Result := Copy(AOutput, 1, CompletionAt - 1);
-end;
-
 procedure THealthGitE2E.RunGit(const AArguments: array of string);
 var
   ArgumentIndex: Integer;
@@ -127,8 +115,14 @@ begin
   FirstRun := RunLwpt(['health', '--hotspots', '--json'], FGitRoot);
   SecondRun := RunLwpt(['health', '--hotspots', '--json'], FGitRoot);
   Expect<Integer>(FirstRun.ExitCode).ToBe(0);
-  Expect<string>(OutputBeforeCompletion(FirstRun.Stdout, 'health')).ToBe(
-    OutputBeforeCompletion(SecondRun.Stdout, 'health'));
+  Expect<string>(FirstRun.Stdout).ToBe(SecondRun.Stdout);
+  Expect<Boolean>(Pos('lwpt health: completed in ', FirstRun.Stdout) = 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('lwpt health: completed in ', FirstRun.Stderr) > 0)
+    .ToBe(True);
+  Expect<Boolean>((Trim(FirstRun.Stdout) <> '')
+    and (Trim(FirstRun.Stdout)[Length(Trim(FirstRun.Stdout))] = '}'))
+    .ToBe(True);
   Expect<Boolean>(Pos('"mode":"git-enriched"', FirstRun.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('"historyCommits":100', FirstRun.Stdout) > 0)

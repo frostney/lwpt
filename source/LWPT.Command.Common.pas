@@ -239,6 +239,7 @@ var
   i, j, SeparatorAt: Integer;
   Existing, ExistingName, ExtraName: string;
   CapturedError, CapturedOutput: string;
+  ChildFailed: Boolean;
   ProcessOptions: TLWPTProcessRunOptions;
   ProcessRunner: TLWPTDuplexProcessRunner;
   {$IFDEF UNIX}
@@ -327,8 +328,15 @@ begin
           ProcessOptions.SeparateStandardError := True;
           ProcessOptions.DiscardCapturedOutput := True;
           ProcessOptions.OnOutputChunk := @CaptureSilentProcessChunk;
-          Result := ProcessRunner.Run('', ProcessOptions, CapturedOutput,
-            CapturedError);
+          BeginSilentChildOperation;
+          ChildFailed := True;
+          try
+            Result := ProcessRunner.Run('', ProcessOptions, CapturedOutput,
+              CapturedError);
+            ChildFailed := Result <> 0;
+          finally
+            FinishSilentChildOperation(ChildFailed);
+          end;
         finally
           ProcessRunner.Free;
         end;

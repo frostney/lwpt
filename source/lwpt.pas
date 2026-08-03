@@ -83,8 +83,10 @@ procedure ReportCommandCompletion(
   const ACompletion: TSubcommandCompletion);
 var
   StatusText : string;
+  WasSilent : Boolean;
 begin
-  if Assigned(OutputRenderer) and OutputRenderer.Capturing then
+  WasSilent := Assigned(OutputRenderer) and OutputRenderer.Capturing;
+  if WasSilent then
     OutputRenderer.FinishSilent(ACompletion.ExitCode,
       ACompletion.ElapsedMilliseconds);
   Flush(Output);
@@ -92,7 +94,7 @@ begin
     StatusText := 'completed in '
   else
     StatusText := 'failed after ';
-  if ACompletion.ExitCode = 0 then
+  if (ACompletion.ExitCode = 0) and WasSilent then
     WriteLn(Output, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
       StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds))
   else
@@ -114,21 +116,29 @@ var
 function PrepareCommandOutput(const ACommandName: string;
   const AOptions: TOptionArray): string;
 var
-  HasSilent, HasVerbose: Boolean;
+  HasAdopt, HasSilent, HasVerbose, HasYes: Boolean;
   OptionIndex: Integer;
 begin
   Result := '';
   HasSilent := False;
   HasVerbose := False;
+  HasYes := False;
+  HasAdopt := False;
   for OptionIndex := 0 to High(AOptions) do
     if AOptions[OptionIndex].Present then
       if SameText(AOptions[OptionIndex].LongName, 'silent') then
         HasSilent := True
       else if SameText(AOptions[OptionIndex].LongName, 'verbose') then
-        HasVerbose := True;
+        HasVerbose := True
+      else if SameText(AOptions[OptionIndex].LongName, 'yes') then
+        HasYes := True
+      else if SameText(AOptions[OptionIndex].LongName, 'adopt') then
+        HasAdopt := True;
   if HasSilent and HasVerbose then
     Exit('--silent cannot be combined with --verbose');
   if not HasSilent then Exit;
+  if SameText(ACommandName, 'init') and not (HasYes or HasAdopt) then
+    Exit('--silent requires --yes or --adopt for non-interactive init');
   try
     OutputRenderer.BeginSilent(ACommandName);
   except

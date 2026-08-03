@@ -136,7 +136,15 @@ type
     property Reason: string read FReason;
   end;
 
+function NormalizeFailureExitCode(const AExitCode: Integer): Integer;
+
 implementation
+
+function NormalizeFailureExitCode(const AExitCode: Integer): Integer;
+begin
+  if AExitCode = 0 then Result := ObservabilityInternalErrorExitCode
+  else Result := AExitCode;
+end;
 
 constructor TLWPTObservabilityPayload.Create(
   const ASource, ACorrelationID: string;
