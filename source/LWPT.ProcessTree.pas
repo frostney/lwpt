@@ -66,6 +66,7 @@ type
     procedure CloseChildAcknowledgementHandles;
     procedure MarkManagedChild;
     procedure DrainAcknowledgementFrames;
+    function HasActiveOwnedProcesses: Boolean;
     function SendCancellationFrame(const ADescendantDeadline,
       AAcknowledgementDeadline: QWord): Boolean;
     procedure BeginForwardedTermination(const ADescendantDeadline,
@@ -892,6 +893,22 @@ begin
   Result := True;
 end;
 
+function TLWPTProcessTree.HasActiveOwnedProcesses: Boolean;
+{$IFDEF UNIX}
+var
+  ErrorCode, ProcessGroupID: Integer;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  ProcessGroupID := FProcess.ProcessID;
+  Result := (ProcessGroupID > 0)
+    and ProcessGroupExists(ProcessGroupID, ErrorCode);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Result := Assigned(FWindowsState) and FWindowsState.HasActiveProcesses;
+  {$ENDIF}
+end;
+
 procedure TLWPTProcessTree.BeginForwardedTermination(
   const ADescendantDeadline, AAcknowledgementDeadline: QWord);
 {$IFDEF UNIX}
@@ -906,6 +923,7 @@ begin
   InterlockedExchange(FImmediateTerminationRequested, 1);
   EnterCriticalSection(FTerminationCriticalSection);
   try
+    if not FCancellationStarted and not HasActiveOwnedProcesses then Exit;
     DrainAcknowledgementFrames;
     if not SendCancellationFrame(ADescendantDeadline,
       AAcknowledgementDeadline) then Exit;
@@ -1132,6 +1150,7 @@ var
 begin
   EnterCriticalSection(FTerminationCriticalSection);
   try
+    if not FCancellationStarted and not HasActiveOwnedProcesses then Exit;
     DrainAcknowledgementFrames;
     if not SendCancellationFrame(ADescendantDeadline,
       AAcknowledgementDeadline) then Exit;

@@ -54,6 +54,7 @@ const
   WorkerErrorCompilerProxyMode = 'worker-error';
   SuccessfulAcknowledgementCompilerProxyMode = 'successful-acknowledgement';
   FailedAcknowledgementCompilerProxyMode = 'failed-acknowledgement';
+  CleanAcknowledgementExitProxyMode = 'clean-acknowledgement-exit';
   MissingAcknowledgementCompilerProxyMode = 'missing-acknowledgement';
   MissingAcknowledgementSiblingCompilerProxyMode =
     'missing-acknowledgement-siblings';
@@ -102,6 +103,7 @@ type
     procedure TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
     procedure TestWorkerErrorTerminatesActiveProcessTree;
     procedure TestSuccessfulTerminationAcknowledgementCompletesCancellation;
+    procedure TestExitedRegisteredProcessTreeIsSuccessfulNoOp;
     procedure TestFailedNestedTerminationAcknowledgementFailsCancellation;
     procedure TestMissingTerminationAcknowledgementFailsCancellation;
     procedure TestSiblingTerminationAcknowledgementsShareFanout;
@@ -742,6 +744,46 @@ begin
     CommandResult.Stdout) = 0).ToBe(True);
 end;
 
+procedure TTestScheduling.TestExitedRegisteredProcessTreeIsSuccessfulNoOp;
+var
+  AcknowledgementDeadline, DescendantDeadline: QWord;
+  Child: TProcess;
+  ChildTree: TLWPTProcessTree;
+  Environment: array of string;
+  Marker: string;
+  Started: TDateTime;
+begin
+  Marker := FScratch + '/control/clean-acknowledgement-exit';
+  SetLength(Environment, 2);
+  Environment[0] := ProcessTreeProxyModeEnvironment + '='
+    + CleanAcknowledgementExitProxyMode;
+  Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + Marker;
+  Child := TProcess.Create(nil);
+  ChildTree := TLWPTProcessTree.Create(Child);
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    ConfigureProcessEnvironment(Child, Environment);
+    ChildTree.Execute;
+    Started := Now;
+    while Child.Running and ((Now - Started) * SecondsPerDay
+      < ProcessExitCeilingSeconds) do Sleep(ProcessPollMilliseconds);
+    Expect<Boolean>(Child.Running).ToBe(False);
+    Child.WaitOnExit;
+    Expect<Integer>(Child.ExitStatus).ToBe(0);
+    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+
+    TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
+      AcknowledgementDeadline);
+    ChildTree.BeginTermination(DescendantDeadline,
+      AcknowledgementDeadline);
+    ChildTree.CompleteTermination;
+  finally
+    if Child.Running then Child.Terminate(1);
+    ChildTree.Free;
+    Child.Free;
+  end;
+end;
+
 procedure TTestScheduling.TestFailedNestedTerminationAcknowledgementFailsCancellation;
 var
   DescendantPID, OwnerPID: Integer;
@@ -1106,6 +1148,12 @@ var
   BytesRead, BytesWritten: DWORD;
   {$ENDIF}
 begin
+  if AMode = CleanAcknowledgementExitProxyMode then
+  begin
+    InstallProcessTreeSignalForwarding;
+    WriteTextFile(APIDFile, IntToStr(GetProcessID));
+    Exit(0);
+  end;
   if AMode = SuccessfulAcknowledgementLeafProxyMode then
   begin
     InstallProcessTreeSignalForwarding;
@@ -1257,7 +1305,8 @@ begin
   else SourceFile := '';
 
   if (Mode = SuccessfulAcknowledgementLeafProxyMode)
-     or (Mode = FailedAcknowledgementLeafProxyMode) then
+     or (Mode = FailedAcknowledgementLeafProxyMode)
+     or (Mode = CleanAcknowledgementExitProxyMode) then
     Exit(RunAcknowledgementLeaf(Mode, PIDFile));
   if ((Mode = SuccessfulAcknowledgementCompilerProxyMode)
       or (Mode = FailedAcknowledgementCompilerProxyMode))
@@ -1344,6 +1393,8 @@ begin
     TestWorkerErrorTerminatesActiveProcessTree);
   Test('successful nested termination acknowledgement completes cancellation',
     TestSuccessfulTerminationAcknowledgementCompletesCancellation);
+  Test('already-exited registered process tree is a successful no-op',
+    TestExitedRegisteredProcessTreeIsSuccessfulNoOp);
   Test('failed descendant termination acknowledgement propagates to ancestor',
     TestFailedNestedTerminationAcknowledgementFailsCancellation);
   Test('missing nested termination acknowledgement fails cancellation',
