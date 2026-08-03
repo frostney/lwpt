@@ -17,7 +17,7 @@ const
   FIXTURE_ROOT = 'tests/fixtures/compiler-drivers/lakon/0.1.0/';
 
 type
-  TMockLakonCompilerDriver = class(TLWPTLakonCompilerDriver)
+  TLWPTMockLakonCompilerDriver = class(TLWPTLakonCompilerDriver)
   public
     HelpOutput: string;
     ProbeCount: Integer;
@@ -33,10 +33,10 @@ type
   private
     function FixtureArguments(const AName: string): TStringArray;
     function FixtureText(const AName: string): string;
-    function NewDriver: TMockLakonCompilerDriver;
+    function NewDriver: TLWPTMockLakonCompilerDriver;
     function Request: TLWPTBuildRequest;
     procedure ExpectArguments(const AActual, AExpected: TStringArray);
-    procedure ExpectProbeError(const ADriver: TMockLakonCompilerDriver;
+    procedure ExpectProbeError(const ADriver: TLWPTMockLakonCompilerDriver;
       const ATarget: TLWPTTarget; const AMessagePart: string);
   public
     procedure SetupTests; override;
@@ -59,7 +59,7 @@ type
     procedure TestNormalizedDiagnosticsAndArtifact;
   end;
 
-function TMockLakonCompilerDriver.ExecuteProbe(
+function TLWPTMockLakonCompilerDriver.ExecuteProbe(
   const AArguments: LWPT.Core.TStringArray; out AStandardOutput,
   AStandardError: string): Integer;
 begin
@@ -106,9 +106,9 @@ begin
 end;
 
 function TLWPTLakonCompilerDriverTests.NewDriver:
-  TMockLakonCompilerDriver;
+  TLWPTMockLakonCompilerDriver;
 begin
-  Result := TMockLakonCompilerDriver.Create('lakon-under-test', '*');
+  Result := TLWPTMockLakonCompilerDriver.Create('lakon-under-test', '*');
   Result.VersionOutput := FixtureText('version.txt');
   Result.HelpOutput := FixtureText('help.txt');
 end;
@@ -154,7 +154,7 @@ begin
 end;
 
 procedure TLWPTLakonCompilerDriverTests.ExpectProbeError(
-  const ADriver: TMockLakonCompilerDriver; const ATarget: TLWPTTarget;
+  const ADriver: TLWPTMockLakonCompilerDriver; const ATarget: TLWPTTarget;
   const AMessagePart: string);
 var
   Raised: Boolean;
@@ -189,7 +189,7 @@ procedure TLWPTLakonCompilerDriverTests.
   TestProbeAdvertisesOnlyReleasedContract;
 var
   Capabilities: TLWPTCompilerCapabilities;
-  Driver: TMockLakonCompilerDriver;
+  Driver: TLWPTMockLakonCompilerDriver;
 begin
   Driver := NewDriver;
   try
@@ -213,7 +213,7 @@ end;
 procedure TLWPTLakonCompilerDriverTests.
   TestProbeRunsVersionAndHelpEveryTime;
 var
-  Driver: TMockLakonCompilerDriver;
+  Driver: TLWPTMockLakonCompilerDriver;
 begin
   Driver := NewDriver;
   try
@@ -227,7 +227,7 @@ end;
 
 procedure TLWPTLakonCompilerDriverTests.TestProbeRejectsWrongIdentity;
 var
-  Driver: TMockLakonCompilerDriver;
+  Driver: TLWPTMockLakonCompilerDriver;
 begin
   Driver := NewDriver;
   try
@@ -241,10 +241,10 @@ end;
 
 procedure TLWPTLakonCompilerDriverTests.TestProbeRejectsOldVersion;
 var
-  ConfiguredDriver, Driver: TMockLakonCompilerDriver;
+  ConfiguredDriver, Driver: TLWPTMockLakonCompilerDriver;
 begin
   Driver := NewDriver;
-  ConfiguredDriver := TMockLakonCompilerDriver.Create('lakon-under-test',
+  ConfiguredDriver := TLWPTMockLakonCompilerDriver.Create('lakon-under-test',
     '>=0.2.0');
   try
     Driver.VersionOutput := 'lakon 0.0.9';
@@ -263,7 +263,7 @@ end;
 procedure TLWPTLakonCompilerDriverTests.
   TestProbeRejectsIncompleteCommandSurface;
 var
-  Driver: TMockLakonCompilerDriver;
+  Driver: TLWPTMockLakonCompilerDriver;
 begin
   Driver := NewDriver;
   try
@@ -278,7 +278,7 @@ end;
 
 procedure TLWPTLakonCompilerDriverTests.TestProbeRejectsUnsupportedTarget;
 var
-  Driver: TMockLakonCompilerDriver;
+  Driver: TLWPTMockLakonCompilerDriver;
   Target: TLWPTTarget;
 begin
   Driver := NewDriver;
