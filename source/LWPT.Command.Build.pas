@@ -935,9 +935,8 @@ var
       besFailed:
         begin
           EventState := ojsFailed;
-          EventExitCode := CompilerExitCodes[AIndex];
-          if EventExitCode = 0 then
-            EventExitCode := ObservabilityInternalErrorExitCode;
+          EventExitCode := NormalizeFailureExitCode(
+            CompilerExitCodes[AIndex]);
           Detail := '';
         end;
       besBlocked:
