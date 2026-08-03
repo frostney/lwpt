@@ -34,6 +34,8 @@ const
   MarkerWaitCeilingSeconds = 5;
   ProcessExitCeilingSeconds = 8;
   ProcessStartupCeilingSeconds = 10;
+  WindowsControllerCompletionCeilingSeconds =
+    ProcessStartupCeilingSeconds + ProcessExitCeilingSeconds + 2;
   ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
   ProcessCaptureOverflowHoldMilliseconds = 2000;
   ProcessTreeProxyModeEnvironment = PROJECT_NAME
@@ -822,7 +824,7 @@ begin
     Started := Now;
     while Controller.Running
       and ((Now - Started) * SecondsPerDay
-        < CancellationCompletionCeilingSeconds) do
+        < WindowsControllerCompletionCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
     Expect<Boolean>(Controller.Running).ToBe(False);
     Controller.WaitOnExit;
@@ -858,6 +860,10 @@ var
 begin
   Result := 1;
   CompilerPID := -1;
+  { Controller failures: 2 invalid control type; 3 missing compiler PID;
+    4 inherited Ctrl-C-ignore setup; 5 controller ignore handler;
+    6 control broadcast; 7 LWPT exit timeout; 8 unexpected LWPT exit status;
+    9 compiler process still active. }
   ControlType := DWORD(StrToInt(ParamStr(2)));
   if (ControlType <> Windows.CTRL_C_EVENT)
      and (ControlType <> Windows.CTRL_BREAK_EVENT) then Exit(2);
