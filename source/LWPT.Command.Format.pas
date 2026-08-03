@@ -20,7 +20,8 @@ uses
 
   LWPT.Core,
   LWPT.Formatter,
-  LWPT.Manifest;
+  LWPT.Manifest,
+  LWPT.OutputRenderer;
 
 { Wraps the LWPT.Formatter unit (converted from GocciaScript format.pas).
   `lwpt format`         rewrites files in place
@@ -362,7 +363,10 @@ begin
 
     if FinalFiles.Count = 0 then
     begin
-      WriteLn('no source files in scope');
+      if ACheckOnly then
+        WriteCommandResultLine('no source files in scope')
+      else
+        WriteLn('no source files in scope');
       Exit(0);
     end;
 
@@ -372,31 +376,36 @@ begin
       begin
         Inc(Changed);
         if ACheckOnly then
-          WriteLn('  needs formatting: ', ExtractFileName(FinalFiles[i]))
+          WriteCommandResultLine('  needs formatting: '
+            + ExtractFileName(FinalFiles[i]))
         else
           WriteLn('  formatted: ', ExtractFileName(FinalFiles[i]));
       end;
 
-    WriteLn;
-    if ExcludeSet.Count > 0 then
-      WriteLn(ExcludeSet.Count, ' file(s) skipped via [format] exclude');
     if ACheckOnly then
     begin
+      WriteCommandResultLine('');
+      if ExcludeSet.Count > 0 then
+        WriteCommandResultLine(IntToStr(ExcludeSet.Count)
+          + ' file(s) skipped via [format] exclude');
       if Changed > 0 then
       begin
-        WriteLn(Changed, ' of ', FinalFiles.Count,
-                ' file(s) need formatting');
+        WriteCommandResultLine(IntToStr(Changed) + ' of '
+          + IntToStr(FinalFiles.Count) + ' file(s) need formatting');
         Result := 1;
       end
       else
       begin
-        WriteLn(FinalFiles.Count,
-                ' file(s) checked — all correctly formatted');
+        WriteCommandResultLine(IntToStr(FinalFiles.Count)
+          + ' file(s) checked — all correctly formatted');
         Result := 0;
       end;
     end
     else
     begin
+      WriteLn;
+      if ExcludeSet.Count > 0 then
+        WriteLn(ExcludeSet.Count, ' file(s) skipped via [format] exclude');
       WriteLn(Changed, ' of ', FinalFiles.Count,
               ' file(s) formatted');
       Result := 0;

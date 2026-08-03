@@ -16,7 +16,8 @@ uses
 
   LWPT.BuildSession,
   LWPT.Core,
-  LWPT.Observability;
+  LWPT.Observability,
+  LWPT.OutputRenderer;
 
 const
   ObservabilityHeartbeatIntervalEnvironment = PROJECT_NAME
@@ -224,6 +225,11 @@ end;
 procedure TLWPTProgressReporter.WriteCapturedOutput(const AOutput: string);
 begin
   if AOutput = '' then Exit;
+  if SilentOutputActive then
+  begin
+    CaptureSilentChildOutput(RawByteString(AOutput), '');
+    Exit;
+  end;
   Write(AOutput);
   if not (AOutput[Length(AOutput)] in [#10, #13]) then WriteLn;
 end;
@@ -232,7 +238,7 @@ procedure TLWPTProgressReporter.ReportJob(const AEvent: TLWPTJobEvent;
   const AOutput, AErrorMessage: string; const AVerbose: Boolean;
   const AStartedAt: QWord);
 var
-  DisplayName, LogOutput, Metadata: string;
+  DisplayName, LogOutput, Metadata, TerminalLine: string;
   Job: TLWPTProgressJob;
 begin
   DisplayName := JobDisplayName(AEvent.Source);
@@ -284,7 +290,10 @@ begin
     ojsFailed:
       begin
         if AEvent.Detail <> '' then Metadata := AEvent.Detail + '; ' + Metadata;
-        WriteLn(ObservabilityFailEvent, DisplayName, ' (', Metadata, ')');
+        TerminalLine := ObservabilityFailEvent + DisplayName + ' ('
+          + Metadata + ')';
+        if SilentOutputActive then WriteCommandResultLine(TerminalLine)
+        else WriteLn(TerminalLine);
       end;
     ojsSkipped:
       begin

@@ -56,9 +56,20 @@ type
     procedure TestBuildModeEqualsSeparatedValueParses;
     procedure TestBuildModeInvalidValueExitsNonZero;
     procedure TestVerboseFlagIsLongOnly;
+    procedure TestSilentFlagIsSharedByEverySubcommand;
     procedure TestSuccessfulCommandReportsCompletion;
     procedure TestFailedCommandReportsCompletion;
     procedure TestRunAliasReportsResolvedCommand;
+    procedure TestSilentSuccessEmitsOnlyCompletion;
+    procedure TestSilentFailureReplaysDiagnosticBeforeCompletion;
+    procedure TestSilentFormatCheckRetainsEvidenceAfterWarning;
+    procedure TestSilentVerboseConflictIsRejected;
+    procedure TestSilentRunAliasUsesResolvedCommand;
+    procedure TestSilentRunScriptSuppressesSuccessfulChildOutput;
+    procedure TestSilentRunScriptReplaysFailedChildOutput;
+    procedure TestSilentBuildReplaysFailedCompilerOutputOnly;
+    procedure TestSilentNoBuildEntriesRetainsFailureAfterWarning;
+    procedure TestSilentInteractiveInitIsRejected;
   end;
 
 function CompletionPrefix(const ACommand, AStatus: string): string;
@@ -85,6 +96,7 @@ end;
 procedure TCLIOptionsE2E.SetupScratchProject;
 begin
   ForceDirectories(FScratch + '/source');
+  ForceDirectories(FScratch + '/scripts');
 
   WriteTextFile(FScratch + '/lwpt.toml',
     '[package]'#10 +
@@ -94,13 +106,39 @@ begin
     ''#10 +
     '[build.hello]'#10 +
     'source = "source/hello.pas"'#10 +
-    'output = "build/hello"'#10);
+    'output = "build/hello"'#10 +
+    ''#10 +
+    '[child-success]'#10 +
+    'script = "scripts/child-success.pas"'#10 +
+    ''#10 +
+    '[child-failure]'#10 +
+    'script = "scripts/child-failure.pas"'#10 +
+    ''#10 +
+    '[prebuild]'#10 +
+    'successful = "scripts/child-success.pas"'#10 +
+    ''#10 +
+    '[unknown-section]'#10 +
+    'enabled = true'#10);
 
   WriteTextFile(FScratch + '/source/hello.pas',
     'program hello;'#10 +
     '{$mode delphi}{$H+}'#10 +
     'begin'#10 +
     '  WriteLn(''hello e2e'');'#10 +
+    'end.'#10);
+
+  WriteTextFile(FScratch + '/scripts/child-success.pas',
+    'program ChildSuccess;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'begin'#10 +
+    '  WriteLn(''successful-child-output'');'#10 +
+    'end.'#10);
+  WriteTextFile(FScratch + '/scripts/child-failure.pas',
+    'program ChildFailure;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'begin'#10 +
+    '  Write(''failed-child-output'');'#10 +
+    '  Halt(7);'#10 +
     'end.'#10);
 end;
 
@@ -219,17 +257,35 @@ begin
   Expect<Boolean>(Pos('-v, --verbose', TestHelp.Stdout) = 0).ToBe(True);
 end;
 
+procedure TCLIOptionsE2E.TestSilentFlagIsSharedByEverySubcommand;
+const
+  Commands: array[0..11] of string = ('install', 'add', 'remove', 'build',
+    'format', 'duplication', 'test', 'repair', 'init', 'run', 'health',
+    'agents');
+var
+  CommandIndex: Integer;
+  HelpResult: TLwptResult;
+begin
+  for CommandIndex := 0 to High(Commands) do
+  begin
+    HelpResult := RunLwpt([Commands[CommandIndex], '--help']);
+    Expect<Integer>(HelpResult.ExitCode).ToBe(0);
+    Expect<Boolean>(Pos('--silent', HelpResult.Stdout) > 0).ToBe(True);
+  end;
+end;
+
 procedure TCLIOptionsE2E.TestSuccessfulCommandReportsCompletion;
 var
-  R : TLwptResult;
-  Prefix, StderrText : string;
+  R: TLwptResult;
+  Prefix, StderrText: string;
 begin
   R := RunLwpt(['build', '--help']);
   Prefix := CompletionPrefix('build', 'completed in ');
   StderrText := Trim(R.Stderr);
   Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Integer>(CountOccurrences(R.Stdout, Prefix)).ToBe(0);
   Expect<Integer>(CountOccurrences(R.Stderr, Prefix)).ToBe(1);
-  Expect<Boolean>(Pos(Prefix, StderrText) = 1).ToBe(True);
+  Expect<Boolean>(Pos(Prefix, StderrText) > 0).ToBe(True);
   Expect<Boolean>((StderrText <> '')
     and (StderrText[Length(StderrText)] = 's')).ToBe(True);
 end;
@@ -259,6 +315,211 @@ begin
   Expect<Integer>(CountOccurrences(R.Stderr, RunPrefix)).ToBe(0);
 end;
 
+procedure TCLIOptionsE2E.TestSilentSuccessEmitsOnlyCompletion;
+var
+  R: TLwptResult;
+  Prefix, StdoutText: string;
+begin
+  R := RunLwpt(['build', 'hello', '--silent'], FScratch);
+  Prefix := CompletionPrefix('build', 'completed in ');
+  StdoutText := Trim(R.Stdout);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<string>(R.Stderr).ToBe('');
+  Expect<Integer>(CountOccurrences(StdoutText, Prefix)).ToBe(1);
+  Expect<Boolean>(Pos(LineEnding, StdoutText) = 0).ToBe(True);
+  Expect<Boolean>(Pos('discovered', StdoutText) = 0).ToBe(True);
+  Expect<Boolean>(Pos('summary:', StdoutText) = 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestSilentFailureReplaysDiagnosticBeforeCompletion;
+var
+  R: TLwptResult;
+  DiagnosticAt, FinalAt: Integer;
+begin
+  R := RunLwpt(['build', '--mode', 'totally-wrong', '--silent'], FScratch);
+  DiagnosticAt := Pos('--mode must be', R.Stderr);
+  FinalAt := Pos(CompletionPrefix('build', 'failed after '), R.Stderr);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<string>(R.Stdout).ToBe('');
+  Expect<Boolean>(DiagnosticAt > 0).ToBe(True);
+  Expect<Boolean>(FinalAt > DiagnosticAt).ToBe(True);
+  Expect<Integer>(CountOccurrences(R.Stderr,
+    CompletionPrefix('build', 'failed after '))).ToBe(1);
+end;
+
+procedure TCLIOptionsE2E.TestSilentFormatCheckRetainsEvidenceAfterWarning;
+var
+  EvidenceAt, FinalAt, WarningAt: Integer;
+  R: TLwptResult;
+begin
+  WriteTextFile(FScratch + '/source/hello.pas',
+    'program hello;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'uses'#10 +
+    '  SysUtils,'#10 +
+    '  Classes;'#10 +
+    'begin'#10 +
+    '  WriteLn(''hello e2e'');'#10 +
+    'end.'#10);
+  try
+    R := RunLwpt(['format', '--check', '--silent'], FScratch);
+    WarningAt := Pos('warning: unrecognised section [unknown-section]',
+      R.Stderr);
+    EvidenceAt := Pos('needs formatting: hello.pas', R.Stderr);
+    FinalAt := Pos(CompletionPrefix('format', 'failed after '), R.Stderr);
+    Expect<Integer>(R.ExitCode).ToBe(1);
+    Expect<string>(R.Stdout).ToBe('');
+    Expect<Boolean>(WarningAt > 0).ToBe(True);
+    Expect<Boolean>(EvidenceAt > WarningAt).ToBe(True);
+    Expect<Boolean>(FinalAt > EvidenceAt).ToBe(True);
+  finally
+    WriteTextFile(FScratch + '/source/hello.pas',
+      'program hello;'#10 +
+      '{$mode delphi}{$H+}'#10 +
+      'begin'#10 +
+      '  WriteLn(''hello e2e'');'#10 +
+      'end.'#10);
+  end;
+end;
+
+procedure TCLIOptionsE2E.TestSilentVerboseConflictIsRejected;
+var
+  R: TLwptResult;
+begin
+  R := RunLwpt(['build', 'hello', '--silent', '--verbose'], FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<string>(R.Stdout).ToBe('');
+  Expect<Boolean>(Pos('--silent cannot be combined with --verbose',
+    R.Stderr) > 0).ToBe(True);
+  Expect<Integer>(CountOccurrences(R.Stderr,
+    CompletionPrefix('build', 'failed after '))).ToBe(1);
+end;
+
+procedure TCLIOptionsE2E.TestSilentRunAliasUsesResolvedCommand;
+var
+  R: TLwptResult;
+begin
+  R := RunLwpt(['run', 'build', 'hello', '--silent'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<string>(R.Stderr).ToBe('');
+  Expect<Integer>(CountOccurrences(R.Stdout,
+    CompletionPrefix('build', 'completed in '))).ToBe(1);
+  Expect<Integer>(CountOccurrences(R.Stdout,
+    CompletionPrefix('run', 'completed in '))).ToBe(0);
+  Expect<Boolean>(Pos(LineEnding, Trim(R.Stdout)) = 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestSilentRunScriptSuppressesSuccessfulChildOutput;
+var
+  R: TLwptResult;
+begin
+  R := RunLwpt(['run', 'child-success', '--silent'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<string>(R.Stderr).ToBe('');
+  Expect<Boolean>(Pos('successful-child-output', R.Stdout) = 0).ToBe(True);
+  Expect<Integer>(CountOccurrences(R.Stdout,
+    CompletionPrefix('run', 'completed in '))).ToBe(1);
+  Expect<Boolean>(Pos(LineEnding, Trim(R.Stdout)) = 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestSilentRunScriptReplaysFailedChildOutput;
+var
+  R: TLwptResult;
+  ChildAt, FinalAt, WarningAt: Integer;
+begin
+  R := RunLwpt(['run', 'child-failure', '--silent'], FScratch);
+  WarningAt := Pos('warning: unrecognised section [unknown-section]',
+    R.Stderr);
+  ChildAt := Pos('failed-child-output', R.Stderr);
+  FinalAt := Pos(CompletionPrefix('run', 'failed after '), R.Stderr);
+  Expect<Integer>(R.ExitCode).ToBe(7);
+  Expect<string>(R.Stdout).ToBe('');
+  Expect<Boolean>(WarningAt > 0).ToBe(True);
+  Expect<Boolean>(ChildAt > WarningAt).ToBe(True);
+  Expect<Boolean>(ChildAt > 0).ToBe(True);
+  Expect<Boolean>(FinalAt > ChildAt).ToBe(True);
+  Expect<Boolean>(Pos('failed-child-output' + LineEnding
+    + CompletionPrefix('run', 'failed after '), R.Stderr) > 0).ToBe(True);
+  Expect<Integer>(CountOccurrences(R.Stderr,
+    CompletionPrefix('run', 'failed after '))).ToBe(1);
+end;
+
+procedure TCLIOptionsE2E.TestSilentBuildReplaysFailedCompilerOutputOnly;
+var
+  R: TLwptResult;
+begin
+  WriteTextFile(FScratch + '/source/hello.pas',
+    'program hello;'#10 +
+    'begin'#10 +
+    '  this is not valid Pascal'#10 +
+    'end.'#10);
+  try
+    R := RunLwpt(['build', 'hello', '--clean', '--silent'], FScratch);
+    Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+    Expect<string>(R.Stdout).ToBe('');
+    Expect<Boolean>((Pos('Fatal:', R.Stderr) > 0)
+      or (Pos('Error:', R.Stderr) > 0)).ToBe(True);
+    Expect<Boolean>(Pos('successful-child-output', R.Stderr) = 0).ToBe(True);
+    Expect<Boolean>(Pos('discovered ', R.Stderr) = 0).ToBe(True);
+    Expect<Boolean>(Pos('START hello', R.Stderr) = 0).ToBe(True);
+    Expect<Integer>(CountOccurrences(R.Stderr,
+      CompletionPrefix('build', 'failed after '))).ToBe(1);
+  finally
+    WriteTextFile(FScratch + '/source/hello.pas',
+      'program hello;'#10 +
+      '{$mode delphi}{$H+}'#10 +
+      'begin'#10 +
+      '  WriteLn(''hello e2e'');'#10 +
+      'end.'#10);
+  end;
+end;
+
+procedure TCLIOptionsE2E.TestSilentNoBuildEntriesRetainsFailureAfterWarning;
+var
+  EvidenceAt, FinalAt, WarningAt: Integer;
+  ProjectPath: string;
+  R: TLwptResult;
+begin
+  ProjectPath := FScratch + '/no-build';
+  ForceDirectories(ProjectPath + '/source');
+  WriteTextFile(ProjectPath + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "no-build"'#10 +
+    'version = "0.0.0"'#10 +
+    'units = ["source"]'#10 +
+    ''#10 +
+    '[unknown-section]'#10 +
+    'enabled = true'#10);
+  R := RunLwpt(['build', '--silent'], ProjectPath);
+  WarningAt := Pos('warning: unrecognised section [unknown-section]',
+    R.Stderr);
+  EvidenceAt := Pos('no [build] entries defined in lwpt.toml', R.Stderr);
+  FinalAt := Pos(CompletionPrefix('build', 'failed after '), R.Stderr);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<string>(R.Stdout).ToBe('');
+  Expect<Boolean>(WarningAt > 0).ToBe(True);
+  Expect<Boolean>(EvidenceAt > WarningAt).ToBe(True);
+  Expect<Boolean>(FinalAt > EvidenceAt).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestSilentInteractiveInitIsRejected;
+var
+  InitPath: string;
+  R: TLwptResult;
+begin
+  InitPath := FScratch + '/interactive-init';
+  ForceDirectories(InitPath);
+  R := RunLwpt(['init', '--silent'], InitPath, [], 1000);
+  Expect<Boolean>(R.TimedOut).ToBe(False);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<string>(R.Stdout).ToBe('');
+  Expect<Boolean>(Pos('--silent requires --yes or --adopt for '
+    + 'non-interactive init', R.Stderr) > 0).ToBe(True);
+  Expect<Integer>(CountOccurrences(R.Stderr,
+    CompletionPrefix('init', 'failed after '))).ToBe(1);
+  Expect<Boolean>(FileExists(InitPath + '/lwpt.toml')).ToBe(False);
+end;
+
 procedure TCLIOptionsE2E.SetupTests;
 begin
   Test('lwpt --help lists every subcommand on stdout',
@@ -275,12 +536,34 @@ begin
     TestBuildModeInvalidValueExitsNonZero);
   Test('--verbose is long-only for build and test',
     TestVerboseFlagIsLongOnly);
+  Test('--silent is inherited by every registered subcommand',
+    TestSilentFlagIsSharedByEverySubcommand);
   Test('successful subcommand reports one final completion line',
     TestSuccessfulCommandReportsCompletion);
   Test('failed subcommand reports its diagnostic and one final completion line',
     TestFailedCommandReportsCompletion);
   Test('run alias reports the resolved subcommand name',
     TestRunAliasReportsResolvedCommand);
+  Test('silent success emits exactly one canonical completion line',
+    TestSilentSuccessEmitsOnlyCompletion);
+  Test('silent failure replays diagnostics before one failure result',
+    TestSilentFailureReplaysDiagnosticBeforeCompletion);
+  Test('silent format check retains evidence after an unrelated warning',
+    TestSilentFormatCheckRetainsEvidenceAfterWarning);
+  Test('silent and verbose are rejected as contradictory',
+    TestSilentVerboseConflictIsRejected);
+  Test('silent run alias reports only the resolved command result',
+    TestSilentRunAliasUsesResolvedCommand);
+  Test('silent successful run script suppresses child output',
+    TestSilentRunScriptSuppressesSuccessfulChildOutput);
+  Test('silent failed run script replays child output before the result',
+    TestSilentRunScriptReplaysFailedChildOutput);
+  Test('silent failed build replays compiler output without progress',
+    TestSilentBuildReplaysFailedCompilerOutputOnly);
+  Test('silent no-build failure survives an unrelated manifest warning',
+    TestSilentNoBuildEntriesRetainsFailureAfterWarning);
+  Test('silent interactive init is rejected without waiting for input',
+    TestSilentInteractiveInitIsRejected);
 end;
 
 begin
