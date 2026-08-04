@@ -80,11 +80,12 @@ procedure SetLwptBinaryPath(const APath: string);
 procedure ConfigureProcessEnvironment(const AProcess: TProcess;
   const AOverrides: array of string);
 
-{ When a nested lwpt run exits with an unexpected code, its captured
+{ When a nested LWPT run exits with an unexpected code, its captured
   output is the only evidence of why. Call this before the exit-code
-  assertion: on mismatch it dumps the captured stdout/stderr into the
-  suite's stdout, which the scheduler's failure replay surfaces
-  directly in CI logs. No-op when the exit code matches. }
+  assertion: on mismatch it writes the captured stdout/stderr to
+  ADiagnostics when supplied. Otherwise, it writes them to the suite's
+  stdout, which the scheduler's failure replay surfaces directly in CI
+  logs. No-op when the exit code matches. }
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
   const AExpectedExit: Integer; const ADiagnostics: TStrings = nil);
 
