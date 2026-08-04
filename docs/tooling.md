@@ -119,6 +119,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `LWPT_FPC` | Path to the FPC binary; overrides `PATH` lookup. The bare `FPC` variable is honoured as a fallback. | unset (`fpc` on `PATH`) |
 | `LWPT_INSTANTFPC` | Path to the InstantFPC binary; overrides `PATH` lookup. The bare `INSTANTFPC` variable is honoured as a fallback. | unset (`instantfpc` on `PATH`) |
 | `LWPT_FPC_UNIT_PATHS` | Path-separator-delimited unit directories appended as `-Fu`/`-Fi` to every compile (CI uses it for non-standard FPC installs; see the prose below) | unset |
+| `LWPT_COMPILER_TIMEOUT_MS` | Positive compiler-process timeout in milliseconds; capability probes retain their fixed 30-second deadline | 30 minutes |
 | `LWPT_HEARTBEAT_INTERVAL_MS` | Diagnostic tuning knob: build/test heartbeat interval; values are clamped to the default ceiling | `30000` |
 | `PATH` | Must contain `fpc`, `instantfpc`, `lefthook` | system default |
 | `LWPT_BUILD_ENTRY` | Per-entry postbuild hook context: selected build-entry name | supplied by LWPT |
