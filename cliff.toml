@@ -59,11 +59,21 @@ commit_parsers = [
   { message = "^Allow ",      group = "New Features" },
   { message = "^Introduce ",  group = "New Features" },
   { message = "^Enable ",     group = "New Features" },
+  { message = "^Acknowledge ", group = "New Features" },
+  { message = "^Forward ",     group = "New Features" },
+  { message = "^Harden ",      group = "New Features" },
+  { message = "^Report ",      group = "New Features" },
+  { message = "^Detect ",      group = "New Features" },
+  { message = "^Expose ",      group = "New Features" },
+  { message = "^Bound ",       group = "New Features" },
+  { message = "^Resolve one dependency version across the full graph", group = "New Features" },
 
   { message = "^Fix ",        group = "Bug Fixes" },
   { message = "^Repair ",     group = "Bug Fixes" },
   { message = "^Resolve ",    group = "Bug Fixes" },
   { message = "^Correct ",    group = "Bug Fixes" },
+  { message = "^Skip ",       group = "Bug Fixes" },
+  { message = "^Retry ",      group = "Bug Fixes" },
 
   { message = "^Optimi[sz]e", group = "Performance" },
   { message = "^Speed up",    group = "Performance" },
@@ -81,6 +91,7 @@ commit_parsers = [
   { message = "^Sweep ",      group = "Internal" },
   { message = "^Update ",     group = "Internal" },
   { message = "^Bump ",       group = "Internal" },
+  { message = "^Run ",        group = "Internal" },
 
   # Conventional-commit subjects (the current house style, scoped or
   # bare). The imperative-English parsers above remain for the

@@ -268,8 +268,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 - **Test-artefact placement** — every `lwpt test` invocation owns a unique
   `.lwpt/sessions/<session-id>/` directory. Each test program receives a
   private `-FE`, `-FU`, and executable path below that session. Successful
-  sessions are removed; failed sessions remain private and diagnosable until
-  `lwpt repair` reclaims them.
+  sessions discard private compiler jobs and hooks but retain stable logs and
+  completed state for diagnosis. Failed sessions retain their private
+  diagnostics. `lwpt repair` reclaims inactive sessions after their owner guard
+  is absent.
 - **`tests/support/` auto-discovery** — `LWPT.Command.Testing.CmdTest` adds `tests/support` to the FPC `-Fu`/`-Fi` paths automatically when it exists. `LWPT.Command.Format.CmdFormat` does not walk `tests/` implicitly; the root manifest's `[format].include` globs cover `tests/integration/`, `tests/support/`, and `tests/e2e/` explicitly so project-owned test helpers are held to the same formatter rules as `source/` (see [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md)).
 
 ### Counts
@@ -280,14 +282,6 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | Integration (`tests/integration/*.Test.pas`) | 22 | 246 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 7 | 35 |
 | **Total** | **58** | **771** |
-
-### Planned testing work
-
-| Item | Reason | When |
-| --- | --- | --- |
-| **~~HTTP-failure tests with test-scoped URL injection~~** | **Solved.** `LWPT_TEST_ARCHIVE_ORIGIN` redirects the archive fetch to a loopback mock server after canonical URL construction, and `tests/integration/InstallFetchFailure.Test.pas` covers HTTP 500, refused connection, a stalled peer, and a fixed-length body cut short. See [issue #34](https://github.com/frostney/lwpt/issues/34). | done |
-| **~~Lockfile records host~~** | **Solved.** The v3 lockfile's `source` field is the verbatim manifest string (`gitlab:org/repo`) and `resolvedURL` is the actual archive URL (`https://gitlab.com/...`). Host is recoverable from either. See ADR-0009. | done |
-| **Windows install lock + mock server + subprocess paths** | Install locking is covered through `lwpt install` / `lwpt repair` behavior rather than direct lock-type tests. Native WinSock mock-server regression coverage is tracked in [issue #35](https://github.com/frostney/lwpt/issues/35). | [Issue #35](https://github.com/frostney/lwpt/issues/35) |
 
 ## TestingPascalLibrary self-test
 
