@@ -82,16 +82,17 @@ the watchdog supplies the same terminal result for orphaned runs.
 The `review` operation opens the configured provider lane after PR admission.
 Before `merge`, the controller requires a terminal provider review on the
 current head, a successful provider check, no unresolved thread, and a reply
-from an account with current write/maintain/admin permission on every automation
+from an account with current maintain or admin permission on every automation
 thread. Provider identities are data in
 `.github/delivery/review-automations.json`; retry and quota policy are not.
 `merge:ready` records that point-in-time acceptance, so the coordinator invokes
 the idempotent `merge` operation immediately before a singleton merge. For a
-native prefix it preflights every member using managed delivery against the
-same candidate, then integrates the frozen prefix bottom to top without
-unrelated work in between. Ordinary members retain their protected automatic
-route. The coordinator never treats labels left by an earlier preflight as
-durable proof.
+native prefix it preflights each `delivery:managed` member against the same
+candidate, then integrates the frozen prefix bottom to top without unrelated
+work in between. An ordinary member never uses the endpoint; at its merge turn
+it remains individually subject to current branch protection and the ordinary
+review policy. The coordinator never treats labels left by an earlier preflight
+as durable proof.
 
 ### `toolchain.yml` — cross-FPC toolchain build
 

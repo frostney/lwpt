@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import sys
@@ -11,7 +12,7 @@ from pathlib import Path
 DELIVERY_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DELIVERY_DIR))
 
-from controller import Controller, MANAGED_RUN_RE  # noqa: E402
+from controller import Controller, MANAGED_RUN_RE, positive_integer  # noqa: E402
 from model import (  # noqa: E402
     DeliveryError,
     derive_candidate_snapshot,
@@ -206,6 +207,13 @@ class DeliveryModelTests(unittest.TestCase):
         started = (now - timedelta(minutes=120)).isoformat()
         self.assertTrue(watchdog_expired(started, 120, now))
         self.assertFalse(watchdog_expired(started, 121, now))
+
+    def test_watchdog_age_must_be_positive(self) -> None:
+        self.assertEqual(1, positive_integer("1"))
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "positive integer"):
+            positive_integer("0")
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "positive integer"):
+            positive_integer("-1")
 
     def test_review_requires_terminal_head_thread_resolution_and_reply(self) -> None:
         automations = [

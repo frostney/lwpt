@@ -33,6 +33,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MAXIMUM_AGE_MINUTES: ${{ inputs.maximum_age_minutes || 120 }}
-        run: >-
-          python3 .github/delivery/controller.py watchdog
-          --maximum-age-minutes "$MAXIMUM_AGE_MINUTES"
+        run: |
+          set -euo pipefail
+          if ! [[ "$MAXIMUM_AGE_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::maximum_age_minutes must be a positive integer."
+            exit 1
+          fi
+          python3 .github/delivery/controller.py watchdog \
+            --maximum-age-minutes "$MAXIMUM_AGE_MINUTES"

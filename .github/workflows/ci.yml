@@ -81,7 +81,31 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate exact full-CI proof inputs
+        env:
+          MODE: ${{ inputs.mode }}
+          CANDIDATE_PR_NUMBER: ${{ inputs.candidate_pr_number }}
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+          TOPOLOGY_DIGEST: ${{ inputs.topology_digest }}
+          CHECK_ID: ${{ inputs.check_id }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" != "full-ci" ]; then
+            exit 0
+          fi
+          if ! [[ "$CANDIDATE_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
+             ! [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]] ||
+             ! [[ "$TOPOLOGY_DIGEST" =~ ^[0-9a-f]{64}$ ]] ||
+             ! [[ "$CHECK_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::full-ci requires a candidate PR, exact head, topology digest, and check ID."
+            exit 1
+          fi
+
   toolchain:
+    needs: validate-inputs
     uses: ./.github/workflows/toolchain.yml
 
   build:

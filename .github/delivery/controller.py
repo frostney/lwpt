@@ -46,7 +46,7 @@ class GitHub:
     def __init__(self) -> None:
         self.repository = os.environ["GITHUB_REPOSITORY"]
         self.owner, self.name = self.repository.split("/", 1)
-        self.token = os.environ["GITHUB_TOKEN"]
+        self.token = os.environ["GH_TOKEN"]
         self.api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
         self.graphql_url = os.environ.get("GITHUB_GRAPHQL_URL", "https://api.github.com/graphql")
 
@@ -392,7 +392,7 @@ class Controller:
             raise
 
     def require_delivery_success(self, number: int, expected_head: str) -> dict[str, Any]:
-        snapshot, digest = self.snapshot(number)
+        _, digest = self.snapshot(number)
         check = self.matching_check(
             expected_head,
             DELIVERY_CHECK,
@@ -471,7 +471,7 @@ class Controller:
                 permission = self.github.collaborator_permission(login)
             except DeliveryError:
                 continue
-            if permission in {"admin", "maintain", "write"}:
+            if permission in {"admin", "maintain"}:
                 maintainers.add(login)
         errors = review_evidence_errors(
             head, self.automations, checks, reviews, threads, maintainers
@@ -653,6 +653,7 @@ class Controller:
     def finalize_full_ci(self, run: dict[str, Any], match: re.Match[str]) -> None:
         number = int(match.group(1))
         head, requested_digest, check_id = match.group(2), match.group(3), int(match.group(4))
+        snapshot: dict[str, Any] | None = None
         check = self.require_owned_check(
             check_id,
             FULL_CI_CHECK,
@@ -682,8 +683,8 @@ class Controller:
             conclusion=conclusion,
             details_url=run["html_url"],
         )
-        if conclusion != "success":
-            for entry in snapshot.get("entries", []) if "snapshot" in locals() else []:
+        if conclusion != "success" and snapshot is not None:
+            for entry in snapshot.get("entries", []):
                 self.github.remove_label(entry["number"], MERGE_READY_LABEL)
 
     def finalize_ordinary(self, run: dict[str, Any]) -> None:
@@ -761,6 +762,13 @@ class Controller:
                             self.github.remove_label(entry["number"], MERGE_READY_LABEL)
 
 
+def positive_integer(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -771,7 +779,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-head")
     parser.add_argument("--candidate-pr-number", type=int)
     parser.add_argument("--event-path")
-    parser.add_argument("--maximum-age-minutes", type=int, default=120)
+    parser.add_argument("--maximum-age-minutes", type=positive_integer, default=120)
     return parser.parse_args()
 
 

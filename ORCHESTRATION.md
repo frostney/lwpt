@@ -54,14 +54,15 @@ The endpoint promotes state but never merges. Milestone Rush or a human
 maintainer owns integration after `merge:ready`. `merge:ready` records the
 point-in-time acceptance produced by the `merge` operation; it is not durable
 proof by itself. For a singleton, the coordinator invokes `merge` immediately
-before integration. For a native prefix, it invokes `merge` for every member
-using managed delivery against the same candidate before the first merge, then
-integrates that frozen prefix from bottom to top without interleaving unrelated
-work. Ordinary members retain their protected automatic route. The coordinator
-must not infer current eligibility from labels left by an earlier preflight.
-Reinvocation before integration is idempotent and revalidates the current head,
-review, topology, and applicable full-CI evidence. Ordinary PRs do not need the
-endpoint. The repository observer creates and finalizes their
+before integration. For a native prefix, it invokes `merge` for each
+`delivery:managed` member against the same candidate before the first merge,
+then integrates that frozen prefix from bottom to top without interleaving
+unrelated work. An ordinary member never uses the endpoint; at its merge turn
+it remains individually subject to current branch protection and the ordinary
+review policy. The coordinator must not infer current eligibility from labels
+left by an earlier preflight. Reinvocation before integration is idempotent and
+revalidates the current head, review, topology, and applicable full-CI evidence.
+The repository observer creates and finalizes ordinary PRs'
 `delivery-admission` from the ordinary PR workflow.
 
 ## Capability decision tree

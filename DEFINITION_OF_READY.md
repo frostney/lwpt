@@ -41,8 +41,8 @@ intermediary issue merely to satisfy process.
   or prefix merge unit.
 - The plan records whether `ci:full-required` applies, the exact singleton or
   cumulative prefix SHA that must prove it, every active inline review
-  automation and its terminal evidence, and any repository workflow,
-  controller, ruleset, or provider adapter that must land first.
+  automation and the terminal evidence required from each, and any repository
+  workflow, controller, ruleset, or provider adapter that must land first.
 - Agent-led plans have classified [`ORCHESTRATION.md`](./ORCHESTRATION.md) as
   valid, missing, invalid, contradictory, or unsupported. A generic workflow
   recommendation is planning input, not evidence that repository integration
