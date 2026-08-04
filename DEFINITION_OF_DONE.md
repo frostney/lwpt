@@ -20,6 +20,15 @@ requirement may be marked not applicable only with a recorded reason.
 
 - Focused tests covering the changed behavior pass, including negative and
   recovery paths where applicable.
+- Every applicable delivery proof is successful for the exact final head or
+  unchanged atomic native prefix. Any head, base, order, or prefix change
+  invalidates prior CI, review, full-CI, and merge-readiness evidence.
+- Managed completion includes terminal current-head evidence from every active
+  inline review automation, zero unresolved threads, and a reply from an
+  account with current maintainer authority on every automation thread,
+  including resolved threads.
+- Each delivery, full-CI, or review requirement marked not applicable has an
+  explicit evidence-backed reason.
 - FreePascal behavior relied upon by the change is checked against the live
   compiler rather than memory.
 - No test is silently skipped, disabled, focused, or weakened to obtain a

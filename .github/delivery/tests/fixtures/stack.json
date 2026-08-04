@@ -1,0 +1,76 @@
+{
+  "number": 43,
+  "headRefOid": "3333333333333333333333333333333333333333",
+  "baseRefOid": "2222222222222222222222222222222222222222",
+  "baseRefName": "feature-two",
+  "labels": {
+    "nodes": [
+      {
+        "name": "delivery:managed"
+      }
+    ]
+  },
+  "stackEntry": {
+    "position": 3
+  },
+  "stack": {
+    "id": "PRS_fixture",
+    "number": 7,
+    "baseRefName": "main",
+    "entries": {
+      "nodes": [
+        {
+          "position": 1,
+          "pullRequest": {
+            "number": 41,
+            "headRefOid": "1111111111111111111111111111111111111111",
+            "baseRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "baseRefName": "main",
+            "labels": {
+              "nodes": [
+                {
+                  "name": "delivery:managed"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "position": 2,
+          "pullRequest": {
+            "number": 42,
+            "headRefOid": "2222222222222222222222222222222222222222",
+            "baseRefOid": "1111111111111111111111111111111111111111",
+            "baseRefName": "feature-one",
+            "labels": {
+              "nodes": [
+                {
+                  "name": "ci:full-required"
+                },
+                {
+                  "name": "delivery:managed"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "position": 3,
+          "pullRequest": {
+            "number": 43,
+            "headRefOid": "3333333333333333333333333333333333333333",
+            "baseRefOid": "2222222222222222222222222222222222222222",
+            "baseRefName": "feature-two",
+            "labels": {
+              "nodes": [
+                {
+                  "name": "delivery:managed"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
