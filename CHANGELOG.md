@@ -1,6 +1,50 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.5.0] - 2026-08-04
+
+### Bug Fixes
+
+- fix(process): preserve Windows job assignment ordering (#157)
+- fix(worker-budget): make delegation handoff atomic (#152)
+- Skip writer threads for empty process input (#151)
+- Retry concurrent worker-budget state-root creation (#139)
+
+### Documentation
+
+- docs: remove stale analysis roadmap links (#163)
+
+### Internal
+
+- chore: reconcile release preparation findings (#164)
+- chore(skills): add run-retro workflow (#162)
+- test(build): expose raw status on observable failure (#147)
+- test(process): make missing-ack cancellation deterministic (#158)
+- refactor(process): type Windows process-tree state (#150)
+- test(worker-budget): expose delegation failure state (#143)
+- refactor(output): share typed progress reporting (#144)
+- test(compiler): await Windows proxy release (#146)
+- Run HTTP mock-server regressions natively on Windows (#130)
+- ci: gate stacked PR validation (#129)
+
+### New Features
+
+- Acknowledge nested process-tree termination (#155)
+- Forward Windows console cancellation (#154)
+- Add universal silent output mode (#149)
+- Add the typed output event foundation (#136)
+- Harden TLS server identity lifecycle (#148)
+- Add Lakon compiler driver (#142)
+- Add Delphi compiler driver (#140)
+- Add Blaise compiler driver (#141)
+- Add deterministic HTTP fetch-failure tests (#131)
+- Report Pascal complexity and Git health hotspots (#138)
+- Detect Type-2 duplication across typed Pascal regions (#137)
+- Expose root-owned compiler profiles and embedding defaults (#132)
+- Resolve one dependency version across the full graph (#134)
+- Bound encrypted TLS handshake buffering (#135)
+- Add the shared Pascal analysis foundation (#133)
+- feat(cli): report subcommand completion timings (#128)
 ## [0.4.0] - 2026-08-01
 
 ### Bug Fixes
@@ -44,6 +88,7 @@ All notable changes to LWPT are documented in this file. The format follows [Kee
 
 ### Internal
 
+- ci(release): stamp the tag version with a host-linkable FPC (#114)
 - test: apply codex-review findings on the #105 fixes (#108)
 - refactor(run): derive list-mode subcommand aliases from the live registry (#94)
 - refactor(test): derive suite descriptions from PROJECT_NAME (#82)
@@ -90,10 +135,13 @@ All notable changes to LWPT are documented in this file. The format follows [Kee
 - Deepen install transaction architecture (#13)
 ## [0.1.0] - 2026-06-04
 
+### Bug Fixes
+
+- Skip live-network e2e tests on transient host downtime (#10)
+
 ### Other Changes
 
-- Install-script e2e smoke (latest-resolving) + stamp release version from tag (ADR-0026) (#11)
-- Skip live-network e2e tests on transient host downtime (#10)
+- Install-script e2e smoke (latest-resolving) + stamp release version from tag (ADR-0018) (#11)
 ## [0.1.0-rc.2] - 2026-06-02
 
 ### Bug Fixes
