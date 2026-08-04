@@ -1,4 +1,9 @@
 name: CI
+run-name: >-
+  ${{ inputs.mode == 'full-ci' &&
+      format('full-ci/{0}/{1}/{2}/{3}', inputs.candidate_pr_number,
+      inputs.expected_head, inputs.topology_digest, inputs.check_id) ||
+      format('CI / {0}', github.ref_name) }}
 
 # Two stages, mirroring the GocciaScript CI pattern (the upstream of
 # LWPT's vendored units). Sister workflows:
@@ -39,9 +44,41 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Manual full-CI proof or ordinary manual verification
+        required: true
+        type: choice
+        default: manual
+        options:
+          - manual
+          - full-ci
+      candidate_pr_number:
+        description: Singleton or native-prefix top PR for full-ci
+        required: false
+        type: string
+      expected_head:
+        description: Exact candidate head for full-ci; blank uses the dispatched ref
+        required: false
+        type: string
+      topology_digest:
+        description: Exact native singleton or prefix digest for full-ci
+        required: false
+        type: string
+      check_id:
+        description: Exact full-ci check run concluded by the trusted finalizer
+        required: false
+        type: string
 
 permissions:
   contents: read
+
+# Rapid prefix merges still create distinct main commits. Keep only the latest
+# integrated-main verification running; explicit full-ci dispatches remain
+# independent exact-candidate proofs and are never silently coalesced.
+concurrency:
+  group: ${{ github.event_name == 'push' && 'integrated-main' || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   toolchain:
@@ -82,6 +119,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ inputs.expected_head || github.sha }}
 
       - name: Restore toolchain cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -312,6 +350,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ inputs.expected_head || github.sha }}
 
       - name: Install FPC (brew)
         if: matrix.fpc-install == 'brew'

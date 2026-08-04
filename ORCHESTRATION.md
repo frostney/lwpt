@@ -1,0 +1,158 @@
+# Repository Orchestration Policy
+
+## Authority and fallback
+
+This file is LWPT's authoritative repository policy for agent capability,
+context, token intervention, and delivery endpoint bindings. It is subordinate
+to [`AGENTS.md`](./AGENTS.md), repository security policy, and the safety gates
+of the invoked workflow.
+
+A generic orchestrator must classify this policy as exactly one of these
+states before it plans or spawns work:
+
+- **Valid:** every required heading, capability class, field, and threshold is
+  supported and internally consistent. Apply this policy.
+- **Missing:** use the consumer's conservative generic fallback and report the
+  missing repository policy before work begins.
+- **Invalid:** a required field or measurable threshold is malformed. Block
+  spawning and request a policy correction.
+- **Contradictory:** two applicable rules require incompatible behavior. Block
+  spawning and name both rules.
+- **Unsupported:** the consumer cannot implement a required capability,
+  context mode, ledger field, endpoint, or intervention. Block spawning and
+  report the unsupported requirement.
+
+Missing policy is the only state that permits fallback. Invalid,
+contradictory, and unsupported policy never silently degrades.
+
+## Delivery integration endpoints
+
+LWPT exposes one trusted transition endpoint:
+`.github/workflows/delivery-transition.yml`. Invoke it from the repository's
+default branch with
+`gh workflow run delivery-transition.yml --ref <default-branch>` and the fields
+below, or supply the same fields in the Actions UI. The workflow run is the
+accepted/rejected transition audit. Checks named `delivery-admission` and
+`full-ci` are the exact-SHA proof records.
+
+| Transition | Operation | Required inputs | Accepted state | Completion evidence |
+| --- | --- | --- | --- | --- |
+| Enrol managed delivery | `enrol` | `pr_number`, `expected_head` | `delivery:managed`; downstream readiness cleared | Pending exact-head `delivery-admission` |
+| Admit PR CI | `ci` | `pr_number`, `expected_head` | `ci:ready`; trusted read-only PR matrix dispatched | Successful exact-head `delivery-admission` |
+| Open review | `review` | `pr_number`, `expected_head` | `review:ready` after current admission succeeds | Provider-neutral review convergence remains external |
+| Prove full CI | `full-ci` | `pr_number` as candidate, `expected_head` | No readiness label; frozen singleton or prefix dispatched | Successful exact-head `full-ci` with topology digest |
+| Admit merge | `merge` | `pr_number`, `expected_head`, `candidate_pr_number` | `merge:ready`; validated draft may become ready | Current CI, review, replies, threads, and applicable full-CI proof |
+| Return to waiting | `reset` | `pr_number`, `expected_head` | Readiness labels cleared; managed/full-required policy retained | New pending exact-head admission when managed |
+
+`delivery:managed`, native stack membership, and `ci:full-required` are
+independent dimensions. A managed PR may be standalone. A native stack may be
+ordinary. Full CI may apply to either. GitHub's native `PullRequest.stack` and
+ordered entries are the sole topology authority; labels and branch names never
+declare stack membership.
+
+The endpoint promotes state but never merges. Milestone Rush or a human
+maintainer owns integration after `merge:ready`. `merge:ready` records the
+point-in-time acceptance produced by the `merge` operation; it is not durable
+proof by itself. For a singleton, the coordinator invokes `merge` immediately
+before integration. For a native prefix, it invokes `merge` for every member
+using managed delivery against the same candidate before the first merge, then
+integrates that frozen prefix from bottom to top without interleaving unrelated
+work. Ordinary members retain their protected automatic route. The coordinator
+must not infer current eligibility from labels left by an earlier preflight.
+Reinvocation before integration is idempotent and revalidates the current head,
+review, topology, and applicable full-CI evidence. Ordinary PRs do not need the
+endpoint. The repository observer creates and finalizes their
+`delivery-admission` from the ordinary PR workflow.
+
+## Capability decision tree
+
+Use capability classes, never product model names.
+
+1. Monitoring, timing, status collection, deterministic checks, mechanical
+   evidence extraction, and unchanged-state reporting use the **efficient**
+   capability class at its standard reasoning level.
+2. Material design, implementation, security work, complex diagnosis, and
+   independent review use the **frontier** capability class with **high**
+   reasoning.
+3. If a task spans both classes, split its deterministic portion when useful;
+   the material decision owner remains frontier/high.
+4. If classification is ambiguous, use frontier/high and record the reason in
+   the lane ledger.
+
+No token or context intervention may silently downgrade work below the class
+required by this decision tree.
+
+## Coordinator and lane responsibilities
+
+The coordinator stays thin. It owns stable decisions, dependency topology,
+lane packets, promotion, delivery transitions, integration, and merge. It does
+not retain detailed implementation work that belongs to a bounded lane.
+
+Lean lane agents own implementation, remediation, independent review, local
+validation, exact-head reporting, and structured handoff for their assigned
+node. A lane reports conflicting evidence instead of silently reopening a
+stable decision.
+
+External polling uses a non-LLM watcher wherever the host permits. A model is
+invoked only for changed, terminal, or exceptional state. A known wait uses
+the exact reported wake time.
+
+## Context packets
+
+Independent agents default to `fork_turns:none`. Each lane receives a compact
+packet containing:
+
+- applicable stable decision IDs and their settled text;
+- issue number and exact head;
+- owned file or behavior scope;
+- dependencies and blockers;
+- acceptance criteria; and
+- required local, CI, review, and delivery gates.
+
+Include only the most recent three to five turns when they are immediately
+relevant. Full-history inheritance requires a recorded, scoped exception that
+explains which missing context cannot be represented in the compact packet.
+
+## Token ledger
+
+Record these fields per lane and cumulatively by capability class:
+
+- inference count;
+- input, cached input, uncached input, output, and reasoning tokens;
+- capability class and reasoning level;
+- context mode (`none`, bounded recent turns, or full history);
+- compaction count; and
+- durable workflow transitions.
+
+A durable transition is a settled decision, completed bounded packet, new
+exact head, validation or review state change, PR state change, or merge. A
+poll, repeated narration, or unchanged external state is not durable.
+
+## Intervention thresholds
+
+Context occupancy for one inference is input tokens divided by that model's
+active context-window capacity. Compute the rolling median over the latest ten
+inferences in the lane; before ten exist, use all completed inferences.
+
+- When that median becomes greater than 40%, record a warning and choose
+  whether to continue, checkpoint, split, replace, or escalate.
+- When that median becomes greater than 55%, checkpoint durable state and
+  split or replace the lane before another inference. Escalation is allowed
+  only when neither action can preserve required capability or context.
+- On the 25th consecutive model inference without a durable transition,
+  record and execute an explicit continue, split, replace, or escalate
+  decision before inference 26.
+- A monitor may perform at most three model inferences without external state
+  change. Before a fourth, move polling to a non-LLM watcher.
+
+An intervention never silently downgrades capability, silently stops required
+work, or ignores the threshold. The first lean Milestone Rush records totals
+by capability class and produces a calibration follow-up. This policy sets no
+hard cumulative run budget until that evidence exists.
+
+## Unsupported or contradictory policy handling
+
+Report the exact heading, rule, value, and consumer limitation. Preserve work
+already made durable, do not spawn or replace lanes under guessed semantics,
+and request correction from the repository owner. A consumer may resume only
+after the policy is valid or the owner changes it explicitly.

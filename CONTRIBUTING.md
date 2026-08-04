@@ -32,37 +32,31 @@ The pre-commit hook runs `lwpt format` and `lwpt agents` locally (both with `sta
 
 If any check fails on a hook autofix you didn't expect, do not commit with `--no-verify`. Investigate, then fix.
 
-### GitHub Stack trial
+### Managed delivery
 
-The 0.5.0 milestone uses GitHub-native stacked pull requests as a trial. Labels
-route each stack layer through the expensive gates; GitHub checks and review
-evidence for the current head remain authoritative:
+Ordinary PRs run the PR matrix automatically. A deferred PR uses the explicit
+endpoint in [`ORCHESTRATION.md`](./ORCHESTRATION.md) and the ordered
+`delivery:managed` → `ci:ready` → `review:ready` → `merge:ready` phases.
+`ci:full-required` independently marks work that needs the six-target full-CI
+proof before merge admission.
 
-- `stack:managed` marks a draft layer owned by the active milestone rush. Trial
-  branches use the `codex/stack-` prefix so the opening run is gated before the
-  label can be applied. Draft pushes and cascading synchronization stop after
-  the cheap admission job.
-- `ci:ready` means the layer is stable. Applying it reruns the full PR matrix
-  once for that exact head while the PR remains draft. Stable lower
-  layers run CI even while upper layers remain under construction.
-- `review:ready` is applied only after CI passes. It admits one PR at a time to
-  the rate-limited CodeRabbit lane from the bottom upward. The label requests
-  the first pass; after a reviewed head changes, use `@coderabbitai review` once
-  the replacement head has passed CI and regained the label.
-- `merge:ready` is applied only after the current head has green CI, terminal
-  review evidence, and no unresolved findings. Only then mark the PR ready for
-  review. The label is routing state, not proof.
+The labels expose current phase; the exact-head `delivery-admission` check,
+current review evidence, and conditional `full-ci` check are proof. GitHub's
+native stack is the only source of prefix order. A managed PR may be standalone,
+and a native stack need not be managed. New heads or changed base/order/prefix
+return affected work to waiting and invalidate stale evidence automatically.
 
-Before changing, rebasing, or pushing any managed layer with readiness state,
-return it and its affected suffix to draft and remove all three readiness
-labels. After an atomic whole-stack or selected-prefix merge, refresh `main`,
-synchronize the remaining suffix and dependent stacks, clear their stale
-readiness labels, and rerun the current-head gates.
-
-For this trial only, the user-approved exception to the ordinary no-rebase and
-no-force-push policy allows `gh stack` to cascade rebase and force-with-lease
-branches created by the 0.5.0 rush. Stop on a lease mismatch. The exception
-never applies to `main`, unrelated branches, or pre-existing branches.
+`review:ready` opens the configured review provider lane after PR CI succeeds;
+it does not mean review is complete. `merge:ready` is accepted only after the
+machine gate observes terminal current-head review, no unresolved threads, a
+current maintainer reply on every automation thread, and applicable exact-SHA
+full CI. The endpoint never merges; the coordinator or maintainer integrates
+the accepted singleton or prefix. Because `merge:ready` records point-in-time
+acceptance rather than proof of future eligibility, the coordinator invokes
+the `merge` operation immediately before a singleton merge or preflights every
+managed member of one frozen native prefix before integrating it bottom to top
+without unrelated work in between. Ordinary members retain their protected
+automatic route.
 
 ## Commit messages
 

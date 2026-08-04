@@ -1,0 +1,38 @@
+name: Delivery proof watchdog
+
+on:
+  schedule:
+    - cron: '13,43 * * * *'
+  workflow_dispatch:
+    inputs:
+      maximum_age_minutes:
+        description: Fail pending proof checks at or beyond this age
+        required: true
+        type: number
+        default: 120
+
+permissions:
+  checks: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: delivery-mutation
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Fail orphaned proofs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAXIMUM_AGE_MINUTES: ${{ inputs.maximum_age_minutes || 120 }}
+        run: >-
+          python3 .github/delivery/controller.py watchdog
+          --maximum-age-minutes "$MAXIMUM_AGE_MINUTES"
