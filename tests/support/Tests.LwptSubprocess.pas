@@ -49,6 +49,8 @@ uses
 type
   TLwptResult = record
     ExitCode: Integer;
+    ProcessExitCode: Integer;
+    ProcessExitStatus: Integer;
     Stdout:   string;
     Stderr:   string;
     TimedOut: Boolean;
@@ -78,13 +80,14 @@ procedure SetLwptBinaryPath(const APath: string);
 procedure ConfigureProcessEnvironment(const AProcess: TProcess;
   const AOverrides: array of string);
 
-{ When a nested lwpt run exits with an unexpected code, its captured
+{ When a nested LWPT run exits with an unexpected code, its captured
   output is the only evidence of why. Call this before the exit-code
-  assertion: on mismatch it dumps the captured stdout/stderr into the
-  suite's stdout, which the scheduler's failure replay surfaces
-  directly in CI logs. No-op when the exit code matches. }
+  assertion: on mismatch it writes the captured stdout/stderr to
+  ADiagnostics when supplied. Otherwise, it writes them to the suite's
+  stdout, which the scheduler's failure replay surfaces directly in CI
+  logs. No-op when the exit code matches. }
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
-  const AExpectedExit: Integer);
+  const AExpectedExit: Integer; const ADiagnostics: TStrings = nil);
 
 { Quick helper for "is the env saying skip network?". E2E tests that
   touch the live internet should consult this and self-skip via a
@@ -274,6 +277,8 @@ const
   TERMINATION_GRACE_MILLISECONDS = 2000;
 begin
   Result.ExitCode := -1;
+  Result.ProcessExitCode := -1;
+  Result.ProcessExitStatus := -1;
   Result.Stdout   := '';
   Result.Stderr   := '';
   Result.TimedOut := False;
@@ -358,9 +363,11 @@ begin
         ExitCode collapses most failures to 0. ExitStatus is nonzero on
         genuine failure either way, so trust it when ExitCode claims
         success. }
-      Result.ExitCode := P.ExitCode;
-      if (Result.ExitCode = 0) and (P.ExitStatus <> 0) then
-        Result.ExitCode := P.ExitStatus;
+      Result.ProcessExitCode := P.ExitCode;
+      Result.ProcessExitStatus := P.ExitStatus;
+      Result.ExitCode := Result.ProcessExitCode;
+      if (Result.ExitCode = 0) and (Result.ProcessExitStatus <> 0) then
+        Result.ExitCode := Result.ProcessExitStatus;
       { A test process may invoke LWPT more than once. Once a nested build or
         test scheduler starts, it has consumed the one-shot worker delegation;
         stop forwarding that stale token so the next command can join the
@@ -380,17 +387,27 @@ begin
   end;
 end;
 
+procedure WriteRunDiagnostic(const ALine: string;
+  const ADiagnostics: TStrings);
+begin
+  if Assigned(ADiagnostics) then ADiagnostics.Add(ALine)
+  else WriteLn(ALine);
+end;
+
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
-  const AExpectedExit: Integer);
+  const AExpectedExit: Integer; const ADiagnostics: TStrings);
 begin
   if ARun.ExitCode = AExpectedExit then Exit;
-  WriteLn('RUN FAILURE [', ALabel, '] exit=', ARun.ExitCode,
-    ' expected=', AExpectedExit);
-  WriteLn('--- captured stdout ---');
-  WriteLn(ARun.Stdout);
-  WriteLn('--- captured stderr ---');
-  WriteLn(ARun.Stderr);
-  WriteLn('--- end captured output ---');
+  WriteRunDiagnostic('RUN FAILURE [' + ALabel + '] exit='
+    + IntToStr(ARun.ExitCode) + ' expected=' + IntToStr(AExpectedExit)
+    + ' process-exit-code=' + IntToStr(ARun.ProcessExitCode)
+    + ' process-exit-status=' + IntToStr(ARun.ProcessExitStatus),
+    ADiagnostics);
+  WriteRunDiagnostic('--- captured stdout ---', ADiagnostics);
+  WriteRunDiagnostic(ARun.Stdout, ADiagnostics);
+  WriteRunDiagnostic('--- captured stderr ---', ADiagnostics);
+  WriteRunDiagnostic(ARun.Stderr, ADiagnostics);
+  WriteRunDiagnostic('--- end captured output ---', ADiagnostics);
 end;
 
 end.
