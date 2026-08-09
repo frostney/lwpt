@@ -515,6 +515,16 @@ jobs:
       - name: Sanity check — lwpt --help
         run: ./build/lwpt.exe --help
 
+      # The end-to-end path that shipped the cross-platform fingerprint bug:
+      # this verifies the committed, POSIX-written lwpt.lock ON WINDOWS. It
+      # is the only leg that exercises `--frozen` on a CRLF-defaulting host,
+      # so it gates both the pinned constraint fingerprint (separator + the
+      # ordinal line sort) and the .gitattributes LF normalization that keeps
+      # HashTree's tree digests stable. Runs BEFORE the plain install, which
+      # rewrites lwpt.lock on the runner (same ordering as the Linux leg).
+      - name: lwpt install --frozen (POSIX-written lockfile verifies on Windows?)
+        run: ./build/lwpt.exe install --frozen
+
       - name: lwpt install (workspace auto-discovery + junctions)
         run: ./build/lwpt.exe install
 

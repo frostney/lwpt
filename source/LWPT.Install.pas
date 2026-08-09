@@ -49,6 +49,37 @@ type
     Resolved     : TResolvedArray;  { the materialized/verified graph }
   end;
 
+  { A single package node in the resolver's constraint graph. Exposed —
+    with ConstraintFingerprintForNode below — so the fingerprint regression
+    test can pin the node-level fold (line shapes, source-line position, and
+    the ordinal sort) directly, on every platform including the Windows
+    `lwpt test` leg. Only the fingerprint-relevant fields are populated by
+    that test; the resolver fills the rest during a real install. }
+  TResolveNode = record
+    Name        : string;
+    Specs       : array of string;   { every VersionSpec seen for this name }
+    Kinds       : array of TVersionKind;
+    Requirers   : array of string;   { parallel to Specs }
+    SourceIdentities: array of string; { canonical source for each requirement }
+    Dep         : TDependency;       { the first source spec seen }
+    CustomSources: TCustomSourceArray;
+    Version     : string;            { concrete (resolved ref or SHA) }
+    CommitSHA   : string;            { authoritative advertised identity }
+    SourceIdentity: string;
+    ConstraintFingerprint: string;
+    ResolvedURL : string;            { actual archive URL fetched }
+    UnitDir     : string;            { the dep's modules root (.lwpt/modules/<name>) }
+    UnitSubdirs : array of string;   { from ChildMan.Units — relative paths
+                                       under UnitDir where the dep's .pas
+                                       files actually live (typically
+                                       ["source"]). Drives -Fu emission. }
+    Hash        : string;            { tree hash of UnitDir contents }
+    ArchiveHash : string;            { sha256 of the .tar.gz; '' for skLocal }
+    Archive     : string;            { path to the committed archive; '' for skLocal }
+    PublishedUnit, PublishedArchive: string;
+    UnitBackup, ArchiveBackup: string;
+  end;
+
 const
   { Test-only archive-fetch redirection. ARCHIVE_FETCH_ORIGIN_ENV is read
     at the archive-fetch boundary AFTER canonical URL construction, so the
@@ -73,13 +104,17 @@ const
   DEFAULT_ARCHIVE_FETCH_TIMEOUT = 5000;
   MAXIMUM_ARCHIVE_FETCH_TIMEOUT = 600000;
 
-  { The separator folded between constraint lines before hashing. Named and
-    pinned because the fingerprint is compared across machines: see
-    ConstraintFingerprintForLines. }
+  { The terminator written after every constraint line before hashing —
+    including the last, reproducing TStrings.Text's trailing line break.
+    Named and pinned because the fingerprint is compared across machines:
+    see ConstraintFingerprintForLines. It is a per-line terminator, not a
+    between-lines join; dropping the final one changes every existing
+    fingerprint and invalidates every committed lockfile. }
   CONSTRAINT_FINGERPRINT_SEPARATOR = #10;
 
 function  LoadLockfile(const APath: string): TResolvedArray;
 function  ConstraintFingerprintForLines(const ALines: TStrings): string;
+function  ConstraintFingerprintForNode(const ANode: TResolveNode; const AProjectRoot: string): string;
 function  ApplyArchiveFetchOrigin(const ACanonicalURL, AOverride: string): string;
 function  ResolveArchiveFetchTimeout(const ARawMilliseconds: string): Integer;
 function  ExtractArchive(const AArchivePath, ADest: string; const ASubDir: string = ''): Integer;
@@ -1571,31 +1606,8 @@ end;
   here; the constraint-accumulation and conflict logic is the reusable core.
   --------------------------------------------------------------------------- }
 type
-  TResolveNode = record
-    Name        : string;
-    Specs       : array of string;   { every VersionSpec seen for this name }
-    Kinds       : array of TVersionKind;
-    Requirers   : array of string;   { parallel to Specs }
-    SourceIdentities: array of string; { canonical source for each requirement }
-    Dep         : TDependency;       { the first source spec seen }
-    CustomSources: TCustomSourceArray;
-    Version     : string;            { concrete (resolved ref or SHA) }
-    CommitSHA   : string;            { authoritative advertised identity }
-    SourceIdentity: string;
-    ConstraintFingerprint: string;
-    ResolvedURL : string;            { actual archive URL fetched }
-    UnitDir     : string;            { the dep's modules root (.lwpt/modules/<name>) }
-    UnitSubdirs : array of string;   { from ChildMan.Units — relative paths
-                                       under UnitDir where the dep's .pas
-                                       files actually live (typically
-                                       ["source"]). Drives -Fu emission. }
-    Hash        : string;            { tree hash of UnitDir contents }
-    ArchiveHash : string;            { sha256 of the .tar.gz; '' for skLocal }
-    Archive     : string;            { path to the committed archive; '' for skLocal }
-    PublishedUnit, PublishedArchive: string;
-    UnitBackup, ArchiveBackup: string;
-  end;
-
+  { TResolveNode is declared in the interface (exposed for the fingerprint
+    regression test); the resolver's own aggregate stays here. }
   TResolution = record
     Nodes : array of TResolveNode;
   end;
@@ -1856,6 +1868,12 @@ end;
 { Fold an ordered constraint-line set into the fingerprint the frozen
   verifier compares.
 
+  Every line — including the last — is followed by
+  CONSTRAINT_FINGERPRINT_SEPARATOR, reproducing TStrings.Text's trailing
+  line break. This is a per-line terminator, not a between-lines join:
+  tidying it to a join would drop the final separator and silently change
+  every committed fingerprint.
+
   The digest input must be byte-identical on every platform: a lockfile is
   written on one machine and verified on another. TStrings.Text joins with
   the PLATFORM line ending (LF on Unix, CRLF on Windows), so hashing it made
@@ -1876,19 +1894,37 @@ begin
   Result := 'sha256:' + SHA256Hex(BytesOf(Folded));
 end;
 
+{ Order the constraint lines by 8-bit ordinal value, byte for byte.
+  CompareStr is ordinal on every platform; the locale collations
+  (AnsiCompareText, which a default TStringList.Sort applies, and
+  AnsiCompareStr, which CaseSensitive := True would apply) both route
+  through CompareStringW on Windows, where '-' and ''' are
+  primary-ignorable. A dep accumulating two requirement lines that differ
+  only in such a character would then sort differently on Windows and
+  recompute the fingerprint there — the very cross-platform drift this
+  digest exists to prevent, in the ordering rather than the separator. The
+  sibling identity folds pin case (CanonicalDependencyIdentity,
+  CanonicalizePathGlobs set CaseSensitive := True); this one goes further to
+  a fully ordinal comparator because its inputs carry package-name
+  punctuation those word-sorts fold away. }
+function CompareConstraintLinesOrdinal(AList: TStringList;
+  AIndex1, AIndex2: Integer): Integer;
+begin
+  Result := CompareStr(AList[AIndex1], AList[AIndex2]);
+end;
+
 function ConstraintFingerprintForNode(const ANode: TResolveNode;
   const AProjectRoot: string): string;
 var Lines: TStringList; k: Integer;
 begin
   Lines := TStringList.Create;
   try
-    Lines.Sorted := True;
-    Lines.Duplicates := dupAccept;
     for k := 0 to High(ANode.Specs) do
       Lines.Add(IntToStr(Ord(ANode.Kinds[k])) + '|' + ANode.Specs[k]
         + '|' + ANode.Requirers[k]);
     Lines.Add('source|' + CanonicalDependencyIdentity(ANode.Dep,
       ANode.CustomSources, AProjectRoot));
+    Lines.CustomSort(@CompareConstraintLinesOrdinal);
     Result := ConstraintFingerprintForLines(Lines);
   finally
     Lines.Free;

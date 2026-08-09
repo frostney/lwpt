@@ -120,16 +120,19 @@ type
   end;
 
   { The frozen verifier's accumulated-constraints fingerprint. A lockfile
-    is written on one machine and verified on another, so the digest input
-    must never inherit a platform-specific separator — hashing
-    TStrings.Text made a POSIX-written lockfile fail --frozen on Windows.
-    The pinned vector below is the fold with LF; it fails on any platform
-    (Windows CI included) whose fold drifts. }
+    is written on one machine and verified on another, so both the digest
+    input and the line ORDER must be platform-invariant — hashing
+    TStrings.Text made a POSIX-written lockfile fail --frozen on Windows,
+    and a locale-collated sort would reintroduce the same class through
+    line ordering. The pinned vectors below are the LF-terminated fold and
+    the ordinal node sort; they fail on any platform (Windows CI included)
+    whose fold or sort drifts. }
   TConstraintFingerprintFold = class(TTestSuite)
   public
     procedure SetupTests; override;
     procedure TestPinnedFingerprintForFixedConstraintSet;
-    procedure TestFoldUsesLineFeedRegardlessOfPlatform;
+    procedure TestFoldReproducesPlatformTextOnLineFeedPlatforms;
+    procedure TestNodeFingerprintPinsOrdinalSort;
   end;
 
   { ParseDependencySource: every prefix shape + default github +
@@ -1525,33 +1528,68 @@ begin
   end;
 end;
 
-procedure TConstraintFingerprintFold.TestFoldUsesLineFeedRegardlessOfPlatform;
-var Lines: TStringList; LineFeedFold, CarriageReturnFold: string;
+procedure TConstraintFingerprintFold.TestFoldReproducesPlatformTextOnLineFeedPlatforms;
+var Lines: TStringList; CarriageReturnFold: string;
 begin
   Lines := FixedConstraintLines;
   try
-    LineFeedFold := 'sha256:' + SHA256Hex(StringAsBytes(
-      '1|^1.0.0|lwpt'#10'1|^1.2.0|widget'#10
-      + 'source|git|https://github.com/acme/widget'#10));
+    { The pin's whole purpose: on an LF platform the pinned fold must be
+      byte-identical to the platform TStrings.Text fold it replaced, so
+      every fingerprint an LF machine ever wrote stays valid. TStrings.Text
+      terminates every line — including the last — with the platform line
+      ending, which is why the separator is a terminator, not a join. On
+      Windows Text uses CRLF, so the equality only holds off Windows. }
+    {$IFNDEF MSWINDOWS}
+    Expect<string>(ConstraintFingerprintForLines(Lines)).ToBe(
+      'sha256:' + SHA256Hex(BytesOf(Lines.Text)));
+    {$ENDIF}
+    { The separator is pinned to LF and must stay distinguishable from CRLF,
+      so a platform-inherited fold cannot pass by coincidence on any host. }
     CarriageReturnFold := 'sha256:' + SHA256Hex(StringAsBytes(
       '1|^1.0.0|lwpt'#13#10'1|^1.2.0|widget'#13#10
       + 'source|git|https://github.com/acme/widget'#13#10));
-    Expect<string>(ConstraintFingerprintForLines(Lines)).ToBe(LineFeedFold);
-    { Guards the pin itself: the two folds must be distinguishable, so a
-      CRLF regression cannot pass by coincidence. }
-    Expect<Boolean>(LineFeedFold = CarriageReturnFold).ToBe(False);
+    Expect<Boolean>(ConstraintFingerprintForLines(Lines) = CarriageReturnFold)
+      .ToBe(False);
     Expect<string>(string(CONSTRAINT_FINGERPRINT_SEPARATOR)).ToBe(string(#10));
   finally
     Lines.Free;
   end;
 end;
 
+procedure TConstraintFingerprintFold.TestNodeFingerprintPinsOrdinalSort;
+const
+  { Two requirement lines identical but for a hyphen in the requirer:
+    'appcore' is added FIRST, so the assertion only holds if the node fold
+    reorders them by 8-bit ordinal ('app-core' wins because '-' = $2D <
+    'c' = $63). A locale word-sort folds the hyphen away and would leave the
+    input order, changing the digest. Folded (each line LF-terminated):
+      1|^1.0.0|app-core\n1|^1.0.0|appcore\nsource|workspace|widget\n }
+  EXPECTED = 'sha256:d8dd5ec45301a80b19936b1fef484def270eee9ce723692183a8b6b'
+    + 'a3c3705b3';
+var Node: TResolveNode;
+begin
+  Node := Default(TResolveNode);
+  Node.Name := 'widget';
+  Node.Dep.Name := 'widget';
+  Node.Dep.SrcKind := skWorkspace;
+  SetLength(Node.Specs, 2);
+  SetLength(Node.Kinds, 2);
+  SetLength(Node.Requirers, 2);
+  Node.Specs[0] := '^1.0.0'; Node.Kinds[0] := vkSemverRange;
+  Node.Requirers[0] := 'appcore';
+  Node.Specs[1] := '^1.0.0'; Node.Kinds[1] := vkSemverRange;
+  Node.Requirers[1] := 'app-core';
+  Expect<string>(ConstraintFingerprintForNode(Node, '')).ToBe(EXPECTED);
+end;
+
 procedure TConstraintFingerprintFold.SetupTests;
 begin
   Test('fixed constraint set folds to the pinned cross-platform digest',
     TestPinnedFingerprintForFixedConstraintSet);
-  Test('fold separator is LF, never the platform line ending',
-    TestFoldUsesLineFeedRegardlessOfPlatform);
+  Test('fold reproduces the platform Text join on LF platforms',
+    TestFoldReproducesPlatformTextOnLineFeedPlatforms);
+  Test('node fold orders requirement lines by ordinal byte value',
+    TestNodeFingerprintPinsOrdinalSort);
 end;
 
 { ── TParseDependencySource ────────────────────────────────────── }
@@ -3257,7 +3295,7 @@ begin
   TestRunnerProgram.AddSuite(TVerifyAgainstLockfile.Create(
     PROJECT_NAME + '.Install: VerifyAgainstLockfile'));
   TestRunnerProgram.AddSuite(TConstraintFingerprintFold.Create(
-    PROJECT_NAME + '.Install: constraint fingerprint fold'));
+    PROJECT_NAME + '.Install: ConstraintFingerprintForNode'));
   TestRunnerProgram.AddSuite(TParseDependencySource.Create(
     PROJECT_NAME + '.Manifest: ParseDependencySource'));
   TestRunnerProgram.AddSuite(TParseVersionSpec.Create(
