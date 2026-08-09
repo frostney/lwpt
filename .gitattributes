@@ -3,14 +3,15 @@
 #
 # LF is the committed form for every text file. GitHub's windows-latest
 # runner defaults core.autocrlf=true, which would otherwise give a Windows
-# checkout a CRLF working tree. That matters here beyond hygiene: two
-# cross-platform digests fold committed working-tree bytes, and a CRLF tree
-# would make a lockfile written on one platform fail `lwpt install --frozen`
-# on another —
-#   * HashTree's computedHash folds the committed .lwpt/modules/** sources;
-#   * the constraint fingerprint folds resolver inputs (the class this PR
-#     pins for the separator, and now the ordinal sort).
-# Pinning LF at the git layer closes the same class through the tree hashes.
+# checkout a CRLF working tree.
+#
+# The cross-platform `lwpt install --frozen` digests are made
+# line-ending-independent IN CODE, not by this file: HashTree normalizes
+# content CRLF->LF and pins its fold order (TreeHashPathCompare), and the
+# constraint fingerprint pins its separator and line sort. So a CRLF
+# checkout verifies regardless of what git does here. This rule is
+# defense-in-depth and plain hygiene — keep the working tree LF so
+# committed bytes, editor output, and the digest inputs never disagree.
 * text=auto eol=lf
 
 # Windows shells require CRLF (mirrors .editorconfig's [*.{bat,cmd}]/[*.ps1]).
