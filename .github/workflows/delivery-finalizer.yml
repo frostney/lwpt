@@ -1,0 +1,35 @@
+name: Delivery proof finalizer
+
+on:
+  workflow_run:
+    workflows:
+      - PR
+      - Managed PR CI
+      - CI
+    types:
+      - completed
+
+permissions:
+  checks: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: delivery-mutation
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      # workflow_run executes the trusted default-branch workflow even when
+      # the completed read-only workflow built pull-request code.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Conclude the exact proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/delivery/controller.py finalize --event-path "$GITHUB_EVENT_PATH"

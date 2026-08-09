@@ -34,6 +34,10 @@ Pre-commit gate (`lefthook.yml`): `lwpt format` + `lwpt agents` (both with `stag
 
 ## Agent Workflows
 
+Repository-owned capability, context, token-intervention, and delivery endpoint
+policy lives in [`ORCHESTRATION.md`](./ORCHESTRATION.md). Generic orchestrators
+consume that policy; they do not infer or install LWPT-specific infrastructure.
+
 Use the project-local [`/prepare-release`](./.agents/skills/prepare-release/SKILL.md) workflow before cutting a release. It runs the complete project and E2E gates, checks cross-platform CI evidence, audits LWPT's architecture conformance, and previews the changelog. It stops before version selection, changelog generation, tagging, and publishing.
 
 ## Code Organization

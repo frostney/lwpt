@@ -1,0 +1,16 @@
+{
+  "automations": [
+    {
+      "id": "coderabbit",
+      "actors": [
+        "coderabbitai",
+        "coderabbitai[bot]"
+      ],
+      "check_context": "CodeRabbit",
+      "terminal_review_states": [
+        "APPROVED",
+        "COMMENTED"
+      ]
+    }
+  ]
+}

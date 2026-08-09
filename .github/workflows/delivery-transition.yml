@@ -1,0 +1,78 @@
+name: Delivery transition
+run-name: delivery-${{ inputs.operation }} / PR #${{ inputs.pr_number }} / ${{ inputs.expected_head }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Managed-delivery transition
+        required: true
+        type: choice
+        options:
+          - enrol
+          - ci
+          - review
+          - full-ci
+          - merge
+          - reset
+      pr_number:
+        description: Target PR; for full-ci this is the candidate/top PR
+        required: true
+        type: number
+      expected_head:
+        description: Exact current head of the target PR
+        required: true
+        type: string
+      candidate_pr_number:
+        description: Frozen singleton/prefix top; required only for merge
+        required: false
+        type: number
+
+permissions:
+  actions: write
+  checks: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: delivery-mutation
+  cancel-in-progress: false
+
+jobs:
+  transition:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify trusted default-branch dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DEFAULT_BRANCH="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')"
+          if [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
+            echo "::error::Dispatch this endpoint from $DEFAULT_BRANCH, not $GITHUB_REF_NAME."
+            exit 1
+          fi
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Apply transition
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPERATION: ${{ inputs.operation }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+          CANDIDATE_PR_NUMBER: ${{ inputs.candidate_pr_number }}
+        run: |
+          set -euo pipefail
+          args=(
+            "$OPERATION"
+            --pr-number "$PR_NUMBER"
+            --expected-head "$EXPECTED_HEAD"
+          )
+          if [ -n "$CANDIDATE_PR_NUMBER" ]; then
+            args+=(--candidate-pr-number "$CANDIDATE_PR_NUMBER")
+          fi
+          python3 .github/delivery/controller.py "${args[@]}"

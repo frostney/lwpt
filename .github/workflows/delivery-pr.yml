@@ -1,0 +1,36 @@
+name: Managed PR CI
+run-name: delivery-pr/${{ inputs.pr_number }}/${{ inputs.expected_head }}/${{ inputs.topology_digest }}/${{ inputs.check_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Managed pull request number
+        required: true
+        type: string
+      expected_head:
+        description: Exact pull request head to execute
+        required: true
+        type: string
+      topology_digest:
+        description: Native singleton or prefix digest admitted by the controller
+        required: true
+        type: string
+      check_id:
+        description: Exact delivery-admission check run to conclude
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: delivery-pr-${{ inputs.pr_number }}-${{ inputs.expected_head }}
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    uses: ./.github/workflows/pr.yml
+    with:
+      managed_dispatch: true
+      expected_head: ${{ inputs.expected_head }}
