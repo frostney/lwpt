@@ -1,0 +1,18 @@
+{
+  "number": 41,
+  "headRefOid": "1111111111111111111111111111111111111111",
+  "baseRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "baseRefName": "main",
+  "labels": {
+    "nodes": [
+      {
+        "name": "delivery:managed"
+      },
+      {
+        "name": "ci:full-required"
+      }
+    ]
+  },
+  "stack": null,
+  "stackEntry": null
+}
