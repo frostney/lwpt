@@ -49,6 +49,11 @@ type
     procedure SetupTests; override;
     procedure TestPinnedNestedTreeDigest;
     procedure TestCanonicalPathReplacesSourceDelimiter;
+    procedure TestNormalizeConvertsCrlfToLf;
+    procedure TestNormalizePreservesLoneCr;
+    procedure TestNormalizeLeavesBinaryVerbatim;
+    procedure TestNormalizeEmptyInput;
+    procedure TestCrlfTreeHashesEqualLf;
   end;
 
   TLoadManifestHappy = class(TTestSuite)
@@ -590,12 +595,71 @@ begin
     .ToBe('nested\file.txt');
 end;
 
+procedure THashTreePaths.TestNormalizeConvertsCrlfToLf;
+begin
+  { CRLF text folds to exactly its LF form — the content analogue of the
+    path canonicalisation, so a Windows checkout hashes as its LF tree. }
+  Expect<string>(SHA256Hex(NormalizeTreeHashContent(
+    StringAsBytes('a'#13#10'b'#13#10'c'))))
+    .ToBe(SHA256Hex(StringAsBytes('a'#10'b'#10'c')));
+end;
+
+procedure THashTreePaths.TestNormalizePreservesLoneCr;
+begin
+  { A CR not followed by LF survives untouched (git's convention). }
+  Expect<string>(SHA256Hex(NormalizeTreeHashContent(
+    StringAsBytes('a'#13'b'#13))))
+    .ToBe(SHA256Hex(StringAsBytes('a'#13'b'#13)));
+end;
+
+procedure THashTreePaths.TestNormalizeLeavesBinaryVerbatim;
+var
+  Bin: TBytes;
+begin
+  { A NUL byte marks the content binary: its embedded CRLF must NOT fold,
+    so the exact bytes reach the digest. }
+  Bin := StringAsBytes('a'#13#10#0'b'#13#10);
+  Expect<string>(SHA256Hex(NormalizeTreeHashContent(Bin)))
+    .ToBe(SHA256Hex(Bin));
+end;
+
+procedure THashTreePaths.TestNormalizeEmptyInput;
+begin
+  Expect<Integer>(Length(NormalizeTreeHashContent(nil))).ToBe(0);
+end;
+
+procedure THashTreePaths.TestCrlfTreeHashesEqualLf;
+var
+  CrlfDigest, LfDigest: string;
+begin
+  { End-to-end: a CRLF working tree and its LF twin produce one digest. }
+  ResetScratch;
+  WriteFixtureBytes(FScratch + PathDelim + 'unit.pas',
+    StringAsBytes('unit A;'#13#10'begin'#13#10'end.'#13#10));
+  CrlfDigest := HashTree(FScratch);
+  ResetScratch;
+  WriteFixtureBytes(FScratch + PathDelim + 'unit.pas',
+    StringAsBytes('unit A;'#10'begin'#10'end.'#10));
+  LfDigest := HashTree(FScratch);
+  Expect<string>(CrlfDigest).ToBe(LfDigest);
+end;
+
 procedure THashTreePaths.SetupTests;
 begin
   Test('nested tree digest matches the pinned hash layout',
     TestPinnedNestedTreeDigest);
   Test('canonical path replaces the supplied source delimiter',
     TestCanonicalPathReplacesSourceDelimiter);
+  Test('normalize folds CRLF content to its LF form',
+    TestNormalizeConvertsCrlfToLf);
+  Test('normalize preserves a lone CR',
+    TestNormalizePreservesLoneCr);
+  Test('normalize leaves NUL-bearing binary verbatim',
+    TestNormalizeLeavesBinaryVerbatim);
+  Test('normalize returns empty for empty input',
+    TestNormalizeEmptyInput);
+  Test('CRLF tree hashes equal its LF twin',
+    TestCrlfTreeHashesEqualLf);
 end;
 
 { ── TLoadManifestHappy ────────────────────────────────────────────── }

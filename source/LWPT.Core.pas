@@ -32,6 +32,9 @@ const
 
   PROCESS_OUTPUT_BUFFER_SIZE = 4096;
   TREE_HASH_PATH_SEPARATOR = '/';
+  TREE_HASH_BYTE_NUL = 0;
+  TREE_HASH_BYTE_CR = 13;
+  TREE_HASH_BYTE_LF = 10;
 
   PLACEHOLDER_USER       = '{user}';
   PLACEHOLDER_REPOSITORY = '{repository}';
@@ -101,6 +104,7 @@ function  SHA256Hex(const AData: TBytes): string;
 function  SHA256File(const APath: string): string;
 function  CanonicalTreeHashPath(const APath: string;
   const ASourceDelimiter: Char): string;
+function  NormalizeTreeHashContent(const ABytes: TBytes): TBytes;
 function  HashTree(const APathOrArchive: string): string;
 
 { Appends every entry of the process environment to ATarget, safe to call
@@ -1369,6 +1373,43 @@ begin
     TREE_HASH_PATH_SEPARATOR, [rfReplaceAll]);
 end;
 
+{ Normalize a hashed file's bytes so the tree digest is independent of
+  checkout line endings: a CRLF Windows working tree must hash the same
+  as the LF tree the lockfile was written from. The content analogue of
+  CanonicalTreeHashPath / #116. Text files: every CRLF (#13#10) becomes
+  LF (#10); a lone CR is left as-is (git's convention). Binary files —
+  any that contain a NUL byte, the standard git heuristic — are hashed
+  VERBATIM, so their exact bytes are never altered. LF-committed content
+  is unchanged by this, so every existing lockfile keeps verifying. }
+function NormalizeTreeHashContent(const ABytes: TBytes): TBytes;
+var
+  Read, Write, Len : Integer;
+begin
+  Len := Length(ABytes);
+  { Binary guard: a single NUL byte means hash verbatim — bail before
+    allocating a normalized copy. }
+  for Read := 0 to Len - 1 do
+    if ABytes[Read] = TREE_HASH_BYTE_NUL then Exit(ABytes);
+  { Single pass: size the output once at the input length, drop the CR of
+    every CRLF pair in place, then trim to the bytes actually written. }
+  SetLength(Result, Len);
+  Write := 0;
+  Read := 0;
+  while Read < Len do
+  begin
+    if (ABytes[Read] = TREE_HASH_BYTE_CR) and (Read + 1 < Len)
+       and (ABytes[Read + 1] = TREE_HASH_BYTE_LF) then
+      Inc(Read)
+    else
+    begin
+      Result[Write] := ABytes[Read];
+      Inc(Write);
+      Inc(Read);
+    end;
+  end;
+  SetLength(Result, Write);
+end;
+
 { Hash of an installed package: SHA-256 over every extracted file's bytes,
   visited in sorted relative-path order so the digest is stable regardless
   of filesystem enumeration order or which mirror served the archive.
@@ -1413,6 +1454,7 @@ var
   Acc   : TBytes;
   i, n  : Integer;
   Chunk : TBytes;
+  FileBytes : TBytes;
   FS    : TFileStream;
   FullPath : string;
 begin
@@ -1438,12 +1480,20 @@ begin
           + Files[i]);
         FS := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
         try
-          n := Length(Acc);
-          SetLength(Acc, n + FS.Size);
-          if FS.Size > 0 then FS.ReadBuffer(Acc[n], FS.Size);
+          SetLength(FileBytes, FS.Size);
+          if FS.Size > 0 then FS.ReadBuffer(FileBytes[0], FS.Size);
         finally
           FS.Free;
         end;
+        { Fold NORMALIZED content: a CRLF checkout hashes as its LF tree
+          (NormalizeTreeHashContent), so a Windows working tree verifies
+          against a POSIX-written lockfile. Binary files pass through
+          verbatim via that helper's NUL guard. }
+        FileBytes := NormalizeTreeHashContent(FileBytes);
+        n := Length(Acc);
+        SetLength(Acc, n + Length(FileBytes));
+        if Length(FileBytes) > 0 then
+          Move(FileBytes[0], Acc[n], Length(FileBytes));
       end;
       Result := 'sha256:' + SHA256Hex(Acc);
     finally
