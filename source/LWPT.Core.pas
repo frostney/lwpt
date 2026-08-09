@@ -1448,6 +1448,47 @@ begin
     end;
 end;
 
+{ Fold-order comparator for HashTree: ASCII case-insensitive, byte-wise,
+  ordinal tiebreak — a platform-independent pin of the order every
+  existing lockfile was written with. TStringList.Sort compares with
+  AnsiCompareText, which is ASCII-uppercase byte compare on POSIX but
+  CompareStringW WORD-SORT on Windows, where '-' is primary-ignorable:
+  the same tree of hyphenated filenames folds in a different order and
+  the digest diverges with byte-identical content ("tree hash mismatch"
+  on a Windows checkout — the third guise of the #78 family, after path
+  separators (#116) and the fingerprint join). Verified byte-for-byte
+  against a real divergence: ASCII-CI order reproduces the POSIX-written
+  lockfile digest exactly; the hyphen-ignoring order reproduces the
+  Windows disk digest exactly. Do not "simplify" this to a plain ordinal
+  compare — that is a THIRD order and would invalidate every lockfile. }
+function TreeHashPathCompare(AList: TStringList;
+  AIndex1, AIndex2: Integer): Integer;
+var
+  A, B : string;
+  i, LA, LB : Integer;
+  CA, CB : Char;
+begin
+  A := AList[AIndex1];
+  B := AList[AIndex2];
+  LA := Length(A);
+  LB := Length(B);
+  i := 1;
+  while (i <= LA) and (i <= LB) do
+  begin
+    CA := A[i];
+    CB := B[i];
+    if CA in ['a'..'z'] then Dec(CA, 32);
+    if CB in ['a'..'z'] then Dec(CB, 32);
+    if CA <> CB then Exit(Ord(CA) - Ord(CB));
+    Inc(i);
+  end;
+  Result := LA - LB;
+  { Case-insensitively equal but distinct paths (a case collision the
+    default Windows/macOS filesystems cannot even host): break the tie
+    ordinally so the order is still deterministic everywhere. }
+  if Result = 0 then Result := CompareStr(A, B);
+end;
+
 function HashTree(const APathOrArchive: string): string;
 var
   Files : TStringList;
@@ -1464,9 +1505,7 @@ begin
     Files := TStringList.Create;
     try
       CollectFiles(IncludeTrailingPathDelimiter(APathOrArchive), '', Files);
-      { Keep the existing comparator for lockfile compatibility. Its
-        ordering remains locale-sensitive for non-ASCII filenames. }
-      Files.Sort;
+      Files.CustomSort(@TreeHashPathCompare);
       SetLength(Acc, 0);
       for i := 0 to Files.Count - 1 do
       begin

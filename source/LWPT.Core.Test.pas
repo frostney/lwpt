@@ -54,6 +54,7 @@ type
     procedure TestNormalizeLeavesBinaryVerbatim;
     procedure TestNormalizeEmptyInput;
     procedure TestCrlfTreeHashesEqualLf;
+    procedure TestFoldOrderIsAsciiCaseInsensitive;
   end;
 
   TLoadManifestHappy = class(TTestSuite)
@@ -644,6 +645,31 @@ begin
   Expect<string>(CrlfDigest).ToBe(LfDigest);
 end;
 
+procedure THashTreePaths.TestFoldOrderIsAsciiCaseInsensitive;
+const
+  { Independently computed (SHA-256 over path + #10 + bytes, folded in
+    ASCII case-insensitive path order): the exact order every existing
+    lockfile was written with. Windows word-sort ranks 'leaf.cnf' BEFORE
+    'leaf-ca-true.cnf' (hyphens are primary-ignorable) and would yield
+    c7e20c2d... instead — the real-world "tree hash mismatch" this
+    comparator pin fixes. }
+  EXPECTED = 'sha256:77386de0b4e46c60b337ea3255b2f68ddb48a46a1a216a828dce604a2f84ad85';
+begin
+  ResetScratch;
+  WriteFixtureBytes(FScratch + PathDelim + 'leaf-ca-true.cnf',
+    StringAsBytes('ca=true'#10));
+  WriteFixtureBytes(FScratch + PathDelim + 'leaf.cnf',
+    StringAsBytes('leaf'#10));
+  WriteFixtureBytes(FScratch + PathDelim + 'README.md',
+    StringAsBytes('# fixture'#10));
+  WriteFixtureBytes(FScratch + PathDelim + 'sub' + PathDelim + 'a-b.pas',
+    StringAsBytes('unit ab;'#10));
+  WriteFixtureBytes(FScratch + PathDelim + 'sub' + PathDelim + 'ab.pas',
+    StringAsBytes('unit ab2;'#10));
+
+  Expect<string>(HashTree(FScratch)).ToBe(EXPECTED);
+end;
+
 procedure THashTreePaths.SetupTests;
 begin
   Test('nested tree digest matches the pinned hash layout',
@@ -660,6 +686,8 @@ begin
     TestNormalizeEmptyInput);
   Test('CRLF tree hashes equal its LF twin',
     TestCrlfTreeHashesEqualLf);
+  Test('fold order is ASCII case-insensitive on every platform',
+    TestFoldOrderIsAsciiCaseInsensitive);
 end;
 
 { ── TLoadManifestHappy ────────────────────────────────────────────── }

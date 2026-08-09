@@ -503,19 +503,17 @@ jobs:
       - name: Sanity check — lwpt --help
         run: ./build/lwpt.exe --help
 
-      # NOTE: a Windows `--frozen` gate belongs here but is still deferred.
-      # This PR made the constraint fingerprint AND (NormalizeTreeHashContent)
-      # the tree-hash CONTENT platform-independent, but a Windows --frozen
-      # run STILL fails with `tree hash mismatch for "httpclient"` and an
-      # unchanged disk digest — so the remaining difference is NOT line
-      # endings (ruled out: committed blobs are LF with no CRLF and no
-      # symlinks, and content normalization did not move the Windows disk
-      # hash). The true cause is some other Windows-checkout divergence in
-      # .lwpt/modules/** that needs inspection on a real Windows tree (a
-      # spike branch dumping per-file digests) to identify. Enable this
-      # gate once that is understood; the fixes in this PR stand on their
-      # own (the fingerprint fix is CI-proven — every package passes the
-      # [frozen] constraint check on Windows).
+      # The only leg that exercises the verifier on a CRLF-defaulting,
+      # word-sorting host. It gates all three platform pins this PR
+      # carries: the constraint-fingerprint separator + ordinal line
+      # sort, the tree-hash content normalization, and the tree-hash
+      # FOLD ORDER (TreeHashPathCompare — AnsiCompareText word-sorts
+      # hyphenated names differently on Windows, which was the actual
+      # cause of the "tree hash mismatch" here, reproduced byte-for-byte
+      # from the divergent digests).
+      - name: lwpt install --frozen (POSIX-written lockfile verifies on Windows?)
+        run: ./build/lwpt.exe install --frozen
+
       - name: lwpt install (workspace auto-discovery + junctions)
         run: ./build/lwpt.exe install
 
