@@ -1,40 +1,98 @@
 # CI
 
-Six GitHub Actions workflows, mirroring the GocciaScript pattern used by the packages now canonical in LWPT. The primary split is **build once on macOS / test natively on every target**; two supplementary workflows route stacked-PR admission and provide a manual licensed-backend smoke.
+Ten GitHub Actions workflows retain the existing build-once/test-natively
+matrix and add a repository-owned managed-delivery adapter. Expensive workflows
+that execute pull-request code have read-only permissions. Controllers and
+finalizers with write permission always run trusted default-branch code.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch`, weekly `schedule` | Build + cache the cross-FPC toolchain |
-| `ci.yml` | `push` to `main`, `workflow_dispatch` | Post-merge confirmation: full 6-target cross-build + native test matrix on the merged main tree |
-| `pr.yml` | `pull_request` to `main`, `workflow_dispatch` | Pre-merge gate: Ubuntu leg (default tier + live-network e2e per #102), native aarch64-darwin leg (default tier), win64 leg (cross-compile, then native offline test run on `windows-latest`); typical wall-clock < 10 min warm, hard caps 15 min (e2e step) / 20 min (darwin job) |
+| `ci.yml` | `push` to `main`, `workflow_dispatch` | Full six-target integrated-main verification or explicit exact-candidate `full-ci` proof |
+| `pr.yml` | `pull_request`, `workflow_call` | Automatic ordinary gate or reusable read-only managed PR matrix |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
-| `stack-ci-router.yml` | `pull_request` label event | Rerun `pr.yml` for an exact same-repository `codex/stack-*` head only after `stack:managed` and `ci:ready` admit it |
 | `delphi-native.yml` | `workflow_dispatch` | Optional Delphi 12+ Win64 smoke on a licensed self-hosted runner; never a required gate |
+| `delivery-transition.yml` | `workflow_dispatch` | Trusted explicit `enrol`, `ci`, `review`, `full-ci`, `merge`, or `reset` endpoint |
+| `delivery-pr.yml` | controller `workflow_dispatch` | Run `pr.yml` read-only for one admitted exact head |
+| `delivery-observer.yml` | PR metadata, schedule, manual | Create pending checks and invalidate stale head/base/topology evidence |
+| `delivery-finalizer.yml` | `workflow_run` completion | Conclude ordinary, managed, cancelled, and full-CI exact checks |
+| `delivery-watchdog.yml` | schedule, manual | Fail proof checks left nonterminal for 120 minutes |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
-- **PRs go through `pr.yml` only** — an Ubuntu leg (default tier plus the live-network e2e tier per [issue #102](https://github.com/frostney/lwpt/issues/102)), a native aarch64-darwin leg (default tier), and a win64 leg: cross-compile on macOS, then the offline default test tier natively on `windows-latest`. Cheap signal so PR authors aren't blocked on the full 6-target matrix per push.
-- **Managed stacks admit CI explicitly** — the first `pr.yml` run skips its expensive matrix until a same-repository `codex/stack-*` PR has both `stack:managed` and `ci:ready`. `stack-ci-router.yml` then reruns that completed workflow for the exact admitted head; unrelated labels, forks, and ordinary PRs cannot use the router.
-- **`ci.yml` runs only on `push` to `main`** — i.e. after merge. This is where the heavyweight 6-target cross-build + native test matrix lives. A PR that introduces a regression on the legs the gate still omits (`x86_64-darwin`, `aarch64-linux`, `i386-win32`, non-Linux e2e) will pass `pr.yml` and fail the post-merge `ci.yml` run; the maintainer then reverts or forwards-fixes from `main`. The trade-off is conscious and has narrowed over time: Windows (win64) was the first carve-out (added after PR #17 merged green with a `SysUtils.FindClose` vs `Windows.FindClose` shadowing break that PR #21 had to fix on `main`), and #102 added the Linux e2e step and the native aarch64-darwin leg after the #84/#105 escape classes.
+- **Ordinary PRs remain automatic.** `pr.yml` runs its Ubuntu, native Darwin,
+  documentation, and win64 legs. The trusted finalizer aggregates that exact
+  workflow result into `delivery-admission`.
+- **Managed PRs use explicit transitions.** Their automatic `pr.yml` run stops
+  successfully at a cheap routing job. The `ci` operation dispatches
+  `delivery-pr.yml`, which calls the same matrix for the exact current head.
+  `delivery:managed` does not assert native stack membership.
+- **`ci.yml` has two exact uses.** A push to `main` verifies the integrated tree;
+  rapid main pushes cancel older integrated-main runs. The `full-ci` operation
+  checks out one frozen singleton or cumulative native-prefix top SHA. Those
+  explicit runs are never coalesced.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
-Repository rules make these workflow contracts enforceable. The default branch
-requires every `pr.yml` job (`build-and-test`, `darwin-test`, `docs`,
-`toolchain / build`, `windows-cross-compile`, and `windows-test`) before
-squash merge — a newly added job is not required automatically, so adding a
-`pr.yml` job includes adding its check context to the ruleset. A separate
-release-tag ruleset restricts SemVer tag creation to the maintainer and rejects
-tag updates or deletion. The protected `release` environment provides the
-explicit approval gate between successful builds and publication.
+Repository rules make these contracts enforceable. The desired main ruleset is
+versioned at `.github/rulesets/protect-main.json`: it requires resolved review
+threads and `delivery-admission` from GitHub Actions integration ID `15368`.
+The integration binding means a same-named status or check from another user or
+app cannot satisfy the rule. Activate that payload only after the producer and
+finalizer exist on the default branch:
+
+```sh
+gh api --method PUT repos/frostney/lwpt/rulesets/18086289 \
+  --input .github/rulesets/protect-main.json
+```
+
+The public
+[`delivery-admission` sandbox](https://github.com/frostney/lwpt-delivery-admission-spike/pull/1)
+exercised pending, duplicate, stale-head, failure, cancellation, watchdog, and
+recovery behavior. Its app-identity probe at
+[`9b3afd4`](https://github.com/frostney/lwpt-delivery-admission-spike/commit/9b3afd43f44fb8c90c1a72aec41deafc8f09e81e)
+left the PR blocked when the
+[app-owned check failed](https://github.com/frostney/lwpt-delivery-admission-spike/actions/runs/30938047359)
+even though a separate same-named commit status reported success; the
+[`af05968` recovery](https://github.com/frostney/lwpt-delivery-admission-spike/actions/runs/30938166552)
+restored a successful app-owned proof.
+
+A separate release-tag ruleset restricts SemVer tag creation to the maintainer
+and rejects tag updates or deletion. The protected `release` environment owns
+the approval gate between successful builds and publication.
 
 ## Workflows
 
-### `stack-ci-router.yml` — managed-stack admission
+### Managed-delivery proof lifecycle
 
-The router handles no pull-request code itself. On the `ci:ready` label event,
-it verifies the managed-stack label, same-repository ownership, and
-`codex/stack-*` branch boundary, then reruns the completed `pr.yml` workflow
-whose head SHA and pull-request number exactly match the admitted PR.
+`delivery-observer.yml` creates one pending `delivery-admission` for the exact
+PR head and native topology. A new head, base, order, or prefix fails stale
+pending proof, removes readiness labels, and creates a new pending proof.
+Managed forks fail closed without dispatching their code. Duplicate events reuse
+the same external proof identity. Trusted mutations share one short-lived
+repository concurrency lane so schedule, transition, finalizer, and watchdog
+events cannot create or conclude competing proofs concurrently.
+
+The endpoint and finalizer communicate through a trusted workflow run name
+containing PR, SHA, topology digest where applicable, and check-run ID. The
+read-only workflow cannot conclude its check. The default-branch finalizer
+re-fetches the PR and native topology, binds the workflow result to the current
+check, and then records success or terminal failure. Cancelled runs are failure;
+the watchdog supplies the same terminal result for orphaned runs.
+
+The `review` operation opens the configured provider lane after PR admission.
+Before `merge`, the controller requires a terminal provider review on the
+current head, a successful provider check, no unresolved thread, and a reply
+from an account with current maintain or admin permission on every automation
+thread. Provider identities are data in
+`.github/delivery/review-automations.json`; retry and quota policy are not.
+`merge:ready` records that point-in-time acceptance, so the coordinator invokes
+the idempotent `merge` operation immediately before a singleton merge. For a
+native prefix it preflights each `delivery:managed` member against the same
+candidate, then integrates the frozen prefix bottom to top without unrelated
+work in between. An ordinary member never uses the endpoint; at its merge turn
+it remains individually subject to current branch protection and the ordinary
+review policy. The coordinator never treats labels left by an earlier preflight
+as durable proof.
 
 ### `toolchain.yml` — cross-FPC toolchain build
 
@@ -63,7 +121,7 @@ The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a
 
 ### `ci.yml` — build + test
 
-**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, `packages/testing/source/`, plus the target's FPC packages slice, including `paszlib` for `ZStream`). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `TLWPTFPCCompilerDriver.BuildArguments`' release translation. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`.
+**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, `packages/testing/source/`, plus the target's FPC packages slice, including `paszlib` for `ZStream`). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `TLWPTFPCCompilerDriver.BuildArguments`' release translation. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`. An explicit `full-ci` dispatch checks out its controller-validated SHA rather than the default-branch workflow SHA.
 
 **Test stage** (per-platform native runners, six-target matrix → five runners):
 
@@ -180,9 +238,11 @@ The scripts mirror the shape of [GocciaScript's installers](https://gocciascript
 ## Triggers (summary)
 
 - `ci.yml`: `push` to `main`, `workflow_dispatch`
-- `pr.yml`: `pull_request` to `main`, `workflow_dispatch`
+- `pr.yml`: `pull_request`, `workflow_call` from `delivery-pr.yml`
 - `release.yml`: `push` of a `v?N.N.N` or `v?N.N.N-*` tag
 - `toolchain.yml`: invoked by `ci.yml`, `pr.yml`, and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming and a weekly `schedule` cron (Mondays 05:00 UTC) that keeps the default-branch cache warm
+- managed delivery: explicit transition dispatch, PR metadata observer,
+  workflow-run finalizer, and scheduled watchdog as listed above
 
 A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` after merge, OR `release.yml` after tag), not both. PRs trigger only the cheap `pr.yml` (whose single win64 cross-compile rides the cached toolchain).
 
