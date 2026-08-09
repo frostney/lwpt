@@ -119,6 +119,19 @@ type
     procedure TestLocalSourceWithEmptyArchiveHashPasses;
   end;
 
+  { The frozen verifier's accumulated-constraints fingerprint. A lockfile
+    is written on one machine and verified on another, so the digest input
+    must never inherit a platform-specific separator — hashing
+    TStrings.Text made a POSIX-written lockfile fail --frozen on Windows.
+    The pinned vector below is the fold with LF; it fails on any platform
+    (Windows CI included) whose fold drifts. }
+  TConstraintFingerprintFold = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestPinnedFingerprintForFixedConstraintSet;
+    procedure TestFoldUsesLineFeedRegardlessOfPlatform;
+  end;
+
   { ParseDependencySource: every prefix shape + default github +
     path forms + the unambiguous-error path. }
   TParseDependencySource = class(TTestSuite)
@@ -1474,6 +1487,71 @@ begin
     TestLockEntryWithoutGraphNodeRaises);
   Test('skLocal with empty ArchiveHash on both sides: no false mismatch',
     TestLocalSourceWithEmptyArchiveHashPasses);
+end;
+
+{ ── TConstraintFingerprintFold ────────────────────────────────── }
+
+{ The exact list the resolver hands to the fingerprint: sorted, duplicates
+  accepted, one line per accumulated requirement plus the canonical source
+  identity. }
+function FixedConstraintLines: TStringList;
+begin
+  Result := TStringList.Create;
+  try
+    Result.Sorted := True;
+    Result.Duplicates := dupAccept;
+    Result.Add('1|^1.0.0|lwpt');
+    Result.Add('1|^1.2.0|widget');
+    Result.Add('source|git|https://github.com/acme/widget');
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure TConstraintFingerprintFold.TestPinnedFingerprintForFixedConstraintSet;
+const
+  { sha256 of "1|^1.0.0|lwpt\n1|^1.2.0|widget\n"
+    + "source|git|https://github.com/acme/widget\n" }
+  EXPECTED = 'sha256:81583af3bb365d31608e77e1a4b034feb09fe13a4fa93ef9e3d3b5'
+    + 'a8fca355c9';
+var Lines: TStringList;
+begin
+  Lines := FixedConstraintLines;
+  try
+    Expect<string>(ConstraintFingerprintForLines(Lines)).ToBe(EXPECTED);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TConstraintFingerprintFold.TestFoldUsesLineFeedRegardlessOfPlatform;
+var Lines: TStringList; LineFeedFold, CarriageReturnFold: string;
+begin
+  Lines := FixedConstraintLines;
+  try
+    LineFeedFold := 'sha256:' + SHA256Hex(StringAsBytes(
+      '1|^1.0.0|lwpt'#10'1|^1.2.0|widget'#10
+      + 'source|git|https://github.com/acme/widget'#10));
+    CarriageReturnFold := 'sha256:' + SHA256Hex(StringAsBytes(
+      '1|^1.0.0|lwpt'#13#10'1|^1.2.0|widget'#13#10
+      + 'source|git|https://github.com/acme/widget'#13#10));
+    Expect<string>(ConstraintFingerprintForLines(Lines)).ToBe(LineFeedFold);
+    { Guards the pin itself: the two folds must be distinguishable, so a
+      CRLF regression cannot pass by coincidence. }
+    Expect<Boolean>(LineFeedFold = CarriageReturnFold).ToBe(False);
+    Expect<string>(string(CONSTRAINT_FINGERPRINT_SEPARATOR)).ToBe(string(#10));
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TConstraintFingerprintFold.SetupTests;
+begin
+  Test('fixed constraint set folds to the pinned cross-platform digest',
+    TestPinnedFingerprintForFixedConstraintSet);
+  Test('fold separator is LF, never the platform line ending',
+    TestFoldUsesLineFeedRegardlessOfPlatform);
 end;
 
 { ── TParseDependencySource ────────────────────────────────────── }
@@ -3178,6 +3256,8 @@ begin
     PROJECT_NAME + '.Install: LoadLockfile'));
   TestRunnerProgram.AddSuite(TVerifyAgainstLockfile.Create(
     PROJECT_NAME + '.Install: VerifyAgainstLockfile'));
+  TestRunnerProgram.AddSuite(TConstraintFingerprintFold.Create(
+    PROJECT_NAME + '.Install: constraint fingerprint fold'));
   TestRunnerProgram.AddSuite(TParseDependencySource.Create(
     PROJECT_NAME + '.Manifest: ParseDependencySource'));
   TestRunnerProgram.AddSuite(TParseVersionSpec.Create(

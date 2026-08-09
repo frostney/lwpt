@@ -73,7 +73,13 @@ const
   DEFAULT_ARCHIVE_FETCH_TIMEOUT = 5000;
   MAXIMUM_ARCHIVE_FETCH_TIMEOUT = 600000;
 
+  { The separator folded between constraint lines before hashing. Named and
+    pinned because the fingerprint is compared across machines: see
+    ConstraintFingerprintForLines. }
+  CONSTRAINT_FINGERPRINT_SEPARATOR = #10;
+
 function  LoadLockfile(const APath: string): TResolvedArray;
+function  ConstraintFingerprintForLines(const ALines: TStrings): string;
 function  ApplyArchiveFetchOrigin(const ACanonicalURL, AOverride: string): string;
 function  ResolveArchiveFetchTimeout(const ARawMilliseconds: string): Integer;
 function  ExtractArchive(const AArchivePath, ADest: string; const ASubDir: string = ''): Integer;
@@ -1847,6 +1853,29 @@ begin
   ANormalized.SrcLocator := Workspace.Path;
 end;
 
+{ Fold an ordered constraint-line set into the fingerprint the frozen
+  verifier compares.
+
+  The digest input must be byte-identical on every platform: a lockfile is
+  written on one machine and verified on another. TStrings.Text joins with
+  the PLATFORM line ending (LF on Unix, CRLF on Windows), so hashing it made
+  a lockfile written on POSIX fail `--frozen` on Windows with "accumulated
+  constraints changed" on identical constraints — the tree-hash separator
+  bug (#78) in a second guise. The separator is therefore pinned rather than
+  inherited, exactly like TREE_HASH_PATH_SEPARATOR.
+
+  Pinning to LF keeps every fingerprint ever computed on an LF platform
+  byte-identical (committed lockfiles stay valid); only Windows-written
+  digests change, and those could never verify anywhere else. }
+function ConstraintFingerprintForLines(const ALines: TStrings): string;
+var Folded: string; k: Integer;
+begin
+  Folded := '';
+  for k := 0 to ALines.Count - 1 do
+    Folded := Folded + ALines[k] + CONSTRAINT_FINGERPRINT_SEPARATOR;
+  Result := 'sha256:' + SHA256Hex(BytesOf(Folded));
+end;
+
 function ConstraintFingerprintForNode(const ANode: TResolveNode;
   const AProjectRoot: string): string;
 var Lines: TStringList; k: Integer;
@@ -1860,7 +1889,7 @@ begin
         + '|' + ANode.Requirers[k]);
     Lines.Add('source|' + CanonicalDependencyIdentity(ANode.Dep,
       ANode.CustomSources, AProjectRoot));
-    Result := 'sha256:' + SHA256Hex(BytesOf(Lines.Text));
+    Result := ConstraintFingerprintForLines(Lines);
   finally
     Lines.Free;
   end;
