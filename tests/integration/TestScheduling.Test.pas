@@ -41,6 +41,9 @@ const
   ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
   ProcessCaptureOverflowHoldMilliseconds = 2000;
   SiblingFanoutCeilingMilliseconds = 1500;
+  { Scheduling speed is not part of the fanout contract. This ceiling only
+    diagnoses a sibling that genuinely never reaches the startup barrier. }
+  SiblingStartupBarrierCeilingSeconds = ProcessStartupCeilingSeconds * 3;
   ProcessTreeProxyModeEnvironment = PROJECT_NAME
     + '_PROCESS_TREE_TEST_PROXY_MODE';
   ProcessTreeProxyPIDFileEnvironment = PROJECT_NAME
@@ -1946,9 +1949,22 @@ begin
   Result := True;
 end;
 
+function WaitForSiblingAcknowledgementMarkers(
+  const APIDFile: string): Boolean;
+var
+  Started: TDateTime;
+begin
+  Started := Now;
+  while not SiblingAcknowledgementMarkersReady(APIDFile)
+    and ((Now - Started) * SecondsPerDay
+      < SiblingStartupBarrierCeilingSeconds) do
+    Sleep(ProcessPollMilliseconds);
+  Result := SiblingAcknowledgementMarkersReady(APIDFile);
+end;
+
 function RunProcessTreeCompilerProxy: Integer;
 var
-  Mode, PIDFile, SourceFile: string;
+  Mode, PIDFile, SiblingPIDFile, SourceFile: string;
   Started: TDateTime;
 begin
   if HasProcessArgument('-iV') and HasProcessArgument('-iTO')
@@ -2018,8 +2034,21 @@ begin
        and SameText(SourceFile, 'A.Slow.Test.pas')) then
   begin
     if Mode = MissingAcknowledgementSiblingCompilerProxyMode then
-      PIDFile := PIDFile + '-' + SourceFile;
+    begin
+      SiblingPIDFile := PIDFile;
+      PIDFile := SiblingPIDFile + '-' + SourceFile;
+    end;
     WriteTextFile(PIDFile, IntToStr(GetProcessID));
+    if Mode = MissingAcknowledgementSiblingCompilerProxyMode then
+    begin
+      { Start the safety lifetime only after every sibling reaches the
+        fixture barrier, so process-startup skew cannot trigger the failure. }
+      if not WaitForSiblingAcknowledgementMarkers(SiblingPIDFile) then
+      begin
+        WriteLn(StdErr, 'sibling compiler startup barrier timed out');
+        Exit(2);
+      end;
+    end;
     Sleep(LongRunningFixtureMilliseconds);
     Exit(0);
   end;
@@ -2031,16 +2060,21 @@ begin
     { Returning compiler success without creating B.Error's binary makes its
       runtime TProcess.Execute raise, driving AbortWithError while A is live. }
     Started := Now;
-    while (((Mode = MissingAcknowledgementSiblingCompilerProxyMode)
-      and not SiblingAcknowledgementMarkersReady(PIDFile))
-      or ((Mode <> MissingAcknowledgementSiblingCompilerProxyMode)
-        and (not FileExists(PIDFile))))
-    and ((Now - Started) * SecondsPerDay < MarkerWaitCeilingSeconds) do
-      Sleep(ProcessPollMilliseconds);
-    if (Mode = MissingAcknowledgementSiblingCompilerProxyMode)
-       and SiblingAcknowledgementMarkersReady(PIDFile) then
+    if Mode = MissingAcknowledgementSiblingCompilerProxyMode then
+    begin
+      if not WaitForSiblingAcknowledgementMarkers(PIDFile) then
+      begin
+        WriteLn(StdErr, 'sibling compiler startup barrier timed out');
+        Exit(2);
+      end;
       WriteTextFile(PIDFile + SiblingCancellationStartedSuffix,
         UIntToStr(GetTickCount64));
+    end
+    else
+      while not FileExists(PIDFile)
+        and ((Now - Started) * SecondsPerDay
+          < MarkerWaitCeilingSeconds) do
+        Sleep(ProcessPollMilliseconds);
     Exit(0);
   end;
   Result := 1;
