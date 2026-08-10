@@ -53,9 +53,17 @@ end;
 begin
   TestRunnerProgram.AddSuite(TMyUnitTests.Create('MyUnit'));
   TestRunnerProgram.Run;
-  ExitCode := TestResultToExitCode;
 end.
 ```
+
+`Run` fails the process by default: a run with any failing test sets
+`ExitCode` to 1 itself, so the exit code `lwpt test` reads is always
+truthful. (Earlier versions required an explicit
+`ExitCode := TestResultToExitCode;` after `Run` — a program that
+omitted it exited 0 with failing assertions and its suite was reported
+as passing. The function remains exported for harnesses that want the
+value explicitly, and the assignment is harmless where it already
+exists.)
 
 `lwpt test`:
 
