@@ -1,0 +1,26 @@
+# Git-layer line-ending policy. Mirrors .editorconfig — which editors honor
+# but git does not — so the rule is also enforced on checkout and commit.
+#
+# LF is the committed form for every text file. GitHub's windows-latest
+# runner defaults core.autocrlf=true, which would otherwise give a Windows
+# checkout a CRLF working tree.
+#
+# The cross-platform `lwpt install --frozen` digests are made
+# line-ending-independent IN CODE, not by this file: HashTree normalizes
+# content CRLF->LF and pins its fold order (TreeHashPathCompare), and the
+# constraint fingerprint pins its separator and line sort. So a CRLF
+# checkout verifies regardless of what git does here. This rule is
+# defense-in-depth and plain hygiene — keep the working tree LF so
+# committed bytes, editor output, and the digest inputs never disagree.
+* text=auto eol=lf
+
+# Windows shells require CRLF (mirrors .editorconfig's [*.{bat,cmd}]/[*.ps1]).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Exact-byte fixtures git must never line-ending-normalize: PKCS#12 TLS
+# identities are binary, and the registry .hex objects are named by the
+# sha256 of their own bytes — a rewritten byte would corrupt the fixture.
+*.p12 binary
+*.hex binary

@@ -49,6 +49,12 @@ type
     procedure SetupTests; override;
     procedure TestPinnedNestedTreeDigest;
     procedure TestCanonicalPathReplacesSourceDelimiter;
+    procedure TestNormalizeConvertsCrlfToLf;
+    procedure TestNormalizePreservesLoneCr;
+    procedure TestNormalizeLeavesBinaryVerbatim;
+    procedure TestNormalizeEmptyInput;
+    procedure TestCrlfTreeHashesEqualLf;
+    procedure TestFoldOrderIsAsciiCaseInsensitive;
   end;
 
   TLoadManifestHappy = class(TTestSuite)
@@ -117,6 +123,22 @@ type
     procedure TestManifestDepWithoutLockEntryRaises;
     procedure TestLockEntryWithoutGraphNodeRaises;
     procedure TestLocalSourceWithEmptyArchiveHashPasses;
+  end;
+
+  { The frozen verifier's accumulated-constraints fingerprint. A lockfile
+    is written on one machine and verified on another, so both the digest
+    input and the line ORDER must be platform-invariant — hashing
+    TStrings.Text made a POSIX-written lockfile fail --frozen on Windows,
+    and a locale-collated sort would reintroduce the same class through
+    line ordering. The pinned vectors below are the LF-terminated fold and
+    the ordinal node sort; they fail on any platform (Windows CI included)
+    whose fold or sort drifts. }
+  TConstraintFingerprintFold = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestPinnedFingerprintForFixedConstraintSet;
+    procedure TestFoldReproducesPlatformTextOnLineFeedPlatforms;
+    procedure TestNodeFingerprintPinsOrdinalSort;
   end;
 
   { ParseDependencySource: every prefix shape + default github +
@@ -574,12 +596,98 @@ begin
     .ToBe('nested\file.txt');
 end;
 
+procedure THashTreePaths.TestNormalizeConvertsCrlfToLf;
+begin
+  { CRLF text folds to exactly its LF form — the content analogue of the
+    path canonicalisation, so a Windows checkout hashes as its LF tree. }
+  Expect<string>(SHA256Hex(NormalizeTreeHashContent(
+    StringAsBytes('a'#13#10'b'#13#10'c'))))
+    .ToBe(SHA256Hex(StringAsBytes('a'#10'b'#10'c')));
+end;
+
+procedure THashTreePaths.TestNormalizePreservesLoneCr;
+begin
+  { A CR not followed by LF survives untouched (git's convention). }
+  Expect<string>(SHA256Hex(NormalizeTreeHashContent(
+    StringAsBytes('a'#13'b'#13))))
+    .ToBe(SHA256Hex(StringAsBytes('a'#13'b'#13)));
+end;
+
+procedure THashTreePaths.TestNormalizeLeavesBinaryVerbatim;
+var
+  Bin: TBytes;
+begin
+  { A NUL byte marks the content binary: its embedded CRLF must NOT fold,
+    so the exact bytes reach the digest. }
+  Bin := StringAsBytes('a'#13#10#0'b'#13#10);
+  Expect<string>(SHA256Hex(NormalizeTreeHashContent(Bin)))
+    .ToBe(SHA256Hex(Bin));
+end;
+
+procedure THashTreePaths.TestNormalizeEmptyInput;
+begin
+  Expect<Integer>(Length(NormalizeTreeHashContent(nil))).ToBe(0);
+end;
+
+procedure THashTreePaths.TestCrlfTreeHashesEqualLf;
+var
+  CrlfDigest, LfDigest: string;
+begin
+  { End-to-end: a CRLF working tree and its LF twin produce one digest. }
+  ResetScratch;
+  WriteFixtureBytes(FScratch + PathDelim + 'unit.pas',
+    StringAsBytes('unit A;'#13#10'begin'#13#10'end.'#13#10));
+  CrlfDigest := HashTree(FScratch);
+  ResetScratch;
+  WriteFixtureBytes(FScratch + PathDelim + 'unit.pas',
+    StringAsBytes('unit A;'#10'begin'#10'end.'#10));
+  LfDigest := HashTree(FScratch);
+  Expect<string>(CrlfDigest).ToBe(LfDigest);
+end;
+
+procedure THashTreePaths.TestFoldOrderIsAsciiCaseInsensitive;
+const
+  { Independently computed (SHA-256 over path + #10 + bytes, folded in
+    ASCII case-insensitive path order): the exact order every existing
+    lockfile was written with. Windows word-sort ranks 'leaf.cnf' BEFORE
+    'leaf-ca-true.cnf' (hyphens are primary-ignorable) and would yield
+    c7e20c2d... instead — the real-world "tree hash mismatch" this
+    comparator pin fixes. }
+  EXPECTED = 'sha256:77386de0b4e46c60b337ea3255b2f68ddb48a46a1a216a828dce604a2f84ad85';
+begin
+  ResetScratch;
+  WriteFixtureBytes(FScratch + PathDelim + 'leaf-ca-true.cnf',
+    StringAsBytes('ca=true'#10));
+  WriteFixtureBytes(FScratch + PathDelim + 'leaf.cnf',
+    StringAsBytes('leaf'#10));
+  WriteFixtureBytes(FScratch + PathDelim + 'README.md',
+    StringAsBytes('# fixture'#10));
+  WriteFixtureBytes(FScratch + PathDelim + 'sub' + PathDelim + 'a-b.pas',
+    StringAsBytes('unit ab;'#10));
+  WriteFixtureBytes(FScratch + PathDelim + 'sub' + PathDelim + 'ab.pas',
+    StringAsBytes('unit ab2;'#10));
+
+  Expect<string>(HashTree(FScratch)).ToBe(EXPECTED);
+end;
+
 procedure THashTreePaths.SetupTests;
 begin
   Test('nested tree digest matches the pinned hash layout',
     TestPinnedNestedTreeDigest);
   Test('canonical path replaces the supplied source delimiter',
     TestCanonicalPathReplacesSourceDelimiter);
+  Test('normalize folds CRLF content to its LF form',
+    TestNormalizeConvertsCrlfToLf);
+  Test('normalize preserves a lone CR',
+    TestNormalizePreservesLoneCr);
+  Test('normalize leaves NUL-bearing binary verbatim',
+    TestNormalizeLeavesBinaryVerbatim);
+  Test('normalize returns empty for empty input',
+    TestNormalizeEmptyInput);
+  Test('CRLF tree hashes equal its LF twin',
+    TestCrlfTreeHashesEqualLf);
+  Test('fold order is ASCII case-insensitive on every platform',
+    TestFoldOrderIsAsciiCaseInsensitive);
 end;
 
 { ── TLoadManifestHappy ────────────────────────────────────────────── }
@@ -1474,6 +1582,106 @@ begin
     TestLockEntryWithoutGraphNodeRaises);
   Test('skLocal with empty ArchiveHash on both sides: no false mismatch',
     TestLocalSourceWithEmptyArchiveHashPasses);
+end;
+
+{ ── TConstraintFingerprintFold ────────────────────────────────── }
+
+{ The exact list the resolver hands to the fingerprint: sorted, duplicates
+  accepted, one line per accumulated requirement plus the canonical source
+  identity. }
+function FixedConstraintLines: TStringList;
+begin
+  Result := TStringList.Create;
+  try
+    Result.Sorted := True;
+    Result.Duplicates := dupAccept;
+    Result.Add('1|^1.0.0|lwpt');
+    Result.Add('1|^1.2.0|widget');
+    Result.Add('source|git|https://github.com/acme/widget');
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure TConstraintFingerprintFold.TestPinnedFingerprintForFixedConstraintSet;
+const
+  { sha256 of "1|^1.0.0|lwpt\n1|^1.2.0|widget\n"
+    + "source|git|https://github.com/acme/widget\n" }
+  EXPECTED = 'sha256:81583af3bb365d31608e77e1a4b034feb09fe13a4fa93ef9e3d3b5'
+    + 'a8fca355c9';
+var Lines: TStringList;
+begin
+  Lines := FixedConstraintLines;
+  try
+    Expect<string>(ConstraintFingerprintForLines(Lines)).ToBe(EXPECTED);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TConstraintFingerprintFold.TestFoldReproducesPlatformTextOnLineFeedPlatforms;
+var Lines: TStringList; CarriageReturnFold: string;
+begin
+  Lines := FixedConstraintLines;
+  try
+    { The pin's whole purpose: on an LF platform the pinned fold must be
+      byte-identical to the platform TStrings.Text fold it replaced, so
+      every fingerprint an LF machine ever wrote stays valid. TStrings.Text
+      terminates every line — including the last — with the platform line
+      ending, which is why the separator is a terminator, not a join. On
+      Windows Text uses CRLF, so the equality only holds off Windows. }
+    {$IFNDEF MSWINDOWS}
+    Expect<string>(ConstraintFingerprintForLines(Lines)).ToBe(
+      'sha256:' + SHA256Hex(BytesOf(Lines.Text)));
+    {$ENDIF}
+    { The separator is pinned to LF and must stay distinguishable from CRLF,
+      so a platform-inherited fold cannot pass by coincidence on any host. }
+    CarriageReturnFold := 'sha256:' + SHA256Hex(StringAsBytes(
+      '1|^1.0.0|lwpt'#13#10'1|^1.2.0|widget'#13#10
+      + 'source|git|https://github.com/acme/widget'#13#10));
+    Expect<Boolean>(ConstraintFingerprintForLines(Lines) = CarriageReturnFold)
+      .ToBe(False);
+    Expect<string>(string(CONSTRAINT_FINGERPRINT_SEPARATOR)).ToBe(string(#10));
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TConstraintFingerprintFold.TestNodeFingerprintPinsOrdinalSort;
+const
+  { Two requirement lines identical but for a hyphen in the requirer:
+    'appcore' is added FIRST, so the assertion only holds if the node fold
+    reorders them by 8-bit ordinal ('app-core' wins because '-' = $2D <
+    'c' = $63). A locale word-sort folds the hyphen away and would leave the
+    input order, changing the digest. Folded (each line LF-terminated):
+      1|^1.0.0|app-core\n1|^1.0.0|appcore\nsource|workspace|widget\n }
+  EXPECTED = 'sha256:d8dd5ec45301a80b19936b1fef484def270eee9ce723692183a8b6b'
+    + 'a3c3705b3';
+var Node: TResolveNode;
+begin
+  Node := Default(TResolveNode);
+  Node.Name := 'widget';
+  Node.Dep.Name := 'widget';
+  Node.Dep.SrcKind := skWorkspace;
+  SetLength(Node.Specs, 2);
+  SetLength(Node.Kinds, 2);
+  SetLength(Node.Requirers, 2);
+  Node.Specs[0] := '^1.0.0'; Node.Kinds[0] := vkSemverRange;
+  Node.Requirers[0] := 'appcore';
+  Node.Specs[1] := '^1.0.0'; Node.Kinds[1] := vkSemverRange;
+  Node.Requirers[1] := 'app-core';
+  Expect<string>(ConstraintFingerprintForNode(Node, '')).ToBe(EXPECTED);
+end;
+
+procedure TConstraintFingerprintFold.SetupTests;
+begin
+  Test('fixed constraint set folds to the pinned cross-platform digest',
+    TestPinnedFingerprintForFixedConstraintSet);
+  Test('fold reproduces the platform Text join on LF platforms',
+    TestFoldReproducesPlatformTextOnLineFeedPlatforms);
+  Test('node fold orders requirement lines by ordinal byte value',
+    TestNodeFingerprintPinsOrdinalSort);
 end;
 
 { ── TParseDependencySource ────────────────────────────────────── }
@@ -3178,6 +3386,8 @@ begin
     PROJECT_NAME + '.Install: LoadLockfile'));
   TestRunnerProgram.AddSuite(TVerifyAgainstLockfile.Create(
     PROJECT_NAME + '.Install: VerifyAgainstLockfile'));
+  TestRunnerProgram.AddSuite(TConstraintFingerprintFold.Create(
+    PROJECT_NAME + '.Install: ConstraintFingerprintForNode'));
   TestRunnerProgram.AddSuite(TParseDependencySource.Create(
     PROJECT_NAME + '.Manifest: ParseDependencySource'));
   TestRunnerProgram.AddSuite(TParseVersionSpec.Create(

@@ -32,6 +32,9 @@ const
 
   PROCESS_OUTPUT_BUFFER_SIZE = 4096;
   TREE_HASH_PATH_SEPARATOR = '/';
+  TREE_HASH_BYTE_NUL = 0;
+  TREE_HASH_BYTE_CR = 13;
+  TREE_HASH_BYTE_LF = 10;
 
   PLACEHOLDER_USER       = '{user}';
   PLACEHOLDER_REPOSITORY = '{repository}';
@@ -101,6 +104,7 @@ function  SHA256Hex(const AData: TBytes): string;
 function  SHA256File(const APath: string): string;
 function  CanonicalTreeHashPath(const APath: string;
   const ASourceDelimiter: Char): string;
+function  NormalizeTreeHashContent(const ABytes: TBytes): TBytes;
 function  HashTree(const APathOrArchive: string): string;
 
 { Appends every entry of the process environment to ATarget, safe to call
@@ -1369,6 +1373,55 @@ begin
     TREE_HASH_PATH_SEPARATOR, [rfReplaceAll]);
 end;
 
+{ Normalize a hashed file's bytes so the tree digest is independent of
+  checkout line endings: a CRLF Windows working tree must hash the same
+  as the LF tree the lockfile was written from. The content analogue of
+  CanonicalTreeHashPath / #116. Text files: every CRLF (#13#10) becomes
+  LF (#10); a lone CR is left as-is (git's convention). Binary files —
+  any that contain a NUL byte, the standard git heuristic — are hashed
+  VERBATIM, so their exact bytes are never altered. LF-committed content
+  is unchanged by this, so every existing lockfile keeps verifying.
+
+  The collapse is intentional and does not weaken artifact integrity:
+  CRLF and LF forms of the same NUL-free text hash alike ON PURPOSE, so
+  a CRLF checkout of the extracted modules verifies against an LF-written
+  lockfile. computedHash's job is "was the installed tree modified",
+  where a checkout-introduced line-ending flip is a false positive to be
+  tolerated, not detected. Byte-exact integrity of the fetched package is
+  a separate anchor: archiveHash is the raw SHA-256 of the .tar.gz (never
+  normalized), and `install --frozen` checks it alongside this tree hash.
+  So the only computedHash pre-images that collide are line-ending
+  variants of identical text; any real byte change to the source-of-truth
+  archive is still caught. }
+function NormalizeTreeHashContent(const ABytes: TBytes): TBytes;
+var
+  Read, Write, Len : Integer;
+begin
+  Len := Length(ABytes);
+  { Binary guard: a single NUL byte means hash verbatim — bail before
+    allocating a normalized copy. }
+  for Read := 0 to Len - 1 do
+    if ABytes[Read] = TREE_HASH_BYTE_NUL then Exit(ABytes);
+  { Single pass: size the output once at the input length, drop the CR of
+    every CRLF pair in place, then trim to the bytes actually written. }
+  SetLength(Result, Len);
+  Write := 0;
+  Read := 0;
+  while Read < Len do
+  begin
+    if (ABytes[Read] = TREE_HASH_BYTE_CR) and (Read + 1 < Len)
+       and (ABytes[Read + 1] = TREE_HASH_BYTE_LF) then
+      Inc(Read)
+    else
+    begin
+      Result[Write] := ABytes[Read];
+      Inc(Write);
+      Inc(Read);
+    end;
+  end;
+  SetLength(Result, Write);
+end;
+
 { Hash of an installed package: SHA-256 over every extracted file's bytes,
   visited in sorted relative-path order so the digest is stable regardless
   of filesystem enumeration order or which mirror served the archive.
@@ -1407,12 +1460,61 @@ begin
     end;
 end;
 
+{ Fold-order comparator for HashTree: ASCII case-insensitive, byte-wise,
+  ordinal tiebreak — a platform-independent pin of the order every
+  existing lockfile was written with. TStringList.Sort compares with
+  AnsiCompareText, which is ASCII-uppercase byte compare on POSIX but
+  CompareStringW WORD-SORT on Windows, where '-' is primary-ignorable:
+  the same tree of hyphenated filenames folds in a different order and
+  the digest diverges with byte-identical content ("tree hash mismatch"
+  on a Windows checkout — the third guise of the #78 family, after path
+  separators (#116) and the fingerprint join). Verified byte-for-byte
+  against a real divergence: ASCII-CI order reproduces the POSIX-written
+  lockfile digest exactly; the hyphen-ignoring order reproduces the
+  Windows disk digest exactly. Do not "simplify" this to a plain ordinal
+  compare — that is a THIRD order and would invalidate every lockfile. }
+function TreeHashPathCompare(AList: TStringList;
+  AIndex1, AIndex2: Integer): Integer;
+var
+  A, B : string;
+  i, LA, LB : Integer;
+  CA, CB : Char;
+begin
+  A := AList[AIndex1];
+  B := AList[AIndex2];
+  LA := Length(A);
+  LB := Length(B);
+  i := 1;
+  while (i <= LA) and (i <= LB) do
+  begin
+    CA := A[i];
+    CB := B[i];
+    if CA in ['a'..'z'] then Dec(CA, 32);
+    if CB in ['a'..'z'] then Dec(CB, 32);
+    if CA <> CB then Exit(Ord(CA) - Ord(CB));
+    Inc(i);
+  end;
+  Result := LA - LB;
+  { Case-insensitively equal but distinct paths (a case collision the
+    default Windows/macOS filesystems cannot even host): break the tie
+    ordinally so the order is still deterministic everywhere. This does
+    NOT change any existing digest — the prior TStringList.Sort
+    (AnsiCompareText) already ordered such a pair uppercase-first and
+    input-order-stably ('A.pas' before 'a.pas'), which CompareStr
+    reproduces byte-for-byte (verified against FPC's Sort). Where the
+    old order could still differ was ACROSS platforms — the exact
+    non-portability this comparator exists to remove — so no lockfile
+    that was portable is invalidated. }
+  if Result = 0 then Result := CompareStr(A, B);
+end;
+
 function HashTree(const APathOrArchive: string): string;
 var
   Files : TStringList;
   Acc   : TBytes;
   i, n  : Integer;
   Chunk : TBytes;
+  FileBytes : TBytes;
   FS    : TFileStream;
   FullPath : string;
 begin
@@ -1422,9 +1524,7 @@ begin
     Files := TStringList.Create;
     try
       CollectFiles(IncludeTrailingPathDelimiter(APathOrArchive), '', Files);
-      { Keep the existing comparator for lockfile compatibility. Its
-        ordering remains locale-sensitive for non-ASCII filenames. }
-      Files.Sort;
+      Files.CustomSort(@TreeHashPathCompare);
       SetLength(Acc, 0);
       for i := 0 to Files.Count - 1 do
       begin
@@ -1438,12 +1538,20 @@ begin
           + Files[i]);
         FS := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
         try
-          n := Length(Acc);
-          SetLength(Acc, n + FS.Size);
-          if FS.Size > 0 then FS.ReadBuffer(Acc[n], FS.Size);
+          SetLength(FileBytes, FS.Size);
+          if FS.Size > 0 then FS.ReadBuffer(FileBytes[0], FS.Size);
         finally
           FS.Free;
         end;
+        { Fold NORMALIZED content: a CRLF checkout hashes as its LF tree
+          (NormalizeTreeHashContent), so a Windows working tree verifies
+          against a POSIX-written lockfile. Binary files pass through
+          verbatim via that helper's NUL guard. }
+        FileBytes := NormalizeTreeHashContent(FileBytes);
+        n := Length(Acc);
+        SetLength(Acc, n + Length(FileBytes));
+        if Length(FileBytes) > 0 then
+          Move(FileBytes[0], Acc[n], Length(FileBytes));
       end;
       Result := 'sha256:' + SHA256Hex(Acc);
     finally

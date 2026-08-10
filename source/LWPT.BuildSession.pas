@@ -430,6 +430,10 @@ begin
     SessionsIdentity := DirectoryIdentity(SessionsRoot);
     Collect(ARoot, '');
     Files.Sort;
+    { Hash inputs never inherit the platform line ending: TStrings.Text joins
+      with CRLF on Windows and LF elsewhere. LF keeps LF-platform digests
+      byte-identical. }
+    Files.LineBreak := #10;
     Result := TextHash(Files.Text);
   finally
     VisitedDirectories.Free;
@@ -539,6 +543,9 @@ begin
       PathFingerprint(AProjectRoot, ALockPath, EmptyPaths));
     AddField(Fields, 'modules', PathFingerprint(AProjectRoot, AModulesPath,
       ARequest.ExcludedPaths));
+    { Same invariant as InputDirectoryFingerprint: the fold separator is
+      pinned, never inherited from the platform. }
+    Fields.LineBreak := #10;
     Result := TextHash(Fields.Text);
   finally
     Fields.Free;
