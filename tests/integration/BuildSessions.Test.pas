@@ -34,13 +34,15 @@ const
   TestWorkerHolderEnvironment = PROJECT_NAME + '_TEST_WORKER_HOLDER';
   TestWorkerHolderReadyEnvironment = PROJECT_NAME
     + '_TEST_WORKER_HOLDER_READY';
-  TestWorkerHolderDelayMillisecondsEnvironment = PROJECT_NAME
-    + '_TEST_WORKER_HOLDER_DELAY_MS';
   TestHeartbeatIntervalMilliseconds = 75;
   TestHeartbeatJobDurationMilliseconds =
     TestHeartbeatIntervalMilliseconds * 4;
-  TestWorkerContentionDurationMilliseconds =
-    TestHeartbeatIntervalMilliseconds * 8;
+  TestWorkerHeartbeatStaleSeconds = 300;
+  { Start the contender after the old fixed-duration holder would have
+    released its lease. The holder must synchronize with observed contention,
+    not assume process startup completes within a wall-clock allowance. }
+  TestDelayedContenderStartMilliseconds =
+    TestHeartbeatIntervalMilliseconds * 9;
   TestShortCompilerDelayMilliseconds = 20;
   { Compiler-invocation shape shared by the proxy and the fail-fast guard:
     a version probe or an @response-file argument. Kept as constants so the
@@ -1137,12 +1139,13 @@ begin
     SetProcessEnv(Holder.Environment, TestWorkerHolderEnvironment + '=1');
     SetProcessEnv(Holder.Environment, TestWorkerHolderReadyEnvironment + '='
       + ReadyPath);
-    SetProcessEnv(Holder.Environment,
-      TestWorkerHolderDelayMillisecondsEnvironment + '='
-      + IntToStr(TestWorkerContentionDurationMilliseconds));
     SetProcessEnv(Holder.Environment, WORKER_STATE_DIR_ENV + '='
       + Project + '/worker-state');
     SetProcessEnv(Holder.Environment, WORKER_BUDGET_ENV + '=1');
+    { Keep the background session heartbeat outside this short observation
+      window, so HeartbeatAt advances only when the contender retries Acquire. }
+    SetProcessEnv(Holder.Environment, WORKER_STALE_SECONDS_ENV + '='
+      + IntToStr(TestWorkerHeartbeatStaleSeconds));
     Holder.Execute;
     StartedAt := GetTickCount64;
     while Holder.Running and not FileExists(ReadyPath)
@@ -1150,11 +1153,14 @@ begin
         < ConcurrencyBarrierCeilingSeconds * 1000) do Sleep(10);
     Expect<Boolean>(FileExists(ReadyPath)).ToBe(True);
 
-    SetLength(Environment, 3);
+    SetLength(Environment, 4);
     Environment[0] := WORKER_STATE_DIR_ENV + '=' + Project + '/worker-state';
     Environment[1] := WORKER_BUDGET_ENV + '=1';
     Environment[2] := ObservabilityHeartbeatIntervalEnvironment + '='
       + IntToStr(TestHeartbeatIntervalMilliseconds);
+    Environment[3] := WORKER_STALE_SECONDS_ENV + '='
+      + IntToStr(TestWorkerHeartbeatStaleSeconds);
+    Sleep(TestDelayedContenderStartMilliseconds);
     RunResult := RunLwpt(['build', 'alpha'], Project, Environment);
 
     DumpRunFailure('contended: queued build', RunResult, 0);
@@ -1392,11 +1398,16 @@ function RunWorkerHolder: Integer;
 var
   Session: TLWPTWorkerBudgetSession;
   Lease: TLWPTWorkerLease;
+  Snapshot: TLWPTWorkerBudgetSnapshot;
   ReadyPath: string;
-  DelayMilliseconds: Integer;
+  HolderSessionId: string;
+  StartedAt: QWord;
+  EntryIndex: Integer;
+  ContenderWaitObserved: Boolean;
 begin
   Result := 1;
-  Session := TLWPTWorkerBudgetSession.Create(NewWorkerSessionId, 1);
+  HolderSessionId := NewWorkerSessionId;
+  Session := TLWPTWorkerBudgetSession.Create(HolderSessionId, 1);
   try
     Lease := Session.Acquire(5000);
     if not Assigned(Lease) then Exit;
@@ -1404,10 +1415,29 @@ begin
       ReadyPath := GetEnvironmentVariable(TestWorkerHolderReadyEnvironment);
       if not ForceDirectories(ExtractFileDir(ReadyPath)) then Exit;
       WriteTextFile(ReadyPath, 'ready');
-      DelayMilliseconds := StrToIntDef(GetEnvironmentVariable(
-        TestWorkerHolderDelayMillisecondsEnvironment),
-        TestWorkerContentionDurationMilliseconds);
-      Sleep(DelayMilliseconds);
+      StartedAt := GetTickCount64;
+      repeat
+        ContenderWaitObserved := False;
+        Snapshot := GetWorkerBudgetSnapshot;
+        { Acquire(0) clears Waiting before it returns, so the durable signal is
+          a zero-grant contender whose heartbeat has advanced across repeated
+          acquisition attempts for at least two reporter intervals. }
+        for EntryIndex := 0 to High(Snapshot.Entries) do
+          if (Snapshot.Entries[EntryIndex].SessionId <> HolderSessionId)
+             and (Snapshot.Entries[EntryIndex].Granted = 0)
+             and not Snapshot.Entries[EntryIndex].Uncertain
+             and (Snapshot.Entries[EntryIndex].HeartbeatAt
+               - Snapshot.Entries[EntryIndex].StartedAt
+               >= TestHeartbeatIntervalMilliseconds * 2) then
+          begin
+            ContenderWaitObserved := True;
+            Break;
+          end;
+        if ContenderWaitObserved then Break;
+        if GetTickCount64 - StartedAt
+           >= ConcurrencyBarrierCeilingSeconds * 1000 then Exit;
+        Sleep(10);
+      until False;
       Result := 0;
     finally
       Lease.Free;
