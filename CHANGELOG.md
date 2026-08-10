@@ -1,6 +1,17 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.5.1] - 2026-08-10
+
+### Bug Fixes
+
+- fix(install): pin the frozen constraint fingerprint to LF line endings (#168)
+- fix(testing): fail the process by default when a suite fails (#167)
+- fix(test): synchronize concurrency fixtures (#173)
+
+### Internal
+
+- ci: add managed delivery orchestration (#166)
 ## [0.5.0] - 2026-08-04
 
 ### Bug Fixes

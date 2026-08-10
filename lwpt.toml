@@ -7,7 +7,7 @@
 
 [package]
 name = "lwpt"
-version = "0.5.0"
+version = "0.5.1"
 units = ["source"]
 
 [build]
