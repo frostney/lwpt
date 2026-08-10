@@ -1380,7 +1380,19 @@ end;
   LF (#10); a lone CR is left as-is (git's convention). Binary files —
   any that contain a NUL byte, the standard git heuristic — are hashed
   VERBATIM, so their exact bytes are never altered. LF-committed content
-  is unchanged by this, so every existing lockfile keeps verifying. }
+  is unchanged by this, so every existing lockfile keeps verifying.
+
+  The collapse is intentional and does not weaken artifact integrity:
+  CRLF and LF forms of the same NUL-free text hash alike ON PURPOSE, so
+  a CRLF checkout of the extracted modules verifies against an LF-written
+  lockfile. computedHash's job is "was the installed tree modified",
+  where a checkout-introduced line-ending flip is a false positive to be
+  tolerated, not detected. Byte-exact integrity of the fetched package is
+  a separate anchor: archiveHash is the raw SHA-256 of the .tar.gz (never
+  normalized), and `install --frozen` checks it alongside this tree hash.
+  So the only computedHash pre-images that collide are line-ending
+  variants of identical text; any real byte change to the source-of-truth
+  archive is still caught. }
 function NormalizeTreeHashContent(const ABytes: TBytes): TBytes;
 var
   Read, Write, Len : Integer;
@@ -1485,7 +1497,14 @@ begin
   Result := LA - LB;
   { Case-insensitively equal but distinct paths (a case collision the
     default Windows/macOS filesystems cannot even host): break the tie
-    ordinally so the order is still deterministic everywhere. }
+    ordinally so the order is still deterministic everywhere. This does
+    NOT change any existing digest — the prior TStringList.Sort
+    (AnsiCompareText) already ordered such a pair uppercase-first and
+    input-order-stably ('A.pas' before 'a.pas'), which CompareStr
+    reproduces byte-for-byte (verified against FPC's Sort). Where the
+    old order could still differ was ACROSS platforms — the exact
+    non-portability this comparator exists to remove — so no lockfile
+    that was portable is invalidated. }
   if Result = 0 then Result := CompareStr(A, B);
 end;
 
