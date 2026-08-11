@@ -167,6 +167,13 @@ The point at which a hook section attaches to a subcommand run. Six top-level se
 A single binary declaration in the `[build]` table — the thing `lwpt build` compiles, one per iteration. Multi-entry form: `[build.cli] source = "..."` (or the TOML-equivalent inline `[build] cli = { source = "..." }`). Single-entry shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` and the output to `build/<entry-name>`. Each entry takes `source` (required), `output` (optional), ordered `flags` (optional), an optional compiler profile, an independent optional complete target tuple, and optional per-entry `prebuild` / `postbuild` hook tables. Flags, compiler, and target are root-manifest behavior; dependency manifests cannot select executable policy. Renamed from the pre-ADR-0013 `[targets]`.
 *Avoid*: "target" (pre-ADR-0013 term; overloaded with Bazel/Make vocabulary and doesn't match LWPT's verb-noun pairing).
 
+**Build session**:
+A project-owned, per-invocation private workspace for compiler outputs,
+compiled hooks, and diagnostic logs. Its storage root may be project-local or
+relocated, but ownership and repair remain bound to exactly one project.
+*Avoid*: "build directory" (the public output directory is separate),
+"temporary directory" (failed sessions are intentionally retained).
+
 <a id="run-task"></a>
 **Run task**:
 A user-declared root-manifest callable addressed by `lwpt run <name>`. Any

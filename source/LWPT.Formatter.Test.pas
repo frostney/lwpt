@@ -79,6 +79,7 @@ type
     procedure TestExplicitIncludeMatchIsCaseSensitive;
     procedure TestOverriddenModulesDirIsExcludedByDefault;
     procedure TestExplicitIncludeOverridesOverriddenModulesDir;
+    procedure TestSessionsBaseDoesNotHideSiblingSources;
   end;
 
 const
@@ -700,6 +701,14 @@ begin
     + #10
     + '[format]'#10
     + 'include = ["vendor/modules/**"]'#10);
+  WriteTextFile(FScratch + '/sessions-in-source.toml',
+      '[package]'#10
+    + 'name = "format-sessions-in-source"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["session-source"]'#10
+    + #10
+    + '[lwpt]'#10
+    + 'sessions-dir = "session-source"'#10);
   WriteTextFile(FScratch + '/src/Good.pas', ALREADY_FORMATTED);
   WriteTextFile(FScratch + '/.lwpt/modules/dep/source/Vendored.pas',
     NEEDS_FORMAT);
@@ -708,6 +717,8 @@ begin
   WriteTextFile(FScratch + '/.lwpt/case/source/Included.pas',
     ALREADY_FORMATTED);
   WriteTextFile(FScratch + '/.lwpt/case/source/included.pas',
+    NEEDS_FORMAT);
+  WriteTextFile(FScratch + '/session-source/NeedsFormat.pas',
     NEEDS_FORMAT);
   FCaseDistinctFilesSupported :=
     DirectoryHasExactEntry(FScratch + '/.lwpt/case/source', 'Included.pas')
@@ -763,6 +774,12 @@ begin
   Expect<Integer>(CmdFormat('override-include.toml', True)).ToBe(1);
 end;
 
+procedure TLWPTFormatToolkitStateDefault.
+  TestSessionsBaseDoesNotHideSiblingSources;
+begin
+  Expect<Integer>(CmdFormat('sessions-in-source.toml', True)).ToBe(1);
+end;
+
 procedure TLWPTFormatToolkitStateDefault.SetupTests;
 begin
   Test('units-seeded .lwpt source is excluded by default',
@@ -777,6 +794,8 @@ begin
     TestOverriddenModulesDirIsExcludedByDefault);
   Test('explicit include overrides the overridden modules-dir exclusion',
     TestExplicitIncludeOverridesOverriddenModulesDir);
+  Test('configured sessions base does not hide sibling sources',
+    TestSessionsBaseDoesNotHideSiblingSources);
 end;
 
 begin

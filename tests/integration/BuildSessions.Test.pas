@@ -81,6 +81,8 @@ type
   public
     procedure SetupTests; override;
     procedure TestConcurrentBuildsUseDistinctSessions;
+    procedure TestConcurrentRelocatedRootsSharePublicationLock;
+    procedure TestDeepProjectCanRelocateSessions;
     procedure TestDistinctOutputsPublishIndependentlyFromRootUnits;
     procedure TestFailedBuildPreservesLastSuccessfulOutput;
     procedure TestInFlightSourceChangeRefusesPublication;
@@ -277,6 +279,76 @@ begin
   if AChanged then
     Body := Body + '// changed while compilation was paused'#10;
   WriteTextFile(FScratch + '/source/app.pas', Body);
+end;
+
+procedure TBuildSessions.TestDeepProjectCanRelocateSessions;
+var
+  Project, ManifestRoot, EnvironmentRoot, RelativeEnvironmentRoot: string;
+  Run: TLwptResult;
+  Ledger: string;
+begin
+  Project := FScratch + '/deep-project';
+  while Length(Project) < 205 do
+    Project := Project + '/deep-path-segment';
+  ManifestRoot := FScratch + '/manifest-sessions';
+  EnvironmentRoot := FScratch + '/environment-sessions';
+  RecursiveDelete(Project);
+  RecursiveDelete(ManifestRoot);
+  RecursiveDelete(EnvironmentRoot);
+  WriteTextFile(Project + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "deep-app"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app" }'#10);
+  WriteTextFile(Project + '/source/app.pas',
+    'program app;'#10'begin'#10'end.'#10);
+
+  Run := RunLwptWithWorkerEnv(['build'], Project, []);
+  DumpRunFailure('deep default session root', Run, 1);
+  Expect<Integer>(Run.ExitCode).ToBe(1);
+  {$IFNDEF MSWINDOWS}
+  { Windows can hit its own directory-path ceiling while constructing the
+    default session before LWPT reaches the FPC file-buffer guard. The
+    non-zero default and both successful relocation paths remain portable;
+    Unix pins the specific compiler-budget diagnostic reproduced in #96. }
+  Expect<Boolean>(Pos('compiler staging path is too long', Run.Stderr) > 0)
+    .ToBe(True);
+  {$ENDIF}
+
+  WriteTextFile(Project + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "deep-app"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[lwpt]'#10
+    + 'sessions-dir = "'
+    + StringReplace(ManifestRoot, '\', '/', [rfReplaceAll]) + '"'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app" }'#10);
+  Run := RunLwptWithWorkerEnv(['build'], Project, []);
+  DumpRunFailure('deep manifest session root', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(DirectoryExists(ManifestRoot)).ToBe(True);
+
+  RelativeEnvironmentRoot := ExtractRelativePath(
+    IncludeTrailingPathDelimiter(Project), EnvironmentRoot);
+  Run := RunLwptWithWorkerEnv(['build', '--clean'], Project,
+    [BUILD_SESSION_DIR_ENV + '=' + RelativeEnvironmentRoot]);
+  DumpRunFailure('deep environment session root', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(DirectoryExists(EnvironmentRoot)).ToBe(True);
+  Ledger := ReadBinaryFile(Project + '/' + BUILD_SESSION_ROOT_LEDGER);
+  Expect<Boolean>(Pos(ExpandFileName(ManifestRoot), Ledger) > 0).ToBe(True);
+  Expect<Boolean>(Pos(ExpandFileName(EnvironmentRoot), Ledger) > 0).ToBe(True);
+
+  RecursiveDelete(Project);
+  RecursiveDelete(ManifestRoot);
+  RecursiveDelete(EnvironmentRoot);
 end;
 
 function TBuildSessions.CountSessionDirs: Integer;
@@ -561,6 +633,71 @@ begin
     Expect<Integer>(RepairResult.ExitCode).ToBe(0);
     Expect<Integer>(CountSessionDirs).ToBe(0);
   finally
+    First.Free;
+    Second.Free;
+  end;
+end;
+
+procedure TBuildSessions.TestConcurrentRelocatedRootsSharePublicationLock;
+var
+  First, Second: TProcess;
+  FirstStatus, SecondStatus: Integer;
+  Ready: Boolean;
+  RealFPC, ReadyDir, ReleasePath, SessionRootA, SessionRootB: string;
+  Started: TDateTime;
+  FirstEnv, SecondEnv: array of string;
+begin
+  RecursiveDelete(FScratch + '/build');
+  ReadyDir := FScratch + '/control/relocated-ready';
+  ReleasePath := FScratch + '/control/relocated-release';
+  SessionRootA := FScratch + '/control/sessions-a';
+  SessionRootB := FScratch + '/control/sessions-b';
+  RecursiveDelete(FScratch + '/control');
+  RealFPC := TestCompilerExecutable;
+  SetLength(FirstEnv, 8);
+  FirstEnv[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  FirstEnv[1] := TEST_FPC_PROXY_ENV + '=1';
+  FirstEnv[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  FirstEnv[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  FirstEnv[4] := TEST_FPC_RELEASE_ENV + '=' + ReleasePath;
+  FirstEnv[5] := WORKER_STATE_DIR_ENV + '=' + FScratch
+    + '/control/relocated-worker-state';
+  FirstEnv[6] := WORKER_BUDGET_ENV + '=2';
+  FirstEnv[7] := BUILD_SESSION_DIR_ENV + '=' + SessionRootA;
+  SecondEnv := Copy(FirstEnv, 0, Length(FirstEnv));
+  SecondEnv[7] := BUILD_SESSION_DIR_ENV + '=' + SessionRootB;
+  First := StartBuildWithEnv(FScratch, 'app', FirstEnv);
+  Second := StartBuildWithEnv(FScratch, 'app', SecondEnv);
+  try
+    Ready := False;
+    Started := Now;
+    while First.Running or Second.Running do
+    begin
+      if CountReadyFiles(ReadyDir) >= 2 then
+      begin
+        Ready := True;
+        Break;
+      end;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
+      Sleep(10);
+    end;
+    if not Ready then
+      DumpBarrierDiagnostics('relocated-publication', ReadyDir);
+    WriteTextFile(ReleasePath, 'release');
+    First.WaitOnExit;
+    Second.WaitOnExit;
+    FirstStatus := First.ExitStatus;
+    SecondStatus := Second.ExitStatus;
+
+    Expect<Boolean>(Ready).ToBe(True);
+    Expect<Boolean>(((FirstStatus = 0) and (SecondStatus = 1))
+      or ((FirstStatus = 1) and (SecondStatus = 0))).ToBe(True);
+    Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app')))
+      .ToBe(True);
+  finally
+    WriteTextFile(ReleasePath, 'release');
+    if First.Running then First.WaitOnExit;
+    if Second.Running then Second.WaitOnExit;
     First.Free;
     Second.Free;
   end;
@@ -1273,6 +1410,10 @@ procedure TBuildSessions.SetupTests;
 begin
   Test('concurrent builds use distinct private sessions',
     TestConcurrentBuildsUseDistinctSessions);
+  Test('concurrent relocated roots share publication coordination',
+    TestConcurrentRelocatedRootsSharePublicationLock);
+  Test('deep projects relocate sessions through manifest and environment',
+    TestDeepProjectCanRelocateSessions);
   Test('distinct outputs publish independently with root units',
     TestDistinctOutputsPublishIndependentlyFromRootUnits);
   Test('failed clean build preserves last successful output',

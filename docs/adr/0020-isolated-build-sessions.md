@@ -11,8 +11,10 @@
   stale, and interrupted work remains private for `lwpt repair`; successful
   cleanup retains its OS guard until the private contents are gone.
 
-Each `lwpt build` and `lwpt test` invocation owns a unique project-local
-session under `.lwpt/sessions/`. Compiler executable, unit, object, resource,
+Each `lwpt build` and `lwpt test` invocation owns a unique private build
+session. The root is selected by `LWPT_SESSION_DIR`, then
+`[lwpt].sessions-dir`, then the unchanged `.lwpt/sessions/` default. Compiler
+executable, unit, object, resource,
 and hook-compilation outputs are written only below that session. A successful
 build captures a versioned compiler-neutral publication fingerprint before
 compilation, acquires a short lock derived from the requested public output,
@@ -36,6 +38,19 @@ retaining sessions whose recorded process is alive.
 
 ## Consequences
 
+- A configured session root is a base, not a directory LWPT scans directly.
+  LWPT creates a `p-<project-hash>` namespace below it, derived from the
+  project's physical directory identity, and verifies both the project and
+  namespace identities stored there. Manifest-relative values resolve from the
+  project root; environment-relative values resolve from the invocation's
+  current directory. Absolute shallow roots are the reliable choice for deep
+  projects and automation.
+- Relocated roots are recorded in the schema-versioned, project-local
+  `.lwpt/session-roots` ledger through an atomic write. `lwpt repair` visits
+  the unchanged default plus exact historical ledger entries only, and only
+  when their identity marker matches the current project. It never scans or
+  deletes arbitrary children of a shared configured base.
+
 - `--clean` means a forced compile in already-fresh private staging. It no
   longer sweeps `build/`, deletes the previous successful executable, prunes
   legacy target directories, or touches source-adjacent compiler artifacts.
@@ -45,7 +60,8 @@ retaining sessions whose recorded process is alive.
   source/output request, prior public-output content, and target dimensions.
   The source directory and declared search roots are content-hashed while
   excluding
-  `.lwpt/sessions/` and every declared build output, so a root-level unit path
+  the resolved build-session root and every declared build output, so a
+  root-level unit path
   still tracks compiler inputs without fingerprinting private staging or an
   unrelated target's publication. Explicit file inputs remain hashed even when
   they are also declared outputs. Directory symlinks and junctions, including
@@ -80,9 +96,15 @@ retaining sessions whose recorded process is alive.
   or publication instead of combining new on-disk bytes with stale parsed
   configuration.
 - Output-specific lock files use the physical destination-parent identity and
-  filesystem-appropriate filename casing. They are stable names backed by an
-  OS-held advisory
-  byte-range lock plus a keyed in-process critical section. This matters on
+  filesystem-appropriate filename casing. They live below the resolved
+  project-owned sessions namespace, so relocation also keeps publication
+  coordination out of a deep project path while the default remains
+  `.lwpt/sessions/locks/`. They are stable names backed by an OS-held advisory
+  byte-range lock plus a keyed in-process critical section. A brief
+  project-local coordinator lock shared with the historical-root ledger
+  prevents two concurrent publishers that selected different session roots
+  from splitting that output lock and both publishing the same stale
+  generation. This matters on
   Unix, where `fcntl` locks are process-scoped and do not serialize threads in
   the same LWPT process. OS ownership ends automatically when the handle closes
   or the process exits; no contender or repair operation unlinks another

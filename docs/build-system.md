@@ -8,7 +8,8 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 - **Self-host.** LWPT's own `lwpt.toml` declares `lwpt` as a `[build]` entry; `lwpt build` rebuilds the binary that just ran. See [ADR-0005](./adr/0005-self-host-build.md).
 - **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev translation in `TLWPTFPCCompilerDriver.BuildArguments`.
 - **Compiler output is invocation-private.** FPC executables and intermediates
-  first land under `.lwpt/sessions/<session-id>/`. A completed executable is
+  first land under the resolved project-owned build-session root. A completed
+  executable is
   atomically published to its manifest `output` only after its declared inputs
   are revalidated.
 - **Compiler-default target unless the build entry selects one.** An optional
@@ -172,8 +173,10 @@ LWPT's own `lwpt.toml` is the reference: one `lwpt` build entry.
 
 ## Session staging and public outputs
 
-Every `lwpt build` and `lwpt test` invocation creates a unique
-`.lwpt/sessions/s-<pid>-<timestamp>-<counter>-<n>/` directory (PID and
+Every `lwpt build` and `lwpt test` invocation creates a unique build-session
+directory. The storage root is selected in this order: `LWPT_SESSION_DIR`,
+`[lwpt].sessions-dir`, then `.lwpt/sessions/`. The default remains
+`.lwpt/sessions/s-<pid>-<timestamp>-<counter>-<n>/` (PID and
 timestamp base36-encoded — the slug prefixes every compiler staging path,
 and FPC's file API silently truncates paths over 255 characters, so each
 component stays short). Build-entry job directories contain separate `bin/` and
@@ -182,6 +185,14 @@ writable compiler paths, even when they build the same entry and mode in
 the same worktree. Before compiling, LWPT verifies the staging path plus
 the longest reachable unit name fits the 255-character budget and refuses
 the compile with an explanatory error when it cannot.
+
+Configured roots are treated as shared bases. Each project uses a short
+`p-<project-hash>` child with a full identity marker. Manifest-relative paths
+resolve from the project root; environment-relative paths resolve from the
+invocation working directory. Prefer an absolute shallow root for reliable
+path-budget relief. LWPT atomically records exact historical project roots in
+`.lwpt/session-roots`; repair visits only those identity-matched entries and
+the project-local default, never arbitrary siblings under a shared base.
 
 Before compiling, LWPT creates a schema-versioned `TLWPTBuildRequest` covering
 the source set and entry point, output kind, mode, defines, search paths,
@@ -199,7 +210,8 @@ postbuild, live compiler refresh, fingerprint revalidation, and atomic
 publication. Publication takes a short output-specific lock, combining an
 in-process critical section with an OS-held lock, and captures the same
 fingerprint again. Search-root
-hashing excludes `.lwpt/sessions/` and all declared build outputs, so a project
+hashing excludes the resolved build-session root and all declared build
+outputs, so a project
 that declares `units = ["."]` tracks compiler inputs without treating private
 staging or another entry's publication as an input. Explicit file inputs are
 still hashed when they are also declared outputs. Workspace-package

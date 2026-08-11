@@ -97,7 +97,7 @@ scaffold:
 Adoption parses the manifest without rewriting it, creates missing
 project-local directories declared by `[package].units`, and appends missing
 `.gitignore` entries for `.lwpt/tmp/`, `.lwpt/install.lock`,
-`.lwpt/sessions/`, `.lwpt/workers/`, and the project-local output directories
+`.lwpt/sessions/`, `.lwpt/session-roots`, `.lwpt/workers/`, and the project-local output directories
 declared by `[build]` (`build/` when none is usable). It reports directories
 as created or found and ignore entries as added or found. It does not create
 a sample program, lockfile, cfg, dependency state, or build output.
@@ -233,8 +233,9 @@ bar = { source = "owner/bar", version = "^1.0", include = ["src/**"] } # inline-
 ./build/lwpt repair
 ```
 
-Cleans `.lwpt/tmp/`, any stale install lock, and abandoned or failed
-`.lwpt/sessions/` staging, then reclaims abandoned per-user worker requests and
-reports the remaining budget state. Live build/test sessions are retained.
+Cleans `.lwpt/tmp/`, any stale install lock, and abandoned or failed sessions
+from the default and identity-verified historical build-session roots, then
+reclaims abandoned per-user worker requests and reports the remaining budget
+state. Live build/test sessions are retained.
 Repair never touches `.lwpt/modules/`, `.lwpt/archives/`, or the last
 successfully published build output.

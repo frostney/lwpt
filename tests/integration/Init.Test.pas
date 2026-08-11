@@ -170,6 +170,7 @@ begin
   Expect<Boolean>(Pos('.lwpt/tmp/',         GI) > 0).ToBe(True);
   Expect<Boolean>(Pos('.lwpt/install.lock', GI) > 0).ToBe(True);
   Expect<Boolean>(Pos('.lwpt/sessions/',    GI) > 0).ToBe(True);
+  Expect<Boolean>(Pos('.lwpt/session-roots', GI) > 0).ToBe(True);
   Expect<Boolean>(Pos('.lwpt/workers/',     GI) > 0).ToBe(True);
   Expect<Boolean>(Pos('build/',             GI) > 0).ToBe(True);
 end;
@@ -264,6 +265,7 @@ begin
     '.lwpt/tmp/'#10 +
     '.lwpt/install.lock'#10 +
     '.lwpt/sessions/'#10 +
+    '.lwpt/session-roots'#10 +
     '.lwpt/workers/'#10);
   R := RunLwpt(['init', '--yes', '--force'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
@@ -322,6 +324,7 @@ begin
   Expect<Boolean>(Pos('.lwpt/tmp/', GitignoreAfter) > 0).ToBe(True);
   Expect<Boolean>(Pos('.lwpt/install.lock', GitignoreAfter) > 0).ToBe(True);
   Expect<Boolean>(Pos('.lwpt/sessions/', GitignoreAfter) > 0).ToBe(True);
+  Expect<Boolean>(Pos('.lwpt/session-roots', GitignoreAfter) > 0).ToBe(True);
   Expect<Boolean>(Pos('.lwpt/workers/', GitignoreAfter) > 0).ToBe(True);
   Expect<Boolean>(Pos('build/', GitignoreAfter) > 0).ToBe(True);
   Expect<Boolean>(Pos('preserved lwpt.toml', Output) > 0).ToBe(True);
