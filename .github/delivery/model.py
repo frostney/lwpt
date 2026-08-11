@@ -137,26 +137,66 @@ def review_evidence_errors(
     review_list = list(reviews)
     thread_list = list(threads)
 
+    active_automations = 0
     for automation in automation_list:
         automation_id = automation["id"]
         actors = set(automation["actors"])
-        context = automation.get("check_context")
-        if context:
-            matching_checks = [check for check in check_list if check.get("name") == context]
-            latest_check = max(matching_checks, key=lambda item: item.get("id", 0), default=None)
-            if not latest_check or latest_check.get("conclusion") != "success":
-                errors.append(f"{automation_id}: terminal successful check is missing")
-
-        terminal_states = set(automation.get("terminal_review_states", ["APPROVED", "COMMENTED"]))
-        terminal_reviews = [
+        contexts = set(automation.get("check_contexts", []))
+        legacy_context = automation.get("check_context")
+        if legacy_context:
+            contexts.add(legacy_context)
+        check_apps = set(automation.get("check_app_slugs", []))
+        matching_checks = [
+            check
+            for check in check_list
+            if check.get("name") in contexts
+            and (
+                not check_apps
+                or (check.get("app") or {}).get("slug") in check_apps
+            )
+        ]
+        current_reviews = [
             review
             for review in review_list
-            if review.get("author", {}).get("login") in actors
-            and review.get("commit", {}).get("oid") == head_sha
-            and review.get("state") in terminal_states
+            if (review.get("author") or {}).get("login") in actors
+            and (review.get("commit") or {}).get("oid") == head_sha
         ]
-        if not terminal_reviews:
-            errors.append(f"{automation_id}: terminal current-head review is missing")
+        if not matching_checks and not current_reviews:
+            continue
+
+        active_automations += 1
+        if contexts:
+            latest_check = max(matching_checks, key=lambda item: item.get("id", 0), default=None)
+            terminal_conclusions = set(
+                automation.get("terminal_check_conclusions", ["success"])
+            )
+            if not latest_check or latest_check.get("conclusion") not in terminal_conclusions:
+                errors.append(f"{automation_id}: terminal current-head check is missing")
+
+        terminal_states = set(automation.get("terminal_review_states", ["APPROVED", "COMMENTED"]))
+        if terminal_states:
+            latest_review = max(
+                current_reviews,
+                key=lambda item: item.get("submittedAt") or "",
+                default=None,
+            )
+            markers = [
+                marker.casefold()
+                for marker in automation.get("nonterminal_review_markers", [])
+            ]
+            review_body = (latest_review or {}).get("body") or ""
+            body_is_nonterminal = any(
+                marker in review_body.casefold() for marker in markers
+            )
+            if (
+                not latest_review
+                or latest_review.get("state") not in terminal_states
+                or body_is_nonterminal
+            ):
+                errors.append(f"{automation_id}: terminal current-head review is missing")
+
+    if not active_automations:
+        errors.append("no configured review automation has current-head evidence")
 
     for index, thread in enumerate(thread_list, start=1):
         comments = thread.get("comments", [])
@@ -164,7 +204,7 @@ def review_evidence_errors(
             comment_index
             for comment_index, comment in enumerate(comments)
             if any(
-                comment.get("author", {}).get("login") in set(item["actors"])
+                (comment.get("author") or {}).get("login") in set(item["actors"])
                 for item in automation_list
             )
         ]
@@ -174,7 +214,7 @@ def review_evidence_errors(
             first_automation = min(automation_indexes)
             replied = any(
                 comment_index > first_automation
-                and comment.get("author", {}).get("login") in maintainer_logins
+                and (comment.get("author") or {}).get("login") in maintainer_logins
                 for comment_index, comment in enumerate(comments)
             )
             if not replied:
