@@ -447,7 +447,16 @@ jobs:
           >> "%BOOTSTRAP_PATH%\fpc.cmd" echo set "UNIT_ARGS="
           >> "%BOOTSTRAP_PATH%\fpc.cmd" echo if defined LWPT_FPC_UNIT_PATHS for %%%%D in ("!LWPT_FPC_UNIT_PATHS:;=" "!") do set "UNIT_ARGS=!UNIT_ARGS! -Fu%%%%~D"
           >> "%BOOTSTRAP_PATH%\fpc.cmd" echo "%LWPT_FPC%" !UNIT_ARGS! %%*
-          set "PATH=%BOOTSTRAP_PATH%;%PATH%"
+          rem Keep this fallback smoke isolated from the native FPC bin that
+          rem the install step publishes for the later direct-command tests.
+          set "PATH=%BOOTSTRAP_PATH%;%SystemRoot%\system32;%SystemRoot%;%SystemRoot%\System32\Wbem"
+          where instantfpc >nul 2>nul
+          if not errorlevel 1 (
+            echo bootstrap fallback smoke unexpectedly resolved instantfpc 1>&2
+            exit /b 1
+          )
+          where fpc
+          if errorlevel 1 exit /b %errorlevel%
           call bootstrap.bat
           if errorlevel 1 exit /b %errorlevel%
           build\lwpt.exe --help
