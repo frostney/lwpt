@@ -1154,8 +1154,8 @@ begin
   if (ExtractFileDrive(Resolved) = '') or not FileExists(Resolved) then
     Fail('bare instantfpc did not resolve to an existing absolute executable; '
       + 'resolved="' + Resolved + '"; LWPT_INSTANTFPC="'
-      + GetEnvironmentVariable('LWPT_INSTANTFPC') + '"; PATH="'
-      + GetEnvironmentVariable('PATH') + '"');
+      + SysUtils.GetEnvironmentVariable('LWPT_INSTANTFPC') + '"; PATH="'
+      + SysUtils.GetEnvironmentVariable('PATH') + '"');
   Expect<Boolean>(FileExists(Resolved)).ToBe(True);
   {$ELSE}
   Expect<Boolean>(True).ToBe(True);
