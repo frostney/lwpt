@@ -50,6 +50,43 @@ type
     procedure TestRunTaskRejectsInvocationArguments;
   end;
 
+const
+  FileAgeOrderingTimeoutMilliseconds = 10000;
+
+procedure WriteUntilFileAgeAfter(const APath, AContent: string;
+  const AOlderPaths: array of string);
+var
+  CandidateAge, OlderAge: LongInt;
+  Deadline: QWord;
+  i: Integer;
+  Ordered: Boolean;
+  BlockingPath: string;
+begin
+  Deadline := GetTickCount64 + FileAgeOrderingTimeoutMilliseconds;
+  repeat
+    WriteTextFile(APath, AContent);
+    CandidateAge := FileAge(APath);
+    Ordered := CandidateAge >= 0;
+    BlockingPath := '';
+    OlderAge := -1;
+    for i := Low(AOlderPaths) to High(AOlderPaths) do
+    begin
+      OlderAge := FileAge(AOlderPaths[i]);
+      if (OlderAge < 0) or (CandidateAge <= OlderAge) then
+      begin
+        Ordered := False;
+        BlockingPath := AOlderPaths[i];
+        Break;
+      end;
+    end;
+    if Ordered then Exit;
+    Sleep(100);
+  until GetTickCount64 >= Deadline;
+  raise Exception.CreateFmt(
+    'timed out establishing file-age order: %s (%d) after %s (%d)',
+    [APath, CandidateAge, BlockingPath, OlderAge]);
+end;
+
 procedure TRunE2E.SetupScratchProject;
 begin
   ForceDirectories(FScratch + '/scripts');
@@ -210,15 +247,16 @@ begin
   R := RunLwpt(['run', 'fresh'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(FScratch + '/fresh-marker.txt')).ToBe(True);
-  WriteTextFile(FScratch + '/fresh-marker.txt', 'fresh-preserved');
+  WriteUntilFileAgeAfter(FScratch + '/fresh-marker.txt', 'fresh-preserved',
+    [FScratch + '/scripts/fresh.pas', FScratch + '/scripts/hello.pas']);
   R := RunLwpt(['run', 'fresh'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<string>(Trim(ReadBinaryFile(FScratch + '/fresh-marker.txt')))
     .ToBe('fresh-preserved');
 
-  Sleep(1100);
-  WriteTextFile(FScratch + '/scripts/fresh.pas',
-    ReadBinaryFile(FScratch + '/scripts/fresh.pas') + #10);
+  WriteUntilFileAgeAfter(FScratch + '/scripts/fresh.pas',
+    ReadBinaryFile(FScratch + '/scripts/fresh.pas') + #10,
+    [FScratch + '/fresh-marker.txt']);
   R := RunLwpt(['run', 'fresh'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<string>(Trim(ReadBinaryFile(FScratch + '/fresh-marker.txt')))
