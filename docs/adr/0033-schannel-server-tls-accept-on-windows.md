@@ -210,10 +210,11 @@ SChannel reports TLS 1.3 post-handshake messages through
 the complete `SECBUFFER_EXTRA` span modified by `DecryptMessage` back through
 `AcceptSecurityContext` as `SECBUFFER_TOKEN` only for TLS 1.3. If SChannel
 does not return `SECBUFFER_EXTRA`, the same modified input buffer is replayed
-as Microsoft requires. The handshake call preserves any following ciphertext,
-and any response token uses the same bounded output path. A TLS 1.2
-renegotiation attempt remains fatal, preserving ADR-0024's no-renegotiation
-contract.
+as Microsoft requires. The backend isolates the first TLS record before the
+handshake call and retains coalesced following ciphertext separately, so SSPI
+cannot consume application records as part of the post-handshake token. Any
+response token uses the same bounded output path. A TLS 1.2 renegotiation
+attempt remains fatal, preserving ADR-0024's no-renegotiation contract.
 
 ## Consequences
 

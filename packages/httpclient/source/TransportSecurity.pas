@@ -3489,6 +3489,7 @@ type
     OutputOffset: Integer;
     PeerClosed: Boolean;
     PostHandshakeInProgress: Boolean;
+    PostHandshakeTail: TBytes;
     PendingPlaintext: TBytes;
     PendingPlaintextOffset: Integer;
     Plaintext: TBytes;
@@ -4444,7 +4445,8 @@ var
 begin
   if not Assigned(AData) then
     Exit;
-  Buffered := Length(AData.EncryptedInput);
+  Buffered := Length(AData.EncryptedInput) +
+    Length(AData.PostHandshakeTail);
   if Buffered > AData.InputHighWatermark then
     Buffered := AData.InputHighWatermark;
   AData.InputBuffered := Buffered;
@@ -4454,6 +4456,33 @@ begin
   else
     AData.InputBackpressured := AData.InputBuffered >=
       AData.InputHighWatermark;
+end;
+
+function SChannelTlsRecordLength(const ABuffer: TBytes): Integer;
+begin
+  Result := 0;
+  if Length(ABuffer) < 5 then
+    Exit;
+  Result := 5 + (Integer(ABuffer[3]) shl 8) + Integer(ABuffer[4]);
+  if Result > Length(ABuffer) then
+    Result := 0;
+end;
+
+procedure RestoreSChannelServerPostHandshakeTail(
+  const AData: TSChannelServerData);
+var
+  ExistingLength: Integer;
+  TailLength: Integer;
+begin
+  TailLength := Length(AData.PostHandshakeTail);
+  if TailLength <= 0 then
+    Exit;
+  ExistingLength := Length(AData.EncryptedInput);
+  SetLength(AData.EncryptedInput, ExistingLength + TailLength);
+  Move(AData.PostHandshakeTail[0], AData.EncryptedInput[ExistingLength],
+    TailLength);
+  SetLength(AData.PostHandshakeTail, 0);
+  RefreshSChannelServerInputFlow(AData);
 end;
 
 function SChannelServerRequestFlags: LongWord;
@@ -4528,8 +4557,18 @@ begin
   end;
 
   ExistingLength := Length(Data.EncryptedInput);
-  SetLength(Data.EncryptedInput, ExistingLength + AcceptedLength);
-  Move(ABuffer^, Data.EncryptedInput[ExistingLength], AcceptedLength);
+  if Data.PostHandshakeInProgress and
+     (Length(Data.PostHandshakeTail) > 0) then
+  begin
+    ExistingLength := Length(Data.PostHandshakeTail);
+    SetLength(Data.PostHandshakeTail, ExistingLength + AcceptedLength);
+    Move(ABuffer^, Data.PostHandshakeTail[ExistingLength], AcceptedLength);
+  end
+  else
+  begin
+    SetLength(Data.EncryptedInput, ExistingLength + AcceptedLength);
+    Move(ABuffer^, Data.EncryptedInput[ExistingLength], AcceptedLength);
+  end;
   Inc(Data.InputAccepted, QWord(AcceptedLength));
   Result := AcceptedLength;
   RefreshSChannelServerInputFlow(Data);
@@ -4565,7 +4604,11 @@ begin
   end;
   if Data.HandshakeDone then
   begin
-    Data.PostHandshakeInProgress := False;
+    if Data.PostHandshakeInProgress then
+    begin
+      RestoreSChannelServerPostHandshakeTail(Data);
+      Data.PostHandshakeInProgress := False;
+    end;
     Result := tssDone;
     Exit;
   end;
@@ -4656,6 +4699,11 @@ begin
       Data.Protocol := ConnectionInfo.dwProtocol;
       Data.HandshakeDone := True;
       AConnection.Active := True;
+      if Data.PostHandshakeInProgress then
+      begin
+        RestoreSChannelServerPostHandshakeTail(Data);
+        Data.PostHandshakeInProgress := False;
+      end;
       if (SChannelServerPendingCiphertext(Data) > 0) or
          (SChannelServerStagedBytes(Data) > 0) then
         Result := tssWantWrite
@@ -4694,6 +4742,7 @@ var
   QualityOfProtection: LongWord;
   ReadLength: Integer;
   Status: SECURITY_STATUS;
+  TokenLength: Integer;
 begin
   Result.State := tssError;
   Result.BytesProcessed := 0;
@@ -4802,9 +4851,19 @@ begin
       if Length(ExtraInput) = 0 then
         ExtraInput := Copy(Data.EncryptedInput, 0,
           Length(Data.EncryptedInput));
-      Data.EncryptedInput := ExtraInput;
+      TokenLength := SChannelTlsRecordLength(ExtraInput);
+      if TokenLength <= 0 then
+      begin
+        PoisonSChannelServerConnection(AConnection);
+        Result.State := tssError;
+        Exit;
+      end;
+      Data.PostHandshakeTail := Copy(ExtraInput, TokenLength,
+        Length(ExtraInput) - TokenLength);
+      Data.EncryptedInput := Copy(ExtraInput, 0, TokenLength);
       Data.HandshakeDone := False;
       Data.PostHandshakeInProgress := True;
+      RefreshSChannelServerInputFlow(Data);
       HandshakeState := HandshakeSChannelServer(AConnection);
       if HandshakeState <> tssDone then
       begin
@@ -4933,18 +4992,6 @@ begin
       Result.State := tssError;
       Exit;
     end;
-    if Data.PendingPlaintextOffset =
-       Integer(Data.StreamSizes.cbMaximumMessage) then
-      raise ETransportSecurityError.CreateFmt(
-        'Second TLS record buffers: stream=%d/%d/%d chunk=%d pending=%d ' +
-        'base=%p 0=%d/%d/%p 1=%d/%d/%p 2=%d/%d/%p',
-        [Data.StreamSizes.cbHeader, Data.StreamSizes.cbMaximumMessage,
-         Data.StreamSizes.cbTrailer, ChunkLength,
-         Data.PendingPlaintext[Data.PendingPlaintextOffset],
-         @Data.RecordBuffer[0],
-         Buffers[0].BufferType, Buffers[0].cbBuffer, Buffers[0].pvBuffer,
-         Buffers[1].BufferType, Buffers[1].cbBuffer, Buffers[1].pvBuffer,
-         Buffers[2].BufferType, Buffers[2].cbBuffer, Buffers[2].pvBuffer]);
     MessageLength := Integer(Buffers[0].cbBuffer) +
       Integer(Buffers[1].cbBuffer) + Integer(Buffers[2].cbBuffer);
     SetLength(Data.RecordBuffer, MessageLength);

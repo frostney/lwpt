@@ -928,6 +928,8 @@ type
     Outgoing: TBytes;
     PeerClosed: Boolean;
     Plaintext: TBytes;
+    PostHandshakeInProgress: Boolean;
+    PostHandshakeTail: TBytes;
     StreamSizes: TSecPkgContextStreamSizes;
   end;
 
@@ -1163,7 +1165,34 @@ begin
   SetLength(AClient.Incoming, 0);
   SetLength(AClient.Outgoing, 0);
   SetLength(AClient.Plaintext, 0);
+  SetLength(AClient.PostHandshakeTail, 0);
   FillChar(AClient, SizeOf(AClient), 0);
+end;
+
+function TestTlsRecordLength(const ABuffer: TBytes): Integer;
+begin
+  Result := 0;
+  if Length(ABuffer) < 5 then
+    Exit;
+  Result := 5 + (Integer(ABuffer[3]) shl 8) + Integer(ABuffer[4]);
+  if Result > Length(ABuffer) then
+    Result := 0;
+end;
+
+procedure RestoreSChannelClientPostHandshakeTail(
+  var AClient: TSChannelTestClient);
+var
+  ExistingLength: Integer;
+  TailLength: Integer;
+begin
+  TailLength := Length(AClient.PostHandshakeTail);
+  if TailLength <= 0 then
+    Exit;
+  ExistingLength := Length(AClient.Incoming);
+  SetLength(AClient.Incoming, ExistingLength + TailLength);
+  Move(AClient.PostHandshakeTail[0], AClient.Incoming[ExistingLength],
+    TailLength);
+  SetLength(AClient.PostHandshakeTail, 0);
 end;
 
 function StepSChannelClientHandshake(
@@ -1258,6 +1287,11 @@ begin
       @AClient.StreamSizes) <> SEC_E_OK then
       raise Exception.Create('Raw SChannel client stream sizes unavailable');
     AClient.Done := True;
+    if AClient.PostHandshakeInProgress then
+    begin
+      RestoreSChannelClientPostHandshakeTail(AClient);
+      AClient.PostHandshakeInProgress := False;
+    end;
     Result := tssDone;
     Exit;
   end;
@@ -1443,9 +1477,16 @@ var
   I: Integer;
   QualityOfProtection: LongWord;
   Status: SECURITY_STATUS;
+  TokenLength: Integer;
 begin
   SetLength(ABuffer, 0);
   repeat
+    if AClient.PostHandshakeInProgress then
+    begin
+      Result := StepSChannelClientHandshake(AClient);
+      if Result <> tssDone then
+        Exit;
+    end;
     if Length(AClient.Plaintext) > 0 then
     begin
       ABuffer := AClient.Plaintext;
@@ -1498,7 +1539,16 @@ begin
             Buffers[I].cbBuffer);
       if Length(ExtraInput) = 0 then
         ExtraInput := Copy(AClient.Incoming, 0, Length(AClient.Incoming));
-      AClient.Incoming := ExtraInput;
+      TokenLength := TestTlsRecordLength(ExtraInput);
+      if TokenLength <= 0 then
+      begin
+        Result := tssError;
+        Exit;
+      end;
+      AClient.PostHandshakeTail := Copy(ExtraInput, TokenLength,
+        Length(ExtraInput) - TokenLength);
+      AClient.Incoming := Copy(ExtraInput, 0, TokenLength);
+      AClient.PostHandshakeInProgress := True;
       AClient.Done := False;
       Result := StepSChannelClientHandshake(AClient);
       if Result <> tssDone then
