@@ -246,7 +246,7 @@ class GitHub:
           repository(owner: $owner, name: $name) {
             pullRequest(number: $number) {
               reviews(first: 100) {
-                nodes { author { login } state commit { oid } submittedAt }
+                nodes { author { login } state commit { oid } body submittedAt }
                 pageInfo { hasNextPage }
               }
               reviewThreads(first: 100) {

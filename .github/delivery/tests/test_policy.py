@@ -64,6 +64,17 @@ class RepositoryPolicyTests(unittest.TestCase):
             status_rule["parameters"]["required_status_checks"],
         )
 
+    def test_live_review_adapter_matches_macroscope_check_only_success(self) -> None:
+        config = json.loads(
+            (ROOT / ".github/delivery/review-automations.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("macroscope", config["automations"][0]["id"])
+        self.assertEqual(
+            [], config["automations"][0]["terminal_review_states"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

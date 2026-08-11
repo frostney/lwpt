@@ -13,8 +13,10 @@ prefix drift. Exact-head `delivery-admission` proves the PR matrix. Conditional
 native-prefix top. `merge:ready` remains the machine-validated final state and
 is not duplicated by another merge-admission check. This decision was
 investigated in [issues #159](https://github.com/frostney/lwpt/issues/159) and
-[#160](https://github.com/frostney/lwpt/issues/160). Progressive diagnostic and
-terminal-promotion behavior was completed in
+[#160](https://github.com/frostney/lwpt/issues/160). The provider-neutral
+review adapter was completed in
+[issue #188](https://github.com/frostney/lwpt/issues/188); progressive diagnostic
+and terminal-promotion behavior was completed in
 [issue #187](https://github.com/frostney/lwpt/issues/187).
 
 ## Considered options
@@ -42,5 +44,8 @@ terminal-promotion behavior was completed in
   failures.
 - Ordinary PR CI stays automatic and is aggregated into the same app-owned
   `delivery-admission` required check.
+- Review automations are configured adapters. At least one must emit
+  current-head evidence, every active adapter must reach its configured
+  terminal state, and inactive configured adapters do not block delivery.
 - Main still runs integrated full CI after merge because squash and prefix
   integration rewrite SHAs; rapid main pushes coalesce to the latest commit.

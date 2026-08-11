@@ -87,12 +87,21 @@ accept a shell command or fork, uses a `diagnostic/...` run identity, and never
 creates or satisfies a `full-ci` proof. A later diagnostic for the same PR
 cancels the prior run.
 
-The `review` operation opens the configured provider lane after PR admission.
-Before `merge`, the controller requires a terminal provider review on the
-current head, a successful provider check, no unresolved thread, and a reply
-from an account with current maintain or admin permission on every automation
-thread. Provider identities are data in
-`.github/delivery/review-automations.json`; retry and quota policy are not.
+The `review` operation opens the repository's review lane after PR admission.
+The controller discovers active review automations from configured check names
+and current-head review actors. At least one configured automation must emit
+current-head evidence. Every automation that does is active and must reach its
+configured terminal check conclusion and review state; configured but inactive
+adapters do not block. Before `merge`, the controller also requires no
+unresolved thread and a reply from an account with current maintain or admin
+permission on every automation thread. Provider identities and terminal states
+are data in `.github/delivery/review-automations.json`; controller logic does
+not name vendors, and retry and quota policy remain external.
+An adapter may bind one or more check names to trusted GitHub App slugs, accept
+provider-specific terminal check conclusions, require or omit a terminal review
+event, and list review-body markers that mean "not terminal". Those fields are
+enough to replace a hosted reviewer or add a check-only custom reviewer without
+changing controller code.
 `merge:ready` records that point-in-time acceptance, so the coordinator invokes
 the idempotent `merge` operation immediately before a singleton merge. For a
 native prefix it preflights each `delivery:managed` member against the same
