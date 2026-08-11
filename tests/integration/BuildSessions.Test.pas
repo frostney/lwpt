@@ -308,8 +308,14 @@ begin
   Run := RunLwptWithWorkerEnv(['build'], Project, []);
   DumpRunFailure('deep default session root', Run, 1);
   Expect<Integer>(Run.ExitCode).ToBe(1);
+  {$IFNDEF MSWINDOWS}
+  { Windows can hit its own directory-path ceiling while constructing the
+    default session before LWPT reaches the FPC file-buffer guard. The
+    non-zero default and both successful relocation paths remain portable;
+    Unix pins the specific compiler-budget diagnostic reproduced in #96. }
   Expect<Boolean>(Pos('compiler staging path is too long', Run.Stderr) > 0)
     .ToBe(True);
+  {$ENDIF}
 
   WriteTextFile(Project + '/lwpt.toml',
       '[package]'#10
