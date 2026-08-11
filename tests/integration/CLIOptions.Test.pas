@@ -35,6 +35,7 @@ uses
   Classes,
   SysUtils,
 
+  Platform,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -78,6 +79,7 @@ type
     procedure TestInvalidTestSelectorsFailBeforePretest;
     procedure TestInventorySkipsHooksAndTestBodies;
     procedure TestCommittedInventoryMismatchFailsActionably;
+    procedure TestEmptyDiscoveryRejectsStaleInventory;
   end;
 
 function CompletionPrefix(const ACommand, AStatus: string): string;
@@ -752,7 +754,7 @@ begin
   ForceDirectories(FScratch + '/tests');
   WriteTextFile(FScratch + '/tests/test-inventory.tsv',
     'lwpt-test-inventory-v1'#10 +
-    'platform'#9'darwin/aarch64'#10 +
+    'platform'#9 + Platform.GetBuildOS + '/' + Platform.GetBuildArch + #10 +
     'program'#9'*'#9'unit'#9'source/Inventory.Test.pas'#9'1'#9'2'#10);
   try
     R := RunLwpt(['test', 'source/Inventory.Test.pas', '--jobs=1'], FScratch);
@@ -763,6 +765,29 @@ begin
   finally
     DeleteFile(FScratch + '/tests/test-inventory.tsv');
   end;
+end;
+
+procedure TCLIOptionsE2E.TestEmptyDiscoveryRejectsStaleInventory;
+var
+  ProjectPath: string;
+  R: TLwptResult;
+begin
+  ProjectPath := FScratch + '/empty-inventory-project';
+  ForceDirectories(ProjectPath + '/tests');
+  WriteTextFile(ProjectPath + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "empty-inventory"'#10 +
+    'version = "0.0.0"'#10 +
+    'units = ["source"]'#10);
+  ForceDirectories(ProjectPath + '/source');
+  WriteTextFile(ProjectPath + '/tests/test-inventory.tsv',
+    'lwpt-test-inventory-v1'#10 +
+    'platform'#9 + Platform.GetBuildOS + '/' + Platform.GetBuildArch + #10 +
+    'program'#9'*'#9'unit'#9'source/Gone.Test.pas'#9'1'#9'1'#10);
+  R := RunLwpt(['test', '--jobs=1'], ProjectPath);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('is not a discovered test program', R.Stderr) > 0)
+    .ToBe(True);
 end;
 
 procedure TCLIOptionsE2E.SetupTests;
@@ -825,6 +850,8 @@ begin
     TestInventorySkipsHooksAndTestBodies);
   Test('committed inventory mismatches fail with expected and actual counts',
     TestCommittedInventoryMismatchFailsActionably);
+  Test('empty discovery rejects a stale committed inventory',
+    TestEmptyDiscoveryRejectsStaleInventory);
 end;
 
 begin

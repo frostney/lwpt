@@ -192,7 +192,9 @@ installs are not supported.
   executable-bound registration record consumed by `LWPT.TestInventory`;
   ordinary bodies and inventory-only enumeration therefore share one runtime
   registration source without allowing nested test subprocesses to impersonate
-  their parent program. See [`testing.md`](./testing.md).
+  their parent program. See
+  [ADR-0035](./adr/0035-runtime-test-registration-inventory.md) and
+  [`testing.md`](./testing.md).
 - **Worker coordination:** `LWPT.WorkerBudget` owns the per-user machine-capacity seam. Invocations register owner-guarded requests and acquire FIFO, reclaimable leases under a short cross-platform transaction lock. Nested LWPT subprocesses consume a one-shot opaque delegation that transfers one grant to the child's own guarded request instead of consuming another slot. `lwpt repair` reclaims requests only when their OS-held owner guard is absent; stale heartbeats remain diagnostic. Build and test scheduling consume this module in their own workstreams.
 
 ## Output and observability boundary

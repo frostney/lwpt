@@ -45,6 +45,8 @@ type
     destructor Destroy; override;
     function Resolve(const APath, AOS, AArchitecture: string;
       out ATier: string; out ASuites, ACases: Integer): Boolean;
+    procedure ValidatePlatform(const AOS, AArchitecture: string);
+    procedure ValidateEmptyDiscovery;
     function ContainsPath(const APath: string): Boolean;
     procedure Paths(const APaths: TStrings);
     procedure ValidateDocumentation(const APath: string);
@@ -186,6 +188,33 @@ begin
         ACases := FEntries[i].Cases;
       end;
     end;
+end;
+
+procedure TLWPTTestInventory.ValidatePlatform(const AOS,
+  AArchitecture: string);
+var
+  Platform: string;
+begin
+  Platform := LowerCase(AOS + '/' + AArchitecture);
+  if FPlatforms.IndexOf(Platform) < 0 then
+    raise ELWPTTestInventoryError.CreateFmt(
+      'test inventory does not declare the running platform %s', [Platform]);
+end;
+
+procedure TLWPTTestInventory.ValidateEmptyDiscovery;
+var
+  Paths: TStringList;
+begin
+  Paths := TStringList.Create;
+  try
+    Self.Paths(Paths);
+    if Paths.Count <> 0 then
+      raise ELWPTTestInventoryError.CreateFmt(
+        'test inventory is stale: "%s" is not a discovered test program',
+        [Paths[0]]);
+  finally
+    Paths.Free;
+  end;
 end;
 
 function TLWPTTestInventory.ContainsPath(const APath: string): Boolean;
@@ -429,6 +458,7 @@ var
   StartPos, EndPos: Integer;
 begin
   Result := '';
+  if (TrimLeft(ALine) = '') or (TrimLeft(ALine)[1] <> '|') then Exit;
   StartPos := Pos('`', ALine);
   if StartPos = 0 then Exit;
   EndPos := PosEx('`', ALine, StartPos + 1);
@@ -440,20 +470,39 @@ end;
 function TLWPTTestInventoryDocumentation(const AInventory: TLWPTTestInventory;
   const APath: string): string;
 var
-  Lines: TStringList;
+  InventoryPaths, Lines, SeenPaths: TStringList;
   Block, DocPath: string;
   BeginIndex, EndIndex, i: Integer;
 begin
+  InventoryPaths := TStringList.Create;
   Lines := TStringList.Create;
+  SeenPaths := TStringList.Create;
   try
+    InventoryPaths.CaseSensitive := True;
+    SeenPaths.CaseSensitive := True;
+    AInventory.Paths(InventoryPaths);
     Lines.LoadFromFile(APath);
     for i := 0 to Lines.Count - 1 do
     begin
       DocPath := ExtractInventoryDocPath(Lines[i]);
       if (DocPath <> '') and AInventory.ContainsPath(DocPath) then
+      begin
+        if SeenPaths.IndexOf(DocPath) >= 0 then
+          raise ELWPTTestInventoryError.CreateFmt(
+            'test inventory documentation repeats "%s" in "%s"; run '
+            + 'instantfpc -Fu./source -Fi./source '
+            + 'scripts/update-test-inventory.pas', [DocPath, APath]);
+        SeenPaths.Add(DocPath);
         Lines[i] := ReplaceCountCell(Lines[i],
           AInventory.CountDisplayForPath(DocPath));
+      end;
     end;
+    for i := 0 to InventoryPaths.Count - 1 do
+      if SeenPaths.IndexOf(InventoryPaths[i]) < 0 then
+        raise ELWPTTestInventoryError.CreateFmt(
+          'test inventory documentation is missing "%s" in "%s"; run '
+          + 'instantfpc -Fu./source -Fi./source '
+          + 'scripts/update-test-inventory.pas', [InventoryPaths[i], APath]);
     BeginIndex := Lines.IndexOf(TEST_INVENTORY_DOC_BEGIN);
     EndIndex := Lines.IndexOf(TEST_INVENTORY_DOC_END);
     if (BeginIndex < 0) or (EndIndex < BeginIndex) then
@@ -475,7 +524,9 @@ begin
       end;
     Result := Lines.Text;
   finally
+    SeenPaths.Free;
     Lines.Free;
+    InventoryPaths.Free;
   end;
 end;
 
@@ -490,7 +541,8 @@ begin
     Expected.Text := TLWPTTestInventoryDocumentation(Self, APath);
     if Actual.Text <> Expected.Text then
       raise ELWPTTestInventoryError.CreateFmt(
-        'test inventory documentation is stale: run scripts/update-test-inventory.pas',
+        'test inventory documentation is stale: run instantfpc -Fu./source '
+        + '-Fi./source scripts/update-test-inventory.pas',
         []);
   finally
     Expected.Free;

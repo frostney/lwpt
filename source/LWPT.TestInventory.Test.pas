@@ -7,6 +7,7 @@ uses
   SysUtils,
 
   LWPT.TestInventory,
+  Platform,
   TestingPascalLibrary;
 
 type
@@ -19,12 +20,60 @@ type
     procedure TestPlatformRulesResolveBySpecificity;
     procedure TestAmbiguousRulesFailClosed;
     procedure TestStaleDocumentationFailsWithUpdateCommand;
+    procedure TestRunningPlatformIsDeclared;
+    procedure TestMissingDocumentationRowFails;
   end;
 
 function TTestInventoryTests.TemporaryPath(const AName: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(GetTempDir(False))
     + 'lwpt-test-inventory-' + IntToHex(GetTickCount64, 16) + '-' + AName;
+end;
+
+procedure TTestInventoryTests.TestRunningPlatformIsDeclared;
+var
+  Inventory: TLWPTTestInventory;
+begin
+  Inventory := TLWPTTestInventory.Create(TEST_INVENTORY_PATH);
+  try
+    Inventory.ValidatePlatform(Platform.GetBuildOS, Platform.GetBuildArch);
+    Expect<Boolean>(True).ToBe(True);
+  finally
+    Inventory.Free;
+  end;
+end;
+
+procedure TTestInventoryTests.TestMissingDocumentationRowFails;
+var
+  Failed: Boolean;
+  Inventory: TLWPTTestInventory;
+  Lines: TStringList;
+  Path: string;
+begin
+  Path := TemporaryPath('missing-row.md');
+  Lines := TStringList.Create;
+  try
+    Lines.Add(TEST_INVENTORY_DOC_BEGIN);
+    Lines.Add('stale');
+    Lines.Add(TEST_INVENTORY_DOC_END);
+    Lines.SaveToFile(Path);
+  finally
+    Lines.Free;
+  end;
+  Inventory := TLWPTTestInventory.Create(TEST_INVENTORY_PATH);
+  try
+    Failed := False;
+    try
+      Inventory.WriteDocumentation(Path);
+    except
+      on E: ELWPTTestInventoryError do
+        Failed := Pos('documentation is missing', E.Message) > 0;
+    end;
+    Expect<Boolean>(Failed).ToBe(True);
+  finally
+    Inventory.Free;
+    DeleteFile(Path);
+  end;
 end;
 
 procedure TTestInventoryTests.TestCanonicalDocumentationIsCurrent;
@@ -145,6 +194,9 @@ begin
     TestCanonicalDocumentationIsCurrent);
   Test('stale documentation names the update command',
     TestStaleDocumentationFailsWithUpdateCommand);
+  Test('the running platform is declared', TestRunningPlatformIsDeclared);
+  Test('documentation requires one row per inventory path',
+    TestMissingDocumentationRowFails);
 end;
 
 begin

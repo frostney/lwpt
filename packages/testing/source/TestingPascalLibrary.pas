@@ -335,12 +335,14 @@ end;
 
 procedure TTestRunner.Run;
 var
+  InventoryMode: string;
   Suite: TTestSuite;
   Test: TTestRegistration;
   TestResult: TTestResult;
 begin
-  if CurrentTestInventoryMode <> '' then WriteLn(InventoryLine);
-  if CurrentTestInventoryMode = TEST_INVENTORY_MODE_ONLY then Halt(0);
+  InventoryMode := ConsumeCurrentTestInventoryMode;
+  if InventoryMode <> '' then WriteLn(InventoryLine);
+  if InventoryMode = TEST_INVENTORY_MODE_ONLY then Halt(0);
 
   WriteLn;
   WriteLn('Running tests...');

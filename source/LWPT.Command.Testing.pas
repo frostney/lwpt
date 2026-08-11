@@ -1177,6 +1177,7 @@ begin
   if FExpectedInventory = nil then Exit;
   OSName := Platform.GetBuildOS;
   Architecture := Platform.GetBuildArch;
+  FExpectedInventory.ValidatePlatform(OSName, Architecture);
   ExpectedPaths := TStringList.Create;
   SeenPaths := TStringList.Create;
   try
@@ -1269,6 +1270,7 @@ var
     EffectiveBail: Integer;
   Session: TLWPTBuildSession;
   Scheduler: TTestScheduler;
+  ExpectedInventory: TLWPTTestInventory;
   CompilerSelection: TLWPTCompilerSelection;
   CompilerDriver: TLWPTCompilerDriver;
   TestTarget: TLWPTTarget;
@@ -1355,6 +1357,17 @@ begin
 
       if Tests.Count = 0 then
       begin
+        if InventoryPath <> '' then
+        begin
+          ExpectedInventory := TLWPTTestInventory.Create(InventoryPath);
+          try
+            ExpectedInventory.ValidatePlatform(Platform.GetBuildOS,
+              Platform.GetBuildArch);
+            ExpectedInventory.ValidateEmptyDiscovery;
+          finally
+            ExpectedInventory.Free;
+          end;
+        end;
         if AInventory then
           WriteLn('{"schema":"' + PROGRAM_NAME
             + '.test-inventory","version":1,"platform":{"os":'
