@@ -40,9 +40,27 @@ type
     procedure TestAddsAFakeAssertion;
   end;
 
+  { Deliberately failing suite: pins Run's fail-the-process default
+    (a failing suite sets ExitCode without per-program boilerplate). }
+  TFailingCanarySuite = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestDeliberateFailure;
+  end;
+
 procedure TCanarySuite.SetupTests;
 begin
   Test('canary always assigns FHasAssertions', TestAddsAFakeAssertion);
+end;
+
+procedure TFailingCanarySuite.SetupTests;
+begin
+  Test('deliberately failing assertion', TestDeliberateFailure);
+end;
+
+procedure TFailingCanarySuite.TestDeliberateFailure;
+begin
+  Expect<Boolean>(True).ToBe(False);
 end;
 
 procedure TCanarySuite.TestAddsAFakeAssertion;
@@ -110,6 +128,40 @@ begin
         'FATAL: expected 1 pass / 0 fail; got %d pass / %d fail',
         [Passed, Failed]));
       Halt(14);
+    end;
+
+    { A fully passing run must leave the process exit code alone. }
+    if ExitCode <> 0 then
+    begin
+      WriteLn(ErrOutput, Format(
+        'FATAL: passing Run set ExitCode to %d', [ExitCode]));
+      Halt(15);
+    end;
+  finally
+    Runner.Free;
+  end;
+
+  { Fail-the-process default: a failing suite run through a fresh
+    throwaway runner must set ExitCode = 1 on its own — this is the
+    contract lwpt test gates on, with no per-program boilerplate. }
+  Runner := TTestRunner.Create;
+  try
+    Runner.AddSuite(TFailingCanarySuite.Create('failing canary'));
+    try
+      Runner.Run;
+    except
+      on E: Exception do
+      begin
+        WriteLn(ErrOutput, 'FATAL: failing-suite Run raised: ', E.Message);
+        Halt(16);
+      end;
+    end;
+
+    if ExitCode <> 1 then
+    begin
+      WriteLn(ErrOutput, Format(
+        'FATAL: failing Run left ExitCode at %d, expected 1', [ExitCode]));
+      Halt(17);
     end;
   finally
     Runner.Free;
