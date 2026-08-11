@@ -391,7 +391,7 @@ jobs:
           fi
           ls -la build/
 
-      - name: Check Windows TLS linkage (native client, runtime-loaded server)
+      - name: Check Windows TLS linkage (native SChannel, no OpenSSL)
         run: |
           set -euo pipefail
           # The checker is a HOST InstantFPC program that only reads the
@@ -474,9 +474,10 @@ jobs:
             echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
           fi
           FPC_UNIT_PATHS=""
-          # fcl-json: InstallScript.E2E.Test uses fpjson. openssl (+ its
-          # historical fcl-net home): TransportSecurity and its co-located test
-          # `uses OpenSSL`.
+          # fcl-json: InstallScript.E2E.Test uses fpjson. fcl-net stays for
+          # its RTL consumers. openssl is retained only so a future unit that
+          # needs it still resolves: per ADR-0033 no Windows source `uses
+          # OpenSSL` any more — both TLS directions are native SChannel.
           for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process fcl-net fcl-json openssl paszlib hash; do
             UNIT_PATH=""
             for unit_target in i386-win32 x86_64-win64; do

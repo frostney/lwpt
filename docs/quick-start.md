@@ -6,7 +6,7 @@ The top-to-bottom walkthrough for getting from `git clone` to passing tests on a
 
 - **Bootstrap is one command, run once.** `./bootstrap.sh` (or `bootstrap.bat` on Windows) produces `build/lwpt` from `source/lwpt.pas`. After that, `./build/lwpt build` is the canonical build entry point.
 - **No `lwpt install` needed after clone.** Per [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) every LWPT project commits `.lwpt/modules/` and `.lwpt/archives/`; `fpc @lwpt.cfg` works without LWPT being involved.
-- **Two prerequisites:** FPC 3.2.2 (with InstantFPC bundled) and Lefthook for pre-commit hooks. TLS is platform-native (SChannel on Windows, SecureTransport on macOS, system OpenSSL on Linux — per [ADR-0016](./adr/0016-tls-backend-per-platform.md)); no DLLs to bundle.
+- **Two prerequisites:** FPC 3.2.2 (with InstantFPC bundled) and Lefthook for pre-commit hooks. TLS is platform-native in both directions on Windows and macOS (SChannel per [ADR-0016](./adr/0016-tls-backend-per-platform.md) and [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md), SecureTransport on macOS, system OpenSSL on Linux); no DLLs to bundle.
 - **A new test is one `.Test.pas` file.** Add `testing` to `[dependencies]` (or rely on workspace auto-discovery in a monorepo), run `lwpt install` once, then write `program <Name>.Test;` files using `TestingPascalLibrary`. `lwpt test` discovers and runs them.
 - **Pre-commit auto-formats.** `lwpt format` and `lwpt agents` run on every commit via Lefthook and re-stage any rewrites (`stage_fixed: true`). The heavyweight gates (`lwpt build`, `lwpt test`, `lwpt format --check`, `lwpt agents --check`) run on the PR workflow in CI. Install the local hook once with `lefthook install`.
 
