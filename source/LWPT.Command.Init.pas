@@ -161,13 +161,14 @@ var
   Stream: TFileStream;
   LastByte: Byte;
 begin
-  SetLength(Wanted, 4 + Length(ABuildDirs));
+  SetLength(Wanted, 5 + Length(ABuildDirs));
   Wanted[0] := GITIGNORE_LINE;
   Wanted[1] := INSTALL_LOCK;
   Wanted[2] := BUILD_SESSIONS_DIR + '/';
   Wanted[3] := WORKER_STATE_FALLBACK_DIR + '/';
+  Wanted[4] := BUILD_SESSION_ROOT_LEDGER;
   for i := 0 to High(ABuildDirs) do
-    Wanted[4 + i] := StringReplace(
+    Wanted[5 + i] := StringReplace(
       IncludeTrailingPathDelimiter(ABuildDirs[i]),
       DirectorySeparator, '/', [rfReplaceAll]);
   Existed := FileExists(APath);

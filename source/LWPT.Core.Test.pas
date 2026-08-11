@@ -1270,6 +1270,7 @@ const
     'modules-dir = "vendor/modules"'#10 +
     'archives-dir = "vendor/archives"'#10 +
     'tmp-dir = ".cache/lwpt-tmp"'#10 +
+    'sessions-dir = "/tmp/lwpt-sessions"'#10 +
     'cfg-file = "fpc.cfg"'#10;
 var Man: TManifest;
 begin
@@ -1277,6 +1278,7 @@ begin
   Expect<string>(Man.ModulesDirOverride).ToBe('vendor/modules');
   Expect<string>(Man.ArchivesDirOverride).ToBe('vendor/archives');
   Expect<string>(Man.TmpDirOverride).ToBe('.cache/lwpt-tmp');
+  Expect<string>(Man.SessionsDirOverride).ToBe('/tmp/lwpt-sessions');
   Expect<string>(Man.CfgFileOverride).ToBe('fpc.cfg');
 end;
 

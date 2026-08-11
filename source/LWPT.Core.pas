@@ -1205,9 +1205,15 @@ procedure AtomicWriteText(const ADst: string;
   const ATmpRoot: string; const AContent: TStringList);
 var Tmp: string;
 begin
-  Tmp := MakeTmpPath(ATmpRoot, 'write-' + ExtractFileName(ADst));
+  { The destination name adds no uniqueness and can push a project-local
+    staging path past Windows' directory-path ceiling in a deep checkout. }
+  Tmp := MakeTmpPath(ATmpRoot, 'write');
   EnsureDstDir(ADst);
   AContent.SaveToFile(Tmp);
+  { The common same-filesystem path is one replacement operation and avoids
+    AtomicMoveFile's recoverable sibling backup, whose longer name can exceed
+    the Windows path ceiling in a deep project. Keep its EXDEV fallback. }
+  if AtomicReplaceFile(Tmp, ADst) then Exit;
   if not AtomicMoveFile(Tmp, ADst) then
   begin
     SysUtils.DeleteFile(Tmp);
@@ -1219,7 +1225,7 @@ end;
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
 var Tmp: string; Stream: TFileStream;
 begin
-  Tmp := MakeTmpPath(ATmpRoot, 'write-' + ExtractFileName(ADst));
+  Tmp := MakeTmpPath(ATmpRoot, 'write');
   EnsureDstDir(ADst);
   Stream := TFileStream.Create(Tmp, fmCreate);
   try
@@ -1227,6 +1233,7 @@ begin
   finally
     Stream.Free;
   end;
+  if AtomicReplaceFile(Tmp, ADst) then Exit;
   if not AtomicMoveFile(Tmp, ADst) then
   begin
     SysUtils.DeleteFile(Tmp);

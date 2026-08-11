@@ -988,7 +988,9 @@ begin
           + 'target is "%s/%s" but host is "%s/%s"',
           [TestTarget.OS, TestTarget.Architecture, Platform.GetBuildOS,
            Platform.GetBuildArch]);
-      Session := TLWPTBuildSession.Create(ProjectRoot);
+      Session := TLWPTBuildSession.Create(ProjectRoot,
+        ResolveBuildSessionsRoot(ProjectRoot, ResolveSessionsDir(Man),
+          GetCurrentDir));
       try
         WriteLn('test session: ', Session.SessionID, ' (',
           Session.SessionReference, ')');

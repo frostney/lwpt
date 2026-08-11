@@ -115,7 +115,8 @@ my-project/
 │   │   └── jhonson/
 │   ├── archives/            # *.tar.gz per dep — COMMITTED (verification)
 │   ├── tmp/                 # install workspace — GITIGNORED
-│   └── sessions/            # private staging; failures retained for repair
+│   ├── sessions/            # default private build-session staging
+│   └── session-roots        # relocated-root ledger — GITIGNORED
 ├── build/                   # FPC output — GITIGNORED
 └── src/
     └── main.pas
@@ -212,6 +213,7 @@ prefix = "APP"   # generates APP_VERSION, APP_BUILD_DATE
 # modules-dir  = ".lwpt/modules"
 # archives-dir = ".lwpt/archives"
 # tmp-dir      = ".lwpt/tmp"
+# sessions-dir = ".lwpt/sessions" # LWPT_SESSION_DIR overrides this
 # cfg-file     = "lwpt.cfg"
 
 [format]

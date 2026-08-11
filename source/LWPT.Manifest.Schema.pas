@@ -86,6 +86,7 @@ type
     msfToolkitModulesDir,
     msfToolkitArchivesDir,
     msfToolkitTmpDir,
+    msfToolkitSessionsDir,
     msfToolkitCfgFile,
     msfFormatInclude,
     msfFormatExclude,
@@ -484,6 +485,10 @@ const
       DefaultValue: 'toolkit default'; Scope: mscAllManifests;
       InvalidPolicy: mipIgnoreAsAbsent; NonEmpty: False;
       Description: 'Private temporary directory override.'),
+    (Name: 'sessions-dir'; ValueKind: mvkString; Requirement: mrOptional;
+      DefaultValue: 'toolkit default'; Scope: mscAllManifests;
+      InvalidPolicy: mipIgnoreAsAbsent; NonEmpty: False;
+      Description: 'Private compiler-session directory override.'),
     (Name: 'cfg-file'; ValueKind: mvkString; Requirement: mrOptional;
       DefaultValue: 'toolkit default'; Scope: mscAllManifests;
       InvalidPolicy: mipIgnoreAsAbsent; NonEmpty: False;
