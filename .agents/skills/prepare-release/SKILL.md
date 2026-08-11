@@ -1,11 +1,11 @@
 ---
 name: prepare-release
 description: >-
-  Prepare LWPT for a release by running the full project and E2E gates,
-  checking the latest cross-platform CI result, auditing architecture drift
-  across source and documentation, previewing the changelog, applying approved
-  truth-sync fixes, and opening a draft preparation PR. Stops before version
-  selection, changelog generation, tagging, or publishing, which belong to
+  Prepare LWPT for a release by reusing exact-main cross-platform CI, running
+  release-specific checks, auditing architecture drift across source and
+  documentation, previewing the changelog, applying approved truth-sync fixes,
+  and opening a draft preparation PR. Stops before version selection,
+  changelog generation, tagging, or publishing, which belong to
   /create-release. Use when the user runs /prepare-release or asks to prepare
   LWPT for a release.
 ---
@@ -23,9 +23,10 @@ than weakening or duplicating its gates.
 
 ## Boundary
 
-- **In scope:** read-only verification, local full E2E, latest-main CI status,
+- **In scope:** read-only verification, exact-main integrated CI evidence,
   architecture-drift findings, documentation and domain-language truth sync,
-  release-mode smoke build, changelog preview, housekeeping, approved fixes,
+  frozen/generated/version checks, release-mode smoke build, Markdown lint,
+  changelog preview, housekeeping, approved fixes, affected-suite
   re-verification, and a draft preparation PR.
 - **Out of scope:** choosing or bumping the version, writing the release
   changelog section, creating a release branch, tagging, publishing, or
@@ -50,11 +51,12 @@ shared worker budget across invocations and worktrees.
 
 Read-only first, then one approval checkpoint, then apply approved fixes:
 
-1. Establish the release baseline and run all non-mutating checks.
+1. Establish the release baseline, bind successful integrated CI to the exact
+   base, and run the release-specific non-mutating checks.
 2. Produce one readiness report with every architecture finding.
 3. Stop for the user to approve fixes or explicitly waive individual findings.
 4. Apply only approved fixes and record every waiver with its rationale.
-5. Re-run the complete gate.
+5. Re-run the release-specific gate and any focused suites affected by fixes.
 6. Open a draft preparation PR through `/create-pr`.
 7. Stop. `/create-release` is a separate invocation after the preparation PR
    has merged and `main` is green.
@@ -65,9 +67,11 @@ Stop and report `BLOCKED` when any of these is true:
 
 - The branch is not based on the current remote default branch, or the working
   tree contains unexpected changes.
-- Any universal, release-mode, E2E, Markdown, frozen-install, or generated-data
-  check fails.
-- The latest completed `ci.yml` run for the base commit is not successful.
+- Any required release-mode, Markdown, frozen-install, generated-data,
+  version, or affected-suite check fails.
+- The latest completed `ci.yml` run for the exact base commit is absent, stale,
+  or unsuccessful. Do not replace missing cross-platform proof with another
+  complete local suite.
 - The default-branch ruleset does not require every current `pr.yml` check, the
   release-tag ruleset is absent, or the protected `release` environment is
   absent.
@@ -91,28 +95,29 @@ Stop and report `BLOCKED` when any of these is true:
 - Classify all existing changes as expected preparation work or unexpected.
   Stop on unexpected changes; do not discard or overwrite them.
 
-### 2. Run the Definition of Done gate
+### 2. Run the release-specific local gate
 
-Run these commands sequentially from the repository root:
+The successful exact-main `ci.yml` run is the default and E2E proof for the
+unchanged base. Do not rerun those complete suites locally. Run the checks that
+release preparation adds, sequentially from the repository root:
 
 ```sh
 ./build/lwpt install --frozen
 ./build/lwpt format --check
-./build/lwpt build --clean
-./build/lwpt test
-./build/lwpt test --tier=e2e
-```
-
-The E2E run must exercise the live network. Do not set `LWPT_SKIP_NETWORK`.
-Then run the release-mode smoke build:
-
-```sh
+./build/lwpt agents --check
 ./build/lwpt build --clean --mode release
 ```
 
 Lint the complete Markdown corpus with the same pinned CLI version used by the
 repository's documentation workflow. Read `.markdownlint-cli2.jsonc` and the
 workflow before selecting the command; verify the tool version live.
+
+If exact-main integrated CI is unavailable or stale, stop rather than silently
+substituting weaker local platform evidence. If an approved preparation fix
+changes source or behavior, run the smallest focused selector or affected tier
+that proves that fix locally. Do not rerun complete default and E2E suites after
+each fix; the preparation PR's required CI and its integrated-main successor
+provide the final complete proof.
 
 ### 3. Check cross-platform evidence
 
@@ -207,8 +212,9 @@ Emit one readiness report before writing fixes:
 
 1. **Verdict:** `READY FOR FIX APPROVAL` or `BLOCKED`.
 2. **Baseline:** branch, base SHA, last release, unreleased commits, FPC version.
-3. **Gate results:** frozen install, format, clean build, default tests, live
-   E2E, release-mode build, Markdown, and latest-main CI.
+3. **Gate results:** frozen install, format, agent-reference check,
+   release-mode build, Markdown, affected focused suites, and exact-main
+   integrated CI (including its default and live E2E matrix).
 4. **Architecture drift:** findings grouped by the surfaces above.
 5. **Generated and release state:** version, committed dependency state, target
    matrix, and artifact agreement.
@@ -219,9 +225,10 @@ Emit one readiness report before writing fixes:
    discard them.
 
 After approval, apply the selected fixes, show the resulting diff, and re-run
-the complete verification gate. The final verdict is `READY FOR
-/create-release` only when all checks pass and every finding is fixed or
-explicitly waived.
+the release-specific gate plus affected focused suites. The final verdict is
+`READY FOR /create-release` only when those checks pass and every finding is
+fixed or explicitly waived. Do not claim final full-suite proof for a changed
+head until the preparation PR and its integrated-main CI are green.
 
 ### 9. Hand off
 

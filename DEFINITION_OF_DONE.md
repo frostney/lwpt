@@ -50,7 +50,11 @@ requirement may be marked not applicable only with a recorded reason.
 
 - E2E coverage is required for changes affecting networking, installation,
   CLI subprocess behavior, platform integration, or release behavior.
-- The full E2E suite passes during release preparation.
+- Release preparation reuses a successful exact-main integrated CI run for the
+  unchanged default and E2E suites. It does not repeat those complete suites
+  locally merely to restate the same proof. Approved source fixes run their
+  affected focused suites before the preparation PR; that PR's required CI and
+  the resulting integrated-main CI become the final full-suite evidence.
 - A change touching process management, concurrency, platform-specific code,
   or the CI workflows themselves dispatches the full CI workflow on the
   branch (`gh workflow run CI --ref <branch>`) and watches it to completion
@@ -89,3 +93,12 @@ compared source, tests, manifests, workflows, documentation, ADRs, and domain
 context. Every finding must be fixed or explicitly waived with a rationale.
 This check belongs in LWPT's `/prepare-release` workflow and is not a customer
 feature or a consumer-project responsibility.
+
+Release preparation runs the release-specific local evidence that integrated
+CI does not provide: frozen and generated-state verification, version
+agreement, format and agent-reference checks, a release-mode build, Markdown
+lint, architecture drift, and changelog preview. A complete local default/E2E
+rerun does not substitute for absent or stale exact-main integrated evidence;
+that state blocks preparation. After preparation changes, rerun only affected
+focused suites locally and let the preparation PR plus integrated-main CI
+provide the complete matrix.
