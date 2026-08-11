@@ -334,6 +334,7 @@ procedure TTestRunner.Run;
 var
   Suite: TTestSuite;
   Test: TTestRegistration;
+  TestResult: TTestResult;
 begin
   WriteLn;
   WriteLn('Running tests...');
@@ -362,6 +363,23 @@ begin
 
   PrintResults;
   PrintSummary;
+
+  { A failing suite fails the process by default: lwpt test (and any
+    CI gating on it) reads the program's exit code, and requiring
+    every consumer test program to remember the
+    `ExitCode := TestResultToExitCode` boilerplate proved error-prone
+    — a program that omitted it exited 0 with failing assertions and
+    lwpt test reported the suite as passing. Computed from this
+    runner's own results; a nonzero ExitCode already set elsewhere is
+    never lowered. Harnesses that run a deliberately failing suite on
+    a throwaway runner (see the canary) reset ExitCode afterwards. }
+  for TestResult in FResults do
+    if TestResult.Status = tsFail then
+    begin
+      if ExitCode = 0 then
+        ExitCode := 1;
+      Break;
+    end;
 end;
 
 procedure TTestRunner.PrintResults;

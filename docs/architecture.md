@@ -34,7 +34,7 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 
 - **Compiler:** FreePascal 3.2.2 (`fpc -iV` verified live; see `tooling.md`).
 - **Mode:** `delphi` everywhere. Project-owned units (`lwpt.pas`, the `LWPT.*` family) and the package units (`CLI.*`, `Semver`, `HTTPClient`, etc) flow through `{$I Shared.inc}` which sets `{$mode delphi} {$H+}` (a few test-support units declare their own mode instead). Several LWPT units additionally enable `{$modeswitch nestedcomments+}` so documentation prose can contain literal placeholder strings (the `{user}` / `{repository}` / `{ref}` substrings) without prematurely closing the surrounding `{ ... }` block.
-- **Runtime:** RTL only. No fcl-web, no fphttpclient, no third-party packages. HTTPS goes through the `HTTPClient` package's `TransportSecurity` with platform-native TLS per ADR-0016: SChannel on Windows, SecureTransport on macOS, runtime-loaded system OpenSSL on Unix-not-Darwin.
+- **Runtime:** RTL only. No fcl-web, no fphttpclient, no third-party packages. The `HTTPClient` package exposes GET, HEAD, and byte-safe POST over one body-capable HTTP/1.1 request core. POST generates its own `Content-Length` and `Content-Type`; 301/302/303 redirects continue as bodyless GET, while 307/308 preserve the method and body. HTTPS uses `TransportSecurity` with platform-native TLS per ADR-0016: SChannel on Windows, SecureTransport on macOS, runtime-loaded system OpenSSL on Unix-not-Darwin.
 - **Scripts:** Pascal via InstantFPC (`scripts/bootstrap.pas`). Shell wrappers (`bootstrap.sh`, `bootstrap.bat`) fall back to direct `fpc` when InstantFPC is absent.
 
 ## The package-manager-is-the-foundation through-line

@@ -88,6 +88,16 @@ type
     procedure TestTruncatedFixedBody;
   end;
 
+  THTTPClientRequestBodies = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestGetAndHeadWireBehaviorIsUnchanged;
+    procedure TestPostRedirect301And302BecomesGet;
+    procedure TestPostRedirect303BecomesGet;
+    procedure TestPostRedirect307And308PreservesBody;
+    procedure TestPostSendsBinaryBodyAndOwnsEntityHeaders;
+  end;
+
 const
   MOCK_LIFECYCLE_CHILD = '--mock-lifecycle-child';
   {$IFDEF MSWINDOWS}
@@ -247,6 +257,82 @@ begin
   for i := 0 to High(AValues) do Result[i] := AValues[i];
 end;
 
+function RequestHeaderEnd(const ARequest: TBytes): Integer;
+var
+  I: Integer;
+begin
+  for I := 0 to Length(ARequest) - 4 do
+    if (ARequest[I] = 13) and (ARequest[I + 1] = 10) and
+       (ARequest[I + 2] = 13) and (ARequest[I + 3] = 10) then
+      Exit(I + 4);
+  Result := -1;
+end;
+
+function RequestHeaderText(const ARequest: TBytes): string;
+var
+  HeaderEnd: Integer;
+  Header: AnsiString;
+begin
+  HeaderEnd := RequestHeaderEnd(ARequest);
+  if HeaderEnd < 0 then Exit('');
+  SetString(Header, PAnsiChar(@ARequest[0]), HeaderEnd);
+  Result := string(Header);
+end;
+
+function RequestBody(const ARequest: TBytes): TBytes;
+var
+  HeaderEnd: Integer;
+begin
+  HeaderEnd := RequestHeaderEnd(ARequest);
+  if HeaderEnd < 0 then Exit(nil);
+  Result := Copy(ARequest, HeaderEnd, Length(ARequest) - HeaderEnd);
+end;
+
+function RedirectResponse(const AStatusCode: Integer;
+  const ALocation: string): TBytes;
+const
+  CRLF = #13#10;
+begin
+  Result := StringBytes('HTTP/1.1 ' + IntToStr(AStatusCode) +
+    ' Redirect' + CRLF + 'Location: ' + ALocation + CRLF +
+    'Content-Length: 0' + CRLF + 'Connection: close' + CRLF + CRLF);
+end;
+
+function ServePostRedirectAndCapture(const AStatusCode: Integer;
+  const ABody: TBytes; const AContentType: string): TBytes;
+var
+  NoHeaders: THTTPHeaders;
+  Options: THTTPRequestOptions;
+  Origin, Target: TMockHTTPServer;
+  Response: THTTPResponse;
+  TargetURL: string;
+begin
+  Target := TMockHTTPServer.Create(BuildSimpleResponse(nil));
+  try
+    Target.Start;
+    TargetURL := 'http://127.0.0.1:' + IntToStr(Target.Port) + '/target';
+    Origin := TMockHTTPServer.Create(RedirectResponse(AStatusCode, TargetURL));
+    try
+      Origin.Start;
+      NoHeaders := nil;
+      Options := DefaultHTTPRequestOptions;
+      Options.RequestTimeoutMilliseconds := 2000;
+      Response := HTTPPost(MockURL(Origin.Port), ABody, AContentType,
+        NoHeaders, Options);
+      Origin.WaitDone;
+      Target.WaitDone;
+      Expect<Integer>(Response.StatusCode).ToBe(200);
+      Expect<Boolean>(Response.Redirected).ToBe(True);
+      Expect<string>(Response.FinalURL).ToBe(TargetURL);
+      Result := Target.ReceivedRequest;
+    finally
+      Origin.Free;
+    end;
+  finally
+    Target.Free;
+  end;
+end;
+
 procedure RunMockLifecycleChild(const AScenario: string);
 var
   Mock: TMockHTTPServer;
@@ -403,6 +489,172 @@ begin
     TestConnectedSilentTeardownIsBounded);
   Test('success, failure, and unstarted cycles balance fixture resources',
     TestRepeatedCyclesBalanceResources);
+end;
+
+{ ── THTTPClientRequestBodies ─────────────────────────────────────── }
+
+procedure THTTPClientRequestBodies.TestPostSendsBinaryBodyAndOwnsEntityHeaders;
+const
+  CRLF = #13#10;
+var
+  Body, CapturedBody: TBytes;
+  CapturedHeader, ExpectedHeader: string;
+  Headers: THTTPHeaders;
+  I: Integer;
+  Mock: TMockHTTPServer;
+  Response: THTTPResponse;
+begin
+  SetLength(Body, 8 * 1024 + 17);
+  for I := 0 to High(Body) do
+    if I mod 19 = 0 then Body[I] := 0
+    else Body[I] := Byte(I and $ff);
+  SetLength(Headers, 5);
+  Headers[0].Name := 'Host';
+  Headers[0].Value := 'example.invalid';
+  Headers[1].Name := 'Content-Length';
+  Headers[1].Value := '1';
+  Headers[2].Name := 'Content-Type';
+  Headers[2].Value := 'text/plain';
+  Headers[3].Name := 'X-Trace';
+  Headers[3].Value := 'retained';
+  Headers[4].Name := 'Transfer-Encoding';
+  Headers[4].Value := 'chunked';
+  Mock := TMockHTTPServer.Create(BuildSimpleResponse(nil));
+  try
+    Mock.Start;
+    Response := HTTPPost(MockURL(Mock.Port), Body,
+      'application/octet-stream', Headers);
+    Mock.WaitDone;
+    Expect<Integer>(Response.StatusCode).ToBe(200);
+    CapturedHeader := RequestHeaderText(Mock.ReceivedRequest);
+    ExpectedHeader := 'POST /x HTTP/1.1' + CRLF +
+      'Host: 127.0.0.1:' + IntToStr(Mock.Port) + CRLF +
+      'Connection: close' + CRLF +
+      'User-Agent: GocciaScript/1.0' + CRLF +
+      'Content-Length: ' + IntToStr(Length(Body)) + CRLF +
+      'Content-Type: application/octet-stream' + CRLF +
+      'X-Trace: retained' + CRLF + CRLF;
+    Expect<string>(CapturedHeader).ToBe(ExpectedHeader);
+    CapturedBody := RequestBody(Mock.ReceivedRequest);
+    Expect<Integer>(Length(CapturedBody)).ToBe(Length(Body));
+    Expect<string>(BytesToHex(CapturedBody)).ToBe(BytesToHex(Body));
+  finally
+    Mock.Free;
+  end;
+end;
+
+procedure THTTPClientRequestBodies.TestPostRedirect301And302BecomesGet;
+const
+  CRLF = #13#10;
+var
+  Body, Captured: TBytes;
+  Header: string;
+  StatusCode: Integer;
+begin
+  Body := MakeBytes([$00, $01, $fe, $ff]);
+  for StatusCode := 301 to 302 do
+  begin
+    Captured := ServePostRedirectAndCapture(StatusCode, Body,
+      'application/octet-stream');
+    Header := RequestHeaderText(Captured);
+    Expect<Boolean>(Pos('GET /target HTTP/1.1' + CRLF, Header) = 1).ToBe(True);
+    Expect<Boolean>(Pos('Content-Length:', Header) = 0).ToBe(True);
+    Expect<Boolean>(Pos('Content-Type:', Header) = 0).ToBe(True);
+    Expect<Integer>(Length(RequestBody(Captured))).ToBe(0);
+  end;
+end;
+
+procedure THTTPClientRequestBodies.TestPostRedirect303BecomesGet;
+const
+  CRLF = #13#10;
+var
+  Captured: TBytes;
+  Header: string;
+begin
+  Captured := ServePostRedirectAndCapture(303,
+    MakeBytes([$00, $01, $02]), 'application/octet-stream');
+  Header := RequestHeaderText(Captured);
+  Expect<Boolean>(Pos('GET /target HTTP/1.1' + CRLF, Header) = 1).ToBe(True);
+  Expect<Boolean>(Pos('Content-Length:', Header) = 0).ToBe(True);
+  Expect<Boolean>(Pos('Content-Type:', Header) = 0).ToBe(True);
+  Expect<Integer>(Length(RequestBody(Captured))).ToBe(0);
+end;
+
+procedure THTTPClientRequestBodies.TestPostRedirect307And308PreservesBody;
+const
+  CRLF = #13#10;
+var
+  Body, Captured, CapturedBody: TBytes;
+  Header: string;
+  StatusCode: Integer;
+begin
+  Body := MakeBytes([$00, $01, $fe, $ff]);
+  for StatusCode := 307 to 308 do
+  begin
+    Captured := ServePostRedirectAndCapture(StatusCode, Body,
+      'application/octet-stream');
+    Header := RequestHeaderText(Captured);
+    Expect<Boolean>(Pos('POST /target HTTP/1.1' + CRLF, Header) = 1).ToBe(True);
+    Expect<Boolean>(Pos('Content-Length: 4' + CRLF, Header) > 0).ToBe(True);
+    Expect<Boolean>(Pos('Content-Type: application/octet-stream' + CRLF,
+      Header) > 0).ToBe(True);
+    CapturedBody := RequestBody(Captured);
+    Expect<string>(BytesToHex(CapturedBody)).ToBe(BytesToHex(Body));
+  end;
+end;
+
+procedure THTTPClientRequestBodies.TestGetAndHeadWireBehaviorIsUnchanged;
+const
+  CRLF = #13#10;
+var
+  CapturedHeader, ExpectedHeader, Method: string;
+  Headers: THTTPHeaders;
+  I: Integer;
+  Mock: TMockHTTPServer;
+  Response: THTTPResponse;
+begin
+  SetLength(Headers, 1);
+  Headers[0].Name := 'X-Preserve';
+  Headers[0].Value := 'yes';
+  for I := 0 to 1 do
+  begin
+    if I = 0 then Method := 'GET'
+    else Method := 'HEAD';
+    Mock := TMockHTTPServer.Create(BuildSimpleResponse(nil));
+    try
+      Mock.Start;
+      if Method = 'GET' then
+        Response := HTTPGet(MockURL(Mock.Port), Headers)
+      else
+        Response := HTTPHead(MockURL(Mock.Port), Headers);
+      Mock.WaitDone;
+      Expect<Integer>(Response.StatusCode).ToBe(200);
+      CapturedHeader := RequestHeaderText(Mock.ReceivedRequest);
+      ExpectedHeader := Method + ' /x HTTP/1.1' + CRLF +
+        'Host: 127.0.0.1:' + IntToStr(Mock.Port) + CRLF +
+        'Connection: close' + CRLF +
+        'User-Agent: GocciaScript/1.0' + CRLF +
+        'X-Preserve: yes' + CRLF + CRLF;
+      Expect<string>(CapturedHeader).ToBe(ExpectedHeader);
+      Expect<Integer>(Length(RequestBody(Mock.ReceivedRequest))).ToBe(0);
+    finally
+      Mock.Free;
+    end;
+  end;
+end;
+
+procedure THTTPClientRequestBodies.SetupTests;
+begin
+  Test('POST sends complete binary content and owns entity headers',
+    TestPostSendsBinaryBodyAndOwnsEntityHeaders);
+  Test('POST redirects through 301 and 302 as bodyless GET',
+    TestPostRedirect301And302BecomesGet);
+  Test('POST redirects through 303 as bodyless GET',
+    TestPostRedirect303BecomesGet);
+  Test('POST redirects through 307 and 308 with method and body preserved',
+    TestPostRedirect307And308PreservesBody);
+  Test('GET and HEAD request bytes remain unchanged',
+    TestGetAndHeadWireBehaviorIsUnchanged);
 end;
 
 { ── THTTPClientByteFetch ──────────────────────────────────────────── }
@@ -845,6 +1097,8 @@ begin
     'HTTPClient: binary-fetch regression'));
   TestRunnerProgram.AddSuite(THTTPClientResourceBounds.Create(
     'HTTPClient: resource bounds'));
+  TestRunnerProgram.AddSuite(THTTPClientRequestBodies.Create(
+    'HTTPClient: request bodies'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

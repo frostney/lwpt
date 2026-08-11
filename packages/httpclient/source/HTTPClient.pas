@@ -1,7 +1,7 @@
 unit HTTPClient;
 
 // Minimal HTTP/1.1 client built on raw BSD sockets.
-// Supports GET and HEAD over HTTP and HTTPS.
+// Supports GET, HEAD, and POST over HTTP and HTTPS.
 // Cross-platform: Unix (macOS, Linux) and Windows.
 // Synchronous API with deadline-aware nonblocking socket I/O.
 
@@ -52,6 +52,12 @@ function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
 function HTTPHead(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse; overload;
 function HTTPHead(const AURL: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse; overload;
+function HTTPPost(const AURL: string; const ABody: TBytes;
+  const AContentType: string;
+  const AHeaders: THTTPHeaders): THTTPResponse; overload;
+function HTTPPost(const AURL: string; const ABody: TBytes;
+  const AContentType: string; const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions): THTTPResponse; overload;
 
 implementation
@@ -556,23 +562,23 @@ end;
 // Send / Receive wrappers (unified TLS + plain)
 // ---------------------------------------------------------------------------
 
-procedure SendAll(const ASock: TSocket;
+procedure SendAllBuffer(const ASock: TSocket;
   var ATransport: TTransportSecurityConnection;
-  const AData: AnsiString; const ADeadline,
-  ATimeoutMilliseconds: QWord);
+  const AData: Pointer; const ALength: Integer;
+  const ADeadline, ATimeoutMilliseconds: QWord);
 var
   Sent, Total, Len, N: Integer;
 begin
-  Total := Length(AData);
+  Total := ALength;
   Sent := 0;
   while Sent < Total do
   begin
     CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
     Len := Total - Sent;
     if ATransport.Active then
-      N := TransportSecurityWrite(ATransport, @AData[Sent + 1], Len)
+      N := TransportSecurityWrite(ATransport, PByte(AData) + Sent, Len)
     else
-      N := SocketSend(ASock, @AData[Sent + 1], Len);
+      N := SocketSend(ASock, PByte(AData) + Sent, Len);
     if (N < 0) and SocketWouldBlock then
     begin
       WaitForSocket(ASock, False, True, ADeadline,
@@ -584,6 +590,26 @@ begin
     Inc(Sent, N);
     CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
   end;
+end;
+
+procedure SendAll(const ASock: TSocket;
+  var ATransport: TTransportSecurityConnection;
+  const AData: AnsiString; const ADeadline,
+  ATimeoutMilliseconds: QWord);
+begin
+  if Length(AData) > 0 then
+    SendAllBuffer(ASock, ATransport, @AData[1], Length(AData), ADeadline,
+      ATimeoutMilliseconds);
+end;
+
+procedure SendAllBytes(const ASock: TSocket;
+  var ATransport: TTransportSecurityConnection;
+  const AData: TBytes; const ADeadline,
+  ATimeoutMilliseconds: QWord);
+begin
+  if Length(AData) > 0 then
+    SendAllBuffer(ASock, ATransport, @AData[0], Length(AData), ADeadline,
+      ATimeoutMilliseconds);
 end;
 
 function RecvBytes(const ASock: TSocket;
@@ -1005,6 +1031,8 @@ begin
 end;
 
 function DoRequest(const AMethod, AURL: string;
+  const ABody: TBytes; const AContentType: string;
+  const AManagesContentHeaders: Boolean;
   const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions;
   const AMaxRedirects: Integer): THTTPResponse;
@@ -1016,9 +1044,9 @@ var
   Raw: TRawHTTPResponse;
   I, Redirects: Integer;
   CurrentURL, Location, HostHeader: string;
-  HasUserAgent: Boolean;
-  IsHead: Boolean;
-  Method: string;
+  HasRequestContent, HasUserAgent, IsHead: Boolean;
+  HeaderName, Method, ContentType: string;
+  Body: TBytes;
   Deadline, StartedAt: QWord;
 begin
   ValidateRequestOptions(AOptions);
@@ -1032,6 +1060,9 @@ begin
   Result.Redirected := False;
   Method := UpperCase(AMethod);
   IsHead := (Method = 'HEAD');
+  Body := ABody;
+  ContentType := AContentType;
+  HasRequestContent := AManagesContentHeaders;
 
   while True do
   begin
@@ -1066,10 +1097,22 @@ begin
         if not HasUserAgent then
           Request := Request + AnsiString('User-Agent: GocciaScript/1.0' + CRLF);
 
-        // Add custom headers (skip Host since we already set it)
+        if HasRequestContent then
+        begin
+          Request := Request + AnsiString('Content-Length: ' +
+            IntToStr(Length(Body)) + CRLF);
+          Request := Request + AnsiString('Content-Type: ' + ContentType + CRLF);
+        end;
+
+        // Add custom headers. Request content owns its framing and media type.
         for I := 0 to High(AHeaders) do
         begin
-          if LowerCase(AHeaders[I].Name) = 'host' then Continue;
+          HeaderName := LowerCase(AHeaders[I].Name);
+          if HeaderName = 'host' then Continue;
+          if AManagesContentHeaders and
+             ((HeaderName = 'content-length') or
+              (HeaderName = 'content-type') or
+              (HeaderName = 'transfer-encoding')) then Continue;
           Request := Request + AnsiString(AHeaders[I].Name + ': ' + AHeaders[I].Value + CRLF);
         end;
 
@@ -1077,6 +1120,9 @@ begin
 
         SendAll(Sock, Transport, Request, Deadline,
           AOptions.RequestTimeoutMilliseconds);
+        if HasRequestContent then
+          SendAllBytes(Sock, Transport, Body, Deadline,
+            AOptions.RequestTimeoutMilliseconds);
         Raw := ReadResponse(Sock, Transport, IsHead, AOptions, Deadline);
         CheckRequestDeadline(Deadline,
           AOptions.RequestTimeoutMilliseconds);
@@ -1105,11 +1151,17 @@ begin
         else
           CurrentURL := Location;
 
-        // 303: change method to GET per RFC 7231
-        if Raw.StatusCode = 303 then
+        // RFC 9205 recommends browser-compatible POST rewriting for 301/302.
+        // 303 always retrieves with GET; 307/308 preserve method and content.
+        if (Raw.StatusCode = 303) or
+           (((Raw.StatusCode = 301) or (Raw.StatusCode = 302)) and
+            (Method = 'POST')) then
         begin
           Method := 'GET';
           IsHead := False;
+          SetLength(Body, 0);
+          ContentType := '';
+          HasRequestContent := False;
         end;
 
         Continue;
@@ -1149,7 +1201,7 @@ function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions): THTTPResponse;
 begin
   try
-    Result := DoRequest('GET', AURL, AHeaders, AOptions,
+    Result := DoRequest('GET', AURL, nil, '', False, AHeaders, AOptions,
       AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
@@ -1167,8 +1219,29 @@ function HTTPHead(const AURL: string; const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions): THTTPResponse;
 begin
   try
-    Result := DoRequest('HEAD', AURL, AHeaders, AOptions,
+    Result := DoRequest('HEAD', AURL, nil, '', False, AHeaders, AOptions,
       AOptions.MaximumRedirects);
+  except
+    on E: ETransportSecurityError do
+      raise EHTTPError.Create(E.Message);
+  end;
+end;
+
+function HTTPPost(const AURL: string; const ABody: TBytes;
+  const AContentType: string;
+  const AHeaders: THTTPHeaders): THTTPResponse;
+begin
+  Result := HTTPPost(AURL, ABody, AContentType, AHeaders,
+    DefaultHTTPRequestOptions);
+end;
+
+function HTTPPost(const AURL: string; const ABody: TBytes;
+  const AContentType: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
+begin
+  try
+    Result := DoRequest('POST', AURL, ABody, AContentType, True,
+      AHeaders, AOptions, AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
       raise EHTTPError.Create(E.Message);
