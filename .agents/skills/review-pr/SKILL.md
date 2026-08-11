@@ -44,10 +44,11 @@ Normal `/review-pr` remains non-merging. An explicit read-only instruction
 remains non-mutating and disables automatic merge.
 
 An active review tool is a merge gate when repository policy or the current PR
-shows it was intentionally invoked. Inspect inline threads plus top-level
-reviews, summaries, suggestions, and nitpicks. For CodeRabbit when active, a
-rate limit, quota response, incomplete run, or missing verdict is pending rather
-than passed; apply equivalent evidence-based semantics to other tools.
+shows it was intentionally invoked. When the repository has a review-automation
+registry, use its actors, check contexts, and terminal states rather than a
+vendor name. Inspect inline threads plus top-level reviews, summaries,
+suggestions, and nitpicks. A rate limit, quota response, incomplete run, or
+missing verdict is pending rather than passed for every provider.
 
 Automatic convergence has a finite wall-clock budget: 30 minutes from entering
 `automatic-merge` mode unless the user supplies another explicit finite

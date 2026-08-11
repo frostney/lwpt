@@ -1,15 +1,27 @@
 {
   "automations": [
     {
-      "id": "coderabbit",
+      "id": "macroscope",
       "actors": [
-        "coderabbitai",
-        "coderabbitai[bot]"
+        "macroscopeapp",
+        "macroscopeapp[bot]"
       ],
-      "check_context": "CodeRabbit",
-      "terminal_review_states": [
-        "APPROVED",
-        "COMMENTED"
+      "check_contexts": [
+        "Macroscope - Correctness Check"
+      ],
+      "check_app_slugs": [
+        "macroscopeapp"
+      ],
+      "terminal_check_conclusions": [
+        "success",
+        "neutral"
+      ],
+      "terminal_review_states": [],
+      "nonterminal_review_markers": [
+        "rate limit",
+        "rate-limit",
+        "quota exceeded",
+        "review incomplete"
       ]
     }
   ]

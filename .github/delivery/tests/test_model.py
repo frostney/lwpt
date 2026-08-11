@@ -258,6 +258,95 @@ class DeliveryModelTests(unittest.TestCase):
         self.assertIn("thread 1: unresolved", errors)
         self.assertIn("thread 1: no current maintainer reply", errors)
 
+    def test_only_current_head_automations_are_active(self) -> None:
+        automations = [
+            {
+                "id": "coderabbit",
+                "actors": ["coderabbitai[bot]"],
+                "check_contexts": ["CodeRabbit"],
+            },
+            {
+                "id": "macroscope",
+                "actors": ["macroscopeapp"],
+                "check_contexts": ["Macroscope - Correctness Check"],
+                "check_app_slugs": ["macroscopeapp"],
+                "terminal_check_conclusions": ["success", "neutral"],
+            },
+        ]
+        checks = [
+            {
+                "id": 4,
+                "name": "Macroscope - Correctness Check",
+                "conclusion": "neutral",
+                "app": {"slug": "macroscopeapp"},
+            }
+        ]
+        reviews = [
+            {
+                "author": {"login": "macroscopeapp"},
+                "commit": {"oid": "a" * 40},
+                "state": "COMMENTED",
+            },
+            {
+                "author": {"login": "coderabbitai[bot]"},
+                "commit": {"oid": "b" * 40},
+                "state": "COMMENTED",
+            },
+        ]
+        self.assertEqual(
+            [],
+            review_evidence_errors(
+                "a" * 40, automations, checks, reviews, [], set()
+            ),
+        )
+
+        checks[0]["app"] = {"slug": "lookalike"}
+        self.assertEqual(
+            ["macroscope: terminal current-head check is missing"],
+            review_evidence_errors(
+                "a" * 40, automations, checks, reviews, [], set()
+            ),
+        )
+
+    def test_every_active_automation_must_converge(self) -> None:
+        automations = [
+            {
+                "id": "hosted",
+                "actors": ["hosted[bot]"],
+                "check_contexts": ["Hosted review"],
+            },
+            {
+                "id": "custom",
+                "actors": ["custom-reviewer"],
+                "check_contexts": ["Custom review"],
+                "terminal_review_states": [],
+            },
+        ]
+        checks = [
+            {"id": 1, "name": "Hosted review", "conclusion": "success"},
+            {"id": 2, "name": "Custom review", "conclusion": None},
+        ]
+        reviews = [
+            {
+                "author": {"login": "hosted[bot]"},
+                "commit": {"oid": "a" * 40},
+                "state": "COMMENTED",
+            }
+        ]
+        self.assertEqual(
+            ["custom: terminal current-head check is missing"],
+            review_evidence_errors(
+                "a" * 40, automations, checks, reviews, [], set()
+            ),
+        )
+        checks[1]["conclusion"] = "success"
+        self.assertEqual(
+            [],
+            review_evidence_errors(
+                "a" * 40, automations, checks, reviews, [], set()
+            ),
+        )
+
     def test_maintainer_comment_before_automation_is_not_a_reply(self) -> None:
         automations = [{"id": "reviewer", "actors": ["reviewer[bot]"]}]
         threads = [
@@ -277,7 +366,98 @@ class DeliveryModelTests(unittest.TestCase):
     def test_rate_limit_without_terminal_review_remains_pending(self) -> None:
         automations = [{"id": "reviewer", "actors": ["reviewer[bot]"]}]
         errors = review_evidence_errors("a" * 40, automations, [], [], [], set())
-        self.assertEqual(["reviewer: terminal current-head review is missing"], errors)
+        self.assertEqual(
+            ["no configured review automation has current-head evidence"], errors
+        )
+
+    def test_active_nonterminal_review_fails_closed(self) -> None:
+        automations = [{"id": "reviewer", "actors": ["reviewer[bot]"]}]
+        reviews = [
+            {
+                "author": {"login": "reviewer[bot]"},
+                "commit": {"oid": "a" * 40},
+                "state": "PENDING",
+            }
+        ]
+        self.assertEqual(
+            ["reviewer: terminal current-head review is missing"],
+            review_evidence_errors(
+                "a" * 40, automations, [], reviews, [], set()
+            ),
+        )
+
+    def test_nullable_github_review_fields_fail_closed(self) -> None:
+        automations = [{"id": "reviewer", "actors": ["reviewer[bot]"]}]
+        reviews = [
+            {
+                "author": None,
+                "commit": None,
+                "state": "PENDING",
+                "submittedAt": None,
+            },
+            {
+                "author": {"login": "reviewer[bot]"},
+                "commit": {"oid": "a" * 40},
+                "state": "PENDING",
+                "submittedAt": None,
+            },
+        ]
+        self.assertEqual(
+            ["reviewer: terminal current-head review is missing"],
+            review_evidence_errors(
+                "a" * 40, automations, [], reviews, [], set()
+            ),
+        )
+
+    def test_nullable_check_and_comment_authors_do_not_crash(self) -> None:
+        automations = [
+            {
+                "id": "reviewer",
+                "actors": ["reviewer[bot]"],
+                "check_contexts": ["Review"],
+                "check_app_slugs": ["reviewer"],
+                "terminal_review_states": [],
+            }
+        ]
+        checks = [{"id": 1, "name": "Review", "conclusion": "success", "app": None}]
+        threads = [{"isResolved": True, "comments": [{"author": None}]}]
+        self.assertEqual(
+            ["no configured review automation has current-head evidence"],
+            review_evidence_errors(
+                "a" * 40, automations, checks, [], threads, set()
+            ),
+        )
+
+    def test_latest_rate_limited_review_fails_closed(self) -> None:
+        automations = [
+            {
+                "id": "reviewer",
+                "actors": ["reviewer[bot]"],
+                "nonterminal_review_markers": ["quota exceeded"],
+            }
+        ]
+        reviews = [
+            {
+                "author": {"login": "reviewer[bot]"},
+                "commit": {"oid": "a" * 40},
+                "state": "COMMENTED",
+                "body": "Review complete",
+                "submittedAt": "2026-08-11T10:00:00Z",
+            },
+            {
+                "author": {"login": "reviewer[bot]"},
+                "commit": {"oid": "a" * 40},
+                "state": "COMMENTED",
+                "body": "Quota exceeded; retry later",
+                "submittedAt": "2026-08-11T10:01:00Z",
+            },
+        ]
+        self.assertEqual(
+            ["reviewer: terminal current-head review is missing"],
+            review_evidence_errors(
+                "a" * 40, automations, [], reviews, [], set()
+            ),
+        )
 
 
 if __name__ == "__main__":
