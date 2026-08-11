@@ -297,10 +297,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 30 | 510 |
+| Unit (`source/*.Test.pas` + package self-tests) | 30 | 510 Unix / 508 Windows |
 | Integration (`tests/integration/*.Test.pas`) | 23 | 250 |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 7 | 35 |
-| **Total** | **60** | **795** |
+| **Total** | **60** | **795 Unix / 793 Windows** |
 
 ## TestingPascalLibrary self-test
 
