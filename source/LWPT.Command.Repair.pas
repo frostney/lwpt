@@ -43,6 +43,7 @@ var
   Ctx : TManifestContext;
   TmpRoot, LockPath : string;
   SessionsRemoved, SessionsRetained: Integer;
+  TmpRootCleaned: Boolean;
   WorkerLines : TStringList;
   WorkerSnapshot : TLWPTWorkerBudgetSnapshot;
   Reclaimed, i : Integer;
@@ -64,16 +65,16 @@ begin
   { A crashed writer may have a validated pre-transaction snapshot below
     tmp. Restore it before the ordinary residue sweep can delete it. }
   RecoverInterruptedInstall(Ctx);
-  if DirectoryExists(TmpRoot) then
+  RepairBuildSessions(Ctx.ProjectRoot, TmpRoot, SessionsRemoved,
+    SessionsRetained, TmpRootCleaned);
+  if TmpRootCleaned then
   begin
-    WipeDir(TmpRoot);
     WriteLn('repair: recovered interrupted publication and cleaned ',
       TmpRoot, '/');
   end
   else
     WriteLn('repair: no ', TmpRoot, '/ to clean');
 
-  RepairBuildSessions(Ctx.ProjectRoot, SessionsRemoved, SessionsRetained);
   WriteLn('repair: removed ', SessionsRemoved, ' abandoned build session(s), ',
     SessionsRetained, ' live session(s) retained');
 

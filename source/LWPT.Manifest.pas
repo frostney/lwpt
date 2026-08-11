@@ -208,6 +208,7 @@ type
     ModulesDirOverride  : string;
     ArchivesDirOverride : string;
     TmpDirOverride      : string;
+    SessionsDirOverride : string;
     CfgFileOverride     : string;
     { [format] include / exclude — see ADR-0007. Both are arrays of
       globs (`*` / `**` / `?` plus literal paths). include is additive
@@ -266,6 +267,7 @@ function  FindCustomSource(const ASources: TCustomSourceArray; const AName: stri
 function  ResolveModulesDir(const AMan: TManifest): string;
 function  ResolveArchivesDir(const AMan: TManifest): string;
 function  ResolveTmpDir(const AMan: TManifest): string;
+function  ResolveSessionsDir(const AMan: TManifest): string;
 function  ResolveCfgFile(const AMan: TManifest): string;
 procedure ParseDependencySourceCore(const ASource: string; const ACustomSources: TCustomSourceArray; APermissive: Boolean; out AKind: TSourceKind; out AHost: THostKind; out AHostName: string; out ALocator: string);
 procedure ParseDependencySource(const ASource: string; out AKind: TSourceKind; out AHost: THostKind; out ALocator: string);
@@ -345,6 +347,11 @@ function ResolveTmpDir(const AMan: TManifest): string;
 begin
   if AMan.TmpDirOverride <> '' then Result := AMan.TmpDirOverride
   else Result := TMP_DIR;
+end;
+
+function ResolveSessionsDir(const AMan: TManifest): string;
+begin
+  Result := AMan.SessionsDirOverride;
 end;
 
 function ResolveCfgFile(const AMan: TManifest): string;
@@ -1788,6 +1795,7 @@ begin
       Result.ModulesDirOverride  := TomlStr(LwptCfgNode, 'modules-dir', '');
       Result.ArchivesDirOverride := TomlStr(LwptCfgNode, 'archives-dir', '');
       Result.TmpDirOverride      := TomlStr(LwptCfgNode, 'tmp-dir', '');
+      Result.SessionsDirOverride := TomlStr(LwptCfgNode, 'sessions-dir', '');
       Result.CfgFileOverride     := TomlStr(LwptCfgNode, 'cfg-file', '');
     end;
 

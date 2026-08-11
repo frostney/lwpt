@@ -81,6 +81,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestConcurrentBuildsUseDistinctSessions;
+    procedure TestDeepProjectCanRelocateSessions;
     procedure TestDistinctOutputsPublishIndependentlyFromRootUnits;
     procedure TestFailedBuildPreservesLastSuccessfulOutput;
     procedure TestInFlightSourceChangeRefusesPublication;
@@ -277,6 +278,70 @@ begin
   if AChanged then
     Body := Body + '// changed while compilation was paused'#10;
   WriteTextFile(FScratch + '/source/app.pas', Body);
+end;
+
+procedure TBuildSessions.TestDeepProjectCanRelocateSessions;
+var
+  Project, ManifestRoot, EnvironmentRoot, RelativeEnvironmentRoot: string;
+  Run: TLwptResult;
+  Ledger: string;
+begin
+  Project := FScratch + '/deep-project';
+  while Length(Project) < 205 do
+    Project := Project + '/deep-path-segment';
+  ManifestRoot := FScratch + '/manifest-sessions';
+  EnvironmentRoot := FScratch + '/environment-sessions';
+  RecursiveDelete(Project);
+  RecursiveDelete(ManifestRoot);
+  RecursiveDelete(EnvironmentRoot);
+  WriteTextFile(Project + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "deep-app"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app" }'#10);
+  WriteTextFile(Project + '/source/app.pas',
+    'program app;'#10'begin'#10'end.'#10);
+
+  Run := RunLwptWithWorkerEnv(['build'], Project, []);
+  DumpRunFailure('deep default session root', Run, 1);
+  Expect<Integer>(Run.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('compiler staging path is too long', Run.Stderr) > 0)
+    .ToBe(True);
+
+  WriteTextFile(Project + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "deep-app"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[lwpt]'#10
+    + 'sessions-dir = "'
+    + StringReplace(ManifestRoot, '\', '/', [rfReplaceAll]) + '"'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "build/app" }'#10);
+  Run := RunLwptWithWorkerEnv(['build'], Project, []);
+  DumpRunFailure('deep manifest session root', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(DirectoryExists(ManifestRoot)).ToBe(True);
+
+  RelativeEnvironmentRoot := ExtractRelativePath(
+    IncludeTrailingPathDelimiter(Project), EnvironmentRoot);
+  Run := RunLwptWithWorkerEnv(['build', '--clean'], Project,
+    [BUILD_SESSION_DIR_ENV + '=' + RelativeEnvironmentRoot]);
+  DumpRunFailure('deep environment session root', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(DirectoryExists(EnvironmentRoot)).ToBe(True);
+  Ledger := ReadBinaryFile(Project + '/' + BUILD_SESSION_ROOT_LEDGER);
+  Expect<Boolean>(Pos(ExpandFileName(ManifestRoot), Ledger) > 0).ToBe(True);
+  Expect<Boolean>(Pos(ExpandFileName(EnvironmentRoot), Ledger) > 0).ToBe(True);
+
+  RecursiveDelete(Project);
+  RecursiveDelete(ManifestRoot);
+  RecursiveDelete(EnvironmentRoot);
 end;
 
 function TBuildSessions.CountSessionDirs: Integer;
@@ -1273,6 +1338,8 @@ procedure TBuildSessions.SetupTests;
 begin
   Test('concurrent builds use distinct private sessions',
     TestConcurrentBuildsUseDistinctSessions);
+  Test('deep projects relocate sessions through manifest and environment',
+    TestDeepProjectCanRelocateSessions);
   Test('distinct outputs publish independently with root units',
     TestDistinctOutputsPublishIndependentlyFromRootUnits);
   Test('failed clean build preserves last successful output',

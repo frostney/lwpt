@@ -10,7 +10,7 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 - **RTL-only with LWPT-canonical packages.** No third-party FPC dependencies in the binary; HTTPS is `HTTPClient` from LWPT's `packages/httpclient/`. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for HTTPClient, CLI, Semver, TOML, and TestingPascalLibrary — all consumed as workspace packages via the root manifest's `[workspaces]` glob (Phase 1 done per ADR-0014 + ADR-0015). GocciaScript is the first named consumer and commits to Path A adoption; Phase 2 graduates individual packages to standalone repos when warranted.
 - **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry implementation is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); its interoperable wire contract is specified in [`registry-spec.md`](./registry-spec.md). Duplication analysis and codebase health have landed. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
-- **Compiler work is session-private.** Build/test compiler outputs stay below `.lwpt/sessions/<session-id>/`; successful build outputs are revalidated and atomically published, while completed-session logs remain available until `lwpt repair` reclaims the session. See ADR-0020.
+- **Compiler work is session-private.** Build/test compiler outputs stay below a project-owned build-session root (project-local by default, relocatable for path budget); successful build outputs are revalidated and atomically published, while completed-session logs remain available until `lwpt repair` reclaims the session. See ADR-0020.
 - **Build scheduling follows the manifest DAG.** Ready build entries overlap within
   both the `--jobs` ceiling and machine-wide worker budget; dependants start
   only after prerequisites publish. See ADR-0023.
@@ -59,8 +59,8 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
                        run *.Test.pas) check sources)  user-defined
                                                        run task)
 
-   ↑ lwpt repair operates on project residue, abandoned .lwpt/sessions/
-     staging, and the per-user worker coordinator orthogonally.
+   ↑ lwpt repair operates on project residue, owned build-session roots,
+     and the per-user worker coordinator orthogonally.
    ↑ lwpt init scaffolds a new project (manifest, source dir, optional install/build).
 ```
 
@@ -90,8 +90,8 @@ Sections currently supported:
 | `[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` | Root lifecycle hooks per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry is a direct `command` plus ordered `args`, with optional shared literal/glob `inputs` / `output` staleness gating. Plus per-`[build]`-entry inline `prebuild` / `postbuild`. |
 | Any other top-level section with a `command` field | A user-declared run task callable via `lwpt run <name>` per [ADR-0013](./adr/0013-run-subcommand-and-build-rename.md) |
 | `[version]` | optional version-baking: writes a generated `.inc` with `<prefix>_VERSION` + `<prefix>_BUILD_DATE` |
-| `[lwpt]` | toolkit-state overrides (`modules-dir`, `archives-dir`, `tmp-dir`, `cfg-file`). Defaults match the constants in `LWPT.Core` |
-| `[format]` | `include = [...]` adds format-scope globs; `exclude = [...]` subtracts them. Toolkit state (root `.lwpt/**` plus any `[lwpt]` override paths) is excluded by default unless an explicit include matches it (ADR-0028). Workspace packages are included by the root walk by default and opt out via their own `[format]` section |
+| `[lwpt]` | toolkit-state overrides (`modules-dir`, `archives-dir`, `tmp-dir`, `sessions-dir`, `cfg-file`). Defaults match the constants in `LWPT.Core`; `sessions-dir` is overridden by `LWPT_SESSION_DIR` |
+| `[format]` | `include = [...]` adds format-scope globs; `exclude = [...]` subtracts them. Toolkit state (root `.lwpt/**`, redirected toolkit paths, and only the project-owned namespace below a shared `sessions-dir` base) is excluded by default unless an explicit include matches it (ADR-0028). Workspace packages are included by the root walk by default and opt out via their own `[format]` section |
 | `[analysis]` | shared analysis source scope only: `include = [...]` adds Pascal source globs on top of `[package].units` and exact `[build]` sources; `exclude = [...]` subtracts them. Workspaces inherit the root configuration unless they declare their own `[analysis]` table. Command-specific thresholds and policy do not live here. |
 | `[health]` | optional strict maxima for routine/file cyclomatic and cognitive complexity plus the separate `0..100` hotspot score. Workspaces inherit root limits unless they declare their own table. See [`health.md`](./health.md). |
 | `[duplication]` | command-owned clone policy: `minimum-tokens` defaults to 100 and must be at least 25; optional integer `maximum-percent` fails only when aggregate duplication is greater than the configured value. Workspaces inherit the root table unless they declare their own. |
@@ -243,6 +243,7 @@ See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) for the full design ra
 | `.lwpt/tmp/` | Gitignored | Install workspace and journaled rollback copies. A materializing install or `lwpt repair` recovers pending state before ordinary residue cleanup. Frozen verification does not mutate it. |
 | `.lwpt/install.lock` | Gitignored | Cross-process install lock. Created with O_CREAT\|O_EXCL by the first `lwpt install`; a second concurrent install fails with `EConcurrencyError` naming the lock holder's PID. Deleted by the normally-completing install; a crashed install leaves it for the user to clear via `lwpt repair`. Windows lock uses `LockFileEx`. |
 | `.lwpt/sessions/<session-id>/` | Gitignored | Build/test compiler staging. Every invocation owns distinct, bounded, hash-qualified job, unit, executable, and hook-compile paths. Completed sessions retain stable job logs until `lwpt repair`; failed/crashed sessions retain their private diagnostics. The sibling `locks/` directory contains stable publication-lock files and per-session owner guards. |
+| `.lwpt/session-roots` | Gitignored | Atomic schema-versioned ledger of exact identity-verified relocated session namespaces used by `lwpt repair`. |
 
 ### ⚠️ Windows safe-deletion warning
 

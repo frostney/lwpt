@@ -32,6 +32,8 @@ type
     procedure TestSessionsAreUniqueAndPrivate;
     procedure TestPathKeysAreBoundedAndCollisionResistant;
     procedure TestSessionIDsStayCompact;
+    procedure TestManifestSessionRootIsProjectRelative;
+    procedure TestRelocatedSessionUsesOwnedProjectNamespace;
     procedure TestCompilerPathBudgetGuard;
     procedure TestSuccessfulSessionIsRemoved;
     procedure TestStaleCandidateDoesNotReplacePublicOutput;
@@ -50,9 +52,12 @@ type
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
     procedure TestDirectoryAliasesHaveDeterministicFingerprint;
     procedure TestPublicationLockUsesFilesystemIdentity;
+    procedure TestProjectNamespaceUsesPhysicalDirectoryIdentity;
+    procedure TestRepairRejectsLinkedRelocatedNamespace;
     {$ENDIF}
     procedure TestRepairRemovesInactiveAndKeepsLiveSessions;
     procedure TestRepairRemovesInterruptedSessionCreation;
+    procedure TestRepairUsesHistoricalRelocatedRootsOnly;
   end;
 
 procedure TLWPTBuildSessionTests.ResetScratch;
@@ -193,6 +198,115 @@ begin
     Second.Free;
   end;
 end;
+
+procedure TLWPTBuildSessionTests.TestManifestSessionRootIsProjectRelative;
+var
+  Resolved: string;
+begin
+  ResetScratch;
+  Resolved := ResolveBuildSessionsRoot(FScratch, '../shallow-sessions',
+    FScratch + '/invocation');
+  Expect<string>(Resolved).ToBe(ExpandFileName(FScratch
+    + '/../shallow-sessions'));
+  Resolved := ResolveBuildSessionsRoot(FScratch, '',
+    FScratch + '/invocation');
+  Expect<string>(Resolved).ToBe(ExpandFileName(FScratch + '/'
+    + BUILD_SESSIONS_DIR));
+end;
+
+procedure TLWPTBuildSessionTests.
+  TestRelocatedSessionUsesOwnedProjectNamespace;
+var
+  Session: TLWPTBuildSession;
+  ConfiguredRoot, Ledger: string;
+begin
+  ResetScratch;
+  ConfiguredRoot := FScratch + '-shared';
+  if DirectoryExists(ConfiguredRoot) then WipeDir(ConfiguredRoot);
+  Session := TLWPTBuildSession.Create(FScratch, ConfiguredRoot);
+  try
+    Expect<Boolean>(Pos(IncludeTrailingPathDelimiter(ConfiguredRoot)
+      + 'p-', Session.SessionsRoot) = 1).ToBe(True);
+    Expect<Boolean>(FileExists(Session.SessionsRoot
+      + '/project.identity')).ToBe(True);
+    Expect<string>(Session.SessionReference).ToBe(Session.SessionRoot);
+    Ledger := FScratch + '/' + BUILD_SESSION_ROOT_LEDGER;
+    Expect<Boolean>(FileExists(Ledger)).ToBe(True);
+  finally
+    Session.Finish(True);
+    Session.Free;
+    if DirectoryExists(ConfiguredRoot) then WipeDir(ConfiguredRoot);
+  end;
+end;
+
+{$IFDEF UNIX}
+procedure TLWPTBuildSessionTests.
+  TestProjectNamespaceUsesPhysicalDirectoryIdentity;
+var
+  ProjectPath, RenamedPath, AliasPath, SharedRoot: string;
+  OriginalRoot, RenamedRoot, AliasRoot, UpperRoot, LowerRoot: string;
+  UpperInfo, LowerInfo: BaseUnix.Stat;
+begin
+  ResetScratch;
+  ProjectPath := FScratch + '/Project';
+  RenamedPath := FScratch + '/Renamed';
+  AliasPath := FScratch + '/Alias';
+  SharedRoot := FScratch + '/shared';
+  ForceDirectories(ProjectPath);
+  OriginalRoot := BuildSessionsProjectRoot(ProjectPath, SharedRoot);
+  if not RenameFile(ProjectPath, RenamedPath) then
+    raise Exception.Create('fixture: could not rename project directory');
+  RenamedRoot := BuildSessionsProjectRoot(RenamedPath, SharedRoot);
+  Expect<string>(RenamedRoot).ToBe(OriginalRoot);
+  if FpSymlink(PAnsiChar('Renamed'), PAnsiChar(AliasPath)) <> 0 then
+    raise Exception.Create('fixture: could not create project alias');
+  AliasRoot := BuildSessionsProjectRoot(AliasPath, SharedRoot);
+  Expect<string>(AliasRoot).ToBe(OriginalRoot);
+
+  ForceDirectories(FScratch + '/Foo');
+  ForceDirectories(FScratch + '/foo');
+  if (FpStat(FScratch + '/Foo', UpperInfo) = 0)
+    and (FpStat(FScratch + '/foo', LowerInfo) = 0)
+    and ((UpperInfo.st_dev <> LowerInfo.st_dev)
+      or (UpperInfo.st_ino <> LowerInfo.st_ino)) then
+  begin
+    UpperRoot := BuildSessionsProjectRoot(FScratch + '/Foo', SharedRoot);
+    LowerRoot := BuildSessionsProjectRoot(FScratch + '/foo', SharedRoot);
+    Expect<Boolean>(UpperRoot <> LowerRoot).ToBe(True);
+  end;
+end;
+
+procedure TLWPTBuildSessionTests.
+  TestRepairRejectsLinkedRelocatedNamespace;
+var
+  Session: TLWPTBuildSession;
+  ConfiguredRoot, NamespaceRoot, VictimSession: string;
+  Removed, Retained: Integer;
+begin
+  ResetScratch;
+  ConfiguredRoot := FScratch + '-shared';
+  if DirectoryExists(ConfiguredRoot) then WipeDir(ConfiguredRoot);
+  Session := TLWPTBuildSession.Create(FScratch, ConfiguredRoot);
+  NamespaceRoot := Session.SessionsRoot;
+  Session.Finish(False, 'failed');
+  Session.Free;
+  WipeDir(NamespaceRoot);
+  VictimSession := FScratch + '/victim/s-foreign';
+  WriteText(VictimSession + '/session.state',
+    '999999999'#10'failed'#10'1');
+  if FpSymlink(PAnsiChar(FScratch + '/victim'),
+    PAnsiChar(NamespaceRoot)) <> 0 then
+    raise Exception.Create('fixture: could not link session namespace');
+
+  RepairBuildSessions(FScratch, Removed, Retained);
+
+  Expect<Integer>(Removed).ToBe(0);
+  Expect<Boolean>(DirectoryExists(VictimSession)).ToBe(True);
+  if IsDirSymlinkOrJunction(NamespaceRoot) then
+    FpUnlink(PAnsiChar(NamespaceRoot));
+  if DirectoryExists(ConfiguredRoot) then WipeDir(ConfiguredRoot);
+end;
+{$ENDIF}
 
 procedure TLWPTBuildSessionTests.TestPathKeysAreBoundedAndCollisionResistant;
 var
@@ -730,7 +844,8 @@ begin
   Expect<Boolean>(FileExists(FailedOwnerPath)).ToBe(True);
   WriteText(LiveRoot + '/session.state', 'unreadable live state');
 
-  RepairBuildSessions(FScratch, Removed, Retained);
+  RepairBuildSessions(IncludeTrailingPathDelimiter(FScratch), Removed,
+    Retained);
   Expect<Integer>(Removed).ToBe(1);
   Expect<Integer>(Retained).ToBe(1);
   Expect<Boolean>(DirectoryExists(FailedRoot)).ToBe(False);
@@ -760,12 +875,42 @@ begin
     + '/.creating-session-abandoned')).ToBe(False);
 end;
 
+procedure TLWPTBuildSessionTests.
+  TestRepairUsesHistoricalRelocatedRootsOnly;
+var
+  FailedSession: TLWPTBuildSession;
+  FailedRoot, ConfiguredRoot, UnownedRoot: string;
+  Removed, Retained: Integer;
+begin
+  ResetScratch;
+  ConfiguredRoot := FScratch + '-shared';
+  UnownedRoot := ConfiguredRoot + '/other-project/s-orphan';
+  if DirectoryExists(ConfiguredRoot) then WipeDir(ConfiguredRoot);
+  FailedSession := TLWPTBuildSession.Create(FScratch, ConfiguredRoot);
+  FailedRoot := FailedSession.SessionRoot;
+  FailedSession.Finish(False, 'failed');
+  FailedSession.Free;
+  WriteText(UnownedRoot + '/session.state', '999999999'#10'failed'#10'1');
+
+  RepairBuildSessions(IncludeTrailingPathDelimiter(FScratch), Removed,
+    Retained);
+
+  Expect<Integer>(Removed).ToBe(1);
+  Expect<Boolean>(DirectoryExists(FailedRoot)).ToBe(False);
+  Expect<Boolean>(DirectoryExists(UnownedRoot)).ToBe(True);
+  if DirectoryExists(ConfiguredRoot) then WipeDir(ConfiguredRoot);
+end;
+
 procedure TLWPTBuildSessionTests.SetupTests;
 begin
   Test('sessions have unique private job roots',
     TestSessionsAreUniqueAndPrivate);
   Test('session ids stay compact for path-budget headroom',
     TestSessionIDsStayCompact);
+  Test('manifest session roots resolve from the project root',
+    TestManifestSessionRootIsProjectRelative);
+  Test('relocated sessions use an owned project namespace',
+    TestRelocatedSessionUsesOwnedProjectNamespace);
   Test('compiler path budget guard refuses over-long staging',
     TestCompilerPathBudgetGuard);
   Test('path keys are bounded and resist sanitised collisions',
@@ -803,11 +948,17 @@ begin
     TestDirectoryAliasesHaveDeterministicFingerprint);
   Test('publication locks use destination filesystem identity',
     TestPublicationLockUsesFilesystemIdentity);
+  Test('project namespaces use physical directory identity',
+    TestProjectNamespaceUsesPhysicalDirectoryIdentity);
+  Test('repair rejects linked relocated namespaces',
+    TestRepairRejectsLinkedRelocatedNamespace);
   {$ENDIF}
   Test('repair removes inactive sessions and retains live sessions',
     TestRepairRemovesInactiveAndKeepsLiveSessions);
   Test('repair removes interrupted session creation',
     TestRepairRemovesInterruptedSessionCreation);
+  Test('repair uses historical relocated roots without scanning siblings',
+    TestRepairUsesHistoricalRelocatedRootsOnly);
 end;
 
 begin

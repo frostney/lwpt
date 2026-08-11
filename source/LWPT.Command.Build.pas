@@ -568,6 +568,9 @@ begin
   AppendCompilerEnvironmentSearchPaths(Request.BuildRequest.Inputs.UnitPaths,
     Request.BuildRequest.Inputs.IncludePaths);
   AddDeclaredOutputs(AMan, Request.ExcludedPaths);
+  i := Length(Request.ExcludedPaths);
+  SetLength(Request.ExcludedPaths, i + 1);
+  Request.ExcludedPaths[i] := ASession.SessionsRoot;
   ValidateBuildRequest(Request.BuildRequest);
   { A cached default-target discovery never substitutes for live validation
     of the concrete operation. }
@@ -1261,8 +1264,9 @@ begin
   if (AJobs > 0) and (AJobs < MaxJobs) then MaxJobs := AJobs;
   if MaxJobs < 1 then MaxJobs := 1;
   WriteLn('build mode: ', ModeStr);
-  Session := TLWPTBuildSession.Create(
-    ExtractFileDir(ExpandFileName(AManifestPath)));
+  Session := TLWPTBuildSession.Create(ProjectRoot,
+    ResolveBuildSessionsRoot(ProjectRoot, ResolveSessionsDir(Man),
+      GetCurrentDir));
   try
     Reporter := TLWPTProgressReporter.Create(Session, lpsBuild);
     WriteLn('build session: ', Session.SessionID, ' (',

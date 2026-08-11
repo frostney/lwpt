@@ -285,7 +285,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
   and `--bail=N` overrides it. Compile and runtime failures both count;
   reaching a positive threshold terminates and reaps active children.
 - **Test-artefact placement** — every `lwpt test` invocation owns a unique
-  `.lwpt/sessions/<session-id>/` directory. Each test program receives a
+  resolved project-owned build-session directory. Each test program receives a
   private `-FE`, `-FU`, and executable path below that session. Successful
   sessions discard private compiler jobs and hooks but retain stable logs and
   completed state for diagnosis. Failed sessions retain their private

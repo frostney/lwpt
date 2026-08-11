@@ -8,6 +8,7 @@ build/
 .lwpt/tmp/
 .lwpt/install.lock
 .lwpt/sessions/
+.lwpt/session-roots
 .lwpt/workers/
 
 # FPC artefacts. These should never appear with -FE build, but defensive

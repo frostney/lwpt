@@ -14,7 +14,8 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 - **TLS clients are platform-native; server accept is asymmetric.** Clients use SChannel on Windows, SecureTransport on macOS, and system OpenSSL on other Unix. The memory-BIO server API requires runtime-loaded OpenSSL 3 or newer on Windows and Unix-not-Darwin; Windows uses a restricted DLL search, and macOS servers use Network.framework. Per [ADR-0016](./adr/0016-tls-backend-per-platform.md) and [ADR-0024](./adr/0024-openssl-server-tls-accept.md).
 - **EXDEV-rename failures fall back to copy-then-delete.** When `.lwpt/tmp/` and `.lwpt/modules/` end up on different filesystems (Docker bind mounts, network drives), the atomic-rename helpers (`AtomicMoveFile`, `AtomicMoveDir`) automatically fall back to a copy followed by delete.
 - **Compiler outputs are session-private.** Build and test invocations write
-  below `.lwpt/sessions/<session-id>/`; only a successful, revalidated build
+  below the resolved project-owned build-session root; only a successful,
+  revalidated build
   result is atomically published to its manifest output.
 - **Every resolved subcommand reports completion.** A status-aware elapsed-time
   line is written to stderr after ordinary success or failure diagnostics.
@@ -110,6 +111,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | Variable | Effect | Default |
 | --- | --- | --- |
 | `LWPT_CACHE_DIR` | Reserved for [issue #30](https://github.com/frostney/lwpt/issues/30). Today: ignored. | n/a until the cache implementation lands |
+| `LWPT_SESSION_DIR` | Build/test session base; relative values resolve from the invocation working directory and override `[lwpt].sessions-dir` | unset |
 | `LWPT_WORKER_BUDGET` | Maximum aggregate LWPT workers for this user and machine | logical processor count |
 | `LWPT_WORKER_STATE_DIR` | Override the worker coordinator state root; an explicit unwritable path fails rather than falling back | the platform application-config directory's `workers/` subdirectory, with automatic fallback to the repository's `.lwpt/workers/` when that default is unwritable |
 | `LWPT_WORKER_LEASE_STALE_SECONDS` | Mark heartbeat diagnostics stale after this interval; values below 3 are rejected. Heartbeat age never authorises reclamation by itself. | `30` |
@@ -220,7 +222,11 @@ Before publication, old committed paths are copied and content-validated below o
 
 ## Build sessions and publication
 
-Build and test sessions are project-local and process-owned. Each compiler
+Build and test sessions are project-owned and process-owned. They use
+`LWPT_SESSION_DIR`, then `[lwpt].sessions-dir`, then the project-local default.
+Configured bases receive an identity-verified project-hash namespace; absolute
+shallow bases are recommended for dependable FPC path-budget relief. Each
+compiler
 invocation receives private executable and unit-output directories. A build
 captures a schema-versioned, compiler-neutral publication fingerprint covering
 the selected compiler identity, executable, and live version; the requested
@@ -234,7 +240,7 @@ advisory byte-range lock on a stable file, so threads and processes both
 serialize publication and process exit still releases OS ownership without a
 stale-file unlink race. LWPT captures the fingerprint again and refuses
 publication if any declared input changed. Search-root hashing excludes
-`.lwpt/sessions/` and declared build outputs, follows workspace directory
+the resolved build-session root and declared build outputs, follows workspace directory
 links with physical cycle detection, and content-hashes directories from
 `LWPT_FPC_UNIT_PATHS`; explicit file inputs remain hashed even if also listed
 as outputs. A current candidate is replaced with one same-filesystem
@@ -261,6 +267,8 @@ Each session holds an OS owner guard from before it becomes visible until final
 state is written. Successful completion removes compiler jobs and compiled hooks
 but retains stable job logs; `lwpt repair` removes only unlocked sessions and
 conservatively retains live guards even when their state file is malformed.
+Relocated roots are atomically recorded in `.lwpt/session-roots`; repair reads
+only exact historical entries whose full project identity matches.
 
 ## Duplication analysis
 
