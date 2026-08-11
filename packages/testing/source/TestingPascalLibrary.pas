@@ -6,7 +6,9 @@ interface
 
 uses
   Generics.Collections,
-  SysUtils;
+  SysUtils,
+
+  TestingPascalLibrary.Protocol;
 
 type
   // Forward declarations
@@ -100,6 +102,7 @@ type
 
     procedure AddSuite(const ASuiteClass: TTestSuiteClass); overload;
     procedure AddSuite(const ASuite: TTestSuite); overload;
+    function InventoryLine: string;
     procedure Run;
 
     property Results: TList<TTestResult> read FResults;
@@ -336,6 +339,9 @@ var
   Test: TTestRegistration;
   TestResult: TTestResult;
 begin
+  if CurrentTestInventoryMode <> '' then WriteLn(InventoryLine);
+  if CurrentTestInventoryMode = TEST_INVENTORY_MODE_ONLY then Halt(0);
+
   WriteLn;
   WriteLn('Running tests...');
   WriteLn;
@@ -380,6 +386,17 @@ begin
         ExitCode := 1;
       Break;
     end;
+end;
+
+function TTestRunner.InventoryLine: string;
+var
+  Suite: TTestSuite;
+  TestCount: Integer;
+begin
+  TestCount := 0;
+  for Suite in FSuites do Inc(TestCount, Suite.Tests.Count);
+  Result := TEST_INVENTORY_PREFIX + IntToStr(FSuites.Count) + #9
+    + IntToStr(TestCount);
 end;
 
 procedure TTestRunner.PrintResults;

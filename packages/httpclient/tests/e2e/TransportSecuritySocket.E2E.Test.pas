@@ -759,10 +759,15 @@ begin
 end.
 {$ELSE}
 uses
-  SysUtils;
+  SysUtils,
+
+  TestingPascalLibrary.Protocol;
 
 begin
-  WriteLn('TransportSecurity socket E2E skipped: Linux-only');
+  if CurrentTestInventoryMode <> '' then
+    WriteLn(TEST_INVENTORY_PREFIX, '0', #9, '0');
+  if CurrentTestInventoryMode <> TEST_INVENTORY_MODE_ONLY then
+    WriteLn('TransportSecurity socket E2E skipped: Linux-only');
   ExitCode := 0;
 end.
 {$ENDIF}

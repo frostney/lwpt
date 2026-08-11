@@ -350,11 +350,12 @@ end;
 function HandleTest(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  IncludeE2E, Verbose : Boolean;
+  IncludeE2E, Inventory, Verbose : Boolean;
   TierVal : string;
   Jobs, Bail, i : Integer;
 begin
   IncludeE2E := False;
+  Inventory := False;
   Verbose := False;
   Jobs := 0;
   Bail := -1;
@@ -376,6 +377,9 @@ begin
     else if SameText(AOptions[i].LongName, 'verbose')
        and AOptions[i].Present then
       Verbose := True
+    else if SameText(AOptions[i].LongName, 'inventory')
+       and AOptions[i].Present then
+      Inventory := True
     else if SameText(AOptions[i].LongName, 'jobs')
        and (AOptions[i] is TIntegerOption) and AOptions[i].Present then
     begin
@@ -400,7 +404,7 @@ begin
     end;
   try
     InstallProcessTreeSignalForwarding;
-    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail, Verbose,
+    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail, Verbose, Inventory,
       APositionals);
   except
     on E: Exception do
@@ -658,7 +662,7 @@ begin
       'Report manifest-scoped Pascal token clones', '[--json]',
       @HandleDuplication, DuplicationOpts));
 
-    SetLength(TestOpts, 4);
+    SetLength(TestOpts, 5);
     TestOpts[0] := TStringOption.Create('tier',
       'Test tier to include: default (unit + integration) or e2e (adds network-touching tier)');
     TestOpts[1] := TIntegerOption.Create('jobs',
@@ -667,9 +671,11 @@ begin
       'Stop after N compile or runtime failures; 0 runs the full queue');
     TestOpts[3] := TFlagOption.Create('verbose',
       'Replay successful test logs');
+    TestOpts[4] := TFlagOption.Create('inventory',
+      'Emit registered suites and cases as deterministic JSON without running tests');
     Registry.Add(TSubcommand.Create('test',
       'Discover and run *.Test.pas files',
-      '[selector...] [--tier default|e2e] [--jobs N] [--bail N] [--verbose]',
+      '[selector...] [--tier default|e2e] [--jobs N] [--bail N] [--verbose] [--inventory]',
       @HandleTest, TestOpts));
 
     SetLength(RepairOpts, 0);

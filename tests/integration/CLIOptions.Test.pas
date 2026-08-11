@@ -76,6 +76,8 @@ type
     procedure TestTestSelectionPreservesTierPolicy;
     procedure TestPretestCannotAddTestPrograms;
     procedure TestInvalidTestSelectorsFailBeforePretest;
+    procedure TestInventorySkipsHooksAndTestBodies;
+    procedure TestCommittedInventoryMismatchFailsActionably;
   end;
 
 function CompletionPrefix(const ACommand, AStatus: string): string;
@@ -702,6 +704,67 @@ begin
   ExpectRejected('../*.Test.pas', 'must be project-root-relative');
 end;
 
+procedure WriteInventoryProbe(const AProjectPath: string);
+begin
+  WriteTextFile(AProjectPath + '/source/Inventory.Test.pas',
+    'program Inventory.Test;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'uses SysUtils;'#10 +
+    'var Marker: Text; Mode: string;'#10 +
+    'begin'#10 +
+    '  Mode := GetEnvironmentVariable(''TESTING_PASCAL_LIBRARY_INVENTORY'');'#10 +
+    '  if (Mode <> '''') and SameFileName(ExpandFileName(ParamStr(0)),'#10 +
+    '    ExpandFileName(GetEnvironmentVariable('#10 +
+    '      ''TESTING_PASCAL_LIBRARY_INVENTORY_EXECUTABLE''))) then'#10 +
+    '    WriteLn(''tpl-inventory-v1'', #9, ''1'', #9, ''1'');'#10 +
+    '  if Mode = ''only'' then Halt(0);'#10 +
+    '  Assign(Marker, ''inventory-body-ran.txt'');'#10 +
+    '  Rewrite(Marker);'#10 +
+    '  Close(Marker);'#10 +
+    'end.'#10);
+end;
+
+procedure TCLIOptionsE2E.TestInventorySkipsHooksAndTestBodies;
+var
+  R: TLwptResult;
+begin
+  WriteInventoryProbe(FScratch);
+  DeleteFile(FScratch + '/pretest-ran.txt');
+  DeleteFile(FScratch + '/inventory-body-ran.txt');
+  R := RunLwpt(['test', '--inventory', 'source/Inventory.Test.pas',
+    '--jobs=1'], FScratch);
+  DumpRunFailure('test inventory', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('"schema":"lwpt.test-inventory"', R.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('"path":"source/Inventory.Test.pas"', R.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('"suites":1,"cases":1', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/pretest-ran.txt')).ToBe(False);
+  Expect<Boolean>(FileExists(FScratch + '/inventory-body-ran.txt')).ToBe(False);
+end;
+
+procedure TCLIOptionsE2E.TestCommittedInventoryMismatchFailsActionably;
+var
+  R: TLwptResult;
+begin
+  WriteInventoryProbe(FScratch);
+  ForceDirectories(FScratch + '/tests');
+  WriteTextFile(FScratch + '/tests/test-inventory.tsv',
+    'lwpt-test-inventory-v1'#10 +
+    'platform'#9'darwin/aarch64'#10 +
+    'program'#9'*'#9'unit'#9'source/Inventory.Test.pas'#9'1'#9'2'#10);
+  try
+    R := RunLwpt(['test', 'source/Inventory.Test.pas', '--jobs=1'], FScratch);
+    Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+    Expect<Boolean>(Pos('test inventory is stale', R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos('expected 1 suites/2 cases, got 1 suites/1 cases',
+      R.Stderr) > 0).ToBe(True);
+  finally
+    DeleteFile(FScratch + '/tests/test-inventory.tsv');
+  end;
+end;
+
 procedure TCLIOptionsE2E.SetupTests;
 begin
   Test('lwpt --help lists every subcommand on stdout',
@@ -758,6 +821,10 @@ begin
     TestPretestCannotAddTestPrograms);
   Test('invalid test selectors fail before pretest and session creation',
     TestInvalidTestSelectorsFailBeforePretest);
+  Test('test inventory skips hooks and registered test bodies',
+    TestInventorySkipsHooksAndTestBodies);
+  Test('committed inventory mismatches fail with expected and actual counts',
+    TestCommittedInventoryMismatchFailsActionably);
 end;
 
 begin

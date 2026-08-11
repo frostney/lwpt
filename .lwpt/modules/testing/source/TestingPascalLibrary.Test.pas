@@ -31,7 +31,8 @@ program TestingPascalLibrary.Test;
 uses
   SysUtils,
 
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  TestingPascalLibrary.Protocol;
 
 type
   TCanarySuite = class(TTestSuite)
@@ -74,12 +75,31 @@ begin
   Expect<Boolean>(True).ToBe(True);
 end;
 
+procedure TestInventoryProtocol;
+var
+  Runner: TTestRunner;
+begin
+  Runner := TTestRunner.Create;
+  try
+    Runner.AddSuite(TCanarySuite.Create('inventory canary'));
+    if Runner.InventoryLine <> TEST_INVENTORY_PREFIX + '1'#9'1' then
+    begin
+      WriteLn(ErrOutput, 'FATAL: inventory protocol mismatch: ',
+        Runner.InventoryLine);
+      Halt(15);
+    end;
+  finally
+    Runner.Free;
+  end;
+end;
+
 var
   Suite: TCanarySuite;
   Runner: TTestRunner;
   Passed, Failed: Integer;
   R: TTestResult;
 begin
+  TestInventoryProtocol;
   WriteLn('TestingPascalLibrary canary starting');
 
   if not Assigned(TestRunnerProgram) then
