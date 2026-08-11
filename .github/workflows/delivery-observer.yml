@@ -31,6 +31,12 @@ on:
       - created
       - edited
       - deleted
+  check_run:
+    types:
+      - created
+      - rerequested
+      - completed
+      - requested_action
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:

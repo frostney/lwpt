@@ -68,6 +68,8 @@ class DiagnosticGitHub(FakeGitHub):
         self.dispatched: list[tuple[str, dict[str, str]]] = []
         self.cancelled: list[int] = []
         self.runs: list[dict] = []
+        self.checks: dict[int, dict] = {}
+        self.updated: list[tuple[int, dict]] = []
 
     def pull(self, number: int) -> dict:
         return {
@@ -85,8 +87,19 @@ class DiagnosticGitHub(FakeGitHub):
     def check_runs(self, head: str) -> list[dict]:
         return []
 
+    def review_evidence(self, number: int) -> tuple[list[dict], list[dict]]:
+        return [], []
+
+    def check_run(self, check_id: int) -> dict:
+        return self.checks[check_id]
+
     def cancel_run(self, run_id: int) -> None:
         self.cancelled.append(run_id)
+
+    def update_check(self, check_id: int, **fields: object) -> None:
+        self.updated.append((check_id, fields))
+        if fields.get("conclusion"):
+            self.checks[check_id]["status"] = "completed"
 
     def create_check(
         self, name: str, head: str, external_id: str, title: str, summary: str
@@ -122,7 +135,50 @@ class PromotionController(Controller):
         return {"conclusion": "success"}
 
     def validate_reviews(self, number: int, head: str) -> None:
-        self.preflight.append("review")
+        self.preflight.append(f"review:{number}")
+
+
+class PrefixPromotionController(PromotionController):
+    def snapshot(self, number: int) -> tuple[dict, str]:
+        snapshot = {
+                "mode": "native-prefix",
+                "candidate": number,
+                "entries": [
+                    {
+                        "number": 40,
+                        "head": "0" * 40,
+                        "base": "a" * 40,
+                        "base_ref": "main",
+                        "full_ci_required": True,
+                    },
+                    {
+                        "number": 41,
+                        "head": "1" * 40,
+                        "base": "0" * 40,
+                        "base_ref": "feature-one",
+                        "full_ci_required": False,
+                    },
+                ],
+            }
+        return snapshot, snapshot_digest(snapshot)
+
+    def current_pull(self, number: int, expected_head: str | None = None) -> dict:
+        self.preflight.append(f"current:{number}")
+        return {
+            "number": number,
+            "state": "open",
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "base": {"sha": "a" * 40 if number == 40 else "0" * 40},
+            "head": {
+                "sha": "0" * 40 if number == 40 else "1" * 40,
+                "repo": {"full_name": self.github.repository},
+            },
+        }
+
+    def require_delivery_success(self, number: int, expected_head: str) -> dict:
+        self.preflight.append(f"pr-ci:{number}")
+        return {"conclusion": "success"}
 
 
 class DeliveryModelTests(unittest.TestCase):
@@ -258,8 +314,147 @@ class DeliveryModelTests(unittest.TestCase):
         github = DiagnosticGitHub(head)
         controller = PromotionController(github)
         controller.full_ci(41, head)
-        self.assertEqual(["pr-ci", "review"], controller.preflight)
+        self.assertEqual(["pr-ci", "review:41"], controller.preflight)
         self.assertEqual("full-ci", github.dispatched[0][1]["mode"])
+
+    def test_native_prefix_promotion_validates_every_member(self) -> None:
+        github = DiagnosticGitHub("1" * 40)
+        controller = PrefixPromotionController(github)
+        controller.full_ci(41, "1" * 40)
+        self.assertIn("current:40", controller.preflight)
+        self.assertIn("pr-ci:40", controller.preflight)
+        self.assertIn("review:40", controller.preflight)
+        self.assertIn("current:41", controller.preflight)
+        self.assertIn("pr-ci:41", controller.preflight)
+        self.assertIn("review:41", controller.preflight)
+
+    def test_lower_prefix_review_change_cancels_candidate_full_ci(self) -> None:
+        lower_head = "0" * 40
+        top_head = "1" * 40
+        snapshot, digest = PrefixPromotionController(
+            DiagnosticGitHub(top_head)
+        ).snapshot(41)
+        github = DiagnosticGitHub(top_head)
+        github.checks[99] = {
+            "id": 99,
+            "status": "in_progress",
+            "name": "full-ci",
+            "app": {"slug": "github-actions"},
+            "output": {
+                "summary": "proof\n\n```json\n"
+                + json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+                + "\n```"
+            },
+        }
+        github.runs = [
+            {
+                "id": 7,
+                "status": "in_progress",
+                "display_title": f"full-ci/41/{top_head}/{digest}/99",
+            }
+        ]
+        controller = Controller(github)
+        controller.cancel_superseded_ci_runs(
+            40, lower_head, "ignored", review_changed=True
+        )
+        self.assertEqual([7], github.cancelled)
+
+    def test_configured_review_check_is_provider_neutral(self) -> None:
+        controller = Controller(DiagnosticGitHub("1" * 40))
+        self.assertTrue(
+            controller.is_review_check(
+                {
+                    "name": "Macroscope - Correctness Check",
+                    "app": {"slug": "macroscopeapp"},
+                }
+            )
+        )
+        self.assertFalse(
+            controller.is_review_check(
+                {"name": "build-and-test", "app": {"slug": "github-actions"}}
+            )
+        )
+
+    def test_review_invalidation_cancels_before_preserving_prefix_evidence(self) -> None:
+        lower_head = "0" * 40
+        top_head = "1" * 40
+        snapshot, digest = PrefixPromotionController(
+            DiagnosticGitHub(top_head)
+        ).snapshot(41)
+        github = DiagnosticGitHub(top_head)
+        encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+        github.checks[99] = {
+            "id": 99,
+            "status": "in_progress",
+            "started_at": "2026-08-11T12:00:00Z",
+            "name": "full-ci",
+            "app": {"slug": "github-actions"},
+            "output": {"summary": f"proof\n\n```json\n{encoded}\n```"},
+        }
+        github.runs = [
+            {
+                "id": 8,
+                "status": "in_progress",
+                "display_title": f"full-ci/41/{top_head}/{digest}/99",
+            }
+        ]
+        controller = Controller(github)
+        fingerprint = controller.review_fingerprint(
+            [], [], [], controller.automations
+        )
+        github.checks[99]["output"]["summary"] += (
+            "\n\n```review-evidence\n"
+            + json.dumps({"40": fingerprint}, separators=(",", ":"))
+            + "\n```"
+        )
+        controller.invalidate_active_full_ci_for_member(
+            40,
+            "Review evidence changed",
+            "lower member changed",
+            force=True,
+        )
+        self.assertEqual([8], github.cancelled)
+        self.assertEqual("failure", github.updated[0][1]["conclusion"])
+        self.assertIn(encoded, github.updated[0][1]["summary"])
+
+    def test_delayed_consumed_review_event_does_not_cancel_full_ci(self) -> None:
+        top_head = "1" * 40
+        snapshot, digest = PrefixPromotionController(
+            DiagnosticGitHub(top_head)
+        ).snapshot(41)
+        github = DiagnosticGitHub(top_head)
+        controller = Controller(github)
+        fingerprint = controller.review_fingerprint(
+            [], [], [], controller.automations
+        )
+        encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+        github.checks[99] = {
+            "id": 99,
+            "status": "in_progress",
+            "started_at": "2026-08-11T12:00:00Z",
+            "name": "full-ci",
+            "app": {"slug": "github-actions"},
+            "output": {
+                "summary": f"proof\n\n```json\n{encoded}\n```"
+                + "\n\n```review-evidence\n"
+                + json.dumps({"40": fingerprint}, separators=(",", ":"))
+                + "\n```"
+            },
+        }
+        github.runs = [
+            {
+                "id": 9,
+                "status": "in_progress",
+                "display_title": f"full-ci/41/{top_head}/{digest}/99",
+            }
+        ]
+        controller.invalidate_active_full_ci_for_member(
+            40,
+            "Review evidence changed",
+            "delayed event",
+        )
+        self.assertEqual([], github.cancelled)
+        self.assertEqual([], github.updated)
 
     def test_full_ci_refuses_a_branch_behind_its_base(self) -> None:
         head = "1" * 40

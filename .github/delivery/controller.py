@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -461,23 +462,32 @@ class Controller:
         )
 
     def full_ci(self, number: int, expected_head: str) -> None:
-        pull = self.current_pull(number, expected_head)
-        self.require_same_repository(pull)
-        if pull.get("mergeable") is False or pull.get("mergeable_state") in {
-            "behind",
-            "dirty",
-            "unknown",
-        }:
-            raise DeliveryError(
-                f"pull request #{number} is not integrated with its current base"
-            )
+        self.current_pull(number, expected_head)
         snapshot, digest = self.snapshot(number)
         if not snapshot_requires_full_ci(snapshot):
             raise DeliveryError(
                 f"candidate #{number} is not marked {FULL_CI_REQUIRED_LABEL}"
             )
-        self.require_delivery_success(number, expected_head)
-        self.validate_reviews(number, expected_head)
+        review_fingerprints: dict[str, str] = {}
+        for entry in snapshot["entries"]:
+            member = self.current_pull(entry["number"], entry["head"])
+            self.require_same_repository(member)
+            if member.get("mergeable") is False or member.get("mergeable_state") in {
+                "behind",
+                "dirty",
+                "unknown",
+            }:
+                raise DeliveryError(
+                    f"pull request #{entry['number']} is not integrated with its current base"
+                )
+            if (member.get("base") or {}).get("sha") not in {None, entry["base"]}:
+                raise DeliveryError(
+                    f"pull request #{entry['number']} base changed during promotion"
+                )
+            self.require_delivery_success(entry["number"], entry["head"])
+            review_fingerprints[str(entry["number"])] = self.validate_reviews(
+                entry["number"], entry["head"]
+            )
         external_id = self.full_ci_external_id(number, expected_head, digest)
         check = self.matching_check(expected_head, FULL_CI_CHECK, external_id)
         if check and check.get("conclusion") == "success":
@@ -490,7 +500,10 @@ class Controller:
             expected_head,
             external_id,
             "Full CI running",
-            f"Candidate topology: `{digest}`\n\n```json\n{summary}\n```",
+            f"Candidate topology: `{digest}`\n\n```json\n{summary}\n```\n\n"
+            + "```review-evidence\n"
+            + json.dumps(review_fingerprints, sort_keys=True, separators=(",", ":"))
+            + "\n```",
         )
         self.dispatch_with_terminal_failure(
             "ci.yml",
@@ -517,7 +530,55 @@ class Controller:
                 f"candidate #{candidate} requires successful exact-topology {FULL_CI_CHECK} evidence"
             )
 
-    def validate_reviews(self, number: int, head: str) -> None:
+    @staticmethod
+    def review_fingerprint(
+        checks: list[dict[str, Any]],
+        reviews: list[dict[str, Any]],
+        threads: list[dict[str, Any]],
+        automations: list[dict[str, Any]],
+    ) -> str:
+        def configured_check(check: dict[str, Any]) -> bool:
+            for automation in automations:
+                contexts = set(automation.get("check_contexts", []))
+                if automation.get("check_context"):
+                    contexts.add(automation["check_context"])
+                apps = set(automation.get("check_app_slugs", []))
+                if check.get("name") in contexts and (
+                    not apps or (check.get("app") or {}).get("slug") in apps
+                ):
+                    return True
+            return False
+
+        evidence = {
+            "checks": sorted(
+                [
+                    {
+                        "id": check.get("id"),
+                        "name": check.get("name"),
+                        "app": (check.get("app") or {}).get("slug"),
+                        "status": check.get("status"),
+                        "conclusion": check.get("conclusion"),
+                        "completed_at": check.get("completed_at"),
+                    }
+                    for check in checks
+                    if configured_check(check)
+                ],
+                key=lambda item: (item["name"] or "", item["id"] or 0),
+            ),
+            "reviews": reviews,
+            "threads": threads,
+        }
+        encoded = json.dumps(
+            evidence, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def current_review_fingerprint(self, number: int, head: str) -> str:
+        checks = self.github.check_runs(head)
+        reviews, threads = self.github.review_evidence(number)
+        return self.review_fingerprint(checks, reviews, threads, self.automations)
+
+    def validate_reviews(self, number: int, head: str) -> str:
         checks = self.github.check_runs(head)
         reviews, threads = self.github.review_evidence(number)
         reply_logins = {
@@ -539,6 +600,7 @@ class Controller:
         )
         if errors:
             raise DeliveryError("review evidence is not terminal: " + "; ".join(errors))
+        return self.review_fingerprint(checks, reviews, threads, self.automations)
 
     def merge(self, number: int, expected_head: str, candidate: int) -> None:
         pull = self.current_pull(number, expected_head)
@@ -654,6 +716,7 @@ class Controller:
         current_head: str,
         current_digest: str,
         review_changed: bool = False,
+        closed: bool = False,
     ) -> None:
         for run in self.github.workflow_runs("ci.yml"):
             if run.get("status") not in {"queued", "in_progress"}:
@@ -662,28 +725,149 @@ class Controller:
             full_ci = FULL_CI_RUN_RE.match(title)
             diagnostic = DIAGNOSTIC_RUN_RE.match(title)
             should_cancel = False
-            if full_ci and int(full_ci.group(1)) == number:
-                should_cancel = (
-                    full_ci.group(2) != current_head
-                    or full_ci.group(3) != current_digest
+            if full_ci:
+                if int(full_ci.group(1)) == number and (
+                    closed
                     or review_changed
-                )
+                    or full_ci.group(2) != current_head
+                    or full_ci.group(3) != current_digest
+                ):
+                    should_cancel = True
+                elif int(full_ci.group(1)) == number:
+                    should_cancel = False
+                else:
+                    check = self.github.check_run(int(full_ci.group(4)))
+                    summary = (check.get("output") or {}).get("summary") or ""
+                    marker = "```json\n"
+                    start = summary.find(marker)
+                    end = summary.find("\n```", start + len(marker))
+                    snapshot = None
+                    if start >= 0 and end > start:
+                        try:
+                            snapshot = json.loads(summary[start + len(marker):end])
+                        except json.JSONDecodeError:
+                            snapshot = None
+                    if snapshot is not None and snapshot_digest(snapshot) == full_ci.group(3):
+                        member = next(
+                            (entry for entry in snapshot.get("entries", [])
+                             if entry.get("number") == number),
+                            None,
+                        )
+                        if member is not None:
+                            should_cancel = (
+                                closed
+                                or review_changed
+                                or member.get("head") != current_head
+                            )
             elif diagnostic and int(diagnostic.group(1)) == number:
-                should_cancel = diagnostic.group(2) != current_head
+                should_cancel = closed or diagnostic.group(2) != current_head
             if should_cancel:
                 self.github.cancel_run(run["id"])
+
+    def is_review_check(self, check: dict[str, Any]) -> bool:
+        name = check.get("name")
+        app = (check.get("app") or {}).get("slug")
+        for automation in self.automations:
+            contexts = set(automation.get("check_contexts", []))
+            if automation.get("check_context"):
+                contexts.add(automation["check_context"])
+            apps = set(automation.get("check_app_slugs", []))
+            if name in contexts and (not apps or app in apps):
+                return True
+        return False
+
+    def invalidate_active_full_ci_for_member(
+        self,
+        number: int,
+        title: str,
+        summary: str,
+        force: bool = False,
+    ) -> None:
+        for run in self.github.workflow_runs("ci.yml"):
+            match = FULL_CI_RUN_RE.match(run.get("display_title", ""))
+            if not match:
+                continue
+            check = self.github.check_run(int(match.group(4)))
+            output = (check.get("output") or {}).get("summary") or ""
+            marker = "```json\n"
+            start = output.find(marker)
+            end = output.find("\n```", start + len(marker))
+            if start < 0 or end <= start:
+                continue
+            try:
+                snapshot = json.loads(output[start + len(marker):end])
+            except json.JSONDecodeError:
+                continue
+            if snapshot_digest(snapshot) != match.group(3) or not snapshot_contains(
+                snapshot, number
+            ):
+                continue
+            review_marker = "```review-evidence\n"
+            review_start = output.find(review_marker)
+            review_end = output.find("\n```", review_start + len(review_marker))
+            stored_fingerprints: dict[str, str] = {}
+            if review_start >= 0 and review_end > review_start:
+                try:
+                    stored_fingerprints = json.loads(
+                        output[review_start + len(review_marker):review_end]
+                    )
+                except json.JSONDecodeError:
+                    stored_fingerprints = {}
+            member = next(
+                entry for entry in snapshot["entries"] if entry["number"] == number
+            )
+            if not force:
+                try:
+                    current_fingerprint = self.current_review_fingerprint(
+                        number, member["head"]
+                    )
+                except DeliveryError:
+                    current_fingerprint = ""
+                if stored_fingerprints.get(str(number)) == current_fingerprint:
+                    continue
+            self.github.cancel_run(run["id"])
+            if check.get("status") != "completed" and self.owned(
+                check, FULL_CI_CHECK
+            ):
+                self.github.update_check(
+                    check["id"],
+                    title=title,
+                    summary=(
+                        summary
+                        + "\n\n```json\n"
+                        + json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+                        + "\n```\n\n```review-evidence\n"
+                        + json.dumps(
+                            stored_fingerprints,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n```"
+                    ),
+                    conclusion="failure",
+                )
 
     def observe(self, event_path: str | None) -> None:
         numbers: set[int] = set()
         review_changed_numbers: set[int] = set()
+        force_review_change: set[int] = set()
         if event_path:
             event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+            check_run = event.get("check_run")
+            if check_run and self.is_review_check(check_run):
+                for reference in check_run.get("pull_requests", []):
+                    review_changed_numbers.add(reference["number"])
+                    if event.get("action") in {"rerequested", "requested_action"}:
+                        force_review_change.add(reference["number"])
+                    numbers.add(reference["number"])
             pull = event.get("pull_request")
             if pull:
                 number = pull["number"]
                 head = pull["head"]["sha"]
                 if "review" in event or "comment" in event:
                     review_changed_numbers.add(number)
+                    if event.get("action") in {"edited", "dismissed", "deleted"}:
+                        force_review_change.add(number)
                 if pull.get("state") == "open":
                     numbers.add(number)
                 else:
@@ -692,6 +876,15 @@ class Controller:
                         head,
                         "Pull request closed",
                         f"Pull request #{number} closed before the proof completed.",
+                    )
+                    self.cancel_superseded_ci_runs(
+                        number, head, "", closed=True
+                    )
+                    self.invalidate_active_full_ci_for_member(
+                        number,
+                        "Prefix member closed",
+                        f"Pull request #{number} closed before the proof completed.",
+                        force=True,
                     )
                 before = event.get("before")
                 if before and before != head:
@@ -709,12 +902,16 @@ class Controller:
             pull = self.current_pull(number)
             _, digest = self.snapshot(number)
             if number in review_changed_numbers:
-                self.fail_pending_full_ci_review_change(number, pull["head"]["sha"])
+                self.invalidate_active_full_ci_for_member(
+                    number,
+                    "Review evidence changed",
+                    f"Review activity changed on prefix member #{number} after full-CI promotion started.",
+                    force=number in force_review_change,
+                )
             self.cancel_superseded_ci_runs(
                 number,
                 pull["head"]["sha"],
                 digest,
-                number in review_changed_numbers,
             )
 
     def fail_pending_full_ci_review_change(self, number: int, head: str) -> None:
