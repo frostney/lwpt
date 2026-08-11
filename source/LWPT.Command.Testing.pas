@@ -8,21 +8,24 @@ unit LWPT.Command.Testing;
 interface
 
 uses
+  Classes,
+
   LWPT.BuildRequest,
   LWPT.CompilerRegistry;
 
 function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
   const AHostOS, AHostArchitecture: string): Boolean;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
-  const AJobs, ABail: Integer; const AVerbose: Boolean): Integer; overload;
+  const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const ASelectors: TStrings): Integer; overload;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
   const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const ASelectors: TStrings;
   const ACompilerHost: TLWPTCompilerHost): Integer; overload;
 
 implementation
 
 uses
-  Classes,
   Process,
   SysUtils,
 
@@ -179,6 +182,12 @@ begin
   Result := (AName = LWPT_DIR) or (AName = 'build') or (AName = '.git');
 end;
 
+function IsTestSourcePath(const APath: string): Boolean; inline;
+begin
+  Result := (Length(APath) > 9)
+    and SameText(Copy(APath, Length(APath) - 8, 9), '.Test.pas');
+end;
+
 procedure CollectTestFiles(const ADir: string; AList: TStringList);
 var
   Search: TSearchRec;
@@ -194,14 +203,104 @@ begin
         if not IsExcludedDir(Search.Name) then
           CollectTestFiles(Base + Search.Name, AList);
       end
-      else if (Length(Search.Name) > 9)
-        and SameText(Copy(Search.Name, Length(Search.Name) - 8, 9),
-          '.Test.pas') then
+      else if IsTestSourcePath(Search.Name) then
         AList.Add(Base + Search.Name);
     until FindNext(Search) <> 0;
   finally
     FindClose(Search);
   end;
+end;
+
+function SelectorEscapesProject(const ASelector: string): Boolean; inline;
+begin
+  Result := Pos('/../', '/' + ASelector + '/') > 0;
+end;
+
+function TestRelativePath(const AProjectRoot, ATestPath: string): string;
+begin
+  Result := ExtractRelativePath(
+    IncludeTrailingPathDelimiter(AProjectRoot), ATestPath);
+  Result := CanonicalPathGlob(Result);
+end;
+
+procedure SelectTestFiles(const AProjectRoot: string;
+  const ADiscovered: TStringList; const ASelectors: TStrings;
+  const ASelected: TStringList);
+var
+  Canonical, FullPath, RelativePath, Selector: string;
+  i, j, MatchCount: Integer;
+  IsDirectory, IsFile, IsGlob: Boolean;
+begin
+  ASelected.CaseSensitive := True;
+  if (ASelectors = nil) or (ASelectors.Count = 0) then
+  begin
+    ASelected.AddStrings(ADiscovered);
+    Exit;
+  end;
+
+  for i := 0 to ASelectors.Count - 1 do
+  begin
+    Selector := ASelectors[i];
+    Canonical := CanonicalPathGlob(Selector);
+    while Copy(Canonical, 1, 2) = './' do Delete(Canonical, 1, 2);
+    if Canonical = '' then
+      raise ELWPTError.Create('test selector must not be empty');
+    if IsAbsoluteFilesystemPath(Canonical)
+       or SelectorEscapesProject(Canonical) then
+      raise ELWPTError.CreateFmt(
+        'test selector "%s" must be project-root-relative', [Selector]);
+
+    IsGlob := PatternHasGlob(Canonical);
+    IsDirectory := False;
+    IsFile := False;
+    FullPath := '';
+    if not IsGlob then
+    begin
+      FullPath := ResolveProjectPath(AProjectRoot, Canonical);
+      if not PathContains(AProjectRoot, FullPath) then
+        raise ELWPTError.CreateFmt(
+          'test selector "%s" must be project-root-relative', [Selector]);
+      IsDirectory := DirectoryExists(FullPath);
+      IsFile := FileExists(FullPath);
+      if not IsDirectory and not IsFile then
+        raise ELWPTError.CreateFmt(
+          'test selector "%s" does not exist', [Selector]);
+      if IsFile and not IsTestSourcePath(FullPath) then
+        raise ELWPTError.CreateFmt(
+          'test selector "%s" is not a *.Test.pas file', [Selector]);
+    end;
+
+    MatchCount := 0;
+    for j := 0 to ADiscovered.Count - 1 do
+    begin
+      RelativePath := TestRelativePath(AProjectRoot, ADiscovered[j]);
+      if (IsGlob and MatchPathGlob(RelativePath, Canonical))
+         or (IsDirectory and PathContains(FullPath, ADiscovered[j]))
+         or (IsFile and SameFileName(FullPath, ADiscovered[j])) then
+      begin
+        if ASelected.IndexOf(ADiscovered[j]) < 0 then
+          ASelected.Add(ADiscovered[j]);
+        Inc(MatchCount);
+      end;
+    end;
+    if MatchCount = 0 then
+    begin
+      if IsGlob then
+        raise ELWPTError.CreateFmt(
+          'test selector "%s" matched no discovered test files', [Selector])
+      else if IsDirectory then
+        raise ELWPTError.CreateFmt(
+          'test selector "%s" contains no discovered test files', [Selector])
+      else
+        raise ELWPTError.CreateFmt(
+          'test selector "%s" is outside the discovered test inventory',
+          [Selector]);
+    end;
+  end;
+  { Match the complete-discovery path's established case-insensitive
+    deterministic order after exact-path deduplication. }
+  ASelected.CaseSensitive := False;
+  ASelected.Sort;
 end;
 
 function IsE2ETestPath(const APath: string): Boolean; inline;
@@ -940,19 +1039,22 @@ begin
 end;
 
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
-  const AJobs, ABail: Integer; const AVerbose: Boolean): Integer;
+  const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const ASelectors: TStrings): Integer;
 begin
-  Result := CmdTest(AManifestPath, AIncludeE2E, AJobs, ABail, AVerbose, nil);
+  Result := CmdTest(AManifestPath, AIncludeE2E, AJobs, ABail, AVerbose,
+    ASelectors, nil);
 end;
 
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
   const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const ASelectors: TStrings;
   const ACompilerHost: TLWPTCompilerHost): Integer;
 const
   TESTS_SUPPORT_DIR = 'tests/support';
 var
   Man: TManifest;
-  Tests: TStringList;
+  DiscoveredTests, Tests: TStringList;
   UnitPaths: TStringArray;
   ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond: string;
   i, n, Passed, Failed, Skipped, CompileFailed, Cancelled,
@@ -971,6 +1073,8 @@ begin
   CompileFailed := 0;
   Cancelled := 0;
   CompilerSelection := nil;
+  DiscoveredTests := nil;
+  Tests := nil;
   try
     try
       Result := 1;
@@ -978,6 +1082,27 @@ begin
       if ABail < 0 then EffectiveBail := Man.TestBail
       else EffectiveBail := ABail;
       ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
+
+      { Freeze discovery and selection before pretest. A hook may prepare
+        inputs for the selected programs, but cannot add programs to this
+        invocation after the user-visible scope has been resolved. }
+      DiscoveredTests := TStringList.Create;
+      Tests := TStringList.Create;
+      for i := 0 to High(Man.Units) do
+        CollectTestFiles(Man.Units[i], DiscoveredTests);
+      CollectTestFiles('.', DiscoveredTests);
+      for i := 0 to DiscoveredTests.Count - 1 do
+        DiscoveredTests[i] := ExpandFileName(DiscoveredTests[i]);
+      DiscoveredTests.Sort;
+      i := DiscoveredTests.Count - 1;
+      while i > 0 do
+      begin
+        if DiscoveredTests[i] = DiscoveredTests[i - 1] then
+          DiscoveredTests.Delete(i);
+        Dec(i);
+      end;
+      SelectTestFiles(ProjectRoot, DiscoveredTests, ASelectors, Tests);
+
       CompilerSelection := TLWPTCompilerSelection.Create(Man, ProjectRoot,
         ACompilerHost);
       CompilerDriver := CompilerSelection.DriverFor('');
@@ -1014,19 +1139,6 @@ begin
       UnitPaths[n] := TESTS_SUPPORT_DIR;
     end;
 
-    Tests := TStringList.Create;
-    try
-      for i := 0 to High(Man.Units) do CollectTestFiles(Man.Units[i], Tests);
-      CollectTestFiles('.', Tests);
-      for i := 0 to Tests.Count - 1 do Tests[i] := ExpandFileName(Tests[i]);
-      Tests.Sort;
-      i := Tests.Count - 1;
-      while i > 0 do
-      begin
-        if Tests[i] = Tests[i - 1] then Tests.Delete(i);
-        Dec(i);
-      end;
-
       if Tests.Count = 0 then
       begin
         WriteLn('no *.Test.pas files found');
@@ -1052,7 +1164,11 @@ begin
         Exit;
       end;
 
-      WriteLn('discovered ', Tests.Count, ' test file(s)');
+      if (ASelectors <> nil) and (ASelectors.Count > 0) then
+        WriteLn('selected ', Tests.Count, ' of ', DiscoveredTests.Count,
+          ' discovered test file(s)')
+      else
+        WriteLn('discovered ', Tests.Count, ' test file(s)');
       if not AIncludeE2E then
         WriteLn('  (e2e tier skipped; pass --tier=e2e to include)');
       Scheduler := TTestScheduler.Create(Tests, AIncludeE2E, UnitPaths,
@@ -1074,10 +1190,6 @@ begin
         Result := 0
       else
         Result := 1;
-    finally
-      Tests.Free;
-    end;
-
     RunHooks('posttest', Man.PostTest, ProjectRoot);
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
@@ -1093,6 +1205,8 @@ begin
       end;
     end;
   finally
+    Tests.Free;
+    DiscoveredTests.Free;
     CompilerSelection.Free;
     WriteLn('summary: ', Passed, ' passed, ', Failed, ' failed, ',
       CompileFailed, ' did not compile, ', Skipped, ' skipped, ',

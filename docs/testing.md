@@ -20,7 +20,15 @@ How LWPT tests itself: the four-tier policy, the mock HTTP server, the binary-fe
 | **E2E** | Sometimes (live hosts or loopback only) | `tests/e2e/` and package-owned `tests/e2e/` | Linux leg only (dedicated `pr.yml` step per #102); every platform post-merge via `ci.yml` | No |
 | **Manual / spike** | N/A | Anywhere maintainer wants | No | No |
 
-`./build/lwpt test` runs Unit + Integration by default. `./build/lwpt test --tier=e2e` includes the live tier.
+`./build/lwpt test` runs Unit + Integration by default. `./build/lwpt test --tier=e2e` includes the live tier. Positional selectors constrain the run to exact `*.Test.pas` files, recursive directories, or LWPT globs (`*`, `?`, and `**`):
+
+```sh
+./build/lwpt test source/LWPT.Core.Test.pas
+./build/lwpt test packages/httpclient
+./build/lwpt test 'tests/**/Install*.Test.pas' --tier=e2e
+```
+
+Quote globs so LWPT—not the shell—matches them consistently. Multiple selectors form a deduplicated union and each must match at least one discovered test program. Discovery and selection freeze before `[pretest]`; the hook can prepare inputs for selected programs but cannot add programs to the current invocation.
 
 ## Test programs
 
@@ -241,7 +249,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`tests/integration/BuildEntries.Test.pas`** | 13 unconditional tests in 1 suite, plus 1 Unix-only and 1 Darwin-only | Covers named/all-entry selection, fail-fast entry/graph/`--jobs` validation, per-entry compiler-flag forwarding, the Darwin classic-linker path, private entry/mode artifacts, collision-resistant job paths, non-destructive clean behavior, and continuing after per-entry failures. |
 | **`tests/integration/InstallLocalDiamond.Test.pas`** | 10 tests in 2 suites | **Full transitive-resolver run** over the canonical diamond graph (root → branch-a + branch-b → leaf-c) with path-syntax local sources (`"../a"`, `"../b"`, `"../c"`) so no network. Asserts lockfile + cfg + tree shape + idempotence + `--frozen` happy path, plus manifest-path invocation from a different cwd. A stripped additive-field fixture proves an unambiguous early schema-v3 lockfile remains valid and byte-identical under frozen verification. **Tamper detection** — edits a file under `.lwpt/modules/leaf-c/`, runs `--frozen`, asserts `EVerifyError` naming the tree-hash mismatch + the dep, and proves lockfile, cfg, full modules hash, and tampered bytes remain unchanged by the failed verification. |
 | **`tests/integration/ExtractPathological.Test.pas`** | 14 tests in 2 suites | **Pathological ustar shapes** — baseline short path, > 100-char prefix-split, symlink deferred-link pass. **GNU 'L' long-name** — paths > 255 bytes (past ustar's prefix-split ceiling) wrapped in a GNU `'L'` typeflag header + body carrying the real name; the extractor's pending-long-name buffer carries the name across the header boundary. **Failure modes** — missing archive raises `EExtractError`, truncated gzip leaves Dest empty, invalid gzip magic same contract, tar truncated mid-entry never produces a byte-equal file. |
-| **`tests/integration/CLIOptions.Test.pas`** | 21 tests in 1 suite | Spawns `./build/lwpt` with various argv. `--help` + `-h` list every subcommand; unknown verb exits non-zero. Option parsing covers both `--mode` value shapes and invalid values. Completion coverage pins ordinary success and failure on stderr, including resolved naming through `lwpt run` aliasing. Silent-mode coverage verifies the shared option on every command, exactly-one-line success, ordered diagnostic/result replay, the `--verbose` conflict, resolved aliases, successful child suppression across a later compiler failure, failed run-task replay, failed format-check and no-build evidence after unrelated warnings, and rejection of interactive `init --silent`. Scratch project (tiny manifest, source, and commands) is built under an invocation-private test root. |
+| **`tests/integration/CLIOptions.Test.pas`** | 27 tests in 1 suite | Spawns `./build/lwpt` with various argv. `--help` + `-h` list every subcommand; unknown verb exits non-zero. Option parsing covers both `--mode` value shapes and invalid values. Test selection covers exact files, recursive directories, `*`/`?`/`**` globs, deduplicated unions, tier preservation, rejection before `pretest` or session creation, and proof that a `pretest`-generated program is excluded from the frozen inventory. Completion coverage pins ordinary success and failure on stderr, including resolved naming through `lwpt run` aliasing. Silent-mode coverage verifies the shared option on every command, exactly-one-line success, ordered diagnostic/result replay, the `--verbose` conflict, resolved aliases, successful child suppression across a later compiler failure, failed run-task replay, failed format-check and no-build evidence after unrelated warnings, and rejection of interactive `init --silent`. Scratch project (tiny manifest, source, tests, and commands) is built under an invocation-private test root. |
 | **`tests/integration/Duplication.Test.pas`** | 6 tests in 1 suite | Spawns `lwpt duplication` against scratch projects and pins report-only human output, byte-stable shared-envelope JSON, configured threshold failure, silent replay of stdout-only failure evidence, actionable invalid-floor diagnostics, and `[analysis].exclude` removal from both scope metadata and clone occurrences. |
 | **`tests/integration/CompilerProfiles.Test.pas`** | 17 tests in 1 suite | Uses disposable external, Blaise-CLI, and Lakon-CLI proxies through real `lwpt build` and `lwpt test` subprocesses. Covers success, configured built-in prefix ordering for probe and compile, Lakon cfg paths, entry precedence, identity/version/target failures without fallback, an explicit complete target tuple reaching probe and compile unchanged, generic non-host test rejection, live capability mutation, malformed results, timeout cleanup, artifact confinement, and publication revalidation. |
 | **`tests/integration/InstallFetchFailure.Test.pas`** | 20 tests in 3 suites | Spawns `lwpt install` against manifests whose dependency cannot be fetched. **Local source** (3): missing directory → exit non-zero, message names both the dep AND the missing path, `.lwpt/tmp/` empty. **Override contract** (11): `ApplyArchiveFetchOrigin` returns the canonical URL byte for byte when `LWPT_TEST_ARCHIVE_ORIGIN` is unset, swaps only the origin when set, and refuses a remote host, `localhost`, an address outside `127.0.0.0/8` (apart from Windows' non-routable limited-broadcast fallback), `https`, a missing port, a path, and user information. **HTTP failure modes** (6): HTTP 500; an immediate connect failure held in TCP `TIME_WAIT` on Unix and preflighted through HTTPClient's nonblocking Winsock flow on Windows; a redirect that must not escape the fixture; a stalled peer bounded by `LWPT_TEST_ARCHIVE_TIMEOUT_MS`; and a fixed-length body cut short mid-transfer. An independent subprocess watchdog and bounded mock-server join make timeout regressions fail instead of hanging CI. Every case runs offline on Unix and native Windows, asserts the dependency and operation in the message, and proves failure commits no lockfile, cfg, cached archive, or module tree. |
@@ -280,6 +288,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 - **`tests/support/Tests.Scratch.pas`** — scratch-directory file helpers shared by the integration + E2E test programs: `WriteTextFile` (write a small text file, creating parent dirs) and `RecursiveDelete` (wipe a tree; symlink-aware — links are unlinked, never followed). Replaces the per-test copy-paste of these two helpers.
 - **Testable internals exposure** — `SHA256Hex` remains in `LWPT.Core`; `LoadManifest` and manifest model types live in `LWPT.Manifest`; `LoadLockfile`, `VerifyAgainstLockfile`, and `ExtractArchive` live in `LWPT.Install`. Documented as testable-internal surface, not part of the consumer contract.
 - **`--tier` flag** on `lwpt test` — default tier runs unit + integration; `--tier=e2e` adds the network-touching tier.
+- **Positional test selectors** — exact `*.Test.pas` files, recursive
+  directories, and LWPT globs constrain the frozen discovered inventory.
+  Selectors are project-root-relative, strict, unioned, and deduplicated;
+  they never bypass `--tier`.
 - **Parallel scheduling controls** — `--jobs=N` caps this invocation within
   the shared worker budget. `[test] bail = N` supplies the project default,
   and `--bail=N` overrides it. Compile and runtime failures both count;
@@ -297,10 +309,10 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 
 | Tier | Files | Test cases |
 | --- | --- | --- |
-| Unit (`source/*.Test.pas` + package self-tests) | 30 | 507 |
-| Integration (`tests/integration/*.Test.pas`) | 23 | 250 |
+| Unit (`source/*.Test.pas` + package self-tests) | 30 | 534 Unix / 532 Windows |
+| Integration (`tests/integration/*.Test.pas`) | 23 | 263 Darwin / 262 other Unix / 258 Windows |
 | E2E (`tests/e2e/*.E2E.Test.pas` + package E2E) | 7 | 35 |
-| **Total** | **60** | **792** |
+| **Total** | **60** | **832 Darwin / 831 other Unix / 825 Windows** |
 
 ## TestingPascalLibrary self-test
 

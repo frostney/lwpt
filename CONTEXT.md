@@ -163,6 +163,24 @@ phase on the first non-zero exit.
 The point at which a hook section attaches to a subcommand run. Six top-level sections — `[preinstall]`, `[postinstall]`, `[prebuild]`, `[postbuild]`, `[pretest]`, `[posttest]` — plus the `prebuild` and `postbuild` fields available on each `[build].<entry>` inline table (per-item, build only). `format`, `repair`, `init`, `run`, and `agents` deliberately have no hook surface; the rationale for each refusal lives in the lifecycle ADR.
 *Avoid*: "lifecycle event" (suggests dynamic dispatch), "build phase" (subcommand-specific; we mean any of the three phased subcommands — install/build/test).
 
+### Testing
+
+**Test program**:
+A self-contained `*.Test.pas` source discovered by `lwpt test`, compiled into
+invocation-private staging, and run as one scheduler job. The discovered
+inventory is frozen before `[pretest]`; the hook may prepare a program's inputs
+but cannot add programs to the current invocation.
+*Avoid*: "test suite" (one program may register several suites), "test case"
+(a program contains cases), "test target" (target means an output platform).
+
+**Test selector**:
+A project-root-relative positional argument to `lwpt test` that selects test
+programs by exact file, recursive directory, or LWPT glob. Multiple selectors
+form one deduplicated union, every selector must match, and selection never
+widens the requested test tier.
+*Avoid*: "filter" (suggests name-substring matching), "test name" (selectors
+identify program paths, not cases registered inside a program).
+
 **Build entry** (build item):
 A single binary declaration in the `[build]` table — the thing `lwpt build` compiles, one per iteration. Multi-entry form: `[build.cli] source = "..."` (or the TOML-equivalent inline `[build] cli = { source = "..." }`). Single-entry shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` and the output to `build/<entry-name>`. Each entry takes `source` (required), `output` (optional), ordered `flags` (optional), an optional compiler profile, an independent optional complete target tuple, and optional per-entry `prebuild` / `postbuild` hook tables. Flags, compiler, and target are root-manifest behavior; dependency manifests cannot select executable policy. Renamed from the pre-ADR-0013 `[targets]`.
 *Avoid*: "target" (pre-ADR-0013 term; overloaded with Bazel/Make vocabulary and doesn't match LWPT's verb-noun pairing).

@@ -28,6 +28,9 @@ uses
   (correct on Windows and on the raw-status path), and trust ExitStatus
   whenever ExitCode claims success but the stored status disagrees. }
 function  NormalisedExitCode(const AProcess: TProcess): Integer;
+function  IsAbsoluteFilesystemPath(const APath: string): Boolean;
+function  PatternHasGlob(const APattern: string): Boolean;
+function  ResolveProjectPath(const AProjectRoot, APath: string): string;
 function  ResolveRunnableCommand(const AProjectRoot,
   ACommand: string): string;
 

@@ -131,3 +131,11 @@ project-relative literals or LWPT globs, every expression must match at least
 one file, a missing output or newer match runs, and an otherwise-fresh command
 skips. Legacy `script` fields hard-error with a `command`/`args` migration
 hint; there is no compatibility execution path.
+
+## 0.6.0 amendment — test discovery precedes `pretest`
+
+[ADR-0034](./0034-freeze-test-selection-before-pretest.md) supersedes this
+ADR's test-only ordering. `lwpt test` now freezes discovery and positional
+selection before `[pretest]`; the hook may prepare inputs for those programs
+but cannot add programs to the current invocation. Install and build lifecycle
+ordering is unchanged.

@@ -400,7 +400,8 @@ begin
     end;
   try
     InstallProcessTreeSignalForwarding;
-    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail, Verbose);
+    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail, Verbose,
+      APositionals);
   except
     on E: Exception do
     begin
@@ -668,7 +669,7 @@ begin
       'Replay successful test logs');
     Registry.Add(TSubcommand.Create('test',
       'Discover and run *.Test.pas files',
-      '[--tier default|e2e] [--jobs N] [--bail N] [--verbose]',
+      '[selector...] [--tier default|e2e] [--jobs N] [--bail N] [--verbose]',
       @HandleTest, TestOpts));
 
     SetLength(RepairOpts, 0);
