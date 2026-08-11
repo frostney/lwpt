@@ -3350,8 +3350,11 @@ begin
     end;
     Expect<Integer>(Length(Received)).ToBe(Length(Expected));
     if CompareByte(Expected[0], Received[0], Length(Expected)) <> 0 then
-      raise Exception.Create(
-        'Retained SChannel plaintext changed after caller mutation');
+      for I := 0 to High(Expected) do
+        if Expected[I] <> Received[I] then
+          raise Exception.CreateFmt(
+            'Retained SChannel plaintext differs at %d: expected %d, got %d',
+            [I, Expected[I], Received[I]]);
   finally
     AbortTransportSecurityServer(Connection);
     FreeSChannelClient(Client);
