@@ -1030,6 +1030,13 @@ begin
     raise EHTTPError.Create('HTTP maximum redirects must not be negative');
 end;
 
+procedure ValidateRequestContentType(const AContentType: string);
+begin
+  if (Pos(#13, AContentType) > 0) or (Pos(#10, AContentType) > 0) then
+    raise EHTTPError.Create(
+      'HTTP content type must not contain carriage return or line feed');
+end;
+
 function DoRequest(const AMethod, AURL: string;
   const ABody: TBytes; const AContentType: string;
   const AManagesContentHeaders: Boolean;
@@ -1050,6 +1057,8 @@ var
   Deadline, StartedAt: QWord;
 begin
   ValidateRequestOptions(AOptions);
+  if AManagesContentHeaders then
+    ValidateRequestContentType(AContentType);
   StartedAt := GetTickCount64;
   if AOptions.RequestTimeoutMilliseconds > High(QWord) - StartedAt then
     Deadline := High(QWord)

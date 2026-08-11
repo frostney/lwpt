@@ -95,6 +95,7 @@ type
     procedure TestPostRedirect301And302BecomesGet;
     procedure TestPostRedirect303BecomesGet;
     procedure TestPostRedirect307And308PreservesBody;
+    procedure TestPostRejectsContentTypeLineBreaksBeforeConnect;
     procedure TestPostSendsBinaryBodyAndOwnsEntityHeaders;
   end;
 
@@ -543,6 +544,39 @@ begin
   end;
 end;
 
+procedure THTTPClientRequestBodies.
+  TestPostRejectsContentTypeLineBreaksBeforeConnect;
+var
+  Body: TBytes;
+  ContentTypes: array[0..1] of string;
+  Endpoint: TMockRefusedEndpoint;
+  ErrorMessage, URL: string;
+  I: Integer;
+  NoHeaders: THTTPHeaders;
+begin
+  Body := MakeBytes([$00, $01]);
+  ContentTypes[0] := 'text/plain' + #13 + 'X-Injected: yes';
+  ContentTypes[1] := 'text/plain' + #10 + 'X-Injected: yes';
+  Endpoint := TMockRefusedEndpoint.Create;
+  try
+    URL := 'http://' + Endpoint.Host + ':' + IntToStr(Endpoint.Port) + '/x';
+    NoHeaders := nil;
+    for I := 0 to High(ContentTypes) do
+    begin
+      ErrorMessage := '';
+      try
+        HTTPPost(URL, Body, ContentTypes[I], NoHeaders);
+      except
+        on E: EHTTPError do ErrorMessage := E.Message;
+      end;
+      Expect<string>(ErrorMessage).ToBe(
+        'HTTP content type must not contain carriage return or line feed');
+    end;
+  finally
+    Endpoint.Free;
+  end;
+end;
+
 procedure THTTPClientRequestBodies.TestPostRedirect301And302BecomesGet;
 const
   CRLF = #13#10;
@@ -647,6 +681,8 @@ procedure THTTPClientRequestBodies.SetupTests;
 begin
   Test('POST sends complete binary content and owns entity headers',
     TestPostSendsBinaryBodyAndOwnsEntityHeaders);
+  Test('POST rejects Content-Type line breaks before connecting',
+    TestPostRejectsContentTypeLineBreaksBeforeConnect);
   Test('POST redirects through 301 and 302 as bodyless GET',
     TestPostRedirect301And302BecomesGet);
   Test('POST redirects through 303 as bodyless GET',
