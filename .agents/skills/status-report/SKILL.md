@@ -93,9 +93,9 @@ policy, never reinterpret a visible failure as green.
 - For every active review tool, inspect inline threads plus top-level status,
   summaries, suggestions, and nitpicks. A rate limit, quota response, error,
   incomplete run, missing verdict, or review against an older head is pending.
-- For CodeRabbit when active, include walkthrough status and every unresolved
-  inline or top-level nitpick. Apply equivalent evidence-based semantics to
-  other tools rather than hardcoding CodeRabbit as the only reviewer.
+- When a repository has a review-automation registry, derive active tools from
+  its actors and check contexts. Include every active tool's top-level status
+  and every unresolved inline or top-level nitpick without hardcoding a vendor.
 - Do not infer that source changes resolved a finding. Use the current forge
   resolution and verdict evidence; expose uncertainty as a blocker.
 
