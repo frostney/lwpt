@@ -726,6 +726,18 @@ begin
     'end.'#10);
 end;
 
+function InventoryPlatformDeclarations: string;
+begin
+  {$IFDEF WINDOWS}
+  { The checked-in x64 LWPT binary can run an i386-compiled test program. }
+  Result := 'platform'#9'windows/x86'#10 +
+    'platform'#9'windows/x86_64'#10;
+  {$ELSE}
+  Result := 'platform'#9 + Platform.GetBuildOS + '/' +
+    Platform.GetBuildArch + #10;
+  {$ENDIF}
+end;
+
 procedure TCLIOptionsE2E.TestInventorySkipsHooksAndTestBodies;
 var
   R: TLwptResult;
@@ -754,7 +766,7 @@ begin
   ForceDirectories(FScratch + '/tests');
   WriteTextFile(FScratch + '/tests/test-inventory.tsv',
     'lwpt-test-inventory-v1'#10 +
-    'platform'#9 + Platform.GetBuildOS + '/' + Platform.GetBuildArch + #10 +
+    InventoryPlatformDeclarations +
     'program'#9'*'#9'unit'#9'source/Inventory.Test.pas'#9'1'#9'2'#10);
   try
     R := RunLwpt(['test', 'source/Inventory.Test.pas', '--jobs=1'], FScratch);
@@ -782,7 +794,7 @@ begin
   ForceDirectories(ProjectPath + '/source');
   WriteTextFile(ProjectPath + '/tests/test-inventory.tsv',
     'lwpt-test-inventory-v1'#10 +
-    'platform'#9 + Platform.GetBuildOS + '/' + Platform.GetBuildArch + #10 +
+    InventoryPlatformDeclarations +
     'program'#9'*'#9'unit'#9'source/Gone.Test.pas'#9'1'#9'1'#10);
   R := RunLwpt(['test', '--jobs=1'], ProjectPath);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);

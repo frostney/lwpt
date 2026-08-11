@@ -241,7 +241,7 @@ inventory never touches the network.
 | **`source/LWPT.CompilerDriver.External.Test.pas`** | 10 tests in 1 suite | Runs a real short-lived proxy for probe and compile, proving canonical TOML stdin/stdout, live refresh, bounded raw stderr context, result/exit agreement, primary and extra-artifact confinement, explicit `--clean` rejection, writer-free empty-input cleanup across repeated short-lived children, timeout cleanup when a sleeping child never reads its large stdin, bounded writer cancellation when an escaped descendant retains stdin, retain/discard drainage plus tree termination after capture overflow, and callback streaming that drains without retained-output overflow. |
 | **`source/LWPT.CompilerDriver.Delphi.Test.pas`** | 12 tests in 1 suite | Pins the built-in opt-in profile, five verified executable/target tuples, live per-operation identity/version/target probes, bounded failure context, the Delphi 12 version floor, executable/header and requested-target mismatch failures without fallback, neutral argument translation, managed-option rejection, normalized source diagnostics including a zero-exit missing-artifact failure, and exact private artifact renaming without requiring a Delphi installation or license. |
 | **`source/LWPT.CompilerRegistry.Test.pas`** | 11 tests in 1 suite | Covers build-entry/project/host/built-in precedence, implicit FPC fallback, built-in Blaise and Lakon selection, the preserved host-command replacement of the Lakon adapter, manifest-over-host authority, case-insensitive caching, out-of-process host command registration, duplicate and protected-built-in-shadow rejection, and configured prefix arguments before adapter arguments. |
-| **`source/LWPT.BuildSession.Test.pas`** | 28 tests in 1 suite | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, compiler-argument fingerprinting, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
+| **`source/LWPT.BuildSession.Test.pas`** | 28 tests in 1 suite (Unix); 23 tests in 1 suite (Windows) | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, compiler-argument fingerprinting, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
 | **`source/LWPT.Command.Build.Test.pas`** | 4 tests in 1 suite | Covers compiler-process cancellation with output capture and child reaping, normal-exit descendant handling, non-zero exit-code reporting, and repeated process-tree state teardown without leaking its owned Windows Job Object handle. |
 | **`source/LWPT.CompilerDriver.FPC.Test.pas`** | 20 tests in 1 suite | Covers capability-probe caching, target dispatch, timeout cleanup, request compatibility, build/test argument translation, ordered extra-argument forwarding and validation, nil-driver rejection, version failures, stale-artifact classification, structured diagnostics, Windows executable-path normalization, and direct Windows bare-command PATH resolution. |
 | **`source/LWPT.CompilerDriver.Blaise.Test.pas`** | 15 tests in 1 suite | Pins the Blaise v0.13.0 identity/help and exact argument fixtures; proves per-operation live probing, the minimum release floor, verified Linux/FreeBSD x86-64 capability filtering, no target fallback, dev/release/clean translation, managed-argument and output-suppression protection, explicit unsupported-feature diagnostics, and normalized diagnostics/artifacts. |
@@ -329,10 +329,10 @@ inventory never touches the network.
 <!-- lwpt:test-inventory-counts:begin -->
 | Tier | Files | Registered test cases |
 | --- | ---: | --- |
-| Unit | 31 | 541 Unix / 539 Windows |
+| Unit | 31 | 541 Unix / 534 Windows |
 | Integration | 23 | 266 Darwin / 265 Linux / 261 Windows |
 | E2E | 7 | 32 Darwin, Windows / 35 Linux |
-| **Total** | **61** | **839 Darwin / 841 Linux / 832 Windows** |
+| **Total** | **61** | **839 Darwin / 841 Linux / 827 Windows** |
 <!-- lwpt:test-inventory-counts:end -->
 
 ## TestingPascalLibrary self-test
