@@ -157,7 +157,39 @@ the import loudly instead of silently overwriting a live key.
 in the user's CNG key store (`%APPDATA%\Microsoft\Crypto\Keys`). Ordinary
 operation — including repeated reloads — deletes each container as its
 snapshot is released, so this is bounded by abnormal termination rather than
-by uptime. Nothing is written to the certificate stores.
+by uptime.
+
+### Delivering the bundled chain
+
+The second Windows CI round settled another guess. SChannel assembles the
+outgoing Certificate flight itself, and it builds that chain from the Windows
+certificate stores rather than from the caller's in-memory store — the
+handshake runs outside the calling process, so a store that only exists in
+this process is invisible to it. A PKCS#12 bundle carrying an intermediate
+therefore produced a leaf-only flight even though the intermediate was in the
+imported store, was reachable through the leaf's `hCertStore`, and satisfied
+strict chain validation. .NET meets the same wall: `SslStream` sends only the
+leaf unless the intermediates are in a Windows store, which is why
+`SslStreamCertificateContext` exists and why it works by adding the caller's
+intermediates to the Intermediate Certification Authorities store.
+
+Each snapshot therefore publishes its bundled issuers into the **current
+user's** `CA` store while it is alive, with two deliberate differences from
+.NET: the user's store rather than the machine's, so no administrative rights
+are needed and nothing is published machine-wide; and every context added is
+recorded and withdrawn again when the snapshot is released, where .NET leaves
+them behind. `CERT_STORE_ADD_NEW` means only certificates this snapshot
+actually added are recorded, so an issuer the user had already installed is
+never withdrawn. Publication is best effort — a store that cannot be opened or
+written degrades to a leaf-only flight rather than failing the identity.
+
+**Accepted cost:** two snapshots of the same identity alive at once share one
+published issuer, because the second `CERT_STORE_ADD_NEW` is refused as a
+duplicate and so is not recorded. If the first is released while the second is
+still serving, the issuer is withdrawn and the second's flight degrades to
+leaf-only until it is itself replaced. That costs chain delivery, never
+correctness, and clients that already hold the intermediate are unaffected.
+Nothing is ever written to a root store, so trust is unaffected either way.
 
 ### Protocol floor
 

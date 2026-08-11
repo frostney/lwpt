@@ -838,6 +838,12 @@ type
     hCertStore: Pointer;
   end;
 
+  TSecPkgContextCertificates = record
+    cCertificates: LongWord;
+    cbCertificateChain: LongWord;
+    pbCertificateChain: PByte;
+  end;
+
   TSChannelTestClient = record
     Context: TSecHandle;
     Credential: TSecHandle;
@@ -867,7 +873,7 @@ const
   SECBUFFER_ATTRMASK = $F0000000;
   SECPKG_ATTR_STREAM_SIZES = 4;
   SECPKG_ATTR_REMOTE_CERT_CONTEXT = $53;
-  SECPKG_ATTR_REMOTE_CERT_CHAIN = $67;
+  SECPKG_ATTR_REMOTE_CERTIFICATES = $5F;
   CERT_NAME_SIMPLE_DISPLAY_TYPE = 4;
   SECPKG_CRED_OUTBOUND = 2;
   SEC_E_OK = SECURITY_STATUS($00000000);
@@ -1380,17 +1386,11 @@ var
 begin
   Result := '';
   Certificate := nil;
-  { SECPKG_ATTR_REMOTE_CERT_CHAIN answers with every certificate the peer
-    sent. Providers that do not implement it still answer
-    SECPKG_ATTR_REMOTE_CERT_CONTEXT, whose store carries the same set. }
-  if QueryContextAttributesW(@AClient.Context, SECPKG_ATTR_REMOTE_CERT_CHAIN,
-    @Certificate) <> SEC_E_OK then
-  begin
-    Certificate := nil;
-    if QueryContextAttributesW(@AClient.Context,
-      SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Certificate) <> SEC_E_OK then
-      raise Exception.Create('Raw SChannel client has no remote certificate');
-  end;
+  { SECPKG_ATTR_REMOTE_CERT_CONTEXT is the documented source: once read, its
+    hCertStore holds the intermediate certificates the peer sent, if any. }
+  if QueryContextAttributesW(@AClient.Context,
+    SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Certificate) <> SEC_E_OK then
+    raise Exception.Create('Raw SChannel client has no remote certificate');
   try
     if not Assigned(Certificate) or not Assigned(Certificate^.hCertStore) then
       Exit;
@@ -1410,6 +1410,26 @@ begin
     if Assigned(Certificate) then
       CertFreeCertificateContext(Certificate);
   end;
+end;
+
+{ How many certificates the peer actually put on the wire. Independent of any
+  store semantics, so a chain-delivery failure can say whether the flight was
+  short or the lookup was. }
+function SChannelClientDeliveredCertificateCount(
+  var AClient: TSChannelTestClient): Integer;
+var
+  Certificates: TSecPkgContextCertificates;
+begin
+  FillChar(Certificates, SizeOf(Certificates), 0);
+  if QueryContextAttributesW(@AClient.Context,
+    SECPKG_ATTR_REMOTE_CERTIFICATES, @Certificates) <> SEC_E_OK then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  Result := Integer(Certificates.cCertificates);
+  if Assigned(Certificates.pbCertificateChain) then
+    FreeContextBuffer(Certificates.pbCertificateChain);
 end;
 
 procedure ShutdownSChannelClient(var AClient: TSChannelTestClient);
@@ -3174,6 +3194,7 @@ var
   Connection: TTransportSecurityConnection;
   Context: TTransportSecurityServerContext;
   Delivered: string;
+  DeliveredCount: Integer;
   Observed: THandshakeObservations;
 {$ENDIF}
 begin
@@ -3185,10 +3206,12 @@ begin
   try
     CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
     Delivered := SChannelClientDeliveredChainNames(Client);
+    DeliveredCount := SChannelClientDeliveredCertificateCount(Client);
     if Pos(INTERMEDIATE_COMMON_NAME, Delivered) = 0 then
-      raise Exception.Create(
-        'Server flight omitted the bundled intermediate; delivered: ' +
-        Delivered);
+      raise Exception.CreateFmt(
+        'Server flight omitted the bundled intermediate; ' +
+        'flight certificates: %d; delivered: %s',
+        [DeliveredCount, Delivered]);
   finally
     AbortTransportSecurityServer(Connection);
     FreeSChannelClient(Client);

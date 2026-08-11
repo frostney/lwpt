@@ -3372,14 +3372,19 @@ type
     dwKeySpec: LongWord;
   end;
 
+  PPCertContext = ^PCertContext;
+  TCertContextArray = array of PCertContext;
+
   TSChannelServerCredentialData = class
   public
     Certificate: PCertContext;
     Credential: TSecHandle;
     HasCredential: Boolean;
     HasPrivateKey: Boolean;
+    IssuerStore: HCERTSTORE;
     KeyContainerName: UnicodeString;
     PrivateKey: PtrUInt;
+    PublishedIssuers: TCertContextArray;
     References: LongInt;
     Store: HCERTSTORE;
     constructor Create;
@@ -3437,6 +3442,8 @@ const
   CERT_NCRYPT_KEY_SPEC = LongWord($FFFFFFFF);
   CERT_KEY_PROV_INFO_PROP_ID = 2;
   NCRYPT_SILENT_FLAG = $00000040;
+  CERT_STORE_ADD_NEW = 1;
+  INTERMEDIATE_AUTHORITY_STORE = 'CA';
   CERT_KEY_CERT_SIGN_KEY_USAGE = $04;
   { X509_PURPOSE_SSL_SERVER rejects a leaf whose key usage asserts none of
     digitalSignature, keyEncipherment, or keyAgreement. }
@@ -3513,6 +3520,16 @@ function NCryptDeleteKey(AKey: PtrUInt; AFlags: LongWord): LongInt; stdcall;
   external 'ncrypt.dll' name 'NCryptDeleteKey';
 function NCryptFreeObject(AObject: PtrUInt): LongInt; stdcall;
   external 'ncrypt.dll' name 'NCryptFreeObject';
+function CertOpenSystemStoreW(ACryptProvider: PtrUInt;
+  ASubsystemProtocol: PWideChar): HCERTSTORE; stdcall;
+  external 'crypt32.dll' name 'CertOpenSystemStoreW';
+function CertAddCertificateContextToStore(AStore: HCERTSTORE;
+  ACertificate: PCertContext; ADisposition: LongWord;
+  AStoreContext: PPCertContext): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertAddCertificateContextToStore';
+function CertDeleteCertificateFromStore(
+  ACertificate: PCertContext): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertDeleteCertificateFromStore';
 
 constructor TSChannelServerCredentialData.Create;
 begin
@@ -3521,8 +3538,10 @@ begin
   Certificate := nil;
   HasCredential := False;
   HasPrivateKey := False;
+  IssuerStore := nil;
   KeyContainerName := '';
   PrivateKey := 0;
+  SetLength(PublishedIssuers, 0);
   References := 1;
   Store := nil;
 end;
@@ -3533,6 +3552,8 @@ begin
 end;
 
 procedure TSChannelServerCredentialData.Release;
+var
+  I: Integer;
 begin
   if InterlockedDecrement(References) <> 0 then
     Exit;
@@ -3555,6 +3576,17 @@ begin
     HasPrivateKey := False;
   end;
   KeyContainerName := '';
+  { Withdraw the issuers this snapshot published. CertDeleteCertificateFromStore
+    frees the context as well, on success and on failure alike. }
+  for I := High(PublishedIssuers) downto 0 do
+    if Assigned(PublishedIssuers[I]) then
+      CertDeleteCertificateFromStore(PublishedIssuers[I]);
+  SetLength(PublishedIssuers, 0);
+  if Assigned(IssuerStore) then
+  begin
+    CertCloseStore(IssuerStore, 0);
+    IssuerStore := nil;
+  end;
   if Assigned(Certificate) then
   begin
     CertFreeCertificateContext(Certificate);
@@ -3925,6 +3957,54 @@ begin
     Result := UnicodeString(WideString(ProviderInfo^.pwszContainerName));
 end;
 
+{ Make the bundled issuers discoverable to the operating system's chain
+  builder.
+
+  SChannel assembles the outgoing Certificate flight itself, and it builds that
+  chain from the Windows certificate stores rather than from the caller's
+  in-memory store — the handshake runs outside the calling process, so a store
+  that only exists in this process is invisible to it. A PKCS#12 bundle
+  carrying an intermediate therefore yields a leaf-only flight unless the
+  intermediate is published where the OS looks. .NET hits the same wall and
+  solves it the same way: SslStreamCertificateContext adds the caller's
+  intermediates to the Intermediate Certification Authorities store.
+
+  Two deliberate differences from .NET: the current user's store is used rather
+  than the machine's, so no administrative rights are needed and nothing is
+  published machine-wide; and every context added here is recorded and removed
+  again when the snapshot is released, where .NET leaves them behind. Only
+  certificates this snapshot actually added are recorded, so an issuer the user
+  had already installed is never withdrawn. Publication is best effort: a store
+  that cannot be opened or written degrades to a leaf-only flight, which is
+  exactly the behaviour before this existed, rather than failing the identity. }
+procedure PublishSChannelServerIssuers(
+  const ASnapshot: TSChannelServerCredentialData);
+var
+  Added: PCertContext;
+  Enumerated: PCertContext;
+begin
+  ASnapshot.IssuerStore := CertOpenSystemStoreW(0,
+    PWideChar(UnicodeString(INTERMEDIATE_AUTHORITY_STORE)));
+  if not Assigned(ASnapshot.IssuerStore) then
+    Exit;
+  Enumerated := CertEnumCertificatesInStore(ASnapshot.Store, nil);
+  while Assigned(Enumerated) do
+  begin
+    if not SChannelSameCertificate(Enumerated, ASnapshot.Certificate) then
+    begin
+      Added := nil;
+      if CertAddCertificateContextToStore(ASnapshot.IssuerStore, Enumerated,
+        CERT_STORE_ADD_NEW, @Added) and Assigned(Added) then
+      begin
+        SetLength(ASnapshot.PublishedIssuers,
+          Length(ASnapshot.PublishedIssuers) + 1);
+        ASnapshot.PublishedIssuers[High(ASnapshot.PublishedIssuers)] := Added;
+      end;
+    end;
+    Enumerated := CertEnumCertificatesInStore(ASnapshot.Store, Enumerated);
+  end;
+end;
+
 function CreateSChannelServerSnapshot(const APkcs12Identity: TBytes;
   const APkcs12Passphrase: UnicodeString;
   const AValidation: TTransportSecurityServerIdentityValidation):
@@ -4017,6 +4097,8 @@ begin
 
     if AValidation = tsivStrict then
       ValidateSChannelServerIdentity(Snapshot.Store, Snapshot.Certificate);
+
+    PublishSChannelServerIssuers(Snapshot);
 
     FillChar(Credentials, SizeOf(Credentials), 0);
     Credentials.dwVersion := SCHANNEL_CRED_VERSION;
