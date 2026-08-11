@@ -185,8 +185,11 @@ type
     PostBuild   : THookArray;
     PreTest     : THookArray;
     PostTest    : THookArray;
-    { [test] scheduler policy. Zero means run the complete queue even
-      after failures; positive values stop at that failure count. }
+    { [test] compiler and scheduler policy. Flags are ordered compiler-driver
+      arguments for every test compile and are loaded only from the root
+      manifest. Zero bail means run the complete queue even after failures;
+      positive values stop at that failure count. }
+    TestFlags   : TStringArray;
     TestBail    : Integer;
     { Compiler configuration is executable policy and root-owned. }
     CompilerDefault: string;
@@ -1769,6 +1772,9 @@ begin
     TestNode := TomlGet(Root, 'test');
     if TomlIsTable(TestNode) then
     begin
+      if AIsRoot then
+        ReadStrictNonEmptyStringArray(TestNode, 'flags', 'test.flags',
+          Result.TestFlags);
       BailNode := TomlGet(TestNode, 'bail');
       if (BailNode <> nil) and not TomlIsInt(BailNode) then
         raise EManifestError.Create(

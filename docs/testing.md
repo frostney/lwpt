@@ -86,6 +86,7 @@ compiler and runtime failures:
 ```toml
 [test]
 bail = 0 # default: run the complete queue
+flags = ["-dTEST_FEATURE"]
 ```
 
 `--bail=N` overrides the manifest for one invocation. A positive threshold
@@ -93,6 +94,14 @@ stops new scheduling as soon as that many failures have been observed,
 terminates and reaps active compiler/test children, and reports the remaining
 programs as cancelled. `--bail=0` always runs the complete queue. CI should
 use `--bail=1` for fast feedback.
+
+`flags` is an optional root-manifest array of non-empty compiler-driver
+arguments applied, in order, to every test-program compile in both tiers.
+Each string is one argument and duplicates remain significant. As with
+`[build]` flags, positional/response-file arguments and options that replace
+the selected compiler, requested target, or session-private outputs are
+rejected. Dependency manifests never contribute test flags, and lifecycle
+hook commands do not inherit them.
 
 Each `*.Test.pas` file sets its own compiler mode via its include directives. `lwpt test` does **not** force `-M<mode>` — every test file in this codebase ends up in delphi mode (either via an explicit `{$mode delphi}{$H+}` header or via `{$I Shared.inc}`), and forcing a mode would conflict with future workspace-package test files that ship their own directives.
 
@@ -247,6 +256,7 @@ test programs. Counts are taken from their registered `Test(...)` cases.
 | **`tests/integration/Agents.Test.pas`** | 14 tests in 1 suite | Covers the `lwpt agents` command-reference generator: section synthesis from the live subcommand registry, `--check` drift detection, marker preservation, and idempotent regeneration. |
 | **`tests/integration/Run.Test.pas`** | 9 tests in 1 suite | Spawns `lwpt run` against scratch projects. Covers direct run-task execution and exact exit propagation, built-in aliasing with flag passthrough, unknown-task errors, list mode, retired `export` as an allowed task name, strict glob staleness and unmatched-input diagnostics, fresh-task skipping, and rejection of invocation-time arguments. |
 | **`tests/integration/TestScheduling.Test.pas`** | 19 unconditional tests in 1 suite, plus 5 Unix-only and 2 Windows-only | Cross-platform subprocess coverage for default overlap, deterministic `--jobs=1` ordering, `--bail=0` override, compile failures counting toward bail, and the amended bail contract: stop new work, fan cancellation to active siblings under one absolute deadline, terminate and reap active children, and print sorted diagnostics. Unix runs native SIGINT/SIGTERM forwarding regressions, rejects forged acknowledgement channels backed by regular files or wrong-direction pipes, and bounds control reads across data, EOF, and silent peers; Windows runs matching Ctrl-C/Ctrl-Break Job Object reaping regressions. A deterministic spawn barrier proves managed and unmanaged process creation share the inheritance-critical window. A nested owner-and-descendant fixture proves successful hop-by-hop acknowledgement and propagated `FAILED`; separate fixtures pin the post-acknowledgement reap window, an already-empty registered tree as a successful no-op, missing terminal acknowledgement, and bounded incremental/trailing protocol framing. An output-capture fixture proves the original process failure survives a secondary delegation-cleanup failure. |
+| **`tests/integration/TestFlags.Test.pas`** | 3 tests in 1 suite | Spawns `lwpt test` against scratch manifests to prove ordered root `[test].flags` reach default- and E2E-tier compiles, LWPT-managed output arguments are rejected, and direct pretest commands inherit neither the flags nor any undeclared arguments. |
 | **`tests/integration/Version.Test.pas`** | 4 tests in 1 suite | Spawns version-reporting forms and verifies output shape plus drift protection against `lwpt.toml`'s `[package].version`. |
 
 ### E2E tier

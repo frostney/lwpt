@@ -112,6 +112,7 @@ type
   private
     FJobs: array of TTestJob;
     FUnitPaths: TStringArray;
+    FCompilerArguments: TStringArray;
     FBuildRoot: string;
     FBail: Integer;
     FNextIndex: Integer;
@@ -160,7 +161,8 @@ type
   public
     constructor Create(const ATests: TStringList;
       const AIncludeE2E: Boolean; const AUnitPaths: TStringArray;
-      const ABuildRoot: string; const AJobs, ABail: Integer;
+      const ACompilerArguments: TStringArray; const ABuildRoot: string;
+      const AJobs, ABail: Integer;
       const ASession: TLWPTBuildSession; const AProjectRoot: string;
       const AVerbose: Boolean; const ACompilerDriver: TLWPTCompilerDriver);
     destructor Destroy; override;
@@ -259,7 +261,8 @@ end;
 
 constructor TTestScheduler.Create(const ATests: TStringList;
   const AIncludeE2E: Boolean; const AUnitPaths: TStringArray;
-  const ABuildRoot: string; const AJobs, ABail: Integer;
+  const ACompilerArguments: TStringArray; const ABuildRoot: string;
+  const AJobs, ABail: Integer;
   const ASession: TLWPTBuildSession; const AProjectRoot: string;
   const AVerbose: Boolean; const ACompilerDriver: TLWPTCompilerDriver);
 var
@@ -280,6 +283,9 @@ begin
   FCancelled := False;
   SetLength(FUnitPaths, Length(AUnitPaths));
   for i := 0 to High(AUnitPaths) do FUnitPaths[i] := AUnitPaths[i];
+  SetLength(FCompilerArguments, Length(ACompilerArguments));
+  for i := 0 to High(ACompilerArguments) do
+    FCompilerArguments[i] := ACompilerArguments[i];
   SetLength(FJobs, ATests.Count);
   SetLength(FStartedReported, ATests.Count);
   SetLength(FTerminalReported, ATests.Count);
@@ -569,7 +575,8 @@ var
 begin
   try
     CompilerProcess := CreatePascalCompilerProcess(FJobs[AIndex].Source,
-      FUnitPaths, Binary, BuildRequest, FBuildRoot, FCompilerDriver);
+      FUnitPaths, FCompilerArguments, Binary, BuildRequest, FBuildRoot,
+      FCompilerDriver);
   except
     { A staging path over the compiler's budget fails this one test with
       the explanatory message instead of aborting the whole scheduler. }
@@ -1047,8 +1054,8 @@ begin
       if not AIncludeE2E then
         WriteLn('  (e2e tier skipped; pass --tier=e2e to include)');
       Scheduler := TTestScheduler.Create(Tests, AIncludeE2E, UnitPaths,
-        Session.JobRoot('tests'), AJobs, EffectiveBail, Session, ProjectRoot,
-        AVerbose, CompilerDriver);
+        Man.TestFlags, Session.JobRoot('tests'), AJobs, EffectiveBail, Session,
+        ProjectRoot, AVerbose, CompilerDriver);
       try
         WriteLn('effective workers: ', Scheduler.EffectiveWorkerCount);
         Scheduler.Run;
