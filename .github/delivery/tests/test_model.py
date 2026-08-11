@@ -386,6 +386,48 @@ class DeliveryModelTests(unittest.TestCase):
             ),
         )
 
+    def test_nullable_github_review_fields_fail_closed(self) -> None:
+        automations = [{"id": "reviewer", "actors": ["reviewer[bot]"]}]
+        reviews = [
+            {
+                "author": None,
+                "commit": None,
+                "state": "PENDING",
+                "submittedAt": None,
+            },
+            {
+                "author": {"login": "reviewer[bot]"},
+                "commit": {"oid": "a" * 40},
+                "state": "PENDING",
+                "submittedAt": None,
+            },
+        ]
+        self.assertEqual(
+            ["reviewer: terminal current-head review is missing"],
+            review_evidence_errors(
+                "a" * 40, automations, [], reviews, [], set()
+            ),
+        )
+
+    def test_nullable_check_and_comment_authors_do_not_crash(self) -> None:
+        automations = [
+            {
+                "id": "reviewer",
+                "actors": ["reviewer[bot]"],
+                "check_contexts": ["Review"],
+                "check_app_slugs": ["reviewer"],
+                "terminal_review_states": [],
+            }
+        ]
+        checks = [{"id": 1, "name": "Review", "conclusion": "success", "app": None}]
+        threads = [{"isResolved": True, "comments": [{"author": None}]}]
+        self.assertEqual(
+            ["no configured review automation has current-head evidence"],
+            review_evidence_errors(
+                "a" * 40, automations, checks, [], threads, set()
+            ),
+        )
+
     def test_latest_rate_limited_review_fails_closed(self) -> None:
         automations = [
             {

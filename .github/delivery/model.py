@@ -152,14 +152,14 @@ def review_evidence_errors(
             if check.get("name") in contexts
             and (
                 not check_apps
-                or check.get("app", {}).get("slug") in check_apps
+                or (check.get("app") or {}).get("slug") in check_apps
             )
         ]
         current_reviews = [
             review
             for review in review_list
-            if review.get("author", {}).get("login") in actors
-            and review.get("commit", {}).get("oid") == head_sha
+            if (review.get("author") or {}).get("login") in actors
+            and (review.get("commit") or {}).get("oid") == head_sha
         ]
         if not matching_checks and not current_reviews:
             continue
@@ -177,7 +177,7 @@ def review_evidence_errors(
         if terminal_states:
             latest_review = max(
                 current_reviews,
-                key=lambda item: item.get("submittedAt", ""),
+                key=lambda item: item.get("submittedAt") or "",
                 default=None,
             )
             markers = [
@@ -204,7 +204,7 @@ def review_evidence_errors(
             comment_index
             for comment_index, comment in enumerate(comments)
             if any(
-                comment.get("author", {}).get("login") in set(item["actors"])
+                (comment.get("author") or {}).get("login") in set(item["actors"])
                 for item in automation_list
             )
         ]
@@ -214,7 +214,7 @@ def review_evidence_errors(
             first_automation = min(automation_indexes)
             replied = any(
                 comment_index > first_automation
-                and comment.get("author", {}).get("login") in maintainer_logins
+                and (comment.get("author") or {}).get("login") in maintainer_logins
                 for comment_index, comment in enumerate(comments)
             )
             if not replied:
