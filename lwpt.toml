@@ -65,3 +65,8 @@ include = [
   "packages/**/*.pas",
   "packages/**/*.inc",
 ]
+
+# Enables deterministic HTTPClient syscall outcomes only while compiling test
+# programs. Production builds do not expose or execute the test seam.
+[test]
+flags = ["-dHTTPCLIENT_TESTING"]

@@ -53,6 +53,10 @@ type
     procedure TestConnectedSilentTeardownIsBounded;
     procedure TestRepeatedCyclesBalanceResources;
     procedure TestStartedUnconnectedTeardownIsBounded;
+    {$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+    procedure TestConnectWaitFailureClosesClientSocket;
+    procedure TestSelectRetriesAfterInterruption;
+    {$ENDIF}
   end;
 
   THTTPClientByteFetch = class(TTestSuite)
@@ -112,6 +116,35 @@ const
   MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS = 2000;
   {$ENDIF}
   MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS = 1000;
+
+{$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+var
+  CapturedClientSocket: PtrInt;
+  SelectTestCallCount: Integer;
+
+function FailConnectWaitSelect(const ASocket: PtrInt;
+  const ARead, AWrite: Boolean;
+  const AAttempt: Integer): THTTPClientSelectTestAction;
+begin
+  Inc(SelectTestCallCount);
+  if AWrite then
+  begin
+    CapturedClientSocket := ASocket;
+    Exit(selectFailed);
+  end;
+  Result := selectUseSystem;
+end;
+
+function InterruptFirstSelect(const ASocket: PtrInt;
+  const ARead, AWrite: Boolean;
+  const AAttempt: Integer): THTTPClientSelectTestAction;
+begin
+  Inc(SelectTestCallCount);
+  if SelectTestCallCount = 1 then
+    Exit(selectInterrupted);
+  Result := selectUseSystem;
+end;
+{$ENDIF}
 
 { ── helpers ───────────────────────────────────────────────────────── }
 
@@ -483,6 +516,57 @@ begin
     BeforeResources.ProcessHandles);
 end;
 
+{$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+procedure THTTPMockServerLifecycle.TestConnectWaitFailureClosesClientSocket;
+var
+  Endpoint: TMockRefusedEndpoint;
+  ErrorMessage: string;
+  NoHeaders: THTTPHeaders;
+begin
+  CapturedClientSocket := -1;
+  SelectTestCallCount := 0;
+  ErrorMessage := '';
+  NoHeaders := nil;
+  Endpoint := TMockRefusedEndpoint.Create;
+  try
+    HTTPClientSelectTestHook := @FailConnectWaitSelect;
+    try
+      try
+        HTTPGet('http://' + Endpoint.Host + ':' + IntToStr(Endpoint.Port) +
+          '/x', NoHeaders, TestOptions(4, 1024, 1000));
+      except
+        on E: EHTTPError do
+          ErrorMessage := E.Message;
+      end;
+    finally
+      HTTPClientSelectTestHook := nil;
+    end;
+  finally
+    Endpoint.Free;
+  end;
+  Expect<string>(ErrorMessage).ToBe('HTTP socket readiness wait failed');
+  Expect<Boolean>(SelectTestCallCount > 0).ToBe(True);
+  Expect<Boolean>(CapturedClientSocket >= 0).ToBe(True);
+  Expect<Integer>(fpFcntl(CapturedClientSocket, F_GETFD, 0)).ToBe(-1);
+end;
+
+procedure THTTPMockServerLifecycle.TestSelectRetriesAfterInterruption;
+var
+  ExpectedBody, GotBody: TBytes;
+begin
+  SelectTestCallCount := 0;
+  ExpectedBody := MakeBytes([$00, $7f, $ff]);
+  HTTPClientSelectTestHook := @InterruptFirstSelect;
+  try
+    GotBody := ServeAndFetch(BuildSimpleResponse(ExpectedBody));
+  finally
+    HTTPClientSelectTestHook := nil;
+  end;
+  Expect<string>(BytesToHex(GotBody)).ToBe(BytesToHex(ExpectedBody));
+  Expect<Boolean>(SelectTestCallCount > 1).ToBe(True);
+end;
+{$ENDIF}
+
 procedure THTTPMockServerLifecycle.SetupTests;
 begin
   Test('started server without a client tears down inside the watchdog',
@@ -491,6 +575,12 @@ begin
     TestConnectedSilentTeardownIsBounded);
   Test('success, failure, and unstarted cycles balance fixture resources',
     TestRepeatedCyclesBalanceResources);
+  {$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+  Test('connect-wait failure closes its client socket',
+    TestConnectWaitFailureClosesClientSocket);
+  Test('select retries after an interrupted system call',
+    TestSelectRetriesAfterInterruption);
+  {$ENDIF}
 end;
 
 { ── THTTPClientRequestBodies ─────────────────────────────────────── }
@@ -871,19 +961,16 @@ var
   ErrorMessage: string;
 begin
   { A chunk-size line of 7fffffff (= High(Integer)) with the body limit set to
-    High(Integer): the guard admits the size, so the old 32-bit `ChunkSize + 2`
-    overflowed negative, skipped the fill loop, and Move()d High(Integer) bytes
-    out of a near-empty buffer. The overflow-safe Int64 compare keeps reading
-    until the size is buffered or the stream ends; the peer closes after the
-    size line, so the request must fail with the truncated-body error instead
-    of crashing or over-reading. }
+    High(Integer): the body guard admits the size, but the Integer-indexed
+    accumulator cannot hold both that payload and its trailing CRLF. Reject it
+    before `ChunkSize + 2` can overflow or any body bytes are read. }
   ErrorMessage := ServeAndCaptureError(
     StringBytes('HTTP/1.1 200 OK' + CRLF +
       'Transfer-Encoding: chunked' + CRLF + CRLF +
       '7fffffff' + CRLF),
     TestOptions(High(Integer), 1024, 1000), 0, 0, 0);
   Expect<string>(ErrorMessage).ToBe(
-    'Invalid HTTP response: truncated chunked body');
+    'HTTP chunk size exceeds supported frame limit of 2147483645 bytes');
 end;
 
 procedure THTTPClientResourceBounds.TestCloseDelimitedBodyOverLimit;

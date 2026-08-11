@@ -38,11 +38,27 @@ type
 
   EHTTPError = class(Exception);
 
+  {$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+  { Test-only select seam. Production code must leave this nil. The hook can
+    simulate the two syscall outcomes that otherwise depend on signal and
+    network timing while leaving ordinary readiness to the real select call. }
+  THTTPClientSelectTestAction = (selectUseSystem, selectInterrupted,
+    selectFailed);
+  THTTPClientSelectTestHook = function(const ASocket: PtrInt;
+    const ARead, AWrite: Boolean;
+    const AAttempt: Integer): THTTPClientSelectTestAction;
+  {$ENDIF}
+
 const
   DEFAULT_MAX_RESPONSE_BODY_BYTES = Int64(64) * 1024 * 1024;
   DEFAULT_MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
   DEFAULT_REQUEST_TIMEOUT_MILLISECONDS = 120 * 1000;
   DEFAULT_MAXIMUM_REDIRECTS = 20;
+
+{$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+var
+  HTTPClientSelectTestHook: THTTPClientSelectTestHook;
+{$ENDIF}
 
 function DefaultHTTPRequestOptions: THTTPRequestOptions;
 function HTTPGet(const AURL: string;
@@ -301,6 +317,8 @@ procedure WaitForSocket(const ASock: TSocket; const ARead, AWrite: Boolean;
 var
   ReadSet, WriteSet: TFDSet;
   ReadSetPointer, WriteSetPointer: PFDSet;
+  Attempt: Integer;
+  Interrupted: Boolean;
   Ready: Integer;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
@@ -318,7 +336,9 @@ begin
     raises once it lapses) and wait again; only a different error is fatal.
     The fd sets are rebuilt each pass because select() leaves their contents
     unspecified after an EINTR return. }
+  Attempt := 0;
   repeat
+    Inc(Attempt);
     fpFD_ZERO(ReadSet);
     fpFD_ZERO(WriteSet);
     ReadSetPointer := nil;
@@ -333,61 +353,80 @@ begin
       fpFD_SET(ASock, WriteSet);
       WriteSetPointer := @WriteSet;
     end;
-    Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
-      RemainingRequestMilliseconds(ADeadline, ATimeoutMilliseconds));
+    {$IFDEF HTTPCLIENT_TESTING}
+    if Assigned(HTTPClientSelectTestHook) then
+      case HTTPClientSelectTestHook(PtrInt(ASock), ARead, AWrite, Attempt) of
+        selectUseSystem:
+          begin
+            Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
+              RemainingRequestMilliseconds(ADeadline,
+                ATimeoutMilliseconds));
+            Interrupted := (Ready < 0) and (fpgeterrno = ESysEINTR);
+          end;
+        selectInterrupted:
+          begin
+            Ready := -1;
+            Interrupted := True;
+          end;
+        selectFailed:
+          begin
+            Ready := -1;
+            Interrupted := False;
+          end;
+      end
+    else
+    {$ENDIF}
+    begin
+      Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
+        RemainingRequestMilliseconds(ADeadline, ATimeoutMilliseconds));
+      Interrupted := (Ready < 0) and (fpgeterrno = ESysEINTR);
+    end;
     if Ready >= 0 then
       Break;
-    if fpgeterrno <> ESysEINTR then
+    if not Interrupted then
       raise EHTTPError.Create('HTTP socket readiness wait failed');
   until False;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  { Mirror the POSIX EINTR tolerance: Winsock's select() fails with WSAEINTR
-    when interrupted, and the socket is still fine. Recompute the timeout and
-    retry; any other error is fatal. }
-  repeat
-    FillChar(ReadSet, SizeOf(ReadSet), 0);
-    FillChar(WriteSet, SizeOf(WriteSet), 0);
-    FillChar(ExceptSet, SizeOf(ExceptSet), 0);
-    ReadSetPointer := nil;
-    WriteSetPointer := nil;
-    ExceptSetPointer := nil;
-    if ARead then
-    begin
-      ReadSet.fd_count := 1;
-      ReadSet.fd_array[0] := ASock;
-      ReadSetPointer := @ReadSet;
-    end;
-    if AWrite then
-    begin
-      WriteSet.fd_count := 1;
-      WriteSet.fd_array[0] := ASock;
-      WriteSetPointer := @WriteSet;
-    end;
-    if ARead or AWrite then
-    begin
-      { Winsock may report a failed nonblocking connect only through the
-        exception set. Writability alone can therefore wait until the request
-        deadline even though SO_ERROR is already available. Callers still read
-        SO_ERROR or perform their send/receive operation after readiness. }
-      ExceptSet.fd_count := 1;
-      ExceptSet.fd_array[0] := ASock;
-      ExceptSetPointer := @ExceptSet;
-    end;
-    Remaining := RemainingRequestMilliseconds(ADeadline,
-      ATimeoutMilliseconds);
-    Timeout.tv_sec := Remaining div 1000;
-    Timeout.tv_usec := (Remaining mod 1000) * 1000;
-    Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer,
-      ExceptSetPointer, @Timeout);
-    if Ready >= 0 then
-      Break;
-    if WSAGetLastError <> WSAEINTR then
-      raise EHTTPError.Create('HTTP socket readiness wait failed');
-  until False;
+  FillChar(ReadSet, SizeOf(ReadSet), 0);
+  FillChar(WriteSet, SizeOf(WriteSet), 0);
+  FillChar(ExceptSet, SizeOf(ExceptSet), 0);
+  ReadSetPointer := nil;
+  WriteSetPointer := nil;
+  ExceptSetPointer := nil;
+  if ARead then
+  begin
+    ReadSet.fd_count := 1;
+    ReadSet.fd_array[0] := ASock;
+    ReadSetPointer := @ReadSet;
+  end;
+  if AWrite then
+  begin
+    WriteSet.fd_count := 1;
+    WriteSet.fd_array[0] := ASock;
+    WriteSetPointer := @WriteSet;
+  end;
+  if ARead or AWrite then
+  begin
+    { Winsock may report a failed nonblocking connect only through the
+      exception set. Writability alone can therefore wait until the request
+      deadline even though SO_ERROR is already available. Callers still read
+      SO_ERROR or perform their send/receive operation after readiness. }
+    ExceptSet.fd_count := 1;
+    ExceptSet.fd_array[0] := ASock;
+    ExceptSetPointer := @ExceptSet;
+  end;
+  Remaining := RemainingRequestMilliseconds(ADeadline,
+    ATimeoutMilliseconds);
+  Timeout.tv_sec := Remaining div 1000;
+  Timeout.tv_usec := (Remaining mod 1000) * 1000;
+  Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer,
+    ExceptSetPointer, @Timeout);
   {$ENDIF}
   if Ready = 0 then
     RaiseRequestDeadline(ATimeoutMilliseconds);
+  if Ready < 0 then
+    raise EHTTPError.Create('HTTP socket readiness wait failed');
   CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
 end;
 
@@ -962,18 +1001,17 @@ begin
         raise EHTTPError.CreateFmt(
           'HTTP response body exceeds configured limit of %d bytes',
           [AOptions.MaxResponseBodyBytes]);
+      { ChunkBuf must hold both the payload and its trailing CRLF. Reject a
+        frame that cannot fit in the Integer-indexed accumulator before any
+        addition can overflow, even when the caller permits that body size. }
+      if ChunkSizeValue > High(Integer) - 2 then
+        raise EHTTPError.CreateFmt(
+          'HTTP chunk size exceeds supported frame limit of %d bytes',
+          [High(Integer) - 2]);
       ChunkSize := Integer(ChunkSizeValue);
       if ChunkSize = 0 then Break;
 
-      { Compare in Int64: with MaxResponseBodyBytes = High(Integer) the guard
-        above admits ChunkSize = High(Integer), so a 32-bit `ChunkSize + 2`
-        overflows to a large negative value, the fill loop is skipped, and
-        AppendBodyBytes then Move()s High(Integer) bytes out of a near-empty
-        ChunkBuf (out-of-bounds read). The widened compare keeps buffering
-        until ChunkSize + 2 bytes are present or a body-limit / truncated-body
-        guard fires, so the trailing Delete(ChunkBuf, 1, ChunkSize + 2) is
-        only reached once ChunkSize + 2 fits in an Integer. }
-      while Int64(Length(ChunkBuf)) < Int64(ChunkSize) + 2 do
+      while Length(ChunkBuf) < ChunkSize + 2 do
       begin
         N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE, ADeadline,
           AOptions.RequestTimeoutMilliseconds);
