@@ -28,6 +28,8 @@ uses
   (correct on Windows and on the raw-status path), and trust ExitStatus
   whenever ExitCode claims success but the stored status disagrees. }
 function  NormalisedExitCode(const AProcess: TProcess): Integer;
+function  ResolveRunnableCommand(const AProjectRoot,
+  ACommand: string): string;
 
 function  CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths: array of string; out AOutBin: string;
@@ -229,7 +231,7 @@ begin
   Result := ExpandFileName(IncludeTrailingPathDelimiter(AProjectRoot) + APath);
 end;
 
-function ResolveCommand(const AProjectRoot, ACommand: string): string;
+function ResolveRunnableCommand(const AProjectRoot, ACommand: string): string;
 {$IFDEF WINDOWS}
 var
   SearchPath: string;
@@ -419,7 +421,8 @@ begin
   AError := '';
   P := TProcess.Create(nil);
   try
-    P.Executable := ResolveCommand(AProjectRoot, AHook.Runnable.Command);
+    P.Executable := ResolveRunnableCommand(AProjectRoot,
+      AHook.Runnable.Command);
     P.CurrentDirectory := AProjectRoot;
     if Length(AEnvironment) > 0 then
     begin
