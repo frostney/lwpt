@@ -7,6 +7,8 @@ unit LWPT.CompilerDriver;
 interface
 
 uses
+  Classes,
+
   LWPT.BuildRequest,
   LWPT.Core;
 
@@ -39,11 +41,30 @@ type
     including capability probing and cache publication, must be safe for
     concurrent calls on one driver instance. }
   TLWPTCompilerDriver = class
+  private
+    FCommandArguments: LWPT.Core.TStringArray;
+    FCommandOverride: string;
+    FCommandWorkingDirectory: string;
+  protected
+    function ConfiguredCommand(const ADefault: string): string;
+    function CommandArgumentCount: Integer;
+    function CommandArgument(const AIndex: Integer): string;
+    procedure AppendCommandArguments(const AParameters: TStrings);
+    function PrependCommandArguments(
+      const AArguments: LWPT.Core.TStringArray): LWPT.Core.TStringArray;
   public
+    procedure ConfigureCommand(const ACommand: string;
+      const AArguments: array of string;
+      const AWorkingDirectory: string = '');
+    function InvocationArguments(
+      const AArguments: LWPT.Core.TStringArray): LWPT.Core.TStringArray;
+    function WorkingDirectory: string;
     function CompilerID: string; virtual; abstract;
     function VersionConstraint: string; virtual;
     function CreateBuildRequest(const ASource, AArtifact: string):
       TLWPTBuildRequest; virtual;
+    function CreateBuildRequestForTarget(const ASource, AArtifact: string;
+      const ATarget: TLWPTTarget): TLWPTBuildRequest; virtual;
     function DefaultTarget: TLWPTTarget; virtual; abstract;
     function ProbeCapabilities(const ATarget: TLWPTTarget;
       const ARefresh: Boolean = False): TLWPTCompilerCapabilities; virtual;
@@ -84,6 +105,66 @@ implementation
 uses
   SysUtils;
 
+procedure TLWPTCompilerDriver.ConfigureCommand(const ACommand: string;
+  const AArguments: array of string; const AWorkingDirectory: string);
+var
+  i: Integer;
+begin
+  FCommandOverride := ACommand;
+  FCommandWorkingDirectory := AWorkingDirectory;
+  SetLength(FCommandArguments, Length(AArguments));
+  for i := 0 to High(AArguments) do FCommandArguments[i] := AArguments[i];
+end;
+
+function TLWPTCompilerDriver.WorkingDirectory: string;
+begin
+  Result := FCommandWorkingDirectory;
+end;
+
+function TLWPTCompilerDriver.ConfiguredCommand(
+  const ADefault: string): string;
+begin
+  if FCommandOverride <> '' then Result := FCommandOverride
+  else Result := ADefault;
+end;
+
+function TLWPTCompilerDriver.CommandArgumentCount: Integer;
+begin
+  Result := Length(FCommandArguments);
+end;
+
+function TLWPTCompilerDriver.CommandArgument(const AIndex: Integer): string;
+begin
+  if (AIndex < 0) or (AIndex >= Length(FCommandArguments)) then Exit('');
+  Result := FCommandArguments[AIndex];
+end;
+
+procedure TLWPTCompilerDriver.AppendCommandArguments(
+  const AParameters: TStrings);
+var
+  i: Integer;
+begin
+  for i := 0 to High(FCommandArguments) do
+    AParameters.Add(FCommandArguments[i]);
+end;
+
+function TLWPTCompilerDriver.PrependCommandArguments(
+  const AArguments: LWPT.Core.TStringArray): LWPT.Core.TStringArray;
+var
+  i: Integer;
+begin
+  SetLength(Result, Length(FCommandArguments) + Length(AArguments));
+  for i := 0 to High(FCommandArguments) do Result[i] := FCommandArguments[i];
+  for i := 0 to High(AArguments) do
+    Result[Length(FCommandArguments) + i] := AArguments[i];
+end;
+
+function TLWPTCompilerDriver.InvocationArguments(
+  const AArguments: LWPT.Core.TStringArray): LWPT.Core.TStringArray;
+begin
+  Result := PrependCommandArguments(AArguments);
+end;
+
 function TLWPTCompilerDriver.VersionConstraint: string;
 begin
   Result := '*';
@@ -92,10 +173,16 @@ end;
 function TLWPTCompilerDriver.CreateBuildRequest(const ASource,
   AArtifact: string): TLWPTBuildRequest;
 begin
+  Result := CreateBuildRequestForTarget(ASource, AArtifact, DefaultTarget);
+end;
+
+function TLWPTCompilerDriver.CreateBuildRequestForTarget(const ASource,
+  AArtifact: string; const ATarget: TLWPTTarget): TLWPTBuildRequest;
+begin
   Result := DefaultBuildRequest;
   Result.Compiler.ID := CompilerID;
   Result.Compiler.VersionConstraint := VersionConstraint;
-  Result.Target := DefaultTarget;
+  Result.Target := ATarget;
   Result.OutputKind := BUILD_OUTPUT_EXECUTABLE;
   Result.Mode := BUILD_MODE_DEV;
   Result.Inputs.EntryPoint := ASource;

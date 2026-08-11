@@ -260,7 +260,7 @@ begin
   WriteState('probe-mode', '');
   WriteState('probe-version', '1.0.0');
   Driver := TLWPTExternalCompilerDriver.Create(PROXY_COMPILER_ID,
-    ParamStr(0), '', '^1.0.0');
+    ParamStr(0), ['prefix-marker'], '^1.0.0');
   try
     Capabilities := Driver.ProbeCapabilities(Default(TLWPTTarget));
     Expect<string>(Capabilities.CompilerID).ToBe(PROXY_COMPILER_ID);
@@ -268,7 +268,8 @@ begin
     Request := Driver.CreateBuildRequest('ignored.pas',
       ExpandFileName('build/tests/external-driver/artifact'));
     Options := BuildCompilerInvocationOptions('', False);
-    Arguments := Driver.BuildArguments(Request, Options);
+    Arguments := Driver.InvocationArguments(
+      Driver.BuildArguments(Request, Options));
     ProcessRunner := TLWPTCompilerProcess.Create(Driver.ExecutableName);
     try
       ExitCode := ProcessRunner.Run(Arguments,
@@ -296,7 +297,7 @@ begin
   WriteState('probe-mode', '');
   WriteState('probe-version', '1.0.0');
   Driver := TLWPTExternalCompilerDriver.Create(UpperCase(PROXY_COMPILER_ID),
-    ParamStr(0), '', '*');
+    ParamStr(0), [], '*');
   try
     Capabilities := Driver.ProbeCapabilities(Default(TLWPTTarget));
     Expect<string>(Capabilities.CompilerID).ToBe(PROXY_COMPILER_ID);
@@ -317,7 +318,7 @@ var
   Request: TLWPTBuildRequest;
 begin
   Driver := TLWPTExternalCompilerDriver.Create(PROXY_COMPILER_ID,
-    ParamStr(0), '', '*');
+    ParamStr(0), [], '*');
   try
     WriteState('probe-mode', 'malformed');
     Raised := False;
@@ -396,7 +397,7 @@ var
   Request: TLWPTBuildRequest;
 begin
   Driver := TLWPTExternalCompilerDriver.Create(PROXY_COMPILER_ID,
-    ParamStr(0), '', '*');
+    ParamStr(0), [], '*');
   try
     Request := Driver.CreateBuildRequest('source.pas', ExpandFileName(
       PROXY_STATE_ROOT + '/private/app'));
@@ -433,7 +434,7 @@ var
   Request: TLWPTBuildRequest;
 begin
   Driver := TLWPTExternalCompilerDriver.Create(PROXY_COMPILER_ID,
-    ParamStr(0), '', '*');
+    ParamStr(0), [], '*');
   try
     Request := DefaultBuildRequest;
     Options := BuildCompilerInvocationOptions('', True);
@@ -597,7 +598,7 @@ end;
 
 procedure TLWPTExternalCompilerDriverTests.SetupTests;
 begin
-  Test('short-lived probe and compile use canonical TOML and split stderr',
+  Test('configured args precede probe and compile protocol operations',
     TestProbeAndCompileProtocol);
   Test('refresh observes a capability mutation',
     TestProbeRefreshObservesMutation);
@@ -650,6 +651,12 @@ begin
      and ((ParamStr(1) = 'probe') or (ParamStr(1) = 'compile')) then
   begin
     RunProxy(ParamStr(1));
+    Halt(0);
+  end;
+  if (ParamCount = 2) and (ParamStr(1) = 'prefix-marker')
+     and ((ParamStr(2) = 'probe') or (ParamStr(2) = 'compile')) then
+  begin
+    RunProxy(ParamStr(2));
     Halt(0);
   end;
   TestRunnerProgram.AddSuite(TLWPTExternalCompilerDriverTests.Create(

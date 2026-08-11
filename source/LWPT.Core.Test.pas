@@ -66,6 +66,7 @@ type
     procedure TestVersionSection;
     procedure TestManifestSnapshotBindsParsedBytes;
     procedure TestRootCompilerProfilesParsed;
+    procedure TestBuildTargetTupleParsed;
     procedure TestDependencyCompilerPolicyIgnored;
   end;
 
@@ -82,6 +83,7 @@ type
     procedure TestBuildFlagsMustBeStringArrayAndAreRootOnly;
     procedure TestUndeclaredCompilerProfilesAreRejected;
     procedure TestArrayCannotBecomeTablePath;
+    procedure TestLegacyRunnableFieldsAreRejected;
   end;
 
   TLoadManifestExtensions = class(TTestSuite)
@@ -92,6 +94,7 @@ type
     procedure TestPrebuildHookEntriesParsed;
     procedure TestHookShorthandStringForm;
     procedure TestHookPairedInputsOutputRequired;
+    procedure TestHookArraysAreStrict;
     procedure TestPerEntryHooksParsed;
     procedure TestUnknownSectionEmitsWarning;
   end;
@@ -798,7 +801,8 @@ const
     ''#10 +
     '[compiler.profiles.native]'#10 +
     'driver = "fpc"'#10 +
-    'executable = "custom-fpc"'#10 +
+    'command = "custom-fpc"'#10 +
+    'args = ["--wrapped", "", "fpc"]'#10 +
     'version = "^3.2.0"'#10 +
     ''#10 +
     '[build]'#10 +
@@ -811,9 +815,33 @@ begin
   Expect<string>(Man.CompilerDefault).ToBe('native');
   Expect<Integer>(Length(Man.CompilerProfiles)).ToBe(1);
   Expect<string>(Man.CompilerProfiles[0].Driver).ToBe('fpc');
-  Expect<string>(Man.CompilerProfiles[0].Executable).ToBe('custom-fpc');
+  Expect<string>(Man.CompilerProfiles[0].Runnable.Command).ToBe('custom-fpc');
+  Expect<Integer>(Length(Man.CompilerProfiles[0].Runnable.Args)).ToBe(3);
+  Expect<string>(Man.CompilerProfiles[0].Runnable.Args[0]).ToBe('--wrapped');
+  Expect<string>(Man.CompilerProfiles[0].Runnable.Args[1]).ToBe('');
   Expect<string>(Man.CompilerProfiles[0].VersionConstraint).ToBe('^3.2.0');
   Expect<string>(Man.BuildEntries[0].CompilerProfile).ToBe('native');
+end;
+
+procedure TLoadManifestHappy.TestBuildTargetTupleParsed;
+const
+  INPUT =
+    '[package]'#10 +
+    'name = "targeted"'#10 +
+    'version = "1.0.0"'#10 +
+    ''#10 +
+    '[build.server]'#10 +
+    'source = "source/server.pas"'#10 +
+    'target = { os = "linux", architecture = "aarch64", abi = "gnu", environment = "container" }'#10;
+var
+  Man: TManifest;
+begin
+  Man := LoadManifest(WriteManifest('target-tuple', INPUT));
+  Expect<Boolean>(Man.BuildEntries[0].HasTarget).ToBe(True);
+  Expect<string>(Man.BuildEntries[0].Target.OS).ToBe('linux');
+  Expect<string>(Man.BuildEntries[0].Target.Architecture).ToBe('aarch64');
+  Expect<string>(Man.BuildEntries[0].Target.ABI).ToBe('gnu');
+  Expect<string>(Man.BuildEntries[0].Target.Environment).ToBe('container');
 end;
 
 procedure TLoadManifestHappy.TestDependencyCompilerPolicyIgnored;
@@ -828,7 +856,7 @@ const
     ''#10 +
     '[compiler.profiles.foreign]'#10 +
     'driver = "foreign"'#10 +
-    'executable = "foreign-driver"'#10 +
+    'command = "foreign-driver"'#10 +
     ''#10 +
     '[build]'#10 +
     'source = "source/app.pas"'#10 +
@@ -852,6 +880,8 @@ begin
     TestManifestSnapshotBindsParsedBytes);
   Test('root compiler profiles and build selection are parsed',
     TestRootCompilerProfilesParsed);
+  Test('build entries parse an independent complete target tuple',
+    TestBuildTargetTupleParsed);
   Test('dependency compiler policy is ignored',
     TestDependencyCompilerPolicyIgnored);
 end;
@@ -1124,6 +1154,27 @@ begin
   end;
 end;
 
+procedure TLoadManifestValidation.TestLegacyRunnableFieldsAreRejected;
+const
+  LEGACY_HOOK =
+    '[package]'#10 + 'name = "legacy-hook"'#10 + 'version = "1.0.0"'#10 +
+    '[prebuild]'#10 + 'old = { script = "scripts/old.pas" }'#10;
+  LEGACY_RUN =
+    '[package]'#10 + 'name = "legacy-run"'#10 + 'version = "1.0.0"'#10 +
+    '[deploy]'#10 + 'script = "scripts/deploy.pas"'#10;
+  LEGACY_COMPILER =
+    '[package]'#10 + 'name = "legacy-compiler"'#10 + 'version = "1.0.0"'#10 +
+    '[compiler.profiles.old]'#10 + 'driver = "fpc"'#10 +
+    'executable = "fpc"'#10;
+begin
+  ExpectManifestLoadError(WriteManifest('legacy-hook', LEGACY_HOOK),
+    'use "command" and explicit "args"', Self);
+  ExpectManifestLoadError(WriteManifest('legacy-run', LEGACY_RUN),
+    'use "command" and explicit "args"', Self);
+  ExpectManifestLoadError(WriteManifest('legacy-compiler', LEGACY_COMPILER),
+    'use command and args', Self);
+end;
+
 procedure TLoadManifestValidation.SetupTests;
 begin
   Test('bare-string dep shorthand rejected (ADR-0004 migration)',
@@ -1143,6 +1194,8 @@ begin
     TestUndeclaredCompilerProfilesAreRejected);
   Test('value arrays cannot become table paths',
     TestArrayCannotBecomeTablePath);
+  Test('legacy runnable fields hard-error with migration guidance',
+    TestLegacyRunnableFieldsAreRejected);
 end;
 
 { ── TLoadManifestExtensions ───────────────────────────────────────── }
@@ -1193,8 +1246,8 @@ const
     'version = "0.1.0"'#10 +
     ''#10 +
     '[prebuild]'#10 +
-    'embed = { script = "scripts/stamp-version.pas", inputs = ["src/Source.pas"], output = "src/Embedded.inc" }'#10 +
-    'codegen = { script = "scripts/other.pas", args = ["--flag", "v"], inputs = ["a.pas", "b.pas"], output = "src/Other.inc" }'#10;
+    'embed = { command = "instantfpc", args = ["scripts/stamp-version.pas"], inputs = ["src/Source.pas"], output = "src/Embedded.inc" }'#10 +
+    'codegen = { command = "tools/codegen", args = ["--flag", "v"], inputs = ["a.pas", "b.pas"], output = "src/Other.inc" }'#10;
 var Man: TManifest;
 begin
   Man := LoadManifest(WriteManifest('prebuild', INPUT));
@@ -1202,22 +1255,22 @@ begin
 
   { Insertion order preserved via OrderedStringMap (ADR-0011). }
   Expect<string>(Man.PreBuild[0].Name).ToBe('embed');
-  Expect<string>(Man.PreBuild[0].Script).ToBe('scripts/stamp-version.pas');
+  Expect<string>(Man.PreBuild[0].Runnable.Command).ToBe('instantfpc');
   Expect<Integer>(Length(Man.PreBuild[0].Inputs)).ToBe(1);
   Expect<string>(Man.PreBuild[0].Inputs[0]).ToBe('src/Source.pas');
   Expect<string>(Man.PreBuild[0].Output).ToBe('src/Embedded.inc');
 
   Expect<string>(Man.PreBuild[1].Name).ToBe('codegen');
-  Expect<string>(Man.PreBuild[1].Script).ToBe('scripts/other.pas');
-  Expect<Integer>(Length(Man.PreBuild[1].Args)).ToBe(2);
-  Expect<string>(Man.PreBuild[1].Args[0]).ToBe('--flag');
-  Expect<string>(Man.PreBuild[1].Args[1]).ToBe('v');
+  Expect<string>(Man.PreBuild[1].Runnable.Command).ToBe('tools/codegen');
+  Expect<Integer>(Length(Man.PreBuild[1].Runnable.Args)).ToBe(2);
+  Expect<string>(Man.PreBuild[1].Runnable.Args[0]).ToBe('--flag');
+  Expect<string>(Man.PreBuild[1].Runnable.Args[1]).ToBe('v');
   Expect<Integer>(Length(Man.PreBuild[1].Inputs)).ToBe(2);
 end;
 
 procedure TLoadManifestExtensions.TestHookShorthandStringForm;
 const
-  { Bare-string shorthand: equivalent to { script = "..." } per
+  { Bare-string shorthand: equivalent to { command = "..." } per
     ADR-0011 §"Entry shape". }
   INPUT =
     '[package]'#10 +
@@ -1231,7 +1284,7 @@ begin
   Man := LoadManifest(WriteManifest('hook-shorthand', INPUT));
   Expect<Integer>(Length(Man.PostInstall)).ToBe(1);
   Expect<string>(Man.PostInstall[0].Name).ToBe('notify');
-  Expect<string>(Man.PostInstall[0].Script).ToBe('scripts/notify.pas');
+  Expect<string>(Man.PostInstall[0].Runnable.Command).ToBe('scripts/notify.pas');
   Expect<Integer>(Length(Man.PostInstall[0].Inputs)).ToBe(0);
   Expect<string>(Man.PostInstall[0].Output).ToBe('');
 end;
@@ -1246,12 +1299,28 @@ const
     'version = "0.1.0"'#10 +
     ''#10 +
     '[prebuild]'#10 +
-    'half = { script = "scripts/x.pas", inputs = ["a.pas"] }'#10;
+    'half = { command = "tools/x", inputs = ["a.pas"] }'#10;
 begin
   ExpectManifestLoadError(
     WriteManifest('hook-half-pair', INPUT),
     'paired option',
     Self);
+end;
+
+procedure TLoadManifestExtensions.TestHookArraysAreStrict;
+const
+  BAD_ARGS =
+    '[package]'#10 + 'name = "bad-args"'#10 + 'version = "1.0.0"'#10 +
+    '[prebuild]'#10 + 'bad = { command = "tool", args = "--bad" }'#10;
+  BAD_INPUTS =
+    '[package]'#10 + 'name = "bad-inputs"'#10 + 'version = "1.0.0"'#10 +
+    '[prebuild]'#10 +
+    'bad = { command = "tool", inputs = "source.pas", output = "out" }'#10;
+begin
+  ExpectManifestLoadError(WriteManifest('hook-bad-args', BAD_ARGS),
+    'args must be an array of strings', Self);
+  ExpectManifestLoadError(WriteManifest('hook-bad-inputs', BAD_INPUTS),
+    'inputs must be an array of strings', Self);
 end;
 
 procedure TLoadManifestExtensions.TestPerEntryHooksParsed;
@@ -1264,20 +1333,20 @@ const
     '[build]'#10 +
     'cli = { source = "src/cli.pas", output = "build/cli",'#10 +
     '        prebuild  = { stamp = "scripts/stamp.pas" },'#10 +
-    '        postbuild = { sign = { script = "scripts/sign.pas", args = ["{item.output}"] } } }'#10;
+    '        postbuild = { sign = { command = "tools/sign", args = ["{item.output}"] } } }'#10;
 var Man: TManifest;
 begin
   Man := LoadManifest(WriteManifest('per-item-hooks', INPUT));
   Expect<Integer>(Length(Man.BuildEntries)).ToBe(1);
   Expect<Integer>(Length(Man.BuildEntries[0].PreBuild)).ToBe(1);
   Expect<string>(Man.BuildEntries[0].PreBuild[0].Name).ToBe('stamp');
-  Expect<string>(Man.BuildEntries[0].PreBuild[0].Script).ToBe('scripts/stamp.pas');
+  Expect<string>(Man.BuildEntries[0].PreBuild[0].Runnable.Command).ToBe('scripts/stamp.pas');
   Expect<Integer>(Length(Man.BuildEntries[0].PostBuild)).ToBe(1);
   Expect<string>(Man.BuildEntries[0].PostBuild[0].Name).ToBe('sign');
-  Expect<string>(Man.BuildEntries[0].PostBuild[0].Script).ToBe('scripts/sign.pas');
-  Expect<Integer>(Length(Man.BuildEntries[0].PostBuild[0].Args)).ToBe(1);
+  Expect<string>(Man.BuildEntries[0].PostBuild[0].Runnable.Command).ToBe('tools/sign');
+  Expect<Integer>(Length(Man.BuildEntries[0].PostBuild[0].Runnable.Args)).ToBe(1);
   { {item.output} interpolates to the resolved output value. }
-  Expect<string>(Man.BuildEntries[0].PostBuild[0].Args[0]).ToBe('build/cli');
+  Expect<string>(Man.BuildEntries[0].PostBuild[0].Runnable.Args[0]).ToBe('build/cli');
 end;
 
 procedure TLoadManifestExtensions.TestUnknownSectionEmitsWarning;
@@ -1312,10 +1381,12 @@ begin
   Test('[format] exclude list parsed',           TestFormatExcludesParsed);
   Test('[prebuild] hook entries parsed (ADR-0011)',
     TestPrebuildHookEntriesParsed);
-  Test('hook bare-string shorthand expands to { script = "..." }',
+  Test('hook bare-string shorthand expands to { command = "..." }',
     TestHookShorthandStringForm);
   Test('hook inputs/output is a paired option (half-pair rejected)',
     TestHookPairedInputsOutputRequired);
+  Test('hook arguments and staleness inputs are strict arrays',
+    TestHookArraysAreStrict);
   Test('[build].<entry>.prebuild / postbuild parsed + {item.output} expanded',
     TestPerEntryHooksParsed);
   Test('unknown top-level section dropped silently with stderr warning',

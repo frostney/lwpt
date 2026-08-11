@@ -65,8 +65,8 @@ type
     procedure TestSilentFormatCheckRetainsEvidenceAfterWarning;
     procedure TestSilentVerboseConflictIsRejected;
     procedure TestSilentRunAliasUsesResolvedCommand;
-    procedure TestSilentRunScriptSuppressesSuccessfulChildOutput;
-    procedure TestSilentRunScriptReplaysFailedChildOutput;
+    procedure TestSilentRunTaskSuppressesSuccessfulChildOutput;
+    procedure TestSilentRunTaskReplaysFailedChildOutput;
     procedure TestSilentBuildReplaysFailedCompilerOutputOnly;
     procedure TestSilentNoBuildEntriesRetainsFailureAfterWarning;
     procedure TestSilentInteractiveInitIsRejected;
@@ -109,13 +109,15 @@ begin
     'output = "build/hello"'#10 +
     ''#10 +
     '[child-success]'#10 +
-    'script = "scripts/child-success.pas"'#10 +
+    'command = "instantfpc"'#10 +
+    'args = ["scripts/child-success.pas"]'#10 +
     ''#10 +
     '[child-failure]'#10 +
-    'script = "scripts/child-failure.pas"'#10 +
+    'command = "instantfpc"'#10 +
+    'args = ["scripts/child-failure.pas"]'#10 +
     ''#10 +
     '[prebuild]'#10 +
-    'successful = "scripts/child-success.pas"'#10 +
+    'successful = { command = "instantfpc", args = ["scripts/child-success.pas"] }'#10 +
     ''#10 +
     '[unknown-section]'#10 +
     'enabled = true'#10);
@@ -409,7 +411,7 @@ begin
   Expect<Boolean>(Pos(LineEnding, Trim(R.Stdout)) = 0).ToBe(True);
 end;
 
-procedure TCLIOptionsE2E.TestSilentRunScriptSuppressesSuccessfulChildOutput;
+procedure TCLIOptionsE2E.TestSilentRunTaskSuppressesSuccessfulChildOutput;
 var
   R: TLwptResult;
 begin
@@ -422,7 +424,7 @@ begin
   Expect<Boolean>(Pos(LineEnding, Trim(R.Stdout)) = 0).ToBe(True);
 end;
 
-procedure TCLIOptionsE2E.TestSilentRunScriptReplaysFailedChildOutput;
+procedure TCLIOptionsE2E.TestSilentRunTaskReplaysFailedChildOutput;
 var
   R: TLwptResult;
   ChildAt, FinalAt, WarningAt: Integer;
@@ -554,10 +556,10 @@ begin
     TestSilentVerboseConflictIsRejected);
   Test('silent run alias reports only the resolved command result',
     TestSilentRunAliasUsesResolvedCommand);
-  Test('silent successful run script suppresses child output',
-    TestSilentRunScriptSuppressesSuccessfulChildOutput);
-  Test('silent failed run script replays child output before the result',
-    TestSilentRunScriptReplaysFailedChildOutput);
+  Test('silent successful run task suppresses child output',
+    TestSilentRunTaskSuppressesSuccessfulChildOutput);
+  Test('silent failed run task replays child output before the result',
+    TestSilentRunTaskReplaysFailedChildOutput);
   Test('silent failed build replays compiler output without progress',
     TestSilentBuildReplaysFailedCompilerOutputOnly);
   Test('silent no-build failure survives an unrelated manifest warning',

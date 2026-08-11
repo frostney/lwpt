@@ -23,11 +23,13 @@ type
   TLWPTCompilerProcess = class
   private
     FExecutable: string;
+    FWorkingDirectory: string;
     FRunner: TLWPTDuplexProcessRunner;
     FCancelled: Boolean;
     FCriticalSection: TRTLCriticalSection;
   public
-    constructor Create(const AExecutable: string = '');
+    constructor Create(const AExecutable: string = '';
+      const AWorkingDirectory: string = '');
     destructor Destroy; override;
     function Run(const AArgs: LWPT.Core.TStringArray;
       out AOutput: string): Integer; overload;
@@ -140,10 +142,12 @@ type
   TLWPTBuildResultArray = array of TLWPTBuildResult;
   TLWPTStringArray = array of string;
 
-constructor TLWPTCompilerProcess.Create(const AExecutable: string);
+constructor TLWPTCompilerProcess.Create(const AExecutable,
+  AWorkingDirectory: string);
 begin
   inherited Create;
   FExecutable := AExecutable;
+  FWorkingDirectory := AWorkingDirectory;
   FRunner := nil;
   FCancelled := False;
   InitCriticalSection(FCriticalSection);
@@ -201,6 +205,8 @@ begin
       P.Executable := FExecutable
     else
       P.Executable := FPCExecutable;
+    if FWorkingDirectory <> '' then
+      P.CurrentDirectory := FWorkingDirectory;
     for ArgumentIndex := 0 to High(AArgs) do
       P.Parameters.Add(AArgs[ArgumentIndex]);
     Options := DefaultProcessRunOptions(AOperationName);
@@ -386,13 +392,16 @@ begin
   for i := 0 to High(AHooks) do
   begin
     Result[i] := AHooks[i];
-    Result[i].Script := ReplaceOutputReference(AHooks[i].Script,
+    Result[i].Runnable.Command := ReplaceOutputReference(
+      AHooks[i].Runnable.Command,
       APublicOutput, ACandidateOutput);
     Result[i].Output := ReplaceOutputReference(AHooks[i].Output,
       APublicOutput, ACandidateOutput);
-    Result[i].Args := Copy(AHooks[i].Args, 0, Length(AHooks[i].Args));
-    for j := 0 to High(Result[i].Args) do
-      Result[i].Args[j] := ReplaceOutputReference(Result[i].Args[j],
+    Result[i].Runnable.Args := Copy(AHooks[i].Runnable.Args, 0,
+      Length(AHooks[i].Runnable.Args));
+    for j := 0 to High(Result[i].Runnable.Args) do
+      Result[i].Runnable.Args[j] := ReplaceOutputReference(
+        Result[i].Runnable.Args[j],
         APublicOutput, ACandidateOutput);
     Result[i].Inputs := Copy(AHooks[i].Inputs, 0, Length(AHooks[i].Inputs));
     for j := 0 to High(Result[i].Inputs) do
@@ -425,11 +434,11 @@ begin
   for i := 0 to High(AHooks) do
   begin
     AddDefinition(AHooks[i].Name);
-    AddDefinition(AHooks[i].Script);
+    AddDefinition(AHooks[i].Runnable.Command);
     AddDefinition(AHooks[i].Output);
-    AddInput(AHooks[i].Script);
-    for j := 0 to High(AHooks[i].Args) do
-      AddDefinition(AHooks[i].Args[j]);
+    AddInput(AHooks[i].Runnable.Command);
+    for j := 0 to High(AHooks[i].Runnable.Args) do
+      AddDefinition(AHooks[i].Runnable.Args[j]);
     for j := 0 to High(AHooks[i].Inputs) do
     begin
       AddDefinition(AHooks[i].Inputs[j]);
@@ -502,7 +511,11 @@ begin
   OutBin := T.Output;
   if OutBin = '' then
     OutBin := ChangeFileExt(T.Source, '');
-  Request.BuildRequest := ADriver.CreateBuildRequest(T.Source, OutBin);
+  if T.HasTarget then
+    Request.BuildRequest := ADriver.CreateBuildRequestForTarget(T.Source,
+      OutBin, T.Target)
+  else
+    Request.BuildRequest := ADriver.CreateBuildRequest(T.Source, OutBin);
   OutBin := Request.BuildRequest.Outputs.Artifact;
   { Every invocation writes compiler outputs below its unique session.
     The public output path is touched only by PublishBuildArtifact after
@@ -521,6 +534,7 @@ begin
   CfgPath := ResolveCfgFile(AMan);
   ModulesPath := ResolveModulesDir(AMan);
   Request.CompilerExecutable := ADriver.ExecutableName;
+  Request.CompilerArguments := ADriver.InvocationArguments([]);
   Request.ManifestContentHash := AManifestContentHash;
   Request.PublicOutput := OutBin;
   if ARelease then
@@ -571,8 +585,8 @@ begin
   Fingerprint := CaptureBuildPublicationFingerprint(ProjectRoot,
     AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
 
-  FpcArgs := ADriver.BuildArguments(Request.BuildRequest,
-    BuildCompilerInvocationOptions(CfgPath, AClean));
+  FpcArgs := ADriver.InvocationArguments(ADriver.BuildArguments(
+    Request.BuildRequest, BuildCompilerInvocationOptions(CfgPath, AClean)));
 
   FpcExit := ACompiler.Run(FpcArgs,
     ADriver.BuildStandardInput(Request.BuildRequest),
@@ -633,7 +647,8 @@ begin
   FSession := ASession;
   FLease := ALease;
   FDriver := ADriver;
-  FCompiler := TLWPTCompilerProcess.Create(FDriver.ExecutableName);
+  FCompiler := TLWPTCompilerProcess.Create(FDriver.ExecutableName,
+    FDriver.WorkingDirectory);
   FCompiled := Default(TLWPTCompiledEntry);
   FBuildResult := DefaultBuildResult;
   FCompilerExitCode := ObservabilityInternalErrorExitCode;
@@ -927,7 +942,7 @@ var
   i, j, Built, Failed, Skipped, Unknown, SelectedCount, MaxJobs, Running,
     Completed : Integer;
   Matched : Boolean;
-  ModeStr, CollA, CollB, DependencyName : string;
+  ModeStr, CollA, CollB, DependencyName, ProjectRoot : string;
   ManifestContentHash: string;
   Session: TLWPTBuildSession;
   WorkerSession: TLWPTWorkerBudgetSession;
@@ -1027,7 +1042,7 @@ var
     HookEnvironment[2] := BUILD_PUBLIC_OUTPUT_ENV + '='
       + Compiled[AIndex].OutBin;
     RunHooksWithEnvironment('postbuild:' + Man.BuildEntries[AIndex].Name,
-      Compiled[AIndex].PostBuild, Session.HookRoot, HookEnvironment);
+      Compiled[AIndex].PostBuild, ProjectRoot, HookEnvironment);
   end;
 
   function AcquireWorkerLease: TLWPTWorkerLease;
@@ -1079,7 +1094,7 @@ var
     if Length(AHooks) = 0 then Exit;
     PostBuildLease := AcquireWorkerLease;
     try
-      RunHooks('postbuild', AHooks, Session.HookRoot);
+      RunHooks('postbuild', AHooks, ProjectRoot);
     finally
       PostBuildLease.Free;
     end;
@@ -1183,6 +1198,7 @@ begin
         raise EManifestError.CreateFmt(
           'manifest not found at %s', [AManifestPath]);
       Man := LoadManifestSnapshot(AManifestPath, ManifestContentHash);
+      ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
       CompilerSelection := TLWPTCompilerSelection.Create(Man,
         ExtractFileDir(ExpandFileName(AManifestPath)), ACompilerHost);
 
@@ -1253,7 +1269,7 @@ begin
       Session.SessionReference, ')');
     { --clean means a forced compile in fresh private staging. It never
       deletes the last successful public output or another live session. }
-    RunHooks('prebuild', Man.PreBuild, Session.HookRoot);
+    RunHooks('prebuild', Man.PreBuild, ProjectRoot);
     GenerateVersionInclude(
       ExtractFileDir(ExpandFileName(AManifestPath)), Man);
 
@@ -1321,7 +1337,7 @@ begin
               try
                 PrintStart(i);
                 RunHooks('prebuild:' + Man.BuildEntries[i].Name,
-                  Man.BuildEntries[i].PreBuild, Session.HookRoot);
+                  Man.BuildEntries[i].PreBuild, ProjectRoot);
                 Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
                   ManifestContentHash, Man.BuildEntries[i], ARelease, AClean,
                   Session, Lease, EntryDrivers[i]);

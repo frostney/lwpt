@@ -28,6 +28,8 @@ uses
   (correct on Windows and on the raw-status path), and trust ExitStatus
   whenever ExitCode claims success but the stored status disagrees. }
 function  NormalisedExitCode(const AProcess: TProcess): Integer;
+function  ResolveRunnableCommand(const AProjectRoot,
+  ACommand: string): string;
 
 function  CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths: array of string; out AOutBin: string;
@@ -35,13 +37,11 @@ function  CreatePascalCompilerProcess(const ASrcFile: string;
   const ADriver: TLWPTCompilerDriver): TProcess;
 procedure AppendCompilerEnvironmentSearchPaths(
   var AUnitPaths, AIncludePaths: TStringArray);
-function  RunPascalScript(const AHook: THook; out AError: string;
-  const ABuildRoot: string = ''): Integer;
-function  RunUserScript(const AHook: THook): Integer;
+function  RunUserTask(const ATask: THook; const AProjectRoot: string): Integer;
 procedure RunHooks(const APhase: string; const AHooks: THookArray;
-  const ABuildRoot: string = '');
+  const AProjectRoot: string);
 procedure RunHooksWithEnvironment(const APhase: string;
-  const AHooks: THookArray; const ABuildRoot: string;
+  const AHooks: THookArray; const AProjectRoot: string;
   const AEnvironment: array of string);
 
 implementation
@@ -160,9 +160,11 @@ begin
     EnsureBuildRequestCompatible(ARequest, Capabilities);
     ARequest.Compiler.VersionIdentity := Capabilities.VersionIdentity;
 
-    Arguments := ADriver.BuildArguments(ARequest,
-      PascalSourceCompilerInvocationOptions(CFG_FILE));
+    Arguments := ADriver.InvocationArguments(ADriver.BuildArguments(ARequest,
+      PascalSourceCompilerInvocationOptions(CFG_FILE)));
     Result.Executable := ADriver.ExecutableName;
+    if ADriver.WorkingDirectory <> '' then
+      Result.CurrentDirectory := ADriver.WorkingDirectory;
     for i := 0 to High(Arguments) do
       Result.Parameters.Add(Arguments[i]);
 
@@ -215,24 +217,196 @@ begin
   end;
 end;
 
-function HookIsStale(const AHook: THook): Boolean;
+function IsAbsoluteFilesystemPath(const APath: string): Boolean;
+begin
+  Result := (APath <> '') and (APath[1] in ['/', '\']);
+  if not Result then
+    Result := (Length(APath) >= 3) and (APath[2] = ':')
+      and (APath[3] in ['/', '\']);
+end;
+
+function ResolveProjectPath(const AProjectRoot, APath: string): string;
+begin
+  if IsAbsoluteFilesystemPath(APath) then Exit(ExpandFileName(APath));
+  Result := ExpandFileName(IncludeTrailingPathDelimiter(AProjectRoot) + APath);
+end;
+
+function ResolveRunnableCommand(const AProjectRoot, ACommand: string): string;
+{$IFDEF WINDOWS}
+var
+  SearchPath: string;
+{$ENDIF}
+begin
+  if (Pos('/', ACommand) > 0) or (Pos('\', ACommand) > 0) then
+  begin
+    Result := ResolveProjectPath(AProjectRoot, ACommand);
+    {$IFDEF WINDOWS}
+    if (ExtractFileExt(Result) = '') and not FileExists(Result) then
+    begin
+      if FileExists(Result + '.exe') then Result := Result + '.exe'
+      else if FileExists(Result + '.com') then Result := Result + '.com';
+    end;
+    {$ENDIF}
+    Exit;
+  end;
+
+  {$IFDEF WINDOWS}
+  { TProcess.Executable does not apply PATH or PATHEXT when it passes an
+    application name directly to CreateProcess. Search only the inherited
+    PATH (never the implicit current directory), without involving a shell. }
+  SearchPath := GetEnvironmentVariable('PATH');
+  Result := FileSearch(ACommand, SearchPath, [sfoStripQuotes]);
+  if (Result = '') and (ExtractFileExt(ACommand) = '') then
+  begin
+    Result := FileSearch(ACommand + '.exe', SearchPath, [sfoStripQuotes]);
+    if Result = '' then
+      Result := FileSearch(ACommand + '.com', SearchPath, [sfoStripQuotes]);
+  end;
+  if Result = '' then Result := ACommand;
+  {$ELSE}
+  { Leave Unix lookup to execvp so a non-executable entry does not mask a
+    later executable with the same name in PATH. }
+  Result := ACommand;
+  {$ENDIF}
+end;
+
+function PatternHasGlob(const APattern: string): Boolean;
+begin
+  Result := (Pos('*', APattern) > 0) or (Pos('?', APattern) > 0);
+end;
+
+function StaticGlobPrefix(const APattern: string): string;
+var
+  Segment: string;
+  SlashAt, StartAt: Integer;
+begin
+  Result := '';
+  StartAt := 1;
+  while StartAt <= Length(APattern) do
+  begin
+    SlashAt := Pos('/', Copy(APattern, StartAt, MaxInt));
+    if SlashAt = 0 then Segment := Copy(APattern, StartAt, MaxInt)
+    else Segment := Copy(APattern, StartAt, SlashAt - 1);
+    if PatternHasGlob(Segment) then Exit;
+    if Result <> '' then Result := Result + '/';
+    Result := Result + Segment;
+    if SlashAt = 0 then Exit;
+    Inc(StartAt, SlashAt);
+  end;
+end;
+
+procedure CollectGlobFiles(const AProjectRoot, ADirectory, APattern: string;
+  const AFiles: TStringList);
+var
+  Search: TSearchRec;
+  FullPath, RelativePath: string;
+begin
+  if FindFirst(IncludeTrailingPathDelimiter(ADirectory) + '*',
+    faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    repeat
+      if (Search.Name = '.') or (Search.Name = '..') then Continue;
+      if (Search.Name <> '') and (Search.Name[1] = '.') then Continue;
+      FullPath := IncludeTrailingPathDelimiter(ADirectory) + Search.Name;
+      if (Search.Attr and faDirectory) <> 0 then
+      begin
+        if ((Search.Attr and faSymLink) = 0)
+           and not IsDirSymlinkOrJunction(FullPath) then
+          CollectGlobFiles(AProjectRoot, FullPath, APattern, AFiles);
+      end
+      else
+      begin
+        RelativePath := ExtractRelativePath(
+          IncludeTrailingPathDelimiter(AProjectRoot), FullPath);
+        RelativePath := StringReplace(RelativePath, '\', '/', [rfReplaceAll]);
+        if MatchPathGlob(RelativePath, APattern) then AFiles.Add(FullPath);
+      end;
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+procedure ResolveInputExpression(const AHook: THook;
+  const AProjectRoot, AExpression: string; const AFiles: TStringList);
+var
+  i: Integer;
+  Canonical, Prefix, SearchRoot: string;
+  Matches: TStringList;
+begin
+  Matches := TStringList.Create;
+  try
+  Canonical := CanonicalPathGlob(AExpression);
+  if IsAbsoluteFilesystemPath(Canonical) or (Canonical = '..')
+     or (Copy(Canonical, 1, 3) = '../') then
+    raise EManifestError.CreateFmt(
+      'runnable "%s": input "%s" must be project-root-relative',
+      [AHook.Name, AExpression]);
+  if not PatternHasGlob(Canonical) then
+  begin
+    SearchRoot := ResolveProjectPath(AProjectRoot, Canonical);
+    if not PathContains(AProjectRoot, SearchRoot) then
+      raise EManifestError.CreateFmt(
+        'runnable "%s": input "%s" must be project-root-relative',
+        [AHook.Name, AExpression]);
+    if FileExists(SearchRoot) then Matches.Add(SearchRoot);
+  end
+  else
+  begin
+    Prefix := StaticGlobPrefix(Canonical);
+    if Prefix = '' then SearchRoot := AProjectRoot
+    else
+    begin
+      SearchRoot := ResolveProjectPath(AProjectRoot, Prefix);
+      if not PathContains(AProjectRoot, SearchRoot) then
+        raise EManifestError.CreateFmt(
+          'runnable "%s": input "%s" must be project-root-relative',
+          [AHook.Name, AExpression]);
+      if not DirectoryExists(SearchRoot) then
+        SearchRoot := ExtractFileDir(SearchRoot);
+    end;
+    if DirectoryExists(SearchRoot) then
+      CollectGlobFiles(AProjectRoot, SearchRoot, Canonical, Matches);
+  end;
+  if Matches.Count = 0 then
+    raise EManifestError.CreateFmt(
+      'runnable "%s": input expression "%s" matched no files',
+      [AHook.Name, AExpression]);
+  for i := 0 to Matches.Count - 1 do AFiles.Add(Matches[i]);
+  finally
+    Matches.Free;
+  end;
+end;
+
+function HookIsStale(const AHook: THook;
+  const AProjectRoot: string): Boolean;
 var
   OutputAge: LongInt;
   i: Integer;
+  Files: TStringList;
+  OutputPath: string;
 begin
   { Always-run hooks (no inputs/output declared) never short-circuit. }
   if (AHook.Output = '') or (Length(AHook.Inputs) = 0) then Exit(True);
-  if not FileExists(AHook.Output) then Exit(True);
-  OutputAge := FileAge(AHook.Output);
-  for i := 0 to High(AHook.Inputs) do
-    if FileExists(AHook.Inputs[i])
-       and (FileAge(AHook.Inputs[i]) > OutputAge) then
-      Exit(True);
-  Result := False;
+  Files := TStringList.Create;
+  try
+    Files.Sorted := True;
+    Files.Duplicates := dupIgnore;
+    for i := 0 to High(AHook.Inputs) do
+      ResolveInputExpression(AHook, AProjectRoot, AHook.Inputs[i], Files);
+    OutputPath := ResolveProjectPath(AProjectRoot, AHook.Output);
+    if not FileExists(OutputPath) then Exit(True);
+    OutputAge := FileAge(OutputPath);
+    for i := 0 to Files.Count - 1 do
+      if FileAge(Files[i]) > OutputAge then Exit(True);
+    Result := False;
+  finally
+    Files.Free;
+  end;
 end;
 
-function RunPascalScriptWithEnvironment(const AHook: THook;
-  out AError: string; const ABuildRoot: string;
+function RunRunnableWithEnvironment(const AHook: THook;
+  out AError: string; const AProjectRoot: string;
   const AEnvironment: array of string): Integer;
 var
   P: TProcess;
@@ -243,30 +417,13 @@ var
   ChildFailed: Boolean;
   ProcessOptions: TLWPTProcessRunOptions;
   ProcessRunner: TLWPTDuplexProcessRunner;
-  {$IFDEF UNIX}
-  CacheRoot: string;
-  {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Bin, CompilerOutput, DiagnosticMessage: string;
-  BuildResult: TLWPTBuildResult;
-  {$ENDIF}
 begin
   AError := '';
-  {$IFDEF MSWINDOWS}
-  if not CompilePascal(AHook.Script, [], Bin, BuildResult, CompilerOutput,
-    ABuildRoot) then
-  begin
-    AError := 'fpc failed to compile ' + AHook.Script;
-    DiagnosticMessage := BuildResultErrorMessage(BuildResult);
-    if DiagnosticMessage <> '' then AError := AError + ': ' + DiagnosticMessage;
-    if CompilerOutput <> '' then AError := AError + LineEnding + CompilerOutput;
-    Exit(1);
-  end;
-  Bin := NativePath(ExpandFileName(Bin));
-  {$ENDIF}
-
   P := TProcess.Create(nil);
   try
+    P.Executable := ResolveRunnableCommand(AProjectRoot,
+      AHook.Runnable.Command);
+    P.CurrentDirectory := AProjectRoot;
     if Length(AEnvironment) > 0 then
     begin
       { Hooks run on the scheduler thread while build jobs materialise
@@ -304,28 +461,15 @@ begin
       for i := 0 to High(AEnvironment) do
         P.Environment.Add(AEnvironment[i]);
     end;
-    {$IFDEF MSWINDOWS}
-    P.Executable := Bin;
-    {$ELSE}
-    P.Executable := InstantFPCExecutable;
-    if ABuildRoot <> '' then
-    begin
-      CacheRoot := IncludeTrailingPathDelimiter(ABuildRoot)
-        + 'instantfpc/' + BuildSessionPathKey(ExpandFileName(AHook.Script));
-      ForceDirectories(CacheRoot);
-      P.Parameters.Add('--set-cache=' + CacheRoot);
-    end;
-    P.Parameters.Add(AHook.Script);
-    {$ENDIF}
-    for j := 0 to High(AHook.Args) do
-      P.Parameters.Add(AHook.Args[j]);
+    for j := 0 to High(AHook.Runnable.Args) do
+      P.Parameters.Add(AHook.Runnable.Args[j]);
     try
       if SilentOutputActive then
       begin
         ProcessRunner := TLWPTDuplexProcessRunner.Create(P);
         try
           ProcessOptions := DefaultProcessRunOptions(
-            'script "' + AHook.Name + '"');
+            'runnable "' + AHook.Name + '"');
           ProcessOptions.SeparateStandardError := True;
           ProcessOptions.DiscardCapturedOutput := True;
           ProcessOptions.OnOutputChunk := @CaptureSilentProcessChunk;
@@ -346,16 +490,12 @@ begin
       begin
         ExecuteUnmanagedProcess(P);
         P.WaitOnExit;
-        Result := P.ExitStatus;
+        Result := NormalisedExitCode(P);
       end;
     except
       on E: Exception do
       begin
-        {$IFDEF MSWINDOWS}
-        AError := 'compiled script unavailable (' + E.Message + ')';
-        {$ELSE}
-        AError := 'instantfpc unavailable (' + E.Message + ')';
-        {$ENDIF}
+        AError := 'command unavailable (' + E.Message + ')';
         Exit(127);
       end;
     end;
@@ -364,26 +504,20 @@ begin
   end;
 end;
 
-function RunPascalScript(const AHook: THook; out AError: string;
-  const ABuildRoot: string): Integer;
-begin
-  Result := RunPascalScriptWithEnvironment(AHook, AError, ABuildRoot, []);
-end;
-
 procedure RunHooksWithEnvironment(const APhase: string;
-  const AHooks: THookArray; const ABuildRoot: string;
+  const AHooks: THookArray; const AProjectRoot: string;
   const AEnvironment: array of string);
 var
   i, Code: Integer;
   H: THook;
-  ScriptError: string;
+  RunnableError: string;
 begin
   if Length(AHooks) = 0 then Exit;
   for i := 0 to High(AHooks) do
   begin
     H := AHooks[i];
 
-    if not HookIsStale(H) then
+    if not HookIsStale(H, AProjectRoot) then
     begin
       WriteLn('  [', APhase, '] ', H.Name, ' (skipped — output fresh)');
       Continue;
@@ -391,44 +525,35 @@ begin
 
     WriteLn('  [', APhase, '] ', H.Name);
 
-    if not FileExists(H.Script) then
-      raise EManifestError.CreateFmt(
-        '[%s] %s: script not found at %s', [APhase, H.Name, H.Script]);
-
-    Code := RunPascalScriptWithEnvironment(H, ScriptError, ABuildRoot,
+    Code := RunRunnableWithEnvironment(H, RunnableError, AProjectRoot,
       AEnvironment);
-    if ScriptError <> '' then
+    if RunnableError <> '' then
       raise ELWPTError.CreateFmt(
         '[%s] %s: %s while running %s',
-        [APhase, H.Name, ScriptError, H.Script]);
+        [APhase, H.Name, RunnableError, H.Runnable.Command]);
 
     if Code <> 0 then
       raise ELWPTError.CreateFmt(
-        '[%s] %s: script exited %d while running %s',
-        [APhase, H.Name, Code, H.Script]);
+        '[%s] %s: command exited %d while running %s',
+        [APhase, H.Name, Code, H.Runnable.Command]);
   end;
 end;
 
 procedure RunHooks(const APhase: string; const AHooks: THookArray;
-  const ABuildRoot: string);
+  const AProjectRoot: string);
 begin
-  RunHooksWithEnvironment(APhase, AHooks, ABuildRoot, []);
+  RunHooksWithEnvironment(APhase, AHooks, AProjectRoot, []);
 end;
 
-function RunUserScript(const AHook: THook): Integer;
+function RunUserTask(const ATask: THook; const AProjectRoot: string): Integer;
 var
-  ScriptError: string;
+  TaskError: string;
 begin
-  if not FileExists(AHook.Script) then
+  if not HookIsStale(ATask, AProjectRoot) then Exit(0);
+  Result := RunRunnableWithEnvironment(ATask, TaskError, AProjectRoot, []);
+  if TaskError <> '' then
   begin
-    WriteLn(ErrOutput, PROGRAM_NAME, ' run: script not found at ',
-      AHook.Script);
-    Exit(127);
-  end;
-  Result := RunPascalScript(AHook, ScriptError);
-  if ScriptError <> '' then
-  begin
-    WriteLn(ErrOutput, PROGRAM_NAME, ' run: ', ScriptError, '.');
+    WriteLn(ErrOutput, PROGRAM_NAME, ' run: ', TaskError, '.');
     if Result = 0 then Result := 1;
   end;
 end;

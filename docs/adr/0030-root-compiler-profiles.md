@@ -82,3 +82,22 @@ rebuild-policy field when an external backend contract requires it.
   so an external driver receives the same complete search surface as FPC.
 - Compiler profiles provide the stable foundation for adding concrete backend
   adapters without adding compiler-specific fields to build requests.
+
+## 0.6.0 amendment — one out-of-process command model
+
+Issue [#161](https://github.com/frostney/lwpt/issues/161) replaces the
+mutually exclusive `executable`/`script` fields and embedding factory API with
+the shared direct runnable-command definition: optional `command` plus ordered
+`args` for built-in adapters, required `command` for custom protocol drivers,
+and host registration of driver identity, command, arguments, version
+constraint, and optional default binding. Legacy manifest fields hard-error;
+there is no implicit InstantFPC translation.
+
+Built-in invocations are `command + configured args + adapter arguments` for
+both live probes and compilation. External protocol invocations are
+`command + configured args + probe|compile`. Commands resolve from the project
+root or inherited `PATH`, execute with the project root as cwd, and remain
+bounded out-of-process operations. Host registration never returns an
+in-process compiler object. Existing profile precedence, version/capability
+validation, process-tree ownership, timeouts, result/artifact validation, and
+no-fallback behavior remain in force.

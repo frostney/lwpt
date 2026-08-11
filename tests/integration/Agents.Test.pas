@@ -10,20 +10,20 @@
   Coverage:
 
     1. Fresh project → AGENTS.md created with markers, subcommands,
-       and the manifest's run-scripts.
+       and the manifest's run tasks.
     2. Second run is byte-idempotent and reports "up to date".
     3. --check on a fresh block exits 0; after an in-region edit it
        exits 1 and writes nothing.
     4. Regeneration replaces the region while preserving hand-written
        prose outside the markers.
-    5. A manifest edit (run-script removed) makes the block stale;
-       regeneration renders the no-run-scripts placeholder.
+    5. A manifest edit (run task removed) makes the block stale;
+       regeneration renders the no-run-tasks placeholder.
     6. Corrupt marker pair (begin removed) → exit non-zero, file
        untouched.
     7. Missing manifest → exit non-zero (agents is project-scoped).
     8. Every command listed by `lwpt --help` appears in the block.
 
-  Scratch project: minimal manifest with one user-declared run-script
+  Scratch project: minimal manifest with one user-declared run task
   section, wiped and re-seeded per run. }
 
 program Agents.Test;
@@ -64,8 +64,8 @@ type
     procedure TestDuplicateMarkersExitNonZero;
     procedure TestInlineMarkerMentionIsProse;
     procedure TestMarkerlessCRLFAppendPreservesBytes;
-    procedure TestPlatformPlaceholderScriptRendersVerbatim;
-    procedure TestMixedCaseReservedScriptNameFailsAtLoad;
+    procedure TestPlatformPlaceholderTaskRendersVerbatim;
+    procedure TestMixedCaseReservedTaskNameFailsAtLoad;
     procedure TestMissingManifestExitsNonZero;
     procedure TestHelpAndGeneratedBlockAgree;
   end;
@@ -81,7 +81,8 @@ begin
     'units = ["scripts"]'#10 +
     ''#10 +
     '[hello]'#10 +
-    'script = "scripts/hello.pas"'#10);
+    'command = "instantfpc"'#10 +
+    'args = ["scripts/hello.pas", "hello world", ""]'#10);
 
   WriteTextFile(FScratch + '/scripts/hello.pas',
     'begin'#10 +
@@ -150,8 +151,10 @@ begin
   Expect<Boolean>(Pos('`--frozen`', Content) > 0).ToBe(True);
   Expect<Boolean>(Pos('- `lwpt agents [--check] [--silent]`', Content) > 0)
     .ToBe(True);
-  { The manifest's run-script, addressable form. }
-  Expect<Boolean>(Pos('- `lwpt run hello` — `scripts/hello.pas`', Content) > 0)
+  { The manifest's run task, addressable form. }
+  Expect<Boolean>(Pos('- `lwpt run hello` — command: `instantfpc`; '
+    + 'args: [0]=`scripts/hello.pas` [1]=`hello world` [2]=(empty)',
+    Content) > 0)
     .ToBe(True);
 end;
 
@@ -224,7 +227,7 @@ var
 begin
   RunLwpt(['agents'], FScratch);
 
-  { Drop the run-script from the manifest: the committed block still
+  { Drop the run task from the manifest: the committed block still
     lists it, so --check must flag drift. }
   WriteTextFile(FScratch + '/lwpt.toml',
     '[package]'#10 +
@@ -236,7 +239,7 @@ begin
 
   R := RunLwpt(['agents'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('No run-scripts declared', ReadAgents) > 0).ToBe(True);
+  Expect<Boolean>(Pos('No run tasks declared', ReadAgents) > 0).ToBe(True);
   Expect<Boolean>(Pos('lwpt run hello', ReadAgents) > 0).ToBe(False);
 
   { Restore the original manifest + block for later tests. }
@@ -329,11 +332,11 @@ begin
   RunLwpt(['agents'], FScratch);
 end;
 
-procedure TAgentsE2E.TestPlatformPlaceholderScriptRendersVerbatim;
+procedure TAgentsE2E.TestPlatformPlaceholderTaskRendersVerbatim;
 var
   R: TLwptResult;
 begin
-  { A platform-interpolated script path must render as declared —
+  { A platform-interpolated command argument must render as declared —
     otherwise the committed block differs per platform and --check
     flips in cross-platform CI. }
   WriteTextFile(FScratch + '/lwpt.toml',
@@ -343,23 +346,26 @@ begin
     'units = ["scripts"]'#10 +
     ''#10 +
     '[native]'#10 +
-    'script = "scripts/{platform.os}.pas"'#10);
+    'command = "instantfpc"'#10 +
+    'args = ["scripts/{platform.os}.pas"]'#10);
 
   R := RunLwpt(['agents'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('`scripts/{platform.os}.pas`', ReadAgents) > 0)
+  Expect<Boolean>(Pos('command: `instantfpc`; '
+    + 'args: [0]=`scripts/{platform.os}.pas`',
+    ReadAgents) > 0)
     .ToBe(True);
 
   SetupScratchProject;
   RunLwpt(['agents'], FScratch);
 end;
 
-procedure TAgentsE2E.TestMixedCaseReservedScriptNameFailsAtLoad;
+procedure TAgentsE2E.TestMixedCaseReservedTaskNameFailsAtLoad;
 var
   R: TLwptResult;
 begin
   { Dispatch is case-insensitive, so a case-variant section like
-    [Agents] would list as a script yet be unreachable. The reserved-
+    [Agents] would list as a task yet be unreachable. The reserved-
     name guard must reject it at manifest load. }
   WriteTextFile(FScratch + '/lwpt.toml',
     '[package]'#10 +
@@ -368,7 +374,8 @@ begin
     'units = ["scripts"]'#10 +
     ''#10 +
     '[Agents]'#10 +
-    'script = "scripts/hello.pas"'#10);
+    'command = "instantfpc"'#10 +
+    'args = ["scripts/hello.pas"]'#10);
 
   R := RunLwpt(['agents'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
@@ -510,10 +517,10 @@ begin
     TestInlineMarkerMentionIsProse);
   Test('appending to a markerless CRLF file preserves its bytes exactly',
     TestMarkerlessCRLFAppendPreservesBytes);
-  Test('a {platform.os} script path renders verbatim, not interpolated',
-    TestPlatformPlaceholderScriptRendersVerbatim);
-  Test('a case-variant reserved script name ([Agents]) fails at manifest load',
-    TestMixedCaseReservedScriptNameFailsAtLoad);
+  Test('a {platform.os} task argument renders verbatim, not interpolated',
+    TestPlatformPlaceholderTaskRendersVerbatim);
+  Test('a case-variant reserved task name ([Agents]) fails at manifest load',
+    TestMixedCaseReservedTaskNameFailsAtLoad);
   Test('missing lwpt.toml exits non-zero (agents is project-scoped)',
     TestMissingManifestExitsNonZero);
   Test('every --help command appears in the generated block',

@@ -20,10 +20,9 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   argument translation, executable naming, failure classification, and result
   normalization. Root-owned profiles select built-in FPC, Delphi, Blaise, the
   opt-in Lakon adapter, a short-lived external driver, or an embedding-host
-  factory for build and
-  test. A registered `lakon` host factory takes precedence over the external
-  Lakon adapter so an embedding can replace the implicit FPC default;
-  lifecycle hook compilation remains on FPC. See ADR-0022, ADR-0029, and
+  registered command for build and test. Host registration uses the same
+  out-of-process command/arguments definition as manifest profiles;
+  lifecycle commands use that definition too. See ADR-0022, ADR-0029, and
   ADR-0030.
 - **Analysis commands share structure, not policy.** `LWPT.Analysis.Scope`
   resolves root/workspace ownership, `LWPT.Analysis.Pascal` exposes normalized
@@ -58,7 +57,7 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
    lwpt build         lwpt test       lwpt format     lwpt run
    (fpc @lwpt.cfg)    (compile +      (rewrite or     (invoke a
                        run *.Test.pas) check sources)  user-defined
-                                                       script)
+                                                       run task)
 
    ↑ lwpt repair operates on project residue, abandoned .lwpt/sessions/
      staging, and the per-user worker coordinator orthogonally.
@@ -78,11 +77,11 @@ Sections currently supported:
 | `[package]` | name, version, units (`-Fu` roots from the project's own source) |
 | `[dependencies]` | bare-string `"<source>@<version>"` shorthand or inline-table `{ source = "...", version = "...", subdir = "..." }` — see [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) |
 | `[sources]` | per-project custom git-host declarations. Each entry is an inline table mapping a prefix name to `archive` + `git` URL templates with `{user}` / `{repository}` / `{ref}` placeholders; enables prefixes like `gitea:owner/repo` against the user's self-hosted instance |
-| `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Inline entries may declare `depends = ["prerequisite"]` and ordered `flags = ["-dFEATURE"]`. Single-binary shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` |
-| `[compiler]` / `[compiler.profiles.<name>]` | root-owned compiler policy. `default` names the project profile; profiles select a driver plus optional `version` and either `executable` or `script`. Built-in IDs are `fpc`, opt-in `blaise`, and opt-in `lakon`; other IDs resolve through an embedding factory or external protocol executable. An embedding host may register `lakon` explicitly and make it the host default. A build entry's `compiler` field overrides the project default. Dependency manifests cannot contribute this policy. |
+| `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Inline entries may declare `depends = ["prerequisite"]`, ordered `flags = ["-dFEATURE"]`, a compiler profile, and an independent target tuple (`os`, `architecture`, optional `abi` and `environment`). Single-binary shorthand defaults the entry name to `[package].name`. |
+| `[compiler]` / `[compiler.profiles.<name>]` | root-owned compiler policy. `default` names the project profile; profiles select a driver plus optional `command`, ordered `args`, and `version`. Built-in IDs are `fpc`, `delphi`, `blaise`, and `lakon`; other IDs use the short-lived external protocol. Hosts may register an out-of-process compiler command and bind it as their default. A build entry's `compiler` field overrides the project default. Dependency manifests cannot contribute this policy. |
 | `[workspaces]` | `include` / `exclude` glob arrays for monorepo workspace auto-discovery (each matched dir with its own `lwpt.toml` is installed as a validated local snapshot) |
-| `[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` | Lifecycle hooks per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with optional `inputs` / `output` staleness gating. Plus per-`[build]`-entry inline `prebuild` / `postbuild` fields for per-binary signing / packaging / etc. |
-| Any other top-level section with a `script` field | A user-declared run-script callable via `lwpt run <name>` per [ADR-0013](./adr/0013-run-subcommand-and-build-rename.md) |
+| `[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` | Root lifecycle hooks per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry is a direct `command` plus ordered `args`, with optional shared literal/glob `inputs` / `output` staleness gating. Plus per-`[build]`-entry inline `prebuild` / `postbuild`. |
+| Any other top-level section with a `command` field | A user-declared run task callable via `lwpt run <name>` per [ADR-0013](./adr/0013-run-subcommand-and-build-rename.md) |
 | `[version]` | optional version-baking: writes a generated `.inc` with `<prefix>_VERSION` + `<prefix>_BUILD_DATE` |
 | `[lwpt]` | toolkit-state overrides (`modules-dir`, `archives-dir`, `tmp-dir`, `cfg-file`). Defaults match the constants in `LWPT.Core` |
 | `[format]` | `include = [...]` adds format-scope globs; `exclude = [...]` subtracts them. Toolkit state (root `.lwpt/**` plus any `[lwpt]` override paths) is excluded by default unless an explicit include matches it (ADR-0028). Workspace packages are included by the root walk by default and opt out via their own `[format]` section |

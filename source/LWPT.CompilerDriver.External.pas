@@ -18,7 +18,6 @@ type
   private
     FCompilerID: string;
     FExecutableName: string;
-    FPrefixArgument: string;
     FVersionConstraint: string;
     FProbeCache: TList;
     FProbeCriticalSection: TRTLCriticalSection;
@@ -26,8 +25,9 @@ type
       out AStandardOutput, AStandardError: string): Integer;
     function FindProbe(const ATarget: TLWPTTarget): Integer;
   public
-    constructor Create(const ACompilerID, AExecutableName,
-      APrefixArgument, AVersionConstraint: string);
+    constructor Create(const ACompilerID, AExecutableName: string;
+      const AArguments: array of string; const AVersionConstraint: string;
+      const AWorkingDirectory: string = '');
     destructor Destroy; override;
     function CompilerID: string; override;
     function VersionConstraint: string; override;
@@ -103,12 +103,13 @@ begin
 end;
 
 constructor TLWPTExternalCompilerDriver.Create(const ACompilerID,
-  AExecutableName, APrefixArgument, AVersionConstraint: string);
+  AExecutableName: string; const AArguments: array of string;
+  const AVersionConstraint, AWorkingDirectory: string);
 begin
   inherited Create;
   FCompilerID := ACompilerID;
   FExecutableName := AExecutableName;
-  FPrefixArgument := APrefixArgument;
+  ConfigureCommand(AExecutableName, AArguments, AWorkingDirectory);
   FVersionConstraint := AVersionConstraint;
   FProbeCache := TList.Create;
   InitCriticalSection(FProbeCriticalSection);
@@ -157,9 +158,10 @@ begin
   DriverProcess := TProcess.Create(nil);
   ProcessRunner := nil;
   try
-    DriverProcess.Executable := FExecutableName;
-    if FPrefixArgument <> '' then
-      DriverProcess.Parameters.Add(FPrefixArgument);
+    DriverProcess.Executable := ConfiguredCommand(FExecutableName);
+    if WorkingDirectory <> '' then
+      DriverProcess.CurrentDirectory := WorkingDirectory;
+    AppendCommandArguments(DriverProcess.Parameters);
     DriverProcess.Parameters.Add(AOperation);
     Options := DefaultProcessRunOptions('compiler driver "'
       + FCompilerID + '" ' + AOperation);
@@ -251,14 +253,8 @@ begin
     raise ELWPTCompilerDriverError.CreateFmt(
       'compiler driver "%s" does not support forced rebuilds requested '
       + 'by --clean', [FCompilerID]);
-  SetLength(Result, 1 + Ord(FPrefixArgument <> ''));
-  if FPrefixArgument <> '' then
-  begin
-    Result[0] := FPrefixArgument;
-    Result[1] := 'compile';
-  end
-  else
-    Result[0] := 'compile';
+  SetLength(Result, 1);
+  Result[0] := 'compile';
 end;
 
 function TLWPTExternalCompilerDriver.ExecutableName: string;

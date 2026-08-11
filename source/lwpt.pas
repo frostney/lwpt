@@ -11,7 +11,7 @@
     duplication report manifest-scoped Type-2 Pascal token clones
     test      discover + compile + run *.Test.pas files
     repair    reclaim install, build-session, and worker-lease residue
-    run       invoke a user-declared run-script (or alias a subcommand)
+    run       invoke a user-declared run task (or alias a subcommand)
     health    report Pascal complexity and optional Git hotspots
     agents    write/verify the agent-facing command reference in
               AGENTS.md (ADR-0027)
@@ -469,12 +469,19 @@ var
 begin
   { Subcommand-aliasing (`lwpt run install`) is intercepted in
     CLI.Subcommands.Run BEFORE this handler is called. So when we
-    arrive here, the name (if any) is always a user-declared script
+    arrive here, the name (if any) is always a user-declared run task
     name — never a subcommand. Empty positionals = list mode. }
   if APositionals.Count = 0 then
     Name := ''
   else
     Name := APositionals[0];
+  if APositionals.Count > 1 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('run'),
+      'run tasks do not accept invocation-time arguments; declare args in ',
+      MANIFEST_FILE);
+    Exit(1);
+  end;
   { Every registered subcommand except run itself is a valid alias
     (`lwpt run run` would be dispatch recursion, not an alias). }
   SetLength(Aliases, Registry.Count);
@@ -683,8 +690,8 @@ begin
 
     SetLength(RunOpts, 0);
     Registry.Add(TSubcommand.Create('run',
-      'Invoke a user-declared run-script (or a built-in subcommand by name)',
-      '<script-name> | <subcommand> [subcommand-args...]',
+      'Invoke a user-declared run task (or a built-in subcommand by name)',
+      '<task-name> | <subcommand> [subcommand-args...]',
       @HandleRun, RunOpts));
 
     SetLength(HealthOpts, 2);

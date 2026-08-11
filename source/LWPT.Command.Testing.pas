@@ -8,8 +8,11 @@ unit LWPT.Command.Testing;
 interface
 
 uses
+  LWPT.BuildRequest,
   LWPT.CompilerRegistry;
 
+function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
+  const AHostOS, AHostArchitecture: string): Boolean;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
   const AJobs, ABail: Integer; const AVerbose: Boolean): Integer; overload;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
@@ -23,7 +26,6 @@ uses
   Process,
   SysUtils,
 
-  LWPT.BuildRequest,
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.CompilerDriver,
@@ -33,7 +35,37 @@ uses
   LWPT.ProcessRunner,
   LWPT.ProcessTree,
   LWPT.ProgressReporter,
-  LWPT.WorkerBudget;
+  LWPT.WorkerBudget,
+  Platform;
+
+function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
+  const AHostOS, AHostArchitecture: string): Boolean;
+var
+  OSMatches, ArchitectureMatches: Boolean;
+begin
+  OSMatches := SameText(ATarget.OS, AHostOS)
+    or (IsWindowsOperatingSystem(ATarget.OS)
+        and IsWindowsOperatingSystem(AHostOS));
+  ArchitectureMatches := SameText(ATarget.Architecture,
+    AHostArchitecture)
+    or ((SameText(ATarget.Architecture, 'i386')
+         or SameText(ATarget.Architecture, 'x86'))
+        and (SameText(AHostArchitecture, 'i386')
+             or SameText(AHostArchitecture, 'x86')))
+    { WOW64 makes a 32-bit Windows executable a native-runnable host
+      artifact on 64-bit x86 Windows. }
+    or (OSMatches and IsWindowsOperatingSystem(AHostOS)
+        and (SameText(ATarget.Architecture, 'i386')
+             or SameText(ATarget.Architecture, 'x86'))
+        and SameText(AHostArchitecture, 'x86_64'));
+  Result := OSMatches and ArchitectureMatches;
+end;
+
+function TestTargetIsHost(const ATarget: TLWPTTarget): Boolean;
+begin
+  Result := TestTargetRunsOnHost(ATarget, Platform.GetBuildOS,
+    Platform.GetBuildArch);
+end;
 
 type
   TTestJobStatus = (tjsPending, tjsCompiling, tjsRunning, tjsPassed,
@@ -922,6 +954,7 @@ var
   Scheduler: TTestScheduler;
   CompilerSelection: TLWPTCompilerSelection;
   CompilerDriver: TLWPTCompilerDriver;
+  TestTarget: TLWPTTarget;
   StartedAt: QWord;
 begin
   StartedAt := GetTickCount64;
@@ -941,11 +974,18 @@ begin
       CompilerSelection := TLWPTCompilerSelection.Create(Man, ProjectRoot,
         ACompilerHost);
       CompilerDriver := CompilerSelection.DriverFor('');
+      TestTarget := CompilerDriver.DefaultTarget;
+      if not TestTargetIsHost(TestTarget) then
+        raise ELWPTError.CreateFmt(
+          'generic test runner requires a host artifact; selected compiler '
+          + 'target is "%s/%s" but host is "%s/%s"',
+          [TestTarget.OS, TestTarget.Architecture, Platform.GetBuildOS,
+           Platform.GetBuildArch]);
       Session := TLWPTBuildSession.Create(ProjectRoot);
       try
         WriteLn('test session: ', Session.SessionID, ' (',
           Session.SessionReference, ')');
-        RunHooks('pretest', Man.PreTest, Session.HookRoot);
+        RunHooks('pretest', Man.PreTest, ProjectRoot);
 
     ModulesRoot := ResolveModulesDir(Man);
     SetLength(UnitPaths, 0);
@@ -982,7 +1022,7 @@ begin
       begin
         WriteLn('no *.Test.pas files found');
         Result := 0;
-        RunHooks('posttest', Man.PostTest, Session.HookRoot);
+        RunHooks('posttest', Man.PostTest, ProjectRoot);
         Session.Finish(True);
         Exit;
       end;
@@ -998,7 +1038,7 @@ begin
         Inc(Failed);
         { Mirror the other exit paths: posttest cleanup/reporting hooks
           run even when the scheduler never starts. }
-        RunHooks('posttest', Man.PostTest, Session.HookRoot);
+        RunHooks('posttest', Man.PostTest, ProjectRoot);
         Session.Finish(False, 'test staging key collision');
         Exit;
       end;
@@ -1029,7 +1069,7 @@ begin
       Tests.Free;
     end;
 
-    RunHooks('posttest', Man.PostTest, Session.HookRoot);
+    RunHooks('posttest', Man.PostTest, ProjectRoot);
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
       + IntToStr(Cancelled) + ' cancelled');

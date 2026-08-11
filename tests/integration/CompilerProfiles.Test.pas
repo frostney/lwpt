@@ -11,6 +11,7 @@ uses
   SysUtils,
 
   LWPT.BuildRequest,
+  LWPT.Command.Testing,
   LWPT.CompilerDriver,
   LWPT.Core,
   LWPT.ProcessRunner,
@@ -54,6 +55,9 @@ type
     procedure TestPublicationTargetMutationBlocksPublication;
     procedure TestPublicationRevalidationRetainsWorkerCapacity;
     procedure TestBuiltInBlaiseProfileDispatchesWithoutFallback;
+    procedure TestExplicitTargetRoundTripsWithoutFallback;
+    procedure TestGenericTestsRejectNonHostTarget;
+    procedure TestWindowsX86TargetRunsOnX64Host;
   end;
 
 function ReadInput: string;
@@ -247,9 +251,11 @@ procedure RunBlaiseProxy;
 var
   Diagnostic, Value: string;
   Request: TLWPTBuildRequest;
-  ArgumentIndex, Count, ExitCode: Integer;
+  ArgumentIndex, Count, ExitCode, FirstAdapterArgument: Integer;
 begin
-  if ParamStr(1) = '--help' then
+  if ParamStr(1) <> 'prefix-marker' then Halt(11);
+  FirstAdapterArgument := 2;
+  if ParamStr(FirstAdapterArgument) = '--help' then
   begin
     WriteTextFile(ExpandFileName('.blaise-help'), 'probed');
     WriteLn('Blaise Compiler v0.13.0');
@@ -269,7 +275,7 @@ begin
   Request.Target.Architecture := 'x86_64';
   Request.OutputKind := BUILD_OUTPUT_EXECUTABLE;
   Request.Mode := BUILD_MODE_DEV;
-  ArgumentIndex := 1;
+  ArgumentIndex := FirstAdapterArgument;
   while ArgumentIndex <= ParamCount do
   begin
     Value := ParamStr(ArgumentIndex);
@@ -321,13 +327,14 @@ var
   BuildResult: TLWPTBuildResult;
   Capabilities: TLWPTCompilerCapabilities;
   Diagnostic, Mode: string;
+  ProbeRequest: TLWPTCompilerProbeRequest;
   Request: TLWPTBuildRequest;
   ExitCode, ProbeCount: Integer;
 begin
   Mode := ReadMode;
   if AOperation = 'probe' then
   begin
-    ParseCompilerProbeRequest(ReadInput);
+    ProbeRequest := ParseCompilerProbeRequest(ReadInput);
     if SysUtils.GetEnvironmentVariable(LEASE_OBSERVER_ENV) <> '' then
       ProbeCount := 0
     else
@@ -343,7 +350,30 @@ begin
     else
       Capabilities.VersionIdentity := '1.0.0';
     SetLength(Capabilities.Targets, 1);
-    if ((Mode = 'target-mismatch') and (ProbeCount >= 2))
+    if Mode = 'explicit-target' then
+    begin
+      if ProbeRequest.Target.OS = '' then Halt(8);
+      Capabilities.Targets[0].OS := 'linux';
+      Capabilities.Targets[0].Architecture := 'aarch64';
+      Capabilities.Targets[0].ABI := 'gnu';
+      Capabilities.Targets[0].Environment := 'container';
+      if ProbeRequest.Target.OS <> '' then
+      begin
+        if (ProbeRequest.Target.OS <> Capabilities.Targets[0].OS)
+           or (ProbeRequest.Target.Architecture <>
+             Capabilities.Targets[0].Architecture)
+           or (ProbeRequest.Target.ABI <> Capabilities.Targets[0].ABI)
+           or (ProbeRequest.Target.Environment <>
+             Capabilities.Targets[0].Environment) then Halt(9);
+        WriteTextFile(ExpandFileName('.target-probe'), 'unchanged');
+      end;
+    end
+    else if Mode = 'nonhost-target' then
+    begin
+      Capabilities.Targets[0].OS := 'nonhost';
+      Capabilities.Targets[0].Architecture := 'nonhost';
+    end
+    else if ((Mode = 'target-mismatch') and (ProbeCount >= 2))
        or ((Mode = 'publication-target-mutation')
          and (ProbeCount >= 3)) then
     begin
@@ -371,6 +401,14 @@ begin
     Halt(0);
   end;
   Request := ParseBuildRequest(ReadInput);
+  if Mode = 'explicit-target' then
+  begin
+    if (Request.Target.OS <> 'linux')
+       or (Request.Target.Architecture <> 'aarch64')
+       or (Request.Target.ABI <> 'gnu')
+       or (Request.Target.Environment <> 'container') then Halt(10);
+    WriteTextFile(ExpandFileName('.target-compile'), 'unchanged');
+  end;
   if Mode = 'malformed' then
   begin
     WriteLn(ErrOutput, 'malformed compile raw diagnostic');
@@ -443,6 +481,10 @@ begin
     DeleteFile(FScratch + '/.blaise-help');
   if FileExists(FScratch + '/.blaise-compile') then
     DeleteFile(FScratch + '/.blaise-compile');
+  if FileExists(FScratch + '/.target-probe') then
+    DeleteFile(FScratch + '/.target-probe');
+  if FileExists(FScratch + '/.target-compile') then
+    DeleteFile(FScratch + '/.target-compile');
   RecursiveDelete(FScratch + '/build');
 end;
 
@@ -457,13 +499,13 @@ begin
   WholePostBuild := '';
   if AObservePostBuildLeases then
   begin
-    EntryPostBuild := ', postbuild = { lease = { script = '
-      + '"scripts/observe-lease.pas", args = '
-      + '[".entry-lease-observed"] } }';
+    EntryPostBuild := ', postbuild = { lease = { command = "instantfpc", '
+      + 'args = ["scripts/observe-lease.pas", '
+      + '".entry-lease-observed"] } }';
     WholePostBuild := #10
       + '[postbuild]'#10
-      + 'lease = { script = "scripts/observe-lease.pas", args = '
-      + '[".whole-lease-observed"] }'#10;
+      + 'lease = { command = "instantfpc", args = '
+      + '["scripts/observe-lease.pas", ".whole-lease-observed"] }'#10;
   end;
   WriteTextFile(FScratch + '/lwpt.toml',
       '[package]'#10
@@ -476,7 +518,7 @@ begin
     + #10
     + '[compiler.profiles.external]'#10
     + 'driver = "' + DRIVER_ID + '"'#10
-    + 'executable = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
+    + 'command = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
     + 'version = "^1.0.0"'#10
     + #10
     + '[compiler.profiles.native]'#10
@@ -501,7 +543,7 @@ begin
     + #10
     + '[compiler.profiles.' + LAKON_DRIVER_ID + ']'#10
     + 'driver = "' + LAKON_DRIVER_ID + '"'#10
-    + 'executable = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
+    + 'command = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
     + 'version = "^0.1.0"'#10
     + #10
     + '[build]'#10
@@ -521,7 +563,8 @@ begin
     + #10
     + '[compiler.profiles.modern]'#10
     + 'driver = "blaise"'#10
-    + 'executable = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
+    + 'command = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
+    + 'args = ["prefix-marker"]'#10
     + 'version = ">=0.13.0"'#10
     + #10
     + '[build]'#10
@@ -845,6 +888,57 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/build/app')).ToBe(True);
 end;
 
+procedure TCompilerProfiles.TestExplicitTargetRoundTripsWithoutFallback;
+var
+  R: TLwptResult;
+begin
+  SetMode('explicit-target');
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10 + 'name = "target-project"'#10
+    + 'version = "0.0.0"'#10 + 'units = ["source"]'#10 + #10
+    + '[compiler]'#10 + 'default = "external"'#10 + #10
+    + '[compiler.profiles.external]'#10 + 'driver = "' + DRIVER_ID + '"'#10
+    + 'command = "' + TomlString(ExpandFileName(ParamStr(0))) + '"'#10
+    + 'version = "^1.0.0"'#10 + #10
+    + '[build.app]'#10 + 'source = "source/app.pas"'#10
+    + 'output = "build/app"'#10
+    + 'target = { os = "linux", architecture = "aarch64", '
+    + 'abi = "gnu", environment = "container" }'#10);
+  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  DumpRunFailure('explicit target round trip', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(FScratch + '/.target-probe')).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/.target-compile')).ToBe(True);
+end;
+
+procedure TCompilerProfiles.TestGenericTestsRejectNonHostTarget;
+var
+  R: TLwptResult;
+begin
+  SetMode('nonhost-target');
+  WriteManifest('external');
+  R := RunLwpt(['test', '--jobs', '1'], FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('generic test runner requires a host artifact',
+    R.Stdout + R.Stderr) > 0)
+    .ToBe(True);
+end;
+
+procedure TCompilerProfiles.TestWindowsX86TargetRunsOnX64Host;
+var
+  Target: TLWPTTarget;
+begin
+  Target.OS := 'win32';
+  Target.Architecture := 'i386';
+  Expect<Boolean>(TestTargetRunsOnHost(Target, 'windows', 'x86_64'))
+    .ToBe(True);
+  Expect<Boolean>(TestTargetRunsOnHost(Target, 'linux', 'x86_64'))
+    .ToBe(False);
+  Target.Architecture := 'x86_64';
+  Expect<Boolean>(TestTargetRunsOnHost(Target, 'windows', 'x86'))
+    .ToBe(False);
+end;
+
 procedure TCompilerProfiles.SetupTests;
 begin
   Test('root external profile drives real build and test',
@@ -875,12 +969,18 @@ begin
     TestPublicationRevalidationRetainsWorkerCapacity);
   Test('built-in Blaise profile dispatches without FPC fallback',
     TestBuiltInBlaiseProfileDispatchesWithoutFallback);
+  Test('explicit target tuple reaches probe and compile unchanged',
+    TestExplicitTargetRoundTripsWithoutFallback);
+  Test('generic tests reject a non-host compiler target',
+    TestGenericTestsRejectNonHostTarget);
+  Test('Windows x86 test artifacts run on an x86_64 host through WOW64',
+    TestWindowsX86TargetRunsOnX64Host);
 end;
 
 begin
   if ReadMode = LAKON_MODE then RunLakonDriver;
   if (ParamCount > 0)
-     and ((ParamStr(1) = '--help') or (ParamStr(1) = '--source')) then
+     and (ParamStr(1) = 'prefix-marker') then
     RunBlaiseProxy;
   if (ParamCount = 1)
      and ((ParamStr(1) = 'probe') or (ParamStr(1) = 'compile')) then

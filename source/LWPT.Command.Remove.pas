@@ -85,9 +85,9 @@ begin
     WriteLn('package: ', Ctx.Manifest.Name, ' ', Ctx.Manifest.Version);
     for i := 0 to High(ANames) do
       WriteLn('removing ', ANames[i]);
-    RunHooks('preinstall', Ctx.Manifest.PreInstall);
+    RunHooks('preinstall', Ctx.Manifest.PreInstall, Ctx.ProjectRoot);
     Res := RunManifestMutationTransaction(Ctx, Lines);
-    RunHooks('postinstall', Ctx.Manifest.PostInstall);
+    RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot);
 
     for i := 0 to High(ANames) do
       if InResolved(Res.Resolved, ANames[i]) then

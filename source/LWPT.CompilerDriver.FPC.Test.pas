@@ -103,6 +103,7 @@ type
     procedure TestSuccessfulCompileProducesNoErrorDiagnostics;
     procedure TestDiagnosticGrammarRejectsSeverityFalsePositives;
     procedure TestWindowsExecutableArtifactPathIsNormalized;
+    procedure TestWindowsBareRunnableResolvesFromInheritedPath;
     procedure TestNilDriverBuildRequestIsRejected;
   end;
 
@@ -1141,6 +1142,26 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
 end;
 
+procedure TLWPTFPCCompilerDriverTests.
+  TestWindowsBareRunnableResolvesFromInheritedPath;
+{$IFDEF MSWINDOWS}
+var
+  Resolved: string;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  Resolved := ResolveRunnableCommand(GetCurrentDir, 'instantfpc');
+  if (ExtractFileDrive(Resolved) = '') or not FileExists(Resolved) then
+    Fail('bare instantfpc did not resolve to an existing absolute executable; '
+      + 'resolved="' + Resolved + '"; LWPT_INSTANTFPC="'
+      + SysUtils.GetEnvironmentVariable('LWPT_INSTANTFPC') + '"; PATH="'
+      + SysUtils.GetEnvironmentVariable('PATH') + '"');
+  Expect<Boolean>(FileExists(Resolved)).ToBe(True);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TLWPTFPCCompilerDriverTests.SetupTests;
 begin
   Test('capability probes cache per target and refresh on demand',
@@ -1179,6 +1200,8 @@ begin
     TestDiagnosticGrammarRejectsSeverityFalsePositives);
   Test('Windows executable artifact paths include the emitted extension',
     TestWindowsExecutableArtifactPathIsNormalized);
+  Test('Windows bare runnable resolves from the inherited PATH',
+    TestWindowsBareRunnableResolvesFromInheritedPath);
   Test('nil FPC drivers fail with the compiler-driver error contract',
     TestNilDriverBuildRequestIsRejected);
 end;

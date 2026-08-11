@@ -1,7 +1,7 @@
 # LWPT — lightweight Pascal toolkit
 
 A small, dependency-light toolkit for FreePascal / Delphi projects.
-One executable, eleven subcommands, driven by a single `lwpt.toml`
+One executable, twelve subcommands, driven by a single `lwpt.toml`
 manifest. Zero-install by default — `git clone && fpc @lwpt.cfg`
 builds a project without running `lwpt install` first.
 
@@ -15,7 +15,7 @@ lwpt format    format uses-clauses + identifiers   [--check]
 lwpt duplication report manifest-scoped Pascal token clones   [--json]
 lwpt test      discover, compile and run *.Test.pas files   [--jobs N] [--bail N]
 lwpt repair    reclaim install, build-session, and worker-lease residue
-lwpt run       invoke a user-declared run-script (or alias a subcommand)
+lwpt run       invoke a user-declared run task (or alias a subcommand)
 lwpt health    report Pascal complexity and optional Git hotspots   [--json] [--hotspots]
 lwpt agents    write/verify the agent-facing command reference in AGENTS.md   [--check]
 ```
@@ -156,9 +156,18 @@ gitea = { archive = "https://git.example.com/{user}/{repository}/archive/{ref}.t
 # Single-binary shorthand: `[build] source = "..."` defaults the
 # entry name to [package].name and the output to build/<entry-name>.
 # Multi-binary form (used here): one inline table per entry.
-cli  = { source = "src/cli.pas",  output = "bin/cli" }
+cli  = { source = "src/cli.pas", output = "bin/cli",
+         target = { os = "linux", architecture = "aarch64",
+                    abi = "gnu", environment = "" } }
 tool = { source = "src/tool.pas", output = "bin/tool", compiler = "custom" }
 delphi-tool = { source = "src/tool.dpr", output = "bin/tool.exe", compiler = "delphi-win64" }
+
+[prebuild]
+generate = { command = "tools/generate", args = ["--output", "src/Generated.inc"], inputs = ["schemas/**/*.json"], output = "src/Generated.inc" }
+
+[deploy]
+command = "tools/deploy"
+args = ["--environment", "staging"]
 
 [compiler]
 # Optional root-owned policy. Without it, build and test use built-in FPC.
@@ -171,26 +180,27 @@ version = "^3.2.0"
 [compiler.profiles.wasm]
 # Opt-in adapter for the released frostney/lakon compiler.
 driver = "lakon"
-executable = "tools/lakon" # optional; otherwise resolved from PATH
+command = "tools/lakon" # optional; otherwise resolved from PATH
 version = ">=0.1.0"
 
 [compiler.profiles.blaise]
 # Built-in opt-in adapter for graemeg/blaise v0.13.0 or newer.
 driver = "blaise"
-executable = "tools/blaise" # optional; otherwise resolved from PATH
+command = "tools/blaise" # optional; otherwise resolved from PATH
 version = ">=0.13.0"
 
 [compiler.profiles.custom]
 # External drivers receive versioned canonical TOML on stdin/stdout.
 driver = "my-compiler"
-executable = "tools/my-compiler-driver"
+command = "tools/my-compiler-driver"
+args = ["--protocol=lwpt"]
 version = "^1.0.0"
 
 [compiler.profiles.delphi-win64]
 # Built-in, opt-in consumer driver; LWPT itself remains FPC-built.
 driver = "delphi"
 # Replace this placeholder with the installed compiler path.
-executable = "C:/path/to/dcc64.exe"
+command = "C:/path/to/dcc64.exe"
 version = ">=36.0.0"
 
 [version]

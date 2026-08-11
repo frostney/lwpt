@@ -114,3 +114,20 @@ LWPT gains a hook surface across three subcommands — `install`, `build`, `test
 - **The decision forecloses three things:** parallel hook execution (we've baked sequential into the semantics; reverting would re-trigger every "but ordering!" discussion); shell-command invocation (everything's InstantFPC; arbitrary `command = "..."` would need its own ADR); and dependency-declared hooks (`(d)` from Q5 is now structurally impossible without a deliberate ADR-cited reversal).
 
 - **The decision opens two things:** extending the schema (additional optional fields — `env`, `cwd`, `continueOnError`, etc — are non-breaking additions) and graduating `Platform.pas` + the hook implementation as standalone packages post-v1 alongside the rest of the graduation roadmap (ADR-0003).
+
+## 0.6.0 amendment — direct runnable commands
+
+Issue [#161](https://github.com/frostney/lwpt/issues/161) supersedes this
+ADR's InstantFPC-only execution choice. A hook now declares one direct
+`command` plus ordered `args`; bare-string shorthand means that direct command
+with no arguments. LWPT never infers an interpreter, compiler, shell, or
+extension behavior. Pascal hooks select `instantfpc` explicitly in the
+manifest, including LWPT's own version-stamping hook on Windows.
+
+The lifecycle, ordering, root-ownership, environment, failure, retargeting,
+and publication decisions above remain unchanged. The paired `inputs` and
+`output` contract is strengthened and shared with run tasks: inputs are
+project-relative literals or LWPT globs, every expression must match at least
+one file, a missing output or newer match runs, and an otherwise-fresh command
+skips. Legacy `script` fields hard-error with a `command`/`args` migration
+hint; there is no compatibility execution path.
