@@ -323,13 +323,13 @@ const
     (Name: '<name>'; ValueKind: mvkStringOrTable; Requirement: mrOptional;
       DefaultValue: ''; Scope: mscAllManifests;
       InvalidPolicy: mipLegacyPassThrough; NonEmpty: False;
-      Description: 'Bare <source>@<version> shorthand or an inline table.'),
+      Description: 'Bare `<source>@<version>` shorthand or an inline table.'),
     (Name: 'source'; ValueKind: mvkString; Requirement: mrRequiredDomain;
       DefaultValue: ''; Scope: mscAllManifests;
       InvalidPolicy: mipDomainError;
-      NonEmpty: True; Description: 'owner/repo (GitHub), '
-      + '<host>:owner/repo (built-in or custom host), an HTTPS tarball, '
-      + 'a local path, or workspace:<version>.'),
+      NonEmpty: True; Description: '`owner/repo` (GitHub), '
+      + '`<host>:owner/repo` (built-in or custom host), an HTTPS tarball, '
+      + 'a local path, or `workspace:<version>`.'),
     (Name: 'version'; ValueKind: mvkString; Requirement: mrOptional;
       DefaultValue: 'none'; Scope: mscAllManifests;
       InvalidPolicy: mipIgnoreAsAbsent; NonEmpty: False;

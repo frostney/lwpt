@@ -152,9 +152,9 @@ Generated from the same immutable structural registry used by manifest validatio
   - `version`: string; optional; default: `0.0.0`; invalid values are ignored as absent. Package version.
   - `units`: array of strings; optional; default: `empty`; invalid values and items are skipped. Pascal unit-root paths.
 - `[dependencies]` — table; all manifests; invalid values are ignored as absent; unknown keys are ignored. Named dependency declarations.
-  - `<name>`: string or table; optional; other values retain legacy handling. Bare <source>@<version> shorthand or an inline table.
+  - `<name>`: string or table; optional; other values retain legacy handling. Bare `<source>@<version>` shorthand or an inline table.
 - `[dependencies].<name>` — string or inline table; all manifests; other values retain legacy handling; unknown keys are ignored. A source shorthand or expanded dependency declaration.
-  - `source`: string; required; invalid values are errors. owner/repo (GitHub), <host>:owner/repo (built-in or custom host), an HTTPS tarball, a local path, or workspace:<version>.
+  - `source`: string; required; invalid values are errors. `owner/repo` (GitHub), `<host>:owner/repo` (built-in or custom host), an HTTPS tarball, a local path, or `workspace:<version>`.
   - `version`: string; optional; default: `none`; invalid values are ignored as absent. Version range, exact version, SHA, or tag.
   - `include`: array of strings; optional; default: `all files`; invalid values and items are skipped. Post-extraction include globs.
   - `exclude`: array of strings; optional; default: `none`; invalid values and items are skipped. Post-extraction exclude globs.
