@@ -58,6 +58,7 @@ type
     procedure TestSecondRunIsByteIdempotent;
     procedure TestCheckFreshExitsZero;
     procedure TestCheckStaleExitsOneAndWritesNothing;
+    procedure TestCheckSchemaDriftExitsOneAndWritesNothing;
     procedure TestRegenerateReplacesRegionPreservesProse;
     procedure TestManifestEditGoesStaleThenPlaceholder;
     procedure TestCorruptMarkersExitNonZero;
@@ -151,11 +152,36 @@ begin
   Expect<Boolean>(Pos('`--frozen`', Content) > 0).ToBe(True);
   Expect<Boolean>(Pos('- `lwpt agents [--check] [--silent]`', Content) > 0)
     .ToBe(True);
+  { Manifest structure comes from the parser's immutable schema registry. }
+  Expect<Boolean>(Pos('### Manifest schema', Content) > 0).ToBe(True);
+  Expect<Boolean>(Pos('- `[test]` — table; all manifests;', Content) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('`flags`: array of strings; optional; default: `empty`; '
+    + 'root manifest only; invalid values are errors.', Content) > 0)
+    .ToBe(True);
   { The manifest's run task, addressable form. }
   Expect<Boolean>(Pos('- `lwpt run hello` — command: `instantfpc`; '
     + 'args: [0]=`scripts/hello.pas` [1]=`hello world` [2]=(empty)',
     Content) > 0)
     .ToBe(True);
+end;
+
+procedure TAgentsE2E.TestCheckSchemaDriftExitsOneAndWritesNothing;
+var
+  R: TLwptResult;
+  Sabotaged: string;
+begin
+  RunLwpt(['agents'], FScratch);
+  Sabotaged := StringReplace(ReadAgents, '### Manifest schema',
+    '### Manifest schema SABOTAGED', []);
+  WriteBytesFile(AgentsPath, Sabotaged);
+
+  R := RunLwpt(['agents', '--check'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('stale', R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(ReadAgents = Sabotaged).ToBe(True);
+
+  RunLwpt(['agents'], FScratch);
 end;
 
 procedure TAgentsE2E.TestSecondRunIsByteIdempotent;
@@ -505,6 +531,8 @@ begin
     TestCheckFreshExitsZero);
   Test('--check on an edited block exits 1 without writing',
     TestCheckStaleExitsOneAndWritesNothing);
+  Test('--check on schema drift exits 1 without writing',
+    TestCheckSchemaDriftExitsOneAndWritesNothing);
   Test('regeneration replaces the region and preserves outside prose',
     TestRegenerateReplacesRegionPreservesProse);
   Test('a manifest edit goes stale; regeneration renders the placeholder',

@@ -26,4 +26,11 @@ The compat surface consumers may rely on (pinned by `tests/integration/Agents.Te
 - `TSubcommandRegistry` gains public read iteration (`Count` + `Item`) in the `cli` package (0.2.0 → 0.3.0) with co-located tests; the registry is now explicitly the single source of truth for surface-rendering consumers.
 - LWPT dogfoods the mechanism: this repo's own `AGENTS.md` command table is the generated block, and the universal project gate (DEFINITION_OF_DONE.md), the PR workflow, and the Lefthook pre-commit hook (`stage_fixed`) all run `lwpt agents` / `--check`, so the reference in this repo can never go stale.
 - `AGENTS.md` joins the atomic-write set: the generator commits through `.lwpt/tmp/` staging with `AtomicWriteBytes` (expanded destination path, per the `AtomicMoveFile` sibling-backup convention).
-- The `lwpt.toml` schema is deliberately *not* part of the generated block yet: doing that honestly requires a declarative schema registry in the manifest parser so the docs derive from the same table the parser validates against — tracked as a follow-up issue rather than hand-authored prose in the binary.
+- The command reference now also contains the `lwpt.toml` structural schema.
+  `LWPT.Manifest.Schema` owns immutable section and field records, including
+  types, required/default metadata, root-only scope, reserved names, unknown-key
+  policy, and the existing per-field malformed-value behavior. Manifest intake
+  validates through that registry and the agents renderer iterates it, while
+  source syntax, placeholders, cross-field relationships, and other domain
+  algorithms remain imperative. A public JSON Schema remains a possible later
+  view rather than part of this decision.

@@ -68,14 +68,21 @@ The arrow from `lwpt install` to `lwpt.cfg` is the through-line. Every other sub
 
 ## Manifest model
 
-`lwpt.toml` is partial-TOML — the reader consumed by `LWPT.Manifest` deliberately omits datetimes, multiline strings, and array-of-tables (which is why `[build]` is a table-of-inline-tables, not `[[build]]`). Every section is described in [`code-style.md`](./code-style.md) and the example in the root [`README.md`](../README.md).
+`lwpt.toml` is parsed by the bundled TOML 1.1 reader. `LWPT.Manifest.Schema`
+then validates its structural contract from an immutable registry before
+`LWPT.Manifest` applies source syntax, placeholder, cross-field, and other
+domain rules. The same ordered registry renders the manifest reference in the
+`lwpt agents` block, so accepted field shapes, defaults, root-only scope, and
+the deliberately mixed malformed-value policies have one source of truth.
+Array-of-tables are valid TOML, but are not a supported LWPT manifest shape;
+`[build]` uses a table of named tables or the documented single-entry form.
 
 Sections currently supported:
 
 | Section | Purpose |
 | --- | --- |
 | `[package]` | name, version, units (`-Fu` roots from the project's own source) |
-| `[dependencies]` | bare-string `"<source>@<version>"` shorthand or inline-table `{ source = "...", version = "...", subdir = "..." }` — see [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) |
+| `[dependencies]` | bare-string `"<source>@<version>"` shorthand or inline-table `{ source = "...", version = "...", include = [...], exclude = [...] }` — see [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md); the retired `subdir` field hard-errors with a migration hint |
 | `[sources]` | per-project custom git-host declarations. Each entry is an inline table mapping a prefix name to `archive` + `git` URL templates with `{user}` / `{repository}` / `{ref}` placeholders; enables prefixes like `gitea:owner/repo` against the user's self-hosted instance |
 | `[build]` | one entry per binary; `lwpt build [<entry-name>]` consumes this. Inline entries may declare `depends = ["prerequisite"]`, ordered `flags = ["-dFEATURE"]`, a compiler profile, and an independent target tuple (`os`, `architecture`, optional `abi` and `environment`). Single-binary shorthand defaults the entry name to `[package].name`. |
 | `[compiler]` / `[compiler.profiles.<name>]` | root-owned compiler policy. `default` names the project profile; profiles select a driver plus optional `command`, ordered `args`, and `version`. Built-in IDs are `fpc`, `delphi`, `blaise`, and `lakon`; other IDs use the short-lived external protocol. Hosts may register an out-of-process compiler command and bind it as their default. A build entry's `compiler` field overrides the project default. Dependency manifests cannot contribute this policy. |
@@ -296,7 +303,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 ## Source layout and package code
 
 `source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`,
-`LWPT.Manifest.pas`, `LWPT.Install.pas`, `LWPT.WorkerBudget.pas`,
+`LWPT.Manifest.pas`, `LWPT.Manifest.Schema.pas`, `LWPT.Install.pas`,
+`LWPT.WorkerBudget.pas`,
 `LWPT.Command.*.pas`, `LWPT.CompilerDriver.pas`,
 `LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.Delphi.pas`,
 `LWPT.CompilerDriver.External.pas`,
