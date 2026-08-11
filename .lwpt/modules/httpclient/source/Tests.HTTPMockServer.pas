@@ -65,6 +65,7 @@ type
     FThread: TThread;
     FWriteDelayMilliseconds: Integer;
     FResponse: TBytes;
+    FReceivedRequest: TBytes;
     FPort: Word;
     {$IFDEF MSWINDOWS}
     FWinSockStarted: Boolean;
@@ -81,6 +82,7 @@ type
     procedure WaitDone; overload;   { bounded wait; raises on timeout }
     function WaitDone(const ATimeoutMilliseconds: Cardinal): Boolean; overload;
     property Port: Word read FPort;
+    property ReceivedRequest: TBytes read FReceivedRequest;
   end;
 
   { Prepares an endpoint whose TCP connect fails immediately. Unix retains an
@@ -275,6 +277,56 @@ begin
   end;
 end;
 
+function FindHeaderEnd(const ARequest: TBytes): Integer;
+var
+  I: Integer;
+begin
+  for I := 0 to Length(ARequest) - 4 do
+    if (ARequest[I] = 13) and (ARequest[I + 1] = 10) and
+       (ARequest[I + 2] = 13) and (ARequest[I + 3] = 10) then
+      Exit(I + 4);
+  Result := -1;
+end;
+
+function RequestContentLength(const ARequest: TBytes;
+  const AHeaderEnd: Integer): Integer;
+const
+  CONTENT_LENGTH_PREFIX = 'content-length:';
+var
+  HeaderText, Line, Value: AnsiString;
+  LineEnd, LineStart: Integer;
+begin
+  Result := 0;
+  if AHeaderEnd <= 0 then Exit;
+  SetString(HeaderText, PAnsiChar(@ARequest[0]), AHeaderEnd);
+  LineStart := 1;
+  while LineStart <= Length(HeaderText) do
+  begin
+    LineEnd := PosEx(CRLF, HeaderText, LineStart);
+    if LineEnd = 0 then LineEnd := Length(HeaderText) + 1;
+    Line := Copy(HeaderText, LineStart, LineEnd - LineStart);
+    if Pos(CONTENT_LENGTH_PREFIX, LowerCase(Line)) = 1 then
+    begin
+      Value := Trim(Copy(Line, Length(CONTENT_LENGTH_PREFIX) + 1,
+        Length(Line)));
+      if not TryStrToInt(Value, Result) or (Result < 0) then Result := 0;
+      Exit;
+    end;
+    LineStart := LineEnd + Length(CRLF);
+  end;
+end;
+
+procedure AppendBytes(var ADestination: TBytes; const ASource;
+  const ALength: Integer);
+var
+  PreviousLength: Integer;
+begin
+  if ALength <= 0 then Exit;
+  PreviousLength := Length(ADestination);
+  SetLength(ADestination, PreviousLength + ALength);
+  Move(ASource, ADestination[PreviousLength], ALength);
+end;
+
 { ── response builders ─────────────────────────────────────────────── }
 
 function BuildSimpleResponse(const ABody: TBytes): TBytes;
@@ -323,6 +375,7 @@ type
     FInitialDelayMilliseconds: Integer;
     FPort: Word;
     FResponse: TBytes;
+    FReceivedRequest: TBytes;
     FWriteDelayMilliseconds: Integer;
     procedure CloseOwnedSockets;
   protected
@@ -335,6 +388,7 @@ type
     destructor Destroy; override;
     procedure Stop;
     function WaitForAccepted(const ATimeoutMilliseconds: Cardinal): Boolean;
+    function ReceivedRequest: TBytes;
   end;
 
 constructor TMockServerThread.Create(AListenSock: TSocket;
@@ -359,6 +413,11 @@ begin
   FInitialDelayMilliseconds := AInitialDelayMilliseconds;
   FreeOnTerminate := False;
   InterlockedIncrement(GMockLiveThreads);
+end;
+
+function TMockServerThread.ReceivedRequest: TBytes;
+begin
+  Result := Copy(FReceivedRequest, 0, Length(FReceivedRequest));
 end;
 
 destructor TMockServerThread.Destroy;
@@ -440,7 +499,7 @@ var
   ClientAddrLen: Longint;
   {$ENDIF}
   Buf: array[0..4095] of Byte;
-  Total, Sent, SendLength, N: Integer;
+  ContentLength, HeaderEnd, Total, Sent, SendLength, N: Integer;
   P: PByte;
 begin
   try
@@ -463,17 +522,27 @@ begin
     end;
     if Terminated then Exit;
 
-    { Drain whatever the client wrote (the HTTP request line + headers).
-      We don't care about the contents — the test pre-configured the
-      response. One recv up to the buffer size is enough for our use:
-      lwpt's HTTPClient sends short GET requests well under 4 KB. }
-    {$IFDEF UNIX}
-    N := fpRecv(ClientSock, @Buf, SizeOf(Buf), 0);
-    {$ENDIF}
-    {$IFDEF MSWINDOWS}
-    N := WinSock2.recv(ClientSock, @Buf, SizeOf(Buf), 0);
-    {$ENDIF}
-    if N < 0 then N := 0;
+    { Capture the complete request, including binary content split across
+      multiple recv calls. Content-Length is the only supported request
+      framing because chunked requests are outside HTTPClient's contract. }
+    HeaderEnd := -1;
+    repeat
+      {$IFDEF UNIX}
+      N := fpRecv(ClientSock, @Buf, SizeOf(Buf), 0);
+      {$ENDIF}
+      {$IFDEF MSWINDOWS}
+      N := WinSock2.recv(ClientSock, @Buf, SizeOf(Buf), 0);
+      {$ENDIF}
+      if N <= 0 then Break;
+      AppendBytes(FReceivedRequest, Buf[0], N);
+      if HeaderEnd < 0 then
+        HeaderEnd := FindHeaderEnd(FReceivedRequest);
+      if HeaderEnd >= 0 then
+      begin
+        ContentLength := RequestContentLength(FReceivedRequest, HeaderEnd);
+        if Length(FReceivedRequest) >= HeaderEnd + ContentLength then Break;
+      end;
+    until False;
     if Terminated then Exit;
 
     if FInitialDelayMilliseconds > 0 then
@@ -529,6 +598,7 @@ begin
   FBytesPerWrite := ABytesPerWrite;
   FWriteDelayMilliseconds := AWriteDelayMilliseconds;
   FInitialDelayMilliseconds := AInitialDelayMilliseconds;
+  SetLength(FReceivedRequest, 0);
   FListenSock := InvalidMockSocket;
   FSilentClientSock := InvalidMockSocket;
 
@@ -575,6 +645,7 @@ begin
   FBytesPerWrite := ABytesPerWrite;
   FWriteDelayMilliseconds := AWriteDelayMilliseconds;
   FInitialDelayMilliseconds := AInitialDelayMilliseconds;
+  SetLength(FReceivedRequest, 0);
 
   FListenSock := INVALID_SOCKET;
   FSilentClientSock := INVALID_SOCKET;
@@ -628,6 +699,7 @@ begin
   FBytesPerWrite := ABytesPerWrite;
   FWriteDelayMilliseconds := AWriteDelayMilliseconds;
   FInitialDelayMilliseconds := AInitialDelayMilliseconds;
+  SetLength(FReceivedRequest, 0);
   raise EMockServerError.Create(
     'Tests.HTTPMockServer requires Unix sockets or WinSock2');
 end;
@@ -717,6 +789,7 @@ begin
     Sleep(1);
   end;
   FThread.WaitFor;
+  FReceivedRequest := TMockServerThread(FThread).ReceivedRequest;
   Result := True;
 end;
 
