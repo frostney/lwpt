@@ -281,7 +281,7 @@ jobs:
           done
           ls -la staged/
 
-      - name: Check Windows TLS linkage (native client, runtime-loaded server)
+      - name: Check Windows TLS linkage (native SChannel, no OpenSSL)
         if: matrix.os == 'win64' || matrix.os == 'win32'
         run: |
           set -euo pipefail

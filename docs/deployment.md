@@ -5,8 +5,8 @@ Platform support tiers, the per-platform TLS backend story, the release process,
 ## Executive Summary
 
 - **Six release targets** map to the matrix in [`docs/ci.md`](./ci.md): `aarch64-darwin` + `x86_64-darwin` + `x86_64-linux` + `aarch64-linux` + `x86_64-win64` + `i386-win32`. All six tested natively on every push to `main` (per `ci.yml`); all six published per release tag (per `release.yml`).
-- **Outbound TLS stays platform-native; server accept is asymmetric.** Clients use SChannel on Windows, SecureTransport on macOS, and OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md). Server accept uses runtime-loaded OpenSSL on Windows and Unix-not-Darwin per [ADR-0024](./adr/0024-openssl-server-tls-accept.md); Darwin callers get an actionable Network.framework error.
-- **Windows releases still ship no OpenSSL DLLs.** SChannel clients have no prerequisite. A Windows program that consumes server accept supplies OpenSSL 3 from an administrator-controlled directory covered by the restricted loader search.
+- **TLS is platform-native in both directions on Windows and macOS.** Clients use SChannel on Windows, SecureTransport on macOS, and OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md). Server accept uses native SChannel on Windows per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md) and runtime-loaded OpenSSL on Unix-not-Darwin per [ADR-0024](./adr/0024-openssl-server-tls-accept.md); Darwin callers get an actionable Network.framework error.
+- **Windows has no OpenSSL relationship at all.** Neither direction links, loads, or requires OpenSSL, so Windows server consumers have no DLL prerequisite and `i386-win32` supports server accept like every other target.
 - **The three Windows CI guards fail closed on OpenSSL linkage.** They inspect normal and delay imports, imported symbol families regardless of DLL name, and static-link inputs; canaries prove the parser sees both a prohibited fixture and real system imports.
 - **No codesigning for v1.** macOS users see the "unidentified developer" warning; documented workaround is `xattr -d com.apple.quarantine ./lwpt`. Promote to Apple Developer ID + notarisation only on demonstrated demand.
 - **Release artefacts come from CI.** Tag → `release.yml` → cross-build on macos-latest → package → GitHub Releases. No hand-built releases; ever.
@@ -24,11 +24,11 @@ The Tier 1 set matches the six-target cross-build matrix in `toolchain.yml` + `c
 
 ## TLS backends per platform
 
-Per [ADR-0016](./adr/0016-tls-backend-per-platform.md) and [ADR-0024](./adr/0024-openssl-server-tls-accept.md), `TransportSecurity.pas` ([`packages/httpclient/source/TransportSecurity.pas`](../packages/httpclient/source/TransportSecurity.pas)) deliberately selects different backends for peer-verifying clients and certificate-presenting servers:
+Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), [ADR-0024](./adr/0024-openssl-server-tls-accept.md), and [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md), `TransportSecurity.pas` ([`packages/httpclient/source/TransportSecurity.pas`](../packages/httpclient/source/TransportSecurity.pas)) deliberately selects different backends for peer-verifying clients and certificate-presenting servers:
 
 | Platform | Outbound client | Server accept | Runtime prerequisite |
 |----------|-----------------|---------------|----------------------|
-| **Windows** | SChannel | OpenSSL 3+, runtime-loaded with restricted search | None for clients; OpenSSL 3 DLLs for server consumers |
+| **Windows** | SChannel | SChannel (SSPI + crypt32), built in | None |
 | **macOS** | SecureTransport | Unsupported; use Network.framework | None |
 | **Linux + other Unix** | OpenSSL, runtime-loaded | OpenSSL 3+, runtime-loaded | Distro's libssl package — see "Linux" below |
 
@@ -62,7 +62,7 @@ typical general-purpose HTTP response. Header limits retain the package
 default. HTTP-layer failures are wrapped as `EFetchError` with the requested
 URL, preserving install transaction cleanup and diagnostics.
 
-### Windows: SChannel clients, OpenSSL servers
+### Windows: SChannel clients and SChannel servers
 
 Outbound HTTPS calls into Windows' Security Service Provider Interface (SSPI) directly via the `Windows` unit and the SChannel constants in `TransportSecurity.pas`. Running LWPT as a client therefore has no third-party DLL prerequisite. The Windows release archive contains exactly:
 
@@ -80,7 +80,7 @@ lwpt-<version>-windows-x64.zip
         └── build-system.md
 ```
 
-The server-accept interface is separate: a Windows application that invokes it must make OpenSSL 3 DLLs available in an administrator-controlled directory covered by the restricted loader policy. The server uses `LoadLibraryEx` with system/default-directory search flags; it does not use the legacy current-directory or ordinary `PATH` search order and does not fall back to OpenSSL 1.1 names. It verifies the loaded runtime is major version 3 or newer before creating a server context. LWPT never import-links, statically links, or ships those DLLs, and `release.yml` does not stage them.
+Server accept has the same story per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md): `AcceptSecurityContext` from `secur32.dll` terminates TLS and `crypt32.dll` imports the PKCS#12 identity, both operating-system components. The private key is imported into the invoking user's CNG key-storage provider (`PKCS12_ALWAYS_CNG_KSP | CRYPT_USER_KEYSET`) because SChannel runs server key operations in lsass and cannot use an ephemeral in-process key; each identity snapshot owns its container and deletes it via `NCryptDeleteKey` when its last reference is released. The bundle's intermediates are published into the current user's Intermediate Certification Authorities store for as long as the snapshot lives and withdrawn when it is released, because SChannel builds the outgoing certificate flight from the Windows stores rather than from an in-process one. Each snapshot adds and owns an exact duplicate store entry, so retiring one snapshot cannot withdraw another snapshot's issuer or a user-installed entry. Nothing is ever written to a root store, and the credential is built from the caller's bundle alone rather than from the Windows trust store. A hard kill can leave the snapshot's CNG key container and non-root issuer entries behind; ordinary teardown and reload remove them. On Windows 10 version 1809 / Server 2019 and newer, `SCH_CREDENTIALS` version 5 disables protocols below TLS 1.2 while leaving the ceiling to SChannel, so Windows 11 / Server 2022 and newer can negotiate TLS 1.3. Older supported hosts use `SCHANNEL_CRED` version 4 pinned to TLS 1.2. LWPT no longer import-links, runtime-loads, or requires OpenSSL anywhere on Windows.
 
 #### CI guard
 
@@ -160,7 +160,7 @@ For an urgent CVE in an LWPT-canonical package or in a system TLS backend on Lin
 2. Tag the patch version (`0.1.1`) — go straight from `0.1.0` to `0.1.1`, no pre-release.
 3. The release notes name the CVE explicitly so downstream users can audit.
 
-Client TLS on Windows (SChannel) and macOS (SecureTransport) is updated by the OS vendor. Linux OpenSSL and Windows server-accept OpenSSL CVE responses belong to the runtime provider; LWPT loads those libraries but does not ship them.
+TLS on Windows (SChannel, both directions) and macOS (SecureTransport) is updated by the OS vendor. Linux OpenSSL CVE responses belong to the runtime provider; LWPT loads that library but does not ship it.
 
 ## Self-hosted runners (Tier 3 path)
 

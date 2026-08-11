@@ -45,7 +45,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0021](./adr/0021-machine-wide-worker-budget.md) | Per-user machine worker capacity coordinated through fair, reclaimable filesystem leases |
 | [0022](./adr/0022-compiler-neutral-build-request.md) | Compiler-neutral versioned build requests, target tuples, capabilities, and normalized results; FPC is the only current adapter |
 | [0023](./adr/0023-parallel-build-target-scheduler.md) | Dependency-aware, bounded parallel target scheduling with deterministic reporting and publication |
-| [0024](./adr/0024-openssl-server-tls-accept.md) | Server-side TLS accept via nonblocking memory-BIO OpenSSL 3 with PKCS#12 identities on Windows and Unix-not-Darwin; macOS servers use Network.framework |
+| [0024](./adr/0024-openssl-server-tls-accept.md) | Server-side TLS accept via nonblocking memory-BIO OpenSSL 3 with PKCS#12 identities on Unix-not-Darwin (originally also Windows, superseded there by [0033](./adr/0033-schannel-server-tls-accept-on-windows.md)); macOS servers use Network.framework |
 | [0025](./adr/0025-cascading-process-tree-cancellation.md) | Cascading process-tree cancellation via Unix signal-forwarding and Windows nested Job Objects |
 | [0026](./adr/0026-release-version-stamp-from-tag.md) | Release binaries stamp the version from the git tag; dev builds stamp from the manifest |
 | [0027](./adr/0027-agents-subcommand.md) | `lwpt agents` writes/verifies the marker-fenced AGENTS.md command reference; subcommand surface 9 → 10 |
@@ -53,6 +53,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0029](./adr/0029-fpc-compiler-driver.md) | Neutral compiler-driver seam with on-demand FPC target probes, unified argument translation, failure classification, and normalized diagnostics |
 | [0030](./adr/0030-root-compiler-profiles.md) | Root-owned named compiler commands, out-of-process host registration, deterministic selection precedence, and the short-lived external-driver TOML protocol |
 | [0031](./adr/0031-fixed-point-single-version-resolution.md) | Deterministic fixed-point dependency discovery, authoritative Git ref identity, graph-wide highest-version selection, and publish-after-validation |
+| [0033](./adr/0033-schannel-server-tls-accept-on-windows.md) | Windows server TLS accept moves to native SChannel + crypt32, removing OpenSSL from Windows entirely and giving `i386-win32` server accept; supersedes the Windows half of [0024](./adr/0024-openssl-server-tls-accept.md) |
 
 ## Spikes
 

@@ -1,13 +1,31 @@
-{ TransportSecurity.Test -- deterministic memory-BIO TLS server coverage.
+{ TransportSecurity.Test -- deterministic in-memory TLS server coverage.
 
-  Darwin deliberately runs only the shared read-bounds regression and the
-  actionable server stub. Windows and Unix-not-Darwin pair the production
-  server API with an in-memory raw OpenSSL client; no sockets or network are
-  involved. }
+  Darwin deliberately runs only the actionable server stub. Unix-not-Darwin
+  pairs the production server API with a raw in-memory OpenSSL client;
+  Windows pairs it with a raw in-memory SChannel client, because the Windows
+  server backend is native SChannel and pulls in no OpenSSL at all. Identity,
+  flow-configuration, and fatal-handshake coverage is backend-neutral and runs
+  everywhere a server backend exists. No sockets or network are involved. }
 
 program TransportSecurity.Test;
 
 {$mode delphi}{$H+}{$codepage utf8}
+
+{ Mirrors TransportSecurity's own backend selection so the suite gates on the
+  backend under test rather than on the platform. Windows drives the native
+  SChannel server with an in-memory SChannel client and links no OpenSSL;
+  Unix-not-Darwin drives the memory-BIO OpenSSL server with a raw in-memory
+  OpenSSL client. }
+{$IFDEF MSWINDOWS}
+{$DEFINE TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{$DEFINE TRANSPORT_SECURITY_SERVER}
+{$ENDIF}
+{$IFDEF UNIX}
+{$IFNDEF DARWIN}
+{$DEFINE TRANSPORT_SECURITY_OPENSSL}
+{$DEFINE TRANSPORT_SECURITY_SERVER}
+{$ENDIF}
+{$ENDIF}
 
 uses
   {$IFDEF UNIX}
@@ -22,7 +40,7 @@ uses
   Process,
   Windows,
   {$ENDIF}
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   DynLibs,
   OpenSSL,
   {$ENDIF}
@@ -67,6 +85,10 @@ const
     'duetto uses Network.framework there';
   OPENSSL_RUNTIME_SKIP_REASON =
     'OpenSSL runtime not available on this host';
+  OPENSSL_CLIENT_SKIP_REASON =
+    'the raw in-memory OpenSSL loopback client is not built on this backend';
+  SCHANNEL_CLIENT_SKIP_REASON =
+    'the raw in-memory SChannel loopback client is Windows-only';
 
 type
   TTransportSecurityServerTests = class(TTestSuite)
@@ -96,6 +118,16 @@ type
     procedure TestPKCS12PathRefusesSymbolicLink;
     procedure TestPlaintextRoundtripAndPartialCiphertextConsumption;
     procedure TestRenegotiationIsRefused;
+    procedure TestSChannelCertificateChainDelivered;
+    procedure TestSChannelGracefulCloseProducesCloseNotify;
+    procedure TestSChannelIdentityImportsIsolatedKeyContainers;
+    procedure TestSChannelHandshakeRoundtripAndContextReuse;
+    procedure TestSChannelInputFlowPrefixAdmissionAndCounters;
+    procedure TestSChannelPeerCloseNotifyReportsPeerClosed;
+    procedure TestSChannelProtocolCeilingFollowsOperatingSystem;
+    procedure TestSChannelReloadRetainsPreviousKeyContainer;
+    procedure TestSChannelPendingCiphertextPointerAndPartialConsumption;
+    procedure TestSChannelWriteWantRetryRetainsPlaintext;
     procedure TestStaleErrorQueueIsCleared;
     procedure TestStrictIdentityAllowsLeafWithoutBasicConstraints;
     procedure TestStrictIdentityValidation;
@@ -105,7 +137,7 @@ type
     procedure TestReloadRetainsSnapshotsAndFailedReloadKeepsActive;
   end;
 
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   TBeginAbortWorker = class(TThread)
   private
     FContext: TTransportSecurityServerContext;
@@ -230,7 +262,7 @@ begin
 end;
 {$ENDIF}
 
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 constructor TBeginAbortWorker.Create(
   const AContext: TTransportSecurityServerContext);
 begin
@@ -342,7 +374,7 @@ begin
   end;
 end;
 
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 type
   TBIONew = function(AMethod: Pointer): Pointer; cdecl;
   TBIORead = function(ABIO, ABuffer: Pointer;
@@ -739,8 +771,877 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{ Raw in-memory SChannel client. The Windows server backend is native
+  SChannel, so the loopback peer must be native too: the Windows test legs
+  have no OpenSSL 3 runtime at all (and win32 has none available anywhere).
+  This client owns its own SSPI credential and drives the same buffer
+  hand-off the OpenSSL raw client provides on Unix. }
+type
+  SECURITY_STATUS = LongInt;
+  SECURITY_INTEGER = Int64;
+  PSecurityInteger = ^SECURITY_INTEGER;
+
+  PSecHandle = ^TSecHandle;
+  TSecHandle = record
+    Lower: PtrUInt;
+    Upper: PtrUInt;
+  end;
+
+  PCredHandle = PSecHandle;
+  PCtxtHandle = PSecHandle;
+
+  PSecBuffer = ^TSecBuffer;
+  TSecBuffer = record
+    cbBuffer: LongWord;
+    BufferType: LongWord;
+    pvBuffer: Pointer;
+  end;
+
+  PSecBufferDesc = ^TSecBufferDesc;
+  TSecBufferDesc = record
+    ulVersion: LongWord;
+    cBuffers: LongWord;
+    pBuffers: PSecBuffer;
+  end;
+
+  TSecPkgContextStreamSizes = record
+    cbHeader: LongWord;
+    cbTrailer: LongWord;
+    cbMaximumMessage: LongWord;
+    cBuffers: LongWord;
+    cbBlockSize: LongWord;
+  end;
+
+  TSchannelCred = record
+    dwVersion: LongWord;
+    cCreds: LongWord;
+    paCred: Pointer;
+    hRootStore: Pointer;
+    cMappers: LongWord;
+    aphMappers: Pointer;
+    cSupportedAlgs: LongWord;
+    palgSupportedAlgs: Pointer;
+    grbitEnabledProtocols: LongWord;
+    dwMinimumCipherStrength: LongWord;
+    dwMaximumCipherStrength: LongWord;
+    dwSessionLifespan: LongWord;
+    dwFlags: LongWord;
+    dwCredFormat: LongWord;
+  end;
+
+  PTlsParameters = ^TTlsParameters;
+  TTlsParameters = record
+    cAlpnIds: LongWord;
+    rgstrAlpnIds: Pointer;
+    grbitDisabledProtocols: LongWord;
+    cDisabledCrypto: LongWord;
+    pDisabledCrypto: Pointer;
+    dwFlags: LongWord;
+  end;
+
+  TSchCredentials = record
+    dwVersion: LongWord;
+    dwCredFormat: LongWord;
+    cCreds: LongWord;
+    paCred: Pointer;
+    hRootStore: Pointer;
+    cMappers: LongWord;
+    aphMappers: Pointer;
+    dwSessionLifespan: LongWord;
+    dwFlags: LongWord;
+    cTlsParameters: LongWord;
+    pTlsParameters: PTlsParameters;
+  end;
+
+  TRtlOsVersionInfoW = record
+    dwOSVersionInfoSize: LongWord;
+    dwMajorVersion: LongWord;
+    dwMinorVersion: LongWord;
+    dwBuildNumber: LongWord;
+    dwPlatformId: LongWord;
+    szCSDVersion: array[0..127] of WideChar;
+  end;
+
+  TRtlOsVersionInfoExW = record
+    dwOSVersionInfoSize: LongWord;
+    dwMajorVersion: LongWord;
+    dwMinorVersion: LongWord;
+    dwBuildNumber: LongWord;
+    dwPlatformId: LongWord;
+    szCSDVersion: array[0..127] of WideChar;
+    wServicePackMajor: Word;
+    wServicePackMinor: Word;
+    wSuiteMask: Word;
+    wProductType: Byte;
+    wReserved: Byte;
+  end;
+
+  TSecPkgContextConnectionInfo = record
+    dwProtocol: LongWord;
+    aiCipher: LongWord;
+    dwCipherStrength: LongWord;
+    aiHash: LongWord;
+    dwHashStrength: LongWord;
+    aiExch: LongWord;
+    dwExchStrength: LongWord;
+  end;
+
+{$IFDEF CPU64}
+  {$IF SizeOf(TSchCredentials) <> 72}
+    {$FATAL Test SCH_CREDENTIALS v5 layout mismatch on 64-bit Windows}
+  {$ENDIF}
+  {$IF SizeOf(TTlsParameters) <> 40}
+    {$FATAL Test TLS_PARAMETERS layout mismatch on 64-bit Windows}
+  {$ENDIF}
+{$ELSE}
+  {$IF SizeOf(TSchCredentials) <> 44}
+    {$FATAL Test SCH_CREDENTIALS v5 layout mismatch on 32-bit Windows}
+  {$ENDIF}
+  {$IF SizeOf(TTlsParameters) <> 24}
+    {$FATAL Test TLS_PARAMETERS layout mismatch on 32-bit Windows}
+  {$ENDIF}
+{$ENDIF}
+  {$IF SizeOf(TRtlOsVersionInfoW) <> 276}
+    {$FATAL Test RTL_OSVERSIONINFOW layout mismatch on Windows}
+  {$ENDIF}
+  {$IF SizeOf(TRtlOsVersionInfoExW) <> 284}
+    {$FATAL Test RTL_OSVERSIONINFOEXW layout mismatch on Windows}
+  {$ENDIF}
+
+  PCertContext = ^TCertContext;
+  TCertContext = record
+    dwCertEncodingType: LongWord;
+    pbCertEncoded: PByte;
+    cbCertEncoded: LongWord;
+    pCertInfo: Pointer;
+    hCertStore: Pointer;
+  end;
+
+  TSChannelTestClient = record
+    Context: TSecHandle;
+    Credential: TSecHandle;
+    Done: Boolean;
+    HasContext: Boolean;
+    HasCredential: Boolean;
+    Incoming: TBytes;
+    Outgoing: TBytes;
+    PeerClosed: Boolean;
+    Plaintext: TBytes;
+    StreamSizes: TSecPkgContextStreamSizes;
+  end;
+
+  THandshakeObservations = record
+    SawWantRead: Boolean;
+    SawWantWrite: Boolean;
+  end;
+
+const
+  SECBUFFER_VERSION = 0;
+  SECBUFFER_EMPTY = 0;
+  SECBUFFER_DATA = 1;
+  SECBUFFER_TOKEN = 2;
+  SECBUFFER_EXTRA = 5;
+  SECBUFFER_STREAM_TRAILER = 6;
+  SECBUFFER_STREAM_HEADER = 7;
+  SECBUFFER_ATTRMASK = $F0000000;
+  SECPKG_ATTR_STREAM_SIZES = 4;
+  SECPKG_ATTR_CONNECTION_INFO = $5A;
+  SECPKG_ATTR_REMOTE_CERT_CONTEXT = $53;
+  CERT_NAME_SIMPLE_DISPLAY_TYPE = 4;
+  SECPKG_CRED_OUTBOUND = 2;
+  SEC_E_OK = SECURITY_STATUS($00000000);
+  SEC_I_CONTINUE_NEEDED = SECURITY_STATUS($00090312);
+  SEC_I_CONTEXT_EXPIRED = SECURITY_STATUS($00090317);
+  SEC_I_RENEGOTIATE = SECURITY_STATUS($00090321);
+  SEC_E_INCOMPLETE_MESSAGE = SECURITY_STATUS($80090318);
+  ISC_REQ_REPLAY_DETECT = $00000004;
+  ISC_REQ_SEQUENCE_DETECT = $00000008;
+  ISC_REQ_CONFIDENTIALITY = $00000010;
+  ISC_REQ_ALLOCATE_MEMORY = $00000100;
+  ISC_REQ_EXTENDED_ERROR = $00004000;
+  ISC_REQ_STREAM = $00008000;
+  ISC_REQ_MANUAL_CRED_VALIDATION = $00080000;
+  SCHANNEL_CRED_VERSION = 4;
+  SCH_CREDENTIALS_VERSION = 5;
+  SCHANNEL_SHUTDOWN = 1;
+  SCH_CRED_MANUAL_CRED_VALIDATION = $00000008;
+  SCH_CRED_NO_DEFAULT_CREDS = $00000010;
+  SCH_USE_STRONG_CRYPTO = $00400000;
+  SP_PROT_TLS1_2_CLIENT = $00000800;
+  SP_PROT_TLS1_3_CLIENT = $00002000;
+  SP_PROT_SSL2_CLIENT = $00000008;
+  SP_PROT_SSL3_CLIENT = $00000020;
+  SP_PROT_TLS1_0_CLIENT = $00000080;
+  SP_PROT_TLS1_1_CLIENT = $00000200;
+  SECURITY_NATIVE_DREP = $00000010;
+  UNISP_NAME = 'Microsoft Unified Security Protocol Provider';
+  SCHANNEL_TARGET_NAME = 'localhost';
+  WINDOWS_10_1809_BUILD = 17763;
+  WINDOWS_SERVER_2022_BUILD = 20348;
+  WINDOWS_11_BUILD = 22000;
+  VER_NT_WORKSTATION = 1;
+
+function AcquireCredentialsHandleW(APrincipal: PWideChar;
+  APackage: PWideChar; ACredentialUse: LongWord; ALogonId: Pointer;
+  AAuthData: Pointer; AGetKeyFn: Pointer; AGetKeyArgument: Pointer;
+  ACredential: PCredHandle;
+  AExpiry: PSecurityInteger): SECURITY_STATUS; stdcall;
+  external 'secur32.dll' name 'AcquireCredentialsHandleW';
+function InitializeSecurityContextW(ACredential: PCredHandle;
+  AContext: PCtxtHandle; ATargetName: PWideChar;
+  AContextRequirements: LongWord; AReserved: LongWord;
+  ATargetDataRepresentation: LongWord; AInput: PSecBufferDesc;
+  AReservedTwo: LongWord; ANewContext: PCtxtHandle; AOutput: PSecBufferDesc;
+  AContextAttributes: PLongWord;
+  AExpiry: PSecurityInteger): SECURITY_STATUS; stdcall;
+  external 'secur32.dll' name 'InitializeSecurityContextW';
+function QueryContextAttributesW(AContext: PCtxtHandle; AAttribute: LongWord;
+  ABuffer: Pointer): SECURITY_STATUS; stdcall;
+  external 'secur32.dll' name 'QueryContextAttributesW';
+function EncryptMessage(AContext: PCtxtHandle;
+  AQualityOfProtection: LongWord; AMessage: PSecBufferDesc;
+  AMessageSequenceNumber: LongWord): SECURITY_STATUS; stdcall;
+  external 'secur32.dll' name 'EncryptMessage';
+function DecryptMessage(AContext: PCtxtHandle; AMessage: PSecBufferDesc;
+  AMessageSequenceNumber: LongWord;
+  AQualityOfProtection: PLongWord): SECURITY_STATUS; stdcall;
+  external 'secur32.dll' name 'DecryptMessage';
+function ApplyControlToken(AContext: PCtxtHandle;
+  AInput: PSecBufferDesc): SECURITY_STATUS; stdcall;
+  external 'secur32.dll' name 'ApplyControlToken';
+function FreeContextBuffer(ABuffer: Pointer): SECURITY_STATUS; stdcall;
+  external 'secur32.dll' name 'FreeContextBuffer';
+function DeleteSecurityContext(AContext: PCtxtHandle): SECURITY_STATUS;
+  stdcall; external 'secur32.dll' name 'DeleteSecurityContext';
+function FreeCredentialsHandle(ACredential: PCredHandle): SECURITY_STATUS;
+  stdcall; external 'secur32.dll' name 'FreeCredentialsHandle';
+function CertEnumCertificatesInStore(AStore: Pointer;
+  APreviousContext: PCertContext): PCertContext; stdcall;
+  external 'crypt32.dll' name 'CertEnumCertificatesInStore';
+function CertFreeCertificateContext(ACertificate: PCertContext): LongBool;
+  stdcall; external 'crypt32.dll' name 'CertFreeCertificateContext';
+function CertGetNameStringA(ACertificate: PCertContext; AType: LongWord;
+  AFlags: LongWord; ATypeParameter: Pointer; AName: PAnsiChar;
+  ANameLength: LongWord): LongWord; stdcall;
+  external 'crypt32.dll' name 'CertGetNameStringA';
+function RtlGetVersion(AVersion: Pointer): LongInt; stdcall;
+  external 'ntdll.dll' name 'RtlGetVersion';
+
+function TestSChannelSupportsTlsParameters: Boolean;
+var
+  Version: TRtlOsVersionInfoW;
+begin
+  FillChar(Version, SizeOf(Version), 0);
+  Version.dwOSVersionInfoSize := SizeOf(Version);
+  Result := (RtlGetVersion(@Version) = 0) and
+    ((Version.dwMajorVersion > 10) or
+     ((Version.dwMajorVersion = 10) and
+      (Version.dwBuildNumber >= WINDOWS_10_1809_BUILD)));
+end;
+
+function TestSChannelSupportsTls13: Boolean;
+var
+  Version: TRtlOsVersionInfoExW;
+begin
+  FillChar(Version, SizeOf(Version), 0);
+  Version.dwOSVersionInfoSize := SizeOf(Version);
+  Result := (RtlGetVersion(@Version) = 0) and
+    ((Version.dwMajorVersion > 10) or
+     ((Version.dwMajorVersion = 10) and
+      (((Version.wProductType = VER_NT_WORKSTATION) and
+        (Version.dwBuildNumber >= WINDOWS_11_BUILD)) or
+       ((Version.wProductType <> VER_NT_WORKSTATION) and
+        (Version.dwBuildNumber >= WINDOWS_SERVER_2022_BUILD)))));
+end;
+
+function TestSecBufferKind(const ABufferType: LongWord): LongWord;
+begin
+  Result := ABufferType and not SECBUFFER_ATTRMASK;
+end;
+
+procedure AppendTestBytes(var ATarget: TBytes; const ASource: Pointer;
+  const ALength: Integer);
+var
+  PreviousLength: Integer;
+begin
+  if ALength <= 0 then
+    Exit;
+  if not Assigned(ASource) then
+    raise Exception.Create('SChannel returned a buffer without a pointer');
+  PreviousLength := Length(ATarget);
+  SetLength(ATarget, PreviousLength + ALength);
+  Move(ASource^, ATarget[PreviousLength], ALength);
+end;
+
+procedure PreserveTestExtraBytes(var ATarget: TBytes; const ASource: Pointer;
+  const ALength: Integer);
+var
+  Temporary: TBytes;
+begin
+  if ALength <= 0 then
+  begin
+    SetLength(ATarget, 0);
+    Exit;
+  end;
+  SetLength(Temporary, ALength);
+  if Assigned(ASource) then
+    Move(ASource^, Temporary[0], ALength)
+  else
+  begin
+    if ALength > Length(ATarget) then
+      raise Exception.Create('SChannel reported extra bytes outside the input');
+    Move(ATarget[Length(ATarget) - ALength], Temporary[0], ALength);
+  end;
+  ATarget := Temporary;
+end;
+
+procedure CreateSChannelClient(out AClient: TSChannelTestClient);
+var
+  AuthenticationData: Pointer;
+  Expiry: SECURITY_INTEGER;
+  LegacyCredentials: TSchannelCred;
+  ModernCredentials: TSchCredentials;
+  Status: SECURITY_STATUS;
+  TlsParameters: TTlsParameters;
+begin
+  FillChar(AClient, SizeOf(AClient), 0);
+  FillChar(LegacyCredentials, SizeOf(LegacyCredentials), 0);
+  FillChar(ModernCredentials, SizeOf(ModernCredentials), 0);
+  FillChar(TlsParameters, SizeOf(TlsParameters), 0);
+  if TestSChannelSupportsTlsParameters then
+  begin
+    TlsParameters.grbitDisabledProtocols := SP_PROT_SSL2_CLIENT or
+      SP_PROT_SSL3_CLIENT or SP_PROT_TLS1_0_CLIENT or
+      SP_PROT_TLS1_1_CLIENT;
+    ModernCredentials.dwVersion := SCH_CREDENTIALS_VERSION;
+    ModernCredentials.dwFlags := SCH_CRED_MANUAL_CRED_VALIDATION or
+      SCH_CRED_NO_DEFAULT_CREDS or SCH_USE_STRONG_CRYPTO;
+    ModernCredentials.cTlsParameters := 1;
+    ModernCredentials.pTlsParameters := @TlsParameters;
+    AuthenticationData := @ModernCredentials;
+  end
+  else
+  begin
+    LegacyCredentials.dwVersion := SCHANNEL_CRED_VERSION;
+    LegacyCredentials.grbitEnabledProtocols := SP_PROT_TLS1_2_CLIENT;
+    LegacyCredentials.dwFlags := SCH_CRED_MANUAL_CRED_VALIDATION or
+      SCH_CRED_NO_DEFAULT_CREDS or SCH_USE_STRONG_CRYPTO;
+    AuthenticationData := @LegacyCredentials;
+  end;
+  Status := AcquireCredentialsHandleW(nil, PWideChar(WideString(UNISP_NAME)),
+    SECPKG_CRED_OUTBOUND, nil, AuthenticationData, nil, nil,
+    @AClient.Credential,
+    @Expiry);
+  if Status <> SEC_E_OK then
+    raise Exception.CreateFmt(
+      'Raw SChannel client credential acquisition failed: 0x%x',
+      [LongWord(Status)]);
+  AClient.HasCredential := True;
+end;
+
+function SChannelClientProtocol(
+  const AClient: TSChannelTestClient): LongWord;
+var
+  ConnectionInfo: TSecPkgContextConnectionInfo;
+begin
+  FillChar(ConnectionInfo, SizeOf(ConnectionInfo), 0);
+  if QueryContextAttributesW(@AClient.Context, SECPKG_ATTR_CONNECTION_INFO,
+    @ConnectionInfo) <> SEC_E_OK then
+    raise Exception.Create('Raw SChannel client protocol is unavailable');
+  Result := ConnectionInfo.dwProtocol;
+end;
+
+procedure FreeSChannelClient(var AClient: TSChannelTestClient);
+begin
+  if AClient.HasContext then
+    DeleteSecurityContext(@AClient.Context);
+  if AClient.HasCredential then
+    FreeCredentialsHandle(@AClient.Credential);
+  { Release the managed fields before blanking the record: FillChar over a
+    dynamic array drops the reference without decrementing it. }
+  SetLength(AClient.Incoming, 0);
+  SetLength(AClient.Outgoing, 0);
+  SetLength(AClient.Plaintext, 0);
+  FillChar(AClient, SizeOf(AClient), 0);
+end;
+
+function StepSChannelClientHandshake(
+  var AClient: TSChannelTestClient): TTransportSecurityState;
+var
+  ContextAttributes: LongWord;
+  ExistingContext: PCtxtHandle;
+  Expiry: SECURITY_INTEGER;
+  InputBuffers: array[0..1] of TSecBuffer;
+  InputDescriptor: TSecBufferDesc;
+  InputPointer: PSecBufferDesc;
+  OutputBuffer: TSecBuffer;
+  OutputDescriptor: TSecBufferDesc;
+  Status: SECURITY_STATUS;
+  TargetName: WideString;
+begin
+  if AClient.Done then
+  begin
+    Result := tssDone;
+    Exit;
+  end;
+  if AClient.HasContext and (Length(AClient.Incoming) = 0) then
+  begin
+    Result := tssWantRead;
+    Exit;
+  end;
+
+  FillChar(OutputBuffer, SizeOf(OutputBuffer), 0);
+  OutputBuffer.BufferType := SECBUFFER_TOKEN;
+  FillChar(OutputDescriptor, SizeOf(OutputDescriptor), 0);
+  OutputDescriptor.ulVersion := SECBUFFER_VERSION;
+  OutputDescriptor.cBuffers := 1;
+  OutputDescriptor.pBuffers := @OutputBuffer;
+
+  InputPointer := nil;
+  FillChar(InputBuffers, SizeOf(InputBuffers), 0);
+  FillChar(InputDescriptor, SizeOf(InputDescriptor), 0);
+  if Length(AClient.Incoming) > 0 then
+  begin
+    InputBuffers[0].BufferType := SECBUFFER_TOKEN;
+    InputBuffers[0].cbBuffer := Length(AClient.Incoming);
+    InputBuffers[0].pvBuffer := @AClient.Incoming[0];
+    InputBuffers[1].BufferType := SECBUFFER_EMPTY;
+    InputDescriptor.ulVersion := SECBUFFER_VERSION;
+    InputDescriptor.cBuffers := 2;
+    InputDescriptor.pBuffers := @InputBuffers[0];
+    InputPointer := @InputDescriptor;
+  end;
+
+  if AClient.HasContext then
+    ExistingContext := @AClient.Context
+  else
+    ExistingContext := nil;
+
+  TargetName := WideString(SCHANNEL_TARGET_NAME);
+  Status := InitializeSecurityContextW(@AClient.Credential, ExistingContext,
+    PWideChar(TargetName), ISC_REQ_SEQUENCE_DETECT or ISC_REQ_REPLAY_DETECT or
+    ISC_REQ_CONFIDENTIALITY or ISC_REQ_EXTENDED_ERROR or
+    ISC_REQ_ALLOCATE_MEMORY or ISC_REQ_STREAM or
+    ISC_REQ_MANUAL_CRED_VALIDATION, 0, SECURITY_NATIVE_DREP, InputPointer, 0,
+    @AClient.Context, @OutputDescriptor, @ContextAttributes, @Expiry);
+  if Status >= 0 then
+    AClient.HasContext := True;
+
+  if Status = SEC_E_INCOMPLETE_MESSAGE then
+  begin
+    if Assigned(OutputBuffer.pvBuffer) then
+      FreeContextBuffer(OutputBuffer.pvBuffer);
+    Result := tssWantRead;
+    Exit;
+  end;
+
+  if Assigned(InputPointer) and
+     (TestSecBufferKind(InputBuffers[1].BufferType) = SECBUFFER_EXTRA) then
+    PreserveTestExtraBytes(AClient.Incoming, InputBuffers[1].pvBuffer,
+      InputBuffers[1].cbBuffer)
+  else
+    SetLength(AClient.Incoming, 0);
+
+  try
+    if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) then
+      AppendTestBytes(AClient.Outgoing, OutputBuffer.pvBuffer,
+        OutputBuffer.cbBuffer);
+  finally
+    if Assigned(OutputBuffer.pvBuffer) then
+      FreeContextBuffer(OutputBuffer.pvBuffer);
+  end;
+
+  if Status = SEC_E_OK then
+  begin
+    if QueryContextAttributesW(@AClient.Context, SECPKG_ATTR_STREAM_SIZES,
+      @AClient.StreamSizes) <> SEC_E_OK then
+      raise Exception.Create('Raw SChannel client stream sizes unavailable');
+    AClient.Done := True;
+    Result := tssDone;
+    Exit;
+  end;
+  if Status = SEC_I_CONTINUE_NEEDED then
+  begin
+    Result := tssWantRead;
+    Exit;
+  end;
+  Result := tssError;
+end;
+
+procedure ConsumeSChannelClientOutgoing(var AClient: TSChannelTestClient;
+  const ALength: Integer);
+begin
+  if ALength <= 0 then
+    Exit;
+  if ALength >= Length(AClient.Outgoing) then
+  begin
+    SetLength(AClient.Outgoing, 0);
+    Exit;
+  end;
+  AClient.Outgoing := Copy(AClient.Outgoing, ALength,
+    Length(AClient.Outgoing) - ALength);
+end;
+
+procedure PumpSChannelClientCiphertext(var AClient: TSChannelTestClient;
+  var AServer: TTransportSecurityConnection);
+var
+  Fed: Integer;
+  Offset: Integer;
+begin
+  Offset := 0;
+  while Offset < Length(AClient.Outgoing) do
+  begin
+    Fed := TransportSecurityFeedCiphertext(AServer, @AClient.Outgoing[Offset],
+      Length(AClient.Outgoing) - Offset);
+    if Fed < 0 then
+      raise Exception.Create('Server ciphertext feed failed');
+    if Fed = 0 then
+      Break;
+    Inc(Offset, Fed);
+  end;
+  ConsumeSChannelClientOutgoing(AClient, Offset);
+end;
+
+procedure DrainSChannelClientCiphertext(var AClient: TSChannelTestClient;
+  out ABuffer: TBytes);
+begin
+  ABuffer := AClient.Outgoing;
+  AClient.Outgoing := nil;
+end;
+
+procedure PumpSChannelServerCiphertext(
+  var AServer: TTransportSecurityConnection;
+  var AClient: TSChannelTestClient);
+var
+  Buffer: Pointer;
+  Pending: Integer;
+begin
+  repeat
+    Pending := TransportSecurityGetCiphertext(AServer, Buffer);
+    if Pending <= 0 then
+      Exit;
+    AppendTestBytes(AClient.Incoming, Buffer, Pending);
+    TransportSecurityConsumeCiphertext(AServer, Pending);
+  until False;
+end;
+
+procedure DriveSChannelHandshake(var AServer: TTransportSecurityConnection;
+  var AClient: TSChannelTestClient; out AObserved: THandshakeObservations);
+var
+  ClientState: TTransportSecurityState;
+  I: Integer;
+  ServerState: TTransportSecurityState;
+begin
+  FillChar(AObserved, SizeOf(AObserved), 0);
+  ServerState := TransportSecurityServerHandshake(AServer);
+  AObserved.SawWantRead := ServerState = tssWantRead;
+  for I := 1 to 128 do
+  begin
+    ClientState := StepSChannelClientHandshake(AClient);
+    if ClientState = tssError then
+      raise Exception.Create('Raw SChannel client handshake failed');
+    PumpSChannelClientCiphertext(AClient, AServer);
+
+    ServerState := TransportSecurityServerHandshake(AServer);
+    AObserved.SawWantRead := AObserved.SawWantRead or
+      (ServerState = tssWantRead);
+    AObserved.SawWantWrite := AObserved.SawWantWrite or
+      (ServerState = tssWantWrite);
+    if ServerState = tssError then
+      raise Exception.Create('TransportSecurity server handshake failed');
+    PumpSChannelServerCiphertext(AServer, AClient);
+
+    if AClient.Done and (ServerState = tssDone) and
+       (TransportSecurityPendingCiphertext(AServer) = 0) then
+      Exit;
+  end;
+  raise Exception.Create('In-memory SChannel handshake exceeded 128 steps');
+end;
+
+procedure CreateSChannelHandshakenPair(
+  const AContext: TTransportSecurityServerContext;
+  out AServer: TTransportSecurityConnection;
+  out AClient: TSChannelTestClient; out AObserved: THandshakeObservations);
+begin
+  FillChar(AServer, SizeOf(AServer), 0);
+  FillChar(AClient, SizeOf(AClient), 0);
+  BeginTransportSecurityServer(AServer, AContext);
+  try
+    CreateSChannelClient(AClient);
+    DriveSChannelHandshake(AServer, AClient, AObserved);
+  except
+    AbortTransportSecurityServer(AServer);
+    FreeSChannelClient(AClient);
+    raise;
+  end;
+end;
+
+procedure WriteSChannelClientPlaintext(var AClient: TSChannelTestClient;
+  const ABuffer: Pointer; const ALength: Integer);
+var
+  BufferDescriptor: TSecBufferDesc;
+  Buffers: array[0..3] of TSecBuffer;
+  ChunkLength: Integer;
+  MessageBytes: TBytes;
+  Offset: Integer;
+  Status: SECURITY_STATUS;
+  TotalLength: Integer;
+begin
+  Offset := 0;
+  while Offset < ALength do
+  begin
+    ChunkLength := ALength - Offset;
+    if ChunkLength > Integer(AClient.StreamSizes.cbMaximumMessage) then
+      ChunkLength := Integer(AClient.StreamSizes.cbMaximumMessage);
+    TotalLength := Integer(AClient.StreamSizes.cbHeader) + ChunkLength +
+      Integer(AClient.StreamSizes.cbTrailer);
+    SetLength(MessageBytes, TotalLength);
+    Move(Pointer(PtrUInt(ABuffer) + PtrUInt(Offset))^,
+      MessageBytes[AClient.StreamSizes.cbHeader], ChunkLength);
+
+    FillChar(Buffers, SizeOf(Buffers), 0);
+    Buffers[0].BufferType := SECBUFFER_STREAM_HEADER;
+    Buffers[0].cbBuffer := AClient.StreamSizes.cbHeader;
+    Buffers[0].pvBuffer := @MessageBytes[0];
+    Buffers[1].BufferType := SECBUFFER_DATA;
+    Buffers[1].cbBuffer := ChunkLength;
+    Buffers[1].pvBuffer := @MessageBytes[AClient.StreamSizes.cbHeader];
+    Buffers[2].BufferType := SECBUFFER_STREAM_TRAILER;
+    Buffers[2].cbBuffer := AClient.StreamSizes.cbTrailer;
+    Buffers[2].pvBuffer :=
+      @MessageBytes[Integer(AClient.StreamSizes.cbHeader) + ChunkLength];
+    Buffers[3].BufferType := SECBUFFER_EMPTY;
+    FillChar(BufferDescriptor, SizeOf(BufferDescriptor), 0);
+    BufferDescriptor.ulVersion := SECBUFFER_VERSION;
+    BufferDescriptor.cBuffers := 4;
+    BufferDescriptor.pBuffers := @Buffers[0];
+
+    Status := EncryptMessage(@AClient.Context, 0, @BufferDescriptor, 0);
+    if Status <> SEC_E_OK then
+      raise Exception.CreateFmt('Raw SChannel client encrypt failed: 0x%x',
+        [LongWord(Status)]);
+    TotalLength := Integer(Buffers[0].cbBuffer) +
+      Integer(Buffers[1].cbBuffer) + Integer(Buffers[2].cbBuffer);
+    AppendTestBytes(AClient.Outgoing, @MessageBytes[0], TotalLength);
+    Inc(Offset, ChunkLength);
+  end;
+end;
+
+procedure WriteSChannelClientText(var AClient: TSChannelTestClient;
+  const AText: AnsiString);
+begin
+  WriteSChannelClientPlaintext(AClient, @AText[1], Length(AText));
+end;
+
+function ReadSChannelClientPlaintext(var AClient: TSChannelTestClient;
+  var ABuffer: TBytes): TTransportSecurityState;
+var
+  BufferDescriptor: TSecBufferDesc;
+  Buffers: array[0..3] of TSecBuffer;
+  ExtraInput: TBytes;
+  I: Integer;
+  QualityOfProtection: LongWord;
+  Status: SECURITY_STATUS;
+begin
+  SetLength(ABuffer, 0);
+  repeat
+    if Length(AClient.Plaintext) > 0 then
+    begin
+      ABuffer := AClient.Plaintext;
+      AClient.Plaintext := nil;
+      Result := tssDone;
+      Exit;
+    end;
+    if AClient.PeerClosed then
+    begin
+      Result := tssPeerClosed;
+      Exit;
+    end;
+    if Length(AClient.Incoming) = 0 then
+    begin
+      Result := tssWantRead;
+      Exit;
+    end;
+
+    FillChar(Buffers, SizeOf(Buffers), 0);
+    Buffers[0].BufferType := SECBUFFER_DATA;
+    Buffers[0].cbBuffer := Length(AClient.Incoming);
+    Buffers[0].pvBuffer := @AClient.Incoming[0];
+    Buffers[1].BufferType := SECBUFFER_EMPTY;
+    Buffers[2].BufferType := SECBUFFER_EMPTY;
+    Buffers[3].BufferType := SECBUFFER_EMPTY;
+    FillChar(BufferDescriptor, SizeOf(BufferDescriptor), 0);
+    BufferDescriptor.ulVersion := SECBUFFER_VERSION;
+    BufferDescriptor.cBuffers := 4;
+    BufferDescriptor.pBuffers := @Buffers[0];
+    QualityOfProtection := 0;
+
+    Status := DecryptMessage(@AClient.Context, @BufferDescriptor, 0,
+      @QualityOfProtection);
+    if Status = SEC_E_INCOMPLETE_MESSAGE then
+    begin
+      Result := tssWantRead;
+      Exit;
+    end;
+    if Status = SEC_I_RENEGOTIATE then
+    begin
+      { SChannel ordinarily returns the complete post-handshake token and
+        following ciphertext as SECBUFFER_EXTRA. Microsoft documents that
+        EXTRA is not guaranteed, in which case the same modified input buffer
+        must be relabelled as the token. Copy before the handshake mutates the
+        descriptor again. }
+      SetLength(ExtraInput, 0);
+      for I := 0 to High(Buffers) do
+        if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+          AppendTestBytes(ExtraInput, Buffers[I].pvBuffer,
+            Buffers[I].cbBuffer);
+      if Length(ExtraInput) = 0 then
+        ExtraInput := Copy(AClient.Incoming, 0, Length(AClient.Incoming));
+      AClient.Incoming := ExtraInput;
+      AClient.Done := False;
+      Result := StepSChannelClientHandshake(AClient);
+      if Result <> tssDone then
+        Exit;
+      Continue;
+    end;
+    if (Status <> SEC_E_OK) and (Status <> SEC_I_CONTEXT_EXPIRED) then
+    begin
+      Result := tssError;
+      Exit;
+    end;
+
+    { Copy plaintext while Incoming still owns the in-place DecryptMessage
+      spans. Replacing Incoming with the preserved tail first would leave the
+      returned DATA pointer dangling. From index 1: on
+      SEC_I_CONTEXT_EXPIRED buffer 0 still carries the caller's label. }
+    if Status = SEC_E_OK then
+      for I := 1 to High(Buffers) do
+        if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
+          AppendTestBytes(AClient.Plaintext, Buffers[I].pvBuffer,
+            Buffers[I].cbBuffer);
+
+    SetLength(ExtraInput, 0);
+    for I := 1 to High(Buffers) do
+      if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendTestBytes(ExtraInput, Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+    AClient.Incoming := ExtraInput;
+    if Status = SEC_I_CONTEXT_EXPIRED then
+      AClient.PeerClosed := True;
+  until False;
+end;
+
+function ReadSChannelClientText(var AClient: TSChannelTestClient): string;
+var
+  Buffer: TBytes;
+begin
+  if ReadSChannelClientPlaintext(AClient, Buffer) <> tssDone then
+    raise Exception.Create('Raw SChannel client plaintext read failed');
+  SetLength(Result, Length(Buffer));
+  if Length(Buffer) > 0 then
+    Move(Buffer[0], Result[1], Length(Buffer));
+end;
+
+{ What the peer actually put on the wire: the subject names and how many
+  certificates there were, both from one walk of the store SChannel attaches
+  to SECPKG_ATTR_REMOTE_CERT_CONTEXT. That store is documented to hold the
+  certificates the peer supplied, and taking both numbers from the same
+  enumeration means the two can never disagree.
+
+  It is also the measurement that cannot be contaminated by the issuer this
+  process publishes into the user's CA store. Round 3 of the Windows CI proved
+  that empirically: before publication existed the same walk returned exactly
+  "localhost", where a walk that consulted local stores would have listed the
+  runner's whole CA store. }
+procedure SChannelClientDeliveredChain(var AClient: TSChannelTestClient;
+  out ANames: string; out ACount: Integer);
+var
+  Certificate: PCertContext;
+  Enumerated: PCertContext;
+  Name: array[0..255] of AnsiChar;
+begin
+  ANames := '';
+  ACount := 0;
+  Certificate := nil;
+  if QueryContextAttributesW(@AClient.Context,
+    SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Certificate) <> SEC_E_OK then
+    raise Exception.Create('Raw SChannel client has no remote certificate');
+  try
+    if not Assigned(Certificate) or not Assigned(Certificate^.hCertStore) then
+      Exit;
+    Enumerated := CertEnumCertificatesInStore(Certificate^.hCertStore, nil);
+    while Assigned(Enumerated) do
+    begin
+      FillChar(Name, SizeOf(Name), 0);
+      CertGetNameStringA(Enumerated, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nil,
+        @Name[0], Length(Name));
+      if ANames <> '' then
+        ANames := ANames + ', ';
+      ANames := ANames + StrPas(@Name[0]);
+      Inc(ACount);
+      Enumerated := CertEnumCertificatesInStore(Certificate^.hCertStore,
+        Enumerated);
+    end;
+  finally
+    if Assigned(Certificate) then
+      CertFreeCertificateContext(Certificate);
+  end;
+end;
+
+procedure ShutdownSChannelClient(var AClient: TSChannelTestClient);
+var
+  ContextAttributes: LongWord;
+  Expiry: SECURITY_INTEGER;
+  OutputBuffer: TSecBuffer;
+  OutputDescriptor: TSecBufferDesc;
+  ShutdownBuffer: TSecBuffer;
+  ShutdownDescriptor: TSecBufferDesc;
+  ShutdownToken: LongWord;
+  Status: SECURITY_STATUS;
+  TargetName: WideString;
+begin
+  ShutdownToken := SCHANNEL_SHUTDOWN;
+  FillChar(ShutdownBuffer, SizeOf(ShutdownBuffer), 0);
+  ShutdownBuffer.cbBuffer := SizeOf(ShutdownToken);
+  ShutdownBuffer.BufferType := SECBUFFER_TOKEN;
+  ShutdownBuffer.pvBuffer := @ShutdownToken;
+  FillChar(ShutdownDescriptor, SizeOf(ShutdownDescriptor), 0);
+  ShutdownDescriptor.ulVersion := SECBUFFER_VERSION;
+  ShutdownDescriptor.cBuffers := 1;
+  ShutdownDescriptor.pBuffers := @ShutdownBuffer;
+  if ApplyControlToken(@AClient.Context, @ShutdownDescriptor) <> SEC_E_OK then
+    raise Exception.Create('Raw SChannel client shutdown token failed');
+
+  FillChar(OutputBuffer, SizeOf(OutputBuffer), 0);
+  OutputBuffer.BufferType := SECBUFFER_TOKEN;
+  FillChar(OutputDescriptor, SizeOf(OutputDescriptor), 0);
+  OutputDescriptor.ulVersion := SECBUFFER_VERSION;
+  OutputDescriptor.cBuffers := 1;
+  OutputDescriptor.pBuffers := @OutputBuffer;
+  TargetName := WideString(SCHANNEL_TARGET_NAME);
+  Status := InitializeSecurityContextW(@AClient.Credential, @AClient.Context,
+    PWideChar(TargetName), ISC_REQ_SEQUENCE_DETECT or ISC_REQ_REPLAY_DETECT or
+    ISC_REQ_CONFIDENTIALITY or ISC_REQ_EXTENDED_ERROR or
+    ISC_REQ_ALLOCATE_MEMORY or ISC_REQ_STREAM or
+    ISC_REQ_MANUAL_CRED_VALIDATION, 0, SECURITY_NATIVE_DREP, nil, 0,
+    @AClient.Context, @OutputDescriptor, @ContextAttributes, @Expiry);
+  try
+    if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) or
+       (Status = SEC_I_CONTEXT_EXPIRED) then
+      AppendTestBytes(AClient.Outgoing, OutputBuffer.pvBuffer,
+        OutputBuffer.cbBuffer)
+    else
+      raise Exception.CreateFmt('Raw SChannel client shutdown failed: 0x%x',
+        [LongWord(Status)]);
+  finally
+    if Assigned(OutputBuffer.pvBuffer) then
+      FreeContextBuffer(OutputBuffer.pvBuffer);
+  end;
+end;
+{$ENDIF}
+
 procedure TTransportSecurityServerTests.TestActiveOnlyAfterHandshake;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Client: TRawOpenSSLClient;
   Connection: TTransportSecurityConnection;
@@ -749,7 +1650,7 @@ var
   State: TTransportSecurityState;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -772,7 +1673,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestBoundsClamp;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Buffer: array[0..0] of Byte;
   Client: TRawOpenSSLClient;
@@ -782,7 +1683,7 @@ var
   ReadResult: TTransportSecurityIOResult;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -805,7 +1706,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestCertificateChainDelivered;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Client: TRawOpenSSLClient;
   Connection: TTransportSecurityConnection;
@@ -813,7 +1714,7 @@ var
   Observed: THandshakeObservations;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -839,13 +1740,13 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestEmptyAndUTF8Passphrases;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_SERVER}
 var
   EmptyContext: TTransportSecurityServerContext;
   UTF8Context: TTransportSecurityServerContext;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   EmptyContext := nil;
   UTF8Context := nil;
   try
@@ -875,13 +1776,13 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestEmbeddedNULPassphraseRejected;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_SERVER}
 var
   EmbeddedNULPassphrase: UnicodeString;
   ErrorMessage: string;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   EmbeddedNULPassphrase := PKCS12_PASSPHRASE + #0 + 'hidden-suffix';
   ErrorMessage := CaptureContextError(PKCS12_PATH, EmbeddedNULPassphrase);
   Expect<Boolean>(Pos('NUL', ErrorMessage) > 0).ToBe(True);
@@ -902,7 +1803,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestInputFlowConfiguration;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_SERVER}
 var
   Connection: TTransportSecurityConnection;
   Context: TTransportSecurityServerContext;
@@ -912,7 +1813,7 @@ var
   OutputFlow: TTransportSecurityOutputFlow;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   FillChar(Connection, SizeOf(Connection), 0);
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
@@ -1026,7 +1927,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestInputFlowPrefixAdmissionAndCounters;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 const
   PAYLOAD_LENGTH = 16000;
 var
@@ -1045,7 +1946,7 @@ var
   Remainder: Integer;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE, TLS_SERVER_MIN_INPUT_CAPACITY, 0,
     TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
@@ -1110,7 +2011,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestPeerCloseNotifyReportsPeerClosed;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Buffer: array[0..0] of Byte;
   Client: TRawOpenSSLClient;
@@ -1121,7 +2022,7 @@ var
   ShutdownResult: Integer;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -1149,7 +2050,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestPendingCiphertextPointerIsStable;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Buffer: array[0..255] of Byte;
   Ciphertext: Pointer;
@@ -1165,7 +2066,7 @@ var
   WriteResult: TTransportSecurityIOResult;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -1262,7 +2163,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestPKCS12SizeLimit;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_SERVER}
 const
   OVERSIZED_PKCS12_LENGTH = 16 * 1024 * 1024 + 1;
 var
@@ -1272,7 +2173,7 @@ var
   Passphrase: UnicodeString;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   ForceDirectories(SCRATCH_DIRECTORY);
   OversizedPath := SCRATCH_DIRECTORY + '/oversized-private-identity.p12';
   Identity := TFileStream.Create(OversizedPath, fmCreate);
@@ -1290,7 +2191,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestPKCS12BytesArePrimaryInput;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Client: TRawOpenSSLClient;
   Connection: TTransportSecurityConnection;
@@ -1301,7 +2202,7 @@ var
   OriginalIdentity: TBytes;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Identity := LoadFixtureBytes(PKCS12_PATH);
   OriginalIdentity := Copy(Identity, 0, Length(Identity));
   Context := TTransportSecurityServerContext.Create(Identity,
@@ -1410,12 +2311,12 @@ end;
 
 procedure TTransportSecurityServerTests.
   TestStrictIdentityAllowsLeafWithoutBasicConstraints;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_SERVER}
 var
   Context: TTransportSecurityServerContext;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   Context := nil;
   try
     Context := TTransportSecurityServerContext.Create(
@@ -1428,13 +2329,13 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestStrictIdentityValidation;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_SERVER}
 var
   Context: TTransportSecurityServerContext;
   ErrorMessage: string;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   ErrorMessage := CaptureContextError(FUTURE_PKCS12_PATH,
     PKCS12_PASSPHRASE);
   if Pos('validity window', ErrorMessage) = 0 then
@@ -1497,7 +2398,7 @@ end;
 
 procedure TTransportSecurityServerTests.
   TestReloadRetainsSnapshotsAndFailedReloadKeepsActive;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Client: TRawOpenSSLClient;
   Connection: TTransportSecurityConnection;
@@ -1516,7 +2417,7 @@ var
   WorkerStarted: Boolean;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   FillChar(Connection, SizeOf(Connection), 0);
   FillChar(Client, SizeOf(Client), 0);
   FillChar(SecondConnection, SizeOf(SecondConnection), 0);
@@ -1592,7 +2493,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestHandshakeTransitionsAndContextReuse;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Client: TRawOpenSSLClient;
   Connection: TTransportSecurityConnection;
@@ -1603,7 +2504,7 @@ var
   SecondObserved: THandshakeObservations;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -1631,7 +2532,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestPlaintextRoundtripAndPartialCiphertextConsumption;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Buffer: array[0..255] of Byte;
   Ciphertext: Pointer;
@@ -1648,7 +2549,7 @@ var
   WriteResult: TTransportSecurityIOResult;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -1709,7 +2610,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestRenegotiationIsRefused;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Buffer: array[0..0] of Byte;
   Client: TRawOpenSSLClient;
@@ -1723,7 +2624,7 @@ var
   StepResult: Integer;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   ResolveRawOpenSSLProcedures;
   if not Assigned(RawSSLRenegotiate) then
     raise Exception.Create('OpenSSL runtime lacks SSL_renegotiate');
@@ -1770,7 +2671,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestStaleErrorQueueIsCleared;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Buffer: array[0..255] of Byte;
   Client: TRawOpenSSLClient;
@@ -1781,7 +2682,7 @@ var
   WriteResult: TTransportSecurityIOResult;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -1811,7 +2712,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestSyscallErrorPoisonsConnection;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Client: TRawOpenSSLClient;
   Connection: TTransportSecurityConnection;
@@ -1821,7 +2722,7 @@ var
   State: TTransportSecurityState;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -1848,7 +2749,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestWriteWantRetryRetainsPlaintext;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 const
   LARGE_WRITE_SIZE = 64 * 1024 + 137;
 var
@@ -1868,7 +2769,7 @@ var
   WriteResult: TTransportSecurityIOResult;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE, TLS_SERVER_DEFAULT_INPUT_CAPACITY,
     TLS_SERVER_MIN_OUTPUT_CAPACITY);
@@ -1935,7 +2836,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestFatalHandshakePoisonsConnection;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_SERVER}
 const
   INVALID_HANDSHAKE = 'GET / HTTP/1.0'#13#10#13#10;
 var
@@ -1944,7 +2845,7 @@ var
   State: TTransportSecurityState;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -1965,7 +2866,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestFatalShutdownPoisonsBeforeOutput;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Buffer: array[0..16383] of Byte;
   Client: TRawOpenSSLClient;
@@ -1980,7 +2881,7 @@ var
   State: TTransportSecurityState;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -2027,7 +2928,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestGracefulCloseProducesCloseNotify;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Buffer: array[0..0] of Byte;
   Client: TRawOpenSSLClient;
@@ -2039,7 +2940,7 @@ var
   State: TTransportSecurityState;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -2069,7 +2970,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestTLSFloorRejectsTLS11;
-{$IFNDEF DARWIN}
+{$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
   Client: TRawOpenSSLClient;
   ClientState: TTransportSecurityState;
@@ -2079,7 +2980,7 @@ var
   ServerState: TTransportSecurityState;
 {$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
@@ -2109,6 +3010,614 @@ begin
   {$ENDIF}
 end;
 
+procedure TTransportSecurityServerTests.
+  TestSChannelHandshakeRoundtripAndContextReuse;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Buffer: array[0..255] of Byte;
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Observed: THandshakeObservations;
+  ReadResult: TTransportSecurityIOResult;
+  SecondClient: TSChannelTestClient;
+  SecondConnection: TTransportSecurityConnection;
+  SecondObserved: THandshakeObservations;
+  State: TTransportSecurityState;
+  WriteResult: TTransportSecurityIOResult;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  FillChar(SecondConnection, SizeOf(SecondConnection), 0);
+  FillChar(SecondClient, SizeOf(SecondClient), 0);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    Expect<Boolean>(Connection.Active).ToBe(False);
+    State := TransportSecurityServerHandshake(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssWantRead));
+    Expect<Boolean>(Connection.Active).ToBe(False);
+
+    CreateSChannelClient(Client);
+    DriveSChannelHandshake(Connection, Client, Observed);
+    Expect<Boolean>(Connection.Active).ToBe(True);
+    Expect<Boolean>(Observed.SawWantRead).ToBe(True);
+    Expect<Boolean>(Observed.SawWantWrite).ToBe(True);
+
+    WriteSChannelClientText(Client, CLIENT_REQUEST);
+    PumpSChannelClientCiphertext(Client, Connection);
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(Length(CLIENT_REQUEST));
+    Expect<string>(Copy(PAnsiChar(@Buffer[0]), 1,
+      ReadResult.BytesProcessed)).ToBe(CLIENT_REQUEST);
+
+    WriteResult := TransportSecurityServerWrite(Connection,
+      @SERVER_RESPONSE[1], Length(SERVER_RESPONSE));
+    Expect<Integer>(WriteResult.BytesProcessed).ToBe(Length(SERVER_RESPONSE));
+    Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
+    PumpSChannelServerCiphertext(Connection, Client);
+    Expect<string>(ReadSChannelClientText(Client)).ToBe(SERVER_RESPONSE);
+
+    CreateSChannelHandshakenPair(Context, SecondConnection, SecondClient,
+      SecondObserved);
+    Expect<Boolean>(SecondConnection.Active).ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    AbortTransportSecurityServer(SecondConnection);
+    FreeSChannelClient(SecondClient);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestSChannelProtocolCeilingFollowsOperatingSystem;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  ExpectedProtocol: LongWord;
+  Observed: THandshakeObservations;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
+    if TestSChannelSupportsTls13 then
+      ExpectedProtocol := SP_PROT_TLS1_3_CLIENT
+    else
+      ExpectedProtocol := SP_PROT_TLS1_2_CLIENT;
+    Expect<LongWord>(SChannelClientProtocol(Client)).ToBe(ExpectedProtocol);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestSChannelInputFlowPrefixAdmissionAndCounters;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+const
+  PAYLOAD_LENGTH = 16000;
+var
+  Accepted: Integer;
+  BaselineAccepted: QWord;
+  BaselineConsumed: QWord;
+  Buffer: array[0..PAYLOAD_LENGTH - 1] of Byte;
+  Ciphertext: TBytes;
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Flow: TTransportSecurityInputFlow;
+  Observed: THandshakeObservations;
+  Payload: AnsiString;
+  ReadResult: TTransportSecurityIOResult;
+  Remainder: Integer;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE, TLS_SERVER_MIN_INPUT_CAPACITY, 0,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    BaselineAccepted := Flow.AcceptedBytes;
+    BaselineConsumed := Flow.ConsumedBytes;
+    Expect<Int64>(Int64(BaselineAccepted)).ToBe(Int64(BaselineConsumed));
+    Expect<Integer>(Flow.BufferedBytes).ToBe(0);
+
+    SetLength(Payload, PAYLOAD_LENGTH);
+    FillChar(Payload[1], Length(Payload), Ord('a'));
+    WriteSChannelClientText(Client, Payload);
+    FillChar(Payload[1], Length(Payload), Ord('b'));
+    WriteSChannelClientText(Client, Payload);
+    DrainSChannelClientCiphertext(Client, Ciphertext);
+    Expect<Boolean>(Length(Ciphertext) >
+      TLS_SERVER_MIN_INPUT_CAPACITY).ToBe(True);
+
+    Accepted := TransportSecurityFeedCiphertext(Connection, @Ciphertext[0],
+      Length(Ciphertext));
+    Expect<Integer>(Accepted).ToBe(TLS_SERVER_MIN_INPUT_CAPACITY);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Integer>(Flow.BufferedBytes).ToBe(TLS_SERVER_MIN_INPUT_CAPACITY);
+    Expect<Int64>(Int64(Flow.AcceptedBytes)).ToBe(
+      Int64(BaselineAccepted + TLS_SERVER_MIN_INPUT_CAPACITY));
+    Expect<Int64>(Int64(Flow.ConsumedBytes)).ToBe(Int64(BaselineConsumed));
+    Expect<Boolean>(Flow.Backpressured).ToBe(True);
+    Expect<Integer>(TransportSecurityFeedCiphertext(Connection,
+      @Ciphertext[Accepted], Length(Ciphertext) - Accepted)).ToBe(0);
+
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(PAYLOAD_LENGTH);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Boolean>(Flow.BufferedBytes > 0).ToBe(True);
+    Expect<Boolean>(Flow.ConsumedBytes > 0).ToBe(True);
+    Expect<Boolean>(Flow.Backpressured).ToBe(True);
+
+    Remainder := Length(Ciphertext) - Accepted;
+    Expect<Integer>(TransportSecurityFeedCiphertext(Connection,
+      @Ciphertext[Accepted], Remainder)).ToBe(Remainder);
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(PAYLOAD_LENGTH);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Int64>(Int64(Flow.AcceptedBytes)).ToBe(
+      Int64(BaselineAccepted + QWord(Length(Ciphertext))));
+    Expect<Int64>(Int64(Flow.ConsumedBytes)).ToBe(
+      Int64(BaselineConsumed + QWord(Length(Ciphertext))));
+    Expect<Integer>(Flow.BufferedBytes).ToBe(0);
+    Expect<Boolean>(Flow.Backpressured).ToBe(False);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestSChannelPendingCiphertextPointerAndPartialConsumption;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Buffer: array[0..255] of Byte;
+  Ciphertext: Pointer;
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Observed: THandshakeObservations;
+  OriginalCiphertext: Pointer;
+  OutputFlow: TTransportSecurityOutputFlow;
+  Partial: Integer;
+  Pending: Integer;
+  ReadResult: TTransportSecurityIOResult;
+  RetryText: AnsiString;
+  State: TTransportSecurityState;
+  WriteResult: TTransportSecurityIOResult;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
+    WriteSChannelClientText(Client, CLIENT_REQUEST);
+    PumpSChannelClientCiphertext(Client, Connection);
+
+    WriteResult := TransportSecurityServerWrite(Connection,
+      @SERVER_RESPONSE[1], Length(SERVER_RESPONSE));
+    Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
+    Pending := TransportSecurityGetCiphertext(Connection, OriginalCiphertext);
+    Expect<Boolean>(Pending > 1).ToBe(True);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.Capacity).ToBe(
+      TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+    Expect<Integer>(OutputFlow.PendingBytes).ToBe(Pending);
+    Expect<Integer>(OutputFlow.RemainingBytes).ToBe(
+      TLS_SERVER_DEFAULT_OUTPUT_CAPACITY - Pending);
+
+    State := TransportSecurityServerHandshake(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(TransportSecurityGetCiphertext(Connection,
+      Ciphertext)).ToBe(Pending);
+    Expect<Boolean>(Ciphertext = OriginalCiphertext).ToBe(True);
+
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(Ord(ReadResult.State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(0);
+    Expect<Boolean>(Ciphertext = OriginalCiphertext).ToBe(True);
+
+    RetryText := 'write waits without consuming caller plaintext';
+    WriteResult := TransportSecurityServerWrite(Connection, @RetryText[1],
+      Length(RetryText));
+    Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(WriteResult.BytesProcessed).ToBe(0);
+
+    State := CloseTransportSecurityServerGracefully(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(TransportSecurityGetCiphertext(Connection,
+      Ciphertext)).ToBe(Pending);
+    Expect<Boolean>(Ciphertext = OriginalCiphertext).ToBe(True);
+
+    Partial := Pending div 2;
+    AppendTestBytes(Client.Incoming, OriginalCiphertext, Partial);
+    TransportSecurityConsumeCiphertext(Connection, Partial);
+    Expect<Integer>(TransportSecurityPendingCiphertext(Connection)).ToBe(
+      Pending - Partial);
+    Expect<Integer>(TransportSecurityGetCiphertext(Connection,
+      Ciphertext)).ToBe(Pending - Partial);
+    Expect<Boolean>(Ciphertext =
+      Pointer(PtrUInt(OriginalCiphertext) + PtrUInt(Partial))).ToBe(True);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.PendingBytes).ToBe(Pending - Partial);
+    Expect<Integer>(OutputFlow.RemainingBytes).ToBe(
+      TLS_SERVER_DEFAULT_OUTPUT_CAPACITY - Pending + Partial);
+    PumpSChannelServerCiphertext(Connection, Client);
+    Expect<string>(ReadSChannelClientText(Client)).ToBe(SERVER_RESPONSE);
+
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(Length(CLIENT_REQUEST));
+    Expect<string>(Copy(PAnsiChar(@Buffer[0]), 1,
+      ReadResult.BytesProcessed)).ToBe(CLIENT_REQUEST);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestSChannelWriteWantRetryRetainsPlaintext;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+const
+  LARGE_WRITE_SIZE = 64 * 1024 + 137;
+var
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Expected: TBytes;
+  I: Integer;
+  Observed: THandshakeObservations;
+  Offset: Integer;
+  OutputFlow: TTransportSecurityOutputFlow;
+  Payload: TBytes;
+  Received: TBytes;
+  Segment: TBytes;
+  Step: Integer;
+  WriteCompleted: Boolean;
+  WriteResult: TTransportSecurityIOResult;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE, TLS_SERVER_DEFAULT_INPUT_CAPACITY,
+    TLS_SERVER_MIN_OUTPUT_CAPACITY);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
+    SetLength(Payload, LARGE_WRITE_SIZE);
+    for I := 0 to High(Payload) do
+      Payload[I] := Byte((I * 31 + 17) and $FF);
+    Expected := Copy(Payload, 0, Length(Payload));
+
+    WriteResult := TransportSecurityServerWrite(Connection, @Payload[0],
+      Length(Payload));
+    Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(WriteResult.BytesProcessed).ToBe(0);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.Capacity).ToBe(TLS_SERVER_MIN_OUTPUT_CAPACITY);
+    Expect<Integer>(OutputFlow.PendingBytes).ToBe(
+      TLS_SERVER_MIN_OUTPUT_CAPACITY);
+    Expect<Integer>(OutputFlow.RemainingBytes).ToBe(0);
+    FillChar(Payload[0], Length(Payload), $A5);
+
+    WriteCompleted := False;
+    for Step := 1 to 128 do
+    begin
+      PumpSChannelServerCiphertext(Connection, Client);
+      WriteResult := TransportSecurityServerWrite(Connection, nil, 0);
+      if WriteResult.BytesProcessed > 0 then
+      begin
+        Expect<Integer>(WriteResult.BytesProcessed).ToBe(Length(Expected));
+        WriteCompleted := True;
+      end;
+      if WriteResult.State = tssError then
+        raise Exception.Create('Retained SChannel write retry failed');
+      if WriteCompleted and
+         (TransportSecurityPendingCiphertext(Connection) = 0) then
+        Break;
+    end;
+    PumpSChannelServerCiphertext(Connection, Client);
+    if not WriteCompleted then
+      raise Exception.Create(
+        'Retained SChannel write did not complete after 128 drain steps');
+
+    SetLength(Received, 0);
+    Offset := 0;
+    while Offset < Length(Expected) do
+    begin
+      if ReadSChannelClientPlaintext(Client, Segment) <> tssDone then
+        raise Exception.Create('Raw SChannel client large read failed');
+      SetLength(Received, Offset + Length(Segment));
+      Move(Segment[0], Received[Offset], Length(Segment));
+      Inc(Offset, Length(Segment));
+    end;
+    if Length(Received) <> Length(Expected) then
+      raise Exception.CreateFmt(
+        'Retained SChannel plaintext length differs: expected %d, got %d',
+        [Length(Expected), Length(Received)]);
+    if CompareByte(Expected[0], Received[0], Length(Expected)) <> 0 then
+      for I := 0 to High(Expected) do
+        if Expected[I] <> Received[I] then
+          raise Exception.CreateFmt(
+            'Retained SChannel plaintext differs at %d: expected %d, got %d',
+            [I, Expected[I], Received[I]]);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.TestSChannelCertificateChainDelivered;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+const
+  INTERMEDIATE_COMMON_NAME = 'TransportSecurity Test Intermediate CA';
+var
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Delivered: string;
+  DeliveredCount: Integer;
+  Observed: THandshakeObservations;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
+    SChannelClientDeliveredChain(Client, Delivered, DeliveredCount);
+    if Pos(INTERMEDIATE_COMMON_NAME, Delivered) = 0 then
+      raise Exception.CreateFmt(
+        'Server flight omitted the bundled intermediate; ' +
+        'flight certificates: %d; delivered: %s',
+        [DeliveredCount, Delivered]);
+    Expect<Boolean>(Pos(INTERMEDIATE_COMMON_NAME, Delivered) > 0).ToBe(True);
+    { Exactly the bundle: leaf plus its one intermediate, no root and nothing
+      swept in from a local store. }
+    if DeliveredCount <> 2 then
+      raise Exception.CreateFmt(
+        'Server flight carried %d certificates instead of the bundled 2: %s',
+        [DeliveredCount, Delivered]);
+    Expect<Integer>(DeliveredCount).ToBe(2);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestSChannelGracefulCloseProducesCloseNotify;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Observed: THandshakeObservations;
+  Segment: TBytes;
+  State: TTransportSecurityState;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
+    State := CloseTransportSecurityServerGracefully(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssWantWrite));
+    Expect<Boolean>(TransportSecurityPendingCiphertext(Connection) > 0).ToBe(
+      True);
+    PumpSChannelServerCiphertext(Connection, Client);
+    Expect<Integer>(Ord(ReadSChannelClientPlaintext(Client, Segment))).ToBe(
+      Ord(tssPeerClosed));
+    Expect<Boolean>(Connection.Active).ToBe(True);
+    AbortTransportSecurityServer(Connection);
+    Expect<Boolean>(Connection.Active).ToBe(False);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestSChannelPeerCloseNotifyReportsPeerClosed;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Buffer: array[0..0] of Byte;
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Observed: THandshakeObservations;
+  ReadResult: TTransportSecurityIOResult;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
+    ShutdownSChannelClient(Client);
+    PumpSChannelClientCiphertext(Client, Connection);
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(Ord(ReadResult.State)).ToBe(Ord(tssPeerClosed));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(0);
+    Expect<Boolean>(Connection.Active).ToBe(False);
+    Expect<Integer>(TransportSecurityPendingCiphertext(Connection)).ToBe(0);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestSChannelIdentityImportsIsolatedKeyContainers;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+const
+  INTERMEDIATE_COMMON_NAME = 'TransportSecurity Test Intermediate CA';
+var
+  Delivered: string;
+  DeliveredCount: Integer;
+  FirstClient: TSChannelTestClient;
+  FirstConnection: TTransportSecurityConnection;
+  FirstContext: TTransportSecurityServerContext;
+  FirstName: UnicodeString;
+  Observed: THandshakeObservations;
+  SecondClient: TSChannelTestClient;
+  SecondConnection: TTransportSecurityConnection;
+  SecondContext: TTransportSecurityServerContext;
+  SecondName: UnicodeString;
+  SurvivorClient: TSChannelTestClient;
+  SurvivorConnection: TTransportSecurityConnection;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  FirstContext := nil;
+  SecondContext := nil;
+  FillChar(FirstConnection, SizeOf(FirstConnection), 0);
+  FillChar(SecondConnection, SizeOf(SecondConnection), 0);
+  FillChar(SurvivorConnection, SizeOf(SurvivorConnection), 0);
+  FillChar(FirstClient, SizeOf(FirstClient), 0);
+  FillChar(SecondClient, SizeOf(SecondClient), 0);
+  FillChar(SurvivorClient, SizeOf(SurvivorClient), 0);
+  try
+    FirstContext := TTransportSecurityServerContext.Create(PKCS12_PATH,
+      PKCS12_PASSPHRASE);
+    SecondContext := TTransportSecurityServerContext.Create(PKCS12_PATH,
+      PKCS12_PASSPHRASE);
+    FirstName := TransportSecurityTestServerKeyContainer(FirstContext);
+    SecondName := TransportSecurityTestServerKeyContainer(SecondContext);
+    Expect<Boolean>(FirstName <> '').ToBe(True);
+    Expect<Boolean>(FirstName <> SecondName).ToBe(True);
+
+    CreateSChannelHandshakenPair(FirstContext, FirstConnection, FirstClient,
+      Observed);
+    Expect<Boolean>(FirstConnection.Active).ToBe(True);
+    CreateSChannelHandshakenPair(SecondContext, SecondConnection, SecondClient,
+      Observed);
+    Expect<Boolean>(SecondConnection.Active).ToBe(True);
+
+    { Closing the first context deletes its persisted container. The second
+      identity was imported from the same bundle, so this is where a shared
+      container would show up as a dead key. }
+    AbortTransportSecurityServer(FirstConnection);
+    FreeSChannelClient(FirstClient);
+    CloseTransportSecurityServerContext(FirstContext);
+    CreateSChannelHandshakenPair(SecondContext, SurvivorConnection,
+      SurvivorClient, Observed);
+    Expect<Boolean>(SurvivorConnection.Active).ToBe(True);
+    SChannelClientDeliveredChain(SurvivorClient, Delivered, DeliveredCount);
+    Expect<Boolean>(Pos(INTERMEDIATE_COMMON_NAME, Delivered) > 0).ToBe(True);
+    Expect<Integer>(DeliveredCount).ToBe(2);
+  finally
+    AbortTransportSecurityServer(FirstConnection);
+    AbortTransportSecurityServer(SecondConnection);
+    AbortTransportSecurityServer(SurvivorConnection);
+    FreeSChannelClient(FirstClient);
+    FreeSChannelClient(SecondClient);
+    FreeSChannelClient(SurvivorClient);
+    CloseTransportSecurityServerContext(FirstContext);
+    CloseTransportSecurityServerContext(SecondContext);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestSChannelReloadRetainsPreviousKeyContainer;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Context: TTransportSecurityServerContext;
+  FreshClient: TSChannelTestClient;
+  FreshConnection: TTransportSecurityConnection;
+  NameAfterReload: UnicodeString;
+  NameBeforeReload: UnicodeString;
+  Observed: THandshakeObservations;
+  RetainedClient: TSChannelTestClient;
+  RetainedConnection: TTransportSecurityConnection;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := nil;
+  FillChar(RetainedConnection, SizeOf(RetainedConnection), 0);
+  FillChar(FreshConnection, SizeOf(FreshConnection), 0);
+  FillChar(RetainedClient, SizeOf(RetainedClient), 0);
+  FillChar(FreshClient, SizeOf(FreshClient), 0);
+  try
+    Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+      PKCS12_PASSPHRASE);
+    { Begin before the reload so this connection retains the old snapshot. }
+    BeginTransportSecurityServer(RetainedConnection, Context);
+    NameBeforeReload := TransportSecurityTestServerKeyContainer(Context);
+    Context.Reload(PKCS12_PATH, PKCS12_PASSPHRASE);
+    NameAfterReload := TransportSecurityTestServerKeyContainer(Context);
+    Expect<Boolean>(NameBeforeReload <> '').ToBe(True);
+    Expect<Boolean>(NameAfterReload <> '').ToBe(True);
+    Expect<Boolean>(NameBeforeReload <> NameAfterReload).ToBe(True);
+
+    { The reloaded-away snapshot still holds a reference, so its container
+      must outlive the reload and complete this handshake. }
+    CreateSChannelClient(RetainedClient);
+    DriveSChannelHandshake(RetainedConnection, RetainedClient, Observed);
+    Expect<Boolean>(RetainedConnection.Active).ToBe(True);
+
+    CreateSChannelHandshakenPair(Context, FreshConnection, FreshClient,
+      Observed);
+    Expect<Boolean>(FreshConnection.Active).ToBe(True);
+  finally
+    AbortTransportSecurityServer(RetainedConnection);
+    AbortTransportSecurityServer(FreshConnection);
+    FreeSChannelClient(RetainedClient);
+    FreeSChannelClient(FreshClient);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityServerTests.ServerTest(const AName: string;
   const AMethod: TTestMethod);
 begin
@@ -2121,75 +3630,127 @@ end;
 procedure TTransportSecurityServerTests.SetupTests;
 begin
   {$IFDEF DARWIN}
-  Skip('Active becomes true only after the server handshake',
-    TestActiveOnlyAfterHandshake, DARWIN_SKIP_REASON);
-  Skip('server read clamps oversized lengths on a handshaken connection',
-    TestBoundsClamp, DARWIN_SKIP_REASON);
-  Skip('PKCS#12 chain delivers the intermediate certificate',
-    TestCertificateChainDelivered, DARWIN_SKIP_REASON);
   Test('Darwin server API reports Network.framework alternative',
     TestDarwinReportsUnsupportedServerTLS);
   Skip('empty and UTF-8 PKCS#12 passphrases load',
-    TestEmptyAndUTF8Passphrases, DARWIN_SKIP_REASON);
+    TestEmptyAndUTF8Passphrases,
+    DARWIN_SKIP_REASON);
   Skip('embedded-NUL PKCS#12 passphrase is rejected',
-    TestEmbeddedNULPassphraseRejected, DARWIN_SKIP_REASON);
+    TestEmbeddedNULPassphraseRejected,
+    DARWIN_SKIP_REASON);
   Skip('missing PKCS#12 fails without disclosing path',
-    TestMissingPKCS12FailsWithoutPathDisclosure, DARWIN_SKIP_REASON);
+    TestMissingPKCS12FailsWithoutPathDisclosure,
+    DARWIN_SKIP_REASON);
   Skip('server input flow validates and publishes watermarks',
-    TestInputFlowConfiguration, DARWIN_SKIP_REASON);
-  Skip('server input flow accepts bounded prefixes and counts consumption',
-    TestInputFlowPrefixAdmissionAndCounters, DARWIN_SKIP_REASON);
-  Skip('peer close_notify reports peer-closed and poisons the connection',
-    TestPeerCloseNotifyReportsPeerClosed, DARWIN_SKIP_REASON);
-  Skip('pending ciphertext pointer stays stable across protocol calls',
-    TestPendingCiphertextPointerIsStable, DARWIN_SKIP_REASON);
+    TestInputFlowConfiguration,
+    DARWIN_SKIP_REASON);
   Skip('garbage and wrong-pass PKCS#12 fail actionably',
-    TestPKCS12LoadFailures, DARWIN_SKIP_REASON);
+    TestPKCS12LoadFailures,
+    DARWIN_SKIP_REASON);
   Skip('PKCS#12 identities above 16 MiB fail without disclosure',
-    TestPKCS12SizeLimit, DARWIN_SKIP_REASON);
-  Skip('caller PKCS#12 bytes are copied before synchronous parsing',
-    TestPKCS12BytesArePrimaryInput, DARWIN_SKIP_REASON);
-  Skip('PKCS#12 path loading refuses links in every component',
-    TestPKCS12PathRefusesSymbolicLink, DARWIN_SKIP_REASON);
+    TestPKCS12SizeLimit,
+    DARWIN_SKIP_REASON);
   Skip('strict identity policy rejects invalid production certificates',
-    TestStrictIdentityValidation, DARWIN_SKIP_REASON);
+    TestStrictIdentityValidation,
+    DARWIN_SKIP_REASON);
   Skip('strict identity allows a leaf without basic constraints',
     TestStrictIdentityAllowsLeafWithoutBasicConstraints,
+    DARWIN_SKIP_REASON);
+  Skip('fatal handshake poisons connection',
+    TestFatalHandshakePoisonsConnection,
+    DARWIN_SKIP_REASON);
+  Skip('PKCS#12 path loading refuses links in every component',
+    TestPKCS12PathRefusesSymbolicLink,
+    DARWIN_SKIP_REASON);
+  Skip('Active becomes true only after the server handshake',
+    TestActiveOnlyAfterHandshake,
+    DARWIN_SKIP_REASON);
+  Skip('server read clamps oversized lengths on a handshaken connection',
+    TestBoundsClamp,
+    DARWIN_SKIP_REASON);
+  Skip('PKCS#12 chain delivers the intermediate certificate',
+    TestCertificateChainDelivered,
+    DARWIN_SKIP_REASON);
+  Skip('server input flow accepts bounded prefixes and counts consumption',
+    TestInputFlowPrefixAdmissionAndCounters,
+    DARWIN_SKIP_REASON);
+  Skip('peer close_notify reports peer-closed and poisons the connection',
+    TestPeerCloseNotifyReportsPeerClosed,
+    DARWIN_SKIP_REASON);
+  Skip('pending ciphertext pointer stays stable across protocol calls',
+    TestPendingCiphertextPointerIsStable,
+    DARWIN_SKIP_REASON);
+  Skip('caller PKCS#12 bytes are copied before synchronous parsing',
+    TestPKCS12BytesArePrimaryInput,
     DARWIN_SKIP_REASON);
   Skip('identity reload retains immutable connection snapshots',
     TestReloadRetainsSnapshotsAndFailedReloadKeepsActive,
     DARWIN_SKIP_REASON);
   Skip('memory-BIO handshake exposes want states and reuses context',
-    TestHandshakeTransitionsAndContextReuse, DARWIN_SKIP_REASON);
+    TestHandshakeTransitionsAndContextReuse,
+    DARWIN_SKIP_REASON);
   Skip('plaintext roundtrip retains partial ciphertext',
     TestPlaintextRoundtripAndPartialCiphertextConsumption,
     DARWIN_SKIP_REASON);
-  Skip('fatal handshake poisons connection',
-    TestFatalHandshakePoisonsConnection, DARWIN_SKIP_REASON);
   Skip('fatal shutdown poisons before retaining alert output',
-    TestFatalShutdownPoisonsBeforeOutput, DARWIN_SKIP_REASON);
+    TestFatalShutdownPoisonsBeforeOutput,
+    DARWIN_SKIP_REASON);
   Skip('graceful close emits close_notify',
-    TestGracefulCloseProducesCloseNotify, DARWIN_SKIP_REASON);
-  Skip('TLS 1.2 renegotiation is refused', TestRenegotiationIsRefused,
+    TestGracefulCloseProducesCloseNotify,
+    DARWIN_SKIP_REASON);
+  Skip('TLS 1.2 renegotiation is refused',
+    TestRenegotiationIsRefused,
     DARWIN_SKIP_REASON);
   Skip('stale OpenSSL error queue is cleared before server operations',
-    TestStaleErrorQueueIsCleared, DARWIN_SKIP_REASON);
+    TestStaleErrorQueueIsCleared,
+    DARWIN_SKIP_REASON);
   Skip('SSL_ERROR_SYSCALL poisons the connection',
-    TestSyscallErrorPoisonsConnection, DARWIN_SKIP_REASON);
-  Skip('TLS floor rejects TLS 1.1', TestTLSFloorRejectsTLS11,
+    TestSyscallErrorPoisonsConnection,
+    DARWIN_SKIP_REASON);
+  Skip('TLS floor rejects TLS 1.1',
+    TestTLSFloorRejectsTLS11,
     DARWIN_SKIP_REASON);
   Skip('SSL_write WANT retry retains the original plaintext',
-    TestWriteWantRetryRetainsPlaintext, DARWIN_SKIP_REASON);
+    TestWriteWantRetryRetainsPlaintext,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel handshake round-trips plaintext and reuses the context',
+    TestSChannelHandshakeRoundtripAndContextReuse,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel PKCS#12 chain delivers the intermediate certificate',
+    TestSChannelCertificateChainDelivered,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel input flow accepts bounded prefixes and counts consumption',
+    TestSChannelInputFlowPrefixAdmissionAndCounters,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel pending ciphertext pointer survives partial consumption',
+    TestSChannelPendingCiphertextPointerAndPartialConsumption,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel write WANT retry retains the original plaintext',
+    TestSChannelWriteWantRetryRetainsPlaintext,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel graceful close emits close_notify',
+    TestSChannelGracefulCloseProducesCloseNotify,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel peer close_notify reports peer-closed',
+    TestSChannelPeerCloseNotifyReportsPeerClosed,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel protocol ceiling follows operating-system capability',
+    TestSChannelProtocolCeilingFollowsOperatingSystem,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel identities import into isolated key containers',
+    TestSChannelIdentityImportsIsolatedKeyContainers,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel reload retains the previous key container',
+    TestSChannelReloadRetainsPreviousKeyContainer,
+    DARWIN_SKIP_REASON);
   {$ELSE}
   FServerBackendAvailable := TransportSecurityServerBackendAvailable;
-  ServerTest('Active becomes true only after the server handshake',
-    TestActiveOnlyAfterHandshake);
-  ServerTest('server read clamps oversized lengths on a handshaken connection',
-    TestBoundsClamp);
-  ServerTest('PKCS#12 chain delivers the intermediate certificate',
-    TestCertificateChainDelivered);
   Skip('Darwin server API reports Network.framework alternative',
     TestDarwinReportsUnsupportedServerTLS, 'Darwin-only behavior');
+
+  { Backend-neutral coverage: identity policy, flow configuration, and
+    fatal-handshake poisoning need no loopback peer, so every platform
+    that has a server backend runs them. }
   ServerTest('empty and UTF-8 PKCS#12 passphrases load',
     TestEmptyAndUTF8Passphrases);
   ServerTest('embedded-NUL PKCS#12 passphrase is rejected',
@@ -2198,18 +3759,16 @@ begin
     TestMissingPKCS12FailsWithoutPathDisclosure);
   ServerTest('server input flow validates and publishes watermarks',
     TestInputFlowConfiguration);
-  ServerTest('server input flow accepts bounded prefixes and counts consumption',
-    TestInputFlowPrefixAdmissionAndCounters);
-  ServerTest('peer close_notify reports peer-closed and poisons the connection',
-    TestPeerCloseNotifyReportsPeerClosed);
-  ServerTest('pending ciphertext pointer stays stable across protocol calls',
-    TestPendingCiphertextPointerIsStable);
   ServerTest('garbage and wrong-pass PKCS#12 fail actionably',
     TestPKCS12LoadFailures);
   ServerTest('PKCS#12 identities above 16 MiB fail without disclosure',
     TestPKCS12SizeLimit);
-  ServerTest('caller PKCS#12 bytes are copied before synchronous parsing',
-    TestPKCS12BytesArePrimaryInput);
+  ServerTest('strict identity policy rejects invalid production certificates',
+    TestStrictIdentityValidation);
+  ServerTest('strict identity allows a leaf without basic constraints',
+    TestStrictIdentityAllowsLeafWithoutBasicConstraints);
+  ServerTest('fatal handshake poisons connection',
+    TestFatalHandshakePoisonsConnection);
   {$IFDEF MSWINDOWS}
   if not FServerBackendAvailable then
     ServerTest('PKCS#12 path loading refuses links in every component',
@@ -2225,30 +3784,151 @@ begin
   ServerTest('PKCS#12 path loading refuses links in every component',
     TestPKCS12PathRefusesSymbolicLink);
   {$ENDIF}
-  ServerTest('strict identity policy rejects invalid production certificates',
-    TestStrictIdentityValidation);
-  ServerTest('strict identity allows a leaf without basic constraints',
-    TestStrictIdentityAllowsLeafWithoutBasicConstraints);
+
+  { Cases that need the raw in-memory OpenSSL loopback client. }
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  ServerTest('Active becomes true only after the server handshake',
+    TestActiveOnlyAfterHandshake);
+  ServerTest('server read clamps oversized lengths on a handshaken connection',
+    TestBoundsClamp);
+  ServerTest('PKCS#12 chain delivers the intermediate certificate',
+    TestCertificateChainDelivered);
+  ServerTest('server input flow accepts bounded prefixes and counts consumption',
+    TestInputFlowPrefixAdmissionAndCounters);
+  ServerTest('peer close_notify reports peer-closed and poisons the connection',
+    TestPeerCloseNotifyReportsPeerClosed);
+  ServerTest('pending ciphertext pointer stays stable across protocol calls',
+    TestPendingCiphertextPointerIsStable);
+  ServerTest('caller PKCS#12 bytes are copied before synchronous parsing',
+    TestPKCS12BytesArePrimaryInput);
   ServerTest('identity reload retains immutable connection snapshots',
     TestReloadRetainsSnapshotsAndFailedReloadKeepsActive);
   ServerTest('memory-BIO handshake exposes want states and reuses context',
     TestHandshakeTransitionsAndContextReuse);
   ServerTest('plaintext roundtrip retains partial ciphertext',
     TestPlaintextRoundtripAndPartialCiphertextConsumption);
-  ServerTest('fatal handshake poisons connection',
-    TestFatalHandshakePoisonsConnection);
   ServerTest('fatal shutdown poisons before retaining alert output',
     TestFatalShutdownPoisonsBeforeOutput);
   ServerTest('graceful close emits close_notify',
     TestGracefulCloseProducesCloseNotify);
-  ServerTest('TLS 1.2 renegotiation is refused', TestRenegotiationIsRefused);
+  ServerTest('TLS 1.2 renegotiation is refused',
+    TestRenegotiationIsRefused);
   ServerTest('stale OpenSSL error queue is cleared before server operations',
     TestStaleErrorQueueIsCleared);
   ServerTest('SSL_ERROR_SYSCALL poisons the connection',
     TestSyscallErrorPoisonsConnection);
-  ServerTest('TLS floor rejects TLS 1.1', TestTLSFloorRejectsTLS11);
+  ServerTest('TLS floor rejects TLS 1.1',
+    TestTLSFloorRejectsTLS11);
   ServerTest('SSL_write WANT retry retains the original plaintext',
     TestWriteWantRetryRetainsPlaintext);
+  {$ELSE}
+  Skip('Active becomes true only after the server handshake',
+    TestActiveOnlyAfterHandshake,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('server read clamps oversized lengths on a handshaken connection',
+    TestBoundsClamp,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('PKCS#12 chain delivers the intermediate certificate',
+    TestCertificateChainDelivered,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('server input flow accepts bounded prefixes and counts consumption',
+    TestInputFlowPrefixAdmissionAndCounters,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('peer close_notify reports peer-closed and poisons the connection',
+    TestPeerCloseNotifyReportsPeerClosed,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('pending ciphertext pointer stays stable across protocol calls',
+    TestPendingCiphertextPointerIsStable,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('caller PKCS#12 bytes are copied before synchronous parsing',
+    TestPKCS12BytesArePrimaryInput,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('identity reload retains immutable connection snapshots',
+    TestReloadRetainsSnapshotsAndFailedReloadKeepsActive,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('memory-BIO handshake exposes want states and reuses context',
+    TestHandshakeTransitionsAndContextReuse,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('plaintext roundtrip retains partial ciphertext',
+    TestPlaintextRoundtripAndPartialCiphertextConsumption,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('fatal shutdown poisons before retaining alert output',
+    TestFatalShutdownPoisonsBeforeOutput,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('graceful close emits close_notify',
+    TestGracefulCloseProducesCloseNotify,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('TLS 1.2 renegotiation is refused',
+    TestRenegotiationIsRefused,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('stale OpenSSL error queue is cleared before server operations',
+    TestStaleErrorQueueIsCleared,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('SSL_ERROR_SYSCALL poisons the connection',
+    TestSyscallErrorPoisonsConnection,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('TLS floor rejects TLS 1.1',
+    TestTLSFloorRejectsTLS11,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('SSL_write WANT retry retains the original plaintext',
+    TestWriteWantRetryRetainsPlaintext,
+    OPENSSL_CLIENT_SKIP_REASON);
+  {$ENDIF}
+
+  { Cases that need the raw in-memory SChannel loopback client. }
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  ServerTest('SChannel handshake round-trips plaintext and reuses the context',
+    TestSChannelHandshakeRoundtripAndContextReuse);
+  ServerTest('SChannel PKCS#12 chain delivers the intermediate certificate',
+    TestSChannelCertificateChainDelivered);
+  ServerTest('SChannel input flow accepts bounded prefixes and counts consumption',
+    TestSChannelInputFlowPrefixAdmissionAndCounters);
+  ServerTest('SChannel pending ciphertext pointer survives partial consumption',
+    TestSChannelPendingCiphertextPointerAndPartialConsumption);
+  ServerTest('SChannel write WANT retry retains the original plaintext',
+    TestSChannelWriteWantRetryRetainsPlaintext);
+  ServerTest('SChannel graceful close emits close_notify',
+    TestSChannelGracefulCloseProducesCloseNotify);
+  ServerTest('SChannel peer close_notify reports peer-closed',
+    TestSChannelPeerCloseNotifyReportsPeerClosed);
+  ServerTest('SChannel protocol ceiling follows operating-system capability',
+    TestSChannelProtocolCeilingFollowsOperatingSystem);
+  ServerTest('SChannel identities import into isolated key containers',
+    TestSChannelIdentityImportsIsolatedKeyContainers);
+  ServerTest('SChannel reload retains the previous key container',
+    TestSChannelReloadRetainsPreviousKeyContainer);
+  {$ELSE}
+  Skip('SChannel handshake round-trips plaintext and reuses the context',
+    TestSChannelHandshakeRoundtripAndContextReuse,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel PKCS#12 chain delivers the intermediate certificate',
+    TestSChannelCertificateChainDelivered,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel input flow accepts bounded prefixes and counts consumption',
+    TestSChannelInputFlowPrefixAdmissionAndCounters,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel pending ciphertext pointer survives partial consumption',
+    TestSChannelPendingCiphertextPointerAndPartialConsumption,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel write WANT retry retains the original plaintext',
+    TestSChannelWriteWantRetryRetainsPlaintext,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel graceful close emits close_notify',
+    TestSChannelGracefulCloseProducesCloseNotify,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel peer close_notify reports peer-closed',
+    TestSChannelPeerCloseNotifyReportsPeerClosed,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel protocol ceiling follows operating-system capability',
+    TestSChannelProtocolCeilingFollowsOperatingSystem,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel identities import into isolated key containers',
+    TestSChannelIdentityImportsIsolatedKeyContainers,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel reload retains the previous key container',
+    TestSChannelReloadRetainsPreviousKeyContainer,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  {$ENDIF}
   {$ENDIF}
 end;
 

@@ -2,17 +2,20 @@ unit TransportSecurity;
 
 // Cross-platform TLS transport. Blocking clients use SecureTransport on
 // macOS, SChannel on Windows, and OpenSSL on Unix. Nonblocking server accept
-// uses memory-BIO OpenSSL on Windows and Unix-not-Darwin; macOS servers use
-// Network.framework outside this unit.
+// uses native SChannel (SSPI + crypt32) on Windows and memory-BIO OpenSSL on
+// Unix-not-Darwin; macOS servers use Network.framework outside this unit.
+// Windows therefore links no OpenSSL and loads no OpenSSL DLL at runtime.
 
 {$I Shared.inc}
 
 {$IFDEF MSWINDOWS}
-{$DEFINE TRANSPORT_SECURITY_OPENSSL}
+{$DEFINE TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{$DEFINE TRANSPORT_SECURITY_SERVER}
 {$ENDIF}
 {$IFDEF UNIX}
 {$IFNDEF DARWIN}
 {$DEFINE TRANSPORT_SECURITY_OPENSSL}
+{$DEFINE TRANSPORT_SECURITY_SERVER}
 {$ENDIF}
 {$ENDIF}
 
@@ -179,6 +182,12 @@ function TransportSecurityTestInjectSyscallError(
   out AObservedError: Integer): TTransportSecurityState;
 {$ENDIF}
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{$IFNDEF PRODUCTION}
+function TransportSecurityTestServerKeyContainer(
+  const AContext: TTransportSecurityServerContext): UnicodeString;
+{$ENDIF}
+{$ENDIF}
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
 function TransportSecurityRead(var AConnection: TTransportSecurityConnection;
   var ABuffer: array of Byte; const ALength: Integer): Integer;
@@ -207,6 +216,7 @@ const
   TSB_SECURE_TRANSPORT = 2;
   TSB_SCHANNEL = 3;
   TSB_OPENSSL_SERVER = 4;
+  TSB_SCHANNEL_SERVER = 5;
   OPENSSL_LOAD_ERROR = 'HTTPS requires OpenSSL but it could not be loaded';
   OPENSSL_SERVER_LOAD_ERROR =
     'TLS server accept requires OpenSSL but it could not be loaded';
@@ -639,6 +649,431 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF TRANSPORT_SECURITY_SERVER}
+{ Server-identity support shared by the OpenSSL and SChannel server
+  backends: the PKCS#12 size ceiling, link-refusing identity-file
+  loading, and the connection/secret bookkeeping both backends use. }
+
+const
+  MAX_PKCS12_IDENTITY_SIZE = 16 * 1024 * 1024;
+
+procedure ResetTransportSecurityConnection(
+  var AConnection: TTransportSecurityConnection); inline;
+begin
+  AConnection.Active := False;
+  AConnection.Backend := TSB_NONE;
+  AConnection.BackendData := nil;
+end;
+
+{$IFDEF UNIX}
+function OpenAt(ADirectoryDescriptor: cint; APath: PChar;
+  AFlags: cint): cint; cdecl; external 'c' name 'openat';
+function FileStatusAt(ADirectoryDescriptor: cint; APath: PChar;
+  var AFileStatus: BaseUnix.Stat; AFlags: cint): cint; cdecl;
+  external 'c' name 'fstatat';
+
+{$IFDEF LINUX}
+type
+  PCIntLWPT = ^cint;
+
+function LinuxErrnoLocation: PCIntLWPT; cdecl;
+  external 'c' name '__errno_location';
+{$ENDIF}
+
+const
+  {$IFDEF LINUX}
+  AT_SYMLINK_NOFOLLOW_LWPT = $00000100;
+  O_NONBLOCK_LWPT = $00000800;
+  { Linux AArch64 overrides the asm-generic directory and no-follow bits.
+    FPC 3.2.2 exposes the asm-generic values on that target, so these values
+    must follow the target UAPI rather than the RTL constants. }
+  {$IFDEF CPUAARCH64}
+  O_DIRECTORY_LWPT = $00004000;
+  O_NOFOLLOW_LWPT = $00008000;
+  {$ELSE}
+  O_DIRECTORY_LWPT = $00010000;
+  O_NOFOLLOW_LWPT = $00020000;
+  {$ENDIF}
+  {$ELSE}
+  {$IFDEF DARWIN}
+  AT_SYMLINK_NOFOLLOW_LWPT = $00000020;
+  O_DIRECTORY_LWPT = $00100000;
+  O_NOFOLLOW_LWPT = $00000100;
+  O_NONBLOCK_LWPT = $00000004;
+  {$ELSE}
+  AT_SYMLINK_NOFOLLOW_LWPT = AT_SYMLINK_NOFOLLOW;
+  O_DIRECTORY_LWPT = O_DIRECTORY;
+  O_NOFOLLOW_LWPT = O_NOFOLLOW;
+  O_NONBLOCK_LWPT = O_NONBLOCK;
+  {$ENDIF}
+  {$ENDIF}
+
+function LastLibcError: cint; inline;
+begin
+  {$IFDEF LINUX}
+  Result := LinuxErrnoLocation^;
+  {$ELSE}
+  Result := fpgeterrno;
+  {$ENDIF}
+end;
+
+function OpenPKCS12Descriptor(const APath: string): cint;
+var
+  Component: string;
+  CurrentDescriptor: cint;
+  ErrorCode: cint;
+  IsFinal: Boolean;
+  LinkInfo: BaseUnix.Stat;
+  NextDescriptor: cint;
+  OpenFlags: cint;
+  OpenInfo: BaseUnix.Stat;
+  Position: Integer;
+  Start: Integer;
+begin
+  if APath = '' then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity file does not exist');
+  if APath[1] = '/' then
+    CurrentDescriptor := fpOpen(PChar('/'), O_RDONLY)
+  else
+    CurrentDescriptor := fpOpen(PChar('.'), O_RDONLY);
+  if CurrentDescriptor < 0 then
+    raise ETransportSecurityError.Create(
+      'Failed to open configured TLS PKCS#12 identity without following links');
+  try
+    Position := 1;
+    while Position <= Length(APath) do
+    begin
+      while (Position <= Length(APath)) and (APath[Position] = '/') do
+        Inc(Position);
+      if Position > Length(APath) then
+        Break;
+      Start := Position;
+      while (Position <= Length(APath)) and (APath[Position] <> '/') do
+        Inc(Position);
+      Component := Copy(APath, Start, Position - Start);
+      while (Position <= Length(APath)) and (APath[Position] = '/') do
+        Inc(Position);
+      IsFinal := Position > Length(APath);
+      if FileStatusAt(CurrentDescriptor, PChar(Component), LinkInfo,
+        AT_SYMLINK_NOFOLLOW_LWPT) <> 0 then
+      begin
+        ErrorCode := LastLibcError;
+        if ErrorCode = ESysENOENT then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 identity file does not exist');
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      end;
+      if (LinkInfo.st_mode and S_IFMT) = S_IFLNK then
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      if IsFinal then
+      begin
+        if (LinkInfo.st_mode and S_IFMT) <> S_IFREG then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 identity must be a regular file');
+        OpenFlags := O_RDONLY or O_NOFOLLOW_LWPT or O_NONBLOCK_LWPT;
+      end
+      else
+      begin
+        if (LinkInfo.st_mode and S_IFMT) <> S_IFDIR then
+          raise ETransportSecurityError.Create(
+            'Failed to open configured TLS PKCS#12 identity without following links');
+        OpenFlags := O_RDONLY or O_NOFOLLOW_LWPT or O_NONBLOCK_LWPT or
+          O_DIRECTORY_LWPT;
+      end;
+      NextDescriptor := OpenAt(CurrentDescriptor, PChar(Component),
+        OpenFlags);
+      if NextDescriptor < 0 then
+      begin
+        ErrorCode := LastLibcError;
+        if ErrorCode = ESysENOENT then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 identity file does not exist');
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      end;
+      if (fpFStat(NextDescriptor, OpenInfo) <> 0) or
+         (OpenInfo.st_dev <> LinkInfo.st_dev) or
+         (OpenInfo.st_ino <> LinkInfo.st_ino) or
+         ((OpenInfo.st_mode and S_IFMT) <> (LinkInfo.st_mode and S_IFMT)) then
+      begin
+        fpClose(NextDescriptor);
+        raise ETransportSecurityError.Create(
+          'Failed to open configured TLS PKCS#12 identity without following links');
+      end;
+      fpClose(CurrentDescriptor);
+      CurrentDescriptor := NextDescriptor;
+    end;
+    Result := CurrentDescriptor;
+    CurrentDescriptor := -1;
+  finally
+    if CurrentDescriptor >= 0 then
+      fpClose(CurrentDescriptor);
+  end;
+end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+type
+  PPWideCharLWPT = ^PWideChar;
+  TWindowsHandleArray = array of THandle;
+
+function WindowsGetFullPathName(APath: PWideChar; ALength: DWORD;
+  ABuffer: PWideChar; AFilePart: PPWideCharLWPT): DWORD; stdcall;
+  external 'kernel32.dll' name 'GetFullPathNameW';
+
+function NormalizeWindowsPath(const APath: UnicodeString): UnicodeString;
+begin
+  Result := APath;
+  if Copy(Result, 1, 8) = '\\?\UNC\' then
+    Result := '\\' + Copy(Result, 9, MaxInt)
+  else if Copy(Result, 1, 4) = '\\?\' then
+    Delete(Result, 1, 4);
+end;
+
+function WindowsFullPath(const APath: string): UnicodeString;
+var
+  BufferLength: DWORD;
+  FilePart: PWideChar;
+begin
+  Result := '';
+  BufferLength := WindowsGetFullPathName(PWideChar(UnicodeString(APath)),
+    0, nil, nil);
+  if BufferLength = 0 then
+    raise ETransportSecurityError.Create(
+      'Failed to inspect configured TLS PKCS#12 identity');
+  SetLength(Result, BufferLength);
+  BufferLength := WindowsGetFullPathName(PWideChar(UnicodeString(APath)),
+    Length(Result), PWideChar(Result), @FilePart);
+  if (BufferLength = 0) or (BufferLength >= DWORD(Length(Result))) then
+    raise ETransportSecurityError.Create(
+      'Failed to inspect configured TLS PKCS#12 identity');
+  SetLength(Result, BufferLength);
+  Result := NormalizeWindowsPath(Result);
+end;
+
+function WindowsRootLength(const APath: UnicodeString): Integer;
+var
+  Position: Integer;
+begin
+  if (Length(APath) >= 3) and (APath[2] = ':') and (APath[3] = '\') then
+    Exit(3);
+  if (Length(APath) < 5) or (Copy(APath, 1, 2) <> '\\') then
+    Exit(0);
+  Position := 3;
+  while (Position <= Length(APath)) and (APath[Position] <> '\') do
+    Inc(Position);
+  if Position > Length(APath) then
+    Exit(0);
+  Inc(Position);
+  while (Position <= Length(APath)) and (APath[Position] <> '\') do
+    Inc(Position);
+  if Position > Length(APath) then
+    Result := Length(APath)
+  else
+    Result := Position;
+end;
+
+procedure CloseWindowsHandles(var AHandles: TWindowsHandleArray);
+var
+  I: Integer;
+begin
+  for I := High(AHandles) downto 0 do
+    if AHandles[I] <> THandle(Windows.INVALID_HANDLE_VALUE) then
+      Windows.CloseHandle(AHandles[I]);
+  SetLength(AHandles, 0);
+end;
+
+procedure OpenWindowsParentHandles(const APath: UnicodeString;
+  out AHandles: TWindowsHandleArray);
+const
+  FILE_FLAG_BACKUP_SEMANTICS_LWPT = $02000000;
+  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
+  FILE_READ_ATTRIBUTES_LWPT = $00000080;
+var
+  ComponentEnd: Integer;
+  ComponentStart: Integer;
+  FileInfo: TByHandleFileInformation;
+  Handle: THandle;
+  LastError: DWORD;
+  ParentPath: UnicodeString;
+  RootLength: Integer;
+begin
+  SetLength(AHandles, 0);
+  RootLength := WindowsRootLength(APath);
+  if RootLength = 0 then
+    raise ETransportSecurityError.Create(
+      'Failed to inspect configured TLS PKCS#12 identity');
+  ComponentStart := RootLength + 1;
+  while ComponentStart <= Length(APath) do
+  begin
+    ComponentEnd := ComponentStart;
+    while (ComponentEnd <= Length(APath)) and
+      (APath[ComponentEnd] <> '\') do
+      Inc(ComponentEnd);
+    if ComponentEnd > Length(APath) then
+      Break;
+    ParentPath := Copy(APath, 1, ComponentEnd - 1);
+    Handle := Windows.CreateFileW(PWideChar(ParentPath),
+      FILE_READ_ATTRIBUTES_LWPT, Windows.FILE_SHARE_READ, nil,
+      Windows.OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS_LWPT or
+      FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
+    if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
+    begin
+      LastError := Windows.GetLastError;
+      CloseWindowsHandles(AHandles);
+      { Mirror the Unix component walk, which reports ENOENT on any component
+        as a missing identity rather than as a link refusal. Without this a
+        configured path whose parent directory is absent is misreported as a
+        reparse-point failure. Neither message discloses the path. }
+      if (LastError = Windows.ERROR_FILE_NOT_FOUND) or
+         (LastError = Windows.ERROR_PATH_NOT_FOUND) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 identity file does not exist');
+      raise ETransportSecurityError.Create(
+        'Failed to open configured TLS PKCS#12 identity without following reparse points');
+    end;
+    if not Windows.GetFileInformationByHandle(Handle, FileInfo) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY) = 0) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+    begin
+      Windows.CloseHandle(Handle);
+      CloseWindowsHandles(AHandles);
+      raise ETransportSecurityError.Create(
+        'Failed to open configured TLS PKCS#12 identity without following reparse points');
+    end;
+    SetLength(AHandles, Length(AHandles) + 1);
+    AHandles[High(AHandles)] := Handle;
+    ComponentStart := ComponentEnd + 1;
+  end;
+end;
+{$ENDIF}
+
+function LoadPKCS12Bytes(const APath: string): TBytes;
+{$IFDEF UNIX}
+var
+  BytesRead: Integer;
+  Descriptor: cint;
+  FileInfo: BaseUnix.Stat;
+  Offset: Integer;
+begin
+  Result := nil;
+  Descriptor := OpenPKCS12Descriptor(APath);
+  try
+    if (fpFStat(Descriptor, FileInfo) <> 0) or
+       ((FileInfo.st_mode and S_IFMT) <> S_IFREG) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must be a regular file');
+    if FileInfo.st_size <= 0 then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity file is empty');
+    if FileInfo.st_size > MAX_PKCS12_IDENTITY_SIZE then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
+    SetLength(Result, Integer(FileInfo.st_size));
+    try
+      Offset := 0;
+      while Offset < Length(Result) do
+      begin
+        repeat
+          BytesRead := fpRead(Descriptor, Result[Offset],
+            Length(Result) - Offset);
+        until (BytesRead >= 0) or (fpgeterrno <> ESysEINTR);
+        if BytesRead <= 0 then
+          raise ETransportSecurityError.Create(
+            'Failed to read configured TLS PKCS#12 identity file');
+        Inc(Offset, BytesRead);
+      end;
+    except
+      FillChar(Result[0], Length(Result), 0);
+      Result := nil;
+      raise;
+    end;
+  finally
+    fpClose(Descriptor);
+  end;
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+const
+  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
+var
+  BytesRead: DWORD;
+  ExpectedPath: UnicodeString;
+  FileInfo: TByHandleFileInformation;
+  FileSize: QWord;
+  Handle: THandle;
+  LastError: DWORD;
+  Offset: Integer;
+  ParentHandles: TWindowsHandleArray;
+begin
+  Result := nil;
+  ExpectedPath := WindowsFullPath(APath);
+  Handle := THandle(Windows.INVALID_HANDLE_VALUE);
+  OpenWindowsParentHandles(ExpectedPath, ParentHandles);
+  try
+    Handle := Windows.CreateFileW(PWideChar(ExpectedPath),
+      Windows.GENERIC_READ, Windows.FILE_SHARE_READ, nil,
+      Windows.OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
+    if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
+    begin
+      LastError := Windows.GetLastError;
+      if (LastError = Windows.ERROR_FILE_NOT_FOUND) or
+         (LastError = Windows.ERROR_PATH_NOT_FOUND) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 identity file does not exist');
+      raise ETransportSecurityError.Create(
+        'Failed to open configured TLS PKCS#12 identity without following reparse points');
+    end;
+    if not Windows.GetFileInformationByHandle(Handle, FileInfo) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT)
+       <> 0) or
+       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY)
+       <> 0) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must be a regular non-reparse file');
+    FileSize := (QWord(FileInfo.nFileSizeHigh) shl 32) or
+      FileInfo.nFileSizeLow;
+    if FileSize = 0 then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity file is empty');
+    if FileSize > MAX_PKCS12_IDENTITY_SIZE then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
+    SetLength(Result, Integer(FileSize));
+    try
+      Offset := 0;
+      while Offset < Length(Result) do
+      begin
+        if not Windows.ReadFile(Handle, Result[Offset],
+          Length(Result) - Offset, BytesRead, nil) or (BytesRead = 0) then
+          raise ETransportSecurityError.Create(
+            'Failed to read configured TLS PKCS#12 identity file');
+        Inc(Offset, BytesRead);
+      end;
+    except
+      FillChar(Result[0], Length(Result), 0);
+      Result := nil;
+      raise;
+    end;
+  finally
+    if Handle <> THandle(Windows.INVALID_HANDLE_VALUE) then
+      Windows.CloseHandle(Handle);
+    CloseWindowsHandles(ParentHandles);
+  end;
+end;
+{$ENDIF}
+
+procedure WipeBytes(var ABytes: TBytes);
+begin
+  if Length(ABytes) > 0 then
+    FillChar(ABytes[0], Length(ABytes), 0);
+  SetLength(ABytes, 0);
+end;
+{$ENDIF}
+
 {$IFDEF TRANSPORT_SECURITY_OPENSSL}
 type
   TOpenSSLData = class
@@ -722,7 +1157,6 @@ const
   BIO_C_SET_BUF_MEM_EOF_RETURN = 130;
   BIO_CTRL_PENDING_COMMAND = 10;
   BIO_FLAGS_RETRY_MASK = $0F;
-  MAX_PKCS12_IDENTITY_SIZE = 16 * 1024 * 1024;
   OPENSSL_OUTPUT_CHUNK_SIZE = 16 * 1024;
   EXFLAG_BCONS = $1;
   EXFLAG_KUSAGE = $2;
@@ -1268,14 +1702,6 @@ begin
     FillChar(AData.PendingPlaintext[0], Length(AData.PendingPlaintext), 0);
   SetLength(AData.PendingPlaintext, 0);
   AData.Free;
-end;
-
-procedure ResetTransportSecurityConnection(
-  var AConnection: TTransportSecurityConnection); inline;
-begin
-  AConnection.Active := False;
-  AConnection.Backend := TSB_NONE;
-  AConnection.BackendData := nil;
 end;
 
 procedure PoisonOpenSSLServerConnection(
@@ -1910,404 +2336,6 @@ begin
   until False;
 end;
 
-{$IFDEF UNIX}
-function OpenAt(ADirectoryDescriptor: cint; APath: PChar;
-  AFlags: cint): cint; cdecl; external 'c' name 'openat';
-function FileStatusAt(ADirectoryDescriptor: cint; APath: PChar;
-  var AFileStatus: BaseUnix.Stat; AFlags: cint): cint; cdecl;
-  external 'c' name 'fstatat';
-
-{$IFDEF LINUX}
-type
-  PCIntLWPT = ^cint;
-
-function LinuxErrnoLocation: PCIntLWPT; cdecl;
-  external 'c' name '__errno_location';
-{$ENDIF}
-
-const
-  {$IFDEF LINUX}
-  AT_SYMLINK_NOFOLLOW_LWPT = $00000100;
-  O_NONBLOCK_LWPT = $00000800;
-  { Linux AArch64 overrides the asm-generic directory and no-follow bits.
-    FPC 3.2.2 exposes the asm-generic values on that target, so these values
-    must follow the target UAPI rather than the RTL constants. }
-  {$IFDEF CPUAARCH64}
-  O_DIRECTORY_LWPT = $00004000;
-  O_NOFOLLOW_LWPT = $00008000;
-  {$ELSE}
-  O_DIRECTORY_LWPT = $00010000;
-  O_NOFOLLOW_LWPT = $00020000;
-  {$ENDIF}
-  {$ELSE}
-  {$IFDEF DARWIN}
-  AT_SYMLINK_NOFOLLOW_LWPT = $00000020;
-  O_DIRECTORY_LWPT = $00100000;
-  O_NOFOLLOW_LWPT = $00000100;
-  O_NONBLOCK_LWPT = $00000004;
-  {$ELSE}
-  AT_SYMLINK_NOFOLLOW_LWPT = AT_SYMLINK_NOFOLLOW;
-  O_DIRECTORY_LWPT = O_DIRECTORY;
-  O_NOFOLLOW_LWPT = O_NOFOLLOW;
-  O_NONBLOCK_LWPT = O_NONBLOCK;
-  {$ENDIF}
-  {$ENDIF}
-
-function LastLibcError: cint; inline;
-begin
-  {$IFDEF LINUX}
-  Result := LinuxErrnoLocation^;
-  {$ELSE}
-  Result := fpgeterrno;
-  {$ENDIF}
-end;
-
-function OpenPKCS12Descriptor(const APath: string): cint;
-var
-  Component: string;
-  CurrentDescriptor: cint;
-  ErrorCode: cint;
-  IsFinal: Boolean;
-  LinkInfo: BaseUnix.Stat;
-  NextDescriptor: cint;
-  OpenFlags: cint;
-  OpenInfo: BaseUnix.Stat;
-  Position: Integer;
-  Start: Integer;
-begin
-  if APath = '' then
-    raise ETransportSecurityError.Create(
-      'Configured TLS PKCS#12 identity file does not exist');
-  if APath[1] = '/' then
-    CurrentDescriptor := fpOpen(PChar('/'), O_RDONLY)
-  else
-    CurrentDescriptor := fpOpen(PChar('.'), O_RDONLY);
-  if CurrentDescriptor < 0 then
-    raise ETransportSecurityError.Create(
-      'Failed to open configured TLS PKCS#12 identity without following links');
-  try
-    Position := 1;
-    while Position <= Length(APath) do
-    begin
-      while (Position <= Length(APath)) and (APath[Position] = '/') do
-        Inc(Position);
-      if Position > Length(APath) then
-        Break;
-      Start := Position;
-      while (Position <= Length(APath)) and (APath[Position] <> '/') do
-        Inc(Position);
-      Component := Copy(APath, Start, Position - Start);
-      while (Position <= Length(APath)) and (APath[Position] = '/') do
-        Inc(Position);
-      IsFinal := Position > Length(APath);
-      if FileStatusAt(CurrentDescriptor, PChar(Component), LinkInfo,
-        AT_SYMLINK_NOFOLLOW_LWPT) <> 0 then
-      begin
-        ErrorCode := LastLibcError;
-        if ErrorCode = ESysENOENT then
-          raise ETransportSecurityError.Create(
-            'Configured TLS PKCS#12 identity file does not exist');
-        raise ETransportSecurityError.Create(
-          'Failed to open configured TLS PKCS#12 identity without following links');
-      end;
-      if (LinkInfo.st_mode and S_IFMT) = S_IFLNK then
-        raise ETransportSecurityError.Create(
-          'Failed to open configured TLS PKCS#12 identity without following links');
-      if IsFinal then
-      begin
-        if (LinkInfo.st_mode and S_IFMT) <> S_IFREG then
-          raise ETransportSecurityError.Create(
-            'Configured TLS PKCS#12 identity must be a regular file');
-        OpenFlags := O_RDONLY or O_NOFOLLOW_LWPT or O_NONBLOCK_LWPT;
-      end
-      else
-      begin
-        if (LinkInfo.st_mode and S_IFMT) <> S_IFDIR then
-          raise ETransportSecurityError.Create(
-            'Failed to open configured TLS PKCS#12 identity without following links');
-        OpenFlags := O_RDONLY or O_NOFOLLOW_LWPT or O_NONBLOCK_LWPT or
-          O_DIRECTORY_LWPT;
-      end;
-      NextDescriptor := OpenAt(CurrentDescriptor, PChar(Component),
-        OpenFlags);
-      if NextDescriptor < 0 then
-      begin
-        ErrorCode := LastLibcError;
-        if ErrorCode = ESysENOENT then
-          raise ETransportSecurityError.Create(
-            'Configured TLS PKCS#12 identity file does not exist');
-        raise ETransportSecurityError.Create(
-          'Failed to open configured TLS PKCS#12 identity without following links');
-      end;
-      if (fpFStat(NextDescriptor, OpenInfo) <> 0) or
-         (OpenInfo.st_dev <> LinkInfo.st_dev) or
-         (OpenInfo.st_ino <> LinkInfo.st_ino) or
-         ((OpenInfo.st_mode and S_IFMT) <> (LinkInfo.st_mode and S_IFMT)) then
-      begin
-        fpClose(NextDescriptor);
-        raise ETransportSecurityError.Create(
-          'Failed to open configured TLS PKCS#12 identity without following links');
-      end;
-      fpClose(CurrentDescriptor);
-      CurrentDescriptor := NextDescriptor;
-    end;
-    Result := CurrentDescriptor;
-    CurrentDescriptor := -1;
-  finally
-    if CurrentDescriptor >= 0 then
-      fpClose(CurrentDescriptor);
-  end;
-end;
-{$ENDIF}
-
-{$IFDEF MSWINDOWS}
-type
-  PPWideCharLWPT = ^PWideChar;
-  TWindowsHandleArray = array of THandle;
-
-function WindowsGetFullPathName(APath: PWideChar; ALength: DWORD;
-  ABuffer: PWideChar; AFilePart: PPWideCharLWPT): DWORD; stdcall;
-  external 'kernel32.dll' name 'GetFullPathNameW';
-
-function NormalizeWindowsPath(const APath: UnicodeString): UnicodeString;
-begin
-  Result := APath;
-  if Copy(Result, 1, 8) = '\\?\UNC\' then
-    Result := '\\' + Copy(Result, 9, MaxInt)
-  else if Copy(Result, 1, 4) = '\\?\' then
-    Delete(Result, 1, 4);
-end;
-
-function WindowsFullPath(const APath: string): UnicodeString;
-var
-  BufferLength: DWORD;
-  FilePart: PWideChar;
-begin
-  Result := '';
-  BufferLength := WindowsGetFullPathName(PWideChar(UnicodeString(APath)),
-    0, nil, nil);
-  if BufferLength = 0 then
-    raise ETransportSecurityError.Create(
-      'Failed to inspect configured TLS PKCS#12 identity');
-  SetLength(Result, BufferLength);
-  BufferLength := WindowsGetFullPathName(PWideChar(UnicodeString(APath)),
-    Length(Result), PWideChar(Result), @FilePart);
-  if (BufferLength = 0) or (BufferLength >= DWORD(Length(Result))) then
-    raise ETransportSecurityError.Create(
-      'Failed to inspect configured TLS PKCS#12 identity');
-  SetLength(Result, BufferLength);
-  Result := NormalizeWindowsPath(Result);
-end;
-
-function WindowsRootLength(const APath: UnicodeString): Integer;
-var
-  Position: Integer;
-begin
-  if (Length(APath) >= 3) and (APath[2] = ':') and (APath[3] = '\') then
-    Exit(3);
-  if (Length(APath) < 5) or (Copy(APath, 1, 2) <> '\\') then
-    Exit(0);
-  Position := 3;
-  while (Position <= Length(APath)) and (APath[Position] <> '\') do
-    Inc(Position);
-  if Position > Length(APath) then
-    Exit(0);
-  Inc(Position);
-  while (Position <= Length(APath)) and (APath[Position] <> '\') do
-    Inc(Position);
-  if Position > Length(APath) then
-    Result := Length(APath)
-  else
-    Result := Position;
-end;
-
-procedure CloseWindowsHandles(var AHandles: TWindowsHandleArray);
-var
-  I: Integer;
-begin
-  for I := High(AHandles) downto 0 do
-    if AHandles[I] <> THandle(Windows.INVALID_HANDLE_VALUE) then
-      Windows.CloseHandle(AHandles[I]);
-  SetLength(AHandles, 0);
-end;
-
-procedure OpenWindowsParentHandles(const APath: UnicodeString;
-  out AHandles: TWindowsHandleArray);
-const
-  FILE_FLAG_BACKUP_SEMANTICS_LWPT = $02000000;
-  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
-  FILE_READ_ATTRIBUTES_LWPT = $00000080;
-var
-  ComponentEnd: Integer;
-  ComponentStart: Integer;
-  FileInfo: TByHandleFileInformation;
-  Handle: THandle;
-  ParentPath: UnicodeString;
-  RootLength: Integer;
-begin
-  SetLength(AHandles, 0);
-  RootLength := WindowsRootLength(APath);
-  if RootLength = 0 then
-    raise ETransportSecurityError.Create(
-      'Failed to inspect configured TLS PKCS#12 identity');
-  ComponentStart := RootLength + 1;
-  while ComponentStart <= Length(APath) do
-  begin
-    ComponentEnd := ComponentStart;
-    while (ComponentEnd <= Length(APath)) and
-      (APath[ComponentEnd] <> '\') do
-      Inc(ComponentEnd);
-    if ComponentEnd > Length(APath) then
-      Break;
-    ParentPath := Copy(APath, 1, ComponentEnd - 1);
-    Handle := Windows.CreateFileW(PWideChar(ParentPath),
-      FILE_READ_ATTRIBUTES_LWPT, Windows.FILE_SHARE_READ, nil,
-      Windows.OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS_LWPT or
-      FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
-    if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
-    begin
-      CloseWindowsHandles(AHandles);
-      raise ETransportSecurityError.Create(
-        'Failed to open configured TLS PKCS#12 identity without following reparse points');
-    end;
-    if not Windows.GetFileInformationByHandle(Handle, FileInfo) or
-       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY) = 0) or
-       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
-    begin
-      Windows.CloseHandle(Handle);
-      CloseWindowsHandles(AHandles);
-      raise ETransportSecurityError.Create(
-        'Failed to open configured TLS PKCS#12 identity without following reparse points');
-    end;
-    SetLength(AHandles, Length(AHandles) + 1);
-    AHandles[High(AHandles)] := Handle;
-    ComponentStart := ComponentEnd + 1;
-  end;
-end;
-{$ENDIF}
-
-function LoadPKCS12Bytes(const APath: string): TBytes;
-{$IFDEF UNIX}
-var
-  BytesRead: Integer;
-  Descriptor: cint;
-  FileInfo: BaseUnix.Stat;
-  Offset: Integer;
-begin
-  Result := nil;
-  Descriptor := OpenPKCS12Descriptor(APath);
-  try
-    if (fpFStat(Descriptor, FileInfo) <> 0) or
-       ((FileInfo.st_mode and S_IFMT) <> S_IFREG) then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity must be a regular file');
-    if FileInfo.st_size <= 0 then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity file is empty');
-    if FileInfo.st_size > MAX_PKCS12_IDENTITY_SIZE then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
-    SetLength(Result, Integer(FileInfo.st_size));
-    try
-      Offset := 0;
-      while Offset < Length(Result) do
-      begin
-        repeat
-          BytesRead := fpRead(Descriptor, Result[Offset],
-            Length(Result) - Offset);
-        until (BytesRead >= 0) or (fpgeterrno <> ESysEINTR);
-        if BytesRead <= 0 then
-          raise ETransportSecurityError.Create(
-            'Failed to read configured TLS PKCS#12 identity file');
-        Inc(Offset, BytesRead);
-      end;
-    except
-      FillChar(Result[0], Length(Result), 0);
-      Result := nil;
-      raise;
-    end;
-  finally
-    fpClose(Descriptor);
-  end;
-end;
-{$ENDIF}
-{$IFDEF MSWINDOWS}
-const
-  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
-var
-  BytesRead: DWORD;
-  ExpectedPath: UnicodeString;
-  FileInfo: TByHandleFileInformation;
-  FileSize: QWord;
-  Handle: THandle;
-  LastError: DWORD;
-  Offset: Integer;
-  ParentHandles: TWindowsHandleArray;
-begin
-  Result := nil;
-  ExpectedPath := WindowsFullPath(APath);
-  Handle := THandle(Windows.INVALID_HANDLE_VALUE);
-  OpenWindowsParentHandles(ExpectedPath, ParentHandles);
-  try
-    Handle := Windows.CreateFileW(PWideChar(ExpectedPath),
-      Windows.GENERIC_READ, Windows.FILE_SHARE_READ, nil,
-      Windows.OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
-    if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
-    begin
-      LastError := Windows.GetLastError;
-      if (LastError = Windows.ERROR_FILE_NOT_FOUND) or
-         (LastError = Windows.ERROR_PATH_NOT_FOUND) then
-        raise ETransportSecurityError.Create(
-          'Configured TLS PKCS#12 identity file does not exist');
-      raise ETransportSecurityError.Create(
-        'Failed to open configured TLS PKCS#12 identity without following reparse points');
-    end;
-    if not Windows.GetFileInformationByHandle(Handle, FileInfo) or
-       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT)
-       <> 0) or
-       ((FileInfo.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY)
-       <> 0) then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity must be a regular non-reparse file');
-    FileSize := (QWord(FileInfo.nFileSizeHigh) shl 32) or
-      FileInfo.nFileSizeLow;
-    if FileSize = 0 then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity file is empty');
-    if FileSize > MAX_PKCS12_IDENTITY_SIZE then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
-    SetLength(Result, Integer(FileSize));
-    try
-      Offset := 0;
-      while Offset < Length(Result) do
-      begin
-        if not Windows.ReadFile(Handle, Result[Offset],
-          Length(Result) - Offset, BytesRead, nil) or (BytesRead = 0) then
-          raise ETransportSecurityError.Create(
-            'Failed to read configured TLS PKCS#12 identity file');
-        Inc(Offset, BytesRead);
-      end;
-    except
-      FillChar(Result[0], Length(Result), 0);
-      Result := nil;
-      raise;
-    end;
-  finally
-    if Handle <> THandle(Windows.INVALID_HANDLE_VALUE) then
-      Windows.CloseHandle(Handle);
-    CloseWindowsHandles(ParentHandles);
-  end;
-end;
-{$ENDIF}
-
-procedure WipeBytes(var ABytes: TBytes);
-begin
-  if Length(ABytes) > 0 then
-    FillChar(ABytes[0], Length(ABytes), 0);
-  SetLength(ABytes, 0);
-end;
-
 procedure WipeUTF8String(var AValue: UTF8String);
 begin
   if Length(AValue) > 0 then
@@ -2686,6 +2714,16 @@ type
     cbBlockSize: LongWord;
   end;
 
+  TSecPkgContextConnectionInfo = record
+    dwProtocol: LongWord;
+    aiCipher: LongWord;
+    dwCipherStrength: LongWord;
+    aiHash: LongWord;
+    dwHashStrength: LongWord;
+    aiExch: LongWord;
+    dwExchStrength: LongWord;
+  end;
+
   PSchannelCred = ^TSchannelCred;
   TSchannelCred = record
     dwVersion: LongWord;
@@ -2703,6 +2741,59 @@ type
     dwFlags: LongWord;
     dwCredFormat: LongWord;
   end;
+
+  PTlsParameters = ^TTlsParameters;
+  TTlsParameters = record
+    cAlpnIds: LongWord;
+    rgstrAlpnIds: Pointer;
+    grbitDisabledProtocols: LongWord;
+    cDisabledCrypto: LongWord;
+    pDisabledCrypto: Pointer;
+    dwFlags: LongWord;
+  end;
+
+  PSchCredentials = ^TSchCredentials;
+  TSchCredentials = record
+    dwVersion: LongWord;
+    dwCredFormat: LongWord;
+    cCreds: LongWord;
+    paCred: Pointer;
+    hRootStore: Pointer;
+    cMappers: LongWord;
+    aphMappers: Pointer;
+    dwSessionLifespan: LongWord;
+    dwFlags: LongWord;
+    cTlsParameters: LongWord;
+    pTlsParameters: PTlsParameters;
+  end;
+
+  TRtlOsVersionInfoW = record
+    dwOSVersionInfoSize: LongWord;
+    dwMajorVersion: LongWord;
+    dwMinorVersion: LongWord;
+    dwBuildNumber: LongWord;
+    dwPlatformId: LongWord;
+    szCSDVersion: array[0..127] of WideChar;
+  end;
+
+{$IFDEF CPU64}
+  {$IF SizeOf(TSchCredentials) <> 72}
+    {$FATAL SCH_CREDENTIALS v5 layout mismatch on 64-bit Windows}
+  {$ENDIF}
+  {$IF SizeOf(TTlsParameters) <> 40}
+    {$FATAL TLS_PARAMETERS layout mismatch on 64-bit Windows}
+  {$ENDIF}
+{$ELSE}
+  {$IF SizeOf(TSchCredentials) <> 44}
+    {$FATAL SCH_CREDENTIALS v5 layout mismatch on 32-bit Windows}
+  {$ENDIF}
+  {$IF SizeOf(TTlsParameters) <> 24}
+    {$FATAL TLS_PARAMETERS layout mismatch on 32-bit Windows}
+  {$ENDIF}
+{$ENDIF}
+  {$IF SizeOf(TRtlOsVersionInfoW) <> 276}
+    {$FATAL RTL_OSVERSIONINFOW layout mismatch on Windows}
+  {$ENDIF}
 
   TSChannelData = class
   public
@@ -2726,6 +2817,7 @@ const
   SECBUFFER_STREAM_TRAILER = 6;
   SECBUFFER_STREAM_HEADER = 7;
   SECPKG_ATTR_STREAM_SIZES = 4;
+  SECPKG_ATTR_CONNECTION_INFO = $5A;
   SEC_E_OK = SECURITY_STATUS($00000000);
   SEC_I_CONTINUE_NEEDED = SECURITY_STATUS($00090312);
   SEC_I_CONTEXT_EXPIRED = SECURITY_STATUS($00090317);
@@ -2739,11 +2831,13 @@ const
   ISC_REQ_ALLOCATE_MEMORY = $00000100;
   ISC_REQ_STREAM = $00008000;
   SCHANNEL_CRED_VERSION = 4;
+  SCH_CREDENTIALS_VERSION = 5;
   SCH_USE_STRONG_CRYPTO = $00400000;
   SCHANNEL_SHUTDOWN = 1;
   SECURITY_NATIVE_DREP = $00000010;
   UNISP_NAME = 'Microsoft Unified Security Protocol Provider';
   SECBUFFER_ATTRMASK = $F0000000;
+  WINDOWS_10_1809_BUILD = 17763;
 
 function AcquireCredentialsHandleW(APrincipal: PWideChar; APackage: PWideChar;
   ACredentialUse: LongWord; ALogonId: Pointer; AAuthData: Pointer;
@@ -2774,6 +2868,20 @@ function DeleteSecurityContext(AContext: PCtxtHandle): SECURITY_STATUS; stdcall;
   external 'secur32.dll' name 'DeleteSecurityContext';
 function FreeCredentialsHandle(ACredential: PCredHandle): SECURITY_STATUS; stdcall;
   external 'secur32.dll' name 'FreeCredentialsHandle';
+function RtlGetVersion(var AVersion: TRtlOsVersionInfoW): LongInt; stdcall;
+  external 'ntdll.dll' name 'RtlGetVersion';
+
+function SChannelSupportsTlsParameters: Boolean;
+var
+  Version: TRtlOsVersionInfoW;
+begin
+  FillChar(Version, SizeOf(Version), 0);
+  Version.dwOSVersionInfoSize := SizeOf(Version);
+  Result := (RtlGetVersion(Version) = 0) and
+    ((Version.dwMajorVersion > 10) or
+     ((Version.dwMajorVersion = 10) and
+      (Version.dwBuildNumber >= WINDOWS_10_1809_BUILD)));
+end;
 
 function SecBufferKind(const ABufferType: LongWord): LongWord; inline;
 begin
@@ -3143,16 +3251,23 @@ begin
 
     SetLength(Data.DecryptedInput, 0);
     Data.DecryptedOffset := 0;
-    for I := 0 to High(Buffers) do
-      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
-        AppendBytes(Data.DecryptedInput, Buffers[I].pvBuffer,
-          Buffers[I].cbBuffer);
+    { Harvest from index 1. DecryptMessage relabels the descriptor in place
+      on success — [0] becomes SECBUFFER_STREAM_HEADER, [1] the plaintext —
+      but on SEC_I_CONTEXT_EXPIRED it returns without touching the buffers,
+      so [0] still carries the caller-supplied SECBUFFER_DATA label over the
+      whole ciphertext. Scanning from 0 therefore turns a peer close_notify
+      into a payload of raw ciphertext. }
+    if not ContextExpired then
+      for I := 1 to High(Buffers) do
+        if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
+          AppendBytes(Data.DecryptedInput, Buffers[I].pvBuffer,
+            Buffers[I].cbBuffer);
 
     { SECBUFFER_EXTRA belongs to Data.EncryptedInput. Some SChannel
       builds report only cbBuffer, so fall back to preserving the input
       tail before replacing the array that owns those bytes. }
     SetLength(ExtraInput, 0);
-    for I := 0 to High(Buffers) do
+    for I := 1 to High(Buffers) do
       if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
         AppendExtraBytes(ExtraInput, Data.EncryptedInput,
           Buffers[I].pvBuffer, Buffers[I].cbBuffer);
@@ -3227,6 +3342,1793 @@ begin
     Inc(Result, ChunkLength);
   end;
 end;
+
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{ Native SChannel server accept.
+
+  This backend is the Windows twin of the memory-BIO OpenSSL server backend
+  and reproduces its observable state machine exactly (ADR-0024): the same
+  tssDone/tssWantRead/tssWantWrite/tssError/tssPeerClosed transitions, the
+  same accepted-prefix input admission with high/low-watermark hysteresis,
+  the same exact pending/remaining output accounting against
+  OutputCapacity, the same retained-plaintext write retry, and the same
+  poison-on-fatal-error behaviour. Consumers (duetto's IOCP TLS transport)
+  drive one API across both platforms, so drift here is a defect.
+
+  Two mechanical differences are deliberate and invisible to callers:
+
+  - OpenSSL buffers unconsumed ciphertext inside its read BIO; SChannel has
+    no such buffer, so EncryptedInput plays that role. SECBUFFER_EXTRA
+    leftovers from AcceptSecurityContext and DecryptMessage are written back
+    into it, which is what keeps ConsumedBytes = AcceptedBytes - Buffered
+    identical to the BIO-pending accounting.
+  - OpenSSL writes records straight into a capacity-sized BIO and can leave a
+    record split across the capacity boundary. EncryptMessage produces whole
+    records and AcceptSecurityContext whole tokens, so whichever does not fit
+    is queued as a prefix and its tail is retained in RecordBuffer until
+    capacity frees up. Pending output is therefore still exactly
+    OutputCapacity when saturated, and a certificate flight larger than the
+    configured capacity drains incrementally instead of failing. }
+
+type
+  HCERTSTORE = Pointer;
+
+  PCryptDataBlob = ^TCryptDataBlob;
+  TCryptDataBlob = record
+    cbData: LongWord;
+    pbData: PByte;
+  end;
+
+  TCryptBitBlob = record
+    cbData: LongWord;
+    pbData: PByte;
+    cUnusedBits: LongWord;
+  end;
+
+  TCryptAlgorithmIdentifier = record
+    pszObjId: PAnsiChar;
+    Parameters: TCryptDataBlob;
+  end;
+
+  TCertPublicKeyInfo = record
+    Algorithm: TCryptAlgorithmIdentifier;
+    PublicKey: TCryptBitBlob;
+  end;
+
+  PCertExtension = ^TCertExtension;
+  TCertExtension = record
+    pszObjId: PAnsiChar;
+    fCritical: LongBool;
+    Value: TCryptDataBlob;
+  end;
+
+  PCertInfo = ^TCertInfo;
+  TCertInfo = record
+    dwVersion: LongWord;
+    SerialNumber: TCryptDataBlob;
+    SignatureAlgorithm: TCryptAlgorithmIdentifier;
+    Issuer: TCryptDataBlob;
+    NotBefore: TFileTime;
+    NotAfter: TFileTime;
+    Subject: TCryptDataBlob;
+    SubjectPublicKeyInfo: TCertPublicKeyInfo;
+    IssuerUniqueId: TCryptBitBlob;
+    SubjectUniqueId: TCryptBitBlob;
+    cExtension: LongWord;
+    rgExtension: PCertExtension;
+  end;
+
+  PCertContext = ^TCertContext;
+  TCertContext = record
+    dwCertEncodingType: LongWord;
+    pbCertEncoded: PByte;
+    cbCertEncoded: LongWord;
+    pCertInfo: PCertInfo;
+    hCertStore: HCERTSTORE;
+  end;
+
+  PPAnsiCharLWPT = ^PAnsiChar;
+
+  PCertEnhancedKeyUsage = ^TCertEnhancedKeyUsage;
+  TCertEnhancedKeyUsage = record
+    cUsageIdentifier: LongWord;
+    rgpszUsageIdentifier: PPAnsiCharLWPT;
+  end;
+
+  TCertBasicConstraints2Info = record
+    fCA: LongBool;
+    fPathLenConstraint: LongBool;
+    dwPathLenConstraint: LongWord;
+  end;
+
+  PCryptKeyProviderInfo = ^TCryptKeyProviderInfo;
+  TCryptKeyProviderInfo = record
+    pwszContainerName: PWideChar;
+    pwszProvName: PWideChar;
+    dwProvType: LongWord;
+    dwFlags: LongWord;
+    cProvParam: LongWord;
+    rgProvParam: Pointer;
+    dwKeySpec: LongWord;
+  end;
+
+  PPCertContext = ^PCertContext;
+  TCertContextArray = array of PCertContext;
+
+  TSChannelServerCredentialData = class
+  public
+    Certificate: PCertContext;
+    Credential: TSecHandle;
+    HasCredential: Boolean;
+    HasPrivateKey: Boolean;
+    IssuerStore: HCERTSTORE;
+    KeyContainerName: UnicodeString;
+    PrivateKey: PtrUInt;
+    PublishedIssuers: TCertContextArray;
+    References: LongInt;
+    Store: HCERTSTORE;
+    constructor Create;
+    procedure Retain;
+    procedure Release;
+  end;
+
+  TSChannelServerData = class
+  public
+    Context: TSecHandle;
+    EncryptedInput: TBytes;
+    HandshakeDone: Boolean;
+    HasContext: Boolean;
+    InputAccepted: QWord;
+    InputBackpressured: Boolean;
+    InputBuffered: Integer;
+    InputConsumed: QWord;
+    InputHighWatermark: Integer;
+    InputLowWatermark: Integer;
+    Output: TBytes;
+    OutputCapacity: Integer;
+    OutputOffset: Integer;
+    PeerClosed: Boolean;
+    PostHandshakeInProgress: Boolean;
+    PendingPlaintext: TBytes;
+    PendingPlaintextOffset: Integer;
+    Plaintext: TBytes;
+    PlaintextOffset: Integer;
+    RecordBuffer: TBytes;
+    RecordOffset: Integer;
+    Protocol: LongWord;
+    ShutdownStarted: Boolean;
+    Snapshot: TSChannelServerCredentialData;
+    StreamSizes: TSecPkgContextStreamSizes;
+  end;
+
+const
+  SECPKG_CRED_INBOUND = 1;
+  ASC_REQ_REPLAY_DETECT = $00000004;
+  ASC_REQ_SEQUENCE_DETECT = $00000008;
+  ASC_REQ_CONFIDENTIALITY = $00000010;
+  ASC_REQ_ALLOCATE_MEMORY = $00000100;
+  ASC_REQ_EXTENDED_ERROR = $00008000;
+  ASC_REQ_STREAM = $00010000;
+  SP_PROT_SSL2_SERVER = $00000004;
+  SP_PROT_SSL3_SERVER = $00000010;
+  SP_PROT_TLS1_0_SERVER = $00000040;
+  SP_PROT_TLS1_1_SERVER = $00000100;
+  SP_PROT_TLS1_2_SERVER = $00000400;
+  SP_PROT_TLS1_3_SERVER = $00001000;
+  SCH_CRED_NO_SYSTEM_MAPPER = $00000002;
+  X509_ASN_ENCODING = $00000001;
+  PKCS_7_ASN_ENCODING = $00010000;
+  CERT_ENCODING_TYPES = X509_ASN_ENCODING or PKCS_7_ASN_ENCODING;
+  CERT_FIND_HAS_PRIVATE_KEY = $00150000;
+  CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG = $00000002;
+  X509_BASIC_CONSTRAINTS2 = 15;
+  PKCS12_ALWAYS_CNG_KSP = $00000200;
+  CRYPT_USER_KEYSET = $00001000;
+  CRYPT_ACQUIRE_SILENT_FLAG = $00000040;
+  CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG = $00040000;
+  CERT_NCRYPT_KEY_SPEC = LongWord($FFFFFFFF);
+  CERT_KEY_PROV_INFO_PROP_ID = 2;
+  NCRYPT_SILENT_FLAG = $00000040;
+  CERT_STORE_ADD_ALWAYS = 4;
+  INTERMEDIATE_AUTHORITY_STORE = 'CA';
+  CERT_KEY_CERT_SIGN_KEY_USAGE = $04;
+  { X509_PURPOSE_SSL_SERVER rejects a leaf whose key usage asserts none of
+    digitalSignature, keyEncipherment, or keyAgreement. }
+  SERVER_PURPOSE_KEY_USAGE = $80 or $20 or $08;
+  OID_BASIC_CONSTRAINTS2 = '2.5.29.19';
+  OID_SERVER_AUTHENTICATION = '1.3.6.1.5.5.7.3.1';
+  OID_ANY_ENHANCED_KEY_USAGE = '2.5.29.37.0';
+  SCHANNEL_SERVER_IDENTITY_PARSE_ERROR =
+    'Failed to parse configured TLS PKCS#12 identity; verify the bundle and passphrase';
+
+function AcceptSecurityContext(ACredential: PCredHandle;
+  AContext: PCtxtHandle; AInput: PSecBufferDesc;
+  AContextRequirements: LongWord; ATargetDataRepresentation: LongWord;
+  ANewContext: PCtxtHandle; AOutput: PSecBufferDesc;
+  AContextAttributes: PLongWord;
+  AExpiry: PSecurityInteger): SECURITY_STATUS; stdcall;
+  external 'secur32.dll' name 'AcceptSecurityContext';
+function PFXImportCertStore(APkcs12: PCryptDataBlob; APassword: PWideChar;
+  AFlags: LongWord): HCERTSTORE; stdcall;
+  external 'crypt32.dll' name 'PFXImportCertStore';
+function CertCloseStore(AStore: HCERTSTORE;
+  AFlags: LongWord): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertCloseStore';
+function CertFindCertificateInStore(AStore: HCERTSTORE;
+  AEncodingType, AFindFlags, AFindType: LongWord; AFindParameter: Pointer;
+  APreviousContext: PCertContext): PCertContext; stdcall;
+  external 'crypt32.dll' name 'CertFindCertificateInStore';
+function CertEnumCertificatesInStore(AStore: HCERTSTORE;
+  APreviousContext: PCertContext): PCertContext; stdcall;
+  external 'crypt32.dll' name 'CertEnumCertificatesInStore';
+function CertDuplicateCertificateContext(
+  ACertificate: PCertContext): PCertContext; stdcall;
+  external 'crypt32.dll' name 'CertDuplicateCertificateContext';
+function CertFreeCertificateContext(
+  ACertificate: PCertContext): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertFreeCertificateContext';
+function CertCompareCertificateName(AEncodingType: LongWord;
+  AFirstName, ASecondName: PCryptDataBlob): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertCompareCertificateName';
+function CertFindExtension(AObjectIdentifier: PAnsiChar;
+  AExtensionCount: LongWord;
+  AExtensions: PCertExtension): PCertExtension; stdcall;
+  external 'crypt32.dll' name 'CertFindExtension';
+function CertGetIntendedKeyUsage(AEncodingType: LongWord;
+  ACertificateInfo: PCertInfo; AKeyUsage: Pointer;
+  AKeyUsageLength: LongWord): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertGetIntendedKeyUsage';
+function CertGetEnhancedKeyUsage(ACertificate: PCertContext;
+  AFlags: LongWord; AUsage: Pointer;
+  var AUsageLength: LongWord): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertGetEnhancedKeyUsage';
+function CertVerifyTimeValidity(ATime: Pointer;
+  ACertificateInfo: PCertInfo): LongInt; stdcall;
+  external 'crypt32.dll' name 'CertVerifyTimeValidity';
+function CryptDecodeObjectEx(AEncodingType: LongWord;
+  AStructureType: PAnsiChar; AEncoded: PByte; AEncodedLength: LongWord;
+  AFlags: LongWord; ADecodeParameters: Pointer; AStructureInfo: Pointer;
+  var AStructureInfoLength: LongWord): LongBool; stdcall;
+  external 'crypt32.dll' name 'CryptDecodeObjectEx';
+function CryptVerifyCertificateSignatureEx(ACryptProvider: PtrUInt;
+  AEncodingType, ASubjectType: LongWord; ASubject: Pointer;
+  AIssuerType: LongWord; AIssuer: Pointer; AFlags: LongWord;
+  AExtra: Pointer): LongBool; stdcall;
+  external 'crypt32.dll' name 'CryptVerifyCertificateSignatureEx';
+function CryptAcquireCertificatePrivateKey(ACertificate: PCertContext;
+  AFlags: LongWord; AParameters: Pointer; out AKey: PtrUInt;
+  out AKeySpec: LongWord; out ACallerFree: LongBool): LongBool; stdcall;
+  external 'crypt32.dll' name 'CryptAcquireCertificatePrivateKey';
+function CertGetCertificateContextProperty(ACertificate: PCertContext;
+  APropertyIdentifier: LongWord; AData: Pointer;
+  var ADataLength: LongWord): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertGetCertificateContextProperty';
+function NCryptDeleteKey(AKey: PtrUInt; AFlags: LongWord): LongInt; stdcall;
+  external 'ncrypt.dll' name 'NCryptDeleteKey';
+function NCryptFreeObject(AObject: PtrUInt): LongInt; stdcall;
+  external 'ncrypt.dll' name 'NCryptFreeObject';
+function CertOpenSystemStoreW(ACryptProvider: PtrUInt;
+  ASubsystemProtocol: PWideChar): HCERTSTORE; stdcall;
+  external 'crypt32.dll' name 'CertOpenSystemStoreW';
+function CertAddCertificateContextToStore(AStore: HCERTSTORE;
+  ACertificate: PCertContext; ADisposition: LongWord;
+  AStoreContext: PPCertContext): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertAddCertificateContextToStore';
+function CertDeleteCertificateFromStore(
+  ACertificate: PCertContext): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertDeleteCertificateFromStore';
+
+constructor TSChannelServerCredentialData.Create;
+begin
+  inherited Create;
+  FillChar(Credential, SizeOf(Credential), 0);
+  Certificate := nil;
+  HasCredential := False;
+  HasPrivateKey := False;
+  IssuerStore := nil;
+  KeyContainerName := '';
+  PrivateKey := 0;
+  SetLength(PublishedIssuers, 0);
+  References := 1;
+  Store := nil;
+end;
+
+procedure TSChannelServerCredentialData.Retain;
+begin
+  InterlockedIncrement(References);
+end;
+
+procedure TSChannelServerCredentialData.Release;
+var
+  I: Integer;
+begin
+  if InterlockedDecrement(References) <> 0 then
+    Exit;
+  if HasCredential then
+  begin
+    FreeCredentialsHandle(@Credential);
+    HasCredential := False;
+  end;
+  { The imported private key is persisted, so the snapshot owns a container
+    that must not outlive it. Deletion happens only here, at the last
+    reference, which is what lets a reloaded-away snapshot keep serving live
+    connections until they finish. NCryptDeleteKey both removes the container
+    and frees the handle; NCryptFreeObject is the fallback so a failed delete
+    still releases the handle. }
+  if HasPrivateKey then
+  begin
+    if NCryptDeleteKey(PrivateKey, NCRYPT_SILENT_FLAG) <> 0 then
+      NCryptFreeObject(PrivateKey);
+    PrivateKey := 0;
+    HasPrivateKey := False;
+  end;
+  KeyContainerName := '';
+  { Withdraw the issuers this snapshot published. CertDeleteCertificateFromStore
+    frees the context as well, on success and on failure alike. }
+  for I := High(PublishedIssuers) downto 0 do
+    if Assigned(PublishedIssuers[I]) then
+      CertDeleteCertificateFromStore(PublishedIssuers[I]);
+  SetLength(PublishedIssuers, 0);
+  if Assigned(IssuerStore) then
+  begin
+    CertCloseStore(IssuerStore, 0);
+    IssuerStore := nil;
+  end;
+  if Assigned(Certificate) then
+  begin
+    CertFreeCertificateContext(Certificate);
+    Certificate := nil;
+  end;
+  { Closed without CERT_CLOSE_STORE_FORCE_FLAG: SChannel holds its own
+    reference to the leaf context, and the store is what supplies the
+    bundled intermediates it sends during the handshake. }
+  if Assigned(Store) then
+  begin
+    CertCloseStore(Store, 0);
+    Store := nil;
+  end;
+  Free;
+end;
+
+function SChannelObjectIdentifierMatches(const AIdentifier: PAnsiChar;
+  const AExpected: AnsiString): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if not Assigned(AIdentifier) then
+    Exit;
+  for I := 1 to Length(AExpected) do
+    if AIdentifier[I - 1] <> AExpected[I] then
+      Exit;
+  Result := AIdentifier[Length(AExpected)] = #0;
+end;
+
+function SChannelSameCertificate(const AFirst,
+  ASecond: PCertContext): Boolean;
+begin
+  Result := Assigned(AFirst) and Assigned(ASecond) and
+    (AFirst^.cbCertEncoded = ASecond^.cbCertEncoded) and
+    ((AFirst^.cbCertEncoded = 0) or
+    (CompareByte(AFirst^.pbCertEncoded^, ASecond^.pbCertEncoded^,
+    AFirst^.cbCertEncoded) = 0));
+end;
+
+function SChannelCertificateIsSelfIssued(
+  const ACertificate: PCertContext): Boolean;
+begin
+  Result := CertCompareCertificateName(X509_ASN_ENCODING,
+    @ACertificate^.pCertInfo^.Issuer, @ACertificate^.pCertInfo^.Subject);
+end;
+
+function SChannelCertificateWasSignedBy(const ACertificate,
+  AIssuer: PCertContext): Boolean;
+const
+  CRYPT_VERIFY_CERT_SIGN_SUBJECT_CERT = 2;
+  CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT = 2;
+begin
+  Result := CryptVerifyCertificateSignatureEx(0, X509_ASN_ENCODING,
+    CRYPT_VERIFY_CERT_SIGN_SUBJECT_CERT, ACertificate,
+    CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT, AIssuer, 0, nil);
+end;
+
+function SChannelCertificateIssuedBySubjectOf(const ACertificate,
+  ACandidateIssuer: PCertContext): Boolean;
+begin
+  Result := CertCompareCertificateName(X509_ASN_ENCODING,
+    @ACertificate^.pCertInfo^.Issuer,
+    @ACandidateIssuer^.pCertInfo^.Subject);
+end;
+
+procedure ValidateSChannelCertificateTime(const ACertificate: PCertContext;
+  const ADescription: string);
+begin
+  if CertVerifyTimeValidity(nil, ACertificate^.pCertInfo) <> 0 then
+    raise ETransportSecurityError.CreateFmt(
+      'Configured TLS PKCS#12 %s is outside its validity window',
+      [ADescription]);
+end;
+
+function SChannelBasicConstraints(const ACertificate: PCertContext;
+  out ACertificateAuthority: Boolean; out APathLength: LongInt): Boolean;
+var
+  Constraints: TCertBasicConstraints2Info;
+  ConstraintsLength: LongWord;
+  Extension: PCertExtension;
+begin
+  ACertificateAuthority := False;
+  APathLength := -1;
+  Extension := CertFindExtension(PAnsiChar(OID_BASIC_CONSTRAINTS2),
+    ACertificate^.pCertInfo^.cExtension, ACertificate^.pCertInfo^.rgExtension);
+  Result := Assigned(Extension);
+  if not Result then
+    Exit;
+  FillChar(Constraints, SizeOf(Constraints), 0);
+  ConstraintsLength := SizeOf(Constraints);
+  if not CryptDecodeObjectEx(X509_ASN_ENCODING,
+    PAnsiChar(PtrUInt(X509_BASIC_CONSTRAINTS2)), Extension^.Value.pbData,
+    Extension^.Value.cbData, 0, nil, @Constraints, ConstraintsLength) then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity has unreadable basic constraints');
+  ACertificateAuthority := Constraints.fCA;
+  if ACertificateAuthority and Constraints.fPathLenConstraint then
+    APathLength := LongInt(Constraints.dwPathLenConstraint);
+end;
+
+function SChannelIntendedKeyUsage(const ACertificate: PCertContext;
+  out AKeyUsage: Byte): Boolean;
+var
+  Bits: array[0..1] of Byte;
+begin
+  Bits[0] := 0;
+  Bits[1] := 0;
+  Result := CertGetIntendedKeyUsage(X509_ASN_ENCODING,
+    ACertificate^.pCertInfo, @Bits[0], SizeOf(Bits));
+  AKeyUsage := Bits[0];
+end;
+
+function SChannelHasServerAuthentication(const ACertificate: PCertContext;
+  out AExtensionPresent: Boolean): Boolean;
+var
+  Buffer: TBytes;
+  Identifier: PAnsiChar;
+  I: Integer;
+  Usage: PCertEnhancedKeyUsage;
+  UsageLength: LongWord;
+begin
+  Result := False;
+  AExtensionPresent := False;
+  UsageLength := 0;
+  if not CertGetEnhancedKeyUsage(ACertificate,
+    CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG, nil, UsageLength) then
+    Exit;
+  if UsageLength < LongWord(SizeOf(TCertEnhancedKeyUsage)) then
+    Exit;
+  SetLength(Buffer, UsageLength);
+  if not CertGetEnhancedKeyUsage(ACertificate,
+    CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG, @Buffer[0], UsageLength) then
+    Exit;
+  AExtensionPresent := True;
+  Usage := PCertEnhancedKeyUsage(@Buffer[0]);
+  if not Assigned(Usage^.rgpszUsageIdentifier) then
+    Exit;
+  for I := 0 to Integer(Usage^.cUsageIdentifier) - 1 do
+  begin
+    Identifier := PPAnsiCharLWPT(PtrUInt(Usage^.rgpszUsageIdentifier) +
+      PtrUInt(I) * PtrUInt(SizeOf(PAnsiChar)))^;
+    if SChannelObjectIdentifierMatches(Identifier,
+       OID_SERVER_AUTHENTICATION) or
+       SChannelObjectIdentifierMatches(Identifier,
+       OID_ANY_ENHANCED_KEY_USAGE) then
+      Exit(True);
+  end;
+end;
+
+procedure ValidateSChannelCertificateConstraints(
+  const ACertificate: PCertContext; const ADescription: string;
+  const ACertificateAuthority: Boolean);
+var
+  IsCertificateAuthority: Boolean;
+  KeyUsage: Byte;
+  PathLength: LongInt;
+  Present: Boolean;
+begin
+  Present := SChannelBasicConstraints(ACertificate, IsCertificateAuthority,
+    PathLength);
+  if ACertificateAuthority and not Present then
+    raise ETransportSecurityError.CreateFmt(
+      'Configured TLS PKCS#12 %s must include basic constraints',
+      [ADescription]);
+  if ACertificateAuthority <> (Present and IsCertificateAuthority) then
+    if ACertificateAuthority then
+      raise ETransportSecurityError.CreateFmt(
+        'Configured TLS PKCS#12 %s must assert CA:TRUE basic constraints',
+        [ADescription])
+    else
+      raise ETransportSecurityError.CreateFmt(
+        'Configured TLS PKCS#12 %s must assert CA:FALSE basic constraints',
+        [ADescription]);
+  if ACertificateAuthority and
+     SChannelIntendedKeyUsage(ACertificate, KeyUsage) and
+     ((KeyUsage and CERT_KEY_CERT_SIGN_KEY_USAGE) = 0) then
+    raise ETransportSecurityError.CreateFmt(
+      'Configured TLS PKCS#12 %s key usage must permit certificate signing',
+      [ADescription]);
+end;
+
+function SChannelCertificatePathLength(
+  const ACertificate: PCertContext): LongInt;
+var
+  IsCertificateAuthority: Boolean;
+begin
+  if not SChannelBasicConstraints(ACertificate, IsCertificateAuthority,
+    Result) then
+    Result := -1;
+end;
+
+{ Strict identity policy, ported rule for rule from the OpenSSL backend's
+  ValidateOpenSSLServerIdentity so both platforms reject the same bundles
+  with the same messages. One documented gap: OpenSSL additionally refuses a
+  certificate carrying an unhandled critical extension (EXFLAG_CRITICAL) or
+  an invalid policy encoding (EXFLAG_INVALID_POLICY); crypt32 exposes no
+  equivalent aggregate flag, so those two sub-cases are not reproduced.
+  Everything the tests and ADR-0024 pin — validity windows, self-signed
+  refusal, basic constraints, issuer key usage, serverAuth purpose,
+  chain coherence, path length, and cycles — is enforced identically. }
+procedure ValidateSChannelServerIdentity(const AStore: HCERTSTORE;
+  const ACertificate: PCertContext);
+var
+  Candidate: PCertContext;
+  CandidateIndex: Integer;
+  Chain: array of PCertContext;
+  ChainCount: Integer;
+  CurrentCertificate: PCertContext;
+  Enumerated: PCertContext;
+  ExtendedKeyUsagePresent: Boolean;
+  FoundIndex: Integer;
+  I: Integer;
+  KeyUsage: Byte;
+  NonSelfIssuedCertificateAuthorities: Integer;
+  PathLength: LongInt;
+  Used: array of Boolean;
+  UsedCount: Integer;
+begin
+  ValidateSChannelCertificateTime(ACertificate, 'leaf certificate');
+  if SChannelCertificateIsSelfIssued(ACertificate) then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 self-signed identities require permissive validation');
+  ValidateSChannelCertificateConstraints(ACertificate, 'leaf certificate',
+    False);
+
+  if not SChannelHasServerAuthentication(ACertificate,
+    ExtendedKeyUsagePresent) then
+  begin
+    if not ExtendedKeyUsagePresent then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 leaf certificate must include serverAuth extended key usage');
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 leaf certificate is not valid for server authentication');
+  end;
+  if SChannelIntendedKeyUsage(ACertificate, KeyUsage) and
+     ((KeyUsage and SERVER_PURPOSE_KEY_USAGE) = 0) then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 leaf certificate has an incompatible server purpose');
+
+  SetLength(Chain, 0);
+  Enumerated := nil;
+  try
+    Enumerated := CertEnumCertificatesInStore(AStore, nil);
+    while Assigned(Enumerated) do
+    begin
+      if not SChannelSameCertificate(Enumerated, ACertificate) then
+      begin
+        { Grow first so the duplicate always has an owner: a failure between
+          duplicating and storing would otherwise leak the context. }
+        SetLength(Chain, Length(Chain) + 1);
+        Chain[High(Chain)] := nil;
+        Candidate := CertDuplicateCertificateContext(Enumerated);
+        if not Assigned(Candidate) then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 certificate chain contains an empty entry');
+        Chain[High(Chain)] := Candidate;
+      end;
+      Enumerated := CertEnumCertificatesInStore(AStore, Enumerated);
+    end;
+
+    ChainCount := Length(Chain);
+    SetLength(Used, ChainCount);
+    for I := 0 to ChainCount - 1 do
+    begin
+      ValidateSChannelCertificateTime(Chain[I],
+        Format('chain certificate %d', [I + 1]));
+      ValidateSChannelCertificateConstraints(Chain[I],
+        Format('chain certificate %d', [I + 1]), True);
+    end;
+
+    CurrentCertificate := ACertificate;
+    NonSelfIssuedCertificateAuthorities := 0;
+    UsedCount := 0;
+    while UsedCount < ChainCount do
+    begin
+      FoundIndex := -1;
+      for CandidateIndex := 0 to ChainCount - 1 do
+        if not Used[CandidateIndex] then
+        begin
+          Candidate := Chain[CandidateIndex];
+          if SChannelCertificateIssuedBySubjectOf(CurrentCertificate,
+             Candidate) and
+             SChannelCertificateWasSignedBy(CurrentCertificate, Candidate) then
+          begin
+            if FoundIndex >= 0 then
+              raise ETransportSecurityError.Create(
+                'Configured TLS PKCS#12 certificate chain has ambiguous issuers');
+            FoundIndex := CandidateIndex;
+          end;
+        end;
+      if FoundIndex < 0 then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 certificate chain is structurally or cryptographically incoherent');
+      Candidate := Chain[FoundIndex];
+      PathLength := SChannelCertificatePathLength(Candidate);
+      if (PathLength >= 0) and
+         (NonSelfIssuedCertificateAuthorities > PathLength) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 certificate chain exceeds an issuer path-length constraint');
+      Used[FoundIndex] := True;
+      Inc(UsedCount);
+      CurrentCertificate := Candidate;
+      if not SChannelCertificateIsSelfIssued(CurrentCertificate) then
+        Inc(NonSelfIssuedCertificateAuthorities);
+    end;
+
+    if SChannelCertificateIsSelfIssued(CurrentCertificate) then
+    begin
+      if not SChannelCertificateWasSignedBy(CurrentCertificate,
+        CurrentCertificate) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 certificate chain has an invalid root signature');
+    end
+    else
+    begin
+      if SChannelCertificateIssuedBySubjectOf(CurrentCertificate,
+         ACertificate) and
+         SChannelCertificateWasSignedBy(CurrentCertificate, ACertificate) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 certificate chain contains a certificate cycle');
+      for I := 0 to ChainCount - 1 do
+      begin
+        Candidate := Chain[I];
+        if Candidate = CurrentCertificate then
+          Continue;
+        if SChannelCertificateIssuedBySubjectOf(CurrentCertificate,
+           Candidate) and
+           SChannelCertificateWasSignedBy(CurrentCertificate, Candidate) then
+          raise ETransportSecurityError.Create(
+            'Configured TLS PKCS#12 certificate chain contains a certificate cycle');
+      end;
+    end;
+  finally
+    if Assigned(Enumerated) then
+      CertFreeCertificateContext(Enumerated);
+    for I := 0 to High(Chain) do
+      if Assigned(Chain[I]) then
+        CertFreeCertificateContext(Chain[I]);
+    SetLength(Chain, 0);
+  end;
+end;
+
+{ The container name the key-storage provider assigned to this import. Read
+  back rather than chosen: PFXImportCertStore names the CNG key itself, and
+  the name is the identity of the persisted container this snapshot owns and
+  will delete. Empty when the property is unreadable. }
+function SChannelServerKeyContainerName(
+  const ACertificate: PCertContext): UnicodeString;
+var
+  Buffer: TBytes;
+  BufferLength: LongWord;
+  ProviderInfo: PCryptKeyProviderInfo;
+begin
+  Result := '';
+  BufferLength := 0;
+  if not CertGetCertificateContextProperty(ACertificate,
+    CERT_KEY_PROV_INFO_PROP_ID, nil, BufferLength) then
+    Exit;
+  if BufferLength < LongWord(SizeOf(TCryptKeyProviderInfo)) then
+    Exit;
+  SetLength(Buffer, BufferLength);
+  if not CertGetCertificateContextProperty(ACertificate,
+    CERT_KEY_PROV_INFO_PROP_ID, @Buffer[0], BufferLength) then
+    Exit;
+  ProviderInfo := PCryptKeyProviderInfo(@Buffer[0]);
+  if Assigned(ProviderInfo^.pwszContainerName) then
+    Result := UnicodeString(WideString(ProviderInfo^.pwszContainerName));
+end;
+
+{ Make the bundled issuers discoverable to the operating system's chain
+  builder.
+
+  SChannel assembles the outgoing Certificate flight itself, and it builds that
+  chain from the Windows certificate stores rather than from the caller's
+  in-memory store — the handshake runs outside the calling process, so a store
+  that only exists in this process is invisible to it. A PKCS#12 bundle
+  carrying an intermediate therefore yields a leaf-only flight unless the
+  intermediate is published where the OS looks. .NET hits the same wall and
+  solves it the same way: SslStreamCertificateContext adds the caller's
+  intermediates to the Intermediate Certification Authorities store.
+
+  Two deliberate differences from .NET: the current user's store is used rather
+  than the machine's, so no administrative rights are needed and nothing is
+  published machine-wide; and every context added here is recorded and removed
+  again when the snapshot is released, where .NET leaves them behind. Only
+  certificates this snapshot actually added are recorded, so an issuer the user
+  had already installed is never withdrawn. Publication is best effort: a store
+  that cannot be opened or written degrades to a leaf-only flight, which is
+  exactly the behaviour before this existed, rather than failing the identity. }
+procedure PublishSChannelServerIssuers(
+  const ASnapshot: TSChannelServerCredentialData);
+var
+  Enumerated: PCertContext;
+  PublishedCount: Integer;
+begin
+  ASnapshot.IssuerStore := CertOpenSystemStoreW(0,
+    PWideChar(UnicodeString(INTERMEDIATE_AUTHORITY_STORE)));
+  if not Assigned(ASnapshot.IssuerStore) then
+    Exit;
+  Enumerated := CertEnumCertificatesInStore(ASnapshot.Store, nil);
+  try
+    while Assigned(Enumerated) do
+    begin
+      if not SChannelSameCertificate(Enumerated, ASnapshot.Certificate) then
+      begin
+        { Grow before mutating the persistent store so every successfully
+          added entry immediately has an owner, even if a later allocation
+          fails. ADD_ALWAYS gives each concurrently live snapshot its own
+          exact entry; deleting an older snapshot's returned context can then
+          never withdraw the issuer from a newer one or from the user. }
+        PublishedCount := Length(ASnapshot.PublishedIssuers);
+        SetLength(ASnapshot.PublishedIssuers,
+          PublishedCount + 1);
+        ASnapshot.PublishedIssuers[PublishedCount] := nil;
+        if not CertAddCertificateContextToStore(ASnapshot.IssuerStore,
+          Enumerated, CERT_STORE_ADD_ALWAYS,
+          @ASnapshot.PublishedIssuers[PublishedCount]) or
+          not Assigned(ASnapshot.PublishedIssuers[PublishedCount]) then
+          SetLength(ASnapshot.PublishedIssuers, PublishedCount);
+      end;
+      Enumerated := CertEnumCertificatesInStore(ASnapshot.Store, Enumerated);
+    end;
+  finally
+    if Assigned(Enumerated) then
+      CertFreeCertificateContext(Enumerated);
+  end;
+end;
+
+function CreateSChannelServerSnapshot(const APkcs12Identity: TBytes;
+  const APkcs12Passphrase: UnicodeString;
+  const AValidation: TTransportSecurityServerIdentityValidation):
+  TSChannelServerCredentialData;
+var
+  AuthenticationData: Pointer;
+  CallerOwnsKey: LongBool;
+  Expiry: SECURITY_INTEGER;
+  Identity: TBytes;
+  IdentityBlob: TCryptDataBlob;
+  KeyHandle: PtrUInt;
+  KeySpecification: LongWord;
+  LegacyCredentials: TSchannelCred;
+  ModernCredentials: TSchCredentials;
+  Passphrase: array of WideChar;
+  Snapshot: TSChannelServerCredentialData;
+  Status: SECURITY_STATUS;
+  TlsParameters: TTlsParameters;
+begin
+  Result := nil;
+  if Length(APkcs12Identity) = 0 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity is empty');
+  if Length(APkcs12Identity) > MAX_PKCS12_IDENTITY_SIZE then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
+  if Pos(#0, APkcs12Passphrase) > 0 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 passphrase contains an embedded NUL');
+
+  SetLength(Identity, Length(APkcs12Identity));
+  Move(APkcs12Identity[0], Identity[0], Length(Identity));
+  SetLength(Passphrase, Length(APkcs12Passphrase) + 1);
+  Snapshot := nil;
+  try
+    if Length(APkcs12Passphrase) > 0 then
+      Move(APkcs12Passphrase[1], Passphrase[0],
+        Length(APkcs12Passphrase) * SizeOf(WideChar));
+    Passphrase[High(Passphrase)] := WideChar(0);
+
+    Snapshot := TSChannelServerCredentialData.Create;
+    IdentityBlob.cbData := Length(Identity);
+    IdentityBlob.pbData := @Identity[0];
+    { The key must be persisted in a key-storage provider. SChannel performs
+      server key operations in lsass, which cannot reach an in-process
+      ephemeral key: importing with PKCS12_NO_PERSIST_KEY makes
+      AcquireCredentialsHandle fail with SEC_E_NO_CREDENTIALS. The snapshot
+      therefore owns a persisted CNG container and deletes it in Release.
+
+      PKCS12_ALLOW_OVERWRITE_KEY is deliberately NOT passed. PFXImportCertStore
+      names CNG keys itself, so ordinary bundles get a fresh container per
+      import and concurrent snapshots of the same identity stay independent
+      (pinned by the isolated-key-container test). Should a bundle ever carry a
+      container name that already exists, omitting the flag makes the import
+      fail loudly instead of silently overwriting a key another live snapshot
+      is still serving with. }
+    Snapshot.Store := PFXImportCertStore(@IdentityBlob, @Passphrase[0],
+      PKCS12_ALWAYS_CNG_KSP or CRYPT_USER_KEYSET);
+    if not Assigned(Snapshot.Store) then
+      raise ETransportSecurityError.Create(
+        SCHANNEL_SERVER_IDENTITY_PARSE_ERROR);
+    Snapshot.Certificate := CertFindCertificateInStore(Snapshot.Store,
+      CERT_ENCODING_TYPES, 0, CERT_FIND_HAS_PRIVATE_KEY, nil, nil);
+    if not Assigned(Snapshot.Certificate) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must contain a certificate and private key');
+
+    { Claim the key handle before anything can fail: from here on every exit —
+      including strict-validation rejection and credential-acquisition failure
+      — runs Release, which deletes the container. }
+    KeyHandle := 0;
+    KeySpecification := 0;
+    CallerOwnsKey := False;
+    if not CryptAcquireCertificatePrivateKey(Snapshot.Certificate,
+      CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG or CRYPT_ACQUIRE_SILENT_FLAG, nil,
+      KeyHandle, KeySpecification, CallerOwnsKey) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must contain a certificate and private key');
+    { Record before rejecting: an owned handle must reach Release even on the
+      rejection path, or its container would outlive the failed snapshot. A
+      handle we do not own is not ours to free, so there is nothing to record. }
+    if CallerOwnsKey then
+    begin
+      Snapshot.PrivateKey := KeyHandle;
+      Snapshot.HasPrivateKey := True;
+    end;
+    if not Snapshot.HasPrivateKey or
+       (KeySpecification <> CERT_NCRYPT_KEY_SPEC) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity did not import into an owned CNG key');
+    Snapshot.KeyContainerName :=
+      SChannelServerKeyContainerName(Snapshot.Certificate);
+
+    if AValidation = tsivStrict then
+      ValidateSChannelServerIdentity(Snapshot.Store, Snapshot.Certificate);
+
+    PublishSChannelServerIssuers(Snapshot);
+
+    AuthenticationData := nil;
+    FillChar(LegacyCredentials, SizeOf(LegacyCredentials), 0);
+    FillChar(ModernCredentials, SizeOf(ModernCredentials), 0);
+    FillChar(TlsParameters, SizeOf(TlsParameters), 0);
+    if SChannelSupportsTlsParameters then
+    begin
+      { SCH_CREDENTIALS v5 leaves the protocol ceiling to the operating
+        system. Disable every protocol below TLS 1.2 explicitly so Windows 11
+        and Server 2022 can negotiate TLS 1.3 without weakening the public
+        floor. TLS_PARAMETERS first shipped in Windows 10 version 1809; the
+        manifest-independent RtlGetVersion gate above prevents passing this
+        structure to older supported hosts. }
+      TlsParameters.grbitDisabledProtocols := SP_PROT_SSL2_SERVER or
+        SP_PROT_SSL3_SERVER or SP_PROT_TLS1_0_SERVER or
+        SP_PROT_TLS1_1_SERVER;
+      ModernCredentials.dwVersion := SCH_CREDENTIALS_VERSION;
+      ModernCredentials.cCreds := 1;
+      ModernCredentials.paCred := @Snapshot.Certificate;
+      ModernCredentials.dwFlags := SCH_USE_STRONG_CRYPTO or
+        SCH_CRED_NO_SYSTEM_MAPPER;
+      ModernCredentials.cTlsParameters := 1;
+      ModernCredentials.pTlsParameters := @TlsParameters;
+      AuthenticationData := @ModernCredentials;
+    end
+    else
+    begin
+      { SCHANNEL_CRED v4 is the Windows 8-compatible fallback. It cannot
+        enable TLS 1.3, which those hosts do not provide, so pin TLS 1.2. }
+      LegacyCredentials.dwVersion := SCHANNEL_CRED_VERSION;
+      LegacyCredentials.cCreds := 1;
+      LegacyCredentials.paCred := @Snapshot.Certificate;
+      LegacyCredentials.grbitEnabledProtocols := SP_PROT_TLS1_2_SERVER;
+      LegacyCredentials.dwFlags := SCH_USE_STRONG_CRYPTO or
+        SCH_CRED_NO_SYSTEM_MAPPER;
+      AuthenticationData := @LegacyCredentials;
+    end;
+    Status := AcquireCredentialsHandleW(nil,
+      PWideChar(WideString(UNISP_NAME)), SECPKG_CRED_INBOUND, nil,
+      AuthenticationData, nil, nil, @Snapshot.Credential, @Expiry);
+    if Status <> SEC_E_OK then
+      raise ETransportSecurityError.CreateFmt(
+        'Failed to acquire SChannel server credentials: 0x%x',
+        [LongWord(Status)]);
+    Snapshot.HasCredential := True;
+    Result := Snapshot;
+    Snapshot := nil;
+  finally
+    if Assigned(Snapshot) then
+      Snapshot.Release;
+    if Length(Passphrase) > 0 then
+      FillChar(Passphrase[0], Length(Passphrase) * SizeOf(WideChar), 0);
+    SetLength(Passphrase, 0);
+    WipeBytes(Identity);
+  end;
+end;
+
+procedure FreeSChannelServerData(const AData: TSChannelServerData);
+begin
+  if not Assigned(AData) then
+    Exit;
+  if AData.HasContext then
+  begin
+    DeleteSecurityContext(@AData.Context);
+    AData.HasContext := False;
+  end;
+  if Assigned(AData.Snapshot) then
+    AData.Snapshot.Release;
+  AData.Snapshot := nil;
+  if Length(AData.PendingPlaintext) > 0 then
+    FillChar(AData.PendingPlaintext[0], Length(AData.PendingPlaintext), 0);
+  SetLength(AData.PendingPlaintext, 0);
+  if Length(AData.Plaintext) > 0 then
+    FillChar(AData.Plaintext[0], Length(AData.Plaintext), 0);
+  SetLength(AData.Plaintext, 0);
+  if Length(AData.RecordBuffer) > 0 then
+    FillChar(AData.RecordBuffer[0], Length(AData.RecordBuffer), 0);
+  SetLength(AData.RecordBuffer, 0);
+  AData.Free;
+end;
+
+function SChannelServerData(
+  const AConnection: TTransportSecurityConnection): TSChannelServerData;
+  inline;
+begin
+  if (AConnection.Backend = TSB_SCHANNEL_SERVER) and
+     Assigned(AConnection.BackendData) then
+    Result := TSChannelServerData(AConnection.BackendData)
+  else
+    Result := nil;
+end;
+
+procedure PoisonSChannelServerConnection(
+  var AConnection: TTransportSecurityConnection);
+var
+  Data: TSChannelServerData;
+begin
+  Data := TSChannelServerData(AConnection.BackendData);
+  ResetTransportSecurityConnection(AConnection);
+  FreeSChannelServerData(Data);
+end;
+
+function SChannelServerPendingCiphertext(
+  const AData: TSChannelServerData): Integer; inline;
+begin
+  if Assigned(AData) then
+    Result := Length(AData.Output) - AData.OutputOffset
+  else
+    Result := 0;
+end;
+
+function SChannelServerOutputFlow(
+  const AData: TSChannelServerData): TTransportSecurityOutputFlow;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  if not Assigned(AData) then
+    Exit;
+  Result.Capacity := AData.OutputCapacity;
+  Result.PendingBytes := SChannelServerPendingCiphertext(AData);
+  Result.RemainingBytes := Result.Capacity - Result.PendingBytes;
+  if Result.RemainingBytes < 0 then
+    Result.RemainingBytes := 0;
+end;
+
+{ Only ever reached with the queue fully drained, because every entry point
+  returns tssWantWrite while output is pending. Compacting here therefore
+  cannot move bytes a caller still holds a GetCiphertext pointer to. }
+procedure CompactSChannelServerOutput(const AData: TSChannelServerData);
+var
+  PendingLength: Integer;
+begin
+  if AData.OutputOffset <= 0 then
+    Exit;
+  PendingLength := Length(AData.Output) - AData.OutputOffset;
+  if PendingLength > 0 then
+    Move(AData.Output[AData.OutputOffset], AData.Output[0], PendingLength);
+  SetLength(AData.Output, PendingLength);
+  AData.OutputOffset := 0;
+end;
+
+function AppendSChannelServerOutput(const AData: TSChannelServerData;
+  const ABuffer: Pointer; const ALength: Integer): Boolean;
+var
+  ExistingLength: Integer;
+begin
+  Result := True;
+  if ALength <= 0 then
+    Exit;
+  CompactSChannelServerOutput(AData);
+  ExistingLength := Length(AData.Output);
+  if ExistingLength + ALength > AData.OutputCapacity then
+  begin
+    Result := False;
+    Exit;
+  end;
+  SetLength(AData.Output, ExistingLength + ALength);
+  Move(ABuffer^, AData.Output[ExistingLength], ALength);
+end;
+
+function FlushSChannelServerRecord(const AData: TSChannelServerData): Boolean;
+var
+  Remaining: Integer;
+  Take: Integer;
+begin
+  Result := True;
+  while AData.RecordOffset < Length(AData.RecordBuffer) do
+  begin
+    Remaining := AData.OutputCapacity -
+      SChannelServerPendingCiphertext(AData);
+    if Remaining <= 0 then
+    begin
+      Result := False;
+      Exit;
+    end;
+    Take := Length(AData.RecordBuffer) - AData.RecordOffset;
+    if Take > Remaining then
+      Take := Remaining;
+    if not AppendSChannelServerOutput(AData,
+      @AData.RecordBuffer[AData.RecordOffset], Take) then
+    begin
+      Result := False;
+      Exit;
+    end;
+    Inc(AData.RecordOffset, Take);
+  end;
+  SetLength(AData.RecordBuffer, 0);
+  AData.RecordOffset := 0;
+end;
+
+function SChannelServerStagedBytes(
+  const AData: TSChannelServerData): Integer; inline;
+begin
+  Result := Length(AData.RecordBuffer) - AData.RecordOffset;
+end;
+
+{ Queue a freshly produced SSPI token through the same prefix-staging path
+  application records use. A handshake flight larger than OutputCapacity
+  therefore drains incrementally instead of failing the connection, which is
+  what OpenSSL's bounded write BIO does. }
+function StageSChannelServerToken(const AData: TSChannelServerData;
+  const ABuffer: Pointer; const ALength: Integer): Boolean;
+begin
+  Result := True;
+  if ALength <= 0 then
+    Exit;
+  if SChannelServerStagedBytes(AData) > 0 then
+  begin
+    { A staged record must drain before another can be staged; reaching this
+      would mean an entry-point guard let a caller past pending output. }
+    Result := False;
+    Exit;
+  end;
+  if not Assigned(ABuffer) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  SetLength(AData.RecordBuffer, ALength);
+  AData.RecordOffset := 0;
+  Move(ABuffer^, AData.RecordBuffer[0], ALength);
+  FlushSChannelServerRecord(AData);
+end;
+
+{ True when the caller must drain retained ciphertext before anything else can
+  make progress. Also advances a partially queued staged record, so a token
+  that did not fit in one go keeps moving. }
+function SChannelServerOutputBusy(
+  const AData: TSChannelServerData): Boolean;
+begin
+  Result := SChannelServerPendingCiphertext(AData) > 0;
+  if Result then
+    Exit;
+  if SChannelServerStagedBytes(AData) <= 0 then
+    Exit;
+  FlushSChannelServerRecord(AData);
+  Result := SChannelServerPendingCiphertext(AData) > 0;
+end;
+
+procedure RefreshSChannelServerInputFlow(const AData: TSChannelServerData);
+var
+  Buffered: Integer;
+begin
+  if not Assigned(AData) then
+    Exit;
+  Buffered := Length(AData.EncryptedInput);
+  if Buffered > AData.InputHighWatermark then
+    Buffered := AData.InputHighWatermark;
+  AData.InputBuffered := Buffered;
+  AData.InputConsumed := AData.InputAccepted - QWord(AData.InputBuffered);
+  if AData.InputBackpressured then
+    AData.InputBackpressured := AData.InputBuffered > AData.InputLowWatermark
+  else
+    AData.InputBackpressured := AData.InputBuffered >=
+      AData.InputHighWatermark;
+end;
+
+function SChannelServerRequestFlags: LongWord;
+begin
+  Result := ASC_REQ_SEQUENCE_DETECT or ASC_REQ_REPLAY_DETECT or
+    ASC_REQ_CONFIDENTIALITY or ASC_REQ_EXTENDED_ERROR or
+    ASC_REQ_ALLOCATE_MEMORY or ASC_REQ_STREAM;
+end;
+
+procedure BeginSChannelServer(var AConnection: TTransportSecurityConnection;
+  const AContext: TTransportSecurityServerContext);
+var
+  Data: TSChannelServerData;
+  Snapshot: TSChannelServerCredentialData;
+begin
+  Snapshot := TSChannelServerCredentialData(AContext.AcquireSnapshot);
+  if not Assigned(Snapshot) or not Snapshot.HasCredential then
+  begin
+    if Assigned(Snapshot) then
+      Snapshot.Release;
+    raise ETransportSecurityError.Create(
+      'TLS server context is not initialized');
+  end;
+  try
+    Data := TSChannelServerData.Create;
+  except
+    Snapshot.Release;
+    raise;
+  end;
+  Data.Snapshot := Snapshot;
+  Data.InputHighWatermark := AContext.FInputHighWatermark;
+  Data.InputLowWatermark := AContext.FInputLowWatermark;
+  Data.OutputCapacity := AContext.FOutputCapacity;
+  AConnection.BackendData := Data;
+  AConnection.Backend := TSB_SCHANNEL_SERVER;
+end;
+
+function FeedSChannelServerCiphertext(
+  var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
+  const ALength: Integer): Integer;
+var
+  AcceptedLength: Integer;
+  Available: Integer;
+  Data: TSChannelServerData;
+  ExistingLength: Integer;
+begin
+  Data := SChannelServerData(AConnection);
+  if not Assigned(Data) then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  if ALength <= 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if not Assigned(ABuffer) then
+    raise ETransportSecurityError.Create(
+      'TLS ciphertext input buffer is nil');
+
+  RefreshSChannelServerInputFlow(Data);
+  Available := Data.InputHighWatermark - Data.InputBuffered;
+  AcceptedLength := ALength;
+  if AcceptedLength > Available then
+    AcceptedLength := Available;
+  if AcceptedLength <= 0 then
+  begin
+    Data.InputBackpressured := True;
+    Result := 0;
+    Exit;
+  end;
+
+  ExistingLength := Length(Data.EncryptedInput);
+  SetLength(Data.EncryptedInput, ExistingLength + AcceptedLength);
+  Move(ABuffer^, Data.EncryptedInput[ExistingLength], AcceptedLength);
+  Inc(Data.InputAccepted, QWord(AcceptedLength));
+  Result := AcceptedLength;
+  RefreshSChannelServerInputFlow(Data);
+end;
+
+function HandshakeSChannelServer(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+var
+  ConnectionInfo: TSecPkgContextConnectionInfo;
+  ContextAttributes: LongWord;
+  Data: TSChannelServerData;
+  ExistingContext: PCtxtHandle;
+  Expiry: SECURITY_INTEGER;
+  InputBuffers: array[0..1] of TSecBuffer;
+  InputDescriptor: TSecBufferDesc;
+  OutputBuffer: TSecBuffer;
+  OutputDescriptor: TSecBufferDesc;
+  Status: SECURITY_STATUS;
+  TokenQueued: Boolean;
+begin
+  Data := SChannelServerData(AConnection);
+  if not Assigned(Data) then
+  begin
+    Result := tssError;
+    Exit;
+  end;
+  { Checked before HandshakeDone: the final flight may still be staged, and
+    reporting tssDone with undelivered bytes would lose them. }
+  if SChannelServerOutputBusy(Data) then
+  begin
+    Result := tssWantWrite;
+    Exit;
+  end;
+  if Data.HandshakeDone then
+  begin
+    Data.PostHandshakeInProgress := False;
+    Result := tssDone;
+    Exit;
+  end;
+
+  repeat
+    if Length(Data.EncryptedInput) = 0 then
+    begin
+      Result := tssWantRead;
+      Exit;
+    end;
+
+    FillChar(OutputBuffer, SizeOf(OutputBuffer), 0);
+    OutputBuffer.BufferType := SECBUFFER_TOKEN;
+    FillChar(OutputDescriptor, SizeOf(OutputDescriptor), 0);
+    OutputDescriptor.ulVersion := SECBUFFER_VERSION;
+    OutputDescriptor.cBuffers := 1;
+    OutputDescriptor.pBuffers := @OutputBuffer;
+
+    FillChar(InputBuffers, SizeOf(InputBuffers), 0);
+    InputBuffers[0].BufferType := SECBUFFER_TOKEN;
+    InputBuffers[0].cbBuffer := Length(Data.EncryptedInput);
+    InputBuffers[0].pvBuffer := @Data.EncryptedInput[0];
+    InputBuffers[1].BufferType := SECBUFFER_EMPTY;
+    FillChar(InputDescriptor, SizeOf(InputDescriptor), 0);
+    InputDescriptor.ulVersion := SECBUFFER_VERSION;
+    InputDescriptor.cBuffers := 2;
+    InputDescriptor.pBuffers := @InputBuffers[0];
+
+    if Data.HasContext then
+      ExistingContext := @Data.Context
+    else
+      ExistingContext := nil;
+
+    Status := AcceptSecurityContext(@Data.Snapshot.Credential,
+      ExistingContext, @InputDescriptor, SChannelServerRequestFlags,
+      SECURITY_NATIVE_DREP, @Data.Context, @OutputDescriptor,
+      @ContextAttributes, @Expiry);
+    if Status >= 0 then
+      Data.HasContext := True;
+
+    TokenQueued := True;
+    try
+      if Status = SEC_E_INCOMPLETE_MESSAGE then
+      begin
+        Result := tssWantRead;
+        Exit;
+      end;
+
+      if SecBufferKind(InputBuffers[1].BufferType) = SECBUFFER_EXTRA then
+        PreserveExtraBytes(Data.EncryptedInput, InputBuffers[1].pvBuffer,
+          InputBuffers[1].cbBuffer)
+      else
+        SetLength(Data.EncryptedInput, 0);
+
+      if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) then
+        TokenQueued := StageSChannelServerToken(Data, OutputBuffer.pvBuffer,
+          OutputBuffer.cbBuffer);
+    finally
+      if Assigned(OutputBuffer.pvBuffer) then
+        FreeContextBuffer(OutputBuffer.pvBuffer);
+    end;
+    if not TokenQueued then
+    begin
+      PoisonSChannelServerConnection(AConnection);
+      Result := tssError;
+      Exit;
+    end;
+
+    if Status = SEC_E_OK then
+    begin
+      Status := QueryContextAttributesW(@Data.Context,
+        SECPKG_ATTR_STREAM_SIZES, @Data.StreamSizes);
+      if Status <> SEC_E_OK then
+      begin
+        PoisonSChannelServerConnection(AConnection);
+        Result := tssError;
+        Exit;
+      end;
+      FillChar(ConnectionInfo, SizeOf(ConnectionInfo), 0);
+      Status := QueryContextAttributesW(@Data.Context,
+        SECPKG_ATTR_CONNECTION_INFO, @ConnectionInfo);
+      if Status <> SEC_E_OK then
+      begin
+        PoisonSChannelServerConnection(AConnection);
+        Result := tssError;
+        Exit;
+      end;
+      Data.Protocol := ConnectionInfo.dwProtocol;
+      Data.HandshakeDone := True;
+      AConnection.Active := True;
+      if (SChannelServerPendingCiphertext(Data) > 0) or
+         (SChannelServerStagedBytes(Data) > 0) then
+        Result := tssWantWrite
+      else
+        Result := tssDone;
+      Exit;
+    end;
+
+    if Status <> SEC_I_CONTINUE_NEEDED then
+    begin
+      PoisonSChannelServerConnection(AConnection);
+      Result := tssError;
+      Exit;
+    end;
+
+    if (SChannelServerPendingCiphertext(Data) > 0) or
+       (SChannelServerStagedBytes(Data) > 0) then
+    begin
+      Result := tssWantWrite;
+      Exit;
+    end;
+  until False;
+end;
+
+function ReadSChannelServer(var AConnection: TTransportSecurityConnection;
+  var ABuffer: array of Byte;
+  const ALength: Integer): TTransportSecurityIOResult;
+var
+  Available: Integer;
+  BufferDescriptor: TSecBufferDesc;
+  Buffers: array[0..3] of TSecBuffer;
+  Data: TSChannelServerData;
+  ExtraInput: TBytes;
+  HandshakeState: TTransportSecurityState;
+  I: Integer;
+  QualityOfProtection: LongWord;
+  ReadLength: Integer;
+  Status: SECURITY_STATUS;
+begin
+  Result.State := tssError;
+  Result.BytesProcessed := 0;
+  Data := SChannelServerData(AConnection);
+  if not Assigned(Data) then
+    Exit;
+  if Data.PostHandshakeInProgress then
+  begin
+    HandshakeState := HandshakeSChannelServer(AConnection);
+    if HandshakeState <> tssDone then
+    begin
+      Result.State := HandshakeState;
+      Exit;
+    end;
+  end;
+  if not Data.HandshakeDone then
+    Exit;
+  if Length(Data.PendingPlaintext) > 0 then
+    raise ETransportSecurityError.Create(
+      'TLS write retry is pending; resume it before reading');
+  if SChannelServerOutputBusy(Data) then
+  begin
+    Result.State := tssWantWrite;
+    Exit;
+  end;
+
+  ReadLength := ALength;
+  if ReadLength > Length(ABuffer) then
+    ReadLength := Length(ABuffer);
+  if ReadLength <= 0 then
+  begin
+    Result.State := tssDone;
+    Exit;
+  end;
+
+  repeat
+    Available := Length(Data.Plaintext) - Data.PlaintextOffset;
+    if Available > 0 then
+    begin
+      Result.BytesProcessed := Available;
+      if Result.BytesProcessed > ReadLength then
+        Result.BytesProcessed := ReadLength;
+      Move(Data.Plaintext[Data.PlaintextOffset], ABuffer[0],
+        Result.BytesProcessed);
+      Inc(Data.PlaintextOffset, Result.BytesProcessed);
+      if Data.PlaintextOffset >= Length(Data.Plaintext) then
+      begin
+        SetLength(Data.Plaintext, 0);
+        Data.PlaintextOffset := 0;
+      end;
+      Result.State := tssDone;
+      Exit;
+    end;
+
+    if Data.PeerClosed then
+    begin
+      PoisonSChannelServerConnection(AConnection);
+      Result.State := tssPeerClosed;
+      Exit;
+    end;
+    if Length(Data.EncryptedInput) = 0 then
+    begin
+      Result.State := tssWantRead;
+      Exit;
+    end;
+
+    FillChar(Buffers, SizeOf(Buffers), 0);
+    Buffers[0].BufferType := SECBUFFER_DATA;
+    Buffers[0].cbBuffer := Length(Data.EncryptedInput);
+    Buffers[0].pvBuffer := @Data.EncryptedInput[0];
+    Buffers[1].BufferType := SECBUFFER_EMPTY;
+    Buffers[2].BufferType := SECBUFFER_EMPTY;
+    Buffers[3].BufferType := SECBUFFER_EMPTY;
+    FillChar(BufferDescriptor, SizeOf(BufferDescriptor), 0);
+    BufferDescriptor.ulVersion := SECBUFFER_VERSION;
+    BufferDescriptor.cBuffers := 4;
+    BufferDescriptor.pBuffers := @Buffers[0];
+    QualityOfProtection := 0;
+
+    Status := DecryptMessage(@Data.Context, @BufferDescriptor, 0,
+      @QualityOfProtection);
+    if Status = SEC_E_INCOMPLETE_MESSAGE then
+    begin
+      Result.State := tssWantRead;
+      Exit;
+    end;
+    if Status = SEC_I_RENEGOTIATE then
+    begin
+      { TLS 1.3 uses this status for post-handshake KeyUpdate and session
+        tickets. SChannel ordinarily returns the complete post-handshake token
+        and following ciphertext as SECBUFFER_EXTRA. Microsoft documents that
+        EXTRA is not guaranteed, in which case the same modified input buffer
+        must be relabelled as the token. TLS 1.2 renegotiation remains fatal,
+        preserving the no-renegotiation contract shared with OpenSSL. }
+      if Data.Protocol <> SP_PROT_TLS1_3_SERVER then
+      begin
+        PoisonSChannelServerConnection(AConnection);
+        Result.State := tssError;
+        Exit;
+      end;
+      SetLength(ExtraInput, 0);
+      for I := 0 to High(Buffers) do
+        if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+          AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+            Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+      if Length(ExtraInput) = 0 then
+        ExtraInput := Copy(Data.EncryptedInput, 0,
+          Length(Data.EncryptedInput));
+      Data.EncryptedInput := ExtraInput;
+      Data.HandshakeDone := False;
+      Data.PostHandshakeInProgress := True;
+      HandshakeState := HandshakeSChannelServer(AConnection);
+      if HandshakeState <> tssDone then
+      begin
+        Result.State := HandshakeState;
+        Exit;
+      end;
+      Continue;
+    end;
+
+    if (Status <> SEC_E_OK) and (Status <> SEC_I_CONTEXT_EXPIRED) then
+    begin
+      PoisonSChannelServerConnection(AConnection);
+      Result.State := tssError;
+      Exit;
+    end;
+
+    SetLength(Data.Plaintext, 0);
+    Data.PlaintextOffset := 0;
+    { Copy plaintext while EncryptedInput still owns the in-place
+      DecryptMessage spans. Replacing it with the preserved tail first would
+      leave the returned DATA pointer dangling. Harvest from index 1 because
+      SEC_I_CONTEXT_EXPIRED leaves buffer 0 carrying the caller's label. }
+    if Status = SEC_E_OK then
+      for I := 1 to High(Buffers) do
+        if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
+          AppendBytes(Data.Plaintext, Buffers[I].pvBuffer,
+            Buffers[I].cbBuffer);
+
+    { SECBUFFER_EXTRA also points into EncryptedInput; preserve it only after
+      harvesting every plaintext span and before replacing its owner. }
+    SetLength(ExtraInput, 0);
+    for I := 1 to High(Buffers) do
+      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+    Data.EncryptedInput := ExtraInput;
+
+    if Status = SEC_I_CONTEXT_EXPIRED then
+      Data.PeerClosed := True;
+  until False;
+end;
+
+function WriteSChannelServer(var AConnection: TTransportSecurityConnection;
+  const ABuffer: Pointer;
+  const ALength: Integer): TTransportSecurityIOResult;
+var
+  BufferDescriptor: TSecBufferDesc;
+  Buffers: array[0..3] of TSecBuffer;
+  ChunkLength: Integer;
+  Data: TSChannelServerData;
+  MessageLength: Integer;
+  PendingLength: Integer;
+  Retrying: Boolean;
+  Status: SECURITY_STATUS;
+begin
+  Result.State := tssError;
+  Result.BytesProcessed := 0;
+  Data := SChannelServerData(AConnection);
+  if not Assigned(Data) or not Data.HandshakeDone then
+    Exit;
+  if SChannelServerPendingCiphertext(Data) > 0 then
+  begin
+    Result.State := tssWantWrite;
+    Exit;
+  end;
+
+  Retrying := Length(Data.PendingPlaintext) > 0;
+  if Retrying and ((ALength <> 0) or Assigned(ABuffer)) then
+    raise ETransportSecurityError.Create(
+      'TLS write retry is pending; resume it with a nil, zero-length buffer');
+  if not Retrying then
+  begin
+    if ALength <= 0 then
+    begin
+      Result.State := tssDone;
+      Exit;
+    end;
+    if not Assigned(ABuffer) then
+      raise ETransportSecurityError.Create(
+        'TLS plaintext output buffer is nil');
+    SetLength(Data.PendingPlaintext, ALength);
+    Move(ABuffer^, Data.PendingPlaintext[0], ALength);
+    Data.PendingPlaintextOffset := 0;
+  end;
+
+  PendingLength := Length(Data.PendingPlaintext);
+  while FlushSChannelServerRecord(Data) and
+    (Data.PendingPlaintextOffset < PendingLength) do
+  begin
+    ChunkLength := PendingLength - Data.PendingPlaintextOffset;
+    if ChunkLength > Integer(Data.StreamSizes.cbMaximumMessage) then
+      ChunkLength := Integer(Data.StreamSizes.cbMaximumMessage);
+    MessageLength := Integer(Data.StreamSizes.cbHeader) + ChunkLength +
+      Integer(Data.StreamSizes.cbTrailer);
+    SetLength(Data.RecordBuffer, MessageLength);
+    Data.RecordOffset := 0;
+    Move(Data.PendingPlaintext[Data.PendingPlaintextOffset],
+      Data.RecordBuffer[Data.StreamSizes.cbHeader], ChunkLength);
+
+    FillChar(Buffers, SizeOf(Buffers), 0);
+    Buffers[0].BufferType := SECBUFFER_STREAM_HEADER;
+    Buffers[0].cbBuffer := Data.StreamSizes.cbHeader;
+    Buffers[0].pvBuffer := @Data.RecordBuffer[0];
+    Buffers[1].BufferType := SECBUFFER_DATA;
+    Buffers[1].cbBuffer := ChunkLength;
+    Buffers[1].pvBuffer := @Data.RecordBuffer[Data.StreamSizes.cbHeader];
+    Buffers[2].BufferType := SECBUFFER_STREAM_TRAILER;
+    Buffers[2].cbBuffer := Data.StreamSizes.cbTrailer;
+    Buffers[2].pvBuffer :=
+      @Data.RecordBuffer[Integer(Data.StreamSizes.cbHeader) + ChunkLength];
+    Buffers[3].BufferType := SECBUFFER_EMPTY;
+    FillChar(BufferDescriptor, SizeOf(BufferDescriptor), 0);
+    BufferDescriptor.ulVersion := SECBUFFER_VERSION;
+    BufferDescriptor.cBuffers := 4;
+    BufferDescriptor.pBuffers := @Buffers[0];
+
+    Status := EncryptMessage(@Data.Context, 0, @BufferDescriptor, 0);
+    if Status <> SEC_E_OK then
+    begin
+      SetLength(Data.RecordBuffer, 0);
+      Data.RecordOffset := 0;
+      PoisonSChannelServerConnection(AConnection);
+      Result.State := tssError;
+      Exit;
+    end;
+    MessageLength := Integer(Buffers[0].cbBuffer) +
+      Integer(Buffers[1].cbBuffer) + Integer(Buffers[2].cbBuffer);
+    SetLength(Data.RecordBuffer, MessageLength);
+    Inc(Data.PendingPlaintextOffset, ChunkLength);
+  end;
+
+  if (Data.PendingPlaintextOffset >= PendingLength) and
+     (Data.RecordOffset >= Length(Data.RecordBuffer)) then
+  begin
+    SetLength(Data.RecordBuffer, 0);
+    Data.RecordOffset := 0;
+    Result.BytesProcessed := PendingLength;
+    FillChar(Data.PendingPlaintext[0], PendingLength, 0);
+    SetLength(Data.PendingPlaintext, 0);
+    Data.PendingPlaintextOffset := 0;
+    if SChannelServerPendingCiphertext(Data) > 0 then
+      Result.State := tssWantWrite
+    else
+      Result.State := tssDone;
+    Exit;
+  end;
+
+  if SChannelServerPendingCiphertext(Data) <= 0 then
+  begin
+    { No progress and nothing to drain would wedge the caller's pump. }
+    PoisonSChannelServerConnection(AConnection);
+    Result.State := tssError;
+    Exit;
+  end;
+  Result.BytesProcessed := 0;
+  Result.State := tssWantWrite;
+end;
+
+function StartSChannelServerShutdown(
+  var AConnection: TTransportSecurityConnection;
+  const AData: TSChannelServerData): Boolean;
+var
+  ContextAttributes: LongWord;
+  Expiry: SECURITY_INTEGER;
+  OutputBuffer: TSecBuffer;
+  OutputDescriptor: TSecBufferDesc;
+  ShutdownBuffer: TSecBuffer;
+  ShutdownDescriptor: TSecBufferDesc;
+  ShutdownToken: LongWord;
+  Status: SECURITY_STATUS;
+  TokenQueued: Boolean;
+begin
+  Result := False;
+  ShutdownToken := SCHANNEL_SHUTDOWN;
+  FillChar(ShutdownBuffer, SizeOf(ShutdownBuffer), 0);
+  ShutdownBuffer.cbBuffer := SizeOf(ShutdownToken);
+  ShutdownBuffer.BufferType := SECBUFFER_TOKEN;
+  ShutdownBuffer.pvBuffer := @ShutdownToken;
+  FillChar(ShutdownDescriptor, SizeOf(ShutdownDescriptor), 0);
+  ShutdownDescriptor.ulVersion := SECBUFFER_VERSION;
+  ShutdownDescriptor.cBuffers := 1;
+  ShutdownDescriptor.pBuffers := @ShutdownBuffer;
+  if ApplyControlToken(@AData.Context, @ShutdownDescriptor) <> SEC_E_OK then
+  begin
+    PoisonSChannelServerConnection(AConnection);
+    Exit;
+  end;
+
+  FillChar(OutputBuffer, SizeOf(OutputBuffer), 0);
+  OutputBuffer.BufferType := SECBUFFER_TOKEN;
+  FillChar(OutputDescriptor, SizeOf(OutputDescriptor), 0);
+  OutputDescriptor.ulVersion := SECBUFFER_VERSION;
+  OutputDescriptor.cBuffers := 1;
+  OutputDescriptor.pBuffers := @OutputBuffer;
+
+  Status := AcceptSecurityContext(@AData.Snapshot.Credential,
+    @AData.Context, nil, SChannelServerRequestFlags, SECURITY_NATIVE_DREP,
+    @AData.Context, @OutputDescriptor, @ContextAttributes, @Expiry);
+  TokenQueued := True;
+  try
+    if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) or
+       (Status = SEC_I_CONTEXT_EXPIRED) then
+      TokenQueued := StageSChannelServerToken(AData, OutputBuffer.pvBuffer,
+        OutputBuffer.cbBuffer)
+    else
+      TokenQueued := False;
+  finally
+    if Assigned(OutputBuffer.pvBuffer) then
+      FreeContextBuffer(OutputBuffer.pvBuffer);
+  end;
+  if not TokenQueued then
+  begin
+    PoisonSChannelServerConnection(AConnection);
+    Exit;
+  end;
+  AData.ShutdownStarted := True;
+  Result := True;
+end;
+
+function CloseSChannelServerGracefully(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+var
+  BufferDescriptor: TSecBufferDesc;
+  Buffers: array[0..3] of TSecBuffer;
+  Data: TSChannelServerData;
+  ExtraInput: TBytes;
+  I: Integer;
+  QualityOfProtection: LongWord;
+  Status: SECURITY_STATUS;
+begin
+  Data := SChannelServerData(AConnection);
+  if not Assigned(Data) then
+  begin
+    Result := tssError;
+    Exit;
+  end;
+  if SChannelServerOutputBusy(Data) then
+  begin
+    Result := tssWantWrite;
+    Exit;
+  end;
+  if Length(Data.PendingPlaintext) > 0 then
+  begin
+    PoisonSChannelServerConnection(AConnection);
+    Result := tssError;
+    Exit;
+  end;
+  if not Data.HandshakeDone then
+  begin
+    PoisonSChannelServerConnection(AConnection);
+    Result := tssError;
+    Exit;
+  end;
+
+  if not Data.ShutdownStarted then
+  begin
+    if not StartSChannelServerShutdown(AConnection, Data) then
+    begin
+      Result := tssError;
+      Exit;
+    end;
+    if (SChannelServerPendingCiphertext(Data) > 0) or
+       (SChannelServerStagedBytes(Data) > 0) then
+    begin
+      Result := tssWantWrite;
+      Exit;
+    end;
+  end;
+
+  repeat
+    if Data.PeerClosed then
+    begin
+      Result := tssDone;
+      Exit;
+    end;
+    if Length(Data.EncryptedInput) = 0 then
+    begin
+      Result := tssWantRead;
+      Exit;
+    end;
+
+    FillChar(Buffers, SizeOf(Buffers), 0);
+    Buffers[0].BufferType := SECBUFFER_DATA;
+    Buffers[0].cbBuffer := Length(Data.EncryptedInput);
+    Buffers[0].pvBuffer := @Data.EncryptedInput[0];
+    Buffers[1].BufferType := SECBUFFER_EMPTY;
+    Buffers[2].BufferType := SECBUFFER_EMPTY;
+    Buffers[3].BufferType := SECBUFFER_EMPTY;
+    FillChar(BufferDescriptor, SizeOf(BufferDescriptor), 0);
+    BufferDescriptor.ulVersion := SECBUFFER_VERSION;
+    BufferDescriptor.cBuffers := 4;
+    BufferDescriptor.pBuffers := @Buffers[0];
+    QualityOfProtection := 0;
+
+    Status := DecryptMessage(@Data.Context, @BufferDescriptor, 0,
+      @QualityOfProtection);
+    if Status = SEC_E_INCOMPLETE_MESSAGE then
+    begin
+      Result := tssWantRead;
+      Exit;
+    end;
+    if (Status <> SEC_E_OK) and (Status <> SEC_I_CONTEXT_EXPIRED) then
+    begin
+      { A fatal alert observed while draining must not surface more output;
+        the legitimate close_notify was already emitted and drained. }
+      PoisonSChannelServerConnection(AConnection);
+      Result := tssError;
+      Exit;
+    end;
+
+    { Index 1 upward for the same reason the read path does: on
+      SEC_I_CONTEXT_EXPIRED buffer 0 still carries the caller's label. }
+    SetLength(ExtraInput, 0);
+    for I := 1 to High(Buffers) do
+      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+    Data.EncryptedInput := ExtraInput;
+
+    if Status = SEC_I_CONTEXT_EXPIRED then
+      Data.PeerClosed := True;
+  until False;
+end;
+{$ENDIF}
 {$ENDIF}
 
 function TransportSecurityServerBackendAvailable: Boolean;
@@ -3241,7 +5143,13 @@ begin
     on E: ETransportSecurityError do
       Result := False;
   end;
-  {$ELSE}
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  { SChannel ships with the operating system: there is no runtime library to
+    probe and no OpenSSL DLL to find. }
+  Result := True;
+  {$ENDIF}
+  {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := False;
   {$ENDIF}
 end;
@@ -3251,6 +5159,10 @@ function TTransportSecurityServerContext.AcquireSnapshot: Pointer;
 var
   Snapshot: TOpenSSLServerContextData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Snapshot: TSChannelServerCredentialData;
+{$ENDIF}
 begin
   Result := nil;
   if not FCriticalSectionInitialized then
@@ -3259,6 +5171,11 @@ begin
   try
     {$IFDEF TRANSPORT_SECURITY_OPENSSL}
     Snapshot := TOpenSSLServerContextData(FBackendData);
+    {$ENDIF}
+    {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+    Snapshot := TSChannelServerCredentialData(FBackendData);
+    {$ENDIF}
+    {$IFDEF TRANSPORT_SECURITY_SERVER}
     if Assigned(Snapshot) then
     begin
       Snapshot.Retain;
@@ -3299,15 +5216,24 @@ procedure TTransportSecurityServerContext.ReplaceSnapshot(
 var
   OldSnapshot: TOpenSSLServerContextData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  OldSnapshot: TSChannelServerCredentialData;
+{$ENDIF}
 begin
-  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   OldSnapshot := nil;
   if not FCriticalSectionInitialized then
     raise ETransportSecurityError.Create(
       'TLS server context is not initialized');
   EnterCriticalSection(FCriticalSection);
   try
+    {$IFDEF TRANSPORT_SECURITY_OPENSSL}
     OldSnapshot := TOpenSSLServerContextData(FBackendData);
+    {$ENDIF}
+    {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+    OldSnapshot := TSChannelServerCredentialData(FBackendData);
+    {$ENDIF}
     FBackendData := ANewSnapshot;
   finally
     LeaveCriticalSection(FCriticalSection);
@@ -3430,6 +5356,10 @@ procedure TTransportSecurityServerContext.Reload(
 var
   Snapshot: TOpenSSLServerContextData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Snapshot: TSChannelServerCredentialData;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   if not TryLoadOpenSSLServer then
@@ -3437,6 +5367,12 @@ begin
   LoadOpenSSLServerProcedures;
   Snapshot := CreateOpenSSLServerSnapshot(APkcs12Identity,
     APkcs12Passphrase, AValidation);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Snapshot := CreateSChannelServerSnapshot(APkcs12Identity,
+    APkcs12Passphrase, AValidation);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   try
     ReplaceSnapshot(Snapshot);
     Snapshot := nil;
@@ -3452,12 +5388,12 @@ end;
 procedure TTransportSecurityServerContext.Reload(
   const APkcs12Path: string; const APkcs12Passphrase: UnicodeString;
   const AValidation: TTransportSecurityServerIdentityValidation);
-{$IFDEF TRANSPORT_SECURITY_OPENSSL}
+{$IFDEF TRANSPORT_SECURITY_SERVER}
 var
   Identity: TBytes;
 {$ENDIF}
 begin
-  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   Identity := LoadPKCS12Bytes(APkcs12Path);
   try
     Reload(Identity, APkcs12Passphrase, AValidation);
@@ -3518,11 +5454,16 @@ begin
   FillChar(AConnection, SizeOf(AConnection), 0);
   AConnection.Backend := TSB_NONE;
 
-  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   if not Assigned(AContext) then
     raise ETransportSecurityError.Create(
       'TLS server context is not initialized');
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   BeginOpenSSLServer(AConnection, AContext);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  BeginSChannelServer(AConnection, AContext);
+  {$ENDIF}
   {$ELSE}
   raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
   {$ENDIF}
@@ -3533,7 +5474,11 @@ function TransportSecurityServerHandshake(
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Result := HandshakeOpenSSLServer(AConnection);
-  {$ELSE}
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Result := HandshakeSChannelServer(AConnection);
+  {$ENDIF}
+  {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := tssError;
   {$ENDIF}
 end;
@@ -3544,7 +5489,11 @@ function TransportSecurityFeedCiphertext(
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Result := FeedOpenSSLServerCiphertext(AConnection, ABuffer, ALength);
-  {$ELSE}
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Result := FeedSChannelServerCiphertext(AConnection, ABuffer, ALength);
+  {$ENDIF}
+  {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := -1;
   {$ENDIF}
 end;
@@ -3555,6 +5504,10 @@ function TransportSecurityServerInputFlow(
 var
   Data: TOpenSSLServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Data: TSChannelServerData;
+{$ENDIF}
 begin
   FillChar(Result, SizeOf(Result), 0);
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
@@ -3562,6 +5515,14 @@ begin
   if not Assigned(Data) then
     Exit;
   RefreshOpenSSLServerInputFlow(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Data := SChannelServerData(AConnection);
+  if not Assigned(Data) then
+    Exit;
+  RefreshSChannelServerInputFlow(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   Result.AcceptedBytes := Data.InputAccepted;
   Result.Backpressured := Data.InputBackpressured;
   Result.BufferedBytes := Data.InputBuffered;
@@ -3577,11 +5538,19 @@ function TransportSecurityServerOutputFlow(
 var
   Data: TOpenSSLServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Data: TSChannelServerData;
+{$ENDIF}
 begin
   FillChar(Result, SizeOf(Result), 0);
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Data := OpenSSLServerData(AConnection);
   Result := OpenSSLServerOutputFlow(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Data := SChannelServerData(AConnection);
+  Result := SChannelServerOutputFlow(Data);
   {$ENDIF}
 end;
 
@@ -3591,11 +5560,20 @@ function TransportSecurityPendingCiphertext(
 var
   Data: TOpenSSLServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Data: TSChannelServerData;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Data := OpenSSLServerData(AConnection);
   Result := OpenSSLServerPendingCiphertext(Data);
-  {$ELSE}
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Data := SChannelServerData(AConnection);
+  Result := SChannelServerPendingCiphertext(Data);
+  {$ENDIF}
+  {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := 0;
   {$ENDIF}
 end;
@@ -3607,11 +5585,21 @@ function TransportSecurityGetCiphertext(
 var
   Data: TOpenSSLServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Data: TSChannelServerData;
+{$ENDIF}
 begin
   ABuffer := nil;
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Data := OpenSSLServerData(AConnection);
   Result := OpenSSLServerPendingCiphertext(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Data := SChannelServerData(AConnection);
+  Result := SChannelServerPendingCiphertext(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   if Result > 0 then
     ABuffer := @Data.Output[Data.OutputOffset];
   {$ELSE}
@@ -3626,12 +5614,23 @@ var
   Data: TOpenSSLServerData;
   Pending: Integer;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Data: TSChannelServerData;
+  Pending: Integer;
+{$ENDIF}
 begin
   if ALength <= 0 then
     Exit;
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Data := OpenSSLServerData(AConnection);
   Pending := OpenSSLServerPendingCiphertext(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Data := SChannelServerData(AConnection);
+  Pending := SChannelServerPendingCiphertext(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
   if not Assigned(Data) or (ALength > Pending) then
     raise ETransportSecurityError.Create(
       'TLS ciphertext consumption exceeds the pending output');
@@ -3652,7 +5651,11 @@ function TransportSecurityServerRead(
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Result := ReadOpenSSLServer(AConnection, ABuffer, ALength);
-  {$ELSE}
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Result := ReadSChannelServer(AConnection, ABuffer, ALength);
+  {$ENDIF}
+  {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result.State := tssError;
   Result.BytesProcessed := 0;
   {$ENDIF}
@@ -3664,7 +5667,11 @@ function TransportSecurityServerWrite(
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Result := WriteOpenSSLServer(AConnection, ABuffer, ALength);
-  {$ELSE}
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Result := WriteSChannelServer(AConnection, ABuffer, ALength);
+  {$ENDIF}
+  {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result.State := tssError;
   Result.BytesProcessed := 0;
   {$ENDIF}
@@ -3675,7 +5682,11 @@ function CloseTransportSecurityServerGracefully(
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Result := CloseOpenSSLServerGracefully(AConnection);
-  {$ELSE}
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Result := CloseSChannelServerGracefully(AConnection);
+  {$ENDIF}
+  {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := tssError;
   {$ENDIF}
 end;
@@ -3686,12 +5697,22 @@ procedure AbortTransportSecurityServer(
 var
   Data: TOpenSSLServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Data: TSChannelServerData;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Data := OpenSSLServerData(AConnection);
   ResetTransportSecurityConnection(AConnection);
   FreeOpenSSLServerData(Data);
-  {$ELSE}
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Data := SChannelServerData(AConnection);
+  ResetTransportSecurityConnection(AConnection);
+  FreeSChannelServerData(Data);
+  {$ENDIF}
+  {$IFNDEF TRANSPORT_SECURITY_SERVER}
   AConnection.Active := False;
   AConnection.Backend := TSB_NONE;
   AConnection.BackendData := nil;
@@ -3736,6 +5757,33 @@ end;
 {$ENDIF}
 {$ENDIF}
 
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{$IFNDEF PRODUCTION}
+{ Names the persisted CNG container backing the context's current snapshot.
+  Exists so the suite can assert what this backend depends on and cannot
+  otherwise observe: that concurrent imports of one identity own separate
+  containers, so releasing a snapshot never deletes a key another snapshot is
+  still serving with. }
+function TransportSecurityTestServerKeyContainer(
+  const AContext: TTransportSecurityServerContext): UnicodeString;
+var
+  Snapshot: TSChannelServerCredentialData;
+begin
+  Result := '';
+  if not Assigned(AContext) then
+    Exit;
+  Snapshot := TSChannelServerCredentialData(AContext.AcquireSnapshot);
+  if not Assigned(Snapshot) then
+    Exit;
+  try
+    Result := Snapshot.KeyContainerName;
+  finally
+    Snapshot.Release;
+  end;
+end;
+{$ENDIF}
+{$ENDIF}
+
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
 begin
   if (AConnection.Backend = TSB_NONE) or
@@ -3750,6 +5798,10 @@ begin
     {$IFDEF MSWINDOWS}
     TSB_SCHANNEL:
       CloseSChannel(AConnection);
+    {$ENDIF}
+    {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+    TSB_SCHANNEL_SERVER:
+      FreeSChannelServerData(TSChannelServerData(AConnection.BackendData));
     {$ENDIF}
     {$IFDEF TRANSPORT_SECURITY_OPENSSL}
     TSB_OPENSSL:
