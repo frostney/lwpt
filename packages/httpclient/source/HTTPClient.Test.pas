@@ -72,6 +72,7 @@ type
     procedure TestChunkedBodyAtLimit;
     procedure TestChunkedBodyOverLimit;
     procedure TestChunkSizeFailures;
+    procedure TestChunkSizeNearIntegerMaxIsBounded;
     procedure TestCloseDelimitedBodyOverLimit;
     procedure TestConflictingContentLengths;
     procedure TestDuplicateContentLengths;
@@ -863,6 +864,28 @@ begin
     'HTTP chunk-size line exceeds configured limit of 64 bytes');
 end;
 
+procedure THTTPClientResourceBounds.TestChunkSizeNearIntegerMaxIsBounded;
+const
+  CRLF = #13#10;
+var
+  ErrorMessage: string;
+begin
+  { A chunk-size line of 7fffffff (= High(Integer)) with the body limit set to
+    High(Integer): the guard admits the size, so the old 32-bit `ChunkSize + 2`
+    overflowed negative, skipped the fill loop, and Move()d High(Integer) bytes
+    out of a near-empty buffer. The overflow-safe Int64 compare keeps reading
+    until the size is buffered or the stream ends; the peer closes after the
+    size line, so the request must fail with the truncated-body error instead
+    of crashing or over-reading. }
+  ErrorMessage := ServeAndCaptureError(
+    StringBytes('HTTP/1.1 200 OK' + CRLF +
+      'Transfer-Encoding: chunked' + CRLF + CRLF +
+      '7fffffff' + CRLF),
+    TestOptions(High(Integer), 1024, 1000), 0, 0, 0);
+  Expect<string>(ErrorMessage).ToBe(
+    'Invalid HTTP response: truncated chunked body');
+end;
+
 procedure THTTPClientResourceBounds.TestCloseDelimitedBodyOverLimit;
 const
   CRLF = #13#10;
@@ -1073,6 +1096,8 @@ begin
   Test('chunked body over limit fails', TestChunkedBodyOverLimit);
   Test('invalid and oversized chunk-size lines fail stably',
     TestChunkSizeFailures);
+  Test('a chunk size near High(Integer) fails without overflow or over-read',
+    TestChunkSizeNearIntegerMaxIsBounded);
   Test('close-delimited body over limit fails',
     TestCloseDelimitedBodyOverLimit);
   Test('invalid Content-Length values fail stably',

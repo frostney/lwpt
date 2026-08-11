@@ -313,63 +313,81 @@ var
 {$ENDIF}
 begin
   {$IFDEF UNIX}
-  fpFD_ZERO(ReadSet);
-  fpFD_ZERO(WriteSet);
-  ReadSetPointer := nil;
-  WriteSetPointer := nil;
-  if ARead then
-  begin
-    fpFD_SET(ASock, ReadSet);
-    ReadSetPointer := @ReadSet;
-  end;
-  if AWrite then
-  begin
-    fpFD_SET(ASock, WriteSet);
-    WriteSetPointer := @WriteSet;
-  end;
-  Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
-    RemainingRequestMilliseconds(ADeadline, ATimeoutMilliseconds));
+  { A signal delivered while select() blocks fails it with EINTR — a healthy
+    socket, not a fault. Recompute the remaining time to the deadline (which
+    raises once it lapses) and wait again; only a different error is fatal.
+    The fd sets are rebuilt each pass because select() leaves their contents
+    unspecified after an EINTR return. }
+  repeat
+    fpFD_ZERO(ReadSet);
+    fpFD_ZERO(WriteSet);
+    ReadSetPointer := nil;
+    WriteSetPointer := nil;
+    if ARead then
+    begin
+      fpFD_SET(ASock, ReadSet);
+      ReadSetPointer := @ReadSet;
+    end;
+    if AWrite then
+    begin
+      fpFD_SET(ASock, WriteSet);
+      WriteSetPointer := @WriteSet;
+    end;
+    Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
+      RemainingRequestMilliseconds(ADeadline, ATimeoutMilliseconds));
+    if Ready >= 0 then
+      Break;
+    if fpgeterrno <> ESysEINTR then
+      raise EHTTPError.Create('HTTP socket readiness wait failed');
+  until False;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  FillChar(ReadSet, SizeOf(ReadSet), 0);
-  FillChar(WriteSet, SizeOf(WriteSet), 0);
-  FillChar(ExceptSet, SizeOf(ExceptSet), 0);
-  ReadSetPointer := nil;
-  WriteSetPointer := nil;
-  ExceptSetPointer := nil;
-  if ARead then
-  begin
-    ReadSet.fd_count := 1;
-    ReadSet.fd_array[0] := ASock;
-    ReadSetPointer := @ReadSet;
-  end;
-  if AWrite then
-  begin
-    WriteSet.fd_count := 1;
-    WriteSet.fd_array[0] := ASock;
-    WriteSetPointer := @WriteSet;
-  end;
-  if ARead or AWrite then
-  begin
-    { Winsock may report a failed nonblocking connect only through the
-      exception set. Writability alone can therefore wait until the request
-      deadline even though SO_ERROR is already available. Callers still read
-      SO_ERROR or perform their send/receive operation after readiness. }
-    ExceptSet.fd_count := 1;
-    ExceptSet.fd_array[0] := ASock;
-    ExceptSetPointer := @ExceptSet;
-  end;
-  Remaining := RemainingRequestMilliseconds(ADeadline,
-    ATimeoutMilliseconds);
-  Timeout.tv_sec := Remaining div 1000;
-  Timeout.tv_usec := (Remaining mod 1000) * 1000;
-  Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer,
-    ExceptSetPointer, @Timeout);
+  { Mirror the POSIX EINTR tolerance: Winsock's select() fails with WSAEINTR
+    when interrupted, and the socket is still fine. Recompute the timeout and
+    retry; any other error is fatal. }
+  repeat
+    FillChar(ReadSet, SizeOf(ReadSet), 0);
+    FillChar(WriteSet, SizeOf(WriteSet), 0);
+    FillChar(ExceptSet, SizeOf(ExceptSet), 0);
+    ReadSetPointer := nil;
+    WriteSetPointer := nil;
+    ExceptSetPointer := nil;
+    if ARead then
+    begin
+      ReadSet.fd_count := 1;
+      ReadSet.fd_array[0] := ASock;
+      ReadSetPointer := @ReadSet;
+    end;
+    if AWrite then
+    begin
+      WriteSet.fd_count := 1;
+      WriteSet.fd_array[0] := ASock;
+      WriteSetPointer := @WriteSet;
+    end;
+    if ARead or AWrite then
+    begin
+      { Winsock may report a failed nonblocking connect only through the
+        exception set. Writability alone can therefore wait until the request
+        deadline even though SO_ERROR is already available. Callers still read
+        SO_ERROR or perform their send/receive operation after readiness. }
+      ExceptSet.fd_count := 1;
+      ExceptSet.fd_array[0] := ASock;
+      ExceptSetPointer := @ExceptSet;
+    end;
+    Remaining := RemainingRequestMilliseconds(ADeadline,
+      ATimeoutMilliseconds);
+    Timeout.tv_sec := Remaining div 1000;
+    Timeout.tv_usec := (Remaining mod 1000) * 1000;
+    Ready := WinSock2.select(0, ReadSetPointer, WriteSetPointer,
+      ExceptSetPointer, @Timeout);
+    if Ready >= 0 then
+      Break;
+    if WSAGetLastError <> WSAEINTR then
+      raise EHTTPError.Create('HTTP socket readiness wait failed');
+  until False;
   {$ENDIF}
   if Ready = 0 then
     RaiseRequestDeadline(ATimeoutMilliseconds);
-  if Ready < 0 then
-    raise EHTTPError.Create('HTTP socket readiness wait failed');
   CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
 end;
 
@@ -422,15 +440,22 @@ begin
   end;
   if ConnectResult <> 0 then
   begin
-    WaitForSocket(Result, False, True, ADeadline, ATimeoutMilliseconds);
-    SocketError := 0;
-    SocketErrorLength := SizeOf(SocketError);
-    if (fpGetSockOpt(Result, SOL_SOCKET, SO_ERROR, @SocketError,
-       @SocketErrorLength) <> 0) or (SocketError <> 0) then
-    begin
+    { WaitForSocket can raise (deadline lapsed or select failure); the just
+      created socket must be closed on any exit through this block or its fd
+      leaks. Mirrors the Windows connect path's try/except. The getsockopt
+      failure path raises inside the try so the single except closes the fd
+      exactly once. }
+    try
+      WaitForSocket(Result, False, True, ADeadline, ATimeoutMilliseconds);
+      SocketError := 0;
+      SocketErrorLength := SizeOf(SocketError);
+      if (fpGetSockOpt(Result, SOL_SOCKET, SO_ERROR, @SocketError,
+         @SocketErrorLength) <> 0) or (SocketError <> 0) then
+        raise EHTTPError.CreateFmt('Failed to connect to %s:%d',
+          [AHost, APort]);
+    except
       CloseSocket(Result);
-      raise EHTTPError.CreateFmt('Failed to connect to %s:%d',
-        [AHost, APort]);
+      raise;
     end;
   end;
 end;
@@ -940,7 +965,15 @@ begin
       ChunkSize := Integer(ChunkSizeValue);
       if ChunkSize = 0 then Break;
 
-      while Length(ChunkBuf) < ChunkSize + 2 do
+      { Compare in Int64: with MaxResponseBodyBytes = High(Integer) the guard
+        above admits ChunkSize = High(Integer), so a 32-bit `ChunkSize + 2`
+        overflows to a large negative value, the fill loop is skipped, and
+        AppendBodyBytes then Move()s High(Integer) bytes out of a near-empty
+        ChunkBuf (out-of-bounds read). The widened compare keeps buffering
+        until ChunkSize + 2 bytes are present or a body-limit / truncated-body
+        guard fires, so the trailing Delete(ChunkBuf, 1, ChunkSize + 2) is
+        only reached once ChunkSize + 2 fits in an Integer. }
+      while Int64(Length(ChunkBuf)) < Int64(ChunkSize) + 2 do
       begin
         N := RecvBytes(ASock, ATransport, Buf, RECV_BUF_SIZE, ADeadline,
           AOptions.RequestTimeoutMilliseconds);
