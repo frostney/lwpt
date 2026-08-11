@@ -3348,7 +3348,10 @@ begin
       Move(Segment[0], Received[Offset], Length(Segment));
       Inc(Offset, Length(Segment));
     end;
-    Expect<Integer>(Length(Received)).ToBe(Length(Expected));
+    if Length(Received) <> Length(Expected) then
+      raise Exception.CreateFmt(
+        'Retained SChannel plaintext length differs: expected %d, got %d',
+        [Length(Expected), Length(Received)]);
     if CompareByte(Expected[0], Received[0], Length(Expected)) <> 0 then
       for I := 0 to High(Expected) do
         if Expected[I] <> Received[I] then
