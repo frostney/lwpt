@@ -11,6 +11,7 @@ uses
   SysUtils,
 
   LWPT.BuildRequest,
+  LWPT.Command.Testing,
   LWPT.CompilerDriver,
   LWPT.Core,
   LWPT.ProcessRunner,
@@ -56,6 +57,7 @@ type
     procedure TestBuiltInBlaiseProfileDispatchesWithoutFallback;
     procedure TestExplicitTargetRoundTripsWithoutFallback;
     procedure TestGenericTestsRejectNonHostTarget;
+    procedure TestWindowsX86TargetRunsOnX64Host;
   end;
 
 function ReadInput: string;
@@ -922,6 +924,21 @@ begin
     .ToBe(True);
 end;
 
+procedure TCompilerProfiles.TestWindowsX86TargetRunsOnX64Host;
+var
+  Target: TLWPTTarget;
+begin
+  Target.OS := 'win32';
+  Target.Architecture := 'i386';
+  Expect<Boolean>(TestTargetRunsOnHost(Target, 'windows', 'x86_64'))
+    .ToBe(True);
+  Expect<Boolean>(TestTargetRunsOnHost(Target, 'linux', 'x86_64'))
+    .ToBe(False);
+  Target.Architecture := 'x86_64';
+  Expect<Boolean>(TestTargetRunsOnHost(Target, 'windows', 'x86'))
+    .ToBe(False);
+end;
+
 procedure TCompilerProfiles.SetupTests;
 begin
   Test('root external profile drives real build and test',
@@ -956,6 +973,8 @@ begin
     TestExplicitTargetRoundTripsWithoutFallback);
   Test('generic tests reject a non-host compiler target',
     TestGenericTestsRejectNonHostTarget);
+  Test('Windows x86 test artifacts run on an x86_64 host through WOW64',
+    TestWindowsX86TargetRunsOnX64Host);
 end;
 
 begin

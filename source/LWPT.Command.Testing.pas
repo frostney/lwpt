@@ -8,8 +8,11 @@ unit LWPT.Command.Testing;
 interface
 
 uses
+  LWPT.BuildRequest,
   LWPT.CompilerRegistry;
 
+function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
+  const AHostOS, AHostArchitecture: string): Boolean;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
   const AJobs, ABail: Integer; const AVerbose: Boolean): Integer; overload;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
@@ -23,7 +26,6 @@ uses
   Process,
   SysUtils,
 
-  LWPT.BuildRequest,
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.CompilerDriver,
@@ -36,20 +38,33 @@ uses
   LWPT.WorkerBudget,
   Platform;
 
-function TestTargetIsHost(const ATarget: TLWPTTarget): Boolean;
+function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
+  const AHostOS, AHostArchitecture: string): Boolean;
 var
   OSMatches, ArchitectureMatches: Boolean;
 begin
-  OSMatches := SameText(ATarget.OS, Platform.GetBuildOS)
+  OSMatches := SameText(ATarget.OS, AHostOS)
     or (IsWindowsOperatingSystem(ATarget.OS)
-        and IsWindowsOperatingSystem(Platform.GetBuildOS));
+        and IsWindowsOperatingSystem(AHostOS));
   ArchitectureMatches := SameText(ATarget.Architecture,
-    Platform.GetBuildArch)
+    AHostArchitecture)
     or ((SameText(ATarget.Architecture, 'i386')
          or SameText(ATarget.Architecture, 'x86'))
-        and (SameText(Platform.GetBuildArch, 'i386')
-             or SameText(Platform.GetBuildArch, 'x86')));
+        and (SameText(AHostArchitecture, 'i386')
+             or SameText(AHostArchitecture, 'x86')))
+    { WOW64 makes a 32-bit Windows executable a native-runnable host
+      artifact on 64-bit x86 Windows. }
+    or (OSMatches and IsWindowsOperatingSystem(AHostOS)
+        and (SameText(ATarget.Architecture, 'i386')
+             or SameText(ATarget.Architecture, 'x86'))
+        and SameText(AHostArchitecture, 'x86_64'));
   Result := OSMatches and ArchitectureMatches;
+end;
+
+function TestTargetIsHost(const ATarget: TLWPTTarget): Boolean;
+begin
+  Result := TestTargetRunsOnHost(ATarget, Platform.GetBuildOS,
+    Platform.GetBuildArch);
 end;
 
 type
