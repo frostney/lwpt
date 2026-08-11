@@ -838,12 +838,6 @@ type
     hCertStore: Pointer;
   end;
 
-  TSecPkgContextCertificates = record
-    cCertificates: LongWord;
-    cbCertificateChain: LongWord;
-    pbCertificateChain: PByte;
-  end;
-
   TSChannelTestClient = record
     Context: TSecHandle;
     Credential: TSecHandle;
@@ -873,7 +867,6 @@ const
   SECBUFFER_ATTRMASK = $F0000000;
   SECPKG_ATTR_STREAM_SIZES = 4;
   SECPKG_ATTR_REMOTE_CERT_CONTEXT = $53;
-  SECPKG_ATTR_REMOTE_CERTIFICATES = $5F;
   CERT_NAME_SIMPLE_DISPLAY_TYPE = 4;
   SECPKG_CRED_OUTBOUND = 2;
   SEC_E_OK = SECURITY_STATUS($00000000);
@@ -1371,23 +1364,27 @@ begin
     Move(Buffer[0], Result[1], Length(Buffer));
 end;
 
-{ Subject names of every certificate the peer sent, comma separated. The
-  server's bundled intermediate has to be among them, which is what pins the
-  credential snapshot keeping the imported PKCS#12 store alive (closed without
-  CERT_CLOSE_STORE_FORCE_FLAG) — SChannel builds the server flight from the
-  leaf's associated store. Returning the list rather than a Boolean makes a
-  failure say what actually arrived. }
-function SChannelClientDeliveredChainNames(
-  var AClient: TSChannelTestClient): string;
+{ What the peer actually put on the wire: the subject names and how many
+  certificates there were, both from one walk of the store SChannel attaches
+  to SECPKG_ATTR_REMOTE_CERT_CONTEXT. That store is documented to hold the
+  certificates the peer supplied, and taking both numbers from the same
+  enumeration means the two can never disagree.
+
+  It is also the measurement that cannot be contaminated by the issuer this
+  process publishes into the user's CA store. Round 3 of the Windows CI proved
+  that empirically: before publication existed the same walk returned exactly
+  "localhost", where a walk that consulted local stores would have listed the
+  runner's whole CA store. }
+procedure SChannelClientDeliveredChain(var AClient: TSChannelTestClient;
+  out ANames: string; out ACount: Integer);
 var
   Certificate: PCertContext;
   Enumerated: PCertContext;
   Name: array[0..255] of AnsiChar;
 begin
-  Result := '';
+  ANames := '';
+  ACount := 0;
   Certificate := nil;
-  { SECPKG_ATTR_REMOTE_CERT_CONTEXT is the documented source: once read, its
-    hCertStore holds the intermediate certificates the peer sent, if any. }
   if QueryContextAttributesW(@AClient.Context,
     SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Certificate) <> SEC_E_OK then
     raise Exception.Create('Raw SChannel client has no remote certificate');
@@ -1400,9 +1397,10 @@ begin
       FillChar(Name, SizeOf(Name), 0);
       CertGetNameStringA(Enumerated, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nil,
         @Name[0], Length(Name));
-      if Result <> '' then
-        Result := Result + ', ';
-      Result := Result + StrPas(@Name[0]);
+      if ANames <> '' then
+        ANames := ANames + ', ';
+      ANames := ANames + StrPas(@Name[0]);
+      Inc(ACount);
       Enumerated := CertEnumCertificatesInStore(Certificate^.hCertStore,
         Enumerated);
     end;
@@ -1410,26 +1408,6 @@ begin
     if Assigned(Certificate) then
       CertFreeCertificateContext(Certificate);
   end;
-end;
-
-{ How many certificates the peer actually put on the wire. Independent of any
-  store semantics, so a chain-delivery failure can say whether the flight was
-  short or the lookup was. }
-function SChannelClientDeliveredCertificateCount(
-  var AClient: TSChannelTestClient): Integer;
-var
-  Certificates: TSecPkgContextCertificates;
-begin
-  FillChar(Certificates, SizeOf(Certificates), 0);
-  if QueryContextAttributesW(@AClient.Context,
-    SECPKG_ATTR_REMOTE_CERTIFICATES, @Certificates) <> SEC_E_OK then
-  begin
-    Result := -1;
-    Exit;
-  end;
-  Result := Integer(Certificates.cCertificates);
-  if Assigned(Certificates.pbCertificateChain) then
-    FreeContextBuffer(Certificates.pbCertificateChain);
 end;
 
 procedure ShutdownSChannelClient(var AClient: TSChannelTestClient);
@@ -3205,15 +3183,20 @@ begin
   FillChar(Client, SizeOf(Client), 0);
   try
     CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
-    Delivered := SChannelClientDeliveredChainNames(Client);
-    DeliveredCount := SChannelClientDeliveredCertificateCount(Client);
+    SChannelClientDeliveredChain(Client, Delivered, DeliveredCount);
     if Pos(INTERMEDIATE_COMMON_NAME, Delivered) = 0 then
       raise Exception.CreateFmt(
         'Server flight omitted the bundled intermediate; ' +
         'flight certificates: %d; delivered: %s',
         [DeliveredCount, Delivered]);
     Expect<Boolean>(Pos(INTERMEDIATE_COMMON_NAME, Delivered) > 0).ToBe(True);
-    Expect<Boolean>(DeliveredCount >= 2).ToBe(True);
+    { Exactly the bundle: leaf plus its one intermediate, no root and nothing
+      swept in from a local store. }
+    if DeliveredCount <> 2 then
+      raise Exception.CreateFmt(
+        'Server flight carried %d certificates instead of the bundled 2: %s',
+        [DeliveredCount, Delivered]);
+    Expect<Integer>(DeliveredCount).ToBe(2);
   finally
     AbortTransportSecurityServer(Connection);
     FreeSChannelClient(Client);
