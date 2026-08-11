@@ -2714,6 +2714,16 @@ type
     cbBlockSize: LongWord;
   end;
 
+  TSecPkgContextConnectionInfo = record
+    dwProtocol: LongWord;
+    aiCipher: LongWord;
+    dwCipherStrength: LongWord;
+    aiHash: LongWord;
+    dwHashStrength: LongWord;
+    aiExch: LongWord;
+    dwExchStrength: LongWord;
+  end;
+
   PSchannelCred = ^TSchannelCred;
   TSchannelCred = record
     dwVersion: LongWord;
@@ -2731,6 +2741,59 @@ type
     dwFlags: LongWord;
     dwCredFormat: LongWord;
   end;
+
+  PTlsParameters = ^TTlsParameters;
+  TTlsParameters = record
+    cAlpnIds: LongWord;
+    rgstrAlpnIds: Pointer;
+    grbitDisabledProtocols: LongWord;
+    cDisabledCrypto: LongWord;
+    pDisabledCrypto: Pointer;
+    dwFlags: LongWord;
+  end;
+
+  PSchCredentials = ^TSchCredentials;
+  TSchCredentials = record
+    dwVersion: LongWord;
+    dwCredFormat: LongWord;
+    cCreds: LongWord;
+    paCred: Pointer;
+    hRootStore: Pointer;
+    cMappers: LongWord;
+    aphMappers: Pointer;
+    dwSessionLifespan: LongWord;
+    dwFlags: LongWord;
+    cTlsParameters: LongWord;
+    pTlsParameters: PTlsParameters;
+  end;
+
+  TRtlOsVersionInfoW = record
+    dwOSVersionInfoSize: LongWord;
+    dwMajorVersion: LongWord;
+    dwMinorVersion: LongWord;
+    dwBuildNumber: LongWord;
+    dwPlatformId: LongWord;
+    szCSDVersion: array[0..127] of WideChar;
+  end;
+
+{$IFDEF CPU64}
+  {$IF SizeOf(TSchCredentials) <> 72}
+    {$FATAL SCH_CREDENTIALS v5 layout mismatch on 64-bit Windows}
+  {$ENDIF}
+  {$IF SizeOf(TTlsParameters) <> 40}
+    {$FATAL TLS_PARAMETERS layout mismatch on 64-bit Windows}
+  {$ENDIF}
+{$ELSE}
+  {$IF SizeOf(TSchCredentials) <> 44}
+    {$FATAL SCH_CREDENTIALS v5 layout mismatch on 32-bit Windows}
+  {$ENDIF}
+  {$IF SizeOf(TTlsParameters) <> 24}
+    {$FATAL TLS_PARAMETERS layout mismatch on 32-bit Windows}
+  {$ENDIF}
+{$ENDIF}
+  {$IF SizeOf(TRtlOsVersionInfoW) <> 276}
+    {$FATAL RTL_OSVERSIONINFOW layout mismatch on Windows}
+  {$ENDIF}
 
   TSChannelData = class
   public
@@ -2754,6 +2817,7 @@ const
   SECBUFFER_STREAM_TRAILER = 6;
   SECBUFFER_STREAM_HEADER = 7;
   SECPKG_ATTR_STREAM_SIZES = 4;
+  SECPKG_ATTR_CONNECTION_INFO = $5A;
   SEC_E_OK = SECURITY_STATUS($00000000);
   SEC_I_CONTINUE_NEEDED = SECURITY_STATUS($00090312);
   SEC_I_CONTEXT_EXPIRED = SECURITY_STATUS($00090317);
@@ -2767,11 +2831,13 @@ const
   ISC_REQ_ALLOCATE_MEMORY = $00000100;
   ISC_REQ_STREAM = $00008000;
   SCHANNEL_CRED_VERSION = 4;
+  SCH_CREDENTIALS_VERSION = 5;
   SCH_USE_STRONG_CRYPTO = $00400000;
   SCHANNEL_SHUTDOWN = 1;
   SECURITY_NATIVE_DREP = $00000010;
   UNISP_NAME = 'Microsoft Unified Security Protocol Provider';
   SECBUFFER_ATTRMASK = $F0000000;
+  WINDOWS_10_1809_BUILD = 17763;
 
 function AcquireCredentialsHandleW(APrincipal: PWideChar; APackage: PWideChar;
   ACredentialUse: LongWord; ALogonId: Pointer; AAuthData: Pointer;
@@ -2802,6 +2868,20 @@ function DeleteSecurityContext(AContext: PCtxtHandle): SECURITY_STATUS; stdcall;
   external 'secur32.dll' name 'DeleteSecurityContext';
 function FreeCredentialsHandle(ACredential: PCredHandle): SECURITY_STATUS; stdcall;
   external 'secur32.dll' name 'FreeCredentialsHandle';
+function RtlGetVersion(var AVersion: TRtlOsVersionInfoW): LongInt; stdcall;
+  external 'ntdll.dll' name 'RtlGetVersion';
+
+function SChannelSupportsTlsParameters: Boolean;
+var
+  Version: TRtlOsVersionInfoW;
+begin
+  FillChar(Version, SizeOf(Version), 0);
+  Version.dwOSVersionInfoSize := SizeOf(Version);
+  Result := (RtlGetVersion(Version) = 0) and
+    ((Version.dwMajorVersion > 10) or
+     ((Version.dwMajorVersion = 10) and
+      (Version.dwBuildNumber >= WINDOWS_10_1809_BUILD)));
+end;
 
 function SecBufferKind(const ABufferType: LongWord): LongWord; inline;
 begin
@@ -3408,12 +3488,14 @@ type
     OutputCapacity: Integer;
     OutputOffset: Integer;
     PeerClosed: Boolean;
+    PostHandshakeInProgress: Boolean;
     PendingPlaintext: TBytes;
     PendingPlaintextOffset: Integer;
     Plaintext: TBytes;
     PlaintextOffset: Integer;
     RecordBuffer: TBytes;
     RecordOffset: Integer;
+    Protocol: LongWord;
     ShutdownStarted: Boolean;
     Snapshot: TSChannelServerCredentialData;
     StreamSizes: TSecPkgContextStreamSizes;
@@ -3427,7 +3509,12 @@ const
   ASC_REQ_ALLOCATE_MEMORY = $00000100;
   ASC_REQ_EXTENDED_ERROR = $00008000;
   ASC_REQ_STREAM = $00010000;
+  SP_PROT_SSL2_SERVER = $00000004;
+  SP_PROT_SSL3_SERVER = $00000010;
+  SP_PROT_TLS1_0_SERVER = $00000040;
+  SP_PROT_TLS1_1_SERVER = $00000100;
   SP_PROT_TLS1_2_SERVER = $00000400;
+  SP_PROT_TLS1_3_SERVER = $00001000;
   SCH_CRED_NO_SYSTEM_MAPPER = $00000002;
   X509_ASN_ENCODING = $00000001;
   PKCS_7_ASN_ENCODING = $00010000;
@@ -4021,16 +4108,19 @@ function CreateSChannelServerSnapshot(const APkcs12Identity: TBytes;
   const AValidation: TTransportSecurityServerIdentityValidation):
   TSChannelServerCredentialData;
 var
+  AuthenticationData: Pointer;
   CallerOwnsKey: LongBool;
-  Credentials: TSchannelCred;
   Expiry: SECURITY_INTEGER;
   Identity: TBytes;
   IdentityBlob: TCryptDataBlob;
   KeyHandle: PtrUInt;
   KeySpecification: LongWord;
+  LegacyCredentials: TSchannelCred;
+  ModernCredentials: TSchCredentials;
   Passphrase: array of WideChar;
   Snapshot: TSChannelServerCredentialData;
   Status: SECURITY_STATUS;
+  TlsParameters: TTlsParameters;
 begin
   Result := nil;
   if Length(APkcs12Identity) = 0 then
@@ -4111,18 +4201,45 @@ begin
 
     PublishSChannelServerIssuers(Snapshot);
 
-    FillChar(Credentials, SizeOf(Credentials), 0);
-    Credentials.dwVersion := SCHANNEL_CRED_VERSION;
-    Credentials.cCreds := 1;
-    Credentials.paCred := @Snapshot.Certificate;
-    { SCHANNEL_CRED (structure version 4) tops out at TLS 1.2, so pinning the
-      server to SP_PROT_TLS1_2_SERVER reproduces the OpenSSL backend's
-      TLS 1.2 floor exactly rather than merely bounding it from below. }
-    Credentials.grbitEnabledProtocols := SP_PROT_TLS1_2_SERVER;
-    Credentials.dwFlags := SCH_USE_STRONG_CRYPTO or SCH_CRED_NO_SYSTEM_MAPPER;
+    AuthenticationData := nil;
+    FillChar(LegacyCredentials, SizeOf(LegacyCredentials), 0);
+    FillChar(ModernCredentials, SizeOf(ModernCredentials), 0);
+    FillChar(TlsParameters, SizeOf(TlsParameters), 0);
+    if SChannelSupportsTlsParameters then
+    begin
+      { SCH_CREDENTIALS v5 leaves the protocol ceiling to the operating
+        system. Disable every protocol below TLS 1.2 explicitly so Windows 11
+        and Server 2022 can negotiate TLS 1.3 without weakening the public
+        floor. TLS_PARAMETERS first shipped in Windows 10 version 1809; the
+        manifest-independent RtlGetVersion gate above prevents passing this
+        structure to older supported hosts. }
+      TlsParameters.grbitDisabledProtocols := SP_PROT_SSL2_SERVER or
+        SP_PROT_SSL3_SERVER or SP_PROT_TLS1_0_SERVER or
+        SP_PROT_TLS1_1_SERVER;
+      ModernCredentials.dwVersion := SCH_CREDENTIALS_VERSION;
+      ModernCredentials.cCreds := 1;
+      ModernCredentials.paCred := @Snapshot.Certificate;
+      ModernCredentials.dwFlags := SCH_USE_STRONG_CRYPTO or
+        SCH_CRED_NO_SYSTEM_MAPPER;
+      ModernCredentials.cTlsParameters := 1;
+      ModernCredentials.pTlsParameters := @TlsParameters;
+      AuthenticationData := @ModernCredentials;
+    end
+    else
+    begin
+      { SCHANNEL_CRED v4 is the Windows 8-compatible fallback. It cannot
+        enable TLS 1.3, which those hosts do not provide, so pin TLS 1.2. }
+      LegacyCredentials.dwVersion := SCHANNEL_CRED_VERSION;
+      LegacyCredentials.cCreds := 1;
+      LegacyCredentials.paCred := @Snapshot.Certificate;
+      LegacyCredentials.grbitEnabledProtocols := SP_PROT_TLS1_2_SERVER;
+      LegacyCredentials.dwFlags := SCH_USE_STRONG_CRYPTO or
+        SCH_CRED_NO_SYSTEM_MAPPER;
+      AuthenticationData := @LegacyCredentials;
+    end;
     Status := AcquireCredentialsHandleW(nil,
       PWideChar(WideString(UNISP_NAME)), SECPKG_CRED_INBOUND, nil,
-      @Credentials, nil, nil, @Snapshot.Credential, @Expiry);
+      AuthenticationData, nil, nil, @Snapshot.Credential, @Expiry);
     if Status <> SEC_E_OK then
       raise ETransportSecurityError.CreateFmt(
         'Failed to acquire SChannel server credentials: 0x%x',
@@ -4421,6 +4538,7 @@ end;
 function HandshakeSChannelServer(
   var AConnection: TTransportSecurityConnection): TTransportSecurityState;
 var
+  ConnectionInfo: TSecPkgContextConnectionInfo;
   ContextAttributes: LongWord;
   Data: TSChannelServerData;
   ExistingContext: PCtxtHandle;
@@ -4447,6 +4565,7 @@ begin
   end;
   if Data.HandshakeDone then
   begin
+    Data.PostHandshakeInProgress := False;
     Result := tssDone;
     Exit;
   end;
@@ -4525,6 +4644,16 @@ begin
         Result := tssError;
         Exit;
       end;
+      FillChar(ConnectionInfo, SizeOf(ConnectionInfo), 0);
+      Status := QueryContextAttributesW(@Data.Context,
+        SECPKG_ATTR_CONNECTION_INFO, @ConnectionInfo);
+      if Status <> SEC_E_OK then
+      begin
+        PoisonSChannelServerConnection(AConnection);
+        Result := tssError;
+        Exit;
+      end;
+      Data.Protocol := ConnectionInfo.dwProtocol;
       Data.HandshakeDone := True;
       AConnection.Active := True;
       if (SChannelServerPendingCiphertext(Data) > 0) or
@@ -4560,6 +4689,7 @@ var
   Buffers: array[0..3] of TSecBuffer;
   Data: TSChannelServerData;
   ExtraInput: TBytes;
+  HandshakeState: TTransportSecurityState;
   I: Integer;
   QualityOfProtection: LongWord;
   ReadLength: Integer;
@@ -4568,7 +4698,18 @@ begin
   Result.State := tssError;
   Result.BytesProcessed := 0;
   Data := SChannelServerData(AConnection);
-  if not Assigned(Data) or not Data.HandshakeDone then
+  if not Assigned(Data) then
+    Exit;
+  if Data.PostHandshakeInProgress then
+  begin
+    HandshakeState := HandshakeSChannelServer(AConnection);
+    if HandshakeState <> tssDone then
+    begin
+      Result.State := HandshakeState;
+      Exit;
+    end;
+  end;
+  if not Data.HandshakeDone then
     Exit;
   if Length(Data.PendingPlaintext) > 0 then
     raise ETransportSecurityError.Create(
@@ -4639,11 +4780,38 @@ begin
       Result.State := tssWantRead;
       Exit;
     end;
-    { SEC_I_RENEGOTIATE lands here deliberately. The OpenSSL backend sets
-      SSL_OP_NO_RENEGOTIATION, which makes a peer-initiated renegotiation a
-      fatal protocol error there; refusing it the same way keeps the
-      observable outcome identical instead of introducing a Windows-only
-      renegotiation path. }
+    { SECBUFFER_EXTRA points into EncryptedInput; some SChannel builds report
+      only cbBuffer, so preserve the input tail before replacing the array
+      that owns those bytes. }
+    SetLength(ExtraInput, 0);
+    for I := 1 to High(Buffers) do
+      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+    Data.EncryptedInput := ExtraInput;
+
+    if Status = SEC_I_RENEGOTIATE then
+    begin
+      { TLS 1.3 uses this status for post-handshake KeyUpdate and session
+        tickets; its extra bytes must re-enter AcceptSecurityContext. TLS 1.2
+        renegotiation remains fatal, preserving the no-renegotiation contract
+        shared with the OpenSSL backend. }
+      if Data.Protocol <> SP_PROT_TLS1_3_SERVER then
+      begin
+        PoisonSChannelServerConnection(AConnection);
+        Result.State := tssError;
+        Exit;
+      end;
+      Data.HandshakeDone := False;
+      Data.PostHandshakeInProgress := True;
+      HandshakeState := HandshakeSChannelServer(AConnection);
+      if HandshakeState <> tssDone then
+      begin
+        Result.State := HandshakeState;
+        Exit;
+      end;
+      Continue;
+    end;
     if (Status <> SEC_E_OK) and (Status <> SEC_I_CONTEXT_EXPIRED) then
     begin
       PoisonSChannelServerConnection(AConnection);
@@ -4664,16 +4832,6 @@ begin
         if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
           AppendBytes(Data.Plaintext, Buffers[I].pvBuffer,
             Buffers[I].cbBuffer);
-
-    { SECBUFFER_EXTRA points into EncryptedInput; some SChannel builds report
-      only cbBuffer, so preserve the input tail before replacing the array
-      that owns those bytes. }
-    SetLength(ExtraInput, 0);
-    for I := 1 to High(Buffers) do
-      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
-        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
-          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
-    Data.EncryptedInput := ExtraInput;
 
     if Status = SEC_I_CONTEXT_EXPIRED then
       Data.PeerClosed := True;

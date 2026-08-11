@@ -124,6 +124,7 @@ type
     procedure TestSChannelHandshakeRoundtripAndContextReuse;
     procedure TestSChannelInputFlowPrefixAdmissionAndCounters;
     procedure TestSChannelPeerCloseNotifyReportsPeerClosed;
+    procedure TestSChannelProtocolCeilingFollowsOperatingSystem;
     procedure TestSChannelReloadRetainsPreviousKeyContainer;
     procedure TestSChannelPendingCiphertextPointerAndPartialConsumption;
     procedure TestSChannelWriteWantRetryRetainsPlaintext;
@@ -829,6 +830,85 @@ type
     dwCredFormat: LongWord;
   end;
 
+  PTlsParameters = ^TTlsParameters;
+  TTlsParameters = record
+    cAlpnIds: LongWord;
+    rgstrAlpnIds: Pointer;
+    grbitDisabledProtocols: LongWord;
+    cDisabledCrypto: LongWord;
+    pDisabledCrypto: Pointer;
+    dwFlags: LongWord;
+  end;
+
+  TSchCredentials = record
+    dwVersion: LongWord;
+    dwCredFormat: LongWord;
+    cCreds: LongWord;
+    paCred: Pointer;
+    hRootStore: Pointer;
+    cMappers: LongWord;
+    aphMappers: Pointer;
+    dwSessionLifespan: LongWord;
+    dwFlags: LongWord;
+    cTlsParameters: LongWord;
+    pTlsParameters: PTlsParameters;
+  end;
+
+  TRtlOsVersionInfoW = record
+    dwOSVersionInfoSize: LongWord;
+    dwMajorVersion: LongWord;
+    dwMinorVersion: LongWord;
+    dwBuildNumber: LongWord;
+    dwPlatformId: LongWord;
+    szCSDVersion: array[0..127] of WideChar;
+  end;
+
+  TRtlOsVersionInfoExW = record
+    dwOSVersionInfoSize: LongWord;
+    dwMajorVersion: LongWord;
+    dwMinorVersion: LongWord;
+    dwBuildNumber: LongWord;
+    dwPlatformId: LongWord;
+    szCSDVersion: array[0..127] of WideChar;
+    wServicePackMajor: Word;
+    wServicePackMinor: Word;
+    wSuiteMask: Word;
+    wProductType: Byte;
+    wReserved: Byte;
+  end;
+
+  TSecPkgContextConnectionInfo = record
+    dwProtocol: LongWord;
+    aiCipher: LongWord;
+    dwCipherStrength: LongWord;
+    aiHash: LongWord;
+    dwHashStrength: LongWord;
+    aiExch: LongWord;
+    dwExchStrength: LongWord;
+  end;
+
+{$IFDEF CPU64}
+  {$IF SizeOf(TSchCredentials) <> 72}
+    {$FATAL Test SCH_CREDENTIALS v5 layout mismatch on 64-bit Windows}
+  {$ENDIF}
+  {$IF SizeOf(TTlsParameters) <> 40}
+    {$FATAL Test TLS_PARAMETERS layout mismatch on 64-bit Windows}
+  {$ENDIF}
+{$ELSE}
+  {$IF SizeOf(TSchCredentials) <> 44}
+    {$FATAL Test SCH_CREDENTIALS v5 layout mismatch on 32-bit Windows}
+  {$ENDIF}
+  {$IF SizeOf(TTlsParameters) <> 24}
+    {$FATAL Test TLS_PARAMETERS layout mismatch on 32-bit Windows}
+  {$ENDIF}
+{$ENDIF}
+  {$IF SizeOf(TRtlOsVersionInfoW) <> 276}
+    {$FATAL Test RTL_OSVERSIONINFOW layout mismatch on Windows}
+  {$ENDIF}
+  {$IF SizeOf(TRtlOsVersionInfoExW) <> 284}
+    {$FATAL Test RTL_OSVERSIONINFOEXW layout mismatch on Windows}
+  {$ENDIF}
+
   PCertContext = ^TCertContext;
   TCertContext = record
     dwCertEncodingType: LongWord;
@@ -866,12 +946,14 @@ const
   SECBUFFER_STREAM_HEADER = 7;
   SECBUFFER_ATTRMASK = $F0000000;
   SECPKG_ATTR_STREAM_SIZES = 4;
+  SECPKG_ATTR_CONNECTION_INFO = $5A;
   SECPKG_ATTR_REMOTE_CERT_CONTEXT = $53;
   CERT_NAME_SIMPLE_DISPLAY_TYPE = 4;
   SECPKG_CRED_OUTBOUND = 2;
   SEC_E_OK = SECURITY_STATUS($00000000);
   SEC_I_CONTINUE_NEEDED = SECURITY_STATUS($00090312);
   SEC_I_CONTEXT_EXPIRED = SECURITY_STATUS($00090317);
+  SEC_I_RENEGOTIATE = SECURITY_STATUS($00090321);
   SEC_E_INCOMPLETE_MESSAGE = SECURITY_STATUS($80090318);
   ISC_REQ_REPLAY_DETECT = $00000004;
   ISC_REQ_SEQUENCE_DETECT = $00000008;
@@ -881,14 +963,24 @@ const
   ISC_REQ_STREAM = $00008000;
   ISC_REQ_MANUAL_CRED_VALIDATION = $00080000;
   SCHANNEL_CRED_VERSION = 4;
+  SCH_CREDENTIALS_VERSION = 5;
   SCHANNEL_SHUTDOWN = 1;
   SCH_CRED_MANUAL_CRED_VALIDATION = $00000008;
   SCH_CRED_NO_DEFAULT_CREDS = $00000010;
   SCH_USE_STRONG_CRYPTO = $00400000;
   SP_PROT_TLS1_2_CLIENT = $00000800;
+  SP_PROT_TLS1_3_CLIENT = $00002000;
+  SP_PROT_SSL2_CLIENT = $00000008;
+  SP_PROT_SSL3_CLIENT = $00000020;
+  SP_PROT_TLS1_0_CLIENT = $00000080;
+  SP_PROT_TLS1_1_CLIENT = $00000200;
   SECURITY_NATIVE_DREP = $00000010;
   UNISP_NAME = 'Microsoft Unified Security Protocol Provider';
   SCHANNEL_TARGET_NAME = 'localhost';
+  WINDOWS_10_1809_BUILD = 17763;
+  WINDOWS_SERVER_2022_BUILD = 20348;
+  WINDOWS_11_BUILD = 22000;
+  VER_NT_WORKSTATION = 1;
 
 function AcquireCredentialsHandleW(APrincipal: PWideChar;
   APackage: PWideChar; ACredentialUse: LongWord; ALogonId: Pointer;
@@ -933,6 +1025,35 @@ function CertGetNameStringA(ACertificate: PCertContext; AType: LongWord;
   AFlags: LongWord; ATypeParameter: Pointer; AName: PAnsiChar;
   ANameLength: LongWord): LongWord; stdcall;
   external 'crypt32.dll' name 'CertGetNameStringA';
+function RtlGetVersion(AVersion: Pointer): LongInt; stdcall;
+  external 'ntdll.dll' name 'RtlGetVersion';
+
+function TestSChannelSupportsTlsParameters: Boolean;
+var
+  Version: TRtlOsVersionInfoW;
+begin
+  FillChar(Version, SizeOf(Version), 0);
+  Version.dwOSVersionInfoSize := SizeOf(Version);
+  Result := (RtlGetVersion(@Version) = 0) and
+    ((Version.dwMajorVersion > 10) or
+     ((Version.dwMajorVersion = 10) and
+      (Version.dwBuildNumber >= WINDOWS_10_1809_BUILD)));
+end;
+
+function TestSChannelSupportsTls13: Boolean;
+var
+  Version: TRtlOsVersionInfoExW;
+begin
+  FillChar(Version, SizeOf(Version), 0);
+  Version.dwOSVersionInfoSize := SizeOf(Version);
+  Result := (RtlGetVersion(@Version) = 0) and
+    ((Version.dwMajorVersion > 10) or
+     ((Version.dwMajorVersion = 10) and
+      (((Version.wProductType = VER_NT_WORKSTATION) and
+        (Version.dwBuildNumber >= WINDOWS_11_BUILD)) or
+       ((Version.wProductType <> VER_NT_WORKSTATION) and
+        (Version.dwBuildNumber >= WINDOWS_SERVER_2022_BUILD)))));
+end;
 
 function TestSecBufferKind(const ABufferType: LongWord): LongWord;
 begin
@@ -977,24 +1098,58 @@ end;
 
 procedure CreateSChannelClient(out AClient: TSChannelTestClient);
 var
-  Credentials: TSchannelCred;
+  AuthenticationData: Pointer;
   Expiry: SECURITY_INTEGER;
+  LegacyCredentials: TSchannelCred;
+  ModernCredentials: TSchCredentials;
   Status: SECURITY_STATUS;
+  TlsParameters: TTlsParameters;
 begin
   FillChar(AClient, SizeOf(AClient), 0);
-  FillChar(Credentials, SizeOf(Credentials), 0);
-  Credentials.dwVersion := SCHANNEL_CRED_VERSION;
-  Credentials.grbitEnabledProtocols := SP_PROT_TLS1_2_CLIENT;
-  Credentials.dwFlags := SCH_CRED_MANUAL_CRED_VALIDATION or
-    SCH_CRED_NO_DEFAULT_CREDS or SCH_USE_STRONG_CRYPTO;
+  FillChar(LegacyCredentials, SizeOf(LegacyCredentials), 0);
+  FillChar(ModernCredentials, SizeOf(ModernCredentials), 0);
+  FillChar(TlsParameters, SizeOf(TlsParameters), 0);
+  if TestSChannelSupportsTlsParameters then
+  begin
+    TlsParameters.grbitDisabledProtocols := SP_PROT_SSL2_CLIENT or
+      SP_PROT_SSL3_CLIENT or SP_PROT_TLS1_0_CLIENT or
+      SP_PROT_TLS1_1_CLIENT;
+    ModernCredentials.dwVersion := SCH_CREDENTIALS_VERSION;
+    ModernCredentials.dwFlags := SCH_CRED_MANUAL_CRED_VALIDATION or
+      SCH_CRED_NO_DEFAULT_CREDS or SCH_USE_STRONG_CRYPTO;
+    ModernCredentials.cTlsParameters := 1;
+    ModernCredentials.pTlsParameters := @TlsParameters;
+    AuthenticationData := @ModernCredentials;
+  end
+  else
+  begin
+    LegacyCredentials.dwVersion := SCHANNEL_CRED_VERSION;
+    LegacyCredentials.grbitEnabledProtocols := SP_PROT_TLS1_2_CLIENT;
+    LegacyCredentials.dwFlags := SCH_CRED_MANUAL_CRED_VALIDATION or
+      SCH_CRED_NO_DEFAULT_CREDS or SCH_USE_STRONG_CRYPTO;
+    AuthenticationData := @LegacyCredentials;
+  end;
   Status := AcquireCredentialsHandleW(nil, PWideChar(WideString(UNISP_NAME)),
-    SECPKG_CRED_OUTBOUND, nil, @Credentials, nil, nil, @AClient.Credential,
+    SECPKG_CRED_OUTBOUND, nil, AuthenticationData, nil, nil,
+    @AClient.Credential,
     @Expiry);
   if Status <> SEC_E_OK then
     raise Exception.CreateFmt(
       'Raw SChannel client credential acquisition failed: 0x%x',
       [LongWord(Status)]);
   AClient.HasCredential := True;
+end;
+
+function SChannelClientProtocol(
+  const AClient: TSChannelTestClient): LongWord;
+var
+  ConnectionInfo: TSecPkgContextConnectionInfo;
+begin
+  FillChar(ConnectionInfo, SizeOf(ConnectionInfo), 0);
+  if QueryContextAttributesW(@AClient.Context, SECPKG_ATTR_CONNECTION_INFO,
+    @ConnectionInfo) <> SEC_E_OK then
+    raise Exception.Create('Raw SChannel client protocol is unavailable');
+  Result := ConnectionInfo.dwProtocol;
 end;
 
 procedure FreeSChannelClient(var AClient: TSChannelTestClient);
@@ -1329,6 +1484,19 @@ begin
       Result := tssWantRead;
       Exit;
     end;
+    SetLength(ExtraInput, 0);
+    for I := 1 to High(Buffers) do
+      if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendTestBytes(ExtraInput, Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+    AClient.Incoming := ExtraInput;
+    if Status = SEC_I_RENEGOTIATE then
+    begin
+      AClient.Done := False;
+      Result := StepSChannelClientHandshake(AClient);
+      if Result <> tssDone then
+        Exit;
+      Continue;
+    end;
     if (Status <> SEC_E_OK) and (Status <> SEC_I_CONTEXT_EXPIRED) then
     begin
       Result := tssError;
@@ -1343,11 +1511,6 @@ begin
         if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
           AppendTestBytes(AClient.Plaintext, Buffers[I].pvBuffer,
             Buffers[I].cbBuffer);
-    SetLength(ExtraInput, 0);
-    for I := 1 to High(Buffers) do
-      if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
-        AppendTestBytes(ExtraInput, Buffers[I].pvBuffer, Buffers[I].cbBuffer);
-    AClient.Incoming := ExtraInput;
     if Status = SEC_I_CONTEXT_EXPIRED then
       AClient.PeerClosed := True;
   until False;
@@ -2898,6 +3061,37 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.
+  TestSChannelProtocolCeilingFollowsOperatingSystem;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  ExpectedProtocol: LongWord;
+  Observed: THandshakeObservations;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
+    if TestSChannelSupportsTls13 then
+      ExpectedProtocol := SP_PROT_TLS1_3_CLIENT
+    else
+      ExpectedProtocol := SP_PROT_TLS1_2_CLIENT;
+    Expect<LongWord>(SChannelClientProtocol(Client)).ToBe(ExpectedProtocol);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
   TestSChannelInputFlowPrefixAdmissionAndCounters;
 {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
 const
@@ -3516,6 +3710,9 @@ begin
   Skip('SChannel peer close_notify reports peer-closed',
     TestSChannelPeerCloseNotifyReportsPeerClosed,
     DARWIN_SKIP_REASON);
+  Skip('SChannel protocol ceiling follows operating-system capability',
+    TestSChannelProtocolCeilingFollowsOperatingSystem,
+    DARWIN_SKIP_REASON);
   Skip('SChannel identities import into isolated key containers',
     TestSChannelIdentityImportsIsolatedKeyContainers,
     DARWIN_SKIP_REASON);
@@ -3670,6 +3867,8 @@ begin
     TestSChannelGracefulCloseProducesCloseNotify);
   ServerTest('SChannel peer close_notify reports peer-closed',
     TestSChannelPeerCloseNotifyReportsPeerClosed);
+  ServerTest('SChannel protocol ceiling follows operating-system capability',
+    TestSChannelProtocolCeilingFollowsOperatingSystem);
   ServerTest('SChannel identities import into isolated key containers',
     TestSChannelIdentityImportsIsolatedKeyContainers);
   ServerTest('SChannel reload retains the previous key container',
@@ -3695,6 +3894,9 @@ begin
     SCHANNEL_CLIENT_SKIP_REASON);
   Skip('SChannel peer close_notify reports peer-closed',
     TestSChannelPeerCloseNotifyReportsPeerClosed,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel protocol ceiling follows operating-system capability',
+    TestSChannelProtocolCeilingFollowsOperatingSystem,
     SCHANNEL_CLIENT_SKIP_REASON);
   Skip('SChannel identities import into isolated key containers',
     TestSChannelIdentityImportsIsolatedKeyContainers,

@@ -114,8 +114,8 @@ unhandled critical extension (`EXFLAG_CRITICAL`) or an invalid policy encoding
 those two sub-cases are not reproduced. Everything ADR-0024 pins is enforced.
 
 `tsivPermissive` remains an explicit self-signed development option, and
-neither mode consults the Windows system trust store: `SCHANNEL_CRED` is built
-from the caller's bundle alone.
+neither mode consults the Windows system trust store: the SChannel credential
+is built from the caller's bundle alone.
 
 ### Private key lifetime
 
@@ -189,16 +189,28 @@ it can leave the snapshot's CNG key container; ordinary teardown and reload
 remove each snapshot's entries. Nothing is ever written to a root store, so
 trust is unaffected.
 
-### Protocol floor
+### Protocol floor and operating-system ceiling
 
-`SCHANNEL_CRED` (structure version 4) is used rather than `SCH_CREDENTIALS`
-(version 5) because it is declarable by hand next to the client-side SSPI
-declarations already in the unit and is available on every supported Windows
-version. It tops out at TLS 1.2, so `grbitEnabledProtocols` is pinned to
-`SP_PROT_TLS1_2_SERVER`. That reproduces the OpenSSL backend's TLS 1.2 floor
-exactly rather than merely bounding it from below. Raising the ceiling to
-TLS 1.3 is a follow-up that requires `SCH_CREDENTIALS` and a Windows 11 /
-Server 2022 floor.
+The public floor remains TLS 1.2 and the ceiling follows SChannel capability.
+Windows 10 version 1809 / Server 2019 introduced `SCH_CREDENTIALS` version 5
+and `TLS_PARAMETERS`. On those and newer hosts, the server uses version 5,
+explicitly disables SSL 2, SSL 3, TLS 1.0, and TLS 1.1, and leaves TLS 1.2 and
+newer protocols to operating-system policy. TLS 1.3 is therefore available on
+Windows 11 / Server 2022 and newer without dropping Windows 8 support.
+
+The selection gate calls manifest-independent `RtlGetVersion`, whose API is
+available on every supported host. Version 5 is selected only for Windows
+build 17763 or newer; a failed query and every older build take the
+`SCHANNEL_CRED` version 4 fallback pinned to `SP_PROT_TLS1_2_SERVER`. The code
+does not guess from undocumented credential-acquisition failure statuses.
+Compile-time size guards pin both version-5 structures on win32 and win64.
+
+SChannel reports TLS 1.3 post-handshake messages through
+`SEC_I_RENEGOTIATE`. After querying the established protocol, the server feeds
+that status's extra bytes back through `AcceptSecurityContext` only for TLS
+1.3, staging any response token through the same bounded output path. A TLS
+1.2 renegotiation attempt remains fatal, preserving ADR-0024's
+no-renegotiation contract.
 
 ## Consequences
 
@@ -216,8 +228,10 @@ Server 2022 floor.
   cases that need a loopback peer are split: the raw in-memory OpenSSL client
   drives them on Unix-not-Darwin, and a raw in-memory SChannel client drives
   the equivalent handshake, round-trip, flow-admission, write-retry, graceful
-  close, and peer-close cases on Windows. The Windows legs therefore exercise
-  the shipped Windows backend for the first time, on both win64 and win32.
+  close, and peer-close cases on Windows. The raw SChannel client uses the same
+  adaptive credential policy and asserts the negotiated protocol ceiling;
+  ordinary round-trip and close tests then exercise post-handshake TLS 1.3.
+  The Windows legs exercise the shipped backend on both win64 and win32.
 - ADR-0024 remains the canonical description of the server contract. This ADR
   supersedes only its Windows backend selection and its Windows OpenSSL
   prerequisite.
