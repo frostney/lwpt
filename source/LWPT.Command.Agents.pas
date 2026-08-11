@@ -48,7 +48,8 @@ uses
 
   CLI.Options,
   LWPT.Core,
-  LWPT.Manifest;
+  LWPT.Manifest,
+  LWPT.Manifest.Schema;
 
 const
   { AGENTS.md is the cross-harness agent-instructions convention
@@ -143,6 +144,43 @@ begin
   end;
 end;
 
+procedure AddManifestSchemaLines(var AText: string);
+var
+  Section: TLWPTManifestSchemaSection;
+  Field: TLWPTManifestSchemaField;
+  SectionSpec: TLWPTManifestSectionSpec;
+  FieldSpec: TLWPTManifestFieldSpec;
+  Line: string;
+begin
+  for Section := Low(TLWPTManifestSchemaSection)
+    to High(TLWPTManifestSchemaSection) do
+  begin
+    SectionSpec := ManifestSchemaSection(Section);
+    Line := '- ' + CodeSpan(SectionSpec.Path) + ' — ' + SectionSpec.Shape
+      + '; ' + ManifestScopeText(SectionSpec.Scope) + '; '
+      + ManifestInvalidPolicyText(SectionSpec.InvalidPolicy) + '; '
+      + ManifestUnknownKeyPolicyText(SectionSpec.UnknownKeyPolicy)
+      + '. ' + SectionSpec.Description;
+    AddLine(AText, Line);
+    for Field := SectionSpec.FirstField to SectionSpec.LastField do
+    begin
+      FieldSpec := ManifestSchemaField(Field);
+      Line := '  - ' + CodeSpan(FieldSpec.Name) + ': '
+        + ManifestValueKindText(FieldSpec.ValueKind) + '; '
+        + ManifestRequirementText(FieldSpec.Requirement);
+      if FieldSpec.DefaultValue <> '' then
+        Line := Line + '; default: ' + CodeSpan(FieldSpec.DefaultValue);
+      if (FieldSpec.Scope = mscRootOnly)
+        and (SectionSpec.Scope = mscAllManifests) then
+        Line := Line + '; ' + ManifestScopeText(FieldSpec.Scope);
+      Line := Line + '; '
+        + ManifestInvalidPolicyText(FieldSpec.InvalidPolicy) + '. '
+        + FieldSpec.Description;
+      AddLine(AText, Line);
+    end;
+  end;
+end;
+
 { The full marker-fenced region, LF line endings, ending with
   MARKER_END and no trailing newline (the splice supplies context). }
 function RenderRegion(const ARegistry: TSubcommandRegistry;
@@ -168,6 +206,15 @@ begin
   AddLine(Result, '### Run tasks');
   AddLine(Result, '');
   AddRunTaskLines(Result, AManifest);
+  AddLine(Result, '');
+  AddLine(Result, '### Manifest schema');
+  AddLine(Result, '');
+  AddLine(Result, 'Generated from the same immutable structural registry '
+    + 'used by manifest validation. Domain-specific syntax and cross-field '
+    + 'rules remain in the parser; see the project documentation for those '
+    + 'details.');
+  AddLine(Result, '');
+  AddManifestSchemaLines(Result);
   AddLine(Result, '');
   Result := Result + MARKER_END;
 end;

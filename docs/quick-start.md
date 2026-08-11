@@ -214,7 +214,7 @@ The full test policy (unit / integration / e2e / manual tiers, fixture rules, mo
 ```toml
 [dependencies]
 foo = "owner/foo@v1.2.3"                                           # bare-string
-bar = { source = "owner/bar", version = "^1.0", subdir = "src" }   # inline-table
+bar = { source = "owner/bar", version = "^1.0", include = ["src/**"] } # inline-table
 ```
 
 **`lwpt install: source = "http" is a legacy kind selector`** — same migration. The current syntax puts the locator in the source value: `"https://example.com/foo.tar.gz"` for an arbitrary tarball.

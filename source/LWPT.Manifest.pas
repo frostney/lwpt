@@ -283,6 +283,7 @@ implementation
 uses
   StrUtils,
 
+  LWPT.Manifest.Schema,
   OrderedStringMap,
   Platform,
   Semver;
@@ -630,7 +631,8 @@ end;
 { ───────────────────────────────────────────────────────────────────
   Manifest dep readers — both the bare-string shorthand
   `name = "<source>@<spec>"` AND the inline-table form
-  `name = { source = "...", version = "...", subdir = "..." }`
+  `name = { source = "...", version = "...", include = [...],
+            exclude = [...] }`
   go through ParseDependencySource + ParseVersionSpec for consistency.
   The earlier inline-table shape (source = "github|gitlab|..." +
   separate repo/ref/tag/asset keys) is rejected with a migration
@@ -712,9 +714,9 @@ begin
   end;
 end;
 
-{ Build dependencies affect scheduler correctness, so malformed values must
-  fail instead of silently dropping graph edges. }
-procedure ReadStrictStringArray(ANode: TTOMLNode; const AKey, APath: string;
+{ Structural validation has already checked the registry's declared kind and
+  item policy. This reader only projects the validated TOML array. }
+procedure ReadValidatedStringArray(ANode: TTOMLNode; const AKey: string;
   var AValues: TStringArray);
 var
   ArrNode: TTOMLNode;
@@ -722,29 +724,16 @@ var
 begin
   SetLength(AValues, 0);
   ArrNode := TomlGet(ANode, AKey);
-  if ArrNode = nil then Exit;
-  if not TomlIsArray(ArrNode) then
-    raise EManifestError.CreateFmt('%s must be an array of strings', [APath]);
+  if not TomlIsArray(ArrNode) then Exit;
   SetLength(AValues, ArrNode.Items.Count);
   for i := 0 to ArrNode.Items.Count - 1 do
-  begin
-    if not TomlIsString(ArrNode.Items[i]) then
-      raise EManifestError.CreateFmt(
-        '%s[%d] must be a string', [APath, i]);
     AValues[i] := ArrNode.Items[i].ScalarText;
-  end;
 end;
 
-procedure ReadStrictNonEmptyStringArray(ANode: TTOMLNode;
-  const AKey, APath: string; var AValues: TStringArray);
-var
-  i: Integer;
+procedure ReadValidatedNonEmptyStringArray(ANode: TTOMLNode;
+  const AKey: string; var AValues: TStringArray);
 begin
-  ReadStrictStringArray(ANode, AKey, APath, AValues);
-  for i := 0 to High(AValues) do
-    if AValues[i] = '' then
-      raise EManifestError.CreateFmt(
-        '%s[%d] must not be empty', [APath, i]);
+  ReadValidatedStringArray(ANode, AKey, AValues);
 end;
 
 function HasAnyKey(ANode: TTOMLNode; const AKeys: array of string): string;
@@ -772,7 +761,8 @@ begin
       + 'alongside source) is no longer supported. The source string '
       + 'itself now carries the locator. Rewrite as a bare shorthand '
       + '"name = ''<source>@<version>''" or an inline table with just '
-      + '{ source = "...", version = "...", subdir = "..." }. '
+      + '{ source = "...", version = "...", include = [...], '
+      + 'exclude = [...] }. '
       + 'See ADR-0009 for the syntax reference.',
       [ADep.Name, Legacy]);
 
@@ -842,7 +832,6 @@ procedure ParseHookEntry(ANode: TTOMLNode; const AName, AContext: string;
 var
   ArgsNode, InputsNode: TTOMLNode;
   i, n: Integer;
-  Pair: TTOMLNodeMap.TKeyValuePair;
 begin
   AHook := Default(THook);
   AHook.Name := AName;
@@ -856,18 +845,6 @@ begin
         '%s "%s": command must not be empty', [AContext, AName]);
     Exit;
   end;
-
-  if not TomlIsTable(ANode) then
-    raise EManifestError.CreateFmt(
-      '%s "%s": expected a command (string) or an inline table '
-      + '{ command = "..." [, args, inputs, output] }', [AContext, AName]);
-
-  for Pair in ANode.Children do
-    if (Pair.Key <> 'command') and (Pair.Key <> 'args')
-       and (Pair.Key <> 'inputs') and (Pair.Key <> 'output')
-       and (Pair.Key <> 'script') then
-      raise EManifestError.CreateFmt(
-        '%s "%s": unknown field "%s"', [AContext, AName, Pair.Key]);
 
   if TomlGet(ANode, 'script') <> nil then
     raise EManifestError.CreateFmt(
@@ -886,44 +863,24 @@ begin
       [AContext, AName]);
 
   ArgsNode := TomlGet(ANode, 'args');
-  if (ArgsNode <> nil) and not TomlIsArray(ArgsNode) then
-    raise EManifestError.CreateFmt(
-      '%s "%s": args must be an array of strings', [AContext, AName]);
   if TomlIsArray(ArgsNode) then
   begin
     SetLength(AHook.Runnable.Args, ArgsNode.Items.Count);
     for i := 0 to ArgsNode.Items.Count - 1 do
-      if TomlIsString(ArgsNode.Items[i]) then
-        AHook.Runnable.Args[i] := ArgsNode.Items[i].ScalarText
-      else
-        raise EManifestError.CreateFmt(
-          '%s "%s": args[%d] must be a string', [AContext, AName, i]);
+      AHook.Runnable.Args[i] := ArgsNode.Items[i].ScalarText;
     AHook.RawArgs := Copy(AHook.Runnable.Args, 0,
       Length(AHook.Runnable.Args));
   end;
 
   InputsNode := TomlGet(ANode, 'inputs');
-  if (InputsNode <> nil) and not TomlIsArray(InputsNode) then
-    raise EManifestError.CreateFmt(
-      '%s "%s": inputs must be an array of strings', [AContext, AName]);
   if TomlIsArray(InputsNode) then
   begin
     n := InputsNode.Items.Count;
     SetLength(AHook.Inputs, n);
     for i := 0 to n - 1 do
-      if TomlIsString(InputsNode.Items[i])
-         and (InputsNode.Items[i].ScalarText <> '') then
-        AHook.Inputs[i] := InputsNode.Items[i].ScalarText
-      else
-        raise EManifestError.CreateFmt(
-          '%s "%s": inputs[%d] must be a non-empty string',
-          [AContext, AName, i]);
+      AHook.Inputs[i] := InputsNode.Items[i].ScalarText;
   end;
 
-  if (TomlGet(ANode, 'output') <> nil)
-     and not TomlIsString(TomlGet(ANode, 'output')) then
-    raise EManifestError.CreateFmt(
-      '%s "%s": output must be a string', [AContext, AName]);
   AHook.Output := TomlStr(ANode, 'output', '');
 
   { Staleness-pair invariant: inputs + output are both present or
@@ -1316,34 +1273,9 @@ begin
   Result := False;
 end;
 
-procedure ParseBuildTarget(ANode: TTOMLNode; const APath: string;
-  var AEntry: TLWPTBuildEntry);
-var
-  Pair: TTOMLNodeMap.TKeyValuePair;
+procedure ParseBuildTarget(ANode: TTOMLNode; var AEntry: TLWPTBuildEntry);
 begin
   if ANode = nil then Exit;
-  if not TomlIsTable(ANode) then
-    raise EManifestError.CreateFmt('%s must be a table', [APath]);
-  for Pair in ANode.Children do
-    if (Pair.Key <> 'os') and (Pair.Key <> 'architecture')
-       and (Pair.Key <> 'abi') and (Pair.Key <> 'environment') then
-      raise EManifestError.CreateFmt('%s has unknown field "%s"',
-        [APath, Pair.Key]);
-  if not TomlIsString(TomlGet(ANode, 'os'))
-     or (TomlStr(ANode, 'os', '') = '') then
-    raise EManifestError.CreateFmt('%s.os must be a non-empty string',
-      [APath]);
-  if not TomlIsString(TomlGet(ANode, 'architecture'))
-     or (TomlStr(ANode, 'architecture', '') = '') then
-    raise EManifestError.CreateFmt(
-      '%s.architecture must be a non-empty string', [APath]);
-  if (TomlGet(ANode, 'abi') <> nil)
-     and not TomlIsString(TomlGet(ANode, 'abi')) then
-    raise EManifestError.CreateFmt('%s.abi must be a string', [APath]);
-  if (TomlGet(ANode, 'environment') <> nil)
-     and not TomlIsString(TomlGet(ANode, 'environment')) then
-    raise EManifestError.CreateFmt('%s.environment must be a string',
-      [APath]);
   AEntry.HasTarget := True;
   AEntry.Target.OS := TomlStr(ANode, 'os', '');
   AEntry.Target.Architecture := TomlStr(ANode, 'architecture', '');
@@ -1353,46 +1285,6 @@ end;
 
 function ParseManifestContent(const APath, AContent: string;
   AIsRoot: Boolean): TManifest;
-const
-  { Recognised top-level sections — anything else either becomes a
-    run task (ADR-0013) when it carries a `command` field, OR
-    fires a single warning to stderr otherwise. The list is the
-    source of truth for "what does LWPT consume?".
-    NOTE: 'generated' + 'targets' are NOT in this list — both were
-    removed in earlier waves and now join the unknown-section
-    policy on equal footing with [teddybear]. }
-  KNOWN_SECTIONS: array[0..18] of string = (
-    'package', 'dependencies', 'sources', 'build', 'version',
-    PROGRAM_NAME, 'format', 'analysis', 'health', 'duplication', 'test',
-    'workspaces',
-    'compiler',
-    'preinstall', 'postinstall', 'prebuild', 'postbuild',
-    'pretest', 'posttest');
-  { Reserved section names — names that, if declared as a top-level
-    section carrying a `command` field, raise a hard error at manifest
-    load. Two classes:
-      - LWPT subcommands (ADR-0013) — would make `lwpt run <name>`
-        ambiguous with the built-in subcommand;
-      - Known configuration section names — already first-class
-        sections; using them as task names would be confusing
-        (and structurally they never reach the task-detection path
-        anyway because KNOWN_SECTIONS is checked first, but this
-        list makes the intent explicit). 'run' itself is included
-        because `lwpt run run` is the nonsense case. }
-  RESERVED_SUBCOMMAND_NAMES: array[0..23] of string = (
-    { subcommands }
-    'install', 'add', 'remove', 'build', 'format', 'test',
-    'repair', 'init', 'run', 'agents', 'health', 'duplication',
-    { configuration section names — defensive: ensure 'workspaces',
-      'package', 'dependencies' etc can NEVER end up registered as
-      run tasks even if a future refactor reorders KNOWN_SECTIONS
-      checks. Per the ADR-0014 amendment "Workspaces" clarification:
-      [workspaces] follows the same mechanism as [package] +
-      [dependencies] (recognised, parsed for all manifests, never
-      runnable). }
-    'package', 'dependencies', 'sources', 'workspaces',
-    'version', PROGRAM_NAME, 'format', 'analysis', 'health', 'duplication',
-    'compiler', 'generated');
 var
   Root, Deps, DepNode, ArrNode : TTOMLNode;
   BuildNode, EntryNode, VerNode   : TTOMLNode;
@@ -1440,10 +1332,12 @@ begin
   end;
 
   try
+    ValidateManifestStructure(Root, AIsRoot);
     Result.Name    := TomlStr(TomlGet(Root, 'package'), 'name', '');
-    Result.Version := TomlStr(TomlGet(Root, 'package'), 'version', '0.0.0');
+    Result.Version := TomlStr(TomlGet(Root, 'package'), 'version',
+      MANIFEST_DEFAULT_PACKAGE_VERSION);
     if Result.Name = '' then
-      Result.Name := TomlStr(Root, 'name', 'unnamed');
+      Result.Name := TomlStr(Root, 'name', MANIFEST_DEFAULT_NAME);
 
     { [package] units/includes arrays }
     ArrNode := TomlGet(TomlGet(Root, 'package'), 'units');
@@ -1527,7 +1421,8 @@ begin
     { [dependencies] — each child is either a bare string in the
       ADR-0009 shorthand form `name = "<source>@<spec>"`, or an
       inline table `name = { source = "...", version = "...",
-      subdir = "..." }`. The earlier shape (separate source/repo/ref
+      include = [...], exclude = [...] }`. The earlier shape (separate
+      source/repo/ref
       keys with source = "github|gitlab|...") is hard-errored with
       a migration hint. }
     Deps := TomlGet(Root, 'dependencies');
@@ -1643,14 +1538,12 @@ begin
       scope resolver can apply root defaults unless a workspace opts out with
       an explicit section. }
     AnalysisNode := TomlGet(Root, 'analysis');
-    if AnalysisNode <> nil then
+    if TomlIsTable(AnalysisNode) then
     begin
-      if not TomlIsTable(AnalysisNode) then
-        raise EManifestError.Create('[analysis] must be a table');
       Result.AnalysisConfigured := True;
-      ReadStrictStringArray(AnalysisNode, 'include', 'analysis.include',
+      ReadValidatedStringArray(AnalysisNode, 'include',
         Result.AnalysisIncludes);
-      ReadStrictStringArray(AnalysisNode, 'exclude', 'analysis.exclude',
+      ReadValidatedStringArray(AnalysisNode, 'exclude',
         Result.AnalysisExcludes);
     end;
 
@@ -1658,24 +1551,11 @@ begin
       absent values preserve report-only behavior. Hotspot scores use the
       documented 0..100 normalized scale. }
     HealthNode := TomlGet(Root, 'health');
-    if HealthNode <> nil then
+    if TomlIsTable(HealthNode) then
     begin
-      if not TomlIsTable(HealthNode) then
-        raise EManifestError.Create('[health] must be a table');
       Result.HealthConfigured := True;
-      for Pair in HealthNode.Children do
-        if (Pair.Key <> 'max-routine-cyclomatic')
-          and (Pair.Key <> 'max-routine-cognitive')
-          and (Pair.Key <> 'max-file-cyclomatic')
-          and (Pair.Key <> 'max-file-cognitive')
-          and (Pair.Key <> 'max-hotspot-score') then
-          raise EManifestError.CreateFmt(
-            '[health] unknown setting "%s"', [Pair.Key]);
 
       BailNode := TomlGet(HealthNode, 'max-routine-cyclomatic');
-      if (BailNode <> nil) and not TomlIsInt(BailNode) then
-        raise EManifestError.Create(
-          '[health] max-routine-cyclomatic must be a non-negative integer');
       BailValue := TomlInt(HealthNode, 'max-routine-cyclomatic', -1);
       if ((BailNode <> nil) and (BailValue < 0))
         or (BailValue > High(Integer)) then
@@ -1684,9 +1564,6 @@ begin
       Result.HealthMaxRoutineCyclomatic := Integer(BailValue);
 
       BailNode := TomlGet(HealthNode, 'max-routine-cognitive');
-      if (BailNode <> nil) and not TomlIsInt(BailNode) then
-        raise EManifestError.Create(
-          '[health] max-routine-cognitive must be a non-negative integer');
       BailValue := TomlInt(HealthNode, 'max-routine-cognitive', -1);
       if ((BailNode <> nil) and (BailValue < 0))
         or (BailValue > High(Integer)) then
@@ -1695,9 +1572,6 @@ begin
       Result.HealthMaxRoutineCognitive := Integer(BailValue);
 
       BailNode := TomlGet(HealthNode, 'max-file-cyclomatic');
-      if (BailNode <> nil) and not TomlIsInt(BailNode) then
-        raise EManifestError.Create(
-          '[health] max-file-cyclomatic must be a non-negative integer');
       BailValue := TomlInt(HealthNode, 'max-file-cyclomatic', -1);
       if ((BailNode <> nil) and (BailValue < 0))
         or (BailValue > High(Integer)) then
@@ -1706,9 +1580,6 @@ begin
       Result.HealthMaxFileCyclomatic := Integer(BailValue);
 
       BailNode := TomlGet(HealthNode, 'max-file-cognitive');
-      if (BailNode <> nil) and not TomlIsInt(BailNode) then
-        raise EManifestError.Create(
-          '[health] max-file-cognitive must be a non-negative integer');
       BailValue := TomlInt(HealthNode, 'max-file-cognitive', -1);
       if ((BailNode <> nil) and (BailValue < 0))
         or (BailValue > High(Integer)) then
@@ -1717,9 +1588,6 @@ begin
       Result.HealthMaxFileCognitive := Integer(BailValue);
 
       BailNode := TomlGet(HealthNode, 'max-hotspot-score');
-      if (BailNode <> nil) and not TomlIsInt(BailNode) then
-        raise EManifestError.Create(
-          '[health] max-hotspot-score must be an integer from 0 to 100');
       BailValue := TomlInt(HealthNode, 'max-hotspot-score', -1);
       if ((BailNode <> nil) and (BailValue < 0)) or (BailValue > 100) then
         raise EManifestError.Create(
@@ -1732,16 +1600,10 @@ begin
       exclusion. Integer percentages keep comparison and serialization
       deterministic on every supported RTL. }
     DuplicationNode := TomlGet(Root, 'duplication');
-    if DuplicationNode <> nil then
+    if TomlIsTable(DuplicationNode) then
     begin
-      if not TomlIsTable(DuplicationNode) then
-        raise EManifestError.Create('[duplication] must be a table');
       Result.DuplicationConfigured := True;
       MinimumTokensNode := TomlGet(DuplicationNode, 'minimum-tokens');
-      if (MinimumTokensNode <> nil) and not TomlIsInt(MinimumTokensNode) then
-        raise EManifestError.CreateFmt(
-          '[duplication] minimum-tokens must be an integer of at least %d',
-          [MANIFEST_DUPLICATION_MINIMUM_TOKEN_FLOOR]);
       if MinimumTokensNode <> nil then
       begin
         DuplicationValue := TomlInt(DuplicationNode, 'minimum-tokens', -1);
@@ -1753,9 +1615,6 @@ begin
         Result.DuplicationMinimumTokens := Integer(DuplicationValue);
       end;
       MaximumPercentNode := TomlGet(DuplicationNode, 'maximum-percent');
-      if (MaximumPercentNode <> nil) and not TomlIsInt(MaximumPercentNode) then
-        raise EManifestError.Create(
-          '[duplication] maximum-percent must be an integer from 0 to 100');
       if MaximumPercentNode <> nil then
       begin
         DuplicationValue := TomlInt(DuplicationNode, 'maximum-percent', -1);
@@ -1773,12 +1632,9 @@ begin
     if TomlIsTable(TestNode) then
     begin
       if AIsRoot then
-        ReadStrictNonEmptyStringArray(TestNode, 'flags', 'test.flags',
+        ReadValidatedNonEmptyStringArray(TestNode, 'flags',
           Result.TestFlags);
       BailNode := TomlGet(TestNode, 'bail');
-      if (BailNode <> nil) and not TomlIsInt(BailNode) then
-        raise EManifestError.Create(
-          '[test] bail must be a non-negative integer');
       if BailNode <> nil then
       begin
         BailValue := TomlInt(TestNode, 'bail', -1);
@@ -1794,26 +1650,14 @@ begin
     if AIsRoot then
     begin
       CompilerNode := TomlGet(Root, 'compiler');
-      if CompilerNode <> nil then
+      if TomlIsTable(CompilerNode) then
       begin
-        if not TomlIsTable(CompilerNode) then
-          raise EManifestError.Create('[compiler] must be a table');
-        if (TomlGet(CompilerNode, 'default') <> nil)
-           and not TomlIsString(TomlGet(CompilerNode, 'default')) then
-          raise EManifestError.Create(
-            '[compiler] default must name a compiler profile');
         Result.CompilerDefault := TomlStr(CompilerNode, 'default', '');
         ProfilesNode := TomlGet(CompilerNode, 'profiles');
-        if (ProfilesNode <> nil) and not TomlIsTable(ProfilesNode) then
-          raise EManifestError.Create(
-            '[compiler.profiles] must be a table');
         if TomlIsTable(ProfilesNode) then
           for Pair in ProfilesNode.Children do
           begin
             ProfileNode := Pair.Value;
-            if not TomlIsTable(ProfileNode) then
-              raise EManifestError.CreateFmt(
-                '[compiler.profiles.%s] must be a table', [Pair.Key]);
             CompilerProfile := Default(TLWPTCompilerProfile);
             CompilerProfile.Name := Pair.Key;
             if CompilerProfileDeclared(Result.CompilerProfiles,
@@ -1821,11 +1665,6 @@ begin
               raise EManifestError.CreateFmt(
                 '[compiler.profiles] duplicate profile name "%s" '
                 + '(profile names are case-insensitive)', [Pair.Key]);
-            if (TomlGet(ProfileNode, 'driver') <> nil)
-               and not TomlIsString(TomlGet(ProfileNode, 'driver')) then
-              raise EManifestError.CreateFmt(
-                '[compiler.profiles.%s] driver must be a string',
-                [Pair.Key]);
             if TomlGet(ProfileNode, 'executable') <> nil then
               raise EManifestError.CreateFmt(
                 '[compiler.profiles.%s] legacy executable is no longer '
@@ -1835,33 +1674,16 @@ begin
                 '[compiler.profiles.%s] legacy script is no longer '
                 + 'supported; use command = "instantfpc" and put the '
                 + 'script path first in args', [Pair.Key]);
-            if (TomlGet(ProfileNode, 'command') <> nil)
-               and not TomlIsString(TomlGet(ProfileNode, 'command')) then
-              raise EManifestError.CreateFmt(
-                '[compiler.profiles.%s] command must be a string', [Pair.Key]);
-            if (TomlGet(ProfileNode, 'version') <> nil)
-               and not TomlIsString(TomlGet(ProfileNode, 'version')) then
-              raise EManifestError.CreateFmt(
-                '[compiler.profiles.%s] version must be a string',
-                [Pair.Key]);
             CompilerProfile.Driver := TomlStr(ProfileNode, 'driver', '');
             CompilerProfile.Runnable.Command := TomlStr(ProfileNode,
               'command', '');
-            ReadStrictStringArray(ProfileNode, 'args',
-              'compiler.profiles.' + Pair.Key + '.args',
+            ReadValidatedStringArray(ProfileNode, 'args',
               CompilerProfile.Runnable.Args);
             CompilerProfile.VersionConstraint := TomlStr(ProfileNode,
-              'version', '*');
+              'version', MANIFEST_DEFAULT_COMPILER_VERSION);
             if CompilerProfile.Name = '' then
               raise EManifestError.Create(
                 '[compiler.profiles] profile name must not be empty');
-            if CompilerProfile.Driver = '' then
-              raise EManifestError.CreateFmt(
-                '[compiler.profiles.%s] driver is required', [Pair.Key]);
-            if CompilerProfile.VersionConstraint = '' then
-              raise EManifestError.CreateFmt(
-                '[compiler.profiles.%s] version must not be empty',
-                [Pair.Key]);
             n := Length(Result.CompilerProfiles);
             SetLength(Result.CompilerProfiles, n + 1);
             Result.CompilerProfiles[n] := CompilerProfile;
@@ -1881,18 +1703,14 @@ begin
         if AIsRoot then ValidateBuildEntryName(Entry.Name);
         Entry.Source := TomlStr(BuildNode, 'source', '');
         Entry.Output := TomlStr(BuildNode, 'output', '');
-        ReadStrictStringArray(BuildNode, 'depends', 'build.depends',
+        ReadValidatedStringArray(BuildNode, 'depends',
           Entry.Depends);
         if AIsRoot then
         begin
-          ReadStrictNonEmptyStringArray(BuildNode, 'flags', 'build.flags',
+          ReadValidatedNonEmptyStringArray(BuildNode, 'flags',
             Entry.Flags);
-          if (TomlGet(BuildNode, 'compiler') <> nil)
-             and not TomlIsString(TomlGet(BuildNode, 'compiler')) then
-            raise EManifestError.Create(
-              'build.compiler must name a compiler profile');
           Entry.CompilerProfile := TomlStr(BuildNode, 'compiler', '');
-          ParseBuildTarget(TomlGet(BuildNode, 'target'), 'build.target', Entry);
+          ParseBuildTarget(TomlGet(BuildNode, 'target'), Entry);
         end;
         if Entry.Output = '' then Entry.Output := 'build/' + Result.Name;
         ParseHookSection(TomlGet(BuildNode, 'prebuild'),
@@ -1915,20 +1733,12 @@ begin
           begin
             Entry.Source := TomlStr(EntryNode, 'source', '');
             Entry.Output := TomlStr(EntryNode, 'output', '');
-            ReadStrictStringArray(EntryNode, 'depends',
-              'build.' + Entry.Name + '.depends', Entry.Depends);
+            ReadValidatedStringArray(EntryNode, 'depends', Entry.Depends);
             if AIsRoot then
             begin
-              ReadStrictNonEmptyStringArray(EntryNode, 'flags',
-                'build.' + Entry.Name + '.flags', Entry.Flags);
-              if (TomlGet(EntryNode, 'compiler') <> nil)
-                 and not TomlIsString(TomlGet(EntryNode, 'compiler')) then
-                raise EManifestError.CreateFmt(
-                  'build.%s.compiler must name a compiler profile',
-                  [Entry.Name]);
+              ReadValidatedNonEmptyStringArray(EntryNode, 'flags', Entry.Flags);
               Entry.CompilerProfile := TomlStr(EntryNode, 'compiler', '');
-              ParseBuildTarget(TomlGet(EntryNode, 'target'),
-                'build.' + Entry.Name + '.target', Entry);
+              ParseBuildTarget(TomlGet(EntryNode, 'target'), Entry);
             end;
             ParseHookSection(TomlGet(EntryNode, 'prebuild'),
               'build.' + Entry.Name + '.prebuild', Entry.PreBuild);
@@ -1964,10 +1774,11 @@ begin
     if TomlIsTable(VerNode) then
     begin
       Result.VersionIncOut := TomlStr(VerNode, 'output', '');
-      Result.VersionPrefix := TomlStr(VerNode, 'prefix', 'BAKED');
+      Result.VersionPrefix := TomlStr(VerNode, 'prefix',
+        MANIFEST_DEFAULT_VERSION_PREFIX);
     end
     else
-      Result.VersionPrefix := 'BAKED';
+      Result.VersionPrefix := MANIFEST_DEFAULT_VERSION_PREFIX;
 
     { [lwpt] — toolkit-state overrides. Empty string in the slot means
       "use the default" from the LWPT_DIR / MODULES_DIR / ... constants. }
@@ -2040,10 +1851,7 @@ begin
               names removed in earlier waves. }
       for Pair in Root.Children do
       begin
-        IsKnown := False;
-        for k := Low(KNOWN_SECTIONS) to High(KNOWN_SECTIONS) do
-          if Pair.Key = KNOWN_SECTIONS[k] then begin IsKnown := True; Break; end;
-        if IsKnown then Continue;
+        if IsKnownManifestSection(Pair.Key) then Continue;
 
         { Run-task detection: section is a table carrying a
           `command` field. Bare-string sections aren't possible in
@@ -2062,14 +1870,13 @@ begin
             case-variant section like [Agents] would list as a task
             yet be unreachable — `lwpt run Agents` dispatches the
             built-in. The reservation must match dispatch semantics. }
-          for k := Low(RESERVED_SUBCOMMAND_NAMES) to High(RESERVED_SUBCOMMAND_NAMES) do
-            if SameText(Pair.Key, RESERVED_SUBCOMMAND_NAMES[k]) then
-              raise EManifestError.CreateFmt(
-                'section [%s] shadows the built-in subcommand and '
-                + 'cannot be used as a run task. Rename the section '
-                + '(e.g. [%s-task]) or invoke the subcommand directly '
-                + '(`lwpt %s`). See ADR-0013.',
-                [Pair.Key, Pair.Key, Pair.Key]);
+          if IsReservedManifestTaskName(Pair.Key) then
+            raise EManifestError.CreateFmt(
+              'section [%s] shadows the built-in subcommand and '
+              + 'cannot be used as a run task. Rename the section '
+              + '(e.g. [%s-task]) or invoke the subcommand directly '
+              + '(`%s %s`). See ADR-0013.',
+              [Pair.Key, Pair.Key, PROGRAM_NAME, Pair.Key]);
           { Parse as a run task using the same shape as a hook entry. }
           ParseHookEntry(Pair.Value, Pair.Key,
             '[' + Pair.Key + ']', Hook);
