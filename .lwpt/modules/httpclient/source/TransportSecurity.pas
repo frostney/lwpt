@@ -3442,7 +3442,7 @@ const
   CERT_NCRYPT_KEY_SPEC = LongWord($FFFFFFFF);
   CERT_KEY_PROV_INFO_PROP_ID = 2;
   NCRYPT_SILENT_FLAG = $00000040;
-  CERT_STORE_ADD_NEW = 1;
+  CERT_STORE_ADD_ALWAYS = 4;
   INTERMEDIATE_AUTHORITY_STORE = 'CA';
   CERT_KEY_CERT_SIGN_KEY_USAGE = $04;
   { X509_PURPOSE_SSL_SERVER rejects a leaf whose key usage asserts none of
@@ -3980,28 +3980,39 @@ end;
 procedure PublishSChannelServerIssuers(
   const ASnapshot: TSChannelServerCredentialData);
 var
-  Added: PCertContext;
   Enumerated: PCertContext;
+  PublishedCount: Integer;
 begin
   ASnapshot.IssuerStore := CertOpenSystemStoreW(0,
     PWideChar(UnicodeString(INTERMEDIATE_AUTHORITY_STORE)));
   if not Assigned(ASnapshot.IssuerStore) then
     Exit;
   Enumerated := CertEnumCertificatesInStore(ASnapshot.Store, nil);
-  while Assigned(Enumerated) do
-  begin
-    if not SChannelSameCertificate(Enumerated, ASnapshot.Certificate) then
+  try
+    while Assigned(Enumerated) do
     begin
-      Added := nil;
-      if CertAddCertificateContextToStore(ASnapshot.IssuerStore, Enumerated,
-        CERT_STORE_ADD_NEW, @Added) and Assigned(Added) then
+      if not SChannelSameCertificate(Enumerated, ASnapshot.Certificate) then
       begin
+        { Grow before mutating the persistent store so every successfully
+          added entry immediately has an owner, even if a later allocation
+          fails. ADD_ALWAYS gives each concurrently live snapshot its own
+          exact entry; deleting an older snapshot's returned context can then
+          never withdraw the issuer from a newer one or from the user. }
+        PublishedCount := Length(ASnapshot.PublishedIssuers);
         SetLength(ASnapshot.PublishedIssuers,
-          Length(ASnapshot.PublishedIssuers) + 1);
-        ASnapshot.PublishedIssuers[High(ASnapshot.PublishedIssuers)] := Added;
+          PublishedCount + 1);
+        ASnapshot.PublishedIssuers[PublishedCount] := nil;
+        if not CertAddCertificateContextToStore(ASnapshot.IssuerStore,
+          Enumerated, CERT_STORE_ADD_ALWAYS,
+          @ASnapshot.PublishedIssuers[PublishedCount]) or
+          not Assigned(ASnapshot.PublishedIssuers[PublishedCount]) then
+          SetLength(ASnapshot.PublishedIssuers, PublishedCount);
       end;
+      Enumerated := CertEnumCertificatesInStore(ASnapshot.Store, Enumerated);
     end;
-    Enumerated := CertEnumCertificatesInStore(ASnapshot.Store, Enumerated);
+  finally
+    if Assigned(Enumerated) then
+      CertFreeCertificateContext(Enumerated);
   end;
 end;
 

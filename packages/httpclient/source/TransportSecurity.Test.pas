@@ -3280,7 +3280,11 @@ end;
 procedure TTransportSecurityServerTests.
   TestSChannelIdentityImportsIsolatedKeyContainers;
 {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+const
+  INTERMEDIATE_COMMON_NAME = 'TransportSecurity Test Intermediate CA';
 var
+  Delivered: string;
+  DeliveredCount: Integer;
   FirstClient: TSChannelTestClient;
   FirstConnection: TTransportSecurityConnection;
   FirstContext: TTransportSecurityServerContext;
@@ -3329,6 +3333,9 @@ begin
     CreateSChannelHandshakenPair(SecondContext, SurvivorConnection,
       SurvivorClient, Observed);
     Expect<Boolean>(SurvivorConnection.Active).ToBe(True);
+    SChannelClientDeliveredChain(SurvivorClient, Delivered, DeliveredCount);
+    Expect<Boolean>(Pos(INTERMEDIATE_COMMON_NAME, Delivered) > 0).ToBe(True);
+    Expect<Integer>(DeliveredCount).ToBe(2);
   finally
     AbortTransportSecurityServer(FirstConnection);
     AbortTransportSecurityServer(SecondConnection);
