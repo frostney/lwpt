@@ -207,10 +207,11 @@ Compile-time size guards pin both version-5 structures on win32 and win64.
 
 SChannel reports TLS 1.3 post-handshake messages through
 `SEC_I_RENEGOTIATE`. After querying the established protocol, the server feeds
-that status's extra bytes back through `AcceptSecurityContext` only for TLS
-1.3, staging any response token through the same bounded output path. A TLS
-1.2 renegotiation attempt remains fatal, preserving ADR-0024's
-no-renegotiation contract.
+the `SECBUFFER_DATA` span modified by `DecryptMessage` back through
+`AcceptSecurityContext` as `SECBUFFER_TOKEN` only for TLS 1.3, followed by any
+`SECBUFFER_EXTRA` ciphertext, and stages any response token through the same
+bounded output path. A TLS 1.2 renegotiation attempt remains fatal, preserving
+ADR-0024's no-renegotiation contract.
 
 ## Consequences
 
