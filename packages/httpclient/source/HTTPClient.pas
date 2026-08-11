@@ -38,11 +38,27 @@ type
 
   EHTTPError = class(Exception);
 
+  {$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+  { Test-only select seam. Production code must leave this nil. The hook can
+    simulate the two syscall outcomes that otherwise depend on signal and
+    network timing while leaving ordinary readiness to the real select call. }
+  THTTPClientSelectTestAction = (selectUseSystem, selectInterrupted,
+    selectFailed);
+  THTTPClientSelectTestHook = function(const ASocket: PtrInt;
+    const ARead, AWrite: Boolean;
+    const AAttempt: Integer): THTTPClientSelectTestAction;
+  {$ENDIF}
+
 const
   DEFAULT_MAX_RESPONSE_BODY_BYTES = Int64(64) * 1024 * 1024;
   DEFAULT_MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
   DEFAULT_REQUEST_TIMEOUT_MILLISECONDS = 120 * 1000;
   DEFAULT_MAXIMUM_REDIRECTS = 20;
+
+{$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
+var
+  HTTPClientSelectTestHook: THTTPClientSelectTestHook;
+{$ENDIF}
 
 function DefaultHTTPRequestOptions: THTTPRequestOptions;
 function HTTPGet(const AURL: string;
@@ -301,6 +317,8 @@ procedure WaitForSocket(const ASock: TSocket; const ARead, AWrite: Boolean;
 var
   ReadSet, WriteSet: TFDSet;
   ReadSetPointer, WriteSetPointer: PFDSet;
+  Attempt: Integer;
+  Interrupted: Boolean;
   Ready: Integer;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
@@ -313,22 +331,61 @@ var
 {$ENDIF}
 begin
   {$IFDEF UNIX}
-  fpFD_ZERO(ReadSet);
-  fpFD_ZERO(WriteSet);
-  ReadSetPointer := nil;
-  WriteSetPointer := nil;
-  if ARead then
-  begin
-    fpFD_SET(ASock, ReadSet);
-    ReadSetPointer := @ReadSet;
-  end;
-  if AWrite then
-  begin
-    fpFD_SET(ASock, WriteSet);
-    WriteSetPointer := @WriteSet;
-  end;
-  Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
-    RemainingRequestMilliseconds(ADeadline, ATimeoutMilliseconds));
+  { A signal delivered while select() blocks fails it with EINTR — a healthy
+    socket, not a fault. Recompute the remaining time to the deadline (which
+    raises once it lapses) and wait again; only a different error is fatal.
+    The fd sets are rebuilt each pass because select() leaves their contents
+    unspecified after an EINTR return. }
+  Attempt := 0;
+  repeat
+    Inc(Attempt);
+    fpFD_ZERO(ReadSet);
+    fpFD_ZERO(WriteSet);
+    ReadSetPointer := nil;
+    WriteSetPointer := nil;
+    if ARead then
+    begin
+      fpFD_SET(ASock, ReadSet);
+      ReadSetPointer := @ReadSet;
+    end;
+    if AWrite then
+    begin
+      fpFD_SET(ASock, WriteSet);
+      WriteSetPointer := @WriteSet;
+    end;
+    {$IFDEF HTTPCLIENT_TESTING}
+    if Assigned(HTTPClientSelectTestHook) then
+      case HTTPClientSelectTestHook(PtrInt(ASock), ARead, AWrite, Attempt) of
+        selectUseSystem:
+          begin
+            Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
+              RemainingRequestMilliseconds(ADeadline,
+                ATimeoutMilliseconds));
+            Interrupted := (Ready < 0) and (fpgeterrno = ESysEINTR);
+          end;
+        selectInterrupted:
+          begin
+            Ready := -1;
+            Interrupted := True;
+          end;
+        selectFailed:
+          begin
+            Ready := -1;
+            Interrupted := False;
+          end;
+      end
+    else
+    {$ENDIF}
+    begin
+      Ready := fpSelect(ASock + 1, ReadSetPointer, WriteSetPointer, nil,
+        RemainingRequestMilliseconds(ADeadline, ATimeoutMilliseconds));
+      Interrupted := (Ready < 0) and (fpgeterrno = ESysEINTR);
+    end;
+    if Ready >= 0 then
+      Break;
+    if not Interrupted then
+      raise EHTTPError.Create('HTTP socket readiness wait failed');
+  until False;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   FillChar(ReadSet, SizeOf(ReadSet), 0);
@@ -422,15 +479,22 @@ begin
   end;
   if ConnectResult <> 0 then
   begin
-    WaitForSocket(Result, False, True, ADeadline, ATimeoutMilliseconds);
-    SocketError := 0;
-    SocketErrorLength := SizeOf(SocketError);
-    if (fpGetSockOpt(Result, SOL_SOCKET, SO_ERROR, @SocketError,
-       @SocketErrorLength) <> 0) or (SocketError <> 0) then
-    begin
+    { WaitForSocket can raise (deadline lapsed or select failure); the just
+      created socket must be closed on any exit through this block or its fd
+      leaks. Mirrors the Windows connect path's try/except. The getsockopt
+      failure path raises inside the try so the single except closes the fd
+      exactly once. }
+    try
+      WaitForSocket(Result, False, True, ADeadline, ATimeoutMilliseconds);
+      SocketError := 0;
+      SocketErrorLength := SizeOf(SocketError);
+      if (fpGetSockOpt(Result, SOL_SOCKET, SO_ERROR, @SocketError,
+         @SocketErrorLength) <> 0) or (SocketError <> 0) then
+        raise EHTTPError.CreateFmt('Failed to connect to %s:%d',
+          [AHost, APort]);
+    except
       CloseSocket(Result);
-      raise EHTTPError.CreateFmt('Failed to connect to %s:%d',
-        [AHost, APort]);
+      raise;
     end;
   end;
 end;
@@ -937,6 +1001,13 @@ begin
         raise EHTTPError.CreateFmt(
           'HTTP response body exceeds configured limit of %d bytes',
           [AOptions.MaxResponseBodyBytes]);
+      { ChunkBuf must hold both the payload and its trailing CRLF. Reject a
+        frame that cannot fit in the Integer-indexed accumulator before any
+        addition can overflow, even when the caller permits that body size. }
+      if ChunkSizeValue > High(Integer) - 2 then
+        raise EHTTPError.CreateFmt(
+          'HTTP chunk size exceeds supported frame limit of %d bytes',
+          [High(Integer) - 2]);
       ChunkSize := Integer(ChunkSizeValue);
       if ChunkSize = 0 then Break;
 
