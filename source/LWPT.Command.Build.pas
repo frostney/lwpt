@@ -1122,7 +1122,8 @@ var
           Compiled[AIndex].ProjectRoot, Compiled[AIndex].CandidateBin,
           Compiled[AIndex].OutBin, Compiled[AIndex].Fingerprint,
           AManifestPath, Compiled[AIndex].CfgPath, LOCKFILE,
-          Compiled[AIndex].ModulesPath, PublicationRequest);
+          Compiled[AIndex].ModulesPath, PublicationRequest,
+          Session.SessionsRoot);
         if PublicationResult = bprStale then
         begin
           States[AIndex] := besFailed;

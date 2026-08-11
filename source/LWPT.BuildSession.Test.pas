@@ -48,6 +48,7 @@ type
     procedure TestHookInputChangeRefusesPublication;
     procedure TestNativeDriverRequestPreservesPublicationFingerprint;
     procedure TestExtraArgumentsChangePublicationFingerprint;
+    procedure TestPublicationLockUsesSessionsRoot;
     {$IFDEF UNIX}
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
     procedure TestDirectoryAliasesHaveDeterministicFingerprint;
@@ -826,6 +827,19 @@ begin
 end;
 {$ENDIF}
 
+procedure TLWPTBuildSessionTests.TestPublicationLockUsesSessionsRoot;
+var
+  LockPath, SessionsRoot: string;
+begin
+  ResetScratch;
+  SessionsRoot := FScratch + '/relocated/p-project';
+  LockPath := BuildPublicationLockPath(SessionsRoot,
+    FScratch + '/build/app');
+
+  Expect<Boolean>(PathContains(SessionsRoot, LockPath)).ToBe(True);
+  Expect<string>(ExtractFileDir(LockPath)).ToBe(SessionsRoot + '/locks');
+end;
+
 procedure TLWPTBuildSessionTests.TestRepairRemovesInactiveAndKeepsLiveSessions;
 var
   LiveSession, FailedSession: TLWPTBuildSession;
@@ -941,6 +955,8 @@ begin
     TestNativeDriverRequestPreservesPublicationFingerprint);
   Test('extra compiler arguments change the publication fingerprint',
     TestExtraArgumentsChangePublicationFingerprint);
+  Test('publication locks use the resolved sessions root',
+    TestPublicationLockUsesSessionsRoot);
   {$IFDEF UNIX}
   Test('symlinked search roots detect changes and terminate cycles',
     TestSymlinkedSearchRootChangeRefusesPublication);

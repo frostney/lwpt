@@ -81,6 +81,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestConcurrentBuildsUseDistinctSessions;
+    procedure TestConcurrentRelocatedRootsSharePublicationLock;
     procedure TestDeepProjectCanRelocateSessions;
     procedure TestDistinctOutputsPublishIndependentlyFromRootUnits;
     procedure TestFailedBuildPreservesLastSuccessfulOutput;
@@ -632,6 +633,71 @@ begin
     Expect<Integer>(RepairResult.ExitCode).ToBe(0);
     Expect<Integer>(CountSessionDirs).ToBe(0);
   finally
+    First.Free;
+    Second.Free;
+  end;
+end;
+
+procedure TBuildSessions.TestConcurrentRelocatedRootsSharePublicationLock;
+var
+  First, Second: TProcess;
+  FirstStatus, SecondStatus: Integer;
+  Ready: Boolean;
+  RealFPC, ReadyDir, ReleasePath, SessionRootA, SessionRootB: string;
+  Started: TDateTime;
+  FirstEnv, SecondEnv: array of string;
+begin
+  RecursiveDelete(FScratch + '/build');
+  ReadyDir := FScratch + '/control/relocated-ready';
+  ReleasePath := FScratch + '/control/relocated-release';
+  SessionRootA := FScratch + '/control/sessions-a';
+  SessionRootB := FScratch + '/control/sessions-b';
+  RecursiveDelete(FScratch + '/control');
+  RealFPC := TestCompilerExecutable;
+  SetLength(FirstEnv, 8);
+  FirstEnv[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  FirstEnv[1] := TEST_FPC_PROXY_ENV + '=1';
+  FirstEnv[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  FirstEnv[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  FirstEnv[4] := TEST_FPC_RELEASE_ENV + '=' + ReleasePath;
+  FirstEnv[5] := WORKER_STATE_DIR_ENV + '=' + FScratch
+    + '/control/relocated-worker-state';
+  FirstEnv[6] := WORKER_BUDGET_ENV + '=2';
+  FirstEnv[7] := BUILD_SESSION_DIR_ENV + '=' + SessionRootA;
+  SecondEnv := Copy(FirstEnv, 0, Length(FirstEnv));
+  SecondEnv[7] := BUILD_SESSION_DIR_ENV + '=' + SessionRootB;
+  First := StartBuildWithEnv(FScratch, 'app', FirstEnv);
+  Second := StartBuildWithEnv(FScratch, 'app', SecondEnv);
+  try
+    Ready := False;
+    Started := Now;
+    while First.Running or Second.Running do
+    begin
+      if CountReadyFiles(ReadyDir) >= 2 then
+      begin
+        Ready := True;
+        Break;
+      end;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
+      Sleep(10);
+    end;
+    if not Ready then
+      DumpBarrierDiagnostics('relocated-publication', ReadyDir);
+    WriteTextFile(ReleasePath, 'release');
+    First.WaitOnExit;
+    Second.WaitOnExit;
+    FirstStatus := First.ExitStatus;
+    SecondStatus := Second.ExitStatus;
+
+    Expect<Boolean>(Ready).ToBe(True);
+    Expect<Boolean>(((FirstStatus = 0) and (SecondStatus = 1))
+      or ((FirstStatus = 1) and (SecondStatus = 0))).ToBe(True);
+    Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app')))
+      .ToBe(True);
+  finally
+    WriteTextFile(ReleasePath, 'release');
+    if First.Running then First.WaitOnExit;
+    if Second.Running then Second.WaitOnExit;
     First.Free;
     Second.Free;
   end;
@@ -1344,6 +1410,8 @@ procedure TBuildSessions.SetupTests;
 begin
   Test('concurrent builds use distinct private sessions',
     TestConcurrentBuildsUseDistinctSessions);
+  Test('concurrent relocated roots share publication coordination',
+    TestConcurrentRelocatedRootsSharePublicationLock);
   Test('deep projects relocate sessions through manifest and environment',
     TestDeepProjectCanRelocateSessions);
   Test('distinct outputs publish independently with root units',

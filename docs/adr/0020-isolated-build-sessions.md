@@ -96,9 +96,15 @@ retaining sessions whose recorded process is alive.
   or publication instead of combining new on-disk bytes with stale parsed
   configuration.
 - Output-specific lock files use the physical destination-parent identity and
-  filesystem-appropriate filename casing. They are stable names backed by an
-  OS-held advisory
-  byte-range lock plus a keyed in-process critical section. This matters on
+  filesystem-appropriate filename casing. They live below the resolved
+  project-owned sessions namespace, so relocation also keeps publication
+  coordination out of a deep project path while the default remains
+  `.lwpt/sessions/locks/`. They are stable names backed by an OS-held advisory
+  byte-range lock plus a keyed in-process critical section. A brief
+  project-local coordinator lock shared with the historical-root ledger
+  prevents two concurrent publishers that selected different session roots
+  from splitting that output lock and both publishing the same stale
+  generation. This matters on
   Unix, where `fcntl` locks are process-scoped and do not serialize threads in
   the same LWPT process. OS ownership ends automatically when the handle closes
   or the process exits; no contender or repair operation unlinks another

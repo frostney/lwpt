@@ -90,11 +90,12 @@ function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
   const AEntrySource: string): Integer;
 procedure EnsureCompilerPathBudget(const AUnitDirectory,
   AExecutableDirectory: string; ALongestBaseNameLength: Integer);
-function BuildPublicationLockPath(const AProjectRoot, AOutput: string): string;
+function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
   ALockPath, AModulesPath: string;
-  const ARequest: TLWPTBuildPublicationRequest):
+  const ARequest: TLWPTBuildPublicationRequest;
+  const ASessionsRoot: string = ''):
   TLWPTBuildPublicationResult;
 procedure RepairBuildSessions(const AProjectRoot: string;
   out ARemoved, ARetained: Integer); overload;
@@ -1409,7 +1410,7 @@ begin
   FFinished := True;
 end;
 
-function BuildPublicationLockPath(const AProjectRoot, AOutput: string): string;
+function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
 var
   OutputIdentity, ParentPath, ParentIdentity, OutputName: string;
 begin
@@ -1427,7 +1428,7 @@ begin
   {$IFDEF DARWIN}
   OutputName := LowerCase(OutputName);
   {$ENDIF}
-  Result := RootedPath(AProjectRoot, BUILD_SESSIONS_DIR)
+  Result := ExcludeTrailingPathDelimiter(ASessionsRoot)
     + '/locks/' + Copy(TextHash(ParentIdentity + '/' + OutputName),
       8, 64) + '.lock';
 end;
@@ -1435,33 +1436,47 @@ end;
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
   ALockPath, AModulesPath: string;
-  const ARequest: TLWPTBuildPublicationRequest):
+  const ARequest: TLWPTBuildPublicationRequest;
+  const ASessionsRoot: string):
   TLWPTBuildPublicationResult;
 var
-  Lock: TLWPTPublicationLock;
-  CurrentFingerprint: string;
+  CoordinatorLock, Lock: TLWPTPublicationLock;
+  CurrentFingerprint, PublicationSessionsRoot: string;
   Destination: string;
 begin
   Destination := RootedPath(AProjectRoot, ADestinationPath);
-  Lock := TLWPTPublicationLock.Create(
-    BuildPublicationLockPath(AProjectRoot, Destination));
+  PublicationSessionsRoot := ASessionsRoot;
+  if PublicationSessionsRoot = '' then
+    PublicationSessionsRoot := RootedPath(AProjectRoot, BUILD_SESSIONS_DIR);
+  { Session-root selection can change while builds overlap. The project-local
+    ledger lock gives every root generation one publication rendezvous; the
+    output-specific lock remains in the resolved namespace for stable
+    same-root coordination. }
+  CoordinatorLock := TLWPTPublicationLock.Create(
+    BuildSessionLedgerLockPath(AProjectRoot));
   try
+    Lock := TLWPTPublicationLock.Create(
+      BuildPublicationLockPath(PublicationSessionsRoot, Destination));
     try
-      CurrentFingerprint := CaptureBuildPublicationFingerprint(
-        AProjectRoot, AManifestPath, ACfgPath, ALockPath, AModulesPath,
-        ARequest);
-    except
-      on ELWPTParsedManifestChanged do Exit(bprStale);
+      try
+        CurrentFingerprint := CaptureBuildPublicationFingerprint(
+          AProjectRoot, AManifestPath, ACfgPath, ALockPath, AModulesPath,
+          ARequest);
+      except
+        on ELWPTParsedManifestChanged do Exit(bprStale);
+      end;
+      if CurrentFingerprint <> AExpectedFingerprint then
+        Exit(bprStale);
+      if not AtomicReplaceFile(ACandidatePath, Destination) then
+        raise ELWPTError.CreateFmt(
+          'could not atomically publish "%s" to "%s"; the completed '
+          + 'candidate remains private', [ACandidatePath, Destination]);
+      Result := bprPublished;
+    finally
+      Lock.Free;
     end;
-    if CurrentFingerprint <> AExpectedFingerprint then
-      Exit(bprStale);
-    if not AtomicReplaceFile(ACandidatePath, Destination) then
-      raise ELWPTError.CreateFmt(
-        'could not atomically publish "%s" to "%s"; the completed '
-        + 'candidate remains private', [ACandidatePath, Destination]);
-    Result := bprPublished;
   finally
-    Lock.Free;
+    CoordinatorLock.Free;
   end;
 end;
 
