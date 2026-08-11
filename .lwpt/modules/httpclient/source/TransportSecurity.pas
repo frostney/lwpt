@@ -4846,6 +4846,9 @@ var
   Buffers: array[0..3] of TSecBuffer;
   ChunkLength: Integer;
   Data: TSChannelServerData;
+  EncryptedOffset: Integer;
+  EncryptedRecord: TBytes;
+  I: Integer;
   MessageLength: Integer;
   PendingLength: Integer;
   Retrying: Boolean;
@@ -4923,7 +4926,16 @@ begin
     end;
     MessageLength := Integer(Buffers[0].cbBuffer) +
       Integer(Buffers[1].cbBuffer) + Integer(Buffers[2].cbBuffer);
-    SetLength(Data.RecordBuffer, MessageLength);
+    SetLength(EncryptedRecord, MessageLength);
+    EncryptedOffset := 0;
+    for I := 0 to 2 do
+      if Buffers[I].cbBuffer > 0 then
+      begin
+        Move(Buffers[I].pvBuffer^, EncryptedRecord[EncryptedOffset],
+          Buffers[I].cbBuffer);
+        Inc(EncryptedOffset, Buffers[I].cbBuffer);
+      end;
+    Data.RecordBuffer := EncryptedRecord;
     Inc(Data.PendingPlaintextOffset, ChunkLength);
   end;
 
