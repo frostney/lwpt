@@ -3334,7 +3334,9 @@ begin
         Break;
     end;
     PumpSChannelServerCiphertext(Connection, Client);
-    Expect<Boolean>(WriteCompleted).ToBe(True);
+    if not WriteCompleted then
+      raise Exception.Create(
+        'Retained SChannel write did not complete after 128 drain steps');
 
     SetLength(Received, 0);
     Offset := 0;
@@ -3347,8 +3349,9 @@ begin
       Inc(Offset, Length(Segment));
     end;
     Expect<Integer>(Length(Received)).ToBe(Length(Expected));
-    Expect<Boolean>(CompareByte(Expected[0], Received[0],
-      Length(Expected)) = 0).ToBe(True);
+    if CompareByte(Expected[0], Received[0], Length(Expected)) <> 0 then
+      raise Exception.Create(
+        'Retained SChannel plaintext changed after caller mutation');
   finally
     AbortTransportSecurityServer(Connection);
     FreeSChannelClient(Client);
