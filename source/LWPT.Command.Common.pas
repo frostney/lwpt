@@ -230,10 +230,42 @@ begin
 end;
 
 function ResolveCommand(const AProjectRoot, ACommand: string): string;
+{$IFDEF WINDOWS}
+var
+  SearchPath: string;
+{$ENDIF}
 begin
-  Result := ACommand;
   if (Pos('/', ACommand) > 0) or (Pos('\', ACommand) > 0) then
+  begin
     Result := ResolveProjectPath(AProjectRoot, ACommand);
+    {$IFDEF WINDOWS}
+    if (ExtractFileExt(Result) = '') and not FileExists(Result) then
+    begin
+      if FileExists(Result + '.exe') then Result := Result + '.exe'
+      else if FileExists(Result + '.com') then Result := Result + '.com';
+    end;
+    {$ENDIF}
+    Exit;
+  end;
+
+  {$IFDEF WINDOWS}
+  { TProcess.Executable does not apply PATH or PATHEXT when it passes an
+    application name directly to CreateProcess. Search only the inherited
+    PATH (never the implicit current directory), without involving a shell. }
+  SearchPath := GetEnvironmentVariable('PATH');
+  Result := FileSearch(ACommand, SearchPath, [sfoStripQuotes]);
+  if (Result = '') and (ExtractFileExt(ACommand) = '') then
+  begin
+    Result := FileSearch(ACommand + '.exe', SearchPath, [sfoStripQuotes]);
+    if Result = '' then
+      Result := FileSearch(ACommand + '.com', SearchPath, [sfoStripQuotes]);
+  end;
+  if Result = '' then Result := ACommand;
+  {$ELSE}
+  { Leave Unix lookup to execvp so a non-executable entry does not mask a
+    later executable with the same name in PATH. }
+  Result := ACommand;
+  {$ENDIF}
 end;
 
 function PatternHasGlob(const APattern: string): Boolean;
