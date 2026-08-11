@@ -17,6 +17,8 @@ const
   BUILD_SESSION_SCHEMA_VERSION = 1;
   BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION = 1;
   BUILD_SESSIONS_DIR = LWPT_DIR + '/sessions';
+  BUILD_SESSION_DIR_ENV = PROJECT_NAME + '_SESSION_DIR';
+  BUILD_SESSION_ROOT_LEDGER = LWPT_DIR + '/session-roots';
   ObservabilityLogsDirectory = '/logs/';
   ObservabilityLogExtension = '.log';
   { FPC's RTL FileRec/TextRec name buffer holds this many characters. The
@@ -46,6 +48,8 @@ type
   TLWPTBuildSession = class
   private
     FProjectRoot: string;
+    FSessionsRoot: string;
+    FDefaultSessionsRoot: Boolean;
     FSessionID: string;
     FSessionRoot: string;
     FSessionOwnerGuardPath: string;
@@ -54,7 +58,8 @@ type
     function JobLogPath(const AName: string): string;
     procedure WriteState(const AState: string);
   public
-    constructor Create(const AProjectRoot: string);
+    constructor Create(const AProjectRoot: string); overload;
+    constructor Create(const AProjectRoot, ASessionsRoot: string); overload;
     destructor Destroy; override;
     function JobRoot(const AName: string): string;
     function JobLogReference(const AName: string): string;
@@ -64,7 +69,13 @@ type
     procedure Finish(ASuccess: Boolean; const ADetail: string = '');
     property SessionID: string read FSessionID;
     property SessionRoot: string read FSessionRoot;
+    property SessionsRoot: string read FSessionsRoot;
   end;
+
+function ResolveBuildSessionsRoot(const AProjectRoot,
+  AManifestSessionsDir, AEnvironmentBase: string): string;
+function BuildSessionsProjectRoot(const AProjectRoot,
+  AConfiguredRoot: string): string;
 
 function CaptureBuildPublicationFingerprint(
   const AProjectRoot, AManifestPath, ACfgPath, ALockPath,
@@ -79,14 +90,18 @@ function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
   const AEntrySource: string): Integer;
 procedure EnsureCompilerPathBudget(const AUnitDirectory,
   AExecutableDirectory: string; ALongestBaseNameLength: Integer);
-function BuildPublicationLockPath(const AProjectRoot, AOutput: string): string;
+function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
   ALockPath, AModulesPath: string;
-  const ARequest: TLWPTBuildPublicationRequest):
+  const ARequest: TLWPTBuildPublicationRequest;
+  const ASessionsRoot: string = ''):
   TLWPTBuildPublicationResult;
 procedure RepairBuildSessions(const AProjectRoot: string;
-  out ARemoved, ARetained: Integer);
+  out ARemoved, ARetained: Integer); overload;
+procedure RepairBuildSessions(const AProjectRoot, ATemporaryRoot: string;
+  out ARemoved, ARetained: Integer;
+  out ATemporaryRootCleaned: Boolean); overload;
 
 implementation
 
@@ -103,6 +118,9 @@ uses
 const
   PUBLICATION_LOCK_WAIT_MILLISECONDS = 30000;
   SESSION_PARTIAL_GRACE_MILLISECONDS = 5000;
+  SESSION_ROOT_LEDGER_SCHEMA_VERSION = 1;
+  SESSION_ROOT_IDENTITY_SCHEMA_VERSION = 2;
+  SESSION_ROOT_IDENTITY_FILE = 'project.identity';
   {$IFDEF UNIX}
   {$IFDEF LINUX}
   FD_CLOEXEC_LWPT = 1;
@@ -184,6 +202,20 @@ begin
   if Length(AText) > 0 then
     Move(AText[1], Bytes[0], Length(AText));
   Result := SHA256BytesPrefixed(Bytes);
+end;
+
+function ResolveBuildSessionsRoot(const AProjectRoot,
+  AManifestSessionsDir, AEnvironmentBase: string): string;
+var
+  EnvironmentValue: string;
+begin
+  EnvironmentValue := SysUtils.GetEnvironmentVariable(
+    BUILD_SESSION_DIR_ENV);
+  if EnvironmentValue <> '' then
+    Exit(RootedPath(AEnvironmentBase, EnvironmentValue));
+  if AManifestSessionsDir <> '' then
+    Exit(RootedPath(AProjectRoot, AManifestSessionsDir));
+  Result := RootedPath(AProjectRoot, BUILD_SESSIONS_DIR);
 end;
 
 function BuildSessionPathKey(const AValue: string): string;
@@ -959,6 +991,197 @@ begin
   inherited Destroy;
 end;
 
+function BuildSessionProjectIdentity(const AProjectRoot: string): string;
+var
+  IdentityPath, PhysicalIdentity: string;
+begin
+  IdentityPath := ExcludeTrailingPathDelimiter(ExpandFileName(AProjectRoot));
+  PhysicalIdentity := DirectoryIdentity(IdentityPath);
+  if PhysicalIdentity <> '' then
+    Exit(TextHash('build-session-project-physical-v1'#10
+      + PhysicalIdentity));
+  {$IFDEF MSWINDOWS}
+  IdentityPath := LowerCase(IdentityPath);
+  {$ENDIF}
+  Result := TextHash('build-session-project-path-v1'#10 + IdentityPath);
+end;
+
+function BuildSessionLedgerPath(const AProjectRoot: string): string;
+begin
+  Result := RootedPath(AProjectRoot, BUILD_SESSION_ROOT_LEDGER);
+end;
+
+function BuildSessionLedgerLockPath(const AProjectRoot: string): string;
+begin
+  Result := RootedPath(AProjectRoot, BUILD_SESSIONS_DIR)
+    + '/locks/session-roots.lock';
+end;
+
+function BuildSessionsProjectRoot(const AProjectRoot,
+  AConfiguredRoot: string): string;
+var
+  Identity: string;
+begin
+  if SamePath(AConfiguredRoot,
+    RootedPath(AProjectRoot, BUILD_SESSIONS_DIR)) then
+    Exit(ExpandFileName(AConfiguredRoot));
+  Identity := BuildSessionProjectIdentity(AProjectRoot);
+  Result := IncludeTrailingPathDelimiter(ExpandFileName(AConfiguredRoot))
+    + 'p-' + Copy(Identity, 8, 16);
+end;
+
+function SessionRootIdentityMatches(const ARoot,
+  AProjectIdentity: string): Boolean;
+var
+  IdentityPath, RootIdentity: string;
+  Lines: TStringList;
+begin
+  Result := False;
+  if ExtractFileName(ExcludeTrailingPathDelimiter(ARoot))
+    <> 'p-' + Copy(AProjectIdentity, 8, 16) then Exit;
+  if IsDirSymlinkOrJunction(ARoot) then Exit;
+  RootIdentity := DirectoryIdentity(ARoot);
+  if RootIdentity = '' then Exit;
+  IdentityPath := IncludeTrailingPathDelimiter(ARoot)
+    + SESSION_ROOT_IDENTITY_FILE;
+  if not FileExists(IdentityPath) then Exit;
+  if IsDirSymlinkOrJunction(IdentityPath) then Exit;
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(IdentityPath);
+    Result := (Lines.Count = 3)
+      and (Lines[0] = 'schema='
+        + IntToStr(SESSION_ROOT_IDENTITY_SCHEMA_VERSION))
+      and (Lines[1] = 'project=' + AProjectIdentity)
+      and (Lines[2] = 'root=' + RootIdentity);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure EnsureSessionRootIdentity(const ARoot,
+  AProjectIdentity: string);
+var
+  IdentityPath, RootIdentity: string;
+  Lines: TStringList;
+begin
+  if (Pos(#10, ARoot) > 0) or (Pos(#13, ARoot) > 0) then
+    raise ELWPTError.Create('build session root contains a line break');
+  if IsDirSymlinkOrJunction(ARoot) then
+    raise ELWPTError.CreateFmt(
+      'build session root must not be a link: %s', [ARoot]);
+  if not EnsureDirectory(ARoot) then
+    raise ELWPTError.CreateFmt(
+      'could not create build sessions directory %s', [ARoot]);
+  IdentityPath := IncludeTrailingPathDelimiter(ARoot)
+    + SESSION_ROOT_IDENTITY_FILE;
+  if IsDirSymlinkOrJunction(IdentityPath) then
+    raise ELWPTError.CreateFmt(
+      'build session root identity must not be a link: %s',
+      [IdentityPath]);
+  RootIdentity := DirectoryIdentity(ARoot);
+  if RootIdentity = '' then
+    raise ELWPTError.CreateFmt(
+      'could not identify build sessions directory %s', [ARoot]);
+  if not FileExists(IdentityPath) then
+  begin
+    Lines := TStringList.Create;
+    try
+      Lines.Add('schema=' + IntToStr(SESSION_ROOT_IDENTITY_SCHEMA_VERSION));
+      Lines.Add('project=' + AProjectIdentity);
+      Lines.Add('root=' + RootIdentity);
+      AtomicWriteText(IdentityPath, ARoot, Lines);
+    finally
+      Lines.Free;
+    end;
+  end;
+  if not SessionRootIdentityMatches(ARoot, AProjectIdentity) then
+    raise ELWPTError.CreateFmt(
+      'build session root ownership does not match this project: %s',
+      [ARoot]);
+end;
+
+procedure LoadSessionRootLedger(const AProjectRoot,
+  AProjectIdentity: string; ARoots: TStrings);
+var
+  LedgerPath, Prefix: string;
+  Lines: TStringList;
+  i: Integer;
+begin
+  ARoots.Clear;
+  LedgerPath := BuildSessionLedgerPath(AProjectRoot);
+  if not FileExists(LedgerPath) then Exit;
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(LedgerPath);
+    if (Lines.Count < 2)
+      or (Lines[0] <> 'schema='
+        + IntToStr(SESSION_ROOT_LEDGER_SCHEMA_VERSION))
+      or (Lines[1] <> 'project=' + AProjectIdentity) then
+      raise ELWPTError.CreateFmt(
+        'build session root ledger is invalid: %s', [LedgerPath]);
+    Prefix := 'root=';
+    for i := 2 to Lines.Count - 1 do
+    begin
+      if Copy(Lines[i], 1, Length(Prefix)) <> Prefix then
+        raise ELWPTError.CreateFmt(
+          'build session root ledger is invalid: %s', [LedgerPath]);
+      if Copy(Lines[i], Length(Prefix) + 1, MaxInt) = '' then
+        raise ELWPTError.CreateFmt(
+          'build session root ledger is invalid: %s', [LedgerPath]);
+      ARoots.Add(Copy(Lines[i], Length(Prefix) + 1, MaxInt));
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure SaveSessionRootLedger(const AProjectRoot,
+  AProjectIdentity: string; ARoots: TStrings);
+var
+  Lines: TStringList;
+  i: Integer;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.Add('schema=' + IntToStr(SESSION_ROOT_LEDGER_SCHEMA_VERSION));
+    Lines.Add('project=' + AProjectIdentity);
+    for i := 0 to ARoots.Count - 1 do
+      Lines.Add('root=' + ARoots[i]);
+    AtomicWriteText(BuildSessionLedgerPath(AProjectRoot),
+      RootedPath(AProjectRoot, TMP_DIR), Lines);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure RegisterSessionRoot(const AProjectRoot,
+  ASessionsRoot: string);
+var
+  LedgerLock: TLWPTPublicationLock;
+  Roots: TStringList;
+  ProjectIdentity: string;
+begin
+  ProjectIdentity := BuildSessionProjectIdentity(AProjectRoot);
+  LedgerLock := TLWPTPublicationLock.Create(
+    BuildSessionLedgerLockPath(AProjectRoot));
+  Roots := TStringList.Create;
+  try
+    EnsureSessionRootIdentity(ASessionsRoot, ProjectIdentity);
+    LoadSessionRootLedger(AProjectRoot, ProjectIdentity, Roots);
+    Roots.CaseSensitive := {$IFDEF MSWINDOWS}False{$ELSE}True{$ENDIF};
+    if Roots.IndexOf(ASessionsRoot) < 0 then
+    begin
+      Roots.Add(ASessionsRoot);
+      Roots.Sort;
+      SaveSessionRootLedger(AProjectRoot, ProjectIdentity, Roots);
+    end;
+  finally
+    Roots.Free;
+    LedgerLock.Free;
+  end;
+end;
+
 { Publication lock files are stable names for advisory byte-range locks.
   The operating system releases ownership when the handle closes or the
   process exits; the files themselves remain and are safe to reuse. }
@@ -992,6 +1215,12 @@ begin
 end;
 
 constructor TLWPTBuildSession.Create(const AProjectRoot: string);
+begin
+  Create(AProjectRoot, RootedPath(AProjectRoot, BUILD_SESSIONS_DIR));
+end;
+
+constructor TLWPTBuildSession.Create(const AProjectRoot,
+  ASessionsRoot: string);
 var
   BaseRoot, PendingRoot: string;
   CollisionCounter: Integer;
@@ -1001,7 +1230,15 @@ begin
   FProjectRoot := ExpandFileName(AProjectRoot);
   FSessionOwnerGuardPath := '';
   FSessionOwnerGuard := nil;
-  BaseRoot := RootedPath(FProjectRoot, BUILD_SESSIONS_DIR);
+  BaseRoot := ExpandFileName(ASessionsRoot);
+  FDefaultSessionsRoot := SamePath(BaseRoot,
+    RootedPath(FProjectRoot, BUILD_SESSIONS_DIR));
+  if not FDefaultSessionsRoot then
+  begin
+    BaseRoot := BuildSessionsProjectRoot(FProjectRoot, BaseRoot);
+    RegisterSessionRoot(FProjectRoot, BaseRoot);
+  end;
+  FSessionsRoot := BaseRoot;
   if not EnsureDirectory(BaseRoot) then
     raise ELWPTError.CreateFmt(
       'could not create build sessions directory %s', [BaseRoot]);
@@ -1101,7 +1338,10 @@ end;
 
 function TLWPTBuildSession.SessionReference: string;
 begin
-  Result := BUILD_SESSIONS_DIR + '/' + FSessionID;
+  if FDefaultSessionsRoot then
+    Result := BUILD_SESSIONS_DIR + '/' + FSessionID
+  else
+    Result := FSessionRoot;
 end;
 
 procedure TLWPTBuildSession.WriteJobLog(const AName, AOutput: string);
@@ -1170,7 +1410,7 @@ begin
   FFinished := True;
 end;
 
-function BuildPublicationLockPath(const AProjectRoot, AOutput: string): string;
+function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
 var
   OutputIdentity, ParentPath, ParentIdentity, OutputName: string;
 begin
@@ -1188,7 +1428,7 @@ begin
   {$IFDEF DARWIN}
   OutputName := LowerCase(OutputName);
   {$ENDIF}
-  Result := RootedPath(AProjectRoot, BUILD_SESSIONS_DIR)
+  Result := ExcludeTrailingPathDelimiter(ASessionsRoot)
     + '/locks/' + Copy(TextHash(ParentIdentity + '/' + OutputName),
       8, 64) + '.lock';
 end;
@@ -1196,47 +1436,69 @@ end;
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
   ALockPath, AModulesPath: string;
-  const ARequest: TLWPTBuildPublicationRequest):
+  const ARequest: TLWPTBuildPublicationRequest;
+  const ASessionsRoot: string):
   TLWPTBuildPublicationResult;
 var
-  Lock: TLWPTPublicationLock;
-  CurrentFingerprint: string;
+  CoordinatorLock, Lock: TLWPTPublicationLock;
+  CurrentFingerprint, PublicationSessionsRoot: string;
   Destination: string;
 begin
   Destination := RootedPath(AProjectRoot, ADestinationPath);
-  Lock := TLWPTPublicationLock.Create(
-    BuildPublicationLockPath(AProjectRoot, Destination));
+  PublicationSessionsRoot := ASessionsRoot;
+  if PublicationSessionsRoot = '' then
+    PublicationSessionsRoot := RootedPath(AProjectRoot, BUILD_SESSIONS_DIR);
+  { Session-root selection can change while builds overlap. The project-local
+    ledger lock gives every root generation one publication rendezvous; the
+    output-specific lock remains in the resolved namespace for stable
+    same-root coordination. }
+  CoordinatorLock := TLWPTPublicationLock.Create(
+    BuildSessionLedgerLockPath(AProjectRoot));
   try
+    Lock := TLWPTPublicationLock.Create(
+      BuildPublicationLockPath(PublicationSessionsRoot, Destination));
     try
-      CurrentFingerprint := CaptureBuildPublicationFingerprint(
-        AProjectRoot, AManifestPath, ACfgPath, ALockPath, AModulesPath,
-        ARequest);
-    except
-      on ELWPTParsedManifestChanged do Exit(bprStale);
+      try
+        CurrentFingerprint := CaptureBuildPublicationFingerprint(
+          AProjectRoot, AManifestPath, ACfgPath, ALockPath, AModulesPath,
+          ARequest);
+      except
+        on ELWPTParsedManifestChanged do Exit(bprStale);
+      end;
+      if CurrentFingerprint <> AExpectedFingerprint then
+        Exit(bprStale);
+      if not AtomicReplaceFile(ACandidatePath, Destination) then
+        raise ELWPTError.CreateFmt(
+          'could not atomically publish "%s" to "%s"; the completed '
+          + 'candidate remains private', [ACandidatePath, Destination]);
+      Result := bprPublished;
+    finally
+      Lock.Free;
     end;
-    if CurrentFingerprint <> AExpectedFingerprint then
-      Exit(bprStale);
-    if not AtomicReplaceFile(ACandidatePath, Destination) then
-      raise ELWPTError.CreateFmt(
-        'could not atomically publish "%s" to "%s"; the completed '
-        + 'candidate remains private', [ACandidatePath, Destination]);
-    Result := bprPublished;
   finally
-    Lock.Free;
+    CoordinatorLock.Free;
   end;
 end;
 
-procedure RepairBuildSessions(const AProjectRoot: string;
-  out ARemoved, ARetained: Integer);
+procedure RepairBuildSessions(const AProjectRoot, ATemporaryRoot: string;
+  out ARemoved, ARetained: Integer;
+  out ATemporaryRootCleaned: Boolean);
 var
   Root, SessionPath, SessionID, StatePath, AgePath, OwnerPath: string;
   Search: TSearchRec;
   PID: LongInt;
   State: string;
   OwnerHeld: Boolean;
+  LedgerLock: TLWPTPublicationLock;
+  Roots: TStringList;
+  ProjectIdentity: string;
+  RootRequiresIdentity: Boolean;
+  i: Integer;
 
   procedure ReclaimSessionPattern(const APattern: string);
   begin
+    if RootRequiresIdentity
+      and not SessionRootIdentityMatches(Root, ProjectIdentity) then Exit;
     if SysUtils.FindFirst(Root + '/' + APattern, faAnyFile, Search) <> 0 then
       Exit;
     try
@@ -1262,6 +1524,9 @@ var
           Inc(ARetained)
         else
         begin
+          if RootRequiresIdentity
+            and not SessionRootIdentityMatches(Root, ProjectIdentity) then
+            Exit;
           WipeDir(SessionPath);
           if FileExists(OwnerPath) then SysUtils.DeleteFile(OwnerPath);
           Inc(ARemoved);
@@ -1271,20 +1536,60 @@ var
       SysUtils.FindClose(Search);
     end;
   end;
+
+  procedure ReclaimRoot(const ARoot: string;
+    ARequireIdentity: Boolean);
+  begin
+    Root := ARoot;
+    RootRequiresIdentity := ARequireIdentity;
+    if not DirectoryExists(Root) then Exit;
+    if RootRequiresIdentity
+      and not SessionRootIdentityMatches(Root, ProjectIdentity) then Exit;
+    ReclaimSessionPattern('s-*');
+    { A process can crash between creating and publishing its visible
+      session directory. The hidden creating form has the same state
+      record, so repair can retain its live owner or reclaim the orphan. }
+    ReclaimSessionPattern('.creating-s-*');
+    { Sessions left behind by binaries that used the long pre-compaction
+      slug ('session-<pid>-<datetime>-...') remain reclaimable. }
+    ReclaimSessionPattern('session-*');
+    ReclaimSessionPattern('.creating-session-*');
+  end;
 begin
   ARemoved := 0;
   ARetained := 0;
-  Root := RootedPath(AProjectRoot, BUILD_SESSIONS_DIR);
-  if not DirectoryExists(Root) then Exit;
-  ReclaimSessionPattern('s-*');
-  { A process can crash between creating and publishing its visible
-    session directory. The hidden creating form has the same state
-    record, so repair can retain its live owner or reclaim the orphan. }
-  ReclaimSessionPattern('.creating-s-*');
-  { Sessions left behind by binaries that used the long pre-compaction
-    slug ('session-<pid>-<datetime>-...') remain reclaimable. }
-  ReclaimSessionPattern('session-*');
-  ReclaimSessionPattern('.creating-session-*');
+  ATemporaryRootCleaned := False;
+  ProjectIdentity := BuildSessionProjectIdentity(AProjectRoot);
+  LedgerLock := TLWPTPublicationLock.Create(
+    BuildSessionLedgerLockPath(AProjectRoot));
+  Roots := TStringList.Create;
+  try
+    { Ledger publication stages through the project temporary root while
+      holding this same lock. Serialize repair's residue sweep with that
+      writer so a live atomic ledger update cannot lose its staged file. }
+    if (ATemporaryRoot <> '') and DirectoryExists(ATemporaryRoot) then
+    begin
+      WipeDir(ATemporaryRoot);
+      ATemporaryRootCleaned := True;
+    end;
+    ReclaimRoot(RootedPath(AProjectRoot, BUILD_SESSIONS_DIR), False);
+    LoadSessionRootLedger(AProjectRoot, ProjectIdentity, Roots);
+    for i := 0 to Roots.Count - 1 do
+      if SessionRootIdentityMatches(Roots[i], ProjectIdentity) then
+        ReclaimRoot(Roots[i], True);
+  finally
+    Roots.Free;
+    LedgerLock.Free;
+  end;
+end;
+
+procedure RepairBuildSessions(const AProjectRoot: string;
+  out ARemoved, ARetained: Integer);
+var
+  TemporaryRootCleaned: Boolean;
+begin
+  RepairBuildSessions(AProjectRoot, '', ARemoved, ARetained,
+    TemporaryRootCleaned);
 end;
 
 var

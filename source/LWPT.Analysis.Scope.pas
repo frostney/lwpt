@@ -52,6 +52,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.BuildSession,
   LWPT.Manifest;
 
 function IsPascalAnalysisSource(const APath: string): Boolean;
@@ -245,7 +246,7 @@ procedure CollectProjectFiles(const AProjectManifest: TManifest;
   const AProjectRoot, ARoot: string; const AConfiguration:
   TLWPTAnalysisConfiguration; var AFiles: TLWPTAnalysisFileArray);
 var
-  ProtectedRoots: array[0..2] of string;
+  ProtectedRoots: array[0..3] of string;
 
   function ProjectPath(const APath: string): string;
   begin
@@ -307,6 +308,9 @@ begin
   ProtectedRoots[0] := ProjectPath(ResolveModulesDir(AProjectManifest));
   ProtectedRoots[1] := ProjectPath(ResolveArchivesDir(AProjectManifest));
   ProtectedRoots[2] := ProjectPath(ResolveTmpDir(AProjectManifest));
+  ProtectedRoots[3] := BuildSessionsProjectRoot(AProjectRoot,
+    ResolveBuildSessionsRoot(AProjectRoot,
+      ResolveSessionsDir(AProjectManifest), GetCurrentDir));
   Walk(AProjectRoot);
   SortFiles(AFiles);
 end;

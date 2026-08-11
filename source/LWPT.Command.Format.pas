@@ -18,6 +18,7 @@ implementation
 uses
   SysUtils,
 
+  LWPT.BuildSession,
   LWPT.Core,
   LWPT.Formatter,
   LWPT.Manifest,
@@ -35,9 +36,9 @@ uses
     seed     = [package].units (each as plain dir, non-recursive)
     add      = [format].include (globs)
     protect  = toolkit state (.lwpt/** plus any [lwpt] modules-dir /
-               archives-dir / tmp-dir / cfg-file override paths, which
-               may sit outside .lwpt/) unless matched by an explicit
-               include
+               archives-dir / tmp-dir / cfg-file override paths, and the
+               project-owned namespace below a sessions-dir override)
+               unless matched by an explicit include
     subtract = [format].exclude (globs)
 
   Glob syntax:
@@ -350,6 +351,10 @@ begin
     AddProtectedRoot(ResolveModulesDir(Man));
     AddProtectedRoot(ResolveArchivesDir(Man));
     AddProtectedRoot(ResolveTmpDir(Man));
+    Path := ExtractFileDir(ExpandFileName(AManifestPath));
+    AddProtectedRoot(BuildSessionsProjectRoot(Path,
+      ResolveBuildSessionsRoot(Path, ResolveSessionsDir(Man),
+        GetCurrentDir)));
     ProtectedCfgFile := ExpandFileName(ResolveCfgFile(Man));
 
     for i := 0 to Files.Count - 1 do

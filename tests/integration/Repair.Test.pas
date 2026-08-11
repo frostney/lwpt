@@ -9,13 +9,15 @@
   install crashes mid-run; it must be safe on a clean tree and
   effective on a dirty one.
 
-  Five assertions:
+  Six assertions:
     1. Repair on a clean tree is a no-op exit 0 (idempotent).
     2. Stale .lwpt/install.lock is removed.
     3. .lwpt/tmp/ contents are removed; the directory itself stays.
        .lwpt/modules/ and .lwpt/archives/ contents are untouched.
     4. Failed build-session staging is reclaimed.
-    5. Dead machine-wide worker requests are reclaimed and diagnosed. }
+    5. Dead machine-wide worker requests are reclaimed and diagnosed.
+    6. Historical relocated sessions remain reclaimable after the override
+       is absent. }
 
 program Repair.Test;
 
@@ -25,6 +27,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.BuildSession,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -44,6 +47,7 @@ type
     procedure TestRepairClearsStaleInstallLock;
     procedure TestRepairCleansTmpButLeavesCommittedState;
     procedure TestRepairReclaimsFailedBuildSession;
+    procedure TestRepairReclaimsHistoricalRelocatedSession;
     procedure TestRepairReclaimsWorkerRequests;
   end;
 
@@ -55,7 +59,10 @@ begin
     '[package]'#10 +
     'name = "repair-e2e"'#10 +
     'version = "0.0.0"'#10 +
-    'units = ["source"]'#10);
+    'units = ["source"]'#10 +
+    #10 +
+    '[build]'#10 +
+    'app = { source = "source/dummy.pas", output = "build/app" }'#10);
 
   WriteTextFile(FScratch + '/source/dummy.pas',
     'unit Dummy;'#10 +
@@ -191,6 +198,58 @@ begin
     .ToBe(True);
 end;
 
+procedure TRepairE2E.TestRepairReclaimsHistoricalRelocatedSession;
+var
+  RelocatedBase, NamespacePath, SessionPath: string;
+  NamespaceSearch, SessionSearch: TSearchRec;
+  R: TLwptResult;
+begin
+  RelocatedBase := FScratch + '/relocated-sessions';
+  RecursiveDelete(RelocatedBase);
+  R := RunLwpt(['build'], FScratch,
+    [BUILD_SESSION_DIR_ENV + '=' + RelocatedBase,
+     'LWPT_WORKER_STATE_DIR=' + FWorkerState,
+     'LWPT_WORKER_BUDGET=1']);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<Boolean>(FileExists(FScratch + '/'
+    + BUILD_SESSION_ROOT_LEDGER)).ToBe(True);
+
+  NamespacePath := '';
+  if FindFirst(RelocatedBase + '/p-*', faDirectory, NamespaceSearch) = 0 then
+  try
+    repeat
+      if (NamespaceSearch.Attr and faDirectory) <> 0 then
+      begin
+        NamespacePath := RelocatedBase + '/' + NamespaceSearch.Name;
+        Break;
+      end;
+    until FindNext(NamespaceSearch) <> 0;
+  finally
+    FindClose(NamespaceSearch);
+  end;
+  Expect<Boolean>(NamespacePath <> '').ToBe(True);
+  SessionPath := '';
+  if FindFirst(NamespacePath + '/s-*', faDirectory, SessionSearch) = 0 then
+  try
+    repeat
+      if (SessionSearch.Attr and faDirectory) <> 0 then
+      begin
+        SessionPath := NamespacePath + '/' + SessionSearch.Name;
+        Break;
+      end;
+    until FindNext(SessionSearch) <> 0;
+  finally
+    FindClose(SessionSearch);
+  end;
+  Expect<Boolean>(SessionPath <> '').ToBe(True);
+
+  R := RunRepair;
+
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(DirectoryExists(SessionPath)).ToBe(False);
+  Expect<Boolean>(FileExists(NamespacePath + '/project.identity')).ToBe(True);
+end;
+
 procedure TRepairE2E.SetupTests;
 begin
   Test('repair on a clean tree is a no-op exit 0',
@@ -201,6 +260,8 @@ begin
     TestRepairCleansTmpButLeavesCommittedState);
   Test('repair reclaims failed build-session staging',
     TestRepairReclaimsFailedBuildSession);
+  Test('repair reclaims a historical relocated build session',
+    TestRepairReclaimsHistoricalRelocatedSession);
   Test('repair reclaims dead machine-wide worker requests',
     TestRepairReclaimsWorkerRequests);
 end;
