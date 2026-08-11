@@ -4780,22 +4780,14 @@ begin
       Result.State := tssWantRead;
       Exit;
     end;
-    { SECBUFFER_EXTRA points into EncryptedInput; some SChannel builds report
-      only cbBuffer, so preserve the input tail before replacing the array
-      that owns those bytes. }
-    SetLength(ExtraInput, 0);
-    for I := 1 to High(Buffers) do
-      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
-        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
-          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
-    Data.EncryptedInput := ExtraInput;
-
     if Status = SEC_I_RENEGOTIATE then
     begin
       { TLS 1.3 uses this status for post-handshake KeyUpdate and session
-        tickets; its extra bytes must re-enter AcceptSecurityContext. TLS 1.2
-        renegotiation remains fatal, preserving the no-renegotiation contract
-        shared with the OpenSSL backend. }
+        tickets. Microsoft requires the same buffer modified by DecryptMessage
+        to re-enter AcceptSecurityContext as SECBUFFER_TOKEN; replacing it
+        with only SECBUFFER_EXTRA would discard the post-handshake message.
+        TLS 1.2 renegotiation remains fatal, preserving the no-renegotiation
+        contract shared with the OpenSSL backend. }
       if Data.Protocol <> SP_PROT_TLS1_3_SERVER then
       begin
         PoisonSChannelServerConnection(AConnection);
@@ -4812,6 +4804,17 @@ begin
       end;
       Continue;
     end;
+
+    { SECBUFFER_EXTRA points into EncryptedInput; some SChannel builds report
+      only cbBuffer, so preserve the input tail before replacing the array
+      that owns those bytes. }
+    SetLength(ExtraInput, 0);
+    for I := 1 to High(Buffers) do
+      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+    Data.EncryptedInput := ExtraInput;
+
     if (Status <> SEC_E_OK) and (Status <> SEC_I_CONTEXT_EXPIRED) then
     begin
       PoisonSChannelServerConnection(AConnection);
