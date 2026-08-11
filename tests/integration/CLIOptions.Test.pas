@@ -70,6 +70,12 @@ type
     procedure TestSilentBuildReplaysFailedCompilerOutputOnly;
     procedure TestSilentNoBuildEntriesRetainsFailureAfterWarning;
     procedure TestSilentInteractiveInitIsRejected;
+    procedure TestTestSelectsOneExactFile;
+    procedure TestTestSelectsDirectoryRecursively;
+    procedure TestTestSelectsGlobAndDeduplicatesUnion;
+    procedure TestTestSelectionPreservesTierPolicy;
+    procedure TestPretestCannotAddTestPrograms;
+    procedure TestInvalidTestSelectorsFailBeforePretest;
   end;
 
 function CompletionPrefix(const ACommand, AStatus: string): string;
@@ -93,10 +99,17 @@ begin
   end;
 end;
 
+function NativeDisplayPath(const APath: string): string;
+begin
+  Result := StringReplace(APath, '/', PathDelim, [rfReplaceAll]);
+end;
+
 procedure TCLIOptionsE2E.SetupScratchProject;
 begin
   ForceDirectories(FScratch + '/source');
   ForceDirectories(FScratch + '/scripts');
+  ForceDirectories(FScratch + '/tests/integration/nested');
+  ForceDirectories(FScratch + '/tests/e2e');
 
   WriteTextFile(FScratch + '/lwpt.toml',
     '[package]'#10 +
@@ -118,6 +131,9 @@ begin
     ''#10 +
     '[prebuild]'#10 +
     'successful = { command = "instantfpc", args = ["scripts/child-success.pas"] }'#10 +
+    ''#10 +
+    '[pretest]'#10 +
+    'marker = { command = "instantfpc", args = ["scripts/pretest-marker.pas"] }'#10 +
     ''#10 +
     '[unknown-section]'#10 +
     'enabled = true'#10);
@@ -141,6 +157,33 @@ begin
     'begin'#10 +
     '  Write(''failed-child-output'');'#10 +
     '  Halt(7);'#10 +
+    'end.'#10);
+  WriteTextFile(FScratch + '/scripts/pretest-marker.pas',
+    'program PretestMarker;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'var Marker: Text;'#10 +
+    'begin'#10 +
+    '  Assign(Marker, ''pretest-ran.txt'');'#10 +
+    '  Rewrite(Marker);'#10 +
+    '  Close(Marker);'#10 +
+    'end.'#10);
+  WriteTextFile(FScratch + '/source/Alpha.Test.pas',
+    'program Alpha.Test;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'begin'#10 +
+    '  WriteLn(''alpha selected'');'#10 +
+    'end.'#10);
+  WriteTextFile(FScratch + '/tests/integration/nested/Beta.Test.pas',
+    'program Beta.Test;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'begin'#10 +
+    '  WriteLn(''beta selected'');'#10 +
+    'end.'#10);
+  WriteTextFile(FScratch + '/tests/e2e/Gamma.E2E.Test.pas',
+    'program Gamma.E2E.Test;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'begin'#10 +
+    '  WriteLn(''gamma selected'');'#10 +
     'end.'#10);
 end;
 
@@ -522,6 +565,143 @@ begin
   Expect<Boolean>(FileExists(InitPath + '/lwpt.toml')).ToBe(False);
 end;
 
+procedure TCLIOptionsE2E.TestTestSelectsOneExactFile;
+var
+  R: TLwptResult;
+begin
+  R := RunLwpt(['test', 'source/Alpha.Test.pas', '--jobs=1'], FScratch);
+  DumpRunFailure('exact test selector', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('selected 1 of 3 discovered test file(s)',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath('source/Alpha.Test.pas') + ' ... pass',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/pretest-ran.txt')).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestTestSelectsDirectoryRecursively;
+var
+  R: TLwptResult;
+begin
+  R := RunLwpt(['test', 'tests/integration', '--jobs=1'], FScratch);
+  DumpRunFailure('directory test selector', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('selected 1 of 3 discovered test file(s)',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath(
+    'tests/integration/nested/Beta.Test.pas') + ' ... pass',
+    R.Stdout) > 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestTestSelectsGlobAndDeduplicatesUnion;
+var
+  R: TLwptResult;
+begin
+  R := RunLwpt(['test', 'source/*.Test.pas',
+    'source/Alpha.Test.pas', 'tests/**/B?ta.Test.pas', '--jobs=1'],
+    FScratch);
+  DumpRunFailure('glob test selector', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('selected 2 of 3 discovered test file(s)',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Integer>(CountOccurrences(R.Stdout,
+    NativeDisplayPath('source/Alpha.Test.pas') + ' ... pass')).ToBe(1);
+  Expect<Integer>(CountOccurrences(R.Stdout,
+    NativeDisplayPath('tests/integration/nested/Beta.Test.pas')
+    + ' ... pass')).ToBe(1);
+end;
+
+procedure TCLIOptionsE2E.TestTestSelectionPreservesTierPolicy;
+var
+  DefaultRun, E2ERun: TLwptResult;
+begin
+  DefaultRun := RunLwpt(['test',
+    'tests/e2e/Gamma.E2E.Test.pas', '--jobs=1'], FScratch);
+  DumpRunFailure('default-tier selected e2e test', DefaultRun, 0);
+  Expect<Integer>(DefaultRun.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('0 passed, 0 failed, 0 did not compile, 1 skipped',
+    DefaultRun.Stdout) > 0).ToBe(True);
+
+  E2ERun := RunLwpt(['test', 'tests/e2e/Gamma.E2E.Test.pas',
+    '--tier=e2e', '--jobs=1'], FScratch);
+  DumpRunFailure('e2e-tier selected test', E2ERun, 0);
+  Expect<Integer>(E2ERun.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos(NativeDisplayPath('tests/e2e/Gamma.E2E.Test.pas')
+    + ' ... pass',
+    E2ERun.Stdout) > 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestPretestCannotAddTestPrograms;
+var
+  ProjectPath: string;
+  R: TLwptResult;
+begin
+  ProjectPath := FScratch + '/generated-test-project';
+  ForceDirectories(ProjectPath + '/source');
+  ForceDirectories(ProjectPath + '/scripts');
+  WriteTextFile(ProjectPath + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "generated-test-project"'#10 +
+    'version = "0.0.0"'#10 +
+    'units = ["source"]'#10 +
+    ''#10 +
+    '[pretest]'#10 +
+    'generate = { command = "instantfpc", args = ["scripts/generate-test.pas"] }'#10);
+  WriteTextFile(ProjectPath + '/source/Existing.Test.pas',
+    'program Existing.Test;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'begin'#10 +
+    'end.'#10);
+  WriteTextFile(ProjectPath + '/scripts/generate-test.pas',
+    'program GenerateTest;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'var Generated: Text;'#10 +
+    'begin'#10 +
+    '  Assign(Generated, ''source/Generated.Test.pas'');'#10 +
+    '  Rewrite(Generated);'#10 +
+    '  WriteLn(Generated, ''program Generated.Test;'');'#10 +
+    '  WriteLn(Generated, ''{$mode delphi}{$H+}'');'#10 +
+    '  WriteLn(Generated, ''begin'');'#10 +
+    '  WriteLn(Generated, ''end.'');'#10 +
+    '  Close(Generated);'#10 +
+    'end.'#10);
+
+  R := RunLwpt(['test', '--jobs=1'], ProjectPath);
+  DumpRunFailure('pretest discovery freeze', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(
+    ProjectPath + '/source/Generated.Test.pas')).ToBe(True);
+  Expect<Boolean>(Pos('discovered 1 test file(s)', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath('source/Existing.Test.pas')
+    + ' ... pass', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath('source/Generated.Test.pas')
+    + ' ... ', R.Stdout) = 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestInvalidTestSelectorsFailBeforePretest;
+var
+  MarkerPath: string;
+
+  procedure ExpectRejected(const ASelector, AMessage: string);
+  var
+    R: TLwptResult;
+  begin
+    if FileExists(MarkerPath) then DeleteFile(MarkerPath);
+    R := RunLwpt(['test', ASelector, '--jobs=1'], FScratch);
+    Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+    Expect<Boolean>(Pos(AMessage, R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos('test session:', R.Stdout) = 0).ToBe(True);
+    Expect<Boolean>(FileExists(MarkerPath)).ToBe(False);
+  end;
+
+begin
+  MarkerPath := FScratch + '/pretest-ran.txt';
+  ExpectRejected('missing/**/*.Test.pas',
+    'matched no discovered test files');
+  ExpectRejected('source/hello.pas', 'is not a *.Test.pas file');
+  ExpectRejected('../*.Test.pas', 'must be project-root-relative');
+end;
+
 procedure TCLIOptionsE2E.SetupTests;
 begin
   Test('lwpt --help lists every subcommand on stdout',
@@ -566,6 +746,18 @@ begin
     TestSilentNoBuildEntriesRetainsFailureAfterWarning);
   Test('silent interactive init is rejected without waiting for input',
     TestSilentInteractiveInitIsRejected);
+  Test('test selects one exact project test file',
+    TestTestSelectsOneExactFile);
+  Test('test selects every descendant test under a directory',
+    TestTestSelectsDirectoryRecursively);
+  Test('test glob selectors support globstar and deduplicate their union',
+    TestTestSelectsGlobAndDeduplicatesUnion);
+  Test('test selectors do not bypass the requested tier',
+    TestTestSelectionPreservesTierPolicy);
+  Test('pretest cannot add programs to the frozen test inventory',
+    TestPretestCannotAddTestPrograms);
+  Test('invalid test selectors fail before pretest and session creation',
+    TestInvalidTestSelectorsFailBeforePretest);
 end;
 
 begin
