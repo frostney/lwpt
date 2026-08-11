@@ -119,9 +119,11 @@ type
     procedure TestPlaintextRoundtripAndPartialCiphertextConsumption;
     procedure TestRenegotiationIsRefused;
     procedure TestSChannelGracefulCloseProducesCloseNotify;
+    procedure TestSChannelIdentityImportsIsolatedKeyContainers;
     procedure TestSChannelHandshakeRoundtripAndContextReuse;
     procedure TestSChannelInputFlowPrefixAdmissionAndCounters;
     procedure TestSChannelPeerCloseNotifyReportsPeerClosed;
+    procedure TestSChannelReloadRetainsPreviousKeyContainer;
     procedure TestSChannelPendingCiphertextPointerAndPartialConsumption;
     procedure TestSChannelWriteWantRetryRetainsPlaintext;
     procedure TestStaleErrorQueueIsCleared;
@@ -3224,6 +3226,122 @@ begin
   {$ENDIF}
 end;
 
+procedure TTransportSecurityServerTests.
+  TestSChannelIdentityImportsIsolatedKeyContainers;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  FirstClient: TSChannelTestClient;
+  FirstConnection: TTransportSecurityConnection;
+  FirstContext: TTransportSecurityServerContext;
+  FirstName: UnicodeString;
+  Observed: THandshakeObservations;
+  SecondClient: TSChannelTestClient;
+  SecondConnection: TTransportSecurityConnection;
+  SecondContext: TTransportSecurityServerContext;
+  SecondName: UnicodeString;
+  SurvivorClient: TSChannelTestClient;
+  SurvivorConnection: TTransportSecurityConnection;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  FirstContext := nil;
+  SecondContext := nil;
+  FillChar(FirstConnection, SizeOf(FirstConnection), 0);
+  FillChar(SecondConnection, SizeOf(SecondConnection), 0);
+  FillChar(SurvivorConnection, SizeOf(SurvivorConnection), 0);
+  FillChar(FirstClient, SizeOf(FirstClient), 0);
+  FillChar(SecondClient, SizeOf(SecondClient), 0);
+  FillChar(SurvivorClient, SizeOf(SurvivorClient), 0);
+  try
+    FirstContext := TTransportSecurityServerContext.Create(PKCS12_PATH,
+      PKCS12_PASSPHRASE);
+    SecondContext := TTransportSecurityServerContext.Create(PKCS12_PATH,
+      PKCS12_PASSPHRASE);
+    FirstName := TransportSecurityTestServerKeyContainer(FirstContext);
+    SecondName := TransportSecurityTestServerKeyContainer(SecondContext);
+    Expect<Boolean>(FirstName <> '').ToBe(True);
+    Expect<Boolean>(FirstName <> SecondName).ToBe(True);
+
+    CreateSChannelHandshakenPair(FirstContext, FirstConnection, FirstClient,
+      Observed);
+    Expect<Boolean>(FirstConnection.Active).ToBe(True);
+    CreateSChannelHandshakenPair(SecondContext, SecondConnection, SecondClient,
+      Observed);
+    Expect<Boolean>(SecondConnection.Active).ToBe(True);
+
+    { Closing the first context deletes its persisted container. The second
+      identity was imported from the same bundle, so this is where a shared
+      container would show up as a dead key. }
+    AbortTransportSecurityServer(FirstConnection);
+    FreeSChannelClient(FirstClient);
+    CloseTransportSecurityServerContext(FirstContext);
+    CreateSChannelHandshakenPair(SecondContext, SurvivorConnection,
+      SurvivorClient, Observed);
+    Expect<Boolean>(SurvivorConnection.Active).ToBe(True);
+  finally
+    AbortTransportSecurityServer(FirstConnection);
+    AbortTransportSecurityServer(SecondConnection);
+    AbortTransportSecurityServer(SurvivorConnection);
+    FreeSChannelClient(FirstClient);
+    FreeSChannelClient(SecondClient);
+    FreeSChannelClient(SurvivorClient);
+    CloseTransportSecurityServerContext(FirstContext);
+    CloseTransportSecurityServerContext(SecondContext);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestSChannelReloadRetainsPreviousKeyContainer;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Context: TTransportSecurityServerContext;
+  FreshClient: TSChannelTestClient;
+  FreshConnection: TTransportSecurityConnection;
+  NameAfterReload: UnicodeString;
+  NameBeforeReload: UnicodeString;
+  Observed: THandshakeObservations;
+  RetainedClient: TSChannelTestClient;
+  RetainedConnection: TTransportSecurityConnection;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := nil;
+  FillChar(RetainedConnection, SizeOf(RetainedConnection), 0);
+  FillChar(FreshConnection, SizeOf(FreshConnection), 0);
+  FillChar(RetainedClient, SizeOf(RetainedClient), 0);
+  FillChar(FreshClient, SizeOf(FreshClient), 0);
+  try
+    Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+      PKCS12_PASSPHRASE);
+    { Begin before the reload so this connection retains the old snapshot. }
+    BeginTransportSecurityServer(RetainedConnection, Context);
+    NameBeforeReload := TransportSecurityTestServerKeyContainer(Context);
+    Context.Reload(PKCS12_PATH, PKCS12_PASSPHRASE);
+    NameAfterReload := TransportSecurityTestServerKeyContainer(Context);
+    Expect<Boolean>(NameBeforeReload <> '').ToBe(True);
+    Expect<Boolean>(NameAfterReload <> '').ToBe(True);
+    Expect<Boolean>(NameBeforeReload <> NameAfterReload).ToBe(True);
+
+    { The reloaded-away snapshot still holds a reference, so its container
+      must outlive the reload and complete this handshake. }
+    CreateSChannelClient(RetainedClient);
+    DriveSChannelHandshake(RetainedConnection, RetainedClient, Observed);
+    Expect<Boolean>(RetainedConnection.Active).ToBe(True);
+
+    CreateSChannelHandshakenPair(Context, FreshConnection, FreshClient,
+      Observed);
+    Expect<Boolean>(FreshConnection.Active).ToBe(True);
+  finally
+    AbortTransportSecurityServer(RetainedConnection);
+    AbortTransportSecurityServer(FreshConnection);
+    FreeSChannelClient(RetainedClient);
+    FreeSChannelClient(FreshClient);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityServerTests.ServerTest(const AName: string;
   const AMethod: TTestMethod);
 begin
@@ -3336,6 +3454,12 @@ begin
     DARWIN_SKIP_REASON);
   Skip('SChannel peer close_notify reports peer-closed',
     TestSChannelPeerCloseNotifyReportsPeerClosed,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel identities import into isolated key containers',
+    TestSChannelIdentityImportsIsolatedKeyContainers,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel reload retains the previous key container',
+    TestSChannelReloadRetainsPreviousKeyContainer,
     DARWIN_SKIP_REASON);
   {$ELSE}
   FServerBackendAvailable := TransportSecurityServerBackendAvailable;
@@ -3483,6 +3607,10 @@ begin
     TestSChannelGracefulCloseProducesCloseNotify);
   ServerTest('SChannel peer close_notify reports peer-closed',
     TestSChannelPeerCloseNotifyReportsPeerClosed);
+  ServerTest('SChannel identities import into isolated key containers',
+    TestSChannelIdentityImportsIsolatedKeyContainers);
+  ServerTest('SChannel reload retains the previous key container',
+    TestSChannelReloadRetainsPreviousKeyContainer);
   {$ELSE}
   Skip('SChannel handshake round-trips plaintext and reuses the context',
     TestSChannelHandshakeRoundtripAndContextReuse,
@@ -3501,6 +3629,12 @@ begin
     SCHANNEL_CLIENT_SKIP_REASON);
   Skip('SChannel peer close_notify reports peer-closed',
     TestSChannelPeerCloseNotifyReportsPeerClosed,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel identities import into isolated key containers',
+    TestSChannelIdentityImportsIsolatedKeyContainers,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel reload retains the previous key container',
+    TestSChannelReloadRetainsPreviousKeyContainer,
     SCHANNEL_CLIENT_SKIP_REASON);
   {$ENDIF}
   {$ENDIF}

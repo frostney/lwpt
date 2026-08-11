@@ -21,9 +21,11 @@
   retained WANT-write plaintext, stable retained-ciphertext spans, strict and
   permissive identity validation, immutable reference-counted reload
   snapshots, and `tssPeerClosed` — is reproduced rule for rule.
-- **Private keys never touch the user's key store.** The PKCS#12 bundle is
-  imported with `PKCS12_NO_PERSIST_KEY | PKCS12_ALWAYS_CNG_KSP`, so the key is
-  ephemeral and in-memory for the lifetime of the credential snapshot.
+- **The private key is persisted, owned, and deleted with its snapshot.**
+  SChannel performs server key operations in lsass, which cannot reach an
+  in-process ephemeral key, so an ephemeral import is not an option. Each
+  snapshot owns one persisted CNG container and deletes it when its last
+  reference goes away.
 
 ## Context
 
@@ -114,6 +116,48 @@ those two sub-cases are not reproduced. Everything ADR-0024 pins is enforced.
 `tsivPermissive` remains an explicit self-signed development option, and
 neither mode consults the Windows system trust store: `SCHANNEL_CRED` is built
 from the caller's bundle alone.
+
+### Private key lifetime
+
+The first Windows CI run settled a question the design had guessed wrong.
+Importing with `PKCS12_NO_PERSIST_KEY | PKCS12_ALWAYS_CNG_KSP` produces an
+ephemeral in-process key, and `AcquireCredentialsHandle` then fails with
+`SEC_E_NO_CREDENTIALS` (0x8009030E). This is inherent, not a flag mistake:
+SChannel runs server key operations in lsass, which cannot reach a key that
+only exists inside the calling process. (.NET raises the equivalent failure
+for `X509KeyStorageFlags.EphemeralKeySet` with `SslStream`, for the same
+reason.)
+
+The bundle is therefore imported with `PKCS12_ALWAYS_CNG_KSP |
+CRYPT_USER_KEYSET` into the user's CNG key-storage provider, and the snapshot
+takes ownership of the resulting container: immediately after import it claims
+the key handle with `CryptAcquireCertificatePrivateKey`
+(`CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_SILENT_FLAG`), refusing
+the identity outright if the handle is not caller-owned or not a CNG key —
+better to fail than to hold a container nothing will clean up. Every teardown
+path funnels through the snapshot's `Release`, which calls `NCryptDeleteKey`
+at the last reference. Because deletion is tied to the refcount rather than to
+`Reload`, a snapshot that has been reloaded away keeps its container until the
+last connection still using it finishes.
+
+**Container naming is the load-bearing detail.** Two snapshots built from the
+same bundle must own different containers, or releasing one would delete a key
+the other is still serving with. `PFXImportCertStore` names CNG keys itself
+rather than honouring a name carried in the bundle, so ordinary bundles get a
+fresh container per import. The design does not rest on that being true: the
+container name is read back from `CERT_KEY_PROV_INFO_PROP_ID` and a Windows
+test asserts that two concurrently live contexts built from one fixture report
+different names, that closing the first leaves the second able to handshake,
+and that a reload publishes a new container while the retained snapshot keeps
+serving with the old one. `PKCS12_ALLOW_OVERWRITE_KEY` is deliberately not
+passed, so a bundle that did carry an already-existing container name fails
+the import loudly instead of silently overwriting a live key.
+
+**Accepted cost:** a hard kill between import and deletion leaks one container
+in the user's CNG key store (`%APPDATA%\Microsoft\Crypto\Keys`). Ordinary
+operation — including repeated reloads — deletes each container as its
+snapshot is released, so this is bounded by abnormal termination rather than
+by uptime. Nothing is written to the certificate stores.
 
 ### Protocol floor
 

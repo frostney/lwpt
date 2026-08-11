@@ -80,7 +80,7 @@ lwpt-<version>-windows-x64.zip
         └── build-system.md
 ```
 
-Server accept has the same story per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md): `AcceptSecurityContext` from `secur32.dll` terminates TLS and `crypt32.dll` imports the PKCS#12 identity, both operating-system components. The private key is imported with `PKCS12_NO_PERSIST_KEY | PKCS12_ALWAYS_CNG_KSP`, so it stays ephemeral and in memory rather than landing in the invoking user's persisted key store, and the credential is built from the caller's bundle alone rather than from the Windows trust store. `SCHANNEL_CRED` version 4 pins the server to TLS 1.2, matching the OpenSSL backend's floor. LWPT no longer import-links, runtime-loads, or requires OpenSSL anywhere on Windows.
+Server accept has the same story per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md): `AcceptSecurityContext` from `secur32.dll` terminates TLS and `crypt32.dll` imports the PKCS#12 identity, both operating-system components. The private key is imported into the invoking user's CNG key-storage provider (`PKCS12_ALWAYS_CNG_KSP | CRYPT_USER_KEYSET`) because SChannel runs server key operations in lsass and cannot use an ephemeral in-process key; each identity snapshot owns its container and deletes it via `NCryptDeleteKey` when its last reference is released, so a hard kill is the only way to leak one. Nothing is written to the certificate stores, and the credential is built from the caller's bundle alone rather than from the Windows trust store. `SCHANNEL_CRED` version 4 pins the server to TLS 1.2, matching the OpenSSL backend's floor. LWPT no longer import-links, runtime-loads, or requires OpenSSL anywhere on Windows.
 
 #### CI guard
 

@@ -394,6 +394,7 @@ begin
     StartsWith(Name, 'ext-ms-win-') or (Name = 'kernel32.dll') or
     (Name = 'ntdll.dll') or (Name = 'advapi32.dll') or
     (Name = 'bcrypt.dll') or (Name = 'crypt32.dll') or
+    (Name = 'ncrypt.dll') or
     (Name = 'ole32.dll') or (Name = 'secur32.dll') or
     (Name = 'shell32.dll') or (Name = 'user32.dll') or
     (Name = 'ws2_32.dll') or (Name = 'msvcrt.dll') or
@@ -714,16 +715,20 @@ begin
     secur32.dll and crypt32.dll, so the allowlist and the family matcher must
     keep letting them through — a tightening that broke them would take the
     shipped Windows TLS stack with it. }
-  if not IsSystemDLL('secur32.dll') or not IsSystemDLL('crypt32.dll') then
+  if not IsSystemDLL('secur32.dll') or not IsSystemDLL('crypt32.dll') or
+    not IsSystemDLL('ncrypt.dll') then
     Fail('native Windows TLS system DLL was not recognised');
-  if IsOpenSSLDLL('secur32.dll') or IsOpenSSLDLL('crypt32.dll') then
+  if IsOpenSSLDLL('secur32.dll') or IsOpenSSLDLL('crypt32.dll') or
+    IsOpenSSLDLL('ncrypt.dll') then
     Fail('native Windows TLS system DLL was misflagged as OpenSSL');
   if IsOpenSSLSymbol('AcceptSecurityContext') or
     IsOpenSSLSymbol('InitializeSecurityContextW') or
     IsOpenSSLSymbol('PFXImportCertStore') or
     IsOpenSSLSymbol('CertFindCertificateInStore') or
     IsOpenSSLSymbol('CertGetEnhancedKeyUsage') or
-    IsOpenSSLSymbol('CryptVerifyCertificateSignatureEx') then
+    IsOpenSSLSymbol('CryptAcquireCertificatePrivateKey') or
+    IsOpenSSLSymbol('CryptVerifyCertificateSignatureEx') or
+    IsOpenSSLSymbol('NCryptDeleteKey') then
     Fail('native Windows TLS symbol was misflagged as OpenSSL linkage');
   Lines := TStringList.Create;
   Problems := TStringList.Create;

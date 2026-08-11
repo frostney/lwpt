@@ -182,6 +182,12 @@ function TransportSecurityTestInjectSyscallError(
   out AObservedError: Integer): TTransportSecurityState;
 {$ENDIF}
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{$IFNDEF PRODUCTION}
+function TransportSecurityTestServerKeyContainer(
+  const AContext: TTransportSecurityServerContext): UnicodeString;
+{$ENDIF}
+{$ENDIF}
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
 function TransportSecurityRead(var AConnection: TTransportSecurityConnection;
   var ABuffer: array of Byte; const ALength: Integer): Integer;
@@ -891,6 +897,7 @@ var
   ComponentStart: Integer;
   FileInfo: TByHandleFileInformation;
   Handle: THandle;
+  LastError: DWORD;
   ParentPath: UnicodeString;
   RootLength: Integer;
 begin
@@ -915,7 +922,16 @@ begin
       FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
     if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
     begin
+      LastError := Windows.GetLastError;
       CloseWindowsHandles(AHandles);
+      { Mirror the Unix component walk, which reports ENOENT on any component
+        as a missing identity rather than as a link refusal. Without this a
+        configured path whose parent directory is absent is misreported as a
+        reparse-point failure. Neither message discloses the path. }
+      if (LastError = Windows.ERROR_FILE_NOT_FOUND) or
+         (LastError = Windows.ERROR_PATH_NOT_FOUND) then
+        raise ETransportSecurityError.Create(
+          'Configured TLS PKCS#12 identity file does not exist');
       raise ETransportSecurityError.Create(
         'Failed to open configured TLS PKCS#12 identity without following reparse points');
     end;
@@ -3338,11 +3354,25 @@ type
     dwPathLenConstraint: LongWord;
   end;
 
+  PCryptKeyProviderInfo = ^TCryptKeyProviderInfo;
+  TCryptKeyProviderInfo = record
+    pwszContainerName: PWideChar;
+    pwszProvName: PWideChar;
+    dwProvType: LongWord;
+    dwFlags: LongWord;
+    cProvParam: LongWord;
+    rgProvParam: Pointer;
+    dwKeySpec: LongWord;
+  end;
+
   TSChannelServerCredentialData = class
   public
     Certificate: PCertContext;
     Credential: TSecHandle;
     HasCredential: Boolean;
+    HasPrivateKey: Boolean;
+    KeyContainerName: UnicodeString;
+    PrivateKey: PtrUInt;
     References: LongInt;
     Store: HCERTSTORE;
     constructor Create;
@@ -3394,7 +3424,12 @@ const
   CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG = $00000002;
   X509_BASIC_CONSTRAINTS2 = 15;
   PKCS12_ALWAYS_CNG_KSP = $00000200;
-  PKCS12_NO_PERSIST_KEY = $00008000;
+  CRYPT_USER_KEYSET = $00001000;
+  CRYPT_ACQUIRE_SILENT_FLAG = $00000040;
+  CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG = $00040000;
+  CERT_NCRYPT_KEY_SPEC = LongWord($FFFFFFFF);
+  CERT_KEY_PROV_INFO_PROP_ID = 2;
+  NCRYPT_SILENT_FLAG = $00000040;
   CERT_KEY_CERT_SIGN_KEY_USAGE = $04;
   { X509_PURPOSE_SSL_SERVER rejects a leaf whose key usage asserts none of
     digitalSignature, keyEncipherment, or keyAgreement. }
@@ -3459,6 +3494,18 @@ function CryptVerifyCertificateSignatureEx(ACryptProvider: PtrUInt;
   AIssuerType: LongWord; AIssuer: Pointer; AFlags: LongWord;
   AExtra: Pointer): LongBool; stdcall;
   external 'crypt32.dll' name 'CryptVerifyCertificateSignatureEx';
+function CryptAcquireCertificatePrivateKey(ACertificate: PCertContext;
+  AFlags: LongWord; AParameters: Pointer; out AKey: PtrUInt;
+  out AKeySpec: LongWord; out ACallerFree: LongBool): LongBool; stdcall;
+  external 'crypt32.dll' name 'CryptAcquireCertificatePrivateKey';
+function CertGetCertificateContextProperty(ACertificate: PCertContext;
+  APropertyIdentifier: LongWord; AData: Pointer;
+  var ADataLength: LongWord): LongBool; stdcall;
+  external 'crypt32.dll' name 'CertGetCertificateContextProperty';
+function NCryptDeleteKey(AKey: PtrUInt; AFlags: LongWord): LongInt; stdcall;
+  external 'ncrypt.dll' name 'NCryptDeleteKey';
+function NCryptFreeObject(AObject: PtrUInt): LongInt; stdcall;
+  external 'ncrypt.dll' name 'NCryptFreeObject';
 
 constructor TSChannelServerCredentialData.Create;
 begin
@@ -3466,6 +3513,9 @@ begin
   FillChar(Credential, SizeOf(Credential), 0);
   Certificate := nil;
   HasCredential := False;
+  HasPrivateKey := False;
+  KeyContainerName := '';
+  PrivateKey := 0;
   References := 1;
   Store := nil;
 end;
@@ -3484,6 +3534,20 @@ begin
     FreeCredentialsHandle(@Credential);
     HasCredential := False;
   end;
+  { The imported private key is persisted, so the snapshot owns a container
+    that must not outlive it. Deletion happens only here, at the last
+    reference, which is what lets a reloaded-away snapshot keep serving live
+    connections until they finish. NCryptDeleteKey both removes the container
+    and frees the handle; NCryptFreeObject is the fallback so a failed delete
+    still releases the handle. }
+  if HasPrivateKey then
+  begin
+    if NCryptDeleteKey(PrivateKey, NCRYPT_SILENT_FLAG) <> 0 then
+      NCryptFreeObject(PrivateKey);
+    PrivateKey := 0;
+    HasPrivateKey := False;
+  end;
+  KeyContainerName := '';
   if Assigned(Certificate) then
   begin
     CertFreeCertificateContext(Certificate);
@@ -3827,15 +3891,45 @@ begin
   end;
 end;
 
+{ The container name the key-storage provider assigned to this import. Read
+  back rather than chosen: PFXImportCertStore names the CNG key itself, and
+  the name is the identity of the persisted container this snapshot owns and
+  will delete. Empty when the property is unreadable. }
+function SChannelServerKeyContainerName(
+  const ACertificate: PCertContext): UnicodeString;
+var
+  Buffer: TBytes;
+  BufferLength: LongWord;
+  ProviderInfo: PCryptKeyProviderInfo;
+begin
+  Result := '';
+  BufferLength := 0;
+  if not CertGetCertificateContextProperty(ACertificate,
+    CERT_KEY_PROV_INFO_PROP_ID, nil, BufferLength) then
+    Exit;
+  if BufferLength < LongWord(SizeOf(TCryptKeyProviderInfo)) then
+    Exit;
+  SetLength(Buffer, BufferLength);
+  if not CertGetCertificateContextProperty(ACertificate,
+    CERT_KEY_PROV_INFO_PROP_ID, @Buffer[0], BufferLength) then
+    Exit;
+  ProviderInfo := PCryptKeyProviderInfo(@Buffer[0]);
+  if Assigned(ProviderInfo^.pwszContainerName) then
+    Result := UnicodeString(WideString(ProviderInfo^.pwszContainerName));
+end;
+
 function CreateSChannelServerSnapshot(const APkcs12Identity: TBytes;
   const APkcs12Passphrase: UnicodeString;
   const AValidation: TTransportSecurityServerIdentityValidation):
   TSChannelServerCredentialData;
 var
+  CallerOwnsKey: LongBool;
   Credentials: TSchannelCred;
   Expiry: SECURITY_INTEGER;
   Identity: TBytes;
   IdentityBlob: TCryptDataBlob;
+  KeyHandle: PtrUInt;
+  KeySpecification: LongWord;
   Passphrase: array of WideChar;
   Snapshot: TSChannelServerCredentialData;
   Status: SECURITY_STATUS;
@@ -3864,11 +3958,21 @@ begin
     Snapshot := TSChannelServerCredentialData.Create;
     IdentityBlob.cbData := Length(Identity);
     IdentityBlob.pbData := @Identity[0];
-    { PKCS12_NO_PERSIST_KEY keeps the imported private key ephemeral and in
-      memory; nothing lands in the caller's persisted key store. It requires
-      the CNG key-storage provider, hence PKCS12_ALWAYS_CNG_KSP. }
+    { The key must be persisted in a key-storage provider. SChannel performs
+      server key operations in lsass, which cannot reach an in-process
+      ephemeral key: importing with PKCS12_NO_PERSIST_KEY makes
+      AcquireCredentialsHandle fail with SEC_E_NO_CREDENTIALS. The snapshot
+      therefore owns a persisted CNG container and deletes it in Release.
+
+      PKCS12_ALLOW_OVERWRITE_KEY is deliberately NOT passed. PFXImportCertStore
+      names CNG keys itself, so ordinary bundles get a fresh container per
+      import and concurrent snapshots of the same identity stay independent
+      (pinned by the isolated-key-container test). Should a bundle ever carry a
+      container name that already exists, omitting the flag makes the import
+      fail loudly instead of silently overwriting a key another live snapshot
+      is still serving with. }
     Snapshot.Store := PFXImportCertStore(@IdentityBlob, @Passphrase[0],
-      PKCS12_NO_PERSIST_KEY or PKCS12_ALWAYS_CNG_KSP);
+      PKCS12_ALWAYS_CNG_KSP or CRYPT_USER_KEYSET);
     if not Assigned(Snapshot.Store) then
       raise ETransportSecurityError.Create(
         SCHANNEL_SERVER_IDENTITY_PARSE_ERROR);
@@ -3877,6 +3981,32 @@ begin
     if not Assigned(Snapshot.Certificate) then
       raise ETransportSecurityError.Create(
         'Configured TLS PKCS#12 identity must contain a certificate and private key');
+
+    { Claim the key handle before anything can fail: from here on every exit —
+      including strict-validation rejection and credential-acquisition failure
+      — runs Release, which deletes the container. }
+    KeyHandle := 0;
+    KeySpecification := 0;
+    CallerOwnsKey := False;
+    if not CryptAcquireCertificatePrivateKey(Snapshot.Certificate,
+      CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG or CRYPT_ACQUIRE_SILENT_FLAG, nil,
+      KeyHandle, KeySpecification, CallerOwnsKey) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must contain a certificate and private key');
+    { Record before rejecting: an owned handle must reach Release even on the
+      rejection path, or its container would outlive the failed snapshot. A
+      handle we do not own is not ours to free, so there is nothing to record. }
+    if CallerOwnsKey then
+    begin
+      Snapshot.PrivateKey := KeyHandle;
+      Snapshot.HasPrivateKey := True;
+    end;
+    if not Snapshot.HasPrivateKey or
+       (KeySpecification <> CERT_NCRYPT_KEY_SPEC) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity did not import into an owned CNG key');
+    Snapshot.KeyContainerName :=
+      SChannelServerKeyContainerName(Snapshot.Certificate);
 
     if AValidation = tsivStrict then
       ValidateSChannelServerIdentity(Snapshot.Store, Snapshot.Certificate);
@@ -5347,6 +5477,33 @@ begin
   AObservedError := SslGetError(Data.SSL, ReadResult);
   Result := OpenSSLServerErrorState(AConnection, Data, AObservedError,
     osoRead);
+end;
+{$ENDIF}
+{$ENDIF}
+
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{$IFNDEF PRODUCTION}
+{ Names the persisted CNG container backing the context's current snapshot.
+  Exists so the suite can assert what this backend depends on and cannot
+  otherwise observe: that concurrent imports of one identity own separate
+  containers, so releasing a snapshot never deletes a key another snapshot is
+  still serving with. }
+function TransportSecurityTestServerKeyContainer(
+  const AContext: TTransportSecurityServerContext): UnicodeString;
+var
+  Snapshot: TSChannelServerCredentialData;
+begin
+  Result := '';
+  if not Assigned(AContext) then
+    Exit;
+  Snapshot := TSChannelServerCredentialData(AContext.AcquireSnapshot);
+  if not Assigned(Snapshot) then
+    Exit;
+  try
+    Result := Snapshot.KeyContainerName;
+  finally
+    Snapshot.Release;
+  end;
 end;
 {$ENDIF}
 {$ENDIF}
