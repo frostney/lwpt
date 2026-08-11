@@ -295,6 +295,54 @@ class Controller:
         return f"full-ci:v1:{number}:{head}:{digest}"
 
     @staticmethod
+    def full_ci_evidence(
+        check: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        summary = (check.get("output") or {}).get("summary") or ""
+
+        def block(marker: str) -> Any:
+            start = summary.find(marker)
+            end = summary.find("\n```", start + len(marker))
+            if start < 0 or end <= start:
+                raise DeliveryError("full-CI proof lacks bound evidence")
+            try:
+                return json.loads(summary[start + len(marker):end])
+            except json.JSONDecodeError as error:
+                raise DeliveryError("full-CI proof has invalid bound evidence") from error
+
+        snapshot = block("```json\n")
+        fingerprints = block("```review-evidence\n")
+        if not isinstance(snapshot, dict) or not isinstance(fingerprints, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in fingerprints.items()
+        ):
+            raise DeliveryError("full-CI proof has invalid bound evidence")
+        entries = snapshot.get("entries")
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, dict) or not isinstance(entry.get("number"), int)
+            for entry in entries
+        ):
+            raise DeliveryError("full-CI proof has invalid bound topology")
+        expected_members = {str(entry["number"]) for entry in entries}
+        if set(fingerprints) != expected_members:
+            raise DeliveryError(
+                "full-CI proof does not bind every prefix member's review evidence"
+            )
+        return snapshot, fingerprints
+
+    @staticmethod
+    def full_ci_evidence_blocks(
+        snapshot: dict[str, Any], fingerprints: dict[str, str]
+    ) -> str:
+        return (
+            "```json\n"
+            + json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+            + "\n```\n\n```review-evidence\n"
+            + json.dumps(fingerprints, sort_keys=True, separators=(",", ":"))
+            + "\n```"
+        )
+
+    @staticmethod
     def owned(check: dict[str, Any], name: str) -> bool:
         return check.get("name") == name and check.get("app", {}).get("slug") == OWNED_APP
 
@@ -491,19 +539,24 @@ class Controller:
         external_id = self.full_ci_external_id(number, expected_head, digest)
         check = self.matching_check(expected_head, FULL_CI_CHECK, external_id)
         if check and check.get("conclusion") == "success":
-            return
+            try:
+                stored_snapshot, stored_fingerprints = self.full_ci_evidence(check)
+                if (
+                    snapshot_digest(stored_snapshot) == digest
+                    and stored_fingerprints == review_fingerprints
+                ):
+                    return
+            except DeliveryError:
+                pass
         if check and check["status"] != "completed":
             return
-        summary = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
         check = self.github.create_check(
             FULL_CI_CHECK,
             expected_head,
             external_id,
             "Full CI running",
-            f"Candidate topology: `{digest}`\n\n```json\n{summary}\n```\n\n"
-            + "```review-evidence\n"
-            + json.dumps(review_fingerprints, sort_keys=True, separators=(",", ":"))
-            + "\n```",
+            f"Candidate topology: `{digest}`\n\n"
+            + self.full_ci_evidence_blocks(snapshot, review_fingerprints),
         )
         self.dispatch_with_terminal_failure(
             "ci.yml",
@@ -529,6 +582,16 @@ class Controller:
             raise DeliveryError(
                 f"candidate #{candidate} requires successful exact-topology {FULL_CI_CHECK} evidence"
             )
+        stored_snapshot, stored_fingerprints = self.full_ci_evidence(check)
+        if snapshot_digest(stored_snapshot) != digest:
+            raise DeliveryError("full-CI proof topology does not match the current candidate")
+        for entry in snapshot["entries"]:
+            current_fingerprint = self.validate_reviews(entry["number"], entry["head"])
+            if stored_fingerprints.get(str(entry["number"])) != current_fingerprint:
+                raise DeliveryError(
+                    f"review evidence for pull request #{entry['number']} changed "
+                    "after full-CI promotion"
+                )
 
     @staticmethod
     def review_fingerprint(
@@ -788,31 +851,14 @@ class Controller:
             if not match:
                 continue
             check = self.github.check_run(int(match.group(4)))
-            output = (check.get("output") or {}).get("summary") or ""
-            marker = "```json\n"
-            start = output.find(marker)
-            end = output.find("\n```", start + len(marker))
-            if start < 0 or end <= start:
-                continue
             try:
-                snapshot = json.loads(output[start + len(marker):end])
-            except json.JSONDecodeError:
+                snapshot, stored_fingerprints = self.full_ci_evidence(check)
+            except DeliveryError:
                 continue
             if snapshot_digest(snapshot) != match.group(3) or not snapshot_contains(
                 snapshot, number
             ):
                 continue
-            review_marker = "```review-evidence\n"
-            review_start = output.find(review_marker)
-            review_end = output.find("\n```", review_start + len(review_marker))
-            stored_fingerprints: dict[str, str] = {}
-            if review_start >= 0 and review_end > review_start:
-                try:
-                    stored_fingerprints = json.loads(
-                        output[review_start + len(review_marker):review_end]
-                    )
-                except json.JSONDecodeError:
-                    stored_fingerprints = {}
             member = next(
                 entry for entry in snapshot["entries"] if entry["number"] == number
             )
@@ -980,16 +1026,29 @@ class Controller:
         conclusion, title = workflow_conclusion(run.get("conclusion"))
         summary = f"Workflow run {run['id']} concluded `{run.get('conclusion')}`."
         try:
+            stored_snapshot, review_fingerprints = self.full_ci_evidence(check)
+            snapshot = stored_snapshot
+            if snapshot_digest(stored_snapshot) != requested_digest:
+                raise DeliveryError("full-CI proof topology changed before finalization")
             self.current_pull(number, head)
-            snapshot, digest = self.snapshot(number)
+            current_snapshot, digest = self.snapshot(number)
             if digest != requested_digest:
                 raise DeliveryError(
                     f"topology changed from {requested_digest} to {digest} during full CI"
                 )
+            for entry in stored_snapshot["entries"]:
+                current_fingerprint = self.validate_reviews(
+                    entry["number"], entry["head"]
+                )
+                if review_fingerprints[str(entry["number"])] != current_fingerprint:
+                    raise DeliveryError(
+                        f"review evidence for pull request #{entry['number']} changed "
+                        "during full CI"
+                    )
             summary = (
                 f"Workflow run {run['id']} concluded `{run.get('conclusion')}` for candidate "
-                f"#{number}, head `{head}`, and topology `{digest}`.\n\n```json\n"
-                f"{json.dumps(snapshot, sort_keys=True, separators=(',', ':'))}\n```"
+                f"#{number}, head `{head}`, and topology `{digest}`.\n\n"
+                + self.full_ci_evidence_blocks(current_snapshot, review_fingerprints)
             )
         except DeliveryError as error:
             conclusion, title = "failure", "Full-CI evidence became stale"

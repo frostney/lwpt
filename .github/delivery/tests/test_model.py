@@ -134,8 +134,9 @@ class PromotionController(Controller):
         self.preflight.append("pr-ci")
         return {"conclusion": "success"}
 
-    def validate_reviews(self, number: int, head: str) -> None:
+    def validate_reviews(self, number: int, head: str) -> str:
         self.preflight.append(f"review:{number}")
+        return f"fingerprint:{number}"
 
 
 class PrefixPromotionController(PromotionController):
@@ -317,6 +318,176 @@ class DeliveryModelTests(unittest.TestCase):
         self.assertEqual(["pr-ci", "review:41"], controller.preflight)
         self.assertEqual("full-ci", github.dispatched[0][1]["mode"])
 
+    def test_completed_full_ci_rejects_changed_review_evidence(self) -> None:
+        head = "1" * 40
+        snapshot = PromotionController(DiagnosticGitHub(head)).snapshot(41)[0]
+        digest = snapshot_digest(snapshot)
+        github = FakeCheckGitHub(
+            {
+                "id": 99,
+                "name": "full-ci",
+                "status": "completed",
+                "conclusion": "success",
+                "app": {"slug": "github-actions"},
+                "external_id": f"full-ci:v1:41:{head}:{digest}",
+                "output": {
+                    "summary": "proof\n\n"
+                    + Controller.full_ci_evidence_blocks(
+                        snapshot, {"41": "promotion-fingerprint"}
+                    )
+                },
+            }
+        )
+        controller = Controller(github)
+        controller.validate_reviews = (  # type: ignore[method-assign]
+            lambda number, member_head: "changed-fingerprint"
+        )
+        with self.assertRaisesRegex(DeliveryError, "changed after full-CI promotion"):
+            controller.require_full_ci(41, snapshot, digest)
+
+    def test_full_ci_finalizer_preserves_bound_review_evidence(self) -> None:
+        head = "1" * 40
+        snapshot = PromotionController(DiagnosticGitHub(head)).snapshot(41)[0]
+        digest = snapshot_digest(snapshot)
+        fingerprints = {"41": "promotion-fingerprint"}
+        github = FakeCheckGitHub(
+            {
+                "id": 99,
+                "name": "full-ci",
+                "status": "in_progress",
+                "app": {"slug": "github-actions"},
+                "external_id": f"full-ci:v1:41:{head}:{digest}",
+                "output": {
+                    "summary": "proof\n\n"
+                    + Controller.full_ci_evidence_blocks(snapshot, fingerprints)
+                },
+            }
+        )
+        controller = Controller(github)
+        controller.current_pull = (  # type: ignore[method-assign]
+            lambda number, expected_head=None: {"number": number}
+        )
+        controller.snapshot = lambda number: (snapshot, digest)  # type: ignore[method-assign]
+        controller.validate_reviews = (  # type: ignore[method-assign]
+            lambda number, member_head: fingerprints[str(number)]
+        )
+        match = FULL_CI_RUN_RE.match(f"full-ci/41/{head}/{digest}/99")
+        self.assertIsNotNone(match)
+        controller.finalize_full_ci(
+            {"id": 7, "conclusion": "success", "html_url": "https://example.test/run/7"},
+            match,
+        )
+        self.assertIn(
+            "```review-evidence\n"
+            + json.dumps(fingerprints, sort_keys=True, separators=(",", ":"))
+            + "\n```",
+            github.updated[0][1]["summary"],
+        )
+
+    def test_full_ci_finalizer_rejects_review_change_during_run(self) -> None:
+        head = "1" * 40
+        snapshot = PromotionController(DiagnosticGitHub(head)).snapshot(41)[0]
+        digest = snapshot_digest(snapshot)
+        github = FakeCheckGitHub(
+            {
+                "id": 99,
+                "name": "full-ci",
+                "status": "in_progress",
+                "app": {"slug": "github-actions"},
+                "external_id": f"full-ci:v1:41:{head}:{digest}",
+                "output": {
+                    "summary": Controller.full_ci_evidence_blocks(
+                        snapshot, {"41": "promotion-fingerprint"}
+                    )
+                },
+            }
+        )
+        github.remove_label = lambda number, label: None  # type: ignore[attr-defined]
+        controller = Controller(github)
+        controller.current_pull = (  # type: ignore[method-assign]
+            lambda number, expected_head=None: {}
+        )
+        controller.snapshot = (  # type: ignore[method-assign]
+            lambda number: (snapshot, digest)
+        )
+        controller.validate_reviews = (  # type: ignore[method-assign]
+            lambda number, member_head: "changed-fingerprint"
+        )
+        match = FULL_CI_RUN_RE.match(f"full-ci/41/{head}/{digest}/99")
+        self.assertIsNotNone(match)
+        controller.finalize_full_ci(
+            {"id": 7, "conclusion": "success", "html_url": "https://example.test/run/7"},
+            match,
+        )
+        self.assertEqual("failure", github.updated[0][1]["conclusion"])
+        self.assertIn("changed during full CI", github.updated[0][1]["summary"])
+
+    def test_completed_full_ci_accepts_unchanged_review_evidence(self) -> None:
+        head = "1" * 40
+        snapshot = PromotionController(DiagnosticGitHub(head)).snapshot(41)[0]
+        digest = snapshot_digest(snapshot)
+        fingerprint = "promotion-fingerprint"
+        github = FakeCheckGitHub(
+            {
+                "id": 99,
+                "name": "full-ci",
+                "status": "completed",
+                "conclusion": "success",
+                "app": {"slug": "github-actions"},
+                "external_id": f"full-ci:v1:41:{head}:{digest}",
+                "output": {
+                    "summary": Controller.full_ci_evidence_blocks(
+                        snapshot, {"41": fingerprint}
+                    )
+                },
+            }
+        )
+        controller = Controller(github)
+        controller.validate_reviews = (  # type: ignore[method-assign]
+            lambda number, member_head: fingerprint
+        )
+        controller.require_full_ci(41, snapshot, digest)
+
+    def test_completed_full_ci_rejects_missing_review_evidence(self) -> None:
+        head = "1" * 40
+        snapshot = PromotionController(DiagnosticGitHub(head)).snapshot(41)[0]
+        digest = snapshot_digest(snapshot)
+        github = FakeCheckGitHub(
+            {
+                "id": 99,
+                "name": "full-ci",
+                "status": "completed",
+                "conclusion": "success",
+                "app": {"slug": "github-actions"},
+                "external_id": f"full-ci:v1:41:{head}:{digest}",
+                "output": {"summary": "```json\n{}\n```"},
+            }
+        )
+        with self.assertRaisesRegex(DeliveryError, "lacks bound evidence"):
+            Controller(github).require_full_ci(41, snapshot, digest)
+
+    def test_full_ci_redispatches_after_successful_proof_review_change(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        controller = PromotionController(github)
+        snapshot, digest = controller.snapshot(41)
+        stale = {
+            "id": 98,
+            "name": "full-ci",
+            "status": "completed",
+            "conclusion": "success",
+            "app": {"slug": "github-actions"},
+            "external_id": f"full-ci:v1:41:{head}:{digest}",
+            "output": {
+                "summary": Controller.full_ci_evidence_blocks(
+                    snapshot, {"41": "old-fingerprint"}
+                )
+            },
+        }
+        github.check_runs = lambda member_head: [stale]  # type: ignore[method-assign]
+        controller.full_ci(41, head)
+        self.assertEqual("full-ci", github.dispatched[0][1]["mode"])
+
     def test_native_prefix_promotion_validates_every_member(self) -> None:
         github = DiagnosticGitHub("1" * 40)
         controller = PrefixPromotionController(github)
@@ -404,7 +575,9 @@ class DeliveryModelTests(unittest.TestCase):
         )
         github.checks[99]["output"]["summary"] += (
             "\n\n```review-evidence\n"
-            + json.dumps({"40": fingerprint}, separators=(",", ":"))
+            + json.dumps(
+                {"40": fingerprint, "41": fingerprint}, separators=(",", ":")
+            )
             + "\n```"
         )
         controller.invalidate_active_full_ci_for_member(
