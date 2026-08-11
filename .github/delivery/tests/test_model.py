@@ -12,7 +12,13 @@ from pathlib import Path
 DELIVERY_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(DELIVERY_DIR))
 
-from controller import Controller, MANAGED_RUN_RE, positive_integer  # noqa: E402
+from controller import (  # noqa: E402
+    Controller,
+    DIAGNOSTIC_RUN_RE,
+    FULL_CI_RUN_RE,
+    MANAGED_RUN_RE,
+    positive_integer,
+)
 from model import (  # noqa: E402
     DeliveryError,
     derive_candidate_snapshot,
@@ -54,6 +60,69 @@ class FakeCheckGitHub(FakeGitHub):
 class FailingDispatchGitHub(FakeCheckGitHub):
     def dispatch(self, workflow: str, inputs: dict[str, str]) -> None:
         raise DeliveryError(f"dispatch of {workflow} was refused")
+
+
+class DiagnosticGitHub(FakeGitHub):
+    def __init__(self, head: str) -> None:
+        self.head = head
+        self.dispatched: list[tuple[str, dict[str, str]]] = []
+        self.cancelled: list[int] = []
+        self.runs: list[dict] = []
+
+    def pull(self, number: int) -> dict:
+        return {
+            "number": number,
+            "state": "open",
+            "head": {"sha": self.head, "repo": {"full_name": self.repository}},
+        }
+
+    def dispatch(self, workflow: str, inputs: dict[str, str]) -> None:
+        self.dispatched.append((workflow, inputs))
+
+    def workflow_runs(self, workflow: str) -> list[dict]:
+        return self.runs
+
+    def check_runs(self, head: str) -> list[dict]:
+        return []
+
+    def cancel_run(self, run_id: int) -> None:
+        self.cancelled.append(run_id)
+
+    def create_check(
+        self, name: str, head: str, external_id: str, title: str, summary: str
+    ) -> dict:
+        return {"id": 99, "status": "in_progress"}
+
+
+class PromotionController(Controller):
+    def __init__(self, github: DiagnosticGitHub) -> None:
+        super().__init__(github)
+        self.preflight: list[str] = []
+
+    def snapshot(self, number: int) -> tuple[dict, str]:
+        return (
+            {
+                "mode": "singleton",
+                "candidate": number,
+                "entries": [
+                    {
+                        "number": number,
+                        "head": "1" * 40,
+                        "base": "2" * 40,
+                        "base_ref": "main",
+                        "full_ci_required": True,
+                    }
+                ],
+            },
+            "a" * 64,
+        )
+
+    def require_delivery_success(self, number: int, expected_head: str) -> dict:
+        self.preflight.append("pr-ci")
+        return {"conclusion": "success"}
+
+    def validate_reviews(self, number: int, head: str) -> None:
+        self.preflight.append("review")
 
 
 class DeliveryModelTests(unittest.TestCase):
@@ -107,6 +176,104 @@ class DeliveryModelTests(unittest.TestCase):
         self.assertEqual(
             "Managed PR CI dispatch failed", github.updated[0][1]["title"]
         )
+
+    def test_diagnostic_dispatch_is_allow_listed_and_not_a_full_ci_proof(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        controller = Controller(github)
+        controller.diagnostic(41, head, "x86_64-win64", "tls")
+        self.assertEqual(
+            [
+                (
+                    "ci.yml",
+                    {
+                        "mode": "diagnostic",
+                        "candidate_pr_number": "41",
+                        "expected_head": head,
+                        "diagnostic_target": "x86_64-win64",
+                        "diagnostic_selector": "tls",
+                    },
+                )
+            ],
+            github.dispatched,
+        )
+        title = f"diagnostic/41/{head}/x86_64-win64/tls"
+        self.assertIsNotNone(DIAGNOSTIC_RUN_RE.match(title))
+        self.assertIsNone(FULL_CI_RUN_RE.match(title))
+        with self.assertRaisesRegex(DeliveryError, "unsupported diagnostic target"):
+            controller.diagnostic(41, head, "windows-latest", "tls")
+
+    def test_diagnostic_refuses_a_stale_head(self) -> None:
+        controller = Controller(DiagnosticGitHub("1" * 40))
+        with self.assertRaisesRegex(DeliveryError, "stale head"):
+            controller.diagnostic(41, "2" * 40, "i386-win32", "default")
+
+    def test_superseded_diagnostic_and_full_ci_runs_are_cancelled(self) -> None:
+        head = "1" * 40
+        digest = "a" * 64
+        github = DiagnosticGitHub(head)
+        github.runs = [
+            {
+                "id": 1,
+                "status": "in_progress",
+                "display_title": f"diagnostic/41/{'2' * 40}/x86_64-win64/tls",
+            },
+            {
+                "id": 2,
+                "status": "queued",
+                "display_title": f"full-ci/41/{head}/{'b' * 64}/99",
+            },
+            {
+                "id": 3,
+                "status": "in_progress",
+                "display_title": f"full-ci/41/{head}/{digest}/100",
+            },
+        ]
+        Controller(github).cancel_superseded_ci_runs(41, head, digest)
+        self.assertEqual([1, 2], github.cancelled)
+
+    def test_review_change_cancels_current_full_ci_but_not_diagnostic(self) -> None:
+        head = "1" * 40
+        digest = "a" * 64
+        github = DiagnosticGitHub(head)
+        github.runs = [
+            {
+                "id": 1,
+                "status": "in_progress",
+                "display_title": f"diagnostic/41/{head}/x86_64-win64/tls",
+            },
+            {
+                "id": 2,
+                "status": "in_progress",
+                "display_title": f"full-ci/41/{head}/{digest}/99",
+            },
+        ]
+        Controller(github).cancel_superseded_ci_runs(
+            41, head, digest, review_changed=True
+        )
+        self.assertEqual([2], github.cancelled)
+
+    def test_full_ci_is_dispatched_only_after_terminal_preflight(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        controller = PromotionController(github)
+        controller.full_ci(41, head)
+        self.assertEqual(["pr-ci", "review"], controller.preflight)
+        self.assertEqual("full-ci", github.dispatched[0][1]["mode"])
+
+    def test_full_ci_refuses_a_branch_behind_its_base(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        def behind_pull(number: int) -> dict:
+            pull = original_pull(number)
+            pull["mergeable_state"] = "behind"
+            return pull
+
+        github.pull = behind_pull  # type: ignore[method-assign]
+        with self.assertRaisesRegex(DeliveryError, "current base"):
+            PromotionController(github).full_ci(41, head)
 
     def test_superseded_pending_head_is_terminally_failed(self) -> None:
         head = "1" * 40

@@ -38,8 +38,13 @@ from model import (
 DELIVERY_CHECK = "delivery-admission"
 FULL_CI_CHECK = "full-ci"
 OWNED_APP = "github-actions"
+DIAGNOSTIC_TARGETS = {"x86_64-win64", "i386-win32"}
+DIAGNOSTIC_SELECTORS = {"default", "e2e", "tls"}
 MANAGED_RUN_RE = re.compile(r"^delivery-pr/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
 FULL_CI_RUN_RE = re.compile(r"^full-ci/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
+DIAGNOSTIC_RUN_RE = re.compile(
+    r"^diagnostic/(\d+)/([0-9a-f]{40})/(x86_64-win64|i386-win32)/(default|e2e|tls)$"
+)
 
 
 class GitHub:
@@ -195,6 +200,28 @@ class GitHub:
             f"/repos/{self.repository}/actions/workflows/{workflow}/dispatches",
             {"ref": repository["default_branch"], "inputs": inputs},
         )
+
+    def workflow_runs(self, workflow: str) -> list[dict[str, Any]]:
+        runs: list[dict[str, Any]] = []
+        for status in ("queued", "in_progress"):
+            result = self.request(
+                "GET",
+                f"/repos/{self.repository}/actions/workflows/{workflow}/runs"
+                f"?event=workflow_dispatch&status={status}&per_page=100",
+            )
+            if result["total_count"] > len(result["workflow_runs"]):
+                raise DeliveryError(
+                    "active workflow-run evidence exceeds the supported 100-item fail-closed bound"
+                )
+            runs.extend(result["workflow_runs"])
+        return runs
+
+    def cancel_run(self, run_id: int) -> None:
+        try:
+            self.request("POST", f"/repos/{self.repository}/actions/runs/{run_id}/cancel")
+        except DeliveryError as error:
+            if "(404)" not in str(error) and "(409)" not in str(error):
+                raise
 
     def collaborator_permission(self, login: str) -> str:
         encoded = urllib.parse.quote(login, safe="")
@@ -413,10 +440,44 @@ class Controller:
         self.clear_readiness(number, (MERGE_READY_LABEL,))
         self.github.add_labels(number, [CI_READY_LABEL, REVIEW_READY_LABEL])
 
+    def diagnostic(
+        self, number: int, expected_head: str, target: str, selector: str
+    ) -> None:
+        pull = self.current_pull(number, expected_head)
+        self.require_same_repository(pull)
+        if target not in DIAGNOSTIC_TARGETS:
+            raise DeliveryError(f"unsupported diagnostic target: {target}")
+        if selector not in DIAGNOSTIC_SELECTORS:
+            raise DeliveryError(f"unsupported diagnostic selector: {selector}")
+        self.github.dispatch(
+            "ci.yml",
+            {
+                "mode": "diagnostic",
+                "candidate_pr_number": str(number),
+                "expected_head": expected_head,
+                "diagnostic_target": target,
+                "diagnostic_selector": selector,
+            },
+        )
+
     def full_ci(self, number: int, expected_head: str) -> None:
         pull = self.current_pull(number, expected_head)
         self.require_same_repository(pull)
+        if pull.get("mergeable") is False or pull.get("mergeable_state") in {
+            "behind",
+            "dirty",
+            "unknown",
+        }:
+            raise DeliveryError(
+                f"pull request #{number} is not integrated with its current base"
+            )
         snapshot, digest = self.snapshot(number)
+        if not snapshot_requires_full_ci(snapshot):
+            raise DeliveryError(
+                f"candidate #{number} is not marked {FULL_CI_REQUIRED_LABEL}"
+            )
+        self.require_delivery_success(number, expected_head)
+        self.validate_reviews(number, expected_head)
         external_id = self.full_ci_external_id(number, expected_head, digest)
         check = self.matching_check(expected_head, FULL_CI_CHECK, external_id)
         if check and check.get("conclusion") == "success":
@@ -587,14 +648,42 @@ class Controller:
             f"Pull request #{number} no longer has head `{head}`.",
         )
 
+    def cancel_superseded_ci_runs(
+        self,
+        number: int,
+        current_head: str,
+        current_digest: str,
+        review_changed: bool = False,
+    ) -> None:
+        for run in self.github.workflow_runs("ci.yml"):
+            if run.get("status") not in {"queued", "in_progress"}:
+                continue
+            title = run.get("display_title", "")
+            full_ci = FULL_CI_RUN_RE.match(title)
+            diagnostic = DIAGNOSTIC_RUN_RE.match(title)
+            should_cancel = False
+            if full_ci and int(full_ci.group(1)) == number:
+                should_cancel = (
+                    full_ci.group(2) != current_head
+                    or full_ci.group(3) != current_digest
+                    or review_changed
+                )
+            elif diagnostic and int(diagnostic.group(1)) == number:
+                should_cancel = diagnostic.group(2) != current_head
+            if should_cancel:
+                self.github.cancel_run(run["id"])
+
     def observe(self, event_path: str | None) -> None:
         numbers: set[int] = set()
+        review_changed_numbers: set[int] = set()
         if event_path:
             event = json.loads(Path(event_path).read_text(encoding="utf-8"))
             pull = event.get("pull_request")
             if pull:
                 number = pull["number"]
                 head = pull["head"]["sha"]
+                if "review" in event or "comment" in event:
+                    review_changed_numbers.add(number)
                 if pull.get("state") == "open":
                     numbers.add(number)
                 else:
@@ -607,11 +696,41 @@ class Controller:
                 before = event.get("before")
                 if before and before != head:
                     self.fail_superseded_head(number, before)
+                    try:
+                        _, digest = self.snapshot(number)
+                        self.cancel_superseded_ci_runs(number, head, digest)
+                    except DeliveryError:
+                        pass
         for pull in self.github.open_pulls():
             if MANAGED_LABEL in label_names(pull):
                 numbers.add(pull["number"])
         for number in sorted(numbers):
             self.observe_one(number)
+            pull = self.current_pull(number)
+            _, digest = self.snapshot(number)
+            if number in review_changed_numbers:
+                self.fail_pending_full_ci_review_change(number, pull["head"]["sha"])
+            self.cancel_superseded_ci_runs(
+                number,
+                pull["head"]["sha"],
+                digest,
+                number in review_changed_numbers,
+            )
+
+    def fail_pending_full_ci_review_change(self, number: int, head: str) -> None:
+        prefix = f"full-ci:v1:{number}:{head}:"
+        for check in self.github.check_runs(head):
+            if (
+                check["status"] != "completed"
+                and self.owned(check, FULL_CI_CHECK)
+                and check.get("external_id", "").startswith(prefix)
+            ):
+                self.github.update_check(
+                    check["id"],
+                    title="Review evidence changed",
+                    summary="Review activity changed after full-CI promotion started.",
+                    conclusion="failure",
+                )
 
     def finalize_managed(self, run: dict[str, Any], match: re.Match[str]) -> None:
         number = int(match.group(1))
@@ -659,6 +778,8 @@ class Controller:
             FULL_CI_CHECK,
             self.full_ci_external_id(number, head, requested_digest),
         )
+        if check.get("status") == "completed":
+            return
         conclusion, title = workflow_conclusion(run.get("conclusion"))
         summary = f"Workflow run {run['id']} concluded `{run.get('conclusion')}`."
         try:
@@ -773,11 +894,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "operation",
-        choices=["enrol", "ci", "review", "full-ci", "merge", "reset", "observe", "finalize", "watchdog"],
+        choices=["enrol", "ci", "review", "diagnostic", "full-ci", "merge", "reset", "observe", "finalize", "watchdog"],
     )
     parser.add_argument("--pr-number", type=int)
     parser.add_argument("--expected-head")
     parser.add_argument("--candidate-pr-number", type=int)
+    parser.add_argument("--diagnostic-target")
+    parser.add_argument("--diagnostic-selector")
     parser.add_argument("--event-path")
     parser.add_argument("--maximum-age-minutes", type=positive_integer, default=120)
     return parser.parse_args()
@@ -799,6 +922,13 @@ def main() -> int:
             controller.ci(require(args.pr_number, "pr-number"), require(args.expected_head, "expected-head"))
         elif args.operation == "review":
             controller.review(require(args.pr_number, "pr-number"), require(args.expected_head, "expected-head"))
+        elif args.operation == "diagnostic":
+            controller.diagnostic(
+                require(args.pr_number, "pr-number"),
+                require(args.expected_head, "expected-head"),
+                require(args.diagnostic_target, "diagnostic-target"),
+                require(args.diagnostic_selector, "diagnostic-selector"),
+            )
         elif args.operation == "full-ci":
             controller.full_ci(require(args.pr_number, "pr-number"), require(args.expected_head, "expected-head"))
         elif args.operation == "merge":

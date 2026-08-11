@@ -8,11 +8,11 @@ finalizers with write permission always run trusted default-branch code.
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch`, weekly `schedule` | Build + cache the cross-FPC toolchain |
-| `ci.yml` | `push` to `main`, `workflow_dispatch` | Full six-target integrated-main verification or explicit exact-candidate `full-ci` proof |
+| `ci.yml` | `push` to `main`, `workflow_dispatch` | Full integrated-main/terminal promotion matrix or one allow-listed native diagnostic slice |
 | `pr.yml` | `pull_request`, `workflow_call` | Automatic ordinary gate or reusable read-only managed PR matrix |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
 | `delphi-native.yml` | `workflow_dispatch` | Optional Delphi 12+ Win64 smoke on a licensed self-hosted runner; never a required gate |
-| `delivery-transition.yml` | `workflow_dispatch` | Trusted explicit `enrol`, `ci`, `review`, `full-ci`, `merge`, or `reset` endpoint |
+| `delivery-transition.yml` | `workflow_dispatch` | Trusted explicit `enrol`, `ci`, `review`, `diagnostic`, `full-ci`, `merge`, or `reset` endpoint |
 | `delivery-pr.yml` | controller `workflow_dispatch` | Run `pr.yml` read-only for one admitted exact head |
 | `delivery-observer.yml` | PR metadata, schedule, manual | Create pending checks and invalidate stale head/base/topology evidence |
 | `delivery-finalizer.yml` | `workflow_run` completion | Conclude ordinary, managed, cancelled, and full-CI exact checks |
@@ -27,10 +27,11 @@ Trigger split, mirroring GocciaScript's CI shape:
   successfully at a cheap routing job. The `ci` operation dispatches
   `delivery-pr.yml`, which calls the same matrix for the exact current head.
   `delivery:managed` does not assert native stack membership.
-- **`ci.yml` has two exact uses.** A push to `main` verifies the integrated tree;
+- **`ci.yml` has three exact uses.** A push to `main` verifies the integrated tree;
   rapid main pushes cancel older integrated-main runs. The `full-ci` operation
   checks out one frozen singleton or cumulative native-prefix top SHA. Those
-  explicit runs are never coalesced.
+  promotion runs are never coalesced. The `diagnostic` operation selects one
+  allow-listed Windows target and test scope and cannot produce a proof check.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
 Repository rules make these contracts enforceable. The desired main ruleset is
@@ -79,6 +80,13 @@ re-fetches the PR and native topology, binds the workflow result to the current
 check, and then records success or terminal failure. Cancelled runs are failure;
 the watchdog supplies the same terminal result for orphaned runs.
 
+The `diagnostic` operation runs one allow-listed native remediation slice. The
+initial surface is Windows x86_64 or i386 with the default tier, the E2E tier,
+or the package's TLS test file. It checks out the exact current PR head, cannot
+accept a shell command or fork, uses a `diagnostic/...` run identity, and never
+creates or satisfies a `full-ci` proof. A later diagnostic for the same PR
+cancels the prior run.
+
 The `review` operation opens the configured provider lane after PR admission.
 Before `merge`, the controller requires a terminal provider review on the
 current head, a successful provider check, no unresolved thread, and a reply
@@ -93,6 +101,13 @@ work in between. An ordinary member never uses the endpoint; at its merge turn
 it remains individually subject to current branch protection and the ordinary
 review policy. The coordinator never treats labels left by an earlier preflight
 as durable proof.
+
+`full-ci` is dispatched only as terminal promotion for a `ci:full-required`
+candidate after current-base integration, exact-head PR admission, and review
+convergence. Its frozen topology digest separates it from diagnostics. A head,
+base/topology, or review change fails the pending proof and the observer cancels
+the superseded matrix. Ordinary changes covered by PR CI do not receive a
+pre-merge full matrix.
 
 ### `toolchain.yml` — cross-FPC toolchain build
 

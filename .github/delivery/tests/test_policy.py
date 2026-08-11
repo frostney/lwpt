@@ -23,8 +23,25 @@ class RepositoryPolicyTests(unittest.TestCase):
         ]
         for heading in headings:
             self.assertIn(heading, policy)
-        for operation in ("enrol", "ci", "review", "full-ci", "merge", "reset"):
+        for operation in (
+            "enrol",
+            "ci",
+            "review",
+            "diagnostic",
+            "full-ci",
+            "merge",
+            "reset",
+        ):
             self.assertIn(f"`{operation}`", policy)
+
+    def test_diagnostics_are_allow_listed_and_proof_separated(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        for value in ("x86_64-win64", "i386-win32", "default", "e2e", "tls"):
+            self.assertIn(f"- {value}", workflow)
+        self.assertIn("diagnostic/", workflow)
+        self.assertIn("- diagnostic", workflow)
+        self.assertIn("current same-repository PR head", workflow)
+        self.assertNotIn("diagnostic:v1", workflow)
 
     def test_orchestration_policy_pins_every_initial_threshold(self) -> None:
         policy = (ROOT / "ORCHESTRATION.md").read_text(encoding="utf-8")

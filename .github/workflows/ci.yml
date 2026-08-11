@@ -3,6 +3,9 @@ run-name: >-
   ${{ inputs.mode == 'full-ci' &&
       format('full-ci/{0}/{1}/{2}/{3}', inputs.candidate_pr_number,
       inputs.expected_head, inputs.topology_digest, inputs.check_id) ||
+      inputs.mode == 'diagnostic' &&
+      format('diagnostic/{0}/{1}/{2}/{3}', inputs.candidate_pr_number,
+      inputs.expected_head, inputs.diagnostic_target, inputs.diagnostic_selector) ||
       format('CI / {0}', github.ref_name) }}
 
 # Two stages, mirroring the GocciaScript CI pattern (the upstream of
@@ -53,6 +56,7 @@ on:
         options:
           - manual
           - full-ci
+          - diagnostic
       candidate_pr_number:
         description: Singleton or native-prefix top PR for full-ci
         required: false
@@ -69,33 +73,79 @@ on:
         description: Exact full-ci check run concluded by the trusted finalizer
         required: false
         type: string
+      diagnostic_target:
+        description: Native target for diagnostic mode
+        required: false
+        type: choice
+        options:
+          - x86_64-win64
+          - i386-win32
+      diagnostic_selector:
+        description: Allow-listed test scope for diagnostic mode
+        required: false
+        type: choice
+        options:
+          - default
+          - e2e
+          - tls
 
 permissions:
   contents: read
+  pull-requests: read
 
 # Rapid prefix merges still create distinct main commits. Keep only the latest
 # integrated-main verification running; explicit full-ci dispatches remain
 # independent exact-candidate proofs and are never silently coalesced.
 concurrency:
-  group: ${{ github.event_name == 'push' && 'integrated-main' || format('ci-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  group: >-
+    ${{ github.event_name == 'push' && 'integrated-main' ||
+        inputs.mode == 'diagnostic' && format('diagnostic-{0}', inputs.candidate_pr_number) ||
+        format('ci-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' || inputs.mode == 'diagnostic' }}
 
 jobs:
   validate-inputs:
     runs-on: ubuntu-latest
+    outputs:
+      build-matrix: ${{ steps.route.outputs.build-matrix }}
+      test-matrix: ${{ steps.route.outputs.test-matrix }}
     steps:
-      - name: Validate exact full-CI proof inputs
+      - name: Validate trusted dispatch inputs
         env:
           MODE: ${{ inputs.mode }}
           CANDIDATE_PR_NUMBER: ${{ inputs.candidate_pr_number }}
           EXPECTED_HEAD: ${{ inputs.expected_head }}
           TOPOLOGY_DIGEST: ${{ inputs.topology_digest }}
           CHECK_ID: ${{ inputs.check_id }}
+          DIAGNOSTIC_TARGET: ${{ inputs.diagnostic_target }}
+          DIAGNOSTIC_SELECTOR: ${{ inputs.diagnostic_selector }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ "$MODE" != "full-ci" ]; then
+          if [ "$MODE" = "diagnostic" ]; then
+            if ! [[ "$CANDIDATE_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
+               ! [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::diagnostic mode requires a candidate PR and exact head."
+              exit 1
+            fi
+            case "$DIAGNOSTIC_TARGET" in
+              x86_64-win64|i386-win32) ;;
+              *) echo "::error::unsupported diagnostic target: $DIAGNOSTIC_TARGET"; exit 1 ;;
+            esac
+            case "$DIAGNOSTIC_SELECTOR" in
+              default|e2e|tls) ;;
+              *) echo "::error::unsupported diagnostic selector: $DIAGNOSTIC_SELECTOR"; exit 1 ;;
+            esac
+            PULL="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$CANDIDATE_PR_NUMBER")"
+            if [ "$(jq -r '.state' <<<"$PULL")" != "open" ] ||
+               [ "$(jq -r '.head.sha' <<<"$PULL")" != "$EXPECTED_HEAD" ] ||
+               [ "$(jq -r '.head.repo.full_name' <<<"$PULL")" != "$GITHUB_REPOSITORY" ]; then
+              echo "::error::diagnostic inputs do not identify a current same-repository PR head."
+              exit 1
+            fi
             exit 0
           fi
+          if [ "$MODE" != "full-ci" ]; then exit 0; fi
           if ! [[ "$CANDIDATE_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
              ! [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]] ||
              ! [[ "$TOPOLOGY_DIGEST" =~ ^[0-9a-f]{64}$ ]] ||
@@ -104,12 +154,39 @@ jobs:
             exit 1
           fi
 
+      - name: Select exact matrix
+        id: route
+        env:
+          MODE: ${{ inputs.mode }}
+          DIAGNOSTIC_TARGET: ${{ inputs.diagnostic_target }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "diagnostic" ]; then
+            case "$DIAGNOSTIC_TARGET" in
+              x86_64-win64)
+                BUILD='{"include":[{"target":"x86_64-win64","cpu":"x86_64","os":"win64"}]}'
+                TEST='{"include":[{"target":"x86_64-win64","runner":"windows-latest","fpc-install":"choco"}]}'
+                ;;
+              i386-win32)
+                BUILD='{"include":[{"target":"i386-win32","cpu":"i386","os":"win32"}]}'
+                TEST='{"include":[{"target":"i386-win32","runner":"windows-latest","fpc-install":"choco"}]}'
+                ;;
+            esac
+          else
+            BUILD='{"include":[{"target":"aarch64-darwin","cpu":"aarch64","os":"darwin","native":true},{"target":"x86_64-darwin","cpu":"x86_64","os":"darwin"},{"target":"x86_64-linux","cpu":"x86_64","os":"linux"},{"target":"aarch64-linux","cpu":"aarch64","os":"linux"},{"target":"x86_64-win64","cpu":"x86_64","os":"win64"},{"target":"i386-win32","cpu":"i386","os":"win32"}]}'
+            TEST='{"include":[{"target":"aarch64-darwin","runner":"macos-latest","fpc-install":"brew","format-check":true},{"target":"x86_64-darwin","runner":"macos-15-intel","fpc-install":"brew"},{"target":"x86_64-linux","runner":"ubuntu-latest","fpc-install":"apt"},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","fpc-install":"apt"},{"target":"x86_64-win64","runner":"windows-latest","fpc-install":"choco","bootstrap-check":true},{"target":"i386-win32","runner":"windows-latest","fpc-install":"choco"}]}'
+          fi
+          echo "build-matrix=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "test-matrix=$TEST" >> "$GITHUB_OUTPUT"
+
   toolchain:
     needs: validate-inputs
     uses: ./.github/workflows/toolchain.yml
 
   build:
-    needs: toolchain
+    needs:
+      - validate-inputs
+      - toolchain
     runs-on: macos-latest
     env:
       # Sourced from toolchain.yml (the single source of truth) so the
@@ -117,27 +194,7 @@ jobs:
       FPC_VERSION: ${{ needs.toolchain.outputs.fpc-version }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-darwin
-            cpu: aarch64
-            os: darwin
-            native: true
-          - target: x86_64-darwin
-            cpu: x86_64
-            os: darwin
-          - target: x86_64-linux
-            cpu: x86_64
-            os: linux
-          - target: aarch64-linux
-            cpu: aarch64
-            os: linux
-          - target: x86_64-win64
-            cpu: x86_64
-            os: win64
-          - target: i386-win32
-            cpu: i386
-            os: win32
+      matrix: ${{ fromJSON(needs.validate-inputs.outputs.build-matrix) }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -340,31 +397,12 @@ jobs:
           path: ci-artifacts/*
 
   test:
-    needs: build
+    needs:
+      - validate-inputs
+      - build
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-darwin
-            runner: macos-latest
-            fpc-install: brew
-            format-check: true     # one runner runs format-check (platform-independent)
-          - target: x86_64-darwin
-            runner: macos-15-intel
-            fpc-install: brew
-          - target: x86_64-linux
-            runner: ubuntu-latest
-            fpc-install: apt
-          - target: aarch64-linux
-            runner: ubuntu-24.04-arm
-            fpc-install: apt
-          - target: x86_64-win64
-            runner: windows-latest
-            fpc-install: choco
-            bootstrap-check: true    # one Windows leg validates bootstrap.bat
-          - target: i386-win32
-            runner: windows-latest
-            fpc-install: choco
+      matrix: ${{ fromJSON(needs.validate-inputs.outputs.test-matrix) }}
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -435,7 +473,7 @@ jobs:
           echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
 
       - name: bootstrap.bat (Windows cold build)
-        if: matrix.bootstrap-check == true
+        if: matrix.bootstrap-check == true && inputs.mode != 'diagnostic'
         shell: cmd
         run: |
           rem Exercise bootstrap.bat's direct-fpc fallback path. This cmd
@@ -496,6 +534,7 @@ jobs:
           ./build/lwpt format --check
 
       - name: lwpt test --bail=1 (default tier)
+        if: inputs.mode != 'diagnostic' || inputs.diagnostic_selector == 'default'
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             ./build/lwpt.exe test --bail=1
@@ -504,9 +543,19 @@ jobs:
           fi
 
       - name: lwpt test --tier=e2e --bail=1 (live network — every platform per Q23=c)
+        if: inputs.mode != 'diagnostic' || inputs.diagnostic_selector == 'e2e'
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             ./build/lwpt.exe test --tier=e2e --bail=1
           else
             ./build/lwpt test --tier=e2e --bail=1
+          fi
+
+      - name: TLS diagnostic test
+        if: inputs.mode == 'diagnostic' && inputs.diagnostic_selector == 'tls'
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ./build/lwpt.exe test packages/httpclient/source/TransportSecurity.Test.pas --bail=1 --verbose
+          else
+            ./build/lwpt test packages/httpclient/source/TransportSecurity.Test.pas --bail=1 --verbose
           fi
