@@ -1,20 +1,21 @@
 { Hooks.Test — pins lifecycle-hook execution semantics (ADR-0011).
 
-  Ten assertions:
+  Eleven assertions:
     1. [prebuild] hook (bare-string shorthand) runs before `lwpt build`.
-    2. [prebuild] hook with inputs/output (the staleness gate) skips
+    2. A bare `.pas` command receives no implicit InstantFPC treatment.
+    3. [prebuild] hook with inputs/output (the staleness gate) skips
        on the second invocation when the output is fresher than every
        input.
-    3. The whole-build [postbuild] hook sees staged outputs before
+    4. The whole-build [postbuild] hook sees staged outputs before
        publication.
-    4. A per-entry [postbuild] hook sees the private candidate before
+    5. A per-entry [postbuild] hook sees the private candidate before
        the public output exists.
-    5. Related paths containing the output name are not retargeted.
-    6. A failing per-entry [postbuild] hook leaves no public output.
-    7. A failing whole-build [postbuild] hook leaves no public output.
-    8. [pretest] hook runs before `lwpt test`.
-    9. [posttest] hook runs even when no tests are discovered.
-    10. Supply-chain guard: a dep manifest's [preinstall] hook is
+    6. Related paths containing the output name are not retargeted.
+    7. A failing per-entry [postbuild] hook leaves no public output.
+    8. A failing whole-build [postbuild] hook leaves no public output.
+    9. [pretest] hook runs before `lwpt test`.
+    10. [posttest] hook runs even when no tests are discovered.
+    11. Supply-chain guard: a dep manifest's [preinstall] hook is
        silently dropped during `lwpt install`. The hook would write a
        sentinel file in the consuming project; the test asserts that
        file does NOT exist after install. This is the most important
@@ -49,7 +50,8 @@ type
     procedure AfterAll;  override;
   public
     procedure SetupTests; override;
-    procedure TestPrebuildShorthandRuns;
+    procedure TestPrebuildCommandRuns;
+    procedure TestBareStringDoesNotSelectInstantFPC;
     procedure TestPrebuildStalenessGateSkipsSecondRun;
     procedure TestPostbuildRunsAfterBuild;
     procedure TestEntryPostbuildUsesPrivateCandidate;
@@ -121,18 +123,31 @@ begin
   SetCurrentDir(FOrigDir);
 end;
 
-procedure THooksE2E.TestPrebuildShorthandRuns;
+procedure THooksE2E.TestPrebuildCommandRuns;
 var R: TLwptResult;
 begin
   SetupScratchProject(
     '[prebuild]'#10 +
-    'touch = "scripts/touch-pre.pas"'#10);
+    'touch = { command = "instantfpc", args = ["scripts/touch-pre.pas"] }'#10);
   WriteSentinelScript(FScratch + '/scripts/touch-pre.pas',
     'sentinel-prebuild.txt');
 
   R := RunLwpt(['build'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(SentinelExists('sentinel-prebuild.txt')).ToBe(True);
+end;
+
+procedure THooksE2E.TestBareStringDoesNotSelectInstantFPC;
+var
+  R: TLwptResult;
+begin
+  SetupScratchProject(
+    '[prebuild]'#10 + 'direct = "scripts/not-executable.pas"'#10);
+  WriteSentinelScript(FScratch + '/scripts/not-executable.pas',
+    'must-not-exist.txt');
+  R := RunLwpt(['build'], FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(SentinelExists('must-not-exist.txt')).ToBe(False);
 end;
 
 procedure THooksE2E.TestPrebuildStalenessGateSkipsSecondRun;
@@ -143,7 +158,7 @@ var
 begin
   SetupScratchProject(
     '[prebuild]'#10 +
-    'gen = { script = "scripts/gen.pas", inputs = ["scripts/gen.pas"], output = "sentinel-gen.txt" }'#10);
+    'gen = { command = "instantfpc", args = ["scripts/gen.pas"], inputs = ["scripts/gen.pas"], output = "sentinel-gen.txt" }'#10);
   WriteSentinelScript(FScratch + '/scripts/gen.pas', 'sentinel-gen.txt');
 
   R1 := RunLwpt(['build'], FScratch);
@@ -169,8 +184,8 @@ var R: TLwptResult;
 begin
   SetupScratchProject(
     '[postbuild]'#10 +
-    'touch = { script = "scripts/touch-post.pas", '
-    + 'args = ["build/tinybin"] }'#10);
+    'touch = { command = "instantfpc", '
+    + 'args = ["scripts/touch-post.pas", "build/tinybin"] }'#10);
   WriteTextFile(FScratch + '/scripts/touch-post.pas',
       'program TouchPostbuild;'#10
     + '{$mode delphi}{$H+}'#10
@@ -205,8 +220,8 @@ begin
     + '[build]'#10
     + 'tinybin = { source = "source/tinybin.pas", '
     + 'output = "build/tinybin", '
-    + 'postbuild = { probe = { script = "scripts/probe-output.pas", '
-    + 'args = ["{item.output}"] } } }'#10);
+    + 'postbuild = { probe = { command = "instantfpc", '
+    + 'args = ["scripts/probe-output.pas", "{item.output}"] } } }'#10);
   WriteTextFile(FScratch + '/scripts/probe-output.pas',
       'program ProbeOutput;'#10
     + '{$mode delphi}{$H+}'#10
@@ -240,8 +255,8 @@ begin
     + '[build]'#10
     + 'tinybin = { source = "source/tinybin.pas", '
     + 'output = "build/tinybin", '
-    + 'postbuild = { probe = { script = "scripts/probe-related.pas", '
-    + 'args = ["build/tinybin.json"] } } }'#10);
+    + 'postbuild = { probe = { command = "instantfpc", '
+    + 'args = ["scripts/probe-related.pas", "build/tinybin.json"] } } }'#10);
   WriteTextFile(FScratch + '/scripts/probe-related.pas',
       'program ProbeRelated;'#10
     + '{$mode delphi}{$H+}'#10
@@ -267,7 +282,7 @@ begin
     + '[build]'#10
     + 'tinybin = { source = "source/tinybin.pas", '
     + 'output = "build/tinybin", '
-    + 'postbuild = { fail = "scripts/fail-postbuild.pas" } }'#10);
+    + 'postbuild = { fail = { command = "instantfpc", args = ["scripts/fail-postbuild.pas"] } } }'#10);
   WriteTextFile(FScratch + '/scripts/fail-postbuild.pas',
       'program FailPostbuild;'#10
     + '{$mode delphi}{$H+}'#10
@@ -285,7 +300,7 @@ var R: TLwptResult;
 begin
   SetupScratchProject(
     '[postbuild]'#10 +
-    'fail = "scripts/fail-postbuild.pas"'#10);
+    'fail = { command = "instantfpc", args = ["scripts/fail-postbuild.pas"] }'#10);
   WriteTextFile(FScratch + '/scripts/fail-postbuild.pas',
       'program FailPostbuild;'#10
     + '{$mode delphi}{$H+}'#10
@@ -303,7 +318,7 @@ var R: TLwptResult;
 begin
   SetupScratchProject(
     '[pretest]'#10 +
-    'touch = "scripts/touch-pretest.pas"'#10);
+    'touch = { command = "instantfpc", args = ["scripts/touch-pretest.pas"] }'#10);
   WriteSentinelScript(FScratch + '/scripts/touch-pretest.pas',
     'sentinel-pretest.txt');
 
@@ -318,7 +333,7 @@ var R: TLwptResult;
 begin
   SetupScratchProject(
     '[posttest]'#10 +
-    'touch = "scripts/touch-posttest.pas"'#10);
+    'touch = { command = "instantfpc", args = ["scripts/touch-posttest.pas"] }'#10);
   WriteSentinelScript(FScratch + '/scripts/touch-posttest.pas',
     'sentinel-posttest.txt');
 
@@ -360,7 +375,7 @@ begin
     'units = ["source"]'#10 +
     ''#10 +
     '[preinstall]'#10 +
-    'attack = "scripts/attack.pas"'#10);
+    'attack = { command = "instantfpc", args = ["scripts/attack.pas"] }'#10);
 
   WriteTextFile(FScratch + '/evildep/source/dep.pas',
     'unit Dep;'#10'{$mode delphi}{$H+}'#10'interface'#10'implementation'#10'end.'#10);
@@ -380,8 +395,10 @@ end;
 
 procedure THooksE2E.SetupTests;
 begin
-  Test('[prebuild] shorthand runs before lwpt build',
-    TestPrebuildShorthandRuns);
+  Test('[prebuild] direct command runs before lwpt build',
+    TestPrebuildCommandRuns);
+  Test('bare-string hook is direct and does not select InstantFPC',
+    TestBareStringDoesNotSelectInstantFPC);
   Test('[prebuild] staleness gate skips the second run when output is fresh',
     TestPrebuildStalenessGateSkipsSecondRun);
   Test('[postbuild] sees staged outputs before publication',

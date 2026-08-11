@@ -25,10 +25,10 @@ var
 begin
   Ctx := LoadManifestContext(AManifestPath);
   WriteLn('package: ', Ctx.Manifest.Name, ' ', Ctx.Manifest.Version);
-  RunHooks('preinstall', Ctx.Manifest.PreInstall);
+  RunHooks('preinstall', Ctx.Manifest.PreInstall, Ctx.ProjectRoot);
   if AFrozen then Mode := itmFrozenVerify else Mode := itmMaterialize;
   RunInstallTransaction(Ctx, Mode);
-  RunHooks('postinstall', Ctx.Manifest.PostInstall);
+  RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot);
 end;
 
 end.

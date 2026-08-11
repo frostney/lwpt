@@ -1,20 +1,20 @@
 { Run.Test — pins lwpt run subcommand semantics (ADR-0013).
 
   `lwpt run <name>` resolves <name> against either:
-    (a) a user-declared run-script in the consumer's manifest (any
-        top-level section with a `script` field that isn't a reserved
+    (a) a user-declared run task in the consumer's manifest (any
+        top-level section with a `command` field that isn't a reserved
         subcommand name), or
     (b) a built-in subcommand — `lwpt run install --frozen` aliases to
         `lwpt install --frozen`.
 
   Four assertions:
-    1. User-script invocation propagates the script's exit code.
+    1. User-task invocation propagates the command's exit code.
     2. Aliased built-in subcommand runs the subcommand correctly.
     3. Aliased built-in with flag passthrough works (--frozen).
     4. Unknown name exits non-zero with a useful message.
 
-  Scratch project: a minimal manifest with one user-defined run-script
-  section (`[hello] script = "scripts/hello.pas"`) plus a tiny InstantFPC
+  Scratch project: a minimal manifest with one user-defined run task
+  section (`[hello] command = "instantfpc"`) plus a tiny InstantFPC
   script that writes a sentinel marker the test then asserts on. }
 
 program Run.Test;
@@ -39,12 +39,15 @@ type
     procedure AfterAll;  override;
   public
     procedure SetupTests; override;
-    procedure TestUserScriptInvokesAndPropagatesExitCode;
+    procedure TestUserTaskInvokesAndPropagatesExitCode;
     procedure TestAliasInstallSubcommand;
     procedure TestAliasWithFlagPassthrough;
     procedure TestListModeOmitsRetiredExport;
-    procedure TestExportCanBeUserScriptName;
+    procedure TestExportCanBeUserTaskName;
     procedure TestUnknownNameExitsNonZero;
+    procedure TestRunTaskStalenessSkipsFreshOutput;
+    procedure TestRunTaskUnmatchedInputFails;
+    procedure TestRunTaskRejectsInvocationArguments;
   end;
 
 procedure TRunE2E.SetupScratchProject;
@@ -58,7 +61,8 @@ begin
     'units = ["scripts"]'#10 +
     ''#10 +
     '[hello]'#10 +
-    'script = "scripts/hello.pas"'#10);
+    'command = "instantfpc"'#10 +
+    'args = ["scripts/hello.pas", "first", "two words"]'#10);
 
   { InstantFPC script: writes a sentinel marker + exits 7. The test
     asserts on both. The marker proves the script ran; the exit code
@@ -69,6 +73,9 @@ begin
     'uses SysUtils, Classes;'#10 +
     'var SL: TStringList;'#10 +
     'begin'#10 +
+    '  if (ParamCount <> 2) or (ParamStr(1) <> ''first'')'#10 +
+    '     or (ParamStr(2) <> ''two words'') then'#10 +
+    '    Halt(6);'#10 +
     '  SL := TStringList.Create;'#10 +
     '  try'#10 +
     '    SL.Add(''ran'');'#10 +
@@ -98,7 +105,7 @@ begin
   SetCurrentDir(FOrigDir);
 end;
 
-procedure TRunE2E.TestUserScriptInvokesAndPropagatesExitCode;
+procedure TRunE2E.TestUserTaskInvokesAndPropagatesExitCode;
 var R: TLwptResult;
 begin
   { Remove any sentinel from a prior test run so its absence is meaningful. }
@@ -143,7 +150,7 @@ begin
   Expect<Boolean>(Pos('export', R.Stdout) = 0).ToBe(True);
 end;
 
-procedure TRunE2E.TestExportCanBeUserScriptName;
+procedure TRunE2E.TestExportCanBeUserTaskName;
 var
   R: TLwptResult;
   ExportScratch: string;
@@ -159,7 +166,8 @@ begin
     'units = ["scripts"]'#10 +
     ''#10 +
     '[export]'#10 +
-    'script = "scripts/export.pas"'#10);
+    'command = "instantfpc"'#10 +
+    'args = ["scripts/export.pas"]'#10);
 
   WriteTextFile(ExportScratch + '/scripts/export.pas',
     'program ExportScript;'#10 +
@@ -181,6 +189,87 @@ begin
   Expect<Boolean>(FileExists(ExportScratch + '/export-marker.txt')).ToBe(True);
 end;
 
+procedure TRunE2E.TestRunTaskStalenessSkipsFreshOutput;
+var
+  R: TLwptResult;
+begin
+  WriteTextFile(FScratch + '/lwpt.toml',
+    '[package]'#10 + 'name = "run-e2e"'#10 + 'version = "0.0.0"'#10 +
+    '[fresh]'#10 +
+    'command = "instantfpc"'#10 +
+    'args = ["scripts/fresh.pas"]'#10 +
+    'inputs = ["scripts/*.pas"]'#10 +
+    'output = "fresh-marker.txt"'#10);
+  WriteTextFile(FScratch + '/scripts/fresh.pas',
+    'program Fresh;'#10 + '{$mode delphi}{$H+}'#10 +
+    'uses Classes;'#10 + 'var L: TStringList;'#10 + 'begin'#10 +
+    '  L := TStringList.Create; try L.Add(''once'');'#10 +
+    '  L.SaveToFile(''fresh-marker.txt''); finally L.Free; end;'#10 +
+    'end.'#10);
+  DeleteFile(FScratch + '/fresh-marker.txt');
+  R := RunLwpt(['run', 'fresh'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(FScratch + '/fresh-marker.txt')).ToBe(True);
+  WriteTextFile(FScratch + '/fresh-marker.txt', 'fresh-preserved');
+  R := RunLwpt(['run', 'fresh'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<string>(Trim(ReadBinaryFile(FScratch + '/fresh-marker.txt')))
+    .ToBe('fresh-preserved');
+
+  Sleep(1100);
+  WriteTextFile(FScratch + '/scripts/fresh.pas',
+    ReadBinaryFile(FScratch + '/scripts/fresh.pas') + #10);
+  R := RunLwpt(['run', 'fresh'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<string>(Trim(ReadBinaryFile(FScratch + '/fresh-marker.txt')))
+    .ToBe('once');
+  SetupScratchProject;
+end;
+
+procedure TRunE2E.TestRunTaskUnmatchedInputFails;
+var
+  R: TLwptResult;
+  OutsidePath: string;
+begin
+  WriteTextFile(FScratch + '/lwpt.toml',
+    '[package]'#10 + 'name = "run-e2e"'#10 + 'version = "0.0.0"'#10 +
+    '[missing]'#10 + 'command = "instantfpc"'#10 +
+    'args = ["scripts/hello.pas"]'#10 +
+    'inputs = ["missing/**/*.proto"]'#10 +
+    'output = "generated.out"'#10);
+  R := RunLwpt(['run', 'missing'], FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('runnable "missing"', R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('missing/**/*.proto', R.Stderr) > 0).ToBe(True);
+
+  OutsidePath := FScratch + '-outside-input.txt';
+  WriteTextFile(OutsidePath, 'outside');
+  try
+    WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10 + 'name = "run-e2e"'#10 + 'version = "0.0.0"'#10 +
+      '[escape]'#10 + 'command = "instantfpc"'#10 +
+      'args = ["scripts/hello.pas"]'#10 +
+      'inputs = ["nested/../../' + ExtractFileName(OutsidePath) + '"]'#10 +
+      'output = "generated.out"'#10);
+    R := RunLwpt(['run', 'escape'], FScratch);
+    Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+    Expect<Boolean>(Pos('must be project-root-relative', R.Stderr) > 0)
+      .ToBe(True);
+  finally
+    DeleteFile(OutsidePath);
+  end;
+  SetupScratchProject;
+end;
+
+procedure TRunE2E.TestRunTaskRejectsInvocationArguments;
+var
+  R: TLwptResult;
+begin
+  R := RunLwpt(['run', 'hello', 'unexpected'], FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('declare args in lwpt.toml', R.Stderr) > 0).ToBe(True);
+end;
+
 procedure TRunE2E.TestUnknownNameExitsNonZero;
 var R: TLwptResult;
 begin
@@ -190,18 +279,24 @@ end;
 
 procedure TRunE2E.SetupTests;
 begin
-  Test('run <user-script> invokes the script and propagates its exit code',
-    TestUserScriptInvokesAndPropagatesExitCode);
+  Test('run <task> invokes its direct command and propagates its exit code',
+    TestUserTaskInvokesAndPropagatesExitCode);
   Test('run install aliases to the built-in install subcommand',
     TestAliasInstallSubcommand);
   Test('run install --frozen passes flags through to the aliased subcommand',
     TestAliasWithFlagPassthrough);
   Test('run lists every registered alias without the retired export subcommand',
     TestListModeOmitsRetiredExport);
-  Test('export is available as a user-declared run-script name',
-    TestExportCanBeUserScriptName);
+  Test('export is available as a user-declared run-task name',
+    TestExportCanBeUserTaskName);
   Test('run <unknown> exits non-zero with a useful error',
     TestUnknownNameExitsNonZero);
+  Test('run-task glob staleness skips a fresh output successfully',
+    TestRunTaskStalenessSkipsFreshOutput);
+  Test('run task reports its name and unmatched input expression',
+    TestRunTaskUnmatchedInputFails);
+  Test('run task rejects invocation-time arguments',
+    TestRunTaskRejectsInvocationArguments);
 end;
 
 begin

@@ -190,7 +190,10 @@ begin
   ProbeProcess := TProcess.Create(nil);
   Runner := nil;
   try
-    ProbeProcess.Executable := FExecutableName;
+    ProbeProcess.Executable := ConfiguredCommand(FExecutableName);
+    if WorkingDirectory <> '' then
+      ProbeProcess.CurrentDirectory := WorkingDirectory;
+    AppendCommandArguments(ProbeProcess.Parameters);
     for ArgumentIndex := 0 to High(AArguments) do
       ProbeProcess.Parameters.Add(AArguments[ArgumentIndex]);
     Options := DefaultProcessRunOptions('compiler "' + LAKON_COMPILER_ID
@@ -393,7 +396,7 @@ end;
 
 function TLWPTLakonCompilerDriver.ExecutableName: string;
 begin
-  Result := FExecutableName;
+  Result := ConfiguredCommand(FExecutableName);
 end;
 
 function TLWPTLakonCompilerDriver.SeparateStandardError: Boolean;

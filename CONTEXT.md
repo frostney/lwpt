@@ -128,6 +128,17 @@ failure is explicit and never falls back to another compiler or target.
 *Avoid*: "compiler entry" (suggests duplicating one entry per platform),
 "fallback list" (unsupported requests are errors).
 
+**Runnable command**:
+A direct child-process definition containing one `command` and an ordered
+`args` array. Commands containing a path resolve from the project root unless
+absolute; bare names use the inherited `PATH`. LWPT starts the process in the
+project root, inherits the parent environment, and passes arguments without a
+shell. It never infers an interpreter or special-cases a file extension. Hooks,
+run tasks, compiler profiles, and host compiler registrations share this
+definition while retaining their surface-specific lifecycle and protocol rules.
+*Avoid*: "command line" (suggests shell parsing), "script command" (there is no
+script distinction), "executable field" (the manifest field is `command`).
+
 **Build result**:
 A schema-versioned compiler-neutral outcome containing success, normalized
 diagnostics, produced artifacts, and dependency metadata. Compiler-native
@@ -138,34 +149,47 @@ contract also carries artifacts and dependency metadata).
 
 <a id="hook"></a>
 **Hook**:
-A LWPT-invoked script with one or more lifecycle attachment points. A hook entry has a required `script` field (InstantFPC path), an optional `args` array, and an optional `inputs`/`output` pair that turns it into a staleness-gated rule — toolkit skips the script when `output` is newer than every `inputs` entry. Bare-string shorthand `"scripts/foo.pas"` is equivalent to `{ script = "scripts/foo.pas" }`. Hooks always run with the project root as cwd, inherit the caller's env, run sequentially in manifest insertion order, and stop the lifecycle phase on the first non-zero exit. Root-manifest only: any hook section in a dependency manifest is silently dropped by the loader.
-*Avoid*: "script" alone (overloaded — see *Script*), "trigger" (suggests event-listener semantics).
+A root-owned runnable command with one or more lifecycle attachment points. An
+optional paired `inputs`/`output` declaration applies shared literal/glob
+staleness evaluation: every expression must match, a missing or older output
+runs, and a fresh output skips. Bare-string shorthand `"tools/generate"` means
+the direct no-argument command `{ command = "tools/generate" }`. Hooks run
+sequentially in insertion order, inherit the caller environment, and stop the
+phase on the first non-zero exit.
+*Avoid*: "hook script" (commands are not implicitly scripts), "trigger"
+(suggests event-listener semantics).
 
 **Lifecycle phase**:
 The point at which a hook section attaches to a subcommand run. Six top-level sections — `[preinstall]`, `[postinstall]`, `[prebuild]`, `[postbuild]`, `[pretest]`, `[posttest]` — plus the `prebuild` and `postbuild` fields available on each `[build].<entry>` inline table (per-item, build only). `format`, `repair`, `init`, `run`, and `agents` deliberately have no hook surface; the rationale for each refusal lives in the lifecycle ADR.
 *Avoid*: "lifecycle event" (suggests dynamic dispatch), "build phase" (subcommand-specific; we mean any of the three phased subcommands — install/build/test).
 
 **Build entry** (build item):
-A single binary declaration in the `[build]` table — the thing `lwpt build` compiles, one per iteration. Multi-entry form: `[build.cli] source = "..."` (or the TOML-equivalent inline `[build] cli = { source = "..." }`). Single-entry shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` and the output to `build/<entry-name>`. Each entry takes `source` (required), `output` (optional), ordered `flags` (optional), and optional per-entry `prebuild` / `postbuild` hook tables. Flags are root-manifest behavior; dependency-manifest flags are not retained. Renamed from the pre-ADR-0013 `[targets]`.
+A single binary declaration in the `[build]` table — the thing `lwpt build` compiles, one per iteration. Multi-entry form: `[build.cli] source = "..."` (or the TOML-equivalent inline `[build] cli = { source = "..." }`). Single-entry shorthand: `[build] source = "..."` directly under `[build]` defaults the entry name to `[package].name` and the output to `build/<entry-name>`. Each entry takes `source` (required), `output` (optional), ordered `flags` (optional), an optional compiler profile, an independent optional complete target tuple, and optional per-entry `prebuild` / `postbuild` hook tables. Flags, compiler, and target are root-manifest behavior; dependency manifests cannot select executable policy. Renamed from the pre-ADR-0013 `[targets]`.
 *Avoid*: "target" (pre-ADR-0013 term; overloaded with Bazel/Make vocabulary and doesn't match LWPT's verb-noun pairing).
 
-<a id="script-run-script"></a>
-**Script** (run-script):
-A user-declared callable section in the manifest, addressable via `lwpt run <name>`. Any top-level section that isn't a known LWPT section and that contains a `script` field becomes a script — `[deploy] script = "scripts/deploy.pas"` is invokable as `lwpt run deploy`. Reuses the [Hook](#hook) entry schema (same `script` / `args` / `inputs` / `output` fields). Section names that shadow a built-in subcommand (`install`, `build`, etc.) are a hard error at manifest load. Root-manifest only: dep manifests' script sections are silently dropped (supply-chain defense, same rule as hooks). See [ADR-0013](./docs/adr/0013-run-subcommand-and-build-rename.md).
-*Avoid*: "command" (overloaded with shell), "task" (Cargo / Gradle parallel that doesn't fit LWPT's surface), "recipe" (Just-specific).
+<a id="run-task"></a>
+**Run task**:
+A user-declared root-manifest callable addressed by `lwpt run <name>`. Any
+otherwise-unknown top-level section containing `command` becomes a task, such
+as `[deploy] command = "tools/deploy"`. It reuses the hook command and optional
+staleness fields. Its arguments are manifest-defined only, a fresh task skips
+successfully, and a child exit code is propagated exactly. Reserved built-in
+subcommand names hard-error. Dependency tasks are dropped without execution.
+*Avoid*: "run-script" or "script" (commands include binaries and explicit
+interpreters), "recipe" (Just-specific).
 
 **Run**:
-The `lwpt run <name>` subcommand. Two behaviours under one verb: if `<name>` matches any registered subcommand, aliases to that subcommand with the remaining args (`lwpt run install --frozen` ≡ `lwpt install --frozen`); otherwise looks up `<name>` in the manifest's [Script](#script-run-script) entries and invokes it. `lwpt run` alone lists every callable name. The aliasing layer is in the CLI dispatcher, not in the run-handler — option parsing for subcommands works unchanged.
+The `lwpt run <name>` subcommand. Two behaviours under one verb: if `<name>` matches any registered subcommand, aliases to that subcommand with the remaining args (`lwpt run install --frozen` ≡ `lwpt install --frozen`); otherwise looks up `<name>` in the manifest's [Run task](#run-task) entries and invokes it. `lwpt run` alone lists every callable name. The aliasing layer is in the CLI dispatcher, not in the run-handler — option parsing for subcommands works unchanged.
 *Avoid*: "exec" (executes-into-this connotation; lwpt run is dispatch + spawn).
 
 **Agents block**:
-The marker-fenced region (`<!-- lwpt:agents:begin -->` … `<!-- lwpt:agents:end -->`) inside a project's `AGENTS.md` that `lwpt agents` writes and `lwpt agents --check` verifies (per ADR-0027). Machine-written from the subcommand registry — the same objects that drive `--help` — plus the manifest's [Script](#script-run-script) entries. Byte-deterministic: LF line endings, no version stamp or timestamp, so `--check` fails only on real drift. Everything outside the markers is hand-written and never touched by the toolkit.
+The marker-fenced region (`<!-- lwpt:agents:begin -->` … `<!-- lwpt:agents:end -->`) inside a project's `AGENTS.md` that `lwpt agents` writes and `lwpt agents --check` verifies (per ADR-0027). Machine-written from the subcommand registry — the same objects that drive `--help` — plus the manifest's [Run task](#run-task) entries. Byte-deterministic: LF line endings, no version stamp or timestamp, so `--check` fails only on real drift. Everything outside the markers is hand-written and never touched by the toolkit.
 *Avoid*: "generated AGENTS.md" (the file is the host; only the block is generated), "agents section" loosely (the term is specifically the marker-fenced region), "agent docs" (harness-side instruction files like CLAUDE.md are a different layer).
 
 ### Manifest interpolation
 
 **Placeholder**:
-A `{name}` token in a manifest string field that the loader substitutes at parse time. LWPT uses two dialects on disjoint surfaces: `{user}` / `{repository}` / `{ref}` apply *only* inside `[sources]` URL templates; the build-lifecycle dialect applies everywhere else that takes substitution — `[build].<entry>.<field>`, top-level hook section fields, per-entry hook fields, run-script fields. The build-lifecycle vars are `{package.name}` and `{package.version}` (from `[package]`), `{item.name}` / `{item.source}` / `{item.output}` (per-item context, valid only inside per-entry hook fields or `[build].<entry>` fields), and `{platform.os}` / `{platform.arch}` (host platform). Unknown placeholders are a hard error at manifest load, with the unknown var named in the message.
+A `{name}` token in a manifest string field that the loader substitutes at parse time. LWPT uses two dialects on disjoint surfaces: `{user}` / `{repository}` / `{ref}` apply *only* inside `[sources]` URL templates; the build-lifecycle dialect applies everywhere else that takes substitution — `[build].<entry>.<field>`, top-level hook section fields, per-entry hook fields, and run-task command fields. The build-lifecycle vars are `{package.name}` and `{package.version}` (from `[package]`), `{item.name}` / `{item.source}` / `{item.output}` (per-item context, valid only inside per-entry hook fields or `[build].<entry>` fields), and `{platform.os}` / `{platform.arch}` (host platform). Unknown placeholders are a hard error at manifest load, with the unknown var named in the message.
 *Avoid*: "interpolation" alone (the process, not the thing), "variable" (suggests assignable; placeholders are read-only at substitution time), "template variable" (overloaded with `[sources]` template terms).
 
 **Mirror**:

@@ -11,10 +11,10 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   first land under `.lwpt/sessions/<session-id>/`. A completed executable is
   atomically published to its manifest `output` only after its declared inputs
   are revalidated.
-- **Compiler-default target unless overridden.** A bare probe supplies the
-  request target when `FPC_TARGET_CPU` / `FPC_TARGET_OS` are unset. Explicit
-  overrides are strictly probed and translated to `-P` / `-T` when dispatch is
-  required.
+- **Compiler-default target unless the build entry selects one.** An optional
+  build-entry `target` table carries OS, architecture, ABI, and environment
+  independently from the compiler profile. Omission uses the driver's first
+  advertised target; explicit tuples are probed unchanged and never fall back.
 - **Compiler-neutral request first.** Build and test select a root-owned named
   compiler profile, validate a versioned request against on-demand compiler
   capabilities, and normalize the result through the selected driver. FPC is
@@ -36,7 +36,7 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   parallel by default, bounded by `--jobs=<n>` and the machine-wide
   `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See
   [ADR-0023](./adr/0023-parallel-build-target-scheduler.md).
-- **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](./adr/0011-build-lifecycle-hooks.md); each entry runs via InstantFPC with staleness gating (output older than any input → re-run). The earlier `[generated]` shape is no longer parsed.
+- **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](./adr/0011-build-lifecycle-hooks.md). Each entry directly executes its declared `command` and ordered `args`; paired literal/glob `inputs` and `output` apply shared strict staleness evaluation. The earlier `[generated]` shape is no longer parsed.
 
 ## The contract
 
@@ -185,11 +185,12 @@ the compile with an explanatory error when it cannot.
 
 Before compiling, LWPT creates a schema-versioned `TLWPTBuildRequest` covering
 the source set and entry point, output kind, mode, defines, search paths,
-resources, ordered extra arguments, private output locations, target
-OS/architecture, and requested compiler identity/version. Build-request schema
+resources, ordered extra arguments, private output locations, the complete
+target OS/architecture/ABI/environment tuple, and requested compiler
+identity/version. Build-request schema
 v2 adds the `extra_arguments` array. The canonical TOML serialization is
 embedded in a separate publication fingerprint. That fingerprint also covers
-the selected compiler executable/live version,
+the selected compiler command, configured prefix arguments, and live version,
 the previous public-output content, the implicit source directory, declared
 unit/include/resource inputs,
 manifest, cfg, lockfile, and installed module contents. After compilation it
@@ -209,11 +210,11 @@ generation means the result is stale: publication is refused and the candidate
 stays private. Per-entry postbuild hooks receive `LWPT_BUILD_OUTPUT` for the
 private candidate, `LWPT_BUILD_PUBLIC_OUTPUT` for the requested manifest path,
 and `LWPT_BUILD_ENTRY` for the entry name. Existing `{item.output}`
-references in their script, arguments, inputs, and staleness output are
+references in their command, arguments, inputs, and staleness output are
 retargeted to the private candidate at execution time when the expanded path
 is a complete path token. Related paths such as `build/app.json` are not
-rewritten. Hook definitions,
-scripts, and declared inputs participate in publication revalidation. A hook
+rewritten. Hook definitions, commands, arguments, and declared inputs
+participate in publication revalidation. A hook
 failure prevents publication. Dependency-free builds retain whole-build
 postbuild as the final gate before batch publication. A declared graph
 publishes prerequisites progressively so dependants start only after successful
@@ -268,7 +269,7 @@ default = "wasm"
 
 [compiler.profiles.wasm]
 driver = "lakon"
-executable = "tools/lakon"
+command = "tools/lakon"
 version = ">=0.1.0"
 ```
 
@@ -296,15 +297,12 @@ system. A Lakon-branded embedding host that exposes `test` must own its WASI
 execution path outside the generic native runner; no Node or wasmtime
 dependency is added to the LWPT binary.
 
-An embedding host uses the same public `TLWPTCompilerHost` factory API. It
-registers `LAKON_COMPILER_ID`, optionally sets `DefaultProfile` to that ID,
-and returns a driver consuming the versioned neutral request/result types.
-For the `lakon` ID only, that registered factory takes precedence over the
-external CLI adapter. This lets a Lakon-branded host replace the ordinary
-implicit FPC default without changing the manifest, while explicit project or
-build-entry profiles remain authoritative. Factory identity, configured
-version, live capabilities, and result/artifact validation are enforced by
-the same selection and build paths; a Lakon failure never selects FPC.
+An embedding host uses `TLWPTCompilerHost.RegisterCommand` to register a driver
+identity, direct command, ordered prefix arguments, version constraint, and
+optional host-default binding. Registration never returns an in-process driver
+object: every probe and compile remains a bounded short-lived protocol process.
+Explicit project and build-entry profiles remain authoritative, and failures
+never select another compiler.
 
 ## Delphi compiler profiles
 
@@ -318,12 +316,12 @@ default = "delphi-win64"
 
 [compiler.profiles.delphi-win64]
 driver = "delphi"
-executable = "C:/path/to/dcc64.exe"
+command = "C:/path/to/dcc64.exe"
 version = ">=36.0.0"
 ```
 
 Replace the placeholder with the installed compiler path; Embarcadero's
-installation directory differs by product version. An explicit `executable`
+installation directory differs by product version. An explicit `command`
 may be absolute or project-relative. When it is omitted, the driver looks for
 `dcc32.exe` under `BDSBIN`, then `BDS/bin`, then uses `dcc32` from `PATH`.
 Embarcadero's `rsvars.bat` initializes the normal command-line environment.
@@ -387,7 +385,7 @@ default = "modern"
 
 [compiler.profiles.modern]
 driver = "blaise"
-executable = "tools/blaise"
+command = "tools/blaise"
 version = ">=0.13.0"
 ```
 
@@ -419,18 +417,17 @@ is selected.
 
 ## Generator hooks (formerly `[generated]`)
 
-An earlier `[generated]` section was replaced by the lifecycle-hook model in [ADR-0011](./adr/0011-build-lifecycle-hooks.md). Each entry is a named hook in `[prebuild]` / `[postbuild]` / `[pretest]` / etc. with explicit `script`, `inputs`, and `output` fields, and a staleness gate (run iff output is older than any input):
+An earlier `[generated]` section was replaced by the lifecycle-hook model in [ADR-0011](./adr/0011-build-lifecycle-hooks.md). Each entry is a named direct command in `[prebuild]` / `[postbuild]` / `[pretest]` / etc. with optional ordered `args` and paired `inputs` / `output` staleness fields:
 
 ```toml
 [prebuild]
-build-foo = { script = "scripts/bar.pas",
+build-foo = { command = "instantfpc",
+              args = ["scripts/bar.pas"],
               inputs = ["a.pas", "b.pas"],
               output = "source/Foo.inc" }
 ```
 
-`lwpt build` (and `lwpt test`, for `[pretest]`) walks each hook before the phase runs. If the output is missing or any input is newer than the output, the script is re-run via InstantFPC. On Unix, LWPT points InstantFPC at a cache below the owning build/test session; Windows compiles the hook directly into that session. The generator consumes its inputs and rewrites its output; no arguments are passed unless the manifest declares them.
-
-If `instantfpc` is not on `PATH`, the failure names the generator script and recommends installing InstantFPC (bundled with FPC).
+`lwpt build` (and `lwpt test`, for `[pretest]`) walks each hook before the phase runs. Every input expression is a project-relative literal or LWPT glob and must match at least one file. A missing output or any newer match runs the command; otherwise it skips. Commands containing a path resolve from the project root, bare names use inherited `PATH`, and arguments are passed directly without shell or interpreter inference. Pascal hooks therefore select `instantfpc` explicitly, as LWPT's own stamping hook does on every supported platform.
 
 LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) removed that embedded-blob hook. The current root manifest instead declares the `[prebuild]` `stamp-version` hook, which derives `source/Version.inc` from `lwpt.toml`.
 

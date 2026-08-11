@@ -10,7 +10,7 @@ driven by a human or an agent.
 
 LWPT provides one Pascal-native executable and one `lwpt.toml` manifest for
 the recurring work around an Object Pascal project: dependency management,
-building, formatting, testing, repair, and declared project scripts. The
+building, formatting, testing, repair, and declared run tasks. The
 package manager remains the foundation: it resolves a project into committed,
 verifiable state that the rest of the toolkit consumes.
 
@@ -22,8 +22,8 @@ one process must not be able to corrupt or overwrite another process's work.
 LWPT itself remains built with FreePascal. Consumer projects should be able to
 select a compiler independently from their target platform, including
 cross-compilation, without LWPT silently changing that selection. Root-owned
-named profiles now select built-in, external-process, or embedding-host
-drivers through one versioned compiler-neutral contract; concrete backend
+named profiles now select built-in adapters or out-of-process compiler
+commands through one versioned compiler-neutral contract; concrete backend
 adapters remain separate product work.
 
 An Object Pascal project must remain buildable and distributable without

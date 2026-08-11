@@ -1,4 +1,4 @@
-{ LWPT.CompilerRegistry — root profiles and embedding-host factories. }
+{ LWPT.CompilerRegistry — root profiles and embedding-host commands. }
 unit LWPT.CompilerRegistry;
 
 {$I Shared.inc}
@@ -13,24 +13,23 @@ uses
   LWPT.Manifest;
 
 type
-  TLWPTCompilerDriverFactory = function(
-    const AProfile: TLWPTCompilerProfile;
-    const AProjectRoot: string): TLWPTCompilerDriver of object;
-
   TLWPTCompilerHost = class
   private
     type
-      TFactoryEntry = record
+      TCommandEntry = record
         DriverID: string;
-        Factory: TLWPTCompilerDriverFactory;
+        Runnable: TLWPTRunnableCommand;
+        VersionConstraint: string;
       end;
   private
     FDefaultProfile: string;
-    FFactories: array of TFactoryEntry;
-    function FindFactory(const ADriverID: string): Integer;
+    FCommands: array of TCommandEntry;
+    function FindCommand(const ADriverID: string): Integer;
   public
-    procedure RegisterFactory(const ADriverID: string;
-      const AFactory: TLWPTCompilerDriverFactory);
+    procedure RegisterCommand(const ADriverID, ACommand: string;
+      const AArguments: array of string;
+      const AVersionConstraint: string = '*';
+      const ABindAsDefault: Boolean = False);
     property DefaultProfile: string read FDefaultProfile write FDefaultProfile;
   end;
 
@@ -66,173 +65,15 @@ implementation
 uses
   SysUtils,
 
-  LWPT.BuildRequest,
   LWPT.CompilerDriver.Blaise,
   LWPT.CompilerDriver.Delphi,
   LWPT.CompilerDriver.External,
   LWPT.CompilerDriver.FPC,
   LWPT.CompilerDriver.Lakon,
-  LWPT.Core,
-  Semver;
+  LWPT.Core;
 
 const
   IMPLICIT_FPC_PROFILE = FPC_COMPILER_ID;
-
-type
-  TLWPTConfiguredCompilerDriver = class(TLWPTCompilerDriver)
-  private
-    FCompilerID: string;
-    FInner: TLWPTCompilerDriver;
-    FVersionConstraint: string;
-  public
-    constructor Create(const ACompilerID, AVersionConstraint: string;
-      const AInner: TLWPTCompilerDriver);
-    destructor Destroy; override;
-    function CompilerID: string; override;
-    function VersionConstraint: string; override;
-    function CreateBuildRequest(const ASource, AArtifact: string):
-      LWPT.BuildRequest.TLWPTBuildRequest; override;
-    function DefaultTarget: LWPT.BuildRequest.TLWPTTarget; override;
-    function ProbeCapabilities(
-      const ATarget: LWPT.BuildRequest.TLWPTTarget;
-      const ARefresh: Boolean = False):
-      LWPT.BuildRequest.TLWPTCompilerCapabilities; override;
-    function BuildArguments(
-      const ARequest: LWPT.BuildRequest.TLWPTBuildRequest;
-      const AOptions: TLWPTCompilerInvocationOptions):
-      LWPT.Core.TStringArray; override;
-    function ExecutableName: string; override;
-    function BuildStandardInput(
-      const ARequest: LWPT.BuildRequest.TLWPTBuildRequest): string; override;
-    function SeparateStandardError: Boolean; override;
-    function CompilationTimeoutMilliseconds: QWord; override;
-    function ClassifyFailure(const AExitCode: Integer;
-      const ARawOutput: string): TLWPTCompilerFailure; override;
-    function NormalizeResult(
-      const ARequest: LWPT.BuildRequest.TLWPTBuildRequest;
-      const AExitCode: Integer; const ARawOutput: string):
-      LWPT.BuildRequest.TLWPTBuildResult; override;
-    function NormalizeExecutionResult(
-      const ARequest: LWPT.BuildRequest.TLWPTBuildRequest;
-      const AExitCode: Integer; const AStandardOutput,
-      AStandardError: string): LWPT.BuildRequest.TLWPTBuildResult; override;
-    function DisplayOutput(const AStandardOutput,
-      AStandardError: string): string; override;
-  end;
-
-constructor TLWPTConfiguredCompilerDriver.Create(const ACompilerID,
-  AVersionConstraint: string; const AInner: TLWPTCompilerDriver);
-begin
-  inherited Create;
-  FCompilerID := ACompilerID;
-  FVersionConstraint := AVersionConstraint;
-  FInner := AInner;
-end;
-
-destructor TLWPTConfiguredCompilerDriver.Destroy;
-begin
-  FInner.Free;
-  inherited Destroy;
-end;
-
-function TLWPTConfiguredCompilerDriver.CompilerID: string;
-begin
-  Result := FCompilerID;
-end;
-
-function TLWPTConfiguredCompilerDriver.VersionConstraint: string;
-begin
-  Result := FVersionConstraint;
-end;
-
-function TLWPTConfiguredCompilerDriver.CreateBuildRequest(
-  const ASource, AArtifact: string): LWPT.BuildRequest.TLWPTBuildRequest;
-begin
-  Result := FInner.CreateBuildRequest(ASource, AArtifact);
-  Result.Compiler.ID := FCompilerID;
-  Result.Compiler.VersionConstraint := FVersionConstraint;
-  Result.Compiler.VersionIdentity := '';
-end;
-
-function TLWPTConfiguredCompilerDriver.DefaultTarget:
-  LWPT.BuildRequest.TLWPTTarget;
-begin
-  Result := FInner.DefaultTarget;
-end;
-
-function TLWPTConfiguredCompilerDriver.ProbeCapabilities(
-  const ATarget: LWPT.BuildRequest.TLWPTTarget; const ARefresh: Boolean):
-  LWPT.BuildRequest.TLWPTCompilerCapabilities;
-begin
-  Result := FInner.ProbeCapabilities(ATarget, ARefresh);
-  ValidateCompilerCapabilities(Result);
-  if not SameText(Result.CompilerID, FCompilerID) then
-    raise ELWPTCompilerDriverError.CreateFmt(
-      'compiler factory "%s" returned capabilities for "%s"',
-      [FCompilerID, Result.CompilerID]);
-  if not Satisfies(Result.VersionIdentity, FVersionConstraint,
-    DefaultSemverOptions) then
-    raise ELWPTCompilerDriverError.CreateFmt(
-      'compiler "%s" version "%s" does not satisfy configured version "%s"',
-      [FCompilerID, Result.VersionIdentity, FVersionConstraint]);
-end;
-
-function TLWPTConfiguredCompilerDriver.BuildArguments(
-  const ARequest: LWPT.BuildRequest.TLWPTBuildRequest;
-  const AOptions: TLWPTCompilerInvocationOptions): LWPT.Core.TStringArray;
-begin
-  Result := FInner.BuildArguments(ARequest, AOptions);
-end;
-
-function TLWPTConfiguredCompilerDriver.ExecutableName: string;
-begin
-  Result := FInner.ExecutableName;
-end;
-
-function TLWPTConfiguredCompilerDriver.BuildStandardInput(
-  const ARequest: LWPT.BuildRequest.TLWPTBuildRequest): string;
-begin
-  Result := FInner.BuildStandardInput(ARequest);
-end;
-
-function TLWPTConfiguredCompilerDriver.SeparateStandardError: Boolean;
-begin
-  Result := FInner.SeparateStandardError;
-end;
-
-function TLWPTConfiguredCompilerDriver.CompilationTimeoutMilliseconds: QWord;
-begin
-  Result := FInner.CompilationTimeoutMilliseconds;
-end;
-
-function TLWPTConfiguredCompilerDriver.ClassifyFailure(
-  const AExitCode: Integer; const ARawOutput: string): TLWPTCompilerFailure;
-begin
-  Result := FInner.ClassifyFailure(AExitCode, ARawOutput);
-end;
-
-function TLWPTConfiguredCompilerDriver.NormalizeResult(
-  const ARequest: LWPT.BuildRequest.TLWPTBuildRequest;
-  const AExitCode: Integer; const ARawOutput: string):
-  LWPT.BuildRequest.TLWPTBuildResult;
-begin
-  Result := FInner.NormalizeResult(ARequest, AExitCode, ARawOutput);
-end;
-
-function TLWPTConfiguredCompilerDriver.NormalizeExecutionResult(
-  const ARequest: LWPT.BuildRequest.TLWPTBuildRequest;
-  const AExitCode: Integer; const AStandardOutput,
-  AStandardError: string): LWPT.BuildRequest.TLWPTBuildResult;
-begin
-  Result := FInner.NormalizeExecutionResult(ARequest, AExitCode,
-    AStandardOutput, AStandardError);
-end;
-
-function TLWPTConfiguredCompilerDriver.DisplayOutput(
-  const AStandardOutput, AStandardError: string): string;
-begin
-  Result := FInner.DisplayOutput(AStandardOutput, AStandardError);
-end;
 
 function IsAbsoluteFilesystemPath(const APath: string): Boolean; inline;
 begin
@@ -244,39 +85,49 @@ begin
     Exit(True);
 end;
 
-function TLWPTCompilerHost.FindFactory(const ADriverID: string): Integer;
+function TLWPTCompilerHost.FindCommand(const ADriverID: string): Integer;
 begin
-  for Result := 0 to High(FFactories) do
-    if SameText(FFactories[Result].DriverID, ADriverID) then Exit;
+  for Result := 0 to High(FCommands) do
+    if SameText(FCommands[Result].DriverID, ADriverID) then Exit;
   Result := -1;
 end;
 
-procedure TLWPTCompilerHost.RegisterFactory(const ADriverID: string;
-  const AFactory: TLWPTCompilerDriverFactory);
+procedure TLWPTCompilerHost.RegisterCommand(const ADriverID,
+  ACommand: string; const AArguments: array of string;
+  const AVersionConstraint: string; const ABindAsDefault: Boolean);
 var
-  Index: Integer;
+  i, Index: Integer;
 begin
   if Trim(ADriverID) = '' then
     raise ELWPTCompilerDriverError.Create(
-      'embedding compiler factory ID must not be empty');
-  if not Assigned(AFactory) then
+      'embedding compiler command ID must not be empty');
+  if Trim(ACommand) = '' then
     raise ELWPTCompilerDriverError.CreateFmt(
-      'embedding compiler factory "%s" is not assigned', [ADriverID]);
+      'embedding compiler command "%s" must name a command', [ADriverID]);
+  if Trim(AVersionConstraint) = '' then
+    raise ELWPTCompilerDriverError.CreateFmt(
+      'embedding compiler command "%s" version must not be empty',
+      [ADriverID]);
   if SameText(ADriverID, FPC_COMPILER_ID)
      or SameText(ADriverID, BLAISE_COMPILER_ID)
      or SameText(ADriverID, DELPHI_COMPILER_ID) then
     raise ELWPTCompilerDriverError.Create(
-      'embedding compiler factories cannot shadow built-in "'
+      'embedding compiler commands cannot shadow built-in "'
       + LowerCase(ADriverID) + '"');
-  Index := FindFactory(ADriverID);
+  Index := FindCommand(ADriverID);
   if Index >= 0 then
     raise ELWPTCompilerDriverError.CreateFmt(
-      'embedding compiler factory "%s" is already registered',
+      'embedding compiler command "%s" is already registered',
       [ADriverID]);
-  Index := Length(FFactories);
-  SetLength(FFactories, Index + 1);
-  FFactories[Index].DriverID := ADriverID;
-  FFactories[Index].Factory := AFactory;
+  Index := Length(FCommands);
+  SetLength(FCommands, Index + 1);
+  FCommands[Index].DriverID := ADriverID;
+  FCommands[Index].Runnable.Command := ACommand;
+  SetLength(FCommands[Index].Runnable.Args, Length(AArguments));
+  for i := 0 to High(AArguments) do
+    FCommands[Index].Runnable.Args[i] := AArguments[i];
+  FCommands[Index].VersionConstraint := AVersionConstraint;
+  if ABindAsDefault then FDefaultProfile := ADriverID;
 end;
 
 destructor TLWPTCompilerSelection.TDriverEntry.Destroy;
@@ -329,113 +180,84 @@ begin
   Result := IMPLICIT_FPC_PROFILE;
 end;
 
-function ResolveConfiguredPath(const AProjectRoot, APath: string): string;
+function ResolveConfiguredCommand(const AProjectRoot, ACommand: string): string;
 begin
-  Result := APath;
-  if APath = '' then Exit;
-  if IsAbsoluteFilesystemPath(APath) then
-    Result := ExpandFileName(APath)
-  else
+  Result := ACommand;
+  if ACommand = '' then Exit;
+  if IsAbsoluteFilesystemPath(ACommand) then
+    Result := ExpandFileName(ACommand)
+  else if (Pos('/', ACommand) > 0) or (Pos('\', ACommand) > 0) then
     Result := ExpandFileName(IncludeTrailingPathDelimiter(AProjectRoot)
-      + APath);
+      + ACommand);
 end;
 
 function TLWPTCompilerSelection.CreateDriver(
   const AProfile: TLWPTCompilerProfile): TLWPTCompilerDriver;
 var
-  ExecutablePath, ScriptPath: string;
-  FactoryIndex: Integer;
-  FactoryDriver: TLWPTCompilerDriver;
-  ResolvedProfile: TLWPTCompilerProfile;
+  CommandPath, VersionConstraint: string;
+  CommandIndex: Integer;
 begin
-  ResolvedProfile := AProfile;
-  ExecutablePath := ResolveConfiguredPath(FProjectRoot,
-    AProfile.Executable);
-  ScriptPath := ResolveConfiguredPath(FProjectRoot, AProfile.Script);
-  ResolvedProfile.Executable := ExecutablePath;
-  ResolvedProfile.Script := ScriptPath;
+  CommandPath := ResolveConfiguredCommand(FProjectRoot,
+    AProfile.Runnable.Command);
+
+  CommandIndex := -1;
+  if Assigned(FHost) then CommandIndex := FHost.FindCommand(AProfile.Driver);
+  if (CommandIndex >= 0) and (CommandPath = '') then
+  begin
+    CommandPath := ResolveConfiguredCommand(FProjectRoot,
+      FHost.FCommands[CommandIndex].Runnable.Command);
+    VersionConstraint := AProfile.VersionConstraint;
+    if VersionConstraint = '*' then
+      VersionConstraint := FHost.FCommands[CommandIndex].VersionConstraint;
+    Exit(TLWPTExternalCompilerDriver.Create(AProfile.Driver, CommandPath,
+      FHost.FCommands[CommandIndex].Runnable.Args, VersionConstraint,
+      FProjectRoot));
+  end;
 
   if SameText(AProfile.Driver, FPC_COMPILER_ID) then
   begin
-    if ScriptPath <> '' then
-      raise ELWPTCompilerDriverError.CreateFmt(
-        'compiler profile "%s" cannot use script with built-in "fpc"',
-        [AProfile.Name]);
-    Exit(TLWPTFPCCompilerDriver.Create(ExecutablePath,
-      AProfile.VersionConstraint));
+    Result := TLWPTFPCCompilerDriver.Create(CommandPath,
+      AProfile.VersionConstraint);
+    Result.ConfigureCommand('', AProfile.Runnable.Args,
+      FProjectRoot);
+    Exit;
   end;
 
   if SameText(AProfile.Driver, DELPHI_COMPILER_ID) then
   begin
-    if ScriptPath <> '' then
-      raise ELWPTCompilerDriverError.CreateFmt(
-        'compiler profile "%s" cannot use script with built-in "delphi"',
-        [AProfile.Name]);
-    Exit(TLWPTDelphiCompilerDriver.Create(ExecutablePath,
-      AProfile.VersionConstraint));
+    Result := TLWPTDelphiCompilerDriver.Create(CommandPath,
+      AProfile.VersionConstraint);
+    Result.ConfigureCommand('', AProfile.Runnable.Args,
+      FProjectRoot);
+    Exit;
   end;
 
   if SameText(AProfile.Driver, BLAISE_COMPILER_ID) then
   begin
-    if ScriptPath <> '' then
-      raise ELWPTCompilerDriverError.CreateFmt(
-        'compiler profile "%s" cannot use script with built-in "blaise"',
-        [AProfile.Name]);
-    Exit(TLWPTBlaiseCompilerDriver.Create(ExecutablePath,
-      AProfile.VersionConstraint));
-  end;
-
-  FactoryIndex := -1;
-  if Assigned(FHost) then FactoryIndex := FHost.FindFactory(AProfile.Driver);
-  if FactoryIndex >= 0 then
-  begin
-    FactoryDriver := FHost.FFactories[FactoryIndex].Factory(ResolvedProfile,
+    Result := TLWPTBlaiseCompilerDriver.Create(CommandPath,
+      AProfile.VersionConstraint);
+    Result.ConfigureCommand('', AProfile.Runnable.Args,
       FProjectRoot);
-    if not Assigned(FactoryDriver) then
-      raise ELWPTCompilerDriverError.CreateFmt(
-        'compiler factory "%s" returned no driver', [AProfile.Driver]);
-    try
-      if not SameText(FactoryDriver.CompilerID, AProfile.Driver) then
-        raise ELWPTCompilerDriverError.CreateFmt(
-          'compiler factory "%s" returned driver identity "%s"',
-          [AProfile.Driver, FactoryDriver.CompilerID]);
-      Result := TLWPTConfiguredCompilerDriver.Create(AProfile.Driver,
-        AProfile.VersionConstraint, FactoryDriver);
-      FactoryDriver := nil;
-      Exit;
-    finally
-      FactoryDriver.Free;
-    end;
+    Exit;
   end;
 
   if SameText(AProfile.Driver, LAKON_COMPILER_ID) then
   begin
-    if ScriptPath <> '' then
-      raise ELWPTCompilerDriverError.CreateFmt(
-        'compiler profile "%s" cannot use script with built-in "%s"',
-        [AProfile.Name, LAKON_COMPILER_ID]);
-    Exit(TLWPTLakonCompilerDriver.Create(ExecutablePath,
-      AProfile.VersionConstraint));
+    Result := TLWPTLakonCompilerDriver.Create(CommandPath,
+      AProfile.VersionConstraint);
+    Result.ConfigureCommand('', AProfile.Runnable.Args,
+      FProjectRoot);
+    Exit;
   end;
 
-  if (ExecutablePath = '') and (ScriptPath = '') then
+  if CommandPath = '' then
     raise ELWPTCompilerDriverError.CreateFmt(
-      'compiler profile "%s" selects unavailable driver "%s"',
+      'compiler profile "%s" selects custom driver "%s" but does not '
+      + 'declare required command',
       [AProfile.Name, AProfile.Driver]);
-  if (ExecutablePath <> '') and not FileExists(ExecutablePath) then
-    raise ELWPTCompilerDriverError.CreateFmt(
-      'compiler profile "%s" executable not found at %s',
-      [AProfile.Name, ExecutablePath]);
-  if (ScriptPath <> '') and not FileExists(ScriptPath) then
-    raise ELWPTCompilerDriverError.CreateFmt(
-      'compiler profile "%s" script not found at %s',
-      [AProfile.Name, ScriptPath]);
-  if ScriptPath <> '' then
-    Result := TLWPTExternalCompilerDriver.Create(AProfile.Driver,
-      InstantFPCExecutable, ScriptPath, AProfile.VersionConstraint)
-  else
-    Result := TLWPTExternalCompilerDriver.Create(AProfile.Driver,
-      ExecutablePath, '', AProfile.VersionConstraint);
+  Result := TLWPTExternalCompilerDriver.Create(AProfile.Driver,
+    CommandPath, AProfile.Runnable.Args, AProfile.VersionConstraint,
+    FProjectRoot);
 end;
 
 function TLWPTCompilerSelection.DriverFor(
@@ -467,7 +289,7 @@ begin
     DriverEntry.Driver := CreateDriver(Profile);
     if not Assigned(DriverEntry.Driver) then
       raise ELWPTCompilerDriverError.CreateFmt(
-        'compiler factory "%s" returned no driver', [Profile.Driver]);
+        'compiler command "%s" returned no driver', [Profile.Driver]);
     FDrivers.Add(DriverEntry);
     Result := DriverEntry.Driver;
   except

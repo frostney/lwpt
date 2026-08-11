@@ -23,8 +23,8 @@ lwpt = { source = "source/{item.name}.pas", output = "build/{item.name}" }
 [workspaces]
 include = ["packages/*"]
 
-# [prebuild] — whole-build hooks (ADR-0011). Each entry runs via
-# InstantFPC before any [build] entry compiles. Staleness-gated by
+# [prebuild] — whole-build hooks (ADR-0011). This project explicitly
+# selects InstantFPC before any [build] entry compiles. Staleness-gated by
 # `inputs` + `output`: skips when the output is newer than every input.
 #
 # stamp-version: derives source/Version.inc from this manifest's
@@ -32,7 +32,8 @@ include = ["packages/*"]
 # Single source of truth for the binary's --version output; structurally
 # prevents drift between the constant in the binary and the manifest.
 [prebuild]
-stamp-version = { script = "scripts/stamp-version.pas",
+stamp-version = { command = "instantfpc",
+                  args = ["scripts/stamp-version.pas"],
                   inputs = ["lwpt.toml"],
                   output = "source/Version.inc" }
 

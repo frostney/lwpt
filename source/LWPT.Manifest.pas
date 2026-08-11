@@ -11,6 +11,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.BuildRequest,
   LWPT.Core,
   TOML;
 
@@ -19,11 +20,15 @@ const
   MANIFEST_DUPLICATION_MINIMUM_TOKEN_FLOOR = 25;
 
 type
+  TLWPTRunnableCommand = record
+    Command: string;
+    Args: TStringArray;
+  end;
+
   TLWPTCompilerProfile = record
     Name: string;
     Driver: string;
-    Executable: string;
-    Script: string;
+    Runnable: TLWPTRunnableCommand;
     VersionConstraint: string;
   end;
   TLWPTCompilerProfileArray = array of TLWPTCompilerProfile;
@@ -125,7 +130,7 @@ type
   end;
 
 
-  { A single lifecycle hook entry (ADR-0011). The Script field is
+  { A single lifecycle hook entry (ADR-0011). The command is
     required; Args is optional (and may be empty). The Inputs/Output
     pair is the staleness gate — both present => skip when output is
     fresher than every input; both absent => run unconditionally;
@@ -134,13 +139,13 @@ type
     drives log lines like "  running [prebuild] embed-testing-library". }
   THook = record
     Name   : string;
-    Script : string;
-    { The script path exactly as declared in the manifest, before
+    Runnable: TLWPTRunnableCommand;
+    { The command exactly as declared in the manifest, before
       placeholder interpolation. Surface-rendering consumers (the
       agents block) use this so generated docs stay identical across
-      platforms; execution always uses the interpolated Script. }
-    RawScript : string;
-    Args   : array of string;
+      platforms; execution always uses the interpolated command. }
+    RawCommand : string;
+    RawArgs : TStringArray;
     Inputs : array of string;
     Output : string;
   end;
@@ -153,6 +158,8 @@ type
     Depends   : TStringArray;      { prerequisite entry names (ADR-0023) }
     Flags     : TStringArray;      { ordered compiler-driver arguments }
     CompilerProfile: string;       { named root [compiler] profile }
+    HasTarget : Boolean;
+    Target    : TLWPTTarget;       { optional explicit compiler target }
     PreBuild  : THookArray;        { per-entry prebuild hooks (ADR-0011) }
     PostBuild : THookArray;        { per-entry postbuild hooks (ADR-0011) }
   end;
@@ -184,15 +191,15 @@ type
     { Compiler configuration is executable policy and root-owned. }
     CompilerDefault: string;
     CompilerProfiles: TLWPTCompilerProfileArray;
-    { User-defined run-scripts (ADR-0013). Any unrecognised top-
-      level section with a `script` field becomes a callable
-      script — `lwpt run <section-name>` invokes it. The structural
-      shape is identical to a hook (script/args/inputs/output), so
+    { User-defined run tasks (ADR-0013). Any unrecognised top-
+      level section with a `command` field becomes callable through
+      `lwpt run <section-name>`. The structural shape is identical
+      to a hook (command/args/inputs/output), so
       we reuse THook. Section names matching any LWPT subcommand
       are a hard error at manifest load; bare unrecognised sections
-      without `script` keep the warn-and-drop policy. Root-only,
+      without `command` keep the warn-and-drop policy. Root-only,
       same as hooks. }
-    Scripts     : THookArray;
+    RunTasks    : THookArray;
     { [lwpt] overrides; empty string means "use the default from the
       LWPT_DIR/MODULES_DIR/... constants in interface". }
     ModulesDirOverride  : string;
@@ -815,10 +822,10 @@ end;
   Build-lifecycle hooks (ADR-0011) — parse hook tables + execute them.
 
   Two surface shapes that produce one record type. Bare-string shorthand:
-    build-version-inc = "scripts/stamp-version.pas"
+    generate = "tools/generate"
   Inline-table form:
-    build-version-inc = { script = "scripts/stamp-version.pas",
-                          args   = ["--flag", "v"],
+    build-version-inc = { command = "instantfpc",
+                          args   = ["scripts/stamp-version.pas", "--flag", "v"],
                           inputs = ["VERSION", "CHANGELOG.md"],
                           output = "source/Version.inc" }
 
@@ -832,55 +839,88 @@ procedure ParseHookEntry(ANode: TTOMLNode; const AName, AContext: string;
 var
   ArgsNode, InputsNode: TTOMLNode;
   i, n: Integer;
+  Pair: TTOMLNodeMap.TKeyValuePair;
 begin
   AHook := Default(THook);
   AHook.Name := AName;
 
   if TomlIsString(ANode) then
   begin
-    { Bare-string shorthand: name = "scripts/foo.pas" }
-    AHook.Script := ANode.ScalarText;
-    AHook.RawScript := AHook.Script;
+    AHook.Runnable.Command := ANode.ScalarText;
+    AHook.RawCommand := AHook.Runnable.Command;
+    if AHook.Runnable.Command = '' then
+      raise EManifestError.CreateFmt(
+        '%s "%s": command must not be empty', [AContext, AName]);
     Exit;
   end;
 
   if not TomlIsTable(ANode) then
     raise EManifestError.CreateFmt(
-      '%s "%s": expected a script path (string) or an inline table '
-      + '{ script = "..." [, args, inputs, output] }', [AContext, AName]);
+      '%s "%s": expected a command (string) or an inline table '
+      + '{ command = "..." [, args, inputs, output] }', [AContext, AName]);
 
-  AHook.Script := TomlStr(ANode, 'script', '');
-  AHook.RawScript := AHook.Script;
-  if AHook.Script = '' then
+  for Pair in ANode.Children do
+    if (Pair.Key <> 'command') and (Pair.Key <> 'args')
+       and (Pair.Key <> 'inputs') and (Pair.Key <> 'output')
+       and (Pair.Key <> 'script') then
+      raise EManifestError.CreateFmt(
+        '%s "%s": unknown field "%s"', [AContext, AName, Pair.Key]);
+
+  if TomlGet(ANode, 'script') <> nil then
     raise EManifestError.CreateFmt(
-      '%s "%s": "script" field is required (path to InstantFPC '
-      + 'script). See ADR-0011.', [AContext, AName]);
+      '%s "%s": legacy "script" is no longer supported; use '
+      + '"command" and explicit "args" (for Pascal, command = '
+      + '"instantfpc"). See ADR-0011.', [AContext, AName]);
+  if (TomlGet(ANode, 'command') <> nil)
+     and not TomlIsString(TomlGet(ANode, 'command')) then
+    raise EManifestError.CreateFmt(
+      '%s "%s": command must be a string', [AContext, AName]);
+  AHook.Runnable.Command := TomlStr(ANode, 'command', '');
+  AHook.RawCommand := AHook.Runnable.Command;
+  if AHook.Runnable.Command = '' then
+    raise EManifestError.CreateFmt(
+      '%s "%s": "command" field is required. See ADR-0011.',
+      [AContext, AName]);
 
   ArgsNode := TomlGet(ANode, 'args');
+  if (ArgsNode <> nil) and not TomlIsArray(ArgsNode) then
+    raise EManifestError.CreateFmt(
+      '%s "%s": args must be an array of strings', [AContext, AName]);
   if TomlIsArray(ArgsNode) then
   begin
-    SetLength(AHook.Args, ArgsNode.Items.Count);
+    SetLength(AHook.Runnable.Args, ArgsNode.Items.Count);
     for i := 0 to ArgsNode.Items.Count - 1 do
       if TomlIsString(ArgsNode.Items[i]) then
-        AHook.Args[i] := ArgsNode.Items[i].ScalarText
+        AHook.Runnable.Args[i] := ArgsNode.Items[i].ScalarText
       else
         raise EManifestError.CreateFmt(
           '%s "%s": args[%d] must be a string', [AContext, AName, i]);
+    AHook.RawArgs := Copy(AHook.Runnable.Args, 0,
+      Length(AHook.Runnable.Args));
   end;
 
   InputsNode := TomlGet(ANode, 'inputs');
+  if (InputsNode <> nil) and not TomlIsArray(InputsNode) then
+    raise EManifestError.CreateFmt(
+      '%s "%s": inputs must be an array of strings', [AContext, AName]);
   if TomlIsArray(InputsNode) then
   begin
     n := InputsNode.Items.Count;
     SetLength(AHook.Inputs, n);
     for i := 0 to n - 1 do
-      if TomlIsString(InputsNode.Items[i]) then
+      if TomlIsString(InputsNode.Items[i])
+         and (InputsNode.Items[i].ScalarText <> '') then
         AHook.Inputs[i] := InputsNode.Items[i].ScalarText
       else
         raise EManifestError.CreateFmt(
-          '%s "%s": inputs[%d] must be a string', [AContext, AName, i]);
+          '%s "%s": inputs[%d] must be a non-empty string',
+          [AContext, AName, i]);
   end;
 
+  if (TomlGet(ANode, 'output') <> nil)
+     and not TomlIsString(TomlGet(ANode, 'output')) then
+    raise EManifestError.CreateFmt(
+      '%s "%s": output must be a string', [AContext, AName]);
   AHook.Output := TomlStr(ANode, 'output', '');
 
   { Staleness-pair invariant: inputs + output are both present or
@@ -1046,11 +1086,11 @@ begin
   for i := 0 to High(AHooks) do
   begin
     HookPath := AFieldPath + '.' + AHooks[i].Name;
-    AHooks[i].Script := ExpandPlaceholders(AHooks[i].Script, ACtx,
-      HookPath + '.script');
+    AHooks[i].Runnable.Command := ExpandPlaceholders(
+      AHooks[i].Runnable.Command, ACtx, HookPath + '.command');
     AHooks[i].Output := ExpandPlaceholders(AHooks[i].Output, ACtx,
       HookPath + '.output');
-    ExpandStringArray(AHooks[i].Args,   ACtx, HookPath + '.args');
+    ExpandStringArray(AHooks[i].Runnable.Args, ACtx, HookPath + '.args');
     ExpandStringArray(AHooks[i].Inputs, ACtx, HookPath + '.inputs');
   end;
 end;
@@ -1273,11 +1313,46 @@ begin
   Result := False;
 end;
 
+procedure ParseBuildTarget(ANode: TTOMLNode; const APath: string;
+  var AEntry: TLWPTBuildEntry);
+var
+  Pair: TTOMLNodeMap.TKeyValuePair;
+begin
+  if ANode = nil then Exit;
+  if not TomlIsTable(ANode) then
+    raise EManifestError.CreateFmt('%s must be a table', [APath]);
+  for Pair in ANode.Children do
+    if (Pair.Key <> 'os') and (Pair.Key <> 'architecture')
+       and (Pair.Key <> 'abi') and (Pair.Key <> 'environment') then
+      raise EManifestError.CreateFmt('%s has unknown field "%s"',
+        [APath, Pair.Key]);
+  if not TomlIsString(TomlGet(ANode, 'os'))
+     or (TomlStr(ANode, 'os', '') = '') then
+    raise EManifestError.CreateFmt('%s.os must be a non-empty string',
+      [APath]);
+  if not TomlIsString(TomlGet(ANode, 'architecture'))
+     or (TomlStr(ANode, 'architecture', '') = '') then
+    raise EManifestError.CreateFmt(
+      '%s.architecture must be a non-empty string', [APath]);
+  if (TomlGet(ANode, 'abi') <> nil)
+     and not TomlIsString(TomlGet(ANode, 'abi')) then
+    raise EManifestError.CreateFmt('%s.abi must be a string', [APath]);
+  if (TomlGet(ANode, 'environment') <> nil)
+     and not TomlIsString(TomlGet(ANode, 'environment')) then
+    raise EManifestError.CreateFmt('%s.environment must be a string',
+      [APath]);
+  AEntry.HasTarget := True;
+  AEntry.Target.OS := TomlStr(ANode, 'os', '');
+  AEntry.Target.Architecture := TomlStr(ANode, 'architecture', '');
+  AEntry.Target.ABI := TomlStr(ANode, 'abi', '');
+  AEntry.Target.Environment := TomlStr(ANode, 'environment', '');
+end;
+
 function ParseManifestContent(const APath, AContent: string;
   AIsRoot: Boolean): TManifest;
 const
   { Recognised top-level sections — anything else either becomes a
-    run-script (ADR-0013) when it carries a `script` field, OR
+    run task (ADR-0013) when it carries a `command` field, OR
     fires a single warning to stderr otherwise. The list is the
     source of truth for "what does LWPT consume?".
     NOTE: 'generated' + 'targets' are NOT in this list — both were
@@ -1291,13 +1366,13 @@ const
     'preinstall', 'postinstall', 'prebuild', 'postbuild',
     'pretest', 'posttest');
   { Reserved section names — names that, if declared as a top-level
-    section carrying a `script` field, raise a hard error at manifest
+    section carrying a `command` field, raise a hard error at manifest
     load. Two classes:
       - LWPT subcommands (ADR-0013) — would make `lwpt run <name>`
         ambiguous with the built-in subcommand;
       - Known configuration section names — already first-class
-        sections; using them as script names would be confusing
-        (and structurally they never reach the script-detection path
+        sections; using them as task names would be confusing
+        (and structurally they never reach the task-detection path
         anyway because KNOWN_SECTIONS is checked first, but this
         list makes the intent explicit). 'run' itself is included
         because `lwpt run run` is the nonsense case. }
@@ -1307,7 +1382,7 @@ const
     'repair', 'init', 'run', 'agents', 'health', 'duplication',
     { configuration section names — defensive: ensure 'workspaces',
       'package', 'dependencies' etc can NEVER end up registered as
-      run-scripts even if a future refactor reorders KNOWN_SECTIONS
+      run tasks even if a future refactor reorders KNOWN_SECTIONS
       checks. Per the ADR-0014 amendment "Workspaces" clarification:
       [workspaces] follows the same mechanism as [package] +
       [dependencies] (recognised, parsed for all manifests, never
@@ -1745,25 +1820,30 @@ begin
               raise EManifestError.CreateFmt(
                 '[compiler.profiles.%s] driver must be a string',
                 [Pair.Key]);
-            if (TomlGet(ProfileNode, 'executable') <> nil)
-               and not TomlIsString(TomlGet(ProfileNode, 'executable')) then
+            if TomlGet(ProfileNode, 'executable') <> nil then
               raise EManifestError.CreateFmt(
-                '[compiler.profiles.%s] executable must be a string',
-                [Pair.Key]);
-            if (TomlGet(ProfileNode, 'script') <> nil)
-               and not TomlIsString(TomlGet(ProfileNode, 'script')) then
+                '[compiler.profiles.%s] legacy executable is no longer '
+                + 'supported; use command and args', [Pair.Key]);
+            if TomlGet(ProfileNode, 'script') <> nil then
               raise EManifestError.CreateFmt(
-                '[compiler.profiles.%s] script must be a string',
-                [Pair.Key]);
+                '[compiler.profiles.%s] legacy script is no longer '
+                + 'supported; use command = "instantfpc" and put the '
+                + 'script path first in args', [Pair.Key]);
+            if (TomlGet(ProfileNode, 'command') <> nil)
+               and not TomlIsString(TomlGet(ProfileNode, 'command')) then
+              raise EManifestError.CreateFmt(
+                '[compiler.profiles.%s] command must be a string', [Pair.Key]);
             if (TomlGet(ProfileNode, 'version') <> nil)
                and not TomlIsString(TomlGet(ProfileNode, 'version')) then
               raise EManifestError.CreateFmt(
                 '[compiler.profiles.%s] version must be a string',
                 [Pair.Key]);
             CompilerProfile.Driver := TomlStr(ProfileNode, 'driver', '');
-            CompilerProfile.Executable := TomlStr(ProfileNode,
-              'executable', '');
-            CompilerProfile.Script := TomlStr(ProfileNode, 'script', '');
+            CompilerProfile.Runnable.Command := TomlStr(ProfileNode,
+              'command', '');
+            ReadStrictStringArray(ProfileNode, 'args',
+              'compiler.profiles.' + Pair.Key + '.args',
+              CompilerProfile.Runnable.Args);
             CompilerProfile.VersionConstraint := TomlStr(ProfileNode,
               'version', '*');
             if CompilerProfile.Name = '' then
@@ -1776,11 +1856,6 @@ begin
               raise EManifestError.CreateFmt(
                 '[compiler.profiles.%s] version must not be empty',
                 [Pair.Key]);
-            if (CompilerProfile.Executable <> '')
-               and (CompilerProfile.Script <> '') then
-              raise EManifestError.CreateFmt(
-                '[compiler.profiles.%s] executable and script are '
-                + 'mutually exclusive', [Pair.Key]);
             n := Length(Result.CompilerProfiles);
             SetLength(Result.CompilerProfiles, n + 1);
             Result.CompilerProfiles[n] := CompilerProfile;
@@ -1811,6 +1886,7 @@ begin
             raise EManifestError.Create(
               'build.compiler must name a compiler profile');
           Entry.CompilerProfile := TomlStr(BuildNode, 'compiler', '');
+          ParseBuildTarget(TomlGet(BuildNode, 'target'), 'build.target', Entry);
         end;
         if Entry.Output = '' then Entry.Output := 'build/' + Result.Name;
         ParseHookSection(TomlGet(BuildNode, 'prebuild'),
@@ -1845,6 +1921,8 @@ begin
                   'build.%s.compiler must name a compiler profile',
                   [Entry.Name]);
               Entry.CompilerProfile := TomlStr(EntryNode, 'compiler', '');
+              ParseBuildTarget(TomlGet(EntryNode, 'target'),
+                'build.' + Entry.Name + '.target', Entry);
             end;
             ParseHookSection(TomlGet(EntryNode, 'prebuild'),
               'build.' + Entry.Name + '.prebuild', Entry.PreBuild);
@@ -1945,8 +2023,8 @@ begin
       { Unrecognised-section policy (ADR-0011 / ADR-0013).
         Anything at the top level we don't recognise as a known
         section is either:
-          (a) a run-script (ADR-0013) — when the section is a table
-              with a `script` field. The section name becomes the
+          (a) a run task (ADR-0013) — when the section is a table
+              with a `command` field. The section name becomes the
               `lwpt run <name>` invocation. Reserved subcommand
               names (install/build/format/test/repair/init/
               run) are a hard error here.
@@ -1961,31 +2039,37 @@ begin
           if Pair.Key = KNOWN_SECTIONS[k] then begin IsKnown := True; Break; end;
         if IsKnown then Continue;
 
-        { Run-script detection: section is a table carrying a
-          `script` field. Bare-string sections aren't possible in
+        { Run-task detection: section is a table carrying a
+          `command` field. Bare-string sections aren't possible in
           TOML (section values are always tables). }
         if TomlIsTable(Pair.Value)
-           and TomlIsString(TomlGet(Pair.Value, 'script')) then
+           and (TomlGet(Pair.Value, 'script') <> nil) then
+          raise EManifestError.CreateFmt(
+            'section [%s]: legacy "script" is no longer supported; '
+            + 'use "command" and explicit "args" (for Pascal, command '
+            + '= "instantfpc")', [Pair.Key]);
+        if TomlIsTable(Pair.Value)
+           and (TomlGet(Pair.Value, 'command') <> nil) then
         begin
           { SameText, not `=`: subcommand dispatch is case-insensitive
             (the CLI lowercases argv and Find uses SameText), so a
-            case-variant section like [Agents] would list as a script
+            case-variant section like [Agents] would list as a task
             yet be unreachable — `lwpt run Agents` dispatches the
             built-in. The reservation must match dispatch semantics. }
           for k := Low(RESERVED_SUBCOMMAND_NAMES) to High(RESERVED_SUBCOMMAND_NAMES) do
             if SameText(Pair.Key, RESERVED_SUBCOMMAND_NAMES[k]) then
               raise EManifestError.CreateFmt(
                 'section [%s] shadows the built-in subcommand and '
-                + 'cannot be used as a run-script. Rename the section '
+                + 'cannot be used as a run task. Rename the section '
                 + '(e.g. [%s-task]) or invoke the subcommand directly '
                 + '(`lwpt %s`). See ADR-0013.',
                 [Pair.Key, Pair.Key, Pair.Key]);
-          { Parse as a script using the same shape as a hook entry. }
+          { Parse as a run task using the same shape as a hook entry. }
           ParseHookEntry(Pair.Value, Pair.Key,
             '[' + Pair.Key + ']', Hook);
-          n := Length(Result.Scripts);
-          SetLength(Result.Scripts, n + 1);
-          Result.Scripts[n] := Hook;
+          n := Length(Result.RunTasks);
+          SetLength(Result.RunTasks, n + 1);
+          Result.RunTasks[n] := Hook;
         end
         else
           WriteLn(ErrOutput, 'warning: unrecognised section [',
@@ -2026,10 +2110,10 @@ begin
       ExpandHookArray(Result.PostBuild,   Ctx, 'postbuild');
       ExpandHookArray(Result.PreTest,     Ctx, 'pretest');
       ExpandHookArray(Result.PostTest,    Ctx, 'posttest');
-      { Run-scripts (ADR-0013). Same namespace as whole-build hooks:
-        no item context. The script path / args may use {package.*}
+      { Run tasks (ADR-0013). Same namespace as whole-build hooks:
+        no item context. The command / args may use {package.*}
         and {platform.*}; {item.*} is a hard error (no item in scope). }
-      ExpandHookArray(Result.Scripts,     Ctx, 'run');
+      ExpandHookArray(Result.RunTasks, Ctx, 'run');
 
       { Pass 2 over build items: per-item hook fields get the
         FULL item namespace ({item.name} + {item.source} +

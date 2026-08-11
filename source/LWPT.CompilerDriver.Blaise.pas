@@ -239,7 +239,10 @@ begin
   ProbeProcess := TProcess.Create(nil);
   Runner := nil;
   try
-    ProbeProcess.Executable := FExecutableName;
+    ProbeProcess.Executable := ConfiguredCommand(FExecutableName);
+    if WorkingDirectory <> '' then
+      ProbeProcess.CurrentDirectory := WorkingDirectory;
+    AppendCommandArguments(ProbeProcess.Parameters);
     ProbeProcess.Parameters.Add(BLAISE_HELP_FLAG);
     Options := DefaultProcessRunOptions('compiler "' + BLAISE_COMPILER_ID
       + '" capability probe');
@@ -434,7 +437,7 @@ end;
 
 function TLWPTBlaiseCompilerDriver.ExecutableName: string;
 begin
-  Result := FExecutableName;
+  Result := ConfiguredCommand(FExecutableName);
 end;
 
 function TLWPTBlaiseCompilerDriver.SeparateStandardError: Boolean;

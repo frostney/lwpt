@@ -31,6 +31,7 @@ type
   TLWPTBuildPublicationRequest = record
     BuildRequest: TLWPTBuildRequest;
     CompilerExecutable: string;
+    CompilerArguments: TStringArray;
     ManifestContentHash: string;
     PublicOutput: string;
     Environment: TStringArray;
@@ -506,6 +507,7 @@ begin
     AddField(Fields, 'build-request',
       SerializeBuildRequest(ARequest.BuildRequest));
     AddField(Fields, 'compiler.executable', ARequest.CompilerExecutable);
+    AddStringArray(Fields, 'compiler.arguments', ARequest.CompilerArguments);
     AddField(Fields, 'manifest.parsed-hash', ARequest.ManifestContentHash);
     AddPathArray(Fields, AProjectRoot, 'sources',
       ARequest.BuildRequest.Inputs.Sources, EmptyPaths);

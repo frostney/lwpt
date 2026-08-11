@@ -263,12 +263,18 @@ begin
 end;
 
 function TLWPTDelphiCompilerDriver.ExecutableTarget: TLWPTTarget;
+var
+  i: Integer;
+  CommandName: string;
 begin
-  if TargetForExecutable(FExecutableName, Result) then Exit;
+  CommandName := ConfiguredCommand(FExecutableName);
+  if TargetForExecutable(CommandName, Result) then Exit;
+  for i := 0 to CommandArgumentCount - 1 do
+    if TargetForExecutable(CommandArgument(i), Result) then Exit;
   raise ELWPTCompilerDriverError.CreateFmt(
     'compiler "%s" executable "%s" is not a verified Delphi command-line '
     + 'compiler; expected dcc32, dcc64, dcclinux64, dccosx64, or '
-    + 'dccosxarm64', [DELPHI_COMPILER_ID, FExecutableName]);
+    + 'dccosxarm64', [DELPHI_COMPILER_ID, CommandName]);
 end;
 
 function TLWPTDelphiCompilerDriver.DefaultTarget: TLWPTTarget;
@@ -287,7 +293,10 @@ var
 begin
   CompilerProcess := TProcess.Create(nil);
   try
-    CompilerProcess.Executable := FExecutableName;
+    CompilerProcess.Executable := ConfiguredCommand(FExecutableName);
+    if WorkingDirectory <> '' then
+      CompilerProcess.CurrentDirectory := WorkingDirectory;
+    AppendCommandArguments(CompilerProcess.Parameters);
     for i := 0 to High(AArguments) do
       CompilerProcess.Parameters.Add(AArguments[i]);
     ProcessRunner := TLWPTDuplexProcessRunner.Create(CompilerProcess);
@@ -544,7 +553,7 @@ end;
 
 function TLWPTDelphiCompilerDriver.ExecutableName: string;
 begin
-  Result := FExecutableName;
+  Result := ConfiguredCommand(FExecutableName);
 end;
 
 function TLWPTDelphiCompilerDriver.ClassifyFailure(

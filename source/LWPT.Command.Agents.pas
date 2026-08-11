@@ -3,7 +3,7 @@
   Writes (or, with --check, verifies) the agent-facing command
   reference inside the project's AGENTS.md: a marker-fenced region
   covering every registered subcommand (summary, usage, options) plus
-  the project's user-declared run-scripts. The region is rendered from
+  the project's user-declared run tasks. The region is rendered from
   the same live TSubcommandRegistry that drives `--help`, so the two
   surfaces cannot drift apart.
 
@@ -65,7 +65,7 @@ begin
   AText := AText + ALine + #10;
 end;
 
-{ Markdown code span for manifest-controlled text (run-script names and
+{ Markdown code span for manifest-controlled text (run-task names and
   paths). A value containing backticks needs a delimiter longer than
   its longest backtick run, space-padded, per CommonMark — otherwise
   the value would terminate the span and corrupt the block's markup. }
@@ -113,22 +113,34 @@ begin
   end;
 end;
 
-procedure AddRunScriptLines(var AText: string; const AManifest: TManifest);
+procedure AddRunTaskLines(var AText: string; const AManifest: TManifest);
 var
-  i : Integer;
+  Line: string;
+  i, j: Integer;
 begin
-  if Length(AManifest.Scripts) = 0 then
+  if Length(AManifest.RunTasks) = 0 then
   begin
-    AddLine(AText, 'No run-scripts declared in `' + MANIFEST_FILE + '`.');
+    AddLine(AText, 'No run tasks declared in `' + MANIFEST_FILE + '`.');
     Exit;
   end;
-  { RawScript, not Script: the loader interpolates placeholders such
-    as platform.os into Script, which would make the committed block
+  { RawCommand, not Command: the loader interpolates placeholders such
+    as platform.os into Command, which would make the committed block
     differ per platform and flip `--check` in cross-platform CI. }
-  for i := 0 to High(AManifest.Scripts) do
-    AddLine(AText, '- ' + CodeSpan(PROGRAM_NAME + ' run '
-      + AManifest.Scripts[i].Name) + ' — '
-      + CodeSpan(AManifest.Scripts[i].RawScript));
+  for i := 0 to High(AManifest.RunTasks) do
+  begin
+    Line := '- ' + CodeSpan(PROGRAM_NAME + ' run '
+      + AManifest.RunTasks[i].Name) + ' — command: '
+      + CodeSpan(AManifest.RunTasks[i].RawCommand) + '; args:';
+    if Length(AManifest.RunTasks[i].RawArgs) = 0 then
+      Line := Line + ' (none)';
+    for j := 0 to High(AManifest.RunTasks[i].RawArgs) do
+      if AManifest.RunTasks[i].RawArgs[j] = '' then
+        Line := Line + ' [' + IntToStr(j) + ']=(empty)'
+      else
+        Line := Line + ' [' + IntToStr(j) + ']='
+          + CodeSpan(AManifest.RunTasks[i].RawArgs[j]);
+    AddLine(AText, Line);
+  end;
 end;
 
 { The full marker-fenced region, LF line endings, ending with
@@ -153,9 +165,9 @@ begin
   AddLine(Result, '');
   AddSubcommandLines(Result, ARegistry);
   AddLine(Result, '');
-  AddLine(Result, '### Run-scripts');
+  AddLine(Result, '### Run tasks');
   AddLine(Result, '');
-  AddRunScriptLines(Result, AManifest);
+  AddRunTaskLines(Result, AManifest);
   AddLine(Result, '');
   Result := Result + MARKER_END;
 end;
@@ -273,7 +285,7 @@ var
   Bytes    : TBytes;
 begin
   { Manifest required: agents is a project-scoped subcommand (it lists
-    the project's run-scripts and writes the project's AGENTS.md). }
+    the project's run tasks and writes the project's AGENTS.md). }
   Man := LoadManifest(AManifestPath);
 
   Existing := ReadAllText(AGENTS_FILE);

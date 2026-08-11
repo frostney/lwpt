@@ -636,7 +636,10 @@ begin
   ProcessTree := nil;
   TerminationThread := nil;
   try
-    CompilerProcess.Executable := FExecutableName;
+    CompilerProcess.Executable := ConfiguredCommand(FExecutableName);
+    if WorkingDirectory <> '' then
+      CompilerProcess.CurrentDirectory := WorkingDirectory;
+    AppendCommandArguments(CompilerProcess.Parameters);
     for ArgumentIndex := 0 to High(AArguments) do
       CompilerProcess.Parameters.Add(AArguments[ArgumentIndex]);
     CompilerProcess.Options := [poUsePipes, poStderrToOutPut];
@@ -955,7 +958,7 @@ end;
 
 function TLWPTFPCCompilerDriver.ExecutableName: string;
 begin
-  Result := FExecutableName;
+  Result := ConfiguredCommand(FExecutableName);
 end;
 
 function TLWPTFPCCompilerDriver.ClassifyFailure(const AExitCode: Integer;

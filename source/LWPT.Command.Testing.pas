@@ -33,7 +33,24 @@ uses
   LWPT.ProcessRunner,
   LWPT.ProcessTree,
   LWPT.ProgressReporter,
-  LWPT.WorkerBudget;
+  LWPT.WorkerBudget,
+  Platform;
+
+function TestTargetIsHost(const ATarget: TLWPTTarget): Boolean;
+var
+  OSMatches, ArchitectureMatches: Boolean;
+begin
+  OSMatches := SameText(ATarget.OS, Platform.GetBuildOS)
+    or (IsWindowsOperatingSystem(ATarget.OS)
+        and IsWindowsOperatingSystem(Platform.GetBuildOS));
+  ArchitectureMatches := SameText(ATarget.Architecture,
+    Platform.GetBuildArch)
+    or ((SameText(ATarget.Architecture, 'i386')
+         or SameText(ATarget.Architecture, 'x86'))
+        and (SameText(Platform.GetBuildArch, 'i386')
+             or SameText(Platform.GetBuildArch, 'x86')));
+  Result := OSMatches and ArchitectureMatches;
+end;
 
 type
   TTestJobStatus = (tjsPending, tjsCompiling, tjsRunning, tjsPassed,
@@ -922,6 +939,7 @@ var
   Scheduler: TTestScheduler;
   CompilerSelection: TLWPTCompilerSelection;
   CompilerDriver: TLWPTCompilerDriver;
+  TestTarget: TLWPTTarget;
   StartedAt: QWord;
 begin
   StartedAt := GetTickCount64;
@@ -941,11 +959,18 @@ begin
       CompilerSelection := TLWPTCompilerSelection.Create(Man, ProjectRoot,
         ACompilerHost);
       CompilerDriver := CompilerSelection.DriverFor('');
+      TestTarget := CompilerDriver.DefaultTarget;
+      if not TestTargetIsHost(TestTarget) then
+        raise ELWPTError.CreateFmt(
+          'generic test runner requires a host artifact; selected compiler '
+          + 'target is "%s/%s" but host is "%s/%s"',
+          [TestTarget.OS, TestTarget.Architecture, Platform.GetBuildOS,
+           Platform.GetBuildArch]);
       Session := TLWPTBuildSession.Create(ProjectRoot);
       try
         WriteLn('test session: ', Session.SessionID, ' (',
           Session.SessionReference, ')');
-        RunHooks('pretest', Man.PreTest, Session.HookRoot);
+        RunHooks('pretest', Man.PreTest, ProjectRoot);
 
     ModulesRoot := ResolveModulesDir(Man);
     SetLength(UnitPaths, 0);
@@ -982,7 +1007,7 @@ begin
       begin
         WriteLn('no *.Test.pas files found');
         Result := 0;
-        RunHooks('posttest', Man.PostTest, Session.HookRoot);
+        RunHooks('posttest', Man.PostTest, ProjectRoot);
         Session.Finish(True);
         Exit;
       end;
@@ -998,7 +1023,7 @@ begin
         Inc(Failed);
         { Mirror the other exit paths: posttest cleanup/reporting hooks
           run even when the scheduler never starts. }
-        RunHooks('posttest', Man.PostTest, Session.HookRoot);
+        RunHooks('posttest', Man.PostTest, ProjectRoot);
         Session.Finish(False, 'test staging key collision');
         Exit;
       end;
@@ -1029,7 +1054,7 @@ begin
       Tests.Free;
     end;
 
-    RunHooks('posttest', Man.PostTest, Session.HookRoot);
+    RunHooks('posttest', Man.PostTest, ProjectRoot);
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
       + IntToStr(Cancelled) + ' cancelled');

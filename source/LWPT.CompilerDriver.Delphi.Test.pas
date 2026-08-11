@@ -173,7 +173,7 @@ begin
   SetLength(Manifest.CompilerProfiles, 1);
   Manifest.CompilerProfiles[0].Name := 'delphi-win64';
   Manifest.CompilerProfiles[0].Driver := DELPHI_COMPILER_ID;
-  Manifest.CompilerProfiles[0].Executable := 'tools/dcc64.exe';
+  Manifest.CompilerProfiles[0].Runnable.Command := 'tools/dcc64.exe';
   Manifest.CompilerProfiles[0].VersionConstraint := '>=36.0.0';
   Selection := TLWPTCompilerSelection.Create(Manifest, FScratchRoot);
   try

@@ -20,19 +20,19 @@ uses
   LWPT.Manifest;
 
 {
-  CmdRun — invoke a user-declared run-script (ADR-0013).
+  CmdRun — invoke a user-declared run task (ADR-0013).
 
-  AName is the section name (the manifest key for the script). When
-  AName is empty, prints a list of every callable name (user scripts,
+  AName is the section name (the manifest key for the task). When
+  AName is empty, prints a list of every callable name (user tasks,
   then subcommand aliases). AAliasNames carries the alias set the
   dispatcher actually accepts — the caller derives it from the live
   subcommand registry so this listing can never drift from dispatch.
-  When AName matches no script and no subcommand, exits 1 with a hint
-  listing the declared scripts.
+  When AName matches no task and no subcommand, exits 1 with a hint
+  listing the declared tasks.
 
   Subcommand-aliasing (`lwpt run install` → `lwpt install`) is handled
   upstream in the CLI dispatcher (CLI.Subcommands.Run) — CmdRun is
-  only reached for genuine user scripts. }
+  only reached for genuine user tasks. }
 
 function CmdRun(const AManifestPath, AName: string;
   const AAliasNames: array of string): Integer;
@@ -47,13 +47,13 @@ begin
   { Empty name → list mode (npm-run convention). }
   if AName = '' then
   begin
-    WriteLn('available scripts:');
-    if Length(Man.Scripts) = 0 then
-      WriteLn('  (none — declare a top-level section with a `script` field)')
+    WriteLn('available tasks:');
+    if Length(Man.RunTasks) = 0 then
+      WriteLn('  (none — declare a top-level section with a `command` field)')
     else
-      for i := 0 to High(Man.Scripts) do
-        WriteLn('  ', Man.Scripts[i].Name, '  ',
-                Man.Scripts[i].Script);
+      for i := 0 to High(Man.RunTasks) do
+        WriteLn('  ', Man.RunTasks[i].Name, '  ',
+                Man.RunTasks[i].Runnable.Command);
     WriteLn;
     WriteLn('subcommand aliases (also valid via `', PROGRAM_NAME, ' run <name>`):');
     Write('  ');
@@ -66,42 +66,43 @@ begin
     Exit(0);
   end;
 
-  { Look up by name. Scripts are root-only and already validated
+  { Look up by name. Tasks are root-only and already validated
     against subcommand-name collisions at manifest load. }
   Hit := False;
-  for i := 0 to High(Man.Scripts) do
-    if Man.Scripts[i].Name = AName then
+  for i := 0 to High(Man.RunTasks) do
+    if Man.RunTasks[i].Name = AName then
     begin
-      Found := Man.Scripts[i];
+      Found := Man.RunTasks[i];
       Hit := True;
       Break;
     end;
 
   if not Hit then
   begin
-    WriteLn(ErrOutput, PROGRAM_NAME, ' run: no script named "',
+    WriteLn(ErrOutput, PROGRAM_NAME, ' run: no task named "',
       AName, '"');
-    if Length(Man.Scripts) > 0 then
+    if Length(Man.RunTasks) > 0 then
     begin
-      Write(ErrOutput, '  available scripts: ');
-      for i := 0 to High(Man.Scripts) do
+      Write(ErrOutput, '  available tasks: ');
+      for i := 0 to High(Man.RunTasks) do
       begin
         if i > 0 then Write(ErrOutput, ', ');
-        Write(ErrOutput, Man.Scripts[i].Name);
+        Write(ErrOutput, Man.RunTasks[i].Name);
       end;
       WriteLn(ErrOutput);
     end
     else
-      WriteLn(ErrOutput, '  (no scripts declared in ', AManifestPath, ')');
+      WriteLn(ErrOutput, '  (no tasks declared in ', AManifestPath, ')');
     Exit(1);
   end;
 
-  { Execute the script directly and propagate its exit code (npm-run
+  { Execute the task directly and propagate its exit code (npm-run
     convention). Differs from lifecycle hooks (which raise on non-zero
-    to abort the phase): a user-invoked script's exit code is the
+    to abort the phase): a user-invoked task's exit code is the
     *answer* the user is asking for, so any propagation other than
-    "what the script returned" loses information. }
-  Result := RunUserScript(Found);
+    "what the command returned" loses information. }
+  Result := RunUserTask(Found,
+    ExtractFileDir(ExpandFileName(AManifestPath)));
 end;
 
 end.

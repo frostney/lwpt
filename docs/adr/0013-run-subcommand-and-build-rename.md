@@ -123,3 +123,20 @@ The subcommand surface, frozen at seven since ADR-0010, expands to eight with `l
 - **The decision forecloses** placeholder section-name interpolation (`[build.{package.name}]` etc.), arbitrary unrecognised sections being treated as anything other than scripts-or-warnings, and dependency-declared scripts. All three remain reversible via a future ADR but each has a sharp UX/safety reason to stay closed.
 
 - **The decision opens** future `[build.<entry>]`-level fields beyond `source` / `output` / hooks (compiler flags overrides, conditional `os = "darwin"` filters, etc) without naming-conflict surprises — the namespace is empty above the field level.
+
+## 0.6.0 amendment — run tasks and independent targets
+
+Issue [#161](https://github.com/frostney/lwpt/issues/161) renames the
+user-facing concept from run-script to **run task**. An otherwise-unknown root
+section becomes callable when it contains `command`; ordered `args` and the
+shared hook `inputs`/`output` staleness fields complete the shape. Task
+arguments are manifest-defined only, skipped-fresh tasks succeed, and an
+executed child exit code is propagated exactly. Legacy `script` fields
+hard-error with an explicit migration hint.
+
+Each build entry may also declare a complete `target` table independently
+from its `compiler` profile: required `os` and `architecture`, plus optional
+`abi` and `environment`. Omission uses the selected driver's first advertised
+target. Explicit tuples reach probe and compile unchanged; unsupported tuples
+fail before compilation without compiler or target fallback. Generic
+`lwpt test` remains a native runner and rejects a non-host artifact.

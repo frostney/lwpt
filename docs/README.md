@@ -32,9 +32,9 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0008](./adr/0008-lockfile-schema-v2-archive-hash.md) | Lockfile schema v2 splits `archiveHash` from `computedHash` for two-hash `--frozen` verification |
 | [0009](./adr/0009-source-syntax-and-tag-resolution.md) | Source syntax (`<source>@<spec>` shorthand; git-host / URL / local kinds) + git smart-HTTP tag resolution; lockfile schema v3 |
 | [0010](./adr/0010-init-subcommand.md) | `lwpt init` interactive scaffold + npm-init-y semantics with `--yes` |
-| [0011](./adr/0011-build-lifecycle-hooks.md) | Lifecycle hooks (`[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` + per-build-entry inline hooks) replacing the earlier `[generated]` section |
+| [0011](./adr/0011-build-lifecycle-hooks.md) | Direct-command lifecycle hooks (`[preinstall]` / `[postinstall]` / `[prebuild]` / `[postbuild]` / `[pretest]` / `[posttest]` + per-build-entry inline hooks) with shared strict staleness evaluation |
 | [0012](./adr/0012-manifest-placeholder-interpolation.md) | Manifest placeholder interpolation (`{package.*}`, `{item.*}`, `{platform.*}`) with two-pass resolution and strict unknown-name errors |
-| [0013](./adr/0013-run-subcommand-and-build-rename.md) | `lwpt run` subcommand for user-declared scripts + subcommand aliasing; `[targets]` renamed to `[build]` with single-entry shorthand |
+| [0013](./adr/0013-run-subcommand-and-build-rename.md) | `lwpt run` for user-declared run tasks + subcommand aliasing; `[build]` entries with optional independent target tuples |
 | [0014](./adr/0014-packages-extraction.md) | Workspace packages under `packages/<name>/` for HTTPClient / CLI / Semver / TOML (extended by ADR-0015 to add `testing`); `[workspaces]` auto-discovery; monorepo symlink/junction install |
 | [0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) | `lwpt export` retired; `TestingPascalLibrary` graduates to the `testing` workspace package; subcommand surface 8 → 7 |
 | [0016](./adr/0016-tls-backend-per-platform.md) | TLS backend is platform-native (SChannel on Windows, SecureTransport on macOS, OpenSSL on Linux); CI guard prevents OpenSSL DLL dependency on Windows |
@@ -51,7 +51,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0027](./adr/0027-agents-subcommand.md) | `lwpt agents` writes/verifies the marker-fenced AGENTS.md command reference; subcommand surface 9 → 10 |
 | [0028](./adr/0028-default-toolkit-state-format-exclusion.md) | Formatter excludes root `.lwpt/**` by default while explicit includes opt matching files back in |
 | [0029](./adr/0029-fpc-compiler-driver.md) | Neutral compiler-driver seam with on-demand FPC target probes, unified argument translation, failure classification, and normalized diagnostics |
-| [0030](./adr/0030-root-compiler-profiles.md) | Root-owned named compiler profiles, embedding-host factories, deterministic selection precedence, and a short-lived external-driver TOML protocol |
+| [0030](./adr/0030-root-compiler-profiles.md) | Root-owned named compiler commands, out-of-process host registration, deterministic selection precedence, and the short-lived external-driver TOML protocol |
 | [0031](./adr/0031-fixed-point-single-version-resolution.md) | Deterministic fixed-point dependency discovery, authoritative Git ref identity, graph-wide highest-version selection, and publish-after-validation |
 
 ## Spikes

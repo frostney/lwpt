@@ -322,7 +322,7 @@ begin
       second positional is a registered subcommand, dispatch to THAT
       subcommand directly with its args starting at argv[3]. The run
       handler never sees this case — it only fires for user-defined
-      run-scripts (which are forbidden from shadowing subcommand names
+      run tasks (which are forbidden from shadowing subcommand names
       by the manifest-load guard, so there's no ambiguity here). }
     ParseStart := 1;
     if (CmdName = 'run') and (ParamCount >= 2) then
