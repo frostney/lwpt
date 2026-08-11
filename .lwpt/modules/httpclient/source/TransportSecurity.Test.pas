@@ -118,6 +118,7 @@ type
     procedure TestPKCS12PathRefusesSymbolicLink;
     procedure TestPlaintextRoundtripAndPartialCiphertextConsumption;
     procedure TestRenegotiationIsRefused;
+    procedure TestSChannelCertificateChainDelivered;
     procedure TestSChannelGracefulCloseProducesCloseNotify;
     procedure TestSChannelIdentityImportsIsolatedKeyContainers;
     procedure TestSChannelHandshakeRoundtripAndContextReuse;
@@ -866,6 +867,7 @@ const
   SECBUFFER_ATTRMASK = $F0000000;
   SECPKG_ATTR_STREAM_SIZES = 4;
   SECPKG_ATTR_REMOTE_CERT_CONTEXT = $53;
+  SECPKG_ATTR_REMOTE_CERT_CHAIN = $67;
   CERT_NAME_SIMPLE_DISPLAY_TYPE = 4;
   SECPKG_CRED_OUTBOUND = 2;
   SEC_E_OK = SECURITY_STATUS($00000000);
@@ -1334,12 +1336,16 @@ begin
       Exit;
     end;
 
-    for I := 0 to High(Buffers) do
-      if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
-        AppendTestBytes(AClient.Plaintext, Buffers[I].pvBuffer,
-          Buffers[I].cbBuffer);
+    { From index 1: on SEC_I_CONTEXT_EXPIRED DecryptMessage leaves the
+      descriptor untouched, so buffer 0 still carries the caller-supplied
+      SECBUFFER_DATA label over the whole ciphertext. }
+    if Status = SEC_E_OK then
+      for I := 1 to High(Buffers) do
+        if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
+          AppendTestBytes(AClient.Plaintext, Buffers[I].pvBuffer,
+            Buffers[I].cbBuffer);
     SetLength(ExtraInput, 0);
-    for I := 0 to High(Buffers) do
+    for I := 1 to High(Buffers) do
       if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
         AppendTestBytes(ExtraInput, Buffers[I].pvBuffer, Buffers[I].cbBuffer);
     AClient.Incoming := ExtraInput;
@@ -1359,24 +1365,32 @@ begin
     Move(Buffer[0], Result[1], Length(Buffer));
 end;
 
-{ The server's bundled intermediate must reach the peer. On Windows that
-  depends on the credential snapshot keeping the imported PKCS#12 store alive
-  (closed without CERT_CLOSE_STORE_FORCE_FLAG), because SChannel builds the
-  server flight from the leaf's associated store. }
-function SChannelClientReceivedIntermediate(
-  var AClient: TSChannelTestClient): Boolean;
-const
-  INTERMEDIATE_COMMON_NAME = 'TransportSecurity Test Intermediate CA';
+{ Subject names of every certificate the peer sent, comma separated. The
+  server's bundled intermediate has to be among them, which is what pins the
+  credential snapshot keeping the imported PKCS#12 store alive (closed without
+  CERT_CLOSE_STORE_FORCE_FLAG) — SChannel builds the server flight from the
+  leaf's associated store. Returning the list rather than a Boolean makes a
+  failure say what actually arrived. }
+function SChannelClientDeliveredChainNames(
+  var AClient: TSChannelTestClient): string;
 var
   Certificate: PCertContext;
   Enumerated: PCertContext;
   Name: array[0..255] of AnsiChar;
 begin
-  Result := False;
+  Result := '';
   Certificate := nil;
-  if QueryContextAttributesW(@AClient.Context,
-    SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Certificate) <> SEC_E_OK then
-    raise Exception.Create('Raw SChannel client has no remote certificate');
+  { SECPKG_ATTR_REMOTE_CERT_CHAIN answers with every certificate the peer
+    sent. Providers that do not implement it still answer
+    SECPKG_ATTR_REMOTE_CERT_CONTEXT, whose store carries the same set. }
+  if QueryContextAttributesW(@AClient.Context, SECPKG_ATTR_REMOTE_CERT_CHAIN,
+    @Certificate) <> SEC_E_OK then
+  begin
+    Certificate := nil;
+    if QueryContextAttributesW(@AClient.Context,
+      SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Certificate) <> SEC_E_OK then
+      raise Exception.Create('Raw SChannel client has no remote certificate');
+  end;
   try
     if not Assigned(Certificate) or not Assigned(Certificate^.hCertStore) then
       Exit;
@@ -1386,11 +1400,9 @@ begin
       FillChar(Name, SizeOf(Name), 0);
       CertGetNameStringA(Enumerated, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nil,
         @Name[0], Length(Name));
-      if Pos(INTERMEDIATE_COMMON_NAME, StrPas(@Name[0])) > 0 then
-      begin
-        CertFreeCertificateContext(Enumerated);
-        Exit(True);
-      end;
+      if Result <> '' then
+        Result := Result + ', ';
+      Result := Result + StrPas(@Name[0]);
       Enumerated := CertEnumCertificatesInStore(Certificate^.hCertStore,
         Enumerated);
     end;
@@ -2858,7 +2870,6 @@ begin
     Expect<Boolean>(Connection.Active).ToBe(True);
     Expect<Boolean>(Observed.SawWantRead).ToBe(True);
     Expect<Boolean>(Observed.SawWantWrite).ToBe(True);
-    Expect<Boolean>(SChannelClientReceivedIntermediate(Client)).ToBe(True);
 
     WriteSChannelClientText(Client, CLIENT_REQUEST);
     PumpSChannelClientCiphertext(Client, Connection);
@@ -3154,6 +3165,38 @@ begin
   {$ENDIF}
 end;
 
+procedure TTransportSecurityServerTests.TestSChannelCertificateChainDelivered;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+const
+  INTERMEDIATE_COMMON_NAME = 'TransportSecurity Test Intermediate CA';
+var
+  Client: TSChannelTestClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Delivered: string;
+  Observed: THandshakeObservations;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    CreateSChannelHandshakenPair(Context, Connection, Client, Observed);
+    Delivered := SChannelClientDeliveredChainNames(Client);
+    if Pos(INTERMEDIATE_COMMON_NAME, Delivered) = 0 then
+      raise Exception.Create(
+        'Server flight omitted the bundled intermediate; delivered: ' +
+        Delivered);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeSChannelClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityServerTests.
   TestSChannelGracefulCloseProducesCloseNotify;
 {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
@@ -3440,6 +3483,9 @@ begin
   Skip('SChannel handshake round-trips plaintext and reuses the context',
     TestSChannelHandshakeRoundtripAndContextReuse,
     DARWIN_SKIP_REASON);
+  Skip('SChannel PKCS#12 chain delivers the intermediate certificate',
+    TestSChannelCertificateChainDelivered,
+    DARWIN_SKIP_REASON);
   Skip('SChannel input flow accepts bounded prefixes and counts consumption',
     TestSChannelInputFlowPrefixAdmissionAndCounters,
     DARWIN_SKIP_REASON);
@@ -3597,6 +3643,8 @@ begin
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   ServerTest('SChannel handshake round-trips plaintext and reuses the context',
     TestSChannelHandshakeRoundtripAndContextReuse);
+  ServerTest('SChannel PKCS#12 chain delivers the intermediate certificate',
+    TestSChannelCertificateChainDelivered);
   ServerTest('SChannel input flow accepts bounded prefixes and counts consumption',
     TestSChannelInputFlowPrefixAdmissionAndCounters);
   ServerTest('SChannel pending ciphertext pointer survives partial consumption',
@@ -3614,6 +3662,9 @@ begin
   {$ELSE}
   Skip('SChannel handshake round-trips plaintext and reuses the context',
     TestSChannelHandshakeRoundtripAndContextReuse,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel PKCS#12 chain delivers the intermediate certificate',
+    TestSChannelCertificateChainDelivered,
     SCHANNEL_CLIENT_SKIP_REASON);
   Skip('SChannel input flow accepts bounded prefixes and counts consumption',
     TestSChannelInputFlowPrefixAdmissionAndCounters,

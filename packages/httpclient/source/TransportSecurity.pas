@@ -3171,16 +3171,23 @@ begin
 
     SetLength(Data.DecryptedInput, 0);
     Data.DecryptedOffset := 0;
-    for I := 0 to High(Buffers) do
-      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
-        AppendBytes(Data.DecryptedInput, Buffers[I].pvBuffer,
-          Buffers[I].cbBuffer);
+    { Harvest from index 1. DecryptMessage relabels the descriptor in place
+      on success — [0] becomes SECBUFFER_STREAM_HEADER, [1] the plaintext —
+      but on SEC_I_CONTEXT_EXPIRED it returns without touching the buffers,
+      so [0] still carries the caller-supplied SECBUFFER_DATA label over the
+      whole ciphertext. Scanning from 0 therefore turns a peer close_notify
+      into a payload of raw ciphertext. }
+    if not ContextExpired then
+      for I := 1 to High(Buffers) do
+        if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
+          AppendBytes(Data.DecryptedInput, Buffers[I].pvBuffer,
+            Buffers[I].cbBuffer);
 
     { SECBUFFER_EXTRA belongs to Data.EncryptedInput. Some SChannel
       builds report only cbBuffer, so fall back to preserving the input
       tail before replacing the array that owns those bytes. }
     SetLength(ExtraInput, 0);
-    for I := 0 to High(Buffers) do
+    for I := 1 to High(Buffers) do
       if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
         AppendExtraBytes(ExtraInput, Data.EncryptedInput,
           Buffers[I].pvBuffer, Buffers[I].cbBuffer);
@@ -4553,16 +4560,23 @@ begin
 
     SetLength(Data.Plaintext, 0);
     Data.PlaintextOffset := 0;
-    for I := 0 to High(Buffers) do
-      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
-        AppendBytes(Data.Plaintext, Buffers[I].pvBuffer,
-          Buffers[I].cbBuffer);
+    { Harvest from index 1. DecryptMessage relabels the descriptor in place
+      on success — [0] becomes SECBUFFER_STREAM_HEADER, [1] the plaintext —
+      but on SEC_I_CONTEXT_EXPIRED it returns without touching the buffers,
+      so [0] still carries the caller-supplied SECBUFFER_DATA label over the
+      whole ciphertext. Scanning from 0 therefore turns a peer close_notify
+      into a payload of raw ciphertext. }
+    if Status = SEC_E_OK then
+      for I := 1 to High(Buffers) do
+        if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
+          AppendBytes(Data.Plaintext, Buffers[I].pvBuffer,
+            Buffers[I].cbBuffer);
 
     { SECBUFFER_EXTRA points into EncryptedInput; some SChannel builds report
       only cbBuffer, so preserve the input tail before replacing the array
       that owns those bytes. }
     SetLength(ExtraInput, 0);
-    for I := 0 to High(Buffers) do
+    for I := 1 to High(Buffers) do
       if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
         AppendExtraBytes(ExtraInput, Data.EncryptedInput,
           Buffers[I].pvBuffer, Buffers[I].cbBuffer);
@@ -4841,8 +4855,10 @@ begin
       Exit;
     end;
 
+    { Index 1 upward for the same reason the read path does: on
+      SEC_I_CONTEXT_EXPIRED buffer 0 still carries the caller's label. }
     SetLength(ExtraInput, 0);
-    for I := 0 to High(Buffers) do
+    for I := 1 to High(Buffers) do
       if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
         AppendExtraBytes(ExtraInput, Data.EncryptedInput,
           Buffers[I].pvBuffer, Buffers[I].cbBuffer);
