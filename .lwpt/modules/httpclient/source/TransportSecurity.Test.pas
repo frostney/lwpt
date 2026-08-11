@@ -1486,6 +1486,14 @@ begin
     end;
     if Status = SEC_I_RENEGOTIATE then
     begin
+      raise Exception.CreateFmt(
+        'Raw SChannel client renegotiate buffers: ' +
+        '0=%d/%d/%p 1=%d/%d/%p 2=%d/%d/%p 3=%d/%d/%p input=%p/%d',
+        [Buffers[0].BufferType, Buffers[0].cbBuffer, Buffers[0].pvBuffer,
+         Buffers[1].BufferType, Buffers[1].cbBuffer, Buffers[1].pvBuffer,
+         Buffers[2].BufferType, Buffers[2].cbBuffer, Buffers[2].pvBuffer,
+         Buffers[3].BufferType, Buffers[3].cbBuffer, Buffers[3].pvBuffer,
+         @AClient.Incoming[0], Length(AClient.Incoming)]);
       { InitializeSecurityContext must receive the SECBUFFER_DATA span
         modified by DecryptMessage, relabelled as a token, followed by any
         SECBUFFER_EXTRA ciphertext. }
