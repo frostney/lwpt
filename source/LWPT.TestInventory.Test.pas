@@ -19,6 +19,7 @@ type
     procedure TestCanonicalDocumentationIsCurrent;
     procedure TestPlatformRulesResolveBySpecificity;
     procedure TestAmbiguousRulesFailClosed;
+    procedure TestPlatformRulesCannotChangeTier;
     procedure TestStaleDocumentationFailsWithUpdateCommand;
     procedure TestRunningPlatformIsDeclared;
     procedure TestMissingDocumentationRowFails;
@@ -147,6 +148,34 @@ begin
   end;
 end;
 
+procedure TTestInventoryTests.TestPlatformRulesCannotChangeTier;
+var
+  Failed: Boolean;
+  Lines: TStringList;
+  Path: string;
+begin
+  Path := TemporaryPath('tier-change.tsv');
+  Lines := TStringList.Create;
+  try
+    Lines.Add(TEST_INVENTORY_SCHEMA);
+    Lines.Add('platform'#9'darwin/aarch64');
+    Lines.Add('program'#9'*'#9'unit'#9'a.Test.pas'#9'1'#9'1');
+    Lines.Add('program'#9'darwin/*'#9'integration'#9'a.Test.pas'#9'1'#9'1');
+    Lines.SaveToFile(Path);
+  finally
+    Lines.Free;
+  end;
+  Failed := False;
+  try
+    TLWPTTestInventory.Create(Path).Free;
+  except
+    on E: ELWPTTestInventoryError do
+      Failed := Pos('changes tier from unit to integration', E.Message) > 0;
+  end;
+  Expect<Boolean>(Failed).ToBe(True);
+  DeleteFile(Path);
+end;
+
 procedure TTestInventoryTests.TestStaleDocumentationFailsWithUpdateCommand;
 var
   Failed: Boolean;
@@ -190,6 +219,8 @@ begin
   Test('platform rules resolve by specificity',
     TestPlatformRulesResolveBySpecificity);
   Test('ambiguous platform rules fail closed', TestAmbiguousRulesFailClosed);
+  Test('platform rules cannot change a program tier',
+    TestPlatformRulesCannotChangeTier);
   Test('canonical documentation is current',
     TestCanonicalDocumentationIsCurrent);
   Test('stale documentation names the update command',

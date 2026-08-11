@@ -253,7 +253,7 @@ inventory never touches the network.
 | **`source/LWPT.Analysis.Scope.Test.pas`** | 5 tests in 1 suite | Covers recursive root/workspace ownership, globally deepest ownership when discovered project roots overlap, inherited versus replaced `[analysis]` configuration, placeholder-expanded exact build sources, additive include/final exclude behavior, relocated toolkit-state exclusion, deterministic root-relative ordering, strict string arrays, and supported Pascal extensions. |
 | **`source/LWPT.Analysis.JSON.Test.pas`** | 4 tests in 1 suite | Pins JSON escaping, fixed byte output, sorted/deduplicated common file/configuration/diagnostic metadata, threshold outcomes, independent command schema versions, caller-owned payloads, and exact one-value validation including malformed, trailing, escaped-string, and excessive-nesting failures. |
 | **`source/LWPT.Health.Test.pas`** | 11 tests in 1 suite | Pins straight-line baselines, nested structural/nesting increments, Boolean sequences including `and then`, direct recursion without inherited-dispatch false positives, escaped keyword identifiers, `goto`, case arms, typed handlers with fallback branches, `try/finally`, conditional routine-body alternatives, synthetic executable-section file sums, strict-greater-than maxima, complete violation collection, and canonical hotspot normalization at exact threshold boundaries. |
-| **`source/LWPT.TestInventory.Test.pas`** | 6 tests in 1 suite | Pins platform-rule specificity, ambiguity failures, canonical documentation convergence, and the actionable stale-documentation path. |
+| **`source/LWPT.TestInventory.Test.pas`** | 7 tests in 1 suite | Pins platform-rule specificity, ambiguity failures, canonical documentation convergence, and the actionable stale-documentation path. |
 | **`source/LWPT.Command.Health.Test.pas`** | 3 tests in 1 suite | Covers deterministic human and shared-envelope JSON output, root/workspace limit inheritance and replacement, report-only mode, and strict type/range/unknown-key validation for `[health]`. |
 | **`source/LWPT.Duplication.Test.pas`** | 18 tests in 1 suite | Covers Type-2 clones across presentation and consistent identifier/literal renames, inconsistent third-occurrence rejection, maximal non-overlapping multi-occurrence groups including the structural 400-statement repetitive-source result, declaration/executable and nested-routine boundaries, exact minimum inclusion, optional strict thresholds, every duplication-table validation branch, absolute-path source-read diagnostics, workspace policy inheritance/replacement, and final shared-scope exclusion. |
 | **`source/LWPT.ManifestEdit.Test.pas`** | 23 tests in 4 suites | Covers dependency insertion, replacement, removal, manifest-line loading, and dependency-name derivation for git-host, local-path, and URL sources. |
@@ -329,10 +329,10 @@ inventory never touches the network.
 <!-- lwpt:test-inventory-counts:begin -->
 | Tier | Files | Registered test cases |
 | --- | ---: | --- |
-| Unit | 31 | 541 Unix / 529 Windows |
+| Unit | 31 | 542 Unix / 530 Windows |
 | Integration | 23 | 266 Darwin / 265 Linux / 260 Windows |
 | E2E | 7 | 32 Darwin, Windows / 35 Linux |
-| **Total** | **61** | **839 Darwin / 841 Linux / 821 Windows** |
+| **Total** | **61** | **840 Darwin / 842 Linux / 822 Windows** |
 <!-- lwpt:test-inventory-counts:end -->
 
 ## TestingPascalLibrary self-test

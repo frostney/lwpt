@@ -139,6 +139,9 @@ begin
     '[pretest]'#10 +
     'marker = { command = "instantfpc", args = ["scripts/pretest-marker.pas"] }'#10 +
     ''#10 +
+    '[posttest]'#10 +
+    'marker = { command = "instantfpc", args = ["scripts/posttest-marker.pas"] }'#10 +
+    ''#10 +
     '[unknown-section]'#10 +
     'enabled = true'#10);
 
@@ -168,6 +171,15 @@ begin
     'var Marker: Text;'#10 +
     'begin'#10 +
     '  Assign(Marker, ''pretest-ran.txt'');'#10 +
+    '  Rewrite(Marker);'#10 +
+    '  Close(Marker);'#10 +
+    'end.'#10);
+  WriteTextFile(FScratch + '/scripts/posttest-marker.pas',
+    'program PosttestMarker;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'var Marker: Text;'#10 +
+    'begin'#10 +
+    '  Assign(Marker, ''posttest-ran.txt'');'#10 +
     '  Rewrite(Marker);'#10 +
     '  Close(Marker);'#10 +
     'end.'#10);
@@ -744,6 +756,7 @@ var
 begin
   WriteInventoryProbe(FScratch);
   DeleteFile(FScratch + '/pretest-ran.txt');
+  DeleteFile(FScratch + '/posttest-ran.txt');
   DeleteFile(FScratch + '/inventory-body-ran.txt');
   R := RunLwpt(['test', '--inventory', 'source/Inventory.Test.pas',
     '--jobs=1'], FScratch);
@@ -755,6 +768,7 @@ begin
     .ToBe(True);
   Expect<Boolean>(Pos('"suites":1,"cases":1', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/pretest-ran.txt')).ToBe(False);
+  Expect<Boolean>(FileExists(FScratch + '/posttest-ran.txt')).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/inventory-body-ran.txt')).ToBe(False);
 end;
 

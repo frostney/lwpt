@@ -74,7 +74,7 @@ constructor TLWPTTestInventory.Create(const APath: string);
 var
   Fields, Lines: TStringList;
   Entry: TLWPTTestInventoryEntry;
-  i, n: Integer;
+  i, j, n: Integer;
   Line: string;
 begin
   inherited Create;
@@ -117,6 +117,12 @@ begin
         raise ELWPTTestInventoryError.CreateFmt(
           'invalid test inventory tier "%s" on row %d',
           [Entry.Tier, i + 1]);
+      for j := 0 to High(FEntries) do
+        if (FEntries[j].Path = Entry.Path)
+           and (FEntries[j].Tier <> Entry.Tier) then
+          raise ELWPTTestInventoryError.CreateFmt(
+            'test inventory path "%s" changes tier from %s to %s on row %d',
+            [Entry.Path, FEntries[j].Tier, Entry.Tier, i + 1]);
       n := Length(FEntries);
       SetLength(FEntries, n + 1);
       FEntries[n] := Entry;

@@ -1393,7 +1393,8 @@ begin
         Inc(Failed);
         { Mirror the other exit paths: posttest cleanup/reporting hooks
           run even when the scheduler never starts. }
-        RunHooks('posttest', Man.PostTest, ProjectRoot);
+        if not AInventory then
+          RunHooks('posttest', Man.PostTest, ProjectRoot);
         Session.Finish(False, 'test staging key collision');
         Exit;
       end;
