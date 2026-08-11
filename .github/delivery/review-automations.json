@@ -16,10 +16,7 @@
         "success",
         "neutral"
       ],
-      "terminal_review_states": [
-        "APPROVED",
-        "COMMENTED"
-      ],
+      "terminal_review_states": [],
       "nonterminal_review_markers": [
         "rate limit",
         "rate-limit",
