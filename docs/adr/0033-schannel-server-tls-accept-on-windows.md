@@ -87,12 +87,12 @@ which is what OpenSSL's bounded write BIO does.
 
 ### Renegotiation
 
-`SEC_I_RENEGOTIATE` is treated as a fatal protocol error: the connection is
-poisoned and `tssError` returned. This is deliberate parity, not an omission.
-The OpenSSL backend sets `SSL_OP_NO_RENEGOTIATION` and fails
-`SSL_read` when a peer attempts renegotiation, so refusing it identically keeps
-one observable outcome instead of introducing a Windows-only renegotiation
-path that consumers would have to handle.
+TLS 1.2 renegotiation is treated as a fatal protocol error: the connection is
+poisoned and `tssError` returned. This preserves parity with the OpenSSL
+backend, which sets `SSL_OP_NO_RENEGOTIATION`. TLS 1.3 uses
+`SEC_I_RENEGOTIATE` for protocol-required post-handshake messages rather than
+legacy renegotiation, so those messages re-enter the SChannel handshake state
+machine as described below.
 
 ### Identity validation
 
@@ -207,11 +207,13 @@ Compile-time size guards pin both version-5 structures on win32 and win64.
 
 SChannel reports TLS 1.3 post-handshake messages through
 `SEC_I_RENEGOTIATE`. After querying the established protocol, the server feeds
-the `SECBUFFER_DATA` span modified by `DecryptMessage` back through
-`AcceptSecurityContext` as `SECBUFFER_TOKEN` only for TLS 1.3, followed by any
-`SECBUFFER_EXTRA` ciphertext, and stages any response token through the same
-bounded output path. A TLS 1.2 renegotiation attempt remains fatal, preserving
-ADR-0024's no-renegotiation contract.
+the complete `SECBUFFER_EXTRA` span modified by `DecryptMessage` back through
+`AcceptSecurityContext` as `SECBUFFER_TOKEN` only for TLS 1.3. If SChannel
+does not return `SECBUFFER_EXTRA`, the same modified input buffer is replayed
+as Microsoft requires. The handshake call preserves any following ciphertext,
+and any response token uses the same bounded output path. A TLS 1.2
+renegotiation attempt remains fatal, preserving ADR-0024's no-renegotiation
+contract.
 
 ## Consequences
 

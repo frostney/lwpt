@@ -1486,31 +1486,18 @@ begin
     end;
     if Status = SEC_I_RENEGOTIATE then
     begin
-      raise Exception.CreateFmt(
-        'Raw SChannel client renegotiate buffers: ' +
-        '0=%d/%d/%p 1=%d/%d/%p 2=%d/%d/%p 3=%d/%d/%p input=%p/%d',
-        [Buffers[0].BufferType, Buffers[0].cbBuffer, Buffers[0].pvBuffer,
-         Buffers[1].BufferType, Buffers[1].cbBuffer, Buffers[1].pvBuffer,
-         Buffers[2].BufferType, Buffers[2].cbBuffer, Buffers[2].pvBuffer,
-         Buffers[3].BufferType, Buffers[3].cbBuffer, Buffers[3].pvBuffer,
-         @AClient.Incoming[0], Length(AClient.Incoming)]);
-      { InitializeSecurityContext must receive the SECBUFFER_DATA span
-        modified by DecryptMessage, relabelled as a token, followed by any
-        SECBUFFER_EXTRA ciphertext. }
+      { SChannel ordinarily returns the complete post-handshake token and
+        following ciphertext as SECBUFFER_EXTRA. Microsoft documents that
+        EXTRA is not guaranteed, in which case the same modified input buffer
+        must be relabelled as the token. Copy before the handshake mutates the
+        descriptor again. }
       SetLength(ExtraInput, 0);
-      for I := 1 to High(Buffers) do
-        if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
-          AppendTestBytes(ExtraInput, Buffers[I].pvBuffer,
-            Buffers[I].cbBuffer);
-      if Length(ExtraInput) = 0 then
-      begin
-        Result := tssError;
-        Exit;
-      end;
-      for I := 1 to High(Buffers) do
+      for I := 0 to High(Buffers) do
         if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
           AppendTestBytes(ExtraInput, Buffers[I].pvBuffer,
             Buffers[I].cbBuffer);
+      if Length(ExtraInput) = 0 then
+        ExtraInput := Copy(AClient.Incoming, 0, Length(AClient.Incoming));
       AClient.Incoming := ExtraInput;
       AClient.Done := False;
       Result := StepSChannelClientHandshake(AClient);

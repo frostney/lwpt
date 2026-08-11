@@ -4783,10 +4783,10 @@ begin
     if Status = SEC_I_RENEGOTIATE then
     begin
       { TLS 1.3 uses this status for post-handshake KeyUpdate and session
-        tickets. Microsoft requires the SECBUFFER_DATA span modified by
-        DecryptMessage to re-enter AcceptSecurityContext as SECBUFFER_TOKEN;
-        any SECBUFFER_EXTRA ciphertext must follow it so the handshake call
-        can preserve that tail. TLS 1.2 renegotiation remains fatal,
+        tickets. SChannel ordinarily returns the complete post-handshake token
+        and following ciphertext as SECBUFFER_EXTRA. Microsoft documents that
+        EXTRA is not guaranteed, in which case the same modified input buffer
+        must be relabelled as the token. TLS 1.2 renegotiation remains fatal,
         preserving the no-renegotiation contract shared with OpenSSL. }
       if Data.Protocol <> SP_PROT_TLS1_3_SERVER then
       begin
@@ -4795,20 +4795,13 @@ begin
         Exit;
       end;
       SetLength(ExtraInput, 0);
-      for I := 1 to High(Buffers) do
-        if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
-          AppendExtraBytes(ExtraInput, Data.EncryptedInput,
-            Buffers[I].pvBuffer, Buffers[I].cbBuffer);
-      if Length(ExtraInput) = 0 then
-      begin
-        PoisonSChannelServerConnection(AConnection);
-        Result.State := tssError;
-        Exit;
-      end;
-      for I := 1 to High(Buffers) do
+      for I := 0 to High(Buffers) do
         if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
           AppendExtraBytes(ExtraInput, Data.EncryptedInput,
             Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+      if Length(ExtraInput) = 0 then
+        ExtraInput := Copy(Data.EncryptedInput, 0,
+          Length(Data.EncryptedInput));
       Data.EncryptedInput := ExtraInput;
       Data.HandshakeDone := False;
       Data.PostHandshakeInProgress := True;
@@ -4940,6 +4933,18 @@ begin
       Result.State := tssError;
       Exit;
     end;
+    if Data.PendingPlaintextOffset =
+       Integer(Data.StreamSizes.cbMaximumMessage) then
+      raise ETransportSecurityError.CreateFmt(
+        'Second TLS record buffers: stream=%d/%d/%d chunk=%d pending=%d ' +
+        'base=%p 0=%d/%d/%p 1=%d/%d/%p 2=%d/%d/%p',
+        [Data.StreamSizes.cbHeader, Data.StreamSizes.cbMaximumMessage,
+         Data.StreamSizes.cbTrailer, ChunkLength,
+         Data.PendingPlaintext[Data.PendingPlaintextOffset],
+         @Data.RecordBuffer[0],
+         Buffers[0].BufferType, Buffers[0].cbBuffer, Buffers[0].pvBuffer,
+         Buffers[1].BufferType, Buffers[1].cbBuffer, Buffers[1].pvBuffer,
+         Buffers[2].BufferType, Buffers[2].cbBuffer, Buffers[2].pvBuffer]);
     MessageLength := Integer(Buffers[0].cbBuffer) +
       Integer(Buffers[1].cbBuffer) + Integer(Buffers[2].cbBuffer);
     SetLength(Data.RecordBuffer, MessageLength);
