@@ -3212,6 +3212,8 @@ begin
         'Server flight omitted the bundled intermediate; ' +
         'flight certificates: %d; delivered: %s',
         [DeliveredCount, Delivered]);
+    Expect<Boolean>(Pos(INTERMEDIATE_COMMON_NAME, Delivered) > 0).ToBe(True);
+    Expect<Boolean>(DeliveredCount >= 2).ToBe(True);
   finally
     AbortTransportSecurityServer(Connection);
     FreeSChannelClient(Client);
