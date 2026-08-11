@@ -61,8 +61,8 @@ function CurrentTestInventoryMode: string;
 var
   ExpectedExecutable: string;
 begin
-  Result := GetEnvironmentVariable(TEST_INVENTORY_ENVIRONMENT);
-  ExpectedExecutable := GetEnvironmentVariable(
+  Result := SysUtils.GetEnvironmentVariable(TEST_INVENTORY_ENVIRONMENT);
+  ExpectedExecutable := SysUtils.GetEnvironmentVariable(
     TEST_INVENTORY_EXECUTABLE_ENVIRONMENT);
   if (Result = '') or (ExpectedExecutable = '')
      or not SameFileName(ExpandFileName(ParamStr(0)),
