@@ -1210,6 +1210,10 @@ begin
   Tmp := MakeTmpPath(ATmpRoot, 'write');
   EnsureDstDir(ADst);
   AContent.SaveToFile(Tmp);
+  { The common same-filesystem path is one replacement operation and avoids
+    AtomicMoveFile's recoverable sibling backup, whose longer name can exceed
+    the Windows path ceiling in a deep project. Keep its EXDEV fallback. }
+  if AtomicReplaceFile(Tmp, ADst) then Exit;
   if not AtomicMoveFile(Tmp, ADst) then
   begin
     SysUtils.DeleteFile(Tmp);
@@ -1229,6 +1233,7 @@ begin
   finally
     Stream.Free;
   end;
+  if AtomicReplaceFile(Tmp, ADst) then Exit;
   if not AtomicMoveFile(Tmp, ADst) then
   begin
     SysUtils.DeleteFile(Tmp);
