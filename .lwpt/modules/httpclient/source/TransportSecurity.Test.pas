@@ -826,6 +826,15 @@ type
     dwCredFormat: LongWord;
   end;
 
+  PCertContext = ^TCertContext;
+  TCertContext = record
+    dwCertEncodingType: LongWord;
+    pbCertEncoded: PByte;
+    cbCertEncoded: LongWord;
+    pCertInfo: Pointer;
+    hCertStore: Pointer;
+  end;
+
   TSChannelTestClient = record
     Context: TSecHandle;
     Credential: TSecHandle;
@@ -854,6 +863,8 @@ const
   SECBUFFER_STREAM_HEADER = 7;
   SECBUFFER_ATTRMASK = $F0000000;
   SECPKG_ATTR_STREAM_SIZES = 4;
+  SECPKG_ATTR_REMOTE_CERT_CONTEXT = $53;
+  CERT_NAME_SIMPLE_DISPLAY_TYPE = 4;
   SECPKG_CRED_OUTBOUND = 2;
   SEC_E_OK = SECURITY_STATUS($00000000);
   SEC_I_CONTINUE_NEEDED = SECURITY_STATUS($00090312);
@@ -910,6 +921,15 @@ function DeleteSecurityContext(AContext: PCtxtHandle): SECURITY_STATUS;
   stdcall; external 'secur32.dll' name 'DeleteSecurityContext';
 function FreeCredentialsHandle(ACredential: PCredHandle): SECURITY_STATUS;
   stdcall; external 'secur32.dll' name 'FreeCredentialsHandle';
+function CertEnumCertificatesInStore(AStore: Pointer;
+  APreviousContext: PCertContext): PCertContext; stdcall;
+  external 'crypt32.dll' name 'CertEnumCertificatesInStore';
+function CertFreeCertificateContext(ACertificate: PCertContext): LongBool;
+  stdcall; external 'crypt32.dll' name 'CertFreeCertificateContext';
+function CertGetNameStringA(ACertificate: PCertContext; AType: LongWord;
+  AFlags: LongWord; ATypeParameter: Pointer; AName: PAnsiChar;
+  ANameLength: LongWord): LongWord; stdcall;
+  external 'crypt32.dll' name 'CertGetNameStringA';
 
 function TestSecBufferKind(const ABufferType: LongWord): LongWord;
 begin
@@ -1335,6 +1355,47 @@ begin
   SetLength(Result, Length(Buffer));
   if Length(Buffer) > 0 then
     Move(Buffer[0], Result[1], Length(Buffer));
+end;
+
+{ The server's bundled intermediate must reach the peer. On Windows that
+  depends on the credential snapshot keeping the imported PKCS#12 store alive
+  (closed without CERT_CLOSE_STORE_FORCE_FLAG), because SChannel builds the
+  server flight from the leaf's associated store. }
+function SChannelClientReceivedIntermediate(
+  var AClient: TSChannelTestClient): Boolean;
+const
+  INTERMEDIATE_COMMON_NAME = 'TransportSecurity Test Intermediate CA';
+var
+  Certificate: PCertContext;
+  Enumerated: PCertContext;
+  Name: array[0..255] of AnsiChar;
+begin
+  Result := False;
+  Certificate := nil;
+  if QueryContextAttributesW(@AClient.Context,
+    SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Certificate) <> SEC_E_OK then
+    raise Exception.Create('Raw SChannel client has no remote certificate');
+  try
+    if not Assigned(Certificate) or not Assigned(Certificate^.hCertStore) then
+      Exit;
+    Enumerated := CertEnumCertificatesInStore(Certificate^.hCertStore, nil);
+    while Assigned(Enumerated) do
+    begin
+      FillChar(Name, SizeOf(Name), 0);
+      CertGetNameStringA(Enumerated, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nil,
+        @Name[0], Length(Name));
+      if Pos(INTERMEDIATE_COMMON_NAME, StrPas(@Name[0])) > 0 then
+      begin
+        CertFreeCertificateContext(Enumerated);
+        Exit(True);
+      end;
+      Enumerated := CertEnumCertificatesInStore(Certificate^.hCertStore,
+        Enumerated);
+    end;
+  finally
+    if Assigned(Certificate) then
+      CertFreeCertificateContext(Certificate);
+  end;
 end;
 
 procedure ShutdownSChannelClient(var AClient: TSChannelTestClient);
@@ -2795,6 +2856,7 @@ begin
     Expect<Boolean>(Connection.Active).ToBe(True);
     Expect<Boolean>(Observed.SawWantRead).ToBe(True);
     Expect<Boolean>(Observed.SawWantWrite).ToBe(True);
+    Expect<Boolean>(SChannelClientReceivedIntermediate(Client)).ToBe(True);
 
     WriteSChannelClientText(Client, CLIENT_REQUEST);
     PumpSChannelClientCiphertext(Client, Connection);
@@ -2980,6 +3042,10 @@ begin
     TransportSecurityConsumeCiphertext(Connection, Partial);
     Expect<Integer>(TransportSecurityPendingCiphertext(Connection)).ToBe(
       Pending - Partial);
+    Expect<Integer>(TransportSecurityGetCiphertext(Connection,
+      Ciphertext)).ToBe(Pending - Partial);
+    Expect<Boolean>(Ciphertext =
+      Pointer(PtrUInt(OriginalCiphertext) + PtrUInt(Partial))).ToBe(True);
     OutputFlow := TransportSecurityServerOutputFlow(Connection);
     Expect<Integer>(OutputFlow.PendingBytes).ToBe(Pending - Partial);
     Expect<Integer>(OutputFlow.RemainingBytes).ToBe(

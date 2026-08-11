@@ -3261,9 +3261,11 @@ end;
     identical to the BIO-pending accounting.
   - OpenSSL writes records straight into a capacity-sized BIO and can leave a
     record split across the capacity boundary. EncryptMessage produces whole
-    records, so a record that does not fit is queued as a prefix and its tail
-    is retained in RecordBuffer until capacity frees up. Pending output is
-    therefore still exactly OutputCapacity when saturated. }
+    records and AcceptSecurityContext whole tokens, so whichever does not fit
+    is queued as a prefix and its tail is retained in RecordBuffer until
+    capacity frees up. Pending output is therefore still exactly
+    OutputCapacity when saturated, and a certificate flight larger than the
+    configured capacity drains incrementally instead of failing. }
 
 type
   HCERTSTORE = Pointer;
@@ -3730,11 +3732,14 @@ begin
     begin
       if not SChannelSameCertificate(Enumerated, ACertificate) then
       begin
+        { Grow first so the duplicate always has an owner: a failure between
+          duplicating and storing would otherwise leak the context. }
+        SetLength(Chain, Length(Chain) + 1);
+        Chain[High(Chain)] := nil;
         Candidate := CertDuplicateCertificateContext(Enumerated);
         if not Assigned(Candidate) then
           raise ETransportSecurityError.Create(
             'Configured TLS PKCS#12 certificate chain contains an empty entry');
-        SetLength(Chain, Length(Chain) + 1);
         Chain[High(Chain)] := Candidate;
       end;
       Enumerated := CertEnumCertificatesInStore(AStore, Enumerated);
@@ -4007,6 +4012,85 @@ begin
   Move(ABuffer^, AData.Output[ExistingLength], ALength);
 end;
 
+function FlushSChannelServerRecord(const AData: TSChannelServerData): Boolean;
+var
+  Remaining: Integer;
+  Take: Integer;
+begin
+  Result := True;
+  while AData.RecordOffset < Length(AData.RecordBuffer) do
+  begin
+    Remaining := AData.OutputCapacity -
+      SChannelServerPendingCiphertext(AData);
+    if Remaining <= 0 then
+    begin
+      Result := False;
+      Exit;
+    end;
+    Take := Length(AData.RecordBuffer) - AData.RecordOffset;
+    if Take > Remaining then
+      Take := Remaining;
+    if not AppendSChannelServerOutput(AData,
+      @AData.RecordBuffer[AData.RecordOffset], Take) then
+    begin
+      Result := False;
+      Exit;
+    end;
+    Inc(AData.RecordOffset, Take);
+  end;
+  SetLength(AData.RecordBuffer, 0);
+  AData.RecordOffset := 0;
+end;
+
+function SChannelServerStagedBytes(
+  const AData: TSChannelServerData): Integer; inline;
+begin
+  Result := Length(AData.RecordBuffer) - AData.RecordOffset;
+end;
+
+{ Queue a freshly produced SSPI token through the same prefix-staging path
+  application records use. A handshake flight larger than OutputCapacity
+  therefore drains incrementally instead of failing the connection, which is
+  what OpenSSL's bounded write BIO does. }
+function StageSChannelServerToken(const AData: TSChannelServerData;
+  const ABuffer: Pointer; const ALength: Integer): Boolean;
+begin
+  Result := True;
+  if ALength <= 0 then
+    Exit;
+  if SChannelServerStagedBytes(AData) > 0 then
+  begin
+    { A staged record must drain before another can be staged; reaching this
+      would mean an entry-point guard let a caller past pending output. }
+    Result := False;
+    Exit;
+  end;
+  if not Assigned(ABuffer) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  SetLength(AData.RecordBuffer, ALength);
+  AData.RecordOffset := 0;
+  Move(ABuffer^, AData.RecordBuffer[0], ALength);
+  FlushSChannelServerRecord(AData);
+end;
+
+{ True when the caller must drain retained ciphertext before anything else can
+  make progress. Also advances a partially queued staged record, so a token
+  that did not fit in one go keeps moving. }
+function SChannelServerOutputBusy(
+  const AData: TSChannelServerData): Boolean;
+begin
+  Result := SChannelServerPendingCiphertext(AData) > 0;
+  if Result then
+    Exit;
+  if SChannelServerStagedBytes(AData) <= 0 then
+    Exit;
+  FlushSChannelServerRecord(AData);
+  Result := SChannelServerPendingCiphertext(AData) > 0;
+end;
+
 procedure RefreshSChannelServerInputFlow(const AData: TSChannelServerData);
 var
   Buffered: Integer;
@@ -4124,17 +4208,16 @@ begin
     Result := tssError;
     Exit;
   end;
-  if Data.HandshakeDone then
-  begin
-    if SChannelServerPendingCiphertext(Data) > 0 then
-      Result := tssWantWrite
-    else
-      Result := tssDone;
-    Exit;
-  end;
-  if SChannelServerPendingCiphertext(Data) > 0 then
+  { Checked before HandshakeDone: the final flight may still be staged, and
+    reporting tssDone with undelivered bytes would lose them. }
+  if SChannelServerOutputBusy(Data) then
   begin
     Result := tssWantWrite;
+    Exit;
+  end;
+  if Data.HandshakeDone then
+  begin
+    Result := tssDone;
     Exit;
   end;
 
@@ -4174,25 +4257,23 @@ begin
     if Status >= 0 then
       Data.HasContext := True;
 
-    if Status = SEC_E_INCOMPLETE_MESSAGE then
-    begin
-      if Assigned(OutputBuffer.pvBuffer) then
-        FreeContextBuffer(OutputBuffer.pvBuffer);
-      Result := tssWantRead;
-      Exit;
-    end;
-
-    if SecBufferKind(InputBuffers[1].BufferType) = SECBUFFER_EXTRA then
-      PreserveExtraBytes(Data.EncryptedInput, InputBuffers[1].pvBuffer,
-        InputBuffers[1].cbBuffer)
-    else
-      SetLength(Data.EncryptedInput, 0);
-
     TokenQueued := True;
     try
+      if Status = SEC_E_INCOMPLETE_MESSAGE then
+      begin
+        Result := tssWantRead;
+        Exit;
+      end;
+
+      if SecBufferKind(InputBuffers[1].BufferType) = SECBUFFER_EXTRA then
+        PreserveExtraBytes(Data.EncryptedInput, InputBuffers[1].pvBuffer,
+          InputBuffers[1].cbBuffer)
+      else
+        SetLength(Data.EncryptedInput, 0);
+
       if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) then
-        TokenQueued := AppendSChannelServerOutput(Data,
-          OutputBuffer.pvBuffer, OutputBuffer.cbBuffer);
+        TokenQueued := StageSChannelServerToken(Data, OutputBuffer.pvBuffer,
+          OutputBuffer.cbBuffer);
     finally
       if Assigned(OutputBuffer.pvBuffer) then
         FreeContextBuffer(OutputBuffer.pvBuffer);
@@ -4216,7 +4297,8 @@ begin
       end;
       Data.HandshakeDone := True;
       AConnection.Active := True;
-      if SChannelServerPendingCiphertext(Data) > 0 then
+      if (SChannelServerPendingCiphertext(Data) > 0) or
+         (SChannelServerStagedBytes(Data) > 0) then
         Result := tssWantWrite
       else
         Result := tssDone;
@@ -4230,7 +4312,8 @@ begin
       Exit;
     end;
 
-    if SChannelServerPendingCiphertext(Data) > 0 then
+    if (SChannelServerPendingCiphertext(Data) > 0) or
+       (SChannelServerStagedBytes(Data) > 0) then
     begin
       Result := tssWantWrite;
       Exit;
@@ -4260,7 +4343,7 @@ begin
   if Length(Data.PendingPlaintext) > 0 then
     raise ETransportSecurityError.Create(
       'TLS write retry is pending; resume it before reading');
-  if SChannelServerPendingCiphertext(Data) > 0 then
+  if SChannelServerOutputBusy(Data) then
   begin
     Result.State := tssWantWrite;
     Exit;
@@ -4358,36 +4441,6 @@ begin
     if Status = SEC_I_CONTEXT_EXPIRED then
       Data.PeerClosed := True;
   until False;
-end;
-
-function FlushSChannelServerRecord(const AData: TSChannelServerData): Boolean;
-var
-  Remaining: Integer;
-  Take: Integer;
-begin
-  Result := True;
-  while AData.RecordOffset < Length(AData.RecordBuffer) do
-  begin
-    Remaining := AData.OutputCapacity -
-      SChannelServerPendingCiphertext(AData);
-    if Remaining <= 0 then
-    begin
-      Result := False;
-      Exit;
-    end;
-    Take := Length(AData.RecordBuffer) - AData.RecordOffset;
-    if Take > Remaining then
-      Take := Remaining;
-    if not AppendSChannelServerOutput(AData,
-      @AData.RecordBuffer[AData.RecordOffset], Take) then
-    begin
-      Result := False;
-      Exit;
-    end;
-    Inc(AData.RecordOffset, Take);
-  end;
-  SetLength(AData.RecordBuffer, 0);
-  AData.RecordOffset := 0;
 end;
 
 function WriteSChannelServer(var AConnection: TTransportSecurityConnection;
@@ -4550,7 +4603,7 @@ begin
   try
     if (Status = SEC_E_OK) or (Status = SEC_I_CONTINUE_NEEDED) or
        (Status = SEC_I_CONTEXT_EXPIRED) then
-      TokenQueued := AppendSChannelServerOutput(AData, OutputBuffer.pvBuffer,
+      TokenQueued := StageSChannelServerToken(AData, OutputBuffer.pvBuffer,
         OutputBuffer.cbBuffer)
     else
       TokenQueued := False;
@@ -4584,7 +4637,7 @@ begin
     Result := tssError;
     Exit;
   end;
-  if SChannelServerPendingCiphertext(Data) > 0 then
+  if SChannelServerOutputBusy(Data) then
   begin
     Result := tssWantWrite;
     Exit;
@@ -4609,7 +4662,8 @@ begin
       Result := tssError;
       Exit;
     end;
-    if SChannelServerPendingCiphertext(Data) > 0 then
+    if (SChannelServerPendingCiphertext(Data) > 0) or
+       (SChannelServerStagedBytes(Data) > 0) then
     begin
       Result := tssWantWrite;
       Exit;

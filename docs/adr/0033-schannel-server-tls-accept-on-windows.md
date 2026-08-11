@@ -72,13 +72,16 @@ behave the same.
 **Output granularity.** OpenSSL writes records straight into a
 capacity-sized BIO pair and will happily leave a record split across the
 capacity boundary, so a saturated output queue holds exactly `OutputCapacity`
-bytes. `EncryptMessage` produces whole records. The backend therefore encrypts
-into a one-record staging buffer and queues as much of it as fits, retaining
-the tail until capacity frees up. Pending output is still exactly
-`OutputCapacity` when saturated, and `TransportSecurityServerWrite` still
-reports `BytesProcessed` only once the entire caller buffer has been encrypted
-and queued — 0 with `tssWantWrite` until then, exactly like a partially
-completed `SSL_write`.
+bytes. `EncryptMessage` produces whole records and `AcceptSecurityContext`
+whole tokens. The backend therefore stages one record or token at a time and
+queues as much of it as fits, retaining the tail until capacity frees up.
+Pending output is still exactly `OutputCapacity` when saturated, and
+`TransportSecurityServerWrite` still reports `BytesProcessed` only once the
+entire caller buffer has been encrypted and queued — 0 with `tssWantWrite`
+until then, exactly like a partially completed `SSL_write`. Handshake and
+shutdown tokens use the same staging path, so a certificate flight larger than
+`OutputCapacity` drains incrementally rather than failing the connection,
+which is what OpenSSL's bounded write BIO does.
 
 ### Renegotiation
 
