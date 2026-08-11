@@ -928,8 +928,6 @@ type
     Outgoing: TBytes;
     PeerClosed: Boolean;
     Plaintext: TBytes;
-    PostHandshakeInProgress: Boolean;
-    PostHandshakeTail: TBytes;
     StreamSizes: TSecPkgContextStreamSizes;
   end;
 
@@ -1165,34 +1163,7 @@ begin
   SetLength(AClient.Incoming, 0);
   SetLength(AClient.Outgoing, 0);
   SetLength(AClient.Plaintext, 0);
-  SetLength(AClient.PostHandshakeTail, 0);
   FillChar(AClient, SizeOf(AClient), 0);
-end;
-
-function TestTlsRecordLength(const ABuffer: TBytes): Integer;
-begin
-  Result := 0;
-  if Length(ABuffer) < 5 then
-    Exit;
-  Result := 5 + (Integer(ABuffer[3]) shl 8) + Integer(ABuffer[4]);
-  if Result > Length(ABuffer) then
-    Result := 0;
-end;
-
-procedure RestoreSChannelClientPostHandshakeTail(
-  var AClient: TSChannelTestClient);
-var
-  ExistingLength: Integer;
-  TailLength: Integer;
-begin
-  TailLength := Length(AClient.PostHandshakeTail);
-  if TailLength <= 0 then
-    Exit;
-  ExistingLength := Length(AClient.Incoming);
-  SetLength(AClient.Incoming, ExistingLength + TailLength);
-  Move(AClient.PostHandshakeTail[0], AClient.Incoming[ExistingLength],
-    TailLength);
-  SetLength(AClient.PostHandshakeTail, 0);
 end;
 
 function StepSChannelClientHandshake(
@@ -1287,11 +1258,6 @@ begin
       @AClient.StreamSizes) <> SEC_E_OK then
       raise Exception.Create('Raw SChannel client stream sizes unavailable');
     AClient.Done := True;
-    if AClient.PostHandshakeInProgress then
-    begin
-      RestoreSChannelClientPostHandshakeTail(AClient);
-      AClient.PostHandshakeInProgress := False;
-    end;
     Result := tssDone;
     Exit;
   end;
@@ -1477,16 +1443,9 @@ var
   I: Integer;
   QualityOfProtection: LongWord;
   Status: SECURITY_STATUS;
-  TokenLength: Integer;
 begin
   SetLength(ABuffer, 0);
   repeat
-    if AClient.PostHandshakeInProgress then
-    begin
-      Result := StepSChannelClientHandshake(AClient);
-      if Result <> tssDone then
-        Exit;
-    end;
     if Length(AClient.Plaintext) > 0 then
     begin
       ABuffer := AClient.Plaintext;
@@ -1539,41 +1498,34 @@ begin
             Buffers[I].cbBuffer);
       if Length(ExtraInput) = 0 then
         ExtraInput := Copy(AClient.Incoming, 0, Length(AClient.Incoming));
-      TokenLength := TestTlsRecordLength(ExtraInput);
-      if TokenLength <= 0 then
-      begin
-        Result := tssError;
-        Exit;
-      end;
-      AClient.PostHandshakeTail := Copy(ExtraInput, TokenLength,
-        Length(ExtraInput) - TokenLength);
-      AClient.Incoming := Copy(ExtraInput, 0, TokenLength);
-      AClient.PostHandshakeInProgress := True;
+      AClient.Incoming := ExtraInput;
       AClient.Done := False;
       Result := StepSChannelClientHandshake(AClient);
       if Result <> tssDone then
         Exit;
       Continue;
     end;
-    SetLength(ExtraInput, 0);
-    for I := 1 to High(Buffers) do
-      if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
-        AppendTestBytes(ExtraInput, Buffers[I].pvBuffer, Buffers[I].cbBuffer);
-    AClient.Incoming := ExtraInput;
     if (Status <> SEC_E_OK) and (Status <> SEC_I_CONTEXT_EXPIRED) then
     begin
       Result := tssError;
       Exit;
     end;
 
-    { From index 1: on SEC_I_CONTEXT_EXPIRED DecryptMessage leaves the
-      descriptor untouched, so buffer 0 still carries the caller-supplied
-      SECBUFFER_DATA label over the whole ciphertext. }
+    { Copy plaintext while Incoming still owns the in-place DecryptMessage
+      spans. Replacing Incoming with the preserved tail first would leave the
+      returned DATA pointer dangling. From index 1: on
+      SEC_I_CONTEXT_EXPIRED buffer 0 still carries the caller's label. }
     if Status = SEC_E_OK then
       for I := 1 to High(Buffers) do
         if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
           AppendTestBytes(AClient.Plaintext, Buffers[I].pvBuffer,
             Buffers[I].cbBuffer);
+
+    SetLength(ExtraInput, 0);
+    for I := 1 to High(Buffers) do
+      if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendTestBytes(ExtraInput, Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+    AClient.Incoming := ExtraInput;
     if Status = SEC_I_CONTEXT_EXPIRED then
       AClient.PeerClosed := True;
   until False;

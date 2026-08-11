@@ -3489,7 +3489,6 @@ type
     OutputOffset: Integer;
     PeerClosed: Boolean;
     PostHandshakeInProgress: Boolean;
-    PostHandshakeTail: TBytes;
     PendingPlaintext: TBytes;
     PendingPlaintextOffset: Integer;
     Plaintext: TBytes;
@@ -4445,8 +4444,7 @@ var
 begin
   if not Assigned(AData) then
     Exit;
-  Buffered := Length(AData.EncryptedInput) +
-    Length(AData.PostHandshakeTail);
+  Buffered := Length(AData.EncryptedInput);
   if Buffered > AData.InputHighWatermark then
     Buffered := AData.InputHighWatermark;
   AData.InputBuffered := Buffered;
@@ -4456,33 +4454,6 @@ begin
   else
     AData.InputBackpressured := AData.InputBuffered >=
       AData.InputHighWatermark;
-end;
-
-function SChannelTlsRecordLength(const ABuffer: TBytes): Integer;
-begin
-  Result := 0;
-  if Length(ABuffer) < 5 then
-    Exit;
-  Result := 5 + (Integer(ABuffer[3]) shl 8) + Integer(ABuffer[4]);
-  if Result > Length(ABuffer) then
-    Result := 0;
-end;
-
-procedure RestoreSChannelServerPostHandshakeTail(
-  const AData: TSChannelServerData);
-var
-  ExistingLength: Integer;
-  TailLength: Integer;
-begin
-  TailLength := Length(AData.PostHandshakeTail);
-  if TailLength <= 0 then
-    Exit;
-  ExistingLength := Length(AData.EncryptedInput);
-  SetLength(AData.EncryptedInput, ExistingLength + TailLength);
-  Move(AData.PostHandshakeTail[0], AData.EncryptedInput[ExistingLength],
-    TailLength);
-  SetLength(AData.PostHandshakeTail, 0);
-  RefreshSChannelServerInputFlow(AData);
 end;
 
 function SChannelServerRequestFlags: LongWord;
@@ -4557,18 +4528,8 @@ begin
   end;
 
   ExistingLength := Length(Data.EncryptedInput);
-  if Data.PostHandshakeInProgress and
-     (Length(Data.PostHandshakeTail) > 0) then
-  begin
-    ExistingLength := Length(Data.PostHandshakeTail);
-    SetLength(Data.PostHandshakeTail, ExistingLength + AcceptedLength);
-    Move(ABuffer^, Data.PostHandshakeTail[ExistingLength], AcceptedLength);
-  end
-  else
-  begin
-    SetLength(Data.EncryptedInput, ExistingLength + AcceptedLength);
-    Move(ABuffer^, Data.EncryptedInput[ExistingLength], AcceptedLength);
-  end;
+  SetLength(Data.EncryptedInput, ExistingLength + AcceptedLength);
+  Move(ABuffer^, Data.EncryptedInput[ExistingLength], AcceptedLength);
   Inc(Data.InputAccepted, QWord(AcceptedLength));
   Result := AcceptedLength;
   RefreshSChannelServerInputFlow(Data);
@@ -4604,11 +4565,7 @@ begin
   end;
   if Data.HandshakeDone then
   begin
-    if Data.PostHandshakeInProgress then
-    begin
-      RestoreSChannelServerPostHandshakeTail(Data);
-      Data.PostHandshakeInProgress := False;
-    end;
+    Data.PostHandshakeInProgress := False;
     Result := tssDone;
     Exit;
   end;
@@ -4699,11 +4656,6 @@ begin
       Data.Protocol := ConnectionInfo.dwProtocol;
       Data.HandshakeDone := True;
       AConnection.Active := True;
-      if Data.PostHandshakeInProgress then
-      begin
-        RestoreSChannelServerPostHandshakeTail(Data);
-        Data.PostHandshakeInProgress := False;
-      end;
       if (SChannelServerPendingCiphertext(Data) > 0) or
          (SChannelServerStagedBytes(Data) > 0) then
         Result := tssWantWrite
@@ -4742,7 +4694,6 @@ var
   QualityOfProtection: LongWord;
   ReadLength: Integer;
   Status: SECURITY_STATUS;
-  TokenLength: Integer;
 begin
   Result.State := tssError;
   Result.BytesProcessed := 0;
@@ -4851,19 +4802,9 @@ begin
       if Length(ExtraInput) = 0 then
         ExtraInput := Copy(Data.EncryptedInput, 0,
           Length(Data.EncryptedInput));
-      TokenLength := SChannelTlsRecordLength(ExtraInput);
-      if TokenLength <= 0 then
-      begin
-        PoisonSChannelServerConnection(AConnection);
-        Result.State := tssError;
-        Exit;
-      end;
-      Data.PostHandshakeTail := Copy(ExtraInput, TokenLength,
-        Length(ExtraInput) - TokenLength);
-      Data.EncryptedInput := Copy(ExtraInput, 0, TokenLength);
+      Data.EncryptedInput := ExtraInput;
       Data.HandshakeDone := False;
       Data.PostHandshakeInProgress := True;
-      RefreshSChannelServerInputFlow(Data);
       HandshakeState := HandshakeSChannelServer(AConnection);
       if HandshakeState <> tssDone then
       begin
@@ -4872,16 +4813,6 @@ begin
       end;
       Continue;
     end;
-
-    { SECBUFFER_EXTRA points into EncryptedInput; some SChannel builds report
-      only cbBuffer, so preserve the input tail before replacing the array
-      that owns those bytes. }
-    SetLength(ExtraInput, 0);
-    for I := 1 to High(Buffers) do
-      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
-        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
-          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
-    Data.EncryptedInput := ExtraInput;
 
     if (Status <> SEC_E_OK) and (Status <> SEC_I_CONTEXT_EXPIRED) then
     begin
@@ -4892,17 +4823,24 @@ begin
 
     SetLength(Data.Plaintext, 0);
     Data.PlaintextOffset := 0;
-    { Harvest from index 1. DecryptMessage relabels the descriptor in place
-      on success — [0] becomes SECBUFFER_STREAM_HEADER, [1] the plaintext —
-      but on SEC_I_CONTEXT_EXPIRED it returns without touching the buffers,
-      so [0] still carries the caller-supplied SECBUFFER_DATA label over the
-      whole ciphertext. Scanning from 0 therefore turns a peer close_notify
-      into a payload of raw ciphertext. }
+    { Copy plaintext while EncryptedInput still owns the in-place
+      DecryptMessage spans. Replacing it with the preserved tail first would
+      leave the returned DATA pointer dangling. Harvest from index 1 because
+      SEC_I_CONTEXT_EXPIRED leaves buffer 0 carrying the caller's label. }
     if Status = SEC_E_OK then
       for I := 1 to High(Buffers) do
         if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
           AppendBytes(Data.Plaintext, Buffers[I].pvBuffer,
             Buffers[I].cbBuffer);
+
+    { SECBUFFER_EXTRA also points into EncryptedInput; preserve it only after
+      harvesting every plaintext span and before replacing its owner. }
+    SetLength(ExtraInput, 0);
+    for I := 1 to High(Buffers) do
+      if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+        AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+          Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+    Data.EncryptedInput := ExtraInput;
 
     if Status = SEC_I_CONTEXT_EXPIRED then
       Data.PeerClosed := True;
