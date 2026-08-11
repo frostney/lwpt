@@ -81,6 +81,7 @@ type
     procedure TestBuildEntryTraversalNameRootOnly;
     procedure TestBuildDependsMustBeStringArray;
     procedure TestBuildFlagsMustBeStringArrayAndAreRootOnly;
+    procedure TestTestFlagsMustBeStringArrayAndAreRootOnly;
     procedure TestUndeclaredCompilerProfilesAreRejected;
     procedure TestArrayCannotBecomeTablePath;
     procedure TestLegacyRunnableFieldsAreRejected;
@@ -1063,6 +1064,62 @@ begin
   Expect<Integer>(Length(Man.BuildEntries[0].Flags)).ToBe(0);
 end;
 
+procedure TLoadManifestValidation.
+  TestTestFlagsMustBeStringArrayAndAreRootOnly;
+const
+  VALID_FLAGS =
+    '[package]'#10 +
+    'name = "valid-test-flags"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[test]'#10 +
+    'flags = ["-dFIRST", "-k-ld_classic", "-dFIRST"]'#10;
+  SCALAR_FLAGS =
+    '[package]'#10 +
+    'name = "scalar-test-flags"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[test]'#10 +
+    'flags = "-dAPP"'#10;
+  MIXED_FLAGS =
+    '[package]'#10 +
+    'name = "mixed-test-flags"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[test]'#10 +
+    'flags = ["-dAPP", 1]'#10;
+  EMPTY_FLAGS =
+    '[package]'#10 +
+    'name = "empty-test-flags"'#10 +
+    'version = "0.1.0"'#10 +
+    ''#10 +
+    '[test]'#10 +
+    'flags = [""]'#10;
+var
+  Man: TManifest;
+  Path: string;
+begin
+  Man := LoadManifest(WriteManifest('valid-test-flags', VALID_FLAGS));
+  Expect<Integer>(Length(Man.TestFlags)).ToBe(3);
+  Expect<string>(Man.TestFlags[0]).ToBe('-dFIRST');
+  Expect<string>(Man.TestFlags[1]).ToBe('-k-ld_classic');
+  Expect<string>(Man.TestFlags[2]).ToBe('-dFIRST');
+
+  ExpectManifestLoadError(
+    WriteManifest('scalar-test-flags', SCALAR_FLAGS),
+    'test.flags must be an array of strings', Self);
+  Path := WriteManifest('mixed-test-flags', MIXED_FLAGS);
+  ExpectManifestLoadError(Path, 'test.flags[1] must be a string', Self);
+  ExpectManifestLoadError(
+    WriteManifest('empty-test-flags', EMPTY_FLAGS),
+    'test.flags[0] must not be empty', Self);
+
+  { A dependency never compiles tests in the consuming project. Its test
+    flags are therefore dropped without validation, matching build flags. }
+  Man := LoadManifest(Path, False);
+  Expect<Integer>(Length(Man.TestFlags)).ToBe(0);
+end;
+
 procedure TLoadManifestValidation.TestUndeclaredCompilerProfilesAreRejected;
 const
   UNKNOWN_DEFAULT =
@@ -1190,6 +1247,8 @@ begin
     TestBuildDependsMustBeStringArray);
   Test('[build] flags are strict root-owned string arrays',
     TestBuildFlagsMustBeStringArrayAndAreRootOnly);
+  Test('[test] flags are strict root-owned string arrays',
+    TestTestFlagsMustBeStringArrayAndAreRootOnly);
   Test('compiler defaults and build entries name declared profiles',
     TestUndeclaredCompilerProfilesAreRejected);
   Test('value arrays cannot become table paths',

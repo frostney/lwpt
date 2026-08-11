@@ -32,7 +32,7 @@ function  ResolveRunnableCommand(const AProjectRoot,
   ACommand: string): string;
 
 function  CreatePascalCompilerProcess(const ASrcFile: string;
-  const AUnitPaths: array of string; out AOutBin: string;
+  const AUnitPaths, AExtraArguments: array of string; out AOutBin: string;
   out ARequest: TLWPTBuildRequest; const ABuildRoot: string;
   const ADriver: TLWPTCompilerDriver): TProcess;
 procedure AppendCompilerEnvironmentSearchPaths(
@@ -94,7 +94,7 @@ begin
 end;
 
 function CreatePascalCompilerProcess(const ASrcFile: string;
-  const AUnitPaths: array of string; out AOutBin: string;
+  const AUnitPaths, AExtraArguments: array of string; out AOutBin: string;
   out ARequest: TLWPTBuildRequest; const ABuildRoot: string;
   const ADriver: TLWPTCompilerDriver): TProcess;
 var
@@ -148,6 +148,9 @@ begin
       ARequest.Inputs.IncludePaths[Length(AUnitPaths) + i] :=
         ConfigurationUnitPaths[i];
     end;
+    SetLength(ARequest.Inputs.ExtraArguments, Length(AExtraArguments));
+    for i := 0 to High(AExtraArguments) do
+      ARequest.Inputs.ExtraArguments[i] := AExtraArguments[i];
     AppendCompilerEnvironmentSearchPaths(ARequest.Inputs.UnitPaths,
       ARequest.Inputs.IncludePaths);
     ARequest.Outputs.ExecutableDirectory := BuildDir;
@@ -195,7 +198,7 @@ begin
   ARawOutput := '';
   Driver := TLWPTFPCCompilerDriver.Create;
   try
-    P := CreatePascalCompilerProcess(ASrcFile, AUnitPaths, AOutBin,
+    P := CreatePascalCompilerProcess(ASrcFile, AUnitPaths, [], AOutBin,
       Request, ABuildRoot, Driver);
     try
       P.Options := [poUsePipes, poStderrToOutPut];
