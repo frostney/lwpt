@@ -1486,9 +1486,24 @@ begin
     end;
     if Status = SEC_I_RENEGOTIATE then
     begin
-      { InitializeSecurityContext must receive the same buffer modified by
-        DecryptMessage, relabelled as a token. StepSChannelClientHandshake
-        does that; do not replace it with SECBUFFER_EXTRA first. }
+      { InitializeSecurityContext must receive the SECBUFFER_DATA span
+        modified by DecryptMessage, relabelled as a token, followed by any
+        SECBUFFER_EXTRA ciphertext. }
+      SetLength(ExtraInput, 0);
+      for I := 1 to High(Buffers) do
+        if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
+          AppendTestBytes(ExtraInput, Buffers[I].pvBuffer,
+            Buffers[I].cbBuffer);
+      if Length(ExtraInput) = 0 then
+      begin
+        Result := tssError;
+        Exit;
+      end;
+      for I := 1 to High(Buffers) do
+        if TestSecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+          AppendTestBytes(ExtraInput, Buffers[I].pvBuffer,
+            Buffers[I].cbBuffer);
+      AClient.Incoming := ExtraInput;
       AClient.Done := False;
       Result := StepSChannelClientHandshake(AClient);
       if Result <> tssDone then

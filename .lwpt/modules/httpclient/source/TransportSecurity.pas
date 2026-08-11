@@ -4783,17 +4783,33 @@ begin
     if Status = SEC_I_RENEGOTIATE then
     begin
       { TLS 1.3 uses this status for post-handshake KeyUpdate and session
-        tickets. Microsoft requires the same buffer modified by DecryptMessage
-        to re-enter AcceptSecurityContext as SECBUFFER_TOKEN; replacing it
-        with only SECBUFFER_EXTRA would discard the post-handshake message.
-        TLS 1.2 renegotiation remains fatal, preserving the no-renegotiation
-        contract shared with the OpenSSL backend. }
+        tickets. Microsoft requires the SECBUFFER_DATA span modified by
+        DecryptMessage to re-enter AcceptSecurityContext as SECBUFFER_TOKEN;
+        any SECBUFFER_EXTRA ciphertext must follow it so the handshake call
+        can preserve that tail. TLS 1.2 renegotiation remains fatal,
+        preserving the no-renegotiation contract shared with OpenSSL. }
       if Data.Protocol <> SP_PROT_TLS1_3_SERVER then
       begin
         PoisonSChannelServerConnection(AConnection);
         Result.State := tssError;
         Exit;
       end;
+      SetLength(ExtraInput, 0);
+      for I := 1 to High(Buffers) do
+        if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_DATA then
+          AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+            Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+      if Length(ExtraInput) = 0 then
+      begin
+        PoisonSChannelServerConnection(AConnection);
+        Result.State := tssError;
+        Exit;
+      end;
+      for I := 1 to High(Buffers) do
+        if SecBufferKind(Buffers[I].BufferType) = SECBUFFER_EXTRA then
+          AppendExtraBytes(ExtraInput, Data.EncryptedInput,
+            Buffers[I].pvBuffer, Buffers[I].cbBuffer);
+      Data.EncryptedInput := ExtraInput;
       Data.HandshakeDone := False;
       Data.PostHandshakeInProgress := True;
       HandshakeState := HandshakeSChannelServer(AConnection);
