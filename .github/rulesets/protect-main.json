@@ -41,8 +41,7 @@
         "do_not_enforce_on_create": false,
         "required_status_checks": [
           {
-            "context": "delivery-admission",
-            "integration_id": 15368
+            "context": "delivery-admission"
           }
         ]
       }

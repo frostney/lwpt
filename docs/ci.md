@@ -36,10 +36,14 @@ Trigger split, mirroring GocciaScript's CI shape:
 
 Repository rules make these contracts enforceable. The desired main ruleset is
 versioned at `.github/rulesets/protect-main.json`: it requires resolved review
-threads and `delivery-admission` from GitHub Actions integration ID `15368`.
-The integration binding means a same-named status or check from another user or
-app cannot satisfy the rule. Activate that payload only after the producer and
-finalizer exist on the default branch:
+threads and the `delivery-admission` context. The trusted default-branch
+controller still validates the app, exact external proof identity, head, and
+topology before it updates a check; PR code has no check-write permission.
+Binding this context to GitHub Actions integration ID `15368` is incompatible
+with controller-created checks made through `GITHUB_TOKEN`: GitHub leaves a
+second required status pending even though the app-owned check is successful.
+Activate this payload only after the producer and finalizer exist on the
+default branch:
 
 ```sh
 gh api --method PUT repos/frostney/lwpt/rulesets/18086289 \
@@ -49,13 +53,8 @@ gh api --method PUT repos/frostney/lwpt/rulesets/18086289 \
 The public
 [`delivery-admission` sandbox](https://github.com/frostney/lwpt-delivery-admission-spike/pull/1)
 exercised pending, duplicate, stale-head, failure, cancellation, watchdog, and
-recovery behavior. Its app-identity probe at
-[`9b3afd4`](https://github.com/frostney/lwpt-delivery-admission-spike/commit/9b3afd43f44fb8c90c1a72aec41deafc8f09e81e)
-left the PR blocked when the
-[app-owned check failed](https://github.com/frostney/lwpt-delivery-admission-spike/actions/runs/30938047359)
-even though a separate same-named commit status reported success; the
-[`af05968` recovery](https://github.com/frostney/lwpt-delivery-admission-spike/actions/runs/30938166552)
-restored a successful app-owned proof.
+recovery behavior. It had no active ruleset, so it did not prove that an
+app-bound required context accepts a controller-created `GITHUB_TOKEN` check.
 
 A separate release-tag ruleset restricts SemVer tag creation to the maintainer
 and rejects tag updates or deletion. The protected `release` environment owns
