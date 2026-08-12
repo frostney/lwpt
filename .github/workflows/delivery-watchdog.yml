@@ -12,7 +12,7 @@ on:
         default: 120
 
 permissions:
-  actions: read
+  actions: write
   checks: write
   contents: read
   pull-requests: write

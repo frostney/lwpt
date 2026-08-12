@@ -51,7 +51,7 @@ class RepositoryPolicyTests(unittest.TestCase):
 
         self.assertIn("GH_TOKEN: ${{ github.token }}", transition)
         self.assertIn("cron: '*/15 * * * *'", watchdog)
-        self.assertIn("actions: read", watchdog)
+        self.assertIn("actions: write", watchdog)
         self.assertIn("Reconcile managed delivery and orphaned proofs", watchdog)
         self.assertIn("controller.py observe", watchdog)
         self.assertLess(
