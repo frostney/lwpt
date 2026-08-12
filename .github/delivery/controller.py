@@ -497,6 +497,7 @@ class Controller:
             check
             for check in self.github.check_runs(expected_head)
             if self.owned(check, DELIVERY_CHECK)
+            and not check.get("external_id", "").startswith("delivery:v1:")
         ]
         check = max(checks, key=lambda item: item["id"]) if checks else None
         if (

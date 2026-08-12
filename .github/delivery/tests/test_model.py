@@ -229,17 +229,17 @@ class DeliveryModelTests(unittest.TestCase):
         github = FakeCheckGitHub(
             {
                 "id": 99,
-                "name": "delivery-admission",
+                "name": "full-ci",
                 "app": {"slug": "some-other-app"},
-                "external_id": f"delivery:v1:41:{'1' * 40}:{'a' * 64}",
+                "external_id": f"full-ci:v1:41:{'1' * 40}:{'a' * 64}",
             }
         )
         controller = Controller(github)
         with self.assertRaisesRegex(DeliveryError, "not the expected app-owned"):
             controller.require_owned_check(
                 99,
-                "delivery-admission",
-                f"delivery:v1:41:{'1' * 40}:{'a' * 64}",
+                "full-ci",
+                f"full-ci:v1:41:{'1' * 40}:{'a' * 64}",
             )
         self.assertEqual([], github.updated)
 
@@ -253,7 +253,15 @@ class DeliveryModelTests(unittest.TestCase):
                 "status": "completed",
                 "conclusion": "success",
                 "app": {"slug": "github-actions"},
-            }
+            },
+            {
+                "id": 2,
+                "name": "delivery-admission",
+                "status": "completed",
+                "conclusion": "failure",
+                "external_id": f"delivery:v1:41:{head}:{'a' * 64}",
+                "app": {"slug": "github-actions"},
+            },
         ]
         self.assertEqual(
             "success", Controller(github).require_delivery_success(41, head)["conclusion"]
