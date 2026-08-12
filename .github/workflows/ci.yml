@@ -457,33 +457,14 @@ jobs:
           if [ -z "$FPC_BIN" ]; then echo "::error::Chocolatey FPC install: fpc.exe not found"; exit 1; fi
           echo "Using FPC at $FPC_BIN"
           echo "$(cygpath -w "$(dirname "$FPC_BIN")")" >> "$GITHUB_PATH"
-          FPC_BIN_WIN=$(cygpath -w "$FPC_BIN")
-          if [ "${{ matrix.target }}" = "x86_64-win64" ]; then
-            TARGET_FPC=""
-            for candidate_root in /c/tools/freepascal /c/fpc; do
-              if [ -d "$candidate_root" ]; then
-                TARGET_FPC=$(find "$candidate_root" \
-                  \( -iname ppcrossx64.exe -o -iname ppcx64.exe \) \
-                  -type f 2>/dev/null | head -1)
-                if [ -n "$TARGET_FPC" ]; then break; fi
-              fi
-            done
-            if [ -z "$TARGET_FPC" ]; then
-              echo "::error::Chocolatey FPC install: x86_64 compiler not found"
-              exit 1
-            fi
-            LWPT_FPC_VALUE=$(cygpath -w "$TARGET_FPC")
-            FPC_PROBE="$TARGET_FPC"
-            FPC_TARGET_ARGS=()
-            EXPECTED_CPU=x86_64
-            EXPECTED_OS=win64
-          else
-            LWPT_FPC_VALUE="$FPC_BIN_WIN"
-            FPC_PROBE="$FPC_BIN"
-            FPC_TARGET_ARGS=()
-            EXPECTED_CPU=i386
-            EXPECTED_OS=win32
-          fi
+          # Chocolatey currently installs i386 FPC. It is the native test
+          # compiler on both Windows runners; x64 Windows executes its output
+          # under WoW64 while the downloaded LWPT artifact keeps its own target.
+          LWPT_FPC_VALUE=$(cygpath -w "$FPC_BIN")
+          FPC_PROBE="$FPC_BIN"
+          FPC_TARGET_ARGS=()
+          EXPECTED_CPU=i386
+          EXPECTED_OS=win32
           ACTUAL_CPU=$("$FPC_PROBE" "${FPC_TARGET_ARGS[@]}" -iTP | tr -d '\r')
           ACTUAL_OS=$("$FPC_PROBE" "${FPC_TARGET_ARGS[@]}" -iTO | tr -d '\r')
           if [ "$ACTUAL_CPU" != "$EXPECTED_CPU" ] || [ "$ACTUAL_OS" != "$EXPECTED_OS" ]; then
@@ -502,7 +483,7 @@ jobs:
           # OpenSSL` any more — both TLS directions are native SChannel.
           for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process fcl-net fcl-json openssl paszlib hash; do
             UNIT_PATH=""
-            for unit_target in "${{ matrix.target }}" i386-win32 x86_64-win64; do
+            for unit_target in i386-win32 x86_64-win64; do
               UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
               if [ -n "$UNIT_PATH" ]; then break; fi
             done
