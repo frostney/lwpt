@@ -444,7 +444,6 @@ jobs:
       - name: Install FPC (choco)
         if: matrix.fpc-install == 'choco'
         run: |
-          set -x
           choco install -y freepascal
           # Add the FPC bin to PATH for subsequent steps. Chocolatey has
           # used both C:\fpc and C:\tools\freepascal layouts over time.
