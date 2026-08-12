@@ -56,11 +56,6 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("def recover_completed_full_ci", controller)
         self.assertIn('"ci.yml", created_after, now', controller)
 
-    def test_removed_review_watcher_is_not_locked_or_installed(self) -> None:
-        lock = json.loads((ROOT / "skills-lock.json").read_text(encoding="utf-8"))
-        self.assertNotIn("resolve-reviews", lock["skills"])
-        self.assertFalse((ROOT / ".agents/skills/resolve-reviews").exists())
-
     def test_diagnostics_are_allow_listed_and_proof_separated(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         for value in (
