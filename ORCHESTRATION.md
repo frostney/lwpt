@@ -44,7 +44,7 @@ conditional exact-SHA promotion proof.
 | Run a native diagnostic | `diagnostic` | `pr_number`, `expected_head`, `diagnostic_target`, `diagnostic_selector` | No readiness mutation | Non-proof `diagnostic/...` run for one allow-listed native slice |
 | Prove full CI | `full-ci` | `pr_number` as candidate, `expected_head` | No readiness label; frozen singleton or prefix dispatched | Successful exact-head `full-ci` with topology digest |
 | Admit merge | `merge` | `pr_number`, `expected_head`, `candidate_pr_number` | `merge:ready`; validated draft may become ready | Current CI, review, replies, threads, and applicable full-CI proof |
-| Return to waiting | `reset` | `pr_number`, `expected_head` | Readiness labels cleared; managed/full-required policy retained | Automatic PR jobs remain the current-head proof |
+| Return to waiting | `reset` | `pr_number`, `expected_head` | Readiness labels cleared; PR returned to draft | Native check history remains immutable evidence |
 
 `delivery:managed`, native stack membership, and `ci:full-required` are
 independent dimensions. A managed PR may be standalone. A native stack may be

@@ -92,13 +92,17 @@ class DiagnosticGitHub(FakeGitHub):
         self.checks: dict[int, dict] = {}
         self.updated: list[tuple[int, dict]] = []
         self.rerun_ids: list[int] = []
+        self.workflow_lookups: list[tuple[str, str, int]] = []
         self.labels: list[tuple[int, list[str]]] = []
         self.removed_labels: list[tuple[int, str]] = []
+        self.draft_ids: list[str] = []
 
     def pull(self, number: int) -> dict:
         return {
             "number": number,
+            "node_id": f"PR_{number}",
             "state": "open",
+            "draft": False,
             "head": {"sha": self.head, "repo": {"full_name": self.repository}},
         }
 
@@ -125,7 +129,10 @@ class DiagnosticGitHub(FakeGitHub):
         if fields.get("conclusion"):
             self.checks[check_id]["status"] = "completed"
 
-    def pull_request_workflow_run(self, workflow: str, head: str) -> dict:
+    def pull_request_workflow_run(
+        self, workflow: str, head: str, number: int
+    ) -> dict:
+        self.workflow_lookups.append((workflow, head, number))
         return {"id": 77, "head_sha": head, "status": "completed"}
 
     def rerun(self, run_id: int) -> None:
@@ -136,6 +143,9 @@ class DiagnosticGitHub(FakeGitHub):
 
     def remove_label(self, number: int, label: str) -> None:
         self.removed_labels.append((number, label))
+
+    def mark_draft(self, node_id: str) -> None:
+        self.draft_ids.append(node_id)
 
     def create_check(
         self, name: str, head: str, external_id: str, title: str, summary: str
@@ -282,8 +292,19 @@ class DeliveryModelTests(unittest.TestCase):
 
         github.pull = managed_pull  # type: ignore[method-assign]
         Controller(github).ci(41, head)
+        self.assertEqual([("pr.yml", head, 41)], github.workflow_lookups)
         self.assertEqual([77], github.rerun_ids)
         self.assertIn((41, ["ci:ready"]), github.labels)
+
+    def test_reset_clears_readiness_and_returns_the_pull_to_draft(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        Controller(github).reset(41, head)
+        self.assertEqual(["PR_41"], github.draft_ids)
+        self.assertEqual(
+            [(41, label) for label in ("ci:ready", "review:ready", "merge:ready")],
+            github.removed_labels,
+        )
 
     def test_diagnostic_dispatch_is_allow_listed_and_not_a_full_ci_proof(self) -> None:
         head = "1" * 40

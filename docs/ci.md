@@ -22,10 +22,11 @@ Trigger split, mirroring GocciaScript's CI shape:
 - **Ordinary PR checks remain automatic.** `pr.yml` runs its Ubuntu, native
   Darwin, documentation, and win64 legs without controller involvement.
 - **Managed PRs retain cheap deferral and explicit phase transitions.** Their
-  initial automatic PR run stops after the routing job. The `ci` transition
-  adds `ci:ready` and reruns that same exact-head PR workflow, producing the
-  same six native checks as an ordinary PR. It neither dispatches a wrapper nor
-  creates another proof. `delivery:managed` does not assert stack membership.
+  initial automatic PR run stops after the routing job. Every first attempt for
+  a managed head defers even when an older head left `ci:ready` attached. The
+  `ci` transition reruns that exact PR/head workflow, producing the same six
+  native checks as an ordinary PR. It neither dispatches a wrapper nor creates
+  another proof. `delivery:managed` does not assert stack membership.
 - **`ci.yml` has three exact uses.** A push to `main` verifies the integrated tree;
   rapid main pushes cancel older integrated-main runs. The `full-ci` operation
   checks out one frozen singleton or cumulative native-prefix top SHA. Those
@@ -55,11 +56,10 @@ the approval gate between successful builds and publication.
 GitHub binds each PR workflow run to the pull request's exact head. Ordinary
 heads execute the native jobs immediately. A managed head first records a cheap
 routing run whose native `delivery-admission` job fails closed; its `ci`
-transition adds `ci:ready` and reruns that exact workflow so the full job set
-executes and the aggregation job can pass. The controller samples that native
-job before later transitions. A new head naturally receives a new job set,
-while the observer removes readiness labels when later evidence no longer
-supports them. Managed forks fail closed.
+transition adds `ci:ready` and reruns that exact PR/head workflow so the full
+job set executes and the aggregation job can pass. The controller samples that
+native job before later transitions. `reset` clears readiness and returns the
+PR to draft; it never rewrites native check history. Managed forks fail closed.
 
 Full-CI remains a separate conditional proof. A full-CI run dispatched
 by `delivery-transition.yml` inherits the repository `GITHUB_TOKEN`; GitHub

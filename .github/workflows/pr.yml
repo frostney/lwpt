@@ -74,7 +74,7 @@ jobs:
   delivery-gate:
     runs-on: ubuntu-latest
     outputs:
-      managed: ${{ steps.route.outputs.managed }}
+      deferred: ${{ steps.route.outputs.deferred }}
     steps:
       - name: Defer unadmitted managed work
         id: route
@@ -82,6 +82,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
 
@@ -89,19 +90,20 @@ jobs:
           if [ "$IS_DRAFT" = "true" ]; then attempts=6; fi
           for attempt in $(seq 1 "$attempts"); do
             LABELS="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.labels[].name')"
-            if grep -Fxq 'delivery:managed' <<<"$LABELS" && \
-               ! grep -Fxq 'ci:ready' <<<"$LABELS"; then
-              echo 'managed=true' >> "$GITHUB_OUTPUT"
+            if grep -Fxq 'delivery:managed' <<<"$LABELS" && { \
+               [ "$RUN_ATTEMPT" = "1" ] || \
+               ! grep -Fxq 'ci:ready' <<<"$LABELS"; }; then
+              echo 'deferred=true' >> "$GITHUB_OUTPUT"
               echo 'Managed work remains deferred until its explicit ci transition.'
               exit 0
             fi
             if [ "$attempt" -lt "$attempts" ]; then sleep 3; fi
           done
-          echo 'managed=false' >> "$GITHUB_OUTPUT"
+          echo 'deferred=false' >> "$GITHUB_OUTPUT"
 
   build-and-test:
     needs: delivery-gate
-    if: ${{ needs.delivery-gate.outputs.managed != 'true' }}
+    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -178,7 +180,7 @@ jobs:
 
   docs:
     needs: delivery-gate
-    if: ${{ needs.delivery-gate.outputs.managed != 'true' }}
+    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -206,7 +208,7 @@ jobs:
   # unique-catch rate has not justified per-PR cost.
   darwin-test:
     needs: delivery-gate
-    if: ${{ needs.delivery-gate.outputs.managed != 'true' }}
+    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: macos-latest
     timeout-minutes: 20
     defaults:
@@ -248,7 +250,7 @@ jobs:
   # shared copy.
   toolchain:
     needs: delivery-gate
-    if: ${{ needs.delivery-gate.outputs.managed != 'true' }}
+    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     uses: ./.github/workflows/toolchain.yml
 
   # Windows compile signal, pre-merge. ci.yml's full cross-build
@@ -269,7 +271,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        needs.delivery-gate.outputs.managed != 'true' &&
+        needs.delivery-gate.outputs.deferred != 'true' &&
         needs.toolchain.result == 'success'
       }}
     needs:
@@ -396,7 +398,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        needs.delivery-gate.outputs.managed != 'true' &&
+        needs.delivery-gate.outputs.deferred != 'true' &&
         needs.windows-cross-compile.result == 'success'
       }}
     needs:
@@ -506,7 +508,7 @@ jobs:
     steps:
       - name: Require the native PR gate
         env:
-          DEFERRED: ${{ needs.delivery-gate.outputs.managed }}
+          DEFERRED: ${{ needs.delivery-gate.outputs.deferred }}
           BUILD_AND_TEST: ${{ needs.build-and-test.result }}
           DOCS: ${{ needs.docs.result }}
           DARWIN_TEST: ${{ needs.darwin-test.result }}

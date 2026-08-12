@@ -218,7 +218,9 @@ class GitHub:
             runs.extend(result["workflow_runs"])
         return runs
 
-    def pull_request_workflow_run(self, workflow: str, head: str) -> dict[str, Any]:
+    def pull_request_workflow_run(
+        self, workflow: str, head: str, number: int
+    ) -> dict[str, Any]:
         query = urllib.parse.urlencode(
             {"event": "pull_request", "head_sha": head, "per_page": 100}
         )
@@ -229,9 +231,16 @@ class GitHub:
             raise DeliveryError(
                 "PR workflow-run evidence exceeds the supported 100-item fail-closed bound"
             )
-        runs = [run for run in result["workflow_runs"] if run.get("head_sha") == head]
+        runs = [
+            run
+            for run in result["workflow_runs"]
+            if run.get("head_sha") == head
+            and any(pull.get("number") == number for pull in run.get("pull_requests", []))
+        ]
         if not runs:
-            raise DeliveryError(f"no pull-request workflow run exists for exact head {head}")
+            raise DeliveryError(
+                f"no pull-request workflow run exists for #{number} at exact head {head}"
+            )
         return max(runs, key=lambda run: run["id"])
 
     def rerun(self, run_id: int) -> None:
@@ -299,6 +308,16 @@ class GitHub:
         mutation = """
         mutation($id: ID!) {
           markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+            pullRequest { id isDraft }
+          }
+        }
+        """
+        self.graphql(mutation, {"id": node_id})
+
+    def mark_draft(self, node_id: str) -> None:
+        mutation = """
+        mutation($id: ID!) {
+          convertPullRequestToDraft(input: {pullRequestId: $id}) {
             pullRequest { id isDraft }
           }
         }
@@ -480,7 +499,9 @@ class Controller:
         try:
             self.require_delivery_success(number, expected_head)
         except DeliveryError:
-            run = self.github.pull_request_workflow_run("pr.yml", expected_head)
+            run = self.github.pull_request_workflow_run(
+                "pr.yml", expected_head, number
+            )
             if run.get("status") in {"queued", "in_progress"}:
                 raise DeliveryError(
                     "the exact-head PR routing run is still active; retry ci after it completes"
@@ -729,8 +750,11 @@ class Controller:
             self.github.mark_ready(topology["id"])
 
     def reset(self, number: int, expected_head: str) -> None:
-        self.current_pull(number, expected_head)
+        pull = self.current_pull(number, expected_head)
+        self.require_same_repository(pull)
         self.clear_readiness(number)
+        if not pull.get("draft"):
+            self.github.mark_draft(pull["node_id"])
 
     def observe_one(self, number: int) -> None:
         pull = self.current_pull(number)

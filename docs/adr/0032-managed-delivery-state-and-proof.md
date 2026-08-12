@@ -42,13 +42,14 @@ and terminal-promotion behavior was completed in
 - Native diagnostics are allow-listed, exact-head, non-proof runs. Full CI is
   reserved for terminal promotion after base, PR CI, and active review evidence
   converge; superseded runs are cancelled.
-- A changed head or native topology removes stale readiness. Native PR jobs are
-  bound to their exact head; full-CI cancellation, failure, and watchdog expiry
-  are terminal failures.
+- A managed head's first PR attempt always defers; only its explicit rerun may
+  execute PR code. Native PR jobs are bound to their exact PR and head;
+  full-CI cancellation, failure, and watchdog expiry are terminal failures.
 - Ordinary PR CI is automatic. Managed PRs retain a cheap automatic routing
-  run; admission reruns that exact-head workflow so both routes use the same
-  app-bound native aggregation job. The controller does not synthesize another
-  PR proof.
+  run; admission reruns that exact PR/head workflow so both routes use the same
+  app-bound native aggregation job. Reset returns the PR to draft instead of
+  rewriting immutable native checks. The controller does not synthesize
+  another PR proof.
 - Review automations are configured adapters. At least one must emit
   current-head evidence, every active adapter must reach its configured
   terminal state, and inactive configured adapters do not block delivery.
