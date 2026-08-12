@@ -1383,16 +1383,23 @@ begin
       'program OutputLimitFixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'uses Classes, SysUtils;'#10
-    + 'var BlockedTmp: string;'#10
+    + 'var BlockedTmp, OutputChunk: string;'#10
+    + '  Remaining, Written: Integer;'#10
     + 'begin'#10
     + '  BlockedTmp := IncludeTrailingPathDelimiter(GetEnvironmentVariable('
     + PascalString(WORKER_STATE_DIR_ENV) + ')) + ''tmp'';'#10
     + '  if DirectoryExists(BlockedTmp) and not RemoveDir(BlockedTmp) then'
     + ' Halt(2);'#10
     + '  TFileStream.Create(BlockedTmp, fmCreate).Free;'#10
-    + '  Write(StringOfChar(''x'', '
-    + IntToStr(ProcessCaptureOverflowBytes) + '));'#10
-    + '  Flush(Output);'#10
+    + '  OutputChunk := StringOfChar(''x'', 64 * 1024);'#10
+    + '  Remaining := ' + IntToStr(ProcessCaptureOverflowBytes) + ';'#10
+    + '  while Remaining > 0 do begin'#10
+    + '    Written := Length(OutputChunk);'#10
+    + '    if Written > Remaining then Written := Remaining;'#10
+    + '    Written := FileWrite(StdOutputHandle, OutputChunk[1], Written);'#10
+    + '    if Written <= 0 then Halt(3);'#10
+    + '    Dec(Remaining, Written);'#10
+    + '  end;'#10
     + '  Sleep(' + IntToStr(ProcessCaptureOverflowHoldMilliseconds) + ');'#10
     + 'end.'#10);
 
@@ -1818,12 +1825,6 @@ var
   BytesRead, BytesWritten: DWORD;
   {$ENDIF}
 begin
-  if AMode = CleanAcknowledgementExitProxyMode then
-  begin
-    InstallProcessTreeSignalForwarding;
-    WriteTextFile(APIDFile, IntToStr(GetProcessID));
-    Exit(0);
-  end;
   StatusHandleText := GetEnvironmentVariable(
     ProcessTreeStatusHandleEnvironment);
   ControlHandleText := GetEnvironmentVariable(
@@ -1845,6 +1846,14 @@ begin
     BytesWritten, nil) or (BytesWritten <> DWORD(Length(Frame))) then
     Exit(2);
   {$ENDIF}
+  if AMode = CleanAcknowledgementExitProxyMode then
+  begin
+    { This fixture needs only to register before a clean exit. Starting the
+      production forwarding threads here races immediate process shutdown on
+      Win32 and is unrelated to the already-empty Job Object contract. }
+    WriteTextFile(APIDFile, IntToStr(GetProcessID));
+    Exit(0);
+  end;
   WriteTextFile(APIDFile + '-descendant', IntToStr(GetProcessID));
   {$IFDEF UNIX}
   if not ReadAcknowledgementControlBefore(ControlHandle,
