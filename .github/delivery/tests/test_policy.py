@@ -2,14 +2,27 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def workflow_job(workflow: str, name: str) -> str:
+    match = re.search(
+        rf"^  {re.escape(name)}:\n.*?(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+        workflow,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"workflow job {name!r} not found")
+    return match.group(0)
 
 
 class RepositoryPolicyTests(unittest.TestCase):
@@ -125,6 +138,73 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn('head -1 || true)\n          if [ -n "$INSTANTFPC_BIN" ]', pr_workflow)
         self.assertIn("for unit_target in i386-win32 x86_64-win64", workflow)
         self.assertNotIn('for unit_target in "${{ matrix.target }}"', workflow)
+
+    def test_native_test_jobs_have_twenty_minute_timeout(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        pr_workflow = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")
+
+        self.assertIn("    timeout-minutes: 20\n", workflow_job(workflow, "test"))
+        for name in ("build-and-test", "darwin-test", "windows-test"):
+            self.assertIn(
+                "    timeout-minutes: 20\n", workflow_job(pr_workflow, name)
+            )
+
+    def test_chocolatey_install_retries_once_with_attempt_diagnostics(self) -> None:
+        workflows = [
+            (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"),
+            (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8"),
+        ]
+        retry_contract = (
+            "for attempt in 1 2; do",
+            'echo "::group::Chocolatey FPC install attempt ${attempt}/2"',
+            "if choco install -y freepascal; then",
+            'echo "::error::Chocolatey FPC install failed after 2 attempts',
+            'echo "::warning::Chocolatey FPC install attempt 1/2 failed',
+            'exit "$install_status"',
+        )
+
+        retry_blocks = []
+        for workflow in workflows:
+            for line in retry_contract:
+                self.assertEqual(1, workflow.count(line), line)
+            start = workflow.index("          for attempt in 1 2; do\n")
+            end = workflow.index("          done\n", start) + len("          done\n")
+            retry_blocks.append(workflow[start:end])
+        self.assertEqual(retry_blocks[0], retry_blocks[1])
+
+        probe = (
+            "set -euo pipefail\n"
+            "attempt_count=0\n"
+            'succeed_at="$1"\n'
+            "choco() {\n"
+            "  attempt_count=$((attempt_count + 1))\n"
+            '  echo "simulated Chocolatey output ${attempt_count}"\n'
+            '  if [ "$attempt_count" -lt "$succeed_at" ]; then return 7; fi\n'
+            "}\n"
+            + textwrap.dedent(retry_blocks[0])
+            + 'echo "attempt-count=${attempt_count}"\n'
+        )
+        succeeds_on_retry = subprocess.run(
+            ["bash", "-c", probe, "retry-probe", "2"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, succeeds_on_retry.returncode, succeeds_on_retry.stderr)
+        self.assertIn("attempt-count=2", succeeds_on_retry.stdout)
+        self.assertIn("attempt 1/2 failed", succeeds_on_retry.stdout)
+        self.assertIn("attempt 2/2", succeeds_on_retry.stdout)
+
+        both_fail = subprocess.run(
+            ["bash", "-c", probe, "retry-probe", "3"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(7, both_fail.returncode)
+        self.assertIn("simulated Chocolatey output 1", both_fail.stdout)
+        self.assertIn("simulated Chocolatey output 2", both_fail.stdout)
+        self.assertIn("failed after 2 attempts (exit code 7)", both_fail.stdout)
 
     def test_scheduling_diagnostic_accepts_final_interval_completion(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

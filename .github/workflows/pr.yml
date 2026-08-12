@@ -105,6 +105,7 @@ jobs:
     needs: delivery-gate
     if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
@@ -405,6 +406,7 @@ jobs:
       - delivery-gate
       - windows-cross-compile
     runs-on: windows-latest
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
@@ -428,7 +430,21 @@ jobs:
       # When ci.yml's copy changes, change this one too.
       - name: Install FPC (choco)
         run: |
-          choco install -y freepascal
+          for attempt in 1 2; do
+            echo "::group::Chocolatey FPC install attempt ${attempt}/2"
+            if choco install -y freepascal; then
+              echo "::endgroup::"
+              break
+            else
+              install_status=$?
+              echo "::endgroup::"
+              if [ "$attempt" -eq 2 ]; then
+                echo "::error::Chocolatey FPC install failed after 2 attempts (exit code ${install_status})"
+                exit "$install_status"
+              fi
+              echo "::warning::Chocolatey FPC install attempt 1/2 failed (exit code ${install_status}); retrying once"
+            fi
+          done
           # Add the FPC bin to PATH for subsequent steps. Chocolatey has
           # used both C:\fpc and C:\tools\freepascal layouts over time.
           FPC_BIN=""

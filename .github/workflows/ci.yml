@@ -412,6 +412,7 @@ jobs:
     needs:
       - validate-inputs
       - build
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.validate-inputs.outputs.test-matrix) }}
@@ -444,7 +445,21 @@ jobs:
       - name: Install FPC (choco)
         if: matrix.fpc-install == 'choco'
         run: |
-          choco install -y freepascal
+          for attempt in 1 2; do
+            echo "::group::Chocolatey FPC install attempt ${attempt}/2"
+            if choco install -y freepascal; then
+              echo "::endgroup::"
+              break
+            else
+              install_status=$?
+              echo "::endgroup::"
+              if [ "$attempt" -eq 2 ]; then
+                echo "::error::Chocolatey FPC install failed after 2 attempts (exit code ${install_status})"
+                exit "$install_status"
+              fi
+              echo "::warning::Chocolatey FPC install attempt 1/2 failed (exit code ${install_status}); retrying once"
+            fi
+          done
           # Add the FPC bin to PATH for subsequent steps. Chocolatey has
           # used both C:\fpc and C:\tools\freepascal layouts over time.
           FPC_BIN=""
