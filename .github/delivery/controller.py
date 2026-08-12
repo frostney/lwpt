@@ -953,12 +953,16 @@ class Controller:
         if event_path:
             event = json.loads(Path(event_path).read_text(encoding="utf-8"))
             check_run = event.get("check_run")
-            if check_run and self.is_review_check(check_run):
+            if check_run and not self.is_review_check(check_run):
+                return
+            if check_run:
                 for reference in check_run.get("pull_requests", []):
                     review_changed_numbers.add(reference["number"])
                     if event.get("action") in {"rerequested", "requested_action"}:
                         force_review_change.add(reference["number"])
                     numbers.add(reference["number"])
+                if not numbers:
+                    return
             pull = event.get("pull_request")
             if pull:
                 number = pull["number"]

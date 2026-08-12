@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Reconcile or fail orphaned proofs
+      - name: Reconcile managed delivery and orphaned proofs
         env:
           GH_TOKEN: ${{ github.token }}
           MAXIMUM_AGE_MINUTES: ${{ inputs.maximum_age_minutes || 120 }}
@@ -42,3 +42,4 @@ jobs:
           fi
           python3 .github/delivery/controller.py watchdog \
             --maximum-age-minutes "$MAXIMUM_AGE_MINUTES"
+          python3 .github/delivery/controller.py observe

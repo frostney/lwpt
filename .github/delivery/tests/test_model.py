@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import sys
+import tempfile
 import unittest
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -753,6 +754,31 @@ class DeliveryModelTests(unittest.TestCase):
                 {"name": "build-and-test", "app": {"slug": "github-actions"}}
             )
         )
+
+    def test_unrelated_check_event_does_not_sweep_managed_pulls(self) -> None:
+        github = DiagnosticGitHub("1" * 40)
+        open_pull_calls = 0
+
+        def open_pulls() -> list[dict]:
+            nonlocal open_pull_calls
+            open_pull_calls += 1
+            return []
+
+        github.open_pulls = open_pulls  # type: ignore[attr-defined]
+        event = {
+            "action": "completed",
+            "check_run": {
+                "name": "Some other external check",
+                "app": {"slug": "some-other-app"},
+                "pull_requests": [{"number": 41}],
+            },
+        }
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = Path(raw_tmp) / "event.json"
+            path.write_text(json.dumps(event), encoding="utf-8")
+            Controller(github).observe(str(path))
+
+        self.assertEqual(0, open_pull_calls)
 
     def test_review_invalidation_cancels_before_preserving_prefix_evidence(self) -> None:
         lower_head = "0" * 40
