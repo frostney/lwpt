@@ -2,8 +2,9 @@
 name: git-workflow
 description: >-
   Applies the user's git defaults: branch from the remote default, merge rather
-  than rebase, never amend or force-push, and squash-merge pull requests. Use
-  when branching, syncing, committing, pushing, or merging in the user's repos.
+  than rebase for ordinary branches, use native GitHub stacks when selected,
+  never amend, and squash-merge pull requests. Use when branching, syncing,
+  committing, pushing, or merging in the user's repos.
 license: Unlicense OR MIT
 compatibility: >-
   Requires git; pull-request operations also require the GitHub CLI (gh) and
@@ -33,5 +34,27 @@ that operation.
 - Use concise Conventional Commit subjects in imperative mood.
 - Let hooks run unless the user explicitly asks otherwise.
 - Squash-merge pull requests and delete the source branch afterward.
+- Because the merge is a squash, the pull request **title** becomes the commit
+  subject on the base branch — the branch's own commit subjects do not survive.
+  Give the title a Conventional Commit subject describing the change as a whole,
+  and pick its type from the net effect rather than from the most frequent
+  commit under it. Where a project generates its changelog or version bump from
+  commit history, a non-conforming title merges cleanly and is then silently
+  absent from it.
+
+## Native GitHub stacks
+
+Use the official `gh stack` workflow when the user selects a stack, when work
+has a real dependency chain, or when a confirmed large issue is deliberately
+split into cumulative, independently reviewable layers. Do not stack unrelated
+work. Each layer must have one clear claim, a bounded diff, its own validation,
+and an explicit subset of the acceptance criteria.
+
+Read [references/github-stacks.md](references/github-stacks.md) before creating,
+syncing, pushing, submitting, reviewing, or merging a stack. That reference is
+the only exception to the merge-only and never-force-push defaults above:
+rebases and force-with-lease are permitted only when performed by verified
+`gh stack` commands against a clean, confirmed native stack. Raw `git rebase`,
+`git push --force`, and manual `git push --force-with-lease` remain forbidden.
 
 After a squash merge, sync the local base and remove the merged local branch.

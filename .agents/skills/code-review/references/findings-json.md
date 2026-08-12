@@ -44,7 +44,7 @@ Each finding contains:
 {
   "id": "CR-N",
   "severity": "BLOCKING | IMPORTANT | IMPROVEMENT",
-  "category": "CLAIM | QUALITY | ARCHITECTURE_RISK",
+  "category": "CLAIM | QUALITY | ARCHITECTURE_RISK | DISCOVERABILITY",
   "title": "string",
   "location": {"path": "string", "line": 1, "symbol": "string or null"},
   "evidence": ["string"],

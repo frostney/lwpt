@@ -2,10 +2,10 @@
 name: run-retro
 description: >-
   Reviews a completed workstream from conversation, repository, and forge
-  evidence, uses grilling to agree improvements to delivery speed, process, and
-  codebase health, then applies selected documentation edits and follow-up
-  ticket actions. Use when ending a substantial workstream or running a project
-  retrospective.
+  evidence, maps lifecycle and ground-level timings, uses grilling to agree
+  improvements to delivery speed, process, and codebase health, then applies
+  selected documentation edits and follow-up ticket actions. Use when ending a
+  substantial workstream or running a project retrospective.
 license: Unlicense OR MIT
 compatibility: >-
   Requires a registered grilling skill and access to the workstream's available
@@ -26,6 +26,11 @@ detailed summary.
   commits, issues, PRs, reviews, checks, outcomes, and rework. Record unavailable
   evidence and lower confidence; do not invent a narrative or broaden into a
   repository audit.
+- For a completed Milestone Rush, read its ignored
+  `.agent/milestone-rush-events.jsonl` under
+  [references/timing-analysis.md](references/timing-analysis.md). Reconcile it
+  with current repository and forge evidence; partial or missing telemetry is a
+  confidence limitation, not permission to infer values.
 - Invoke `grilling` with the evidence and candidates. Do not imitate it with
   ad-hoc questions; stop if it is unavailable. Let it ask one decision at a time
   with a recommendation. Act only after it reaches shared understanding and
@@ -39,6 +44,11 @@ detailed summary.
 - Promote only generalized, project-level lessons supported by evidence. Exclude
   chronology, one-off mistakes, personal preferences, duplicates, existing
   rules, and speculation.
+- Apply de-duplication to the workstream: reuse prior investigations and
+  decisions, coalesce the same event from multiple evidence systems, and combine
+  candidate lessons with the same cause and action while retaining provenance.
+  Report repeated implementation encountered in the workstream, but do not turn
+  the retro into a repository-wide duplication or discoverability audit.
 
 ## Route each lesson
 
@@ -59,23 +69,32 @@ selects its exact proposed contents.
 
 1. Resolve the workstream boundary and read relevant project documentation.
 2. Build an evidence ledger of outcomes, friction, rework, surprises, effective
-   or missed gates, and successful practices under all three lenses.
-3. Remove unsupported, session-specific, duplicate, and already-covered
+   or missed gates, and successful practices under all three lenses. Select one
+   or more timing profiles from the reference and map both high-level lifecycle
+   phases and available ground-level operations.
+3. Reconstruct exclusive critical-path contribution, overlapping or masked
+   work, and aggregate resource consumption without double-counting. Rank
+   bottlenecks by exclusive wall-clock impact; report confidence and missing
+   attribution.
+4. Remove unsupported, session-specific, duplicate, and already-covered
    candidates; classify the rest using the routes above.
-4. Run `grilling` one decision at a time with the boundary, evidence, current
+5. Run `grilling` one decision at a time with the boundary, evidence, current
    docs, absences, and candidates.
-5. Present the detailed summary:
+6. Present the detailed summary:
    - findings under every lens, including no-finding results;
+   - lifecycle and selected surface profiles, exclusive critical-path ranking,
+     masked or overlapping work, ground-level build/test/tool timings, aggregate
+     resource totals, evidence provenance, and confidence gaps;
    - exact proposed documentation additions, replacements, or removals by file;
    - concise ticket summaries with all available action paths;
    - report-only observations, supporting evidence, confidence, and gaps.
-6. Obtain exact user selections through `grilling`. More detail or further
+7. Obtain exact user selections through `grilling`. More detail or further
    grilling returns to that loop and regenerates the summary.
-7. Apply only selected documentation changes, preserving structure and avoiding
+8. Apply only selected documentation changes, preserving structure and avoiding
    duplication. Run only the selected ticket actions through `create-issue`.
-8. Compare the result with the confirmed action set, reread edited sections, and
+9. Compare the result with the confirmed action set, reread edited sections, and
    run declared documentation checks.
-9. Report changed docs, created issue links, report-only findings, confidence
+10. Report changed docs, created issue links, report-only findings, confidence
    limits, and observed validation. Keep workstream history in chat.
 
 Confirmation does not authorize commits, pushes, PRs, unselected issues, or

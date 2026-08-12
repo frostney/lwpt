@@ -6,87 +6,104 @@ description: >-
   when the user runs /review-pr or /review-pr automatic-merge.
 license: Unlicense OR MIT
 compatibility: >-
-  Requires the GitHub CLI (gh) authenticated to the target repository and
-  network access.
-metadata:
-  upstream: https://github.com/frostney/known-good-route
-  adaptation: finite automatic-merge convergence deadline
+  Requires Python 3.11 or newer, the GitHub CLI (gh) authenticated to the target
+  repository, the internal `delivery-wait` skill, and network access.
 ---
 
 # Review PR
 
-Resolve the current PR's actionable review findings without creating a second
-review conversation. With the exact `automatic-merge` qualifier, converge the
-PR and merge it.
+Converge exactly one pull request without creating a second review conversation.
+With the exact `automatic-merge` qualifier, merge an ordinary PR only after the
+same exact-head convergence contract passes.
 
 ## Invariants
 
 - Preserve unrelated work. Never amend, force-push, or revert changes you did
   not author.
-- Reply only in the originating review thread when a reply is useful. Do not
-  post top-level PR summaries or issue comments. In `automatic-merge` mode, a
-  documented review-tool retrigger command is the only allowed top-level
-  comment.
+- Reply only in the originating review thread. Every inline automation thread
+  requires a maintainer-workflow reply stating its evidence-backed disposition
+  before readiness or merge, including invalid, obsolete, duplicate, and
+  out-of-scope findings. Do not post top-level PR summaries or issue comments.
+  In `automatic-merge` mode, a documented automation retrigger command is the
+  only allowed top-level comment.
 - Validate findings before changing code and run the relevant project checks
   after fixes.
 - Discover active review tools from current repository configuration, branch
   protection, checks, and PR activity. Do not hardcode one provider or require
   an integration that is disabled, historical, or merely installed.
-- Treat review, approval, and CI evidence as valid only for the current PR head.
-  A new commit or baseline merge resets every affected gate.
+- Treat review, approval, thread-readiness, finding, and CI evidence as valid
+  only for the exact current PR head. A new commit or baseline update resets
+  every affected gate.
+- Own no label routing, milestone scheduling, stack scheduling, cross-PR
+  admission, or project-specific CI policy. If the PR is a native stack member,
+  converge this layer and return its state to the stack owner without merging.
+
+Read [references/convergence.md](references/convergence.md) before deciding that
+a PR is ready, pending, blocked, or merged.
+
+Use `scripts/review_wait.py` for review inspection, deterministic waiting,
+inline replies, and thread resolution. Invoke it with `--json`; the harness must
+passively await a running command rather than wake a model to report unchanged
+state. The repository policy defaults to
+`.github/delivery/review-automations.json` and may be overridden explicitly.
+Use a caller-owned checkpoint below gitignored `.agent/waits/`.
 
 ## Automatic merge
 
 The exact `automatic-merge` qualifier authorizes relevant fixes, validation,
-new commits, plain pushes, documented reviewer retriggers, monitoring, one
-squash merge, source-branch deletion, and local cleanup under `git-workflow`.
-Normal `/review-pr` remains non-merging. An explicit read-only instruction
-remains non-mutating and disables automatic merge.
+new commits, permitted pushes, documented automation retriggers, monitoring,
+one ordinary squash merge, source-branch deletion, and local cleanup under
+`git-workflow`. Normal `/review-pr` remains non-merging. An explicit read-only
+instruction remains non-mutating and disables automatic merge.
 
-An active review tool is a merge gate when repository policy or the current PR
-shows it was intentionally invoked. When the repository has a review-automation
-registry, use its actors, check contexts, and terminal states rather than a
-vendor name. Inspect inline threads plus top-level reviews, summaries,
-suggestions, and nitpicks. A rate limit, quota response, incomplete run, or
-missing verdict is pending rather than passed for every provider.
-
-Automatic convergence has a finite wall-clock budget: 30 minutes from entering
-`automatic-merge` mode unless the user supplies another explicit finite
-deadline. Backoff, CI waits, reviewer waits, and retriggers all consume that
-single budget. At the deadline, stop without merging and report the exact
-nonterminal checks or review tools; never fall back to the host platform limit.
+An active review automation is a gate when repository policy or the current PR
+shows it was intentionally invoked. Inspect inline threads plus top-level
+reviews, summaries, suggestions, and nitpicks. A rate-limited, incomplete,
+errored, missing, or head-ambiguous verdict is pending rather than passed.
 
 ## Workflow
 
-1. Confirm the branch has an open PR and merge the remote default branch if
-   behind.
-2. Read the current head, PR diff, unresolved threads, top-level review
-   findings, active review tools and their terminal states, required checks,
-   affected code, and applicable project instructions.
-3. If `resolve-reviews` is registered, use it for thread mechanics while keeping
-   this skill's invariants. Otherwise handle the threads directly.
+1. Confirm the repository and exact PR identity. Read its current head, diff,
+   required checks, applicable project instructions, active review automation,
+   terminal states, unresolved-thread count, and unanswered inline-automation-
+   thread count.
+2. If an ordinary branch needs a baseline update, use `/update-pr`. A stack owner
+   must perform any stack-wide synchronization before asking this skill to
+   re-evaluate the affected layer.
+3. Run the review helper's `inspect` operation for the exact PR head. It returns
+   active automation evidence, inline and top-level findings, replies, and
+   authoritative thread state. Validate and classify findings in this workflow;
+   the helper supplies facts and exact mutations, never judgment.
 4. Evaluate every current finding. Fix validated in-scope findings; reply inline
-   when acknowledgement, clarification, or a question is needed; resolve
-   completed threads. Dismiss invalid, obsolete, duplicate, or out-of-scope
-   findings only with evidence. Never silently ignore a nitpick.
+   to every automation thread through the helper's idempotent `reply` operation;
+   resolve completed threads through its explicit `resolve` operation. Dismiss invalid,
+   obsolete, duplicate, or out-of-scope findings only with evidence. Never
+   silently ignore a nitpick, and never substitute a top-level comment when an
+   inline comment cannot accept a reply.
 5. Run checks relevant to the changed behavior, including rendered UI and
    accessibility checks for user-facing changes.
 6. Use `/update-pr` to commit and push. If unavailable, follow its documented
    no-amend, no-force-push workflow directly.
-7. In normal mode, report the outcome, findings addressed, commits, observed
-   validation, review-tool state, and PR URL.
-8. In `automatic-merge` mode, repeat the workflow against the new head. Wait
-   with bounded backoff for required checks and every active review tool. When a
-   tool is incomplete, errored, or rate-limited, use its documented retrigger
-   mechanism when current evidence says it is allowed; a required command
-   comment may use the narrow top-level exception. Retrigger only while enough
-   convergence budget remains to observe a terminal result.
-9. Stop without merging for an exhausted convergence budget, material product
-   decision, unrelated failure, unsafe or divergent PR, unavailable terminal
-   external dependency, or unresolved required finding. Report the exact
-   blocker.
-10. Once the current head is ready, every required check is green, every active
-    review tool has a completed verdict, and no actionable finding remains,
-    squash-merge and delete the source branch through `git-workflow`. Sync the
-    local default branch, remove only clean worktrees owned by this run, and
-    report the merged PR, final head, validation, reviews, and cleanup.
+7. Re-read the exact head, required checks, terminal automation verdicts,
+   actionable findings, unresolved threads, and unanswered inline automation
+   threads. Apply the convergence and `retry_at` rules in the reference. A new
+   head restarts this step with no inherited gate evidence.
+8. In normal mode, return the result contract without merging. In
+   `automatic-merge` mode, launch the helper's foreground `wait` operation with
+   the exact head, repository policy, checkpoint, and safely derived deadline.
+   Resume this workflow only when the command returns a meaningful transition.
+   Use a
+   documented retrigger only when current evidence permits it; its required
+   command may use the narrow top-level exception. Never guess a timer, quota,
+   provider policy, or retry count. If the host cannot passively await a
+   subprocess, return `pending` with that unsupported capability instead of
+   using model heartbeats.
+9. Stop without merging for a material product decision, unrelated failure,
+   unsafe or divergent PR, unavailable terminal external dependency, or
+   unresolved required finding. Report the exact blocker.
+10. In `automatic-merge` mode, squash-merge through `git-workflow` only when the
+    ordinary PR is `ready` under the exact final-head contract. Sync the local
+    default branch, remove only clean worktrees owned by this run, and report
+    the merged PR, final head, validation, reviews, and cleanup. For a native
+    stack member, return `ready` without merging so the stack owner can recheck
+    its selected prefix and invoke the atomic stack merge.
