@@ -12,7 +12,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -220,30 +220,71 @@ class GitHub:
         return runs
 
     def completed_workflow_runs(
-        self, workflow: str, created_after: datetime
+        self,
+        workflow: str,
+        created_after: datetime,
+        created_before: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        created = created_after.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        runs: list[dict[str, Any]] = []
-        page = 1
-        while True:
+        def formatted(value: datetime) -> str:
+            return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def load_range(start: datetime, finish: datetime) -> list[dict[str, Any]]:
             query = urllib.parse.urlencode(
                 {
                     "event": "workflow_dispatch",
                     "status": "completed",
-                    "created": f">={created}",
+                    "created": f"{formatted(start)}..{formatted(finish)}",
                     "per_page": 100,
-                    "page": page,
+                    "page": 1,
                 }
             )
             result = self.request(
                 "GET",
                 f"/repos/{self.repository}/actions/workflows/{workflow}/runs?{query}",
             )
-            batch = result["workflow_runs"]
-            runs.extend(batch)
-            if not batch or len(runs) >= result["total_count"]:
-                return runs
-            page += 1
+            total = result["total_count"]
+            if total >= 1000:
+                if (finish - start).total_seconds() <= 1:
+                    raise DeliveryError(
+                        "completed workflow-run recovery exceeds GitHub's "
+                        "1,000-result cap within one second"
+                    )
+                midpoint = start + (finish - start) / 2
+                midpoint = midpoint.replace(microsecond=0)
+                return load_range(start, midpoint) + load_range(
+                    midpoint + timedelta(seconds=1), finish
+                )
+
+            runs = list(result["workflow_runs"])
+            page = 2
+            while len(runs) < total:
+                page_query = urllib.parse.urlencode(
+                    {
+                        "event": "workflow_dispatch",
+                        "status": "completed",
+                        "created": f"{formatted(start)}..{formatted(finish)}",
+                        "per_page": 100,
+                        "page": page,
+                    }
+                )
+                page_result = self.request(
+                    "GET",
+                    f"/repos/{self.repository}/actions/workflows/{workflow}/runs?{page_query}",
+                )
+                batch = page_result["workflow_runs"]
+                if not batch:
+                    raise DeliveryError(
+                        "completed workflow-run pagination ended before total_count"
+                    )
+                runs.extend(batch)
+                page += 1
+            return runs
+
+        start = created_after.astimezone(timezone.utc).replace(microsecond=0)
+        finish = (created_before or datetime.now(timezone.utc)).astimezone(
+            timezone.utc
+        ).replace(microsecond=0)
+        return load_range(start, finish)
 
     def cancel_run(self, run_id: int) -> None:
         try:
@@ -1147,7 +1188,7 @@ class Controller:
         elif run.get("name") == "PR":
             self.finalize_ordinary(run)
 
-    def recover_completed_full_ci(self) -> set[int]:
+    def recover_completed_full_ci(self, now: datetime) -> set[int]:
         pending: dict[int, dict[str, Any]] = {}
         for pull in self.github.open_pulls():
             for check in self.github.check_runs(pull["head"]["sha"]):
@@ -1166,7 +1207,9 @@ class Controller:
         )
         if created_after.tzinfo is None:
             created_after = created_after.replace(tzinfo=timezone.utc)
-        for run in self.github.completed_workflow_runs("ci.yml", created_after):
+        for run in self.github.completed_workflow_runs(
+            "ci.yml", created_after, now
+        ):
             match = FULL_CI_RUN_RE.match(run.get("display_title", ""))
             if not match:
                 continue
@@ -1185,7 +1228,7 @@ class Controller:
 
     def watchdog(self, maximum_age_minutes: int) -> None:
         now = datetime.now(timezone.utc)
-        recovered = self.recover_completed_full_ci()
+        recovered = self.recover_completed_full_ci(now)
         for pull in self.github.open_pulls():
             head = pull["head"]["sha"]
             for check in self.github.check_runs(head):

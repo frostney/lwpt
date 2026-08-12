@@ -5,6 +5,7 @@ import copy
 import json
 import sys
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -74,7 +75,10 @@ class RecoveryGitHub(FakeCheckGitHub):
         return [{"number": 41, "head": {"sha": self.head}}]
 
     def completed_workflow_runs(
-        self, workflow: str, created_after: datetime
+        self,
+        workflow: str,
+        created_after: datetime,
+        created_before: datetime | None = None,
     ) -> list[dict]:
         self.created_after = created_after
         return [self.run]
@@ -530,13 +534,43 @@ class DeliveryModelTests(unittest.TestCase):
 
         github.request = request  # type: ignore[method-assign]
         runs = github.completed_workflow_runs(
-            "ci.yml", datetime(2026, 8, 12, 10, 0, tzinfo=timezone.utc)
+            "ci.yml",
+            datetime(2026, 8, 12, 10, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 12, 11, 0, tzinfo=timezone.utc),
         )
 
         self.assertEqual([1, 2], [run["id"] for run in runs])
         self.assertEqual(2, len(requested))
         self.assertIn("status=completed", requested[0])
-        self.assertIn("created=%3E%3D2026-08-12T10%3A00%3A00Z", requested[0])
+        self.assertIn(
+            "created=2026-08-12T10%3A00%3A00Z..2026-08-12T11%3A00%3A00Z",
+            requested[0],
+        )
+
+    def test_completed_run_query_splits_github_result_cap(self) -> None:
+        github = object.__new__(GitHub)
+        github.repository = "frostney/lwpt"
+        requested: list[str] = []
+
+        def request(method: str, path: str, payload: object | None = None) -> dict:
+            requested.append(path)
+            created = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(path).query
+            )["created"][0]
+            if created == "2026-08-12T10:00:00Z..2026-08-12T12:00:00Z":
+                return {"total_count": 1000, "workflow_runs": []}
+            run_id = 1 if created.endswith("..2026-08-12T11:00:00Z") else 2
+            return {"total_count": 1, "workflow_runs": [{"id": run_id}]}
+
+        github.request = request  # type: ignore[method-assign]
+        runs = github.completed_workflow_runs(
+            "ci.yml",
+            datetime(2026, 8, 12, 10, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual([1, 2], [run["id"] for run in runs])
+        self.assertEqual(3, len(requested))
 
     def test_completed_full_ci_accepts_unchanged_review_evidence(self) -> None:
         head = "1" * 40

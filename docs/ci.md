@@ -80,11 +80,12 @@ re-fetches the PR and native topology, binds the workflow result to the current
 check, and then records success or terminal failure. A full-CI run dispatched
 by `delivery-transition.yml` inherits the repository `GITHUB_TOKEN`; GitHub
 allows that explicit `workflow_dispatch` but suppresses its subsequent
-`workflow_run` event. The trusted watchdog therefore discovers recent terminal
+`workflow_run` event. The trusted watchdog therefore discovers terminal
 full-CI runs every 15 minutes and passes their bound identity through the same
-finalizer before applying its 120-minute timeout. Cancelled runs are failures,
-and duplicate or reordered observations are harmless because a completed check
-is terminal.
+finalizer before applying its 120-minute timeout. Creation-time queries are
+split when GitHub's filtered 1,000-result cap is reached, so recovery cannot
+silently lose the matching run. Cancelled runs are failures, and duplicate or
+reordered observations are harmless because a completed check is terminal.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
 initial surface covers Windows x86_64/i386 default, E2E, and TLS slices, plus an

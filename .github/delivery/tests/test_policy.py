@@ -54,7 +54,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("actions: read", watchdog)
         self.assertIn("Reconcile or fail orphaned proofs", watchdog)
         self.assertIn("def recover_completed_full_ci", controller)
-        self.assertIn('completed_workflow_runs("ci.yml", created_after)', controller)
+        self.assertIn('"ci.yml", created_after, now', controller)
 
     def test_removed_review_watcher_is_not_locked_or_installed(self) -> None:
         lock = json.loads((ROOT / "skills-lock.json").read_text(encoding="utf-8"))
