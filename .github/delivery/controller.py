@@ -219,7 +219,7 @@ class GitHub:
         return runs
 
     def pull_request_workflow_run(
-        self, workflow: str, head: str, number: int
+        self, workflow: str, head: str, number: int, base: str
     ) -> dict[str, Any]:
         query = urllib.parse.urlencode(
             {"event": "pull_request", "head_sha": head, "per_page": 100}
@@ -235,11 +235,15 @@ class GitHub:
             run
             for run in result["workflow_runs"]
             if run.get("head_sha") == head
-            and any(pull.get("number") == number for pull in run.get("pull_requests", []))
+            and any(
+                pull.get("number") == number
+                and pull.get("base", {}).get("sha") == base
+                for pull in run.get("pull_requests", [])
+            )
         ]
         if not runs:
             raise DeliveryError(
-                f"no pull-request workflow run exists for #{number} at exact head {head}"
+                f"no pull-request workflow run exists for #{number} at exact head/base {head}/{base}"
             )
         return max(runs, key=lambda run: run["id"])
 
@@ -496,31 +500,44 @@ class Controller:
         self.require_same_repository(pull)
         if MANAGED_LABEL not in label_names(pull):
             raise DeliveryError(f"pull request #{number} is not {MANAGED_LABEL}")
-        try:
-            self.require_delivery_success(number, expected_head)
-        except DeliveryError:
-            run = self.github.pull_request_workflow_run(
-                "pr.yml", expected_head, number
-            )
-            if run.get("status") in {"queued", "in_progress"}:
-                raise DeliveryError(
-                    "the exact-head PR routing run is still active; retry ci after it completes"
-                )
+        run = self.github.pull_request_workflow_run(
+            "pr.yml", expected_head, number, pull["base"]["sha"]
+        )
+        check = self.delivery_check_for_run(expected_head, run["id"])
+        if check and check.get("status") == "completed" and check.get("conclusion") == "success":
             self.clear_readiness(number, (REVIEW_READY_LABEL, MERGE_READY_LABEL))
             self.github.add_labels(number, [CI_READY_LABEL])
-            self.github.rerun(run["id"])
             return
+        if run.get("status") in {"queued", "in_progress"}:
+            raise DeliveryError(
+                "the exact-head PR routing run is still active; retry ci after it completes"
+            )
         self.clear_readiness(number, (REVIEW_READY_LABEL, MERGE_READY_LABEL))
         self.github.add_labels(number, [CI_READY_LABEL])
+        try:
+            self.github.rerun(run["id"])
+        except DeliveryError:
+            self.github.remove_label(number, CI_READY_LABEL)
+            raise
 
-    def require_delivery_success(self, number: int, expected_head: str) -> dict[str, Any]:
+    def delivery_check_for_run(
+        self, expected_head: str, run_id: int
+    ) -> dict[str, Any] | None:
+        prefix = f"https://github.com/{self.github.repository}/actions/runs/{run_id}/job/"
         checks = [
             check
             for check in self.github.check_runs(expected_head)
             if self.owned(check, DELIVERY_CHECK)
-            and not check.get("external_id", "").startswith("delivery:v1:")
+            and check.get("details_url", "").startswith(prefix)
         ]
-        check = max(checks, key=lambda item: item["id"]) if checks else None
+        return max(checks, key=lambda item: item["id"]) if checks else None
+
+    def require_delivery_success(self, number: int, expected_head: str) -> dict[str, Any]:
+        pull = self.current_pull(number, expected_head)
+        run = self.github.pull_request_workflow_run(
+            "pr.yml", expected_head, number, pull["base"]["sha"]
+        )
+        check = self.delivery_check_for_run(expected_head, run["id"])
         if (
             check is None
             or check.get("status") != "completed"

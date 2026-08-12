@@ -92,7 +92,7 @@ class DiagnosticGitHub(FakeGitHub):
         self.checks: dict[int, dict] = {}
         self.updated: list[tuple[int, dict]] = []
         self.rerun_ids: list[int] = []
-        self.workflow_lookups: list[tuple[str, str, int]] = []
+        self.workflow_lookups: list[tuple[str, str, int, str]] = []
         self.labels: list[tuple[int, list[str]]] = []
         self.removed_labels: list[tuple[int, str]] = []
         self.draft_ids: list[str] = []
@@ -103,6 +103,7 @@ class DiagnosticGitHub(FakeGitHub):
             "node_id": f"PR_{number}",
             "state": "open",
             "draft": False,
+            "base": {"sha": "2" * 40},
             "head": {"sha": self.head, "repo": {"full_name": self.repository}},
         }
 
@@ -113,7 +114,7 @@ class DiagnosticGitHub(FakeGitHub):
         return self.runs
 
     def check_runs(self, head: str) -> list[dict]:
-        return []
+        return list(self.checks.values())
 
     def review_evidence(self, number: int) -> tuple[list[dict], list[dict]]:
         return [], []
@@ -130,9 +131,9 @@ class DiagnosticGitHub(FakeGitHub):
             self.checks[check_id]["status"] = "completed"
 
     def pull_request_workflow_run(
-        self, workflow: str, head: str, number: int
+        self, workflow: str, head: str, number: int, base: str
     ) -> dict:
-        self.workflow_lookups.append((workflow, head, number))
+        self.workflow_lookups.append((workflow, head, number, base))
         return {"id": 77, "head_sha": head, "status": "completed"}
 
     def rerun(self, run_id: int) -> None:
@@ -262,6 +263,7 @@ class DeliveryModelTests(unittest.TestCase):
                 "name": "delivery-admission",
                 "status": "completed",
                 "conclusion": "success",
+                "details_url": "https://github.com/frostney/lwpt/actions/runs/77/job/1",
                 "app": {"slug": "github-actions"},
             },
             {
@@ -292,7 +294,7 @@ class DeliveryModelTests(unittest.TestCase):
 
         github.pull = managed_pull  # type: ignore[method-assign]
         Controller(github).ci(41, head)
-        self.assertEqual([("pr.yml", head, 41)], github.workflow_lookups)
+        self.assertEqual([("pr.yml", head, 41, "2" * 40)], github.workflow_lookups)
         self.assertEqual([77], github.rerun_ids)
         self.assertIn((41, ["ci:ready"]), github.labels)
 
