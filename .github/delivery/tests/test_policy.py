@@ -230,7 +230,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks"
         )
         self.assertEqual(
-            [{"context": "delivery-admission"}],
+            [{"context": "delivery-admission", "integration_id": 15368}],
             status_rule["parameters"]["required_status_checks"],
         )
 
