@@ -46,6 +46,9 @@ and terminal-promotion behavior was completed in
   execute PR code, and that rerun still requires the `ci:ready` phase label.
   Native PR jobs are bound to their exact PR and head;
   full-CI cancellation, failure, and watchdog expiry are terminal failures.
+- GitHub's 30-day and 50-attempt rerun limits bound managed-candidate lifetime.
+  Exhaustion is an explicit stale-candidate blocker requiring a new head, not
+  justification for a second privileged PR execution path.
 - Ordinary PR CI is automatic. Managed PRs retain a cheap automatic routing
   run; admission reruns that exact PR/head workflow so both routes use the same
   app-bound native aggregation job. Reset returns the PR to draft instead of

@@ -28,6 +28,9 @@ Trigger split, mirroring GocciaScript's CI shape:
   the label and a rerun attempt are required, so an automatic or manual
   first attempt remains deferred. The rerun produces the same six native
   checks as an ordinary PR. `delivery:managed` does not assert stack membership.
+  GitHub bounds reruns to 30 days and 50 attempts; a candidate outside that
+  delivery window must receive a new synchronized head rather than entering a
+  second execution route.
 - **`ci.yml` has three exact uses.** A push to `main` verifies the integrated tree;
   rapid main pushes cancel older integrated-main runs. The `full-ci` operation
   checks out one frozen singleton or cumulative native-prefix top SHA. Those
