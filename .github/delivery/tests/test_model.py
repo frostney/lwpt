@@ -521,16 +521,17 @@ class DeliveryModelTests(unittest.TestCase):
         self.assertEqual("success", github.updated[0][1]["conclusion"])
         self.assertIsNotNone(github.created_after)
 
-    def test_completed_run_query_is_time_bounded_and_paginated(self) -> None:
+    def test_completed_run_query_is_time_bounded(self) -> None:
         github = object.__new__(GitHub)
         github.repository = "frostney/lwpt"
         requested: list[str] = []
 
         def request(method: str, path: str, payload: object | None = None) -> dict:
             requested.append(path)
-            if "&page=1" in path:
-                return {"total_count": 2, "workflow_runs": [{"id": 1}]}
-            return {"total_count": 2, "workflow_runs": [{"id": 2}]}
+            return {
+                "total_count": 2,
+                "workflow_runs": [{"id": 1}, {"id": 2}],
+            }
 
         github.request = request  # type: ignore[method-assign]
         runs = github.completed_workflow_runs(
@@ -540,7 +541,7 @@ class DeliveryModelTests(unittest.TestCase):
         )
 
         self.assertEqual([1, 2], [run["id"] for run in runs])
-        self.assertEqual(2, len(requested))
+        self.assertEqual(1, len(requested))
         self.assertIn("status=completed", requested[0])
         self.assertIn(
             "created=2026-08-12T10%3A00%3A00Z..2026-08-12T11%3A00%3A00Z",
@@ -558,7 +559,7 @@ class DeliveryModelTests(unittest.TestCase):
                 urllib.parse.urlsplit(path).query
             )["created"][0]
             if created == "2026-08-12T10:00:00Z..2026-08-12T12:00:00Z":
-                return {"total_count": 1000, "workflow_runs": []}
+                return {"total_count": 101, "workflow_runs": []}
             run_id = 1 if created.endswith("..2026-08-12T11:00:00Z") else 2
             return {"total_count": 1, "workflow_runs": [{"id": run_id}]}
 

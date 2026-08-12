@@ -83,9 +83,10 @@ allows that explicit `workflow_dispatch` but suppresses its subsequent
 `workflow_run` event. The trusted watchdog therefore discovers terminal
 full-CI runs every 15 minutes and passes their bound identity through the same
 finalizer before applying its 120-minute timeout. Creation-time queries are
-split when GitHub's filtered 1,000-result cap is reached, so recovery cannot
-silently lose the matching run. Cancelled runs are failures, and duplicate or
-reordered observations are harmless because a completed check is terminal.
+split until each result fits one page, avoiding both GitHub's filtered
+1,000-result cap and offset pagination over a changing completed-run set.
+Cancelled runs are failures, and duplicate or reordered observations are
+harmless because a completed check is terminal.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
 initial surface covers Windows x86_64/i386 default, E2E, and TLS slices, plus an

@@ -243,11 +243,11 @@ class GitHub:
                 f"/repos/{self.repository}/actions/workflows/{workflow}/runs?{query}",
             )
             total = result["total_count"]
-            if total >= 1000:
+            if total > 100:
                 if (finish - start).total_seconds() <= 1:
                     raise DeliveryError(
                         "completed workflow-run recovery exceeds GitHub's "
-                        "1,000-result cap within one second"
+                        "100-result stable range within one second"
                     )
                 midpoint = start + (finish - start) / 2
                 midpoint = midpoint.replace(microsecond=0)
@@ -255,30 +255,7 @@ class GitHub:
                     midpoint + timedelta(seconds=1), finish
                 )
 
-            runs = list(result["workflow_runs"])
-            page = 2
-            while len(runs) < total:
-                page_query = urllib.parse.urlencode(
-                    {
-                        "event": "workflow_dispatch",
-                        "status": "completed",
-                        "created": f"{formatted(start)}..{formatted(finish)}",
-                        "per_page": 100,
-                        "page": page,
-                    }
-                )
-                page_result = self.request(
-                    "GET",
-                    f"/repos/{self.repository}/actions/workflows/{workflow}/runs?{page_query}",
-                )
-                batch = page_result["workflow_runs"]
-                if not batch:
-                    raise DeliveryError(
-                        "completed workflow-run pagination ended before total_count"
-                    )
-                runs.extend(batch)
-                page += 1
-            return runs
+            return list(result["workflow_runs"])
 
         start = created_after.astimezone(timezone.utc).replace(microsecond=0)
         finish = (created_before or datetime.now(timezone.utc)).astimezone(
