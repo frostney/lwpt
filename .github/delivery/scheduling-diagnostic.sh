@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+poll_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_POLL_SECONDS:-5}"
+poll_count="${LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT:-18}"
+sample_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_SAMPLE_SECONDS:-5}"
+cleanup_grace_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_CLEANUP_GRACE_SECONDS:-2}"
+pid_file="${RUNNER_TEMP:-/tmp}/TestScheduling.pids"
+lwpt_pid=0
+
+collect_test_pids() {
+  pgrep -f '[T]estScheduling.Test' > "$pid_file" || true
+}
+
+terminate_probe() {
+  owned_pid="$lwpt_pid"
+  if [ "$owned_pid" -le 0 ]; then
+    owned_pid="$(jobs -pr | tail -1 || true)"
+  fi
+  if [ -z "$owned_pid" ]; then return; fi
+  collect_test_pids
+  kill -TERM -- "-$owned_pid" 2>/dev/null \
+    || kill -TERM "$owned_pid" 2>/dev/null || true
+  sleep "$cleanup_grace_seconds"
+  kill -KILL -- "-$owned_pid" 2>/dev/null \
+    || kill -KILL "$owned_pid" 2>/dev/null || true
+  wait "$owned_pid" 2>/dev/null || true
+}
+
+sample_probe() {
+  collect_test_pids
+  ps -axo pid,ppid,stat,etime,command
+  while IFS= read -r test_pid; do
+    if [ -n "$test_pid" ]; then
+      sample "$test_pid" "$sample_seconds" 1 \
+        -file "${RUNNER_TEMP:-/tmp}/TestScheduling-${test_pid}.sample.txt" \
+        || true
+      cat "${RUNNER_TEMP:-/tmp}/TestScheduling-${test_pid}.sample.txt" \
+        || true
+    fi
+  done < "$pid_file"
+}
+
+finish_if_complete() {
+  if kill -0 "$lwpt_pid" 2>/dev/null; then
+    process_state="$(ps -p "$lwpt_pid" -o stat= 2>/dev/null || true)"
+    if [ -n "$process_state" ] && [[ "$process_state" != *Z* ]]; then
+      return 1
+    fi
+  fi
+  set +e
+  wait "$lwpt_pid"
+  result=$?
+  set -e
+  trap - EXIT INT TERM
+  exit "$result"
+}
+
+trap terminate_probe EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+python3 -c \
+  'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+  ./build/lwpt test tests/integration/TestScheduling.Test.pas \
+  --jobs=1 --bail=1 --verbose &
+lwpt_pid=$!
+
+for _ in $(seq 1 "$poll_count"); do
+  finish_if_complete || true
+  sleep "$poll_seconds"
+done
+
+# The process may have exited during the final sleep. This check owns the
+# deadline boundary and prevents a successful late completion being reported
+# as a timeout.
+finish_if_complete || true
+
+echo "::error::scheduling diagnostic exceeded 90 seconds"
+sample_probe
+exit 1

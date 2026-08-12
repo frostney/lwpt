@@ -39,12 +39,14 @@ from model import (
 DELIVERY_CHECK = "delivery-admission"
 FULL_CI_CHECK = "full-ci"
 OWNED_APP = "github-actions"
-DIAGNOSTIC_TARGETS = {"x86_64-win64", "i386-win32"}
-DIAGNOSTIC_SELECTORS = {"default", "e2e", "tls"}
+DIAGNOSTIC_TARGETS = {"x86_64-darwin", "x86_64-win64", "i386-win32"}
+DIAGNOSTIC_SELECTORS = {"default", "e2e", "scheduling", "tls"}
 MANAGED_RUN_RE = re.compile(r"^delivery-pr/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
 FULL_CI_RUN_RE = re.compile(r"^full-ci/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
 DIAGNOSTIC_RUN_RE = re.compile(
-    r"^diagnostic/(\d+)/([0-9a-f]{40})/(x86_64-win64|i386-win32)/(default|e2e|tls)$"
+    r"^diagnostic/(\d+)/([0-9a-f]{40})/"
+    r"(?:x86_64-darwin/scheduling|"
+    r"(?:x86_64-win64|i386-win32)/(?:default|e2e|tls))$"
 )
 
 
@@ -498,6 +500,10 @@ class Controller:
             raise DeliveryError(f"unsupported diagnostic target: {target}")
         if selector not in DIAGNOSTIC_SELECTORS:
             raise DeliveryError(f"unsupported diagnostic selector: {selector}")
+        if (target == "x86_64-darwin") != (selector == "scheduling"):
+            raise DeliveryError(
+                f"unsupported diagnostic slice: {target}/{selector}"
+            )
         self.github.dispatch(
             "ci.yml",
             {

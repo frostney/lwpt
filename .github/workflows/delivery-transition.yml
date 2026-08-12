@@ -33,6 +33,7 @@ on:
         required: false
         type: choice
         options:
+          - x86_64-darwin
           - x86_64-win64
           - i386-win32
       diagnostic_selector:
@@ -42,6 +43,7 @@ on:
         options:
           - default
           - e2e
+          - scheduling
           - tls
 
 permissions:

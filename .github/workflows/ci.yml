@@ -78,6 +78,7 @@ on:
         required: false
         type: choice
         options:
+          - x86_64-darwin
           - x86_64-win64
           - i386-win32
       diagnostic_selector:
@@ -87,6 +88,7 @@ on:
         options:
           - default
           - e2e
+          - scheduling
           - tls
 
 permissions:
@@ -129,13 +131,20 @@ jobs:
               exit 1
             fi
             case "$DIAGNOSTIC_TARGET" in
-              x86_64-win64|i386-win32) ;;
+              x86_64-darwin|x86_64-win64|i386-win32) ;;
               *) echo "::error::unsupported diagnostic target: $DIAGNOSTIC_TARGET"; exit 1 ;;
             esac
             case "$DIAGNOSTIC_SELECTOR" in
-              default|e2e|tls) ;;
+              default|e2e|scheduling|tls) ;;
               *) echo "::error::unsupported diagnostic selector: $DIAGNOSTIC_SELECTOR"; exit 1 ;;
             esac
+            if { [ "$DIAGNOSTIC_TARGET" = "x86_64-darwin" ] &&
+                 [ "$DIAGNOSTIC_SELECTOR" != "scheduling" ]; } ||
+               { [ "$DIAGNOSTIC_TARGET" != "x86_64-darwin" ] &&
+                 [ "$DIAGNOSTIC_SELECTOR" = "scheduling" ]; }; then
+              echo "::error::unsupported diagnostic slice: $DIAGNOSTIC_TARGET/$DIAGNOSTIC_SELECTOR"
+              exit 1
+            fi
             PULL="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$CANDIDATE_PR_NUMBER")"
             if [ "$(jq -r '.state' <<<"$PULL")" != "open" ] ||
                [ "$(jq -r '.head.sha' <<<"$PULL")" != "$EXPECTED_HEAD" ] ||
@@ -163,6 +172,10 @@ jobs:
           set -euo pipefail
           if [ "$MODE" = "diagnostic" ]; then
             case "$DIAGNOSTIC_TARGET" in
+              x86_64-darwin)
+                BUILD='{"include":[{"target":"x86_64-darwin","cpu":"x86_64","os":"darwin"}]}'
+                TEST='{"include":[{"target":"x86_64-darwin","runner":"macos-15-intel","fpc-install":"brew"}]}'
+                ;;
               x86_64-win64)
                 BUILD='{"include":[{"target":"x86_64-win64","cpu":"x86_64","os":"win64"}]}'
                 TEST='{"include":[{"target":"x86_64-win64","runner":"windows-latest","fpc-install":"choco"}]}'
@@ -586,3 +599,18 @@ jobs:
           else
             ./build/lwpt test packages/httpclient/source/TransportSecurity.Test.pas --bail=1 --verbose
           fi
+
+      - name: Checkout trusted scheduling diagnostic
+        if: inputs.mode == 'diagnostic' && inputs.diagnostic_selector == 'scheduling'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: .trusted-delivery
+          sparse-checkout: .github/delivery/scheduling-diagnostic.sh
+
+      - name: Scheduling diagnostic test
+        if: inputs.mode == 'diagnostic' && inputs.diagnostic_selector == 'scheduling'
+        shell: bash
+        run: .trusted-delivery/.github/delivery/scheduling-diagnostic.sh

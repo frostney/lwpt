@@ -81,11 +81,15 @@ check, and then records success or terminal failure. Cancelled runs are failure;
 the watchdog supplies the same terminal result for orphaned runs.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
-initial surface is Windows x86_64 or i386 with the default tier, the E2E tier,
-or the package's TLS test file. It checks out the exact current PR head, cannot
-accept a shell command or fork, uses a `diagnostic/...` run identity, and never
-creates or satisfies a `full-ci` proof. A later diagnostic for the same PR
-cancels the prior run.
+initial surface covers Windows x86_64/i386 default, E2E, and TLS slices, plus an
+Intel-Darwin scheduling slice that runs only `TestScheduling.Test.pas`, fails
+after 90 seconds, and captures the native process sample instead of consuming a
+full matrix as a hang probe. Target and selector combinations are allow-listed
+as pairs: a Windows selector cannot silently run on Darwin, and the scheduling
+probe cannot run on Windows. The endpoint checks out the exact current PR head,
+cannot accept a shell command or fork, uses a `diagnostic/...` run identity, and
+never creates or satisfies a `full-ci` proof. A later diagnostic for the same
+PR cancels the prior run.
 
 The `review` operation opens the repository's review lane after PR admission.
 The controller discovers active review automations from configured check names
