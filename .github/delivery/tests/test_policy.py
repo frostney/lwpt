@@ -220,7 +220,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("fork_turns:none", policy)
         self.assertIn("No token or context intervention may silently downgrade", policy)
 
-    def test_main_ruleset_binds_admission_to_github_actions(self) -> None:
+    def test_main_ruleset_binds_native_admission_job_to_github_actions(self) -> None:
         ruleset = json.loads(
             (ROOT / ".github/rulesets/protect-main.json").read_text(encoding="utf-8")
         )

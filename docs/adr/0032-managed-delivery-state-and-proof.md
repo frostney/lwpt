@@ -8,7 +8,8 @@ ordered phase state; `ci:full-required` is independent applicability policy.
 GitHub's native pull-request stack and ordered entries are the only topology
 authority. A repository-owned `workflow_dispatch` endpoint accepts explicit
 transitions, while default-branch observers invalidate head, base, order, or
-prefix drift. Exact-head `delivery-admission` proves the PR matrix. Conditional
+prefix drift. A native GitHub Actions `delivery-admission` job aggregates the
+exact-head PR jobs for ordinary and managed PRs alike. Conditional
 `full-ci` proves one singleton or the unchanged cumulative SHA at a frozen
 native-prefix top. `merge:ready` remains the machine-validated final state and
 is not duplicated by another merge-admission check. This decision was
@@ -32,8 +33,8 @@ and terminal-promotion behavior was completed in
 ## Consequences
 
 - Workflows with write permission never check out or execute pull-request
-  code. Read-only exact-head matrices are concluded by a trusted
-  default-branch finalizer; the scheduled watchdog feeds terminal full-CI runs
+  code. The automatic read-only PR workflow reports its native required jobs
+  directly; the scheduled watchdog feeds terminal full-CI runs
   through that same finalizer when `GITHUB_TOKEN` event suppression prevents a
   `workflow_run` delivery.
 - Managed delivery, stack topology, and full-CI applicability can vary
@@ -41,11 +42,13 @@ and terminal-promotion behavior was completed in
 - Native diagnostics are allow-listed, exact-head, non-proof runs. Full CI is
   reserved for terminal promotion after base, PR CI, and active review evidence
   converge; superseded runs are cancelled.
-- A changed head or native topology creates a new pending proof and removes
-  stale readiness. Cancellation, failure, and watchdog expiry are terminal
-  failures.
-- Ordinary PR CI stays automatic and is aggregated into the same app-owned
-  `delivery-admission` required check.
+- A changed head or native topology removes stale readiness. Native PR jobs are
+  bound to their exact head; full-CI cancellation, failure, and watchdog expiry
+  are terminal failures.
+- Ordinary PR CI is automatic. Managed PRs retain a cheap automatic routing
+  run; admission reruns that exact-head workflow so both routes use the same
+  app-bound native aggregation job. The controller does not synthesize another
+  PR proof.
 - Review automations are configured adapters. At least one must emit
   current-head evidence, every active adapter must reach its configured
   terminal state, and inactive configured adapters do not block delivery.

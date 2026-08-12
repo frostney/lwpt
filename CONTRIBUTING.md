@@ -40,7 +40,7 @@ endpoint in [`ORCHESTRATION.md`](./ORCHESTRATION.md) and the ordered
 `ci:full-required` independently marks work that needs the six-target full-CI
 proof before merge admission.
 
-The labels expose current phase; the exact-head `delivery-admission` check,
+The labels expose current phase; the native exact-head `delivery-admission` job,
 current review evidence, and conditional `full-ci` check are proof. GitHub's
 native stack is the only source of prefix order. A managed PR may be standalone,
 and a native stack need not be managed. New heads or changed base/order/prefix
