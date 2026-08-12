@@ -69,6 +69,20 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("current same-repository PR head", workflow)
         self.assertNotIn("diagnostic:v1", workflow)
 
+    def test_windows_compiler_discovery_skips_absent_roots(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        pr_workflow = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")
+        self.assertIn("for candidate_root in /c/tools/freepascal /c/fpc", workflow)
+        self.assertIn('if [ -d "$candidate_root" ]; then', workflow)
+        self.assertNotIn("TARGET_FPC=$(find /c/tools/freepascal /c/fpc", workflow)
+        self.assertNotIn("Chocolatey FPC install: x86_64 compiler not found", workflow)
+        self.assertIn('echo "LWPT_FPC=$LWPT_FPC_VALUE"', workflow)
+        self.assertNotIn("FPC target mismatch", workflow)
+        self.assertIn('head -1 || true)\n          if [ -n "$INSTANTFPC_BIN" ]', workflow)
+        self.assertIn('head -1 || true)\n          if [ -n "$INSTANTFPC_BIN" ]', pr_workflow)
+        self.assertIn("for unit_target in i386-win32 x86_64-win64", workflow)
+        self.assertNotIn('for unit_target in "${{ matrix.target }}"', workflow)
+
     def test_scheduling_diagnostic_accepts_final_interval_completion(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
