@@ -5,6 +5,7 @@ poll_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_POLL_SECONDS:-5}"
 poll_count="${LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT:-18}"
 sample_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_SAMPLE_SECONDS:-5}"
 cleanup_grace_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_CLEANUP_GRACE_SECONDS:-2}"
+scope="${LWPT_SCHEDULING_DIAGNOSTIC_SCOPE:-scheduling}"
 pid_file="${RUNNER_TEMP:-/tmp}/TestScheduling.pids"
 lwpt_pid=0
 
@@ -59,9 +60,15 @@ finish_if_complete() {
 trap terminate_probe EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+case "$scope" in
+  default) test_selectors=() ;;
+  scheduling) test_selectors=(tests/integration/TestScheduling.Test.pas) ;;
+  *) echo "unsupported scheduling diagnostic scope: $scope" >&2; exit 2 ;;
+esac
+
 python3 -c \
   'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
-  ./build/lwpt test tests/integration/TestScheduling.Test.pas \
+  ./build/lwpt test "${test_selectors[@]}" \
   --jobs=1 --bail=1 --verbose &
 lwpt_pid=$!
 
@@ -75,6 +82,6 @@ done
 # as a timeout.
 finish_if_complete || true
 
-echo "::error::scheduling diagnostic exceeded 90 seconds"
+echo "::error::$scope diagnostic exceeded its bounded runtime"
 sample_probe
 exit 1

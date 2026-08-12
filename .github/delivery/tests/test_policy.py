@@ -62,7 +62,8 @@ class RepositoryPolicyTests(unittest.TestCase):
             ROOT / ".github/delivery/scheduling-diagnostic.sh"
         ).read_text(encoding="utf-8")
         self.assertIn("TestScheduling.Test.pas", diagnostic)
-        self.assertIn("scheduling diagnostic exceeded 90 seconds", diagnostic)
+        self.assertIn("diagnostic exceeded its bounded runtime", diagnostic)
+        self.assertIn("default) test_selectors=()", diagnostic)
         self.assertIn("diagnostic/", workflow)
         self.assertIn("- diagnostic", workflow)
         self.assertIn("current same-repository PR head", workflow)

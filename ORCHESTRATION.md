@@ -55,8 +55,9 @@ Diagnostics are remediation tools, never delivery proof. The trusted endpoint
 accepts only repository-declared targets and test selectors, refuses forks and
 stale heads, and dispatches no arbitrary command. A new diagnostic for the same
 PR cancels its superseded diagnostic run. The initial allow-list covers Windows
-default, E2E, and TLS slices plus a bounded Intel-Darwin scheduling probe that
-captures a native process sample on timeout. `full-ci` is a terminal promotion:
+default, E2E, and TLS slices plus bounded Intel-Darwin selected-scheduling and
+default-tier probes that capture a native process sample on timeout. `full-ci`
+is a terminal promotion:
 the candidate must be marked `ci:full-required`, integrated with its current
 base, green in exact-head PR CI, and converged under the active review policy
 before the matrix is dispatched. Head, topology, or later review change fails

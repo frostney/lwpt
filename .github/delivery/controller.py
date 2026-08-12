@@ -45,7 +45,7 @@ MANAGED_RUN_RE = re.compile(r"^delivery-pr/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(
 FULL_CI_RUN_RE = re.compile(r"^full-ci/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
 DIAGNOSTIC_RUN_RE = re.compile(
     r"^diagnostic/(\d+)/([0-9a-f]{40})/"
-    r"(?:x86_64-darwin/scheduling|"
+    r"(?:x86_64-darwin/(?:default|scheduling)|"
     r"(?:x86_64-win64|i386-win32)/(?:default|e2e|tls))$"
 )
 
@@ -500,7 +500,14 @@ class Controller:
             raise DeliveryError(f"unsupported diagnostic target: {target}")
         if selector not in DIAGNOSTIC_SELECTORS:
             raise DeliveryError(f"unsupported diagnostic selector: {selector}")
-        if (target == "x86_64-darwin") != (selector == "scheduling"):
+        valid_slice = (
+            target == "x86_64-darwin"
+            and selector in {"default", "scheduling"}
+        ) or (
+            target in {"x86_64-win64", "i386-win32"}
+            and selector in {"default", "e2e", "tls"}
+        )
+        if not valid_slice:
             raise DeliveryError(
                 f"unsupported diagnostic slice: {target}/{selector}"
             )

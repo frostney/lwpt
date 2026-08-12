@@ -283,17 +283,16 @@ class DeliveryModelTests(unittest.TestCase):
                 f"diagnostic/41/{head}/x86_64-darwin/scheduling"
             )
         )
-        with self.assertRaisesRegex(DeliveryError, "unsupported diagnostic slice"):
-            Controller(DiagnosticGitHub(head)).diagnostic(
-                41, head, "x86_64-darwin", "default"
-            )
+        Controller(DiagnosticGitHub(head)).diagnostic(
+            41, head, "x86_64-darwin", "default"
+        )
         with self.assertRaisesRegex(DeliveryError, "unsupported diagnostic slice"):
             Controller(DiagnosticGitHub(head)).diagnostic(
                 41, head, "x86_64-win64", "scheduling"
             )
         self.assertIsNone(
             DIAGNOSTIC_RUN_RE.match(
-                f"diagnostic/41/{head}/x86_64-darwin/default"
+                f"diagnostic/41/{head}/x86_64-darwin/tls"
             )
         )
 
