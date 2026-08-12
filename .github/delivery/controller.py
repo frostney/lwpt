@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -38,8 +39,15 @@ from model import (
 DELIVERY_CHECK = "delivery-admission"
 FULL_CI_CHECK = "full-ci"
 OWNED_APP = "github-actions"
+DIAGNOSTIC_TARGETS = {"x86_64-darwin", "x86_64-win64", "i386-win32"}
+DIAGNOSTIC_SELECTORS = {"default", "e2e", "scheduling", "tls"}
 MANAGED_RUN_RE = re.compile(r"^delivery-pr/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
 FULL_CI_RUN_RE = re.compile(r"^full-ci/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
+DIAGNOSTIC_RUN_RE = re.compile(
+    r"^diagnostic/(\d+)/([0-9a-f]{40})/"
+    r"(?:x86_64-darwin/(?:default|scheduling)|"
+    r"(?:x86_64-win64|i386-win32)/(?:default|e2e|tls))$"
+)
 
 
 class GitHub:
@@ -196,6 +204,28 @@ class GitHub:
             {"ref": repository["default_branch"], "inputs": inputs},
         )
 
+    def workflow_runs(self, workflow: str) -> list[dict[str, Any]]:
+        runs: list[dict[str, Any]] = []
+        for status in ("queued", "in_progress"):
+            result = self.request(
+                "GET",
+                f"/repos/{self.repository}/actions/workflows/{workflow}/runs"
+                f"?event=workflow_dispatch&status={status}&per_page=100",
+            )
+            if result["total_count"] > len(result["workflow_runs"]):
+                raise DeliveryError(
+                    "active workflow-run evidence exceeds the supported 100-item fail-closed bound"
+                )
+            runs.extend(result["workflow_runs"])
+        return runs
+
+    def cancel_run(self, run_id: int) -> None:
+        try:
+            self.request("POST", f"/repos/{self.repository}/actions/runs/{run_id}/cancel")
+        except DeliveryError as error:
+            if "(404)" not in str(error) and "(409)" not in str(error):
+                raise
+
     def collaborator_permission(self, login: str) -> str:
         encoded = urllib.parse.quote(login, safe="")
         result = self.request(
@@ -265,6 +295,54 @@ class Controller:
     @staticmethod
     def full_ci_external_id(number: int, head: str, digest: str) -> str:
         return f"full-ci:v1:{number}:{head}:{digest}"
+
+    @staticmethod
+    def full_ci_evidence(
+        check: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        summary = (check.get("output") or {}).get("summary") or ""
+
+        def block(marker: str) -> Any:
+            start = summary.find(marker)
+            end = summary.find("\n```", start + len(marker))
+            if start < 0 or end <= start:
+                raise DeliveryError("full-CI proof lacks bound evidence")
+            try:
+                return json.loads(summary[start + len(marker):end])
+            except json.JSONDecodeError as error:
+                raise DeliveryError("full-CI proof has invalid bound evidence") from error
+
+        snapshot = block("```json\n")
+        fingerprints = block("```review-evidence\n")
+        if not isinstance(snapshot, dict) or not isinstance(fingerprints, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in fingerprints.items()
+        ):
+            raise DeliveryError("full-CI proof has invalid bound evidence")
+        entries = snapshot.get("entries")
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, dict) or not isinstance(entry.get("number"), int)
+            for entry in entries
+        ):
+            raise DeliveryError("full-CI proof has invalid bound topology")
+        expected_members = {str(entry["number"]) for entry in entries}
+        if set(fingerprints) != expected_members:
+            raise DeliveryError(
+                "full-CI proof does not bind every prefix member's review evidence"
+            )
+        return snapshot, fingerprints
+
+    @staticmethod
+    def full_ci_evidence_blocks(
+        snapshot: dict[str, Any], fingerprints: dict[str, str]
+    ) -> str:
+        return (
+            "```json\n"
+            + json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+            + "\n```\n\n```review-evidence\n"
+            + json.dumps(fingerprints, sort_keys=True, separators=(",", ":"))
+            + "\n```"
+        )
 
     @staticmethod
     def owned(check: dict[str, Any], name: str) -> bool:
@@ -413,23 +491,85 @@ class Controller:
         self.clear_readiness(number, (MERGE_READY_LABEL,))
         self.github.add_labels(number, [CI_READY_LABEL, REVIEW_READY_LABEL])
 
-    def full_ci(self, number: int, expected_head: str) -> None:
+    def diagnostic(
+        self, number: int, expected_head: str, target: str, selector: str
+    ) -> None:
         pull = self.current_pull(number, expected_head)
         self.require_same_repository(pull)
+        if target not in DIAGNOSTIC_TARGETS:
+            raise DeliveryError(f"unsupported diagnostic target: {target}")
+        if selector not in DIAGNOSTIC_SELECTORS:
+            raise DeliveryError(f"unsupported diagnostic selector: {selector}")
+        valid_slice = (
+            target == "x86_64-darwin"
+            and selector in {"default", "scheduling"}
+        ) or (
+            target in {"x86_64-win64", "i386-win32"}
+            and selector in {"default", "e2e", "tls"}
+        )
+        if not valid_slice:
+            raise DeliveryError(
+                f"unsupported diagnostic slice: {target}/{selector}"
+            )
+        self.github.dispatch(
+            "ci.yml",
+            {
+                "mode": "diagnostic",
+                "candidate_pr_number": str(number),
+                "expected_head": expected_head,
+                "diagnostic_target": target,
+                "diagnostic_selector": selector,
+            },
+        )
+
+    def full_ci(self, number: int, expected_head: str) -> None:
+        self.current_pull(number, expected_head)
         snapshot, digest = self.snapshot(number)
+        if not snapshot_requires_full_ci(snapshot):
+            raise DeliveryError(
+                f"candidate #{number} is not marked {FULL_CI_REQUIRED_LABEL}"
+            )
+        review_fingerprints: dict[str, str] = {}
+        for entry in snapshot["entries"]:
+            member = self.current_pull(entry["number"], entry["head"])
+            self.require_same_repository(member)
+            if member.get("mergeable") is False or member.get("mergeable_state") in {
+                "behind",
+                "dirty",
+                "unknown",
+            }:
+                raise DeliveryError(
+                    f"pull request #{entry['number']} is not integrated with its current base"
+                )
+            if (member.get("base") or {}).get("sha") not in {None, entry["base"]}:
+                raise DeliveryError(
+                    f"pull request #{entry['number']} base changed during promotion"
+                )
+            self.require_delivery_success(entry["number"], entry["head"])
+            review_fingerprints[str(entry["number"])] = self.validate_reviews(
+                entry["number"], entry["head"]
+            )
         external_id = self.full_ci_external_id(number, expected_head, digest)
         check = self.matching_check(expected_head, FULL_CI_CHECK, external_id)
         if check and check.get("conclusion") == "success":
-            return
+            try:
+                stored_snapshot, stored_fingerprints = self.full_ci_evidence(check)
+                if (
+                    snapshot_digest(stored_snapshot) == digest
+                    and stored_fingerprints == review_fingerprints
+                ):
+                    return
+            except DeliveryError:
+                pass
         if check and check["status"] != "completed":
             return
-        summary = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
         check = self.github.create_check(
             FULL_CI_CHECK,
             expected_head,
             external_id,
             "Full CI running",
-            f"Candidate topology: `{digest}`\n\n```json\n{summary}\n```",
+            f"Candidate topology: `{digest}`\n\n"
+            + self.full_ci_evidence_blocks(snapshot, review_fingerprints),
         )
         self.dispatch_with_terminal_failure(
             "ci.yml",
@@ -455,8 +595,66 @@ class Controller:
             raise DeliveryError(
                 f"candidate #{candidate} requires successful exact-topology {FULL_CI_CHECK} evidence"
             )
+        stored_snapshot, stored_fingerprints = self.full_ci_evidence(check)
+        if snapshot_digest(stored_snapshot) != digest:
+            raise DeliveryError("full-CI proof topology does not match the current candidate")
+        for entry in snapshot["entries"]:
+            current_fingerprint = self.validate_reviews(entry["number"], entry["head"])
+            if stored_fingerprints.get(str(entry["number"])) != current_fingerprint:
+                raise DeliveryError(
+                    f"review evidence for pull request #{entry['number']} changed "
+                    "after full-CI promotion"
+                )
 
-    def validate_reviews(self, number: int, head: str) -> None:
+    @staticmethod
+    def review_fingerprint(
+        checks: list[dict[str, Any]],
+        reviews: list[dict[str, Any]],
+        threads: list[dict[str, Any]],
+        automations: list[dict[str, Any]],
+    ) -> str:
+        def configured_check(check: dict[str, Any]) -> bool:
+            for automation in automations:
+                contexts = set(automation.get("check_contexts", []))
+                if automation.get("check_context"):
+                    contexts.add(automation["check_context"])
+                apps = set(automation.get("check_app_slugs", []))
+                if check.get("name") in contexts and (
+                    not apps or (check.get("app") or {}).get("slug") in apps
+                ):
+                    return True
+            return False
+
+        evidence = {
+            "checks": sorted(
+                [
+                    {
+                        "id": check.get("id"),
+                        "name": check.get("name"),
+                        "app": (check.get("app") or {}).get("slug"),
+                        "status": check.get("status"),
+                        "conclusion": check.get("conclusion"),
+                        "completed_at": check.get("completed_at"),
+                    }
+                    for check in checks
+                    if configured_check(check)
+                ],
+                key=lambda item: (item["name"] or "", item["id"] or 0),
+            ),
+            "reviews": reviews,
+            "threads": threads,
+        }
+        encoded = json.dumps(
+            evidence, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def current_review_fingerprint(self, number: int, head: str) -> str:
+        checks = self.github.check_runs(head)
+        reviews, threads = self.github.review_evidence(number)
+        return self.review_fingerprint(checks, reviews, threads, self.automations)
+
+    def validate_reviews(self, number: int, head: str) -> str:
         checks = self.github.check_runs(head)
         reviews, threads = self.github.review_evidence(number)
         reply_logins = {
@@ -478,6 +676,7 @@ class Controller:
         )
         if errors:
             raise DeliveryError("review evidence is not terminal: " + "; ".join(errors))
+        return self.review_fingerprint(checks, reviews, threads, self.automations)
 
     def merge(self, number: int, expected_head: str, candidate: int) -> None:
         pull = self.current_pull(number, expected_head)
@@ -587,14 +786,147 @@ class Controller:
             f"Pull request #{number} no longer has head `{head}`.",
         )
 
+    def cancel_superseded_ci_runs(
+        self,
+        number: int,
+        current_head: str,
+        current_digest: str,
+        review_changed: bool = False,
+        closed: bool = False,
+    ) -> None:
+        for run in self.github.workflow_runs("ci.yml"):
+            if run.get("status") not in {"queued", "in_progress"}:
+                continue
+            title = run.get("display_title", "")
+            full_ci = FULL_CI_RUN_RE.match(title)
+            diagnostic = DIAGNOSTIC_RUN_RE.match(title)
+            should_cancel = False
+            if full_ci:
+                if int(full_ci.group(1)) == number and (
+                    closed
+                    or review_changed
+                    or full_ci.group(2) != current_head
+                    or full_ci.group(3) != current_digest
+                ):
+                    should_cancel = True
+                elif int(full_ci.group(1)) == number:
+                    should_cancel = False
+                else:
+                    check = self.github.check_run(int(full_ci.group(4)))
+                    summary = (check.get("output") or {}).get("summary") or ""
+                    marker = "```json\n"
+                    start = summary.find(marker)
+                    end = summary.find("\n```", start + len(marker))
+                    snapshot = None
+                    if start >= 0 and end > start:
+                        try:
+                            snapshot = json.loads(summary[start + len(marker):end])
+                        except json.JSONDecodeError:
+                            snapshot = None
+                    if snapshot is not None and snapshot_digest(snapshot) == full_ci.group(3):
+                        member = next(
+                            (entry for entry in snapshot.get("entries", [])
+                             if entry.get("number") == number),
+                            None,
+                        )
+                        if member is not None:
+                            should_cancel = (
+                                closed
+                                or review_changed
+                                or member.get("head") != current_head
+                            )
+            elif diagnostic and int(diagnostic.group(1)) == number:
+                should_cancel = closed or diagnostic.group(2) != current_head
+            if should_cancel:
+                self.github.cancel_run(run["id"])
+
+    def is_review_check(self, check: dict[str, Any]) -> bool:
+        name = check.get("name")
+        app = (check.get("app") or {}).get("slug")
+        for automation in self.automations:
+            contexts = set(automation.get("check_contexts", []))
+            if automation.get("check_context"):
+                contexts.add(automation["check_context"])
+            apps = set(automation.get("check_app_slugs", []))
+            if name in contexts and (not apps or app in apps):
+                return True
+        return False
+
+    def invalidate_active_full_ci_for_member(
+        self,
+        number: int,
+        title: str,
+        summary: str,
+        force: bool = False,
+    ) -> None:
+        for run in self.github.workflow_runs("ci.yml"):
+            match = FULL_CI_RUN_RE.match(run.get("display_title", ""))
+            if not match:
+                continue
+            check = self.github.check_run(int(match.group(4)))
+            try:
+                snapshot, stored_fingerprints = self.full_ci_evidence(check)
+            except DeliveryError:
+                continue
+            if snapshot_digest(snapshot) != match.group(3) or not snapshot_contains(
+                snapshot, number
+            ):
+                continue
+            member = next(
+                entry for entry in snapshot["entries"] if entry["number"] == number
+            )
+            if not force:
+                try:
+                    current_fingerprint = self.current_review_fingerprint(
+                        number, member["head"]
+                    )
+                except DeliveryError:
+                    current_fingerprint = ""
+                if stored_fingerprints.get(str(number)) == current_fingerprint:
+                    continue
+            self.github.cancel_run(run["id"])
+            if check.get("status") != "completed" and self.owned(
+                check, FULL_CI_CHECK
+            ):
+                self.github.update_check(
+                    check["id"],
+                    title=title,
+                    summary=(
+                        summary
+                        + "\n\n```json\n"
+                        + json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+                        + "\n```\n\n```review-evidence\n"
+                        + json.dumps(
+                            stored_fingerprints,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n```"
+                    ),
+                    conclusion="failure",
+                )
+
     def observe(self, event_path: str | None) -> None:
         numbers: set[int] = set()
+        review_changed_numbers: set[int] = set()
+        force_review_change: set[int] = set()
         if event_path:
             event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+            check_run = event.get("check_run")
+            if check_run and self.is_review_check(check_run):
+                for reference in check_run.get("pull_requests", []):
+                    review_changed_numbers.add(reference["number"])
+                    if event.get("action") in {"rerequested", "requested_action"}:
+                        force_review_change.add(reference["number"])
+                    numbers.add(reference["number"])
             pull = event.get("pull_request")
             if pull:
                 number = pull["number"]
                 head = pull["head"]["sha"]
+                if "review" in event or "comment" in event:
+                    review_changed_numbers.add(number)
+                    if event.get("action") in {"edited", "dismissed", "deleted"}:
+                        force_review_change.add(number)
                 if pull.get("state") == "open":
                     numbers.add(number)
                 else:
@@ -604,14 +936,57 @@ class Controller:
                         "Pull request closed",
                         f"Pull request #{number} closed before the proof completed.",
                     )
+                    self.cancel_superseded_ci_runs(
+                        number, head, "", closed=True
+                    )
+                    self.invalidate_active_full_ci_for_member(
+                        number,
+                        "Prefix member closed",
+                        f"Pull request #{number} closed before the proof completed.",
+                        force=True,
+                    )
                 before = event.get("before")
                 if before and before != head:
                     self.fail_superseded_head(number, before)
+                    try:
+                        _, digest = self.snapshot(number)
+                        self.cancel_superseded_ci_runs(number, head, digest)
+                    except DeliveryError:
+                        pass
         for pull in self.github.open_pulls():
             if MANAGED_LABEL in label_names(pull):
                 numbers.add(pull["number"])
         for number in sorted(numbers):
             self.observe_one(number)
+            pull = self.current_pull(number)
+            _, digest = self.snapshot(number)
+            if number in review_changed_numbers:
+                self.invalidate_active_full_ci_for_member(
+                    number,
+                    "Review evidence changed",
+                    f"Review activity changed on prefix member #{number} after full-CI promotion started.",
+                    force=number in force_review_change,
+                )
+            self.cancel_superseded_ci_runs(
+                number,
+                pull["head"]["sha"],
+                digest,
+            )
+
+    def fail_pending_full_ci_review_change(self, number: int, head: str) -> None:
+        prefix = f"full-ci:v1:{number}:{head}:"
+        for check in self.github.check_runs(head):
+            if (
+                check["status"] != "completed"
+                and self.owned(check, FULL_CI_CHECK)
+                and check.get("external_id", "").startswith(prefix)
+            ):
+                self.github.update_check(
+                    check["id"],
+                    title="Review evidence changed",
+                    summary="Review activity changed after full-CI promotion started.",
+                    conclusion="failure",
+                )
 
     def finalize_managed(self, run: dict[str, Any], match: re.Match[str]) -> None:
         number = int(match.group(1))
@@ -659,19 +1034,34 @@ class Controller:
             FULL_CI_CHECK,
             self.full_ci_external_id(number, head, requested_digest),
         )
+        if check.get("status") == "completed":
+            return
         conclusion, title = workflow_conclusion(run.get("conclusion"))
         summary = f"Workflow run {run['id']} concluded `{run.get('conclusion')}`."
         try:
+            stored_snapshot, review_fingerprints = self.full_ci_evidence(check)
+            snapshot = stored_snapshot
+            if snapshot_digest(stored_snapshot) != requested_digest:
+                raise DeliveryError("full-CI proof topology changed before finalization")
             self.current_pull(number, head)
-            snapshot, digest = self.snapshot(number)
+            current_snapshot, digest = self.snapshot(number)
             if digest != requested_digest:
                 raise DeliveryError(
                     f"topology changed from {requested_digest} to {digest} during full CI"
                 )
+            for entry in stored_snapshot["entries"]:
+                current_fingerprint = self.validate_reviews(
+                    entry["number"], entry["head"]
+                )
+                if review_fingerprints[str(entry["number"])] != current_fingerprint:
+                    raise DeliveryError(
+                        f"review evidence for pull request #{entry['number']} changed "
+                        "during full CI"
+                    )
             summary = (
                 f"Workflow run {run['id']} concluded `{run.get('conclusion')}` for candidate "
-                f"#{number}, head `{head}`, and topology `{digest}`.\n\n```json\n"
-                f"{json.dumps(snapshot, sort_keys=True, separators=(',', ':'))}\n```"
+                f"#{number}, head `{head}`, and topology `{digest}`.\n\n"
+                + self.full_ci_evidence_blocks(current_snapshot, review_fingerprints)
             )
         except DeliveryError as error:
             conclusion, title = "failure", "Full-CI evidence became stale"
@@ -773,11 +1163,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "operation",
-        choices=["enrol", "ci", "review", "full-ci", "merge", "reset", "observe", "finalize", "watchdog"],
+        choices=["enrol", "ci", "review", "diagnostic", "full-ci", "merge", "reset", "observe", "finalize", "watchdog"],
     )
     parser.add_argument("--pr-number", type=int)
     parser.add_argument("--expected-head")
     parser.add_argument("--candidate-pr-number", type=int)
+    parser.add_argument("--diagnostic-target")
+    parser.add_argument("--diagnostic-selector")
     parser.add_argument("--event-path")
     parser.add_argument("--maximum-age-minutes", type=positive_integer, default=120)
     return parser.parse_args()
@@ -799,6 +1191,13 @@ def main() -> int:
             controller.ci(require(args.pr_number, "pr-number"), require(args.expected_head, "expected-head"))
         elif args.operation == "review":
             controller.review(require(args.pr_number, "pr-number"), require(args.expected_head, "expected-head"))
+        elif args.operation == "diagnostic":
+            controller.diagnostic(
+                require(args.pr_number, "pr-number"),
+                require(args.expected_head, "expected-head"),
+                require(args.diagnostic_target, "diagnostic-target"),
+                require(args.diagnostic_selector, "diagnostic-selector"),
+            )
         elif args.operation == "full-ci":
             controller.full_ci(require(args.pr_number, "pr-number"), require(args.expected_head, "expected-head"))
         elif args.operation == "merge":

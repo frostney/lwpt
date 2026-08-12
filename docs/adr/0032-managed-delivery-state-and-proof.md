@@ -15,7 +15,9 @@ is not duplicated by another merge-admission check. This decision was
 investigated in [issues #159](https://github.com/frostney/lwpt/issues/159) and
 [#160](https://github.com/frostney/lwpt/issues/160). The provider-neutral
 review adapter was completed in
-[issue #188](https://github.com/frostney/lwpt/issues/188).
+[issue #188](https://github.com/frostney/lwpt/issues/188); progressive diagnostic
+and terminal-promotion behavior was completed in
+[issue #187](https://github.com/frostney/lwpt/issues/187).
 
 ## Considered options
 
@@ -34,6 +36,9 @@ review adapter was completed in
   default-branch finalizer.
 - Managed delivery, stack topology, and full-CI applicability can vary
   independently.
+- Native diagnostics are allow-listed, exact-head, non-proof runs. Full CI is
+  reserved for terminal promotion after base, PR CI, and active review evidence
+  converge; superseded runs are cancelled.
 - A changed head or native topology creates a new pending proof and removes
   stale readiness. Cancellation, failure, and watchdog expiry are terminal
   failures.

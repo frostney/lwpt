@@ -15,11 +15,34 @@ on:
       - ready_for_review
       - converted_to_draft
       - closed
+  pull_request_review:
+    branches:
+      - main
+      - 'codex/**'
+    types:
+      - submitted
+      - edited
+      - dismissed
+  pull_request_review_comment:
+    branches:
+      - main
+      - 'codex/**'
+    types:
+      - created
+      - edited
+      - deleted
+  check_run:
+    types:
+      - created
+      - rerequested
+      - completed
+      - requested_action
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
 permissions:
+  actions: write
   checks: write
   contents: read
   pull-requests: write

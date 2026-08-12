@@ -12,6 +12,7 @@ on:
           - enrol
           - ci
           - review
+          - diagnostic
           - full-ci
           - merge
           - reset
@@ -27,6 +28,23 @@ on:
         description: Frozen singleton/prefix top; required only for merge
         required: false
         type: number
+      diagnostic_target:
+        description: Native target for diagnostic operation
+        required: false
+        type: choice
+        options:
+          - x86_64-darwin
+          - x86_64-win64
+          - i386-win32
+      diagnostic_selector:
+        description: Allow-listed test scope for diagnostic operation
+        required: false
+        type: choice
+        options:
+          - default
+          - e2e
+          - scheduling
+          - tls
 
 permissions:
   actions: write
@@ -65,6 +83,8 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           EXPECTED_HEAD: ${{ inputs.expected_head }}
           CANDIDATE_PR_NUMBER: ${{ inputs.candidate_pr_number }}
+          DIAGNOSTIC_TARGET: ${{ inputs.diagnostic_target }}
+          DIAGNOSTIC_SELECTOR: ${{ inputs.diagnostic_selector }}
         run: |
           set -euo pipefail
           args=(
@@ -74,5 +94,11 @@ jobs:
           )
           if [ -n "$CANDIDATE_PR_NUMBER" ]; then
             args+=(--candidate-pr-number "$CANDIDATE_PR_NUMBER")
+          fi
+          if [ -n "$DIAGNOSTIC_TARGET" ]; then
+            args+=(--diagnostic-target "$DIAGNOSTIC_TARGET")
+          fi
+          if [ -n "$DIAGNOSTIC_SELECTOR" ]; then
+            args+=(--diagnostic-selector "$DIAGNOSTIC_SELECTOR")
           fi
           python3 .github/delivery/controller.py "${args[@]}"

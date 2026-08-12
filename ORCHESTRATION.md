@@ -40,6 +40,7 @@ accepted/rejected transition audit. Checks named `delivery-admission` and
 | Enrol managed delivery | `enrol` | `pr_number`, `expected_head` | `delivery:managed`; downstream readiness cleared | Pending exact-head `delivery-admission` |
 | Admit PR CI | `ci` | `pr_number`, `expected_head` | `ci:ready`; trusted read-only PR matrix dispatched | Successful exact-head `delivery-admission` |
 | Open review | `review` | `pr_number`, `expected_head` | `review:ready` after current admission succeeds | Provider-neutral review convergence remains external |
+| Run a native diagnostic | `diagnostic` | `pr_number`, `expected_head`, `diagnostic_target`, `diagnostic_selector` | No readiness mutation | Non-proof `diagnostic/...` run for one allow-listed native slice |
 | Prove full CI | `full-ci` | `pr_number` as candidate, `expected_head` | No readiness label; frozen singleton or prefix dispatched | Successful exact-head `full-ci` with topology digest |
 | Admit merge | `merge` | `pr_number`, `expected_head`, `candidate_pr_number` | `merge:ready`; validated draft may become ready | Current CI, review, replies, threads, and applicable full-CI proof |
 | Return to waiting | `reset` | `pr_number`, `expected_head` | Readiness labels cleared; managed/full-required policy retained | New pending exact-head admission when managed |
@@ -49,6 +50,18 @@ independent dimensions. A managed PR may be standalone. A native stack may be
 ordinary. Full CI may apply to either. GitHub's native `PullRequest.stack` and
 ordered entries are the sole topology authority; labels and branch names never
 declare stack membership.
+
+Diagnostics are remediation tools, never delivery proof. The trusted endpoint
+accepts only repository-declared targets and test selectors, refuses forks and
+stale heads, and dispatches no arbitrary command. A new diagnostic for the same
+PR cancels its superseded diagnostic run. The initial allow-list covers Windows
+default, E2E, and TLS slices plus bounded Intel-Darwin selected-scheduling and
+default-tier probes that capture a native process sample on timeout. `full-ci`
+is a terminal promotion:
+the candidate must be marked `ci:full-required`, integrated with its current
+base, green in exact-head PR CI, and converged under the active review policy
+before the matrix is dispatched. Head, topology, or later review change fails
+its proof and cancels the run.
 
 The endpoint promotes state but never merges. Milestone Rush or a human
 maintainer owns integration after `merge:ready`. `merge:ready` records the

@@ -472,7 +472,7 @@ jobs:
           echo "Using FPC at $FPC_BIN"
           echo "$(cygpath -w "$(dirname "$FPC_BIN")")" >> "$GITHUB_PATH"
           echo "LWPT_FPC=$(cygpath -w "$FPC_BIN")" >> "$GITHUB_ENV"
-          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1)
+          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1 || true)
           if [ -n "$INSTANTFPC_BIN" ]; then
             echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
           fi

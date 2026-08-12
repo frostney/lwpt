@@ -57,9 +57,12 @@ requirement may be marked not applicable only with a recorded reason.
   the resulting integrated-main CI become the final full-suite evidence.
 - A change touching process management, concurrency, platform-specific code,
   or the CI workflows themselves dispatches the full CI workflow on the
-  branch (`gh workflow run CI --ref <branch>`) and watches it to completion
-  before merge when the change targets platforms or tiers the PR gate
-  does not cover (post-#102 the gate covers Linux default+e2e,
+  branch and watches it to completion before merge when the change targets
+  platforms or tiers the PR gate does not cover. During remediation, use an
+  allow-listed native diagnostic slice. Dispatch the full matrix only once the
+  branch contains the current base and focused checks, required PR CI, and
+  active review evidence have converged; a later change invalidates that proof
+  (post-#102 the gate covers Linux default+e2e,
   aarch64-darwin default, and win64 offline; `x86_64-darwin`,
   `aarch64-linux`, `i386-win32`, and non-Linux e2e remain
   post-merge-only).
