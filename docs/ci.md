@@ -282,7 +282,11 @@ The scripts mirror the shape of [GocciaScript's installers](https://gocciascript
 - managed delivery: explicit transition dispatch, PR metadata observer,
   workflow-run finalizer, and scheduled watchdog as listed above
 
-A given commit triggers at most one heavyweight cross-build pipeline (`ci.yml` after merge, OR `release.yml` after tag), not both. PRs trigger only the cheap `pr.yml` (whose single win64 cross-compile rides the cached toolchain).
+A normal commit triggers one heavyweight cross-build pipeline through `ci.yml`
+after merge. A release commit later triggers `release.yml` again when tagged:
+that second cross-build stamps the tag version and produces the permanent
+release artifacts, but does not repeat the native test matrix. PRs trigger only
+the cheap `pr.yml` (whose single win64 cross-compile rides the cached toolchain).
 
 ### `delphi-native.yml` — licensed backend smoke
 
