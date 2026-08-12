@@ -51,10 +51,35 @@ class RepositoryPolicyTests(unittest.TestCase):
 
         self.assertIn("GH_TOKEN: ${{ github.token }}", transition)
         self.assertIn("cron: '*/15 * * * *'", watchdog)
-        self.assertIn("actions: read", watchdog)
-        self.assertIn("Reconcile or fail orphaned proofs", watchdog)
+        self.assertIn("actions: write", watchdog)
+        self.assertIn("Reconcile managed delivery and orphaned proofs", watchdog)
+        self.assertIn("controller.py observe", watchdog)
+        self.assertLess(
+            watchdog.index("controller.py watchdog"),
+            watchdog.index("controller.py observe"),
+        )
         self.assertIn("def recover_completed_full_ci", controller)
         self.assertIn('"ci.yml", created_after, now', controller)
+
+    def test_delivery_observer_omits_no_op_pr_events_and_duplicate_schedule(self) -> None:
+        observer = (
+            ROOT / ".github/workflows/delivery-observer.yml"
+        ).read_text(encoding="utf-8")
+        pull_request_types = observer.split("  pull_request_review:", 1)[0]
+
+        self.assertNotIn("      - opened\n", pull_request_types)
+        self.assertNotIn("      - ready_for_review\n", pull_request_types)
+        self.assertNotIn("  schedule:\n", observer)
+        for action in (
+            "reopened",
+            "synchronize",
+            "edited",
+            "labeled",
+            "unlabeled",
+            "converted_to_draft",
+            "closed",
+        ):
+            self.assertIn(f"      - {action}\n", pull_request_types)
 
     def test_diagnostics_are_allow_listed_and_proof_separated(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
