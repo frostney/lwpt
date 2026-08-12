@@ -57,6 +57,7 @@ const
     + '_PROCESS_TREE_CHANNEL_TOKEN';
   ProcessTreeAcknowledgementProtocol = PROJECT_NAME + '-ACK/1';
   SiblingCancellationStartedSuffix = '-cancellation-started';
+  NestedCompilerNaturalExitSuffix = '-natural-exit';
   SiblingSlowSources: array[0..5] of string = (
     'A.Slow.Test.pas', 'C.Slow.Test.pas', 'D.Slow.Test.pas',
     'E.Slow.Test.pas', 'F.Slow.Test.pas', 'G.Slow.Test.pas');
@@ -845,9 +846,17 @@ begin
     + PascalString(ProcessTreeProxyModeEnvironment + '=') + '))'#10
     + '        and (not SameText(Copy(Entry, 1, Length('
     + PascalString(ProcessTreeProxyPIDFileEnvironment + '=') + ')), '
-    + PascalString(ProcessTreeProxyPIDFileEnvironment + '=') + ')) then'#10
+    + PascalString(ProcessTreeProxyPIDFileEnvironment + '=') + '))'#10
+    + '        and (not SameText(Copy(Entry, 1, Length('
+    + PascalString(ManagedProcessTreeEnvironment + '=') + ')), '
+    + PascalString(ManagedProcessTreeEnvironment + '=') + ')) then'#10
     + '        Child.Environment.Add(Entry);'#10
     + '    end;'#10
+    + '    { Delegate the inherited acknowledgement channel to the direct'#10
+    + '      child with the parent identity it will validate. }'#10
+    + '    Child.Environment.Add('
+    + PascalString(ManagedProcessTreeEnvironment + '=')
+    + ' + IntToStr(GetProcessID));'#10
     + '    Child.Environment.Add('
     + PascalString(CompilerExecutableEnvironment + '='
       + ExpandFileName(ParamStr(0))) + ');'#10
@@ -880,6 +889,8 @@ begin
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
 
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
+  Expect<Boolean>(FileExists(PIDFile + NestedCompilerNaturalExitSuffix))
+    .ToBe(False);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
   CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
@@ -2050,6 +2061,10 @@ begin
       end;
     end;
     Sleep(LongRunningFixtureMilliseconds);
+    if Mode = IgnoreTerminateCompilerProxyMode then
+      { Reaching the safety exit means cancellation failed to reap the proxy. }
+      WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
+        UIntToStr(GetTickCount64));
     Exit(0);
   end;
 
