@@ -38,6 +38,24 @@ class RepositoryPolicyTests(unittest.TestCase):
         ):
             self.assertIn(f"`{operation}`", policy)
 
+    def test_token_dispatched_full_ci_has_scheduled_terminal_recovery(self) -> None:
+        transition = (
+            ROOT / ".github/workflows/delivery-transition.yml"
+        ).read_text(encoding="utf-8")
+        watchdog = (
+            ROOT / ".github/workflows/delivery-watchdog.yml"
+        ).read_text(encoding="utf-8")
+        controller = (
+            ROOT / ".github/delivery/controller.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("GH_TOKEN: ${{ github.token }}", transition)
+        self.assertIn("cron: '*/15 * * * *'", watchdog)
+        self.assertIn("actions: read", watchdog)
+        self.assertIn("Reconcile or fail orphaned proofs", watchdog)
+        self.assertIn("def recover_completed_full_ci", controller)
+        self.assertIn('"ci.yml", created_after, now', controller)
+
     def test_diagnostics_are_allow_listed_and_proof_separated(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         for value in (
@@ -87,17 +105,39 @@ class RepositoryPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             (tmp / "build").mkdir()
+            (tmp / "bin").mkdir()
             fake = tmp / "build/lwpt"
             fake.write_text(
-                "#!/usr/bin/env python3\nimport time\ntime.sleep(0.75)\n",
+                "#!/usr/bin/env bash\n"
+                "echo $$ > \"$RUNNER_TEMP/fake-lwpt.pid\"\n"
+                "while [ ! -f \"$RUNNER_TEMP/release-lwpt\" ]; do\n"
+                "  /bin/sleep 0.01\n"
+                "done\n",
                 encoding="utf-8",
             )
             fake.chmod(0o755)
+            controlled_sleep = tmp / "bin/sleep"
+            controlled_sleep.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$RUNNER_TEMP/release-lwpt\"\n"
+                "while [ ! -s \"$RUNNER_TEMP/fake-lwpt.pid\" ]; do\n"
+                "  /bin/sleep 0.01\n"
+                "done\n"
+                "pid=$(cat \"$RUNNER_TEMP/fake-lwpt.pid\")\n"
+                "while kill -0 \"$pid\" 2>/dev/null; do\n"
+                "  state=$(ps -p \"$pid\" -o stat= 2>/dev/null || true)\n"
+                "  case \"$state\" in *Z*) break ;; esac\n"
+                "  /bin/sleep 0.01\n"
+                "done\n",
+                encoding="utf-8",
+            )
+            controlled_sleep.chmod(0o755)
             env = os.environ.copy()
             env.update(
                 {
-                    "LWPT_SCHEDULING_DIAGNOSTIC_POLL_SECONDS": "0.5",
-                    "LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT": "2",
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "LWPT_SCHEDULING_DIAGNOSTIC_POLL_SECONDS": "1",
+                    "LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT": "1",
                     "RUNNER_TEMP": raw_tmp,
                 }
             )

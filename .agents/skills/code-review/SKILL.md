@@ -36,9 +36,15 @@ mode.
   mutation.
 
 Safe probes include declared checks, local builds and servers, disposable
-repros, isolated test data, browser interaction, and temporary artifacts. Clean
-up disposable artifacts and report retained ones. Ask before any persistent or
-externally visible side effect.
+repros, isolated test data, browser interaction, temporary artifacts, and
+revert-clean falsification probes. A falsification probe temporarily introduces
+one targeted wrong behavior to prove the relevant test or gate fails for the
+right reason. Record the initial tree state, prefer a disposable worktree or
+copy, restore the mutation immediately, compare the final tree byte-for-byte
+with the recorded state, and report the mutation and observed failure. Skip the
+probe and mark the evidence static-only when exact restoration is not safe.
+Clean up disposable artifacts and report retained ones. Ask before any
+persistent or externally visible side effect.
 
 A request to save JSON authorizes only the named findings artifact in default
 mode; it does not authorize remediation. For ordinary review findings, read
@@ -72,9 +78,10 @@ validation, verdict, and report.
    bounded scope, inspected supporting context, exact probes and observed
    results, candidate findings with evidence, impact, and smallest remedy,
    verified claims, limitations, and `complete` or `incomplete` status.
-5. Validate every candidate against the current checkout, deduplicate and
-   reconcile conflicts across lanes, then assign final IDs, severities,
-   categories, and verdict. Do not repeat a completed lane wholesale.
+5. Validate every candidate against the current checkout, apply the
+   de-duplication model below, reconcile conflicts across lanes, then assign
+   final IDs, severities, categories, and verdict. Do not repeat a completed
+   lane wholesale.
 6. If sub-agents are unsupported, unavailable after any applicable bounded
    retry, or leave a lane incomplete, complete that lane directly. Report the
    affected lane and reason as a single-agent fallback. Temporary capacity
@@ -157,7 +164,10 @@ selected prior findings.
    cover claim fidelity, correctness, simplification, self-documentation, test
    value, and operational behavior. Add UI/accessibility, trust boundaries,
    persistence/migrations, concurrency, compatibility, deployment/rollback,
-   observability, or performance only when the change touches those surfaces.
+   observability, performance, or discoverability only when the change touches
+   those surfaces. Activate discoverability for changes to public pages,
+   routing, metadata, crawl controls, structured data, public content, or
+   web-performance behavior.
 6. Measure churn for every changed file in the finding scope and, where history
    can identify it reliably, each changed function, method, class, or module.
    Follow renames, state the history window, and record touch count and line
@@ -190,6 +200,26 @@ finding.
 
 Keep the axes distinct so one cannot mask the other.
 
+### De-duplication
+
+Apply four separate checks across the bounded change and its minimum supporting
+context:
+
+- **Implementation:** find repeated code, logic, tests, fixtures, configuration,
+  schemas, workflows, documentation, or competing representations of one
+  concept.
+- **Work:** reuse current issue decisions, prior findings, investigations, and
+  accepted remediation evidence instead of repeating them. Revalidate rather
+  than rediscover when their scope overlaps the change.
+- **Evidence:** coalesce the same event reported by multiple checks, logs, or
+  tools so it is counted once while retaining every source.
+- **Output:** combine candidates with the same cause, impact, and remedy into one
+  finding, preserve provenance, and explicitly reconcile contradictory evidence.
+
+Do not expand finding scope beyond the bounded change. Duplication visible only
+in supporting context can support an in-scope finding but is not a separate
+finding there.
+
 ### Claim and specification
 
 Find missing or partial requirements, incorrect behavior, and unrequested scope.
@@ -219,6 +249,16 @@ Cite the originating requirement or identify the claim as inferred.
   current official documentation or source. Repository decisions override
   generic preferences.
 
+### Discoverability
+
+For an active public-web surface, verify crawl and index controls, canonical and
+descriptive metadata, internal discovery paths, structured data that matches
+visible content, semantic content structure, rendering, and material web
+performance. Assess conventional search and AI-assisted discovery together,
+while keeping crawler access, search inclusion, and model-training controls
+distinct. Use current official search-engine and publisher guidance; do not
+invent special AEO markup, keywords, or guarantees.
+
 ## Fresh-review report
 
 For a fresh review, lead with the verdict: `APPROVE`,
@@ -235,8 +275,11 @@ Include:
   incomplete lanes, and every coordinator-completed fallback with its reason;
 - the churn window, symbol/file coverage, and architectural-risk hotspots;
 - exact probes and checks with observed results;
+- de-duplication coverage, coalesced evidence sources, and merged or conflicted
+  candidate findings;
 - actionable findings as
-  `[CR-N][BLOCKING|IMPORTANT|IMPROVEMENT][CLAIM|QUALITY|ARCHITECTURE_RISK]
+  `[CR-N][BLOCKING|IMPORTANT|IMPROVEMENT][CLAIM|QUALITY|ARCHITECTURE_RISK|
+  DISCOVERABILITY]
   file:line — evidence, impact, smallest remedy`;
 - verified claims, static-only or unreached areas, and retained probe artifacts.
 

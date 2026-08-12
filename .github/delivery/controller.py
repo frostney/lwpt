@@ -12,7 +12,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -218,6 +218,50 @@ class GitHub:
                 )
             runs.extend(result["workflow_runs"])
         return runs
+
+    def completed_workflow_runs(
+        self,
+        workflow: str,
+        created_after: datetime,
+        created_before: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        def formatted(value: datetime) -> str:
+            return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def load_range(start: datetime, finish: datetime) -> list[dict[str, Any]]:
+            query = urllib.parse.urlencode(
+                {
+                    "event": "workflow_dispatch",
+                    "status": "completed",
+                    "created": f"{formatted(start)}..{formatted(finish)}",
+                    "per_page": 100,
+                    "page": 1,
+                }
+            )
+            result = self.request(
+                "GET",
+                f"/repos/{self.repository}/actions/workflows/{workflow}/runs?{query}",
+            )
+            total = result["total_count"]
+            if total > 100:
+                if (finish - start).total_seconds() <= 1:
+                    raise DeliveryError(
+                        "completed workflow-run recovery exceeds GitHub's "
+                        "100-result stable range within one second"
+                    )
+                midpoint = start + (finish - start) / 2
+                midpoint = midpoint.replace(microsecond=0)
+                return load_range(start, midpoint) + load_range(
+                    midpoint + timedelta(seconds=1), finish
+                )
+
+            return list(result["workflow_runs"])
+
+        start = created_after.astimezone(timezone.utc).replace(microsecond=0)
+        finish = (created_before or datetime.now(timezone.utc)).astimezone(
+            timezone.utc
+        ).replace(microsecond=0)
+        return load_range(start, finish)
 
     def cancel_run(self, run_id: int) -> None:
         try:
@@ -1121,8 +1165,47 @@ class Controller:
         elif run.get("name") == "PR":
             self.finalize_ordinary(run)
 
+    def recover_completed_full_ci(self, now: datetime) -> set[int]:
+        pending: dict[int, dict[str, Any]] = {}
+        for pull in self.github.open_pulls():
+            for check in self.github.check_runs(pull["head"]["sha"]):
+                if (
+                    check["status"] != "completed"
+                    and self.owned(check, FULL_CI_CHECK)
+                ):
+                    pending[check["id"]] = check
+        if not pending:
+            return set()
+
+        recovered: set[int] = set()
+        created_after = min(
+            datetime.fromisoformat(check["started_at"].replace("Z", "+00:00"))
+            for check in pending.values()
+        )
+        if created_after.tzinfo is None:
+            created_after = created_after.replace(tzinfo=timezone.utc)
+        for run in self.github.completed_workflow_runs(
+            "ci.yml", created_after, now
+        ):
+            match = FULL_CI_RUN_RE.match(run.get("display_title", ""))
+            if not match:
+                continue
+            check_id = int(match.group(4))
+            check = pending.get(check_id)
+            if check is None:
+                continue
+            expected_external_id = self.full_ci_external_id(
+                int(match.group(1)), match.group(2), match.group(3)
+            )
+            if check.get("external_id") != expected_external_id:
+                continue
+            self.finalize_full_ci(run, match)
+            recovered.add(check_id)
+        return recovered
+
     def watchdog(self, maximum_age_minutes: int) -> None:
         now = datetime.now(timezone.utc)
+        recovered = self.recover_completed_full_ci(now)
         for pull in self.github.open_pulls():
             head = pull["head"]["sha"]
             for check in self.github.check_runs(head):
@@ -1130,7 +1213,7 @@ class Controller:
                     self.owned(check, DELIVERY_CHECK) or self.owned(check, FULL_CI_CHECK)
                 ):
                     continue
-                if check["status"] == "completed":
+                if check["status"] == "completed" or check["id"] in recovered:
                     continue
                 if watchdog_expired(check["started_at"], maximum_age_minutes, now):
                     self.github.update_check(

@@ -2,7 +2,7 @@ name: Delivery proof watchdog
 
 on:
   schedule:
-    - cron: '13,43 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       maximum_age_minutes:
@@ -12,6 +12,7 @@ on:
         default: 120
 
 permissions:
+  actions: read
   checks: write
   contents: read
   pull-requests: write
@@ -29,7 +30,7 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Fail orphaned proofs
+      - name: Reconcile or fail orphaned proofs
         env:
           GH_TOKEN: ${{ github.token }}
           MAXIMUM_AGE_MINUTES: ${{ inputs.maximum_age_minutes || 120 }}

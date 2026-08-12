@@ -33,7 +33,9 @@ and terminal-promotion behavior was completed in
 
 - Workflows with write permission never check out or execute pull-request
   code. Read-only exact-head matrices are concluded by a trusted
-  default-branch finalizer.
+  default-branch finalizer; the scheduled watchdog feeds terminal full-CI runs
+  through that same finalizer when `GITHUB_TOKEN` event suppression prevents a
+  `workflow_run` delivery.
 - Managed delivery, stack topology, and full-CI applicability can vary
   independently.
 - Native diagnostics are allow-listed, exact-head, non-proof runs. Full CI is

@@ -93,9 +93,9 @@ policy, never reinterpret a visible failure as green.
 - For every active review tool, inspect inline threads plus top-level status,
   summaries, suggestions, and nitpicks. A rate limit, quota response, error,
   incomplete run, missing verdict, or review against an older head is pending.
-- When a repository has a review-automation registry, derive active tools from
-  its actors and check contexts. Include every active tool's top-level status
-  and every unresolved inline or top-level nitpick without hardcoding a vendor.
+- For every active automation, include its current-head summary or walkthrough
+  status and every unresolved inline or top-level nitpick. Apply the same
+  evidence-based semantics without hardcoding a provider.
 - Do not infer that source changes resolved a finding. Use the current forge
   resolution and verdict evidence; expose uncertainty as a blocker.
 

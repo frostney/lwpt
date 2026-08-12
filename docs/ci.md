@@ -15,8 +15,8 @@ finalizers with write permission always run trusted default-branch code.
 | `delivery-transition.yml` | `workflow_dispatch` | Trusted explicit `enrol`, `ci`, `review`, `diagnostic`, `full-ci`, `merge`, or `reset` endpoint |
 | `delivery-pr.yml` | controller `workflow_dispatch` | Run `pr.yml` read-only for one admitted exact head |
 | `delivery-observer.yml` | PR metadata, schedule, manual | Create pending checks and invalidate stale head/base/topology evidence |
-| `delivery-finalizer.yml` | `workflow_run` completion | Conclude ordinary, managed, cancelled, and full-CI exact checks |
-| `delivery-watchdog.yml` | schedule, manual | Fail proof checks left nonterminal for 120 minutes |
+| `delivery-finalizer.yml` | `workflow_run` completion | Conclude ordinary, managed, cancelled, and full-CI exact checks when GitHub emits the event |
+| `delivery-watchdog.yml` | 15-minute schedule, manual | Reconcile terminal full-CI runs, then fail proof checks left nonterminal for 120 minutes |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
@@ -77,8 +77,16 @@ The endpoint and finalizer communicate through a trusted workflow run name
 containing PR, SHA, topology digest where applicable, and check-run ID. The
 read-only workflow cannot conclude its check. The default-branch finalizer
 re-fetches the PR and native topology, binds the workflow result to the current
-check, and then records success or terminal failure. Cancelled runs are failure;
-the watchdog supplies the same terminal result for orphaned runs.
+check, and then records success or terminal failure. A full-CI run dispatched
+by `delivery-transition.yml` inherits the repository `GITHUB_TOKEN`; GitHub
+allows that explicit `workflow_dispatch` but suppresses its subsequent
+`workflow_run` event. The trusted watchdog therefore discovers terminal
+full-CI runs every 15 minutes and passes their bound identity through the same
+finalizer before applying its 120-minute timeout. Creation-time queries are
+split until each result fits one page, avoiding both GitHub's filtered
+1,000-result cap and offset pagination over a changing completed-run set.
+Cancelled runs are failures, and duplicate or reordered observations are
+harmless because a completed check is terminal.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
 initial surface covers Windows x86_64/i386 default, E2E, and TLS slices, plus an
