@@ -13,9 +13,9 @@ finalizers with write permission always run trusted default-branch code.
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
 | `delphi-native.yml` | `workflow_dispatch` | Optional Delphi 12+ Win64 smoke on a licensed self-hosted runner; never a required gate |
 | `delivery-transition.yml` | `workflow_dispatch` | Trusted explicit `enrol`, `ci`, `review`, `diagnostic`, `full-ci`, `merge`, or `reset` endpoint |
-| `delivery-observer.yml` | PR metadata, schedule, manual | Invalidate stale managed readiness and full-CI evidence |
+| `delivery-observer.yml` | State-changing PR metadata, manual | Invalidate stale managed readiness and full-CI evidence |
 | `delivery-finalizer.yml` | `workflow_run` completion | Conclude full-CI proof when GitHub emits the event |
-| `delivery-watchdog.yml` | 15-minute schedule, manual | Reconcile terminal full-CI runs, then fail full-CI proofs left nonterminal for 120 minutes |
+| `delivery-watchdog.yml` | 15-minute schedule, manual | Reconcile managed state and terminal full-CI runs, then fail full-CI proofs left nonterminal for 120 minutes |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
@@ -75,6 +75,15 @@ split until each result fits one page, avoiding both GitHub's filtered
 1,000-result cap and offset pagination over a changing completed-run set.
 Cancelled runs are failures, and duplicate or reordered observations are
 harmless because a completed full-CI check is terminal.
+
+The observer listens only for PR actions that can alter a managed head,
+topology, review proof, phase label, draft state, or closure. Opening an
+unenrolled PR and marking a draft ready cannot invalidate managed state, so
+those actions do not start reconciliation. The watchdog's existing scheduled
+run recovers orphaned proofs before performing the periodic all-PR sweep, while
+manual observer dispatch remains available for an immediate repair. External
+check events that do not match a configured review adapter return before that
+sweep.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
 initial surface covers Windows x86_64/i386 default, E2E, and TLS slices, plus an

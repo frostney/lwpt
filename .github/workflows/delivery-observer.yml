@@ -6,13 +6,11 @@ on:
       - main
       - 'codex/**'
     types:
-      - opened
       - reopened
       - synchronize
       - edited
       - labeled
       - unlabeled
-      - ready_for_review
       - converted_to_draft
       - closed
   pull_request_review:
@@ -37,8 +35,6 @@ on:
       - rerequested
       - completed
       - requested_action
-  schedule:
-    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -55,8 +51,8 @@ jobs:
   reconcile:
     runs-on: ubuntu-latest
     steps:
-      # pull_request_target and schedule both resolve this checkout from the
-      # default branch. No pull-request code is fetched or executed here.
+      # Event and manual reconciliation both execute trusted default-branch
+      # code. No pull-request code is fetched or executed here.
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
