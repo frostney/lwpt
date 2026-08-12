@@ -462,7 +462,7 @@ jobs:
           # under WoW64 while the downloaded LWPT artifact keeps its own target.
           LWPT_FPC_VALUE=$(cygpath -w "$FPC_BIN")
           echo "LWPT_FPC=$LWPT_FPC_VALUE" >> "$GITHUB_ENV"
-          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1)
+          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1 || true)
           if [ -n "$INSTANTFPC_BIN" ]; then
             echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
           fi
