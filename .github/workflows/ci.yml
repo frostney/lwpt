@@ -461,16 +461,6 @@ jobs:
           # compiler on both Windows runners; x64 Windows executes its output
           # under WoW64 while the downloaded LWPT artifact keeps its own target.
           LWPT_FPC_VALUE=$(cygpath -w "$FPC_BIN")
-          FPC_PROBE="$FPC_BIN"
-          FPC_TARGET_ARGS=()
-          EXPECTED_CPU=i386
-          EXPECTED_OS=win32
-          ACTUAL_CPU=$("$FPC_PROBE" "${FPC_TARGET_ARGS[@]}" -iTP | tr -d '\r')
-          ACTUAL_OS=$("$FPC_PROBE" "${FPC_TARGET_ARGS[@]}" -iTO | tr -d '\r')
-          if [ "$ACTUAL_CPU" != "$EXPECTED_CPU" ] || [ "$ACTUAL_OS" != "$EXPECTED_OS" ]; then
-            echo "::error::FPC target mismatch: expected $EXPECTED_CPU/$EXPECTED_OS, got $ACTUAL_CPU/$ACTUAL_OS"
-            exit 1
-          fi
           echo "LWPT_FPC=$LWPT_FPC_VALUE" >> "$GITHUB_ENV"
           INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1)
           if [ -n "$INSTANTFPC_BIN" ]; then

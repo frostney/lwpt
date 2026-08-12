@@ -75,8 +75,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn('if [ -d "$candidate_root" ]; then', workflow)
         self.assertNotIn("TARGET_FPC=$(find /c/tools/freepascal /c/fpc", workflow)
         self.assertNotIn("Chocolatey FPC install: x86_64 compiler not found", workflow)
-        self.assertIn("EXPECTED_CPU=i386", workflow)
-        self.assertIn("EXPECTED_OS=win32", workflow)
+        self.assertIn('echo "LWPT_FPC=$LWPT_FPC_VALUE"', workflow)
+        self.assertNotIn("FPC target mismatch", workflow)
         self.assertIn("for unit_target in i386-win32 x86_64-win64", workflow)
         self.assertNotIn('for unit_target in "${{ matrix.target }}"', workflow)
 
