@@ -161,6 +161,9 @@ jobs:
       - name: Bootstrap (cold build of build/lwpt)
         run: ./bootstrap.sh
 
+      - name: Test inventory documentation is generated
+        run: instantfpc -Fu./source -Fi./source scripts/update-test-inventory.pas --check
+
       - name: lwpt --help (binary loads?)
         run: ./build/lwpt --help
 

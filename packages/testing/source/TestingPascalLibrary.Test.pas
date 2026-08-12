@@ -31,13 +31,15 @@ program TestingPascalLibrary.Test;
 uses
   SysUtils,
 
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  TestingPascalLibrary.Protocol;
 
 type
   TCanarySuite = class(TTestSuite)
   public
     procedure SetupTests; override;
     procedure TestAddsAFakeAssertion;
+    procedure TestInventoryRequestIsConsumedBeforeBodies;
   end;
 
   { Deliberately failing suite: pins Run's fail-the-process default
@@ -51,6 +53,15 @@ type
 procedure TCanarySuite.SetupTests;
 begin
   Test('canary always assigns FHasAssertions', TestAddsAFakeAssertion);
+  Test('inventory authorization is consumed before test bodies',
+    TestInventoryRequestIsConsumedBeforeBodies);
+end;
+
+procedure TCanarySuite.TestInventoryRequestIsConsumedBeforeBodies;
+begin
+  Expect<string>(GetEnvironmentVariable(TEST_INVENTORY_ENVIRONMENT)).ToBe('');
+  Expect<string>(GetEnvironmentVariable(
+    TEST_INVENTORY_EXECUTABLE_ENVIRONMENT)).ToBe('');
 end;
 
 procedure TFailingCanarySuite.SetupTests;
@@ -74,12 +85,31 @@ begin
   Expect<Boolean>(True).ToBe(True);
 end;
 
+procedure TestInventoryProtocol;
+var
+  Runner: TTestRunner;
+begin
+  Runner := TTestRunner.Create;
+  try
+    Runner.AddSuite(TCanarySuite.Create('inventory canary'));
+    if Runner.InventoryLine <> TEST_INVENTORY_PREFIX + '1'#9'2' then
+    begin
+      WriteLn(ErrOutput, 'FATAL: inventory protocol mismatch: ',
+        Runner.InventoryLine);
+      Halt(15);
+    end;
+  finally
+    Runner.Free;
+  end;
+end;
+
 var
   Suite: TCanarySuite;
   Runner: TTestRunner;
   Passed, Failed: Integer;
   R: TTestResult;
 begin
+  TestInventoryProtocol;
   WriteLn('TestingPascalLibrary canary starting');
 
   if not Assigned(TestRunnerProgram) then
@@ -122,10 +152,10 @@ begin
         tsFail: Inc(Failed);
       end;
 
-    if (Passed <> 1) or (Failed <> 0) then
+    if (Passed <> 2) or (Failed <> 0) then
     begin
       WriteLn(ErrOutput, Format(
-        'FATAL: expected 1 pass / 0 fail; got %d pass / %d fail',
+        'FATAL: expected 2 passes / 0 fail; got %d pass / %d fail',
         [Passed, Failed]));
       Halt(14);
     end;

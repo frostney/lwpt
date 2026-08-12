@@ -16,10 +16,10 @@ uses
 function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
   const AHostOS, AHostArchitecture: string): Boolean;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
-  const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings): Integer; overload;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
-  const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings;
   const ACompilerHost: TLWPTCompilerHost): Integer; overload;
 
@@ -29,6 +29,7 @@ uses
   Process,
   SysUtils,
 
+  LWPT.Analysis.JSON,
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.CompilerDriver,
@@ -38,8 +39,10 @@ uses
   LWPT.ProcessRunner,
   LWPT.ProcessTree,
   LWPT.ProgressReporter,
+  LWPT.TestInventory,
   LWPT.WorkerBudget,
-  Platform;
+  Platform,
+  TestingPascalLibrary.Protocol;
 
 function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
   const AHostOS, AHostArchitecture: string): Boolean;
@@ -85,6 +88,8 @@ type
     Status: TTestJobStatus;
     StartedAt: QWord;
     ActiveProcessRunner: TLWPTDuplexProcessRunner;
+    InventorySuites: Integer;
+    InventoryCases: Integer;
   end;
 
   TTestProgressKind = (tpkStart, tpkTerminal);
@@ -129,6 +134,9 @@ type
     FCompilerDriver: TLWPTCompilerDriver;
     FProjectRoot: string;
     FVerbose: Boolean;
+    FInventory: Boolean;
+    FExpectedInventory: TLWPTTestInventory;
+    FCompleteDiscovery: Boolean;
     FReporter: TLWPTProgressReporter;
     FStartedReported: array of Boolean;
     FTerminalReported: array of Boolean;
@@ -153,6 +161,7 @@ type
       const AStatus: TTestJobStatus; const AExitCode: Integer = 0);
     procedure FailJob(const AIndex: Integer; const AStatus: TTestJobStatus;
       const AExitCode: Integer; const AMessage: string = '');
+    procedure SetInventoryCounts(const AIndex, ASuites, ACases: Integer);
     procedure AbortWithError(const AIndex: Integer; const AMessage: string);
     procedure CancelPendingAndActiveLocked;
     function IsCancelled: Boolean;
@@ -167,11 +176,15 @@ type
       const ACompilerArguments: TStringArray; const ABuildRoot: string;
       const AJobs, ABail: Integer;
       const ASession: TLWPTBuildSession; const AProjectRoot: string;
-      const AVerbose: Boolean; const ACompilerDriver: TLWPTCompilerDriver);
+      const AVerbose, AInventory, ACompleteDiscovery: Boolean;
+      const AInventoryPath: string;
+      const ACompilerDriver: TLWPTCompilerDriver);
     destructor Destroy; override;
     procedure Run;
     procedure PrintResults(const AProjectRoot: string; out APassed,
       AFailed, ACompileFailed, ASkipped, ACancelled: Integer);
+    function InventoryJSON(const AProjectRoot: string): string;
+    procedure ValidateInventory(const AProjectRoot: string);
     property InternalError: string read FInternalError;
     function EffectiveWorkerCount: Integer;
   end;
@@ -363,7 +376,9 @@ constructor TTestScheduler.Create(const ATests: TStringList;
   const ACompilerArguments: TStringArray; const ABuildRoot: string;
   const AJobs, ABail: Integer;
   const ASession: TLWPTBuildSession; const AProjectRoot: string;
-  const AVerbose: Boolean; const ACompilerDriver: TLWPTCompilerDriver);
+  const AVerbose, AInventory, ACompleteDiscovery: Boolean;
+  const AInventoryPath: string;
+  const ACompilerDriver: TLWPTCompilerDriver);
 var
   i, Runnable, RequestedWorkers: Integer;
 begin
@@ -375,6 +390,10 @@ begin
   FSession := ASession;
   FProjectRoot := AProjectRoot;
   FVerbose := AVerbose;
+  FInventory := AInventory;
+  FCompleteDiscovery := ACompleteDiscovery;
+  if AInventoryPath <> '' then
+    FExpectedInventory := TLWPTTestInventory.Create(AInventoryPath);
   FReporter := TLWPTProgressReporter.Create(ASession, lpsTest);
   FBail := ABail;
   FNextIndex := 0;
@@ -394,7 +413,8 @@ begin
     FJobs[i].Source := ATests[i];
     FReporter.RegisterJob(ObservabilityTestIdentityNamespace + ATests[i],
       TestDisplayPath(AProjectRoot, ATests[i]));
-    if (not AIncludeE2E) and IsE2ETestPath(ATests[i]) then
+    if (not AInventory) and (not AIncludeE2E)
+       and IsE2ETestPath(ATests[i]) then
       FJobs[i].Status := tjsSkipped
     else
     begin
@@ -416,6 +436,7 @@ destructor TTestScheduler.Destroy;
 var
   i: Integer;
 begin
+  FExpectedInventory.Free;
   FReporter.Free;
   for i := 0 to FWorkers.Count - 1 do TTestWorker(FWorkers[i]).Free;
   FWorkers.Free;
@@ -635,6 +656,18 @@ begin
   end;
 end;
 
+procedure TTestScheduler.SetInventoryCounts(const AIndex, ASuites,
+  ACases: Integer);
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    FJobs[AIndex].InventorySuites := ASuites;
+    FJobs[AIndex].InventoryCases := ACases;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+end;
+
 procedure TTestScheduler.AbortWithError(const AIndex: Integer;
   const AMessage: string);
 begin
@@ -663,14 +696,73 @@ begin
   end;
 end;
 
+procedure SetChildEnvironmentEntry(const AEnvironment: TStrings;
+  const AName, AValue: string);
+var
+  i, Separator: Integer;
+  ExistingName: string;
+begin
+  for i := AEnvironment.Count - 1 downto 0 do
+  begin
+    Separator := Pos('=', AEnvironment[i]);
+    if Separator = 0 then ExistingName := AEnvironment[i]
+    else ExistingName := Copy(AEnvironment[i], 1, Separator - 1);
+    {$IFDEF MSWINDOWS}
+    if SameText(ExistingName, AName) then AEnvironment.Delete(i);
+    {$ELSE}
+    if ExistingName = AName then AEnvironment.Delete(i);
+    {$ENDIF}
+  end;
+  AEnvironment.Add(AName + '=' + AValue);
+end;
+
+function ParseInventoryOutput(const AOutput: string; out ASuites,
+  ACases: Integer): Boolean;
+var
+  Fields, Lines: TStringList;
+  Found: Boolean;
+  Cases, Suites, i: Integer;
+begin
+  Result := False;
+  ASuites := 0;
+  ACases := 0;
+  Found := False;
+  Fields := TStringList.Create;
+  Lines := TStringList.Create;
+  try
+    Lines.Text := AOutput;
+    Fields.StrictDelimiter := True;
+    Fields.Delimiter := #9;
+    for i := 0 to Lines.Count - 1 do
+      if Copy(Lines[i], 1, Length(TEST_INVENTORY_PREFIX))
+         = TEST_INVENTORY_PREFIX then
+      begin
+        Fields.DelimitedText := Copy(Lines[i],
+          Length(TEST_INVENTORY_PREFIX) + 1, MaxInt);
+        if (Fields.Count <> 2)
+           or not TryStrToInt(Fields[0], Suites)
+           or not TryStrToInt(Fields[1], Cases)
+           or (Suites < 0) or (Cases < 0) then Exit;
+        if Found and ((Suites <> ASuites) or (Cases <> ACases)) then Exit;
+        ASuites := Suites;
+        ACases := Cases;
+        Found := True;
+      end;
+    Result := Found;
+  finally
+    Lines.Free;
+    Fields.Free;
+  end;
+end;
+
 procedure TTestScheduler.RunOne(const AIndex: Integer;
   const ALease: TLWPTWorkerLease);
 var
   CompilerProcess, TestProcess: TProcess;
-  Binary, Output, StandardOutput, StandardError: string;
+  Binary, InventoryMode, Output, StandardOutput, StandardError: string;
   BuildRequest: TLWPTBuildRequest;
   BuildResult: TLWPTBuildResult;
-  Code: Integer;
+  Code, InventorySuites, InventoryCases: Integer;
 begin
   try
     CompilerProcess := CreatePascalCompilerProcess(FJobs[AIndex].Source,
@@ -734,6 +826,15 @@ begin
     TestProcess.Executable := Binary;
     CopyCurrentEnvironment(TestProcess.Environment);
     AppendWorkerLeaseEnvironment(TestProcess.Environment, ALease);
+    if FInventory or (FExpectedInventory <> nil) then
+    begin
+      if FInventory then InventoryMode := TEST_INVENTORY_MODE_ONLY
+      else InventoryMode := TEST_INVENTORY_MODE_REPORT;
+      SetChildEnvironmentEntry(TestProcess.Environment,
+        TEST_INVENTORY_ENVIRONMENT, InventoryMode);
+      SetChildEnvironmentEntry(TestProcess.Environment,
+        TEST_INVENTORY_EXECUTABLE_ENVIRONMENT, Binary);
+    end;
     try
       Code := RunProcess(AIndex, TestProcess, '', False, 0,
         'test executable', Output, StandardError);
@@ -755,6 +856,17 @@ begin
     TestProcess.Free;
   end;
   SetJobOutput(AIndex, False, Output);
+  if Code = 0 then
+  begin
+    if ParseInventoryOutput(Output, InventorySuites, InventoryCases) then
+      SetInventoryCounts(AIndex, InventorySuites, InventoryCases)
+    else if FInventory or (FExpectedInventory <> nil) then
+    begin
+      FailJob(AIndex, tjsRunFailed, 1,
+        'test executable did not emit one valid inventory record');
+      Exit;
+    end;
+  end;
   if IsCancelled then
     CompleteJob(AIndex, tjsCancelled)
   else if Code = 0 then
@@ -931,10 +1043,11 @@ begin
   for i := 0 to FWorkers.Count - 1 do TTestWorker(FWorkers[i]).Start;
   try
     repeat
-      while NextProgressEvent(Event) do PrintProgressEvent(Event);
+      while NextProgressEvent(Event) do
+        if not FInventory then PrintProgressEvent(Event);
       if AllJobsTerminal then Break;
       NowTick := GetTickCount64;
-      if FReporter.HeartbeatDue(NowTick) then
+      if (not FInventory) and FReporter.HeartbeatDue(NowTick) then
       begin
         HeartbeatEvent := TLWPTHeartbeatEvent.Create('test',
           FSession.SessionID, NowTick - InvocationStartedAt);
@@ -957,7 +1070,8 @@ begin
     raise;
   end;
   for i := 0 to FWorkers.Count - 1 do TTestWorker(FWorkers[i]).WaitFor;
-  while NextProgressEvent(Event) do PrintProgressEvent(Event);
+  while NextProgressEvent(Event) do
+    if not FInventory then PrintProgressEvent(Event);
 end;
 
 procedure TTestScheduler.PrintResults(const AProjectRoot: string;
@@ -1016,6 +1130,100 @@ begin
   end;
 end;
 
+function InventoryTier(const APath: string): string;
+var
+  Normalised: string;
+begin
+  Normalised := CanonicalPathGlob(APath);
+  if IsE2ETestPath(Normalised) then Result := 'e2e'
+  else if Pos('/tests/integration/', '/' + Normalised) > 0 then
+    Result := 'integration'
+  else Result := 'unit';
+end;
+
+function TTestScheduler.InventoryJSON(const AProjectRoot: string): string;
+var
+  i: Integer;
+  DisplayPath, Separator: string;
+begin
+  Result := '{"schema":"' + PROGRAM_NAME
+    + '.test-inventory","version":1,"platform":{"os":'
+    + JSONString(Platform.GetBuildOS) + ',"architecture":'
+    + JSONString(Platform.GetBuildArch) + '},"programs":[';
+  Separator := '';
+  for i := 0 to High(FJobs) do
+  begin
+    DisplayPath := CanonicalPathGlob(ExtractRelativePath(
+      IncludeTrailingPathDelimiter(AProjectRoot), FJobs[i].Source));
+    if FJobs[i].Status <> tjsPassed then
+      raise ELWPTError.CreateFmt(
+        'test inventory failed for "%s": %s',
+        [DisplayPath, FJobs[i].ErrorMessage]);
+    Result := Result + Separator + '{"path":' + JSONString(DisplayPath)
+      + ',"tier":' + JSONString(InventoryTier(DisplayPath))
+      + ',"suites":' + IntToStr(FJobs[i].InventorySuites)
+      + ',"cases":' + IntToStr(FJobs[i].InventoryCases) + '}';
+    Separator := ',';
+  end;
+  Result := Result + ']}';
+end;
+
+procedure TTestScheduler.ValidateInventory(const AProjectRoot: string);
+var
+  ExpectedPaths, SeenPaths: TStringList;
+  ActualTier, Architecture, DisplayPath, ExpectedTier, OSName: string;
+  ExpectedCases, ExpectedSuites, i: Integer;
+begin
+  if FExpectedInventory = nil then Exit;
+  OSName := Platform.GetBuildOS;
+  Architecture := Platform.GetBuildArch;
+  FExpectedInventory.ValidatePlatform(OSName, Architecture);
+  ExpectedPaths := TStringList.Create;
+  SeenPaths := TStringList.Create;
+  try
+    SeenPaths.CaseSensitive := True;
+    for i := 0 to High(FJobs) do
+    begin
+      DisplayPath := CanonicalPathGlob(ExtractRelativePath(
+        IncludeTrailingPathDelimiter(AProjectRoot), FJobs[i].Source));
+      SeenPaths.Add(DisplayPath);
+      if not FExpectedInventory.Resolve(DisplayPath, OSName, Architecture,
+        ExpectedTier, ExpectedSuites, ExpectedCases) then
+        raise ELWPTError.CreateFmt(
+          'test inventory is stale: add "%s" for platform %s/%s',
+          [DisplayPath, OSName, Architecture]);
+      ActualTier := InventoryTier(DisplayPath);
+      if ActualTier <> ExpectedTier then
+        raise ELWPTError.CreateFmt(
+          'test inventory tier mismatch for "%s": expected %s, got %s',
+          [DisplayPath, ExpectedTier, ActualTier]);
+      if FJobs[i].Status = tjsPassed then
+      begin
+        if (FJobs[i].InventorySuites <> ExpectedSuites)
+           or (FJobs[i].InventoryCases <> ExpectedCases) then
+          raise ELWPTError.CreateFmt(
+            'test inventory is stale for "%s" on %s/%s: expected %d '
+            + 'suites/%d cases, got %d suites/%d cases; update %s',
+            [DisplayPath, OSName, Architecture, ExpectedSuites,
+             ExpectedCases, FJobs[i].InventorySuites,
+             FJobs[i].InventoryCases, TEST_INVENTORY_PATH]);
+      end;
+    end;
+    if FCompleteDiscovery then
+    begin
+      FExpectedInventory.Paths(ExpectedPaths);
+      for i := 0 to ExpectedPaths.Count - 1 do
+        if SeenPaths.IndexOf(ExpectedPaths[i]) < 0 then
+          raise ELWPTError.CreateFmt(
+            'test inventory is stale: "%s" is not a discovered test program',
+            [ExpectedPaths[i]]);
+    end;
+  finally
+    SeenPaths.Free;
+    ExpectedPaths.Free;
+  end;
+end;
+
 { Test sources become session staging keys the same way build entries do.
   Distinct sources sharing one key would silently share compiler staging —
   the interference the private-session design exists to rule out — so the
@@ -1039,15 +1247,15 @@ begin
 end;
 
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
-  const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings): Integer;
 begin
   Result := CmdTest(AManifestPath, AIncludeE2E, AJobs, ABail, AVerbose,
-    ASelectors, nil);
+    AInventory, ASelectors, nil);
 end;
 
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
-  const AJobs, ABail: Integer; const AVerbose: Boolean;
+  const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings;
   const ACompilerHost: TLWPTCompilerHost): Integer;
 const
@@ -1056,11 +1264,13 @@ var
   Man: TManifest;
   DiscoveredTests, Tests: TStringList;
   UnitPaths: TStringArray;
-  ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond: string;
+  ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond,
+    InventoryPath: string;
   i, n, Passed, Failed, Skipped, CompileFailed, Cancelled,
     EffectiveBail: Integer;
   Session: TLWPTBuildSession;
   Scheduler: TTestScheduler;
+  ExpectedInventory: TLWPTTestInventory;
   CompilerSelection: TLWPTCompilerSelection;
   CompilerDriver: TLWPTCompilerDriver;
   TestTarget: TLWPTTarget;
@@ -1082,6 +1292,9 @@ begin
       if ABail < 0 then EffectiveBail := Man.TestBail
       else EffectiveBail := ABail;
       ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
+      InventoryPath := IncludeTrailingPathDelimiter(ProjectRoot)
+        + TEST_INVENTORY_PATH;
+      if not FileExists(InventoryPath) then InventoryPath := '';
 
       { Freeze discovery and selection before pretest. A hook may prepare
         inputs for the selected programs, but cannot add programs to this
@@ -1117,9 +1330,12 @@ begin
         ResolveBuildSessionsRoot(ProjectRoot, ResolveSessionsDir(Man),
           GetCurrentDir));
       try
-        WriteLn('test session: ', Session.SessionID, ' (',
-          Session.SessionReference, ')');
-        RunHooks('pretest', Man.PreTest, ProjectRoot);
+        if not AInventory then
+        begin
+          WriteLn('test session: ', Session.SessionID, ' (',
+            Session.SessionReference, ')');
+          RunHooks('pretest', Man.PreTest, ProjectRoot);
+        end;
 
     ModulesRoot := ResolveModulesDir(Man);
     SetLength(UnitPaths, 0);
@@ -1141,9 +1357,27 @@ begin
 
       if Tests.Count = 0 then
       begin
-        WriteLn('no *.Test.pas files found');
+        if InventoryPath <> '' then
+        begin
+          ExpectedInventory := TLWPTTestInventory.Create(InventoryPath);
+          try
+            ExpectedInventory.ValidatePlatform(Platform.GetBuildOS,
+              Platform.GetBuildArch);
+            ExpectedInventory.ValidateEmptyDiscovery;
+          finally
+            ExpectedInventory.Free;
+          end;
+        end;
+        if AInventory then
+          WriteLn('{"schema":"' + PROGRAM_NAME
+            + '.test-inventory","version":1,"platform":{"os":'
+            + JSONString(Platform.GetBuildOS) + ',"architecture":'
+            + JSONString(Platform.GetBuildArch) + '},"programs":[]}')
+        else
+          WriteLn('no *.Test.pas files found');
         Result := 0;
-        RunHooks('posttest', Man.PostTest, ProjectRoot);
+        if not AInventory then
+          RunHooks('posttest', Man.PostTest, ProjectRoot);
         Session.Finish(True);
         Exit;
       end;
@@ -1159,26 +1393,40 @@ begin
         Inc(Failed);
         { Mirror the other exit paths: posttest cleanup/reporting hooks
           run even when the scheduler never starts. }
-        RunHooks('posttest', Man.PostTest, ProjectRoot);
+        if not AInventory then
+          RunHooks('posttest', Man.PostTest, ProjectRoot);
         Session.Finish(False, 'test staging key collision');
         Exit;
       end;
 
-      if (ASelectors <> nil) and (ASelectors.Count > 0) then
-        WriteLn('selected ', Tests.Count, ' of ', DiscoveredTests.Count,
-          ' discovered test file(s)')
-      else
-        WriteLn('discovered ', Tests.Count, ' test file(s)');
-      if not AIncludeE2E then
-        WriteLn('  (e2e tier skipped; pass --tier=e2e to include)');
+      if not AInventory then
+      begin
+        if (ASelectors <> nil) and (ASelectors.Count > 0) then
+          WriteLn('selected ', Tests.Count, ' of ', DiscoveredTests.Count,
+            ' discovered test file(s)')
+        else
+          WriteLn('discovered ', Tests.Count, ' test file(s)');
+        if not AIncludeE2E then
+          WriteLn('  (e2e tier skipped; pass --tier=e2e to include)');
+      end;
       Scheduler := TTestScheduler.Create(Tests, AIncludeE2E, UnitPaths,
         Man.TestFlags, Session.JobRoot('tests'), AJobs, EffectiveBail, Session,
-        ProjectRoot, AVerbose, CompilerDriver);
+        ProjectRoot, AVerbose, AInventory,
+        (ASelectors = nil) or (ASelectors.Count = 0), InventoryPath,
+        CompilerDriver);
       try
-        WriteLn('effective workers: ', Scheduler.EffectiveWorkerCount);
+        if not AInventory then
+          WriteLn('effective workers: ', Scheduler.EffectiveWorkerCount);
         Scheduler.Run;
-        Scheduler.PrintResults(ProjectRoot, Passed, Failed, CompileFailed,
-          Skipped, Cancelled);
+        Scheduler.ValidateInventory(ProjectRoot);
+        if AInventory then
+        begin
+          WriteLn(Scheduler.InventoryJSON(ProjectRoot));
+          Passed := Tests.Count;
+        end
+        else
+          Scheduler.PrintResults(ProjectRoot, Passed, Failed, CompileFailed,
+            Skipped, Cancelled);
         if Scheduler.InternalError <> '' then
           WriteLn(ErrOutput, PROGRAM_NAME, ' test: scheduler error: ',
             Scheduler.InternalError);
@@ -1190,7 +1438,7 @@ begin
         Result := 0
       else
         Result := 1;
-    RunHooks('posttest', Man.PostTest, ProjectRoot);
+    if not AInventory then RunHooks('posttest', Man.PostTest, ProjectRoot);
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
       + IntToStr(Cancelled) + ' cancelled');
@@ -1208,10 +1456,11 @@ begin
     Tests.Free;
     DiscoveredTests.Free;
     CompilerSelection.Free;
-    WriteLn('summary: ', Passed, ' passed, ', Failed, ' failed, ',
-      CompileFailed, ' did not compile, ', Skipped, ' skipped, ',
-      Cancelled, ' cancelled; elapsed ',
-      FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
+    if not AInventory then
+      WriteLn('summary: ', Passed, ' passed, ', Failed, ' failed, ',
+        CompileFailed, ' did not compile, ', Skipped, ' skipped, ',
+        Cancelled, ' cancelled; elapsed ',
+        FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
   end;
 end;
 
