@@ -459,9 +459,15 @@ jobs:
           echo "$(cygpath -w "$(dirname "$FPC_BIN")")" >> "$GITHUB_PATH"
           FPC_BIN_WIN=$(cygpath -w "$FPC_BIN")
           if [ "${{ matrix.target }}" = "x86_64-win64" ]; then
-            TARGET_FPC=$(find /c/tools/freepascal /c/fpc \
-              \( -iname ppcrossx64.exe -o -iname ppcx64.exe \) \
-              -type f 2>/dev/null | head -1)
+            TARGET_FPC=""
+            for candidate_root in /c/tools/freepascal /c/fpc; do
+              if [ -d "$candidate_root" ]; then
+                TARGET_FPC=$(find "$candidate_root" \
+                  \( -iname ppcrossx64.exe -o -iname ppcx64.exe \) \
+                  -type f 2>/dev/null | head -1)
+                if [ -n "$TARGET_FPC" ]; then break; fi
+              fi
+            done
             if [ -z "$TARGET_FPC" ]; then
               echo "::error::Chocolatey FPC install: x86_64 compiler not found"
               exit 1

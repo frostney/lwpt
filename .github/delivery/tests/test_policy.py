@@ -69,6 +69,12 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("current same-repository PR head", workflow)
         self.assertNotIn("diagnostic:v1", workflow)
 
+    def test_windows_compiler_discovery_skips_absent_roots(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("for candidate_root in /c/tools/freepascal /c/fpc", workflow)
+        self.assertIn('if [ -d "$candidate_root" ]; then', workflow)
+        self.assertNotIn("TARGET_FPC=$(find /c/tools/freepascal /c/fpc", workflow)
+
     def test_scheduling_diagnostic_accepts_final_interval_completion(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
