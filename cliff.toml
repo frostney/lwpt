@@ -67,6 +67,8 @@ commit_parsers = [
   { message = "^Expose ",      group = "New Features" },
   { message = "^Bound ",       group = "New Features" },
   { message = "^Resolve one dependency version across the full graph", group = "New Features" },
+  { message = "^HTTPClient: add POST support on a body-capable request core", group = "New Features" },
+  { message = "^Unify direct commands and compiler targets", group = "New Features" },
 
   { message = "^Fix ",        group = "Bug Fixes" },
   { message = "^Repair ",     group = "Bug Fixes" },
