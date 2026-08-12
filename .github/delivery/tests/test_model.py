@@ -16,6 +16,7 @@ from controller import (  # noqa: E402
     Controller,
     DIAGNOSTIC_RUN_RE,
     FULL_CI_RUN_RE,
+    GitHub,
     MANAGED_RUN_RE,
     positive_integer,
 )
@@ -60,6 +61,28 @@ class FakeCheckGitHub(FakeGitHub):
 class FailingDispatchGitHub(FakeCheckGitHub):
     def dispatch(self, workflow: str, inputs: dict[str, str]) -> None:
         raise DeliveryError(f"dispatch of {workflow} was refused")
+
+
+class RecoveryGitHub(FakeCheckGitHub):
+    def __init__(self, check: dict, run: dict, head: str) -> None:
+        super().__init__(check)
+        self.run = run
+        self.head = head
+        self.created_after: datetime | None = None
+
+    def open_pulls(self) -> list[dict]:
+        return [{"number": 41, "head": {"sha": self.head}}]
+
+    def completed_workflow_runs(
+        self, workflow: str, created_after: datetime
+    ) -> list[dict]:
+        self.created_after = created_after
+        return [self.run]
+
+    def update_check(self, check_id: int, **fields: object) -> None:
+        super().update_check(check_id, **fields)
+        if fields.get("conclusion"):
+            self.check["status"] = "completed"
 
 
 class DiagnosticGitHub(FakeGitHub):
@@ -452,6 +475,68 @@ class DeliveryModelTests(unittest.TestCase):
         )
         self.assertEqual("failure", github.updated[0][1]["conclusion"])
         self.assertIn("changed during full CI", github.updated[0][1]["summary"])
+
+    def test_watchdog_recovers_a_token_dispatched_terminal_full_ci(self) -> None:
+        head = "1" * 40
+        snapshot = PromotionController(DiagnosticGitHub(head)).snapshot(41)[0]
+        digest = snapshot_digest(snapshot)
+        fingerprints = {"41": "promotion-fingerprint"}
+        check = {
+            "id": 99,
+            "name": "full-ci",
+            "status": "in_progress",
+            "started_at": "2026-08-12T11:00:00Z",
+            "app": {"slug": "github-actions"},
+            "external_id": f"full-ci:v1:41:{head}:{digest}",
+            "output": {
+                "summary": Controller.full_ci_evidence_blocks(
+                    snapshot, fingerprints
+                )
+            },
+        }
+        run = {
+            "id": 7,
+            "display_title": f"full-ci/41/{head}/{digest}/99",
+            "conclusion": "success",
+            "html_url": "https://example.test/run/7",
+        }
+        github = RecoveryGitHub(check, run, head)
+        controller = Controller(github)
+        controller.current_pull = (  # type: ignore[method-assign]
+            lambda number, expected_head=None: {"number": number}
+        )
+        controller.snapshot = lambda number: (snapshot, digest)  # type: ignore[method-assign]
+        controller.validate_reviews = (  # type: ignore[method-assign]
+            lambda number, member_head: fingerprints[str(number)]
+        )
+
+        controller.watchdog(120)
+        controller.watchdog(120)
+
+        self.assertEqual(1, len(github.updated))
+        self.assertEqual("success", github.updated[0][1]["conclusion"])
+        self.assertIsNotNone(github.created_after)
+
+    def test_completed_run_query_is_time_bounded_and_paginated(self) -> None:
+        github = object.__new__(GitHub)
+        github.repository = "frostney/lwpt"
+        requested: list[str] = []
+
+        def request(method: str, path: str, payload: object | None = None) -> dict:
+            requested.append(path)
+            if "&page=1" in path:
+                return {"total_count": 2, "workflow_runs": [{"id": 1}]}
+            return {"total_count": 2, "workflow_runs": [{"id": 2}]}
+
+        github.request = request  # type: ignore[method-assign]
+        runs = github.completed_workflow_runs(
+            "ci.yml", datetime(2026, 8, 12, 10, 0, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual([1, 2], [run["id"] for run in runs])
+        self.assertEqual(2, len(requested))
+        self.assertIn("status=completed", requested[0])
+        self.assertIn("created=%3E%3D2026-08-12T10%3A00%3A00Z", requested[0])
 
     def test_completed_full_ci_accepts_unchanged_review_evidence(self) -> None:
         head = "1" * 40

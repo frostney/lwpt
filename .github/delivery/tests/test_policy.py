@@ -38,6 +38,29 @@ class RepositoryPolicyTests(unittest.TestCase):
         ):
             self.assertIn(f"`{operation}`", policy)
 
+    def test_token_dispatched_full_ci_has_scheduled_terminal_recovery(self) -> None:
+        transition = (
+            ROOT / ".github/workflows/delivery-transition.yml"
+        ).read_text(encoding="utf-8")
+        watchdog = (
+            ROOT / ".github/workflows/delivery-watchdog.yml"
+        ).read_text(encoding="utf-8")
+        controller = (
+            ROOT / ".github/delivery/controller.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("GH_TOKEN: ${{ github.token }}", transition)
+        self.assertIn("cron: '*/15 * * * *'", watchdog)
+        self.assertIn("actions: read", watchdog)
+        self.assertIn("Reconcile or fail orphaned proofs", watchdog)
+        self.assertIn("def recover_completed_full_ci", controller)
+        self.assertIn('completed_workflow_runs("ci.yml", created_after)', controller)
+
+    def test_removed_review_watcher_is_not_locked_or_installed(self) -> None:
+        lock = json.loads((ROOT / "skills-lock.json").read_text(encoding="utf-8"))
+        self.assertNotIn("resolve-reviews", lock["skills"])
+        self.assertFalse((ROOT / ".agents/skills/resolve-reviews").exists())
+
     def test_diagnostics_are_allow_listed_and_proof_separated(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         for value in (
