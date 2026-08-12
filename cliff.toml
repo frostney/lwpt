@@ -67,7 +67,7 @@ commit_parsers = [
   { message = "^Expose ",      group = "New Features" },
   { message = "^Bound ",       group = "New Features" },
   { message = "^Unify\\b",     group = "New Features" },
-  { message = "^[^:]+: add\\b", group = "New Features" },
+  { message = "^[A-Z][^:]*: add\\b", group = "New Features" },
   { message = "^Resolve\\b",   group = "New Features" },
 
   { message = "^Fix ",        group = "Bug Fixes" },
