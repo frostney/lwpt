@@ -105,17 +105,39 @@ class RepositoryPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             (tmp / "build").mkdir()
+            (tmp / "bin").mkdir()
             fake = tmp / "build/lwpt"
             fake.write_text(
-                "#!/usr/bin/env python3\nimport time\ntime.sleep(0.75)\n",
+                "#!/usr/bin/env bash\n"
+                "echo $$ > \"$RUNNER_TEMP/fake-lwpt.pid\"\n"
+                "while [ ! -f \"$RUNNER_TEMP/release-lwpt\" ]; do\n"
+                "  /bin/sleep 0.01\n"
+                "done\n",
                 encoding="utf-8",
             )
             fake.chmod(0o755)
+            controlled_sleep = tmp / "bin/sleep"
+            controlled_sleep.write_text(
+                "#!/usr/bin/env bash\n"
+                "touch \"$RUNNER_TEMP/release-lwpt\"\n"
+                "while [ ! -s \"$RUNNER_TEMP/fake-lwpt.pid\" ]; do\n"
+                "  /bin/sleep 0.01\n"
+                "done\n"
+                "pid=$(cat \"$RUNNER_TEMP/fake-lwpt.pid\")\n"
+                "while kill -0 \"$pid\" 2>/dev/null; do\n"
+                "  state=$(ps -p \"$pid\" -o stat= 2>/dev/null || true)\n"
+                "  case \"$state\" in *Z*) break ;; esac\n"
+                "  /bin/sleep 0.01\n"
+                "done\n",
+                encoding="utf-8",
+            )
+            controlled_sleep.chmod(0o755)
             env = os.environ.copy()
             env.update(
                 {
-                    "LWPT_SCHEDULING_DIAGNOSTIC_POLL_SECONDS": "0.5",
-                    "LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT": "2",
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "LWPT_SCHEDULING_DIAGNOSTIC_POLL_SECONDS": "1",
+                    "LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT": "1",
                     "RUNNER_TEMP": raw_tmp,
                 }
             )
