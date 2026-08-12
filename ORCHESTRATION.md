@@ -32,18 +32,19 @@ LWPT exposes one trusted transition endpoint:
 default branch with
 `gh workflow run delivery-transition.yml --ref <default-branch>` and the fields
 below, or supply the same fields in the Actions UI. The workflow run is the
-accepted/rejected transition audit. Checks named `delivery-admission` and
-`full-ci` are the exact-SHA proof records.
+accepted/rejected transition audit. GitHub Actions' native
+`delivery-admission` job aggregates the exact-head PR gate; `full-ci` is the
+conditional exact-SHA promotion proof.
 
 | Transition | Operation | Required inputs | Accepted state | Completion evidence |
 | --- | --- | --- | --- | --- |
-| Enrol managed delivery | `enrol` | `pr_number`, `expected_head` | `delivery:managed`; downstream readiness cleared | Pending exact-head `delivery-admission` |
-| Admit PR CI | `ci` | `pr_number`, `expected_head` | `ci:ready`; trusted read-only PR matrix dispatched | Successful exact-head `delivery-admission` |
+| Enrol managed delivery | `enrol` | `pr_number`, `expected_head` | `delivery:managed`; downstream readiness cleared | Cheap automatic PR routing run on the exact head |
+| Admit PR CI | `ci` | `pr_number`, `expected_head` | `ci:ready`; the exact-head PR run is admitted/rerun when needed | Successful native exact-head `delivery-admission` job |
 | Open review | `review` | `pr_number`, `expected_head` | `review:ready` after current admission succeeds | Provider-neutral review convergence remains external |
 | Run a native diagnostic | `diagnostic` | `pr_number`, `expected_head`, `diagnostic_target`, `diagnostic_selector` | No readiness mutation | Non-proof `diagnostic/...` run for one allow-listed native slice |
 | Prove full CI | `full-ci` | `pr_number` as candidate, `expected_head` | No readiness label; frozen singleton or prefix dispatched | Successful exact-head `full-ci` with topology digest |
 | Admit merge | `merge` | `pr_number`, `expected_head`, `candidate_pr_number` | `merge:ready`; validated draft may become ready | Current CI, review, replies, threads, and applicable full-CI proof |
-| Return to waiting | `reset` | `pr_number`, `expected_head` | Readiness labels cleared; managed/full-required policy retained | New pending exact-head admission when managed |
+| Return to waiting | `reset` | `pr_number`, `expected_head` | Readiness labels cleared; PR returned to draft | Native check history remains immutable evidence |
 
 `delivery:managed`, native stack membership, and `ci:full-required` are
 independent dimensions. A managed PR may be standalone. A native stack may be
@@ -75,8 +76,9 @@ it remains individually subject to current branch protection and the ordinary
 review policy. The coordinator must not infer current eligibility from labels
 left by an earlier preflight. Reinvocation before integration is idempotent and
 revalidates the current head, review, topology, and applicable full-CI evidence.
-The repository observer creates and finalizes ordinary PRs'
-`delivery-admission` from the ordinary PR workflow.
+Ordinary and managed PRs use the same native PR workflow and required
+`delivery-admission` job. The controller only advances a managed PR through its
+phase labels and reruns its deferred exact-head workflow when admitted.
 
 ## Capability decision tree
 

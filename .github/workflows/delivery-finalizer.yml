@@ -3,8 +3,6 @@ name: Delivery proof finalizer
 on:
   workflow_run:
     workflows:
-      - PR
-      - Managed PR CI
       - CI
     types:
       - completed

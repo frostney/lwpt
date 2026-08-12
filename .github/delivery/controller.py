@@ -36,12 +36,11 @@ from model import (
 )
 
 
-DELIVERY_CHECK = "delivery-admission"
 FULL_CI_CHECK = "full-ci"
+DELIVERY_CHECK = "delivery-admission"
 OWNED_APP = "github-actions"
 DIAGNOSTIC_TARGETS = {"x86_64-darwin", "x86_64-win64", "i386-win32"}
 DIAGNOSTIC_SELECTORS = {"default", "e2e", "scheduling", "tls"}
-MANAGED_RUN_RE = re.compile(r"^delivery-pr/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
 FULL_CI_RUN_RE = re.compile(r"^full-ci/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
 DIAGNOSTIC_RUN_RE = re.compile(
     r"^diagnostic/(\d+)/([0-9a-f]{40})/"
@@ -57,6 +56,7 @@ class GitHub:
         self.token = os.environ["GH_TOKEN"]
         self.api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
         self.graphql_url = os.environ.get("GITHUB_GRAPHQL_URL", "https://api.github.com/graphql")
+        self.server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
 
     def request(self, method: str, path: str, payload: Any | None = None) -> Any:
         url = path if path.startswith("https://") else f"{self.api_url}{path}"
@@ -219,6 +219,34 @@ class GitHub:
             runs.extend(result["workflow_runs"])
         return runs
 
+    def pull_request_workflow_run(
+        self, workflow: str, head: str, number: int, base: str
+    ) -> dict[str, Any] | None:
+        query = urllib.parse.urlencode(
+            {"event": "pull_request", "head_sha": head, "per_page": 100}
+        )
+        result = self.request(
+            "GET", f"/repos/{self.repository}/actions/workflows/{workflow}/runs?{query}"
+        )
+        if result["total_count"] > len(result["workflow_runs"]):
+            raise DeliveryError(
+                "PR workflow-run evidence exceeds the supported 100-item fail-closed bound"
+            )
+        runs = [
+            run
+            for run in result["workflow_runs"]
+            if run.get("head_sha") == head
+            and any(
+                pull.get("number") == number
+                and pull.get("base", {}).get("sha") == base
+                for pull in run.get("pull_requests", [])
+            )
+        ]
+        return max(runs, key=lambda run: run["id"]) if runs else None
+
+    def rerun(self, run_id: int) -> None:
+        self.request("POST", f"/repos/{self.repository}/actions/runs/{run_id}/rerun")
+
     def completed_workflow_runs(
         self,
         workflow: str,
@@ -287,6 +315,16 @@ class GitHub:
         """
         self.graphql(mutation, {"id": node_id})
 
+    def mark_draft(self, node_id: str) -> None:
+        mutation = """
+        mutation($id: ID!) {
+          convertPullRequestToDraft(input: {pullRequestId: $id}) {
+            pullRequest { id isDraft }
+          }
+        }
+        """
+        self.graphql(mutation, {"id": node_id})
+
     def review_evidence(self, number: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         query = """
         query($owner: String!, $name: String!, $number: Int!) {
@@ -331,10 +369,6 @@ class Controller:
         self.github = github
         config_path = Path(__file__).with_name("review-automations.json")
         self.automations = json.loads(config_path.read_text(encoding="utf-8"))["automations"]
-
-    @staticmethod
-    def delivery_external_id(number: int, head: str, digest: str) -> str:
-        return f"delivery:v1:{number}:{head}:{digest}"
 
     @staticmethod
     def full_ci_external_id(number: int, head: str, digest: str) -> str:
@@ -452,29 +486,9 @@ class Controller:
         for label in labels:
             self.github.remove_label(number, label)
 
-    def ensure_delivery_check(
-        self, number: int, head: str, snapshot: dict[str, Any], digest: str, retry: bool = False
-    ) -> dict[str, Any]:
-        external_id = self.delivery_external_id(number, head, digest)
-        check = self.matching_check(head, DELIVERY_CHECK, external_id)
-        if check and (check["status"] != "completed" or check.get("conclusion") == "success"):
-            return check
-        if check and not retry:
-            return check
-        summary = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
-        return self.github.create_check(
-            DELIVERY_CHECK,
-            head,
-            external_id,
-            "Waiting for managed-delivery CI",
-            f"Exact topology: `{digest}`\n\n```json\n{summary}\n```",
-        )
-
     def enrol(self, number: int, expected_head: str) -> None:
         pull = self.current_pull(number, expected_head)
         self.require_same_repository(pull)
-        snapshot, digest = self.snapshot(number)
-        self.ensure_delivery_check(number, expected_head, snapshot, digest, retry=True)
         self.clear_readiness(number)
         self.github.add_labels(number, [MANAGED_LABEL])
 
@@ -483,48 +497,64 @@ class Controller:
         self.require_same_repository(pull)
         if MANAGED_LABEL not in label_names(pull):
             raise DeliveryError(f"pull request #{number} is not {MANAGED_LABEL}")
-        snapshot, digest = self.snapshot(number)
-        check = self.ensure_delivery_check(number, expected_head, snapshot, digest, retry=True)
-        if check.get("conclusion") == "success":
+        run = self.github.pull_request_workflow_run(
+            "pr.yml", expected_head, number, pull["base"]["sha"]
+        )
+        if run is None:
+            raise DeliveryError(
+                f"no pull-request workflow run exists for #{number} at exact head/base"
+            )
+        check = self.delivery_check_for_run(expected_head, run["id"])
+        if check and check.get("status") == "completed" and check.get("conclusion") == "success":
+            self.clear_readiness(number, (REVIEW_READY_LABEL, MERGE_READY_LABEL))
             self.github.add_labels(number, [CI_READY_LABEL])
             return
-        if check.get("output", {}).get("title") == "Managed PR CI running":
-            return
+        if run.get("status") in {"queued", "in_progress"}:
+            raise DeliveryError(
+                "the exact-head PR routing run is still active; retry ci after it completes"
+            )
         self.clear_readiness(number, (REVIEW_READY_LABEL, MERGE_READY_LABEL))
         self.github.add_labels(number, [CI_READY_LABEL])
-        self.github.update_check(
-            check["id"],
-            title="Managed PR CI running",
-            summary=f"Read-only exact-head matrix dispatched for `{expected_head}` and topology `{digest}`.",
-        )
         try:
-            self.dispatch_with_terminal_failure(
-                "delivery-pr.yml",
-                {
-                    "pr_number": str(number),
-                    "expected_head": expected_head,
-                    "topology_digest": digest,
-                    "check_id": str(check["id"]),
-                },
-                check,
-                "Managed PR CI dispatch failed",
-            )
+            self.github.rerun(run["id"])
         except DeliveryError:
-            self.clear_readiness(number)
+            self.github.remove_label(number, CI_READY_LABEL)
             raise
 
-    def require_delivery_success(self, number: int, expected_head: str) -> dict[str, Any]:
-        _, digest = self.snapshot(number)
-        check = self.matching_check(
-            expected_head,
-            DELIVERY_CHECK,
-            self.delivery_external_id(number, expected_head, digest),
+    def delivery_check_for_run(
+        self, expected_head: str, run_id: int
+    ) -> dict[str, Any] | None:
+        prefix = (
+            f"{self.github.server_url}/{self.github.repository}/actions/runs/{run_id}/job/"
         )
-        if not check or check.get("conclusion") != "success":
+        checks = [
+            check
+            for check in self.github.check_runs(expected_head)
+            if self.owned(check, DELIVERY_CHECK)
+            and check.get("details_url", "").startswith(prefix)
+        ]
+        return max(checks, key=lambda item: item["id"]) if checks else None
+
+    def require_delivery_success(self, number: int, expected_head: str) -> dict[str, Any]:
+        check = self.delivery_check(number, expected_head)
+        if (
+            check is None
+            or check.get("status") != "completed"
+            or check.get("conclusion") != "success"
+        ):
             raise DeliveryError(
-                f"#{number} lacks successful exact-head {DELIVERY_CHECK} evidence for topology {digest}"
+                f"#{number} lacks a successful exact-head native {DELIVERY_CHECK} job"
             )
         return check
+
+    def delivery_check(
+        self, number: int, expected_head: str
+    ) -> dict[str, Any] | None:
+        pull = self.current_pull(number, expected_head)
+        run = self.github.pull_request_workflow_run(
+            "pr.yml", expected_head, number, pull["base"]["sha"]
+        )
+        return None if run is None else self.delivery_check_for_run(expected_head, run["id"])
 
     def review(self, number: int, expected_head: str) -> None:
         pull = self.current_pull(number, expected_head)
@@ -746,74 +776,40 @@ class Controller:
 
     def reset(self, number: int, expected_head: str) -> None:
         pull = self.current_pull(number, expected_head)
+        self.require_same_repository(pull)
+        if MANAGED_LABEL not in label_names(pull):
+            raise DeliveryError(f"pull request #{number} is not {MANAGED_LABEL}")
         self.clear_readiness(number)
-        if MANAGED_LABEL in label_names(pull):
-            snapshot, digest = self.snapshot(number)
-            check = self.latest_owned_check(expected_head, DELIVERY_CHECK)
-            if check and check["status"] != "completed":
-                self.github.update_check(
-                    check["id"],
-                    title="Managed delivery reset",
-                    summary="The coordinator explicitly returned this head to waiting state.",
-                    conclusion="failure",
-                )
-            self.ensure_delivery_check(number, expected_head, snapshot, digest, retry=True)
+        if not pull.get("draft"):
+            self.github.mark_draft(pull["node_id"])
 
     def observe_one(self, number: int) -> None:
         pull = self.current_pull(number)
-        head = pull["head"]["sha"]
         labels = label_names(pull)
-        snapshot, digest = self.snapshot(number)
-        external_id = self.delivery_external_id(number, head, digest)
-        current = self.matching_check(head, DELIVERY_CHECK, external_id)
-        latest = self.latest_owned_check(head, DELIVERY_CHECK)
-
-        if latest and latest.get("external_id") != external_id and latest["status"] != "completed":
-            self.github.update_check(
-                latest["id"],
-                title="Delivery topology changed",
-                summary=f"Current exact topology is `{digest}`; the prior proof is stale.",
-                conclusion="failure",
-            )
-            current = None
-        if current is None:
-            if MANAGED_LABEL in labels:
-                self.clear_readiness(number)
-            current = self.ensure_delivery_check(number, head, snapshot, digest, retry=True)
 
         if MANAGED_LABEL in labels:
             if pull["head"]["repo"]["full_name"] != self.github.repository:
                 self.clear_readiness(number)
-                if current["status"] != "completed":
-                    self.github.update_check(
-                        current["id"],
-                        title="Managed fork refused",
-                        summary="The privileged controller never dispatches or executes fork code.",
-                        conclusion="failure",
-                    )
                 return
-            if current.get("conclusion") not in {None, "success"}:
-                self.clear_readiness(number)
-            if REVIEW_READY_LABEL in labels and current.get("conclusion") != "success":
-                self.clear_readiness(number, (REVIEW_READY_LABEL, MERGE_READY_LABEL))
+            if REVIEW_READY_LABEL in labels:
+                check = self.delivery_check(number, pull["head"]["sha"])
+                if (
+                    check is None
+                    or check.get("status") != "completed"
+                    or check.get("conclusion") != "success"
+                ):
+                    self.clear_readiness(number, (REVIEW_READY_LABEL, MERGE_READY_LABEL))
             if pull.get("draft"):
                 self.clear_readiness(number, (MERGE_READY_LABEL,))
-        # Ordinary PR labels retain their existing human/provider semantics;
-        # only the aggregate admission check is controller-owned for them.
 
     def fail_pending_head(self, number: int, head: str, title: str, summary: str) -> None:
-        prefixes = (
-            f"delivery:v1:{number}:{head}:",
-            f"full-ci:v1:{number}:{head}:",
-        )
+        prefixes = (f"full-ci:v1:{number}:{head}:",)
         for check in self.github.check_runs(head):
             if check["status"] == "completed" or not any(
                 check.get("external_id", "").startswith(prefix) for prefix in prefixes
             ):
                 continue
-            if not (
-                self.owned(check, DELIVERY_CHECK) or self.owned(check, FULL_CI_CHECK)
-            ):
+            if not self.owned(check, FULL_CI_CHECK):
                 continue
             self.github.update_check(
                 check["id"],
@@ -1032,43 +1028,6 @@ class Controller:
                     conclusion="failure",
                 )
 
-    def finalize_managed(self, run: dict[str, Any], match: re.Match[str]) -> None:
-        number = int(match.group(1))
-        head, requested_digest, check_id = match.group(2), match.group(3), int(match.group(4))
-        check = self.require_owned_check(
-            check_id,
-            DELIVERY_CHECK,
-            self.delivery_external_id(number, head, requested_digest),
-        )
-        conclusion, title = workflow_conclusion(run.get("conclusion"))
-        summary = f"Workflow run {run['id']} concluded `{run.get('conclusion')}`."
-        try:
-            pull = self.current_pull(number, head)
-            if MANAGED_LABEL not in label_names(pull):
-                raise DeliveryError("managed-delivery label was removed during the matrix")
-            snapshot, digest = self.snapshot(number)
-            if digest != requested_digest:
-                raise DeliveryError(
-                    f"topology changed from {requested_digest} to {digest} during PR CI"
-                )
-            summary = (
-                f"Workflow run {run['id']} concluded `{run.get('conclusion')}` for topology "
-                f"`{digest}`.\n\n```json\n"
-                f"{json.dumps(snapshot, sort_keys=True, separators=(',', ':'))}\n```"
-            )
-        except DeliveryError as error:
-            conclusion, title = "failure", "Managed PR CI evidence became stale"
-            summary = f"Workflow run {run['id']}: {error}"
-        self.github.update_check(
-            check_id,
-            title=title,
-            summary=summary,
-            conclusion=conclusion,
-            details_url=run["html_url"],
-        )
-        if conclusion != "success":
-            self.clear_readiness(number)
-
     def finalize_full_ci(self, run: dict[str, Any], match: re.Match[str]) -> None:
         number = int(match.group(1))
         head, requested_digest, check_id = match.group(2), match.group(3), int(match.group(4))
@@ -1121,49 +1080,12 @@ class Controller:
             for entry in snapshot.get("entries", []):
                 self.github.remove_label(entry["number"], MERGE_READY_LABEL)
 
-    def finalize_ordinary(self, run: dict[str, Any]) -> None:
-        conclusion, title = workflow_conclusion(run.get("conclusion"))
-        references = run.get("pull_requests", [])
-        if not references:
-            references = [
-                {"number": pull["number"]}
-                for pull in self.github.open_pulls()
-                if pull["head"]["sha"] == run["head_sha"]
-            ]
-        for reference in references:
-            number = reference["number"]
-            try:
-                pull = self.current_pull(number, run["head_sha"])
-            except DeliveryError:
-                continue
-            if MANAGED_LABEL in label_names(pull):
-                continue
-            snapshot, digest = self.snapshot(number)
-            check = self.ensure_delivery_check(
-                number, run["head_sha"], snapshot, digest, retry=True
-            )
-            self.github.update_check(
-                check["id"],
-                title=title,
-                summary=(
-                    f"Ordinary PR workflow run {run['id']} concluded "
-                    f"`{run.get('conclusion')}` for topology `{digest}`."
-                ),
-                conclusion=conclusion,
-                details_url=run["html_url"],
-            )
-
     def finalize(self, event_path: str) -> None:
         event = json.loads(Path(event_path).read_text(encoding="utf-8"))
         run = event["workflow_run"]
-        managed = MANAGED_RUN_RE.match(run.get("display_title", ""))
         full_ci = FULL_CI_RUN_RE.match(run.get("display_title", ""))
-        if managed:
-            self.finalize_managed(run, managed)
-        elif full_ci:
+        if full_ci:
             self.finalize_full_ci(run, full_ci)
-        elif run.get("name") == "PR":
-            self.finalize_ordinary(run)
 
     def recover_completed_full_ci(self, now: datetime) -> set[int]:
         pending: dict[int, dict[str, Any]] = {}
@@ -1209,9 +1131,7 @@ class Controller:
         for pull in self.github.open_pulls():
             head = pull["head"]["sha"]
             for check in self.github.check_runs(head):
-                if not (
-                    self.owned(check, DELIVERY_CHECK) or self.owned(check, FULL_CI_CHECK)
-                ):
+                if not self.owned(check, FULL_CI_CHECK):
                     continue
                 if check["status"] == "completed" or check["id"] in recovered:
                     continue
@@ -1224,15 +1144,12 @@ class Controller:
                         ),
                         conclusion="failure",
                     )
-                    if check["name"] == DELIVERY_CHECK:
-                        self.clear_readiness(pull["number"])
-                    else:
-                        try:
-                            snapshot, _ = self.snapshot(pull["number"])
-                        except DeliveryError:
-                            continue
-                        for entry in snapshot["entries"]:
-                            self.github.remove_label(entry["number"], MERGE_READY_LABEL)
+                    try:
+                        snapshot, _ = self.snapshot(pull["number"])
+                    except DeliveryError:
+                        continue
+                    for entry in snapshot["entries"]:
+                        self.github.remove_label(entry["number"], MERGE_READY_LABEL)
 
 
 def positive_integer(value: str) -> int:

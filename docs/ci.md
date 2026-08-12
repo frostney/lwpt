@@ -1,6 +1,6 @@
 # CI
 
-Ten GitHub Actions workflows retain the existing build-once/test-natively
+Nine GitHub Actions workflows retain the existing build-once/test-natively
 matrix and add a repository-owned managed-delivery adapter. Expensive workflows
 that execute pull-request code have read-only permissions. Controllers and
 finalizers with write permission always run trusted default-branch code.
@@ -9,24 +9,28 @@ finalizers with write permission always run trusted default-branch code.
 |----------|---------|---------|
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch`, weekly `schedule` | Build + cache the cross-FPC toolchain |
 | `ci.yml` | `push` to `main`, `workflow_dispatch` | Full integrated-main/terminal promotion matrix or one allow-listed native diagnostic slice |
-| `pr.yml` | `pull_request`, `workflow_call` | Automatic ordinary gate or reusable read-only managed PR matrix |
+| `pr.yml` | `pull_request` | Automatic native gate for ordinary and managed PRs |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
 | `delphi-native.yml` | `workflow_dispatch` | Optional Delphi 12+ Win64 smoke on a licensed self-hosted runner; never a required gate |
 | `delivery-transition.yml` | `workflow_dispatch` | Trusted explicit `enrol`, `ci`, `review`, `diagnostic`, `full-ci`, `merge`, or `reset` endpoint |
-| `delivery-pr.yml` | controller `workflow_dispatch` | Run `pr.yml` read-only for one admitted exact head |
-| `delivery-observer.yml` | PR metadata, schedule, manual | Create pending checks and invalidate stale head/base/topology evidence |
-| `delivery-finalizer.yml` | `workflow_run` completion | Conclude ordinary, managed, cancelled, and full-CI exact checks when GitHub emits the event |
-| `delivery-watchdog.yml` | 15-minute schedule, manual | Reconcile terminal full-CI runs, then fail proof checks left nonterminal for 120 minutes |
+| `delivery-observer.yml` | PR metadata, schedule, manual | Invalidate stale managed readiness and full-CI evidence |
+| `delivery-finalizer.yml` | `workflow_run` completion | Conclude full-CI proof when GitHub emits the event |
+| `delivery-watchdog.yml` | 15-minute schedule, manual | Reconcile terminal full-CI runs, then fail full-CI proofs left nonterminal for 120 minutes |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
-- **Ordinary PRs remain automatic.** `pr.yml` runs its Ubuntu, native Darwin,
-  documentation, and win64 legs. The trusted finalizer aggregates that exact
-  workflow result into `delivery-admission`.
-- **Managed PRs use explicit transitions.** Their automatic `pr.yml` run stops
-  successfully at a cheap routing job. The `ci` operation dispatches
-  `delivery-pr.yml`, which calls the same matrix for the exact current head.
-  `delivery:managed` does not assert native stack membership.
+- **Ordinary PR checks remain automatic.** `pr.yml` runs its Ubuntu, native
+  Darwin, documentation, and win64 legs without controller involvement.
+- **Managed PRs retain cheap deferral and explicit phase transitions.** Their
+  initial automatic PR run stops after the routing job. Every first attempt for
+  a managed head defers even when an older head left `ci:ready` attached. The
+  `ci` transition adds `ci:ready` and reruns that exact PR/head workflow. Both
+  the label and a rerun attempt are required, so an automatic or manual
+  first attempt remains deferred. The rerun produces the same six native
+  checks as an ordinary PR. `delivery:managed` does not assert stack membership.
+  GitHub bounds reruns to 30 days and 50 attempts; a candidate outside that
+  delivery window must receive a new synchronized head rather than entering a
+  second execution route.
 - **`ci.yml` has three exact uses.** A push to `main` verifies the integrated tree;
   rapid main pushes cancel older integrated-main runs. The `full-ci` operation
   checks out one frozen singleton or cumulative native-prefix top SHA. Those
@@ -36,26 +40,14 @@ Trigger split, mirroring GocciaScript's CI shape:
 
 Repository rules make these contracts enforceable. The desired main ruleset is
 versioned at `.github/rulesets/protect-main.json`: it requires resolved review
-threads and `delivery-admission` from GitHub Actions integration ID `15368`.
-The integration binding means a same-named status or check from another user or
-app cannot satisfy the rule. Activate that payload only after the producer and
-finalizer exist on the default branch:
+threads and the native `delivery-admission` job from GitHub Actions integration
+ID `15368`. The integration binding means a same-named status or check from
+another user or app cannot satisfy the rule:
 
 ```sh
 gh api --method PUT repos/frostney/lwpt/rulesets/18086289 \
   --input .github/rulesets/protect-main.json
 ```
-
-The public
-[`delivery-admission` sandbox](https://github.com/frostney/lwpt-delivery-admission-spike/pull/1)
-exercised pending, duplicate, stale-head, failure, cancellation, watchdog, and
-recovery behavior. Its app-identity probe at
-[`9b3afd4`](https://github.com/frostney/lwpt-delivery-admission-spike/commit/9b3afd43f44fb8c90c1a72aec41deafc8f09e81e)
-left the PR blocked when the
-[app-owned check failed](https://github.com/frostney/lwpt-delivery-admission-spike/actions/runs/30938047359)
-even though a separate same-named commit status reported success; the
-[`af05968` recovery](https://github.com/frostney/lwpt-delivery-admission-spike/actions/runs/30938166552)
-restored a successful app-owned proof.
 
 A separate release-tag ruleset restricts SemVer tag creation to the maintainer
 and rejects tag updates or deletion. The protected `release` environment owns
@@ -65,19 +57,15 @@ the approval gate between successful builds and publication.
 
 ### Managed-delivery proof lifecycle
 
-`delivery-observer.yml` creates one pending `delivery-admission` for the exact
-PR head and native topology. A new head, base, order, or prefix fails stale
-pending proof, removes readiness labels, and creates a new pending proof.
-Managed forks fail closed without dispatching their code. Duplicate events reuse
-the same external proof identity. Trusted mutations share one short-lived
-repository concurrency lane so schedule, transition, finalizer, and watchdog
-events cannot create or conclude competing proofs concurrently.
+GitHub binds each PR workflow run to the pull request's exact head. Ordinary
+heads execute the native jobs immediately. A managed head first records a cheap
+routing run whose native `delivery-admission` job fails closed; its `ci`
+transition adds `ci:ready` and reruns that exact PR/head workflow so the full
+job set executes and the aggregation job can pass. The controller samples that
+native job before later transitions. `reset` clears readiness and returns the
+PR to draft; it never rewrites native check history. Managed forks fail closed.
 
-The endpoint and finalizer communicate through a trusted workflow run name
-containing PR, SHA, topology digest where applicable, and check-run ID. The
-read-only workflow cannot conclude its check. The default-branch finalizer
-re-fetches the PR and native topology, binds the workflow result to the current
-check, and then records success or terminal failure. A full-CI run dispatched
+Full-CI remains a separate conditional proof. A full-CI run dispatched
 by `delivery-transition.yml` inherits the repository `GITHUB_TOKEN`; GitHub
 allows that explicit `workflow_dispatch` but suppresses its subsequent
 `workflow_run` event. The trusted watchdog therefore discovers terminal
@@ -86,7 +74,7 @@ finalizer before applying its 120-minute timeout. Creation-time queries are
 split until each result fits one page, avoiding both GitHub's filtered
 1,000-result cap and offset pagination over a changing completed-run set.
 Cancelled runs are failures, and duplicate or reordered observations are
-harmless because a completed check is terminal.
+harmless because a completed full-CI check is terminal.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
 initial surface covers Windows x86_64/i386 default, E2E, and TLS slices, plus an
@@ -276,7 +264,7 @@ The scripts mirror the shape of [GocciaScript's installers](https://gocciascript
 ## Triggers (summary)
 
 - `ci.yml`: `push` to `main`, `workflow_dispatch`
-- `pr.yml`: `pull_request`, `workflow_call` from `delivery-pr.yml`
+- `pr.yml`: `pull_request`
 - `release.yml`: `push` of a `v?N.N.N` or `v?N.N.N-*` tag
 - `toolchain.yml`: invoked by `ci.yml`, `pr.yml`, and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming and a weekly `schedule` cron (Mondays 05:00 UTC) that keeps the default-branch cache warm
 - managed delivery: explicit transition dispatch, PR metadata observer,

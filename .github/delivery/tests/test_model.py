@@ -18,7 +18,6 @@ from controller import (  # noqa: E402
     DIAGNOSTIC_RUN_RE,
     FULL_CI_RUN_RE,
     GitHub,
-    MANAGED_RUN_RE,
     positive_integer,
 )
 from model import (  # noqa: E402
@@ -59,11 +58,6 @@ class FakeCheckGitHub(FakeGitHub):
         self.updated.append((check_id, fields))
 
 
-class FailingDispatchGitHub(FakeCheckGitHub):
-    def dispatch(self, workflow: str, inputs: dict[str, str]) -> None:
-        raise DeliveryError(f"dispatch of {workflow} was refused")
-
-
 class RecoveryGitHub(FakeCheckGitHub):
     def __init__(self, check: dict, run: dict, head: str) -> None:
         super().__init__(check)
@@ -90,6 +84,8 @@ class RecoveryGitHub(FakeCheckGitHub):
 
 
 class DiagnosticGitHub(FakeGitHub):
+    server_url = "https://github.com"
+
     def __init__(self, head: str) -> None:
         self.head = head
         self.dispatched: list[tuple[str, dict[str, str]]] = []
@@ -97,11 +93,19 @@ class DiagnosticGitHub(FakeGitHub):
         self.runs: list[dict] = []
         self.checks: dict[int, dict] = {}
         self.updated: list[tuple[int, dict]] = []
+        self.rerun_ids: list[int] = []
+        self.workflow_lookups: list[tuple[str, str, int, str]] = []
+        self.labels: list[tuple[int, list[str]]] = []
+        self.removed_labels: list[tuple[int, str]] = []
+        self.draft_ids: list[str] = []
 
     def pull(self, number: int) -> dict:
         return {
             "number": number,
+            "node_id": f"PR_{number}",
             "state": "open",
+            "draft": False,
+            "base": {"sha": "2" * 40},
             "head": {"sha": self.head, "repo": {"full_name": self.repository}},
         }
 
@@ -112,7 +116,7 @@ class DiagnosticGitHub(FakeGitHub):
         return self.runs
 
     def check_runs(self, head: str) -> list[dict]:
-        return []
+        return list(self.checks.values())
 
     def review_evidence(self, number: int) -> tuple[list[dict], list[dict]]:
         return [], []
@@ -127,6 +131,24 @@ class DiagnosticGitHub(FakeGitHub):
         self.updated.append((check_id, fields))
         if fields.get("conclusion"):
             self.checks[check_id]["status"] = "completed"
+
+    def pull_request_workflow_run(
+        self, workflow: str, head: str, number: int, base: str
+    ) -> dict:
+        self.workflow_lookups.append((workflow, head, number, base))
+        return {"id": 77, "head_sha": head, "status": "completed"}
+
+    def rerun(self, run_id: int) -> None:
+        self.rerun_ids.append(run_id)
+
+    def add_labels(self, number: int, labels: list[str]) -> None:
+        self.labels.append((number, labels))
+
+    def remove_label(self, number: int, label: str) -> None:
+        self.removed_labels.append((number, label))
+
+    def mark_draft(self, node_id: str) -> None:
+        self.draft_ids.append(node_id)
 
     def create_check(
         self, name: str, head: str, external_id: str, title: str, summary: str
@@ -216,49 +238,84 @@ class DeliveryModelTests(unittest.TestCase):
         with self.assertRaisesRegex(DeliveryError, "stale head"):
             require_expected_head(pull, "b" * 40)
 
-    def test_duplicate_delivery_uses_one_deterministic_key(self) -> None:
-        controller = Controller(FakeGitHub())
-        key_one = controller.delivery_external_id(41, "1" * 40, "a" * 64)
-        key_two = controller.delivery_external_id(41, "1" * 40, "a" * 64)
-        self.assertEqual(key_one, key_two)
-
-    def test_finalizer_run_identity_binds_topology_and_check(self) -> None:
-        title = f"delivery-pr/41/{'1' * 40}/{'a' * 64}/99"
-        match = MANAGED_RUN_RE.match(title)
-        self.assertIsNotNone(match)
-        self.assertEqual(("41", "1" * 40, "a" * 64, "99"), match.groups())
-
     def test_finalizer_rejects_an_unowned_check_id(self) -> None:
         github = FakeCheckGitHub(
             {
                 "id": 99,
-                "name": "delivery-admission",
+                "name": "full-ci",
                 "app": {"slug": "some-other-app"},
-                "external_id": f"delivery:v1:41:{'1' * 40}:{'a' * 64}",
+                "external_id": f"full-ci:v1:41:{'1' * 40}:{'a' * 64}",
             }
         )
         controller = Controller(github)
         with self.assertRaisesRegex(DeliveryError, "not the expected app-owned"):
             controller.require_owned_check(
                 99,
-                "delivery-admission",
-                f"delivery:v1:41:{'1' * 40}:{'a' * 64}",
+                "full-ci",
+                f"full-ci:v1:41:{'1' * 40}:{'a' * 64}",
             )
         self.assertEqual([], github.updated)
 
-    def test_dispatch_failure_terminally_fails_the_owned_proof(self) -> None:
-        github = FailingDispatchGitHub({"id": 99})
-        controller = Controller(github)
-        with self.assertRaisesRegex(DeliveryError, "dispatch.*refused"):
-            controller.dispatch_with_terminal_failure(
-                "delivery-pr.yml",
-                {"expected_head": "1" * 40},
-                {"id": 99},
-                "Managed PR CI dispatch failed",
-            )
-        self.assertEqual("failure", github.updated[0][1]["conclusion"])
+    def test_native_pr_checks_are_the_delivery_proof(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        github.check_runs = lambda _: [  # type: ignore[method-assign]
+            {
+                "id": 1,
+                "name": "delivery-admission",
+                "status": "completed",
+                "conclusion": "success",
+                "details_url": "https://github.com/frostney/lwpt/actions/runs/77/job/1",
+                "app": {"slug": "github-actions"},
+            },
+            {
+                "id": 2,
+                "name": "delivery-admission",
+                "status": "completed",
+                "conclusion": "failure",
+                "external_id": f"delivery:v1:41:{head}:{'a' * 64}",
+                "app": {"slug": "github-actions"},
+            },
+        ]
         self.assertEqual(
-            "Managed PR CI dispatch failed", github.updated[0][1]["title"]
+            "success", Controller(github).require_delivery_success(41, head)["conclusion"]
+        )
+        github.check_runs = lambda _: []  # type: ignore[method-assign]
+        with self.assertRaisesRegex(DeliveryError, "native delivery-admission job"):
+            Controller(github).require_delivery_success(41, head)
+
+    def test_managed_ci_admits_and_reruns_the_existing_exact_head_workflow(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        def managed_pull(number: int) -> dict:
+            pull = original_pull(number)
+            pull["labels"] = [{"name": "delivery:managed"}]
+            return pull
+
+        github.pull = managed_pull  # type: ignore[method-assign]
+        Controller(github).ci(41, head)
+        self.assertEqual([("pr.yml", head, 41, "2" * 40)], github.workflow_lookups)
+        self.assertEqual([77], github.rerun_ids)
+        self.assertIn((41, ["ci:ready"]), github.labels)
+
+    def test_reset_clears_readiness_and_returns_the_pull_to_draft(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        def managed_pull(number: int) -> dict:
+            pull = original_pull(number)
+            pull["labels"] = [{"name": "delivery:managed"}]
+            return pull
+
+        github.pull = managed_pull  # type: ignore[method-assign]
+        Controller(github).reset(41, head)
+        self.assertEqual(["PR_41"], github.draft_ids)
+        self.assertEqual(
+            [(41, label) for label in ("ci:ready", "review:ready", "merge:ready")],
+            github.removed_labels,
         )
 
     def test_diagnostic_dispatch_is_allow_listed_and_not_a_full_ci_proof(self) -> None:
@@ -793,20 +850,6 @@ class DeliveryModelTests(unittest.TestCase):
         github.pull = behind_pull  # type: ignore[method-assign]
         with self.assertRaisesRegex(DeliveryError, "current base"):
             PromotionController(github).full_ci(41, head)
-
-    def test_superseded_pending_head_is_terminally_failed(self) -> None:
-        head = "1" * 40
-        github = FakeCheckGitHub(
-            {
-                "id": 99,
-                "name": "delivery-admission",
-                "status": "in_progress",
-                "app": {"slug": "github-actions"},
-                "external_id": f"delivery:v1:41:{head}:{'a' * 64}",
-            }
-        )
-        Controller(github).fail_superseded_head(41, head)
-        self.assertEqual("failure", github.updated[0][1]["conclusion"])
 
     def test_closed_pull_request_terminally_fails_pending_proof(self) -> None:
         head = "1" * 40

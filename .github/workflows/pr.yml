@@ -3,17 +3,14 @@ name: PR
 # Fast PR gate. Mirrors the GocciaScript pattern: ci.yml runs only
 # on push to main, so pr.yml is the sole pre-merge signal a PR sees.
 #
-#   pr.yml      — every ordinary PR and every explicitly admitted managed PR:
+#   pr.yml      — every ordinary and managed PR:
 #                 Ubuntu native bootstrap + install + format --check + build +
 #                 test, then the live-
 #                 network e2e tier on the same Linux leg (#102);
 #                 a native aarch64-darwin default-tier leg; and a
 #                 win64 leg: cross-compile on macOS, then the
 #                 offline default test tier natively on
-#                 windows-latest. Managed PRs remain drafts while work is
-#                 noisy; their automatic run stops at a cheap successful gate,
-#                 and delivery-pr.yml calls this workflow for the admitted
-#                 exact head. Typical wall-clock
+#                 windows-latest. Typical wall-clock
 #                 < 10 min on a warm toolchain cache (hard caps per job/step).
 #   ci.yml      — push to main only: full 6-target cross-build +
 #                 per-platform native test runs (incl. e2e on
@@ -62,18 +59,6 @@ on:
       - opened
       - reopened
       - synchronize
-  workflow_call:
-    inputs:
-      managed_dispatch:
-        description: Run the matrix for a controller-admitted managed head
-        required: false
-        type: boolean
-        default: false
-      expected_head:
-        description: Exact managed PR head to check out
-        required: false
-        type: string
-        default: ''
 permissions:
   contents: read
   pull-requests: read
@@ -82,56 +67,43 @@ permissions:
 # case: a superseded push should not keep burning the macOS runner
 # (or, on a cold cache, a ~30-min toolchain rebuild).
 concurrency:
-  group: pr-${{ github.workflow }}-${{ inputs.expected_head || github.event.pull_request.head.ref || github.ref_name }}
+  group: pr-${{ github.workflow }}-${{ github.event.pull_request.head.ref }}
   cancel-in-progress: true
 
 jobs:
   delivery-gate:
     runs-on: ubuntu-latest
     outputs:
-      managed: ${{ steps.route.outputs.managed }}
+      deferred: ${{ steps.route.outputs.deferred }}
     steps:
-      - name: Route ordinary and managed delivery
+      - name: Defer unadmitted managed work
         id: route
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          MANAGED_DISPATCH: ${{ inputs.managed_dispatch }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
 
-          if [ "$MANAGED_DISPATCH" = "true" ]; then
-            echo 'managed=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          IS_DRAFT="$(jq -r '.pull_request.draft' "$GITHUB_EVENT_PATH")"
-          ATTEMPTS=1
-          if [ "$IS_DRAFT" = "true" ]; then ATTEMPTS=6; fi
-
-          for _ in $(seq 1 "$ATTEMPTS"); do
-            PULL="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
-            CURRENT_HEAD="$(jq -r '.head.sha' <<<"$PULL")"
-            LABELS="$(jq -r '.labels[].name' <<<"$PULL")"
-            if grep -Fxq 'delivery:managed' <<<"$LABELS"; then
-              echo 'managed=true' >> "$GITHUB_OUTPUT"
-              echo 'Managed draft remains pending until the explicit ci transition.'
+          attempts=1
+          if [ "$IS_DRAFT" = "true" ]; then attempts=6; fi
+          for attempt in $(seq 1 "$attempts"); do
+            LABELS="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.labels[].name')"
+            if grep -Fxq 'delivery:managed' <<<"$LABELS" && { \
+               [ "$RUN_ATTEMPT" = "1" ] || \
+               ! grep -Fxq 'ci:ready' <<<"$LABELS"; }; then
+              echo 'deferred=true' >> "$GITHUB_OUTPUT"
+              echo 'Managed work remains deferred until its explicit ci transition.'
               exit 0
             fi
-            if [ "$CURRENT_HEAD" != "$EXPECTED_HEAD" ]; then
-              echo 'managed=true' >> "$GITHUB_OUTPUT"
-              echo 'Superseded automatic run stops before executing PR code.'
-              exit 0
-            fi
-            if [ "$ATTEMPTS" -gt 1 ]; then sleep 3; fi
+            if [ "$attempt" -lt "$attempts" ]; then sleep 3; fi
           done
-
-          echo 'managed=false' >> "$GITHUB_OUTPUT"
+          echo 'deferred=false' >> "$GITHUB_OUTPUT"
 
   build-and-test:
     needs: delivery-gate
-    if: ${{ needs.delivery-gate.result == 'success' && needs.delivery-gate.outputs.managed != 'true' }}
+    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -150,7 +122,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ inputs.expected_head || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Install FPC
         run: |
@@ -208,13 +180,13 @@ jobs:
 
   docs:
     needs: delivery-gate
-    if: ${{ needs.delivery-gate.result == 'success' && needs.delivery-gate.outputs.managed != 'true' }}
+    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.expected_head || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Lint Markdown
         uses: DavidAnson/markdownlint-cli2-action@05f32210e84442804257b2a6f20b273450ec8265 # v19.1.0
@@ -236,7 +208,7 @@ jobs:
   # unique-catch rate has not justified per-PR cost.
   darwin-test:
     needs: delivery-gate
-    if: ${{ needs.delivery-gate.result == 'success' && needs.delivery-gate.outputs.managed != 'true' }}
+    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: macos-latest
     timeout-minutes: 20
     defaults:
@@ -249,7 +221,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ inputs.expected_head || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Install FPC (brew)
         run: |
@@ -278,7 +250,7 @@ jobs:
   # shared copy.
   toolchain:
     needs: delivery-gate
-    if: ${{ needs.delivery-gate.result == 'success' && needs.delivery-gate.outputs.managed != 'true' }}
+    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     uses: ./.github/workflows/toolchain.yml
 
   # Windows compile signal, pre-merge. ci.yml's full cross-build
@@ -299,9 +271,8 @@ jobs:
     if: >-
       ${{
         always() &&
-        needs.toolchain.result == 'success' &&
-        needs.delivery-gate.result == 'success' &&
-        needs.delivery-gate.outputs.managed != 'true'
+        needs.delivery-gate.outputs.deferred != 'true' &&
+        needs.toolchain.result == 'success'
       }}
     needs:
       - delivery-gate
@@ -319,7 +290,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.expected_head || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Restore toolchain cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -427,9 +398,8 @@ jobs:
     if: >-
       ${{
         always() &&
-        needs.windows-cross-compile.result == 'success' &&
-        needs.delivery-gate.result == 'success' &&
-        needs.delivery-gate.outputs.managed != 'true'
+        needs.delivery-gate.outputs.deferred != 'true' &&
+        needs.windows-cross-compile.result == 'success'
       }}
     needs:
       - delivery-gate
@@ -450,7 +420,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.expected_head || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
       # Verbatim copy of ci.yml's "Install FPC (choco)" step (test
       # matrix) — lwpt test compiles *.Test.pas with the native FPC,
@@ -523,3 +493,39 @@ jobs:
 
       - name: lwpt test --bail=1 (default tier — unit + integration)
         run: ./build/lwpt.exe test --bail=1
+
+  delivery-admission:
+    if: ${{ always() }}
+    needs:
+      - delivery-gate
+      - build-and-test
+      - docs
+      - darwin-test
+      - toolchain
+      - windows-cross-compile
+      - windows-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the native PR gate
+        env:
+          DEFERRED: ${{ needs.delivery-gate.outputs.deferred }}
+          BUILD_AND_TEST: ${{ needs.build-and-test.result }}
+          DOCS: ${{ needs.docs.result }}
+          DARWIN_TEST: ${{ needs.darwin-test.result }}
+          TOOLCHAIN: ${{ needs.toolchain.result }}
+          WINDOWS_CROSS_COMPILE: ${{ needs.windows-cross-compile.result }}
+          WINDOWS_TEST: ${{ needs.windows-test.result }}
+        run: |
+          set -euo pipefail
+          if [ "$DEFERRED" = "true" ]; then
+            echo '::error::Managed delivery is deferred until its explicit ci transition.'
+            exit 1
+          fi
+          for result in \
+            "$BUILD_AND_TEST" "$DOCS" "$DARWIN_TEST" "$TOOLCHAIN" \
+            "$WINDOWS_CROSS_COMPILE" "$WINDOWS_TEST"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::A native PR job concluded $result."
+              exit 1
+            fi
+          done
