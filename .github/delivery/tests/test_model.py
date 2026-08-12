@@ -84,6 +84,8 @@ class RecoveryGitHub(FakeCheckGitHub):
 
 
 class DiagnosticGitHub(FakeGitHub):
+    server_url = "https://github.com"
+
     def __init__(self, head: str) -> None:
         self.head = head
         self.dispatched: list[tuple[str, dict[str, str]]] = []
@@ -301,6 +303,14 @@ class DeliveryModelTests(unittest.TestCase):
     def test_reset_clears_readiness_and_returns_the_pull_to_draft(self) -> None:
         head = "1" * 40
         github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        def managed_pull(number: int) -> dict:
+            pull = original_pull(number)
+            pull["labels"] = [{"name": "delivery:managed"}]
+            return pull
+
+        github.pull = managed_pull  # type: ignore[method-assign]
         Controller(github).reset(41, head)
         self.assertEqual(["PR_41"], github.draft_ids)
         self.assertEqual(

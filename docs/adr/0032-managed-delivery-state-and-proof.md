@@ -43,7 +43,8 @@ and terminal-promotion behavior was completed in
   reserved for terminal promotion after base, PR CI, and active review evidence
   converge; superseded runs are cancelled.
 - A managed head's first PR attempt always defers; only its explicit rerun may
-  execute PR code. Native PR jobs are bound to their exact PR and head;
+  execute PR code, and that rerun still requires the `ci:ready` phase label.
+  Native PR jobs are bound to their exact PR and head;
   full-CI cancellation, failure, and watchdog expiry are terminal failures.
 - Ordinary PR CI is automatic. Managed PRs retain a cheap automatic routing
   run; admission reruns that exact PR/head workflow so both routes use the same

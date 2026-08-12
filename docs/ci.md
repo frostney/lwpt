@@ -24,9 +24,10 @@ Trigger split, mirroring GocciaScript's CI shape:
 - **Managed PRs retain cheap deferral and explicit phase transitions.** Their
   initial automatic PR run stops after the routing job. Every first attempt for
   a managed head defers even when an older head left `ci:ready` attached. The
-  `ci` transition reruns that exact PR/head workflow, producing the same six
-  native checks as an ordinary PR. It neither dispatches a wrapper nor creates
-  another proof. `delivery:managed` does not assert stack membership.
+  `ci` transition adds `ci:ready` and reruns that exact PR/head workflow. Both
+  the label and a rerun attempt are required, so an automatic or manual
+  first attempt remains deferred. The rerun produces the same six native
+  checks as an ordinary PR. `delivery:managed` does not assert stack membership.
 - **`ci.yml` has three exact uses.** A push to `main` verifies the integrated tree;
   rapid main pushes cancel older integrated-main runs. The `full-ci` operation
   checks out one frozen singleton or cumulative native-prefix top SHA. Those
