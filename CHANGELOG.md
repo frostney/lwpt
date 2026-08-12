@@ -1,6 +1,35 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.6.0] - 2026-08-12
+
+### Bug Fixes
+
+- fix(httpclient): harden socket waits and chunk bounds (#183)
+
+### Documentation
+
+- docs: align release readiness contracts (#195)
+- docs(release): reuse integrated CI evidence (#189)
+- docs(testing): correct HTTPClient test count (#182)
+
+### Internal
+
+- chore: refresh workflow skills and repair full-CI finalization (#194)
+- ci: tolerate absent Windows compiler roots (#193)
+- ci: make cross-platform proof progressive (#192)
+
+### New Features
+
+- feat(test): verify runtime registration inventory (#191)
+- feat(delivery): discover active review adapters (#190)
+- feat(test): select test paths and globs (#185)
+- feat(httpclient): native SChannel server TLS on Windows (win64 + win32) (#184)
+- feat(build): allow relocating session staging (#181)
+- HTTPClient: add POST support on a body-capable request core (#180)
+- feat(manifest): expose declarative schema (#179)
+- feat(test): support manifest compiler flags (#177)
+- Unify direct commands and compiler targets (#176)
 ## [0.5.1] - 2026-08-10
 
 ### Bug Fixes
