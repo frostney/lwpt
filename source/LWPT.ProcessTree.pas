@@ -67,6 +67,7 @@ type
     procedure MarkManagedChild;
     procedure DrainAcknowledgementFrames;
     function HasActiveOwnedProcesses: Boolean;
+    function HasCancellationTargetBefore(const ADeadline: QWord): Boolean;
     function SendCancellationFrame(const ADescendantDeadline,
       AAcknowledgementDeadline: QWord): Boolean;
     procedure BeginForwardedTermination(const ADescendantDeadline,
@@ -949,6 +950,22 @@ begin
   {$ENDIF}
 end;
 
+function TLWPTProcessTree.HasCancellationTargetBefore(
+  const ADeadline: QWord): Boolean;
+begin
+  Result := HasActiveOwnedProcesses;
+  {$IFDEF MSWINDOWS}
+  { A signalled process handle can briefly precede the Job Object's active
+    process count reaching zero. Reconcile that accounting before committing
+    to a cancellation transaction: an exited forwarding process cannot
+    acknowledge CANCEL, while a genuinely surviving descendant remains a
+    cancellation target after the bounded descendant window. }
+  if Result and ProcessExitedBefore(FProcess.ProcessHandle,
+    GetTickCount64) then
+    Result := not FWindowsState.WaitUntilEmptyBefore(ADeadline);
+  {$ENDIF}
+end;
+
 procedure TLWPTProcessTree.BeginForwardedTermination(
   const ADescendantDeadline, AAcknowledgementDeadline: QWord);
 {$IFDEF UNIX}
@@ -963,7 +980,8 @@ begin
   InterlockedExchange(FImmediateTerminationRequested, 1);
   EnterCriticalSection(FTerminationCriticalSection);
   try
-    if not FCancellationStarted and not HasActiveOwnedProcesses then Exit;
+    if not FCancellationStarted
+       and not HasCancellationTargetBefore(ADescendantDeadline) then Exit;
     DrainAcknowledgementFrames;
     if not SendCancellationFrame(ADescendantDeadline,
       AAcknowledgementDeadline) then Exit;
@@ -1188,7 +1206,8 @@ var
 begin
   EnterCriticalSection(FTerminationCriticalSection);
   try
-    if not FCancellationStarted and not HasActiveOwnedProcesses then Exit;
+    if not FCancellationStarted
+       and not HasCancellationTargetBefore(ADescendantDeadline) then Exit;
     DrainAcknowledgementFrames;
     if not SendCancellationFrame(ADescendantDeadline,
       AAcknowledgementDeadline) then Exit;
