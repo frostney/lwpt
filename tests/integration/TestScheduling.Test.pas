@@ -1383,16 +1383,23 @@ begin
       'program OutputLimitFixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'uses Classes, SysUtils;'#10
-    + 'var BlockedTmp: string;'#10
+    + 'var BlockedTmp, OutputChunk: string;'#10
+    + '  Remaining, Written: Integer;'#10
     + 'begin'#10
     + '  BlockedTmp := IncludeTrailingPathDelimiter(GetEnvironmentVariable('
     + PascalString(WORKER_STATE_DIR_ENV) + ')) + ''tmp'';'#10
     + '  if DirectoryExists(BlockedTmp) and not RemoveDir(BlockedTmp) then'
     + ' Halt(2);'#10
     + '  TFileStream.Create(BlockedTmp, fmCreate).Free;'#10
-    + '  Write(StringOfChar(''x'', '
-    + IntToStr(ProcessCaptureOverflowBytes) + '));'#10
-    + '  Flush(Output);'#10
+    + '  OutputChunk := StringOfChar(''x'', 64 * 1024);'#10
+    + '  Remaining := ' + IntToStr(ProcessCaptureOverflowBytes) + ';'#10
+    + '  while Remaining > 0 do begin'#10
+    + '    Written := Length(OutputChunk);'#10
+    + '    if Written > Remaining then Written := Remaining;'#10
+    + '    Written := FileWrite(StdOutputHandle, OutputChunk[1], Written);'#10
+    + '    if Written <= 0 then Halt(3);'#10
+    + '    Dec(Remaining, Written);'#10
+    + '  end;'#10
     + '  Sleep(' + IntToStr(ProcessCaptureOverflowHoldMilliseconds) + ');'#10
     + 'end.'#10);
 
@@ -1784,11 +1791,15 @@ begin
       Sleep(ProcessPollMilliseconds);
     if not FileExists(ParamStr(5)) then Exit(3);
     CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
-    { The controller shares the new console but must survive Ctrl-Break too.
-      The compiler proxy installs the same two-event handler before publishing
-      its PID, leaving LWPT as the only process that performs cancellation. }
-    if not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
-      True) then Exit(6);
+    { SetConsoleCtrlHandler(nil, True) already makes this controller ignore
+      Ctrl-C. Register the Pascal callback only for Ctrl-Break, which ignores
+      that inherited flag; avoiding a redundant operating-system callback
+      keeps the Ctrl-C controller on its single main-thread fixture path. The
+      compiler proxy installs its handler before publishing its PID, leaving
+      LWPT as the only process that performs cancellation. }
+    if (ControlType = Windows.CTRL_BREAK_EVENT)
+       and not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
+         True) then Exit(6);
     if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(7);
     Started := Now;
     while LwptProcess.Running
@@ -1818,12 +1829,6 @@ var
   BytesRead, BytesWritten: DWORD;
   {$ENDIF}
 begin
-  if AMode = CleanAcknowledgementExitProxyMode then
-  begin
-    InstallProcessTreeSignalForwarding;
-    WriteTextFile(APIDFile, IntToStr(GetProcessID));
-    Exit(0);
-  end;
   StatusHandleText := GetEnvironmentVariable(
     ProcessTreeStatusHandleEnvironment);
   ControlHandleText := GetEnvironmentVariable(
@@ -1845,6 +1850,14 @@ begin
     BytesWritten, nil) or (BytesWritten <> DWORD(Length(Frame))) then
     Exit(2);
   {$ENDIF}
+  if AMode = CleanAcknowledgementExitProxyMode then
+  begin
+    { This fixture needs only to register before a clean exit. Starting the
+      production forwarding threads here races immediate process shutdown on
+      Win32 and is unrelated to the already-empty Job Object contract. }
+    WriteTextFile(APIDFile, IntToStr(GetProcessID));
+    Exit(0);
+  end;
   WriteTextFile(APIDFile + '-descendant', IntToStr(GetProcessID));
   {$IFDEF UNIX}
   if not ReadAcknowledgementControlBefore(ControlHandle,
