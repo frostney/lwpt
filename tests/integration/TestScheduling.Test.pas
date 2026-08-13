@@ -1791,11 +1791,15 @@ begin
       Sleep(ProcessPollMilliseconds);
     if not FileExists(ParamStr(5)) then Exit(3);
     CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
-    { The controller shares the new console but must survive Ctrl-Break too.
-      The compiler proxy installs the same two-event handler before publishing
-      its PID, leaving LWPT as the only process that performs cancellation. }
-    if not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
-      True) then Exit(6);
+    { SetConsoleCtrlHandler(nil, True) already makes this controller ignore
+      Ctrl-C. Register the Pascal callback only for Ctrl-Break, which ignores
+      that inherited flag; avoiding a redundant operating-system callback
+      keeps the Ctrl-C controller on its single main-thread fixture path. The
+      compiler proxy installs its handler before publishing its PID, leaving
+      LWPT as the only process that performs cancellation. }
+    if (ControlType = Windows.CTRL_BREAK_EVENT)
+       and not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
+         True) then Exit(6);
     if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(7);
     Started := Now;
     while LwptProcess.Running
