@@ -61,14 +61,18 @@ trap terminate_probe EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 case "$scope" in
-  default) test_selectors=() ;;
-  scheduling) test_selectors=(tests/integration/TestScheduling.Test.pas) ;;
+  default) test_command=(./build/lwpt test) ;;
+  scheduling)
+    test_command=(
+      ./build/lwpt test tests/integration/TestScheduling.Test.pas
+    )
+    ;;
   *) echo "unsupported scheduling diagnostic scope: $scope" >&2; exit 2 ;;
 esac
 
 python3 -c \
   'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
-  ./build/lwpt test "${test_selectors[@]}" \
+  "${test_command[@]}" \
   --jobs=1 --bail=1 --verbose &
 lwpt_pid=$!
 
