@@ -62,6 +62,7 @@ const
   WAIT_TIMEOUT_MILLISECONDS = 10000;
   SCRATCH_DELETE_TIMEOUT_MILLISECONDS = 2000;
   SCRATCH_DELETE_RETRY_MILLISECONDS = 25;
+  MARKER_COMPLETE_SUFFIX = '.complete';
 
 type
   TStateRootUtilityResult = record
@@ -207,6 +208,15 @@ begin
   end;
 end;
 
+procedure PublishReadableMarker(const APath, AText: string);
+begin
+  WriteMarker(APath, AText);
+  { Path visibility alone does not mean a Windows writer has returned from
+    its atomic replacement. Publish a separate existence-only marker after
+    the payload write completes, transferring read ownership to the parent. }
+  WriteMarker(APath + MARKER_COMPLETE_SUFFIX, 'complete');
+end;
+
 function WaitForFile(const APath: string;
   ATimeoutMilliseconds: Integer): Boolean;
 var
@@ -231,6 +241,15 @@ begin
   finally
     Lines.Free;
   end;
+end;
+
+function WaitForReadableMarker(const APath: string;
+  ATimeoutMilliseconds: Integer; out AText: string): Boolean;
+begin
+  Result := WaitForFile(APath + MARKER_COMPLETE_SUFFIX,
+    ATimeoutMilliseconds);
+  if not Result then Exit;
+  AText := ReadMarkerText(APath);
 end;
 
 function InterruptFirstWorkerStateRootCreate(
@@ -271,7 +290,7 @@ var
   HasProcess, HasLease, FailedRelease, Refused : Boolean;
   Session : TLWPTWorkerBudgetSession;
   Lease : TLWPTWorkerLease;
-  AcquiredPath, ReleasePath, OutputPath, ChildOutput, TmpPath,
+  AcquiredPath, ReleasePath, OutputPath, ChildOutput, ChildMarker, TmpPath,
     DelegationToken, RequestPath, OwnerPath, Kind, ParentOutput,
     ChildRelease, ChildConsume, ChildAcquired, CancellationError : string;
   Snapshot : TLWPTWorkerBudgetSnapshot;
@@ -661,7 +680,8 @@ begin
         ExitCode := 3;
         Exit(True);
       end;
-      WriteMarker(ParamStr(2), 'pid=' + IntToStr(GetProcessID));
+      PublishReadableMarker(ParamStr(2),
+        'pid=' + IntToStr(GetProcessID));
       while not FileExists(ParamStr(3)) do Sleep(25);
     finally
       Lease.Free;
@@ -673,7 +693,7 @@ begin
 
   if (ParamCount = 5) and (ParamStr(1) = PENDING_CHILD_SWITCH) then
   begin
-    WriteMarker(ParamStr(2), 'ready-to-consume');
+    PublishReadableMarker(ParamStr(2), 'ready-to-consume');
     while not FileExists(ParamStr(3)) do Sleep(25);
     Session := TLWPTWorkerBudgetSession.Create(DELEGATED_CHILD_SESSION, 1);
     Lease := nil;
@@ -725,10 +745,12 @@ begin
       Lines.Add('parent-granted-after-delegation='
         + IntToStr(Session.GrantedWorkers));
       Child.Execute;
-      if not WaitForFile(ChildOutput, WAIT_TIMEOUT_MILLISECONDS) then
-        raise Exception.Create('delegated child did not acquire its lease');
+      if not WaitForReadableMarker(ChildOutput,
+        WAIT_TIMEOUT_MILLISECONDS, ChildMarker) then
+        raise Exception.Create(
+          'delegated child did not publish its readiness marker');
       Lines.Add('spawned-child-pid=' + IntToStr(Child.ProcessID));
-      Lines.Add('ready-marker=' + ReadMarkerText(ChildOutput));
+      Lines.Add('ready-marker=' + ChildMarker);
 
       Lease.Release;
       Lease.Free;
