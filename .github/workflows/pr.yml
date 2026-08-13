@@ -430,31 +430,39 @@ jobs:
       # When ci.yml's copy changes, change this one too.
       - name: Install FPC (choco)
         run: |
+          FPC_BIN=""
           for attempt in 1 2; do
             echo "::group::Chocolatey FPC install attempt ${attempt}/2"
-            if choco install -y freepascal; then
+            install_status=0
+            choco install -y freepascal || install_status=$?
+            FPC_BIN=""
+            for candidate_root in /c/tools/freepascal /c/fpc; do
+              if [ -d "$candidate_root" ]; then
+                FPC_BIN=$(find "$candidate_root" -name fpc.exe -type f 2>/dev/null | head -1 || true)
+                if [ -n "$FPC_BIN" ]; then break; fi
+              fi
+            done
+            if [ "$install_status" -eq 0 ] && [ -n "$FPC_BIN" ]; then
               echo "::endgroup::"
               break
-            else
-              install_status=$?
-              echo "::endgroup::"
-              if [ "$attempt" -eq 2 ]; then
-                echo "::error::Chocolatey FPC install failed after 2 attempts (exit code ${install_status})"
-                exit "$install_status"
-              fi
-              echo "::warning::Chocolatey FPC install attempt 1/2 failed (exit code ${install_status}); retrying once"
             fi
+            if [ "$install_status" -eq 0 ]; then
+              install_status=1
+              failure_reason="fpc.exe not found after Chocolatey exited 0"
+            elif [ -z "$FPC_BIN" ]; then
+              failure_reason="fpc.exe not found"
+            else
+              failure_reason="Chocolatey command failed"
+            fi
+            echo "::endgroup::"
+            if [ "$attempt" -eq 2 ]; then
+              echo "::error::Chocolatey FPC install failed after 2 attempts (exit code ${install_status}; ${failure_reason})"
+              exit "$install_status"
+            fi
+            echo "::warning::Chocolatey FPC install attempt 1/2 did not produce a usable compiler (exit code ${install_status}; ${failure_reason}); retrying once"
           done
           # Add the FPC bin to PATH for subsequent steps. Chocolatey has
           # used both C:\fpc and C:\tools\freepascal layouts over time.
-          FPC_BIN=""
-          for candidate_root in /c/tools/freepascal /c/fpc; do
-            if [ -d "$candidate_root" ]; then
-              FPC_BIN=$(find "$candidate_root" -name fpc.exe -type f 2>/dev/null | head -1)
-              if [ -n "$FPC_BIN" ]; then break; fi
-            fi
-          done
-          if [ -z "$FPC_BIN" ]; then echo "::error::Chocolatey FPC install: fpc.exe not found"; exit 1; fi
           echo "Using FPC at $FPC_BIN"
           echo "$(cygpath -w "$(dirname "$FPC_BIN")")" >> "$GITHUB_PATH"
           echo "LWPT_FPC=$(cygpath -w "$FPC_BIN")" >> "$GITHUB_ENV"
