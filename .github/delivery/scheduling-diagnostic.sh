@@ -63,7 +63,7 @@ trap 'exit 143' TERM
 case "$scope" in
   default)
     test_command=(
-      bash -c
+      /bin/bash -c
       './build/lwpt test --jobs=1 --bail=1 --verbose &&
        for _ in 1 2; do
          ./build/lwpt test tests/integration/TestScheduling.Test.pas \
