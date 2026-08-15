@@ -56,10 +56,15 @@ function CmdBuild(const AManifestPath: string;
   const AEntryNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer; const AVerbose: Boolean;
   const ACompilerHost: TLWPTCompilerHost): Integer; overload;
+function CmdBuild(const AManifestPath: string;
+  const AEntryNames: array of string; const ARelease, AClean: Boolean;
+  const AJobs: Integer; const AVerbose, AUseCache: Boolean;
+  const ACompilerHost: TLWPTCompilerHost): Integer; overload;
 
 implementation
 
 uses
+  LWPT.BuildCache,
   LWPT.BuildRequest,
   LWPT.BuildSession,
   LWPT.Command.Common,
@@ -80,6 +85,10 @@ type
     CandidateBin: string;
     OutBin: string;
     Fingerprint: string;
+    CacheFingerprint: string;
+    CacheSnapshot: string;
+    CacheDiagnostic: string;
+    CacheUnixMode: Integer;
     ProjectRoot: string;
     CfgPath: string;
     ModulesPath: string;
@@ -101,6 +110,8 @@ type
     FLease: TLWPTWorkerLease;
     FDriver: TLWPTCompilerDriver;
     FCompiler: TLWPTCompilerProcess;
+    FCache: TLWPTBuildCache;
+    FUseCache: Boolean;
     FCompiled: TLWPTCompiledEntry;
     FBuildResult: TLWPTBuildResult;
     FCompilerExitCode: Integer;
@@ -117,7 +128,8 @@ type
       const AManifest: TManifest; const AManifestContentHash: string;
       const AEntry: TLWPTBuildEntry; const ARelease, AClean: Boolean;
       const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
-      const ADriver: TLWPTCompilerDriver);
+      const ADriver: TLWPTCompilerDriver; const ACache: TLWPTBuildCache;
+      const AUseCache: Boolean);
     destructor Destroy; override;
     procedure BeginCancel(const ADescendantDeadline,
       AAcknowledgementDeadline: QWord);
@@ -486,18 +498,22 @@ function BuildOneEntry(const AManifestPath: string; const AMan: TManifest;
   const AManifestContentHash: string;
   const T: TLWPTBuildEntry; ARelease, AClean: Boolean;
   ASession: TLWPTBuildSession; ACompiler: TLWPTCompilerProcess;
-  ADriver: TLWPTCompilerDriver; out ACompiled: TLWPTCompiledEntry;
+  ADriver: TLWPTCompilerDriver; ACache: TLWPTBuildCache;
+  const AUseCache: Boolean; out ACompiled: TLWPTCompiledEntry;
   out ABuildResult: TLWPTBuildResult; out AOutput: string;
   out ACompilerExitCode: Integer): Boolean;
 var
   FpcArgs : TStringArray;
   OutBin, JobRoot, BinDir, CandidateBin, UnitOutDir, StandardOutput,
     StandardError,
+    CacheFingerprint, CacheReason, CacheSnapshot, CacheOutput,
     Fingerprint, ProjectRoot, CfgPath, ModulesPath : string;
   i, FpcExit : Integer;
   Capabilities: TLWPTCompilerCapabilities;
+  CachedResult: TLWPTCachedBuildResult;
   Failure: TLWPTCompilerFailure;
   Request: TLWPTBuildPublicationRequest;
+  CacheRequest: TLWPTBuildRequest;
   ScanDirs: LWPT.Core.TStringArray;
 begin
   ACompiled := Default(TLWPTCompiledEntry);
@@ -549,9 +565,14 @@ begin
   Request.BuildRequest.Outputs.ExecutableDirectory := BinDir;
   Request.BuildRequest.Outputs.UnitDirectory := UnitOutDir;
   Request.BuildRequest.Outputs.ObjectDirectory := UnitOutDir;
+  { Only environment that changes the effective compiler request belongs in
+    the reusable fingerprint. Scheduler leases, terminal state, temporary
+    directories, and other inherited process state must not turn every build
+    into a cache miss. Target selection is already represented by the neutral
+    target tuple and compiler discovery by the executable plus live version. }
   SetLength(Request.Environment, 1);
-  Request.Environment[0] := 'LWPT_FPC_UNIT_PATHS='
-    + GetEnvironmentVariable('LWPT_FPC_UNIT_PATHS');
+  Request.Environment[0] := PROJECT_NAME + '_FPC_UNIT_PATHS='
+    + GetEnvironmentVariable(PROJECT_NAME + '_FPC_UNIT_PATHS');
   Request.BuildRequest.Inputs.UnitPaths :=
     Copy(AMan.Units, 0, Length(AMan.Units));
   Request.BuildRequest.Inputs.IncludePaths :=
@@ -578,6 +599,10 @@ begin
   EnsureBuildRequestCompatible(Request.BuildRequest, Capabilities);
   Request.BuildRequest.Compiler.VersionIdentity :=
     Capabilities.VersionIdentity;
+  CacheRequest := NeutralBuildCacheRequest(Request.BuildRequest, OutBin);
+  Request.CompilerArguments := ADriver.InvocationArguments(
+    ADriver.BuildArguments(CacheRequest,
+      BuildCompilerInvocationOptions(CfgPath, False)));
   { The cfg reaches FPC unexpanded (@file), so its -Fu lines are read
     through the same shared extractor the test flow uses. }
   ScanDirs := Copy(Request.BuildRequest.Inputs.UnitPaths, 0,
@@ -587,6 +612,54 @@ begin
     LongestCompiledBaseNameLength(ScanDirs, T.Source));
   Fingerprint := CaptureBuildPublicationFingerprint(ProjectRoot,
     AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
+  CacheFingerprint := CaptureBuildCacheFingerprint(ProjectRoot,
+    AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
+
+  CacheReason := 'disabled';
+  if AClean then CacheReason := 'clean'
+  else if AUseCache and Assigned(ACache) then
+    try
+      if ACache.Materialize(CacheFingerprint, CandidateBin,
+        JobRoot + '/cache-tmp', CachedResult, CacheReason) then
+      begin
+        if CachedResult.ArtifactKind <> Request.BuildRequest.OutputKind then
+        begin
+          SysUtils.DeleteFile(CandidateBin);
+          CacheReason := 'result-kind-mismatch';
+        end
+        else
+        begin
+          ABuildResult := DefaultBuildResult;
+          ABuildResult.Success := True;
+          SetLength(ABuildResult.Artifacts, 1);
+          ABuildResult.Artifacts[0].Kind := CachedResult.ArtifactKind;
+          ABuildResult.Artifacts[0].Path := CandidateBin;
+          ABuildResult.Artifacts[0].Digest := CachedResult.ArtifactDigest;
+          ValidateBuildResult(ABuildResult);
+          ValidateReportedArtifacts(ADriver.CompilerID,
+            Request.BuildRequest, ABuildResult);
+          ACompilerExitCode := 0;
+          AOutput := 'cache hit: ' + CacheFingerprint + LineEnding;
+          ACompiled.Name := T.Name;
+          ACompiled.CandidateBin := CandidateBin;
+          ACompiled.OutBin := OutBin;
+          ACompiled.Fingerprint := Fingerprint;
+          ACompiled.CacheFingerprint := CacheFingerprint;
+          ACompiled.CacheDiagnostic := 'cache hit';
+          ACompiled.ProjectRoot := ProjectRoot;
+          ACompiled.CfgPath := CfgPath;
+          ACompiled.ModulesPath := ModulesPath;
+          ACompiled.Request := Request;
+          ACompiled.PostBuild := RetargetPostBuildHooks(T.PostBuild,
+            OutBin, CandidateBin);
+          Exit(True);
+        end;
+      end;
+    except
+      on E: Exception do CacheReason := 'unavailable';
+    end
+  else if AUseCache then CacheReason := 'unavailable';
+  CacheOutput := 'cache miss: ' + CacheReason + LineEnding;
 
   FpcArgs := ADriver.InvocationArguments(ADriver.BuildArguments(
     Request.BuildRequest, BuildCompilerInvocationOptions(CfgPath, AClean)));
@@ -598,7 +671,8 @@ begin
     'compiler "' + ADriver.CompilerID + '" compile',
     StandardOutput, StandardError);
   ACompilerExitCode := FpcExit;
-  AOutput := ADriver.DisplayOutput(StandardOutput, StandardError);
+  AOutput := CacheOutput
+    + ADriver.DisplayOutput(StandardOutput, StandardError);
   ABuildResult := ADriver.NormalizeExecutionResult(Request.BuildRequest,
     FpcExit, StandardOutput, StandardError);
   ValidateReportedArtifacts(ADriver.CompilerID, Request.BuildRequest,
@@ -617,6 +691,14 @@ begin
     ACompiled.CandidateBin := CandidateBin;
     ACompiled.OutBin := OutBin;
     ACompiled.Fingerprint := Fingerprint;
+    ACompiled.CacheFingerprint := CacheFingerprint;
+    ACompiled.CacheDiagnostic := 'cache miss: ' + CacheReason;
+    ACompiled.CacheUnixMode := BuildArtifactUnixMode(CandidateBin);
+    CacheSnapshot := JobRoot + '/cache-artifact/'
+      + ExtractFileName(CandidateBin);
+    ForceDirectories(ExtractFileDir(CacheSnapshot));
+    if CopyFileContent(CandidateBin, CacheSnapshot) then
+      ACompiled.CacheSnapshot := CacheSnapshot;
     ACompiled.ProjectRoot := ProjectRoot;
     ACompiled.CfgPath := CfgPath;
     ACompiled.ModulesPath := ModulesPath;
@@ -637,7 +719,8 @@ constructor TLWPTBuildJob.Create(const AManifestPath: string;
   const AManifest: TManifest; const AManifestContentHash: string;
   const AEntry: TLWPTBuildEntry; const ARelease, AClean: Boolean;
   const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
-  const ADriver: TLWPTCompilerDriver);
+  const ADriver: TLWPTCompilerDriver; const ACache: TLWPTBuildCache;
+  const AUseCache: Boolean);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
@@ -650,6 +733,8 @@ begin
   FSession := ASession;
   FLease := ALease;
   FDriver := ADriver;
+  FCache := ACache;
+  FUseCache := AUseCache;
   FCompiler := TLWPTCompilerProcess.Create(FDriver.ExecutableName,
     FDriver.WorkingDirectory);
   FCompiled := Default(TLWPTCompiledEntry);
@@ -679,7 +764,7 @@ begin
     try
       FSucceeded := BuildOneEntry(FManifestPath, FManifest,
         FManifestContentHash, FEntry, FRelease, FClean, FSession,
-        FCompiler, FDriver, FCompiled, FBuildResult, FOutput,
+        FCompiler, FDriver, FCache, FUseCache, FCompiled, FBuildResult, FOutput,
         FCompilerExitCode);
       if (not FSucceeded) and (FError = '') then
         if FEntry.Source = '' then
@@ -940,6 +1025,15 @@ function CmdBuild(const AManifestPath: string;
   const AEntryNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer; const AVerbose: Boolean;
   const ACompilerHost: TLWPTCompilerHost): Integer;
+begin
+  Result := CmdBuild(AManifestPath, AEntryNames, ARelease, AClean,
+    AJobs, AVerbose, True, ACompilerHost);
+end;
+
+function CmdBuild(const AManifestPath: string;
+  const AEntryNames: array of string; const ARelease, AClean: Boolean;
+  const AJobs: Integer; const AVerbose, AUseCache: Boolean;
+  const ACompilerHost: TLWPTCompilerHost): Integer;
 var
   Man : TManifest;
   i, j, Built, Failed, Skipped, Unknown, SelectedCount, MaxJobs, Running,
@@ -970,6 +1064,7 @@ var
   Reported: array of Boolean;
   Reporter: TLWPTProgressReporter;
   HeartbeatEvent: TLWPTHeartbeatEvent;
+  Cache: TLWPTBuildCache;
 
   function LogIdentity(const AIndex: Integer): string;
   begin
@@ -1133,6 +1228,21 @@ var
         end
         else
         begin
+          if AUseCache and Assigned(Cache)
+             and (Compiled[AIndex].CacheSnapshot <> '') then
+            try
+              Cache.Store(Compiled[AIndex].CacheFingerprint,
+                Compiled[AIndex].CacheSnapshot,
+                PublicationRequest.BuildRequest.OutputKind,
+                Compiled[AIndex].CacheUnixMode);
+              CapturedOutputs[AIndex] := CapturedOutputs[AIndex]
+                + 'cache stored: ' + Compiled[AIndex].CacheFingerprint
+                + LineEnding;
+            except
+              on E: Exception do
+                CapturedOutputs[AIndex] := CapturedOutputs[AIndex]
+                  + 'cache store skipped: unavailable' + LineEnding;
+            end;
           States[AIndex] := besSucceeded;
           Inc(Built);
         end;
@@ -1196,6 +1306,7 @@ begin
   Result := 1;
   CompilerSelection := nil;
   Reporter := nil;
+  Cache := nil;
   try
     try
       if not FileExists(AManifestPath) then
@@ -1203,6 +1314,12 @@ begin
           'manifest not found at %s', [AManifestPath]);
       Man := LoadManifestSnapshot(AManifestPath, ManifestContentHash);
       ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
+      if AUseCache then
+        try
+          Cache := TLWPTBuildCache.CreateDefault;
+        except
+          on E: Exception do Cache := nil;
+        end;
       CompilerSelection := TLWPTCompilerSelection.Create(Man,
         ExtractFileDir(ExpandFileName(AManifestPath)), ACompilerHost);
 
@@ -1345,7 +1462,7 @@ begin
                   Man.BuildEntries[i].PreBuild, ProjectRoot);
                 Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
                   ManifestContentHash, Man.BuildEntries[i], ARelease, AClean,
-                  Session, Lease, EntryDrivers[i]);
+                  Session, Lease, EntryDrivers[i], Cache, AUseCache);
                 Lease := nil;
                 States[i] := besRunning;
                 Inc(Running);
@@ -1504,6 +1621,7 @@ begin
       end;
     end;
   finally
+    Cache.Free;
     CompilerSelection.Free;
     WriteLn('summary: ', Built, ' built, ', Failed, ' failed, ',
       Skipped, ' skipped; elapsed ',

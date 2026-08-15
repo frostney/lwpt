@@ -27,6 +27,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.ObjectStore,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -44,6 +45,7 @@ type
     procedure TestCleanLeavesSharedArtefactsUntouched;
     procedure TestCleanKeepsNonArtefactFiles;
     procedure TestCleanWithoutBuildDirSucceeds;
+    procedure TestNoCacheBypassesReusableBuildResult;
     {$IFDEF UNIX}
     procedure TestCleanDoesNotFollowSymlinkedDirs;
     {$ENDIF}
@@ -125,6 +127,34 @@ begin
   Expect<Boolean>(Pos('build mode: dev, clean', R.Stdout) > 0).ToBe(True);
 end;
 
+procedure TBuildClean.TestNoCacheBypassesReusableBuildResult;
+var
+  CacheRoot: string;
+  Environment: array of string;
+  First, Hit, Bypassed: TLwptResult;
+begin
+  WipeOutputs;
+  CacheRoot := FScratch + '/cache';
+  RecursiveDelete(CacheRoot);
+  SetLength(Environment, 1);
+  Environment[0] := CACHE_DIR_ENV + '=' + CacheRoot;
+
+  First := RunLwpt(['build', '--verbose'], FScratch, Environment);
+  Expect<Integer>(First.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('cache miss: no-result', First.Stdout) > 0).ToBe(True);
+
+  Hit := RunLwpt(['build', '--verbose'], FScratch, Environment);
+  Expect<Integer>(Hit.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('cache hit:', Hit.Stdout) > 0).ToBe(True);
+
+  Bypassed := RunLwpt(['build', '--verbose', '--no-cache'], FScratch,
+    Environment);
+  Expect<Integer>(Bypassed.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('cache miss: disabled', Bypassed.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('cache hit:', Bypassed.Stdout) = 0).ToBe(True);
+end;
+
 { Clean must not traverse build/ at all, including through a symlink.
   Unix only because Windows symlink creation needs privileges. Compiled
   out rather than an empty body: the test runner counts a test that runs
@@ -156,6 +186,8 @@ begin
     TestCleanKeepsNonArtefactFiles);
   Test('build --clean with no build/ dir still succeeds',
     TestCleanWithoutBuildDirSucceeds);
+  Test('build --no-cache bypasses a reusable result',
+    TestNoCacheBypassesReusableBuildResult);
   {$IFDEF UNIX}
   Test('build --clean does not follow symlinked dirs out of build/',
     TestCleanDoesNotFollowSymlinkedDirs);

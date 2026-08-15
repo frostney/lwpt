@@ -48,6 +48,8 @@ type
     procedure TestHookInputChangeRefusesPublication;
     procedure TestNativeDriverRequestPreservesPublicationFingerprint;
     procedure TestExtraArgumentsChangePublicationFingerprint;
+    procedure TestCacheFingerprintIgnoresSessionAndPublicArtifactBytes;
+    procedure TestCacheFingerprintCoversCompilerTargetInputsAndEnvironment;
     procedure TestPublicationLockUsesSessionsRoot;
     {$IFDEF UNIX}
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
@@ -130,6 +132,90 @@ begin
     MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Boolean>(FirstFingerprint <> SecondFingerprint).ToBe(True);
+end;
+
+procedure TLWPTBuildSessionTests.
+  TestCacheFingerprintIgnoresSessionAndPublicArtifactBytes;
+var
+  FirstFingerprint, SecondFingerprint: string;
+  Request: TLWPTBuildPublicationRequest;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  WriteText(FScratch + '/build/app', 'first-public-generation');
+  Request := BasicRequest;
+  Request.BuildRequest.Outputs.Artifact :=
+    FScratch + '/.lwpt/sessions/first/bin/app';
+  Request.BuildRequest.Outputs.ExecutableDirectory :=
+    FScratch + '/.lwpt/sessions/first/bin';
+  Request.BuildRequest.Outputs.UnitDirectory :=
+    FScratch + '/.lwpt/sessions/first/units';
+  Request.BuildRequest.Outputs.ObjectDirectory :=
+    FScratch + '/.lwpt/sessions/first/objects';
+  FirstFingerprint := CaptureBuildCacheFingerprint(FScratch,
+    MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+
+  Request.BuildRequest.Outputs.Artifact :=
+    FScratch + '/.lwpt/sessions/second/bin/app';
+  Request.BuildRequest.Outputs.ExecutableDirectory :=
+    FScratch + '/.lwpt/sessions/second/bin';
+  Request.BuildRequest.Outputs.UnitDirectory :=
+    FScratch + '/.lwpt/sessions/second/units';
+  Request.BuildRequest.Outputs.ObjectDirectory :=
+    FScratch + '/.lwpt/sessions/second/objects';
+  WriteText(FScratch + '/build/app', 'second-public-generation');
+  SecondFingerprint := CaptureBuildCacheFingerprint(FScratch,
+    MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+
+  Expect<string>(SecondFingerprint).ToBe(FirstFingerprint);
+end;
+
+procedure TLWPTBuildSessionTests.
+  TestCacheFingerprintCoversCompilerTargetInputsAndEnvironment;
+var
+  Baseline, Changed: string;
+  Request: TLWPTBuildPublicationRequest;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  Request := BasicRequest;
+  SetLength(Request.CompilerArguments, 1);
+  Request.CompilerArguments[0] := '--effective-first';
+  SetLength(Request.Environment, 1);
+  Request.Environment[0] := 'CACHE_FIXTURE=first';
+  Baseline := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+
+  Request.CompilerArguments[0] := '--effective-second';
+  Changed := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  Expect<Boolean>(Changed <> Baseline).ToBe(True);
+  Request.CompilerArguments[0] := '--effective-first';
+
+  Request.BuildRequest.Compiler.VersionIdentity := '2.0.0';
+  Changed := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  Expect<Boolean>(Changed <> Baseline).ToBe(True);
+  Request.BuildRequest.Compiler.VersionIdentity := '1.0.0';
+
+  Request.BuildRequest.Target.Architecture := 'other-arch';
+  Changed := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  Expect<Boolean>(Changed <> Baseline).ToBe(True);
+  Request.BuildRequest.Target.Architecture := 'test-arch';
+
+  WriteText(FScratch + '/source/app.pas', 'begin WriteLn; end.');
+  Changed := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  Expect<Boolean>(Changed <> Baseline).ToBe(True);
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+
+  Request.Environment[0] := 'CACHE_FIXTURE=second';
+  Changed := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  Expect<Boolean>(Changed <> Baseline).ToBe(True);
 end;
 
 procedure TLWPTBuildSessionTests.WriteText(const APath, AText: string);
@@ -955,6 +1041,10 @@ begin
     TestNativeDriverRequestPreservesPublicationFingerprint);
   Test('extra compiler arguments change the publication fingerprint',
     TestExtraArgumentsChangePublicationFingerprint);
+  Test('cache fingerprints ignore sessions and prior public artifact bytes',
+    TestCacheFingerprintIgnoresSessionAndPublicArtifactBytes);
+  Test('cache fingerprints cover compiler target inputs and environment',
+    TestCacheFingerprintCoversCompilerTargetInputsAndEnvironment);
   Test('publication locks use the resolved sessions root',
     TestPublicationLockUsesSessionsRoot);
   {$IFDEF UNIX}

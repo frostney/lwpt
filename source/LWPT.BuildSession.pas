@@ -16,6 +16,7 @@ uses
 const
   BUILD_SESSION_SCHEMA_VERSION = 1;
   BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION = 1;
+  BUILD_CACHE_FINGERPRINT_SCHEMA_VERSION = 1;
   BUILD_SESSIONS_DIR = LWPT_DIR + '/sessions';
   BUILD_SESSION_DIR_ENV = PROJECT_NAME + '_SESSION_DIR';
   BUILD_SESSION_ROOT_LEDGER = LWPT_DIR + '/session-roots';
@@ -81,6 +82,12 @@ function CaptureBuildPublicationFingerprint(
   const AProjectRoot, AManifestPath, ACfgPath, ALockPath,
   AModulesPath: string;
   const ARequest: TLWPTBuildPublicationRequest): string;
+function CaptureBuildCacheFingerprint(
+  const AProjectRoot, AManifestPath, ACfgPath, ALockPath,
+  AModulesPath: string;
+  const ARequest: TLWPTBuildPublicationRequest): string;
+function NeutralBuildCacheRequest(const ARequest: TLWPTBuildRequest;
+  const APublicOutput: string): TLWPTBuildRequest;
 function BuildSessionPathKey(const AValue: string): string;
 procedure AppendUnitDirsFromOptions(const AOptions: TStrings;
   var ADirs: TStringArray);
@@ -579,6 +586,81 @@ begin
       ARequest.ExcludedPaths));
     { Same invariant as InputDirectoryFingerprint: the fold separator is
       pinned, never inherited from the platform. }
+    Fields.LineBreak := #10;
+    Result := TextHash(Fields.Text);
+  finally
+    Fields.Free;
+  end;
+end;
+
+function NeutralBuildCacheRequest(const ARequest: TLWPTBuildRequest;
+  const APublicOutput: string): TLWPTBuildRequest;
+const
+  NEUTRAL_SESSION_ROOT = '<build-session>';
+begin
+  Result := ARequest;
+  Result.Outputs.Artifact := APublicOutput;
+  Result.Outputs.ExecutableDirectory := NEUTRAL_SESSION_ROOT + '/bin';
+  Result.Outputs.UnitDirectory := NEUTRAL_SESSION_ROOT + '/units';
+  Result.Outputs.ObjectDirectory := NEUTRAL_SESSION_ROOT + '/objects';
+  Result.Outputs.ResourceDirectory := NEUTRAL_SESSION_ROOT + '/resources';
+end;
+
+function CaptureBuildCacheFingerprint(
+  const AProjectRoot, AManifestPath, ACfgPath, ALockPath,
+  AModulesPath: string;
+  const ARequest: TLWPTBuildPublicationRequest): string;
+var
+  EmptyPaths: TStringArray;
+  Fields: TStringList;
+  ManifestFingerprint, SourceDirectory: string;
+  NeutralRequest: TLWPTBuildRequest;
+begin
+  SetLength(EmptyPaths, 0);
+  Fields := TStringList.Create;
+  try
+    AddField(Fields, 'schema',
+      IntToStr(BUILD_CACHE_FINGERPRINT_SCHEMA_VERSION));
+    ValidateBuildRequest(ARequest.BuildRequest);
+    NeutralRequest := NeutralBuildCacheRequest(ARequest.BuildRequest,
+      ARequest.PublicOutput);
+    AddField(Fields, 'build-request', SerializeBuildRequest(NeutralRequest));
+    AddField(Fields, 'compiler.executable', ARequest.CompilerExecutable);
+    AddStringArray(Fields, 'compiler.arguments', ARequest.CompilerArguments);
+    AddField(Fields, 'manifest.parsed-hash', ARequest.ManifestContentHash);
+    AddPathArray(Fields, AProjectRoot, 'sources',
+      ARequest.BuildRequest.Inputs.Sources, EmptyPaths);
+    SourceDirectory := ExtractFileDir(
+      RootedPath(AProjectRoot, ARequest.BuildRequest.Inputs.EntryPoint));
+    AddField(Fields, 'source-directory', SourceDirectory);
+    AddField(Fields, 'source-directory.content',
+      PathFingerprint(AProjectRoot, SourceDirectory,
+        ARequest.ExcludedPaths));
+    AddField(Fields, 'output', ARequest.PublicOutput);
+    AddStringArray(Fields, 'environment', ARequest.Environment);
+    AddPathArray(Fields, AProjectRoot, 'unit-paths',
+      ARequest.BuildRequest.Inputs.UnitPaths, ARequest.ExcludedPaths);
+    AddPathArray(Fields, AProjectRoot, 'include-paths',
+      ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths);
+    AddPathArray(Fields, AProjectRoot, 'workspace-paths',
+      ARequest.WorkspacePaths, ARequest.ExcludedPaths);
+    AddPathArray(Fields, AProjectRoot, 'resources',
+      ARequest.BuildRequest.Inputs.Resources, ARequest.ExcludedPaths);
+    AddStringArray(Fields, 'hook-definition', ARequest.HookDefinition);
+    AddPathArray(Fields, AProjectRoot, 'hook-inputs',
+      ARequest.HookInputs, ARequest.ExcludedPaths);
+    ManifestFingerprint := PathFingerprint(
+      AProjectRoot, AManifestPath, EmptyPaths);
+    if ManifestFingerprint <> 'file:' + ARequest.ManifestContentHash then
+      raise ELWPTParsedManifestChanged.Create(
+        'manifest changed after it was parsed');
+    AddField(Fields, 'manifest', ManifestFingerprint);
+    AddField(Fields, 'cfg',
+      PathFingerprint(AProjectRoot, ACfgPath, EmptyPaths));
+    AddField(Fields, 'lock',
+      PathFingerprint(AProjectRoot, ALockPath, EmptyPaths));
+    AddField(Fields, 'modules', PathFingerprint(AProjectRoot, AModulesPath,
+      ARequest.ExcludedPaths));
     Fields.LineBreak := #10;
     Result := TextHash(Fields.Text);
   finally

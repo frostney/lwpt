@@ -233,7 +233,7 @@ end;
 function HandleBuild(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  Release, Clean, JobsPresent, Verbose : Boolean;
+  Release, Clean, JobsPresent, UseCache, Verbose : Boolean;
   Jobs : Integer;
   ModeVal : string;
   EntryNames : array of string;
@@ -243,6 +243,7 @@ begin
   Clean   := False;
   Jobs    := 0;              { auto: bounded by graph + machine budget }
   JobsPresent := False;
+  UseCache := True;
   Verbose := False;
   for i := 0 to High(AOptions) do
   begin
@@ -251,6 +252,9 @@ begin
     if SameText(AOptions[i].LongName, 'verbose')
        and AOptions[i].Present then
       Verbose := True;
+    if SameText(AOptions[i].LongName, 'no-cache')
+       and AOptions[i].Present then
+      UseCache := False;
     if SameText(AOptions[i].LongName, 'mode')
        and (AOptions[i] is TStringOption) then
     begin
@@ -284,7 +288,7 @@ begin
   try
     InstallProcessTreeSignalForwarding;
     Result := CmdBuild(MANIFEST_FILE, EntryNames, Release, Clean, Jobs,
-      Verbose);
+      Verbose, UseCache, nil);
   except
     on E: Exception do
     begin
@@ -634,7 +638,7 @@ begin
       '<name> [<name>...]',
       @HandleRemove, RemoveOpts));
 
-    SetLength(BuildOpts, 4);
+    SetLength(BuildOpts, 5);
     BuildOpts[0] := TStringOption.Create('mode',
       'Build mode: dev (default) or release');
     BuildOpts[1] := TFlagOption.Create('clean',
@@ -643,9 +647,12 @@ begin
       'Maximum concurrent build entries (default: machine budget)');
     BuildOpts[3] := TFlagOption.Create('verbose',
       'Replay successful build-entry logs');
+    BuildOpts[4] := TFlagOption.Create('no-cache',
+      'Compile without reading or writing reusable build results');
     Registry.Add(TSubcommand.Create('build',
       'Compile manifest build entries',
-      '[entry...] [--mode dev|release] [--clean] [--jobs N] [--verbose]',
+      '[entry...] [--mode dev|release] [--clean] [--jobs N] [--verbose] '
+        + '[--no-cache]',
       @HandleBuild, BuildOpts));
 
     SetLength(FormatOpts, 1);
