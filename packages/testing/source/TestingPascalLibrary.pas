@@ -125,6 +125,11 @@ uses
   Generics.Defaults,
   TypInfo;
 
+{$IFDEF DARWIN}
+function Pthread_setname_np(const AName: PChar): Integer; cdecl;
+  external 'c' name 'pthread_setname_np';
+{$ENDIF}
+
 var
   CurrentDescribeSuite: TTestSuite;
 
@@ -339,6 +344,9 @@ var
   Suite: TTestSuite;
   Test: TTestRegistration;
   TestResult: TTestResult;
+  {$IFDEF DARWIN}
+  DiagnosticThreadName: string;
+  {$ENDIF}
 begin
   InventoryMode := ConsumeCurrentTestInventoryMode;
   if InventoryMode <> '' then WriteLn(InventoryLine);
@@ -359,6 +367,10 @@ begin
       for Test in Suite.Tests do
       begin
         Suite.FCurrentTestName := Test.Name;
+        {$IFDEF DARWIN}
+        DiagnosticThreadName := Copy('lwpt-208: ' + Test.Name, 1, 63);
+        Pthread_setname_np(PChar(DiagnosticThreadName));
+        {$ENDIF}
         RunTest(Suite, Test);
       end;
 

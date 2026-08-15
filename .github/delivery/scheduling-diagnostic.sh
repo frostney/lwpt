@@ -7,10 +7,29 @@ sample_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_SAMPLE_SECONDS:-5}"
 cleanup_grace_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_CLEANUP_GRACE_SECONDS:-2}"
 scope="${LWPT_SCHEDULING_DIAGNOSTIC_SCOPE:-scheduling}"
 pid_file="${RUNNER_TEMP:-/tmp}/TestScheduling.pids"
+tree_pid_file="${RUNNER_TEMP:-/tmp}/TestScheduling-tree.pids"
 lwpt_pid=0
 
 collect_test_pids() {
   pgrep -f '[T]estScheduling.Test' > "$pid_file" || true
+}
+
+collect_process_tree_pids() {
+  : > "$tree_pid_file"
+  pending_pids="$lwpt_pid"
+  while [ -n "$pending_pids" ]; do
+    next_pids=""
+    for process_pid in $pending_pids; do
+      if kill -0 "$process_pid" 2>/dev/null; then
+        echo "$process_pid" >> "$tree_pid_file"
+        child_pids="$(pgrep -P "$process_pid" || true)"
+        if [ -n "$child_pids" ]; then
+          next_pids="$next_pids $child_pids"
+        fi
+      fi
+    done
+    pending_pids="$next_pids"
+  done
 }
 
 terminate_probe() {
@@ -30,16 +49,20 @@ terminate_probe() {
 
 sample_probe() {
   collect_test_pids
-  ps -axo pid,ppid,stat,etime,command
-  while IFS= read -r test_pid; do
-    if [ -n "$test_pid" ]; then
-      sample "$test_pid" "$sample_seconds" 1 \
-        -file "${RUNNER_TEMP:-/tmp}/TestScheduling-${test_pid}.sample.txt" \
+  collect_process_tree_pids
+  echo "[DEBUG-208] bounded process-tree capture"
+  ps -axo pid,ppid,pgid,stat,etime,wchan,command \
+    || ps -axo pid,ppid,pgid,stat,etime,command
+  while IFS= read -r process_pid; do
+    if [ -n "$process_pid" ]; then
+      echo "[DEBUG-208] sampling PID $process_pid"
+      sample "$process_pid" "$sample_seconds" 1 \
+        -file "${RUNNER_TEMP:-/tmp}/TestScheduling-${process_pid}.sample.txt" \
         || true
-      cat "${RUNNER_TEMP:-/tmp}/TestScheduling-${test_pid}.sample.txt" \
+      cat "${RUNNER_TEMP:-/tmp}/TestScheduling-${process_pid}.sample.txt" \
         || true
     fi
-  done < "$pid_file"
+  done < "$tree_pid_file"
 }
 
 finish_if_complete() {
@@ -61,7 +84,16 @@ trap terminate_probe EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 case "$scope" in
-  default) test_command=(./build/lwpt test) ;;
+  default)
+    test_command=(
+      /bin/bash -c
+      './build/lwpt test --jobs=1 --bail=1 --verbose &&
+       for _ in 1 2; do
+         ./build/lwpt test tests/integration/TestScheduling.Test.pas \
+           --jobs=1 --bail=1 --verbose || exit $?;
+       done'
+    )
+    ;;
   scheduling)
     test_command=(
       ./build/lwpt test tests/integration/TestScheduling.Test.pas
