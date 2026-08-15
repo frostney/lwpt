@@ -107,6 +107,16 @@ begin
   Result := PROGRAM_NAME + ' ' + ASubcommand + ': ';
 end;
 
+function RejectUnexpectedPositionals(const ASubcommand: string;
+  const APositionals: TStrings): Boolean;
+begin
+  Result := APositionals.Count > 0;
+  if Result then
+    WriteLn(ErrOutput, ErrPrefix(ASubcommand), 'unexpected argument "',
+      APositionals[0], '" (', ASubcommand,
+      ' takes no positional arguments)');
+end;
+
 { Declared ahead of the handlers because HandleAgents renders the
   command surface from the live registry itself — the registry is the
   single source of truth for both `--help` and the agents block. }
@@ -154,6 +164,7 @@ var
   Frozen : Boolean;
   i : Integer;
 begin
+  if RejectUnexpectedPositionals('install', APositionals) then Exit(1);
   Frozen := False;
   for i := 0 to High(AOptions) do
     if SameText(AOptions[i].LongName, 'frozen')
@@ -305,6 +316,7 @@ var
   CheckOnly : Boolean;
   i : Integer;
 begin
+  if RejectUnexpectedPositionals('format', APositionals) then Exit(1);
   CheckOnly := False;
   for i := 0 to High(AOptions) do
     if SameText(AOptions[i].LongName, 'check')
@@ -423,6 +435,7 @@ end;
 function HandleRepair(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 begin
+  if RejectUnexpectedPositionals('repair', APositionals) then Exit(1);
   try
     CmdRepair(MANIFEST_FILE);
     Result := 0;
@@ -442,6 +455,7 @@ var
   Yes, Force, Adopt : Boolean;
   i : Integer;
 begin
+  if RejectUnexpectedPositionals('init', APositionals) then Exit(1);
   Yes := False;
   Force := False;
   Adopt := False;
@@ -580,18 +594,16 @@ end;
 { --- top-level flags ----------------------------------------------------- }
 function HandleTopLevelFlags: Boolean;
 var
-  i : Integer;
   A : string;
 begin
   Result := False;
-  for i := 1 to ParamCount do
+  if ParamCount > 0 then
   begin
-    A := ParamStr(i);
+    A := ParamStr(1);
     if (A = '--version') or (A = '-v') or (LowerCase(A) = 'version') then
     begin
       WriteLn(PROGRAM_NAME, ' ', PROGRAM_VERSION);
       Result := True;
-      Exit;
     end;
   end;
 end;

@@ -20,11 +20,16 @@ const
 type
   ELWPTObjectStoreError = class(ELWPTError);
 
+  {$IFDEF OBJECTSTORE_TESTING}
+  TLWPTObjectStoreBeforeQuarantineHook = procedure(const APath: string);
+  {$ENDIF}
+
   TLWPTImmutableObjectStore = class
   private
     FRoot: string;
     function CanonicalDigest(const ADigest: string): string;
-    function Quarantine(const APath, ADigest: string): Boolean;
+    function Quarantine(const APath, ADigest: string;
+      out AQuarantinePath: string): Boolean;
   public
     constructor Create(const ARoot: string);
     function ObjectPath(const ADigest: string): string;
@@ -39,6 +44,12 @@ function ResolveCacheRoot: string;
 function ResolveCacheRootFromValues(const AOverride, AHome,
   AXDGCacheHome, ALocalAppData: string): string;
 function DependencyArchiveStoreRoot(const ACacheRoot: string): string;
+
+{$IFDEF OBJECTSTORE_TESTING}
+var
+  ObjectStoreBeforeQuarantineTestHook:
+    TLWPTObjectStoreBeforeQuarantineHook;
+{$ENDIF}
 
 implementation
 
@@ -166,32 +177,50 @@ begin
 end;
 
 function TLWPTImmutableObjectStore.Quarantine(const APath,
-  ADigest: string): Boolean;
+  ADigest: string; out AQuarantinePath: string): Boolean;
 var
-  QuarantineRoot, QuarantinePath: string;
+  QuarantineRoot: string;
 begin
+  AQuarantinePath := '';
   Result := not FileExists(APath);
   if Result then Exit;
   QuarantineRoot := IncludeTrailingPathDelimiter(FRoot) + 'quarantine';
   ForceDirectories(QuarantineRoot);
-  QuarantinePath := MakeTmpPath(QuarantineRoot,
+  AQuarantinePath := MakeTmpPath(QuarantineRoot,
     Copy(CanonicalDigest(ADigest), 8, 12) + '-corrupt');
-  Result := AtomicMoveFile(APath, QuarantinePath);
+  Result := AtomicMoveFile(APath, AQuarantinePath);
+  if not Result then AQuarantinePath := '';
 end;
 
 function TLWPTImmutableObjectStore.Lookup(const ADigest: string;
   out APath: string): Boolean;
 var
-  Expected, Actual: string;
+  Expected, Actual, QuarantinePath: string;
 begin
   Expected := CanonicalDigest(ADigest);
   APath := ObjectPath(Expected);
   if not FileExists(APath) then Exit(False);
   Actual := 'sha256:' + SHA256File(APath);
   if Actual = Expected then Exit(True);
-  if not Quarantine(APath, Expected) then
+  {$IFDEF OBJECTSTORE_TESTING}
+  if Assigned(ObjectStoreBeforeQuarantineTestHook) then
+    ObjectStoreBeforeQuarantineTestHook(APath);
+  {$ENDIF}
+  if not Quarantine(APath, Expected, QuarantinePath) then
     raise ELWPTObjectStoreError.CreateFmt(
       'corrupt object %s could not be quarantined', [Expected]);
+  { A verified replacement may have won the pathname after the stale hash
+    above. Hash the object actually moved, and restore that proven winner
+    atomically instead of leaving the content-addressed entry missing. }
+  if (QuarantinePath <> '')
+     and (('sha256:' + SHA256File(QuarantinePath)) = Expected) then
+  begin
+    if not AtomicMoveFile(QuarantinePath, APath) then
+      raise ELWPTObjectStoreError.CreateFmt(
+        'verified object %s could not be restored after quarantine',
+        [Expected]);
+    Exit(True);
+  end;
   APath := '';
   Result := False;
 end;
