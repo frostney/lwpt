@@ -2319,8 +2319,9 @@ var
     if not FindPriorLock(ANode, Entry) then Exit;
     if Entry.ArchiveHash = '' then Exit;
     if Entry.Version <> ANode.Version then Exit;
-    if (Entry.CommitSHA <> '') and (ANode.CommitSHA <> '')
-       and not SameText(Entry.CommitSHA, ANode.CommitSHA) then Exit;
+    if (ANode.CommitSHA <> '')
+       and ((Entry.CommitSHA = '')
+         or not SameText(Entry.CommitSHA, ANode.CommitSHA)) then Exit;
     Result := Entry.ArchiveHash;
   end;
 

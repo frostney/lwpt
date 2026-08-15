@@ -21,6 +21,8 @@ uses
 const
   ADMIT_CHILD_SWITCH = '--object-store-admit-child';
   START_BARRIER_TIMEOUT_MS = 10000;
+  ADMIT_CHILD_TIMEOUT_MS = 5000;
+  ADMIT_CHILD_TERMINATION_TIMEOUT_MS = 2000;
 
 var
   ReplacementSource: string;
@@ -72,6 +74,38 @@ begin
     Sleep(10);
   until GetTickCount64 - Started >= START_BARRIER_TIMEOUT_MS;
   Result := FileExists(APath);
+end;
+
+procedure ReapAdmitter(const AProcess: TProcess);
+begin
+  if AProcess.WaitOnExit(ADMIT_CHILD_TERMINATION_TIMEOUT_MS)
+     or not AProcess.Running then
+  begin
+    AProcess.WaitOnExit;
+    Exit;
+  end;
+  raise Exception.Create('object-store admitter did not terminate');
+end;
+
+procedure StopAdmitter(const AProcess: TProcess);
+begin
+  if AProcess = nil then Exit;
+  if AProcess.Running then AProcess.Terminate(1);
+  ReapAdmitter(AProcess);
+end;
+
+procedure WaitForAdmitter(const AProcess: TProcess);
+begin
+  if AProcess.WaitOnExit(ADMIT_CHILD_TIMEOUT_MS)
+     or not AProcess.Running then
+  begin
+    AProcess.WaitOnExit;
+    Exit;
+  end;
+  AProcess.Terminate(1);
+  ReapAdmitter(AProcess);
+  raise Exception.CreateFmt('object-store admitter exceeded %d ms',
+    [ADMIT_CHILD_TIMEOUT_MS]);
 end;
 
 function RunChildMode: Boolean;
@@ -331,22 +365,20 @@ begin
     Expect<Boolean>(WaitForSignal(FirstReady)).ToBe(True);
     Expect<Boolean>(WaitForSignal(SecondReady)).ToBe(True);
     WriteSignal(ReleasePath);
-    First.WaitOnExit;
-    Second.WaitOnExit;
+    WaitForAdmitter(First);
+    WaitForAdmitter(Second);
     Expect<Integer>(First.ExitStatus).ToBe(0);
     Expect<Integer>(Second.ExitStatus).ToBe(0);
   finally
     if not FileExists(ReleasePath) then WriteSignal(ReleasePath);
     if First <> nil then
     begin
-      if First.Running then First.Terminate(1);
-      First.WaitOnExit;
+      StopAdmitter(First);
       First.Free;
     end;
     if Second <> nil then
     begin
-      if Second.Running then Second.Terminate(1);
-      Second.WaitOnExit;
+      StopAdmitter(Second);
       Second.Free;
     end;
   end;

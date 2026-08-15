@@ -32,6 +32,7 @@ type
     procedure TestMixedTagSHAUsesImmutableFetchAndFrozenIdentity;
     procedure TestSecondRoundReusesRefAndCandidateCaches;
     procedure TestVerifiedArchiveCacheReusesLockedBytesAcrossProjects;
+    procedure TestMovedTagRefetchesWhenLockHasNoCommitIdentity;
   end;
 
 const
@@ -109,6 +110,20 @@ begin
          or (Pos('sourceIdentity = ', Lines[i]) = 1)
          or (Pos('constraintFingerprint = ', Lines[i]) = 1) then
         Lines.Delete(i);
+    Lines.SaveToFile(APath);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure RemoveResolvedCommit(const APath: string);
+var Lines: TStringList; i: Integer;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(APath);
+    for i := Lines.Count - 1 downto 0 do
+      if Pos('resolvedCommit = ', Lines[i]) = 1 then Lines.Delete(i);
     Lines.SaveToFile(APath);
   finally
     Lines.Free;
@@ -240,6 +255,46 @@ begin
 
   Run := RunInstall(SecondRoot, ['install', '--frozen']);
   Expect<Integer>(Run.ExitCode).ToBe(0);
+end;
+
+procedure TInstallGitGraph.
+  TestMovedTagRefetchesWhenLockHasNoCommitIdentity;
+var Root, ArchivePath, LockText, Combined: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/moved-tag-with-early-lock';
+  WriteRoot(Root, 'moved-tag-with-early-lock',
+    'shared = "fixture/shared@^1.0.0"'#10);
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+
+  Run := RunInstall(Root, ['install']);
+  if Run.ExitCode <> 0 then
+    WriteLn('--- original tag install ---'#10, Run.Stdout, Run.Stderr, '---');
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  RemoveResolvedCommit(Root + '/lwpt.lock');
+
+  WriteRefs('shared', 'tag|v1.0.0|' + MUTATED_SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', MUTATED_SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+
+  Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  if Run.ExitCode <> 0 then
+    WriteLn('--- moved tag install ---'#10, Combined, '---');
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Integer>(RequestCount(
+    'archive|shared|' + MUTATED_SHARED_COMMIT)).ToBe(1);
+  ArchivePath := Root + '/.lwpt/archives/shared-v1.0.0.tar.gz';
+  LockText := ReadText(Root + '/lwpt.lock');
+  Expect<Boolean>(Pos('resolvedCommit = "' + MUTATED_SHARED_COMMIT + '"',
+    LockText) > 0).ToBe(True);
+  Expect<Boolean>(Pos('archiveHash = "sha256:' + SHA256File(ArchivePath)
+    + '"', LockText) > 0).ToBe(True);
 end;
 
 procedure TInstallGitGraph.AfterAll;
@@ -417,6 +472,8 @@ begin
     TestSecondRoundReusesRefAndCandidateCaches);
   Test('verified archive objects are reused across projects from lock identity',
     TestVerifiedArchiveCacheReusesLockedBytesAcrossProjects);
+  Test('a moved tag is refetched when the prior lock has no commit identity',
+    TestMovedTagRefetchesWhenLockHasNoCommitIdentity);
 end;
 
 begin
