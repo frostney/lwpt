@@ -131,6 +131,7 @@ uses
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
   HTTPClient,
   LWPT.GitProtocol,
+  LWPT.ObjectStore,
   LWPT.Resolver,
   Semver,
   TOML,
@@ -823,9 +824,10 @@ end;
 
 function FetchToCache(const ADep: TDependency;
   const AResolvedRef, AModulesRoot, AArchivesRoot, ATmpRoot,
-    AProjectRoot: string;
+    AProjectRoot, AExpectedArchiveHash: string;
   const ACustomSources: TCustomSourceArray;
   const AWorkspaces: TWorkspaceArray;
+  const AObjectStore: TLWPTImmutableObjectStore;
   out AUnitDir, AArchive, AArchiveHash, AResolvedURL: string): Boolean;
 var
   URL, LocalPath, OriginOverride : string;
@@ -900,7 +902,9 @@ begin
     EffectiveDep.SrcLocator := WSPath;
     Result := FetchToCache(EffectiveDep, AResolvedRef,
       AModulesRoot, AArchivesRoot, ATmpRoot, AProjectRoot,
+      AExpectedArchiveHash,
       ACustomSources, AWorkspaces,
+      AObjectStore,
       AUnitDir, AArchive, AArchiveHash, AResolvedURL);
     Exit;
   end;
@@ -924,6 +928,28 @@ begin
   URL := FetchURL(ADep, AResolvedRef, ACustomSources);
   if URL = '' then Exit(False);
 
+  { Project archives keep their existing human/provenance name. The shared
+    store is addressed only by the expected raw-content digest from an
+    authoritative prior lock entry. }
+  AArchive := ArchivePathForRef(AArchivesRoot, ADep.Name, ADep.SrcKind,
+    AResolvedRef);
+  AResolvedURL := URL;
+  if (AObjectStore <> nil) and (AExpectedArchiveHash <> '') then
+    try
+      if AObjectStore.Materialize(AExpectedArchiveHash, AArchive,
+           ATmpRoot) then
+      begin
+        AArchiveHash := AExpectedArchiveHash;
+        WriteLn('  reused verified archive for ', ADep.Name,
+          ' from the per-user cache');
+        Exit(True);
+      end;
+    except
+      on E: Exception do
+        WriteLn(ErrOutput, 'warning: dependency archive cache lookup for ',
+          ADep.Name, ' failed: ', E.Message, '; fetching from source');
+    end;
+
   { The archive-fetch boundary, and the only place the test-only origin
     override applies: canonical construction above is untouched, and the
     redirect below is inert unless the environment asks for it. }
@@ -932,7 +958,6 @@ begin
     The override only aims the fetch at a loopback mock server; the
     loopback origin must never persist into lwpt.lock, so AResolvedURL
     keeps the URL as constructed while URL below carries the rewrite. }
-  AResolvedURL := URL;
   FixtureRoot := SysUtils.GetEnvironmentVariable(
     PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
   { The ref fixture and archive-origin seams compose deliberately. A fixture
@@ -988,10 +1013,17 @@ begin
 
   { Archive filename uses an escaped resolved ref for git-host sources,
     or the stable "url" tag for direct archive URLs. }
-  AArchive := ArchivePathForRef(AArchivesRoot, ADep.Name, ADep.SrcKind,
-    AResolvedRef);
   AArchiveHash := SHA256BytesPrefixed(Resp.Body);
   AtomicWriteBytes(AArchive, ATmpRoot, Resp.Body);
+  if AObjectStore <> nil then
+    try
+      AObjectStore.Admit(AArchive, AArchiveHash);
+    except
+      on E: Exception do
+        WriteLn(ErrOutput, 'warning: dependency archive cache admission for ',
+          ADep.Name, ' failed: ', E.Message,
+          '; the project archive remains authoritative');
+    end;
   Result := True;
 end;
 
@@ -2198,7 +2230,9 @@ end;
 procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
   var R: TResolution; const AModulesRoot, AArchivesRoot, ATmpRoot,
   ARollbackRoot, AProjectRoot: string;
-  const AWorkspaces: TWorkspaceArray);
+  const AWorkspaces: TWorkspaceArray;
+  const APriorLock: TResolvedArray;
+  const AObjectStore: TLWPTImmutableObjectStore);
 type
   TSelectionState = record
     Name, SourceIdentity, RefName, CommitSHA: string;
@@ -2218,7 +2252,8 @@ var
   Queue: array of Integer;
   ChildMan: TManifest;
   ChildManifestPath, ManifestRelDir, ExtractTmp: string;
-  UnitDir, Archive, ArchiveHash, ResolvedURL, CacheArchive: string;
+  UnitDir, Archive, ArchiveHash, ResolvedURL, CacheArchive,
+    ExpectedArchiveHash: string;
   FetchRef, RollbackFailures: string;
   SelectionDeferred, Stable: Boolean;
 
@@ -2235,6 +2270,58 @@ var
   begin
     Result := CanonicalDependencyIdentity(ADep, ACustomSources,
       AProjectRoot);
+  end;
+
+  function FindPriorLock(const ANode: TResolveNode;
+    out AEntry: TResolved): Boolean;
+  var k: Integer;
+  begin
+    AEntry := Default(TResolved);
+    for k := 0 to High(APriorLock) do
+      if SameText(APriorLock[k].Name, ANode.Name)
+         and (APriorLock[k].SourceIdentity <> '')
+         and (APriorLock[k].SourceIdentity = SourceKey(ANode.Dep,
+           ANode.CustomSources)) then
+      begin
+        AEntry := APriorLock[k];
+        Exit(True);
+      end;
+    Result := False;
+  end;
+
+  function PriorSelectionSatisfies(const ANode: TResolveNode;
+    const AEntry: TResolved): Boolean;
+  var k: Integer;
+  begin
+    Result := True;
+    for k := 0 to High(ANode.Kinds) do
+      case ANode.Kinds[k] of
+        vkSemverRange:
+          Result := Result and Satisfies(StripVPrefix(AEntry.Version),
+            ANode.Specs[k], DefaultSemverOptions);
+        vkSemverExact:
+          Result := Result and ((AEntry.Version = ANode.Specs[k])
+            or (AEntry.Version = 'v' + ANode.Specs[k]));
+        vkCommitSha:
+          Result := Result and (AEntry.CommitSHA <> '')
+            and SameText(ANode.Specs[k], Copy(AEntry.CommitSHA, 1,
+              Length(ANode.Specs[k])));
+        vkLiteralTag:
+          Result := Result and (AEntry.Version = ANode.Specs[k]);
+        vkNone:;
+      end;
+  end;
+
+  function ExpectedHashForSelection(const ANode: TResolveNode): string;
+  var Entry: TResolved;
+  begin
+    Result := '';
+    if not FindPriorLock(ANode, Entry) then Exit;
+    if Entry.ArchiveHash = '' then Exit;
+    if Entry.Version <> ANode.Version then Exit;
+    if (Entry.CommitSHA <> '') and (ANode.CommitSHA <> '')
+       and not SameText(Entry.CommitSHA, ANode.CommitSHA) then Exit;
+    Result := Entry.ArchiveHash;
   end;
 
   function NodeConstraintFingerprint(const ANode: TResolveNode): string;
@@ -2298,16 +2385,20 @@ var
   end;
 
   function CachedRefs(const ANode: TResolveNode): TGitRefArray;
-  var RepoURL: string; k, n: Integer;
+  var RepoURL: string; Refs: TGitRefArray; k, n: Integer;
   begin
     RepoURL := GitRepoURL(ANode.Dep, ANode.CustomSources);
     for k := 0 to High(RefCache) do
       if RefCache[k].RepoURL = RepoURL then Exit(RefCache[k].Refs);
     WriteLn('  resolving tags for ', ANode.Name, '...');
+    { A failed advertisement is not a reusable empty advertisement. Resolve
+      before extending the cache so a later complete-set selection can take
+      the same lock-identity fallback as the discovery pass. }
+    Refs := ListRemoteRefs(RepoURL);
     n := Length(RefCache);
     SetLength(RefCache, n + 1);
     RefCache[n].RepoURL := RepoURL;
-    RefCache[n].Refs := ListRemoteRefs(RepoURL);
+    RefCache[n].Refs := Refs;
     Result := RefCache[n].Refs;
   end;
 
@@ -2349,6 +2440,7 @@ var
     k, Longest: Integer;
     AllSHA, HasWorkspaceConstraint: Boolean;
     WorkspaceVersion: string;
+    PriorEntry: TResolved;
   begin
     Result := Default(TSelectionState);
     Result.Name := ANode.Name;
@@ -2398,7 +2490,23 @@ var
       Requirements[k].Kind := ANode.Kinds[k];
       Requirements[k].Requirer := ANode.Requirers[k];
     end;
-    Refs := CachedRefs(ANode);
+    try
+      Refs := CachedRefs(ANode);
+    except
+      on E: Exception do
+      begin
+        if FindPriorLock(ANode, PriorEntry)
+           and PriorSelectionSatisfies(ANode, PriorEntry) then
+        begin
+          Result.RefName := PriorEntry.Version;
+          Result.CommitSHA := PriorEntry.CommitSHA;
+          WriteLn(ErrOutput, 'warning: tag resolution for ', ANode.Name,
+            ' failed: ', E.Message, '; reusing verified lockfile identity');
+          Exit;
+        end;
+        raise;
+      end;
+    end;
     try
       Selection := SelectHighestRef(ANode.Name, Requirements, Refs);
     except
@@ -2652,9 +2760,12 @@ begin
         end
         else
         begin
+          ExpectedArchiveHash := ExpectedHashForSelection(R.Nodes[idx]);
           FetchToCache(R.Nodes[idx].Dep, FetchRef,
             PlanModules, PlanArchives, PlanScratch, AProjectRoot,
+            ExpectedArchiveHash,
             R.Nodes[idx].CustomSources, AWorkspaces,
+            AObjectStore,
             UnitDir, Archive, ArchiveHash, ResolvedURL);
           if (Archive <> '') and FileExists(Archive) then
           begin
@@ -3085,6 +3196,7 @@ var
   Resolved : TResolvedArray;
   LockEntries, OldLock : TResolvedArray;
   Lock : TInstallLock;
+  ObjectStore : TLWPTImmutableObjectStore;
   ModulesRoot, ArchivesRoot, TmpRoot, CfgPath, LockPath, LockfilePath,
     ManifestPath, RollbackRoot, RecoveryFailures, RollbackFailures : string;
   i, j, k : Integer;
@@ -3112,6 +3224,7 @@ begin
   ManifestPath := ResolveProjectPath(AContext.ProjectRoot, AContext.Path);
 
   Lock := TInstallLock.Create(LockPath);
+  ObjectStore := nil;
   try
     PublicationPending := False;
     LockfileBackup := '';
@@ -3148,11 +3261,23 @@ begin
             'failed to retain manifest rollback copy');
     end;
 
-    { Mutation flow: snapshot the pre-transaction lock entries for the
-      orphan diff before WriteLock overwrites them. }
+    { A prior lock supplies content identity for cache lookup and a safe
+      offline selection fallback. Mutation flows also use the same snapshot
+      for their orphan diff after WriteLock replaces it. }
     OldLock := nil;
-    if (AManifestLines <> nil) and FileExists(LockfilePath) then
+    if FileExists(LockfilePath) then
       OldLock := LoadLockfile(LockfilePath);
+
+    if not Frozen then
+      try
+        ObjectStore := TLWPTImmutableObjectStore.Create(
+          DependencyArchiveStoreRoot(ResolveCacheRoot));
+      except
+        on E: Exception do
+          WriteLn(ErrOutput,
+            'warning: per-user dependency archive cache is unavailable: ',
+            E.Message, '; continuing with project-owned archives');
+      end;
 
     R := Default(TResolution);
     WriteLn('resolving dependency graph (', Length(Man.Deps), ' direct)...');
@@ -3165,7 +3290,7 @@ begin
     begin
       ResolveGraphFixedPoint(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
                              RollbackRoot, AContext.ProjectRoot,
-                             Man.Workspaces);
+                             Man.Workspaces, OldLock, ObjectStore);
       PublicationPending := True;
     end;
     WriteLn('resolved ', Length(R.Nodes), ' packages, no conflicts.');
@@ -3396,6 +3521,7 @@ begin
       end;
     end;
   finally
+    ObjectStore.Free;
     Lock.Free;
   end;
 end;
