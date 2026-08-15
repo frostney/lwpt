@@ -194,7 +194,7 @@ begin
     'program alpha;'#10'begin end.'#10);
   WriteTextFile(FScratch + '/app-src/app.pas',
     'program app;'#10
-    + '{$I ../build/alpha}'#10
+    + '{$I ../build/' + ExtractFileName(ExpectedExe('alpha')) + '}'#10
     + 'begin WriteLn(GENERATED_VALUE); end.'#10);
   WriteTextFile(FScratch + '/scripts/publish-include.pas',
     'program PublishInclude;'#10
