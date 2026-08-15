@@ -50,6 +50,7 @@ type
     procedure TestExtraArgumentsChangePublicationFingerprint;
     procedure TestCacheFingerprintIgnoresSessionAndPublicArtifactBytes;
     procedure TestCacheFingerprintCoversCompilerTargetInputsAndEnvironment;
+    procedure TestCacheFingerprintCoversPrerequisiteOutputs;
     procedure TestPublicationLockUsesSessionsRoot;
     {$IFDEF UNIX}
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
@@ -215,6 +216,28 @@ begin
   Request.Environment[0] := 'CACHE_FIXTURE=second';
   Changed := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
     CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  Expect<Boolean>(Changed <> Baseline).ToBe(True);
+end;
+
+procedure TLWPTBuildSessionTests.TestCacheFingerprintCoversPrerequisiteOutputs;
+var
+  Baseline, Changed: string;
+  Request: TLWPTBuildPublicationRequest;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  WriteText(FScratch + '/build/generated.inc', 'const VALUE = ''first'';');
+  Request := BasicRequest;
+  SetLength(Request.PrerequisiteOutputs, 1);
+  Request.PrerequisiteOutputs[0] := 'build/generated.inc';
+  Baseline := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+
+  WriteText(FScratch + '/build/generated.inc', 'const VALUE = ''second'';');
+  Changed := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+
   Expect<Boolean>(Changed <> Baseline).ToBe(True);
 end;
 
@@ -1045,6 +1068,8 @@ begin
     TestCacheFingerprintIgnoresSessionAndPublicArtifactBytes);
   Test('cache fingerprints cover compiler target inputs and environment',
     TestCacheFingerprintCoversCompilerTargetInputsAndEnvironment);
+  Test('cache fingerprints cover prerequisite outputs',
+    TestCacheFingerprintCoversPrerequisiteOutputs);
   Test('publication locks use the resolved sessions root',
     TestPublicationLockUsesSessionsRoot);
   {$IFDEF UNIX}

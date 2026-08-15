@@ -46,6 +46,7 @@ type
     procedure TestCleanKeepsNonArtefactFiles;
     procedure TestCleanWithoutBuildDirSucceeds;
     procedure TestNoCacheBypassesReusableBuildResult;
+    procedure TestPrerequisiteOutputChangeInvalidatesDependentResult;
     {$IFDEF UNIX}
     procedure TestCleanDoesNotFollowSymlinkedDirs;
     {$ENDIF}
@@ -131,7 +132,7 @@ procedure TBuildClean.TestNoCacheBypassesReusableBuildResult;
 var
   CacheRoot: string;
   Environment: array of string;
-  First, Hit, Bypassed: TLwptResult;
+  First, Hit, Bypassed, CleanBypassed: TLwptResult;
 begin
   WipeOutputs;
   CacheRoot := FScratch + '/cache';
@@ -153,6 +154,74 @@ begin
   Expect<Boolean>(Pos('cache miss: disabled', Bypassed.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('cache hit:', Bypassed.Stdout) = 0).ToBe(True);
+
+  CleanBypassed := RunLwpt(
+    ['build', '--verbose', '--clean', '--no-cache'], FScratch, Environment);
+  Expect<Integer>(CleanBypassed.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('cache miss: disabled', CleanBypassed.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('cache hit:', CleanBypassed.Stdout) = 0).ToBe(True);
+end;
+
+procedure TBuildClean.TestPrerequisiteOutputChangeInvalidatesDependentResult;
+var
+  CacheRoot: string;
+  Environment: array of string;
+  First, Second, Changed: TLwptResult;
+begin
+  WipeOutputs;
+  CacheRoot := FScratch + '/graph-cache';
+  RecursiveDelete(CacheRoot);
+  SetLength(Environment, 1);
+  Environment[0] := CACHE_DIR_ENV + '=' + CacheRoot;
+  WriteTextFile(FScratch + '/alpha-src/value.inc',
+    'const GENERATED_VALUE = ''ONE'';'#10);
+  WriteTextFile(FScratch + '/alpha-src/alpha.pas',
+    'program alpha;'#10'begin end.'#10);
+  WriteTextFile(FScratch + '/app-src/app.pas',
+    'program app;'#10
+    + '{$I ../build/alpha}'#10
+    + 'begin WriteLn(GENERATED_VALUE); end.'#10);
+  WriteTextFile(FScratch + '/scripts/publish-include.pas',
+    'program PublishInclude;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, SysUtils;'#10
+    + 'var Lines: TStringList;'#10
+    + 'begin'#10
+    + '  Lines := TStringList.Create;'#10
+    + '  try'#10
+    + '    Lines.LoadFromFile(ParamStr(1));'#10
+    + '    Lines.SaveToFile(ParamStr(2));'#10
+    + '  finally'#10
+    + '    Lines.Free;'#10
+    + '  end;'#10
+    + 'end.'#10);
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "buildcachegraph"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["alpha-src", "app-src"]'#10
+    + #10
+    + '[build]'#10
+    + 'alpha = { source = "alpha-src/alpha.pas", output = "build/alpha", '
+    + 'postbuild = { publish = { command = "instantfpc", '
+    + 'args = ["scripts/publish-include.pas", "alpha-src/value.inc", '
+    + '"{item.output}"] } } }'#10
+    + 'app = { source = "app-src/app.pas", output = "build/app", '
+    + 'depends = ["alpha"] }'#10);
+
+  First := RunLwpt(['build', '--verbose'], FScratch, Environment);
+  Expect<Integer>(First.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('cache hit:', First.Stdout) = 0).ToBe(True);
+  Second := RunLwpt(['build', '--verbose'], FScratch, Environment);
+  Expect<Integer>(Second.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('cache hit:', Second.Stdout) > 0).ToBe(True);
+
+  WriteTextFile(FScratch + '/alpha-src/value.inc',
+    'const GENERATED_VALUE = ''TWO'';'#10);
+  Changed := RunLwpt(['build', '--verbose'], FScratch, Environment);
+  Expect<Integer>(Changed.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('cache hit:', Changed.Stdout) = 0).ToBe(True);
 end;
 
 { Clean must not traverse build/ at all, including through a symlink.
@@ -192,6 +261,8 @@ begin
   Test('build --clean does not follow symlinked dirs out of build/',
     TestCleanDoesNotFollowSymlinkedDirs);
   {$ENDIF}
+  Test('prerequisite output changes invalidate dependent results',
+    TestPrerequisiteOutputChangeInvalidatesDependentResult);
 end;
 
 begin

@@ -39,6 +39,7 @@ type
     PublicOutput: string;
     Environment: TStringArray;
     WorkspacePaths: TStringArray;
+    PrerequisiteOutputs: TStringArray;
     HookDefinition: TStringArray;
     HookInputs: TStringArray;
     ExcludedPaths: TStringArray;
@@ -567,6 +568,8 @@ begin
       ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths);
     AddPathArray(Fields, AProjectRoot, 'workspace-paths',
       ARequest.WorkspacePaths, ARequest.ExcludedPaths);
+    AddPathArray(Fields, AProjectRoot, 'prerequisite-outputs',
+      ARequest.PrerequisiteOutputs, EmptyPaths);
     AddPathArray(Fields, AProjectRoot, 'resources',
       ARequest.BuildRequest.Inputs.Resources, ARequest.ExcludedPaths);
     AddStringArray(Fields, 'hook-definition', ARequest.HookDefinition);
@@ -644,6 +647,8 @@ begin
       ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths);
     AddPathArray(Fields, AProjectRoot, 'workspace-paths',
       ARequest.WorkspacePaths, ARequest.ExcludedPaths);
+    AddPathArray(Fields, AProjectRoot, 'prerequisite-outputs',
+      ARequest.PrerequisiteOutputs, EmptyPaths);
     AddPathArray(Fields, AProjectRoot, 'resources',
       ARequest.BuildRequest.Inputs.Resources, ARequest.ExcludedPaths);
     AddStringArray(Fields, 'hook-definition', ARequest.HookDefinition);

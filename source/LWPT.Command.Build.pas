@@ -493,6 +493,33 @@ begin
   end;
 end;
 
+function FindBuildEntryIndex(const AEntries: array of TLWPTBuildEntry;
+  const AName: string): Integer; forward;
+
+procedure AddPrerequisiteOutputs(const AMan: TManifest;
+  const AEntry: TLWPTBuildEntry; var APaths: TStringArray);
+var
+  DependencyIndex, i: Integer;
+  OutputPath: string;
+begin
+  SetLength(APaths, Length(AEntry.Depends));
+  for i := 0 to High(AEntry.Depends) do
+  begin
+    DependencyIndex := FindBuildEntryIndex(AMan.BuildEntries,
+      AEntry.Depends[i]);
+    if DependencyIndex < 0 then Continue;
+    OutputPath := AMan.BuildEntries[DependencyIndex].Output;
+    if OutputPath = '' then
+      OutputPath := ChangeFileExt(
+        AMan.BuildEntries[DependencyIndex].Source, '');
+    {$IFDEF MSWINDOWS}
+    if (OutputPath <> '') and (ExtractFileExt(OutputPath) = '') then
+      OutputPath := OutputPath + '.exe';
+    {$ENDIF}
+    APaths[i] := OutputPath;
+  end;
+end;
+
 { Compile one build entry. Returns True on success. }
 function BuildOneEntry(const AManifestPath: string; const AMan: TManifest;
   const AManifestContentHash: string;
@@ -582,6 +609,7 @@ begin
   SetLength(Request.WorkspacePaths, Length(AMan.Workspaces));
   for i := 0 to High(AMan.Workspaces) do
     Request.WorkspacePaths[i] := AMan.Workspaces[i].Path;
+  AddPrerequisiteOutputs(AMan, T, Request.PrerequisiteOutputs);
   AddHookPublicationInputs(T.PostBuild, Request);
   AddHookPublicationInputs(AMan.PostBuild, Request);
   ACompiled.PostBuild := RetargetPostBuildHooks(T.PostBuild,
@@ -615,8 +643,8 @@ begin
   CacheFingerprint := CaptureBuildCacheFingerprint(ProjectRoot,
     AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
 
-  CacheReason := 'disabled';
-  if AClean then CacheReason := 'clean'
+  if not AUseCache then CacheReason := 'disabled'
+  else if AClean then CacheReason := 'clean'
   else if AUseCache and Assigned(ACache) then
     try
       if ACache.Materialize(CacheFingerprint, CandidateBin,

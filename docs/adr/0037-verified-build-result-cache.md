@@ -16,7 +16,8 @@ trees, or relevant environment values are interchangeable.
 Normal `lwpt build` invocations capture a schema-versioned, compiler-neutral
 cache fingerprint before compilation. It includes the serialized neutral build
 request; source, resource, workspace, lockfile, module, cfg, manifest, and hook
-content; the selected compiler driver, executable, live version, target tuple,
+content; declared prerequisite outputs; the selected compiler driver,
+executable, live version, target tuple,
 and effective translated arguments; and compiler-relevant environment. Private
 session paths and the previous public artifact bytes are excluded.
 
