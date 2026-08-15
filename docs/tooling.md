@@ -12,7 +12,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
   machine budget remains authoritative across processes and worktrees.
 - **Worker capacity is coordinated across worktrees.** The internal worker-budget module uses per-user, reclaimable filesystem leases. Its default budget is the host's logical processor count; `LWPT_WORKER_BUDGET` overrides it.
 - **TLS is platform-native on Windows and macOS in both directions.** Clients use SChannel on Windows, SecureTransport on macOS, and system OpenSSL on other Unix. Server accept is native SChannel on Windows and requires runtime-loaded OpenSSL 3 or newer on Unix-not-Darwin; macOS servers use Network.framework. Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), [ADR-0024](./adr/0024-openssl-server-tls-accept.md), and [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md).
-- **EXDEV-rename failures fall back to copy-then-delete.** When `.lwpt/tmp/` and `.lwpt/modules/` end up on different filesystems (Docker bind mounts, network drives), the atomic-rename helpers (`AtomicMoveFile`, `AtomicMoveDir`) automatically fall back to a copy followed by delete.
+- **EXDEV-rename failures fall back safely.** When `.lwpt/tmp/` and a file destination end up on different filesystems, `AtomicMoveFile` copies into an unaddressed sibling on the destination filesystem and atomically replaces the destination before deleting the source. Directory moves retain their recursive copy-then-delete fallback.
 - **Compiler outputs are session-private.** Build and test invocations write
   below the resolved project-owned build-session root; only a successful,
   revalidated build
@@ -110,7 +110,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 
 | Variable | Effect | Default |
 | --- | --- | --- |
-| `LWPT_CACHE_DIR` | Reserved for [issue #30](https://github.com/frostney/lwpt/issues/30). Today: ignored. | n/a until the cache implementation lands |
+| `LWPT_CACHE_DIR` | Absolute or working-directory-relative root for per-user immutable cache namespaces. Dependency archives use `dependency-archives/`; paths never enter committed project state. | `%LOCALAPPDATA%\lwpt\cache` on Windows, `~/Library/Caches/lwpt` on macOS, `$XDG_CACHE_HOME/lwpt` or `~/.cache/lwpt` on other Unix systems |
 | `LWPT_SESSION_DIR` | Build/test session base; relative values resolve from the invocation working directory and override `[lwpt].sessions-dir` | unset |
 | `LWPT_WORKER_BUDGET` | Maximum aggregate LWPT workers for this user and machine | logical processor count |
 | `LWPT_WORKER_STATE_DIR` | Override the worker coordinator state root; an explicit unwritable path fails rather than falling back | the platform application-config directory's `workers/` subdirectory, with automatic fallback to the repository's `.lwpt/workers/` when that default is unwritable |
@@ -127,6 +127,28 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `LWPT_BUILD_ENTRY` | Per-entry postbuild hook context: selected build-entry name | supplied by LWPT |
 | `LWPT_BUILD_OUTPUT` | Per-entry postbuild hook context: session-private candidate path; transform this file before publication | supplied by LWPT |
 | `LWPT_BUILD_PUBLIC_OUTPUT` | Per-entry postbuild hook context: requested manifest output path | supplied by LWPT |
+
+## Per-user dependency archive cache
+
+Normal materializing installs admit each downloaded archive into an immutable
+SHA-256 object store below the per-user cache root. A later project whose
+existing machine-written lockfile proves the same source selection and archive
+hash can reuse that object without downloading the bytes. If Git ref discovery
+is unavailable, the recorded authoritative ref/commit may also be reused when
+it still satisfies the complete manifest constraint set. This is the offline
+materialization path; `lwpt install --frozen` remains verification-only and
+never repairs missing project state.
+
+Every hit is hashed before use, copied through the destination project's
+`.lwpt/tmp/`, hashed again, and atomically published to its ordinary committed
+`.lwpt/archives/` name. Cache filenames are not trusted, project archives are
+not hardlinked, and no cache path is written to `lwpt.lock`. Corrupt objects are
+moved to the store's `quarantine/` namespace and treated as misses. Incomplete
+writes remain unaddressed below `tmp/`; same-key concurrent writers can publish
+only complete bytes proving the same digest. Cache read/write failures emit a
+warning and fall back to the source because the disposable cache is never
+required for correctness. See
+[ADR-0036](./adr/0036-per-user-dependency-archive-cas.md).
 
 ## Machine-wide worker budget
 
@@ -205,10 +227,10 @@ Every committed-path write in LWPT goes through `.lwpt/tmp/` first. The helpers 
 | --- | --- |
 | `AtomicWriteText(Dst, TmpRoot, StringList)` | `WriteLock`, `WriteCfg` |
 | `AtomicWriteBytes(Dst, TmpRoot, Bytes)` | `FetchToCache` (network archive download) |
-| `AtomicMoveFile(Src, Dst)` | The underlying rename for the two helpers above |
+| `AtomicMoveFile(Src, Dst)` | Same-filesystem replacement, or cross-filesystem copy to an unaddressed destination sibling followed by atomic replacement |
 | `AtomicMoveDir(Src, Dst)` | fixed-point resolver plan publication |
 
-On the same filesystem, `rename(2)` is one syscall. Across filesystems (a Docker bind mount of `.lwpt/` onto a different volume; a network drive; certain remote-pair-programming setups), `rename` fails with `EXDEV`. The helpers detect the failure and fall back to **copy-then-delete**: target copied byte-for-byte to its final location, source deleted. Slower, and the copy itself isn't atomic against crash, but the source remains intact until the copy completes — so a crash mid-copy leaves the source in `.lwpt/tmp/` (cleaned up by `lwpt repair` or the next install's startup pass) and never produces a half-written committed file.
+On the same filesystem, `rename(2)` is one syscall. Across filesystems (a Docker bind mount of `.lwpt/` onto a different volume; a network drive; certain remote-pair-programming setups), `rename` fails with `EXDEV`. File moves then copy into a unique unaddressed sibling of the destination and atomically replace the public path only after that copy completes; the source is deleted last. A crash therefore leaves readers on the complete old destination and may leave only a sibling/tmp orphan for repair. Directory moves use recursive copy-then-delete because operating systems expose no portable atomic cross-filesystem directory replacement.
 
 If EXDEV failures are persistent and the fallback is too slow, ensure `.lwpt/` lives on the same filesystem as the project root (don't bind-mount it).
 
