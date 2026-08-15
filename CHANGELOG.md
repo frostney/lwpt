@@ -1,6 +1,26 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.6.1] - 2026-08-15
+
+### Bug Fixes
+
+- fix(release): require installer checksum verification (#216)
+- fix(ci): run default scheduling diagnostic (#215)
+- fix(test): hand off WorkerBudget marker reads (#206)
+- fix(process-tree): reconcile exited Windows jobs (#210)
+- fix(test): stabilize Windows scheduling fixtures (#203)
+- fix(test): bind nested scheduling acknowledgement (#200)
+
+### Internal
+
+- ci: bound native test jobs (#199)
+- ci: prune no-op delivery observer events (#202)
+- refactor(delivery): use native admission job (#197)
+
+### Other Changes
+
+- Validate Chocolatey FPC retry success
 ## [0.6.0] - 2026-08-12
 
 ### Bug Fixes
