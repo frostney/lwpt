@@ -67,7 +67,7 @@ program	*	integration	tests/integration/ExtractPathological.Test.pas	2	14
 program	*	integration	tests/integration/Hooks.Test.pas	1	11
 program	*	integration	tests/integration/Init.Test.pas	1	21
 program	*	integration	tests/integration/InstallFetchFailure.Test.pas	3	20
-program	*	integration	tests/integration/InstallGitGraph.Test.pas	1	5
+program	*	integration	tests/integration/InstallGitGraph.Test.pas	1	6
 program	*	integration	tests/integration/InstallGraphConflict.Test.pas	1	20
 program	*	integration	tests/integration/InstallLocalDiamond.Test.pas	2	10
 program	*	integration	tests/integration/InstallNestedManifest.Test.pas	1	4
