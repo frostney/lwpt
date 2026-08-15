@@ -6,13 +6,8 @@ poll_count="${LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT:-18}"
 sample_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_SAMPLE_SECONDS:-5}"
 cleanup_grace_seconds="${LWPT_SCHEDULING_DIAGNOSTIC_CLEANUP_GRACE_SECONDS:-2}"
 scope="${LWPT_SCHEDULING_DIAGNOSTIC_SCOPE:-scheduling}"
-pid_file="${RUNNER_TEMP:-/tmp}/TestScheduling.pids"
 tree_pid_file="${RUNNER_TEMP:-/tmp}/TestScheduling-tree.pids"
 lwpt_pid=0
-
-collect_test_pids() {
-  pgrep -f '[T]estScheduling.Test' > "$pid_file" || true
-}
 
 collect_process_tree_pids() {
   : > "$tree_pid_file"
@@ -38,7 +33,6 @@ terminate_probe() {
     owned_pid="$(jobs -pr | tail -1 || true)"
   fi
   if [ -z "$owned_pid" ]; then return; fi
-  collect_test_pids
   kill -TERM -- "-$owned_pid" 2>/dev/null \
     || kill -TERM "$owned_pid" 2>/dev/null || true
   sleep "$cleanup_grace_seconds"
@@ -48,7 +42,6 @@ terminate_probe() {
 }
 
 sample_probe() {
-  collect_test_pids
   collect_process_tree_pids
   echo "[DEBUG-208] bounded process-tree capture"
   ps -axo pid,ppid,pgid,stat,etime,wchan,command \

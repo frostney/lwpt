@@ -368,7 +368,7 @@ begin
       begin
         Suite.FCurrentTestName := Test.Name;
         {$IFDEF DARWIN}
-        DiagnosticThreadName := Copy('lwpt-208: ' + Test.Name, 1, 63);
+        DiagnosticThreadName := Copy('test: ' + Test.Name, 1, 63);
         Pthread_setname_np(PChar(DiagnosticThreadName));
         {$ENDIF}
         RunTest(Suite, Test);
