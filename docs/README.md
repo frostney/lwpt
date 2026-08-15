@@ -55,6 +55,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0031](./adr/0031-fixed-point-single-version-resolution.md) | Deterministic fixed-point dependency discovery, authoritative Git ref identity, graph-wide highest-version selection, and publish-after-validation |
 | [0033](./adr/0033-schannel-server-tls-accept-on-windows.md) | Windows server TLS accept moves to native SChannel + crypt32, removing OpenSSL from Windows entirely and giving `i386-win32` server accept; supersedes the Windows half of [0024](./adr/0024-openssl-server-tls-accept.md) |
 | [0034](./adr/0034-freeze-test-selection-before-pretest.md) | Test discovery and file/directory/glob selection freeze before `pretest`; hooks may prepare inputs but cannot add programs to the invocation |
+| [0036](./adr/0036-per-user-dependency-archive-cas.md) | Verified dependency archives reuse one per-user immutable SHA-256 object while project-owned archives and frozen verification remain authoritative |
 
 ## Spikes
 

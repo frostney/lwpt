@@ -6,6 +6,11 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 
 - **The package manager is the foundation.** `lwpt install` resolves the dependency graph and writes `lwpt.cfg`; every other subcommand consumes that same cfg. The manifest (`lwpt.toml`) is the single source of truth.
 - **Zero-install by default.** `.lwpt/modules/` (extracted) and `.lwpt/archives/` (verification) are committed; a fresh clone is buildable with `fpc @lwpt.cfg` before `lwpt install` is ever run. See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md).
+- **Dependency downloads are reused without weakening zero-install.** Verified
+  archive bytes are admitted once into a per-user immutable SHA-256 store, then
+  copied atomically back into each project's authoritative committed archive
+  path when its lockfile proves the identity. See
+  [ADR-0036](./adr/0036-per-user-dependency-archive-cas.md).
 - **Self-hosting from day one.** LWPT builds LWPT through `lwpt build` against the repo's own manifest; the one-time `scripts/bootstrap.pas` resolves the chicken-and-egg. See [ADR-0005](./adr/0005-self-host-build.md).
 - **RTL-only with LWPT-canonical packages.** No third-party FPC dependencies in the binary; HTTPS is `HTTPClient` from LWPT's `packages/httpclient/`. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for HTTPClient, CLI, Semver, TOML, and TestingPascalLibrary — all consumed as workspace packages via the root manifest's `[workspaces]` glob (Phase 1 done per ADR-0014 + ADR-0015). GocciaScript is the first named consumer and commits to Path A adoption; Phase 2 graduates individual packages to standalone repos when warranted.
 - **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry implementation is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); its interoperable wire contract is specified in [`registry-spec.md`](./registry-spec.md). Duplication analysis and codebase health have landed. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
@@ -44,8 +49,8 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
                       │
                       ▼
               ┌──────────────────┐
-              │   lwpt install   │  ← resolves deps, fetches into .lwpt/archives/,
-              │                  │     extracts into .lwpt/modules/, writes lwpt.lock
+              │   lwpt install   │  ← resolves deps, fetches/reuses verified bytes,
+              │                  │     commits .lwpt state, writes lwpt.lock
               └────┬─────────────┘
                    │
                    ▼
@@ -59,6 +64,8 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
                        run *.Test.pas) check sources)  user-defined
                                                        run task)
 
+   ↕ per-user dependency-archive CAS stores immutable verified bytes only;
+     project .lwpt/archives/ remains authoritative.
    ↑ lwpt repair operates on project residue, owned build-session roots,
      and the per-user worker coordinator orthogonally.
    ↑ lwpt init scaffolds a new project (manifest, source dir, optional install/build).
@@ -163,7 +170,15 @@ installs are not supported.
 
 ## Fetch / extract / build / test pipeline
 
-- **Fetch:** HTTPS GET via the LWPT-canonical `HTTPClient` package (raw sockets + SChannel on Windows / SecureTransport on macOS / OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md)). The byte-safe `AppendRawBytes` accumulator fixes a header-recv truncation bug that previously corrupted binary downloads. URL templates per source kind live in `FetchURL`.
+- **Fetch:** Before HTTPS, a prior authoritative lock entry can address the
+  per-user dependency archive store by raw SHA-256. Every hit and staged copy
+  is re-hashed before atomic project publication; corruption is quarantined and
+  becomes a miss. Otherwise HTTPS GET uses the LWPT-canonical `HTTPClient`
+  package (raw sockets + SChannel on Windows / SecureTransport on macOS /
+  OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md)). The
+  byte-safe `AppendRawBytes` accumulator fixes a header-recv truncation bug that
+  previously corrupted binary downloads. URL templates per source kind live
+  in `FetchURL`. Frozen mode does not read or materialize from the shared store.
 - **Extract:** gunzip (zstream) + a direct ustar reader. The bundled FPC `libtar` has a bug — it ignores the 155-byte `prefix` field at offset 345, so paths longer than 100 bytes get silently dropped. LWPT's reader joins `prefix + '/' + name` correctly and also follows GNU `'L'`/`'K'` long-name entries.
 - **Build:** `BuildOneEntry` creates a `TLWPTBuildRequest`, asks the selected driver
   to probe the requested target, validates the request against those

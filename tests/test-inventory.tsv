@@ -31,7 +31,8 @@ program	*	unit	source/LWPT.CompilerDriver.External.Test.pas	1	10
 program	*	unit	source/LWPT.CompilerDriver.FPC.Test.pas	1	20
 program	*	unit	source/LWPT.CompilerDriver.Lakon.Test.pas	1	17
 program	*	unit	source/LWPT.CompilerRegistry.Test.pas	1	11
-program	*	unit	source/LWPT.Core.Test.pas	21	144
+program	*	unit	source/LWPT.Core.Test.pas	21	145
+program	windows/*	unit	source/LWPT.Core.Test.pas	21	144
 program	*	unit	source/LWPT.Duplication.Test.pas	1	18
 program	*	unit	source/LWPT.Formatter.Test.pas	4	25
 program	*	unit	source/LWPT.Health.Test.pas	1	11
@@ -39,6 +40,7 @@ program	*	unit	source/LWPT.TestInventory.Test.pas	1	7
 program	*	unit	source/LWPT.Manifest.Schema.Test.pas	1	7
 program	*	unit	source/LWPT.ManifestEdit.Test.pas	4	23
 program	*	unit	source/LWPT.Observability.Test.pas	1	6
+program	*	unit	source/LWPT.ObjectStore.Test.pas	1	10
 program	*	unit	source/LWPT.OutputRenderer.Test.pas	1	1
 program	*	unit	source/LWPT.Resolver.Test.pas	1	7
 program	*	unit	source/LWPT.WorkerBudget.Test.pas	1	22
@@ -64,7 +66,7 @@ program	*	integration	tests/integration/ExtractPathological.Test.pas	2	14
 program	*	integration	tests/integration/Hooks.Test.pas	1	11
 program	*	integration	tests/integration/Init.Test.pas	1	21
 program	*	integration	tests/integration/InstallFetchFailure.Test.pas	3	20
-program	*	integration	tests/integration/InstallGitGraph.Test.pas	1	4
+program	*	integration	tests/integration/InstallGitGraph.Test.pas	1	6
 program	*	integration	tests/integration/InstallGraphConflict.Test.pas	1	20
 program	*	integration	tests/integration/InstallLocalDiamond.Test.pas	2	10
 program	*	integration	tests/integration/InstallNestedManifest.Test.pas	1	4
