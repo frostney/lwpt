@@ -718,8 +718,22 @@ begin
 end;
 
 function MakeTmpPath(const ATmpRoot, AHint: string): string;
+const
+  DirectoryCreateAttempts = 32;
+var
+  Attempt: Integer;
 begin
-  ForceDirectories(ATmpRoot);
+  { ForceDirectories is process-local race-prone: when two processes recurse
+    through the same missing hierarchy, one can lose an intermediate mkdir to
+    EEXIST and return before the winner creates the final directory. Validate
+    the postcondition and retry briefly while that competing creation lands. }
+  for Attempt := 1 to DirectoryCreateAttempts do
+  begin
+    if DirectoryExists(ATmpRoot) then Break;
+    ForceDirectories(ATmpRoot);
+    if DirectoryExists(ATmpRoot) then Break;
+    Sleep(1);
+  end;
   Result := MakeUniqueTmpPath(ATmpRoot, AHint);
 end;
 

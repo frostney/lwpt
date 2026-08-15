@@ -60,6 +60,7 @@ After bootstrap:
 ./build/lwpt build <entry>      # single build entry
 ./build/lwpt build --clean      # force a fresh private-session rebuild
 ./build/lwpt build --jobs=1     # force sequential entry execution
+./build/lwpt build --no-cache   # compile without reusable build results
 
 ./build/lwpt format             # rewrite sources to canonical style
 ./build/lwpt format --check     # exit non-zero on any deviation

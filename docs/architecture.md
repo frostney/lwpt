@@ -185,7 +185,10 @@ installs are not supported.
   capabilities, and obtains its invocation. Root-manifest per-entry flags
   become ordered neutral extra arguments before the driver translates them;
   dependency-manifest flags are dropped. `TLWPTCompilerProcess` executes
-  them below the seam. The driver normalizes diagnostics while the scheduler
+  them below the seam. `LWPT.BuildCache` derives a session-neutral fingerprint
+  from that request plus content and environment inputs, and can materialize a
+  verified immutable result from the per-user object store before the compiler
+  runs. The driver normalizes diagnostics while the scheduler
   retains raw output for ordered log replay. The publication fingerprint embeds
   the deterministic request serialization alongside the implicit source
   directory, declared inputs, and postbuild hook contributors. Per-entry
@@ -196,7 +199,9 @@ installs are not supported.
   snapshot, and atomically replace the public executable when it is still
   current. Search-root fingerprints follow workspace directory links with cycle
   protection and exclude unrelated declared outputs, while explicit file inputs
-  remain hashed.
+  remain hashed. Only a successfully published current candidate is admitted
+  to the build-result namespace; failed, cancelled, stale, and hook-failed
+  candidates remain session-private. `--no-cache` bypasses lookup and storage.
 - **Test:** Each `*.Test.pas` is a self-contained program using
   `TestingPascalLibrary`. `lwpt test` resolves the project-scoped compiler
   driver once and shares it across every test worker; per-entry compiler
