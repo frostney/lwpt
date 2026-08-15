@@ -65,27 +65,24 @@ trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 printf 'Downloading %s\n' "$ASSET"
 curl -fsSL -o "${TMPDIR}/${ASSET}" "$URL"
 
-if curl -fsSL -o "${TMPDIR}/checksums.txt" "$SUMS_URL" 2>/dev/null; then
-  printf 'Verifying checksum\n'
-  EXPECTED="$(grep " ${ASSET}\$" "${TMPDIR}/checksums.txt" | awk '{print $1}')"
-  if [ -z "$EXPECTED" ]; then
-    printf 'install.sh: no checksum entry for %s — skipping verification\n' "$ASSET" >&2
-  else
-    if command -v sha256sum >/dev/null 2>&1; then
-      ACTUAL="$(sha256sum "${TMPDIR}/${ASSET}" | awk '{print $1}')"
-    elif command -v shasum >/dev/null 2>&1; then
-      ACTUAL="$(shasum -a 256 "${TMPDIR}/${ASSET}" | awk '{print $1}')"
-    else
-      printf 'install.sh: neither sha256sum nor shasum available — skipping verification\n' >&2
-      ACTUAL=""
-    fi
-    if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
-      err "checksum mismatch — expected $EXPECTED, got $ACTUAL"
-    fi
-  fi
+curl -fsSL -o "${TMPDIR}/checksums.txt" "$SUMS_URL" \
+  || err "could not download checksums file at $SUMS_URL"
+
+printf 'Verifying checksum\n'
+EXPECTED="$(awk -v asset="$ASSET" '$2 == asset { print $1; exit }' \
+  "${TMPDIR}/checksums.txt")"
+[ -n "$EXPECTED" ] || err "checksums file has no entry for $ASSET"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "${TMPDIR}/${ASSET}" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL="$(shasum -a 256 "${TMPDIR}/${ASSET}" | awk '{print $1}')"
 else
-  printf 'install.sh: no checksums file at %s — skipping verification\n' "$SUMS_URL" >&2
+  err "neither sha256sum nor shasum is available"
 fi
+
+[ "$ACTUAL" = "$EXPECTED" ] \
+  || err "checksum mismatch — expected $EXPECTED, got $ACTUAL"
 
 cd "$TMPDIR"
 tar xzf "$ASSET"

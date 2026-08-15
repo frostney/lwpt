@@ -231,8 +231,8 @@ Source kinds: `skGitHost` (default `github`, with `gitlab:` / `bitbucket:` / any
 
 `TestingPascalLibrary` lives in the `testing` workspace package and is
 auto-discovered via `[workspaces] include = ["packages/*"]` in the
-root manifest — `lwpt install` symlinks it into `.lwpt/modules/testing/`
-on first run, and the cfg emitter wires the `-Fu` / `-Fi` paths so
+root manifest — `lwpt install` publishes its validated snapshot into
+`.lwpt/modules/testing/`, and the cfg emitter wires the `-Fu` / `-Fi` paths so
 every `*.Test.pas` file resolves `uses TestingPascalLibrary;` with no
 further setup.
 
