@@ -643,7 +643,7 @@ var
 begin
   SetMode('success');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   DumpRunFailure('external build', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app'))).ToBe(True);
@@ -681,7 +681,7 @@ begin
     UpdatedCfg.Add('-Fucfg-only-units');
     AtomicWriteText(FScratch + '/lwpt.cfg', FScratch + '/.lwpt/tmp',
       UpdatedCfg);
-    R := RunLwpt(['build', '--jobs', '1'], FScratch);
+    R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
     DumpRunFailure('Lakon cfg-only unit path', R, 0);
     Expect<Integer>(R.ExitCode).ToBe(0);
     Expect<Boolean>(FileExists(FScratch + '/build/app.wasm')).ToBe(True);
@@ -701,7 +701,7 @@ var
 begin
   SetMode('identity-mismatch');
   WriteManifest('native');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   DumpRunFailure('entry precedence', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
 end;
@@ -712,7 +712,7 @@ var
 begin
   SetMode('identity-mismatch');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('returned compiler identity "wrong"',
     R.Stdout + R.Stderr) > 0).ToBe(True);
@@ -725,7 +725,7 @@ var
 begin
   SetMode('version-mismatch');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('does not satisfy', R.Stdout + R.Stderr) > 0).ToBe(True);
 end;
@@ -736,7 +736,7 @@ var
 begin
   SetMode('target-mismatch');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('target tuple', R.Stdout + R.Stderr) > 0).ToBe(True);
 end;
@@ -747,7 +747,7 @@ var
 begin
   SetMode('capability-mutation');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('does not satisfy', R.Stdout + R.Stderr) > 0).ToBe(True);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app'))).ToBe(False);
@@ -759,7 +759,7 @@ var
 begin
   SetMode('malformed');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('malformed compile raw diagnostic',
     R.Stdout + R.Stderr) > 0).ToBe(True);
@@ -794,7 +794,7 @@ var
 begin
   SetMode('timeout');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch,
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch,
     [COMPILER_TIMEOUT_ENVIRONMENT + '=100']);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('timed out after 100 ms', R.Stdout + R.Stderr) > 0)
@@ -808,7 +808,7 @@ var
 begin
   SetMode('extra-artifact');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('outside the declared private output roots',
     R.Stdout + R.Stderr) > 0).ToBe(True);
@@ -825,7 +825,7 @@ var
 begin
   SetMode('reordered-artifacts');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   DumpRunFailure('reordered artifacts', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
 
@@ -851,7 +851,7 @@ var
 begin
   SetMode('publication-target-mutation');
   WriteManifest('external');
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('target tuple is not supported',
     R.Stdout + R.Stderr) > 0).ToBe(True);
@@ -864,7 +864,7 @@ var
 begin
   SetMode('publication-lease');
   WriteManifest('external', True);
-  R := RunLwpt(['build', '--jobs', '1'], FScratch,
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch,
     [WORKER_STATE_DIR_ENV + '=' + FScratch + '/worker-state',
      WORKER_BUDGET_ENV + '=1']);
   DumpRunFailure('publication lease', R, 0);
@@ -880,7 +880,7 @@ var
 begin
   SetMode('success');
   WriteBlaiseManifest;
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   DumpRunFailure('built-in Blaise build', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(FScratch + '/.blaise-help')).ToBe(True);
@@ -904,7 +904,7 @@ begin
     + 'output = "build/app"'#10
     + 'target = { os = "linux", architecture = "aarch64", '
     + 'abi = "gnu", environment = "container" }'#10);
-  R := RunLwpt(['build', '--jobs', '1'], FScratch);
+  R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch);
   DumpRunFailure('explicit target round trip', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(FScratch + '/.target-probe')).ToBe(True);

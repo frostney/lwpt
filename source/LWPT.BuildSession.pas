@@ -605,7 +605,7 @@ begin
   Result.Outputs.Artifact := APublicOutput;
   Result.Outputs.ExecutableDirectory := NEUTRAL_SESSION_ROOT + '/bin';
   Result.Outputs.UnitDirectory := NEUTRAL_SESSION_ROOT + '/units';
-  Result.Outputs.ObjectDirectory := NEUTRAL_SESSION_ROOT + '/objects';
+  Result.Outputs.ObjectDirectory := NEUTRAL_SESSION_ROOT + '/units';
   Result.Outputs.ResourceDirectory := NEUTRAL_SESSION_ROOT + '/resources';
 end;
 
