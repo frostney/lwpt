@@ -40,7 +40,7 @@ program	*	unit	source/LWPT.TestInventory.Test.pas	1	7
 program	*	unit	source/LWPT.Manifest.Schema.Test.pas	1	7
 program	*	unit	source/LWPT.ManifestEdit.Test.pas	4	23
 program	*	unit	source/LWPT.Observability.Test.pas	1	6
-program	*	unit	source/LWPT.ObjectStore.Test.pas	1	9
+program	*	unit	source/LWPT.ObjectStore.Test.pas	1	10
 program	*	unit	source/LWPT.OutputRenderer.Test.pas	1	1
 program	*	unit	source/LWPT.Resolver.Test.pas	1	7
 program	*	unit	source/LWPT.WorkerBudget.Test.pas	1	22

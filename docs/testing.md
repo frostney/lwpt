@@ -260,7 +260,7 @@ inventory never touches the network.
 | **`source/LWPT.OutputRenderer.Test.pas`** | 1 test in 1 suite | Proves the fixed-capacity silent emergency ring preserves the exact most-recent 1 MiB tail across chunked wraparound without shifting retained bytes on append. |
 | **`source/LWPT.Resolver.Test.pas`** | 7 tests in 1 suite | Pins highest-common-version selection across the complete constraint set, pairwise-overlap/global-empty rejection with every requirer named, literal-tag/SHA and differently named tag unification through advertised commit identity, annotated-tag peeled-commit identity, rejection of equal SemVer precedence mapped to different commits, and literal-branch compatibility. |
 | **`source/LWPT.Observability.Test.pas`** | 6 tests in 1 suite | Pins typed job, heartbeat, diagnostic, byte-safe child-output, command-terminal, truncation, and capture-degradation payloads, including source/correlation tags, ordinary/protected/terminal retention classes, the nonzero outcome invariant for failed jobs, zero-exit failure normalization, and preservation of genuine child exits. |
-| **`source/LWPT.ObjectStore.Test.pas`** | 9 tests in 1 suite | Exercises canonical sharded SHA-256 addressing, digest rejection, verified admission/lookup/materialization, mismatch refusal, corruption quarantine, interrupted-write invisibility, two same-key producer processes publishing one complete object, override normalization, and native Windows/macOS/XDG cache-root defaults. |
+| **`source/LWPT.ObjectStore.Test.pas`** | 10 tests in 1 suite | Exercises canonical sharded SHA-256 addressing, digest rejection, verified admission/lookup/materialization, mismatch refusal, corruption quarantine, deterministic restoration when a stale lookup quarantines a concurrent valid replacement, interrupted-write invisibility, two same-key producer processes publishing one complete object, override normalization, and native Windows/macOS/XDG cache-root defaults. |
 | **`source/LWPT.WorkerBudget.Test.pas`** | 22 tests in 1 suite (Unix); 17 tests in 1 suite (Windows) | Self-spawning cross-process coverage for the per-user worker coordinator: two worktree CWDs share a bounded budget, first transactions retry interrupted state-root creation, requests are capped, dead owners are reclaimed, live unreadable/malformed/unknown-schema requests fail closed, repeated release/reacquire cannot jump a waiter, and nested LWPT works at budget 1 through one-shot delegation. Delegation coverage refuses fan-out and token reuse, keeps a child counted after parent death, returns capacity after child failure, and prevents parent release from creating a ghost grant. Failed release writes remain retryable, and two scheduler threads safely share one session. Snapshot assertions cover owner identity, granted capacity, lease age, waiting count, and diagnostics. |
 | **`packages/semver/source/Semver.Test.pas`** | 15 tests in 3 suites | `Satisfies` happy path (caret/tilde/exact, complete and partial hyphen ranges, explicit prerelease inclusion, and default prerelease exclusion); `RangeIntersects` matrix the resolver leans on (caret+caret across major boundaries, exact+caret, union ranges); `MaxSatisfying` correctness (highest in range, empty when none match, ignore out-of-range). |
 | **`packages/testing/source/TestingPascalLibrary.Test.pas`** | 2 tests in 1 suite | The framework canary, lives with the package per ADR-0015. Uses TPL at arm's length (one `Expect<Boolean>(True).ToBe(True)`) so that if TPL itself breaks, this file's failure narrows the blame instead of the suite reporting opaquely. Custom exit codes (10/11/12/13/14) for each plausible TPL initialisation failure mode. |
@@ -330,10 +330,10 @@ inventory never touches the network.
 <!-- lwpt:test-inventory-counts:begin -->
 | Tier | Files | Registered test cases |
 | --- | ---: | --- |
-| Unit | 32 | 552 Unix / 539 Windows |
+| Unit | 32 | 553 Unix / 540 Windows |
 | Integration | 23 | 267 Darwin / 266 Linux / 261 Windows |
 | E2E | 7 | 34 Darwin, Windows / 37 Linux |
-| **Total** | **62** | **853 Darwin / 855 Linux / 834 Windows** |
+| **Total** | **62** | **854 Darwin / 856 Linux / 835 Windows** |
 <!-- lwpt:test-inventory-counts:end -->
 
 ## TestingPascalLibrary self-test

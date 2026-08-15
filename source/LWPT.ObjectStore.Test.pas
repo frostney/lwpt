@@ -21,6 +21,9 @@ uses
 const
   ADMIT_CHILD_SWITCH = '--object-store-admit-child';
 
+var
+  ReplacementSource: string;
+
 type
   TObjectStoreContract = class(TTestSuite)
   private
@@ -43,6 +46,7 @@ type
     procedure TestAdmitLookupAndMaterialize;
     procedure TestAdmissionHashMismatchPublishesNothing;
     procedure TestCorruptObjectIsQuarantinedAndMisses;
+    procedure TestConcurrentValidReplacementIsRestoredAfterQuarantine;
     procedure TestInterruptedTemporaryObjectIsNeverVisible;
     procedure TestConcurrentSameKeyAdmissionPublishesOneCompleteObject;
     procedure TestCacheRootOverrideIsAbsoluteAndNormalized;
@@ -62,6 +66,18 @@ begin
     Store.Free;
   end;
   Result := True;
+end;
+
+procedure PublishValidReplacement(const APath: string);
+var
+  Staged: string;
+begin
+  ObjectStoreBeforeQuarantineTestHook := nil;
+  Staged := APath + '.replacement';
+  if not CopyFileContent(ReplacementSource, Staged) then
+    raise Exception.Create('failed to stage object-store test replacement');
+  if not AtomicReplaceFile(Staged, APath) then
+    raise Exception.Create('failed to publish object-store test replacement');
 end;
 
 procedure TObjectStoreContract.WriteBytes(const APath, AText: string);
@@ -234,6 +250,28 @@ begin
   end;
 end;
 
+procedure TObjectStoreContract.
+  TestConcurrentValidReplacementIsRestoredAfterQuarantine;
+var
+  Store: TLWPTImmutableObjectStore;
+  ObjectPath, HitPath: string;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
+  try
+    ObjectPath := Store.Admit(FSource, FDigest);
+    WriteBytes(ObjectPath, 'corrupt');
+    ReplacementSource := FSource;
+    ObjectStoreBeforeQuarantineTestHook := @PublishValidReplacement;
+    Expect<Boolean>(Store.Lookup(FDigest, HitPath)).ToBe(True);
+    Expect<string>(HitPath).ToBe(ObjectPath);
+    Expect<string>('sha256:' + SHA256File(ObjectPath)).ToBe(FDigest);
+  finally
+    ObjectStoreBeforeQuarantineTestHook := nil;
+    ReplacementSource := '';
+    Store.Free;
+  end;
+end;
+
 procedure TObjectStoreContract.TestInterruptedTemporaryObjectIsNeverVisible;
 var
   Store: TLWPTImmutableObjectStore;
@@ -315,6 +353,8 @@ begin
     TestAdmissionHashMismatchPublishesNothing);
   Test('corrupt objects are quarantined and become misses',
     TestCorruptObjectIsQuarantinedAndMisses);
+  Test('a valid replacement moved by stale quarantine is restored',
+    TestConcurrentValidReplacementIsRestoredAfterQuarantine);
   Test('interrupted temporary objects are never visible',
     TestInterruptedTemporaryObjectIsNeverVisible);
   Test('concurrent same-key producers publish one complete object',
