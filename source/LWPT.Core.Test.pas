@@ -365,6 +365,10 @@ type
   private
     FOrigDir: string;
     FScratch: string;
+    {$IFDEF UNIX}
+    FCrossDeviceBase: string;
+    FCrossDeviceSkipReason: string;
+    {$ENDIF}
   protected
     procedure AfterAll; override;
     procedure BeforeAll; override;
@@ -374,6 +378,9 @@ type
     procedure TestSiblingOfBareFilenameStaysRelative;
     procedure TestMoveFileReplacesExistingBareDestination;
     procedure TestMoveDirReplacesExistingBareDestination;
+    {$IFDEF UNIX}
+    procedure TestMoveFileReplacesExistingAcrossFilesystems;
+    {$ENDIF}
   end;
 
   { [sources] custom-prefix declaration with placeholder URL
@@ -3430,6 +3437,53 @@ begin
     end;
 end;
 
+{$IFDEF UNIX}
+function FindCrossDeviceBase(const AReferencePath: string;
+  out AReason: string): string;
+var
+  ReferenceInfo, CandidateInfo: BaseUnix.Stat;
+  Candidates: TStringList;
+  Candidate, Probe: string;
+  i: Integer;
+begin
+  Result := '';
+  AReason := '';
+  if FpStat(AReferencePath, ReferenceInfo) <> 0 then
+  begin
+    AReason := 'could not inspect the destination filesystem';
+    Exit;
+  end;
+
+  Candidates := TStringList.Create;
+  try
+    Candidate := GetEnvironmentVariable(
+      PROJECT_NAME + '_TEST_CROSS_DEVICE_DIR');
+    if Candidate <> '' then Candidates.Add(Candidate);
+    Candidates.Add('/dev/shm');
+    Candidates.Add(GetTempDir(False));
+    for i := 0 to Candidates.Count - 1 do
+    begin
+      Candidate := ExcludeTrailingPathDelimiter(Candidates[i]);
+      if (Candidate = '') or not DirectoryExists(Candidate) then Continue;
+      if (FpStat(Candidate, CandidateInfo) <> 0)
+         or (CandidateInfo.st_dev = ReferenceInfo.st_dev) then Continue;
+      Probe := IncludeTrailingPathDelimiter(Candidate)
+        + PROGRAM_NAME + '-cross-device-probe-'
+        + IntToStr(GetProcessID);
+      try
+        ForceDirectories(Probe);
+        if DirectoryExists(Probe) then Exit(Candidate);
+      finally
+        if DirectoryExists(Probe) then WipeDir(Probe);
+      end;
+    end;
+  finally
+    Candidates.Free;
+  end;
+  AReason := 'no writable second filesystem is available on this host';
+end;
+{$ENDIF}
+
 procedure TAtomicMoveBareDestination.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
@@ -3492,14 +3546,58 @@ begin
   Expect<Integer>(CountDirEntries('.')).ToBe(1);
 end;
 
+{$IFDEF UNIX}
+procedure TAtomicMoveBareDestination.
+  TestMoveFileReplacesExistingAcrossFilesystems;
+var
+  CrossScratch, SourcePath, DestinationPath: string;
+  SourceInfo, DestinationInfo: BaseUnix.Stat;
+begin
+  CrossScratch := IncludeTrailingPathDelimiter(FCrossDeviceBase)
+    + PROGRAM_NAME + '-atomic-move-' + IntToStr(GetProcessID);
+  SourcePath := CrossScratch + '/incoming.tmp';
+  DestinationPath := FScratch + '/cross-device-destination.txt';
+  try
+    ForceDirectories(CrossScratch);
+    WriteBareFile(SourcePath, 'fresh');
+    WriteBareFile(DestinationPath, 'stale');
+    Expect<Integer>(FpStat(SourcePath, SourceInfo)).ToBe(0);
+    Expect<Integer>(FpStat(DestinationPath, DestinationInfo)).ToBe(0);
+    Expect<Boolean>(SourceInfo.st_dev <> DestinationInfo.st_dev).ToBe(True);
+
+    Expect<Boolean>(AtomicMoveFile(SourcePath, DestinationPath)).ToBe(True);
+
+    Expect<string>(ReadBareFile(DestinationPath)).ToBe('fresh');
+    Expect<Boolean>(FileExists(SourcePath)).ToBe(False);
+    { The EXDEV copy is staged beside the destination and leaves no sibling. }
+    Expect<Integer>(CountDirEntries(FScratch)).ToBe(1);
+  finally
+    if DirectoryExists(CrossScratch) then WipeDir(CrossScratch);
+  end;
+end;
+{$ENDIF}
+
 procedure TAtomicMoveBareDestination.SetupTests;
 begin
+  {$IFDEF UNIX}
+  FCrossDeviceBase := FindCrossDeviceBase(GetCurrentDir,
+    FCrossDeviceSkipReason);
+  {$ENDIF}
   Test('sibling of a bare filename resolves under the current directory',
     TestSiblingOfBareFilenameStaysRelative);
   Test('bare-filename destination with existing file is replaced',
     TestMoveFileReplacesExistingBareDestination);
   Test('bare-dirname destination with existing directory is replaced',
     TestMoveDirReplacesExistingBareDestination);
+  {$IFDEF UNIX}
+  if FCrossDeviceBase <> '' then
+    Test('existing file is atomically replaced across filesystems',
+      TestMoveFileReplacesExistingAcrossFilesystems)
+  else
+    Skip('existing file is atomically replaced across filesystems',
+      TestMoveFileReplacesExistingAcrossFilesystems,
+      FCrossDeviceSkipReason);
+  {$ENDIF}
 end;
 
 begin

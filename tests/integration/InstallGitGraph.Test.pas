@@ -15,7 +15,7 @@ uses
 type
   TInstallGitGraph = class(TTestSuite)
   private
-    FOriginalDir, FScratch, FFixtureRoot: string;
+    FOriginalDir, FScratch, FFixtureRoot, FCacheRoot: string;
     procedure WriteRoot(const ARoot, AName, ADependencies: string);
     procedure WriteRefs(const ARepository, AContent: string);
     procedure WriteArchive(const AName, ACommit, AManifest: string);
@@ -31,6 +31,8 @@ type
     procedure TestLateConstraintIsIncludedInTerminalConflict;
     procedure TestMixedTagSHAUsesImmutableFetchAndFrozenIdentity;
     procedure TestSecondRoundReusesRefAndCandidateCaches;
+    procedure TestVerifiedArchiveCacheReusesLockedBytesAcrossProjects;
+    procedure TestMovedTagRefetchesWhenLockHasNoCommitIdentity;
   end;
 
 const
@@ -114,6 +116,20 @@ begin
   end;
 end;
 
+procedure RemoveResolvedCommit(const APath: string);
+var Lines: TStringList; i: Integer;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(APath);
+    for i := Lines.Count - 1 downto 0 do
+      if Pos('resolvedCommit = ', Lines[i]) = 1 then Lines.Delete(i);
+    Lines.SaveToFile(APath);
+  finally
+    Lines.Free;
+  end;
+end;
+
 procedure TInstallGitGraph.WriteRoot(const ARoot, AName,
   ADependencies: string);
 begin
@@ -154,7 +170,8 @@ function TInstallGitGraph.RunInstall(const ARoot: string;
   const AArguments: array of string): TLwptResult;
 begin
   Result := RunLwpt(AArguments, ARoot,
-    [PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot]);
+    [PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot,
+     PROJECT_NAME + '_CACHE_DIR=' + FCacheRoot]);
 end;
 
 function TInstallGitGraph.RequestCount(const ALine: string): Integer;
@@ -178,8 +195,106 @@ begin
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
   FScratch := CreateScratchRoot('install-git-graph');
   FFixtureRoot := FScratch + '/git-fixture';
+  FCacheRoot := FScratch + '/user-cache';
   RecursiveDelete(FScratch);
   ForceDirectories(FFixtureRoot);
+end;
+
+procedure TInstallGitGraph.
+  TestVerifiedArchiveCacheReusesLockedBytesAcrossProjects;
+var
+  FirstRoot, SecondRoot, ArchivePath, LockText, Combined: string;
+  Run: TLwptResult;
+begin
+  FirstRoot := FScratch + '/cache-first-project';
+  SecondRoot := FScratch + '/cache-second-project';
+  WriteRoot(FirstRoot, 'cache-project',
+    'shared = "fixture/shared@^1.0.0"'#10);
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+
+  Run := RunInstall(FirstRoot, ['install']);
+  if Run.ExitCode <> 0 then
+    WriteLn('--- first cache install ---'#10, Run.Stdout, Run.Stderr, '---');
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Integer>(RequestCount(
+    'archive|shared|' + SHARED_COMMIT)).ToBe(1);
+
+  { A second checkout has the same committed manifest + lock identity but its
+    project archive/module state is deliberately absent. Remove the fixture
+    archive too: success can now come only from the verified per-user object. }
+  ForceDirectories(SecondRoot + '/source');
+  CopyFileContent(FirstRoot + '/lwpt.toml', SecondRoot + '/lwpt.toml');
+  CopyFileContent(FirstRoot + '/lwpt.lock', SecondRoot + '/lwpt.lock');
+  WriteTextFile(SecondRoot + '/source/main.pas',
+    'program main;'#10 + '{$mode delphi}{$H+}'#10 + 'begin end.'#10);
+  SysUtils.DeleteFile(FFixtureRoot + '/archives/shared/'
+    + SHARED_COMMIT + '.tar.gz');
+  SysUtils.DeleteFile(FFixtureRoot + '/refs/shared.refs');
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+
+  Run := RunInstall(SecondRoot, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  if Run.ExitCode <> 0 then
+    WriteLn('--- second cache install ---'#10, Combined, '---');
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('reused verified archive for shared', Combined) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('reusing verified lockfile identity', Combined) > 0)
+    .ToBe(True);
+  Expect<Integer>(RequestCount(
+    'archive|shared|' + SHARED_COMMIT)).ToBe(0);
+  ArchivePath := SecondRoot + '/.lwpt/archives/shared-v1.0.0.tar.gz';
+  Expect<Boolean>(FileExists(ArchivePath)).ToBe(True);
+  LockText := ReadText(SecondRoot + '/lwpt.lock');
+  Expect<Boolean>(Pos('archiveHash = "sha256:' + SHA256File(ArchivePath)
+    + '"', LockText) > 0).ToBe(True);
+
+  Run := RunInstall(SecondRoot, ['install', '--frozen']);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+end;
+
+procedure TInstallGitGraph.
+  TestMovedTagRefetchesWhenLockHasNoCommitIdentity;
+var Root, ArchivePath, LockText, Combined: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/moved-tag-with-early-lock';
+  WriteRoot(Root, 'moved-tag-with-early-lock',
+    'shared = "fixture/shared@^1.0.0"'#10);
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+
+  Run := RunInstall(Root, ['install']);
+  if Run.ExitCode <> 0 then
+    WriteLn('--- original tag install ---'#10, Run.Stdout, Run.Stderr, '---');
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  RemoveResolvedCommit(Root + '/lwpt.lock');
+
+  WriteRefs('shared', 'tag|v1.0.0|' + MUTATED_SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', MUTATED_SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+
+  Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  if Run.ExitCode <> 0 then
+    WriteLn('--- moved tag install ---'#10, Combined, '---');
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Integer>(RequestCount(
+    'archive|shared|' + MUTATED_SHARED_COMMIT)).ToBe(1);
+  ArchivePath := Root + '/.lwpt/archives/shared-v1.0.0.tar.gz';
+  LockText := ReadText(Root + '/lwpt.lock');
+  Expect<Boolean>(Pos('resolvedCommit = "' + MUTATED_SHARED_COMMIT + '"',
+    LockText) > 0).ToBe(True);
+  Expect<Boolean>(Pos('archiveHash = "sha256:' + SHA256File(ArchivePath)
+    + '"', LockText) > 0).ToBe(True);
 end;
 
 procedure TInstallGitGraph.AfterAll;
@@ -355,6 +470,10 @@ begin
   Test('a changed transitive constraint forces round two while ref and '
     + 'unchanged-candidate caches are reused',
     TestSecondRoundReusesRefAndCandidateCaches);
+  Test('verified archive objects are reused across projects from lock identity',
+    TestVerifiedArchiveCacheReusesLockedBytesAcrossProjects);
+  Test('a moved tag is refetched when the prior lock has no commit identity',
+    TestMovedTagRefetchesWhenLockHasNoCommitIdentity);
 end;
 
 begin

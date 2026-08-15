@@ -930,52 +930,30 @@ end;
 
 function AtomicMoveFile(const ASrc, ADst: string): Boolean;
 var
-  DstDir, Backup: string;
-
-  procedure RestoreBackup;
-  begin
-    if Backup = '' then Exit;
-    if FileExists(ADst) then SysUtils.DeleteFile(ADst);
-    if FileExists(Backup) then SysUtils.RenameFile(Backup, ADst);
-  end;
-
+  DstDir, StagedCopy: string;
 begin
   if not FileExists(ASrc) then Exit(False);
   DstDir := ExtractFileDir(ADst);
   if DstDir <> '' then ForceDirectories(DstDir);
-  Backup := '';
+  { One same-filesystem replacement is the common path. Unlike renaming the
+    old destination aside first, this never creates a reader-visible gap. }
+  if AtomicReplaceFile(ASrc, ADst) then Exit(True);
+
+  { EXDEV (or its Windows equivalent): copy to a unique sibling on the
+    destination filesystem, then perform the same one-operation replacement.
+    A crash can leave only the unaddressed sibling; readers keep seeing either
+    the complete old destination or the complete new one. }
+  StagedCopy := MakeSiblingTmpPath(ADst, 'copy');
   Result := False;
-
-  if FileExists(ADst) then
-  begin
-    Backup := MakeSiblingTmpPath(ADst, 'old');
-    if not SysUtils.RenameFile(ADst, Backup) then Exit(False);
-  end;
-
   try
-    Result := SysUtils.RenameFile(ASrc, ADst);
-    if not Result then
-    begin
-      { Rename failed — most commonly EXDEV (cross-filesystem). Fall back
-        to copy-then-delete; the old destination is held aside and restored
-        if the copy cannot be completed. }
-      if CopyFileContent(ASrc, ADst) then
-      begin
-        SysUtils.DeleteFile(ASrc);
-        Result := True;
-      end;
-    end;
-
-    if Result then
-    begin
-      if Backup <> '' then SysUtils.DeleteFile(Backup);
-      Exit;
-    end;
-
-    RestoreBackup;
-  except
-    RestoreBackup;
-    raise;
+    if not CopyFileContent(ASrc, StagedCopy) then Exit;
+    if not AtomicReplaceFile(StagedCopy, ADst) then Exit;
+    { Publication is already complete. A failed source cleanup is recoverable
+      residue, not a failed move that should trigger rollback of the new path. }
+    SysUtils.DeleteFile(ASrc);
+    Result := True;
+  finally
+    if FileExists(StagedCopy) then SysUtils.DeleteFile(StagedCopy);
   end;
 end;
 

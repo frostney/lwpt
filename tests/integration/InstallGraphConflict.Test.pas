@@ -18,6 +18,9 @@ uses
   Tests.LwptSubprocess,
   Tests.Scratch;
 
+const
+  EMPTY_SCHEMA_V3_LOCK = 'version = 3';
+
 type
   TInstallGraphConflict = class(TTestSuite)
   private
@@ -201,7 +204,7 @@ begin
   WriteTextFile(Root + '/.lwpt/modules/branch-a/old.txt', 'old-a');
   WriteTextFile(Root + '/.lwpt/modules/branch-b/old.txt', 'old-b');
   WriteTextFile(Root + '/.lwpt/archives/sentinel.tar.gz', 'old-archive');
-  WriteTextFile(Root + '/lwpt.lock', 'old-lock');
+  WriteTextFile(Root + '/lwpt.lock', EMPTY_SCHEMA_V3_LOCK);
   WriteTextFile(Root + '/lwpt.cfg', 'old-cfg');
   Run := RunLwpt(['install'], Root,
     [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']);
@@ -213,7 +216,7 @@ begin
   Expect<string>(ReadText(Root + '/.lwpt/archives/sentinel.tar.gz'))
     .ToBe('old-archive' + LineEnding);
   Expect<string>(ReadText(Root + '/lwpt.lock'))
-    .ToBe('old-lock' + LineEnding);
+    .ToBe(EMPTY_SCHEMA_V3_LOCK + LineEnding);
   Expect<string>(ReadText(Root + '/lwpt.cfg'))
     .ToBe('old-cfg' + LineEnding);
 end;
@@ -513,7 +516,7 @@ begin
   ForceDirectories(Root + '/.lwpt/modules/branch-b');
   WriteTextFile(Root + '/.lwpt/modules/branch-a/old.txt', 'old-a');
   WriteTextFile(Root + '/.lwpt/modules/branch-b/old.txt', 'old-b');
-  WriteTextFile(Root + '/lwpt.lock', 'old-lock');
+  WriteTextFile(Root + '/lwpt.lock', EMPTY_SCHEMA_V3_LOCK);
   WriteTextFile(Root + '/lwpt.cfg', 'old-cfg');
   Run := RunLwpt(['install'], Root,
     [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1',
@@ -527,7 +530,7 @@ begin
   Expect<string>(ReadText(
     Root + '/.lwpt/modules/branch-b/old.txt')).ToBe('old-b' + LineEnding);
   Expect<string>(ReadText(Root + '/lwpt.lock'))
-    .ToBe('old-lock' + LineEnding);
+    .ToBe(EMPTY_SCHEMA_V3_LOCK + LineEnding);
   Expect<string>(ReadText(Root + '/lwpt.cfg'))
     .ToBe('old-cfg' + LineEnding);
   Expect<Boolean>(HasRollbackMarker(Root + '/.lwpt/tmp')).ToBe(True);
@@ -546,7 +549,7 @@ begin
   ForceDirectories(Root + '/.lwpt/modules/branch-b');
   WriteTextFile(Root + '/.lwpt/modules/branch-a/old.txt', 'old-a');
   WriteTextFile(Root + '/.lwpt/modules/branch-b/old.txt', 'old-b');
-  WriteTextFile(Root + '/lwpt.lock', 'old-lock');
+  WriteTextFile(Root + '/lwpt.lock', EMPTY_SCHEMA_V3_LOCK);
   WriteTextFile(Root + '/lwpt.cfg', 'old-cfg');
   Run := RunLwpt(['install'], Root,
     [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1',
@@ -560,7 +563,7 @@ begin
   Expect<string>(ReadText(
     Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old-a' + LineEnding);
   Expect<string>(ReadText(Root + '/lwpt.lock'))
-    .ToBe('old-lock' + LineEnding);
+    .ToBe(EMPTY_SCHEMA_V3_LOCK + LineEnding);
   Expect<string>(ReadText(Root + '/lwpt.cfg'))
     .ToBe('old-cfg' + LineEnding);
   Expect<Boolean>(HasRollbackMarker(Root + '/.lwpt/tmp')).ToBe(True);
