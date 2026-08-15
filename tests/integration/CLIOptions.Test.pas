@@ -327,7 +327,7 @@ end;
 
 procedure TCLIOptionsE2E.TestFormatRejectsUnexpectedPositionalBeforeSideEffects;
 var
-  OriginalSource, SourcePath, UnformattedSource: string;
+  OriginalSource, SourcePath, UnformattedSource, WrittenSource: string;
   R: TLwptResult;
 begin
   SourcePath := FScratch + '/source/hello.pas';
@@ -340,6 +340,7 @@ begin
     '  WriteLn(''hello e2e'');'#10 +
     'end.'#10;
   WriteTextFile(SourcePath, UnformattedSource);
+  WrittenSource := ReadBinaryFile(SourcePath);
   try
     R := RunLwpt(['format', 'unexpected'], FScratch);
     Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
@@ -347,7 +348,7 @@ begin
       R.Stderr) > 0).ToBe(True);
     Expect<Boolean>(Pos('format takes no positional arguments', R.Stderr) > 0)
       .ToBe(True);
-    Expect<string>(ReadBinaryFile(SourcePath)).ToBe(UnformattedSource);
+    Expect<string>(ReadBinaryFile(SourcePath)).ToBe(WrittenSource);
   finally
     WriteTextFile(SourcePath, OriginalSource);
   end;
@@ -375,12 +376,13 @@ const
     'name = "preserve-me"'#10 +
     'version = "0.0.0"'#10;
 var
-  InitPath: string;
+  ExistingManifestOnDisk, InitPath: string;
   R: TLwptResult;
 begin
   InitPath := FScratch + '/init-positional-project';
   ForceDirectories(InitPath);
   WriteTextFile(InitPath + '/lwpt.toml', ExistingManifest);
+  ExistingManifestOnDisk := ReadBinaryFile(InitPath + '/lwpt.toml');
   R := RunLwpt(['init', 'unexpected', '--yes', '--force'], InitPath);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('lwpt init: unexpected argument "unexpected"',
@@ -388,7 +390,7 @@ begin
   Expect<Boolean>(Pos('init takes no positional arguments', R.Stderr) > 0)
     .ToBe(True);
   Expect<string>(ReadBinaryFile(InitPath + '/lwpt.toml')).ToBe(
-    ExistingManifest);
+    ExistingManifestOnDisk);
   Expect<Boolean>(DirectoryExists(InitPath + '/source')).ToBe(False);
 end;
 
