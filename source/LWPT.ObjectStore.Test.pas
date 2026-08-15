@@ -20,6 +20,7 @@ uses
 
 const
   ADMIT_CHILD_SWITCH = '--object-store-admit-child';
+  START_BARRIER_TIMEOUT_MS = 10000;
 
 var
   ReplacementSource: string;
@@ -34,7 +35,7 @@ type
     procedure ResetScratch;
     procedure WriteBytes(const APath, AText: string);
     function ReadBytes(const APath: string): string;
-    function StartAdmitter: TProcess;
+    function StartAdmitter(const AReadyPath, AReleasePath: string): TProcess;
   protected
     procedure BeforeAll; override;
     procedure BeforeEach; override;
@@ -53,14 +54,37 @@ type
     procedure TestPlatformDefaultUsesPerUserCacheLocation;
   end;
 
+procedure WriteSignal(const APath: string);
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmCreate);
+  Stream.Free;
+end;
+
+function WaitForSignal(const APath: string): Boolean;
+var
+  Started: QWord;
+begin
+  Started := GetTickCount64;
+  repeat
+    if FileExists(APath) then Exit(True);
+    Sleep(10);
+  until GetTickCount64 - Started >= START_BARRIER_TIMEOUT_MS;
+  Result := FileExists(APath);
+end;
+
 function RunChildMode: Boolean;
 var
   Store: TLWPTImmutableObjectStore;
 begin
   Result := False;
-  if (ParamCount <> 4) or (ParamStr(1) <> ADMIT_CHILD_SWITCH) then Exit;
+  if (ParamCount <> 6) or (ParamStr(1) <> ADMIT_CHILD_SWITCH) then Exit;
   Store := TLWPTImmutableObjectStore.Create(ParamStr(2));
   try
+    WriteSignal(ParamStr(5));
+    if not WaitForSignal(ParamStr(6)) then
+      raise Exception.Create('timed out waiting for object-store start barrier');
     Store.Admit(ParamStr(3), ParamStr(4));
   finally
     Store.Free;
@@ -135,7 +159,8 @@ begin
   if DirectoryExists(FScratch) then WipeDir(FScratch);
 end;
 
-function TObjectStoreContract.StartAdmitter: TProcess;
+function TObjectStoreContract.StartAdmitter(const AReadyPath,
+  AReleasePath: string): TProcess;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := ParamStr(0);
@@ -143,6 +168,8 @@ begin
   Result.Parameters.Add(FStoreRoot);
   Result.Parameters.Add(FSource);
   Result.Parameters.Add(FDigest);
+  Result.Parameters.Add(AReadyPath);
+  Result.Parameters.Add(AReleasePath);
   Result.Options := [poNoConsole];
   Result.Execute;
 end;
@@ -291,18 +318,37 @@ procedure TObjectStoreContract.
 var
   Store: TLWPTImmutableObjectStore;
   First, Second: TProcess;
-  HitPath: string;
+  FirstReady, SecondReady, ReleasePath, HitPath: string;
 begin
-  First := StartAdmitter;
-  Second := StartAdmitter;
+  FirstReady := FScratch + '/first-ready';
+  SecondReady := FScratch + '/second-ready';
+  ReleasePath := FScratch + '/release-admitters';
+  First := nil;
+  Second := nil;
   try
+    First := StartAdmitter(FirstReady, ReleasePath);
+    Second := StartAdmitter(SecondReady, ReleasePath);
+    Expect<Boolean>(WaitForSignal(FirstReady)).ToBe(True);
+    Expect<Boolean>(WaitForSignal(SecondReady)).ToBe(True);
+    WriteSignal(ReleasePath);
     First.WaitOnExit;
     Second.WaitOnExit;
     Expect<Integer>(First.ExitStatus).ToBe(0);
     Expect<Integer>(Second.ExitStatus).ToBe(0);
   finally
-    First.Free;
-    Second.Free;
+    if not FileExists(ReleasePath) then WriteSignal(ReleasePath);
+    if First <> nil then
+    begin
+      if First.Running then First.Terminate(1);
+      First.WaitOnExit;
+      First.Free;
+    end;
+    if Second <> nil then
+    begin
+      if Second.Running then Second.Terminate(1);
+      Second.WaitOnExit;
+      Second.Free;
+    end;
   end;
   Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
   try
