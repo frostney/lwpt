@@ -56,6 +56,10 @@ type
     procedure TestBuildModeSpaceSeparatedValueParses;
     procedure TestBuildModeEqualsSeparatedValueParses;
     procedure TestBuildModeInvalidValueExitsNonZero;
+    procedure TestInstallRejectsUnexpectedPositionalBeforeSideEffects;
+    procedure TestFormatRejectsUnexpectedPositionalBeforeSideEffects;
+    procedure TestRepairRejectsUnexpectedPositionalBeforeSideEffects;
+    procedure TestInitRejectsUnexpectedPositionalBeforeSideEffects;
     procedure TestVerboseFlagIsLongOnly;
     procedure TestSilentFlagIsSharedByEverySubcommand;
     procedure TestSuccessfulCommandReportsCompletion;
@@ -302,6 +306,90 @@ begin
     both the parse path AND the validation step. }
   R := RunLwpt(['build', 'hello', '--mode', 'totally-wrong'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestInstallRejectsUnexpectedPositionalBeforeSideEffects;
+var
+  MarkerPath: string;
+  R: TLwptResult;
+begin
+  MarkerPath := FScratch + '/.lwpt/tmp/unexpected-positional-marker';
+  WriteTextFile(MarkerPath, 'preserve');
+  R := RunLwpt(['install', 'first-unexpected', 'version'],
+    FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('lwpt install: unexpected argument "first-unexpected"',
+    R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('install takes no positional arguments', R.Stderr) > 0)
+    .ToBe(True);
+  Expect<Boolean>(FileExists(MarkerPath)).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestFormatRejectsUnexpectedPositionalBeforeSideEffects;
+var
+  OriginalSource, SourcePath, UnformattedSource: string;
+  R: TLwptResult;
+begin
+  SourcePath := FScratch + '/source/hello.pas';
+  OriginalSource := ReadBinaryFile(SourcePath);
+  UnformattedSource :=
+    'program hello;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'uses SysUtils, Classes;'#10 +
+    'begin'#10 +
+    '  WriteLn(''hello e2e'');'#10 +
+    'end.'#10;
+  WriteTextFile(SourcePath, UnformattedSource);
+  try
+    R := RunLwpt(['format', 'unexpected'], FScratch);
+    Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+    Expect<Boolean>(Pos('lwpt format: unexpected argument "unexpected"',
+      R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos('format takes no positional arguments', R.Stderr) > 0)
+      .ToBe(True);
+    Expect<string>(ReadBinaryFile(SourcePath)).ToBe(UnformattedSource);
+  finally
+    WriteTextFile(SourcePath, OriginalSource);
+  end;
+end;
+
+procedure TCLIOptionsE2E.TestRepairRejectsUnexpectedPositionalBeforeSideEffects;
+var
+  MarkerPath: string;
+  R: TLwptResult;
+begin
+  MarkerPath := FScratch + '/.lwpt/tmp/repair-positional-marker';
+  WriteTextFile(MarkerPath, 'preserve');
+  R := RunLwpt(['repair', 'unexpected'], FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('lwpt repair: unexpected argument "unexpected"',
+    R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('repair takes no positional arguments', R.Stderr) > 0)
+    .ToBe(True);
+  Expect<Boolean>(FileExists(MarkerPath)).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestInitRejectsUnexpectedPositionalBeforeSideEffects;
+const
+  ExistingManifest = '[package]'#10 +
+    'name = "preserve-me"'#10 +
+    'version = "0.0.0"'#10;
+var
+  InitPath: string;
+  R: TLwptResult;
+begin
+  InitPath := FScratch + '/init-positional-project';
+  ForceDirectories(InitPath);
+  WriteTextFile(InitPath + '/lwpt.toml', ExistingManifest);
+  R := RunLwpt(['init', 'unexpected', '--yes', '--force'], InitPath);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('lwpt init: unexpected argument "unexpected"',
+    R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('init takes no positional arguments', R.Stderr) > 0)
+    .ToBe(True);
+  Expect<string>(ReadBinaryFile(InitPath + '/lwpt.toml')).ToBe(
+    ExistingManifest);
+  Expect<Boolean>(DirectoryExists(InitPath + '/source')).ToBe(False);
 end;
 
 procedure TCLIOptionsE2E.TestVerboseFlagIsLongOnly;
@@ -830,6 +918,14 @@ begin
     TestBuildModeEqualsSeparatedValueParses);
   Test('build --mode invalid (unknown mode value) exits non-zero',
     TestBuildModeInvalidValueExitsNonZero);
+  Test('install rejects its first positional before cleaning install tmp',
+    TestInstallRejectsUnexpectedPositionalBeforeSideEffects);
+  Test('format rejects a positional before rewriting source',
+    TestFormatRejectsUnexpectedPositionalBeforeSideEffects);
+  Test('repair rejects a positional before cleaning project residue',
+    TestRepairRejectsUnexpectedPositionalBeforeSideEffects);
+  Test('init rejects a positional before overwriting project files',
+    TestInitRejectsUnexpectedPositionalBeforeSideEffects);
   Test('--verbose is long-only for build and test',
     TestVerboseFlagIsLongOnly);
   Test('--silent is inherited by every registered subcommand',
