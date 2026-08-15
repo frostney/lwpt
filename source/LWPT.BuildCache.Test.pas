@@ -41,6 +41,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestStoreAndMaterializePreserveVerifiedResult;
+    procedure TestMaterializeAppliesZeroUnixMode;
     procedure TestMissingResultReportsDeterministicReason;
     procedure TestInvalidFingerprintIsRefused;
     procedure TestCorruptArtifactIsRejected;
@@ -165,6 +166,29 @@ begin
   end;
 end;
 
+procedure TBuildCacheContract.TestMaterializeAppliesZeroUnixMode;
+var
+  Cache: TLWPTBuildCache;
+  Cached: TLWPTCachedBuildResult;
+  Destination, Reason: string;
+begin
+  Cache := TLWPTBuildCache.Create(FCacheRoot);
+  try
+    Cache.Store(TEST_FINGERPRINT, FArtifact, TEST_ARTIFACT_KIND, 0);
+    Destination := FScratch + '/session-zero-mode/bin/app';
+    Expect<Boolean>(Cache.Materialize(TEST_FINGERPRINT, Destination,
+      FScratch + '/session-zero-mode/tmp', Cached, Reason)).ToBe(True);
+    Expect<string>(Reason).ToBe('hit');
+    {$IFDEF UNIX}
+    Expect<Integer>(BuildArtifactUnixMode(Destination)).ToBe(0);
+    {$ELSE}
+    Expect<Boolean>(FileExists(Destination)).ToBe(True);
+    {$ENDIF}
+  finally
+    Cache.Free;
+  end;
+end;
+
 procedure TBuildCacheContract.TestMissingResultReportsDeterministicReason;
 var
   Cache: TLWPTBuildCache;
@@ -267,6 +291,8 @@ procedure TBuildCacheContract.SetupTests;
 begin
   Test('store and materialize preserve the verified result',
     TestStoreAndMaterializePreserveVerifiedResult);
+  Test('materialize applies a recorded zero Unix mode',
+    TestMaterializeAppliesZeroUnixMode);
   Test('missing results report a deterministic reason',
     TestMissingResultReportsDeterministicReason);
   Test('invalid fingerprints are refused', TestInvalidFingerprintIsRefused);

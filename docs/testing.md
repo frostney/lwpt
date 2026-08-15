@@ -241,7 +241,7 @@ inventory never touches the network.
 | **`source/LWPT.CompilerDriver.External.Test.pas`** | 10 tests in 1 suite | Runs a real short-lived proxy for probe and compile, proving canonical TOML stdin/stdout, live refresh, bounded raw stderr context, result/exit agreement, primary and extra-artifact confinement, explicit `--clean` rejection, writer-free empty-input cleanup across repeated short-lived children, timeout cleanup when a sleeping child never reads its large stdin, bounded writer cancellation when an escaped descendant retains stdin, retain/discard drainage plus tree termination after capture overflow, and callback streaming that drains without retained-output overflow. |
 | **`source/LWPT.CompilerDriver.Delphi.Test.pas`** | 12 tests in 1 suite | Pins the built-in opt-in profile, five verified executable/target tuples, live per-operation identity/version/target probes, bounded failure context, the Delphi 12 version floor, executable/header and requested-target mismatch failures without fallback, neutral argument translation, managed-option rejection, normalized source diagnostics including a zero-exit missing-artifact failure, and exact private artifact renaming without requiring a Delphi installation or license. |
 | **`source/LWPT.CompilerRegistry.Test.pas`** | 11 tests in 1 suite | Covers build-entry/project/host/built-in precedence, implicit FPC fallback, built-in Blaise and Lakon selection, the preserved host-command replacement of the Lakon adapter, manifest-over-host authority, case-insensitive caching, out-of-process host command registration, duplicate and protected-built-in-shadow rejection, and configured prefix arguments before adapter arguments. |
-| **`source/LWPT.BuildCache.Test.pas`** | 5 tests in 1 suite | Covers verified result manifests and artifact materialization, deterministic misses, invalid fingerprints, corrupt-artifact rejection, and concurrent cross-process publication without partial or mismatched results. |
+| **`source/LWPT.BuildCache.Test.pas`** | 6 tests in 1 suite | Covers verified result manifests and artifact materialization, Unix mode restoration, deterministic misses, invalid fingerprints, corrupt-artifact rejection, and concurrent cross-process publication without partial or mismatched results. |
 | **`source/LWPT.BuildSession.Test.pas`** | 31 tests in 1 suite (Unix); 26 tests in 1 suite (Windows) | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, distinct publication versus reusable-cache fingerprints, compiler/target/flag/environment cache inputs, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
 | **`source/LWPT.Command.Build.Test.pas`** | 4 tests in 1 suite | Covers compiler-process cancellation with output capture and child reaping, normal-exit descendant handling, non-zero exit-code reporting, and repeated process-tree state teardown without leaking its owned Windows Job Object handle. |
 | **`source/LWPT.CompilerDriver.FPC.Test.pas`** | 20 tests in 1 suite | Covers capability-probe caching, target dispatch, timeout cleanup, request compatibility, build/test argument translation, ordered extra-argument forwarding and validation, nil-driver rejection, version failures, stale-artifact classification, structured diagnostics, Windows executable-path normalization, and direct Windows bare-command PATH resolution. |
@@ -331,10 +331,10 @@ inventory never touches the network.
 <!-- lwpt:test-inventory-counts:begin -->
 | Tier | Files | Registered test cases |
 | --- | ---: | --- |
-| Unit | 33 | 561 Unix / 548 Windows |
+| Unit | 33 | 562 Unix / 549 Windows |
 | Integration | 23 | 274 Darwin / 273 Linux / 268 Windows |
 | E2E | 7 | 34 Darwin, Windows / 37 Linux |
-| **Total** | **63** | **869 Darwin / 871 Linux / 850 Windows** |
+| **Total** | **63** | **870 Darwin / 872 Linux / 851 Windows** |
 <!-- lwpt:test-inventory-counts:end -->
 
 ## TestingPascalLibrary self-test

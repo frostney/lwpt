@@ -104,7 +104,7 @@ end;
 function ApplyUnixMode(const APath: string; const AMode: Integer): Boolean;
 begin
   {$IFDEF UNIX}
-  if AMode <> 0 then Exit(FpChmod(APath, AMode) = 0);
+  Exit(FpChmod(APath, AMode) = 0);
   {$ENDIF}
   Result := True;
 end;
