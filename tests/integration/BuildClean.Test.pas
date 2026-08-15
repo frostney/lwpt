@@ -168,7 +168,20 @@ var
   CacheRoot: string;
   Environment: array of string;
   First, Second, Changed: TLwptResult;
-  Diagnostics: TStringList;
+  procedure RequireSuccessfulRun(const ALabel: string;
+    const ARun: TLwptResult);
+  var
+    Diagnostics: TStringList;
+  begin
+    if ARun.ExitCode = 0 then Exit;
+    Diagnostics := TStringList.Create;
+    try
+      DumpRunFailure(ALabel, ARun, 0, Diagnostics);
+      Fail(Diagnostics.Text);
+    finally
+      Diagnostics.Free;
+    end;
+  end;
 begin
   WipeOutputs;
   CacheRoot := FScratch + '/graph-cache';
@@ -212,23 +225,16 @@ begin
     + 'depends = ["alpha"] }'#10);
 
   First := RunLwpt(['build', '--verbose'], FScratch, Environment);
-  Expect<Integer>(First.ExitCode).ToBe(0);
+  RequireSuccessfulRun('first prerequisite build', First);
   Expect<Boolean>(Pos('cache hit:', First.Stdout) = 0).ToBe(True);
   Second := RunLwpt(['build', '--verbose'], FScratch, Environment);
-  Expect<Integer>(Second.ExitCode).ToBe(0);
+  RequireSuccessfulRun('second prerequisite build', Second);
   Expect<Boolean>(Pos('cache hit:', Second.Stdout) > 0).ToBe(True);
 
   WriteTextFile(FScratch + '/alpha-src/value.inc',
     'const GENERATED_VALUE = ''TWO'';'#10);
   Changed := RunLwpt(['build', '--verbose'], FScratch, Environment);
-  Diagnostics := TStringList.Create;
-  try
-    DumpRunFailure('changed prerequisite build', Changed, 0, Diagnostics);
-    if Changed.ExitCode <> 0 then Fail(Diagnostics.Text);
-  finally
-    Diagnostics.Free;
-  end;
-  Expect<Integer>(Changed.ExitCode).ToBe(0);
+  RequireSuccessfulRun('changed prerequisite build', Changed);
   Expect<Boolean>(Pos('cache hit:', Changed.Stdout) = 0).ToBe(True);
 end;
 
