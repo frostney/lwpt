@@ -48,7 +48,7 @@ program	*	e2e	tests/e2e/InstallBitbucket.E2E.Test.pas	1	4
 program	*	e2e	tests/e2e/InstallDirectArchivesWindows.E2E.Test.pas	1	3
 program	*	e2e	tests/e2e/InstallGitHub.E2E.Test.pas	1	6
 program	*	e2e	tests/e2e/InstallGitLab.E2E.Test.pas	1	4
-program	*	e2e	tests/e2e/InstallScript.E2E.Test.pas	2	11
+program	*	e2e	tests/e2e/InstallScript.E2E.Test.pas	3	13
 program	*	integration	tests/integration/AddRemove.Test.pas	1	8
 program	*	integration	tests/integration/Agents.Test.pas	1	15
 program	*	integration	tests/integration/BuildClean.Test.pas	1	4

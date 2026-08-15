@@ -46,7 +46,7 @@ Both code paths are dev-mode only; release builds always go through `./build/lwp
 After bootstrap:
 
 ```sh
-./build/lwpt --help     # top-level help; lists the 11 subcommands
+./build/lwpt --help     # top-level help; lists the 12 subcommands
 ```
 
 ## Daily commands
@@ -162,7 +162,7 @@ include = ["packages/*"]
 ./build/lwpt install
 ```
 
-`lwpt install` symlinks the package into `.lwpt/modules/testing/`; commit the symlink alongside the other deps (it's part of zero-install per ADR-0002).
+`lwpt install` publishes the package's validated snapshot into `.lwpt/modules/testing/`; commit that snapshot alongside the other deps (it's part of zero-install per ADR-0002). Re-run install after changing the workspace source.
 
 Create a co-located test next to the unit it covers, e.g. `source/MyUnit.Test.pas`:
 

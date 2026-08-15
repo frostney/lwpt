@@ -55,26 +55,17 @@ try {
   Invoke-WebRequest -Uri $Url -OutFile $ZipPath -UseBasicParsing
 
   $SumsPath = Join-Path $TempDir "checksums.txt"
-  $haveSums = $false
-  try {
-    Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsPath -UseBasicParsing -ErrorAction Stop
-    $haveSums = $true
-  } catch {
-    Write-Warning "install.ps1: no checksums file at $SumsUrl — skipping verification"
-  }
+  Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsPath -UseBasicParsing -ErrorAction Stop
 
-  if ($haveSums) {
-    Write-Host "Verifying checksum"
-    $line = Get-Content $SumsPath | Where-Object { $_ -match " $([regex]::Escape($Asset))$" } | Select-Object -First 1
-    if (-not $line) {
-      Write-Warning "install.ps1: no checksum entry for $Asset — skipping verification"
-    } else {
-      $expected = ($line -split '\s+')[0].ToLower()
-      $actual = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLower()
-      if ($expected -ne $actual) {
-        throw "install.ps1: checksum mismatch — expected $expected, got $actual"
-      }
-    }
+  Write-Host "Verifying checksum"
+  $line = Get-Content $SumsPath | Where-Object { $_ -match " $([regex]::Escape($Asset))$" } | Select-Object -First 1
+  if (-not $line) {
+    throw "install.ps1: checksums file has no entry for $Asset"
+  }
+  $expected = ($line -split '\s+')[0].ToLower()
+  $actual = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLower()
+  if ($expected -ne $actual) {
+    throw "install.ps1: checksum mismatch — expected $expected, got $actual"
   }
 
   Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force

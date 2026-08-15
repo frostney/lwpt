@@ -102,6 +102,20 @@ type
     procedure TestInvalidSuccessfulResponseFails;
   end;
 
+  TInstallScriptVerificationTests = class(TTestSuite)
+  private
+    FBinDir, FInstallPath, FScratch: string;
+    FSkipped: Boolean;
+    function RunMode(const AMode: string; out AStderr: string): Integer;
+  protected
+    procedure BeforeAll; override;
+    procedure AfterAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestMissingChecksumsFileFails;
+    procedure TestMissingChecksumEntryFails;
+  end;
+
   TInstallScriptE2E = class(TTestSuite)
   private
     FOrigDir, FScratch, FBinDir, FRepoRoot, FResolvedTag: string;
@@ -595,6 +609,95 @@ begin
     TestInvalidSuccessfulResponseFails);
 end;
 
+function TInstallScriptVerificationTests.RunMode(const AMode: string;
+  out AStderr: string): Integer;
+var InstallOut: string;
+begin
+  Result := RunSh(
+    [FInstallPath],
+    FScratch,
+    ['PATH=' + FBinDir + ':/usr/bin:/bin',
+     'LWPT_VERSION=v1.2.3',
+     'INSTALL_DIR=' + FScratch + '/install',
+     'INSTALL_CHECKSUM_MODE=' + AMode],
+    InstallOut,
+    AStderr);
+end;
+
+procedure TInstallScriptVerificationTests.BeforeAll;
+var CurlPath: string;
+begin
+  FSkipped := False;
+  {$IFNDEF UNIX}
+  FSkipped := True;
+  WriteLn('  [skip] install.sh checksum fixtures require /bin/sh; '
+        + 'skipped on non-Unix');
+  Exit;
+  {$ENDIF}
+
+  FScratch := CreateScratchRoot('install-script-verification');
+  FBinDir := FScratch + '/bin';
+  FInstallPath := GetCurrentDir + '/scripts/install.sh';
+  ForceDirectories(FBinDir);
+  CurlPath := FBinDir + '/curl';
+  WriteTextFile(CurlPath,
+    '#!/bin/sh'#10 +
+    'Output=""'#10 +
+    'URL=""'#10 +
+    'while [ "$#" -gt 0 ]; do'#10 +
+    '  case "$1" in'#10 +
+    '    -o) Output="$2"; shift 2 ;;'#10 +
+    '    -*) shift ;;'#10 +
+    '    *) URL="$1"; shift ;;'#10 +
+    '  esac'#10 +
+    'done'#10 +
+    'case "$URL" in'#10 +
+    '  *-checksums.txt)'#10 +
+    '    case "$INSTALL_CHECKSUM_MODE" in'#10 +
+    '      missing-file)'#10 +
+    '        printf ''curl: (22) The requested URL returned error: 404\n'' >&2'#10 +
+    '        exit 22 ;;'#10 +
+    '      missing-entry)'#10 +
+    '        printf ''deadbeef  another-asset.tar.gz\n'' > "$Output" ;;'#10 +
+    '    esac ;;'#10 +
+    '  *) printf ''not-an-archive'' > "$Output" ;;'#10 +
+    'esac'#10);
+  {$IFDEF UNIX}
+  if FpChmod(PChar(CurlPath), &755) <> 0 then RaiseLastOSError;
+  {$ENDIF}
+end;
+
+procedure TInstallScriptVerificationTests.AfterAll;
+begin
+  if not FSkipped then RecursiveDelete(FScratch);
+end;
+
+procedure TInstallScriptVerificationTests.TestMissingChecksumsFileFails;
+var InstallStderr: string;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Expect<Boolean>(RunMode('missing-file', InstallStderr) <> 0).ToBe(True);
+  Expect<Boolean>(Pos('could not download checksums file',
+    InstallStderr) > 0).ToBe(True);
+end;
+
+procedure TInstallScriptVerificationTests.TestMissingChecksumEntryFails;
+var InstallStderr: string;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Expect<Boolean>(RunMode('missing-entry', InstallStderr) <> 0).ToBe(True);
+  Expect<Boolean>(Pos('checksums file has no entry',
+    InstallStderr) > 0).ToBe(True);
+end;
+
+procedure TInstallScriptVerificationTests.SetupTests;
+begin
+  Test('missing checksums file fails closed',
+    TestMissingChecksumsFileFails);
+  Test('missing asset entry fails closed',
+    TestMissingChecksumEntryFails);
+end;
+
 procedure TInstallScriptE2E.BeforeAll;
 var
   InstallOut: string;
@@ -747,6 +850,8 @@ end;
 begin
   TestRunnerProgram.AddSuite(TLatestTagResolutionTests.Create(
     'latest-release resolution classification (E2E)'));
+  TestRunnerProgram.AddSuite(TInstallScriptVerificationTests.Create(
+    'install.sh: checksum verification (E2E)'));
   TestRunnerProgram.AddSuite(TInstallScriptE2E.Create(
     'install.sh: latest-release smoke (E2E)'));
   TestRunnerProgram.Run;
