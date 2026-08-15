@@ -271,6 +271,16 @@ below the session for diagnosis. `--clean` means fresh session staging plus a
 forced compiler rebuild; it does not sweep `build/`, delete the running LWPT
 executable, or remove another process's output.
 
+Build reuse is a separate per-user namespace over `LWPT.ObjectStore`. Its
+schema-versioned fingerprint excludes session paths and the previous public
+artifact while covering the neutral request, effective driver invocation,
+source/resource/workspace/dependency content, target, hooks, and relevant
+environment. A hit is hash-verified into the new session and still crosses the
+ordinary postbuild and publication boundary. A miss reports a stable reason;
+`--no-cache` reports `disabled` and performs neither lookup nor admission.
+Only a successfully published candidate is stored, so failures, cancellation,
+staleness, and hook failures cannot seed later hits.
+
 Per-entry postbuild hooks run before publication with the private candidate
 in `LWPT_BUILD_OUTPUT`, the requested path in `LWPT_BUILD_PUBLIC_OUTPUT`, and
 the entry name in `LWPT_BUILD_ENTRY`. Runtime retargeting also maps existing

@@ -306,7 +306,7 @@ begin
   WriteTextFile(Project + '/source/app.pas',
     'program app;'#10'begin'#10'end.'#10);
 
-  Run := RunLwptWithWorkerEnv(['build'], Project, []);
+  Run := RunLwptWithWorkerEnv(['build', '--no-cache'], Project, []);
   DumpRunFailure('deep default session root', Run, 1);
   Expect<Integer>(Run.ExitCode).ToBe(1);
   {$IFNDEF MSWINDOWS}
@@ -330,14 +330,14 @@ begin
     + #10
     + '[build]'#10
     + 'app = { source = "source/app.pas", output = "build/app" }'#10);
-  Run := RunLwptWithWorkerEnv(['build'], Project, []);
+  Run := RunLwptWithWorkerEnv(['build', '--no-cache'], Project, []);
   DumpRunFailure('deep manifest session root', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<Boolean>(DirectoryExists(ManifestRoot)).ToBe(True);
 
   RelativeEnvironmentRoot := ExtractRelativePath(
     IncludeTrailingPathDelimiter(Project), EnvironmentRoot);
-  Run := RunLwptWithWorkerEnv(['build', '--clean'], Project,
+  Run := RunLwptWithWorkerEnv(['build', '--clean', '--no-cache'], Project,
     [BUILD_SESSION_DIR_ENV + '=' + RelativeEnvironmentRoot]);
   DumpRunFailure('deep environment session root', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
@@ -493,7 +493,8 @@ function TBuildSessions.StartBuildWithEnv(
   const AProject, AEntry: string;
   const AExtraEnv: array of string): TProcess;
 begin
-  Result := StartBuildWithArgs(AProject, ['build', AEntry], AExtraEnv);
+  Result := StartBuildWithArgs(AProject,
+    ['build', '--no-cache', AEntry], AExtraEnv);
 end;
 
 function TBuildSessions.StartBuildWithArgs(const AProject: string;
@@ -787,11 +788,11 @@ var
   BeforeContent, AfterContent: string;
   R: TLwptResult;
 begin
-  R := RunLwptWithWorkerEnv(['build', 'app'], FScratch, []);
+  R := RunLwptWithWorkerEnv(['build', '--no-cache', 'app'], FScratch, []);
   Expect<Integer>(R.ExitCode).ToBe(0);
   BeforeContent := ReadBinaryFile(ExpectedExe(FScratch + '/build/app'));
 
-  R := RunLwptWithWorkerEnv(['build', '--clean', 'app'], FScratch,
+  R := RunLwptWithWorkerEnv(['build', '--clean', '--no-cache', 'app'], FScratch,
     [FPC_ENV + '=' + FScratch + '/missing-fpc']);
 
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
@@ -970,7 +971,8 @@ begin
   Env[4] := TEST_FPC_RELEASE_DIR_ENV + '=' + ReleaseDir;
   Env[5] := WORKER_STATE_DIR_ENV + '=' + Project + '/worker-state';
   Env[6] := WORKER_BUDGET_ENV + '=4';
-  Build := StartBuildWithArgs(Project, ['build', 'app'], Env);
+  Build := StartBuildWithArgs(Project,
+    ['build', '--no-cache', 'app'], Env);
   try
     Started := Now;
     while Build.Running
@@ -1042,7 +1044,7 @@ begin
   Env[5] := WORKER_STATE_DIR_ENV + '=' + Project + '/worker-state';
   Env[6] := WORKER_BUDGET_ENV + '=4';
   Build := StartBuildWithArgs(Project,
-    ['build', 'app', '--jobs=1'], Env);
+    ['build', '--no-cache', 'app', '--jobs=1'], Env);
   try
     Started := Now;
     while Build.Running and not EntryReady(ReadyDir, 'alpha') do
@@ -1113,7 +1115,7 @@ begin
   Env[6] := WORKER_STATE_DIR_ENV + '=' + Project + '/worker-state';
   Env[7] := WORKER_BUDGET_ENV + '=4';
   try
-    R := RunLwptWithWorkerEnv(['build'], Project, Env);
+    R := RunLwptWithWorkerEnv(['build', '--no-cache'], Project, Env);
     Expect<Integer>(R.ExitCode).ToBe(1);
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/beta')))
       .ToBe(True);
@@ -1208,7 +1210,7 @@ begin
     WorkerRootExistedBefore := DirectoryExists(WorkerStateRoot);
     TransactionLockExistedBefore := FileExists(WorkerTransactionLock);
     RunResult := RunLwptWithWorkerEnv(
-      ['build', 'alpha', 'beta'], Project, QuietEnvironment);
+      ['build', '--no-cache', 'alpha', 'beta'], Project, QuietEnvironment);
     DumpObservableFailure('observable: quiet build', Project,
       WorkerStateRoot, WorkerRootExistedBefore,
       TransactionLockExistedBefore, RunResult);
@@ -1222,7 +1224,8 @@ begin
     WorkerRootExistedBefore := DirectoryExists(WorkerStateRoot);
     TransactionLockExistedBefore := FileExists(WorkerTransactionLock);
     RunResult := RunLwptWithWorkerEnv(
-      ['build', 'alpha', 'beta', '--verbose'], Project, Environment);
+      ['build', '--no-cache', 'alpha', 'beta', '--verbose'], Project,
+      Environment);
     DumpObservableFailure('observable: verbose build', Project,
       WorkerStateRoot, WorkerRootExistedBefore,
       TransactionLockExistedBefore, RunResult);
@@ -1298,7 +1301,8 @@ begin
     Environment[3] := WORKER_STALE_SECONDS_ENV + '='
       + IntToStr(TestWorkerHeartbeatStaleSeconds);
     Sleep(TestDelayedContenderStartMilliseconds);
-    RunResult := RunLwpt(['build', 'alpha'], Project, Environment);
+    RunResult := RunLwpt(['build', '--no-cache', 'alpha'], Project,
+      Environment);
 
     DumpRunFailure('contended: queued build', RunResult, 0);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
@@ -1343,7 +1347,7 @@ begin
   try
     WorkerRootExistedBefore := DirectoryExists(WorkerStateRoot);
     TransactionLockExistedBefore := FileExists(WorkerTransactionLock);
-    RunResult := RunLwptWithWorkerEnv(['build', 'alpha'], Project,
+    RunResult := RunLwptWithWorkerEnv(['build', '--no-cache', 'alpha'], Project,
       Environment);
     DumpObservableFailure('observable: controlled failure', Project,
       WorkerStateRoot, WorkerRootExistedBefore,

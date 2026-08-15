@@ -4,7 +4,7 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 
 ## Executive Summary
 
-- **The contract:** single entry point from repo root (`./build/lwpt build`), a clean development build of every binary by default, named build entries as positional args, `--mode dev` (default) / `--mode release`, `--clean` flag, single `build/` output directory.
+- **The contract:** single entry point from repo root (`./build/lwpt build`), a development build of every binary by default, named build entries as positional args, `--mode dev` (default) / `--mode release`, verified reusable results by default, `--clean` and `--no-cache` controls, and one public `build/` output directory.
 - **Self-host.** LWPT's own `lwpt.toml` declares `lwpt` as a `[build]` entry; `lwpt build` rebuilds the binary that just ran. See [ADR-0005](./adr/0005-self-host-build.md).
 - **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev translation in `TLWPTFPCCompilerDriver.BuildArguments`.
 - **Compiler output is invocation-private.** FPC executables and intermediates
@@ -12,6 +12,11 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   executable is
   atomically published to its manifest `output` only after its declared inputs
   are revalidated.
+- **Completed builds are reused by verified identity.** A compiler-neutral
+  fingerprint selects immutable result manifests and artifact objects below
+  the per-user cache root. Every hit re-hashes the artifact before placing it
+  in a private session; `--no-cache` bypasses both lookup and storage, while
+  `--clean` forces compilation for that invocation.
 - **Compiler-default target unless the build entry selects one.** An optional
   build-entry `target` table carries OS, architecture, ABI, and environment
   independently from the compiler profile. Omission uses the driver's first
@@ -51,6 +56,7 @@ Every project on this stack satisfies the build-system contract from `native-nos
 | Bounded parallelism | Ready entries overlap by default; `--jobs=<n>` sets the invocation ceiling and the machine worker budget may lower it |
 | Dev / prod distinction | `--mode dev` (default) / `--mode release` |
 | Clean selection | `--clean` flag; combined: `lwpt build --clean cli` forces a full compile in fresh private staging |
+| Cache bypass | `--no-cache` forces compilation without reading or writing reusable build results |
 | Single public output directory | Completed binaries land at the selected entry's `output`, conventionally under `build/`; compiler intermediates remain session-private |
 
 ## Self-host
@@ -94,6 +100,23 @@ empty private staging; clean additionally passes `-B` for dev mode (release
 already includes it) to force recompilation. The last successful executable,
 another live session, legacy `build/targets/` directories, source-adjacent
 artefacts, and the currently running LWPT executable remain untouched.
+
+Without `--clean` or `--no-cache`, LWPT first captures a versioned neutral
+cache fingerprint. It covers source and resource content, resolved lockfile and
+module state, workspace inputs, the compiler driver identity, executable and
+live version, the target tuple, effective translated arguments, hooks, and
+compiler-relevant environment. A verified hit is copied into the invocation's
+private session and follows the same postbuild, live-probe, fingerprint
+revalidation, and atomic-publication path as a newly compiled artifact.
+
+Successful, current builds publish an immutable artifact object and result
+manifest only after public-output publication succeeds. Failed, cancelled,
+stale, or postbuild-failed candidates never enter the reusable store. Corrupt
+references, manifests, and artifact objects become deterministic misses rather
+than hits. The default root is the platform cache location documented in
+[ADR-0036](./adr/0036-per-user-dependency-archive-cas.md), and
+`LWPT_CACHE_DIR` relocates the shared root for both dependency and build
+namespaces. See [ADR-0037](./adr/0037-verified-build-result-cache.md).
 
 When a build fails with output matching a stale-artefact signature (internal
 compiler exception, resource-compile errors, missing `.reslst`), `lwpt build`
@@ -238,8 +261,8 @@ Successful sessions remove compiler jobs and compiled hooks but retain stable
 job logs and completed state for diagnosis. Failed, stale, or interrupted
 sessions retain their private diagnostics. `lwpt repair` removes inactive
 sessions only after their OS-held owner guard is absent; malformed state fails
-closed while its guard remains held. Artifact reuse is deliberately absent
-here and belongs to the content-addressed cache work.
+closed while its guard remains held. Reusable artifacts remain separate from
+session ownership and are admitted only after successful publication.
 
 `[version]` include files are staged beside their destination and generated
 through true same-filesystem replacement before fingerprinting, so concurrent

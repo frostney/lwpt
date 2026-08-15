@@ -82,10 +82,10 @@ procedure ConfigureProcessEnvironment(const AProcess: TProcess;
 
 { When a nested LWPT run exits with an unexpected code, its captured
   output is the only evidence of why. Call this before the exit-code
-  assertion: on mismatch it writes the captured stdout/stderr to
-  ADiagnostics when supplied. Otherwise, it writes them to the suite's
-  stdout, which the scheduler's failure replay surfaces directly in CI
-  logs. No-op when the exit code matches. }
+  assertion: on mismatch it appends the captured stdout/stderr to
+  ADiagnostics when supplied, allowing the caller to include it in an
+  assertion failure. Existing callers without a diagnostic buffer retain
+  the direct stderr fallback. No-op when the exit code matches. }
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
   const AExpectedExit: Integer; const ADiagnostics: TStrings = nil);
 
@@ -391,7 +391,7 @@ procedure WriteRunDiagnostic(const ALine: string;
   const ADiagnostics: TStrings);
 begin
   if Assigned(ADiagnostics) then ADiagnostics.Add(ALine)
-  else WriteLn(ALine);
+  else WriteLn(ErrOutput, ALine);
 end;
 
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
