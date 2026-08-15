@@ -168,6 +168,7 @@ var
   CacheRoot: string;
   Environment: array of string;
   First, Second, Changed: TLwptResult;
+  Diagnostics: TStringList;
 begin
   WipeOutputs;
   CacheRoot := FScratch + '/graph-cache';
@@ -220,7 +221,13 @@ begin
   WriteTextFile(FScratch + '/alpha-src/value.inc',
     'const GENERATED_VALUE = ''TWO'';'#10);
   Changed := RunLwpt(['build', '--verbose'], FScratch, Environment);
-  DumpRunFailure('changed prerequisite build', Changed, 0);
+  Diagnostics := TStringList.Create;
+  try
+    DumpRunFailure('changed prerequisite build', Changed, 0, Diagnostics);
+    if Changed.ExitCode <> 0 then Fail(Diagnostics.Text);
+  finally
+    Diagnostics.Free;
+  end;
   Expect<Integer>(Changed.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('cache hit:', Changed.Stdout) = 0).ToBe(True);
 end;
