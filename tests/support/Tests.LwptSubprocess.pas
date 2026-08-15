@@ -83,10 +83,11 @@ procedure ConfigureProcessEnvironment(const AProcess: TProcess;
 { When a nested LWPT run exits with an unexpected code, its captured
   output is the only evidence of why. Call this before the exit-code
   assertion: on mismatch it appends the captured stdout/stderr to
-  ADiagnostics so the caller can include it in the assertion failure.
-  No-op when the exit code matches. }
+  ADiagnostics when supplied, allowing the caller to include it in an
+  assertion failure. Existing callers without a diagnostic buffer retain
+  the direct stderr fallback. No-op when the exit code matches. }
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
-  const AExpectedExit: Integer; const ADiagnostics: TStrings);
+  const AExpectedExit: Integer; const ADiagnostics: TStrings = nil);
 
 { Quick helper for "is the env saying skip network?". E2E tests that
   touch the live internet should consult this and self-skip via a
@@ -389,7 +390,8 @@ end;
 procedure WriteRunDiagnostic(const ALine: string;
   const ADiagnostics: TStrings);
 begin
-  ADiagnostics.Add(ALine);
+  if Assigned(ADiagnostics) then ADiagnostics.Add(ALine)
+  else WriteLn(ErrOutput, ALine);
 end;
 
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
