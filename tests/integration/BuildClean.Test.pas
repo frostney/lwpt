@@ -220,6 +220,7 @@ begin
   WriteTextFile(FScratch + '/alpha-src/value.inc',
     'const GENERATED_VALUE = ''TWO'';'#10);
   Changed := RunLwpt(['build', '--verbose'], FScratch, Environment);
+  DumpRunFailure('changed prerequisite build', Changed, 0);
   Expect<Integer>(Changed.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('cache hit:', Changed.Stdout) = 0).ToBe(True);
 end;
