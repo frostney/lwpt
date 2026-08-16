@@ -1361,8 +1361,10 @@ begin
           [Iteration, SiblingSlowSources[SourceIndex], CompilerPID]));
       if FileExists(SourcePIDFile + NestedCompilerNaturalExitSuffix) then
       begin
-        if NaturalExitSources <> '' then NaturalExitSources += ', ';
-        NaturalExitSources += SiblingSlowSources[SourceIndex];
+        if NaturalExitSources <> '' then
+          NaturalExitSources := NaturalExitSources + ', ';
+        NaturalExitSources := NaturalExitSources
+          + SiblingSlowSources[SourceIndex];
       end;
     end;
     if Pos('A.Slow.Test.pas ... ERROR', CommandResult.Stdout) = 0 then
