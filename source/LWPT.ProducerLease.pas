@@ -482,11 +482,11 @@ begin
           end;
         until FindNext(KeySearch) <> 0;
       finally
-        FindClose(KeySearch);
+        SysUtils.FindClose(KeySearch);
       end;
     until FindNext(PrefixSearch) <> 0;
   finally
-    FindClose(PrefixSearch);
+    SysUtils.FindClose(PrefixSearch);
   end;
 end;
 

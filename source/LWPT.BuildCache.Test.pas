@@ -38,7 +38,8 @@ type
     procedure WriteBytes(const APath, AText: string);
     function ReadBytes(const APath: string): string;
     function ObjectPath(const ADigest: string): string;
-    function StartStoreChild(const AArtifact: string): TProcess;
+    function StartStoreChild(const AArtifact: string;
+      const ABudget: string = ''): TProcess;
   protected
     procedure BeforeAll; override;
     procedure BeforeEach; override;
@@ -94,18 +95,21 @@ begin
   {$ENDIF}
 end;
 
-function RunChildMode: Boolean;
+function RunChildMode(out AExitCode: Integer): Boolean;
 var
   Cache: TLWPTBuildCache;
+  Stored: Boolean;
 begin
   Result := False;
+  AExitCode := 0;
   if (ParamCount <> 4) or (ParamStr(1) <> STORE_CHILD_SWITCH) then Exit;
   Cache := TLWPTBuildCache.Create(ParamStr(2));
   try
-    Cache.Store(TEST_FINGERPRINT, ParamStr(3), ParamStr(4));
+    Stored := Cache.Store(TEST_FINGERPRINT, ParamStr(3), ParamStr(4));
   finally
     Cache.Free;
   end;
+  if not Stored then AExitCode := 3;
   Result := True;
 end;
 
@@ -178,25 +182,28 @@ end;
 procedure TBuildCacheContract.TestBudgetRefusalLeavesNoPartialResult;
 var
   ArtifactDigest: string;
-  Cache: TLWPTBuildCache;
+  Child: TProcess;
 begin
-  SetBudgetEnvironment(IntToStr(Length(ReadBytes(FArtifact))));
   ArtifactDigest := 'sha256:' + SHA256File(FArtifact);
-  Cache := TLWPTBuildCache.Create(FCacheRoot);
+  Child := StartStoreChild(FArtifact,
+    IntToStr(Length(ReadBytes(FArtifact))));
   try
-    Expect<Boolean>(Cache.Store(TEST_FINGERPRINT, FArtifact,
-      TEST_ARTIFACT_KIND)).ToBe(False);
+    Child.WaitOnExit;
+    Expect<Integer>(Child.ExitStatus).ToBe(3);
     Expect<Boolean>(FileExists(ObjectPath(ArtifactDigest))).ToBe(False);
     Expect<Boolean>(FileExists(FCacheRoot + '/build-results/refs/sha256/'
       + Copy(TEST_FINGERPRINT, 8, 2) + '/'
       + Copy(TEST_FINGERPRINT, 10, MaxInt))).ToBe(False);
   finally
-    Cache.Free;
+    Child.Free;
   end;
 end;
 
 function TBuildCacheContract.StartStoreChild(
-  const AArtifact: string): TProcess;
+  const AArtifact: string; const ABudget: string): TProcess;
+var
+  EnvironmentIndex: Integer;
+  Prefix: string;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := ParamStr(0);
@@ -204,6 +211,16 @@ begin
   Result.Parameters.Add(FCacheRoot);
   Result.Parameters.Add(AArtifact);
   Result.Parameters.Add(TEST_ARTIFACT_KIND);
+  if ABudget <> '' then
+  begin
+    AppendProcessEnvironment(Result.Environment);
+    Prefix := CACHE_MAX_BYTES_ENV + '=';
+    for EnvironmentIndex := Result.Environment.Count - 1 downto 0 do
+      if Copy(Result.Environment[EnvironmentIndex], 1, Length(Prefix)) = Prefix
+         then
+        Result.Environment.Delete(EnvironmentIndex);
+    Result.Environment.Add(Prefix + ABudget);
+  end;
   Result.Options := [poNoConsole];
   Result.Execute;
 end;
@@ -372,8 +389,10 @@ begin
     TestBudgetRefusalLeavesNoPartialResult);
 end;
 
+var
+  ChildExitCode: Integer;
 begin
-  if RunChildMode then Halt(0);
+  if RunChildMode(ChildExitCode) then Halt(ChildExitCode);
   TestRunnerProgram.AddSuite(TBuildCacheContract.Create(
     'build cache: verified result storage'));
   TestRunnerProgram.Run;
