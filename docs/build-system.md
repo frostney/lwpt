@@ -113,10 +113,15 @@ Successful, current builds publish an immutable artifact object and result
 manifest only after public-output publication succeeds. Failed, cancelled,
 stale, or postbuild-failed candidates never enter the reusable store. Corrupt
 references, manifests, and artifact objects become deterministic misses rather
-than hits. The default root is the platform cache location documented in
+than hits. Concurrent missing fingerprints share one local producer lease;
+waiters name the fingerprint they are waiting for, recheck the verified result,
+and may abandon independently. A crashed producer releases its OS-held guard
+for safe takeover, while heartbeat age alone cannot displace a live long-running
+compile. The default root is the platform cache location documented in
 [ADR-0036](./adr/0036-per-user-dependency-archive-cas.md), and
 `LWPT_CACHE_DIR` relocates the shared root for both dependency and build
-namespaces. See [ADR-0037](./adr/0037-verified-build-result-cache.md).
+namespaces. See [ADR-0037](./adr/0037-verified-build-result-cache.md) and
+[ADR-0038](./adr/0038-local-producer-leases.md).
 
 When a build fails with output matching a stale-artefact signature (internal
 compiler exception, resource-compile errors, missing `.reslst`), `lwpt build`

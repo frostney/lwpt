@@ -44,6 +44,7 @@ type
       AAcknowledgementDeadline: QWord);
     procedure Cancel;
     procedure CompleteCancel;
+    function IsCancelled: Boolean;
   end;
 
 function CmdBuild(const AManifestPath: string;
@@ -71,6 +72,7 @@ uses
   LWPT.CompilerDriver,
   LWPT.Manifest,
   LWPT.Observability,
+  LWPT.ProducerLease,
   LWPT.ProgressReporter,
   LWPT.WorkerBudget;
 
@@ -89,6 +91,7 @@ type
     CacheSnapshot: string;
     CacheDiagnostic: string;
     CacheUnixMode: Integer;
+    ProducerLease: TLWPTProducerLease;
     ProjectRoot: string;
     CfgPath: string;
     ModulesPath: string;
@@ -107,6 +110,7 @@ type
     FRelease: Boolean;
     FClean: Boolean;
     FSession: TLWPTBuildSession;
+    FWorkerSession: TLWPTWorkerBudgetSession;
     FLease: TLWPTWorkerLease;
     FDriver: TLWPTCompilerDriver;
     FCompiler: TLWPTCompilerProcess;
@@ -127,7 +131,9 @@ type
     constructor Create(const AManifestPath: string;
       const AManifest: TManifest; const AManifestContentHash: string;
       const AEntry: TLWPTBuildEntry; const ARelease, AClean: Boolean;
-      const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
+      const ASession: TLWPTBuildSession;
+      const AWorkerSession: TLWPTWorkerBudgetSession;
+      const ALease: TLWPTWorkerLease;
       const ADriver: TLWPTCompilerDriver; const ACache: TLWPTBuildCache;
       const AUseCache: Boolean);
     destructor Destroy; override;
@@ -136,7 +142,7 @@ type
     procedure Cancel;
     procedure CompleteCancel;
     function IsDone: Boolean;
-    property Compiled: TLWPTCompiledEntry read FCompiled;
+    function TakeCompiled: TLWPTCompiledEntry;
     property BuildResult: TLWPTBuildResult read FBuildResult;
     property CompilerExitCode: Integer read FCompilerExitCode;
     property CapturedOutput: string read FOutput;
@@ -287,6 +293,16 @@ begin
   EnterCriticalSection(FCriticalSection);
   try
     if Assigned(FRunner) then FRunner.CompleteCancel;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+end;
+
+function TLWPTCompilerProcess.IsCancelled: Boolean;
+begin
+  EnterCriticalSection(FCriticalSection);
+  try
+    Result := FCancelled;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
@@ -524,7 +540,8 @@ end;
 function BuildOneEntry(const AManifestPath: string; const AMan: TManifest;
   const AManifestContentHash: string;
   const T: TLWPTBuildEntry; ARelease, AClean: Boolean;
-  ASession: TLWPTBuildSession; ACompiler: TLWPTCompilerProcess;
+  ASession: TLWPTBuildSession; AWorkerSession: TLWPTWorkerBudgetSession;
+  var AWorkerLease: TLWPTWorkerLease; ACompiler: TLWPTCompilerProcess;
   ADriver: TLWPTCompilerDriver; ACache: TLWPTBuildCache;
   const AUseCache: Boolean; out ACompiled: TLWPTCompiledEntry;
   out ABuildResult: TLWPTBuildResult; out AOutput: string;
@@ -538,13 +555,82 @@ var
   i, FpcExit : Integer;
   Capabilities: TLWPTCompilerCapabilities;
   CachedResult: TLWPTCachedBuildResult;
+  ProducerSnapshot: TLWPTProducerLeaseSnapshot;
   Failure: TLWPTCompilerFailure;
   Request: TLWPTBuildPublicationRequest;
   CacheRequest: TLWPTBuildRequest;
   ScanDirs: LWPT.Core.TStringArray;
+  LastProgressAt, WaitNow, WaitStartedAt: QWord;
+  ReleasingWorkerForWait: Boolean;
+
+  function RevalidateWaitedFingerprint: Boolean;
+  begin
+    Result := CaptureBuildCacheFingerprint(ProjectRoot,
+      AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request)
+      = CacheFingerprint;
+    if not Result then Exit;
+    { An equivalent producer may have changed only the public output while
+      this invocation waited. Refresh that publication precondition after
+      proving all reusable-result inputs still address the same object. }
+    Fingerprint := CaptureBuildPublicationFingerprint(ProjectRoot,
+      AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
+  end;
+
+  function AcceptCachedResult(const ADiagnostic: string): Boolean;
+  begin
+    Result := False;
+    if CachedResult.ArtifactKind <> Request.BuildRequest.OutputKind then
+    begin
+      SysUtils.DeleteFile(CandidateBin);
+      CacheReason := 'result-kind-mismatch';
+      Exit;
+    end;
+    ABuildResult := DefaultBuildResult;
+    ABuildResult.Success := True;
+    SetLength(ABuildResult.Artifacts, 1);
+    ABuildResult.Artifacts[0].Kind := CachedResult.ArtifactKind;
+    ABuildResult.Artifacts[0].Path := CandidateBin;
+    ABuildResult.Artifacts[0].Digest := CachedResult.ArtifactDigest;
+    ValidateBuildResult(ABuildResult);
+    ValidateReportedArtifacts(ADriver.CompilerID,
+      Request.BuildRequest, ABuildResult);
+    ACompilerExitCode := 0;
+    AOutput := ADiagnostic + ': ' + CacheFingerprint + LineEnding;
+    ACompiled.Name := T.Name;
+    ACompiled.CandidateBin := CandidateBin;
+    ACompiled.OutBin := OutBin;
+    ACompiled.Fingerprint := Fingerprint;
+    ACompiled.CacheFingerprint := CacheFingerprint;
+    ACompiled.CacheDiagnostic := ADiagnostic;
+    ACompiled.ProjectRoot := ProjectRoot;
+    ACompiled.CfgPath := CfgPath;
+    ACompiled.ModulesPath := ModulesPath;
+    ACompiled.Request := Request;
+    ACompiled.PostBuild := RetargetPostBuildHooks(T.PostBuild,
+      OutBin, CandidateBin);
+    Result := True;
+  end;
+
+  function ReacquireWorkerLease: Boolean;
+  begin
+    Result := False;
+    while not Assigned(AWorkerLease) do
+    begin
+      if ACompiler.IsCancelled then
+      begin
+        AOutput := 'cache wait abandoned: ' + CacheFingerprint
+          + LineEnding;
+        Exit;
+      end;
+      AWorkerLease := AWorkerSession.Acquire(
+        PRODUCER_LEASE_POLL_MILLISECONDS);
+    end;
+    Result := True;
+  end;
 begin
   ACompiled := Default(TLWPTCompiledEntry);
   ABuildResult := DefaultBuildResult;
+  ReleasingWorkerForWait := False;
   AOutput := '';
   ACompilerExitCode := ObservabilityInternalErrorExitCode;
   if T.Source = '' then
@@ -648,43 +734,101 @@ begin
   else if AUseCache and Assigned(ACache) then
     try
       if ACache.Materialize(CacheFingerprint, CandidateBin,
-        JobRoot + '/cache-tmp', CachedResult, CacheReason) then
+           JobRoot + '/cache-tmp', CachedResult, CacheReason)
+         and AcceptCachedResult('cache hit') then
+        Exit(True);
+
+      ACompiled.ProducerLease := ACache.TryAcquireProducer(
+        CacheFingerprint, 'build result "' + T.Name + '"');
+      if not Assigned(ACompiled.ProducerLease) then
       begin
-        if CachedResult.ArtifactKind <> Request.BuildRequest.OutputKind then
-        begin
-          SysUtils.DeleteFile(CandidateBin);
-          CacheReason := 'result-kind-mismatch';
-        end
-        else
-        begin
-          ABuildResult := DefaultBuildResult;
-          ABuildResult.Success := True;
-          SetLength(ABuildResult.Artifacts, 1);
-          ABuildResult.Artifacts[0].Kind := CachedResult.ArtifactKind;
-          ABuildResult.Artifacts[0].Path := CandidateBin;
-          ABuildResult.Artifacts[0].Digest := CachedResult.ArtifactDigest;
-          ValidateBuildResult(ABuildResult);
-          ValidateReportedArtifacts(ADriver.CompilerID,
-            Request.BuildRequest, ABuildResult);
-          ACompilerExitCode := 0;
-          AOutput := 'cache hit: ' + CacheFingerprint + LineEnding;
-          ACompiled.Name := T.Name;
-          ACompiled.CandidateBin := CandidateBin;
-          ACompiled.OutBin := OutBin;
-          ACompiled.Fingerprint := Fingerprint;
-          ACompiled.CacheFingerprint := CacheFingerprint;
-          ACompiled.CacheDiagnostic := 'cache hit';
-          ACompiled.ProjectRoot := ProjectRoot;
-          ACompiled.CfgPath := CfgPath;
-          ACompiled.ModulesPath := ModulesPath;
-          ACompiled.Request := Request;
-          ACompiled.PostBuild := RetargetPostBuildHooks(T.PostBuild,
-            OutBin, CandidateBin);
-          Exit(True);
-        end;
+        { A cache waiter does not consume compile capacity. The producer may
+          need that capacity to run hooks and publish this result. }
+        { Release is fallible: its destructor deliberately suppresses a
+          coordination failure because destruction cannot be retried. A
+          waiter must observe that failure and stop before it starts polling,
+          or it can retain scarce capacity while pretending to have yielded
+          it to the producer. }
+        ReleasingWorkerForWait := True;
+        AWorkerLease.Release;
+        ReleasingWorkerForWait := False;
+        FreeAndNil(AWorkerLease);
+        WaitStartedAt := GetTickCount64;
+        LastProgressAt := WaitStartedAt;
+        WriteLn('cache wait: build result "', T.Name, '" ',
+          CacheFingerprint);
+        repeat
+          if ACompiler.IsCancelled then
+          begin
+            AOutput := 'cache wait abandoned: ' + CacheFingerprint
+              + LineEnding;
+            Exit(False);
+          end;
+          Sleep(PRODUCER_LEASE_POLL_MILLISECONDS);
+          if ACache.Materialize(CacheFingerprint, CandidateBin,
+               JobRoot + '/cache-tmp', CachedResult, CacheReason) then
+          begin
+            if not RevalidateWaitedFingerprint then
+            begin
+              SysUtils.DeleteFile(CandidateBin);
+              AOutput := 'inputs changed while waiting for cached build '
+                + 'result ' + CacheFingerprint + LineEnding;
+              Exit(False);
+            end;
+            if AcceptCachedResult('cache wait hit') then Exit(True);
+          end;
+          ACompiled.ProducerLease := ACache.TryAcquireProducer(
+            CacheFingerprint, 'build result "' + T.Name + '"');
+          if Assigned(ACompiled.ProducerLease) then Break;
+          WaitNow := GetTickCount64;
+          if WaitNow - LastProgressAt >=
+             PRODUCER_LEASE_PROGRESS_MILLISECONDS then
+          begin
+            if ACache.ProducerSnapshot(CacheFingerprint,
+                 ProducerSnapshot) then
+              WriteLn('cache wait: ', ProducerSnapshot.Description,
+                ' (owner ', ProducerSnapshot.ProcessId, ', ',
+                WaitNow - WaitStartedAt, 'ms)')
+            else
+              WriteLn('cache wait: build result "', T.Name, '" (',
+                WaitNow - WaitStartedAt, 'ms)');
+            LastProgressAt := WaitNow;
+          end;
+        until False;
+      end;
+
+      if not ReacquireWorkerLease then
+      begin
+        FreeAndNil(ACompiled.ProducerLease);
+        Exit(False);
+      end;
+
+      if not RevalidateWaitedFingerprint then
+      begin
+        FreeAndNil(ACompiled.ProducerLease);
+        AOutput := 'inputs changed while waiting for cached build result '
+          + CacheFingerprint + LineEnding;
+        Exit(False);
+      end;
+      { The prior producer may have published immediately before releasing
+        its guard. Re-check the verified fingerprint after becoming owner so
+        takeover never recompiles a result that is already complete. }
+      if ACache.Materialize(CacheFingerprint, CandidateBin,
+           JobRoot + '/cache-tmp', CachedResult, CacheReason)
+         and AcceptCachedResult('cache takeover hit') then
+      begin
+        FreeAndNil(ACompiled.ProducerLease);
+        Exit(True);
       end;
     except
-      on E: Exception do CacheReason := 'unavailable';
+      on E: Exception do
+      begin
+        if ReleasingWorkerForWait then raise;
+        FreeAndNil(ACompiled.ProducerLease);
+        if not Assigned(AWorkerLease) then
+          if not ReacquireWorkerLease then Exit(False);
+        CacheReason := 'unavailable';
+      end;
     end
   else if AUseCache then CacheReason := 'unavailable';
   CacheOutput := 'cache miss: ' + CacheReason + LineEnding;
@@ -709,6 +853,7 @@ begin
 
   if not Result then
   begin
+    FreeAndNil(ACompiled.ProducerLease);
     Failure := ADriver.ClassifyFailure(FpcExit, AOutput);
     AOutput := AOutput + LineEnding + Failure.Summary + LineEnding;
   end;
@@ -746,7 +891,9 @@ end;
 constructor TLWPTBuildJob.Create(const AManifestPath: string;
   const AManifest: TManifest; const AManifestContentHash: string;
   const AEntry: TLWPTBuildEntry; const ARelease, AClean: Boolean;
-  const ASession: TLWPTBuildSession; const ALease: TLWPTWorkerLease;
+  const ASession: TLWPTBuildSession;
+  const AWorkerSession: TLWPTWorkerBudgetSession;
+  const ALease: TLWPTWorkerLease;
   const ADriver: TLWPTCompilerDriver; const ACache: TLWPTBuildCache;
   const AUseCache: Boolean);
 begin
@@ -759,6 +906,7 @@ begin
   FRelease := ARelease;
   FClean := AClean;
   FSession := ASession;
+  FWorkerSession := AWorkerSession;
   FLease := ALease;
   FDriver := ADriver;
   FCache := ACache;
@@ -777,6 +925,10 @@ end;
 
 destructor TLWPTBuildJob.Destroy;
 begin
+  { A completed result transfers its producer lease through TakeCompiled.
+    Any lease still attached here belongs to a failed, cancelled, or
+    never-consumed job and must not outlive that job. }
+  FreeAndNil(FCompiled.ProducerLease);
   { Execute releases and nils FLease at the end of every run, so a lease
     still attached here belongs to a job whose thread never started.
     Destroying it returns the worker grant. }
@@ -786,14 +938,20 @@ begin
   inherited Destroy;
 end;
 
+function TLWPTBuildJob.TakeCompiled: TLWPTCompiledEntry;
+begin
+  Result := FCompiled;
+  FCompiled.ProducerLease := nil;
+end;
+
 procedure TLWPTBuildJob.Execute;
 begin
   try
     try
       FSucceeded := BuildOneEntry(FManifestPath, FManifest,
         FManifestContentHash, FEntry, FRelease, FClean, FSession,
-        FCompiler, FDriver, FCache, FUseCache, FCompiled, FBuildResult, FOutput,
-        FCompilerExitCode);
+        FWorkerSession, FLease, FCompiler, FDriver, FCache, FUseCache,
+        FCompiled, FBuildResult, FOutput, FCompilerExitCode);
       if (not FSucceeded) and (FError = '') then
         if FEntry.Source = '' then
           FError := 'build entry has no source'
@@ -807,6 +965,7 @@ begin
       end;
     end;
   finally
+    if not FSucceeded then FreeAndNil(FCompiled.ProducerLease);
     if Assigned(FLease) then
     begin
       try
@@ -1283,6 +1442,7 @@ var
         end;
       end;
     finally
+      FreeAndNil(Compiled[AIndex].ProducerLease);
       FinalizationLease.Free;
     end;
   end;
@@ -1490,7 +1650,8 @@ begin
                   Man.BuildEntries[i].PreBuild, ProjectRoot);
                 Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
                   ManifestContentHash, Man.BuildEntries[i], ARelease, AClean,
-                  Session, Lease, EntryDrivers[i], Cache, AUseCache);
+                  Session, WorkerSession, Lease, EntryDrivers[i], Cache,
+                  AUseCache);
                 Lease := nil;
                 States[i] := besRunning;
                 Inc(Running);
@@ -1532,7 +1693,7 @@ begin
               CompilerExitCodes[i] := Jobs[i].CompilerExitCode;
               if Jobs[i].Succeeded then
               begin
-                Compiled[i] := Jobs[i].Compiled;
+                Compiled[i] := Jobs[i].TakeCompiled;
                 States[i] := besCompiled;
                 Reporter.MarkJobInactive(LogIdentity(i));
               end
@@ -1620,6 +1781,8 @@ begin
       try
         StopAndFreeJobs;
       finally
+        for i := 0 to High(Compiled) do
+          FreeAndNil(Compiled[i].ProducerLease);
         WorkerSession.Free;
       end;
     end;

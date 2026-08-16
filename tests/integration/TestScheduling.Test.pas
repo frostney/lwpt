@@ -834,6 +834,7 @@ begin
     + '    Child.Executable := '
     + PascalString(LwptBinaryPath) + ';'#10
     + '    Child.Parameters.Add(''build'');'#10
+    + '    Child.Parameters.Add(''--no-cache'');'#10
     + '    Child.CurrentDirectory := ' + PascalString(NestedProject) + ';'#10
     + '    for Index := 1 to GetEnvironmentVariableCount do'#10
     + '    begin'#10

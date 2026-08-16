@@ -173,7 +173,10 @@ installs are not supported.
 - **Fetch:** Before HTTPS, a prior authoritative lock entry can address the
   per-user dependency archive store by raw SHA-256. Every hit and staged copy
   is re-hashed before atomic project publication; corruption is quarantined and
-  becomes a miss. Otherwise HTTPS GET uses the LWPT-canonical `HTTPClient`
+  becomes a miss. Identical known-hash misses share a local producer guard;
+  waiters recheck the desired hash after publication or crash takeover. A first
+  fetch without an authoritative content hash does not coordinate by mutable
+  provenance. Otherwise HTTPS GET uses the LWPT-canonical `HTTPClient`
   package (raw sockets + SChannel on Windows / SecureTransport on macOS /
   OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md)). The
   byte-safe `AppendRawBytes` accumulator fixes a header-recv truncation bug that
@@ -202,6 +205,13 @@ installs are not supported.
   remain hashed. Only a successfully published current candidate is admitted
   to the build-result namespace; failed, cancelled, stale, and hook-failed
   candidates remain session-private. `--no-cache` bypasses lookup and storage.
+- **Producer coordination:** `LWPT.ProducerLease` places per-key OS-held guards
+  and heartbeat metadata below the shared cache root. Build fingerprints and
+  known dependency archive hashes are separate key domains. Waiters report the
+  object and elapsed wait, verified publication remains atomic, different keys
+  proceed independently, and owner death releases the guard for takeover.
+  Heartbeat age is diagnostic rather than authority, preserving a healthy
+  long-running producer.
 - **Test:** Each `*.Test.pas` is a self-contained program using
   `TestingPascalLibrary`. `lwpt test` resolves the project-scoped compiler
   driver once and shares it across every test worker; per-entry compiler
