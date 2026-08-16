@@ -41,7 +41,7 @@ const
   ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
   ProcessCaptureOverflowHoldMilliseconds = 2000;
   SiblingFanoutCeilingMilliseconds = 1500;
-  SiblingFanoutDiagnosticIterations = 20;
+  SiblingFanoutDiagnosticIterations = 100;
   SubprocessDrainCompletionCeilingMilliseconds = 5000;
   { Scheduling speed is not part of the fanout contract. This ceiling only
     diagnoses a sibling that genuinely never reaches the startup barrier. }
