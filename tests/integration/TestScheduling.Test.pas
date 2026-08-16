@@ -41,6 +41,7 @@ const
   ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
   ProcessCaptureOverflowHoldMilliseconds = 2000;
   SiblingFanoutCeilingMilliseconds = 1500;
+  SiblingFanoutDiagnosticIterations = 20;
   SubprocessDrainCompletionCeilingMilliseconds = 5000;
   { Scheduling speed is not part of the fanout contract. This ceiling only
     diagnoses a sibling that genuinely never reaches the startup barrier. }
@@ -1321,41 +1322,62 @@ end;
 
 procedure TTestScheduling.TestSiblingTerminationAcknowledgementsShareFanout;
 var
-  CompilerPID, SourceIndex: Integer;
+  CompilerPID, Iteration, SourceIndex: Integer;
   CancellationStartedAt, ElapsedMilliseconds: QWord;
-  PIDFile: string;
+  NaturalExitSources, PIDFile, SourcePIDFile: string;
   CommandResult: TLwptResult;
 begin
-  ResetProject(0);
-  PIDFile := FScratch + '/control/sibling-ack-compiler-pid';
-  WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
-    'program MissingRuntimeBinaryInput; begin end.'#10);
-  for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
-    WriteTextFile(FScratch + '/tests/' + SiblingSlowSources[SourceIndex],
-      'program SlowCompilerInput; begin end.'#10);
-
-  CommandResult := RunTestsWithCompilerProxy(['--jobs=7'],
-    MissingAcknowledgementSiblingCompilerProxyMode, PIDFile, 7);
-  Expect<Boolean>(FileExists(PIDFile + SiblingCancellationStartedSuffix))
-    .ToBe(True);
-  CancellationStartedAt := StrToQWord(Trim(ReadBinaryFile(PIDFile
-    + SiblingCancellationStartedSuffix)));
-  ElapsedMilliseconds := GetTickCount64 - CancellationStartedAt;
-  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+  for Iteration := 1 to SiblingFanoutDiagnosticIterations do
   begin
-    Expect<Boolean>(FileExists(PIDFile + '-'
-      + SiblingSlowSources[SourceIndex])).ToBe(True);
-    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-'
-      + SiblingSlowSources[SourceIndex])));
-    Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+    ResetProject(0);
+    PIDFile := FScratch + '/control/sibling-ack-compiler-pid';
+    WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
+      'program MissingRuntimeBinaryInput; begin end.'#10);
+    for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+      WriteTextFile(FScratch + '/tests/' + SiblingSlowSources[SourceIndex],
+        'program SlowCompilerInput; begin end.'#10);
+
+    CommandResult := RunTestsWithCompilerProxy(['--jobs=7'],
+      MissingAcknowledgementSiblingCompilerProxyMode, PIDFile, 7);
+    if not FileExists(PIDFile + SiblingCancellationStartedSuffix) then
+      Fail(Format('fanout iteration %d did not publish the cancellation '
+        + 'start marker', [Iteration]));
+    CancellationStartedAt := StrToQWord(Trim(ReadBinaryFile(PIDFile
+      + SiblingCancellationStartedSuffix)));
+    ElapsedMilliseconds := GetTickCount64 - CancellationStartedAt;
+    if CommandResult.ExitCode <> 1 then
+      Fail(Format('fanout iteration %d exited %d instead of 1',
+        [Iteration, CommandResult.ExitCode]));
+    NaturalExitSources := '';
+    for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+    begin
+      SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
+      if not FileExists(SourcePIDFile) then
+        Fail(Format('fanout iteration %d did not publish the PID marker for %s',
+          [Iteration, SiblingSlowSources[SourceIndex]]));
+      CompilerPID := StrToInt(Trim(ReadBinaryFile(SourcePIDFile)));
+      if ProcessIsRunning(CompilerPID) then
+        Fail(Format('fanout iteration %d left %s running as PID %d',
+          [Iteration, SiblingSlowSources[SourceIndex], CompilerPID]));
+      if FileExists(SourcePIDFile + NestedCompilerNaturalExitSuffix) then
+      begin
+        if NaturalExitSources <> '' then NaturalExitSources += ', ';
+        NaturalExitSources += SiblingSlowSources[SourceIndex];
+      end;
+    end;
+    if Pos('A.Slow.Test.pas ... ERROR', CommandResult.Stdout) = 0 then
+      Fail(Format('fanout iteration %d omitted A.Slow.Test.pas ERROR',
+        [Iteration]));
+    if Pos('C.Slow.Test.pas ... ERROR', CommandResult.Stdout) = 0 then
+      Fail(Format('fanout iteration %d omitted C.Slow.Test.pas ERROR',
+        [Iteration]));
+    if ElapsedMilliseconds >= SiblingFanoutCeilingMilliseconds then
+      Fail(Format('fanout iteration %d took %d ms after cancellation '
+        + '(ceiling %d ms); natural exits: %s',
+        [Iteration, ElapsedMilliseconds, SiblingFanoutCeilingMilliseconds,
+        NaturalExitSources]));
   end;
-  Expect<Boolean>(Pos('A.Slow.Test.pas ... ERROR',
-    CommandResult.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('C.Slow.Test.pas ... ERROR',
-    CommandResult.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(ElapsedMilliseconds < SiblingFanoutCeilingMilliseconds)
-    .ToBe(True);
+  Expect<Boolean>(True).ToBe(True);
 end;
 
 procedure TTestScheduling.TestProtocolFramingIsBoundedAndIncremental;
@@ -2127,7 +2149,8 @@ begin
       end;
     end;
     Sleep(LongRunningFixtureMilliseconds);
-    if Mode = IgnoreTerminateCompilerProxyMode then
+    if (Mode = IgnoreTerminateCompilerProxyMode)
+       or (Mode = MissingAcknowledgementSiblingCompilerProxyMode) then
       { Reaching the safety exit means cancellation failed to reap the proxy. }
       WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
         UIntToStr(GetTickCount64));
