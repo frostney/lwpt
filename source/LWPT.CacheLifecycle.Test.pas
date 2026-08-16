@@ -27,6 +27,7 @@ type
     FCacheRoot: string;
     FOriginalBudget: string;
     FScratch: string;
+    function CacheBytes(const APath: string): Int64;
     procedure ResetScratch;
     procedure SetBudget(const AValue: string);
     function WriteObject(const AName, ABytes: string;
@@ -38,9 +39,13 @@ type
   public
     procedure SetupTests; override;
     procedure TestAggregateAdmissionEvictsDeterministicLRU;
+    procedure TestAuxiliaryBytesConstrainAdmission;
+    procedure TestFirstRecordCreatesLifecycleTemporaryRoot;
+    procedure TestIndexGrowthCannotExceedBudget;
     procedure TestLiveObjectIsPreservedAndAdmissionSkips;
     procedure TestRepairRebuildsIndexAndRemovesCorruption;
     procedure TestRepairRebuildsSemanticallyCorruptIndex;
+    procedure TestRepairZeroBudgetPrunesBuildReferences;
     {$IFDEF UNIX}
     procedure TestRepairUnlinksCacheShardsWithoutFollowingThem;
     {$ENDIF}
@@ -134,6 +139,43 @@ begin
   end;
 end;
 
+procedure TCacheLifecycleContract.TestRepairZeroBudgetPrunesBuildReferences;
+var
+  Digest, ReferencePath, StaleReferencePath, UpperReferencePath: string;
+  FirstReport, SecondReport: TLWPTCacheRepairReport;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/build-results/objects', FCacheRoot, 'build-results');
+  try
+    Digest := WriteObject('build-manifest', 'cached-result-manifest', Store);
+    ReferencePath := FCacheRoot + '/build-results/refs/sha256/11/'
+      + StringOfChar('1', 62);
+    StaleReferencePath := FCacheRoot + '/build-results/refs/sha256/22/'
+      + StringOfChar('2', 62);
+    UpperReferencePath := FCacheRoot + '/build-results/refs/sha256/33/'
+      + StringOfChar('3', 62);
+    WriteTextFile(ReferencePath, Digest + #10);
+    WriteTextFile(StaleReferencePath,
+      'sha256:' + StringOfChar('f', 64) + #10);
+    WriteTextFile(UpperReferencePath, UpperCase(Digest) + #10);
+    SetBudget('0');
+    FirstReport := RepairSharedCache(FCacheRoot);
+    Expect<Boolean>(FileExists(Store.ObjectPath(Digest))).ToBe(False);
+    Expect<Boolean>(FileExists(ReferencePath)).ToBe(False);
+    Expect<Boolean>(FileExists(StaleReferencePath)).ToBe(False);
+    Expect<Boolean>(FileExists(UpperReferencePath)).ToBe(False);
+    Expect<Int64>(FirstReport.BytesAfter).ToBe(0);
+    Expect<Boolean>(FirstReport.BytesReclaimed > 0).ToBe(True);
+    Expect<Boolean>(FirstReport.IncompleteEntriesRemoved >= 1).ToBe(True);
+    SecondReport := RepairSharedCache(FCacheRoot);
+    Expect<Int64>(SecondReport.BytesReclaimed).ToBe(0);
+    Expect<Integer>(SecondReport.IncompleteEntriesRemoved).ToBe(0);
+  finally
+    Store.Free;
+  end;
+end;
+
 {$IFDEF UNIX}
 procedure TCacheLifecycleContract.
   TestRepairUnlinksCacheShardsWithoutFollowingThem;
@@ -172,6 +214,28 @@ end;
 procedure TCacheLifecycleContract.SetBudget(const AValue: string);
 begin
   SetProcessEnvironment(CACHE_MAX_BYTES_ENV, AValue);
+end;
+
+function TCacheLifecycleContract.CacheBytes(const APath: string): Int64;
+var
+  Child: string;
+  Search: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(IncludeTrailingPathDelimiter(APath) + '*', faAnyFile,
+       Search) <> 0 then Exit;
+  try
+    repeat
+      if (Search.Name = '.') or (Search.Name = '..') then Continue;
+      Child := IncludeTrailingPathDelimiter(APath) + Search.Name;
+      if (Search.Attr and faDirectory) <> 0 then
+        Inc(Result, CacheBytes(Child))
+      else
+        Inc(Result, Search.Size);
+    until FindNext(Search) <> 0;
+  finally
+    SysUtils.FindClose(Search);
+  end;
 end;
 
 procedure TCacheLifecycleContract.ResetScratch;
@@ -225,26 +289,108 @@ var
   BuildStore, DependencyStore: TLWPTImmutableObjectStore;
   FirstDigest, Hit, SecondDigest, ThirdDigest: string;
 begin
-  SetBudget('14');
+  SetBudget('15000');
   DependencyStore := TLWPTImmutableObjectStore.Create(
     FCacheRoot + '/dependency-archives', FCacheRoot,
     DEPENDENCY_ARCHIVE_NAMESPACE);
   BuildStore := TLWPTImmutableObjectStore.Create(
     FCacheRoot + '/build-results/objects', FCacheRoot, 'build-results');
   try
-    FirstDigest := WriteObject('first', 'aaaa', DependencyStore);
-    SecondDigest := WriteObject('second', 'bbbbbb', BuildStore);
+    FirstDigest := WriteObject('first', StringOfChar('a', 4000),
+      DependencyStore);
+    SecondDigest := WriteObject('second', StringOfChar('b', 6000),
+      BuildStore);
     Expect<Boolean>(DependencyStore.Lookup(FirstDigest, Hit)).ToBe(True);
-    ThirdDigest := WriteObject('third', 'cccccccc', DependencyStore);
+    ThirdDigest := WriteObject('third', StringOfChar('c', 8000),
+      DependencyStore);
     Expect<Boolean>(FileExists(DependencyStore.ObjectPath(FirstDigest)))
       .ToBe(True);
     Expect<Boolean>(FileExists(BuildStore.ObjectPath(SecondDigest)))
       .ToBe(False);
     Expect<Boolean>(FileExists(DependencyStore.ObjectPath(ThirdDigest)))
       .ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= 15000).ToBe(True);
   finally
     BuildStore.Free;
     DependencyStore.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.TestAuxiliaryBytesConstrainAdmission;
+var
+  Digest, Source: string;
+  Store: TLWPTImmutableObjectStore;
+begin
+  SetBudget('2500');
+  WriteTextFile(FCacheRoot + '/producer-leases/diagnostic',
+    StringOfChar('m', 2000));
+  Source := FScratch + '/sources/constrained';
+  WriteTextFile(Source, StringOfChar('x', 1000));
+  Digest := 'sha256:' + SHA256File(Source);
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/dependency-archives', FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    Expect<string>(Store.Admit(Source, Digest)).ToBe('');
+    Expect<Boolean>(FileExists(Store.ObjectPath(Digest))).ToBe(False);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= 2500).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.
+  TestFirstRecordCreatesLifecycleTemporaryRoot;
+var
+  Digest, ObjectPath: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  ObjectPath := FCacheRoot + '/dependency-archives/sha256/aa/'
+    + StringOfChar('b', 62);
+  WriteTextFile(ObjectPath, 'seed');
+  Digest := 'sha256:aa' + StringOfChar('b', 62);
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Lifecycle.RecordObjectLocked(Digest, ObjectPath);
+    Expect<Boolean>(FileExists(FCacheRoot + '/lifecycle/index')).ToBe(True);
+    Expect<Boolean>(FileExists(FCacheRoot + '/lifecycle/manifests/'
+      + DEPENDENCY_ARCHIVE_NAMESPACE + '/sha256/aa/'
+      + StringOfChar('b', 62))).ToBe(True);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.TestIndexGrowthCannotExceedBudget;
+var
+  Digest, Hit, IndexText: string;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/dependency-archives', FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    Digest := WriteObject('sequence-boundary', 'bounded-index', Store);
+    IndexText := 'schema=1'#10
+      + 'sequence=9'#10
+      + 'entry.' + DEPENDENCY_ARCHIVE_NAMESPACE + ':' + Digest + '=9'#10;
+    WriteTextFile(FCacheRoot + '/lifecycle/index', IndexText);
+    SetBudget(IntToStr(CacheBytes(FCacheRoot)));
+    Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= ResolveCacheMaxBytes).ToBe(True);
+    with TStringList.Create do
+      try
+        LoadFromFile(FCacheRoot + '/lifecycle/index');
+        Expect<string>(Values['sequence']).ToBe('9');
+      finally
+        Free;
+      end;
+  finally
+    Store.Free;
   end;
 end;
 
@@ -256,7 +402,7 @@ var
   Lifecycle: TLWPTCacheLifecycle;
   LiveLease: TObject;
 begin
-  SetBudget('10');
+  SetBudget('12000');
   DependencyStore := TLWPTImmutableObjectStore.Create(
     FCacheRoot + '/dependency-archives', FCacheRoot,
     DEPENDENCY_ARCHIVE_NAMESPACE);
@@ -265,11 +411,12 @@ begin
   Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot, 'build-results');
   LiveLease := nil;
   try
-    FirstDigest := WriteObject('old', 'aaaa', DependencyStore);
-    LiveDigest := WriteObject('live', 'bbbbbb', BuildStore);
+    FirstDigest := WriteObject('old', StringOfChar('a', 4000),
+      DependencyStore);
+    LiveDigest := WriteObject('live', StringOfChar('b', 6000), BuildStore);
     LiveLease := Lifecycle.AcquireObject(LiveDigest);
     Source := FScratch + '/sources/new';
-    WriteTextFile(Source, 'cccccccc');
+    WriteTextFile(Source, StringOfChar('c', 8000));
     NewDigest := 'sha256:' + SHA256File(Source);
     Expect<string>(DependencyStore.Admit(Source, NewDigest)).ToBe('');
     Expect<Boolean>(FileExists(DependencyStore.ObjectPath(FirstDigest)))
@@ -368,12 +515,20 @@ procedure TCacheLifecycleContract.SetupTests;
 begin
   Test('aggregate admission evicts the deterministic least-recently-used '
     + 'object', TestAggregateAdmissionEvictsDeterministicLRU);
+  Test('auxiliary cache bytes constrain ordinary admission',
+    TestAuxiliaryBytesConstrainAdmission);
+  Test('the first lifecycle record creates its atomic temporary root',
+    TestFirstRecordCreatesLifecycleTemporaryRoot);
+  Test('index growth cannot take a cache hit above budget',
+    TestIndexGrowthCannotExceedBudget);
   Test('live objects are preserved and an admission that cannot fit skips',
     TestLiveObjectIsPreservedAndAdmissionSkips);
   Test('repair rebuilds the index and removes corruption repeatably',
     TestRepairRebuildsIndexAndRemovesCorruption);
   Test('repair rebuilds a semantically inconsistent index exactly',
     TestRepairRebuildsSemanticallyCorruptIndex);
+  Test('zero-budget repair prunes live and stale build references',
+    TestRepairZeroBudgetPrunesBuildReferences);
   {$IFDEF UNIX}
   Test('repair unlinks cache shards without following them',
     TestRepairUnlinksCacheShardsWithoutFollowingThem);

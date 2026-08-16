@@ -272,6 +272,40 @@ begin
   end;
 end;
 
+function IndexByteSize(const ASequence: Int64;
+  const AEntries: TStringList): Int64;
+var
+  Index: Integer;
+  Lines: TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LineBreak := #10;
+    Lines.Add('schema=' + IntToStr(CACHE_INDEX_SCHEMA));
+    Lines.Add('sequence=' + IntToStr(ASequence));
+    AEntries.Sort;
+    for Index := 0 to AEntries.Count - 1 do
+      Lines.Add('entry.' + AEntries.Names[Index] + '='
+        + AEntries.ValueFromIndex[Index]);
+    Result := Length(RawByteString(Lines.Text));
+  finally
+    Lines.Free;
+  end;
+end;
+
+function FileByteSize(const APath: string): Int64;
+var
+  Search: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(APath, faAnyFile, Search) <> 0 then Exit;
+  try
+    if (Search.Attr and faDirectory) = 0 then Result := Search.Size;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
+
 procedure WriteManifest(const ACacheRoot, ANamespace, ADigest,
   AObjectPath: string; const ASize: Int64);
 var
@@ -287,6 +321,7 @@ begin
     Lines.Add('object=' + AObjectPath);
     ForceDirectories(ExtractFileDir(ManifestPath(ACacheRoot,
       ANamespace, ADigest)));
+    ForceDirectories(LifecycleTemporaryRoot(ACacheRoot));
     AtomicWriteText(ManifestPath(ACacheRoot, ANamespace, ADigest),
       LifecycleTemporaryRoot(ACacheRoot), Lines);
   finally
@@ -383,13 +418,7 @@ begin
     AppendObjects(BuildRoot + '/objects', BUILD_NAMESPACE, Result);
 end;
 
-function TotalBytes(const AObjects: TLWPTCacheObjectArray): Int64;
-var
-  Index: Integer;
-begin
-  Result := 0;
-  for Index := 0 to High(AObjects) do Inc(Result, AObjects[Index].Size);
-end;
+function DirectoryBytes(const APath: string): Int64; forward;
 
 function IndexMatchesObjects(const AObjects: TLWPTCacheObjectArray;
   const AEntries: TStringList; const ASequence: Int64): Boolean;
@@ -447,6 +476,134 @@ begin
   end;
 end;
 
+function BuildReferenceSHA256Root(const ACacheRoot: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(ACacheRoot)
+    + BUILD_NAMESPACE + '/refs/sha256';
+end;
+
+function ObjectsContainDigest(const AObjects: TLWPTCacheObjectArray;
+  const ANamespace, ADigest: string): Boolean;
+var
+  Index: Integer;
+begin
+  for Index := 0 to High(AObjects) do
+    if (AObjects[Index].Namespace = ANamespace)
+       and (AObjects[Index].Digest = ADigest) then Exit(True);
+  Result := False;
+end;
+
+procedure RemoveBuildReferencesForDigest(const ACacheRoot,
+  ADigest: string);
+var
+  EntryPath, PrefixPath, ReferenceText, Root: string;
+  EntrySearch, PrefixSearch: TSearchRec;
+begin
+  Root := BuildReferenceSHA256Root(ACacheRoot);
+  if IsDirSymlinkOrJunction(Root) then Exit;
+  if FindFirst(IncludeTrailingPathDelimiter(Root) + '*',
+       faAnyFile or faSymLink, PrefixSearch) <> 0 then Exit;
+  try
+    repeat
+      if (PrefixSearch.Name = '.') or (PrefixSearch.Name = '..')
+         or ((PrefixSearch.Attr and faDirectory) = 0)
+         or ((PrefixSearch.Attr and faSymLink) <> 0) then Continue;
+      PrefixPath := IncludeTrailingPathDelimiter(Root) + PrefixSearch.Name;
+      if IsDirSymlinkOrJunction(PrefixPath) then Continue;
+      if FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
+           faAnyFile or faSymLink, EntrySearch) <> 0 then Continue;
+      try
+        repeat
+          if (EntrySearch.Name = '.') or (EntrySearch.Name = '..')
+             or ((EntrySearch.Attr and faDirectory) <> 0)
+             or ((EntrySearch.Attr and faSymLink) <> 0) then Continue;
+          EntryPath := IncludeTrailingPathDelimiter(PrefixPath)
+            + EntrySearch.Name;
+          if ReadSmallTextFile(EntryPath, ReferenceText)
+             and (LowerCase(Trim(ReferenceText)) = ADigest) then
+            SysUtils.DeleteFile(EntryPath);
+        until FindNext(EntrySearch) <> 0;
+      finally
+        SysUtils.FindClose(EntrySearch);
+      end;
+    until FindNext(PrefixSearch) <> 0;
+  finally
+    SysUtils.FindClose(PrefixSearch);
+  end;
+end;
+
+procedure RepairBuildReferences(const ACacheRoot: string;
+  const AObjects: TLWPTCacheObjectArray;
+  var AReport: TLWPTCacheRepairReport);
+var
+  Digest, EntryPath, Hex, PrefixPath, ReferenceText, Root: string;
+  EntrySearch, PrefixSearch: TSearchRec;
+  RemoveEntry: Boolean;
+begin
+  Root := BuildReferenceSHA256Root(ACacheRoot);
+  if IsDirSymlinkOrJunction(Root) then
+  begin
+    WipeDir(Root);
+    Inc(AReport.IncompleteEntriesRemoved);
+    Exit;
+  end;
+  if FindFirst(IncludeTrailingPathDelimiter(Root) + '*',
+       faAnyFile or faSymLink, PrefixSearch) <> 0 then Exit;
+  try
+    repeat
+      if (PrefixSearch.Name = '.') or (PrefixSearch.Name = '..') then
+        Continue;
+      PrefixPath := IncludeTrailingPathDelimiter(Root) + PrefixSearch.Name;
+      if ((PrefixSearch.Attr and faDirectory) = 0)
+         or ((PrefixSearch.Attr and faSymLink) <> 0)
+         or IsDirSymlinkOrJunction(PrefixPath)
+         or (Length(PrefixSearch.Name) <> 2) then
+      begin
+        if ((PrefixSearch.Attr and faDirectory) <> 0)
+           or ((PrefixSearch.Attr and faSymLink) <> 0) then WipeDir(PrefixPath)
+        else SysUtils.DeleteFile(PrefixPath);
+        Inc(AReport.IncompleteEntriesRemoved);
+        Continue;
+      end;
+      if FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
+           faAnyFile or faSymLink, EntrySearch) <> 0 then Continue;
+      try
+        repeat
+          if (EntrySearch.Name = '.') or (EntrySearch.Name = '..') then
+            Continue;
+          EntryPath := IncludeTrailingPathDelimiter(PrefixPath)
+            + EntrySearch.Name;
+          Hex := LowerCase(PrefixSearch.Name + EntrySearch.Name);
+          RemoveEntry := ((EntrySearch.Attr and faDirectory) <> 0)
+            or ((EntrySearch.Attr and faSymLink) <> 0)
+            or not IsLowerHex(Hex)
+            or not ReadSmallTextFile(EntryPath, ReferenceText);
+          if not RemoveEntry then
+          begin
+            Digest := Trim(ReferenceText);
+            RemoveEntry := not IsLowerHex(Copy(Digest, 8, MaxInt))
+              or (Copy(Digest, 1, 7) <> 'sha256:')
+              or not ObjectsContainDigest(AObjects, BUILD_NAMESPACE, Digest);
+          end;
+          if RemoveEntry then
+          begin
+            if ((EntrySearch.Attr and faDirectory) <> 0)
+               or ((EntrySearch.Attr and faSymLink) <> 0) then
+              WipeDir(EntryPath)
+            else
+              SysUtils.DeleteFile(EntryPath);
+            Inc(AReport.IncompleteEntriesRemoved);
+          end;
+        until FindNext(EntrySearch) <> 0;
+      finally
+        SysUtils.FindClose(EntrySearch);
+      end;
+    until FindNext(PrefixSearch) <> 0;
+  finally
+    SysUtils.FindClose(PrefixSearch);
+  end;
+end;
+
 function RemoveObject(const ACacheRoot: string;
   const AObject: TLWPTCacheObject; const AEntries: TStringList): Boolean;
 var
@@ -455,6 +612,8 @@ begin
   Result := not FileExists(AObject.Path);
   if not Result then Result := SysUtils.DeleteFile(AObject.Path);
   if not Result then Exit;
+  if AObject.Namespace = BUILD_NAMESPACE then
+    RemoveBuildReferencesForDigest(ACacheRoot, AObject.Digest);
   SysUtils.DeleteFile(ManifestPath(ACacheRoot, AObject.Namespace,
     AObject.Digest));
   Index := AEntries.IndexOfName(ObjectKey(AObject.Namespace,
@@ -466,7 +625,7 @@ function EnforceBudgetLocked(const ACacheRoot: string;
   const AAdditionalBytes: Int64; out ALivePreserved: Integer;
   out AReclaimed: Int64; const AKnownLive: TStrings): Boolean;
 var
-  Budget, CurrentBytes, Sequence: Int64;
+  Budget, CurrentBytes, RemovalBytes, Sequence: Int64;
   Entries: TStringList;
   Coordinator: TLWPTProducerLeaseCoordinator;
   Index: Integer;
@@ -480,7 +639,11 @@ begin
   Budget := ResolveCacheMaxBytes;
   if AAdditionalBytes > Budget then Exit;
   Objects := DiscoverObjects(ACacheRoot);
-  CurrentBytes := TotalBytes(Objects);
+  { The budget owns the complete shared-cache tree, not only immutable object
+    payloads. This includes result references, lifecycle control files,
+    producer metadata, and incomplete/quarantined bytes until repair reclaims
+    them. Directory entries themselves carry no portable logical byte size. }
+  CurrentBytes := DirectoryBytes(ACacheRoot);
   Entries := TStringList.Create;
   Coordinator := TLWPTProducerLeaseCoordinator.Create(
     ProducerLeaseRoot(ACacheRoot));
@@ -519,14 +682,20 @@ begin
       try
         if RemoveObject(ACacheRoot, Objects[Index], Entries) then
         begin
-          Dec(CurrentBytes, Objects[Index].Size);
-          Inc(AReclaimed, Objects[Index].Size);
+          RemovalBytes := CurrentBytes;
+          CurrentBytes := DirectoryBytes(ACacheRoot);
+          if CurrentBytes < RemovalBytes then
+            Inc(AReclaimed, RemovalBytes - CurrentBytes);
         end;
       finally
         Lease.Free;
       end;
     end;
-    WriteIndex(ACacheRoot, Sequence, Entries);
+    if Entries.Count = 0 then
+      SysUtils.DeleteFile(IndexPath(ACacheRoot))
+    else
+      WriteIndex(ACacheRoot, Sequence, Entries);
+    CurrentBytes := DirectoryBytes(ACacheRoot);
     Result := CurrentBytes + AAdditionalBytes <= Budget;
   finally
     Coordinator.Free;
@@ -613,7 +782,10 @@ begin
     if not RemoveObject(FCacheRoot, Item, Entries) then
       raise ELWPTCacheLifecycleError.CreateFmt(
         'failed to discard cache object %s', [ADigest]);
-    WriteIndex(FCacheRoot, Sequence, Entries);
+    if Entries.Count = 0 then
+      SysUtils.DeleteFile(IndexPath(FCacheRoot))
+    else
+      WriteIndex(FCacheRoot, Sequence, Entries);
   finally
     Entries.Free;
   end;
@@ -658,7 +830,7 @@ procedure TLWPTCacheLifecycle.TouchObjectLocked(
 var
   Entries: TStringList;
   IndexValid: Boolean;
-  Sequence: Int64;
+  AdditionalBytes, ExistingBytes, Sequence: Int64;
 begin
   Entries := TStringList.Create;
   try
@@ -671,6 +843,22 @@ begin
     end;
     Inc(Sequence);
     Entries.Values[Key(ADigest)] := IntToStr(Sequence);
+    ExistingBytes := FileByteSize(IndexPath(FCacheRoot));
+    AdditionalBytes := IndexByteSize(Sequence, Entries) - ExistingBytes;
+    if AdditionalBytes < 0 then AdditionalBytes := 0;
+    if (AdditionalBytes > 0)
+       and not MakeRoomLocked(AdditionalBytes) then Exit;
+    if AdditionalBytes > 0 then
+    begin
+      LoadIndex(FCacheRoot, Sequence, Entries, IndexValid);
+      if not IndexValid then
+      begin
+        Entries.Clear;
+        Sequence := 0;
+      end;
+      Inc(Sequence);
+      Entries.Values[Key(ADigest)] := IntToStr(Sequence);
+    end;
     WriteIndex(FCacheRoot, Sequence, Entries);
   finally
     Entries.Free;
@@ -691,7 +879,8 @@ begin
       if (Search.Name = '.') or (Search.Name = '..') then Continue;
       Child := IncludeTrailingPathDelimiter(APath) + Search.Name;
       if (Search.Attr and faSymLink) <> 0 then Continue
-      else if (Search.Attr and faDirectory) <> 0 then
+      else if ((Search.Attr and faDirectory) <> 0)
+         and not IsDirSymlinkOrJunction(Child) then
         Inc(Result, DirectoryBytes(Child))
       else
         Inc(Result, Search.Size);
@@ -879,13 +1068,14 @@ var
   BuildObjectsSafe, BuildRootSafe, DependencyRootSafe, IndexValid,
     ManifestValid: Boolean;
   Objects: TLWPTCacheObjectArray;
-  Reclaimed, Sequence: Int64;
+  InitialBytes, Reclaimed, Sequence: Int64;
 begin
   Result := Default(TLWPTCacheRepairReport);
   CacheRoot := ExcludeTrailingPathDelimiter(ExpandFileName(ACacheRoot));
   DependencyRoot := IncludeTrailingPathDelimiter(CacheRoot)
     + DEPENDENCY_NAMESPACE;
   BuildRoot := IncludeTrailingPathDelimiter(CacheRoot) + BUILD_NAMESPACE;
+  InitialBytes := DirectoryBytes(CacheRoot);
   Result.BudgetBytes := ResolveCacheMaxBytes;
   Result.AbandonedLeasesReclaimed := RepairProducerLeases(CacheRoot,
     Result.LiveLeasesPreserved);
@@ -925,7 +1115,6 @@ begin
     end;
 
     Objects := DiscoverObjects(CacheRoot);
-    Result.BytesBefore := TotalBytes(Objects) + Result.BytesReclaimed;
     Entries := TStringList.Create;
     try
       Entries.NameValueSeparator := '=';
@@ -971,6 +1160,7 @@ begin
         end;
       end;
       Objects := DiscoverObjects(CacheRoot);
+      RepairBuildReferences(CacheRoot, Objects, Result);
       if not IndexValid
          or not IndexMatchesObjects(Objects, Entries, Sequence) then
       begin
@@ -984,8 +1174,12 @@ begin
 
     EnforceBudgetLocked(CacheRoot, 0, LivePreserved, Reclaimed, LiveKeys);
     Inc(Result.LiveObjectsPreserved, LivePreserved);
-    Inc(Result.BytesReclaimed, Reclaimed);
-    Result.BytesAfter := TotalBytes(DiscoverObjects(CacheRoot));
+    Result.BytesAfter := DirectoryBytes(CacheRoot);
+    Result.BytesBefore := InitialBytes;
+    if Result.BytesAfter < Result.BytesBefore then
+      Result.BytesReclaimed := Result.BytesBefore - Result.BytesAfter
+    else
+      Result.BytesReclaimed := 0;
   finally
     GlobalLease.Free;
     GlobalCoordinator.Free;

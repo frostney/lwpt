@@ -346,13 +346,13 @@ function TLWPTImmutableObjectStore.AdmitRetained(const ASourcePath,
 var
   Expected, Existing, TmpRoot, Staged, Actual: string;
   MutationLease, ObjectLease: TObject;
-  StagedSize: Int64;
-  Search: TSearchRec;
+  Published: Boolean;
 begin
   ALease := nil;
   AInserted := False;
   ObjectLease := nil;
   MutationLease := nil;
+  Published := False;
   Staged := '';
   TmpRoot := '';
   Expected := CanonicalDigest(AExpectedDigest);
@@ -392,14 +392,6 @@ begin
         raise ELWPTObjectStoreError.CreateFmt(
           'staged object hash mismatch: expected %s, got %s',
           [Expected, Actual]);
-      if FindFirst(Staged, faAnyFile, Search) <> 0 then
-        raise ELWPTObjectStoreError.CreateFmt(
-          'failed to inspect staged object %s', [Expected]);
-      try
-        StagedSize := Search.Size;
-      finally
-        FindClose(Search);
-      end;
       {$IFDEF OBJECTSTORE_TESTING}
       if Assigned(ObjectStoreAfterStageTestHook) then
         ObjectStoreAfterStageTestHook(Staged);
@@ -407,12 +399,6 @@ begin
 
       MutationLease := FCacheLifecycle.AcquireMutation;
       try
-        if not FCacheLifecycle.MakeRoomLocked(StagedSize) then
-        begin
-          SysUtils.DeleteFile(Staged);
-          Staged := '';
-          Exit('');
-        end;
         EnsureUnlinkedDirectory(IncludeTrailingPathDelimiter(FRoot)
           + 'sha256', 'object digest root');
         EnsureUnlinkedDirectory(ExtractFileDir(Result),
@@ -424,7 +410,15 @@ begin
           raise ELWPTObjectStoreError.CreateFmt(
             'failed to publish object %s', [Expected]);
         Staged := '';
+        Published := True;
         FCacheLifecycle.RecordObjectLocked(Expected, Result);
+        if not FCacheLifecycle.MakeRoomLocked(0) then
+        begin
+          FCacheLifecycle.DiscardObjectLocked(Expected, Result);
+          Published := False;
+          Result := '';
+          Exit;
+        end;
         AInserted := True;
         ALease := ObjectLease;
         ObjectLease := nil;
@@ -435,6 +429,24 @@ begin
     except
       if (Staged <> '') and FileExists(Staged) then
         SysUtils.DeleteFile(Staged);
+      if Published then
+      begin
+        try
+          MutationLease := FCacheLifecycle.AcquireMutation;
+          try
+            FCacheLifecycle.DiscardObjectLocked(Expected, Result);
+            Published := False;
+          finally
+            MutationLease.Free;
+            MutationLease := nil;
+          end;
+        except
+          { Preserve the publication failure. Repair owns any residue left by
+            a rollback failure, and replacing the original exception would
+            hide the operation that made the object incomplete. }
+          Published := True;
+        end;
+      end;
       if (TmpRoot <> '') and DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
       raise;
     end;

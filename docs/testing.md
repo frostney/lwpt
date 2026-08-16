@@ -242,7 +242,7 @@ inventory never touches the network.
 | **`source/LWPT.CompilerDriver.Delphi.Test.pas`** | 12 tests in 1 suite | Pins the built-in opt-in profile, five verified executable/target tuples, live per-operation identity/version/target probes, bounded failure context, the Delphi 12 version floor, executable/header and requested-target mismatch failures without fallback, neutral argument translation, managed-option rejection, normalized source diagnostics including a zero-exit missing-artifact failure, and exact private artifact renaming without requiring a Delphi installation or license. |
 | **`source/LWPT.CompilerRegistry.Test.pas`** | 11 tests in 1 suite | Covers build-entry/project/host/built-in precedence, implicit FPC fallback, built-in Blaise and Lakon selection, the preserved host-command replacement of the Lakon adapter, manifest-over-host authority, case-insensitive caching, out-of-process host command registration, duplicate and protected-built-in-shadow rejection, and configured prefix arguments before adapter arguments. |
 | **`source/LWPT.BuildCache.Test.pas`** | 7 tests in 1 suite | Covers verified result manifests and artifact materialization, Unix mode restoration, deterministic misses, invalid fingerprints, corrupt-artifact rejection, budget refusal without partial logical results, and concurrent cross-process publication without partial or mismatched results. |
-| **`source/LWPT.CacheLifecycle.Test.pas`** | 7 tests in 1 suite (Unix); 6 tests in 1 suite (Windows) | Covers aggregate deterministic LRU eviction across cache namespaces, live-object preservation and admission refusal, corrupt-object and incomplete-state repair with repeatable reports, semantic index reconstruction, abandoned versus active producer-state recovery, safe Unix shard and namespace-link removal, and default/override cache-budget parsing. |
+| **`source/LWPT.CacheLifecycle.Test.pas`** | 11 tests in 1 suite (Unix); 10 tests in 1 suite (Windows) | Covers aggregate deterministic LRU eviction across cache namespaces, live-object preservation and admission refusal, corrupt-object and incomplete-state repair with repeatable reports, semantic index reconstruction, abandoned versus active producer-state recovery, safe Unix shard and namespace-link removal, and default/override cache-budget parsing. |
 | **`source/LWPT.ProducerLease.Test.pas`** | 6 tests in 1 suite | Covers single-producer ownership, independent keys, waiter abandonment, normal handoff, crash takeover, and stale-heartbeat diagnostics that cannot displace a live OS-held owner. |
 | **`source/LWPT.BuildSession.Test.pas`** | 31 tests in 1 suite (Unix); 26 tests in 1 suite (Windows) | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, distinct publication versus reusable-cache fingerprints, compiler/target/flag/environment cache inputs, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
 | **`source/LWPT.Command.Build.Test.pas`** | 4 tests in 1 suite | Covers compiler-process cancellation with output capture and child reaping, normal-exit descendant handling, non-zero exit-code reporting, and repeated process-tree state teardown without leaking its owned Windows Job Object handle. |
@@ -334,10 +334,10 @@ inventory never touches the network.
 <!-- lwpt:test-inventory-counts:begin -->
 | Tier | Files | Registered test cases |
 | --- | ---: | --- |
-| Unit | 35 | 577 Unix / 563 Windows |
+| Unit | 35 | 581 Unix / 567 Windows |
 | Integration | 24 | 279 Darwin / 278 Linux / 272 Windows |
 | E2E | 7 | 34 Darwin, Windows / 37 Linux |
-| **Total** | **66** | **890 Darwin / 892 Linux / 869 Windows** |
+| **Total** | **66** | **894 Darwin / 896 Linux / 873 Windows** |
 <!-- lwpt:test-inventory-counts:end -->
 
 ## TestingPascalLibrary self-test

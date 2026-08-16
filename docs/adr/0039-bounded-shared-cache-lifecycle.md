@@ -15,9 +15,11 @@ checkout govern eviction of objects shared by unrelated projects.
 
 ## Decision
 
-LWPT applies one aggregate per-user object budget across the dependency archive
-and build-result namespaces. The default is 10 GiB. Only
-`LWPT_CACHE_MAX_BYTES`, expressed as a non-negative byte count, overrides it;
+LWPT applies one aggregate per-user byte budget across the complete shared
+cache tree used by the dependency archive and build-result namespaces. Regular
+file bytes for immutable objects, result references, lifecycle control state,
+producer metadata, staging, and quarantine all count. The default is 10 GiB.
+Only `LWPT_CACHE_MAX_BYTES`, expressed as a non-negative byte count, overrides it;
 there is no `lwpt.toml` setting. A zero budget disables new admissions and lets
 repair remove every unleased object. `LWPT_CACHE_DIR` continues to relocate all
 shared cache state. `lwpt build --no-cache` remains the invocation-level bypass,
@@ -47,11 +49,13 @@ enforces the effective budget. It reports the budget and remaining bytes,
 bytes reclaimed, corruption and incomplete state removed, abandoned leases,
 and live objects/leases preserved. Repeating repair is safe. Project-owned
 committed `.lwpt/archives/`, `.lwpt/modules/`, lockfiles, and configuration are
-outside this lifecycle.
+outside this lifecycle. A repair may remain above budget only when counted
+state is protected by a live operating-system guard; the report identifies
+that preservation so a later repair can reclaim it after release.
 
 ## Consequences
 
-- Shared object bytes have predictable aggregate disk use without making cache
+- Shared cache bytes have predictable aggregate disk use without making cache
   availability part of build or install correctness.
 - Projects may bypass build caching but cannot raise, partition, or otherwise
   govern global eviction policy.

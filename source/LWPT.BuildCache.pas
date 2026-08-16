@@ -34,7 +34,6 @@ type
   TLWPTBuildCache = class
   private
     FRoot: string;
-    FTemporaryRoot: string;
     FCacheLifecycle: TLWPTCacheLifecycle;
     FObjects: TLWPTImmutableObjectStore;
     FProducerLeases: TLWPTProducerLeaseCoordinator;
@@ -121,7 +120,6 @@ constructor TLWPTBuildCache.Create(const ACacheRoot: string);
 begin
   inherited Create;
   FRoot := BuildResultCacheRoot(ACacheRoot);
-  FTemporaryRoot := IncludeTrailingPathDelimiter(FRoot) + 'tmp';
   FCacheLifecycle := TLWPTCacheLifecycle.Create(ACacheRoot,
     BUILD_RESULT_NAMESPACE);
   FObjects := TLWPTImmutableObjectStore.Create(
@@ -308,6 +306,8 @@ var
   ArtifactInserted, ManifestInserted, Published: Boolean;
   CacheResult: TLWPTCachedBuildResult;
   Lines: TStringList;
+  ReferenceAdditional, ReferenceBytes, ReferenceSize: Int64;
+  Search: TSearchRec;
 begin
   Result := False;
   ArtifactLease := nil;
@@ -359,9 +359,19 @@ begin
       try
         Lines.LineBreak := #10;
         Lines.Add(ManifestDigest);
+        ReferenceBytes := Length(RawByteString(Lines.Text));
+        ReferenceSize := 0;
+        if FindFirst(ReferencePath(AFingerprint), faAnyFile, Search) = 0 then
+        try
+          ReferenceSize := Search.Size;
+        finally
+          SysUtils.FindClose(Search);
+        end;
+        ReferenceAdditional := ReferenceBytes - ReferenceSize;
+        if ReferenceAdditional < 0 then ReferenceAdditional := 0;
+        if not FCacheLifecycle.MakeRoomLocked(ReferenceAdditional) then Exit;
         ForceDirectories(ExtractFileDir(ReferencePath(AFingerprint)));
-        ForceDirectories(FTemporaryRoot);
-        AtomicWriteText(ReferencePath(AFingerprint), FTemporaryRoot, Lines);
+        AtomicWriteText(ReferencePath(AFingerprint), ManifestTmpRoot, Lines);
         Published := True;
         Result := True;
       finally
