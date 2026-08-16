@@ -202,10 +202,19 @@ end;
 function TCacheLifecycleContract.WriteObject(const AName,
   ABytes: string; const AStore: TLWPTImmutableObjectStore): string;
 var
+  Raw: RawByteString;
   Source: string;
+  Stream: TFileStream;
 begin
   Source := FScratch + '/sources/' + AName;
-  WriteTextFile(Source, ABytes);
+  ForceDirectories(ExtractFileDir(Source));
+  Stream := TFileStream.Create(Source, fmCreate);
+  try
+    Raw := RawByteString(ABytes);
+    if Length(Raw) > 0 then Stream.WriteBuffer(Raw[1], Length(Raw));
+  finally
+    Stream.Free;
+  end;
   Result := 'sha256:' + SHA256File(Source);
   Expect<Boolean>(AStore.Admit(Source, Result) <> '').ToBe(True);
 end;
