@@ -132,6 +132,7 @@ uses
   HTTPClient,
   LWPT.GitProtocol,
   LWPT.ObjectStore,
+  LWPT.ProducerLease,
   LWPT.Resolver,
   Semver,
   TOML,
@@ -839,6 +840,7 @@ var
   WSPath : string;
   AvailableNames : string;
   StagePath, FixtureRoot : string;
+  ProducerLease: TLWPTProducerLease;
 
   procedure StageLocalCopy(const AMessage: string);
   begin
@@ -860,8 +862,79 @@ var
     end;
     WriteLn('  copied ', ADep.Name, AMessage);
   end;
+
+  function WaitForSharedArchive: Boolean;
+  var
+    Coordinator: TLWPTProducerLeaseCoordinator;
+    Snapshot: TLWPTProducerLeaseSnapshot;
+    LastProgressAt, WaitNow, WaitStartedAt: QWord;
+  begin
+    Result := False;
+    if (AObjectStore = nil) or (AExpectedArchiveHash = '') then Exit;
+    Coordinator := TLWPTProducerLeaseCoordinator.Create(
+      ProducerLeaseRoot(ExtractFileDir(AObjectStore.Root)));
+    try
+      ProducerLease := Coordinator.TryAcquire(
+        'dependency:' + LowerCase(AExpectedArchiveHash),
+        'dependency archive "' + ADep.Name + '" '
+          + LowerCase(AExpectedArchiveHash));
+      if not Assigned(ProducerLease) then
+      begin
+        WaitStartedAt := GetTickCount64;
+        LastProgressAt := WaitStartedAt;
+        WriteLn('  waiting for dependency archive ', ADep.Name, ' ',
+          LowerCase(AExpectedArchiveHash));
+        repeat
+          Sleep(PRODUCER_LEASE_POLL_MILLISECONDS);
+          if AObjectStore.Materialize(AExpectedArchiveHash,
+               AArchive, ATmpRoot) then
+          begin
+            AArchiveHash := AExpectedArchiveHash;
+            WriteLn('  reused verified archive for ', ADep.Name,
+              ' after waiting for its producer');
+            Exit(True);
+          end;
+          ProducerLease := Coordinator.TryAcquire(
+            'dependency:' + LowerCase(AExpectedArchiveHash),
+            'dependency archive "' + ADep.Name + '" '
+              + LowerCase(AExpectedArchiveHash));
+          if Assigned(ProducerLease) then Break;
+          WaitNow := GetTickCount64;
+          if WaitNow - LastProgressAt >=
+             PRODUCER_LEASE_PROGRESS_MILLISECONDS then
+          begin
+            if Coordinator.Snapshot(
+                 'dependency:' + LowerCase(AExpectedArchiveHash),
+                 Snapshot) then
+              WriteLn('  waiting for ', Snapshot.Description,
+                ' (owner ', Snapshot.ProcessId, ', ',
+                WaitNow - WaitStartedAt, 'ms)')
+            else
+              WriteLn('  waiting for dependency archive ', ADep.Name,
+                ' (', WaitNow - WaitStartedAt, 'ms)');
+            LastProgressAt := WaitNow;
+          end;
+        until False;
+      end;
+
+      { A producer can publish immediately before releasing the guard.
+        Revalidate the desired content hash after takeover. }
+      if AObjectStore.Materialize(AExpectedArchiveHash,
+           AArchive, ATmpRoot) then
+      begin
+        AArchiveHash := AExpectedArchiveHash;
+        FreeAndNil(ProducerLease);
+        WriteLn('  reused verified archive for ', ADep.Name,
+          ' after producer handoff');
+        Exit(True);
+      end;
+    finally
+      Coordinator.Free;
+    end;
+  end;
 begin
   Result := False;
+  ProducerLease := nil;
   AUnitDir := IncludeTrailingPathDelimiter(AModulesRoot) + ADep.Name;
   AArchive := '';
   AArchiveHash := '';
@@ -950,10 +1023,31 @@ begin
           ADep.Name, ' failed: ', E.Message, '; fetching from source');
     end;
 
+  try
+    if WaitForSharedArchive then Exit(True);
+  except
+    on E: Exception do
+    begin
+      FreeAndNil(ProducerLease);
+      WriteLn(ErrOutput, 'warning: dependency archive producer lease for ',
+        ADep.Name, ' failed: ', E.Message, '; fetching from source');
+    end;
+  end;
+
+  { Test-only crash injection after this process has become the producer but
+    before it can touch the origin or publish bytes. Halt deliberately skips
+    object cleanup so the cross-process integration test observes the same
+    operating-system guard release as an abrupt producer death. }
+  if Assigned(ProducerLease)
+     and (SysUtils.GetEnvironmentVariable(
+       PROJECT_NAME + '_TEST_CRASH_DEPENDENCY_PRODUCER') = '1') then
+    Halt(88);
+
   { The archive-fetch boundary, and the only place the test-only origin
     override applies: canonical construction above is untouched, and the
     redirect below is inert unless the environment asks for it. }
-  OriginOverride := SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_ORIGIN_ENV);
+  try
+    OriginOverride := SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_ORIGIN_ENV);
   { Record the canonical URL in the lockfile, captured before the redirect.
     The override only aims the fetch at a loopback mock server; the
     loopback origin must never persist into lwpt.lock, so AResolvedURL
@@ -1024,7 +1118,10 @@ begin
           ADep.Name, ' failed: ', E.Message,
           '; the project archive remains authoritative');
     end;
-  Result := True;
+    Result := True;
+  finally
+    ProducerLease.Free;
+  end;
 end;
 
 { ===========================================================================

@@ -13,6 +13,7 @@ uses
 
   LWPT.BuildSession,
   LWPT.Core,
+  LWPT.ObjectStore,
   LWPT.Observability,
   LWPT.ProgressReporter,
   LWPT.WorkerBudget,
@@ -81,6 +82,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestConcurrentBuildsUseDistinctSessions;
+    procedure TestConcurrentCacheMissCompilesOnce;
     procedure TestConcurrentRelocatedRootsSharePublicationLock;
     procedure TestDeepProjectCanRelocateSessions;
     procedure TestDistinctOutputsPublishIndependentlyFromRootUnits;
@@ -636,6 +638,91 @@ begin
   finally
     First.Free;
     Second.Free;
+  end;
+end;
+
+procedure TBuildSessions.TestConcurrentCacheMissCompilesOnce;
+var
+  CacheRoot, ReadyDir, ReleasePath, RealFPC: string;
+  First, Second: TProcess;
+  FirstStatus, SecondStatus: Integer;
+  ProducerReady, TwoSessions: Boolean;
+  Seed: TLwptResult;
+  Started: TDateTime;
+  Env: array of string;
+begin
+  RecursiveDelete(FScratch + '/build');
+  RecursiveDelete(FScratch + '/.lwpt/sessions');
+  Seed := RunLwptWithWorkerEnv(['build', 'app', '--no-cache'], FScratch, []);
+  DumpRunFailure('cache producer seed', Seed, 0);
+  Expect<Integer>(Seed.ExitCode).ToBe(0);
+  CacheRoot := FScratch + '/control/producer-cache';
+  ReadyDir := FScratch + '/control/producer-ready';
+  ReleasePath := FScratch + '/control/producer-release';
+  RecursiveDelete(FScratch + '/control');
+  RealFPC := TestCompilerExecutable;
+  SetLength(Env, 8);
+  Env[0] := FPC_ENV + '=' + ExpandFileName(ParamStr(0));
+  Env[1] := TEST_FPC_PROXY_ENV + '=1';
+  Env[2] := TEST_REAL_FPC_ENV + '=' + RealFPC;
+  Env[3] := TEST_FPC_READY_DIR_ENV + '=' + ReadyDir;
+  Env[4] := TEST_FPC_RELEASE_ENV + '=' + ReleasePath;
+  Env[5] := WORKER_STATE_DIR_ENV + '=' + FScratch
+    + '/control/producer-worker-state';
+  { The waiter must yield and later reacquire the only worker slot. }
+  Env[6] := WORKER_BUDGET_ENV + '=1';
+  Env[7] := CACHE_DIR_ENV + '=' + CacheRoot;
+  First := StartBuildWithArgs(FScratch,
+    ['build', 'app', '--verbose'], Env);
+  Second := nil;
+  try
+    ProducerReady := False;
+    Started := Now;
+    while First.Running do
+    begin
+      if CountReadyFiles(ReadyDir) = 1 then
+      begin
+        ProducerReady := True;
+        Break;
+      end;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
+      Sleep(10);
+    end;
+    if not ProducerReady then
+      DumpBarrierDiagnostics('cache-producer', ReadyDir);
+    Second := StartBuildWithArgs(FScratch,
+      ['build', 'app', '--verbose'], Env);
+    TwoSessions := False;
+    Started := Now;
+    while First.Running and Second.Running do
+    begin
+      if CountSessionDirs >= 2 then
+      begin
+        TwoSessions := True;
+        Break;
+      end;
+      if (Now - Started) * 86400 > ConcurrencyBarrierCeilingSeconds then Break;
+      Sleep(10);
+    end;
+    WriteTextFile(ReleasePath, 'release');
+    First.WaitOnExit;
+    Second.WaitOnExit;
+    FirstStatus := First.ExitStatus;
+    SecondStatus := Second.ExitStatus;
+
+    Expect<Boolean>(ProducerReady).ToBe(True);
+    Expect<Boolean>(TwoSessions).ToBe(True);
+    Expect<Integer>(CountReadyFiles(ReadyDir)).ToBe(1);
+    Expect<Integer>(FirstStatus).ToBe(0);
+    Expect<Integer>(SecondStatus).ToBe(0);
+    Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app')))
+      .ToBe(True);
+  finally
+    WriteTextFile(ReleasePath, 'release');
+    if Assigned(Second) and Second.Running then Second.WaitOnExit;
+    if First.Running then First.WaitOnExit;
+    Second.Free;
+    First.Free;
   end;
 end;
 
@@ -1414,6 +1501,8 @@ procedure TBuildSessions.SetupTests;
 begin
   Test('concurrent builds use distinct private sessions',
     TestConcurrentBuildsUseDistinctSessions);
+  Test('concurrent identical cache misses compile once',
+    TestConcurrentCacheMissCompilesOnce);
   Test('concurrent relocated roots share publication coordination',
     TestConcurrentRelocatedRootsSharePublicationLock);
   Test('deep projects relocate sessions through manifest and environment',

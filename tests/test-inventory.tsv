@@ -43,6 +43,7 @@ program	*	unit	source/LWPT.ManifestEdit.Test.pas	4	23
 program	*	unit	source/LWPT.Observability.Test.pas	1	6
 program	*	unit	source/LWPT.ObjectStore.Test.pas	1	10
 program	*	unit	source/LWPT.OutputRenderer.Test.pas	1	1
+program	*	unit	source/LWPT.ProducerLease.Test.pas	1	6
 program	*	unit	source/LWPT.Resolver.Test.pas	1	7
 program	*	unit	source/LWPT.WorkerBudget.Test.pas	1	22
 program	windows/*	unit	source/LWPT.WorkerBudget.Test.pas	1	17
@@ -59,7 +60,7 @@ program	windows/*	integration	tests/integration/BuildClean.Test.pas	1	5
 program	*	integration	tests/integration/BuildEntries.Test.pas	1	14
 program	darwin/*	integration	tests/integration/BuildEntries.Test.pas	1	15
 program	windows/*	integration	tests/integration/BuildEntries.Test.pas	1	13
-program	*	integration	tests/integration/BuildSessions.Test.pas	1	15
+program	*	integration	tests/integration/BuildSessions.Test.pas	1	16
 program	*	integration	tests/integration/CLIOptions.Test.pas	1	34
 program	*	integration	tests/integration/CompilerProfiles.Test.pas	1	18
 program	*	integration	tests/integration/Duplication.Test.pas	1	6
@@ -71,6 +72,7 @@ program	*	integration	tests/integration/InstallGitGraph.Test.pas	1	6
 program	*	integration	tests/integration/InstallGraphConflict.Test.pas	1	20
 program	*	integration	tests/integration/InstallLocalDiamond.Test.pas	2	10
 program	*	integration	tests/integration/InstallNestedManifest.Test.pas	1	4
+program	*	integration	tests/integration/InstallProducerLease.Test.pas	1	2
 program	*	integration	tests/integration/InstallSymlinkCycle.Test.pas	1	3
 program	*	integration	tests/integration/Repair.Test.pas	1	6
 program	*	integration	tests/integration/Run.Test.pas	1	9

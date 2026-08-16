@@ -12,7 +12,8 @@ uses
   SysUtils,
 
   LWPT.Core,
-  LWPT.ObjectStore;
+  LWPT.ObjectStore,
+  LWPT.ProducerLease;
 
 const
   BUILD_CACHE_RESULT_SCHEMA_VERSION = 1;
@@ -34,6 +35,7 @@ type
     FRoot: string;
     FTemporaryRoot: string;
     FObjects: TLWPTImmutableObjectStore;
+    FProducerLeases: TLWPTProducerLeaseCoordinator;
     function ReferencePath(const AFingerprint: string): string;
     function ParseResultManifest(const AText: string;
       out AResult: TLWPTCachedBuildResult): Boolean;
@@ -48,8 +50,12 @@ type
     function Materialize(const AFingerprint, ADestination,
       ASessionTemporaryRoot: string; out AResult: TLWPTCachedBuildResult;
       out AReason: string): Boolean;
+    function ProducerSnapshot(const AFingerprint: string;
+      out ASnapshot: TLWPTProducerLeaseSnapshot): Boolean;
     procedure Store(const AFingerprint, AArtifactPath,
       AArtifactKind: string; const AUnixMode: Integer = -1);
+    function TryAcquireProducer(const AFingerprint,
+      ADescription: string): TLWPTProducerLease;
     property Root: string read FRoot;
   end;
 
@@ -116,6 +122,8 @@ begin
   FTemporaryRoot := IncludeTrailingPathDelimiter(FRoot) + 'tmp';
   FObjects := TLWPTImmutableObjectStore.Create(
     IncludeTrailingPathDelimiter(FRoot) + 'objects');
+  FProducerLeases := TLWPTProducerLeaseCoordinator.Create(
+    ProducerLeaseRoot(ACacheRoot));
 end;
 
 constructor TLWPTBuildCache.CreateDefault;
@@ -125,8 +133,27 @@ end;
 
 destructor TLWPTBuildCache.Destroy;
 begin
+  FProducerLeases.Free;
   FObjects.Free;
   inherited Destroy;
+end;
+
+function TLWPTBuildCache.TryAcquireProducer(const AFingerprint,
+  ADescription: string): TLWPTProducerLease;
+begin
+  { ReferencePath performs the public fingerprint validation before the
+    caller can create shared coordination state. }
+  ReferencePath(AFingerprint);
+  Result := FProducerLeases.TryAcquire('build:'
+    + CanonicalDigest(AFingerprint), ADescription);
+end;
+
+function TLWPTBuildCache.ProducerSnapshot(const AFingerprint: string;
+  out ASnapshot: TLWPTProducerLeaseSnapshot): Boolean;
+begin
+  ReferencePath(AFingerprint);
+  Result := FProducerLeases.Snapshot('build:'
+    + CanonicalDigest(AFingerprint), ASnapshot);
 end;
 
 function TLWPTBuildCache.ReferencePath(
