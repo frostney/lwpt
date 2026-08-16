@@ -23,9 +23,10 @@
     - The binary path is configurable via LwptBinaryPath but defaults
       to ./build/lwpt (resolved relative to the test's CWD, which
       lwpt test sets to the project root before launching each test).
-    - poWaitOnExit + reading streams after exit. Output is short
-      for LWPT subcommands; if a future subcommand streams large
-      output we'll switch to incremental drain.
+    - Pipes are drained in bounded available-byte snapshots while the child
+      runs. A child or descendant can retain a pipe writer after the direct
+      process exits, so reading until EOF would make timeout and termination
+      handling unreachable.
 
   Surface — kept minimal:
 
@@ -115,6 +116,9 @@ function IsNetworkUnavailable(const AResult: TLwptResult): Boolean;
 
 implementation
 
+uses
+  Pipes;
+
 var
   GLwptBinaryPath: string = '';
   GForwardWorkerLease: Boolean = True;
@@ -153,27 +157,30 @@ begin
          or (Pos('failed to resolve host', Err) > 0);
 end;
 
-{ Drain a stream into a string buffer. Stops at EOF; assumes the
-  subprocess has already exited so no blocking reads. Uses a 4 KiB
-  chunk size — large enough that LWPT's typical output (a few lines)
-  fits in one read. }
-function DrainStream(AStream: TStream): string;
+{ Drain only the bytes reported available at entry. A direct child can stay
+  live after producing one progress line, and descendants can inherit its pipe
+  writer. Reading until EOF would block the caller before it can poll process
+  state or enforce a requested timeout. }
+function DrainAvailableStream(AStream: TInputPipeStream): string;
 const
   CHUNK = 4 * 1024;
 var
-  Buf: array of Byte;
-  N, Total: Integer;
+  Available, N, ReadSize, Total: Integer;
+  Buf: array[0..CHUNK - 1] of Byte;
 begin
   Result := '';
-  SetLength(Buf, CHUNK);
+  Available := AStream.NumBytesAvailable;
   Total := 0;
-  while True do
+  while Available > 0 do
   begin
-    N := AStream.Read(Buf[0], CHUNK);
+    ReadSize := CHUNK;
+    if Available < ReadSize then ReadSize := Available;
+    N := AStream.Read(Buf[0], ReadSize);
     if N <= 0 then Break;
     SetLength(Result, Total + N);
     Move(Buf[0], Result[Total + 1], N);
     Inc(Total, N);
+    Dec(Available, N);
   end;
 end;
 
@@ -321,9 +328,9 @@ begin
       while P.Running do
       begin
         if P.Output.NumBytesAvailable > 0 then
-          Result.Stdout := Result.Stdout + DrainStream(P.Output);
+          Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
         if P.Stderr.NumBytesAvailable > 0 then
-          Result.Stderr := Result.Stderr + DrainStream(P.Stderr);
+          Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
         if (ATimeoutMilliseconds > 0)
            and (GetTickCount64 - StartedAt >= ATimeoutMilliseconds) then
         begin
@@ -341,9 +348,9 @@ begin
             TERMINATION_GRACE_MILLISECONDS) do
         begin
           if P.Output.NumBytesAvailable > 0 then
-            Result.Stdout := Result.Stdout + DrainStream(P.Output);
+            Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
           if P.Stderr.NumBytesAvailable > 0 then
-            Result.Stderr := Result.Stderr + DrainStream(P.Stderr);
+            Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
           Sleep(10);
         end;
         if P.Running then
@@ -353,9 +360,9 @@ begin
       end;
       { final drain after exit }
       if P.Output.NumBytesAvailable > 0 then
-        Result.Stdout := Result.Stdout + DrainStream(P.Output);
+        Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
       if P.Stderr.NumBytesAvailable > 0 then
-        Result.Stderr := Result.Stderr + DrainStream(P.Stderr);
+        Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
       { Mirrors LWPT.Command.Common.NormalisedExitCode (this unit must
         not link LWPT units): on Unix, ExitCode decodes correctly only
         when the Running poll reaped the raw waitpid(2) status; if
