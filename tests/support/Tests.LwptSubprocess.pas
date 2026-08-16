@@ -184,6 +184,35 @@ begin
   end;
 end;
 
+{$IFDEF MSWINDOWS}
+{ Windows does not permit a process working directory to be removed. Existing
+  integration fixtures therefore rely on a normal child completion retaining
+  the final EOF barrier until inherited pipe writers have exited. Keep that
+  established Windows cleanup behavior without using it in the running or
+  timeout paths, where an EOF read would make polling and termination
+  unreachable. Darwin and other Unix hosts must never use this helper: an
+  orphaned writer is the scheduling hang fixed by DrainAvailableStream. }
+function DrainExitedStream(AStream: TStream): string;
+const
+  CHUNK = 4 * 1024;
+var
+  Buf: array[0..CHUNK - 1] of Byte;
+  N, Total: Integer;
+begin
+  Result := '';
+  Total := 0;
+  repeat
+    N := AStream.Read(Buf[0], CHUNK);
+    if N > 0 then
+    begin
+      SetLength(Result, Total + N);
+      Move(Buf[0], Result[Total + 1], N);
+      Inc(Total, N);
+    end;
+  until N <= 0;
+end;
+{$ENDIF}
+
 { Name part of a NAME=value environment entry. Windows env blocks can
   contain entries starting with '=' (drive-letter cwd entries); those
   yield an empty name and never match an override. }
@@ -358,11 +387,25 @@ begin
             'timed-out lwpt subprocess did not terminate within %d ms',
             [TERMINATION_GRACE_MILLISECONDS]);
       end;
-      { final drain after exit }
-      if P.Output.NumBytesAvailable > 0 then
-        Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
-      if P.Stderr.NumBytesAvailable > 0 then
-        Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
+      { Final drain after exit. A requested timeout must remain bounded even
+        when a descendant retains a writer. Normal Windows completion keeps
+        its historical EOF barrier because live descendants can lock fixture
+        working directories; Unix completion stays nonblocking because an
+        orphaned writer is the Darwin scheduling failure this helper fixes. }
+      {$IFDEF MSWINDOWS}
+      if not Result.TimedOut then
+      begin
+        Result.Stdout := Result.Stdout + DrainExitedStream(P.Output);
+        Result.Stderr := Result.Stderr + DrainExitedStream(P.Stderr);
+      end
+      else
+      {$ENDIF}
+      begin
+        if P.Output.NumBytesAvailable > 0 then
+          Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
+        if P.Stderr.NumBytesAvailable > 0 then
+          Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
+      end;
       { Mirrors LWPT.Command.Common.NormalisedExitCode (this unit must
         not link LWPT units): on Unix, ExitCode decodes correctly only
         when the Running poll reaped the raw waitpid(2) status; if
