@@ -23,9 +23,10 @@
     - The binary path is configurable via LwptBinaryPath but defaults
       to ./build/lwpt (resolved relative to the test's CWD, which
       lwpt test sets to the project root before launching each test).
-    - poWaitOnExit + reading streams after exit. Output is short
-      for LWPT subcommands; if a future subcommand streams large
-      output we'll switch to incremental drain.
+    - Pipes are drained in bounded available-byte snapshots while the child
+      runs. A child or descendant can retain a pipe writer after the direct
+      process exits, so reading until EOF would make timeout and termination
+      handling unreachable.
 
   Surface — kept minimal:
 
@@ -115,6 +116,9 @@ function IsNetworkUnavailable(const AResult: TLwptResult): Boolean;
 
 implementation
 
+uses
+  Pipes;
+
 var
   GLwptBinaryPath: string = '';
   GForwardWorkerLease: Boolean = True;
@@ -153,29 +157,61 @@ begin
          or (Pos('failed to resolve host', Err) > 0);
 end;
 
-{ Drain a stream into a string buffer. Stops at EOF; assumes the
-  subprocess has already exited so no blocking reads. Uses a 4 KiB
-  chunk size — large enough that LWPT's typical output (a few lines)
-  fits in one read. }
-function DrainStream(AStream: TStream): string;
+{ Drain only the bytes reported available at entry. A direct child can stay
+  live after producing one progress line, and descendants can inherit its pipe
+  writer. Reading until EOF would block the caller before it can poll process
+  state or enforce a requested timeout. }
+function DrainAvailableStream(AStream: TInputPipeStream): string;
 const
   CHUNK = 4 * 1024;
 var
-  Buf: array of Byte;
-  N, Total: Integer;
+  Available, N, ReadSize, Total: Integer;
+  Buf: array[0..CHUNK - 1] of Byte;
 begin
   Result := '';
-  SetLength(Buf, CHUNK);
+  Available := AStream.NumBytesAvailable;
   Total := 0;
-  while True do
+  while Available > 0 do
   begin
-    N := AStream.Read(Buf[0], CHUNK);
+    ReadSize := CHUNK;
+    if Available < ReadSize then ReadSize := Available;
+    N := AStream.Read(Buf[0], ReadSize);
     if N <= 0 then Break;
     SetLength(Result, Total + N);
     Move(Buf[0], Result[Total + 1], N);
     Inc(Total, N);
+    Dec(Available, N);
   end;
 end;
+
+{$IFDEF MSWINDOWS}
+{ Windows does not permit a process working directory to be removed. Existing
+  integration fixtures therefore rely on a normal child completion retaining
+  the final EOF barrier until inherited pipe writers have exited. Keep that
+  established Windows cleanup behavior without using it in the running or
+  timeout paths, where an EOF read would make polling and termination
+  unreachable. Darwin and other Unix hosts must never use this helper: an
+  orphaned writer is the scheduling hang fixed by DrainAvailableStream. }
+function DrainExitedStream(AStream: TStream): string;
+const
+  CHUNK = 4 * 1024;
+var
+  Buf: array[0..CHUNK - 1] of Byte;
+  N, Total: Integer;
+begin
+  Result := '';
+  Total := 0;
+  repeat
+    N := AStream.Read(Buf[0], CHUNK);
+    if N > 0 then
+    begin
+      SetLength(Result, Total + N);
+      Move(Buf[0], Result[Total + 1], N);
+      Inc(Total, N);
+    end;
+  until N <= 0;
+end;
+{$ENDIF}
 
 { Name part of a NAME=value environment entry. Windows env blocks can
   contain entries starting with '=' (drive-letter cwd entries); those
@@ -321,9 +357,9 @@ begin
       while P.Running do
       begin
         if P.Output.NumBytesAvailable > 0 then
-          Result.Stdout := Result.Stdout + DrainStream(P.Output);
+          Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
         if P.Stderr.NumBytesAvailable > 0 then
-          Result.Stderr := Result.Stderr + DrainStream(P.Stderr);
+          Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
         if (ATimeoutMilliseconds > 0)
            and (GetTickCount64 - StartedAt >= ATimeoutMilliseconds) then
         begin
@@ -341,9 +377,9 @@ begin
             TERMINATION_GRACE_MILLISECONDS) do
         begin
           if P.Output.NumBytesAvailable > 0 then
-            Result.Stdout := Result.Stdout + DrainStream(P.Output);
+            Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
           if P.Stderr.NumBytesAvailable > 0 then
-            Result.Stderr := Result.Stderr + DrainStream(P.Stderr);
+            Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
           Sleep(10);
         end;
         if P.Running then
@@ -351,11 +387,25 @@ begin
             'timed-out lwpt subprocess did not terminate within %d ms',
             [TERMINATION_GRACE_MILLISECONDS]);
       end;
-      { final drain after exit }
-      if P.Output.NumBytesAvailable > 0 then
-        Result.Stdout := Result.Stdout + DrainStream(P.Output);
-      if P.Stderr.NumBytesAvailable > 0 then
-        Result.Stderr := Result.Stderr + DrainStream(P.Stderr);
+      { Final drain after exit. A requested timeout must remain bounded even
+        when a descendant retains a writer. Normal Windows completion keeps
+        its historical EOF barrier because live descendants can lock fixture
+        working directories; Unix completion stays nonblocking because an
+        orphaned writer is the Darwin scheduling failure this helper fixes. }
+      {$IFDEF MSWINDOWS}
+      if not Result.TimedOut then
+      begin
+        Result.Stdout := Result.Stdout + DrainExitedStream(P.Output);
+        Result.Stderr := Result.Stderr + DrainExitedStream(P.Stderr);
+      end
+      else
+      {$ENDIF}
+      begin
+        if P.Output.NumBytesAvailable > 0 then
+          Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
+        if P.Stderr.NumBytesAvailable > 0 then
+          Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
+      end;
       { Mirrors LWPT.Command.Common.NormalisedExitCode (this unit must
         not link LWPT units): on Unix, ExitCode decodes correctly only
         when the Running poll reaped the raw waitpid(2) status; if

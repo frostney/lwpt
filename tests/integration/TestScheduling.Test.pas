@@ -41,6 +41,7 @@ const
   ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
   ProcessCaptureOverflowHoldMilliseconds = 2000;
   SiblingFanoutCeilingMilliseconds = 1500;
+  SubprocessDrainCompletionCeilingMilliseconds = 5000;
   { Scheduling speed is not part of the fanout contract. This ceiling only
     diagnoses a sibling that genuinely never reaches the startup barrier. }
   SiblingStartupBarrierCeilingSeconds = ProcessStartupCeilingSeconds * 3;
@@ -180,6 +181,7 @@ type
     procedure TestInheritedChannelRejectsRegularFiles;
     procedure TestInheritedChannelRejectsWrongPipeDirection;
     procedure TestAcknowledgementControlReadIsBounded;
+    procedure TestSubprocessDrainDoesNotWaitForInheritedPipeEOF;
     {$ENDIF}
     {$IFDEF MSWINDOWS}
     procedure RunWindowsConsoleForwardingTest(const AControlType: DWORD;
@@ -1622,6 +1624,56 @@ begin
     if ControlPipe[1] >= 0 then FpClose(ControlPipe[1]);
   end;
 end;
+
+procedure TTestScheduling.TestSubprocessDrainDoesNotWaitForInheritedPipeEOF;
+var
+  HolderPID: Integer;
+  HolderPIDPath: string;
+  RunResult: TLwptResult;
+  StartedAt: QWord;
+begin
+  HolderPID := -1;
+  ResetProject(0);
+  HolderPIDPath := FScratch + '/control/pipe-holder-pid';
+  WriteTextFile(FScratch + '/tests/A.InheritPipe.Test.pas',
+      'program InheritPipeFixture;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Process;'#10
+    + 'var Child: TProcess; PIDFile: Text;'#10
+    + 'begin'#10
+    + '  Child := TProcess.Create(nil);'#10
+    + '  try'#10
+    + '    Child.Executable := ''/bin/sleep'';'#10
+    + '    Child.Parameters.Add(''15'');'#10
+    + '    Child.Execute;'#10
+    + '    Assign(PIDFile, ' + PascalString(HolderPIDPath) + ');'#10
+    + '    Rewrite(PIDFile);'#10
+    + '    Write(PIDFile, Child.ProcessID);'#10
+    + '    Close(PIDFile);'#10
+    + '  finally Child.Free end;'#10
+    + 'end.'#10);
+  try
+    StartedAt := GetTickCount64;
+    RunResult := RunTests(['--jobs=1']);
+    Expect<Integer>(RunResult.ExitCode).ToBe(0);
+    Expect<Boolean>(GetTickCount64 - StartedAt
+      < SubprocessDrainCompletionCeilingMilliseconds).ToBe(True);
+    Expect<Boolean>(FileExists(HolderPIDPath)).ToBe(True);
+    if FileExists(HolderPIDPath) then
+      HolderPID := StrToInt(Trim(ReadBinaryFile(HolderPIDPath)));
+    Expect<Boolean>(ProcessIsRunning(HolderPID)).ToBe(True);
+  finally
+    if (HolderPID > 0) and ProcessIsRunning(HolderPID) then
+    begin
+      FpKill(HolderPID, SIGTERM);
+      StartedAt := GetTickCount64;
+      while ProcessIsRunning(HolderPID)
+        and (GetTickCount64 - StartedAt
+          < QWord(ProcessExitCeilingSeconds) * 1000) do
+        Sleep(ProcessPollMilliseconds);
+    end;
+  end;
+end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
@@ -2153,6 +2205,8 @@ begin
     TestInheritedChannelRejectsWrongPipeDirection);
   Test('acknowledgement control read is bounded for EOF and no data',
     TestAcknowledgementControlReadIsBounded);
+  Test('subprocess drain does not wait for inherited pipe EOF',
+    TestSubprocessDrainDoesNotWaitForInheritedPipeEOF);
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Test('Ctrl-C reaps the active compiler Job Object',
