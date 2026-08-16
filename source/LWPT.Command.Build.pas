@@ -142,7 +142,7 @@ type
     procedure Cancel;
     procedure CompleteCancel;
     function IsDone: Boolean;
-    property Compiled: TLWPTCompiledEntry read FCompiled;
+    function TakeCompiled: TLWPTCompiledEntry;
     property BuildResult: TLWPTBuildResult read FBuildResult;
     property CompilerExitCode: Integer read FCompilerExitCode;
     property CapturedOutput: string read FOutput;
@@ -925,6 +925,10 @@ end;
 
 destructor TLWPTBuildJob.Destroy;
 begin
+  { A completed result transfers its producer lease through TakeCompiled.
+    Any lease still attached here belongs to a failed, cancelled, or
+    never-consumed job and must not outlive that job. }
+  FreeAndNil(FCompiled.ProducerLease);
   { Execute releases and nils FLease at the end of every run, so a lease
     still attached here belongs to a job whose thread never started.
     Destroying it returns the worker grant. }
@@ -932,6 +936,12 @@ begin
   FCompiler.Free;
   DoneCriticalSection(FDoneCriticalSection);
   inherited Destroy;
+end;
+
+function TLWPTBuildJob.TakeCompiled: TLWPTCompiledEntry;
+begin
+  Result := FCompiled;
+  FCompiled.ProducerLease := nil;
 end;
 
 procedure TLWPTBuildJob.Execute;
@@ -1683,7 +1693,7 @@ begin
               CompilerExitCodes[i] := Jobs[i].CompilerExitCode;
               if Jobs[i].Succeeded then
               begin
-                Compiled[i] := Jobs[i].Compiled;
+                Compiled[i] := Jobs[i].TakeCompiled;
                 States[i] := besCompiled;
                 Reporter.MarkJobInactive(LogIdentity(i));
               end
