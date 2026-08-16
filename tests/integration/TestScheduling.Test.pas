@@ -818,6 +818,7 @@ var
   Attempt: Integer;
   CompilerPID: Integer;
   NestedProject, PIDFile: string;
+  NaturalExitObserved: Boolean;
   CommandResult: TLwptResult;
 begin
   for Attempt := 1 to 8 do
@@ -837,6 +838,7 @@ begin
     + '    Child.Executable := '
     + PascalString(LwptBinaryPath) + ';'#10
     + '    Child.Parameters.Add(''build'');'#10
+    + '    Child.Parameters.Add(''--no-cache'');'#10
     + '    Child.CurrentDirectory := ' + PascalString(NestedProject) + ';'#10
     + '    for Index := 1 to GetEnvironmentVariableCount do'#10
     + '    begin'#10
@@ -892,22 +894,23 @@ begin
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
 
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
-  if FileExists(PIDFile + NestedCompilerNaturalExitSuffix) then
-  begin
-    WriteLn(ErrOutput, '[DEBUG-50] nested compiler reached natural exit on '
-      + 'attempt ', Attempt);
-    WriteLn(ErrOutput, '[DEBUG-50] captured stdout:');
-    WriteLn(ErrOutput, CommandResult.Stdout);
-    WriteLn(ErrOutput, '[DEBUG-50] captured stderr:');
-    WriteLn(ErrOutput, CommandResult.Stderr);
-  end;
-  Expect<Boolean>(FileExists(PIDFile + NestedCompilerNaturalExitSuffix))
-    .ToBe(False);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
   CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
   { Reap-until-empty is part of the command-return contract: no retry loop. }
   Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+  NaturalExitObserved := FileExists(
+    PIDFile + NestedCompilerNaturalExitSuffix);
+  if NaturalExitObserved then
+  begin
+    WriteLn(ErrOutput, '[DEBUG-50 no-cache] nested compiler reached natural '
+      + 'exit on attempt ', Attempt);
+    WriteLn(ErrOutput, '[DEBUG-50 no-cache] captured stdout:');
+    WriteLn(ErrOutput, CommandResult.Stdout);
+    WriteLn(ErrOutput, '[DEBUG-50 no-cache] captured stderr:');
+    WriteLn(ErrOutput, CommandResult.Stderr);
+  end;
+  Expect<Boolean>(NaturalExitObserved).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/control/nested-pending-ran'))
     .ToBe(False);
   Expect<Boolean>(Pos('A.Nested.Test.pas ... cancelled',
