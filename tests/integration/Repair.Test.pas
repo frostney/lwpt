@@ -41,6 +41,7 @@ type
   private
     FCacheRoot, FOrigDir, FScratch, FWorkerState: string;
     procedure SetupScratchProject;
+    procedure WriteCacheBytes(const APath, ABytes: string);
     function RunRepair: TLwptResult;
   protected
     procedure BeforeAll; override;
@@ -75,6 +76,21 @@ begin
     'interface'#10 +
     'implementation'#10 +
     'end.'#10);
+end;
+
+procedure TRepairE2E.WriteCacheBytes(const APath, ABytes: string);
+var
+  Raw: RawByteString;
+  Stream: TFileStream;
+begin
+  ForceDirectories(ExtractFileDir(APath));
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    Raw := RawByteString(ABytes);
+    if Length(Raw) > 0 then Stream.WriteBuffer(Raw[1], Length(Raw));
+  finally
+    Stream.Free;
+  end;
 end;
 
 function TRepairE2E.RunRepair: TLwptResult;
@@ -273,8 +289,8 @@ begin
     + Copy(CORRUPT_HEX, 1, 2) + '/' + Copy(CORRUPT_HEX, 3, MaxInt);
   HealthyPath := FCacheRoot + '/dependency-archives/sha256/'
     + Copy(HEALTHY_HEX, 1, 2) + '/' + Copy(HEALTHY_HEX, 3, MaxInt);
-  WriteTextFile(CorruptPath, 'tampered');
-  WriteTextFile(HealthyPath, 'healthy cache payload');
+  WriteCacheBytes(CorruptPath, 'tampered'#10);
+  WriteCacheBytes(HealthyPath, 'healthy cache payload'#10);
   WriteTextFile(FCacheRoot + '/dependency-archives/tmp/incomplete',
     'partial');
 
