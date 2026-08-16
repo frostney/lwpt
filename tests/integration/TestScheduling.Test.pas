@@ -815,10 +815,13 @@ end;
 
 procedure TTestScheduling.TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
 var
+  Attempt: Integer;
   CompilerPID: Integer;
   NestedProject, PIDFile: string;
   CommandResult: TLwptResult;
 begin
+  for Attempt := 1 to 8 do
+  begin
   ResetProject(0);
   NestedProject := FScratch + '/nested-build';
   PIDFile := FScratch + '/control/nested-compiler-pid';
@@ -891,7 +894,8 @@ begin
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
   if FileExists(PIDFile + NestedCompilerNaturalExitSuffix) then
   begin
-    WriteLn(ErrOutput, '[DEBUG-50] nested compiler reached natural exit');
+    WriteLn(ErrOutput, '[DEBUG-50] nested compiler reached natural exit on '
+      + 'attempt ', Attempt);
     WriteLn(ErrOutput, '[DEBUG-50] captured stdout:');
     WriteLn(ErrOutput, CommandResult.Stdout);
     WriteLn(ErrOutput, '[DEBUG-50] captured stderr:');
@@ -912,6 +916,7 @@ begin
   Expect<Boolean>(Pos('B.Fail.Test.pas ... FAIL (exit 1)',
     CommandResult.Stdout) > 0)
     .ToBe(True);
+  end;
 end;
 
 procedure TTestScheduling.TestWorkerErrorTerminatesActiveProcessTree;
@@ -2126,9 +2131,6 @@ begin
     TestCompileFailureCountsTowardBail);
   Test('bail terminates active and leaves pending unstarted',
     TestBailTerminatesActiveAndLeavesPendingUnstarted);
-  Test('bail reaps nested ' + PROJECT_NAME
-    + ' compiler that ignores SIGTERM',
-    TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
   Test('worker error terminates another active process tree',
     TestWorkerErrorTerminatesActiveProcessTree);
   Test('successful nested termination acknowledgement completes cancellation',
@@ -2173,6 +2175,9 @@ begin
     TestFailureReplaysAndPreservesIsolatedLog);
   Test('verbose success logs never interleave',
     TestVerboseSuccessLogsNeverInterleave);
+  Test('bail reaps nested ' + PROJECT_NAME
+    + ' compiler that ignores SIGTERM',
+    TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
 end;
 
 begin
