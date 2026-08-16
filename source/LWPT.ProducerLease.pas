@@ -65,6 +65,7 @@ type
     function KeyRoot(const AKeyDigest: string): string;
   public
     constructor Create(const ARoot: string);
+    function TryAcquireGuard(const AObjectKey: string): TObject;
     function TryAcquire(const AObjectKey,
       ADescription: string): TLWPTProducerLease;
     function Snapshot(const AObjectKey: string;
@@ -73,6 +74,8 @@ type
   end;
 
 function ProducerLeaseRoot(const ACacheRoot: string): string;
+function RepairProducerLeases(const ACacheRoot: string;
+  out ALivePreserved: Integer): Integer;
 
 implementation
 
@@ -395,6 +398,98 @@ begin
     + PRODUCER_LEASE_NAMESPACE;
 end;
 
+function RepairProducerLeases(const ACacheRoot: string;
+  out ALivePreserved: Integer): Integer;
+var
+  Guard: TLWPTProducerGuard;
+  KeyRootPath, LeaseRoot, PrefixPath, StatePath, TemporaryRoot: string;
+  PrefixSearch, KeySearch: TSearchRec;
+begin
+  Result := 0;
+  ALivePreserved := 0;
+  if IsDirSymlinkOrJunction(ProducerLeaseRoot(ACacheRoot)) then
+  begin
+    WipeDir(ProducerLeaseRoot(ACacheRoot));
+    Inc(Result);
+    Exit;
+  end;
+  LeaseRoot := IncludeTrailingPathDelimiter(ProducerLeaseRoot(ACacheRoot))
+    + 'sha256';
+  if IsDirSymlinkOrJunction(LeaseRoot) then
+  begin
+    WipeDir(LeaseRoot);
+    Inc(Result);
+    Exit;
+  end;
+  if FindFirst(IncludeTrailingPathDelimiter(LeaseRoot) + '*',
+       faAnyFile or faSymLink,
+       PrefixSearch) <> 0 then Exit;
+  try
+    repeat
+      if (PrefixSearch.Name = '.') or (PrefixSearch.Name = '..') then Continue;
+      if ((PrefixSearch.Attr and faSymLink) <> 0)
+         or IsDirSymlinkOrJunction(IncludeTrailingPathDelimiter(LeaseRoot)
+           + PrefixSearch.Name) then
+      begin
+        WipeDir(IncludeTrailingPathDelimiter(LeaseRoot) + PrefixSearch.Name);
+        Inc(Result);
+        Continue;
+      end;
+      if (PrefixSearch.Attr and faDirectory) = 0 then Continue;
+      PrefixPath := IncludeTrailingPathDelimiter(LeaseRoot)
+        + PrefixSearch.Name;
+      if FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
+           faAnyFile or faSymLink, KeySearch) <> 0 then Continue;
+      try
+        repeat
+          if (KeySearch.Name = '.') or (KeySearch.Name = '..') then Continue;
+          if ((KeySearch.Attr and faSymLink) <> 0)
+             or IsDirSymlinkOrJunction(
+               IncludeTrailingPathDelimiter(PrefixPath) + KeySearch.Name) then
+          begin
+            WipeDir(IncludeTrailingPathDelimiter(PrefixPath) + KeySearch.Name);
+            Inc(Result);
+            Continue;
+          end;
+          if (KeySearch.Attr and faDirectory) = 0 then Continue;
+          KeyRootPath := IncludeTrailingPathDelimiter(PrefixPath)
+            + KeySearch.Name;
+          Guard := nil;
+          if not TLWPTProducerGuard.TryCreate(
+               IncludeTrailingPathDelimiter(KeyRootPath) + GUARD_FILE,
+               Guard) then
+          begin
+            Inc(ALivePreserved);
+            Continue;
+          end;
+          try
+            StatePath := IncludeTrailingPathDelimiter(KeyRootPath)
+              + STATE_FILE;
+            TemporaryRoot := IncludeTrailingPathDelimiter(KeyRootPath)
+              + 'tmp';
+            if FileExists(StatePath) or DirectoryExists(TemporaryRoot) then
+            begin
+              if FileExists(StatePath) and not SysUtils.DeleteFile(StatePath)
+                 then
+                raise ELWPTProducerLeaseError.CreateFmt(
+                  'failed to reclaim abandoned producer state at %s',
+                  [StatePath]);
+              if DirectoryExists(TemporaryRoot) then WipeDir(TemporaryRoot);
+              Inc(Result);
+            end;
+          finally
+            Guard.Free;
+          end;
+        until FindNext(KeySearch) <> 0;
+      finally
+        FindClose(KeySearch);
+      end;
+    until FindNext(PrefixSearch) <> 0;
+  finally
+    FindClose(PrefixSearch);
+  end;
+end;
+
 constructor TLWPTProducerLeaseCoordinator.Create(const ARoot: string);
 begin
   inherited Create;
@@ -402,6 +497,9 @@ begin
     raise ELWPTProducerLeaseError.Create(
       'producer-lease root cannot be empty');
   FRoot := ExcludeTrailingPathDelimiter(ExpandFileName(ARoot));
+  if IsDirSymlinkOrJunction(FRoot) then
+    raise ELWPTProducerLeaseError.Create(
+      'producer-lease namespace root must not be a link');
 end;
 
 function TLWPTProducerLeaseCoordinator.KeyDigest(
@@ -420,6 +518,47 @@ begin
     + Copy(AKeyDigest, 1, 2) + '/' + Copy(AKeyDigest, 3, MaxInt);
 end;
 
+procedure EnsureLeaseDirectory(const ARoot, ADigest: string;
+  out AKeyDirectory: string);
+var
+  PrefixDirectory, SHA256Directory: string;
+begin
+  SHA256Directory := IncludeTrailingPathDelimiter(ARoot) + 'sha256';
+  PrefixDirectory := IncludeTrailingPathDelimiter(SHA256Directory)
+    + Copy(ADigest, 1, 2);
+  AKeyDirectory := IncludeTrailingPathDelimiter(PrefixDirectory)
+    + Copy(ADigest, 3, MaxInt);
+  if IsDirSymlinkOrJunction(SHA256Directory)
+     or IsDirSymlinkOrJunction(PrefixDirectory)
+     or IsDirSymlinkOrJunction(AKeyDirectory) then
+    raise ELWPTProducerLeaseError.Create(
+      'producer-lease state must not traverse a link');
+  if not EnsureDirectory(AKeyDirectory) then
+    raise ELWPTProducerLeaseError.CreateFmt(
+      'failed to create producer-lease directory at %s', [AKeyDirectory]);
+  if IsDirSymlinkOrJunction(SHA256Directory)
+     or IsDirSymlinkOrJunction(PrefixDirectory)
+     or IsDirSymlinkOrJunction(AKeyDirectory) then
+    raise ELWPTProducerLeaseError.Create(
+      'producer-lease state became a link');
+end;
+
+function TLWPTProducerLeaseCoordinator.TryAcquireGuard(
+  const AObjectKey: string): TObject;
+var
+  Guard: TLWPTProducerGuard;
+  Digest, KeyDirectory: string;
+begin
+  Result := nil;
+  Digest := KeyDigest(AObjectKey);
+  EnsureLeaseDirectory(FRoot, Digest, KeyDirectory);
+  Guard := nil;
+  if TLWPTProducerGuard.TryCreate(
+       IncludeTrailingPathDelimiter(KeyDirectory) + GUARD_FILE,
+       Guard) then
+    Result := Guard;
+end;
+
 function TLWPTProducerLeaseCoordinator.TryAcquire(const AObjectKey,
   ADescription: string): TLWPTProducerLease;
 var
@@ -429,10 +568,7 @@ var
 begin
   Result := nil;
   Digest := KeyDigest(AObjectKey);
-  KeyDirectory := KeyRoot(Digest);
-  if not EnsureDirectory(KeyDirectory) then
-    raise ELWPTProducerLeaseError.CreateFmt(
-      'failed to create producer-lease directory at %s', [KeyDirectory]);
+  EnsureLeaseDirectory(FRoot, Digest, KeyDirectory);
   Guard := nil;
   if not TLWPTProducerGuard.TryCreate(
        IncludeTrailingPathDelimiter(KeyDirectory) + GUARD_FILE,

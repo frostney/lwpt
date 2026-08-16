@@ -74,7 +74,7 @@ After bootstrap:
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
-./build/lwpt repair             # reclaim install, build, and worker residue
+./build/lwpt repair             # recover project and shared-cache residue
 ```
 
 [`build-system.md`](./build-system.md) covers each in depth.

@@ -13,6 +13,7 @@ uses
   Process,
   SysUtils,
 
+  LWPT.CacheLifecycle,
   LWPT.Core,
   LWPT.ObjectStore,
   TestingPascalLibrary,
@@ -20,12 +21,15 @@ uses
 
 const
   ADMIT_CHILD_SWITCH = '--object-store-admit-child';
+  GUARDED_ADMIT_CHILD_SWITCH = '--object-store-guarded-admit-child';
   START_BARRIER_TIMEOUT_MS = 10000;
   ADMIT_CHILD_TIMEOUT_MS = 5000;
   ADMIT_CHILD_TERMINATION_TIMEOUT_MS = 2000;
 
 var
   ReplacementSource: string;
+  StageReadyPath: string;
+  StageReleasePath: string;
 
 type
   TObjectStoreContract = class(TTestSuite)
@@ -37,7 +41,8 @@ type
     procedure ResetScratch;
     procedure WriteBytes(const APath, AText: string);
     function ReadBytes(const APath: string): string;
-    function StartAdmitter(const AReadyPath, AReleasePath: string): TProcess;
+    function StartAdmitter(const AReadyPath, AReleasePath: string;
+      const AGuarded: Boolean = False): TProcess;
   protected
     procedure BeforeAll; override;
     procedure BeforeEach; override;
@@ -52,6 +57,7 @@ type
     procedure TestConcurrentValidReplacementIsRestoredAfterQuarantine;
     procedure TestInterruptedTemporaryObjectIsNeverVisible;
     procedure TestConcurrentSameKeyAdmissionPublishesOneCompleteObject;
+    procedure TestRepairPreservesActiveCrossProcessAdmission;
     procedure TestCacheRootOverrideIsAbsoluteAndNormalized;
     procedure TestPlatformDefaultUsesPerUserCacheLocation;
   end;
@@ -62,6 +68,16 @@ var
 begin
   Stream := TFileStream.Create(APath, fmCreate);
   Stream.Free;
+end;
+
+function WaitForSignal(const APath: string): Boolean; forward;
+
+procedure PauseAfterStage(const APath: string);
+begin
+  WriteSignal(StageReadyPath);
+  if not WaitForSignal(StageReleasePath) then
+    raise Exception.CreateFmt(
+      'timed out waiting to release staged object %s', [APath]);
 end;
 
 function WaitForSignal(const APath: string): Boolean;
@@ -113,14 +129,27 @@ var
   Store: TLWPTImmutableObjectStore;
 begin
   Result := False;
-  if (ParamCount <> 6) or (ParamStr(1) <> ADMIT_CHILD_SWITCH) then Exit;
-  Store := TLWPTImmutableObjectStore.Create(ParamStr(2));
+  if (ParamCount <> 6) or ((ParamStr(1) <> ADMIT_CHILD_SWITCH)
+     and (ParamStr(1) <> GUARDED_ADMIT_CHILD_SWITCH)) then Exit;
+  Store := TLWPTImmutableObjectStore.Create(ParamStr(2),
+    ExtractFileDir(ParamStr(2)), DEPENDENCY_ARCHIVE_NAMESPACE);
   try
-    WriteSignal(ParamStr(5));
-    if not WaitForSignal(ParamStr(6)) then
-      raise Exception.Create('timed out waiting for object-store start barrier');
+    if ParamStr(1) = GUARDED_ADMIT_CHILD_SWITCH then
+    begin
+      StageReadyPath := ParamStr(5);
+      StageReleasePath := ParamStr(6);
+      ObjectStoreAfterStageTestHook := PauseAfterStage;
+    end
+    else
+    begin
+      WriteSignal(ParamStr(5));
+      if not WaitForSignal(ParamStr(6)) then
+        raise Exception.Create(
+          'timed out waiting for object-store start barrier');
+    end;
     Store.Admit(ParamStr(3), ParamStr(4));
   finally
+    ObjectStoreAfterStageTestHook := nil;
     Store.Free;
   end;
   Result := True;
@@ -194,11 +223,12 @@ begin
 end;
 
 function TObjectStoreContract.StartAdmitter(const AReadyPath,
-  AReleasePath: string): TProcess;
+  AReleasePath: string; const AGuarded: Boolean): TProcess;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := ParamStr(0);
-  Result.Parameters.Add(ADMIT_CHILD_SWITCH);
+  if AGuarded then Result.Parameters.Add(GUARDED_ADMIT_CHILD_SWITCH)
+  else Result.Parameters.Add(ADMIT_CHILD_SWITCH);
   Result.Parameters.Add(FStoreRoot);
   Result.Parameters.Add(FSource);
   Result.Parameters.Add(FDigest);
@@ -208,12 +238,44 @@ begin
   Result.Execute;
 end;
 
+procedure TObjectStoreContract.TestRepairPreservesActiveCrossProcessAdmission;
+var
+  Admitter: TProcess;
+  ReadyPath, ReleasePath: string;
+  Report: TLWPTCacheRepairReport;
+  Store: TLWPTImmutableObjectStore;
+begin
+  ReadyPath := FScratch + '/staged-ready';
+  ReleasePath := FScratch + '/release-staged';
+  Admitter := StartAdmitter(ReadyPath, ReleasePath, True);
+  try
+    Expect<Boolean>(WaitForSignal(ReadyPath)).ToBe(True);
+    Report := RepairSharedCache(FScratch + '/cache');
+    Expect<Boolean>(Report.LiveObjectsPreserved >= 1).ToBe(True);
+    WriteSignal(ReleasePath);
+    WaitForAdmitter(Admitter);
+    Expect<Integer>(Admitter.ExitStatus).ToBe(0);
+  finally
+    if not FileExists(ReleasePath) then WriteSignal(ReleasePath);
+    StopAdmitter(Admitter);
+    Admitter.Free;
+  end;
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    Expect<Boolean>(FileExists(Store.ObjectPath(FDigest))).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
 procedure TObjectStoreContract.TestDigestAddressIsCanonicalAndSharded;
 var
   Store: TLWPTImmutableObjectStore;
   Hex, Expected: string;
 begin
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     Hex := Copy(FDigest, 8, MaxInt);
     Expected := IncludeTrailingPathDelimiter(ExpandFileName(FStoreRoot))
@@ -229,7 +291,8 @@ var
   Store: TLWPTImmutableObjectStore;
   Refused: Boolean;
 begin
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     Refused := False;
     try
@@ -248,7 +311,8 @@ var
   Store: TLWPTImmutableObjectStore;
   ObjectPath, HitPath, Destination: string;
 begin
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     ObjectPath := Store.Admit(FSource, FDigest);
     Expect<Boolean>(Store.Lookup(FDigest, HitPath)).ToBe(True);
@@ -268,7 +332,8 @@ var
   Store: TLWPTImmutableObjectStore;
   Refused: Boolean;
 begin
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     Refused := False;
     try
@@ -290,7 +355,8 @@ var
   SR: TSearchRec;
   Quarantined: Boolean;
 begin
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     ObjectPath := Store.Admit(FSource, FDigest);
     WriteBytes(ObjectPath, 'corrupt');
@@ -317,7 +383,8 @@ var
   Store: TLWPTImmutableObjectStore;
   ObjectPath, HitPath: string;
 begin
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     ObjectPath := Store.Admit(FSource, FDigest);
     WriteBytes(ObjectPath, 'corrupt');
@@ -339,7 +406,8 @@ var
   HitPath: string;
 begin
   WriteBytes(FStoreRoot + '/tmp/interrupted.tmp', ReadBytes(FSource));
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     Expect<Boolean>(Store.Lookup(FDigest, HitPath)).ToBe(False);
   finally
@@ -382,7 +450,8 @@ begin
       Second.Free;
     end;
   end;
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot);
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     Expect<Boolean>(Store.Lookup(FDigest, HitPath)).ToBe(True);
     Expect<string>(ReadBytes(HitPath)).ToBe(ReadBytes(FSource));
@@ -437,6 +506,8 @@ begin
     TestInterruptedTemporaryObjectIsNeverVisible);
   Test('concurrent same-key producers publish one complete object',
     TestConcurrentSameKeyAdmissionPublishesOneCompleteObject);
+  Test('repair preserves a cross-process admission paused after staging',
+    TestRepairPreservesActiveCrossProcessAdmission);
   Test('cache-root override is absolute and normalized',
     TestCacheRootOverrideIsAbsoluteAndNormalized);
   Test('platform default uses the per-user cache location',

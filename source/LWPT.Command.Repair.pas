@@ -16,9 +16,11 @@ uses
   SysUtils,
 
   LWPT.BuildSession,
+  LWPT.CacheLifecycle,
   LWPT.Core,
   LWPT.Install,
   LWPT.Manifest,
+  LWPT.ObjectStore,
   LWPT.WorkerBudget;
 
 function LooksLikeAbsolutePath(const APath: string): Boolean;
@@ -46,6 +48,7 @@ var
   TmpRootCleaned: Boolean;
   WorkerLines : TStringList;
   WorkerSnapshot : TLWPTWorkerBudgetSnapshot;
+  CacheReport: TLWPTCacheRepairReport;
   Reclaimed, i : Integer;
 begin
   Ctx := LoadManifestContext(AManifestPath);
@@ -91,8 +94,26 @@ begin
     WorkerLines.Free;
   end;
 
-  WriteLn('repair complete. Interrupted install state was restored before '
-    + 'temporary residue was removed.');
+  CacheReport := RepairSharedCache(ResolveCacheRoot);
+  WriteLn('repair: shared cache ', CacheReport.BytesAfter, ' byte(s) after ',
+    'repair; budget ', CacheReport.BudgetBytes, ' byte(s), reclaimed ',
+    CacheReport.BytesReclaimed, ' byte(s)');
+  WriteLn('repair: removed ', CacheReport.CorruptObjectsRemoved,
+    ' corrupt shared-cache object(s), ',
+    CacheReport.IncompleteEntriesRemoved, ' incomplete area(s), and ',
+    CacheReport.AbandonedLeasesReclaimed,
+    ' abandoned producer lease(s)');
+  WriteLn('repair: preserved ', CacheReport.LiveObjectsPreserved,
+    ' live shared-cache object(s) and ', CacheReport.LiveLeasesPreserved,
+    ' live producer lease(s)');
+  if CacheReport.IndexRebuilt then
+    WriteLn('repair: rebuilt the shared-cache LRU index from verified ',
+      'object manifests')
+  else
+    WriteLn('repair: verified the shared-cache LRU index');
+
+  WriteLn('repair complete. Project install recovery and per-user shared-cache '
+    + 'recovery completed without touching committed project archives.');
 end;
 
 end.

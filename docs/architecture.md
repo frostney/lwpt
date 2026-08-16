@@ -212,6 +212,13 @@ installs are not supported.
   proceed independently, and owner death releases the guard for takeover.
   Heartbeat age is diagnostic rather than authority, preserving a healthy
   long-running producer.
+- **Cache lifecycle:** `LWPT.CacheLifecycle` owns one aggregate per-user object
+  budget across dependency archives and build results. It records a monotonic
+  deterministic LRU index, protects admission and materialization with
+  per-object OS-held guards, and serializes only index/budget mutations.
+  `lwpt repair` verifies object manifests and content, reconstructs damaged
+  index state, reclaims abandoned/incomplete residue, preserves live guards,
+  and evicts unleased objects until the configured budget is met.
 - **Test:** Each `*.Test.pas` is a self-contained program using
   `TestingPascalLibrary`. `lwpt test` resolves the project-scoped compiler
   driver once and shares it across every test worker; per-entry compiler

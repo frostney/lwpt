@@ -11,8 +11,12 @@ uses
   Classes,
   Process,
   SysUtils,
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
 
   LWPT.BuildCache,
+  LWPT.CacheLifecycle,
   LWPT.Core,
   TestingPascalLibrary,
   Tests.Scratch;
@@ -29,6 +33,7 @@ type
     FScratch: string;
     FCacheRoot: string;
     FArtifact: string;
+    FOriginalBudget: string;
     procedure ResetScratch;
     procedure WriteBytes(const APath, AText: string);
     function ReadBytes(const APath: string): string;
@@ -46,7 +51,48 @@ type
     procedure TestInvalidFingerprintIsRefused;
     procedure TestCorruptArtifactIsRejected;
     procedure TestConcurrentStoresPublishOneMatchingCompleteResult;
+    procedure TestBudgetRefusalLeavesNoPartialResult;
   end;
+
+{$IFDEF UNIX}
+function CSetEnvironmentVariable(AName, AValue: PAnsiChar;
+  AOverwrite: LongInt): LongInt; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'setenv';
+  {$ELSE}
+  external name 'setenv';
+  {$ENDIF}
+function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'unsetenv';
+  {$ELSE}
+  external name 'unsetenv';
+  {$ENDIF}
+{$ENDIF}
+
+procedure SetBudgetEnvironment(const AValue: string);
+{$IFDEF UNIX}
+var
+  Name, Value: AnsiString;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Name, Value: UnicodeString;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Name := AnsiString(CACHE_MAX_BYTES_ENV);
+  Value := AnsiString(AValue);
+  if AValue = '' then CUnsetEnvironmentVariable(PAnsiChar(Name))
+  else CSetEnvironmentVariable(PAnsiChar(Name), PAnsiChar(Value), 1);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Name := UnicodeString(CACHE_MAX_BYTES_ENV);
+  Value := UnicodeString(AValue);
+  if AValue = '' then Windows.SetEnvironmentVariableW(PWideChar(Name), nil)
+  else Windows.SetEnvironmentVariableW(PWideChar(Name), PWideChar(Value));
+  {$ENDIF}
+end;
 
 function RunChildMode: Boolean;
 var
@@ -109,11 +155,13 @@ begin
   FCacheRoot := FScratch + '/cache';
   FArtifact := FScratch + '/input/app';
   WriteBytes(FArtifact, 'compiled bytes'#0'with binary tail');
+  SetBudgetEnvironment('');
 end;
 
 procedure TBuildCacheContract.BeforeAll;
 begin
   FScratch := CreateScratchRoot('build-cache');
+  FOriginalBudget := SysUtils.GetEnvironmentVariable(CACHE_MAX_BYTES_ENV);
 end;
 
 procedure TBuildCacheContract.BeforeEach;
@@ -123,7 +171,28 @@ end;
 
 procedure TBuildCacheContract.AfterAll;
 begin
+  SetBudgetEnvironment(FOriginalBudget);
   if DirectoryExists(FScratch) then WipeDir(FScratch);
+end;
+
+procedure TBuildCacheContract.TestBudgetRefusalLeavesNoPartialResult;
+var
+  ArtifactDigest: string;
+  Cache: TLWPTBuildCache;
+begin
+  SetBudgetEnvironment(IntToStr(Length(ReadBytes(FArtifact))));
+  ArtifactDigest := 'sha256:' + SHA256File(FArtifact);
+  Cache := TLWPTBuildCache.Create(FCacheRoot);
+  try
+    Expect<Boolean>(Cache.Store(TEST_FINGERPRINT, FArtifact,
+      TEST_ARTIFACT_KIND)).ToBe(False);
+    Expect<Boolean>(FileExists(ObjectPath(ArtifactDigest))).ToBe(False);
+    Expect<Boolean>(FileExists(FCacheRoot + '/build-results/refs/sha256/'
+      + Copy(TEST_FINGERPRINT, 8, 2) + '/'
+      + Copy(TEST_FINGERPRINT, 10, MaxInt))).ToBe(False);
+  finally
+    Cache.Free;
+  end;
 end;
 
 function TBuildCacheContract.StartStoreChild(
@@ -299,6 +368,8 @@ begin
   Test('corrupt artifacts are rejected', TestCorruptArtifactIsRejected);
   Test('concurrent stores publish one matching complete result',
     TestConcurrentStoresPublishOneMatchingCompleteResult);
+  Test('a budget refusal leaves no partial logical result',
+    TestBudgetRefusalLeavesNoPartialResult);
 end;
 
 begin

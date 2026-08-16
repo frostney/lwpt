@@ -120,8 +120,13 @@ for safe takeover, while heartbeat age alone cannot displace a live long-running
 compile. The default root is the platform cache location documented in
 [ADR-0036](./adr/0036-per-user-dependency-archive-cas.md), and
 `LWPT_CACHE_DIR` relocates the shared root for both dependency and build
-namespaces. See [ADR-0037](./adr/0037-verified-build-result-cache.md) and
-[ADR-0038](./adr/0038-local-producer-leases.md).
+namespaces. `LWPT_CACHE_MAX_BYTES` sets their one aggregate per-user byte
+budget (10 GiB by default); projects cannot raise or partition it through
+`lwpt.toml`. Normal admission applies deterministic least-recently-used
+eviction and skips caching when an object cannot fit without removing live
+state. See [ADR-0037](./adr/0037-verified-build-result-cache.md),
+[ADR-0038](./adr/0038-local-producer-leases.md), and
+[ADR-0039](./adr/0039-bounded-shared-cache-lifecycle.md).
 
 When a build fails with output matching a stale-artefact signature (internal
 compiler exception, resource-compile errors, missing `.reslst`), `lwpt build`

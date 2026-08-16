@@ -11,6 +11,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.CacheLifecycle,
   LWPT.Core,
   LWPT.ObjectStore,
   LWPT.ProducerLease;
@@ -34,6 +35,7 @@ type
   private
     FRoot: string;
     FTemporaryRoot: string;
+    FCacheLifecycle: TLWPTCacheLifecycle;
     FObjects: TLWPTImmutableObjectStore;
     FProducerLeases: TLWPTProducerLeaseCoordinator;
     function ReferencePath(const AFingerprint: string): string;
@@ -52,8 +54,8 @@ type
       out AReason: string): Boolean;
     function ProducerSnapshot(const AFingerprint: string;
       out ASnapshot: TLWPTProducerLeaseSnapshot): Boolean;
-    procedure Store(const AFingerprint, AArtifactPath,
-      AArtifactKind: string; const AUnixMode: Integer = -1);
+    function Store(const AFingerprint, AArtifactPath,
+      AArtifactKind: string; const AUnixMode: Integer = -1): Boolean;
     function TryAcquireProducer(const AFingerprint,
       ADescription: string): TLWPTProducerLease;
     property Root: string read FRoot;
@@ -120,8 +122,11 @@ begin
   inherited Create;
   FRoot := BuildResultCacheRoot(ACacheRoot);
   FTemporaryRoot := IncludeTrailingPathDelimiter(FRoot) + 'tmp';
+  FCacheLifecycle := TLWPTCacheLifecycle.Create(ACacheRoot,
+    BUILD_RESULT_NAMESPACE);
   FObjects := TLWPTImmutableObjectStore.Create(
-    IncludeTrailingPathDelimiter(FRoot) + 'objects');
+    IncludeTrailingPathDelimiter(FRoot) + 'objects', ACacheRoot,
+    BUILD_RESULT_NAMESPACE);
   FProducerLeases := TLWPTProducerLeaseCoordinator.Create(
     ProducerLeaseRoot(ACacheRoot));
 end;
@@ -135,6 +140,7 @@ destructor TLWPTBuildCache.Destroy;
 begin
   FProducerLeases.Free;
   FObjects.Free;
+  FCacheLifecycle.Free;
   inherited Destroy;
 end;
 
@@ -259,17 +265,24 @@ begin
     AReason := 'invalid-reference';
     Exit;
   end;
-  if not FObjects.Lookup(ManifestDigest, ManifestPath) then
+  ForceDirectories(ASessionTemporaryRoot);
+  ManifestPath := MakeTmpPath(ASessionTemporaryRoot, 'result-manifest');
+  if not FObjects.Materialize(ManifestDigest, ManifestPath,
+       ASessionTemporaryRoot) then
   begin
     AReason := 'result-manifest-missing';
     Exit;
   end;
-  if not ReadSmallTextFile(ManifestPath, ManifestText)
-     or not ParseResultManifest(ManifestText, AResult)
-     or (AResult.Fingerprint <> CanonicalDigest(AFingerprint)) then
-  begin
-    AReason := 'result-manifest-invalid';
-    Exit;
+  try
+    if not ReadSmallTextFile(ManifestPath, ManifestText)
+       or not ParseResultManifest(ManifestText, AResult)
+       or (AResult.Fingerprint <> CanonicalDigest(AFingerprint)) then
+    begin
+      AReason := 'result-manifest-invalid';
+      Exit;
+    end;
+  finally
+    SysUtils.DeleteFile(ManifestPath);
   end;
   if not FObjects.Materialize(AResult.ArtifactDigest, ADestination,
     ASessionTemporaryRoot) then
@@ -287,52 +300,89 @@ begin
   Result := True;
 end;
 
-procedure TLWPTBuildCache.Store(const AFingerprint, AArtifactPath,
-  AArtifactKind: string; const AUnixMode: Integer);
+function TLWPTBuildCache.Store(const AFingerprint, AArtifactPath,
+  AArtifactKind: string; const AUnixMode: Integer): Boolean;
 var
-  ArtifactDigest, ManifestDigest, ManifestPath: string;
+  ArtifactDigest, ManifestDigest, ManifestPath, ManifestTmpRoot: string;
+  ArtifactLease, ManifestLease, MutationLease: TObject;
+  ArtifactInserted, ManifestInserted, Published: Boolean;
   CacheResult: TLWPTCachedBuildResult;
   Lines: TStringList;
 begin
-  if not FileExists(AArtifactPath) then
-    raise ELWPTBuildCacheError.CreateFmt(
-      'cache artifact does not exist: %s', [AArtifactPath]);
-  CacheResult := Default(TLWPTCachedBuildResult);
-  CacheResult.SchemaVersion := BUILD_CACHE_RESULT_SCHEMA_VERSION;
-  CacheResult.Fingerprint := CanonicalDigest(AFingerprint);
-  if CacheResult.Fingerprint = '' then
-    raise ELWPTBuildCacheError.CreateFmt(
-      'invalid build fingerprint "%s"', [AFingerprint]);
-  CacheResult.ArtifactKind := AArtifactKind;
-  if AUnixMode >= 0 then CacheResult.UnixMode := AUnixMode
-  else CacheResult.UnixMode := BuildArtifactUnixMode(AArtifactPath);
-  ArtifactDigest := 'sha256:' + SHA256File(AArtifactPath);
-  CacheResult.ArtifactDigest := ArtifactDigest;
-  FObjects.Admit(AArtifactPath, ArtifactDigest);
+  Result := False;
+  ArtifactLease := nil;
+  ManifestLease := nil;
+  MutationLease := nil;
+  ArtifactInserted := False;
+  ManifestInserted := False;
+  Published := False;
+  try
+    if not FileExists(AArtifactPath) then
+      raise ELWPTBuildCacheError.CreateFmt(
+        'cache artifact does not exist: %s', [AArtifactPath]);
+    CacheResult := Default(TLWPTCachedBuildResult);
+    CacheResult.SchemaVersion := BUILD_CACHE_RESULT_SCHEMA_VERSION;
+    CacheResult.Fingerprint := CanonicalDigest(AFingerprint);
+    if CacheResult.Fingerprint = '' then
+      raise ELWPTBuildCacheError.CreateFmt(
+        'invalid build fingerprint "%s"', [AFingerprint]);
+    CacheResult.ArtifactKind := AArtifactKind;
+    if AUnixMode >= 0 then CacheResult.UnixMode := AUnixMode
+    else CacheResult.UnixMode := BuildArtifactUnixMode(AArtifactPath);
+    ArtifactDigest := 'sha256:' + SHA256File(AArtifactPath);
+    CacheResult.ArtifactDigest := ArtifactDigest;
+    if FObjects.AdmitRetained(AArtifactPath, ArtifactDigest,
+         ArtifactLease, ArtifactInserted) = '' then Exit;
 
-  ForceDirectories(FTemporaryRoot);
-  ManifestPath := MakeTmpPath(FTemporaryRoot, 'build-result');
-  Lines := SerializeResultManifest(CacheResult);
-  try
-    AtomicWriteText(ManifestPath, FTemporaryRoot, Lines);
-  finally
-    Lines.Free;
-  end;
-  try
-    ManifestDigest := 'sha256:' + SHA256File(ManifestPath);
-    FObjects.Admit(ManifestPath, ManifestDigest);
-  finally
-    SysUtils.DeleteFile(ManifestPath);
-  end;
+    { Compose the manifest beside the invocation-private artifact. Shared
+      build-cache tmp is repair-owned and is used only while mutation-guarded. }
+    ManifestTmpRoot := ExtractFileDir(AArtifactPath);
+    ForceDirectories(ManifestTmpRoot);
+    ManifestPath := MakeTmpPath(ManifestTmpRoot, 'build-result');
+    Lines := SerializeResultManifest(CacheResult);
+    try
+      AtomicWriteText(ManifestPath, ManifestTmpRoot, Lines);
+    finally
+      Lines.Free;
+    end;
+    try
+      ManifestDigest := 'sha256:' + SHA256File(ManifestPath);
+      if FObjects.AdmitRetained(ManifestPath, ManifestDigest,
+           ManifestLease, ManifestInserted) = '' then Exit;
+    finally
+      SysUtils.DeleteFile(ManifestPath);
+    end;
 
-  Lines := TStringList.Create;
-  try
-    Lines.LineBreak := #10;
-    Lines.Add(ManifestDigest);
-    ForceDirectories(ExtractFileDir(ReferencePath(AFingerprint)));
-    AtomicWriteText(ReferencePath(AFingerprint), FTemporaryRoot, Lines);
+    MutationLease := FCacheLifecycle.AcquireMutation;
+    try
+      Lines := TStringList.Create;
+      try
+        Lines.LineBreak := #10;
+        Lines.Add(ManifestDigest);
+        ForceDirectories(ExtractFileDir(ReferencePath(AFingerprint)));
+        ForceDirectories(FTemporaryRoot);
+        AtomicWriteText(ReferencePath(AFingerprint), FTemporaryRoot, Lines);
+        Published := True;
+        Result := True;
+      finally
+        Lines.Free;
+      end;
+    finally
+      MutationLease.Free;
+      MutationLease := nil;
+    end;
   finally
-    Lines.Free;
+    MutationLease.Free;
+    try
+      if not Published then
+      begin
+        if ManifestInserted then FObjects.DiscardRetained(ManifestDigest);
+        if ArtifactInserted then FObjects.DiscardRetained(ArtifactDigest);
+      end;
+    finally
+      ManifestLease.Free;
+      ArtifactLease.Free;
+    end;
   end;
 end;
 
