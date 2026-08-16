@@ -889,6 +889,14 @@ begin
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
 
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
+  if FileExists(PIDFile + NestedCompilerNaturalExitSuffix) then
+  begin
+    WriteLn(ErrOutput, '[DEBUG-50] nested compiler reached natural exit');
+    WriteLn(ErrOutput, '[DEBUG-50] captured stdout:');
+    WriteLn(ErrOutput, CommandResult.Stdout);
+    WriteLn(ErrOutput, '[DEBUG-50] captured stderr:');
+    WriteLn(ErrOutput, CommandResult.Stderr);
+  end;
   Expect<Boolean>(FileExists(PIDFile + NestedCompilerNaturalExitSuffix))
     .ToBe(False);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
