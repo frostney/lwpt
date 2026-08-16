@@ -904,7 +904,9 @@ begin
       if (Search.Name = '.') or (Search.Name = '..') then Continue;
       Inc(Result);
       if ((Search.Attr and faDirectory) <> 0)
-         and ((Search.Attr and faSymLink) = 0) then
+         and ((Search.Attr and faSymLink) = 0)
+         and not IsDirSymlinkOrJunction(
+           IncludeTrailingPathDelimiter(APath) + Search.Name) then
       begin
         Child := IncludeTrailingPathDelimiter(APath) + Search.Name;
         Inc(Result, DirectoryEntryCount(Child));
