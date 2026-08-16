@@ -58,6 +58,11 @@ function RepairSharedCache(const ACacheRoot: string):
 
 implementation
 
+{$IFDEF MSWINDOWS}
+uses
+  Windows;
+{$ENDIF}
+
 const
   CACHE_LIFECYCLE_NAMESPACE = 'lifecycle';
   CACHE_INDEX_SCHEMA = 1;
@@ -135,10 +140,50 @@ begin
   Result := Int64(Parsed);
 end;
 
+{$IFDEF UNIX}
+function CGetEnvironmentVariable(AName: PAnsiChar): PAnsiChar; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'getenv';
+  {$ELSE}
+  external name 'getenv';
+  {$ENDIF}
+{$ENDIF}
+
+function LiveEnvironmentVariable(const AName: string): string;
+{$IFDEF UNIX}
+var
+  Name: AnsiString;
+  Value: PAnsiChar;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Name, Value: UnicodeString;
+  Required, Written: DWORD;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Name := AnsiString(AName);
+  Value := CGetEnvironmentVariable(PAnsiChar(Name));
+  if Value = nil then Exit('');
+  Result := string(AnsiString(Value));
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Name := UnicodeString(AName);
+  Required := Windows.GetEnvironmentVariableW(PWideChar(Name), nil, 0);
+  if Required = 0 then Exit('');
+  SetLength(Value, Required);
+  Written := Windows.GetEnvironmentVariableW(PWideChar(Name),
+    PWideChar(Value), Required);
+  if Written = 0 then Exit('');
+  SetLength(Value, Written);
+  Result := string(Value);
+  {$ENDIF}
+end;
+
 function ResolveCacheMaxBytes: Int64;
 begin
   Result := ResolveCacheMaxBytesFromValue(
-    SysUtils.GetEnvironmentVariable(CACHE_MAX_BYTES_ENV));
+    LiveEnvironmentVariable(CACHE_MAX_BYTES_ENV));
 end;
 
 function ReadSmallTextFile(const APath: string;
@@ -316,11 +361,11 @@ begin
           AObjects[LengthBefore] := Item;
         until FindNext(ObjectSearch) <> 0;
       finally
-        FindClose(ObjectSearch);
+        SysUtils.FindClose(ObjectSearch);
       end;
     until FindNext(PrefixSearch) <> 0;
   finally
-    FindClose(PrefixSearch);
+    SysUtils.FindClose(PrefixSearch);
   end;
 end;
 
@@ -588,7 +633,7 @@ begin
   try
     Size := Search.Size;
   finally
-    FindClose(Search);
+    SysUtils.FindClose(Search);
   end;
   WriteManifest(FCacheRoot, FNamespace, ADigest, AObjectPath, Size);
   Entries := TStringList.Create;
@@ -652,7 +697,7 @@ begin
         Inc(Result, Search.Size);
     until FindNext(Search) <> 0;
   finally
-    FindClose(Search);
+    SysUtils.FindClose(Search);
   end;
 end;
 
@@ -677,7 +722,7 @@ begin
       end;
     until FindNext(Search) <> 0;
   finally
-    FindClose(Search);
+    SysUtils.FindClose(Search);
   end;
 end;
 
@@ -735,7 +780,7 @@ begin
       end;
     until FindNext(Search) <> 0;
   finally
-    FindClose(Search);
+    SysUtils.FindClose(Search);
   end;
 end;
 
@@ -783,11 +828,11 @@ begin
           end;
         until FindNext(EntrySearch) <> 0;
       finally
-        FindClose(EntrySearch);
+        SysUtils.FindClose(EntrySearch);
       end;
     until FindNext(PrefixSearch) <> 0;
   finally
-    FindClose(PrefixSearch);
+    SysUtils.FindClose(PrefixSearch);
   end;
 end;
 
