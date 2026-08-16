@@ -815,14 +815,10 @@ end;
 
 procedure TTestScheduling.TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
 var
-  Attempt: Integer;
   CompilerPID: Integer;
   NestedProject, PIDFile: string;
-  NaturalExitObserved: Boolean;
   CommandResult: TLwptResult;
 begin
-  for Attempt := 1 to 8 do
-  begin
   ResetProject(0);
   NestedProject := FScratch + '/nested-build';
   PIDFile := FScratch + '/control/nested-compiler-pid';
@@ -894,23 +890,13 @@ begin
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
 
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
+  Expect<Boolean>(FileExists(PIDFile + NestedCompilerNaturalExitSuffix))
+    .ToBe(False);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
   CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
   { Reap-until-empty is part of the command-return contract: no retry loop. }
   Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
-  NaturalExitObserved := FileExists(
-    PIDFile + NestedCompilerNaturalExitSuffix);
-  if NaturalExitObserved then
-  begin
-    WriteLn(ErrOutput, '[DEBUG-50 no-cache] nested compiler reached natural '
-      + 'exit on attempt ', Attempt);
-    WriteLn(ErrOutput, '[DEBUG-50 no-cache] captured stdout:');
-    WriteLn(ErrOutput, CommandResult.Stdout);
-    WriteLn(ErrOutput, '[DEBUG-50 no-cache] captured stderr:');
-    WriteLn(ErrOutput, CommandResult.Stderr);
-  end;
-  Expect<Boolean>(NaturalExitObserved).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/control/nested-pending-ran'))
     .ToBe(False);
   Expect<Boolean>(Pos('A.Nested.Test.pas ... cancelled',
@@ -919,7 +905,6 @@ begin
   Expect<Boolean>(Pos('B.Fail.Test.pas ... FAIL (exit 1)',
     CommandResult.Stdout) > 0)
     .ToBe(True);
-  end;
 end;
 
 procedure TTestScheduling.TestWorkerErrorTerminatesActiveProcessTree;
@@ -2134,6 +2119,9 @@ begin
     TestCompileFailureCountsTowardBail);
   Test('bail terminates active and leaves pending unstarted',
     TestBailTerminatesActiveAndLeavesPendingUnstarted);
+  Test('bail reaps nested ' + PROJECT_NAME
+    + ' compiler that ignores SIGTERM',
+    TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
   Test('worker error terminates another active process tree',
     TestWorkerErrorTerminatesActiveProcessTree);
   Test('successful nested termination acknowledgement completes cancellation',
@@ -2178,9 +2166,6 @@ begin
     TestFailureReplaysAndPreservesIsolatedLog);
   Test('verbose success logs never interleave',
     TestVerboseSuccessLogsNeverInterleave);
-  Test('bail reaps nested ' + PROJECT_NAME
-    + ' compiler that ignores SIGTERM',
-    TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
 end;
 
 begin
