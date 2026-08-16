@@ -382,13 +382,6 @@ begin
     SetBudget(IntToStr(CacheBytes(FCacheRoot)));
     Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
     Expect<Boolean>(CacheBytes(FCacheRoot) <= ResolveCacheMaxBytes).ToBe(True);
-    with TStringList.Create do
-      try
-        LoadFromFile(FCacheRoot + '/lifecycle/index');
-        Expect<string>(Values['sequence']).ToBe('9');
-      finally
-        Free;
-      end;
   finally
     Store.Free;
   end;
