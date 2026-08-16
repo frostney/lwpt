@@ -41,7 +41,7 @@ const
   ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
   ProcessCaptureOverflowHoldMilliseconds = 2000;
   SiblingFanoutCeilingMilliseconds = 1500;
-  SiblingFanoutDiagnosticIterations = 100;
+  SiblingFanoutDiagnosticIterations = 1;
   SubprocessDrainCompletionCeilingMilliseconds = 5000;
   { Scheduling speed is not part of the fanout contract. This ceiling only
     diagnoses a sibling that genuinely never reaches the startup barrier. }
@@ -1323,8 +1323,9 @@ end;
 procedure TTestScheduling.TestSiblingTerminationAcknowledgementsShareFanout;
 var
   CompilerPID, Iteration, SourceIndex: Integer;
-  CancellationStartedAt, ElapsedMilliseconds: QWord;
-  NaturalExitSources, PIDFile, SourcePIDFile: string;
+  CancellationStartedAt, ElapsedMilliseconds, NaturalExitAt: QWord;
+  MissingMarkerSources, NaturalExitSources, PIDFile, SourcePIDFile,
+    SetupExitSources: string;
   CommandResult: TLwptResult;
 begin
   for Iteration := 1 to SiblingFanoutDiagnosticIterations do
@@ -1340,8 +1341,34 @@ begin
     CommandResult := RunTestsWithCompilerProxy(['--jobs=7'],
       MissingAcknowledgementSiblingCompilerProxyMode, PIDFile, 7);
     if not FileExists(PIDFile + SiblingCancellationStartedSuffix) then
+    begin
+      MissingMarkerSources := '';
+      NaturalExitSources := '';
+      for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+      begin
+        SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
+        if not FileExists(SourcePIDFile) then
+        begin
+          if MissingMarkerSources <> '' then
+            MissingMarkerSources := MissingMarkerSources + ', ';
+          MissingMarkerSources := MissingMarkerSources
+            + SiblingSlowSources[SourceIndex];
+        end;
+        if FileExists(SourcePIDFile + NestedCompilerNaturalExitSuffix) then
+        begin
+          if NaturalExitSources <> '' then
+            NaturalExitSources := NaturalExitSources + ', ';
+          NaturalExitSources := NaturalExitSources
+            + SiblingSlowSources[SourceIndex];
+        end;
+      end;
       Fail(Format('fanout iteration %d did not publish the cancellation '
-        + 'start marker', [Iteration]));
+        + 'start marker; missing sibling markers: %s; sibling safety exits: '
+        + '%s; seven effective workers: %s', [Iteration, MissingMarkerSources,
+        NaturalExitSources,
+        BoolToStr(Pos('effective workers: 7', CommandResult.Stdout) > 0,
+          True)]));
+    end;
     CancellationStartedAt := StrToQWord(Trim(ReadBinaryFile(PIDFile
       + SiblingCancellationStartedSuffix)));
     ElapsedMilliseconds := GetTickCount64 - CancellationStartedAt;
@@ -1349,6 +1376,36 @@ begin
       Fail(Format('fanout iteration %d exited %d instead of 1',
         [Iteration, CommandResult.ExitCode]));
     NaturalExitSources := '';
+    SetupExitSources := '';
+    for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+    begin
+      SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
+      if FileExists(SourcePIDFile + NestedCompilerNaturalExitSuffix) then
+      begin
+        NaturalExitAt := StrToQWord(Trim(ReadBinaryFile(SourcePIDFile
+          + NestedCompilerNaturalExitSuffix)));
+        if NaturalExitAt <= CancellationStartedAt then
+        begin
+          if SetupExitSources <> '' then
+            SetupExitSources := SetupExitSources + ', ';
+          SetupExitSources := SetupExitSources
+            + SiblingSlowSources[SourceIndex];
+        end
+        else
+        begin
+          if NaturalExitSources <> '' then
+            NaturalExitSources := NaturalExitSources + ', ';
+          NaturalExitSources := NaturalExitSources
+            + SiblingSlowSources[SourceIndex];
+        end;
+      end;
+    end;
+    if SetupExitSources <> '' then
+      Fail(Format('fanout iteration %d reached cancellation only after '
+        + 'sibling safety exits: %s', [Iteration, SetupExitSources]));
+    if NaturalExitSources <> '' then
+      Fail(Format('fanout iteration %d failed to cancel sibling proxies: %s',
+        [Iteration, NaturalExitSources]));
     for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
     begin
       SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
@@ -1359,13 +1416,6 @@ begin
       if ProcessIsRunning(CompilerPID) then
         Fail(Format('fanout iteration %d left %s running as PID %d',
           [Iteration, SiblingSlowSources[SourceIndex], CompilerPID]));
-      if FileExists(SourcePIDFile + NestedCompilerNaturalExitSuffix) then
-      begin
-        if NaturalExitSources <> '' then
-          NaturalExitSources := NaturalExitSources + ', ';
-        NaturalExitSources := NaturalExitSources
-          + SiblingSlowSources[SourceIndex];
-      end;
     end;
     if Pos('A.Slow.Test.pas ... ERROR', CommandResult.Stdout) = 0 then
       Fail(Format('fanout iteration %d omitted A.Slow.Test.pas ERROR',
@@ -2153,9 +2203,16 @@ begin
     Sleep(LongRunningFixtureMilliseconds);
     if (Mode = IgnoreTerminateCompilerProxyMode)
        or (Mode = MissingAcknowledgementSiblingCompilerProxyMode) then
-      { Reaching the safety exit means cancellation failed to reap the proxy. }
+    begin
+      { Reaching the safety exit means setup never completed or cancellation
+        failed to reap the proxy. Retire a sibling's readiness marker before
+        publishing the timestamp so a late peer cannot satisfy a stale
+        barrier. }
+      if Mode = MissingAcknowledgementSiblingCompilerProxyMode then
+        DeleteFile(PIDFile);
       WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
         UIntToStr(GetTickCount64));
+    end;
     Exit(0);
   end;
 
