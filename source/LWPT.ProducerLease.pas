@@ -402,22 +402,41 @@ function RepairProducerLeases(const ACacheRoot: string;
   out ALivePreserved: Integer): Integer;
 var
   Guard: TLWPTProducerGuard;
-  KeyRootPath, LeaseRoot, PrefixPath, StatePath, TemporaryRoot: string;
+  KeyRootPath, LeaseNamespaceRoot, LeaseRoot, PrefixPath, StatePath,
+    TemporaryRoot: string;
   PrefixSearch, KeySearch: TSearchRec;
 begin
   Result := 0;
   ALivePreserved := 0;
-  if IsDirSymlinkOrJunction(ProducerLeaseRoot(ACacheRoot)) then
+  LeaseNamespaceRoot := ProducerLeaseRoot(ACacheRoot);
+  if IsDirSymlinkOrJunction(LeaseNamespaceRoot) then
   begin
-    WipeDir(ProducerLeaseRoot(ACacheRoot));
+    WipeDir(LeaseNamespaceRoot);
     Inc(Result);
     Exit;
   end;
-  LeaseRoot := IncludeTrailingPathDelimiter(ProducerLeaseRoot(ACacheRoot))
+  if FileExists(LeaseNamespaceRoot) then
+  begin
+    if not SysUtils.DeleteFile(LeaseNamespaceRoot) then
+      raise ELWPTProducerLeaseError.CreateFmt(
+        'failed to remove invalid producer lease namespace at %s',
+        [LeaseNamespaceRoot]);
+    Inc(Result);
+    Exit;
+  end;
+  LeaseRoot := IncludeTrailingPathDelimiter(LeaseNamespaceRoot)
     + 'sha256';
   if IsDirSymlinkOrJunction(LeaseRoot) then
   begin
     WipeDir(LeaseRoot);
+    Inc(Result);
+    Exit;
+  end;
+  if FileExists(LeaseRoot) then
+  begin
+    if not SysUtils.DeleteFile(LeaseRoot) then
+      raise ELWPTProducerLeaseError.CreateFmt(
+        'failed to remove invalid producer lease root at %s', [LeaseRoot]);
     Inc(Result);
     Exit;
   end;
@@ -528,7 +547,8 @@ begin
     + Copy(ADigest, 1, 2);
   AKeyDirectory := IncludeTrailingPathDelimiter(PrefixDirectory)
     + Copy(ADigest, 3, MaxInt);
-  if IsDirSymlinkOrJunction(SHA256Directory)
+  if IsDirSymlinkOrJunction(ARoot)
+     or IsDirSymlinkOrJunction(SHA256Directory)
      or IsDirSymlinkOrJunction(PrefixDirectory)
      or IsDirSymlinkOrJunction(AKeyDirectory) then
     raise ELWPTProducerLeaseError.Create(
@@ -536,7 +556,8 @@ begin
   if not EnsureDirectory(AKeyDirectory) then
     raise ELWPTProducerLeaseError.CreateFmt(
       'failed to create producer-lease directory at %s', [AKeyDirectory]);
-  if IsDirSymlinkOrJunction(SHA256Directory)
+  if IsDirSymlinkOrJunction(ARoot)
+     or IsDirSymlinkOrJunction(SHA256Directory)
      or IsDirSymlinkOrJunction(PrefixDirectory)
      or IsDirSymlinkOrJunction(AKeyDirectory) then
     raise ELWPTProducerLeaseError.Create(

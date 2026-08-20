@@ -978,13 +978,21 @@ end;
 procedure RemoveObjectStoreLinks(const AObjectRoot: string;
   var AReport: TLWPTCacheRepairReport);
 var
-  EntryPath, PrefixPath, SHA256Root: string;
+  EntryPath, Hex, PrefixPath, SHA256Root: string;
   EntrySearch, PrefixSearch: TSearchRec;
 begin
   SHA256Root := IncludeTrailingPathDelimiter(AObjectRoot) + 'sha256';
   if IsDirSymlinkOrJunction(SHA256Root) then
   begin
     WipeDir(SHA256Root);
+    Inc(AReport.IncompleteEntriesRemoved);
+    Exit;
+  end;
+  if FileExists(SHA256Root) then
+  begin
+    if not SysUtils.DeleteFile(SHA256Root) then
+      raise ELWPTCacheLifecycleError.CreateFmt(
+        'failed to remove invalid object-store root at %s', [SHA256Root]);
     Inc(AReport.IncompleteEntriesRemoved);
     Exit;
   end;
@@ -996,13 +1004,23 @@ begin
       PrefixPath := IncludeTrailingPathDelimiter(SHA256Root)
         + PrefixSearch.Name;
       if ((PrefixSearch.Attr and faSymLink) <> 0)
-         or IsDirSymlinkOrJunction(PrefixPath) then
+         or IsDirSymlinkOrJunction(PrefixPath)
+         or ((PrefixSearch.Attr and faDirectory) = 0)
+         or not IsLowerHex(PrefixSearch.Name + StringOfChar('0', 62)) then
       begin
-        WipeDir(PrefixPath);
+        if (PrefixSearch.Attr and faSymLink) <> 0 then
+          WipeDir(PrefixPath)
+        else if (PrefixSearch.Attr and faDirectory) <> 0 then
+          RemoveResidue(PrefixPath, AReport)
+        else if SysUtils.DeleteFile(PrefixPath) then
+          Inc(AReport.BytesReclaimed, PrefixSearch.Size)
+        else
+          raise ELWPTCacheLifecycleError.CreateFmt(
+            'failed to remove malformed object-store entry at %s',
+            [PrefixPath]);
         Inc(AReport.IncompleteEntriesRemoved);
         Continue;
       end;
-      if (PrefixSearch.Attr and faDirectory) = 0 then Continue;
       if FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
            faAnyFile or faSymLink, EntrySearch) <> 0 then Continue;
       try
@@ -1011,10 +1029,22 @@ begin
             Continue;
           EntryPath := IncludeTrailingPathDelimiter(PrefixPath)
             + EntrySearch.Name;
+          Hex := PrefixSearch.Name + EntrySearch.Name;
           if ((EntrySearch.Attr and faSymLink) <> 0)
-             or IsDirSymlinkOrJunction(EntryPath) then
+             or IsDirSymlinkOrJunction(EntryPath)
+             or ((EntrySearch.Attr and faDirectory) <> 0)
+             or not IsLowerHex(Hex) then
           begin
-            WipeDir(EntryPath);
+            if (EntrySearch.Attr and faSymLink) <> 0 then
+              WipeDir(EntryPath)
+            else if (EntrySearch.Attr and faDirectory) <> 0 then
+              RemoveResidue(EntryPath, AReport)
+            else if SysUtils.DeleteFile(EntryPath) then
+              Inc(AReport.BytesReclaimed, EntrySearch.Size)
+            else
+              raise ELWPTCacheLifecycleError.CreateFmt(
+                'failed to remove malformed object-store entry at %s',
+                [EntryPath]);
             Inc(AReport.IncompleteEntriesRemoved);
           end;
         until FindNext(EntrySearch) <> 0;

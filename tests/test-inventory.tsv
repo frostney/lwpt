@@ -22,8 +22,8 @@ program	*	unit	source/LWPT.Analysis.Pascal.Test.pas	2	18
 program	*	unit	source/LWPT.Analysis.Scope.Test.pas	1	5
 program	*	unit	source/LWPT.BuildRequest.Test.pas	1	12
 program	*	unit	source/LWPT.BuildCache.Test.pas	1	7
-program	*	unit	source/LWPT.CacheLifecycle.Test.pas	1	10
-program	unix/*	unit	source/LWPT.CacheLifecycle.Test.pas	1	11
+program	*	unit	source/LWPT.CacheLifecycle.Test.pas	1	11
+program	unix/*	unit	source/LWPT.CacheLifecycle.Test.pas	1	12
 program	*	unit	source/LWPT.BuildSession.Test.pas	1	31
 program	windows/*	unit	source/LWPT.BuildSession.Test.pas	1	26
 program	*	unit	source/LWPT.Command.Build.Test.pas	1	4
@@ -47,6 +47,7 @@ program	*	unit	source/LWPT.Observability.Test.pas	1	6
 program	*	unit	source/LWPT.ObjectStore.Test.pas	1	11
 program	*	unit	source/LWPT.OutputRenderer.Test.pas	1	1
 program	*	unit	source/LWPT.ProducerLease.Test.pas	1	6
+program	unix/*	unit	source/LWPT.ProducerLease.Test.pas	1	7
 program	*	unit	source/LWPT.Resolver.Test.pas	1	7
 program	*	unit	source/LWPT.WorkerBudget.Test.pas	1	22
 program	windows/*	unit	source/LWPT.WorkerBudget.Test.pas	1	17

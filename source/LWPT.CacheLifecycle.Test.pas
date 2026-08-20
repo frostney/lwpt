@@ -45,6 +45,7 @@ type
     procedure TestLiveObjectIsPreservedAndAdmissionSkips;
     procedure TestRepairRebuildsIndexAndRemovesCorruption;
     procedure TestRepairRebuildsSemanticallyCorruptIndex;
+    procedure TestRepairRemovesInvalidProducerLeaseRoot;
     procedure TestRepairZeroBudgetPrunesBuildReferences;
     {$IFDEF UNIX}
     procedure TestRepairUnlinksCacheShardsWithoutFollowingThem;
@@ -429,7 +430,8 @@ end;
 procedure TCacheLifecycleContract.
   TestRepairRebuildsIndexAndRemovesCorruption;
 var
-  CorruptDigest, HealthyDigest: string;
+  CorruptDigest, HealthyDigest, MalformedEntry, MalformedPrefix,
+    MalformedRootEntry: string;
   FirstReport, SecondReport: TLWPTCacheRepairReport;
   Store: TLWPTImmutableObjectStore;
 begin
@@ -443,13 +445,23 @@ begin
     WriteTextFile(Store.ObjectPath(CorruptDigest), 'wrong');
     WriteTextFile(FCacheRoot + '/dependency-archives/tmp/incomplete',
       'partial');
+    MalformedRootEntry := FCacheRoot
+      + '/dependency-archives/sha256/not-a-shard';
+    MalformedPrefix := FCacheRoot + '/dependency-archives/sha256/zz/entry';
+    MalformedEntry := FCacheRoot + '/dependency-archives/sha256/ab/bad';
+    WriteTextFile(MalformedRootEntry, 'root-residue');
+    WriteTextFile(MalformedPrefix, 'prefix-residue');
+    WriteTextFile(MalformedEntry, 'entry-residue');
     FirstReport := RepairSharedCache(FCacheRoot);
     Expect<Boolean>(FirstReport.IndexRebuilt).ToBe(True);
     Expect<Integer>(FirstReport.CorruptObjectsRemoved).ToBe(1);
-    Expect<Integer>(FirstReport.IncompleteEntriesRemoved).ToBe(1);
+    Expect<Integer>(FirstReport.IncompleteEntriesRemoved).ToBe(5);
     Expect<Boolean>(FirstReport.BytesReclaimed > 0).ToBe(True);
     Expect<Boolean>(FileExists(Store.ObjectPath(CorruptDigest))).ToBe(False);
     Expect<Boolean>(FileExists(Store.ObjectPath(HealthyDigest))).ToBe(True);
+    Expect<Boolean>(FileExists(MalformedRootEntry)).ToBe(False);
+    Expect<Boolean>(FileExists(MalformedPrefix)).ToBe(False);
+    Expect<Boolean>(FileExists(MalformedEntry)).ToBe(False);
     SecondReport := RepairSharedCache(FCacheRoot);
     Expect<Integer>(SecondReport.CorruptObjectsRemoved).ToBe(0);
     Expect<Integer>(SecondReport.IncompleteEntriesRemoved).ToBe(0);
@@ -457,6 +469,19 @@ begin
   finally
     Store.Free;
   end;
+end;
+
+procedure TCacheLifecycleContract.TestRepairRemovesInvalidProducerLeaseRoot;
+var
+  InvalidRoot: string;
+  Report: TLWPTCacheRepairReport;
+begin
+  InvalidRoot := ProducerLeaseRoot(FCacheRoot) + '/sha256';
+  WriteTextFile(InvalidRoot, 'invalid-root');
+  Report := RepairSharedCache(FCacheRoot);
+  Expect<Boolean>(FileExists(InvalidRoot)).ToBe(False);
+  Expect<Boolean>(DirectoryExists(InvalidRoot)).ToBe(True);
+  Expect<Integer>(Report.AbandonedLeasesReclaimed).ToBe(1);
 end;
 
 procedure TCacheLifecycleContract.
@@ -520,6 +545,8 @@ begin
     TestRepairRebuildsIndexAndRemovesCorruption);
   Test('repair rebuilds a semantically inconsistent index exactly',
     TestRepairRebuildsSemanticallyCorruptIndex);
+  Test('repair removes an invalid producer lease root file',
+    TestRepairRemovesInvalidProducerLeaseRoot);
   Test('zero-budget repair prunes live and stale build references',
     TestRepairZeroBudgetPrunesBuildReferences);
   {$IFDEF UNIX}

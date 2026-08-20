@@ -5,6 +5,7 @@ program LWPT.ProducerLease.Test;
 
 uses
   {$IFDEF UNIX}
+  BaseUnix,
   cthreads,
   {$ENDIF}
   Classes,
@@ -43,6 +44,9 @@ type
     procedure TestReleasedProducerHandsOffToWaiter;
     procedure TestCrashedProducerIsReclaimable;
     procedure TestStaleHeartbeatDoesNotDisplaceLiveOwner;
+    {$IFDEF UNIX}
+    procedure TestRootSwapIsRejected;
+    {$ENDIF}
   end;
 
 function WaitForMarker(const APath: string): Boolean;
@@ -319,6 +323,38 @@ begin
   end;
 end;
 
+{$IFDEF UNIX}
+procedure TProducerLeaseContract.TestRootSwapIsRejected;
+var
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
+  OutsideRoot: string;
+  Raised: Boolean;
+begin
+  ForceDirectories(FLeaseRoot);
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(FLeaseRoot);
+  Lease := nil;
+  try
+    WipeDir(FLeaseRoot);
+    OutsideRoot := FScratch + '/outside';
+    ForceDirectories(OutsideRoot);
+    if FpSymlink(PChar(OutsideRoot), PChar(FLeaseRoot)) <> 0 then
+      raise Exception.Create('failed to create producer-root symlink fixture');
+    Raised := False;
+    try
+      Lease := Coordinator.TryAcquire(TEST_KEY, 'root swap');
+    except
+      on ELWPTProducerLeaseError do Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(DirectoryExists(OutsideRoot + '/sha256')).ToBe(False);
+  finally
+    Lease.Free;
+    Coordinator.Free;
+  end;
+end;
+{$ENDIF}
+
 procedure TProducerLeaseContract.SetupTests;
 begin
   Test('one local producer owns an object key',
@@ -333,6 +369,10 @@ begin
     TestCrashedProducerIsReclaimable);
   Test('stale heartbeat does not displace a live owner',
     TestStaleHeartbeatDoesNotDisplaceLiveOwner);
+  {$IFDEF UNIX}
+  Test('a producer root swapped to a link is rejected',
+    TestRootSwapIsRejected);
+  {$ENDIF}
 end;
 
 begin
