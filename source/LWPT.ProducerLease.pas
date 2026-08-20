@@ -437,8 +437,8 @@ function RepairProducerLeases(const ACacheRoot: string;
   out ALivePreserved: Integer): Integer;
 var
   Guard: TLWPTProducerGuard;
-  KeyRootPath, LeaseNamespaceRoot, LeaseRoot, PrefixPath, QuarantinePath,
-    StatePath, TemporaryRoot: string;
+  KeyRootPath, LeaseNamespaceRoot, LeaseRoot, PrefixPath,
+    QuarantinePath: string;
   PrefixSearch, KeySearch: TSearchRec;
 begin
   Result := 0;
@@ -517,36 +517,29 @@ begin
             Continue;
           end;
           try
-            StatePath := IncludeTrailingPathDelimiter(KeyRootPath)
-              + STATE_FILE;
-            TemporaryRoot := IncludeTrailingPathDelimiter(KeyRootPath)
-              + 'tmp';
-            if FileExists(StatePath) or DirectoryExists(TemporaryRoot) then
+            QuarantinePath := KeyRootPath + '.repair-'
+              + NewToken(KeySearch.Name);
+            if not TryDetachAbandonedKey(KeyRootPath, QuarantinePath,
+                 Guard) then
             begin
-              QuarantinePath := KeyRootPath + '.repair-'
-                + NewToken(KeySearch.Name);
-              if not TryDetachAbandonedKey(KeyRootPath, QuarantinePath,
-                   Guard) then
+              if Guard = nil then
               begin
-                if Guard = nil then
-                begin
-                  Inc(ALivePreserved);
-                  Continue;
-                end;
-                raise ELWPTProducerLeaseError.CreateFmt(
-                  'failed to isolate abandoned producer state at %s',
-                  [KeyRootPath]);
+                Inc(ALivePreserved);
+                Continue;
               end;
-              if IsDirSymlinkOrJunction(QuarantinePath)
-                 or DirectoryExists(QuarantinePath) then
-                WipeDir(QuarantinePath)
-              else if FileExists(QuarantinePath)
-                 and not SysUtils.DeleteFile(QuarantinePath) then
-                raise ELWPTProducerLeaseError.CreateFmt(
-                  'failed to remove isolated producer state at %s',
-                  [QuarantinePath]);
-              Inc(Result);
+              raise ELWPTProducerLeaseError.CreateFmt(
+                'failed to isolate abandoned producer state at %s',
+                [KeyRootPath]);
             end;
+            if IsDirSymlinkOrJunction(QuarantinePath)
+               or DirectoryExists(QuarantinePath) then
+              WipeDir(QuarantinePath)
+            else if FileExists(QuarantinePath)
+               and not SysUtils.DeleteFile(QuarantinePath) then
+              raise ELWPTProducerLeaseError.CreateFmt(
+                'failed to remove isolated producer state at %s',
+                [QuarantinePath]);
+            Inc(Result);
           finally
             Guard.Free;
           end;

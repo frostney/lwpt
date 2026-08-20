@@ -503,8 +503,9 @@ procedure TCacheLifecycleContract.
   TestRepairReclaimsAbandonedAndPreservesLiveLease;
 var
   Coordinator: TLWPTProducerLeaseCoordinator;
-  Digest, KeyRoot, LeaseKey: string;
+  Digest, KeyRoot, LeaseKey, ReleasedDigest, ReleasedKeyRoot: string;
   Lease: TLWPTProducerLease;
+  ReleasedGuard: TObject;
   Report: TLWPTCacheRepairReport;
 begin
   LeaseKey := 'test-live-producer';
@@ -514,14 +515,22 @@ begin
   WriteTextFile(KeyRoot + '/state', 'abandoned');
   Coordinator := TLWPTProducerLeaseCoordinator.Create(
     ProducerLeaseRoot(FCacheRoot));
+  ReleasedDigest := SHA256Hex(BytesOf('test-released-guard'));
+  ReleasedKeyRoot := ProducerLeaseRoot(FCacheRoot) + '/sha256/'
+    + Copy(ReleasedDigest, 1, 2) + '/'
+    + Copy(ReleasedDigest, 3, MaxInt);
+  ReleasedGuard := Coordinator.TryAcquireGuard('test-released-guard');
+  Expect<Boolean>(ReleasedGuard <> nil).ToBe(True);
+  ReleasedGuard.Free;
   Lease := Coordinator.TryAcquire(LeaseKey, 'live test producer');
   try
     Expect<Boolean>(Lease <> nil).ToBe(True);
     Report := RepairSharedCache(FCacheRoot);
-    Expect<Integer>(Report.AbandonedLeasesReclaimed).ToBe(1);
+    Expect<Integer>(Report.AbandonedLeasesReclaimed).ToBe(2);
     Expect<Boolean>(Report.LiveLeasesPreserved >= 1).ToBe(True);
     Expect<Boolean>(FileExists(KeyRoot + '/state')).ToBe(False);
     Expect<Boolean>(DirectoryExists(KeyRoot)).ToBe(False);
+    Expect<Boolean>(DirectoryExists(ReleasedKeyRoot)).ToBe(False);
   finally
     Lease.Free;
     Coordinator.Free;
