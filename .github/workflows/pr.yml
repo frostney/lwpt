@@ -194,8 +194,10 @@ jobs:
         with:
           globs: "**/*.md"
 
-      - name: Exercise managed-delivery fixtures
-        run: python3 -m unittest discover -s .github/delivery/tests -v
+      - name: Exercise repository workflow fixtures
+        run: |
+          python3 -m unittest discover -s .github/delivery/tests -v
+          python3 -m unittest discover -s .github/tests -v
 
   # PR-gate extension (#102): one native aarch64-darwin leg. The #105
   # env-race family and its masks all first surfaced on darwin legs,
