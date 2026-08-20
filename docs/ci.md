@@ -1,6 +1,6 @@
 # CI
 
-Ten GitHub Actions workflows retain the existing build-once/test-natively
+Nine GitHub Actions workflows retain the existing build-once/test-natively
 matrix and add a repository-owned managed-delivery adapter. Expensive workflows
 that execute pull-request code have read-only permissions. Controllers and
 finalizers with write permission always run trusted default-branch code.
@@ -16,7 +16,6 @@ finalizers with write permission always run trusted default-branch code.
 | `delivery-observer.yml` | State-changing PR metadata, manual | Invalidate stale managed readiness and full-CI evidence |
 | `delivery-finalizer.yml` | `workflow_run` completion | Conclude full-CI proof when GitHub emits the event |
 | `delivery-watchdog.yml` | 15-minute schedule, manual | Reconcile managed state and terminal full-CI runs, then fail full-CI proofs left nonterminal for 120 minutes |
-| `lwpt-update.yml` | `workflow_call` (reusable), `workflow_dispatch` | Weekly Dependabot-equivalent: `lwpt outdated` / `lwpt update` then a PR with release notes (ADR-0039). Canonical copy is [`docs/templates/lwpt-update.yml`](./templates/lwpt-update.yml) until it can land at `.github/workflows/lwpt-update.yml`. Not a required PR check. |
 
 Trigger split, mirroring GocciaScript's CI shape:
 

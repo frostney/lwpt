@@ -87,7 +87,6 @@ Workflow knowledge that is not derivable from the command surface. The generated
 | See which git-host deps have newer tags | `./build/lwpt outdated` (`--json` for the machine report) |
 | Update outdated git-host deps | `./build/lwpt update` or `./build/lwpt update <name>` |
 | Update a dependency's version spec by hand | `./build/lwpt add <source@new-version>` (same name → entry updated, stale archive pruned) |
-| Enable weekly update PRs in a consumer | copy [`docs/templates/lwpt-update.yml`](./docs/templates/lwpt-update.yml) into `.github/workflows/`, or `uses: frostney/lwpt/.github/workflows/lwpt-update.yml@main` once that reusable file is on `main` |
 | Show the version | `./build/lwpt --version` |
 | Report Pascal token clones | `./build/lwpt duplication` (`--json` for the machine envelope) |
 
