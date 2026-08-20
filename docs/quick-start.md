@@ -128,6 +128,11 @@ git add .lwpt/ lwpt.lock lwpt.cfg lwpt.toml
 git commit -m "feat: add horse v4.0.0"
 ```
 
+To check and update git-host dependencies by hand, use `lwpt outdated` followed
+by `lwpt update`. To schedule the same transaction and receive one pull request
+with safely quoted release-note excerpts, call the reusable
+[`lwpt-update.yml` workflow](./ci.md#lwpt-dependency-updater).
+
 The dependency name defaults to the repo / path basename (`horse` here); pass `--name <name>` to override it (required for `https://` tarball sources). The manifest is only written after the install succeeded, so a typo'd repo or dead tag leaves `lwpt.toml` untouched. Equivalent manual path: edit `lwpt.toml` yourself —
 
 ```toml
