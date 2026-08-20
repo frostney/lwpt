@@ -127,7 +127,7 @@ deterministic least-recently-used eviction and skips caching when an object
 cannot fit without removing live state. See
 [ADR-0037](./adr/0037-verified-build-result-cache.md),
 [ADR-0038](./adr/0038-local-producer-leases.md), and
-[ADR-0039](./adr/0039-bounded-shared-cache-lifecycle.md).
+[ADR-0040](./adr/0040-bounded-shared-cache-lifecycle.md).
 
 When a build fails with output matching a stale-artefact signature (internal
 compiler exception, resource-compile errors, missing `.reslst`), `lwpt build`

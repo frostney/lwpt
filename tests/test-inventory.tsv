@@ -36,12 +36,13 @@ program	*	unit	source/LWPT.CompilerDriver.Lakon.Test.pas	1	17
 program	*	unit	source/LWPT.CompilerRegistry.Test.pas	1	11
 program	*	unit	source/LWPT.Core.Test.pas	21	145
 program	windows/*	unit	source/LWPT.Core.Test.pas	21	144
+program	*	unit	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	unit	source/LWPT.Duplication.Test.pas	1	18
 program	*	unit	source/LWPT.Formatter.Test.pas	4	25
 program	*	unit	source/LWPT.Health.Test.pas	1	11
 program	*	unit	source/LWPT.TestInventory.Test.pas	1	7
 program	*	unit	source/LWPT.Manifest.Schema.Test.pas	1	7
-program	*	unit	source/LWPT.ManifestEdit.Test.pas	4	23
+program	*	unit	source/LWPT.ManifestEdit.Test.pas	5	31
 program	*	unit	source/LWPT.Observability.Test.pas	1	6
 program	*	unit	source/LWPT.ObjectStore.Test.pas	1	11
 program	*	unit	source/LWPT.OutputRenderer.Test.pas	1	1

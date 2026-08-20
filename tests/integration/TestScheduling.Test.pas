@@ -41,6 +41,7 @@ const
   ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
   ProcessCaptureOverflowHoldMilliseconds = 2000;
   SiblingFanoutCeilingMilliseconds = 1500;
+  SiblingFanoutDiagnosticIterations = 1;
   SubprocessDrainCompletionCeilingMilliseconds = 5000;
   { Scheduling speed is not part of the fanout contract. This ceiling only
     diagnoses a sibling that genuinely never reaches the startup barrier. }
@@ -57,7 +58,8 @@ const
   ProcessTreeChannelTokenEnvironment = PROJECT_NAME
     + '_PROCESS_TREE_CHANNEL_TOKEN';
   ProcessTreeAcknowledgementProtocol = PROJECT_NAME + '-ACK/1';
-  SiblingCancellationStartedSuffix = '-cancellation-started';
+  SiblingFailureReadySuffix = '-failure-ready';
+  SiblingCancellationReceivedSuffix = '-cancellation-received';
   NestedCompilerNaturalExitSuffix = '-natural-exit';
   SiblingSlowSources: array[0..5] of string = (
     'A.Slow.Test.pas', 'C.Slow.Test.pas', 'D.Slow.Test.pas',
@@ -337,14 +339,20 @@ begin
   end;
 end;
 
-{$IFDEF UNIX}
 function ReadAcknowledgementControlBefore(const AHandle: PtrInt;
   const ADeadline: QWord): Boolean;
 var
   Buffer: array[0..511] of Byte;
-  BytesRead, ControlFlags, ErrorCode: LongInt;
+  BytesRead: LongInt;
+  {$IFDEF UNIX}
+  ControlFlags, ErrorCode: LongInt;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  AvailableBytes, WindowsBytesRead: DWORD;
+  {$ENDIF}
 begin
   Result := False;
+  {$IFDEF UNIX}
   ControlFlags := FpFcntl(AHandle, F_GetFl);
   if (ControlFlags < 0)
      or (FpFcntl(AHandle, F_SetFl,
@@ -358,8 +366,25 @@ begin
     if GetTickCount64 >= ADeadline then Exit;
     Sleep(ProcessPollMilliseconds);
   until False;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  repeat
+    AvailableBytes := 0;
+    if not Windows.PeekNamedPipe(THandle(AHandle), nil, 0, nil,
+      @AvailableBytes, nil) then Exit;
+    if AvailableBytes > 0 then
+    begin
+      WindowsBytesRead := 0;
+      if not Windows.ReadFile(THandle(AHandle), Buffer[0], SizeOf(Buffer),
+        WindowsBytesRead, nil) then Exit;
+      BytesRead := WindowsBytesRead;
+      Exit(BytesRead > 0);
+    end;
+    if GetTickCount64 >= ADeadline then Exit;
+    Sleep(ProcessPollMilliseconds);
+  until False;
+  {$ENDIF}
 end;
-{$ENDIF}
 
 { Scheduler progress lines print discovered test paths with the native
   separator (tests\A.Test.pas on Windows); normalise so assertions can be
@@ -1321,41 +1346,118 @@ end;
 
 procedure TTestScheduling.TestSiblingTerminationAcknowledgementsShareFanout;
 var
-  CompilerPID, SourceIndex: Integer;
-  CancellationStartedAt, ElapsedMilliseconds: QWord;
-  PIDFile: string;
+  CompilerPID, Iteration, SourceIndex: Integer;
+  CancellationReceivedAt, CancellationStartedAt,
+    ElapsedMilliseconds: QWord;
+  MissingCancellationSources, MissingMarkerSources, NaturalExitSources,
+    PIDFile, SourcePIDFile: string;
   CommandResult: TLwptResult;
 begin
-  ResetProject(0);
-  PIDFile := FScratch + '/control/sibling-ack-compiler-pid';
-  WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
-    'program MissingRuntimeBinaryInput; begin end.'#10);
-  for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
-    WriteTextFile(FScratch + '/tests/' + SiblingSlowSources[SourceIndex],
-      'program SlowCompilerInput; begin end.'#10);
-
-  CommandResult := RunTestsWithCompilerProxy(['--jobs=7'],
-    MissingAcknowledgementSiblingCompilerProxyMode, PIDFile, 7);
-  Expect<Boolean>(FileExists(PIDFile + SiblingCancellationStartedSuffix))
-    .ToBe(True);
-  CancellationStartedAt := StrToQWord(Trim(ReadBinaryFile(PIDFile
-    + SiblingCancellationStartedSuffix)));
-  ElapsedMilliseconds := GetTickCount64 - CancellationStartedAt;
-  Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+  for Iteration := 1 to SiblingFanoutDiagnosticIterations do
   begin
-    Expect<Boolean>(FileExists(PIDFile + '-'
-      + SiblingSlowSources[SourceIndex])).ToBe(True);
-    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-'
-      + SiblingSlowSources[SourceIndex])));
-    Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
+    ResetProject(0);
+    PIDFile := FScratch + '/control/sibling-ack-compiler-pid';
+    WriteTextFile(FScratch + '/tests/B.Error.Test.pas',
+      'program MissingRuntimeBinaryInput; begin end.'#10);
+    for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+      WriteTextFile(FScratch + '/tests/' + SiblingSlowSources[SourceIndex],
+        'program SlowCompilerInput; begin end.'#10);
+
+    CommandResult := RunTestsWithCompilerProxy(['--jobs=7'],
+      MissingAcknowledgementSiblingCompilerProxyMode, PIDFile, 7);
+    if not FileExists(PIDFile + SiblingFailureReadySuffix) then
+    begin
+      MissingMarkerSources := '';
+      NaturalExitSources := '';
+      for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+      begin
+        SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
+        if not FileExists(SourcePIDFile) then
+        begin
+          if MissingMarkerSources <> '' then
+            MissingMarkerSources := MissingMarkerSources + ', ';
+          MissingMarkerSources := MissingMarkerSources
+            + SiblingSlowSources[SourceIndex];
+        end;
+        if FileExists(SourcePIDFile + NestedCompilerNaturalExitSuffix) then
+        begin
+          if NaturalExitSources <> '' then
+            NaturalExitSources := NaturalExitSources + ', ';
+          NaturalExitSources := NaturalExitSources
+            + SiblingSlowSources[SourceIndex];
+        end;
+      end;
+      Fail(Format('fanout iteration %d did not publish the failure-ready '
+        + 'marker; missing sibling markers: %s; sibling safety exits: '
+        + '%s; seven effective workers: %s', [Iteration, MissingMarkerSources,
+        NaturalExitSources,
+        BoolToStr(Pos('effective workers: 7', CommandResult.Stdout) > 0,
+          True)]));
+    end;
+    if CommandResult.ExitCode <> 1 then
+      Fail(Format('fanout iteration %d exited %d instead of 1',
+        [Iteration, CommandResult.ExitCode]));
+    CancellationStartedAt := 0;
+    MissingCancellationSources := '';
+    NaturalExitSources := '';
+    for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+    begin
+      SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
+      if not FileExists(SourcePIDFile
+        + SiblingCancellationReceivedSuffix) then
+      begin
+        if MissingCancellationSources <> '' then
+          MissingCancellationSources := MissingCancellationSources + ', ';
+        MissingCancellationSources := MissingCancellationSources
+          + SiblingSlowSources[SourceIndex];
+      end
+      else
+      begin
+        CancellationReceivedAt := StrToQWord(Trim(ReadBinaryFile(SourcePIDFile
+          + SiblingCancellationReceivedSuffix)));
+        if (CancellationStartedAt = 0)
+           or (CancellationReceivedAt < CancellationStartedAt) then
+          CancellationStartedAt := CancellationReceivedAt;
+      end;
+      if FileExists(SourcePIDFile + NestedCompilerNaturalExitSuffix) then
+      begin
+        if NaturalExitSources <> '' then
+          NaturalExitSources := NaturalExitSources + ', ';
+        NaturalExitSources := NaturalExitSources
+          + SiblingSlowSources[SourceIndex];
+      end;
+    end;
+    if MissingCancellationSources <> '' then
+      Fail(Format('fanout iteration %d did not deliver cancellation to: %s',
+        [Iteration, MissingCancellationSources]));
+    if NaturalExitSources <> '' then
+      Fail(Format('fanout iteration %d failed to cancel sibling proxies: %s',
+        [Iteration, NaturalExitSources]));
+    ElapsedMilliseconds := GetTickCount64 - CancellationStartedAt;
+    for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+    begin
+      SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
+      if not FileExists(SourcePIDFile) then
+        Fail(Format('fanout iteration %d did not publish the PID marker for %s',
+          [Iteration, SiblingSlowSources[SourceIndex]]));
+      CompilerPID := StrToInt(Trim(ReadBinaryFile(SourcePIDFile)));
+      if ProcessIsRunning(CompilerPID) then
+        Fail(Format('fanout iteration %d left %s running as PID %d',
+          [Iteration, SiblingSlowSources[SourceIndex], CompilerPID]));
+    end;
+    if Pos('A.Slow.Test.pas ... ERROR', CommandResult.Stdout) = 0 then
+      Fail(Format('fanout iteration %d omitted A.Slow.Test.pas ERROR',
+        [Iteration]));
+    if Pos('C.Slow.Test.pas ... ERROR', CommandResult.Stdout) = 0 then
+      Fail(Format('fanout iteration %d omitted C.Slow.Test.pas ERROR',
+        [Iteration]));
+    if ElapsedMilliseconds >= SiblingFanoutCeilingMilliseconds then
+      Fail(Format('fanout iteration %d took %d ms after cancellation '
+        + '(ceiling %d ms); natural exits: %s',
+        [Iteration, ElapsedMilliseconds, SiblingFanoutCeilingMilliseconds,
+        NaturalExitSources]));
   end;
-  Expect<Boolean>(Pos('A.Slow.Test.pas ... ERROR',
-    CommandResult.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('C.Slow.Test.pas ... ERROR',
-    CommandResult.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(ElapsedMilliseconds < SiblingFanoutCeilingMilliseconds)
-    .ToBe(True);
+  Expect<Boolean>(True).ToBe(True);
 end;
 
 procedure TTestScheduling.TestProtocolFramingIsBoundedAndIncremental;
@@ -2039,9 +2141,70 @@ begin
   Result := SiblingAcknowledgementMarkersReady(APIDFile);
 end;
 
+function RunMissingAcknowledgementSiblingProxy(const ARootPIDFile,
+  ASourceFile: string): Integer;
+var
+  ChannelToken, ControlHandleText, Frame, PIDFile,
+    StatusHandleText: string;
+  ControlHandle, StatusHandle: PtrInt;
+  {$IFDEF MSWINDOWS}
+  BytesWritten: DWORD;
+  {$ENDIF}
+begin
+  Result := 1;
+  StatusHandleText := GetEnvironmentVariable(
+    ProcessTreeStatusHandleEnvironment);
+  ControlHandleText := GetEnvironmentVariable(
+    ProcessTreeControlHandleEnvironment);
+  ChannelToken := GetEnvironmentVariable(
+    ProcessTreeChannelTokenEnvironment);
+  if (StatusHandleText = '') or (ControlHandleText = '') then Exit(2);
+  StatusHandle := StrToInt64(StatusHandleText);
+  ControlHandle := StrToInt64(ControlHandleText);
+  Frame := ProcessTreeAcknowledgementProtocol + ' ' + ChannelToken
+    + ' HELLO' + LineEnding;
+  {$IFDEF UNIX}
+  FpSignal(SIGTERM, SignalHandler(SIG_IGN));
+  if FpWrite(StatusHandle, Frame[1], Length(Frame)) <> Length(Frame) then
+    Exit(3);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  BytesWritten := 0;
+  if not Windows.WriteFile(THandle(StatusHandle), Frame[1], Length(Frame),
+    BytesWritten, nil) or (BytesWritten <> DWORD(Length(Frame))) then Exit(3);
+  {$ENDIF}
+  PIDFile := ARootPIDFile + '-' + ASourceFile;
+  WriteTextFile(PIDFile, IntToStr(GetProcessID));
+  if not WaitForSiblingAcknowledgementMarkers(ARootPIDFile) then
+  begin
+    WriteLn(StdErr, 'sibling compiler startup barrier timed out');
+    DeleteFile(PIDFile);
+    WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
+      UIntToStr(GetTickCount64));
+    Exit(4);
+  end;
+  if not ReadAcknowledgementControlBefore(ControlHandle,
+    GetTickCount64 + QWord(SiblingStartupBarrierCeilingSeconds) * 1000) then
+  begin
+    WriteLn(StdErr, 'sibling compiler cancellation frame timed out');
+    DeleteFile(PIDFile);
+    WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
+      UIntToStr(GetTickCount64));
+    Exit(5);
+  end;
+  WriteTextFile(PIDFile + SiblingCancellationReceivedSuffix,
+    UIntToStr(GetTickCount64));
+  Sleep(LongRunningFixtureMilliseconds);
+  { A healthy parent reaps this proxy after its missing acknowledgement. }
+  DeleteFile(PIDFile);
+  WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
+    UIntToStr(GetTickCount64));
+  Result := 0;
+end;
+
 function RunProcessTreeCompilerProxy: Integer;
 var
-  Mode, PIDFile, SiblingPIDFile, SourceFile: string;
+  Mode, PIDFile, SourceFile: string;
   Started: TDateTime;
 begin
   if HasProcessArgument('-iV') and HasProcessArgument('-iTO')
@@ -2092,8 +2255,10 @@ begin
     if not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
       True) then Exit(2);
   {$ENDIF}
-  if (Mode = MissingAcknowledgementCompilerProxyMode)
-     or (Mode = MissingAcknowledgementSiblingCompilerProxyMode) then
+  if (Mode = MissingAcknowledgementSiblingCompilerProxyMode)
+     and not SameText(SourceFile, 'B.Error.Test.pas') then
+    Exit(RunMissingAcknowledgementSiblingProxy(PIDFile, SourceFile));
+  if Mode = MissingAcknowledgementCompilerProxyMode then
   begin
     InstallProcessTreeSignalForwarding;
     CloseInheritedStatusHandle;
@@ -2102,35 +2267,20 @@ begin
      or (Mode = IgnoreTerminateCompilerProxyMode)
      or ((Mode = MissingAcknowledgementCompilerProxyMode)
        and SameText(SourceFile, 'A.Slow.Test.pas'))
-     or ((Mode = MissingAcknowledgementSiblingCompilerProxyMode)
-       and not SameText(SourceFile, 'B.Error.Test.pas'))
      {$IFDEF MSWINDOWS}
      or (Mode = WindowsIgnoreControlCompilerProxyMode)
      {$ENDIF}
      or ((Mode = WorkerErrorCompilerProxyMode)
        and SameText(SourceFile, 'A.Slow.Test.pas')) then
   begin
-    if Mode = MissingAcknowledgementSiblingCompilerProxyMode then
-    begin
-      SiblingPIDFile := PIDFile;
-      PIDFile := SiblingPIDFile + '-' + SourceFile;
-    end;
     WriteTextFile(PIDFile, IntToStr(GetProcessID));
-    if Mode = MissingAcknowledgementSiblingCompilerProxyMode then
-    begin
-      { Start the safety lifetime only after every sibling reaches the
-        fixture barrier, so process-startup skew cannot trigger the failure. }
-      if not WaitForSiblingAcknowledgementMarkers(SiblingPIDFile) then
-      begin
-        WriteLn(StdErr, 'sibling compiler startup barrier timed out');
-        Exit(2);
-      end;
-    end;
     Sleep(LongRunningFixtureMilliseconds);
     if Mode = IgnoreTerminateCompilerProxyMode then
+    begin
       { Reaching the safety exit means cancellation failed to reap the proxy. }
       WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
         UIntToStr(GetTickCount64));
+    end;
     Exit(0);
   end;
 
@@ -2148,7 +2298,7 @@ begin
         WriteLn(StdErr, 'sibling compiler startup barrier timed out');
         Exit(2);
       end;
-      WriteTextFile(PIDFile + SiblingCancellationStartedSuffix,
+      WriteTextFile(PIDFile + SiblingFailureReadySuffix,
         UIntToStr(GetTickCount64));
     end
     else

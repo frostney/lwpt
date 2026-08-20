@@ -46,7 +46,7 @@ Both code paths are dev-mode only; release builds always go through `./build/lwp
 After bootstrap:
 
 ```sh
-./build/lwpt --help     # top-level help; lists the 12 subcommands
+./build/lwpt --help     # top-level help; lists the 14 subcommands
 ```
 
 ## Daily commands
@@ -74,6 +74,8 @@ After bootstrap:
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
+./build/lwpt outdated           # compare locked git-host deps to advertised tags
+./build/lwpt update             # bump constraints + reinstall newer git-host deps
 ./build/lwpt repair             # recover project and shared-cache residue
 ```
 
@@ -125,6 +127,11 @@ If you genuinely need to bypass (rare), see [`tooling.md`](./tooling.md) — but
 git add .lwpt/ lwpt.lock lwpt.cfg lwpt.toml
 git commit -m "feat: add horse v4.0.0"
 ```
+
+To check and update git-host dependencies by hand, use `lwpt outdated` followed
+by `lwpt update`. To schedule the same transaction and receive one pull request
+with safely quoted release-note excerpts, call the reusable
+[`lwpt-update.yml` workflow](./ci.md#lwpt-dependency-updater).
 
 The dependency name defaults to the repo / path basename (`horse` here); pass `--name <name>` to override it (required for `https://` tarball sources). The manifest is only written after the install succeeded, so a typo'd repo or dead tag leaves `lwpt.toml` untouched. Equivalent manual path: edit `lwpt.toml` yourself —
 

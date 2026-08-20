@@ -259,7 +259,8 @@ inventory never touches the network.
 | **`source/LWPT.TestInventory.Test.pas`** | 7 tests in 1 suite | Pins platform-rule specificity, ambiguity failures, canonical documentation convergence, and the actionable stale-documentation path. |
 | **`source/LWPT.Command.Health.Test.pas`** | 3 tests in 1 suite | Covers deterministic human and shared-envelope JSON output, root/workspace limit inheritance and replacement, report-only mode, and strict type/range/unknown-key validation for `[health]`. |
 | **`source/LWPT.Duplication.Test.pas`** | 18 tests in 1 suite | Covers Type-2 clones across presentation and consistent identifier/literal renames, inconsistent third-occurrence rejection, maximal non-overlapping multi-occurrence groups including the structural 400-statement repetitive-source result, declaration/executable and nested-routine boundaries, exact minimum inclusion, optional strict thresholds, every duplication-table validation branch, absolute-path source-read diagnostics, workspace policy inheritance/replacement, and final shared-scope exclusion. |
-| **`source/LWPT.ManifestEdit.Test.pas`** | 23 tests in 4 suites | Covers dependency insertion, replacement, removal, manifest-line loading, and dependency-name derivation for git-host, local-path, and URL sources. |
+| **`source/LWPT.ManifestEdit.Test.pas`** | 31 tests in 5 suites | Covers dependency insertion, replacement, removal, version-only constraint edits (bare specs and inline-table `version` keys), manifest-line loading, and dependency-name derivation for git-host, local-path, and URL sources. |
+| **`source/LWPT.DependencyUpdate.Test.pas`** | 17 tests in 4 suites | Pins outdated status (current / newer / major, including 0.x minor-as-major), skip rules for workspace/local/URL sources, `^`/`~`/exact constraint bumps, and collection against injected git-tag lists so CI never needs the network. |
 | **`source/LWPT.OutputRenderer.Test.pas`** | 1 test in 1 suite | Proves the fixed-capacity silent emergency ring preserves the exact most-recent 1 MiB tail across chunked wraparound without shifting retained bytes on append. |
 | **`source/LWPT.Resolver.Test.pas`** | 7 tests in 1 suite | Pins highest-common-version selection across the complete constraint set, pairwise-overlap/global-empty rejection with every requirer named, literal-tag/SHA and differently named tag unification through advertised commit identity, annotated-tag peeled-commit identity, rejection of equal SemVer precedence mapped to different commits, and literal-branch compatibility. |
 | **`source/LWPT.Observability.Test.pas`** | 6 tests in 1 suite | Pins typed job, heartbeat, diagnostic, byte-safe child-output, command-terminal, truncation, and capture-degradation payloads, including source/correlation tags, ordinary/protected/terminal retention classes, the nonzero outcome invariant for failed jobs, zero-exit failure normalization, and preservation of genuine child exits. |
@@ -334,10 +335,10 @@ inventory never touches the network.
 <!-- lwpt:test-inventory-counts:begin -->
 | Tier | Files | Registered test cases |
 | --- | ---: | --- |
-| Unit | 35 | 581 Unix / 567 Windows |
+| Unit | 36 | 606 Unix / 592 Windows |
 | Integration | 24 | 279 Darwin / 278 Linux / 272 Windows |
 | E2E | 7 | 34 Darwin, Windows / 37 Linux |
-| **Total** | **66** | **894 Darwin / 896 Linux / 873 Windows** |
+| **Total** | **67** | **919 Darwin / 921 Linux / 898 Windows** |
 <!-- lwpt:test-inventory-counts:end -->
 
 ## TestingPascalLibrary self-test

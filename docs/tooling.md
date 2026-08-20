@@ -181,7 +181,7 @@ later repair can reclaim the released state. Repeating repair on the repaired
 state is safe and reports zero further reclamation. Shared-cache repair never
 deletes the invoking project's committed `.lwpt/archives/` or
 `.lwpt/modules/` state. See
-[ADR-0039](./adr/0039-bounded-shared-cache-lifecycle.md).
+[ADR-0040](./adr/0040-bounded-shared-cache-lifecycle.md).
 
 ## Machine-wide worker budget
 
