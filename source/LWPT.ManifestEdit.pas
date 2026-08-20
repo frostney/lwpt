@@ -371,6 +371,66 @@ begin
   Result := True;
 end;
 
+procedure SkipInlineTableValue(const ALine: string; var i: Integer;
+  ALimit: Integer);
+var
+  Depth: Integer;
+  Quote: Char;
+begin
+  if i >= ALimit then Exit;
+  if ALine[i] in ['"', #39] then
+  begin
+    Quote := ALine[i];
+    Inc(i);
+    while i < ALimit do
+    begin
+      if (Quote = '"') and (ALine[i] = '\') then
+        Inc(i, 2)
+      else if ALine[i] = Quote then
+      begin
+        Inc(i);
+        Exit;
+      end
+      else
+        Inc(i);
+    end;
+    Exit;
+  end;
+  if ALine[i] = '[' then
+  begin
+    Depth := 1;
+    Inc(i);
+    while (i < ALimit) and (Depth > 0) do
+    begin
+      if ALine[i] in ['"', #39] then
+      begin
+        Quote := ALine[i];
+        Inc(i);
+        while i < ALimit do
+        begin
+          if (Quote = '"') and (ALine[i] = '\') then
+            Inc(i, 2)
+          else if ALine[i] = Quote then
+          begin
+            Inc(i);
+            Break;
+          end
+          else
+            Inc(i);
+        end;
+      end
+      else
+      begin
+        if ALine[i] = '[' then Inc(Depth)
+        else if ALine[i] = ']' then Dec(Depth);
+        Inc(i);
+      end;
+    end;
+    Exit;
+  end;
+  while (i < ALimit) and (ALine[i] <> ',') do Inc(i);
+end;
+
 function FindInlineTableClose(const ALine: string; AOpen: Integer): Integer;
 var
   i: Integer;
@@ -412,7 +472,7 @@ end;
 function ReplaceInlineTableVersion(const ALine, ANewConstraint: string;
   out ANewLine: string): Boolean;
 var
-  Brace, CloseBrace, i, KeyStart, KeyEnd, QuoteStart: Integer;
+  Brace, CloseBrace, i, KeyStart, KeyEnd: Integer;
   Key: string;
 begin
   Result := False;
@@ -445,25 +505,7 @@ begin
       ANewLine := ReplaceQuotedValueAt(ALine, i, ANewConstraint);
       Exit(True);
     end;
-    if (i < CloseBrace) and (ALine[i] in ['"', #39]) then
-    begin
-      QuoteStart := i;
-      Inc(i);
-      while i < CloseBrace do
-      begin
-        if (ALine[QuoteStart] = '"') and (ALine[i] = '\') then
-          Inc(i, 2)
-        else if ALine[i] = ALine[QuoteStart] then
-        begin
-          Inc(i);
-          Break;
-        end
-        else
-          Inc(i);
-      end;
-    end
-    else
-      while (i < CloseBrace) and (ALine[i] <> ',') do Inc(i);
+    SkipInlineTableValue(ALine, i, CloseBrace);
   end;
 
   ANewLine := TrimRight(Copy(ALine, 1, CloseBrace - 1));

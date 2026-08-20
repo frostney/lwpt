@@ -78,6 +78,7 @@ type
     procedure TestMissingNameReturnsFalse;
     procedure TestRejectsTripleQuotedBareSpec;
     procedure TestInsertsInlineVersionBeforeCommentBrace;
+    procedure TestBumpsVersionAfterMultiItemArray;
   end;
 
 { --- SetDependencyLine ---------------------------------------------------- }
@@ -639,6 +640,23 @@ begin
   end;
 end;
 
+procedure TSetDependencyVersionSuite.TestBumpsVersionAfterMultiItemArray;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Add('[dependencies]');
+    SL.Add('leaf = { source = "a/leaf", include = ["src/**", "tests/**"], version = "^1.0.0" }');
+    Expect<Boolean>(SetDependencyVersionConstraint(SL, 'leaf', '^2.0.0'))
+      .ToBe(True);
+    Expect<string>(SL[1]).ToBe(
+      'leaf = { source = "a/leaf", include = ["src/**", "tests/**"], version = "^2.0.0" }');
+  finally
+    SL.Free;
+  end;
+end;
+
 procedure TSetDependencyVersionSuite.SetupTests;
 begin
   Test('bumps the spec on a bare source@version line', TestBumpsBareSpec);
@@ -652,6 +670,8 @@ begin
     TestRejectsTripleQuotedBareSpec);
   Test('inserts version before a trailing comment that contains }',
     TestInsertsInlineVersionBeforeCommentBrace);
+  Test('bumps version after a multi-item include array',
+    TestBumpsVersionAfterMultiItemArray);
 end;
 
 
