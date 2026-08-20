@@ -111,6 +111,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | Variable | Effect | Default |
 | --- | --- | --- |
 | `LWPT_CACHE_DIR` | Absolute or working-directory-relative root for per-user immutable cache namespaces. Dependency archives use `dependency-archives/`; paths never enter committed project state. | `%LOCALAPPDATA%\lwpt\cache` on Windows, `~/Library/Caches/lwpt` on macOS, `$XDG_CACHE_HOME/lwpt` or `~/.cache/lwpt` on other Unix systems |
+| `LWPT_CACHE_MAX_BYTES` | Aggregate regular-file byte budget for the complete per-user shared cache, including objects, references, control files, producer metadata, staging, and quarantine. This is user-owned process configuration, not a project manifest setting. `0` disables new admissions and lets repair evict all unleased objects. | `10737418240` (10 GiB) |
 | `LWPT_SESSION_DIR` | Build/test session base; relative values resolve from the invocation working directory and override `[lwpt].sessions-dir` | unset |
 | `LWPT_WORKER_BUDGET` | Maximum aggregate LWPT workers for this user and machine | logical processor count |
 | `LWPT_WORKER_STATE_DIR` | Override the worker coordinator state root; an explicit unwritable path fails rather than falling back | the platform application-config directory's `workers/` subdirectory, with automatic fallback to the repository's `.lwpt/workers/` when that default is unwritable |
@@ -149,6 +150,41 @@ only complete bytes proving the same digest. Cache read/write failures emit a
 warning and fall back to the source because the disposable cache is never
 required for correctness. See
 [ADR-0036](./adr/0036-per-user-dependency-archive-cas.md).
+
+## Shared cache lifecycle
+
+The dependency and build namespaces share one user-owned size budget. The
+budget counts all regular-file bytes below the shared cache root, including
+immutable objects, build-result references, lifecycle control files, producer
+metadata, and incomplete or quarantined state pending repair. Every verified
+hit advances a monotonic access sequence, so admission evicts the
+least-recently-used object with the object identity as the deterministic tie
+break. Admission never completes above the effective budget: an oversized
+object, or one that cannot fit without deleting live state, is simply not
+cached. The project-owned archive or freshly built output remains
+authoritative.
+
+Object admission and materialization hold per-object operating-system guards.
+Eviction skips those guards and therefore preserves objects still being
+produced, verified, or copied into a private project/session path. A short
+cache-root mutation guard serializes index publication and eviction across
+processes; it does not serialize independent downloads or compiles.
+
+`lwpt repair` is the only maintenance command. It removes incomplete staging
+and quarantined corruption, reclaims producer metadata only when its OS guard
+is no longer held, atomically detaches the guarded key directory before
+recursive removal so a concurrent link substitution cannot redirect cleanup,
+using the directory rename itself as the final producer race check on Windows,
+verifies content-addressed bytes, rebuilds a corrupt LRU index from verified
+object manifests, and enforces the current budget. Its
+report names bytes reclaimed, corrupt objects removed, and live objects and
+leases preserved. Live producer metadata and guarded object bytes may keep a
+repair result above budget; the report makes that preservation explicit and a
+later repair can reclaim the released state. Repeating repair on the repaired
+state is safe and reports zero further reclamation. Shared-cache repair never
+deletes the invoking project's committed `.lwpt/archives/` or
+`.lwpt/modules/` state. See
+[ADR-0040](./adr/0040-bounded-shared-cache-lifecycle.md).
 
 ## Machine-wide worker budget
 

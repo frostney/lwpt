@@ -76,7 +76,7 @@ After bootstrap:
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt outdated           # compare locked git-host deps to advertised tags
 ./build/lwpt update             # bump constraints + reinstall newer git-host deps
-./build/lwpt repair             # reclaim install, build, and worker residue
+./build/lwpt repair             # recover project and shared-cache residue
 ```
 
 [`build-system.md`](./build-system.md) covers each in depth.

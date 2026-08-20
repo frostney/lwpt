@@ -1468,13 +1468,17 @@ var
           if AUseCache and Assigned(Cache)
              and (Compiled[AIndex].CacheSnapshot <> '') then
             try
-              Cache.Store(Compiled[AIndex].CacheFingerprint,
-                Compiled[AIndex].CacheSnapshot,
-                PublicationRequest.BuildRequest.OutputKind,
-                Compiled[AIndex].CacheUnixMode);
-              CapturedOutputs[AIndex] := CapturedOutputs[AIndex]
-                + 'cache stored: ' + Compiled[AIndex].CacheFingerprint
-                + LineEnding;
+              if Cache.Store(Compiled[AIndex].CacheFingerprint,
+                   Compiled[AIndex].CacheSnapshot,
+                   PublicationRequest.BuildRequest.OutputKind,
+                   Compiled[AIndex].CacheUnixMode) then
+                CapturedOutputs[AIndex] := CapturedOutputs[AIndex]
+                  + 'cache stored: ' + Compiled[AIndex].CacheFingerprint
+                  + LineEnding
+              else
+                CapturedOutputs[AIndex] := CapturedOutputs[AIndex]
+                  + 'cache store skipped: shared cache budget cannot admit '
+                  + 'the complete result' + LineEnding;
             except
               on E: Exception do
                 CapturedOutputs[AIndex] := CapturedOutputs[AIndex]

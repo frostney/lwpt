@@ -11,6 +11,7 @@ interface
 uses
   SysUtils,
 
+  LWPT.CacheLifecycle,
   LWPT.Core;
 
 const
@@ -22,19 +23,32 @@ type
 
   {$IFDEF OBJECTSTORE_TESTING}
   TLWPTObjectStoreBeforeQuarantineHook = procedure(const APath: string);
+  TLWPTObjectStoreAfterStageHook = procedure(const APath: string);
   {$ENDIF}
 
   TLWPTImmutableObjectStore = class
   private
+    FCacheLifecycle: TLWPTCacheLifecycle;
     FRoot: string;
     function CanonicalDigest(const ADigest: string): string;
+    function VerifyObject(const ADigest: string; out APath: string;
+      out ACorrupt: Boolean): Boolean;
+    function RepairCorruptObjectLocked(const ADigest: string;
+      out APath: string): Boolean;
+    function LookupWithObjectGuard(const ADigest: string;
+      out APath: string): Boolean;
     function Quarantine(const APath, ADigest: string;
       out AQuarantinePath: string): Boolean;
   public
-    constructor Create(const ARoot: string);
+    constructor Create(const ARoot, ACacheRoot,
+      ANamespace: string);
+    destructor Destroy; override;
     function ObjectPath(const ADigest: string): string;
     function Lookup(const ADigest: string; out APath: string): Boolean;
     function Admit(const ASourcePath, AExpectedDigest: string): string;
+    function AdmitRetained(const ASourcePath, AExpectedDigest: string;
+      out ALease: TObject; out AInserted: Boolean): string;
+    procedure DiscardRetained(const ADigest: string);
     function Materialize(const ADigest, ADestination,
       ATmpRoot: string): Boolean;
     property Root: string read FRoot;
@@ -49,6 +63,7 @@ function DependencyArchiveStoreRoot(const ACacheRoot: string): string;
 var
   ObjectStoreBeforeQuarantineTestHook:
     TLWPTObjectStoreBeforeQuarantineHook;
+  ObjectStoreAfterStageTestHook: TLWPTObjectStoreAfterStageHook;
 {$ENDIF}
 
 implementation
@@ -70,6 +85,36 @@ end;
 function NormalizeRoot(const APath: string): string;
 begin
   Result := ExcludeTrailingPathDelimiter(ExpandFileName(APath));
+end;
+
+procedure EnsureUnlinkedDirectory(const APath, ADescription: string);
+const
+  DIRECTORY_CREATE_ATTEMPTS = 32;
+var
+  Attempt: Integer;
+begin
+  if IsDirSymlinkOrJunction(APath) then
+    raise ELWPTObjectStoreError.CreateFmt(
+      '%s must not be a link: %s', [ADescription, APath]);
+  for Attempt := 1 to DIRECTORY_CREATE_ATTEMPTS do
+  begin
+    if DirectoryExists(APath) then Break;
+    try
+      ForceDirectories(APath);
+    except
+      on E: EInOutError do
+        if (Attempt = DIRECTORY_CREATE_ATTEMPTS)
+           and not DirectoryExists(APath) then raise;
+    end;
+    if DirectoryExists(APath) then Break;
+    Sleep(1);
+  end;
+  if not DirectoryExists(APath) then
+    raise ELWPTObjectStoreError.CreateFmt(
+      'failed to create %s at %s', [ADescription, APath]);
+  if IsDirSymlinkOrJunction(APath) then
+    raise ELWPTObjectStoreError.CreateFmt(
+      '%s became a link: %s', [ADescription, APath]);
 end;
 
 function ResolveCacheRootFromValues(const AOverride, AHome,
@@ -135,12 +180,28 @@ begin
     + DEPENDENCY_ARCHIVE_NAMESPACE;
 end;
 
-constructor TLWPTImmutableObjectStore.Create(const ARoot: string);
+constructor TLWPTImmutableObjectStore.Create(const ARoot, ACacheRoot,
+  ANamespace: string);
+var
+  CacheRoot, NamespaceRoot: string;
 begin
   inherited Create;
   if ARoot = '' then
     raise ELWPTObjectStoreError.Create('object-store root cannot be empty');
   FRoot := NormalizeRoot(ARoot);
+  CacheRoot := NormalizeRoot(ACacheRoot);
+  NamespaceRoot := IncludeTrailingPathDelimiter(CacheRoot) + ANamespace;
+  if IsDirSymlinkOrJunction(NamespaceRoot)
+     or IsDirSymlinkOrJunction(FRoot) then
+    raise ELWPTObjectStoreError.Create(
+      'shared-cache namespace roots must not be links');
+  FCacheLifecycle := TLWPTCacheLifecycle.Create(ACacheRoot, ANamespace);
+end;
+
+destructor TLWPTImmutableObjectStore.Destroy;
+begin
+  FCacheLifecycle.Free;
+  inherited Destroy;
 end;
 
 function TLWPTImmutableObjectStore.CanonicalDigest(
@@ -185,23 +246,35 @@ begin
   Result := not FileExists(APath);
   if Result then Exit;
   QuarantineRoot := IncludeTrailingPathDelimiter(FRoot) + 'quarantine';
-  ForceDirectories(QuarantineRoot);
+  EnsureUnlinkedDirectory(QuarantineRoot, 'object quarantine');
   AQuarantinePath := MakeTmpPath(QuarantineRoot,
     Copy(CanonicalDigest(ADigest), 8, 12) + '-corrupt');
   Result := AtomicMoveFile(APath, AQuarantinePath);
   if not Result then AQuarantinePath := '';
 end;
 
-function TLWPTImmutableObjectStore.Lookup(const ADigest: string;
-  out APath: string): Boolean;
+function TLWPTImmutableObjectStore.VerifyObject(const ADigest: string;
+  out APath: string; out ACorrupt: Boolean): Boolean;
 var
-  Expected, Actual, QuarantinePath: string;
+  Expected, Actual: string;
 begin
   Expected := CanonicalDigest(ADigest);
+  ACorrupt := False;
   APath := ObjectPath(Expected);
   if not FileExists(APath) then Exit(False);
   Actual := 'sha256:' + SHA256File(APath);
   if Actual = Expected then Exit(True);
+  ACorrupt := True;
+  Result := False;
+end;
+
+function TLWPTImmutableObjectStore.RepairCorruptObjectLocked(
+  const ADigest: string; out APath: string): Boolean;
+var
+  Expected, QuarantinePath: string;
+begin
+  Expected := CanonicalDigest(ADigest);
+  APath := ObjectPath(Expected);
   {$IFDEF OBJECTSTORE_TESTING}
   if Assigned(ObjectStoreBeforeQuarantineTestHook) then
     ObjectStoreBeforeQuarantineTestHook(APath);
@@ -225,11 +298,63 @@ begin
   Result := False;
 end;
 
+function TLWPTImmutableObjectStore.LookupWithObjectGuard(
+  const ADigest: string; out APath: string): Boolean;
+var
+  Corrupt: Boolean;
+  MutationLease: TObject;
+begin
+  Result := VerifyObject(ADigest, APath, Corrupt);
+  if not Result and not Corrupt then Exit;
+  MutationLease := FCacheLifecycle.AcquireMutation;
+  try
+    if Corrupt then Result := RepairCorruptObjectLocked(ADigest, APath);
+    if Result then FCacheLifecycle.TouchObjectLocked(ADigest);
+  finally
+    MutationLease.Free;
+  end;
+end;
+
+function TLWPTImmutableObjectStore.Lookup(const ADigest: string;
+  out APath: string): Boolean;
+var
+  Digest: string;
+  ObjectLease: TObject;
+begin
+  Digest := CanonicalDigest(ADigest);
+  ObjectLease := FCacheLifecycle.AcquireObject(Digest);
+  try
+    Result := LookupWithObjectGuard(Digest, APath);
+  finally
+    ObjectLease.Free;
+  end;
+end;
+
 function TLWPTImmutableObjectStore.Admit(const ASourcePath,
   AExpectedDigest: string): string;
 var
-  Expected, Existing, TmpRoot, Staged, Actual: string;
+  Inserted: Boolean;
+  Lease: TObject;
 begin
+  Result := AdmitRetained(ASourcePath, AExpectedDigest, Lease, Inserted);
+  Lease.Free;
+end;
+
+function TLWPTImmutableObjectStore.AdmitRetained(const ASourcePath,
+  AExpectedDigest: string; out ALease: TObject;
+  out AInserted: Boolean): string;
+var
+  Expected, Existing, TmpRoot, Staged, Actual: string;
+  MutationLease, ObjectLease: TObject;
+  Published: Boolean;
+begin
+  ALease := nil;
+  AInserted := False;
+  ObjectLease := nil;
+  MutationLease := nil;
+  Published := False;
+  Staged := '';
+  TmpRoot := '';
   Expected := CanonicalDigest(AExpectedDigest);
   if not FileExists(ASourcePath) then
     raise ELWPTObjectStoreError.CreateFmt(
@@ -239,39 +364,110 @@ begin
     raise ELWPTObjectStoreError.CreateFmt(
       'object admission hash mismatch: expected %s, got %s',
       [Expected, Actual]);
-  if Lookup(Expected, Existing) then Exit(Existing);
-
   Result := ObjectPath(Expected);
-  TmpRoot := IncludeTrailingPathDelimiter(FRoot) + 'tmp';
-  ForceDirectories(TmpRoot);
-  Staged := MakeTmpPath(TmpRoot, 'object');
-  if not CopyFileContent(ASourcePath, Staged) then
-    raise ELWPTObjectStoreError.CreateFmt(
-      'failed to stage object %s', [Expected]);
+  ObjectLease := FCacheLifecycle.AcquireObject(Expected);
   try
-    Actual := 'sha256:' + SHA256File(Staged);
-    if Actual <> Expected then
-      raise ELWPTObjectStoreError.CreateFmt(
-        'staged object hash mismatch: expected %s, got %s',
-        [Expected, Actual]);
-    ForceDirectories(ExtractFileDir(Result));
-    { Replacement is safe because every competing writer must prove the same
-      digest before reaching this point. AtomicReplaceFile keeps readers from
-      observing a partial object; a Windows sharing race accepts the already
-      published verified winner. }
-    if not AtomicReplaceFile(Staged, Result) then
-    begin
-      if Lookup(Expected, Existing) then
+    try
+      if LookupWithObjectGuard(Expected, Existing) then
       begin
-        SysUtils.DeleteFile(Staged);
+        ALease := ObjectLease;
+        ObjectLease := nil;
         Exit(Existing);
       end;
-      raise ELWPTObjectStoreError.CreateFmt(
-        'failed to publish object %s', [Expected]);
+
+      { Each digest owns a staging directory under its object-use guard.
+        Repair can reclaim abandoned directories while skipping this one,
+        without serializing unrelated large copies behind the index guard. }
+      TmpRoot := IncludeTrailingPathDelimiter(FRoot) + 'tmp/'
+        + Copy(Expected, 8, MaxInt);
+      EnsureUnlinkedDirectory(IncludeTrailingPathDelimiter(FRoot) + 'tmp',
+        'object staging root');
+      EnsureUnlinkedDirectory(TmpRoot, 'object staging directory');
+      Staged := MakeTmpPath(TmpRoot, 'object');
+      if not CopyFileContent(ASourcePath, Staged) then
+        raise ELWPTObjectStoreError.CreateFmt(
+          'failed to stage object %s', [Expected]);
+      Actual := 'sha256:' + SHA256File(Staged);
+      if Actual <> Expected then
+        raise ELWPTObjectStoreError.CreateFmt(
+          'staged object hash mismatch: expected %s, got %s',
+          [Expected, Actual]);
+      {$IFDEF OBJECTSTORE_TESTING}
+      if Assigned(ObjectStoreAfterStageTestHook) then
+        ObjectStoreAfterStageTestHook(Staged);
+      {$ENDIF}
+
+      MutationLease := FCacheLifecycle.AcquireMutation;
+      try
+        EnsureUnlinkedDirectory(IncludeTrailingPathDelimiter(FRoot)
+          + 'sha256', 'object digest root');
+        EnsureUnlinkedDirectory(ExtractFileDir(Result),
+          'object digest shard');
+        { Replacement is safe because every competing writer must prove the
+          same digest before reaching this point. The object-use guard keeps
+          eviction and materialization outside the publication interval. }
+        if not AtomicReplaceFile(Staged, Result) then
+          raise ELWPTObjectStoreError.CreateFmt(
+            'failed to publish object %s', [Expected]);
+        Staged := '';
+        Published := True;
+        FCacheLifecycle.RecordObjectLocked(Expected, Result);
+        if not FCacheLifecycle.MakeRoomLocked(0) then
+        begin
+          FCacheLifecycle.DiscardObjectLocked(Expected, Result);
+          Published := False;
+          Result := '';
+          Exit;
+        end;
+        AInserted := True;
+        ALease := ObjectLease;
+        ObjectLease := nil;
+      finally
+        MutationLease.Free;
+        MutationLease := nil;
+      end;
+    except
+      if (Staged <> '') and FileExists(Staged) then
+        SysUtils.DeleteFile(Staged);
+      if Published then
+      begin
+        try
+          MutationLease := FCacheLifecycle.AcquireMutation;
+          try
+            FCacheLifecycle.DiscardObjectLocked(Expected, Result);
+            Published := False;
+          finally
+            MutationLease.Free;
+            MutationLease := nil;
+          end;
+        except
+          { Preserve the publication failure. Repair owns any residue left by
+            a rollback failure, and replacing the original exception would
+            hide the operation that made the object incomplete. }
+          Published := True;
+        end;
+      end;
+      if (TmpRoot <> '') and DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
+      raise;
     end;
-  except
-    if FileExists(Staged) then SysUtils.DeleteFile(Staged);
-    raise;
+  finally
+    if (TmpRoot <> '') and DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
+    ObjectLease.Free;
+  end;
+end;
+
+procedure TLWPTImmutableObjectStore.DiscardRetained(
+  const ADigest: string);
+var
+  Digest: string;
+  MutationLease: TObject;
+begin
+  Digest := CanonicalDigest(ADigest);
+  MutationLease := FCacheLifecycle.AcquireMutation;
+  try
+    FCacheLifecycle.DiscardObjectLocked(Digest, ObjectPath(Digest));
+  finally
+    MutationLease.Free;
   end;
 end;
 
@@ -279,31 +475,37 @@ function TLWPTImmutableObjectStore.Materialize(const ADigest,
   ADestination, ATmpRoot: string): Boolean;
 var
   Expected, SourcePath, Staged, Actual: string;
+  ObjectLease: TObject;
 begin
   Expected := CanonicalDigest(ADigest);
-  if not Lookup(Expected, SourcePath) then Exit(False);
-  ForceDirectories(ATmpRoot);
-  Staged := MakeTmpPath(ATmpRoot, 'cache-object');
-  if not CopyFileContent(SourcePath, Staged) then
-  begin
-    if FileExists(Staged) then SysUtils.DeleteFile(Staged);
-    Exit(False);
-  end;
+  ObjectLease := FCacheLifecycle.AcquireObject(Expected);
   try
-    Actual := 'sha256:' + SHA256File(Staged);
-    if Actual <> Expected then
+    if not LookupWithObjectGuard(Expected, SourcePath) then Exit(False);
+    ForceDirectories(ATmpRoot);
+    Staged := MakeTmpPath(ATmpRoot, 'cache-object');
+    if not CopyFileContent(SourcePath, Staged) then
     begin
-      SysUtils.DeleteFile(Staged);
+      if FileExists(Staged) then SysUtils.DeleteFile(Staged);
       Exit(False);
     end;
-    if not AtomicMoveFile(Staged, ADestination) then
-      raise ELWPTObjectStoreError.CreateFmt(
-        'failed to materialize object %s at %s',
-        [Expected, ADestination]);
-    Result := True;
-  except
-    if FileExists(Staged) then SysUtils.DeleteFile(Staged);
-    raise;
+    try
+      Actual := 'sha256:' + SHA256File(Staged);
+      if Actual <> Expected then
+      begin
+        SysUtils.DeleteFile(Staged);
+        Exit(False);
+      end;
+      if not AtomicMoveFile(Staged, ADestination) then
+        raise ELWPTObjectStoreError.CreateFmt(
+          'failed to materialize object %s at %s',
+          [Expected, ADestination]);
+      Result := True;
+    except
+      if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+      raise;
+    end;
+  finally
+    ObjectLease.Free;
   end;
 end;
 

@@ -474,7 +474,8 @@ begin
   Expect<Integer>(Run.ExitCode).ToBe(86);
   Expect<Boolean>(FileExists(
     Root + '/.lwpt/modules/branch-a/source/branch-a.pas')).ToBe(True);
-  Run := RunLwpt(['repair'], Root);
+  Run := RunLwpt(['repair'], Root,
+    [PROJECT_NAME + '_CACHE_DIR=' + FScratch + '/shared-cache']);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadText(
     Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old' + LineEnding);
@@ -497,7 +498,8 @@ begin
   Expect<Integer>(Run.ExitCode).ToBe(87);
   Expect<string>(ReadText(
     Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old' + LineEnding);
-  Run := RunLwpt(['repair'], Root);
+  Run := RunLwpt(['repair'], Root,
+    [PROJECT_NAME + '_CACHE_DIR=' + FScratch + '/shared-cache']);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadText(
     Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old' + LineEnding);
@@ -567,7 +569,8 @@ begin
   Expect<string>(ReadText(Root + '/lwpt.cfg'))
     .ToBe('old-cfg' + LineEnding);
   Expect<Boolean>(HasRollbackMarker(Root + '/.lwpt/tmp')).ToBe(True);
-  Run := RunLwpt(['repair'], Root);
+  Run := RunLwpt(['repair'], Root,
+    [PROJECT_NAME + '_CACHE_DIR=' + FScratch + '/shared-cache']);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadText(
     Root + '/.lwpt/modules/branch-b/old.txt')).ToBe('old-b' + LineEnding);
@@ -590,14 +593,16 @@ begin
     [PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER=2']);
   Expect<Integer>(Run.ExitCode).ToBe(86);
   Run := RunLwpt(['repair'], Root,
-    [PROJECT_NAME + '_TEST_THROW_RESTORE_FOR=branch-a']);
+    [PROJECT_NAME + '_CACHE_DIR=' + FScratch + '/shared-cache',
+     PROJECT_NAME + '_TEST_THROW_RESTORE_FOR=branch-a']);
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('injected restore exception', Combined) > 0).ToBe(True);
   Expect<string>(ReadText(
     Root + '/.lwpt/modules/branch-b/old.txt')).ToBe('old-b' + LineEnding);
   Expect<Boolean>(HasRollbackMarker(Root + '/.lwpt/tmp')).ToBe(True);
-  Run := RunLwpt(['repair'], Root);
+  Run := RunLwpt(['repair'], Root,
+    [PROJECT_NAME + '_CACHE_DIR=' + FScratch + '/shared-cache']);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadText(
     Root + '/.lwpt/modules/branch-a/old.txt')).ToBe('old-a' + LineEnding);

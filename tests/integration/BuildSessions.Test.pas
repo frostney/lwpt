@@ -516,6 +516,8 @@ begin
   SetProcessEnv(Result.Environment, WORKER_STATE_DIR_ENV + '='
     + FScratch + '/worker-state');
   SetProcessEnv(Result.Environment, WORKER_BUDGET_ENV + '=4');
+  SetProcessEnv(Result.Environment, CACHE_DIR_ENV + '='
+    + FScratch + '/shared-cache');
   for i := 0 to High(AExtraEnv) do
     SetProcessEnv(Result.Environment, AExtraEnv[i]);
   Result.Execute;
@@ -531,6 +533,7 @@ begin
   SetLength(Env, 0);
   SetEnv(Env, WORKER_STATE_DIR_ENV + '=' + FScratch + '/worker-state');
   SetEnv(Env, WORKER_BUDGET_ENV + '=4');
+  SetEnv(Env, CACHE_DIR_ENV + '=' + FScratch + '/shared-cache');
   for i := 0 to High(AExtraEnv) do SetEnv(Env, AExtraEnv[i]);
   Result := RunLwpt(AArgs, AProject, Env);
 end;

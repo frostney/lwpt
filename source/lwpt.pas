@@ -12,7 +12,7 @@
     format    format uses-clauses and identifiers (--check to verify only)
     duplication report manifest-scoped Type-2 Pascal token clones
     test      discover + compile + run *.Test.pas files
-    repair    reclaim install, build-session, and worker-lease residue
+    repair    recover project and shared-cache residue
     run       invoke a user-declared run task (or alias a subcommand)
     health    report Pascal complexity and optional Git hotspots
     agents    write/verify the agent-facing command reference in
@@ -764,7 +764,7 @@ begin
 
     SetLength(RepairOpts, 0);
     Registry.Add(TSubcommand.Create('repair',
-      'Reclaim install, build-session, and worker-lease residue', '',
+      'Recover project and shared-cache residue', '',
       @HandleRepair, RepairOpts));
 
     SetLength(InitOpts, 3);

@@ -9,7 +9,7 @@
   install crashes mid-run; it must be safe on a clean tree and
   effective on a dirty one.
 
-  Six assertions:
+  Seven assertions:
     1. Repair on a clean tree is a no-op exit 0 (idempotent).
     2. Stale .lwpt/install.lock is removed.
     3. .lwpt/tmp/ contents are removed; the directory itself stays.
@@ -17,13 +17,17 @@
     4. Failed build-session staging is reclaimed.
     5. Dead machine-wide worker requests are reclaimed and diagnosed.
     6. Historical relocated sessions remain reclaimable after the override
-       is absent. }
+       is absent.
+    7. Shared-cache corruption and incomplete state are repaired repeatably. }
 
 program Repair.Test;
 
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}
+  cthreads,
+  {$ENDIF}
   Classes,
   SysUtils,
 
@@ -35,8 +39,9 @@ uses
 type
   TRepairE2E = class(TTestSuite)
   private
-    FOrigDir, FScratch, FWorkerState: string;
+    FCacheRoot, FOrigDir, FScratch, FWorkerState: string;
     procedure SetupScratchProject;
+    procedure WriteCacheBytes(const APath, ABytes: string);
     function RunRepair: TLwptResult;
   protected
     procedure BeforeAll; override;
@@ -48,6 +53,7 @@ type
     procedure TestRepairCleansTmpButLeavesCommittedState;
     procedure TestRepairReclaimsFailedBuildSession;
     procedure TestRepairReclaimsHistoricalRelocatedSession;
+    procedure TestRepairRecoversSharedCache;
     procedure TestRepairReclaimsWorkerRequests;
   end;
 
@@ -72,9 +78,25 @@ begin
     'end.'#10);
 end;
 
+procedure TRepairE2E.WriteCacheBytes(const APath, ABytes: string);
+var
+  Raw: RawByteString;
+  Stream: TFileStream;
+begin
+  ForceDirectories(ExtractFileDir(APath));
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    Raw := RawByteString(ABytes);
+    if Length(Raw) > 0 then Stream.WriteBuffer(Raw[1], Length(Raw));
+  finally
+    Stream.Free;
+  end;
+end;
+
 function TRepairE2E.RunRepair: TLwptResult;
 begin
   Result := RunLwpt(['repair'], FScratch, [
+    'LWPT_CACHE_DIR=' + FCacheRoot,
     'LWPT_WORKER_STATE_DIR=' + FWorkerState,
     'LWPT_WORKER_BUDGET=1'
   ]);
@@ -114,6 +136,7 @@ procedure TRepairE2E.BeforeAll;
 begin
   FOrigDir := GetCurrentDir;
   FScratch := CreateScratchRoot('repair-e2e');
+  FCacheRoot := FScratch + '/shared-cache';
   FWorkerState := FScratch + '/worker-state';
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 
@@ -122,7 +145,7 @@ begin
   SetupScratchProject;
 
   { Run install once so .lwpt/ has the canonical committed state. }
-  RunLwpt(['install'], FScratch);
+  RunLwpt(['install'], FScratch, ['LWPT_CACHE_DIR=' + FCacheRoot]);
 end;
 
 procedure TRepairE2E.AfterAll;
@@ -250,6 +273,42 @@ begin
   Expect<Boolean>(FileExists(NamespacePath + '/project.identity')).ToBe(True);
 end;
 
+procedure TRepairE2E.TestRepairRecoversSharedCache;
+const
+  CORRUPT_HEX =
+    '6e16134b15b8ffcaf579c488d22e69239e96b2978b9cfa2b600907f71bcbd462';
+  HEALTHY_HEX =
+    '95059162bf04f962254ae2f56b4159c8d93ecb6ab5be9d4ad6d1368aebeb0c53';
+var
+  CorruptPath, HealthyPath: string;
+  R: TLwptResult;
+begin
+  { Seed the on-disk public cache contract directly: this root CLI test must
+    not construct its fixture through the implementation under test. }
+  CorruptPath := FCacheRoot + '/dependency-archives/sha256/'
+    + Copy(CORRUPT_HEX, 1, 2) + '/' + Copy(CORRUPT_HEX, 3, MaxInt);
+  HealthyPath := FCacheRoot + '/dependency-archives/sha256/'
+    + Copy(HEALTHY_HEX, 1, 2) + '/' + Copy(HEALTHY_HEX, 3, MaxInt);
+  WriteCacheBytes(CorruptPath, 'tampered'#10);
+  WriteCacheBytes(HealthyPath, 'healthy cache payload'#10);
+  WriteTextFile(FCacheRoot + '/dependency-archives/tmp/incomplete',
+    'partial');
+
+  R := RunRepair;
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(CorruptPath)).ToBe(False);
+  Expect<Boolean>(FileExists(HealthyPath)).ToBe(True);
+  Expect<Boolean>(Pos('removed 1 corrupt shared-cache object',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('shared-cache recovery completed without touching '
+    + 'committed project archives', R.Stdout) > 0).ToBe(True);
+
+  R := RunRepair;
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('removed 0 corrupt shared-cache object',
+    R.Stdout) > 0).ToBe(True);
+end;
+
 procedure TRepairE2E.SetupTests;
 begin
   Test('repair on a clean tree is a no-op exit 0',
@@ -262,6 +321,8 @@ begin
     TestRepairReclaimsFailedBuildSession);
   Test('repair reclaims a historical relocated build session',
     TestRepairReclaimsHistoricalRelocatedSession);
+  Test('shared cache recovery is explicit and repeatable',
+    TestRepairRecoversSharedCache);
   Test('repair reclaims dead machine-wide worker requests',
     TestRepairReclaimsWorkerRequests);
 end;

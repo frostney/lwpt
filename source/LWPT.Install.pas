@@ -3369,7 +3369,8 @@ begin
     if not Frozen then
       try
         ObjectStore := TLWPTImmutableObjectStore.Create(
-          DependencyArchiveStoreRoot(ResolveCacheRoot));
+          DependencyArchiveStoreRoot(ResolveCacheRoot), ResolveCacheRoot,
+          DEPENDENCY_ARCHIVE_NAMESPACE);
       except
         on E: Exception do
           WriteLn(ErrOutput,
