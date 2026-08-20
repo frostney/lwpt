@@ -1,9 +1,10 @@
 # CI
 
-Nine GitHub Actions workflows retain the existing build-once/test-natively
-matrix and add a repository-owned managed-delivery adapter. Expensive workflows
-that execute pull-request code have read-only permissions. Controllers and
-finalizers with write permission always run trusted default-branch code.
+Ten GitHub Actions workflows retain the existing build-once/test-natively
+matrix, add a repository-owned managed-delivery adapter, and expose the reusable
+LWPT dependency updater. Expensive workflows that execute pull-request code have
+read-only permissions. Controllers and finalizers with write permission always
+run trusted default-branch code.
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
@@ -16,6 +17,7 @@ finalizers with write permission always run trusted default-branch code.
 | `delivery-observer.yml` | State-changing PR metadata, manual | Invalidate stale managed readiness and full-CI evidence |
 | `delivery-finalizer.yml` | `workflow_run` completion | Conclude full-CI proof when GitHub emits the event |
 | `delivery-watchdog.yml` | 15-minute schedule, manual | Reconcile managed state and terminal full-CI runs, then fail full-CI proofs left nonterminal for 120 minutes |
+| `lwpt-update.yml` | `workflow_call`, manual | Update git-host dependencies and open or refresh one bot-owned pull request |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
@@ -54,6 +56,62 @@ and rejects tag updates or deletion. The protected `release` environment owns
 the approval gate between successful builds and publication.
 
 ## Workflows
+
+### LWPT dependency updater
+
+Consumers can schedule ADR-0039's Dependabot-equivalent without copying its
+update and pull-request logic:
+
+```yaml
+name: lwpt-update
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  update:
+    uses: frostney/lwpt/.github/workflows/lwpt-update.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+```
+
+The reusable job prefers a compatible `build/lwpt`, then `lwpt` on `PATH`, and
+otherwise bootstraps the selected `lwpt-ref` from source. It runs `lwpt
+outdated --json`, exits without a branch when everything is current, and runs
+`lwpt update` when a `newer` or `major` entry exists. Only `lwpt.toml`,
+`lwpt.lock`, `lwpt.cfg`, `.lwpt/modules/`, and `.lwpt/archives/` are staged.
+The fixed `lwpt/update-dependencies` branch is bot-owned and replaced with
+`--force-with-lease`; do not put manual commits on it.
+
+The pull-request body records the constraint, locked version, latest tag, and
+status for every update. GitHub release titles are escaped and the first 40
+lines of release notes are placed in a dynamically sized plain-text fence, so
+upstream Markdown, HTML, issue-closing text, and mentions remain inert. GitLab,
+Bitbucket, and custom-host entries are named but direct the reader to that host
+for release notes.
+
+By default the job authenticates with the caller's `GITHUB_TOKEN`. GitHub puts
+the resulting pull-request checks in an approval-required state. Consumers that
+want CI to start without that approval can pass a GitHub App installation token
+or personal access token:
+
+```yaml
+jobs:
+  update:
+    uses: frostney/lwpt/.github/workflows/lwpt-update.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+    secrets:
+      update_token: ${{ secrets.LWPT_UPDATE_TOKEN }}
+```
+
+Optional inputs change `working-directory`, the bot `branch-name`, `pr-title`,
+or the bootstrapped `lwpt-ref`. Concurrent runs targeting the same repository
+and branch serialize rather than racing the fixed update branch.
 
 ### Managed-delivery proof lifecycle
 

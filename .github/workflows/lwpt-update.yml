@@ -1,0 +1,337 @@
+name: LWPT dependency update
+
+# Reusable weekly Dependabot-equivalent for lwpt.toml git-host deps
+# (ADR-0039). See docs/ci.md for the caller workflow.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory that contains lwpt.toml
+        type: string
+        default: '.'
+      branch-name:
+        description: Bot-owned branch the updater replaces
+        type: string
+        default: 'lwpt/update-dependencies'
+      pr-title:
+        description: Pull-request title
+        type: string
+        default: 'chore(deps): update lwpt dependencies'
+      lwpt-ref:
+        description: frostney/lwpt ref to bootstrap when no local binary exists
+        type: string
+        default: 'main'
+    secrets:
+      update_token:
+        description: Optional App or PAT token so the dependency PR starts CI automatically
+        required: false
+  workflow_dispatch:
+    inputs:
+      working-directory:
+        description: Directory that contains lwpt.toml
+        type: string
+        default: '.'
+      branch-name:
+        description: Bot-owned branch the updater replaces
+        type: string
+        default: 'lwpt/update-dependencies'
+      pr-title:
+        description: Pull-request title
+        type: string
+        default: 'chore(deps): update lwpt dependencies'
+      lwpt-ref:
+        description: frostney/lwpt ref to bootstrap when no local binary exists
+        type: string
+        default: 'main'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: lwpt-update-${{ github.repository }}-${{ inputs.branch-name || 'lwpt/update-dependencies' }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout consumer
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.update_token || github.token }}
+
+      - name: Resolve LWPT
+        working-directory: ${{ inputs.working-directory || '.' }}
+        env:
+          LWPT_REF: ${{ inputs.lwpt-ref || 'main' }}
+        run: |
+          set -euo pipefail
+          if [ -x ./build/lwpt ] && ./build/lwpt outdated --help >/dev/null 2>&1; then
+            echo "LWPT_BIN=$(pwd)/build/lwpt" >> "$GITHUB_ENV"
+            echo "Using ./build/lwpt"
+            exit 0
+          fi
+          if command -v lwpt >/dev/null 2>&1 && lwpt outdated --help >/dev/null 2>&1; then
+            echo "LWPT_BIN=$(command -v lwpt)" >> "$GITHUB_ENV"
+            echo "Using lwpt from PATH"
+            exit 0
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          lwpt_source="$RUNNER_TEMP/lwpt-src"
+          git init "$lwpt_source"
+          git -C "$lwpt_source" remote add origin https://github.com/frostney/lwpt.git
+          git -C "$lwpt_source" fetch --depth 1 origin "$LWPT_REF"
+          git -C "$lwpt_source" checkout --detach FETCH_HEAD
+          (cd "$lwpt_source" && ./bootstrap.sh)
+          echo "LWPT_BIN=$lwpt_source/build/lwpt" >> "$GITHUB_ENV"
+
+      - name: Scan and update
+        id: scan
+        working-directory: ${{ inputs.working-directory || '.' }}
+        env:
+          LWPT_OUTDATED_JSON: ${{ runner.temp }}/lwpt-outdated.json
+          LWPT_PENDING_JSON: ${{ runner.temp }}/lwpt-pending.json
+        run: |
+          set -euo pipefail
+          scan_exit=0
+          "$LWPT_BIN" outdated --json > "$LWPT_OUTDATED_JSON" || scan_exit=$?
+          export LWPT_SCAN_EXIT="$scan_exit"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          outdated_path = pathlib.Path(os.environ['LWPT_OUTDATED_JSON'])
+          try:
+              data = json.loads(outdated_path.read_text(encoding='utf-8'))
+          except (OSError, json.JSONDecodeError) as error:
+              raise SystemExit(f'lwpt outdated did not emit valid JSON: {error}')
+
+          packages = data.get('packages')
+          if not isinstance(packages, list):
+              raise SystemExit('lwpt outdated JSON has no packages array')
+          allowed = {'current', 'newer', 'major'}
+          for package in packages:
+              if not isinstance(package, dict) or package.get('status') not in allowed:
+                  raise SystemExit('lwpt outdated JSON contains an invalid package status')
+
+          pending = [p for p in packages if p['status'] in {'newer', 'major'}]
+          scan_exit = int(os.environ['LWPT_SCAN_EXIT'])
+          expected_exit = 1 if pending else 0
+          if scan_exit != expected_exit:
+              raise SystemExit(
+                  f'lwpt outdated exited {scan_exit}; expected {expected_exit} for its JSON report'
+              )
+
+          pathlib.Path(os.environ['LWPT_PENDING_JSON']).write_text(
+              json.dumps(pending, indent=2) + '\n', encoding='utf-8'
+          )
+          print(f'Compared {len(packages)} git-host dependencies; {len(pending)} pending.')
+          for package in packages:
+              print(
+                  f"- {package.get('name', '')}: {package.get('locked', '') or '(unlocked)'}"
+                  f" -> {package.get('latest', '')} ({package['status']})"
+              )
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'pending={len(pending)}\n')
+          PY
+
+          pending_count=$(python3 -c \
+            'import json,os,pathlib; print(len(json.loads(pathlib.Path(os.environ["LWPT_PENDING_JSON"]).read_text())))')
+          if [ "$pending_count" -eq 0 ]; then
+            echo "No LWPT dependency updates."
+            exit 0
+          fi
+          "$LWPT_BIN" update
+
+      - name: Build pull-request body
+        if: steps.scan.outputs.pending != '0'
+        env:
+          GH_TOKEN: ${{ secrets.update_token || github.token }}
+          LWPT_PENDING_JSON: ${{ runner.temp }}/lwpt-pending.json
+          LWPT_PR_BODY: ${{ runner.temp }}/lwpt-pr-body.md
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import html
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import urllib.parse
+
+          pending = json.loads(
+              pathlib.Path(os.environ['LWPT_PENDING_JSON']).read_text(encoding='utf-8')
+          )
+
+          def markdown_text(value):
+              text = ' '.join(str(value or '').split())
+              text = html.escape(text, quote=False)
+              text = text.replace('#', '&#35;').replace('@', '&#64;')
+              return re.sub(r'([\\`*_\[\]])', r'\\\1', text)
+
+          def table_code(value):
+              text = ' '.join(str(value or '').split())
+              text = text.replace('\\', '\\\\').replace('`', '\\`').replace('|', '\\|')
+              return f'`{text}`'
+
+          def literal_excerpt(value):
+              body = str(value or '').strip()
+              if not body:
+                  return '_No GitHub release notes for this tag._'
+              original_lines = body.splitlines()
+              snippet = '\n'.join(original_lines[:40]).strip()
+              truncated = len(original_lines) > 40
+              if len(snippet) > 4000:
+                  snippet = snippet[:4000].rstrip()
+                  truncated = True
+              if truncated:
+                  snippet += '\n\n…'
+              longest = max(
+                  (len(match.group(0)) for match in re.finditer(r'`+', snippet)),
+                  default=0,
+              )
+              fence = '`' * max(3, longest + 1)
+              return f'{fence}text\n{snippet}\n{fence}'
+
+          def github_source(source):
+              return source.startswith('github:') or ':' not in source
+
+          def github_release(locator, latest_ref, latest):
+              owner, repository = locator.split('/', 1)
+              candidates = []
+              for tag in (latest_ref, latest_ref.lstrip('vV'), 'v' + latest.lstrip('vV')):
+                  if tag and tag not in candidates:
+                      candidates.append(tag)
+              for tag in candidates:
+                  endpoint = 'repos/{}/{}/releases/tags/{}'.format(
+                      urllib.parse.quote(owner, safe=''),
+                      urllib.parse.quote(repository, safe=''),
+                      urllib.parse.quote(tag, safe=''),
+                  )
+                  result = subprocess.run(
+                      ['gh', 'api', endpoint], capture_output=True, text=True, check=False
+                  )
+                  if result.returncode != 0:
+                      continue
+                  try:
+                      release = json.loads(result.stdout)
+                  except json.JSONDecodeError:
+                      continue
+                  return release
+              return None
+
+          lines = [
+              '## LWPT dependency updates',
+              '',
+              'These git-host dependencies have a newer advertised tag than the lockfile.',
+              'Constraints were rewritten only when the latest tag is outside the authored',
+              '`^` / `~` / exact spec. `lwpt update` then ran the install transaction so',
+              '`lwpt.lock`, `lwpt.cfg`, and committed dependency state stay consistent.',
+              '',
+              '| Package | Constraint | Locked | Latest | Status |',
+              '| --- | --- | --- | --- | --- |',
+          ]
+          notes = []
+          notes_size = 0
+          for package in pending:
+              lines.append(
+                  '| {} | {} | {} | {} | {} |'.format(
+                      table_code(package.get('name')),
+                      table_code(package.get('constraint')),
+                      table_code(package.get('locked')),
+                      table_code(package.get('latest')),
+                      markdown_text(package.get('status')),
+                  )
+              )
+
+              name = table_code(package.get('name'))
+              source = str(package.get('source') or '')
+              locator = str(package.get('locator') or '')
+              latest_ref = str(package.get('latestRef') or package.get('latest') or '')
+              if not github_source(source) or locator.count('/') != 1:
+                  section = (
+                      f'### {name} — {markdown_text(latest_ref)}\n\n'
+                      f'Hosted outside GitHub ({table_code(source)}); view release notes '
+                      'on that host.'
+                  )
+              else:
+                  release = github_release(
+                      locator, latest_ref, str(package.get('latest') or '')
+                  )
+                  title = latest_ref
+                  body = ''
+                  if release:
+                      title = release.get('name') or release.get('tag_name') or latest_ref
+                      body = release.get('body') or ''
+                  section = (
+                      f'### {name} — {markdown_text(title)}\n\n'
+                      f'{literal_excerpt(body)}'
+                  )
+
+              if notes_size + len(section) > 40000:
+                  notes.append(
+                      '_Additional release-note excerpts were omitted to keep the pull-request '
+                      'body within GitHub limits._'
+                  )
+                  break
+              notes.append(section)
+              notes_size += len(section)
+
+          lines.extend(['', '## Why', ''])
+          lines.extend(notes or ['No release-note excerpts were available.'])
+          pathlib.Path(os.environ['LWPT_PR_BODY']).write_text(
+              '\n'.join(lines) + '\n', encoding='utf-8'
+          )
+          PY
+
+      - name: Open or update pull request
+        if: steps.scan.outputs.pending != '0'
+        working-directory: ${{ inputs.working-directory || '.' }}
+        env:
+          GH_TOKEN: ${{ secrets.update_token || github.token }}
+          BRANCH_NAME: ${{ inputs.branch-name || 'lwpt/update-dependencies' }}
+          PR_TITLE: "${{ inputs.pr-title || 'chore(deps): update lwpt dependencies' }}"
+          LWPT_PR_BODY: ${{ runner.temp }}/lwpt-pr-body.md
+        run: |
+          set -euo pipefail
+          default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
+          if [ "$BRANCH_NAME" = "$default_branch" ]; then
+            echo "::error::The updater branch must not be the default branch."
+            exit 1
+          fi
+          git check-ref-format "refs/heads/$BRANCH_NAME"
+
+          git checkout -B "$BRANCH_NAME"
+          git add -A -- lwpt.toml
+          for path in lwpt.lock lwpt.cfg .lwpt/modules .lwpt/archives; do
+            tracked_path=$(git ls-files -- "$path")
+            if [ -e "$path" ] || [ -n "$tracked_path" ]; then
+              git add -A -- "$path"
+            fi
+          done
+          if git diff --cached --quiet; then
+            echo "Update ran but produced no file changes."
+            exit 0
+          fi
+
+          git -c user.name='lwpt-bot' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "$PR_TITLE"
+          git push --force-with-lease origin "HEAD:refs/heads/$BRANCH_NAME"
+
+          existing=$(gh pr list --state open --head "$BRANCH_NAME" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$PR_TITLE" --body-file "$LWPT_PR_BODY"
+          else
+            gh pr create --base "$default_branch" --head "$BRANCH_NAME" \
+              --title "$PR_TITLE" --body-file "$LWPT_PR_BODY"
+          fi
