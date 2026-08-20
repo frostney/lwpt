@@ -47,7 +47,10 @@ content, reconstructs corrupt or missing LRU entries from verified manifests,
 reclaims producer metadata only after acquiring its released OS guard and
 atomically detaching the guarded key directory before recursive removal, and
 enforces the effective budget. Detachment moves a concurrently substituted
-link itself, so repair never follows that link outside the cache. It reports
+link itself, so repair never follows that link outside the cache. On Windows,
+where an open child prevents the directory rename, the released guard and the
+directory rename arbitrate the race: a new producer either blocks detachment
+or starts against a newly created key after the old one has moved. It reports
 the budget and remaining bytes,
 bytes reclaimed, corruption and incomplete state removed, abandoned leases,
 and live objects/leases preserved. Repeating repair is safe. Project-owned

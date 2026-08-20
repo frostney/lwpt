@@ -398,6 +398,41 @@ begin
     + PRODUCER_LEASE_NAMESPACE;
 end;
 
+function TryDetachAbandonedKey(const AKeyRootPath, AQuarantinePath: string;
+  var AGuard: TLWPTProducerGuard): Boolean;
+{$IFDEF MSWINDOWS}
+const
+  MAX_RENAME_ATTEMPTS = 2;
+var
+  Attempt: Integer;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Result := SysUtils.RenameFile(AKeyRootPath, AQuarantinePath);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  { Windows refuses to rename a directory while its locked guard child is
+    open. Releasing the guard is still race-safe: a producer that acquires it
+    first keeps the directory rename from succeeding; a successful rename
+    atomically detaches the old key before a producer can recreate its path. }
+  AGuard.Free;
+  AGuard := nil;
+  for Attempt := 1 to MAX_RENAME_ATTEMPTS do
+  begin
+    if SysUtils.RenameFile(AKeyRootPath, AQuarantinePath) then Exit(True);
+    if not TLWPTProducerGuard.TryCreate(
+         IncludeTrailingPathDelimiter(AKeyRootPath) + GUARD_FILE,
+         AGuard) then Exit(False);
+    if Attempt < MAX_RENAME_ATTEMPTS then
+    begin
+      AGuard.Free;
+      AGuard := nil;
+    end;
+  end;
+  Result := False;
+  {$ENDIF}
+end;
+
 function RepairProducerLeases(const ACacheRoot: string;
   out ALivePreserved: Integer): Integer;
 var
@@ -490,10 +525,18 @@ begin
             begin
               QuarantinePath := KeyRootPath + '.repair-'
                 + NewToken(KeySearch.Name);
-              if not SysUtils.RenameFile(KeyRootPath, QuarantinePath) then
+              if not TryDetachAbandonedKey(KeyRootPath, QuarantinePath,
+                   Guard) then
+              begin
+                if Guard = nil then
+                begin
+                  Inc(ALivePreserved);
+                  Continue;
+                end;
                 raise ELWPTProducerLeaseError.CreateFmt(
                   'failed to isolate abandoned producer state at %s',
                   [KeyRootPath]);
+              end;
               if IsDirSymlinkOrJunction(QuarantinePath)
                  or DirectoryExists(QuarantinePath) then
                 WipeDir(QuarantinePath)

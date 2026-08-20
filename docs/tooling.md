@@ -174,6 +174,7 @@ processes; it does not serialize independent downloads or compiles.
 and quarantined corruption, reclaims producer metadata only when its OS guard
 is no longer held, atomically detaches the guarded key directory before
 recursive removal so a concurrent link substitution cannot redirect cleanup,
+using the directory rename itself as the final producer race check on Windows,
 verifies content-addressed bytes, rebuilds a corrupt LRU index from verified
 object manifests, and enforces the current budget. Its
 report names bytes reclaimed, corrupt objects removed, and live objects and
