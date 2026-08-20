@@ -177,14 +177,17 @@ jobs:
               text = text.replace('#', '&#35;').replace('@', '&#64;')
               return re.sub(r'([\\`*_\[\]])', r'\\\1', text)
 
-          def table_code(value):
-              text = ' '.join(str(value or '').split())
-              text = text.replace('\\', '\\\\').replace('|', '\\|')
+          def backtick_fence(text, minimum):
               longest = max(
                   (len(match.group(0)) for match in re.finditer(r'`+', text)),
                   default=0,
               )
-              fence = '`' * max(1, longest + 1)
+              return '`' * max(minimum, longest + 1)
+
+          def table_code(value):
+              text = ' '.join(str(value or '').split())
+              text = text.replace('\\', '\\\\').replace('|', '\\|')
+              fence = backtick_fence(text, 1)
               padding = ' ' if text.startswith('`') or text.endswith('`') else ''
               return f'{fence}{padding}{text}{padding}{fence}'
 
@@ -200,11 +203,7 @@ jobs:
                   truncated = True
               if truncated:
                   snippet += '\n\n…'
-              longest = max(
-                  (len(match.group(0)) for match in re.finditer(r'`+', snippet)),
-                  default=0,
-              )
-              fence = '`' * max(3, longest + 1)
+              fence = backtick_fence(snippet, 3)
               return f'{fence}text\n{snippet}\n{fence}'
 
           def github_source(source):
