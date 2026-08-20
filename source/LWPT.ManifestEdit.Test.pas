@@ -76,6 +76,8 @@ type
     procedure TestInsertsMissingInlineVersion;
     procedure TestPreservesIncludeGlobsAndComment;
     procedure TestMissingNameReturnsFalse;
+    procedure TestRejectsTripleQuotedBareSpec;
+    procedure TestInsertsInlineVersionBeforeCommentBrace;
   end;
 
 { --- SetDependencyLine ---------------------------------------------------- }
@@ -604,6 +606,39 @@ begin
   end;
 end;
 
+procedure TSetDependencyVersionSuite.TestRejectsTripleQuotedBareSpec;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Add('[dependencies]');
+    SL.Add('leaf = """a/leaf@^1.0.0"""');
+    Expect<Boolean>(SetDependencyVersionConstraint(SL, 'leaf', '^2.0.0'))
+      .ToBe(False);
+    Expect<string>(SL[1]).ToBe('leaf = """a/leaf@^1.0.0"""');
+  finally
+    SL.Free;
+  end;
+end;
+
+procedure TSetDependencyVersionSuite.TestInsertsInlineVersionBeforeCommentBrace;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Add('[dependencies]');
+    SL.Add('leaf = { source = "a/leaf", include = ["src/**"] } # keep }');
+    Expect<Boolean>(SetDependencyVersionConstraint(SL, 'leaf', '^2.0.0'))
+      .ToBe(True);
+    Expect<string>(SL[1]).ToBe(
+      'leaf = { source = "a/leaf", include = ["src/**"], version = "^2.0.0" } # keep }');
+  finally
+    SL.Free;
+  end;
+end;
+
 procedure TSetDependencyVersionSuite.SetupTests;
 begin
   Test('bumps the spec on a bare source@version line', TestBumpsBareSpec);
@@ -613,6 +648,10 @@ begin
   Test('preserves a trailing comment on a bare bump',
     TestPreservesIncludeGlobsAndComment);
   Test('returns False for a missing name', TestMissingNameReturnsFalse);
+  Test('rejects a triple-quoted bare spec without rewriting it',
+    TestRejectsTripleQuotedBareSpec);
+  Test('inserts version before a trailing comment that contains }',
+    TestInsertsInlineVersionBeforeCommentBrace);
 end;
 
 

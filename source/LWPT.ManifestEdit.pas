@@ -324,13 +324,15 @@ begin
   Result := ALine;
 end;
 
-function ReplaceBareSpecVersion(const ALine, ANewConstraint: string): string;
+function ReplaceBareSpecVersion(const ALine, ANewConstraint: string;
+  out ANewLine: string): Boolean;
 var
   Eq, i, LastAt, QuoteStart: Integer;
   Quote: Char;
   Value: string;
 begin
-  Result := ALine;
+  Result := False;
+  ANewLine := ALine;
   Eq := Pos('=', ALine);
   if Eq = 0 then Exit;
   i := Eq + 1;
@@ -338,6 +340,10 @@ begin
   if (i > Length(ALine)) or not (ALine[i] in ['"', #39]) then Exit;
   QuoteStart := i;
   Quote := ALine[i];
+  if (i + 2 <= Length(ALine))
+     and (ALine[i + 1] = Quote)
+     and (ALine[i + 2] = Quote) then
+    Exit;
   Inc(i);
   LastAt := 0;
   while i <= Length(ALine) do
@@ -354,28 +360,67 @@ begin
   end;
   if i > Length(ALine) then Exit;
   if LastAt > QuoteStart then
-    Result := Copy(ALine, 1, LastAt) + TomlEscape(ANewConstraint)
+    ANewLine := Copy(ALine, 1, LastAt) + TomlEscape(ANewConstraint)
       + Copy(ALine, i, MaxInt)
   else
   begin
     Value := Copy(ALine, QuoteStart + 1, i - QuoteStart - 1);
-    Result := ReplaceQuotedValueAt(ALine, QuoteStart,
+    ANewLine := ReplaceQuotedValueAt(ALine, QuoteStart,
       Value + '@' + ANewConstraint);
+  end;
+  Result := True;
+end;
+
+function FindInlineTableClose(const ALine: string; AOpen: Integer): Integer;
+var
+  i: Integer;
+  Quote: Char;
+begin
+  Result := 0;
+  i := AOpen + 1;
+  while i <= Length(ALine) do
+  begin
+    if ALine[i] = '#' then
+      Exit;
+    if ALine[i] in ['"', #39] then
+    begin
+      Quote := ALine[i];
+      Inc(i);
+      while i <= Length(ALine) do
+      begin
+        if (Quote = '"') and (ALine[i] = '\') then
+          Inc(i, 2)
+        else if ALine[i] = Quote then
+        begin
+          Inc(i);
+          Break;
+        end
+        else
+          Inc(i);
+      end;
+    end
+    else if ALine[i] = '}' then
+    begin
+      Result := i;
+      Exit;
+    end
+    else
+      Inc(i);
   end;
 end;
 
-function ReplaceInlineTableVersion(const ALine, ANewConstraint: string): string;
+function ReplaceInlineTableVersion(const ALine, ANewConstraint: string;
+  out ANewLine: string): Boolean;
 var
   Brace, CloseBrace, i, KeyStart, KeyEnd, QuoteStart: Integer;
   Key: string;
 begin
-  Result := ALine;
+  Result := False;
+  ANewLine := ALine;
   Brace := Pos('{', ALine);
   if Brace = 0 then Exit;
-  CloseBrace := Length(ALine);
-  while (CloseBrace > Brace) and (ALine[CloseBrace] <> '}') do
-    Dec(CloseBrace);
-  if CloseBrace <= Brace then Exit;
+  CloseBrace := FindInlineTableClose(ALine, Brace);
+  if CloseBrace = 0 then Exit;
 
   i := Brace + 1;
   while i < CloseBrace do
@@ -397,8 +442,8 @@ begin
     if SameText(Key, 'version') and (i < CloseBrace)
        and (ALine[i] in ['"', #39]) then
     begin
-      Result := ReplaceQuotedValueAt(ALine, i, ANewConstraint);
-      Exit;
+      ANewLine := ReplaceQuotedValueAt(ALine, i, ANewConstraint);
+      Exit(True);
     end;
     if (i < CloseBrace) and (ALine[i] in ['"', #39]) then
     begin
@@ -421,18 +466,19 @@ begin
       while (i < CloseBrace) and (ALine[i] <> ',') do Inc(i);
   end;
 
-  Result := TrimRight(Copy(ALine, 1, CloseBrace - 1));
-  if (Result <> '') and (Result[Length(Result)] <> '{') then
-    Result := Result + ',';
-  Result := Result + ' version = "' + TomlEscape(ANewConstraint) + '" '
+  ANewLine := TrimRight(Copy(ALine, 1, CloseBrace - 1));
+  if (ANewLine <> '') and (ANewLine[Length(ANewLine)] <> '{') then
+    ANewLine := ANewLine + ',';
+  ANewLine := ANewLine + ' version = "' + TomlEscape(ANewConstraint) + '" '
     + Copy(ALine, CloseBrace, MaxInt);
+  Result := True;
 end;
 
 function SetDependencyVersionConstraint(ALines: TStringList;
   const AName, ANewConstraint: string): Boolean;
 var
   SecStart, SecEnd, i, Eq: Integer;
-  ValuePart: string;
+  ValuePart, NewLine: string;
 begin
   Result := False;
   if not FindDependenciesSection(ALines, SecStart, SecEnd) then Exit;
@@ -444,11 +490,12 @@ begin
       ValuePart := Trim(Copy(ALines[i], Eq + 1, MaxInt));
       if (ValuePart <> '') and (ValuePart[1] = '{') then
       begin
-        if Pos('}', ALines[i]) = 0 then Exit;
-        ALines[i] := ReplaceInlineTableVersion(ALines[i], ANewConstraint);
+        if not ReplaceInlineTableVersion(ALines[i], ANewConstraint, NewLine) then
+          Exit;
       end
-      else
-        ALines[i] := ReplaceBareSpecVersion(ALines[i], ANewConstraint);
+      else if not ReplaceBareSpecVersion(ALines[i], ANewConstraint, NewLine) then
+        Exit;
+      ALines[i] := NewLine;
       Exit(True);
     end;
 end;
