@@ -17,11 +17,13 @@ function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
   const AHostOS, AHostArchitecture: string): Boolean;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
-  const ASelectors: TStrings): Integer; overload;
+  const ASelectors: TStrings; const AUseCache: Boolean = True): Integer;
+  overload;
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings;
-  const ACompilerHost: TLWPTCompilerHost): Integer; overload;
+  const ACompilerHost: TLWPTCompilerHost;
+  const AUseCache: Boolean = True): Integer; overload;
 
 implementation
 
@@ -30,6 +32,7 @@ uses
   SysUtils,
 
   LWPT.Analysis.JSON,
+  LWPT.BuildCache,
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.CompilerDriver,
@@ -38,7 +41,9 @@ uses
   LWPT.Observability,
   LWPT.ProcessRunner,
   LWPT.ProcessTree,
+  LWPT.ProducerLease,
   LWPT.ProgressReporter,
+  LWPT.TestArtifactSet,
   LWPT.TestInventory,
   LWPT.WorkerBudget,
   Platform,
@@ -74,6 +79,18 @@ begin
 end;
 
 type
+  TLWPTTestCacheContext = record
+    Cache: TLWPTBuildCache;
+    UseCache: Boolean;
+    ManifestPath: string;
+    ManifestContentHash: string;
+    ConfigurationPath: string;
+    ModulesPath: string;
+    CompilerImplicitInputs: TStringArray;
+    WorkspacePaths: TStringArray;
+    ExcludedPaths: TStringArray;
+  end;
+
   TTestJobStatus = (tjsPending, tjsCompiling, tjsRunning, tjsPassed,
     tjsCompileFailed, tjsRunFailed, tjsSkipped, tjsCancelled,
     tjsWorkerError);
@@ -138,6 +155,7 @@ type
     FExpectedInventory: TLWPTTestInventory;
     FCompleteDiscovery: Boolean;
     FReporter: TLWPTProgressReporter;
+    FCacheContext: TLWPTTestCacheContext;
     FStartedReported: array of Boolean;
     FTerminalReported: array of Boolean;
     function ClaimJob(out AIndex: Integer): Boolean;
@@ -166,7 +184,7 @@ type
     procedure CancelPendingAndActiveLocked;
     function IsCancelled: Boolean;
     procedure RunOne(const AIndex: Integer;
-      const ALease: TLWPTWorkerLease);
+      var ALease: TLWPTWorkerLease);
     function AllJobsTerminal: Boolean;
     function NextProgressEvent(out AEvent: TTestProgressEvent): Boolean;
     procedure PrintProgressEvent(const AEvent: TTestProgressEvent);
@@ -178,7 +196,8 @@ type
       const ASession: TLWPTBuildSession; const AProjectRoot: string;
       const AVerbose, AInventory, ACompleteDiscovery: Boolean;
       const AInventoryPath: string;
-      const ACompilerDriver: TLWPTCompilerDriver);
+      const ACompilerDriver: TLWPTCompilerDriver;
+      const ACacheContext: TLWPTTestCacheContext);
     destructor Destroy; override;
     procedure Run;
     procedure PrintResults(const AProjectRoot: string; out APassed,
@@ -378,13 +397,15 @@ constructor TTestScheduler.Create(const ATests: TStringList;
   const ASession: TLWPTBuildSession; const AProjectRoot: string;
   const AVerbose, AInventory, ACompleteDiscovery: Boolean;
   const AInventoryPath: string;
-  const ACompilerDriver: TLWPTCompilerDriver);
+  const ACompilerDriver: TLWPTCompilerDriver;
+  const ACacheContext: TLWPTTestCacheContext);
 var
   i, Runnable, RequestedWorkers: Integer;
 begin
   inherited Create;
   InitCriticalSection(FCriticalSection);
   FCompilerDriver := ACompilerDriver;
+  FCacheContext := ACacheContext;
   FWorkers := TList.Create;
   FBuildRoot := ABuildRoot;
   FSession := ASession;
@@ -755,19 +776,96 @@ begin
   end;
 end;
 
+function CacheMissDiagnostic(const AReason: string): string;
+begin
+  if (AReason = 'invalid-reference')
+     or (AReason = 'result-manifest-missing')
+     or (AReason = 'result-manifest-invalid')
+     or (AReason = 'artifact-missing')
+     or (AReason = 'artifact-mode-failed')
+     or (AReason = 'artifact-set-invalid')
+     or (AReason = 'result-kind-mismatch') then
+    Result := 'cache corruption: ' + AReason
+  else
+    Result := 'cache miss: ' + AReason;
+end;
+
 procedure TTestScheduler.RunOne(const AIndex: Integer;
-  const ALease: TLWPTWorkerLease);
+  var ALease: TLWPTWorkerLease);
 var
   CompilerProcess, TestProcess: TProcess;
-  Binary, InventoryMode, Output, StandardOutput, StandardError: string;
-  BuildRequest: TLWPTBuildRequest;
+  ArtifactSetPath, Binary, CacheDiagnostic, CacheFingerprint, CacheReason,
+    InventoryMode, Output, RelativeSource, StandardOutput,
+    StandardError: string;
+  BuildRequest, NeutralRequest: TLWPTBuildRequest;
   BuildResult: TLWPTBuildResult;
+  CachedResult: TLWPTCachedBuildResult;
+  ProducerLease: TLWPTProducerLease;
+  ProducerSnapshot: TLWPTProducerLeaseSnapshot;
+  PublicationRequest: TLWPTBuildPublicationRequest;
   Code, InventorySuites, InventoryCases: Integer;
+  LastProgressAt, WaitNow, WaitStartedAt: QWord;
+  ReleasingWorkerForWait: Boolean;
+
+  function CaptureFingerprint: string;
+  begin
+    Result := CaptureBuildCacheFingerprint(FProjectRoot,
+      FCacheContext.ManifestPath, FCacheContext.ConfigurationPath, LOCKFILE,
+      FCacheContext.ModulesPath, PublicationRequest,
+      BUILD_CACHE_OPERATION_TEST_PROGRAM);
+  end;
+
+  function ReacquireWorkerLease: Boolean;
+  begin
+    Result := False;
+    while not Assigned(ALease) do
+    begin
+      if IsCancelled then Exit;
+      ALease := AcquireLease;
+    end;
+    Result := True;
+  end;
+
+  function AcceptCachedResult(const ADiagnostic: string): Boolean;
+  var
+    i: Integer;
+  begin
+    Result := False;
+    if CachedResult.ArtifactKind <> TEST_ARTIFACT_SET_KIND then
+    begin
+      SysUtils.DeleteFile(ArtifactSetPath);
+      CacheReason := 'result-kind-mismatch';
+      Exit;
+    end;
+    BuildResult := DefaultBuildResult;
+    BuildResult.Success := True;
+    if not MaterializeTestArtifactSet(ArtifactSetPath,
+      ExtractFileDir(Binary), BuildResult.Artifacts, CacheReason) then
+    begin
+      SysUtils.DeleteFile(ArtifactSetPath);
+      Exit;
+    end;
+    SysUtils.DeleteFile(ArtifactSetPath);
+    try
+      ValidateBuildResult(BuildResult);
+      ValidateReportedArtifacts(FCompilerDriver.CompilerID, BuildRequest,
+        BuildResult);
+    except
+      for i := 0 to High(BuildResult.Artifacts) do
+        SysUtils.DeleteFile(BuildResult.Artifacts[i].Path);
+      raise;
+    end;
+    CacheDiagnostic := ADiagnostic + ': ' + CacheFingerprint + LineEnding;
+    Result := True;
+  end;
 begin
+  ProducerLease := nil;
+  ReleasingWorkerForWait := False;
+  try
   try
     CompilerProcess := CreatePascalCompilerProcess(FJobs[AIndex].Source,
       FUnitPaths, FCompilerArguments, Binary, BuildRequest, FBuildRoot,
-      FCompilerDriver);
+      FCompilerDriver, FCacheContext.ConfigurationPath);
   except
     { A staging path over the compiler's budget fails this one test with
       the explanatory message instead of aborting the whole scheduler. }
@@ -778,6 +876,166 @@ begin
       Exit;
     end;
   end;
+
+  RelativeSource := TestRelativePath(FProjectRoot, FJobs[AIndex].Source);
+  ArtifactSetPath := ExtractFileDir(Binary) + '/cache-tmp/artifact-set';
+  NeutralRequest := BuildRequest;
+  NeutralRequest.Inputs.EntryPoint := RelativeSource;
+  SetLength(NeutralRequest.Inputs.Sources, 1);
+  NeutralRequest.Inputs.Sources[0] := RelativeSource;
+  NeutralRequest := NeutralBuildCacheRequest(NeutralRequest,
+    'test-programs/' + RelativeSource);
+  PublicationRequest := Default(TLWPTBuildPublicationRequest);
+  PublicationRequest.BuildRequest := NeutralRequest;
+  PublicationRequest.CompilerExecutable := FCompilerDriver.ExecutableName;
+  PublicationRequest.CompilerArguments := FCompilerDriver.InvocationArguments(
+    FCompilerDriver.BuildArguments(NeutralRequest,
+      PascalSourceCompilerInvocationOptions(
+        FCacheContext.ConfigurationPath)));
+  PublicationRequest.ManifestContentHash :=
+    FCacheContext.ManifestContentHash;
+  PublicationRequest.PublicOutput := 'test-programs/' + RelativeSource;
+  PublicationRequest.CompilerImplicitInputs :=
+    Copy(FCacheContext.CompilerImplicitInputs, 0,
+      Length(FCacheContext.CompilerImplicitInputs));
+  SetLength(PublicationRequest.Environment, 1);
+  PublicationRequest.Environment[0] := PROJECT_NAME + '_FPC_UNIT_PATHS='
+    + GetEnvironmentVariable(PROJECT_NAME + '_FPC_UNIT_PATHS');
+  PublicationRequest.WorkspacePaths :=
+    Copy(FCacheContext.WorkspacePaths, 0,
+      Length(FCacheContext.WorkspacePaths));
+  PublicationRequest.ExcludedPaths :=
+    Copy(FCacheContext.ExcludedPaths, 0,
+      Length(FCacheContext.ExcludedPaths));
+  if not FCacheContext.UseCache then
+    CacheDiagnostic := 'cache bypass: disabled' + LineEnding
+  else if not Assigned(FCacheContext.Cache) then
+    CacheDiagnostic := 'cache bypass: unavailable' + LineEnding
+  else
+  begin
+    try
+      CacheFingerprint := CaptureFingerprint;
+      if FCacheContext.Cache.Materialize(CacheFingerprint, ArtifactSetPath,
+           ExtractFileDir(Binary) + '/cache-tmp', CachedResult, CacheReason)
+         and AcceptCachedResult('cache hit') then
+      begin
+        CompilerProcess.Free;
+        CompilerProcess := nil;
+      end
+      else
+      begin
+        CacheDiagnostic := CacheMissDiagnostic(CacheReason) + ': '
+          + CacheFingerprint + LineEnding;
+        ProducerLease := FCacheContext.Cache.TryAcquireProducer(
+          CacheFingerprint, 'test program "' + RelativeSource + '"');
+        if not Assigned(ProducerLease) then
+        begin
+          ReleasingWorkerForWait := True;
+          ALease.Release;
+          ReleasingWorkerForWait := False;
+          FreeAndNil(ALease);
+          WaitStartedAt := GetTickCount64;
+          LastProgressAt := WaitStartedAt;
+          WriteLn('cache wait: test program "', RelativeSource, '" ',
+            CacheFingerprint);
+          repeat
+            if IsCancelled then
+            begin
+              CompilerProcess.Free;
+              CompleteJob(AIndex, tjsCancelled);
+              Exit;
+            end;
+            Sleep(PRODUCER_LEASE_POLL_MILLISECONDS);
+            if FCacheContext.Cache.Materialize(CacheFingerprint,
+                 ArtifactSetPath,
+                 ExtractFileDir(Binary) + '/cache-tmp', CachedResult, CacheReason) then
+            begin
+              if CaptureFingerprint <> CacheFingerprint then
+              begin
+                CompilerProcess.Free;
+                FailJob(AIndex, tjsCompileFailed, 1,
+                  'inputs changed while waiting for cached test program');
+                Exit;
+              end;
+              if not ReacquireWorkerLease then
+              begin
+                CompilerProcess.Free;
+                CompleteJob(AIndex, tjsCancelled);
+                Exit;
+              end;
+              if AcceptCachedResult('cache wait hit') then
+              begin
+                CompilerProcess.Free;
+                CompilerProcess := nil;
+                Break;
+              end;
+            end;
+            ProducerLease := FCacheContext.Cache.TryAcquireProducer(
+              CacheFingerprint, 'test program "' + RelativeSource + '"');
+            if Assigned(ProducerLease) then
+            begin
+              if not ReacquireWorkerLease then
+              begin
+                CompilerProcess.Free;
+                FreeAndNil(ProducerLease);
+                CompleteJob(AIndex, tjsCancelled);
+                Exit;
+              end;
+              if CaptureFingerprint <> CacheFingerprint then
+              begin
+                CompilerProcess.Free;
+                FreeAndNil(ProducerLease);
+                FailJob(AIndex, tjsCompileFailed, 1,
+                  'inputs changed while waiting for cached test program');
+                Exit;
+              end;
+              if FCacheContext.Cache.Materialize(CacheFingerprint,
+                   ArtifactSetPath,
+                   ExtractFileDir(Binary) + '/cache-tmp', CachedResult, CacheReason)
+                 and AcceptCachedResult('cache takeover hit') then
+              begin
+                CompilerProcess.Free;
+                CompilerProcess := nil;
+                FreeAndNil(ProducerLease);
+              end;
+              Break;
+            end;
+            WaitNow := GetTickCount64;
+            if WaitNow - LastProgressAt >=
+               PRODUCER_LEASE_PROGRESS_MILLISECONDS then
+            begin
+              if FCacheContext.Cache.ProducerSnapshot(CacheFingerprint,
+                   ProducerSnapshot) then
+                WriteLn('cache wait: ', ProducerSnapshot.Description,
+                  ' (owner ', ProducerSnapshot.ProcessId, ', ',
+                  WaitNow - WaitStartedAt, 'ms)')
+              else
+                WriteLn('cache wait: test program "', RelativeSource, '" (',
+                  WaitNow - WaitStartedAt, 'ms)');
+              LastProgressAt := WaitNow;
+            end;
+          until False;
+        end;
+      end;
+    except
+      on E: Exception do
+      begin
+        if ReleasingWorkerForWait then raise;
+        FreeAndNil(ProducerLease);
+        if not ReacquireWorkerLease then
+        begin
+          CompilerProcess.Free;
+          CompleteJob(AIndex, tjsCancelled);
+          Exit;
+        end;
+        CacheDiagnostic := 'cache bypass: unavailable' + LineEnding;
+      end;
+    end;
+  end;
+
+  if not Assigned(CompilerProcess) then
+    SetJobOutput(AIndex, True, CacheDiagnostic)
+  else
   try
     try
       Code := RunProcess(AIndex, CompilerProcess,
@@ -789,7 +1047,8 @@ begin
     finally
       CompilerProcess.Free;
     end;
-    Output := FCompilerDriver.DisplayOutput(StandardOutput, StandardError);
+    Output := CacheDiagnostic
+      + FCompilerDriver.DisplayOutput(StandardOutput, StandardError);
     SetJobOutput(AIndex, True, Output);
     BuildResult := FCompilerDriver.NormalizeExecutionResult(BuildRequest, Code,
       StandardOutput, StandardError);
@@ -798,6 +1057,7 @@ begin
   except
     on E: ELWPTError do
     begin
+      FreeAndNil(ProducerLease);
       SetJobOutput(AIndex, True, E.Message);
       FailJob(AIndex, tjsCompileFailed, 1, E.Message);
       Exit;
@@ -805,14 +1065,48 @@ begin
   end;
   if IsCancelled then
   begin
+    FreeAndNil(ProducerLease);
     CompleteJob(AIndex, tjsCancelled);
     Exit;
   end;
   if not BuildResult.Success then
   begin
+    FreeAndNil(ProducerLease);
     FailJob(AIndex, tjsCompileFailed, Code,
       BuildResultErrorMessage(BuildResult));
     Exit;
+  end;
+
+  if Assigned(ProducerLease) then
+  begin
+    try
+      if CaptureFingerprint <> CacheFingerprint then
+        SetJobOutput(AIndex, True, Output
+          + 'cache store skipped: inputs changed during compilation'
+          + LineEnding)
+      else
+      begin
+        WriteTestArtifactSet(ExtractFileDir(Binary), ArtifactSetPath,
+          BuildResult.Artifacts);
+        if FCacheContext.Cache.Store(CacheFingerprint, ArtifactSetPath,
+          TEST_ARTIFACT_SET_KIND, BuildArtifactUnixMode(ArtifactSetPath)) then
+          SetJobOutput(AIndex, True, Output + 'cache stored: '
+            + CacheFingerprint + LineEnding)
+        else
+          SetJobOutput(AIndex, True, Output
+            + 'cache store skipped: shared cache budget cannot admit '
+            + 'the complete result' + LineEnding);
+        SysUtils.DeleteFile(ArtifactSetPath);
+      end;
+    except
+      on E: Exception do
+      begin
+        SysUtils.DeleteFile(ArtifactSetPath);
+        SetJobOutput(AIndex, True, Output
+          + 'cache store skipped: unavailable' + LineEnding);
+      end;
+    end;
+    FreeAndNil(ProducerLease);
   end;
 
   SetJobStage(AIndex, tjsRunning, Binary);
@@ -873,6 +1167,9 @@ begin
     CompleteJob(AIndex, tjsPassed)
   else
     FailJob(AIndex, tjsRunFailed, Code);
+  finally
+    FreeAndNil(ProducerLease);
+  end;
 end;
 
 function TestDisplayPath(const AProjectRoot, ASource: string): string;
@@ -1246,18 +1543,82 @@ begin
   Result := False;
 end;
 
+procedure AddTestCacheExcludedOutputs(const AMan: TManifest;
+  var APaths: TStringArray);
+var
+  Count, i: Integer;
+  OutputPath: string;
+begin
+  for i := 0 to High(AMan.BuildEntries) do
+  begin
+    OutputPath := AMan.BuildEntries[i].Output;
+    if OutputPath = '' then
+      OutputPath := ChangeFileExt(AMan.BuildEntries[i].Source, '');
+    {$IFDEF MSWINDOWS}
+    if (OutputPath <> '') and (ExtractFileExt(OutputPath) = '') then
+      OutputPath := OutputPath + '.exe';
+    {$ENDIF}
+    if OutputPath = '' then Continue;
+    Count := Length(APaths);
+    SetLength(APaths, Count + 1);
+    APaths[Count] := OutputPath;
+  end;
+end;
+
+function NeutralProjectPath(const AProjectRoot, APath: string): string;
+begin
+  if PathContains(AProjectRoot, APath) then
+    Result := CanonicalPathGlob(ExtractRelativePath(
+      IncludeTrailingPathDelimiter(AProjectRoot), ExpandFileName(APath)))
+  else
+    Result := APath;
+end;
+
+procedure CaptureProjectRootCompilerInputs(const AProjectRoot: string;
+  var APaths: TStringArray);
+var
+  Entries: TStringList;
+  FullPath: string;
+  Search: TSearchRec;
+  i: Integer;
+begin
+  Entries := TStringList.Create;
+  Entries.CaseSensitive := True;
+  try
+    if FindFirst(IncludeTrailingPathDelimiter(AProjectRoot) + '*',
+      faAnyFile or faSymLink, Search) = 0 then
+    try
+      repeat
+        if (Search.Name = '.') or (Search.Name = '..')
+           or (Search.Name = '.git')
+           or ((Search.Attr and faDirectory) <> 0) then Continue;
+        FullPath := IncludeTrailingPathDelimiter(AProjectRoot) + Search.Name;
+        if not FileExists(FullPath) then Continue;
+        Entries.Add(Search.Name);
+      until FindNext(Search) <> 0;
+    finally
+      FindClose(Search);
+    end;
+    Entries.Sort;
+    SetLength(APaths, Entries.Count);
+    for i := 0 to Entries.Count - 1 do APaths[i] := Entries[i];
+  finally
+    Entries.Free;
+  end;
+end;
+
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
-  const ASelectors: TStrings): Integer;
+  const ASelectors: TStrings; const AUseCache: Boolean): Integer;
 begin
   Result := CmdTest(AManifestPath, AIncludeE2E, AJobs, ABail, AVerbose,
-    AInventory, ASelectors, nil);
+    AInventory, ASelectors, nil, AUseCache);
 end;
 
 function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings;
-  const ACompilerHost: TLWPTCompilerHost): Integer;
+  const ACompilerHost: TLWPTCompilerHost; const AUseCache: Boolean): Integer;
 const
   TESTS_SUPPORT_DIR = 'tests/support';
 var
@@ -1265,7 +1626,7 @@ var
   DiscoveredTests, Tests: TStringList;
   UnitPaths: TStringArray;
   ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond,
-    InventoryPath: string;
+    InventoryPath, ManifestContentHash: string;
   i, n, Passed, Failed, Skipped, CompileFailed, Cancelled,
     EffectiveBail: Integer;
   Session: TLWPTBuildSession;
@@ -1275,6 +1636,8 @@ var
   CompilerDriver: TLWPTCompilerDriver;
   TestTarget: TLWPTTarget;
   StartedAt: QWord;
+  Cache: TLWPTBuildCache;
+  CacheContext: TLWPTTestCacheContext;
 begin
   StartedAt := GetTickCount64;
   Passed := 0;
@@ -1285,10 +1648,12 @@ begin
   CompilerSelection := nil;
   DiscoveredTests := nil;
   Tests := nil;
+  Cache := nil;
+  CacheContext := Default(TLWPTTestCacheContext);
   try
     try
       Result := 1;
-      Man := LoadManifest(AManifestPath);
+      Man := LoadManifestSnapshot(AManifestPath, ManifestContentHash);
       if ABail < 0 then EffectiveBail := Man.TestBail
       else EffectiveBail := ABail;
       ProjectRoot := ExtractFileDir(ExpandFileName(AManifestPath));
@@ -1399,6 +1764,29 @@ begin
         Exit;
       end;
 
+      CacheContext.UseCache := AUseCache;
+      CacheContext.ManifestPath := AManifestPath;
+      CacheContext.ManifestContentHash := ManifestContentHash;
+      CacheContext.ConfigurationPath := ResolveCfgFile(Man);
+      CacheContext.ModulesPath := ModulesRoot;
+      CaptureProjectRootCompilerInputs(ProjectRoot,
+        CacheContext.CompilerImplicitInputs);
+      SetLength(CacheContext.WorkspacePaths, Length(Man.Workspaces));
+      for i := 0 to High(Man.Workspaces) do
+        CacheContext.WorkspacePaths[i] := NeutralProjectPath(ProjectRoot,
+          Man.Workspaces[i].Path);
+      AddTestCacheExcludedOutputs(Man, CacheContext.ExcludedPaths);
+      n := Length(CacheContext.ExcludedPaths);
+      SetLength(CacheContext.ExcludedPaths, n + 1);
+      CacheContext.ExcludedPaths[n] := Session.SessionsRoot;
+      if AUseCache then
+        try
+          Cache := TLWPTBuildCache.CreateDefault;
+        except
+          on E: Exception do Cache := nil;
+        end;
+      CacheContext.Cache := Cache;
+
       if not AInventory then
       begin
         if (ASelectors <> nil) and (ASelectors.Count > 0) then
@@ -1413,7 +1801,7 @@ begin
         Man.TestFlags, Session.JobRoot('tests'), AJobs, EffectiveBail, Session,
         ProjectRoot, AVerbose, AInventory,
         (ASelectors = nil) or (ASelectors.Count = 0), InventoryPath,
-        CompilerDriver);
+        CompilerDriver, CacheContext);
       try
         if not AInventory then
           WriteLn('effective workers: ', Scheduler.EffectiveWorkerCount);
@@ -1455,6 +1843,7 @@ begin
   finally
     Tests.Free;
     DiscoveredTests.Free;
+    Cache.Free;
     CompilerSelection.Free;
     if not AInventory then
       WriteLn('summary: ', Passed, ' passed, ', Failed, ' failed, ',

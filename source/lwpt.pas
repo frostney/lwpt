@@ -370,12 +370,13 @@ end;
 function HandleTest(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  IncludeE2E, Inventory, Verbose : Boolean;
+  IncludeE2E, Inventory, UseCache, Verbose : Boolean;
   TierVal : string;
   Jobs, Bail, i : Integer;
 begin
   IncludeE2E := False;
   Inventory := False;
+  UseCache := True;
   Verbose := False;
   Jobs := 0;
   Bail := -1;
@@ -400,6 +401,9 @@ begin
     else if SameText(AOptions[i].LongName, 'inventory')
        and AOptions[i].Present then
       Inventory := True
+    else if SameText(AOptions[i].LongName, 'no-cache')
+       and AOptions[i].Present then
+      UseCache := False
     else if SameText(AOptions[i].LongName, 'jobs')
        and (AOptions[i] is TIntegerOption) and AOptions[i].Present then
     begin
@@ -425,7 +429,7 @@ begin
   try
     InstallProcessTreeSignalForwarding;
     Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail, Verbose, Inventory,
-      APositionals);
+      APositionals, UseCache);
   except
     on E: Exception do
     begin
@@ -746,7 +750,7 @@ begin
       'Report manifest-scoped Pascal token clones', '[--json]',
       @HandleDuplication, DuplicationOpts));
 
-    SetLength(TestOpts, 5);
+    SetLength(TestOpts, 6);
     TestOpts[0] := TStringOption.Create('tier',
       'Test tier to include: default (unit + integration) or e2e (adds network-touching tier)');
     TestOpts[1] := TIntegerOption.Create('jobs',
@@ -757,9 +761,12 @@ begin
       'Replay successful test logs');
     TestOpts[4] := TFlagOption.Create('inventory',
       'Emit registered suites and cases as deterministic JSON without running tests');
+    TestOpts[5] := TFlagOption.Create('no-cache',
+      'Compile without reading or writing reusable test executables');
     Registry.Add(TSubcommand.Create('test',
       'Discover and run *.Test.pas files',
-      '[selector...] [--tier default|e2e] [--jobs N] [--bail N] [--verbose] [--inventory]',
+      '[selector...] [--tier default|e2e] [--jobs N] [--bail N] [--verbose] '
+        + '[--inventory] [--no-cache]',
       @HandleTest, TestOpts));
 
     SetLength(RepairOpts, 0);

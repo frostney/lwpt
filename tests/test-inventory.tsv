@@ -24,8 +24,8 @@ program	*	unit	source/LWPT.BuildRequest.Test.pas	1	12
 program	*	unit	source/LWPT.BuildCache.Test.pas	1	7
 program	*	unit	source/LWPT.CacheLifecycle.Test.pas	1	11
 program	unix/*	unit	source/LWPT.CacheLifecycle.Test.pas	1	12
-program	*	unit	source/LWPT.BuildSession.Test.pas	1	31
-program	windows/*	unit	source/LWPT.BuildSession.Test.pas	1	26
+program	*	unit	source/LWPT.BuildSession.Test.pas	1	32
+program	windows/*	unit	source/LWPT.BuildSession.Test.pas	1	27
 program	*	unit	source/LWPT.Command.Build.Test.pas	1	4
 program	*	unit	source/LWPT.Command.Health.Test.pas	1	3
 program	*	unit	source/LWPT.CompilerDriver.Blaise.Test.pas	1	15
@@ -40,6 +40,7 @@ program	*	unit	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	unit	source/LWPT.Duplication.Test.pas	1	18
 program	*	unit	source/LWPT.Formatter.Test.pas	4	25
 program	*	unit	source/LWPT.Health.Test.pas	1	11
+program	*	unit	source/LWPT.TestArtifactSet.Test.pas	1	6
 program	*	unit	source/LWPT.TestInventory.Test.pas	1	7
 program	*	unit	source/LWPT.Manifest.Schema.Test.pas	1	7
 program	*	unit	source/LWPT.ManifestEdit.Test.pas	5	31
@@ -81,6 +82,7 @@ program	*	integration	tests/integration/InstallSymlinkCycle.Test.pas	1	3
 program	*	integration	tests/integration/Repair.Test.pas	1	7
 program	*	integration	tests/integration/Run.Test.pas	1	9
 program	*	integration	tests/integration/Scratch.Test.pas	1	2
+program	*	integration	tests/integration/TestCache.Test.pas	1	10
 program	*	integration	tests/integration/TestFlags.Test.pas	1	3
 program	*	integration	tests/integration/TestScheduling.Test.pas	1	25
 program	windows/*	integration	tests/integration/TestScheduling.Test.pas	1	21
