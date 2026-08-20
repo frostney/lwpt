@@ -30,6 +30,8 @@ function  HasDirectDep(const AMan: TManifest; const AName: string): Boolean;
 procedure RequireNotWorkspacePackage(const AMan: TManifest; const AName: string);
 procedure LoadManifestLines(const APath: string; ALines: TStringList);
 procedure SetDependencyLine(ALines: TStringList; const AName, ABareSpec: string; out AReplaced: Boolean);
+function  SetDependencyVersionConstraint(ALines: TStringList;
+  const AName, ANewConstraint: string): Boolean;
 function  RemoveDependencyLine(ALines: TStringList; const AName: string): Boolean;
 
 implementation
@@ -280,6 +282,262 @@ begin
     if LineDeclaresKey(ALines[i], AName) then
     begin
       ALines.Delete(i);
+      Exit(True);
+    end;
+end;
+
+{ Rewrite only the version half of a [dependencies] entry so include /
+  exclude globs on an inline table survive `lwpt update`. Bare
+  `name = "source@spec"` lines get a new @spec; single-line inline
+  tables get their version = "..." value replaced (or inserted).
+  Returns False when the name has no editable line. }
+function UnquoteTomlKey(const AKey: string): string;
+begin
+  Result := AKey;
+  if (Length(Result) >= 2)
+     and (((Result[1] = '"') and (Result[Length(Result)] = '"'))
+          or ((Result[1] = #39) and (Result[Length(Result)] = #39))) then
+    Result := Copy(Result, 2, Length(Result) - 2);
+end;
+
+function ReplaceQuotedValueAt(const ALine: string; AQuoteStart: Integer;
+  const ANewValue: string): string;
+var
+  i: Integer;
+  Quote: Char;
+begin
+  Quote := ALine[AQuoteStart];
+  i := AQuoteStart + 1;
+  while i <= Length(ALine) do
+  begin
+    if (Quote = '"') and (ALine[i] = '\') then
+      Inc(i, 2)
+    else if ALine[i] = Quote then
+    begin
+      Result := Copy(ALine, 1, AQuoteStart) + TomlEscape(ANewValue)
+        + Copy(ALine, i, MaxInt);
+      Exit;
+    end
+    else
+      Inc(i);
+  end;
+  Result := ALine;
+end;
+
+function ReplaceBareSpecVersion(const ALine, ANewConstraint: string;
+  out ANewLine: string): Boolean;
+var
+  Eq, i, LastAt, QuoteStart: Integer;
+  Quote: Char;
+  Value: string;
+begin
+  Result := False;
+  ANewLine := ALine;
+  Eq := Pos('=', ALine);
+  if Eq = 0 then Exit;
+  i := Eq + 1;
+  while (i <= Length(ALine)) and (ALine[i] in [' ', #9]) do Inc(i);
+  if (i > Length(ALine)) or not (ALine[i] in ['"', #39]) then Exit;
+  QuoteStart := i;
+  Quote := ALine[i];
+  if (i + 2 <= Length(ALine))
+     and (ALine[i + 1] = Quote)
+     and (ALine[i + 2] = Quote) then
+    Exit;
+  Inc(i);
+  LastAt := 0;
+  while i <= Length(ALine) do
+  begin
+    if (Quote = '"') and (ALine[i] = '\') then
+      Inc(i, 2)
+    else if ALine[i] = Quote then
+      Break
+    else
+    begin
+      if ALine[i] = '@' then LastAt := i;
+      Inc(i);
+    end;
+  end;
+  if i > Length(ALine) then Exit;
+  if LastAt > QuoteStart then
+    ANewLine := Copy(ALine, 1, LastAt) + TomlEscape(ANewConstraint)
+      + Copy(ALine, i, MaxInt)
+  else
+  begin
+    Value := Copy(ALine, QuoteStart + 1, i - QuoteStart - 1);
+    ANewLine := ReplaceQuotedValueAt(ALine, QuoteStart,
+      Value + '@' + ANewConstraint);
+  end;
+  Result := True;
+end;
+
+procedure SkipInlineTableValue(const ALine: string; var i: Integer;
+  ALimit: Integer);
+var
+  Depth: Integer;
+  Quote: Char;
+begin
+  if i >= ALimit then Exit;
+  if ALine[i] in ['"', #39] then
+  begin
+    Quote := ALine[i];
+    Inc(i);
+    while i < ALimit do
+    begin
+      if (Quote = '"') and (ALine[i] = '\') then
+        Inc(i, 2)
+      else if ALine[i] = Quote then
+      begin
+        Inc(i);
+        Exit;
+      end
+      else
+        Inc(i);
+    end;
+    Exit;
+  end;
+  if ALine[i] = '[' then
+  begin
+    Depth := 1;
+    Inc(i);
+    while (i < ALimit) and (Depth > 0) do
+    begin
+      if ALine[i] in ['"', #39] then
+      begin
+        Quote := ALine[i];
+        Inc(i);
+        while i < ALimit do
+        begin
+          if (Quote = '"') and (ALine[i] = '\') then
+            Inc(i, 2)
+          else if ALine[i] = Quote then
+          begin
+            Inc(i);
+            Break;
+          end
+          else
+            Inc(i);
+        end;
+      end
+      else
+      begin
+        if ALine[i] = '[' then Inc(Depth)
+        else if ALine[i] = ']' then Dec(Depth);
+        Inc(i);
+      end;
+    end;
+    Exit;
+  end;
+  while (i < ALimit) and (ALine[i] <> ',') do Inc(i);
+end;
+
+function FindInlineTableClose(const ALine: string; AOpen: Integer): Integer;
+var
+  i: Integer;
+  Quote: Char;
+begin
+  Result := 0;
+  i := AOpen + 1;
+  while i <= Length(ALine) do
+  begin
+    if ALine[i] = '#' then
+      Exit;
+    if ALine[i] in ['"', #39] then
+    begin
+      Quote := ALine[i];
+      Inc(i);
+      while i <= Length(ALine) do
+      begin
+        if (Quote = '"') and (ALine[i] = '\') then
+          Inc(i, 2)
+        else if ALine[i] = Quote then
+        begin
+          Inc(i);
+          Break;
+        end
+        else
+          Inc(i);
+      end;
+    end
+    else if ALine[i] = '}' then
+    begin
+      Result := i;
+      Exit;
+    end
+    else
+      Inc(i);
+  end;
+end;
+
+function ReplaceInlineTableVersion(const ALine, ANewConstraint: string;
+  out ANewLine: string): Boolean;
+var
+  Brace, CloseBrace, i, KeyStart, KeyEnd: Integer;
+  Key: string;
+begin
+  Result := False;
+  ANewLine := ALine;
+  Brace := Pos('{', ALine);
+  if Brace = 0 then Exit;
+  CloseBrace := FindInlineTableClose(ALine, Brace);
+  if CloseBrace = 0 then Exit;
+
+  i := Brace + 1;
+  while i < CloseBrace do
+  begin
+    while (i < CloseBrace) and (ALine[i] in [' ', #9, ',']) do Inc(i);
+    if i >= CloseBrace then Break;
+    KeyStart := i;
+    while (i < CloseBrace) and not (ALine[i] in ['=', ' ', #9]) do Inc(i);
+    KeyEnd := i;
+    Key := UnquoteTomlKey(Trim(Copy(ALine, KeyStart, KeyEnd - KeyStart)));
+    while (i < CloseBrace) and (ALine[i] in [' ', #9]) do Inc(i);
+    if (i >= CloseBrace) or (ALine[i] <> '=') then
+    begin
+      while (i < CloseBrace) and (ALine[i] <> ',') do Inc(i);
+      Continue;
+    end;
+    Inc(i);
+    while (i < CloseBrace) and (ALine[i] in [' ', #9]) do Inc(i);
+    if SameText(Key, 'version') and (i < CloseBrace)
+       and (ALine[i] in ['"', #39]) then
+    begin
+      ANewLine := ReplaceQuotedValueAt(ALine, i, ANewConstraint);
+      Exit(True);
+    end;
+    SkipInlineTableValue(ALine, i, CloseBrace);
+  end;
+
+  ANewLine := TrimRight(Copy(ALine, 1, CloseBrace - 1));
+  if (ANewLine <> '') and (ANewLine[Length(ANewLine)] <> '{') then
+    ANewLine := ANewLine + ',';
+  ANewLine := ANewLine + ' version = "' + TomlEscape(ANewConstraint) + '" '
+    + Copy(ALine, CloseBrace, MaxInt);
+  Result := True;
+end;
+
+function SetDependencyVersionConstraint(ALines: TStringList;
+  const AName, ANewConstraint: string): Boolean;
+var
+  SecStart, SecEnd, i, Eq: Integer;
+  ValuePart, NewLine: string;
+begin
+  Result := False;
+  if not FindDependenciesSection(ALines, SecStart, SecEnd) then Exit;
+  for i := SecStart + 1 to SecEnd - 1 do
+    if LineDeclaresKey(ALines[i], AName) then
+    begin
+      Eq := Pos('=', ALines[i]);
+      if Eq = 0 then Exit;
+      ValuePart := Trim(Copy(ALines[i], Eq + 1, MaxInt));
+      if (ValuePart <> '') and (ValuePart[1] = '{') then
+      begin
+        if not ReplaceInlineTableVersion(ALines[i], ANewConstraint, NewLine) then
+          Exit;
+      end
+      else if not ReplaceBareSpecVersion(ALines[i], ANewConstraint, NewLine) then
+        Exit;
+      ALines[i] := NewLine;
       Exit(True);
     end;
 end;

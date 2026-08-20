@@ -1,11 +1,13 @@
 { LWPT — lightweight Pascal toolkit.
 
-  One executable, eleven subcommands sharing a common core (manifest,
+  One executable, fourteen subcommands sharing a common core (manifest,
   TOML, resolver, cfg emitter):
     init      scaffold a new project or adopt an existing manifest
     install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
     add       add a dependency to lwpt.toml + install it (ADR-0019)
     remove    remove dependencies from lwpt.toml + prune their modules
+    outdated  compare locked git-host deps to advertised tags (ADR-0039)
+    update    bump constraints + reinstall newer git-host deps (ADR-0039)
     build     compile manifest [build] entries
     format    format uses-clauses and identifiers (--check to verify only)
     duplication report manifest-scoped Type-2 Pascal token clones
@@ -48,7 +50,9 @@ uses
   LWPT.Command.Health,
   LWPT.Command.Init,
   LWPT.Command.Install,
+  LWPT.Command.Outdated,
   LWPT.Command.Remove,
+  LWPT.Command.Update,
   LWPT.Command.Repair,
   LWPT.Command.Run,
   LWPT.Command.Testing,
@@ -591,6 +595,52 @@ begin
   end;
 end;
 
+
+{ --- outdated (ADR-0039) ------------------------------------------------- }
+function HandleOutdated(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  JSON: Boolean;
+  i: Integer;
+begin
+  if RejectUnexpectedPositionals('outdated', APositionals) then Exit(1);
+  JSON := False;
+  for i := 0 to High(AOptions) do
+    if SameText(AOptions[i].LongName, 'json') and AOptions[i].Present then
+      JSON := True;
+  try
+    Result := CmdOutdated(MANIFEST_FILE, JSON);
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('outdated'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
+{ --- update (ADR-0039) --------------------------------------------------- }
+function HandleUpdate(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  Names: array of string;
+  i: Integer;
+begin
+  SetLength(Names, APositionals.Count);
+  for i := 0 to APositionals.Count - 1 do
+    Names[i] := APositionals[i];
+  try
+    CmdUpdate(MANIFEST_FILE, Names);
+    Result := 0;
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('update'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
 { --- top-level flags ----------------------------------------------------- }
 function HandleTopLevelFlags: Boolean;
 var
@@ -610,9 +660,9 @@ end;
 
 { --- registration -------------------------------------------------------- }
 var
-  InstallOpts, AddOpts, RemoveOpts, TestOpts, BuildOpts, InitOpts,
-    RunOpts, FormatOpts, HealthOpts, DuplicationOpts, RepairOpts,
-    AgentsOpts : TOptionArray;
+  InstallOpts, AddOpts, RemoveOpts, OutdatedOpts, UpdateOpts, TestOpts,
+    BuildOpts, InitOpts, RunOpts, FormatOpts, HealthOpts, DuplicationOpts,
+    RepairOpts, AgentsOpts : TOptionArray;
 begin
   if HandleTopLevelFlags then
   begin
@@ -649,6 +699,21 @@ begin
       'Remove dependencies from the manifest and prune their modules',
       '<name> [<name>...]',
       @HandleRemove, RemoveOpts));
+
+
+    SetLength(OutdatedOpts, 1);
+    OutdatedOpts[0] := TFlagOption.Create('json',
+      'Emit a machine-readable report of each compared dependency');
+    Registry.Add(TSubcommand.Create('outdated',
+      'Compare locked git-host dependencies to advertised tags',
+      '[--json]',
+      @HandleOutdated, OutdatedOpts));
+
+    SetLength(UpdateOpts, 0);
+    Registry.Add(TSubcommand.Create('update',
+      'Bump constraints and reinstall newer git-host dependencies',
+      '[name ...]',
+      @HandleUpdate, UpdateOpts));
 
     SetLength(BuildOpts, 5);
     BuildOpts[0] := TStringOption.Create('mode',

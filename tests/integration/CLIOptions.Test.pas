@@ -237,6 +237,8 @@ begin
   R := RunLwpt(['--help']);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('install', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('outdated', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('update',  R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('build',   R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('format',  R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('duplication', R.Stdout) > 0).ToBe(True);
@@ -410,9 +412,9 @@ end;
 
 procedure TCLIOptionsE2E.TestSilentFlagIsSharedByEverySubcommand;
 const
-  Commands: array[0..11] of string = ('install', 'add', 'remove', 'build',
-    'format', 'duplication', 'test', 'repair', 'init', 'run', 'health',
-    'agents');
+  Commands: array[0..13] of string = ('install', 'add', 'remove', 'outdated',
+    'update', 'build', 'format', 'duplication', 'test', 'repair', 'init',
+    'run', 'health', 'agents');
 var
   CommandIndex: Integer;
   HelpResult: TLwptResult;
