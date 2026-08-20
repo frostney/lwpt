@@ -402,8 +402,8 @@ function RepairProducerLeases(const ACacheRoot: string;
   out ALivePreserved: Integer): Integer;
 var
   Guard: TLWPTProducerGuard;
-  KeyRootPath, LeaseNamespaceRoot, LeaseRoot, PrefixPath, StatePath,
-    TemporaryRoot: string;
+  KeyRootPath, LeaseNamespaceRoot, LeaseRoot, PrefixPath, QuarantinePath,
+    StatePath, TemporaryRoot: string;
   PrefixSearch, KeySearch: TSearchRec;
 begin
   Result := 0;
@@ -488,12 +488,20 @@ begin
               + 'tmp';
             if FileExists(StatePath) or DirectoryExists(TemporaryRoot) then
             begin
-              if FileExists(StatePath) and not SysUtils.DeleteFile(StatePath)
-                 then
+              QuarantinePath := KeyRootPath + '.repair-'
+                + NewToken(KeySearch.Name);
+              if not SysUtils.RenameFile(KeyRootPath, QuarantinePath) then
                 raise ELWPTProducerLeaseError.CreateFmt(
-                  'failed to reclaim abandoned producer state at %s',
-                  [StatePath]);
-              if DirectoryExists(TemporaryRoot) then WipeDir(TemporaryRoot);
+                  'failed to isolate abandoned producer state at %s',
+                  [KeyRootPath]);
+              if IsDirSymlinkOrJunction(QuarantinePath)
+                 or DirectoryExists(QuarantinePath) then
+                WipeDir(QuarantinePath)
+              else if FileExists(QuarantinePath)
+                 and not SysUtils.DeleteFile(QuarantinePath) then
+                raise ELWPTProducerLeaseError.CreateFmt(
+                  'failed to remove isolated producer state at %s',
+                  [QuarantinePath]);
               Inc(Result);
             end;
           finally

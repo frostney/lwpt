@@ -172,8 +172,10 @@ processes; it does not serialize independent downloads or compiles.
 
 `lwpt repair` is the only maintenance command. It removes incomplete staging
 and quarantined corruption, reclaims producer metadata only when its OS guard
-is no longer held, verifies content-addressed bytes, rebuilds a corrupt LRU
-index from verified object manifests, and enforces the current budget. Its
+is no longer held, atomically detaches the guarded key directory before
+recursive removal so a concurrent link substitution cannot redirect cleanup,
+verifies content-addressed bytes, rebuilds a corrupt LRU index from verified
+object manifests, and enforces the current budget. Its
 report names bytes reclaimed, corrupt objects removed, and live objects and
 leases preserved. Live producer metadata and guarded object bytes may keep a
 repair result above budget; the report makes that preservation explicit and a

@@ -44,8 +44,11 @@ Each admitted object has an atomic control manifest recording its namespace,
 digest, path, and byte size. `lwpt repair` is the only user-facing maintenance
 path. It removes incomplete staging and quarantined bytes, verifies object
 content, reconstructs corrupt or missing LRU entries from verified manifests,
-reclaims producer metadata only after acquiring its released OS guard, and
-enforces the effective budget. It reports the budget and remaining bytes,
+reclaims producer metadata only after acquiring its released OS guard and
+atomically detaching the guarded key directory before recursive removal, and
+enforces the effective budget. Detachment moves a concurrently substituted
+link itself, so repair never follows that link outside the cache. It reports
+the budget and remaining bytes,
 bytes reclaimed, corruption and incomplete state removed, abandoned leases,
 and live objects/leases preserved. Repeating repair is safe. Project-owned
 committed `.lwpt/archives/`, `.lwpt/modules/`, lockfiles, and configuration are

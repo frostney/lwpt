@@ -181,8 +181,9 @@ end;
 procedure TCacheLifecycleContract.
   TestRepairUnlinksCacheShardsWithoutFollowingThem;
 var
-  LinkPath, NamespaceLink, NamespaceOutsideFile, NamespaceOutsideRoot,
-    OutsideFile, OutsideRoot: string;
+  LeaseDigest, LeaseLink, LeaseOutsideFile, LeaseOutsideRoot, LinkPath,
+    NamespaceLink, NamespaceOutsideFile, NamespaceOutsideRoot, OutsideFile,
+    OutsideRoot: string;
   Report: TLWPTCacheRepairReport;
 begin
   OutsideRoot := FScratch + '/outside';
@@ -209,6 +210,20 @@ begin
   Expect<Boolean>(FileExists(NamespaceOutsideFile)).ToBe(True);
   Expect<Boolean>(IsDirSymlinkOrJunction(NamespaceLink)).ToBe(False);
   Expect<Boolean>(Report.IncompleteEntriesRemoved >= 1).ToBe(True);
+
+  LeaseOutsideRoot := FScratch + '/outside-producer';
+  LeaseOutsideFile := LeaseOutsideRoot + '/state';
+  WriteTextFile(LeaseOutsideFile, 'producer-outside-must-survive');
+  LeaseDigest := SHA256Hex(BytesOf('linked-producer-key'));
+  LeaseLink := ProducerLeaseRoot(FCacheRoot) + '/sha256/'
+    + Copy(LeaseDigest, 1, 2) + '/' + Copy(LeaseDigest, 3, MaxInt);
+  ForceDirectories(ExtractFileDir(LeaseLink));
+  if FpSymlink(PChar(LeaseOutsideRoot), PChar(LeaseLink)) <> 0 then
+    raise Exception.Create('failed to create producer-key link fixture');
+  Report := RepairSharedCache(FCacheRoot);
+  Expect<Boolean>(FileExists(LeaseOutsideFile)).ToBe(True);
+  Expect<Boolean>(IsDirSymlinkOrJunction(LeaseLink)).ToBe(False);
+  Expect<Boolean>(Report.AbandonedLeasesReclaimed >= 1).ToBe(True);
 end;
 {$ENDIF}
 
@@ -506,6 +521,7 @@ begin
     Expect<Integer>(Report.AbandonedLeasesReclaimed).ToBe(1);
     Expect<Boolean>(Report.LiveLeasesPreserved >= 1).ToBe(True);
     Expect<Boolean>(FileExists(KeyRoot + '/state')).ToBe(False);
+    Expect<Boolean>(DirectoryExists(KeyRoot)).ToBe(False);
   finally
     Lease.Free;
     Coordinator.Free;
