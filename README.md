@@ -1,7 +1,7 @@
 # LWPT — lightweight Pascal toolkit
 
 A small, dependency-light toolkit for FreePascal / Delphi projects.
-One executable, twelve subcommands, driven by a single `lwpt.toml`
+One executable, fourteen subcommands, driven by a single `lwpt.toml`
 manifest. Zero-install by default — `git clone && fpc @lwpt.cfg`
 builds a project without running `lwpt install` first.
 
@@ -10,6 +10,8 @@ lwpt init      scaffold a new project or adopt an existing manifest   [--adopt]
 lwpt install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
 lwpt add       add a dependency to lwpt.toml + install it   [--name <name>]
 lwpt remove    remove dependencies from lwpt.toml + prune their modules
+lwpt outdated  compare locked git-host deps to advertised tags   [--json]
+lwpt update    bump constraints + reinstall newer git-host deps   [name ...]
 lwpt build     compile manifest build entries   [--mode dev|release] [--clean] [--jobs N]
 lwpt format    format uses-clauses + identifiers   [--check]
 lwpt duplication report manifest-scoped Pascal token clones   [--json]
@@ -58,6 +60,8 @@ bootstrap.bat      # Windows
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
+./build/lwpt outdated           # report newer advertised tags
+./build/lwpt update             # bump constraints + refresh the lock
 ./build/lwpt repair             # recover install, build, and worker residue
 ./build/lwpt health             # deterministic complexity report
 ./build/lwpt health --hotspots  # add local Git churn and hotspot ranking

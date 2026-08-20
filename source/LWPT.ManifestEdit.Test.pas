@@ -68,6 +68,16 @@ type
     procedure TestInvalidBasenameIsNotDerivable;
   end;
 
+  TSetDependencyVersionSuite = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestBumpsBareSpec;
+    procedure TestBumpsInlineTableVersion;
+    procedure TestInsertsMissingInlineVersion;
+    procedure TestPreservesIncludeGlobsAndComment;
+    procedure TestMissingNameReturnsFalse;
+  end;
+
 { --- SetDependencyLine ---------------------------------------------------- }
 
 procedure TSetDependencyLineSuite.TestCreatesSectionWhenAbsent;
@@ -510,6 +520,102 @@ begin
     TestInvalidBasenameIsNotDerivable);
 end;
 
+{ --- SetDependencyVersionConstraint -------------------------------------- }
+
+procedure TSetDependencyVersionSuite.TestBumpsBareSpec;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Add('[dependencies]');
+    SL.Add('leaf = "a/leaf@^1.0.0"');
+    Expect<Boolean>(SetDependencyVersionConstraint(SL, 'leaf', '^2.0.0'))
+      .ToBe(True);
+    Expect<string>(SL[1]).ToBe('leaf = "a/leaf@^2.0.0"');
+  finally
+    SL.Free;
+  end;
+end;
+
+procedure TSetDependencyVersionSuite.TestBumpsInlineTableVersion;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Add('[dependencies]');
+    SL.Add('leaf = { source = "a/leaf", version = "^1.0.0", include = ["src/**"] }');
+    Expect<Boolean>(SetDependencyVersionConstraint(SL, 'leaf', '^2.0.0'))
+      .ToBe(True);
+    Expect<string>(SL[1]).ToBe(
+      'leaf = { source = "a/leaf", version = "^2.0.0", include = ["src/**"] }');
+  finally
+    SL.Free;
+  end;
+end;
+
+procedure TSetDependencyVersionSuite.TestInsertsMissingInlineVersion;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Add('[dependencies]');
+    SL.Add('leaf = { source = "a/leaf", include = ["src/**"] }');
+    Expect<Boolean>(SetDependencyVersionConstraint(SL, 'leaf', '^2.0.0'))
+      .ToBe(True);
+    Expect<string>(SL[1]).ToBe(
+      'leaf = { source = "a/leaf", include = ["src/**"], version = "^2.0.0" }');
+  finally
+    SL.Free;
+  end;
+end;
+
+procedure TSetDependencyVersionSuite.TestPreservesIncludeGlobsAndComment;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Add('[dependencies]');
+    SL.Add('leaf = "a/leaf@^1.0.0"  # keep me');
+    Expect<Boolean>(SetDependencyVersionConstraint(SL, 'leaf', '~1.2.0'))
+      .ToBe(True);
+    Expect<string>(SL[1]).ToBe('leaf = "a/leaf@~1.2.0"  # keep me');
+  finally
+    SL.Free;
+  end;
+end;
+
+procedure TSetDependencyVersionSuite.TestMissingNameReturnsFalse;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create;
+  try
+    SL.Add('[dependencies]');
+    SL.Add('leaf = "a/leaf@^1.0.0"');
+    Expect<Boolean>(SetDependencyVersionConstraint(SL, 'nope', '^2.0.0'))
+      .ToBe(False);
+    Expect<string>(SL[1]).ToBe('leaf = "a/leaf@^1.0.0"');
+  finally
+    SL.Free;
+  end;
+end;
+
+procedure TSetDependencyVersionSuite.SetupTests;
+begin
+  Test('bumps the spec on a bare source@version line', TestBumpsBareSpec);
+  Test('bumps version inside an inline table', TestBumpsInlineTableVersion);
+  Test('inserts version when an inline table omits it',
+    TestInsertsMissingInlineVersion);
+  Test('preserves a trailing comment on a bare bump',
+    TestPreservesIncludeGlobsAndComment);
+  Test('returns False for a missing name', TestMissingNameReturnsFalse);
+end;
+
+
 begin
   TestRunnerProgram.AddSuite(
     TSetDependencyLineSuite.Create(PROJECT_NAME + '.ManifestEdit: SetDependencyLine'));
@@ -519,6 +625,8 @@ begin
     TDeriveDependencyNameSuite.Create(PROJECT_NAME + '.ManifestEdit: DeriveDependencyName'));
   TestRunnerProgram.AddSuite(
     TLoadManifestLinesSuite.Create(PROJECT_NAME + '.ManifestEdit: LoadManifestLines'));
+  TestRunnerProgram.AddSuite(
+    TSetDependencyVersionSuite.Create(PROJECT_NAME + '.ManifestEdit: SetDependencyVersionConstraint'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.
