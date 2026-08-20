@@ -312,24 +312,26 @@ end;
   Mirrors build.pas GenerateVersionInclude but path + constant prefix come
   from the [version] manifest section. }
 
-function VersionIncludeHasVersion(const APath, APrefix,
-  AVersion: string): Boolean;
+function VersionIncludeMatchesExpected(const APath, AExpectedPath: string): Boolean;
 var
-  Existing: TStringList;
+  Existing, Expected: TStringList;
 begin
   Result := False;
   if not FileExists(APath) then Exit;
+  if not FileExists(AExpectedPath) then Exit;
   Existing := TStringList.Create;
+  Expected := TStringList.Create;
   try
     try
       Existing.LoadFromFile(APath);
-      Result := Pos(APrefix + '_VERSION = ''' + AVersion + '''',
-        Existing.Text) > 0;
+      Expected.LoadFromFile(AExpectedPath);
+      Result := Existing.Text = Expected.Text;
     except
       { Destination may still be mid-replace; caller retries. }
       Result := False;
     end;
   finally
+    Expected.Free;
     Existing.Free;
   end;
 end;
@@ -369,7 +371,9 @@ begin
     { Two `lwpt build` processes in the same project both write this include
       before compile. Win32 MoveFileEx then fails if the destination is mid-
       replace; the loser used to abort before it even had a session. A peer
-      that already published the same version is success. }
+      that already published the same generated include is success.
+      Dest-exists or same version alone is not: a locked stale include
+      can keep yesterday's BUILD_DATE. }
     Published := False;
     for Attempt := 1 to ReplaceAttempts do
     begin
@@ -378,7 +382,7 @@ begin
         Published := True;
         Break;
       end;
-      if VersionIncludeHasVersion(Destination, Pfx, AMan.Version) then
+      if VersionIncludeMatchesExpected(Destination, Tmp) then
       begin
         SysUtils.DeleteFile(Tmp);
         Published := True;
