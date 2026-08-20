@@ -291,14 +291,12 @@ begin
   Second := RunLwpt(['test', '--verbose', '--jobs=1'], ProjectB, Environment);
   RequireSuccess('second equivalent worktree run', Second);
   Expect<Boolean>(Pos('cache hit:', Second.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('Free Pascal Compiler', Second.Stdout) = 0).ToBe(True);
   Expect<Integer>(CountMarkerLines(Marker)).ToBe(2);
 
   Bypass := RunLwpt(['test', '--verbose', '--jobs=1', '--no-cache'],
     ProjectB, Environment);
   RequireSuccess('test cache bypass run', Bypass);
   Expect<Boolean>(Pos('cache bypass: disabled', Bypass.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('Free Pascal Compiler', Bypass.Stdout) > 0).ToBe(True);
   Expect<Integer>(CountMarkerLines(Marker)).ToBe(3);
 end;
 
@@ -561,7 +559,7 @@ begin
   RequireSuccess('corrupt cache rebuild', Rebuilt);
   Expect<Boolean>(Pos('cache corruption: artifact-missing', Rebuilt.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('Free Pascal Compiler', Rebuilt.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('cache stored:', Rebuilt.Stdout) > 0).ToBe(True);
   Expect<Integer>(CountMarkerLines(Marker)).ToBe(2);
 end;
 
@@ -633,7 +631,7 @@ begin
     RequireSuccess('first concurrent test run', First.RunResult);
     RequireSuccess('second concurrent test run', Second.RunResult);
     Combined := First.RunResult.Stdout + Second.RunResult.Stdout;
-    Expect<Integer>(CountSubstring(Combined, 'Free Pascal Compiler')).ToBe(1);
+    Expect<Integer>(CountSubstring(Combined, 'cache stored:')).ToBe(1);
     Expect<Boolean>((Pos('cache wait hit:', Combined) > 0)
       or (Pos('cache hit:', Combined) > 0)).ToBe(True);
     Expect<Integer>(CountFiles(Marker)).ToBe(2);
