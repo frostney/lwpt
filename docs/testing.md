@@ -334,10 +334,10 @@ inventory never touches the network.
 <!-- lwpt:test-inventory-counts:begin -->
 | Tier | Files | Registered test cases |
 | --- | ---: | --- |
-| Unit | 35 | 590 Unix / 577 Windows |
+| Unit | 35 | 592 Unix / 579 Windows |
 | Integration | 24 | 278 Darwin / 277 Linux / 271 Windows |
 | E2E | 7 | 34 Darwin, Windows / 37 Linux |
-| **Total** | **66** | **902 Darwin / 904 Linux / 882 Windows** |
+| **Total** | **66** | **904 Darwin / 906 Linux / 884 Windows** |
 <!-- lwpt:test-inventory-counts:end -->
 
 ## TestingPascalLibrary self-test
