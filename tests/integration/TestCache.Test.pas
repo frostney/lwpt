@@ -438,6 +438,10 @@ var
   Environment: TStringArray;
   ProjectRoot, UnreadablePath: string;
   Bypass, Enabled: TLwptResult;
+  FingerprintUnavailableExpected: Boolean;
+  {$IFDEF UNIX}
+  UnreadableDescriptor: THandle;
+  {$ENDIF}
 begin
   ProjectRoot := FScratch + '/bypass-fingerprint-project';
   WriteProject(ProjectRoot, MarkerProgram(0));
@@ -445,9 +449,13 @@ begin
   WriteTextFile(UnreadablePath, 'unit Unused; interface implementation end.');
   Environment := CacheEnvironment(FScratch + '/bypass-fingerprint-cache',
     FScratch + '/bypass-fingerprint-marker');
+  FingerprintUnavailableExpected := False;
   {$IFDEF UNIX}
   if FpChmod(UnreadablePath, 0) <> 0 then
     raise Exception.Create('fixture: unreadable input chmod failed');
+  UnreadableDescriptor := FileOpen(UnreadablePath, fmOpenRead);
+  FingerprintUnavailableExpected := UnreadableDescriptor = THandle(-1);
+  if UnreadableDescriptor <> THandle(-1) then FileClose(UnreadableDescriptor);
   {$ENDIF}
   try
     Bypass := RunLwpt(['test', '--verbose', '--jobs=1', '--no-cache'],
@@ -463,8 +471,9 @@ begin
   Expect<Boolean>(Pos('cache bypass: disabled', Bypass.Stdout) > 0).ToBe(True);
   RequireSuccess('cache fail-open fingerprint', Enabled);
   {$IFDEF UNIX}
-  Expect<Boolean>(Pos('cache bypass: unavailable', Enabled.Stdout) > 0)
-    .ToBe(True);
+  if FingerprintUnavailableExpected then
+    Expect<Boolean>(Pos('cache bypass: unavailable', Enabled.Stdout) > 0)
+      .ToBe(True);
   {$ENDIF}
 end;
 

@@ -950,17 +950,17 @@ begin
                  ArtifactSetPath,
                  ExtractFileDir(Binary) + '/cache-tmp', CachedResult, CacheReason) then
             begin
+              if not ReacquireWorkerLease then
+              begin
+                CompilerProcess.Free;
+                CompleteJob(AIndex, tjsCancelled);
+                Exit;
+              end;
               if CaptureFingerprint <> CacheFingerprint then
               begin
                 CompilerProcess.Free;
                 FailJob(AIndex, tjsCompileFailed, 1,
                   'inputs changed while waiting for cached test program');
-                Exit;
-              end;
-              if not ReacquireWorkerLease then
-              begin
-                CompilerProcess.Free;
-                CompleteJob(AIndex, tjsCancelled);
                 Exit;
               end;
               if AcceptCachedResult('cache wait hit') then
@@ -1765,7 +1765,7 @@ begin
       end;
 
       CacheContext.UseCache := AUseCache;
-      CacheContext.ManifestPath := AManifestPath;
+      CacheContext.ManifestPath := ExpandFileName(AManifestPath);
       CacheContext.ManifestContentHash := ManifestContentHash;
       CacheContext.ConfigurationPath := ResolveCfgFile(Man);
       CacheContext.ModulesPath := ModulesRoot;
