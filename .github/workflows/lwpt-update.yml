@@ -179,8 +179,14 @@ jobs:
 
           def table_code(value):
               text = ' '.join(str(value or '').split())
-              text = text.replace('\\', '\\\\').replace('`', '\\`').replace('|', '\\|')
-              return f'`{text}`'
+              text = text.replace('\\', '\\\\').replace('|', '\\|')
+              longest = max(
+                  (len(match.group(0)) for match in re.finditer(r'`+', text)),
+                  default=0,
+              )
+              fence = '`' * max(1, longest + 1)
+              padding = ' ' if text.startswith('`') or text.endswith('`') else ''
+              return f'{fence}{padding}{text}{padding}{fence}'
 
           def literal_excerpt(value):
               body = str(value or '').strip()

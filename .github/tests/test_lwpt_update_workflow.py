@@ -140,7 +140,7 @@ class LWPTUpdateWorkflowTests(unittest.TestCase):
                 "locator": "acme/leaf",
                 "constraint": "^1.2.0",
                 "locked": "1.2.0",
-                "latest": "2.0.0",
+                "latest": "2.0.0`**@team**",
                 "latestRef": "v2.0.0",
                 "status": "major",
             },
@@ -205,6 +205,10 @@ class LWPTUpdateWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(0, result.returncode, result.stderr)
             body = body_path.read_text(encoding="utf-8")
+            self.assertIn(
+                "| `leaf` | `^1.2.0` | `1.2.0` | ``2.0.0`**@team**`` | major |",
+                body,
+            )
             self.assertIn("Release &#64;team &#35;42 \\[breaking\\]", body)
             self.assertIn("````text\n## Changes", body)
             self.assertIn("Fixes #42\nThanks @maintainer", body)
