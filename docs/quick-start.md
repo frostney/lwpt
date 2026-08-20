@@ -46,7 +46,7 @@ Both code paths are dev-mode only; release builds always go through `./build/lwp
 After bootstrap:
 
 ```sh
-./build/lwpt --help     # top-level help; lists the 12 subcommands
+./build/lwpt --help     # top-level help; lists the 14 subcommands
 ```
 
 ## Daily commands
@@ -74,6 +74,8 @@ After bootstrap:
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
+./build/lwpt outdated           # compare locked git-host deps to advertised tags
+./build/lwpt update             # bump constraints + reinstall newer git-host deps
 ./build/lwpt repair             # reclaim install, build, and worker residue
 ```
 

@@ -566,9 +566,9 @@ const
       NonEmpty: False; Description: 'Retired; use command and args.')
   );
 
-  RESERVED_TASK_NAMES: array[0..20] of string = (
-    'install', 'add', 'remove', 'build', 'format', 'test', 'repair',
-    'init', 'run', 'agents', 'health', 'duplication',
+  RESERVED_TASK_NAMES: array[0..22] of string = (
+    'install', 'add', 'remove', 'outdated', 'update', 'build', 'format',
+    'test', 'repair', 'init', 'run', 'agents', 'health', 'duplication',
     'package', 'dependencies', 'sources', 'workspaces', 'version',
     PROGRAM_NAME, 'analysis', 'compiler', 'generated');
 
