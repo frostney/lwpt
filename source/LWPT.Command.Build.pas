@@ -312,11 +312,37 @@ end;
   Mirrors build.pas GenerateVersionInclude but path + constant prefix come
   from the [version] manifest section. }
 
+function VersionIncludeHasVersion(const APath, APrefix,
+  AVersion: string): Boolean;
+var
+  Existing: TStringList;
+begin
+  Result := False;
+  if not FileExists(APath) then Exit;
+  Existing := TStringList.Create;
+  try
+    try
+      Existing.LoadFromFile(APath);
+      Result := Pos(APrefix + '_VERSION = ''' + AVersion + '''',
+        Existing.Text) > 0;
+    except
+      { Destination may still be mid-replace; caller retries. }
+      Result := False;
+    end;
+  finally
+    Existing.Free;
+  end;
+end;
+
 procedure GenerateVersionInclude(const AProjectRoot: string;
   const AMan: TManifest);
+const
+  ReplaceAttempts = 32;
 var
   Lines: TStringList;
   Destination, Pfx, Tmp: string;
+  Attempt: Integer;
+  Published: Boolean;
 begin
   if AMan.VersionIncOut = '' then Exit;   { [version] not configured }
   Destination := AMan.VersionIncOut;
@@ -340,7 +366,27 @@ begin
     Tmp := MakeTmpPath(ExtractFileDir(Destination),
       '.' + ExtractFileName(Destination) + '-version');
     Lines.SaveToFile(Tmp);
-    if not AtomicReplaceFile(Tmp, Destination) then
+    { Two `lwpt build` processes in the same project both write this include
+      before compile. Win32 MoveFileEx then fails if the destination is mid-
+      replace; the loser used to abort before it even had a session. A peer
+      that already published the same version is success. }
+    Published := False;
+    for Attempt := 1 to ReplaceAttempts do
+    begin
+      if AtomicReplaceFile(Tmp, Destination) then
+      begin
+        Published := True;
+        Break;
+      end;
+      if VersionIncludeHasVersion(Destination, Pfx, AMan.Version) then
+      begin
+        SysUtils.DeleteFile(Tmp);
+        Published := True;
+        Break;
+      end;
+      Sleep(1);
+    end;
+    if not Published then
     begin
       SysUtils.DeleteFile(Tmp);
       raise ELWPTError.CreateFmt(
