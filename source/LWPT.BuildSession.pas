@@ -16,7 +16,9 @@ uses
 const
   BUILD_SESSION_SCHEMA_VERSION = 1;
   BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION = 1;
-  BUILD_CACHE_FINGERPRINT_SCHEMA_VERSION = 1;
+  BUILD_CACHE_FINGERPRINT_SCHEMA_VERSION = 2;
+  BUILD_CACHE_OPERATION_BUILD_ENTRY = 'build-entry';
+  BUILD_CACHE_OPERATION_TEST_PROGRAM = 'test-program';
   BUILD_SESSIONS_DIR = LWPT_DIR + '/sessions';
   BUILD_SESSION_DIR_ENV = PROJECT_NAME + '_SESSION_DIR';
   BUILD_SESSION_ROOT_LEDGER = LWPT_DIR + '/session-roots';
@@ -38,6 +40,7 @@ type
     ManifestContentHash: string;
     PublicOutput: string;
     Environment: TStringArray;
+    CompilerImplicitInputs: TStringArray;
     WorkspacePaths: TStringArray;
     PrerequisiteOutputs: TStringArray;
     HookDefinition: TStringArray;
@@ -86,7 +89,8 @@ function CaptureBuildPublicationFingerprint(
 function CaptureBuildCacheFingerprint(
   const AProjectRoot, AManifestPath, ACfgPath, ALockPath,
   AModulesPath: string;
-  const ARequest: TLWPTBuildPublicationRequest): string;
+  const ARequest: TLWPTBuildPublicationRequest;
+  const AOperation: string = BUILD_CACHE_OPERATION_BUILD_ENTRY): string;
 function NeutralBuildCacheRequest(const ARequest: TLWPTBuildRequest;
   const APublicOutput: string): TLWPTBuildRequest;
 function BuildSessionPathKey(const AValue: string): string;
@@ -612,7 +616,8 @@ end;
 function CaptureBuildCacheFingerprint(
   const AProjectRoot, AManifestPath, ACfgPath, ALockPath,
   AModulesPath: string;
-  const ARequest: TLWPTBuildPublicationRequest): string;
+  const ARequest: TLWPTBuildPublicationRequest;
+  const AOperation: string): string;
 var
   EmptyPaths: TStringArray;
   Fields: TStringList;
@@ -622,8 +627,11 @@ begin
   SetLength(EmptyPaths, 0);
   Fields := TStringList.Create;
   try
+    if AOperation = '' then
+      raise ELWPTError.Create('cache operation identity must not be empty');
     AddField(Fields, 'schema',
       IntToStr(BUILD_CACHE_FINGERPRINT_SCHEMA_VERSION));
+    AddField(Fields, 'operation', AOperation);
     ValidateBuildRequest(ARequest.BuildRequest);
     NeutralRequest := NeutralBuildCacheRequest(ARequest.BuildRequest,
       ARequest.PublicOutput);
@@ -633,8 +641,12 @@ begin
     AddField(Fields, 'manifest.parsed-hash', ARequest.ManifestContentHash);
     AddPathArray(Fields, AProjectRoot, 'sources',
       ARequest.BuildRequest.Inputs.Sources, EmptyPaths);
+    AddPathArray(Fields, AProjectRoot, 'compiler-implicit-inputs',
+      ARequest.CompilerImplicitInputs, ARequest.ExcludedPaths);
+    { Cache identity must survive an equivalent checkout at another absolute
+      path. Content is still read relative to the concrete project root. }
     SourceDirectory := ExtractFileDir(
-      RootedPath(AProjectRoot, ARequest.BuildRequest.Inputs.EntryPoint));
+      ARequest.BuildRequest.Inputs.EntryPoint);
     AddField(Fields, 'source-directory', SourceDirectory);
     AddField(Fields, 'source-directory.content',
       PathFingerprint(AProjectRoot, SourceDirectory,

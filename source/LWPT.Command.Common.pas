@@ -37,7 +37,8 @@ function  ResolveRunnableCommand(const AProjectRoot,
 function  CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths, AExtraArguments: array of string; out AOutBin: string;
   out ARequest: TLWPTBuildRequest; const ABuildRoot: string;
-  const ADriver: TLWPTCompilerDriver): TProcess;
+  const ADriver: TLWPTCompilerDriver;
+  const AConfigurationFile: string = CFG_FILE): TProcess;
 procedure AppendCompilerEnvironmentSearchPaths(
   var AUnitPaths, AIncludePaths: TStringArray);
 function  RunUserTask(const ATask: THook; const AProjectRoot: string): Integer;
@@ -99,7 +100,8 @@ end;
 function CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths, AExtraArguments: array of string; out AOutBin: string;
   out ARequest: TLWPTBuildRequest; const ABuildRoot: string;
-  const ADriver: TLWPTCompilerDriver): TProcess;
+  const ADriver: TLWPTCompilerDriver;
+  const AConfigurationFile: string): TProcess;
 var
   Arguments: LWPT.Core.TStringArray;
   BuildDir: string;
@@ -135,7 +137,7 @@ begin
     ARequest := ADriver.CreateBuildRequest(ASrcFile, AOutBin);
     AOutBin := ARequest.Outputs.Artifact;
     SetLength(ConfigurationUnitPaths, 0);
-    AppendUnitDirsFromCfg(CFG_FILE, ConfigurationUnitPaths);
+    AppendUnitDirsFromCfg(AConfigurationFile, ConfigurationUnitPaths);
     UnitPathCount := Length(AUnitPaths) + Length(ConfigurationUnitPaths);
     SetLength(ARequest.Inputs.UnitPaths, UnitPathCount);
     SetLength(ARequest.Inputs.IncludePaths, UnitPathCount);
@@ -167,7 +169,7 @@ begin
     ARequest.Compiler.VersionIdentity := Capabilities.VersionIdentity;
 
     Arguments := ADriver.InvocationArguments(ADriver.BuildArguments(ARequest,
-      PascalSourceCompilerInvocationOptions(CFG_FILE)));
+      PascalSourceCompilerInvocationOptions(AConfigurationFile)));
     Result.Executable := ADriver.ExecutableName;
     if ADriver.WorkingDirectory <> '' then
       Result.CurrentDirectory := ADriver.WorkingDirectory;

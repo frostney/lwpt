@@ -7,7 +7,7 @@ How LWPT tests itself: the four-tier policy, the mock HTTP server, the binary-fe
 - **Four tiers** with explicit policy on when each runs: **Unit** (always), **Integration** (always), **E2E** (opt-in `--tier=e2e`; runs in CI's online job), **Manual** (never automatic).
 - **E2E crosses a real process or operating-system boundary.** Root CLI tests spawn `./build/lwpt` without `uses LWPT.Core`; package E2E tests use only their package's published API against real operating-system resources.
 - **The single most important test** is the HTTPClient binary-fetch regression in `packages/httpclient/source/HTTPClient.Test.pas`. It uses the mock HTTP server (`packages/httpclient/source/Tests.HTTPMockServer.pas`) to inject `#0` bytes into response headers and chunked bodies, deterministically pinning HTTPClient's byte-safe `AppendRawBytes` contract against regression.
-- **TestingPascalLibrary is the framework.** Lives in the `testing` workspace package per [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) (an earlier embedded-blob model extruded via `lwpt export testing` is retired). Each `*.Test.pas` is a self-contained program; `lwpt test` discovers it, validates a compiler-neutral request, compiles through the selected project compiler profile, retains raw compiler output, stores normalized diagnostics, then runs a successful binary and reads its exit code.
+- **TestingPascalLibrary is the framework.** Lives in the `testing` workspace package per [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) (an earlier embedded-blob model extruded via `lwpt export testing` is retired). Each `*.Test.pas` is a self-contained program; `lwpt test` discovers it, validates a compiler-neutral request, materializes a verified compiled artifact set or compiles through the selected project compiler profile, then runs the binary and reads its current exit code. Compilation may be cached; execution never is.
 - **Fixtures are committed for small inputs (<100 KB).** Large artefacts are generated at test-run time from a deterministic seed so the repo stays small.
 - **Status:** the unit, integration, and E2E inventory is listed below; live `lwpt test` discovery is authoritative. The framework canary (tier-0 — "the testing framework itself works") lives in `packages/testing/source/TestingPascalLibrary.Test.pas`.
 
@@ -29,6 +29,27 @@ How LWPT tests itself: the four-tier policy, the mock HTTP server, the binary-fe
 ```
 
 Quote globs so LWPT—not the shell—matches them consistently. Multiple selectors form a deduplicated union and each must match at least one discovered test program. Discovery and selection freeze before `[pretest]`; the hook can prepare inputs for selected programs but cannot add programs to the current invocation.
+
+## Compiled-test reuse
+
+`lwpt test` caches verified compilation artifacts by default through the same
+per-user `build-results` object store, producer leases, aggregate budget,
+eviction, corruption handling, and `lwpt repair` path as `lwpt build`. Its
+fingerprint has a separate test-program identity and covers project-relative
+source and transitive content, resolved dependency state, manifest, lockfile,
+configuration, test flags, compiler driver and live version, target, normalized
+arguments, and relevant environment. Equivalent worktrees can therefore reuse
+an entry without making absolute session or checkout paths part of its identity.
+
+A hit verifies and expands the complete driver-reported artifact set only into
+the current invocation-private test job. LWPT then launches that executable as
+usual. Ordinary test bodies always run, and `--inventory` always asks the
+current executable for registrations; pass/fail state, output, timing, and
+inventory results are never cache entries. Failed or cancelled compiles do not
+publish. A corrupt or incomplete entry reports a deterministic corruption miss
+and recompiles. `--no-cache` performs a real compilation and neither reads nor
+writes reusable results. See
+[ADR-0041](./adr/0041-verified-test-executable-cache.md).
 
 ## Test programs
 
@@ -244,7 +265,8 @@ inventory never touches the network.
 | **`source/LWPT.BuildCache.Test.pas`** | 7 tests in 1 suite | Covers verified result manifests and artifact materialization, Unix mode restoration, deterministic misses, invalid fingerprints, corrupt-artifact rejection, budget refusal without partial logical results, and concurrent cross-process publication without partial or mismatched results. |
 | **`source/LWPT.CacheLifecycle.Test.pas`** | 12 tests in 1 suite (Unix); 11 tests in 1 suite (Windows) | Covers aggregate deterministic LRU eviction across cache namespaces, live-object preservation and admission refusal, corrupt-object and malformed-hierarchy repair with repeatable reports, semantic index reconstruction, invalid and abandoned versus active producer-state recovery, safe Unix shard and namespace-link removal, and default/override cache-budget parsing. |
 | **`source/LWPT.ProducerLease.Test.pas`** | 7 tests in 1 suite (Unix); 6 tests in 1 suite (Windows) | Covers single-producer ownership, independent keys, waiter abandonment, normal handoff, crash takeover, stale-heartbeat diagnostics that cannot displace a live OS-held owner, and Unix producer-root swap rejection. |
-| **`source/LWPT.BuildSession.Test.pas`** | 31 tests in 1 suite (Unix); 26 tests in 1 suite (Windows) | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, distinct publication versus reusable-cache fingerprints, compiler/target/flag/environment cache inputs, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
+| **`source/LWPT.BuildSession.Test.pas`** | 32 tests in 1 suite (Unix); 27 tests in 1 suite (Windows) | Covers unique private paths, bounded collision-resistant keys, atomic/stale publication, parsed-manifest binding, distinct publication versus reusable-cache fingerprints and build-entry versus test-program operation identities, compiler/target/flag/environment cache inputs, implicit, declared, and postbuild-hook input hashing, filesystem-identity publication locks, symlinked workspace inputs, and owner-guarded repair. |
+| **`source/LWPT.TestArtifactSet.Test.pas`** | 6 tests in 1 suite | Covers deterministic complete multi-artifact round trips, malformed-set rejection without partial output, refusal of artifacts outside or linked through the invocation-private compilation root, and rejection of pre-existing destination or physical source aliases. |
 | **`source/LWPT.Command.Build.Test.pas`** | 4 tests in 1 suite | Covers compiler-process cancellation with output capture and child reaping, normal-exit descendant handling, non-zero exit-code reporting, and repeated process-tree state teardown without leaking its owned Windows Job Object handle. |
 | **`source/LWPT.CompilerDriver.FPC.Test.pas`** | 20 tests in 1 suite | Covers capability-probe caching, target dispatch, timeout cleanup, request compatibility, build/test argument translation, ordered extra-argument forwarding and validation, nil-driver rejection, version failures, stale-artifact classification, structured diagnostics, Windows executable-path normalization, and direct Windows bare-command PATH resolution. |
 | **`source/LWPT.CompilerDriver.Blaise.Test.pas`** | 15 tests in 1 suite | Pins the Blaise v0.13.0 identity/help and exact argument fixtures; proves per-operation live probing, the minimum release floor, verified Linux/FreeBSD x86-64 capability filtering, no target fallback, dev/release/clean translation, managed-argument and output-suppression protection, explicit unsupported-feature diagnostics, and normalized diagnostics/artifacts. |
@@ -291,6 +313,7 @@ inventory never touches the network.
 | **`tests/integration/Run.Test.pas`** | 9 tests in 1 suite | Spawns `lwpt run` against scratch projects. Covers direct run-task execution and exact exit propagation, built-in aliasing with flag passthrough, unknown-task errors, list mode, retired `export` as an allowed task name, strict glob staleness and unmatched-input diagnostics, fresh-task skipping, and rejection of invocation-time arguments. |
 | **`tests/integration/TestScheduling.Test.pas`** | 25 tests in 1 suite (Unix); 21 tests in 1 suite (Windows) | Cross-platform subprocess coverage for default overlap, deterministic `--jobs=1` ordering, `--bail=0` override, compile failures counting toward bail, and the amended bail contract: stop new work, fan cancellation to active siblings under one absolute deadline, terminate and reap active children, and print sorted diagnostics. Unix runs native SIGINT/SIGTERM forwarding regressions, rejects forged acknowledgement channels backed by regular files or wrong-direction pipes, bounds control reads across data, EOF, and silent peers, and proves a nested test descendant retaining an inherited output writer cannot trap subprocess capture waiting for EOF; Windows runs matching Ctrl-C/Ctrl-Break Job Object reaping regressions. A deterministic spawn barrier proves managed and unmanaged process creation share the inheritance-critical window. A nested owner-and-descendant fixture proves successful hop-by-hop acknowledgement and propagated `FAILED`; separate fixtures pin the post-acknowledgement reap window, an already-empty registered tree as a successful no-op, missing terminal acknowledgement, and bounded incremental/trailing protocol framing. An output-capture fixture proves the original process failure survives a secondary delegation-cleanup failure. |
 | **`tests/integration/TestFlags.Test.pas`** | 3 tests in 1 suite | Spawns `lwpt test` against scratch manifests to prove ordered root `[test].flags` reach default- and E2E-tier compiles, LWPT-managed output arguments are rejected, and direct pretest commands inherit neither the flags nor any undeclared arguments. |
+| **`tests/integration/TestCache.Test.pas`** | 10 tests in 1 suite | Proves equivalent worktrees compile once but execute every time; source, declared and implicit-root unit, flag, and configured-compiler-file invalidation; fresh inventory queries over a reused executable; corrupt-artifact rebuilding; exclusion of failed compiles; fresh failing executions; explicit `--no-cache` compilation without fingerprint traversal; and one-producer behavior for concurrent identical misses. |
 | **`tests/integration/Version.Test.pas`** | 4 tests in 1 suite | Spawns version-reporting forms and verifies output shape plus drift protection against `lwpt.toml`'s `[package].version`. |
 
 ### E2E tier
@@ -335,10 +358,10 @@ inventory never touches the network.
 <!-- lwpt:test-inventory-counts:begin -->
 | Tier | Files | Registered test cases |
 | --- | ---: | --- |
-| Unit | 36 | 608 Unix / 593 Windows |
-| Integration | 24 | 279 Darwin / 278 Linux / 272 Windows |
+| Unit | 37 | 615 Unix / 600 Windows |
+| Integration | 25 | 289 Darwin / 288 Linux / 282 Windows |
 | E2E | 7 | 34 Darwin, Windows / 37 Linux |
-| **Total** | **67** | **921 Darwin / 923 Linux / 899 Windows** |
+| **Total** | **69** | **938 Darwin / 940 Linux / 916 Windows** |
 <!-- lwpt:test-inventory-counts:end -->
 
 ## TestingPascalLibrary self-test

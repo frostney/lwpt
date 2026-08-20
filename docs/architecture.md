@@ -223,14 +223,20 @@ installs are not supported.
   `TestingPascalLibrary`. `lwpt test` resolves the project-scoped compiler
   driver once and shares it across every test worker; per-entry compiler
   profiles apply to `lwpt build`, not to individual test files. Workers validate
-  each neutral request, compile into private session paths, retain raw compiler
-  output, and store normalized build-result diagnostics before running a
-  successful binary. `TestingPascalLibrary.Protocol` exposes the opt-in,
+  each neutral request and first seek a verified compilation artifact set under
+  a test-specific cache fingerprint. Hits are materialized only below the
+  current private session; misses compile there and admit only a complete,
+  successful driver-reported set. Workers retain raw compiler output and store
+  normalized build-result diagnostics before running a successful binary.
+  Execution is always fresh: pass/fail state, output, timing, and inventory
+  results are never cached, and `--no-cache` bypasses compilation reuse.
+  `TestingPascalLibrary.Protocol` exposes the opt-in,
   executable-bound registration record consumed by `LWPT.TestInventory`;
   ordinary bodies and inventory-only enumeration therefore share one runtime
   registration source without allowing nested test subprocesses to impersonate
   their parent program. See
-  [ADR-0035](./adr/0035-runtime-test-registration-inventory.md) and
+  [ADR-0035](./adr/0035-runtime-test-registration-inventory.md),
+  [ADR-0041](./adr/0041-verified-test-executable-cache.md), and
   [`testing.md`](./testing.md).
 - **Worker coordination:** `LWPT.WorkerBudget` owns the per-user machine-capacity seam. Invocations register owner-guarded requests and acquire FIFO, reclaimable leases under a short cross-platform transaction lock. Nested LWPT subprocesses consume a one-shot opaque delegation that transfers one grant to the child's own guarded request instead of consuming another slot. `lwpt repair` reclaims requests only when their OS-held owner guard is absent; stale heartbeats remain diagnostic. Build and test scheduling consume this module in their own workstreams.
 

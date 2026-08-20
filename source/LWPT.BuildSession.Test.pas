@@ -51,6 +51,7 @@ type
     procedure TestCacheFingerprintIgnoresSessionAndPublicArtifactBytes;
     procedure TestCacheFingerprintCoversCompilerTargetInputsAndEnvironment;
     procedure TestCacheFingerprintCoversPrerequisiteOutputs;
+    procedure TestCacheFingerprintSeparatesOperationIdentity;
     procedure TestPublicationLockUsesSessionsRoot;
     {$IFDEF UNIX}
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
@@ -239,6 +240,26 @@ begin
     CFG_FILE, LOCKFILE, MODULES_DIR, Request);
 
   Expect<Boolean>(Changed <> Baseline).ToBe(True);
+end;
+
+procedure TLWPTBuildSessionTests.TestCacheFingerprintSeparatesOperationIdentity;
+var
+  BuildFingerprint, TestFingerprint: string;
+  Request: TLWPTBuildPublicationRequest;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  Request := BasicRequest;
+
+  BuildFingerprint := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request,
+    BUILD_CACHE_OPERATION_BUILD_ENTRY);
+  TestFingerprint := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request,
+    BUILD_CACHE_OPERATION_TEST_PROGRAM);
+
+  Expect<Boolean>(TestFingerprint <> BuildFingerprint).ToBe(True);
 end;
 
 procedure TLWPTBuildSessionTests.WriteText(const APath, AText: string);
@@ -1070,6 +1091,8 @@ begin
     TestCacheFingerprintCoversCompilerTargetInputsAndEnvironment);
   Test('cache fingerprints cover prerequisite outputs',
     TestCacheFingerprintCoversPrerequisiteOutputs);
+  Test('cache fingerprints separate build and test operations',
+    TestCacheFingerprintSeparatesOperationIdentity);
   Test('publication locks use the resolved sessions root',
     TestPublicationLockUsesSessionsRoot);
   {$IFDEF UNIX}
