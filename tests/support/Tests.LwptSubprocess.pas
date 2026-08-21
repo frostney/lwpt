@@ -137,6 +137,16 @@ begin
   {$ENDIF}
 end;
 
+function ArgumentsContain(const AArgs: array of string;
+  const AValue: string): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to High(AArgs) do
+    if SameText(AArgs[i], AValue) then Exit(True);
+  Result := False;
+end;
+
 procedure SetLwptBinaryPath(const APath: string);
 begin
   GLwptBinaryPath := APath;
@@ -425,7 +435,9 @@ begin
         deliberately leave the still-live delegation available. }
       if ForwardedWorkerLease
          and (((Length(AArgs) > 0) and SameText(AArgs[0], 'build')
-           and (Pos('START ', Result.Stdout) > 0))
+           and ((Pos('START ', Result.Stdout) > 0)
+             or ((Result.ExitCode = 0)
+               and not ArgumentsContain(AArgs, '--help'))))
          or ((Length(AArgs) > 0) and SameText(AArgs[0], 'test')
            and (Pos('discovered ', Result.Stdout) > 0))) then
         GForwardWorkerLease := False;
