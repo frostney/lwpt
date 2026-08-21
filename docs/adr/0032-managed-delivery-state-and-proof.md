@@ -52,8 +52,14 @@ and terminal-promotion behavior was completed in
 - Ordinary PR CI is automatic. Managed PRs retain a cheap automatic routing
   run; admission reruns that exact PR/head workflow so both routes use the same
   app-bound native aggregation job. Reset returns the PR to draft instead of
-  rewriting immutable native checks. The controller does not synthesize
-  another PR proof.
+  rewriting immutable native checks. GitHub does not permit the workflow's
+  `GITHUB_TOKEN` to mark a draft ready. After exact-head PR CI succeeds, the
+  coordinator therefore uses its ordinary authenticated PR operation, checks
+  that the head is still current, and invokes the review transition. Review
+  admission requires a ready PR before applying `review:ready`; merge admission
+  validates current evidence without changing draft state. The controller does
+  not synthesize another PR proof. Returning a managed PR to draft invalidates
+  its review and merge phases; merge admission refuses drafts.
 - Review automations are configured adapters. At least one must emit
   current-head evidence, every active adapter must reach its configured
   terminal state, and inactive configured adapters do not block delivery.

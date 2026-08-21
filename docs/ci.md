@@ -120,8 +120,16 @@ heads execute the native jobs immediately. A managed head first records a cheap
 routing run whose native `delivery-admission` job fails closed; its `ci`
 transition adds `ci:ready` and reruns that exact PR/head workflow so the full
 job set executes and the aggregation job can pass. The controller samples that
-native job before later transitions. `reset` clears readiness and returns the
-PR to draft; it never rewrites native check history. Managed forks fail closed.
+native job before later transitions. GitHub does not permit the workflow's
+`GITHUB_TOKEN` to mark a draft ready, so the coordinator uses its ordinary
+authenticated PR operation after CI succeeds, revalidates the exact head, and
+then invokes the review transition. That transition requires the PR to be ready
+before applying `review:ready`, allowing review automation to converge before
+full CI and merge admission. Returning a managed PR to draft invalidates its
+review and merge phases; merge admission refuses drafts and does not change
+draft state.
+`reset` clears readiness and returns the PR to draft; it never rewrites native
+check history. Managed forks fail closed.
 
 Full-CI remains a separate conditional proof. A full-CI run dispatched
 by `delivery-transition.yml` inherits the repository `GITHUB_TOKEN`; GitHub

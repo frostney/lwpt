@@ -46,11 +46,15 @@ native stack is the only source of prefix order. A managed PR may be standalone,
 and a native stack need not be managed. New heads or changed base/order/prefix
 return affected work to waiting and invalidate stale evidence automatically.
 
-`review:ready` opens the repository's review lane after PR CI succeeds; it does
+After PR CI succeeds, the coordinator marks the managed draft ready with its
+ordinary authenticated PR operation, revalidates the exact head, and invokes
+the review transition. The transition requires the PR to be ready before it
+applies `review:ready`; that label opens the repository's review lane and does
 not mean review is complete. `merge:ready` is accepted only after the machine
 gate observes terminal current-head evidence from every active configured
 review automation, no unresolved threads, a current maintainer reply on every
-automation thread, and applicable exact-SHA full CI. The endpoint never merges;
+automation thread, and applicable exact-SHA full CI. Merge admission does not
+change draft state, and the endpoint never merges;
 the coordinator or maintainer integrates
 the accepted singleton or prefix. Because `merge:ready` records point-in-time
 acceptance rather than proof of future eligibility, the coordinator invokes
@@ -58,6 +62,10 @@ the `merge` operation immediately before a singleton merge or preflights every
 managed member of one frozen native prefix before integrating it bottom to top
 without unrelated work in between. Ordinary members retain their protected
 automatic route.
+
+Returning a managed PR to draft invalidates both `review:ready` and
+`merge:ready`; merge admission fails closed until the PR is ready and review
+evidence converges again.
 
 ## Commit messages
 

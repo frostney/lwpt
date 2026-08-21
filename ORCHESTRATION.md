@@ -40,10 +40,10 @@ conditional exact-SHA promotion proof.
 | --- | --- | --- | --- | --- |
 | Enrol managed delivery | `enrol` | `pr_number`, `expected_head` | `delivery:managed`; downstream readiness cleared | Cheap automatic PR routing run on the exact head |
 | Admit PR CI | `ci` | `pr_number`, `expected_head` | `ci:ready`; the exact-head PR run is admitted/rerun when needed | Successful native exact-head `delivery-admission` job |
-| Open review | `review` | `pr_number`, `expected_head` | `review:ready` after current admission succeeds | Provider-neutral review convergence remains external |
+| Open review | `review` | `pr_number`, `expected_head` | `review:ready`; PR must already be ready | Provider-neutral review convergence remains external |
 | Run a native diagnostic | `diagnostic` | `pr_number`, `expected_head`, `diagnostic_target`, `diagnostic_selector` | No readiness mutation | Non-proof `diagnostic/...` run for one allow-listed native slice |
 | Prove full CI | `full-ci` | `pr_number` as candidate, `expected_head` | No readiness label; frozen singleton or prefix dispatched | Successful exact-head `full-ci` with topology digest |
-| Admit merge | `merge` | `pr_number`, `expected_head`, `candidate_pr_number` | `merge:ready`; validated draft may become ready | Current CI, review, replies, threads, and applicable full-CI proof |
+| Admit merge | `merge` | `pr_number`, `expected_head`, `candidate_pr_number` | `merge:ready`; draft state is unchanged | Current CI, review, replies, threads, and applicable full-CI proof |
 | Return to waiting | `reset` | `pr_number`, `expected_head` | Readiness labels cleared; PR returned to draft | Native check history remains immutable evidence |
 
 `delivery:managed`, native stack membership, and `ci:full-required` are
@@ -79,6 +79,14 @@ revalidates the current head, review, topology, and applicable full-CI evidence.
 Ordinary and managed PRs use the same native PR workflow and required
 `delivery-admission` job. The controller only advances a managed PR through its
 phase labels and reruns its deferred exact-head workflow when admitted.
+
+GitHub does not permit the workflow's `GITHUB_TOKEN` to invoke
+`markPullRequestReadyForReview`. After a successful exact-head `ci` transition,
+the coordinator uses its ordinary authenticated PR operation (`gh pr ready`
+for CLI-capable harnesses), verifies the same head is still current, and then
+invokes `review`. The review transition fails closed while the PR is draft.
+Returning the PR to draft invalidates `review:ready` and `merge:ready`; merge
+admission fails closed while it remains draft and never changes draft state.
 
 ## Capability decision tree
 
