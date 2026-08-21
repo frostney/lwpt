@@ -69,7 +69,7 @@ The curated set of FPC packages made available to a LWPT CI build target. Plural
 *Avoid*: "unit slice", "package slice", "exact RTL units", "completeness bug", "cross-compiled FPC" when the target uses a native FPC package layout.
 
 **Windows SChannel archive-fetch failure**:
-A Windows-only failure in the `HTTPClient` package's SChannel backend while fetching live dependency archives during `lwpt test --tier=e2e`. Specific to LWPT's archive-fetch workload; not a general claim that HTTPS is broken, and not evidence that the FPC packages slice is wrong. GocciaScript's HTTPS smoke exercises a smaller request shape.
+A Windows-only failure in the `HTTPClient` package's SChannel backend while fetching live dependency archives through LWPT's repository-owned E2E route. Specific to LWPT's archive-fetch workload; not a general claim that HTTPS is broken, and not evidence that the FPC packages slice is wrong. GocciaScript's HTTPS smoke exercises a smaller request shape.
 *Avoid*: "SChannel HTTPS issue", "Windows HTTPS is broken", "GocciaScript works but LWPT does not".
 
 **Toolkit state**:
@@ -176,8 +176,8 @@ but cannot add programs to the current invocation.
 **Test selector**:
 A project-root-relative positional argument to `lwpt test` that selects test
 programs by exact file, recursive directory, or LWPT glob. Multiple selectors
-form one deduplicated union, every selector must match, and selection never
-widens the requested test tier.
+form one deduplicated union, every selector must match, and selection runs
+exactly the matching programs.
 *Avoid*: "filter" (suggests name-substring matching), "test name" (selectors
 identify program paths, not cases registered inside a program).
 

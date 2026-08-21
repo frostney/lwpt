@@ -220,7 +220,9 @@ installs are not supported.
   index state, reclaims abandoned/incomplete residue, preserves live guards,
   and evicts unleased objects until the configured budget is met.
 - **Test:** Each `*.Test.pas` is a self-contained program using
-  `TestingPascalLibrary`. `lwpt test` resolves the project-scoped compiler
+  `TestingPascalLibrary`. The runner discovers all programs or resolves strict
+  file, directory, and glob selectors; projects own any grouping and network
+  policy. `lwpt test` resolves the project-scoped compiler
   driver once and shares it across every test worker; per-entry compiler
   profiles apply to `lwpt build`, not to individual test files. Workers validate
   each neutral request and first seek a verified compilation artifact set under
@@ -395,7 +397,7 @@ The production gaps the spike's handoff flagged + the current status of each:
 | Gap | Status | Notes |
 | --- | --- | --- |
 | Self-test suite (HTTPClient regression first) | Done | The single most important test is the mock-server-based binary-fetch regression that pins HTTPClient's byte-safe `AppendRawBytes` contract |
-| Live network tests against GitLab + Bitbucket + fetch-failure-mode tests | Done | Live GitHub (`octocat/Hello-World`), GitLab (`gitlab-examples/ci-debug-trace`), and Bitbucket (`atlassian/atlaskit`) suites ship in the `tests/e2e/` tier. The cross-platform loopback suite covers HTTP 500, refused connections, redirect confinement, stalled deadlines, truncated bodies, transaction cleanup, and preserved canonical production URLs. |
+| Live network tests against GitLab + Bitbucket + fetch-failure-mode tests | Done | Live GitHub (`octocat/Hello-World`), GitLab (`gitlab-examples/ci-debug-trace`), and Bitbucket (`atlassian/atlaskit`) suites ship under the repository's `tests/e2e/` path. The cross-platform loopback suite covers HTTP 500, refused connections, redirect confinement, stalled deadlines, truncated bodies, transaction cleanup, and preserved canonical production URLs. |
 | Error handling hardened | Done | Validated journaled rollback under `.lwpt/tmp/`, stable-plan publication, recovery before tmp cleanup, aggregate rollback diagnostics, EXDEV fallback, `O_CREAT\|O_EXCL` cross-process install lock, lockfile schema v3 with `archiveHash` and `resolvedURL`, and read-only `--frozen` two-hash verification. |
 | CI on the platform tier matrix | Done | Tier 1 cross-build and native-test coverage ships for Linux, Windows, and macOS (see [`deployment.md`](./deployment.md)). Windows install locking (`LockFileEx`), subprocess paths, and WinSock-backed HTTP mock-server regressions run natively. |
 | Release artifacts | Done | Windows + macOS releases ship the binary alone; Linux relies on distro libssl per [ADR-0016](./adr/0016-tls-backend-per-platform.md). |

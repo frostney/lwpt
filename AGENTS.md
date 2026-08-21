@@ -58,7 +58,7 @@ Unit-naming, formatter rules, package formatting policy, and line-ending convent
 
 [`docs/testing.md`](./docs/testing.md) is the canonical policy. Short version:
 
-- Four tiers: **Unit** (co-located, always), **Integration** (`tests/integration/`, always), **E2E** (`tests/e2e/` plus package-owned `tests/e2e/`; opt-in via `--tier=e2e`), **Manual** (never automatic).
+- Test groups are repository policy, not runner semantics: co-located unit programs, `tests/integration/`, and `tests/e2e/` plus package-owned E2E paths. `lwpt test` runs all discovered programs or exactly the supplied selectors.
 - The single most important test is the **HTTPClient binary-fetch regression** that pins the byte-safe `AppendRawBytes` accumulator's contract via a mock HTTP server. Lives in `packages/httpclient/source/HTTPClient.Test.pas`.
 - Root CLI E2E tests do **not** `uses LWPT.Core` — they spawn the binary and check exit codes, stdout/stderr, and on-disk side effects. Package E2E tests exercise only that package's published surface against real operating-system resources.
 
@@ -69,7 +69,7 @@ Unit-naming, formatter rules, package formatting policy, and line-ending convent
 - **Formatter scope is manifest-declared, with toolkit state protected by default** per [ADR-0007](./docs/adr/0007-formatter-scope-manifest-declared.md) and [ADR-0028](./docs/adr/0028-default-toolkit-state-format-exclusion.md): `[package].units` seeds + `[format].include` adds + toolkit-state default exclusion (root `.lwpt/**`, redirected toolkit paths, and only the project-owned `p-<hash>` namespace below a shared `sessions-dir` base) unless explicitly included + `[format].exclude` final subtraction, all glob-aware, no implicit `tests/` walk. Root LWPT's `[format].include` covers tests + every workspace package (`packages/**/*.{pas,inc}`) so the canonical style applies across the monorepo by default. A workspace package opts out by declaring its own `[format]` section in `packages/<name>/lwpt.toml` (per ADR-0017's root-owns-unless-overridden model).
 - **TLS is platform-native on Windows and macOS in both directions; Unix-not-Darwin uses OpenSSL.** Per [ADR-0016](./docs/adr/0016-tls-backend-per-platform.md), outbound `TransportSecurity.pas` clients use **SChannel on Windows**, **SecureTransport on macOS**, and runtime-loaded **OpenSSL** elsewhere. Per [ADR-0024](./docs/adr/0024-openssl-server-tls-accept.md), server contexts take size-capped caller-supplied **PKCS#12 bytes** as the primary input, strictly validate certificate policy and bundled-chain coherence by default without platform trust, and publish reloads as immutable reference-counted snapshots. The convenience path overload opens once without following links; permissive self-signed development is explicit. Server accept is **native SChannel** on Windows per [ADR-0033](./docs/adr/0033-schannel-server-tls-accept-on-windows.md) — no OpenSSL is linked or loaded anywhere on Windows, and `i386-win32` is supported — and requires **OpenSSL 3 or newer** on Unix-not-Darwin; macOS servers use Network.framework outside this package. `Active` means the server handshake is authenticated, retained ciphertext must drain before another protocol operation, and consumers must enforce a handshake deadline and byte budget. Encrypted input and output capacities are independently configured per context (each 64 KiB by default, each valid from 17–256 KiB); input uses accepted-prefix feeds, cumulative counters, and high/low-watermark backpressure, while output exposes exact pending and remaining capacity. OpenSSL is never import-linked, statically linked, or shipped in LWPT release archives, and Windows binaries contain no OpenSSL relationship at all. The guards in `pr.yml`, `ci.yml`, and `release.yml` inspect PE imports, imported OpenSSL symbol families, and link inputs, with positive parser canaries. Full per-platform story in [`docs/deployment.md`](./docs/deployment.md).
 - **No secrets in fixtures.** Test artefacts pin specific tagged releases of small public repos; never include credentials, tokens, or anything touching a private endpoint.
-- **Network operations are explicit.** `lwpt install` and its manifest-editing frontends `lwpt add` / `lwpt remove` (both run the install transaction per [ADR-0019](./docs/adr/0019-add-remove-subcommands.md)) plus `lwpt outdated` / `lwpt update` ([ADR-0039](./docs/adr/0039-outdated-update-subcommands.md) — tag listing; `update` may also fetch archives) are the only subcommands that hit the network in the default install mode. All other subcommands (including `lwpt test` without `--tier=e2e`) are offline.
+- **Network operations are explicit.** `lwpt install` and its manifest-editing frontends `lwpt add` / `lwpt remove` (both run the install transaction per [ADR-0019](./docs/adr/0019-add-remove-subcommands.md)) plus `lwpt outdated` / `lwpt update` ([ADR-0039](./docs/adr/0039-outdated-update-subcommands.md) — tag listing; `update` may also fetch archives) are the only toolkit-owned network paths. Test programs own their own network policy; LWPT's live-network programs require `LWPT_ENABLE_NETWORK=1`.
 
 ## Product and Roadmap Boundaries
 
@@ -82,7 +82,7 @@ Workflow knowledge that is not derivable from the command surface. The generated
 | Want to... | Run |
 | --- | --- |
 | First-time setup after clone | `./bootstrap.sh` then `./build/lwpt install` |
-| Run E2E tier offline (skip live-network tests) | `LWPT_SKIP_NETWORK=1 ./build/lwpt test --tier=e2e` |
+| Run LWPT's E2E paths offline | `./build/lwpt test 'tests/e2e/*.Test.pas' 'packages/*/tests/e2e/*.Test.pas'` |
 | Add a dependency without `lwpt add` | edit `lwpt.toml`, then `./build/lwpt install` |
 | See which git-host deps have newer tags | `./build/lwpt outdated` (`--json` for the machine report) |
 | Update outdated git-host deps | `./build/lwpt update` or `./build/lwpt update <name>` |
@@ -124,8 +124,7 @@ Generated by `lwpt agents` from the toolkit's command registry and this project'
 - `lwpt duplication [--json] [--silent]` — Report manifest-scoped Pascal token clones
   - `--json` — Emit the deterministic machine-readable analysis envelope
   - `--silent` — Suppress ordinary output and emit only the final command result
-- `lwpt test [selector...] [--tier default|e2e] [--jobs N] [--bail N] [--verbose] [--inventory] [--no-cache] [--silent]` — Discover and run *.Test.pas files
-  - `--tier=<value>` — Test tier to include: default (unit + integration) or e2e (adds network-touching tier)
+- `lwpt test [selector...] [--jobs N] [--bail N] [--verbose] [--inventory] [--no-cache] [--silent]` — Discover and run *.Test.pas files
   - `--jobs=<N>` — Maximum concurrent test programs (default: shared machine budget)
   - `--bail=<N>` — Stop after N compile or runtime failures; 0 runs the full queue
   - `--verbose` — Replay successful test logs

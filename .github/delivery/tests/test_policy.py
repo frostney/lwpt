@@ -119,12 +119,28 @@ class RepositoryPolicyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("TestScheduling.Test.pas", diagnostic)
         self.assertIn("diagnostic exceeded its bounded runtime", diagnostic)
-        self.assertIn("./build/lwpt test --jobs=1 --bail=1 --verbose", diagnostic)
+        self.assertIn('"source/*.Test.pas"', diagnostic)
+        self.assertIn('"packages/*/source/*.Test.pas"', diagnostic)
+        self.assertIn('"tests/integration/*.Test.pas"', diagnostic)
+        self.assertIn("--jobs=1 --bail=1 --verbose", diagnostic)
         self.assertIn('"${test_command[@]}"', diagnostic)
         self.assertIn("diagnostic/", workflow)
         self.assertIn("- diagnostic", workflow)
         self.assertIn("current same-repository PR head", workflow)
         self.assertNotIn("diagnostic:v1", workflow)
+
+    def test_test_routes_use_project_selectors_without_runner_tiers(self) -> None:
+        pr_workflow = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")
+        ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        for workflow in (pr_workflow, ci_workflow):
+            self.assertNotIn("--tier", workflow)
+            self.assertIn("'source/*.Test.pas'", workflow)
+            self.assertIn("'packages/*/source/*.Test.pas'", workflow)
+            self.assertIn("'tests/integration/*.Test.pas'", workflow)
+            self.assertIn("'tests/e2e/*.Test.pas'", workflow)
+            self.assertIn("'packages/*/tests/e2e/*.Test.pas'", workflow)
+        self.assertIn('LWPT_ENABLE_NETWORK: "1"', pr_workflow)
+        self.assertIn('LWPT_ENABLE_NETWORK: "1"', ci_workflow)
 
     def test_windows_compiler_discovery_skips_absent_roots(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -139,22 +155,6 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn('head -1 || true)\n          if [ -n "$INSTANTFPC_BIN" ]', pr_workflow)
         self.assertIn("for unit_target in i386-win32 x86_64-win64", workflow)
         self.assertNotIn('for unit_target in "${{ matrix.target }}"', workflow)
-
-    def test_full_ci_bridges_test_cli_generations_with_project_selectors(self) -> None:
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-
-        for selector in (
-            "'source/*.Test.pas'",
-            "'packages/*/source/*.Test.pas'",
-            "'tests/integration/*.Test.pas'",
-            "'tests/e2e/*.Test.pas'",
-            "'packages/*/tests/e2e/*.Test.pas'",
-        ):
-            self.assertIn(selector, workflow)
-        self.assertIn('test_help="$("$test_binary" test --help)"', workflow)
-        self.assertIn('[[ "$test_help" == *"--tier"* ]]', workflow)
-        self.assertEqual(1, workflow.count("test_arguments+=(--tier=e2e)"))
-        self.assertIn('LWPT_ENABLE_NETWORK: "1"', workflow)
 
     def test_native_test_jobs_have_twenty_minute_timeout(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

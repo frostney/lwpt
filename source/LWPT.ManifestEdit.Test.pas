@@ -1,4 +1,4 @@
-{ LWPT.ManifestEdit.Test — unit-tier coverage for the comment-preserving
+{ LWPT.ManifestEdit.Test — unit coverage for the comment-preserving
   [dependencies] editor behind `lwpt add` / `lwpt remove` (ADR-0019):
   section location + creation, key matching (bare and quoted, commented
   lines ignored), insert / replace / delete, the inline-table refusal,

@@ -15,11 +15,11 @@ uses
 
 function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
   const AHostOS, AHostArchitecture: string): Boolean;
-function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
+function CmdTest(const AManifestPath: string;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings; const AUseCache: Boolean = True): Integer;
   overload;
-function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
+function CmdTest(const AManifestPath: string;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings;
   const ACompilerHost: TLWPTCompilerHost;
@@ -92,7 +92,7 @@ type
   end;
 
   TTestJobStatus = (tjsPending, tjsCompiling, tjsRunning, tjsPassed,
-    tjsCompileFailed, tjsRunFailed, tjsSkipped, tjsCancelled,
+    tjsCompileFailed, tjsRunFailed, tjsCancelled,
     tjsWorkerError);
 
   TTestJob = record
@@ -190,7 +190,7 @@ type
     procedure PrintProgressEvent(const AEvent: TTestProgressEvent);
   public
     constructor Create(const ATests: TStringList;
-      const AIncludeE2E: Boolean; const AUnitPaths: TStringArray;
+      const AUnitPaths: TStringArray;
       const ACompilerArguments: TStringArray; const ABuildRoot: string;
       const AJobs, ABail: Integer;
       const ASession: TLWPTBuildSession; const AProjectRoot: string;
@@ -201,7 +201,7 @@ type
     destructor Destroy; override;
     procedure Run;
     procedure PrintResults(const AProjectRoot: string; out APassed,
-      AFailed, ACompileFailed, ASkipped, ACancelled: Integer);
+      AFailed, ACompileFailed, ACancelled: Integer);
     function InventoryJSON(const AProjectRoot: string): string;
     procedure ValidateInventory(const AProjectRoot: string);
     property InternalError: string read FInternalError;
@@ -335,15 +335,6 @@ begin
   ASelected.Sort;
 end;
 
-function IsE2ETestPath(const APath: string): Boolean; inline;
-var
-  Normalised: string;
-begin
-  Normalised := StringReplace(APath, '\', '/', [rfReplaceAll]);
-  Result := (Pos('/tests/e2e/', Normalised) > 0)
-         or (Pos('tests/e2e/', Normalised) = 1);
-end;
-
 procedure CopyCurrentEnvironment(AEnvironment: TStrings);
 begin
   { Concurrent scheduler workers copy here; a direct sweep raced the RTL's
@@ -391,7 +382,7 @@ begin
 end;
 
 constructor TTestScheduler.Create(const ATests: TStringList;
-  const AIncludeE2E: Boolean; const AUnitPaths: TStringArray;
+  const AUnitPaths: TStringArray;
   const ACompilerArguments: TStringArray; const ABuildRoot: string;
   const AJobs, ABail: Integer;
   const ASession: TLWPTBuildSession; const AProjectRoot: string;
@@ -434,14 +425,8 @@ begin
     FJobs[i].Source := ATests[i];
     FReporter.RegisterJob(ObservabilityTestIdentityNamespace + ATests[i],
       TestDisplayPath(AProjectRoot, ATests[i]));
-    if (not AInventory) and (not AIncludeE2E)
-       and IsE2ETestPath(ATests[i]) then
-      FJobs[i].Status := tjsSkipped
-    else
-    begin
-      FJobs[i].Status := tjsPending;
-      Inc(Runnable);
-    end;
+    FJobs[i].Status := tjsPending;
+    Inc(Runnable);
   end;
   if Runnable = 0 then Exit;
   if AJobs = 0 then RequestedWorkers := Runnable
@@ -1181,7 +1166,7 @@ end;
 function IsTerminalTestStatus(const AStatus: TTestJobStatus): Boolean; inline;
 begin
   Result := AStatus in [tjsPassed, tjsCompileFailed, tjsRunFailed,
-    tjsSkipped, tjsCancelled, tjsWorkerError];
+    tjsCancelled, tjsWorkerError];
 end;
 
 function TTestScheduler.AllJobsTerminal: Boolean;
@@ -1254,18 +1239,6 @@ begin
       FSession.SessionID, ojsStarted, 0, 0, '', LogReference);
     try
       FReporter.ReportJob(JobEvent, '', '', FVerbose, AEvent.StartedAt);
-    finally
-      JobEvent.Free;
-    end;
-    Exit;
-  end;
-  if AEvent.Status = tjsSkipped then
-  begin
-    JobEvent := TLWPTJobEvent.Create(
-      ObservabilityTestIdentityNamespace + AEvent.Source,
-      FSession.SessionID, ojsSkipped, 0, 0, 'e2e tier', '');
-    try
-      FReporter.ReportJob(JobEvent, '', '', FVerbose);
     finally
       JobEvent.Free;
     end;
@@ -1372,7 +1345,7 @@ begin
 end;
 
 procedure TTestScheduler.PrintResults(const AProjectRoot: string;
-  out APassed, AFailed, ACompileFailed, ASkipped, ACancelled: Integer);
+  out APassed, AFailed, ACompileFailed, ACancelled: Integer);
 var
   i: Integer;
   DisplayPath: string;
@@ -1380,7 +1353,6 @@ begin
   APassed := 0;
   AFailed := 0;
   ACompileFailed := 0;
-  ASkipped := 0;
   ACancelled := 0;
   for i := 0 to High(FJobs) do
   begin
@@ -1403,11 +1375,6 @@ begin
           WriteLn('FAIL (exit ', FJobs[i].ExitCode, ')');
           Inc(AFailed);
         end;
-      tjsSkipped:
-        begin
-          WriteLn('skipped (e2e tier)');
-          Inc(ASkipped);
-        end;
       tjsCancelled:
         begin
           WriteLn('cancelled (bail threshold reached)');
@@ -1427,24 +1394,13 @@ begin
   end;
 end;
 
-function InventoryTier(const APath: string): string;
-var
-  Normalised: string;
-begin
-  Normalised := CanonicalPathGlob(APath);
-  if IsE2ETestPath(Normalised) then Result := 'e2e'
-  else if Pos('/tests/integration/', '/' + Normalised) > 0 then
-    Result := 'integration'
-  else Result := 'unit';
-end;
-
 function TTestScheduler.InventoryJSON(const AProjectRoot: string): string;
 var
   i: Integer;
   DisplayPath, Separator: string;
 begin
   Result := '{"schema":"' + PROGRAM_NAME
-    + '.test-inventory","version":1,"platform":{"os":'
+    + '.test-inventory","version":2,"platform":{"os":'
     + JSONString(Platform.GetBuildOS) + ',"architecture":'
     + JSONString(Platform.GetBuildArch) + '},"programs":[';
   Separator := '';
@@ -1457,7 +1413,6 @@ begin
         'test inventory failed for "%s": %s',
         [DisplayPath, FJobs[i].ErrorMessage]);
     Result := Result + Separator + '{"path":' + JSONString(DisplayPath)
-      + ',"tier":' + JSONString(InventoryTier(DisplayPath))
       + ',"suites":' + IntToStr(FJobs[i].InventorySuites)
       + ',"cases":' + IntToStr(FJobs[i].InventoryCases) + '}';
     Separator := ',';
@@ -1468,7 +1423,7 @@ end;
 procedure TTestScheduler.ValidateInventory(const AProjectRoot: string);
 var
   ExpectedPaths, SeenPaths: TStringList;
-  ActualTier, Architecture, DisplayPath, ExpectedTier, OSName: string;
+  Architecture, DisplayPath, OSName: string;
   ExpectedCases, ExpectedSuites, i: Integer;
 begin
   if FExpectedInventory = nil then Exit;
@@ -1485,15 +1440,10 @@ begin
         IncludeTrailingPathDelimiter(AProjectRoot), FJobs[i].Source));
       SeenPaths.Add(DisplayPath);
       if not FExpectedInventory.Resolve(DisplayPath, OSName, Architecture,
-        ExpectedTier, ExpectedSuites, ExpectedCases) then
+        ExpectedSuites, ExpectedCases) then
         raise ELWPTError.CreateFmt(
           'test inventory is stale: add "%s" for platform %s/%s',
           [DisplayPath, OSName, Architecture]);
-      ActualTier := InventoryTier(DisplayPath);
-      if ActualTier <> ExpectedTier then
-        raise ELWPTError.CreateFmt(
-          'test inventory tier mismatch for "%s": expected %s, got %s',
-          [DisplayPath, ExpectedTier, ActualTier]);
       if FJobs[i].Status = tjsPassed then
       begin
         if (FJobs[i].InventorySuites <> ExpectedSuites)
@@ -1607,15 +1557,15 @@ begin
   end;
 end;
 
-function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
+function CmdTest(const AManifestPath: string;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings; const AUseCache: Boolean): Integer;
 begin
-  Result := CmdTest(AManifestPath, AIncludeE2E, AJobs, ABail, AVerbose,
+  Result := CmdTest(AManifestPath, AJobs, ABail, AVerbose,
     AInventory, ASelectors, nil, AUseCache);
 end;
 
-function CmdTest(const AManifestPath: string; const AIncludeE2E: Boolean;
+function CmdTest(const AManifestPath: string;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings;
   const ACompilerHost: TLWPTCompilerHost; const AUseCache: Boolean): Integer;
@@ -1627,7 +1577,7 @@ var
   UnitPaths: TStringArray;
   ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond,
     InventoryPath, ManifestContentHash: string;
-  i, n, Passed, Failed, Skipped, CompileFailed, Cancelled,
+  i, n, Passed, Failed, CompileFailed, Cancelled,
     EffectiveBail: Integer;
   Session: TLWPTBuildSession;
   Scheduler: TTestScheduler;
@@ -1642,7 +1592,6 @@ begin
   StartedAt := GetTickCount64;
   Passed := 0;
   Failed := 0;
-  Skipped := 0;
   CompileFailed := 0;
   Cancelled := 0;
   CompilerSelection := nil;
@@ -1735,7 +1684,7 @@ begin
         end;
         if AInventory then
           WriteLn('{"schema":"' + PROGRAM_NAME
-            + '.test-inventory","version":1,"platform":{"os":'
+            + '.test-inventory","version":2,"platform":{"os":'
             + JSONString(Platform.GetBuildOS) + ',"architecture":'
             + JSONString(Platform.GetBuildArch) + '},"programs":[]}')
         else
@@ -1794,10 +1743,8 @@ begin
             ' discovered test file(s)')
         else
           WriteLn('discovered ', Tests.Count, ' test file(s)');
-        if not AIncludeE2E then
-          WriteLn('  (e2e tier skipped; pass --tier=e2e to include)');
       end;
-      Scheduler := TTestScheduler.Create(Tests, AIncludeE2E, UnitPaths,
+      Scheduler := TTestScheduler.Create(Tests, UnitPaths,
         Man.TestFlags, Session.JobRoot('tests'), AJobs, EffectiveBail, Session,
         ProjectRoot, AVerbose, AInventory,
         (ASelectors = nil) or (ASelectors.Count = 0), InventoryPath,
@@ -1814,7 +1761,7 @@ begin
         end
         else
           Scheduler.PrintResults(ProjectRoot, Passed, Failed, CompileFailed,
-            Skipped, Cancelled);
+            Cancelled);
         if Scheduler.InternalError <> '' then
           WriteLn(ErrOutput, PROGRAM_NAME, ' test: scheduler error: ',
             Scheduler.InternalError);
@@ -1847,8 +1794,7 @@ begin
     CompilerSelection.Free;
     if not AInventory then
       WriteLn('summary: ', Passed, ' passed, ', Failed, ' failed, ',
-        CompileFailed, ' did not compile, ', Skipped, ' skipped, ',
-        Cancelled, ' cancelled; elapsed ',
+        CompileFailed, ' did not compile, ', Cancelled, ' cancelled; elapsed ',
         FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
   end;
 end;

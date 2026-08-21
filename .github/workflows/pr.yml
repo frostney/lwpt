@@ -5,15 +5,15 @@ name: PR
 #
 #   pr.yml      — every ordinary and managed PR:
 #                 Ubuntu native bootstrap + install + format --check + build +
-#                 test, then the live-
-#                 network e2e tier on the same Linux leg (#102);
-#                 a native aarch64-darwin default-tier leg; and a
+#                 ordinary tests, then the live-network E2E paths on the
+#                 same Linux leg (#102); a native aarch64-darwin
+#                 ordinary-test leg; and a
 #                 win64 leg: cross-compile on macOS, then the
-#                 offline default test tier natively on
+#                 offline ordinary tests natively on
 #                 windows-latest. Typical wall-clock
 #                 < 10 min on a warm toolchain cache (hard caps per job/step).
 #   ci.yml      — push to main only: full 6-target cross-build +
-#                 per-platform native test runs (incl. e2e on
+#                 per-platform native test runs (including E2E paths on
 #                 every platform). Post-merge confirmation.
 #   release.yml — tag-triggered cross-build + package + publish.
 #
@@ -21,8 +21,8 @@ name: PR
 # legs the gate still omits (x86_64-darwin, aarch64-linux,
 # i386-win32, or non-Linux e2e) will pass pr.yml and only fail on
 # the main-branch ci.yml run. The maintainer reverts/forwards-fixes
-# from main. Pre-merge coverage now spans Linux default+e2e,
-# aarch64-darwin default, and win64 offline (#102 extended the
+# from main. Pre-merge coverage now spans Linux ordinary+E2E,
+# aarch64-darwin ordinary, and win64 offline (#102 extended the
 # original Ubuntu+win64 gate). This bounded trade keeps PR feedback
 # cheap, which is the conscious GocciaScript design
 # choice we mirror.
@@ -34,13 +34,13 @@ name: PR
 # used to merge green and break main. windows-cross-compile closes
 # the compile gap (one win64 cross-compile reusing the toolchain
 # cache main runs keep warm); windows-test then runs the offline
-# default test tier natively against that binary, catching
+# ordinary tests natively against that binary, catching
 # Windows-only runtime breaks (junction installs, path handling,
 # process env) and compile breaks in test sources, which lwpt test
 # compiles with the native FPC. #102 added the next two carve-outs
-# (the Linux e2e step and the darwin-test leg below) after the
+# (the Linux E2E step and the darwin-test leg below) after the
 # #84/#105 escape classes. Still post-merge only: the i386-win32
-# leg, the e2e tier on non-Linux platforms, bootstrap.bat, and the
+# leg, E2E paths on non-Linux platforms, bootstrap.bat, and the
 # x86_64-darwin / aarch64-linux permutations.
 #
 # The Ubuntu native build deliberately uses the distro FPC (same
@@ -109,11 +109,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      # Default-tier steps skip live-network E2E; the dedicated e2e
-      # step below overrides this to "0" for its single run (#102).
-      # Post-merge ci.yml still runs the tier on every platform.
-      LWPT_SKIP_NETWORK: "1"
     steps:
       # persist-credentials: false on every pr.yml checkout: these jobs
       # build and EXECUTE the PR's own code (bootstrap, lwpt, tests),
@@ -161,23 +156,31 @@ jobs:
       - name: lwpt agents --check (AGENTS.md command reference fresh?)
         run: ./build/lwpt agents --check
 
-      - name: lwpt test --bail=1 (default tier — unit + integration)
-        run: ./build/lwpt test --bail=1
+      - name: lwpt test --bail=1 (ordinary project paths)
+        run: >-
+          ./build/lwpt test
+          'source/*.Test.pas'
+          'packages/*/source/*.Test.pas'
+          'tests/integration/*.Test.pas'
+          --bail=1
 
-      # PR-gate extension (#102): the live-network e2e tier runs on this
+      # PR-gate extension (#102): the project-owned E2E paths run on this
       # one Linux leg pre-merge. Evidence: the #84 TLS-close regression
-      # was only reachable through the e2e tier, and the higher-
-      # concurrency e2e runs are what flushed the #101-class timing
-      # flakes — both previously invisible to this gate. Clean DNS/
+      # was only reachable through these programs. The ordinary pass above
+      # retains the concurrency suites which cover the #101 timing class;
+      # they are not rerun here as accidental stress. Clean DNS/
       # connect failures self-skip (transient third-party downtime);
       # content, protocol, and TLS failures remain blocking, which is
-      # the point. The step env overrides the job-level skip. Post-
-      # merge ci.yml still runs e2e on every platform.
-      - name: lwpt test --tier=e2e --bail=1 (live network, Linux leg)
+      # the point. Post-merge ci.yml still runs these paths on every platform.
+      - name: lwpt test --bail=1 (E2E project paths, live network)
         timeout-minutes: 15
         env:
-          LWPT_SKIP_NETWORK: "0"
-        run: ./build/lwpt test --tier=e2e --bail=1
+          LWPT_ENABLE_NETWORK: "1"
+        run: >-
+          ./build/lwpt test
+          'tests/e2e/*.Test.pas'
+          'packages/*/tests/e2e/*.Test.pas'
+          --bail=1
 
   docs:
     needs: delivery-gate
@@ -204,9 +207,9 @@ jobs:
   # and darwin-only runtime breaks (the fpc-proxy misroute) were
   # invisible to the Linux-only gate. Native
   # bootstrap via brew keeps this independent of the cross-toolchain
-  # cache. Default tier only; e2e stays on the Linux leg above and on
+  # cache. Ordinary paths only; E2E stays on the Linux leg above and on
   # post-merge ci.yml. Cost bound: ~5-6 min warm (brew fpc ~40 s +
-  # bootstrap ~1 min + default tier). The remaining ci.yml-only legs
+  # bootstrap ~1 min + ordinary tests). The remaining ci.yml-only legs
   # (x86_64-darwin, aarch64-linux, i386-win32) stay post-merge: their
   # unique-catch rate has not justified per-PR cost.
   darwin-test:
@@ -217,8 +220,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      LWPT_SKIP_NETWORK: "1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -240,8 +241,13 @@ jobs:
       - name: lwpt install (workspace auto-discovery + symlinks)
         run: ./build/lwpt install
 
-      - name: lwpt test --bail=1 (default tier — unit + integration)
-        run: ./build/lwpt test --bail=1
+      - name: lwpt test --bail=1 (ordinary project paths)
+        run: >-
+          ./build/lwpt test
+          'source/*.Test.pas'
+          'packages/*/source/*.Test.pas'
+          'tests/integration/*.Test.pas'
+          --bail=1
 
   # Reuses toolchain.yml exactly like ci.yml/release.yml do. The cache
   # key (lwpt-fpc-cross-<fpc>-macos-arm64-<n>) has no branch or ref
@@ -262,8 +268,8 @@ jobs:
   # green and breaks main (see the header comment). One target is
   # enough: win32 and win64 share the same {$IFDEF WINDOWS} sources,
   # and the failure class is compile-time. The produced lwpt.exe is
-  # uploaded for the windows-test job below, which runs the default
-  # test tier against it natively (same build-once / test-natively
+  # uploaded for the windows-test job below, which runs the ordinary
+  # project paths against it natively (same build-once / test-natively
   # split as ci.yml).
   #
   # The compile step mirrors ci.yml's build stage (x86_64-win64 leg):
@@ -389,13 +395,13 @@ jobs:
           path: build/lwpt.exe
 
   # Native Windows test run, pre-merge. Downloads the cross-built
-  # lwpt.exe and runs the offline default tier on windows-latest:
+  # lwpt.exe and runs the offline ordinary paths on windows-latest:
   # lwpt install + lwpt test. This catches what a compile alone
   # cannot — Windows-only runtime regressions in lwpt itself
   # (junction-vs-symlink installs, path handling, subprocess
   # environment handling) and compile breaks in test sources, which
   # lwpt test compiles with the native FPC at run time (Q22=b).
-  # Post-merge ci.yml still owns the i386-win32 leg, the e2e tier
+  # Post-merge ci.yml still owns the i386-win32 leg, E2E paths
   # on non-Linux platforms, and the bootstrap.bat smoke.
   windows-test:
     if: >-
@@ -412,11 +418,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      # The default tier is offline by design; this also keeps any
-      # future network-touching test out of the PR gate (mirrors the
-      # build-and-test job).
-      LWPT_SKIP_NETWORK: "1"
     steps:
       # persist-credentials: false — this job downloads and EXECUTES
       # the PR-built lwpt.exe; keep git auth material out of the
@@ -517,8 +518,13 @@ jobs:
       - name: lwpt install (workspace auto-discovery + junctions)
         run: ./build/lwpt.exe install
 
-      - name: lwpt test --bail=1 (default tier — unit + integration)
-        run: ./build/lwpt.exe test --bail=1
+      - name: lwpt test --bail=1 (ordinary project paths)
+        run: >-
+          ./build/lwpt.exe test
+          'source/*.Test.pas'
+          'packages/*/source/*.Test.pas'
+          'tests/integration/*.Test.pas'
+          --bail=1
 
   delivery-admission:
     if: ${{ always() }}
