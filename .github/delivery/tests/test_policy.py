@@ -140,6 +140,22 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("for unit_target in i386-win32 x86_64-win64", workflow)
         self.assertNotIn('for unit_target in "${{ matrix.target }}"', workflow)
 
+    def test_full_ci_bridges_test_cli_generations_with_project_selectors(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+        for selector in (
+            "'source/*.Test.pas'",
+            "'packages/*/source/*.Test.pas'",
+            "'tests/integration/*.Test.pas'",
+            "'tests/e2e/*.Test.pas'",
+            "'packages/*/tests/e2e/*.Test.pas'",
+        ):
+            self.assertIn(selector, workflow)
+        self.assertIn('test_help="$("$test_binary" test --help)"', workflow)
+        self.assertIn('[[ "$test_help" == *"--tier"* ]]', workflow)
+        self.assertEqual(1, workflow.count("test_arguments+=(--tier=e2e)"))
+        self.assertIn('LWPT_ENABLE_NETWORK: "1"', workflow)
+
     def test_native_test_jobs_have_twenty_minute_timeout(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         pr_workflow = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")

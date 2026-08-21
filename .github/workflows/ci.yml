@@ -572,26 +572,45 @@ jobs:
         run: |
           ./build/lwpt format --check
 
-      - name: lwpt test --bail=1 (default tier)
+      - name: lwpt test --bail=1 (ordinary project paths)
         if: >-
           inputs.mode != 'diagnostic' ||
           (inputs.diagnostic_selector == 'default' &&
            inputs.diagnostic_target != 'x86_64-darwin')
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            ./build/lwpt.exe test --bail=1
+            test_binary=./build/lwpt.exe
           else
-            ./build/lwpt test --bail=1
+            test_binary=./build/lwpt
           fi
+          "$test_binary" test \
+            'source/*.Test.pas' \
+            'packages/*/source/*.Test.pas' \
+            'tests/integration/*.Test.pas' \
+            --bail=1
 
-      - name: lwpt test --tier=e2e --bail=1 (live network — every platform per Q23=c)
+      # Trusted full CI is dispatched from main while it executes a candidate
+      # binary. Bridge the one release boundary where main still has --tier
+      # and the candidate has selector-only tests; the product keeps no alias.
+      - name: lwpt test --bail=1 (E2E project paths, live network — every platform per Q23=c)
         if: inputs.mode != 'diagnostic' || inputs.diagnostic_selector == 'e2e'
+        env:
+          LWPT_ENABLE_NETWORK: "1"
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            ./build/lwpt.exe test --tier=e2e --bail=1
+            test_binary=./build/lwpt.exe
           else
-            ./build/lwpt test --tier=e2e --bail=1
+            test_binary=./build/lwpt
           fi
+          test_arguments=(
+            'tests/e2e/*.Test.pas'
+            'packages/*/tests/e2e/*.Test.pas'
+          )
+          test_help="$("$test_binary" test --help)"
+          if [[ "$test_help" == *"--tier"* ]]; then
+            test_arguments+=(--tier=e2e)
+          fi
+          "$test_binary" test "${test_arguments[@]}" --bail=1
 
       - name: TLS diagnostic test
         if: inputs.mode == 'diagnostic' && inputs.diagnostic_selector == 'tls'
