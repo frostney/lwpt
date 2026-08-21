@@ -1,4 +1,4 @@
-{ LWPT.Core.Test — unit-tier coverage for the testable internals
+{ LWPT.Core.Test — unit coverage for the testable internals
   exposed in a later cycle: SHA256Hex against NIST vectors, LoadManifest happy
   and error paths, plus per-section parsing for [lwpt], [format],
   hook sections (ADR-0011), and placeholder interpolation (ADR-0012).

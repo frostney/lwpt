@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted for LWPT 0.6.0.
+Accepted for LWPT 0.6.0. The tier-policy consequence was superseded by
+[ADR-0042](./0042-keep-test-grouping-in-userland.md).
 
 ## Context
 
@@ -16,7 +17,7 @@ Freeze the complete discovered test inventory and resolve all positional selecto
 
 - `lwpt test [selector...]` accepts project-root-relative `*.Test.pas` files, directories (recursive), and LWPT globs (`*`, `?`, and `**`). Multiple selectors form a deduplicated union.
 - Every selector is strict. Absolute paths, project escapes, non-test files, missing literals, empty directories, and globs matching no discovered test fail before a build session or hook starts.
-- Selection never changes tier policy. An E2E program selected without `--tier=e2e` remains skipped.
+- Every selected program runs regardless of its path; the runner has no test-group taxonomy.
 - With no selectors, LWPT still selects the complete discovered inventory; only the lifecycle ordering changes.
 - Projects that generated test programs in `[pretest]` must generate them earlier or invoke the generator before `lwpt test`. Existing `[pretest]` commands may continue generating fixtures, units, and other inputs consumed by already-discovered programs.
 
