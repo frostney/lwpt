@@ -233,7 +233,7 @@ Each runner installs FPC natively (`brew` / `apt` / `choco`), then the `x86_64-w
 2. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
 3. **`lwpt format --check`** — only on `aarch64-darwin` runner (formatting is platform-independent; one check is enough)
 4. **`lwpt test <ordinary paths> --bail=1`** — the repository's co-located and integration programs; compiles them via the runner's native FPC, runs them concurrently, and stops quickly on the first failure
-5. **`LWPT_ENABLE_NETWORK=1 lwpt test <E2E paths> --bail=1`** — the repository's E2E programs (Q23 decision: run on every platform to surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
+5. **`lwpt test <E2E paths> --bail=1`** — with `LWPT_ENABLE_NETWORK=1` set in the job environment, the repository's E2E programs run on every platform (Q23 decision: surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
 
 Per [Q22=b](./adr/0014-packages-extraction.md), the runner side compiles tests at runtime via `lwpt test` rather than pre-compiling them on the cross-build stage. This exercises the full LWPT pipeline natively — including the resolver, the per-target cfg emitter, FPC's per-platform `{$IFDEF}` paths, and the install loop's symlink-vs-copy decision (junctions on Windows, symlinks on Unix).
 
