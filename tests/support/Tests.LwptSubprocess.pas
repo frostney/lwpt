@@ -425,7 +425,7 @@ begin
         deliberately leave the still-live delegation available. }
       if ForwardedWorkerLease
          and (((Length(AArgs) > 0) and SameText(AArgs[0], 'build')
-           and (Pos('build jobs:', Result.Stdout) > 0))
+           and (Pos('START ', Result.Stdout) > 0))
          or ((Length(AArgs) > 0) and SameText(AArgs[0], 'test')
            and (Pos('discovered ', Result.Stdout) > 0))) then
         GForwardWorkerLease := False;

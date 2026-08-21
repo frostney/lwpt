@@ -287,6 +287,8 @@ begin
   R := RunLwpt(['build', 'hello', '--mode', 'release'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/hello'))).ToBe(True);
+  Expect<Boolean>(Pos('build targets: hello', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build mode: release', R.Stdout) > 0).ToBe(True);
 end;
 
 procedure TCLIOptionsE2E.TestBuildModeEqualsSeparatedValueParses;
@@ -298,6 +300,8 @@ begin
   R := RunLwpt(['build', 'hello', '--mode=release'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/hello'))).ToBe(True);
+  Expect<Boolean>(Pos('build targets: hello', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build mode: release', R.Stdout) > 0).ToBe(True);
 end;
 
 procedure TCLIOptionsE2E.TestBuildModeInvalidValueExitsNonZero;

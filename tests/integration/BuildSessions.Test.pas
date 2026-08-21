@@ -1218,8 +1218,8 @@ begin
       + 'prerequisite "alpha"', R.Stderr) > 0).ToBe(True);
     Expect<Boolean>(Pos('build entry "app" failed:', R.Stderr) = 0)
       .ToBe(True);
-    AlphaAt := Pos('START alpha ', R.Stdout);
-    BetaAt := Pos('START beta ', R.Stdout);
+    AlphaAt := Pos('START alpha' + LineEnding, R.Stdout);
+    BetaAt := Pos('START beta' + LineEnding, R.Stdout);
     AppAt := Pos('SKIP app ', R.Stdout);
     Expect<Boolean>((AlphaAt > 0) and (AlphaAt < BetaAt)
       and (BetaAt < AppAt)).ToBe(True);
@@ -1307,9 +1307,29 @@ begin
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
     Expect<Integer>(RunResult.ProcessExitCode).ToBe(0);
     Expect<Integer>(RunResult.ProcessExitStatus).ToBe(0);
+    Expect<Boolean>(Pos('build targets: alpha, beta', RunResult.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('build mode: dev', RunResult.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('START alpha' + LineEnding, RunResult.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('START beta' + LineEnding, RunResult.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('PASS alpha -> build/alpha' + LineEnding,
+      RunResult.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('PASS beta -> build/beta' + LineEnding,
+      RunResult.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('RESULT PASS (2 built, 0 failed, 0 skipped)',
+      RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('alpha-begin|', RunResult.Stdout) = 0).ToBe(True);
     Expect<Boolean>(Pos('beta-begin|', RunResult.Stdout) = 0).ToBe(True);
     Expect<Boolean>(Pos('HEARTBEAT ', RunResult.Stdout) = 0).ToBe(True);
+    Expect<Boolean>(Pos('discovered ', RunResult.Stdout) = 0).ToBe(True);
+    Expect<Boolean>(Pos('build session: ', RunResult.Stdout) = 0).ToBe(True);
+    Expect<Boolean>(Pos('effective workers:', RunResult.Stdout) = 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('log: ', RunResult.Stdout) = 0).ToBe(True);
+    Expect<Boolean>(Pos('cache miss:', RunResult.Stdout) = 0).ToBe(True);
+    Expect<Boolean>(Pos('elapsed ', RunResult.Stdout) = 0).ToBe(True);
 
     WorkerRootExistedBefore := DirectoryExists(WorkerStateRoot);
     TransactionLockExistedBefore := FileExists(WorkerTransactionLock);
@@ -1322,6 +1342,9 @@ begin
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
     Expect<Integer>(RunResult.ProcessExitCode).ToBe(0);
     Expect<Integer>(RunResult.ProcessExitStatus).ToBe(0);
+    Expect<Boolean>(Pos('build targets: alpha, beta', RunResult.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('build mode: dev', RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('discovered 2 build entry(s)', RunResult.Stdout) > 0)
       .ToBe(True);
     Expect<Boolean>(Pos('build session: ', RunResult.Stdout) > 0).ToBe(True);
@@ -1341,7 +1364,9 @@ begin
       .ToBe(True);
     Expect<Boolean>(Pos('beta-begin|beta-end|', RunResult.Stdout) > 0)
       .ToBe(True);
-    Expect<Boolean>(Pos('summary: 2 built, 0 failed, 0 skipped; elapsed ',
+    Expect<Boolean>(Pos('cache miss: disabled', RunResult.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('RESULT PASS (2 built, 0 failed, 0 skipped; elapsed ',
       RunResult.Stdout) > 0).ToBe(True);
     LogReference := FirstLogReference(RunResult.Stdout);
     Expect<Boolean>(LogReference <> '').ToBe(True);
@@ -1396,9 +1421,10 @@ begin
 
     DumpRunFailure('contended: queued build', RunResult, 0);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
-    Expect<Boolean>(Pos('HEARTBEAT build elapsed ', RunResult.Stdout) > 0)
+    Expect<Boolean>(Pos('HEARTBEAT build; active: alpha (queued)',
+      RunResult.Stdout) > 0)
       .ToBe(True);
-    Expect<Boolean>(Pos('active: alpha (queued)', RunResult.Stdout) > 0)
+    Expect<Boolean>(Pos('HEARTBEAT build elapsed ', RunResult.Stdout) = 0)
       .ToBe(True);
   finally
     if Holder.Running then Holder.Terminate(1);
@@ -1466,12 +1492,16 @@ begin
     Expect<Boolean>(Pos('RUN STATE [observable: controlled failure] '
       + 'sessions-root=' + Project + '/.lwpt/sessions exists=',
       DiagnosticText) > 0).ToBe(True);
-    Expect<Boolean>(Pos('FAIL alpha ', RunResult.Stdout) > 0).ToBe(True);
-    Expect<Boolean>(Pos('alpha-begin|alpha-end|', RunResult.Stdout)
+    Expect<Boolean>(Pos('FAIL alpha (log: ', RunResult.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('FAILED (fpc exit 17)', RunResult.Stdout)
       > Pos('FAIL alpha ', RunResult.Stdout)).ToBe(True);
+    Expect<Boolean>(Pos('alpha-begin|alpha-end|', RunResult.Stdout) = 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('cache miss:', RunResult.Stdout) = 0).ToBe(True);
     Expect<Boolean>(Pos('build entry "alpha" failed: FAILED (fpc exit 17)',
       RunResult.Stderr) > 0).ToBe(True);
-    Expect<Boolean>(Pos('summary: 0 built, 1 failed, 0 skipped; elapsed ',
+    Expect<Boolean>(Pos('RESULT FAIL (0 built, 1 failed, 0 skipped)',
       RunResult.Stdout) > 0).ToBe(True);
     LogPath := '';
     if FindFirst(Project + '/.lwpt/sessions/s-*', faDirectory,
