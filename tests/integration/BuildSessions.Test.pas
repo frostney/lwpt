@@ -1314,10 +1314,10 @@ begin
       .ToBe(True);
     Expect<Boolean>(Pos('START beta' + LineEnding, RunResult.Stdout) > 0)
       .ToBe(True);
-    Expect<Boolean>(Pos('PASS alpha -> build/alpha' + LineEnding,
-      RunResult.Stdout) > 0).ToBe(True);
-    Expect<Boolean>(Pos('PASS beta -> build/beta' + LineEnding,
-      RunResult.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('PASS alpha -> ' + ExpectedExe('build/alpha')
+      + LineEnding, RunResult.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('PASS beta -> ' + ExpectedExe('build/beta')
+      + LineEnding, RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('RESULT PASS (2 built, 0 failed, 0 skipped)',
       RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('alpha-begin|', RunResult.Stdout) = 0).ToBe(True);
