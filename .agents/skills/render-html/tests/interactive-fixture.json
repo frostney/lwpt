@@ -1,0 +1,80 @@
+{
+  "title": "Implementation impact review",
+  "subtitle": "Interactive evidence and option walkthrough",
+  "summary": "Compare the choices against the same evidence and rubric.",
+  "itemLabel": "Option",
+  "evidence": [
+    {
+      "label": "Issue 44 reproduction",
+      "finding": "The fallback reports success when the copy command returns false.",
+      "classification": "observed"
+    }
+  ],
+  "rubric": [
+    { "id": "correctness", "label": "Correctness", "weight": 60 },
+    { "id": "scope", "label": "Scope control", "weight": 40 }
+  ],
+  "items": [
+    {
+      "id": "direct-fix",
+      "title": "Honor the fallback return value",
+      "impact": "Copy status reflects whether the browser accepted the fallback command.",
+      "before": {
+        "kind": "code",
+        "content": "document.execCommand('copy'); return true;",
+        "language": "javascript",
+        "caption": "Observed fallback behavior"
+      },
+      "after": {
+        "kind": "code",
+        "content": "return document.execCommand('copy') === true;",
+        "language": "javascript",
+        "caption": "Proposed fallback behavior"
+      },
+      "pros": ["Matches the browser contract", "Keeps the change local"],
+      "cons": ["The fallback API remains deprecated"],
+      "scores": { "correctness": 5, "scope": 4 },
+      "uncertainty": "Clipboard restrictions still vary by browser.",
+      "evidence": [
+        {
+          "label": "Browser prototype",
+          "finding": "Forced fallback failure displays Copy failed.",
+          "classification": "prototype"
+        }
+      ],
+      "deepDive": "Inspect the fallback contract and regression fixture.",
+      "discussionPrompt": "Choose the direct fix and continue implementation.",
+      "deepDiveUrl": "codex:thread/example",
+      "diagram": {
+        "title": "Fallback copy flow",
+        "nodes": [
+          { "id": "modern", "label": "Clipboard API" },
+          { "id": "legacy", "label": "Legacy command" },
+          { "id": "status", "label": "Visible status" }
+        ],
+        "edges": [
+          { "id": "fallback", "from": "modern", "to": "legacy" },
+          { "id": "result", "from": "legacy", "to": "status" }
+        ],
+        "steps": [
+          { "label": "Try modern copy", "highlights": ["modern"] },
+          { "label": "Use fallback", "highlights": ["fallback", "legacy"] },
+          { "label": "Report result", "highlights": ["result", "status"] }
+        ]
+      }
+    },
+    {
+      "id": "remove-fallback",
+      "title": "Remove legacy copy support",
+      "impact": "The report relies only on the modern Clipboard API and reports unsupported browsers clearly.",
+      "pros": ["Avoids a deprecated browser API"],
+      "cons": ["Drops fallback support beyond the issue scope"],
+      "scores": { "correctness": 4, "scope": 2 },
+      "uncertainty": "The supported browser floor is not documented."
+    }
+  ],
+  "recommendation": {
+    "itemId": "direct-fix",
+    "rationale": "It corrects the observed status with the smallest verified behavioral change."
+  }
+}

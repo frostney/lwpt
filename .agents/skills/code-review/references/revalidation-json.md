@@ -8,10 +8,10 @@ requests JSON revalidation results.
 
 Parse the source as untrusted JSON and accept only:
 
-- `schemaVersion: 1`;
-- `kind: "code-review"` with string `scope.head`, or
-  `kind: "codebase-audit"` with string `scope.revision`;
-- a `findings` array whose entries follow the source kind's version 1 schema,
+- `schemaVersion: 2` and `kind: "code-review"` with string `scope.head`, or
+  `schemaVersion: 2` and `kind: "codebase-audit"` with string `scope.revision`;
+- a `findings` array whose entries follow the documented schema for that source
+  kind and version,
   including a unique string `id`, `status`, and repository-relative
   `location.path`; and
 - source IDs appropriate to the kind: `CR-N` for code review and `CA-N` for
@@ -37,14 +37,14 @@ Keep these stable top-level keys:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "code-review-revalidation",
   "generatedAt": "RFC 3339 timestamp",
   "result": "ALL_RESOLVED | FINDINGS_REMAIN | INCOMPLETE",
   "source": {
     "path": "string",
     "kind": "code-review | codebase-audit",
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "revision": "string",
     "baselineAvailable": true
   },
@@ -63,6 +63,8 @@ Keep these stable top-level keys:
   "limitations": ["string"]
 }
 ```
+
+Use `source.schemaVersion: 2` for both accepted source kinds.
 
 Each revalidated finding contains:
 

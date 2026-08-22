@@ -305,16 +305,6 @@ class GitHub:
         )
         return result["permission"]
 
-    def mark_ready(self, node_id: str) -> None:
-        mutation = """
-        mutation($id: ID!) {
-          markPullRequestReadyForReview(input: {pullRequestId: $id}) {
-            pullRequest { id isDraft }
-          }
-        }
-        """
-        self.graphql(mutation, {"id": node_id})
-
     def mark_draft(self, node_id: str) -> None:
         mutation = """
         mutation($id: ID!) {
@@ -562,6 +552,10 @@ class Controller:
         if MANAGED_LABEL not in label_names(pull):
             raise DeliveryError(f"pull request #{number} is not {MANAGED_LABEL}")
         self.require_delivery_success(number, expected_head)
+        if pull.get("draft"):
+            raise DeliveryError(
+                f"pull request #{number} must be marked ready before opening review"
+            )
         self.clear_readiness(number, (MERGE_READY_LABEL,))
         self.github.add_labels(number, [CI_READY_LABEL, REVIEW_READY_LABEL])
 
@@ -757,6 +751,8 @@ class Controller:
         self.require_same_repository(pull)
         if MANAGED_LABEL not in label_names(pull):
             raise DeliveryError(f"pull request #{number} is not {MANAGED_LABEL}")
+        if pull.get("draft"):
+            raise DeliveryError(f"pull request #{number} is still a draft")
         self.require_delivery_success(number, expected_head)
         if REVIEW_READY_LABEL not in label_names(pull):
             raise DeliveryError(f"pull request #{number} has not opened the review phase")
@@ -770,9 +766,6 @@ class Controller:
         self.github.add_labels(
             number, [CI_READY_LABEL, REVIEW_READY_LABEL, MERGE_READY_LABEL]
         )
-        topology = self.github.topology(number)
-        if topology["isDraft"]:
-            self.github.mark_ready(topology["id"])
 
     def reset(self, number: int, expected_head: str) -> None:
         pull = self.current_pull(number, expected_head)
@@ -800,7 +793,7 @@ class Controller:
                 ):
                     self.clear_readiness(number, (REVIEW_READY_LABEL, MERGE_READY_LABEL))
             if pull.get("draft"):
-                self.clear_readiness(number, (MERGE_READY_LABEL,))
+                self.clear_readiness(number, (REVIEW_READY_LABEL, MERGE_READY_LABEL))
 
     def fail_pending_head(self, number: int, head: str, title: str, summary: str) -> None:
         prefixes = (f"full-ci:v1:{number}:{head}:",)

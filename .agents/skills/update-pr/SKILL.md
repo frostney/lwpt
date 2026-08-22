@@ -20,7 +20,9 @@ When the current PR belongs to a native GitHub stack, read
 [../git-workflow/references/github-stacks.md](../git-workflow/references/github-stacks.md).
 
 1. Inspect repository state, recent commits, the remote default branch, and the
-   current PR.
+   current PR, including its `mergeable_state`: a dirty (unmergeable) PR gets no
+   pull_request workflow runs whatsoever, so missing CI is resolved by merging
+   the base per step 3, never by retriggers.
 2. Stop if on the base branch or no open PR exists; report the required next
    workflow.
 3. When an ordinary branch is behind the remote base, merge it into the branch.

@@ -6,14 +6,16 @@ description: >-
   report, PR board, review-readiness board, or local-work overview.
 license: Unlicense OR MIT
 compatibility: >-
-  Requires git plus authenticated read-only forge access; GitHub repositories
-  use gh and network access. Rich board rendering is optional.
+  Requires git plus authenticated read-only access to the Git hosting service;
+  GitHub repositories use gh and network access. Rich board rendering is
+  optional.
 ---
 
 # Status report
 
 Return one snapshot-dated status board for the current repository and all of its
-worktrees. Reconcile local and forge state before classifying anything.
+worktrees. Reconcile local state with current issue, pull-request, review, and CI
+state before classifying anything.
 
 ## Read-only contract
 
@@ -33,8 +35,8 @@ worktrees. Reconcile local and forge state before classifying anything.
 
 1. Resolve the repository, remote default branch, applicable instructions,
    review policy, branch protection, and merge requirements without changing
-   local state. Distinguish live forge data from possibly stale remote-tracking
-   refs.
+   local state. Distinguish live issue, pull-request, review, and CI data from
+   possibly stale remote-tracking refs.
 2. Paginate every open PR and read its URL, author, base and head refs, head
    commit, draft and merge states, update time, review requests and decisions,
    commit statuses, and check runs.
@@ -52,8 +54,8 @@ worktrees. Reconcile local and forge state before classifying anything.
 
 When one read interface is unavailable or permission-limited, try another
 configured authenticated read-only interface before declaring an evidence gap.
-Current official forge and reviewer semantics override enumerated status names
-when an API evolves; preserve the completion gates rather than guessing.
+Current official Git hosting and reviewer semantics override enumerated status
+names when an API evolves; preserve the completion gates rather than guessing.
 
 ## Classify once
 
@@ -96,7 +98,7 @@ policy, never reinterpret a visible failure as green.
 - For every active automation, include its current-head summary or walkthrough
   status and every unresolved inline or top-level nitpick. Apply the same
   evidence-based semantics without hardcoding a provider.
-- Do not infer that source changes resolved a finding. Use the current forge
+- Do not infer that source changes resolved a finding. Use the current review
   resolution and verdict evidence; expose uncertainty as a blocker.
 
 ## Summarize local work
