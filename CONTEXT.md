@@ -7,7 +7,7 @@ LWPT is a single-binary Pascal toolkit driven by a single TOML manifest. The too
 ### Manifest, lockfile, cfg
 
 **Manifest**:
-The single source of truth for what a project declares — its name, version, units, dependencies, build targets, formatter scope, and toolkit-state overrides. Always lives at `lwpt.toml` (derived from `PROGRAM_NAME`); never anywhere else.
+The single source of truth for what a project declares — its name, version, units, dependencies, build entries, formatter scope, and toolkit-state overrides. Always lives at `lwpt.toml` (derived from `PROGRAM_NAME`); never anywhere else.
 *Avoid*: `package.json`, `Cargo.toml`, `pyproject.toml`, "project file", "config file". The manifest is hand-edited; everything else on disk is generated from it.
 
 **Lockfile**:

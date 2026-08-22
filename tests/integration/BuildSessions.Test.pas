@@ -1307,7 +1307,7 @@ begin
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
     Expect<Integer>(RunResult.ProcessExitCode).ToBe(0);
     Expect<Integer>(RunResult.ProcessExitStatus).ToBe(0);
-    Expect<Boolean>(Pos('build targets: alpha, beta', RunResult.Stdout) > 0)
+    Expect<Boolean>(Pos('build entries: alpha, beta', RunResult.Stdout) > 0)
       .ToBe(True);
     Expect<Boolean>(Pos('build mode: dev', RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('START alpha' + LineEnding, RunResult.Stdout) > 0)
@@ -1342,7 +1342,7 @@ begin
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
     Expect<Integer>(RunResult.ProcessExitCode).ToBe(0);
     Expect<Integer>(RunResult.ProcessExitStatus).ToBe(0);
-    Expect<Boolean>(Pos('build targets: alpha, beta', RunResult.Stdout) > 0)
+    Expect<Boolean>(Pos('build entries: alpha, beta', RunResult.Stdout) > 0)
       .ToBe(True);
     Expect<Boolean>(Pos('build mode: dev', RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('discovered 2 build entry(s)', RunResult.Stdout) > 0)

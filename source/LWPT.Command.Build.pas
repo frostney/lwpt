@@ -1637,7 +1637,7 @@ begin
       if ModeStr <> '' then ModeStr := ModeStr + ', ';
       ModeStr := ModeStr + Man.BuildEntries[i].Name;
     end;
-  WriteLn('build targets: ', ModeStr);
+  WriteLn('build entries: ', ModeStr);
   if AVerbose then
     WriteLn('discovered ', SelectedCount, ' build entry(s)');
 

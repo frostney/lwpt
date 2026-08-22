@@ -289,7 +289,7 @@ begin
   R := RunLwpt(['build', 'hello', '--mode', 'release'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/hello'))).ToBe(True);
-  Expect<Boolean>(Pos('build targets: hello', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build entries: hello', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('build mode: release', R.Stdout) > 0).ToBe(True);
 end;
 
@@ -302,7 +302,7 @@ begin
   R := RunLwpt(['build', 'hello', '--mode=release'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/hello'))).ToBe(True);
-  Expect<Boolean>(Pos('build targets: hello', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build entries: hello', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('build mode: release', R.Stdout) > 0).ToBe(True);
 end;
 

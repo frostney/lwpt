@@ -33,7 +33,7 @@ intermediary issue merely to satisfy process.
 - The important design questions have been grilled one decision at a time, and
   the chosen behavior is recorded.
 - Acceptance criteria describe observable success and failure behavior.
-- Required test tiers and cross-platform checks are identified.
+- Required test groups and cross-platform checks are identified.
 - Dependencies, migration or compatibility expectations, and unresolved
   decisions are explicit.
 - The delivery plan records ordinary versus `delivery:managed` routing,

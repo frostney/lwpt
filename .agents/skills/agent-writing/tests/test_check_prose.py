@@ -48,9 +48,9 @@ class CheckProseTests(unittest.TestCase):
 
         self.assertEqual(findings, [])
 
-    def test_repository_markdown_passes(self):
-        repository_root = Path(__file__).parents[2]
-        findings = CHECK_PROSE.check_paths(CHECK_PROSE.markdown_paths(repository_root))
+    def test_skill_markdown_passes(self):
+        skill_root = Path(__file__).parents[1]
+        findings = CHECK_PROSE.check_paths(sorted(skill_root.rglob("*.md")))
 
         self.assertEqual(findings, [])
 
