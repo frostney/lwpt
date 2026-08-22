@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect, wait for, reply to, and resolve GitHub review activity."""
+"""Inspect, wait for, reply to, and resolve pull-request feedback."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ query($owner:String!,$name:String!,$number:Int!){
     pullRequest(number:$number){
       headRefOid
       comments(first:100){nodes{id databaseId body createdAt author{login} authorAssociation} pageInfo{hasNextPage}}
-      reviews(first:100){nodes{author{login} authorAssociation state body submittedAt commit{oid}} pageInfo{hasNextPage}}
+      reviews(first:100){nodes{id databaseId author{login} authorAssociation state body submittedAt commit{oid}} pageInfo{hasNextPage}}
       reviewThreads(first:100){nodes{id isResolved comments(first:100){nodes{
         id databaseId body createdAt author{login} authorAssociation replyTo{id}
       } pageInfo{hasNextPage}}} pageInfo{hasNextPage}}
@@ -147,10 +147,10 @@ def review_snapshot(
     }
     all_actors = set().union(*actor_sets.values()) if actor_sets else set()
     for thread in threads_connection.get("nodes") or []:
-        comments_connection = thread.get("comments") or {}
-        if comments_connection.get("pageInfo", {}).get("hasNextPage"):
+        thread_comments_connection = thread.get("comments") or {}
+        if thread_comments_connection.get("pageInfo", {}).get("hasNextPage"):
             raise WaitError(f"review thread {thread.get('id')} has more than 100 comments")
-        comments = comments_connection.get("nodes") or []
+        comments = thread_comments_connection.get("nodes") or []
         is_resolved = bool(thread.get("isResolved"))
         if not is_resolved:
             unresolved += 1
@@ -158,6 +158,14 @@ def review_snapshot(
             comment for comment in comments
             if normalize_login((comment.get("author") or {}).get("login")) in all_actors
         ]
+        automation_ids = sorted(
+            automation_id
+            for automation_id, actors in actor_sets.items()
+            if any(
+                normalize_login((comment.get("author") or {}).get("login")) in actors
+                for comment in comments
+            )
+        )
         unanswered_comments = [
             finding for finding in automation_comments
             if not any(
@@ -174,6 +182,7 @@ def review_snapshot(
             "id": thread.get("id"),
             "resolved": is_resolved,
             "automation": bool(automation_comments),
+            "automationIds": automation_ids,
             "maintainerReply": has_maintainer_reply,
             "comments": [
                 ({
@@ -238,7 +247,14 @@ def review_snapshot(
             "terminal": check_terminal or review_terminal,
             "checks": matching_checks,
             "reviews": [
-                ({"author": (review.get("author") or {}).get("login"), "state": review.get("state"), "submittedAt": review.get("submittedAt")}
+                ({
+                    "id": review.get("databaseId"),
+                    "nodeId": review.get("id"),
+                    "author": (review.get("author") or {}).get("login"),
+                    "state": review.get("state"),
+                    "submittedAt": review.get("submittedAt"),
+                    "hasBody": bool(str(review.get("body") or "").strip()),
+                }
                 | (
                     {"body": review.get("body")}
                     if include_bodies
@@ -257,17 +273,62 @@ def review_snapshot(
             "nodeId": comment.get("id"),
             "author": (comment.get("author") or {}).get("login"),
             "createdAt": comment.get("createdAt"),
+            "automationIds": sorted(
+                automation_id
+                for automation_id, actors in actor_sets.items()
+                if author in actors
+            ),
+            "hasBody": bool(str(comment.get("body") or "").strip()),
         }
         if include_bodies:
             item["body"] = comment.get("body")
         else:
             item["bodyDigest"] = stable_digest(str(comment.get("body") or ""))
         top_level.append(item)
+
+    finding_surfaces = []
+    for thread in threads:
+        if thread["resolved"] and (
+            not thread["automation"] or thread["maintainerReply"]
+        ):
+            continue
+        finding_surfaces.append({
+            "kind": "inline-thread",
+            "id": thread["id"],
+            "headBinding": "current-thread-state",
+            "automationIds": thread["automationIds"],
+            "resolved": thread["resolved"],
+            "maintainerReply": thread["maintainerReply"],
+            "comments": thread["comments"],
+        })
+    for automation in automation_states:
+        for review in automation["reviews"]:
+            if not review["hasBody"]:
+                continue
+            finding_surfaces.append({
+                "kind": "review",
+                "id": review["nodeId"],
+                "headBinding": "exact-head",
+                "automationIds": [automation["id"]],
+                "review": review,
+            })
+    for comment in top_level:
+        if not comment["hasBody"]:
+            continue
+        finding_surfaces.append({
+            "kind": "top-level-comment",
+            "id": comment["nodeId"],
+            "headBinding": "pull-request",
+            "automationIds": comment["automationIds"],
+            "comment": comment,
+        })
     return {
         "head": head,
         "automations": automation_states,
         "unresolvedThreads": unresolved,
         "unansweredAutomationThreads": unanswered,
+        "findingSurfaceCount": len(finding_surfaces),
+        "findingSurfaces": finding_surfaces,
         "threads": threads,
         "topLevelAutomationComments": top_level,
     }
@@ -276,13 +337,21 @@ def review_snapshot(
 def classify(expected_head: str, observation: dict[str, Any]) -> tuple[str, str]:
     if observation.get("head") != expected_head:
         return "invalidated", f"expected head {expected_head}, observed {observation.get('head')}"
+    automations_terminal = all(
+        item.get("terminal") for item in observation.get("automations", [])
+    )
+    if automations_terminal and observation.get("findingSurfaceCount", 0) > 0:
+        return (
+            "judgment-required",
+            "automation completed; finding surfaces require exact-head classification",
+        )
     if (
-        all(item.get("terminal") for item in observation.get("automations", []))
+        automations_terminal
         and observation.get("unresolvedThreads") == 0
         and observation.get("unansweredAutomationThreads") == 0
     ):
-        return "satisfied", "review convergence reached"
-    return "waiting", "review convergence is pending"
+        return "satisfied", "review gates satisfied"
+    return "waiting", "review gates are pending"
 
 
 def review_transition_key(observation: dict[str, Any]) -> dict[str, Any]:
