@@ -36,25 +36,29 @@ type
     FLastHeartbeatAt: QWord;
     FSession: TLWPTBuildSession;
     FStyle: TLWPTProgressStyle;
+    FVerbose: Boolean;
     function FindJob(const AIdentity: string): TObject;
     function JobDisplayName(const AIdentity: string): string;
     procedure WriteCapturedOutput(const AOutput: string);
   public
     constructor Create(const ASession: TLWPTBuildSession;
-      const AStyle: TLWPTProgressStyle);
+      const AStyle: TLWPTProgressStyle;
+      const AVerbose: Boolean = False);
     destructor Destroy; override;
     procedure RegisterJob(const AIdentity, ADisplayName: string);
     procedure MarkJobInactive(const AIdentity: string);
     procedure StartHeartbeatClock(const AInvocationStartedAt,
       ALastHeartbeatAt: QWord);
     function HeartbeatDue(const ANow: QWord): Boolean;
-    function ActiveJobSummary(const ANow: QWord): string;
+    function ActiveJobSummary(const ANow: QWord;
+      const AIncludeElapsed: Boolean = True): string;
     procedure ReportHeartbeat(const AEvent: TLWPTHeartbeatEvent);
     procedure ReportWaitHeartbeat(const AEvent: TLWPTHeartbeatEvent;
       const AMessage: string; const AObservedAt: QWord);
     procedure ReportJob(const AEvent: TLWPTJobEvent;
       const AOutput, AErrorMessage: string; const AVerbose: Boolean;
-      const AStartedAt: QWord = 0);
+      const AStartedAt: QWord = 0;
+      const AFailureOutput: string = '');
     property HeartbeatIntervalMilliseconds: QWord read FHeartbeatInterval;
   end;
 
@@ -106,11 +110,12 @@ begin
 end;
 
 constructor TLWPTProgressReporter.Create(const ASession: TLWPTBuildSession;
-  const AStyle: TLWPTProgressStyle);
+  const AStyle: TLWPTProgressStyle; const AVerbose: Boolean);
 begin
   inherited Create;
   FSession := ASession;
   FStyle := AStyle;
+  FVerbose := AVerbose;
   FHeartbeatInterval := ObservabilityHeartbeatIntervalMilliseconds;
   FJobs := TList.Create;
 end;
@@ -183,7 +188,7 @@ begin
 end;
 
 function TLWPTProgressReporter.ActiveJobSummary(
-  const ANow: QWord): string;
+  const ANow: QWord; const AIncludeElapsed: Boolean): string;
 var
   Index: Integer;
   Job: TLWPTProgressJob;
@@ -196,8 +201,8 @@ begin
     if Result <> '' then Result := Result + ', ';
     Result := Result + Job.DisplayName;
     if Job.StartedAt = 0 then Result := Result + ' (queued)'
-    else Result := Result + ' (' + FormatElapsedMilliseconds(
-      ANow - Job.StartedAt) + ')';
+    else if AIncludeElapsed then Result := Result + ' ('
+      + FormatElapsedMilliseconds(ANow - Job.StartedAt) + ')';
   end;
 end;
 
@@ -207,9 +212,13 @@ var
   ObservedAt: QWord;
 begin
   ObservedAt := FHeartbeatStartedAt + AEvent.ElapsedMilliseconds;
-  WriteLn(ObservabilityHeartbeatEvent, AEvent.Source, ' elapsed ',
-    FormatElapsedMilliseconds(AEvent.ElapsedMilliseconds), '; active: ',
-    ActiveJobSummary(ObservedAt));
+  if (FStyle = lpsBuild) and not FVerbose then
+    WriteLn(ObservabilityHeartbeatEvent, AEvent.Source, '; active: ',
+      ActiveJobSummary(ObservedAt, False))
+  else
+    WriteLn(ObservabilityHeartbeatEvent, AEvent.Source, ' elapsed ',
+      FormatElapsedMilliseconds(AEvent.ElapsedMilliseconds), '; active: ',
+      ActiveJobSummary(ObservedAt));
   FLastHeartbeatAt := ObservedAt;
 end;
 
@@ -217,8 +226,11 @@ procedure TLWPTProgressReporter.ReportWaitHeartbeat(
   const AEvent: TLWPTHeartbeatEvent; const AMessage: string;
   const AObservedAt: QWord);
 begin
-  WriteLn(ObservabilityHeartbeatEvent, AMessage, ' ',
-    FormatElapsedMilliseconds(AEvent.ElapsedMilliseconds));
+  if (FStyle = lpsBuild) and not FVerbose then
+    WriteLn(ObservabilityHeartbeatEvent, AMessage)
+  else
+    WriteLn(ObservabilityHeartbeatEvent, AMessage, ' ',
+      FormatElapsedMilliseconds(AEvent.ElapsedMilliseconds));
   FLastHeartbeatAt := AObservedAt;
 end;
 
@@ -236,9 +248,9 @@ end;
 
 procedure TLWPTProgressReporter.ReportJob(const AEvent: TLWPTJobEvent;
   const AOutput, AErrorMessage: string; const AVerbose: Boolean;
-  const AStartedAt: QWord);
+  const AStartedAt: QWord; const AFailureOutput: string);
 var
-  DisplayName, LogOutput, Metadata, TerminalLine: string;
+  DisplayName, LogOutput, Metadata, ReplayOutput, TerminalLine: string;
   Job: TLWPTProgressJob;
 begin
   DisplayName := JobDisplayName(AEvent.Source);
@@ -251,7 +263,9 @@ begin
       Job.Active := True;
     end;
     FSession.WriteJobLog(AEvent.Source, '');
-    if AEvent.Detail = '' then
+    if (FStyle = lpsBuild) and not FVerbose then
+      WriteLn(ObservabilityStartEvent, DisplayName)
+    else if AEvent.Detail = '' then
       WriteLn(ObservabilityStartEvent, DisplayName, ' (log: ',
         AEvent.LogReference, ')')
     else
@@ -282,29 +296,62 @@ begin
     + '; log: ' + AEvent.LogReference;
   case AEvent.State of
     ojsPassed:
-      if (FStyle = lpsBuild) and (AEvent.Detail <> '') then
+      if (FStyle = lpsBuild) and not FVerbose then
+      begin
+        if AEvent.Detail <> '' then
+          WriteLn(ObservabilityPassEvent, DisplayName, ' -> ', AEvent.Detail)
+        else
+          WriteLn(ObservabilityPassEvent, DisplayName);
+      end
+      else if (FStyle = lpsBuild) and (AEvent.Detail <> '') then
         WriteLn(ObservabilityPassEvent, DisplayName, ' -> ', AEvent.Detail,
           ' (', Metadata, ')')
       else
         WriteLn(ObservabilityPassEvent, DisplayName, ' (', Metadata, ')');
     ojsFailed:
       begin
-        if AEvent.Detail <> '' then Metadata := AEvent.Detail + '; ' + Metadata;
-        TerminalLine := ObservabilityFailEvent + DisplayName + ' ('
-          + Metadata + ')';
+        if (FStyle = lpsBuild) and not FVerbose then
+          TerminalLine := ObservabilityFailEvent + DisplayName + ' (log: '
+            + AEvent.LogReference + ')'
+        else
+        begin
+          if AEvent.Detail <> '' then
+            Metadata := AEvent.Detail + '; ' + Metadata;
+          TerminalLine := ObservabilityFailEvent + DisplayName + ' ('
+            + Metadata + ')';
+        end;
         if SilentOutputActive then WriteCommandResultLine(TerminalLine)
         else WriteLn(TerminalLine);
       end;
     ojsSkipped:
       begin
-        if AEvent.Detail <> '' then Metadata := AEvent.Detail + '; ' + Metadata;
-        WriteLn(ObservabilitySkipEvent, DisplayName, ' (', Metadata, ')');
+        if (FStyle = lpsBuild) and not FVerbose then
+        begin
+          if AEvent.Detail <> '' then
+            WriteLn(ObservabilitySkipEvent, DisplayName, ' (',
+              AEvent.Detail, ')')
+          else
+            WriteLn(ObservabilitySkipEvent, DisplayName);
+        end
+        else
+        begin
+          if AEvent.Detail <> '' then
+            Metadata := AEvent.Detail + '; ' + Metadata;
+          WriteLn(ObservabilitySkipEvent, DisplayName, ' (', Metadata, ')');
+        end;
       end;
   end;
-  if (AEvent.State = ojsFailed)
-     or (AVerbose and (AEvent.State = ojsPassed)) then
+  ReplayOutput := LogOutput;
+  if (FStyle = lpsBuild) and not FVerbose and not SilentOutputActive then
+  begin
+    ReplayOutput := AFailureOutput;
+    if (ReplayOutput = '') and (AErrorMessage <> '') then
+      ReplayOutput := AErrorMessage + LineEnding;
+  end;
+  if AEvent.State = ojsFailed then WriteCapturedOutput(ReplayOutput)
+  else if AVerbose and (AEvent.State = ojsPassed) then
     WriteCapturedOutput(LogOutput);
-  if (AErrorMessage <> '') and (Pos(AErrorMessage, LogOutput) = 0) then
+  if (AErrorMessage <> '') and (Pos(AErrorMessage, ReplayOutput) = 0) then
     WriteLn('  error: ', AErrorMessage);
   if (FStyle = lpsBuild) and (AErrorMessage <> '') then
     case AEvent.State of
