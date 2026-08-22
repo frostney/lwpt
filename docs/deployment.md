@@ -15,7 +15,7 @@ Platform support tiers, the per-platform TLS backend story, the release process,
 
 | Tier | Targets | What "supported" means |
 |------|---------|------------------------|
-| **Tier 1** | `x86_64-linux`, `aarch64-linux`, `x86_64-win64`, `aarch64-darwin`, `x86_64-darwin` | Full LWPT self-test on every push to `main` (`ci.yml`'s test matrix runs `lwpt install / format --check / test / test --tier=e2e` natively on each). Pre-built binaries published per release tag. |
+| **Tier 1** | `x86_64-linux`, `aarch64-linux`, `x86_64-win64`, `aarch64-darwin`, `x86_64-darwin` | Full LWPT self-test on every push to `main` (`ci.yml` runs the repository's ordinary and E2E path selectors natively on each without repeating programs). Pre-built binaries published per release tag. |
 | **Tier 1 (build + smoke)** | `i386-win32` | Cross-built + tested on a `windows-latest` runner alongside `x86_64-win64`. The 32-bit binary is published per release. |
 | **Tier 2** | Other Win64 SKUs (server, arm64) | CI is x86_64 only at the Windows runner level; arm64-windows would need separate runners. |
 | **Tier 3** | FreeBSD, OpenBSD, Linux ARM32, NetBSD, others | Documented as "should work, no automation". Issues accepted but not blocking. No published binaries. PRs to elevate to Tier 1 welcome. |

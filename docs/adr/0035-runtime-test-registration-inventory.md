@@ -8,8 +8,8 @@ by hand. Source-text counting cannot distinguish active platform branches,
 while reconstructing totals from CI logs made documentation drift expensive to
 detect and easy to misdiagnose.
 
-The inventory must cover discovered unit, integration, and E2E programs without
-running network-touching bodies. It must also distinguish the native Darwin,
+The inventory must cover every discovered test program without
+running test bodies. It must also distinguish the native Darwin,
 Linux, win64, and win32 registrations exercised by CI.
 
 ## Decision
@@ -22,8 +22,8 @@ bodies; in verification mode it emits the same record and then runs normally.
 
 `lwpt test --inventory [selector...]` discovers and compiles the selected test
 programs, suppresses lifecycle hooks, requests inventory-only execution, and
-prints one deterministic JSON value. E2E programs are enumerated regardless of
-the ordinary tier because their bodies never run.
+prints one deterministic JSON value. Every selected program is enumerated
+because its body never runs.
 
 A project opts into continuous verification by committing
 `tests/test-inventory.tsv`. Rules select by exact `os/architecture`, OS wildcard,
@@ -60,3 +60,6 @@ extra test-body or network pass is introduced.
   remain backward-compatible or receive an explicit schema/version transition.
 - Projects without `tests/test-inventory.tsv` retain their existing test
   behavior and pay no verification requirement.
+- [ADR-0042](./0042-keep-test-grouping-in-userland.md) removed the original
+  path-derived tier field. Runtime JSON and the committed TSV use schema v2;
+  both record only path, platform, suite count, and case count.

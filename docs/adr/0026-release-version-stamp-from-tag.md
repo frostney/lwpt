@@ -31,7 +31,7 @@ Stamp-from-tag is only trustworthy if it is checked. Three independent layers, e
 
 1. **Build-job native `--version` check (pre-publish gate).** `release.yml`'s build job runs the freshly cross-built *native* binary (`aarch64-darwin` on the macOS build host) and asserts `lwpt --version == lwpt <tag>`. `Version.inc` is shared across all matrix targets, so a correct native stamp proves it for the whole matrix. Runs **before** publish — a stamping failure fails the release with no artefact shipped.
 2. **Post-publish install-smoke job.** Runs the real `install.sh` against the just-published tag (explicit `LWPT_VERSION`, so it covers prerelease-flagged `rc.x` too) and asserts the *installed* binary reports the tag. Validates what the build job can't: the uploaded assets are downloadable, correctly named (the macOS `.zip`-vs-`.tar.gz` class, PR #8), and checksum-valid.
-3. **Everyday install-script e2e test.** Resolves non-prerelease "latest" + derives the expected (above). Runs on every push to `main` (the e2e tier), catching `install.sh` regressions *between* releases — the layers (1) and (2) only run at tag-cut time.
+3. **Everyday install-script E2E test.** Resolves non-prerelease "latest" + derives the expected (above). Runs on every push to `main` through the repository's E2E-path route, catching `install.sh` regressions *between* releases — the layers (1) and (2) only run at tag-cut time.
 
 ## Consequences
 

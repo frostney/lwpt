@@ -1,7 +1,7 @@
 { TestFlags.Test — pins root [test].flags compiler-request wiring.
 
   The tests cross the real CLI boundary against scratch projects. They prove
-  flags reach every selected test tier, remain subject to compiler-driver
+  flags reach every selected test program, remain subject to compiler-driver
   confinement, and cannot leak into direct lifecycle commands. }
 
 program TestFlags.Test;
@@ -21,18 +21,18 @@ type
   private
     FScratch: string;
     procedure SetupScratchProject(const AFlags, AHookSection: string;
-      const AIncludeE2ETest: Boolean);
+      const AIncludeNestedTest: Boolean);
   protected
     procedure BeforeAll; override;
   public
     procedure SetupTests; override;
-    procedure TestFlagsReachDefaultAndE2ETierCompiles;
+    procedure TestFlagsReachAllSelectedCompiles;
     procedure TestManagedOutputArgumentIsRejected;
     procedure TestDirectPretestCommandDoesNotInheritFlags;
   end;
 
 procedure TTestFlagsIntegration.SetupScratchProject(const AFlags,
-  AHookSection: string; const AIncludeE2ETest: Boolean);
+  AHookSection: string; const AIncludeNestedTest: Boolean);
 const
   FLAG_TEST_SOURCE =
     'program FlagTest;'#10 +
@@ -55,10 +55,11 @@ begin
     'flags = [' + AFlags + ']'#10 +
     AHookSection);
   WriteTextFile(FScratch + '/source/DefaultFlag.Test.pas', FLAG_TEST_SOURCE);
-  if AIncludeE2ETest then
+  if AIncludeNestedTest then
   begin
-    ForceDirectories(FScratch + '/tests/e2e');
-    WriteTextFile(FScratch + '/tests/e2e/E2EFlag.Test.pas', FLAG_TEST_SOURCE);
+    ForceDirectories(FScratch + '/tests/custom');
+    WriteTextFile(FScratch + '/tests/custom/NestedFlag.Test.pas',
+      FLAG_TEST_SOURCE);
   end;
 end;
 
@@ -68,19 +69,15 @@ begin
   SetLwptBinaryPath(ExpandFileName('build/lwpt'));
 end;
 
-procedure TTestFlagsIntegration.TestFlagsReachDefaultAndE2ETierCompiles;
+procedure TTestFlagsIntegration.TestFlagsReachAllSelectedCompiles;
 var
-  DefaultRun, E2ERun: TLwptResult;
+  Run: TLwptResult;
 begin
   SetupScratchProject('"-dISSUE172_FLAG"', '', True);
 
-  DefaultRun := RunLwpt(['test', '--jobs=1'], FScratch);
-  DumpRunFailure('default-tier test flags', DefaultRun, 0);
-  Expect<Integer>(DefaultRun.ExitCode).ToBe(0);
-
-  E2ERun := RunLwpt(['test', '--tier=e2e', '--jobs=1'], FScratch);
-  DumpRunFailure('e2e-tier test flags', E2ERun, 0);
-  Expect<Integer>(E2ERun.ExitCode).ToBe(0);
+  Run := RunLwpt(['test', '--jobs=1'], FScratch);
+  DumpRunFailure('test flags on complete discovery', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
 end;
 
 procedure TTestFlagsIntegration.TestManagedOutputArgumentIsRejected;
@@ -134,8 +131,8 @@ end;
 
 procedure TTestFlagsIntegration.SetupTests;
 begin
-  Test('[test] flags reach default and e2e test compiles',
-    TestFlagsReachDefaultAndE2ETierCompiles);
+  Test('[test] flags reach every selected test compile',
+    TestFlagsReachAllSelectedCompiles);
   Test('[test] flags reject LWPT-managed output arguments',
     TestManagedOutputArgumentIsRejected);
   Test('[test] flags do not alter direct pretest command arguments',

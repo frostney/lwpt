@@ -12,9 +12,9 @@
     connections.
 
   Skip semantics:
-    LWPT_SKIP_NETWORK=1 → all tests in this suite count as pass with
+    LWPT_ENABLE_NETWORK unset or not 1 → all tests in this suite count as pass with
     a "skipped" log line, exit code 0. The CI matrix runs the e2e
-    tier with LWPT_SKIP_NETWORK=1 on jobs without internet access.
+    selected E2E paths with network disabled on jobs without internet access.
 
     Additionally, a clean connect/DNS failure to the host at install
     time (IsNetworkUnavailable) flips the suite to skip — transient
@@ -102,7 +102,7 @@ begin
 
   if FSkipped then
   begin
-    WriteLn('  [skip] LWPT_SKIP_NETWORK=1 set; live-network tests skipped');
+    WriteLn('  [skip] LWPT_ENABLE_NETWORK=1 not set; live-network tests skipped');
     Exit;
   end;
 

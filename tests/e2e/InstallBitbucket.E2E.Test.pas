@@ -16,7 +16,7 @@
     (e.g. `atlassian-atlaskit-d7ac1acad54e/`); StripFirstComponent
     handles whatever the top dir is.
 
-  Skip semantics: LWPT_SKIP_NETWORK=1, OR a clean connect/DNS failure
+  Skip semantics: LWPT_ENABLE_NETWORK is not 1, OR a clean connect/DNS failure
   to the host at install time (IsNetworkUnavailable — transient
   third-party downtime, not an LWPT defect), → tests pass with a "skipped"
   log line. A content/hash/parse failure still fails hard. See docs/ci.md. }
@@ -99,7 +99,7 @@ begin
 
   if FSkipped then
   begin
-    WriteLn('  [skip] LWPT_SKIP_NETWORK=1 set; live-network tests skipped');
+    WriteLn('  [skip] LWPT_ENABLE_NETWORK=1 not set; live-network tests skipped');
     Exit;
   end;
 

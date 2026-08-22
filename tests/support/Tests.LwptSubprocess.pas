@@ -1,12 +1,12 @@
 { Tests.LwptSubprocess — spawn ./build/lwpt as a subprocess and capture
   exit code, stdout, stderr.
 
-  E2E tests need this because the whole point of the tier is to test
-  the binary as users invoke it: argv parsing through the real CLI
+  Repository-owned E2E programs need this to test the binary as users invoke
+  it: argv parsing through the real CLI
   layer, exit codes the shell sees, stdout/stderr the user sees, and
   on-disk side effects in a real CWD. Tests that `uses LWPT.Core`
   link the library and skip the binary surface entirely — which is
-  what Unit + Integration are for.
+  what LWPT's unit and integration groups are for.
 
   Design choices:
 
@@ -18,7 +18,7 @@
       adds or overrides individual variables for that subprocess
       only.
     - cwd defaults to the current directory; AInDir overrides for
-      per-test scratch dirs (matches the integration-tier pattern
+      per-test scratch dirs (matches the integration-test pattern
       from InstallLocalDiamond.Test.pas).
     - The binary path is configurable via LwptBinaryPath but defaults
       to ./build/lwpt (resolved relative to the test's CWD, which
@@ -90,9 +90,9 @@ procedure ConfigureProcessEnvironment(const AProcess: TProcess;
 procedure DumpRunFailure(const ALabel: string; const ARun: TLwptResult;
   const AExpectedExit: Integer; const ADiagnostics: TStrings = nil);
 
-{ Quick helper for "is the env saying skip network?". E2E tests that
-  touch the live internet should consult this and self-skip via a
-  WriteLn + early-return. }
+{ LWPT's repository policy makes live network access opt-in. Tests that
+  touch the live internet should consult this and self-skip unless their
+  userland route explicitly enables network access. }
 function SkipNetworkTests: Boolean;
 
 { Did a non-zero `lwpt` result fail purely because the network / host
@@ -154,7 +154,7 @@ end;
 
 function SkipNetworkTests: Boolean;
 begin
-  Result := GetEnvironmentVariable('LWPT_SKIP_NETWORK') = '1';
+  Result := GetEnvironmentVariable('LWPT_ENABLE_NETWORK') <> '1';
 end;
 
 function IsNetworkUnavailable(const AResult: TLwptResult): Boolean;

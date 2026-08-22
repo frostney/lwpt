@@ -370,32 +370,16 @@ end;
 function HandleTest(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  IncludeE2E, Inventory, UseCache, Verbose : Boolean;
-  TierVal : string;
+  Inventory, UseCache, Verbose : Boolean;
   Jobs, Bail, i : Integer;
 begin
-  IncludeE2E := False;
   Inventory := False;
   UseCache := True;
   Verbose := False;
   Jobs := 0;
   Bail := -1;
   for i := 0 to High(AOptions) do
-    if SameText(AOptions[i].LongName, 'tier')
-       and (AOptions[i] is TStringOption) then
-    begin
-      TierVal := LowerCase(
-        TStringOption(AOptions[i]).ValueOr('default'));
-      if TierVal = 'e2e' then
-        IncludeE2E := True
-      else if TierVal <> 'default' then
-      begin
-        WriteLn(ErrOutput, ErrPrefix('test'),
-          '--tier must be "default" or "e2e", got "', TierVal, '"');
-        Exit(1);
-      end;
-    end
-    else if SameText(AOptions[i].LongName, 'verbose')
+    if SameText(AOptions[i].LongName, 'verbose')
        and AOptions[i].Present then
       Verbose := True
     else if SameText(AOptions[i].LongName, 'inventory')
@@ -428,7 +412,7 @@ begin
     end;
   try
     InstallProcessTreeSignalForwarding;
-    Result := CmdTest(MANIFEST_FILE, IncludeE2E, Jobs, Bail, Verbose, Inventory,
+    Result := CmdTest(MANIFEST_FILE, Jobs, Bail, Verbose, Inventory,
       APositionals, UseCache);
   except
     on E: Exception do
@@ -750,22 +734,20 @@ begin
       'Report manifest-scoped Pascal token clones', '[--json]',
       @HandleDuplication, DuplicationOpts));
 
-    SetLength(TestOpts, 6);
-    TestOpts[0] := TStringOption.Create('tier',
-      'Test tier to include: default (unit + integration) or e2e (adds network-touching tier)');
-    TestOpts[1] := TIntegerOption.Create('jobs',
+    SetLength(TestOpts, 5);
+    TestOpts[0] := TIntegerOption.Create('jobs',
       'Maximum concurrent test programs (default: shared machine budget)');
-    TestOpts[2] := TIntegerOption.Create('bail',
+    TestOpts[1] := TIntegerOption.Create('bail',
       'Stop after N compile or runtime failures; 0 runs the full queue');
-    TestOpts[3] := TFlagOption.Create('verbose',
+    TestOpts[2] := TFlagOption.Create('verbose',
       'Replay successful test logs');
-    TestOpts[4] := TFlagOption.Create('inventory',
+    TestOpts[3] := TFlagOption.Create('inventory',
       'Emit registered suites and cases as deterministic JSON without running tests');
-    TestOpts[5] := TFlagOption.Create('no-cache',
+    TestOpts[4] := TFlagOption.Create('no-cache',
       'Compile without reading or writing reusable test executables');
     Registry.Add(TSubcommand.Create('test',
       'Discover and run *.Test.pas files',
-      '[selector...] [--tier default|e2e] [--jobs N] [--bail N] [--verbose] '
+      '[selector...] [--jobs N] [--bail N] [--verbose] '
         + '[--inventory] [--no-cache]',
       @HandleTest, TestOpts));
 

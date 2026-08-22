@@ -1,7 +1,8 @@
 { CLIOptions.Test — spawn ./build/lwpt with various argv shapes
   and assert on exit codes + stdout/stderr.
 
-  Lives in the E2E tier because the CLI parser lives BEHIND ParamStr /
+  Lives in the repository's integration group because the CLI parser lives
+  BEHIND ParamStr /
   ParamCount; a unit test inside the test process would parse its own
   argv, not arbitrary input. The only way to test option-parsing
   realistically is to spawn the binary.
@@ -78,7 +79,8 @@ type
     procedure TestTestSelectsOneExactFile;
     procedure TestTestSelectsDirectoryRecursively;
     procedure TestTestSelectsGlobAndDeduplicatesUnion;
-    procedure TestTestSelectionPreservesTierPolicy;
+    procedure TestTestSelectorRunsMatchingProgramRegardlessOfPath;
+    procedure TestTestWithoutSelectorsRunsCompleteDiscovery;
     procedure TestPretestCannotAddTestPrograms;
     procedure TestInvalidTestSelectorsFailBeforePretest;
     procedure TestInventorySkipsHooksAndTestBodies;
@@ -723,24 +725,34 @@ begin
     + ' ... pass')).ToBe(1);
 end;
 
-procedure TCLIOptionsE2E.TestTestSelectionPreservesTierPolicy;
+procedure TCLIOptionsE2E.TestTestSelectorRunsMatchingProgramRegardlessOfPath;
 var
-  DefaultRun, E2ERun: TLwptResult;
+  Run: TLwptResult;
 begin
-  DefaultRun := RunLwpt(['test',
+  Run := RunLwpt(['test',
     'tests/e2e/Gamma.E2E.Test.pas', '--jobs=1'], FScratch);
-  DumpRunFailure('default-tier selected e2e test', DefaultRun, 0);
-  Expect<Integer>(DefaultRun.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('0 passed, 0 failed, 0 did not compile, 1 skipped',
-    DefaultRun.Stdout) > 0).ToBe(True);
-
-  E2ERun := RunLwpt(['test', 'tests/e2e/Gamma.E2E.Test.pas',
-    '--tier=e2e', '--jobs=1'], FScratch);
-  DumpRunFailure('e2e-tier selected test', E2ERun, 0);
-  Expect<Integer>(E2ERun.ExitCode).ToBe(0);
+  DumpRunFailure('selected test in user-owned e2e directory', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<Boolean>(Pos(NativeDisplayPath('tests/e2e/Gamma.E2E.Test.pas')
     + ' ... pass',
-    E2ERun.Stdout) > 0).ToBe(True);
+    Run.Stdout) > 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestTestWithoutSelectorsRunsCompleteDiscovery;
+var
+  Run: TLwptResult;
+begin
+  Run := RunLwpt(['test', '--jobs=1'], FScratch);
+  DumpRunFailure('complete discovered inventory', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('discovered 3 test file(s)', Run.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath('source/Alpha.Test.pas') + ' ... pass',
+    Run.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath(
+    'tests/integration/nested/Beta.Test.pas') + ' ... pass',
+    Run.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath('tests/e2e/Gamma.E2E.Test.pas')
+    + ' ... pass', Run.Stdout) > 0).ToBe(True);
 end;
 
 procedure TCLIOptionsE2E.TestPretestCannotAddTestPrograms;
@@ -860,8 +872,10 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('"schema":"lwpt.test-inventory"', R.Stdout) > 0)
     .ToBe(True);
+  Expect<Boolean>(Pos('"version":2', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('"path":"source/Inventory.Test.pas"', R.Stdout) > 0)
     .ToBe(True);
+  Expect<Boolean>(Pos('"tier":', R.Stdout) = 0).ToBe(True);
   Expect<Boolean>(Pos('"suites":1,"cases":1', R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/pretest-ran.txt')).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/posttest-ran.txt')).ToBe(False);
@@ -875,9 +889,9 @@ begin
   WriteInventoryProbe(FScratch);
   ForceDirectories(FScratch + '/tests');
   WriteTextFile(FScratch + '/tests/test-inventory.tsv',
-    'lwpt-test-inventory-v1'#10 +
+    'lwpt-test-inventory-v2'#10 +
     InventoryPlatformDeclarations +
-    'program'#9'*'#9'unit'#9'source/Inventory.Test.pas'#9'1'#9'2'#10);
+    'program'#9'*'#9'source/Inventory.Test.pas'#9'1'#9'2'#10);
   try
     R := RunLwpt(['test', 'source/Inventory.Test.pas', '--jobs=1'], FScratch);
     Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
@@ -903,9 +917,9 @@ begin
     'units = ["source"]'#10);
   ForceDirectories(ProjectPath + '/source');
   WriteTextFile(ProjectPath + '/tests/test-inventory.tsv',
-    'lwpt-test-inventory-v1'#10 +
+    'lwpt-test-inventory-v2'#10 +
     InventoryPlatformDeclarations +
-    'program'#9'*'#9'unit'#9'source/Gone.Test.pas'#9'1'#9'1'#10);
+    'program'#9'*'#9'source/Gone.Test.pas'#9'1'#9'1'#10);
   R := RunLwpt(['test', '--jobs=1'], ProjectPath);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('is not a discovered test program', R.Stderr) > 0)
@@ -970,8 +984,10 @@ begin
     TestTestSelectsDirectoryRecursively);
   Test('test glob selectors support globstar and deduplicate their union',
     TestTestSelectsGlobAndDeduplicatesUnion);
-  Test('test selectors do not bypass the requested tier',
-    TestTestSelectionPreservesTierPolicy);
+  Test('test selectors run matching programs regardless of directory',
+    TestTestSelectorRunsMatchingProgramRegardlessOfPath);
+  Test('test without selectors runs the complete discovered inventory',
+    TestTestWithoutSelectorsRunsCompleteDiscovery);
   Test('pretest cannot add programs to the frozen test inventory',
     TestPretestCannotAddTestPrograms);
   Test('invalid test selectors fail before pretest and session creation',
