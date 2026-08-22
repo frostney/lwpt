@@ -10,7 +10,7 @@ Keep these stable top-level keys:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "code-review",
   "generatedAt": "RFC 3339 timestamp",
   "verdict": "APPROVE | APPROVE_WITH_IMPROVEMENTS | REQUEST_CHANGES",
@@ -21,8 +21,8 @@ Keep these stable top-level keys:
     "dirtyState": "string"
   },
   "coverage": {
-    "activePerspectives": ["string"],
-    "skippedPerspectives": [{"name": "string", "reason": "string"}],
+    "activeAxes": ["deduplication | claim-and-specification | engineering-quality | discoverability"],
+    "skippedAxes": [{"name": "string", "reason": "string"}],
     "staticOnly": ["string"],
     "unreached": ["string"]
   },
@@ -43,7 +43,7 @@ Each finding contains:
 ```json
 {
   "id": "CR-N",
-  "severity": "BLOCKING | IMPORTANT | IMPROVEMENT",
+  "severity": "BLOCKING | IMPORTANT | IMPROVEMENT | NITPICK",
   "category": "CLAIM | QUALITY | ARCHITECTURE_RISK | DISCOVERABILITY",
   "title": "string",
   "location": {"path": "string", "line": 1, "symbol": "string or null"},
@@ -70,6 +70,7 @@ For `ARCHITECTURE_RISK`, replace `churn: null` with:
 ```
 
 Use JSON numbers for counts, `null` only where shown, repository-relative paths,
-and deterministic finding order by severity then ID. Include every reported
-finding and preserve an empty `findings` array when none qualify. After writing,
-parse the file once and report its path; do not modify other files.
+and deterministic finding order by `BLOCKING`, `IMPORTANT`, `IMPROVEMENT`,
+`NITPICK`, then ID. Include every reported finding and preserve an empty
+`findings` array when none qualify. After writing, parse the file once and
+report its path; do not modify other files.

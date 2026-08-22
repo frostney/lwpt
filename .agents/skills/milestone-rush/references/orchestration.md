@@ -47,7 +47,7 @@ than silently overriding it or asking the same question again.
 Default independent workers to the host equivalent of no inherited conversation
 history. A packet contains only applicable decision IDs and selected contracts,
 issue or PR identity, branch and exact head, owned scope, dependencies,
-acceptance criteria, applicable gates, capability class, context envelope, and
+requirements, applicable gates, capability class, context envelope, and
 the required structured transition output. Include a small recent-turn slice
 only when immediately relevant. Full-history inheritance requires a recorded,
 scoped exception.

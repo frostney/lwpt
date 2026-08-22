@@ -27,6 +27,9 @@ repository, then create it after the required review boundary.
   duplicate, or needs material facts that cannot be established. For a
   duplicate, return the existing issue and stop without asking whether to file
   the same request anyway or mutate the existing issue.
+- Before posting, resolve the authenticated GitHub username and exact model name
+  from the current GitHub account and agent environment. Stop if either is
+  unavailable; never guess or substitute a generic label.
 
 ## Automatic mode
 
@@ -44,8 +47,8 @@ approval. Material ambiguity or risk disables automatic mode.
 4. Draft against the matching template. Keep only decision-, implementation-,
    and verification-relevant content:
    - a specific plain-language title;
-   - problem, current and expected behavior, scope, constraints, and acceptance
-     criteria;
+   - problem, current and expected behavior, scope, constraints, and required
+     behavior;
    - reproduction and regression expectations for bugs;
    - user/test impact, likely affected area, and related work where relevant.
 5. For UI/UX work, add the affected states, current and expected visual evidence,
@@ -54,7 +57,13 @@ approval. Material ambiguity or risk disables automatic mode.
 6. Choose only existing labels unless the user asks to create one.
 7. Show the proposed title, labels, and body unless the user waived review or
    automatic mode applies.
-8. Create the issue with the available forge tooling and return its URL.
+8. End the issue body with this visually separate GitHub Note, replacing both
+   values with the exact identities resolved for this run:
+
+   > [!NOTE]
+   > Created on behalf of @username using ModelName.
+
+9. Create the issue with the available GitHub tooling and return its URL.
 
 Lead with the outcome. Omit boilerplate, repeated summaries, and a narration of
 the workflow.

@@ -43,15 +43,22 @@ freshly fetched remote default and pushing normally.
 ## Submit, validate, and merge
 
 - Use `gh stack submit` to create or update the native stack. Reconcile every
-  PR's title, body, base, draft state, linked acceptance criteria, and observed
+  PR's title, body, base, draft state, linked requirements, and observed
   validation after submission. Put a closing keyword only on the layer that
   completes the issue.
 - Treat every layer as a real PR. Validate its exact head and review its own
   claim; do not let evidence from one layer stand in for another.
+- `/address-stack-feedback` is the explicit review exception for a whole native
+  stack. It may freeze an exact-head reviewed layer and cover a validated live
+  finding with a later top fix layer. A covered lower layer is not independently
+  merge-ready: the required overlay and every layer beneath it form one
+  indivisible ready stack.
 - Before merging, re-read native topology and exact remote heads. Use
-  `gh stack merge --squash` for the selected atomic prefix only after every PR
-  in that prefix independently satisfies its current-head checks, review, and
-  readiness gates. Never select rebase-merge merely because stack maintenance
-  used rebases.
+  `gh stack merge --squash` for a selected atomic prefix only after every PR in
+  that prefix independently satisfies its current-head checks, review, and
+  readiness gates. When `/address-stack-feedback` supplied readiness, select
+  the complete reported stack only after its final membership audit still
+  matches; never merge a prefix beneath its top overlays. Never select
+  rebase-merge merely because stack maintenance used rebases.
 - After merge, use the official stack cleanup/sync path, remove only clean local
   branches owned by the run, and verify the integrated remote default.
