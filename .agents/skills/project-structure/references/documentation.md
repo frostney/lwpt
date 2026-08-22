@@ -41,7 +41,7 @@ entries or spikes to match later reality.
 
 - `VISION.md`: purpose, audience, durable technical direction, and explicit
   non-goals.
-- `DEFINITION_OF_READY.md`: outcome, scope, acceptance criteria, constraints,
+- `DEFINITION_OF_READY.md`: outcome, scope, required behavior, constraints,
   and resolved dependencies.
 - `DEFINITION_OF_DONE.md`: implementation, meaningful tests, current docs,
   passing project gate, review evidence, and required handoff artifacts.

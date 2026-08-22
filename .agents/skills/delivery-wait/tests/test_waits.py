@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DELIVERY = ROOT / "delivery-wait" / "scripts" / "delivery_wait.py"
-REVIEW = ROOT / "review-pr" / "scripts" / "review_wait.py"
+REVIEW = ROOT / "address-pr-feedback" / "scripts" / "review_wait.py"
 
 
 FAKE_GH = r'''#!/usr/bin/env python3
@@ -73,6 +73,7 @@ def check(
     status: str,
     conclusion: str | None,
     started_at: str = "2026-08-12T08:00:00Z",
+    app: str = "automated-review-app",
 ) -> dict:
     return {
         "__typename": "CheckRun",
@@ -82,7 +83,7 @@ def check(
         "detailsUrl": "https://example.invalid/check",
         "startedAt": started_at,
         "completedAt": started_at if status == "COMPLETED" else None,
-        "checkSuite": {"app": {"slug": "macroscopeapp"}},
+        "checkSuite": {"app": {"slug": app}},
     }
 
 
@@ -114,8 +115,8 @@ class WaitCommandsTest(unittest.TestCase):
         self.environment["PYTHONDONTWRITEBYTECODE"] = "1"
         self.policy = self.directory / "policy.json"
         self.policy.write_text(json.dumps({"automations":[{
-            "id":"macroscope", "actors":["macroscopeapp[bot]"],
-            "check_contexts":["Macroscope"], "check_app_slugs":["macroscopeapp"],
+            "id":"automated-review", "actors":["review-bot[bot]"],
+            "check_contexts":["Automated review"], "check_app_slugs":["automated-review-app"],
             "terminal_check_conclusions":["success"], "terminal_review_states":[],
             "nonterminal_review_markers":["rate limit"],
         }]}))
@@ -147,7 +148,7 @@ class WaitCommandsTest(unittest.TestCase):
                 "comments":{"nodes":[],"pageInfo":{"hasNextPage":False}},
                 "reviews":{"nodes":[],"pageInfo":{"hasNextPage":False}},
                 "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":False}},
-                "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[check("Macroscope","COMPLETED","SUCCESS")],"pageInfo":{"hasNextPage":False}}}}}]},
+                "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[check("Automated review","COMPLETED","SUCCESS")],"pageInfo":{"hasNextPage":False}}}}}]},
             },
             "tag":{"ref":None,"release":None},
             "workflow":{"id":44,"head_sha":"head-1","status":"completed","conclusion":"success","html_url":"https://example.invalid/run"},
@@ -286,8 +287,8 @@ class WaitCommandsTest(unittest.TestCase):
     def test_review_policy_accepts_the_existing_single_context_shape(self) -> None:
         self.write_scenario()
         self.policy.write_text(json.dumps({"automations":[{
-            "id":"macroscope", "actors":["macroscopeapp[bot]"],
-            "check_context":"Macroscope",
+            "id":"automated-review", "actors":["review-bot[bot]"],
+            "check_context":"Automated review",
             "terminal_review_states":["APPROVED", "COMMENTED"],
         }]}))
         _, output = self.run_json(
@@ -296,19 +297,61 @@ class WaitCommandsTest(unittest.TestCase):
         )
         self.assertEqual(output["state"], "satisfied")
 
-    def test_review_wait_remains_pending_for_unresolved_thread(self) -> None:
+    def test_review_wait_requires_judgment_for_unresolved_finding(self) -> None:
         self.write_scenario()
         scenario = json.loads(self.scenario.read_text())
         scenario["review"]["reviewThreads"]["nodes"] = [{
             "id":"thread-1", "isResolved":False,
-            "comments":{"nodes":[{"id":"node-1","databaseId":10,"body":"finding","createdAt":"now","author":{"login":"macroscopeapp[bot]"},"authorAssociation":"NONE","replyTo":None}],"pageInfo":{"hasNextPage":False}},
+            "comments":{"nodes":[{"id":"node-1","databaseId":10,"body":"finding","createdAt":"now","author":{"login":"review-bot[bot]"},"authorAssociation":"NONE","replyTo":None}],"pageInfo":{"hasNextPage":False}},
         }]
         self.scenario.write_text(json.dumps(scenario))
         _, output = self.run_json(
             REVIEW, "wait", "--repo", "owner/repo", "--pr", "7", "--head", "head-1", "--policy", str(self.policy),
             "--deadline", (datetime.now(timezone.utc) + timedelta(seconds=.08)).isoformat(), "--interval", "0.02",
         )
-        self.assertEqual(output["state"], "timed-out")
+        self.assertEqual(output["state"], "judgment-required")
+        self.assertEqual(output["observation"]["findingSurfaceCount"], 1)
+
+    def test_terminal_neutral_check_cannot_hide_review_or_comment_bodies(self) -> None:
+        self.policy.write_text(json.dumps({"automations":[{
+            "id":"automated-review", "actors":["review-bot[bot]"],
+            "check_contexts":["Automated review"], "check_app_slugs":["review-app"],
+            "terminal_check_conclusions":["success", "neutral"],
+            "terminal_review_states":["COMMENTED"],
+            "nonterminal_review_markers":[],
+        }]}))
+        self.write_scenario()
+        scenario = json.loads(self.scenario.read_text())
+        scenario["review"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"] = [
+            check("Automated review", "COMPLETED", "NEUTRAL", app="review-app")
+        ]
+        scenario["review"]["reviews"]["nodes"] = [{
+            "id":"review-node-1", "databaseId":31,
+            "author":{"login":"review-bot[bot]"}, "authorAssociation":"NONE",
+            "state":"COMMENTED", "body":"Critical: unsafe state transition.",
+            "submittedAt":"2026-08-12T08:02:00Z", "commit":{"oid":"head-1"},
+        }]
+        scenario["review"]["comments"]["nodes"] = [{
+            "id":"comment-node-1", "databaseId":32,
+            "author":{"login":"review-bot[bot]"}, "authorAssociation":"NONE",
+            "body":"Review summary with one critical issue.",
+            "createdAt":"2026-08-12T08:02:01Z",
+        }]
+        self.scenario.write_text(json.dumps(scenario))
+
+        _, output = self.run_json(
+            REVIEW, "inspect", "--repo", "owner/repo", "--pr", "7",
+            "--head", "head-1", "--policy", str(self.policy),
+        )
+
+        self.assertEqual(output["state"], "judgment-required")
+        surfaces = output["observation"]["findingSurfaces"]
+        self.assertEqual(output["observation"]["findingSurfaceCount"], 2)
+        self.assertEqual(
+            {surface["kind"] for surface in surfaces},
+            {"review", "top-level-comment"},
+        )
+        self.assertIn("Critical", surfaces[0]["review"]["body"])
 
     def test_review_wait_reports_new_finding_before_convergence(self) -> None:
         self.write_scenario()
@@ -335,7 +378,7 @@ class WaitCommandsTest(unittest.TestCase):
         scenario = json.loads(self.scenario.read_text())
         scenario["review"]["reviewThreads"]["nodes"] = [{
             "id":"thread-1", "isResolved":False,
-            "comments":{"nodes":[{"id":"node-1","databaseId":10,"body":"sensitive finding detail","createdAt":"now","author":{"login":"macroscopeapp[bot]"},"authorAssociation":"NONE","replyTo":None}],"pageInfo":{"hasNextPage":False}},
+            "comments":{"nodes":[{"id":"node-1","databaseId":10,"body":"sensitive finding detail","createdAt":"now","author":{"login":"review-bot[bot]"},"authorAssociation":"NONE","replyTo":None}],"pageInfo":{"hasNextPage":False}},
         }]
         self.scenario.write_text(json.dumps(scenario))
         state = self.directory / "review.json"
