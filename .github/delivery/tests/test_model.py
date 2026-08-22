@@ -319,6 +319,145 @@ class DeliveryModelTests(unittest.TestCase):
             github.removed_labels,
         )
 
+    def test_review_opens_the_phase_for_a_managed_ready_pull_after_ci(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        def managed_pull(number: int) -> dict:
+            pull = original_pull(number)
+            pull["labels"] = [{"name": "delivery:managed"}]
+            return pull
+
+        github.pull = managed_pull  # type: ignore[method-assign]
+        controller = PromotionController(github)
+        controller.review(41, head)
+        self.assertEqual(["pr-ci"], controller.preflight)
+        self.assertEqual([(41, ["ci:ready", "review:ready"])], github.labels)
+
+    def test_review_is_idempotent_when_the_managed_pull_is_already_ready(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        def managed_pull(number: int) -> dict:
+            pull = original_pull(number)
+            pull["labels"] = [{"name": "delivery:managed"}]
+            return pull
+
+        github.pull = managed_pull  # type: ignore[method-assign]
+        controller = PromotionController(github)
+        controller.review(41, head)
+        controller.review(41, head)
+        self.assertEqual(
+            [
+                (41, ["ci:ready", "review:ready"]),
+                (41, ["ci:ready", "review:ready"]),
+            ],
+            github.labels,
+        )
+
+    def test_review_refusal_does_not_open_an_unmanaged_pull(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        with self.assertRaisesRegex(DeliveryError, "not delivery:managed"):
+            PromotionController(github).review(41, head)
+        self.assertEqual([], github.labels)
+
+    def test_review_refusal_does_not_open_a_draft_without_successful_ci(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        def managed_draft(number: int) -> dict:
+            pull = original_pull(number)
+            pull["draft"] = True
+            pull["labels"] = [{"name": "delivery:managed"}]
+            return pull
+
+        github.pull = managed_draft  # type: ignore[method-assign]
+        controller = PromotionController(github)
+
+        def failed_ci(number: int, expected_head: str) -> dict:
+            raise DeliveryError("exact-head CI is not successful")
+
+        controller.require_delivery_success = failed_ci  # type: ignore[method-assign]
+        with self.assertRaisesRegex(DeliveryError, "CI is not successful"):
+            controller.review(41, head)
+        self.assertEqual([], github.labels)
+
+    def test_review_requires_the_harness_to_mark_the_admitted_draft_ready(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        def managed_draft(number: int) -> dict:
+            pull = original_pull(number)
+            pull["draft"] = True
+            pull["labels"] = [{"name": "delivery:managed"}]
+            return pull
+
+        github.pull = managed_draft  # type: ignore[method-assign]
+        with self.assertRaisesRegex(DeliveryError, "must be marked ready"):
+            PromotionController(github).review(41, head)
+        self.assertEqual([], github.labels)
+
+    def test_merge_refuses_a_pull_returned_to_draft(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        class MergeController(PromotionController):
+            def require_full_ci(
+                self, candidate: int, snapshot: dict, digest: str
+            ) -> None:
+                self.preflight.append(f"full-ci:{candidate}")
+
+        def admitted_pull(number: int) -> dict:
+            pull = original_pull(number)
+            pull["draft"] = True
+            pull["labels"] = [
+                {"name": "delivery:managed"},
+                {"name": "review:ready"},
+            ]
+            return pull
+
+        github.pull = admitted_pull  # type: ignore[method-assign]
+        with self.assertRaisesRegex(DeliveryError, "still a draft"):
+            MergeController(github).merge(41, head, 41)
+        self.assertEqual([], github.labels)
+
+    def test_observer_invalidates_review_when_a_managed_pull_returns_to_draft(
+        self,
+    ) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        original_pull = github.pull
+
+        def converted_pull(number: int) -> dict:
+            pull = original_pull(number)
+            pull["draft"] = True
+            pull["labels"] = [
+                {"name": "delivery:managed"},
+                {"name": "ci:ready"},
+                {"name": "review:ready"},
+                {"name": "merge:ready"},
+            ]
+            return pull
+
+        class ObserverController(Controller):
+            def delivery_check(
+                self, number: int, expected_head: str
+            ) -> dict | None:
+                return {"status": "completed", "conclusion": "success"}
+
+        github.pull = converted_pull  # type: ignore[method-assign]
+        ObserverController(github).observe_one(41)
+        self.assertEqual(
+            [(41, "review:ready"), (41, "merge:ready")],
+            github.removed_labels,
+        )
+
     def test_diagnostic_dispatch_is_allow_listed_and_not_a_full_ci_proof(self) -> None:
         head = "1" * 40
         github = DiagnosticGitHub(head)
