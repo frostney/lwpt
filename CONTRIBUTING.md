@@ -27,7 +27,7 @@ The pre-commit hook runs `lwpt format` and `lwpt agents` locally (both with `sta
 
 1. All four CI gate commands exit zero on the proposed branch.
 2. CI is green on every Tier 1 platform from [`docs/deployment.md`](./docs/deployment.md).
-3. The change has tests where tests are the right answer (see [`docs/testing.md`](./docs/testing.md) for the policy on when each test tier applies).
+3. The change has tests where tests are the right answer (see [`docs/testing.md`](./docs/testing.md) for LWPT's repository-owned test groups and CI routes).
 4. Documentation that mentions the changed surface has been updated. The no-duplication rule from [`docs/`](./docs/) applies: edit the *one* canonical document, not five.
 
 If any check fails on a hook autofix you didn't expect, do not commit with `--no-verify`. Investigate, then fix.

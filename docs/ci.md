@@ -152,10 +152,10 @@ check events that do not match a configured review adapter return before that
 sweep.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
-initial surface covers Windows x86_64/i386 default, E2E, and TLS slices, plus an
+initial surface covers Windows x86_64/i386 ordinary, E2E, and TLS slices, plus an
 Intel-Darwin scheduling slice that runs only `TestScheduling.Test.pas` with a
 90-second ceiling. When isolation changes the symptom, the same target can run
-its default tier with a seven-minute ceiling. Both capture a native process
+its ordinary project paths with a seven-minute ceiling. Both capture a native process
 sample instead of consuming a full matrix as a hang probe. Target and selector
 combinations are allow-listed as pairs: Windows-only selectors cannot silently
 run on Darwin, and the scheduling probe cannot run on Windows. The endpoint
@@ -240,8 +240,8 @@ Each runner installs FPC natively (`brew` / `apt` / `choco`), then the `x86_64-w
 1. **Sanity** — `lwpt --help` (does the binary even load?)
 2. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
 3. **`lwpt format --check`** — only on `aarch64-darwin` runner (formatting is platform-independent; one check is enough)
-4. **`lwpt test --bail=1`** — default tier (unit + integration); compiles every `*.Test.pas` via the runner's native FPC, runs them concurrently, and stops quickly on the first failure
-5. **`lwpt test --tier=e2e --bail=1`** — live network tier (Q23 decision: run on every platform to surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
+4. **`lwpt test <ordinary paths> --bail=1`** — the repository's co-located and integration programs; compiles them via the runner's native FPC, runs them concurrently, and stops quickly on the first failure
+5. **`lwpt test <E2E paths> --bail=1`** — with `LWPT_ENABLE_NETWORK=1` set in the job environment, the repository's E2E programs run on every platform (Q23 decision: surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
 
 Per [Q22=b](./adr/0014-packages-extraction.md), the runner side compiles tests at runtime via `lwpt test` rather than pre-compiling them on the cross-build stage. This exercises the full LWPT pipeline natively — including the resolver, the per-target cfg emitter, FPC's per-platform `{$IFDEF}` paths, and the install loop's symlink-vs-copy decision (junctions on Windows, symlinks on Unix).
 
@@ -257,9 +257,9 @@ Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR
 6. `./build/lwpt format --check`
 7. `./build/lwpt build` (manifest-target compile)
 8. `./build/lwpt agents --check` (generated command-reference drift)
-9. `./build/lwpt test --bail=1` (default tier — unit + integration)
+9. `./build/lwpt test <ordinary paths> --bail=1`
 
-The live-network e2e tier runs pre-merge on the Linux leg only — a dedicated step that overrides the job-level skip with `LWPT_SKIP_NETWORK: "0"` (the harness skips only on the exact value `1`), added per [issue #102](https://github.com/frostney/lwpt/issues/102) after the #84 TLS-close and #101 timing classes proved invisible to a default-tier-only gate; every platform still runs e2e post-merge via `ci.yml`. The native `build-and-test`, `darwin-test`, and `windows-test` jobs each have a 20-minute ceiling. The Windows job uses the same two-attempt Chocolatey setup contract as `ci.yml`. A second PR job, `darwin-test`, natively bootstraps on `macos-latest` (brew FPC, independent of the cross-toolchain cache) and runs the default tier — the #105 env-race family and its masks all first surfaced on darwin legs. Bounded cost: ~5–6 min warm, parallel to `build-and-test`. The remaining `ci.yml`-only legs (`x86_64-darwin`, `aarch64-linux`, `i386-win32`) stay post-merge. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
+The live-network E2E paths run pre-merge on the Linux leg only. Their dedicated selector invocation sets the repository-owned `LWPT_ENABLE_NETWORK=1` opt-in, added per [issue #102](https://github.com/frostney/lwpt/issues/102) after the #84 TLS-close class proved invisible to the ordinary route. The ordinary pass still carries the concurrency suites which cover the #101 timing class; E2E does not rerun them as accidental stress. Every platform still runs the E2E paths post-merge via `ci.yml`. The native `build-and-test`, `darwin-test`, and `windows-test` jobs each have a 20-minute ceiling. The Windows job uses the same two-attempt Chocolatey setup contract as `ci.yml`. A second PR job, `darwin-test`, natively bootstraps on `macos-latest` (brew FPC, independent of the cross-toolchain cache) and runs the ordinary paths — the #105 env-race family and its masks all first surfaced on darwin legs. Bounded cost: ~5–6 min warm, parallel to `build-and-test`. The remaining `ci.yml`-only legs (`x86_64-darwin`, `aarch64-linux`, `i386-win32`) stay post-merge. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
 
 The PR workflow deliberately uses the distro FPC (same as the install instructions in `README.md`), so any regression that only shows up with the system FPC's slightly older RTL gets caught before merge.
 
@@ -267,12 +267,12 @@ The PR workflow deliberately uses the distro FPC (same as the install instructio
 
 A second job reuses `toolchain.yml` (`workflow_call`, exactly like `ci.yml`) and cross-compiles `source/lwpt.pas` for **`x86_64-win64` only**, mirroring `ci.yml`'s build-stage flags and unit paths. It exists because `{$IFDEF WINDOWS}` codepaths never compile on the Ubuntu runner: PR #17 merged green while breaking `main` with a `SysUtils.FindClose` vs `Windows.FindClose` unit-shadowing error that PR #21 then had to fix. One target suffices — win32 and win64 share the same `{$IFDEF WINDOWS}` sources. The job also runs the no-OpenSSL guard (ADR-0016 for clients, ADR-0033 for servers — Windows must contain no OpenSSL linkage in either direction) against the produced `lwpt.exe`, surfacing that release-blocker on the PR instead of post-merge.
 
-The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC via choco (a verbatim copy of `ci.yml`'s step — `lwpt test` compiles `*.Test.pas` with the native FPC at run time per Q22=b), download the binary, then `lwpt install` + `lwpt test --bail=1` (default tier, offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
+The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC via choco (a verbatim copy of `ci.yml`'s step — `lwpt test` compiles `*.Test.pas` with the native FPC at run time per Q22=b), download the binary, then `lwpt install` + `lwpt test <ordinary paths> --bail=1` (offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
 
 Deliberate scope limits — still post-merge only (`ci.yml`):
 
 - **The `i386-win32` leg** (win32 and win64 share `{$IFDEF WINDOWS}` sources; the 32-bit leg re-verifies, it rarely diverges).
-- **The e2e tier on non-Linux platforms** and the `bootstrap.bat` cold-build smoke (the Linux e2e leg runs pre-merge per #102).
+- **The E2E paths on non-Linux platforms** and the `bootstrap.bat` cold-build smoke (the Linux E2E leg runs pre-merge per #102).
 - **`x86_64-darwin` and `aarch64-linux` runtime.** The aarch64-darwin PR leg covers `{$IFDEF DARWIN}` compile + arm64 runtime pre-merge (added per #102 after the #105 env-race family surfaced on darwin legs first); the intel-mac and arm-linux permutations stay post-merge — their unique-catch rate has not justified per-PR cost.
 
 Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`) has no branch component, and GitHub Actions lets PR runs restore caches created on the base branch — so PR runs hit the toolchain that `ci.yml` pushes to `main` keep warm, and the `toolchain` job is a seconds-long cache lookup. On eviction, the PR run rebuilds the toolchain (~30 min) into its own cache scope (not shared across PRs); a weekly `schedule` cron on `toolchain.yml` re-warms the default-branch copy so that window is bounded even when `main` is quiet. `pr.yml` also sets `concurrency` with `cancel-in-progress`, so a superseded push doesn't keep burning the macOS runner.
@@ -384,13 +384,13 @@ A bump invalidates the cache on the next workflow run; the toolchain rebuild tak
 
 ## Live-network E2E exercise
 
-The `test --tier=e2e` step runs three live fetches per platform:
+The explicit E2E-path step runs three live fetches per platform:
 
 - `octocat/Hello-World @ 7fd1a60b…` from GitHub (stable historical commit)
 - `gitlab-examples/ci-debug-trace @ dd648b2e48ce6518303b0bb580b2ee32fadaf045` from GitLab
 - `atlassian/atlaskit @ d7ac1acad54e…` from Bitbucket
 
-Per Q23=c, these run on every platform (6 in total per push). Total network traffic per push: 18 archive fetches. If this becomes a rate-limit concern, the future fallback is `LWPT_SKIP_NETWORK=1` on N-1 of the 6 runners (the env var is respected by every E2E test).
+Per Q23=c, these run on every platform (6 in total per push). Total network traffic per push: 18 archive fetches. The test programs require the repository-owned `LWPT_ENABLE_NETWORK=1` opt-in; omitting it keeps live access disabled.
 
 ### Transient host downtime skips, it does not fail
 

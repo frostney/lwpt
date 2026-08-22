@@ -12,7 +12,7 @@ uses
 
 const
   TEST_INVENTORY_PATH = 'tests/test-inventory.tsv';
-  TEST_INVENTORY_SCHEMA = 'lwpt-test-inventory-v1';
+  TEST_INVENTORY_SCHEMA = 'lwpt-test-inventory-v2';
   TEST_INVENTORY_DOC_BEGIN = '<!-- lwpt:test-inventory-counts:begin -->';
   TEST_INVENTORY_DOC_END = '<!-- lwpt:test-inventory-counts:end -->';
 
@@ -21,7 +21,6 @@ type
 
   TLWPTTestInventoryEntry = record
     Path: string;
-    Tier: string;
     Platform: string;
     Suites: Integer;
     Cases: Integer;
@@ -37,14 +36,14 @@ type
       AArchitecture: string): Integer;
     function PlatformLabel(const AIndexes: array of Integer): string;
     function CountDisplayForPath(const APath: string): string;
-    function AggregateDisplay(const ATier: string): string;
-    function ProgramCount(const ATier: string): Integer;
+    function AggregateDisplay: string;
+    function ProgramCount: Integer;
     function RenderAggregateBlock: string;
   public
     constructor Create(const APath: string);
     destructor Destroy; override;
     function Resolve(const APath, AOS, AArchitecture: string;
-      out ATier: string; out ASuites, ACases: Integer): Boolean;
+      out ASuites, ACases: Integer): Boolean;
     procedure ValidatePlatform(const AOS, AArchitecture: string);
     procedure ValidateEmptyDiscovery;
     function ContainsPath(const APath: string): Boolean;
@@ -74,7 +73,7 @@ constructor TLWPTTestInventory.Create(const APath: string);
 var
   Fields, Lines: TStringList;
   Entry: TLWPTTestInventoryEntry;
-  i, j, n: Integer;
+  i, n: Integer;
   Line: string;
 begin
   inherited Create;
@@ -103,26 +102,14 @@ begin
         if FPlatforms.IndexOf(Fields[1]) < 0 then FPlatforms.Add(Fields[1]);
         Continue;
       end;
-      if (Fields.Count <> 6) or (Fields[0] <> 'program')
-         or not TryStrToInt(Fields[4], Entry.Suites)
-         or not TryStrToInt(Fields[5], Entry.Cases)
+      if (Fields.Count <> 5) or (Fields[0] <> 'program')
+         or not TryStrToInt(Fields[3], Entry.Suites)
+         or not TryStrToInt(Fields[4], Entry.Cases)
          or (Entry.Suites < 0) or (Entry.Cases < 0) then
         raise ELWPTTestInventoryError.CreateFmt(
           'invalid test inventory row %d in "%s"', [i + 1, APath]);
       Entry.Platform := Fields[1];
-      Entry.Tier := Fields[2];
-      Entry.Path := CanonicalInventoryPath(Fields[3]);
-      if (Entry.Tier <> 'unit') and (Entry.Tier <> 'integration')
-         and (Entry.Tier <> 'e2e') then
-        raise ELWPTTestInventoryError.CreateFmt(
-          'invalid test inventory tier "%s" on row %d',
-          [Entry.Tier, i + 1]);
-      for j := 0 to High(FEntries) do
-        if (FEntries[j].Path = Entry.Path)
-           and (FEntries[j].Tier <> Entry.Tier) then
-          raise ELWPTTestInventoryError.CreateFmt(
-            'test inventory path "%s" changes tier from %s to %s on row %d',
-            [Entry.Path, FEntries[j].Tier, Entry.Tier, i + 1]);
+      Entry.Path := CanonicalInventoryPath(Fields[2]);
       n := Length(FEntries);
       SetLength(FEntries, n + 1);
       FEntries[n] := Entry;
@@ -167,7 +154,7 @@ begin
 end;
 
 function TLWPTTestInventory.Resolve(const APath, AOS,
-  AArchitecture: string; out ATier: string; out ASuites,
+  AArchitecture: string; out ASuites,
   ACases: Integer): Boolean;
 var
   i, Score, BestScore: Integer;
@@ -189,7 +176,6 @@ begin
       begin
         Result := True;
         BestScore := Score;
-        ATier := FEntries[i].Tier;
         ASuites := FEntries[i].Suites;
         ACases := FEntries[i].Cases;
       end;
@@ -314,14 +300,14 @@ type
   end;
 var
   Groups: array of TCountGroup;
-  Architecture, OSName, Tier, Part: string;
+  Architecture, OSName, Part: string;
   Cases, GroupIndex, i, n, Suites: Integer;
 begin
   SetLength(Groups, 0);
   for i := 0 to FPlatforms.Count - 1 do
   begin
     if not SplitPlatform(FPlatforms[i], OSName, Architecture)
-       or not Resolve(APath, OSName, Architecture, Tier, Suites, Cases) then
+       or not Resolve(APath, OSName, Architecture, Suites, Cases) then
       raise ELWPTTestInventoryError.CreateFmt(
         'test inventory has no rule for "%s" on %s',
         [APath, FPlatforms[i]]);
@@ -354,7 +340,7 @@ begin
   end;
 end;
 
-function TLWPTTestInventory.ProgramCount(const ATier: string): Integer;
+function TLWPTTestInventory.ProgramCount: Integer;
 var
   Paths: TStringList;
   i: Integer;
@@ -363,8 +349,7 @@ begin
   try
     Paths.CaseSensitive := True;
     for i := 0 to High(FEntries) do
-      if ((ATier = '') or (FEntries[i].Tier = ATier))
-         and (Paths.IndexOf(FEntries[i].Path) < 0) then
+      if Paths.IndexOf(FEntries[i].Path) < 0 then
         Paths.Add(FEntries[i].Path);
     Result := Paths.Count;
   finally
@@ -372,7 +357,7 @@ begin
   end;
 end;
 
-function TLWPTTestInventory.AggregateDisplay(const ATier: string): string;
+function TLWPTTestInventory.AggregateDisplay: string;
 type
   TAggregateGroup = record
     Cases: Integer;
@@ -381,15 +366,14 @@ type
 var
   Groups: array of TAggregateGroup;
   Paths: TStringList;
-  Architecture, OSName, Tier, Part: string;
+  Architecture, OSName, Part: string;
   Cases, GroupIndex, i, j, n, Suites, Total: Integer;
 begin
   Paths := TStringList.Create;
   try
     Paths.CaseSensitive := True;
     for i := 0 to High(FEntries) do
-      if ((ATier = '') or (FEntries[i].Tier = ATier))
-         and (Paths.IndexOf(FEntries[i].Path) < 0) then
+      if Paths.IndexOf(FEntries[i].Path) < 0 then
         Paths.Add(FEntries[i].Path);
     SetLength(Groups, 0);
     for i := 0 to FPlatforms.Count - 1 do
@@ -398,7 +382,7 @@ begin
       Total := 0;
       for j := 0 to Paths.Count - 1 do
       begin
-        if not Resolve(Paths[j], OSName, Architecture, Tier, Suites, Cases) then
+        if not Resolve(Paths[j], OSName, Architecture, Suites, Cases) then
           raise ELWPTTestInventoryError.CreateFmt(
             'test inventory has no rule for "%s" on %s',
             [Paths[j], FPlatforms[i]]);
@@ -434,16 +418,10 @@ end;
 function TLWPTTestInventory.RenderAggregateBlock: string;
 begin
   Result := TEST_INVENTORY_DOC_BEGIN + LineEnding
-    + '| Tier | Files | Registered test cases |' + LineEnding
-    + '| --- | ---: | --- |' + LineEnding
-    + '| Unit | ' + IntToStr(ProgramCount('unit')) + ' | '
-      + AggregateDisplay('unit') + ' |' + LineEnding
-    + '| Integration | ' + IntToStr(ProgramCount('integration')) + ' | '
-      + AggregateDisplay('integration') + ' |' + LineEnding
-    + '| E2E | ' + IntToStr(ProgramCount('e2e')) + ' | '
-      + AggregateDisplay('e2e') + ' |' + LineEnding
-    + '| **Total** | **' + IntToStr(ProgramCount('')) + '** | **'
-      + AggregateDisplay('') + '** |' + LineEnding
+    + '| Files | Registered test cases |' + LineEnding
+    + '| ---: | --- |' + LineEnding
+    + '| **' + IntToStr(ProgramCount) + '** | **'
+      + AggregateDisplay + '** |' + LineEnding
     + TEST_INVENTORY_DOC_END;
 end;
 

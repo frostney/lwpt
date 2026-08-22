@@ -550,8 +550,8 @@ begin
     + 'uses SysUtils;'#10
     + 'begin Sleep(' + IntToStr(TestHeartbeatJobDurationMilliseconds)
     + ') end.'#10);
-  WriteTextFile(FScratch + '/tests/e2e/B.Skip.Test.pas',
-      'program SkipFixture;'#10
+  WriteTextFile(FScratch + '/tests/e2e/B.Selected.Test.pas',
+      'program SelectedFixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'begin end.'#10);
   RunResult := RunTestsWithHeartbeat([], TestHeartbeatIntervalMilliseconds);
@@ -561,7 +561,7 @@ begin
   Expect<Boolean>(Pos('(.lwpt/sessions/', RunResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('discovered 2 test file(s)', RunResult.Stdout) > 0)
     .ToBe(True);
-  Expect<Boolean>(Pos('effective workers: 1', RunResult.Stdout) > 0)
+  Expect<Boolean>(Pos('effective workers: 2', RunResult.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('START tests/A.Silent.Test.pas',
     SlashNorm(RunResult.Stdout)) > 0).ToBe(True);
@@ -571,10 +571,10 @@ begin
     SlashNorm(RunResult.Stdout)) > 0).ToBe(True);
   Expect<Boolean>(Pos('PASS tests/A.Silent.Test.pas',
     SlashNorm(RunResult.Stdout)) > 0).ToBe(True);
-  Expect<Boolean>(Pos('SKIP tests/e2e/B.Skip.Test.pas (e2e tier)',
+  Expect<Boolean>(Pos('PASS tests/e2e/B.Selected.Test.pas',
     SlashNorm(RunResult.Stdout)) > 0).ToBe(True);
-  Expect<Boolean>(Pos('summary: 1 passed, 0 failed, 0 did not compile, '
-    + '1 skipped, 0 cancelled; elapsed ', RunResult.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('summary: 2 passed, 0 failed, 0 did not compile, '
+    + '0 cancelled; elapsed ', RunResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos(' ms', RunResult.Stdout) > 0).ToBe(True);
 end;
 
@@ -663,7 +663,7 @@ begin
   Expect<Boolean>(Pos('alpha-1|alpha-2|', RunResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('beta-1|beta-2|', RunResult.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('summary: 2 passed, 0 failed, 0 did not compile, '
-    + '0 skipped, 0 cancelled; elapsed ', RunResult.Stdout) > 0).ToBe(True);
+    + '0 cancelled; elapsed ', RunResult.Stdout) > 0).ToBe(True);
 end;
 
 procedure TTestScheduling.TestDefaultJobsOverlap;

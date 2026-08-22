@@ -19,7 +19,7 @@ type
     procedure TestCanonicalDocumentationIsCurrent;
     procedure TestPlatformRulesResolveBySpecificity;
     procedure TestAmbiguousRulesFailClosed;
-    procedure TestPlatformRulesCannotChangeTier;
+    procedure TestTaxonomyColumnIsRejected;
     procedure TestStaleDocumentationFailsWithUpdateCommand;
     procedure TestRunningPlatformIsDeclared;
     procedure TestMissingDocumentationRowFails;
@@ -94,19 +94,17 @@ procedure TTestInventoryTests.TestPlatformRulesResolveBySpecificity;
 var
   Cases, Suites: Integer;
   Inventory: TLWPTTestInventory;
-  Tier: string;
 begin
   Inventory := TLWPTTestInventory.Create(TEST_INVENTORY_PATH);
   try
     Expect<Boolean>(Inventory.Resolve(
       'packages/httpclient/source/HTTPClient.Test.pas', 'darwin', 'aarch64',
-      Tier, Suites, Cases)).ToBe(True);
-    Expect<string>(Tier).ToBe('unit');
+      Suites, Cases)).ToBe(True);
     Expect<Integer>(Suites).ToBe(4);
     Expect<Integer>(Cases).ToBe(35);
     Expect<Boolean>(Inventory.Resolve(
       'packages/httpclient/source/HTTPClient.Test.pas', 'windows', 'i386',
-      Tier, Suites, Cases)).ToBe(True);
+      Suites, Cases)).ToBe(True);
     Expect<Integer>(Cases).ToBe(33);
   finally
     Inventory.Free;
@@ -118,7 +116,7 @@ var
   Failed: Boolean;
   Inventory: TLWPTTestInventory;
   Lines: TStringList;
-  Path, Tier: string;
+  Path: string;
   Cases, Suites: Integer;
 begin
   Path := TemporaryPath('ambiguous.tsv');
@@ -126,8 +124,8 @@ begin
   try
     Lines.Add(TEST_INVENTORY_SCHEMA);
     Lines.Add('platform'#9'darwin/aarch64');
-    Lines.Add('program'#9'*'#9'unit'#9'a.Test.pas'#9'1'#9'1');
-    Lines.Add('program'#9'*'#9'unit'#9'a.Test.pas'#9'1'#9'1');
+    Lines.Add('program'#9'*'#9'a.Test.pas'#9'1'#9'1');
+    Lines.Add('program'#9'*'#9'a.Test.pas'#9'1'#9'1');
     Lines.SaveToFile(Path);
   finally
     Lines.Free;
@@ -136,7 +134,7 @@ begin
   try
     Failed := False;
     try
-      Inventory.Resolve('a.Test.pas', 'darwin', 'aarch64', Tier, Suites,
+      Inventory.Resolve('a.Test.pas', 'darwin', 'aarch64', Suites,
         Cases);
     except
       on ELWPTTestInventoryError do Failed := True;
@@ -148,19 +146,18 @@ begin
   end;
 end;
 
-procedure TTestInventoryTests.TestPlatformRulesCannotChangeTier;
+procedure TTestInventoryTests.TestTaxonomyColumnIsRejected;
 var
   Failed: Boolean;
   Lines: TStringList;
   Path: string;
 begin
-  Path := TemporaryPath('tier-change.tsv');
+  Path := TemporaryPath('taxonomy-column.tsv');
   Lines := TStringList.Create;
   try
     Lines.Add(TEST_INVENTORY_SCHEMA);
     Lines.Add('platform'#9'darwin/aarch64');
     Lines.Add('program'#9'*'#9'unit'#9'a.Test.pas'#9'1'#9'1');
-    Lines.Add('program'#9'darwin/*'#9'integration'#9'a.Test.pas'#9'1'#9'1');
     Lines.SaveToFile(Path);
   finally
     Lines.Free;
@@ -170,7 +167,7 @@ begin
     TLWPTTestInventory.Create(Path).Free;
   except
     on E: ELWPTTestInventoryError do
-      Failed := Pos('changes tier from unit to integration', E.Message) > 0;
+      Failed := Pos('invalid test inventory row', E.Message) > 0;
   end;
   Expect<Boolean>(Failed).ToBe(True);
   DeleteFile(Path);
@@ -219,8 +216,8 @@ begin
   Test('platform rules resolve by specificity',
     TestPlatformRulesResolveBySpecificity);
   Test('ambiguous platform rules fail closed', TestAmbiguousRulesFailClosed);
-  Test('platform rules cannot change a program tier',
-    TestPlatformRulesCannotChangeTier);
+  Test('inventory rows reject a runner-owned taxonomy column',
+    TestTaxonomyColumnIsRejected);
   Test('canonical documentation is current',
     TestCanonicalDocumentationIsCurrent);
   Test('stale documentation names the update command',

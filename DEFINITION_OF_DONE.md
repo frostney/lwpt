@@ -51,20 +51,20 @@ requirement may be marked not applicable only with a recorded reason.
 - E2E coverage is required for changes affecting networking, installation,
   CLI subprocess behavior, platform integration, or release behavior.
 - Release preparation reuses a successful exact-main integrated CI run for the
-  unchanged default and E2E suites. It does not repeat those complete suites
+  unchanged ordinary and E2E project routes. It does not repeat those complete routes
   locally merely to restate the same proof. Approved source fixes run their
   affected focused suites before the preparation PR; that PR's required CI and
   the resulting integrated-main CI become the final full-suite evidence.
 - A change touching process management, concurrency, platform-specific code,
   or the CI workflows themselves dispatches the full CI workflow on the
   branch and watches it to completion before merge when the change targets
-  platforms or tiers the PR gate does not cover. During remediation, use an
+  platforms or test routes the PR gate does not cover. During remediation, use an
   allow-listed native diagnostic slice. Dispatch the full matrix only once the
   branch contains the current base and focused checks, required PR CI, and
   active review evidence have converged; a later change invalidates that proof
-  (post-#102 the gate covers Linux default+e2e,
-  aarch64-darwin default, and win64 offline; `x86_64-darwin`,
-  `aarch64-linux`, `i386-win32`, and non-Linux e2e remain
+  (post-#102 the gate covers Linux ordinary+E2E,
+  aarch64-darwin ordinary, and win64 offline; `x86_64-darwin`,
+  `aarch64-linux`, `i386-win32`, and non-Linux E2E remain
   post-merge-only).
 - An intermittent-failure fix names the pinned mechanism and its evidence;
   timeout bumps, retries, and quarantines are mitigations and link a
@@ -100,7 +100,7 @@ feature or a consumer-project responsibility.
 Release preparation runs the release-specific local evidence that integrated
 CI does not provide: frozen and generated-state verification, version
 agreement, format and agent-reference checks, a release-mode build, Markdown
-lint, architecture drift, and changelog preview. A complete local default/E2E
+lint, architecture drift, and changelog preview. A complete local ordinary/E2E
 rerun does not substitute for absent or stale exact-main integrated evidence;
 that state blocks preparation. After preparation changes, rerun only affected
 focused suites locally and let the preparation PR plus integrated-main CI

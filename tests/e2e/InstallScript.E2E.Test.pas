@@ -36,7 +36,7 @@
 
   Skip semantics (each logs a "[skip]" line and passes):
     - non-Unix host                  → skip (install.sh is sh)
-    - LWPT_SKIP_NETWORK=1             → skip
+    - LWPT_ENABLE_NETWORK unset or not 1 → skip
     - curl unavailable               → skip (environment, not a defect)
     - no normal release published    → skip (nothing to smoke yet)
     - GitHub API rate limit          → skip (distinct from connectivity)
@@ -721,7 +721,7 @@ begin
     {$IFNDEF UNIX}
     WriteLn('  [skip] install.sh is Unix-only; Windows install.ps1 smoke is separate');
     {$ELSE}
-    WriteLn('  [skip] LWPT_SKIP_NETWORK=1 set; install-script test skipped');
+    WriteLn('  [skip] LWPT_ENABLE_NETWORK=1 not set; install-script test skipped');
     {$ENDIF}
     Exit;
   end;
