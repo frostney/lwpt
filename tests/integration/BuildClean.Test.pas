@@ -125,7 +125,8 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/alpha')))
     .ToBe(True);
-  Expect<Boolean>(Pos('build mode: dev, clean', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build mode: dev', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('build mode: dev, clean', R.Stdout) = 0).ToBe(True);
 end;
 
 procedure TBuildClean.TestNoCacheBypassesReusableBuildResult;

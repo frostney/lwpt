@@ -116,10 +116,12 @@ type
     FCompiler: TLWPTCompilerProcess;
     FCache: TLWPTBuildCache;
     FUseCache: Boolean;
+    FVerbose: Boolean;
     FCompiled: TLWPTCompiledEntry;
     FBuildResult: TLWPTBuildResult;
     FCompilerExitCode: Integer;
     FOutput: string;
+    FFailureOutput: string;
     FError: string;
     FCancellationError: string;
     FSucceeded: Boolean;
@@ -135,7 +137,7 @@ type
       const AWorkerSession: TLWPTWorkerBudgetSession;
       const ALease: TLWPTWorkerLease;
       const ADriver: TLWPTCompilerDriver; const ACache: TLWPTBuildCache;
-      const AUseCache: Boolean);
+      const AUseCache, AVerbose: Boolean);
     destructor Destroy; override;
     procedure BeginCancel(const ADescendantDeadline,
       AAcknowledgementDeadline: QWord);
@@ -146,6 +148,7 @@ type
     property BuildResult: TLWPTBuildResult read FBuildResult;
     property CompilerExitCode: Integer read FCompilerExitCode;
     property CapturedOutput: string read FOutput;
+    property FailureOutput: string read FFailureOutput;
     property CancellationError: string read FCancellationError;
     property ErrorMessage: string read FError;
     property Succeeded: Boolean read FSucceeded;
@@ -593,9 +596,9 @@ function BuildOneEntry(const AManifestPath: string; const AMan: TManifest;
   ASession: TLWPTBuildSession; AWorkerSession: TLWPTWorkerBudgetSession;
   var AWorkerLease: TLWPTWorkerLease; ACompiler: TLWPTCompilerProcess;
   ADriver: TLWPTCompilerDriver; ACache: TLWPTBuildCache;
-  const AUseCache: Boolean; out ACompiled: TLWPTCompiledEntry;
+  const AUseCache, AVerbose: Boolean; out ACompiled: TLWPTCompiledEntry;
   out ABuildResult: TLWPTBuildResult; out AOutput: string;
-  out ACompilerExitCode: Integer): Boolean;
+  out AFailureOutput: string; out ACompilerExitCode: Integer): Boolean;
 var
   FpcArgs : TStringArray;
   OutBin, JobRoot, BinDir, CandidateBin, UnitOutDir, StandardOutput,
@@ -682,6 +685,7 @@ begin
   ABuildResult := DefaultBuildResult;
   ReleasingWorkerForWait := False;
   AOutput := '';
+  AFailureOutput := '';
   ACompilerExitCode := ObservabilityInternalErrorExitCode;
   if T.Source = '' then
     Exit(False);
@@ -805,8 +809,11 @@ begin
         FreeAndNil(AWorkerLease);
         WaitStartedAt := GetTickCount64;
         LastProgressAt := WaitStartedAt;
-        WriteLn('cache wait: build result "', T.Name, '" ',
-          CacheFingerprint);
+        if AVerbose then
+          WriteLn('cache wait: build result "', T.Name, '" ',
+            CacheFingerprint)
+        else
+          WriteLn('cache wait: build result "', T.Name, '"');
         repeat
           if ACompiler.IsCancelled then
           begin
@@ -834,14 +841,19 @@ begin
           if WaitNow - LastProgressAt >=
              PRODUCER_LEASE_PROGRESS_MILLISECONDS then
           begin
-            if ACache.ProducerSnapshot(CacheFingerprint,
-                 ProducerSnapshot) then
-              WriteLn('cache wait: ', ProducerSnapshot.Description,
-                ' (owner ', ProducerSnapshot.ProcessId, ', ',
-                WaitNow - WaitStartedAt, 'ms)')
+            if AVerbose then
+            begin
+              if ACache.ProducerSnapshot(CacheFingerprint,
+                   ProducerSnapshot) then
+                WriteLn('cache wait: ', ProducerSnapshot.Description,
+                  ' (owner ', ProducerSnapshot.ProcessId, ', ',
+                  WaitNow - WaitStartedAt, 'ms)')
+              else
+                WriteLn('cache wait: build result "', T.Name, '" (',
+                  WaitNow - WaitStartedAt, 'ms)');
+            end
             else
-              WriteLn('cache wait: build result "', T.Name, '" (',
-                WaitNow - WaitStartedAt, 'ms)');
+              WriteLn('cache wait: build result "', T.Name, '" (waiting)');
             LastProgressAt := WaitNow;
           end;
         until False;
@@ -906,6 +918,9 @@ begin
     FreeAndNil(ACompiled.ProducerLease);
     Failure := ADriver.ClassifyFailure(FpcExit, AOutput);
     AOutput := AOutput + LineEnding + Failure.Summary + LineEnding;
+    AFailureOutput := BuildResultErrorMessage(ABuildResult);
+    if AFailureOutput = '' then AFailureOutput := Failure.Summary;
+    AFailureOutput := AFailureOutput + LineEnding;
   end;
 
   if Result then
@@ -935,6 +950,10 @@ begin
       + '  ' + Failure.Recovery
       + LineEnding + '  retry with: ' + PROGRAM_NAME + ' build '
       + T.Name + ' --clean' + LineEnding;
+    AFailureOutput := AFailureOutput + LineEnding
+      + '  ' + Failure.Recovery
+      + LineEnding + '  retry with: ' + PROGRAM_NAME + ' build '
+      + T.Name + ' --clean' + LineEnding;
   end;
 end;
 
@@ -945,7 +964,7 @@ constructor TLWPTBuildJob.Create(const AManifestPath: string;
   const AWorkerSession: TLWPTWorkerBudgetSession;
   const ALease: TLWPTWorkerLease;
   const ADriver: TLWPTCompilerDriver; const ACache: TLWPTBuildCache;
-  const AUseCache: Boolean);
+  const AUseCache, AVerbose: Boolean);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
@@ -961,6 +980,7 @@ begin
   FDriver := ADriver;
   FCache := ACache;
   FUseCache := AUseCache;
+  FVerbose := AVerbose;
   FCompiler := TLWPTCompilerProcess.Create(FDriver.ExecutableName,
     FDriver.WorkingDirectory);
   FCompiled := Default(TLWPTCompiledEntry);
@@ -1001,7 +1021,8 @@ begin
       FSucceeded := BuildOneEntry(FManifestPath, FManifest,
         FManifestContentHash, FEntry, FRelease, FClean, FSession,
         FWorkerSession, FLease, FCompiler, FDriver, FCache, FUseCache,
-        FCompiled, FBuildResult, FOutput, FCompilerExitCode);
+        FVerbose, FCompiled, FBuildResult, FOutput, FFailureOutput,
+        FCompilerExitCode);
       if (not FSucceeded) and (FError = '') then
         if FEntry.Source = '' then
           FError := 'build entry has no source'
@@ -1288,6 +1309,7 @@ var
   CompilerExitCodes: array of Integer;
   Compiled: TLWPTCompiledEntryArray;
   CapturedOutputs, Errors: TLWPTStringArray;
+  FailureOutputs: TLWPTStringArray;
   PublicationRequest: TLWPTBuildPublicationRequest;
   PublicationResult: TLWPTBuildPublicationResult;
   CompilerSelection: TLWPTCompilerSelection;
@@ -1362,7 +1384,8 @@ var
       EventState, GetTickCount64 - StartTicks[AIndex], EventExitCode, Detail,
       LogReference);
     try
-      Reporter.ReportJob(Event, LogOutput, Errors[AIndex], AVerbose);
+      Reporter.ReportJob(Event, LogOutput, Errors[AIndex], AVerbose, 0,
+        FailureOutputs[AIndex]);
     finally
       Event.Free;
     end;
@@ -1607,7 +1630,16 @@ begin
   SelectedCount := 0;
   for i := 0 to High(Selected) do
     if Selected[i] then Inc(SelectedCount);
-  WriteLn('discovered ', SelectedCount, ' build entry(s)');
+  ModeStr := '';
+  for i := 0 to High(Man.BuildEntries) do
+    if Selected[i] then
+    begin
+      if ModeStr <> '' then ModeStr := ModeStr + ', ';
+      ModeStr := ModeStr + Man.BuildEntries[i].Name;
+    end;
+  WriteLn('build targets: ', ModeStr);
+  if AVerbose then
+    WriteLn('discovered ', SelectedCount, ' build entry(s)');
 
   if FindArtefactDirCollision(Man.BuildEntries, CollA, CollB) then
   begin
@@ -1619,18 +1651,19 @@ begin
   end;
 
   if ARelease then ModeStr := 'release' else ModeStr := 'dev';
-  if AClean then ModeStr := ModeStr + ', clean';
   MaxJobs := SelectedCount;
   if (AJobs > 0) and (AJobs < MaxJobs) then MaxJobs := AJobs;
   if MaxJobs < 1 then MaxJobs := 1;
   WriteLn('build mode: ', ModeStr);
+  if AVerbose and AClean then WriteLn('build clean: yes');
   Session := TLWPTBuildSession.Create(ProjectRoot,
     ResolveBuildSessionsRoot(ProjectRoot, ResolveSessionsDir(Man),
       GetCurrentDir));
   try
-    Reporter := TLWPTProgressReporter.Create(Session, lpsBuild);
-    WriteLn('build session: ', Session.SessionID, ' (',
-      Session.SessionReference, ')');
+    Reporter := TLWPTProgressReporter.Create(Session, lpsBuild, AVerbose);
+    if AVerbose then
+      WriteLn('build session: ', Session.SessionID, ' (',
+        Session.SessionReference, ')');
     { --clean means a forced compile in fresh private staging. It never
       deletes the last successful public output or another live session. }
     RunHooks('prebuild', Man.PreBuild, ProjectRoot);
@@ -1646,6 +1679,7 @@ begin
     SetLength(CompilerExitCodes, Length(Man.BuildEntries));
     SetLength(Compiled, Length(Man.BuildEntries));
     SetLength(CapturedOutputs, Length(Man.BuildEntries));
+    SetLength(FailureOutputs, Length(Man.BuildEntries));
     SetLength(Errors, Length(Man.BuildEntries));
     SetLength(StartTicks, Length(Man.BuildEntries));
     SetLength(Reported, Length(Man.BuildEntries));
@@ -1665,8 +1699,11 @@ begin
         effective request so a second ready entry waits instead of trying
         to acquire beyond the inherited grant. }
       MaxJobs := WorkerSession.RequestedWorkers;
-      WriteLn('build jobs: ', MaxJobs);
-      WriteLn('effective workers: ', MaxJobs);
+      if AVerbose then
+      begin
+        WriteLn('build jobs: ', MaxJobs);
+        WriteLn('effective workers: ', MaxJobs);
+      end;
       try
         while Completed < SelectedCount do
         begin
@@ -1705,7 +1742,7 @@ begin
                 Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
                   ManifestContentHash, Man.BuildEntries[i], ARelease, AClean,
                   Session, WorkerSession, Lease, EntryDrivers[i], Cache,
-                  AUseCache);
+                  AUseCache, AVerbose);
                 Lease := nil;
                 States[i] := besRunning;
                 Inc(Running);
@@ -1743,6 +1780,7 @@ begin
             begin
               Jobs[i].WaitFor;
               CapturedOutputs[i] := Jobs[i].CapturedOutput;
+              FailureOutputs[i] := Jobs[i].FailureOutput;
               BuildResults[i] := Jobs[i].BuildResult;
               CompilerExitCodes[i] := Jobs[i].CompilerExitCode;
               if Jobs[i].Succeeded then
@@ -1868,9 +1906,12 @@ begin
   finally
     Cache.Free;
     CompilerSelection.Free;
-    WriteLn('summary: ', Built, ' built, ', Failed, ' failed, ',
-      Skipped, ' skipped; elapsed ',
+    if Failed = 0 then ModeStr := 'PASS' else ModeStr := 'FAIL';
+    Write('RESULT ', ModeStr, ' (', Built, ' built, ', Failed,
+      ' failed, ', Skipped, ' skipped');
+    if AVerbose then Write('; elapsed ',
       FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
+    WriteLn(')');
   end;
 end;
 
