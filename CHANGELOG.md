@@ -1,6 +1,36 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.7.0] - 2026-08-23
+
+### Bug Fixes
+
+- fix(release): align preparation with shipped behavior (#246)
+- fix(delivery): open review only after PR is ready (#240)
+- fix(test): observe sibling cancellation fanout (#228)
+- fix(review): include tests in Macroscope correctness (#233)
+- fix(build): retry Win32 version-include replace (#230)
+- fix(test): avoid waiting for inherited pipe EOF (#224)
+- fix(cli): reject unexpected positional arguments (#220)
+
+### Internal
+
+- chore(skills): install agent-writing (#245)
+- chore(skills): refresh project workflows (#244)
+- ci: bridge selector-driven test routes (#243)
+- ci: add reusable LWPT dependency updater (#231)
+- test: capture Darwin scheduling recurrence evidence (#218)
+
+### New Features
+
+- feat(build): focus routine progress output (#242)
+- feat(test): keep grouping in userland (#241)
+- feat(test): cache verified executables (#234)
+- feat(cache): bound shared cache lifecycle (#225)
+- feat(deps): give consumers a sanctioned way to bump git-host packages (#229)
+- feat(cache): coalesce producer misses (#222)
+- feat(build): cache verified build results (#221)
+- feat(install): add per-user dependency archive CAS (#219)
 ## [0.6.1] - 2026-08-15
 
 ### Bug Fixes
