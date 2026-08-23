@@ -13,7 +13,11 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   [ADR-0036](./adr/0036-per-user-dependency-archive-cas.md).
 - **Self-hosting from day one.** LWPT builds LWPT through `lwpt build` against the repo's own manifest; the one-time `scripts/bootstrap.pas` resolves the chicken-and-egg. See [ADR-0005](./adr/0005-self-host-build.md).
 - **RTL-only with LWPT-canonical packages.** No third-party FPC dependencies in the binary; HTTPS is `HTTPClient` from LWPT's `packages/httpclient/`. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT is the canonical source for HTTPClient, CLI, Semver, TOML, and TestingPascalLibrary — all consumed as workspace packages via the root manifest's `[workspaces]` glob (Phase 1 done per ADR-0014 + ADR-0015). GocciaScript is the first named consumer and commits to Path A adoption; Phase 2 graduates individual packages to standalone repos when warranted.
-- **Pre-1.0 has deliberate gaps.** The self-hosted origin-and-mirror HTTP registry implementation is tracked in [issue #29](https://github.com/frostney/lwpt/issues/29); its interoperable wire contract is specified in [`registry-spec.md`](./registry-spec.md). Duplication analysis and codebase health have landed. Architecture drift is a project-local release check for LWPT itself, not a customer feature.
+- **The registry origin is self-hosted.** `lwpt registry init|serve` owns stable
+  identity, content-addressed archives and metadata, atomically activated
+  signed snapshots, crash recovery, and the foreground HTTP/TLS lifecycle per
+  [ADR-0043](./adr/0043-self-hosted-registry-origin.md). Publication, clients,
+  and mirrors build on the wire contract in [`registry-spec.md`](./registry-spec.md).
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
 - **Compiler work is session-private.** Build/test compiler outputs stay below a project-owned build-session root (project-local by default, relocatable for path budget); successful build outputs are revalidated and atomically published, while completed-session logs remain available until `lwpt repair` reclaims the session. See ADR-0020.
 - **Build scheduling follows the manifest DAG.** Ready build entries overlap within
@@ -361,7 +365,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.Delphi.pas`,
 `LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
-`LWPT.GitProtocol.pas`) plus a small remainder of utility units
+`LWPT.GitProtocol.pas`, and the `LWPT.Registry.*` origin storage, signing,
+HTTP routing, and native macOS listener units) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
 LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` —
 live under `packages/<name>/` per

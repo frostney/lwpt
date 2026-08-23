@@ -5,7 +5,7 @@ Platform support tiers, the per-platform TLS backend story, the release process,
 ## Executive Summary
 
 - **Six release targets** map to the matrix in [`docs/ci.md`](./ci.md): `aarch64-darwin` + `x86_64-darwin` + `x86_64-linux` + `aarch64-linux` + `x86_64-win64` + `i386-win32`. All six tested natively on every push to `main` (per `ci.yml`); all six published per release tag (per `release.yml`).
-- **TLS is platform-native in both directions on Windows and macOS.** Clients use SChannel on Windows, SecureTransport on macOS, and OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md). Server accept uses native SChannel on Windows per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md) and runtime-loaded OpenSSL on Unix-not-Darwin per [ADR-0024](./adr/0024-openssl-server-tls-accept.md); Darwin callers get an actionable Network.framework error.
+- **TLS is platform-native in both directions on Windows and macOS.** Clients use SChannel on Windows, SecureTransport on macOS, and OpenSSL on Linux per [ADR-0016](./adr/0016-tls-backend-per-platform.md). Server accept uses native SChannel on Windows per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md), runtime-loaded OpenSSL on Unix-not-Darwin per [ADR-0024](./adr/0024-openssl-server-tls-accept.md), and Network.framework for the self-hosted registry origin on macOS per [ADR-0043](./adr/0043-self-hosted-registry-origin.md).
 - **Windows has no OpenSSL relationship at all.** Neither direction links, loads, or requires OpenSSL, so Windows server consumers have no DLL prerequisite and `i386-win32` supports server accept like every other target.
 - **The three Windows CI guards fail closed on OpenSSL linkage.** They inspect normal and delay imports, imported symbol families regardless of DLL name, and static-link inputs; canaries prove the parser sees both a prohibited fixture and real system imports.
 - **No codesigning for v1.** macOS users see the "unidentified developer" warning; documented workaround is `xattr -d com.apple.quarantine ./lwpt`. Promote to Apple Developer ID + notarisation only on demonstrated demand.
@@ -29,7 +29,7 @@ Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), [ADR-0024](./adr/0024-op
 | Platform | Outbound client | Server accept | Runtime prerequisite |
 |----------|-----------------|---------------|----------------------|
 | **Windows** | SChannel | SChannel (SSPI + crypt32), built in | None |
-| **macOS** | SecureTransport | Unsupported; use Network.framework | None |
+| **macOS** | SecureTransport | Network.framework for the registry origin; generic `TransportSecurity` accept remains unsupported | None |
 | **Linux + other Unix** | OpenSSL, runtime-loaded | OpenSSL 3+, runtime-loaded | Distro's libssl package — see "Linux" below |
 
 `HTTPClient` consumes the blocking `StartTransportSecurity` surface for outbound connections. Fd-owning servers create one `TTransportSecurityServerContext` from caller-supplied PKCS#12 bytes plus a passphrase; the byte input is copied, parsed synchronously, and wiped. The convenience path overload walks every component without following symbolic links or reparse points, retains the validated parent handles until the final file is open, reads through that final handle, then delegates to the byte API. Strict validation is the default: the leaf and bundled chain must be currently valid, the leaf must explicitly support server authentication and must not assert `CA:TRUE` (basic constraints may be absent), every bundled issuer must assert `CA:TRUE`, permit certificate signing when key usage is present, and satisfy its path-length constraint, and every bundled link must have coherent names and signatures. The `issuer-no-certsign` fixture is rejected because its key-usage extension omits `keyCertSign`. This policy validates the supplied identity, not platform system trust. Self-signed development identities require explicit `tsivPermissive` validation.
@@ -90,7 +90,12 @@ Server accept has the same story per [ADR-0033](./adr/0033-schannel-server-tls-a
 
 The `Darwin` client branch of `TransportSecurity.pas` calls into Apple's SecureTransport framework, which is built into every macOS install. No `brew install openssl@3`, no `DYLD_LIBRARY_PATH` shenanigans, no library version pinning. macOS release archives ship the binary alone, same shape as the Windows archives (without the `.exe` suffix).
 
-Server accept is intentionally unsupported on Darwin. Constructing a `TTransportSecurityServerContext` fails cleanly with an error directing the caller to Network.framework, which owns TLS for duetto's macOS server backend. LWPT does not add deprecated, TLS-1.2-capped SecureTransport server mode or a macOS OpenSSL prerequisite.
+Generic `TTransportSecurityServerContext` accept remains unsupported on Darwin.
+The self-hosted registry origin instead imports its size-bounded PKCS#12
+identity into a process-private temporary keychain, validates the bundled
+chain against its private anchor with Apple's SSL server policy, and owns a
+Network.framework listener directly. It does not add deprecated,
+TLS-1.2-capped SecureTransport server mode or a macOS OpenSSL prerequisite.
 
 #### Quarantine workaround
 

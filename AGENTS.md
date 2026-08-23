@@ -1,6 +1,6 @@
 # Agent Instructions
 
-LWPT is a single-binary Pascal toolkit driven by a single `lwpt.toml` manifest. Fourteen subcommands (`init`, `install`, `add`, `remove`, `outdated`, `update`, `build`, `format`, `duplication`, `test`, `repair`, `run`, `health`, `agents`) sit on top of a shared core that emits FPC response fragments the rest of the toolkit consumes.
+LWPT is a single-binary Pascal toolkit driven by a single `lwpt.toml` manifest. Fifteen command families (`init`, `install`, `add`, `remove`, `outdated`, `update`, `build`, `format`, `duplication`, `test`, `repair`, `registry`, `run`, `health`, `agents`) sit on top of a shared core that emits FPC response fragments the rest of the toolkit consumes.
 
 This file is the operating manual for AI assistants and the canonical contract for what agents may not violate. Detailed how-to material lives under [`docs/`](./docs/); when this file mentions a topic in a sentence or two, the canonical home is one link away.
 
@@ -23,7 +23,7 @@ These would silently corrupt the project if violated.
 - **Compiler outputs are invocation-private.** `lwpt build` and `lwpt test` write executables, units, objects, resources, and compiled hooks only below their unique project-owned build session (`.lwpt/sessions/<session-id>/` by default, or an identity-verified relocated root). A build may mutate its public manifest output only through fingerprint revalidation plus `AtomicReplaceFile`; `--clean` forces recompilation and never sweeps shared paths. See [ADR-0020](./docs/adr/0020-isolated-build-sessions.md).
 - **`lwpt install` takes a cross-process lock** at `.lwpt/install.lock` (Unix: `O_CREAT|O_EXCL`; Windows: `LockFileEx`). Two concurrent installs in the same project fail fast with `EConcurrencyError` naming the holder's PID. A crashed install leaves the lock file behind; `lwpt repair` clears it. The lock encompasses the full pipeline: crash-recovery cleanup, resolve, fetch, extract, lockfile + cfg write — and, for the `add` / `remove` mutation flow ([ADR-0019](./docs/adr/0019-add-remove-subcommands.md)), the `lwpt.toml` commit + orphan pruning.
 - **`lwpt.lock` is machine-written, schema v3.** Never hand-edit. The schema records the verbatim manifest source string, the resolver's chosen ref (tag/SHA), the actual archive URL, the extracted-tree sha256, and the cached-archive sha256. `--frozen` re-hashes the archive + tree and compares to both stored hashes. v1 and v2 lockfiles fail to load with a clear migration hint. Corrupt lockfile → delete + re-run `lwpt install` to regenerate. See [ADR-0008](./docs/adr/0008-lockfile-schema-v2-archive-hash.md) (v1→v2 archiveHash split) and [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md) (v2→v3 source-syntax refactor; the last lockfile schema break in v1).
-- **Subcommand surface is frozen.** Adding a new subcommand requires an ADR. Current set: `install`, `add` + `remove` ([ADR-0019](./docs/adr/0019-add-remove-subcommands.md) — manifest-editing frontends to the install transaction; install-before-write ordering and lockfile-diff pruning are part of their contract), `outdated` + `update` ([ADR-0039](./docs/adr/0039-outdated-update-subcommands.md) — Dependabot-equivalent for git-host deps; `update` rewrites constraints then runs the install transaction), `build`, `format`, `duplication` and `health` ([ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md), with health's shipped contract in [`docs/health.md`](./docs/health.md)), `test`, `repair`, `init` ([ADR-0010](./docs/adr/0010-init-subcommand.md)), `run` ([ADR-0013](./docs/adr/0013-run-subcommand-and-build-rename.md)), and `agents` ([ADR-0027](./docs/adr/0027-agents-subcommand.md) — writes/verifies the marker-fenced command reference in `AGENTS.md`; the generated block below is its dogfooded output). An earlier `export` subcommand was retired per [ADR-0015](./docs/adr/0015-drop-export-testing-becomes-workspace-package.md) when the testing framework graduated to `packages/testing/`.
+- **Subcommand surface is frozen.** Adding a new subcommand requires an ADR. Current set: `install`, `add` + `remove` ([ADR-0019](./docs/adr/0019-add-remove-subcommands.md) — manifest-editing frontends to the install transaction; install-before-write ordering and lockfile-diff pruning are part of their contract), `outdated` + `update` ([ADR-0039](./docs/adr/0039-outdated-update-subcommands.md) — Dependabot-equivalent for git-host deps; `update` rewrites constraints then runs the install transaction), `build`, `format`, `duplication` and `health` ([ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md), with health's shipped contract in [`docs/health.md`](./docs/health.md)), `test`, `repair`, `init` ([ADR-0010](./docs/adr/0010-init-subcommand.md)), the `registry init|serve` family ([ADR-0043](./docs/adr/0043-self-hosted-registry-origin.md)), `run` ([ADR-0013](./docs/adr/0013-run-subcommand-and-build-rename.md)), and `agents` ([ADR-0027](./docs/adr/0027-agents-subcommand.md) — writes/verifies the marker-fenced command reference in `AGENTS.md`; the generated block below is its dogfooded output). An earlier `export` subcommand was retired per [ADR-0015](./docs/adr/0015-drop-export-testing-becomes-workspace-package.md) when the testing framework graduated to `packages/testing/`.
 - **No new external dependencies** in the LWPT binary distribution. Contributor / CI tooling (when those workstreams land) is separate; documented in [`docs/tooling.md`](./docs/tooling.md).
 
 ## Runtime / Commands
@@ -85,6 +85,7 @@ Workflow knowledge that is not derivable from the command surface. The generated
 | Run LWPT's E2E paths offline | `./build/lwpt test 'tests/e2e/*.Test.pas' 'packages/*/tests/e2e/*.Test.pas'` |
 | Add a dependency without `lwpt add` | edit `lwpt.toml`, then `./build/lwpt install` |
 | See which git-host deps have newer tags | `./build/lwpt outdated` (`--json` for the machine report) |
+| Initialize or run a self-hosted registry origin | `./build/lwpt registry init` then `./build/lwpt registry serve` |
 | Update outdated git-host deps | `./build/lwpt update` or `./build/lwpt update <name>` |
 | Update a dependency's version spec by hand | `./build/lwpt add <source@new-version>` (same name → entry updated, stale archive pruned) |
 | Show the version | `./build/lwpt --version` |
@@ -132,6 +133,15 @@ Generated by `lwpt agents` from the toolkit's command registry and this project'
   - `--no-cache` — Compile without reading or writing reusable test executables
   - `--silent` — Suppress ordinary output and emit only the final command result
 - `lwpt repair [--silent]` — Recover project and shared-cache residue
+  - `--silent` — Suppress ordinary output and emit only the final command result
+- `lwpt registry <init|serve> [--data-dir <path>] [configuration options] [--silent]` — Initialize or serve a self-hosted registry origin
+  - `--data-dir=<value>` — Origin data directory (default: .lwpt/registry)
+  - `--identity=<value>` — Stable canonical HTTPS origin identity (init only)
+  - `--base-url=<value>` — Canonical public base URL (init only; default: http://localhost:8080)
+  - `--listen=<value>` — Listen address (init only; default: localhost)
+  - `--port=<N>` — Listen port (init only; default: 8080)
+  - `--tls-pkcs12=<value>` — PKCS#12 identity path required by HTTPS (init only)
+  - `--tls-password-env=<value>` — Environment variable containing the PKCS#12 password (init only)
   - `--silent` — Suppress ordinary output and emit only the final command result
 - `lwpt init [--yes] [--force] [--adopt] [--silent]` — Scaffold a new LWPT project or adopt an existing manifest
   - `--yes` — Skip prompts and use defaults derived from the directory name

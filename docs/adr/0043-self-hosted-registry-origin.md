@@ -1,0 +1,132 @@
+# Self-hosted registry origin lifecycle
+
+Issue [#53](https://github.com/frostney/lwpt/issues/53) turns the registry
+protocol from [a wire contract](../registry-spec.md) into an origin that the
+LWPT executable can initialize and run. The command surface is
+`lwpt registry init|serve`: one ADR-backed command family with lifecycle
+operations below it, rather than two unrelated top-level subcommands. This is
+the interface approved by the registry parent issue and preserves the frozen
+top-level vocabulary as one cohesive capability.
+
+`registry init` accepts `--data-dir`, `--identity`, `--base-url`, `--listen`,
+`--port`, `--tls-pkcs12`, and `--tls-password-env`. Its deterministic defaults
+are `.lwpt/registry`, `http://localhost:8080`, `localhost`, and port `8080`.
+On first initialization the canonical base URL becomes the identity unless an
+explicit canonical HTTPS identity is supplied. Later initialization may move
+the base URL or listener and atomically updates operational configuration, but
+an existing identity cannot change. `registry serve` opens that data directory
+and remains in the foreground; process supervisors own daemonization and
+restart policy.
+
+## Storage and activation
+
+The data directory is an origin, not an install cache:
+
+```text
+registry.toml
+keys/root.seed
+keys/ed25519-<public-key-hash>.toml
+objects/sha256/<hash>
+records/sha256/<hash>.toml
+snapshots/sha256/<hash>.toml
+checkpoints/<sequence>.toml
+checkpoints/<sequence>.sig.toml
+indexes/<package>.toml
+state/current.toml
+locks/
+tmp/
+```
+
+Archives and protocol metadata are immutable at their content-addressed path.
+Writing different bytes to an occupied path is an `immutable_conflict`.
+Publishing an existing `(origin, name, version)` with identical bytes is
+idempotent; different bytes are an `identity_conflict`. A per-package version
+index is replaced atomically and is a derived lookup aid, not a trust root.
+
+Publication writes the archive, record, next snapshot, checkpoint, detached
+signature, and version index before replacing `state/current.toml`. That one
+small atomic pointer names the complete committed checkpoint, signature, and
+snapshot. A request reads it once, so concurrent readers continue using the
+old immutable graph while a publisher prepares the new one. A crash before
+the pointer replacement leaves unreachable immutable or temporary data; a
+crash after it leaves a complete new graph.
+
+Publication takes an operating-system advisory producer lease. Its persistent
+guard and diagnostic files do not establish liveness: the kernel lock is
+released when a process exits. Startup reclaims `tmp/` only after acquiring
+that lease, then verifies the activated snapshot hash, checkpoint relationship,
+key record, signature payload, and Ed25519 signature. If a publisher is live,
+startup leaves its staging alone and serves the previous committed pointer.
+
+All committed-state writes use `AtomicWriteBytes`. The private seed is written
+the same way and mode `0600` is applied on Unix. The password is read from the
+named environment variable only while constructing the TLS listener; it is
+never persisted.
+
+## Signing and diagnostics
+
+`LWPT.Registry.Crypto` is the shared signing and verification primitive for
+origin, mirror, resolver, and cache consumers. It implements SHA-512 and
+RFC 8032 Ed25519 in Pascal, produces the same bytes on every release platform,
+uses platform secure randomness only for seed generation, rejects non-canonical
+signature scalars, and is pinned by the RFC 8032 empty-message and one-byte
+vectors. It does not select OpenSSL, Security.framework, or CNG signing APIs,
+which prevents provider defaults from changing registry identity across
+platforms.
+
+Registry failures begin with a stable lowercase reason code followed by a
+colon, including `insecure_transport`, `identity_conflict`,
+`immutable_conflict`, `publication_locked`, `snapshot_hash_mismatch`,
+`signature_payload_mismatch`, and `signature_invalid`. Human detail may grow;
+consumers branch only on the code.
+
+## Listener and TLS lifecycle
+
+Plain HTTP is accepted only when the canonical base URL host is the exact name
+`localhost` and the listener is `localhost` or `127.0.0.1`. A wildcard,
+private address, or other host produces `insecure_transport` before serving.
+
+HTTPS uses the repository's native server policy:
+
+- Windows uses the HTTPClient package's native SChannel server context.
+- Unix other than Darwin uses its runtime-loaded OpenSSL 3 memory-BIO server
+  context.
+- macOS imports the configured PKCS#12 identity into a process-private
+  temporary keychain, validates its bundled chain with a private anchor and
+  Apple's server policy, and serves with Network.framework. FPC 3.2.2 reaches
+  the Network C API through the stable blocks ABI, with one serial queue per
+  connection.
+
+The listener handles each socket or Network.framework connection independently
+and closes it after one bounded HTTP/1.1 GET or HEAD request. Request headers
+are capped at 32 KiB. Hashed objects are returned without content encoding and
+with immutable cache headers. Discovery, capabilities, current checkpoints,
+keys, snapshots, records, and archive objects are served relative to the
+configured base path. Authenticated remote publication remains issue #54, so
+this slice does not advertise `publication-v1` yet.
+
+## Rejected alternatives
+
+- **Run tasks as the server interface.** Run tasks launch user commands and
+  cannot own persisted identity, generated trust roots, recovery, or a stable
+  cross-project contract.
+- **Extend project `init`.** Project scaffolding and registry-origin creation
+  have unrelated state, secrets, and lifecycle rules.
+- **Rewrite `latest.toml` and `latest.sig.toml` independently.** Two renames
+  permit a reader to observe a checkpoint and signature from different
+  publications. The activation pointer makes their relationship atomic.
+- **Use cache eviction or mutable object paths.** An origin is authoritative
+  durable state. Cache policy must never remove a snapshot ancestor or replace
+  published bytes.
+- **Select a platform Ed25519 provider.** Provider-specific parsing and
+  canonicality behavior would make signatures and diagnostics drift between
+  release targets.
+
+## Consequences
+
+The origin can be hosted directly by LWPT and supervised by any ordinary
+process manager. Old snapshots and objects accumulate until an explicit,
+protocol-aware retention design is approved; general cache repair and eviction
+must not touch them. Remote publication, mirror synchronization, and registry
+dependency resolution build on this store and shared crypto unit in issues
+#54 and #55.

@@ -12,9 +12,9 @@
 - Origins accept authenticated, atomic publication through the HTTP API.
   Mirrors synchronize the same immutable objects and publish a checkpoint only
   after every referenced object has verified.
-- This document specifies the interoperable wire contract. Implementing the
-  registry executable, storage engine, command surface, or lifecycle requires
-  an implementation ADR in the corresponding implementation issue.
+- This document specifies the interoperable wire contract. The origin
+  executable, storage engine, command surface, and lifecycle are recorded in
+  [ADR-0043](./adr/0043-self-hosted-registry-origin.md).
 
 ## Status and conformance language
 
