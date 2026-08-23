@@ -61,6 +61,7 @@ const
   SiblingFailureReadySuffix = '-failure-ready';
   SiblingCancellationReceivedSuffix = '-cancellation-received';
   NestedCompilerNaturalExitSuffix = '-natural-exit';
+  NestedCompilerStartedAtSuffix = '-started-at';
   SiblingSlowSources: array[0..5] of string = (
     'A.Slow.Test.pas', 'C.Slow.Test.pas', 'D.Slow.Test.pas',
     'E.Slow.Test.pas', 'F.Slow.Test.pas', 'G.Slow.Test.pas');
@@ -842,12 +843,14 @@ end;
 
 procedure TTestScheduling.TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
 var
+  CancellationElapsed, CompilerStartedAt, ReturnedAt: QWord;
   CompilerPID: Integer;
-  NestedProject, PIDFile: string;
+  NestedProject, NestedTestStartedPath, PIDFile: string;
   CommandResult: TLwptResult;
 begin
   ResetProject(0);
   NestedProject := FScratch + '/nested-build';
+  NestedTestStartedPath := FScratch + '/control/nested-test-started';
   PIDFile := FScratch + '/control/nested-compiler-pid';
   WriteBuildProject(NestedProject);
   WriteTextFile(FScratch + '/tests/A.Nested.Test.pas',
@@ -855,7 +858,12 @@ begin
     + '{$mode delphi}{$H+}'#10
     + 'uses Process, SysUtils;'#10
     + 'var Child: TProcess; Entry: string; Index: Integer;'#10
+    + '  MarkerFile: Text;'#10
     + 'begin'#10
+    + '  Assign(MarkerFile, ' + PascalString(NestedTestStartedPath) + ');'#10
+    + '  Rewrite(MarkerFile);'#10
+    + '  Write(MarkerFile, GetTickCount64);'#10
+    + '  Close(MarkerFile);'#10
     + '  Child := TProcess.Create(nil);'#10
     + '  try'#10
     + '    Child.Executable := '
@@ -900,6 +908,8 @@ begin
     + '    Child.Free;'#10
     + '  end;'#10
     + 'end.'#10);
+  { Compilation order is intentionally unconstrained. Start the compiler
+    startup ceiling only after the nested test reaches its runtime phase. }
   WriteTextFile(FScratch + '/tests/B.Fail.Test.pas',
       'program FailAfterNestedCompilerStarts;'#10
     + '{$mode delphi}{$H+}'#10
@@ -907,20 +917,44 @@ begin
     + 'var Started: TDateTime;'#10
     + 'begin'#10
     + '  Started := Now;'#10
+    + '  while (not FileExists(' + PascalString(NestedTestStartedPath)
+    + '))'#10
+    + '    and ((Now - Started) * ' + IntToStr(SecondsPerDay) + ' < '
+    + IntToStr(ProcessStartupCeilingSeconds) + ') do Sleep('
+    + IntToStr(ProcessPollMilliseconds) + ');'#10
+    + '  if not FileExists(' + PascalString(NestedTestStartedPath)
+    + ') then Halt(2);'#10
+    + '  Started := Now;'#10
     + '  while (not FileExists(' + PascalString(PIDFile) + '))'#10
     + '    and ((Now - Started) * ' + IntToStr(SecondsPerDay) + ' < '
     + IntToStr(MarkerWaitCeilingSeconds) + ') do Sleep('
     + IntToStr(ProcessPollMilliseconds) + ');'#10
-    + '  if not FileExists(' + PascalString(PIDFile) + ') then Halt(2);'#10
+    + '  if not FileExists(' + PascalString(PIDFile) + ') then Halt(3);'#10
     + '  Halt(1);'#10
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
 
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
+  ReturnedAt := GetTickCount64;
+  if not FileExists(NestedTestStartedPath) then
+    Fail('nested test did not reach its runtime startup barrier');
+  if not FileExists(PIDFile) then
+    Fail('nested compiler did not reach its startup barrier');
+  if not FileExists(PIDFile + NestedCompilerStartedAtSuffix) then
+    Fail('nested compiler did not record its monotonic startup time');
+  CompilerStartedAt := StrToQWord(Trim(ReadBinaryFile(
+    PIDFile + NestedCompilerStartedAtSuffix)));
+  if ReturnedAt < CompilerStartedAt then
+    Fail('nested compiler startup time followed command return');
+  CancellationElapsed := ReturnedAt - CompilerStartedAt;
+  if CancellationElapsed >=
+     QWord(CancellationCompletionCeilingSeconds) * 1000 then
+    Fail('nested compiler cancellation took '
+      + UIntToStr(CancellationElapsed) + ' ms; ceiling is '
+      + IntToStr(CancellationCompletionCeilingSeconds * 1000) + ' ms');
   Expect<Boolean>(FileExists(PIDFile + NestedCompilerNaturalExitSuffix))
     .ToBe(False);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
   CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
   { Reap-until-empty is part of the command-return contract: no retry loop. }
   Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
@@ -1729,18 +1763,20 @@ end;
 
 procedure TTestScheduling.TestSubprocessDrainDoesNotWaitForInheritedPipeEOF;
 var
+  DrainElapsed, FixtureCompletedAt, ReturnedAt: QWord;
   HolderPID: Integer;
-  HolderPIDPath: string;
+  FixtureCompletedPath, HolderPIDPath: string;
   RunResult: TLwptResult;
   StartedAt: QWord;
 begin
   HolderPID := -1;
   ResetProject(0);
+  FixtureCompletedPath := FScratch + '/control/pipe-fixture-completed';
   HolderPIDPath := FScratch + '/control/pipe-holder-pid';
   WriteTextFile(FScratch + '/tests/A.InheritPipe.Test.pas',
       'program InheritPipeFixture;'#10
     + '{$mode delphi}{$H+}'#10
-    + 'uses Process;'#10
+    + 'uses Process, SysUtils;'#10
     + 'var Child: TProcess; PIDFile: Text;'#10
     + 'begin'#10
     + '  Child := TProcess.Create(nil);'#10
@@ -1753,13 +1789,27 @@ begin
     + '    Write(PIDFile, Child.ProcessID);'#10
     + '    Close(PIDFile);'#10
     + '  finally Child.Free end;'#10
+    + '  Assign(PIDFile, ' + PascalString(FixtureCompletedPath) + ');'#10
+    + '  Rewrite(PIDFile);'#10
+    + '  Write(PIDFile, GetTickCount64);'#10
+    + '  Close(PIDFile);'#10
     + 'end.'#10);
   try
-    StartedAt := GetTickCount64;
     RunResult := RunTests(['--jobs=1']);
+    ReturnedAt := GetTickCount64;
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
-    Expect<Boolean>(GetTickCount64 - StartedAt
-      < SubprocessDrainCompletionCeilingMilliseconds).ToBe(True);
+    { Compilation and worker acquisition precede the behavior under test. }
+    if not FileExists(FixtureCompletedPath) then
+      Fail('pipe fixture did not record its monotonic completion time');
+    FixtureCompletedAt := StrToQWord(Trim(ReadBinaryFile(
+      FixtureCompletedPath)));
+    if ReturnedAt < FixtureCompletedAt then
+      Fail('pipe fixture completion time followed command return');
+    DrainElapsed := ReturnedAt - FixtureCompletedAt;
+    if DrainElapsed >= SubprocessDrainCompletionCeilingMilliseconds then
+      Fail('subprocess drain took ' + UIntToStr(DrainElapsed)
+        + ' ms after fixture completion; ceiling is '
+        + IntToStr(SubprocessDrainCompletionCeilingMilliseconds) + ' ms');
     Expect<Boolean>(FileExists(HolderPIDPath)).ToBe(True);
     if FileExists(HolderPIDPath) then
       HolderPID := StrToInt(Trim(ReadBinaryFile(HolderPIDPath)));
@@ -2274,6 +2324,9 @@ begin
        and SameText(SourceFile, 'A.Slow.Test.pas')) then
   begin
     WriteTextFile(PIDFile, IntToStr(GetProcessID));
+    if Mode = IgnoreTerminateCompilerProxyMode then
+      WriteTextFile(PIDFile + NestedCompilerStartedAtSuffix,
+        UIntToStr(GetTickCount64));
     Sleep(LongRunningFixtureMilliseconds);
     if Mode = IgnoreTerminateCompilerProxyMode then
     begin
