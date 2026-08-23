@@ -10,6 +10,7 @@ uses
   cthreads,
   {$ENDIF}
   Classes,
+  Pipes,
   Process,
   SysUtils,
 
@@ -27,6 +28,9 @@ const
   ADMIT_CHILD_TIMEOUT_MS = 5000;
   ADMIT_CHILD_TERMINATION_TIMEOUT_MS = 2000;
   CONTENTION_ITERATIONS = 16;
+  DIAGNOSTIC_STREAM_BYTES = 256 * 1024;
+  STDOUT_TAIL_MARKER = 'object-store-stdout-tail';
+  STDERR_TAIL_MARKER = 'object-store-stderr-tail';
 
 type
   TAdmitterResult = record
@@ -72,6 +76,7 @@ type
     procedure TestCorruptObjectIsQuarantinedAndMisses;
     procedure TestConcurrentValidReplacementIsRestoredAfterQuarantine;
     procedure TestInterruptedTemporaryObjectIsNeverVisible;
+    procedure TestAfterPublicationFailureRollsBackAndRecovers;
     procedure TestAdmitterFailurePreservesDiagnostics;
     procedure TestConcurrentSameKeyAdmissionPublishesOneCompleteObject;
     procedure TestRepairPreservesActiveCrossProcessAdmission;
@@ -115,8 +120,12 @@ begin
   MarkChildPhase('09-publication-started');
   if InjectPublicationFailure then
   begin
-    WriteLn('intentional object-store child stdout');
-    WriteLn(ErrOutput, 'intentional object-store child stderr');
+    WriteLn(StringOfChar('o', DIAGNOSTIC_STREAM_BYTES));
+    WriteLn(STDOUT_TAIL_MARKER);
+    Flush(Output);
+    WriteLn(ErrOutput, StringOfChar('e', DIAGNOSTIC_STREAM_BYTES));
+    WriteLn(ErrOutput, STDERR_TAIL_MARKER);
+    Flush(ErrOutput);
     raise Exception.Create('intentional object-store child failure');
   end;
 end;
@@ -124,6 +133,11 @@ end;
 procedure AfterPublication(const AStaged, ADestination: string);
 begin
   MarkChildPhase('10-publication-completed');
+end;
+
+procedure FailAfterPublication(const AStaged, ADestination: string);
+begin
+  raise Exception.Create('intentional after-publication failure');
 end;
 
 function WaitForSignal(const APath: string): Boolean;
@@ -138,32 +152,39 @@ begin
   Result := FileExists(APath);
 end;
 
-procedure ReapAdmitter(const AProcess: TProcess);
-begin
-  if AProcess.WaitOnExit(ADMIT_CHILD_TERMINATION_TIMEOUT_MS)
-     or not AProcess.Running then
-  begin
-    AProcess.WaitOnExit;
-    Exit;
-  end;
-  raise Exception.Create('object-store admitter did not terminate');
-end;
-
-function ReadProcessStream(const AStream: TStream): string;
+function DrainAvailableProcessStream(
+  const AStream: TInputPipeStream): string;
+const
+  CHUNK_SIZE = 4096;
 var
-  Buffer: array[0..4095] of Byte;
-  Chunk: string;
-  Count: Integer;
+  Available, Count, ReadSize, Total: Integer;
+  Buffer: array[0..CHUNK_SIZE - 1] of Byte;
 begin
   Result := '';
-  repeat
-    Count := AStream.Read(Buffer[0], SizeOf(Buffer));
-    if Count > 0 then
-    begin
-      SetString(Chunk, PAnsiChar(@Buffer[0]), Count);
-      Result := Result + Chunk;
-    end;
-  until Count <= 0;
+  Available := AStream.NumBytesAvailable;
+  Total := 0;
+  while Available > 0 do
+  begin
+    ReadSize := CHUNK_SIZE;
+    if Available < ReadSize then ReadSize := Available;
+    Count := AStream.Read(Buffer[0], ReadSize);
+    if Count <= 0 then Break;
+    SetLength(Result, Total + Count);
+    Move(Buffer[0], Result[Total + 1], Count);
+    Inc(Total, Count);
+    Dec(Available, Count);
+  end;
+end;
+
+procedure DrainAdmitterStreams(const AProcess: TProcess;
+  var AResult: TAdmitterResult);
+begin
+  if AProcess.Output.NumBytesAvailable > 0 then
+    AResult.Stdout := AResult.Stdout
+      + DrainAvailableProcessStream(AProcess.Output);
+  if AProcess.Stderr.NumBytesAvailable > 0 then
+    AResult.Stderr := AResult.Stderr
+      + DrainAvailableProcessStream(AProcess.Stderr);
 end;
 
 function CollectChildPhases(const APrefix: string): string;
@@ -194,19 +215,39 @@ end;
 
 function FinishAdmitter(const AProcess: TProcess;
   const APhasePrefix: string): TAdmitterResult;
+var
+  StartedAt, TerminatedAt: QWord;
 begin
   Result.TimedOut := False;
-  if AProcess.WaitOnExit(ADMIT_CHILD_TIMEOUT_MS)
-     or not AProcess.Running then
+  Result.Stdout := '';
+  Result.Stderr := '';
+  StartedAt := GetTickCount64;
+  { WaitOnExit cannot precede draining: a child that fills either pipe blocks
+    before it can exit. Keep both streams moving through the deadline and the
+    termination grace, then reap and collect the final available bytes. }
+  while AProcess.Running
+    and (GetTickCount64 - StartedAt < ADMIT_CHILD_TIMEOUT_MS) do
   begin
-    AProcess.WaitOnExit;
+    DrainAdmitterStreams(AProcess, Result);
+    Sleep(10);
   end;
   if AProcess.Running then
   begin
     Result.TimedOut := True;
     AProcess.Terminate(1);
-    ReapAdmitter(AProcess);
+    TerminatedAt := GetTickCount64;
+    while AProcess.Running
+      and (GetTickCount64 - TerminatedAt <
+        ADMIT_CHILD_TERMINATION_TIMEOUT_MS) do
+    begin
+      DrainAdmitterStreams(AProcess, Result);
+      Sleep(10);
+    end;
+    if AProcess.Running then
+      raise Exception.Create('object-store admitter did not terminate');
   end;
+  AProcess.WaitOnExit;
+  DrainAdmitterStreams(AProcess, Result);
   Result.ExitCode := AProcess.ExitCode;
   Result.RawExitStatus := AProcess.ExitStatus;
   Result.ExitStatus := Result.RawExitStatus;
@@ -214,8 +255,6 @@ begin
   if (Result.ExitStatus > 255) and (Result.ExitStatus mod 256 = 0) then
     Result.ExitStatus := Result.ExitStatus div 256;
   {$ENDIF}
-  Result.Stdout := ReadProcessStream(AProcess.Output);
-  Result.Stderr := ReadProcessStream(AProcess.Stderr);
   Result.Phases := CollectChildPhases(APhasePrefix);
 end;
 
@@ -558,6 +597,43 @@ begin
 end;
 
 procedure TObjectStoreContract.
+  TestAfterPublicationFailureRollsBackAndRecovers;
+var
+  Store: TLWPTImmutableObjectStore;
+  ObjectPath, HitPath: string;
+  Raised: Boolean;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ObjectPath := Store.ObjectPath(FDigest);
+    Raised := False;
+    ObjectStoreAfterPublicationTestHook := FailAfterPublication;
+    try
+      try
+        Store.Admit(FSource, FDigest);
+      except
+        on E: Exception do
+          Raised := Pos('intentional after-publication failure',
+            E.Message) > 0;
+      end;
+    finally
+      ObjectStoreAfterPublicationTestHook := nil;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(FileExists(ObjectPath)).ToBe(False);
+    Expect<Boolean>(Store.Lookup(FDigest, HitPath)).ToBe(False);
+    Expect<string>(Store.Admit(FSource, FDigest)).ToBe(ObjectPath);
+    Expect<Boolean>(Store.Lookup(FDigest, HitPath)).ToBe(True);
+    Expect<string>(HitPath).ToBe(ObjectPath);
+    Expect<string>('sha256:' + SHA256File(HitPath)).ToBe(FDigest);
+  finally
+    ObjectStoreAfterPublicationTestHook := nil;
+    Store.Free;
+  end;
+end;
+
+procedure TObjectStoreContract.
   RunContentionIteration(const AIteration: Integer);
 var
   Store: TLWPTImmutableObjectStore;
@@ -623,7 +699,8 @@ var
   Admitter: TProcess;
   AdmitterFinished: Boolean;
   AdmitterResult: TAdmitterResult;
-  Diagnostic, ReadyPath, ReleasePath: string;
+  Diagnostic, ExpectedStderrPrefix, ExpectedStdout, ReadyPath,
+    ReleasePath: string;
 begin
   ReadyPath := FScratch + '/diagnostic-ready';
   ReleasePath := FScratch + '/diagnostic-release';
@@ -642,16 +719,22 @@ begin
     Admitter.Free;
   end;
   Diagnostic := AdmitterDiagnostic('intentional failure', AdmitterResult);
+  ExpectedStdout := StringOfChar('o', DIAGNOSTIC_STREAM_BYTES)
+    + LineEnding + STDOUT_TAIL_MARKER + LineEnding;
+  ExpectedStderrPrefix := StringOfChar('e', DIAGNOSTIC_STREAM_BYTES)
+    + LineEnding + STDERR_TAIL_MARKER + LineEnding;
   Expect<Integer>(AdmitterResult.ExitStatus).ToBe(217);
+  Expect<Boolean>(AdmitterResult.TimedOut).ToBe(False);
   Expect<Boolean>(Pos('exit-status=217', Diagnostic) > 0).ToBe(True);
   Expect<Boolean>(Pos('phases=01-child-started,02-store-created,'
     + '03-ready-signaled,04-release-observed,05-admission-started,'
     + '06-object-staged,09-publication-started',
     Diagnostic) > 0).ToBe(True);
-  Expect<Boolean>(Pos('intentional object-store child stdout',
-    AdmitterResult.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('intentional object-store child stderr',
-    AdmitterResult.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(AdmitterResult.Stdout = ExpectedStdout).ToBe(True);
+  Expect<Boolean>(Pos(ExpectedStderrPrefix, AdmitterResult.Stderr) = 1)
+    .ToBe(True);
+  Expect<Boolean>(Pos(ExpectedStdout, Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos(ExpectedStderrPrefix, Diagnostic) > 0).ToBe(True);
   Expect<Boolean>(Pos('intentional object-store child failure',
     AdmitterResult.Stderr) > 0).ToBe(True);
 end;
@@ -709,6 +792,8 @@ begin
     TestConcurrentValidReplacementIsRestoredAfterQuarantine);
   Test('interrupted temporary objects are never visible',
     TestInterruptedTemporaryObjectIsNeverVisible);
+  Test('after-publication failures roll back and allow recovery',
+    TestAfterPublicationFailureRollsBackAndRecovers);
   Test('admitter failures preserve status, streams, and exact phases',
     TestAdmitterFailurePreservesDiagnostics);
   Test('concurrent same-key producers publish one complete object',

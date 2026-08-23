@@ -349,6 +349,9 @@ function TLWPTImmutableObjectStore.AdmitRetained(const ASourcePath,
   out AInserted: Boolean): string;
 var
   Expected, Existing, TmpRoot, Staged, Actual: string;
+  {$IFDEF OBJECTSTORE_TESTING}
+  PublishedStaged: string;
+  {$ENDIF}
   MutationLease, ObjectLease: TObject;
   Published: Boolean;
 begin
@@ -418,11 +421,14 @@ begin
           raise ELWPTObjectStoreError.CreateFmt(
             'failed to publish object %s', [Expected]);
         {$IFDEF OBJECTSTORE_TESTING}
-        if Assigned(ObjectStoreAfterPublicationTestHook) then
-          ObjectStoreAfterPublicationTestHook(Staged, Result);
+        PublishedStaged := Staged;
         {$ENDIF}
         Staged := '';
         Published := True;
+        {$IFDEF OBJECTSTORE_TESTING}
+        if Assigned(ObjectStoreAfterPublicationTestHook) then
+          ObjectStoreAfterPublicationTestHook(PublishedStaged, Result);
+        {$ENDIF}
         FCacheLifecycle.RecordObjectLocked(Expected, Result);
         if not FCacheLifecycle.MakeRoomLocked(0) then
         begin
