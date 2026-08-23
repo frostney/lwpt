@@ -21,12 +21,27 @@ uses
 
 const
   ADMIT_CHILD_SWITCH = '--object-store-admit-child';
+  DIAGNOSTIC_ADMIT_CHILD_SWITCH = '--object-store-diagnostic-admit-child';
   GUARDED_ADMIT_CHILD_SWITCH = '--object-store-guarded-admit-child';
   START_BARRIER_TIMEOUT_MS = 10000;
   ADMIT_CHILD_TIMEOUT_MS = 5000;
   ADMIT_CHILD_TERMINATION_TIMEOUT_MS = 2000;
+  CONTENTION_ITERATIONS = 16;
+
+type
+  TAdmitterResult = record
+    ExitCode: Integer;
+    ExitStatus: Integer;
+    RawExitStatus: Integer;
+    Stdout: string;
+    Stderr: string;
+    Phases: string;
+    TimedOut: Boolean;
+  end;
 
 var
+  ChildPhasePrefix: string;
+  InjectPublicationFailure: Boolean;
   ReplacementSource: string;
   StageReadyPath: string;
   StageReleasePath: string;
@@ -42,7 +57,8 @@ type
     procedure WriteBytes(const APath, AText: string);
     function ReadBytes(const APath: string): string;
     function StartAdmitter(const AReadyPath, AReleasePath: string;
-      const AGuarded: Boolean = False): TProcess;
+      const AChildSwitch: string = ADMIT_CHILD_SWITCH): TProcess;
+    procedure RunContentionIteration(const AIteration: Integer);
   protected
     procedure BeforeAll; override;
     procedure BeforeEach; override;
@@ -56,6 +72,7 @@ type
     procedure TestCorruptObjectIsQuarantinedAndMisses;
     procedure TestConcurrentValidReplacementIsRestoredAfterQuarantine;
     procedure TestInterruptedTemporaryObjectIsNeverVisible;
+    procedure TestAdmitterFailurePreservesDiagnostics;
     procedure TestConcurrentSameKeyAdmissionPublishesOneCompleteObject;
     procedure TestRepairPreservesActiveCrossProcessAdmission;
     procedure TestCacheRootOverrideIsAbsoluteAndNormalized;
@@ -70,14 +87,43 @@ begin
   Stream.Free;
 end;
 
+procedure MarkChildPhase(const APhase: string);
+begin
+  WriteSignal(ChildPhasePrefix + '.phase-' + APhase);
+end;
+
 function WaitForSignal(const APath: string): Boolean; forward;
 
 procedure PauseAfterStage(const APath: string);
 begin
+  MarkChildPhase('06-object-staged');
   WriteSignal(StageReadyPath);
+  MarkChildPhase('07-stage-ready-signaled');
   if not WaitForSignal(StageReleasePath) then
     raise Exception.CreateFmt(
       'timed out waiting to release staged object %s', [APath]);
+  MarkChildPhase('08-stage-release-observed');
+end;
+
+procedure ObserveAfterStage(const APath: string);
+begin
+  MarkChildPhase('06-object-staged');
+end;
+
+procedure BeforePublication(const AStaged, ADestination: string);
+begin
+  MarkChildPhase('09-publication-started');
+  if InjectPublicationFailure then
+  begin
+    WriteLn('intentional object-store child stdout');
+    WriteLn(ErrOutput, 'intentional object-store child stderr');
+    raise Exception.Create('intentional object-store child failure');
+  end;
+end;
+
+procedure AfterPublication(const AStaged, ADestination: string);
+begin
+  MarkChildPhase('10-publication-completed');
 end;
 
 function WaitForSignal(const APath: string): Boolean;
@@ -103,25 +149,94 @@ begin
   raise Exception.Create('object-store admitter did not terminate');
 end;
 
-procedure StopAdmitter(const AProcess: TProcess);
+function ReadProcessStream(const AStream: TStream): string;
+var
+  Buffer: array[0..4095] of Byte;
+  Chunk: string;
+  Count: Integer;
 begin
-  if AProcess = nil then Exit;
-  if AProcess.Running then AProcess.Terminate(1);
-  ReapAdmitter(AProcess);
+  Result := '';
+  repeat
+    Count := AStream.Read(Buffer[0], SizeOf(Buffer));
+    if Count > 0 then
+    begin
+      SetString(Chunk, PAnsiChar(@Buffer[0]), Count);
+      Result := Result + Chunk;
+    end;
+  until Count <= 0;
 end;
 
-procedure WaitForAdmitter(const AProcess: TProcess);
+function CollectChildPhases(const APrefix: string): string;
+var
+  Phases: TStringList;
+  Search: TSearchRec;
 begin
+  Phases := TStringList.Create;
+  try
+    if FindFirst(APrefix + '.phase-*', faAnyFile, Search) = 0 then
+    try
+      repeat
+        if (Search.Attr and faDirectory) = 0 then
+          Phases.Add(Copy(Search.Name, Pos('.phase-', Search.Name) + 7,
+            MaxInt));
+      until FindNext(Search) <> 0;
+    finally
+      FindClose(Search);
+    end;
+    Phases.Sort;
+    Result := StringReplace(Trim(Phases.Text), LineEnding, ',',
+      [rfReplaceAll]);
+    if Result = '' then Result := '(none)';
+  finally
+    Phases.Free;
+  end;
+end;
+
+function FinishAdmitter(const AProcess: TProcess;
+  const APhasePrefix: string): TAdmitterResult;
+begin
+  Result.TimedOut := False;
   if AProcess.WaitOnExit(ADMIT_CHILD_TIMEOUT_MS)
      or not AProcess.Running then
   begin
     AProcess.WaitOnExit;
-    Exit;
   end;
-  AProcess.Terminate(1);
-  ReapAdmitter(AProcess);
-  raise Exception.CreateFmt('object-store admitter exceeded %d ms',
-    [ADMIT_CHILD_TIMEOUT_MS]);
+  if AProcess.Running then
+  begin
+    Result.TimedOut := True;
+    AProcess.Terminate(1);
+    ReapAdmitter(AProcess);
+  end;
+  Result.ExitCode := AProcess.ExitCode;
+  Result.RawExitStatus := AProcess.ExitStatus;
+  Result.ExitStatus := Result.RawExitStatus;
+  {$IFDEF UNIX}
+  if (Result.ExitStatus > 255) and (Result.ExitStatus mod 256 = 0) then
+    Result.ExitStatus := Result.ExitStatus div 256;
+  {$ENDIF}
+  Result.Stdout := ReadProcessStream(AProcess.Output);
+  Result.Stderr := ReadProcessStream(AProcess.Stderr);
+  Result.Phases := CollectChildPhases(APhasePrefix);
+end;
+
+function AdmitterDiagnostic(const ALabel: string;
+  const AResult: TAdmitterResult): string;
+begin
+  Result := 'OBJECT STORE ADMITTER [' + ALabel + '] exit-status='
+    + IntToStr(AResult.ExitStatus) + ' exit-code='
+    + IntToStr(AResult.ExitCode) + ' raw-exit-status='
+    + IntToStr(AResult.RawExitStatus) + ' timed-out='
+    + BoolToStr(AResult.TimedOut, True) + ' phases=' + AResult.Phases
+    + LineEnding + '--- stdout ---' + LineEnding + AResult.Stdout
+    + LineEnding + '--- stderr ---' + LineEnding + AResult.Stderr
+    + LineEnding + '--- end admitter ---';
+end;
+
+procedure DumpAdmitterFailure(const ALabel: string;
+  const AResult: TAdmitterResult);
+begin
+  if AResult.TimedOut or (AResult.ExitStatus <> 0) then
+    WriteLn(AdmitterDiagnostic(ALabel, AResult));
 end;
 
 function RunChildMode: Boolean;
@@ -130,28 +245,48 @@ var
 begin
   Result := False;
   if (ParamCount <> 6) or ((ParamStr(1) <> ADMIT_CHILD_SWITCH)
+     and (ParamStr(1) <> DIAGNOSTIC_ADMIT_CHILD_SWITCH)
      and (ParamStr(1) <> GUARDED_ADMIT_CHILD_SWITCH)) then Exit;
+  ChildPhasePrefix := ParamStr(5);
+  InjectPublicationFailure := ParamStr(1) = DIAGNOSTIC_ADMIT_CHILD_SWITCH;
+  MarkChildPhase('01-child-started');
   Store := TLWPTImmutableObjectStore.Create(ParamStr(2),
     ExtractFileDir(ParamStr(2)), DEPENDENCY_ARCHIVE_NAMESPACE);
   try
+    MarkChildPhase('02-store-created');
+    ObjectStoreBeforePublicationTestHook := BeforePublication;
+    ObjectStoreAfterPublicationTestHook := AfterPublication;
     if ParamStr(1) = GUARDED_ADMIT_CHILD_SWITCH then
     begin
       StageReadyPath := ParamStr(5);
       StageReleasePath := ParamStr(6);
       ObjectStoreAfterStageTestHook := PauseAfterStage;
+      MarkChildPhase('03-stage-hook-configured');
     end
     else
     begin
+      ObjectStoreAfterStageTestHook := ObserveAfterStage;
       WriteSignal(ParamStr(5));
+      MarkChildPhase('03-ready-signaled');
       if not WaitForSignal(ParamStr(6)) then
         raise Exception.Create(
           'timed out waiting for object-store start barrier');
+      MarkChildPhase('04-release-observed');
     end;
+    if ParamStr(1) = GUARDED_ADMIT_CHILD_SWITCH then
+      MarkChildPhase('04-admission-started')
+    else
+      MarkChildPhase('05-admission-started');
     Store.Admit(ParamStr(3), ParamStr(4));
+    MarkChildPhase('11-admission-completed');
   finally
     ObjectStoreAfterStageTestHook := nil;
+    ObjectStoreBeforePublicationTestHook := nil;
+    ObjectStoreAfterPublicationTestHook := nil;
+    InjectPublicationFailure := False;
     Store.Free;
   end;
+  MarkChildPhase('12-child-completed');
   Result := True;
 end;
 
@@ -223,43 +358,50 @@ begin
 end;
 
 function TObjectStoreContract.StartAdmitter(const AReadyPath,
-  AReleasePath: string; const AGuarded: Boolean): TProcess;
+  AReleasePath, AChildSwitch: string): TProcess;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := ParamStr(0);
-  if AGuarded then Result.Parameters.Add(GUARDED_ADMIT_CHILD_SWITCH)
-  else Result.Parameters.Add(ADMIT_CHILD_SWITCH);
+  Result.Parameters.Add(AChildSwitch);
   Result.Parameters.Add(FStoreRoot);
   Result.Parameters.Add(FSource);
   Result.Parameters.Add(FDigest);
   Result.Parameters.Add(AReadyPath);
   Result.Parameters.Add(AReleasePath);
-  Result.Options := [poNoConsole];
+  Result.Options := [poNoConsole, poUsePipes];
   Result.Execute;
 end;
 
 procedure TObjectStoreContract.TestRepairPreservesActiveCrossProcessAdmission;
 var
   Admitter: TProcess;
+  AdmitterFinished: Boolean;
+  AdmitterResult: TAdmitterResult;
   ReadyPath, ReleasePath: string;
   Report: TLWPTCacheRepairReport;
   Store: TLWPTImmutableObjectStore;
 begin
   ReadyPath := FScratch + '/staged-ready';
   ReleasePath := FScratch + '/release-staged';
-  Admitter := StartAdmitter(ReadyPath, ReleasePath, True);
+  Admitter := StartAdmitter(ReadyPath, ReleasePath,
+    GUARDED_ADMIT_CHILD_SWITCH);
+  AdmitterFinished := False;
   try
     Expect<Boolean>(WaitForSignal(ReadyPath)).ToBe(True);
     Report := RepairSharedCache(FScratch + '/cache');
     Expect<Boolean>(Report.LiveObjectsPreserved >= 1).ToBe(True);
     WriteSignal(ReleasePath);
-    WaitForAdmitter(Admitter);
-    Expect<Integer>(Admitter.ExitStatus).ToBe(0);
+    AdmitterResult := FinishAdmitter(Admitter, ReadyPath);
+    AdmitterFinished := True;
   finally
     if not FileExists(ReleasePath) then WriteSignal(ReleasePath);
-    StopAdmitter(Admitter);
+    if not AdmitterFinished then
+      AdmitterResult := FinishAdmitter(Admitter, ReadyPath);
+    DumpAdmitterFailure('repair admission', AdmitterResult);
     Admitter.Free;
   end;
+  Expect<Boolean>(AdmitterResult.TimedOut).ToBe(False);
+  Expect<Integer>(AdmitterResult.ExitStatus).ToBe(0);
   Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
     FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
@@ -416,48 +558,111 @@ begin
 end;
 
 procedure TObjectStoreContract.
-  TestConcurrentSameKeyAdmissionPublishesOneCompleteObject;
+  RunContentionIteration(const AIteration: Integer);
 var
   Store: TLWPTImmutableObjectStore;
   First, Second: TProcess;
+  FirstFinished, SecondFinished: Boolean;
+  FirstResult, SecondResult: TAdmitterResult;
   FirstReady, SecondReady, ReleasePath, HitPath: string;
 begin
+  ResetScratch;
   FirstReady := FScratch + '/first-ready';
   SecondReady := FScratch + '/second-ready';
   ReleasePath := FScratch + '/release-admitters';
   First := nil;
   Second := nil;
+  FirstFinished := False;
+  SecondFinished := False;
   try
     First := StartAdmitter(FirstReady, ReleasePath);
     Second := StartAdmitter(SecondReady, ReleasePath);
     Expect<Boolean>(WaitForSignal(FirstReady)).ToBe(True);
     Expect<Boolean>(WaitForSignal(SecondReady)).ToBe(True);
     WriteSignal(ReleasePath);
-    WaitForAdmitter(First);
-    WaitForAdmitter(Second);
-    Expect<Integer>(First.ExitStatus).ToBe(0);
-    Expect<Integer>(Second.ExitStatus).ToBe(0);
+    FirstResult := FinishAdmitter(First, FirstReady);
+    FirstFinished := True;
+    SecondResult := FinishAdmitter(Second, SecondReady);
+    SecondFinished := True;
   finally
     if not FileExists(ReleasePath) then WriteSignal(ReleasePath);
     if First <> nil then
     begin
-      StopAdmitter(First);
+      if not FirstFinished then
+        FirstResult := FinishAdmitter(First, FirstReady);
+      DumpAdmitterFailure('iteration ' + IntToStr(AIteration) + ' first',
+        FirstResult);
       First.Free;
     end;
     if Second <> nil then
     begin
-      StopAdmitter(Second);
+      if not SecondFinished then
+        SecondResult := FinishAdmitter(Second, SecondReady);
+      DumpAdmitterFailure('iteration ' + IntToStr(AIteration) + ' second',
+        SecondResult);
       Second.Free;
     end;
   end;
+  Expect<Boolean>(FirstResult.TimedOut).ToBe(False);
+  Expect<Boolean>(SecondResult.TimedOut).ToBe(False);
+  Expect<Integer>(FirstResult.ExitStatus).ToBe(0);
+  Expect<Integer>(SecondResult.ExitStatus).ToBe(0);
   Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
     FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     Expect<Boolean>(Store.Lookup(FDigest, HitPath)).ToBe(True);
     Expect<string>(ReadBytes(HitPath)).ToBe(ReadBytes(FSource));
+    Expect<string>('sha256:' + SHA256File(HitPath)).ToBe(FDigest);
   finally
     Store.Free;
   end;
+end;
+
+procedure TObjectStoreContract.TestAdmitterFailurePreservesDiagnostics;
+var
+  Admitter: TProcess;
+  AdmitterFinished: Boolean;
+  AdmitterResult: TAdmitterResult;
+  Diagnostic, ReadyPath, ReleasePath: string;
+begin
+  ReadyPath := FScratch + '/diagnostic-ready';
+  ReleasePath := FScratch + '/diagnostic-release';
+  Admitter := StartAdmitter(ReadyPath, ReleasePath,
+    DIAGNOSTIC_ADMIT_CHILD_SWITCH);
+  AdmitterFinished := False;
+  try
+    Expect<Boolean>(WaitForSignal(ReadyPath)).ToBe(True);
+    WriteSignal(ReleasePath);
+    AdmitterResult := FinishAdmitter(Admitter, ReadyPath);
+    AdmitterFinished := True;
+  finally
+    if not FileExists(ReleasePath) then WriteSignal(ReleasePath);
+    if not AdmitterFinished then
+      AdmitterResult := FinishAdmitter(Admitter, ReadyPath);
+    Admitter.Free;
+  end;
+  Diagnostic := AdmitterDiagnostic('intentional failure', AdmitterResult);
+  Expect<Integer>(AdmitterResult.ExitStatus).ToBe(217);
+  Expect<Boolean>(Pos('exit-status=217', Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('phases=01-child-started,02-store-created,'
+    + '03-ready-signaled,04-release-observed,05-admission-started,'
+    + '06-object-staged,09-publication-started',
+    Diagnostic) > 0).ToBe(True);
+  Expect<Boolean>(Pos('intentional object-store child stdout',
+    AdmitterResult.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('intentional object-store child stderr',
+    AdmitterResult.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('intentional object-store child failure',
+    AdmitterResult.Stderr) > 0).ToBe(True);
+end;
+
+procedure TObjectStoreContract.
+  TestConcurrentSameKeyAdmissionPublishesOneCompleteObject;
+var
+  Iteration: Integer;
+begin
+  for Iteration := 1 to CONTENTION_ITERATIONS do
+    RunContentionIteration(Iteration);
 end;
 
 procedure TObjectStoreContract.TestCacheRootOverrideIsAbsoluteAndNormalized;
@@ -504,6 +709,8 @@ begin
     TestConcurrentValidReplacementIsRestoredAfterQuarantine);
   Test('interrupted temporary objects are never visible',
     TestInterruptedTemporaryObjectIsNeverVisible);
+  Test('admitter failures preserve status, streams, and exact phases',
+    TestAdmitterFailurePreservesDiagnostics);
   Test('concurrent same-key producers publish one complete object',
     TestConcurrentSameKeyAdmissionPublishesOneCompleteObject);
   Test('repair preserves a cross-process admission paused after staging',

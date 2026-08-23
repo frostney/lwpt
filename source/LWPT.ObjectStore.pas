@@ -24,6 +24,8 @@ type
   {$IFDEF OBJECTSTORE_TESTING}
   TLWPTObjectStoreBeforeQuarantineHook = procedure(const APath: string);
   TLWPTObjectStoreAfterStageHook = procedure(const APath: string);
+  TLWPTObjectStorePublicationHook = procedure(const AStaged,
+    ADestination: string);
   {$ENDIF}
 
   TLWPTImmutableObjectStore = class
@@ -64,6 +66,8 @@ var
   ObjectStoreBeforeQuarantineTestHook:
     TLWPTObjectStoreBeforeQuarantineHook;
   ObjectStoreAfterStageTestHook: TLWPTObjectStoreAfterStageHook;
+  ObjectStoreBeforePublicationTestHook: TLWPTObjectStorePublicationHook;
+  ObjectStoreAfterPublicationTestHook: TLWPTObjectStorePublicationHook;
 {$ENDIF}
 
 implementation
@@ -403,12 +407,20 @@ begin
           + 'sha256', 'object digest root');
         EnsureUnlinkedDirectory(ExtractFileDir(Result),
           'object digest shard');
+        {$IFDEF OBJECTSTORE_TESTING}
+        if Assigned(ObjectStoreBeforePublicationTestHook) then
+          ObjectStoreBeforePublicationTestHook(Staged, Result);
+        {$ENDIF}
         { Replacement is safe because every competing writer must prove the
           same digest before reaching this point. The object-use guard keeps
           eviction and materialization outside the publication interval. }
         if not AtomicReplaceFile(Staged, Result) then
           raise ELWPTObjectStoreError.CreateFmt(
             'failed to publish object %s', [Expected]);
+        {$IFDEF OBJECTSTORE_TESTING}
+        if Assigned(ObjectStoreAfterPublicationTestHook) then
+          ObjectStoreAfterPublicationTestHook(Staged, Result);
+        {$ENDIF}
         Staged := '';
         Published := True;
         FCacheLifecycle.RecordObjectLocked(Expected, Result);
