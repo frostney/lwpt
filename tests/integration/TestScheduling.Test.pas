@@ -458,6 +458,18 @@ begin
     + 'uses Classes, SysUtils;'#10
     + 'var Started: TDateTime;'#10
     + 'begin'#10
+    + '  TFileStream.Create('
+    + PascalString(FScratch + '/control/' + AOwnMarker + '-ready')
+    + ', fmCreate).Free;'#10
+    + '  Started := Now;'#10
+    + '  while (not FileExists('
+    + PascalString(FScratch + '/control/' + AOtherMarker + '-ready') + '))'#10
+    + '    and ((Now - Started) * ' + IntToStr(SecondsPerDay) + ' < '
+    + IntToStr(ProcessStartupCeilingSeconds) + ') do Sleep('
+    + IntToStr(ProcessPollMilliseconds) + ');'#10
+    + '  if not FileExists('
+    + PascalString(FScratch + '/control/' + AOtherMarker + '-ready')
+    + ') then Halt(2);'#10
     + '  TFileStream.Create(' + PascalString(FScratch + '/control/' + AOwnMarker)
     + ', fmCreate).Free;'#10
     + '  Started := Now;'#10
@@ -467,7 +479,7 @@ begin
     + IntToStr(MarkerWaitCeilingSeconds) + ') do Sleep('
     + IntToStr(ProcessPollMilliseconds) + ');'#10
     + '  if not FileExists('
-    + PascalString(FScratch + '/control/' + AOtherMarker) + ') then Halt(2);'#10
+    + PascalString(FScratch + '/control/' + AOtherMarker) + ') then Halt(3);'#10
     + 'end.'#10);
 end;
 
@@ -674,9 +686,15 @@ begin
   ResetProject(0);
   WriteOverlapProgram('A.First.Test.pas', 'first-started', 'second-started');
   WriteOverlapProgram('B.Second.Test.pas', 'second-started', 'first-started');
+  { Runtime readiness has its own bounded setup phase. The original marker
+    exchange below remains the behavior-specific overlap contract. }
   CommandResult := RunTests([]);
   DumpRunFailure('default overlap run', CommandResult, 0);
   Expect<Integer>(CommandResult.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(FScratch
+    + '/control/first-started-ready')).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch
+    + '/control/second-started-ready')).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/first-started')).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/second-started')).ToBe(True);
 end;
@@ -765,20 +783,26 @@ end;
 
 procedure TTestScheduling.TestBailTerminatesActiveAndLeavesPendingUnstarted;
 var
+  CancellationElapsed, ReturnedAt, SlowStartedAt: QWord;
   CommandResult: TLwptResult;
+  SlowStartedAtPath, SlowTestStartedPath: string;
   Started: TDateTime;
   GrandchildPID: Integer;
 begin
   ResetProject(0);
+  SlowStartedAtPath := FScratch + '/control/slow-started-at';
+  SlowTestStartedPath := FScratch + '/control/slow-test-started';
   WriteTextFile(FScratch + '/tests/A.Slow.Test.pas',
       'program SlowFixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'uses Classes, Process, SysUtils;'#10
-    + 'var Child: TProcess; PIDFile: TStringList;'#10
+    + 'var Child: TProcess; PIDFile: TStringList; StartedFile: Text;'#10
     + 'begin'#10
     + '  if (ParamCount = 1) and (ParamStr(1) = ''--grandchild'') then'#10
     + '  begin Sleep(' + IntToStr(LongRunningFixtureMilliseconds)
     + '); Halt(0) end;'#10
+    + '  TFileStream.Create(' + PascalString(SlowTestStartedPath)
+    + ', fmCreate).Free;'#10
     + '  Child := TProcess.Create(nil);'#10
     + '  Child.Executable := ParamStr(0);'#10
     + '  Child.Parameters.Add(''--grandchild'');'#10
@@ -789,6 +813,10 @@ begin
     + '    PIDFile.SaveToFile('
     + PascalString(FScratch + '/control/grandchild-pid') + ');'#10
     + '  finally PIDFile.Free end;'#10
+    + '  Assign(StartedFile, ' + PascalString(SlowStartedAtPath) + ');'#10
+    + '  Rewrite(StartedFile);'#10
+    + '  Write(StartedFile, GetTickCount64);'#10
+    + '  Close(StartedFile);'#10
     + '  TFileStream.Create('
     + PascalString(FScratch + '/control/slow-started')
     + ', fmCreate).Free;'#10
@@ -804,21 +832,39 @@ begin
     + 'var Started: TDateTime;'#10
     + 'begin'#10
     + '  Started := Now;'#10
+    + '  while (not FileExists(' + PascalString(SlowTestStartedPath) + '))'#10
+    + '    and ((Now - Started) * ' + IntToStr(SecondsPerDay) + ' < '
+    + IntToStr(ProcessStartupCeilingSeconds) + ') do Sleep('
+    + IntToStr(ProcessPollMilliseconds) + ');'#10
+    + '  if not FileExists(' + PascalString(SlowTestStartedPath)
+    + ') then Halt(2);'#10
+    + '  Started := Now;'#10
     + '  while (not FileExists('
     + PascalString(FScratch + '/control/slow-started') + '))'#10
     + '    and ((Now - Started) * ' + IntToStr(SecondsPerDay) + ' < '
     + IntToStr(MarkerWaitCeilingSeconds) + ') do Sleep('
     + IntToStr(ProcessPollMilliseconds) + ');'#10
     + '  if not FileExists('
-    + PascalString(FScratch + '/control/slow-started') + ') then Halt(2);'#10
+    + PascalString(FScratch + '/control/slow-started') + ') then Halt(3);'#10
     + '  Halt(1);'#10
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'pending-ran', 0);
-  Started := Now;
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
+  ReturnedAt := GetTickCount64;
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  Expect<Boolean>((Now - Started) * SecondsPerDay
-    < CancellationCompletionCeilingSeconds).ToBe(True);
+  if not FileExists(SlowTestStartedPath) then
+    Fail('slow test did not reach its runtime startup barrier');
+  if not FileExists(SlowStartedAtPath) then
+    Fail('slow test did not record its monotonic readiness time');
+  SlowStartedAt := StrToQWord(Trim(ReadBinaryFile(SlowStartedAtPath)));
+  if ReturnedAt < SlowStartedAt then
+    Fail('slow test readiness time followed command return');
+  CancellationElapsed := ReturnedAt - SlowStartedAt;
+  if CancellationElapsed >=
+     QWord(CancellationCompletionCeilingSeconds) * 1000 then
+    Fail('active process-tree cancellation took '
+      + UIntToStr(CancellationElapsed) + ' ms; ceiling is '
+      + IntToStr(CancellationCompletionCeilingSeconds * 1000) + ' ms');
   Expect<Boolean>(FileExists(FScratch + '/control/slow-started')).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/slow-completed')).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/control/pending-ran')).ToBe(False);
@@ -2291,8 +2337,14 @@ begin
     while ((not FileExists(PIDFile + '-owner'))
       or (not FileExists(PIDFile + '-descendant')))
       and ((Now - Started) * SecondsPerDay
-        < MarkerWaitCeilingSeconds) do
+        < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
+    if (not FileExists(PIDFile + '-owner'))
+       or (not FileExists(PIDFile + '-descendant')) then
+    begin
+      WriteLn(StdErr, 'acknowledgement owner startup barrier timed out');
+      Exit(2);
+    end;
     Exit(0);
   end;
 
@@ -2323,10 +2375,10 @@ begin
      or ((Mode = WorkerErrorCompilerProxyMode)
        and SameText(SourceFile, 'A.Slow.Test.pas')) then
   begin
-    WriteTextFile(PIDFile, IntToStr(GetProcessID));
     if Mode = IgnoreTerminateCompilerProxyMode then
       WriteTextFile(PIDFile + NestedCompilerStartedAtSuffix,
         UIntToStr(GetTickCount64));
+    WriteTextFile(PIDFile, IntToStr(GetProcessID));
     Sleep(LongRunningFixtureMilliseconds);
     if Mode = IgnoreTerminateCompilerProxyMode then
     begin
@@ -2355,10 +2407,17 @@ begin
         UIntToStr(GetTickCount64));
     end
     else
+    begin
       while not FileExists(PIDFile)
         and ((Now - Started) * SecondsPerDay
-          < MarkerWaitCeilingSeconds) do
+          < ProcessStartupCeilingSeconds) do
         Sleep(ProcessPollMilliseconds);
+      if not FileExists(PIDFile) then
+      begin
+        WriteLn(StdErr, 'compiler proxy startup barrier timed out');
+        Exit(2);
+      end;
+    end;
     Exit(0);
   end;
   Result := 1;
