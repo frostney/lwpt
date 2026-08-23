@@ -61,17 +61,17 @@ Every project on this stack satisfies the build-system contract from `native-nos
 
 ### Build output
 
-Routine `lwpt build` output names the selected targets and the exact `dev` or
-`release` mode, then reports each target through `START`, `PASS`, `FAIL`, or
-`SKIP`. A passing target names its published output, long-running work emits a
-bounded heartbeat naming active or queued targets, and the command finishes
+Routine `lwpt build` output names the selected entries and the exact `dev` or
+`release` mode, then reports each entry through `START`, `PASS`, `FAIL`, or
+`SKIP`. A passing entry names its published output, long-running work emits a
+bounded heartbeat naming active or queued entries, and the command finishes
 with a deterministic `RESULT PASS` or `RESULT FAIL` count line.
 
 `--verbose` adds execution diagnostics: the session identifier and path,
 worker allocation, successful log references, elapsed timings, cache and
 compiler details, and captured output from successful compiler processes.
 Failures always replay their actionable compiler diagnostics and name the
-retained target log, so diagnosing a failed routine build does not require a
+retained entry log, so diagnosing a failed routine build does not require a
 second verbose run. Cache wait progress remains visible in routine output but
 omits fingerprints, process identities, and producer descriptions unless
 verbose. `--silent` retains the shared one-result-line contract described by

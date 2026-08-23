@@ -72,9 +72,10 @@ Stop and report `BLOCKED` when any of these is true:
 - The latest completed `ci.yml` run for the exact base commit is absent, stale,
   or unsuccessful. Do not replace missing cross-platform proof with another
   complete local suite.
-- The default-branch ruleset does not require every current `pr.yml` check, the
-  release-tag ruleset is absent, or the protected `release` environment is
-  absent.
+- The default-branch ruleset does not require the current
+  `delivery-admission` check, that admission job does not depend on and validate
+  every current native `pr.yml` job, the release-tag ruleset is absent, or the
+  protected `release` environment is absent.
 - An architecture-drift finding remains neither fixed nor explicitly waived
   with a rationale.
 - The release workflows and documented target or artifact matrices disagree.
@@ -114,17 +115,19 @@ workflow before selecting the command; verify the tool version live.
 
 If exact-main integrated CI is unavailable or stale, stop rather than silently
 substituting weaker local platform evidence. If an approved preparation fix
-changes source or behavior, run the smallest focused selector or affected tier
-that proves that fix locally. Do not rerun complete default and E2E suites after
-each fix; the preparation PR's required CI and its integrated-main successor
-provide the final complete proof.
+changes source or behavior, run the smallest focused selector or affected
+project route that proves that fix locally. Do not rerun complete default and
+E2E suites after each fix; the preparation PR's required CI and its
+integrated-main successor provide the final complete proof.
 
 ### 3. Check cross-platform evidence
 
 - Inspect the latest completed `ci.yml` run for the base commit with `gh`.
 - Require the six-target cross-build and native test matrix to be green.
 - Inspect the active repository rulesets and environments. Require:
-  - the default branch to require every current `pr.yml` check;
+  - the default branch to require the current `delivery-admission` check, and
+    that admission job to depend on and validate every current native `pr.yml`
+    job;
   - SemVer release tags to reject deletion, updates, and unauthorized creation;
   - the `release.yml` publish job to use a protected `release` environment with
     an explicit approval gate.
@@ -155,8 +158,8 @@ Cover every surface:
 - **Filesystem and concurrency:** actual writes, locks, temporary paths,
   cleanup, build outputs, and repair behavior against atomicity and safety
   claims. Planned behavior in GitHub issues must not be described as shipped.
-- **Testing:** discovery, tiers, skips, network policy, subprocess boundaries,
-  and test counts against `docs/testing.md` and CI workflows.
+- **Testing:** discovery, repository groups, skips, network policy, subprocess
+  boundaries, and test counts against `docs/testing.md` and CI workflows.
 - **Platforms and transport:** source conditionals, TLS implementations,
   compiler targets, and artifact packaging against deployment claims.
 - **Environment and configuration:** every environment-variable and manifest

@@ -211,7 +211,9 @@ Then:
 ./build/lwpt test           # discovers MyUnit.Test.pas, compiles, runs, reads exit code
 ```
 
-The full test policy (unit / integration / e2e / manual tiers, fixture rules, mock HTTP server, the binary-fetch regression) is in [`testing.md`](./testing.md).
+The full test policy (unit, integration, E2E, and manual groups; fixture rules;
+mock HTTP server; and the binary-fetch regression) is in
+[`testing.md`](./testing.md).
 
 ## Common errors
 

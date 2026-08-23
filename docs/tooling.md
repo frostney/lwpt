@@ -117,6 +117,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `LWPT_WORKER_STATE_DIR` | Override the worker coordinator state root; an explicit unwritable path fails rather than falling back | the platform application-config directory's `workers/` subdirectory, with automatic fallback to the repository's `.lwpt/workers/` when that default is unwritable |
 | `LWPT_WORKER_LEASE_STALE_SECONDS` | Mark heartbeat diagnostics stale after this interval; values below 3 are rejected. Heartbeat age never authorises reclamation by itself. | `30` |
 | `LWPT_WORKER_LEASE_TOKEN` | One-shot opaque delegation token added to one nested LWPT subprocess by the worker-budget API; do not configure, reuse, or persist manually | unset |
+| `LWPT_PRODUCER_LEASE_STALE_SECONDS` | Mark producer heartbeat diagnostics stale after this interval; values below 3 are rejected. Heartbeat age never authorises reclamation while the OS-held owner guard exists. | `30` |
 | `FPC_TARGET_CPU` | Requested compiler target processor. A non-host value is probed and passed as `-P<value>`; unavailable dispatch fails without fallback. | unset (host CPU) |
 | `FPC_TARGET_OS` | Requested compiler target operating system. A non-host value is probed and passed as `-T<value>`; unavailable targets fail without fallback. | unset (host OS) |
 | `LWPT_FPC` | Path to the FPC binary; overrides `PATH` lookup. The bare `FPC` variable is honoured as a fallback. | unset (`fpc` on `PATH`) |

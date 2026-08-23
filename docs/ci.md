@@ -255,7 +255,7 @@ Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR
 4. `./build/lwpt install --frozen` (committed lockfile matches committed trees — runs *before* plain install so lock drift cannot be masked by regeneration)
 5. `./build/lwpt install` (workspace auto-discovery + symlinks)
 6. `./build/lwpt format --check`
-7. `./build/lwpt build` (manifest-target compile)
+7. `./build/lwpt build` (manifest build-entry compile)
 8. `./build/lwpt agents --check` (generated command-reference drift)
 9. `./build/lwpt test <ordinary paths> --bail=1`
 
