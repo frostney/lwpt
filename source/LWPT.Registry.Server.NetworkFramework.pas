@@ -14,7 +14,7 @@ uses
   LWPT.Registry.Store;
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
-  const APKCS12Path, APassphrase: string);
+  const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
 
 implementation
 
@@ -37,9 +37,10 @@ const
   MAX_REQUEST_BYTES = 32 * 1024;
   LISTENER_READY_TIMEOUT_SECONDS = 10;
   DRAIN_POLL_MILLISECONDS = 100;
+  CONNECTION_DEADLINE_MILLISECONDS = 10000;
+  MAX_ACTIVE_CONNECTIONS = 32;
   NANOSECONDS_PER_MILLISECOND = Int64(1000000);
   NANOSECONDS_PER_SECOND = Int64(1000000000);
-  DISPATCH_TIME_FOREVER = UInt64($FFFFFFFFFFFFFFFF);
   CF_STRING_ENCODING_UTF8 = $08000100;
   NW_LISTENER_STATE_READY = 2;
   NW_LISTENER_STATE_FAILED = 3;
@@ -77,6 +78,7 @@ type
     FRequest: AnsiString;
     FClosing: Boolean;
     FResponding: Boolean;
+    FDeadline: QWord;
     FStateBlock: TRegistryBlock;
     FReceiveBlock: TRegistryBlock;
     FSendBlock: TRegistryBlock;
@@ -100,6 +102,9 @@ type
     FTemporaryKeychain: Pointer;
     FListenerState: Integer;
     FActiveConnections: LongInt;
+    FConnections: TList;
+    FConnectionLock: TRTLCriticalSection;
+    FStopFlag: PBoolean;
     FStopping: Boolean;
     FListenerStateBlock: TRegistryBlock;
     FNewConnectionBlock: TRegistryBlock;
@@ -110,7 +115,7 @@ type
     procedure LoadIdentity(const APath, APassphrase: string);
   public
     constructor Create(AStore: TLWPTRegistryStore;
-      const APKCS12Path, APassphrase: string);
+      const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
     destructor Destroy; override;
     procedure Run;
   end;
@@ -368,8 +373,20 @@ begin
     Nw_connection_cancel(ANetworkConnection);
     Exit;
   end;
-  Connection := TNetworkFrameworkRegistryConnection.Create;
+  EnterCriticalSection(Server.FConnectionLock);
+  try
+    if Server.FConnections.Count >= MAX_ACTIVE_CONNECTIONS then
+    begin
+      Nw_connection_cancel(ANetworkConnection);
+      Exit;
+    end;
+    Connection := TNetworkFrameworkRegistryConnection.Create;
+    Server.FConnections.Add(Connection);
+  finally
+    LeaveCriticalSection(Server.FConnectionLock);
+  end;
   Connection.FServer := Server;
+  Connection.FDeadline := GetTickCount64 + CONNECTION_DEADLINE_MILLISECONDS;
   Nw_retain(ANetworkConnection);
   Connection.FConnection := ANetworkConnection;
   Connection.FQueue := Dispatch_queue_create(
@@ -384,6 +401,11 @@ end;
 
 procedure TNetworkFrameworkRegistryConnection.ArmReceive;
 begin
+  if GetTickCount64 >= FDeadline then
+  begin
+    Cancel;
+    Exit;
+  end;
   if not FClosing then
     Nw_connection_receive(FConnection, 1, MAX_REQUEST_BYTES,
       MakeBlock(FReceiveBlock, @ReceiveInvoke, Self));
@@ -391,6 +413,11 @@ end;
 
 procedure TNetworkFrameworkRegistryConnection.Cancel;
 begin
+  if GetTickCount64 >= FDeadline then
+  begin
+    Cancel;
+    Exit;
+  end;
   if FClosing then Exit;
   FClosing := True;
   Nw_connection_cancel(FConnection);
@@ -401,6 +428,11 @@ procedure TNetworkFrameworkRegistryConnection.Consume(const ABuffer: Pointer;
 var
   Chunk: AnsiString;
 begin
+  if GetTickCount64 >= FDeadline then
+  begin
+    Cancel;
+    Exit;
+  end;
   if Length(FRequest) + ALength > MAX_REQUEST_BYTES then
   begin
     Cancel;
@@ -452,6 +484,12 @@ end;
 procedure TNetworkFrameworkRegistryServer.ConnectionFinished(
   AConnection: TNetworkFrameworkRegistryConnection);
 begin
+  EnterCriticalSection(FConnectionLock);
+  try
+    FConnections.Remove(AConnection);
+  finally
+    LeaveCriticalSection(FConnectionLock);
+  end;
   Nw_release(AConnection.FConnection);
   Dispatch_release(AConnection.FQueue);
   AConnection.Free;
@@ -600,7 +638,7 @@ begin
 end;
 
 constructor TNetworkFrameworkRegistryServer.Create(AStore: TLWPTRegistryStore;
-  const APKCS12Path, APassphrase: string);
+  const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
 var
   Endpoint: Pointer;
   Host, Port: AnsiString;
@@ -608,6 +646,9 @@ begin
   inherited Create;
   IsMultiThread := True;
   FStore := AStore;
+  FStopFlag := AStopFlag;
+  FConnections := TList.Create;
+  InitCriticalSection(FConnectionLock);
   FReadySemaphore := Dispatch_semaphore_create(0);
   FStopSemaphore := Dispatch_semaphore_create(0);
   FDrainSemaphore := Dispatch_semaphore_create(0);
@@ -646,6 +687,8 @@ begin
 end;
 
 destructor TNetworkFrameworkRegistryServer.Destroy;
+var
+  Index: Integer;
 begin
   FStopping := True;
   if FListener <> nil then
@@ -655,6 +698,13 @@ begin
       Dispatch_semaphore_wait(FListenerDoneSemaphore,
         Dispatch_time(0, DRAIN_POLL_MILLISECONDS
           * NANOSECONDS_PER_MILLISECOND));
+  end;
+  EnterCriticalSection(FConnectionLock);
+  try
+    for Index := 0 to FConnections.Count - 1 do
+      TNetworkFrameworkRegistryConnection(FConnections[Index]).Cancel;
+  finally
+    LeaveCriticalSection(FConnectionLock);
   end;
   while InterLockedExchangeAdd(FActiveConnections, 0) > 0 do
     Dispatch_semaphore_wait(FDrainSemaphore,
@@ -674,14 +724,33 @@ begin
   if FDrainSemaphore <> nil then Dispatch_release(FDrainSemaphore);
   if FListenerDoneSemaphore <> nil then
     Dispatch_release(FListenerDoneSemaphore);
+  DoneCriticalSection(FConnectionLock);
+  FConnections.Free;
   inherited Destroy;
 end;
 
 procedure TNetworkFrameworkRegistryServer.Run;
+var
+  Index: Integer;
 begin
   WriteLn('registry origin ', FStore.Config.Identity, ' listening at ',
     FStore.Config.BaseURL);
-  Dispatch_semaphore_wait(FStopSemaphore, DISPATCH_TIME_FOREVER);
+  while not FStopping do
+  begin
+    if Assigned(FStopFlag) and FStopFlag^ then Break;
+    EnterCriticalSection(FConnectionLock);
+    try
+      for Index := 0 to FConnections.Count - 1 do
+        if GetTickCount64 >= TNetworkFrameworkRegistryConnection(
+          FConnections[Index]).FDeadline then
+          TNetworkFrameworkRegistryConnection(FConnections[Index]).Cancel;
+    finally
+      LeaveCriticalSection(FConnectionLock);
+    end;
+    Dispatch_semaphore_wait(FStopSemaphore,
+      Dispatch_time(0, DRAIN_POLL_MILLISECONDS
+        * NANOSECONDS_PER_MILLISECOND));
+  end;
 end;
 
 procedure ResolveSymbols;
@@ -705,12 +774,12 @@ begin
 end;
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
-  const APKCS12Path, APassphrase: string);
+  const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
 var
   Server: TNetworkFrameworkRegistryServer;
 begin
   Server := TNetworkFrameworkRegistryServer.Create(AStore, APKCS12Path,
-    APassphrase);
+    APassphrase, AStopFlag);
   try
     Server.Run;
   finally
@@ -724,7 +793,7 @@ initialization
 {$ELSE}
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
-  const APKCS12Path, APassphrase: string);
+  const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
 begin
   raise ELWPTRegistryError.CreateStable('tls_unavailable',
     'Network.framework registry transport is available only on macOS');

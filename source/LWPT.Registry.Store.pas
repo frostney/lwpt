@@ -59,6 +59,8 @@ type
     function TmpRoot: string;
     function LoadSeed: TBytes;
     function ReadCurrentState: TLWPTRegistryState;
+    procedure VerifyState(const AState: TLWPTRegistryState);
+    procedure RecoverDerivedState(const AState: TLWPTRegistryState);
     procedure WriteImmutable(const ARelative: string;
       const ABytes: TBytes);
   public
@@ -67,6 +69,7 @@ type
       const ARequested: TLWPTRegistryConfig;
       const APublishedAt: string): TLWPTRegistryStore;
     procedure Recover;
+    procedure EnsureFreshCheckpoint(const ANow: string);
     function LoadCurrentState: TLWPTRegistryState;
     function LoadResource(const ARelative: string): TBytes;
     procedure Publish(const APublication: TLWPTRegistryPublication);
@@ -77,6 +80,7 @@ type
 function CanonicalRegistryURL(const AValue: string;
   const ARequireHTTPS: Boolean): string;
 function RegistryKeyStoragePath(const AKeyID: string): string;
+function RegistryTimestampNow: string;
 function RegistryConfiguration(const AIdentity, ABaseURL,
   AListenAddress: string; const APort: Word; const ATLSPKCS12Path,
   ATLSPasswordEnvironment: string): TLWPTRegistryConfig;
@@ -86,9 +90,13 @@ implementation
 
 uses
   DateUtils,
+  Sockets,
   StrUtils,
   {$IFDEF UNIX}
   BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
   {$ENDIF}
 
   LWPT.ProducerLease,
@@ -101,6 +109,22 @@ const
   SIGNING_SEED_FILE = 'keys/root.seed';
   INITIALIZATION_MARKER = '.initializing';
   CHECKPOINT_DOMAIN = PROJECT_NAME + '-REGISTRY-CHECKPOINT-V1' + #10;
+  CHECKPOINT_RENEWAL_THRESHOLD_HOURS = 24;
+
+{$IFDEF MSWINDOWS}
+const
+  SDDL_REVISION_1_LWPT = 1;
+  PRIVATE_FILE_SDDL = 'D:P(A;;FA;;;OW)(A;;FA;;;SY)';
+
+function ConvertStringSecurityDescriptorToSecurityDescriptorW(
+  AStringSecurityDescriptor: PWideChar; AStringSDRevision: LongWord;
+  out ASecurityDescriptor: Pointer; ASecurityDescriptorSize: PLongWord): LongBool;
+  stdcall; external 'advapi32.dll'
+  name 'ConvertStringSecurityDescriptorToSecurityDescriptorW';
+{$ENDIF}
+{$IFDEF UNIX}
+function CFSync(AHandle: cint): cint; cdecl; external name 'fsync';
+{$ENDIF}
 
 constructor ELWPTRegistryError.CreateStable(const ACode, AMessage: string);
 begin
@@ -115,6 +139,122 @@ end;
 function Text(const ABytes: TBytes): string;
 begin
   Result := TEncoding.UTF8.GetString(ABytes);
+end;
+
+function RegistryTimestampNow: string;
+begin
+  Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
+    LocalTimeToUniversal(Now));
+end;
+
+procedure ValidateRegistryPath(const APath: string);
+var
+  Current, Parent: string;
+begin
+  Current := ExcludeTrailingPathDelimiter(ExpandFileName(APath));
+  if Current = '' then
+    raise ELWPTRegistryError.CreateStable('invalid_registry_path',
+      'registry path is empty');
+  while True do
+  begin
+    if IsDirSymlinkOrJunction(Current) then
+      raise ELWPTRegistryError.CreateStable('registry_path_link',
+        'registry paths cannot contain symbolic links or reparse points');
+    Parent := ExcludeTrailingPathDelimiter(ExtractFileDir(Current));
+    if (Parent = '') or (Parent = Current) then Break;
+    Current := Parent;
+  end;
+end;
+
+procedure AtomicCreatePrivateBytes(const ADestination, ATemporaryRoot: string;
+  const ABytes: TBytes);
+var
+  Temporary: string;
+  {$IFDEF UNIX}
+  Descriptor, Written, Offset: Integer;
+  FileInfo: Stat;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  BytesWritten: LongWord;
+  Handle: THandle;
+  SecurityAttributes: TSecurityAttributes;
+  SecurityDescriptor: Pointer;
+  {$ENDIF}
+begin
+  ValidateRegistryPath(ADestination);
+  ValidateRegistryPath(ATemporaryRoot);
+  if FileExists(ADestination) or IsDirSymlinkOrJunction(ADestination) then
+    raise ELWPTRegistryError.CreateStable('private_key_exists',
+      'refusing to replace an existing registry signing seed');
+  ForceDirectories(ExtractFileDir(ADestination));
+  ForceDirectories(ATemporaryRoot);
+  Temporary := MakeTmpPath(ATemporaryRoot, 'private-key');
+  {$IFDEF UNIX}
+  Descriptor := FpOpen(PChar(Temporary), O_WRONLY or O_CREAT or O_EXCL,
+    &600);
+  if Descriptor < 0 then
+    raise ELWPTRegistryError.CreateStable('private_key_permissions',
+      'could not create private registry key staging with mode 0600');
+  try
+    Offset := 0;
+    while Offset < Length(ABytes) do
+    begin
+      Written := FpWrite(Descriptor, ABytes[Offset], Length(ABytes) - Offset);
+      if Written <= 0 then
+        raise ELWPTRegistryError.CreateStable('private_key_write_failed',
+          'could not write the complete registry signing seed');
+      Inc(Offset, Written);
+    end;
+    if (FpChmod(Temporary, &600) <> 0) or (FpFStat(Descriptor, FileInfo) <> 0)
+      or ((FileInfo.st_mode and &777) <> &600) or (CFSync(Descriptor) <> 0) then
+      raise ELWPTRegistryError.CreateStable('private_key_permissions',
+        'registry signing seed mode 0600 could not be guaranteed');
+  finally
+    FpClose(Descriptor);
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  SecurityDescriptor := nil;
+  if not ConvertStringSecurityDescriptorToSecurityDescriptorW(
+    PWideChar(UnicodeString(PRIVATE_FILE_SDDL)), SDDL_REVISION_1_LWPT,
+    SecurityDescriptor, nil) then
+    raise ELWPTRegistryError.CreateStable('private_key_permissions',
+      'could not create the private registry key ACL');
+  try
+    FillChar(SecurityAttributes, SizeOf(SecurityAttributes), 0);
+    SecurityAttributes.nLength := SizeOf(SecurityAttributes);
+    SecurityAttributes.lpSecurityDescriptor := SecurityDescriptor;
+    Handle := Windows.CreateFileW(PWideChar(UnicodeString(Temporary)),
+      GENERIC_WRITE, 0, @SecurityAttributes, CREATE_NEW,
+      FILE_ATTRIBUTE_NORMAL or FILE_FLAG_WRITE_THROUGH, 0);
+    if Handle = INVALID_HANDLE_VALUE then
+      raise ELWPTRegistryError.CreateStable('private_key_permissions',
+        'could not create private registry key staging with an owner-only ACL');
+    try
+      BytesWritten := 0;
+      if (Length(ABytes) > 0) and (not Windows.WriteFile(Handle, ABytes[0],
+        Length(ABytes), BytesWritten, nil) or
+        (BytesWritten <> LongWord(Length(ABytes)))) then
+        raise ELWPTRegistryError.CreateStable('private_key_write_failed',
+          'could not write the complete registry signing seed');
+      if not Windows.FlushFileBuffers(Handle) then
+        raise ELWPTRegistryError.CreateStable('private_key_write_failed',
+          'could not commit the private registry signing seed');
+    finally
+      Windows.CloseHandle(Handle);
+    end;
+  finally
+    Windows.LocalFree(HLOCAL(SecurityDescriptor));
+  end;
+  {$ENDIF}
+  try
+    if not AtomicReplaceFile(Temporary, ADestination) then
+      raise ELWPTRegistryError.CreateStable('private_key_write_failed',
+        'could not atomically commit the private registry signing seed');
+  except
+    SysUtils.DeleteFile(Temporary);
+    raise;
+  end;
 end;
 
 function Quote(const AValue: string): string;
@@ -333,12 +473,112 @@ begin
   end;
 end;
 
+function RFC5952(const AAddress: in6_addr): string;
+var
+  BestLength, BestStart, CurrentLength, CurrentStart, Index: Integer;
+  Groups: array[0..7] of Word;
+begin
+  for Index := 0 to 7 do Groups[Index] :=
+    Word(AAddress.u6_addr8[Index * 2]) shl 8
+    or Word(AAddress.u6_addr8[Index * 2 + 1]);
+  BestStart := -1;
+  BestLength := 0;
+  Index := 0;
+  while Index < 8 do
+  begin
+    if Groups[Index] <> 0 then
+    begin
+      Inc(Index);
+      Continue;
+    end;
+    CurrentStart := Index;
+    while (Index < 8) and (Groups[Index] = 0) do Inc(Index);
+    CurrentLength := Index - CurrentStart;
+    if (CurrentLength >= 2) and (CurrentLength > BestLength) then
+    begin
+      BestStart := CurrentStart;
+      BestLength := CurrentLength;
+    end;
+  end;
+  Result := '';
+  Index := 0;
+  while Index < 8 do
+  begin
+    if Index = BestStart then
+    begin
+      Result := Result + '::';
+      Inc(Index, BestLength);
+      Continue;
+    end;
+    if (Result <> '') and (Result[Length(Result)] <> ':') then
+      Result := Result + ':';
+    Result := Result + LowerCase(IntToHex(Groups[Index], 1));
+    Inc(Index);
+  end;
+end;
+
+function CanonicalHost(const AHost: string): string;
+var
+  Address4: in_addr;
+  AllIPv4Characters: Boolean;
+  Character: Char;
+  LabelValue: string;
+  Labels: TStringList;
+  Index: Integer;
+begin
+  if AHost = '' then
+    raise ELWPTRegistryError.CreateStable('invalid_url',
+      'registry URL host is empty');
+  AllIPv4Characters := True;
+  for Character in AHost do
+  begin
+    if Ord(Character) > 127 then
+      raise ELWPTRegistryError.CreateStable('invalid_url',
+        'registry URL host must be ASCII');
+    if not (Character in ['0'..'9', '.']) then AllIPv4Characters := False;
+  end;
+  if AllIPv4Characters then
+  begin
+    if not TryStrToHostAddr(AHost, Address4) then
+      raise ELWPTRegistryError.CreateStable('invalid_url',
+        'registry IPv4 host is invalid');
+    Exit(HostAddrToStr(Address4));
+  end;
+  Labels := TStringList.Create;
+  try
+    Labels.Delimiter := '.';
+    Labels.StrictDelimiter := True;
+    Labels.DelimitedText := LowerCase(AHost);
+    for Index := 0 to Labels.Count - 1 do
+    begin
+      LabelValue := Labels[Index];
+      if (LabelValue = '') or (Length(LabelValue) > 63)
+        or (LabelValue[1] = '-') or (LabelValue[Length(LabelValue)] = '-') then
+        raise ELWPTRegistryError.CreateStable('invalid_url',
+          'registry DNS host has an invalid label');
+      for Character in LabelValue do
+        if not (Character in ['a'..'z', '0'..'9', '-']) then
+          raise ELWPTRegistryError.CreateStable('invalid_url',
+            'registry DNS host has an invalid character');
+    end;
+  finally
+    Labels.Free;
+  end;
+  Result := LowerCase(AHost);
+end;
+
 function CanonicalRegistryURL(const AValue: string;
   const ARequireHTTPS: Boolean): string;
 var
   Authority, Host, Path, Port, Scheme: string;
+  Address6: in6_addr;
+  Character: Char;
   BracketEnd, Colon, Slash: Integer;
 begin
+  for Character in AValue do
+    if (Ord(Character) <= 32) or (Character = '"') or (Character = '\') then
+      raise ELWPTRegistryError.CreateStable('invalid_url',
+        'registry URL contains a forbidden character');
   if Pos('://', AValue) = 0 then
     raise ELWPTRegistryError.CreateStable('invalid_url', 'registry URL must be absolute');
   Scheme := LowerCase(Copy(AValue, 1, Pos('://', AValue) - 1));
@@ -363,7 +603,11 @@ begin
   begin
     BracketEnd := Pos(']', Authority);
     if BracketEnd = 0 then raise ELWPTRegistryError.CreateStable('invalid_url', 'invalid bracketed IPv6 host');
-    Host := LowerCase(Copy(Authority, 1, BracketEnd));
+    Host := Copy(Authority, 2, BracketEnd - 2);
+    if not TryStrToHostAddr6(Host, Address6) then
+      raise ELWPTRegistryError.CreateStable('invalid_url',
+        'registry IPv6 host is invalid');
+    Host := '[' + RFC5952(Address6) + ']';
     if Length(Authority) > BracketEnd then
     begin
       if Authority[BracketEnd + 1] <> ':' then
@@ -379,13 +623,14 @@ begin
       Host := LowerCase(Copy(Authority, 1, Colon - 1));
       Port := Copy(Authority, Colon + 1, MaxInt);
     end
-    else Host := LowerCase(Authority);
+    else Host := Authority;
   end;
-  if Host = '' then raise ELWPTRegistryError.CreateStable('invalid_url', 'registry URL host is empty');
+  if (Host <> '') and (Host[1] <> '[') then Host := CanonicalHost(Host);
   if Port <> '' then
   begin
     if (StrToIntDef(Port, 0) < 1) or (StrToIntDef(Port, 0) > 65535) then
       raise ELWPTRegistryError.CreateStable('invalid_url', 'registry URL port is invalid');
+    Port := IntToStr(StrToInt(Port));
     if ((Scheme = 'https') and (Port = '443'))
       or ((Scheme = 'http') and (Port = '80')) then Port := '';
   end;
@@ -401,6 +646,18 @@ end;
 function IsLoopbackListenAddress(const AValue: string): Boolean;
 begin
   Result := SameText(AValue, 'localhost') or (AValue = '127.0.0.1');
+end;
+
+function IsAbsoluteFilesystemPath(const AValue: string): Boolean;
+begin
+  {$IFDEF UNIX}
+  Result := (AValue <> '') and (AValue[1] = PathDelim);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Result := (Length(AValue) >= 3) and (AValue[2] = ':')
+    and (AValue[3] in ['\', '/']);
+  if not Result then Result := StartsStr('\\', AValue);
+  {$ENDIF}
 end;
 
 function RegistryConfiguration(const AIdentity, ABaseURL,
@@ -438,6 +695,9 @@ begin
       raise ELWPTRegistryError.CreateStable('tls_configuration', 'HTTPS requires a PKCS#12 path');
     if AConfig.TLSPasswordEnvironment = '' then
       raise ELWPTRegistryError.CreateStable('tls_configuration', 'HTTPS requires a password environment name');
+    if not IsAbsoluteFilesystemPath(AConfig.TLSPKCS12Path) then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'HTTPS PKCS#12 path must be absolute in persisted configuration');
   end;
 end;
 
@@ -565,31 +825,6 @@ begin
   Result := Result + ']' + #10;
 end;
 
-function ReadVersionIndex(const ADocument, AOrigin,
-  AName: string): TStringList;
-var
-  Entry: string;
-begin
-  if StringValue(ADocument, 'schema') <> PROGRAM_NAME
-    + '-registry-version-index-v1' then
-    raise ELWPTRegistryError.CreateStable('state_corrupt',
-      'unsupported version-index schema');
-  if StringValue(ADocument, 'origin') <> AOrigin then
-    raise ELWPTRegistryError.CreateStable('state_corrupt',
-      'version-index origin does not match the store');
-  if StringValue(ADocument, 'name') <> AName then
-    raise ELWPTRegistryError.CreateStable('state_corrupt',
-      'version-index package name does not match its path');
-  Result := ReadStringArray(ADocument, 'versions',
-    'version-index versions');
-  Result.NameValueSeparator := '=';
-  for Entry in Result do
-    if (Pos('=', Entry) < 2) or not IsSHA256(
-      Copy(Entry, Pos('=', Entry) + 1, MaxInt)) then
-      raise ELWPTRegistryError.CreateStable('state_corrupt',
-        'version-index entry is invalid');
-end;
-
 function CheckpointDocument(const AOrigin: string; const ASequence: QWord;
   const ASnapshotHash, APublishedAt, AKeyID: string): string;
 begin
@@ -642,6 +877,10 @@ constructor TLWPTRegistryStore.Create(const ARoot: string);
 begin
   inherited Create;
   FRoot := ExpandFileName(ARoot);
+  ValidateRegistryPath(FRoot);
+  if FileExists(FRoot) and not DirectoryExists(FRoot) then
+    raise ELWPTRegistryError.CreateStable('invalid_registry_path',
+      'registry data root is not a directory');
   if not FileExists(RootPath(CONFIG_FILE)) then
     raise ELWPTRegistryError.CreateStable('origin_not_initialized',
       'registry data directory is not initialized: ' + FRoot);
@@ -653,6 +892,7 @@ function TLWPTRegistryStore.RootPath(const ARelative: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(FRoot)
     + StringReplace(ARelative, '/', PathDelim, [rfReplaceAll]);
+  ValidateRegistryPath(Result);
 end;
 
 function TLWPTRegistryStore.TmpRoot: string;
@@ -664,7 +904,7 @@ function TLWPTRegistryStore.LoadSeed: TBytes;
 var
   Seed: TLWPTEd25519Seed;
 begin
-  if not HexToBytes(Trim(ReadText(RootPath(SIGNING_SEED_FILE))), Seed,
+  if not HexToBytes(Trim(Text(LoadResource(SIGNING_SEED_FILE))), Seed,
     SizeOf(Seed)) then
     raise ELWPTRegistryError.CreateStable('state_corrupt', 'registry signing seed is invalid');
   SetLength(Result, SizeOf(Seed));
@@ -688,6 +928,62 @@ begin
   AtomicWriteBytes(RootPath(ARelative), TmpRoot, ABytes);
 end;
 
+function InitializationArtifact(const AName: string): Boolean;
+begin
+  Result := (AName = INITIALIZATION_MARKER) or (AName = 'tmp')
+    or (AName = 'keys') or (AName = 'objects') or (AName = 'records')
+    or (AName = 'snapshots') or (AName = 'checkpoints')
+    or (AName = 'indexes') or (AName = 'state');
+end;
+
+procedure PrepareUnconfiguredRoot(const ARoot: string);
+var
+  Entries: TStringList;
+  EntryPath: string;
+  Search: TSearchRec;
+  Index: Integer;
+begin
+  Entries := TStringList.Create;
+  try
+    if FindFirst(IncludeTrailingPathDelimiter(ARoot) + '*',
+      faAnyFile or faSymLink, Search) = 0 then
+    try
+      repeat
+        if (Search.Name = '.') or (Search.Name = '..') then Continue;
+        if not InitializationArtifact(Search.Name) then
+          raise ELWPTRegistryError.CreateStable('origin_directory_not_empty',
+            'uninitialized registry root contains caller-owned entry '
+            + Search.Name);
+        Entries.Add(Search.Name);
+      until FindNext(Search) <> 0;
+    finally
+      FindClose(Search);
+    end;
+    if (Entries.Count > 0) and (Entries.IndexOf(INITIALIZATION_MARKER) < 0) then
+      raise ELWPTRegistryError.CreateStable('origin_directory_not_empty',
+        'nonempty registry root has no initialization ownership marker');
+    if Entries.Count > 0 then
+    begin
+      EntryPath := IncludeTrailingPathDelimiter(ARoot)
+        + INITIALIZATION_MARKER;
+      ValidateRegistryPath(EntryPath);
+      if ReadText(EntryPath) <> 'registry initialization in progress' + #10 then
+        raise ELWPTRegistryError.CreateStable('origin_directory_not_empty',
+          'registry initialization ownership marker is invalid');
+    end;
+    for Index := 0 to Entries.Count - 1 do
+    begin
+      EntryPath := IncludeTrailingPathDelimiter(ARoot) + Entries[Index];
+      ValidateRegistryPath(EntryPath);
+      if not AtomicRemovePath(EntryPath) then
+        raise ELWPTRegistryError.CreateStable('initialization_recovery_failed',
+          'could not remove owned incomplete artifact ' + Entries[Index]);
+    end;
+  finally
+    Entries.Free;
+  end;
+end;
+
 class function TLWPTRegistryStore.Initialize(const ARoot: string;
   const ARequested: TLWPTRegistryConfig;
   const APublishedAt: string): TLWPTRegistryStore;
@@ -701,11 +997,14 @@ var
   Seed: TLWPTEd25519Seed;
   State: TLWPTRegistryState;
   RootDir, TemporaryRoot: string;
+  InitCoordinator: TLWPTProducerLeaseCoordinator;
+  InitLease: TLWPTProducerLease;
 
   function AtRoot(const ARelative: string): string;
   begin
     Result := IncludeTrailingPathDelimiter(RootDir)
       + StringReplace(ARelative, '/', PathDelim, [rfReplaceAll]);
+    ValidateRegistryPath(Result);
   end;
 
   procedure WriteInitialImmutable(const ARelative: string;
@@ -719,145 +1018,158 @@ var
 begin
   Result := nil;
   RootDir := ExpandFileName(ARoot);
+  ValidateRegistryPath(RootDir);
+  if FileExists(RootDir) and not DirectoryExists(RootDir) then
+    raise ELWPTRegistryError.CreateStable('invalid_registry_path',
+      'registry data root is not a directory');
   TemporaryRoot := IncludeTrailingPathDelimiter(RootDir) + 'tmp';
-  if FileExists(IncludeTrailingPathDelimiter(RootDir)
-    + INITIALIZATION_MARKER) and not FileExists(
-      IncludeTrailingPathDelimiter(RootDir) + CONFIG_FILE) then
-  begin
-    { No configuration means no initialization ever committed. Reclaim only
-      a directory carrying our marker, then rebuild it from fresh key bytes. }
-    WipeDir(RootDir);
-  end;
-  ForceDirectories(RootDir);
-  if FileExists(IncludeTrailingPathDelimiter(RootDir) + CONFIG_FILE) then
-  begin
-    Existing := TLWPTRegistryStore.Create(ARoot);
-    try
-      Config := ARequested;
-      if Config.Identity = '' then Config.Identity := Existing.Config.Identity;
-      Config.BaseURL := CanonicalRegistryURL(Config.BaseURL, False);
-      Config.Identity := CanonicalRegistryURL(Config.Identity,
-        Config.Identity <> Config.BaseURL);
-      if Config.Identity <> Existing.Config.Identity then
-        raise ELWPTRegistryError.CreateStable('identity_conflict',
-          'initialized origin identity cannot be changed');
-      ValidateRegistryConfiguration(Config);
-      AtomicWriteBytes(Existing.RootPath(CONFIG_FILE), Existing.TmpRoot,
-        Bytes(ConfigDocument(Config)));
-    finally
-      Existing.Free;
-    end;
-    Exit(TLWPTRegistryStore.Create(ARoot));
-  end;
-  Config := ARequested;
-  Config.BaseURL := CanonicalRegistryURL(Config.BaseURL, False);
-  if Config.Identity = '' then Config.Identity := Config.BaseURL
-  else Config.Identity := CanonicalRegistryURL(Config.Identity, True);
-  ValidateRegistryConfiguration(Config);
-  TimestampPlusSevenDays(APublishedAt);
-  ForceDirectories(TemporaryRoot);
-  AtomicWriteBytes(AtRoot(INITIALIZATION_MARKER), TemporaryRoot,
-    Bytes('registry initialization in progress' + #10));
-  ConfigBytes := Bytes(ConfigDocument(Config));
-  GenerateEd25519Seed(Seed);
-  AtomicWriteBytes(AtRoot(SIGNING_SEED_FILE), TemporaryRoot,
-    Bytes(BytesToHex(Seed, SizeOf(Seed)) + #10));
-  {$IFDEF UNIX}
-  FpChmod(PChar(AtRoot(SIGNING_SEED_FILE)), &600);
-  {$ENDIF}
+  InitCoordinator := TLWPTProducerLeaseCoordinator.Create(
+    IncludeTrailingPathDelimiter(GetTempDir) + PROGRAM_NAME
+    + '-registry-initialization-leases');
+  InitLease := nil;
   try
-    Ed25519PublicKey(Seed, PublicKey);
-    SetLength(PublicKeyBytes, SizeOf(PublicKey));
-    Move(PublicKey[0], PublicKeyBytes[0], SizeOf(PublicKey));
-    KeyID := 'ed25519:' + SHA256Hex(PublicKeyBytes);
-    WriteInitialImmutable(RegistryKeyStoragePath(KeyID), Bytes(
-      'schema = ' + Quote(PROGRAM_NAME + '-registry-key-v1') + #10
-      + 'origin = ' + Quote(Config.Identity) + #10
-      + 'key_id = ' + Quote(KeyID) + #10
-      + 'algorithm = "ed25519"' + #10
-      + 'public_key = ' + Quote('hex:' + BytesToHex(PublicKey,
-        SizeOf(PublicKey))) + #10
-      + 'valid_from_sequence = 1' + #10));
-    Records := TStringList.Create;
-    try
-      Snapshot := Bytes(SnapshotDocument(Config.Identity, 1,
-        APublishedAt, '', Records));
-    finally
-      Records.Free;
+    InitLease := InitCoordinator.TryAcquire(RootDir,
+      'registry initialization and reconfiguration');
+    if not Assigned(InitLease) then
+      raise ELWPTRegistryError.CreateStable('initialization_locked',
+        'another process is initializing or reconfiguring this origin');
+    ForceDirectories(RootDir);
+    ValidateRegistryPath(RootDir);
+    if not FileExists(IncludeTrailingPathDelimiter(RootDir) + CONFIG_FILE) then
+      PrepareUnconfiguredRoot(RootDir);
+    ForceDirectories(RootDir);
+    if FileExists(IncludeTrailingPathDelimiter(RootDir) + CONFIG_FILE) then
+    begin
+      Existing := TLWPTRegistryStore.Create(ARoot);
+      try
+        Config := ARequested;
+        if Config.Identity = '' then Config.Identity := Existing.Config.Identity;
+        Config.BaseURL := CanonicalRegistryURL(Config.BaseURL, False);
+        Config.Identity := CanonicalRegistryURL(Config.Identity,
+          Config.Identity <> Config.BaseURL);
+        if Config.TLSPKCS12Path <> '' then
+          Config.TLSPKCS12Path := ExpandFileName(Config.TLSPKCS12Path);
+        if Config.Identity <> Existing.Config.Identity then
+          raise ELWPTRegistryError.CreateStable('identity_conflict',
+            'initialized origin identity cannot be changed');
+        ValidateRegistryConfiguration(Config);
+        AtomicWriteBytes(Existing.RootPath(CONFIG_FILE), Existing.TmpRoot,
+          Bytes(ConfigDocument(Config)));
+      finally
+        Existing.Free;
+      end;
+      Exit(TLWPTRegistryStore.Create(ARoot));
     end;
-    SnapshotHash := 'sha256:' + SHA256Hex(Snapshot);
-    WriteInitialImmutable('snapshots/sha256/'
-      + Copy(SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml', Snapshot);
-    Checkpoint := Bytes(CheckpointDocument(Config.Identity, 1, SnapshotHash,
-      APublishedAt, KeyID));
-    Signature := Bytes(SignatureDocument(Checkpoint, Seed, KeyID));
-    WriteInitialImmutable('checkpoints/1.toml', Checkpoint);
-    WriteInitialImmutable('checkpoints/1.sig.toml', Signature);
-    State.Sequence := 1;
-    State.SnapshotHash := SnapshotHash;
-    State.CheckpointPath := 'checkpoints/1.toml';
-    State.SignaturePath := 'checkpoints/1.sig.toml';
-    AtomicWriteBytes(AtRoot(CURRENT_STATE_FILE), TemporaryRoot,
-      Bytes(StateDocument(State)));
-    { Configuration is the initialization commit marker. Constructors cannot
-      observe an origin until all immutable state and its pointer are ready. }
-    AtomicWriteBytes(AtRoot(CONFIG_FILE), TemporaryRoot, ConfigBytes);
-    SysUtils.DeleteFile(AtRoot(INITIALIZATION_MARKER));
-    Result := TLWPTRegistryStore.Create(ARoot);
-  except
-    FreeAndNil(Result);
-    raise;
+    Config := ARequested;
+    Config.BaseURL := CanonicalRegistryURL(Config.BaseURL, False);
+    if Config.Identity = '' then Config.Identity := Config.BaseURL
+    else Config.Identity := CanonicalRegistryURL(Config.Identity, True);
+    if Config.TLSPKCS12Path <> '' then
+      Config.TLSPKCS12Path := ExpandFileName(Config.TLSPKCS12Path);
+    ValidateRegistryConfiguration(Config);
+    TimestampPlusSevenDays(APublishedAt);
+    ForceDirectories(TemporaryRoot);
+    AtomicWriteBytes(AtRoot(INITIALIZATION_MARKER), TemporaryRoot,
+      Bytes('registry initialization in progress' + #10));
+    ConfigBytes := Bytes(ConfigDocument(Config));
+    GenerateEd25519Seed(Seed);
+    AtomicCreatePrivateBytes(AtRoot(SIGNING_SEED_FILE), TemporaryRoot,
+      Bytes(BytesToHex(Seed, SizeOf(Seed)) + #10));
+    try
+      Ed25519PublicKey(Seed, PublicKey);
+      SetLength(PublicKeyBytes, SizeOf(PublicKey));
+      Move(PublicKey[0], PublicKeyBytes[0], SizeOf(PublicKey));
+      KeyID := 'ed25519:' + SHA256Hex(PublicKeyBytes);
+      WriteInitialImmutable(RegistryKeyStoragePath(KeyID), Bytes(
+        'schema = ' + Quote(PROGRAM_NAME + '-registry-key-v1') + #10
+        + 'origin = ' + Quote(Config.Identity) + #10
+        + 'key_id = ' + Quote(KeyID) + #10
+        + 'algorithm = "ed25519"' + #10
+        + 'public_key = ' + Quote('hex:' + BytesToHex(PublicKey,
+          SizeOf(PublicKey))) + #10
+        + 'valid_from_sequence = 1' + #10));
+      Records := TStringList.Create;
+      try
+        Snapshot := Bytes(SnapshotDocument(Config.Identity, 1,
+          APublishedAt, '', Records));
+      finally
+        Records.Free;
+      end;
+      SnapshotHash := 'sha256:' + SHA256Hex(Snapshot);
+      WriteInitialImmutable('snapshots/sha256/'
+        + Copy(SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml', Snapshot);
+      Checkpoint := Bytes(CheckpointDocument(Config.Identity, 1, SnapshotHash,
+        APublishedAt, KeyID));
+      Signature := Bytes(SignatureDocument(Checkpoint, Seed, KeyID));
+      WriteInitialImmutable('checkpoints/1.toml', Checkpoint);
+      WriteInitialImmutable('checkpoints/1.sig.toml', Signature);
+      State.Sequence := 1;
+      State.SnapshotHash := SnapshotHash;
+      State.CheckpointPath := 'checkpoints/1.toml';
+      State.SignaturePath := 'checkpoints/1.sig.toml';
+      AtomicWriteBytes(AtRoot(CURRENT_STATE_FILE), TemporaryRoot,
+        Bytes(StateDocument(State)));
+      AtomicWriteBytes(AtRoot(CONFIG_FILE), TemporaryRoot, ConfigBytes);
+      SysUtils.DeleteFile(AtRoot(INITIALIZATION_MARKER));
+      Result := TLWPTRegistryStore.Create(ARoot);
+    except
+      FreeAndNil(Result);
+      raise;
+    end;
+  finally
+    FillChar(Seed, SizeOf(Seed), 0);
+    InitLease.Free;
+    InitCoordinator.Free;
   end;
 end;
 
-procedure TLWPTRegistryStore.Recover;
+procedure TLWPTRegistryStore.VerifyState(const AState: TLWPTRegistryState);
 var
   CheckpointBytes, KeyBytes, SignatureBytes, SigningInput: TBytes;
   CheckpointDocumentText, KeyDocumentText, SignatureDocumentText: string;
-  KeyID, Payload, PublicKeyHex, SignatureHex: string;
+  KeyID, Payload, PublicKeyHex, PublishedAt, SignatureHex: string;
   PublicKey: TLWPTEd25519PublicKey;
   Signature: TLWPTEd25519Signature;
-  State: TLWPTRegistryState;
-  Coordinator: TLWPTProducerLeaseCoordinator;
-  Lease: TLWPTProducerLease;
+  ExpectedCheckpointHash, RenewalPrefix: string;
 begin
-  { A live publisher owns temporary staging. A restart may serve the last
-    committed pointer immediately, but only a process that acquires the
-    advisory guard may reclaim abandoned staging. OS locks disappear when a
-    publisher crashes, so persistent guard files are never liveness proof. }
-  Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
-  Lease := nil;
-  try
-    Lease := Coordinator.TryAcquire('registry-publication',
-      'registry startup recovery');
-    if Assigned(Lease) then
-    begin
-      if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
-      ForceDirectories(TmpRoot);
-    end;
-  finally
-    Lease.Free;
-    Coordinator.Free;
-  end;
-  State := ReadCurrentState;
-  if not IsSHA256(State.SnapshotHash) then
+  if not IsSHA256(AState.SnapshotHash) then
     raise ELWPTRegistryError.CreateStable('state_corrupt',
       'committed snapshot hash is invalid');
-  if State.CheckpointPath <> 'checkpoints/' + UIntToStr(State.Sequence)
+  RenewalPrefix := 'checkpoints/renewals/sha256/';
+  if AState.CheckpointPath = 'checkpoints/' + UIntToStr(AState.Sequence)
     + '.toml' then
-    raise ELWPTRegistryError.CreateStable('state_corrupt',
-      'committed checkpoint path is invalid');
-  if State.SignaturePath <> 'checkpoints/' + UIntToStr(State.Sequence)
-    + '.sig.toml' then
-    raise ELWPTRegistryError.CreateStable('state_corrupt',
-      'committed signature path is invalid');
+  begin
+    if AState.SignaturePath <> 'checkpoints/' + UIntToStr(AState.Sequence)
+      + '.sig.toml' then
+      raise ELWPTRegistryError.CreateStable('state_corrupt',
+        'committed signature path is invalid');
+  end
+  else
+  begin
+    if not StartsStr(RenewalPrefix, AState.CheckpointPath)
+      or not EndsStr('.toml', AState.CheckpointPath) then
+      raise ELWPTRegistryError.CreateStable('state_corrupt',
+        'committed checkpoint path is invalid');
+    ExpectedCheckpointHash := Copy(AState.CheckpointPath,
+      Length(RenewalPrefix) + 1,
+      Length(AState.CheckpointPath) - Length(RenewalPrefix) - 5);
+    if not IsSHA256('sha256:' + ExpectedCheckpointHash)
+      or (AState.SignaturePath <> RenewalPrefix + ExpectedCheckpointHash
+        + '.sig.toml') then
+      raise ELWPTRegistryError.CreateStable('state_corrupt',
+        'committed renewal paths are invalid');
+  end;
   if SHA256BytesPrefixed(LoadResource('snapshots/sha256/'
-    + Copy(State.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml'))
-    <> State.SnapshotHash then
+    + Copy(AState.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml'))
+    <> AState.SnapshotHash then
     raise ELWPTRegistryError.CreateStable('snapshot_hash_mismatch',
       'committed snapshot bytes do not match the activation pointer');
-  CheckpointBytes := LoadResource(State.CheckpointPath);
-  SignatureBytes := LoadResource(State.SignaturePath);
+  CheckpointBytes := LoadResource(AState.CheckpointPath);
+  SignatureBytes := LoadResource(AState.SignaturePath);
+  if StartsStr(RenewalPrefix, AState.CheckpointPath)
+    and (SHA256Hex(CheckpointBytes) <> ExpectedCheckpointHash) then
+    raise ELWPTRegistryError.CreateStable('checkpoint_hash_mismatch',
+      'committed renewal checkpoint bytes do not match their path');
   CheckpointDocumentText := Text(CheckpointBytes);
   SignatureDocumentText := Text(SignatureBytes);
   if StringValue(CheckpointDocumentText, 'schema') <> PROGRAM_NAME
@@ -867,12 +1179,17 @@ begin
   if StringValue(CheckpointDocumentText, 'origin') <> FConfig.Identity then
     raise ELWPTRegistryError.CreateStable('checkpoint_origin_mismatch',
       'checkpoint origin differs from the configured identity');
-  if UIntValue(CheckpointDocumentText, 'sequence') <> State.Sequence then
+  if UIntValue(CheckpointDocumentText, 'sequence') <> AState.Sequence then
     raise ELWPTRegistryError.CreateStable('checkpoint_state_mismatch',
       'checkpoint sequence differs from committed state');
-  if StringValue(CheckpointDocumentText, 'snapshot') <> State.SnapshotHash then
+  if StringValue(CheckpointDocumentText, 'snapshot') <> AState.SnapshotHash then
     raise ELWPTRegistryError.CreateStable('checkpoint_state_mismatch',
       'checkpoint snapshot differs from committed state');
+  PublishedAt := StringValue(CheckpointDocumentText, 'published_at');
+  if StringValue(CheckpointDocumentText, 'expires_at')
+    <> TimestampPlusSevenDays(PublishedAt) then
+    raise ELWPTRegistryError.CreateStable('checkpoint_expiry_invalid',
+      'checkpoint expiry is not seven days after publication');
   KeyID := StringValue(CheckpointDocumentText, 'key_id');
   if StringValue(SignatureDocumentText, 'key_id') <> KeyID then
     raise ELWPTRegistryError.CreateStable('signature_key_mismatch',
@@ -922,6 +1239,112 @@ begin
     raise ELWPTRegistryError.CreateStable('signature_invalid', 'checkpoint signature verification failed');
 end;
 
+procedure TLWPTRegistryStore.RecoverDerivedState(
+  const AState: TLWPTRegistryState);
+var
+  ActiveNames, Records, Versions: TStringList;
+  Entry, FileName, Name, RecordHash, RecordText, Version: string;
+  Index: Integer;
+  Search: TSearchRec;
+begin
+  Records := ReadSnapshotRecords(Text(LoadResource('snapshots/sha256/'
+    + Copy(AState.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml')));
+  ActiveNames := TStringList.Create;
+  ActiveNames.Sorted := True;
+  ActiveNames.Duplicates := dupIgnore;
+  ActiveNames.OwnsObjects := True;
+  try
+    for RecordHash in Records do
+    begin
+      if not IsSHA256(RecordHash) then
+        raise ELWPTRegistryError.CreateStable('state_corrupt',
+          'snapshot contains an invalid record hash');
+      RecordText := Text(LoadResource('records/sha256/'
+        + Copy(RecordHash, Length('sha256:') + 1, MaxInt) + '.toml'));
+      if SHA256BytesPrefixed(Bytes(RecordText)) <> RecordHash then
+        raise ELWPTRegistryError.CreateStable('record_hash_mismatch',
+          'active package record bytes do not match their path');
+      Name := StringValue(RecordText, 'name');
+      Version := StringValue(RecordText, 'version');
+      Index := ActiveNames.IndexOf(Name);
+      if Index < 0 then
+      begin
+        Versions := TStringList.Create;
+        Versions.Sorted := True;
+        Versions.Duplicates := dupError;
+        ActiveNames.AddObject(Name, Versions);
+      end
+      else Versions := TStringList(ActiveNames.Objects[Index]);
+      Versions.Add(Version + '=' + RecordHash);
+    end;
+    ForceDirectories(RootPath('indexes'));
+    for Index := 0 to ActiveNames.Count - 1 do
+    begin
+      Versions := TStringList(ActiveNames.Objects[Index]);
+      Entry := VersionIndexDocument(FConfig.Identity, ActiveNames[Index],
+        Versions);
+      FileName := RootPath('indexes/' + ActiveNames[Index] + '.toml');
+      if not FileExists(FileName) or (ReadText(FileName) <> Entry) then
+        AtomicWriteBytes(FileName, TmpRoot, Bytes(Entry));
+    end;
+    if FindFirst(RootPath('indexes/*.toml'), faAnyFile, Search) = 0 then
+    try
+      repeat
+        Name := ChangeFileExt(Search.Name, '');
+        if ActiveNames.IndexOf(Name) < 0 then
+          if not SysUtils.DeleteFile(RootPath('indexes/' + Search.Name)) then
+            raise ELWPTRegistryError.CreateStable('recovery_failed',
+              'could not remove an index absent from committed state');
+      until FindNext(Search) <> 0;
+    finally
+      FindClose(Search);
+    end;
+    if FindFirst(RootPath('checkpoints/*.toml'), faAnyFile, Search) = 0 then
+    try
+      repeat
+        FileName := Search.Name;
+        if EndsStr('.sig.toml', FileName) then
+          Name := Copy(FileName, 1, Length(FileName) - Length('.sig.toml'))
+        else Name := ChangeFileExt(FileName, '');
+        if (StrToQWordDef(Name, 0) > AState.Sequence)
+          and not SysUtils.DeleteFile(RootPath('checkpoints/' + FileName)) then
+          raise ELWPTRegistryError.CreateStable('recovery_failed',
+            'could not remove an uncommitted checkpoint');
+      until FindNext(Search) <> 0;
+    finally
+      FindClose(Search);
+    end;
+  finally
+    ActiveNames.Free;
+    Records.Free;
+  end;
+end;
+
+procedure TLWPTRegistryStore.Recover;
+var
+  State: TLWPTRegistryState;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
+begin
+  State := ReadCurrentState;
+  VerifyState(State);
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
+  Lease := nil;
+  try
+    Lease := Coordinator.TryAcquire('registry-publication',
+      'registry startup recovery');
+    if Assigned(Lease) then
+    begin
+      if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
+      ForceDirectories(TmpRoot);
+      RecoverDerivedState(State);
+    end;
+  finally
+    Lease.Free;
+    Coordinator.Free;
+  end;
+end;
+
 function TLWPTRegistryStore.ReadCurrentState: TLWPTRegistryState;
 begin
   Result := ParseState(ReadText(RootPath(CURRENT_STATE_FILE)));
@@ -930,6 +1353,7 @@ end;
 function TLWPTRegistryStore.LoadCurrentState: TLWPTRegistryState;
 begin
   Result := ReadCurrentState;
+  VerifyState(Result);
 end;
 
 function TLWPTRegistryStore.LoadResource(const ARelative: string): TBytes;
@@ -945,6 +1369,77 @@ begin
   Result := ReadBytes(FullPath);
 end;
 
+procedure InjectRegistryFailure(const APoint: string);
+begin
+  if GetEnvironmentVariable(UpperCase(PROGRAM_NAME)
+    + '_REGISTRY_TEST_FAIL_AFTER') = APoint then
+    raise ELWPTRegistryError.CreateStable('injected_registry_failure',
+      'test failure after ' + APoint);
+end;
+
+procedure TLWPTRegistryStore.EnsureFreshCheckpoint(const ANow: string);
+var
+  Checkpoint, SeedBytes, Signature: TBytes;
+  CheckpointHash, CheckpointText, ExpiresAt, KeyID, RenewalPath: string;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  ExpiresDate, NowDate: TDateTime;
+  Lease: TLWPTProducerLease;
+  PublicKey: TLWPTEd25519PublicKey;
+  Seed: TLWPTEd25519Seed;
+  State: TLWPTRegistryState;
+begin
+  TimestampPlusSevenDays(ANow);
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
+  Lease := nil;
+  try
+    Lease := Coordinator.TryAcquire('registry-publication',
+      'registry checkpoint renewal');
+    if not Assigned(Lease) then Exit;
+    State := ReadCurrentState;
+    VerifyState(State);
+    CheckpointText := Text(LoadResource(State.CheckpointPath));
+    ExpiresAt := StringValue(CheckpointText, 'expires_at');
+    if not TryISO8601ToDate(ExpiresAt, ExpiresDate, True)
+      or not TryISO8601ToDate(ANow, NowDate, True) then
+      raise ELWPTRegistryError.CreateStable('checkpoint_expiry_invalid',
+        'checkpoint expiry is not canonical UTC');
+    if ExpiresDate > IncHour(NowDate,
+      CHECKPOINT_RENEWAL_THRESHOLD_HOURS) then Exit;
+    KeyID := StringValue(CheckpointText, 'key_id');
+    SeedBytes := LoadSeed;
+    try
+      if Length(SeedBytes) <> SizeOf(Seed) then
+        raise ELWPTRegistryError.CreateStable('state_corrupt',
+          'registry signing seed has the wrong length');
+      Move(SeedBytes[0], Seed[0], SizeOf(Seed));
+      Ed25519PublicKey(Seed, PublicKey);
+      SetLength(SeedBytes, SizeOf(PublicKey));
+      Move(PublicKey[0], SeedBytes[0], SizeOf(PublicKey));
+      if KeyID <> 'ed25519:' + SHA256Hex(SeedBytes) then
+        raise ELWPTRegistryError.CreateStable('key_id_mismatch',
+          'registry signing seed does not match the active key');
+      Checkpoint := Bytes(CheckpointDocument(FConfig.Identity,
+        State.Sequence, State.SnapshotHash, ANow, KeyID));
+      Signature := Bytes(SignatureDocument(Checkpoint, Seed, KeyID));
+    finally
+      FillChar(Seed, SizeOf(Seed), 0);
+      if Length(SeedBytes) > 0 then FillChar(SeedBytes[0], Length(SeedBytes), 0);
+    end;
+    CheckpointHash := SHA256Hex(Checkpoint);
+    RenewalPath := 'checkpoints/renewals/sha256/' + CheckpointHash;
+    WriteImmutable(RenewalPath + '.toml', Checkpoint);
+    WriteImmutable(RenewalPath + '.sig.toml', Signature);
+    InjectRegistryFailure('renewal-checkpoint');
+    State.CheckpointPath := RenewalPath + '.toml';
+    State.SignaturePath := RenewalPath + '.sig.toml';
+    AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
+      Bytes(StateDocument(State)));
+  finally
+    Lease.Free;
+    Coordinator.Free;
+  end;
+end;
+
 procedure TLWPTRegistryStore.Publish(
   const APublication: TLWPTRegistryPublication);
 var
@@ -952,7 +1447,7 @@ var
   ArchiveHash, ExistingRecordHash, IndexPath, KeyID, RecordHash,
     SnapshotHash: string;
   Checkpoint, RecordBytes, SeedBytes, Signature, Snapshot: TBytes;
-  CurrentSnapshot, IndexDocument, RecordDocument: string;
+  ActiveRecordDocument, CurrentSnapshot, IndexDocument, RecordDocument: string;
   Coordinator: TLWPTProducerLeaseCoordinator;
   Lease: TLWPTProducerLease;
   PublicKey: TLWPTEd25519PublicKey;
@@ -979,6 +1474,8 @@ begin
     if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
     ForceDirectories(TmpRoot);
     State := ReadCurrentState;
+    VerifyState(State);
+    RecoverDerivedState(State);
     ArchiveHash := SHA256BytesPrefixed(APublication.Archive);
     WriteImmutable('objects/sha256/' + Copy(ArchiveHash,
       Length('sha256:') + 1, MaxInt), APublication.Archive);
@@ -998,59 +1495,76 @@ begin
       Length('sha256:') + 1, MaxInt) + '.toml', RecordBytes);
     CurrentSnapshot := Text(LoadResource('snapshots/sha256/'
       + Copy(State.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml'));
-    IndexPath := RootPath('indexes/' + APublication.Name + '.toml');
-    if FileExists(IndexPath) then
-      VersionEntries := ReadVersionIndex(ReadText(IndexPath),
-        FConfig.Identity, APublication.Name)
-    else
-    begin
-      VersionEntries := TStringList.Create;
-      VersionEntries.Sorted := True;
-      VersionEntries.Duplicates := dupError;
-      VersionEntries.NameValueSeparator := '=';
-    end;
+    VersionEntries := TStringList.Create;
+    VersionEntries.Sorted := True;
+    VersionEntries.Duplicates := dupError;
+    VersionEntries.NameValueSeparator := '=';
+    Records := ReadSnapshotRecords(CurrentSnapshot);
     try
-      ExistingRecordHash := VersionEntries.Values[APublication.Version];
-      if ExistingRecordHash <> '' then
+      for ExistingRecordHash in Records do
       begin
-        if ExistingRecordHash = RecordHash then Exit;
-        raise ELWPTRegistryError.CreateStable('identity_conflict',
-          'package version is immutable: ' + APublication.Name + '@'
-          + APublication.Version);
+        if not IsSHA256(ExistingRecordHash) then
+          raise ELWPTRegistryError.CreateStable('state_corrupt',
+            'snapshot contains an invalid record hash');
+        ActiveRecordDocument := Text(LoadResource('records/sha256/'
+          + Copy(ExistingRecordHash, Length('sha256:') + 1, MaxInt)
+          + '.toml'));
+        if SHA256BytesPrefixed(Bytes(ActiveRecordDocument))
+          <> ExistingRecordHash then
+          raise ELWPTRegistryError.CreateStable('record_hash_mismatch',
+            'active package record bytes do not match their path');
+        if StringValue(ActiveRecordDocument, 'name') = APublication.Name then
+        begin
+          VersionEntries.Add(StringValue(ActiveRecordDocument, 'version')
+            + '=' + ExistingRecordHash);
+          if StringValue(ActiveRecordDocument, 'version')
+            = APublication.Version then
+          begin
+            if ExistingRecordHash = RecordHash then Exit;
+            raise ELWPTRegistryError.CreateStable('identity_conflict',
+              'package version is immutable: ' + APublication.Name + '@'
+              + APublication.Version);
+          end;
+        end;
       end;
       VersionEntries.Add(APublication.Version + '=' + RecordHash);
-      Records := ReadSnapshotRecords(CurrentSnapshot);
-      try
-        Records.Add(RecordHash);
-        Snapshot := Bytes(SnapshotDocument(FConfig.Identity,
-          State.Sequence + 1, APublication.PublishedAt, State.SnapshotHash,
-          Records));
-      finally
-        Records.Free;
-      end;
+      Records.Add(RecordHash);
+      Snapshot := Bytes(SnapshotDocument(FConfig.Identity,
+        State.Sequence + 1, APublication.PublishedAt, State.SnapshotHash,
+        Records));
       IndexDocument := VersionIndexDocument(FConfig.Identity,
         APublication.Name, VersionEntries);
     finally
+      Records.Free;
       VersionEntries.Free;
     end;
+    IndexPath := RootPath('indexes/' + APublication.Name + '.toml');
+    {
+      Immutable publication bytes are prepared first. Only current.toml
+      activates them; indexes are derived aliases and follow activation.
+    }
     SnapshotHash := SHA256BytesPrefixed(Snapshot);
     WriteImmutable('snapshots/sha256/' + Copy(SnapshotHash,
       Length('sha256:') + 1, MaxInt) + '.toml', Snapshot);
     SeedBytes := LoadSeed;
-    Move(SeedBytes[0], Seed[0], SizeOf(Seed));
-    Ed25519PublicKey(Seed, PublicKey);
-    SetLength(SeedBytes, SizeOf(PublicKey));
-    Move(PublicKey[0], SeedBytes[0], SizeOf(PublicKey));
-    KeyID := 'ed25519:' + SHA256Hex(SeedBytes);
-    Checkpoint := Bytes(CheckpointDocument(FConfig.Identity,
-      State.Sequence + 1, SnapshotHash, APublication.PublishedAt, KeyID));
-    Signature := Bytes(SignatureDocument(Checkpoint, Seed, KeyID));
+    try
+      Move(SeedBytes[0], Seed[0], SizeOf(Seed));
+      Ed25519PublicKey(Seed, PublicKey);
+      SetLength(SeedBytes, SizeOf(PublicKey));
+      Move(PublicKey[0], SeedBytes[0], SizeOf(PublicKey));
+      KeyID := 'ed25519:' + SHA256Hex(SeedBytes);
+      Checkpoint := Bytes(CheckpointDocument(FConfig.Identity,
+        State.Sequence + 1, SnapshotHash, APublication.PublishedAt, KeyID));
+      Signature := Bytes(SignatureDocument(Checkpoint, Seed, KeyID));
+    finally
+      FillChar(Seed, SizeOf(Seed), 0);
+      if Length(SeedBytes) > 0 then FillChar(SeedBytes[0], Length(SeedBytes), 0);
+    end;
     WriteImmutable('checkpoints/' + UIntToStr(State.Sequence + 1) + '.toml',
       Checkpoint);
     WriteImmutable('checkpoints/' + UIntToStr(State.Sequence + 1)
       + '.sig.toml', Signature);
-    AtomicWriteBytes(RootPath('indexes/' + APublication.Name + '.toml'),
-      TmpRoot, Bytes(IndexDocument));
+    InjectRegistryFailure('checkpoint');
     State.Sequence := State.Sequence + 1;
     State.SnapshotHash := SnapshotHash;
     State.CheckpointPath := 'checkpoints/' + UIntToStr(State.Sequence) + '.toml';
@@ -1058,6 +1572,10 @@ begin
       + '.sig.toml';
     AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
       Bytes(StateDocument(State)));
+    InjectRegistryFailure('activation');
+    AtomicWriteBytes(IndexPath, TmpRoot, Bytes(IndexDocument));
+    { No additional commit follows the alias. A crash here is recovered by
+      rebuilding aliases from the authenticated active snapshot. }
   finally
     Lease.Free;
     Coordinator.Free;

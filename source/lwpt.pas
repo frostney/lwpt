@@ -468,8 +468,10 @@ begin
   ServeConfigurationPresent := False;
   for Index := 0 to High(AOptions) do
   begin
-    if AOptions[Index].Present and not SameText(AOptions[Index].LongName,
-      'data-dir') then ServeConfigurationPresent := True;
+    if AOptions[Index].Present
+      and not SameText(AOptions[Index].LongName, 'data-dir')
+      and not SameText(AOptions[Index].LongName, 'silent') then
+      ServeConfigurationPresent := True;
     if AOptions[Index] is TStringOption then
     begin
       if SameText(AOptions[Index].LongName, 'data-dir') then

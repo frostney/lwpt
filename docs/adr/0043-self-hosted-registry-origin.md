@@ -31,6 +31,8 @@ records/sha256/<hash>.toml
 snapshots/sha256/<hash>.toml
 checkpoints/<sequence>.toml
 checkpoints/<sequence>.sig.toml
+checkpoints/renewals/sha256/<checkpoint-hash>.toml
+checkpoints/renewals/sha256/<checkpoint-hash>.sig.toml
 indexes/<package>.toml
 state/current.toml
 locks/
@@ -43,13 +45,13 @@ Publishing an existing `(origin, name, version)` with identical bytes is
 idempotent; different bytes are an `identity_conflict`. A per-package version
 index is replaced atomically and is a derived lookup aid, not a trust root.
 
-Publication writes the archive, record, next snapshot, checkpoint, detached
-signature, and version index before replacing `state/current.toml`. That one
-small atomic pointer names the complete committed checkpoint, signature, and
-snapshot. A request reads it once, so concurrent readers continue using the
-old immutable graph while a publisher prepares the new one. A crash before
-the pointer replacement leaves unreachable immutable or temporary data; a
-crash after it leaves a complete new graph.
+Publication writes the archive, record, next snapshot, checkpoint, and
+detached signature before replacing `state/current.toml`. That one small
+atomic pointer is the authority for the complete committed checkpoint,
+signature, and snapshot. Derived version indexes are atomically replaced only
+after activation and are rebuilt from the active snapshot after a crash. An
+index or numeric checkpoint ahead of the pointer is never publication proof
+and cannot make a retry idempotent or consume a sequence.
 
 Publication takes an operating-system advisory producer lease. Its persistent
 guard and diagnostic files do not establish liveness: the kernel lock is
@@ -57,11 +59,24 @@ released when a process exits. Startup reclaims `tmp/` only after acquiring
 that lease, then verifies the activated snapshot hash, checkpoint relationship,
 key record, signature payload, and Ed25519 signature. If a publisher is live,
 startup leaves its staging alone and serves the previous committed pointer.
+Initialization and operational reconfiguration use a separate operating-system
+lease from marker inspection through commit. Recovery removes only enumerated
+origin-owned artifacts carrying a valid initialization marker; it never wipes
+the caller's data root. Every registry path rejects symbolic-link and reparse
+components before reads, writes, recovery, or serving.
 
-All committed-state writes use `AtomicWriteBytes`. The private seed is written
-the same way and mode `0600` is applied on Unix. The password is read from the
-named environment variable only while constructing the TLS listener; it is
-never persisted.
+All committed-state writes use atomic replacement. The private seed has a
+stricter creation path: staging and destination are private from their first
+open, Unix mode `0600` or the Windows owner-and-system ACL is verified before
+commit, and initialization fails closed if that cannot be guaranteed. The
+password is read from the named environment variable only while constructing
+the TLS listener; it is never persisted. The PKCS#12 path is persisted as an
+absolute path so a supervisor may restart from another working directory.
+
+An active checkpoint is renewed when less than 24 hours of its seven-day
+validity remains. Renewal keeps the package sequence and snapshot unchanged,
+writes a content-addressed checkpoint and signature, then atomically replaces
+the same state pointer. Historical sequence checkpoint bytes never change.
 
 ## Signing and diagnostics
 
@@ -69,8 +84,9 @@ never persisted.
 origin, mirror, resolver, and cache consumers. It implements SHA-512 and
 RFC 8032 Ed25519 in Pascal, produces the same bytes on every release platform,
 uses platform secure randomness only for seed generation, rejects non-canonical
-signature scalars, and is pinned by the RFC 8032 empty-message and one-byte
-vectors. It does not select OpenSSL, Security.framework, or CNG signing APIs,
+signature scalars, noncanonical field encodings, and small-order public keys
+and `R` points. RFC 8032 positive vectors and negative forgery vectors pin the
+behavior. It does not select OpenSSL, Security.framework, or CNG signing APIs,
 which prevents provider defaults from changing registry identity across
 platforms.
 
@@ -97,13 +113,19 @@ HTTPS uses the repository's native server policy:
   the Network C API through the stable blocks ABI, with one serial queue per
   connection.
 
-The listener handles each socket or Network.framework connection independently
-and closes it after one bounded HTTP/1.1 GET or HEAD request. Request headers
-are capped at 32 KiB. Hashed objects are returned without content encoding and
-with immutable cache headers. Discovery, capabilities, current checkpoints,
-keys, snapshots, records, and archive objects are served relative to the
-configured base path. Authenticated remote publication remains issue #54, so
-this slice does not advertise `publication-v1` yet.
+The listener admits at most 32 owned connections, handles each independently,
+and closes it after one bounded HTTP/1.1 GET or HEAD request. One ten-second
+monotonic deadline covers handshake, request, and response; request headers are
+capped at 32 KiB. Shutdown interrupts acceptance, cancels every client, drains
+its workers or Network.framework callbacks, and only then releases the store
+and TLS context. Hashed objects, records, and snapshots are SHA-256 checked
+again before every response and receive immutable cache headers. Checkpoint
+aliases and historical checkpoint paths require cache revalidation.
+
+Discovery and capabilities advertise only the implemented read surface:
+checkpoint, key, package-record, snapshot, and object schemas with
+`snapshot-sync-v1`. Package lists and publication remain issue #54; rotation
+chains remain issue #55. Neither future feature is advertised by this origin.
 
 ## Rejected alternatives
 

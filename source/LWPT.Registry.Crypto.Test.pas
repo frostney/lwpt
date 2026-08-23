@@ -15,6 +15,8 @@ type
     procedure TestRFC8032EmptyMessageVector;
     procedure TestRFC8032SingleByteVector;
     procedure TestTamperingHasStableRejection;
+    procedure TestSmallOrderForgeryIsRejected;
+    procedure TestNonCanonicalPointEncodingsAreRejected;
     procedure TestSHA512EmptyVector;
   end;
 
@@ -43,6 +45,49 @@ begin
     'e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155'
     + '5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b');
   Expect<Boolean>(Ed25519Verify(Message, PublicKey, Signature)).ToBe(True);
+end;
+
+procedure TRegistryCryptoContract.TestSmallOrderForgeryIsRejected;
+var
+  Message: TBytes;
+  PublicKey: TLWPTEd25519PublicKey;
+  Signature: TLWPTEd25519Signature;
+begin
+  { A = identity, R = identity, S = 0 satisfies the unchecked group equation
+    for every message. RFC 8032 verification must reject both torsion points. }
+  FillChar(PublicKey, SizeOf(PublicKey), 0);
+  PublicKey[0] := 1;
+  FillChar(Signature, SizeOf(Signature), 0);
+  Signature[0] := 1;
+  Message := TEncoding.UTF8.GetBytes('forgery');
+  Expect<Boolean>(Ed25519Verify(Message, PublicKey, Signature)).ToBe(False);
+end;
+
+procedure TRegistryCryptoContract.TestNonCanonicalPointEncodingsAreRejected;
+var
+  Index: Integer;
+  Message: TBytes;
+  PublicKey: TLWPTEd25519PublicKey;
+  Seed: TLWPTEd25519Seed;
+  Signature: TLWPTEd25519Signature;
+begin
+  FillChar(Seed, SizeOf(Seed), 9);
+  Message := TEncoding.UTF8.GetBytes('canonical points');
+  Ed25519PublicKey(Seed, PublicKey);
+  Ed25519Sign(Message, Seed, Signature);
+
+  { y = 2^255-19 is outside the field but reduces to zero in permissive
+    decoders. Exercise it independently in A and R. }
+  PublicKey[0] := $ED;
+  for Index := 1 to 30 do PublicKey[Index] := $FF;
+  PublicKey[31] := $7F;
+  Expect<Boolean>(Ed25519Verify(Message, PublicKey, Signature)).ToBe(False);
+
+  Ed25519PublicKey(Seed, PublicKey);
+  Signature[0] := $ED;
+  for Index := 1 to 30 do Signature[Index] := $FF;
+  Signature[31] := $7F;
+  Expect<Boolean>(Ed25519Verify(Message, PublicKey, Signature)).ToBe(False);
 end;
 
 procedure TRegistryCryptoContract.TestSHA512EmptyVector;
@@ -99,6 +144,10 @@ begin
   Test('RFC 8032 one-byte vector is exact',
     TestRFC8032SingleByteVector);
   Test('tampered signatures are rejected', TestTamperingHasStableRejection);
+  Test('small-order public keys and R points reject forgeries',
+    TestSmallOrderForgeryIsRejected);
+  Test('noncanonical field encodings are rejected',
+    TestNonCanonicalPointEncodingsAreRejected);
   Test('SHA-512 empty-message vector is exact', TestSHA512EmptyVector);
 end;
 

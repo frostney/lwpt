@@ -8,7 +8,11 @@ uses
   {$ENDIF}
   Classes,
   Process,
+  Sockets,
   SysUtils,
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
 
   TestingPascalLibrary,
   Tests.LwptSubprocess,
@@ -38,6 +42,8 @@ type
     procedure TestInitPolicyAndStableIdentityThroughCLI;
     procedure TestForegroundServerSurvivesRestartAndConcurrentReaders;
     procedure TestConfiguredTLSServerCompletesARequest;
+    procedure TestSilentServeUsesPersistedConfiguration;
+    procedure TestSlowClientsAreBoundedByOneDeadline;
   end;
 
 function TRegistryE2EContract.BasePort: Integer;
@@ -50,6 +56,7 @@ function TRegistryE2EContract.StartServer(const ADataDirectory: string;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := LwptBinaryPath;
+  Result.CurrentDirectory := FScratch;
   Result.Parameters.Add('registry');
   Result.Parameters.Add('serve');
   Result.Parameters.Add('--data-dir');
@@ -108,9 +115,76 @@ end;
 procedure TRegistryE2EContract.StopServer(AProcess: TProcess);
 begin
   if not Assigned(AProcess) then Exit;
-  if AProcess.Running then AProcess.Terminate(1);
+  if AProcess.Running then
+  begin
+    {$IFDEF UNIX}
+    FpKill(AProcess.ProcessID, SIGTERM);
+    {$ELSE}
+    AProcess.Terminate(1);
+    {$ENDIF}
+  end;
   AProcess.WaitOnExit;
   AProcess.Free;
+end;
+
+procedure TRegistryE2EContract.TestSilentServeUsesPersistedConfiguration;
+var
+  ResultValue: TLwptResult;
+begin
+  ResultValue := RunLwpt(['registry', 'serve', '--silent', '--data-dir',
+    FScratch + '/missing']);
+  Expect<Integer>(ResultValue.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('serve accepts only', ResultValue.Stderr) = 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('origin_not_initialized:', ResultValue.Stderr) > 0)
+    .ToBe(True);
+end;
+
+procedure TRegistryE2EContract.TestSlowClientsAreBoundedByOneDeadline;
+var
+  Address: TInetSockAddr;
+  DataDirectory, DiscoveryURL: string;
+  Init: TLwptResult;
+  Index: Integer;
+  Server: TProcess;
+  SlowSockets: array[0..39] of TSocket;
+  Partial: AnsiString;
+begin
+  DataDirectory := FScratch + '/slow-origin';
+  DiscoveryURL := 'http://localhost:' + IntToStr(BasePort + 3)
+    + '/.well-known/lwpt-registry';
+  Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
+    '--base-url', 'http://localhost:' + IntToStr(BasePort + 3), '--port',
+    IntToStr(BasePort + 3)]);
+  Expect<Integer>(Init.ExitCode).ToBe(0);
+  Server := StartServer(DataDirectory, False);
+  for Index := 0 to High(SlowSockets) do SlowSockets[Index] := -1;
+  try
+    WaitUntilReady(DiscoveryURL, False);
+    FillChar(Address, SizeOf(Address), 0);
+    Address.sin_family := AF_INET;
+    Address.sin_port := HToNs(BasePort + 3);
+    Address.sin_addr := StrToNetAddr('127.0.0.1');
+    Partial := 'GET /';
+    for Index := 0 to High(SlowSockets) do
+    begin
+      SlowSockets[Index] := fpSocket(AF_INET, SOCK_STREAM, 0);
+      if (SlowSockets[Index] >= 0)
+        and (fpConnect(SlowSockets[Index], @Address, SizeOf(Address)) = 0) then
+        fpSend(SlowSockets[Index], @Partial[1], Length(Partial), 0);
+    end;
+    Sleep(11000);
+    Expect<Boolean>(Pos('registry-discovery-v1', Curl(DiscoveryURL,
+      False)) > 0).ToBe(True);
+  finally
+    for Index := 0 to High(SlowSockets) do
+      if SlowSockets[Index] >= 0 then
+      begin
+        fpShutdown(SlowSockets[Index], 2);
+        CloseSocket(SlowSockets[Index]);
+      end;
+    StopServer(Server);
+  end;
 end;
 
 procedure TRegistryE2EContract.WaitUntilReady(const AURL: string;
@@ -253,6 +327,10 @@ begin
     TestForegroundServerSurvivesRestartAndConcurrentReaders);
   Test('configured TLS server completes a request',
     TestConfiguredTLSServerCompletesARequest);
+  Test('silent serve uses persisted configuration',
+    TestSilentServeUsesPersistedConfiguration);
+  Test('slow clients are bounded by one deadline',
+    TestSlowClientsAreBoundedByOneDeadline);
 end;
 
 begin

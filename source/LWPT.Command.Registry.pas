@@ -16,9 +16,43 @@ implementation
 uses
   DateUtils,
   SysUtils,
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
 
   LWPT.Registry.Server,
   LWPT.Registry.Store;
+
+var
+  ActiveRegistryServer: TLWPTRegistryServer = nil;
+
+{$IFDEF UNIX}
+function CSignal(const ASignal: LongInt;
+  const AHandler: Pointer): Pointer; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'signal';
+  {$ELSE}
+  external name 'signal';
+  {$ENDIF}
+
+procedure RegistrySignalHandler(ASignal: LongInt); cdecl;
+begin
+  if Assigned(ActiveRegistryServer) then ActiveRegistryServer.RequestStop;
+end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+function RegistryConsoleControlHandler(AControlType: DWORD): BOOL; stdcall;
+begin
+  Result := AControlType in [CTRL_C_EVENT, CTRL_BREAK_EVENT,
+    CTRL_CLOSE_EVENT, CTRL_SHUTDOWN_EVENT];
+  if Result and Assigned(ActiveRegistryServer) then
+    ActiveRegistryServer.RequestStop;
+end;
+{$ENDIF}
 
 function CurrentTimestamp: string;
 begin
@@ -58,8 +92,21 @@ begin
   try
     Server := TLWPTRegistryServer.Create(Store);
     try
+      Store.EnsureFreshCheckpoint(RegistryTimestampNow);
+      ActiveRegistryServer := Server;
+      {$IFDEF UNIX}
+      CSignal(SIGINT, @RegistrySignalHandler);
+      CSignal(SIGTERM, @RegistrySignalHandler);
+      {$ENDIF}
+      {$IFDEF MSWINDOWS}
+      Windows.SetConsoleCtrlHandler(@RegistryConsoleControlHandler, True);
+      {$ENDIF}
       Server.Run;
     finally
+      {$IFDEF MSWINDOWS}
+      Windows.SetConsoleCtrlHandler(@RegistryConsoleControlHandler, False);
+      {$ENDIF}
+      ActiveRegistryServer := nil;
       Server.Free;
     end;
   finally

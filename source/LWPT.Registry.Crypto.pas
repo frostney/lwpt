@@ -623,6 +623,56 @@ begin
   Result := False;
 end;
 
+function FieldEncodingCanonical(
+  const AEncoded: TLWPTEd25519PublicKey): Boolean;
+var
+  Index: Integer;
+begin
+  { RFC 8032 encodes y as a little-endian integer below 2^255-19. }
+  if (AEncoded[31] and $7F) < $7F then Exit(True);
+  if (AEncoded[31] and $7F) > $7F then Exit(False);
+  for Index := 30 downto 1 do
+    if AEncoded[Index] < $FF then Exit(True);
+  Result := AEncoded[0] < $ED;
+end;
+
+function GFIsZero(const AValue: TGF): Boolean;
+var
+  Encoded, Zero: TLWPTEd25519PublicKey;
+begin
+  FillChar(Zero, SizeOf(Zero), 0);
+  Pack25519(Encoded, AValue);
+  Result := Equal32(Encoded, Zero);
+end;
+
+function PointHasSmallOrder(const APoint: TPoint): Boolean;
+var
+  Cofactor: TLWPTEd25519PublicKey;
+  Encoded, Identity: TLWPTEd25519PublicKey;
+  Product: TPoint;
+begin
+  FillChar(Cofactor, SizeOf(Cofactor), 0);
+  Cofactor[0] := 8;
+  ScalarMultiply(Product, APoint, @Cofactor[0]);
+  PackPoint(Encoded, Product);
+  FillChar(Identity, SizeOf(Identity), 0);
+  Identity[0] := 1;
+  Result := Equal32(Encoded, Identity);
+end;
+
+function DecodeCanonicalPoint(var APoint: TPoint;
+  const AEncoded: TLWPTEd25519PublicKey): Boolean;
+begin
+  Result := False;
+  if not FieldEncodingCanonical(AEncoded) then Exit;
+  if not UnpackNegative(APoint, AEncoded) then Exit;
+  { x = 0 has only the zero sign. Accepting the high bit there gives one
+    field element two encodings and makes signature bytes noncanonical. }
+  if ((AEncoded[31] and $80) <> 0) and GFIsZero(APoint[0]) then Exit;
+  if PointHasSmallOrder(APoint) then Exit;
+  Result := True;
+end;
+
 procedure Ed25519PublicKey(const ASeed: TLWPTEd25519Seed;
   out APublicKey: TLWPTEd25519PublicKey);
 var
@@ -691,11 +741,13 @@ var
   Encoded, REncoded: TLWPTEd25519PublicKey;
   HashValue: TSHA512Digest;
   HashInput: TBytes;
-  LeftPoint, PublicPoint: TPoint;
+  LeftPoint, PublicPoint, RPoint: TPoint;
 begin
   Result := False;
   if not ScalarCanonical(@ASignature[32]) then Exit;
-  if not UnpackNegative(PublicPoint, APublicKey) then Exit;
+  if not DecodeCanonicalPoint(PublicPoint, APublicKey) then Exit;
+  Move(ASignature[0], REncoded[0], 32);
+  if not DecodeCanonicalPoint(RPoint, REncoded) then Exit;
   SetLength(HashInput, 64 + Length(AMessage));
   Move(ASignature[0], HashInput[0], 32);
   Move(APublicKey[0], HashInput[32], 32);
@@ -706,7 +758,6 @@ begin
   ScalarBase(PublicPoint, @ASignature[32]);
   AddPoint(LeftPoint, PublicPoint);
   PackPoint(Encoded, LeftPoint);
-  Move(ASignature[0], REncoded[0], 32);
   Result := Equal32(Encoded, REncoded);
 end;
 

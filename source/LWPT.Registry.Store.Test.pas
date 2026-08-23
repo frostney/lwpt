@@ -8,8 +8,16 @@ uses
   {$ENDIF}
   Classes,
   SysUtils,
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
 
   LWPT.Core,
+  LWPT.ProducerLease,
+  LWPT.Registry.Server,
   LWPT.Registry.Store,
   TestingPascalLibrary,
   Tests.Scratch;
@@ -30,6 +38,49 @@ type
     property Failure: string read FFailure;
   end;
 
+{$IFDEF UNIX}
+function CSetEnvironmentVariable(AName, AValue: PAnsiChar;
+  AOverwrite: LongInt): LongInt; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'setenv';
+  {$ELSE}
+  external name 'setenv';
+  {$ENDIF}
+function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'unsetenv';
+  {$ELSE}
+  external name 'unsetenv';
+  {$ENDIF}
+{$ENDIF}
+
+procedure SetFailurePoint(const AValue: string);
+{$IFDEF UNIX}
+var
+  Name, Value: AnsiString;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Name, Value: UnicodeString;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Name := AnsiString(UpperCase(PROGRAM_NAME)
+    + '_REGISTRY_TEST_FAIL_AFTER');
+  Value := AnsiString(AValue);
+  if AValue = '' then CUnsetEnvironmentVariable(PAnsiChar(Name))
+  else CSetEnvironmentVariable(PAnsiChar(Name), PAnsiChar(Value), 1);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Name := UnicodeString(UpperCase(PROGRAM_NAME)
+    + '_REGISTRY_TEST_FAIL_AFTER');
+  Value := UnicodeString(AValue);
+  if AValue = '' then Windows.SetEnvironmentVariableW(PWideChar(Name), nil)
+  else Windows.SetEnvironmentVariableW(PWideChar(Name), PWideChar(Value));
+  {$ENDIF}
+end;
+
+type
   TRegistryStoreContract = class(TTestSuite)
   private
     FScratch: string;
@@ -49,7 +100,18 @@ type
     procedure TestPublicationIsImmutableAndIdempotent;
     procedure TestVersionIndexRetainsEveryPublishedVersion;
     procedure TestIncompleteInitializationIsRecovered;
+    procedure TestCallerOwnedRootIsPreserved;
+    procedure TestInitializationUsesAnOperatingSystemLease;
     procedure TestRecoveryClearsIncompleteStaging;
+    procedure TestCheckpointCrashDoesNotActivatePublication;
+    procedure TestActivationCrashRebuildsDerivedIndex;
+    procedure TestCheckpointRenewsWithoutNewSequence;
+    procedure TestRegistryPathsRejectLinks;
+    procedure TestCanonicalURLValidation;
+    procedure TestSigningSeedIsPrivateFromCreation;
+    procedure TestServerRejectsCorruptContentAddressedBytes;
+    procedure TestServerDiscoveryIsTruthful;
+    procedure TestCheckpointResponsesRequireRevalidation;
     procedure TestReadersObserveCompleteStateDuringPublication;
     procedure TestTamperedSignatureHasStableDiagnostic;
   end;
@@ -224,13 +286,279 @@ procedure TRegistryStoreContract.TestIncompleteInitializationIsRecovered;
 var
   Store: TLWPTRegistryStore;
 begin
-  WriteTextFile(FScratch + '/.initializing', 'interrupted');
-  WriteTextFile(FScratch + '/partial', 'uncommitted');
+  WriteTextFile(FScratch + '/.initializing',
+    'registry initialization in progress' + #10);
+  WriteTextFile(FScratch + '/tmp/uncommitted', 'partial');
   Store := InitializeStore;
   try
-    Expect<Boolean>(FileExists(FScratch + '/partial')).ToBe(False);
+    Expect<Boolean>(FileExists(FScratch + '/tmp/uncommitted')).ToBe(False);
     Expect<Boolean>(FileExists(FScratch + '/.initializing')).ToBe(False);
     Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(1);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestCallerOwnedRootIsPreserved;
+var
+  Diagnostic: string;
+  Store: TLWPTRegistryStore;
+begin
+  WriteTextFile(FScratch + '/caller-data', 'keep me');
+  Diagnostic := '';
+  Store := nil;
+  try
+    Store := InitializeStore;
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Store.Free;
+  Expect<Boolean>(Pos('origin_directory_not_empty:', Diagnostic) = 1)
+    .ToBe(True);
+  Expect<string>(Trim(ReadBinaryFile(FScratch + '/caller-data'))).ToBe('keep me');
+end;
+
+procedure TRegistryStoreContract.TestInitializationUsesAnOperatingSystemLease;
+var
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Diagnostic: string;
+  Lease: TLWPTProducerLease;
+  Store: TLWPTRegistryStore;
+begin
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(
+    IncludeTrailingPathDelimiter(GetTempDir) + PROGRAM_NAME
+    + '-registry-initialization-leases');
+  Lease := Coordinator.TryAcquire(ExpandFileName(FScratch), 'test holder');
+  try
+    Expect<Boolean>(Assigned(Lease)).ToBe(True);
+    Diagnostic := '';
+    Store := nil;
+    try
+      Store := InitializeStore;
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    Store.Free;
+    Expect<Boolean>(Pos('initialization_locked:', Diagnostic) = 1).ToBe(True);
+  finally
+    Lease.Free;
+    Coordinator.Free;
+  end;
+  Store := InitializeStore;
+  Store.Free;
+end;
+
+procedure TRegistryStoreContract.TestCheckpointCrashDoesNotActivatePublication;
+var
+  Diagnostic: string;
+  Store: TLWPTRegistryStore;
+begin
+  Store := InitializeStore;
+  try
+    SetFailurePoint('checkpoint');
+    Diagnostic := '';
+    try
+      PublishExample(Store, $61);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    SetFailurePoint('');
+    Expect<Boolean>(Pos('injected_registry_failure:', Diagnostic) = 1)
+      .ToBe(True);
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(1);
+  finally
+    SetFailurePoint('');
+    Store.Free;
+  end;
+  Store := TLWPTRegistryStore.Create(FScratch);
+  try
+    Expect<Boolean>(FileExists(FScratch + '/checkpoints/2.toml')).ToBe(False);
+    Expect<Int64>(PublishExample(Store, $61).Sequence).ToBe(2);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestActivationCrashRebuildsDerivedIndex;
+var
+  Diagnostic: string;
+  Store: TLWPTRegistryStore;
+begin
+  Store := InitializeStore;
+  try
+    SetFailurePoint('activation');
+    Diagnostic := '';
+    try
+      PublishExample(Store, $62);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    SetFailurePoint('');
+    Expect<Boolean>(Pos('injected_registry_failure:', Diagnostic) = 1)
+      .ToBe(True);
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(2);
+    Expect<Boolean>(FileExists(FScratch + '/indexes/example-lib.toml'))
+      .ToBe(False);
+  finally
+    SetFailurePoint('');
+    Store.Free;
+  end;
+  Store := TLWPTRegistryStore.Create(FScratch);
+  try
+    Expect<Boolean>(FileExists(FScratch + '/indexes/example-lib.toml'))
+      .ToBe(True);
+    Expect<Int64>(PublishExample(Store, $62).Sequence).ToBe(2);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestCheckpointRenewsWithoutNewSequence;
+var
+  Historical, Renewed: string;
+  State: TLWPTRegistryState;
+  Store: TLWPTRegistryStore;
+begin
+  Store := InitializeStore;
+  try
+    Historical := ReadBinaryFile(FScratch + '/checkpoints/1.toml');
+    Store.EnsureFreshCheckpoint('2026-08-29T11:00:00Z');
+    State := Store.LoadCurrentState;
+    Expect<Int64>(State.Sequence).ToBe(1);
+    Expect<Boolean>(Pos('checkpoints/renewals/sha256/',
+      State.CheckpointPath) = 1).ToBe(True);
+    Renewed := ReadBinaryFile(FScratch + '/' + State.CheckpointPath);
+    Expect<Boolean>(Pos('expires_at = "2026-09-05T11:00:00Z"',
+      Renewed) > 0).ToBe(True);
+    Expect<string>(ReadBinaryFile(FScratch + '/checkpoints/1.toml'))
+      .ToBe(Historical);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestRegistryPathsRejectLinks;
+{$IFDEF UNIX}
+var
+  Diagnostic, RealRoot, SymlinkRoot: string;
+  Store: TLWPTRegistryStore;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  RealRoot := FScratch + '/real';
+  SymlinkRoot := FScratch + '/linked';
+  ForceDirectories(RealRoot);
+  if FpSymlink(PChar(RealRoot), PChar(SymlinkRoot)) <> 0 then RaiseLastOSError;
+  Diagnostic := '';
+  Store := nil;
+  try
+    Store := TLWPTRegistryStore.Initialize(SymlinkRoot, DefaultConfig,
+      INITIAL_TIME);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Store.Free;
+  Expect<Boolean>(Pos('registry_path_link:', Diagnostic) = 1).ToBe(True);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TRegistryStoreContract.TestCanonicalURLValidation;
+var
+  Diagnostic: string;
+begin
+  Expect<string>(CanonicalRegistryURL(
+    'https://[2001:0db8:0:0:0:0:0:1]:443/a/../b', False))
+    .ToBe('https://[2001:db8::1]/b');
+  Diagnostic := '';
+  try
+    CanonicalRegistryURL('https://example.com/"bad"', False);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('invalid_url:', Diagnostic) = 1).ToBe(True);
+end;
+
+procedure TRegistryStoreContract.TestSigningSeedIsPrivateFromCreation;
+{$IFDEF UNIX}
+var
+  Info: Stat;
+  Store: TLWPTRegistryStore;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Store := InitializeStore;
+  Store.Free;
+  if FpStat(FScratch + '/keys/root.seed', Info) <> 0 then RaiseLastOSError;
+  Expect<Integer>(Info.st_mode and &777).ToBe(&600);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TRegistryStoreContract.TestServerRejectsCorruptContentAddressedBytes;
+var
+  ObjectName: string;
+  Response: TLWPTRegistryHTTPResponse;
+  Search: TSearchRec;
+  Store: TLWPTRegistryStore;
+begin
+  Store := InitializeStore;
+  try
+    PublishExample(Store, $71);
+    Expect<Integer>(FindFirst(FScratch + '/objects/sha256/*', faAnyFile,
+      Search)).ToBe(0);
+    while (Search.Name = '.') or (Search.Name = '..')
+      or ((Search.Attr and faDirectory) <> 0) do
+      if FindNext(Search) <> 0 then
+        raise Exception.Create('published object was not found');
+    ObjectName := Search.Name;
+    FindClose(Search);
+    WriteTextFile(FScratch + '/objects/sha256/' + ObjectName, 'tampered');
+    Response := RegistryHTTPResponse(Store, 'GET',
+      '/v1/objects/sha256/' + ObjectName);
+    Expect<Integer>(Response.Status).ToBe(500);
+    Expect<Boolean>(Pos('resource_hash_mismatch',
+      TEncoding.UTF8.GetString(Response.Body)) > 0).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestServerDiscoveryIsTruthful;
+var
+  Body: string;
+  Response: TLWPTRegistryHTTPResponse;
+  Store: TLWPTRegistryStore;
+begin
+  Store := InitializeStore;
+  try
+    Response := RegistryHTTPResponse(Store, 'GET', '/v1/capabilities');
+    Body := TEncoding.UTF8.GetString(Response.Body);
+    Expect<Boolean>(Pos('package-list-v1', Body) = 0).ToBe(True);
+    Expect<Boolean>(Pos('rotation-chain-v1', Body) = 0).ToBe(True);
+    Response := RegistryHTTPResponse(Store, 'GET',
+      '/.well-known/' + PROGRAM_NAME + '-registry');
+    Body := TEncoding.UTF8.GetString(Response.Body);
+    Expect<Boolean>(Pos('rotations =', Body) = 0).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestCheckpointResponsesRequireRevalidation;
+var
+  Response: TLWPTRegistryHTTPResponse;
+  Store: TLWPTRegistryStore;
+begin
+  Store := InitializeStore;
+  try
+    Response := RegistryHTTPResponse(Store, 'GET',
+      '/v1/checkpoints/latest.toml');
+    Expect<string>(Response.CacheControl).ToBe('no-cache, must-revalidate');
+    Response := RegistryHTTPResponse(Store, 'GET', '/v1/checkpoints/1.toml');
+    Expect<string>(Response.CacheControl).ToBe('no-cache, must-revalidate');
   finally
     Store.Free;
   end;
@@ -349,8 +677,26 @@ begin
     TestVersionIndexRetainsEveryPublishedVersion);
   Test('incomplete initialization is recovered',
     TestIncompleteInitializationIsRecovered);
+  Test('caller-owned root is preserved', TestCallerOwnedRootIsPreserved);
+  Test('initialization uses an operating-system lease',
+    TestInitializationUsesAnOperatingSystemLease);
   Test('recovery clears incomplete staging',
     TestRecoveryClearsIncompleteStaging);
+  Test('checkpoint crash does not activate publication',
+    TestCheckpointCrashDoesNotActivatePublication);
+  Test('activation crash rebuilds derived index',
+    TestActivationCrashRebuildsDerivedIndex);
+  Test('checkpoint renews without new sequence',
+    TestCheckpointRenewsWithoutNewSequence);
+  Test('registry paths reject links', TestRegistryPathsRejectLinks);
+  Test('canonical URL validation', TestCanonicalURLValidation);
+  Test('signing seed is private from creation',
+    TestSigningSeedIsPrivateFromCreation);
+  Test('server rejects corrupt content-addressed bytes',
+    TestServerRejectsCorruptContentAddressedBytes);
+  Test('server discovery is truthful', TestServerDiscoveryIsTruthful);
+  Test('checkpoint responses require revalidation',
+    TestCheckpointResponsesRequireRevalidation);
   Test('readers observe complete state during publication',
     TestReadersObserveCompleteStateDuringPublication);
   Test('tampered signature has a stable diagnostic',
