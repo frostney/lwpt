@@ -755,8 +755,8 @@ var
   AdmitterFinished: Boolean;
   AdmitterResult: TAdmitterResult;
   DiagnosticMatches: Boolean;
-  Diagnostic, ExpectedStderrPrefix, ExpectedStdout, ReadyPath,
-    ReleasePath: string;
+  Diagnostic, ExpectedPhases, ExpectedStderrPrefix, ExpectedStdout,
+    ReadyPath, ReleasePath: string;
 begin
   ReadyPath := FScratch + '/diagnostic-ready';
   ReleasePath := FScratch + '/diagnostic-release';
@@ -779,12 +779,13 @@ begin
     + LineEnding + STDOUT_TAIL_MARKER + LineEnding;
   ExpectedStderrPrefix := StringOfChar('e', DIAGNOSTIC_STREAM_BYTES)
     + LineEnding + STDERR_TAIL_MARKER + LineEnding;
+  ExpectedPhases := '01-child-started,02-store-created,03-ready-signaled,'
+    + '04-release-observed,05-admission-started,06-object-staged,'
+    + '09-publication-started';
   DiagnosticMatches := (AdmitterResult.ExitStatus = 217)
     and not AdmitterResult.TimedOut
     and (Pos('exit-status=217', Diagnostic) > 0)
-    and (Pos('phases=01-child-started,02-store-created,03-ready-signaled,'
-      + '04-release-observed,05-admission-started,06-object-staged,'
-      + '09-publication-started', Diagnostic) > 0)
+    and (AdmitterResult.Phases = ExpectedPhases)
     and (AdmitterResult.Stdout = ExpectedStdout)
     and (Pos(ExpectedStderrPrefix, AdmitterResult.Stderr) = 1)
     and (Pos(ExpectedStdout, Diagnostic) > 0)
@@ -795,10 +796,8 @@ begin
   Expect<Integer>(AdmitterResult.ExitStatus).ToBe(217);
   Expect<Boolean>(AdmitterResult.TimedOut).ToBe(False);
   Expect<Boolean>(Pos('exit-status=217', Diagnostic) > 0).ToBe(True);
-  Expect<Boolean>(Pos('phases=01-child-started,02-store-created,'
-    + '03-ready-signaled,04-release-observed,05-admission-started,'
-    + '06-object-staged,09-publication-started',
-    Diagnostic) > 0).ToBe(True);
+  Expect<string>(AdmitterResult.Phases).ToBe(ExpectedPhases);
+  Expect<Boolean>(Pos('phases=' + ExpectedPhases, Diagnostic) > 0).ToBe(True);
   Expect<Boolean>(AdmitterResult.Stdout = ExpectedStdout).ToBe(True);
   Expect<Boolean>(Pos(ExpectedStderrPrefix, AdmitterResult.Stderr) = 1)
     .ToBe(True);
