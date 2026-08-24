@@ -36,6 +36,9 @@ type
     ADestination: string);
   TLWPTObjectStoreMaterializeHook = procedure(const ADigest,
     APath: string);
+  TLWPTObjectStoreStagedVerificationOpenHook = procedure(
+    const APath: string; const AAttempt: Integer;
+    out AErrorCode: Integer);
   {$ENDIF}
 
   TLWPTImmutableObjectStore = class
@@ -91,9 +94,51 @@ var
     TLWPTObjectStoreMaterializeHook;
   ObjectStoreAfterMaterializeCopyTestHook:
     TLWPTObjectStoreMaterializeHook;
+  ObjectStoreStagedVerificationOpenTestHook:
+    TLWPTObjectStoreStagedVerificationOpenHook;
 {$ENDIF}
 
 implementation
+
+uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
+  Classes;
+
+function StagedVerificationHash(const APath: string): string;
+const
+  OPEN_ATTEMPTS = 3;
+  OPEN_RETRY_MILLISECONDS = 1;
+var
+  Attempt: Integer;
+  ErrorCode: Integer;
+begin
+  for Attempt := 1 to OPEN_ATTEMPTS do
+  begin
+    ErrorCode := 0;
+    {$IFDEF OBJECTSTORE_TESTING}
+    if Assigned(ObjectStoreStagedVerificationOpenTestHook) then
+      ObjectStoreStagedVerificationOpenTestHook(APath, Attempt, ErrorCode);
+    {$ENDIF}
+    if ErrorCode = 0 then
+    begin
+      if not FileExists(APath) then Exit('');
+      if TrySHA256FileOpen(APath, Result, ErrorCode) then Exit;
+    end;
+    {$IFDEF UNIX}
+    if (ErrorCode in [ESysEAGAIN, ESysEINTR])
+       and (Attempt < OPEN_ATTEMPTS) then
+    begin
+      Sleep(OPEN_RETRY_MILLISECONDS);
+      Continue;
+    end;
+    {$ENDIF}
+    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+      [APath, SysErrorMessage(ErrorCode)]);
+  end;
+  Result := '';
+end;
 
 function ObjectMaterializeFailureName(
   const AFailure: TLWPTObjectMaterializeFailure): string;
@@ -595,7 +640,7 @@ begin
           if Assigned(ObjectStoreAfterMaterializeCopyTestHook) then
             ObjectStoreAfterMaterializeCopyTestHook(Expected, Staged);
           {$ENDIF}
-          Actual := 'sha256:' + SHA256File(Staged);
+          Actual := 'sha256:' + StagedVerificationHash(Staged);
           if Actual <> Expected then
           begin
             SysUtils.DeleteFile(Staged);
