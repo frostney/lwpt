@@ -33,7 +33,7 @@ type
     FProducerLeases: TLWPTProducerLeaseCoordinator;
     function ReferencePath(const AFingerprint: string): string;
     function InvalidateReferenceIfCurrent(const AFingerprint,
-      AManifestDigest: string): Boolean;
+      AExpectedReferenceText: string): Boolean;
     function ReadSmallTextFile(const APath: string;
       out AText: string): Boolean;
   public
@@ -187,7 +187,7 @@ begin
 end;
 
 function TLWPTBuildCache.InvalidateReferenceIfCurrent(
-  const AFingerprint, AManifestDigest: string): Boolean;
+  const AFingerprint, AExpectedReferenceText: string): Boolean;
 var
   Current: string;
   MutationLease: TObject;
@@ -196,13 +196,12 @@ begin
   {$IFDEF OBJECTSTORE_TESTING}
   if Assigned(BuildCacheBeforeReferenceInvalidationTestHook) then
     BuildCacheBeforeReferenceInvalidationTestHook(AFingerprint,
-      AManifestDigest);
+      CanonicalBuildCacheDigest(AExpectedReferenceText));
   {$ENDIF}
   MutationLease := FCacheLifecycle.AcquireMutation;
   try
     if ReadSmallTextFile(ReferencePath(AFingerprint), Current)
-       and (CanonicalBuildCacheDigest(Trim(Current)) =
-         CanonicalBuildCacheDigest(AManifestDigest)) then
+       and (Trim(Current) = AExpectedReferenceText) then
     begin
       if not SysUtils.DeleteFile(ReferencePath(AFingerprint)) then
       begin
@@ -232,10 +231,14 @@ begin
   AReason := 'no-result';
   if not ReadSmallTextFile(ReferencePath(AFingerprint), ReferenceText) then
     Exit;
-  ManifestDigest := CanonicalBuildCacheDigest(Trim(ReferenceText));
-  if ManifestDigest = '' then
+  ReferenceText := Trim(ReferenceText);
+  ManifestDigest := CanonicalBuildCacheDigest(ReferenceText);
+  if (ManifestDigest = '') or (ReferenceText <> ManifestDigest) then
   begin
     AReason := 'invalid-reference';
+    if (ManifestDigest <> '')
+       and not InvalidateReferenceIfCurrent(AFingerprint,
+         ReferenceText) then AReason := 'no-result';
     Exit;
   end;
   ForceDirectories(ASessionTemporaryRoot);
@@ -249,7 +252,7 @@ begin
         + ObjectMaterializeFailureName(ObjectFailure);
       if ObjectFailure in [omfObjectMissing, omfVerificationFailed] then
         if not InvalidateReferenceIfCurrent(AFingerprint,
-             ManifestDigest) then AReason := 'no-result';
+             ReferenceText) then AReason := 'no-result';
     finally
       ObjectLease.Free;
     end;
@@ -264,7 +267,7 @@ begin
     begin
       AReason := 'result-manifest-invalid';
       if not InvalidateReferenceIfCurrent(AFingerprint,
-           ManifestDigest) then AReason := 'no-result';
+           ReferenceText) then AReason := 'no-result';
       Exit;
     end;
   finally
@@ -278,7 +281,7 @@ begin
       AReason := 'artifact-' + ObjectMaterializeFailureName(ObjectFailure);
       if ObjectFailure in [omfObjectMissing, omfVerificationFailed] then
         if not InvalidateReferenceIfCurrent(AFingerprint,
-             ManifestDigest) then AReason := 'no-result';
+             ReferenceText) then AReason := 'no-result';
     finally
       ObjectLease.Free;
     end;

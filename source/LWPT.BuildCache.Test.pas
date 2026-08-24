@@ -561,7 +561,7 @@ end;
 
 procedure TBuildCacheContract.TestMixedCaseReferenceIsInvalidated;
 var
-  ArtifactDigest, Destination, ManifestDigest, Reason: string;
+  Destination, ManifestDigest, Reason: string;
   Cache: TLWPTBuildCache;
   Cached: TLWPTCachedBuildResult;
 begin
@@ -571,13 +571,12 @@ begin
       TEST_ARTIFACT_KIND)).ToBe(True);
     ManifestDigest := Trim(ReadBytes(ReferencePath(TEST_FINGERPRINT)));
     WriteBytes(ReferencePath(TEST_FINGERPRINT), UpperCase(ManifestDigest) + #10);
-    ArtifactDigest := 'sha256:' + SHA256File(FArtifact);
-    Expect<Boolean>(SysUtils.DeleteFile(ObjectPath(ArtifactDigest))).ToBe(True);
     Destination := FScratch + '/mixed-case/bin/app';
     Expect<Boolean>(Cache.Materialize(TEST_FINGERPRINT, Destination,
       FScratch + '/mixed-case/tmp', Cached, Reason)).ToBe(False);
-    Expect<string>(Reason).ToBe('artifact-object-missing');
+    Expect<string>(Reason).ToBe('invalid-reference');
     Expect<Boolean>(FileExists(ReferencePath(TEST_FINGERPRINT))).ToBe(False);
+    Expect<Boolean>(FileExists(Destination)).ToBe(False);
   finally
     Cache.Free;
   end;
