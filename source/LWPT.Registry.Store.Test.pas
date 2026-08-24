@@ -57,6 +57,7 @@ type
     procedure TestDefaultIdentityIsDeterministic;
     procedure TestExplicitIdentitySurvivesReconfiguration;
     procedure TestPlainHTTPRejectsRemoteBinding;
+    procedure TestInvalidConfigurationLeavesFreshRootUncommitted;
     procedure TestInitialCheckpointVerifiesAfterRestart;
     procedure TestPublicationIsImmutableAndIdempotent;
     procedure TestVersionIndexRetainsEveryPublishedVersion;
@@ -204,6 +205,43 @@ begin
   end;
   Store.Free;
   Expect<Boolean>(Pos('insecure_transport:', Diagnostic) = 1).ToBe(True);
+end;
+
+procedure TRegistryStoreContract.TestInvalidConfigurationLeavesFreshRootUncommitted;
+var
+  Config: TLWPTRegistryConfig;
+  Diagnostic: string;
+  Store: TLWPTRegistryStore;
+begin
+  Config := RegistryConfiguration('', 'https://localhost:9417',
+    REGISTRY_DEFAULT_LISTEN_ADDRESS, REGISTRY_DEFAULT_PORT,
+    ExpandFileName(FScratch + '/certificate.p12'), 'TLS_PASSWORD' + #1);
+  Diagnostic := '';
+  Store := nil;
+  try
+    Store := TLWPTRegistryStore.Initialize(FScratch, Config, INITIAL_TIME);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Store.Free;
+  Expect<Boolean>(Pos('invalid_configuration:', Diagnostic) = 1).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/registry.toml')).ToBe(False);
+  Expect<Boolean>(FileExists(FScratch + '/keys/root.seed')).ToBe(False);
+  Expect<Boolean>(DirectoryExists(FScratch + '/keys')).ToBe(False);
+  Expect<Boolean>(DirectoryExists(FScratch + '/snapshots')).ToBe(False);
+  Expect<Boolean>(DirectoryExists(FScratch + '/checkpoints')).ToBe(False);
+  Expect<Boolean>(DirectoryExists(FScratch + '/state')).ToBe(False);
+  Expect<Boolean>(FileExists(FScratch + '/.initializing')).ToBe(False);
+  Store := TLWPTRegistryStore.Initialize(FScratch, DefaultConfig,
+    INITIAL_TIME);
+  Store.Free;
+  Store := TLWPTRegistryStore.Create(FScratch);
+  try
+    Expect<string>(Store.Config.Identity).ToBe(REGISTRY_DEFAULT_BASE_URL);
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(1);
+  finally
+    Store.Free;
+  end;
 end;
 
 procedure TRegistryStoreContract.TestInitialCheckpointVerifiesAfterRestart;
@@ -717,6 +755,8 @@ begin
     TestExplicitIdentitySurvivesReconfiguration);
   Test('plain HTTP rejects a remote binding',
     TestPlainHTTPRejectsRemoteBinding);
+  Test('invalid configuration leaves a fresh root uncommitted',
+    TestInvalidConfigurationLeavesFreshRootUncommitted);
   Test('initial checkpoint verifies after restart',
     TestInitialCheckpointVerifiesAfterRestart);
   Test('publication is immutable and idempotent',

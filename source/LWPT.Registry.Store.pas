@@ -266,7 +266,29 @@ begin
   end;
 end;
 
-function Quote(const AValue: string): string;
+function PersistedTOMLQuote(const AValue: string): string;
+var
+  Character: Char;
+begin
+  Result := '"';
+  for Character in AValue do
+    case Character of
+      '"': Result := Result + '\"';
+      '\': Result := Result + '\\';
+      #8: Result := Result + '\b';
+      #9: Result := Result + '\t';
+      #10: Result := Result + '\n';
+      #12: Result := Result + '\f';
+      #13: Result := Result + '\r';
+      #0..#7, #11, #14..#31, #127:
+        raise ELWPTRegistryError.CreateStable('invalid_configuration',
+          'control characters are not permitted in persisted registry state');
+      else Result := Result + Character;
+    end;
+  Result := Result + '"';
+end;
+
+function RegistryTOMLQuote(const AValue: string): string;
 var
   Character: Char;
 begin
@@ -285,11 +307,6 @@ begin
       else Result := Result + Character;
     end;
   Result := Result + '"';
-end;
-
-function RegistryTOMLQuote(const AValue: string): string;
-begin
-  Result := Quote(AValue);
 end;
 
 function RegistryIndexStoragePath(const AName: string): string;
@@ -690,10 +707,31 @@ begin
   Result.TLSPasswordEnvironment := ATLSPasswordEnvironment;
 end;
 
+procedure ValidatePersistedConfigurationString(const AValue: string);
+var
+  Character: Char;
+begin
+  for Character in AValue do
+    if Character in [#0..#31, #127] then
+      raise ELWPTRegistryError.CreateStable('invalid_configuration',
+        'control characters are not permitted in registry configuration');
+end;
+
+procedure ValidatePersistedConfigurationStrings(
+  const AConfig: TLWPTRegistryConfig);
+begin
+  ValidatePersistedConfigurationString(AConfig.Identity);
+  ValidatePersistedConfigurationString(AConfig.BaseURL);
+  ValidatePersistedConfigurationString(AConfig.ListenAddress);
+  ValidatePersistedConfigurationString(AConfig.TLSPKCS12Path);
+  ValidatePersistedConfigurationString(AConfig.TLSPasswordEnvironment);
+end;
+
 procedure ValidateRegistryConfiguration(const AConfig: TLWPTRegistryConfig);
 var
   BaseURL, Identity: string;
 begin
+  ValidatePersistedConfigurationStrings(AConfig);
   BaseURL := CanonicalRegistryURL(AConfig.BaseURL, False);
   if BaseURL <> AConfig.BaseURL then
     raise ELWPTRegistryError.CreateStable('invalid_url', 'base URL is not canonical; use ' + BaseURL);
@@ -721,13 +759,15 @@ end;
 
 function ConfigDocument(const AConfig: TLWPTRegistryConfig): string;
 begin
-  Result := 'schema = ' + Quote(PROGRAM_NAME + '-registry-origin-config-v1') + #10
-    + 'identity = ' + Quote(AConfig.Identity) + #10
-    + 'base_url = ' + Quote(AConfig.BaseURL) + #10
-    + 'listen_address = ' + Quote(AConfig.ListenAddress) + #10
+  Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
+    + '-registry-origin-config-v1') + #10
+    + 'identity = ' + PersistedTOMLQuote(AConfig.Identity) + #10
+    + 'base_url = ' + PersistedTOMLQuote(AConfig.BaseURL) + #10
+    + 'listen_address = ' + PersistedTOMLQuote(AConfig.ListenAddress) + #10
     + 'port = ' + IntToStr(AConfig.Port) + #10
-    + 'tls_pkcs12 = ' + Quote(AConfig.TLSPKCS12Path) + #10
-    + 'tls_password_env = ' + Quote(AConfig.TLSPasswordEnvironment) + #10;
+    + 'tls_pkcs12 = ' + PersistedTOMLQuote(AConfig.TLSPKCS12Path) + #10
+    + 'tls_password_env = '
+    + PersistedTOMLQuote(AConfig.TLSPasswordEnvironment) + #10;
 end;
 
 function ParseConfig(const ADocument: string): TLWPTRegistryConfig;
@@ -767,16 +807,17 @@ function SnapshotDocument(const AOrigin: string; const ASequence: QWord;
 var
   Index: Integer;
 begin
-  Result := 'schema = ' + Quote(PROGRAM_NAME + '-registry-snapshot-v1') + #10
-    + 'origin = ' + Quote(AOrigin) + #10
+  Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
+    + '-registry-snapshot-v1') + #10
+    + 'origin = ' + PersistedTOMLQuote(AOrigin) + #10
     + 'sequence = ' + UIntToStr(ASequence) + #10
-    + 'published_at = ' + Quote(APublishedAt) + #10
-    + 'previous = ' + Quote(APrevious) + #10
+    + 'published_at = ' + PersistedTOMLQuote(APublishedAt) + #10
+    + 'previous = ' + PersistedTOMLQuote(APrevious) + #10
     + 'records = [';
   for Index := 0 to ARecords.Count - 1 do
   begin
     if Index > 0 then Result := Result + ', ';
-    Result := Result + Quote(ARecords[Index]);
+    Result := Result + PersistedTOMLQuote(ARecords[Index]);
   end;
   Result := Result + ']' + #10;
 end;
@@ -831,14 +872,14 @@ var
   Index: Integer;
 begin
   Result := 'schema = '
-    + Quote(PROGRAM_NAME + '-registry-version-index-v1') + #10
-    + 'origin = ' + Quote(AOrigin) + #10
-    + 'name = ' + Quote(AName) + #10
+    + PersistedTOMLQuote(PROGRAM_NAME + '-registry-version-index-v1') + #10
+    + 'origin = ' + PersistedTOMLQuote(AOrigin) + #10
+    + 'name = ' + PersistedTOMLQuote(AName) + #10
     + 'versions = [';
   for Index := 0 to AEntries.Count - 1 do
   begin
     if Index > 0 then Result := Result + ', ';
-    Result := Result + Quote(AEntries[Index]);
+    Result := Result + PersistedTOMLQuote(AEntries[Index]);
   end;
   Result := Result + ']' + #10;
 end;
@@ -846,13 +887,15 @@ end;
 function CheckpointDocument(const AOrigin: string; const ASequence: QWord;
   const ASnapshotHash, APublishedAt, AKeyID: string): string;
 begin
-  Result := 'schema = ' + Quote(PROGRAM_NAME + '-registry-checkpoint-v1') + #10
-    + 'origin = ' + Quote(AOrigin) + #10
+  Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
+    + '-registry-checkpoint-v1') + #10
+    + 'origin = ' + PersistedTOMLQuote(AOrigin) + #10
     + 'sequence = ' + UIntToStr(ASequence) + #10
-    + 'snapshot = ' + Quote(ASnapshotHash) + #10
-    + 'published_at = ' + Quote(APublishedAt) + #10
-    + 'expires_at = ' + Quote(TimestampPlusSevenDays(APublishedAt)) + #10
-    + 'key_id = ' + Quote(AKeyID) + #10;
+    + 'snapshot = ' + PersistedTOMLQuote(ASnapshotHash) + #10
+    + 'published_at = ' + PersistedTOMLQuote(APublishedAt) + #10
+    + 'expires_at = '
+    + PersistedTOMLQuote(TimestampPlusSevenDays(APublishedAt)) + #10
+    + 'key_id = ' + PersistedTOMLQuote(AKeyID) + #10;
 end;
 
 function SignatureDocument(const ACheckpoint: TBytes;
@@ -863,21 +906,24 @@ var
 begin
   SigningInput := Bytes(CHECKPOINT_DOMAIN + Text(ACheckpoint));
   Ed25519Sign(SigningInput, ASeed, Signature);
-  Result := 'schema = ' + Quote(PROGRAM_NAME + '-registry-signature-v1') + #10
+  Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
+    + '-registry-signature-v1') + #10
     + 'algorithm = "ed25519"' + #10
-    + 'key_id = ' + Quote(AKeyID) + #10
-    + 'payload = ' + Quote('sha256:' + SHA256Hex(ACheckpoint)) + #10
-    + 'signature = ' + Quote('hex:' + BytesToHex(Signature,
+    + 'key_id = ' + PersistedTOMLQuote(AKeyID) + #10
+    + 'payload = '
+    + PersistedTOMLQuote('sha256:' + SHA256Hex(ACheckpoint)) + #10
+    + 'signature = ' + PersistedTOMLQuote('hex:' + BytesToHex(Signature,
       SizeOf(Signature))) + #10;
 end;
 
 function StateDocument(const AState: TLWPTRegistryState): string;
 begin
-  Result := 'schema = ' + Quote(PROGRAM_NAME + '-registry-state-v1') + #10
+  Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
+    + '-registry-state-v1') + #10
     + 'sequence = ' + UIntToStr(AState.Sequence) + #10
-    + 'snapshot = ' + Quote(AState.SnapshotHash) + #10
-    + 'checkpoint = ' + Quote(AState.CheckpointPath) + #10
-    + 'signature = ' + Quote(AState.SignaturePath) + #10;
+    + 'snapshot = ' + PersistedTOMLQuote(AState.SnapshotHash) + #10
+    + 'checkpoint = ' + PersistedTOMLQuote(AState.CheckpointPath) + #10
+    + 'signature = ' + PersistedTOMLQuote(AState.SignaturePath) + #10;
 end;
 
 function ParseState(const ADocument: string): TLWPTRegistryState;
@@ -1035,6 +1081,9 @@ var
   end;
 begin
   Result := nil;
+  { Reject values that cannot be persisted and reopened before initialization
+    acquires a lease or creates any registry-owned filesystem state. }
+  ValidatePersistedConfigurationStrings(ARequested);
   RootDir := ExpandFileName(ARoot);
   ValidateRegistryPath(RootDir);
   if FileExists(RootDir) and not DirectoryExists(RootDir) then
@@ -1099,11 +1148,12 @@ begin
       Move(PublicKey[0], PublicKeyBytes[0], SizeOf(PublicKey));
       KeyID := 'ed25519:' + SHA256Hex(PublicKeyBytes);
       WriteInitialImmutable(RegistryKeyStoragePath(KeyID), Bytes(
-        'schema = ' + Quote(PROGRAM_NAME + '-registry-key-v1') + #10
-        + 'origin = ' + Quote(Config.Identity) + #10
-        + 'key_id = ' + Quote(KeyID) + #10
+        'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
+        + '-registry-key-v1') + #10
+        + 'origin = ' + PersistedTOMLQuote(Config.Identity) + #10
+        + 'key_id = ' + PersistedTOMLQuote(KeyID) + #10
         + 'algorithm = "ed25519"' + #10
-        + 'public_key = ' + Quote('hex:' + BytesToHex(PublicKey,
+        + 'public_key = ' + PersistedTOMLQuote('hex:' + BytesToHex(PublicKey,
           SizeOf(PublicKey))) + #10
         + 'valid_from_sequence = 1' + #10));
       Records := TStringList.Create;
@@ -1524,13 +1574,13 @@ begin
     WriteImmutable('objects/sha256/' + Copy(ArchiveHash,
       Length('sha256:') + 1, MaxInt), APublication.Archive);
     RecordDocument := 'schema = '
-      + Quote(PROGRAM_NAME + '-registry-package-v1') + #10
-      + 'origin = ' + Quote(FConfig.Identity) + #10
-      + 'name = ' + Quote(APublication.Name) + #10
-      + 'version = ' + Quote(APublication.Version) + #10
-      + 'archive = ' + Quote(ArchiveHash) + #10
+      + PersistedTOMLQuote(PROGRAM_NAME + '-registry-package-v1') + #10
+      + 'origin = ' + PersistedTOMLQuote(FConfig.Identity) + #10
+      + 'name = ' + PersistedTOMLQuote(APublication.Name) + #10
+      + 'version = ' + PersistedTOMLQuote(APublication.Version) + #10
+      + 'archive = ' + PersistedTOMLQuote(ArchiveHash) + #10
       + 'archive_size = ' + IntToStr(Length(APublication.Archive)) + #10
-      + 'published_at = ' + Quote(APublication.PublishedAt) + #10
+      + 'published_at = ' + PersistedTOMLQuote(APublication.PublishedAt) + #10
       + 'yanked = false' + #10
       + 'dependencies = []' + #10;
     RecordBytes := Bytes(RecordDocument);

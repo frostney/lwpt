@@ -214,8 +214,8 @@ end;
 
 procedure TRegistryE2EContract.TestInitPolicyAndStableIdentityThroughCLI;
 var
-  First, Reconfigured, Rejected: TLwptResult;
-  DataDirectory: string;
+  ControlRejected, First, Reconfigured, Rejected: TLwptResult;
+  ControlDirectory, DataDirectory: string;
 begin
   DataDirectory := FScratch + '/origin';
   First := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
@@ -239,6 +239,21 @@ begin
     '--listen', '0.0.0.0']);
   Expect<Integer>(Rejected.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('insecure_transport:', Rejected.Stderr) > 0).ToBe(True);
+  ControlDirectory := FScratch + '/control-origin';
+  ControlRejected := RunLwpt(['registry', 'init', '--data-dir',
+    ControlDirectory, '--base-url', 'https://localhost:'
+    + IntToStr(BasePort + 2), '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
+    '--tls-password-env', TLS_PASSWORD_ENV + #1]);
+  Expect<Integer>(ControlRejected.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('invalid_configuration:', ControlRejected.Stderr) > 0)
+    .ToBe(True);
+  Expect<Boolean>(FileExists(ControlDirectory + '/registry.toml')).ToBe(False);
+  Expect<Boolean>(FileExists(ControlDirectory + '/keys/root.seed')).ToBe(False);
+  Expect<Boolean>(DirectoryExists(ControlDirectory + '/keys')).ToBe(False);
+  Expect<Boolean>(DirectoryExists(ControlDirectory + '/snapshots')).ToBe(False);
+  Expect<Boolean>(DirectoryExists(ControlDirectory + '/checkpoints'))
+    .ToBe(False);
+  Expect<Boolean>(DirectoryExists(ControlDirectory + '/state')).ToBe(False);
 end;
 
 procedure TRegistryE2EContract.TestForegroundServerSurvivesRestartAndConcurrentReaders;
