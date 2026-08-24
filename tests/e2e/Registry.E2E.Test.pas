@@ -42,6 +42,7 @@ type
     procedure TestInitPolicyAndStableIdentityThroughCLI;
     procedure TestForegroundServerSurvivesRestartAndConcurrentReaders;
     procedure TestConfiguredTLSServerCompletesARequest;
+    procedure TestIdleTLSHandshakesExpireAndReleaseAdmission;
     procedure TestSilentServeUsesPersistedConfiguration;
     procedure TestSlowClientsAreBoundedByOneDeadline;
   end;
@@ -319,6 +320,54 @@ begin
   end;
 end;
 
+procedure TRegistryE2EContract.TestIdleTLSHandshakesExpireAndReleaseAdmission;
+var
+  Address: TInetSockAddr;
+  DataDirectory, DiscoveryURL: string;
+  IdleSockets: array[0..31] of TSocket;
+  Index: Integer;
+  Init: TLwptResult;
+  Server: TProcess;
+begin
+  DataDirectory := FScratch + '/idle-tls-origin';
+  DiscoveryURL := 'https://localhost:' + IntToStr(BasePort + 4)
+    + '/.well-known/lwpt-registry';
+  Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
+    '--base-url', 'https://localhost:' + IntToStr(BasePort + 4), '--port',
+    IntToStr(BasePort + 4), '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
+    '--tls-password-env', TLS_PASSWORD_ENV], '',
+    [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
+  Expect<Integer>(Init.ExitCode).ToBe(0);
+  Server := StartServer(DataDirectory, True);
+  for Index := 0 to High(IdleSockets) do IdleSockets[Index] := -1;
+  try
+    WaitUntilReady(DiscoveryURL, True);
+    FillChar(Address, SizeOf(Address), 0);
+    Address.sin_family := AF_INET;
+    Address.sin_port := HToNs(BasePort + 4);
+    Address.sin_addr := StrToNetAddr('127.0.0.1');
+    for Index := 0 to High(IdleSockets) do
+    begin
+      IdleSockets[Index] := fpSocket(AF_INET, SOCK_STREAM, 0);
+      Expect<Boolean>(IdleSockets[Index] >= 0).ToBe(True);
+      Expect<Integer>(fpConnect(IdleSockets[Index], @Address,
+        SizeOf(Address))).ToBe(0);
+    end;
+    Sleep(11000);
+    Expect<Boolean>(Server.Running).ToBe(True);
+    Expect<Boolean>(Pos('lwpt-registry-discovery-v1', Curl(DiscoveryURL,
+      True)) > 0).ToBe(True);
+  finally
+    for Index := 0 to High(IdleSockets) do
+      if IdleSockets[Index] >= 0 then
+      begin
+        fpShutdown(IdleSockets[Index], 2);
+        CloseSocket(IdleSockets[Index]);
+      end;
+    StopServer(Server);
+  end;
+end;
+
 procedure TRegistryE2EContract.SetupTests;
 begin
   Test('CLI init preserves identity and rejects remote plain HTTP',
@@ -327,6 +376,8 @@ begin
     TestForegroundServerSurvivesRestartAndConcurrentReaders);
   Test('configured TLS server completes a request',
     TestConfiguredTLSServerCompletesARequest);
+  Test('idle TLS handshakes expire and release admission',
+    TestIdleTLSHandshakesExpireAndReleaseAdmission);
   Test('silent serve uses persisted configuration',
     TestSilentServeUsesPersistedConfiguration);
   Test('slow clients are bounded by one deadline',

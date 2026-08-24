@@ -413,13 +413,9 @@ end;
 
 procedure TNetworkFrameworkRegistryConnection.Cancel;
 begin
-  if GetTickCount64 >= FDeadline then
-  begin
-    Cancel;
-    Exit;
-  end;
   if FClosing then Exit;
   FClosing := True;
+  { The cancelled state callback releases the retained connection and queue. }
   Nw_connection_cancel(FConnection);
 end;
 
