@@ -1082,7 +1082,7 @@ begin
       Exit;
     end;
     try
-      WriteMarker(AcquiredPath,
+      PublishReadableMarker(AcquiredPath,
         'pid=' + IntToStr(GetProcessID) + #10
         + 'budget=' + IntToStr(Session.EffectiveBudget) + #10
         + 'requested=' + IntToStr(Session.RequestedWorkers));
@@ -1480,7 +1480,7 @@ end;
 procedure TWorkerBudgetProcesses.TestRequestIsBoundedByMachineCapacity;
 var
   Process : TProcess;
-  Acquired, ReleasePath : string;
+  Acquired, AcquiredText, ReleasePath : string;
   Values : TStringList;
 begin
   Process := nil;
@@ -1490,9 +1490,10 @@ begin
   try
     Process := StartChild('bounded-request', FScratch + '/worktree-a',
       Acquired, ReleasePath, 4);
-    Expect<Boolean>(WaitForFile(Acquired,
-      WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
-    Values := ReadUtilityValues(Acquired);
+    Expect<Boolean>(WaitForReadableMarker(Acquired,
+      WAIT_TIMEOUT_MILLISECONDS, AcquiredText)).ToBe(True);
+    Values := TStringList.Create;
+    Values.Text := AcquiredText;
     Expect<Integer>(StrToIntDef(Values.Values['budget'], 0)).ToBe(1);
     Expect<Integer>(StrToIntDef(Values.Values['requested'], 0)).ToBe(1);
     WriteMarker(ReleasePath, 'release');
