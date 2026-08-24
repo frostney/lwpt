@@ -891,11 +891,14 @@ procedure TTestScheduling.TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
 var
   CancellationElapsed, CompilerStartedAt, ReturnedAt: QWord;
   CompilerPID: Integer;
-  NestedProject, NestedTestStartedPath, PIDFile: string;
-  CommandResult: TLwptResult;
+  NestedProject, NestedSetupModePath, NestedSetupReadyPath,
+  NestedTestStartedPath, PIDFile: string;
+  CommandResult, SetupResult: TLwptResult;
 begin
   ResetProject(0);
   NestedProject := FScratch + '/nested-build';
+  NestedSetupModePath := FScratch + '/control/nested-setup-mode';
+  NestedSetupReadyPath := FScratch + '/control/nested-setup-ready';
   NestedTestStartedPath := FScratch + '/control/nested-test-started';
   PIDFile := FScratch + '/control/nested-compiler-pid';
   WriteBuildProject(NestedProject);
@@ -906,6 +909,13 @@ begin
     + 'var Child: TProcess; Entry: string; Index: Integer;'#10
     + '  MarkerFile: Text;'#10
     + 'begin'#10
+    + '  if FileExists(' + PascalString(NestedSetupModePath) + ') then'#10
+    + '  begin'#10
+    + '    Assign(MarkerFile, ' + PascalString(NestedSetupReadyPath) + ');'#10
+    + '    Rewrite(MarkerFile);'#10
+    + '    Close(MarkerFile);'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  Assign(MarkerFile, ' + PascalString(NestedTestStartedPath) + ');'#10
     + '  Rewrite(MarkerFile);'#10
     + '  Write(MarkerFile, GetTickCount64);'#10
@@ -960,8 +970,16 @@ begin
       'program FailAfterNestedCompilerStarts;'#10
     + '{$mode delphi}{$H+}'#10
     + 'uses SysUtils;'#10
-    + 'var Started: TDateTime;'#10
+    + 'var MarkerFile: Text; Started: TDateTime;'#10
     + 'begin'#10
+    + '  if FileExists(' + PascalString(NestedSetupModePath) + ') then'#10
+    + '  begin'#10
+    + '    Assign(MarkerFile, '
+    + PascalString(NestedSetupReadyPath + '-failure') + ');'#10
+    + '    Rewrite(MarkerFile);'#10
+    + '    Close(MarkerFile);'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  Started := Now;'#10
     + '  while (not FileExists(' + PascalString(NestedTestStartedPath)
     + '))'#10
@@ -979,6 +997,18 @@ begin
     + '  Halt(1);'#10
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
+
+  { Compile both active siblings in a parent-owned setup phase. The behavior
+    run can measure runtime readiness without charging either compile. }
+  TFileStream.Create(NestedSetupModePath, fmCreate).Free;
+  SetupResult := RunTests(['tests/A.Nested.Test.pas',
+    'tests/B.Fail.Test.pas', '--jobs=2']);
+  DumpRunFailure('nested fixture setup run', SetupResult, 0);
+  Expect<Integer>(SetupResult.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(NestedSetupReadyPath)).ToBe(True);
+  Expect<Boolean>(FileExists(NestedSetupReadyPath + '-failure')).ToBe(True);
+  RecursiveDelete(FScratch + '/control');
+  ForceDirectories(FScratch + '/control');
 
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
   ReturnedAt := GetTickCount64;
