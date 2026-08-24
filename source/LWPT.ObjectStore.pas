@@ -24,6 +24,8 @@ type
   {$IFDEF OBJECTSTORE_TESTING}
   TLWPTObjectStoreBeforeQuarantineHook = procedure(const APath: string);
   TLWPTObjectStoreAfterStageHook = procedure(const APath: string);
+  TLWPTObjectStorePublicationHook = procedure(const AStaged,
+    ADestination: string);
   {$ENDIF}
 
   TLWPTImmutableObjectStore = class
@@ -64,6 +66,8 @@ var
   ObjectStoreBeforeQuarantineTestHook:
     TLWPTObjectStoreBeforeQuarantineHook;
   ObjectStoreAfterStageTestHook: TLWPTObjectStoreAfterStageHook;
+  ObjectStoreBeforePublicationTestHook: TLWPTObjectStorePublicationHook;
+  ObjectStoreAfterPublicationTestHook: TLWPTObjectStorePublicationHook;
 {$ENDIF}
 
 implementation
@@ -345,6 +349,9 @@ function TLWPTImmutableObjectStore.AdmitRetained(const ASourcePath,
   out AInserted: Boolean): string;
 var
   Expected, Existing, TmpRoot, Staged, Actual: string;
+  {$IFDEF OBJECTSTORE_TESTING}
+  PublishedStaged: string;
+  {$ENDIF}
   MutationLease, ObjectLease: TObject;
   Published: Boolean;
 begin
@@ -403,14 +410,25 @@ begin
           + 'sha256', 'object digest root');
         EnsureUnlinkedDirectory(ExtractFileDir(Result),
           'object digest shard');
+        {$IFDEF OBJECTSTORE_TESTING}
+        if Assigned(ObjectStoreBeforePublicationTestHook) then
+          ObjectStoreBeforePublicationTestHook(Staged, Result);
+        {$ENDIF}
         { Replacement is safe because every competing writer must prove the
           same digest before reaching this point. The object-use guard keeps
           eviction and materialization outside the publication interval. }
         if not AtomicReplaceFile(Staged, Result) then
           raise ELWPTObjectStoreError.CreateFmt(
             'failed to publish object %s', [Expected]);
+        {$IFDEF OBJECTSTORE_TESTING}
+        PublishedStaged := Staged;
+        {$ENDIF}
         Staged := '';
         Published := True;
+        {$IFDEF OBJECTSTORE_TESTING}
+        if Assigned(ObjectStoreAfterPublicationTestHook) then
+          ObjectStoreAfterPublicationTestHook(PublishedStaged, Result);
+        {$ENDIF}
         FCacheLifecycle.RecordObjectLocked(Expected, Result);
         if not FCacheLifecycle.MakeRoomLocked(0) then
         begin
