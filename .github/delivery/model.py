@@ -143,12 +143,14 @@ def check_is_terminal(
     ):
         return True
     skipped_titles = automation.get("terminal_skipped_output_titles", [])
+    output_title = check_output_title(check)
     return (
         check.get("status") == "completed"
         and check.get("conclusion") == "skipped"
         and check.get("head_sha") == head_sha
         and isinstance(skipped_titles, list)
-        and check_output_title(check) in skipped_titles
+        and bool(output_title)
+        and output_title in skipped_titles
     )
 
 

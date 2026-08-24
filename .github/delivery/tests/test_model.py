@@ -1266,6 +1266,14 @@ class DeliveryModelTests(unittest.TestCase):
             ),
             "missing output": (automations[0], {**valid, "output": None}),
             "malformed output": (automations[0], {**valid, "output": "malformed"}),
+            "null policy and malformed output": (
+                {**automations[0], "terminal_skipped_output_titles": [None]},
+                {**valid, "output": None},
+            ),
+            "empty policy and empty title": (
+                {**automations[0], "terminal_skipped_output_titles": [""]},
+                {**valid, "output": {"title": ""}},
+            ),
             "missing title": (automations[0], {**valid, "output": {}}),
             "title variant": (
                 automations[0],
@@ -1275,6 +1283,10 @@ class DeliveryModelTests(unittest.TestCase):
             "lookalike app": (
                 automations[0],
                 {**valid, "app": {"slug": "macroscopeapp-lookalike"}},
+            ),
+            "lookalike context": (
+                automations[0],
+                {**valid, "name": "Macroscope - Other Check"},
             ),
             "incomplete check": (automations[0], {**valid, "status": "in_progress"}),
             "cancelled check": (automations[0], {**valid, "conclusion": "cancelled"}),
