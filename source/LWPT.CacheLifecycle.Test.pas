@@ -377,6 +377,29 @@ begin
   Report := RepairSharedCache(FCacheRoot);
   Expect<Boolean>(FileExists(ReferencePath)).ToBe(False);
   Expect<Boolean>(Report.IncompleteEntriesRemoved >= 1).ToBe(True);
+
+  {$IFDEF UNIX}
+  PrefixPath := FCacheRoot + '/build-results/refs/sha256/ee';
+  ReferencePath := PrefixPath + '/' + StringOfChar('e', 62);
+  WriteTextFile(ReferencePath, 'not-a-digest');
+  if FpChmod(PChar(PrefixPath), 0) <> 0 then
+    raise Exception.Create('failed to hide build-reference fixture');
+  Refused := False;
+  try
+    try
+      RepairSharedCache(FCacheRoot);
+    except
+      on ELWPTCacheLifecycleError do Refused := True;
+    end;
+  finally
+    if FpChmod(PChar(PrefixPath), &755) <> 0 then
+      raise Exception.Create('failed to restore hidden reference fixture');
+  end;
+  Expect<Boolean>(Refused).ToBe(True);
+  Expect<Boolean>(FileExists(ReferencePath)).ToBe(True);
+  RepairSharedCache(FCacheRoot);
+  Expect<Boolean>(FileExists(ReferencePath)).ToBe(False);
+  {$ENDIF}
 end;
 
 {$IFDEF UNIX}

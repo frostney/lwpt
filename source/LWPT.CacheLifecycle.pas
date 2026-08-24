@@ -59,6 +59,9 @@ function RepairSharedCache(const ACacheRoot: string):
 implementation
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   Windows,
   {$ENDIF}
@@ -535,24 +538,28 @@ begin
   Result := (ADigest <> '') and (Trim(Text) = ADigest);
 end;
 
-function FindFirstMeansEmpty(const AResult: Integer): Boolean;
+function FindFirstMeansNoEntry(const AResult: Integer): Boolean;
 begin
   {$IFDEF MSWINDOWS}
   Result := AResult in [Windows.ERROR_FILE_NOT_FOUND,
-    Windows.ERROR_NO_MORE_FILES];
+    Windows.ERROR_PATH_NOT_FOUND, Windows.ERROR_NO_MORE_FILES];
   {$ELSE}
-  { POSIX enumeration returns dot entries for an empty directory. A failed
-    FindFirst while the directory remains present is therefore unreadable. }
-  Result := False;
+  Result := (AResult = -1) and (FpGetErrNo = ESysENOENT);
   {$ENDIF}
 end;
 
 function CacheEntryExists(const APath: string): Boolean;
 var
+  FindResult: Integer;
   Search: TSearchRec;
 begin
-  Result := FindFirst(APath, faAnyFile or faSymLink, Search) = 0;
-  if Result then SysUtils.FindClose(Search);
+  FindResult := FindFirst(APath, faAnyFile or faSymLink, Search);
+  Result := FindResult = 0;
+  if Result then
+    SysUtils.FindClose(Search)
+  else if not FindFirstMeansNoEntry(FindResult) then
+    raise ELWPTCacheLifecycleError.CreateFmt(
+      'failed to verify removal of build-cache reference %s', [APath]);
 end;
 
 procedure RemoveBuildReferenceEntry(const APath: string;
@@ -613,7 +620,7 @@ begin
     faAnyFile or faSymLink, PrefixSearch);
   if FindResult <> 0 then
   begin
-    if DirectoryExists(Root) and not FindFirstMeansEmpty(FindResult) then
+    if not FindFirstMeansNoEntry(FindResult) then
       Result := False;
     Exit;
   end;
@@ -637,8 +644,7 @@ begin
         faAnyFile or faSymLink, EntrySearch);
       if FindResult <> 0 then
       begin
-        if DirectoryExists(PrefixPath)
-           and not FindFirstMeansEmpty(FindResult) then Result := False;
+        if not FindFirstMeansNoEntry(FindResult) then Result := False;
         Continue;
       end;
       try
@@ -657,9 +663,12 @@ begin
             EntrySearch.Name);
           RemoveEntry := ReferenceNamesBuildObject(ACacheRoot, EntryPath,
             Fingerprint, ADigest, Malformed);
-          if (RemoveEntry or Malformed) and FileExists(EntryPath)
-             and not SysUtils.DeleteFile(EntryPath) then
-            Result := False;
+          if RemoveEntry or Malformed then
+            try
+              RemoveBuildReferenceEntry(EntryPath, EntrySearch.Attr);
+            except
+              on ELWPTCacheLifecycleError do Result := False;
+            end;
         until FindNext(EntrySearch) <> 0;
       finally
         SysUtils.FindClose(EntrySearch);
@@ -677,6 +686,7 @@ var
   ArtifactPath, Digest, EntryPath, Fingerprint, Hex, ManifestPath,
     PrefixPath, Root: string;
   EntrySearch, PrefixSearch: TSearchRec;
+  FindResult: Integer;
   Manifest: TLWPTCachedBuildResult;
   RemoveEntry: Boolean;
 begin
@@ -687,8 +697,15 @@ begin
     Inc(AReport.IncompleteEntriesRemoved);
     Exit;
   end;
-  if FindFirst(IncludeTrailingPathDelimiter(Root) + '*',
-       faAnyFile or faSymLink, PrefixSearch) <> 0 then Exit;
+  FindResult := FindFirst(IncludeTrailingPathDelimiter(Root) + '*',
+    faAnyFile or faSymLink, PrefixSearch);
+  if FindResult <> 0 then
+  begin
+    if not FindFirstMeansNoEntry(FindResult) then
+      raise ELWPTCacheLifecycleError.CreateFmt(
+        'failed to enumerate build-cache references at %s', [Root]);
+    Exit;
+  end;
   try
     repeat
       if (PrefixSearch.Name = '.') or (PrefixSearch.Name = '..') then
@@ -703,8 +720,16 @@ begin
         Inc(AReport.IncompleteEntriesRemoved);
         Continue;
       end;
-      if FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
-           faAnyFile or faSymLink, EntrySearch) <> 0 then Continue;
+      FindResult := FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
+        faAnyFile or faSymLink, EntrySearch);
+      if FindResult <> 0 then
+      begin
+        if not FindFirstMeansNoEntry(FindResult) then
+          raise ELWPTCacheLifecycleError.CreateFmt(
+            'failed to enumerate build-cache references at %s',
+            [PrefixPath]);
+        Continue;
+      end;
       try
         repeat
           if (EntrySearch.Name = '.') or (EntrySearch.Name = '..') then
