@@ -85,6 +85,9 @@ function RegistryConfiguration(const AIdentity, ABaseURL,
   AListenAddress: string; const APort: Word; const ATLSPKCS12Path,
   ATLSPasswordEnvironment: string): TLWPTRegistryConfig;
 procedure ValidateRegistryConfiguration(const AConfig: TLWPTRegistryConfig);
+{$IFDEF REGISTRY_TESTING}
+procedure SetRegistryFailurePointForTesting(const APoint: string);
+{$ENDIF}
 
 implementation
 
@@ -110,6 +113,11 @@ const
   INITIALIZATION_MARKER = '.initializing';
   CHECKPOINT_DOMAIN = PROJECT_NAME + '-REGISTRY-CHECKPOINT-V1' + #10;
   CHECKPOINT_RENEWAL_THRESHOLD_HOURS = 24;
+
+{$IFDEF REGISTRY_TESTING}
+var
+  RegistryFailurePointForTesting: string;
+{$ENDIF}
 
 {$IFDEF MSWINDOWS}
 const
@@ -1369,13 +1377,19 @@ begin
   Result := ReadBytes(FullPath);
 end;
 
+{$IFDEF REGISTRY_TESTING}
+procedure SetRegistryFailurePointForTesting(const APoint: string);
+begin
+  RegistryFailurePointForTesting := APoint;
+end;
+
 procedure InjectRegistryFailure(const APoint: string);
 begin
-  if GetEnvironmentVariable(UpperCase(PROGRAM_NAME)
-    + '_REGISTRY_TEST_FAIL_AFTER') = APoint then
+  if RegistryFailurePointForTesting = APoint then
     raise ELWPTRegistryError.CreateStable('injected_registry_failure',
       'test failure after ' + APoint);
 end;
+{$ENDIF}
 
 procedure TLWPTRegistryStore.EnsureFreshCheckpoint(const ANow: string);
 var
@@ -1429,7 +1443,9 @@ begin
     RenewalPath := 'checkpoints/renewals/sha256/' + CheckpointHash;
     WriteImmutable(RenewalPath + '.toml', Checkpoint);
     WriteImmutable(RenewalPath + '.sig.toml', Signature);
+    {$IFDEF REGISTRY_TESTING}
     InjectRegistryFailure('renewal-checkpoint');
+    {$ENDIF}
     State.CheckpointPath := RenewalPath + '.toml';
     State.SignaturePath := RenewalPath + '.sig.toml';
     AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
@@ -1564,7 +1580,9 @@ begin
       Checkpoint);
     WriteImmutable('checkpoints/' + UIntToStr(State.Sequence + 1)
       + '.sig.toml', Signature);
+    {$IFDEF REGISTRY_TESTING}
     InjectRegistryFailure('checkpoint');
+    {$ENDIF}
     State.Sequence := State.Sequence + 1;
     State.SnapshotHash := SnapshotHash;
     State.CheckpointPath := 'checkpoints/' + UIntToStr(State.Sequence) + '.toml';
@@ -1572,7 +1590,9 @@ begin
       + '.sig.toml';
     AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
       Bytes(StateDocument(State)));
+    {$IFDEF REGISTRY_TESTING}
     InjectRegistryFailure('activation');
+    {$ENDIF}
     AtomicWriteBytes(IndexPath, TmpRoot, Bytes(IndexDocument));
     { No additional commit follows the alias. A crash here is recovered by
       rebuilding aliases from the authenticated active snapshot. }

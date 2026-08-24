@@ -11,9 +11,6 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Windows,
-  {$ENDIF}
 
   LWPT.Core,
   LWPT.ProducerLease,
@@ -38,46 +35,9 @@ type
     property Failure: string read FFailure;
   end;
 
-{$IFDEF UNIX}
-function CSetEnvironmentVariable(AName, AValue: PAnsiChar;
-  AOverwrite: LongInt): LongInt; cdecl;
-  {$IFDEF LINUX}
-  external 'c' name 'setenv';
-  {$ELSE}
-  external name 'setenv';
-  {$ENDIF}
-function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
-  {$IFDEF LINUX}
-  external 'c' name 'unsetenv';
-  {$ELSE}
-  external name 'unsetenv';
-  {$ENDIF}
-{$ENDIF}
-
 procedure SetFailurePoint(const AValue: string);
-{$IFDEF UNIX}
-var
-  Name, Value: AnsiString;
-{$ENDIF}
-{$IFDEF MSWINDOWS}
-var
-  Name, Value: UnicodeString;
-{$ENDIF}
 begin
-  {$IFDEF UNIX}
-  Name := AnsiString(UpperCase(PROGRAM_NAME)
-    + '_REGISTRY_TEST_FAIL_AFTER');
-  Value := AnsiString(AValue);
-  if AValue = '' then CUnsetEnvironmentVariable(PAnsiChar(Name))
-  else CSetEnvironmentVariable(PAnsiChar(Name), PAnsiChar(Value), 1);
-  {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Name := UnicodeString(UpperCase(PROGRAM_NAME)
-    + '_REGISTRY_TEST_FAIL_AFTER');
-  Value := UnicodeString(AValue);
-  if AValue = '' then Windows.SetEnvironmentVariableW(PWideChar(Name), nil)
-  else Windows.SetEnvironmentVariableW(PWideChar(Name), PWideChar(Value));
-  {$ENDIF}
+  SetRegistryFailurePointForTesting(AValue);
 end;
 
 type
