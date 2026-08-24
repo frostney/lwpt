@@ -60,6 +60,8 @@ const
   SiblingFailureReadySuffix = '-failure-ready';
   SiblingCancellationReceivedSuffix = '-cancellation-received';
   SiblingFanoutObservedSuffix = '-fanout-observed';
+  FixtureSetupModeName = 'fixture-setup-mode';
+  FixtureSetupReadySuffix = '-setup-ready';
   NestedCompilerNaturalExitSuffix = '-natural-exit';
   NestedCompilerStartedAtSuffix = '-started-at';
   SiblingSlowSources: array[0..5] of string = (
@@ -147,6 +149,8 @@ type
     procedure WriteOverlapProgram(const AFileName, AOwnMarker,
       AOtherMarker: string);
     procedure WriteBuildProject(const AProjectRoot: string);
+    procedure PrepareTestFixtures(const ASelectors,
+      AReadyMarkers: array of string);
     function RunTests(const AArgs: array of string): TLwptResult;
     function RunTestsWithCompilerProxy(const AArgs: array of string;
       const AProxyMode, APIDFile: string;
@@ -458,6 +462,14 @@ begin
     + 'uses Classes, SysUtils;'#10
     + 'var Started: TDateTime;'#10
     + 'begin'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
+    + '  begin'#10
+    + '    TFileStream.Create('
+    + PascalString(FScratch + '/control/' + AOwnMarker
+      + FixtureSetupReadySuffix) + ', fmCreate).Free;'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  TFileStream.Create('
     + PascalString(FScratch + '/control/' + AOwnMarker + '-ready')
     + ', fmCreate).Free;'#10
@@ -499,6 +511,30 @@ begin
     + '{$mode delphi}{$H+}'#10
     + 'begin'#10
     + 'end.'#10);
+end;
+
+procedure TTestScheduling.PrepareTestFixtures(const ASelectors,
+  AReadyMarkers: array of string);
+var
+  Args: array of string;
+  Index: Integer;
+  SetupResult: TLwptResult;
+begin
+  if Length(ASelectors) <> Length(AReadyMarkers) then
+    Fail('fixture setup selectors and readiness markers must match');
+  TFileStream.Create(FScratch + '/control/' + FixtureSetupModeName,
+    fmCreate).Free;
+  SetLength(Args, Length(ASelectors) + 1);
+  for Index := 0 to High(ASelectors) do Args[Index] := ASelectors[Index];
+  Args[High(Args)] := '--jobs=' + IntToStr(Length(ASelectors));
+  SetupResult := RunTests(Args);
+  DumpRunFailure('fixture setup run', SetupResult, 0);
+  Expect<Integer>(SetupResult.ExitCode).ToBe(0);
+  for Index := 0 to High(AReadyMarkers) do
+    Expect<Boolean>(FileExists(FScratch + '/control/'
+      + AReadyMarkers[Index] + FixtureSetupReadySuffix)).ToBe(True);
+  RecursiveDelete(FScratch + '/control');
+  ForceDirectories(FScratch + '/control');
 end;
 
 function TTestScheduling.RunTests(const AArgs: array of string): TLwptResult;
@@ -686,8 +722,10 @@ begin
   ResetProject(0);
   WriteOverlapProgram('A.First.Test.pas', 'first-started', 'second-started');
   WriteOverlapProgram('B.Second.Test.pas', 'second-started', 'first-started');
-  { Runtime readiness has its own bounded setup phase. The original marker
-    exchange below remains the behavior-specific overlap contract. }
+  PrepareTestFixtures(['tests/A.First.Test.pas',
+    'tests/B.Second.Test.pas'], ['first-started', 'second-started']);
+  { The original marker exchange remains the behavior-specific overlap
+    contract after the parent-owned compilation phase. }
   CommandResult := RunTests([]);
   DumpRunFailure('default overlap run', CommandResult, 0);
   Expect<Integer>(CommandResult.ExitCode).ToBe(0);
@@ -801,6 +839,14 @@ begin
     + '  if (ParamCount = 1) and (ParamStr(1) = ''--grandchild'') then'#10
     + '  begin Sleep(' + IntToStr(LongRunningFixtureMilliseconds)
     + '); Halt(0) end;'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
+    + '  begin'#10
+    + '    TFileStream.Create('
+    + PascalString(FScratch + '/control/slow' + FixtureSetupReadySuffix)
+    + ', fmCreate).Free;'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  TFileStream.Create(' + PascalString(SlowTestStartedPath)
     + ', fmCreate).Free;'#10
     + '  Child := TProcess.Create(nil);'#10
@@ -828,9 +874,17 @@ begin
   WriteTextFile(FScratch + '/tests/B.Fail.Test.pas',
       'program FailFixture;'#10
     + '{$mode delphi}{$H+}'#10
-    + 'uses SysUtils;'#10
+    + 'uses Classes, SysUtils;'#10
     + 'var Started: TDateTime;'#10
     + 'begin'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
+    + '  begin'#10
+    + '    TFileStream.Create('
+    + PascalString(FScratch + '/control/failure' + FixtureSetupReadySuffix)
+    + ', fmCreate).Free;'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  Started := Now;'#10
     + '  while (not FileExists(' + PascalString(SlowTestStartedPath) + '))'#10
     + '    and ((Now - Started) * ' + IntToStr(SecondsPerDay) + ' < '
@@ -849,6 +903,8 @@ begin
     + '  Halt(1);'#10
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'pending-ran', 0);
+  PrepareTestFixtures(['tests/A.Slow.Test.pas',
+    'tests/B.Fail.Test.pas'], ['slow', 'failure']);
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
   ReturnedAt := GetTickCount64;
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
@@ -891,14 +947,11 @@ procedure TTestScheduling.TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM;
 var
   CancellationElapsed, CompilerStartedAt, ReturnedAt: QWord;
   CompilerPID: Integer;
-  NestedProject, NestedSetupModePath, NestedSetupReadyPath,
-  NestedTestStartedPath, PIDFile: string;
-  CommandResult, SetupResult: TLwptResult;
+  NestedProject, NestedTestStartedPath, PIDFile: string;
+  CommandResult: TLwptResult;
 begin
   ResetProject(0);
   NestedProject := FScratch + '/nested-build';
-  NestedSetupModePath := FScratch + '/control/nested-setup-mode';
-  NestedSetupReadyPath := FScratch + '/control/nested-setup-ready';
   NestedTestStartedPath := FScratch + '/control/nested-test-started';
   PIDFile := FScratch + '/control/nested-compiler-pid';
   WriteBuildProject(NestedProject);
@@ -909,9 +962,12 @@ begin
     + 'var Child: TProcess; Entry: string; Index: Integer;'#10
     + '  MarkerFile: Text;'#10
     + 'begin'#10
-    + '  if FileExists(' + PascalString(NestedSetupModePath) + ') then'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
     + '  begin'#10
-    + '    Assign(MarkerFile, ' + PascalString(NestedSetupReadyPath) + ');'#10
+    + '    Assign(MarkerFile, '
+    + PascalString(FScratch + '/control/nested' + FixtureSetupReadySuffix)
+    + ');'#10
     + '    Rewrite(MarkerFile);'#10
     + '    Close(MarkerFile);'#10
     + '    Halt(0);'#10
@@ -972,10 +1028,12 @@ begin
     + 'uses SysUtils;'#10
     + 'var MarkerFile: Text; Started: TDateTime;'#10
     + 'begin'#10
-    + '  if FileExists(' + PascalString(NestedSetupModePath) + ') then'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
     + '  begin'#10
     + '    Assign(MarkerFile, '
-    + PascalString(NestedSetupReadyPath + '-failure') + ');'#10
+    + PascalString(FScratch + '/control/nested-failure'
+      + FixtureSetupReadySuffix) + ');'#10
     + '    Rewrite(MarkerFile);'#10
     + '    Close(MarkerFile);'#10
     + '    Halt(0);'#10
@@ -998,17 +1056,8 @@ begin
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
 
-  { Compile both active siblings in a parent-owned setup phase. The behavior
-    run can measure runtime readiness without charging either compile. }
-  TFileStream.Create(NestedSetupModePath, fmCreate).Free;
-  SetupResult := RunTests(['tests/A.Nested.Test.pas',
-    'tests/B.Fail.Test.pas', '--jobs=2']);
-  DumpRunFailure('nested fixture setup run', SetupResult, 0);
-  Expect<Integer>(SetupResult.ExitCode).ToBe(0);
-  Expect<Boolean>(FileExists(NestedSetupReadyPath)).ToBe(True);
-  Expect<Boolean>(FileExists(NestedSetupReadyPath + '-failure')).ToBe(True);
-  RecursiveDelete(FScratch + '/control');
-  ForceDirectories(FScratch + '/control');
+  PrepareTestFixtures(['tests/A.Nested.Test.pas',
+    'tests/B.Fail.Test.pas'], ['nested', 'nested-failure']);
 
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
   ReturnedAt := GetTickCount64;
