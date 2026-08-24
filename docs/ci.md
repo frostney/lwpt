@@ -176,9 +176,13 @@ are data in `.github/delivery/review-automations.json`; controller logic does
 not name vendors, and retry and quota policy remain external.
 An adapter may bind one or more check names to trusted GitHub App slugs, accept
 provider-specific terminal check conclusions, require or omit a terminal review
-event, and list review-body markers that mean "not terminal". Those fields are
-enough to replace a hosted reviewer or add a check-only custom reviewer without
-changing controller code.
+event, accept an exact allow-list of output titles for completed current-head
+`skipped` checks, and list review-body markers that mean "not terminal". A
+skipped check is never accepted through the generic terminal-conclusion list;
+its check name, app slug, head SHA, completion state, conclusion, and output
+title must all match the adapter policy. Those fields are enough to replace a
+hosted reviewer or add a check-only custom reviewer without changing controller
+code.
 `merge:ready` records that point-in-time acceptance, so the coordinator invokes
 the idempotent `merge` operation immediately before a singleton merge. For a
 native prefix it preflights each `delivery:managed` member against the same

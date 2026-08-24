@@ -381,7 +381,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             status_rule["parameters"]["required_status_checks"],
         )
 
-    def test_live_review_adapter_matches_macroscope_check_only_success(self) -> None:
+    def test_live_review_adapter_accepts_only_the_exact_macroscope_no_code_skip(self) -> None:
         config = json.loads(
             (ROOT / ".github/delivery/review-automations.json").read_text(
                 encoding="utf-8"
@@ -390,6 +390,14 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual("macroscope", config["automations"][0]["id"])
         self.assertEqual(
             [], config["automations"][0]["terminal_review_states"]
+        )
+        self.assertEqual(
+            ["success", "neutral"],
+            config["automations"][0]["terminal_check_conclusions"],
+        )
+        self.assertEqual(
+            ["No code objects were reviewed."],
+            config["automations"][0]["terminal_skipped_output_titles"],
         )
 
 

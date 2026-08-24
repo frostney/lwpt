@@ -1202,6 +1202,174 @@ class DeliveryModelTests(unittest.TestCase):
             ),
         )
 
+    def test_exact_configured_no_code_skip_is_terminal(self) -> None:
+        head = "a" * 40
+        automations = [
+            {
+                "id": "macroscope",
+                "actors": ["macroscopeapp"],
+                "check_contexts": ["Macroscope - Correctness Check"],
+                "check_app_slugs": ["macroscopeapp"],
+                "terminal_check_conclusions": ["success", "neutral"],
+                "terminal_skipped_output_titles": [
+                    "No code objects were reviewed."
+                ],
+                "terminal_review_states": [],
+            }
+        ]
+        check = {
+            "id": 4,
+            "name": "Macroscope - Correctness Check",
+            "head_sha": head,
+            "status": "completed",
+            "conclusion": "skipped",
+            "app": {"slug": "macroscopeapp"},
+            "output": {"title": "No code objects were reviewed."},
+        }
+
+        self.assertEqual(
+            [], review_evidence_errors(head, automations, [check], [], [], set())
+        )
+
+    def test_no_code_skip_policy_fails_closed_for_every_distinguishing_field(self) -> None:
+        head = "a" * 40
+        automations = [
+            {
+                "id": "macroscope",
+                "actors": ["macroscopeapp"],
+                "check_contexts": ["Macroscope - Correctness Check"],
+                "check_app_slugs": ["macroscopeapp"],
+                "terminal_check_conclusions": ["success", "neutral"],
+                "terminal_skipped_output_titles": [
+                    "No code objects were reviewed."
+                ],
+                "terminal_review_states": [],
+            }
+        ]
+        valid = {
+            "id": 4,
+            "name": "Macroscope - Correctness Check",
+            "head_sha": head,
+            "status": "completed",
+            "conclusion": "skipped",
+            "app": {"slug": "macroscopeapp"},
+            "output": {"title": "No code objects were reviewed."},
+        }
+        rejected = {
+            "generic skipped without an allow-list": (
+                {
+                    **automations[0],
+                    "terminal_check_conclusions": ["skipped"],
+                    "terminal_skipped_output_titles": [],
+                },
+                valid,
+            ),
+            "missing output": (automations[0], {**valid, "output": None}),
+            "malformed output": (automations[0], {**valid, "output": "malformed"}),
+            "null policy and malformed output": (
+                {**automations[0], "terminal_skipped_output_titles": [None]},
+                {**valid, "output": None},
+            ),
+            "empty policy and empty title": (
+                {**automations[0], "terminal_skipped_output_titles": [""]},
+                {**valid, "output": {"title": ""}},
+            ),
+            "missing title": (automations[0], {**valid, "output": {}}),
+            "title variant": (
+                automations[0],
+                {**valid, "output": {"title": "No code objects were reviewed"}},
+            ),
+            "stale head": (automations[0], {**valid, "head_sha": "b" * 40}),
+            "lookalike app": (
+                automations[0],
+                {**valid, "app": {"slug": "macroscopeapp-lookalike"}},
+            ),
+            "lookalike context": (
+                automations[0],
+                {**valid, "name": "Macroscope - Other Check"},
+            ),
+            "incomplete check": (automations[0], {**valid, "status": "in_progress"}),
+            "cancelled check": (automations[0], {**valid, "conclusion": "cancelled"}),
+            "timed-out check": (automations[0], {**valid, "conclusion": "timed_out"}),
+        }
+        for label, (automation, changed) in rejected.items():
+            with self.subTest(label=label):
+                self.assertNotEqual(
+                    [],
+                    review_evidence_errors(
+                        head, [automation], [changed], [], [], set()
+                    ),
+                )
+
+    def test_latest_configured_check_controls_no_code_skip_terminal_state(self) -> None:
+        head = "a" * 40
+        automations = [
+            {
+                "id": "macroscope",
+                "actors": ["macroscopeapp"],
+                "check_contexts": ["Macroscope - Correctness Check"],
+                "check_app_slugs": ["macroscopeapp"],
+                "terminal_skipped_output_titles": [
+                    "No code objects were reviewed."
+                ],
+                "terminal_review_states": [],
+            }
+        ]
+        accepted = {
+            "id": 4,
+            "name": "Macroscope - Correctness Check",
+            "head_sha": head,
+            "status": "completed",
+            "conclusion": "skipped",
+            "app": {"slug": "macroscopeapp"},
+            "output": {"title": "No code objects were reviewed."},
+        }
+        rejected = {
+            **accepted,
+            "id": 5,
+            "output": {"title": "Review was skipped for another reason."},
+        }
+        self.assertEqual(
+            ["macroscope: terminal current-head check is missing"],
+            review_evidence_errors(
+                head, automations, [accepted, rejected], [], [], set()
+            ),
+        )
+
+    def test_review_fingerprint_binds_no_code_skip_evidence(self) -> None:
+        head = "a" * 40
+        controller = Controller(DiagnosticGitHub(head))
+        check = {
+            "id": 4,
+            "name": "Macroscope - Correctness Check",
+            "head_sha": head,
+            "status": "completed",
+            "conclusion": "skipped",
+            "app": {"slug": "macroscopeapp"},
+            "output": {"title": "No code objects were reviewed."},
+            "completed_at": "2026-08-24T20:33:15Z",
+        }
+        original = controller.review_fingerprint(
+            [check], [], [], controller.automations
+        )
+        title_changed = copy.deepcopy(check)
+        title_changed["output"]["title"] = "Review was skipped for another reason."
+        head_changed = copy.deepcopy(check)
+        head_changed["head_sha"] = "b" * 40
+
+        self.assertNotEqual(
+            original,
+            controller.review_fingerprint(
+                [title_changed], [], [], controller.automations
+            ),
+        )
+        self.assertNotEqual(
+            original,
+            controller.review_fingerprint(
+                [head_changed], [], [], controller.automations
+            ),
+        )
+
     def test_every_active_automation_must_converge(self) -> None:
         automations = [
             {

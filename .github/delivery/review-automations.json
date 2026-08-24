@@ -16,6 +16,9 @@
         "success",
         "neutral"
       ],
+      "terminal_skipped_output_titles": [
+        "No code objects were reviewed."
+      ],
       "terminal_review_states": [],
       "nonterminal_review_markers": [
         "rate limit",
