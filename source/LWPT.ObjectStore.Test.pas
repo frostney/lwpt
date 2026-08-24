@@ -8,6 +8,10 @@ program LWPT.ObjectStore.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
   {$ENDIF}
   Classes,
   Pipes,
@@ -41,6 +45,19 @@ type
     Stderr: string;
     Phases: string;
     TimedOut: Boolean;
+  end;
+
+  TProcessStreamReader = class(TThread)
+  private
+    FErrorMessage: string;
+    FOutput: string;
+    FStream: TStream;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AStream: TStream);
+    property ErrorMessage: string read FErrorMessage;
+    property Output: string read FOutput;
   end;
 
 var
@@ -152,39 +169,66 @@ begin
   Result := FileExists(APath);
 end;
 
-function DrainAvailableProcessStream(
-  const AStream: TInputPipeStream): string;
+constructor TProcessStreamReader.Create(const AStream: TStream);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FStream := AStream;
+end;
+
+procedure TProcessStreamReader.Execute;
 const
   CHUNK_SIZE = 4096;
 var
-  Available, Count, ReadSize, Total: Integer;
+  Count, Total: Integer;
   Buffer: array[0..CHUNK_SIZE - 1] of Byte;
 begin
-  Result := '';
-  Available := AStream.NumBytesAvailable;
+  FOutput := '';
+  FErrorMessage := '';
   Total := 0;
-  while Available > 0 do
-  begin
-    ReadSize := CHUNK_SIZE;
-    if Available < ReadSize then ReadSize := Available;
-    Count := AStream.Read(Buffer[0], ReadSize);
-    if Count <= 0 then Break;
-    SetLength(Result, Total + Count);
-    Move(Buffer[0], Result[Total + 1], Count);
-    Inc(Total, Count);
-    Dec(Available, Count);
+  try
+    repeat
+      Count := FStream.Read(Buffer[0], CHUNK_SIZE);
+      if Count > 0 then
+      begin
+        SetLength(FOutput, Total + Count);
+        Move(Buffer[0], FOutput[Total + 1], Count);
+        Inc(Total, Count);
+      end;
+    until Count <= 0;
+  except
+    on E: Exception do FErrorMessage := E.Message;
   end;
 end;
 
-procedure DrainAdmitterStreams(const AProcess: TProcess;
-  var AResult: TAdmitterResult);
+function CollectChildPhases(const APrefix: string): string; forward;
+
+function ForceTerminateAdmitter(const AProcess: TProcess;
+  out AErrorCode: Integer): Boolean;
 begin
-  if AProcess.Output.NumBytesAvailable > 0 then
-    AResult.Stdout := AResult.Stdout
-      + DrainAvailableProcessStream(AProcess.Output);
-  if AProcess.Stderr.NumBytesAvailable > 0 then
-    AResult.Stderr := AResult.Stderr
-      + DrainAvailableProcessStream(AProcess.Stderr);
+  AErrorCode := 0;
+  {$IFDEF UNIX}
+  Result := fpKill(AProcess.ProcessID, SIGKILL) = 0;
+  if not Result then AErrorCode := fpgeterrno;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Result := Windows.TerminateProcess(AProcess.ProcessHandle, 1);
+  if not Result then AErrorCode := Windows.GetLastError;
+  {$ENDIF}
+end;
+
+procedure AbortForUnreapedAdmitter(const AProcess: TProcess;
+  const APhasePrefix: string; const ATerminationSent: Boolean;
+  const ATerminationError: Integer);
+begin
+  WriteLn('OBJECT STORE ADMITTER [unreaped child] process-id=',
+    AProcess.ProcessID, ' status=unavailable termination-sent=',
+    BoolToStr(ATerminationSent, True), ' termination-error=',
+    ATerminationError, ' phases=', CollectChildPhases(APhasePrefix));
+  { Reader destruction waits for EOF. If forced termination cannot be reaped,
+    exiting the test process is the only bounded cleanup that cannot deadlock
+    on pipe handles still owned by the child. }
+  Halt(1);
 end;
 
 function CollectChildPhases(const APrefix: string): string;
@@ -216,38 +260,49 @@ end;
 function FinishAdmitter(const AProcess: TProcess;
   const APhasePrefix: string): TAdmitterResult;
 var
-  StartedAt, TerminatedAt: QWord;
+  StderrReader, StdoutReader: TProcessStreamReader;
+  StartedAt: QWord;
+  TerminationError: Integer;
+  TerminationSent: Boolean;
 begin
   Result.TimedOut := False;
   Result.Stdout := '';
   Result.Stderr := '';
-  StartedAt := GetTickCount64;
-  { WaitOnExit cannot precede draining: a child that fills either pipe blocks
-    before it can exit. Keep both streams moving through the deadline and the
-    termination grace, then reap and collect the final available bytes. }
-  while AProcess.Running
-    and (GetTickCount64 - StartedAt < ADMIT_CHILD_TIMEOUT_MS) do
-  begin
-    DrainAdmitterStreams(AProcess, Result);
-    Sleep(10);
-  end;
-  if AProcess.Running then
-  begin
-    Result.TimedOut := True;
-    AProcess.Terminate(1);
-    TerminatedAt := GetTickCount64;
+  StdoutReader := TProcessStreamReader.Create(AProcess.Output);
+  StderrReader := TProcessStreamReader.Create(AProcess.Stderr);
+  try
+    { Windows anonymous pipes can block a large writer while a polling reader
+      observes no complete write. Drain stdout and stderr independently until
+      EOF so neither stream can prevent the deliberate child failure. }
+    StdoutReader.Start;
+    StderrReader.Start;
+    StartedAt := GetTickCount64;
     while AProcess.Running
-      and (GetTickCount64 - TerminatedAt <
-        ADMIT_CHILD_TERMINATION_TIMEOUT_MS) do
-    begin
-      DrainAdmitterStreams(AProcess, Result);
+      and (GetTickCount64 - StartedAt < ADMIT_CHILD_TIMEOUT_MS) do
       Sleep(10);
-    end;
     if AProcess.Running then
-      raise Exception.Create('object-store admitter did not terminate');
+    begin
+      Result.TimedOut := True;
+      TerminationSent := ForceTerminateAdmitter(AProcess, TerminationError);
+      if not AProcess.WaitOnExit(ADMIT_CHILD_TERMINATION_TIMEOUT_MS) then
+        AbortForUnreapedAdmitter(AProcess, APhasePrefix, TerminationSent,
+          TerminationError);
+    end;
+    if AProcess.Running then AProcess.WaitOnExit;
+    StdoutReader.WaitFor;
+    StderrReader.WaitFor;
+    if StdoutReader.ErrorMessage <> '' then
+      raise Exception.Create('could not read object-store admitter stdout: '
+        + StdoutReader.ErrorMessage);
+    if StderrReader.ErrorMessage <> '' then
+      raise Exception.Create('could not read object-store admitter stderr: '
+        + StderrReader.ErrorMessage);
+    Result.Stdout := StdoutReader.Output;
+    Result.Stderr := StderrReader.Output;
+  finally
+    StdoutReader.Free;
+    StderrReader.Free;
   end;
-  AProcess.WaitOnExit;
-  DrainAdmitterStreams(AProcess, Result);
   Result.ExitCode := AProcess.ExitCode;
   Result.RawExitStatus := AProcess.ExitStatus;
   Result.ExitStatus := Result.RawExitStatus;
@@ -699,6 +754,7 @@ var
   Admitter: TProcess;
   AdmitterFinished: Boolean;
   AdmitterResult: TAdmitterResult;
+  DiagnosticMatches: Boolean;
   Diagnostic, ExpectedStderrPrefix, ExpectedStdout, ReadyPath,
     ReleasePath: string;
 begin
@@ -723,6 +779,19 @@ begin
     + LineEnding + STDOUT_TAIL_MARKER + LineEnding;
   ExpectedStderrPrefix := StringOfChar('e', DIAGNOSTIC_STREAM_BYTES)
     + LineEnding + STDERR_TAIL_MARKER + LineEnding;
+  DiagnosticMatches := (AdmitterResult.ExitStatus = 217)
+    and not AdmitterResult.TimedOut
+    and (Pos('exit-status=217', Diagnostic) > 0)
+    and (Pos('phases=01-child-started,02-store-created,03-ready-signaled,'
+      + '04-release-observed,05-admission-started,06-object-staged,'
+      + '09-publication-started', Diagnostic) > 0)
+    and (AdmitterResult.Stdout = ExpectedStdout)
+    and (Pos(ExpectedStderrPrefix, AdmitterResult.Stderr) = 1)
+    and (Pos(ExpectedStdout, Diagnostic) > 0)
+    and (Pos(ExpectedStderrPrefix, Diagnostic) > 0)
+    and (Pos('intentional object-store child failure',
+      AdmitterResult.Stderr) > 0);
+  if not DiagnosticMatches then WriteLn(Diagnostic);
   Expect<Integer>(AdmitterResult.ExitStatus).ToBe(217);
   Expect<Boolean>(AdmitterResult.TimedOut).ToBe(False);
   Expect<Boolean>(Pos('exit-status=217', Diagnostic) > 0).ToBe(True);
