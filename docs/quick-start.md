@@ -46,7 +46,7 @@ Both code paths are dev-mode only; release builds always go through `./build/lwp
 After bootstrap:
 
 ```sh
-./build/lwpt --help     # top-level help; lists the 14 subcommands
+./build/lwpt --help     # top-level help; lists the 15 command families
 ```
 
 ## Daily commands
@@ -77,6 +77,8 @@ After bootstrap:
 ./build/lwpt outdated           # compare locked git-host deps to advertised tags
 ./build/lwpt update             # bump constraints + reinstall newer git-host deps
 ./build/lwpt repair             # recover project and shared-cache residue
+./build/lwpt registry init      # initialize a self-hosted registry origin
+./build/lwpt registry serve     # serve the origin in the foreground
 ```
 
 [`build-system.md`](./build-system.md) covers each in depth.

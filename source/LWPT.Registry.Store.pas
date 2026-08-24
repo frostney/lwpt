@@ -80,6 +80,7 @@ type
 function CanonicalRegistryURL(const AValue: string;
   const ARequireHTTPS: Boolean): string;
 function RegistryKeyStoragePath(const AKeyID: string): string;
+function RegistryTOMLQuote(const AValue: string): string;
 function RegistryTimestampNow: string;
 function RegistryConfiguration(const AIdentity, ABaseURL,
   AListenAddress: string; const APort: Word; const ATLSPKCS12Path,
@@ -279,12 +280,21 @@ begin
       #10: Result := Result + '\n';
       #12: Result := Result + '\f';
       #13: Result := Result + '\r';
-      #0..#7, #11, #14..#31:
-        raise ELWPTRegistryError.CreateStable('invalid_configuration',
-          'control characters are not permitted in registry configuration');
+      #0..#7, #11, #14..#31, #127:
+        Result := Result + '\u00' + LowerCase(IntToHex(Ord(Character), 2));
       else Result := Result + Character;
     end;
   Result := Result + '"';
+end;
+
+function RegistryTOMLQuote(const AValue: string): string;
+begin
+  Result := Quote(AValue);
+end;
+
+function RegistryIndexStoragePath(const AName: string): string;
+begin
+  Result := 'indexes/sha256/' + SHA256Hex(Bytes(AName)) + '.toml';
 end;
 
 function Unquote(const AValue: string): string;
@@ -1250,7 +1260,7 @@ end;
 procedure TLWPTRegistryStore.RecoverDerivedState(
   const AState: TLWPTRegistryState);
 var
-  ActiveNames, Records, Versions: TStringList;
+  ActiveIndexFiles, ActiveNames, Records, Versions: TStringList;
   Entry, FileName, Name, RecordHash, RecordText, Version: string;
   Index: Integer;
   Search: TSearchRec;
@@ -1261,6 +1271,9 @@ begin
   ActiveNames.Sorted := True;
   ActiveNames.Duplicates := dupIgnore;
   ActiveNames.OwnsObjects := True;
+  ActiveIndexFiles := TStringList.Create;
+  ActiveIndexFiles.Sorted := True;
+  ActiveIndexFiles.Duplicates := dupIgnore;
   try
     for RecordHash in Records do
     begin
@@ -1285,22 +1298,36 @@ begin
       else Versions := TStringList(ActiveNames.Objects[Index]);
       Versions.Add(Version + '=' + RecordHash);
     end;
-    ForceDirectories(RootPath('indexes'));
+    ForceDirectories(RootPath('indexes/sha256'));
     for Index := 0 to ActiveNames.Count - 1 do
     begin
       Versions := TStringList(ActiveNames.Objects[Index]);
       Entry := VersionIndexDocument(FConfig.Identity, ActiveNames[Index],
         Versions);
-      FileName := RootPath('indexes/' + ActiveNames[Index] + '.toml');
+      FileName := RegistryIndexStoragePath(ActiveNames[Index]);
+      ActiveIndexFiles.Add(ExtractFileName(FileName));
+      FileName := RootPath(FileName);
       if not FileExists(FileName) or (ReadText(FileName) <> Entry) then
         AtomicWriteBytes(FileName, TmpRoot, Bytes(Entry));
     end;
+    { Indexes are internal derived state. Remove the pre-hash layout rather
+      than retaining aliases that are not portable to every release host. }
     if FindFirst(RootPath('indexes/*.toml'), faAnyFile, Search) = 0 then
     try
       repeat
-        Name := ChangeFileExt(Search.Name, '');
-        if ActiveNames.IndexOf(Name) < 0 then
-          if not SysUtils.DeleteFile(RootPath('indexes/' + Search.Name)) then
+        if not SysUtils.DeleteFile(RootPath('indexes/' + Search.Name)) then
+          raise ELWPTRegistryError.CreateStable('recovery_failed',
+            'could not remove an index from the non-portable layout');
+      until FindNext(Search) <> 0;
+    finally
+      FindClose(Search);
+    end;
+    if FindFirst(RootPath('indexes/sha256/*.toml'), faAnyFile, Search) = 0 then
+    try
+      repeat
+        if ActiveIndexFiles.IndexOf(Search.Name) < 0 then
+          if not SysUtils.DeleteFile(RootPath('indexes/sha256/'
+            + Search.Name)) then
             raise ELWPTRegistryError.CreateStable('recovery_failed',
               'could not remove an index absent from committed state');
       until FindNext(Search) <> 0;
@@ -1323,6 +1350,7 @@ begin
       FindClose(Search);
     end;
   finally
+    ActiveIndexFiles.Free;
     ActiveNames.Free;
     Records.Free;
   end;
@@ -1554,7 +1582,7 @@ begin
       Records.Free;
       VersionEntries.Free;
     end;
-    IndexPath := RootPath('indexes/' + APublication.Name + '.toml');
+    IndexPath := RootPath(RegistryIndexStoragePath(APublication.Name));
     {
       Immutable publication bytes are prepared first. Only current.toml
       activates them; indexes are derived aliases and follow activation.

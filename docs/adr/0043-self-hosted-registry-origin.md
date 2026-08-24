@@ -33,7 +33,7 @@ checkpoints/<sequence>.toml
 checkpoints/<sequence>.sig.toml
 checkpoints/renewals/sha256/<checkpoint-hash>.toml
 checkpoints/renewals/sha256/<checkpoint-hash>.sig.toml
-indexes/<package>.toml
+indexes/sha256/<package-name-hash>.toml
 state/current.toml
 locks/
 tmp/
@@ -44,6 +44,8 @@ Writing different bytes to an occupied path is an `immutable_conflict`.
 Publishing an existing `(origin, name, version)` with identical bytes is
 idempotent; different bytes are an `identity_conflict`. A per-package version
 index is replaced atomically and is a derived lookup aid, not a trust root.
+Its filename is the SHA-256 of the canonical UTF-8 package name, so every
+protocol-valid name has the same safe storage key on Windows, macOS, and Unix.
 
 Publication writes the archive, record, next snapshot, checkpoint, and
 detached signature before replacing `state/current.toml`. That one small

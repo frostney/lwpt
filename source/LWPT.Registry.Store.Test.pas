@@ -45,6 +45,7 @@ type
   private
     FScratch: string;
     function DefaultConfig: TLWPTRegistryConfig;
+    function IndexPath(const AName: string): string;
     function InitializeStore: TLWPTRegistryStore;
     function PublishExample(AStore: TLWPTRegistryStore;
       const AByte: Byte): TLWPTRegistryState;
@@ -59,6 +60,7 @@ type
     procedure TestInitialCheckpointVerifiesAfterRestart;
     procedure TestPublicationIsImmutableAndIdempotent;
     procedure TestVersionIndexRetainsEveryPublishedVersion;
+    procedure TestReservedPackageNameUsesPortableIndexKey;
     procedure TestIncompleteInitializationIsRecovered;
     procedure TestCallerOwnedRootIsPreserved;
     procedure TestInitializationUsesAnOperatingSystemLease;
@@ -70,6 +72,7 @@ type
     procedure TestCanonicalURLValidation;
     procedure TestSigningSeedIsPrivateFromCreation;
     procedure TestServerRejectsCorruptContentAddressedBytes;
+    procedure TestServerErrorsConformToWireContract;
     procedure TestServerDiscoveryIsTruthful;
     procedure TestCheckpointResponsesRequireRevalidation;
     procedure TestReadersObserveCompleteStateDuringPublication;
@@ -107,6 +110,12 @@ function TRegistryStoreContract.DefaultConfig: TLWPTRegistryConfig;
 begin
   Result := RegistryConfiguration('', REGISTRY_DEFAULT_BASE_URL,
     REGISTRY_DEFAULT_LISTEN_ADDRESS, REGISTRY_DEFAULT_PORT, '', '');
+end;
+
+function TRegistryStoreContract.IndexPath(const AName: string): string;
+begin
+  Result := FScratch + '/indexes/sha256/'
+    + SHA256Hex(TEncoding.UTF8.GetBytes(AName)) + '.toml';
 end;
 
 function TRegistryStoreContract.InitializeStore: TLWPTRegistryStore;
@@ -233,10 +242,39 @@ begin
     SetLength(Publication.Archive, 128);
     FillChar(Publication.Archive[0], Length(Publication.Archive), $42);
     Store.Publish(Publication);
-    IndexText := ReadBinaryFile(FScratch + '/indexes/example-lib.toml');
+    IndexText := ReadBinaryFile(IndexPath('example-lib'));
     Expect<Boolean>(Pos('1.0.0=sha256:', IndexText) > 0).ToBe(True);
     Expect<Boolean>(Pos('2.0.0=sha256:', IndexText) > 0).ToBe(True);
     Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(3);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestReservedPackageNameUsesPortableIndexKey;
+var
+  IndexText: string;
+  Publication: TLWPTRegistryPublication;
+  Store: TLWPTRegistryStore;
+begin
+  Store := InitializeStore;
+  Publication.Name := 'con';
+  Publication.Version := '1.0.0';
+  Publication.PublishedAt := SECOND_TIME;
+  SetLength(Publication.Archive, 32);
+  FillChar(Publication.Archive[0], Length(Publication.Archive), $43);
+  try
+    Store.Publish(Publication);
+    Expect<Boolean>(FileExists(IndexPath(Publication.Name))).ToBe(True);
+    Expect<Boolean>(FileExists(FScratch + '/indexes/con.toml')).ToBe(False);
+  finally
+    Store.Free;
+  end;
+  Store := TLWPTRegistryStore.Create(FScratch);
+  try
+    IndexText := ReadBinaryFile(IndexPath(Publication.Name));
+    Expect<Boolean>(Pos('name = "con"', IndexText) > 0).ToBe(True);
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(2);
   finally
     Store.Free;
   end;
@@ -357,7 +395,7 @@ begin
     Expect<Boolean>(Pos('injected_registry_failure:', Diagnostic) = 1)
       .ToBe(True);
     Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(2);
-    Expect<Boolean>(FileExists(FScratch + '/indexes/example-lib.toml'))
+    Expect<Boolean>(FileExists(IndexPath('example-lib')))
       .ToBe(False);
   finally
     SetFailurePoint('');
@@ -365,7 +403,7 @@ begin
   end;
   Store := TLWPTRegistryStore.Create(FScratch);
   try
-    Expect<Boolean>(FileExists(FScratch + '/indexes/example-lib.toml'))
+    Expect<Boolean>(FileExists(IndexPath('example-lib')))
       .ToBe(True);
     Expect<Int64>(PublishExample(Store, $62).Sequence).ToBe(2);
   finally
@@ -481,6 +519,51 @@ begin
     Expect<Integer>(Response.Status).ToBe(500);
     Expect<Boolean>(Pos('resource_hash_mismatch',
       TEncoding.UTF8.GetString(Response.Body)) > 0).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestServerErrorsConformToWireContract;
+var
+  Body, ExpectedBody, Wire: string;
+  Character: Char;
+  RequestID: string;
+  RequestIDStart: SizeInt;
+  Response: TLWPTRegistryHTTPResponse;
+  Store: TLWPTRegistryStore;
+begin
+  ExpectedBody := 'schema = "' + PROGRAM_NAME + '-registry-error-v1"' + #10
+    + 'code = "bad\"code"' + #10
+    + 'message = "path\\failed\t\u0001"' + #10
+    + 'request_id = "request\\\"\u007f"' + #10
+    + 'retryable = false' + #10;
+  Response := RegistryErrorResponse(400, 'Bad Request', 'bad"code',
+    'path\failed' + #9 + #1, 'request\"' + #127);
+  Body := TEncoding.UTF8.GetString(Response.Body);
+  Expect<string>(Body).ToBe(ExpectedBody);
+  Expect<Boolean>((Pos(#1, Body) = 0) and (Pos(#127, Body) = 0)).ToBe(True);
+  Wire := TEncoding.UTF8.GetString(RegistryHTTPWireResponse(Response, True));
+  Expect<Boolean>(Pos('Content-Length: ' + IntToStr(Length(Response.Body))
+    + #13#10, Wire) > 0).ToBe(True);
+  Expect<Boolean>(Pos(#13#10#13#10 + ExpectedBody, Wire) > 0).ToBe(True);
+
+  Store := InitializeStore;
+  try
+    Response := RegistryHTTPResponse(Store, 'POST', '/');
+    Body := TEncoding.UTF8.GetString(Response.Body);
+    Expect<Integer>(Response.Status).ToBe(405);
+    RequestIDStart := Pos('request_id = "', Body);
+    Expect<Boolean>(RequestIDStart > 0).ToBe(True);
+    Expect<Boolean>(Pos('request_id = ""', Body) = 0).ToBe(True);
+    RequestID := Copy(Body, RequestIDStart + Length('request_id = "'), 26);
+    Expect<Integer>(Length(RequestID)).ToBe(26);
+    for Character in RequestID do
+      Expect<Boolean>(Character in ['0'..'9', 'a'..'f']).ToBe(True);
+    Expect<Boolean>(Body[RequestIDStart + Length('request_id = "') + 26]
+      = '"').ToBe(True);
+    Expect<Boolean>(RequestIDStart
+      < Pos('retryable = false', Body)).ToBe(True);
   finally
     Store.Free;
   end;
@@ -640,6 +723,8 @@ begin
     TestPublicationIsImmutableAndIdempotent);
   Test('version index retains every published version',
     TestVersionIndexRetainsEveryPublishedVersion);
+  Test('reserved package name uses a portable index key',
+    TestReservedPackageNameUsesPortableIndexKey);
   Test('incomplete initialization is recovered',
     TestIncompleteInitializationIsRecovered);
   Test('caller-owned root is preserved', TestCallerOwnedRootIsPreserved);
@@ -659,6 +744,8 @@ begin
     TestSigningSeedIsPrivateFromCreation);
   Test('server rejects corrupt content-addressed bytes',
     TestServerRejectsCorruptContentAddressedBytes);
+  Test('server errors conform to the wire contract',
+    TestServerErrorsConformToWireContract);
   Test('server discovery is truthful', TestServerDiscoveryIsTruthful);
   Test('checkpoint responses require revalidation',
     TestCheckpointResponsesRequireRevalidation);

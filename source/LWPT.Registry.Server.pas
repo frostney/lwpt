@@ -39,6 +39,9 @@ type
 
 function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
   const AMethod, ATarget: string): TLWPTRegistryHTTPResponse;
+function RegistryErrorResponse(const AStatus: Integer; const AReason,
+  ACode, AMessage: string; const ARequestID: string = ''):
+  TLWPTRegistryHTTPResponse;
 function RegistryHTTPWireResponse(const AResponse: TLWPTRegistryHTTPResponse;
   const AIncludeBody: Boolean): TBytes;
 
@@ -64,6 +67,9 @@ const
   CLIENT_READ_TIMEOUT_MILLISECONDS = 10000;
   TLS_CIPHERTEXT_BUDGET_BYTES = 1024 * 1024;
   MAX_ACTIVE_CLIENTS = 32;
+
+var
+  RegistryRequestSequence: LongInt;
 
 type
   TLWPTRegistryClientThread = class(TThread)
@@ -116,18 +122,41 @@ begin
   Result := Copy(ABaseURL, AuthorityEnd, MaxInt);
 end;
 
-function ErrorResponse(const AStatus: Integer; const AReason,
-  ACode, AMessage: string): TLWPTRegistryHTTPResponse;
+function NewRegistryRequestID: string;
+var
+  Identity: string;
 begin
+  Identity := RegistryTimestampNow + ':' + IntToStr(GetTickCount64) + ':'
+    + IntToStr(InterlockedIncrement(RegistryRequestSequence));
+  Result := Copy(SHA256Hex(Bytes(Identity)), 1, 26);
+end;
+
+function RegistryErrorResponse(const AStatus: Integer; const AReason,
+  ACode, AMessage: string; const ARequestID: string):
+  TLWPTRegistryHTTPResponse;
+var
+  RequestID: string;
+begin
+  RequestID := ARequestID;
+  if RequestID = '' then RequestID := NewRegistryRequestID;
   Result.Status := AStatus;
   Result.Reason := AReason;
   Result.ContentType := 'application/vnd.' + PROGRAM_NAME
     + '.registry-error+toml';
   Result.CacheControl := 'no-store';
   Result.ETag := '';
-  Result.Body := Bytes('schema = "' + PROGRAM_NAME
-    + '-registry-error-v1"' + #10 + 'code = "' + ACode + '"' + #10
-    + 'message = "' + AMessage + '"' + #10 + 'retryable = false' + #10);
+  Result.Body := Bytes('schema = '
+    + RegistryTOMLQuote(PROGRAM_NAME + '-registry-error-v1') + #10
+    + 'code = ' + RegistryTOMLQuote(ACode) + #10
+    + 'message = ' + RegistryTOMLQuote(AMessage) + #10
+    + 'request_id = ' + RegistryTOMLQuote(RequestID) + #10
+    + 'retryable = false' + #10);
+end;
+
+function ErrorResponse(const AStatus: Integer; const AReason,
+  ACode, AMessage: string): TLWPTRegistryHTTPResponse;
+begin
+  Result := RegistryErrorResponse(AStatus, AReason, ACode, AMessage);
 end;
 
 function ResourceResponse(AStore: TLWPTRegistryStore;
