@@ -548,6 +548,23 @@ begin
   {$ENDIF}
 end;
 
+function FindNextFinished(var ASearch: TSearchRec;
+  out AResult: Integer): Boolean;
+begin
+  AResult := FindNext(ASearch);
+  Result := AResult <> 0;
+end;
+
+function FindNextMeansEnd(const AResult: Integer): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := AResult = Windows.ERROR_NO_MORE_FILES;
+  {$ELSE}
+  { FPC 3.2.2 collapses both end-of-directory and errors to -1 on POSIX. }
+  Result := AResult = -1;
+  {$ENDIF}
+end;
+
 function CacheEntryExists(const APath: string): Boolean;
 var
   FindResult: Integer;
@@ -669,11 +686,13 @@ begin
             except
               on ELWPTCacheLifecycleError do Result := False;
             end;
-        until FindNext(EntrySearch) <> 0;
+        until FindNextFinished(EntrySearch, FindResult);
+        if not FindNextMeansEnd(FindResult) then Result := False;
       finally
         SysUtils.FindClose(EntrySearch);
       end;
-    until FindNext(PrefixSearch) <> 0;
+    until FindNextFinished(PrefixSearch, FindResult);
+    if not FindNextMeansEnd(FindResult) then Result := False;
   finally
     SysUtils.FindClose(PrefixSearch);
   end;
@@ -758,11 +777,18 @@ begin
             RemoveBuildReferenceEntry(EntryPath, EntrySearch.Attr);
             Inc(AReport.IncompleteEntriesRemoved);
           end;
-        until FindNext(EntrySearch) <> 0;
+        until FindNextFinished(EntrySearch, FindResult);
+        if not FindNextMeansEnd(FindResult) then
+          raise ELWPTCacheLifecycleError.CreateFmt(
+            'failed to enumerate build-cache references at %s',
+            [PrefixPath]);
       finally
         SysUtils.FindClose(EntrySearch);
       end;
-    until FindNext(PrefixSearch) <> 0;
+    until FindNextFinished(PrefixSearch, FindResult);
+    if not FindNextMeansEnd(FindResult) then
+      raise ELWPTCacheLifecycleError.CreateFmt(
+        'failed to enumerate build-cache references at %s', [Root]);
   finally
     SysUtils.FindClose(PrefixSearch);
   end;
