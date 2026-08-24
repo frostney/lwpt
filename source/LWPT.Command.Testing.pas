@@ -15,6 +15,8 @@ uses
 
 function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
   const AHostOS, AHostArchitecture: string): Boolean;
+function CacheUnavailableDiagnostic(const AExceptionClass,
+  AExceptionMessage: string): string;
 function CmdTest(const AManifestPath: string;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings; const AUseCache: Boolean = True): Integer;
@@ -777,6 +779,30 @@ begin
     Result := 'cache miss: ' + AReason;
 end;
 
+function BoundedSingleLine(const AValue: string;
+  const AMaximumLength: Integer): string;
+var
+  Index: Integer;
+begin
+  Result := AValue;
+  for Index := 1 to Length(Result) do
+    if (Ord(Result[Index]) < 32) or (Ord(Result[Index]) = 127) then
+      Result[Index] := ' ';
+  if Length(Result) > AMaximumLength then
+    Result := Copy(Result, 1, AMaximumLength) + '...';
+end;
+
+function CacheUnavailableDiagnostic(const AExceptionClass,
+  AExceptionMessage: string): string;
+const
+  MaximumClassLength = 64;
+  MaximumMessageLength = 256;
+begin
+  Result := 'cache bypass: unavailable ('
+    + BoundedSingleLine(AExceptionClass, MaximumClassLength) + ': '
+    + BoundedSingleLine(AExceptionMessage, MaximumMessageLength) + ')';
+end;
+
 procedure TTestScheduler.RunOne(const AIndex: Integer;
   var ALease: TLWPTWorkerLease);
 var
@@ -1015,7 +1041,8 @@ begin
           CompleteJob(AIndex, tjsCancelled);
           Exit;
         end;
-        CacheDiagnostic := 'cache bypass: unavailable' + LineEnding;
+        CacheDiagnostic := CacheUnavailableDiagnostic(E.ClassName,
+          E.Message) + LineEnding;
       end;
     end;
   end;
