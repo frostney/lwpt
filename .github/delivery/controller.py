@@ -24,6 +24,7 @@ from model import (
     MERGE_READY_LABEL,
     READINESS_LABELS,
     REVIEW_READY_LABEL,
+    check_output_title,
     derive_candidate_snapshot,
     label_names,
     require_expected_head,
@@ -700,8 +701,10 @@ class Controller:
                         "id": check.get("id"),
                         "name": check.get("name"),
                         "app": (check.get("app") or {}).get("slug"),
+                        "head_sha": check.get("head_sha"),
                         "status": check.get("status"),
                         "conclusion": check.get("conclusion"),
+                        "output_title": check_output_title(check),
                         "completed_at": check.get("completed_at"),
                     }
                     for check in checks
