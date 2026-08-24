@@ -557,7 +557,8 @@ begin
   Rebuilt := RunLwpt(['test', '--verbose', '--jobs=1'], ProjectRoot,
     Environment);
   RequireSuccess('corrupt cache rebuild', Rebuilt);
-  Expect<Boolean>(Pos('cache corruption: artifact-missing', Rebuilt.Stdout) > 0)
+  Expect<Boolean>(Pos('cache corruption: artifact-verification-failed',
+    Rebuilt.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('cache stored:', Rebuilt.Stdout) > 0).ToBe(True);
   Expect<Integer>(CountMarkerLines(Marker)).ToBe(2);

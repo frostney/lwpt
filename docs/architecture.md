@@ -216,9 +216,12 @@ installs are not supported.
   budget across dependency archives and build results. It records a monotonic
   deterministic LRU index, protects admission and materialization with
   per-object OS-held guards, and serializes only index/budget mutations.
-  `lwpt repair` verifies object manifests and content, reconstructs damaged
-  index state, reclaims abandoned/incomplete residue, preserves live guards,
-  and evicts unleased objects until the configured budget is met.
+  Build fingerprints transitively name both a result manifest and its artifact;
+  mutation invalidates that logical reference before either object is removed.
+  `lwpt repair` verifies object manifests, content, and both hops of each build
+  reference, reconstructs damaged index state, reclaims abandoned/incomplete
+  residue, preserves live guards, and evicts unleased objects until the
+  configured budget is met.
 - **Test:** Each `*.Test.pas` is a self-contained program using
   `TestingPascalLibrary`. The runner discovers all programs or resolves strict
   file, directory, and glob selectors; projects own any grouping and network

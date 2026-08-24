@@ -11,25 +11,19 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.BuildResultManifest,
   LWPT.CacheLifecycle,
   LWPT.Core,
   LWPT.ObjectStore,
   LWPT.ProducerLease;
 
 const
-  BUILD_CACHE_RESULT_SCHEMA_VERSION = 1;
   BUILD_RESULT_NAMESPACE = 'build-results';
 
 type
   ELWPTBuildCacheError = class(ELWPTError);
-
-  TLWPTCachedBuildResult = record
-    SchemaVersion: Integer;
-    Fingerprint: string;
-    ArtifactDigest: string;
-    ArtifactKind: string;
-    UnixMode: Integer;
-  end;
+  TLWPTCachedBuildResult =
+    LWPT.BuildResultManifest.TLWPTCachedBuildResult;
 
   TLWPTBuildCache = class
   private
@@ -38,12 +32,10 @@ type
     FObjects: TLWPTImmutableObjectStore;
     FProducerLeases: TLWPTProducerLeaseCoordinator;
     function ReferencePath(const AFingerprint: string): string;
-    function ParseResultManifest(const AText: string;
-      out AResult: TLWPTCachedBuildResult): Boolean;
+    function InvalidateReferenceIfCurrent(const AFingerprint,
+      AManifestDigest: string): Boolean;
     function ReadSmallTextFile(const APath: string;
       out AText: string): Boolean;
-    function SerializeResultManifest(
-      const AResult: TLWPTCachedBuildResult): TStringList;
   public
     constructor CreateDefault;
     constructor Create(const ACacheRoot: string);
@@ -65,33 +57,15 @@ function BuildArtifactUnixMode(const APath: string): Integer;
 
 implementation
 
+{$IFDEF UNIX}
 uses
-  {$IFDEF UNIX}
-  BaseUnix,
-  {$ENDIF}
-  TOML;
-
-const
-  RESULT_MANIFEST_MAX_BYTES = 64 * 1024;
+  BaseUnix;
+{$ENDIF}
 
 function BuildResultCacheRoot(const ACacheRoot: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(ACacheRoot)
     + BUILD_RESULT_NAMESPACE;
-end;
-
-function CanonicalDigest(const ADigest: string): string;
-var
-  Hex: string;
-  Index: Integer;
-begin
-  Result := '';
-  if not SameText(Copy(ADigest, 1, 7), 'sha256:') then Exit;
-  Hex := LowerCase(Copy(ADigest, 8, MaxInt));
-  if Length(Hex) <> 64 then Exit;
-  for Index := 1 to Length(Hex) do
-    if not (Hex[Index] in ['0'..'9', 'a'..'f']) then Exit;
-  Result := 'sha256:' + Hex;
 end;
 
 function BuildArtifactUnixMode(const APath: string): Integer;
@@ -149,7 +123,7 @@ begin
     caller can create shared coordination state. }
   ReferencePath(AFingerprint);
   Result := FProducerLeases.TryAcquire('build:'
-    + CanonicalDigest(AFingerprint), ADescription);
+    + CanonicalBuildCacheDigest(AFingerprint), ADescription);
 end;
 
 function TLWPTBuildCache.ProducerSnapshot(const AFingerprint: string;
@@ -157,7 +131,7 @@ function TLWPTBuildCache.ProducerSnapshot(const AFingerprint: string;
 begin
   ReferencePath(AFingerprint);
   Result := FProducerLeases.Snapshot('build:'
-    + CanonicalDigest(AFingerprint), ASnapshot);
+    + CanonicalBuildCacheDigest(AFingerprint), ASnapshot);
 end;
 
 function TLWPTBuildCache.ReferencePath(
@@ -165,7 +139,7 @@ function TLWPTBuildCache.ReferencePath(
 var
   Digest, Hex: string;
 begin
-  Digest := CanonicalDigest(AFingerprint);
+  Digest := CanonicalBuildCacheDigest(AFingerprint);
   if Digest = '' then
     raise ELWPTBuildCacheError.CreateFmt(
       'build fingerprint must use sha256:<64 lowercase hex> (got "%s")',
@@ -183,66 +157,49 @@ var
 begin
   Result := False;
   AText := '';
-  if not FileExists(APath) then Exit;
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
-    if Stream.Size > RESULT_MANIFEST_MAX_BYTES then Exit;
-    SetLength(Bytes, Stream.Size);
-    if Stream.Size > 0 then Stream.ReadBuffer(Bytes[0], Stream.Size);
-  finally
-    Stream.Free;
+    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      if Stream.Size > BUILD_RESULT_MANIFEST_MAX_BYTES then Exit;
+      SetLength(Bytes, Stream.Size);
+      if Stream.Size > 0 then Stream.ReadBuffer(Bytes[0], Stream.Size);
+    finally
+      Stream.Free;
+    end;
+  except
+    on E: EFOpenError do Exit;
+    on E: EInOutError do Exit;
+    on E: EReadError do Exit;
   end;
   SetLength(AText, Length(Bytes));
   if Length(Bytes) > 0 then Move(Bytes[0], AText[1], Length(Bytes));
   Result := True;
 end;
 
-function TLWPTBuildCache.SerializeResultManifest(
-  const AResult: TLWPTCachedBuildResult): TStringList;
-begin
-  Result := TStringList.Create;
-  Result.LineBreak := #10;
-  Result.Add('schema = ' + IntToStr(AResult.SchemaVersion));
-  Result.Add('fingerprint = "' + AResult.Fingerprint + '"');
-  Result.Add('artifact_digest = "' + AResult.ArtifactDigest + '"');
-  Result.Add('artifact_kind = "' + AResult.ArtifactKind + '"');
-  Result.Add('unix_mode = ' + IntToStr(AResult.UnixMode));
-end;
-
-function TLWPTBuildCache.ParseResultManifest(const AText: string;
-  out AResult: TLWPTCachedBuildResult): Boolean;
+function TLWPTBuildCache.InvalidateReferenceIfCurrent(
+  const AFingerprint, AManifestDigest: string): Boolean;
 var
-  Parser: TTOMLParser;
-  Root: TTOMLNode;
+  Current: string;
+  MutationLease: TObject;
 begin
   Result := False;
-  AResult := Default(TLWPTCachedBuildResult);
-  Parser := TTOMLParser.Create;
-  Root := nil;
+  MutationLease := FCacheLifecycle.AcquireMutation;
   try
-    try
-      Root := Parser.ParseDocument(AText);
-    except
-      on ETOMLParseError do Exit;
+    if ReadSmallTextFile(ReferencePath(AFingerprint), Current)
+       and (Trim(Current) = AManifestDigest) then
+    begin
+      if not SysUtils.DeleteFile(ReferencePath(AFingerprint)) then
+      begin
+        if FileExists(ReferencePath(AFingerprint)) then
+          raise ELWPTBuildCacheError.CreateFmt(
+            'failed to invalidate build-cache reference %s',
+            [AFingerprint]);
+        Exit;
+      end;
+      Result := True;
     end;
   finally
-    Parser.Free;
-  end;
-  try
-    AResult.SchemaVersion := TomlInt(Root, 'schema', 0);
-    AResult.Fingerprint := CanonicalDigest(
-      TomlStr(Root, 'fingerprint', ''));
-    AResult.ArtifactDigest := CanonicalDigest(
-      TomlStr(Root, 'artifact_digest', ''));
-    AResult.ArtifactKind := TomlStr(Root, 'artifact_kind', '');
-    AResult.UnixMode := TomlInt(Root, 'unix_mode', -1);
-    Result := (AResult.SchemaVersion = BUILD_CACHE_RESULT_SCHEMA_VERSION)
-      and (AResult.Fingerprint <> '')
-      and (AResult.ArtifactDigest <> '')
-      and (AResult.ArtifactKind <> '')
-      and (AResult.UnixMode >= 0) and (AResult.UnixMode <= $1FF);
-  finally
-    Root.Free;
+    MutationLease.Free;
   end;
 end;
 
@@ -251,13 +208,14 @@ function TLWPTBuildCache.Materialize(const AFingerprint, ADestination,
   out AReason: string): Boolean;
 var
   ManifestDigest, ManifestPath, ManifestText, ReferenceText: string;
+  ObjectFailure: TLWPTObjectMaterializeFailure;
 begin
   Result := False;
   AResult := Default(TLWPTCachedBuildResult);
   AReason := 'no-result';
   if not ReadSmallTextFile(ReferencePath(AFingerprint), ReferenceText) then
     Exit;
-  ManifestDigest := CanonicalDigest(Trim(ReferenceText));
+  ManifestDigest := CanonicalBuildCacheDigest(Trim(ReferenceText));
   if ManifestDigest = '' then
   begin
     AReason := 'invalid-reference';
@@ -266,26 +224,36 @@ begin
   ForceDirectories(ASessionTemporaryRoot);
   ManifestPath := MakeTmpPath(ASessionTemporaryRoot, 'result-manifest');
   if not FObjects.Materialize(ManifestDigest, ManifestPath,
-       ASessionTemporaryRoot) then
+       ASessionTemporaryRoot, ObjectFailure) then
   begin
-    AReason := 'result-manifest-missing';
+    AReason := 'result-manifest-'
+      + ObjectMaterializeFailureName(ObjectFailure);
+    if ObjectFailure in [omfObjectMissing, omfVerificationFailed] then
+      if not InvalidateReferenceIfCurrent(AFingerprint,
+           ManifestDigest) then AReason := 'no-result';
     Exit;
   end;
   try
     if not ReadSmallTextFile(ManifestPath, ManifestText)
-       or not ParseResultManifest(ManifestText, AResult)
-       or (AResult.Fingerprint <> CanonicalDigest(AFingerprint)) then
+       or not ParseBuildResultManifest(ManifestText, AResult)
+       or (AResult.Fingerprint <>
+         CanonicalBuildCacheDigest(AFingerprint)) then
     begin
       AReason := 'result-manifest-invalid';
+      if not InvalidateReferenceIfCurrent(AFingerprint,
+           ManifestDigest) then AReason := 'no-result';
       Exit;
     end;
   finally
     SysUtils.DeleteFile(ManifestPath);
   end;
   if not FObjects.Materialize(AResult.ArtifactDigest, ADestination,
-    ASessionTemporaryRoot) then
+    ASessionTemporaryRoot, ObjectFailure) then
   begin
-    AReason := 'artifact-missing';
+    AReason := 'artifact-' + ObjectMaterializeFailureName(ObjectFailure);
+    if ObjectFailure in [omfObjectMissing, omfVerificationFailed] then
+      if not InvalidateReferenceIfCurrent(AFingerprint,
+           ManifestDigest) then AReason := 'no-result';
     Exit;
   end;
   if not ApplyUnixMode(ADestination, AResult.UnixMode) then
@@ -322,7 +290,7 @@ begin
         'cache artifact does not exist: %s', [AArtifactPath]);
     CacheResult := Default(TLWPTCachedBuildResult);
     CacheResult.SchemaVersion := BUILD_CACHE_RESULT_SCHEMA_VERSION;
-    CacheResult.Fingerprint := CanonicalDigest(AFingerprint);
+    CacheResult.Fingerprint := CanonicalBuildCacheDigest(AFingerprint);
     if CacheResult.Fingerprint = '' then
       raise ELWPTBuildCacheError.CreateFmt(
         'invalid build fingerprint "%s"', [AFingerprint]);
@@ -339,7 +307,7 @@ begin
     ManifestTmpRoot := ExtractFileDir(AArtifactPath);
     ForceDirectories(ManifestTmpRoot);
     ManifestPath := MakeTmpPath(ManifestTmpRoot, 'build-result');
-    Lines := SerializeResultManifest(CacheResult);
+    Lines := SerializeBuildResultManifest(CacheResult);
     try
       AtomicWriteText(ManifestPath, ManifestTmpRoot, Lines);
     finally

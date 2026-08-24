@@ -764,9 +764,11 @@ end;
 function CacheMissDiagnostic(const AReason: string): string;
 begin
   if (AReason = 'invalid-reference')
-     or (AReason = 'result-manifest-missing')
+     or (AReason = 'result-manifest-object-missing')
+     or (AReason = 'result-manifest-verification-failed')
      or (AReason = 'result-manifest-invalid')
-     or (AReason = 'artifact-missing')
+     or (AReason = 'artifact-object-missing')
+     or (AReason = 'artifact-verification-failed')
      or (AReason = 'artifact-mode-failed')
      or (AReason = 'artifact-set-invalid')
      or (AReason = 'result-kind-mismatch') then

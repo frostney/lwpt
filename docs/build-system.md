@@ -147,6 +147,15 @@ cannot fit without removing live state. See
 [ADR-0038](./adr/0038-local-producer-leases.md), and
 [ADR-0040](./adr/0040-bounded-shared-cache-lifecycle.md).
 
+The fingerprint reference, result manifest, and artifact form one logical
+cache result. Eviction invalidates the fingerprint before removing either
+object, and repair rejects references whose manifest is missing or malformed,
+binds another fingerprint, or names a missing/corrupt artifact. A reader
+already copying a guarded artifact may finish, while later readers see
+`no-result`. Verbose cache diagnostics retain the failing object and stage
+(missing, verification, copy, or staged-hash) when a filesystem fault occurs
+outside ordinary eviction.
+
 When a build fails with output matching a stale-artefact signature (internal
 compiler exception, resource-compile errors, missing `.reslst`), `lwpt build`
 prints a hint to retry with `--clean`. Failure classification and exit-message

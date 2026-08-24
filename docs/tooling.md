@@ -169,7 +169,10 @@ Object admission and materialization hold per-object operating-system guards.
 Eviction skips those guards and therefore preserves objects still being
 produced, verified, or copied into a private project/session path. A short
 cache-root mutation guard serializes index publication and eviction across
-processes; it does not serialize independent downloads or compiles.
+processes; it does not serialize independent downloads or compiles. Build
+references are invalidated under that guard before their result manifest or
+transitively named artifact is removed, so new readers see a miss while a
+reader already holding the artifact guard may finish safely.
 
 `lwpt repair` is the only maintenance command. It removes incomplete staging
 and quarantined corruption, reclaims producer metadata only when its OS guard
@@ -177,7 +180,8 @@ is no longer held, atomically detaches the guarded key directory before
 recursive removal so a concurrent link substitution cannot redirect cleanup,
 using the directory rename itself as the final producer race check on Windows,
 verifies content-addressed bytes, rebuilds a corrupt LRU index from verified
-object manifests, and enforces the current budget. Its
+object manifests, removes malformed or incomplete transitive build references,
+and enforces the current budget. Its
 report names bytes reclaimed, corrupt objects removed, and live objects and
 leases preserved. Live producer metadata and guarded object bytes may keep a
 repair result above budget; the report makes that preservation explicit and a

@@ -47,6 +47,9 @@ type
     procedure TestRepairRebuildsSemanticallyCorruptIndex;
     procedure TestRepairRemovesInvalidProducerLeaseRoot;
     procedure TestRepairZeroBudgetPrunesBuildReferences;
+    procedure TestRepairRemovesTransitiveDanglingBuildReferences;
+    procedure TestCorruptManifestCannotHideArtifactReference;
+    procedure TestEmptyReferenceTreeDoesNotBlockRemoval;
     {$IFDEF UNIX}
     procedure TestRepairUnlinksCacheShardsWithoutFollowingThem;
     {$ENDIF}
@@ -173,6 +176,140 @@ begin
     Expect<Int64>(SecondReport.BytesReclaimed).ToBe(0);
     Expect<Integer>(SecondReport.IncompleteEntriesRemoved).ToBe(0);
   finally
+    Store.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.
+  TestRepairRemovesTransitiveDanglingBuildReferences;
+const
+  FINGERPRINT =
+    'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+var
+  ArtifactDigest, ManifestDigest, MalformedDigest, OversizedDigest,
+    OversizedReferencePath, ReferencePath, MalformedReferencePath: string;
+  Report: TLWPTCacheRepairReport;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/build-results/objects', FCacheRoot, 'build-results');
+  try
+    ArtifactDigest := WriteObject('artifact', 'compiled-artifact', Store);
+    ManifestDigest := WriteObject('manifest',
+      'schema = 1'#10
+      + 'fingerprint = "' + FINGERPRINT + '"'#10
+      + 'artifact_digest = "' + ArtifactDigest + '"'#10
+      + 'artifact_kind = "executable"'#10
+      + 'unix_mode = 0'#10, Store);
+    MalformedDigest := WriteObject('malformed-manifest',
+      'schema = 1'#10 + 'artifact_digest = [broken'#10, Store);
+    OversizedDigest := WriteObject('oversized-manifest',
+      StringOfChar('x', 64 * 1024 + 1), Store);
+    ReferencePath := FCacheRoot + '/build-results/refs/sha256/aa/'
+      + StringOfChar('a', 62);
+    MalformedReferencePath := FCacheRoot
+      + '/build-results/refs/sha256/bb/' + StringOfChar('b', 62);
+    OversizedReferencePath := FCacheRoot
+      + '/build-results/refs/sha256/cc/' + StringOfChar('c', 62);
+    WriteTextFile(ReferencePath, ManifestDigest + #10);
+    WriteTextFile(MalformedReferencePath, MalformedDigest + #10);
+    WriteTextFile(OversizedReferencePath, OversizedDigest + #10);
+    SysUtils.DeleteFile(Store.ObjectPath(ArtifactDigest));
+
+    Report := RepairSharedCache(FCacheRoot);
+    Expect<Boolean>(FileExists(ReferencePath)).ToBe(False);
+    Expect<Boolean>(FileExists(MalformedReferencePath)).ToBe(False);
+    Expect<Boolean>(FileExists(OversizedReferencePath)).ToBe(False);
+    Expect<Boolean>(Report.IncompleteEntriesRemoved >= 3).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.
+  TestCorruptManifestCannotHideArtifactReference;
+const
+  FINGERPRINT =
+    'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
+var
+  ArtifactDigest, ManifestDigest, ReferencePath: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  MutationLease, ObjectLease: TObject;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/build-results/objects', FCacheRoot, 'build-results');
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot, 'build-results');
+  ObjectLease := nil;
+  MutationLease := nil;
+  try
+    ArtifactDigest := WriteObject('hidden-artifact', 'compiled-artifact',
+      Store);
+    ManifestDigest := WriteObject('hidden-manifest',
+      'schema = 1'#10
+      + 'fingerprint = "' + FINGERPRINT + '"'#10
+      + 'artifact_digest = "' + ArtifactDigest + '"'#10
+      + 'artifact_kind = "executable"'#10
+      + 'unix_mode = 0'#10, Store);
+    ReferencePath := FCacheRoot + '/build-results/refs/sha256/dd/'
+      + StringOfChar('d', 62);
+    WriteTextFile(ReferencePath, ManifestDigest + #10);
+
+    { Keep the TOML valid while changing its bytes and named artifact. An
+      eviction must distrust this object because it no longer matches the
+      digest persisted by the reference. }
+    WriteTextFile(Store.ObjectPath(ManifestDigest),
+      'schema = 1'#10
+      + 'fingerprint = "' + FINGERPRINT + '"'#10
+      + 'artifact_digest = "sha256:' + StringOfChar('e', 64) + '"'#10
+      + 'artifact_kind = "executable"'#10
+      + 'unix_mode = 0'#10);
+    ObjectLease := Lifecycle.AcquireObject(ArtifactDigest);
+    MutationLease := Lifecycle.AcquireMutation;
+    Lifecycle.DiscardObjectLocked(ArtifactDigest,
+      Store.ObjectPath(ArtifactDigest));
+    MutationLease.Free;
+    MutationLease := nil;
+    ObjectLease.Free;
+    ObjectLease := nil;
+
+    Expect<Boolean>(FileExists(Store.ObjectPath(ArtifactDigest))).ToBe(False);
+    Expect<Boolean>(FileExists(ReferencePath)).ToBe(False);
+  finally
+    MutationLease.Free;
+    ObjectLease.Free;
+    Lifecycle.Free;
+    Store.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.TestEmptyReferenceTreeDoesNotBlockRemoval;
+var
+  Digest: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  MutationLease, ObjectLease: TObject;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/build-results/objects', FCacheRoot, 'build-results');
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot, 'build-results');
+  ObjectLease := nil;
+  MutationLease := nil;
+  try
+    Digest := WriteObject('unreferenced', 'unreferenced-result', Store);
+    ForceDirectories(FCacheRoot + '/build-results/refs/sha256');
+    ObjectLease := Lifecycle.AcquireObject(Digest);
+    MutationLease := Lifecycle.AcquireMutation;
+    Lifecycle.DiscardObjectLocked(Digest, Store.ObjectPath(Digest));
+    MutationLease.Free;
+    MutationLease := nil;
+    ObjectLease.Free;
+    ObjectLease := nil;
+    Expect<Boolean>(FileExists(Store.ObjectPath(Digest))).ToBe(False);
+  finally
+    MutationLease.Free;
+    ObjectLease.Free;
+    Lifecycle.Free;
     Store.Free;
   end;
 end;
@@ -574,6 +711,12 @@ begin
     TestRepairRemovesInvalidProducerLeaseRoot);
   Test('zero-budget repair prunes live and stale build references',
     TestRepairZeroBudgetPrunesBuildReferences);
+  Test('repair removes transitive dangling build references',
+    TestRepairRemovesTransitiveDanglingBuildReferences);
+  Test('corrupt manifests cannot hide artifact references from eviction',
+    TestCorruptManifestCannotHideArtifactReference);
+  Test('an empty reference tree does not block object removal',
+    TestEmptyReferenceTreeDoesNotBlockRemoval);
   {$IFDEF UNIX}
   Test('repair unlinks cache shards without following them',
     TestRepairUnlinksCacheShardsWithoutFollowingThem);
