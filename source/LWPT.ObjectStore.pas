@@ -67,6 +67,9 @@ type
     function Materialize(const ADigest, ADestination,
       ATmpRoot: string; out AFailure:
       TLWPTObjectMaterializeFailure): Boolean; overload;
+    function MaterializeRetained(const ADigest, ADestination,
+      ATmpRoot: string; out AFailure: TLWPTObjectMaterializeFailure;
+      out ALease: TObject): Boolean;
     property Root: string read FRoot;
   end;
 
@@ -548,47 +551,74 @@ function TLWPTImmutableObjectStore.Materialize(const ADigest,
   ADestination, ATmpRoot: string; out AFailure:
   TLWPTObjectMaterializeFailure): Boolean;
 var
+  Lease: TObject;
+begin
+  Lease := nil;
+  try
+    Result := MaterializeRetained(ADigest, ADestination, ATmpRoot,
+      AFailure, Lease);
+  finally
+    Lease.Free;
+  end;
+end;
+
+function TLWPTImmutableObjectStore.MaterializeRetained(const ADigest,
+  ADestination, ATmpRoot: string; out AFailure:
+  TLWPTObjectMaterializeFailure; out ALease: TObject): Boolean;
+var
   Expected, SourcePath, Staged, Actual: string;
   ObjectLease: TObject;
 begin
   Result := False;
   AFailure := omfNone;
+  ALease := nil;
   Expected := CanonicalDigest(ADigest);
   ObjectLease := FCacheLifecycle.AcquireObject(Expected);
   try
-    if not LookupWithObjectGuard(Expected, SourcePath, AFailure) then Exit;
-    ForceDirectories(ATmpRoot);
-    Staged := MakeTmpPath(ATmpRoot, 'cache-object');
-    {$IFDEF OBJECTSTORE_TESTING}
-    if Assigned(ObjectStoreBeforeMaterializeCopyTestHook) then
-      ObjectStoreBeforeMaterializeCopyTestHook(Expected, SourcePath);
-    {$ENDIF}
-    if not CopyFileContent(SourcePath, Staged) then
-    begin
-      if FileExists(Staged) then SysUtils.DeleteFile(Staged);
-      AFailure := omfCopyFailed;
-      Exit;
-    end;
     try
-      {$IFDEF OBJECTSTORE_TESTING}
-      if Assigned(ObjectStoreAfterMaterializeCopyTestHook) then
-        ObjectStoreAfterMaterializeCopyTestHook(Expected, Staged);
-      {$ENDIF}
-      Actual := 'sha256:' + SHA256File(Staged);
-      if Actual <> Expected then
-      begin
-        SysUtils.DeleteFile(Staged);
-        AFailure := omfStagedHashMismatch;
-        Exit;
+      try
+        if not LookupWithObjectGuard(Expected, SourcePath, AFailure) then Exit;
+        ForceDirectories(ATmpRoot);
+        Staged := MakeTmpPath(ATmpRoot, 'cache-object');
+        {$IFDEF OBJECTSTORE_TESTING}
+        if Assigned(ObjectStoreBeforeMaterializeCopyTestHook) then
+          ObjectStoreBeforeMaterializeCopyTestHook(Expected, SourcePath);
+        {$ENDIF}
+        if not CopyFileContent(SourcePath, Staged) then
+        begin
+          if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+          AFailure := omfCopyFailed;
+          Exit;
+        end;
+        try
+          {$IFDEF OBJECTSTORE_TESTING}
+          if Assigned(ObjectStoreAfterMaterializeCopyTestHook) then
+            ObjectStoreAfterMaterializeCopyTestHook(Expected, Staged);
+          {$ENDIF}
+          Actual := 'sha256:' + SHA256File(Staged);
+          if Actual <> Expected then
+          begin
+            SysUtils.DeleteFile(Staged);
+            AFailure := omfStagedHashMismatch;
+            Exit;
+          end;
+          if not AtomicMoveFile(Staged, ADestination) then
+            raise ELWPTObjectStoreError.CreateFmt(
+              'failed to materialize object %s at %s',
+              [Expected, ADestination]);
+          AFailure := omfNone;
+          Result := True;
+        except
+          if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+          raise;
+        end;
+      finally
+        ALease := ObjectLease;
+        ObjectLease := nil;
       end;
-      if not AtomicMoveFile(Staged, ADestination) then
-        raise ELWPTObjectStoreError.CreateFmt(
-          'failed to materialize object %s at %s',
-          [Expected, ADestination]);
-      AFailure := omfNone;
-      Result := True;
     except
-      if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+      ALease.Free;
+      ALease := nil;
       raise;
     end;
   finally

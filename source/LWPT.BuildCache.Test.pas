@@ -49,7 +49,9 @@ type
       const ABudget: string = ''): TProcess;
     function StartMaterializeChild(const AArtifactDigest,
       ADestination, AReadyPath, AReleasePath: string;
-      const AAfterCopy: Boolean = False): TProcess;
+      const AAfterCopy: Boolean = False;
+      const APauseBeforeInvalidation: Boolean = False;
+      const AExpectedReason: string = 'no-result'): TProcess;
   protected
     procedure BeforeAll; override;
     procedure BeforeEach; override;
@@ -57,13 +59,16 @@ type
   public
     procedure SetupTests; override;
     procedure TestStoreAndMaterializePreserveVerifiedResult;
+    procedure TestArtifactKindRoundTripsTomlEscapes;
     procedure TestMaterializeAppliesZeroUnixMode;
     procedure TestMissingResultReportsDeterministicReason;
     procedure TestInvalidFingerprintIsRefused;
     procedure TestCorruptArtifactIsRejected;
+    procedure TestMixedCaseReferenceIsInvalidated;
     procedure TestConcurrentStoresPublishOneMatchingCompleteResult;
     procedure TestConcurrentStoreInvalidatesBeforeLiveMaterializeCompletes;
     procedure TestReaderLosingEvictionRaceReturnsNoResult;
+    procedure TestConcurrentRepublishSurvivesStaleInvalidation;
     procedure TestBudgetRefusalLeavesNoPartialResult;
     procedure TestLowBudgetArtifactEvictionInvalidatesResult;
   end;
@@ -133,6 +138,15 @@ begin
     raise Exception.Create('timed out waiting to resume cache materialize');
 end;
 
+procedure PauseBeforeReferenceInvalidation(const AFingerprint,
+  AManifestDigest: string);
+begin
+  if AFingerprint <> TEST_FINGERPRINT then Exit;
+  WriteSignal(MaterializeReadyPath);
+  if not WaitForSignal(MaterializeReleasePath) then
+    raise Exception.Create('timed out waiting to invalidate cache reference');
+end;
+
 procedure SetBudgetEnvironment(const AValue: string);
 {$IFDEF UNIX}
 var
@@ -188,7 +202,7 @@ var
 begin
   Result := False;
   AExitCode := 0;
-  if (ParamStr(1) = MATERIALIZE_CHILD_SWITCH) and (ParamCount = 8) then
+  if (ParamStr(1) = MATERIALIZE_CHILD_SWITCH) and (ParamCount = 10) then
   begin
     MaterializeArtifactDigest := ParamStr(4);
     MaterializeReadyPath := ParamStr(6);
@@ -197,17 +211,21 @@ begin
       ObjectStoreAfterMaterializeCopyTestHook := PauseMaterializeAtDigest
     else
       ObjectStoreBeforeMaterializeCopyTestHook := PauseMaterializeAtDigest;
+    if ParamStr(9) = 'before-invalidation' then
+      BuildCacheBeforeReferenceInvalidationTestHook :=
+        PauseBeforeReferenceInvalidation;
     Cache := TLWPTBuildCache.Create(ParamStr(2));
     try
       if not Cache.Materialize(ParamStr(3), ParamStr(5),
            ExtractFileDir(ParamStr(5)) + '/tmp', Cached, Reason) then
       begin
         WriteChildText(ParamStr(5) + '.reason', Reason);
-        if Reason <> 'no-result' then AExitCode := 4;
+        if Reason <> ParamStr(10) then AExitCode := 4;
       end;
     finally
       ObjectStoreAfterMaterializeCopyTestHook := nil;
       ObjectStoreBeforeMaterializeCopyTestHook := nil;
+      BuildCacheBeforeReferenceInvalidationTestHook := nil;
       Cache.Free;
     end;
     Exit(True);
@@ -225,7 +243,8 @@ end;
 
 function TBuildCacheContract.StartMaterializeChild(
   const AArtifactDigest, ADestination, AReadyPath,
-  AReleasePath: string; const AAfterCopy: Boolean): TProcess;
+  AReleasePath: string; const AAfterCopy,
+  APauseBeforeInvalidation: Boolean; const AExpectedReason: string): TProcess;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := ParamStr(0);
@@ -238,6 +257,11 @@ begin
   Result.Parameters.Add(AReleasePath);
   if AAfterCopy then Result.Parameters.Add('after-copy')
   else Result.Parameters.Add('before-copy');
+  if APauseBeforeInvalidation then
+    Result.Parameters.Add('before-invalidation')
+  else
+    Result.Parameters.Add('none');
+  Result.Parameters.Add(AExpectedReason);
   Result.Options := [poNoConsole];
   Result.Execute;
 end;
@@ -430,6 +454,28 @@ begin
   end;
 end;
 
+procedure TBuildCacheContract.TestArtifactKindRoundTripsTomlEscapes;
+const
+  EscapedKind = 'exe"cutable\line'#10'next';
+var
+  Cache: TLWPTBuildCache;
+  Cached: TLWPTCachedBuildResult;
+  Destination, Reason: string;
+begin
+  Cache := TLWPTBuildCache.Create(FCacheRoot);
+  try
+    Expect<Boolean>(Cache.Store(TEST_FINGERPRINT, FArtifact,
+      EscapedKind)).ToBe(True);
+    Destination := FScratch + '/escaped-kind/bin/app';
+    Expect<Boolean>(Cache.Materialize(TEST_FINGERPRINT, Destination,
+      FScratch + '/escaped-kind/tmp', Cached, Reason)).ToBe(True);
+    Expect<string>(Reason).ToBe('hit');
+    Expect<string>(Cached.ArtifactKind).ToBe(EscapedKind);
+  finally
+    Cache.Free;
+  end;
+end;
+
 procedure TBuildCacheContract.TestMaterializeAppliesZeroUnixMode;
 var
   Cache: TLWPTBuildCache;
@@ -508,6 +554,30 @@ begin
     Expect<string>(Reason).ToBe('artifact-verification-failed');
     Expect<Boolean>(FileExists(ReferencePath(TEST_FINGERPRINT))).ToBe(False);
     Expect<Boolean>(FileExists(Destination)).ToBe(False);
+  finally
+    Cache.Free;
+  end;
+end;
+
+procedure TBuildCacheContract.TestMixedCaseReferenceIsInvalidated;
+var
+  ArtifactDigest, Destination, ManifestDigest, Reason: string;
+  Cache: TLWPTBuildCache;
+  Cached: TLWPTCachedBuildResult;
+begin
+  Cache := TLWPTBuildCache.Create(FCacheRoot);
+  try
+    Expect<Boolean>(Cache.Store(TEST_FINGERPRINT, FArtifact,
+      TEST_ARTIFACT_KIND)).ToBe(True);
+    ManifestDigest := Trim(ReadBytes(ReferencePath(TEST_FINGERPRINT)));
+    WriteBytes(ReferencePath(TEST_FINGERPRINT), UpperCase(ManifestDigest) + #10);
+    ArtifactDigest := 'sha256:' + SHA256File(FArtifact);
+    Expect<Boolean>(SysUtils.DeleteFile(ObjectPath(ArtifactDigest))).ToBe(True);
+    Destination := FScratch + '/mixed-case/bin/app';
+    Expect<Boolean>(Cache.Materialize(TEST_FINGERPRINT, Destination,
+      FScratch + '/mixed-case/tmp', Cached, Reason)).ToBe(False);
+    Expect<string>(Reason).ToBe('artifact-object-missing');
+    Expect<Boolean>(FileExists(ReferencePath(TEST_FINGERPRINT))).ToBe(False);
   finally
     Cache.Free;
   end;
@@ -683,22 +753,95 @@ begin
   end;
 end;
 
+procedure TBuildCacheContract.
+  TestConcurrentRepublishSurvivesStaleInvalidation;
+var
+  ArtifactDigest, Destination, ManifestDigest, ReadyPath, Reason,
+    ReleasePath: string;
+  Cache: TLWPTBuildCache;
+  Cached: TLWPTCachedBuildResult;
+  Materializer, StoreChild: TProcess;
+begin
+  Cache := TLWPTBuildCache.Create(FCacheRoot);
+  Materializer := nil;
+  StoreChild := nil;
+  ReadyPath := FScratch + '/republish/ready';
+  ReleasePath := FScratch + '/republish/release';
+  Destination := FScratch + '/republish/stale';
+  try
+    Expect<Boolean>(Cache.Store(TEST_FINGERPRINT, FArtifact,
+      TEST_ARTIFACT_KIND)).ToBe(True);
+    ManifestDigest := Trim(ReadBytes(ReferencePath(TEST_FINGERPRINT)));
+    ArtifactDigest := 'sha256:' + SHA256File(FArtifact);
+    Expect<Boolean>(SysUtils.DeleteFile(ObjectPath(ArtifactDigest))).ToBe(True);
+
+    Materializer := StartMaterializeChild(ArtifactDigest, Destination,
+      ReadyPath, ReleasePath, False, True, 'artifact-object-missing');
+    Expect<Boolean>(WaitForSignal(ReadyPath)).ToBe(True);
+    StoreChild := StartStoreChild(FArtifact);
+    Expect<Boolean>(StoreChild.WaitOnExit(1000)).ToBe(False);
+
+    WriteSignal(ReleasePath);
+    Expect<Boolean>(Materializer.WaitOnExit(CHILD_TIMEOUT_MS)).ToBe(True);
+    Expect<Integer>(Materializer.ExitStatus).ToBe(0);
+    Expect<string>(ReadBytes(Destination + '.reason')).ToBe(
+      'artifact-object-missing');
+    Expect<Boolean>(StoreChild.WaitOnExit(CHILD_TIMEOUT_MS)).ToBe(True);
+    Expect<Integer>(StoreChild.ExitStatus).ToBe(0);
+    Expect<string>(Trim(ReadBytes(ReferencePath(TEST_FINGERPRINT)))).ToBe(
+      ManifestDigest);
+
+    Destination := FScratch + '/republish/final';
+    Expect<Boolean>(Cache.Materialize(TEST_FINGERPRINT, Destination,
+      FScratch + '/republish/tmp-final', Cached, Reason)).ToBe(True);
+    Expect<string>(Reason).ToBe('hit');
+    Expect<string>(ReadBytes(Destination)).ToBe(ReadBytes(FArtifact));
+  finally
+    if Assigned(Materializer) and Materializer.Running then
+    begin
+      WriteSignal(ReleasePath);
+      if not Materializer.WaitOnExit(CHILD_TIMEOUT_MS) then
+      begin
+        Materializer.Terminate(1);
+        Materializer.WaitOnExit(2000);
+      end;
+    end;
+    if Assigned(StoreChild) and StoreChild.Running then
+    begin
+      if not StoreChild.WaitOnExit(CHILD_TIMEOUT_MS) then
+      begin
+        StoreChild.Terminate(1);
+        StoreChild.WaitOnExit(2000);
+      end;
+    end;
+    StoreChild.Free;
+    Materializer.Free;
+    Cache.Free;
+  end;
+end;
+
 procedure TBuildCacheContract.SetupTests;
 begin
   Test('store and materialize preserve the verified result',
     TestStoreAndMaterializePreserveVerifiedResult);
+  Test('artifact kind round-trips TOML escapes',
+    TestArtifactKindRoundTripsTomlEscapes);
   Test('materialize applies a recorded zero Unix mode',
     TestMaterializeAppliesZeroUnixMode);
   Test('missing results report a deterministic reason',
     TestMissingResultReportsDeterministicReason);
   Test('invalid fingerprints are refused', TestInvalidFingerprintIsRefused);
   Test('corrupt artifacts are rejected', TestCorruptArtifactIsRejected);
+  Test('mixed-case references are invalidated',
+    TestMixedCaseReferenceIsInvalidated);
   Test('concurrent stores publish one matching complete result',
     TestConcurrentStoresPublishOneMatchingCompleteResult);
   Test('a concurrent store invalidates before a live materialize completes',
     TestConcurrentStoreInvalidatesBeforeLiveMaterializeCompletes);
   Test('a reader losing the eviction race reports no result',
     TestReaderLosingEvictionRaceReturnsNoResult);
+  Test('a concurrent republish survives stale invalidation',
+    TestConcurrentRepublishSurvivesStaleInvalidation);
   Test('a budget refusal leaves no partial logical result',
     TestBudgetRefusalLeavesNoPartialResult);
   Test('low-budget artifact eviction invalidates its logical result',

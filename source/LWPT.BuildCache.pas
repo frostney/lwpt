@@ -52,6 +52,16 @@ type
     property Root: string read FRoot;
   end;
 
+{$IFDEF OBJECTSTORE_TESTING}
+type
+  TLWPTBuildCacheInvalidationHook = procedure(const AFingerprint,
+    AManifestDigest: string);
+
+var
+  BuildCacheBeforeReferenceInvalidationTestHook:
+    TLWPTBuildCacheInvalidationHook;
+{$ENDIF}
+
 function BuildResultCacheRoot(const ACacheRoot: string): string;
 function BuildArtifactUnixMode(const APath: string): Integer;
 
@@ -183,10 +193,16 @@ var
   MutationLease: TObject;
 begin
   Result := False;
+  {$IFDEF OBJECTSTORE_TESTING}
+  if Assigned(BuildCacheBeforeReferenceInvalidationTestHook) then
+    BuildCacheBeforeReferenceInvalidationTestHook(AFingerprint,
+      AManifestDigest);
+  {$ENDIF}
   MutationLease := FCacheLifecycle.AcquireMutation;
   try
     if ReadSmallTextFile(ReferencePath(AFingerprint), Current)
-       and (Trim(Current) = AManifestDigest) then
+       and (CanonicalBuildCacheDigest(Trim(Current)) =
+         CanonicalBuildCacheDigest(AManifestDigest)) then
     begin
       if not SysUtils.DeleteFile(ReferencePath(AFingerprint)) then
       begin
@@ -209,6 +225,7 @@ function TLWPTBuildCache.Materialize(const AFingerprint, ADestination,
 var
   ManifestDigest, ManifestPath, ManifestText, ReferenceText: string;
   ObjectFailure: TLWPTObjectMaterializeFailure;
+  ObjectLease: TObject;
 begin
   Result := False;
   AResult := Default(TLWPTCachedBuildResult);
@@ -223,16 +240,22 @@ begin
   end;
   ForceDirectories(ASessionTemporaryRoot);
   ManifestPath := MakeTmpPath(ASessionTemporaryRoot, 'result-manifest');
-  if not FObjects.Materialize(ManifestDigest, ManifestPath,
-       ASessionTemporaryRoot, ObjectFailure) then
+  ObjectLease := nil;
+  if not FObjects.MaterializeRetained(ManifestDigest, ManifestPath,
+       ASessionTemporaryRoot, ObjectFailure, ObjectLease) then
   begin
-    AReason := 'result-manifest-'
-      + ObjectMaterializeFailureName(ObjectFailure);
-    if ObjectFailure in [omfObjectMissing, omfVerificationFailed] then
-      if not InvalidateReferenceIfCurrent(AFingerprint,
-           ManifestDigest) then AReason := 'no-result';
+    try
+      AReason := 'result-manifest-'
+        + ObjectMaterializeFailureName(ObjectFailure);
+      if ObjectFailure in [omfObjectMissing, omfVerificationFailed] then
+        if not InvalidateReferenceIfCurrent(AFingerprint,
+             ManifestDigest) then AReason := 'no-result';
+    finally
+      ObjectLease.Free;
+    end;
     Exit;
   end;
+  ObjectLease.Free;
   try
     if not ReadSmallTextFile(ManifestPath, ManifestText)
        or not ParseBuildResultManifest(ManifestText, AResult)
@@ -247,15 +270,21 @@ begin
   finally
     SysUtils.DeleteFile(ManifestPath);
   end;
-  if not FObjects.Materialize(AResult.ArtifactDigest, ADestination,
-    ASessionTemporaryRoot, ObjectFailure) then
+  ObjectLease := nil;
+  if not FObjects.MaterializeRetained(AResult.ArtifactDigest, ADestination,
+    ASessionTemporaryRoot, ObjectFailure, ObjectLease) then
   begin
-    AReason := 'artifact-' + ObjectMaterializeFailureName(ObjectFailure);
-    if ObjectFailure in [omfObjectMissing, omfVerificationFailed] then
-      if not InvalidateReferenceIfCurrent(AFingerprint,
-           ManifestDigest) then AReason := 'no-result';
+    try
+      AReason := 'artifact-' + ObjectMaterializeFailureName(ObjectFailure);
+      if ObjectFailure in [omfObjectMissing, omfVerificationFailed] then
+        if not InvalidateReferenceIfCurrent(AFingerprint,
+             ManifestDigest) then AReason := 'no-result';
+    finally
+      ObjectLease.Free;
+    end;
     Exit;
   end;
+  ObjectLease.Free;
   if not ApplyUnixMode(ADestination, AResult.UnixMode) then
   begin
     SysUtils.DeleteFile(ADestination);

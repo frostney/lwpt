@@ -150,7 +150,7 @@ begin
   Result.Add('schema = ' + IntToStr(AResult.SchemaVersion));
   Result.Add('fingerprint = "' + AResult.Fingerprint + '"');
   Result.Add('artifact_digest = "' + AResult.ArtifactDigest + '"');
-  Result.Add('artifact_kind = "' + AResult.ArtifactKind + '"');
+  Result.Add('artifact_kind = "' + TomlEscape(AResult.ArtifactKind) + '"');
   Result.Add('unix_mode = ' + IntToStr(AResult.UnixMode));
 end;
 
