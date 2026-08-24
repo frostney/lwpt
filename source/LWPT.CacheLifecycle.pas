@@ -58,10 +58,14 @@ function RepairSharedCache(const ACacheRoot: string):
 
 implementation
 
-{$IFDEF MSWINDOWS}
 uses
-  Windows;
-{$ENDIF}
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
+  LWPT.BuildResultManifest;
 
 const
   CACHE_LIFECYCLE_NAMESPACE = 'lifecycle';
@@ -196,14 +200,19 @@ var
 begin
   Result := False;
   AText := '';
-  if not FileExists(APath) then Exit;
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
-    if Stream.Size > MAX_CONTROL_BYTES then Exit;
-    SetLength(Bytes, Stream.Size);
-    if Stream.Size > 0 then Stream.ReadBuffer(Bytes[0], Stream.Size);
-  finally
-    Stream.Free;
+    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      if Stream.Size > MAX_CONTROL_BYTES then Exit;
+      SetLength(Bytes, Stream.Size);
+      if Stream.Size > 0 then Stream.ReadBuffer(Bytes[0], Stream.Size);
+    finally
+      Stream.Free;
+    end;
+  except
+    on E: EFOpenError do Exit;
+    on E: EInOutError do Exit;
+    on E: EReadError do Exit;
   end;
   SetLength(AText, Length(Bytes));
   if Length(Bytes) > 0 then Move(Bytes[0], AText[1], Length(Bytes));
@@ -482,51 +491,208 @@ begin
     + BUILD_NAMESPACE + '/refs/sha256';
 end;
 
-function ObjectsContainDigest(const AObjects: TLWPTCacheObjectArray;
-  const ANamespace, ADigest: string): Boolean;
+function FindObjectPath(const AObjects: TLWPTCacheObjectArray;
+  const ANamespace, ADigest: string; out APath: string): Boolean;
 var
   Index: Integer;
 begin
+  APath := '';
   for Index := 0 to High(AObjects) do
     if (AObjects[Index].Namespace = ANamespace)
-       and (AObjects[Index].Digest = ADigest) then Exit(True);
+       and (AObjects[Index].Digest = ADigest) then
+    begin
+      APath := AObjects[Index].Path;
+      Exit(True);
+    end;
   Result := False;
 end;
 
-procedure RemoveBuildReferencesForDigest(const ACacheRoot,
-  ADigest: string);
+function BuildReferenceFingerprint(const APrefix,
+  AEntry: string): string;
 var
-  EntryPath, PrefixPath, ReferenceText, Root: string;
-  EntrySearch, PrefixSearch: TSearchRec;
+  Hex: string;
 begin
+  Hex := APrefix + AEntry;
+  if not IsLowerHex(Hex) then Exit('');
+  Result := 'sha256:' + Hex;
+end;
+
+function BuildObjectPath(const ACacheRoot, ADigest: string): string;
+var
+  Hex: string;
+begin
+  Hex := Copy(ADigest, 8, MaxInt);
+  Result := IncludeTrailingPathDelimiter(ACacheRoot)
+    + BUILD_NAMESPACE + '/objects/sha256/' + Copy(Hex, 1, 2)
+    + '/' + Copy(Hex, 3, MaxInt);
+end;
+
+function ReadCanonicalBuildReference(const APath: string;
+  out ADigest: string): Boolean;
+var
+  Text: string;
+begin
+  ADigest := '';
+  if not ReadSmallTextFile(APath, Text) then Exit(False);
+  ADigest := CanonicalBuildCacheDigest(Trim(Text));
+  Result := (ADigest <> '') and (Trim(Text) = ADigest);
+end;
+
+function FindFirstMeansNoEntry(const AResult: Integer): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := AResult in [Windows.ERROR_FILE_NOT_FOUND,
+    Windows.ERROR_PATH_NOT_FOUND, Windows.ERROR_NO_MORE_FILES];
+  {$ELSE}
+  Result := (AResult = -1) and (FpGetErrNo = ESysENOENT);
+  {$ENDIF}
+end;
+
+function FindNextFinished(var ASearch: TSearchRec;
+  out AResult: Integer): Boolean;
+begin
+  AResult := FindNext(ASearch);
+  Result := AResult <> 0;
+end;
+
+function FindNextMeansEnd(const AResult: Integer): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := AResult = Windows.ERROR_NO_MORE_FILES;
+  {$ELSE}
+  { FPC 3.2.2 collapses both end-of-directory and errors to -1 on POSIX. }
+  Result := AResult = -1;
+  {$ENDIF}
+end;
+
+function CacheEntryExists(const APath: string): Boolean;
+var
+  FindResult: Integer;
+  Search: TSearchRec;
+begin
+  FindResult := FindFirst(APath, faAnyFile or faSymLink, Search);
+  Result := FindResult = 0;
+  if Result then
+    SysUtils.FindClose(Search)
+  else if not FindFirstMeansNoEntry(FindResult) then
+    raise ELWPTCacheLifecycleError.CreateFmt(
+      'failed to verify removal of build-cache reference %s', [APath]);
+end;
+
+procedure RemoveBuildReferenceEntry(const APath: string;
+  const AAttributes: LongInt);
+begin
+  if ((AAttributes and faDirectory) <> 0)
+     or IsDirSymlinkOrJunction(APath) then
+    WipeDir(APath)
+  else
+    SysUtils.DeleteFile(APath);
+  if CacheEntryExists(APath) then
+    raise ELWPTCacheLifecycleError.CreateFmt(
+      'failed to remove invalid build-cache reference %s', [APath]);
+end;
+
+function ReferenceNamesBuildObject(const ACacheRoot, AReferencePath,
+  AReferenceFingerprint, AObjectDigest: string;
+  out AMalformed: Boolean): Boolean;
+var
+  Manifest: TLWPTCachedBuildResult;
+  ManifestDigest, ManifestPath: string;
+begin
+  Result := False;
+  AMalformed := False;
+  if not ReadCanonicalBuildReference(AReferencePath, ManifestDigest) then
+  begin
+    AMalformed := True;
+    Exit;
+  end;
+  if ManifestDigest = AObjectDigest then Exit(True);
+  ManifestPath := BuildObjectPath(ACacheRoot, ManifestDigest);
+  if not ReadVerifiedBuildResultManifest(ManifestPath, ManifestDigest,
+       Manifest) then
+  begin
+    AMalformed := True;
+    Exit;
+  end;
+  if Manifest.Fingerprint <> AReferenceFingerprint then
+  begin
+    AMalformed := True;
+    Exit;
+  end;
+  Result := Manifest.ArtifactDigest = AObjectDigest;
+end;
+
+function RemoveBuildReferencesForDigest(const ACacheRoot,
+  ADigest: string): Boolean;
+var
+  EntryPath, Fingerprint, PrefixPath, Root: string;
+  EntrySearch, PrefixSearch: TSearchRec;
+  FindResult: Integer;
+  Malformed, RemoveEntry: Boolean;
+begin
+  Result := True;
   Root := BuildReferenceSHA256Root(ACacheRoot);
-  if IsDirSymlinkOrJunction(Root) then Exit;
-  if FindFirst(IncludeTrailingPathDelimiter(Root) + '*',
-       faAnyFile or faSymLink, PrefixSearch) <> 0 then Exit;
+  if IsDirSymlinkOrJunction(Root) then Exit(False);
+  FindResult := FindFirst(IncludeTrailingPathDelimiter(Root) + '*',
+    faAnyFile or faSymLink, PrefixSearch);
+  if FindResult <> 0 then
+  begin
+    if not FindFirstMeansNoEntry(FindResult) then
+      Result := False;
+    Exit;
+  end;
   try
     repeat
       if (PrefixSearch.Name = '.') or (PrefixSearch.Name = '..')
          or ((PrefixSearch.Attr and faDirectory) = 0)
-         or ((PrefixSearch.Attr and faSymLink) <> 0) then Continue;
+         or ((PrefixSearch.Attr and faSymLink) <> 0) then
+      begin
+        if (PrefixSearch.Name <> '.') and (PrefixSearch.Name <> '..') then
+          Result := False;
+        Continue;
+      end;
       PrefixPath := IncludeTrailingPathDelimiter(Root) + PrefixSearch.Name;
-      if IsDirSymlinkOrJunction(PrefixPath) then Continue;
-      if FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
-           faAnyFile or faSymLink, EntrySearch) <> 0 then Continue;
+      if IsDirSymlinkOrJunction(PrefixPath) then
+      begin
+        Result := False;
+        Continue;
+      end;
+      FindResult := FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
+        faAnyFile or faSymLink, EntrySearch);
+      if FindResult <> 0 then
+      begin
+        if not FindFirstMeansNoEntry(FindResult) then Result := False;
+        Continue;
+      end;
       try
         repeat
           if (EntrySearch.Name = '.') or (EntrySearch.Name = '..')
              or ((EntrySearch.Attr and faDirectory) <> 0)
-             or ((EntrySearch.Attr and faSymLink) <> 0) then Continue;
+             or ((EntrySearch.Attr and faSymLink) <> 0) then
+          begin
+            if (EntrySearch.Name <> '.') and (EntrySearch.Name <> '..') then
+              Result := False;
+            Continue;
+          end;
           EntryPath := IncludeTrailingPathDelimiter(PrefixPath)
             + EntrySearch.Name;
-          if ReadSmallTextFile(EntryPath, ReferenceText)
-             and (LowerCase(Trim(ReferenceText)) = ADigest) then
-            SysUtils.DeleteFile(EntryPath);
-        until FindNext(EntrySearch) <> 0;
+          Fingerprint := BuildReferenceFingerprint(PrefixSearch.Name,
+            EntrySearch.Name);
+          RemoveEntry := ReferenceNamesBuildObject(ACacheRoot, EntryPath,
+            Fingerprint, ADigest, Malformed);
+          if RemoveEntry or Malformed then
+            try
+              RemoveBuildReferenceEntry(EntryPath, EntrySearch.Attr);
+            except
+              on ELWPTCacheLifecycleError do Result := False;
+            end;
+        until FindNextFinished(EntrySearch, FindResult);
+        if not FindNextMeansEnd(FindResult) then Result := False;
       finally
         SysUtils.FindClose(EntrySearch);
       end;
-    until FindNext(PrefixSearch) <> 0;
+    until FindNextFinished(PrefixSearch, FindResult);
+    if not FindNextMeansEnd(FindResult) then Result := False;
   finally
     SysUtils.FindClose(PrefixSearch);
   end;
@@ -536,8 +702,11 @@ procedure RepairBuildReferences(const ACacheRoot: string;
   const AObjects: TLWPTCacheObjectArray;
   var AReport: TLWPTCacheRepairReport);
 var
-  Digest, EntryPath, Hex, PrefixPath, ReferenceText, Root: string;
+  ArtifactPath, Digest, EntryPath, Fingerprint, Hex, ManifestPath,
+    PrefixPath, Root: string;
   EntrySearch, PrefixSearch: TSearchRec;
+  FindResult: Integer;
+  Manifest: TLWPTCachedBuildResult;
   RemoveEntry: Boolean;
 begin
   Root := BuildReferenceSHA256Root(ACacheRoot);
@@ -547,8 +716,15 @@ begin
     Inc(AReport.IncompleteEntriesRemoved);
     Exit;
   end;
-  if FindFirst(IncludeTrailingPathDelimiter(Root) + '*',
-       faAnyFile or faSymLink, PrefixSearch) <> 0 then Exit;
+  FindResult := FindFirst(IncludeTrailingPathDelimiter(Root) + '*',
+    faAnyFile or faSymLink, PrefixSearch);
+  if FindResult <> 0 then
+  begin
+    if not FindFirstMeansNoEntry(FindResult) then
+      raise ELWPTCacheLifecycleError.CreateFmt(
+        'failed to enumerate build-cache references at %s', [Root]);
+    Exit;
+  end;
   try
     repeat
       if (PrefixSearch.Name = '.') or (PrefixSearch.Name = '..') then
@@ -559,46 +735,60 @@ begin
          or IsDirSymlinkOrJunction(PrefixPath)
          or (Length(PrefixSearch.Name) <> 2) then
       begin
-        if ((PrefixSearch.Attr and faDirectory) <> 0)
-           or ((PrefixSearch.Attr and faSymLink) <> 0) then WipeDir(PrefixPath)
-        else SysUtils.DeleteFile(PrefixPath);
+        RemoveBuildReferenceEntry(PrefixPath, PrefixSearch.Attr);
         Inc(AReport.IncompleteEntriesRemoved);
         Continue;
       end;
-      if FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
-           faAnyFile or faSymLink, EntrySearch) <> 0 then Continue;
+      FindResult := FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
+        faAnyFile or faSymLink, EntrySearch);
+      if FindResult <> 0 then
+      begin
+        if not FindFirstMeansNoEntry(FindResult) then
+          raise ELWPTCacheLifecycleError.CreateFmt(
+            'failed to enumerate build-cache references at %s',
+            [PrefixPath]);
+        Continue;
+      end;
       try
         repeat
           if (EntrySearch.Name = '.') or (EntrySearch.Name = '..') then
             Continue;
           EntryPath := IncludeTrailingPathDelimiter(PrefixPath)
             + EntrySearch.Name;
-          Hex := LowerCase(PrefixSearch.Name + EntrySearch.Name);
+          Hex := PrefixSearch.Name + EntrySearch.Name;
           RemoveEntry := ((EntrySearch.Attr and faDirectory) <> 0)
             or ((EntrySearch.Attr and faSymLink) <> 0)
             or not IsLowerHex(Hex)
-            or not ReadSmallTextFile(EntryPath, ReferenceText);
+            or not ReadCanonicalBuildReference(EntryPath, Digest);
           if not RemoveEntry then
           begin
-            Digest := Trim(ReferenceText);
-            RemoveEntry := not IsLowerHex(Copy(Digest, 8, MaxInt))
-              or (Copy(Digest, 1, 7) <> 'sha256:')
-              or not ObjectsContainDigest(AObjects, BUILD_NAMESPACE, Digest);
+            Fingerprint := BuildReferenceFingerprint(PrefixSearch.Name,
+              EntrySearch.Name);
+            RemoveEntry := not FindObjectPath(AObjects, BUILD_NAMESPACE,
+              Digest, ManifestPath)
+              or not ReadVerifiedBuildResultManifest(ManifestPath, Digest,
+                Manifest)
+              or (Manifest.Fingerprint <> Fingerprint)
+              or not FindObjectPath(AObjects, BUILD_NAMESPACE,
+                Manifest.ArtifactDigest, ArtifactPath);
           end;
           if RemoveEntry then
           begin
-            if ((EntrySearch.Attr and faDirectory) <> 0)
-               or ((EntrySearch.Attr and faSymLink) <> 0) then
-              WipeDir(EntryPath)
-            else
-              SysUtils.DeleteFile(EntryPath);
+            RemoveBuildReferenceEntry(EntryPath, EntrySearch.Attr);
             Inc(AReport.IncompleteEntriesRemoved);
           end;
-        until FindNext(EntrySearch) <> 0;
+        until FindNextFinished(EntrySearch, FindResult);
+        if not FindNextMeansEnd(FindResult) then
+          raise ELWPTCacheLifecycleError.CreateFmt(
+            'failed to enumerate build-cache references at %s',
+            [PrefixPath]);
       finally
         SysUtils.FindClose(EntrySearch);
       end;
-    until FindNext(PrefixSearch) <> 0;
+    until FindNextFinished(PrefixSearch, FindResult);
+    if not FindNextMeansEnd(FindResult) then
+      raise ELWPTCacheLifecycleError.CreateFmt(
+        'failed to enumerate build-cache references at %s', [Root]);
   finally
     SysUtils.FindClose(PrefixSearch);
   end;
@@ -609,11 +799,12 @@ function RemoveObject(const ACacheRoot: string;
 var
   Index: Integer;
 begin
+  if (AObject.Namespace = BUILD_NAMESPACE)
+     and not RemoveBuildReferencesForDigest(ACacheRoot,
+       AObject.Digest) then Exit(False);
   Result := not FileExists(AObject.Path);
   if not Result then Result := SysUtils.DeleteFile(AObject.Path);
   if not Result then Exit;
-  if AObject.Namespace = BUILD_NAMESPACE then
-    RemoveBuildReferencesForDigest(ACacheRoot, AObject.Digest);
   SysUtils.DeleteFile(ManifestPath(ACacheRoot, AObject.Namespace,
     AObject.Digest));
   Index := AEntries.IndexOfName(ObjectKey(AObject.Namespace,

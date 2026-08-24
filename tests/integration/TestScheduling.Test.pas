@@ -23,6 +23,7 @@ uses
 
   LWPT.BuildSession,
   LWPT.CacheLifecycle,
+  LWPT.Command.Testing,
   LWPT.Core,
   LWPT.ObjectStore,
   LWPT.ProcessTree,
@@ -154,7 +155,9 @@ type
     procedure PrepareTestFixtures(const ASelectors,
       AReadyMarkers: array of string);
     function SessionLogOccurrenceCount(const ARun: TLwptResult;
-      const ANeedle: string): Integer;
+      const ANeedle: string): Integer; overload;
+    function SessionLogOccurrenceCount(const ARun: TLwptResult;
+      const ANeedle: string; out AMatchingLines: string): Integer; overload;
     procedure AssertPreparedFixturesUsed(const ARun: TLwptResult;
       const AExpectedCount: Integer);
     function RunTests(const AArgs: array of string): TLwptResult;
@@ -174,6 +177,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestDefaultJobsOverlap;
+    procedure TestCacheUnavailableDiagnosticIsBoundedSingleLine;
     procedure TestJobsOneRunsInSourceOrder;
     procedure TestBailZeroOverridesManifestAndRunsAll;
     procedure TestCompileFailureCountsTowardBail;
@@ -559,12 +563,11 @@ begin
       Fail('fixture setup exceeded its parent-owned '
         + UIntToStr(SetupTimeoutMilliseconds) + ' ms deadline');
     Expect<Integer>(SetupResult.ExitCode).ToBe(0);
+    { Ready markers prove bounded setup completion. Each caller immediately
+      proves exact direct-cache reuse and rejects every compilation path. }
     for Index := 0 to High(AReadyMarkers) do
       Expect<Boolean>(FileExists(FScratch + '/control/'
         + AReadyMarkers[Index] + FixtureSetupReadySuffix)).ToBe(True);
-    if SessionLogOccurrenceCount(SetupResult, 'cache stored: sha256:')
-       <> Length(ASelectors) then
-      Fail('fixture setup did not materialize every selected executable');
   finally
     RecursiveDelete(FScratch + '/control');
     ForceDirectories(FScratch + '/control');
@@ -573,15 +576,26 @@ end;
 
 function TTestScheduling.SessionLogOccurrenceCount(const ARun: TLwptResult;
   const ANeedle: string): Integer;
+var
+  MatchingLines: string;
+begin
+  Result := SessionLogOccurrenceCount(ARun, ANeedle, MatchingLines);
+end;
+
+function TTestScheduling.SessionLogOccurrenceCount(const ARun: TLwptResult;
+  const ANeedle: string; out AMatchingLines: string): Integer;
 const
   SessionReferencePrefix = ' (';
   TestSessionPrefix = 'test session: ';
 var
-  LogDirectory, LogPath, SessionReference: string;
+  LineIndex: Integer;
+  LogContent, LogDirectory, LogPath, SessionReference: string;
   LogSearch: TSearchRec;
+  LogLines: TStringList;
   ReferenceEnd, ReferenceStart, SessionStart: Integer;
 begin
   Result := 0;
+  AMatchingLines := '';
   SessionStart := Pos(TestSessionPrefix, ARun.Stdout);
   if SessionStart = 0 then Fail('test run did not report its session');
   ReferenceStart := Pos(SessionReferencePrefix, ARun.Stdout, SessionStart);
@@ -602,7 +616,22 @@ begin
       if (LogSearch.Attr and faDirectory) = 0 then
       begin
         LogPath := IncludeTrailingPathDelimiter(LogDirectory) + LogSearch.Name;
-        Inc(Result, OccurrenceCount(ANeedle, ReadBinaryFile(LogPath)));
+        LogContent := ReadBinaryFile(LogPath);
+        Inc(Result, OccurrenceCount(ANeedle, LogContent));
+        LogLines := TStringList.Create;
+        try
+          LogLines.Text := LogContent;
+          for LineIndex := 0 to LogLines.Count - 1 do
+            if Pos(ANeedle, LogLines[LineIndex]) > 0 then
+            begin
+              if AMatchingLines <> '' then AMatchingLines :=
+                AMatchingLines + ' | ';
+              AMatchingLines := AMatchingLines + LogSearch.Name + ': '
+                + LogLines[LineIndex];
+            end;
+        finally
+          LogLines.Free;
+        end;
       end;
     until FindNext(LogSearch) <> 0;
   finally
@@ -615,6 +644,7 @@ procedure TTestScheduling.AssertPreparedFixturesUsed(const ARun: TLwptResult;
 var
   CacheBypassCount, CacheCorruptionCount, CacheHitCount, CacheMissCount,
     CacheStoreCount, CacheTakeoverHitCount, CacheWaitHitCount: Integer;
+  CacheBypassLines, DiagnosticSuffix: string;
 begin
   CacheHitCount := SessionLogOccurrenceCount(ARun, 'cache hit: sha256:');
   CacheWaitHitCount := SessionLogOccurrenceCount(ARun,
@@ -624,8 +654,12 @@ begin
   CacheMissCount := SessionLogOccurrenceCount(ARun, 'cache miss:');
   CacheCorruptionCount := SessionLogOccurrenceCount(ARun,
     'cache corruption:');
-  CacheBypassCount := SessionLogOccurrenceCount(ARun, 'cache bypass:');
+  CacheBypassCount := SessionLogOccurrenceCount(ARun, 'cache bypass:',
+    CacheBypassLines);
   CacheStoreCount := SessionLogOccurrenceCount(ARun, 'cache stored:');
+  DiagnosticSuffix := '';
+  if CacheBypassLines <> '' then
+    DiagnosticSuffix := '; diagnostics: ' + CacheBypassLines;
   if (CacheHitCount <> AExpectedCount) or (CacheWaitHitCount <> 0)
      or (CacheTakeoverHitCount <> 0) or (CacheMissCount <> 0)
      or (CacheCorruptionCount <> 0) or (CacheBypassCount <> 0)
@@ -637,7 +671,45 @@ begin
       + IntToStr(CacheMissCount) + ', corruptions '
       + IntToStr(CacheCorruptionCount) + ', bypasses '
       + IntToStr(CacheBypassCount) + ', stores '
-      + IntToStr(CacheStoreCount));
+      + IntToStr(CacheStoreCount) + DiagnosticSuffix);
+end;
+
+procedure TTestScheduling.TestCacheUnavailableDiagnosticIsBoundedSingleLine;
+var
+  Diagnostic, ErrorMessage, LogDirectory: string;
+  Raised: Boolean;
+  RunResult: TLwptResult;
+begin
+  Diagnostic := CacheUnavailableDiagnostic('EProbe',
+    'first'#13#10'second'#9'third'#0'fourth');
+  Expect<string>(Diagnostic).ToBe(
+    'cache bypass: unavailable (EProbe: first  second third fourth)');
+  Diagnostic := CacheUnavailableDiagnostic(StringOfChar('C', 80),
+    StringOfChar('m', 300));
+  Expect<string>(Diagnostic).ToBe('cache bypass: unavailable ('
+    + StringOfChar('C', 64) + '...: ' + StringOfChar('m', 256) + '...)');
+
+  LogDirectory := FScratch + '/.lwpt/sessions/s-diagnostic/logs';
+  ForceDirectories(LogDirectory);
+  WriteTextFile(LogDirectory + '/fixture.log',
+    'cache bypass: unavailable (EProbe: rendered detail)' + LineEnding);
+  RunResult := Default(TLwptResult);
+  RunResult.Stdout := 'test session: s-diagnostic '
+    + '(.lwpt/sessions/s-diagnostic)' + LineEnding;
+  Raised := False;
+  ErrorMessage := '';
+  try
+    AssertPreparedFixturesUsed(RunResult, 0);
+  except
+    on E: ETestAssertionError do
+    begin
+      Raised := True;
+      ErrorMessage := E.Message;
+    end;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(Pos('diagnostics: fixture.log: cache bypass: unavailable '
+    + '(EProbe: rendered detail)', ErrorMessage) > 0).ToBe(True);
 end;
 
 function TTestScheduling.RunTests(const AArgs: array of string): TLwptResult;
@@ -2646,6 +2718,8 @@ end;
 procedure TTestScheduling.SetupTests;
 begin
   Test('default jobs overlap', TestDefaultJobsOverlap);
+  Test('cache unavailable diagnostic is bounded and single-line',
+    TestCacheUnavailableDiagnosticIsBoundedSingleLine);
   Test('--jobs=1 runs in source order', TestJobsOneRunsInSourceOrder);
   Test('--bail=0 overrides manifest and runs all',
     TestBailZeroOverridesManifestAndRunsAll);
