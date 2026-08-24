@@ -50,6 +50,7 @@ type
     procedure TestRepairRemovesTransitiveDanglingBuildReferences;
     procedure TestCorruptManifestCannotHideArtifactReference;
     procedure TestEmptyReferenceTreeDoesNotBlockRemoval;
+    procedure TestRepairFailsClosedWhenReferenceCannotBeDeleted;
     {$IFDEF UNIX}
     procedure TestRepairUnlinksCacheShardsWithoutFollowingThem;
     {$ENDIF}
@@ -327,6 +328,55 @@ begin
     Lifecycle.Free;
     Store.Free;
   end;
+end;
+
+procedure TCacheLifecycleContract.
+  TestRepairFailsClosedWhenReferenceCannotBeDeleted;
+var
+  PrefixPath, ReferencePath: string;
+  Refused: Boolean;
+  Report: TLWPTCacheRepairReport;
+  {$IFDEF MSWINDOWS}
+  ReferenceHandle: THandle;
+  {$ENDIF}
+begin
+  PrefixPath := FCacheRoot + '/build-results/refs/sha256/ff';
+  ReferencePath := PrefixPath + '/' + StringOfChar('f', 62);
+  WriteTextFile(ReferencePath, 'not-a-digest');
+  Refused := False;
+  {$IFDEF UNIX}
+  if FpChmod(PChar(PrefixPath), &555) <> 0 then
+    raise Exception.Create('failed to protect build-reference fixture');
+  try
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  ReferenceHandle := Windows.CreateFileW(
+    PWideChar(UnicodeString(ReferencePath)), Windows.GENERIC_READ,
+    Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE, nil,
+    Windows.OPEN_EXISTING, Windows.FILE_ATTRIBUTE_NORMAL, 0);
+  if ReferenceHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
+    raise Exception.Create('failed to protect build-reference fixture');
+  try
+  {$ENDIF}
+    try
+      RepairSharedCache(FCacheRoot);
+    except
+      on ELWPTCacheLifecycleError do Refused := True;
+    end;
+    Expect<Boolean>(Refused).ToBe(True);
+    Expect<Boolean>(FileExists(ReferencePath)).ToBe(True);
+  finally
+    {$IFDEF UNIX}
+    if FpChmod(PChar(PrefixPath), &755) <> 0 then
+      raise Exception.Create('failed to restore build-reference fixture');
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    Windows.CloseHandle(ReferenceHandle);
+    {$ENDIF}
+  end;
+  Report := RepairSharedCache(FCacheRoot);
+  Expect<Boolean>(FileExists(ReferencePath)).ToBe(False);
+  Expect<Boolean>(Report.IncompleteEntriesRemoved >= 1).ToBe(True);
 end;
 
 {$IFDEF UNIX}
@@ -732,6 +782,8 @@ begin
     TestCorruptManifestCannotHideArtifactReference);
   Test('an empty reference tree does not block object removal',
     TestEmptyReferenceTreeDoesNotBlockRemoval);
+  Test('repair fails closed when a reference cannot be deleted',
+    TestRepairFailsClosedWhenReferenceCannotBeDeleted);
   {$IFDEF UNIX}
   Test('repair unlinks cache shards without following them',
     TestRepairUnlinksCacheShardsWithoutFollowingThem);

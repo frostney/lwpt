@@ -547,6 +547,27 @@ begin
   {$ENDIF}
 end;
 
+function CacheEntryExists(const APath: string): Boolean;
+var
+  Search: TSearchRec;
+begin
+  Result := FindFirst(APath, faAnyFile or faSymLink, Search) = 0;
+  if Result then SysUtils.FindClose(Search);
+end;
+
+procedure RemoveBuildReferenceEntry(const APath: string;
+  const AAttributes: LongInt);
+begin
+  if ((AAttributes and faDirectory) <> 0)
+     or IsDirSymlinkOrJunction(APath) then
+    WipeDir(APath)
+  else
+    SysUtils.DeleteFile(APath);
+  if CacheEntryExists(APath) then
+    raise ELWPTCacheLifecycleError.CreateFmt(
+      'failed to remove invalid build-cache reference %s', [APath]);
+end;
+
 function ReferenceNamesBuildObject(const ACacheRoot, AReferencePath,
   AReferenceFingerprint, AObjectDigest: string;
   out AMalformed: Boolean): Boolean;
@@ -678,9 +699,7 @@ begin
          or IsDirSymlinkOrJunction(PrefixPath)
          or (Length(PrefixSearch.Name) <> 2) then
       begin
-        if ((PrefixSearch.Attr and faDirectory) <> 0)
-           or ((PrefixSearch.Attr and faSymLink) <> 0) then WipeDir(PrefixPath)
-        else SysUtils.DeleteFile(PrefixPath);
+        RemoveBuildReferenceEntry(PrefixPath, PrefixSearch.Attr);
         Inc(AReport.IncompleteEntriesRemoved);
         Continue;
       end;
@@ -711,11 +730,7 @@ begin
           end;
           if RemoveEntry then
           begin
-            if ((EntrySearch.Attr and faDirectory) <> 0)
-               or ((EntrySearch.Attr and faSymLink) <> 0) then
-              WipeDir(EntryPath)
-            else
-              SysUtils.DeleteFile(EntryPath);
+            RemoveBuildReferenceEntry(EntryPath, EntrySearch.Attr);
             Inc(AReport.IncompleteEntriesRemoved);
           end;
         until FindNext(EntrySearch) <> 0;
