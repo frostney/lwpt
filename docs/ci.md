@@ -154,9 +154,11 @@ sweep.
 The `diagnostic` operation runs one allow-listed native remediation slice. The
 initial surface covers Windows x86_64/i386 ordinary, E2E, and TLS slices, plus an
 Intel-Darwin scheduling slice that runs only `TestScheduling.Test.pas` with a
-90-second ceiling. When isolation changes the symptom, the same target can run
-its ordinary project paths with a seven-minute ceiling. Both capture a native process
-sample instead of consuming a full matrix as a hang probe. Target and selector
+150-second ceiling. The focused inventory remained healthy past the earlier
+90-second boundary in [issue #260](https://github.com/frostney/lwpt/issues/260).
+When isolation changes the symptom, the same target can run its ordinary project
+paths with a seven-minute ceiling. Both capture a native process sample instead
+of consuming a full matrix as a hang probe. Target and selector
 combinations are allow-listed as pairs: Windows-only selectors cannot silently
 run on Darwin, and the scheduling probe cannot run on Windows. The endpoint
 checks out the exact current PR head,
