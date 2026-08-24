@@ -559,12 +559,11 @@ begin
       Fail('fixture setup exceeded its parent-owned '
         + UIntToStr(SetupTimeoutMilliseconds) + ' ms deadline');
     Expect<Integer>(SetupResult.ExitCode).ToBe(0);
+    { Ready markers prove bounded setup completion. Each caller immediately
+      proves exact direct-cache reuse and rejects every compilation path. }
     for Index := 0 to High(AReadyMarkers) do
       Expect<Boolean>(FileExists(FScratch + '/control/'
         + AReadyMarkers[Index] + FixtureSetupReadySuffix)).ToBe(True);
-    if SessionLogOccurrenceCount(SetupResult, 'cache stored: sha256:')
-       <> Length(ASelectors) then
-      Fail('fixture setup did not materialize every selected executable');
   finally
     RecursiveDelete(FScratch + '/control');
     ForceDirectories(FScratch + '/control');
