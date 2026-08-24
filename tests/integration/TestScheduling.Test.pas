@@ -40,7 +40,6 @@ const
     ProcessStartupCeilingSeconds + ProcessExitCeilingSeconds + 2;
   ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
   ProcessCaptureOverflowHoldMilliseconds = 2000;
-  SiblingFanoutCeilingMilliseconds = 1500;
   SiblingFanoutDiagnosticIterations = 1;
   SubprocessDrainCompletionCeilingMilliseconds = 5000;
   { Scheduling speed is not part of the fanout contract. This ceiling only
@@ -60,6 +59,7 @@ const
   ProcessTreeAcknowledgementProtocol = PROJECT_NAME + '-ACK/1';
   SiblingFailureReadySuffix = '-failure-ready';
   SiblingCancellationReceivedSuffix = '-cancellation-received';
+  SiblingFanoutObservedSuffix = '-fanout-observed';
   NestedCompilerNaturalExitSuffix = '-natural-exit';
   NestedCompilerStartedAtSuffix = '-started-at';
   SiblingSlowSources: array[0..5] of string = (
@@ -1427,10 +1427,8 @@ end;
 procedure TTestScheduling.TestSiblingTerminationAcknowledgementsShareFanout;
 var
   CompilerPID, Iteration, SourceIndex: Integer;
-  CancellationReceivedAt, CancellationStartedAt,
-    ElapsedMilliseconds: QWord;
-  MissingCancellationSources, MissingMarkerSources, NaturalExitSources,
-    PIDFile, SourcePIDFile: string;
+  MissingCancellationSources, MissingFanoutSources, MissingMarkerSources,
+    NaturalExitSources, PIDFile, SourcePIDFile: string;
   CommandResult: TLwptResult;
 begin
   for Iteration := 1 to SiblingFanoutDiagnosticIterations do
@@ -1477,8 +1475,8 @@ begin
     if CommandResult.ExitCode <> 1 then
       Fail(Format('fanout iteration %d exited %d instead of 1',
         [Iteration, CommandResult.ExitCode]));
-    CancellationStartedAt := 0;
     MissingCancellationSources := '';
+    MissingFanoutSources := '';
     NaturalExitSources := '';
     for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
     begin
@@ -1490,14 +1488,13 @@ begin
           MissingCancellationSources := MissingCancellationSources + ', ';
         MissingCancellationSources := MissingCancellationSources
           + SiblingSlowSources[SourceIndex];
-      end
-      else
+      end;
+      if not FileExists(SourcePIDFile + SiblingFanoutObservedSuffix) then
       begin
-        CancellationReceivedAt := StrToQWord(Trim(ReadBinaryFile(SourcePIDFile
-          + SiblingCancellationReceivedSuffix)));
-        if (CancellationStartedAt = 0)
-           or (CancellationReceivedAt < CancellationStartedAt) then
-          CancellationStartedAt := CancellationReceivedAt;
+        if MissingFanoutSources <> '' then
+          MissingFanoutSources := MissingFanoutSources + ', ';
+        MissingFanoutSources := MissingFanoutSources
+          + SiblingSlowSources[SourceIndex];
       end;
       if FileExists(SourcePIDFile + NestedCompilerNaturalExitSuffix) then
       begin
@@ -1510,10 +1507,13 @@ begin
     if MissingCancellationSources <> '' then
       Fail(Format('fanout iteration %d did not deliver cancellation to: %s',
         [Iteration, MissingCancellationSources]));
+    if MissingFanoutSources <> '' then
+      Fail(Format('fanout iteration %d did not let every sibling observe '
+        + 'the complete cancellation fanout: %s',
+        [Iteration, MissingFanoutSources]));
     if NaturalExitSources <> '' then
       Fail(Format('fanout iteration %d failed to cancel sibling proxies: %s',
         [Iteration, NaturalExitSources]));
-    ElapsedMilliseconds := GetTickCount64 - CancellationStartedAt;
     for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
     begin
       SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
@@ -1524,18 +1524,11 @@ begin
       if ProcessIsRunning(CompilerPID) then
         Fail(Format('fanout iteration %d left %s running as PID %d',
           [Iteration, SiblingSlowSources[SourceIndex], CompilerPID]));
+      if Pos(SiblingSlowSources[SourceIndex] + ' ... ERROR',
+        CommandResult.Stdout) = 0 then
+        Fail(Format('fanout iteration %d omitted %s ERROR',
+          [Iteration, SiblingSlowSources[SourceIndex]]));
     end;
-    if Pos('A.Slow.Test.pas ... ERROR', CommandResult.Stdout) = 0 then
-      Fail(Format('fanout iteration %d omitted A.Slow.Test.pas ERROR',
-        [Iteration]));
-    if Pos('C.Slow.Test.pas ... ERROR', CommandResult.Stdout) = 0 then
-      Fail(Format('fanout iteration %d omitted C.Slow.Test.pas ERROR',
-        [Iteration]));
-    if ElapsedMilliseconds >= SiblingFanoutCeilingMilliseconds then
-      Fail(Format('fanout iteration %d took %d ms after cancellation '
-        + '(ceiling %d ms); natural exits: %s',
-        [Iteration, ElapsedMilliseconds, SiblingFanoutCeilingMilliseconds,
-        NaturalExitSources]));
   end;
   Expect<Boolean>(True).ToBe(True);
 end;
@@ -2237,6 +2230,29 @@ begin
   Result := SiblingAcknowledgementMarkersReady(APIDFile);
 end;
 
+function SiblingCancellationMarkersReady(const APIDFile: string): Boolean;
+var
+  SourceIndex: Integer;
+begin
+  for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
+    if not FileExists(APIDFile + '-' + SiblingSlowSources[SourceIndex]
+      + SiblingCancellationReceivedSuffix) then
+      Exit(False);
+  Result := True;
+end;
+
+function WaitForSiblingCancellationMarkers(
+  const APIDFile: string): Boolean;
+var
+  Deadline: QWord;
+begin
+  Deadline := GetTickCount64 + QWord(ProcessExitCeilingSeconds) * 1000;
+  while not SiblingCancellationMarkersReady(APIDFile)
+    and (GetTickCount64 < Deadline) do
+    Sleep(ProcessPollMilliseconds);
+  Result := SiblingCancellationMarkersReady(APIDFile);
+end;
+
 function RunMissingAcknowledgementSiblingProxy(const ARootPIDFile,
   ASourceFile: string): Integer;
 var
@@ -2289,6 +2305,20 @@ begin
     Exit(5);
   end;
   WriteTextFile(PIDFile + SiblingCancellationReceivedSuffix,
+    UIntToStr(GetTickCount64));
+  { Every proxy must observe every sibling's cancellation marker before the
+    parent reaps it. Pairing BeginCancel and CompleteCancel per sibling kills
+    the first proxy before later siblings receive cancellation, so this proves
+    fanout without measuring unrelated command teardown time. }
+  if not WaitForSiblingCancellationMarkers(ARootPIDFile) then
+  begin
+    WriteLn(StdErr, 'sibling compiler fanout barrier timed out');
+    DeleteFile(PIDFile);
+    WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
+      UIntToStr(GetTickCount64));
+    Exit(6);
+  end;
+  WriteTextFile(PIDFile + SiblingFanoutObservedSuffix,
     UIntToStr(GetTickCount64));
   Sleep(LongRunningFixtureMilliseconds);
   { A healthy parent reaps this proxy after its missing acknowledgement. }
