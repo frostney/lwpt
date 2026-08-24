@@ -62,7 +62,6 @@ const
   SiblingFailureReadySuffix = '-failure-ready';
   SiblingCancellationReceivedSuffix = '-cancellation-received';
   SiblingFanoutObservedSuffix = '-fanout-observed';
-  FixtureCacheMaximumBytes = 64 * 1024 * 1024;
   FixtureSetupModeName = 'fixture-setup-mode';
   FixtureSetupReadySuffix = '-setup-ready';
   NestedCompilerNaturalExitSuffix = '-natural-exit';
@@ -614,15 +613,31 @@ end;
 procedure TTestScheduling.AssertPreparedFixturesUsed(const ARun: TLwptResult;
   const AExpectedCount: Integer);
 var
-  CacheHitCount, CacheMissCount: Integer;
+  CacheBypassCount, CacheCorruptionCount, CacheHitCount, CacheMissCount,
+    CacheStoreCount, CacheTakeoverHitCount, CacheWaitHitCount: Integer;
 begin
   CacheHitCount := SessionLogOccurrenceCount(ARun, 'cache hit: sha256:');
-  if CacheHitCount <> AExpectedCount then
-    Fail('behavior run used ' + IntToStr(CacheHitCount) + ' prepared fixture(s); '
-      + 'expected ' + IntToStr(AExpectedCount));
+  CacheWaitHitCount := SessionLogOccurrenceCount(ARun,
+    'cache wait hit: sha256:');
+  CacheTakeoverHitCount := SessionLogOccurrenceCount(ARun,
+    'cache takeover hit: sha256:');
   CacheMissCount := SessionLogOccurrenceCount(ARun, 'cache miss:');
-  if CacheMissCount <> 0 then
-    Fail('behavior run recompiled a prepared fixture');
+  CacheCorruptionCount := SessionLogOccurrenceCount(ARun,
+    'cache corruption:');
+  CacheBypassCount := SessionLogOccurrenceCount(ARun, 'cache bypass:');
+  CacheStoreCount := SessionLogOccurrenceCount(ARun, 'cache stored:');
+  if (CacheHitCount <> AExpectedCount) or (CacheWaitHitCount <> 0)
+     or (CacheTakeoverHitCount <> 0) or (CacheMissCount <> 0)
+     or (CacheCorruptionCount <> 0) or (CacheBypassCount <> 0)
+     or (CacheStoreCount <> 0) then
+    Fail('behavior run cache proof failed: direct hits '
+      + IntToStr(CacheHitCount) + '/' + IntToStr(AExpectedCount)
+      + ', wait hits ' + IntToStr(CacheWaitHitCount) + ', takeover hits '
+      + IntToStr(CacheTakeoverHitCount) + ', misses '
+      + IntToStr(CacheMissCount) + ', corruptions '
+      + IntToStr(CacheCorruptionCount) + ', bypasses '
+      + IntToStr(CacheBypassCount) + ', stores '
+      + IntToStr(CacheStoreCount));
 end;
 
 function TTestScheduling.RunTests(const AArgs: array of string): TLwptResult;
@@ -651,7 +666,7 @@ begin
   Environment[3] := CACHE_DIR_ENV + '='
     + FScratch + '/shared-cache';
   Environment[4] := CACHE_MAX_BYTES_ENV + '='
-    + IntToStr(FixtureCacheMaximumBytes);
+    + IntToStr(DEFAULT_CACHE_MAX_BYTES);
   if AHeartbeatMilliseconds > 0 then
     Environment[5] := ObservabilityHeartbeatIntervalEnvironment + '='
       + IntToStr(AHeartbeatMilliseconds);
