@@ -600,6 +600,7 @@ procedure TRegistryStoreContract.TestTamperedSignatureHasStableDiagnostic;
 var
   Diagnostic: string;
   Reopened: TLWPTRegistryStore;
+  SignatureNibble: SizeInt;
   SignaturePath, SignatureText: string;
   State: TLWPTRegistryState;
   Store: TLWPTRegistryStore;
@@ -609,7 +610,11 @@ begin
   Store.Free;
   SignaturePath := FScratch + '/' + State.SignaturePath;
   SignatureText := ReadBinaryFile(SignaturePath);
-  SignatureText[Pos('signature = "hex:', SignatureText) + 20] := '0';
+  SignatureNibble := Pos('signature = "hex:', SignatureText)
+    + Length('signature = "hex:');
+  if SignatureText[SignatureNibble] = '0' then
+    SignatureText[SignatureNibble] := '1'
+  else SignatureText[SignatureNibble] := '0';
   WriteTextFile(SignaturePath, SignatureText);
   Diagnostic := '';
   Reopened := nil;
