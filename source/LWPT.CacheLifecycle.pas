@@ -197,14 +197,19 @@ var
 begin
   Result := False;
   AText := '';
-  if not FileExists(APath) then Exit;
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
-    if Stream.Size > MAX_CONTROL_BYTES then Exit;
-    SetLength(Bytes, Stream.Size);
-    if Stream.Size > 0 then Stream.ReadBuffer(Bytes[0], Stream.Size);
-  finally
-    Stream.Free;
+    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      if Stream.Size > MAX_CONTROL_BYTES then Exit;
+      SetLength(Bytes, Stream.Size);
+      if Stream.Size > 0 then Stream.ReadBuffer(Bytes[0], Stream.Size);
+    finally
+      Stream.Free;
+    end;
+  except
+    on E: EFOpenError do Exit;
+    on E: EInOutError do Exit;
+    on E: EReadError do Exit;
   end;
   SetLength(AText, Length(Bytes));
   if Length(Bytes) > 0 then Move(Bytes[0], AText[1], Length(Bytes));

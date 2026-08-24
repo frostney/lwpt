@@ -188,6 +188,9 @@ const
 var
   ArtifactDigest, ManifestDigest, MalformedDigest, OversizedDigest,
     OversizedReferencePath, ReferencePath, MalformedReferencePath: string;
+  {$IFDEF UNIX}
+  UnreadableReferencePath: string;
+  {$ENDIF}
   Report: TLWPTCacheRepairReport;
   Store: TLWPTImmutableObjectStore;
 begin
@@ -214,13 +217,25 @@ begin
     WriteTextFile(ReferencePath, ManifestDigest + #10);
     WriteTextFile(MalformedReferencePath, MalformedDigest + #10);
     WriteTextFile(OversizedReferencePath, OversizedDigest + #10);
+    {$IFDEF UNIX}
+    UnreadableReferencePath := FCacheRoot
+      + '/build-results/refs/sha256/ee/' + StringOfChar('e', 62);
+    WriteTextFile(UnreadableReferencePath, ManifestDigest + #10);
+    if FpChmod(PChar(UnreadableReferencePath), 0) <> 0 then
+      raise Exception.Create('failed to make build reference unreadable');
+    {$ENDIF}
     SysUtils.DeleteFile(Store.ObjectPath(ArtifactDigest));
 
     Report := RepairSharedCache(FCacheRoot);
     Expect<Boolean>(FileExists(ReferencePath)).ToBe(False);
     Expect<Boolean>(FileExists(MalformedReferencePath)).ToBe(False);
     Expect<Boolean>(FileExists(OversizedReferencePath)).ToBe(False);
+    {$IFDEF UNIX}
+    Expect<Boolean>(FileExists(UnreadableReferencePath)).ToBe(False);
+    Expect<Boolean>(Report.IncompleteEntriesRemoved >= 4).ToBe(True);
+    {$ELSE}
     Expect<Boolean>(Report.IncompleteEntriesRemoved >= 3).ToBe(True);
+    {$ENDIF}
   finally
     Store.Free;
   end;
