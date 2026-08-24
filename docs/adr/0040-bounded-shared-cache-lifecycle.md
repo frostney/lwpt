@@ -40,6 +40,19 @@ continues with the next deterministic candidate. Existing producer-key guards
 still own download/compile coalescing; the object guard covers the later
 verified publication and consumption boundary.
 
+A build-result reference is one logical edge through two immutable objects:
+the reference directly names a result manifest, and that manifest names its
+artifact. Eviction and explicit removal resolve this edge while holding the
+mutation guard. They invalidate every direct or transitive reference before
+unlinking either object. A reader that acquired the reference earlier either
+finishes while its artifact object guard prevents eviction, or observes the
+invalidation as a miss; a reader arriving after invalidation cannot enter the
+manifest-to-artifact window. Object-store materialization preserves whether a
+miss came from an absent object, failed verification, a failed copy, or a
+staged hash mismatch. Build-cache diagnostics prefix that exact stage with
+`result-manifest-` or `artifact-` instead of collapsing all failures into an
+artifact-missing report.
+
 Each admitted object has an atomic control manifest recording its namespace,
 digest, path, and byte size. `lwpt repair` is the only user-facing maintenance
 path. It removes incomplete staging and quarantined bytes, verifies object
@@ -59,6 +72,15 @@ outside this lifecycle. A repair may remain above budget only when counted
 state is protected by a live operating-system guard; the report identifies
 that preservation so a later repair can reclaim it after release.
 
+Repair also validates build references transitively. The reference path must
+be a canonical fingerprint, its contents must canonically name a present and
+parseable result manifest, that manifest must bind the same fingerprint, and
+its artifact digest must name an object that repair verified, or preserved
+because its live object guard made verification nonblocking. Malformed,
+unreadable, or incomplete logical results lose their disposable reference
+conservatively; unreferenced immutable objects remain ordinary budget
+candidates.
+
 ## Consequences
 
 - Shared cache bytes have predictable aggregate disk use without making cache
@@ -69,5 +91,8 @@ that preservation so a later repair can reclaim it after release.
   producers remain concurrent across keys.
 - A crash can leave an unindexed object or incomplete control file, but repair
   verifies the content-addressed bytes before reconstructing metadata.
+- Evicting an artifact may leave an unreferenced manifest object until later
+  budget enforcement, but it cannot leave a fingerprint that resolves only
+  part of a build result.
 - No cache prune/clear subcommand, explicit offline-install mode, remote cache
   administration, or test-executable cache is introduced.

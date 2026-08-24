@@ -21,9 +21,9 @@ program	*	source/LWPT.Analysis.JSON.Test.pas	1	4
 program	*	source/LWPT.Analysis.Pascal.Test.pas	2	18
 program	*	source/LWPT.Analysis.Scope.Test.pas	1	5
 program	*	source/LWPT.BuildRequest.Test.pas	1	12
-program	*	source/LWPT.BuildCache.Test.pas	1	7
-program	*	source/LWPT.CacheLifecycle.Test.pas	1	11
-program	unix/*	source/LWPT.CacheLifecycle.Test.pas	1	12
+program	*	source/LWPT.BuildCache.Test.pas	1	13
+program	*	source/LWPT.CacheLifecycle.Test.pas	1	15
+program	unix/*	source/LWPT.CacheLifecycle.Test.pas	1	16
 program	*	source/LWPT.BuildSession.Test.pas	1	32
 program	windows/*	source/LWPT.BuildSession.Test.pas	1	27
 program	*	source/LWPT.Command.Build.Test.pas	1	4
@@ -45,7 +45,7 @@ program	*	source/LWPT.TestInventory.Test.pas	1	7
 program	*	source/LWPT.Manifest.Schema.Test.pas	1	7
 program	*	source/LWPT.ManifestEdit.Test.pas	5	31
 program	*	source/LWPT.Observability.Test.pas	1	6
-program	*	source/LWPT.ObjectStore.Test.pas	1	13
+program	*	source/LWPT.ObjectStore.Test.pas	1	14
 program	*	source/LWPT.OutputRenderer.Test.pas	1	1
 program	*	source/LWPT.ProducerLease.Test.pas	1	6
 program	unix/*	source/LWPT.ProducerLease.Test.pas	1	7
@@ -79,11 +79,11 @@ program	*	tests/integration/InstallLocalDiamond.Test.pas	2	10
 program	*	tests/integration/InstallNestedManifest.Test.pas	1	4
 program	*	tests/integration/InstallProducerLease.Test.pas	1	2
 program	*	tests/integration/InstallSymlinkCycle.Test.pas	1	3
-program	*	tests/integration/Repair.Test.pas	1	7
+program	*	tests/integration/Repair.Test.pas	1	8
 program	*	tests/integration/Run.Test.pas	1	9
 program	*	tests/integration/Scratch.Test.pas	1	2
 program	*	tests/integration/TestCache.Test.pas	1	10
 program	*	tests/integration/TestFlags.Test.pas	1	3
-program	*	tests/integration/TestScheduling.Test.pas	1	25
-program	windows/*	tests/integration/TestScheduling.Test.pas	1	21
+program	*	tests/integration/TestScheduling.Test.pas	1	26
+program	windows/*	tests/integration/TestScheduling.Test.pas	1	22
 program	*	tests/integration/Version.Test.pas	1	4

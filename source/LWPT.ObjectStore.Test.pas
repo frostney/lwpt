@@ -67,6 +67,23 @@ var
   StageReadyPath: string;
   StageReleasePath: string;
 
+procedure RemoveMaterializeSource(const ADigest, APath: string);
+begin
+  SysUtils.DeleteFile(APath);
+end;
+
+procedure CorruptMaterializeStage(const ADigest, APath: string);
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    Stream.WriteBuffer(ADigest[1], 1);
+  finally
+    Stream.Free;
+  end;
+end;
+
 type
   TObjectStoreContract = class(TTestSuite)
   private
@@ -89,6 +106,7 @@ type
     procedure TestDigestAddressIsCanonicalAndSharded;
     procedure TestInvalidDigestIsRefused;
     procedure TestAdmitLookupAndMaterialize;
+    procedure TestMaterializeReportsExactFailureStage;
     procedure TestAdmissionHashMismatchPublishesNothing;
     procedure TestCorruptObjectIsQuarantinedAndMisses;
     procedure TestConcurrentValidReplacementIsRestoredAfterQuarantine;
@@ -428,6 +446,8 @@ end;
 
 procedure TObjectStoreContract.ResetScratch;
 begin
+  ObjectStoreBeforeMaterializeCopyTestHook := nil;
+  ObjectStoreAfterMaterializeCopyTestHook := nil;
   if DirectoryExists(FScratch) then WipeDir(FScratch);
   ForceDirectories(FScratch);
   FStoreRoot := FScratch + '/cache/dependency-archives';
@@ -558,6 +578,51 @@ begin
       FScratch + '/project/.lwpt/tmp')).ToBe(True);
     Expect<string>(ReadBytes(Destination)).ToBe(ReadBytes(FSource));
     Expect<string>('sha256:' + SHA256File(Destination)).ToBe(FDigest);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TObjectStoreContract.TestMaterializeReportsExactFailureStage;
+var
+  Destination, MissingDigest: string;
+  Failure: TLWPTObjectMaterializeFailure;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    MissingDigest := 'sha256:' + StringOfChar('0', 64);
+    Destination := FScratch + '/project/materialized';
+    Expect<Boolean>(Store.Materialize(MissingDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
+    Expect<Integer>(Ord(Failure)).ToBe(Ord(omfObjectMissing));
+
+    Store.Admit(FSource, FDigest);
+    WriteBytes(Store.ObjectPath(FDigest), 'corrupt');
+    Expect<Boolean>(Store.Materialize(FDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
+    Expect<Integer>(Ord(Failure)).ToBe(Ord(omfVerificationFailed));
+
+    Store.Admit(FSource, FDigest);
+    ObjectStoreBeforeMaterializeCopyTestHook := RemoveMaterializeSource;
+    try
+      Expect<Boolean>(Store.Materialize(FDigest, Destination,
+        FScratch + '/project/tmp', Failure)).ToBe(False);
+      Expect<Integer>(Ord(Failure)).ToBe(Ord(omfCopyFailed));
+    finally
+      ObjectStoreBeforeMaterializeCopyTestHook := nil;
+    end;
+
+    Store.Admit(FSource, FDigest);
+    ObjectStoreAfterMaterializeCopyTestHook := CorruptMaterializeStage;
+    try
+      Expect<Boolean>(Store.Materialize(FDigest, Destination,
+        FScratch + '/project/tmp', Failure)).ToBe(False);
+      Expect<Integer>(Ord(Failure)).ToBe(Ord(omfStagedHashMismatch));
+    finally
+      ObjectStoreAfterMaterializeCopyTestHook := nil;
+    end;
   finally
     Store.Free;
   end;
@@ -852,6 +917,8 @@ begin
   Test('invalid digests are refused', TestInvalidDigestIsRefused);
   Test('admission, verified lookup, and materialization preserve bytes',
     TestAdmitLookupAndMaterialize);
+  Test('materialization reports the exact failing object-store stage',
+    TestMaterializeReportsExactFailureStage);
   Test('admission refuses a mismatched digest before publication',
     TestAdmissionHashMismatchPublishesNothing);
   Test('corrupt objects are quarantined and become misses',
