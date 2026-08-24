@@ -150,5 +150,5 @@ The origin can be hosted directly by LWPT and supervised by any ordinary
 process manager. Old snapshots and objects accumulate until an explicit,
 protocol-aware retention design is approved; general cache repair and eviction
 must not touch them. Remote publication, mirror synchronization, and registry
-dependency resolution build on this store and shared crypto unit in issues
-#54 and #55.
+dependency resolution build on this store and shared crypto unit in issues #54
+and #55.
