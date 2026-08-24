@@ -180,7 +180,7 @@ begin
       raise Exception.CreateFmt('failed to publish active test case at %s',
         [APath]);
   except
-    DeleteFile(TemporaryPath);
+    SysUtils.DeleteFile(TemporaryPath);
     raise;
   end;
 end;
