@@ -29,10 +29,15 @@ program TestingPascalLibrary.Test;
 {$mode delphi}{$H+}
 
 uses
+  Classes,
+  Process,
   SysUtils,
 
   TestingPascalLibrary,
   TestingPascalLibrary.Protocol;
+
+const
+  ACTIVE_CASE_CHILD_ARGUMENT = '--active-case-marker-canary-child';
 
 type
   TCanarySuite = class(TTestSuite)
@@ -49,6 +54,29 @@ type
     procedure SetupTests; override;
     procedure TestDeliberateFailure;
   end;
+
+  TActiveCaseCanarySuite = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestFirstCaseMarker;
+    procedure TestSecondCaseMarker;
+  end;
+
+var
+  ActiveCaseMarkerPath: string;
+
+function ReadMarker: string;
+var
+  Lines: TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ActiveCaseMarkerPath);
+    Result := Trim(Lines.Text);
+  finally
+    Lines.Free;
+  end;
+end;
 
 procedure TCanarySuite.SetupTests;
 begin
@@ -67,6 +95,26 @@ end;
 procedure TFailingCanarySuite.SetupTests;
 begin
   Test('deliberately failing assertion', TestDeliberateFailure);
+end;
+
+procedure TActiveCaseCanarySuite.SetupTests;
+begin
+  Test('first marker case', TestFirstCaseMarker);
+  Test('second marker case', TestSecondCaseMarker);
+end;
+
+procedure TActiveCaseCanarySuite.TestFirstCaseMarker;
+begin
+  Expect<string>(GetEnvironmentVariable(
+    TEST_ACTIVE_CASE_FILE_ENVIRONMENT)).ToBe('');
+  Expect<string>(ReadMarker).ToBe(
+    'active case canary > first marker case');
+end;
+
+procedure TActiveCaseCanarySuite.TestSecondCaseMarker;
+begin
+  Expect<string>(ReadMarker).ToBe(
+    'active case canary > second marker case');
 end;
 
 procedure TFailingCanarySuite.TestDeliberateFailure;
@@ -103,13 +151,65 @@ begin
   end;
 end;
 
+procedure RunActiveCaseMarkerChild;
+var
+  MarkerRunner: TTestRunner;
+  MarkerResult: TTestResult;
+begin
+  ActiveCaseMarkerPath := GetEnvironmentVariable(
+    TEST_ACTIVE_CASE_FILE_ENVIRONMENT);
+  MarkerRunner := TTestRunner.Create;
+  try
+    MarkerRunner.AddSuite(TActiveCaseCanarySuite.Create('active case canary'));
+    MarkerRunner.Run;
+    for MarkerResult in MarkerRunner.Results do
+      if MarkerResult.Status <> tsPass then
+        Halt(19);
+    if GetEnvironmentVariable(TEST_ACTIVE_CASE_FILE_ENVIRONMENT) <> '' then
+      Halt(20);
+  finally
+    MarkerRunner.Free;
+  end;
+end;
+
+procedure TestActiveCaseMarkerProtocol;
+var
+  EnvironmentIndex: Integer;
+  MarkerProcess: TProcess;
+begin
+  ActiveCaseMarkerPath := GetTempFileName('', 'tpl-active-case-');
+  DeleteFile(ActiveCaseMarkerPath);
+  MarkerProcess := TProcess.Create(nil);
+  try
+    MarkerProcess.Executable := ParamStr(0);
+    MarkerProcess.Parameters.Add(ACTIVE_CASE_CHILD_ARGUMENT);
+    for EnvironmentIndex := 1 to GetEnvironmentVariableCount do
+      MarkerProcess.Environment.Add(GetEnvironmentString(EnvironmentIndex));
+    MarkerProcess.Environment.Values[TEST_ACTIVE_CASE_FILE_ENVIRONMENT] :=
+      ActiveCaseMarkerPath;
+    MarkerProcess.Options := [poWaitOnExit];
+    MarkerProcess.Execute;
+    if MarkerProcess.ExitStatus <> 0 then Halt(MarkerProcess.ExitStatus);
+    if ReadMarker <> 'active case canary > second marker case' then Halt(21);
+  finally
+    MarkerProcess.Free;
+    DeleteFile(ActiveCaseMarkerPath);
+  end;
+end;
+
 var
   Suite: TCanarySuite;
   Runner: TTestRunner;
   Passed, Failed: Integer;
   R: TTestResult;
 begin
+  if (ParamCount = 1) and (ParamStr(1) = ACTIVE_CASE_CHILD_ARGUMENT) then
+  begin
+    RunActiveCaseMarkerChild;
+    Halt(0);
+  end;
   TestInventoryProtocol;
+  TestActiveCaseMarkerProtocol;
   WriteLn('TestingPascalLibrary canary starting');
 
   if not Assigned(TestRunnerProgram) then

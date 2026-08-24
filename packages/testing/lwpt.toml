@@ -1,10 +1,10 @@
 # Testing — assertion + suite + runner framework for *.Test.pas files.
 #
-# Co-developed with GocciaScript. LWPT adds Darwin test-thread names for
-# diagnostics. Established as an in-monorepo LWPT package per ADR-0015. This
-# replaces the earlier embedded-blob + `lwpt export testing` model with regular
-# workspace-package consumption. The CmdTest discovery loop in
-# LWPT.Command.Testing finds tests
+# Co-developed with GocciaScript. LWPT adds opt-in test-case diagnostics for
+# native recurrence capture. Established as an in-monorepo LWPT package per
+# ADR-0015. This replaces the earlier embedded-blob + `lwpt export testing`
+# model with regular workspace-package consumption. The CmdTest discovery loop
+# in LWPT.Command.Testing finds tests
 # via this package's units once `lwpt install` has published its snapshot in
 # `.lwpt/modules/testing/` — same path as every other workspace dep.
 #
@@ -16,5 +16,5 @@
 
 [package]
 name    = "testing"
-version = "0.3.0"
+version = "0.4.0"
 units   = ["source"]

@@ -38,7 +38,7 @@ resolvedCommit = ""
 sourceIdentity = "local|packages/testing/"
 constraintFingerprint = "sha256:2adf1524a6a74e1de84d2c4edccf481f22d762189476c6063cfc6da5341959e9"
 resolvedURL = ""
-computedHash = "sha256:2f84500fe2c15b878b712386d8a6cc27e27f5737015d888f1a7e6156b522ea94"
+computedHash = "sha256:b871498828ee27e57c2a19aaadef90a8d207f0aa01f4ba3e043c5b384e8712a6"
 archiveHash = ""
 
 [package.toml]
