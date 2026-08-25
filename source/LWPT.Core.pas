@@ -136,11 +136,17 @@ uses
 {$IFDEF MSWINDOWS}
 const
   MOVEFILE_WRITE_THROUGH_LWPT = $00000008;
+  ERROR_UNABLE_TO_MOVE_REPLACEMENT_2_LWPT = 1177;
   FSCTL_GET_REPARSE_POINT_LWPT = $000900A8;
   FSCTL_SET_REPARSE_POINT_LWPT = $000900A4;
   FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
   FILE_FLAG_BACKUP_SEMANTICS_LWPT = $02000000;
   MAX_REPARSE_DATA_BUFFER_SIZE_LWPT = 16 * 1024;
+
+function LWPTReplaceFileW(AReplacedFileName, AReplacementFileName,
+  ABackupFileName: PWideChar; AReplaceFlags: LongWord;
+  AExclude, AReserved: Pointer): LongBool; stdcall;
+  external 'kernel32.dll' name 'ReplaceFileW';
 {$ENDIF}
 
 var
@@ -1174,6 +1180,10 @@ end;
 function AtomicReplaceFile(const ASrc, ADst: string): Boolean;
 var
   DstDir: string;
+  {$IFDEF MSWINDOWS}
+  BackupPath: string;
+  ReplaceError: LongWord;
+  {$ENDIF}
 begin
   if not FileExists(ASrc) then Exit(False);
   DstDir := ExtractFileDir(ADst);
@@ -1182,10 +1192,49 @@ begin
   Result := FpRename(PChar(ASrc), PChar(ADst)) = 0;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
+  { ReplaceFileW requests delete sharing for the replaced file, so a retained
+    read handle opened with FILE_SHARE_DELETE keeps serving the old bytes while
+    the path changes atomically. A named sibling backup makes ReplaceFileW's
+    partial-failure states recoverable: error 1177 moves the old destination to
+    that backup, so restore it before reporting failure. MoveFileEx cannot
+    provide the open-reader contract. If the destination merely disappeared
+    before ReplaceFileW opened it, use the ordinary no-destination move only
+    while the staged source is still present. }
+  if FileExists(ADst) then
+  begin
+    BackupPath := MakeSiblingTmpPath(ADst, 'replace-backup');
+    Result := LWPTReplaceFileW(PWideChar(UnicodeString(ADst)),
+      PWideChar(UnicodeString(ASrc)), PWideChar(UnicodeString(BackupPath)),
+      0, nil, nil);
+    if Result then
+    begin
+      if FileExists(BackupPath) then
+        if not SysUtils.DeleteFile(BackupPath) then
+          raise EExtractError.CreateFmt(
+            'atomic replacement of "%s" left its retained backup', [ADst]);
+      Exit;
+    end;
+    ReplaceError := Windows.GetLastError;
+    if ReplaceError = ERROR_UNABLE_TO_MOVE_REPLACEMENT_2_LWPT then
+    begin
+      if (not FileExists(BackupPath))
+        or not Windows.MoveFileExW(PWideChar(UnicodeString(BackupPath)),
+          PWideChar(UnicodeString(ADst)), MOVEFILE_WRITE_THROUGH_LWPT) then
+        raise EExtractError.CreateFmt(
+          'atomic replacement of "%s" could not restore its retained backup',
+          [ADst]);
+      Exit(False);
+    end;
+    if FileExists(BackupPath) and not SysUtils.DeleteFile(BackupPath) then
+      raise EExtractError.CreateFmt(
+        'atomic replacement of "%s" could not remove its unused backup',
+        [ADst]);
+    if FileExists(ADst) or not FileExists(ASrc) then Exit(False);
+  end;
   Result := Windows.MoveFileExW(
     PWideChar(UnicodeString(ASrc)),
     PWideChar(UnicodeString(ADst)),
-    Windows.MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH_LWPT);
+    MOVEFILE_WRITE_THROUGH_LWPT);
   {$ENDIF}
 end;
 

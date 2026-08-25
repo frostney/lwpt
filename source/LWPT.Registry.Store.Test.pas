@@ -557,8 +557,8 @@ procedure TRegistryStoreContract.TestIncompleteInitializationIsRecovered;
 var
   Store: TLWPTRegistryStore;
 begin
-  WriteTextFile(FScratch + '/.initializing',
-    'registry initialization in progress' + #10);
+  AtomicWriteBytes(FScratch + '/.initializing', FScratch + '/tmp',
+    TEncoding.UTF8.GetBytes('registry initialization in progress' + #10));
   WriteTextFile(FScratch + '/tmp/uncommitted', 'partial');
   Store := InitializeStore;
   try
