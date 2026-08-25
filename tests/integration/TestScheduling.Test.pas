@@ -2233,6 +2233,7 @@ end;
 function RunWindowsConsoleController: Integer;
 var
   CompilerPID: Integer;
+  ControlProcessGroupID: DWORD;
   ControlType: DWORD;
   Environment: array of string;
   LwptProcess: TProcess;
@@ -2246,7 +2247,7 @@ begin
   WrongWriteHandle := 0;
   { Controller failures: 2 invalid control type; 3 missing compiler PID;
     4 acknowledgement pipe creation; 5 inherited Ctrl-C-ignore setup;
-    6 controller ignore handler; 7 control broadcast; 8 LWPT exit timeout;
+    7 control broadcast; 8 LWPT exit timeout;
     9 unexpected LWPT exit status; 10 compiler process still active. }
   ControlType := DWORD(StrToInt(ParamStr(2)));
   if (ControlType <> Windows.CTRL_C_EVENT)
@@ -2285,6 +2286,7 @@ begin
     LwptProcess.CurrentDirectory := ParamStr(4);
     ConfigureProcessEnvironment(LwptProcess, Environment);
     LwptProcess.InheritHandles := True;
+    LwptProcess.Options := [poNewProcessGroup];
     LwptProcess.Execute;
     Windows.CloseHandle(WrongReadHandle);
     WrongReadHandle := 0;
@@ -2297,16 +2299,16 @@ begin
       Sleep(ProcessPollMilliseconds);
     if not FileExists(ParamStr(5)) then Exit(3);
     CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
-    { SetConsoleCtrlHandler(nil, True) already makes this controller ignore
-      Ctrl-C. Register the Pascal callback only for Ctrl-Break, which ignores
-      that inherited flag; avoiding a redundant operating-system callback
-      keeps the Ctrl-C controller on its single main-thread fixture path. The
-      compiler proxy installs its handler before publishing its PID, leaving
-      LWPT as the only process that performs cancellation. }
-    if (ControlType = Windows.CTRL_BREAK_EVENT)
-       and not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
-         True) then Exit(6);
-    if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(7);
+    { Ctrl-C cannot target one process group, so broadcast it while this
+      controller keeps the inherited ignore attribute. Ctrl-Break ignores that
+      attribute and targets LWPT's process group, excluding this controller
+      without an asynchronous Pascal callback. }
+    if ControlType = Windows.CTRL_BREAK_EVENT then
+      ControlProcessGroupID := LwptProcess.ProcessID
+    else
+      ControlProcessGroupID := 0;
+    if not Windows.GenerateConsoleCtrlEvent(ControlType,
+      ControlProcessGroupID) then Exit(7);
     Started := Now;
     while LwptProcess.Running
       and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
