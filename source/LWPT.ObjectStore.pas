@@ -39,6 +39,8 @@ type
   TLWPTObjectStoreStagedVerificationOpenHook = procedure(
     const APath: string; const AAttempt: Integer;
     out AErrorCode: Integer);
+  TLWPTObjectStoreStagedVerificationRetryHook = procedure(
+    const AAttempt, ADelayMilliseconds: Integer);
   {$ENDIF}
 
   TLWPTImmutableObjectStore = class
@@ -96,6 +98,8 @@ var
     TLWPTObjectStoreMaterializeHook;
   ObjectStoreStagedVerificationOpenTestHook:
     TLWPTObjectStoreStagedVerificationOpenHook;
+  ObjectStoreStagedVerificationRetryTestHook:
+    TLWPTObjectStoreStagedVerificationRetryHook;
 {$ENDIF}
 
 implementation
@@ -108,10 +112,13 @@ uses
 
 function StagedVerificationHash(const APath: string): string;
 const
-  OPEN_ATTEMPTS = 3;
-  OPEN_RETRY_MILLISECONDS = 1;
+  OPEN_ATTEMPTS = 6;
+  OPEN_RETRY_INITIAL_MILLISECONDS = 1;
 var
   Attempt: Integer;
+  {$IFDEF UNIX}
+  DelayMilliseconds: Integer;
+  {$ENDIF}
   ErrorCode: Integer;
 begin
   for Attempt := 1 to OPEN_ATTEMPTS do
@@ -130,7 +137,13 @@ begin
     if (ErrorCode in [ESysEAGAIN, ESysEINTR])
        and (Attempt < OPEN_ATTEMPTS) then
     begin
-      Sleep(OPEN_RETRY_MILLISECONDS);
+      DelayMilliseconds := OPEN_RETRY_INITIAL_MILLISECONDS shl (Attempt - 1);
+      {$IFDEF OBJECTSTORE_TESTING}
+      if Assigned(ObjectStoreStagedVerificationRetryTestHook) then
+        ObjectStoreStagedVerificationRetryTestHook(Attempt,
+          DelayMilliseconds);
+      {$ENDIF}
+      Sleep(DelayMilliseconds);
       Continue;
     end;
     {$ENDIF}

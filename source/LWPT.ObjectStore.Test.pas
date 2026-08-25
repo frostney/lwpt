@@ -68,6 +68,7 @@ var
   StagedVerificationErrorCode: Integer;
   StagedVerificationFailures: Integer;
   StagedVerificationPath: string;
+  StagedVerificationRetryDelays: string;
   StageReadyPath: string;
   StageReleasePath: string;
 
@@ -107,6 +108,15 @@ begin
   AErrorCode := 0;
   SysUtils.DeleteFile(APath);
 end;
+
+procedure ObserveStagedVerificationRetry(const AAttempt,
+  ADelayMilliseconds: Integer);
+begin
+  if StagedVerificationRetryDelays <> '' then
+    StagedVerificationRetryDelays := StagedVerificationRetryDelays + ',';
+  StagedVerificationRetryDelays := StagedVerificationRetryDelays
+    + IntToStr(AAttempt) + ':' + IntToStr(ADelayMilliseconds);
+end;
 {$ENDIF}
 
 type
@@ -133,7 +143,7 @@ type
     procedure TestAdmitLookupAndMaterialize;
     procedure TestMaterializeReportsExactFailureStage;
     {$IFDEF UNIX}
-    procedure TestTransientStagedVerificationOpenRecovers;
+    procedure TestTransientStagedVerificationBurstRecovers;
     procedure TestTransientStagedVerificationOpenStopsAtBound;
     procedure TestNonTransientStagedVerificationOpenIsNotRetried;
     {$ENDIF}
@@ -479,10 +489,12 @@ begin
   ObjectStoreBeforeMaterializeCopyTestHook := nil;
   ObjectStoreAfterMaterializeCopyTestHook := nil;
   ObjectStoreStagedVerificationOpenTestHook := nil;
+  ObjectStoreStagedVerificationRetryTestHook := nil;
   StagedVerificationAttempts := 0;
   StagedVerificationErrorCode := 0;
   StagedVerificationFailures := 0;
   StagedVerificationPath := '';
+  StagedVerificationRetryDelays := '';
   if DirectoryExists(FScratch) then WipeDir(FScratch);
   ForceDirectories(FScratch);
   FStoreRoot := FScratch + '/cache/dependency-archives';
@@ -492,7 +504,7 @@ begin
 end;
 
 {$IFDEF UNIX}
-procedure TObjectStoreContract.TestTransientStagedVerificationOpenRecovers;
+procedure TObjectStoreContract.TestTransientStagedVerificationBurstRecovers;
 var
   Destination: string;
   ErrorCode: Integer;
@@ -504,20 +516,25 @@ begin
     Store.Admit(FSource, FDigest);
     ObjectStoreStagedVerificationOpenTestHook :=
       FailStagedVerificationOpen;
+    ObjectStoreStagedVerificationRetryTestHook :=
+      ObserveStagedVerificationRetry;
     for ErrorCode in [ESysEAGAIN, ESysEINTR] do
     begin
       StagedVerificationAttempts := 0;
+      StagedVerificationRetryDelays := '';
       StagedVerificationErrorCode := ErrorCode;
-      StagedVerificationFailures := 1;
+      StagedVerificationFailures := 3;
       Destination := FScratch + '/project/materialized-'
         + IntToStr(ErrorCode);
       Expect<Boolean>(Store.Materialize(FDigest, Destination,
         FScratch + '/project/tmp')).ToBe(True);
-      Expect<Integer>(StagedVerificationAttempts).ToBe(2);
+      Expect<Integer>(StagedVerificationAttempts).ToBe(4);
+      Expect<string>(StagedVerificationRetryDelays).ToBe('1:1,2:2,3:4');
       Expect<string>(ReadBytes(Destination)).ToBe(ReadBytes(FSource));
     end;
   finally
     ObjectStoreStagedVerificationOpenTestHook := nil;
+    ObjectStoreStagedVerificationRetryTestHook := nil;
     Store.Free;
   end;
 end;
@@ -537,6 +554,8 @@ begin
     StagedVerificationFailures := MaxInt;
     ObjectStoreStagedVerificationOpenTestHook :=
       FailStagedVerificationOpen;
+    ObjectStoreStagedVerificationRetryTestHook :=
+      ObserveStagedVerificationRetry;
     Raised := False;
     try
       Store.Materialize(FDigest, Destination, FScratch + '/project/tmp');
@@ -544,7 +563,9 @@ begin
       on E: EFOpenError do Raised := True;
     end;
     Expect<Boolean>(Raised).ToBe(True);
-    Expect<Integer>(StagedVerificationAttempts).ToBe(3);
+    Expect<Integer>(StagedVerificationAttempts).ToBe(6);
+    Expect<string>(StagedVerificationRetryDelays).ToBe(
+      '1:1,2:2,3:4,4:8,5:16');
     Expect<Boolean>(FileExists(Destination)).ToBe(False);
     Expect<Boolean>(FileExists(StagedVerificationPath)).ToBe(False);
     Expect<Boolean>(FileExists(ObjectPath)).ToBe(True);
@@ -552,6 +573,7 @@ begin
     Expect<string>(LookupPath).ToBe(ObjectPath);
   finally
     ObjectStoreStagedVerificationOpenTestHook := nil;
+    ObjectStoreStagedVerificationRetryTestHook := nil;
     Store.Free;
   end;
 end;
@@ -572,6 +594,8 @@ begin
     StagedVerificationFailures := MaxInt;
     ObjectStoreStagedVerificationOpenTestHook :=
       FailStagedVerificationOpen;
+    ObjectStoreStagedVerificationRetryTestHook :=
+      ObserveStagedVerificationRetry;
     Raised := False;
     try
       Store.Materialize(FDigest, Destination, FScratch + '/project/tmp');
@@ -580,6 +604,7 @@ begin
     end;
     Expect<Boolean>(Raised).ToBe(True);
     Expect<Integer>(StagedVerificationAttempts).ToBe(1);
+    Expect<string>(StagedVerificationRetryDelays).ToBe('');
 
     StagedVerificationAttempts := 0;
     Destination := FScratch + '/project/missing-stage';
@@ -591,6 +616,7 @@ begin
     Expect<Integer>(StagedVerificationAttempts).ToBe(1);
   finally
     ObjectStoreStagedVerificationOpenTestHook := nil;
+    ObjectStoreStagedVerificationRetryTestHook := nil;
     Store.Free;
   end;
 end;
@@ -1060,8 +1086,8 @@ begin
   Test('materialization reports the exact failing object-store stage',
     TestMaterializeReportsExactFailureStage);
   {$IFDEF UNIX}
-  Test('one transient staged verification open recovers',
-    TestTransientStagedVerificationOpenRecovers);
+  Test('a transient staged verification open burst recovers with backoff',
+    TestTransientStagedVerificationBurstRecovers);
   Test('persistent transient staged verification opens stop at the bound',
     TestTransientStagedVerificationOpenStopsAtBound);
   Test('non-transient staged verification opens are not retried',
