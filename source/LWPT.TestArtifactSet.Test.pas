@@ -32,6 +32,7 @@ type
     procedure TestSourceOutsidePrivateRootIsRejected;
     procedure TestLinkedSourceInsidePrivateRootIsRejected;
     procedure TestExistingDestinationIsRejected;
+    procedure TestExceptionStagesRemainDistinct;
     procedure TestPhysicalSourceAliasIsRejected;
   end;
 
@@ -203,6 +204,35 @@ begin
   Expect<Integer>(Length(Cached)).ToBe(0);
 end;
 
+procedure TTestArtifactSetContract.TestExceptionStagesRemainDistinct;
+var
+  Artifacts, Cached: TLWPTArtifactArray;
+  BlockedRoot, Bundle, DestinationReason, MissingReason, SourceRoot: string;
+begin
+  Expect<Boolean>(MaterializeTestArtifactSet(
+    FScratch + '/exception-stage/missing.bundle',
+    FScratch + '/exception-stage/missing-destination', Cached,
+    MissingReason)).ToBe(False);
+  Expect<Boolean>(Pos('artifact-set-invalid: exception-bundle-open-',
+    MissingReason) = 1).ToBe(True);
+
+  SourceRoot := FScratch + '/exception-stage/source';
+  Bundle := FScratch + '/exception-stage/artifacts.bundle';
+  BlockedRoot := FScratch + '/exception-stage/blocked-root';
+  WriteBytes(SourceRoot + '/bin/program', 'cached executable');
+  SetLength(Artifacts, 1);
+  Artifacts[0].Kind := BUILD_OUTPUT_EXECUTABLE;
+  Artifacts[0].Path := SourceRoot + '/bin/program';
+  WriteTestArtifactSet(SourceRoot, Bundle, Artifacts);
+  WriteBytes(BlockedRoot, 'not a directory');
+  Expect<Boolean>(MaterializeTestArtifactSet(Bundle, BlockedRoot, Cached,
+    DestinationReason)).ToBe(False);
+  Expect<Boolean>(Pos(
+    'artifact-set-invalid: exception-destination-create-',
+    DestinationReason) = 1).ToBe(True);
+  Expect<Boolean>(DestinationReason <> MissingReason).ToBe(True);
+end;
+
 procedure TTestArtifactSetContract.TestPhysicalSourceAliasIsRejected;
 var
   Artifacts: TLWPTArtifactArray;
@@ -243,6 +273,8 @@ begin
     TestLinkedSourceInsidePrivateRootIsRejected);
   Test('existing destination aliases are rejected',
     TestExistingDestinationIsRejected);
+  Test('exception reasons preserve the failing operation stage',
+    TestExceptionStagesRemainDistinct);
   Test('physical source aliases are rejected',
     TestPhysicalSourceAliasIsRejected);
 end;

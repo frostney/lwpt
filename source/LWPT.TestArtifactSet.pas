@@ -327,13 +327,14 @@ var
   Bundle, Destination: TFileStream;
   Count, ContentLength, Mode: QWord;
   CreatedPaths: TStringList;
-  DestinationPath, Kind, Magic, RelativePath: string;
+  DestinationPath, Kind, Magic, OperationStage, RelativePath: string;
   RawMagic: RawByteString;
   DestinationIsLink: Boolean;
   i: Integer;
 begin
   Result := False;
   AReason := 'artifact-set-invalid';
+  OperationStage := 'bundle-open';
   SetLength(AArtifacts, 0);
   CreatedPaths := TStringList.Create;
   {$IFDEF MSWINDOWS}
@@ -346,6 +347,7 @@ begin
     try
       Bundle := TFileStream.Create(ABundlePath, fmOpenRead or fmShareDenyNone);
       SetLength(RawMagic, Length(ARTIFACT_SET_MAGIC));
+      OperationStage := 'bundle-magic';
       if Bundle.Read(RawMagic[1], Length(RawMagic)) <> Length(RawMagic) then
       begin
         AReason := 'artifact-set-invalid: truncated-magic';
@@ -357,6 +359,7 @@ begin
         AReason := 'artifact-set-invalid: magic';
         Exit;
       end;
+      OperationStage := 'bundle-count';
       if not ReadUInt64(Bundle, Count) then
       begin
         AReason := 'artifact-set-invalid: truncated-count';
@@ -370,38 +373,45 @@ begin
       SetLength(AArtifacts, Count);
       for i := 0 to Count - 1 do
       begin
+        OperationStage := 'artifact-relative-path';
         if not ReadString(Bundle, RelativePath) then
         begin
           AReason := 'artifact-set-invalid: relative-path';
           Exit;
         end;
+        OperationStage := 'artifact-kind';
         if not ReadString(Bundle, Kind) or (Kind = '') then
         begin
           AReason := 'artifact-set-invalid: kind';
           Exit;
         end;
+        OperationStage := 'artifact-mode';
         if not ReadUInt64(Bundle, Mode) or (Mode > $1FF) then
         begin
           AReason := 'artifact-set-invalid: mode';
           Exit;
         end;
+        OperationStage := 'artifact-content-length';
         if not ReadUInt64(Bundle, ContentLength)
            or (ContentLength > QWord(Bundle.Size - Bundle.Position)) then
         begin
           AReason := 'artifact-set-invalid: content-length';
           Exit;
         end;
+        OperationStage := 'destination-path';
         if not SafeDestination(ABuildRoot, RelativePath, DestinationPath) then
         begin
           AReason := 'artifact-set-invalid: destination-path';
           Exit;
         end;
+        OperationStage := 'destination-parent-link';
         if PathHasLinkedComponent(ABuildRoot,
           ExtractFileDir(DestinationPath)) then
         begin
           AReason := 'artifact-set-invalid: destination-parent-link';
           Exit;
         end;
+        OperationStage := 'destination-exists';
         if PathEntry(DestinationPath, DestinationIsLink) then
         begin
           AReason := 'artifact-set-invalid: destination-exists';
@@ -413,13 +423,17 @@ begin
           Exit;
         end;
         CreatedPaths.Add(DestinationPath);
+        OperationStage := 'destination-directory';
         ForceDirectories(ExtractFileDir(DestinationPath));
+        OperationStage := 'destination-create';
         Destination := TFileStream.Create(DestinationPath, fmCreate);
         try
+          OperationStage := 'destination-copy';
           CopyBytes(Bundle, Destination, ContentLength);
         finally
           Destination.Free;
         end;
+        OperationStage := 'destination-mode';
         if not ApplyArtifactUnixMode(DestinationPath, Mode) then
         begin
           AReason := 'artifact-set-invalid: destination-mode';
@@ -427,6 +441,7 @@ begin
         end;
         AArtifacts[i].Kind := Kind;
         AArtifacts[i].Path := DestinationPath;
+        OperationStage := 'destination-digest';
         AArtifacts[i].Digest := 'sha256:' + SHA256File(DestinationPath);
       end;
       if Bundle.Position <> Bundle.Size then
@@ -438,7 +453,8 @@ begin
       Result := True;
     except
       on E: Exception do
-        AReason := 'artifact-set-invalid: exception-' + E.ClassName;
+        AReason := 'artifact-set-invalid: exception-' + OperationStage
+          + '-' + E.ClassName;
     end;
   finally
     Bundle.Free;
