@@ -46,7 +46,7 @@ program	*	source/LWPT.Manifest.Schema.Test.pas	1	7
 program	*	source/LWPT.ManifestEdit.Test.pas	5	31
 program	*	source/LWPT.Observability.Test.pas	1	6
 program	*	source/LWPT.ObjectStore.Test.pas	1	14
-program	unix/*	source/LWPT.ObjectStore.Test.pas	1	17
+program	unix/*	source/LWPT.ObjectStore.Test.pas	1	15
 program	*	source/LWPT.OutputRenderer.Test.pas	1	1
 program	*	source/LWPT.ProducerLease.Test.pas	1	6
 program	unix/*	source/LWPT.ProducerLease.Test.pas	1	7
