@@ -29,8 +29,14 @@ const
   {$IFDEF UNIX}
   {$IFDEF LINUX}
   AT_SYMLINK_NOFOLLOW_LWPT = $00000100;
+  { Linux AArch64 overrides the asm-generic directory and no-follow bits. }
+  {$IFDEF CPUAARCH64}
+  O_DIRECTORY_LWPT = $00004000;
+  O_NOFOLLOW_LWPT = $00008000;
+  {$ELSE}
   O_DIRECTORY_LWPT = $00010000;
   O_NOFOLLOW_LWPT = $00020000;
+  {$ENDIF}
   O_NONBLOCK_LWPT = $00000800;
   {$ELSE}
   {$IFDEF DARWIN}
