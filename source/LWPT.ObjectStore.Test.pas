@@ -91,16 +91,11 @@ begin
   SysUtils.DeleteFile(APath);
 end;
 
-procedure CorruptMaterializeSource(const ADigest, APath: string);
-var
-  Stream: TFileStream;
+procedure CorruptMaterializeStage(const ADigest: string;
+  const AStream: TStream);
 begin
-  Stream := TFileStream.Create(APath, fmCreate);
-  try
-    Stream.WriteBuffer(ADigest[1], 1);
-  finally
-    Stream.Free;
-  end;
+  AStream.Position := 0;
+  AStream.WriteBuffer(ADigest[1], 1);
 end;
 
 type
@@ -518,6 +513,7 @@ procedure TObjectStoreContract.ResetScratch;
 begin
   ObjectStoreBeforeMaterializeCopyTestHook := nil;
   ObjectStoreAfterMaterializeCopyTestHook := nil;
+  ObjectStoreAfterMaterializeCopyStreamTestHook := nil;
   ObjectStoreBeforeStreamProtectionTestHook := nil;
   {$IFDEF UNIX}
   ProcessTreeBeforeUnmanagedSpawnLockTestHook := nil;
@@ -753,13 +749,14 @@ begin
     end;
 
     Store.Admit(FSource, FDigest);
-    ObjectStoreBeforeMaterializeCopyTestHook := CorruptMaterializeSource;
+    ObjectStoreAfterMaterializeCopyStreamTestHook :=
+      CorruptMaterializeStage;
     try
       Expect<Boolean>(Store.Materialize(FDigest, Destination,
         FScratch + '/project/tmp', Failure)).ToBe(False);
       Expect<Integer>(Ord(Failure)).ToBe(Ord(omfStagedHashMismatch));
     finally
-      ObjectStoreBeforeMaterializeCopyTestHook := nil;
+      ObjectStoreAfterMaterializeCopyStreamTestHook := nil;
     end;
   finally
     Store.Free;

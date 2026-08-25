@@ -9,6 +9,7 @@ unit LWPT.ObjectStore;
 interface
 
 uses
+  Classes,
   SysUtils,
 
   LWPT.CacheLifecycle,
@@ -36,6 +37,8 @@ type
     ADestination: string);
   TLWPTObjectStoreMaterializeHook = procedure(const ADigest,
     APath: string);
+  TLWPTObjectStoreMaterializeStreamHook = procedure(
+    const ADigest: string; const AStream: TStream);
   TLWPTObjectStoreStreamOpenedHook = procedure(const APath: string);
   {$ENDIF}
 
@@ -92,6 +95,8 @@ var
     TLWPTObjectStoreMaterializeHook;
   ObjectStoreAfterMaterializeCopyTestHook:
     TLWPTObjectStoreMaterializeHook;
+  ObjectStoreAfterMaterializeCopyStreamTestHook:
+    TLWPTObjectStoreMaterializeStreamHook;
   ObjectStoreBeforeStreamProtectionTestHook:
     TLWPTObjectStoreStreamOpenedHook;
 {$ENDIF}
@@ -102,7 +107,6 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
-  Classes,
   LWPT.ProcessTree;
 
 {$IFDEF UNIX}
@@ -183,6 +187,9 @@ begin
       {$IFDEF OBJECTSTORE_TESTING}
         if Assigned(ObjectStoreAfterMaterializeCopyTestHook) then
           ObjectStoreAfterMaterializeCopyTestHook(ADigest, ADst);
+        if Assigned(ObjectStoreAfterMaterializeCopyStreamTestHook) then
+          ObjectStoreAfterMaterializeCopyStreamTestHook(ADigest,
+            Destination);
       {$ENDIF}
         Destination.Position := 0;
         SetLength(Buffer, Destination.Size);
