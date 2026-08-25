@@ -68,6 +68,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestDefaultIdentityIsDeterministic;
+    procedure TestDefaultIdentitySurvivesHTTPSReconfiguration;
     procedure TestExplicitIdentitySurvivesReconfiguration;
     procedure TestPlainHTTPRejectsRemoteBinding;
     procedure TestInvalidConfigurationLeavesFreshRootUncommitted;
@@ -91,6 +92,7 @@ type
     procedure TestServerRejectsCorruptContentAddressedBytes;
     procedure TestLargeResourceUsesStreamedDescriptor;
     procedure TestOversizedResourceIsRejectedBeforeHashing;
+    procedure TestResourceOpenRejectsUnsafeFilesystemKinds;
     procedure TestServerErrorsConformToWireContract;
     procedure TestRenewalErrorDoesNotDiscloseStorePath;
     procedure TestServerDiscoveryIsTruthful;
@@ -210,6 +212,24 @@ begin
     Expect<string>(Store.Config.Identity).ToBe(REGISTRY_DEFAULT_BASE_URL);
     FirstState := Store.LoadCurrentState;
     Expect<Int64>(FirstState.Sequence).ToBe(1);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestDefaultIdentitySurvivesHTTPSReconfiguration;
+var
+  Config: TLWPTRegistryConfig;
+  Store: TLWPTRegistryStore;
+begin
+  Store := InitializeStore;
+  Store.Free;
+  Config := RegistryConfiguration('', 'https://moved.example', 'localhost',
+    8443, FScratch + '/identity.p12', 'REGISTRY_PASSWORD');
+  Store := TLWPTRegistryStore.Initialize(FScratch, Config, SECOND_TIME);
+  try
+    Expect<string>(Store.Config.Identity).ToBe(REGISTRY_DEFAULT_BASE_URL);
+    Expect<string>(Store.Config.BaseURL).ToBe('https://moved.example');
   finally
     Store.Free;
   end;
@@ -830,6 +850,63 @@ begin
   end;
 end;
 
+procedure TRegistryStoreContract.TestResourceOpenRejectsUnsafeFilesystemKinds;
+{$IFDEF UNIX}
+var
+  Diagnostic, ParentPath, RealParentPath, ResourcePath: string;
+  Elapsed, Started: QWord;
+  Response: TLWPTRegistryHTTPResponse;
+  ResourceStream: TStream;
+  Stream: TFileStream;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  ParentPath := FScratch + '/open-safe';
+  RealParentPath := FScratch + '/open-real';
+  ResourcePath := ParentPath + '/inner/resource';
+  ForceDirectories(ExtractFileDir(ResourcePath));
+  Stream := TFileStream.Create(ResourcePath, fmCreate);
+  try
+    Stream.WriteBuffer('payload'[1], Length('payload'));
+  finally
+    Stream.Free;
+  end;
+  FillChar(Response, SizeOf(Response), 0);
+  Response.ResourcePath := ResourcePath;
+  Response.ResourceLength := Length('payload');
+  Expect<Boolean>(RenameFile(ParentPath, RealParentPath)).ToBe(True);
+  Expect<Integer>(FpSymlink(PChar(RealParentPath), PChar(ParentPath))).ToBe(0);
+  Diagnostic := '';
+  ResourceStream := nil;
+  try
+    ResourceStream := OpenRegistryHTTPResource(Response);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  ResourceStream.Free;
+  Expect<Boolean>(Pos('resource_changed:', Diagnostic) = 1).ToBe(True);
+  Expect<Boolean>(DeleteFile(ParentPath)).ToBe(True);
+  Expect<Boolean>(RenameFile(RealParentPath, ParentPath)).ToBe(True);
+
+  Expect<Boolean>(DeleteFile(ResourcePath)).ToBe(True);
+  Expect<Integer>(FpMkFifo(PChar(ResourcePath), &600)).ToBe(0);
+  Diagnostic := '';
+  ResourceStream := nil;
+  Started := GetTickCount64;
+  try
+    ResourceStream := OpenRegistryHTTPResource(Response);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Elapsed := GetTickCount64 - Started;
+  ResourceStream.Free;
+  Expect<Boolean>(Pos('resource_changed:', Diagnostic) = 1).ToBe(True);
+  Expect<Boolean>(Elapsed < 1000).ToBe(True);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TRegistryStoreContract.TestServerErrorsConformToWireContract;
 var
   Body, ExpectedBody, Wire: string;
@@ -1073,6 +1150,8 @@ end;
 procedure TRegistryStoreContract.SetupTests;
 begin
   Test('default identity is deterministic', TestDefaultIdentityIsDeterministic);
+  Test('default identity survives HTTPS reconfiguration',
+    TestDefaultIdentitySurvivesHTTPSReconfiguration);
   Test('explicit identity survives reconfiguration',
     TestExplicitIdentitySurvivesReconfiguration);
   Test('plain HTTP rejects a remote binding',
@@ -1116,6 +1195,8 @@ begin
     TestLargeResourceUsesStreamedDescriptor);
   Test('oversized resource is rejected before hashing',
     TestOversizedResourceIsRejectedBeforeHashing);
+  Test('resource open rejects unsafe filesystem kinds',
+    TestResourceOpenRejectsUnsafeFilesystemKinds);
   Test('server errors conform to the wire contract',
     TestServerErrorsConformToWireContract);
   Test('renewal error does not disclose the store path',

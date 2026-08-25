@@ -838,7 +838,7 @@ begin
 
     SetLength(RegistryOpts, 7);
     RegistryOpts[0] := TStringOption.Create('data-dir',
-      'Origin data directory (default: .lwpt/registry)');
+      'Origin data directory (default: ' + REGISTRY_DEFAULT_DATA_DIR + ')');
     RegistryOpts[1] := TStringOption.Create('identity',
       'Stable canonical HTTPS origin identity (init only)');
     RegistryOpts[2] := TStringOption.Create('base-url',

@@ -14,14 +14,13 @@ uses
   LWPT.Registry.Store;
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
-  const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
+  const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean);
 
 implementation
 
 {$IFDEF DARWIN}
 
 uses
-  BaseUnix,
   Classes,
   SysUtils,
 
@@ -48,7 +47,6 @@ const
   NW_CONNECTION_STATE_READY = 3;
   NW_CONNECTION_STATE_FAILED = 4;
   NW_CONNECTION_STATE_CANCELLED = 5;
-  O_NOFOLLOW_LWPT = $00000100;
 
 type
   PBlockDescriptor = ^TBlockDescriptor;
@@ -312,12 +310,19 @@ var
 begin
   EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
-  Server.FListenerState := AState;
   case AState of
     NW_LISTENER_STATE_READY, NW_LISTENER_STATE_FAILED:
-      Dispatch_semaphore_signal(Server.FReadySemaphore);
+      begin
+        InterLockedExchange(Server.FListenerState, AState);
+        Dispatch_semaphore_signal(Server.FReadySemaphore);
+      end;
     NW_LISTENER_STATE_CANCELLED:
-      Dispatch_semaphore_signal(Server.FListenerDoneSemaphore);
+      begin
+        { Publish cancellation only after the callback's final semaphore use. }
+        Dispatch_semaphore_signal(Server.FListenerDoneSemaphore);
+        InterLockedExchange(Server.FListenerState, AState);
+      end;
+    else InterLockedExchange(Server.FListenerState, AState);
   end;
 end;
 
@@ -592,36 +597,45 @@ begin
   Nw_release(AConnection.FConnection);
   Dispatch_release(AConnection.FQueue);
   AConnection.Free;
-  InterLockedDecrement(FActiveConnections);
+  { Active-count zero is the callback-complete publication. The decrement must
+    be the callback's final access to server-owned storage. }
   Dispatch_semaphore_signal(FDrainSemaphore);
+  InterLockedDecrement(FActiveConnections);
 end;
 
 function ReadPKCS12WithoutFollowingLinks(const APath: string): TBytes;
 var
-  Descriptor, ReadCount, Total: Integer;
-  FileInfo: Stat;
+  Stream: TStream;
 begin
-  Descriptor := FpOpen(PChar(APath), O_RDONLY or O_NOFOLLOW_LWPT);
-  if Descriptor < 0 then
-    raise ELWPTRegistryError.CreateStable('tls_configuration',
-      'could not open PKCS#12 identity without following links');
+  Result := nil;
+  Stream := nil;
   try
-    if (FpFStat(Descriptor, FileInfo) <> 0) or not FPS_ISREG(FileInfo.st_mode)
-      or (FileInfo.st_size < 1) or (FileInfo.st_size > MAX_PKCS12_BYTES) then
-      raise ELWPTRegistryError.CreateStable('tls_configuration',
-        'PKCS#12 identity must be a regular file from 1 byte through 16 MiB');
-    SetLength(Result, FileInfo.st_size);
-    Total := 0;
-    while Total < Length(Result) do
-    begin
-      ReadCount := FpRead(Descriptor, Result[Total], Length(Result) - Total);
-      if ReadCount <= 0 then
+    try
+      try
+        Stream := OpenRegistryFileWithoutFollowingLinks(APath);
+      except
+        on E: Exception do
+          raise ELWPTRegistryError.CreateStable('tls_configuration',
+            'could not open PKCS#12 identity without following links');
+      end;
+      if (Stream.Size < 1) or (Stream.Size > MAX_PKCS12_BYTES) then
         raise ELWPTRegistryError.CreateStable('tls_configuration',
-          'could not read the complete PKCS#12 identity');
-      Inc(Total, ReadCount);
+          'PKCS#12 identity must be a regular file from 1 byte through 16 MiB');
+      SetLength(Result, Stream.Size);
+      try
+        Stream.ReadBuffer(Result[0], Length(Result));
+      except
+        on E: Exception do
+          raise ELWPTRegistryError.CreateStable('tls_configuration',
+            'could not read the complete PKCS#12 identity');
+      end;
+    except
+      if Length(Result) > 0 then FillChar(Result[0], Length(Result), 0);
+      Result := nil;
+      raise;
     end;
   finally
-    FpClose(Descriptor);
+    Stream.Free;
   end;
 end;
 
@@ -780,7 +794,8 @@ begin
   Nw_listener_start(FListener);
   Dispatch_semaphore_wait(FReadySemaphore,
     Dispatch_time(0, LISTENER_READY_TIMEOUT_SECONDS * NANOSECONDS_PER_SECOND));
-  if FListenerState <> NW_LISTENER_STATE_READY then
+  if InterLockedExchangeAdd(FListenerState, 0)
+    <> NW_LISTENER_STATE_READY then
     raise ELWPTRegistryError.CreateStable('listen_failed',
       'Network.framework could not bind the configured endpoint');
 end;
@@ -793,7 +808,8 @@ begin
   if FListener <> nil then
   begin
     Nw_listener_cancel(FListener);
-    while FListenerState <> NW_LISTENER_STATE_CANCELLED do
+    while InterLockedExchangeAdd(FListenerState, 0)
+      <> NW_LISTENER_STATE_CANCELLED do
       Dispatch_semaphore_wait(FListenerDoneSemaphore,
         Dispatch_time(0, DRAIN_POLL_MILLISECONDS
           * NANOSECONDS_PER_MILLISECOND));
@@ -873,12 +889,19 @@ begin
 end;
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
-  const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
+  const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean);
 var
   Server: TNetworkFrameworkRegistryServer;
 begin
-  Server := TNetworkFrameworkRegistryServer.Create(AStore, APKCS12Path,
-    APassphrase, AStopFlag);
+  Server := nil;
+  try
+    Server := TNetworkFrameworkRegistryServer.Create(AStore, APKCS12Path,
+      APassphrase, AStopFlag);
+  finally
+    if Length(APassphrase) > 0 then
+      FillChar(APassphrase[1], Length(APassphrase) * SizeOf(Char), 0);
+    APassphrase := '';
+  end;
   try
     Server.Run;
   finally
@@ -892,8 +915,11 @@ initialization
 {$ELSE}
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
-  const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
+  const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean);
 begin
+  if Length(APassphrase) > 0 then
+    FillChar(APassphrase[1], Length(APassphrase) * SizeOf(Char), 0);
+  APassphrase := '';
   raise ELWPTRegistryError.CreateStable('tls_unavailable',
     'Network.framework registry transport is available only on macOS');
 end;

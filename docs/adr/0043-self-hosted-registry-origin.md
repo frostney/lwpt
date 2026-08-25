@@ -72,8 +72,11 @@ stricter creation path: staging and destination are private from their first
 open, Unix mode `0600` or the Windows owner-and-system ACL is verified before
 commit, and initialization fails closed if that cannot be guaranteed. The
 password is read from the named environment variable only while constructing
-the TLS listener; it is never persisted. The PKCS#12 path is persisted as an
-absolute path so a supervisor may restart from another working directory.
+the TLS listener, and its mutable buffer is wiped before the listener run loop
+begins; it is never persisted. The PKCS#12 path is persisted as an absolute
+path so a supervisor may restart from another working directory. Its components
+are opened without following links, and a nonblocking retained handle must name
+a regular file before any bytes are imported.
 
 An active checkpoint is renewed when less than 24 hours of its seven-day
 validity remains. Renewal keeps the package sequence and snapshot unchanged,
@@ -125,11 +128,11 @@ and closes it after one bounded HTTP/1.1 GET or HEAD request. One ten-second
 monotonic deadline covers handshake, request, and response; request headers are
 capped at 32 KiB. A response resource is capped at 2,147,483,647 bytes, matching
 the platform-safe maximum accepted by the current publication and state-loading
-surface. The listener opens it once without following a final-path link, checks
-its length and digest in cancellable 64 KiB steps, rewinds that retained handle,
-and sends from the same handle through one connection-owned buffer. The listener
-never builds a second
-body-sized wire response in memory. Shutdown
+surface. The listener opens every path component without following links,
+retains verified parent handles through a nonblocking regular-file open, checks
+the resource length and digest in cancellable 64 KiB steps, rewinds that retained
+handle, and sends from the same handle through one connection-owned buffer. The
+listener never builds a second body-sized wire response in memory. Shutdown
 interrupts acceptance, cancels every client, drains
 its workers or Network.framework callbacks, and only then releases the store
 and TLS context. Hashed objects, records, and snapshots are SHA-256 checked

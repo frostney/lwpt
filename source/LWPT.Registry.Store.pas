@@ -17,7 +17,7 @@ uses
   LWPT.Core;
 
 const
-  REGISTRY_DEFAULT_DATA_DIR = '.lwpt/registry';
+  REGISTRY_DEFAULT_DATA_DIR = LWPT_DIR + '/registry';
   REGISTRY_DEFAULT_BASE_URL = 'http://localhost:8080';
   REGISTRY_DEFAULT_LISTEN_ADDRESS = 'localhost';
   REGISTRY_DEFAULT_PORT = 8080;
@@ -770,8 +770,9 @@ begin
   BaseURL := CanonicalRegistryURL(AConfig.BaseURL, False);
   if BaseURL <> AConfig.BaseURL then
     raise ELWPTRegistryError.CreateStable('invalid_url', 'base URL is not canonical; use ' + BaseURL);
-  Identity := CanonicalRegistryURL(AConfig.Identity,
-    AConfig.Identity <> AConfig.BaseURL);
+  { Persisted identities include the default loopback HTTP identity. The
+    explicit-identity HTTPS rule is enforced only during first initialization. }
+  Identity := CanonicalRegistryURL(AConfig.Identity, False);
   if Identity <> AConfig.Identity then
     raise ELWPTRegistryError.CreateStable('invalid_identity', 'origin identity is not canonical; use ' + Identity);
   if (AConfig.ListenAddress = '') or (AConfig.Port = 0) then
@@ -1160,8 +1161,7 @@ begin
         Config := ARequested;
         if Config.Identity = '' then Config.Identity := Existing.Config.Identity;
         Config.BaseURL := CanonicalRegistryURL(Config.BaseURL, False);
-        Config.Identity := CanonicalRegistryURL(Config.Identity,
-          Config.Identity <> Config.BaseURL);
+        Config.Identity := CanonicalRegistryURL(Config.Identity, False);
         if Config.TLSPKCS12Path <> '' then
           Config.TLSPKCS12Path := ExpandFileName(Config.TLSPKCS12Path);
         if Config.Identity <> Existing.Config.Identity then
