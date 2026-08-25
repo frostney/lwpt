@@ -773,6 +773,7 @@ begin
      or (AReason = 'artifact-verification-failed')
      or (AReason = 'artifact-mode-failed')
      or (AReason = 'artifact-set-invalid')
+     or (Pos('artifact-set-invalid: ', AReason) = 1)
      or (AReason = 'result-kind-mismatch') then
     Result := 'cache corruption: ' + AReason
   else

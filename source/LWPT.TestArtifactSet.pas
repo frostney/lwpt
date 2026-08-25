@@ -327,13 +327,14 @@ var
   Bundle, Destination: TFileStream;
   Count, ContentLength, Mode: QWord;
   CreatedPaths: TStringList;
-  DestinationPath, Kind, Magic, RelativePath: string;
+  DestinationPath, Kind, Magic, OperationStage, RelativePath: string;
   RawMagic: RawByteString;
   DestinationIsLink: Boolean;
   i: Integer;
 begin
   Result := False;
   AReason := 'artifact-set-invalid';
+  OperationStage := 'bundle-open';
   SetLength(AArtifacts, 0);
   CreatedPaths := TStringList.Create;
   {$IFDEF MSWINDOWS}
@@ -346,44 +347,114 @@ begin
     try
       Bundle := TFileStream.Create(ABundlePath, fmOpenRead or fmShareDenyNone);
       SetLength(RawMagic, Length(ARTIFACT_SET_MAGIC));
+      OperationStage := 'bundle-magic';
       if Bundle.Read(RawMagic[1], Length(RawMagic)) <> Length(RawMagic) then
+      begin
+        AReason := 'artifact-set-invalid: truncated-magic';
         Exit;
+      end;
       Magic := string(RawMagic);
-      if Magic <> ARTIFACT_SET_MAGIC then Exit;
-      if not ReadUInt64(Bundle, Count) or (Count = 0)
-         or (Count > ARTIFACT_SET_MAX_COUNT) then Exit;
+      if Magic <> ARTIFACT_SET_MAGIC then
+      begin
+        AReason := 'artifact-set-invalid: magic';
+        Exit;
+      end;
+      OperationStage := 'bundle-count';
+      if not ReadUInt64(Bundle, Count) then
+      begin
+        AReason := 'artifact-set-invalid: truncated-count';
+        Exit;
+      end;
+      if (Count = 0) or (Count > ARTIFACT_SET_MAX_COUNT) then
+      begin
+        AReason := 'artifact-set-invalid: count';
+        Exit;
+      end;
       SetLength(AArtifacts, Count);
       for i := 0 to Count - 1 do
       begin
-        if not ReadString(Bundle, RelativePath)
-           or not ReadString(Bundle, Kind)
-           or (Kind = '')
-           or not ReadUInt64(Bundle, Mode) or (Mode > $1FF)
-           or not ReadUInt64(Bundle, ContentLength)
-           or (ContentLength > QWord(Bundle.Size - Bundle.Position))
-           or not SafeDestination(ABuildRoot, RelativePath, DestinationPath)
-           or PathHasLinkedComponent(ABuildRoot,
-             ExtractFileDir(DestinationPath))
-           or PathEntry(DestinationPath, DestinationIsLink)
-           or (CreatedPaths.IndexOf(DestinationPath) >= 0) then Exit;
+        OperationStage := 'artifact-relative-path';
+        if not ReadString(Bundle, RelativePath) then
+        begin
+          AReason := 'artifact-set-invalid: relative-path';
+          Exit;
+        end;
+        OperationStage := 'artifact-kind';
+        if not ReadString(Bundle, Kind) or (Kind = '') then
+        begin
+          AReason := 'artifact-set-invalid: kind';
+          Exit;
+        end;
+        OperationStage := 'artifact-mode';
+        if not ReadUInt64(Bundle, Mode) or (Mode > $1FF) then
+        begin
+          AReason := 'artifact-set-invalid: mode';
+          Exit;
+        end;
+        OperationStage := 'artifact-content-length';
+        if not ReadUInt64(Bundle, ContentLength)
+           or (ContentLength > QWord(Bundle.Size - Bundle.Position)) then
+        begin
+          AReason := 'artifact-set-invalid: content-length';
+          Exit;
+        end;
+        OperationStage := 'destination-path';
+        if not SafeDestination(ABuildRoot, RelativePath, DestinationPath) then
+        begin
+          AReason := 'artifact-set-invalid: destination-path';
+          Exit;
+        end;
+        OperationStage := 'destination-parent-link';
+        if PathHasLinkedComponent(ABuildRoot,
+          ExtractFileDir(DestinationPath)) then
+        begin
+          AReason := 'artifact-set-invalid: destination-parent-link';
+          Exit;
+        end;
+        OperationStage := 'destination-exists';
+        if PathEntry(DestinationPath, DestinationIsLink) then
+        begin
+          AReason := 'artifact-set-invalid: destination-exists';
+          Exit;
+        end;
+        if CreatedPaths.IndexOf(DestinationPath) >= 0 then
+        begin
+          AReason := 'artifact-set-invalid: duplicate-destination';
+          Exit;
+        end;
         CreatedPaths.Add(DestinationPath);
+        OperationStage := 'destination-directory';
         ForceDirectories(ExtractFileDir(DestinationPath));
+        OperationStage := 'destination-create';
         Destination := TFileStream.Create(DestinationPath, fmCreate);
         try
+          OperationStage := 'destination-copy';
           CopyBytes(Bundle, Destination, ContentLength);
         finally
           Destination.Free;
         end;
-        if not ApplyArtifactUnixMode(DestinationPath, Mode) then Exit;
+        OperationStage := 'destination-mode';
+        if not ApplyArtifactUnixMode(DestinationPath, Mode) then
+        begin
+          AReason := 'artifact-set-invalid: destination-mode';
+          Exit;
+        end;
         AArtifacts[i].Kind := Kind;
         AArtifacts[i].Path := DestinationPath;
+        OperationStage := 'destination-digest';
         AArtifacts[i].Digest := 'sha256:' + SHA256File(DestinationPath);
       end;
-      if Bundle.Position <> Bundle.Size then Exit;
+      if Bundle.Position <> Bundle.Size then
+      begin
+        AReason := 'artifact-set-invalid: trailing-bytes';
+        Exit;
+      end;
       AReason := 'hit';
       Result := True;
     except
-      on E: Exception do AReason := 'artifact-set-invalid';
+      on E: Exception do
+        AReason := 'artifact-set-invalid: exception-' + OperationStage
+          + '-' + E.ClassName;
     end;
   finally
     Bundle.Free;

@@ -146,6 +146,7 @@ type
   TTestScheduling = class(TTestSuite)
   private
     FScratch: string;
+    FPreparedCacheDiagnostics: string;
     procedure ResetProject(const ABail: Integer);
     procedure WriteMarkerProgram(const AFileName, AMarker: string;
       const AExitCode: Integer);
@@ -158,6 +159,8 @@ type
       const ANeedle: string): Integer; overload;
     function SessionLogOccurrenceCount(const ARun: TLwptResult;
       const ANeedle: string; out AMatchingLines: string): Integer; overload;
+    function SessionCacheDecisionDiagnostics(
+      const ARun: TLwptResult): string;
     procedure AssertPreparedFixturesUsed(const ARun: TLwptResult;
       const AExpectedCount: Integer);
     function RunTests(const AArgs: array of string): TLwptResult;
@@ -178,6 +181,7 @@ type
     procedure SetupTests; override;
     procedure TestDefaultJobsOverlap;
     procedure TestCacheUnavailableDiagnosticIsBoundedSingleLine;
+    procedure TestPreparedCacheFailureReportsSourceDecisions;
     procedure TestJobsOneRunsInSourceOrder;
     procedure TestBailZeroOverridesManifestAndRunsAll;
     procedure TestCompileFailureCountsTowardBail;
@@ -443,6 +447,7 @@ begin
   RecursiveDelete(FScratch);
   ForceDirectories(FScratch + '/tests');
   ForceDirectories(FScratch + '/control');
+  FPreparedCacheDiagnostics := '';
 end;
 
 procedure TTestScheduling.ResetProject(const ABail: Integer);
@@ -563,6 +568,8 @@ begin
       Fail('fixture setup exceeded its parent-owned '
         + UIntToStr(SetupTimeoutMilliseconds) + ' ms deadline');
     Expect<Integer>(SetupResult.ExitCode).ToBe(0);
+    FPreparedCacheDiagnostics :=
+      SessionCacheDecisionDiagnostics(SetupResult);
     { Ready markers prove bounded setup completion. Each caller immediately
       proves exact direct-cache reuse and rejects every compilation path. }
     for Index := 0 to High(AReadyMarkers) do
@@ -639,31 +646,69 @@ begin
   end;
 end;
 
+function TTestScheduling.SessionCacheDecisionDiagnostics(
+  const ARun: TLwptResult): string;
+var
+  MatchingLines: string;
+
+  procedure AppendDecision(const ANeedle: string);
+  begin
+    SessionLogOccurrenceCount(ARun, ANeedle, MatchingLines);
+    if MatchingLines = '' then Exit;
+    if Result <> '' then Result := Result + ' | ';
+    Result := Result + MatchingLines;
+  end;
+
+begin
+  Result := '';
+  AppendDecision('cache hit: sha256:');
+  AppendDecision('cache wait hit: sha256:');
+  AppendDecision('cache takeover hit: sha256:');
+  AppendDecision('cache miss:');
+  AppendDecision('cache corruption:');
+  AppendDecision('cache bypass:');
+  AppendDecision('cache stored:');
+  AppendDecision('cache store skipped:');
+end;
+
 procedure TTestScheduling.AssertPreparedFixturesUsed(const ARun: TLwptResult;
   const AExpectedCount: Integer);
 var
   CacheBypassCount, CacheCorruptionCount, CacheHitCount, CacheMissCount,
-    CacheStoreCount, CacheTakeoverHitCount, CacheWaitHitCount: Integer;
-  CacheBypassLines, DiagnosticSuffix: string;
+    CacheStoreCount, CacheTakeoverHitCount, CacheWaitHitCount,
+    StoreSkippedCount: Integer;
+  CacheBypassLines, CacheCorruptionLines, CacheHitLines, CacheMissLines,
+    CacheStoreLines, CacheTakeoverHitLines, CacheWaitHitLines,
+    DiagnosticLines, DiagnosticSuffix, StoreSkippedLines: string;
 begin
-  CacheHitCount := SessionLogOccurrenceCount(ARun, 'cache hit: sha256:');
+  CacheHitCount := SessionLogOccurrenceCount(ARun, 'cache hit: sha256:',
+    CacheHitLines);
   CacheWaitHitCount := SessionLogOccurrenceCount(ARun,
-    'cache wait hit: sha256:');
+    'cache wait hit: sha256:', CacheWaitHitLines);
   CacheTakeoverHitCount := SessionLogOccurrenceCount(ARun,
-    'cache takeover hit: sha256:');
-  CacheMissCount := SessionLogOccurrenceCount(ARun, 'cache miss:');
+    'cache takeover hit: sha256:', CacheTakeoverHitLines);
+  CacheMissCount := SessionLogOccurrenceCount(ARun, 'cache miss:',
+    CacheMissLines);
   CacheCorruptionCount := SessionLogOccurrenceCount(ARun,
-    'cache corruption:');
+    'cache corruption:', CacheCorruptionLines);
   CacheBypassCount := SessionLogOccurrenceCount(ARun, 'cache bypass:',
     CacheBypassLines);
-  CacheStoreCount := SessionLogOccurrenceCount(ARun, 'cache stored:');
+  CacheStoreCount := SessionLogOccurrenceCount(ARun, 'cache stored:',
+    CacheStoreLines);
+  StoreSkippedCount := SessionLogOccurrenceCount(ARun,
+    'cache store skipped:', StoreSkippedLines);
+  DiagnosticLines := SessionCacheDecisionDiagnostics(ARun);
   DiagnosticSuffix := '';
-  if CacheBypassLines <> '' then
-    DiagnosticSuffix := '; diagnostics: ' + CacheBypassLines;
+  if FPreparedCacheDiagnostics <> '' then
+    DiagnosticSuffix := '; setup diagnostics: '
+      + FPreparedCacheDiagnostics;
+  if DiagnosticLines <> '' then
+    DiagnosticSuffix := DiagnosticSuffix + '; behavior diagnostics: '
+      + DiagnosticLines;
   if (CacheHitCount <> AExpectedCount) or (CacheWaitHitCount <> 0)
      or (CacheTakeoverHitCount <> 0) or (CacheMissCount <> 0)
      or (CacheCorruptionCount <> 0) or (CacheBypassCount <> 0)
-     or (CacheStoreCount <> 0) then
+     or (CacheStoreCount <> 0) or (StoreSkippedCount <> 0) then
     Fail('behavior run cache proof failed: direct hits '
       + IntToStr(CacheHitCount) + '/' + IntToStr(AExpectedCount)
       + ', wait hits ' + IntToStr(CacheWaitHitCount) + ', takeover hits '
@@ -671,7 +716,8 @@ begin
       + IntToStr(CacheMissCount) + ', corruptions '
       + IntToStr(CacheCorruptionCount) + ', bypasses '
       + IntToStr(CacheBypassCount) + ', stores '
-      + IntToStr(CacheStoreCount) + DiagnosticSuffix);
+      + IntToStr(CacheStoreCount) + ', store skips '
+      + IntToStr(StoreSkippedCount) + DiagnosticSuffix);
 end;
 
 procedure TTestScheduling.TestCacheUnavailableDiagnosticIsBoundedSingleLine;
@@ -710,6 +756,65 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
   Expect<Boolean>(Pos('diagnostics: fixture.log: cache bypass: unavailable '
     + '(EProbe: rendered detail)', ErrorMessage) > 0).ToBe(True);
+end;
+
+procedure TTestScheduling.TestPreparedCacheFailureReportsSourceDecisions;
+var
+  ErrorMessage, LogDirectory, SetupLogDirectory: string;
+  Raised: Boolean;
+  RunResult, SetupResult: TLwptResult;
+begin
+  SetupLogDirectory := FScratch + '/.lwpt/sessions/s-setup/logs';
+  ForceDirectories(SetupLogDirectory);
+  WriteTextFile(SetupLogDirectory + '/tests_A.Prepared.Test.pas.log',
+    'cache miss: no-result: sha256:' + StringOfChar('c', 64) + LineEnding
+    + 'cache stored: sha256:' + StringOfChar('c', 64) + LineEnding);
+  WriteTextFile(SetupLogDirectory + '/tests_B.Prepared.Test.pas.log',
+    'cache miss: no-result: sha256:' + StringOfChar('d', 64) + LineEnding
+    + 'cache store skipped: inputs changed during compilation' + LineEnding);
+  SetupResult := Default(TLwptResult);
+  SetupResult.Stdout := 'test session: s-setup '
+    + '(.lwpt/sessions/s-setup)' + LineEnding;
+  FPreparedCacheDiagnostics :=
+    SessionCacheDecisionDiagnostics(SetupResult);
+
+  LogDirectory := FScratch + '/.lwpt/sessions/s-prepared/logs';
+  ForceDirectories(LogDirectory);
+  WriteTextFile(LogDirectory + '/tests_A.Prepared.Test.pas.log',
+    'cache hit: sha256:' + StringOfChar('a', 64) + LineEnding);
+  WriteTextFile(LogDirectory + '/tests_B.Prepared.Test.pas.log',
+    'cache corruption: artifact-set-invalid: destination-exists: sha256:'
+    + StringOfChar('b', 64) + LineEnding
+    + 'cache stored: sha256:' + StringOfChar('b', 64) + LineEnding);
+  RunResult := Default(TLwptResult);
+  RunResult.Stdout := 'test session: s-prepared '
+    + '(.lwpt/sessions/s-prepared)' + LineEnding;
+  Raised := False;
+  ErrorMessage := '';
+  try
+    AssertPreparedFixturesUsed(RunResult, 2);
+  except
+    on E: ETestAssertionError do
+    begin
+      Raised := True;
+      ErrorMessage := E.Message;
+    end;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(Pos('setup diagnostics:', ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_A.Prepared.Test.pas.log: cache miss: '
+    + 'no-result: sha256:'
+    + StringOfChar('c', 64), ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache store skipped: '
+    + 'inputs changed during compilation', ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('behavior diagnostics:', ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_A.Prepared.Test.pas.log: cache hit: '
+    + 'sha256:' + StringOfChar('a', 64), ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache corruption: '
+    + 'artifact-set-invalid: destination-exists: sha256:'
+    + StringOfChar('b', 64), ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache stored: sha256:'
+    + StringOfChar('b', 64), ErrorMessage) > 0).ToBe(True);
 end;
 
 function TTestScheduling.RunTests(const AArgs: array of string): TLwptResult;
@@ -2722,6 +2827,8 @@ begin
   Test('default jobs overlap', TestDefaultJobsOverlap);
   Test('cache unavailable diagnostic is bounded and single-line',
     TestCacheUnavailableDiagnosticIsBoundedSingleLine);
+  Test('prepared cache failures report source decisions and fingerprints',
+    TestPreparedCacheFailureReportsSourceDecisions);
   Test('--jobs=1 runs in source order', TestJobsOneRunsInSourceOrder);
   Test('--bail=0 overrides manifest and runs all',
     TestBailZeroOverridesManifestAndRunsAll);
