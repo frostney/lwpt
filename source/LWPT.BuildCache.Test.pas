@@ -25,6 +25,7 @@ uses
 const
   STORE_CHILD_SWITCH = '--build-cache-store-child';
   MATERIALIZE_CHILD_SWITCH = '--build-cache-materialize-child';
+  NO_SIGNAL_PATH = '-';
   CHILD_TIMEOUT_MS = 10000;
   TEST_FINGERPRINT =
     'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -46,7 +47,10 @@ type
     function ObjectPath(const ADigest: string): string;
     function ReferencePath(const AFingerprint: string): string;
     function StartStoreChild(const AArtifact: string;
-      const ABudget: string = ''): TProcess;
+      const ABudget: string = '';
+      const AFingerprint: string = TEST_FINGERPRINT;
+      const AReadyPath: string = '';
+      const AReleasePath: string = ''): TProcess;
     function StartMaterializeChild(const AArtifactDigest,
       ADestination, AReadyPath, AReleasePath: string;
       const AAfterCopy: Boolean = False;
@@ -66,6 +70,7 @@ type
     procedure TestCorruptArtifactIsRejected;
     procedure TestMixedCaseReferenceIsInvalidated;
     procedure TestConcurrentStoresPublishOneMatchingCompleteResult;
+    procedure TestConcurrentDistinctStoresPublishBothCompleteResults;
     procedure TestConcurrentStoreInvalidatesBeforeLiveMaterializeCompletes;
     procedure TestReaderLosingEvictionRaceReturnsNoResult;
     procedure TestConcurrentRepublishSurvivesStaleInvalidation;
@@ -230,10 +235,19 @@ begin
     end;
     Exit(True);
   end;
-  if (ParamCount <> 4) or (ParamStr(1) <> STORE_CHILD_SWITCH) then Exit;
+  if (ParamCount <> 7) or (ParamStr(1) <> STORE_CHILD_SWITCH) then Exit;
+  if ParamStr(6) <> NO_SIGNAL_PATH then
+  begin
+    WriteSignal(ParamStr(6));
+    if not WaitForSignal(ParamStr(7)) then
+    begin
+      AExitCode := 5;
+      Exit(True);
+    end;
+  end;
   Cache := TLWPTBuildCache.Create(ParamStr(2));
   try
-    Stored := Cache.Store(TEST_FINGERPRINT, ParamStr(3), ParamStr(4));
+    Stored := Cache.Store(ParamStr(5), ParamStr(3), ParamStr(4));
   finally
     Cache.Free;
   end;
@@ -402,7 +416,8 @@ begin
 end;
 
 function TBuildCacheContract.StartStoreChild(
-  const AArtifact: string; const ABudget: string): TProcess;
+  const AArtifact, ABudget, AFingerprint, AReadyPath,
+  AReleasePath: string): TProcess;
 var
   EnvironmentIndex: Integer;
   Prefix: string;
@@ -413,6 +428,11 @@ begin
   Result.Parameters.Add(FCacheRoot);
   Result.Parameters.Add(AArtifact);
   Result.Parameters.Add(TEST_ARTIFACT_KIND);
+  Result.Parameters.Add(AFingerprint);
+  if AReadyPath = '' then Result.Parameters.Add(NO_SIGNAL_PATH)
+  else Result.Parameters.Add(AReadyPath);
+  if AReleasePath = '' then Result.Parameters.Add(NO_SIGNAL_PATH)
+  else Result.Parameters.Add(AReleasePath);
   if ABudget <> '' then
   begin
     AppendProcessEnvironment(Result.Environment);
@@ -425,6 +445,59 @@ begin
   end;
   Result.Options := [poNoConsole];
   Result.Execute;
+end;
+
+procedure TBuildCacheContract.
+  TestConcurrentDistinctStoresPublishBothCompleteResults;
+var
+  Cache: TLWPTBuildCache;
+  Cached: TLWPTCachedBuildResult;
+  Destination, FirstArtifact, FirstReady, Reason, ReleasePath,
+    SecondArtifact, SecondReady: string;
+  First, Second: TProcess;
+begin
+  FirstArtifact := FScratch + '/distinct-producer-a/app';
+  SecondArtifact := FScratch + '/distinct-producer-b/app';
+  FirstReady := FScratch + '/distinct-producers/a-ready';
+  SecondReady := FScratch + '/distinct-producers/b-ready';
+  ReleasePath := FScratch + '/distinct-producers/release';
+  WriteBytes(FirstArtifact, 'complete distinct producer A bytes');
+  WriteBytes(SecondArtifact, 'complete distinct producer B bytes');
+  First := StartStoreChild(FirstArtifact, '', TEST_FINGERPRINT,
+    FirstReady, ReleasePath);
+  Second := StartStoreChild(SecondArtifact, '', SECOND_TEST_FINGERPRINT,
+    SecondReady, ReleasePath);
+  try
+    Expect<Boolean>(WaitForSignal(FirstReady)).ToBe(True);
+    Expect<Boolean>(WaitForSignal(SecondReady)).ToBe(True);
+    WriteSignal(ReleasePath);
+    Expect<Boolean>(First.WaitOnExit(CHILD_TIMEOUT_MS)).ToBe(True);
+    Expect<Boolean>(Second.WaitOnExit(CHILD_TIMEOUT_MS)).ToBe(True);
+    Expect<Integer>(First.ExitStatus).ToBe(0);
+    Expect<Integer>(Second.ExitStatus).ToBe(0);
+  finally
+    if First.Running or Second.Running then WriteSignal(ReleasePath);
+    if First.Running then First.Terminate(1);
+    if Second.Running then Second.Terminate(1);
+    First.Free;
+    Second.Free;
+  end;
+
+  Cache := TLWPTBuildCache.Create(FCacheRoot);
+  try
+    Destination := FScratch + '/distinct-session/a';
+    Expect<Boolean>(Cache.Materialize(TEST_FINGERPRINT, Destination,
+      FScratch + '/distinct-session/tmp-a', Cached, Reason)).ToBe(True);
+    Expect<string>(Reason).ToBe('hit');
+    Expect<string>(ReadBytes(Destination)).ToBe(ReadBytes(FirstArtifact));
+    Destination := FScratch + '/distinct-session/b';
+    Expect<Boolean>(Cache.Materialize(SECOND_TEST_FINGERPRINT, Destination,
+      FScratch + '/distinct-session/tmp-b', Cached, Reason)).ToBe(True);
+    Expect<string>(Reason).ToBe('hit');
+    Expect<string>(ReadBytes(Destination)).ToBe(ReadBytes(SecondArtifact));
+  finally
+    Cache.Free;
+  end;
 end;
 
 procedure TBuildCacheContract.TestStoreAndMaterializePreserveVerifiedResult;
@@ -835,6 +908,8 @@ begin
     TestMixedCaseReferenceIsInvalidated);
   Test('concurrent stores publish one matching complete result',
     TestConcurrentStoresPublishOneMatchingCompleteResult);
+  Test('concurrent distinct stores publish both complete results',
+    TestConcurrentDistinctStoresPublishBothCompleteResults);
   Test('a concurrent store invalidates before a live materialize completes',
     TestConcurrentStoreInvalidatesBeforeLiveMaterializeCompletes);
   Test('a reader losing the eviction race reports no result',

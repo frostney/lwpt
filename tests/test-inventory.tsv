@@ -21,7 +21,7 @@ program	*	source/LWPT.Analysis.JSON.Test.pas	1	4
 program	*	source/LWPT.Analysis.Pascal.Test.pas	2	18
 program	*	source/LWPT.Analysis.Scope.Test.pas	1	5
 program	*	source/LWPT.BuildRequest.Test.pas	1	12
-program	*	source/LWPT.BuildCache.Test.pas	1	13
+program	*	source/LWPT.BuildCache.Test.pas	1	14
 program	*	source/LWPT.CacheLifecycle.Test.pas	1	15
 program	unix/*	source/LWPT.CacheLifecycle.Test.pas	1	16
 program	*	source/LWPT.BuildSession.Test.pas	1	32
@@ -85,6 +85,6 @@ program	*	tests/integration/Run.Test.pas	1	9
 program	*	tests/integration/Scratch.Test.pas	1	2
 program	*	tests/integration/TestCache.Test.pas	1	10
 program	*	tests/integration/TestFlags.Test.pas	1	3
-program	*	tests/integration/TestScheduling.Test.pas	1	26
-program	windows/*	tests/integration/TestScheduling.Test.pas	1	22
+program	*	tests/integration/TestScheduling.Test.pas	1	27
+program	windows/*	tests/integration/TestScheduling.Test.pas	1	23
 program	*	tests/integration/Version.Test.pas	1	4
