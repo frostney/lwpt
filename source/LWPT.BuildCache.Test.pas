@@ -35,19 +35,25 @@ const
   TEST_ARTIFACT_KIND = 'executable';
 
 type
+  PLWPTCriticalSection = ^TRTLCriticalSection;
+
   TSharedCacheStoreThread = class(TThread)
   private
     FArtifact: string;
     FCache: TLWPTBuildCache;
     FErrorMessage: string;
     FFingerprint: string;
+    FReady: PInteger;
     FStart: PBoolean;
+    FStartCriticalSection: PLWPTCriticalSection;
     FStored: Boolean;
   protected
     procedure Execute; override;
   public
     constructor Create(const ACache: TLWPTBuildCache;
-      const AArtifact, AFingerprint: string; const AStart: PBoolean);
+      const AArtifact, AFingerprint: string; const AStart: PBoolean;
+      const AReady: PInteger;
+      const AStartCriticalSection: PLWPTCriticalSection);
     property ErrorMessage: string read FErrorMessage;
     property Stored: Boolean read FStored;
   end;
@@ -121,7 +127,9 @@ var
   MaterializeReleasePath: string;
 
 constructor TSharedCacheStoreThread.Create(const ACache: TLWPTBuildCache;
-  const AArtifact, AFingerprint: string; const AStart: PBoolean);
+  const AArtifact, AFingerprint: string; const AStart: PBoolean;
+  const AReady: PInteger;
+  const AStartCriticalSection: PLWPTCriticalSection);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
@@ -129,11 +137,29 @@ begin
   FArtifact := AArtifact;
   FFingerprint := AFingerprint;
   FStart := AStart;
+  FReady := AReady;
+  FStartCriticalSection := AStartCriticalSection;
 end;
 
 procedure TSharedCacheStoreThread.Execute;
+var
+  Started: Boolean;
 begin
-  while not FStart^ do Sleep(1);
+  EnterCriticalSection(FStartCriticalSection^);
+  try
+    Inc(FReady^);
+  finally
+    LeaveCriticalSection(FStartCriticalSection^);
+  end;
+  repeat
+    EnterCriticalSection(FStartCriticalSection^);
+    try
+      Started := FStart^;
+    finally
+      LeaveCriticalSection(FStartCriticalSection^);
+    end;
+    if not Started then Sleep(1);
+  until Started;
   try
     FStored := FCache.Store(FFingerprint, FArtifact, TEST_ARTIFACT_KIND);
   except
@@ -245,8 +271,10 @@ var
   Cache: TLWPTBuildCache;
   Cached: TLWPTCachedBuildResult;
   FirstStore, SecondStore: TSharedCacheStoreThread;
+  ReadyStores: Integer;
   Reason: string;
   StartStores: Boolean;
+  StartStoresCriticalSection: TRTLCriticalSection;
   Stored: Boolean;
 begin
   Result := False;
@@ -255,14 +283,30 @@ begin
   begin
     Cache := TLWPTBuildCache.Create(ParamStr(2));
     StartStores := False;
+    ReadyStores := 0;
+    InitCriticalSection(StartStoresCriticalSection);
     FirstStore := TSharedCacheStoreThread.Create(Cache, ParamStr(3),
-      ParamStr(4), @StartStores);
+      ParamStr(4), @StartStores, @ReadyStores, @StartStoresCriticalSection);
     SecondStore := TSharedCacheStoreThread.Create(Cache, ParamStr(5),
-      ParamStr(6), @StartStores);
+      ParamStr(6), @StartStores, @ReadyStores, @StartStoresCriticalSection);
     try
       FirstStore.Start;
       SecondStore.Start;
-      StartStores := True;
+      repeat
+        EnterCriticalSection(StartStoresCriticalSection);
+        try
+          if ReadyStores = 2 then Break;
+        finally
+          LeaveCriticalSection(StartStoresCriticalSection);
+        end;
+        Sleep(1);
+      until False;
+      EnterCriticalSection(StartStoresCriticalSection);
+      try
+        StartStores := True;
+      finally
+        LeaveCriticalSection(StartStoresCriticalSection);
+      end;
       FirstStore.WaitFor;
       SecondStore.WaitFor;
       if (not FirstStore.Stored) or (FirstStore.ErrorMessage <> '') then
@@ -272,6 +316,7 @@ begin
     finally
       FirstStore.Free;
       SecondStore.Free;
+      DoneCriticalSection(StartStoresCriticalSection);
       Cache.Free;
     end;
     Exit(True);
