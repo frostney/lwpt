@@ -1287,7 +1287,7 @@ begin
         Entries.Add(Search.Name);
       until FindNext(Search) <> 0;
     finally
-      FindClose(Search);
+      SysUtils.FindClose(Search);
     end;
     if (Entries.Count > 0) and (Entries.IndexOf(INITIALIZATION_MARKER) < 0) then
       raise ELWPTRegistryError.CreateStable('origin_directory_not_empty',
@@ -1655,7 +1655,7 @@ begin
             'could not remove an index from the non-portable layout');
       until FindNext(Search) <> 0;
     finally
-      FindClose(Search);
+      SysUtils.FindClose(Search);
     end;
     if FindFirst(RootPath('indexes/sha256/*.toml'), faAnyFile, Search) = 0 then
     try
@@ -1667,7 +1667,7 @@ begin
               'could not remove an index absent from committed state');
       until FindNext(Search) <> 0;
     finally
-      FindClose(Search);
+      SysUtils.FindClose(Search);
     end;
     if FindFirst(RootPath('checkpoints/*.toml'), faAnyFile, Search) = 0 then
     try
@@ -1682,7 +1682,7 @@ begin
             'could not remove an uncommitted checkpoint');
       until FindNext(Search) <> 0;
     finally
-      FindClose(Search);
+      SysUtils.FindClose(Search);
     end;
   finally
     ActiveIndexFiles.Free;
