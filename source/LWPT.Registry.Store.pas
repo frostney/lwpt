@@ -110,6 +110,7 @@ uses
 
   LWPT.ProducerLease,
   LWPT.Registry.Crypto,
+  LWPT.Registry.Filesystem,
   Semver;
 
 const
@@ -356,14 +357,20 @@ end;
 
 function ReadBytes(const APath: string): TBytes;
 var
-  Stream: TFileStream;
+  Stream: TStream;
 begin
-  if not FileExists(APath) then
-    raise ELWPTRegistryError.CreateStable('state_missing', 'required file is missing: ' + APath);
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  Stream := nil;
   try
+    try
+      Stream := OpenRegistryFileWithoutFollowingLinks(APath);
+    except
+      on E: ELWPTRegistryFileOpenError do
+        raise ELWPTRegistryError.CreateStable('state_missing',
+          'required file could not be opened safely');
+    end;
     if Stream.Size > High(Integer) then
-      raise ELWPTRegistryError.CreateStable('state_corrupt', 'file exceeds supported size: ' + APath);
+      raise ELWPTRegistryError.CreateStable('state_corrupt',
+        'registry file exceeds supported size');
     SetLength(Result, Stream.Size);
     if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
   finally
@@ -1509,7 +1516,7 @@ end;
 procedure TLWPTRegistryStore.DescribeResource(const ARelative: string;
   out APath: string; out ASize: Int64);
 var
-  Stream: TFileStream;
+  Stream: TStream;
 begin
   if (ARelative = '') or (ARelative[1] = '/') or (Pos('..', ARelative) > 0)
     or (Pos('\', ARelative) > 0) then
@@ -1519,11 +1526,15 @@ begin
   if not PathContains(FRoot, APath) then
     raise ELWPTRegistryError.CreateStable('invalid_resource_path',
       'registry resource escapes its data root');
-  if not FileExists(APath) then
-    raise ELWPTRegistryError.CreateStable('state_missing',
-      'required file is missing: ' + APath);
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  Stream := nil;
   try
+    try
+      Stream := OpenRegistryFileWithoutFollowingLinks(APath);
+    except
+      on E: ELWPTRegistryFileOpenError do
+        raise ELWPTRegistryError.CreateStable('state_missing',
+          'required resource could not be opened safely');
+    end;
     ASize := Stream.Size;
   finally
     Stream.Free;

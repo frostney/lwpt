@@ -15,6 +15,9 @@ uses
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
   const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean);
+{$IFDEF REGISTRY_TESTING}
+function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
+{$ENDIF}
 
 implementation
 
@@ -25,6 +28,7 @@ uses
   SysUtils,
 
   LWPT.Core,
+  LWPT.Registry.Filesystem,
   LWPT.Registry.Server;
 
 {$linkframework Network}
@@ -142,6 +146,124 @@ function Dispatch_time(AWhen: UInt64; ADeltaNanoseconds: Int64): UInt64;
 function Dispatch_data_create(ABuffer: Pointer; ASize: NativeUInt;
   AQueue, ADestructor: Pointer): Pointer; cdecl;
   external name 'dispatch_data_create';
+
+{$IFDEF REGISTRY_TESTING}
+var
+  RegistryCallbackTestReady: Pointer;
+  RegistryCallbackTestRelease: Pointer;
+
+procedure PauseRegistryCallbackForTesting;
+begin
+  if RegistryCallbackTestReady = nil then Exit;
+  Dispatch_semaphore_signal(RegistryCallbackTestReady);
+  Dispatch_semaphore_wait(RegistryCallbackTestRelease, High(UInt64));
+end;
+{$ENDIF}
+
+procedure PublishListenerCancellation(ASemaphore: Pointer;
+  var AState: LongInt);
+begin
+  Dispatch_semaphore_signal(ASemaphore);
+  {$IFDEF REGISTRY_TESTING}
+  PauseRegistryCallbackForTesting;
+  {$ENDIF}
+  InterLockedExchange(AState, NW_LISTENER_STATE_CANCELLED);
+end;
+
+procedure PublishConnectionCompletion(ASemaphore: Pointer;
+  var AActiveConnections: LongInt);
+begin
+  Dispatch_semaphore_signal(ASemaphore);
+  {$IFDEF REGISTRY_TESTING}
+  PauseRegistryCallbackForTesting;
+  {$ENDIF}
+  InterLockedDecrement(AActiveConnections);
+end;
+
+{$IFDEF REGISTRY_TESTING}
+type
+  TRegistryCallbackKind = (rckListener, rckConnection);
+
+  TRegistryCallbackTestThread = class(TThread)
+  private
+    FCallbackKind: TRegistryCallbackKind;
+    FCallbackSemaphore: Pointer;
+    FPublishedValue: PLongInt;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const ACallbackKind: TRegistryCallbackKind;
+      ACallbackSemaphore: Pointer; APublishedValue: PLongInt);
+  end;
+
+constructor TRegistryCallbackTestThread.Create(
+  const ACallbackKind: TRegistryCallbackKind; ACallbackSemaphore: Pointer;
+  APublishedValue: PLongInt);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FCallbackKind := ACallbackKind;
+  FCallbackSemaphore := ACallbackSemaphore;
+  FPublishedValue := APublishedValue;
+end;
+
+procedure TRegistryCallbackTestThread.Execute;
+begin
+  if FCallbackKind = rckListener then
+    PublishListenerCancellation(FCallbackSemaphore, FPublishedValue^)
+  else PublishConnectionCompletion(FCallbackSemaphore, FPublishedValue^);
+end;
+
+function TestRegistryCallbackOrdering(
+  const ACallbackKind: TRegistryCallbackKind): Boolean;
+var
+  CallbackSemaphore: Pointer;
+  PublishedValue: LongInt;
+  ReadySemaphore, ReleaseSemaphore: Pointer;
+  Thread: TRegistryCallbackTestThread;
+begin
+  Result := False;
+  ReadySemaphore := Dispatch_semaphore_create(0);
+  ReleaseSemaphore := Dispatch_semaphore_create(0);
+  RegistryCallbackTestReady := ReadySemaphore;
+  RegistryCallbackTestRelease := ReleaseSemaphore;
+  CallbackSemaphore := Dispatch_semaphore_create(0);
+  if ACallbackKind = rckListener then PublishedValue := 0
+  else PublishedValue := 1;
+  Thread := TRegistryCallbackTestThread.Create(ACallbackKind,
+    CallbackSemaphore, @PublishedValue);
+  try
+    Thread.Start;
+    if Dispatch_semaphore_wait(RegistryCallbackTestReady,
+      Dispatch_time(0, NANOSECONDS_PER_SECOND)) <> 0 then Exit;
+    if ACallbackKind = rckListener then
+      Result := InterLockedExchangeAdd(PublishedValue, 0)
+        <> NW_LISTENER_STATE_CANCELLED
+    else Result := InterLockedExchangeAdd(PublishedValue, 0) <> 0;
+    Dispatch_semaphore_signal(RegistryCallbackTestRelease);
+    Thread.WaitFor;
+    if ACallbackKind = rckListener then
+      Result := Result and (InterLockedExchangeAdd(PublishedValue, 0)
+        = NW_LISTENER_STATE_CANCELLED)
+    else Result := Result and (InterLockedExchangeAdd(PublishedValue, 0) = 0);
+  finally
+    Dispatch_semaphore_signal(RegistryCallbackTestRelease);
+    Thread.WaitFor;
+    Thread.Free;
+    RegistryCallbackTestReady := nil;
+    RegistryCallbackTestRelease := nil;
+    Dispatch_release(CallbackSemaphore);
+    Dispatch_release(ReleaseSemaphore);
+    Dispatch_release(ReadySemaphore);
+  end;
+end;
+
+function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
+begin
+  Result := TestRegistryCallbackOrdering(rckListener)
+    and TestRegistryCallbackOrdering(rckConnection);
+end;
+{$ENDIF}
 function Dispatch_data_create_map(AData: Pointer; ABuffer: PPointer;
   ASize: PNativeUInt): Pointer; cdecl; external name 'dispatch_data_create_map';
 
@@ -317,11 +439,8 @@ begin
         Dispatch_semaphore_signal(Server.FReadySemaphore);
       end;
     NW_LISTENER_STATE_CANCELLED:
-      begin
-        { Publish cancellation only after the callback's final semaphore use. }
-        Dispatch_semaphore_signal(Server.FListenerDoneSemaphore);
-        InterLockedExchange(Server.FListenerState, AState);
-      end;
+      PublishListenerCancellation(Server.FListenerDoneSemaphore,
+        Server.FListenerState);
     else InterLockedExchange(Server.FListenerState, AState);
   end;
 end;
@@ -599,8 +718,7 @@ begin
   AConnection.Free;
   { Active-count zero is the callback-complete publication. The decrement must
     be the callback's final access to server-owned storage. }
-  Dispatch_semaphore_signal(FDrainSemaphore);
-  InterLockedDecrement(FActiveConnections);
+  PublishConnectionCompletion(FDrainSemaphore, FActiveConnections);
 end;
 
 function ReadPKCS12WithoutFollowingLinks(const APath: string): TBytes;
@@ -697,57 +815,77 @@ var
   Bytes: TBytes;
   CFData, CFOptions, CFPassphrase, IdentityReference, Item,
     Items: Pointer;
+  EncodedPassphrase, KeychainPassphrase, KeychainPath: AnsiString;
   Keys, Values: array[0..1] of Pointer;
-  KeychainPassphrase, KeychainPath: AnsiString;
   Status: Int32;
 begin
-  Bytes := ReadPKCS12WithoutFollowingLinks(APath);
-  KeychainPath := AnsiString(GetTempFileName(GetTempDir,
-    PROGRAM_NAME + '-registry-tls-'));
-  KeychainPassphrase := AnsiString(PROJECT_NAME + '-registry-transient');
-  Status := SecKeychainCreate(PAnsiChar(KeychainPath),
-    Length(KeychainPassphrase), PAnsiChar(KeychainPassphrase), False, nil,
-    FTemporaryKeychain);
-  if Status <> 0 then
-    raise ELWPTRegistryError.CreateStable('tls_configuration',
-      'temporary keychain creation failed with status ' + IntToStr(Status));
-  CFData := CFDataCreate(nil, @Bytes[0], Length(Bytes));
-  FillChar(Bytes[0], Length(Bytes), 0);
-  CFPassphrase := CFStringCreateWithCString(nil,
-    PAnsiChar(AnsiString(APassphrase)), CF_STRING_ENCODING_UTF8);
-  Keys[0] := KeyImportPassphrase;
-  Values[0] := CFPassphrase;
-  Keys[1] := KeyImportKeychain;
-  Values[1] := FTemporaryKeychain;
-  CFOptions := CFDictionaryCreate(nil, @Keys[0], @Values[0], 2,
-    DictionaryKeyCallbacks, DictionaryValueCallbacks);
+  Bytes := nil;
+  CFData := nil;
+  CFOptions := nil;
+  CFPassphrase := nil;
+  IdentityReference := nil;
   Items := nil;
-  Status := SecPKCS12Import(CFData, CFOptions, @Items);
-  CFRelease(CFOptions);
-  CFRelease(CFPassphrase);
-  CFRelease(CFData);
-  if (Status <> 0) or (Items = nil) or (CFArrayGetCount(Items) = 0) then
-  begin
+  EncodedPassphrase := '';
+  try
+    Bytes := ReadPKCS12WithoutFollowingLinks(APath);
+    KeychainPath := AnsiString(GetTempFileName(GetTempDir,
+      PROGRAM_NAME + '-registry-tls-'));
+    KeychainPassphrase := AnsiString(PROJECT_NAME + '-registry-transient');
+    Status := SecKeychainCreate(PAnsiChar(KeychainPath),
+      Length(KeychainPassphrase), PAnsiChar(KeychainPassphrase), False, nil,
+      FTemporaryKeychain);
+    if Status <> 0 then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'temporary keychain creation failed with status ' + IntToStr(Status));
+    CFData := CFDataCreate(nil, @Bytes[0], Length(Bytes));
+    if CFData = nil then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'could not retain PKCS#12 identity bytes for import');
+    FillChar(Bytes[0], Length(Bytes), 0);
+    Bytes := nil;
+    EncodedPassphrase := AnsiString(APassphrase);
+    CFPassphrase := CFStringCreateWithCString(nil,
+      PAnsiChar(EncodedPassphrase), CF_STRING_ENCODING_UTF8);
+    if CFPassphrase = nil then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'could not encode the PKCS#12 passphrase');
+    Keys[0] := KeyImportPassphrase;
+    Values[0] := CFPassphrase;
+    Keys[1] := KeyImportKeychain;
+    Values[1] := FTemporaryKeychain;
+    CFOptions := CFDictionaryCreate(nil, @Keys[0], @Values[0], 2,
+      DictionaryKeyCallbacks, DictionaryValueCallbacks);
+    if CFOptions = nil then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'could not prepare PKCS#12 import options');
+    Status := SecPKCS12Import(CFData, CFOptions, @Items);
+    if (Status <> 0) or (Items = nil) or (CFArrayGetCount(Items) = 0) then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'PKCS#12 import failed with status ' + IntToStr(Status));
+    Item := CFArrayGetValueAtIndex(Items, 0);
+    ValidateBundledIdentity(Item);
+    IdentityReference := CFDictionaryGetValue(Item, KeyImportItemIdentity);
+    if IdentityReference = nil then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'PKCS#12 contains no identity');
+    CFRetain(IdentityReference);
+    FTLSIdentity := Sec_identity_create(IdentityReference);
+    if FTLSIdentity = nil then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'could not create the Network.framework TLS identity');
+  finally
+    if Length(Bytes) > 0 then FillChar(Bytes[0], Length(Bytes), 0);
+    Bytes := nil;
+    if Length(EncodedPassphrase) > 0 then
+      FillChar(EncodedPassphrase[1], Length(EncodedPassphrase)
+        * SizeOf(AnsiChar), 0);
+    EncodedPassphrase := '';
+    if IdentityReference <> nil then CFRelease(IdentityReference);
     if Items <> nil then CFRelease(Items);
-    raise ELWPTRegistryError.CreateStable('tls_configuration',
-      'PKCS#12 import failed with status ' + IntToStr(Status));
+    if CFOptions <> nil then CFRelease(CFOptions);
+    if CFPassphrase <> nil then CFRelease(CFPassphrase);
+    if CFData <> nil then CFRelease(CFData);
   end;
-  Item := CFArrayGetValueAtIndex(Items, 0);
-  ValidateBundledIdentity(Item);
-  IdentityReference := CFDictionaryGetValue(Item, KeyImportItemIdentity);
-  if IdentityReference = nil then
-  begin
-    CFRelease(Items);
-    raise ELWPTRegistryError.CreateStable('tls_configuration',
-      'PKCS#12 contains no identity');
-  end;
-  CFRetain(IdentityReference);
-  CFRelease(Items);
-  FTLSIdentity := Sec_identity_create(IdentityReference);
-  CFRelease(IdentityReference);
-  if FTLSIdentity = nil then
-    raise ELWPTRegistryError.CreateStable('tls_configuration',
-      'could not create the Network.framework TLS identity');
 end;
 
 constructor TNetworkFrameworkRegistryServer.Create(AStore: TLWPTRegistryStore;
@@ -923,6 +1061,13 @@ begin
   raise ELWPTRegistryError.CreateStable('tls_unavailable',
     'Network.framework registry transport is available only on macOS');
 end;
+
+{$IFDEF REGISTRY_TESTING}
+function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
+begin
+  Result := True;
+end;
+{$ENDIF}
 
 {$ENDIF}
 

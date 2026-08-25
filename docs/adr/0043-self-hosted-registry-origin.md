@@ -132,7 +132,10 @@ surface. The listener opens every path component without following links,
 retains verified parent handles through a nonblocking regular-file open, checks
 the resource length and digest in cancellable 64 KiB steps, rewinds that retained
 handle, and sends from the same handle through one connection-owned buffer. The
-listener never builds a second body-sized wire response in memory. Shutdown
+same retained component-safe boundary protects committed configuration, state,
+checkpoint, signature, index, and signing-seed reads during startup, recovery,
+and publication. The listener never builds a second body-sized wire response in
+memory. Shutdown
 interrupts acceptance, cancels every client, drains
 its workers or Network.framework callbacks, and only then releases the store
 and TLS context. Hashed objects, records, and snapshots are SHA-256 checked

@@ -8,13 +8,19 @@ uses
   {$ENDIF}
   Classes,
   SysUtils,
+  {$IFDEF MSWINDOWS}
+  Process,
+  Windows,
+  {$ENDIF}
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
 
   LWPT.Core,
   LWPT.ProducerLease,
+  LWPT.Registry.Filesystem,
   LWPT.Registry.Server,
+  LWPT.Registry.Server.NetworkFramework,
   LWPT.Registry.Store,
   TestingPascalLibrary,
   Tests.Scratch;
@@ -50,6 +56,49 @@ procedure SetFailurePoint(const AValue: string);
 begin
   SetRegistryFailurePointForTesting(AValue);
 end;
+
+{$IFDEF MSWINDOWS}
+function TryCreateWindowsJunction(const ALinkDirectory,
+  ALinkTarget: string): Boolean;
+var
+  CommandInterpreter: string;
+  ProcessInstance: TProcess;
+begin
+  Result := False;
+  CommandInterpreter := SysUtils.GetEnvironmentVariable('COMSPEC');
+  if CommandInterpreter = '' then CommandInterpreter := 'cmd.exe';
+  ProcessInstance := TProcess.Create(nil);
+  try
+    ProcessInstance.Executable := CommandInterpreter;
+    ProcessInstance.Parameters.Add('/C');
+    ProcessInstance.Parameters.Add('mklink /J "'
+      + StringReplace(ALinkDirectory, '/', '\', [rfReplaceAll]) + '" "'
+      + StringReplace(ALinkTarget, '/', '\', [rfReplaceAll]) + '"');
+    ProcessInstance.Options := [poWaitOnExit];
+    try
+      ProcessInstance.Execute;
+      Result := ProcessInstance.ExitStatus = 0;
+    except
+      Result := False;
+    end;
+  finally
+    ProcessInstance.Free;
+  end;
+end;
+
+procedure RemoveWindowsJunctionIfPresent(const ALinkDirectory: string);
+var
+  ErrorCode: DWORD;
+begin
+  if Windows.RemoveDirectoryW(PWideChar(UnicodeString(ALinkDirectory))) then
+    Exit;
+  ErrorCode := Windows.GetLastError;
+  if ErrorCode in [Windows.ERROR_FILE_NOT_FOUND,
+     Windows.ERROR_PATH_NOT_FOUND] then Exit;
+  raise Exception.CreateFmt('failed to remove registry junction fixture (%d)',
+    [ErrorCode]);
+end;
+{$ENDIF}
 
 type
   TRegistryStoreContract = class(TTestSuite)
@@ -93,6 +142,7 @@ type
     procedure TestLargeResourceUsesStreamedDescriptor;
     procedure TestOversizedResourceIsRejectedBeforeHashing;
     procedure TestResourceOpenRejectsUnsafeFilesystemKinds;
+    procedure TestNetworkFrameworkTeardownOrdering;
     procedure TestServerErrorsConformToWireContract;
     procedure TestRenewalErrorDoesNotDiscloseStorePath;
     procedure TestServerDiscoveryIsTruthful;
@@ -851,60 +901,112 @@ begin
 end;
 
 procedure TRegistryStoreContract.TestResourceOpenRejectsUnsafeFilesystemKinds;
-{$IFDEF UNIX}
 var
-  Diagnostic, ParentPath, RealParentPath, ResourcePath: string;
+  Diagnostic, ObjectName, ParentPath, RealParentPath, ResourcePath: string;
   Elapsed, Started: QWord;
-  Response: TLWPTRegistryHTTPResponse;
+  Response, RoutedResponse: TLWPTRegistryHTTPResponse;
   ResourceStream: TStream;
-  Stream: TFileStream;
-{$ENDIF}
-begin
+  Search: TSearchRec;
+  Store: TLWPTRegistryStore;
   {$IFDEF UNIX}
-  ParentPath := FScratch + '/open-safe';
-  RealParentPath := FScratch + '/open-real';
-  ResourcePath := ParentPath + '/inner/resource';
-  ForceDirectories(ExtractFileDir(ResourcePath));
-  Stream := TFileStream.Create(ResourcePath, fmCreate);
-  try
-    Stream.WriteBuffer('payload'[1], Length('payload'));
-  finally
-    Stream.Free;
-  end;
-  FillChar(Response, SizeOf(Response), 0);
-  Response.ResourcePath := ResourcePath;
-  Response.ResourceLength := Length('payload');
-  Expect<Boolean>(RenameFile(ParentPath, RealParentPath)).ToBe(True);
-  Expect<Integer>(FpSymlink(PChar(RealParentPath), PChar(ParentPath))).ToBe(0);
-  Diagnostic := '';
-  ResourceStream := nil;
-  try
-    ResourceStream := OpenRegistryHTTPResource(Response);
-  except
-    on E: Exception do Diagnostic := E.Message;
-  end;
-  ResourceStream.Free;
-  Expect<Boolean>(Pos('resource_changed:', Diagnostic) = 1).ToBe(True);
-  Expect<Boolean>(DeleteFile(ParentPath)).ToBe(True);
-  Expect<Boolean>(RenameFile(RealParentPath, ParentPath)).ToBe(True);
-
-  Expect<Boolean>(DeleteFile(ResourcePath)).ToBe(True);
-  Expect<Integer>(FpMkFifo(PChar(ResourcePath), &600)).ToBe(0);
-  Diagnostic := '';
-  ResourceStream := nil;
-  Started := GetTickCount64;
-  try
-    ResourceStream := OpenRegistryHTTPResource(Response);
-  except
-    on E: Exception do Diagnostic := E.Message;
-  end;
-  Elapsed := GetTickCount64 - Started;
-  ResourceStream.Free;
-  Expect<Boolean>(Pos('resource_changed:', Diagnostic) = 1).ToBe(True);
-  Expect<Boolean>(Elapsed < 1000).ToBe(True);
-  {$ELSE}
-  Expect<Boolean>(True).ToBe(True);
+  StatePath: string;
+  State: TLWPTRegistryState;
   {$ENDIF}
+begin
+  Store := InitializeStore;
+  try
+    PublishExample(Store, $73);
+    Expect<Integer>(FindFirst(FScratch + '/objects/sha256/*', faAnyFile,
+      Search)).ToBe(0);
+    while (Search.Name = '.') or (Search.Name = '..')
+      or ((Search.Attr and faDirectory) <> 0) do
+      if FindNext(Search) <> 0 then
+        raise Exception.Create('published object was not found');
+    ObjectName := Search.Name;
+    FindClose(Search);
+    Response := RegistryHTTPResponse(Store, 'GET',
+      '/v1/objects/sha256/' + ObjectName);
+    Expect<Integer>(Response.Status).ToBe(200);
+    ResourcePath := Response.ResourcePath;
+    ParentPath := FScratch + '/objects';
+    RealParentPath := FScratch + '/objects-real';
+    Expect<Boolean>(RenameFile(ParentPath, RealParentPath)).ToBe(True);
+    {$IFDEF UNIX}
+    Expect<Integer>(FpSymlink(PChar(RealParentPath), PChar(ParentPath)))
+      .ToBe(0);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    if not TryCreateWindowsJunction(ParentPath, RealParentPath) then
+    begin
+      Expect<Boolean>(RenameFile(RealParentPath, ParentPath)).ToBe(True);
+      raise Exception.Create('registry parent junction creation failed');
+    end;
+    {$ENDIF}
+    try
+      Started := GetTickCount64;
+      RoutedResponse := RegistryHTTPResponse(Store, 'GET',
+        '/v1/objects/sha256/' + ObjectName);
+      Elapsed := GetTickCount64 - Started;
+      Expect<Integer>(RoutedResponse.Status).ToBe(404);
+      Expect<Boolean>(Elapsed < 1000).ToBe(True);
+      Diagnostic := '';
+      ResourceStream := nil;
+      try
+        ResourceStream := OpenRegistryHTTPResource(Response);
+      except
+        on E: Exception do Diagnostic := E.Message;
+      end;
+      ResourceStream.Free;
+      Expect<Boolean>(Pos('resource_changed:', Diagnostic) = 1).ToBe(True);
+    finally
+      {$IFDEF UNIX}
+      Expect<Boolean>(DeleteFile(ParentPath)).ToBe(True);
+      {$ENDIF}
+      {$IFDEF MSWINDOWS}
+      RemoveWindowsJunctionIfPresent(ParentPath);
+      {$ENDIF}
+      Expect<Boolean>(RenameFile(RealParentPath, ParentPath)).ToBe(True);
+    end;
+
+    {$IFDEF UNIX}
+    Expect<Boolean>(DeleteFile(ResourcePath)).ToBe(True);
+    Expect<Integer>(FpMkFifo(PChar(ResourcePath), &600)).ToBe(0);
+    Started := GetTickCount64;
+    RoutedResponse := RegistryHTTPResponse(Store, 'GET',
+      '/v1/objects/sha256/' + ObjectName);
+    Elapsed := GetTickCount64 - Started;
+    Expect<Integer>(RoutedResponse.Status).ToBe(404);
+    Expect<Boolean>(Elapsed < 1000).ToBe(True);
+    Diagnostic := '';
+    ResourceStream := nil;
+    try
+      ResourceStream := OpenRegistryHTTPResource(Response);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    ResourceStream.Free;
+    Expect<Boolean>(Pos('resource_changed:', Diagnostic) = 1).ToBe(True);
+    Expect<Boolean>(DeleteFile(ResourcePath)).ToBe(True);
+
+    StatePath := FScratch + '/state/current.toml';
+    Expect<Boolean>(DeleteFile(StatePath)).ToBe(True);
+    Expect<Integer>(FpMkFifo(PChar(StatePath), &600)).ToBe(0);
+    Diagnostic := '';
+    Started := GetTickCount64;
+    try
+      State := Store.LoadCurrentState;
+      if State.Sequence = 0 then Diagnostic := '';
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    Elapsed := GetTickCount64 - Started;
+    Expect<Boolean>(Pos('state_missing:', Diagnostic) = 1).ToBe(True);
+    Expect<Boolean>(Elapsed < 1000).ToBe(True);
+    Expect<Boolean>(DeleteFile(StatePath)).ToBe(True);
+    {$ENDIF}
+  finally
+    Store.Free;
+  end;
 end;
 
 procedure TRegistryStoreContract.TestServerErrorsConformToWireContract;
@@ -950,6 +1052,11 @@ begin
   finally
     Store.Free;
   end;
+end;
+
+procedure TRegistryStoreContract.TestNetworkFrameworkTeardownOrdering;
+begin
+  Expect<Boolean>(NetworkFrameworkTeardownOrderingIsSafeForTesting).ToBe(True);
 end;
 
 procedure TRegistryStoreContract.TestRenewalErrorDoesNotDiscloseStorePath;
@@ -1197,6 +1304,8 @@ begin
     TestOversizedResourceIsRejectedBeforeHashing);
   Test('resource open rejects unsafe filesystem kinds',
     TestResourceOpenRejectsUnsafeFilesystemKinds);
+  Test('Network.framework teardown waits for callback completion',
+    TestNetworkFrameworkTeardownOrdering);
   Test('server errors conform to the wire contract',
     TestServerErrorsConformToWireContract);
   Test('renewal error does not disclose the store path',
