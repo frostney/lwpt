@@ -6,9 +6,10 @@
   lifecycle E2E test, protected only by the test password `test-only`.
 - Its leaf, intermediate, root, and private key derive from the committed
   HTTPClient test PKI. They are not credentials and must never be deployed.
-- The bundle uses PBES2/PBKDF2 with AES-256-CBC and SHA-256 so OpenSSL 3 can
-  import it without the optional legacy provider, while its short-lived leaf
-  satisfies Apple's native SSL server policy.
+- The bundle uses PBE-SHA1-3DES for both key and certificate bags so OpenSSL 3
+  can import it without the optional legacy provider and older supported
+  Windows hosts can import it, while its short-lived leaf satisfies Apple's
+  native SSL server policy.
 
 The leaf was issued from the committed HTTPClient intermediate with the
 extensions in `packages/httpclient/source/fixtures/leaf.cnf`, a 397-day
