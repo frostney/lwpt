@@ -42,7 +42,8 @@ type
   end;
 
 function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
-  const AMethod, ATarget: string): TLWPTRegistryHTTPResponse;
+  const AMethod, ATarget: string; AProgress: TSHA256Progress = nil):
+  TLWPTRegistryHTTPResponse;
 function RegistryErrorResponse(const AStatus: Integer; const AReason,
   ACode, AMessage: string; const ARequestID: string = ''):
   TLWPTRegistryHTTPResponse;
@@ -185,37 +186,54 @@ end;
 
 function ResourceResponse(AStore: TLWPTRegistryStore;
   const ARelative, AContentType, AETag, AExpectedDigest: string;
-  const AImmutable: Boolean): TLWPTRegistryHTTPResponse;
+  const AImmutable: Boolean; AProgress: TSHA256Progress):
+  TLWPTRegistryHTTPResponse;
+var
+  RouteStream: TStream;
 begin
+  RouteStream := nil;
   try
-    SetLength(Result.Body, 0);
-    AStore.DescribeResource(ARelative, Result.ResourcePath,
-      Result.ResourceLength);
-    Result.ResourceDigest := AExpectedDigest;
-    Result.Status := 200;
-    Result.Reason := 'OK';
-    Result.ContentType := AContentType;
-    if AImmutable then
-      Result.CacheControl := 'public, max-age=31536000, immutable'
-    else Result.CacheControl := 'no-cache, must-revalidate';
-    Result.ETag := AETag;
-  except
-    on E: ELWPTRegistryError do
-      if Pos('resource_hash_mismatch:', E.Message) = 1 then
-        Result := ErrorResponse(500, 'Internal Server Error',
-          'resource_hash_mismatch',
-          'stored registry resource failed content verification')
-      else if Pos('resource_too_large:', E.Message) = 1 then
-        Result := ErrorResponse(500, 'Internal Server Error',
-          'resource_too_large',
-          'stored registry resource exceeds the service limit')
-      else Result := ErrorResponse(404, 'Not Found', 'not_found',
-          'registry resource was not found');
+    try
+      SetLength(Result.Body, 0);
+      AStore.DescribeResource(ARelative, Result.ResourcePath,
+        Result.ResourceLength);
+      Result.ResourceDigest := AExpectedDigest;
+      if Result.ResourceDigest = '' then
+      begin
+        RouteStream := OpenRegistryHTTPResource(Result, AProgress);
+        Result.ResourceDigest := 'sha256:' + SHA256Stream(RouteStream,
+          AProgress);
+      end;
+      Result.Status := 200;
+      Result.Reason := 'OK';
+      Result.ContentType := AContentType;
+      if AImmutable then
+        Result.CacheControl := 'public, max-age=31536000, immutable'
+      else Result.CacheControl := 'no-cache, must-revalidate';
+      Result.ETag := AETag;
+    except
+      on E: ELWPTRegistryError do
+        if Pos('connection_deadline:', E.Message) = 1 then
+          raise
+        else if Pos('resource_hash_mismatch:', E.Message) = 1 then
+          Result := ErrorResponse(500, 'Internal Server Error',
+            'resource_hash_mismatch',
+            'stored registry resource failed content verification')
+        else if Pos('resource_too_large:', E.Message) = 1 then
+          Result := ErrorResponse(500, 'Internal Server Error',
+            'resource_too_large',
+            'stored registry resource exceeds the service limit')
+        else Result := ErrorResponse(404, 'Not Found', 'not_found',
+            'registry resource was not found');
+    end;
+  finally
+    RouteStream.Free;
   end;
 end;
 
 function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
-  const AMethod, ATarget: string): TLWPTRegistryHTTPResponse;
+  const AMethod, ATarget: string; AProgress: TSHA256Progress):
+  TLWPTRegistryHTTPResponse;
 var
   APIPath, Digest, KeyID, Prefix, Relative, RequestID: string;
   State: TLWPTRegistryState;
@@ -306,11 +324,11 @@ begin
   if APIPath = '/v1/checkpoints/latest.toml' then
     Exit(ResourceResponse(AStore, State.CheckpointPath,
       'application/vnd.' + PROGRAM_NAME + '.registry-checkpoint+toml', '',
-      '', False));
+      '', False, AProgress));
   if APIPath = '/v1/checkpoints/latest.sig.toml' then
     Exit(ResourceResponse(AStore, State.SignaturePath,
       'application/vnd.' + PROGRAM_NAME + '.registry-signature+toml', '',
-      '', False));
+      '', False, AProgress));
   if StartsStr('/v1/objects/sha256/', APIPath) then
   begin
     Digest := Copy(APIPath, Length('/v1/objects/sha256/') + 1, MaxInt);
@@ -319,7 +337,7 @@ begin
         'registry resource was not found'));
     Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
     Exit(ResourceResponse(AStore, Relative, 'application/gzip',
-      '"sha256:' + Digest + '"', 'sha256:' + Digest, True));
+      '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
   end;
   if StartsStr('/v1/records/sha256/', APIPath) then
   begin
@@ -331,7 +349,7 @@ begin
     Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
     Exit(ResourceResponse(AStore, Relative,
       'application/vnd.' + PROGRAM_NAME + '.registry-package+toml',
-      '"sha256:' + Digest + '"', 'sha256:' + Digest, True));
+      '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
   end;
   if StartsStr('/v1/snapshots/sha256/', APIPath) then
   begin
@@ -343,7 +361,7 @@ begin
     Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
     Exit(ResourceResponse(AStore, Relative,
       'application/vnd.' + PROGRAM_NAME + '.registry-snapshot+toml',
-      '"sha256:' + Digest + '"', 'sha256:' + Digest, True));
+      '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
   end;
   if StartsStr('/v1/keys/ed25519:', APIPath) then
   begin
@@ -357,7 +375,7 @@ begin
     Relative := RegistryKeyStoragePath(KeyID);
     Exit(ResourceResponse(AStore, Relative,
       'application/vnd.' + PROGRAM_NAME + '.registry-key+toml', '', '',
-      True));
+      True, AProgress));
   end;
   if StartsStr('/v1/checkpoints/', APIPath) then
   begin
@@ -365,11 +383,11 @@ begin
     if EndsStr('.sig.toml', APIPath) then
       Exit(ResourceResponse(AStore, Relative,
         'application/vnd.' + PROGRAM_NAME + '.registry-signature+toml', '',
-        '', False));
+        '', False, AProgress));
     if EndsStr('.toml', APIPath) then
       Exit(ResourceResponse(AStore, Relative,
         'application/vnd.' + PROGRAM_NAME + '.registry-checkpoint+toml', '',
-        '', False));
+        '', False, AProgress));
   end;
   Result := ErrorResponse(404, 'Not Found', 'not_found',
     'registry resource was not found');
@@ -562,7 +580,8 @@ begin
         else
         begin
           Target := Copy(RequestLine, 1, Space - 1);
-          Response := RegistryHTTPResponse(FStore, Method, Target);
+          Response := RegistryHTTPResponse(FStore, Method, Target,
+            CheckDeadline);
         end;
       end;
       IncludeBody := not SameText(Method, 'HEAD');
@@ -743,7 +762,7 @@ begin
     Space := Pos(' ', RequestLine);
     if Space = 0 then Exit;
     Target := Copy(RequestLine, 1, Space - 1);
-    Response := RegistryHTTPResponse(FStore, Method, Target);
+    Response := RegistryHTTPResponse(FStore, Method, Target, CheckDeadline);
     IncludeBody := not SameText(Method, 'HEAD');
     if Response.ResourcePath <> '' then
       try

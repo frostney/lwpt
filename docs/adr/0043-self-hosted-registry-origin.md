@@ -132,6 +132,9 @@ surface. The listener opens every path component without following links,
 retains verified parent handles through a nonblocking regular-file open, checks
 the resource length and digest in cancellable 64 KiB steps, rewinds that retained
 handle, and sends from the same handle through one connection-owned buffer. The
+route descriptor carries the authoritative digest for content-addressed files;
+other routed files are hashed under the same deadline, so the later retained
+delivery handle must prove the exact bytes that routing accepted. The
 same retained component-safe boundary protects committed configuration, state,
 checkpoint, signature, index, and signing-seed reads during startup, recovery,
 and publication. The listener never builds a second body-sized wire response in

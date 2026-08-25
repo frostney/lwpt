@@ -57,6 +57,34 @@ begin
   SetRegistryFailurePointForTesting(AValue);
 end;
 
+procedure ReplaceFileWithSameLength(const APath: string;
+  const AByte: Byte);
+var
+  Buffer: TBytes;
+  Existing, Replacement: TFileStream;
+  ReplacementPath: string;
+begin
+  Existing := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    if Existing.Size > MaxInt then
+      raise Exception.Create('test replacement exceeds addressable memory');
+    SetLength(Buffer, Integer(Existing.Size));
+  finally
+    Existing.Free;
+  end;
+  if Length(Buffer) > 0 then FillChar(Buffer[0], Length(Buffer), AByte);
+  ReplacementPath := APath + '.same-length-replacement';
+  Replacement := TFileStream.Create(ReplacementPath, fmCreate);
+  try
+    if Length(Buffer) > 0 then
+      Replacement.WriteBuffer(Buffer[0], Length(Buffer));
+  finally
+    Replacement.Free;
+  end;
+  if not AtomicReplaceFile(ReplacementPath, APath) then
+    raise Exception.Create('could not install same-length test replacement');
+end;
+
 {$IFDEF MSWINDOWS}
 function TryCreateWindowsJunction(const ALinkDirectory,
   ALinkTarget: string): Boolean;
@@ -1107,16 +1135,55 @@ end;
 
 procedure TRegistryStoreContract.TestCheckpointResponsesRequireRevalidation;
 var
-  Response: TLWPTRegistryHTTPResponse;
+  CheckpointResponse, KeyResponse, Response: TLWPTRegistryHTTPResponse;
+  Diagnostic, KeyID: string;
+  ResourceStream: TStream;
+  Search: TSearchRec;
   Store: TLWPTRegistryStore;
 begin
   Store := InitializeStore;
   try
-    Response := RegistryHTTPResponse(Store, 'GET',
+    CheckpointResponse := RegistryHTTPResponse(Store, 'GET',
       '/v1/checkpoints/latest.toml');
-    Expect<string>(Response.CacheControl).ToBe('no-cache, must-revalidate');
+    Expect<string>(CheckpointResponse.CacheControl)
+      .ToBe('no-cache, must-revalidate');
+    Expect<Boolean>(CheckpointResponse.ResourceDigest <> '').ToBe(True);
     Response := RegistryHTTPResponse(Store, 'GET', '/v1/checkpoints/1.toml');
     Expect<string>(Response.CacheControl).ToBe('no-cache, must-revalidate');
+    Expect<Boolean>(Response.ResourceDigest <> '').ToBe(True);
+
+    Expect<Integer>(FindFirst(FScratch + '/keys/ed25519-*.toml', faAnyFile,
+      Search)).ToBe(0);
+    KeyID := 'ed25519:' + Copy(Search.Name, Length('ed25519-') + 1,
+      Length(Search.Name) - Length('ed25519-') - Length('.toml'));
+    FindClose(Search);
+    KeyResponse := RegistryHTTPResponse(Store, 'GET', '/v1/keys/' + KeyID
+      + '.toml');
+    Expect<Integer>(KeyResponse.Status).ToBe(200);
+    Expect<Boolean>(KeyResponse.ResourceDigest <> '').ToBe(True);
+    ReplaceFileWithSameLength(KeyResponse.ResourcePath, $4B);
+    Diagnostic := '';
+    ResourceStream := nil;
+    try
+      ResourceStream := OpenRegistryHTTPResource(KeyResponse);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    ResourceStream.Free;
+    Expect<Boolean>(Pos('resource_hash_mismatch:', Diagnostic) = 1)
+      .ToBe(True);
+
+    ReplaceFileWithSameLength(CheckpointResponse.ResourcePath, $43);
+    Diagnostic := '';
+    ResourceStream := nil;
+    try
+      ResourceStream := OpenRegistryHTTPResource(CheckpointResponse);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    ResourceStream.Free;
+    Expect<Boolean>(Pos('resource_hash_mismatch:', Diagnostic) = 1)
+      .ToBe(True);
   finally
     Store.Free;
   end;

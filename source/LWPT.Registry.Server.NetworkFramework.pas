@@ -620,7 +620,8 @@ begin
     Exit;
   end;
   Target := Copy(RequestLine, 1, Space - 1);
-  Response := RegistryHTTPResponse(FServer.FStore, Method, Target);
+  Response := RegistryHTTPResponse(FServer.FStore, Method, Target,
+    CheckDeadline);
   IncludeBody := not SameText(Method, 'HEAD');
   if GetTickCount64 >= FDeadline then
   begin
