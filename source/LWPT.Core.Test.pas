@@ -378,6 +378,9 @@ type
     procedure TestSiblingOfBareFilenameStaysRelative;
     procedure TestMoveFileReplacesExistingBareDestination;
     procedure TestMoveDirReplacesExistingBareDestination;
+    {$IFDEF MSWINDOWS}
+    procedure TestReplaceFileAtDeepExistingDestination;
+    {$ENDIF}
     {$IFDEF UNIX}
     procedure TestMoveFileReplacesExistingAcrossFilesystems;
     {$ENDIF}
@@ -3546,6 +3549,42 @@ begin
   Expect<Integer>(CountDirEntries('.')).ToBe(1);
 end;
 
+{$IFDEF MSWINDOWS}
+procedure TAtomicMoveBareDestination.TestReplaceFileAtDeepExistingDestination;
+const
+  DestinationName = 'destination-with-existing-bytes.txt';
+  LegacyWindowsPathCeiling = 260;
+var
+  DeepDir, DestinationPath, LegacyBackupPath, SourcePath: string;
+  PaddingLength: Integer;
+begin
+  PaddingLength := 245 - Length(IncludeTrailingPathDelimiter(FScratch))
+    - 1 - Length(DestinationName);
+  Expect<Boolean>(PaddingLength > 0).ToBe(True);
+  DeepDir := IncludeTrailingPathDelimiter(FScratch)
+    + StringOfChar('d', PaddingLength);
+  ForceDirectories(DeepDir);
+  DestinationPath := IncludeTrailingPathDelimiter(DeepDir) + DestinationName;
+  SourcePath := IncludeTrailingPathDelimiter(DeepDir) + 'incoming.tmp';
+  WriteBareFile(DestinationPath, 'stale');
+  WriteBareFile(SourcePath, 'fresh');
+
+  { The former destination-derived backup crosses the legacy Win32 ceiling,
+    while both caller-owned paths remain below it and are valid fixtures. }
+  LegacyBackupPath := MakeSiblingTmpPath(DestinationPath, 'replace-backup');
+  Expect<Boolean>(Length(DestinationPath) < LegacyWindowsPathCeiling)
+    .ToBe(True);
+  Expect<Boolean>(Length(SourcePath) < LegacyWindowsPathCeiling).ToBe(True);
+  Expect<Boolean>(Length(LegacyBackupPath) >= LegacyWindowsPathCeiling)
+    .ToBe(True);
+
+  Expect<Boolean>(AtomicReplaceFile(SourcePath, DestinationPath)).ToBe(True);
+  Expect<string>(ReadBareFile(DestinationPath)).ToBe('fresh');
+  Expect<Boolean>(FileExists(SourcePath)).ToBe(False);
+  Expect<Integer>(CountDirEntries(DeepDir)).ToBe(1);
+end;
+{$ENDIF}
+
 {$IFDEF UNIX}
 procedure TAtomicMoveBareDestination.
   TestMoveFileReplacesExistingAcrossFilesystems;
@@ -3589,6 +3628,10 @@ begin
     TestMoveFileReplacesExistingBareDestination);
   Test('bare-dirname destination with existing directory is replaced',
     TestMoveDirReplacesExistingBareDestination);
+  {$IFDEF MSWINDOWS}
+  Test('deep existing destination is replaced without a longer-path backup',
+    TestReplaceFileAtDeepExistingDestination);
+  {$ENDIF}
   {$IFDEF UNIX}
   if FCrossDeviceBase <> '' then
     Test('existing file is atomically replaced across filesystems',

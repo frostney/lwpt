@@ -699,6 +699,47 @@ begin
   end;
 end;
 
+{$IFDEF MSWINDOWS}
+function WindowsExtendedPath(const APath: string): UnicodeString;
+var
+  FullPath: UnicodeString;
+begin
+  FullPath := UnicodeString(StringReplace(ExpandFileName(APath), '/', '\',
+    [rfReplaceAll]));
+  if Copy(FullPath, 1, 4) = '\\?\' then Exit(FullPath);
+  if Copy(FullPath, 1, 2) = '\\' then
+    Result := '\\?\UNC\' + Copy(FullPath, 3, MaxInt)
+  else
+    Result := '\\?\' + FullPath;
+end;
+
+function WindowsPathExists(const APath: string): Boolean;
+var
+  ExtendedPath: UnicodeString;
+begin
+  ExtendedPath := WindowsExtendedPath(APath);
+  Result := Windows.GetFileAttributesW(PWideChar(ExtendedPath)) <> $FFFFFFFF;
+end;
+
+function MakeWindowsReplaceBackupPath(const ADst: string): string;
+var
+  Dir: string;
+  Sequence: Cardinal;
+begin
+  Dir := ExtractFileDir(ADst);
+  if Dir = '' then Dir := '.';
+  repeat
+    Sequence := Cardinal(InterlockedIncrement(TmpPathCounter));
+    { Keep the ordinary spelling compact and independent of the destination
+      filename. The Win32 calls use its extended-length spelling below, so a
+      deep but valid destination does not acquire a longer-path precondition. }
+    Result := IncludeTrailingPathDelimiter(Dir) + '.r-'
+      + ProcessIdStr + '-' + EncodeBase36(TmpPathStartedAt) + '-'
+      + IntToStr(Int64(Sequence)) + TmpPathExtension;
+  until not WindowsPathExists(Result);
+end;
+{$ENDIF}
+
 function MakeUniqueTmpPath(const ARoot, APrefix: string): string;
 var
   Sequence: Cardinal;
@@ -1182,10 +1223,16 @@ var
   DstDir: string;
   {$IFDEF MSWINDOWS}
   BackupPath: string;
+  BackupPathW, DstPathW, SrcPathW: UnicodeString;
   ReplaceError: LongWord;
   {$ENDIF}
 begin
+  {$IFDEF UNIX}
   if not FileExists(ASrc) then Exit(False);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  if not WindowsPathExists(ASrc) then Exit(False);
+  {$ENDIF}
   DstDir := ExtractFileDir(ADst);
   if DstDir <> '' then ForceDirectories(DstDir);
   {$IFDEF UNIX}
@@ -1200,16 +1247,18 @@ begin
     provide the open-reader contract. If the destination merely disappeared
     before ReplaceFileW opened it, use the ordinary no-destination move only
     while the staged source is still present. }
-  if FileExists(ADst) then
+  SrcPathW := WindowsExtendedPath(ASrc);
+  DstPathW := WindowsExtendedPath(ADst);
+  if WindowsPathExists(ADst) then
   begin
-    BackupPath := MakeSiblingTmpPath(ADst, 'replace-backup');
-    Result := LWPTReplaceFileW(PWideChar(UnicodeString(ADst)),
-      PWideChar(UnicodeString(ASrc)), PWideChar(UnicodeString(BackupPath)),
-      0, nil, nil);
+    BackupPath := MakeWindowsReplaceBackupPath(ADst);
+    BackupPathW := WindowsExtendedPath(BackupPath);
+    Result := LWPTReplaceFileW(PWideChar(DstPathW), PWideChar(SrcPathW),
+      PWideChar(BackupPathW), 0, nil, nil);
     if Result then
     begin
-      if FileExists(BackupPath) then
-        if not SysUtils.DeleteFile(BackupPath) then
+      if WindowsPathExists(BackupPath) then
+        if not Windows.DeleteFileW(PWideChar(BackupPathW)) then
           raise EExtractError.CreateFmt(
             'atomic replacement of "%s" left its retained backup', [ADst]);
       Exit;
@@ -1217,23 +1266,22 @@ begin
     ReplaceError := Windows.GetLastError;
     if ReplaceError = ERROR_UNABLE_TO_MOVE_REPLACEMENT_2_LWPT then
     begin
-      if (not FileExists(BackupPath))
-        or not Windows.MoveFileExW(PWideChar(UnicodeString(BackupPath)),
-          PWideChar(UnicodeString(ADst)), MOVEFILE_WRITE_THROUGH_LWPT) then
+      if (not WindowsPathExists(BackupPath))
+        or not Windows.MoveFileExW(PWideChar(BackupPathW),
+          PWideChar(DstPathW), MOVEFILE_WRITE_THROUGH_LWPT) then
         raise EExtractError.CreateFmt(
           'atomic replacement of "%s" could not restore its retained backup',
           [ADst]);
       Exit(False);
     end;
-    if FileExists(BackupPath) and not SysUtils.DeleteFile(BackupPath) then
+    if WindowsPathExists(BackupPath)
+      and not Windows.DeleteFileW(PWideChar(BackupPathW)) then
       raise EExtractError.CreateFmt(
         'atomic replacement of "%s" could not remove its unused backup',
         [ADst]);
-    if FileExists(ADst) or not FileExists(ASrc) then Exit(False);
+    if WindowsPathExists(ADst) or not WindowsPathExists(ASrc) then Exit(False);
   end;
-  Result := Windows.MoveFileExW(
-    PWideChar(UnicodeString(ASrc)),
-    PWideChar(UnicodeString(ADst)),
+  Result := Windows.MoveFileExW(PWideChar(SrcPathW), PWideChar(DstPathW),
     MOVEFILE_WRITE_THROUGH_LWPT);
   {$ENDIF}
 end;
