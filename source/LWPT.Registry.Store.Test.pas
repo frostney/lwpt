@@ -35,6 +35,17 @@ type
     property Failure: string read FFailure;
   end;
 
+  TPublisherThread = class(TThread)
+  private
+    FStore: TLWPTRegistryStore;
+    FFailure: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AStore: TLWPTRegistryStore);
+    property Failure: string read FFailure;
+  end;
+
 procedure SetFailurePoint(const AValue: string);
 begin
   SetRegistryFailurePointForTesting(AValue);
@@ -58,6 +69,7 @@ type
     procedure TestExplicitIdentitySurvivesReconfiguration;
     procedure TestPlainHTTPRejectsRemoteBinding;
     procedure TestInvalidConfigurationLeavesFreshRootUncommitted;
+    procedure TestCommittedInitializationMarkerIsReconciled;
     procedure TestInitialCheckpointVerifiesAfterRestart;
     procedure TestPublicationIsImmutableAndIdempotent;
     procedure TestVersionIndexRetainsEveryPublishedVersion;
@@ -71,9 +83,13 @@ type
     procedure TestCheckpointRenewsWithoutNewSequence;
     procedure TestRegistryPathsRejectLinks;
     procedure TestCanonicalURLValidation;
+    procedure TestConfiguredEncodedBasePathRoutes;
+    procedure TestUnsupportedListenerFamilyFailsDuringInitialization;
     procedure TestSigningSeedIsPrivateFromCreation;
     procedure TestServerRejectsCorruptContentAddressedBytes;
+    procedure TestLargeResourceUsesStreamedDescriptor;
     procedure TestServerErrorsConformToWireContract;
+    procedure TestRenewalErrorDoesNotDiscloseStorePath;
     procedure TestServerDiscoveryIsTruthful;
     procedure TestCheckpointResponsesRequireRevalidation;
     procedure TestReadersObserveCompleteStateDuringPublication;
@@ -85,6 +101,29 @@ begin
   inherited Create(True);
   FreeOnTerminate := False;
   FStore := AStore;
+end;
+
+constructor TPublisherThread.Create(AStore: TLWPTRegistryStore);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FStore := AStore;
+end;
+
+procedure TPublisherThread.Execute;
+var
+  Publication: TLWPTRegistryPublication;
+begin
+  try
+    Publication.Name := 'example-lib';
+    Publication.Version := '1.0.0';
+    Publication.PublishedAt := SECOND_TIME;
+    SetLength(Publication.Archive, 1024 * 1024);
+    FillChar(Publication.Archive[0], Length(Publication.Archive), $51);
+    FStore.Publish(Publication);
+  except
+    on E: Exception do FFailure := E.Message;
+  end;
 end;
 
 procedure TReaderThread.Execute;
@@ -241,6 +280,37 @@ begin
     Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(1);
   finally
     Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestCommittedInitializationMarkerIsReconciled;
+var
+  Diagnostic: string;
+  Store: TLWPTRegistryStore;
+begin
+  SetFailurePoint('initialization-activation');
+  Diagnostic := '';
+  Store := nil;
+  try
+    Store := TLWPTRegistryStore.Initialize(FScratch, DefaultConfig,
+      INITIAL_TIME);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Store.Free;
+  SetFailurePoint('');
+  Expect<Boolean>(Pos('injected_registry_failure:', Diagnostic) = 1)
+    .ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/registry.toml')).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/.initializing')).ToBe(True);
+  Store := TLWPTRegistryStore.Initialize(FScratch, DefaultConfig,
+    SECOND_TIME);
+  try
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(1);
+    Expect<Boolean>(FileExists(FScratch + '/.initializing')).ToBe(False);
+  finally
+    Store.Free;
+    SetFailurePoint('');
   end;
 end;
 
@@ -507,6 +577,9 @@ begin
   Expect<string>(CanonicalRegistryURL(
     'https://[2001:0db8:0:0:0:0:0:1]:443/a/../b', False))
     .ToBe('https://[2001:db8::1]/b');
+  Expect<string>(CanonicalRegistryURL(
+    'https://example.com/a//b/%2f/c', False))
+    .ToBe('https://example.com/a//b/%2F/c');
   Diagnostic := '';
   try
     CanonicalRegistryURL('https://example.com/"bad"', False);
@@ -514,6 +587,53 @@ begin
     on E: Exception do Diagnostic := E.Message;
   end;
   Expect<Boolean>(Pos('invalid_url:', Diagnostic) = 1).ToBe(True);
+end;
+
+procedure TRegistryStoreContract.TestConfiguredEncodedBasePathRoutes;
+var
+  Config: TLWPTRegistryConfig;
+  Response: TLWPTRegistryHTTPResponse;
+  Store: TLWPTRegistryStore;
+begin
+  Config := DefaultConfig;
+  Config.BaseURL := 'http://localhost:8080/registry%2Fstable//instance';
+  Store := TLWPTRegistryStore.Initialize(FScratch, Config, INITIAL_TIME);
+  try
+    Response := RegistryHTTPResponse(Store, 'GET',
+      '/registry%2Fstable//instance/v1/capabilities');
+    Expect<Integer>(Response.Status).ToBe(200);
+    Response := RegistryHTTPResponse(Store, 'GET',
+      '/registry/stable//instance/v1/capabilities');
+    Expect<Integer>(Response.Status).ToBe(404);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestUnsupportedListenerFamilyFailsDuringInitialization;
+{$IFNDEF DARWIN}
+var
+  Config: TLWPTRegistryConfig;
+  Diagnostic: string;
+  Store: TLWPTRegistryStore;
+{$ENDIF}
+begin
+  {$IFNDEF DARWIN}
+  Config := RegistryConfiguration('', 'https://[::1]:9417', '::1', 9417,
+    ExpandFileName(FScratch + '/certificate.p12'), 'TLS_PASSWORD');
+  Diagnostic := '';
+  Store := nil;
+  try
+    Store := TLWPTRegistryStore.Initialize(FScratch, Config, INITIAL_TIME);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Store.Free;
+  Expect<Boolean>(Pos('invalid_listen_address:', Diagnostic) = 1).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/registry.toml')).ToBe(False);
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
 end;
 
 procedure TRegistryStoreContract.TestSigningSeedIsPrivateFromCreation;
@@ -557,6 +677,46 @@ begin
     Expect<Integer>(Response.Status).ToBe(500);
     Expect<Boolean>(Pos('resource_hash_mismatch',
       TEncoding.UTF8.GetString(Response.Body)) > 0).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestLargeResourceUsesStreamedDescriptor;
+var
+  ObjectName: string;
+  Publication: TLWPTRegistryPublication;
+  Response: TLWPTRegistryHTTPResponse;
+  Search: TSearchRec;
+  Store: TLWPTRegistryStore;
+  Wire: TBytes;
+begin
+  Store := InitializeStore;
+  try
+    Publication.Name := 'large-lib';
+    Publication.Version := '1.0.0';
+    Publication.PublishedAt := SECOND_TIME;
+    SetLength(Publication.Archive, 8 * 1024 * 1024);
+    FillChar(Publication.Archive[0], Length(Publication.Archive), $5A);
+    Store.Publish(Publication);
+    Expect<Integer>(FindFirst(FScratch + '/objects/sha256/*', faAnyFile,
+      Search)).ToBe(0);
+    while (Search.Name = '.') or (Search.Name = '..')
+      or ((Search.Attr and faDirectory) <> 0) do
+      if FindNext(Search) <> 0 then
+        raise Exception.Create('published object was not found');
+    ObjectName := Search.Name;
+    FindClose(Search);
+    Response := RegistryHTTPResponse(Store, 'GET',
+      '/v1/objects/sha256/' + ObjectName);
+    Expect<Integer>(Response.Status).ToBe(200);
+    Expect<Integer>(Length(Response.Body)).ToBe(0);
+    Expect<Int64>(Response.ResourceLength).ToBe(8 * 1024 * 1024);
+    Expect<Boolean>(Response.ResourcePath <> '').ToBe(True);
+    Wire := RegistryHTTPWireResponse(Response, True);
+    Expect<Boolean>(Length(Wire) < 1024).ToBe(True);
+    Expect<Boolean>(Pos('Content-Length: 8388608',
+      TEncoding.UTF8.GetString(Wire)) > 0).ToBe(True);
   finally
     Store.Free;
   end;
@@ -607,6 +767,29 @@ begin
   end;
 end;
 
+procedure TRegistryStoreContract.TestRenewalErrorDoesNotDiscloseStorePath;
+var
+  Body: string;
+  Response: TLWPTRegistryHTTPResponse;
+  State: TLWPTRegistryState;
+  Store: TLWPTRegistryStore;
+begin
+  Store := InitializeStore;
+  try
+    State := Store.LoadCurrentState;
+    SysUtils.DeleteFile(FScratch + '/' + State.CheckpointPath);
+    Response := RegistryHTTPResponse(Store, 'GET', '/v1/capabilities');
+    Body := TEncoding.UTF8.GetString(Response.Body);
+    Expect<Integer>(Response.Status).ToBe(500);
+    Expect<Boolean>(Pos('checkpoint_renewal_failed', Body) > 0).ToBe(True);
+    Expect<Boolean>(Pos(FScratch, Body) = 0).ToBe(True);
+    Expect<Boolean>(Pos('the active checkpoint could not be renewed', Body)
+      > 0).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
 procedure TRegistryStoreContract.TestServerDiscoveryIsTruthful;
 var
   Body: string;
@@ -618,7 +801,9 @@ begin
     Response := RegistryHTTPResponse(Store, 'GET', '/v1/capabilities');
     Body := TEncoding.UTF8.GetString(Response.Body);
     Expect<Boolean>(Pos('package-list-v1', Body) = 0).ToBe(True);
+    Expect<Boolean>(Pos('publication-v1', Body) = 0).ToBe(True);
     Expect<Boolean>(Pos('rotation-chain-v1', Body) = 0).ToBe(True);
+    Expect<Boolean>(Pos('auth_schemes = []', Body) > 0).ToBe(True);
     Response := RegistryHTTPResponse(Store, 'GET',
       '/.well-known/' + PROGRAM_NAME + '-registry');
     Body := TEncoding.UTF8.GetString(Response.Body);
@@ -695,24 +880,53 @@ end;
 procedure TRegistryStoreContract.TestReadersObserveCompleteStateDuringPublication;
 var
   Index: Integer;
+  Publisher: TPublisherThread;
+  ReadyPath, ReleasePath: string;
   Readers: array[0..3] of TReaderThread;
+  StartedAt: QWord;
   Store: TLWPTRegistryStore;
 begin
   Store := InitializeStore;
+  Publisher := nil;
+  ReadyPath := FScratch + '-publication-ready';
+  ReleasePath := FScratch + '-publication-release';
   try
+    SetRegistryPublicationBarrierForTesting(ReadyPath, ReleasePath);
+    Publisher := TPublisherThread.Create(Store);
+    Publisher.Start;
+    StartedAt := GetTickCount64;
+    while not FileExists(ReadyPath) do
+    begin
+      if GetTickCount64 - StartedAt >= 5000 then
+        raise Exception.Create('publication did not reach activation barrier');
+      Sleep(10);
+    end;
     for Index := 0 to High(Readers) do
     begin
       Readers[Index] := TReaderThread.Create(Store);
       Readers[Index].Start;
     end;
-    PublishExample(Store, $51);
     for Index := 0 to High(Readers) do
     begin
       Readers[Index].WaitFor;
       Expect<string>(Readers[Index].Failure).ToBe('');
       Readers[Index].Free;
     end;
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(1);
+    WriteTextFile(ReleasePath, 'release');
+    Publisher.WaitFor;
+    Expect<string>(Publisher.Failure).ToBe('');
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(2);
   finally
+    if not FileExists(ReleasePath) then WriteTextFile(ReleasePath, 'release');
+    if Assigned(Publisher) then
+    begin
+      Publisher.WaitFor;
+      Publisher.Free;
+    end;
+    SetRegistryPublicationBarrierForTesting('', '');
+    SysUtils.DeleteFile(ReadyPath);
+    SysUtils.DeleteFile(ReleasePath);
     Store.Free;
   end;
 end;
@@ -757,6 +971,8 @@ begin
     TestPlainHTTPRejectsRemoteBinding);
   Test('invalid configuration leaves a fresh root uncommitted',
     TestInvalidConfigurationLeavesFreshRootUncommitted);
+  Test('committed initialization marker is reconciled',
+    TestCommittedInitializationMarkerIsReconciled);
   Test('initial checkpoint verifies after restart',
     TestInitialCheckpointVerifiesAfterRestart);
   Test('publication is immutable and idempotent',
@@ -780,12 +996,20 @@ begin
     TestCheckpointRenewsWithoutNewSequence);
   Test('registry paths reject links', TestRegistryPathsRejectLinks);
   Test('canonical URL validation', TestCanonicalURLValidation);
+  Test('configured encoded base path routes',
+    TestConfiguredEncodedBasePathRoutes);
+  Test('unsupported listener family fails during initialization',
+    TestUnsupportedListenerFamilyFailsDuringInitialization);
   Test('signing seed is private from creation',
     TestSigningSeedIsPrivateFromCreation);
   Test('server rejects corrupt content-addressed bytes',
     TestServerRejectsCorruptContentAddressedBytes);
+  Test('large resource uses a streamed descriptor',
+    TestLargeResourceUsesStreamedDescriptor);
   Test('server errors conform to the wire contract',
     TestServerErrorsConformToWireContract);
+  Test('renewal error does not disclose the store path',
+    TestRenewalErrorDoesNotDiscloseStorePath);
   Test('server discovery is truthful', TestServerDiscoveryIsTruthful);
   Test('checkpoint responses require revalidation',
     TestCheckpointResponsesRequireRevalidation);

@@ -258,7 +258,7 @@ end;
 
 procedure TRegistryE2EContract.TestForegroundServerSurvivesRestartAndConcurrentReaders;
 var
-  DataDirectory, DiscoveryURL: string;
+  DataDirectory, DiscoveryURL, ResourceURL: string;
   Init: TLwptResult;
   Index: Integer;
   Readers: array[0..7] of TProcess;
@@ -266,10 +266,12 @@ var
 begin
   DataDirectory := FScratch + '/plain-origin';
   DiscoveryURL := 'http://localhost:' + IntToStr(BasePort)
-    + '/.well-known/lwpt-registry';
+    + '/registry%2Fstable//instance/.well-known/lwpt-registry';
+  ResourceURL := 'http://localhost:' + IntToStr(BasePort)
+    + '/registry%2Fstable//instance/v1/checkpoints/latest.toml';
   Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
-    '--base-url', 'http://localhost:' + IntToStr(BasePort), '--port',
-    IntToStr(BasePort)]);
+    '--base-url', 'http://localhost:' + IntToStr(BasePort)
+    + '/registry%2Fstable//instance', '--port', IntToStr(BasePort)]);
   Expect<Integer>(Init.ExitCode).ToBe(0);
   Server := StartServer(DataDirectory, False);
   try
@@ -291,7 +293,7 @@ begin
       {$ELSE}
       Readers[Index].Parameters.Add('/dev/null');
       {$ENDIF}
-      Readers[Index].Parameters.Add(DiscoveryURL);
+      Readers[Index].Parameters.Add(ResourceURL);
       Readers[Index].Execute;
     end;
     for Index := 0 to High(Readers) do
@@ -306,6 +308,8 @@ begin
   Server := StartServer(DataDirectory, False);
   try
     WaitUntilReady(DiscoveryURL, False);
+    Expect<Boolean>(Pos('lwpt-registry-checkpoint-v1', Curl(ResourceURL,
+      False)) > 0).ToBe(True);
   finally
     StopServer(Server);
   end;
@@ -313,13 +317,15 @@ end;
 
 procedure TRegistryE2EContract.TestConfiguredTLSServerCompletesARequest;
 var
-  DataDirectory, DiscoveryURL: string;
+  DataDirectory, DiscoveryURL, ResourceURL: string;
   Init: TLwptResult;
   Server: TProcess;
 begin
   DataDirectory := FScratch + '/tls-origin';
   DiscoveryURL := 'https://localhost:' + IntToStr(BasePort + 2)
     + '/.well-known/lwpt-registry';
+  ResourceURL := 'https://localhost:' + IntToStr(BasePort + 2)
+    + '/v1/checkpoints/latest.toml';
   Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
     '--base-url', 'https://localhost:' + IntToStr(BasePort + 2), '--port',
     IntToStr(BasePort + 2), '--tls-pkcs12',
@@ -330,6 +336,8 @@ begin
   Server := StartServer(DataDirectory, True);
   try
     WaitUntilReady(DiscoveryURL, True);
+    Expect<Boolean>(Pos('lwpt-registry-checkpoint-v1', Curl(ResourceURL,
+      True)) > 0).ToBe(True);
   finally
     StopServer(Server);
   end;

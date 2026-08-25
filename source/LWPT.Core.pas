@@ -1243,6 +1243,12 @@ end;
 
 type
   TSHA256Digest = array[0..31] of Byte;
+  TSHA256Context = record
+    State: array[0..7] of Cardinal;
+    Buffer: array[0..63] of Byte;
+    BufferLength: Integer;
+    TotalLength: QWord;
+  end;
 
 { SHA-256 performs intentional modular arithmetic on 32-bit values
   (Cardinals): the compression loop's `temp1 := h + s1 + ch + K[t] + W[t]`
@@ -1256,7 +1262,8 @@ type
   network-source archive-hash path was the first call site to hit
   it after the matching ADR. }
 {$PUSH}{$R-}{$Q-}
-function SHA256Bytes(const AData: TBytes): TSHA256Digest;
+procedure SHA256Transform(var AContext: TSHA256Context;
+  const ABlock: array of Byte);
 const
   K: array[0..63] of Cardinal = (
     $428a2f98,$71374491,$b5c0fbcf,$e9b5dba5,$3956c25b,$59f111f1,$923f82a4,$ab1c5ed5,
@@ -1268,11 +1275,8 @@ const
     $19a4c116,$1e376c08,$2748774c,$34b0bcb5,$391c0cb3,$4ed8aa4a,$5b9cca4f,$682e6ff3,
     $748f82ee,$78a5636f,$84c87814,$8cc70208,$90befffa,$a4506ceb,$bef9a3f7,$c67178f2);
 var
-  HV: array[0..7] of Cardinal;
   W: array[0..63] of Cardinal;
-  Msg: TBytes;
-  BitLen: QWord;
-  i, t, ChunkStart: Integer;
+  t: Integer;
   a,b,c,d,e,f,g,h, s0,s1, ch, maj, temp1, temp2: Cardinal;
 
   function RotR(x: Cardinal; n: Byte): Cardinal; inline;
@@ -1281,28 +1285,11 @@ var
   end;
 
 begin
-  HV[0]:=$6a09e667; HV[1]:=$bb67ae85; HV[2]:=$3c6ef372; HV[3]:=$a54ff53a;
-  HV[4]:=$510e527f; HV[5]:=$9b05688c; HV[6]:=$1f83d9ab; HV[7]:=$5be0cd19;
-
-  BitLen := QWord(Length(AData)) * 8;
-  { pad: 0x80, then zeros, then 64-bit big-endian length }
-  Msg := Copy(AData, 0, Length(AData));
-  SetLength(Msg, Length(Msg) + 1);
-  Msg[High(Msg)] := $80;
-  while (Length(Msg) mod 64) <> 56 do
-    SetLength(Msg, Length(Msg) + 1);
-  SetLength(Msg, Length(Msg) + 8);
-  for i := 0 to 7 do
-    Msg[Length(Msg) - 1 - i] := Byte((BitLen shr (8 * i)) and $FF);
-
-  ChunkStart := 0;
-  while ChunkStart < Length(Msg) do
-  begin
     for t := 0 to 15 do
-      W[t] := (Cardinal(Msg[ChunkStart + t*4    ]) shl 24) or
-              (Cardinal(Msg[ChunkStart + t*4 + 1]) shl 16) or
-              (Cardinal(Msg[ChunkStart + t*4 + 2]) shl 8) or
-              (Cardinal(Msg[ChunkStart + t*4 + 3]));
+      W[t] := (Cardinal(ABlock[t*4    ]) shl 24) or
+              (Cardinal(ABlock[t*4 + 1]) shl 16) or
+              (Cardinal(ABlock[t*4 + 2]) shl 8) or
+              (Cardinal(ABlock[t*4 + 3]));
     for t := 16 to 63 do
     begin
       s0 := RotR(W[t-15],7) xor RotR(W[t-15],18) xor (W[t-15] shr 3);
@@ -1310,8 +1297,10 @@ begin
       W[t] := W[t-16] + s0 + W[t-7] + s1;
     end;
 
-    a:=HV[0]; b:=HV[1]; c:=HV[2]; d:=HV[3];
-    e:=HV[4]; f:=HV[5]; g:=HV[6]; h:=HV[7];
+    a:=AContext.State[0]; b:=AContext.State[1];
+    c:=AContext.State[2]; d:=AContext.State[3];
+    e:=AContext.State[4]; f:=AContext.State[5];
+    g:=AContext.State[6]; h:=AContext.State[7];
 
     for t := 0 to 63 do
     begin
@@ -1325,42 +1314,124 @@ begin
       d:=c; c:=b; b:=a; a:=temp1 + temp2;
     end;
 
-    Inc(HV[0],a); Inc(HV[1],b); Inc(HV[2],c); Inc(HV[3],d);
-    Inc(HV[4],e); Inc(HV[5],f); Inc(HV[6],g); Inc(HV[7],h);
-    Inc(ChunkStart, 64);
-  end;
+    Inc(AContext.State[0],a); Inc(AContext.State[1],b);
+    Inc(AContext.State[2],c); Inc(AContext.State[3],d);
+    Inc(AContext.State[4],e); Inc(AContext.State[5],f);
+    Inc(AContext.State[6],g); Inc(AContext.State[7],h);
+end;
 
-  for i := 0 to 7 do
+procedure SHA256Init(var AContext: TSHA256Context);
+begin
+  FillChar(AContext, SizeOf(AContext), 0);
+  AContext.State[0]:=$6a09e667; AContext.State[1]:=$bb67ae85;
+  AContext.State[2]:=$3c6ef372; AContext.State[3]:=$a54ff53a;
+  AContext.State[4]:=$510e527f; AContext.State[5]:=$9b05688c;
+  AContext.State[6]:=$1f83d9ab; AContext.State[7]:=$5be0cd19;
+end;
+
+procedure SHA256Update(var AContext: TSHA256Context; const AData;
+  const ACount: Integer);
+var
+  Count, Take: Integer;
+  Cursor: PByte;
+begin
+  if ACount <= 0 then Exit;
+  Cursor := @AData;
+  Count := ACount;
+  Inc(AContext.TotalLength, Count);
+  while Count > 0 do
   begin
-    Result[i*4    ] := Byte((HV[i] shr 24) and $FF);
-    Result[i*4 + 1] := Byte((HV[i] shr 16) and $FF);
-    Result[i*4 + 2] := Byte((HV[i] shr 8) and $FF);
-    Result[i*4 + 3] := Byte( HV[i]         and $FF);
+    Take := SizeOf(AContext.Buffer) - AContext.BufferLength;
+    if Take > Count then Take := Count;
+    Move(Cursor^, AContext.Buffer[AContext.BufferLength], Take);
+    Inc(Cursor, Take);
+    Inc(AContext.BufferLength, Take);
+    Dec(Count, Take);
+    if AContext.BufferLength = SizeOf(AContext.Buffer) then
+    begin
+      SHA256Transform(AContext, AContext.Buffer);
+      AContext.BufferLength := 0;
+    end;
   end;
+end;
+
+procedure SHA256Final(var AContext: TSHA256Context;
+  out ADigest: TSHA256Digest);
+var
+  BitLength: QWord;
+  Index: Integer;
+begin
+  BitLength := AContext.TotalLength * 8;
+  AContext.Buffer[AContext.BufferLength] := $80;
+  Inc(AContext.BufferLength);
+  if AContext.BufferLength > 56 then
+  begin
+    FillChar(AContext.Buffer[AContext.BufferLength],
+      SizeOf(AContext.Buffer) - AContext.BufferLength, 0);
+    SHA256Transform(AContext, AContext.Buffer);
+    AContext.BufferLength := 0;
+  end;
+  FillChar(AContext.Buffer[AContext.BufferLength],
+    56 - AContext.BufferLength, 0);
+  for Index := 0 to 7 do
+    AContext.Buffer[63 - Index] := Byte((BitLength shr (8 * Index)) and $FF);
+  SHA256Transform(AContext, AContext.Buffer);
+
+  for Index := 0 to 7 do
+  begin
+    ADigest[Index*4    ] := Byte((AContext.State[Index] shr 24) and $FF);
+    ADigest[Index*4 + 1] := Byte((AContext.State[Index] shr 16) and $FF);
+    ADigest[Index*4 + 2] := Byte((AContext.State[Index] shr 8) and $FF);
+    ADigest[Index*4 + 3] := Byte( AContext.State[Index]         and $FF);
+  end;
+  FillChar(AContext, SizeOf(AContext), 0);
+end;
+
+function SHA256Bytes(const AData: TBytes): TSHA256Digest;
+var
+  Context: TSHA256Context;
+begin
+  SHA256Init(Context);
+  if Length(AData) > 0 then SHA256Update(Context, AData[0], Length(AData));
+  SHA256Final(Context, Result);
 end;
 {$POP}
 
-function SHA256Hex(const AData: TBytes): string;
-var D: TSHA256Digest; i: Integer;
+function SHA256DigestHex(const ADigest: TSHA256Digest): string;
+var
+  Index: Integer;
 begin
-  D := SHA256Bytes(AData);
   Result := '';
-  for i := 0 to 31 do
-    Result := Result + LowerCase(IntToHex(D[i], 2));
+  for Index := 0 to High(ADigest) do
+    Result := Result + LowerCase(IntToHex(ADigest[Index], 2));
+end;
+
+function SHA256Hex(const AData: TBytes): string;
+begin
+  Result := SHA256DigestHex(SHA256Bytes(AData));
 end;
 
 function SHA256File(const APath: string): string;
-var FS: TFileStream; Buf: TBytes;
+var
+  Buffer: array[0..65535] of Byte;
+  Context: TSHA256Context;
+  Digest: TSHA256Digest;
+  ReadCount: Integer;
+  Stream: TFileStream;
 begin
   if not FileExists(APath) then Exit('');
-  FS := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
-    SetLength(Buf, FS.Size);
-    if FS.Size > 0 then FS.ReadBuffer(Buf[0], FS.Size);
+    SHA256Init(Context);
+    repeat
+      ReadCount := Stream.Read(Buffer[0], SizeOf(Buffer));
+      if ReadCount > 0 then SHA256Update(Context, Buffer[0], ReadCount);
+    until ReadCount = 0;
+    SHA256Final(Context, Digest);
   finally
-    FS.Free;
+    Stream.Free;
   end;
-  Result := SHA256Hex(Buf);
+  Result := SHA256DigestHex(Digest);
 end;
 
 function CanonicalTreeHashPath(const APath: string;

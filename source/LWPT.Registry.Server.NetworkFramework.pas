@@ -79,13 +79,21 @@ type
     FClosing: Boolean;
     FResponding: Boolean;
     FDeadline: QWord;
+    FResponseStream: TFileStream;
+    FSendBuffer: TBytes;
+    FSendData: Pointer;
     FStateBlock: TRegistryBlock;
     FReceiveBlock: TRegistryBlock;
     FSendBlock: TRegistryBlock;
     procedure ArmReceive;
     procedure Cancel;
     procedure Consume(const ABuffer: Pointer; const ALength: NativeUInt);
+    procedure SendCompleted(AError: Pointer);
+    procedure SendCurrentBuffer;
+    procedure SendNextResourceChunk;
     procedure SendResponse;
+  public
+    destructor Destroy; override;
   end;
 
   TNetworkFrameworkRegistryServer = class
@@ -357,7 +365,7 @@ var
 begin
   EnsureFrameworkThread;
   Connection := TNetworkFrameworkRegistryConnection(ABlock^.Context);
-  Connection.Cancel;
+  Connection.SendCompleted(AError);
 end;
 
 procedure NewConnectionInvoke(ABlock: PRegistryBlock;
@@ -419,6 +427,13 @@ begin
   Nw_connection_cancel(FConnection);
 end;
 
+destructor TNetworkFrameworkRegistryConnection.Destroy;
+begin
+  FResponseStream.Free;
+  if FSendData <> nil then Dispatch_release(FSendData);
+  inherited Destroy;
+end;
+
 procedure TNetworkFrameworkRegistryConnection.Consume(const ABuffer: Pointer;
   const ALength: NativeUInt);
 var
@@ -439,18 +454,20 @@ begin
   if Pos(#13#10#13#10, FRequest) > 0 then
   begin
     FResponding := True;
-    SendResponse;
+    try
+      SendResponse;
+    except
+      Cancel;
+    end;
   end;
 end;
 
 procedure TNetworkFrameworkRegistryConnection.SendResponse;
 var
-  Data: Pointer;
   IncludeBody: Boolean;
   Method, RequestLine, Target: string;
   Response: TLWPTRegistryHTTPResponse;
   Space: Integer;
-  Wire: TBytes;
 begin
   RequestLine := Copy(string(FRequest), 1, Pos(#13#10, string(FRequest)) - 1);
   Space := Pos(' ', RequestLine);
@@ -470,11 +487,81 @@ begin
   Target := Copy(RequestLine, 1, Space - 1);
   Response := RegistryHTTPResponse(FServer.FStore, Method, Target);
   IncludeBody := not SameText(Method, 'HEAD');
-  Wire := RegistryHTTPWireResponse(Response, IncludeBody);
-  Data := Dispatch_data_create(@Wire[0], Length(Wire), nil, nil);
-  Nw_connection_send(FConnection, Data, ContentContextDefaultStream, False,
-    MakeBlock(FSendBlock, @SendInvoke, Self));
-  Dispatch_release(Data);
+  if GetTickCount64 >= FDeadline then
+  begin
+    Cancel;
+    Exit;
+  end;
+  if IncludeBody and (Response.ResourcePath <> '') then
+  begin
+    VerifyRegistryHTTPResource(Response);
+    FResponseStream := TFileStream.Create(Response.ResourcePath,
+      fmOpenRead or fmShareDenyNone);
+  end;
+  FSendBuffer := RegistryHTTPWireResponse(Response,
+    IncludeBody and (Response.ResourcePath = ''));
+  SendCurrentBuffer;
+end;
+
+procedure TNetworkFrameworkRegistryConnection.SendCurrentBuffer;
+begin
+  if FClosing or (Length(FSendBuffer) = 0)
+    or (GetTickCount64 >= FDeadline) then
+  begin
+    Cancel;
+    Exit;
+  end;
+  FSendData := Dispatch_data_create(@FSendBuffer[0], Length(FSendBuffer),
+    nil, nil);
+  Nw_connection_send(FConnection, FSendData, ContentContextDefaultStream,
+    False, MakeBlock(FSendBlock, @SendInvoke, Self));
+end;
+
+procedure TNetworkFrameworkRegistryConnection.SendNextResourceChunk;
+var
+  ReadCount: Integer;
+begin
+  if not Assigned(FResponseStream) then
+  begin
+    Cancel;
+    Exit;
+  end;
+  SetLength(FSendBuffer, 64 * 1024);
+  ReadCount := FResponseStream.Read(FSendBuffer[0], Length(FSendBuffer));
+  SetLength(FSendBuffer, ReadCount);
+  if ReadCount = 0 then
+  begin
+    FreeAndNil(FResponseStream);
+    Cancel;
+    Exit;
+  end;
+  SendCurrentBuffer;
+end;
+
+procedure TNetworkFrameworkRegistryConnection.SendCompleted(AError: Pointer);
+begin
+  if FSendData <> nil then
+  begin
+    Dispatch_release(FSendData);
+    FSendData := nil;
+  end;
+  SetLength(FSendBuffer, 0);
+  if (AError <> nil) or FClosing or (GetTickCount64 >= FDeadline) then
+  begin
+    Cancel;
+    Exit;
+  end;
+  if Assigned(FResponseStream) then
+  begin
+    if FResponseStream.Position < FResponseStream.Size then
+      SendNextResourceChunk
+    else
+    begin
+      FreeAndNil(FResponseStream);
+      Cancel;
+    end;
+  end
+  else Cancel;
 end;
 
 procedure TNetworkFrameworkRegistryServer.ConnectionFinished(

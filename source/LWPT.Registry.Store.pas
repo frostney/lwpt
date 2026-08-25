@@ -70,6 +70,8 @@ type
       const APublishedAt: string): TLWPTRegistryStore;
     procedure Recover;
     procedure EnsureFreshCheckpoint(const ANow: string);
+    procedure DescribeResource(const ARelative, AExpectedDigest: string;
+      out APath: string; out ASize: Int64);
     function LoadCurrentState: TLWPTRegistryState;
     function LoadResource(const ARelative: string): TBytes;
     procedure Publish(const APublication: TLWPTRegistryPublication);
@@ -88,6 +90,8 @@ function RegistryConfiguration(const AIdentity, ABaseURL,
 procedure ValidateRegistryConfiguration(const AConfig: TLWPTRegistryConfig);
 {$IFDEF REGISTRY_TESTING}
 procedure SetRegistryFailurePointForTesting(const APoint: string);
+procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
+  AReleasePath: string);
 {$ENDIF}
 
 implementation
@@ -118,6 +122,9 @@ const
 {$IFDEF REGISTRY_TESTING}
 var
   RegistryFailurePointForTesting: string;
+  RegistryPublicationReadyPathForTesting: string;
+  RegistryPublicationReleasePathForTesting: string;
+procedure InjectRegistryFailure(const APoint: string); forward;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
@@ -481,31 +488,56 @@ end;
 
 function RemoveDotSegments(const APath: string): string;
 var
-  Item: string;
-  Index: Integer;
-  Input, Output: TStringList;
-begin
-  if APath = '' then Exit('');
-  Input := TStringList.Create;
-  Output := TStringList.Create;
-  try
-    Input.Delimiter := '/';
-    Input.StrictDelimiter := True;
-    Input.DelimitedText := APath;
-    for Item in Input do
-      if (Item = '') or (Item = '.') then
-        Continue
-      else if Item = '..' then
-      begin
-        if Output.Count > 0 then Output.Delete(Output.Count - 1);
-      end
-      else Output.Add(Item);
-    Result := '';
-    for Index := 0 to Output.Count - 1 do Result := Result + '/' + Output[Index];
-  finally
-    Output.Free;
-    Input.Free;
+  Input, Output, Segment: string;
+  Slash: SizeInt;
+
+  procedure RemoveLastSegment;
+  var
+    LastSlash: SizeInt;
+  begin
+    LastSlash := LastDelimiter('/', Output);
+    if LastSlash > 0 then Delete(Output, LastSlash, MaxInt)
+    else Output := '';
   end;
+begin
+  Input := APath;
+  Output := '';
+  while Input <> '' do
+  begin
+    if StartsStr('../', Input) then Delete(Input, 1, 3)
+    else if StartsStr('./', Input) then Delete(Input, 1, 2)
+    else if StartsStr('/./', Input) then Delete(Input, 1, 2)
+    else if Input = '/.' then Input := '/'
+    else if StartsStr('/../', Input) then
+    begin
+      Delete(Input, 1, 3);
+      RemoveLastSegment;
+    end
+    else if Input = '/..' then
+    begin
+      Input := '/';
+      RemoveLastSegment;
+    end
+    else if (Input = '.') or (Input = '..') then Input := ''
+    else
+    begin
+      if Input[1] = '/' then
+        Slash := PosEx('/', Input, 2)
+      else Slash := Pos('/', Input);
+      if Slash = 0 then
+      begin
+        Segment := Input;
+        Input := '';
+      end
+      else
+      begin
+        Segment := Copy(Input, 1, Slash - 1);
+        Delete(Input, 1, Slash - 1);
+      end;
+      Output := Output + Segment;
+    end;
+  end;
+  Result := Output;
 end;
 
 function RFC5952(const AAddress: in6_addr): string;
@@ -741,6 +773,12 @@ begin
     raise ELWPTRegistryError.CreateStable('invalid_identity', 'origin identity is not canonical; use ' + Identity);
   if (AConfig.ListenAddress = '') or (AConfig.Port = 0) then
     raise ELWPTRegistryError.CreateStable('invalid_configuration', 'listen address and port are required');
+  {$IFNDEF DARWIN}
+  if not SameText(AConfig.ListenAddress, 'localhost')
+    and (StrToNetAddr(AConfig.ListenAddress).s_addr = LongWord(-1)) then
+    raise ELWPTRegistryError.CreateStable('invalid_listen_address',
+      'listen address must be localhost or an IPv4 address on this platform');
+  {$ENDIF}
   if StartsText('http://', AConfig.BaseURL)
     and not IsLoopbackListenAddress(AConfig.ListenAddress) then
     raise ELWPTRegistryError.CreateStable('insecure_transport',
@@ -1109,6 +1147,13 @@ begin
     begin
       Existing := TLWPTRegistryStore.Create(ARoot);
       try
+        if FileExists(AtRoot(INITIALIZATION_MARKER)) then
+        begin
+          if not SysUtils.DeleteFile(AtRoot(INITIALIZATION_MARKER)) then
+            raise ELWPTRegistryError.CreateStable(
+              'initialization_recovery_failed',
+              'could not reconcile committed origin initialization marker');
+        end;
         Config := ARequested;
         if Config.Identity = '' then Config.Identity := Existing.Config.Identity;
         Config.BaseURL := CanonicalRegistryURL(Config.BaseURL, False);
@@ -1178,6 +1223,9 @@ begin
       AtomicWriteBytes(AtRoot(CURRENT_STATE_FILE), TemporaryRoot,
         Bytes(StateDocument(State)));
       AtomicWriteBytes(AtRoot(CONFIG_FILE), TemporaryRoot, ConfigBytes);
+      {$IFDEF REGISTRY_TESTING}
+      InjectRegistryFailure('initialization-activation');
+      {$ENDIF}
       SysUtils.DeleteFile(AtRoot(INITIALIZATION_MARKER));
       Result := TLWPTRegistryStore.Create(ARoot);
     except
@@ -1455,10 +1503,45 @@ begin
   Result := ReadBytes(FullPath);
 end;
 
+procedure TLWPTRegistryStore.DescribeResource(const ARelative,
+  AExpectedDigest: string; out APath: string; out ASize: Int64);
+var
+  Stream: TFileStream;
+begin
+  if (ARelative = '') or (ARelative[1] = '/') or (Pos('..', ARelative) > 0)
+    or (Pos('\', ARelative) > 0) then
+    raise ELWPTRegistryError.CreateStable('invalid_resource_path',
+      'registry resource path is invalid');
+  APath := RootPath(ARelative);
+  if not PathContains(FRoot, APath) then
+    raise ELWPTRegistryError.CreateStable('invalid_resource_path',
+      'registry resource escapes its data root');
+  if not FileExists(APath) then
+    raise ELWPTRegistryError.CreateStable('state_missing',
+      'required file is missing: ' + APath);
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    ASize := Stream.Size;
+  finally
+    Stream.Free;
+  end;
+  if (AExpectedDigest <> '')
+    and ('sha256:' + SHA256File(APath) <> AExpectedDigest) then
+    raise ELWPTRegistryError.CreateStable('resource_hash_mismatch',
+      'content-addressed resource bytes do not match the request path');
+end;
+
 {$IFDEF REGISTRY_TESTING}
 procedure SetRegistryFailurePointForTesting(const APoint: string);
 begin
   RegistryFailurePointForTesting := APoint;
+end;
+
+procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
+  AReleasePath: string);
+begin
+  RegistryPublicationReadyPathForTesting := AReadyPath;
+  RegistryPublicationReleasePathForTesting := AReleasePath;
 end;
 
 procedure InjectRegistryFailure(const APoint: string);
@@ -1548,6 +1631,9 @@ var
   Records, VersionEntries: TStringList;
   Seed: TLWPTEd25519Seed;
   State: TLWPTRegistryState;
+  {$IFDEF REGISTRY_TESTING}
+  BarrierStartedAt: QWord;
+  {$ENDIF}
 begin
   if (Length(APublication.Name) < 1) or (Length(APublication.Name) > 128)
     or not (APublication.Name[1] in ['a'..'z', '0'..'9']) then
@@ -1666,6 +1752,21 @@ begin
     State.CheckpointPath := 'checkpoints/' + UIntToStr(State.Sequence) + '.toml';
     State.SignaturePath := 'checkpoints/' + UIntToStr(State.Sequence)
       + '.sig.toml';
+    {$IFDEF REGISTRY_TESTING}
+    if RegistryPublicationReadyPathForTesting <> '' then
+    begin
+      AtomicWriteBytes(RegistryPublicationReadyPathForTesting, TmpRoot,
+        Bytes('ready' + #10));
+      BarrierStartedAt := GetTickCount64;
+      while not FileExists(RegistryPublicationReleasePathForTesting) do
+      begin
+        if GetTickCount64 - BarrierStartedAt >= 10000 then
+          raise ELWPTRegistryError.CreateStable('test_barrier_timeout',
+            'publication activation barrier timed out');
+        Sleep(10);
+      end;
+    end;
+    {$ENDIF}
     AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
       Bytes(StateDocument(State)));
     {$IFDEF REGISTRY_TESTING}

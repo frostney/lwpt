@@ -115,10 +115,18 @@ HTTPS uses the repository's native server policy:
   the Network C API through the stable blocks ABI, with one serial queue per
   connection.
 
+The portable socket listeners on Windows and Unix other than Darwin accept
+`localhost` or an IPv4 address. Initialization rejects other listener families
+there rather than persisting a configuration that can fail only at `serve`.
+The macOS Network.framework listener also accepts IPv6 addresses.
+
 The listener admits at most 32 owned connections, handles each independently,
 and closes it after one bounded HTTP/1.1 GET or HEAD request. One ten-second
 monotonic deadline covers handshake, request, and response; request headers are
-capped at 32 KiB. Shutdown interrupts acceptance, cancels every client, drains
+capped at 32 KiB. Verified resources are described by path, length, and digest,
+then revalidated and sent through one 64 KiB connection-owned buffer. The
+listener never builds a second body-sized wire response in memory. Shutdown
+interrupts acceptance, cancels every client, drains
 its workers or Network.framework callbacks, and only then releases the store
 and TLS context. Hashed objects, records, and snapshots are SHA-256 checked
 again before every response and receive immutable cache headers. Checkpoint

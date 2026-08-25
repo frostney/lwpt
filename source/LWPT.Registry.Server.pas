@@ -21,6 +21,9 @@ type
     CacheControl: string;
     ETag: string;
     Body: TBytes;
+    ResourcePath: string;
+    ResourceLength: Int64;
+    ResourceDigest: string;
   end;
 
   TLWPTRegistryServer = class
@@ -44,6 +47,8 @@ function RegistryErrorResponse(const AStatus: Integer; const AReason,
   TLWPTRegistryHTTPResponse;
 function RegistryHTTPWireResponse(const AResponse: TLWPTRegistryHTTPResponse;
   const AIncludeBody: Boolean): TBytes;
+procedure VerifyRegistryHTTPResource(
+  const AResponse: TLWPTRegistryHTTPResponse);
 
 implementation
 
@@ -145,6 +150,9 @@ begin
     + '.registry-error+toml';
   Result.CacheControl := 'no-store';
   Result.ETag := '';
+  Result.ResourcePath := '';
+  Result.ResourceLength := 0;
+  Result.ResourceDigest := '';
   Result.Body := Bytes('schema = '
     + RegistryTOMLQuote(PROGRAM_NAME + '-registry-error-v1') + #10
     + 'code = ' + RegistryTOMLQuote(ACode) + #10
@@ -164,11 +172,10 @@ function ResourceResponse(AStore: TLWPTRegistryStore;
   const AImmutable: Boolean): TLWPTRegistryHTTPResponse;
 begin
   try
-    Result.Body := AStore.LoadResource(ARelative);
-    if (AExpectedDigest <> '') and (SHA256BytesPrefixed(Result.Body)
-      <> AExpectedDigest) then
-      raise ELWPTRegistryError.CreateStable('resource_hash_mismatch',
-        'content-addressed resource bytes do not match the request path');
+    SetLength(Result.Body, 0);
+    AStore.DescribeResource(ARelative, AExpectedDigest,
+      Result.ResourcePath, Result.ResourceLength);
+    Result.ResourceDigest := AExpectedDigest;
     Result.Status := 200;
     Result.Reason := 'OK';
     Result.ContentType := AContentType;
@@ -190,21 +197,32 @@ end;
 function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
   const AMethod, ATarget: string): TLWPTRegistryHTTPResponse;
 var
-  APIPath, Digest, KeyID, Prefix, Relative: string;
+  APIPath, Digest, KeyID, Prefix, Relative, RequestID: string;
   State: TLWPTRegistryState;
 begin
   try
     AStore.EnsureFreshCheckpoint(RegistryTimestampNow);
   except
     on E: ELWPTRegistryError do
-      Exit(ErrorResponse(500, 'Internal Server Error',
-        'checkpoint_renewal_failed', E.Message));
+    begin
+      RequestID := NewRegistryRequestID;
+      {$IFDEF UNIX}
+      Relative := 'registry request ' + RequestID
+        + ' checkpoint renewal failed: ' + E.Message + LineEnding;
+      FpWrite(StdErrorHandle, Relative[1], Length(Relative));
+      {$ELSE}
+      WriteLn(ErrOutput, 'registry request ', RequestID,
+        ' checkpoint renewal failed: ', E.Message);
+      {$ENDIF}
+      Exit(RegistryErrorResponse(500, 'Internal Server Error',
+        'checkpoint_renewal_failed',
+        'the active checkpoint could not be renewed', RequestID));
+    end;
   end;
   if not SameText(AMethod, 'GET') and not SameText(AMethod, 'HEAD') then
     Exit(ErrorResponse(405, 'Method Not Allowed', 'method_not_allowed',
       'only GET and HEAD are supported'));
-  if (Pos('?', ATarget) > 0) or (Pos('#', ATarget) > 0)
-    or (Pos('..', ATarget) > 0) or (Pos('%', ATarget) > 0) then
+  if (Pos('?', ATarget) > 0) or (Pos('#', ATarget) > 0) then
     Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target',
       'request target is not canonical'));
   Prefix := BasePath(AStore.Config.BaseURL);
@@ -213,6 +231,9 @@ begin
     Exit(ErrorResponse(404, 'Not Found', 'not_found',
       'request target is outside the configured registry base path'));
   APIPath := Copy(ATarget, Length(Prefix) + 1, MaxInt);
+  if (Pos('..', APIPath) > 0) or (Pos('%', APIPath) > 0) then
+    Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target',
+      'request target is not canonical'));
   if APIPath = '/.well-known/' + PROGRAM_NAME + '-registry' then
   begin
     Result.Status := 200;
@@ -221,6 +242,9 @@ begin
       + '.registry-discovery+toml';
     Result.CacheControl := 'no-cache';
     Result.ETag := '';
+    Result.ResourcePath := '';
+    Result.ResourceLength := 0;
+    Result.ResourceDigest := '';
     Result.Body := Bytes('schema = "' + PROGRAM_NAME
       + '-registry-discovery-v1"' + #10 + 'protocol = 1' + #10
       + 'origin = "' + AStore.Config.Identity + '"' + #10
@@ -239,6 +263,9 @@ begin
       + '.registry-capabilities+toml';
     Result.CacheControl := 'no-cache';
     Result.ETag := '';
+    Result.ResourcePath := '';
+    Result.ResourceLength := 0;
+    Result.ResourceDigest := '';
     Result.Body := Bytes('schema = "' + PROGRAM_NAME
       + '-registry-capabilities-v1"' + #10 + 'protocol = 1' + #10
       + 'hashes = ["sha256"]' + #10 + 'signatures = ["ed25519"]' + #10
@@ -331,18 +358,22 @@ end;
 function RegistryHTTPWireResponse(const AResponse: TLWPTRegistryHTTPResponse;
   const AIncludeBody: Boolean): TBytes;
 var
+  ContentLength: Int64;
   Header: string;
   HeaderBytes: TBytes;
 begin
+  if AResponse.ResourcePath <> '' then
+    ContentLength := AResponse.ResourceLength
+  else ContentLength := Length(AResponse.Body);
   Header := 'HTTP/1.1 ' + IntToStr(AResponse.Status) + ' '
     + AResponse.Reason + #13#10 + 'Content-Type: ' + AResponse.ContentType
-    + #13#10 + 'Content-Length: ' + IntToStr(Length(AResponse.Body)) + #13#10
+    + #13#10 + 'Content-Length: ' + IntToStr(ContentLength) + #13#10
     + 'Cache-Control: ' + AResponse.CacheControl + #13#10;
   if AResponse.ETag <> '' then Header := Header + 'ETag: ' + AResponse.ETag
     + #13#10;
   Header := Header + 'Connection: close' + #13#10 + #13#10;
   HeaderBytes := Bytes(Header);
-  if not AIncludeBody then Exit(HeaderBytes);
+  if not AIncludeBody or (AResponse.ResourcePath <> '') then Exit(HeaderBytes);
   SetLength(Result, Length(HeaderBytes) + Length(AResponse.Body));
   if Length(HeaderBytes) > 0 then Move(HeaderBytes[0], Result[0],
     Length(HeaderBytes));
@@ -416,6 +447,56 @@ begin
   end;
 end;
 
+procedure VerifyRegistryHTTPResource(
+  const AResponse: TLWPTRegistryHTTPResponse);
+var
+  Stream: TFileStream;
+begin
+  if AResponse.ResourcePath = '' then Exit;
+  Stream := TFileStream.Create(AResponse.ResourcePath,
+    fmOpenRead or fmShareDenyNone);
+  try
+    if Stream.Size <> AResponse.ResourceLength then
+      raise ELWPTRegistryError.CreateStable('resource_changed',
+        'registry resource size changed after routing');
+  finally
+    Stream.Free;
+  end;
+  if (AResponse.ResourceDigest <> '')
+    and ('sha256:' + SHA256File(AResponse.ResourcePath)
+      <> AResponse.ResourceDigest) then
+    raise ELWPTRegistryError.CreateStable('resource_hash_mismatch',
+      'registry resource changed after routing');
+end;
+
+procedure SendResourcePlain(const ASocket: TSocket;
+  const AResponse: TLWPTRegistryHTTPResponse; const ADeadline: QWord);
+var
+  Buffer: array[0..65535] of Byte;
+  ReadCount, Sent, SentTotal: Integer;
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(AResponse.ResourcePath,
+    fmOpenRead or fmShareDenyNone);
+  try
+    repeat
+      if GetTickCount64 >= ADeadline then Exit;
+      ReadCount := Stream.Read(Buffer[0], SizeOf(Buffer));
+      SentTotal := 0;
+      while SentTotal < ReadCount do
+      begin
+        ApplyDeadlineTimeout(ASocket, ADeadline);
+        Sent := fpSend(ASocket, @Buffer[SentTotal],
+          ReadCount - SentTotal, 0);
+        if Sent <= 0 then Exit;
+        Inc(SentTotal, Sent);
+      end;
+    until ReadCount = 0;
+  finally
+    Stream.Free;
+  end;
+end;
+
 procedure TLWPTRegistryClientThread.ExecutePlain;
 var
   Buffer: array[0..4095] of Byte;
@@ -463,9 +544,14 @@ begin
       end;
     end;
     IncludeBody := not SameText(Method, 'HEAD');
-    Wire := RegistryHTTPWireResponse(Response, IncludeBody);
+    if IncludeBody and (Response.ResourcePath <> '') then
+      VerifyRegistryHTTPResource(Response);
+    Wire := RegistryHTTPWireResponse(Response,
+      IncludeBody and (Response.ResourcePath = ''));
     CheckDeadline;
     SendAll(FSocket, Wire, FDeadline);
+    if IncludeBody and (Response.ResourcePath <> '') then
+      SendResourcePlain(FSocket, Response, FDeadline);
   except
     { A malformed client must not end the foreground server. }
   end;
@@ -519,11 +605,62 @@ begin
       'TLS ciphertext exceeded the configured input capacity');
 end;
 
+procedure SendTLSBuffer(const ASocket: TSocket;
+  var AConnection: TTransportSecurityConnection; const ABuffer;
+  const ACount: Integer; const ADeadline: QWord;
+  var AReceivedTotal: QWord);
+var
+  Buffer: PByte;
+  Offset: Integer;
+  IOResult: TTransportSecurityIOResult;
+begin
+  Buffer := @ABuffer;
+  Offset := 0;
+  while Offset < ACount do
+  begin
+    if GetTickCount64 >= ADeadline then
+      raise ELWPTRegistryError.CreateStable('connection_deadline',
+        'registry connection exceeded its total deadline');
+    IOResult := TransportSecurityServerWrite(AConnection, @Buffer[Offset],
+      ACount - Offset);
+    Inc(Offset, IOResult.BytesProcessed);
+    FlushTLSCiphertext(ASocket, AConnection, ADeadline);
+    if (IOResult.BytesProcessed = 0) and (IOResult.State = tssWantRead) then
+      ReceiveTLSCiphertext(ASocket, AConnection, AReceivedTotal, ADeadline)
+    else if (IOResult.BytesProcessed = 0) and not
+      (IOResult.State in [tssDone, tssWantWrite]) then
+      raise ELWPTRegistryError.CreateStable('tls_io_failed',
+        'TLS response write failed');
+  end;
+end;
+
+procedure SendResourceTLS(const ASocket: TSocket;
+  var AConnection: TTransportSecurityConnection;
+  const AResponse: TLWPTRegistryHTTPResponse; const ADeadline: QWord;
+  var AReceivedTotal: QWord);
+var
+  Buffer: array[0..65535] of Byte;
+  ReadCount: Integer;
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(AResponse.ResourcePath,
+    fmOpenRead or fmShareDenyNone);
+  try
+    repeat
+      ReadCount := Stream.Read(Buffer[0], SizeOf(Buffer));
+      if ReadCount > 0 then SendTLSBuffer(ASocket, AConnection, Buffer[0],
+        ReadCount, ADeadline, AReceivedTotal);
+    until ReadCount = 0;
+  finally
+    Stream.Free;
+  end;
+end;
+
 procedure TLWPTRegistryClientThread.ExecuteTLS;
 var
   Buffer: array[0..4095] of Byte;
   Connection: TTransportSecurityConnection;
-  HeaderEnd, Offset, Space: Integer;
+  HeaderEnd, Space: Integer;
   IncludeBody: Boolean;
   Method, Request, RequestChunk, RequestLine, Target: string;
   Response: TLWPTRegistryHTTPResponse;
@@ -583,23 +720,15 @@ begin
     Target := Copy(RequestLine, 1, Space - 1);
     Response := RegistryHTTPResponse(FStore, Method, Target);
     IncludeBody := not SameText(Method, 'HEAD');
-    Wire := RegistryHTTPWireResponse(Response, IncludeBody);
-    Offset := 0;
-    while Offset < Length(Wire) do
-    begin
-      CheckDeadline;
-      IOResult := TransportSecurityServerWrite(Connection, @Wire[Offset],
-        Length(Wire) - Offset);
-      Inc(Offset, IOResult.BytesProcessed);
-      FlushTLSCiphertext(FSocket, Connection, FDeadline);
-      if (IOResult.BytesProcessed = 0) and (IOResult.State = tssWantRead) then
-        ReceiveTLSCiphertext(FSocket, Connection, FTLSCiphertextReceived,
-          FDeadline)
-      else if (IOResult.BytesProcessed = 0) and not
-        (IOResult.State in [tssDone, tssWantWrite]) then
-        raise ELWPTRegistryError.CreateStable('tls_io_failed',
-          'TLS response write failed');
-    end;
+    if IncludeBody and (Response.ResourcePath <> '') then
+      VerifyRegistryHTTPResource(Response);
+    Wire := RegistryHTTPWireResponse(Response,
+      IncludeBody and (Response.ResourcePath = ''));
+    if Length(Wire) > 0 then SendTLSBuffer(FSocket, Connection, Wire[0],
+      Length(Wire), FDeadline, FTLSCiphertextReceived);
+    if IncludeBody and (Response.ResourcePath <> '') then
+      SendResourceTLS(FSocket, Connection, Response, FDeadline,
+        FTLSCiphertextReceived);
     FlushTLSCiphertext(FSocket, Connection, FDeadline);
     repeat
       ResultState := CloseTransportSecurityServerGracefully(Connection);
