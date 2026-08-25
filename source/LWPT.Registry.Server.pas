@@ -239,10 +239,11 @@ var
   State: TLWPTRegistryState;
 begin
   try
-    AStore.EnsureFreshCheckpoint(RegistryTimestampNow);
+    AStore.EnsureFreshCheckpoint(RegistryTimestampNow, AProgress);
   except
     on E: ELWPTRegistryError do
     begin
+      if Pos('connection_deadline:', E.Message) = 1 then raise;
       RequestID := NewRegistryRequestID;
       {$IFDEF UNIX}
       Relative := 'registry request ' + RequestID
@@ -320,7 +321,7 @@ begin
       + 'max_page_size = 100' + #10);
     Exit;
   end;
-  State := AStore.LoadCurrentState;
+  State := AStore.LoadCurrentState(AProgress);
   if APIPath = '/v1/checkpoints/latest.toml' then
     Exit(ResourceResponse(AStore, State.CheckpointPath,
       'application/vnd.' + PROGRAM_NAME + '.registry-checkpoint+toml', '',

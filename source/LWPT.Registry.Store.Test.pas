@@ -134,6 +134,7 @@ type
     FScratch: string;
     FResourceProgressCalls: Integer;
     procedure CheckResourceProgress;
+    procedure CheckStateProgress;
     function DefaultConfig: TLWPTRegistryConfig;
     function IndexPath(const AName: string): string;
     function InitializeStore: TLWPTRegistryStore;
@@ -199,6 +200,14 @@ begin
   if FResourceProgressCalls > 2 then
     raise ELWPTRegistryError.CreateStable('test_resource_cancelled',
       'resource verification cancellation was observed');
+end;
+
+procedure TRegistryStoreContract.CheckStateProgress;
+begin
+  Inc(FResourceProgressCalls);
+  if FResourceProgressCalls > 4 then
+    raise ELWPTRegistryError.CreateStable('connection_deadline',
+      'test deadline expired during committed-state verification');
 end;
 
 procedure TPublisherThread.Execute;
@@ -1143,6 +1152,18 @@ var
 begin
   Store := InitializeStore;
   try
+    FResourceProgressCalls := 0;
+    Diagnostic := '';
+    try
+      RegistryHTTPResponse(Store, 'GET', '/v1/capabilities',
+        CheckStateProgress);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Pos('connection_deadline:', Diagnostic) = 1)
+      .ToBe(True);
+    Expect<Boolean>(FResourceProgressCalls > 4).ToBe(True);
+
     CheckpointResponse := RegistryHTTPResponse(Store, 'GET',
       '/v1/checkpoints/latest.toml');
     Expect<string>(CheckpointResponse.CacheControl)

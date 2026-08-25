@@ -58,9 +58,11 @@ type
     FConfig: TLWPTRegistryConfig;
     function RootPath(const ARelative: string): string;
     function TmpRoot: string;
-    function LoadSeed: TBytes;
-    function ReadCurrentState: TLWPTRegistryState;
-    procedure VerifyState(const AState: TLWPTRegistryState);
+    function LoadSeed(AProgress: TSHA256Progress = nil): TBytes;
+    function ReadCurrentState(AProgress: TSHA256Progress = nil):
+      TLWPTRegistryState;
+    procedure VerifyState(const AState: TLWPTRegistryState;
+      AProgress: TSHA256Progress = nil);
     procedure RecoverDerivedState(const AState: TLWPTRegistryState);
     procedure WriteImmutable(const ARelative: string;
       const ABytes: TBytes);
@@ -70,11 +72,14 @@ type
       const ARequested: TLWPTRegistryConfig;
       const APublishedAt: string): TLWPTRegistryStore;
     procedure Recover;
-    procedure EnsureFreshCheckpoint(const ANow: string);
+    procedure EnsureFreshCheckpoint(const ANow: string;
+      AProgress: TSHA256Progress = nil);
     procedure DescribeResource(const ARelative: string; out APath: string;
       out ASize: Int64);
-    function LoadCurrentState: TLWPTRegistryState;
-    function LoadResource(const ARelative: string): TBytes;
+    function LoadCurrentState(AProgress: TSHA256Progress = nil):
+      TLWPTRegistryState;
+    function LoadResource(const ARelative: string;
+      AProgress: TSHA256Progress = nil): TBytes;
     procedure Publish(const APublication: TLWPTRegistryPublication);
     property Config: TLWPTRegistryConfig read FConfig;
     property Root: string read FRoot;
@@ -355,8 +360,10 @@ begin
   end;
 end;
 
-function ReadBytes(const APath: string): TBytes;
+function ReadBytes(const APath: string;
+  AProgress: TSHA256Progress = nil): TBytes;
 var
+  Offset, ReadCount: Integer;
   Stream: TStream;
 begin
   Stream := nil;
@@ -372,15 +379,41 @@ begin
       raise ELWPTRegistryError.CreateStable('state_corrupt',
         'registry file exceeds supported size');
     SetLength(Result, Stream.Size);
-    if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
+    Offset := 0;
+    repeat
+      if Assigned(AProgress) then AProgress;
+      ReadCount := Length(Result) - Offset;
+      if ReadCount > 65536 then ReadCount := 65536;
+      if ReadCount > 0 then
+      begin
+        Stream.ReadBuffer(Result[Offset], ReadCount);
+        Inc(Offset, ReadCount);
+      end;
+    until Offset = Length(Result);
+    if Assigned(AProgress) then AProgress;
   finally
     Stream.Free;
   end;
 end;
 
-function ReadText(const APath: string): string;
+function ReadText(const APath: string;
+  AProgress: TSHA256Progress = nil): string;
 begin
-  Result := Text(ReadBytes(APath));
+  Result := Text(ReadBytes(APath, AProgress));
+end;
+
+function SHA256BytesWithProgress(const ABytes: TBytes;
+  AProgress: TSHA256Progress): string;
+var
+  Stream: TBytesStream;
+begin
+  if not Assigned(AProgress) then Exit(SHA256Hex(ABytes));
+  Stream := TBytesStream.Create(ABytes);
+  try
+    Result := SHA256Stream(Stream, AProgress);
+  finally
+    Stream.Free;
+  end;
 end;
 
 function KeyValue(const ADocument, AKey: string): string;
@@ -1013,11 +1046,11 @@ begin
   Result := RootPath('tmp');
 end;
 
-function TLWPTRegistryStore.LoadSeed: TBytes;
+function TLWPTRegistryStore.LoadSeed(AProgress: TSHA256Progress): TBytes;
 var
   Seed: TLWPTEd25519Seed;
 begin
-  if not HexToBytes(Trim(Text(LoadResource(SIGNING_SEED_FILE))), Seed,
+  if not HexToBytes(Trim(Text(LoadResource(SIGNING_SEED_FILE, AProgress))), Seed,
     SizeOf(Seed)) then
     raise ELWPTRegistryError.CreateStable('state_corrupt', 'registry signing seed is invalid');
   SetLength(Result, SizeOf(Seed));
@@ -1249,7 +1282,8 @@ begin
   end;
 end;
 
-procedure TLWPTRegistryStore.VerifyState(const AState: TLWPTRegistryState);
+procedure TLWPTRegistryStore.VerifyState(const AState: TLWPTRegistryState;
+  AProgress: TSHA256Progress);
 var
   CheckpointBytes, KeyBytes, SignatureBytes, SigningInput: TBytes;
   CheckpointDocumentText, KeyDocumentText, SignatureDocumentText: string;
@@ -1258,6 +1292,7 @@ var
   Signature: TLWPTEd25519Signature;
   ExpectedCheckpointHash, RenewalPrefix: string;
 begin
+  if Assigned(AProgress) then AProgress;
   if not IsSHA256(AState.SnapshotHash) then
     raise ELWPTRegistryError.CreateStable('state_corrupt',
       'committed snapshot hash is invalid');
@@ -1285,15 +1320,17 @@ begin
       raise ELWPTRegistryError.CreateStable('state_corrupt',
         'committed renewal paths are invalid');
   end;
-  if SHA256BytesPrefixed(LoadResource('snapshots/sha256/'
-    + Copy(AState.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml'))
+  if 'sha256:' + SHA256BytesWithProgress(LoadResource('snapshots/sha256/'
+    + Copy(AState.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml',
+    AProgress), AProgress)
     <> AState.SnapshotHash then
     raise ELWPTRegistryError.CreateStable('snapshot_hash_mismatch',
       'committed snapshot bytes do not match the activation pointer');
-  CheckpointBytes := LoadResource(AState.CheckpointPath);
-  SignatureBytes := LoadResource(AState.SignaturePath);
+  CheckpointBytes := LoadResource(AState.CheckpointPath, AProgress);
+  SignatureBytes := LoadResource(AState.SignaturePath, AProgress);
   if StartsStr(RenewalPrefix, AState.CheckpointPath)
-    and (SHA256Hex(CheckpointBytes) <> ExpectedCheckpointHash) then
+    and (SHA256BytesWithProgress(CheckpointBytes, AProgress)
+      <> ExpectedCheckpointHash) then
     raise ELWPTRegistryError.CreateStable('checkpoint_hash_mismatch',
       'committed renewal checkpoint bytes do not match their path');
   CheckpointDocumentText := Text(CheckpointBytes);
@@ -1328,10 +1365,11 @@ begin
     raise ELWPTRegistryError.CreateStable('signature_invalid',
       'checkpoint signature algorithm is unsupported');
   Payload := StringValue(SignatureDocumentText, 'payload');
-  if Payload <> SHA256BytesPrefixed(CheckpointBytes) then
+  if Payload <> 'sha256:' + SHA256BytesWithProgress(CheckpointBytes,
+    AProgress) then
     raise ELWPTRegistryError.CreateStable('signature_payload_mismatch',
       'signature payload does not match checkpoint bytes');
-  KeyBytes := LoadResource(RegistryKeyStoragePath(KeyID));
+  KeyBytes := LoadResource(RegistryKeyStoragePath(KeyID), AProgress);
   KeyDocumentText := Text(KeyBytes);
   if StringValue(KeyDocumentText, 'schema') <> PROGRAM_NAME
     + '-registry-key-v1' then
@@ -1353,7 +1391,7 @@ begin
     raise ELWPTRegistryError.CreateStable('key_invalid', 'Ed25519 public key encoding is invalid');
   SetLength(KeyBytes, SizeOf(PublicKey));
   Move(PublicKey[0], KeyBytes[0], SizeOf(PublicKey));
-  if KeyID <> 'ed25519:' + SHA256Hex(KeyBytes) then
+  if KeyID <> 'ed25519:' + SHA256BytesWithProgress(KeyBytes, AProgress) then
     raise ELWPTRegistryError.CreateStable('key_id_mismatch',
       'registry key identifier does not match its public key');
   if not StartsStr('hex:', SignatureHex)
@@ -1361,8 +1399,10 @@ begin
       SizeOf(Signature)) then
     raise ELWPTRegistryError.CreateStable('signature_invalid', 'Ed25519 signature encoding is invalid');
   SigningInput := Bytes(CHECKPOINT_DOMAIN + Text(CheckpointBytes));
+  if Assigned(AProgress) then AProgress;
   if not Ed25519Verify(SigningInput, PublicKey, Signature) then
     raise ELWPTRegistryError.CreateStable('signature_invalid', 'checkpoint signature verification failed');
+  if Assigned(AProgress) then AProgress;
 end;
 
 procedure TLWPTRegistryStore.RecoverDerivedState(
@@ -1489,18 +1529,21 @@ begin
   end;
 end;
 
-function TLWPTRegistryStore.ReadCurrentState: TLWPTRegistryState;
+function TLWPTRegistryStore.ReadCurrentState(AProgress: TSHA256Progress):
+  TLWPTRegistryState;
 begin
-  Result := ParseState(ReadText(RootPath(CURRENT_STATE_FILE)));
+  Result := ParseState(ReadText(RootPath(CURRENT_STATE_FILE), AProgress));
 end;
 
-function TLWPTRegistryStore.LoadCurrentState: TLWPTRegistryState;
+function TLWPTRegistryStore.LoadCurrentState(AProgress: TSHA256Progress):
+  TLWPTRegistryState;
 begin
-  Result := ReadCurrentState;
-  VerifyState(Result);
+  Result := ReadCurrentState(AProgress);
+  VerifyState(Result, AProgress);
 end;
 
-function TLWPTRegistryStore.LoadResource(const ARelative: string): TBytes;
+function TLWPTRegistryStore.LoadResource(const ARelative: string;
+  AProgress: TSHA256Progress): TBytes;
 var
   FullPath: string;
 begin
@@ -1510,7 +1553,7 @@ begin
   FullPath := RootPath(ARelative);
   if not PathContains(FRoot, FullPath) then
     raise ELWPTRegistryError.CreateStable('invalid_resource_path', 'registry resource escapes its data root');
-  Result := ReadBytes(FullPath);
+  Result := ReadBytes(FullPath, AProgress);
 end;
 
 procedure TLWPTRegistryStore.DescribeResource(const ARelative: string;
@@ -1565,7 +1608,8 @@ begin
 end;
 {$ENDIF}
 
-procedure TLWPTRegistryStore.EnsureFreshCheckpoint(const ANow: string);
+procedure TLWPTRegistryStore.EnsureFreshCheckpoint(const ANow: string;
+  AProgress: TSHA256Progress);
 var
   Checkpoint, SeedBytes, Signature: TBytes;
   CheckpointHash, CheckpointText, ExpiresAt, KeyID, RenewalPath: string;
@@ -1583,9 +1627,9 @@ begin
     Lease := Coordinator.TryAcquire('registry-publication',
       'registry checkpoint renewal');
     if not Assigned(Lease) then Exit;
-    State := ReadCurrentState;
-    VerifyState(State);
-    CheckpointText := Text(LoadResource(State.CheckpointPath));
+    State := ReadCurrentState(AProgress);
+    VerifyState(State, AProgress);
+    CheckpointText := Text(LoadResource(State.CheckpointPath, AProgress));
     ExpiresAt := StringValue(CheckpointText, 'expires_at');
     if not TryISO8601ToDate(ExpiresAt, ExpiresDate, True)
       or not TryISO8601ToDate(ANow, NowDate, True) then
@@ -1594,7 +1638,7 @@ begin
     if ExpiresDate > IncHour(NowDate,
       CHECKPOINT_RENEWAL_THRESHOLD_HOURS) then Exit;
     KeyID := StringValue(CheckpointText, 'key_id');
-    SeedBytes := LoadSeed;
+    SeedBytes := LoadSeed(AProgress);
     try
       if Length(SeedBytes) <> SizeOf(Seed) then
         raise ELWPTRegistryError.CreateStable('state_corrupt',
