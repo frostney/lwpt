@@ -54,6 +54,7 @@ type
   EConcurrencyError = class(ELWPTError);
 
   TStringArray = array of string;
+  TSHA256Progress = procedure of object;
 
 function  FPCExecutable: string;
 function  InstantFPCExecutable: string;
@@ -101,6 +102,8 @@ procedure AtomicWriteText(const ADst: string; const ATmpRoot: string; const ACon
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
 function  SHA256BytesPrefixed(const ABytes: TBytes): string;
 function  SHA256Hex(const AData: TBytes): string;
+function  SHA256Stream(AStream: TStream;
+  AProgress: TSHA256Progress = nil): string;
 function  SHA256File(const APath: string): string;
 function  CanonicalTreeHashPath(const APath: string;
   const ASourceDelimiter: Char): string;
@@ -1411,27 +1414,41 @@ begin
   Result := SHA256DigestHex(SHA256Bytes(AData));
 end;
 
-function SHA256File(const APath: string): string;
+function SHA256Stream(AStream: TStream;
+  AProgress: TSHA256Progress): string;
 var
   Buffer: array[0..65535] of Byte;
   Context: TSHA256Context;
   Digest: TSHA256Digest;
   ReadCount: Integer;
+begin
+  AStream.Position := 0;
+  try
+    SHA256Init(Context);
+    repeat
+      if Assigned(AProgress) then AProgress;
+      ReadCount := AStream.Read(Buffer[0], SizeOf(Buffer));
+      if ReadCount > 0 then SHA256Update(Context, Buffer[0], ReadCount);
+    until ReadCount = 0;
+    if Assigned(AProgress) then AProgress;
+    SHA256Final(Context, Digest);
+    Result := SHA256DigestHex(Digest);
+  finally
+    AStream.Position := 0;
+  end;
+end;
+
+function SHA256File(const APath: string): string;
+var
   Stream: TFileStream;
 begin
   if not FileExists(APath) then Exit('');
   Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
-    SHA256Init(Context);
-    repeat
-      ReadCount := Stream.Read(Buffer[0], SizeOf(Buffer));
-      if ReadCount > 0 then SHA256Update(Context, Buffer[0], ReadCount);
-    until ReadCount = 0;
-    SHA256Final(Context, Digest);
+    Result := SHA256Stream(Stream);
   finally
     Stream.Free;
   end;
-  Result := SHA256DigestHex(Digest);
 end;
 
 function CanonicalTreeHashPath(const APath: string;

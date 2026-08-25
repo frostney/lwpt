@@ -21,6 +21,7 @@ const
   REGISTRY_DEFAULT_BASE_URL = 'http://localhost:8080';
   REGISTRY_DEFAULT_LISTEN_ADDRESS = 'localhost';
   REGISTRY_DEFAULT_PORT = 8080;
+  MAX_REGISTRY_RESOURCE_BYTES = High(Integer);
 
 type
   ELWPTRegistryError = class(ELWPTError)
@@ -70,8 +71,8 @@ type
       const APublishedAt: string): TLWPTRegistryStore;
     procedure Recover;
     procedure EnsureFreshCheckpoint(const ANow: string);
-    procedure DescribeResource(const ARelative, AExpectedDigest: string;
-      out APath: string; out ASize: Int64);
+    procedure DescribeResource(const ARelative: string; out APath: string;
+      out ASize: Int64);
     function LoadCurrentState: TLWPTRegistryState;
     function LoadResource(const ARelative: string): TBytes;
     procedure Publish(const APublication: TLWPTRegistryPublication);
@@ -705,6 +706,8 @@ begin
     raise ELWPTRegistryError.CreateStable('insecure_transport',
       'plain HTTP is permitted only for the exact host localhost');
   Path := RemoveDotSegments(CanonicalPercentEncoding(Path));
+  while (Length(Path) > 1) and (Path[Length(Path)] = '/') do
+    Delete(Path, Length(Path), 1);
   Result := Scheme + '://' + Host;
   if Port <> '' then Result := Result + ':' + Port;
   if Path <> '/' then Result := Result + Path;
@@ -1503,8 +1506,8 @@ begin
   Result := ReadBytes(FullPath);
 end;
 
-procedure TLWPTRegistryStore.DescribeResource(const ARelative,
-  AExpectedDigest: string; out APath: string; out ASize: Int64);
+procedure TLWPTRegistryStore.DescribeResource(const ARelative: string;
+  out APath: string; out ASize: Int64);
 var
   Stream: TFileStream;
 begin
@@ -1525,10 +1528,9 @@ begin
   finally
     Stream.Free;
   end;
-  if (AExpectedDigest <> '')
-    and ('sha256:' + SHA256File(APath) <> AExpectedDigest) then
-    raise ELWPTRegistryError.CreateStable('resource_hash_mismatch',
-      'content-addressed resource bytes do not match the request path');
+  if ASize > MAX_REGISTRY_RESOURCE_BYTES then
+    raise ELWPTRegistryError.CreateStable('resource_too_large',
+      'registry resource exceeds the 2147483647-byte service limit');
 end;
 
 {$IFDEF REGISTRY_TESTING}

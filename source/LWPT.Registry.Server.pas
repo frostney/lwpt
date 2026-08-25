@@ -10,6 +10,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.Core,
   LWPT.Registry.Store,
   Sockets;
 
@@ -45,10 +46,12 @@ function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
 function RegistryErrorResponse(const AStatus: Integer; const AReason,
   ACode, AMessage: string; const ARequestID: string = ''):
   TLWPTRegistryHTTPResponse;
+function RegistryResourceFailureResponse(const ADiagnostic: string):
+  TLWPTRegistryHTTPResponse;
 function RegistryHTTPWireResponse(const AResponse: TLWPTRegistryHTTPResponse;
   const AIncludeBody: Boolean): TBytes;
-procedure VerifyRegistryHTTPResource(
-  const AResponse: TLWPTRegistryHTTPResponse);
+function OpenRegistryHTTPResource(const AResponse: TLWPTRegistryHTTPResponse;
+  AProgress: TSHA256Progress = nil): TStream;
 
 implementation
 
@@ -58,10 +61,10 @@ uses
   BaseUnix,
   {$ENDIF}
   {$IFDEF MSWINDOWS}
+  Windows,
   WinSock2,
   {$ENDIF}
 
-  LWPT.Core,
   {$IFDEF DARWIN}
   LWPT.Registry.Server.NetworkFramework,
   {$ENDIF}
@@ -72,11 +75,34 @@ const
   CLIENT_READ_TIMEOUT_MILLISECONDS = 10000;
   TLS_CIPHERTEXT_BUDGET_BYTES = 1024 * 1024;
   MAX_ACTIVE_CLIENTS = 32;
+  {$IFDEF UNIX}
+  {$IFDEF LINUX}
+  {$IFDEF CPUAARCH64}
+  O_NOFOLLOW_LWPT = $00008000;
+  {$ELSE}
+  O_NOFOLLOW_LWPT = $00020000;
+  {$ENDIF}
+  {$ELSE}
+  {$IFDEF DARWIN}
+  O_NOFOLLOW_LWPT = $00000100;
+  {$ELSE}
+  O_NOFOLLOW_LWPT = O_NOFOLLOW;
+  {$ENDIF}
+  {$ENDIF}
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  FILE_FLAG_OPEN_REPARSE_POINT_LWPT = $00200000;
+  {$ENDIF}
 
 var
   RegistryRequestSequence: LongInt;
 
 type
+  TOwnedHandleStream = class(THandleStream)
+  public
+    destructor Destroy; override;
+  end;
+
   TLWPTRegistryClientThread = class(TThread)
   private
     FSocket: TSocket;
@@ -96,6 +122,17 @@ type
     procedure Cancel;
     property Done: Boolean read FDone;
   end;
+
+destructor TOwnedHandleStream.Destroy;
+begin
+  {$IFDEF UNIX}
+  FpClose(Handle);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows.CloseHandle(Handle);
+  {$ENDIF}
+  inherited Destroy;
+end;
 
 function Bytes(const AValue: string): TBytes;
 begin
@@ -167,14 +204,26 @@ begin
   Result := RegistryErrorResponse(AStatus, AReason, ACode, AMessage);
 end;
 
+function RegistryResourceFailureResponse(const ADiagnostic: string):
+  TLWPTRegistryHTTPResponse;
+begin
+  if Pos('resource_hash_mismatch:', ADiagnostic) = 1 then
+    Result := RegistryErrorResponse(500, 'Internal Server Error',
+      'resource_hash_mismatch',
+      'stored registry resource failed content verification')
+  else Result := RegistryErrorResponse(500, 'Internal Server Error',
+      'resource_verification_failed',
+      'stored registry resource could not be verified');
+end;
+
 function ResourceResponse(AStore: TLWPTRegistryStore;
   const ARelative, AContentType, AETag, AExpectedDigest: string;
   const AImmutable: Boolean): TLWPTRegistryHTTPResponse;
 begin
   try
     SetLength(Result.Body, 0);
-    AStore.DescribeResource(ARelative, AExpectedDigest,
-      Result.ResourcePath, Result.ResourceLength);
+    AStore.DescribeResource(ARelative, Result.ResourcePath,
+      Result.ResourceLength);
     Result.ResourceDigest := AExpectedDigest;
     Result.Status := 200;
     Result.Reason := 'OK';
@@ -189,6 +238,10 @@ begin
         Result := ErrorResponse(500, 'Internal Server Error',
           'resource_hash_mismatch',
           'stored registry resource failed content verification')
+      else if Pos('resource_too_large:', E.Message) = 1 then
+        Result := ErrorResponse(500, 'Internal Server Error',
+          'resource_too_large',
+          'stored registry resource exceeds the service limit')
       else Result := ErrorResponse(404, 'Not Found', 'not_found',
           'registry resource was not found');
   end;
@@ -447,54 +500,94 @@ begin
   end;
 end;
 
-procedure VerifyRegistryHTTPResource(
-  const AResponse: TLWPTRegistryHTTPResponse);
+function OpenRegistryReadStreamNoFollow(const APath: string): TStream;
 var
-  Stream: TFileStream;
+  Handle: THandle;
+  {$IFDEF MSWINDOWS}
+  Information: TByHandleFileInformation;
+  {$ENDIF}
 begin
-  if AResponse.ResourcePath = '' then Exit;
-  Stream := TFileStream.Create(AResponse.ResourcePath,
-    fmOpenRead or fmShareDenyNone);
+  {$IFDEF UNIX}
+  Handle := FpOpen(PChar(APath), O_RDONLY or O_NOFOLLOW_LWPT);
+  if Handle < 0 then
+    raise ELWPTRegistryError.CreateStable('resource_changed',
+      'registry resource could not be opened without following links');
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+    Windows.GENERIC_READ, Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+      or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING,
+    FILE_FLAG_OPEN_REPARSE_POINT_LWPT, 0);
+  if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
+    raise ELWPTRegistryError.CreateStable('resource_changed',
+      'registry resource could not be opened without following links');
+  if not Windows.GetFileInformationByHandle(Handle, Information)
+    or ((Information.dwFileAttributes
+    and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+  begin
+    Windows.CloseHandle(Handle);
+    raise ELWPTRegistryError.CreateStable('resource_changed',
+      'registry resource became a link after routing');
+  end;
+  {$ENDIF}
   try
-    if Stream.Size <> AResponse.ResourceLength then
+    Result := TOwnedHandleStream.Create(Handle);
+  except
+    {$IFDEF UNIX}
+    FpClose(Handle);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    Windows.CloseHandle(Handle);
+    {$ENDIF}
+    raise;
+  end;
+end;
+
+function OpenRegistryHTTPResource(const AResponse: TLWPTRegistryHTTPResponse;
+  AProgress: TSHA256Progress): TStream;
+begin
+  Result := nil;
+  if AResponse.ResourcePath = '' then Exit;
+  if Assigned(AProgress) then AProgress;
+  Result := OpenRegistryReadStreamNoFollow(AResponse.ResourcePath);
+  try
+    if IsDirSymlinkOrJunction(AResponse.ResourcePath) then
+      raise ELWPTRegistryError.CreateStable('resource_changed',
+        'registry resource became a link after routing');
+    if (Result.Size <> AResponse.ResourceLength)
+      or (Result.Size > MAX_REGISTRY_RESOURCE_BYTES) then
       raise ELWPTRegistryError.CreateStable('resource_changed',
         'registry resource size changed after routing');
-  finally
-    Stream.Free;
-  end;
-  if (AResponse.ResourceDigest <> '')
-    and ('sha256:' + SHA256File(AResponse.ResourcePath)
+    if (AResponse.ResourceDigest <> '')
+      and ('sha256:' + SHA256Stream(Result, AProgress)
       <> AResponse.ResourceDigest) then
-    raise ELWPTRegistryError.CreateStable('resource_hash_mismatch',
-      'registry resource changed after routing');
+      raise ELWPTRegistryError.CreateStable('resource_hash_mismatch',
+        'registry resource changed after routing');
+    Result.Position := 0;
+  except
+    FreeAndNil(Result);
+    raise;
+  end;
 end;
 
 procedure SendResourcePlain(const ASocket: TSocket;
-  const AResponse: TLWPTRegistryHTTPResponse; const ADeadline: QWord);
+  AStream: TStream; const ADeadline: QWord);
 var
   Buffer: array[0..65535] of Byte;
   ReadCount, Sent, SentTotal: Integer;
-  Stream: TFileStream;
 begin
-  Stream := TFileStream.Create(AResponse.ResourcePath,
-    fmOpenRead or fmShareDenyNone);
-  try
-    repeat
-      if GetTickCount64 >= ADeadline then Exit;
-      ReadCount := Stream.Read(Buffer[0], SizeOf(Buffer));
-      SentTotal := 0;
-      while SentTotal < ReadCount do
-      begin
-        ApplyDeadlineTimeout(ASocket, ADeadline);
-        Sent := fpSend(ASocket, @Buffer[SentTotal],
-          ReadCount - SentTotal, 0);
-        if Sent <= 0 then Exit;
-        Inc(SentTotal, Sent);
-      end;
-    until ReadCount = 0;
-  finally
-    Stream.Free;
-  end;
+  repeat
+    if GetTickCount64 >= ADeadline then Exit;
+    ReadCount := AStream.Read(Buffer[0], SizeOf(Buffer));
+    SentTotal := 0;
+    while SentTotal < ReadCount do
+    begin
+      ApplyDeadlineTimeout(ASocket, ADeadline);
+      Sent := fpSend(ASocket, @Buffer[SentTotal], ReadCount - SentTotal, 0);
+      if Sent <= 0 then Exit;
+      Inc(SentTotal, Sent);
+    end;
+  until ReadCount = 0;
 end;
 
 procedure TLWPTRegistryClientThread.ExecutePlain;
@@ -503,55 +596,66 @@ var
   HeaderEnd, Received, Space: Integer;
   IncludeBody: Boolean;
   Method, Request, RequestLine, Target: string;
+  ResourceStream: TStream;
   Response: TLWPTRegistryHTTPResponse;
   Wire: TBytes;
 begin
+  ResourceStream := nil;
   try
-    Request := '';
-    repeat
-      CheckDeadline;
-      ApplyDeadlineTimeout(FSocket, FDeadline);
-      Received := fpRecv(FSocket, @Buffer[0], Length(Buffer), 0);
-      if Received <= 0 then Exit;
-      if Length(Request) + Received > MAX_REQUEST_HEADER_BYTES then
-      begin
-        Response := ErrorResponse(431, 'Request Header Fields Too Large',
-          'request_headers_too_large', 'request headers exceed 32 KiB');
-        SendAll(FSocket, RegistryHTTPWireResponse(Response, True), FDeadline);
-        Exit;
-      end;
-      SetString(RequestLine, PAnsiChar(@Buffer[0]), Received);
-      Request := Request + RequestLine;
-      HeaderEnd := Pos(#13#10#13#10, Request);
-    until HeaderEnd > 0;
-    RequestLine := Copy(Request, 1, Pos(#13#10, Request) - 1);
-    Space := Pos(' ', RequestLine);
-    if Space = 0 then
-      Response := ErrorResponse(400, 'Bad Request', 'invalid_request',
-        'request line is invalid')
-    else
-    begin
-      Method := Copy(RequestLine, 1, Space - 1);
-      Delete(RequestLine, 1, Space);
+    try
+      Request := '';
+      repeat
+        CheckDeadline;
+        ApplyDeadlineTimeout(FSocket, FDeadline);
+        Received := fpRecv(FSocket, @Buffer[0], Length(Buffer), 0);
+        if Received <= 0 then Exit;
+        if Length(Request) + Received > MAX_REQUEST_HEADER_BYTES then
+        begin
+          Response := ErrorResponse(431, 'Request Header Fields Too Large',
+            'request_headers_too_large', 'request headers exceed 32 KiB');
+          SendAll(FSocket, RegistryHTTPWireResponse(Response, True), FDeadline);
+          Exit;
+        end;
+        SetString(RequestLine, PAnsiChar(@Buffer[0]), Received);
+        Request := Request + RequestLine;
+        HeaderEnd := Pos(#13#10#13#10, Request);
+      until HeaderEnd > 0;
+      RequestLine := Copy(Request, 1, Pos(#13#10, Request) - 1);
       Space := Pos(' ', RequestLine);
       if Space = 0 then
         Response := ErrorResponse(400, 'Bad Request', 'invalid_request',
           'request line is invalid')
       else
       begin
-        Target := Copy(RequestLine, 1, Space - 1);
-        Response := RegistryHTTPResponse(FStore, Method, Target);
+        Method := Copy(RequestLine, 1, Space - 1);
+        Delete(RequestLine, 1, Space);
+        Space := Pos(' ', RequestLine);
+        if Space = 0 then
+          Response := ErrorResponse(400, 'Bad Request', 'invalid_request',
+            'request line is invalid')
+        else
+        begin
+          Target := Copy(RequestLine, 1, Space - 1);
+          Response := RegistryHTTPResponse(FStore, Method, Target);
+        end;
       end;
+      IncludeBody := not SameText(Method, 'HEAD');
+      if Response.ResourcePath <> '' then
+        try
+          ResourceStream := OpenRegistryHTTPResource(Response, CheckDeadline);
+        except
+          on E: Exception do
+            Response := RegistryResourceFailureResponse(E.Message);
+        end;
+      Wire := RegistryHTTPWireResponse(Response,
+        IncludeBody and (Response.ResourcePath = ''));
+      CheckDeadline;
+      SendAll(FSocket, Wire, FDeadline);
+      if IncludeBody and Assigned(ResourceStream) then
+        SendResourcePlain(FSocket, ResourceStream, FDeadline);
+    finally
+      ResourceStream.Free;
     end;
-    IncludeBody := not SameText(Method, 'HEAD');
-    if IncludeBody and (Response.ResourcePath <> '') then
-      VerifyRegistryHTTPResource(Response);
-    Wire := RegistryHTTPWireResponse(Response,
-      IncludeBody and (Response.ResourcePath = ''));
-    CheckDeadline;
-    SendAll(FSocket, Wire, FDeadline);
-    if IncludeBody and (Response.ResourcePath <> '') then
-      SendResourcePlain(FSocket, Response, FDeadline);
   except
     { A malformed client must not end the foreground server. }
   end;
@@ -636,24 +740,17 @@ end;
 
 procedure SendResourceTLS(const ASocket: TSocket;
   var AConnection: TTransportSecurityConnection;
-  const AResponse: TLWPTRegistryHTTPResponse; const ADeadline: QWord;
+  AStream: TStream; const ADeadline: QWord;
   var AReceivedTotal: QWord);
 var
   Buffer: array[0..65535] of Byte;
   ReadCount: Integer;
-  Stream: TFileStream;
 begin
-  Stream := TFileStream.Create(AResponse.ResourcePath,
-    fmOpenRead or fmShareDenyNone);
-  try
-    repeat
-      ReadCount := Stream.Read(Buffer[0], SizeOf(Buffer));
-      if ReadCount > 0 then SendTLSBuffer(ASocket, AConnection, Buffer[0],
-        ReadCount, ADeadline, AReceivedTotal);
-    until ReadCount = 0;
-  finally
-    Stream.Free;
-  end;
+  repeat
+    ReadCount := AStream.Read(Buffer[0], SizeOf(Buffer));
+    if ReadCount > 0 then SendTLSBuffer(ASocket, AConnection, Buffer[0],
+      ReadCount, ADeadline, AReceivedTotal);
+  until ReadCount = 0;
 end;
 
 procedure TLWPTRegistryClientThread.ExecuteTLS;
@@ -663,11 +760,13 @@ var
   HeaderEnd, Space: Integer;
   IncludeBody: Boolean;
   Method, Request, RequestChunk, RequestLine, Target: string;
+  ResourceStream: TStream;
   Response: TLWPTRegistryHTTPResponse;
   ResultState: TTransportSecurityState;
   IOResult: TTransportSecurityIOResult;
   Wire: TBytes;
 begin
+  ResourceStream := nil;
   FillChar(Connection, SizeOf(Connection), 0);
   BeginTransportSecurityServer(Connection, FTLSServerContext);
   try
@@ -720,14 +819,19 @@ begin
     Target := Copy(RequestLine, 1, Space - 1);
     Response := RegistryHTTPResponse(FStore, Method, Target);
     IncludeBody := not SameText(Method, 'HEAD');
-    if IncludeBody and (Response.ResourcePath <> '') then
-      VerifyRegistryHTTPResource(Response);
+    if Response.ResourcePath <> '' then
+      try
+        ResourceStream := OpenRegistryHTTPResource(Response, CheckDeadline);
+      except
+        on E: Exception do
+          Response := RegistryResourceFailureResponse(E.Message);
+      end;
     Wire := RegistryHTTPWireResponse(Response,
       IncludeBody and (Response.ResourcePath = ''));
     if Length(Wire) > 0 then SendTLSBuffer(FSocket, Connection, Wire[0],
       Length(Wire), FDeadline, FTLSCiphertextReceived);
-    if IncludeBody and (Response.ResourcePath <> '') then
-      SendResourceTLS(FSocket, Connection, Response, FDeadline,
+    if IncludeBody and Assigned(ResourceStream) then
+      SendResourceTLS(FSocket, Connection, ResourceStream, FDeadline,
         FTLSCiphertextReceived);
     FlushTLSCiphertext(FSocket, Connection, FDeadline);
     repeat
@@ -739,6 +843,7 @@ begin
           FDeadline);
     until (ResultState = tssDone) or (ResultState = tssPeerClosed);
   finally
+    ResourceStream.Free;
     AbortTransportSecurityServer(Connection);
   end;
 end;

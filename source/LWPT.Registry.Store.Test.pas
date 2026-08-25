@@ -55,6 +55,8 @@ type
   TRegistryStoreContract = class(TTestSuite)
   private
     FScratch: string;
+    FResourceProgressCalls: Integer;
+    procedure CheckResourceProgress;
     function DefaultConfig: TLWPTRegistryConfig;
     function IndexPath(const AName: string): string;
     function InitializeStore: TLWPTRegistryStore;
@@ -88,6 +90,7 @@ type
     procedure TestSigningSeedIsPrivateFromCreation;
     procedure TestServerRejectsCorruptContentAddressedBytes;
     procedure TestLargeResourceUsesStreamedDescriptor;
+    procedure TestOversizedResourceIsRejectedBeforeHashing;
     procedure TestServerErrorsConformToWireContract;
     procedure TestRenewalErrorDoesNotDiscloseStorePath;
     procedure TestServerDiscoveryIsTruthful;
@@ -108,6 +111,14 @@ begin
   inherited Create(True);
   FreeOnTerminate := False;
   FStore := AStore;
+end;
+
+procedure TRegistryStoreContract.CheckResourceProgress;
+begin
+  Inc(FResourceProgressCalls);
+  if FResourceProgressCalls > 2 then
+    raise ELWPTRegistryError.CreateStable('test_resource_cancelled',
+      'resource verification cancellation was observed');
 end;
 
 procedure TPublisherThread.Execute;
@@ -580,6 +591,10 @@ begin
   Expect<string>(CanonicalRegistryURL(
     'https://example.com/a//b/%2f/c', False))
     .ToBe('https://example.com/a//b/%2F/c');
+  Expect<string>(CanonicalRegistryURL('https://example.com/a/', False))
+    .ToBe('https://example.com/a');
+  Expect<string>(CanonicalRegistryURL('https://example.com/', False))
+    .ToBe('https://example.com');
   Diagnostic := '';
   try
     CanonicalRegistryURL('https://example.com/"bad"', False);
@@ -655,8 +670,14 @@ end;
 
 procedure TRegistryStoreContract.TestServerRejectsCorruptContentAddressedBytes;
 var
+  Diagnostic: string;
+  HashDiagnostic: string;
+  {$IFDEF UNIX}
+  LinkTarget: string;
+  {$ENDIF}
   ObjectName: string;
   Response: TLWPTRegistryHTTPResponse;
+  ResourceStream: TStream;
   Search: TSearchRec;
   Store: TLWPTRegistryStore;
 begin
@@ -674,9 +695,40 @@ begin
     WriteTextFile(FScratch + '/objects/sha256/' + ObjectName, 'tampered');
     Response := RegistryHTTPResponse(Store, 'GET',
       '/v1/objects/sha256/' + ObjectName);
+    Expect<Integer>(Response.Status).ToBe(200);
+    Diagnostic := '';
+    ResourceStream := nil;
+    try
+      ResourceStream := OpenRegistryHTTPResource(Response);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    ResourceStream.Free;
+    Expect<Boolean>(Pos('resource_hash_mismatch:', Diagnostic) = 1)
+      .ToBe(True);
+    HashDiagnostic := Diagnostic;
+    {$IFDEF UNIX}
+    LinkTarget := Response.ResourcePath + '.target';
+    WriteTextFile(LinkTarget, 'tampered');
+    Expect<Boolean>(DeleteFile(Response.ResourcePath)).ToBe(True);
+    Expect<Integer>(FpSymlink(PChar(LinkTarget),
+      PChar(Response.ResourcePath))).ToBe(0);
+    Diagnostic := '';
+    ResourceStream := nil;
+    try
+      ResourceStream := OpenRegistryHTTPResource(Response);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    ResourceStream.Free;
+    Expect<Boolean>(Pos('resource_changed:', Diagnostic) = 1).ToBe(True);
+    {$ENDIF}
+    Response := RegistryResourceFailureResponse(HashDiagnostic);
     Expect<Integer>(Response.Status).ToBe(500);
-    Expect<Boolean>(Pos('resource_hash_mismatch',
+    Expect<Boolean>(Pos('code = "resource_hash_mismatch"',
       TEncoding.UTF8.GetString(Response.Body)) > 0).ToBe(True);
+    Expect<Boolean>(Pos(FScratch,
+      TEncoding.UTF8.GetString(Response.Body)) = 0).ToBe(True);
   finally
     Store.Free;
   end;
@@ -687,6 +739,9 @@ var
   ObjectName: string;
   Publication: TLWPTRegistryPublication;
   Response: TLWPTRegistryHTTPResponse;
+  Diagnostic: string;
+  ReplacementPath: string;
+  ResourceStream: TStream;
   Search: TSearchRec;
   Store: TLWPTRegistryStore;
   Wire: TBytes;
@@ -717,6 +772,59 @@ begin
     Expect<Boolean>(Length(Wire) < 1024).ToBe(True);
     Expect<Boolean>(Pos('Content-Length: 8388608',
       TEncoding.UTF8.GetString(Wire)) > 0).ToBe(True);
+    FResourceProgressCalls := 0;
+    Diagnostic := '';
+    ResourceStream := nil;
+    try
+      ResourceStream := OpenRegistryHTTPResource(Response,
+        CheckResourceProgress);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    ResourceStream.Free;
+    Expect<Boolean>(Pos('test_resource_cancelled:', Diagnostic) = 1)
+      .ToBe(True);
+    ResourceStream := OpenRegistryHTTPResource(Response);
+    try
+      ReplacementPath := Response.ResourcePath + '.replacement';
+      WriteTextFile(ReplacementPath, 'replacement');
+      Expect<Boolean>(AtomicReplaceFile(ReplacementPath,
+        Response.ResourcePath)).ToBe(True);
+      Expect<string>('sha256:' + SHA256Stream(ResourceStream))
+        .ToBe(Response.ResourceDigest);
+    finally
+      ResourceStream.Free;
+    end;
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestOversizedResourceIsRejectedBeforeHashing;
+const
+  OBJECT_NAME =
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+var
+  ObjectPath: string;
+  Response: TLWPTRegistryHTTPResponse;
+  Store: TLWPTRegistryStore;
+  Stream: TFileStream;
+begin
+  Store := InitializeStore;
+  try
+    ForceDirectories(FScratch + '/objects/sha256');
+    ObjectPath := FScratch + '/objects/sha256/' + OBJECT_NAME;
+    Stream := TFileStream.Create(ObjectPath, fmCreate);
+    try
+      Stream.Size := Int64(MAX_REGISTRY_RESOURCE_BYTES) + 1;
+    finally
+      Stream.Free;
+    end;
+    Response := RegistryHTTPResponse(Store, 'GET',
+      '/v1/objects/sha256/' + OBJECT_NAME);
+    Expect<Integer>(Response.Status).ToBe(500);
+    Expect<Boolean>(Pos('resource_too_large',
+      TEncoding.UTF8.GetString(Response.Body)) > 0).ToBe(True);
   finally
     Store.Free;
   end;
@@ -1006,6 +1114,8 @@ begin
     TestServerRejectsCorruptContentAddressedBytes);
   Test('large resource uses a streamed descriptor',
     TestLargeResourceUsesStreamedDescriptor);
+  Test('oversized resource is rejected before hashing',
+    TestOversizedResourceIsRejectedBeforeHashing);
   Test('server errors conform to the wire contract',
     TestServerErrorsConformToWireContract);
   Test('renewal error does not disclose the store path',

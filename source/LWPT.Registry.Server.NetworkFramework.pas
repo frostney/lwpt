@@ -79,7 +79,7 @@ type
     FClosing: Boolean;
     FResponding: Boolean;
     FDeadline: QWord;
-    FResponseStream: TFileStream;
+    FResponseStream: TStream;
     FSendBuffer: TBytes;
     FSendData: Pointer;
     FStateBlock: TRegistryBlock;
@@ -87,6 +87,7 @@ type
     FSendBlock: TRegistryBlock;
     procedure ArmReceive;
     procedure Cancel;
+    procedure CheckDeadline;
     procedure Consume(const ABuffer: Pointer; const ALength: NativeUInt);
     procedure SendCompleted(AError: Pointer);
     procedure SendCurrentBuffer;
@@ -365,7 +366,11 @@ var
 begin
   EnsureFrameworkThread;
   Connection := TNetworkFrameworkRegistryConnection(ABlock^.Context);
-  Connection.SendCompleted(AError);
+  try
+    Connection.SendCompleted(AError);
+  except
+    Connection.Cancel;
+  end;
 end;
 
 procedure NewConnectionInvoke(ABlock: PRegistryBlock;
@@ -376,35 +381,34 @@ var
 begin
   EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
-  if Server.FStopping then
-  begin
-    Nw_connection_cancel(ANetworkConnection);
-    Exit;
-  end;
   EnterCriticalSection(Server.FConnectionLock);
   try
-    if Server.FConnections.Count >= MAX_ACTIVE_CONNECTIONS then
+    if Server.FStopping
+      or (Server.FConnections.Count >= MAX_ACTIVE_CONNECTIONS) then
     begin
       Nw_connection_cancel(ANetworkConnection);
       Exit;
     end;
     Connection := TNetworkFrameworkRegistryConnection.Create;
+    Connection.FServer := Server;
+    Connection.FDeadline := GetTickCount64
+      + CONNECTION_DEADLINE_MILLISECONDS;
+    Nw_retain(ANetworkConnection);
+    Connection.FConnection := ANetworkConnection;
+    Connection.FQueue := Dispatch_queue_create(
+      PAnsiChar(AnsiString('org.' + PROGRAM_NAME + '.registry.connection')),
+      nil);
+    Nw_connection_set_queue(ANetworkConnection, Connection.FQueue);
+    Nw_connection_set_state_changed_handler(ANetworkConnection,
+      MakeBlock(Connection.FStateBlock, @ConnectionStateInvoke, Connection));
     Server.FConnections.Add(Connection);
+    InterLockedIncrement(Server.FActiveConnections);
+    { Starting under the admission lock prevents the run loop from observing a
+      published connection before every field and callback is initialized. }
+    Nw_connection_start(ANetworkConnection);
   finally
     LeaveCriticalSection(Server.FConnectionLock);
   end;
-  Connection.FServer := Server;
-  Connection.FDeadline := GetTickCount64 + CONNECTION_DEADLINE_MILLISECONDS;
-  Nw_retain(ANetworkConnection);
-  Connection.FConnection := ANetworkConnection;
-  Connection.FQueue := Dispatch_queue_create(
-    PAnsiChar(AnsiString('org.' + PROGRAM_NAME + '.registry.connection')),
-    nil);
-  InterLockedIncrement(Server.FActiveConnections);
-  Nw_connection_set_queue(ANetworkConnection, Connection.FQueue);
-  Nw_connection_set_state_changed_handler(ANetworkConnection,
-    MakeBlock(Connection.FStateBlock, @ConnectionStateInvoke, Connection));
-  Nw_connection_start(ANetworkConnection);
 end;
 
 procedure TNetworkFrameworkRegistryConnection.ArmReceive;
@@ -425,6 +429,13 @@ begin
   FClosing := True;
   { The cancelled state callback releases the retained connection and queue. }
   Nw_connection_cancel(FConnection);
+end;
+
+procedure TNetworkFrameworkRegistryConnection.CheckDeadline;
+begin
+  if FClosing or (GetTickCount64 >= FDeadline) then
+    raise ELWPTRegistryError.CreateStable('connection_deadline',
+      'registry connection exceeded its total deadline');
 end;
 
 destructor TNetworkFrameworkRegistryConnection.Destroy;
@@ -492,11 +503,15 @@ begin
     Cancel;
     Exit;
   end;
-  if IncludeBody and (Response.ResourcePath <> '') then
+  if Response.ResourcePath <> '' then
   begin
-    VerifyRegistryHTTPResource(Response);
-    FResponseStream := TFileStream.Create(Response.ResourcePath,
-      fmOpenRead or fmShareDenyNone);
+    try
+      FResponseStream := OpenRegistryHTTPResource(Response, CheckDeadline);
+    except
+      on E: Exception do
+        Response := RegistryResourceFailureResponse(E.Message);
+    end;
+    if not IncludeBody then FreeAndNil(FResponseStream);
   end;
   FSendBuffer := RegistryHTTPWireResponse(Response,
     IncludeBody and (Response.ResourcePath = ''));
@@ -526,6 +541,7 @@ begin
     Cancel;
     Exit;
   end;
+  CheckDeadline;
   SetLength(FSendBuffer, 64 * 1024);
   ReadCount := FResponseStream.Read(FSendBuffer[0], Length(FSendBuffer));
   SetLength(FSendBuffer, ReadCount);

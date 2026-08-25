@@ -123,9 +123,13 @@ The macOS Network.framework listener also accepts IPv6 addresses.
 The listener admits at most 32 owned connections, handles each independently,
 and closes it after one bounded HTTP/1.1 GET or HEAD request. One ten-second
 monotonic deadline covers handshake, request, and response; request headers are
-capped at 32 KiB. Verified resources are described by path, length, and digest,
-then revalidated and sent through one 64 KiB connection-owned buffer. The
-listener never builds a second body-sized wire response in memory. Shutdown
+capped at 32 KiB. A response resource is capped at 2,147,483,647 bytes, matching
+the platform-safe maximum accepted by the current publication and state-loading
+surface. The listener opens it once without following a final-path link, checks
+its length and digest in cancellable 64 KiB steps, rewinds that retained handle,
+and sends from the same handle through one connection-owned buffer. The listener
+never builds a second
+body-sized wire response in memory. Shutdown
 interrupts acceptance, cancels every client, drains
 its workers or Network.framework callbacks, and only then releases the store
 and TLS context. Hashed objects, records, and snapshots are SHA-256 checked
