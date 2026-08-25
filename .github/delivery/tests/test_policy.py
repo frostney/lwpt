@@ -96,8 +96,12 @@ class RepositoryPolicyTests(unittest.TestCase):
 
     def test_diagnostics_are_allow_listed_and_proof_separated(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        transition = (
+            ROOT / ".github/workflows/delivery-transition.yml"
+        ).read_text(encoding="utf-8")
         for value in (
             "x86_64-darwin",
+            "x86_64-linux",
             "x86_64-win64",
             "i386-win32",
             "default",
@@ -106,6 +110,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "tls",
         ):
             self.assertIn(f"- {value}", workflow)
+            self.assertIn(f"- {value}", transition)
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("Checkout trusted scheduling diagnostic", workflow)
         self.assertIn("ref: ${{ github.sha }}", workflow)
@@ -127,6 +132,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("diagnostic/", workflow)
         self.assertIn("- diagnostic", workflow)
         self.assertIn("current same-repository PR head", workflow)
+        self.assertIn("x86_64-linux/scheduling", workflow)
+        self.assertNotIn("x86_64-linux/default", workflow)
         self.assertNotIn("diagnostic:v1", workflow)
 
     def test_test_routes_use_project_selectors_without_runner_tiers(self) -> None:
@@ -300,6 +307,25 @@ class RepositoryPolicyTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertNotIn("exceeded", result.stdout)
 
+    def test_active_case_marker_is_published_by_atomic_replacement(self) -> None:
+        testing_library = (
+            ROOT / "packages/testing/source/TestingPascalLibrary.pas"
+        ).read_text(encoding="utf-8")
+        publish_start = testing_library.index("procedure PublishActiveTestCase")
+        publish_end = testing_library.index(
+            "function TestResultToExitCode", publish_start
+        )
+        publish = testing_library[publish_start:publish_end]
+        self.assertIn(".tmp-", publish)
+        self.assertLess(
+            publish.index("Flush(MarkerFile)"), publish.index("CloseFile")
+        )
+        self.assertLess(
+            publish.index("CloseFile"), publish.index("ReplaceActiveTestCaseFile")
+        )
+        self.assertIn("RenameFile(ATemporaryPath, ATargetPath)", testing_library)
+        self.assertIn("MOVEFILE_REPLACE_EXISTING", testing_library)
+
     def test_scheduling_diagnostic_timeout_reaps_descendant(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
@@ -307,11 +333,23 @@ class RepositoryPolicyTests(unittest.TestCase):
             child = tmp / "TestScheduling.Test"
             grandchild = tmp / "unrelated-grandchild"
             grandchild.write_text(
-                "#!/usr/bin/env bash\nsleep 30\n", encoding="utf-8"
+                "#!/usr/bin/env bash\n"
+                "proc_dir=\"$LWPT_SCHEDULING_DIAGNOSTIC_PROC_ROOT/$$\"\n"
+                "mkdir -p \"$proc_dir/task/$$/fd\"\n"
+                "printf 'Name:\\tfixture-grandchild\\nState:\\tS (sleeping)\\n' > \"$proc_dir/status\"\n"
+                "printf 'fixture_wait\\n' > \"$proc_dir/wchan\"\n"
+                "printf 'read(0x3, 0x4, 0x5)\\n' > \"$proc_dir/syscall\"\n"
+                "printf 'fixture-grandchild\\n' > \"$proc_dir/task/$$/comm\"\n"
+                "printf 'fixture_task_wait\\n' > \"$proc_dir/task/$$/wchan\"\n"
+                "printf 'futex(0x1)\\n' > \"$proc_dir/task/$$/syscall\"\n"
+                "printf 'fixture stack\\n' > \"$proc_dir/task/$$/stack\"\n"
+                "sleep 30\n",
+                encoding="utf-8",
             )
             grandchild.chmod(0o755)
             child.write_text(
                 "#!/usr/bin/env bash\n"
+                "printf 'TSchedulingSuite > blocked nested case\\n' > \"${TESTING_PASCAL_LIBRARY_ACTIVE_CASE_FILE:-$RUNNER_TEMP/missing-case}\"\n"
                 f"{grandchild} &\n"
                 "echo $! > grandchild.pid\n"
                 "wait\n",
@@ -330,6 +368,11 @@ class RepositoryPolicyTests(unittest.TestCase):
             sample = tmp / "sample"
             sample.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             sample.chmod(0o755)
+            timeout = tmp / "timeout"
+            timeout.write_text(
+                "#!/usr/bin/env bash\nshift\nexec \"$@\"\n", encoding="utf-8"
+            )
+            timeout.chmod(0o755)
             env = os.environ.copy()
             env.update(
                 {
@@ -338,6 +381,8 @@ class RepositoryPolicyTests(unittest.TestCase):
                     "LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT": "20",
                     "LWPT_SCHEDULING_DIAGNOSTIC_SAMPLE_SECONDS": "0",
                     "LWPT_SCHEDULING_DIAGNOSTIC_CLEANUP_GRACE_SECONDS": "0.05",
+                    "LWPT_SCHEDULING_DIAGNOSTIC_PLATFORM": "Linux",
+                    "LWPT_SCHEDULING_DIAGNOSTIC_PROC_ROOT": str(tmp / "proc"),
                     "RUNNER_TEMP": raw_tmp,
                 }
             )
@@ -352,6 +397,14 @@ class RepositoryPolicyTests(unittest.TestCase):
             )
             self.assertEqual(1, result.returncode)
             self.assertIn("exceeded", result.stdout)
+            self.assertIn("active test case", result.stdout)
+            self.assertIn(
+                "TSchedulingSuite > blocked nested case", result.stdout
+            )
+            self.assertIn("fixture_wait", result.stdout)
+            self.assertIn("read(0x3, 0x4, 0x5)", result.stdout)
+            self.assertIn("fixture_task_wait", result.stdout)
+            self.assertIn("fixture stack", result.stdout)
             child_pid = int((tmp / "child.pid").read_text().strip())
             grandchild_pid = int((tmp / "grandchild.pid").read_text().strip())
             time.sleep(0.05)

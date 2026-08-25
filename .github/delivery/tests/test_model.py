@@ -520,6 +520,27 @@ class DeliveryModelTests(unittest.TestCase):
             )
         )
 
+    def test_linux_scheduling_diagnostic_is_allow_listed(self) -> None:
+        head = "1" * 40
+        github = DiagnosticGitHub(head)
+        Controller(github).diagnostic(41, head, "x86_64-linux", "scheduling")
+        self.assertEqual("diagnostic", github.dispatched[0][1]["mode"])
+        self.assertEqual(
+            "x86_64-linux", github.dispatched[0][1]["diagnostic_target"]
+        )
+        self.assertEqual(
+            "scheduling", github.dispatched[0][1]["diagnostic_selector"]
+        )
+        self.assertIsNotNone(
+            DIAGNOSTIC_RUN_RE.match(
+                f"diagnostic/41/{head}/x86_64-linux/scheduling"
+            )
+        )
+        with self.assertRaisesRegex(DeliveryError, "unsupported diagnostic slice"):
+            Controller(DiagnosticGitHub(head)).diagnostic(
+                41, head, "x86_64-linux", "default"
+            )
+
     def test_superseded_diagnostic_and_full_ci_runs_are_cancelled(self) -> None:
         head = "1" * 40
         digest = "a" * 64

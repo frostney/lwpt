@@ -8,12 +8,15 @@ const
   TEST_INVENTORY_ENVIRONMENT = 'TESTING_PASCAL_LIBRARY_INVENTORY';
   TEST_INVENTORY_EXECUTABLE_ENVIRONMENT =
     'TESTING_PASCAL_LIBRARY_INVENTORY_EXECUTABLE';
+  TEST_ACTIVE_CASE_FILE_ENVIRONMENT =
+    'TESTING_PASCAL_LIBRARY_ACTIVE_CASE_FILE';
   TEST_INVENTORY_MODE_ONLY = 'only';
   TEST_INVENTORY_MODE_REPORT = 'report';
   TEST_INVENTORY_PREFIX = 'tpl-inventory-v1'#9;
 
 function CurrentTestInventoryMode: string;
 function ConsumeCurrentTestInventoryMode: string;
+function ConsumeActiveTestCaseFile: string;
 
 implementation
 
@@ -33,7 +36,7 @@ function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
   {$ENDIF}
 {$ENDIF}
 
-procedure ClearInventoryEnvironmentVariable(const AName: string);
+procedure ClearEnvironmentVariable(const AName: string);
 {$IFDEF UNIX}
 var
   Name: AnsiString;
@@ -77,8 +80,17 @@ begin
   { The request authorizes exactly this process. Clearing it before any test
     body runs prevents same-executable subprocesses from inheriting a second
     valid report request. }
-  ClearInventoryEnvironmentVariable(TEST_INVENTORY_ENVIRONMENT);
-  ClearInventoryEnvironmentVariable(TEST_INVENTORY_EXECUTABLE_ENVIRONMENT);
+  ClearEnvironmentVariable(TEST_INVENTORY_ENVIRONMENT);
+  ClearEnvironmentVariable(TEST_INVENTORY_EXECUTABLE_ENVIRONMENT);
+end;
+
+function ConsumeActiveTestCaseFile: string;
+begin
+  Result := SysUtils.GetEnvironmentVariable(TEST_ACTIVE_CASE_FILE_ENVIRONMENT);
+  if Result = '' then Exit;
+  { The first test program owns the marker. Consuming the path before its test
+    bodies run prevents nested test programs from overwriting the outer case. }
+  ClearEnvironmentVariable(TEST_ACTIVE_CASE_FILE_ENVIRONMENT);
 end;
 
 end.
