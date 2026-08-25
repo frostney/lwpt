@@ -644,22 +644,42 @@ procedure TTestScheduling.AssertPreparedFixturesUsed(const ARun: TLwptResult;
 var
   CacheBypassCount, CacheCorruptionCount, CacheHitCount, CacheMissCount,
     CacheStoreCount, CacheTakeoverHitCount, CacheWaitHitCount: Integer;
-  CacheBypassLines, DiagnosticSuffix: string;
+  CacheBypassLines, CacheCorruptionLines, CacheHitLines, CacheMissLines,
+    CacheStoreLines, CacheTakeoverHitLines, CacheWaitHitLines,
+    DiagnosticLines, DiagnosticSuffix: string;
 begin
-  CacheHitCount := SessionLogOccurrenceCount(ARun, 'cache hit: sha256:');
+  CacheHitCount := SessionLogOccurrenceCount(ARun, 'cache hit: sha256:',
+    CacheHitLines);
   CacheWaitHitCount := SessionLogOccurrenceCount(ARun,
-    'cache wait hit: sha256:');
+    'cache wait hit: sha256:', CacheWaitHitLines);
   CacheTakeoverHitCount := SessionLogOccurrenceCount(ARun,
-    'cache takeover hit: sha256:');
-  CacheMissCount := SessionLogOccurrenceCount(ARun, 'cache miss:');
+    'cache takeover hit: sha256:', CacheTakeoverHitLines);
+  CacheMissCount := SessionLogOccurrenceCount(ARun, 'cache miss:',
+    CacheMissLines);
   CacheCorruptionCount := SessionLogOccurrenceCount(ARun,
-    'cache corruption:');
+    'cache corruption:', CacheCorruptionLines);
   CacheBypassCount := SessionLogOccurrenceCount(ARun, 'cache bypass:',
     CacheBypassLines);
-  CacheStoreCount := SessionLogOccurrenceCount(ARun, 'cache stored:');
+  CacheStoreCount := SessionLogOccurrenceCount(ARun, 'cache stored:',
+    CacheStoreLines);
+  DiagnosticLines := CacheHitLines;
+  if CacheWaitHitLines <> '' then DiagnosticLines := DiagnosticLines + ' | '
+    + CacheWaitHitLines;
+  if CacheTakeoverHitLines <> '' then DiagnosticLines := DiagnosticLines
+    + ' | ' + CacheTakeoverHitLines;
+  if CacheMissLines <> '' then DiagnosticLines := DiagnosticLines + ' | '
+    + CacheMissLines;
+  if CacheCorruptionLines <> '' then DiagnosticLines := DiagnosticLines
+    + ' | ' + CacheCorruptionLines;
+  if CacheBypassLines <> '' then DiagnosticLines := DiagnosticLines + ' | '
+    + CacheBypassLines;
+  if CacheStoreLines <> '' then DiagnosticLines := DiagnosticLines + ' | '
+    + CacheStoreLines;
+  if Copy(DiagnosticLines, 1, 3) = ' | ' then
+    Delete(DiagnosticLines, 1, 3);
   DiagnosticSuffix := '';
-  if CacheBypassLines <> '' then
-    DiagnosticSuffix := '; diagnostics: ' + CacheBypassLines;
+  if DiagnosticLines <> '' then
+    DiagnosticSuffix := '; diagnostics: ' + DiagnosticLines;
   if (CacheHitCount <> AExpectedCount) or (CacheWaitHitCount <> 0)
      or (CacheTakeoverHitCount <> 0) or (CacheMissCount <> 0)
      or (CacheCorruptionCount <> 0) or (CacheBypassCount <> 0)
@@ -691,15 +711,18 @@ begin
 
   LogDirectory := FScratch + '/.lwpt/sessions/s-diagnostic/logs';
   ForceDirectories(LogDirectory);
-  WriteTextFile(LogDirectory + '/fixture.log',
-    'cache bypass: unavailable (EProbe: rendered detail)' + LineEnding);
+  WriteTextFile(LogDirectory + '/tests_A.Prepared.Test.pas.log',
+    'cache hit: sha256:' + StringOfChar('a', 64) + LineEnding);
+  WriteTextFile(LogDirectory + '/tests_B.Prepared.Test.pas.log',
+    'cache miss: no-result: sha256:' + StringOfChar('b', 64) + LineEnding
+    + 'cache stored: sha256:' + StringOfChar('b', 64) + LineEnding);
   RunResult := Default(TLwptResult);
   RunResult.Stdout := 'test session: s-diagnostic '
     + '(.lwpt/sessions/s-diagnostic)' + LineEnding;
   Raised := False;
   ErrorMessage := '';
   try
-    AssertPreparedFixturesUsed(RunResult, 0);
+    AssertPreparedFixturesUsed(RunResult, 2);
   except
     on E: ETestAssertionError do
     begin
@@ -708,8 +731,12 @@ begin
     end;
   end;
   Expect<Boolean>(Raised).ToBe(True);
-  Expect<Boolean>(Pos('diagnostics: fixture.log: cache bypass: unavailable '
-    + '(EProbe: rendered detail)', ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('diagnostics: tests_A.Prepared.Test.pas.log: cache hit: '
+    + 'sha256:' + StringOfChar('a', 64), ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache miss: no-result: '
+    + 'sha256:' + StringOfChar('b', 64), ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache stored: sha256:'
+    + StringOfChar('b', 64), ErrorMessage) > 0).ToBe(True);
 end;
 
 function TTestScheduling.RunTests(const AArgs: array of string): TLwptResult;
