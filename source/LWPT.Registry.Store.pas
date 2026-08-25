@@ -865,6 +865,9 @@ begin
       if Authority[BracketEnd + 1] <> ':' then
         raise ELWPTRegistryError.CreateStable('invalid_url', 'invalid authority after IPv6 host');
       Port := Copy(Authority, BracketEnd + 2, MaxInt);
+      if Port = '' then
+        raise ELWPTRegistryError.CreateStable('invalid_url',
+          'registry URL port is empty');
     end;
   end
   else
@@ -874,10 +877,16 @@ begin
     begin
       Host := LowerCase(Copy(Authority, 1, Colon - 1));
       Port := Copy(Authority, Colon + 1, MaxInt);
+      if Port = '' then
+        raise ELWPTRegistryError.CreateStable('invalid_url',
+          'registry URL port is empty');
     end
     else Host := Authority;
   end;
-  if (Host <> '') and (Host[1] <> '[') then Host := CanonicalHost(Host);
+  if Host = '' then
+    raise ELWPTRegistryError.CreateStable('invalid_url',
+      'registry URL host is empty');
+  if Host[1] <> '[' then Host := CanonicalHost(Host);
   if Port <> '' then
   begin
     if (StrToIntDef(Port, 0) < 1) or (StrToIntDef(Port, 0) > 65535) then
