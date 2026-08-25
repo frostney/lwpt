@@ -2746,6 +2746,11 @@ end;
 
 procedure TTestScheduling.SetupTests;
 begin
+  { Issue #275 diagnostic isolation: run the prepared nested fixture before
+    unrelated scheduling cases can prevent the trusted probe reaching it. }
+  Test('bail reaps nested ' + PROJECT_NAME
+    + ' compiler that ignores SIGTERM',
+    TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
   Test('default jobs overlap', TestDefaultJobsOverlap);
   Test('cache unavailable diagnostic is bounded and single-line',
     TestCacheUnavailableDiagnosticIsBoundedSingleLine);
@@ -2756,9 +2761,6 @@ begin
     TestCompileFailureCountsTowardBail);
   Test('bail terminates active and leaves pending unstarted',
     TestBailTerminatesActiveAndLeavesPendingUnstarted);
-  Test('bail reaps nested ' + PROJECT_NAME
-    + ' compiler that ignores SIGTERM',
-    TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
   Test('worker error terminates another active process tree',
     TestWorkerErrorTerminatesActiveProcessTree);
   Test('successful nested termination acknowledgement completes cancellation',
