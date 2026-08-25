@@ -198,6 +198,7 @@ type
     procedure TestLargeResourceUsesStreamedDescriptor;
     procedure TestOversizedResourceIsRejectedBeforeHashing;
     procedure TestResourceOpenRejectsUnsafeFilesystemKinds;
+    procedure TestNetworkFrameworkBlockABI;
     procedure TestNetworkFrameworkTeardownOrdering;
     procedure TestServerErrorsConformToWireContract;
     procedure TestRenewalErrorDoesNotDiscloseStorePath;
@@ -1229,6 +1230,11 @@ begin
   Expect<Boolean>(NetworkFrameworkTeardownOrderingIsSafeForTesting).ToBe(True);
 end;
 
+procedure TRegistryStoreContract.TestNetworkFrameworkBlockABI;
+begin
+  Expect<Boolean>(NetworkFrameworkBlockABIIsCompleteForTesting).ToBe(True);
+end;
+
 procedure TRegistryStoreContract.TestRenewalErrorDoesNotDiscloseStorePath;
 var
   Body: string;
@@ -1575,6 +1581,8 @@ begin
     TestOversizedResourceIsRejectedBeforeHashing);
   Test('resource open rejects unsafe filesystem kinds',
     TestResourceOpenRejectsUnsafeFilesystemKinds);
+  Test('Network.framework blocks expose the compiler ABI',
+    TestNetworkFrameworkBlockABI);
   Test('Network.framework teardown waits for callback completion',
     TestNetworkFrameworkTeardownOrdering);
   Test('server errors conform to the wire contract',

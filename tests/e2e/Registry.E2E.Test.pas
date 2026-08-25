@@ -224,6 +224,7 @@ begin
     REGISTRY_TLS_FIXTURE,
     '--tls-password-env', TLS_PASSWORD_ENV], '',
     [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
+  DumpRunFailure('registry init', First, 0);
   Expect<Integer>(First.ExitCode).ToBe(0);
   Reconfigured := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
     '--base-url', 'https://localhost:' + IntToStr(BasePort + 1), '--port',
@@ -231,12 +232,14 @@ begin
     REGISTRY_TLS_FIXTURE,
     '--tls-password-env', TLS_PASSWORD_ENV], '',
     [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
+  DumpRunFailure('registry reconfiguration', Reconfigured, 0);
   Expect<Integer>(Reconfigured.ExitCode).ToBe(0);
   Expect<Boolean>(Pos('https://identity.example', Reconfigured.Stdout) > 0)
     .ToBe(True);
   Rejected := RunLwpt(['registry', 'init', '--data-dir',
     FScratch + '/remote-http', '--base-url', 'http://example.com',
     '--listen', '0.0.0.0']);
+  DumpRunFailure('remote plain HTTP rejection', Rejected, 1);
   Expect<Integer>(Rejected.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('insecure_transport:', Rejected.Stderr) > 0).ToBe(True);
   ControlDirectory := FScratch + '/control-origin';
@@ -244,6 +247,8 @@ begin
     ControlDirectory, '--base-url', 'https://localhost:'
     + IntToStr(BasePort + 2), '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
     '--tls-password-env', TLS_PASSWORD_ENV + #1]);
+  DumpRunFailure('control-character configuration rejection',
+    ControlRejected, 1);
   Expect<Integer>(ControlRejected.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('invalid_configuration:', ControlRejected.Stderr) > 0)
     .ToBe(True);

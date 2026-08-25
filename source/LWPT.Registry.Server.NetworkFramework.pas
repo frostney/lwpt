@@ -17,6 +17,7 @@ procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
   const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean);
 {$IFDEF REGISTRY_TESTING}
 function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
+function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
 {$ENDIF}
 
 implementation
@@ -51,12 +52,25 @@ const
   NW_CONNECTION_STATE_READY = 3;
   NW_CONNECTION_STATE_FAILED = 4;
   NW_CONNECTION_STATE_CANCELLED = 5;
+  { Network.framework consumes Objective-C blocks. Clang emits the signature
+    flag plus the descriptor's signature/layout tail for every callback below;
+    retaining that complete ABI is required even though the captured context
+    itself is only an unretained owner pointer. }
+  BLOCK_FLAG_HAS_SIGNATURE = Int32($40000000);
+  BLOCK_SIGNATURE_CONFIGURE = 'v16@?0^{nw_protocol_options=}8';
+  BLOCK_SIGNATURE_STATE = 'v20@?0i8^{nw_error=}12';
+  BLOCK_SIGNATURE_RECEIVE =
+    'v36@?0^{dispatch_data_s=}8^{nw_content_context=}16B24^{nw_error=}28';
+  BLOCK_SIGNATURE_SEND = 'v16@?0^{nw_error=}8';
+  BLOCK_SIGNATURE_NEW_CONNECTION = 'v16@?0^{nw_connection=}8';
 
 type
   PBlockDescriptor = ^TBlockDescriptor;
   TBlockDescriptor = record
     Reserved: NativeUInt;
     Size: NativeUInt;
+    Signature: PAnsiChar;
+    Layout: PAnsiChar;
   end;
 
   PRegistryBlock = ^TRegistryBlock;
@@ -146,6 +160,8 @@ function Dispatch_time(AWhen: UInt64; ADeltaNanoseconds: Int64): UInt64;
 function Dispatch_data_create(ABuffer: Pointer; ASize: NativeUInt;
   AQueue, ADestructor: Pointer): Pointer; cdecl;
   external name 'dispatch_data_create';
+function Block_has_signature(ABlock: Pointer): ByteBool; cdecl;
+  external name '_Block_has_signature';
 
 {$IFDEF REGISTRY_TESTING}
 var
@@ -367,11 +383,15 @@ function SecKeychainDelete(AKeychain: Pointer): Int32; cdecl;
 
 const
   RTLD_DEFAULT = Pointer(-2);
-  BlockDescriptor: TBlockDescriptor =
-    (Reserved: 0; Size: SizeOf(TRegistryBlock));
 
 var
   BlockIsaStack: Pointer;
+  ConfigureBlockDescriptor, NewConnectionBlockDescriptor,
+    ReceiveBlockDescriptor, SendBlockDescriptor,
+    StateBlockDescriptor: TBlockDescriptor;
+  ConfigureBlockSignature, NewConnectionBlockSignature,
+    ReceiveBlockSignature, SendBlockSignature,
+    StateBlockSignature: AnsiString;
   ContentContextDefaultStream: Pointer;
   KeyImportPassphrase: Pointer;
   KeyImportItemIdentity: Pointer;
@@ -395,16 +415,42 @@ begin
 end;
 
 function MakeBlock(var ABlock: TRegistryBlock; AInvoke: CodePointer;
-  AContext: Pointer): Pointer;
+  AContext: Pointer; ADescriptor: PBlockDescriptor): Pointer;
 begin
   ABlock.Isa := BlockIsaStack;
-  ABlock.Flags := 0;
+  ABlock.Flags := BLOCK_FLAG_HAS_SIGNATURE;
   ABlock.Reserved := 0;
   ABlock.Invoke := AInvoke;
-  ABlock.Descriptor := @BlockDescriptor;
+  ABlock.Descriptor := ADescriptor;
   ABlock.Context := AContext;
   Result := @ABlock;
 end;
+
+{$IFDEF REGISTRY_TESTING}
+function BlockMatchesABI(var ABlock: TRegistryBlock;
+  ADescriptor: PBlockDescriptor; const AExpectedSignature: AnsiString): Boolean;
+begin
+  MakeBlock(ABlock, nil, nil, ADescriptor);
+  Result := (ABlock.Flags and BLOCK_FLAG_HAS_SIGNATURE <> 0)
+    and (ABlock.Descriptor^.Size = SizeOf(TRegistryBlock))
+    and (AnsiString(ABlock.Descriptor^.Signature) = AExpectedSignature)
+    and Block_has_signature(@ABlock);
+end;
+
+function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
+var
+  Block: TRegistryBlock;
+begin
+  Result := BlockMatchesABI(Block, @ConfigureBlockDescriptor,
+    ConfigureBlockSignature)
+    and BlockMatchesABI(Block, @StateBlockDescriptor, StateBlockSignature)
+    and BlockMatchesABI(Block, @ReceiveBlockDescriptor,
+      ReceiveBlockSignature)
+    and BlockMatchesABI(Block, @SendBlockDescriptor, SendBlockSignature)
+    and BlockMatchesABI(Block, @NewConnectionBlockDescriptor,
+      NewConnectionBlockSignature);
+end;
+{$ENDIF}
 
 procedure TLSConfigureInvoke(ABlock: PRegistryBlock;
   AOptions: Pointer); cdecl;
@@ -524,7 +570,8 @@ begin
       nil);
     Nw_connection_set_queue(ANetworkConnection, Connection.FQueue);
     Nw_connection_set_state_changed_handler(ANetworkConnection,
-      MakeBlock(Connection.FStateBlock, @ConnectionStateInvoke, Connection));
+      MakeBlock(Connection.FStateBlock, @ConnectionStateInvoke, Connection,
+        @StateBlockDescriptor));
     Server.FConnections.Add(Connection);
     InterLockedIncrement(Server.FActiveConnections);
     { Starting under the admission lock prevents the run loop from observing a
@@ -544,7 +591,8 @@ begin
   end;
   if not FClosing then
     Nw_connection_receive(FConnection, 1, MAX_REQUEST_BYTES,
-      MakeBlock(FReceiveBlock, @ReceiveInvoke, Self));
+      MakeBlock(FReceiveBlock, @ReceiveInvoke, Self,
+        @ReceiveBlockDescriptor));
 end;
 
 procedure TNetworkFrameworkRegistryConnection.Cancel;
@@ -654,7 +702,7 @@ begin
   FSendData := Dispatch_data_create(@FSendBuffer[0], Length(FSendBuffer),
     nil, nil);
   Nw_connection_send(FConnection, FSendData, ContentContextDefaultStream,
-    False, MakeBlock(FSendBlock, @SendInvoke, Self));
+    False, MakeBlock(FSendBlock, @SendInvoke, Self, @SendBlockDescriptor));
 end;
 
 procedure TNetworkFrameworkRegistryConnection.SendNextResourceChunk;
@@ -909,8 +957,10 @@ begin
     PAnsiChar(AnsiString('org.' + PROGRAM_NAME + '.registry.listener')), nil);
   LoadIdentity(APKCS12Path, APassphrase);
   FParameters := Nw_parameters_create_secure_tcp(
-    MakeBlock(FTLSBlock, @TLSConfigureInvoke, Self),
-    MakeBlock(FTCPBlock, @TCPConfigureInvoke, Self));
+    MakeBlock(FTLSBlock, @TLSConfigureInvoke, Self,
+      @ConfigureBlockDescriptor),
+    MakeBlock(FTCPBlock, @TCPConfigureInvoke, Self,
+      @ConfigureBlockDescriptor));
   Nw_parameters_set_reuse_local_address(FParameters, True);
   Host := AnsiString(FStore.Config.ListenAddress);
   if SameText(string(Host), 'localhost') then Host := '127.0.0.1';
@@ -927,9 +977,11 @@ begin
       'Network.framework could not create the registry listener');
   Nw_listener_set_queue(FListener, FListenerQueue);
   Nw_listener_set_state_changed_handler(FListener,
-    MakeBlock(FListenerStateBlock, @ListenerStateInvoke, Self));
+    MakeBlock(FListenerStateBlock, @ListenerStateInvoke, Self,
+      @StateBlockDescriptor));
   Nw_listener_set_new_connection_handler(FListener,
-    MakeBlock(FNewConnectionBlock, @NewConnectionInvoke, Self));
+    MakeBlock(FNewConnectionBlock, @NewConnectionInvoke, Self,
+      @NewConnectionBlockDescriptor));
   Nw_listener_start(FListener);
   Dispatch_semaphore_wait(FReadySemaphore,
     Dispatch_time(0, LISTENER_READY_TIMEOUT_SECONDS * NANOSECONDS_PER_SECOND));
@@ -1008,7 +1060,26 @@ begin
 end;
 
 procedure ResolveSymbols;
+  procedure InitializeBlockDescriptor(var ADescriptor: TBlockDescriptor;
+    var ASignatureStorage: AnsiString; const ASignature: AnsiString);
+  begin
+    ASignatureStorage := ASignature;
+    ADescriptor.Reserved := 0;
+    ADescriptor.Size := SizeOf(TRegistryBlock);
+    ADescriptor.Signature := PAnsiChar(ASignatureStorage);
+    ADescriptor.Layout := nil;
+  end;
 begin
+  InitializeBlockDescriptor(ConfigureBlockDescriptor,
+    ConfigureBlockSignature, BLOCK_SIGNATURE_CONFIGURE);
+  InitializeBlockDescriptor(StateBlockDescriptor, StateBlockSignature,
+    BLOCK_SIGNATURE_STATE);
+  InitializeBlockDescriptor(ReceiveBlockDescriptor, ReceiveBlockSignature,
+    BLOCK_SIGNATURE_RECEIVE);
+  InitializeBlockDescriptor(SendBlockDescriptor, SendBlockSignature,
+    BLOCK_SIGNATURE_SEND);
+  InitializeBlockDescriptor(NewConnectionBlockDescriptor,
+    NewConnectionBlockSignature, BLOCK_SIGNATURE_NEW_CONNECTION);
   BlockIsaStack := Dlsym(RTLD_DEFAULT, '_NSConcreteStackBlock');
   ContentContextDefaultStream := PPointer(Dlsym(RTLD_DEFAULT,
     '_nw_content_context_default_stream'))^;
@@ -1065,6 +1136,11 @@ end;
 
 {$IFDEF REGISTRY_TESTING}
 function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
+begin
+  Result := True;
+end;
+
+function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
 begin
   Result := True;
 end;
