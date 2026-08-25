@@ -102,10 +102,6 @@ procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
 function  SHA256BytesPrefixed(const ABytes: TBytes): string;
 function  SHA256Hex(const AData: TBytes): string;
 function  SHA256File(const APath: string): string;
-{ Returns false only when the initial file open fails, capturing its OS error
-  before exception construction can overwrite the thread-local error value. }
-function  TrySHA256FileOpen(const APath: string; out AHash: string;
-  out AErrorCode: Integer): Boolean;
 function  CanonicalTreeHashPath(const APath: string;
   const ASourceDelimiter: Char): string;
 function  NormalizeTreeHashContent(const ABytes: TBytes): TBytes;
@@ -1365,33 +1361,6 @@ begin
     FS.Free;
   end;
   Result := SHA256Hex(Buf);
-end;
-
-function TrySHA256FileOpen(const APath: string; out AHash: string;
-  out AErrorCode: Integer): Boolean;
-var
-  Buffer: TBytes;
-  Handle: THandle;
-  Stream: THandleStream;
-begin
-  AHash := '';
-  AErrorCode := 0;
-  Handle := FileOpen(APath, fmOpenRead or fmShareDenyNone);
-  if Handle = THandle(-1) then
-  begin
-    AErrorCode := GetLastOSError;
-    Exit(False);
-  end;
-  Stream := THandleStream.Create(Handle);
-  try
-    SetLength(Buffer, Stream.Size);
-    if Stream.Size > 0 then Stream.ReadBuffer(Buffer[0], Stream.Size);
-  finally
-    Stream.Free;
-    FileClose(Handle);
-  end;
-  AHash := SHA256Hex(Buffer);
-  Result := True;
 end;
 
 function CanonicalTreeHashPath(const APath: string;
