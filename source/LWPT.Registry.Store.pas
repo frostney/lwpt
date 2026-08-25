@@ -975,11 +975,16 @@ begin
   if (AConfig.ListenAddress = '') or (AConfig.Port = 0) then
     raise ELWPTRegistryError.CreateStable('invalid_configuration', 'listen address and port are required');
   {$IFNDEF DARWIN}
-  if not SameText(AConfig.ListenAddress, 'localhost')
-    and not TryCanonicalIPv4Host(AConfig.ListenAddress,
+  if not SameText(AConfig.ListenAddress, 'localhost') then
+  begin
+    if not TryCanonicalIPv4Host(AConfig.ListenAddress,
       CanonicalListenAddress) then
-    raise ELWPTRegistryError.CreateStable('invalid_listen_address',
-      'listen address must be localhost or an IPv4 address on this platform');
+      raise ELWPTRegistryError.CreateStable('invalid_listen_address',
+        'listen address must be localhost or an IPv4 address on this platform');
+    if CanonicalListenAddress <> AConfig.ListenAddress then
+      raise ELWPTRegistryError.CreateStable('invalid_listen_address',
+        'listen address is not canonical; use ' + CanonicalListenAddress);
+  end;
   {$ENDIF}
   if StartsText('http://', AConfig.BaseURL)
     and not IsLoopbackListenAddress(AConfig.ListenAddress) then

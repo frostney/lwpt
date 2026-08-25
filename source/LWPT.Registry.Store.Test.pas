@@ -810,6 +810,19 @@ begin
   Store.Free;
   Expect<Boolean>(Pos('invalid_listen_address:', Diagnostic) = 1).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/registry.toml')).ToBe(False);
+  Config := RegistryConfiguration('', 'https://10.0.0.1:9417',
+    '010.000.000.001', 9417,
+    ExpandFileName(FScratch + '/certificate.p12'), 'TLS_PASSWORD');
+  Diagnostic := '';
+  Store := nil;
+  try
+    Store := TLWPTRegistryStore.Initialize(FScratch, Config, INITIAL_TIME);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Store.Free;
+  Expect<Boolean>(Pos('invalid_listen_address:', Diagnostic) = 1).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/registry.toml')).ToBe(False);
   {$ELSE}
   Expect<Boolean>(True).ToBe(True);
   {$ENDIF}
