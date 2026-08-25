@@ -152,7 +152,7 @@ check events that do not match a configured review adapter return before that
 sweep.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
-initial surface covers Windows x86_64/i386 ordinary, E2E, and TLS slices, plus an
+surface covers Windows x86_64/i386 ordinary, E2E, and TLS slices, plus an
 Intel-Darwin scheduling slice that runs only `TestScheduling.Test.pas` with a
 150-second ceiling. The focused inventory remained healthy past the earlier
 90-second boundary in [issue #260](https://github.com/frostney/lwpt/issues/260).

@@ -168,7 +168,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(scheduling_poll_count, darwin_poll_count)
         self.assertEqual(18, linux_poll_count)
         # The focused suite was still making progress at 90.072 seconds on
-        # macos-15-intel. Keep a full minute beyond that observed lower bound.
+        # macos-15-intel. Keep approximately one minute beyond that observed
+        # lower bound.
         self.assertGreaterEqual(
             scheduling_poll_seconds * darwin_poll_count,
             150,
