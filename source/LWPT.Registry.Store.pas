@@ -889,6 +889,10 @@ begin
   if Host[1] <> '[' then Host := CanonicalHost(Host);
   if Port <> '' then
   begin
+    for Character in Port do
+      if not (Character in ['0'..'9']) then
+        raise ELWPTRegistryError.CreateStable('invalid_url',
+          'registry URL port is invalid');
     if (StrToIntDef(Port, 0) < 1) or (StrToIntDef(Port, 0) > 65535) then
       raise ELWPTRegistryError.CreateStable('invalid_url', 'registry URL port is invalid');
     Port := IntToStr(StrToInt(Port));
