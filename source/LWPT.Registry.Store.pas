@@ -629,6 +629,7 @@ var
 begin
   Result := False;
   if AValue = '' then Exit(True);
+  if AValue[Length(AValue)] = ':' then Exit;
   PartStart := 1;
   while PartStart <= Length(AValue) do
   begin

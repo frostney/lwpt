@@ -731,6 +731,13 @@ begin
     on E: Exception do Diagnostic := E.Message;
   end;
   Expect<Boolean>(Pos('invalid_url:', Diagnostic) = 1).ToBe(True);
+  Diagnostic := '';
+  try
+    CanonicalRegistryURL('https://[1:2:3:4:5:6:7:8:]/a', False);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('invalid_url:', Diagnostic) = 1).ToBe(True);
 end;
 
 procedure TRegistryStoreContract.TestConfiguredEncodedBasePathRoutes;
