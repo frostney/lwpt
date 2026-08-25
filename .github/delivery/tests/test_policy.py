@@ -100,6 +100,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             ROOT / ".github/workflows/delivery-transition.yml"
         ).read_text(encoding="utf-8")
         for value in (
+            "aarch64-darwin",
             "x86_64-darwin",
             "x86_64-linux",
             "x86_64-win64",
@@ -133,8 +134,23 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("- diagnostic", workflow)
         self.assertIn("current same-repository PR head", workflow)
         self.assertIn("x86_64-linux/scheduling", workflow)
+        self.assertIn("aarch64-darwin/scheduling", workflow)
+        self.assertNotIn("aarch64-darwin/default", workflow)
         self.assertNotIn("x86_64-linux/default", workflow)
         self.assertNotIn("diagnostic:v1", workflow)
+
+    def test_arm_darwin_scheduling_diagnostic_uses_native_matrix(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            'BUILD=\'{"include":[{"target":"aarch64-darwin","cpu":"aarch64",'
+            '"os":"darwin","native":true}]}\'',
+            workflow,
+        )
+        self.assertIn(
+            'TEST=\'{"include":[{"target":"aarch64-darwin",'
+            '"runner":"macos-latest","fpc-install":"brew"}]}\'',
+            workflow,
+        )
 
     def test_scheduling_diagnostic_has_realistic_hosted_budget(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -151,7 +167,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         )
         workflow_poll_counts = re.search(
             r"diagnostic_selector == 'default' && '(\d+)' \|\| "
-            r"inputs\.diagnostic_target == 'x86_64-darwin' && '(\d+)' "
+            r"\(inputs\.diagnostic_target == 'x86_64-darwin' \|\| "
+            r"inputs\.diagnostic_target == 'aarch64-darwin'\) && '(\d+)' "
             r"\|\| '(\d+)'",
             workflow,
         )
