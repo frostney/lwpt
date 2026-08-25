@@ -85,6 +85,22 @@ begin
     raise Exception.Create('could not install same-length test replacement');
 end;
 
+procedure ReplaceFileWithSize(const APath: string; const ASize: Int64);
+var
+  Replacement: TFileStream;
+  ReplacementPath: string;
+begin
+  ReplacementPath := APath + '.sized-replacement';
+  Replacement := TFileStream.Create(ReplacementPath, fmCreate);
+  try
+    Replacement.Size := ASize;
+  finally
+    Replacement.Free;
+  end;
+  if not AtomicReplaceFile(ReplacementPath, APath) then
+    raise Exception.Create('could not install sized test replacement');
+end;
+
 {$IFDEF MSWINDOWS}
 function TryCreateWindowsJunction(const ALinkDirectory,
   ALinkTarget: string): Boolean;
@@ -1205,6 +1221,16 @@ begin
     ResourceStream.Free;
     Expect<Boolean>(Pos('resource_hash_mismatch:', Diagnostic) = 1)
       .ToBe(True);
+
+    ReplaceFileWithSize(CheckpointResponse.ResourcePath,
+      Int64(MAX_REGISTRY_CONTROL_DOCUMENT_BYTES) + 1);
+    Diagnostic := '';
+    try
+      Store.LoadCurrentState;
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Pos('state_corrupt:', Diagnostic) = 1).ToBe(True);
   finally
     Store.Free;
   end;

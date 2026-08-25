@@ -21,6 +21,7 @@ const
   REGISTRY_DEFAULT_BASE_URL = 'http://localhost:8080';
   REGISTRY_DEFAULT_LISTEN_ADDRESS = 'localhost';
   REGISTRY_DEFAULT_PORT = 8080;
+  MAX_REGISTRY_CONTROL_DOCUMENT_BYTES = 1024 * 1024;
   MAX_REGISTRY_RESOURCE_BYTES = High(Integer);
 
 type
@@ -56,6 +57,8 @@ type
   private
     FRoot: string;
     FConfig: TLWPTRegistryConfig;
+    function HashResource(const ARelative: string;
+      AProgress: TSHA256Progress): string;
     function RootPath(const ARelative: string): string;
     function TmpRoot: string;
     function LoadSeed(AProgress: TSHA256Progress = nil): TBytes;
@@ -79,7 +82,8 @@ type
     function LoadCurrentState(AProgress: TSHA256Progress = nil):
       TLWPTRegistryState;
     function LoadResource(const ARelative: string;
-      AProgress: TSHA256Progress = nil): TBytes;
+      AProgress: TSHA256Progress = nil;
+      const AMaxBytes: Int64 = MAX_REGISTRY_RESOURCE_BYTES): TBytes;
     procedure Publish(const APublication: TLWPTRegistryPublication);
     property Config: TLWPTRegistryConfig read FConfig;
     property Root: string read FRoot;
@@ -361,7 +365,8 @@ begin
 end;
 
 function ReadBytes(const APath: string;
-  AProgress: TSHA256Progress = nil): TBytes;
+  AProgress: TSHA256Progress = nil;
+  const AMaxBytes: Int64 = MAX_REGISTRY_RESOURCE_BYTES): TBytes;
 var
   Offset, ReadCount: Integer;
   Stream: TStream;
@@ -375,10 +380,12 @@ begin
         raise ELWPTRegistryError.CreateStable('state_missing',
           'required file could not be opened safely');
     end;
-    if Stream.Size > High(Integer) then
+    if Assigned(AProgress) then AProgress;
+    if (Stream.Size > High(Integer)) or (Stream.Size > AMaxBytes) then
       raise ELWPTRegistryError.CreateStable('state_corrupt',
         'registry file exceeds supported size');
     SetLength(Result, Stream.Size);
+    if Assigned(AProgress) then AProgress;
     Offset := 0;
     repeat
       if Assigned(AProgress) then AProgress;
@@ -397,9 +404,10 @@ begin
 end;
 
 function ReadText(const APath: string;
-  AProgress: TSHA256Progress = nil): string;
+  AProgress: TSHA256Progress = nil;
+  const AMaxBytes: Int64 = MAX_REGISTRY_RESOURCE_BYTES): string;
 begin
-  Result := Text(ReadBytes(APath, AProgress));
+  Result := Text(ReadBytes(APath, AProgress, AMaxBytes));
 end;
 
 function SHA256BytesWithProgress(const ABytes: TBytes;
@@ -1030,7 +1038,8 @@ begin
   if not FileExists(RootPath(CONFIG_FILE)) then
     raise ELWPTRegistryError.CreateStable('origin_not_initialized',
       'registry data directory is not initialized: ' + FRoot);
-  FConfig := ParseConfig(ReadText(RootPath(CONFIG_FILE)));
+  FConfig := ParseConfig(ReadText(RootPath(CONFIG_FILE), nil,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
   Recover;
 end;
 
@@ -1050,8 +1059,8 @@ function TLWPTRegistryStore.LoadSeed(AProgress: TSHA256Progress): TBytes;
 var
   Seed: TLWPTEd25519Seed;
 begin
-  if not HexToBytes(Trim(Text(LoadResource(SIGNING_SEED_FILE, AProgress))), Seed,
-    SizeOf(Seed)) then
+  if not HexToBytes(Trim(Text(LoadResource(SIGNING_SEED_FILE, AProgress,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES))), Seed, SizeOf(Seed)) then
     raise ELWPTRegistryError.CreateStable('state_corrupt', 'registry signing seed is invalid');
   SetLength(Result, SizeOf(Seed));
   Move(Seed[0], Result[0], SizeOf(Seed));
@@ -1320,14 +1329,16 @@ begin
       raise ELWPTRegistryError.CreateStable('state_corrupt',
         'committed renewal paths are invalid');
   end;
-  if 'sha256:' + SHA256BytesWithProgress(LoadResource('snapshots/sha256/'
+  if 'sha256:' + HashResource('snapshots/sha256/'
     + Copy(AState.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml',
-    AProgress), AProgress)
+    AProgress)
     <> AState.SnapshotHash then
     raise ELWPTRegistryError.CreateStable('snapshot_hash_mismatch',
       'committed snapshot bytes do not match the activation pointer');
-  CheckpointBytes := LoadResource(AState.CheckpointPath, AProgress);
-  SignatureBytes := LoadResource(AState.SignaturePath, AProgress);
+  CheckpointBytes := LoadResource(AState.CheckpointPath, AProgress,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
+  SignatureBytes := LoadResource(AState.SignaturePath, AProgress,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
   if StartsStr(RenewalPrefix, AState.CheckpointPath)
     and (SHA256BytesWithProgress(CheckpointBytes, AProgress)
       <> ExpectedCheckpointHash) then
@@ -1369,7 +1380,8 @@ begin
     AProgress) then
     raise ELWPTRegistryError.CreateStable('signature_payload_mismatch',
       'signature payload does not match checkpoint bytes');
-  KeyBytes := LoadResource(RegistryKeyStoragePath(KeyID), AProgress);
+  KeyBytes := LoadResource(RegistryKeyStoragePath(KeyID), AProgress,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
   KeyDocumentText := Text(KeyBytes);
   if StringValue(KeyDocumentText, 'schema') <> PROGRAM_NAME
     + '-registry-key-v1' then
@@ -1532,7 +1544,8 @@ end;
 function TLWPTRegistryStore.ReadCurrentState(AProgress: TSHA256Progress):
   TLWPTRegistryState;
 begin
-  Result := ParseState(ReadText(RootPath(CURRENT_STATE_FILE), AProgress));
+  Result := ParseState(ReadText(RootPath(CURRENT_STATE_FILE), AProgress,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
 end;
 
 function TLWPTRegistryStore.LoadCurrentState(AProgress: TSHA256Progress):
@@ -1543,7 +1556,7 @@ begin
 end;
 
 function TLWPTRegistryStore.LoadResource(const ARelative: string;
-  AProgress: TSHA256Progress): TBytes;
+  AProgress: TSHA256Progress; const AMaxBytes: Int64): TBytes;
 var
   FullPath: string;
 begin
@@ -1553,7 +1566,39 @@ begin
   FullPath := RootPath(ARelative);
   if not PathContains(FRoot, FullPath) then
     raise ELWPTRegistryError.CreateStable('invalid_resource_path', 'registry resource escapes its data root');
-  Result := ReadBytes(FullPath, AProgress);
+  Result := ReadBytes(FullPath, AProgress, AMaxBytes);
+end;
+
+function TLWPTRegistryStore.HashResource(const ARelative: string;
+  AProgress: TSHA256Progress): string;
+var
+  FullPath: string;
+  Stream: TStream;
+begin
+  if (ARelative = '') or (ARelative[1] = '/') or (Pos('..', ARelative) > 0)
+    or (Pos('\', ARelative) > 0) then
+    raise ELWPTRegistryError.CreateStable('invalid_resource_path',
+      'registry resource path is invalid');
+  FullPath := RootPath(ARelative);
+  if not PathContains(FRoot, FullPath) then
+    raise ELWPTRegistryError.CreateStable('invalid_resource_path',
+      'registry resource escapes its data root');
+  Stream := nil;
+  try
+    try
+      Stream := OpenRegistryFileWithoutFollowingLinks(FullPath);
+    except
+      on E: ELWPTRegistryFileOpenError do
+        raise ELWPTRegistryError.CreateStable('state_missing',
+          'required file could not be opened safely');
+    end;
+    if Stream.Size > MAX_REGISTRY_RESOURCE_BYTES then
+      raise ELWPTRegistryError.CreateStable('state_corrupt',
+        'registry file exceeds supported size');
+    Result := SHA256Stream(Stream, AProgress);
+  finally
+    Stream.Free;
+  end;
 end;
 
 procedure TLWPTRegistryStore.DescribeResource(const ARelative: string;
@@ -1629,7 +1674,8 @@ begin
     if not Assigned(Lease) then Exit;
     State := ReadCurrentState(AProgress);
     VerifyState(State, AProgress);
-    CheckpointText := Text(LoadResource(State.CheckpointPath, AProgress));
+    CheckpointText := Text(LoadResource(State.CheckpointPath, AProgress,
+      MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
     ExpiresAt := StringValue(CheckpointText, 'expires_at');
     if not TryISO8601ToDate(ExpiresAt, ExpiresDate, True)
       or not TryISO8601ToDate(ANow, NowDate, True) then

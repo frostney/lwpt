@@ -127,10 +127,13 @@ The listener admits at most 32 owned connections, handles each independently,
 and closes it after one bounded HTTP/1.1 GET or HEAD request. One ten-second
 monotonic deadline covers handshake, request, and response; request headers are
 capped at 32 KiB. Committed-state reads and hashes report progress in 64 KiB
-steps to the same deadline before routing may select a resource. A response
-resource is capped at 2,147,483,647 bytes, matching the platform-safe maximum
-accepted by the current publication and state-loading surface. The listener
-opens every path component without following links,
+steps to the same deadline before routing may select a resource. Fixed-schema
+configuration, state, checkpoint, signature, key, and seed documents are capped
+at 1 MiB before allocation or parsing; snapshot verification hashes its retained
+stream without materializing the snapshot. A response resource is capped at
+2,147,483,647 bytes, matching the platform-safe maximum accepted by the current
+publication and state-loading surface. The listener opens every path component
+without following links,
 retains verified parent handles through a nonblocking regular-file open, checks
 the resource length and digest in cancellable 64 KiB steps, rewinds that retained
 handle, and sends from the same handle through one connection-owned buffer. The
