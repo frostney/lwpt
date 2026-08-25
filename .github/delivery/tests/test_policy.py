@@ -96,6 +96,9 @@ class RepositoryPolicyTests(unittest.TestCase):
 
     def test_diagnostics_are_allow_listed_and_proof_separated(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        transition = (
+            ROOT / ".github/workflows/delivery-transition.yml"
+        ).read_text(encoding="utf-8")
         for value in (
             "x86_64-darwin",
             "x86_64-linux",
@@ -107,6 +110,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "tls",
         ):
             self.assertIn(f"- {value}", workflow)
+            self.assertIn(f"- {value}", transition)
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("Checkout trusted scheduling diagnostic", workflow)
         self.assertIn("ref: ${{ github.sha }}", workflow)
