@@ -347,25 +347,71 @@ begin
       Bundle := TFileStream.Create(ABundlePath, fmOpenRead or fmShareDenyNone);
       SetLength(RawMagic, Length(ARTIFACT_SET_MAGIC));
       if Bundle.Read(RawMagic[1], Length(RawMagic)) <> Length(RawMagic) then
+      begin
+        AReason := 'artifact-set-invalid: truncated-magic';
         Exit;
+      end;
       Magic := string(RawMagic);
-      if Magic <> ARTIFACT_SET_MAGIC then Exit;
-      if not ReadUInt64(Bundle, Count) or (Count = 0)
-         or (Count > ARTIFACT_SET_MAX_COUNT) then Exit;
+      if Magic <> ARTIFACT_SET_MAGIC then
+      begin
+        AReason := 'artifact-set-invalid: magic';
+        Exit;
+      end;
+      if not ReadUInt64(Bundle, Count) then
+      begin
+        AReason := 'artifact-set-invalid: truncated-count';
+        Exit;
+      end;
+      if (Count = 0) or (Count > ARTIFACT_SET_MAX_COUNT) then
+      begin
+        AReason := 'artifact-set-invalid: count';
+        Exit;
+      end;
       SetLength(AArtifacts, Count);
       for i := 0 to Count - 1 do
       begin
-        if not ReadString(Bundle, RelativePath)
-           or not ReadString(Bundle, Kind)
-           or (Kind = '')
-           or not ReadUInt64(Bundle, Mode) or (Mode > $1FF)
-           or not ReadUInt64(Bundle, ContentLength)
-           or (ContentLength > QWord(Bundle.Size - Bundle.Position))
-           or not SafeDestination(ABuildRoot, RelativePath, DestinationPath)
-           or PathHasLinkedComponent(ABuildRoot,
-             ExtractFileDir(DestinationPath))
-           or PathEntry(DestinationPath, DestinationIsLink)
-           or (CreatedPaths.IndexOf(DestinationPath) >= 0) then Exit;
+        if not ReadString(Bundle, RelativePath) then
+        begin
+          AReason := 'artifact-set-invalid: relative-path';
+          Exit;
+        end;
+        if not ReadString(Bundle, Kind) or (Kind = '') then
+        begin
+          AReason := 'artifact-set-invalid: kind';
+          Exit;
+        end;
+        if not ReadUInt64(Bundle, Mode) or (Mode > $1FF) then
+        begin
+          AReason := 'artifact-set-invalid: mode';
+          Exit;
+        end;
+        if not ReadUInt64(Bundle, ContentLength)
+           or (ContentLength > QWord(Bundle.Size - Bundle.Position)) then
+        begin
+          AReason := 'artifact-set-invalid: content-length';
+          Exit;
+        end;
+        if not SafeDestination(ABuildRoot, RelativePath, DestinationPath) then
+        begin
+          AReason := 'artifact-set-invalid: destination-path';
+          Exit;
+        end;
+        if PathHasLinkedComponent(ABuildRoot,
+          ExtractFileDir(DestinationPath)) then
+        begin
+          AReason := 'artifact-set-invalid: destination-parent-link';
+          Exit;
+        end;
+        if PathEntry(DestinationPath, DestinationIsLink) then
+        begin
+          AReason := 'artifact-set-invalid: destination-exists';
+          Exit;
+        end;
+        if CreatedPaths.IndexOf(DestinationPath) >= 0 then
+        begin
+          AReason := 'artifact-set-invalid: duplicate-destination';
+          Exit;
+        end;
         CreatedPaths.Add(DestinationPath);
         ForceDirectories(ExtractFileDir(DestinationPath));
         Destination := TFileStream.Create(DestinationPath, fmCreate);
@@ -374,16 +420,25 @@ begin
         finally
           Destination.Free;
         end;
-        if not ApplyArtifactUnixMode(DestinationPath, Mode) then Exit;
+        if not ApplyArtifactUnixMode(DestinationPath, Mode) then
+        begin
+          AReason := 'artifact-set-invalid: destination-mode';
+          Exit;
+        end;
         AArtifacts[i].Kind := Kind;
         AArtifacts[i].Path := DestinationPath;
         AArtifacts[i].Digest := 'sha256:' + SHA256File(DestinationPath);
       end;
-      if Bundle.Position <> Bundle.Size then Exit;
+      if Bundle.Position <> Bundle.Size then
+      begin
+        AReason := 'artifact-set-invalid: trailing-bytes';
+        Exit;
+      end;
       AReason := 'hit';
       Result := True;
     except
-      on E: Exception do AReason := 'artifact-set-invalid';
+      on E: Exception do
+        AReason := 'artifact-set-invalid: exception-' + E.ClassName;
     end;
   finally
     Bundle.Free;

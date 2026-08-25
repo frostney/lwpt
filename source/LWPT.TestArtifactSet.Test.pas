@@ -128,7 +128,7 @@ begin
   end;
   Expect<Boolean>(MaterializeTestArtifactSet(Bundle, DestinationRoot,
     Cached, Reason)).ToBe(False);
-  Expect<string>(Reason).ToBe('artifact-set-invalid');
+  Expect<string>(Reason).ToBe('artifact-set-invalid: content-length');
   Expect<Integer>(Length(Cached)).ToBe(0);
   Expect<Boolean>(FileExists(DestinationRoot + '/first')).ToBe(False);
   Expect<Boolean>(FileExists(DestinationRoot + '/second')).ToBe(False);
@@ -197,7 +197,7 @@ begin
 
   Expect<Boolean>(MaterializeTestArtifactSet(Bundle, DestinationRoot,
     Cached, Reason)).ToBe(False);
-  Expect<string>(Reason).ToBe('artifact-set-invalid');
+  Expect<string>(Reason).ToBe('artifact-set-invalid: destination-exists');
   Expect<string>(ReadBytes(DestinationRoot + '/bin/program')).ToBe(
     'pre-existing bytes');
   Expect<Integer>(Length(Cached)).ToBe(0);

@@ -783,7 +783,8 @@ begin
   WriteTextFile(LogDirectory + '/tests_A.Prepared.Test.pas.log',
     'cache hit: sha256:' + StringOfChar('a', 64) + LineEnding);
   WriteTextFile(LogDirectory + '/tests_B.Prepared.Test.pas.log',
-    'cache miss: no-result: sha256:' + StringOfChar('b', 64) + LineEnding
+    'cache corruption: artifact-set-invalid: destination-exists: sha256:'
+    + StringOfChar('b', 64) + LineEnding
     + 'cache stored: sha256:' + StringOfChar('b', 64) + LineEnding);
   RunResult := Default(TLwptResult);
   RunResult.Stdout := 'test session: s-prepared '
@@ -809,8 +810,9 @@ begin
   Expect<Boolean>(Pos('behavior diagnostics:', ErrorMessage) > 0).ToBe(True);
   Expect<Boolean>(Pos('tests_A.Prepared.Test.pas.log: cache hit: '
     + 'sha256:' + StringOfChar('a', 64), ErrorMessage) > 0).ToBe(True);
-  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache miss: no-result: '
-    + 'sha256:' + StringOfChar('b', 64), ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache corruption: '
+    + 'artifact-set-invalid: destination-exists: sha256:'
+    + StringOfChar('b', 64), ErrorMessage) > 0).ToBe(True);
   Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache stored: sha256:'
     + StringOfChar('b', 64), ErrorMessage) > 0).ToBe(True);
 end;
