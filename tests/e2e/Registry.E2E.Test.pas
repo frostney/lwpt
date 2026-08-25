@@ -243,10 +243,11 @@ begin
   Expect<Integer>(Rejected.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('insecure_transport:', Rejected.Stderr) > 0).ToBe(True);
   ControlDirectory := FScratch + '/control-origin';
+  { DEL crosses both Unix and Windows command-line tokenization unchanged. }
   ControlRejected := RunLwpt(['registry', 'init', '--data-dir',
     ControlDirectory, '--base-url', 'https://localhost:'
     + IntToStr(BasePort + 2), '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
-    '--tls-password-env', TLS_PASSWORD_ENV + #1]);
+    '--tls-password-env', TLS_PASSWORD_ENV + #127]);
   DumpRunFailure('control-character configuration rejection',
     ControlRejected, 1);
   Expect<Integer>(ControlRejected.ExitCode).ToBe(1);
