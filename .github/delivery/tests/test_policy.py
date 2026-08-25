@@ -136,6 +136,47 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertNotIn("x86_64-linux/default", workflow)
         self.assertNotIn("diagnostic:v1", workflow)
 
+    def test_scheduling_diagnostic_has_realistic_hosted_budget(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        diagnostic = (
+            ROOT / ".github/delivery/scheduling-diagnostic.sh"
+        ).read_text(encoding="utf-8")
+        script_poll_seconds = re.search(
+            r'poll_seconds="\$\{LWPT_SCHEDULING_DIAGNOSTIC_POLL_SECONDS:-(\d+)\}"',
+            diagnostic,
+        )
+        script_poll_count = re.search(
+            r'poll_count="\$\{LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT:-(\d+)\}"',
+            diagnostic,
+        )
+        workflow_poll_counts = re.search(
+            r"diagnostic_selector == 'default' && '(\d+)' \|\| "
+            r"inputs\.diagnostic_target == 'x86_64-darwin' && '(\d+)' "
+            r"\|\| '(\d+)'",
+            workflow,
+        )
+        self.assertIsNotNone(script_poll_seconds)
+        self.assertIsNotNone(script_poll_count)
+        self.assertIsNotNone(workflow_poll_counts)
+        scheduling_poll_seconds = int(script_poll_seconds.group(1))
+        scheduling_poll_count = int(script_poll_count.group(1))
+        default_poll_count = int(workflow_poll_counts.group(1))
+        darwin_poll_count = int(workflow_poll_counts.group(2))
+        linux_poll_count = int(workflow_poll_counts.group(3))
+        self.assertEqual(30, scheduling_poll_count)
+        self.assertEqual(84, default_poll_count)
+        self.assertEqual(scheduling_poll_count, darwin_poll_count)
+        self.assertEqual(18, linux_poll_count)
+        # The focused suite was still making progress at 90.072 seconds on
+        # macos-15-intel. Keep approximately one minute beyond that observed
+        # lower bound.
+        self.assertGreaterEqual(
+            scheduling_poll_seconds * darwin_poll_count,
+            150,
+        )
+        self.assertEqual(420, scheduling_poll_seconds * default_poll_count)
+        self.assertEqual(90, scheduling_poll_seconds * linux_poll_count)
+
     def test_test_routes_use_project_selectors_without_runner_tiers(self) -> None:
         pr_workflow = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")
         ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

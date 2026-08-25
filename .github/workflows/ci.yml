@@ -651,5 +651,5 @@ jobs:
         shell: bash
         env:
           LWPT_SCHEDULING_DIAGNOSTIC_SCOPE: ${{ inputs.diagnostic_selector }}
-          LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT: ${{ inputs.diagnostic_selector == 'default' && '84' || '18' }}
+          LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT: ${{ inputs.diagnostic_selector == 'default' && '84' || inputs.diagnostic_target == 'x86_64-darwin' && '30' || '18' }}
         run: .trusted-delivery/.github/delivery/scheduling-diagnostic.sh
