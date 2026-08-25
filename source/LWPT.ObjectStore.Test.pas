@@ -21,6 +21,7 @@ uses
   LWPT.CacheLifecycle,
   LWPT.Core,
   LWPT.ObjectStore,
+  LWPT.ProcessTree,
   TestingPascalLibrary,
   Tests.Scratch;
 
@@ -60,12 +61,42 @@ type
     property Output: string read FOutput;
   end;
 
+  {$IFDEF UNIX}
+  TProtectedStageSpawner = class(TThread)
+  private
+    FErrorMessage: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    property ErrorMessage: string read FErrorMessage;
+  end;
+  {$ENDIF}
+
 var
   ChildPhasePrefix: string;
   InjectPublicationFailure: Boolean;
+  ProtectedStageChild: TProcess;
+  {$IFDEF UNIX}
+  ProtectedStageSpawnAttemptPath: string;
+  ProtectedStageSpawner: TProtectedStageSpawner;
+  {$ENDIF}
+  ProtectedStageChildReadyPath: string;
   ReplacementSource: string;
   StageReadyPath: string;
   StageReleasePath: string;
+
+procedure RemoveMaterializeSource(const ADigest, APath: string);
+begin
+  SysUtils.DeleteFile(APath);
+end;
+
+procedure CorruptMaterializeStage(const ADigest: string;
+  const AStream: TStream);
+begin
+  AStream.Position := 0;
+  AStream.WriteBuffer(ADigest[1], 1);
+end;
 
 type
   TObjectStoreContract = class(TTestSuite)
@@ -89,6 +120,10 @@ type
     procedure TestDigestAddressIsCanonicalAndSharded;
     procedure TestInvalidDigestIsRefused;
     procedure TestAdmitLookupAndMaterialize;
+    procedure TestMaterializeReportsExactFailureStage;
+    {$IFDEF UNIX}
+    procedure TestMaterializeProtectsStageFromChildInheritance;
+    {$ENDIF}
     procedure TestAdmissionHashMismatchPublishesNothing;
     procedure TestCorruptObjectIsQuarantinedAndMisses;
     procedure TestConcurrentValidReplacementIsRestoredAfterQuarantine;
@@ -109,12 +144,60 @@ begin
   Stream.Free;
 end;
 
+function WaitForSignal(const APath: string): Boolean; forward;
+
+{$IFDEF UNIX}
+procedure MarkProtectedStageSpawnAttempt;
+begin
+  WriteSignal(ProtectedStageSpawnAttemptPath);
+end;
+
+constructor TProtectedStageSpawner.Create;
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+end;
+
+procedure TProtectedStageSpawner.Execute;
+begin
+  FErrorMessage := '';
+  try
+    ProtectedStageChild := TProcess.Create(nil);
+    ProtectedStageChild.Executable := '/bin/sh';
+    ProtectedStageChild.Parameters.Add('-c');
+    ProtectedStageChild.Parameters.Add(
+      'printf ready > "$1"; sleep 5');
+    ProtectedStageChild.Parameters.Add('object-store-child');
+    ProtectedStageChild.Parameters.Add(ProtectedStageChildReadyPath);
+    ProtectedStageChild.Options := [poNoConsole];
+    ExecuteUnmanagedProcess(ProtectedStageChild);
+  except
+    on E: Exception do FErrorMessage := E.Message;
+  end;
+end;
+
+procedure AttemptSpawnBeforeStreamProtection(const APath: string);
+begin
+  if Pos('cache-object.', ExtractFileName(APath)) <> 1 then Exit;
+  ProtectedStageSpawnAttemptPath := APath + '.spawn-attempt';
+  ProtectedStageChildReadyPath := APath + '.child-ready';
+  ProcessTreeBeforeUnmanagedSpawnLockTestHook :=
+    MarkProtectedStageSpawnAttempt;
+  ProtectedStageSpawner := TProtectedStageSpawner.Create;
+  ProtectedStageSpawner.Start;
+  if not WaitForSignal(ProtectedStageSpawnAttemptPath) then
+    raise Exception.Create('timed out waiting for concurrent spawn attempt');
+  Sleep(100);
+  if FileExists(ProtectedStageChildReadyPath) then
+    raise Exception.Create(
+      'concurrent child escaped the stream-protection spawn guard');
+end;
+{$ENDIF}
+
 procedure MarkChildPhase(const APhase: string);
 begin
   WriteSignal(ChildPhasePrefix + '.phase-' + APhase);
 end;
-
-function WaitForSignal(const APath: string): Boolean; forward;
 
 procedure PauseAfterStage(const APath: string);
 begin
@@ -428,6 +511,17 @@ end;
 
 procedure TObjectStoreContract.ResetScratch;
 begin
+  ObjectStoreBeforeMaterializeCopyTestHook := nil;
+  ObjectStoreAfterMaterializeCopyTestHook := nil;
+  ObjectStoreAfterMaterializeCopyStreamTestHook := nil;
+  ObjectStoreBeforeStreamProtectionTestHook := nil;
+  {$IFDEF UNIX}
+  ProcessTreeBeforeUnmanagedSpawnLockTestHook := nil;
+  ProtectedStageSpawnAttemptPath := '';
+  ProtectedStageSpawner := nil;
+  {$ENDIF}
+  ProtectedStageChild := nil;
+  ProtectedStageChildReadyPath := '';
   if DirectoryExists(FScratch) then WipeDir(FScratch);
   ForceDirectories(FScratch);
   FStoreRoot := FScratch + '/cache/dependency-archives';
@@ -435,6 +529,66 @@ begin
   WriteBytes(FSource, 'immutable archive bytes'#0'with binary tail');
   FDigest := 'sha256:' + SHA256File(FSource);
 end;
+
+{$IFDEF UNIX}
+procedure TObjectStoreContract.
+  TestMaterializeProtectsStageFromChildInheritance;
+var
+  Destination: string;
+  ErrorCode: Integer;
+  Handle: THandle;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    Store.Admit(FSource, FDigest);
+    ObjectStoreBeforeStreamProtectionTestHook :=
+      AttemptSpawnBeforeStreamProtection;
+    Destination := FScratch + '/project/materialized';
+    Expect<Boolean>(Store.Materialize(FDigest, Destination,
+      FScratch + '/project/tmp')).ToBe(True);
+    Expect<Boolean>(WaitForSignal(ProtectedStageChildReadyPath)).ToBe(True);
+    ProtectedStageSpawner.WaitFor;
+    Expect<string>(ProtectedStageSpawner.ErrorMessage).ToBe('');
+    Expect<Boolean>(Assigned(ProtectedStageChild)).ToBe(True);
+    Expect<Boolean>(ProtectedStageChild.Running).ToBe(True);
+    Handle := FileOpen(Destination, fmOpenRead or fmShareDenyNone);
+    if Handle = THandle(-1) then ErrorCode := GetLastOSError
+    else
+    begin
+      ErrorCode := 0;
+      FileClose(Handle);
+    end;
+    Expect<Integer>(ErrorCode).ToBe(0);
+  finally
+    ObjectStoreBeforeStreamProtectionTestHook := nil;
+    ProcessTreeBeforeUnmanagedSpawnLockTestHook := nil;
+    if Assigned(ProtectedStageSpawner) then
+    begin
+      ProtectedStageSpawner.WaitFor;
+      ProtectedStageSpawner.Free;
+      ProtectedStageSpawner := nil;
+    end;
+    if Assigned(ProtectedStageChild) then
+    begin
+      if ProtectedStageChild.Running then
+        ProtectedStageChild.Terminate(0);
+      ProtectedStageChild.WaitOnExit(2000);
+      ProtectedStageChild.Free;
+      ProtectedStageChild := nil;
+    end;
+    if FileExists(ProtectedStageChildReadyPath) then
+      SysUtils.DeleteFile(ProtectedStageChildReadyPath);
+    if FileExists(ProtectedStageSpawnAttemptPath) then
+      SysUtils.DeleteFile(ProtectedStageSpawnAttemptPath);
+    ProtectedStageChildReadyPath := '';
+    ProtectedStageSpawnAttemptPath := '';
+    Store.Free;
+  end;
+  Expect<string>(ReadBytes(Destination)).ToBe(ReadBytes(FSource));
+end;
+{$ENDIF}
 
 procedure TObjectStoreContract.BeforeAll;
 begin
@@ -558,6 +712,52 @@ begin
       FScratch + '/project/.lwpt/tmp')).ToBe(True);
     Expect<string>(ReadBytes(Destination)).ToBe(ReadBytes(FSource));
     Expect<string>('sha256:' + SHA256File(Destination)).ToBe(FDigest);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TObjectStoreContract.TestMaterializeReportsExactFailureStage;
+var
+  Destination, MissingDigest: string;
+  Failure: TLWPTObjectMaterializeFailure;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    MissingDigest := 'sha256:' + StringOfChar('0', 64);
+    Destination := FScratch + '/project/materialized';
+    Expect<Boolean>(Store.Materialize(MissingDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
+    Expect<Integer>(Ord(Failure)).ToBe(Ord(omfObjectMissing));
+
+    Store.Admit(FSource, FDigest);
+    WriteBytes(Store.ObjectPath(FDigest), 'corrupt');
+    Expect<Boolean>(Store.Materialize(FDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
+    Expect<Integer>(Ord(Failure)).ToBe(Ord(omfVerificationFailed));
+
+    Store.Admit(FSource, FDigest);
+    ObjectStoreBeforeMaterializeCopyTestHook := RemoveMaterializeSource;
+    try
+      Expect<Boolean>(Store.Materialize(FDigest, Destination,
+        FScratch + '/project/tmp', Failure)).ToBe(False);
+      Expect<Integer>(Ord(Failure)).ToBe(Ord(omfCopyFailed));
+    finally
+      ObjectStoreBeforeMaterializeCopyTestHook := nil;
+    end;
+
+    Store.Admit(FSource, FDigest);
+    ObjectStoreAfterMaterializeCopyStreamTestHook :=
+      CorruptMaterializeStage;
+    try
+      Expect<Boolean>(Store.Materialize(FDigest, Destination,
+        FScratch + '/project/tmp', Failure)).ToBe(False);
+      Expect<Integer>(Ord(Failure)).ToBe(Ord(omfStagedHashMismatch));
+    finally
+      ObjectStoreAfterMaterializeCopyStreamTestHook := nil;
+    end;
   finally
     Store.Free;
   end;
@@ -852,6 +1052,12 @@ begin
   Test('invalid digests are refused', TestInvalidDigestIsRefused);
   Test('admission, verified lookup, and materialization preserve bytes',
     TestAdmitLookupAndMaterialize);
+  Test('materialization reports the exact failing object-store stage',
+    TestMaterializeReportsExactFailureStage);
+  {$IFDEF UNIX}
+  Test('materialization protects its staged handle from child inheritance',
+    TestMaterializeProtectsStageFromChildInheritance);
+  {$ENDIF}
   Test('admission refuses a mismatched digest before publication',
     TestAdmissionHashMismatchPublishesNothing);
   Test('corrupt objects are quarantined and become misses',

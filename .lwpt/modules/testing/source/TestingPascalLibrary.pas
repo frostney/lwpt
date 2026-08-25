@@ -123,7 +123,11 @@ implementation
 uses
   DateUtils,
   Generics.Defaults,
-  TypInfo;
+  TypInfo
+  {$IFDEF MSWINDOWS}
+  , Windows
+  {$ENDIF}
+  ;
 
 {$IFDEF DARWIN}
 function Pthread_setname_np(const AName: PChar): Integer; cdecl;
@@ -132,6 +136,54 @@ function Pthread_setname_np(const AName: PChar): Integer; cdecl;
 
 var
   CurrentDescribeSuite: TTestSuite;
+
+{$IFDEF MSWINDOWS}
+const
+  MOVEFILE_WRITE_THROUGH_TESTING = $00000008;
+{$ENDIF}
+
+function ReplaceActiveTestCaseFile(const ATemporaryPath,
+  ATargetPath: string): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  TargetPath, TemporaryPath: UnicodeString;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  TemporaryPath := UnicodeString(ATemporaryPath);
+  TargetPath := UnicodeString(ATargetPath);
+  Result := Windows.MoveFileExW(PWideChar(TemporaryPath), PWideChar(TargetPath),
+    MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH_TESTING);
+  {$ELSE}
+  Result := RenameFile(ATemporaryPath, ATargetPath);
+  {$ENDIF}
+end;
+
+procedure PublishActiveTestCase(const APath, ASuiteName,
+  ATestName: string);
+var
+  MarkerFile: TextFile;
+  TemporaryPath: string;
+begin
+  if APath = '' then Exit;
+  TemporaryPath := APath + '.tmp-' + IntToStr(GetProcessID);
+  try
+    AssignFile(MarkerFile, TemporaryPath);
+    Rewrite(MarkerFile);
+    try
+      WriteLn(MarkerFile, ASuiteName + ' > ' + ATestName);
+      Flush(MarkerFile);
+    finally
+      CloseFile(MarkerFile);
+    end;
+    if not ReplaceActiveTestCaseFile(TemporaryPath, APath) then
+      raise Exception.CreateFmt('failed to publish active test case at %s',
+        [APath]);
+  except
+    SysUtils.DeleteFile(TemporaryPath);
+    raise;
+  end;
+end;
 
 function TestResultToExitCode: Integer;
 var
@@ -340,6 +392,7 @@ end;
 
 procedure TTestRunner.Run;
 var
+  ActiveTestCaseFile: string;
   InventoryMode: string;
   Suite: TTestSuite;
   Test: TTestRegistration;
@@ -351,6 +404,7 @@ begin
   InventoryMode := ConsumeCurrentTestInventoryMode;
   if InventoryMode <> '' then WriteLn(InventoryLine);
   if InventoryMode = TEST_INVENTORY_MODE_ONLY then Halt(0);
+  ActiveTestCaseFile := ConsumeActiveTestCaseFile;
 
   WriteLn;
   WriteLn('Running tests...');
@@ -371,6 +425,7 @@ begin
         DiagnosticThreadName := Copy('test: ' + Test.Name, 1, 63);
         Pthread_setname_np(PChar(DiagnosticThreadName));
         {$ENDIF}
+        PublishActiveTestCase(ActiveTestCaseFile, Suite.Name, Test.Name);
         RunTest(Suite, Test);
       end;
 

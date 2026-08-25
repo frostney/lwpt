@@ -9,6 +9,7 @@ unit LWPT.ObjectStore;
 interface
 
 uses
+  Classes,
   SysUtils,
 
   LWPT.CacheLifecycle,
@@ -21,11 +22,24 @@ const
 type
   ELWPTObjectStoreError = class(ELWPTError);
 
+  TLWPTObjectMaterializeFailure = (
+    omfNone,
+    omfObjectMissing,
+    omfVerificationFailed,
+    omfCopyFailed,
+    omfStagedHashMismatch
+  );
+
   {$IFDEF OBJECTSTORE_TESTING}
   TLWPTObjectStoreBeforeQuarantineHook = procedure(const APath: string);
   TLWPTObjectStoreAfterStageHook = procedure(const APath: string);
   TLWPTObjectStorePublicationHook = procedure(const AStaged,
     ADestination: string);
+  TLWPTObjectStoreMaterializeHook = procedure(const ADigest,
+    APath: string);
+  TLWPTObjectStoreMaterializeStreamHook = procedure(
+    const ADigest: string; const AStream: TStream);
+  TLWPTObjectStoreStreamOpenedHook = procedure(const APath: string);
   {$ENDIF}
 
   TLWPTImmutableObjectStore = class
@@ -38,7 +52,8 @@ type
     function RepairCorruptObjectLocked(const ADigest: string;
       out APath: string): Boolean;
     function LookupWithObjectGuard(const ADigest: string;
-      out APath: string): Boolean;
+      out APath: string; out AFailure:
+      TLWPTObjectMaterializeFailure): Boolean;
     function Quarantine(const APath, ADigest: string;
       out AQuarantinePath: string): Boolean;
   public
@@ -52,7 +67,13 @@ type
       out ALease: TObject; out AInserted: Boolean): string;
     procedure DiscardRetained(const ADigest: string);
     function Materialize(const ADigest, ADestination,
-      ATmpRoot: string): Boolean;
+      ATmpRoot: string): Boolean; overload;
+    function Materialize(const ADigest, ADestination,
+      ATmpRoot: string; out AFailure:
+      TLWPTObjectMaterializeFailure): Boolean; overload;
+    function MaterializeRetained(const ADigest, ADestination,
+      ATmpRoot: string; out AFailure: TLWPTObjectMaterializeFailure;
+      out ALease: TObject): Boolean;
     property Root: string read FRoot;
   end;
 
@@ -60,6 +81,8 @@ function ResolveCacheRoot: string;
 function ResolveCacheRootFromValues(const AOverride, AHome,
   AXDGCacheHome, ALocalAppData: string): string;
 function DependencyArchiveStoreRoot(const ACacheRoot: string): string;
+function ObjectMaterializeFailureName(
+  const AFailure: TLWPTObjectMaterializeFailure): string;
 
 {$IFDEF OBJECTSTORE_TESTING}
 var
@@ -68,9 +91,137 @@ var
   ObjectStoreAfterStageTestHook: TLWPTObjectStoreAfterStageHook;
   ObjectStoreBeforePublicationTestHook: TLWPTObjectStorePublicationHook;
   ObjectStoreAfterPublicationTestHook: TLWPTObjectStorePublicationHook;
+  ObjectStoreBeforeMaterializeCopyTestHook:
+    TLWPTObjectStoreMaterializeHook;
+  ObjectStoreAfterMaterializeCopyTestHook:
+    TLWPTObjectStoreMaterializeHook;
+  ObjectStoreAfterMaterializeCopyStreamTestHook:
+    TLWPTObjectStoreMaterializeStreamHook;
+  ObjectStoreBeforeStreamProtectionTestHook:
+    TLWPTObjectStoreStreamOpenedHook;
 {$ENDIF}
 
 implementation
+
+uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
+  LWPT.ProcessTree;
+
+{$IFDEF UNIX}
+const
+  {$IFDEF LINUX}
+  FD_CLOEXEC_LWPT = 1;
+  {$ELSE}
+  FD_CLOEXEC_LWPT = FD_CLOEXEC;
+  {$ENDIF}
+
+procedure ProtectStreamFromChildInheritance(const AStream: TFileStream;
+  const APath: string);
+var
+  ErrorCode: Integer;
+begin
+  if FpFcntl(AStream.Handle, F_SETFD, FD_CLOEXEC_LWPT) = 0 then Exit;
+  ErrorCode := FpGetErrNo;
+  raise ELWPTObjectStoreError.CreateFmt(
+    'failed to protect object-store stream from child inheritance at %s '
+    + '(system error %d)', [APath, ErrorCode]);
+end;
+
+function OpenProtectedObjectStream(const APath: string;
+  const AMode: Word): TFileStream;
+begin
+  Result := nil;
+  BeginProcessHandleSetup;
+  try
+    Result := TFileStream.Create(APath, AMode);
+    try
+      {$IFDEF OBJECTSTORE_TESTING}
+      if Assigned(ObjectStoreBeforeStreamProtectionTestHook) then
+        ObjectStoreBeforeStreamProtectionTestHook(APath);
+      {$ENDIF}
+      ProtectStreamFromChildInheritance(Result, APath);
+    except
+      Result.Free;
+      Result := nil;
+      raise;
+    end;
+  finally
+    EndProcessHandleSetup;
+  end;
+end;
+{$ENDIF}
+
+function CopyFileContentAndHash(const ASrc, ADst, ADigest: string;
+  out AHash: string): Boolean;
+var
+  Buffer: TBytes;
+  CopyCompleted: Boolean;
+  Destination, Source: TFileStream;
+begin
+  Result := False;
+  AHash := '';
+  if not FileExists(ASrc) then Exit;
+  CopyCompleted := False;
+  try
+    {$IFDEF UNIX}
+    Source := OpenProtectedObjectStream(ASrc,
+      fmOpenRead or fmShareDenyNone);
+    {$ELSE}
+    Source := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
+    {$ENDIF}
+    try
+      {$IFDEF UNIX}
+      Destination := OpenProtectedObjectStream(ADst, fmCreate);
+      {$ELSE}
+      Destination := TFileStream.Create(ADst, fmCreate);
+      {$ENDIF}
+      try
+        if Source.Size > 0 then
+          Destination.CopyFrom(Source, Source.Size);
+        CopyCompleted := True;
+        { TFileStream creates staged files read-write. Read back through the
+          owned handle without a second FPC open; close-on-exec keeps its lock
+          from surviving in a compiler after this process closes the stream. }
+      {$IFDEF OBJECTSTORE_TESTING}
+        if Assigned(ObjectStoreAfterMaterializeCopyTestHook) then
+          ObjectStoreAfterMaterializeCopyTestHook(ADigest, ADst);
+        if Assigned(ObjectStoreAfterMaterializeCopyStreamTestHook) then
+          ObjectStoreAfterMaterializeCopyStreamTestHook(ADigest,
+            Destination);
+      {$ENDIF}
+        Destination.Position := 0;
+        SetLength(Buffer, Destination.Size);
+        if Destination.Size > 0 then
+          Destination.ReadBuffer(Buffer[0], Destination.Size);
+        AHash := SHA256Hex(Buffer);
+      finally
+        Destination.Free;
+      end;
+    finally
+      Source.Free;
+    end;
+  except
+    if CopyCompleted then raise;
+    Exit(False);
+  end;
+  Result := True;
+end;
+
+function ObjectMaterializeFailureName(
+  const AFailure: TLWPTObjectMaterializeFailure): string;
+begin
+  case AFailure of
+    omfNone: Result := 'none';
+    omfObjectMissing: Result := 'object-missing';
+    omfVerificationFailed: Result := 'verification-failed';
+    omfCopyFailed: Result := 'copy-failed';
+    omfStagedHashMismatch: Result := 'staged-hash-mismatch';
+  else
+    Result := 'unknown';
+  end;
+end;
 
 function IsAbsolutePath(const APath: string): Boolean;
 begin
@@ -303,16 +454,27 @@ begin
 end;
 
 function TLWPTImmutableObjectStore.LookupWithObjectGuard(
-  const ADigest: string; out APath: string): Boolean;
+  const ADigest: string; out APath: string; out AFailure:
+  TLWPTObjectMaterializeFailure): Boolean;
 var
   Corrupt: Boolean;
   MutationLease: TObject;
 begin
+  AFailure := omfNone;
   Result := VerifyObject(ADigest, APath, Corrupt);
-  if not Result and not Corrupt then Exit;
+  if not Result and not Corrupt then
+  begin
+    AFailure := omfObjectMissing;
+    Exit;
+  end;
   MutationLease := FCacheLifecycle.AcquireMutation;
   try
-    if Corrupt then Result := RepairCorruptObjectLocked(ADigest, APath);
+    if Corrupt then
+    begin
+      Result := RepairCorruptObjectLocked(ADigest, APath);
+      if not Result then
+        AFailure := omfVerificationFailed;
+    end;
     if Result then FCacheLifecycle.TouchObjectLocked(ADigest);
   finally
     MutationLease.Free;
@@ -323,12 +485,13 @@ function TLWPTImmutableObjectStore.Lookup(const ADigest: string;
   out APath: string): Boolean;
 var
   Digest: string;
+  Failure: TLWPTObjectMaterializeFailure;
   ObjectLease: TObject;
 begin
   Digest := CanonicalDigest(ADigest);
   ObjectLease := FCacheLifecycle.AcquireObject(Digest);
   try
-    Result := LookupWithObjectGuard(Digest, APath);
+    Result := LookupWithObjectGuard(Digest, APath, Failure);
   finally
     ObjectLease.Free;
   end;
@@ -349,6 +512,7 @@ function TLWPTImmutableObjectStore.AdmitRetained(const ASourcePath,
   out AInserted: Boolean): string;
 var
   Expected, Existing, TmpRoot, Staged, Actual: string;
+  Failure: TLWPTObjectMaterializeFailure;
   {$IFDEF OBJECTSTORE_TESTING}
   PublishedStaged: string;
   {$ENDIF}
@@ -375,7 +539,7 @@ begin
   ObjectLease := FCacheLifecycle.AcquireObject(Expected);
   try
     try
-      if LookupWithObjectGuard(Expected, Existing) then
+      if LookupWithObjectGuard(Expected, Existing, Failure) then
       begin
         ALease := ObjectLease;
         ObjectLease := nil;
@@ -492,34 +656,80 @@ end;
 function TLWPTImmutableObjectStore.Materialize(const ADigest,
   ADestination, ATmpRoot: string): Boolean;
 var
+  Failure: TLWPTObjectMaterializeFailure;
+begin
+  Result := Materialize(ADigest, ADestination, ATmpRoot, Failure);
+end;
+
+function TLWPTImmutableObjectStore.Materialize(const ADigest,
+  ADestination, ATmpRoot: string; out AFailure:
+  TLWPTObjectMaterializeFailure): Boolean;
+var
+  Lease: TObject;
+begin
+  Lease := nil;
+  try
+    Result := MaterializeRetained(ADigest, ADestination, ATmpRoot,
+      AFailure, Lease);
+  finally
+    Lease.Free;
+  end;
+end;
+
+function TLWPTImmutableObjectStore.MaterializeRetained(const ADigest,
+  ADestination, ATmpRoot: string; out AFailure:
+  TLWPTObjectMaterializeFailure; out ALease: TObject): Boolean;
+var
   Expected, SourcePath, Staged, Actual: string;
   ObjectLease: TObject;
 begin
+  Result := False;
+  AFailure := omfNone;
+  ALease := nil;
   Expected := CanonicalDigest(ADigest);
   ObjectLease := FCacheLifecycle.AcquireObject(Expected);
   try
-    if not LookupWithObjectGuard(Expected, SourcePath) then Exit(False);
-    ForceDirectories(ATmpRoot);
-    Staged := MakeTmpPath(ATmpRoot, 'cache-object');
-    if not CopyFileContent(SourcePath, Staged) then
-    begin
-      if FileExists(Staged) then SysUtils.DeleteFile(Staged);
-      Exit(False);
-    end;
     try
-      Actual := 'sha256:' + SHA256File(Staged);
-      if Actual <> Expected then
-      begin
-        SysUtils.DeleteFile(Staged);
-        Exit(False);
+      try
+        if not LookupWithObjectGuard(Expected, SourcePath, AFailure) then Exit;
+        ForceDirectories(ATmpRoot);
+        Staged := MakeTmpPath(ATmpRoot, 'cache-object');
+        {$IFDEF OBJECTSTORE_TESTING}
+        if Assigned(ObjectStoreBeforeMaterializeCopyTestHook) then
+          ObjectStoreBeforeMaterializeCopyTestHook(Expected, SourcePath);
+        {$ENDIF}
+        try
+          if not CopyFileContentAndHash(SourcePath, Staged, Expected,
+            Actual) then
+          begin
+            if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+            AFailure := omfCopyFailed;
+            Exit;
+          end;
+          Actual := 'sha256:' + Actual;
+          if Actual <> Expected then
+          begin
+            SysUtils.DeleteFile(Staged);
+            AFailure := omfStagedHashMismatch;
+            Exit;
+          end;
+          if not AtomicMoveFile(Staged, ADestination) then
+            raise ELWPTObjectStoreError.CreateFmt(
+              'failed to materialize object %s at %s',
+              [Expected, ADestination]);
+          AFailure := omfNone;
+          Result := True;
+        except
+          if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+          raise;
+        end;
+      finally
+        ALease := ObjectLease;
+        ObjectLease := nil;
       end;
-      if not AtomicMoveFile(Staged, ADestination) then
-        raise ELWPTObjectStoreError.CreateFmt(
-          'failed to materialize object %s at %s',
-          [Expected, ADestination]);
-      Result := True;
     except
-      if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+      ALease.Free;
+      ALease := nil;
       raise;
     end;
   finally

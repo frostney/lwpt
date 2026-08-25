@@ -9,7 +9,7 @@
   install crashes mid-run; it must be safe on a clean tree and
   effective on a dirty one.
 
-  Seven assertions:
+  Eight assertions:
     1. Repair on a clean tree is a no-op exit 0 (idempotent).
     2. Stale .lwpt/install.lock is removed.
     3. .lwpt/tmp/ contents are removed; the directory itself stays.
@@ -18,7 +18,8 @@
     5. Dead machine-wide worker requests are reclaimed and diagnosed.
     6. Historical relocated sessions remain reclaimable after the override
        is absent.
-    7. Shared-cache corruption and incomplete state are repaired repeatably. }
+    7. Shared-cache corruption and incomplete state are repaired repeatably.
+    8. Transitive build references with missing artifacts are removed. }
 
 program Repair.Test;
 
@@ -54,6 +55,7 @@ type
     procedure TestRepairReclaimsFailedBuildSession;
     procedure TestRepairReclaimsHistoricalRelocatedSession;
     procedure TestRepairRecoversSharedCache;
+    procedure TestRepairRemovesTransitiveBuildReference;
     procedure TestRepairReclaimsWorkerRequests;
   end;
 
@@ -309,6 +311,37 @@ begin
     R.Stdout) > 0).ToBe(True);
 end;
 
+procedure TRepairE2E.TestRepairRemovesTransitiveBuildReference;
+const
+  FINGERPRINT_HEX =
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  MANIFEST_HEX =
+    'baa8500429609b519b80a8937d8f83e861c3326d08d75264a54a2c2c7b9fe1e1';
+  ARTIFACT_HEX =
+    'd64f66647820cf67d9fc5ca385a2645de43ea5b5e00c787c530e9e49371ff6ed';
+var
+  ManifestPath, ReferencePath: string;
+  R: TLwptResult;
+begin
+  ManifestPath := FCacheRoot + '/build-results/objects/sha256/'
+    + Copy(MANIFEST_HEX, 1, 2) + '/' + Copy(MANIFEST_HEX, 3, MaxInt);
+  ReferencePath := FCacheRoot + '/build-results/refs/sha256/'
+    + Copy(FINGERPRINT_HEX, 1, 2) + '/'
+    + Copy(FINGERPRINT_HEX, 3, MaxInt);
+  WriteCacheBytes(ManifestPath,
+    'schema = 1'#10
+    + 'fingerprint = "sha256:' + FINGERPRINT_HEX + '"'#10
+    + 'artifact_digest = "sha256:' + ARTIFACT_HEX + '"'#10
+    + 'artifact_kind = "executable"'#10
+    + 'unix_mode = 0'#10);
+  WriteCacheBytes(ReferencePath, 'sha256:' + MANIFEST_HEX + #10);
+
+  R := RunRepair;
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(ManifestPath)).ToBe(True);
+  Expect<Boolean>(FileExists(ReferencePath)).ToBe(False);
+end;
+
 procedure TRepairE2E.SetupTests;
 begin
   Test('repair on a clean tree is a no-op exit 0',
@@ -323,6 +356,8 @@ begin
     TestRepairReclaimsHistoricalRelocatedSession);
   Test('shared cache recovery is explicit and repeatable',
     TestRepairRecoversSharedCache);
+  Test('repair removes a transitive build reference with no artifact',
+    TestRepairRemovesTransitiveBuildReference);
   Test('repair reclaims dead machine-wide worker requests',
     TestRepairReclaimsWorkerRequests);
 end;

@@ -55,9 +55,11 @@ declare stack membership.
 Diagnostics are remediation tools, never delivery proof. The trusted endpoint
 accepts only repository-declared targets and test selectors, refuses forks and
 stale heads, and dispatches no arbitrary command. A new diagnostic for the same
-PR cancels its superseded diagnostic run. The initial allow-list covers Windows
-default, E2E, and TLS slices plus bounded Intel-Darwin selected-scheduling and
-ordinary-path probes that capture a native process sample on timeout. `full-ci`
+PR cancels its superseded diagnostic run. The allow-list covers Windows
+default, E2E, and TLS slices, bounded ARM- and Intel-Darwin scheduling,
+Intel-Darwin ordinary-path probes, and the x86_64 Linux scheduling probe. Both
+Darwin targets capture native process samples on timeout; Linux captures the
+active test case and `/proc` process and thread blocking state. `full-ci`
 is a terminal promotion:
 the candidate must be marked `ci:full-required`, integrated with its current
 base, green in exact-head PR CI, and converged under the active review policy

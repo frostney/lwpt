@@ -22,7 +22,10 @@ uses
   Tests.Scratch,
 
   LWPT.BuildSession,
+  LWPT.CacheLifecycle,
+  LWPT.Command.Testing,
   LWPT.Core,
+  LWPT.ObjectStore,
   LWPT.ProcessTree,
   LWPT.ProgressReporter,
   LWPT.WorkerBudget;
@@ -60,6 +63,8 @@ const
   SiblingFailureReadySuffix = '-failure-ready';
   SiblingCancellationReceivedSuffix = '-cancellation-received';
   SiblingFanoutObservedSuffix = '-fanout-observed';
+  FixtureSetupModeName = 'fixture-setup-mode';
+  FixtureSetupReadySuffix = '-setup-ready';
   NestedCompilerNaturalExitSuffix = '-natural-exit';
   NestedCompilerStartedAtSuffix = '-started-at';
   SiblingSlowSources: array[0..5] of string = (
@@ -141,12 +146,23 @@ type
   TTestScheduling = class(TTestSuite)
   private
     FScratch: string;
+    FPreparedCacheDiagnostics: string;
     procedure ResetProject(const ABail: Integer);
     procedure WriteMarkerProgram(const AFileName, AMarker: string;
       const AExitCode: Integer);
     procedure WriteOverlapProgram(const AFileName, AOwnMarker,
       AOtherMarker: string);
     procedure WriteBuildProject(const AProjectRoot: string);
+    procedure PrepareTestFixtures(const ASelectors,
+      AReadyMarkers: array of string);
+    function SessionLogOccurrenceCount(const ARun: TLwptResult;
+      const ANeedle: string): Integer; overload;
+    function SessionLogOccurrenceCount(const ARun: TLwptResult;
+      const ANeedle: string; out AMatchingLines: string): Integer; overload;
+    function SessionCacheDecisionDiagnostics(
+      const ARun: TLwptResult): string;
+    procedure AssertPreparedFixturesUsed(const ARun: TLwptResult;
+      const AExpectedCount: Integer);
     function RunTests(const AArgs: array of string): TLwptResult;
     function RunTestsWithCompilerProxy(const AArgs: array of string;
       const AProxyMode, APIDFile: string;
@@ -156,13 +172,16 @@ type
       const AProjectName: string);
     {$ENDIF}
     function RunTestsWithHeartbeat(const AArgs: array of string;
-      const AHeartbeatMilliseconds: Integer): TLwptResult;
+      const AHeartbeatMilliseconds: Integer;
+      const ATimeoutMilliseconds: QWord = 0): TLwptResult;
   protected
     procedure BeforeAll; override;
     procedure BeforeEach; override;
   public
     procedure SetupTests; override;
     procedure TestDefaultJobsOverlap;
+    procedure TestCacheUnavailableDiagnosticIsBoundedSingleLine;
+    procedure TestPreparedCacheFailureReportsSourceDecisions;
     procedure TestJobsOneRunsInSourceOrder;
     procedure TestBailZeroOverridesManifestAndRunsAll;
     procedure TestCompileFailureCountsTowardBail;
@@ -395,6 +414,19 @@ begin
   Result := StringReplace(AOutput, '\', '/', [rfReplaceAll]);
 end;
 
+function OccurrenceCount(const ANeedle, AText: string): Integer;
+var
+  Offset: Integer;
+begin
+  Result := 0;
+  Offset := Pos(ANeedle, AText);
+  while Offset > 0 do
+  begin
+    Inc(Result);
+    Offset := Pos(ANeedle, AText, Offset + Length(ANeedle));
+  end;
+end;
+
 function HasProcessArgument(const AValue: string): Boolean;
 var
   ArgumentIndex: Integer;
@@ -415,12 +447,14 @@ begin
   RecursiveDelete(FScratch);
   ForceDirectories(FScratch + '/tests');
   ForceDirectories(FScratch + '/control');
+  FPreparedCacheDiagnostics := '';
 end;
 
 procedure TTestScheduling.ResetProject(const ABail: Integer);
 begin
   RecursiveDelete(FScratch + '/tests');
   RecursiveDelete(FScratch + '/.lwpt');
+  RecursiveDelete(FScratch + '/shared-cache');
   RecursiveDelete(FScratch + '/worker-state');
   RecursiveDelete(FScratch + '/control');
   ForceDirectories(FScratch + '/tests');
@@ -458,6 +492,14 @@ begin
     + 'uses Classes, SysUtils;'#10
     + 'var Started: TDateTime;'#10
     + 'begin'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
+    + '  begin'#10
+    + '    TFileStream.Create('
+    + PascalString(FScratch + '/control/' + AOwnMarker
+      + FixtureSetupReadySuffix) + ', fmCreate).Free;'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  TFileStream.Create('
     + PascalString(FScratch + '/control/' + AOwnMarker + '-ready')
     + ', fmCreate).Free;'#10
@@ -501,6 +543,280 @@ begin
     + 'end.'#10);
 end;
 
+procedure TTestScheduling.PrepareTestFixtures(const ASelectors,
+  AReadyMarkers: array of string);
+var
+  Args: array of string;
+  Index: Integer;
+  SetupResult: TLwptResult;
+  SetupTimeoutMilliseconds: QWord;
+begin
+  if Length(ASelectors) <> Length(AReadyMarkers) then
+    Fail('fixture setup selectors and readiness markers must match');
+  if Length(ASelectors) = 0 then Fail('fixture setup requires a selector');
+  TFileStream.Create(FScratch + '/control/' + FixtureSetupModeName,
+    fmCreate).Free;
+  SetLength(Args, Length(ASelectors) + 1);
+  for Index := 0 to High(ASelectors) do Args[Index] := ASelectors[Index];
+  Args[High(Args)] := '--jobs=' + IntToStr(Length(ASelectors));
+  SetupTimeoutMilliseconds := QWord(ProcessStartupCeilingSeconds) * 1000
+    * QWord(Length(ASelectors));
+  try
+    SetupResult := RunTestsWithHeartbeat(Args, 0, SetupTimeoutMilliseconds);
+    DumpRunFailure('fixture setup run', SetupResult, 0);
+    if SetupResult.TimedOut then
+      Fail('fixture setup exceeded its parent-owned '
+        + UIntToStr(SetupTimeoutMilliseconds) + ' ms deadline');
+    Expect<Integer>(SetupResult.ExitCode).ToBe(0);
+    FPreparedCacheDiagnostics :=
+      SessionCacheDecisionDiagnostics(SetupResult);
+    { Ready markers prove bounded setup completion. Each caller immediately
+      proves exact direct-cache reuse and rejects every compilation path. }
+    for Index := 0 to High(AReadyMarkers) do
+      Expect<Boolean>(FileExists(FScratch + '/control/'
+        + AReadyMarkers[Index] + FixtureSetupReadySuffix)).ToBe(True);
+  finally
+    RecursiveDelete(FScratch + '/control');
+    ForceDirectories(FScratch + '/control');
+  end;
+end;
+
+function TTestScheduling.SessionLogOccurrenceCount(const ARun: TLwptResult;
+  const ANeedle: string): Integer;
+var
+  MatchingLines: string;
+begin
+  Result := SessionLogOccurrenceCount(ARun, ANeedle, MatchingLines);
+end;
+
+function TTestScheduling.SessionLogOccurrenceCount(const ARun: TLwptResult;
+  const ANeedle: string; out AMatchingLines: string): Integer;
+const
+  SessionReferencePrefix = ' (';
+  TestSessionPrefix = 'test session: ';
+var
+  LineIndex: Integer;
+  LogContent, LogDirectory, LogPath, SessionReference: string;
+  LogSearch: TSearchRec;
+  LogLines: TStringList;
+  ReferenceEnd, ReferenceStart, SessionStart: Integer;
+begin
+  Result := 0;
+  AMatchingLines := '';
+  SessionStart := Pos(TestSessionPrefix, ARun.Stdout);
+  if SessionStart = 0 then Fail('test run did not report its session');
+  ReferenceStart := Pos(SessionReferencePrefix, ARun.Stdout, SessionStart);
+  if ReferenceStart = 0 then Fail('test run did not report its session path');
+  Inc(ReferenceStart, Length(SessionReferencePrefix));
+  ReferenceEnd := Pos(')', ARun.Stdout, ReferenceStart);
+  if ReferenceEnd = 0 then Fail('test run reported an invalid session path');
+  SessionReference := Copy(ARun.Stdout, ReferenceStart,
+    ReferenceEnd - ReferenceStart);
+  LogDirectory := FScratch + '/' + SessionReference + '/logs';
+  if not DirectoryExists(LogDirectory) then
+    Fail('test run session log directory does not exist');
+  if FindFirst(IncludeTrailingPathDelimiter(LogDirectory) + '*.log',
+    faAnyFile, LogSearch) <> 0 then
+    Fail('test run session contains no compiler logs');
+  try
+    repeat
+      if (LogSearch.Attr and faDirectory) = 0 then
+      begin
+        LogPath := IncludeTrailingPathDelimiter(LogDirectory) + LogSearch.Name;
+        LogContent := ReadBinaryFile(LogPath);
+        Inc(Result, OccurrenceCount(ANeedle, LogContent));
+        LogLines := TStringList.Create;
+        try
+          LogLines.Text := LogContent;
+          for LineIndex := 0 to LogLines.Count - 1 do
+            if Pos(ANeedle, LogLines[LineIndex]) > 0 then
+            begin
+              if AMatchingLines <> '' then AMatchingLines :=
+                AMatchingLines + ' | ';
+              AMatchingLines := AMatchingLines + LogSearch.Name + ': '
+                + LogLines[LineIndex];
+            end;
+        finally
+          LogLines.Free;
+        end;
+      end;
+    until FindNext(LogSearch) <> 0;
+  finally
+    FindClose(LogSearch);
+  end;
+end;
+
+function TTestScheduling.SessionCacheDecisionDiagnostics(
+  const ARun: TLwptResult): string;
+var
+  MatchingLines: string;
+
+  procedure AppendDecision(const ANeedle: string);
+  begin
+    SessionLogOccurrenceCount(ARun, ANeedle, MatchingLines);
+    if MatchingLines = '' then Exit;
+    if Result <> '' then Result := Result + ' | ';
+    Result := Result + MatchingLines;
+  end;
+
+begin
+  Result := '';
+  AppendDecision('cache hit: sha256:');
+  AppendDecision('cache wait hit: sha256:');
+  AppendDecision('cache takeover hit: sha256:');
+  AppendDecision('cache miss:');
+  AppendDecision('cache corruption:');
+  AppendDecision('cache bypass:');
+  AppendDecision('cache stored:');
+  AppendDecision('cache store skipped:');
+end;
+
+procedure TTestScheduling.AssertPreparedFixturesUsed(const ARun: TLwptResult;
+  const AExpectedCount: Integer);
+var
+  CacheBypassCount, CacheCorruptionCount, CacheHitCount, CacheMissCount,
+    CacheStoreCount, CacheTakeoverHitCount, CacheWaitHitCount,
+    StoreSkippedCount: Integer;
+  CacheBypassLines, CacheCorruptionLines, CacheHitLines, CacheMissLines,
+    CacheStoreLines, CacheTakeoverHitLines, CacheWaitHitLines,
+    DiagnosticLines, DiagnosticSuffix, StoreSkippedLines: string;
+begin
+  CacheHitCount := SessionLogOccurrenceCount(ARun, 'cache hit: sha256:',
+    CacheHitLines);
+  CacheWaitHitCount := SessionLogOccurrenceCount(ARun,
+    'cache wait hit: sha256:', CacheWaitHitLines);
+  CacheTakeoverHitCount := SessionLogOccurrenceCount(ARun,
+    'cache takeover hit: sha256:', CacheTakeoverHitLines);
+  CacheMissCount := SessionLogOccurrenceCount(ARun, 'cache miss:',
+    CacheMissLines);
+  CacheCorruptionCount := SessionLogOccurrenceCount(ARun,
+    'cache corruption:', CacheCorruptionLines);
+  CacheBypassCount := SessionLogOccurrenceCount(ARun, 'cache bypass:',
+    CacheBypassLines);
+  CacheStoreCount := SessionLogOccurrenceCount(ARun, 'cache stored:',
+    CacheStoreLines);
+  StoreSkippedCount := SessionLogOccurrenceCount(ARun,
+    'cache store skipped:', StoreSkippedLines);
+  DiagnosticLines := SessionCacheDecisionDiagnostics(ARun);
+  DiagnosticSuffix := '';
+  if FPreparedCacheDiagnostics <> '' then
+    DiagnosticSuffix := '; setup diagnostics: '
+      + FPreparedCacheDiagnostics;
+  if DiagnosticLines <> '' then
+    DiagnosticSuffix := DiagnosticSuffix + '; behavior diagnostics: '
+      + DiagnosticLines;
+  if (CacheHitCount <> AExpectedCount) or (CacheWaitHitCount <> 0)
+     or (CacheTakeoverHitCount <> 0) or (CacheMissCount <> 0)
+     or (CacheCorruptionCount <> 0) or (CacheBypassCount <> 0)
+     or (CacheStoreCount <> 0) or (StoreSkippedCount <> 0) then
+    Fail('behavior run cache proof failed: direct hits '
+      + IntToStr(CacheHitCount) + '/' + IntToStr(AExpectedCount)
+      + ', wait hits ' + IntToStr(CacheWaitHitCount) + ', takeover hits '
+      + IntToStr(CacheTakeoverHitCount) + ', misses '
+      + IntToStr(CacheMissCount) + ', corruptions '
+      + IntToStr(CacheCorruptionCount) + ', bypasses '
+      + IntToStr(CacheBypassCount) + ', stores '
+      + IntToStr(CacheStoreCount) + ', store skips '
+      + IntToStr(StoreSkippedCount) + DiagnosticSuffix);
+end;
+
+procedure TTestScheduling.TestCacheUnavailableDiagnosticIsBoundedSingleLine;
+var
+  Diagnostic, ErrorMessage, LogDirectory: string;
+  Raised: Boolean;
+  RunResult: TLwptResult;
+begin
+  Diagnostic := CacheUnavailableDiagnostic('EProbe',
+    'first'#13#10'second'#9'third'#0'fourth');
+  Expect<string>(Diagnostic).ToBe(
+    'cache bypass: unavailable (EProbe: first  second third fourth)');
+  Diagnostic := CacheUnavailableDiagnostic(StringOfChar('C', 80),
+    StringOfChar('m', 300));
+  Expect<string>(Diagnostic).ToBe('cache bypass: unavailable ('
+    + StringOfChar('C', 64) + '...: ' + StringOfChar('m', 256) + '...)');
+
+  LogDirectory := FScratch + '/.lwpt/sessions/s-diagnostic/logs';
+  ForceDirectories(LogDirectory);
+  WriteTextFile(LogDirectory + '/fixture.log',
+    'cache bypass: unavailable (EProbe: rendered detail)' + LineEnding);
+  RunResult := Default(TLwptResult);
+  RunResult.Stdout := 'test session: s-diagnostic '
+    + '(.lwpt/sessions/s-diagnostic)' + LineEnding;
+  Raised := False;
+  ErrorMessage := '';
+  try
+    AssertPreparedFixturesUsed(RunResult, 0);
+  except
+    on E: ETestAssertionError do
+    begin
+      Raised := True;
+      ErrorMessage := E.Message;
+    end;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(Pos('diagnostics: fixture.log: cache bypass: unavailable '
+    + '(EProbe: rendered detail)', ErrorMessage) > 0).ToBe(True);
+end;
+
+procedure TTestScheduling.TestPreparedCacheFailureReportsSourceDecisions;
+var
+  ErrorMessage, LogDirectory, SetupLogDirectory: string;
+  Raised: Boolean;
+  RunResult, SetupResult: TLwptResult;
+begin
+  SetupLogDirectory := FScratch + '/.lwpt/sessions/s-setup/logs';
+  ForceDirectories(SetupLogDirectory);
+  WriteTextFile(SetupLogDirectory + '/tests_A.Prepared.Test.pas.log',
+    'cache miss: no-result: sha256:' + StringOfChar('c', 64) + LineEnding
+    + 'cache stored: sha256:' + StringOfChar('c', 64) + LineEnding);
+  WriteTextFile(SetupLogDirectory + '/tests_B.Prepared.Test.pas.log',
+    'cache miss: no-result: sha256:' + StringOfChar('d', 64) + LineEnding
+    + 'cache store skipped: inputs changed during compilation' + LineEnding);
+  SetupResult := Default(TLwptResult);
+  SetupResult.Stdout := 'test session: s-setup '
+    + '(.lwpt/sessions/s-setup)' + LineEnding;
+  FPreparedCacheDiagnostics :=
+    SessionCacheDecisionDiagnostics(SetupResult);
+
+  LogDirectory := FScratch + '/.lwpt/sessions/s-prepared/logs';
+  ForceDirectories(LogDirectory);
+  WriteTextFile(LogDirectory + '/tests_A.Prepared.Test.pas.log',
+    'cache hit: sha256:' + StringOfChar('a', 64) + LineEnding);
+  WriteTextFile(LogDirectory + '/tests_B.Prepared.Test.pas.log',
+    'cache corruption: artifact-set-invalid: destination-exists: sha256:'
+    + StringOfChar('b', 64) + LineEnding
+    + 'cache stored: sha256:' + StringOfChar('b', 64) + LineEnding);
+  RunResult := Default(TLwptResult);
+  RunResult.Stdout := 'test session: s-prepared '
+    + '(.lwpt/sessions/s-prepared)' + LineEnding;
+  Raised := False;
+  ErrorMessage := '';
+  try
+    AssertPreparedFixturesUsed(RunResult, 2);
+  except
+    on E: ETestAssertionError do
+    begin
+      Raised := True;
+      ErrorMessage := E.Message;
+    end;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Boolean>(Pos('setup diagnostics:', ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_A.Prepared.Test.pas.log: cache miss: '
+    + 'no-result: sha256:'
+    + StringOfChar('c', 64), ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache store skipped: '
+    + 'inputs changed during compilation', ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('behavior diagnostics:', ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_A.Prepared.Test.pas.log: cache hit: '
+    + 'sha256:' + StringOfChar('a', 64), ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache corruption: '
+    + 'artifact-set-invalid: destination-exists: sha256:'
+    + StringOfChar('b', 64), ErrorMessage) > 0).ToBe(True);
+  Expect<Boolean>(Pos('tests_B.Prepared.Test.pas.log: cache stored: sha256:'
+    + StringOfChar('b', 64), ErrorMessage) > 0).ToBe(True);
+end;
+
 function TTestScheduling.RunTests(const AArgs: array of string): TLwptResult;
 begin
   Result := RunTestsWithHeartbeat(AArgs, 0);
@@ -508,7 +824,8 @@ end;
 
 function TTestScheduling.RunTestsWithHeartbeat(
   const AArgs: array of string;
-  const AHeartbeatMilliseconds: Integer): TLwptResult;
+  const AHeartbeatMilliseconds: Integer;
+  const ATimeoutMilliseconds: QWord): TLwptResult;
 var
   Args, Environment: array of string;
   ArgumentIndex: Integer;
@@ -517,16 +834,20 @@ begin
   Args[0] := 'test';
   for ArgumentIndex := 0 to High(AArgs) do
     Args[ArgumentIndex + 1] := AArgs[ArgumentIndex];
-  if AHeartbeatMilliseconds > 0 then SetLength(Environment, 4)
-  else SetLength(Environment, 3);
+  if AHeartbeatMilliseconds > 0 then SetLength(Environment, 6)
+  else SetLength(Environment, 5);
   Environment[0] := WORKER_LEASE_TOKEN_ENV + '=';
   Environment[1] := WORKER_STATE_DIR_ENV + '='
     + FScratch + '/worker-state';
   Environment[2] := WORKER_BUDGET_ENV + '=2';
+  Environment[3] := CACHE_DIR_ENV + '='
+    + FScratch + '/shared-cache';
+  Environment[4] := CACHE_MAX_BYTES_ENV + '='
+    + IntToStr(DEFAULT_CACHE_MAX_BYTES);
   if AHeartbeatMilliseconds > 0 then
-    Environment[3] := ObservabilityHeartbeatIntervalEnvironment + '='
+    Environment[5] := ObservabilityHeartbeatIntervalEnvironment + '='
       + IntToStr(AHeartbeatMilliseconds);
-  Result := RunLwpt(Args, FScratch, Environment);
+  Result := RunLwpt(Args, FScratch, Environment, ATimeoutMilliseconds);
 end;
 
 function TTestScheduling.RunTestsWithCompilerProxy(
@@ -686,10 +1007,13 @@ begin
   ResetProject(0);
   WriteOverlapProgram('A.First.Test.pas', 'first-started', 'second-started');
   WriteOverlapProgram('B.Second.Test.pas', 'second-started', 'first-started');
-  { Runtime readiness has its own bounded setup phase. The original marker
-    exchange below remains the behavior-specific overlap contract. }
+  PrepareTestFixtures(['tests/A.First.Test.pas',
+    'tests/B.Second.Test.pas'], ['first-started', 'second-started']);
+  { The original marker exchange remains the behavior-specific overlap
+    contract after the parent-owned compilation phase. }
   CommandResult := RunTests([]);
   DumpRunFailure('default overlap run', CommandResult, 0);
+  AssertPreparedFixturesUsed(CommandResult, 2);
   Expect<Integer>(CommandResult.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(FScratch
     + '/control/first-started-ready')).ToBe(True);
@@ -801,6 +1125,14 @@ begin
     + '  if (ParamCount = 1) and (ParamStr(1) = ''--grandchild'') then'#10
     + '  begin Sleep(' + IntToStr(LongRunningFixtureMilliseconds)
     + '); Halt(0) end;'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
+    + '  begin'#10
+    + '    TFileStream.Create('
+    + PascalString(FScratch + '/control/slow' + FixtureSetupReadySuffix)
+    + ', fmCreate).Free;'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  TFileStream.Create(' + PascalString(SlowTestStartedPath)
     + ', fmCreate).Free;'#10
     + '  Child := TProcess.Create(nil);'#10
@@ -828,9 +1160,17 @@ begin
   WriteTextFile(FScratch + '/tests/B.Fail.Test.pas',
       'program FailFixture;'#10
     + '{$mode delphi}{$H+}'#10
-    + 'uses SysUtils;'#10
+    + 'uses Classes, SysUtils;'#10
     + 'var Started: TDateTime;'#10
     + 'begin'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
+    + '  begin'#10
+    + '    TFileStream.Create('
+    + PascalString(FScratch + '/control/failure' + FixtureSetupReadySuffix)
+    + ', fmCreate).Free;'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  Started := Now;'#10
     + '  while (not FileExists(' + PascalString(SlowTestStartedPath) + '))'#10
     + '    and ((Now - Started) * ' + IntToStr(SecondsPerDay) + ' < '
@@ -849,8 +1189,11 @@ begin
     + '  Halt(1);'#10
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'pending-ran', 0);
+  PrepareTestFixtures(['tests/A.Slow.Test.pas',
+    'tests/B.Fail.Test.pas'], ['slow', 'failure']);
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
   ReturnedAt := GetTickCount64;
+  AssertPreparedFixturesUsed(CommandResult, 2);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   if not FileExists(SlowTestStartedPath) then
     Fail('slow test did not reach its runtime startup barrier');
@@ -906,6 +1249,16 @@ begin
     + 'var Child: TProcess; Entry: string; Index: Integer;'#10
     + '  MarkerFile: Text;'#10
     + 'begin'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
+    + '  begin'#10
+    + '    Assign(MarkerFile, '
+    + PascalString(FScratch + '/control/nested' + FixtureSetupReadySuffix)
+    + ');'#10
+    + '    Rewrite(MarkerFile);'#10
+    + '    Close(MarkerFile);'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  Assign(MarkerFile, ' + PascalString(NestedTestStartedPath) + ');'#10
     + '  Rewrite(MarkerFile);'#10
     + '  Write(MarkerFile, GetTickCount64);'#10
@@ -960,8 +1313,18 @@ begin
       'program FailAfterNestedCompilerStarts;'#10
     + '{$mode delphi}{$H+}'#10
     + 'uses SysUtils;'#10
-    + 'var Started: TDateTime;'#10
+    + 'var MarkerFile: Text; Started: TDateTime;'#10
     + 'begin'#10
+    + '  if FileExists('
+    + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
+    + '  begin'#10
+    + '    Assign(MarkerFile, '
+    + PascalString(FScratch + '/control/nested-failure'
+      + FixtureSetupReadySuffix) + ');'#10
+    + '    Rewrite(MarkerFile);'#10
+    + '    Close(MarkerFile);'#10
+    + '    Halt(0);'#10
+    + '  end;'#10
     + '  Started := Now;'#10
     + '  while (not FileExists(' + PascalString(NestedTestStartedPath)
     + '))'#10
@@ -980,8 +1343,12 @@ begin
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
 
+  PrepareTestFixtures(['tests/A.Nested.Test.pas',
+    'tests/B.Fail.Test.pas'], ['nested', 'nested-failure']);
+
   CommandResult := RunTests(['--jobs=2', '--bail=1']);
   ReturnedAt := GetTickCount64;
+  AssertPreparedFixturesUsed(CommandResult, 2);
   if not FileExists(NestedTestStartedPath) then
     Fail('nested test did not reach its runtime startup barrier');
   if not FileExists(PIDFile) then
@@ -1971,6 +2338,7 @@ end;
 function RunWindowsConsoleController: Integer;
 var
   CompilerPID: Integer;
+  ControlProcessGroupID: DWORD;
   ControlType: DWORD;
   Environment: array of string;
   LwptProcess: TProcess;
@@ -1984,7 +2352,7 @@ begin
   WrongWriteHandle := 0;
   { Controller failures: 2 invalid control type; 3 missing compiler PID;
     4 acknowledgement pipe creation; 5 inherited Ctrl-C-ignore setup;
-    6 controller ignore handler; 7 control broadcast; 8 LWPT exit timeout;
+    7 control broadcast; 8 LWPT exit timeout;
     9 unexpected LWPT exit status; 10 compiler process still active. }
   ControlType := DWORD(StrToInt(ParamStr(2)));
   if (ControlType <> Windows.CTRL_C_EVENT)
@@ -2023,6 +2391,7 @@ begin
     LwptProcess.CurrentDirectory := ParamStr(4);
     ConfigureProcessEnvironment(LwptProcess, Environment);
     LwptProcess.InheritHandles := True;
+    LwptProcess.Options := [poNewProcessGroup];
     LwptProcess.Execute;
     Windows.CloseHandle(WrongReadHandle);
     WrongReadHandle := 0;
@@ -2035,16 +2404,16 @@ begin
       Sleep(ProcessPollMilliseconds);
     if not FileExists(ParamStr(5)) then Exit(3);
     CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
-    { SetConsoleCtrlHandler(nil, True) already makes this controller ignore
-      Ctrl-C. Register the Pascal callback only for Ctrl-Break, which ignores
-      that inherited flag; avoiding a redundant operating-system callback
-      keeps the Ctrl-C controller on its single main-thread fixture path. The
-      compiler proxy installs its handler before publishing its PID, leaving
-      LWPT as the only process that performs cancellation. }
-    if (ControlType = Windows.CTRL_BREAK_EVENT)
-       and not Windows.SetConsoleCtrlHandler(@IgnoreWindowsConsoleControl,
-         True) then Exit(6);
-    if not Windows.GenerateConsoleCtrlEvent(ControlType, 0) then Exit(7);
+    { Ctrl-C cannot target one process group, so broadcast it while this
+      controller keeps the inherited ignore attribute. Ctrl-Break ignores that
+      attribute and targets LWPT's process group, excluding this controller
+      without an asynchronous Pascal callback. }
+    if ControlType = Windows.CTRL_BREAK_EVENT then
+      ControlProcessGroupID := LwptProcess.ProcessID
+    else
+      ControlProcessGroupID := 0;
+    if not Windows.GenerateConsoleCtrlEvent(ControlType,
+      ControlProcessGroupID) then Exit(7);
     Started := Now;
     while LwptProcess.Running
       and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
@@ -2456,6 +2825,10 @@ end;
 procedure TTestScheduling.SetupTests;
 begin
   Test('default jobs overlap', TestDefaultJobsOverlap);
+  Test('cache unavailable diagnostic is bounded and single-line',
+    TestCacheUnavailableDiagnosticIsBoundedSingleLine);
+  Test('prepared cache failures report source decisions and fingerprints',
+    TestPreparedCacheFailureReportsSourceDecisions);
   Test('--jobs=1 runs in source order', TestJobsOneRunsInSourceOrder);
   Test('--bail=0 overrides manifest and runs all',
     TestBailZeroOverridesManifestAndRunsAll);

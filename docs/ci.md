@@ -37,7 +37,7 @@ Trigger split, mirroring GocciaScript's CI shape:
   rapid main pushes cancel older integrated-main runs. The `full-ci` operation
   checks out one frozen singleton or cumulative native-prefix top SHA. Those
   promotion runs are never coalesced. The `diagnostic` operation selects one
-  allow-listed Windows target and test scope and cannot produce a proof check.
+  allow-listed native target and test scope and cannot produce a proof check.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
 Repository rules make these contracts enforceable. The desired main ruleset is
@@ -152,13 +152,20 @@ check events that do not match a configured review adapter return before that
 sweep.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
-initial surface covers Windows x86_64/i386 ordinary, E2E, and TLS slices, plus an
-Intel-Darwin scheduling slice that runs only `TestScheduling.Test.pas` with a
-90-second ceiling. When isolation changes the symptom, the same target can run
-its ordinary project paths with a seven-minute ceiling. Both capture a native process
-sample instead of consuming a full matrix as a hang probe. Target and selector
-combinations are allow-listed as pairs: Windows-only selectors cannot silently
-run on Darwin, and the scheduling probe cannot run on Windows. The endpoint
+surface covers Windows x86_64/i386 ordinary, E2E, and TLS slices, plus ARM- and
+Intel-Darwin scheduling slices that run only `TestScheduling.Test.pas` with a
+150-second ceiling. ARM-Darwin captures the active case and process state for
+[issue #278](https://github.com/frostney/lwpt/issues/278). The focused Intel
+inventory remained healthy past the earlier 90-second boundary in
+[issue #260](https://github.com/frostney/lwpt/issues/260).
+The x86_64 Linux scheduling slice runs the same test with a 90-second ceiling.
+When isolation changes the Intel-Darwin symptom, that target can run its
+ordinary project paths with a seven-minute ceiling. Both Darwin targets capture
+a native process sample on timeout; Linux records the active test case and
+captures `/proc` process and thread status, wait channels, syscalls, stacks, and
+file descriptors. Target and selector combinations are allow-listed as pairs:
+Windows-only selectors cannot silently run on Darwin or Linux, and the
+scheduling probe cannot run on Windows. The endpoint
 checks out the exact current PR head,
 cannot accept a shell command or fork, uses a `diagnostic/...` run identity, and
 never creates or satisfies a `full-ci` proof. A later diagnostic for the same
@@ -176,9 +183,13 @@ are data in `.github/delivery/review-automations.json`; controller logic does
 not name vendors, and retry and quota policy remain external.
 An adapter may bind one or more check names to trusted GitHub App slugs, accept
 provider-specific terminal check conclusions, require or omit a terminal review
-event, and list review-body markers that mean "not terminal". Those fields are
-enough to replace a hosted reviewer or add a check-only custom reviewer without
-changing controller code.
+event, accept an exact allow-list of output titles for completed current-head
+`skipped` checks, and list review-body markers that mean "not terminal". A
+skipped check is never accepted through the generic terminal-conclusion list;
+its check name, app slug, head SHA, completion state, conclusion, and output
+title must all match the adapter policy. Those fields are enough to replace a
+hosted reviewer or add a check-only custom reviewer without changing controller
+code.
 `merge:ready` records that point-in-time acceptance, so the coordinator invokes
 the idempotent `merge` operation immediately before a singleton merge. For a
 native prefix it preflights each `delivery:managed` member against the same

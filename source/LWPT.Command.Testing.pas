@@ -15,6 +15,8 @@ uses
 
 function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
   const AHostOS, AHostArchitecture: string): Boolean;
+function CacheUnavailableDiagnostic(const AExceptionClass,
+  AExceptionMessage: string): string;
 function CmdTest(const AManifestPath: string;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings; const AUseCache: Boolean = True): Integer;
@@ -764,15 +766,42 @@ end;
 function CacheMissDiagnostic(const AReason: string): string;
 begin
   if (AReason = 'invalid-reference')
-     or (AReason = 'result-manifest-missing')
+     or (AReason = 'result-manifest-object-missing')
+     or (AReason = 'result-manifest-verification-failed')
      or (AReason = 'result-manifest-invalid')
-     or (AReason = 'artifact-missing')
+     or (AReason = 'artifact-object-missing')
+     or (AReason = 'artifact-verification-failed')
      or (AReason = 'artifact-mode-failed')
      or (AReason = 'artifact-set-invalid')
+     or (Pos('artifact-set-invalid: ', AReason) = 1)
      or (AReason = 'result-kind-mismatch') then
     Result := 'cache corruption: ' + AReason
   else
     Result := 'cache miss: ' + AReason;
+end;
+
+function BoundedSingleLine(const AValue: string;
+  const AMaximumLength: Integer): string;
+var
+  Index: Integer;
+begin
+  Result := AValue;
+  for Index := 1 to Length(Result) do
+    if (Ord(Result[Index]) < 32) or (Ord(Result[Index]) = 127) then
+      Result[Index] := ' ';
+  if Length(Result) > AMaximumLength then
+    Result := Copy(Result, 1, AMaximumLength) + '...';
+end;
+
+function CacheUnavailableDiagnostic(const AExceptionClass,
+  AExceptionMessage: string): string;
+const
+  MaximumClassLength = 64;
+  MaximumMessageLength = 256;
+begin
+  Result := 'cache bypass: unavailable ('
+    + BoundedSingleLine(AExceptionClass, MaximumClassLength) + ': '
+    + BoundedSingleLine(AExceptionMessage, MaximumMessageLength) + ')';
 end;
 
 procedure TTestScheduler.RunOne(const AIndex: Integer;
@@ -1013,7 +1042,8 @@ begin
           CompleteJob(AIndex, tjsCancelled);
           Exit;
         end;
-        CacheDiagnostic := 'cache bypass: unavailable' + LineEnding;
+        CacheDiagnostic := CacheUnavailableDiagnostic(E.ClassName,
+          E.Message) + LineEnding;
       end;
     end;
   end;

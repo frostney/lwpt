@@ -78,7 +78,9 @@ on:
         required: false
         type: choice
         options:
+          - aarch64-darwin
           - x86_64-darwin
+          - x86_64-linux
           - x86_64-win64
           - i386-win32
       diagnostic_selector:
@@ -131,7 +133,7 @@ jobs:
               exit 1
             fi
             case "$DIAGNOSTIC_TARGET" in
-              x86_64-darwin|x86_64-win64|i386-win32) ;;
+              aarch64-darwin|x86_64-darwin|x86_64-linux|x86_64-win64|i386-win32) ;;
               *) echo "::error::unsupported diagnostic target: $DIAGNOSTIC_TARGET"; exit 1 ;;
             esac
             case "$DIAGNOSTIC_SELECTOR" in
@@ -139,7 +141,9 @@ jobs:
               *) echo "::error::unsupported diagnostic selector: $DIAGNOSTIC_SELECTOR"; exit 1 ;;
             esac
             case "$DIAGNOSTIC_TARGET/$DIAGNOSTIC_SELECTOR" in
+              aarch64-darwin/scheduling|\
               x86_64-darwin/default|x86_64-darwin/scheduling|\
+              x86_64-linux/scheduling|\
               x86_64-win64/default|x86_64-win64/e2e|x86_64-win64/tls|\
               i386-win32/default|i386-win32/e2e|i386-win32/tls) ;;
               *) echo "::error::unsupported diagnostic slice: $DIAGNOSTIC_TARGET/$DIAGNOSTIC_SELECTOR"; exit 1 ;;
@@ -171,9 +175,17 @@ jobs:
           set -euo pipefail
           if [ "$MODE" = "diagnostic" ]; then
             case "$DIAGNOSTIC_TARGET" in
+              aarch64-darwin)
+                BUILD='{"include":[{"target":"aarch64-darwin","cpu":"aarch64","os":"darwin","native":true}]}'
+                TEST='{"include":[{"target":"aarch64-darwin","runner":"macos-latest","fpc-install":"brew"}]}'
+                ;;
               x86_64-darwin)
                 BUILD='{"include":[{"target":"x86_64-darwin","cpu":"x86_64","os":"darwin"}]}'
                 TEST='{"include":[{"target":"x86_64-darwin","runner":"macos-15-intel","fpc-install":"brew"}]}'
+                ;;
+              x86_64-linux)
+                BUILD='{"include":[{"target":"x86_64-linux","cpu":"x86_64","os":"linux"}]}'
+                TEST='{"include":[{"target":"x86_64-linux","runner":"ubuntu-latest","fpc-install":"apt"}]}'
                 ;;
               x86_64-win64)
                 BUILD='{"include":[{"target":"x86_64-win64","cpu":"x86_64","os":"win64"}]}'
@@ -621,9 +633,13 @@ jobs:
       - name: Checkout trusted scheduling diagnostic
         if: >-
           inputs.mode == 'diagnostic' &&
-          inputs.diagnostic_target == 'x86_64-darwin' &&
-          (inputs.diagnostic_selector == 'default' ||
-           inputs.diagnostic_selector == 'scheduling')
+          ((inputs.diagnostic_target == 'x86_64-darwin' &&
+            inputs.diagnostic_selector == 'default') ||
+           ((inputs.diagnostic_target == 'x86_64-darwin' ||
+             inputs.diagnostic_target == 'aarch64-darwin') &&
+            inputs.diagnostic_selector == 'scheduling') ||
+           (inputs.diagnostic_target == 'x86_64-linux' &&
+            inputs.diagnostic_selector == 'scheduling'))
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           fetch-depth: 1
@@ -635,11 +651,15 @@ jobs:
       - name: Scheduling diagnostic test
         if: >-
           inputs.mode == 'diagnostic' &&
-          inputs.diagnostic_target == 'x86_64-darwin' &&
-          (inputs.diagnostic_selector == 'default' ||
-           inputs.diagnostic_selector == 'scheduling')
+          ((inputs.diagnostic_target == 'x86_64-darwin' &&
+            inputs.diagnostic_selector == 'default') ||
+           ((inputs.diagnostic_target == 'x86_64-darwin' ||
+             inputs.diagnostic_target == 'aarch64-darwin') &&
+            inputs.diagnostic_selector == 'scheduling') ||
+           (inputs.diagnostic_target == 'x86_64-linux' &&
+            inputs.diagnostic_selector == 'scheduling'))
         shell: bash
         env:
           LWPT_SCHEDULING_DIAGNOSTIC_SCOPE: ${{ inputs.diagnostic_selector }}
-          LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT: ${{ inputs.diagnostic_selector == 'default' && '84' || '18' }}
+          LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT: ${{ inputs.diagnostic_selector == 'default' && '84' || (inputs.diagnostic_target == 'x86_64-darwin' || inputs.diagnostic_target == 'aarch64-darwin') && '30' || '18' }}
         run: .trusted-delivery/.github/delivery/scheduling-diagnostic.sh

@@ -91,9 +91,22 @@ type
   end;
 
 procedure InstallProcessTreeSignalForwarding;
+{ Serializes creation and close-on-exec protection of file descriptors with
+  every managed and unmanaged process spawn. Calls must be paired. }
+procedure BeginProcessHandleSetup;
+procedure EndProcessHandleSetup;
 procedure ExecuteUnmanagedProcess(const AProcess: TProcess);
 function FeedProcessTreeProtocol(var ABuffer: string;
   const ABytes: string; out ALine: string): TLWPTProtocolReadResult;
+
+{$IFDEF OBJECTSTORE_TESTING}
+type
+  TLWPTProcessSpawnAttemptHook = procedure;
+
+var
+  ProcessTreeBeforeUnmanagedSpawnLockTestHook:
+    TLWPTProcessSpawnAttemptHook;
+{$ENDIF}
 
 implementation
 
@@ -763,12 +776,26 @@ begin
   { Windows TProcess can only inherit all inheritable handles. Raw production
     spawns therefore share the managed-spawn window; Unix also participates as
     defence in depth alongside close-on-exec acknowledgement descriptors. }
+  {$IFDEF OBJECTSTORE_TESTING}
+  if Assigned(ProcessTreeBeforeUnmanagedSpawnLockTestHook) then
+    ProcessTreeBeforeUnmanagedSpawnLockTestHook;
+  {$ENDIF}
   EnterCriticalSection(ProcessSpawnCriticalSection);
   try
     AProcess.Execute;
   finally
     LeaveCriticalSection(ProcessSpawnCriticalSection);
   end;
+end;
+
+procedure BeginProcessHandleSetup;
+begin
+  EnterCriticalSection(ProcessSpawnCriticalSection);
+end;
+
+procedure EndProcessHandleSetup;
+begin
+  LeaveCriticalSection(ProcessSpawnCriticalSection);
 end;
 
 procedure TLWPTProcessTree.Execute;
