@@ -41,6 +41,7 @@ FULL_CI_CHECK = "full-ci"
 DELIVERY_CHECK = "delivery-admission"
 OWNED_APP = "github-actions"
 DIAGNOSTIC_TARGETS = {
+    "aarch64-darwin",
     "x86_64-darwin",
     "x86_64-linux",
     "x86_64-win64",
@@ -50,7 +51,8 @@ DIAGNOSTIC_SELECTORS = {"default", "e2e", "scheduling", "tls"}
 FULL_CI_RUN_RE = re.compile(r"^full-ci/(\d+)/([0-9a-f]{40})/([0-9a-f]{64})/(\d+)$")
 DIAGNOSTIC_RUN_RE = re.compile(
     r"^diagnostic/(\d+)/([0-9a-f]{40})/"
-    r"(?:x86_64-darwin/(?:default|scheduling)|"
+    r"(?:(?:aarch64-darwin|x86_64-darwin)/scheduling|"
+    r"x86_64-darwin/default|"
     r"x86_64-linux/scheduling|"
     r"(?:x86_64-win64|i386-win32)/(?:default|e2e|tls))$"
 )
@@ -576,8 +578,10 @@ class Controller:
         if selector not in DIAGNOSTIC_SELECTORS:
             raise DeliveryError(f"unsupported diagnostic selector: {selector}")
         valid_slice = (
-            target == "x86_64-darwin"
-            and selector in {"default", "scheduling"}
+            target in {"aarch64-darwin", "x86_64-darwin"}
+            and selector == "scheduling"
+        ) or (
+            target == "x86_64-darwin" and selector == "default"
         ) or (
             target == "x86_64-linux" and selector == "scheduling"
         ) or (

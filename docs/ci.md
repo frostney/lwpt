@@ -37,7 +37,7 @@ Trigger split, mirroring GocciaScript's CI shape:
   rapid main pushes cancel older integrated-main runs. The `full-ci` operation
   checks out one frozen singleton or cumulative native-prefix top SHA. Those
   promotion runs are never coalesced. The `diagnostic` operation selects one
-  allow-listed Windows target and test scope and cannot produce a proof check.
+  allow-listed native target and test scope and cannot produce a proof check.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
 Repository rules make these contracts enforceable. The desired main ruleset is
@@ -152,16 +152,18 @@ check events that do not match a configured review adapter return before that
 sweep.
 
 The `diagnostic` operation runs one allow-listed native remediation slice. The
-surface covers Windows x86_64/i386 ordinary, E2E, and TLS slices, plus an
-Intel-Darwin scheduling slice that runs only `TestScheduling.Test.pas` with a
-150-second ceiling. The focused inventory remained healthy past the earlier
-90-second boundary in [issue #260](https://github.com/frostney/lwpt/issues/260).
+surface covers Windows x86_64/i386 ordinary, E2E, and TLS slices, plus ARM- and
+Intel-Darwin scheduling slices that run only `TestScheduling.Test.pas` with a
+150-second ceiling. ARM-Darwin captures the active case and process state for
+[issue #278](https://github.com/frostney/lwpt/issues/278). The focused Intel
+inventory remained healthy past the earlier 90-second boundary in
+[issue #260](https://github.com/frostney/lwpt/issues/260).
 The x86_64 Linux scheduling slice runs the same test with a 90-second ceiling.
-When isolation changes the Darwin symptom, that target can run its ordinary
-project paths with a seven-minute ceiling. Darwin captures a native process
-sample on timeout; Linux records the active test case and captures `/proc`
-process and thread status, wait channels, syscalls, stacks, and file
-descriptors. Target and selector combinations are allow-listed as pairs:
+When isolation changes the Intel-Darwin symptom, that target can run its
+ordinary project paths with a seven-minute ceiling. Both Darwin targets capture
+a native process sample on timeout; Linux records the active test case and
+captures `/proc` process and thread status, wait channels, syscalls, stacks, and
+file descriptors. Target and selector combinations are allow-listed as pairs:
 Windows-only selectors cannot silently run on Darwin or Linux, and the
 scheduling probe cannot run on Windows. The endpoint
 checks out the exact current PR head,
