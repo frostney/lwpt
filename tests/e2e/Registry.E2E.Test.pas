@@ -263,6 +263,10 @@ var
   Index: Integer;
   Readers: array[0..7] of TProcess;
   Server: TProcess;
+  {$IFDEF MSWINDOWS}
+  SecondServer: TProcess;
+  StartedAt: QWord;
+  {$ENDIF}
 begin
   DataDirectory := FScratch + '/plain-origin';
   DiscoveryURL := 'http://localhost:' + IntToStr(BasePort)
@@ -276,6 +280,24 @@ begin
   Server := StartServer(DataDirectory, False);
   try
     WaitUntilReady(DiscoveryURL, False);
+    {$IFDEF MSWINDOWS}
+    SecondServer := StartServer(DataDirectory, False);
+    try
+      StartedAt := GetTickCount64;
+      while SecondServer.Running and (GetTickCount64 - StartedAt < 3000) do
+        Sleep(10);
+      Expect<Boolean>(SecondServer.Running).ToBe(False);
+      if not SecondServer.Running then
+      begin
+        SecondServer.WaitOnExit;
+        Expect<Boolean>(SecondServer.ExitStatus <> 0).ToBe(True);
+      end;
+      Expect<Boolean>(Pos('lwpt-registry-discovery-v1', Curl(DiscoveryURL,
+        False)) > 0).ToBe(True);
+    finally
+      StopServer(SecondServer);
+    end;
+    {$ENDIF}
     for Index := 0 to High(Readers) do
     begin
       Readers[Index] := TProcess.Create(nil);

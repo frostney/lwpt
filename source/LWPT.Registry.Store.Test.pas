@@ -52,6 +52,17 @@ type
     property Failure: string read FFailure;
   end;
 
+  TRecoveryThread = class(TThread)
+  private
+    FFailure: string;
+    FRoot: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const ARoot: string);
+    property Failure: string read FFailure;
+  end;
+
 procedure SetFailurePoint(const AValue: string);
 begin
   SetRegistryFailurePointForTesting(AValue);
@@ -208,6 +219,26 @@ begin
   inherited Create(True);
   FreeOnTerminate := False;
   FStore := AStore;
+end;
+
+constructor TRecoveryThread.Create(const ARoot: string);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FRoot := ARoot;
+end;
+
+procedure TRecoveryThread.Execute;
+var
+  Store: TLWPTRegistryStore;
+begin
+  Store := nil;
+  try
+    Store := TLWPTRegistryStore.Create(FRoot);
+  except
+    on E: Exception do FFailure := E.Message;
+  end;
+  Store.Free;
 end;
 
 procedure TRegistryStoreContract.CheckResourceProgress;
@@ -706,7 +737,7 @@ end;
 
 procedure TRegistryStoreContract.TestCanonicalURLValidation;
 var
-  Diagnostic: string;
+  Diagnostic, Host: string;
 begin
   Expect<string>(CanonicalRegistryURL(
     'https://[2001:0db8:0:0:0:0:0:1]:443/a/../b', False))
@@ -724,6 +755,17 @@ begin
     .ToBe('https://example.com/a');
   Expect<string>(CanonicalRegistryURL('https://example.com/', False))
     .ToBe('https://example.com');
+  Host := StringOfChar('a', 63) + '.' + StringOfChar('b', 63) + '.'
+    + StringOfChar('c', 63) + '.' + StringOfChar('d', 61);
+  Expect<string>(CanonicalRegistryURL('https://' + Host, False))
+    .ToBe('https://' + Host);
+  Diagnostic := '';
+  try
+    CanonicalRegistryURL('https://' + Host + 'd', False);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('invalid_url:', Diagnostic) = 1).ToBe(True);
   Diagnostic := '';
   try
     CanonicalRegistryURL('https://example.com/"bad"', False);
@@ -1125,6 +1167,10 @@ var
   Response: TLWPTRegistryHTTPResponse;
   Store: TLWPTRegistryStore;
 begin
+  Expect<Integer>(RegistryDeadlineTimeoutForTesting(100, 99)).ToBe(1);
+  Expect<Integer>(RegistryDeadlineTimeoutForTesting(100, 100)).ToBe(1);
+  Expect<Integer>(RegistryDeadlineTimeoutForTesting(100, 101)).ToBe(1);
+  Expect<Integer>(RegistryDeadlineTimeoutForTesting(250, 100)).ToBe(150);
   ExpectedBody := 'schema = "' + PROGRAM_NAME + '-registry-error-v1"' + #10
     + 'code = "bad\"code"' + #10
     + 'message = "path\\failed\t\u0001"' + #10
@@ -1322,6 +1368,10 @@ end;
 
 procedure TRegistryStoreContract.TestRecoveryClearsIncompleteStaging;
 var
+  Recovery: TRecoveryThread;
+  ReadyPath, ReleasePath: string;
+  State: TLWPTRegistryState;
+  StartedAt: QWord;
   Store: TLWPTRegistryStore;
 begin
   Store := InitializeStore;
@@ -1333,6 +1383,42 @@ begin
       .ToBe(False);
     Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(1);
   finally
+    Store.Free;
+  end;
+  Store := TLWPTRegistryStore.Create(FScratch);
+  Recovery := nil;
+  ReadyPath := FScratch + '-recovery-ready';
+  ReleasePath := FScratch + '-recovery-release';
+  try
+    SetRegistryRecoveryBarrierForTesting(ReadyPath, ReleasePath);
+    Recovery := TRecoveryThread.Create(FScratch);
+    Recovery.Start;
+    StartedAt := GetTickCount64;
+    while not FileExists(ReadyPath) do
+    begin
+      if GetTickCount64 - StartedAt >= 5000 then
+        raise Exception.Create('recovery did not reach pre-lease barrier');
+      Sleep(10);
+    end;
+    State := PublishExample(Store, $51);
+    Expect<Int64>(State.Sequence).ToBe(2);
+    WriteTextFile(ReleasePath, 'release');
+    Recovery.WaitFor;
+    Expect<string>(Recovery.Failure).ToBe('');
+    State := Store.LoadCurrentState;
+    Expect<Int64>(State.Sequence).ToBe(2);
+    Expect<Boolean>(FileExists(FScratch + '/' + State.CheckpointPath))
+      .ToBe(True);
+  finally
+    if not FileExists(ReleasePath) then WriteTextFile(ReleasePath, 'release');
+    if Assigned(Recovery) then
+    begin
+      Recovery.WaitFor;
+      Recovery.Free;
+    end;
+    SetRegistryRecoveryBarrierForTesting('', '');
+    SysUtils.DeleteFile(ReadyPath);
+    SysUtils.DeleteFile(ReleasePath);
     Store.Free;
   end;
 end;

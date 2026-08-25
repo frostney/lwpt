@@ -57,6 +57,10 @@ function RegistryHTTPWireResponse(const AResponse: TLWPTRegistryHTTPResponse;
   const AIncludeBody: Boolean): TBytes;
 function OpenRegistryHTTPResource(const AResponse: TLWPTRegistryHTTPResponse;
   AProgress: TSHA256Progress = nil): TStream;
+{$IFDEF REGISTRY_TESTING}
+function RegistryDeadlineTimeoutForTesting(const ADeadline,
+  ANow: QWord): LongInt;
+{$ENDIF}
 
 implementation
 
@@ -603,24 +607,41 @@ begin
   RegistrySocketShutdown(FSocket);
 end;
 
+function RegistryDeadlineTimeout(const ADeadline, ANow: QWord): LongInt;
+var
+  Remaining: QWord;
+begin
+  if ANow >= ADeadline then Exit(1);
+  Remaining := ADeadline - ANow;
+  if Remaining > High(LongInt) then Exit(High(LongInt));
+  Result := LongInt(Remaining);
+  if Result < 1 then Result := 1;
+end;
+
+{$IFDEF REGISTRY_TESTING}
+function RegistryDeadlineTimeoutForTesting(const ADeadline,
+  ANow: QWord): LongInt;
+begin
+  Result := RegistryDeadlineTimeout(ADeadline, ANow);
+end;
+{$ENDIF}
+
 procedure ApplyDeadlineTimeout(const ASocket: TSocket;
   const ADeadline: QWord);
 var
-  Remaining: QWord;
+  TimeoutMilliseconds: LongInt;
   {$IFDEF UNIX}
   Timeout: TTimeVal;
   {$ELSE}
   Timeout: LongInt;
   {$ENDIF}
 begin
-  if GetTickCount64 >= ADeadline then Remaining := 1
-  else Remaining := ADeadline - GetTickCount64;
-  if Remaining > High(LongInt) then Remaining := High(LongInt);
+  TimeoutMilliseconds := RegistryDeadlineTimeout(ADeadline, GetTickCount64);
   {$IFDEF UNIX}
-  Timeout.tv_sec := Remaining div 1000;
-  Timeout.tv_usec := (Remaining mod 1000) * 1000;
+  Timeout.tv_sec := TimeoutMilliseconds div 1000;
+  Timeout.tv_usec := (TimeoutMilliseconds mod 1000) * 1000;
   {$ELSE}
-  Timeout := Remaining;
+  Timeout := TimeoutMilliseconds;
   {$ENDIF}
   RegistrySetSocketOption(ASocket, SOL_SOCKET, SO_RCVTIMEO, @Timeout,
     SizeOf(Timeout));
@@ -1092,8 +1113,15 @@ begin
   end;
   try
     Reuse := 1;
+    {$IFDEF MSWINDOWS}
+    if RegistrySetSocketOption(ListenSocket, SOL_SOCKET,
+      SO_EXCLUSIVEADDRUSE, @Reuse, SizeOf(Reuse)) <> 0 then
+      raise ELWPTRegistryError.CreateStable('listen_failed',
+        'could not reserve the registry listen address exclusively');
+    {$ELSE}
     RegistrySetSocketOption(ListenSocket, SOL_SOCKET, SO_REUSEADDR, @Reuse,
       SizeOf(Reuse));
+    {$ENDIF}
     FillChar(Address, SizeOf(Address), 0);
     Address.sin_family := AF_INET;
     Address.sin_port := htons(FStore.Config.Port);

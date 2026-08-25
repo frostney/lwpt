@@ -102,6 +102,8 @@ procedure ValidateRegistryConfiguration(const AConfig: TLWPTRegistryConfig);
 procedure SetRegistryFailurePointForTesting(const APoint: string);
 procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
   AReleasePath: string);
+procedure SetRegistryRecoveryBarrierForTesting(const AReadyPath,
+  AReleasePath: string);
 {$ENDIF}
 
 implementation
@@ -137,6 +139,8 @@ var
   RegistryFailurePointForTesting: string;
   RegistryPublicationReadyPathForTesting: string;
   RegistryPublicationReleasePathForTesting: string;
+  RegistryRecoveryReadyPathForTesting: string;
+  RegistryRecoveryReleasePathForTesting: string;
 procedure InjectRegistryFailure(const APoint: string); forward;
 {$ENDIF}
 
@@ -781,6 +785,9 @@ begin
   if AHost = '' then
     raise ELWPTRegistryError.CreateStable('invalid_url',
       'registry URL host is empty');
+  if Length(AHost) > 253 then
+    raise ELWPTRegistryError.CreateStable('invalid_url',
+      'registry DNS host exceeds 253 characters');
   AllIPv4Characters := True;
   for Character in AHost do
   begin
@@ -1676,9 +1683,27 @@ var
   State: TLWPTRegistryState;
   Coordinator: TLWPTProducerLeaseCoordinator;
   Lease: TLWPTProducerLease;
+  {$IFDEF REGISTRY_TESTING}
+  BarrierStartedAt: QWord;
+  {$ENDIF}
 begin
   State := ReadCurrentState;
   VerifyState(State);
+  {$IFDEF REGISTRY_TESTING}
+  if RegistryRecoveryReadyPathForTesting <> '' then
+  begin
+    AtomicWriteBytes(RegistryRecoveryReadyPathForTesting, TmpRoot,
+      Bytes('ready' + #10));
+    BarrierStartedAt := GetTickCount64;
+    while not FileExists(RegistryRecoveryReleasePathForTesting) do
+    begin
+      if GetTickCount64 - BarrierStartedAt >= 10000 then
+        raise ELWPTRegistryError.CreateStable('test_barrier_timeout',
+          'registry recovery barrier timed out');
+      Sleep(10);
+    end;
+  end;
+  {$ENDIF}
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
   Lease := nil;
   try
@@ -1686,6 +1711,11 @@ begin
       'registry startup recovery');
     if Assigned(Lease) then
     begin
+      { Publication can advance after the optimistic startup check and before
+        this lease is acquired. Recovery must derive and prune only from the
+        state made authoritative while publication is excluded. }
+      State := ReadCurrentState;
+      VerifyState(State);
       if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
       ForceDirectories(TmpRoot);
       RecoverDerivedState(State);
@@ -1798,6 +1828,13 @@ procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
 begin
   RegistryPublicationReadyPathForTesting := AReadyPath;
   RegistryPublicationReleasePathForTesting := AReleasePath;
+end;
+
+procedure SetRegistryRecoveryBarrierForTesting(const AReadyPath,
+  AReleasePath: string);
+begin
+  RegistryRecoveryReadyPathForTesting := AReadyPath;
+  RegistryRecoveryReleasePathForTesting := AReleasePath;
 end;
 
 procedure InjectRegistryFailure(const APoint: string);
