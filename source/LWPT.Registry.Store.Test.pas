@@ -490,13 +490,13 @@ begin
   Expect<Integer>(FindFirst(FScratch + '/keys/ed25519-*.toml', faAnyFile,
     Search)).ToBe(0);
   FirstKey := Search.Name;
-  FindClose(Search);
+  SysUtils.FindClose(Search);
   Store := TLWPTRegistryStore.Create(FScratch);
   Store.Free;
   Expect<Integer>(FindFirst(FScratch + '/keys/ed25519-*.toml', faAnyFile,
     Search)).ToBe(0);
   SecondKey := Search.Name;
-  FindClose(Search);
+  SysUtils.FindClose(Search);
   Expect<string>(SecondKey).ToBe(FirstKey);
 end;
 
@@ -927,7 +927,7 @@ begin
       if FindNext(Search) <> 0 then
         raise Exception.Create('published object was not found');
     ObjectName := Search.Name;
-    FindClose(Search);
+    SysUtils.FindClose(Search);
     WriteTextFile(FScratch + '/objects/sha256/' + ObjectName, 'tampered');
     Response := RegistryHTTPResponse(Store, 'GET',
       '/v1/objects/sha256/' + ObjectName);
@@ -997,7 +997,7 @@ begin
       if FindNext(Search) <> 0 then
         raise Exception.Create('published object was not found');
     ObjectName := Search.Name;
-    FindClose(Search);
+    SysUtils.FindClose(Search);
     Response := RegistryHTTPResponse(Store, 'GET',
       '/v1/objects/sha256/' + ObjectName);
     Expect<Integer>(Response.Status).ToBe(200);
@@ -1089,7 +1089,7 @@ begin
       if FindNext(Search) <> 0 then
         raise Exception.Create('published object was not found');
     ObjectName := Search.Name;
-    FindClose(Search);
+    SysUtils.FindClose(Search);
     Response := RegistryHTTPResponse(Store, 'GET',
       '/v1/objects/sha256/' + ObjectName);
     Expect<Integer>(Response.Status).ToBe(200);
@@ -1310,7 +1310,7 @@ begin
       Search)).ToBe(0);
     KeyID := 'ed25519:' + Copy(Search.Name, Length('ed25519-') + 1,
       Length(Search.Name) - Length('ed25519-') - Length('.toml'));
-    FindClose(Search);
+    SysUtils.FindClose(Search);
     KeyResponse := RegistryHTTPResponse(Store, 'GET', '/v1/keys/' + KeyID
       + '.toml');
     Expect<Integer>(KeyResponse.Status).ToBe(200);
