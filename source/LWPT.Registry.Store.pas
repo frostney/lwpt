@@ -108,7 +108,6 @@ implementation
 
 uses
   DateUtils,
-  Sockets,
   StrUtils,
   {$IFDEF UNIX}
   BaseUnix,
@@ -129,6 +128,9 @@ const
   INITIALIZATION_MARKER = '.initializing';
   CHECKPOINT_DOMAIN = PROJECT_NAME + '-REGISTRY-CHECKPOINT-V1' + #10;
   CHECKPOINT_RENEWAL_THRESHOLD_HOURS = 24;
+
+type
+  TRegistryIPv6Address = array[0..15] of Byte;
 
 {$IFDEF REGISTRY_TESTING}
 var
@@ -589,14 +591,147 @@ begin
   Result := Output;
 end;
 
-function RFC5952(const AAddress: in6_addr): string;
+function TryCanonicalIPv4Host(const AHost: string;
+  out ACanonical: string): Boolean;
+var
+  Character: Char;
+  Index, Octet, OctetCount, Start: Integer;
+  Part: string;
+begin
+  Result := False;
+  ACanonical := '';
+  OctetCount := 0;
+  Start := 1;
+  for Index := 1 to Length(AHost) + 1 do
+    if (Index > Length(AHost)) or (AHost[Index] = '.') then
+    begin
+      Part := Copy(AHost, Start, Index - Start);
+      if (Part = '') or (Length(Part) > 3) then Exit;
+      for Character in Part do
+        if not (Character in ['0'..'9']) then Exit;
+      if not TryStrToInt(Part, Octet) or (Octet > 255) then Exit;
+      Inc(OctetCount);
+      if OctetCount > 4 then Exit;
+      if ACanonical <> '' then ACanonical := ACanonical + '.';
+      ACanonical := ACanonical + IntToStr(Octet);
+      Start := Index + 1;
+    end;
+  Result := OctetCount = 4;
+end;
+
+function ParseIPv6Side(const AValue: string; var AGroups: array of Word;
+  var ACount: Integer; const AFinalSide: Boolean): Boolean;
+var
+  CanonicalIPv4, Part: string;
+  Character: Char;
+  Colon, Index, IPv4Octet, PartStart, Value: Integer;
+  IPv4Bytes: array[0..3] of Byte;
+begin
+  Result := False;
+  if AValue = '' then Exit(True);
+  PartStart := 1;
+  while PartStart <= Length(AValue) do
+  begin
+    Colon := PosEx(':', AValue, PartStart);
+    if Colon = 0 then Colon := Length(AValue) + 1;
+    Part := Copy(AValue, PartStart, Colon - PartStart);
+    if Part = '' then Exit;
+    if Pos('.', Part) > 0 then
+    begin
+      if (Colon <= Length(AValue)) or not AFinalSide
+        or not TryCanonicalIPv4Host(Part, CanonicalIPv4)
+        or (ACount > High(AGroups) - 1) then Exit;
+      PartStart := 1;
+      for Index := 0 to 3 do
+      begin
+        Colon := PosEx('.', CanonicalIPv4, PartStart);
+        if Colon = 0 then Colon := Length(CanonicalIPv4) + 1;
+        if not TryStrToInt(Copy(CanonicalIPv4, PartStart,
+          Colon - PartStart), IPv4Octet) then Exit;
+        IPv4Bytes[Index] := Byte(IPv4Octet);
+        PartStart := Colon + 1;
+      end;
+      AGroups[ACount] := Word(IPv4Bytes[0]) shl 8 or IPv4Bytes[1];
+      Inc(ACount);
+      AGroups[ACount] := Word(IPv4Bytes[2]) shl 8 or IPv4Bytes[3];
+      Inc(ACount);
+      Exit(True);
+    end;
+    if (Length(Part) > 4) or (ACount > High(AGroups)) then Exit;
+    for Character in Part do
+      if not (Character in ['0'..'9', 'a'..'f', 'A'..'F']) then Exit;
+    if not TryStrToInt('$' + Part, Value) then Exit;
+    AGroups[ACount] := Word(Value);
+    Inc(ACount);
+    PartStart := Colon + 1;
+  end;
+  Result := True;
+end;
+
+function TryParseIPv6Address(const AValue: string;
+  out AAddress: TRegistryIPv6Address): Boolean;
+var
+  LeftCount, RightCount, Separator, ZeroCount: Integer;
+  LeftGroups, RightGroups: array[0..7] of Word;
+  Index, OutputIndex: Integer;
+  LeftValue, RightValue: string;
+begin
+  Result := False;
+  FillChar(AAddress, SizeOf(AAddress), 0);
+  FillChar(LeftGroups, SizeOf(LeftGroups), 0);
+  FillChar(RightGroups, SizeOf(RightGroups), 0);
+  Separator := Pos('::', AValue);
+  if (Separator > 0) and (PosEx('::', AValue, Separator + 2) > 0) then Exit;
+  if Separator > 0 then
+  begin
+    LeftValue := Copy(AValue, 1, Separator - 1);
+    RightValue := Copy(AValue, Separator + 2, MaxInt);
+  end
+  else
+  begin
+    LeftValue := AValue;
+    RightValue := '';
+  end;
+  LeftCount := 0;
+  RightCount := 0;
+  if not ParseIPv6Side(LeftValue, LeftGroups, LeftCount,
+    Separator = 0) then Exit;
+  if not ParseIPv6Side(RightValue, RightGroups, RightCount, True) then Exit;
+  if Separator = 0 then
+  begin
+    if LeftCount <> 8 then Exit;
+    ZeroCount := 0;
+  end
+  else
+  begin
+    if LeftCount + RightCount >= 8 then Exit;
+    ZeroCount := 8 - LeftCount - RightCount;
+  end;
+  OutputIndex := 0;
+  for Index := 0 to LeftCount - 1 do
+  begin
+    AAddress[OutputIndex] := LeftGroups[Index] shr 8;
+    AAddress[OutputIndex + 1] := LeftGroups[Index] and $FF;
+    Inc(OutputIndex, 2);
+  end;
+  Inc(OutputIndex, ZeroCount * 2);
+  for Index := 0 to RightCount - 1 do
+  begin
+    AAddress[OutputIndex] := RightGroups[Index] shr 8;
+    AAddress[OutputIndex + 1] := RightGroups[Index] and $FF;
+    Inc(OutputIndex, 2);
+  end;
+  Result := True;
+end;
+
+function RFC5952(const AAddress: TRegistryIPv6Address): string;
 var
   BestLength, BestStart, CurrentLength, CurrentStart, Index: Integer;
   Groups: array[0..7] of Word;
 begin
   for Index := 0 to 7 do Groups[Index] :=
-    Word(AAddress.u6_addr8[Index * 2]) shl 8
-    or Word(AAddress.u6_addr8[Index * 2 + 1]);
+    Word(AAddress[Index * 2]) shl 8
+    or Word(AAddress[Index * 2 + 1]);
   BestStart := -1;
   BestLength := 0;
   Index := 0;
@@ -635,8 +770,8 @@ end;
 
 function CanonicalHost(const AHost: string): string;
 var
-  Address4: in_addr;
   AllIPv4Characters: Boolean;
+  CanonicalIPv4: string;
   Character: Char;
   LabelValue: string;
   Labels: TStringList;
@@ -655,10 +790,10 @@ begin
   end;
   if AllIPv4Characters then
   begin
-    if not TryStrToHostAddr(AHost, Address4) then
+    if not TryCanonicalIPv4Host(AHost, CanonicalIPv4) then
       raise ELWPTRegistryError.CreateStable('invalid_url',
         'registry IPv4 host is invalid');
-    Exit(HostAddrToStr(Address4));
+    Exit(CanonicalIPv4);
   end;
   Labels := TStringList.Create;
   try
@@ -687,7 +822,7 @@ function CanonicalRegistryURL(const AValue: string;
   const ARequireHTTPS: Boolean): string;
 var
   Authority, Host, Path, Port, Scheme: string;
-  Address6: in6_addr;
+  Address6: TRegistryIPv6Address;
   Character: Char;
   BracketEnd, Colon, Slash: Integer;
 begin
@@ -720,7 +855,7 @@ begin
     BracketEnd := Pos(']', Authority);
     if BracketEnd = 0 then raise ELWPTRegistryError.CreateStable('invalid_url', 'invalid bracketed IPv6 host');
     Host := Copy(Authority, 2, BracketEnd - 2);
-    if not TryStrToHostAddr6(Host, Address6) then
+    if not TryParseIPv6Address(Host, Address6) then
       raise ELWPTRegistryError.CreateStable('invalid_url',
         'registry IPv6 host is invalid');
     Host := '[' + RFC5952(Address6) + ']';
@@ -812,7 +947,7 @@ end;
 
 procedure ValidateRegistryConfiguration(const AConfig: TLWPTRegistryConfig);
 var
-  BaseURL, Identity: string;
+  BaseURL, CanonicalListenAddress, Identity: string;
 begin
   ValidatePersistedConfigurationStrings(AConfig);
   BaseURL := CanonicalRegistryURL(AConfig.BaseURL, False);
@@ -827,7 +962,8 @@ begin
     raise ELWPTRegistryError.CreateStable('invalid_configuration', 'listen address and port are required');
   {$IFNDEF DARWIN}
   if not SameText(AConfig.ListenAddress, 'localhost')
-    and (StrToNetAddr(AConfig.ListenAddress).s_addr = LongWord(-1)) then
+    and not TryCanonicalIPv4Host(AConfig.ListenAddress,
+      CanonicalListenAddress) then
     raise ELWPTRegistryError.CreateStable('invalid_listen_address',
       'listen address must be localhost or an IPv4 address on this platform');
   {$ENDIF}

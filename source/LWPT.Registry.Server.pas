@@ -12,7 +12,11 @@ uses
 
   LWPT.Core,
   LWPT.Registry.Store,
+  {$IFDEF MSWINDOWS}
+  WinSock2;
+  {$ELSE}
   Sockets;
+  {$ENDIF}
 
 type
   TLWPTRegistryHTTPResponse = record
@@ -63,7 +67,6 @@ uses
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Windows,
-  WinSock2,
   {$ENDIF}
 
   {$IFDEF DARWIN}
@@ -82,6 +85,14 @@ var
   RegistryRequestSequence: LongInt;
 
 type
+  {$IFDEF MSWINDOWS}
+  TRegistrySockAddr = TSockAddrIn;
+  TRegistrySockLen = LongInt;
+  {$ELSE}
+  TRegistrySockAddr = TInetSockAddr;
+  TRegistrySockLen = TSockLen;
+  {$ENDIF}
+
   TLWPTRegistryClientThread = class(TThread)
   private
     FSocket: TSocket;
@@ -101,6 +112,151 @@ type
     procedure Cancel;
     property Done: Boolean read FDone;
   end;
+
+{$IFDEF MSWINDOWS}
+procedure StartRegistrySockets;
+var
+  Data: TWSAData;
+begin
+  if WSAStartup($0202, Data) <> 0 then
+    raise ELWPTRegistryError.CreateStable('listen_failed',
+      'could not initialize the Windows socket provider');
+end;
+
+procedure StopRegistrySockets;
+begin
+  WSACleanup;
+end;
+{$ENDIF}
+
+function RegistrySocket: TSocket; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
+  {$ELSE}
+  Result := fpSocket(AF_INET, SOCK_STREAM, 0);
+  {$ENDIF}
+end;
+
+function RegistrySocketInvalid(const ASocket: TSocket): Boolean; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := ASocket = INVALID_SOCKET;
+  {$ELSE}
+  Result := ASocket < 0;
+  {$ENDIF}
+end;
+
+procedure RegistrySocketClose(const ASocket: TSocket); inline;
+begin
+  {$IFDEF MSWINDOWS}
+  WinSock2.closesocket(ASocket);
+  {$ELSE}
+  CloseSocket(ASocket);
+  {$ENDIF}
+end;
+
+procedure RegistrySocketShutdown(const ASocket: TSocket); inline;
+begin
+  {$IFDEF MSWINDOWS}
+  WinSock2.shutdown(ASocket, SD_BOTH);
+  {$ELSE}
+  fpShutdown(ASocket, 2);
+  {$ENDIF}
+end;
+
+function RegistrySetSocketOption(const ASocket: TSocket;
+  const ALevel, AName: Integer; const AValue: Pointer;
+  const ASize: Integer): Integer; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.setsockopt(ASocket, ALevel, AName, PChar(AValue), ASize);
+  {$ELSE}
+  Result := fpSetSockOpt(ASocket, ALevel, AName, AValue, ASize);
+  {$ENDIF}
+end;
+
+function RegistrySocketSend(const ASocket: TSocket; const ABuffer: Pointer;
+  const ALength: Integer): Integer; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.send(ASocket, ABuffer^, ALength, 0);
+  {$ELSE}
+  Result := fpSend(ASocket, ABuffer, ALength, 0);
+  {$ENDIF}
+end;
+
+function RegistrySocketReceive(const ASocket: TSocket;
+  const ABuffer: Pointer; const ALength: Integer): Integer; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.recv(ASocket, ABuffer^, ALength, 0);
+  {$ELSE}
+  Result := fpRecv(ASocket, ABuffer, ALength, 0);
+  {$ENDIF}
+end;
+
+function RegistrySocketBind(const ASocket: TSocket;
+  var AAddress: TRegistrySockAddr): Integer; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.bind(ASocket, PSockAddr(@AAddress), SizeOf(AAddress));
+  {$ELSE}
+  Result := fpBind(ASocket, @AAddress, SizeOf(AAddress));
+  {$ENDIF}
+end;
+
+function RegistrySocketListen(const ASocket: TSocket): Integer; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.listen(ASocket, 128);
+  {$ELSE}
+  Result := fpListen(ASocket, 128);
+  {$ENDIF}
+end;
+
+procedure RegistrySocketReadSet(const ASocket: TSocket;
+  out AReadSet: TFDSet); inline;
+begin
+  {$IFDEF MSWINDOWS}
+  FillChar(AReadSet, SizeOf(AReadSet), 0);
+  AReadSet.fd_count := 1;
+  AReadSet.fd_array[0] := ASocket;
+  {$ELSE}
+  fpFD_ZERO(AReadSet);
+  fpFD_SET(ASocket, AReadSet);
+  {$ENDIF}
+end;
+
+function RegistrySocketSelect(const ASocket: TSocket; var AReadSet: TFDSet;
+  var ATimeout: TTimeVal): Integer; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.select(0, @AReadSet, nil, nil, @ATimeout);
+  {$ELSE}
+  Result := fpSelect(ASocket + 1, @AReadSet, nil, nil, @ATimeout);
+  {$ENDIF}
+end;
+
+function RegistrySocketAccept(const ASocket: TSocket;
+  var AAddress: TRegistrySockAddr;
+  var AAddressLength: TRegistrySockLen): TSocket; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.accept(ASocket, PSockAddr(@AAddress), @AAddressLength);
+  {$ELSE}
+  Result := fpAccept(ASocket, @AAddress, @AAddressLength);
+  {$ENDIF}
+end;
+
+function RegistryIPv4Address(const AHost: string): LongWord; inline;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.inet_addr(PAnsiChar(AnsiString(AHost)));
+  {$ELSE}
+  Result := StrToNetAddr(AHost).s_addr;
+  {$ENDIF}
+end;
 
 function Bytes(const AValue: string): TBytes;
 begin
@@ -444,7 +600,7 @@ end;
 procedure TLWPTRegistryClientThread.Cancel;
 begin
   Terminate;
-  fpShutdown(FSocket, 2);
+  RegistrySocketShutdown(FSocket);
 end;
 
 procedure ApplyDeadlineTimeout(const ASocket: TSocket;
@@ -466,8 +622,10 @@ begin
   {$ELSE}
   Timeout := Remaining;
   {$ENDIF}
-  fpSetSockOpt(ASocket, SOL_SOCKET, SO_RCVTIMEO, @Timeout, SizeOf(Timeout));
-  fpSetSockOpt(ASocket, SOL_SOCKET, SO_SNDTIMEO, @Timeout, SizeOf(Timeout));
+  RegistrySetSocketOption(ASocket, SOL_SOCKET, SO_RCVTIMEO, @Timeout,
+    SizeOf(Timeout));
+  RegistrySetSocketOption(ASocket, SOL_SOCKET, SO_SNDTIMEO, @Timeout,
+    SizeOf(Timeout));
 end;
 
 procedure SendAll(const ASocket: TSocket; const ABytes: TBytes;
@@ -480,7 +638,8 @@ begin
   begin
     if GetTickCount64 >= ADeadline then Exit;
     ApplyDeadlineTimeout(ASocket, ADeadline);
-    Sent := fpSend(ASocket, @ABytes[Offset], Length(ABytes) - Offset, 0);
+    Sent := RegistrySocketSend(ASocket, @ABytes[Offset],
+      Length(ABytes) - Offset);
     if Sent <= 0 then Exit;
     Inc(Offset, Sent);
   end;
@@ -528,7 +687,8 @@ begin
     while SentTotal < ReadCount do
     begin
       ApplyDeadlineTimeout(ASocket, ADeadline);
-      Sent := fpSend(ASocket, @Buffer[SentTotal], ReadCount - SentTotal, 0);
+      Sent := RegistrySocketSend(ASocket, @Buffer[SentTotal],
+        ReadCount - SentTotal);
       if Sent <= 0 then Exit;
       Inc(SentTotal, Sent);
     end;
@@ -552,7 +712,7 @@ begin
       repeat
         CheckDeadline;
         ApplyDeadlineTimeout(FSocket, FDeadline);
-        Received := fpRecv(FSocket, @Buffer[0], Length(Buffer), 0);
+        Received := RegistrySocketReceive(FSocket, @Buffer[0], Length(Buffer));
         if Received <= 0 then Exit;
         if Length(Request) + Received > MAX_REQUEST_HEADER_BYTES then
         begin
@@ -621,7 +781,7 @@ begin
     ApplyDeadlineTimeout(ASocket, ADeadline);
     Pending := TransportSecurityGetCiphertext(AConnection, Buffer);
     if Pending <= 0 then Exit;
-    Sent := fpSend(ASocket, Buffer, Pending, 0);
+    Sent := RegistrySocketSend(ASocket, Buffer, Pending);
     if Sent <= 0 then
       raise ELWPTRegistryError.CreateStable('tls_io_failed',
         'could not send TLS ciphertext');
@@ -640,7 +800,7 @@ begin
     raise ELWPTRegistryError.CreateStable('connection_deadline',
       'registry connection exceeded its total deadline');
   ApplyDeadlineTimeout(ASocket, ADeadline);
-  Received := fpRecv(ASocket, @Buffer[0], Length(Buffer), 0);
+  Received := RegistrySocketReceive(ASocket, @Buffer[0], Length(Buffer));
   if Received <= 0 then
     raise ELWPTRegistryError.CreateStable('tls_io_failed',
       'TLS peer closed before completing the request');
@@ -802,8 +962,8 @@ begin
   except
     { Connection-scoped protocol and I/O failures do not stop the listener. }
   end;
-  fpShutdown(FSocket, 2);
-  CloseSocket(FSocket);
+  RegistrySocketShutdown(FSocket);
+  RegistrySocketClose(FSocket);
   FDone := True;
 end;
 
@@ -881,8 +1041,8 @@ end;
 
 procedure TLWPTRegistryServer.Run;
 var
-  Address: TInetSockAddr;
-  AddressLength: TSocklen;
+  Address: TRegistrySockAddr;
+  AddressLength: TRegistrySockLen;
   ClientSocket, ListenSocket: TSocket;
   Client: TLWPTRegistryClientThread;
   Clients: TList;
@@ -901,6 +1061,10 @@ var
   {$ENDIF}
   TLSServerContext: TTransportSecurityServerContext;
 begin
+  {$IFDEF MSWINDOWS}
+  StartRegistrySockets;
+  try
+  {$ENDIF}
   TLSServerContext := nil;
   if StartsText('https://', FStore.Config.BaseURL) then
   begin
@@ -919,8 +1083,8 @@ begin
   end;
   ListenHost := FStore.Config.ListenAddress;
   if SameText(ListenHost, 'localhost') then ListenHost := '127.0.0.1';
-  ListenSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
-  if ListenSocket < 0 then
+  ListenSocket := RegistrySocket;
+  if RegistrySocketInvalid(ListenSocket) then
   begin
     TLSServerContext.Free;
     raise ELWPTRegistryError.CreateStable('listen_failed',
@@ -928,20 +1092,20 @@ begin
   end;
   try
     Reuse := 1;
-    fpSetSockOpt(ListenSocket, SOL_SOCKET, SO_REUSEADDR, @Reuse,
+    RegistrySetSocketOption(ListenSocket, SOL_SOCKET, SO_REUSEADDR, @Reuse,
       SizeOf(Reuse));
     FillChar(Address, SizeOf(Address), 0);
     Address.sin_family := AF_INET;
-    Address.sin_port := HToNs(FStore.Config.Port);
-    Address.sin_addr := StrToNetAddr(ListenHost);
+    Address.sin_port := htons(FStore.Config.Port);
+    Address.sin_addr.s_addr := RegistryIPv4Address(ListenHost);
     if Address.sin_addr.s_addr = LongWord(-1) then
       raise ELWPTRegistryError.CreateStable('invalid_listen_address',
         'listen address must be localhost or an IPv4 address');
-    if fpBind(ListenSocket, @Address, SizeOf(Address)) <> 0 then
+    if RegistrySocketBind(ListenSocket, Address) <> 0 then
       raise ELWPTRegistryError.CreateStable('listen_failed',
         'could not bind ' + FStore.Config.ListenAddress + ':'
         + IntToStr(FStore.Config.Port));
-    if fpListen(ListenSocket, 128) <> 0 then
+    if RegistrySocketListen(ListenSocket) <> 0 then
       raise ELWPTRegistryError.CreateStable('listen_failed',
         'could not listen on the configured registry socket');
     WriteLn('registry origin ', FStore.Config.Identity, ' listening at ',
@@ -949,12 +1113,11 @@ begin
     while not FStopping do
     begin
       ReapClients;
-      fpFD_ZERO(ReadSet);
-      fpFD_SET(ListenSocket, ReadSet);
+      RegistrySocketReadSet(ListenSocket, ReadSet);
       SelectTimeout.tv_sec := 0;
       SelectTimeout.tv_usec := 100000;
-      SelectResult := fpSelect(ListenSocket + 1, @ReadSet, nil, nil,
-        @SelectTimeout);
+      SelectResult := RegistrySocketSelect(ListenSocket, ReadSet,
+        SelectTimeout);
       if SelectResult < 0 then
       begin
         if FStopping then Break;
@@ -962,8 +1125,9 @@ begin
       end;
       if SelectResult = 0 then Continue;
       AddressLength := SizeOf(Address);
-      ClientSocket := fpAccept(ListenSocket, @Address, @AddressLength);
-      if ClientSocket < 0 then
+      ClientSocket := RegistrySocketAccept(ListenSocket, Address,
+        AddressLength);
+      if RegistrySocketInvalid(ClientSocket) then
       begin
         if FStopping then Break;
         Continue;
@@ -972,8 +1136,8 @@ begin
       try
         if Clients.Count >= MAX_ACTIVE_CLIENTS then
         begin
-          fpShutdown(ClientSocket, 2);
-          CloseSocket(ClientSocket);
+          RegistrySocketShutdown(ClientSocket);
+          RegistrySocketClose(ClientSocket);
           Continue;
         end;
       finally
@@ -985,9 +1149,9 @@ begin
       {$ELSE}
       Timeout := CLIENT_READ_TIMEOUT_MILLISECONDS;
       {$ENDIF}
-      fpSetSockOpt(ClientSocket, SOL_SOCKET, SO_RCVTIMEO, @Timeout,
+      RegistrySetSocketOption(ClientSocket, SOL_SOCKET, SO_RCVTIMEO, @Timeout,
         SizeOf(Timeout));
-      fpSetSockOpt(ClientSocket, SOL_SOCKET, SO_SNDTIMEO, @Timeout,
+      RegistrySetSocketOption(ClientSocket, SOL_SOCKET, SO_SNDTIMEO, @Timeout,
         SizeOf(Timeout));
       Client := TLWPTRegistryClientThread.Create(ClientSocket, FStore,
         TLSServerContext);
@@ -1001,10 +1165,15 @@ begin
     end;
   finally
     FStopping := True;
-    CloseSocket(ListenSocket);
+    RegistrySocketClose(ListenSocket);
     DrainClients;
     TLSServerContext.Free;
   end;
+  {$IFDEF MSWINDOWS}
+  finally
+    StopRegistrySockets;
+  end;
+  {$ENDIF}
 end;
 
 end.

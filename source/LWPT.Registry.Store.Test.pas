@@ -712,6 +712,12 @@ begin
     'https://[2001:0db8:0:0:0:0:0:1]:443/a/../b', False))
     .ToBe('https://[2001:db8::1]/b');
   Expect<string>(CanonicalRegistryURL(
+    'https://127.000.000.001:443/a', False))
+    .ToBe('https://127.0.0.1/a');
+  Expect<string>(CanonicalRegistryURL(
+    'https://[::ffff:192.0.2.128]/a', False))
+    .ToBe('https://[::ffff:c000:280]/a');
+  Expect<string>(CanonicalRegistryURL(
     'https://example.com/a//b/%2f/c', False))
     .ToBe('https://example.com/a//b/%2F/c');
   Expect<string>(CanonicalRegistryURL('https://example.com/a/', False))
