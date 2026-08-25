@@ -9,6 +9,7 @@ unit LWPT.ObjectStore;
 interface
 
 uses
+  Classes,
   SysUtils,
 
   LWPT.CacheLifecycle,
@@ -36,9 +37,9 @@ type
     ADestination: string);
   TLWPTObjectStoreMaterializeHook = procedure(const ADigest,
     APath: string);
-  TLWPTObjectStoreStagedVerificationOpenHook = procedure(
-    const APath: string; const AAttempt: Integer;
-    out AErrorCode: Integer);
+  TLWPTObjectStoreMaterializeStreamHook = procedure(
+    const ADigest: string; const AStream: TStream);
+  TLWPTObjectStoreStreamOpenedHook = procedure(const APath: string);
   {$ENDIF}
 
   TLWPTImmutableObjectStore = class
@@ -94,8 +95,10 @@ var
     TLWPTObjectStoreMaterializeHook;
   ObjectStoreAfterMaterializeCopyTestHook:
     TLWPTObjectStoreMaterializeHook;
-  ObjectStoreStagedVerificationOpenTestHook:
-    TLWPTObjectStoreStagedVerificationOpenHook;
+  ObjectStoreAfterMaterializeCopyStreamTestHook:
+    TLWPTObjectStoreMaterializeStreamHook;
+  ObjectStoreBeforeStreamProtectionTestHook:
+    TLWPTObjectStoreStreamOpenedHook;
 {$ENDIF}
 
 implementation
@@ -104,40 +107,106 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
-  Classes;
+  LWPT.ProcessTree;
 
-function StagedVerificationHash(const APath: string): string;
+{$IFDEF UNIX}
 const
-  OPEN_ATTEMPTS = 3;
-  OPEN_RETRY_MILLISECONDS = 1;
+  {$IFDEF LINUX}
+  FD_CLOEXEC_LWPT = 1;
+  {$ELSE}
+  FD_CLOEXEC_LWPT = FD_CLOEXEC;
+  {$ENDIF}
+
+procedure ProtectStreamFromChildInheritance(const AStream: TFileStream;
+  const APath: string);
 var
-  Attempt: Integer;
   ErrorCode: Integer;
 begin
-  for Attempt := 1 to OPEN_ATTEMPTS do
-  begin
-    ErrorCode := 0;
-    {$IFDEF OBJECTSTORE_TESTING}
-    if Assigned(ObjectStoreStagedVerificationOpenTestHook) then
-      ObjectStoreStagedVerificationOpenTestHook(APath, Attempt, ErrorCode);
-    {$ENDIF}
-    if ErrorCode = 0 then
-    begin
-      if not FileExists(APath) then Exit('');
-      if TrySHA256FileOpen(APath, Result, ErrorCode) then Exit;
+  if FpFcntl(AStream.Handle, F_SETFD, FD_CLOEXEC_LWPT) = 0 then Exit;
+  ErrorCode := FpGetErrNo;
+  raise ELWPTObjectStoreError.CreateFmt(
+    'failed to protect object-store stream from child inheritance at %s '
+    + '(system error %d)', [APath, ErrorCode]);
+end;
+
+function OpenProtectedObjectStream(const APath: string;
+  const AMode: Word): TFileStream;
+begin
+  Result := nil;
+  BeginProcessHandleSetup;
+  try
+    Result := TFileStream.Create(APath, AMode);
+    try
+      {$IFDEF OBJECTSTORE_TESTING}
+      if Assigned(ObjectStoreBeforeStreamProtectionTestHook) then
+        ObjectStoreBeforeStreamProtectionTestHook(APath);
+      {$ENDIF}
+      ProtectStreamFromChildInheritance(Result, APath);
+    except
+      Result.Free;
+      Result := nil;
+      raise;
     end;
-    {$IFDEF UNIX}
-    if (ErrorCode in [ESysEAGAIN, ESysEINTR])
-       and (Attempt < OPEN_ATTEMPTS) then
-    begin
-      Sleep(OPEN_RETRY_MILLISECONDS);
-      Continue;
-    end;
-    {$ENDIF}
-    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
-      [APath, SysErrorMessage(ErrorCode)]);
+  finally
+    EndProcessHandleSetup;
   end;
-  Result := '';
+end;
+{$ENDIF}
+
+function CopyFileContentAndHash(const ASrc, ADst, ADigest: string;
+  out AHash: string): Boolean;
+var
+  Buffer: TBytes;
+  CopyCompleted: Boolean;
+  Destination, Source: TFileStream;
+begin
+  Result := False;
+  AHash := '';
+  if not FileExists(ASrc) then Exit;
+  CopyCompleted := False;
+  try
+    {$IFDEF UNIX}
+    Source := OpenProtectedObjectStream(ASrc,
+      fmOpenRead or fmShareDenyNone);
+    {$ELSE}
+    Source := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
+    {$ENDIF}
+    try
+      {$IFDEF UNIX}
+      Destination := OpenProtectedObjectStream(ADst, fmCreate);
+      {$ELSE}
+      Destination := TFileStream.Create(ADst, fmCreate);
+      {$ENDIF}
+      try
+        if Source.Size > 0 then
+          Destination.CopyFrom(Source, Source.Size);
+        CopyCompleted := True;
+        { TFileStream creates staged files read-write. Read back through the
+          owned handle without a second FPC open; close-on-exec keeps its lock
+          from surviving in a compiler after this process closes the stream. }
+      {$IFDEF OBJECTSTORE_TESTING}
+        if Assigned(ObjectStoreAfterMaterializeCopyTestHook) then
+          ObjectStoreAfterMaterializeCopyTestHook(ADigest, ADst);
+        if Assigned(ObjectStoreAfterMaterializeCopyStreamTestHook) then
+          ObjectStoreAfterMaterializeCopyStreamTestHook(ADigest,
+            Destination);
+      {$ENDIF}
+        Destination.Position := 0;
+        SetLength(Buffer, Destination.Size);
+        if Destination.Size > 0 then
+          Destination.ReadBuffer(Buffer[0], Destination.Size);
+        AHash := SHA256Hex(Buffer);
+      finally
+        Destination.Free;
+      end;
+    finally
+      Source.Free;
+    end;
+  except
+    if CopyCompleted then raise;
+    Exit(False);
+  end;
+  Result := True;
 end;
 
 function ObjectMaterializeFailureName(
@@ -629,18 +698,15 @@ begin
         if Assigned(ObjectStoreBeforeMaterializeCopyTestHook) then
           ObjectStoreBeforeMaterializeCopyTestHook(Expected, SourcePath);
         {$ENDIF}
-        if not CopyFileContent(SourcePath, Staged) then
-        begin
-          if FileExists(Staged) then SysUtils.DeleteFile(Staged);
-          AFailure := omfCopyFailed;
-          Exit;
-        end;
         try
-          {$IFDEF OBJECTSTORE_TESTING}
-          if Assigned(ObjectStoreAfterMaterializeCopyTestHook) then
-            ObjectStoreAfterMaterializeCopyTestHook(Expected, Staged);
-          {$ENDIF}
-          Actual := 'sha256:' + StagedVerificationHash(Staged);
+          if not CopyFileContentAndHash(SourcePath, Staged, Expected,
+            Actual) then
+          begin
+            if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+            AFailure := omfCopyFailed;
+            Exit;
+          end;
+          Actual := 'sha256:' + Actual;
           if Actual <> Expected then
           begin
             SysUtils.DeleteFile(Staged);

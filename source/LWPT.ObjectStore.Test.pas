@@ -21,6 +21,7 @@ uses
   LWPT.CacheLifecycle,
   LWPT.Core,
   LWPT.ObjectStore,
+  LWPT.ProcessTree,
   TestingPascalLibrary,
   Tests.Scratch;
 
@@ -60,14 +61,28 @@ type
     property Output: string read FOutput;
   end;
 
+  {$IFDEF UNIX}
+  TProtectedStageSpawner = class(TThread)
+  private
+    FErrorMessage: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    property ErrorMessage: string read FErrorMessage;
+  end;
+  {$ENDIF}
+
 var
   ChildPhasePrefix: string;
   InjectPublicationFailure: Boolean;
+  ProtectedStageChild: TProcess;
+  {$IFDEF UNIX}
+  ProtectedStageSpawnAttemptPath: string;
+  ProtectedStageSpawner: TProtectedStageSpawner;
+  {$ENDIF}
+  ProtectedStageChildReadyPath: string;
   ReplacementSource: string;
-  StagedVerificationAttempts: Integer;
-  StagedVerificationErrorCode: Integer;
-  StagedVerificationFailures: Integer;
-  StagedVerificationPath: string;
   StageReadyPath: string;
   StageReleasePath: string;
 
@@ -76,38 +91,12 @@ begin
   SysUtils.DeleteFile(APath);
 end;
 
-procedure CorruptMaterializeStage(const ADigest, APath: string);
-var
-  Stream: TFileStream;
+procedure CorruptMaterializeStage(const ADigest: string;
+  const AStream: TStream);
 begin
-  Stream := TFileStream.Create(APath, fmCreate);
-  try
-    Stream.WriteBuffer(ADigest[1], 1);
-  finally
-    Stream.Free;
-  end;
+  AStream.Position := 0;
+  AStream.WriteBuffer(ADigest[1], 1);
 end;
-
-{$IFDEF UNIX}
-procedure FailStagedVerificationOpen(const APath: string;
-  const AAttempt: Integer; out AErrorCode: Integer);
-begin
-  StagedVerificationAttempts := AAttempt;
-  StagedVerificationPath := APath;
-  AErrorCode := 0;
-  if AAttempt > StagedVerificationFailures then Exit;
-  AErrorCode := StagedVerificationErrorCode;
-end;
-
-procedure RemoveStagedVerificationFile(const APath: string;
-  const AAttempt: Integer; out AErrorCode: Integer);
-begin
-  StagedVerificationAttempts := AAttempt;
-  StagedVerificationPath := APath;
-  AErrorCode := 0;
-  SysUtils.DeleteFile(APath);
-end;
-{$ENDIF}
 
 type
   TObjectStoreContract = class(TTestSuite)
@@ -133,9 +122,7 @@ type
     procedure TestAdmitLookupAndMaterialize;
     procedure TestMaterializeReportsExactFailureStage;
     {$IFDEF UNIX}
-    procedure TestTransientStagedVerificationOpenRecovers;
-    procedure TestTransientStagedVerificationOpenStopsAtBound;
-    procedure TestNonTransientStagedVerificationOpenIsNotRetried;
+    procedure TestMaterializeProtectsStageFromChildInheritance;
     {$ENDIF}
     procedure TestAdmissionHashMismatchPublishesNothing;
     procedure TestCorruptObjectIsQuarantinedAndMisses;
@@ -157,12 +144,60 @@ begin
   Stream.Free;
 end;
 
+function WaitForSignal(const APath: string): Boolean; forward;
+
+{$IFDEF UNIX}
+procedure MarkProtectedStageSpawnAttempt;
+begin
+  WriteSignal(ProtectedStageSpawnAttemptPath);
+end;
+
+constructor TProtectedStageSpawner.Create;
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+end;
+
+procedure TProtectedStageSpawner.Execute;
+begin
+  FErrorMessage := '';
+  try
+    ProtectedStageChild := TProcess.Create(nil);
+    ProtectedStageChild.Executable := '/bin/sh';
+    ProtectedStageChild.Parameters.Add('-c');
+    ProtectedStageChild.Parameters.Add(
+      'printf ready > "$1"; sleep 5');
+    ProtectedStageChild.Parameters.Add('object-store-child');
+    ProtectedStageChild.Parameters.Add(ProtectedStageChildReadyPath);
+    ProtectedStageChild.Options := [poNoConsole];
+    ExecuteUnmanagedProcess(ProtectedStageChild);
+  except
+    on E: Exception do FErrorMessage := E.Message;
+  end;
+end;
+
+procedure AttemptSpawnBeforeStreamProtection(const APath: string);
+begin
+  if Pos('cache-object.', ExtractFileName(APath)) <> 1 then Exit;
+  ProtectedStageSpawnAttemptPath := APath + '.spawn-attempt';
+  ProtectedStageChildReadyPath := APath + '.child-ready';
+  ProcessTreeBeforeUnmanagedSpawnLockTestHook :=
+    MarkProtectedStageSpawnAttempt;
+  ProtectedStageSpawner := TProtectedStageSpawner.Create;
+  ProtectedStageSpawner.Start;
+  if not WaitForSignal(ProtectedStageSpawnAttemptPath) then
+    raise Exception.Create('timed out waiting for concurrent spawn attempt');
+  Sleep(100);
+  if FileExists(ProtectedStageChildReadyPath) then
+    raise Exception.Create(
+      'concurrent child escaped the stream-protection spawn guard');
+end;
+{$ENDIF}
+
 procedure MarkChildPhase(const APhase: string);
 begin
   WriteSignal(ChildPhasePrefix + '.phase-' + APhase);
 end;
-
-function WaitForSignal(const APath: string): Boolean; forward;
 
 procedure PauseAfterStage(const APath: string);
 begin
@@ -478,11 +513,15 @@ procedure TObjectStoreContract.ResetScratch;
 begin
   ObjectStoreBeforeMaterializeCopyTestHook := nil;
   ObjectStoreAfterMaterializeCopyTestHook := nil;
-  ObjectStoreStagedVerificationOpenTestHook := nil;
-  StagedVerificationAttempts := 0;
-  StagedVerificationErrorCode := 0;
-  StagedVerificationFailures := 0;
-  StagedVerificationPath := '';
+  ObjectStoreAfterMaterializeCopyStreamTestHook := nil;
+  ObjectStoreBeforeStreamProtectionTestHook := nil;
+  {$IFDEF UNIX}
+  ProcessTreeBeforeUnmanagedSpawnLockTestHook := nil;
+  ProtectedStageSpawnAttemptPath := '';
+  ProtectedStageSpawner := nil;
+  {$ENDIF}
+  ProtectedStageChild := nil;
+  ProtectedStageChildReadyPath := '';
   if DirectoryExists(FScratch) then WipeDir(FScratch);
   ForceDirectories(FScratch);
   FStoreRoot := FScratch + '/cache/dependency-archives';
@@ -492,107 +531,62 @@ begin
 end;
 
 {$IFDEF UNIX}
-procedure TObjectStoreContract.TestTransientStagedVerificationOpenRecovers;
+procedure TObjectStoreContract.
+  TestMaterializeProtectsStageFromChildInheritance;
 var
   Destination: string;
   ErrorCode: Integer;
+  Handle: THandle;
   Store: TLWPTImmutableObjectStore;
 begin
   Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
     FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     Store.Admit(FSource, FDigest);
-    ObjectStoreStagedVerificationOpenTestHook :=
-      FailStagedVerificationOpen;
-    for ErrorCode in [ESysEAGAIN, ESysEINTR] do
-    begin
-      StagedVerificationAttempts := 0;
-      StagedVerificationErrorCode := ErrorCode;
-      StagedVerificationFailures := 1;
-      Destination := FScratch + '/project/materialized-'
-        + IntToStr(ErrorCode);
-      Expect<Boolean>(Store.Materialize(FDigest, Destination,
-        FScratch + '/project/tmp')).ToBe(True);
-      Expect<Integer>(StagedVerificationAttempts).ToBe(2);
-      Expect<string>(ReadBytes(Destination)).ToBe(ReadBytes(FSource));
-    end;
-  finally
-    ObjectStoreStagedVerificationOpenTestHook := nil;
-    Store.Free;
-  end;
-end;
-
-procedure TObjectStoreContract.TestTransientStagedVerificationOpenStopsAtBound;
-var
-  Destination, ObjectPath, LookupPath: string;
-  Raised: Boolean;
-  Store: TLWPTImmutableObjectStore;
-begin
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
-    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
-  try
-    ObjectPath := Store.Admit(FSource, FDigest);
+    ObjectStoreBeforeStreamProtectionTestHook :=
+      AttemptSpawnBeforeStreamProtection;
     Destination := FScratch + '/project/materialized';
-    StagedVerificationErrorCode := ESysEAGAIN;
-    StagedVerificationFailures := MaxInt;
-    ObjectStoreStagedVerificationOpenTestHook :=
-      FailStagedVerificationOpen;
-    Raised := False;
-    try
-      Store.Materialize(FDigest, Destination, FScratch + '/project/tmp');
-    except
-      on E: EFOpenError do Raised := True;
-    end;
-    Expect<Boolean>(Raised).ToBe(True);
-    Expect<Integer>(StagedVerificationAttempts).ToBe(3);
-    Expect<Boolean>(FileExists(Destination)).ToBe(False);
-    Expect<Boolean>(FileExists(StagedVerificationPath)).ToBe(False);
-    Expect<Boolean>(FileExists(ObjectPath)).ToBe(True);
-    Expect<Boolean>(Store.Lookup(FDigest, LookupPath)).ToBe(True);
-    Expect<string>(LookupPath).ToBe(ObjectPath);
-  finally
-    ObjectStoreStagedVerificationOpenTestHook := nil;
-    Store.Free;
-  end;
-end;
-
-procedure TObjectStoreContract.TestNonTransientStagedVerificationOpenIsNotRetried;
-var
-  Destination: string;
-  Failure: TLWPTObjectMaterializeFailure;
-  Raised: Boolean;
-  Store: TLWPTImmutableObjectStore;
-begin
-  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
-    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
-  try
-    Store.Admit(FSource, FDigest);
-    Destination := FScratch + '/project/permission-denied';
-    StagedVerificationErrorCode := ESysEACCES;
-    StagedVerificationFailures := MaxInt;
-    ObjectStoreStagedVerificationOpenTestHook :=
-      FailStagedVerificationOpen;
-    Raised := False;
-    try
-      Store.Materialize(FDigest, Destination, FScratch + '/project/tmp');
-    except
-      on E: EFOpenError do Raised := True;
-    end;
-    Expect<Boolean>(Raised).ToBe(True);
-    Expect<Integer>(StagedVerificationAttempts).ToBe(1);
-
-    StagedVerificationAttempts := 0;
-    Destination := FScratch + '/project/missing-stage';
-    ObjectStoreStagedVerificationOpenTestHook :=
-      RemoveStagedVerificationFile;
     Expect<Boolean>(Store.Materialize(FDigest, Destination,
-      FScratch + '/project/tmp', Failure)).ToBe(False);
-    Expect<Integer>(Ord(Failure)).ToBe(Ord(omfStagedHashMismatch));
-    Expect<Integer>(StagedVerificationAttempts).ToBe(1);
+      FScratch + '/project/tmp')).ToBe(True);
+    Expect<Boolean>(WaitForSignal(ProtectedStageChildReadyPath)).ToBe(True);
+    ProtectedStageSpawner.WaitFor;
+    Expect<string>(ProtectedStageSpawner.ErrorMessage).ToBe('');
+    Expect<Boolean>(Assigned(ProtectedStageChild)).ToBe(True);
+    Expect<Boolean>(ProtectedStageChild.Running).ToBe(True);
+    Handle := FileOpen(Destination, fmOpenRead or fmShareDenyNone);
+    if Handle = THandle(-1) then ErrorCode := GetLastOSError
+    else
+    begin
+      ErrorCode := 0;
+      FileClose(Handle);
+    end;
+    Expect<Integer>(ErrorCode).ToBe(0);
   finally
-    ObjectStoreStagedVerificationOpenTestHook := nil;
+    ObjectStoreBeforeStreamProtectionTestHook := nil;
+    ProcessTreeBeforeUnmanagedSpawnLockTestHook := nil;
+    if Assigned(ProtectedStageSpawner) then
+    begin
+      ProtectedStageSpawner.WaitFor;
+      ProtectedStageSpawner.Free;
+      ProtectedStageSpawner := nil;
+    end;
+    if Assigned(ProtectedStageChild) then
+    begin
+      if ProtectedStageChild.Running then
+        ProtectedStageChild.Terminate(0);
+      ProtectedStageChild.WaitOnExit(2000);
+      ProtectedStageChild.Free;
+      ProtectedStageChild := nil;
+    end;
+    if FileExists(ProtectedStageChildReadyPath) then
+      SysUtils.DeleteFile(ProtectedStageChildReadyPath);
+    if FileExists(ProtectedStageSpawnAttemptPath) then
+      SysUtils.DeleteFile(ProtectedStageSpawnAttemptPath);
+    ProtectedStageChildReadyPath := '';
+    ProtectedStageSpawnAttemptPath := '';
     Store.Free;
   end;
+  Expect<string>(ReadBytes(Destination)).ToBe(ReadBytes(FSource));
 end;
 {$ENDIF}
 
@@ -755,13 +749,14 @@ begin
     end;
 
     Store.Admit(FSource, FDigest);
-    ObjectStoreAfterMaterializeCopyTestHook := CorruptMaterializeStage;
+    ObjectStoreAfterMaterializeCopyStreamTestHook :=
+      CorruptMaterializeStage;
     try
       Expect<Boolean>(Store.Materialize(FDigest, Destination,
         FScratch + '/project/tmp', Failure)).ToBe(False);
       Expect<Integer>(Ord(Failure)).ToBe(Ord(omfStagedHashMismatch));
     finally
-      ObjectStoreAfterMaterializeCopyTestHook := nil;
+      ObjectStoreAfterMaterializeCopyStreamTestHook := nil;
     end;
   finally
     Store.Free;
@@ -1060,12 +1055,8 @@ begin
   Test('materialization reports the exact failing object-store stage',
     TestMaterializeReportsExactFailureStage);
   {$IFDEF UNIX}
-  Test('one transient staged verification open recovers',
-    TestTransientStagedVerificationOpenRecovers);
-  Test('persistent transient staged verification opens stop at the bound',
-    TestTransientStagedVerificationOpenStopsAtBound);
-  Test('non-transient staged verification opens are not retried',
-    TestNonTransientStagedVerificationOpenIsNotRetried);
+  Test('materialization protects its staged handle from child inheritance',
+    TestMaterializeProtectsStageFromChildInheritance);
   {$ENDIF}
   Test('admission refuses a mismatched digest before publication',
     TestAdmissionHashMismatchPublishesNothing);

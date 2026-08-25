@@ -121,6 +121,39 @@ def watchdog_expired(started_at: str, maximum_age_minutes: int, now: datetime) -
     return (now - started).total_seconds() >= maximum_age_minutes * 60
 
 
+def check_output_title(check: dict[str, Any]) -> str | None:
+    output = check.get("output")
+    if not isinstance(output, dict):
+        return None
+    title = output.get("title")
+    return title if isinstance(title, str) else None
+
+
+def check_is_terminal(
+    head_sha: str, automation: dict[str, Any], check: dict[str, Any] | None
+) -> bool:
+    if not check:
+        return False
+    terminal_conclusions = set(
+        automation.get("terminal_check_conclusions", ["success"])
+    )
+    if (
+        check.get("conclusion") != "skipped"
+        and check.get("conclusion") in terminal_conclusions
+    ):
+        return True
+    skipped_titles = automation.get("terminal_skipped_output_titles", [])
+    output_title = check_output_title(check)
+    return (
+        check.get("status") == "completed"
+        and check.get("conclusion") == "skipped"
+        and check.get("head_sha") == head_sha
+        and isinstance(skipped_titles, list)
+        and bool(output_title)
+        and output_title in skipped_titles
+    )
+
+
 def review_evidence_errors(
     head_sha: str,
     automations: Iterable[dict[str, Any]],
@@ -167,10 +200,7 @@ def review_evidence_errors(
         active_automations += 1
         if contexts:
             latest_check = max(matching_checks, key=lambda item: item.get("id", 0), default=None)
-            terminal_conclusions = set(
-                automation.get("terminal_check_conclusions", ["success"])
-            )
-            if not latest_check or latest_check.get("conclusion") not in terminal_conclusions:
+            if not check_is_terminal(head_sha, automation, latest_check):
                 errors.append(f"{automation_id}: terminal current-head check is missing")
 
         terminal_states = set(automation.get("terminal_review_states", ["APPROVED", "COMMENTED"]))
