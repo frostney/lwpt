@@ -751,6 +751,9 @@ begin
   Expect<string>(CanonicalRegistryURL(
     'https://example.com/a//b/%2f/c', False))
     .ToBe('https://example.com/a//b/%2F/c');
+  Expect<string>(CanonicalRegistryURL(
+    'https://example.com/a!$&''()*+,;=:@/b', False))
+    .ToBe('https://example.com/a!$&''()*+,;=:@/b');
   Expect<string>(CanonicalRegistryURL('https://example.com/a/', False))
     .ToBe('https://example.com/a');
   Expect<string>(CanonicalRegistryURL('https://example.com/', False))
@@ -762,6 +765,20 @@ begin
   Diagnostic := '';
   try
     CanonicalRegistryURL('https://' + Host + 'd', False);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('invalid_url:', Diagnostic) = 1).ToBe(True);
+  Diagnostic := '';
+  try
+    CanonicalRegistryURL('https://example.com/{package}', False);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('invalid_url:', Diagnostic) = 1).ToBe(True);
+  Diagnostic := '';
+  try
+    CanonicalRegistryURL('https://example.com/' + #$C3 + #$A9, False);
   except
     on E: Exception do Diagnostic := E.Message;
   end;

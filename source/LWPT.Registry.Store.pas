@@ -509,6 +509,13 @@ begin
   Result := (ACharacter in ['A'..'Z', 'a'..'z', '0'..'9', '-', '.', '_', '~']);
 end;
 
+function IsURIPathCharacter(const ACharacter: Char): Boolean;
+begin
+  Result := IsUnreserved(ACharacter)
+    or (ACharacter in ['!', '$', '&', '''', '(', ')', '*', '+', ',', ';',
+      '=', ':', '@', '/']);
+end;
+
 function CanonicalPercentEncoding(const AValue: string): string;
 const
   HEX = '0123456789ABCDEF';
@@ -522,6 +529,9 @@ begin
   begin
     if AValue[Index] <> '%' then
     begin
+      if not IsURIPathCharacter(AValue[Index]) then
+        raise ELWPTRegistryError.CreateStable('invalid_url',
+          'registry URL path contains an invalid raw character');
       Result := Result + AValue[Index];
       Inc(Index);
       Continue;
@@ -847,8 +857,8 @@ begin
     raise ELWPTRegistryError.CreateStable('invalid_identity', 'explicit origin identity must use https');
   Authority := Copy(AValue, Pos('://', AValue) + 3, MaxInt);
   if (Pos('?', Authority) > 0) or (Pos('#', Authority) > 0)
-    or (Pos('@', Authority) > 0) then
-    raise ELWPTRegistryError.CreateStable('invalid_url', 'user information, query, and fragment are forbidden');
+    then raise ELWPTRegistryError.CreateStable('invalid_url',
+      'query and fragment are forbidden');
   Slash := Pos('/', Authority);
   if Slash > 0 then
   begin
@@ -856,6 +866,9 @@ begin
     Authority := Copy(Authority, 1, Slash - 1);
   end
   else Path := '';
+  if Pos('@', Authority) > 0 then
+    raise ELWPTRegistryError.CreateStable('invalid_url',
+      'user information is forbidden');
   if Authority = '' then raise ELWPTRegistryError.CreateStable('invalid_url', 'registry URL host is empty');
   Port := '';
   if Authority[1] = '[' then
