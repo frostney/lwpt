@@ -431,9 +431,14 @@ function BlockMatchesABI(var ABlock: TRegistryBlock;
   ADescriptor: PBlockDescriptor; const AExpectedSignature: AnsiString): Boolean;
 begin
   MakeBlock(ABlock, nil, nil, ADescriptor);
-  Result := (ABlock.Flags and BLOCK_FLAG_HAS_SIGNATURE <> 0)
+  Result := (ABlock.Isa = BlockIsaStack)
+    and (ABlock.Flags and BLOCK_FLAG_HAS_SIGNATURE <> 0)
+    and (ABlock.Reserved = 0)
+    and (ABlock.Descriptor = ADescriptor)
+    and (ABlock.Descriptor^.Reserved = 0)
     and (ABlock.Descriptor^.Size = SizeOf(TRegistryBlock))
     and (AnsiString(ABlock.Descriptor^.Signature) = AExpectedSignature)
+    and (ABlock.Descriptor^.Layout = nil)
     and Block_has_signature(@ABlock);
 end;
 
@@ -442,13 +447,15 @@ var
   Block: TRegistryBlock;
 begin
   Result := BlockMatchesABI(Block, @ConfigureBlockDescriptor,
-    ConfigureBlockSignature)
-    and BlockMatchesABI(Block, @StateBlockDescriptor, StateBlockSignature)
+    'v16@?0^{nw_protocol_options=}8')
+    and BlockMatchesABI(Block, @StateBlockDescriptor,
+      'v20@?0i8^{nw_error=}12')
     and BlockMatchesABI(Block, @ReceiveBlockDescriptor,
-      ReceiveBlockSignature)
-    and BlockMatchesABI(Block, @SendBlockDescriptor, SendBlockSignature)
+      'v36@?0^{dispatch_data_s=}8^{nw_content_context=}16B24^{nw_error=}28')
+    and BlockMatchesABI(Block, @SendBlockDescriptor,
+      'v16@?0^{nw_error=}8')
     and BlockMatchesABI(Block, @NewConnectionBlockDescriptor,
-      NewConnectionBlockSignature);
+      'v16@?0^{nw_connection=}8');
 end;
 {$ENDIF}
 
