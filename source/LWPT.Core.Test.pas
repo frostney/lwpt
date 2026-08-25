@@ -380,6 +380,7 @@ type
     procedure TestMoveDirReplacesExistingBareDestination;
     {$IFDEF MSWINDOWS}
     procedure TestReplaceFileAtDeepExistingDestination;
+    procedure TestReplaceFileRejectsDirectorySource;
     {$ENDIF}
     {$IFDEF UNIX}
     procedure TestMoveFileReplacesExistingAcrossFilesystems;
@@ -3583,6 +3584,15 @@ begin
   Expect<Boolean>(FileExists(SourcePath)).ToBe(False);
   Expect<Integer>(CountDirEntries(DeepDir)).ToBe(1);
 end;
+
+procedure TAtomicMoveBareDestination.TestReplaceFileRejectsDirectorySource;
+begin
+  ForceDirectories('incoming-dir');
+
+  Expect<Boolean>(AtomicReplaceFile('incoming-dir', 'dest.txt')).ToBe(False);
+  Expect<Boolean>(DirectoryExists('incoming-dir')).ToBe(True);
+  Expect<Boolean>(FileExists('dest.txt')).ToBe(False);
+end;
 {$ENDIF}
 
 {$IFDEF UNIX}
@@ -3631,6 +3641,8 @@ begin
   {$IFDEF MSWINDOWS}
   Test('deep existing destination is replaced without a longer-path backup',
     TestReplaceFileAtDeepExistingDestination);
+  Test('file replacement rejects a directory source',
+    TestReplaceFileRejectsDirectorySource);
   {$ENDIF}
   {$IFDEF UNIX}
   if FCrossDeviceBase <> '' then

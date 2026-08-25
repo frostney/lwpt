@@ -721,6 +721,17 @@ begin
   Result := Windows.GetFileAttributesW(PWideChar(ExtendedPath)) <> $FFFFFFFF;
 end;
 
+function WindowsFileExists(const APath: string): Boolean;
+var
+  Attributes: Cardinal;
+  ExtendedPath: UnicodeString;
+begin
+  ExtendedPath := WindowsExtendedPath(APath);
+  Attributes := Windows.GetFileAttributesW(PWideChar(ExtendedPath));
+  Result := (Attributes <> $FFFFFFFF)
+    and ((Attributes and Windows.FILE_ATTRIBUTE_DIRECTORY) = 0);
+end;
+
 function MakeWindowsReplaceBackupPath(const ADst: string): string;
 var
   Dir: string;
@@ -1231,7 +1242,7 @@ begin
   if not FileExists(ASrc) then Exit(False);
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  if not WindowsPathExists(ASrc) then Exit(False);
+  if not WindowsFileExists(ASrc) then Exit(False);
   {$ENDIF}
   DstDir := ExtractFileDir(ADst);
   if DstDir <> '' then ForceDirectories(DstDir);
