@@ -242,8 +242,8 @@ end;
 procedure TInstallGitGraph.
   TestVerifiedArchiveCacheReusesLockedBytesAcrossProjects;
 var
-  FirstRoot, SecondRoot, ArchivePath, LockText, Combined,
-    OriginalLockText: string;
+  FirstRoot, SecondRoot, ArchivePath, LockText, LockBytes, Combined,
+    OriginalLockBytes: string;
   Run: TLwptResult;
 begin
   FirstRoot := FScratch + '/cache-first-project';
@@ -262,7 +262,7 @@ begin
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<Integer>(RequestCount(
     'archive|shared|' + SHARED_COMMIT)).ToBe(1);
-  OriginalLockText := ReadText(FirstRoot + '/lwpt.lock');
+  OriginalLockBytes := ReadBinaryFile(FirstRoot + '/lwpt.lock');
 
   { A second checkout has the same committed manifest + lock identity but its
     project archive/module state is deliberately absent. Remove the fixture
@@ -289,8 +289,9 @@ begin
     'archive|shared|' + SHARED_COMMIT)).ToBe(0);
   ArchivePath := SecondRoot + '/.lwpt/archives/shared-v1.0.0.tar.gz';
   Expect<Boolean>(FileExists(ArchivePath)).ToBe(True);
+  LockBytes := ReadBinaryFile(SecondRoot + '/lwpt.lock');
+  Expect<string>(LockBytes).ToBe(OriginalLockBytes);
   LockText := ReadText(SecondRoot + '/lwpt.lock');
-  Expect<string>(LockText).ToBe(OriginalLockText);
   Expect<Boolean>(Pos('archiveHash = "sha256:' + SHA256File(ArchivePath)
     + '"', LockText) > 0).ToBe(True);
 
