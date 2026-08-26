@@ -168,17 +168,27 @@ end;
 function HandleInstall(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  Frozen : Boolean;
+  Frozen, Offline : Boolean;
   i : Integer;
 begin
   if RejectUnexpectedPositionals('install', APositionals) then Exit(1);
   Frozen := False;
+  Offline := False;
   for i := 0 to High(AOptions) do
     if SameText(AOptions[i].LongName, 'frozen')
        and AOptions[i].Present then
-      Frozen := True;
+      Frozen := True
+    else if SameText(AOptions[i].LongName, 'offline')
+       and AOptions[i].Present then
+      Offline := True;
+  if Frozen and Offline then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('install'),
+      '--offline cannot be combined with --frozen');
+    Exit(1);
+  end;
   try
-    CmdInstall(MANIFEST_FILE, Frozen);
+    CmdInstall(MANIFEST_FILE, Frozen, Offline);
     Result := 0;
   except
     on E: Exception do
@@ -747,11 +757,13 @@ begin
     Registry.OnCommandPrepared := @PrepareCommandOutput;
     Registry.OnCommandCompleted := @ReportCommandCompletion;
 
-    SetLength(InstallOpts, 1);
+    SetLength(InstallOpts, 2);
     InstallOpts[0] := TFlagOption.Create('frozen',
       'CI mode: refuse to update the lockfile, refuse network, verify hashes');
+    InstallOpts[1] := TFlagOption.Create('offline',
+      'Restore locked dependency state without network access');
     Registry.Add(TSubcommand.Create('install',
-      'Resolve and fetch dependencies', '[--frozen]',
+      'Resolve and fetch dependencies', '[--frozen] [--offline]',
       @HandleInstall, InstallOpts));
 
     SetLength(AddOpts, 1);

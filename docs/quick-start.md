@@ -72,6 +72,7 @@ After bootstrap:
 
 ./build/lwpt install            # fetch any new deps; rewrite lwpt.lock + lwpt.cfg
 ./build/lwpt install --frozen   # CI: verify, refuse to update
+./build/lwpt install --offline  # restore exact locked state from local bytes
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt outdated           # compare locked git-host deps to advertised tags
@@ -82,6 +83,15 @@ After bootstrap:
 ```
 
 [`build-system.md`](./build-system.md) covers each in depth.
+
+`install --offline` requires an existing compatible `lwpt.lock`. It resolves
+network-backed dependencies to the lockfile's exact identities without remote
+discovery, verifies a committed `.lwpt/archives/` file or the shared
+content-addressed cache, then atomically restores missing archives, modules,
+and `lwpt.cfg`. Local and workspace dependencies are copied from their declared
+paths. The lockfile remains byte-identical. A missing object, corrupt archive,
+or manifest/lock mismatch fails without fetching around the problem. Offline
+materialization and read-only `--frozen` verification are mutually exclusive.
 
 ## Start or adopt a project
 
@@ -236,6 +246,11 @@ bar = { source = "owner/bar", version = "^1.0", include = ["src/**"] } # inline-
 **`HTTPS requires OpenSSL but it could not be loaded` (Linux only)** — install your distro's libssl package (`apt install libssl3` / `dnf install openssl-libs` / `apk add openssl3-libs`). LWPT loads it via `dlopen` at runtime. Windows + macOS do not hit this path (SChannel / SecureTransport are built into the OS — see [ADR-0016](./adr/0016-tls-backend-per-platform.md)).
 
 **`[frozen] missing extracted module for "<name>"`** — `lwpt install --frozen` requires `.lwpt/modules/<name>/` to be present. Run `lwpt install` (without `--frozen`) to fetch.
+
+**`[offline] verified archive for "<name>" is unavailable`** — neither the
+committed project archive nor the shared content-addressed cache contains the
+archive hash recorded in `lwpt.lock`. Restore the committed archive or run
+`lwpt install` online once to seed verified content.
 
 **Pre-commit hook auto-formatted files unexpectedly** — the hook runs `lwpt format` and `lwpt agents` with `stage_fixed: true`, so any drift (source formatting, the AGENTS.md agents block) gets rewritten + re-staged into the same commit. Review the staged diff before pushing.
 
