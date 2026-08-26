@@ -113,6 +113,20 @@ begin
 end;
 
 {$IFDEF MSWINDOWS}
+const
+  FSCTL_SET_SPARSE_LWPT = $000900C4;
+
+procedure MarkTestFileSparse(AStream: TFileStream);
+var
+  ErrorCode, Returned: DWORD;
+begin
+  if Windows.DeviceIoControl(AStream.Handle, FSCTL_SET_SPARSE_LWPT, nil, 0,
+    nil, 0, Returned, nil) then Exit;
+  ErrorCode := Windows.GetLastError;
+  raise Exception.CreateFmt('failed to mark oversized fixture sparse (%d)',
+    [ErrorCode]);
+end;
+
 function TryCreateWindowsJunction(const ALinkDirectory,
   ALinkTarget: string): Boolean;
 var
@@ -1054,6 +1068,9 @@ begin
     ObjectPath := FScratch + '/objects/sha256/' + OBJECT_NAME;
     Stream := TFileStream.Create(ObjectPath, fmCreate);
     try
+      {$IFDEF MSWINDOWS}
+      MarkTestFileSparse(Stream);
+      {$ENDIF}
       Stream.Size := Int64(MAX_REGISTRY_RESOURCE_BYTES) + 1;
     finally
       Stream.Free;
