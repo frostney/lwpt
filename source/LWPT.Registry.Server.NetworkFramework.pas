@@ -1088,7 +1088,9 @@ procedure TNetworkFrameworkRegistryServer.LoadIdentity(const APath,
 var
   Bytes: TBytes;
   CertificateChain, CFData, CFOptions, CFPassphrase, IdentityReference, Item,
-    Items, RuntimeCertificates: Pointer;
+    Items, NetworkCertificates, RuntimeCertificates: Pointer;
+  CertificateCount, Index: NativeInt;
+  NetworkCertificateValues: array of Pointer;
   EncodedPassphrase, KeychainPassphrase, KeychainPath,
     KeychainPathNonce: AnsiString;
   KeychainPasswordRandom, KeychainPathRandom: TTemporaryKeychainRandom;
@@ -1103,6 +1105,7 @@ begin
   CFPassphrase := nil;
   IdentityReference := nil;
   Items := nil;
+  NetworkCertificates := nil;
   RuntimeCertificates := nil;
   EncodedPassphrase := '';
   KeychainPassphrase := '';
@@ -1165,16 +1168,27 @@ begin
     if IdentityReference = nil then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'PKCS#12 contains no identity');
+    CertificateCount := CFArrayGetCount(CertificateChain);
+    SetLength(NetworkCertificateValues, CertificateCount - 1);
+    for Index := 0 to High(NetworkCertificateValues) do
+      NetworkCertificateValues[Index] := CFArrayGetValueAtIndex(
+        CertificateChain, Index + 1);
+    NetworkCertificates := CFArrayCreate(nil,
+      @NetworkCertificateValues[0], Length(NetworkCertificateValues),
+      ArrayCallbacks);
+    if NetworkCertificates = nil then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'could not retain the Network.framework certificate chain');
     CFRetain(IdentityReference);
     FTLSIdentity := Sec_identity_create_with_certificates(IdentityReference,
-      CertificateChain);
+      NetworkCertificates);
     if FTLSIdentity = nil then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'could not create the Network.framework TLS identity');
     RuntimeCertificates := Sec_identity_copy_certificates_ref(FTLSIdentity);
     if (RuntimeCertificates = nil)
-      or (CFArrayGetCount(RuntimeCertificates) <> CFArrayGetCount(
-        CertificateChain)) then
+      or (CFArrayGetCount(RuntimeCertificates)
+        <> Length(NetworkCertificateValues)) then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'Network.framework TLS identity did not retain its certificate chain');
   finally
@@ -1190,6 +1204,7 @@ begin
     FillChar(KeychainPathRandom, SizeOf(KeychainPathRandom), 0);
     if IdentityReference <> nil then CFRelease(IdentityReference);
     if RuntimeCertificates <> nil then CFRelease(RuntimeCertificates);
+    if NetworkCertificates <> nil then CFRelease(NetworkCertificates);
     if Items <> nil then CFRelease(Items);
     if CFOptions <> nil then CFRelease(CFOptions);
     if CFPassphrase <> nil then CFRelease(CFPassphrase);
