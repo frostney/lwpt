@@ -2836,16 +2836,9 @@ begin
     TestCompileFailureCountsTowardBail);
   Test('bail terminates active and leaves pending unstarted',
     TestBailTerminatesActiveAndLeavesPendingUnstarted);
-  {$IF DEFINED(DARWIN) AND DEFINED(CPUX86_64)}
-  Skip('bail reaps nested ' + PROJECT_NAME
-    + ' compiler that ignores SIGTERM',
-    TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM,
-    'diagnostic-only skip for #275 so Intel-Darwin full CI reaches Registry E2E');
-  {$ELSE}
   Test('bail reaps nested ' + PROJECT_NAME
     + ' compiler that ignores SIGTERM',
     TestBailTerminatesNestedLWPTCompilerIgnoringSIGTERM);
-  {$ENDIF}
   Test('worker error terminates another active process tree',
     TestWorkerErrorTerminatesActiveProcessTree);
   Test('successful nested termination acknowledgement completes cancellation',

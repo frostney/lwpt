@@ -19,8 +19,6 @@ procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
 function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
 function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
 function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
-function NetworkFrameworkDiagnosticBudgetIsBoundedForTesting: Boolean;
-function NetworkFrameworkDiagnosticBoundaryIsSafeForTesting: Boolean;
 {$ENDIF}
 
 implementation
@@ -67,7 +65,6 @@ const
     'v36@?0^{dispatch_data_s=}8^{nw_content_context=}16B24^{nw_error=}28';
   BLOCK_SIGNATURE_SEND = 'v16@?0^{nw_error=}8';
   BLOCK_SIGNATURE_NEW_CONNECTION = 'v16@?0^{nw_connection=}8';
-  MAX_NETWORK_FRAMEWORK_DIAGNOSTIC_EVENTS = 128;
   MAX_TEMPORARY_KEYCHAIN_RECOVERY_FILES = 128;
   TEMPORARY_KEYCHAIN_RANDOM_BYTES = 32;
 
@@ -94,8 +91,6 @@ type
   TTemporaryKeychainRandom =
     array[0..TEMPORARY_KEYCHAIN_RANDOM_BYTES - 1] of Byte;
   TTemporaryKeychainCleanupReporter = procedure(const AMessage: string);
-  TNetworkFrameworkDiagnosticWriter = procedure(const ALine: AnsiString);
-  TNetworkFrameworkErrorAccessor = function(AError: Pointer): Int32;
   TNetworkFrameworkRegistryServer = class;
 
   TNetworkFrameworkRegistryConnection = class
@@ -138,13 +133,6 @@ type
     FTLSIdentity: Pointer;
     FTemporaryKeychain: Pointer;
     FTemporaryKeychainPath: string;
-    FDiagnosticsEnabled: Boolean;
-    FDiagnosticEventCount: LongInt;
-    {$IFDEF REGISTRY_TESTING}
-    FDiagnosticWriter: TNetworkFrameworkDiagnosticWriter;
-    FErrorCodeAccessor: TNetworkFrameworkErrorAccessor;
-    FErrorDomainAccessor: TNetworkFrameworkErrorAccessor;
-    {$ENDIF}
     FListenerState: Integer;
     FActiveConnections: LongInt;
     FConnections: TList;
@@ -157,15 +145,7 @@ type
     FTCPBlock: TRegistryBlock;
     procedure ConnectionFinished(
       AConnection: TNetworkFrameworkRegistryConnection);
-    function BeginDiagnostic: Boolean;
     procedure DeleteTemporaryKeychainStorage;
-    procedure Diagnostic(const AEvent: string);
-    procedure DiagnosticConnectionState(const AState: Int32;
-      const AError: Pointer);
-    procedure DiagnosticNewConnection;
-    procedure DiagnosticTLSConfigureEntered;
-    procedure DiagnosticTLSConfigureResult(const AOptionsPresent,
-      AIdentityPresent: Boolean);
     procedure LoadIdentity(const APath, APassphrase: string);
   public
     constructor Create(AStore: TLWPTRegistryStore;
@@ -325,10 +305,6 @@ function Nw_endpoint_create_host(AHost, APort: PAnsiChar): Pointer; cdecl;
   external name 'nw_endpoint_create_host';
 function Nw_tls_copy_sec_protocol_options(AOptions: Pointer): Pointer; cdecl;
   external name 'nw_tls_copy_sec_protocol_options';
-function Nw_error_get_error_domain(AError: Pointer): Int32; cdecl;
-  external name 'nw_error_get_error_domain';
-function Nw_error_get_error_code(AError: Pointer): Int32; cdecl;
-  external name 'nw_error_get_error_code';
 procedure Sec_protocol_options_set_local_identity(AOptions,
   AIdentity: Pointer); cdecl;
   external name 'sec_protocol_options_set_local_identity';
@@ -393,8 +369,12 @@ function CFRetain(AObject: Pointer): Pointer; cdecl; external name 'CFRetain';
 procedure CFRelease(AObject: Pointer); cdecl; external name 'CFRelease';
 function SecPKCS12Import(AData, AOptions: Pointer;
   AItems: PPointer): Int32; cdecl; external name 'SecPKCS12Import';
-function Sec_identity_create(AIdentity: Pointer): Pointer; cdecl;
-  external name 'sec_identity_create';
+function Sec_identity_create_with_certificates(AIdentity,
+  ACertificates: Pointer): Pointer; cdecl;
+  external name 'sec_identity_create_with_certificates';
+function Sec_identity_copy_certificates_ref(AIdentity: Pointer): Pointer;
+  cdecl; external name 'sec_identity_copy_certificates_ref';
+procedure Sec_release(AObject: Pointer); cdecl; external name 'sec_release';
 function SecPolicyCreateSSL(AServer: ByteBool; AHostname: Pointer): Pointer;
   cdecl; external name 'SecPolicyCreateSSL';
 function SecTrustCreateWithCertificates(ACertificates, APolicies: Pointer;
@@ -461,12 +441,6 @@ begin
   Result := @ABlock;
 end;
 
-function ClaimNetworkFrameworkDiagnostic(var AEventCount: LongInt): Boolean;
-begin
-  Result := InterLockedIncrement(AEventCount)
-    <= MAX_NETWORK_FRAMEWORK_DIAGNOSTIC_EVENTS;
-end;
-
 {$IFDEF REGISTRY_TESTING}
 function BlockMatchesABI(var ABlock: TRegistryBlock;
   ADescriptor: PBlockDescriptor; const AExpectedSignature: AnsiString): Boolean;
@@ -499,149 +473,7 @@ begin
       'v16@?0^{nw_connection=}8');
 end;
 
-function NetworkFrameworkDiagnosticBudgetIsBoundedForTesting: Boolean;
-var
-  Accepted, EventCount, Index: LongInt;
-begin
-  Accepted := 0;
-  EventCount := 0;
-  for Index := 1 to MAX_NETWORK_FRAMEWORK_DIAGNOSTIC_EVENTS + 2 do
-    if ClaimNetworkFrameworkDiagnostic(EventCount) then Inc(Accepted);
-  Result := Accepted = MAX_NETWORK_FRAMEWORK_DIAGNOSTIC_EVENTS;
-end;
-
-var
-  DiagnosticErrorAccessorCallsForTesting,
-    DiagnosticWriterCallsForTesting: Integer;
-
-function RaiseNetworkFrameworkErrorAccessorForTesting(
-  AError: Pointer): Int32;
-begin
-  Inc(DiagnosticErrorAccessorCallsForTesting);
-  Result := 0;
-  raise Exception.Create('diagnostic error accessor failed');
-end;
-
-procedure RaiseNetworkFrameworkDiagnosticWriterForTesting(
-  const ALine: AnsiString);
-begin
-  Inc(DiagnosticWriterCallsForTesting);
-  raise Exception.Create('diagnostic writer failed');
-end;
-
-function NetworkFrameworkDiagnosticBoundaryIsSafeForTesting: Boolean;
-var
-  Server: TNetworkFrameworkRegistryServer;
-begin
-  DiagnosticErrorAccessorCallsForTesting := 0;
-  DiagnosticWriterCallsForTesting := 0;
-  Server := TNetworkFrameworkRegistryServer(
-    TNetworkFrameworkRegistryServer.NewInstance);
-  try
-    Server.FErrorCodeAccessor :=
-      @RaiseNetworkFrameworkErrorAccessorForTesting;
-    Server.FErrorDomainAccessor :=
-      @RaiseNetworkFrameworkErrorAccessorForTesting;
-    Server.FDiagnosticWriter :=
-      @RaiseNetworkFrameworkDiagnosticWriterForTesting;
-    Server.FDiagnosticsEnabled := False;
-    Server.DiagnosticConnectionState(NW_CONNECTION_STATE_FAILED, Pointer(1));
-    Server.DiagnosticNewConnection;
-    Result := (DiagnosticErrorAccessorCallsForTesting = 0)
-      and (DiagnosticWriterCallsForTesting = 0);
-    Server.FDiagnosticsEnabled := True;
-    Server.DiagnosticConnectionState(NW_CONNECTION_STATE_FAILED, Pointer(1));
-    Server.DiagnosticNewConnection;
-    Result := Result and (DiagnosticErrorAccessorCallsForTesting = 1)
-      and (DiagnosticWriterCallsForTesting = 1);
-  finally
-    Server.FreeInstance;
-  end;
-end;
 {$ENDIF}
-
-procedure TNetworkFrameworkRegistryServer.Diagnostic(const AEvent: string);
-var
-  Line: AnsiString;
-begin
-  try
-    Line := AnsiString(PROGRAM_NAME
-      + ' registry: Network.framework diagnostic: ' + AEvent + LineEnding);
-    {$IFDEF REGISTRY_TESTING}
-    if Assigned(FDiagnosticWriter) then
-      FDiagnosticWriter(Line)
-    else
-    {$ENDIF}
-      if Length(Line) > 0 then
-        FpWrite(StdErrorHandle, Line[1], Length(Line));
-  except
-    { Diagnostics must never alter the Network.framework callback. }
-  end;
-end;
-
-function TNetworkFrameworkRegistryServer.BeginDiagnostic: Boolean;
-begin
-  Result := FDiagnosticsEnabled
-    and ClaimNetworkFrameworkDiagnostic(FDiagnosticEventCount);
-end;
-
-procedure TNetworkFrameworkRegistryServer.DiagnosticConnectionState(
-  const AState: Int32; const AError: Pointer);
-var
-  ErrorCode, ErrorDomain: Int32;
-begin
-  if not BeginDiagnostic then Exit;
-  try
-    if AError = nil then
-      Diagnostic('connection-state=' + IntToStr(AState)
-        + ' error-domain=none error-code=none')
-    else
-    begin
-      {$IFDEF REGISTRY_TESTING}
-      if Assigned(FErrorDomainAccessor) then
-        ErrorDomain := FErrorDomainAccessor(AError)
-      else
-      {$ENDIF}
-        ErrorDomain := Nw_error_get_error_domain(AError);
-      {$IFDEF REGISTRY_TESTING}
-      if Assigned(FErrorCodeAccessor) then
-        ErrorCode := FErrorCodeAccessor(AError)
-      else
-      {$ENDIF}
-        ErrorCode := Nw_error_get_error_code(AError);
-      Diagnostic('connection-state=' + IntToStr(AState)
-        + ' error-domain=' + IntToStr(ErrorDomain)
-        + ' error-code=' + IntToStr(ErrorCode));
-    end;
-  except
-    { Error inspection and formatting are best-effort diagnostics only. }
-  end;
-end;
-
-procedure TNetworkFrameworkRegistryServer.DiagnosticNewConnection;
-begin
-  if not BeginDiagnostic then Exit;
-  Diagnostic('new-connection entered');
-end;
-
-procedure TNetworkFrameworkRegistryServer.DiagnosticTLSConfigureEntered;
-begin
-  if not BeginDiagnostic then Exit;
-  Diagnostic('tls-configure entered');
-end;
-
-procedure TNetworkFrameworkRegistryServer.DiagnosticTLSConfigureResult(
-  const AOptionsPresent, AIdentityPresent: Boolean);
-begin
-  if not BeginDiagnostic then Exit;
-  try
-    Diagnostic('tls-configure copied-options='
-      + BoolToStr(AOptionsPresent, True) + ' identity='
-      + BoolToStr(AIdentityPresent, True));
-  except
-    { Formatting is best-effort diagnostics only. }
-  end;
-end;
 
 procedure TLSConfigureInvoke(ABlock: PRegistryBlock;
   AOptions: Pointer); cdecl;
@@ -651,12 +483,9 @@ var
 begin
   EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
-  Server.DiagnosticTLSConfigureEntered;
   Options := Nw_tls_copy_sec_protocol_options(AOptions);
-  Server.DiagnosticTLSConfigureResult(Options <> nil,
-    Server.FTLSIdentity <> nil);
   Sec_protocol_options_set_local_identity(Options, Server.FTLSIdentity);
-  Nw_release(Options);
+  Sec_release(Options);
 end;
 
 procedure TCPConfigureInvoke(ABlock: PRegistryBlock;
@@ -692,7 +521,6 @@ var
 begin
   EnsureFrameworkThread;
   Connection := TNetworkFrameworkRegistryConnection(ABlock^.Context);
-  Connection.FServer.DiagnosticConnectionState(AState, AError);
   case AState of
     NW_CONNECTION_STATE_READY: Connection.ArmReceive;
     NW_CONNECTION_STATE_FAILED: Connection.Cancel;
@@ -746,7 +574,6 @@ var
 begin
   EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
-  Server.DiagnosticNewConnection;
   EnterCriticalSection(Server.FConnectionLock);
   try
     if Server.FStopping
@@ -1260,8 +1087,8 @@ procedure TNetworkFrameworkRegistryServer.LoadIdentity(const APath,
   APassphrase: string);
 var
   Bytes: TBytes;
-  CFData, CFOptions, CFPassphrase, IdentityReference, Item,
-    Items: Pointer;
+  CertificateChain, CFData, CFOptions, CFPassphrase, IdentityReference, Item,
+    Items, RuntimeCertificates: Pointer;
   EncodedPassphrase, KeychainPassphrase, KeychainPath,
     KeychainPathNonce: AnsiString;
   KeychainPasswordRandom, KeychainPathRandom: TTemporaryKeychainRandom;
@@ -1270,11 +1097,13 @@ var
   Status: Int32;
 begin
   Bytes := nil;
+  CertificateChain := nil;
   CFData := nil;
   CFOptions := nil;
   CFPassphrase := nil;
   IdentityReference := nil;
   Items := nil;
+  RuntimeCertificates := nil;
   EncodedPassphrase := '';
   KeychainPassphrase := '';
   KeychainPathNonce := '';
@@ -1331,15 +1160,23 @@ begin
         'PKCS#12 import failed with status ' + IntToStr(Status));
     Item := CFArrayGetValueAtIndex(Items, 0);
     ValidateBundledIdentity(Item);
+    CertificateChain := CFDictionaryGetValue(Item, KeyImportItemCertChain);
     IdentityReference := CFDictionaryGetValue(Item, KeyImportItemIdentity);
     if IdentityReference = nil then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'PKCS#12 contains no identity');
     CFRetain(IdentityReference);
-    FTLSIdentity := Sec_identity_create(IdentityReference);
+    FTLSIdentity := Sec_identity_create_with_certificates(IdentityReference,
+      CertificateChain);
     if FTLSIdentity = nil then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'could not create the Network.framework TLS identity');
+    RuntimeCertificates := Sec_identity_copy_certificates_ref(FTLSIdentity);
+    if (RuntimeCertificates = nil)
+      or (CFArrayGetCount(RuntimeCertificates) <> CFArrayGetCount(
+        CertificateChain)) then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'Network.framework TLS identity did not retain its certificate chain');
   finally
     if Length(Bytes) > 0 then FillChar(Bytes[0], Length(Bytes), 0);
     Bytes := nil;
@@ -1352,6 +1189,7 @@ begin
     FillChar(KeychainPasswordRandom, SizeOf(KeychainPasswordRandom), 0);
     FillChar(KeychainPathRandom, SizeOf(KeychainPathRandom), 0);
     if IdentityReference <> nil then CFRelease(IdentityReference);
+    if RuntimeCertificates <> nil then CFRelease(RuntimeCertificates);
     if Items <> nil then CFRelease(Items);
     if CFOptions <> nil then CFRelease(CFOptions);
     if CFPassphrase <> nil then CFRelease(CFPassphrase);
@@ -1369,8 +1207,6 @@ begin
   IsMultiThread := True;
   FStore := AStore;
   FStopFlag := AStopFlag;
-  FDiagnosticsEnabled := SameText(SysUtils.GetEnvironmentVariable(
-    PROJECT_NAME + '_ENABLE_NETWORK'), '1');
   FConnections := TList.Create;
   InitCriticalSection(FConnectionLock);
   FReadySemaphore := Dispatch_semaphore_create(0);
@@ -1445,7 +1281,7 @@ begin
         * NANOSECONDS_PER_MILLISECOND));
   if FListener <> nil then Nw_release(FListener);
   if FParameters <> nil then Nw_release(FParameters);
-  if FTLSIdentity <> nil then Nw_release(FTLSIdentity);
+  if FTLSIdentity <> nil then Sec_release(FTLSIdentity);
   if FTemporaryKeychain <> nil then
   begin
     DeleteStatus := SecKeychainDelete(FTemporaryKeychain);
@@ -1592,15 +1428,6 @@ begin
   Result := True;
 end;
 
-function NetworkFrameworkDiagnosticBudgetIsBoundedForTesting: Boolean;
-begin
-  Result := True;
-end;
-
-function NetworkFrameworkDiagnosticBoundaryIsSafeForTesting: Boolean;
-begin
-  Result := True;
-end;
 {$ENDIF}
 
 {$ENDIF}
