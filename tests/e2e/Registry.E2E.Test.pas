@@ -313,6 +313,7 @@ begin
       Readers[Index].Executable := 'curl';
       {$ENDIF}
       Readers[Index].Parameters.Add('--silent');
+      Readers[Index].Parameters.Add('--fail');
       Readers[Index].Parameters.Add('--max-time');
       Readers[Index].Parameters.Add('3');
       Readers[Index].Parameters.Add('--output');
