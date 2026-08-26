@@ -1236,6 +1236,8 @@ begin
   Expect<Boolean>(NetworkFrameworkBlockABIIsCompleteForTesting).ToBe(True);
   Expect<Boolean>(NetworkFrameworkDiagnosticBudgetIsBoundedForTesting)
     .ToBe(True);
+  Expect<Boolean>(NetworkFrameworkDiagnosticBoundaryIsSafeForTesting)
+    .ToBe(True);
 end;
 
 procedure TRegistryStoreContract.TestNetworkFrameworkCleanupFailureSemantics;

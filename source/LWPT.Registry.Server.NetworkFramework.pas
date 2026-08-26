@@ -20,6 +20,7 @@ function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
 function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
 function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
 function NetworkFrameworkDiagnosticBudgetIsBoundedForTesting: Boolean;
+function NetworkFrameworkDiagnosticBoundaryIsSafeForTesting: Boolean;
 {$ENDIF}
 
 implementation
@@ -93,6 +94,8 @@ type
   TTemporaryKeychainRandom =
     array[0..TEMPORARY_KEYCHAIN_RANDOM_BYTES - 1] of Byte;
   TTemporaryKeychainCleanupReporter = procedure(const AMessage: string);
+  TNetworkFrameworkDiagnosticWriter = procedure(const ALine: AnsiString);
+  TNetworkFrameworkErrorAccessor = function(AError: Pointer): Int32;
   TNetworkFrameworkRegistryServer = class;
 
   TNetworkFrameworkRegistryConnection = class
@@ -137,6 +140,11 @@ type
     FTemporaryKeychainPath: string;
     FDiagnosticsEnabled: Boolean;
     FDiagnosticEventCount: LongInt;
+    {$IFDEF REGISTRY_TESTING}
+    FDiagnosticWriter: TNetworkFrameworkDiagnosticWriter;
+    FErrorCodeAccessor: TNetworkFrameworkErrorAccessor;
+    FErrorDomainAccessor: TNetworkFrameworkErrorAccessor;
+    {$ENDIF}
     FListenerState: Integer;
     FActiveConnections: LongInt;
     FConnections: TList;
@@ -149,8 +157,15 @@ type
     FTCPBlock: TRegistryBlock;
     procedure ConnectionFinished(
       AConnection: TNetworkFrameworkRegistryConnection);
+    function BeginDiagnostic: Boolean;
     procedure DeleteTemporaryKeychainStorage;
     procedure Diagnostic(const AEvent: string);
+    procedure DiagnosticConnectionState(const AState: Int32;
+      const AError: Pointer);
+    procedure DiagnosticNewConnection;
+    procedure DiagnosticTLSConfigureEntered;
+    procedure DiagnosticTLSConfigureResult(const AOptionsPresent,
+      AIdentityPresent: Boolean);
     procedure LoadIdentity(const APath, APassphrase: string);
   public
     constructor Create(AStore: TLWPTRegistryStore;
@@ -494,25 +509,138 @@ begin
     if ClaimNetworkFrameworkDiagnostic(EventCount) then Inc(Accepted);
   Result := Accepted = MAX_NETWORK_FRAMEWORK_DIAGNOSTIC_EVENTS;
 end;
+
+var
+  DiagnosticErrorAccessorCallsForTesting,
+    DiagnosticWriterCallsForTesting: Integer;
+
+function RaiseNetworkFrameworkErrorAccessorForTesting(
+  AError: Pointer): Int32;
+begin
+  Inc(DiagnosticErrorAccessorCallsForTesting);
+  Result := 0;
+  raise Exception.Create('diagnostic error accessor failed');
+end;
+
+procedure RaiseNetworkFrameworkDiagnosticWriterForTesting(
+  const ALine: AnsiString);
+begin
+  Inc(DiagnosticWriterCallsForTesting);
+  raise Exception.Create('diagnostic writer failed');
+end;
+
+function NetworkFrameworkDiagnosticBoundaryIsSafeForTesting: Boolean;
+var
+  Server: TNetworkFrameworkRegistryServer;
+begin
+  DiagnosticErrorAccessorCallsForTesting := 0;
+  DiagnosticWriterCallsForTesting := 0;
+  Server := TNetworkFrameworkRegistryServer(
+    TNetworkFrameworkRegistryServer.NewInstance);
+  try
+    Server.FErrorCodeAccessor :=
+      @RaiseNetworkFrameworkErrorAccessorForTesting;
+    Server.FErrorDomainAccessor :=
+      @RaiseNetworkFrameworkErrorAccessorForTesting;
+    Server.FDiagnosticWriter :=
+      @RaiseNetworkFrameworkDiagnosticWriterForTesting;
+    Server.FDiagnosticsEnabled := False;
+    Server.DiagnosticConnectionState(NW_CONNECTION_STATE_FAILED, Pointer(1));
+    Server.DiagnosticNewConnection;
+    Result := (DiagnosticErrorAccessorCallsForTesting = 0)
+      and (DiagnosticWriterCallsForTesting = 0);
+    Server.FDiagnosticsEnabled := True;
+    Server.DiagnosticConnectionState(NW_CONNECTION_STATE_FAILED, Pointer(1));
+    Server.DiagnosticNewConnection;
+    Result := Result and (DiagnosticErrorAccessorCallsForTesting = 1)
+      and (DiagnosticWriterCallsForTesting = 1);
+  finally
+    Server.FreeInstance;
+  end;
+end;
 {$ENDIF}
 
 procedure TNetworkFrameworkRegistryServer.Diagnostic(const AEvent: string);
 var
   Line: AnsiString;
 begin
-  if not FDiagnosticsEnabled
-    or not ClaimNetworkFrameworkDiagnostic(FDiagnosticEventCount) then Exit;
-  Line := AnsiString(PROGRAM_NAME
-    + ' registry: Network.framework diagnostic: ' + AEvent + LineEnding);
-  if Length(Line) > 0 then
-    FpWrite(StdErrorHandle, Line[1], Length(Line));
+  try
+    Line := AnsiString(PROGRAM_NAME
+      + ' registry: Network.framework diagnostic: ' + AEvent + LineEnding);
+    {$IFDEF REGISTRY_TESTING}
+    if Assigned(FDiagnosticWriter) then
+      FDiagnosticWriter(Line)
+    else
+    {$ENDIF}
+      if Length(Line) > 0 then
+        FpWrite(StdErrorHandle, Line[1], Length(Line));
+  except
+    { Diagnostics must never alter the Network.framework callback. }
+  end;
 end;
 
-function NetworkErrorDiagnostic(const AError: Pointer): string;
+function TNetworkFrameworkRegistryServer.BeginDiagnostic: Boolean;
 begin
-  if AError = nil then Exit('error-domain=none error-code=none');
-  Result := 'error-domain=' + IntToStr(Nw_error_get_error_domain(AError))
-    + ' error-code=' + IntToStr(Nw_error_get_error_code(AError));
+  Result := FDiagnosticsEnabled
+    and ClaimNetworkFrameworkDiagnostic(FDiagnosticEventCount);
+end;
+
+procedure TNetworkFrameworkRegistryServer.DiagnosticConnectionState(
+  const AState: Int32; const AError: Pointer);
+var
+  ErrorCode, ErrorDomain: Int32;
+begin
+  if not BeginDiagnostic then Exit;
+  try
+    if AError = nil then
+      Diagnostic('connection-state=' + IntToStr(AState)
+        + ' error-domain=none error-code=none')
+    else
+    begin
+      {$IFDEF REGISTRY_TESTING}
+      if Assigned(FErrorDomainAccessor) then
+        ErrorDomain := FErrorDomainAccessor(AError)
+      else
+      {$ENDIF}
+        ErrorDomain := Nw_error_get_error_domain(AError);
+      {$IFDEF REGISTRY_TESTING}
+      if Assigned(FErrorCodeAccessor) then
+        ErrorCode := FErrorCodeAccessor(AError)
+      else
+      {$ENDIF}
+        ErrorCode := Nw_error_get_error_code(AError);
+      Diagnostic('connection-state=' + IntToStr(AState)
+        + ' error-domain=' + IntToStr(ErrorDomain)
+        + ' error-code=' + IntToStr(ErrorCode));
+    end;
+  except
+    { Error inspection and formatting are best-effort diagnostics only. }
+  end;
+end;
+
+procedure TNetworkFrameworkRegistryServer.DiagnosticNewConnection;
+begin
+  if not BeginDiagnostic then Exit;
+  Diagnostic('new-connection entered');
+end;
+
+procedure TNetworkFrameworkRegistryServer.DiagnosticTLSConfigureEntered;
+begin
+  if not BeginDiagnostic then Exit;
+  Diagnostic('tls-configure entered');
+end;
+
+procedure TNetworkFrameworkRegistryServer.DiagnosticTLSConfigureResult(
+  const AOptionsPresent, AIdentityPresent: Boolean);
+begin
+  if not BeginDiagnostic then Exit;
+  try
+    Diagnostic('tls-configure copied-options='
+      + BoolToStr(AOptionsPresent, True) + ' identity='
+      + BoolToStr(AIdentityPresent, True));
+  except
+    { Formatting is best-effort diagnostics only. }
+  end;
 end;
 
 procedure TLSConfigureInvoke(ABlock: PRegistryBlock;
@@ -523,11 +651,10 @@ var
 begin
   EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
-  Server.Diagnostic('tls-configure entered');
+  Server.DiagnosticTLSConfigureEntered;
   Options := Nw_tls_copy_sec_protocol_options(AOptions);
-  Server.Diagnostic('tls-configure copied-options='
-    + BoolToStr(Options <> nil, True) + ' identity='
-    + BoolToStr(Server.FTLSIdentity <> nil, True));
+  Server.DiagnosticTLSConfigureResult(Options <> nil,
+    Server.FTLSIdentity <> nil);
   Sec_protocol_options_set_local_identity(Options, Server.FTLSIdentity);
   Nw_release(Options);
 end;
@@ -565,8 +692,7 @@ var
 begin
   EnsureFrameworkThread;
   Connection := TNetworkFrameworkRegistryConnection(ABlock^.Context);
-  Connection.FServer.Diagnostic('connection-state=' + IntToStr(AState)
-    + ' ' + NetworkErrorDiagnostic(AError));
+  Connection.FServer.DiagnosticConnectionState(AState, AError);
   case AState of
     NW_CONNECTION_STATE_READY: Connection.ArmReceive;
     NW_CONNECTION_STATE_FAILED: Connection.Cancel;
@@ -620,7 +746,7 @@ var
 begin
   EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
-  Server.Diagnostic('new-connection entered');
+  Server.DiagnosticNewConnection;
   EnterCriticalSection(Server.FConnectionLock);
   try
     if Server.FStopping
@@ -1467,6 +1593,11 @@ begin
 end;
 
 function NetworkFrameworkDiagnosticBudgetIsBoundedForTesting: Boolean;
+begin
+  Result := True;
+end;
+
+function NetworkFrameworkDiagnosticBoundaryIsSafeForTesting: Boolean;
 begin
   Result := True;
 end;
