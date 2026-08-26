@@ -202,7 +202,7 @@ begin
   Run := RunInstall(ARoot, ['install']);
   DumpRunFailure('offline seed ' + AScenario, Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
-  ALockText := ReadText(ARoot + '/lwpt.lock');
+  ALockText := ReadBinaryFile(ARoot + '/lwpt.lock');
 end;
 
 function TInstallGitGraph.RunInstall(const ARoot: string;
@@ -318,7 +318,7 @@ begin
   Expect<Boolean>(FileExists(Root
     + '/.lwpt/modules/shared/source/shared.pas')).ToBe(True);
   Expect<Boolean>(FileExists(Root + '/lwpt.cfg')).ToBe(True);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<Integer>(RequestCount('refs|shared')).ToBe(0);
   Expect<Integer>(RequestCount(
     'archive|shared|' + SHARED_COMMIT)).ToBe(0);
@@ -348,7 +348,7 @@ begin
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('[offline]', Combined) > 0).ToBe(True);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<string>(ReadBinaryFile(Root + '/lwpt.cfg')).ToBe(OriginalCfg);
   Expect<string>(ReadBinaryFile(Root
     + '/.lwpt/modules/sentinel/keep.txt')).ToBe(OriginalSentinel);
@@ -379,7 +379,7 @@ begin
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('archive hash mismatch', Combined) > 0).ToBe(True);
   Expect<string>(ReadBinaryFile(ArchivePath)).ToBe(OriginalArchive);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/shared'))
     .ToBe(False);
   Expect<Boolean>(FileExists(Root + '/lwpt.cfg')).ToBe(False);
@@ -408,7 +408,7 @@ begin
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('[offline]', Combined) > 0).ToBe(True);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<string>(SHA256File(ArchivePath)).ToBe(ArchiveHash);
   Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/shared'))
     .ToBe(False);
@@ -419,14 +419,14 @@ end;
 procedure TInstallGitGraph.
   TestOfflineCompatibleDriftFailsBeforePublication;
 var
-  Root, LockText, ModuleHash, ArchiveHash, CfgText, Combined: string;
+  Root, LockText, ModuleHash, ArchiveHash, CfgBytes, Combined: string;
   Run: TLwptResult;
 begin
   PrepareOfflineSeed('offline-compatible-drift', Root, LockText);
   ModuleHash := HashTree(Root + '/.lwpt/modules/shared');
   ArchiveHash := SHA256File(Root
     + '/.lwpt/archives/shared-v1.0.0.tar.gz');
-  CfgText := ReadText(Root + '/lwpt.cfg');
+  CfgBytes := ReadBinaryFile(Root + '/lwpt.cfg');
   WriteRoot(Root, 'offline-compatible-drift',
     'shared = "fixture/shared@>=1.0.0 <2.0.0"'#10);
   WriteTextFile(FFixtureRoot + '/requests.log', '');
@@ -439,8 +439,8 @@ begin
   Expect<Boolean>((Run.ExitCode <> 0) and (Run.ExitCode <> 87)).ToBe(True);
   Expect<Boolean>(Pos('accumulated constraints changed', Combined) > 0)
     .ToBe(True);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
-  Expect<string>(ReadText(Root + '/lwpt.cfg')).ToBe(CfgText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.cfg')).ToBe(CfgBytes);
   Expect<string>(HashTree(Root + '/.lwpt/modules/shared')).ToBe(ModuleHash);
   Expect<string>(SHA256File(Root
     + '/.lwpt/archives/shared-v1.0.0.tar.gz')).ToBe(ArchiveHash);
@@ -452,7 +452,7 @@ var Root, LockText: string; Run: TLwptResult;
 begin
   PrepareOfflineSeed('offline-early-v3', Root, LockText);
   RemoveAdditiveIdentityFields(Root + '/lwpt.lock');
-  LockText := ReadText(Root + '/lwpt.lock');
+  LockText := ReadBinaryFile(Root + '/lwpt.lock');
   RecursiveDelete(Root + '/.lwpt/modules');
   SysUtils.DeleteFile(Root + '/lwpt.cfg');
   RecursiveDelete(FCacheRoot);
@@ -464,7 +464,7 @@ begin
   Run := RunInstall(Root, ['install', '--offline']);
   DumpRunFailure('offline early v3 restore', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<Boolean>(FileExists(Root
     + '/.lwpt/modules/shared/source/shared.pas')).ToBe(True);
   Expect<Boolean>(FileExists(Root + '/lwpt.cfg')).ToBe(True);
@@ -486,7 +486,7 @@ begin
   DumpRunFailure('offline early v3 SHA seed', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   RemoveAdditiveIdentityFields(Root + '/lwpt.lock');
-  LockText := ReadText(Root + '/lwpt.lock');
+  LockText := ReadBinaryFile(Root + '/lwpt.lock');
   RecursiveDelete(Root + '/.lwpt/modules');
   SysUtils.DeleteFile(Root + '/lwpt.cfg');
   RecursiveDelete(FCacheRoot);
@@ -497,7 +497,7 @@ begin
   Run := RunInstall(Root, ['install', '--offline']);
   DumpRunFailure('offline early v3 SHA restore', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<Boolean>(FileExists(Root
     + '/.lwpt/modules/shared/source/shared.pas')).ToBe(True);
   Expect<Boolean>(FileExists(Root + '/lwpt.cfg')).ToBe(True);
@@ -523,7 +523,7 @@ begin
   Run := RunInstall(Root, ['install']);
   DumpRunFailure('offline local/workspace seed', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
-  LockText := ReadText(Root + '/lwpt.lock');
+  LockText := ReadBinaryFile(Root + '/lwpt.lock');
   RecursiveDelete(Root + '/.lwpt/modules');
   SysUtils.DeleteFile(Root + '/lwpt.cfg');
   WriteTextFile(FFixtureRoot + '/requests.log', '');
@@ -536,7 +536,7 @@ begin
   Expect<Boolean>(FileExists(Root
     + '/.lwpt/modules/workspace-dep/source/main.pas')).ToBe(True);
   Expect<Boolean>(FileExists(Root + '/lwpt.cfg')).ToBe(True);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<Integer>(RequestCount('refs|shared')).ToBe(0);
 end;
 
@@ -577,7 +577,7 @@ begin
   finally
     Mock.Free;
   end;
-  LockText := ReadText(Root + '/lwpt.lock');
+  LockText := ReadBinaryFile(Root + '/lwpt.lock');
   ArchivePath := Root + '/.lwpt/archives/direct-url.tar.gz';
   Expect<Boolean>(FileExists(ArchivePath)).ToBe(True);
   RecursiveDelete(Root + '/.lwpt/modules');
@@ -599,7 +599,7 @@ begin
   Expect<Boolean>(FileExists(Root
     + '/.lwpt/modules/direct/source/direct.pas')).ToBe(True);
   Expect<Boolean>(FileExists(Root + '/lwpt.cfg')).ToBe(True);
-  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
 end;
 
 procedure TInstallGitGraph.TestOfflineAndFrozenAreMutuallyExclusive;
