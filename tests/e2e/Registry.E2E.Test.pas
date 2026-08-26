@@ -32,8 +32,11 @@ type
     function StartServer(const ADataDirectory: string;
       const ATLS: Boolean): TProcess;
     function Curl(const AURL: string; const AInsecure: Boolean): string;
+    function CurlAttempt(const AURL: string; const AInsecure: Boolean;
+      out AExitStatus: Integer; out AStandardError: string): string;
     procedure StopServer(AProcess: TProcess);
-    procedure WaitUntilReady(const AURL: string; const AInsecure: Boolean);
+    procedure WaitUntilReady(const AURL: string; const AInsecure: Boolean;
+      AServer: TProcess);
   protected
     procedure BeforeEach; override;
     procedure AfterAll; override;
@@ -69,7 +72,7 @@ begin
   Result.Execute;
 end;
 
-function ReadProcessOutput(AProcess: TProcess): string;
+function ReadStreamOutput(AStream: TStream): string;
 var
   BytesRead, Total: Integer;
   Buffer: array[0..4095] of Byte;
@@ -77,7 +80,7 @@ begin
   Result := '';
   Total := 0;
   repeat
-    BytesRead := AProcess.Output.Read(Buffer[0], Length(Buffer));
+    BytesRead := AStream.Read(Buffer[0], Length(Buffer));
     if BytesRead > 0 then
     begin
       SetLength(Result, Total + BytesRead);
@@ -129,6 +132,16 @@ end;
 function TRegistryE2EContract.Curl(const AURL: string;
   const AInsecure: Boolean): string;
 var
+  ExitStatus: Integer;
+  StandardError: string;
+begin
+  Result := CurlAttempt(AURL, AInsecure, ExitStatus, StandardError);
+end;
+
+function TRegistryE2EContract.CurlAttempt(const AURL: string;
+  const AInsecure: Boolean; out AExitStatus: Integer;
+  out AStandardError: string): string;
+var
   ProcessInstance: TProcess;
 begin
   ProcessInstance := TProcess.Create(nil);
@@ -146,8 +159,10 @@ begin
     ProcessInstance.Parameters.Add(AURL);
     ProcessInstance.Options := [poUsePipes, poWaitOnExit];
     ProcessInstance.Execute;
-    Result := ReadProcessOutput(ProcessInstance);
-    if ProcessInstance.ExitStatus <> 0 then Result := '';
+    Result := ReadStreamOutput(ProcessInstance.Output);
+    AStandardError := ReadStreamOutput(ProcessInstance.Stderr);
+    AExitStatus := ProcessInstance.ExitStatus;
+    if AExitStatus <> 0 then Result := '';
   finally
     ProcessInstance.Free;
   end;
@@ -201,7 +216,7 @@ begin
   Server := StartServer(DataDirectory, False);
   for Index := 0 to High(SlowSockets) do SlowSockets[Index] := -1;
   try
-    WaitUntilReady(DiscoveryURL, False);
+    WaitUntilReady(DiscoveryURL, False, Server);
     FillChar(Address, SizeOf(Address), 0);
     Address.sin_family := AF_INET;
     Address.sin_port := HToNs(BasePort + 3);
@@ -229,16 +244,36 @@ begin
 end;
 
 procedure TRegistryE2EContract.WaitUntilReady(const AURL: string;
-  const AInsecure: Boolean);
+  const AInsecure: Boolean; AServer: TProcess);
 var
+  ExitState, KeychainState, StandardError: string;
+  ExitStatus: Integer;
+  Running: Boolean;
   StartedAt: QWord;
 begin
+  ExitStatus := -1;
+  StandardError := '';
   StartedAt := GetTickCount64;
   repeat
-    if Pos('lwpt-registry-discovery-v1', Curl(AURL, AInsecure)) > 0 then Exit;
+    if Pos('lwpt-registry-discovery-v1', CurlAttempt(AURL, AInsecure,
+      ExitStatus, StandardError)) > 0 then Exit;
     Sleep(25);
   until GetTickCount64 - StartedAt >= 10000;
-  raise Exception.Create('registry server did not become ready');
+  Running := Assigned(AServer) and AServer.Running;
+  if Running then ExitState := 'running'
+  else if Assigned(AServer) then ExitState := IntToStr(AServer.ExitStatus)
+  else ExitState := 'unavailable';
+  {$IFDEF DARWIN}
+  if Assigned(AServer) then
+    KeychainState := IntToStr(TemporaryKeychainPathCount(AServer.ProcessID))
+  else KeychainState := 'unavailable';
+  {$ELSE}
+  KeychainState := 'not-applicable';
+  {$ENDIF}
+  raise Exception.CreateFmt('registry server did not become ready: '
+    + 'curl exit=%d stderr=%s; server running=%s exit=%s; '
+    + 'temporary keychain paths=%s', [ExitStatus, QuotedStr(StandardError),
+    BoolToStr(Running, True), ExitState, KeychainState]);
 end;
 
 procedure TRegistryE2EContract.BeforeEach;
@@ -325,7 +360,7 @@ begin
   Expect<Integer>(Init.ExitCode).ToBe(0);
   Server := StartServer(DataDirectory, False);
   try
-    WaitUntilReady(DiscoveryURL, False);
+    WaitUntilReady(DiscoveryURL, False, Server);
     {$IFDEF MSWINDOWS}
     SecondServer := StartServer(DataDirectory, False);
     try
@@ -376,7 +411,7 @@ begin
   end;
   Server := StartServer(DataDirectory, False);
   try
-    WaitUntilReady(DiscoveryURL, False);
+    WaitUntilReady(DiscoveryURL, False, Server);
     Expect<Boolean>(Pos('lwpt-registry-checkpoint-v1', Curl(ResourceURL,
       False)) > 0).ToBe(True);
   finally
@@ -404,7 +439,7 @@ begin
   Expect<Integer>(Init.ExitCode).ToBe(0);
   Server := StartServer(DataDirectory, True);
   try
-    WaitUntilReady(DiscoveryURL, True);
+    WaitUntilReady(DiscoveryURL, True, Server);
     Expect<Boolean>(Pos('lwpt-registry-checkpoint-v1', Curl(ResourceURL,
       True)) > 0).ToBe(True);
   finally
@@ -485,7 +520,7 @@ begin
     Residue := TFileStream.Create(ResiduePath, fmCreate);
     Residue.Free;
     Server := StartServer(DataDirectory, True);
-    WaitUntilReady(DiscoveryURL, True);
+    WaitUntilReady(DiscoveryURL, True, Server);
     Expect<Boolean>(FileExists(ResiduePath)).ToBe(False);
     Expect<Integer>(FpLStat(PChar(SymlinkPath), Status)).ToBe(0);
     Expect<Integer>(TemporaryKeychainPathCount(Server.ProcessID)).ToBe(0);
@@ -528,7 +563,7 @@ begin
   Server := StartServer(DataDirectory, True);
   for Index := 0 to High(IdleSockets) do IdleSockets[Index] := -1;
   try
-    WaitUntilReady(DiscoveryURL, True);
+    WaitUntilReady(DiscoveryURL, True, Server);
     FillChar(Address, SizeOf(Address), 0);
     Address.sin_family := AF_INET;
     Address.sin_port := HToNs(BasePort + 4);
