@@ -40,7 +40,11 @@ type
   end;
   TResolvedArray = array of TResolved;
 
-  TInstallTransactionMode = (itmMaterialize, itmFrozenVerify);
+  TInstallTransactionMode = (
+    itmMaterialize,
+    itmFrozenVerify,
+    itmOfflineMaterialize
+  );
 
   TInstallTransactionResult = record
     PackageCount : Integer;
@@ -2329,7 +2333,8 @@ procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
   ARollbackRoot, AProjectRoot: string;
   const AWorkspaces: TWorkspaceArray;
   const APriorLock: TResolvedArray;
-  const AObjectStore: TLWPTImmutableObjectStore);
+  const AObjectStore: TLWPTImmutableObjectStore;
+  const AOffline: Boolean);
 type
   TSelectionState = record
     Name, SourceIdentity, RefName, CommitSHA: string;
@@ -2348,6 +2353,7 @@ var
   Round, i, j, idx, Head: Integer;
   Queue: array of Integer;
   ChildMan: TManifest;
+  LockedEntry: TResolved;
   ChildManifestPath, ManifestRelDir, ExtractTmp: string;
   UnitDir, Archive, ArchiveHash, ResolvedURL, CacheArchive,
     ExpectedArchiveHash: string;
@@ -2420,6 +2426,95 @@ var
        and ((Entry.CommitSHA = '')
          or not SameText(Entry.CommitSHA, ANode.CommitSHA)) then Exit;
     Result := Entry.ArchiveHash;
+  end;
+
+  function IsNetworkBacked(const ANode: TResolveNode): Boolean;
+  begin
+    Result := not (ANode.Dep.SrcKind in [skLocal, skWorkspace]);
+  end;
+
+  procedure SelectLockedNode(const ANode: TResolveNode;
+    var AState: TSelectionState);
+  var Entry: TResolved;
+  begin
+    if not FindPriorLock(ANode, Entry) then
+      raise EVerifyError.CreateFmt(
+        '[offline] dependency "%s" has no compatible lock entry for '
+        + 'its current source. Run `lwpt install` online to resolve it.',
+        [ANode.Name]);
+    if not PriorSelectionSatisfies(ANode, Entry) then
+      raise EVerifyError.CreateFmt(
+        '[offline] locked version "%s" no longer satisfies the manifest '
+        + 'requirements for "%s". Run `lwpt install` online to resolve '
+        + 'the changed graph.', [Entry.Version, ANode.Name]);
+    if Entry.ArchiveHash = '' then
+      raise EVerifyError.CreateFmt(
+        '[offline] lock entry for "%s" has no archive hash. Run '
+        + '`lwpt install` online to regenerate compatible locked evidence.',
+        [ANode.Name]);
+    AState.RefName := Entry.Version;
+    AState.CommitSHA := Entry.CommitSHA;
+  end;
+
+  procedure StageLockedArchive(const ANode: TResolveNode;
+    const AFetchRef: string; out AUnitDir, AArchive, AArchiveHash,
+    AResolvedURL: string);
+  var
+    Entry: TResolved;
+    ProjectArchive, ActualHash: string;
+    Failure: TLWPTObjectMaterializeFailure;
+  begin
+    if not FindPriorLock(ANode, Entry) then
+      raise EVerifyError.CreateFmt(
+        '[offline] dependency "%s" has no compatible lock entry',
+        [ANode.Name]);
+    AUnitDir := IncludeTrailingPathDelimiter(PlanModules) + ANode.Name;
+    AArchive := ArchivePathForRef(PlanArchives, ANode.Name,
+      ANode.Dep.SrcKind, AFetchRef);
+    AArchiveHash := '';
+    AResolvedURL := Entry.ResolvedURL;
+    ForceDirectories(ExtractFileDir(AArchive));
+    ProjectArchive := ArchivePathForRef(AArchivesRoot, ANode.Name,
+      ANode.Dep.SrcKind, Entry.Version);
+    if FileExists(ProjectArchive) then
+    begin
+      ActualHash := 'sha256:' + SHA256File(ProjectArchive);
+      if ActualHash <> Entry.ArchiveHash then
+        raise EVerifyError.CreateFmt(
+          '[offline] archive hash mismatch for "%s": disk=%s lockfile=%s. '
+          + 'Restore the committed archive or run `lwpt install` online.',
+          [ANode.Name, ActualHash, Entry.ArchiveHash]);
+      if not CopyFileContent(ProjectArchive, AArchive) then
+        raise EFetchError.CreateFmt(
+          '[offline] failed to stage committed archive for "%s"',
+          [ANode.Name]);
+      AArchiveHash := Entry.ArchiveHash;
+      WriteLn('  reused committed archive for ', ANode.Name);
+      Exit;
+    end;
+    Failure := omfObjectMissing;
+    if AObjectStore <> nil then
+      try
+        if AObjectStore.Materialize(Entry.ArchiveHash, AArchive,
+             PlanScratch, Failure) then
+        begin
+          AArchiveHash := Entry.ArchiveHash;
+          WriteLn('  reused verified archive for ', ANode.Name,
+            ' from the per-user cache');
+          Exit;
+        end;
+      except
+        on E: Exception do
+          raise EFetchError.CreateFmt(
+            '[offline] dependency archive cache failed for "%s": %s',
+            [ANode.Name, E.Message]);
+      end;
+    raise EFetchError.CreateFmt(
+      '[offline] verified archive for "%s" is unavailable '
+      + '(expected %s; cache result: %s). Restore the committed archive '
+      + 'or run `lwpt install` online to seed the cache.',
+      [ANode.Name, Entry.ArchiveHash,
+       ObjectMaterializeFailureName(Failure)]);
   end;
 
   function NodeConstraintFingerprint(const ANode: TResolveNode): string;
@@ -2543,6 +2638,11 @@ var
     Result := Default(TSelectionState);
     Result.Name := ANode.Name;
     Result.SourceIdentity := SourceKey(ANode.Dep, ANode.CustomSources);
+    if AOffline and IsNetworkBacked(ANode) then
+    begin
+      SelectLockedNode(ANode, Result);
+      Exit;
+    end;
     if ANode.Dep.SrcKind <> skGitHost then
     begin
       HasWorkspaceConstraint := False;
@@ -2840,7 +2940,38 @@ begin
           + SHA256Hex(BytesOf(SourceKey(R.Nodes[idx].Dep,
           R.Nodes[idx].CustomSources) + '|'
           + FetchRef)) + '.tar.gz';
-        if (R.Nodes[idx].Dep.SrcKind in [skGitHost, skURL])
+        if AOffline and IsNetworkBacked(R.Nodes[idx]) then
+        begin
+          if FileExists(CacheArchive) then
+          begin
+            UnitDir := IncludeTrailingPathDelimiter(PlanModules)
+              + R.Nodes[idx].Name;
+            Archive := ArchivePathForRef(PlanArchives, R.Nodes[idx].Name,
+              R.Nodes[idx].Dep.SrcKind, FetchRef);
+            ForceDirectories(ExtractFileDir(Archive));
+            if not CopyFileContent(CacheArchive, Archive) then
+              raise EFetchError.CreateFmt(
+                '[offline] failed to restore staged candidate "%s"',
+                [R.Nodes[idx].Name]);
+            ArchiveHash := 'sha256:' + SHA256File(Archive);
+            if not FindPriorLock(R.Nodes[idx], LockedEntry) then
+              raise EVerifyError.CreateFmt(
+                '[offline] dependency "%s" has no compatible lock entry',
+                [R.Nodes[idx].Name]);
+            ResolvedURL := LockedEntry.ResolvedURL;
+          end
+          else
+          begin
+            StageLockedArchive(R.Nodes[idx], FetchRef, UnitDir, Archive,
+              ArchiveHash, ResolvedURL);
+            ForceDirectories(ExtractFileDir(CacheArchive));
+            if not CopyFileContent(Archive, CacheArchive) then
+              raise EFetchError.CreateFmt(
+                '[offline] failed to retain staged candidate "%s"',
+                [R.Nodes[idx].Name]);
+          end;
+        end
+        else if (R.Nodes[idx].Dep.SrcKind in [skGitHost, skURL])
            and FileExists(CacheArchive) then
         begin
           UnitDir := IncludeTrailingPathDelimiter(PlanModules)
@@ -3152,6 +3283,75 @@ begin
         [ALockEntries[i].Name]);
 end;
 
+procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
+  const ALockEntries: array of TResolved);
+
+  function FindLockEntry(const AName: string; out AOut: TResolved): Boolean;
+  var k: Integer;
+  begin
+    for k := 0 to High(ALockEntries) do
+      if SameText(ALockEntries[k].Name, AName) then
+      begin
+        AOut := ALockEntries[k];
+        Exit(True);
+      end;
+    Result := False;
+  end;
+
+  function GraphHasEntry(const AName: string): Boolean;
+  var k: Integer;
+  begin
+    for k := 0 to High(AResolved) do
+      if SameText(AResolved[k].Name, AName) then Exit(True);
+    Result := False;
+  end;
+
+var
+  i: Integer;
+  Lock: TResolved;
+begin
+  for i := 0 to High(AResolved) do
+  begin
+    if not FindLockEntry(AResolved[i].Name, Lock) then
+      raise EVerifyError.CreateFmt(
+        '[offline] manifest graph reaches "%s" but the lockfile has no '
+        + 'entry. Run `lwpt install` online to resolve the changed graph.',
+        [AResolved[i].Name]);
+    if AResolved[i].SourceIdentity <> Lock.SourceIdentity then
+      raise EVerifyError.CreateFmt(
+        '[offline] source or extraction policy changed for "%s". Run '
+        + '`lwpt install` online to resolve the changed graph.',
+        [AResolved[i].Name]);
+    if AResolved[i].ConstraintFingerprint <> Lock.ConstraintFingerprint then
+      raise EVerifyError.CreateFmt(
+        '[offline] accumulated constraints changed for "%s". Run '
+        + '`lwpt install` online to resolve the changed graph.',
+        [AResolved[i].Name]);
+    if (AResolved[i].Version <> Lock.Version)
+       or not SameText(AResolved[i].CommitSHA, Lock.CommitSHA) then
+      raise EVerifyError.CreateFmt(
+        '[offline] locked resolution identity changed for "%s". Run '
+        + '`lwpt install` online to resolve the changed graph.',
+        [AResolved[i].Name]);
+    if AResolved[i].Hash <> Lock.Hash then
+      raise EVerifyError.CreateFmt(
+        '[offline] tree hash mismatch for "%s": staged=%s lockfile=%s. '
+        + 'The available source does not reconstruct the locked module tree.',
+        [AResolved[i].Name, AResolved[i].Hash, Lock.Hash]);
+    if AResolved[i].ArchiveHash <> Lock.ArchiveHash then
+      raise EVerifyError.CreateFmt(
+        '[offline] archive hash mismatch for "%s": staged=%s '
+        + 'lockfile=%s. Restore verified locked content.',
+        [AResolved[i].Name, AResolved[i].ArchiveHash, Lock.ArchiveHash]);
+  end;
+  for i := 0 to High(ALockEntries) do
+    if not GraphHasEntry(ALockEntries[i].Name) then
+      raise EVerifyError.CreateFmt(
+        '[offline] lockfile has "%s" but the manifest graph does not '
+        + 'reach it. Run `lwpt install` online to resolve the changed graph.',
+        [ALockEntries[i].Name]);
+end;
+
 { Frozen-mode archive-hash recovery helper. The resolver doesn't know
   the archive filename in frozen mode (the resolved ref lives in the
   lockfile, not the manifest); look the entry up and re-hash. }
@@ -3298,7 +3498,7 @@ var
   ModulesRoot, ArchivesRoot, TmpRoot, CfgPath, LockPath, LockfilePath,
     ManifestPath, RollbackRoot, RecoveryFailures, RollbackFailures : string;
   i, j, k : Integer;
-  Frozen : Boolean;
+  Frozen, Offline : Boolean;
   FrozenLock: TResolved;
   LockFound: Boolean;
   LockedVersionKind: TVersionKind;
@@ -3312,6 +3512,7 @@ var
 begin
   Man := AContext.Manifest;
   Frozen := AMode = itmFrozenVerify;
+  Offline := AMode = itmOfflineMaterialize;
 
   ModulesRoot  := ResolveProjectPath(AContext.ProjectRoot, ResolveModulesDir(Man));
   ArchivesRoot := ResolveProjectPath(AContext.ProjectRoot, ResolveArchivesDir(Man));
@@ -3365,6 +3566,10 @@ begin
     OldLock := nil;
     if FileExists(LockfilePath) then
       OldLock := LoadLockfile(LockfilePath);
+    if Offline and not FileExists(LockfilePath) then
+      raise ELockfileError.CreateFmt(
+        '[offline] lockfile not found at %s. Run `lwpt install` online '
+        + 'to resolve and lock dependencies first.', [LockfilePath]);
 
     if not Frozen then
       try
@@ -3389,7 +3594,7 @@ begin
     begin
       ResolveGraphFixedPoint(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
                              RollbackRoot, AContext.ProjectRoot,
-                             Man.Workspaces, OldLock, ObjectStore);
+                             Man.Workspaces, OldLock, ObjectStore, Offline);
       PublicationPending := True;
     end;
     WriteLn('resolved ', Length(R.Nodes), ' packages, no conflicts.');
@@ -3534,9 +3739,12 @@ begin
       Exit;
     end;
 
-    WriteLock(LockfilePath, TmpRoot, Resolved);
-    if SysUtils.GetEnvironmentVariable(
-      PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE') = '1' then
+    if Offline then
+      VerifyOfflineAgainstLockfile(Resolved, OldLock)
+    else
+      WriteLock(LockfilePath, TmpRoot, Resolved);
+    if (not Offline) and (SysUtils.GetEnvironmentVariable(
+      PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE') = '1') then
     begin
       if SysUtils.GetEnvironmentVariable(
         PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR') <> '' then
@@ -3560,8 +3768,13 @@ begin
         'injected failure after lockfile publication');
     end;
     WriteCfg(CfgPath, TmpRoot, Resolved, Man, AContext.ProjectRoot);
-    WriteLn('wrote ', LWPT.Core.LOCKFILE, ' (', Length(Resolved),
-            ' packages) and ', CfgPath);
+    if Offline then
+      WriteLn('[offline] restored ', Length(Resolved),
+        ' packages and wrote ', CfgPath, '; ', LWPT.Core.LOCKFILE,
+        ' was left unchanged')
+    else
+      WriteLn('wrote ', LWPT.Core.LOCKFILE, ' (', Length(Resolved),
+              ' packages) and ', CfgPath);
 
     if AManifestLines <> nil then
     begin

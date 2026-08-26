@@ -58,6 +58,7 @@ bootstrap.bat      # Windows
 ./build/lwpt test               # discover/compile/run *.Test.pas
 ./build/lwpt install            # fetch any new deps
 ./build/lwpt install --frozen   # CI: verify, refuse to update
+./build/lwpt install --offline  # restore exact locked state from local bytes
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt outdated           # report newer advertised tags
@@ -81,7 +82,7 @@ for the full rationale.
 | `source/lwpt.pas` | new | program entry: registers subcommands |
 | `source/LWPT.Core.pas` | new | project identity, error hierarchy, and shared low-level helpers |
 | `source/LWPT.Manifest.pas` | new | manifest model, intake, source/version parsing, and manifest path context |
-| `source/LWPT.Install.pas` | new | install transaction: resolve, fetch, extract, lockfile/cfg, frozen verification |
+| `source/LWPT.Install.pas` | new | install transaction: resolve, fetch or restore, extract, lockfile/cfg, frozen verification |
 | `source/LWPT.Command.*.pas` | new | command-level behavior for each subcommand |
 | `source/LWPT.Formatter.pas` | converted from GocciaScript `format.pas` | formatter engine used by `LWPT.Command.Format` |
 | `source/LWPT.GitProtocol.pas` | new | git smart-HTTP tag listing for `<source>@<spec>` resolution |

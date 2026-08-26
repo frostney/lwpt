@@ -293,8 +293,8 @@ See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) for the full design ra
 | Path | Status | Purpose |
 | --- | --- | --- |
 | `.lwpt/modules/<dep>/` | **Committed** | Exact extracted or copied dependency snapshots from the stable resolver plan. Include/exclude policy has already been applied; the thing `-Fu` paths point at is never a live reread of a mutable local/workspace source. ADR-0031 supersedes ADR-0014's earlier publication-time monorepo-link amendment for materializing installs. |
-| `.lwpt/archives/<dep>-<version>.tar.gz` | **Committed** | Source-of-truth tarballs. Used for hash verification on `--frozen`. |
-| `.lwpt/tmp/` | Gitignored | Install workspace and journaled rollback copies. A materializing install or `lwpt repair` recovers pending state before ordinary residue cleanup. Frozen verification does not mutate it. |
+| `.lwpt/archives/<dep>-<version>.tar.gz` | **Committed** | Source-of-truth tarballs. Used for hash verification on `--frozen` and exact reconstruction by `install --offline`. |
+| `.lwpt/tmp/` | Gitignored | Install workspace and journaled rollback copies. A normal or offline materializing install, or `lwpt repair`, recovers pending state before ordinary residue cleanup. Frozen verification does not mutate it. |
 | `.lwpt/install.lock` | Gitignored | Cross-process install lock. Created with O_CREAT\|O_EXCL by the first `lwpt install`; a second concurrent install fails with `EConcurrencyError` naming the lock holder's PID. Deleted by the normally-completing install; a crashed install leaves it for the user to clear via `lwpt repair`. Windows lock uses `LockFileEx`. |
 | `.lwpt/sessions/<session-id>/` | Gitignored | Build/test compiler staging. Every invocation owns distinct, bounded, hash-qualified job, unit, executable, and hook-compile paths. Completed sessions retain stable job logs until `lwpt repair`; failed/crashed sessions retain their private diagnostics. The sibling `locks/` directory contains stable publication-lock files and per-session owner guards. |
 | `.lwpt/session-roots` | Gitignored | Atomic schema-versioned ledger of exact identity-verified relocated session namespaces used by `lwpt repair`. |
@@ -323,9 +323,9 @@ adds one module-specific subclass:
 | Class | Raised for |
 | --- | --- |
 | `EFetchError` | Network failures, HTTP non-2xx, local source dir missing |
-| `EVerifyError` | `--frozen` archive-hash or tree-hash mismatch against the lockfile |
+| `EVerifyError` | `--frozen` or `--offline` identity, archive-hash, or tree-hash mismatch against the lockfile |
 | `EExtractError` | Archive parse failures, tar corruption, missing archive, atomic-move failure |
-| `ELockfileError` | Corrupt TOML in `lwpt.lock`, schema version mismatch (v1 → v2), missing lockfile when `--frozen` |
+| `ELockfileError` | Corrupt TOML in `lwpt.lock`, schema version mismatch, or missing lockfile when `--frozen` or `--offline` |
 | `EManifestError` | TOML errors, missing required keys, unsatisfiable constraints, unknown source kinds |
 | `EConcurrencyError` | Concurrent `lwpt install` — second process fails fast naming the first's PID |
 | `ELWPTWorkerBudgetError` | Invalid worker-budget configuration, ownership, lease, or delegation state |
