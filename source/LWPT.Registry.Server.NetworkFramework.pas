@@ -18,6 +18,7 @@ procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
 {$IFDEF REGISTRY_TESTING}
 function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
 function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
+function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
 {$ENDIF}
 
 implementation
@@ -976,6 +977,42 @@ begin
   AValue := '';
 end;
 
+procedure HandleTemporaryKeychainCleanupFailure(const AMessage: string;
+  const APrimaryExceptionActive: Boolean);
+begin
+  if AMessage = '' then Exit;
+  if APrimaryExceptionActive then
+  begin
+    WriteLn(StdErr,
+      'registry TLS cleanup: temporary keychain cleanup failed');
+    Exit;
+  end;
+  raise ELWPTRegistryError.CreateStable('tls_configuration', AMessage);
+end;
+
+{$IFDEF REGISTRY_TESTING}
+function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
+var
+  CleanupOnlyRaised, PrimaryPreserved: Boolean;
+begin
+  PrimaryPreserved := False;
+  CleanupOnlyRaised := False;
+  try
+    HandleTemporaryKeychainCleanupFailure('test cleanup failure', True);
+    PrimaryPreserved := True;
+  except
+    PrimaryPreserved := False;
+  end;
+  try
+    HandleTemporaryKeychainCleanupFailure('test cleanup failure', False);
+  except
+    on E: ELWPTRegistryError do
+      CleanupOnlyRaised := Pos('tls_configuration:', E.Message) > 0;
+  end;
+  Result := PrimaryPreserved and CleanupOnlyRaised;
+end;
+{$ENDIF}
+
 procedure TNetworkFrameworkRegistryServer.DeleteTemporaryKeychainStorage;
 var
   Path: string;
@@ -1218,9 +1255,8 @@ begin
   DoneCriticalSection(FConnectionLock);
   FConnections.Free;
   try
-    if CleanupFailure <> '' then
-      raise ELWPTRegistryError.CreateStable('tls_configuration',
-        CleanupFailure);
+    HandleTemporaryKeychainCleanupFailure(CleanupFailure,
+      ExceptObject <> nil);
   finally
     inherited Destroy;
   end;
@@ -1332,6 +1368,11 @@ begin
 end;
 
 function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
+begin
+  Result := True;
+end;
+
+function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
 begin
   Result := True;
 end;

@@ -40,6 +40,7 @@ type
     function CurlAttempt(const AURL: string; const AInsecure: Boolean;
       out AExitStatus: Integer; out AStandardError: string;
       out AOutputTruncated, AStandardErrorTruncated: Boolean): string;
+    function StopServerAndReturnExit(var AProcess: TProcess): Integer;
     procedure StopServer(var AProcess: TProcess);
     procedure WaitUntilReady(const AURL: string; const AInsecure: Boolean;
       AServer: TProcess);
@@ -147,6 +148,17 @@ begin
   end;
 end;
 
+procedure RemoveRunOwnedTemporaryKeychain(const APath: string);
+var
+  Status: Stat;
+begin
+  if APath = '' then Exit;
+  if (FpLStat(PChar(APath), Status) <> 0)
+    or ((Status.st_mode and S_IFMT) <> S_IFREG)
+    or (Status.st_uid <> FpGetUID) then Exit;
+  FpUnlink(PChar(APath));
+end;
+
 function CreateDeadProcessID: LongInt;
 var
   ProcessInstance: TProcess;
@@ -234,12 +246,14 @@ begin
   Result := not AProcess.Running;
 end;
 
-procedure TRegistryE2EContract.StopServer(var AProcess: TProcess);
+function TRegistryE2EContract.StopServerAndReturnExit(
+  var AProcess: TProcess): Integer;
 var
   Forced: Boolean;
   FailureMessage: string;
   ProcessInstance: TProcess;
 begin
+  Result := -1;
   if not Assigned(AProcess) then Exit;
   ProcessInstance := AProcess;
   AProcess := nil;
@@ -269,6 +283,11 @@ begin
           + 'termination';
     end;
   finally
+    if not ProcessInstance.Running then
+    begin
+      ProcessInstance.WaitOnExit;
+      Result := ProcessInstance.ExitStatus;
+    end;
     ProcessInstance.Free;
   end;
   if Forced and (FailureMessage = '') then
@@ -281,6 +300,13 @@ begin
       WriteLn(StdErr, 'registry E2E cleanup: ', FailureMessage)
     else raise Exception.Create(FailureMessage);
   end;
+end;
+
+procedure TRegistryE2EContract.StopServer(var AProcess: TProcess);
+var
+  IgnoredExitStatus: Integer;
+begin
+  IgnoredExitStatus := StopServerAndReturnExit(AProcess);
 end;
 
 procedure TRegistryE2EContract.TestSilentServeUsesPersistedConfiguration;
@@ -569,8 +595,8 @@ const
     '1111111111111111111111111111111111111111111111111111111111111111';
 var
   BoundedPaths: array of string;
-  DataDirectory, DiscoveryURL, LivePath, Nonce, ResiduePath,
-    SymlinkPath: string;
+  CrashedPath, DataDirectory, DiscoveryURL, LivePath, Nonce,
+    ResiduePath, SymlinkPath: string;
   CrashedPID, DeadPID, RecoveredPID: LongInt;
   Index: Integer;
   Init: TLwptResult;
@@ -578,6 +604,8 @@ var
   Server: TProcess;
   Status: Stat;
 begin
+  CrashedPath := '';
+  LivePath := '';
   DeadPID := CreateDeadProcessID;
   ResiduePath := IncludeTrailingPathDelimiter(GetTempDir)
     + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
@@ -638,9 +666,9 @@ begin
     Expect<Boolean>(FileExists(ResiduePath)).ToBe(False);
     Expect<Integer>(FpLStat(PChar(SymlinkPath), Status)).ToBe(0);
     Expect<Integer>(TemporaryKeychainPathCount(Server.ProcessID)).ToBe(1);
-    LivePath := TemporaryKeychainPathForProcess(Server.ProcessID);
-    Expect<Boolean>(LivePath <> '').ToBe(True);
-    Expect<Integer>(FpLStat(PChar(LivePath), Status)).ToBe(0);
+    CrashedPath := TemporaryKeychainPathForProcess(Server.ProcessID);
+    Expect<Boolean>(CrashedPath <> '').ToBe(True);
+    Expect<Integer>(FpLStat(PChar(CrashedPath), Status)).ToBe(0);
     Expect<Integer>(Status.st_mode and S_IFMT).ToBe(S_IFREG);
     Expect<Integer>(Status.st_mode and (S_IRWXU or S_IRWXG or S_IRWXO))
       .ToBe(S_IRUSR or S_IWUSR);
@@ -656,14 +684,20 @@ begin
     RecoveredPID := Server.ProcessID;
     Expect<Integer>(TemporaryKeychainPathCount(CrashedPID)).ToBe(0);
     Expect<Integer>(TemporaryKeychainPathCount(RecoveredPID)).ToBe(1);
-    StopServer(Server);
+    LivePath := TemporaryKeychainPathForProcess(RecoveredPID);
+    Expect<Integer>(StopServerAndReturnExit(Server)).ToBe(0);
     Expect<Integer>(TemporaryKeychainPathCount(RecoveredPID)).ToBe(0);
   finally
-    StopServer(Server);
-    SysUtils.DeleteFile(ResiduePath);
-    FpUnlink(PChar(SymlinkPath));
-    for Index := 0 to High(BoundedPaths) do
-      FpUnlink(PChar(BoundedPaths[Index]));
+    try
+      StopServer(Server);
+    finally
+      RemoveRunOwnedTemporaryKeychain(CrashedPath);
+      RemoveRunOwnedTemporaryKeychain(LivePath);
+      SysUtils.DeleteFile(ResiduePath);
+      FpUnlink(PChar(SymlinkPath));
+      for Index := 0 to High(BoundedPaths) do
+        FpUnlink(PChar(BoundedPaths[Index]));
+    end;
   end;
 end;
 {$ELSE}

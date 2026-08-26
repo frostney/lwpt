@@ -200,6 +200,7 @@ type
     procedure TestResourceOpenRejectsUnsafeFilesystemKinds;
     procedure TestNetworkFrameworkBlockABI;
     procedure TestNetworkFrameworkTeardownOrdering;
+    procedure TestNetworkFrameworkCleanupFailureSemantics;
     procedure TestServerErrorsConformToWireContract;
     procedure TestRenewalErrorDoesNotDiscloseStorePath;
     procedure TestServerDiscoveryIsTruthful;
@@ -1235,6 +1236,12 @@ begin
   Expect<Boolean>(NetworkFrameworkBlockABIIsCompleteForTesting).ToBe(True);
 end;
 
+procedure TRegistryStoreContract.TestNetworkFrameworkCleanupFailureSemantics;
+begin
+  Expect<Boolean>(NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting)
+    .ToBe(True);
+end;
+
 procedure TRegistryStoreContract.TestRenewalErrorDoesNotDiscloseStorePath;
 var
   Body: string;
@@ -1585,6 +1592,8 @@ begin
     TestNetworkFrameworkBlockABI);
   Test('Network.framework teardown waits for callback completion',
     TestNetworkFrameworkTeardownOrdering);
+  Test('Network.framework cleanup preserves an active primary failure',
+    TestNetworkFrameworkCleanupFailureSemantics);
   Test('server errors conform to the wire contract',
     TestServerErrorsConformToWireContract);
   Test('renewal error does not disclose the store path',
