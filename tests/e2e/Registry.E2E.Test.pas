@@ -22,6 +22,10 @@ uses
 const
   TLS_PASSWORD_ENV = 'LWPT_REGISTRY_E2E_PASSWORD';
   TLS_PASSWORD = 'test-only';
+  { The server's connection deadline is 10 seconds; retain two seconds for
+    listener and connection teardown before the test force-terminates it. }
+  SERVER_STOP_TIMEOUT_MILLISECONDS = 12000;
+  SERVER_KILL_TIMEOUT_MILLISECONDS = 2000;
   REGISTRY_TLS_FIXTURE =
     'tests/fixtures/registry/localhost-native-identity.p12';
 
@@ -202,19 +206,53 @@ begin
   end;
 end;
 
+function WaitForServerExit(AProcess: TProcess;
+  const ATimeoutMilliseconds: QWord): Boolean;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while AProcess.Running
+    and (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do Sleep(10);
+  Result := not AProcess.Running;
+end;
+
 procedure TRegistryE2EContract.StopServer(AProcess: TProcess);
+var
+  Forced: Boolean;
 begin
   if not Assigned(AProcess) then Exit;
-  if AProcess.Running then
-  begin
-    {$IFDEF UNIX}
-    FpKill(AProcess.ProcessID, SIGTERM);
-    {$ELSE}
-    AProcess.Terminate(1);
-    {$ENDIF}
+  Forced := False;
+  try
+    if AProcess.Running then
+    begin
+      {$IFDEF UNIX}
+      FpKill(AProcess.ProcessID, SIGTERM);
+      {$ELSE}
+      AProcess.Terminate(1);
+      {$ENDIF}
+    end;
+    if not WaitForServerExit(AProcess,
+      SERVER_STOP_TIMEOUT_MILLISECONDS) then
+    begin
+      Forced := True;
+      {$IFDEF UNIX}
+      FpKill(AProcess.ProcessID, SIGKILL);
+      {$ELSE}
+      AProcess.Terminate(1);
+      {$ENDIF}
+      if not WaitForServerExit(AProcess,
+        SERVER_KILL_TIMEOUT_MILLISECONDS) then
+        raise Exception.Create('registry server did not stop after forced '
+          + 'termination');
+    end;
+  finally
+    AProcess.Free;
   end;
-  AProcess.WaitOnExit;
-  AProcess.Free;
+  if Forced then
+    raise Exception.CreateFmt('registry server exceeded its %d ms shutdown '
+      + 'bound and required forced termination',
+      [SERVER_STOP_TIMEOUT_MILLISECONDS]);
 end;
 
 procedure TRegistryE2EContract.TestSilentServeUsesPersistedConfiguration;
