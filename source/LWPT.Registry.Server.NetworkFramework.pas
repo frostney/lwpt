@@ -369,11 +369,11 @@ function CFRetain(AObject: Pointer): Pointer; cdecl; external name 'CFRetain';
 procedure CFRelease(AObject: Pointer); cdecl; external name 'CFRelease';
 function SecPKCS12Import(AData, AOptions: Pointer;
   AItems: PPointer): Int32; cdecl; external name 'SecPKCS12Import';
-function Sec_identity_create_with_certificates(AIdentity,
-  ACertificates: Pointer): Pointer; cdecl;
-  external name 'sec_identity_create_with_certificates';
-function Sec_identity_copy_certificates_ref(AIdentity: Pointer): Pointer;
-  cdecl; external name 'sec_identity_copy_certificates_ref';
+function SecIdentityCreateWithCertificate(AKeychainOrArray,
+  ACertificate: Pointer; out AIdentity: Pointer): Int32; cdecl;
+  external name 'SecIdentityCreateWithCertificate';
+function Sec_identity_create(AIdentity: Pointer): Pointer; cdecl;
+  external name 'sec_identity_create';
 procedure Sec_release(AObject: Pointer); cdecl; external name 'sec_release';
 function SecPolicyCreateSSL(AServer: ByteBool; AHostname: Pointer): Pointer;
   cdecl; external name 'SecPolicyCreateSSL';
@@ -988,6 +988,14 @@ begin
   WriteLn(StdErr, AMessage);
 end;
 
+procedure WriteIdentityResolutionDiagnostic(const AMessage: string);
+var
+  Line: AnsiString;
+begin
+  Line := AnsiString('[DEBUG-resolved-identity] ' + AMessage + LineEnding);
+  if Length(Line) > 0 then FpWrite(StdErrorHandle, Line[1], Length(Line));
+end;
+
 procedure HandleTemporaryKeychainCleanupFailure(const AMessage: string;
   const APrimaryExceptionActive: Boolean;
   const AReporter: TTemporaryKeychainCleanupReporter);
@@ -1088,14 +1096,13 @@ procedure TNetworkFrameworkRegistryServer.LoadIdentity(const APath,
 var
   Bytes: TBytes;
   CertificateChain, CFData, CFOptions, CFPassphrase, IdentityReference, Item,
-    Items, NetworkCertificates, RuntimeCertificates: Pointer;
-  CertificateCount, Index: NativeInt;
-  NetworkCertificateValues: array of Pointer;
+    Items, LeafCertificate, ResolvedIdentity: Pointer;
   EncodedPassphrase, KeychainPassphrase, KeychainPath,
     KeychainPathNonce: AnsiString;
   KeychainPasswordRandom, KeychainPathRandom: TTemporaryKeychainRandom;
   Keys, Values: array[0..1] of Pointer;
   PathStatus: Stat;
+  StartedAt: QWord;
   Status: Int32;
 begin
   Bytes := nil;
@@ -1105,8 +1112,8 @@ begin
   CFPassphrase := nil;
   IdentityReference := nil;
   Items := nil;
-  NetworkCertificates := nil;
-  RuntimeCertificates := nil;
+  LeafCertificate := nil;
+  ResolvedIdentity := nil;
   EncodedPassphrase := '';
   KeychainPassphrase := '';
   KeychainPathNonce := '';
@@ -1168,29 +1175,27 @@ begin
     if IdentityReference = nil then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'PKCS#12 contains no identity');
-    CertificateCount := CFArrayGetCount(CertificateChain);
-    SetLength(NetworkCertificateValues, CertificateCount - 1);
-    for Index := 0 to High(NetworkCertificateValues) do
-      NetworkCertificateValues[Index] := CFArrayGetValueAtIndex(
-        CertificateChain, Index + 1);
-    NetworkCertificates := CFArrayCreate(nil,
-      @NetworkCertificateValues[0], Length(NetworkCertificateValues),
-      ArrayCallbacks);
-    if NetworkCertificates = nil then
+    if (CertificateChain = nil) or (CFArrayGetCount(CertificateChain) = 0) then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
-        'could not retain the Network.framework certificate chain');
-    CFRetain(IdentityReference);
-    FTLSIdentity := Sec_identity_create_with_certificates(IdentityReference,
-      NetworkCertificates);
+        'PKCS#12 contains no certificate chain');
+    LeafCertificate := CFArrayGetValueAtIndex(CertificateChain, 0);
+    StartedAt := GetTickCount64;
+    WriteIdentityResolutionDiagnostic(
+      'before SecIdentityCreateWithCertificate');
+    Status := SecIdentityCreateWithCertificate(FTemporaryKeychain,
+      LeafCertificate, ResolvedIdentity);
+    WriteIdentityResolutionDiagnostic(
+      'after SecIdentityCreateWithCertificate status=' + IntToStr(Status)
+      + ' identity=' + BoolToStr(ResolvedIdentity <> nil, True)
+      + ' elapsed-ms=' + IntToStr(GetTickCount64 - StartedAt));
+    if (Status <> 0) or (ResolvedIdentity = nil) then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'temporary keychain identity resolution failed with status '
+        + IntToStr(Status));
+    FTLSIdentity := Sec_identity_create(ResolvedIdentity);
     if FTLSIdentity = nil then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'could not create the Network.framework TLS identity');
-    RuntimeCertificates := Sec_identity_copy_certificates_ref(FTLSIdentity);
-    if (RuntimeCertificates = nil)
-      or (CFArrayGetCount(RuntimeCertificates)
-        <> Length(NetworkCertificateValues)) then
-      raise ELWPTRegistryError.CreateStable('tls_configuration',
-        'Network.framework TLS identity did not retain its certificate chain');
   finally
     if Length(Bytes) > 0 then FillChar(Bytes[0], Length(Bytes), 0);
     Bytes := nil;
@@ -1202,9 +1207,7 @@ begin
     WipeAnsiString(KeychainPathNonce);
     FillChar(KeychainPasswordRandom, SizeOf(KeychainPasswordRandom), 0);
     FillChar(KeychainPathRandom, SizeOf(KeychainPathRandom), 0);
-    if IdentityReference <> nil then CFRelease(IdentityReference);
-    if RuntimeCertificates <> nil then CFRelease(RuntimeCertificates);
-    if NetworkCertificates <> nil then CFRelease(NetworkCertificates);
+    if ResolvedIdentity <> nil then CFRelease(ResolvedIdentity);
     if Items <> nil then CFRelease(Items);
     if CFOptions <> nil then CFRelease(CFOptions);
     if CFPassphrase <> nil then CFRelease(CFPassphrase);
