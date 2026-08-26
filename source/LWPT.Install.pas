@@ -40,7 +40,11 @@ type
   end;
   TResolvedArray = array of TResolved;
 
-  TInstallTransactionMode = (itmMaterialize, itmFrozenVerify);
+  TInstallTransactionMode = (
+    itmMaterialize,
+    itmFrozenVerify,
+    itmOfflineMaterialize
+  );
 
   TInstallTransactionResult = record
     PackageCount : Integer;
@@ -1747,6 +1751,44 @@ type
   end;
   TPathRollbackArray = array of TPathRollback;
 
+procedure ResolutionToResolved(const AResolution: TResolution;
+  out AResolved: TResolvedArray);
+var i, j: Integer;
+begin
+  SetLength(AResolved, Length(AResolution.Nodes));
+  for i := 0 to High(AResolution.Nodes) do
+  begin
+    AResolved[i] := Default(TResolved);
+    AResolved[i].Name := AResolution.Nodes[i].Name;
+    AResolved[i].Version := AResolution.Nodes[i].Version;
+    AResolved[i].CommitSHA := AResolution.Nodes[i].CommitSHA;
+    AResolved[i].SourceIdentity := AResolution.Nodes[i].SourceIdentity;
+    AResolved[i].ConstraintFingerprint :=
+      AResolution.Nodes[i].ConstraintFingerprint;
+    AResolved[i].SrcOriginal := AResolution.Nodes[i].Dep.SrcOriginal;
+    AResolved[i].SrcKind := AResolution.Nodes[i].Dep.SrcKind;
+    AResolved[i].SrcHost := AResolution.Nodes[i].Dep.SrcHost;
+    AResolved[i].SrcHostName := AResolution.Nodes[i].Dep.SrcHostName;
+    AResolved[i].SrcLocator := AResolution.Nodes[i].Dep.SrcLocator;
+    AResolved[i].ResolvedURL := AResolution.Nodes[i].ResolvedURL;
+    AResolved[i].UnitDir := AResolution.Nodes[i].UnitDir;
+    SetLength(AResolved[i].UnitSubdirs,
+      Length(AResolution.Nodes[i].UnitSubdirs));
+    for j := 0 to High(AResolution.Nodes[i].UnitSubdirs) do
+      AResolved[i].UnitSubdirs[j] :=
+        AResolution.Nodes[i].UnitSubdirs[j];
+    AResolved[i].Archive := AResolution.Nodes[i].Archive;
+    AResolved[i].ArchiveHash := AResolution.Nodes[i].ArchiveHash;
+    if AResolution.Nodes[i].Hash <> '' then
+      AResolved[i].Hash := AResolution.Nodes[i].Hash
+    else
+      AResolved[i].Hash := 'sha256:(unfetched)';
+  end;
+end;
+
+procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
+  const ALockEntries: array of TResolved); forward;
+
 procedure AppendRollbackFailure(var AFailures: string;
   const AMessage: string);
 begin
@@ -2329,7 +2371,8 @@ procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
   ARollbackRoot, AProjectRoot: string;
   const AWorkspaces: TWorkspaceArray;
   const APriorLock: TResolvedArray;
-  const AObjectStore: TLWPTImmutableObjectStore);
+  const AObjectStore: TLWPTImmutableObjectStore;
+  const AOffline: Boolean);
 type
   TSelectionState = record
     Name, SourceIdentity, RefName, CommitSHA: string;
@@ -2342,12 +2385,14 @@ type
   TRefCache = array of TRefCacheEntry;
 var
   Previous, Desired: TSelectionStateArray;
+  OfflineResolved: TResolvedArray;
   RefCache: TRefCache;
   SeenSignatures: TStringList;
   PlanRoot, PlanModules, PlanArchives, PlanScratch: string;
   Round, i, j, idx, Head: Integer;
   Queue: array of Integer;
   ChildMan: TManifest;
+  LockedEntry: TResolved;
   ChildManifestPath, ManifestRelDir, ExtractTmp: string;
   UnitDir, Archive, ArchiveHash, ResolvedURL, CacheArchive,
     ExpectedArchiveHash: string;
@@ -2369,6 +2414,25 @@ var
       AProjectRoot);
   end;
 
+  function LockSourceMatches(const ANode: TResolveNode;
+    const AEntry: TResolved): Boolean;
+  begin
+    if AEntry.SourceIdentity <> '' then
+      Result := AEntry.SourceIdentity = SourceKey(ANode.Dep,
+        ANode.CustomSources)
+    else
+      Result := AEntry.SrcOriginal = ANode.Dep.SrcOriginal;
+  end;
+
+  function LockedCommitIdentity(const AEntry: TResolved): string;
+  var Kind: TVersionKind; Value: string;
+  begin
+    Result := AEntry.CommitSHA;
+    if Result <> '' then Exit;
+    ParseVersionSpec(AEntry.Version, Kind, Value);
+    if Kind = vkCommitSha then Result := Value;
+  end;
+
   function FindPriorLock(const ANode: TResolveNode;
     out AEntry: TResolved): Boolean;
   var k: Integer;
@@ -2376,9 +2440,7 @@ var
     AEntry := Default(TResolved);
     for k := 0 to High(APriorLock) do
       if SameText(APriorLock[k].Name, ANode.Name)
-         and (APriorLock[k].SourceIdentity <> '')
-         and (APriorLock[k].SourceIdentity = SourceKey(ANode.Dep,
-           ANode.CustomSources)) then
+         and LockSourceMatches(ANode, APriorLock[k]) then
       begin
         AEntry := APriorLock[k];
         Exit(True);
@@ -2388,8 +2450,9 @@ var
 
   function PriorSelectionSatisfies(const ANode: TResolveNode;
     const AEntry: TResolved): Boolean;
-  var k: Integer;
+  var k: Integer; CommitIdentity: string;
   begin
+    CommitIdentity := LockedCommitIdentity(AEntry);
     Result := True;
     for k := 0 to High(ANode.Kinds) do
       case ANode.Kinds[k] of
@@ -2400,8 +2463,8 @@ var
           Result := Result and ((AEntry.Version = ANode.Specs[k])
             or (AEntry.Version = 'v' + ANode.Specs[k]));
         vkCommitSha:
-          Result := Result and (AEntry.CommitSHA <> '')
-            and SameText(ANode.Specs[k], Copy(AEntry.CommitSHA, 1,
+          Result := Result and (CommitIdentity <> '')
+            and SameText(ANode.Specs[k], Copy(CommitIdentity, 1,
               Length(ANode.Specs[k])));
         vkLiteralTag:
           Result := Result and (AEntry.Version = ANode.Specs[k]);
@@ -2420,6 +2483,95 @@ var
        and ((Entry.CommitSHA = '')
          or not SameText(Entry.CommitSHA, ANode.CommitSHA)) then Exit;
     Result := Entry.ArchiveHash;
+  end;
+
+  function IsNetworkBacked(const ANode: TResolveNode): Boolean;
+  begin
+    Result := not (ANode.Dep.SrcKind in [skLocal, skWorkspace]);
+  end;
+
+  procedure SelectLockedNode(const ANode: TResolveNode;
+    var AState: TSelectionState);
+  var Entry: TResolved;
+  begin
+    if not FindPriorLock(ANode, Entry) then
+      raise EVerifyError.CreateFmt(
+        '[offline] dependency "%s" has no compatible lock entry for '
+        + 'its current source. Run `lwpt install` online to resolve it.',
+        [ANode.Name]);
+    if not PriorSelectionSatisfies(ANode, Entry) then
+      raise EVerifyError.CreateFmt(
+        '[offline] locked version "%s" no longer satisfies the manifest '
+        + 'requirements for "%s". Run `lwpt install` online to resolve '
+        + 'the changed graph.', [Entry.Version, ANode.Name]);
+    if Entry.ArchiveHash = '' then
+      raise EVerifyError.CreateFmt(
+        '[offline] lock entry for "%s" has no archive hash. Run '
+        + '`lwpt install` online to regenerate compatible locked evidence.',
+        [ANode.Name]);
+    AState.RefName := Entry.Version;
+    AState.CommitSHA := LockedCommitIdentity(Entry);
+  end;
+
+  procedure StageLockedArchive(const ANode: TResolveNode;
+    const AFetchRef: string; out AUnitDir, AArchive, AArchiveHash,
+    AResolvedURL: string);
+  var
+    Entry: TResolved;
+    ProjectArchive, ActualHash: string;
+    Failure: TLWPTObjectMaterializeFailure;
+  begin
+    if not FindPriorLock(ANode, Entry) then
+      raise EVerifyError.CreateFmt(
+        '[offline] dependency "%s" has no compatible lock entry',
+        [ANode.Name]);
+    AUnitDir := IncludeTrailingPathDelimiter(PlanModules) + ANode.Name;
+    AArchive := ArchivePathForRef(PlanArchives, ANode.Name,
+      ANode.Dep.SrcKind, AFetchRef);
+    AArchiveHash := '';
+    AResolvedURL := Entry.ResolvedURL;
+    ForceDirectories(ExtractFileDir(AArchive));
+    ProjectArchive := ArchivePathForRef(AArchivesRoot, ANode.Name,
+      ANode.Dep.SrcKind, Entry.Version);
+    if FileExists(ProjectArchive) then
+    begin
+      ActualHash := 'sha256:' + SHA256File(ProjectArchive);
+      if ActualHash <> Entry.ArchiveHash then
+        raise EVerifyError.CreateFmt(
+          '[offline] archive hash mismatch for "%s": disk=%s lockfile=%s. '
+          + 'Restore the committed archive or run `lwpt install` online.',
+          [ANode.Name, ActualHash, Entry.ArchiveHash]);
+      if not CopyFileContent(ProjectArchive, AArchive) then
+        raise EFetchError.CreateFmt(
+          '[offline] failed to stage committed archive for "%s"',
+          [ANode.Name]);
+      AArchiveHash := Entry.ArchiveHash;
+      WriteLn('  reused committed archive for ', ANode.Name);
+      Exit;
+    end;
+    Failure := omfObjectMissing;
+    if AObjectStore <> nil then
+      try
+        if AObjectStore.Materialize(Entry.ArchiveHash, AArchive,
+             PlanScratch, Failure) then
+        begin
+          AArchiveHash := Entry.ArchiveHash;
+          WriteLn('  reused verified archive for ', ANode.Name,
+            ' from the per-user cache');
+          Exit;
+        end;
+      except
+        on E: Exception do
+          raise EFetchError.CreateFmt(
+            '[offline] dependency archive cache failed for "%s": %s',
+            [ANode.Name, E.Message]);
+      end;
+    raise EFetchError.CreateFmt(
+      '[offline] verified archive for "%s" is unavailable '
+      + '(expected %s; cache result: %s). Restore the committed archive '
+      + 'or run `lwpt install` online to seed the cache.',
+      [ANode.Name, Entry.ArchiveHash,
+       ObjectMaterializeFailureName(Failure)]);
   end;
 
   function NodeConstraintFingerprint(const ANode: TResolveNode): string;
@@ -2543,6 +2695,11 @@ var
     Result := Default(TSelectionState);
     Result.Name := ANode.Name;
     Result.SourceIdentity := SourceKey(ANode.Dep, ANode.CustomSources);
+    if AOffline and IsNetworkBacked(ANode) then
+    begin
+      SelectLockedNode(ANode, Result);
+      Exit;
+    end;
     if ANode.Dep.SrcKind <> skGitHost then
     begin
       HasWorkspaceConstraint := False;
@@ -2840,7 +2997,38 @@ begin
           + SHA256Hex(BytesOf(SourceKey(R.Nodes[idx].Dep,
           R.Nodes[idx].CustomSources) + '|'
           + FetchRef)) + '.tar.gz';
-        if (R.Nodes[idx].Dep.SrcKind in [skGitHost, skURL])
+        if AOffline and IsNetworkBacked(R.Nodes[idx]) then
+        begin
+          if FileExists(CacheArchive) then
+          begin
+            UnitDir := IncludeTrailingPathDelimiter(PlanModules)
+              + R.Nodes[idx].Name;
+            Archive := ArchivePathForRef(PlanArchives, R.Nodes[idx].Name,
+              R.Nodes[idx].Dep.SrcKind, FetchRef);
+            ForceDirectories(ExtractFileDir(Archive));
+            if not CopyFileContent(CacheArchive, Archive) then
+              raise EFetchError.CreateFmt(
+                '[offline] failed to restore staged candidate "%s"',
+                [R.Nodes[idx].Name]);
+            ArchiveHash := 'sha256:' + SHA256File(Archive);
+            if not FindPriorLock(R.Nodes[idx], LockedEntry) then
+              raise EVerifyError.CreateFmt(
+                '[offline] dependency "%s" has no compatible lock entry',
+                [R.Nodes[idx].Name]);
+            ResolvedURL := LockedEntry.ResolvedURL;
+          end
+          else
+          begin
+            StageLockedArchive(R.Nodes[idx], FetchRef, UnitDir, Archive,
+              ArchiveHash, ResolvedURL);
+            ForceDirectories(ExtractFileDir(CacheArchive));
+            if not CopyFileContent(Archive, CacheArchive) then
+              raise EFetchError.CreateFmt(
+                '[offline] failed to retain staged candidate "%s"',
+                [R.Nodes[idx].Name]);
+          end;
+        end
+        else if (R.Nodes[idx].Dep.SrcKind in [skGitHost, skURL])
            and FileExists(CacheArchive) then
         begin
           UnitDir := IncludeTrailingPathDelimiter(PlanModules)
@@ -2958,6 +3146,12 @@ begin
         Previous := Desired;
       end;
     until Stable;
+
+    if AOffline then
+    begin
+      ResolutionToResolved(R, OfflineResolved);
+      VerifyOfflineAgainstLockfile(OfflineResolved, APriorLock);
+    end;
 
     try
       PublishPlan;
@@ -3152,6 +3346,91 @@ begin
         [ALockEntries[i].Name]);
 end;
 
+procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
+  const ALockEntries: array of TResolved);
+
+  function LockedCommitIdentity(const AEntry: TResolved): string;
+  var Kind: TVersionKind; Value: string;
+  begin
+    Result := AEntry.CommitSHA;
+    if Result <> '' then Exit;
+    ParseVersionSpec(AEntry.Version, Kind, Value);
+    if Kind = vkCommitSha then Result := Value;
+  end;
+
+  function FindLockEntry(const AName: string; out AOut: TResolved): Boolean;
+  var k: Integer;
+  begin
+    for k := 0 to High(ALockEntries) do
+      if SameText(ALockEntries[k].Name, AName) then
+      begin
+        AOut := ALockEntries[k];
+        Exit(True);
+      end;
+    Result := False;
+  end;
+
+  function GraphHasEntry(const AName: string): Boolean;
+  var k: Integer;
+  begin
+    for k := 0 to High(AResolved) do
+      if SameText(AResolved[k].Name, AName) then Exit(True);
+    Result := False;
+  end;
+
+var
+  i: Integer;
+  Lock: TResolved;
+  LockCommit: string;
+begin
+  for i := 0 to High(AResolved) do
+  begin
+    if not FindLockEntry(AResolved[i].Name, Lock) then
+      raise EVerifyError.CreateFmt(
+        '[offline] manifest graph reaches "%s" but the lockfile has no '
+        + 'entry. Run `lwpt install` online to resolve the changed graph.',
+        [AResolved[i].Name]);
+    if ((Lock.SourceIdentity <> '')
+        and (AResolved[i].SourceIdentity <> Lock.SourceIdentity))
+       or ((Lock.SourceIdentity = '')
+        and (AResolved[i].SrcOriginal <> Lock.SrcOriginal)) then
+      raise EVerifyError.CreateFmt(
+        '[offline] source or extraction policy changed for "%s". Run '
+        + '`lwpt install` online to resolve the changed graph.',
+        [AResolved[i].Name]);
+    if (Lock.ConstraintFingerprint <> '')
+       and (AResolved[i].ConstraintFingerprint <>
+         Lock.ConstraintFingerprint) then
+      raise EVerifyError.CreateFmt(
+        '[offline] accumulated constraints changed for "%s". Run '
+        + '`lwpt install` online to resolve the changed graph.',
+        [AResolved[i].Name]);
+    LockCommit := LockedCommitIdentity(Lock);
+    if (AResolved[i].Version <> Lock.Version)
+       or not SameText(AResolved[i].CommitSHA, LockCommit) then
+      raise EVerifyError.CreateFmt(
+        '[offline] locked resolution identity changed for "%s". Run '
+        + '`lwpt install` online to resolve the changed graph.',
+        [AResolved[i].Name]);
+    if AResolved[i].Hash <> Lock.Hash then
+      raise EVerifyError.CreateFmt(
+        '[offline] tree hash mismatch for "%s": staged=%s lockfile=%s. '
+        + 'The available source does not reconstruct the locked module tree.',
+        [AResolved[i].Name, AResolved[i].Hash, Lock.Hash]);
+    if AResolved[i].ArchiveHash <> Lock.ArchiveHash then
+      raise EVerifyError.CreateFmt(
+        '[offline] archive hash mismatch for "%s": staged=%s '
+        + 'lockfile=%s. Restore verified locked content.',
+        [AResolved[i].Name, AResolved[i].ArchiveHash, Lock.ArchiveHash]);
+  end;
+  for i := 0 to High(ALockEntries) do
+    if not GraphHasEntry(ALockEntries[i].Name) then
+      raise EVerifyError.CreateFmt(
+        '[offline] lockfile has "%s" but the manifest graph does not '
+        + 'reach it. Run `lwpt install` online to resolve the changed graph.',
+        [ALockEntries[i].Name]);
+end;
+
 { Frozen-mode archive-hash recovery helper. The resolver doesn't know
   the archive filename in frozen mode (the resolved ref lives in the
   lockfile, not the manifest); look the entry up and re-hash. }
@@ -3298,7 +3577,7 @@ var
   ModulesRoot, ArchivesRoot, TmpRoot, CfgPath, LockPath, LockfilePath,
     ManifestPath, RollbackRoot, RecoveryFailures, RollbackFailures : string;
   i, j, k : Integer;
-  Frozen : Boolean;
+  Frozen, Offline : Boolean;
   FrozenLock: TResolved;
   LockFound: Boolean;
   LockedVersionKind: TVersionKind;
@@ -3312,6 +3591,7 @@ var
 begin
   Man := AContext.Manifest;
   Frozen := AMode = itmFrozenVerify;
+  Offline := AMode = itmOfflineMaterialize;
 
   ModulesRoot  := ResolveProjectPath(AContext.ProjectRoot, ResolveModulesDir(Man));
   ArchivesRoot := ResolveProjectPath(AContext.ProjectRoot, ResolveArchivesDir(Man));
@@ -3365,6 +3645,10 @@ begin
     OldLock := nil;
     if FileExists(LockfilePath) then
       OldLock := LoadLockfile(LockfilePath);
+    if Offline and not FileExists(LockfilePath) then
+      raise ELockfileError.CreateFmt(
+        '[offline] lockfile not found at %s. Run `lwpt install` online '
+        + 'to resolve and lock dependencies first.', [LockfilePath]);
 
     if not Frozen then
       try
@@ -3389,38 +3673,12 @@ begin
     begin
       ResolveGraphFixedPoint(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
                              RollbackRoot, AContext.ProjectRoot,
-                             Man.Workspaces, OldLock, ObjectStore);
+                             Man.Workspaces, OldLock, ObjectStore, Offline);
       PublicationPending := True;
     end;
     WriteLn('resolved ', Length(R.Nodes), ' packages, no conflicts.');
 
-    SetLength(Resolved, Length(R.Nodes));
-    for i := 0 to High(R.Nodes) do
-    begin
-      Resolved[i] := Default(TResolved);
-      Resolved[i].Name        := R.Nodes[i].Name;
-      Resolved[i].Version     := R.Nodes[i].Version;
-      Resolved[i].CommitSHA   := R.Nodes[i].CommitSHA;
-      Resolved[i].SourceIdentity := R.Nodes[i].SourceIdentity;
-      Resolved[i].ConstraintFingerprint :=
-        R.Nodes[i].ConstraintFingerprint;
-      Resolved[i].SrcOriginal := R.Nodes[i].Dep.SrcOriginal;
-      Resolved[i].SrcKind     := R.Nodes[i].Dep.SrcKind;
-      Resolved[i].SrcHost     := R.Nodes[i].Dep.SrcHost;
-      Resolved[i].SrcHostName := R.Nodes[i].Dep.SrcHostName;
-      Resolved[i].SrcLocator  := R.Nodes[i].Dep.SrcLocator;
-      Resolved[i].ResolvedURL := R.Nodes[i].ResolvedURL;
-      Resolved[i].UnitDir     := R.Nodes[i].UnitDir;
-      SetLength(Resolved[i].UnitSubdirs, Length(R.Nodes[i].UnitSubdirs));
-      for j := 0 to High(R.Nodes[i].UnitSubdirs) do
-        Resolved[i].UnitSubdirs[j] := R.Nodes[i].UnitSubdirs[j];
-      Resolved[i].Archive     := R.Nodes[i].Archive;
-      Resolved[i].ArchiveHash := R.Nodes[i].ArchiveHash;
-      if R.Nodes[i].Hash <> '' then
-        Resolved[i].Hash := R.Nodes[i].Hash
-      else
-        Resolved[i].Hash := 'sha256:(unfetched)';
-    end;
+    ResolutionToResolved(R, Resolved);
 
     if Frozen then
     begin
@@ -3534,9 +3792,12 @@ begin
       Exit;
     end;
 
-    WriteLock(LockfilePath, TmpRoot, Resolved);
-    if SysUtils.GetEnvironmentVariable(
-      PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE') = '1' then
+    if Offline then
+      VerifyOfflineAgainstLockfile(Resolved, OldLock)
+    else
+      WriteLock(LockfilePath, TmpRoot, Resolved);
+    if (not Offline) and (SysUtils.GetEnvironmentVariable(
+      PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE') = '1') then
     begin
       if SysUtils.GetEnvironmentVariable(
         PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR') <> '' then
@@ -3560,8 +3821,13 @@ begin
         'injected failure after lockfile publication');
     end;
     WriteCfg(CfgPath, TmpRoot, Resolved, Man, AContext.ProjectRoot);
-    WriteLn('wrote ', LWPT.Core.LOCKFILE, ' (', Length(Resolved),
-            ' packages) and ', CfgPath);
+    if Offline then
+      WriteLn('[offline] restored ', Length(Resolved),
+        ' packages and wrote ', CfgPath, '; ', LWPT.Core.LOCKFILE,
+        ' was left unchanged')
+    else
+      WriteLn('wrote ', LWPT.Core.LOCKFILE, ' (', Length(Resolved),
+              ' packages) and ', CfgPath);
 
     if AManifestLines <> nil then
     begin
