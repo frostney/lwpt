@@ -103,6 +103,9 @@ begin
 end;
 
 {$IFDEF DARWIN}
+const
+  MAX_TEMPORARY_KEYCHAIN_DIAGNOSTIC_PATHS = 129;
+
 function TemporaryKeychainPathCount(const APID: LongInt): Integer;
 var
   Pattern: string;
@@ -116,6 +119,7 @@ begin
   try
     repeat
       Inc(Result);
+      if Result >= MAX_TEMPORARY_KEYCHAIN_DIAGNOSTIC_PATHS then Break;
     until FindNext(Search) <> 0;
   finally
     FindClose(Search);
@@ -280,6 +284,9 @@ var
   ExitStatus: Integer;
   OutputTruncated, Running, StandardErrorTruncated: Boolean;
   StartedAt: QWord;
+  {$IFDEF DARWIN}
+  KeychainPaths: Integer;
+  {$ENDIF}
 begin
   ExitStatus := -1;
   StandardError := '';
@@ -296,7 +303,13 @@ begin
   else ExitState := 'unavailable';
   {$IFDEF DARWIN}
   if Assigned(AServer) then
-    KeychainState := IntToStr(TemporaryKeychainPathCount(AServer.ProcessID))
+  begin
+    KeychainPaths := TemporaryKeychainPathCount(AServer.ProcessID);
+    if KeychainPaths >= MAX_TEMPORARY_KEYCHAIN_DIAGNOSTIC_PATHS then
+      KeychainState := '>='
+        + IntToStr(MAX_TEMPORARY_KEYCHAIN_DIAGNOSTIC_PATHS)
+    else KeychainState := IntToStr(KeychainPaths);
+  end
   else KeychainState := 'unavailable';
   {$ELSE}
   KeychainState := 'not-applicable';
