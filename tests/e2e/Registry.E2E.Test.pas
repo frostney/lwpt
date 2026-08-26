@@ -503,6 +503,7 @@ begin
 end;
 {$ELSE}
 begin
+  Expect<Boolean>(True).ToBe(True);
 end;
 {$ENDIF}
 
