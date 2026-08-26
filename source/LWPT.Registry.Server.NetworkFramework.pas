@@ -90,6 +90,7 @@ type
   PNativeUInt = ^NativeUInt;
   TTemporaryKeychainRandom =
     array[0..TEMPORARY_KEYCHAIN_RANDOM_BYTES - 1] of Byte;
+  TTemporaryKeychainCleanupReporter = procedure(const AMessage: string);
   TNetworkFrameworkRegistryServer = class;
 
   TNetworkFrameworkRegistryConnection = class
@@ -977,39 +978,73 @@ begin
   AValue := '';
 end;
 
+procedure WriteTemporaryKeychainCleanupReport(const AMessage: string);
+begin
+  WriteLn(StdErr, AMessage);
+end;
+
 procedure HandleTemporaryKeychainCleanupFailure(const AMessage: string;
-  const APrimaryExceptionActive: Boolean);
+  const APrimaryExceptionActive: Boolean;
+  const AReporter: TTemporaryKeychainCleanupReporter);
+const
+  STABLE_PREFIX = 'tls_configuration: ';
 begin
   if AMessage = '' then Exit;
   if APrimaryExceptionActive then
   begin
-    WriteLn(StdErr,
-      'registry TLS cleanup: temporary keychain cleanup failed');
+    try
+      if Assigned(AReporter) then
+        AReporter(
+          'registry TLS cleanup: temporary keychain cleanup failed');
+    except
+      { Reporting is best-effort and must not replace the primary failure. }
+    end;
     Exit;
   end;
+  if Pos(STABLE_PREFIX, AMessage) = 1 then
+    raise ELWPTRegistryError.Create(AMessage);
   raise ELWPTRegistryError.CreateStable('tls_configuration', AMessage);
 end;
 
 {$IFDEF REGISTRY_TESTING}
+procedure RaiseTemporaryKeychainCleanupReportForTesting(
+  const AMessage: string);
+begin
+  raise Exception.Create('cleanup report failed');
+end;
+
 function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
 var
-  CleanupOnlyRaised, PrimaryPreserved: Boolean;
+  CleanupOnlyRaised, PrimaryPreserved, StableMessagePreserved: Boolean;
 begin
   PrimaryPreserved := False;
   CleanupOnlyRaised := False;
+  StableMessagePreserved := False;
   try
-    HandleTemporaryKeychainCleanupFailure('test cleanup failure', True);
+    HandleTemporaryKeychainCleanupFailure('test cleanup failure', True,
+      @RaiseTemporaryKeychainCleanupReportForTesting);
     PrimaryPreserved := True;
   except
     PrimaryPreserved := False;
   end;
   try
-    HandleTemporaryKeychainCleanupFailure('test cleanup failure', False);
+    HandleTemporaryKeychainCleanupFailure('test cleanup failure', False,
+      @RaiseTemporaryKeychainCleanupReportForTesting);
   except
     on E: ELWPTRegistryError do
-      CleanupOnlyRaised := Pos('tls_configuration:', E.Message) > 0;
+      CleanupOnlyRaised := E.Message =
+        'tls_configuration: test cleanup failure';
   end;
-  Result := PrimaryPreserved and CleanupOnlyRaised;
+  try
+    HandleTemporaryKeychainCleanupFailure(
+      'tls_configuration: existing stable failure', False,
+      @RaiseTemporaryKeychainCleanupReportForTesting);
+  except
+    on E: ELWPTRegistryError do
+      StableMessagePreserved := E.Message =
+        'tls_configuration: existing stable failure';
+  end;
+  Result := PrimaryPreserved and CleanupOnlyRaised and StableMessagePreserved;
 end;
 {$ENDIF}
 
@@ -1256,7 +1291,7 @@ begin
   FConnections.Free;
   try
     HandleTemporaryKeychainCleanupFailure(CleanupFailure,
-      ExceptObject <> nil);
+      ExceptObject <> nil, @WriteTemporaryKeychainCleanupReport);
   finally
     inherited Destroy;
   end;
