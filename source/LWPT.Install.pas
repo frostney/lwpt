@@ -1751,6 +1751,44 @@ type
   end;
   TPathRollbackArray = array of TPathRollback;
 
+procedure ResolutionToResolved(const AResolution: TResolution;
+  out AResolved: TResolvedArray);
+var i, j: Integer;
+begin
+  SetLength(AResolved, Length(AResolution.Nodes));
+  for i := 0 to High(AResolution.Nodes) do
+  begin
+    AResolved[i] := Default(TResolved);
+    AResolved[i].Name := AResolution.Nodes[i].Name;
+    AResolved[i].Version := AResolution.Nodes[i].Version;
+    AResolved[i].CommitSHA := AResolution.Nodes[i].CommitSHA;
+    AResolved[i].SourceIdentity := AResolution.Nodes[i].SourceIdentity;
+    AResolved[i].ConstraintFingerprint :=
+      AResolution.Nodes[i].ConstraintFingerprint;
+    AResolved[i].SrcOriginal := AResolution.Nodes[i].Dep.SrcOriginal;
+    AResolved[i].SrcKind := AResolution.Nodes[i].Dep.SrcKind;
+    AResolved[i].SrcHost := AResolution.Nodes[i].Dep.SrcHost;
+    AResolved[i].SrcHostName := AResolution.Nodes[i].Dep.SrcHostName;
+    AResolved[i].SrcLocator := AResolution.Nodes[i].Dep.SrcLocator;
+    AResolved[i].ResolvedURL := AResolution.Nodes[i].ResolvedURL;
+    AResolved[i].UnitDir := AResolution.Nodes[i].UnitDir;
+    SetLength(AResolved[i].UnitSubdirs,
+      Length(AResolution.Nodes[i].UnitSubdirs));
+    for j := 0 to High(AResolution.Nodes[i].UnitSubdirs) do
+      AResolved[i].UnitSubdirs[j] :=
+        AResolution.Nodes[i].UnitSubdirs[j];
+    AResolved[i].Archive := AResolution.Nodes[i].Archive;
+    AResolved[i].ArchiveHash := AResolution.Nodes[i].ArchiveHash;
+    if AResolution.Nodes[i].Hash <> '' then
+      AResolved[i].Hash := AResolution.Nodes[i].Hash
+    else
+      AResolved[i].Hash := 'sha256:(unfetched)';
+  end;
+end;
+
+procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
+  const ALockEntries: array of TResolved); forward;
+
 procedure AppendRollbackFailure(var AFailures: string;
   const AMessage: string);
 begin
@@ -2347,6 +2385,7 @@ type
   TRefCache = array of TRefCacheEntry;
 var
   Previous, Desired: TSelectionStateArray;
+  OfflineResolved: TResolvedArray;
   RefCache: TRefCache;
   SeenSignatures: TStringList;
   PlanRoot, PlanModules, PlanArchives, PlanScratch: string;
@@ -2375,6 +2414,25 @@ var
       AProjectRoot);
   end;
 
+  function LockSourceMatches(const ANode: TResolveNode;
+    const AEntry: TResolved): Boolean;
+  begin
+    if AEntry.SourceIdentity <> '' then
+      Result := AEntry.SourceIdentity = SourceKey(ANode.Dep,
+        ANode.CustomSources)
+    else
+      Result := AEntry.SrcOriginal = ANode.Dep.SrcOriginal;
+  end;
+
+  function LockedCommitIdentity(const AEntry: TResolved): string;
+  var Kind: TVersionKind; Value: string;
+  begin
+    Result := AEntry.CommitSHA;
+    if Result <> '' then Exit;
+    ParseVersionSpec(AEntry.Version, Kind, Value);
+    if Kind = vkCommitSha then Result := Value;
+  end;
+
   function FindPriorLock(const ANode: TResolveNode;
     out AEntry: TResolved): Boolean;
   var k: Integer;
@@ -2382,9 +2440,7 @@ var
     AEntry := Default(TResolved);
     for k := 0 to High(APriorLock) do
       if SameText(APriorLock[k].Name, ANode.Name)
-         and (APriorLock[k].SourceIdentity <> '')
-         and (APriorLock[k].SourceIdentity = SourceKey(ANode.Dep,
-           ANode.CustomSources)) then
+         and LockSourceMatches(ANode, APriorLock[k]) then
       begin
         AEntry := APriorLock[k];
         Exit(True);
@@ -2394,8 +2450,9 @@ var
 
   function PriorSelectionSatisfies(const ANode: TResolveNode;
     const AEntry: TResolved): Boolean;
-  var k: Integer;
+  var k: Integer; CommitIdentity: string;
   begin
+    CommitIdentity := LockedCommitIdentity(AEntry);
     Result := True;
     for k := 0 to High(ANode.Kinds) do
       case ANode.Kinds[k] of
@@ -2406,8 +2463,8 @@ var
           Result := Result and ((AEntry.Version = ANode.Specs[k])
             or (AEntry.Version = 'v' + ANode.Specs[k]));
         vkCommitSha:
-          Result := Result and (AEntry.CommitSHA <> '')
-            and SameText(ANode.Specs[k], Copy(AEntry.CommitSHA, 1,
+          Result := Result and (CommitIdentity <> '')
+            and SameText(ANode.Specs[k], Copy(CommitIdentity, 1,
               Length(ANode.Specs[k])));
         vkLiteralTag:
           Result := Result and (AEntry.Version = ANode.Specs[k]);
@@ -2453,7 +2510,7 @@ var
         + '`lwpt install` online to regenerate compatible locked evidence.',
         [ANode.Name]);
     AState.RefName := Entry.Version;
-    AState.CommitSHA := Entry.CommitSHA;
+    AState.CommitSHA := LockedCommitIdentity(Entry);
   end;
 
   procedure StageLockedArchive(const ANode: TResolveNode;
@@ -3090,6 +3147,12 @@ begin
       end;
     until Stable;
 
+    if AOffline then
+    begin
+      ResolutionToResolved(R, OfflineResolved);
+      VerifyOfflineAgainstLockfile(OfflineResolved, APriorLock);
+    end;
+
     try
       PublishPlan;
     except
@@ -3286,6 +3349,15 @@ end;
 procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
   const ALockEntries: array of TResolved);
 
+  function LockedCommitIdentity(const AEntry: TResolved): string;
+  var Kind: TVersionKind; Value: string;
+  begin
+    Result := AEntry.CommitSHA;
+    if Result <> '' then Exit;
+    ParseVersionSpec(AEntry.Version, Kind, Value);
+    if Kind = vkCommitSha then Result := Value;
+  end;
+
   function FindLockEntry(const AName: string; out AOut: TResolved): Boolean;
   var k: Integer;
   begin
@@ -3309,6 +3381,7 @@ procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
 var
   i: Integer;
   Lock: TResolved;
+  LockCommit: string;
 begin
   for i := 0 to High(AResolved) do
   begin
@@ -3317,18 +3390,24 @@ begin
         '[offline] manifest graph reaches "%s" but the lockfile has no '
         + 'entry. Run `lwpt install` online to resolve the changed graph.',
         [AResolved[i].Name]);
-    if AResolved[i].SourceIdentity <> Lock.SourceIdentity then
+    if ((Lock.SourceIdentity <> '')
+        and (AResolved[i].SourceIdentity <> Lock.SourceIdentity))
+       or ((Lock.SourceIdentity = '')
+        and (AResolved[i].SrcOriginal <> Lock.SrcOriginal)) then
       raise EVerifyError.CreateFmt(
         '[offline] source or extraction policy changed for "%s". Run '
         + '`lwpt install` online to resolve the changed graph.',
         [AResolved[i].Name]);
-    if AResolved[i].ConstraintFingerprint <> Lock.ConstraintFingerprint then
+    if (Lock.ConstraintFingerprint <> '')
+       and (AResolved[i].ConstraintFingerprint <>
+         Lock.ConstraintFingerprint) then
       raise EVerifyError.CreateFmt(
         '[offline] accumulated constraints changed for "%s". Run '
         + '`lwpt install` online to resolve the changed graph.',
         [AResolved[i].Name]);
+    LockCommit := LockedCommitIdentity(Lock);
     if (AResolved[i].Version <> Lock.Version)
-       or not SameText(AResolved[i].CommitSHA, Lock.CommitSHA) then
+       or not SameText(AResolved[i].CommitSHA, LockCommit) then
       raise EVerifyError.CreateFmt(
         '[offline] locked resolution identity changed for "%s". Run '
         + '`lwpt install` online to resolve the changed graph.',
@@ -3599,33 +3678,7 @@ begin
     end;
     WriteLn('resolved ', Length(R.Nodes), ' packages, no conflicts.');
 
-    SetLength(Resolved, Length(R.Nodes));
-    for i := 0 to High(R.Nodes) do
-    begin
-      Resolved[i] := Default(TResolved);
-      Resolved[i].Name        := R.Nodes[i].Name;
-      Resolved[i].Version     := R.Nodes[i].Version;
-      Resolved[i].CommitSHA   := R.Nodes[i].CommitSHA;
-      Resolved[i].SourceIdentity := R.Nodes[i].SourceIdentity;
-      Resolved[i].ConstraintFingerprint :=
-        R.Nodes[i].ConstraintFingerprint;
-      Resolved[i].SrcOriginal := R.Nodes[i].Dep.SrcOriginal;
-      Resolved[i].SrcKind     := R.Nodes[i].Dep.SrcKind;
-      Resolved[i].SrcHost     := R.Nodes[i].Dep.SrcHost;
-      Resolved[i].SrcHostName := R.Nodes[i].Dep.SrcHostName;
-      Resolved[i].SrcLocator  := R.Nodes[i].Dep.SrcLocator;
-      Resolved[i].ResolvedURL := R.Nodes[i].ResolvedURL;
-      Resolved[i].UnitDir     := R.Nodes[i].UnitDir;
-      SetLength(Resolved[i].UnitSubdirs, Length(R.Nodes[i].UnitSubdirs));
-      for j := 0 to High(R.Nodes[i].UnitSubdirs) do
-        Resolved[i].UnitSubdirs[j] := R.Nodes[i].UnitSubdirs[j];
-      Resolved[i].Archive     := R.Nodes[i].Archive;
-      Resolved[i].ArchiveHash := R.Nodes[i].ArchiveHash;
-      if R.Nodes[i].Hash <> '' then
-        Resolved[i].Hash := R.Nodes[i].Hash
-      else
-        Resolved[i].Hash := 'sha256:(unfetched)';
-    end;
+    ResolutionToResolved(R, Resolved);
 
     if Frozen then
     begin

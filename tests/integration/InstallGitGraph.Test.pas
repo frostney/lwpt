@@ -42,6 +42,9 @@ type
     procedure TestOfflineMissPreservesCommittedState;
     procedure TestOfflineCorruptArchiveIsNotFetchedAround;
     procedure TestOfflineManifestDriftFailsBeforePublication;
+    procedure TestOfflineCompatibleDriftFailsBeforePublication;
+    procedure TestOfflineAcceptsUnambiguousEarlyV3Lock;
+    procedure TestOfflineAcceptsEarlyV3SHAIdentity;
     procedure TestOfflineRestoresLocalAndWorkspaceDependencies;
     procedure TestOfflineRestoresDirectURLWithoutTransport;
     procedure TestOfflineRequiresExistingLock;
@@ -407,6 +410,94 @@ begin
   Expect<Integer>(RequestCount('refs|shared')).ToBe(0);
 end;
 
+procedure TInstallGitGraph.
+  TestOfflineCompatibleDriftFailsBeforePublication;
+var
+  Root, LockText, ModuleHash, ArchiveHash, CfgText, Combined: string;
+  Run: TLwptResult;
+begin
+  PrepareOfflineSeed('offline-compatible-drift', Root, LockText);
+  ModuleHash := HashTree(Root + '/.lwpt/modules/shared');
+  ArchiveHash := SHA256File(Root
+    + '/.lwpt/archives/shared-v1.0.0.tar.gz');
+  CfgText := ReadText(Root + '/lwpt.cfg');
+  WriteRoot(Root, 'offline-compatible-drift',
+    'shared = "fixture/shared@>=1.0.0 <2.0.0"'#10);
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+
+  Run := RunLwpt(['install', '--offline'], Root,
+    [PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot,
+     PROJECT_NAME + '_CACHE_DIR=' + FCacheRoot,
+     PROJECT_NAME + '_TEST_HALT_AFTER_MODULE_RETAIN=shared']);
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>((Run.ExitCode <> 0) and (Run.ExitCode <> 87)).ToBe(True);
+  Expect<Boolean>(Pos('accumulated constraints changed', Combined) > 0)
+    .ToBe(True);
+  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<string>(ReadText(Root + '/lwpt.cfg')).ToBe(CfgText);
+  Expect<string>(HashTree(Root + '/.lwpt/modules/shared')).ToBe(ModuleHash);
+  Expect<string>(SHA256File(Root
+    + '/.lwpt/archives/shared-v1.0.0.tar.gz')).ToBe(ArchiveHash);
+  Expect<Integer>(RequestCount('refs|shared')).ToBe(0);
+end;
+
+procedure TInstallGitGraph.TestOfflineAcceptsUnambiguousEarlyV3Lock;
+var Root, LockText: string; Run: TLwptResult;
+begin
+  PrepareOfflineSeed('offline-early-v3', Root, LockText);
+  RemoveAdditiveIdentityFields(Root + '/lwpt.lock');
+  LockText := ReadText(Root + '/lwpt.lock');
+  RecursiveDelete(Root + '/.lwpt/modules');
+  SysUtils.DeleteFile(Root + '/lwpt.cfg');
+  RecursiveDelete(FCacheRoot);
+  SysUtils.DeleteFile(FFixtureRoot + '/refs/shared.refs');
+  SysUtils.DeleteFile(FFixtureRoot + '/archives/shared/'
+    + SHARED_COMMIT + '.tar.gz');
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+
+  Run := RunInstall(Root, ['install', '--offline']);
+  DumpRunFailure('offline early v3 restore', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<Boolean>(FileExists(Root
+    + '/.lwpt/modules/shared/source/shared.pas')).ToBe(True);
+  Expect<Boolean>(FileExists(Root + '/lwpt.cfg')).ToBe(True);
+  Expect<Integer>(RequestCount('refs|shared')).ToBe(0);
+end;
+
+procedure TInstallGitGraph.TestOfflineAcceptsEarlyV3SHAIdentity;
+var Root, LockText: string; Run: TLwptResult;
+begin
+  FCacheRoot := FScratch + '/offline-early-v3-sha-cache';
+  RecursiveDelete(FCacheRoot);
+  Root := FScratch + '/offline-early-v3-sha';
+  WriteRoot(Root, 'offline-early-v3-sha',
+    'shared = "fixture/shared@' + SHARED_COMMIT + '"'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('offline early v3 SHA seed', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  RemoveAdditiveIdentityFields(Root + '/lwpt.lock');
+  LockText := ReadText(Root + '/lwpt.lock');
+  RecursiveDelete(Root + '/.lwpt/modules');
+  SysUtils.DeleteFile(Root + '/lwpt.cfg');
+  RecursiveDelete(FCacheRoot);
+  SysUtils.DeleteFile(FFixtureRoot + '/archives/shared/'
+    + SHARED_COMMIT + '.tar.gz');
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+
+  Run := RunInstall(Root, ['install', '--offline']);
+  DumpRunFailure('offline early v3 SHA restore', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
+  Expect<Boolean>(FileExists(Root
+    + '/.lwpt/modules/shared/source/shared.pas')).ToBe(True);
+  Expect<Boolean>(FileExists(Root + '/lwpt.cfg')).ToBe(True);
+  Expect<Integer>(RequestCount('refs|shared')).ToBe(0);
+end;
+
 procedure TInstallGitGraph.TestOfflineRestoresLocalAndWorkspaceDependencies;
 var Root, LockText: string; Run: TLwptResult;
 begin
@@ -761,6 +852,12 @@ begin
     TestOfflineCorruptArchiveIsNotFetchedAround);
   Test('offline rejects manifest drift before publishing locked state',
     TestOfflineManifestDriftFailsBeforePublication);
+  Test('offline rejects compatible manifest drift before publication starts',
+    TestOfflineCompatibleDriftFailsBeforePublication);
+  Test('offline accepts an unambiguous early schema-v3 lock',
+    TestOfflineAcceptsUnambiguousEarlyV3Lock);
+  Test('offline derives an early schema-v3 SHA identity from the locked ref',
+    TestOfflineAcceptsEarlyV3SHAIdentity);
   Test('offline restores local and workspace dependencies from their paths',
     TestOfflineRestoresLocalAndWorkspaceDependencies);
   Test('offline restores a direct URL archive without touching transport',
