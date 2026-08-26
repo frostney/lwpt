@@ -983,6 +983,20 @@ var
 begin
   Path := FTemporaryKeychainPath;
   if Path = '' then Exit;
+  if FpLStat(PChar(Path), Status) <> 0 then
+  begin
+    if FpGetErrNo = ESysENOENT then
+    begin
+      FTemporaryKeychainPath := '';
+      Exit;
+    end;
+    raise ELWPTRegistryError.CreateStable('tls_configuration',
+      'could not verify temporary keychain storage before removal');
+  end;
+  if ((Status.st_mode and S_IFMT) <> S_IFREG)
+    or (Status.st_uid <> FpGetUID) then
+    raise ELWPTRegistryError.CreateStable('tls_configuration',
+      'temporary keychain storage ownership changed before removal');
   if not SysUtils.DeleteFile(Path) then
     raise ELWPTRegistryError.CreateStable('tls_configuration',
       'could not remove temporary keychain storage');
@@ -1076,7 +1090,6 @@ begin
     if FTLSIdentity = nil then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'could not create the Network.framework TLS identity');
-    DeleteTemporaryKeychainStorage;
   finally
     if Length(Bytes) > 0 then FillChar(Bytes[0], Length(Bytes), 0);
     Bytes := nil;
@@ -1152,9 +1165,11 @@ end;
 
 destructor TNetworkFrameworkRegistryServer.Destroy;
 var
+  CleanupFailure: string;
   DeleteStatus: Int32;
   Index: Integer;
 begin
+  CleanupFailure := '';
   FStopping := True;
   if FListener <> nil then
   begin
@@ -1184,17 +1199,16 @@ begin
     DeleteStatus := SecKeychainDelete(FTemporaryKeychain);
     CFRelease(FTemporaryKeychain);
     FTemporaryKeychain := nil;
-    if (DeleteStatus <> 0) and (FTemporaryKeychainPath <> '')
-      and FileExists(FTemporaryKeychainPath)
-      and not SysUtils.DeleteFile(FTemporaryKeychainPath) then
-      WriteLn(StdErr,
-        'registry TLS cleanup: could not remove temporary keychain storage');
+    if DeleteStatus <> 0 then
+      CleanupFailure := 'Security.framework could not delete temporary '
+        + 'keychain storage';
   end;
-  if (FTemporaryKeychainPath <> '') and FileExists(FTemporaryKeychainPath)
-    and not SysUtils.DeleteFile(FTemporaryKeychainPath) then
-    WriteLn(StdErr,
-      'registry TLS cleanup: could not remove temporary keychain storage');
-  FTemporaryKeychainPath := '';
+  try
+    DeleteTemporaryKeychainStorage;
+  except
+    on E: Exception do
+      if CleanupFailure = '' then CleanupFailure := E.Message;
+  end;
   if FListenerQueue <> nil then Dispatch_release(FListenerQueue);
   if FReadySemaphore <> nil then Dispatch_release(FReadySemaphore);
   if FStopSemaphore <> nil then Dispatch_release(FStopSemaphore);
@@ -1203,7 +1217,13 @@ begin
     Dispatch_release(FListenerDoneSemaphore);
   DoneCriticalSection(FConnectionLock);
   FConnections.Free;
-  inherited Destroy;
+  try
+    if CleanupFailure <> '' then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        CleanupFailure);
+  finally
+    inherited Destroy;
+  end;
 end;
 
 procedure TNetworkFrameworkRegistryServer.Run;

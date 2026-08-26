@@ -114,9 +114,12 @@ HTTPS uses the repository's native server policy:
   context.
 - macOS imports the configured PKCS#12 identity into a process-private
   temporary keychain, validates its bundled chain with a private anchor and
-  Apple's server policy, and serves with Network.framework. FPC 3.2.2 reaches
-  the Network C API through the stable blocks ABI, with one serial queue per
-  connection.
+  Apple's server policy, and serves with Network.framework. The current-user
+  0600 PID-and-random-nonce keychain file remains available for lazy private-
+  key access while the server is active; graceful shutdown verifies deletion,
+  and the next start recovers an exact owned file only after its PID is
+  definitely dead. FPC 3.2.2 reaches the Network C API through the stable
+  blocks ABI, with one serial queue per connection.
 
 The portable socket listeners on Windows and Unix other than Darwin accept
 `localhost` or an IPv4 address. Initialization rejects other listener families

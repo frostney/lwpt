@@ -130,6 +130,23 @@ begin
   end;
 end;
 
+function TemporaryKeychainPathForProcess(const APID: LongInt): string;
+var
+  Pattern: string;
+  Search: TSearchRec;
+begin
+  Result := '';
+  Pattern := IncludeTrailingPathDelimiter(GetTempDir)
+    + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
+    + '-registry-tls-' + IntToStr(APID) + '-*.keychain';
+  if FindFirst(Pattern, faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    Result := IncludeTrailingPathDelimiter(GetTempDir) + Search.Name;
+  finally
+    FindClose(Search);
+  end;
+end;
+
 function CreateDeadProcessID: LongInt;
 var
   ProcessInstance: TProcess;
@@ -552,8 +569,9 @@ const
     '1111111111111111111111111111111111111111111111111111111111111111';
 var
   BoundedPaths: array of string;
-  DataDirectory, DiscoveryURL, Nonce, ResiduePath, SymlinkPath: string;
-  DeadPID: LongInt;
+  DataDirectory, DiscoveryURL, LivePath, Nonce, ResiduePath,
+    SymlinkPath: string;
+  CrashedPID, DeadPID, RecoveredPID: LongInt;
   Index: Integer;
   Init: TLwptResult;
   Residue: TFileStream;
@@ -619,11 +637,27 @@ begin
     WaitUntilReady(DiscoveryURL, True, Server);
     Expect<Boolean>(FileExists(ResiduePath)).ToBe(False);
     Expect<Integer>(FpLStat(PChar(SymlinkPath), Status)).ToBe(0);
-    Expect<Integer>(TemporaryKeychainPathCount(Server.ProcessID)).ToBe(0);
-    Expect<Integer>(FpKill(Server.ProcessID, SIGKILL)).ToBe(0);
+    Expect<Integer>(TemporaryKeychainPathCount(Server.ProcessID)).ToBe(1);
+    LivePath := TemporaryKeychainPathForProcess(Server.ProcessID);
+    Expect<Boolean>(LivePath <> '').ToBe(True);
+    Expect<Integer>(FpLStat(PChar(LivePath), Status)).ToBe(0);
+    Expect<Integer>(Status.st_mode and S_IFMT).ToBe(S_IFREG);
+    Expect<Integer>(Status.st_mode and (S_IRWXU or S_IRWXG or S_IRWXO))
+      .ToBe(S_IRUSR or S_IWUSR);
+    Expect<QWord>(Status.st_uid).ToBe(FpGetUID);
+    CrashedPID := Server.ProcessID;
+    Expect<Integer>(FpKill(CrashedPID, SIGKILL)).ToBe(0);
     Server.WaitOnExit;
     Expect<Boolean>(Server.Running).ToBe(False);
-    Expect<Integer>(TemporaryKeychainPathCount(Server.ProcessID)).ToBe(0);
+    Expect<Integer>(TemporaryKeychainPathCount(CrashedPID)).ToBe(1);
+    StopServer(Server);
+    Server := StartServer(DataDirectory, True);
+    WaitUntilReady(DiscoveryURL, True, Server);
+    RecoveredPID := Server.ProcessID;
+    Expect<Integer>(TemporaryKeychainPathCount(CrashedPID)).ToBe(0);
+    Expect<Integer>(TemporaryKeychainPathCount(RecoveredPID)).ToBe(1);
+    StopServer(Server);
+    Expect<Integer>(TemporaryKeychainPathCount(RecoveredPID)).ToBe(0);
   finally
     StopServer(Server);
     SysUtils.DeleteFile(ResiduePath);
@@ -694,7 +728,7 @@ begin
     TestForegroundServerSurvivesRestartAndConcurrentReaders);
   Test('configured TLS server completes a request',
     TestConfiguredTLSServerCompletesARequest);
-  Test('temporary TLS keychain recovers residue and survives a hard crash',
+  Test('temporary TLS keychain retains live storage and recovers a hard crash',
     TestTemporaryKeychainResidueIsRecoveredAndCrashSafe);
   Test('idle TLS handshakes expire and release admission',
     TestIdleTLSHandshakesExpireAndReleaseAdmission);

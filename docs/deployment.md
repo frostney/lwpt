@@ -93,8 +93,11 @@ The `Darwin` client branch of `TransportSecurity.pas` calls into Apple's SecureT
 Generic `TTransportSecurityServerContext` accept remains unsupported on Darwin.
 The self-hosted registry origin instead imports its size-bounded PKCS#12
 identity into a process-private temporary keychain, validates the bundled
-chain against its private anchor with Apple's SSL server policy, and owns a
-Network.framework listener directly. It does not add deprecated,
+chain against its private anchor with Apple's SSL server policy, retains the
+current-user 0600 keychain file while the listener may need its private key,
+and owns a Network.framework listener directly. Graceful shutdown verifies
+deletion; a later start recovers an exact PID-and-random-nonce file only after
+its owner process is definitely dead. It does not add deprecated,
 TLS-1.2-capped SecureTransport server mode or a macOS OpenSSL prerequisite.
 
 #### Quarantine workaround
