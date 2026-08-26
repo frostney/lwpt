@@ -7,6 +7,7 @@ uses
   cthreads,
   {$ENDIF}
   Classes,
+  Pipes,
   Process,
   Sockets,
   SysUtils,
@@ -33,7 +34,8 @@ type
       const ATLS: Boolean): TProcess;
     function Curl(const AURL: string; const AInsecure: Boolean): string;
     function CurlAttempt(const AURL: string; const AInsecure: Boolean;
-      out AExitStatus: Integer; out AStandardError: string): string;
+      out AExitStatus: Integer; out AStandardError: string;
+      out AOutputTruncated, AStandardErrorTruncated: Boolean): string;
     procedure StopServer(AProcess: TProcess);
     procedure WaitUntilReady(const AURL: string; const AInsecure: Boolean;
       AServer: TProcess);
@@ -72,22 +74,32 @@ begin
   Result.Execute;
 end;
 
-function ReadStreamOutput(AStream: TStream): string;
+procedure DrainCurlDiagnosticStream(AStream: TInputPipeStream;
+  var ADestination: string; var ATruncated: Boolean);
+const
+  CURL_DIAGNOSTIC_CAPTURE_BYTES = 16 * 1024;
 var
-  BytesRead, Total: Integer;
+  Available, BytesRead, Keep, ReadSize, Remaining: Integer;
   Buffer: array[0..4095] of Byte;
 begin
-  Result := '';
-  Total := 0;
-  repeat
-    BytesRead := AStream.Read(Buffer[0], Length(Buffer));
-    if BytesRead > 0 then
+  Available := AStream.NumBytesAvailable;
+  while Available > 0 do
+  begin
+    ReadSize := Length(Buffer);
+    if Available < ReadSize then ReadSize := Available;
+    BytesRead := AStream.Read(Buffer[0], ReadSize);
+    if BytesRead <= 0 then Break;
+    Remaining := CURL_DIAGNOSTIC_CAPTURE_BYTES - Length(ADestination);
+    Keep := BytesRead;
+    if Keep > Remaining then Keep := Remaining;
+    if Keep > 0 then
     begin
-      SetLength(Result, Total + BytesRead);
-      Move(Buffer[0], Result[Total + 1], BytesRead);
-      Inc(Total, BytesRead);
+      SetLength(ADestination, Length(ADestination) + Keep);
+      Move(Buffer[0], ADestination[Length(ADestination) - Keep + 1], Keep);
     end;
-  until BytesRead <= 0;
+    if Keep < BytesRead then ATruncated := True;
+    Dec(Available, BytesRead);
+  end;
 end;
 
 {$IFDEF DARWIN}
@@ -133,14 +145,17 @@ function TRegistryE2EContract.Curl(const AURL: string;
   const AInsecure: Boolean): string;
 var
   ExitStatus: Integer;
+  OutputTruncated, StandardErrorTruncated: Boolean;
   StandardError: string;
 begin
-  Result := CurlAttempt(AURL, AInsecure, ExitStatus, StandardError);
+  Result := CurlAttempt(AURL, AInsecure, ExitStatus, StandardError,
+    OutputTruncated, StandardErrorTruncated);
 end;
 
 function TRegistryE2EContract.CurlAttempt(const AURL: string;
   const AInsecure: Boolean; out AExitStatus: Integer;
-  out AStandardError: string): string;
+  out AStandardError: string; out AOutputTruncated,
+  AStandardErrorTruncated: Boolean): string;
 var
   ProcessInstance: TProcess;
 begin
@@ -157,10 +172,25 @@ begin
     ProcessInstance.Parameters.Add('3');
     if AInsecure then ProcessInstance.Parameters.Add('--insecure');
     ProcessInstance.Parameters.Add(AURL);
-    ProcessInstance.Options := [poUsePipes, poWaitOnExit];
+    ProcessInstance.Options := [poUsePipes];
+    Result := '';
+    AStandardError := '';
+    AOutputTruncated := False;
+    AStandardErrorTruncated := False;
     ProcessInstance.Execute;
-    Result := ReadStreamOutput(ProcessInstance.Output);
-    AStandardError := ReadStreamOutput(ProcessInstance.Stderr);
+    while ProcessInstance.Running do
+    begin
+      DrainCurlDiagnosticStream(ProcessInstance.Output, Result,
+        AOutputTruncated);
+      DrainCurlDiagnosticStream(ProcessInstance.Stderr, AStandardError,
+        AStandardErrorTruncated);
+      Sleep(10);
+    end;
+    DrainCurlDiagnosticStream(ProcessInstance.Output, Result,
+      AOutputTruncated);
+    DrainCurlDiagnosticStream(ProcessInstance.Stderr, AStandardError,
+      AStandardErrorTruncated);
+    ProcessInstance.WaitOnExit;
     AExitStatus := ProcessInstance.ExitStatus;
     if AExitStatus <> 0 then Result := '';
   finally
@@ -248,7 +278,7 @@ procedure TRegistryE2EContract.WaitUntilReady(const AURL: string;
 var
   ExitState, KeychainState, StandardError: string;
   ExitStatus: Integer;
-  Running: Boolean;
+  OutputTruncated, Running, StandardErrorTruncated: Boolean;
   StartedAt: QWord;
 begin
   ExitStatus := -1;
@@ -256,7 +286,8 @@ begin
   StartedAt := GetTickCount64;
   repeat
     if Pos('lwpt-registry-discovery-v1', CurlAttempt(AURL, AInsecure,
-      ExitStatus, StandardError)) > 0 then Exit;
+      ExitStatus, StandardError, OutputTruncated,
+      StandardErrorTruncated)) > 0 then Exit;
     Sleep(25);
   until GetTickCount64 - StartedAt >= 10000;
   Running := Assigned(AServer) and AServer.Running;
@@ -271,9 +302,12 @@ begin
   KeychainState := 'not-applicable';
   {$ENDIF}
   raise Exception.CreateFmt('registry server did not become ready: '
-    + 'curl exit=%d stderr=%s; server running=%s exit=%s; '
-    + 'temporary keychain paths=%s', [ExitStatus, QuotedStr(StandardError),
-    BoolToStr(Running, True), ExitState, KeychainState]);
+    + 'curl exit=%d stdout-truncated=%s stderr=%s '
+    + 'stderr-truncated=%s; server running=%s exit=%s; '
+    + 'temporary keychain paths=%s', [ExitStatus,
+    BoolToStr(OutputTruncated, True), QuotedStr(StandardError),
+    BoolToStr(StandardErrorTruncated, True), BoolToStr(Running, True),
+    ExitState, KeychainState]);
 end;
 
 procedure TRegistryE2EContract.BeforeEach;
