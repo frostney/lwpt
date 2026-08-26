@@ -19,6 +19,7 @@ procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
 function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
 function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
 function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
+function NetworkFrameworkDiagnosticBudgetIsBoundedForTesting: Boolean;
 {$ENDIF}
 
 implementation
@@ -65,6 +66,7 @@ const
     'v36@?0^{dispatch_data_s=}8^{nw_content_context=}16B24^{nw_error=}28';
   BLOCK_SIGNATURE_SEND = 'v16@?0^{nw_error=}8';
   BLOCK_SIGNATURE_NEW_CONNECTION = 'v16@?0^{nw_connection=}8';
+  MAX_NETWORK_FRAMEWORK_DIAGNOSTIC_EVENTS = 128;
   MAX_TEMPORARY_KEYCHAIN_RECOVERY_FILES = 128;
   TEMPORARY_KEYCHAIN_RANDOM_BYTES = 32;
 
@@ -133,6 +135,8 @@ type
     FTLSIdentity: Pointer;
     FTemporaryKeychain: Pointer;
     FTemporaryKeychainPath: string;
+    FDiagnosticsEnabled: Boolean;
+    FDiagnosticEventCount: LongInt;
     FListenerState: Integer;
     FActiveConnections: LongInt;
     FConnections: TList;
@@ -146,6 +150,7 @@ type
     procedure ConnectionFinished(
       AConnection: TNetworkFrameworkRegistryConnection);
     procedure DeleteTemporaryKeychainStorage;
+    procedure Diagnostic(const AEvent: string);
     procedure LoadIdentity(const APath, APassphrase: string);
   public
     constructor Create(AStore: TLWPTRegistryStore;
@@ -305,6 +310,10 @@ function Nw_endpoint_create_host(AHost, APort: PAnsiChar): Pointer; cdecl;
   external name 'nw_endpoint_create_host';
 function Nw_tls_copy_sec_protocol_options(AOptions: Pointer): Pointer; cdecl;
   external name 'nw_tls_copy_sec_protocol_options';
+function Nw_error_get_error_domain(AError: Pointer): Int32; cdecl;
+  external name 'nw_error_get_error_domain';
+function Nw_error_get_error_code(AError: Pointer): Int32; cdecl;
+  external name 'nw_error_get_error_code';
 procedure Sec_protocol_options_set_local_identity(AOptions,
   AIdentity: Pointer); cdecl;
   external name 'sec_protocol_options_set_local_identity';
@@ -437,6 +446,12 @@ begin
   Result := @ABlock;
 end;
 
+function ClaimNetworkFrameworkDiagnostic(var AEventCount: LongInt): Boolean;
+begin
+  Result := InterLockedIncrement(AEventCount)
+    <= MAX_NETWORK_FRAMEWORK_DIAGNOSTIC_EVENTS;
+end;
+
 {$IFDEF REGISTRY_TESTING}
 function BlockMatchesABI(var ABlock: TRegistryBlock;
   ADescriptor: PBlockDescriptor; const AExpectedSignature: AnsiString): Boolean;
@@ -468,7 +483,37 @@ begin
     and BlockMatchesABI(Block, @NewConnectionBlockDescriptor,
       'v16@?0^{nw_connection=}8');
 end;
+
+function NetworkFrameworkDiagnosticBudgetIsBoundedForTesting: Boolean;
+var
+  Accepted, EventCount, Index: LongInt;
+begin
+  Accepted := 0;
+  EventCount := 0;
+  for Index := 1 to MAX_NETWORK_FRAMEWORK_DIAGNOSTIC_EVENTS + 2 do
+    if ClaimNetworkFrameworkDiagnostic(EventCount) then Inc(Accepted);
+  Result := Accepted = MAX_NETWORK_FRAMEWORK_DIAGNOSTIC_EVENTS;
+end;
 {$ENDIF}
+
+procedure TNetworkFrameworkRegistryServer.Diagnostic(const AEvent: string);
+var
+  Line: AnsiString;
+begin
+  if not FDiagnosticsEnabled
+    or not ClaimNetworkFrameworkDiagnostic(FDiagnosticEventCount) then Exit;
+  Line := AnsiString(PROGRAM_NAME
+    + ' registry: Network.framework diagnostic: ' + AEvent + LineEnding);
+  if Length(Line) > 0 then
+    FpWrite(StdErrorHandle, Line[1], Length(Line));
+end;
+
+function NetworkErrorDiagnostic(const AError: Pointer): string;
+begin
+  if AError = nil then Exit('error-domain=none error-code=none');
+  Result := 'error-domain=' + IntToStr(Nw_error_get_error_domain(AError))
+    + ' error-code=' + IntToStr(Nw_error_get_error_code(AError));
+end;
 
 procedure TLSConfigureInvoke(ABlock: PRegistryBlock;
   AOptions: Pointer); cdecl;
@@ -478,7 +523,11 @@ var
 begin
   EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
+  Server.Diagnostic('tls-configure entered');
   Options := Nw_tls_copy_sec_protocol_options(AOptions);
+  Server.Diagnostic('tls-configure copied-options='
+    + BoolToStr(Options <> nil, True) + ' identity='
+    + BoolToStr(Server.FTLSIdentity <> nil, True));
   Sec_protocol_options_set_local_identity(Options, Server.FTLSIdentity);
   Nw_release(Options);
 end;
@@ -516,6 +565,8 @@ var
 begin
   EnsureFrameworkThread;
   Connection := TNetworkFrameworkRegistryConnection(ABlock^.Context);
+  Connection.FServer.Diagnostic('connection-state=' + IntToStr(AState)
+    + ' ' + NetworkErrorDiagnostic(AError));
   case AState of
     NW_CONNECTION_STATE_READY: Connection.ArmReceive;
     NW_CONNECTION_STATE_FAILED: Connection.Cancel;
@@ -569,6 +620,7 @@ var
 begin
   EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
+  Server.Diagnostic('new-connection entered');
   EnterCriticalSection(Server.FConnectionLock);
   try
     if Server.FStopping
@@ -1191,6 +1243,8 @@ begin
   IsMultiThread := True;
   FStore := AStore;
   FStopFlag := AStopFlag;
+  FDiagnosticsEnabled := SameText(SysUtils.GetEnvironmentVariable(
+    PROJECT_NAME + '_ENABLE_NETWORK'), '1');
   FConnections := TList.Create;
   InitCriticalSection(FConnectionLock);
   FReadySemaphore := Dispatch_semaphore_create(0);
@@ -1408,6 +1462,11 @@ begin
 end;
 
 function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
+begin
+  Result := True;
+end;
+
+function NetworkFrameworkDiagnosticBudgetIsBoundedForTesting: Boolean;
 begin
   Result := True;
 end;
