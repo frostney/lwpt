@@ -946,15 +946,15 @@ begin
   if FindFirst(Pattern, faAnyFile or faSymLink, Search) <> 0 then Exit;
   try
     repeat
+      Inc(Inspected);
+      if Inspected > MAX_TEMPORARY_KEYCHAIN_RECOVERY_FILES then
+        raise ELWPTRegistryError.CreateStable('tls_configuration',
+          'temporary keychain recovery limit exceeded');
       if not TryTemporaryKeychainOwnerPID(Search.Name, OwnerPID) then Continue;
       Path := IncludeTrailingPathDelimiter(GetTempDir) + Search.Name;
       if (FpLStat(PChar(Path), Status) <> 0)
         or ((Status.st_mode and S_IFMT) <> S_IFREG)
         or (Status.st_uid <> FpGetUID) then Continue;
-      Inc(Inspected);
-      if Inspected > MAX_TEMPORARY_KEYCHAIN_RECOVERY_FILES then
-        raise ELWPTRegistryError.CreateStable('tls_configuration',
-          'temporary keychain recovery limit exceeded');
       if not ProcessIsDefinitelyDead(OwnerPID) then Continue;
       if not SysUtils.DeleteFile(Path) then
         raise ELWPTRegistryError.CreateStable('tls_configuration',

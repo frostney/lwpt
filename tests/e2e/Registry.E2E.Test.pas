@@ -420,8 +420,10 @@ const
   TEST_SYMLINK_NONCE =
     '1111111111111111111111111111111111111111111111111111111111111111';
 var
-  DataDirectory, DiscoveryURL, ResiduePath, SymlinkPath: string;
+  BoundedPaths: array of string;
+  DataDirectory, DiscoveryURL, Nonce, ResiduePath, SymlinkPath: string;
   DeadPID: LongInt;
+  Index: Integer;
   Init: TLwptResult;
   Residue: TFileStream;
   Server: TProcess;
@@ -436,6 +438,14 @@ begin
     + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
     + '-registry-tls-' + IntToStr(DeadPID) + '-' + TEST_SYMLINK_NONCE
     + '.keychain';
+  SetLength(BoundedPaths, 129);
+  for Index := 0 to High(BoundedPaths) do
+  begin
+    Nonce := LowerCase(StringOfChar('0', 60) + IntToHex(Index + 2, 4));
+    BoundedPaths[Index] := IncludeTrailingPathDelimiter(GetTempDir)
+      + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
+      + '-registry-tls-' + IntToStr(DeadPID) + '-' + Nonce + '.keychain';
+  end;
   Server := nil;
   try
     SysUtils.DeleteFile(ResiduePath);
@@ -453,6 +463,27 @@ begin
       '--tls-password-env', TLS_PASSWORD_ENV], '',
       [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
     Expect<Integer>(Init.ExitCode).ToBe(0);
+    for Index := 0 to High(BoundedPaths) do
+    begin
+      FpUnlink(PChar(BoundedPaths[Index]));
+      Expect<Integer>(FpSymlink(PChar(ResiduePath),
+        PChar(BoundedPaths[Index]))).ToBe(0);
+    end;
+    Server := StartServer(DataDirectory, True);
+    for Index := 1 to 200 do
+    begin
+      if not Server.Running then Break;
+      Sleep(10);
+    end;
+    Expect<Boolean>(Server.Running).ToBe(False);
+    Expect<Boolean>(Server.ExitStatus <> 0).ToBe(True);
+    StopServer(Server);
+    Server := nil;
+    for Index := 0 to High(BoundedPaths) do
+      FpUnlink(PChar(BoundedPaths[Index]));
+    SysUtils.DeleteFile(ResiduePath);
+    Residue := TFileStream.Create(ResiduePath, fmCreate);
+    Residue.Free;
     Server := StartServer(DataDirectory, True);
     WaitUntilReady(DiscoveryURL, True);
     Expect<Boolean>(FileExists(ResiduePath)).ToBe(False);
@@ -466,6 +497,8 @@ begin
     StopServer(Server);
     SysUtils.DeleteFile(ResiduePath);
     FpUnlink(PChar(SymlinkPath));
+    for Index := 0 to High(BoundedPaths) do
+      FpUnlink(PChar(BoundedPaths[Index]));
   end;
 end;
 {$ELSE}
