@@ -42,6 +42,7 @@ type
     procedure TestInitPolicyAndStableIdentityThroughCLI;
     procedure TestForegroundServerSurvivesRestartAndConcurrentReaders;
     procedure TestConfiguredTLSServerCompletesARequest;
+    procedure TestTemporaryKeychainResidueIsRecoveredAndCrashSafe;
     procedure TestIdleTLSHandshakesExpireAndReleaseAdmission;
     procedure TestSilentServeUsesPersistedConfiguration;
     procedure TestSlowClientsAreBoundedByOneDeadline;
@@ -85,6 +86,45 @@ begin
     end;
   until BytesRead <= 0;
 end;
+
+{$IFDEF DARWIN}
+function TemporaryKeychainPathCount(const APID: LongInt): Integer;
+var
+  Pattern: string;
+  Search: TSearchRec;
+begin
+  Result := 0;
+  Pattern := IncludeTrailingPathDelimiter(GetTempDir)
+    + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
+    + '-registry-tls-' + IntToStr(APID) + '-*.keychain';
+  if FindFirst(Pattern, faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    repeat
+      Inc(Result);
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+function CreateDeadProcessID: LongInt;
+var
+  ProcessInstance: TProcess;
+begin
+  ProcessInstance := TProcess.Create(nil);
+  try
+    ProcessInstance.Executable := '/usr/bin/true';
+    ProcessInstance.Options := [poWaitOnExit];
+    ProcessInstance.Execute;
+    Result := ProcessInstance.ProcessID;
+    Expect<Integer>(ProcessInstance.ExitStatus).ToBe(0);
+    Expect<Boolean>((FpKill(Result, 0) <> 0)
+      and (FpGetErrNo = ESysESRCH)).ToBe(True);
+  finally
+    ProcessInstance.Free;
+  end;
+end;
+{$ENDIF}
 
 function TRegistryE2EContract.Curl(const AURL: string;
   const AInsecure: Boolean): string;
@@ -372,6 +412,67 @@ begin
   end;
 end;
 
+procedure TRegistryE2EContract.TestTemporaryKeychainResidueIsRecoveredAndCrashSafe;
+{$IFDEF DARWIN}
+const
+  TEST_NONCE =
+    '0000000000000000000000000000000000000000000000000000000000000000';
+  TEST_SYMLINK_NONCE =
+    '1111111111111111111111111111111111111111111111111111111111111111';
+var
+  DataDirectory, DiscoveryURL, ResiduePath, SymlinkPath: string;
+  DeadPID: LongInt;
+  Init: TLwptResult;
+  Residue: TFileStream;
+  Server: TProcess;
+  Status: Stat;
+begin
+  DeadPID := CreateDeadProcessID;
+  ResiduePath := IncludeTrailingPathDelimiter(GetTempDir)
+    + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
+    + '-registry-tls-' + IntToStr(DeadPID) + '-' + TEST_NONCE
+    + '.keychain';
+  SymlinkPath := IncludeTrailingPathDelimiter(GetTempDir)
+    + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
+    + '-registry-tls-' + IntToStr(DeadPID) + '-' + TEST_SYMLINK_NONCE
+    + '.keychain';
+  Server := nil;
+  try
+    SysUtils.DeleteFile(ResiduePath);
+    Residue := TFileStream.Create(ResiduePath, fmCreate);
+    Residue.Free;
+    FpUnlink(PChar(SymlinkPath));
+    Expect<Integer>(FpSymlink(PChar(ResiduePath),
+      PChar(SymlinkPath))).ToBe(0);
+    DataDirectory := FScratch + '/crash-safe-tls-origin';
+    DiscoveryURL := 'https://localhost:' + IntToStr(BasePort + 5)
+      + '/.well-known/lwpt-registry';
+    Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
+      '--base-url', 'https://localhost:' + IntToStr(BasePort + 5), '--port',
+      IntToStr(BasePort + 5), '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
+      '--tls-password-env', TLS_PASSWORD_ENV], '',
+      [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
+    Expect<Integer>(Init.ExitCode).ToBe(0);
+    Server := StartServer(DataDirectory, True);
+    WaitUntilReady(DiscoveryURL, True);
+    Expect<Boolean>(FileExists(ResiduePath)).ToBe(False);
+    Expect<Integer>(FpLStat(PChar(SymlinkPath), Status)).ToBe(0);
+    Expect<Integer>(TemporaryKeychainPathCount(Server.ProcessID)).ToBe(0);
+    Expect<Integer>(FpKill(Server.ProcessID, SIGKILL)).ToBe(0);
+    Server.WaitOnExit;
+    Expect<Boolean>(Server.Running).ToBe(False);
+    Expect<Integer>(TemporaryKeychainPathCount(Server.ProcessID)).ToBe(0);
+  finally
+    StopServer(Server);
+    SysUtils.DeleteFile(ResiduePath);
+    FpUnlink(PChar(SymlinkPath));
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
 procedure TRegistryE2EContract.TestIdleTLSHandshakesExpireAndReleaseAdmission;
 var
   Address: TInetSockAddr;
@@ -428,6 +529,8 @@ begin
     TestForegroundServerSurvivesRestartAndConcurrentReaders);
   Test('configured TLS server completes a request',
     TestConfiguredTLSServerCompletesARequest);
+  Test('temporary TLS keychain recovers residue and survives a hard crash',
+    TestTemporaryKeychainResidueIsRecoveredAndCrashSafe);
   Test('idle TLS handshakes expire and release admission',
     TestIdleTLSHandshakesExpireAndReleaseAdmission);
   Test('silent serve uses persisted configuration',

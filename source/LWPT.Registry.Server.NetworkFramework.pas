@@ -25,6 +25,7 @@ implementation
 {$IFDEF DARWIN}
 
 uses
+  BaseUnix,
   Classes,
   SysUtils,
 
@@ -63,6 +64,8 @@ const
     'v36@?0^{dispatch_data_s=}8^{nw_content_context=}16B24^{nw_error=}28';
   BLOCK_SIGNATURE_SEND = 'v16@?0^{nw_error=}8';
   BLOCK_SIGNATURE_NEW_CONNECTION = 'v16@?0^{nw_connection=}8';
+  MAX_TEMPORARY_KEYCHAIN_RECOVERY_FILES = 128;
+  TEMPORARY_KEYCHAIN_RANDOM_BYTES = 32;
 
 type
   PBlockDescriptor = ^TBlockDescriptor;
@@ -84,6 +87,8 @@ type
   end;
 
   PNativeUInt = ^NativeUInt;
+  TTemporaryKeychainRandom =
+    array[0..TEMPORARY_KEYCHAIN_RANDOM_BYTES - 1] of Byte;
   TNetworkFrameworkRegistryServer = class;
 
   TNetworkFrameworkRegistryConnection = class
@@ -125,6 +130,7 @@ type
     FListenerDoneSemaphore: Pointer;
     FTLSIdentity: Pointer;
     FTemporaryKeychain: Pointer;
+    FTemporaryKeychainPath: string;
     FListenerState: Integer;
     FActiveConnections: LongInt;
     FConnections: TList;
@@ -137,6 +143,7 @@ type
     FTCPBlock: TRegistryBlock;
     procedure ConnectionFinished(
       AConnection: TNetworkFrameworkRegistryConnection);
+    procedure DeleteTemporaryKeychainStorage;
     procedure LoadIdentity(const APath, APassphrase: string);
   public
     constructor Create(AStore: TLWPTRegistryStore;
@@ -380,6 +387,8 @@ function SecKeychainCreate(APath: PAnsiChar; APassphraseLength: UInt32;
   out AKeychain: Pointer): Int32; cdecl; external name 'SecKeychainCreate';
 function SecKeychainDelete(AKeychain: Pointer): Int32; cdecl;
   external name 'SecKeychainDelete';
+function SecRandomCopyBytes(ARandom: Pointer; ACount: NativeUInt;
+  ABytes: Pointer): Int32; cdecl; external name 'SecRandomCopyBytes';
 
 const
   RTLD_DEFAULT = Pointer(-2);
@@ -865,14 +874,135 @@ begin
   end;
 end;
 
+function TemporaryKeychainRandomHex(
+  out ARandom: TTemporaryKeychainRandom): AnsiString;
+const
+  HEX = '0123456789abcdef';
+var
+  Index: Integer;
+begin
+  if SecRandomCopyBytes(nil, SizeOf(ARandom), @ARandom[0]) <> 0 then
+    raise ELWPTRegistryError.CreateStable('tls_configuration',
+      'could not obtain secure temporary keychain material');
+  SetLength(Result, SizeOf(ARandom) * 2);
+  for Index := 0 to High(ARandom) do
+  begin
+    Result[Index * 2 + 1] := HEX[(ARandom[Index] shr 4) + 1];
+    Result[Index * 2 + 2] := HEX[(ARandom[Index] and $0f) + 1];
+  end;
+end;
+
+function TryTemporaryKeychainOwnerPID(const AName: string;
+  out APID: LongInt): Boolean;
+const
+  SUFFIX = '.keychain';
+var
+  Character: Char;
+  Index: Integer;
+  Nonce, Owner, Prefix, Tail: string;
+begin
+  Result := False;
+  APID := 0;
+  Prefix := PROGRAM_NAME + '-registry-tls-';
+  if Length(AName) <= Length(Prefix) + Length(SUFFIX) then Exit;
+  if Copy(AName, 1, Length(Prefix)) <> Prefix then Exit;
+  if Copy(AName, Length(AName) - Length(SUFFIX) + 1,
+    Length(SUFFIX)) <> SUFFIX then Exit;
+  Tail := Copy(AName, Length(Prefix) + 1,
+    Length(AName) - Length(Prefix) - Length(SUFFIX));
+  Index := Pos('-', Tail);
+  if Index <= 1 then Exit;
+  Owner := Copy(Tail, 1, Index - 1);
+  Nonce := Copy(Tail, Index + 1, MaxInt);
+  if Length(Nonce) <> TEMPORARY_KEYCHAIN_RANDOM_BYTES * 2 then Exit;
+  for Character in Owner do
+    if not (Character in ['0'..'9']) then Exit;
+  for Character in Nonce do
+    if not (Character in ['0'..'9', 'a'..'f']) then Exit;
+  if not TryStrToInt(Owner, APID) or (APID <= 0) then Exit;
+  Result := True;
+end;
+
+function ProcessIsDefinitelyDead(const APID: LongInt): Boolean;
+var
+  ErrorCode: cint;
+begin
+  if FpKill(APID, 0) = 0 then Exit(False);
+  ErrorCode := FpGetErrNo;
+  Result := ErrorCode = ESysESRCH;
+end;
+
+procedure ReconcileAbandonedTemporaryKeychains;
+var
+  Inspected: Integer;
+  OwnerPID: LongInt;
+  Path, Pattern: string;
+  Search: TSearchRec;
+  Status: Stat;
+begin
+  Inspected := 0;
+  Pattern := IncludeTrailingPathDelimiter(GetTempDir)
+    + PROGRAM_NAME + '-registry-tls-*.keychain';
+  if FindFirst(Pattern, faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    repeat
+      if not TryTemporaryKeychainOwnerPID(Search.Name, OwnerPID) then Continue;
+      Path := IncludeTrailingPathDelimiter(GetTempDir) + Search.Name;
+      if (FpLStat(PChar(Path), Status) <> 0)
+        or ((Status.st_mode and S_IFMT) <> S_IFREG)
+        or (Status.st_uid <> FpGetUID) then Continue;
+      Inc(Inspected);
+      if Inspected > MAX_TEMPORARY_KEYCHAIN_RECOVERY_FILES then
+        raise ELWPTRegistryError.CreateStable('tls_configuration',
+          'temporary keychain recovery limit exceeded');
+      if not ProcessIsDefinitelyDead(OwnerPID) then Continue;
+      if not SysUtils.DeleteFile(Path) then
+        raise ELWPTRegistryError.CreateStable('tls_configuration',
+          'could not recover abandoned temporary keychain storage');
+      if (FpLStat(PChar(Path), Status) = 0)
+        or (FpGetErrNo <> ESysENOENT) then
+        raise ELWPTRegistryError.CreateStable('tls_configuration',
+          'temporary keychain storage survived recovery');
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+procedure WipeAnsiString(var AValue: AnsiString);
+begin
+  if Length(AValue) > 0 then
+    FillChar(AValue[1], Length(AValue) * SizeOf(AnsiChar), 0);
+  AValue := '';
+end;
+
+procedure TNetworkFrameworkRegistryServer.DeleteTemporaryKeychainStorage;
+var
+  Path: string;
+  Status: Stat;
+begin
+  Path := FTemporaryKeychainPath;
+  if Path = '' then Exit;
+  if not SysUtils.DeleteFile(Path) then
+    raise ELWPTRegistryError.CreateStable('tls_configuration',
+      'could not remove temporary keychain storage');
+  if (FpLStat(PChar(Path), Status) = 0) or (FpGetErrNo <> ESysENOENT) then
+    raise ELWPTRegistryError.CreateStable('tls_configuration',
+      'temporary keychain storage survived removal');
+  FTemporaryKeychainPath := '';
+end;
+
 procedure TNetworkFrameworkRegistryServer.LoadIdentity(const APath,
   APassphrase: string);
 var
   Bytes: TBytes;
   CFData, CFOptions, CFPassphrase, IdentityReference, Item,
     Items: Pointer;
-  EncodedPassphrase, KeychainPassphrase, KeychainPath: AnsiString;
+  EncodedPassphrase, KeychainPassphrase, KeychainPath,
+    KeychainPathNonce: AnsiString;
+  KeychainPasswordRandom, KeychainPathRandom: TTemporaryKeychainRandom;
   Keys, Values: array[0..1] of Pointer;
+  PathStatus: Stat;
   Status: Int32;
 begin
   Bytes := nil;
@@ -882,17 +1012,34 @@ begin
   IdentityReference := nil;
   Items := nil;
   EncodedPassphrase := '';
+  KeychainPassphrase := '';
+  KeychainPathNonce := '';
+  FillChar(KeychainPasswordRandom, SizeOf(KeychainPasswordRandom), 0);
+  FillChar(KeychainPathRandom, SizeOf(KeychainPathRandom), 0);
   try
     Bytes := ReadPKCS12WithoutFollowingLinks(APath);
-    KeychainPath := AnsiString(GetTempFileName(GetTempDir,
-      PROGRAM_NAME + '-registry-tls-'));
-    KeychainPassphrase := AnsiString(PROJECT_NAME + '-registry-transient');
+    ReconcileAbandonedTemporaryKeychains;
+    KeychainPathNonce := TemporaryKeychainRandomHex(KeychainPathRandom);
+    FTemporaryKeychainPath := IncludeTrailingPathDelimiter(GetTempDir)
+      + PROGRAM_NAME + '-registry-tls-' + IntToStr(GetProcessID) + '-'
+      + string(KeychainPathNonce) + '.keychain';
+    KeychainPath := AnsiString(FTemporaryKeychainPath);
+    if FpLStat(PChar(FTemporaryKeychainPath), PathStatus) = 0 then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'temporary keychain path already exists');
+    if FpGetErrNo <> ESysENOENT then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'could not verify the temporary keychain path');
+    KeychainPassphrase := TemporaryKeychainRandomHex(KeychainPasswordRandom);
     Status := SecKeychainCreate(PAnsiChar(KeychainPath),
       Length(KeychainPassphrase), PAnsiChar(KeychainPassphrase), False, nil,
       FTemporaryKeychain);
     if Status <> 0 then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'temporary keychain creation failed with status ' + IntToStr(Status));
+    if FpChmod(FTemporaryKeychainPath, S_IRUSR or S_IWUSR) <> 0 then
+      raise ELWPTRegistryError.CreateStable('tls_configuration',
+        'could not restrict temporary keychain storage');
     CFData := CFDataCreate(nil, @Bytes[0], Length(Bytes));
     if CFData = nil then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
@@ -929,6 +1076,7 @@ begin
     if FTLSIdentity = nil then
       raise ELWPTRegistryError.CreateStable('tls_configuration',
         'could not create the Network.framework TLS identity');
+    DeleteTemporaryKeychainStorage;
   finally
     if Length(Bytes) > 0 then FillChar(Bytes[0], Length(Bytes), 0);
     Bytes := nil;
@@ -936,6 +1084,10 @@ begin
       FillChar(EncodedPassphrase[1], Length(EncodedPassphrase)
         * SizeOf(AnsiChar), 0);
     EncodedPassphrase := '';
+    WipeAnsiString(KeychainPassphrase);
+    WipeAnsiString(KeychainPathNonce);
+    FillChar(KeychainPasswordRandom, SizeOf(KeychainPasswordRandom), 0);
+    FillChar(KeychainPathRandom, SizeOf(KeychainPathRandom), 0);
     if IdentityReference <> nil then CFRelease(IdentityReference);
     if Items <> nil then CFRelease(Items);
     if CFOptions <> nil then CFRelease(CFOptions);
@@ -1000,6 +1152,7 @@ end;
 
 destructor TNetworkFrameworkRegistryServer.Destroy;
 var
+  DeleteStatus: Int32;
   Index: Integer;
 begin
   FStopping := True;
@@ -1028,9 +1181,20 @@ begin
   if FTLSIdentity <> nil then Nw_release(FTLSIdentity);
   if FTemporaryKeychain <> nil then
   begin
-    SecKeychainDelete(FTemporaryKeychain);
+    DeleteStatus := SecKeychainDelete(FTemporaryKeychain);
     CFRelease(FTemporaryKeychain);
+    FTemporaryKeychain := nil;
+    if (DeleteStatus <> 0) and (FTemporaryKeychainPath <> '')
+      and FileExists(FTemporaryKeychainPath)
+      and not SysUtils.DeleteFile(FTemporaryKeychainPath) then
+      WriteLn(StdErr,
+        'registry TLS cleanup: could not remove temporary keychain storage');
   end;
+  if (FTemporaryKeychainPath <> '') and FileExists(FTemporaryKeychainPath)
+    and not SysUtils.DeleteFile(FTemporaryKeychainPath) then
+    WriteLn(StdErr,
+      'registry TLS cleanup: could not remove temporary keychain storage');
+  FTemporaryKeychainPath := '';
   if FListenerQueue <> nil then Dispatch_release(FListenerQueue);
   if FReadySemaphore <> nil then Dispatch_release(FReadySemaphore);
   if FStopSemaphore <> nil then Dispatch_release(FStopSemaphore);
