@@ -40,7 +40,7 @@ type
     function CurlAttempt(const AURL: string; const AInsecure: Boolean;
       out AExitStatus: Integer; out AStandardError: string;
       out AOutputTruncated, AStandardErrorTruncated: Boolean): string;
-    procedure StopServer(AProcess: TProcess);
+    procedure StopServer(var AProcess: TProcess);
     procedure WaitUntilReady(const AURL: string; const AInsecure: Boolean;
       AServer: TProcess);
   protected
@@ -217,42 +217,53 @@ begin
   Result := not AProcess.Running;
 end;
 
-procedure TRegistryE2EContract.StopServer(AProcess: TProcess);
+procedure TRegistryE2EContract.StopServer(var AProcess: TProcess);
 var
   Forced: Boolean;
+  FailureMessage: string;
+  ProcessInstance: TProcess;
 begin
   if not Assigned(AProcess) then Exit;
+  ProcessInstance := AProcess;
+  AProcess := nil;
   Forced := False;
+  FailureMessage := '';
   try
-    if AProcess.Running then
+    if ProcessInstance.Running then
     begin
       {$IFDEF UNIX}
-      FpKill(AProcess.ProcessID, SIGTERM);
+      FpKill(ProcessInstance.ProcessID, SIGTERM);
       {$ELSE}
-      AProcess.Terminate(1);
+      ProcessInstance.Terminate(1);
       {$ENDIF}
     end;
-    if not WaitForServerExit(AProcess,
+    if not WaitForServerExit(ProcessInstance,
       SERVER_STOP_TIMEOUT_MILLISECONDS) then
     begin
       Forced := True;
       {$IFDEF UNIX}
-      FpKill(AProcess.ProcessID, SIGKILL);
+      FpKill(ProcessInstance.ProcessID, SIGKILL);
       {$ELSE}
-      AProcess.Terminate(1);
+      ProcessInstance.Terminate(1);
       {$ENDIF}
-      if not WaitForServerExit(AProcess,
+      if not WaitForServerExit(ProcessInstance,
         SERVER_KILL_TIMEOUT_MILLISECONDS) then
-        raise Exception.Create('registry server did not stop after forced '
-          + 'termination');
+        FailureMessage := 'registry server did not stop after forced '
+          + 'termination';
     end;
   finally
-    AProcess.Free;
+    ProcessInstance.Free;
   end;
-  if Forced then
-    raise Exception.CreateFmt('registry server exceeded its %d ms shutdown '
+  if Forced and (FailureMessage = '') then
+    FailureMessage := Format('registry server exceeded its %d ms shutdown '
       + 'bound and required forced termination',
       [SERVER_STOP_TIMEOUT_MILLISECONDS]);
+  if FailureMessage <> '' then
+  begin
+    if ExceptObject <> nil then
+      WriteLn(StdErr, 'registry E2E cleanup: ', FailureMessage)
+    else raise Exception.Create(FailureMessage);
+  end;
 end;
 
 procedure TRegistryE2EContract.TestSilentServeUsesPersistedConfiguration;
