@@ -325,7 +325,8 @@ begin
 end;
 
 procedure TInstallGitGraph.TestOfflineMissPreservesCommittedState;
-var SeedRoot, Root, LockText, Combined: string; Run: TLwptResult;
+var SeedRoot, Root, LockText, Combined, OriginalCfg,
+  OriginalSentinel: string; Run: TLwptResult;
 begin
   PrepareOfflineSeed('offline-miss', SeedRoot, LockText);
   Root := FScratch + '/offline-miss-recovery';
@@ -334,6 +335,9 @@ begin
   CopyFileContent(SeedRoot + '/lwpt.lock', Root + '/lwpt.lock');
   WriteTextFile(Root + '/.lwpt/modules/sentinel/keep.txt', 'keep'#10);
   WriteTextFile(Root + '/lwpt.cfg', 'existing cfg'#10);
+  OriginalCfg := ReadBinaryFile(Root + '/lwpt.cfg');
+  OriginalSentinel := ReadBinaryFile(Root
+    + '/.lwpt/modules/sentinel/keep.txt');
   RecursiveDelete(FCacheRoot);
   SysUtils.DeleteFile(FFixtureRoot + '/refs/shared.refs');
   SysUtils.DeleteFile(FFixtureRoot + '/archives/shared/'
@@ -345,9 +349,9 @@ begin
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('[offline]', Combined) > 0).ToBe(True);
   Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
-  Expect<string>(ReadText(Root + '/lwpt.cfg')).ToBe('existing cfg'#10);
-  Expect<string>(ReadText(Root
-    + '/.lwpt/modules/sentinel/keep.txt')).ToBe('keep'#10);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.cfg')).ToBe(OriginalCfg);
+  Expect<string>(ReadBinaryFile(Root
+    + '/.lwpt/modules/sentinel/keep.txt')).ToBe(OriginalSentinel);
   Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/shared'))
     .ToBe(False);
   Expect<Integer>(RequestCount('refs|shared')).ToBe(0);
@@ -356,13 +360,15 @@ begin
 end;
 
 procedure TInstallGitGraph.TestOfflineCorruptArchiveIsNotFetchedAround;
-var Root, LockText, ArchivePath, Combined: string; Run: TLwptResult;
+var Root, LockText, ArchivePath, Combined, OriginalArchive: string;
+  Run: TLwptResult;
 begin
   PrepareOfflineSeed('offline-corrupt', Root, LockText);
   ArchivePath := Root + '/.lwpt/archives/shared-v1.0.0.tar.gz';
   RecursiveDelete(Root + '/.lwpt/modules');
   SysUtils.DeleteFile(Root + '/lwpt.cfg');
   WriteTextFile(ArchivePath, 'corrupt committed archive'#10);
+  OriginalArchive := ReadBinaryFile(ArchivePath);
   SysUtils.DeleteFile(FFixtureRoot + '/refs/shared.refs');
   SysUtils.DeleteFile(FFixtureRoot + '/archives/shared/'
     + SHARED_COMMIT + '.tar.gz');
@@ -372,7 +378,7 @@ begin
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('archive hash mismatch', Combined) > 0).ToBe(True);
-  Expect<string>(ReadText(ArchivePath)).ToBe('corrupt committed archive'#10);
+  Expect<string>(ReadBinaryFile(ArchivePath)).ToBe(OriginalArchive);
   Expect<string>(ReadText(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/shared'))
     .ToBe(False);
