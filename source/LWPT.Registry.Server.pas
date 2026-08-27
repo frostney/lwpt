@@ -201,6 +201,9 @@ function RegistrySetSocketOption(const ASocket: TSocket;
   const ALevel, AName: Integer; const AValue: Pointer;
   const ASize: Integer): Integer; inline;
 begin
+  {$IFDEF REGISTRY_TESTING}
+  if RegistryTestPlainSendActive then Exit(0);
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   Result := WinSock2.setsockopt(ASocket, ALevel, AName, PChar(AValue), ASize);
   {$ELSE}
@@ -805,9 +808,8 @@ begin
   RegistryTestPlainSendMaximum := AMaximumSend;
   RegistryTestPlainSendTime := AStartTime;
   try
-    { The testing seam intercepts every send before the socket is observed.
-      Zero is an unused portable TSocket value; unlike -1 it also fits the
-      unsigned Windows socket type. }
+    { The testing seam intercepts deadline socket options and every send before
+      the portable placeholder socket is observed. }
     SendResourcePlain(0, AStream, ADeadline);
     Result := RegistryTestPlainSendCalls;
   finally
