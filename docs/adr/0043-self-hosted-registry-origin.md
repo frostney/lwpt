@@ -123,11 +123,13 @@ HTTPS uses the repository's native server policy:
 - macOS 15 and older use the portable socket listener and the HTTPClient
   package's public Secure Transport server backend. Its PKCS#12 import uses an
   isolated temporary keychain without changing the default keychain or search
-  list. Ordinary teardown deletes the keychain; a scan-capped later creation
-  recovers only exact same-user regular-file residue whose owner PID is
-  definitely dead. The feed/drain connection contract keeps parsing, routing,
-  resources, deadlines, and shutdown in the same registry implementation used
-  on other platforms.
+  list. Ordinary teardown and scan-capped recovery atomically move a candidate
+  to an unpredictable same-directory quarantine and delete it only after the
+  quarantined device, inode, owner, and file type still match the owned file;
+  pathname replacements are preserved and fail closed. Recovery additionally
+  requires that the residue's owner PID is definitely dead. The feed/drain
+  connection contract keeps parsing, routing, resources, deadlines, and
+  shutdown in the same registry implementation used on other platforms.
 
 The registry selects these Darwin transports from the runtime macOS product-
 version major: 26 and newer selects Network.framework; 15 and older selects
@@ -144,7 +146,10 @@ The macOS 26-and-newer Network.framework listener also accepts IPv6 addresses.
 The listener admits at most 32 owned connections, handles each independently,
 and closes it after one bounded HTTP/1.1 GET or HEAD request. One ten-second
 monotonic deadline covers handshake, request, and response; request headers are
-capped at 32 KiB. Committed-state reads and hashes report progress in 64 KiB
+capped at 32 KiB, and every short response send rechecks the same absolute
+deadline. Unix sends suppress SIGPIPE per socket: Linux uses `MSG_NOSIGNAL`,
+while Darwin listeners enable `SO_NOSIGPIPE` for accepted sockets. Committed-
+state reads and hashes report progress in 64 KiB
 steps to the same deadline before routing may select a resource. Fixed-schema
 configuration, state, checkpoint, signature, key, and seed documents are capped
 at 1 MiB before allocation or parsing; snapshot verification hashes its retained

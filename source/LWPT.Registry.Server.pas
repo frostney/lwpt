@@ -62,6 +62,9 @@ function RegistryDeadlineTimeoutForTesting(const ADeadline,
   ANow: QWord): LongInt;
 function RegistryTLSShutdownStateIsTerminalForTesting(
   const AState: Integer): Boolean;
+function RegistrySendResourcePlainForTesting(AStream: TStream;
+  const ADeadline, AStartTime, AAdvancePerSend: QWord;
+  const AMaximumSend: Integer): Integer;
 {$ENDIF}
 
 implementation
@@ -86,9 +89,24 @@ const
   CLIENT_READ_TIMEOUT_MILLISECONDS = 10000;
   TLS_CIPHERTEXT_BUDGET_BYTES = 1024 * 1024;
   MAX_ACTIVE_CLIENTS = 32;
+  {$IFDEF LINUX}
+  REGISTRY_SOCKET_SEND_FLAGS = $4000; { Linux MSG_NOSIGNAL. }
+  {$ELSE}
+  REGISTRY_SOCKET_SEND_FLAGS = 0;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  REGISTRY_SO_NOSIGPIPE = $1022;
+  {$ENDIF}
 
 var
   RegistryRequestSequence: LongInt;
+  {$IFDEF REGISTRY_TESTING}
+  RegistryTestPlainSendActive: Boolean;
+  RegistryTestPlainSendAdvance: QWord;
+  RegistryTestPlainSendCalls: Integer;
+  RegistryTestPlainSendMaximum: Integer;
+  RegistryTestPlainSendTime: QWord;
+  {$ENDIF}
 
 {$IFDEF DARWIN}
 function CurrentRegistryDarwinTLSTransport: TRegistryDarwinTLSTransport;
@@ -193,11 +211,46 @@ end;
 function RegistrySocketSend(const ASocket: TSocket; const ABuffer: Pointer;
   const ALength: Integer): Integer; inline;
 begin
+  {$IFDEF REGISTRY_TESTING}
+  if RegistryTestPlainSendActive then
+  begin
+    Inc(RegistryTestPlainSendCalls);
+    Inc(RegistryTestPlainSendTime, RegistryTestPlainSendAdvance);
+    Result := ALength;
+    if Result > RegistryTestPlainSendMaximum then
+      Result := RegistryTestPlainSendMaximum;
+    Exit;
+  end;
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   Result := WinSock2.send(ASocket, ABuffer^, ALength, 0);
   {$ELSE}
-  Result := fpSend(ASocket, ABuffer, ALength, 0);
+  Result := fpSend(ASocket, ABuffer, ALength, REGISTRY_SOCKET_SEND_FLAGS);
   {$ENDIF}
+end;
+
+function RegistryPrepareSocketNoSigPipe(const ASocket: TSocket): Boolean;
+{$IFDEF DARWIN}
+var
+  Enabled: LongInt;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  Enabled := 1;
+  Result := RegistrySetSocketOption(ASocket, SOL_SOCKET,
+    REGISTRY_SO_NOSIGPIPE, @Enabled, SizeOf(Enabled)) = 0;
+  {$ELSE}
+  Result := True;
+  {$ENDIF}
+end;
+
+function RegistryMonotonicMilliseconds: QWord; inline;
+begin
+  {$IFDEF REGISTRY_TESTING}
+  if RegistryTestPlainSendActive then
+    Exit(RegistryTestPlainSendTime);
+  {$ENDIF}
+  Result := GetTickCount64;
 end;
 
 function RegistrySocketReceive(const ASocket: TSocket;
@@ -726,11 +779,12 @@ var
   ReadCount, Sent, SentTotal: Integer;
 begin
   repeat
-    if GetTickCount64 >= ADeadline then Exit;
+    if RegistryMonotonicMilliseconds >= ADeadline then Exit;
     ReadCount := AStream.Read(Buffer[0], SizeOf(Buffer));
     SentTotal := 0;
     while SentTotal < ReadCount do
     begin
+      if RegistryMonotonicMilliseconds >= ADeadline then Exit;
       ApplyDeadlineTimeout(ASocket, ADeadline);
       Sent := RegistrySocketSend(ASocket, @Buffer[SentTotal],
         ReadCount - SentTotal);
@@ -739,6 +793,26 @@ begin
     end;
   until ReadCount = 0;
 end;
+
+{$IFDEF REGISTRY_TESTING}
+function RegistrySendResourcePlainForTesting(AStream: TStream;
+  const ADeadline, AStartTime, AAdvancePerSend: QWord;
+  const AMaximumSend: Integer): Integer;
+begin
+  RegistryTestPlainSendActive := True;
+  RegistryTestPlainSendAdvance := AAdvancePerSend;
+  RegistryTestPlainSendCalls := 0;
+  RegistryTestPlainSendMaximum := AMaximumSend;
+  RegistryTestPlainSendTime := AStartTime;
+  try
+    SendResourcePlain(-1, AStream, ADeadline);
+    Result := RegistryTestPlainSendCalls;
+  finally
+    RegistryTestPlainSendActive := False;
+  end;
+end;
+
+{$ENDIF}
 
 procedure TLWPTRegistryClientThread.ExecutePlain;
 var
@@ -1165,6 +1239,9 @@ begin
   end;
   try
     Reuse := 1;
+    if not RegistryPrepareSocketNoSigPipe(ListenSocket) then
+      raise ELWPTRegistryError.CreateStable('listen_failed',
+        'could not disable broken-pipe signals on the registry socket');
     {$IFDEF MSWINDOWS}
     if RegistrySetSocketOption(ListenSocket, SOL_SOCKET,
       SO_EXCLUSIVEADDRUSE, @Reuse, SizeOf(Reuse)) <> 0 then

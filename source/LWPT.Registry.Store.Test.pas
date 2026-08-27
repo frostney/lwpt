@@ -199,6 +199,7 @@ type
     procedure TestReservedPackageNameUsesPortableIndexKey;
     procedure TestIncompleteInitializationIsRecovered;
     procedure TestOversizedInitializationMarkerIsRejected;
+    procedure TestPlainResourceSendChecksDeadlineAfterShortWrites;
     procedure TestCallerOwnedRootIsPreserved;
     procedure TestInitializationUsesAnOperatingSystemLease;
     procedure TestRecoveryClearsIncompleteStaging;
@@ -672,6 +673,25 @@ begin
   Store.Free;
   Expect<Boolean>(Pos('state_corrupt:', Diagnostic) = 1).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/.initializing')).ToBe(True);
+end;
+
+procedure TRegistryStoreContract.
+  TestPlainResourceSendChecksDeadlineAfterShortWrites;
+var
+  Data: array[0..7] of Byte;
+  SendCalls: Integer;
+  Stream: TMemoryStream;
+begin
+  FillChar(Data, SizeOf(Data), $5a);
+  Stream := TMemoryStream.Create;
+  try
+    Stream.WriteBuffer(Data[0], SizeOf(Data));
+    Stream.Position := 0;
+    SendCalls := RegistrySendResourcePlainForTesting(Stream, 3, 0, 1, 1);
+  finally
+    Stream.Free;
+  end;
+  Expect<Integer>(SendCalls).ToBe(3);
 end;
 
 procedure TRegistryStoreContract.TestCallerOwnedRootIsPreserved;
@@ -1683,6 +1703,8 @@ begin
     TestIncompleteInitializationIsRecovered);
   Test('oversized initialization marker is rejected before recovery',
     TestOversizedInitializationMarkerIsRejected);
+  Test('plain resource short writes obey the monotonic deadline',
+    TestPlainResourceSendChecksDeadlineAfterShortWrites);
   Test('caller-owned root is preserved', TestCallerOwnedRootIsPreserved);
   Test('initialization uses an operating-system lease',
     TestInitializationUsesAnOperatingSystemLease);

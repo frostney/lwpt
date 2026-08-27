@@ -56,6 +56,7 @@ type
     procedure TestIdleTLSHandshakesExpireAndReleaseAdmission;
     procedure TestSilentServeUsesPersistedConfiguration;
     procedure TestSlowClientsAreBoundedByOneDeadline;
+    procedure TestClientResetDoesNotTerminateServer;
   end;
 
 function TRegistryE2EContract.BasePort: Integer;
@@ -398,6 +399,68 @@ begin
       end;
     StopServer(Server);
   end;
+end;
+
+procedure TRegistryE2EContract.TestClientResetDoesNotTerminateServer;
+{$IFDEF UNIX}
+type
+  TResetLinger = packed record
+    Enabled: LongInt;
+    Seconds: LongInt;
+  end;
+var
+  Address: TInetSockAddr;
+  DataDirectory, DiscoveryURL: string;
+  Index: Integer;
+  Init: TLwptResult;
+  Linger: TResetLinger;
+  Request: AnsiString;
+  ResetSocket: TSocket;
+  Server: TProcess;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  DataDirectory := FScratch + '/reset-origin';
+  DiscoveryURL := 'http://localhost:' + IntToStr(BasePort + 6)
+    + '/.well-known/lwpt-registry';
+  Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
+    '--base-url', 'http://localhost:' + IntToStr(BasePort + 6), '--port',
+    IntToStr(BasePort + 6)]);
+  Expect<Integer>(Init.ExitCode).ToBe(0);
+  Server := StartServer(DataDirectory, False);
+  try
+    WaitUntilReady(DiscoveryURL, False, Server);
+    FillChar(Address, SizeOf(Address), 0);
+    Address.sin_family := AF_INET;
+    Address.sin_port := HToNs(BasePort + 6);
+    Address.sin_addr := StrToNetAddr('127.0.0.1');
+    Linger.Enabled := 1;
+    Linger.Seconds := 0;
+    Request := 'GET /.well-known/lwpt-registry HTTP/1.1'#13#10
+      + 'Host: localhost'#13#10'Connection: close'#13#10#13#10;
+    for Index := 1 to 128 do
+    begin
+      ResetSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
+      Expect<Boolean>(ResetSocket >= 0).ToBe(True);
+      try
+        Expect<Integer>(fpConnect(ResetSocket, @Address,
+          SizeOf(Address))).ToBe(0);
+        Expect<Integer>(fpSetSockOpt(ResetSocket, SOL_SOCKET, SO_LINGER,
+          @Linger, SizeOf(Linger))).ToBe(0);
+        Expect<Integer>(fpSend(ResetSocket, @Request[1], Length(Request),
+          0)).ToBe(Length(Request));
+      finally
+        CloseSocket(ResetSocket);
+      end;
+    end;
+    Sleep(100);
+    Expect<Boolean>(Server.Running).ToBe(True);
+    Expect<Boolean>(Pos('registry-discovery-v1', Curl(DiscoveryURL,
+      False)) > 0).ToBe(True);
+  finally
+    StopServer(Server);
+  end;
+  {$ENDIF}
 end;
 
 procedure TRegistryE2EContract.WaitUntilReady(const AURL: string;
@@ -828,6 +891,14 @@ begin
     TestSilentServeUsesPersistedConfiguration);
   Test('slow clients are bounded by one deadline',
     TestSlowClientsAreBoundedByOneDeadline);
+  {$IFDEF UNIX}
+  Test('client resets cannot terminate the registry process',
+    TestClientResetDoesNotTerminateServer);
+  {$ELSE}
+  Skip('client resets cannot terminate the registry process',
+    TestClientResetDoesNotTerminateServer,
+    'SIGPIPE is a Unix socket behavior');
+  {$ENDIF}
 end;
 
 begin
