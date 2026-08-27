@@ -35,6 +35,31 @@ type
     procedure TestBothNestedShapesAtOnce;
   end;
 
+  (* A comment between unit names used to desynchronise the uses-clause
+     parser. FormatUsesInLines accumulated the clause into one string and
+     re-ran StripLineComment over the whole accumulation to find the
+     terminating `;`; that helper truncates at the first comment marker,
+     so the `;` was never seen and the scan swallowed the rest of the
+     file, which `lwpt format` then re-emitted as sorted "unit names".
+     --check only ever reported "needs formatting", so the destruction
+     landed on the rewrite. A clause carrying a comment is now emitted
+     verbatim — the treatment a clause carrying an $IFDEF has always had,
+     and the semantics the comments already want: they pin a position. *)
+  TFormatUsesComments = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestLineCommentPreservesTheWholeFile;
+    procedure TestBlockCommentPreservesTheWholeFile;
+    procedure TestParenStarCommentPreservesTheWholeFile;
+    procedure TestBlockCommentOpenPastTheTerminatorScan;
+    procedure TestCommentAfterTheSemicolonPreservesTheFile;
+    procedure TestMarkersInsideStringLiteralsAreNotComments;
+    procedure TestDirectiveClauseStaysVerbatim;
+    procedure TestCommentedClauseIsIdempotent;
+    procedure TestCheckAgreesWithRewrite;
+    procedure TestUncommentedClauseIsStillSorted;
+  end;
+
   { ADR-0007 — exercises the scope-resolution algorithm via the
     exposed ExpandFormatPattern entry point. Sets up a known-shape
     fixture tree once, then each test asserts on a different pattern. }
@@ -340,6 +365,294 @@ begin
     TestNestedFunctionBodyRefsRenamed);
   Test('both shapes at once: nothing leaks across scopes',
     TestBothNestedShapesAtOnce);
+end;
+
+{ ───────── TFormatUsesComments ─────────
+  Every fixture below is already in the shape the formatter should
+  produce, so "unchanged" is the whole assertion: the clause survives
+  byte-for-byte and, crucially, so does everything after it. }
+
+const
+  { The downstream shape that triggered the corruption (Knips, lwpt
+    0.7.0): the comment documents why the unit may not be sorted. }
+  USES_LINE_COMMENT =
+    'unit LineComment;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'uses'#10 +
+    '  cmem,'#10 +
+    '  // must stay second: pthread-backed locks before anything spawns'#10 +
+    '  Knips.ThreadManager,'#10 +
+    '  SysUtils;'#10 +
+    'procedure DoStuff;'#10 +
+    'implementation'#10 +
+    'procedure DoStuff;'#10 +
+    'begin'#10 +
+    '  WriteLn(''hello'');'#10 +
+    'end;'#10 +
+    'end.'#10;
+
+  USES_BLOCK_COMMENT =
+    'unit BlockComment;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'uses'#10 +
+    '  cmem,'#10 +
+    '  { must stay second: pthread-backed locks before anything spawns }'#10 +
+    '  Knips.ThreadManager,'#10 +
+    '  SysUtils;'#10 +
+    'implementation'#10 +
+    'end.'#10;
+
+  USES_PAREN_STAR_COMMENT =
+    'unit ParenStarComment;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'uses'#10 +
+    '  cmem,'#10 +
+    { No brace anywhere in the body: the (* *) branch of the detector is
+      the only thing that can divert this clause. }
+    '  (* must stay second: pthread-backed locks before anything spawns *)'#10 +
+    '  Knips.ThreadManager,'#10 +
+    '  SysUtils;'#10 +
+    'implementation'#10 +
+    'end.'#10;
+
+  { The comment sits after the terminating `;`. Pre-fix the clause
+    parser folded it into the last unit name and appended a second
+    semicolon behind it. }
+  USES_TRAILING_COMMENT =
+    'unit TrailingComment;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'uses'#10 +
+    '  cmem,'#10 +
+    '  SysUtils; // pinned order, do not sort'#10 +
+    'implementation'#10 +
+    'end.'#10;
+
+  { The pre-existing passthrough this fix generalises. }
+  USES_DIRECTIVE =
+    'unit Directive;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'uses'#10 +
+    '  SysUtils,'#10 +
+    '{$IFDEF UNIX}'#10 +
+    '  BaseUnix,'#10 +
+    '{$ENDIF}'#10 +
+    '  Classes;'#10 +
+    'implementation'#10 +
+    'end.'#10;
+
+  USES_UNCOMMENTED =
+    'unit Uncommented;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'uses'#10 +
+    '  SysUtils, Classes;'#10 +
+    'implementation'#10 +
+    'end.'#10;
+
+  { Comment markers that live inside a `Unit in 'path'` string literal
+    are not comments. The detector scans string-aware precisely so this
+    clause stays sortable; drop that and the clause diverts to the
+    verbatim path and is never grouped. }
+  USES_MARKERS_IN_STRING =
+    'unit MarkersInString;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'uses'#10 +
+    '  SysUtils, Classes,'#10 +
+    '  Braced in ''gen/a{0}.pas'','#10 +
+    '  Slashed in ''gen//legacy.pas'';'#10 +
+    'implementation'#10 +
+    'end.'#10;
+
+  (* A brace comment that stays open past the line the terminator scan
+     stops on. The scan cuts `cmem, { note` at the brace, sees no `;`,
+     and stops one line later on `…needs it;` — which is still inside
+     the comment. Everything after that is reached by the outer loop,
+     so the passthrough has to hand it a correct block state: without
+     the fold, InBlock reads False and the prose line below is parsed
+     as a second uses clause and rewritten. *)
+  USES_OPEN_BLOCK_COMMENT =
+    'unit OpenBlockComment;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'uses'#10 +
+    '  cmem, { keep cmem first: it must replace the memory manager'#10 +
+    '    before any other unit allocates, and the RTL needs it;'#10 +
+    '    uses C, D; would be a different clause entirely'#10 +
+    '    end of note }'#10 +
+    '  Knips.ThreadManager,'#10 +
+    '  SysUtils;'#10 +
+    'implementation'#10 +
+    'end.'#10;
+
+{ Formats APath in place and reports whether the bytes survived. }
+function FormatLeavesFileUnchanged(const ASuffix, ASource: string;
+  out AAfter: string): Boolean;
+var
+  Path, Before: string;
+begin
+  Path   := WriteTempPas(ASuffix, ASource);
+  Before := ReadFile(Path);
+  FormatFile(Path, rmFormat);
+  AAfter := ReadFile(Path);
+  Result := AAfter = Before;
+end;
+
+procedure TFormatUsesComments.TestLineCommentPreservesTheWholeFile;
+var Out: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('uses-line-comment',
+    USES_LINE_COMMENT, Out)).ToBe(True);
+
+  { The regression signature: pre-fix everything from `procedure DoStuff`
+    to `end.` was folded into the clause and re-emitted as one line
+    terminated by `end.;`. }
+  Expect<Boolean>(Contains(Out, 'end.;')).ToBe(False);
+  Expect<Boolean>(Contains(Out, 'implementation' + LineEnding)).ToBe(True);
+  Expect<Boolean>(Contains(Out, LineEnding + 'end.')).ToBe(True);
+
+  { The comment still precedes the unit it pins, in the authored order. }
+  Expect<Boolean>(Contains(Out,
+    '  cmem,' + LineEnding +
+    '  // must stay second: pthread-backed locks before anything spawns' +
+    LineEnding + '  Knips.ThreadManager,')).ToBe(True);
+end;
+
+procedure TFormatUsesComments.TestBlockCommentPreservesTheWholeFile;
+var Out: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('uses-block-comment',
+    USES_BLOCK_COMMENT, Out)).ToBe(True);
+  Expect<Boolean>(Contains(Out, 'end.,')).ToBe(False);
+  Expect<Boolean>(Contains(Out,
+    '  cmem,' + LineEnding +
+    '  { must stay second: pthread-backed locks before anything spawns }' +
+    LineEnding + '  Knips.ThreadManager,')).ToBe(True);
+end;
+
+procedure TFormatUsesComments.TestParenStarCommentPreservesTheWholeFile;
+var Out: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('uses-paren-star-comment',
+    USES_PAREN_STAR_COMMENT, Out)).ToBe(True);
+  Expect<Boolean>(Contains(Out, LineEnding + 'end.')).ToBe(True);
+end;
+
+procedure TFormatUsesComments.TestCommentAfterTheSemicolonPreservesTheFile;
+var Out: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('uses-trailing-comment',
+    USES_TRAILING_COMMENT, Out)).ToBe(True);
+  { Pre-fix: `SysUtils; // pinned order, do not sort;` — a second
+    semicolon glued behind the comment. }
+  Expect<Boolean>(Contains(Out, 'do not sort;')).ToBe(False);
+end;
+
+procedure TFormatUsesComments.TestDirectiveClauseStaysVerbatim;
+var Out: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('uses-directive',
+    USES_DIRECTIVE, Out)).ToBe(True);
+  { Unsorted on purpose: SysUtils still precedes Classes because the
+    clause was never reordered. }
+  Expect<Boolean>(Contains(Out,
+    '  SysUtils,' + LineEnding + '{$IFDEF UNIX}')).ToBe(True);
+end;
+
+procedure TFormatUsesComments.TestCommentedClauseIsIdempotent;
+var
+  Path, Pass1, Pass2: string;
+begin
+  Path := WriteTempPas('uses-comment-idempotence', USES_LINE_COMMENT);
+
+  FormatFile(Path, rmFormat);
+  Pass1 := ReadFile(Path);
+  FormatFile(Path, rmFormat);
+  Pass2 := ReadFile(Path);
+
+  Expect<string>(Pass2).ToBe(Pass1);
+end;
+
+procedure TFormatUsesComments.TestCheckAgreesWithRewrite;
+var Path: string;
+begin
+  { The correctness contract behind --check: it must not claim a change
+    the rewrite would not make. Pre-fix, check reported True ("needs
+    formatting") and the rewrite it stood for destroyed the file. }
+  Path := WriteTempPas('uses-comment-check', USES_LINE_COMMENT);
+  Expect<Boolean>(FormatFile(Path, rmCheck)).ToBe(False);
+  Expect<Boolean>(FormatFile(Path, rmFormat)).ToBe(False);
+end;
+
+procedure TFormatUsesComments.TestUncommentedClauseIsStillSorted;
+var Out: string;
+begin
+  { The passthrough must stay scoped to commented clauses — an ordinary
+    clause is still regrouped and alphabetised. }
+  Out := FormatAndRead('uses-uncommented', USES_UNCOMMENTED);
+  Expect<Boolean>(Contains(Out,
+    'uses' + LineEnding + '  Classes,' + LineEnding + '  SysUtils;'))
+    .ToBe(True);
+end;
+
+procedure TFormatUsesComments.TestMarkersInsideStringLiteralsAreNotComments;
+var Out: string;
+begin
+  Out := FormatAndRead('uses-markers-in-string', USES_MARKERS_IN_STRING);
+
+  { Grouped and alphabetised — proof the clause was NOT diverted to the
+    verbatim path by the `{` and `//` inside the two path literals. }
+  Expect<Boolean>(Contains(Out,
+    'uses' + LineEnding + '  Classes,' + LineEnding + '  SysUtils,'))
+    .ToBe(True);
+  Expect<Boolean>(Contains(Out,
+    '  Braced in ''gen/a{0}.pas'',' + LineEnding +
+    '  Slashed in ''gen//legacy.pas'';')).ToBe(True);
+end;
+
+procedure TFormatUsesComments.TestBlockCommentOpenPastTheTerminatorScan;
+var Out: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('uses-open-block-comment',
+    USES_OPEN_BLOCK_COMMENT, Out)).ToBe(True);
+
+  { The decoy prose sits beyond the line the terminator scan stopped on.
+    Without the block-state fold it is parsed as a uses clause and
+    rewritten to one unit per line. }
+  Expect<Boolean>(Contains(Out,
+    '    uses C, D; would be a different clause entirely' + LineEnding))
+    .ToBe(True);
+  Expect<Boolean>(Contains(Out,
+    'uses' + LineEnding + '  C,')).ToBe(False);
+end;
+
+procedure TFormatUsesComments.SetupTests;
+begin
+  Test('// comment inside uses: file survives, comment stays put',
+    TestLineCommentPreservesTheWholeFile);
+  Test('{ } comment inside uses: file survives, comment stays put',
+    TestBlockCommentPreservesTheWholeFile);
+  Test('(* *) comment inside uses: file survives',
+    TestParenStarCommentPreservesTheWholeFile);
+  Test('brace comment open past the terminator scan: prose after it is '
+    + 'not parsed as a clause', TestBlockCommentOpenPastTheTerminatorScan);
+  Test('comment after the clause semicolon: no stray semicolon appended',
+    TestCommentAfterTheSemicolonPreservesTheFile);
+  Test('comment markers inside path literals do not divert the clause',
+    TestMarkersInsideStringLiteralsAreNotComments);
+  Test('directive clause keeps its established verbatim treatment',
+    TestDirectiveClauseStaysVerbatim);
+  Test('commented clause: formatting twice equals formatting once',
+    TestCommentedClauseIsIdempotent);
+  Test('--check agrees with the rewrite on a commented clause',
+    TestCheckAgreesWithRewrite);
+  Test('uncommented clause is still grouped and alphabetised',
+    TestUncommentedClauseIsStillSorted);
 end;
 
 { ───────── TFormatScopeExpansion (ADR-0007) ───────── }
@@ -801,6 +1114,7 @@ end;
 begin
   TestRunnerProgram.AddSuite(TFormatIdempotence.Create(PROJECT_NAME + '.Formatter: idempotence'));
   TestRunnerProgram.AddSuite(TFormatParamRename.Create(PROJECT_NAME + '.Formatter: param-rename regression'));
+  TestRunnerProgram.AddSuite(TFormatUsesComments.Create(PROJECT_NAME + '.Formatter: uses-clause comments'));
   TestRunnerProgram.AddSuite(TFormatScopeExpansion.Create(PROJECT_NAME + '.Formatter: scope expansion (ADR-0007)'));
   TestRunnerProgram.AddSuite(TLWPTFormatToolkitStateDefault.Create(PROJECT_NAME + '.Formatter: toolkit-state default'));
   TestRunnerProgram.Run;

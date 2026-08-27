@@ -131,9 +131,47 @@ begin
   end;
 end;
 
-function ContainsDirective(const AText: string): Boolean;
+(* A uses clause that carries a compiler directive or a comment is
+   emitted verbatim rather than regrouped and sorted.
+
+   Directives have always worked this way: reordering across an $IFDEF
+   changes which units a build actually sees. Comments earn the same
+   treatment for a second reason — a comment inside a uses clause exists
+   to pin a position ("cthreads must come first so TThread has a
+   driver"), so sorting past it would silently invalidate the note it
+   carries. The clause is the smallest thing the formatter can leave
+   alone; a comment anywhere in it makes the whole clause author-owned.
+
+   Detection deliberately does not reuse StripLineComment: that helper
+   truncates at the first comment marker, which is exactly what made the
+   caller lose the clause-terminating `;` and swallow the rest of the
+   file. String literals are skipped so a `Unit in 'some/path.pas'`
+   entry can never be mistaken for a comment. *)
+function ContainsDirectiveOrComment(const AText: string): Boolean;
+var
+  I: Integer;
+  InStr: Boolean;
 begin
-  Result := Pos('{$', UpperCase(AText)) > 0;
+  I := 1;
+  InStr := False;
+  while I <= Length(AText) do
+  begin
+    if InStr then
+    begin
+      if AText[I] = '''' then
+        InStr := False;
+    end
+    else if AText[I] = '''' then
+      InStr := True
+    else if AText[I] = '{' then
+      Exit(True)
+    else if (I < Length(AText)) and (AText[I] = '(') and (AText[I + 1] = '*') then
+      Exit(True)
+    else if (I < Length(AText)) and (AText[I] = '/') and (AText[I + 1] = '/') then
+      Exit(True);
+    Inc(I);
+  end;
+  Result := False;
 end;
 
 function StripLineComment(const ALine: string): string;
@@ -209,7 +247,7 @@ end;
 
 procedure FormatUsesInLines(const AInput: TStringList; const AOutput: TStringList);
 var
-  I, J: Integer;
+  I, J, StartLine: Integer;
   UsesContent, AfterUses, FullBlock, BeforeSC: string;
   Units, Formatted: TStringList;
   InBlock: Boolean;
@@ -241,10 +279,34 @@ begin
         BeforeSC := StripLineComment(AInput[J]);
       end;
 
-      if ContainsDirective(FullBlock) then
+      if ContainsDirectiveOrComment(FullBlock) then
       begin
+        StartLine := I;
         while I <= J do
         begin
+          (* Keep the block-comment state machine in step across the
+             passthrough: a brace opened inside the clause must still
+             read as open on the lines that follow it, or a line of
+             prose inside that comment gets mistaken for the next
+             clause. Line I itself was already folded into InBlock
+             above.
+
+             Two known limits, both pre-existing and both harmless now
+             that a commented clause is emitted verbatim:
+               - UpdateBlockState tracks brace comments only, never the
+                 parenthesis-star form; do not read it as symmetric.
+                 A line of prose beginning with the clause keyword,
+                 inside a parenthesis-star comment, is still parsed as
+                 a clause — which is why no line of this comment starts
+                 with that word.
+               - the terminator scan above overshoots a clause that
+                 ends `{ … };` — StripLineComment cuts at the brace, so
+                 the `;` behind it is invisible and J runs on to the
+                 next semicolon. The overshot lines are re-emitted
+                 unchanged; the only cost is that a clause landing
+                 inside that range is left unformatted. *)
+          if I > StartLine then
+            InBlock := UpdateBlockState(AInput[I], InBlock);
           AOutput.Add(AInput[I]);
           Inc(I);
         end;
