@@ -70,6 +70,9 @@ its Windows implementation with native SChannel. ADR-0043 records the two
 native Darwin registry transports: Network.framework on macOS 26 and newer,
 and the portable listener using HTTPClient Secure Transport on macOS 15 and
 older. Runtime product version, never CPU architecture, selects between them.
+The runtime query uses the structured public
+`NSProcessInfo.operatingSystemVersion` value; localized display strings are
+not parsed.
 
 ## Considered options
 

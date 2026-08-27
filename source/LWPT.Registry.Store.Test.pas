@@ -216,7 +216,8 @@ type
     procedure TestNetworkFrameworkTeardownOrdering;
     procedure TestNetworkFrameworkCleanupFailureSemantics;
     procedure TestDarwinTLSTransportSelection;
-    procedure TestDarwinProductVersionParsing;
+    procedure TestDarwinStructuredOperatingSystemVersion;
+    procedure TestDarwinListenerCapabilitySelection;
     procedure TestServerErrorsConformToWireContract;
     procedure TestRenewalErrorDoesNotDiscloseStorePath;
     procedure TestServerDiscoveryIsTruthful;
@@ -241,12 +242,50 @@ begin
       rdttNetworkFramework);
 end;
 
-procedure TRegistryStoreContract.TestDarwinProductVersionParsing;
+procedure TRegistryStoreContract.TestDarwinStructuredOperatingSystemVersion;
+var
+  Diagnostic: string;
+  {$IFDEF DARWIN}
+  RuntimeMajor: Cardinal;
+  {$ENDIF}
 begin
-  Expect<Cardinal>(RegistryDarwinProductVersionMajorForTesting(
-    'Version 15.7.1 (Build 24G231)')).ToBe(15);
-  Expect<Cardinal>(RegistryDarwinProductVersionMajorForTesting(
-    'Version 26.0 (Build 25A354)')).ToBe(26);
+  Expect<Cardinal>(RegistryDarwinOperatingSystemVersionMajorForTesting(
+    15)).ToBe(15);
+  Expect<Cardinal>(RegistryDarwinOperatingSystemVersionMajorForTesting(
+    26)).ToBe(26);
+  Diagnostic := '';
+  try
+    RegistryDarwinOperatingSystemVersionMajorForTesting(0);
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('tls_configuration:', Diagnostic) = 1).ToBe(True);
+  {$IFDEF DARWIN}
+  RuntimeMajor := RegistryDarwinOperatingSystemMajorVersion;
+  Expect<Boolean>(RuntimeMajor >= 15).ToBe(True);
+  if RuntimeMajor >= 26 then
+    Expect<TRegistryDarwinTLSTransport>(
+      RegistryDarwinTLSTransportForMajorVersion(RuntimeMajor)).ToBe(
+        rdttNetworkFramework)
+  else
+    Expect<TRegistryDarwinTLSTransport>(
+      RegistryDarwinTLSTransportForMajorVersion(RuntimeMajor)).ToBe(
+        rdttSecureTransport);
+  {$ENDIF}
+end;
+
+procedure TRegistryStoreContract.TestDarwinListenerCapabilitySelection;
+begin
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
+    'localhost', 15)).ToBe(True);
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
+    '127.0.0.1', 15)).ToBe(True);
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
+    '::1', 15)).ToBe(False);
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
+    'registry.example.com', 15)).ToBe(False);
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
+    '::1', 26)).ToBe(True);
 end;
 
 constructor TReaderThread.Create(AStore: TLWPTRegistryStore);
@@ -891,14 +930,15 @@ begin
 end;
 
 procedure TRegistryStoreContract.TestUnsupportedListenerFamilyFailsDuringInitialization;
-{$IFNDEF DARWIN}
 var
   Config: TLWPTRegistryConfig;
   Diagnostic: string;
   Store: TLWPTRegistryStore;
-{$ENDIF}
 begin
-  {$IFNDEF DARWIN}
+  {$IFDEF DARWIN}
+  SetRegistryDarwinOperatingSystemMajorVersionForTesting(15);
+  {$ENDIF}
+  try
   Config := RegistryConfiguration('', 'https://[::1]:9417', '::1', 9417,
     ExpandFileName(FScratch + '/certificate.p12'), 'TLS_PASSWORD');
   Diagnostic := '';
@@ -924,9 +964,11 @@ begin
   Store.Free;
   Expect<Boolean>(Pos('invalid_listen_address:', Diagnostic) = 1).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/registry.toml')).ToBe(False);
-  {$ELSE}
-  Expect<Boolean>(True).ToBe(True);
-  {$ENDIF}
+  finally
+    {$IFDEF DARWIN}
+    SetRegistryDarwinOperatingSystemMajorVersionForTesting(0);
+    {$ENDIF}
+  end;
 end;
 
 procedure TRegistryStoreContract.TestSigningSeedIsPrivateFromCreation;
@@ -1639,8 +1681,10 @@ begin
     TestNetworkFrameworkCleanupFailureSemantics);
   Test('Darwin TLS transport selection follows product version',
     TestDarwinTLSTransportSelection);
-  Test('Darwin product version parsing is deterministic',
-    TestDarwinProductVersionParsing);
+  Test('Darwin structured product version query is deterministic',
+    TestDarwinStructuredOperatingSystemVersion);
+  Test('Darwin listener capability follows the runtime TLS transport',
+    TestDarwinListenerCapabilitySelection);
   Test('server errors conform to the wire contract',
     TestServerErrorsConformToWireContract);
   Test('renewal error does not disclose the store path',

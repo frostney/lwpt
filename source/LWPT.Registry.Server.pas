@@ -19,11 +19,6 @@ uses
   {$ENDIF}
 
 type
-  TRegistryDarwinTLSTransport = (
-    rdttSecureTransport,
-    rdttNetworkFramework
-  );
-
   TLWPTRegistryHTTPResponse = record
     Status: Integer;
     Reason: string;
@@ -62,20 +57,12 @@ function RegistryHTTPWireResponse(const AResponse: TLWPTRegistryHTTPResponse;
   const AIncludeBody: Boolean): TBytes;
 function OpenRegistryHTTPResource(const AResponse: TLWPTRegistryHTTPResponse;
   AProgress: TSHA256Progress = nil): TStream;
-function RegistryDarwinTLSTransportForMajorVersion(
-  const AMajorVersion: Cardinal): TRegistryDarwinTLSTransport;
 {$IFDEF REGISTRY_TESTING}
 function RegistryDeadlineTimeoutForTesting(const ADeadline,
   ANow: QWord): LongInt;
-function RegistryDarwinProductVersionMajorForTesting(
-  const AVersionString: string): Cardinal;
 {$ENDIF}
 
 implementation
-
-{$IFDEF DARWIN}
-{$linkframework Foundation}
-{$ENDIF}
 
 uses
   StrUtils,
@@ -97,74 +84,15 @@ const
   CLIENT_READ_TIMEOUT_MILLISECONDS = 10000;
   TLS_CIPHERTEXT_BUDGET_BYTES = 1024 * 1024;
   MAX_ACTIVE_CLIENTS = 32;
-  NETWORK_FRAMEWORK_REGISTRY_MINIMUM_MACOS_MAJOR = 26;
-
-{$IFDEF DARWIN}
-function ObjCGetClass(AName: PAnsiChar): Pointer; cdecl;
-  external name 'objc_getClass';
-function ObjCMessagePointer(AReceiver, ASelector: Pointer): Pointer; cdecl;
-  external name 'objc_msgSend';
-function ObjCRegisterSelector(AName: PAnsiChar): Pointer; cdecl;
-  external name 'sel_registerName';
-{$ENDIF}
 
 var
   RegistryRequestSequence: LongInt;
 
-function RegistryDarwinProductVersionMajor(
-  const AVersionString: string): Cardinal;
-var
-  Index, Start: Integer;
-begin
-  Index := 1;
-  while (Index <= Length(AVersionString))
-    and not (AVersionString[Index] in ['0'..'9']) do
-    Inc(Index);
-  Start := Index;
-  while (Index <= Length(AVersionString))
-    and (AVersionString[Index] in ['0'..'9']) do
-    Inc(Index);
-  if (Start > Length(AVersionString))
-    or not TryStrToDWord(Copy(AVersionString, Start, Index - Start), Result)
-    or (Result = 0) then
-    raise ELWPTRegistryError.CreateStable('tls_configuration',
-      'could not determine the macOS product version');
-end;
-
-function RegistryDarwinTLSTransportForMajorVersion(
-  const AMajorVersion: Cardinal): TRegistryDarwinTLSTransport;
-begin
-  if AMajorVersion >= NETWORK_FRAMEWORK_REGISTRY_MINIMUM_MACOS_MAJOR then
-    Result := rdttNetworkFramework
-  else
-    Result := rdttSecureTransport;
-end;
-
 {$IFDEF DARWIN}
 function CurrentRegistryDarwinTLSTransport: TRegistryDarwinTLSTransport;
-var
-  ProcessInfo, VersionString: Pointer;
-  UTF8Version: PAnsiChar;
 begin
-  ProcessInfo := ObjCMessagePointer(ObjCGetClass('NSProcessInfo'),
-    ObjCRegisterSelector('processInfo'));
-  VersionString := ObjCMessagePointer(ProcessInfo,
-    ObjCRegisterSelector('operatingSystemVersionString'));
-  UTF8Version := PAnsiChar(ObjCMessagePointer(VersionString,
-    ObjCRegisterSelector('UTF8String')));
-  if UTF8Version = nil then
-    raise ELWPTRegistryError.CreateStable('tls_configuration',
-      'could not determine the macOS product version');
   Result := RegistryDarwinTLSTransportForMajorVersion(
-    RegistryDarwinProductVersionMajor(string(UTF8Version)));
-end;
-{$ENDIF}
-
-{$IFDEF REGISTRY_TESTING}
-function RegistryDarwinProductVersionMajorForTesting(
-  const AVersionString: string): Cardinal;
-begin
-  Result := RegistryDarwinProductVersionMajor(AVersionString);
+    RegistryDarwinOperatingSystemMajorVersion);
 end;
 {$ENDIF}
 

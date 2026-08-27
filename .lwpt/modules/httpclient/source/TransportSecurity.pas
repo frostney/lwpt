@@ -179,6 +179,19 @@ function CloseTransportSecurityServerGracefully(
   var AConnection: TTransportSecurityConnection): TTransportSecurityState;
 procedure AbortTransportSecurityServer(
   var AConnection: TTransportSecurityConnection);
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+{$IFNDEF PRODUCTION}
+procedure TransportSecurityTestForceSecureTransportCleanupFailures(
+  const AKeychainDeleteStatus: LongInt; const AFileDeleteFailure: Boolean);
+procedure TransportSecurityTestForceSecureTransportNetworkFetchStatus(
+  const AStatus: LongInt);
+function TransportSecurityTestSecureTransportNetworkFetchWasDisabled: Boolean;
+function TransportSecurityTestInjectSecureTransportFatalStatus(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+function TransportSecurityTestInjectSecureTransportPeerClose(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+{$ENDIF}
+{$ENDIF}
 {$IFDEF TRANSPORT_SECURITY_OPENSSL}
 {$IFNDEF PRODUCTION}
 function TransportSecurityTestInjectSyscallError(
@@ -454,6 +467,16 @@ type
   TSecureTransportWriteFunc = function(AConnection: SSLConnectionRef;
     AData: Pointer; var ADataLength: PtrUInt): OSStatus; cdecl;
 
+  TSecureTransportServerSymbols = record
+    ArrayCallbacks: Pointer;
+    DictionaryKeyCallbacks: Pointer;
+    DictionaryValueCallbacks: Pointer;
+    ImportCertChainKey: Pointer;
+    ImportIdentityKey: Pointer;
+    ImportKeychainKey: Pointer;
+    ImportPassphraseKey: Pointer;
+  end;
+
 function SSLCreateContext(AAllocator: CFAllocatorRef;
   AProtocolSide: SSLProtocolSide;
   AConnectionType: SSLConnectionType): SSLContextRef; cdecl;
@@ -523,6 +546,9 @@ function SecTrustSetAnchorCertificates(ATrust, AAnchors: Pointer): OSStatus;
 function SecTrustSetAnchorCertificatesOnly(ATrust: Pointer;
   AAnchorCertificatesOnly: ByteBool): OSStatus; cdecl;
   external name 'SecTrustSetAnchorCertificatesOnly';
+function SecTrustSetNetworkFetchAllowed(ATrust: Pointer;
+  AAllowFetch: ByteBool): OSStatus; cdecl;
+  external name 'SecTrustSetNetworkFetchAllowed';
 function Dlsym(AHandle: Pointer; AName: PAnsiChar): Pointer; cdecl;
   external name 'dlsym';
 
@@ -534,19 +560,23 @@ const
   RTLD_DEFAULT = Pointer(-2);
 
 var
-  SecureTransportArrayCallbacks: Pointer;
-  SecureTransportDictionaryKeyCallbacks: Pointer;
-  SecureTransportDictionaryValueCallbacks: Pointer;
-  SecureTransportImportCertChainKey: Pointer;
-  SecureTransportImportIdentityKey: Pointer;
-  SecureTransportImportKeychainKey: Pointer;
-  SecureTransportImportPassphraseKey: Pointer;
+  SecureTransportServerSymbolLock: TRTLCriticalSection;
+  SecureTransportServerSymbols: TSecureTransportServerSymbols;
+  SecureTransportServerSymbolsReady: Boolean;
+  {$IFNDEF PRODUCTION}
+  SecureTransportTestCleanupKeychainStatus: OSStatus;
+  SecureTransportTestCleanupFileFailure: Boolean;
+  SecureTransportTestNetworkFetchStatus: OSStatus;
+  SecureTransportTestNetworkFetchCalled: Boolean;
+  {$ENDIF}
 
 procedure ResolveSecureTransportServerSymbols;
 var
-  Symbol: Pointer;
+  Resolved: TSecureTransportServerSymbols;
 
   function ResolveConstant(const AName: PAnsiChar): Pointer;
+  var
+    Symbol: Pointer;
   begin
     Symbol := Dlsym(RTLD_DEFAULT, AName);
     if Symbol = nil then
@@ -555,27 +585,34 @@ var
     Result := PPointer(Symbol)^;
   end;
 begin
-  if SecureTransportImportPassphraseKey <> nil then
-    Exit;
-  SecureTransportImportPassphraseKey := ResolveConstant(
-    'kSecImportExportPassphrase');
-  SecureTransportImportKeychainKey := ResolveConstant(
-    'kSecImportExportKeychain');
-  SecureTransportImportIdentityKey := ResolveConstant(
-    'kSecImportItemIdentity');
-  SecureTransportImportCertChainKey := ResolveConstant(
-    'kSecImportItemCertChain');
-  SecureTransportArrayCallbacks := Dlsym(RTLD_DEFAULT,
-    'kCFTypeArrayCallBacks');
-  SecureTransportDictionaryKeyCallbacks := Dlsym(RTLD_DEFAULT,
-    'kCFTypeDictionaryKeyCallBacks');
-  SecureTransportDictionaryValueCallbacks := Dlsym(RTLD_DEFAULT,
-    'kCFTypeDictionaryValueCallBacks');
-  if (SecureTransportArrayCallbacks = nil)
-    or (SecureTransportDictionaryKeyCallbacks = nil)
-    or (SecureTransportDictionaryValueCallbacks = nil) then
-    raise ETransportSecurityError.Create(
-      'CoreFoundation is missing required public collection callbacks');
+  EnterCriticalSection(SecureTransportServerSymbolLock);
+  try
+    if SecureTransportServerSymbolsReady then Exit;
+    FillChar(Resolved, SizeOf(Resolved), 0);
+    Resolved.ImportPassphraseKey := ResolveConstant(
+      'kSecImportExportPassphrase');
+    Resolved.ImportKeychainKey := ResolveConstant(
+      'kSecImportExportKeychain');
+    Resolved.ImportIdentityKey := ResolveConstant(
+      'kSecImportItemIdentity');
+    Resolved.ImportCertChainKey := ResolveConstant(
+      'kSecImportItemCertChain');
+    Resolved.ArrayCallbacks := Dlsym(RTLD_DEFAULT,
+      'kCFTypeArrayCallBacks');
+    Resolved.DictionaryKeyCallbacks := Dlsym(RTLD_DEFAULT,
+      'kCFTypeDictionaryKeyCallBacks');
+    Resolved.DictionaryValueCallbacks := Dlsym(RTLD_DEFAULT,
+      'kCFTypeDictionaryValueCallBacks');
+    if (Resolved.ArrayCallbacks = nil)
+      or (Resolved.DictionaryKeyCallbacks = nil)
+      or (Resolved.DictionaryValueCallbacks = nil) then
+      raise ETransportSecurityError.Create(
+        'CoreFoundation is missing required public collection callbacks');
+    SecureTransportServerSymbols := Resolved;
+    SecureTransportServerSymbolsReady := True;
+  finally
+    LeaveCriticalSection(SecureTransportServerSymbolLock);
+  end;
 end;
 
 constructor TSecureTransportServerSnapshot.Create;
@@ -589,26 +626,107 @@ begin
   InterlockedIncrement(References);
 end;
 
-procedure TSecureTransportServerSnapshot.Release;
+procedure HandleSecureTransportKeychainCleanupFailure(
+  const AMessage: string; const APrimaryExceptionActive: Boolean);
+begin
+  if AMessage = '' then Exit;
+  if APrimaryExceptionActive then
+  begin
+    try
+      WriteLn(StdErr,
+        'TLS cleanup: temporary Secure Transport keychain cleanup failed');
+    except
+      { Reporting is best-effort and must not replace the primary failure. }
+    end;
+    Exit;
+  end;
+  raise ETransportSecurityError.Create(AMessage);
+end;
+
+function DeleteSecureTransportKeychain(const AKeychain: Pointer): OSStatus;
+begin
+  {$IFNDEF PRODUCTION}
+  if SecureTransportTestCleanupKeychainStatus <> ERR_SEC_SUCCESS then
+    Exit(SecureTransportTestCleanupKeychainStatus);
+  {$ENDIF}
+  Result := SecKeychainDelete(AKeychain);
+end;
+
+function DeleteSecureTransportKeychainFile(const APath: string): Boolean;
+begin
+  Result := SysUtils.DeleteFile(APath);
+  {$IFNDEF PRODUCTION}
+  if SecureTransportTestCleanupFileFailure then Result := False;
+  {$ENDIF}
+end;
+
+procedure CleanupSecureTransportKeychain(var AKeychain: Pointer;
+  var APath: string; const APrimaryExceptionActive: Boolean);
 var
-  Path: string;
+  CleanupFailure: string;
+  DeleteStatus: OSStatus;
+  Status: BaseUnix.Stat;
+begin
+  CleanupFailure := '';
+  if AKeychain <> nil then
+  begin
+    DeleteStatus := DeleteSecureTransportKeychain(AKeychain);
+    CFRelease(AKeychain);
+    AKeychain := nil;
+    if DeleteStatus <> ERR_SEC_SUCCESS then
+      CleanupFailure := Format(
+        'Security.framework could not delete temporary TLS keychain storage: %d',
+        [DeleteStatus]);
+  end;
+  if APath <> '' then
+  begin
+    if FpLStat(PChar(APath), Status) = 0 then
+    begin
+      if ((Status.st_mode and S_IFMT) <> S_IFREG)
+        or (Status.st_uid <> FpGetUID) then
+      begin
+        if CleanupFailure = '' then
+          CleanupFailure :=
+            'Temporary TLS keychain storage changed ownership or type';
+      end
+      else if not DeleteSecureTransportKeychainFile(APath) then
+      begin
+        if CleanupFailure = '' then
+          CleanupFailure :=
+            'Failed to remove temporary TLS keychain storage';
+      end;
+    end
+    else if FpGetErrNo <> ESysENOENT then
+      if CleanupFailure = '' then
+        CleanupFailure :=
+          'Failed to inspect temporary TLS keychain storage';
+    if (FpLStat(PChar(APath), Status) = 0)
+      or (FpGetErrNo <> ESysENOENT) then
+    begin
+      if CleanupFailure = '' then
+        CleanupFailure :=
+          'Temporary TLS keychain storage survived cleanup';
+    end
+    else
+      APath := '';
+  end;
+  HandleSecureTransportKeychainCleanupFailure(CleanupFailure,
+    APrimaryExceptionActive);
+end;
+
+procedure TSecureTransportServerSnapshot.Release;
 begin
   if InterlockedDecrement(References) <> 0 then
     Exit;
   if CertificateArray <> nil then
     CFRelease(CertificateArray);
   CertificateArray := nil;
-  if Keychain <> nil then
-  begin
-    SecKeychainDelete(Keychain);
-    CFRelease(Keychain);
+  try
+    CleanupSecureTransportKeychain(Keychain, KeychainPath,
+      ExceptObject <> nil);
+  finally
+    Free;
   end;
-  Keychain := nil;
-  Path := KeychainPath;
-  KeychainPath := '';
-  if (Path <> '') and FileExists(Path) then
-    SysUtils.DeleteFile(Path);
-  Free;
 end;
 
 function SecureTransportRandomHex: AnsiString;
@@ -722,13 +840,22 @@ begin
       'Configured TLS identity must contain a non-self-signed certificate chain');
   Anchor := CFArrayGetValueAtIndex(AChain, CFArrayGetCount(AChain) - 1);
   Anchors := CFArrayCreate(nil, @Anchor, 1,
-    SecureTransportArrayCallbacks);
+    SecureTransportServerSymbols.ArrayCallbacks);
   Policy := SecPolicyCreateSSL(True, nil);
   Trust := nil;
   ErrorReference := nil;
   try
     Status := SecTrustCreateWithCertificates(AChain, Policy, Trust);
-    if (Status <> ERR_SEC_SUCCESS) or (Trust = nil)
+    if (Status <> ERR_SEC_SUCCESS) or (Trust = nil) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS identity does not form a valid bundled server chain');
+    Status := SecTrustSetNetworkFetchAllowed(Trust, False);
+    {$IFNDEF PRODUCTION}
+    SecureTransportTestNetworkFetchCalled := True;
+    if SecureTransportTestNetworkFetchStatus <> ERR_SEC_SUCCESS then
+      Status := SecureTransportTestNetworkFetchStatus;
+    {$ENDIF}
+    if (Status <> ERR_SEC_SUCCESS)
       or (SecTrustSetAnchorCertificates(Trust, Anchors) <> ERR_SEC_SUCCESS)
       or (SecTrustSetAnchorCertificatesOnly(Trust, True)
         <> ERR_SEC_SUCCESS)
@@ -757,7 +884,8 @@ var
     Items, Keychain: Pointer;
   CertificateCount, Index: NativeInt;
   CertificateValues: array of Pointer;
-  EncodedPassphrase, KeychainPassphrase, KeychainPath: AnsiString;
+  EncodedKeychainPath, EncodedPassphrase, KeychainPassphrase: AnsiString;
+  KeychainPath: string;
   IdentityBytes: TBytes;
   Keys, Values: array[0..1] of Pointer;
   Status: OSStatus;
@@ -780,6 +908,7 @@ begin
   Identity := nil;
   Items := nil;
   Keychain := nil;
+  EncodedKeychainPath := '';
   EncodedPassphrase := '';
   KeychainPassphrase := '';
   KeychainPath := '';
@@ -787,20 +916,21 @@ begin
   Move(APkcs12Identity[0], IdentityBytes[0], Length(IdentityBytes));
   try
     ReconcileAbandonedSecureTransportKeychains;
-    KeychainPath := AnsiString(IncludeTrailingPathDelimiter(GetTempDir)
+    KeychainPath := IncludeTrailingPathDelimiter(GetTempDir)
       + SECURE_TRANSPORT_KEYCHAIN_PREFIX + IntToStr(GetProcessID) + '-'
-      + string(SecureTransportRandomHex) + '.keychain');
-    if FileExists(string(KeychainPath)) then
+      + string(SecureTransportRandomHex) + '.keychain';
+    if FileExists(KeychainPath) then
       raise ETransportSecurityError.Create(
         'Temporary TLS keychain path already exists');
+    EncodedKeychainPath := AnsiString(KeychainPath);
     KeychainPassphrase := SecureTransportRandomHex;
-    Status := SecKeychainCreate(PAnsiChar(KeychainPath),
+    Status := SecKeychainCreate(PAnsiChar(EncodedKeychainPath),
       Length(KeychainPassphrase), PAnsiChar(KeychainPassphrase), False, nil,
       Keychain);
     if Status <> ERR_SEC_SUCCESS then
       raise ETransportSecurityError.CreateFmt(
         'Failed to create temporary TLS keychain: %d', [Status]);
-    if FpChmod(PChar(string(KeychainPath)), S_IRUSR or S_IWUSR) <> 0 then
+    if FpChmod(PChar(KeychainPath), S_IRUSR or S_IWUSR) <> 0 then
       raise ETransportSecurityError.Create(
         'Failed to restrict temporary TLS keychain storage');
     CFData := CFDataCreate(nil, @IdentityBytes[0], Length(IdentityBytes));
@@ -813,13 +943,13 @@ begin
     if CFPassphrase = nil then
       raise ETransportSecurityError.Create(
         'Failed to encode configured TLS PKCS#12 passphrase');
-    Keys[0] := SecureTransportImportPassphraseKey;
+    Keys[0] := SecureTransportServerSymbols.ImportPassphraseKey;
     Values[0] := CFPassphrase;
-    Keys[1] := SecureTransportImportKeychainKey;
+    Keys[1] := SecureTransportServerSymbols.ImportKeychainKey;
     Values[1] := Keychain;
     CFOptions := CFDictionaryCreate(nil, @Keys[0], @Values[0], 2,
-      SecureTransportDictionaryKeyCallbacks,
-      SecureTransportDictionaryValueCallbacks);
+      SecureTransportServerSymbols.DictionaryKeyCallbacks,
+      SecureTransportServerSymbols.DictionaryValueCallbacks);
     if CFOptions = nil then
       raise ETransportSecurityError.Create(
         'Failed to prepare configured TLS PKCS#12 import');
@@ -830,9 +960,9 @@ begin
         'Failed to parse configured TLS PKCS#12 identity; verify the bundle and passphrase');
     Item := CFArrayGetValueAtIndex(Items, 0);
     CertificateChain := CFDictionaryGetValue(Item,
-      SecureTransportImportCertChainKey);
+      SecureTransportServerSymbols.ImportCertChainKey);
     Identity := CFDictionaryGetValue(Item,
-      SecureTransportImportIdentityKey);
+      SecureTransportServerSymbols.ImportIdentityKey);
     if (Identity = nil) or (CertificateChain = nil)
       or (CFArrayGetCount(CertificateChain) = 0) then
       raise ETransportSecurityError.Create(
@@ -847,7 +977,7 @@ begin
         Index);
     Result := TSecureTransportServerSnapshot.Create;
     Result.CertificateArray := CFArrayCreate(nil, @CertificateValues[0],
-      Length(CertificateValues), SecureTransportArrayCallbacks);
+      Length(CertificateValues), SecureTransportServerSymbols.ArrayCallbacks);
     if Result.CertificateArray = nil then
     begin
       Result.Free;
@@ -857,7 +987,7 @@ begin
     end;
     Result.Keychain := Keychain;
     Keychain := nil;
-    Result.KeychainPath := string(KeychainPath);
+    Result.KeychainPath := KeychainPath;
     KeychainPath := '';
   finally
     if Length(IdentityBytes) > 0 then
@@ -869,6 +999,7 @@ begin
     if Length(KeychainPassphrase) > 0 then
       FillChar(KeychainPassphrase[1], Length(KeychainPassphrase), 0);
     KeychainPassphrase := '';
+    EncodedKeychainPath := '';
     if Items <> nil then
       CFRelease(Items);
     if CFOptions <> nil then
@@ -877,13 +1008,8 @@ begin
       CFRelease(CFPassphrase);
     if CFData <> nil then
       CFRelease(CFData);
-    if Keychain <> nil then
-    begin
-      SecKeychainDelete(Keychain);
-      CFRelease(Keychain);
-    end;
-    if (KeychainPath <> '') and FileExists(string(KeychainPath)) then
-      SysUtils.DeleteFile(string(KeychainPath));
+    CleanupSecureTransportKeychain(Keychain, KeychainPath,
+      ExceptObject <> nil);
   end;
 end;
 
@@ -1304,21 +1430,26 @@ begin
   Data := SecureTransportServerData(AConnection);
   if not Assigned(Data) then
     Exit(tssError);
+  if AStatus = ERR_SSL_CLOSED_GRACEFUL then
+  begin
+    PoisonSecureTransportServerConnection(AConnection);
+    if APeerCloseIsSuccess then
+      Result := tssPeerClosed
+    else
+      Result := tssError;
+    Exit;
+  end;
+  if (AStatus <> ERR_SEC_SUCCESS) and (AStatus <> ERR_SSL_WOULD_BLOCK) then
+  begin
+    PoisonSecureTransportServerConnection(AConnection);
+    Exit(tssError);
+  end;
   if SecureTransportServerPendingCiphertext(Data) > 0 then
     Exit(tssWantWrite);
   case AStatus of
     ERR_SEC_SUCCESS: Result := tssDone;
     ERR_SSL_WOULD_BLOCK: Result := tssWantRead;
-    ERR_SSL_CLOSED_GRACEFUL:
-      if APeerCloseIsSuccess then
-        Result := tssPeerClosed
-      else
-      begin
-        PoisonSecureTransportServerConnection(AConnection);
-        Result := tssError;
-      end;
   else
-    PoisonSecureTransportServerConnection(AConnection);
     Result := tssError;
   end;
 end;
@@ -6159,14 +6290,18 @@ end;
 
 destructor TTransportSecurityServerContext.Destroy;
 begin
-  if FCriticalSectionInitialized then
-  begin
-    ReplaceSnapshot(nil);
-    DoneCriticalSection(FCriticalSection);
-    FCriticalSectionInitialized := False;
+  try
+    if FCriticalSectionInitialized then
+      try
+        ReplaceSnapshot(nil);
+      finally
+        DoneCriticalSection(FCriticalSection);
+        FCriticalSectionInitialized := False;
+      end;
+    FBackendData := nil;
+  finally
+    inherited Destroy;
   end;
-  FBackendData := nil;
-  inherited Destroy;
 end;
 
 procedure TTransportSecurityServerContext.Reload(
@@ -6619,6 +6754,43 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+{$IFNDEF PRODUCTION}
+procedure TransportSecurityTestForceSecureTransportCleanupFailures(
+  const AKeychainDeleteStatus: LongInt; const AFileDeleteFailure: Boolean);
+begin
+  SecureTransportTestCleanupKeychainStatus := AKeychainDeleteStatus;
+  SecureTransportTestCleanupFileFailure := AFileDeleteFailure;
+end;
+
+procedure TransportSecurityTestForceSecureTransportNetworkFetchStatus(
+  const AStatus: LongInt);
+begin
+  SecureTransportTestNetworkFetchStatus := AStatus;
+  SecureTransportTestNetworkFetchCalled := False;
+end;
+
+function TransportSecurityTestSecureTransportNetworkFetchWasDisabled: Boolean;
+begin
+  Result := SecureTransportTestNetworkFetchCalled;
+end;
+
+function TransportSecurityTestInjectSecureTransportFatalStatus(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+begin
+  Result := SecureTransportServerState(AConnection, ERR_SSL_CLOSED_ABORT,
+    False);
+end;
+
+function TransportSecurityTestInjectSecureTransportPeerClose(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+begin
+  Result := SecureTransportServerState(AConnection,
+    ERR_SSL_CLOSED_GRACEFUL, True);
+end;
+{$ENDIF}
+{$ENDIF}
+
 {$IFDEF TRANSPORT_SECURITY_OPENSSL}
 {$IFNDEF PRODUCTION}
 function TransportSecurityTestInjectSyscallError(
@@ -6779,5 +6951,15 @@ begin
     Result := 0;
   end;
 end;
+
+initialization
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  InitCriticalSection(SecureTransportServerSymbolLock);
+  {$ENDIF}
+
+finalization
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  DoneCriticalSection(SecureTransportServerSymbolLock);
+  {$ENDIF}
 
 end.

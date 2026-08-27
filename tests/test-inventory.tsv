@@ -12,7 +12,7 @@ program	*	packages/cli/source/CLI.Parser.Test.pas	1	9
 program	*	packages/cli/source/CLI.Subcommands.Test.pas	1	8
 program	*	packages/httpclient/source/HTTPClient.Test.pas	4	35
 program	windows/*	packages/httpclient/source/HTTPClient.Test.pas	4	33
-program	*	packages/httpclient/source/TransportSecurity.Test.pas	1	39
+program	*	packages/httpclient/source/TransportSecurity.Test.pas	1	42
 program	*	packages/httpclient/tests/e2e/TransportSecuritySocket.E2E.Test.pas	0	0
 program	linux/*	packages/httpclient/tests/e2e/TransportSecuritySocket.E2E.Test.pas	1	3
 program	*	packages/semver/source/Semver.Test.pas	3	15
@@ -48,7 +48,7 @@ program	*	source/LWPT.Observability.Test.pas	1	6
 program	*	source/LWPT.ObjectStore.Test.pas	1	14
 program	unix/*	source/LWPT.ObjectStore.Test.pas	1	15
 program	*	source/LWPT.Registry.Crypto.Test.pas	1	6
-program	*	source/LWPT.Registry.Store.Test.pas	1	37
+program	*	source/LWPT.Registry.Store.Test.pas	1	38
 program	*	source/LWPT.OutputRenderer.Test.pas	1	1
 program	*	source/LWPT.ProducerLease.Test.pas	1	6
 program	unix/*	source/LWPT.ProducerLease.Test.pas	1	7

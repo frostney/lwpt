@@ -131,7 +131,9 @@ HTTPS uses the repository's native server policy:
 
 The registry selects these Darwin transports from the runtime macOS product-
 version major: 26 and newer selects Network.framework; 15 and older selects
-Secure Transport. CPU architecture does not influence the decision.
+Secure Transport. The query uses the structured public
+`NSProcessInfo.operatingSystemVersion` value, not a localized display string.
+CPU architecture does not influence the decision.
 
 The portable socket listeners on Windows, Unix other than Darwin, and macOS
 15 and older accept
