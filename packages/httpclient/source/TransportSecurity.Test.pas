@@ -115,7 +115,7 @@ type
     procedure TestDarwinSecureTransportCleanupFailures;
     procedure TestDarwinSecureTransportNetworkFetchDisabled;
     procedure TestDarwinSecureTransportServerLifecycle;
-    procedure TestDarwinSecureTransportReplacementRacesPreserveFiles;
+    procedure TestDarwinSecureTransportReplacementRacesNeverUnlinkReplacements;
     procedure TestDarwinSecureTransportRoundTrip;
     procedure TestDarwinSecureTransportWriteWantRetryRetainsPlaintext;
     procedure TestEmptyAndUTF8Passphrases;
@@ -2145,8 +2145,6 @@ end;
 
 procedure TTransportSecurityServerTests.TestDarwinSecureTransportCleanupFailures;
 {$IFDEF DARWIN}
-const
-  TEST_CLEANUP_STATUS = -50;
 var
   CleanupOnlyRaised, PrimaryPreserved: Boolean;
   Context: TTransportSecurityServerContext;
@@ -2156,8 +2154,7 @@ begin
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   CleanupOnlyRaised := False;
-  TransportSecurityTestForceSecureTransportCleanupFailures(
-    TEST_CLEANUP_STATUS, True);
+  TransportSecurityTestForceSecureTransportCleanupFileFailure(True);
   try
     try
       CloseTransportSecurityServerContext(Context);
@@ -2171,13 +2168,12 @@ begin
     end;
   finally
     Context := nil;
-    TransportSecurityTestForceSecureTransportCleanupFailures(0, False);
+    TransportSecurityTestForceSecureTransportCleanupFileFailure(False);
   end;
   Expect<Boolean>(CleanupOnlyRaised).ToBe(True);
 
   PrimaryPreserved := False;
-  TransportSecurityTestForceSecureTransportCleanupFailures(
-    TEST_CLEANUP_STATUS, True);
+  TransportSecurityTestForceSecureTransportCleanupFileFailure(True);
   try
     try
       Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
@@ -2189,7 +2185,7 @@ begin
     end;
   finally
     Context := nil;
-    TransportSecurityTestForceSecureTransportCleanupFailures(0, False);
+    TransportSecurityTestForceSecureTransportCleanupFileFailure(False);
   end;
   Expect<Boolean>(PrimaryPreserved).ToBe(True);
   {$ENDIF}
@@ -2306,14 +2302,14 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.
-  TestDarwinSecureTransportReplacementRacesPreserveFiles;
+  TestDarwinSecureTransportReplacementRacesNeverUnlinkReplacements;
 {$IFDEF DARWIN}
 const
-  TEST_CLEANUP_STATUS = -50;
   TEST_DEAD_OWNER_PID = 2147483647;
 var
   Context: TTransportSecurityServerContext;
   FailedClosed: Boolean;
+  ImportRaceStage: Integer;
   OriginalPath, PreservedPath, StalePath: string;
 {$ENDIF}
 begin
@@ -2323,8 +2319,7 @@ begin
   FailedClosed := False;
   OriginalPath := '';
   PreservedPath := '';
-  TransportSecurityTestForceSecureTransportCleanupFailures(
-    TEST_CLEANUP_STATUS, False);
+  TransportSecurityTestForceSecureTransportCleanupFileFailure(False);
   TransportSecurityTestForceSecureTransportReplacementRace(True, False);
   try
     try
@@ -2340,11 +2335,11 @@ begin
       PreservedPath);
     Expect<Boolean>(FailedClosed).ToBe(True);
     Expect<Boolean>(FileExists(OriginalPath)).ToBe(True);
-    Expect<Boolean>(FileExists(PreservedPath)).ToBe(True);
+    Expect<Boolean>(FileExists(PreservedPath)).ToBe(False);
   finally
     Context := nil;
     TransportSecurityTestForceSecureTransportReplacementRace(False, False);
-    TransportSecurityTestForceSecureTransportCleanupFailures(0, False);
+    TransportSecurityTestForceSecureTransportCleanupFileFailure(False);
     SysUtils.DeleteFile(OriginalPath);
     SysUtils.DeleteFile(PreservedPath);
   end;
@@ -2375,6 +2370,72 @@ begin
   finally
     CloseTransportSecurityServerContext(Context);
     TransportSecurityTestForceSecureTransportReplacementRace(False, False);
+    TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(0);
+    SysUtils.DeleteFile(OriginalPath);
+    SysUtils.DeleteFile(PreservedPath);
+    SysUtils.DeleteFile(StalePath);
+  end;
+
+  for ImportRaceStage := 0 to 1 do
+  begin
+    Context := nil;
+    FailedClosed := False;
+    OriginalPath := '';
+    PreservedPath := '';
+    TransportSecurityTestForceSecureTransportImportReplacementRace(
+      ImportRaceStage = 0, ImportRaceStage = 1);
+    try
+      try
+        Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+          PKCS12_PASSPHRASE);
+      except
+        on E: ETransportSecurityError do
+          FailedClosed := E.Message =
+            'Temporary TLS keychain storage changed identity during import';
+      end;
+      TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+        PreservedPath);
+      Expect<Boolean>(FailedClosed).ToBe(True);
+      Expect<Boolean>(FileExists(OriginalPath)).ToBe(True);
+      Expect<Boolean>(FileExists(PreservedPath)).ToBe(False);
+    finally
+      CloseTransportSecurityServerContext(Context);
+      TransportSecurityTestForceSecureTransportImportReplacementRace(False,
+        False);
+      SysUtils.DeleteFile(OriginalPath);
+      SysUtils.DeleteFile(PreservedPath);
+    end;
+  end;
+
+  StalePath := IncludeTrailingPathDelimiter(GetTempDir)
+    + 'secure-transport-server-' + IntToStr(TEST_DEAD_OWNER_PID)
+    + '-00000000000000000000000000000002.keychain';
+  SysUtils.DeleteFile(StalePath);
+  CreateExclusiveDarwinTestFile(StalePath);
+  Context := nil;
+  FailedClosed := False;
+  OriginalPath := '';
+  PreservedPath := '';
+  TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
+    TEST_DEAD_OWNER_PID);
+  TransportSecurityTestForceSecureTransportFinalUnlinkReplacementRace(True);
+  try
+    try
+      Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+        PKCS12_PASSPHRASE);
+    except
+      on E: ETransportSecurityError do
+        FailedClosed := True;
+    end;
+    TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+      PreservedPath);
+    Expect<Boolean>(FailedClosed).ToBe(True);
+    Expect<Boolean>(FileExists(OriginalPath)).ToBe(True);
+    Expect<Boolean>(FileExists(PreservedPath)).ToBe(False);
+  finally
+    CloseTransportSecurityServerContext(Context);
+    TransportSecurityTestForceSecureTransportFinalUnlinkReplacementRace(
+      False);
     TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(0);
     SysUtils.DeleteFile(OriginalPath);
     SysUtils.DeleteFile(PreservedPath);
@@ -4802,8 +4863,8 @@ begin
     TestDarwinSecureTransportNetworkFetchDisabled);
   Test('Darwin Secure Transport server begins and aborts cleanly',
     TestDarwinSecureTransportServerLifecycle);
-  Test('Darwin Secure Transport replacement races preserve both files',
-    TestDarwinSecureTransportReplacementRacesPreserveFiles);
+  Test('Darwin Secure Transport replacement races never unlink replacements',
+    TestDarwinSecureTransportReplacementRacesNeverUnlinkReplacements);
   Test('Darwin Secure Transport handshake and IO round-trip in memory',
     TestDarwinSecureTransportRoundTrip);
   Test('Darwin Secure Transport write retry retains caller plaintext',
@@ -4907,8 +4968,8 @@ begin
   FServerBackendAvailable := TransportSecurityServerBackendAvailable;
   Skip('Darwin Secure Transport server begins and aborts cleanly',
     TestDarwinSecureTransportServerLifecycle, 'Darwin-only behavior');
-  Skip('Darwin Secure Transport replacement races preserve both files',
-    TestDarwinSecureTransportReplacementRacesPreserveFiles,
+  Skip('Darwin Secure Transport replacement races never unlink replacements',
+    TestDarwinSecureTransportReplacementRacesNeverUnlinkReplacements,
     'Darwin-only behavior');
   Skip('Darwin Secure Transport handshake and IO round-trip in memory',
     TestDarwinSecureTransportRoundTrip, 'Darwin-only behavior');
