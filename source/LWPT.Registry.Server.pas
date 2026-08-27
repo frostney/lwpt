@@ -805,7 +805,10 @@ begin
   RegistryTestPlainSendMaximum := AMaximumSend;
   RegistryTestPlainSendTime := AStartTime;
   try
-    SendResourcePlain(-1, AStream, ADeadline);
+    { The testing seam intercepts every send before the socket is observed.
+      Zero is an unused portable TSocket value; unlike -1 it also fits the
+      unsigned Windows socket type. }
+    SendResourcePlain(0, AStream, ADeadline);
     Result := RegistryTestPlainSendCalls;
   finally
     RegistryTestPlainSendActive := False;
