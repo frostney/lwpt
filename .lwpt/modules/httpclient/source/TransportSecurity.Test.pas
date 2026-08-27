@@ -2307,6 +2307,7 @@ procedure TTransportSecurityServerTests.
 const
   TEST_DEAD_OWNER_PID = 2147483647;
 var
+  ABARaceStage: Integer;
   Context: TTransportSecurityServerContext;
   FailedClosed: Boolean;
   ImportRaceStage: Integer;
@@ -2376,22 +2377,53 @@ begin
     SysUtils.DeleteFile(StalePath);
   end;
 
-  for ImportRaceStage := 0 to 1 do
+  for ImportRaceStage := 0 to 2 do
   begin
     Context := nil;
     FailedClosed := False;
     OriginalPath := '';
     PreservedPath := '';
     TransportSecurityTestForceSecureTransportImportReplacementRace(
-      ImportRaceStage = 0, ImportRaceStage = 1);
+      ImportRaceStage = 0, ImportRaceStage = 1, ImportRaceStage = 2);
     try
       try
         Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
           PKCS12_PASSPHRASE);
       except
         on E: ETransportSecurityError do
+        begin
           FailedClosed := E.Message =
             'Temporary TLS keychain storage changed identity during import';
+        end;
+      end;
+      TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+        PreservedPath);
+      Expect<Boolean>(FailedClosed).ToBe(True);
+      Expect<Boolean>(FileExists(OriginalPath)).ToBe(True);
+      Expect<Boolean>(FileExists(PreservedPath)).ToBe(True);
+    finally
+      CloseTransportSecurityServerContext(Context);
+      TransportSecurityTestForceSecureTransportImportReplacementRace(False,
+        False, False);
+      SysUtils.DeleteFile(OriginalPath);
+      SysUtils.DeleteFile(PreservedPath);
+    end;
+  end;
+
+  for ABARaceStage := 0 to 1 do
+  begin
+    Context := nil;
+    FailedClosed := False;
+    OriginalPath := '';
+    PreservedPath := '';
+    TransportSecurityTestForceSecureTransportBindABARace(True,
+      ABARaceStage);
+    try
+      try
+        Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+          PKCS12_PASSPHRASE);
+      except
+        on E: ETransportSecurityError do FailedClosed := True;
       end;
       TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
         PreservedPath);
@@ -2400,11 +2432,44 @@ begin
       Expect<Boolean>(FileExists(PreservedPath)).ToBe(False);
     finally
       CloseTransportSecurityServerContext(Context);
-      TransportSecurityTestForceSecureTransportImportReplacementRace(False,
-        False);
+      TransportSecurityTestForceSecureTransportBindABARace(False, 0);
       SysUtils.DeleteFile(OriginalPath);
       SysUtils.DeleteFile(PreservedPath);
     end;
+  end;
+
+  StalePath := IncludeTrailingPathDelimiter(GetTempDir)
+    + 'secure-transport-server-' + IntToStr(TEST_DEAD_OWNER_PID)
+    + '-00000000000000000000000000000003.keychain';
+  SysUtils.DeleteFile(StalePath);
+  CreateExclusiveDarwinTestFile(StalePath);
+  Context := nil;
+  FailedClosed := False;
+  OriginalPath := '';
+  PreservedPath := '';
+  TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
+    TEST_DEAD_OWNER_PID);
+  TransportSecurityTestForceSecureTransportBindABARace(True, 0);
+  try
+    try
+      Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+        PKCS12_PASSPHRASE);
+    except
+      on E: ETransportSecurityError do FailedClosed := True;
+    end;
+    TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+      PreservedPath);
+    Expect<Boolean>(FailedClosed).ToBe(True);
+    Expect<Boolean>(FileExists(StalePath)).ToBe(True);
+    Expect<Boolean>(OriginalPath <> '').ToBe(True);
+    Expect<Boolean>(FileExists(PreservedPath)).ToBe(False);
+  finally
+    CloseTransportSecurityServerContext(Context);
+    TransportSecurityTestForceSecureTransportBindABARace(False, 0);
+    TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(0);
+    SysUtils.DeleteFile(OriginalPath);
+    SysUtils.DeleteFile(PreservedPath);
+    SysUtils.DeleteFile(StalePath);
   end;
 
   StalePath := IncludeTrailingPathDelimiter(GetTempDir)

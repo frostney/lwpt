@@ -124,14 +124,18 @@ HTTPS uses the repository's native server policy:
   package's public Secure Transport server backend. Its PKCS#12 import uses an
   isolated temporary keychain without changing the default keychain or search
   list. Because Security.framework legitimately replaces the file while
-  importing, post-import ownership is established by a stable `lstat`, public
-  `SecKeychainOpen`, `CFEqual` with the original keychain reference, and a
-  second matching `lstat`. Ordinary teardown uses the resulting public
+  importing and caches `SecKeychainOpen` references by path, neither inode
+  continuity nor `CFEqual` proves which post-import object occupies that path.
+  The backend instead writes a bounded CSPRNG-derived marker into the explicit
+  isolated keychain, moves the candidate to an unpredictable same-directory
+  quarantine, reopens only that path, and requires the marker there before
+  publishing its identity. Ordinary teardown uses the resulting public
   CoreServices `FSRef` with `FSUnlinkObject`, which removes that object even if
   its pathname is replaced. Scan-capped recovery atomically moves a candidate
-  to an unpredictable same-directory quarantine, validates its device, inode,
-  owner, and file type, binds an `FSRef`, revalidates, and unlinks only that
-  object. Pathname replacements are preserved and fail closed. Recovery also
+  to a separate unpredictable quarantine, validates its device, inode, owner,
+  and file type, binds an `FSRef`, validates the reference's resolved object,
+  and unlinks only that object. Pathname replacements are preserved and fail
+  closed. Recovery also
   requires that the residue's owner PID is definitely dead. The feed/drain
   connection contract keeps parsing, routing, resources, deadlines, and
   shutdown in the same registry implementation used on other platforms.

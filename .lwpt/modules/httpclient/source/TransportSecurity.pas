@@ -190,7 +190,9 @@ procedure TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
 procedure TransportSecurityTestForceSecureTransportReplacementRace(
   const AOrdinaryCleanup, ARecovery: Boolean);
 procedure TransportSecurityTestForceSecureTransportImportReplacementRace(
-  const ABeforeOpen, AAfterEquality: Boolean);
+  const ABeforeValidation, ABeforeOpen, AAfterMarkerLookup: Boolean);
+procedure TransportSecurityTestForceSecureTransportBindABARace(
+  const AEnabled: Boolean; const ACallsToSkip: LongInt);
 procedure TransportSecurityTestForceSecureTransportFinalUnlinkReplacementRace(
   const AEnabled: Boolean);
 procedure TransportSecurityTestSecureTransportReplacementRacePaths(
@@ -531,8 +533,6 @@ function SSLWrite(AContext: SSLContextRef; AData: Pointer;
 function SSLClose(AContext: SSLContextRef): OSStatus; cdecl;
   external name 'SSLClose';
 procedure CFRelease(ARef: Pointer); cdecl; external name 'CFRelease';
-function CFEqual(AFirst, ASecond: Pointer): ByteBool; cdecl;
-  external name 'CFEqual';
 function CFArrayCreate(AAllocator, AValues: Pointer; ACount: NativeInt;
   ACallbacks: Pointer): Pointer; cdecl; external name 'CFArrayCreate';
 function CFArrayGetCount(AArray: Pointer): NativeInt; cdecl;
@@ -554,6 +554,18 @@ function SecKeychainCreate(APath: PAnsiChar; APassphraseLength: UInt32;
   out AKeychain: Pointer): OSStatus; cdecl; external name 'SecKeychainCreate';
 function SecKeychainOpen(APath: PAnsiChar; out AKeychain: Pointer): OSStatus;
   cdecl; external name 'SecKeychainOpen';
+function SecKeychainAddGenericPassword(AKeychain: Pointer;
+  AServiceNameLength: UInt32; AServiceName: PAnsiChar;
+  AAccountNameLength: UInt32; AAccountName: PAnsiChar;
+  APasswordLength: UInt32; APasswordData: Pointer;
+  AItem: PPointer): OSStatus; cdecl;
+  external name 'SecKeychainAddGenericPassword';
+function SecKeychainFindGenericPassword(AKeychainOrArray: Pointer;
+  AServiceNameLength: UInt32; AServiceName: PAnsiChar;
+  AAccountNameLength: UInt32; AAccountName: PAnsiChar;
+  APasswordLength: PUInt32; APasswordData: PPointer;
+  out AItem: Pointer): OSStatus; cdecl;
+  external name 'SecKeychainFindGenericPassword';
 function SecPKCS12Import(AData, AOptions: Pointer;
   AItems: PPointer): OSStatus; cdecl; external name 'SecPKCS12Import';
 function SecPolicyCreateSSL(AServer: ByteBool; AHostname: Pointer): Pointer;
@@ -582,6 +594,10 @@ function RenameAtXNP(AFromFD: LongInt; AFromPath: PAnsiChar;
 function FSPathMakeRefWithOptions(APath: PByte; AOptions: UInt32;
   ARef: Pointer; AIsDirectory: PByte): OSStatus; cdecl;
   external name 'FSPathMakeRefWithOptions';
+function FSRefMakePath(const ARef: Pointer; APath: PByte;
+  APathBufferSize: UInt32): OSStatus; cdecl; external name 'FSRefMakePath';
+function FSCompareFSRefs(const AFirst, ASecond: Pointer): SmallInt; cdecl;
+  external name 'FSCompareFSRefs';
 function FSUnlinkObject(const ARef: Pointer): SmallInt; cdecl;
   external name 'FSUnlinkObject';
 
@@ -594,6 +610,7 @@ const
   SECURE_TRANSPORT_RENAME_EXCLUSIVE = $00000004;
   SECURE_TRANSPORT_CURRENT_WORKING_DIRECTORY_FD = -2;
   SECURE_TRANSPORT_FSREF_NOFOLLOW = $00000001;
+  SECURE_TRANSPORT_FSREF_PATH_CAPACITY = 4096;
   RTLD_DEFAULT = Pointer(-2);
 
 var
@@ -607,8 +624,11 @@ var
   SecureTransportTestRecoveryDeadOwnerPID: LongInt;
   SecureTransportTestOrdinaryReplacementRace: Boolean;
   SecureTransportTestRecoveryReplacementRace: Boolean;
+  SecureTransportTestImportReplacementRaceBeforeValidation: Boolean;
   SecureTransportTestImportReplacementRaceBeforeOpen: Boolean;
-  SecureTransportTestImportReplacementRaceAfterEquality: Boolean;
+  SecureTransportTestImportReplacementRaceAfterMarkerLookup: Boolean;
+  SecureTransportTestBindABARace: Boolean;
+  SecureTransportTestBindABACallsToSkip: LongInt;
   SecureTransportTestFinalUnlinkReplacementRace: Boolean;
   SecureTransportTestReplacementOriginalPath: string;
   SecureTransportTestReplacementPreservedPath: string;
@@ -774,68 +794,167 @@ begin
   SecureTransportTestReplacementOriginalPath := APath;
   SecureTransportTestReplacementPreservedPath := PreservedPath;
 end;
+
+procedure InjectSecureTransportBindABARaceBeforeCapture(const APath: string);
+begin
+  InjectSecureTransportReplacementRace(APath);
+end;
+
+procedure RestoreSecureTransportBindABARaceAfterCapture(const APath: string);
+var
+  PreservedPath: string;
+begin
+  PreservedPath := SecureTransportTestReplacementPreservedPath;
+  if (PreservedPath = '') or not SysUtils.DeleteFile(APath)
+    or not RenameSecureTransportFileExclusive(PreservedPath, APath) then
+    raise ETransportSecurityError.Create(
+      'Could not restore temporary TLS keychain bind-ABA fixture');
+end;
 {$ENDIF}
+
+function SecureTransportFileReferenceIdentityMatches(
+  const AFileReference: TSecureTransportFSRef;
+  const AExpectedDevice, AExpectedInode: QWord): Boolean;
+var
+  EncodedResolvedPath: AnsiString;
+  FirstStatus, SecondStatus: BaseUnix.Stat;
+  PathBuffer: array[0..SECURE_TRANSPORT_FSREF_PATH_CAPACITY - 1] of Byte;
+  VerificationReference: TSecureTransportFSRef;
+begin
+  Result := False;
+  FillChar(PathBuffer, SizeOf(PathBuffer), 0);
+  if FSRefMakePath(@AFileReference, @PathBuffer[0], SizeOf(PathBuffer))
+    <> ERR_SEC_SUCCESS then Exit;
+  EncodedResolvedPath := AnsiString(PAnsiChar(@PathBuffer[0]));
+  if (EncodedResolvedPath = '')
+    or (FpLStat(PChar(EncodedResolvedPath), FirstStatus) <> 0)
+    or not SecureTransportFileIdentityMatches(FirstStatus,
+      AExpectedDevice, AExpectedInode) then Exit;
+  FillChar(VerificationReference, SizeOf(VerificationReference), 0);
+  if FSPathMakeRefWithOptions(PByte(PAnsiChar(EncodedResolvedPath)),
+    SECURE_TRANSPORT_FSREF_NOFOLLOW, @VerificationReference, nil)
+    <> ERR_SEC_SUCCESS then Exit;
+  if FSCompareFSRefs(@AFileReference, @VerificationReference)
+    <> ERR_SEC_SUCCESS then Exit;
+  Result := (FpLStat(PChar(EncodedResolvedPath), SecondStatus) = 0)
+    and SecureTransportFileIdentityMatches(SecondStatus,
+      AExpectedDevice, AExpectedInode);
+end;
 
 function BindSecureTransportFileReference(const APath: string;
   const AExpectedDevice, AExpectedInode: QWord;
   out AFileReference: TSecureTransportFSRef): Boolean;
 var
   EncodedPath: AnsiString;
-  Status: BaseUnix.Stat;
+  InjectABARace: Boolean;
 begin
   FillChar(AFileReference, SizeOf(AFileReference), 0);
   EncodedPath := AnsiString(APath);
+  InjectABARace := False;
+  {$IFNDEF PRODUCTION}
+  if SecureTransportTestBindABARace then
+  begin
+    if SecureTransportTestBindABACallsToSkip > 0 then
+      Dec(SecureTransportTestBindABACallsToSkip)
+    else
+    begin
+      SecureTransportTestBindABARace := False;
+      InjectABARace := True;
+      InjectSecureTransportBindABARaceBeforeCapture(APath);
+    end;
+  end;
+  {$ENDIF}
   Result := FSPathMakeRefWithOptions(PByte(PAnsiChar(EncodedPath)),
     SECURE_TRANSPORT_FSREF_NOFOLLOW, @AFileReference, nil)
     = ERR_SEC_SUCCESS;
+  {$IFNDEF PRODUCTION}
+  if InjectABARace then
+    RestoreSecureTransportBindABARaceAfterCapture(APath);
+  {$ENDIF}
   if Result then
-    Result := (FpLStat(PChar(APath), Status) = 0)
-      and SecureTransportFileIdentityMatches(Status, AExpectedDevice,
-        AExpectedInode);
+    Result := SecureTransportFileReferenceIdentityMatches(AFileReference,
+      AExpectedDevice, AExpectedInode);
 end;
 
-function ValidateImportedSecureTransportKeychainIdentity(const AKeychain: Pointer;
-  const APath: string; out ADevice, AInode: QWord;
+function ValidateImportedSecureTransportKeychainIdentity(
+  const AMarkerService, AMarkerAccount: AnsiString; var APath: string;
+  out ADevice, AInode: QWord;
   var AFileReference: TSecureTransportFSRef;
   var AFileReferenceKnown: Boolean): Boolean;
 var
   EncodedPath: AnsiString;
   FirstStatus, SecondStatus: BaseUnix.Stat;
   ImportedFileReference: TSecureTransportFSRef;
+  MarkerItem: Pointer;
+  QuarantinePath: string;
+  QuarantineOwned: Boolean;
   ReopenedKeychain: Pointer;
 begin
   Result := False;
+  QuarantineOwned := False;
   ADevice := 0;
   AInode := 0;
+  {$IFNDEF PRODUCTION}
+  if SecureTransportTestImportReplacementRaceBeforeValidation then
+    InjectSecureTransportReplacementRace(APath);
+  {$ENDIF}
   if (FpLStat(PChar(APath), FirstStatus) <> 0)
     or ((FirstStatus.st_mode and S_IFMT) <> S_IFREG)
     or (FirstStatus.st_uid <> FpGetUID) then Exit;
-  if not BindSecureTransportFileReference(APath, QWord(FirstStatus.st_dev),
-    QWord(FirstStatus.st_ino), ImportedFileReference) then Exit;
-  AFileReference := ImportedFileReference;
-  AFileReferenceKnown := True;
-  {$IFNDEF PRODUCTION}
-  if SecureTransportTestImportReplacementRaceBeforeOpen then
-    InjectSecureTransportReplacementRace(APath);
-  {$ENDIF}
-  EncodedPath := AnsiString(APath);
-  ReopenedKeychain := nil;
-  if (SecKeychainOpen(PAnsiChar(EncodedPath), ReopenedKeychain)
-    <> ERR_SEC_SUCCESS) or (ReopenedKeychain = nil) then Exit;
+  QuarantinePath := SecureTransportQuarantinePath(APath);
+  if not RenameSecureTransportFileExclusive(APath, QuarantinePath) then Exit;
+  QuarantineOwned := True;
   try
-    if not CFEqual(ReopenedKeychain, AKeychain) then Exit;
+    if (FpLStat(PChar(QuarantinePath), FirstStatus) <> 0)
+      or ((FirstStatus.st_mode and S_IFMT) <> S_IFREG)
+      or (FirstStatus.st_uid <> FpGetUID) then Exit;
+    if not BindSecureTransportFileReference(QuarantinePath,
+      QWord(FirstStatus.st_dev), QWord(FirstStatus.st_ino),
+      ImportedFileReference) then Exit;
     {$IFNDEF PRODUCTION}
-    if SecureTransportTestImportReplacementRaceAfterEquality then
-      InjectSecureTransportReplacementRace(APath);
+    if SecureTransportTestImportReplacementRaceBeforeOpen then
+      InjectSecureTransportReplacementRace(QuarantinePath);
     {$ENDIF}
-    if (FpLStat(PChar(APath), SecondStatus) <> 0)
-      or not SecureTransportFileIdentityMatches(SecondStatus,
-        QWord(FirstStatus.st_dev), QWord(FirstStatus.st_ino)) then Exit;
-    ADevice := QWord(FirstStatus.st_dev);
-    AInode := QWord(FirstStatus.st_ino);
-    Result := True;
+    EncodedPath := AnsiString(QuarantinePath);
+    MarkerItem := nil;
+    ReopenedKeychain := nil;
+    if (SecKeychainOpen(PAnsiChar(EncodedPath), ReopenedKeychain)
+      <> ERR_SEC_SUCCESS) or (ReopenedKeychain = nil) then Exit;
+    try
+      if (SecKeychainFindGenericPassword(ReopenedKeychain,
+        Length(AMarkerService), PAnsiChar(AMarkerService),
+        Length(AMarkerAccount), PAnsiChar(AMarkerAccount), nil, nil,
+        MarkerItem) <> ERR_SEC_SUCCESS) or (MarkerItem = nil) then Exit;
+      {$IFNDEF PRODUCTION}
+      if SecureTransportTestImportReplacementRaceAfterMarkerLookup then
+        InjectSecureTransportReplacementRace(QuarantinePath);
+      {$ENDIF}
+      if (FpLStat(PChar(QuarantinePath), SecondStatus) <> 0)
+        or not SecureTransportFileIdentityMatches(SecondStatus,
+          QWord(FirstStatus.st_dev), QWord(FirstStatus.st_ino)) then Exit;
+      ADevice := QWord(FirstStatus.st_dev);
+      AInode := QWord(FirstStatus.st_ino);
+      AFileReference := ImportedFileReference;
+      AFileReferenceKnown := True;
+      APath := QuarantinePath;
+      QuarantineOwned := False;
+      Result := True;
+    finally
+      if MarkerItem <> nil then CFRelease(MarkerItem);
+      CFRelease(ReopenedKeychain);
+    end;
   finally
-    CFRelease(ReopenedKeychain);
+    if QuarantineOwned then
+    begin
+      if RestoreOrPreserveSecureTransportQuarantine(QuarantinePath, APath)
+        then
+      begin
+        {$IFNDEF PRODUCTION}
+        if SecureTransportTestReplacementOriginalPath = QuarantinePath then
+          SecureTransportTestReplacementOriginalPath := APath;
+        {$ENDIF}
+      end;
+    end;
   end;
 end;
 
@@ -843,7 +962,6 @@ function QuarantineAndRemoveSecureTransportFile(const APath: string;
   const AExpectedDevice, AExpectedInode: QWord;
   const AInjectReplacementRace: Boolean; out AFailure: string): Boolean;
 var
-  EncodedQuarantinePath: AnsiString;
   FileReference: TSecureTransportFSRef;
   QuarantinePath: string;
   Status: BaseUnix.Stat;
@@ -883,22 +1001,12 @@ begin
       AFailure := 'Temporary TLS keychain storage changed identity during cleanup';
     Exit;
   end;
-  EncodedQuarantinePath := AnsiString(QuarantinePath);
   FillChar(FileReference, SizeOf(FileReference), 0);
-  if FSPathMakeRefWithOptions(PByte(PAnsiChar(EncodedQuarantinePath)),
-    SECURE_TRANSPORT_FSREF_NOFOLLOW, @FileReference, nil)
-    <> ERR_SEC_SUCCESS then
+  if not BindSecureTransportFileReference(QuarantinePath,
+    AExpectedDevice, AExpectedInode, FileReference) then
   begin
     RestoreOrPreserveSecureTransportQuarantine(QuarantinePath, APath);
     AFailure := 'Failed to bind temporary TLS keychain cleanup identity';
-    Exit;
-  end;
-  if (FpLStat(PChar(QuarantinePath), Status) <> 0)
-    or not SecureTransportFileIdentityMatches(Status, AExpectedDevice,
-      AExpectedInode) then
-  begin
-    RestoreOrPreserveSecureTransportQuarantine(QuarantinePath, APath);
-    AFailure := 'Temporary TLS keychain storage changed after identity binding';
     Exit;
   end;
   {$IFNDEF PRODUCTION}
@@ -1168,6 +1276,7 @@ var
   CertificateCount, Index: NativeInt;
   CertificateValues: array of Pointer;
   EncodedKeychainPath, EncodedPassphrase, KeychainPassphrase: AnsiString;
+  MarkerAccount, MarkerService: AnsiString;
   KeychainPath: string;
   KeychainDevice, KeychainInode: QWord;
   KeychainFileReference: TSecureTransportFSRef;
@@ -1202,6 +1311,8 @@ begin
   EncodedKeychainPath := '';
   EncodedPassphrase := '';
   KeychainPassphrase := '';
+  MarkerAccount := '';
+  MarkerService := '';
   KeychainPath := '';
   SetLength(IdentityBytes, Length(APkcs12Identity));
   Move(APkcs12Identity[0], IdentityBytes[0], Length(IdentityBytes));
@@ -1257,11 +1368,6 @@ begin
       raise ETransportSecurityError.Create(
         'Failed to prepare configured TLS PKCS#12 import');
     Status := SecPKCS12Import(CFData, CFOptions, @Items);
-    if not ValidateImportedSecureTransportKeychainIdentity(Keychain,
-      KeychainPath, KeychainDevice, KeychainInode, KeychainFileReference,
-      KeychainFileReferenceKnown) then
-      raise ETransportSecurityError.Create(
-        'Temporary TLS keychain storage changed identity during import');
     if (Status <> ERR_SEC_SUCCESS) or (Items = nil)
       or (CFArrayGetCount(Items) = 0) then
       raise ETransportSecurityError.Create(
@@ -1275,6 +1381,18 @@ begin
       or (CFArrayGetCount(CertificateChain) = 0) then
       raise ETransportSecurityError.Create(
         'Configured TLS PKCS#12 identity must contain a certificate and private key');
+    MarkerService := 'temporary-tls-keychain-' + SecureTransportRandomHex;
+    MarkerAccount := SecureTransportRandomHex;
+    if SecKeychainAddGenericPassword(Keychain, Length(MarkerService),
+      PAnsiChar(MarkerService), Length(MarkerAccount), PAnsiChar(MarkerAccount),
+      0, nil, nil) <> ERR_SEC_SUCCESS then
+      raise ETransportSecurityError.Create(
+        'Failed to mark temporary TLS keychain storage');
+    if not ValidateImportedSecureTransportKeychainIdentity(MarkerService,
+      MarkerAccount, KeychainPath, KeychainDevice, KeychainInode,
+      KeychainFileReference, KeychainFileReferenceKnown) then
+      raise ETransportSecurityError.Create(
+        'Temporary TLS keychain storage changed identity during import');
     if AValidation = tsivStrict then
       ValidateSecureTransportServerIdentity(CertificateChain);
     CertificateCount := CFArrayGetCount(CertificateChain);
@@ -1309,6 +1427,12 @@ begin
     if Length(KeychainPassphrase) > 0 then
       FillChar(KeychainPassphrase[1], Length(KeychainPassphrase), 0);
     KeychainPassphrase := '';
+    if Length(MarkerAccount) > 0 then
+      FillChar(MarkerAccount[1], Length(MarkerAccount), 0);
+    MarkerAccount := '';
+    if Length(MarkerService) > 0 then
+      FillChar(MarkerService[1], Length(MarkerService), 0);
+    MarkerService := '';
     EncodedKeychainPath := '';
     if Items <> nil then
       CFRelease(Items);
@@ -7151,10 +7275,22 @@ begin
 end;
 
 procedure TransportSecurityTestForceSecureTransportImportReplacementRace(
-  const ABeforeOpen, AAfterEquality: Boolean);
+  const ABeforeValidation, ABeforeOpen, AAfterMarkerLookup: Boolean);
 begin
+  SecureTransportTestImportReplacementRaceBeforeValidation :=
+    ABeforeValidation;
   SecureTransportTestImportReplacementRaceBeforeOpen := ABeforeOpen;
-  SecureTransportTestImportReplacementRaceAfterEquality := AAfterEquality;
+  SecureTransportTestImportReplacementRaceAfterMarkerLookup :=
+    AAfterMarkerLookup;
+  SecureTransportTestReplacementOriginalPath := '';
+  SecureTransportTestReplacementPreservedPath := '';
+end;
+
+procedure TransportSecurityTestForceSecureTransportBindABARace(
+  const AEnabled: Boolean; const ACallsToSkip: LongInt);
+begin
+  SecureTransportTestBindABARace := AEnabled;
+  SecureTransportTestBindABACallsToSkip := ACallsToSkip;
   SecureTransportTestReplacementOriginalPath := '';
   SecureTransportTestReplacementPreservedPath := '';
 end;
