@@ -3727,7 +3727,10 @@ procedure TTransportSecurityServerTests.TestFatalHandshakePoisonsConnection;
 {$IFDEF TRANSPORT_SECURITY_SERVER}
 {$IFNDEF DARWIN}
 const
-  INVALID_HANDSHAKE = #$16#$03#$03#$00#$01#$00;
+  { Complete non-TLS input is a provider-independent fatal handshake. A
+    TLS-shaped record with only one handshake byte is incomplete, so OpenSSL
+    correctly buffers it and reports WANT_READ instead of a protocol error. }
+  INVALID_HANDSHAKE = 'GET / HTTP/1.0'#13#10#13#10;
 {$ENDIF}
 var
   Connection: TTransportSecurityConnection;
