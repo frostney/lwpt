@@ -112,19 +112,32 @@ HTTPS uses the repository's native server policy:
 - Windows uses the HTTPClient package's native SChannel server context.
 - Unix other than Darwin uses its runtime-loaded OpenSSL 3 memory-BIO server
   context.
-- macOS imports the configured PKCS#12 identity into a process-private
-  temporary keychain, validates its bundled chain with a private anchor and
-  Apple's server policy, and serves with Network.framework. The current-user
-  0600 PID-and-random-nonce keychain file remains available for lazy private-
-  key access while the server is active; graceful shutdown verifies deletion,
-  and the next start recovers an exact owned file only after its PID is
-  definitely dead. FPC 3.2.2 reaches the Network C API through the stable
-  blocks ABI, with one serial queue per connection.
+- macOS 26 and newer import the configured PKCS#12 identity into a
+  process-private temporary keychain, validate its bundled chain with a
+  private anchor and Apple's server policy, and serve with Network.framework.
+  The current-user 0600 PID-and-random-nonce keychain file remains available
+  for lazy private-key access while the server is active; graceful shutdown
+  verifies deletion, and the next start recovers an exact owned file only
+  after its PID is definitely dead. FPC 3.2.2 reaches the Network C API
+  through the stable blocks ABI, with one serial queue per connection.
+- macOS 15 and older use the portable socket listener and the HTTPClient
+  package's public Secure Transport server backend. Its PKCS#12 import uses an
+  isolated temporary keychain without changing the default keychain or search
+  list. Ordinary teardown deletes the keychain; a scan-capped later creation
+  recovers only exact same-user regular-file residue whose owner PID is
+  definitely dead. The feed/drain connection contract keeps parsing, routing,
+  resources, deadlines, and shutdown in the same registry implementation used
+  on other platforms.
 
-The portable socket listeners on Windows and Unix other than Darwin accept
+The registry selects these Darwin transports from the runtime macOS product-
+version major: 26 and newer selects Network.framework; 15 and older selects
+Secure Transport. CPU architecture does not influence the decision.
+
+The portable socket listeners on Windows, Unix other than Darwin, and macOS
+15 and older accept
 `localhost` or an IPv4 address. Initialization rejects other listener families
 there rather than persisting a configuration that can fail only at `serve`.
-The macOS Network.framework listener also accepts IPv6 addresses.
+The macOS 26-and-newer Network.framework listener also accepts IPv6 addresses.
 
 The listener admits at most 32 owned connections, handles each independently,
 and closes it after one bounded HTTP/1.1 GET or HEAD request. One ten-second

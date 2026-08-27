@@ -215,6 +215,8 @@ type
     procedure TestNetworkFrameworkBlockABI;
     procedure TestNetworkFrameworkTeardownOrdering;
     procedure TestNetworkFrameworkCleanupFailureSemantics;
+    procedure TestDarwinTLSTransportSelection;
+    procedure TestDarwinProductVersionParsing;
     procedure TestServerErrorsConformToWireContract;
     procedure TestRenewalErrorDoesNotDiscloseStorePath;
     procedure TestServerDiscoveryIsTruthful;
@@ -222,6 +224,30 @@ type
     procedure TestReadersObserveCompleteStateDuringPublication;
     procedure TestTamperedSignatureHasStableDiagnostic;
   end;
+
+procedure TRegistryStoreContract.TestDarwinTLSTransportSelection;
+begin
+  Expect<TRegistryDarwinTLSTransport>(
+    RegistryDarwinTLSTransportForMajorVersion(15)).ToBe(
+      rdttSecureTransport);
+  Expect<TRegistryDarwinTLSTransport>(
+    RegistryDarwinTLSTransportForMajorVersion(25)).ToBe(
+      rdttSecureTransport);
+  Expect<TRegistryDarwinTLSTransport>(
+    RegistryDarwinTLSTransportForMajorVersion(26)).ToBe(
+      rdttNetworkFramework);
+  Expect<TRegistryDarwinTLSTransport>(
+    RegistryDarwinTLSTransportForMajorVersion(30)).ToBe(
+      rdttNetworkFramework);
+end;
+
+procedure TRegistryStoreContract.TestDarwinProductVersionParsing;
+begin
+  Expect<Cardinal>(RegistryDarwinProductVersionMajorForTesting(
+    'Version 15.7.1 (Build 24G231)')).ToBe(15);
+  Expect<Cardinal>(RegistryDarwinProductVersionMajorForTesting(
+    'Version 26.0 (Build 25A354)')).ToBe(26);
+end;
 
 constructor TReaderThread.Create(AStore: TLWPTRegistryStore);
 begin
@@ -1611,6 +1637,10 @@ begin
     TestNetworkFrameworkTeardownOrdering);
   Test('Network.framework cleanup preserves an active primary failure',
     TestNetworkFrameworkCleanupFailureSemantics);
+  Test('Darwin TLS transport selection follows product version',
+    TestDarwinTLSTransportSelection);
+  Test('Darwin product version parsing is deterministic',
+    TestDarwinProductVersionParsing);
   Test('server errors conform to the wire contract',
     TestServerErrorsConformToWireContract);
   Test('renewal error does not disclose the store path',

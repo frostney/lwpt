@@ -110,16 +110,30 @@ end;
 {$IFDEF DARWIN}
 const
   MAX_TEMPORARY_KEYCHAIN_DIAGNOSTIC_PATHS = 129;
+  SECURE_TRANSPORT_KEYCHAIN_PREFIX = 'secure-transport-server-';
 
-function TemporaryKeychainPathCount(const APID: LongInt): Integer;
+function RegistryTemporaryKeychainPrefix: string;
+begin
+  Result := ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
+    + '-registry-tls-';
+end;
+
+function TemporaryKeychainPath(const APrefix: string; const APID: LongInt;
+  const ANonce: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(GetTempDir) + APrefix
+    + IntToStr(APID) + '-' + ANonce + '.keychain';
+end;
+
+function TemporaryKeychainPathCountForPrefix(const APrefix: string;
+  const APID: LongInt): Integer;
 var
   Pattern: string;
   Search: TSearchRec;
 begin
   Result := 0;
-  Pattern := IncludeTrailingPathDelimiter(GetTempDir)
-    + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
-    + '-registry-tls-' + IntToStr(APID) + '-*.keychain';
+  Pattern := IncludeTrailingPathDelimiter(GetTempDir) + APrefix
+    + IntToStr(APID) + '-*.keychain';
   if FindFirst(Pattern, faAnyFile or faSymLink, Search) <> 0 then Exit;
   try
     repeat
@@ -131,21 +145,38 @@ begin
   end;
 end;
 
-function TemporaryKeychainPathForProcess(const APID: LongInt): string;
+function TemporaryKeychainPathCount(const APID: LongInt): Integer;
+begin
+  Result := TemporaryKeychainPathCountForPrefix(
+    RegistryTemporaryKeychainPrefix, APID)
+    + TemporaryKeychainPathCountForPrefix(
+      SECURE_TRANSPORT_KEYCHAIN_PREFIX, APID);
+end;
+
+function TemporaryKeychainPathForPrefix(const APrefix: string;
+  const APID: LongInt): string;
 var
   Pattern: string;
   Search: TSearchRec;
 begin
   Result := '';
-  Pattern := IncludeTrailingPathDelimiter(GetTempDir)
-    + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
-    + '-registry-tls-' + IntToStr(APID) + '-*.keychain';
+  Pattern := IncludeTrailingPathDelimiter(GetTempDir) + APrefix
+    + IntToStr(APID) + '-*.keychain';
   if FindFirst(Pattern, faAnyFile or faSymLink, Search) <> 0 then Exit;
   try
     Result := IncludeTrailingPathDelimiter(GetTempDir) + Search.Name;
   finally
     FindClose(Search);
   end;
+end;
+
+function TemporaryKeychainPathForProcess(const APID: LongInt): string;
+begin
+  Result := TemporaryKeychainPathForPrefix(
+    RegistryTemporaryKeychainPrefix, APID);
+  if Result = '' then
+    Result := TemporaryKeychainPathForPrefix(
+      SECURE_TRANSPORT_KEYCHAIN_PREFIX, APID);
 end;
 
 procedure RemoveRunOwnedTemporaryKeychain(const APath: string);
@@ -589,14 +620,19 @@ end;
 procedure TRegistryE2EContract.TestTemporaryKeychainResidueIsRecoveredAndCrashSafe;
 {$IFDEF DARWIN}
 const
-  TEST_NONCE =
+  REGISTRY_TEST_NONCE =
     '0000000000000000000000000000000000000000000000000000000000000000';
-  TEST_SYMLINK_NONCE =
+  REGISTRY_TEST_SYMLINK_NONCE =
     '1111111111111111111111111111111111111111111111111111111111111111';
+  SECURE_TRANSPORT_TEST_NONCE =
+    '00000000000000000000000000000000';
+  SECURE_TRANSPORT_TEST_SYMLINK_NONCE =
+    '11111111111111111111111111111111';
 var
   BoundedPaths: array of string;
   CrashedPath, DataDirectory, DiscoveryURL, LivePath, Nonce,
-    ResiduePath, SymlinkPath: string;
+    RegistryResiduePath, RegistrySymlinkPath, SecureTransportResiduePath,
+    SecureTransportSymlinkPath: string;
   CrashedPID, DeadPID, RecoveredPID: LongInt;
   Index: Integer;
   Init: TLwptResult;
@@ -607,30 +643,41 @@ begin
   CrashedPath := '';
   LivePath := '';
   DeadPID := CreateDeadProcessID;
-  ResiduePath := IncludeTrailingPathDelimiter(GetTempDir)
-    + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
-    + '-registry-tls-' + IntToStr(DeadPID) + '-' + TEST_NONCE
-    + '.keychain';
-  SymlinkPath := IncludeTrailingPathDelimiter(GetTempDir)
-    + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
-    + '-registry-tls-' + IntToStr(DeadPID) + '-' + TEST_SYMLINK_NONCE
-    + '.keychain';
-  SetLength(BoundedPaths, 129);
-  for Index := 0 to High(BoundedPaths) do
+  RegistryResiduePath := TemporaryKeychainPath(
+    RegistryTemporaryKeychainPrefix, DeadPID, REGISTRY_TEST_NONCE);
+  RegistrySymlinkPath := TemporaryKeychainPath(
+    RegistryTemporaryKeychainPrefix, DeadPID,
+    REGISTRY_TEST_SYMLINK_NONCE);
+  SecureTransportResiduePath := TemporaryKeychainPath(
+    SECURE_TRANSPORT_KEYCHAIN_PREFIX, DeadPID,
+    SECURE_TRANSPORT_TEST_NONCE);
+  SecureTransportSymlinkPath := TemporaryKeychainPath(
+    SECURE_TRANSPORT_KEYCHAIN_PREFIX, DeadPID,
+    SECURE_TRANSPORT_TEST_SYMLINK_NONCE);
+  SetLength(BoundedPaths, 258);
+  for Index := 0 to 128 do
   begin
     Nonce := LowerCase(StringOfChar('0', 60) + IntToHex(Index + 2, 4));
-    BoundedPaths[Index] := IncludeTrailingPathDelimiter(GetTempDir)
-      + ChangeFileExt(ExtractFileName(LwptBinaryPath), '')
-      + '-registry-tls-' + IntToStr(DeadPID) + '-' + Nonce + '.keychain';
+    BoundedPaths[Index] := TemporaryKeychainPath(
+      RegistryTemporaryKeychainPrefix, DeadPID, Nonce);
+    Nonce := LowerCase(StringOfChar('0', 28) + IntToHex(Index + 2, 4));
+    BoundedPaths[Index + 129] := TemporaryKeychainPath(
+      SECURE_TRANSPORT_KEYCHAIN_PREFIX, DeadPID, Nonce);
   end;
   Server := nil;
   try
-    SysUtils.DeleteFile(ResiduePath);
-    Residue := TFileStream.Create(ResiduePath, fmCreate);
+    SysUtils.DeleteFile(RegistryResiduePath);
+    SysUtils.DeleteFile(SecureTransportResiduePath);
+    Residue := TFileStream.Create(RegistryResiduePath, fmCreate);
     Residue.Free;
-    FpUnlink(PChar(SymlinkPath));
-    Expect<Integer>(FpSymlink(PChar(ResiduePath),
-      PChar(SymlinkPath))).ToBe(0);
+    Residue := TFileStream.Create(SecureTransportResiduePath, fmCreate);
+    Residue.Free;
+    FpUnlink(PChar(RegistrySymlinkPath));
+    FpUnlink(PChar(SecureTransportSymlinkPath));
+    Expect<Integer>(FpSymlink(PChar(RegistryResiduePath),
+      PChar(RegistrySymlinkPath))).ToBe(0);
+    Expect<Integer>(FpSymlink(PChar(SecureTransportResiduePath),
+      PChar(SecureTransportSymlinkPath))).ToBe(0);
     DataDirectory := FScratch + '/crash-safe-tls-origin';
     DiscoveryURL := 'https://localhost:' + IntToStr(BasePort + 5)
       + '/.well-known/lwpt-registry';
@@ -643,8 +690,12 @@ begin
     for Index := 0 to High(BoundedPaths) do
     begin
       FpUnlink(PChar(BoundedPaths[Index]));
-      Expect<Integer>(FpSymlink(PChar(ResiduePath),
-        PChar(BoundedPaths[Index]))).ToBe(0);
+      if Index < 129 then
+        Expect<Integer>(FpSymlink(PChar(RegistryResiduePath),
+          PChar(BoundedPaths[Index]))).ToBe(0)
+      else
+        Expect<Integer>(FpSymlink(PChar(SecureTransportResiduePath),
+          PChar(BoundedPaths[Index]))).ToBe(0);
     end;
     Server := StartServer(DataDirectory, True);
     for Index := 1 to 200 do
@@ -658,13 +709,18 @@ begin
     Server := nil;
     for Index := 0 to High(BoundedPaths) do
       FpUnlink(PChar(BoundedPaths[Index]));
-    SysUtils.DeleteFile(ResiduePath);
-    Residue := TFileStream.Create(ResiduePath, fmCreate);
+    SysUtils.DeleteFile(RegistryResiduePath);
+    SysUtils.DeleteFile(SecureTransportResiduePath);
+    Residue := TFileStream.Create(RegistryResiduePath, fmCreate);
+    Residue.Free;
+    Residue := TFileStream.Create(SecureTransportResiduePath, fmCreate);
     Residue.Free;
     Server := StartServer(DataDirectory, True);
     WaitUntilReady(DiscoveryURL, True, Server);
-    Expect<Boolean>(FileExists(ResiduePath)).ToBe(False);
-    Expect<Integer>(FpLStat(PChar(SymlinkPath), Status)).ToBe(0);
+    Expect<Boolean>(FileExists(RegistryResiduePath)
+      xor FileExists(SecureTransportResiduePath)).ToBe(True);
+    Expect<Integer>(FpLStat(PChar(RegistrySymlinkPath), Status)).ToBe(0);
+    Expect<Integer>(FpLStat(PChar(SecureTransportSymlinkPath), Status)).ToBe(0);
     Expect<Integer>(TemporaryKeychainPathCount(Server.ProcessID)).ToBe(1);
     CrashedPath := TemporaryKeychainPathForProcess(Server.ProcessID);
     Expect<Boolean>(CrashedPath <> '').ToBe(True);
@@ -693,8 +749,10 @@ begin
     finally
       RemoveRunOwnedTemporaryKeychain(CrashedPath);
       RemoveRunOwnedTemporaryKeychain(LivePath);
-      SysUtils.DeleteFile(ResiduePath);
-      FpUnlink(PChar(SymlinkPath));
+      SysUtils.DeleteFile(RegistryResiduePath);
+      SysUtils.DeleteFile(SecureTransportResiduePath);
+      FpUnlink(PChar(RegistrySymlinkPath));
+      FpUnlink(PChar(SecureTransportSymlinkPath));
       for Index := 0 to High(BoundedPaths) do
         FpUnlink(PChar(BoundedPaths[Index]));
     end;

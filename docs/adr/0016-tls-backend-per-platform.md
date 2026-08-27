@@ -1,9 +1,13 @@
 # TLS backends follow each platform's native client stack
 
-> **Amended by [ADR-0024](./0024-openssl-server-tls-accept.md).** This ADR
-> governs outbound clients. Server accept uses socket-independent memory-BIO
-> OpenSSL on Windows and Unix-not-Darwin; macOS servers use
-> Network.framework.
+> **Amended by [ADR-0024](./0024-openssl-server-tls-accept.md),
+> [ADR-0033](./0033-schannel-server-tls-accept-on-windows.md), and
+> [ADR-0043](./0043-self-hosted-registry-origin.md).** This ADR governs
+> outbound clients. Server accept uses native SChannel on Windows,
+> socket-independent memory-BIO OpenSSL on Unix-not-Darwin, and public Secure
+> Transport at the HTTPClient seam on macOS. The registry prefers
+> Network.framework on macOS 26 and newer and uses Secure Transport on macOS
+> 15 and older.
 
 ## Executive Summary
 
@@ -15,9 +19,8 @@
 - **HTTPClient owns this implementation.** Per
   [ADR-0017](./0017-packages-lwpt-canonical.md), LWPT is the canonical source
   for the package; GocciaScript is a consumer, not an upstream to mirror.
-- **Server accept is a deliberate exception.** ADR-0024 adds runtime-loaded
-  OpenSSL for Windows and Unix-not-Darwin servers without changing the client
-  path.
+- **Server accept is a separate transport seam.** Its platform-native and
+  runtime-loaded implementations do not change the client path.
 
 The `TransportSecurity` unit in
 [`packages/httpclient/source/`](../../packages/httpclient/source/) presents one
@@ -62,10 +65,11 @@ conditionals already selected SChannel and SecureTransport, and release
 archives did not contain OpenSSL. Correcting those instructions did not change
 the outbound implementation or release contents.
 
-ADR-0024 later introduced a separate server seam. On Windows that seam
-runtime-loads OpenSSL 3 through a restricted DLL search; it does not turn the
-Windows client path into an OpenSSL client and does not permit import-linked
-OpenSSL in the shipped binary.
+ADR-0024 later introduced a separate memory-BIO server seam. ADR-0033 replaced
+its Windows implementation with native SChannel. ADR-0043 records the two
+native Darwin registry transports: Network.framework on macOS 26 and newer,
+and the portable listener using HTTPClient Secure Transport on macOS 15 and
+older. Runtime product version, never CPU architecture, selects between them.
 
 ## Considered options
 
@@ -88,8 +92,8 @@ OpenSSL in the shipped binary.
 - macOS outbound HTTPS uses SecureTransport and requires no Homebrew OpenSSL.
 - Unix-not-Darwin outbound HTTPS requires a discoverable system libssl.
 - `HTTPClient` keeps one client-facing API across all three implementations.
-- Server consumers follow ADR-0024's separate memory-BIO contract, OpenSSL 3
-  runtime requirement, state machine, and deployment rules.
+- Server consumers follow ADR-0024's separate feed/drain contract and state
+  machine; only Unix-not-Darwin has the OpenSSL 3 runtime requirement.
 - CI inspects Windows PE imports, imported symbol families, and link inputs so
   runtime loader strings remain permitted while renamed, legacy, delay-loaded,
   or static OpenSSL linkage fails closed.

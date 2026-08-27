@@ -2,14 +2,18 @@ unit TransportSecurity;
 
 // Cross-platform TLS transport. Blocking clients use SecureTransport on
 // macOS, SChannel on Windows, and OpenSSL on Unix. Nonblocking server accept
-// uses native SChannel (SSPI + crypt32) on Windows and memory-BIO OpenSSL on
-// Unix-not-Darwin; macOS servers use Network.framework outside this unit.
+// uses native SChannel (SSPI + crypt32) on Windows, Secure Transport on
+// macOS, and memory-BIO OpenSSL on Unix-not-Darwin.
 // Windows therefore links no OpenSSL and loads no OpenSSL DLL at runtime.
 
 {$I Shared.inc}
 
 {$IFDEF MSWINDOWS}
 {$DEFINE TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{$DEFINE TRANSPORT_SECURITY_SERVER}
+{$ENDIF}
+{$IFDEF DARWIN}
+{$DEFINE TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
 {$DEFINE TRANSPORT_SECURITY_SERVER}
 {$ENDIF}
 {$IFDEF UNIX}
@@ -217,11 +221,11 @@ const
   TSB_SCHANNEL = 3;
   TSB_OPENSSL_SERVER = 4;
   TSB_SCHANNEL_SERVER = 5;
+  TSB_SECURE_TRANSPORT_SERVER = 6;
   OPENSSL_LOAD_ERROR = 'HTTPS requires OpenSSL but it could not be loaded';
   OPENSSL_SERVER_LOAD_ERROR =
     'TLS server accept requires OpenSSL but it could not be loaded';
-  TLS_SERVER_UNSUPPORTED_ERROR =
-    'TLS server accept is not supported on macOS; use Network.framework for server TLS';
+  TLS_SERVER_UNSUPPORTED_ERROR = 'TLS server accept is not supported';
   TLS_HANDSHAKE_ERROR = 'TLS handshake failed';
   TLS_READ_ERROR = 'TLS read failed';
   TLS_WRITE_ERROR = 'TLS write failed';
@@ -403,6 +407,7 @@ const
   ERR_SSL_WOULD_BLOCK = -9803;
   ERR_SSL_CLOSED_GRACEFUL = -9805;
   ERR_SSL_CLOSED_ABORT = -9806;
+  K_SSL_SERVER_SIDE = 0;
   K_SSL_CLIENT_SIDE = 1;
   K_SSL_STREAM_TYPE = 0;
   K_TLS_PROTOCOL_12 = 8;
@@ -414,6 +419,34 @@ type
     Context: SSLContextRef;
     WantRead: Boolean;
     WantWrite: Boolean;
+  end;
+
+  TSecureTransportServerSnapshot = class
+  public
+    CertificateArray: Pointer;
+    Keychain: Pointer;
+    KeychainPath: string;
+    References: LongInt;
+    constructor Create;
+    procedure Retain;
+    procedure Release;
+  end;
+
+  TSecureTransportServerData = class
+  public
+    Context: SSLContextRef;
+    HandshakeDone: Boolean;
+    Input: TBytes;
+    InputAccepted: QWord;
+    InputBackpressured: Boolean;
+    InputBuffered: Integer;
+    InputConsumed: QWord;
+    InputHighWatermark: Integer;
+    InputLowWatermark: Integer;
+    Output: TBytes;
+    OutputCapacity: Integer;
+    OutputOffset: Integer;
+    Snapshot: TSecureTransportServerSnapshot;
   end;
 
   TSecureTransportReadFunc = function(AConnection: SSLConnectionRef;
@@ -438,6 +471,9 @@ function SSLSetPeerDomainName(AContext: SSLContextRef; APeerName: PAnsiChar;
 function SSLSetProtocolVersionMin(AContext: SSLContextRef;
   AVersion: SSLProtocol): OSStatus; cdecl;
   external name 'SSLSetProtocolVersionMin';
+function SSLSetCertificate(AContext: SSLContextRef;
+  ACertificateArray: Pointer): OSStatus; cdecl;
+  external name 'SSLSetCertificate';
 function SSLHandshake(AContext: SSLContextRef): OSStatus; cdecl;
   external name 'SSLHandshake';
 function SSLRead(AContext: SSLContextRef; AData: Pointer;
@@ -449,6 +485,407 @@ function SSLWrite(AContext: SSLContextRef; AData: Pointer;
 function SSLClose(AContext: SSLContextRef): OSStatus; cdecl;
   external name 'SSLClose';
 procedure CFRelease(ARef: Pointer); cdecl; external name 'CFRelease';
+function CFArrayCreate(AAllocator, AValues: Pointer; ACount: NativeInt;
+  ACallbacks: Pointer): Pointer; cdecl; external name 'CFArrayCreate';
+function CFArrayGetCount(AArray: Pointer): NativeInt; cdecl;
+  external name 'CFArrayGetCount';
+function CFArrayGetValueAtIndex(AArray: Pointer;
+  AIndex: NativeInt): Pointer; cdecl; external name 'CFArrayGetValueAtIndex';
+function CFDataCreate(AAllocator, ABytes: Pointer;
+  ALength: NativeInt): Pointer; cdecl; external name 'CFDataCreate';
+function CFDictionaryCreate(AAllocator: Pointer; AKeys, AValues: PPointer;
+  ACount: NativeInt; AKeyCallbacks, AValueCallbacks: Pointer): Pointer; cdecl;
+  external name 'CFDictionaryCreate';
+function CFDictionaryGetValue(ADictionary, AKey: Pointer): Pointer; cdecl;
+  external name 'CFDictionaryGetValue';
+function CFStringCreateWithCString(AAllocator: Pointer; AString: PAnsiChar;
+  AEncoding: UInt32): Pointer; cdecl;
+  external name 'CFStringCreateWithCString';
+function SecKeychainCreate(APath: PAnsiChar; APassphraseLength: UInt32;
+  APassphrase: Pointer; APromptUser: ByteBool; AInitialAccess: Pointer;
+  out AKeychain: Pointer): OSStatus; cdecl; external name 'SecKeychainCreate';
+function SecKeychainDelete(AKeychain: Pointer): OSStatus; cdecl;
+  external name 'SecKeychainDelete';
+function SecPKCS12Import(AData, AOptions: Pointer;
+  AItems: PPointer): OSStatus; cdecl; external name 'SecPKCS12Import';
+function SecPolicyCreateSSL(AServer: ByteBool; AHostname: Pointer): Pointer;
+  cdecl; external name 'SecPolicyCreateSSL';
+function SecRandomCopyBytes(ARandom: Pointer; ACount: NativeUInt;
+  ABytes: Pointer): OSStatus; cdecl; external name 'SecRandomCopyBytes';
+function SecTrustCreateWithCertificates(ACertificates, APolicies: Pointer;
+  out ATrust: Pointer): OSStatus; cdecl;
+  external name 'SecTrustCreateWithCertificates';
+function SecTrustEvaluateWithError(ATrust: Pointer;
+  out AError: Pointer): ByteBool; cdecl;
+  external name 'SecTrustEvaluateWithError';
+function SecTrustSetAnchorCertificates(ATrust, AAnchors: Pointer): OSStatus;
+  cdecl; external name 'SecTrustSetAnchorCertificates';
+function SecTrustSetAnchorCertificatesOnly(ATrust: Pointer;
+  AAnchorCertificatesOnly: ByteBool): OSStatus; cdecl;
+  external name 'SecTrustSetAnchorCertificatesOnly';
+function Dlsym(AHandle: Pointer; AName: PAnsiChar): Pointer; cdecl;
+  external name 'dlsym';
+
+const
+  CF_STRING_ENCODING_UTF8 = $08000100;
+  MAX_SECURE_TRANSPORT_KEYCHAIN_RECOVERY_FILES = 128;
+  SECURE_TRANSPORT_KEYCHAIN_RANDOM_BYTES = 16;
+  SECURE_TRANSPORT_KEYCHAIN_PREFIX = 'secure-transport-server-';
+  RTLD_DEFAULT = Pointer(-2);
+
+var
+  SecureTransportArrayCallbacks: Pointer;
+  SecureTransportDictionaryKeyCallbacks: Pointer;
+  SecureTransportDictionaryValueCallbacks: Pointer;
+  SecureTransportImportCertChainKey: Pointer;
+  SecureTransportImportIdentityKey: Pointer;
+  SecureTransportImportKeychainKey: Pointer;
+  SecureTransportImportPassphraseKey: Pointer;
+
+procedure ResolveSecureTransportServerSymbols;
+var
+  Symbol: Pointer;
+
+  function ResolveConstant(const AName: PAnsiChar): Pointer;
+  begin
+    Symbol := Dlsym(RTLD_DEFAULT, AName);
+    if Symbol = nil then
+      raise ETransportSecurityError.Create(
+        'Security.framework is missing a required public TLS symbol');
+    Result := PPointer(Symbol)^;
+  end;
+begin
+  if SecureTransportImportPassphraseKey <> nil then
+    Exit;
+  SecureTransportImportPassphraseKey := ResolveConstant(
+    'kSecImportExportPassphrase');
+  SecureTransportImportKeychainKey := ResolveConstant(
+    'kSecImportExportKeychain');
+  SecureTransportImportIdentityKey := ResolveConstant(
+    'kSecImportItemIdentity');
+  SecureTransportImportCertChainKey := ResolveConstant(
+    'kSecImportItemCertChain');
+  SecureTransportArrayCallbacks := Dlsym(RTLD_DEFAULT,
+    'kCFTypeArrayCallBacks');
+  SecureTransportDictionaryKeyCallbacks := Dlsym(RTLD_DEFAULT,
+    'kCFTypeDictionaryKeyCallBacks');
+  SecureTransportDictionaryValueCallbacks := Dlsym(RTLD_DEFAULT,
+    'kCFTypeDictionaryValueCallBacks');
+  if (SecureTransportArrayCallbacks = nil)
+    or (SecureTransportDictionaryKeyCallbacks = nil)
+    or (SecureTransportDictionaryValueCallbacks = nil) then
+    raise ETransportSecurityError.Create(
+      'CoreFoundation is missing required public collection callbacks');
+end;
+
+constructor TSecureTransportServerSnapshot.Create;
+begin
+  inherited Create;
+  References := 1;
+end;
+
+procedure TSecureTransportServerSnapshot.Retain;
+begin
+  InterlockedIncrement(References);
+end;
+
+procedure TSecureTransportServerSnapshot.Release;
+var
+  Path: string;
+begin
+  if InterlockedDecrement(References) <> 0 then
+    Exit;
+  if CertificateArray <> nil then
+    CFRelease(CertificateArray);
+  CertificateArray := nil;
+  if Keychain <> nil then
+  begin
+    SecKeychainDelete(Keychain);
+    CFRelease(Keychain);
+  end;
+  Keychain := nil;
+  Path := KeychainPath;
+  KeychainPath := '';
+  if (Path <> '') and FileExists(Path) then
+    SysUtils.DeleteFile(Path);
+  Free;
+end;
+
+function SecureTransportRandomHex: AnsiString;
+const
+  HEX = '0123456789abcdef';
+var
+  Bytes: array[0..SECURE_TRANSPORT_KEYCHAIN_RANDOM_BYTES - 1] of Byte;
+  Index: Integer;
+begin
+  FillChar(Bytes, SizeOf(Bytes), 0);
+  if SecRandomCopyBytes(nil, SizeOf(Bytes), @Bytes[0]) <> ERR_SEC_SUCCESS then
+    raise ETransportSecurityError.Create(
+      'Failed to obtain secure temporary keychain material');
+  SetLength(Result, SizeOf(Bytes) * 2);
+  for Index := Low(Bytes) to High(Bytes) do
+  begin
+    Result[Index * 2 + 1] := HEX[(Bytes[Index] shr 4) + 1];
+    Result[Index * 2 + 2] := HEX[(Bytes[Index] and $0f) + 1];
+  end;
+  FillChar(Bytes, SizeOf(Bytes), 0);
+end;
+
+function TrySecureTransportKeychainOwnerPID(const AName: string;
+  out APID: LongInt): Boolean;
+const
+  SUFFIX = '.keychain';
+var
+  Character: Char;
+  Index: Integer;
+  Nonce, Owner, Tail: string;
+begin
+  Result := False;
+  APID := 0;
+  if Length(AName) <= Length(SECURE_TRANSPORT_KEYCHAIN_PREFIX)
+    + Length(SUFFIX) then
+    Exit;
+  if Copy(AName, 1, Length(SECURE_TRANSPORT_KEYCHAIN_PREFIX))
+    <> SECURE_TRANSPORT_KEYCHAIN_PREFIX then
+    Exit;
+  if Copy(AName, Length(AName) - Length(SUFFIX) + 1,
+    Length(SUFFIX)) <> SUFFIX then
+    Exit;
+  Tail := Copy(AName, Length(SECURE_TRANSPORT_KEYCHAIN_PREFIX) + 1,
+    Length(AName) - Length(SECURE_TRANSPORT_KEYCHAIN_PREFIX)
+    - Length(SUFFIX));
+  Index := Pos('-', Tail);
+  if Index <= 1 then Exit;
+  Owner := Copy(Tail, 1, Index - 1);
+  Nonce := Copy(Tail, Index + 1, MaxInt);
+  if Length(Nonce) <> SECURE_TRANSPORT_KEYCHAIN_RANDOM_BYTES * 2 then Exit;
+  for Character in Owner do
+    if not (Character in ['0'..'9']) then Exit;
+  for Character in Nonce do
+    if not (Character in ['0'..'9', 'a'..'f']) then Exit;
+  if not TryStrToInt(Owner, APID) or (APID <= 0) then Exit;
+  Result := True;
+end;
+
+function SecureTransportOwnerIsDefinitelyDead(const APID: LongInt): Boolean;
+begin
+  if FpKill(APID, 0) = 0 then Exit(False);
+  Result := FpGetErrNo = ESysESRCH;
+end;
+
+procedure ReconcileAbandonedSecureTransportKeychains;
+var
+  Inspected: Integer;
+  OwnerPID: LongInt;
+  Path, Pattern: string;
+  Search: TSearchRec;
+  Status: BaseUnix.Stat;
+begin
+  Inspected := 0;
+  Pattern := IncludeTrailingPathDelimiter(GetTempDir)
+    + SECURE_TRANSPORT_KEYCHAIN_PREFIX + '*.keychain';
+  if FindFirst(Pattern, faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    repeat
+      Inc(Inspected);
+      if Inspected > MAX_SECURE_TRANSPORT_KEYCHAIN_RECOVERY_FILES then
+        raise ETransportSecurityError.Create(
+          'Temporary TLS keychain recovery limit exceeded');
+      if not TrySecureTransportKeychainOwnerPID(Search.Name, OwnerPID) then
+        Continue;
+      Path := IncludeTrailingPathDelimiter(GetTempDir) + Search.Name;
+      if (FpLStat(PChar(Path), Status) <> 0)
+        or ((Status.st_mode and S_IFMT) <> S_IFREG)
+        or (Status.st_uid <> FpGetUID) then
+        Continue;
+      if not SecureTransportOwnerIsDefinitelyDead(OwnerPID) then Continue;
+      if not SysUtils.DeleteFile(Path) then
+        raise ETransportSecurityError.Create(
+          'Failed to recover abandoned temporary TLS keychain storage');
+      if (FpLStat(PChar(Path), Status) = 0)
+        or (FpGetErrNo <> ESysENOENT) then
+        raise ETransportSecurityError.Create(
+          'Temporary TLS keychain storage survived recovery');
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+procedure ValidateSecureTransportServerIdentity(const AChain: Pointer);
+var
+  Anchor, Anchors, ErrorReference, Policy, Trust: Pointer;
+  Status: OSStatus;
+begin
+  if (AChain = nil) or (CFArrayGetCount(AChain) < 2) then
+    raise ETransportSecurityError.Create(
+      'Configured TLS identity must contain a non-self-signed certificate chain');
+  Anchor := CFArrayGetValueAtIndex(AChain, CFArrayGetCount(AChain) - 1);
+  Anchors := CFArrayCreate(nil, @Anchor, 1,
+    SecureTransportArrayCallbacks);
+  Policy := SecPolicyCreateSSL(True, nil);
+  Trust := nil;
+  ErrorReference := nil;
+  try
+    Status := SecTrustCreateWithCertificates(AChain, Policy, Trust);
+    if (Status <> ERR_SEC_SUCCESS) or (Trust = nil)
+      or (SecTrustSetAnchorCertificates(Trust, Anchors) <> ERR_SEC_SUCCESS)
+      or (SecTrustSetAnchorCertificatesOnly(Trust, True)
+        <> ERR_SEC_SUCCESS)
+      or not SecTrustEvaluateWithError(Trust, ErrorReference) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS identity does not form a valid bundled server chain');
+  finally
+    if ErrorReference <> nil then
+      CFRelease(ErrorReference);
+    if Trust <> nil then
+      CFRelease(Trust);
+    if Policy <> nil then
+      CFRelease(Policy);
+    if Anchors <> nil then
+      CFRelease(Anchors);
+  end;
+end;
+
+function CreateSecureTransportServerSnapshot(
+  const APkcs12Identity: TBytes;
+  const APkcs12Passphrase: UnicodeString;
+  const AValidation: TTransportSecurityServerIdentityValidation):
+  TSecureTransportServerSnapshot;
+var
+  CertificateChain, CFData, CFOptions, CFPassphrase, Identity, Item,
+    Items, Keychain: Pointer;
+  CertificateCount, Index: NativeInt;
+  CertificateValues: array of Pointer;
+  EncodedPassphrase, KeychainPassphrase, KeychainPath: AnsiString;
+  IdentityBytes: TBytes;
+  Keys, Values: array[0..1] of Pointer;
+  Status: OSStatus;
+begin
+  Result := nil;
+  if Length(APkcs12Identity) = 0 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity is empty');
+  if Length(APkcs12Identity) > 16 * 1024 * 1024 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity exceeds the 16 MiB limit');
+  if Pos(#0, APkcs12Passphrase) > 0 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 passphrase contains an embedded NUL');
+  ResolveSecureTransportServerSymbols;
+  CertificateChain := nil;
+  CFData := nil;
+  CFOptions := nil;
+  CFPassphrase := nil;
+  Identity := nil;
+  Items := nil;
+  Keychain := nil;
+  EncodedPassphrase := '';
+  KeychainPassphrase := '';
+  KeychainPath := '';
+  SetLength(IdentityBytes, Length(APkcs12Identity));
+  Move(APkcs12Identity[0], IdentityBytes[0], Length(IdentityBytes));
+  try
+    ReconcileAbandonedSecureTransportKeychains;
+    KeychainPath := AnsiString(IncludeTrailingPathDelimiter(GetTempDir)
+      + SECURE_TRANSPORT_KEYCHAIN_PREFIX + IntToStr(GetProcessID) + '-'
+      + string(SecureTransportRandomHex) + '.keychain');
+    if FileExists(string(KeychainPath)) then
+      raise ETransportSecurityError.Create(
+        'Temporary TLS keychain path already exists');
+    KeychainPassphrase := SecureTransportRandomHex;
+    Status := SecKeychainCreate(PAnsiChar(KeychainPath),
+      Length(KeychainPassphrase), PAnsiChar(KeychainPassphrase), False, nil,
+      Keychain);
+    if Status <> ERR_SEC_SUCCESS then
+      raise ETransportSecurityError.CreateFmt(
+        'Failed to create temporary TLS keychain: %d', [Status]);
+    if FpChmod(PChar(string(KeychainPath)), S_IRUSR or S_IWUSR) <> 0 then
+      raise ETransportSecurityError.Create(
+        'Failed to restrict temporary TLS keychain storage');
+    CFData := CFDataCreate(nil, @IdentityBytes[0], Length(IdentityBytes));
+    if CFData = nil then
+      raise ETransportSecurityError.Create(
+        'Failed to retain configured TLS PKCS#12 identity');
+    EncodedPassphrase := UTF8Encode(APkcs12Passphrase);
+    CFPassphrase := CFStringCreateWithCString(nil,
+      PAnsiChar(EncodedPassphrase), CF_STRING_ENCODING_UTF8);
+    if CFPassphrase = nil then
+      raise ETransportSecurityError.Create(
+        'Failed to encode configured TLS PKCS#12 passphrase');
+    Keys[0] := SecureTransportImportPassphraseKey;
+    Values[0] := CFPassphrase;
+    Keys[1] := SecureTransportImportKeychainKey;
+    Values[1] := Keychain;
+    CFOptions := CFDictionaryCreate(nil, @Keys[0], @Values[0], 2,
+      SecureTransportDictionaryKeyCallbacks,
+      SecureTransportDictionaryValueCallbacks);
+    if CFOptions = nil then
+      raise ETransportSecurityError.Create(
+        'Failed to prepare configured TLS PKCS#12 import');
+    Status := SecPKCS12Import(CFData, CFOptions, @Items);
+    if (Status <> ERR_SEC_SUCCESS) or (Items = nil)
+      or (CFArrayGetCount(Items) = 0) then
+      raise ETransportSecurityError.Create(
+        'Failed to parse configured TLS PKCS#12 identity; verify the bundle and passphrase');
+    Item := CFArrayGetValueAtIndex(Items, 0);
+    CertificateChain := CFDictionaryGetValue(Item,
+      SecureTransportImportCertChainKey);
+    Identity := CFDictionaryGetValue(Item,
+      SecureTransportImportIdentityKey);
+    if (Identity = nil) or (CertificateChain = nil)
+      or (CFArrayGetCount(CertificateChain) = 0) then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must contain a certificate and private key');
+    if AValidation = tsivStrict then
+      ValidateSecureTransportServerIdentity(CertificateChain);
+    CertificateCount := CFArrayGetCount(CertificateChain);
+    SetLength(CertificateValues, CertificateCount);
+    CertificateValues[0] := Identity;
+    for Index := 1 to CertificateCount - 1 do
+      CertificateValues[Index] := CFArrayGetValueAtIndex(CertificateChain,
+        Index);
+    Result := TSecureTransportServerSnapshot.Create;
+    Result.CertificateArray := CFArrayCreate(nil, @CertificateValues[0],
+      Length(CertificateValues), SecureTransportArrayCallbacks);
+    if Result.CertificateArray = nil then
+    begin
+      Result.Free;
+      Result := nil;
+      raise ETransportSecurityError.Create(
+        'Failed to retain configured TLS certificate chain');
+    end;
+    Result.Keychain := Keychain;
+    Keychain := nil;
+    Result.KeychainPath := string(KeychainPath);
+    KeychainPath := '';
+  finally
+    if Length(IdentityBytes) > 0 then
+      FillChar(IdentityBytes[0], Length(IdentityBytes), 0);
+    IdentityBytes := nil;
+    if Length(EncodedPassphrase) > 0 then
+      FillChar(EncodedPassphrase[1], Length(EncodedPassphrase), 0);
+    EncodedPassphrase := '';
+    if Length(KeychainPassphrase) > 0 then
+      FillChar(KeychainPassphrase[1], Length(KeychainPassphrase), 0);
+    KeychainPassphrase := '';
+    if Items <> nil then
+      CFRelease(Items);
+    if CFOptions <> nil then
+      CFRelease(CFOptions);
+    if CFPassphrase <> nil then
+      CFRelease(CFPassphrase);
+    if CFData <> nil then
+      CFRelease(CFData);
+    if Keychain <> nil then
+    begin
+      SecKeychainDelete(Keychain);
+      CFRelease(Keychain);
+    end;
+    if (KeychainPath <> '') and FileExists(string(KeychainPath)) then
+      SysUtils.DeleteFile(string(KeychainPath));
+  end;
+end;
 
 function SecureTransportSocketRead(AConnection: SSLConnectionRef;
   AData: Pointer; var ADataLength: PtrUInt): OSStatus; cdecl;
@@ -647,12 +1084,377 @@ begin
     raise ETransportSecurityError.CreateFmt('%s: %d', [TLS_WRITE_ERROR, Status]);
   Result := Processed;
 end;
+
+procedure CompactSecureTransportServerOutput(
+  const AData: TSecureTransportServerData);
+var
+  Pending: Integer;
+begin
+  if not Assigned(AData) or (AData.OutputOffset <= 0) then
+    Exit;
+  Pending := Length(AData.Output) - AData.OutputOffset;
+  if Pending > 0 then
+    Move(AData.Output[AData.OutputOffset], AData.Output[0], Pending);
+  SetLength(AData.Output, Pending);
+  AData.OutputOffset := 0;
+end;
+
+function SecureTransportServerPendingCiphertext(
+  const AData: TSecureTransportServerData): Integer; inline;
+begin
+  if Assigned(AData) then
+    Result := Length(AData.Output) - AData.OutputOffset
+  else
+    Result := 0;
+end;
+
+function SecureTransportServerReadCallback(AConnection: SSLConnectionRef;
+  AData: Pointer; var ADataLength: PtrUInt): OSStatus; cdecl;
+var
+  Available, Requested, Taken: Integer;
+  Data: TSecureTransportServerData;
+begin
+  Data := TSecureTransportServerData(AConnection);
+  Requested := Integer(ADataLength);
+  Available := Length(Data.Input);
+  Taken := Requested;
+  if Taken > Available then
+    Taken := Available;
+  if Taken > 0 then
+  begin
+    Move(Data.Input[0], AData^, Taken);
+    Inc(Data.InputConsumed, QWord(Taken));
+    if Taken < Available then
+      Move(Data.Input[Taken], Data.Input[0], Available - Taken);
+    SetLength(Data.Input, Available - Taken);
+  end;
+  ADataLength := Taken;
+  Data.InputBuffered := Length(Data.Input);
+  if Taken = Requested then
+    Result := ERR_SEC_SUCCESS
+  else
+    Result := ERR_SSL_WOULD_BLOCK;
+  if Data.InputBackpressured then
+    Data.InputBackpressured := Length(Data.Input) > Data.InputLowWatermark;
+end;
+
+function SecureTransportServerWriteCallback(AConnection: SSLConnectionRef;
+  AData: Pointer; var ADataLength: PtrUInt): OSStatus; cdecl;
+var
+  Available, Existing, Requested, Taken: Integer;
+  Data: TSecureTransportServerData;
+begin
+  Data := TSecureTransportServerData(AConnection);
+  CompactSecureTransportServerOutput(Data);
+  Requested := Integer(ADataLength);
+  Existing := Length(Data.Output);
+  Available := Data.OutputCapacity - Existing;
+  Taken := Requested;
+  if Taken > Available then
+    Taken := Available;
+  if Taken > 0 then
+  begin
+    SetLength(Data.Output, Existing + Taken);
+    Move(AData^, Data.Output[Existing], Taken);
+  end;
+  ADataLength := Taken;
+  if Taken = Requested then
+    Result := ERR_SEC_SUCCESS
+  else
+    Result := ERR_SSL_WOULD_BLOCK;
+end;
+
+procedure FreeSecureTransportServerData(
+  const AData: TSecureTransportServerData);
+begin
+  if not Assigned(AData) then
+    Exit;
+  if AData.Context <> nil then
+    CFRelease(AData.Context);
+  if Assigned(AData.Snapshot) then
+    AData.Snapshot.Release;
+  AData.Context := nil;
+  AData.Snapshot := nil;
+  SetLength(AData.Input, 0);
+  SetLength(AData.Output, 0);
+  AData.Free;
+end;
+
+function SecureTransportServerData(
+  const AConnection: TTransportSecurityConnection):
+  TSecureTransportServerData; inline;
+begin
+  if (AConnection.Backend = TSB_SECURE_TRANSPORT_SERVER)
+    and Assigned(AConnection.BackendData) then
+    Result := TSecureTransportServerData(AConnection.BackendData)
+  else
+    Result := nil;
+end;
+
+procedure PoisonSecureTransportServerConnection(
+  var AConnection: TTransportSecurityConnection);
+var
+  Data: TSecureTransportServerData;
+begin
+  Data := TSecureTransportServerData(AConnection.BackendData);
+  AConnection.Active := False;
+  AConnection.Backend := TSB_NONE;
+  AConnection.BackendData := nil;
+  FreeSecureTransportServerData(Data);
+end;
+
+procedure BeginSecureTransportServer(
+  var AConnection: TTransportSecurityConnection;
+  const AContext: TTransportSecurityServerContext);
+var
+  Data: TSecureTransportServerData;
+  Snapshot: TSecureTransportServerSnapshot;
+  Status: OSStatus;
+begin
+  Snapshot := TSecureTransportServerSnapshot(AContext.AcquireSnapshot);
+  if not Assigned(Snapshot) or (Snapshot.CertificateArray = nil) then
+  begin
+    if Assigned(Snapshot) then
+      Snapshot.Release;
+    raise ETransportSecurityError.Create(
+      'TLS server context is not initialized');
+  end;
+  try
+    Data := TSecureTransportServerData.Create;
+  except
+    Snapshot.Release;
+    raise;
+  end;
+  try
+    Data.Snapshot := Snapshot;
+    Data.InputHighWatermark := AContext.FInputHighWatermark;
+    Data.InputLowWatermark := AContext.FInputLowWatermark;
+    Data.OutputCapacity := AContext.FOutputCapacity;
+    Data.Context := SSLCreateContext(nil, K_SSL_SERVER_SIDE,
+      K_SSL_STREAM_TYPE);
+    if Data.Context = nil then
+      raise ETransportSecurityError.Create(
+        'Failed to create Secure Transport server context');
+    Status := SSLSetIOFuncs(Data.Context,
+      SecureTransportServerReadCallback,
+      SecureTransportServerWriteCallback);
+    if Status <> ERR_SEC_SUCCESS then
+      raise ETransportSecurityError.CreateFmt(
+        'Failed to configure Secure Transport server I/O: %d', [Status]);
+    Status := SSLSetConnection(Data.Context, SSLConnectionRef(Data));
+    if Status <> ERR_SEC_SUCCESS then
+      raise ETransportSecurityError.CreateFmt(
+        'Failed to bind Secure Transport server I/O: %d', [Status]);
+    Status := SSLSetCertificate(Data.Context, Snapshot.CertificateArray);
+    if Status <> ERR_SEC_SUCCESS then
+      raise ETransportSecurityError.CreateFmt(
+        'Failed to configure Secure Transport server identity: %d', [Status]);
+    Status := SSLSetProtocolVersionMin(Data.Context, K_TLS_PROTOCOL_12);
+    if Status <> ERR_SEC_SUCCESS then
+      raise ETransportSecurityError.CreateFmt(
+        'Failed to configure Secure Transport server TLS floor: %d', [Status]);
+    AConnection.BackendData := Data;
+    AConnection.Backend := TSB_SECURE_TRANSPORT_SERVER;
+  except
+    FreeSecureTransportServerData(Data);
+    raise;
+  end;
+end;
+
+function FeedSecureTransportServerCiphertext(
+  var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
+  const ALength: Integer): Integer;
+var
+  Accepted, Available, Existing: Integer;
+  Data: TSecureTransportServerData;
+begin
+  Data := SecureTransportServerData(AConnection);
+  if not Assigned(Data) then
+    Exit(-1);
+  if ALength <= 0 then
+    Exit(0);
+  if not Assigned(ABuffer) then
+    raise ETransportSecurityError.Create(
+      'TLS ciphertext input buffer is nil');
+  Available := Data.InputHighWatermark - Length(Data.Input);
+  Accepted := ALength;
+  if Accepted > Available then
+    Accepted := Available;
+  if Accepted <= 0 then
+  begin
+    Data.InputBackpressured := True;
+    Exit(0);
+  end;
+  Existing := Length(Data.Input);
+  SetLength(Data.Input, Existing + Accepted);
+  Move(ABuffer^, Data.Input[Existing], Accepted);
+  Inc(Data.InputAccepted, QWord(Accepted));
+  Data.InputBackpressured := Length(Data.Input) >= Data.InputHighWatermark;
+  Data.InputBuffered := Length(Data.Input);
+  Result := Accepted;
+end;
+
+function SecureTransportServerState(
+  var AConnection: TTransportSecurityConnection;
+  const AStatus: OSStatus; const APeerCloseIsSuccess: Boolean):
+  TTransportSecurityState;
+var
+  Data: TSecureTransportServerData;
+begin
+  Data := SecureTransportServerData(AConnection);
+  if not Assigned(Data) then
+    Exit(tssError);
+  if SecureTransportServerPendingCiphertext(Data) > 0 then
+    Exit(tssWantWrite);
+  case AStatus of
+    ERR_SEC_SUCCESS: Result := tssDone;
+    ERR_SSL_WOULD_BLOCK: Result := tssWantRead;
+    ERR_SSL_CLOSED_GRACEFUL:
+      if APeerCloseIsSuccess then
+        Result := tssPeerClosed
+      else
+      begin
+        PoisonSecureTransportServerConnection(AConnection);
+        Result := tssError;
+      end;
+  else
+    PoisonSecureTransportServerConnection(AConnection);
+    Result := tssError;
+  end;
+end;
+
+function HandshakeSecureTransportServer(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+var
+  Data: TSecureTransportServerData;
+  Status: OSStatus;
+begin
+  Data := SecureTransportServerData(AConnection);
+  if not Assigned(Data) then
+    Exit(tssError);
+  if SecureTransportServerPendingCiphertext(Data) > 0 then
+    Exit(tssWantWrite);
+  if Data.HandshakeDone then
+    Exit(tssDone);
+  Status := SSLHandshake(Data.Context);
+  if Status = ERR_SEC_SUCCESS then
+  begin
+    Data.HandshakeDone := True;
+    AConnection.Active := True;
+  end;
+  Result := SecureTransportServerState(AConnection, Status, False);
+end;
+
+function SecureTransportServerInputFlow(
+  const AData: TSecureTransportServerData): TTransportSecurityInputFlow;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  if not Assigned(AData) then
+    Exit;
+  Result.AcceptedBytes := AData.InputAccepted;
+  Result.Backpressured := AData.InputBackpressured;
+  Result.BufferedBytes := Length(AData.Input);
+  Result.ConsumedBytes := AData.InputConsumed;
+  Result.HighWatermark := AData.InputHighWatermark;
+  Result.LowWatermark := AData.InputLowWatermark;
+end;
+
+function SecureTransportServerOutputFlow(
+  const AData: TSecureTransportServerData): TTransportSecurityOutputFlow;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  if not Assigned(AData) then
+    Exit;
+  Result.Capacity := AData.OutputCapacity;
+  Result.PendingBytes := SecureTransportServerPendingCiphertext(AData);
+  Result.RemainingBytes := Result.Capacity - Result.PendingBytes;
+end;
+
+function ReadSecureTransportServer(
+  var AConnection: TTransportSecurityConnection; var ABuffer: array of Byte;
+  const ALength: Integer): TTransportSecurityIOResult;
+var
+  Data: TSecureTransportServerData;
+  Processed: PtrUInt;
+  ReadLength: Integer;
+  Status: OSStatus;
+begin
+  Result.State := tssError;
+  Result.BytesProcessed := 0;
+  Data := SecureTransportServerData(AConnection);
+  if not Assigned(Data) or not Data.HandshakeDone then
+    Exit;
+  if SecureTransportServerPendingCiphertext(Data) > 0 then
+  begin
+    Result.State := tssWantWrite;
+    Exit;
+  end;
+  ReadLength := ALength;
+  if ReadLength > Length(ABuffer) then
+    ReadLength := Length(ABuffer);
+  if ReadLength <= 0 then
+  begin
+    Result.State := tssDone;
+    Exit;
+  end;
+  Processed := 0;
+  Status := SSLRead(Data.Context, @ABuffer[0], ReadLength, Processed);
+  Result.BytesProcessed := Integer(Processed);
+  Result.State := SecureTransportServerState(AConnection, Status, True);
+end;
+
+function WriteSecureTransportServer(
+  var AConnection: TTransportSecurityConnection; const ABuffer: Pointer;
+  const ALength: Integer): TTransportSecurityIOResult;
+var
+  Data: TSecureTransportServerData;
+  Processed: PtrUInt;
+  Status: OSStatus;
+begin
+  Result.State := tssError;
+  Result.BytesProcessed := 0;
+  Data := SecureTransportServerData(AConnection);
+  if not Assigned(Data) or not Data.HandshakeDone then
+    Exit;
+  if SecureTransportServerPendingCiphertext(Data) > 0 then
+  begin
+    Result.State := tssWantWrite;
+    Exit;
+  end;
+  if ALength <= 0 then
+  begin
+    Result.State := tssDone;
+    Exit;
+  end;
+  if not Assigned(ABuffer) then
+    raise ETransportSecurityError.Create(
+      'TLS plaintext output buffer is nil');
+  Processed := 0;
+  Status := SSLWrite(Data.Context, ABuffer, ALength, Processed);
+  Result.BytesProcessed := Integer(Processed);
+  Result.State := SecureTransportServerState(AConnection, Status, False);
+end;
+
+function CloseSecureTransportServerGracefully(
+  var AConnection: TTransportSecurityConnection): TTransportSecurityState;
+var
+  Data: TSecureTransportServerData;
+  Status: OSStatus;
+begin
+  Data := SecureTransportServerData(AConnection);
+  if not Assigned(Data) or not Data.HandshakeDone then
+    Exit(tssError);
+  if SecureTransportServerPendingCiphertext(Data) > 0 then
+    Exit(tssWantWrite);
+  Status := SSLClose(Data.Context);
+  Result := SecureTransportServerState(AConnection, Status, True);
+end;
 {$ENDIF}
 
 {$IFDEF TRANSPORT_SECURITY_SERVER}
-{ Server-identity support shared by the OpenSSL and SChannel server
-  backends: the PKCS#12 size ceiling, link-refusing identity-file
-  loading, and the connection/secret bookkeeping both backends use. }
+{ Server-identity support shared by the platform server backends: the
+  PKCS#12 size ceiling, link-refusing identity-file loading, and the
+  connection/secret bookkeeping they use. }
 
 const
   MAX_PKCS12_IDENTITY_SIZE = 16 * 1024 * 1024;
@@ -5149,6 +5951,10 @@ begin
     probe and no OpenSSL DLL to find. }
   Result := True;
   {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  { Secure Transport and Security.framework ship with macOS. }
+  Result := True;
+  {$ENDIF}
   {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := False;
   {$ENDIF}
@@ -5163,6 +5969,10 @@ var
 var
   Snapshot: TSChannelServerCredentialData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+var
+  Snapshot: TSecureTransportServerSnapshot;
+{$ENDIF}
 begin
   Result := nil;
   if not FCriticalSectionInitialized then
@@ -5174,6 +5984,9 @@ begin
     {$ENDIF}
     {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
     Snapshot := TSChannelServerCredentialData(FBackendData);
+    {$ENDIF}
+    {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+    Snapshot := TSecureTransportServerSnapshot(FBackendData);
     {$ENDIF}
     {$IFDEF TRANSPORT_SECURITY_SERVER}
     if Assigned(Snapshot) then
@@ -5220,6 +6033,10 @@ var
 var
   OldSnapshot: TSChannelServerCredentialData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+var
+  OldSnapshot: TSecureTransportServerSnapshot;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_SERVER}
   OldSnapshot := nil;
@@ -5233,6 +6050,9 @@ begin
     {$ENDIF}
     {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
     OldSnapshot := TSChannelServerCredentialData(FBackendData);
+    {$ENDIF}
+    {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+    OldSnapshot := TSecureTransportServerSnapshot(FBackendData);
     {$ENDIF}
     FBackendData := ANewSnapshot;
   finally
@@ -5360,6 +6180,10 @@ var
 var
   Snapshot: TSChannelServerCredentialData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+var
+  Snapshot: TSecureTransportServerSnapshot;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   if not TryLoadOpenSSLServer then
@@ -5370,6 +6194,10 @@ begin
   {$ENDIF}
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Snapshot := CreateSChannelServerSnapshot(APkcs12Identity,
+    APkcs12Passphrase, AValidation);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Snapshot := CreateSecureTransportServerSnapshot(APkcs12Identity,
     APkcs12Passphrase, AValidation);
   {$ENDIF}
   {$IFDEF TRANSPORT_SECURITY_SERVER}
@@ -5464,6 +6292,9 @@ begin
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   BeginSChannelServer(AConnection, AContext);
   {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  BeginSecureTransportServer(AConnection, AContext);
+  {$ENDIF}
   {$ELSE}
   raise ETransportSecurityError.Create(TLS_SERVER_UNSUPPORTED_ERROR);
   {$ENDIF}
@@ -5477,6 +6308,9 @@ begin
   {$ENDIF}
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Result := HandshakeSChannelServer(AConnection);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Result := HandshakeSecureTransportServer(AConnection);
   {$ENDIF}
   {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := tssError;
@@ -5493,6 +6327,10 @@ begin
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Result := FeedSChannelServerCiphertext(AConnection, ABuffer, ALength);
   {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Result := FeedSecureTransportServerCiphertext(AConnection, ABuffer,
+    ALength);
+  {$ENDIF}
   {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := -1;
   {$ENDIF}
@@ -5508,6 +6346,10 @@ var
 var
   Data: TSChannelServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+var
+  Data: TSecureTransportServerData;
+{$ENDIF}
 begin
   FillChar(Result, SizeOf(Result), 0);
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
@@ -5521,6 +6363,11 @@ begin
   if not Assigned(Data) then
     Exit;
   RefreshSChannelServerInputFlow(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Data := SecureTransportServerData(AConnection);
+  Result := SecureTransportServerInputFlow(Data);
+  Exit;
   {$ENDIF}
   {$IFDEF TRANSPORT_SECURITY_SERVER}
   Result.AcceptedBytes := Data.InputAccepted;
@@ -5542,6 +6389,10 @@ var
 var
   Data: TSChannelServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+var
+  Data: TSecureTransportServerData;
+{$ENDIF}
 begin
   FillChar(Result, SizeOf(Result), 0);
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
@@ -5551,6 +6402,10 @@ begin
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Data := SChannelServerData(AConnection);
   Result := SChannelServerOutputFlow(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Data := SecureTransportServerData(AConnection);
+  Result := SecureTransportServerOutputFlow(Data);
   {$ENDIF}
 end;
 
@@ -5564,6 +6419,10 @@ var
 var
   Data: TSChannelServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+var
+  Data: TSecureTransportServerData;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Data := OpenSSLServerData(AConnection);
@@ -5572,6 +6431,10 @@ begin
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Data := SChannelServerData(AConnection);
   Result := SChannelServerPendingCiphertext(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Data := SecureTransportServerData(AConnection);
+  Result := SecureTransportServerPendingCiphertext(Data);
   {$ENDIF}
   {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := 0;
@@ -5589,6 +6452,10 @@ var
 var
   Data: TSChannelServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+var
+  Data: TSecureTransportServerData;
+{$ENDIF}
 begin
   ABuffer := nil;
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
@@ -5598,6 +6465,10 @@ begin
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Data := SChannelServerData(AConnection);
   Result := SChannelServerPendingCiphertext(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Data := SecureTransportServerData(AConnection);
+  Result := SecureTransportServerPendingCiphertext(Data);
   {$ENDIF}
   {$IFDEF TRANSPORT_SECURITY_SERVER}
   if Result > 0 then
@@ -5619,6 +6490,11 @@ var
   Data: TSChannelServerData;
   Pending: Integer;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+var
+  Data: TSecureTransportServerData;
+  Pending: Integer;
+{$ENDIF}
 begin
   if ALength <= 0 then
     Exit;
@@ -5629,6 +6505,10 @@ begin
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Data := SChannelServerData(AConnection);
   Pending := SChannelServerPendingCiphertext(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Data := SecureTransportServerData(AConnection);
+  Pending := SecureTransportServerPendingCiphertext(Data);
   {$ENDIF}
   {$IFDEF TRANSPORT_SECURITY_SERVER}
   if not Assigned(Data) or (ALength > Pending) then
@@ -5655,6 +6535,9 @@ begin
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Result := ReadSChannelServer(AConnection, ABuffer, ALength);
   {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Result := ReadSecureTransportServer(AConnection, ABuffer, ALength);
+  {$ENDIF}
   {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result.State := tssError;
   Result.BytesProcessed := 0;
@@ -5671,6 +6554,9 @@ begin
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Result := WriteSChannelServer(AConnection, ABuffer, ALength);
   {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Result := WriteSecureTransportServer(AConnection, ABuffer, ALength);
+  {$ENDIF}
   {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result.State := tssError;
   Result.BytesProcessed := 0;
@@ -5685,6 +6571,9 @@ begin
   {$ENDIF}
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Result := CloseSChannelServerGracefully(AConnection);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Result := CloseSecureTransportServerGracefully(AConnection);
   {$ENDIF}
   {$IFNDEF TRANSPORT_SECURITY_SERVER}
   Result := tssError;
@@ -5701,6 +6590,10 @@ var
 var
   Data: TSChannelServerData;
 {$ENDIF}
+{$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+var
+  Data: TSecureTransportServerData;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Data := OpenSSLServerData(AConnection);
@@ -5711,6 +6604,13 @@ begin
   Data := SChannelServerData(AConnection);
   ResetTransportSecurityConnection(AConnection);
   FreeSChannelServerData(Data);
+  {$ENDIF}
+  {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+  Data := SecureTransportServerData(AConnection);
+  AConnection.Active := False;
+  AConnection.Backend := TSB_NONE;
+  AConnection.BackendData := nil;
+  FreeSecureTransportServerData(Data);
   {$ENDIF}
   {$IFNDEF TRANSPORT_SECURITY_SERVER}
   AConnection.Active := False;
@@ -5802,6 +6702,11 @@ begin
     {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
     TSB_SCHANNEL_SERVER:
       FreeSChannelServerData(TSChannelServerData(AConnection.BackendData));
+    {$ENDIF}
+    {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+    TSB_SECURE_TRANSPORT_SERVER:
+      FreeSecureTransportServerData(
+        TSecureTransportServerData(AConnection.BackendData));
     {$ENDIF}
     {$IFDEF TRANSPORT_SECURITY_OPENSSL}
     TSB_OPENSSL:
