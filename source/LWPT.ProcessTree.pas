@@ -400,6 +400,29 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF MSWINDOWS}
+function WriteProtocolFrameWithFailure(const AHandle: PtrInt;
+  const AFrame: string; out AErrorCode, ABytesWritten: DWORD): Boolean;
+begin
+  AErrorCode := Windows.ERROR_INVALID_HANDLE;
+  ABytesWritten := 0;
+  if (AHandle < 0) or (AFrame = '') then Exit(False);
+  if not Windows.WriteFile(THandle(AHandle), AFrame[1], Length(AFrame),
+    ABytesWritten, nil) then
+  begin
+    AErrorCode := Windows.GetLastError;
+    Exit(False);
+  end;
+  if ABytesWritten <> DWORD(Length(AFrame)) then
+  begin
+    AErrorCode := Windows.ERROR_WRITE_FAULT;
+    Exit(False);
+  end;
+  AErrorCode := Windows.ERROR_SUCCESS;
+  Result := True;
+end;
+{$ENDIF}
+
 procedure CloseProtocolHandle(var AHandle: PtrInt);
 begin
   if AHandle < 0 then Exit;
@@ -1616,6 +1639,27 @@ begin
       ProtocolFrame(InheritedChannelToken, AKind));
 end;
 
+{$IFDEF MSWINDOWS}
+function SendInheritedAcknowledgementWithFailure(const AKind: string;
+  out AFailure: string): Boolean;
+var
+  BytesWritten, ErrorCode: DWORD;
+  Frame: string;
+begin
+  AFailure := '';
+  Frame := ProtocolFrame(InheritedChannelToken, AKind);
+  Result := (InheritedStatusWriteHandle >= 0)
+    and WriteProtocolFrameWithFailure(InheritedStatusWriteHandle, Frame,
+      ErrorCode, BytesWritten);
+  if Result then Exit;
+  AFailure := 'could not send process-tree termination acknowledgement '
+    + '(emitter pid ' + UIntToStr(Windows.GetCurrentProcessId)
+    + ', wrote ' + UIntToStr(BytesWritten) + '/' + UIntToStr(Length(Frame))
+    + ' bytes, Win32 error ' + UIntToStr(ErrorCode) + ': '
+    + SysErrorMessage(ErrorCode) + ')';
+end;
+{$ENDIF}
+
 procedure IncomingCancellationDeadlines(out ADescendantDeadline,
   AAcknowledgementDeadline: QWord);
 var
@@ -1693,7 +1737,7 @@ end;
 procedure TLWPTInheritedControlForwarder.Execute;
 var
   AcknowledgementDeadline, DescendantDeadline: QWord;
-  CancellationBuffer, CancellationLine: string;
+  AcknowledgementFailure, CancellationBuffer, CancellationLine: string;
 begin
   CancellationBuffer := '';
   repeat
@@ -1715,10 +1759,10 @@ begin
       Windows.ExitProcess(ProcessTreeCancellationExitCode);
     end;
   end;
-  if not SendInheritedAcknowledgement(AcknowledgementReaped) then
+  if not SendInheritedAcknowledgementWithFailure(AcknowledgementReaped,
+    AcknowledgementFailure) then
   begin
-    ReportForwardingFailure(
-      'could not send process-tree termination acknowledgement');
+    ReportForwardingFailure(AcknowledgementFailure);
     Windows.ExitProcess(ProcessTreeCancellationExitCode);
   end;
   Windows.ExitProcess(WindowsControlExitCode);
