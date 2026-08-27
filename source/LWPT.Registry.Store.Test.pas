@@ -219,7 +219,7 @@ type
     procedure TestNetworkFrameworkTeardownOrdering;
     procedure TestNetworkFrameworkCleanupFailureSemantics;
     procedure TestDarwinTLSTransportSelection;
-    procedure TestDarwinStructuredOperatingSystemVersion;
+    procedure TestDarwinKernelRelease;
     procedure TestDarwinListenerCapabilitySelection;
     procedure TestServerErrorsConformToWireContract;
     procedure TestRenewalErrorDoesNotDiscloseStorePath;
@@ -232,63 +232,76 @@ type
 procedure TRegistryStoreContract.TestDarwinTLSTransportSelection;
 begin
   Expect<TRegistryDarwinTLSTransport>(
-    RegistryDarwinTLSTransportForMajorVersion(15)).ToBe(
+    RegistryDarwinTLSTransportForKernelMajor(24)).ToBe(
       rdttSecureTransport);
   Expect<TRegistryDarwinTLSTransport>(
-    RegistryDarwinTLSTransportForMajorVersion(25)).ToBe(
-      rdttSecureTransport);
-  Expect<TRegistryDarwinTLSTransport>(
-    RegistryDarwinTLSTransportForMajorVersion(26)).ToBe(
+    RegistryDarwinTLSTransportForKernelMajor(25)).ToBe(
       rdttNetworkFramework);
   Expect<TRegistryDarwinTLSTransport>(
-    RegistryDarwinTLSTransportForMajorVersion(30)).ToBe(
+    RegistryDarwinTLSTransportForKernelMajor(26)).ToBe(
       rdttNetworkFramework);
 end;
 
-procedure TRegistryStoreContract.TestDarwinStructuredOperatingSystemVersion;
+procedure TRegistryStoreContract.TestDarwinKernelRelease;
 var
-  Diagnostic: string;
   {$IFDEF DARWIN}
   RuntimeMajor: Cardinal;
   {$ENDIF}
-begin
-  Expect<Cardinal>(RegistryDarwinOperatingSystemVersionMajorForTesting(
-    15)).ToBe(15);
-  Expect<Cardinal>(RegistryDarwinOperatingSystemVersionMajorForTesting(
-    26)).ToBe(26);
-  Diagnostic := '';
-  try
-    RegistryDarwinOperatingSystemVersionMajorForTesting(0);
-  except
-    on E: Exception do Diagnostic := E.Message;
+  procedure ExpectRejected(const ARelease: string);
+  var
+    Diagnostic: string;
+  begin
+    Diagnostic := '';
+    try
+      RegistryDarwinKernelReleaseMajorForTesting(ARelease);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Diagnostic = 'tls_configuration: could not determine '
+      + 'the Darwin kernel release').ToBe(True);
   end;
-  Expect<Boolean>(Pos('tls_configuration:', Diagnostic) = 1).ToBe(True);
+begin
+  Expect<Cardinal>(RegistryDarwinKernelReleaseMajorForTesting(
+    '24.6.0')).ToBe(24);
+  Expect<Cardinal>(RegistryDarwinKernelReleaseMajorForTesting(
+    '25.0.0')).ToBe(25);
+  ExpectRejected('');
+  ExpectRejected('0.0.0');
+  ExpectRejected('24');
+  ExpectRejected('24.6');
+  ExpectRejected('24.6.0.1');
+  ExpectRejected('24..0');
+  ExpectRejected('24.a.0');
+  ExpectRejected('-24.6.0');
+  ExpectRejected('4294967296.0.0');
+  ExpectRejected('24.4294967296.0');
+  ExpectRejected('24.0.4294967296');
   {$IFDEF DARWIN}
-  RuntimeMajor := RegistryDarwinOperatingSystemMajorVersion;
-  Expect<Boolean>(RuntimeMajor >= 15).ToBe(True);
-  if RuntimeMajor >= 26 then
+  RuntimeMajor := RegistryDarwinKernelReleaseMajor;
+  Expect<Boolean>(RuntimeMajor >= 24).ToBe(True);
+  if RuntimeMajor >= 25 then
     Expect<TRegistryDarwinTLSTransport>(
-      RegistryDarwinTLSTransportForMajorVersion(RuntimeMajor)).ToBe(
+      RegistryDarwinTLSTransportForKernelMajor(RuntimeMajor)).ToBe(
         rdttNetworkFramework)
   else
     Expect<TRegistryDarwinTLSTransport>(
-      RegistryDarwinTLSTransportForMajorVersion(RuntimeMajor)).ToBe(
+      RegistryDarwinTLSTransportForKernelMajor(RuntimeMajor)).ToBe(
         rdttSecureTransport);
   {$ENDIF}
 end;
 
 procedure TRegistryStoreContract.TestDarwinListenerCapabilitySelection;
 begin
-  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
-    'localhost', 15)).ToBe(True);
-  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
-    '127.0.0.1', 15)).ToBe(True);
-  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
-    '::1', 15)).ToBe(False);
-  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
-    'registry.example.com', 15)).ToBe(False);
-  Expect<Boolean>(RegistryDarwinListenAddressSupportedForMajorVersion(
-    '::1', 26)).ToBe(True);
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForKernelMajor(
+    'localhost', 24)).ToBe(True);
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForKernelMajor(
+    '127.0.0.1', 24)).ToBe(True);
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForKernelMajor(
+    '::1', 24)).ToBe(False);
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForKernelMajor(
+    'registry.example.com', 24)).ToBe(False);
+  Expect<Boolean>(RegistryDarwinListenAddressSupportedForKernelMajor(
+    '::1', 25)).ToBe(True);
 end;
 
 constructor TReaderThread.Create(AStore: TLWPTRegistryStore);
@@ -979,7 +992,7 @@ var
   Store: TLWPTRegistryStore;
 begin
   {$IFDEF DARWIN}
-  SetRegistryDarwinOperatingSystemMajorVersionForTesting(15);
+  SetRegistryDarwinKernelReleaseMajorForTesting(24);
   {$ENDIF}
   try
   Config := RegistryConfiguration('', 'https://[::1]:9417', '::1', 9417,
@@ -1009,7 +1022,7 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/registry.toml')).ToBe(False);
   finally
     {$IFDEF DARWIN}
-    SetRegistryDarwinOperatingSystemMajorVersionForTesting(0);
+    SetRegistryDarwinKernelReleaseMajorForTesting(0);
     {$ENDIF}
   end;
 end;
@@ -1738,10 +1751,10 @@ begin
     TestNetworkFrameworkTeardownOrdering);
   Test('Network.framework cleanup preserves an active primary failure',
     TestNetworkFrameworkCleanupFailureSemantics);
-  Test('Darwin TLS transport selection follows product version',
+  Test('Darwin TLS transport selection follows the kernel release',
     TestDarwinTLSTransportSelection);
-  Test('Darwin structured product version query is deterministic',
-    TestDarwinStructuredOperatingSystemVersion);
+  Test('Darwin kernel release query is strict and deterministic',
+    TestDarwinKernelRelease);
   Test('Darwin listener capability follows the runtime TLS transport',
     TestDarwinListenerCapabilitySelection);
   Test('server errors conform to the wire contract',

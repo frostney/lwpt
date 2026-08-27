@@ -106,13 +106,14 @@ The self-hosted registry keeps its Network.framework listener as the default
 on macOS 26 and newer. On macOS 15 and older it selects the portable registry
 socket listener, which delegates TLS to the HTTPClient Secure Transport server
 backend and therefore shares the same request parsing, routing, resource, and
-shutdown behavior as Windows and Unix. The selector reads the runtime macOS
-product-version major from the structured public
-`NSProcessInfo.operatingSystemVersion` value; it does not parse the localized
-human-readable version string. CPU architecture has no role. On the Secure
-Transport compatibility path, initialization accepts only `localhost` or a
-canonical IPv4 address so an IPv6 configuration cannot be persisted for a
-listener that cannot serve it. Neither Darwin path links or loads OpenSSL.
+shutdown behavior as Windows and Unix. The selector reads the public runtime
+Darwin kernel release returned by `uname`: kernel 24 uses Secure Transport,
+while kernel 25 and newer uses Network.framework. It does not synthesize a
+macOS marketing version, depend on compatibility-sensitive Foundation
+reporting, or inspect CPU architecture. On the Secure Transport compatibility
+path, initialization accepts only `localhost` or a canonical IPv4 address so
+an IPv6 configuration cannot be persisted for a listener that cannot serve
+it. Neither Darwin path links or loads OpenSSL.
 
 #### Quarantine workaround
 

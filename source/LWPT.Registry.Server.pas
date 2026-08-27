@@ -111,8 +111,8 @@ var
 {$IFDEF DARWIN}
 function CurrentRegistryDarwinTLSTransport: TRegistryDarwinTLSTransport;
 begin
-  Result := RegistryDarwinTLSTransportForMajorVersion(
-    RegistryDarwinOperatingSystemMajorVersion);
+  Result := RegistryDarwinTLSTransportForKernelMajor(
+    RegistryDarwinKernelReleaseMajor);
 end;
 {$ENDIF}
 

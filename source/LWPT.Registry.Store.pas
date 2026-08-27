@@ -103,18 +103,18 @@ function RegistryConfiguration(const AIdentity, ABaseURL,
   AListenAddress: string; const APort: Word; const ATLSPKCS12Path,
   ATLSPasswordEnvironment: string): TLWPTRegistryConfig;
 procedure ValidateRegistryConfiguration(const AConfig: TLWPTRegistryConfig);
-function RegistryDarwinTLSTransportForMajorVersion(
-  const AMajorVersion: Cardinal): TRegistryDarwinTLSTransport;
-function RegistryDarwinListenAddressSupportedForMajorVersion(
-  const AListenAddress: string; const AMajorVersion: Cardinal): Boolean;
+function RegistryDarwinTLSTransportForKernelMajor(
+  const AKernelMajor: Cardinal): TRegistryDarwinTLSTransport;
+function RegistryDarwinListenAddressSupportedForKernelMajor(
+  const AListenAddress: string; const AKernelMajor: Cardinal): Boolean;
 {$IFDEF DARWIN}
-function RegistryDarwinOperatingSystemMajorVersion: Cardinal;
+function RegistryDarwinKernelReleaseMajor: Cardinal;
 {$ENDIF}
 {$IFDEF REGISTRY_TESTING}
-function RegistryDarwinOperatingSystemVersionMajorForTesting(
-  const AMajorVersion: NativeInt): Cardinal;
-procedure SetRegistryDarwinOperatingSystemMajorVersionForTesting(
-  const AMajorVersion: Cardinal);
+function RegistryDarwinKernelReleaseMajorForTesting(
+  const ARelease: string): Cardinal;
+procedure SetRegistryDarwinKernelReleaseMajorForTesting(
+  const AKernelMajor: Cardinal);
 procedure SetRegistryFailurePointForTesting(const APoint: string);
 procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
   AReleasePath: string);
@@ -123,10 +123,6 @@ procedure SetRegistryRecoveryBarrierForTesting(const AReadyPath,
 {$ENDIF}
 
 implementation
-
-{$IFDEF DARWIN}
-{$linkframework Foundation}
-{$ENDIF}
 
 uses
   DateUtils,
@@ -150,35 +146,10 @@ const
   INITIALIZATION_MARKER = '.initializing';
   CHECKPOINT_DOMAIN = PROJECT_NAME + '-REGISTRY-CHECKPOINT-V1' + #10;
   CHECKPOINT_RENEWAL_THRESHOLD_HOURS = 24;
-  NETWORK_FRAMEWORK_REGISTRY_MINIMUM_MACOS_MAJOR = 26;
+  NETWORK_FRAMEWORK_REGISTRY_MINIMUM_DARWIN_KERNEL_MAJOR = 25;
 
 type
   TRegistryIPv6Address = array[0..15] of Byte;
-
-{$IFDEF DARWIN}
-type
-  TNSOperatingSystemVersion = record
-    MajorVersion: NativeInt;
-    MinorVersion: NativeInt;
-    PatchVersion: NativeInt;
-  end;
-
-function ObjCGetClass(AName: PAnsiChar): Pointer; cdecl;
-  external name 'objc_getClass';
-function ObjCMessagePointer(AReceiver, ASelector: Pointer): Pointer; cdecl;
-  external name 'objc_msgSend';
-{$IFDEF CPUX86_64}
-function ObjCMessageOperatingSystemVersion(AReceiver,
-  ASelector: Pointer): TNSOperatingSystemVersion; cdecl;
-  external name 'objc_msgSend_stret';
-{$ELSE}
-function ObjCMessageOperatingSystemVersion(AReceiver,
-  ASelector: Pointer): TNSOperatingSystemVersion; cdecl;
-  external name 'objc_msgSend';
-{$ENDIF}
-function ObjCRegisterSelector(AName: PAnsiChar): Pointer; cdecl;
-  external name 'sel_registerName';
-{$ENDIF}
 
 {$IFDEF REGISTRY_TESTING}
 var
@@ -187,7 +158,7 @@ var
   RegistryPublicationReleasePathForTesting: string;
   RegistryRecoveryReadyPathForTesting: string;
   RegistryRecoveryReleasePathForTesting: string;
-  RegistryDarwinMajorVersionForTesting: Cardinal;
+  RegistryDarwinKernelMajorForTesting: Cardinal;
 procedure InjectRegistryFailure(const APoint: string); forward;
 {$ENDIF}
 
@@ -680,30 +651,59 @@ begin
   Result := OctetCount = 4;
 end;
 
-function RegistryDarwinOperatingSystemVersionMajor(
-  const AMajorVersion: NativeInt): Cardinal;
-begin
-  if (AMajorVersion <= 0) or (QWord(AMajorVersion) > High(Cardinal)) then
+function ParseRegistryDarwinKernelReleaseMajor(
+  const ARelease: string): Cardinal;
+var
+  Character: Char;
+  Digit, Dots: Integer;
+  HasDigit: Boolean;
+  Major, PartValue: QWord;
+  procedure Reject;
+  begin
     raise ELWPTRegistryError.CreateStable('tls_configuration',
-      'could not determine the macOS product version');
-  Result := Cardinal(AMajorVersion);
+      'could not determine the Darwin kernel release');
+  end;
+begin
+  Dots := 0;
+  HasDigit := False;
+  Major := 0;
+  PartValue := 0;
+  for Character in ARelease do
+    if Character in ['0'..'9'] then
+    begin
+      HasDigit := True;
+      Digit := Ord(Character) - Ord('0');
+      if PartValue > (High(Cardinal) - QWord(Digit)) div 10 then Reject;
+      PartValue := PartValue * 10 + QWord(Digit);
+    end
+    else if Character = '.' then
+    begin
+      if (not HasDigit) or (Dots >= 2) then Reject;
+      if Dots = 0 then Major := PartValue;
+      Inc(Dots);
+      HasDigit := False;
+      PartValue := 0;
+    end
+    else Reject;
+  if (Dots <> 2) or (not HasDigit) or (Major = 0) then Reject;
+  Result := Cardinal(Major);
 end;
 
-function RegistryDarwinTLSTransportForMajorVersion(
-  const AMajorVersion: Cardinal): TRegistryDarwinTLSTransport;
+function RegistryDarwinTLSTransportForKernelMajor(
+  const AKernelMajor: Cardinal): TRegistryDarwinTLSTransport;
 begin
-  if AMajorVersion >= NETWORK_FRAMEWORK_REGISTRY_MINIMUM_MACOS_MAJOR then
+  if AKernelMajor >= NETWORK_FRAMEWORK_REGISTRY_MINIMUM_DARWIN_KERNEL_MAJOR then
     Result := rdttNetworkFramework
   else
     Result := rdttSecureTransport;
 end;
 
-function RegistryDarwinListenAddressSupportedForMajorVersion(
-  const AListenAddress: string; const AMajorVersion: Cardinal): Boolean;
+function RegistryDarwinListenAddressSupportedForKernelMajor(
+  const AListenAddress: string; const AKernelMajor: Cardinal): Boolean;
 var
   CanonicalAddress: string;
 begin
-  if RegistryDarwinTLSTransportForMajorVersion(AMajorVersion)
+  if RegistryDarwinTLSTransportForKernelMajor(AKernelMajor)
     = rdttNetworkFramework then
     Exit(True);
   if SameText(AListenAddress, 'localhost') then Exit(True);
@@ -712,37 +712,34 @@ begin
 end;
 
 {$IFDEF DARWIN}
-function RegistryDarwinOperatingSystemMajorVersion: Cardinal;
+function RegistryDarwinKernelReleaseMajor: Cardinal;
 var
-  ProcessInfo: Pointer;
-  Version: TNSOperatingSystemVersion;
+  SystemInfo: TutsName;
 begin
   {$IFDEF REGISTRY_TESTING}
-  if RegistryDarwinMajorVersionForTesting <> 0 then
-    Exit(RegistryDarwinMajorVersionForTesting);
+  if RegistryDarwinKernelMajorForTesting <> 0 then
+    Exit(RegistryDarwinKernelMajorForTesting);
   {$ENDIF}
-  ProcessInfo := ObjCMessagePointer(ObjCGetClass('NSProcessInfo'),
-    ObjCRegisterSelector('processInfo'));
-  if ProcessInfo = nil then
+  FillChar(SystemInfo, SizeOf(SystemInfo), 0);
+  if fpUname(SystemInfo) <> 0 then
     raise ELWPTRegistryError.CreateStable('tls_configuration',
-      'could not determine the macOS product version');
-  Version := ObjCMessageOperatingSystemVersion(ProcessInfo,
-    ObjCRegisterSelector('operatingSystemVersion'));
-  Result := RegistryDarwinOperatingSystemVersionMajor(Version.MajorVersion);
+      'could not determine the Darwin kernel release');
+  Result := ParseRegistryDarwinKernelReleaseMajor(
+    StrPas(PChar(@SystemInfo.release[0])));
 end;
 {$ENDIF}
 
 {$IFDEF REGISTRY_TESTING}
-function RegistryDarwinOperatingSystemVersionMajorForTesting(
-  const AMajorVersion: NativeInt): Cardinal;
+function RegistryDarwinKernelReleaseMajorForTesting(
+  const ARelease: string): Cardinal;
 begin
-  Result := RegistryDarwinOperatingSystemVersionMajor(AMajorVersion);
+  Result := ParseRegistryDarwinKernelReleaseMajor(ARelease);
 end;
 
-procedure SetRegistryDarwinOperatingSystemMajorVersionForTesting(
-  const AMajorVersion: Cardinal);
+procedure SetRegistryDarwinKernelReleaseMajorForTesting(
+  const AKernelMajor: Cardinal);
 begin
-  RegistryDarwinMajorVersionForTesting := AMajorVersion;
+  RegistryDarwinKernelMajorForTesting := AKernelMajor;
 end;
 {$ENDIF}
 
@@ -1108,8 +1105,8 @@ begin
   if (AConfig.ListenAddress = '') or (AConfig.Port = 0) then
     raise ELWPTRegistryError.CreateStable('invalid_configuration', 'listen address and port are required');
   {$IFDEF DARWIN}
-  if RegistryDarwinTLSTransportForMajorVersion(
-    RegistryDarwinOperatingSystemMajorVersion) = rdttSecureTransport then
+  if RegistryDarwinTLSTransportForKernelMajor(
+    RegistryDarwinKernelReleaseMajor) = rdttSecureTransport then
   {$ENDIF}
   if not SameText(AConfig.ListenAddress, 'localhost') then
   begin
