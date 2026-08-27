@@ -243,10 +243,10 @@ begin
 end;
 
 procedure TRegistryStoreContract.TestDarwinKernelRelease;
+{$IFDEF DARWIN}
 var
-  {$IFDEF DARWIN}
   RuntimeMajor: Cardinal;
-  {$ENDIF}
+{$ENDIF}
   procedure ExpectRejected(const ARelease: string);
   var
     Diagnostic: string;
