@@ -1,7 +1,7 @@
 # LWPT — lightweight Pascal toolkit
 
 A small, dependency-light toolkit for FreePascal / Delphi projects.
-One executable, fourteen subcommands, driven by a single `lwpt.toml`
+One executable, fifteen command families, driven by a single `lwpt.toml`
 manifest. Zero-install by default — `git clone && fpc @lwpt.cfg`
 builds a project without running `lwpt install` first.
 
@@ -17,6 +17,7 @@ lwpt format    format uses-clauses + identifiers   [--check]
 lwpt duplication report manifest-scoped Pascal token clones   [--json]
 lwpt test      discover, compile and run *.Test.pas files   [--jobs N] [--bail N]
 lwpt repair    reclaim install, build-session, and worker-lease residue
+lwpt registry  initialize or serve a self-hosted registry origin   <init|serve>
 lwpt run       invoke a user-declared run task (or alias a subcommand)
 lwpt health    report Pascal complexity and optional Git hotspots   [--json] [--hotspots]
 lwpt agents    write/verify the agent-facing command reference in AGENTS.md   [--check]
@@ -64,6 +65,8 @@ bootstrap.bat      # Windows
 ./build/lwpt outdated           # report newer advertised tags
 ./build/lwpt update             # bump constraints + refresh the lock
 ./build/lwpt repair             # recover install, build, and worker residue
+./build/lwpt registry init      # initialize a self-hosted registry origin
+./build/lwpt registry serve     # serve the origin in the foreground
 ./build/lwpt health             # deterministic complexity report
 ./build/lwpt health --hotspots  # add local Git churn and hotspot ranking
 ```

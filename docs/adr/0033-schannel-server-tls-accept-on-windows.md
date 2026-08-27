@@ -5,7 +5,9 @@
 - **Windows server accept is native SChannel.** `AcceptSecurityContext` plus
   crypt32 identity handling replaces the runtime-loaded OpenSSL 3 server
   backend that [ADR-0024](./0024-openssl-server-tls-accept.md) introduced.
-  Unix-not-Darwin keeps memory-BIO OpenSSL; Darwin keeps Network.framework.
+  Unix-not-Darwin keeps memory-BIO OpenSSL; Darwin uses public Secure
+  Transport at the HTTPClient seam while the registry prefers
+  Network.framework on macOS 26 and newer.
 - **Windows now has no OpenSSL relationship at all.** The client was already
   SChannel per [ADR-0016](./0016-tls-backend-per-platform.md), so removing the
   server backend removes the last consumer. `TRANSPORT_SECURITY_OPENSSL` is now

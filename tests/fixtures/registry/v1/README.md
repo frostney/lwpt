@@ -40,8 +40,8 @@ the otherwise valid sequence-1 checkpoint must fail with
 
 | Protocol resource | Fixture |
 | --- | --- |
-| Discovery | `discovery-origin.toml`, `discovery-mirror.toml` |
-| Capabilities | `capabilities-origin.toml`, `capabilities-mirror.toml` |
+| Discovery | `discovery-origin.toml`, `discovery-origin-read-only.toml`, `discovery-mirror.toml` |
+| Capabilities | `capabilities-origin.toml`, `capabilities-origin-read-only.toml`, `capabilities-mirror.toml` |
 | Public keys | `keys/root.toml`, `keys/rotated.toml` |
 | Package records | `records/<sha256>.toml` |
 | Archive objects | `objects/<sha256>.hex` |

@@ -57,6 +57,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0034](./adr/0034-freeze-test-selection-before-pretest.md) | Test discovery and file/directory/glob selection freeze before `pretest`; hooks may prepare inputs but cannot add programs to the invocation |
 | [0036](./adr/0036-per-user-dependency-archive-cas.md) | Verified dependency archives reuse one per-user immutable SHA-256 object while project-owned archives and frozen verification remain authoritative |
 | [0037](./adr/0037-verified-build-result-cache.md) | Verified compiler-neutral build-result reuse through per-user immutable manifests and artifacts, with explicit bypass |
+| [0043](./adr/0043-self-hosted-registry-origin.md) | Self-hosted registry origin command family, content-addressed storage, atomic signed state, recovery, and native TLS lifecycle |
 
 ## Spikes
 

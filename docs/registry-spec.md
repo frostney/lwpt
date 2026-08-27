@@ -9,12 +9,13 @@
 - Immutable package records, snapshots, and archive objects are addressed by
   SHA-256. A short-lived checkpoint signed with Ed25519 identifies the current
   snapshot.
-- Origins accept authenticated, atomic publication through the HTTP API.
+- Origins may start read-only and advertise authenticated, atomic publication
+  through the HTTP API only when that surface is enabled.
   Mirrors synchronize the same immutable objects and publish a checkpoint only
   after every referenced object has verified.
-- This document specifies the interoperable wire contract. Implementing the
-  registry executable, storage engine, command surface, or lifecycle requires
-  an implementation ADR in the corresponding implementation issue.
+- This document specifies the interoperable wire contract. The origin
+  executable, storage engine, command surface, and lifecycle are recorded in
+  [ADR-0043](./adr/0043-self-hosted-registry-origin.md).
 
 ## Status and conformance language
 
@@ -31,8 +32,9 @@ valid cases and rejects every invalid case for the stated reason.
 ## Roles and terminology
 
 **Origin**
-: The authority that accepts publications, assigns monotonic snapshot sequence
-  numbers, and signs checkpoints.
+: The authority that assigns monotonic snapshot sequence numbers and signs
+  checkpoints. An origin may be read-only while its publication surface is
+  disabled.
 
 **Mirror**
 : An independently operated, read-only HTTP server that synchronizes immutable
@@ -215,6 +217,10 @@ checkpoint = "https://mirror.example.net/lwpt/v1/checkpoints/latest.toml"
 rotations = "https://mirror.example.net/lwpt/v1/rotations"
 ```
 
+`rotations` is present only when `rotation-chain-v1` is advertised. This lets
+an origin expose its signed read surface before rotation support is enabled
+without claiming an endpoint it does not implement.
+
 `role` is `origin` or `mirror`. `origin` MUST independently satisfy the
 canonical URI and transport rules. `base_url` and every service endpoint URL
 MUST satisfy those rules and remain under `base_url`.
@@ -233,9 +239,10 @@ auth_schemes = ["bearer"]
 max_page_size = 100
 ```
 
-Origins advertise `publication-v1`; mirrors MUST NOT. Unknown features may be
-ignored. Origins advertising `publication-v1` MUST advertise at least one
-authentication scheme. Protocol 1 defines `bearer`; clients send
+Origins MAY advertise `publication-v1`; mirrors MUST NOT. A read-only origin
+omits it and uses `auth_schemes = []`. Unknown features may be ignored. Origins
+advertising `publication-v1` MUST advertise at least one authentication
+scheme. Protocol 1 defines `bearer`; clients send
 `Authorization: Bearer <token>`, and an unauthenticated publication request
 returns `401` with `WWW-Authenticate: Bearer`. Mirrors use
 `auth_schemes = []`. Unknown authentication schemes may be ignored if a common

@@ -1,6 +1,6 @@
 { LWPT — lightweight Pascal toolkit.
 
-  One executable, fourteen subcommands sharing a common core (manifest,
+  One executable, fifteen command families sharing a common core (manifest,
   TOML, resolver, cfg emitter):
     init      scaffold a new project or adopt an existing manifest
     install   resolve + fetch dependencies, write lwpt.lock + lwpt.cfg
@@ -17,6 +17,7 @@
     health    report Pascal complexity and optional Git hotspots
     agents    write/verify the agent-facing command reference in
               AGENTS.md (ADR-0027)
+    registry  initialize or serve a self-hosted origin (ADR-0043)
 
   earlier (ADR-0015) there was an eighth subcommand, `export`, which
   extruded the embedded TestingPascalLibrary blob into the consumer's
@@ -52,13 +53,15 @@ uses
   LWPT.Command.Install,
   LWPT.Command.Outdated,
   LWPT.Command.Remove,
+  LWPT.Command.Registry,
   LWPT.Command.Update,
   LWPT.Command.Repair,
   LWPT.Command.Run,
   LWPT.Command.Testing,
   LWPT.Core,
   LWPT.OutputRenderer,
-  LWPT.ProcessTree;
+  LWPT.ProcessTree,
+  LWPT.Registry.Store;
 
 const
   MILLISECONDS_PER_CENTISECOND = 10;
@@ -450,6 +453,83 @@ begin
   end;
 end;
 
+{ --- registry ---------------------------------------------------------- }
+function HandleRegistry(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+var
+  BaseURL, DataDirectory, Identity, ListenAddress, TLSPKCS12,
+    TLSPasswordEnvironment: string;
+  Index, Port: Integer;
+  ServeConfigurationPresent: Boolean;
+begin
+  if APositionals.Count <> 1 then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('registry'),
+      'expected exactly one operation: init or serve');
+    Exit(1);
+  end;
+  DataDirectory := REGISTRY_DEFAULT_DATA_DIR;
+  Identity := '';
+  BaseURL := REGISTRY_DEFAULT_BASE_URL;
+  ListenAddress := REGISTRY_DEFAULT_LISTEN_ADDRESS;
+  Port := REGISTRY_DEFAULT_PORT;
+  TLSPKCS12 := '';
+  TLSPasswordEnvironment := '';
+  ServeConfigurationPresent := False;
+  for Index := 0 to High(AOptions) do
+  begin
+    if AOptions[Index].Present
+      and not SameText(AOptions[Index].LongName, 'data-dir')
+      and not SameText(AOptions[Index].LongName, 'silent') then
+      ServeConfigurationPresent := True;
+    if AOptions[Index] is TStringOption then
+    begin
+      if SameText(AOptions[Index].LongName, 'data-dir') then
+        DataDirectory := TStringOption(AOptions[Index]).ValueOr(DataDirectory)
+      else if SameText(AOptions[Index].LongName, 'identity') then
+        Identity := TStringOption(AOptions[Index]).ValueOr(Identity)
+      else if SameText(AOptions[Index].LongName, 'base-url') then
+        BaseURL := TStringOption(AOptions[Index]).ValueOr(BaseURL)
+      else if SameText(AOptions[Index].LongName, 'listen') then
+        ListenAddress := TStringOption(AOptions[Index]).ValueOr(ListenAddress)
+      else if SameText(AOptions[Index].LongName, 'tls-pkcs12') then
+        TLSPKCS12 := TStringOption(AOptions[Index]).ValueOr(TLSPKCS12)
+      else if SameText(AOptions[Index].LongName, 'tls-password-env') then
+        TLSPasswordEnvironment := TStringOption(AOptions[Index]).ValueOr(
+          TLSPasswordEnvironment);
+    end
+    else if SameText(AOptions[Index].LongName, 'port') then
+      Port := TIntegerOption(AOptions[Index]).ValueOr(Port);
+  end;
+  try
+    if SameText(APositionals[0], 'init') then
+      Result := CmdRegistryInit(DataDirectory, Identity, BaseURL,
+        ListenAddress, Port, TLSPKCS12, TLSPasswordEnvironment)
+    else if SameText(APositionals[0], 'serve') then
+    begin
+      if ServeConfigurationPresent then
+      begin
+        WriteLn(ErrOutput, ErrPrefix('registry'),
+          'serve accepts only --data-dir; change persisted configuration with init');
+        Exit(1);
+      end;
+      Result := CmdRegistryServe(DataDirectory);
+    end
+    else
+    begin
+      WriteLn(ErrOutput, ErrPrefix('registry'), 'unknown operation "',
+        APositionals[0], '"; expected init or serve');
+      Result := 1;
+    end;
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, ErrPrefix('registry'), E.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
 { --- init --------------------------------------------------------------- }
 function HandleInit(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
@@ -660,7 +740,7 @@ end;
 var
   InstallOpts, AddOpts, RemoveOpts, OutdatedOpts, UpdateOpts, TestOpts,
     BuildOpts, InitOpts, RunOpts, FormatOpts, HealthOpts, DuplicationOpts,
-    RepairOpts, AgentsOpts : TOptionArray;
+    RepairOpts, RegistryOpts, AgentsOpts : TOptionArray;
 begin
   if HandleTopLevelFlags then
   begin
@@ -767,6 +847,26 @@ begin
     Registry.Add(TSubcommand.Create('repair',
       'Recover project and shared-cache residue', '',
       @HandleRepair, RepairOpts));
+
+    SetLength(RegistryOpts, 7);
+    RegistryOpts[0] := TStringOption.Create('data-dir',
+      'Origin data directory (default: ' + REGISTRY_DEFAULT_DATA_DIR + ')');
+    RegistryOpts[1] := TStringOption.Create('identity',
+      'Stable canonical HTTPS origin identity (init only)');
+    RegistryOpts[2] := TStringOption.Create('base-url',
+      'Canonical public base URL (init only; default: http://localhost:8080)');
+    RegistryOpts[3] := TStringOption.Create('listen',
+      'Listen address (init only; default: localhost)');
+    RegistryOpts[4] := TIntegerOption.Create('port',
+      'Listen port (init only; default: 8080)');
+    RegistryOpts[5] := TStringOption.Create('tls-pkcs12',
+      'PKCS#12 identity path required by HTTPS (init only)');
+    RegistryOpts[6] := TStringOption.Create('tls-password-env',
+      'Environment variable containing the PKCS#12 password (init only)');
+    Registry.Add(TSubcommand.Create('registry',
+      'Initialize or serve a self-hosted registry origin',
+      '<init|serve> [--data-dir <path>] [configuration options]',
+      @HandleRegistry, RegistryOpts));
 
     SetLength(InitOpts, 3);
     InitOpts[0] := TFlagOption.Create('yes',
