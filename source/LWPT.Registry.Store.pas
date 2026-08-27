@@ -1412,7 +1412,8 @@ begin
       EntryPath := IncludeTrailingPathDelimiter(ARoot)
         + INITIALIZATION_MARKER;
       ValidateRegistryPath(EntryPath);
-      if ReadText(EntryPath) <> 'registry initialization in progress' + #10 then
+      if ReadText(EntryPath, nil, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES)
+        <> 'registry initialization in progress' + #10 then
         raise ELWPTRegistryError.CreateStable('origin_directory_not_empty',
           'registry initialization ownership marker is invalid');
     end;

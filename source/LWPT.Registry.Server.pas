@@ -60,6 +60,8 @@ function OpenRegistryHTTPResource(const AResponse: TLWPTRegistryHTTPResponse;
 {$IFDEF REGISTRY_TESTING}
 function RegistryDeadlineTimeoutForTesting(const ADeadline,
   ANow: QWord): LongInt;
+function RegistryTLSShutdownStateIsTerminalForTesting(
+  const AState: Integer): Boolean;
 {$ENDIF}
 
 implementation
@@ -626,11 +628,25 @@ begin
   if Result < 1 then Result := 1;
 end;
 
+function RegistryTLSShutdownStateIsTerminal(
+  const AState: TTransportSecurityState): Boolean; inline;
+begin
+  Result := AState in [tssDone, tssError, tssPeerClosed];
+end;
+
 {$IFDEF REGISTRY_TESTING}
 function RegistryDeadlineTimeoutForTesting(const ADeadline,
   ANow: QWord): LongInt;
 begin
   Result := RegistryDeadlineTimeout(ADeadline, ANow);
+end;
+
+function RegistryTLSShutdownStateIsTerminalForTesting(
+  const AState: Integer): Boolean;
+begin
+  Result := (AState >= Ord(Low(TTransportSecurityState)))
+    and (AState <= Ord(High(TTransportSecurityState)))
+    and RegistryTLSShutdownStateIsTerminal(TTransportSecurityState(AState));
 end;
 {$ENDIF}
 
@@ -852,17 +868,31 @@ var
   Buffer: PByte;
   Offset: Integer;
   IOResult: TTransportSecurityIOResult;
+  RetryPending: Boolean;
 begin
   Buffer := @ABuffer;
   Offset := 0;
+  RetryPending := False;
   while Offset < ACount do
   begin
     if GetTickCount64 >= ADeadline then
       raise ELWPTRegistryError.CreateStable('connection_deadline',
         'registry connection exceeded its total deadline');
-    IOResult := TransportSecurityServerWrite(AConnection, @Buffer[Offset],
-      ACount - Offset);
-    Inc(Offset, IOResult.BytesProcessed);
+    if RetryPending then
+      IOResult := TransportSecurityServerWrite(AConnection, nil, 0)
+    else
+      IOResult := TransportSecurityServerWrite(AConnection, @Buffer[Offset],
+        ACount - Offset);
+    if IOResult.BytesProcessed > 0 then
+    begin
+      Inc(Offset, IOResult.BytesProcessed);
+      RetryPending := False;
+    end
+    else if RetryPending and (IOResult.State = tssDone)
+      and (TransportSecurityPendingCiphertext(AConnection) = 0) then
+      RetryPending := False
+    else if IOResult.State in [tssWantRead, tssWantWrite] then
+      RetryPending := True;
     FlushTLSCiphertext(ASocket, AConnection, ADeadline);
     if (IOResult.BytesProcessed = 0) and (IOResult.State = tssWantRead) then
       ReceiveTLSCiphertext(ASocket, AConnection, AReceivedTotal, ADeadline)
@@ -971,12 +1001,15 @@ begin
     FlushTLSCiphertext(FSocket, Connection, FDeadline);
     repeat
       ResultState := CloseTransportSecurityServerGracefully(Connection);
-      CheckDeadline;
-      FlushTLSCiphertext(FSocket, Connection, FDeadline);
-      if ResultState = tssWantRead then
-        ReceiveTLSCiphertext(FSocket, Connection, FTLSCiphertextReceived,
-          FDeadline);
-    until (ResultState = tssDone) or (ResultState = tssPeerClosed);
+      if not RegistryTLSShutdownStateIsTerminal(ResultState) then
+      begin
+        CheckDeadline;
+        FlushTLSCiphertext(FSocket, Connection, FDeadline);
+        if ResultState = tssWantRead then
+          ReceiveTLSCiphertext(FSocket, Connection, FTLSCiphertextReceived,
+            FDeadline);
+      end;
+    until RegistryTLSShutdownStateIsTerminal(ResultState);
   finally
     ResourceStream.Free;
     AbortTransportSecurityServer(Connection);

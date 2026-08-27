@@ -185,6 +185,8 @@ procedure TransportSecurityTestForceSecureTransportCleanupFailures(
   const AKeychainDeleteStatus: LongInt; const AFileDeleteFailure: Boolean);
 procedure TransportSecurityTestForceSecureTransportRecoveryUnlinkRace(
   const AEnabled: Boolean);
+procedure TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
+  const APID: LongInt);
 procedure TransportSecurityTestForceSecureTransportNetworkFetchStatus(
   const AStatus: LongInt);
 procedure TransportSecurityTestForceSecureTransportTrustEvaluationFailure(
@@ -463,6 +465,9 @@ type
     Output: TBytes;
     OutputCapacity: Integer;
     OutputOffset: Integer;
+    PendingPlaintext: TBytes;
+    PendingPlaintextOffset: Integer;
+    WriteNeedsResume: Boolean;
     Snapshot: TSecureTransportServerSnapshot;
   end;
 
@@ -572,6 +577,7 @@ var
   SecureTransportTestCleanupFileFailure: Boolean;
   SecureTransportTestTrustEvaluationFailure: Boolean;
   SecureTransportTestRecoveryUnlinkRace: Boolean;
+  SecureTransportTestRecoveryDeadOwnerPID: LongInt;
   SecureTransportTestNetworkFetchStatus: OSStatus;
   SecureTransportTestNetworkFetchCalled: Boolean;
   {$ENDIF}
@@ -793,6 +799,11 @@ end;
 
 function SecureTransportOwnerIsDefinitelyDead(const APID: LongInt): Boolean;
 begin
+  {$IFNDEF PRODUCTION}
+  if (SecureTransportTestRecoveryDeadOwnerPID > 0)
+    and (APID = SecureTransportTestRecoveryDeadOwnerPID) then
+    Exit(True);
+  {$ENDIF}
   if FpKill(APID, 0) = 0 then Exit(False);
   Result := FpGetErrNo = ESysESRCH;
 end;
@@ -1324,6 +1335,9 @@ begin
   AData.Snapshot := nil;
   SetLength(AData.Input, 0);
   SetLength(AData.Output, 0);
+  if Length(AData.PendingPlaintext) > 0 then
+    FillChar(AData.PendingPlaintext[0], Length(AData.PendingPlaintext), 0);
+  SetLength(AData.PendingPlaintext, 0);
   AData.Free;
 end;
 
@@ -1560,7 +1574,10 @@ function WriteSecureTransportServer(
   const ALength: Integer): TTransportSecurityIOResult;
 var
   Data: TSecureTransportServerData;
+  PendingLength: Integer;
   Processed: PtrUInt;
+  ResumeCall: Boolean;
+  Retrying: Boolean;
   Status: OSStatus;
 begin
   Result.State := tssError;
@@ -1573,18 +1590,63 @@ begin
     Result.State := tssWantWrite;
     Exit;
   end;
-  if ALength <= 0 then
-  begin
-    Result.State := tssDone;
-    Exit;
-  end;
-  if not Assigned(ABuffer) then
+
+  Retrying := Length(Data.PendingPlaintext) > 0;
+  if Retrying and ((ALength <> 0) or Assigned(ABuffer)) then
     raise ETransportSecurityError.Create(
-      'TLS plaintext output buffer is nil');
-  Processed := 0;
-  Status := SSLWrite(Data.Context, ABuffer, ALength, Processed);
-  Result.BytesProcessed := Integer(Processed);
-  Result.State := SecureTransportServerState(AConnection, Status, False);
+      'TLS write retry is pending; resume it with a nil, zero-length buffer');
+  if not Retrying then
+  begin
+    if ALength <= 0 then
+    begin
+      Result.State := tssDone;
+      Exit;
+    end;
+    if not Assigned(ABuffer) then
+      raise ETransportSecurityError.Create(
+        'TLS plaintext output buffer is nil');
+    SetLength(Data.PendingPlaintext, ALength);
+    Move(ABuffer^, Data.PendingPlaintext[0], ALength);
+    Data.PendingPlaintextOffset := 0;
+    Data.WriteNeedsResume := False;
+  end;
+
+  { Secure Transport can report errSSLWouldBlock after accepting part or all
+    of the plaintext. Keep the caller's bytes until repeated SSLWrite calls,
+    including a zero-length resume after output drain, complete
+    the operation. This preserves the package-wide nil/zero retry contract. }
+  PendingLength := Length(Data.PendingPlaintext);
+  repeat
+    ResumeCall := Data.WriteNeedsResume;
+    Processed := 0;
+    if ResumeCall then
+      Status := SSLWrite(Data.Context, nil, 0, Processed)
+    else
+      Status := SSLWrite(Data.Context,
+        @Data.PendingPlaintext[Data.PendingPlaintextOffset],
+        PendingLength - Data.PendingPlaintextOffset, Processed);
+    if not ResumeCall then
+      Inc(Data.PendingPlaintextOffset, Integer(Processed));
+    Data.WriteNeedsResume := Status = ERR_SSL_WOULD_BLOCK;
+    Result.State := SecureTransportServerState(AConnection, Status, False);
+    if Result.State = tssError then Exit;
+    if (Status = ERR_SEC_SUCCESS)
+      and (Data.PendingPlaintextOffset >= PendingLength) then
+    begin
+      Result.BytesProcessed := PendingLength;
+      FillChar(Data.PendingPlaintext[0], PendingLength, 0);
+      SetLength(Data.PendingPlaintext, 0);
+      Data.PendingPlaintextOffset := 0;
+      Data.WriteNeedsResume := False;
+      if SecureTransportServerPendingCiphertext(Data) > 0 then
+        Result.State := tssWantWrite
+      else
+        Result.State := tssDone;
+      Exit;
+    end;
+    if SecureTransportServerPendingCiphertext(Data) > 0 then Exit;
+    if Status = ERR_SSL_WOULD_BLOCK then Exit;
+  until Data.PendingPlaintextOffset >= PendingLength;
 end;
 
 function CloseSecureTransportServerGracefully(
@@ -1598,6 +1660,11 @@ begin
     Exit(tssError);
   if SecureTransportServerPendingCiphertext(Data) > 0 then
     Exit(tssWantWrite);
+  if Length(Data.PendingPlaintext) > 0 then
+  begin
+    PoisonSecureTransportServerConnection(AConnection);
+    Exit(tssError);
+  end;
   Status := SSLClose(Data.Context);
   Result := SecureTransportServerState(AConnection, Status, True);
 end;
@@ -6788,6 +6855,12 @@ procedure TransportSecurityTestForceSecureTransportRecoveryUnlinkRace(
   const AEnabled: Boolean);
 begin
   SecureTransportTestRecoveryUnlinkRace := AEnabled;
+end;
+
+procedure TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
+  const APID: LongInt);
+begin
+  SecureTransportTestRecoveryDeadOwnerPID := APID;
 end;
 
 procedure TransportSecurityTestForceSecureTransportNetworkFetchStatus(

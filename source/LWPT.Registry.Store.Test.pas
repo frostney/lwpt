@@ -22,6 +22,7 @@ uses
   LWPT.Registry.Server,
   LWPT.Registry.Server.NetworkFramework,
   LWPT.Registry.Store,
+  TransportSecurity,
   TestingPascalLibrary,
   Tests.Scratch;
 
@@ -197,6 +198,7 @@ type
     procedure TestVersionIndexRetainsEveryPublishedVersion;
     procedure TestReservedPackageNameUsesPortableIndexKey;
     procedure TestIncompleteInitializationIsRecovered;
+    procedure TestOversizedInitializationMarkerIsRejected;
     procedure TestCallerOwnedRootIsPreserved;
     procedure TestInitializationUsesAnOperatingSystemLease;
     procedure TestRecoveryClearsIncompleteStaging;
@@ -649,6 +651,27 @@ begin
   finally
     Store.Free;
   end;
+end;
+
+procedure TRegistryStoreContract.TestOversizedInitializationMarkerIsRejected;
+var
+  Diagnostic: string;
+  Store: TLWPTRegistryStore;
+begin
+  WriteTextFile(FScratch + '/.initializing',
+    'registry initialization in progress' + #10);
+  ReplaceFileWithSize(FScratch + '/.initializing',
+    Int64(MAX_REGISTRY_CONTROL_DOCUMENT_BYTES) + 1);
+  Diagnostic := '';
+  Store := nil;
+  try
+    Store := InitializeStore;
+  except
+    on E: Exception do Diagnostic := E.Message;
+  end;
+  Store.Free;
+  Expect<Boolean>(Pos('state_corrupt:', Diagnostic) = 1).ToBe(True);
+  Expect<Boolean>(FileExists(FScratch + '/.initializing')).ToBe(True);
 end;
 
 procedure TRegistryStoreContract.TestCallerOwnedRootIsPreserved;
@@ -1275,6 +1298,16 @@ begin
   Expect<Integer>(RegistryDeadlineTimeoutForTesting(100, 100)).ToBe(1);
   Expect<Integer>(RegistryDeadlineTimeoutForTesting(100, 101)).ToBe(1);
   Expect<Integer>(RegistryDeadlineTimeoutForTesting(250, 100)).ToBe(150);
+  Expect<Boolean>(RegistryTLSShutdownStateIsTerminalForTesting(
+    Ord(tssDone))).ToBe(True);
+  Expect<Boolean>(RegistryTLSShutdownStateIsTerminalForTesting(
+    Ord(tssError))).ToBe(True);
+  Expect<Boolean>(RegistryTLSShutdownStateIsTerminalForTesting(
+    Ord(tssPeerClosed))).ToBe(True);
+  Expect<Boolean>(RegistryTLSShutdownStateIsTerminalForTesting(
+    Ord(tssWantRead))).ToBe(False);
+  Expect<Boolean>(RegistryTLSShutdownStateIsTerminalForTesting(
+    Ord(tssWantWrite))).ToBe(False);
   ExpectedBody := 'schema = "' + PROGRAM_NAME + '-registry-error-v1"' + #10
     + 'code = "bad\"code"' + #10
     + 'message = "path\\failed\t\u0001"' + #10
@@ -1648,6 +1681,8 @@ begin
     TestReservedPackageNameUsesPortableIndexKey);
   Test('incomplete initialization is recovered',
     TestIncompleteInitializationIsRecovered);
+  Test('oversized initialization marker is rejected before recovery',
+    TestOversizedInitializationMarkerIsRejected);
   Test('caller-owned root is preserved', TestCallerOwnedRootIsPreserved);
   Test('initialization uses an operating-system lease',
     TestInitializationUsesAnOperatingSystemLease);

@@ -116,6 +116,7 @@ type
     procedure TestDarwinSecureTransportNetworkFetchDisabled;
     procedure TestDarwinSecureTransportServerLifecycle;
     procedure TestDarwinSecureTransportRoundTrip;
+    procedure TestDarwinSecureTransportWriteWantRetryRetainsPlaintext;
     procedure TestEmptyAndUTF8Passphrases;
     procedure TestEmbeddedNULPassphraseRejected;
     procedure TestFatalHandshakePoisonsConnection;
@@ -454,24 +455,6 @@ begin
   end;
 end;
 
-function DarwinDeadProcessID: LongInt;
-var
-  ProcessInstance: TProcess;
-begin
-  ProcessInstance := TProcess.Create(nil);
-  try
-    ProcessInstance.Executable := '/usr/bin/true';
-    ProcessInstance.Options := [poWaitOnExit];
-    ProcessInstance.Execute;
-    Result := ProcessInstance.ProcessID;
-    if (ProcessInstance.ExitStatus <> 0)
-      or (FpKill(Result, 0) = 0)
-      or (FpGetErrNo <> ESysESRCH) then
-      raise Exception.Create('Could not create a dead process ID fixture');
-  finally
-    ProcessInstance.Free;
-  end;
-end;
 {$ENDIF}
 
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
@@ -2227,6 +2210,8 @@ end;
 
 procedure TTransportSecurityServerTests.TestDarwinSecureTransportServerLifecycle;
 {$IFDEF DARWIN}
+const
+  TEST_DEAD_OWNER_PID = 2147483647;
 var
   Connection: TTransportSecurityConnection;
   Context: TTransportSecurityServerContext;
@@ -2241,9 +2226,11 @@ begin
   Context := nil;
   FillChar(Connection, SizeOf(Connection), 0);
   StaleKeychainPath := IncludeTrailingPathDelimiter(GetTempDir)
-    + 'secure-transport-server-' + IntToStr(DarwinDeadProcessID)
+    + 'secure-transport-server-' + IntToStr(TEST_DEAD_OWNER_PID)
     + '-00000000000000000000000000000000.keychain';
   SysUtils.DeleteFile(StaleKeychainPath);
+  TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
+    TEST_DEAD_OWNER_PID);
   try
     StaleKeychain := TFileStream.Create(StaleKeychainPath, fmCreate);
     StaleKeychain.Free;
@@ -2262,6 +2249,7 @@ begin
     Expect<Integer>(Ord(State)).ToBe(Ord(tssWantRead));
     Expect<Boolean>(Connection.Active).ToBe(False);
   finally
+    TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(0);
     TransportSecurityTestForceSecureTransportRecoveryUnlinkRace(False);
     AbortTransportSecurityServer(Connection);
     CloseTransportSecurityServerContext(Context);
@@ -2331,6 +2319,96 @@ begin
     PumpRawSecureTransportServer(Connection, Client);
     State := CloseTransportSecurityServerGracefully(Connection);
     Expect<Boolean>(State in [tssDone, tssPeerClosed]).ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestDarwinSecureTransportWriteWantRetryRetainsPlaintext;
+{$IFDEF DARWIN}
+const
+  LARGE_WRITE_SIZE = 64 * 1024 + 137;
+var
+  Buffer: array[0..4095] of Byte;
+  Client: TRawSecureTransportClient;
+  ClientProcessed: PtrUInt;
+  ClientStatus: LongInt;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Expected: TBytes;
+  I: Integer;
+  Offset: Integer;
+  Payload: TBytes;
+  ReadLength: Integer;
+  Received: TBytes;
+  Step: Integer;
+  WriteCompleted: Boolean;
+  WriteResult: TTransportSecurityIOResult;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  FillChar(Client, SizeOf(Client), 0);
+  FillChar(Connection, SizeOf(Connection), 0);
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE, TLS_SERVER_DEFAULT_INPUT_CAPACITY,
+    TLS_SERVER_MIN_OUTPUT_CAPACITY);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    SetLength(Payload, LARGE_WRITE_SIZE);
+    for I := 0 to High(Payload) do
+      Payload[I] := Byte((I * 31 + 17) and $FF);
+    Expected := Copy(Payload, 0, Length(Payload));
+
+    WriteResult := TransportSecurityServerWrite(Connection, @Payload[0],
+      Length(Payload));
+    Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(WriteResult.BytesProcessed).ToBe(0);
+    FillChar(Payload[0], Length(Payload), $A5);
+
+    WriteCompleted := False;
+    for Step := 1 to 128 do
+    begin
+      PumpRawSecureTransportServer(Connection, Client);
+      WriteResult := TransportSecurityServerWrite(Connection, nil, 0);
+      if WriteResult.BytesProcessed > 0 then
+      begin
+        Expect<Integer>(WriteResult.BytesProcessed).ToBe(Length(Expected));
+        WriteCompleted := True;
+      end;
+      if WriteResult.State = tssError then
+        raise Exception.Create('Retained Secure Transport write retry failed');
+      if WriteCompleted
+        and (TransportSecurityPendingCiphertext(Connection) = 0) then Break;
+    end;
+    PumpRawSecureTransportServer(Connection, Client);
+    Expect<Boolean>(WriteCompleted).ToBe(True);
+
+    SetLength(Received, Length(Expected));
+    Offset := 0;
+    while Offset < Length(Received) do
+    begin
+      ClientProcessed := 0;
+      ReadLength := Length(Received) - Offset;
+      if ReadLength > Length(Buffer) then ReadLength := Length(Buffer);
+      ClientStatus := TestSSLRead(Client.Context, @Buffer[0], ReadLength,
+        ClientProcessed);
+      if ((ClientStatus <> TEST_ERR_SEC_SUCCESS)
+        and (ClientStatus <> TEST_ERR_SSL_WOULD_BLOCK))
+        or (ClientProcessed = 0) then
+        raise Exception.CreateFmt(
+          'Raw Secure Transport client large read failed: %d/%d',
+          [ClientStatus, ClientProcessed]);
+      Move(Buffer[0], Received[Offset], ClientProcessed);
+      Inc(Offset, Integer(ClientProcessed));
+    end;
+    Expect<Boolean>(CompareByte(Expected[0], Received[0],
+      Length(Expected)) = 0).ToBe(True);
   finally
     AbortTransportSecurityServer(Connection);
     FreeRawSecureTransportClient(Client);
@@ -4602,6 +4680,8 @@ begin
     TestDarwinSecureTransportServerLifecycle);
   Test('Darwin Secure Transport handshake and IO round-trip in memory',
     TestDarwinSecureTransportRoundTrip);
+  Test('Darwin Secure Transport write retry retains caller plaintext',
+    TestDarwinSecureTransportWriteWantRetryRetainsPlaintext);
   Skip('empty and UTF-8 PKCS#12 passphrases load',
     TestEmptyAndUTF8Passphrases,
     'the existing OpenSSL-generated fixtures use PKCS#12 algorithms unsupported by Security.framework');
@@ -4703,6 +4783,9 @@ begin
     TestDarwinSecureTransportServerLifecycle, 'Darwin-only behavior');
   Skip('Darwin Secure Transport handshake and IO round-trip in memory',
     TestDarwinSecureTransportRoundTrip, 'Darwin-only behavior');
+  Skip('Darwin Secure Transport write retry retains caller plaintext',
+    TestDarwinSecureTransportWriteWantRetryRetainsPlaintext,
+    'Darwin-only behavior');
   Skip('Darwin Secure Transport resolves server symbols concurrently once',
     TestDarwinConcurrentSecureTransportFirstUse, 'Darwin-only behavior');
   Skip('Darwin Secure Transport cleanup failures preserve primary errors',
