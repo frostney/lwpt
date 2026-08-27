@@ -183,8 +183,12 @@ procedure AbortTransportSecurityServer(
 {$IFNDEF PRODUCTION}
 procedure TransportSecurityTestForceSecureTransportCleanupFailures(
   const AKeychainDeleteStatus: LongInt; const AFileDeleteFailure: Boolean);
+procedure TransportSecurityTestForceSecureTransportRecoveryUnlinkRace(
+  const AEnabled: Boolean);
 procedure TransportSecurityTestForceSecureTransportNetworkFetchStatus(
   const AStatus: LongInt);
+procedure TransportSecurityTestForceSecureTransportTrustEvaluationFailure(
+  const AEnabled: Boolean);
 function TransportSecurityTestSecureTransportNetworkFetchWasDisabled: Boolean;
 function TransportSecurityTestInjectSecureTransportFatalStatus(
   var AConnection: TTransportSecurityConnection): TTransportSecurityState;
@@ -566,6 +570,8 @@ var
   {$IFNDEF PRODUCTION}
   SecureTransportTestCleanupKeychainStatus: OSStatus;
   SecureTransportTestCleanupFileFailure: Boolean;
+  SecureTransportTestTrustEvaluationFailure: Boolean;
+  SecureTransportTestRecoveryUnlinkRace: Boolean;
   SecureTransportTestNetworkFetchStatus: OSStatus;
   SecureTransportTestNetworkFetchCalled: Boolean;
   {$ENDIF}
@@ -817,9 +823,20 @@ begin
         or (Status.st_uid <> FpGetUID) then
         Continue;
       if not SecureTransportOwnerIsDefinitelyDead(OwnerPID) then Continue;
+      {$IFNDEF PRODUCTION}
+      if SecureTransportTestRecoveryUnlinkRace then
+      begin
+        SecureTransportTestRecoveryUnlinkRace := False;
+        SysUtils.DeleteFile(Path);
+      end;
+      {$ENDIF}
       if not SysUtils.DeleteFile(Path) then
+      begin
+        if (FpLStat(PChar(Path), Status) <> 0)
+          and (FpGetErrNo = ESysENOENT) then Continue;
         raise ETransportSecurityError.Create(
           'Failed to recover abandoned temporary TLS keychain storage');
+      end;
       if (FpLStat(PChar(Path), Status) = 0)
         or (FpGetErrNo <> ESysENOENT) then
         raise ETransportSecurityError.Create(
@@ -859,7 +876,11 @@ begin
       or (SecTrustSetAnchorCertificates(Trust, Anchors) <> ERR_SEC_SUCCESS)
       or (SecTrustSetAnchorCertificatesOnly(Trust, True)
         <> ERR_SEC_SUCCESS)
-      or not SecTrustEvaluateWithError(Trust, ErrorReference) then
+      or not SecTrustEvaluateWithError(Trust, ErrorReference)
+      {$IFNDEF PRODUCTION}
+      or SecureTransportTestTrustEvaluationFailure
+      {$ENDIF}
+      then
       raise ETransportSecurityError.Create(
         'Configured TLS identity does not form a valid bundled server chain');
   finally
@@ -6763,11 +6784,23 @@ begin
   SecureTransportTestCleanupFileFailure := AFileDeleteFailure;
 end;
 
+procedure TransportSecurityTestForceSecureTransportRecoveryUnlinkRace(
+  const AEnabled: Boolean);
+begin
+  SecureTransportTestRecoveryUnlinkRace := AEnabled;
+end;
+
 procedure TransportSecurityTestForceSecureTransportNetworkFetchStatus(
   const AStatus: LongInt);
 begin
   SecureTransportTestNetworkFetchStatus := AStatus;
   SecureTransportTestNetworkFetchCalled := False;
+end;
+
+procedure TransportSecurityTestForceSecureTransportTrustEvaluationFailure(
+  const AEnabled: Boolean);
+begin
+  SecureTransportTestTrustEvaluationFailure := AEnabled;
 end;
 
 function TransportSecurityTestSecureTransportNetworkFetchWasDisabled: Boolean;

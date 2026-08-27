@@ -19,6 +19,7 @@ procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
 function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
 function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
 function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
+function NetworkFrameworkRecoveryConcurrentUnlinkIsSafeForTesting: Boolean;
 {$ENDIF}
 
 implementation
@@ -28,6 +29,9 @@ implementation
 uses
   BaseUnix,
   Classes,
+  {$IFDEF REGISTRY_TESTING}
+  Process,
+  {$ENDIF}
   SysUtils,
 
   LWPT.Core,
@@ -176,6 +180,7 @@ function Block_has_signature(ABlock: Pointer): ByteBool; cdecl;
 var
   RegistryCallbackTestReady: Pointer;
   RegistryCallbackTestRelease: Pointer;
+  RegistryRecoveryUnlinkRaceForTesting: Boolean;
 
 procedure PauseRegistryCallbackForTesting;
 begin
@@ -963,9 +968,20 @@ begin
         or ((Status.st_mode and S_IFMT) <> S_IFREG)
         or (Status.st_uid <> FpGetUID) then Continue;
       if not ProcessIsDefinitelyDead(OwnerPID) then Continue;
+      {$IFDEF REGISTRY_TESTING}
+      if RegistryRecoveryUnlinkRaceForTesting then
+      begin
+        RegistryRecoveryUnlinkRaceForTesting := False;
+        SysUtils.DeleteFile(Path);
+      end;
+      {$ENDIF}
       if not SysUtils.DeleteFile(Path) then
+      begin
+        if (FpLStat(PChar(Path), Status) <> 0)
+          and (FpGetErrNo = ESysENOENT) then Continue;
         raise ELWPTRegistryError.CreateStable('tls_configuration',
           'could not recover abandoned temporary keychain storage');
+      end;
       if (FpLStat(PChar(Path), Status) = 0)
         or (FpGetErrNo <> ESysENOENT) then
         raise ELWPTRegistryError.CreateStable('tls_configuration',
@@ -1050,6 +1066,39 @@ begin
         'tls_configuration: existing stable failure';
   end;
   Result := PrimaryPreserved and CleanupOnlyRaised and StableMessagePreserved;
+end;
+
+function NetworkFrameworkRecoveryConcurrentUnlinkIsSafeForTesting: Boolean;
+var
+  Child: TProcess;
+  DeadPID: LongInt;
+  Path: string;
+  Stream: TFileStream;
+begin
+  Result := False;
+  Child := TProcess.Create(nil);
+  try
+    Child.Executable := '/usr/bin/true';
+    Child.Options := [poWaitOnExit];
+    Child.Execute;
+    DeadPID := Child.ProcessID;
+  finally
+    Child.Free;
+  end;
+  if not ProcessIsDefinitelyDead(DeadPID) then Exit;
+  Path := IncludeTrailingPathDelimiter(GetTempDir) + PROGRAM_NAME
+    + '-registry-tls-' + IntToStr(DeadPID) + '-'
+    + StringOfChar('0', TEMPORARY_KEYCHAIN_RANDOM_BYTES * 2) + '.keychain';
+  Stream := TFileStream.Create(Path, fmCreate);
+  Stream.Free;
+  RegistryRecoveryUnlinkRaceForTesting := True;
+  try
+    ReconcileAbandonedTemporaryKeychains;
+    Result := not FileExists(Path);
+  finally
+    RegistryRecoveryUnlinkRaceForTesting := False;
+    SysUtils.DeleteFile(Path);
+  end;
 end;
 {$ENDIF}
 
@@ -1439,6 +1488,11 @@ begin
 end;
 
 function NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting: Boolean;
+begin
+  Result := True;
+end;
+
+function NetworkFrameworkRecoveryConcurrentUnlinkIsSafeForTesting: Boolean;
 begin
   Result := True;
 end;

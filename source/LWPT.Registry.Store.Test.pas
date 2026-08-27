@@ -1325,6 +1325,8 @@ procedure TRegistryStoreContract.TestNetworkFrameworkCleanupFailureSemantics;
 begin
   Expect<Boolean>(NetworkFrameworkCleanupFailureSemanticsAreSafeForTesting)
     .ToBe(True);
+  Expect<Boolean>(NetworkFrameworkRecoveryConcurrentUnlinkIsSafeForTesting)
+    .ToBe(True);
 end;
 
 procedure TRegistryStoreContract.TestRenewalErrorDoesNotDiscloseStorePath;
