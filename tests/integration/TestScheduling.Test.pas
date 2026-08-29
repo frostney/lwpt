@@ -2415,7 +2415,7 @@ begin
     LwptProcess.Options := [poNewProcessGroup];
     LwptProcess.Execute;
     RecordWindowsControllerState(StatePath, 'LWPT started pid '
-      + UIntToStr(LwptProcess.ProcessID));
+      + UIntToStr(QWord(LwptProcess.ProcessID)));
     Windows.CloseHandle(WrongReadHandle);
     WrongReadHandle := 0;
     Windows.CloseHandle(WrongWriteHandle);
@@ -2429,7 +2429,7 @@ begin
     CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
     RecordWindowsControllerState(StatePath, 'compiler ready pid '
       + IntToStr(CompilerPID) + ', LWPT pid '
-      + UIntToStr(LwptProcess.ProcessID));
+      + UIntToStr(QWord(LwptProcess.ProcessID)));
     { Ctrl-C cannot target one process group, so broadcast it while this
       controller keeps the inherited ignore attribute. Ctrl-Break ignores that
       attribute and targets LWPT's process group, excluding this controller
@@ -2441,8 +2441,8 @@ begin
     if not Windows.GenerateConsoleCtrlEvent(ControlType,
       ControlProcessGroupID) then Exit(7);
     RecordWindowsControllerState(StatePath, 'control sent '
-      + UIntToStr(ControlType) + ', LWPT pid '
-      + UIntToStr(LwptProcess.ProcessID));
+      + UIntToStr(QWord(ControlType)) + ', LWPT pid '
+      + UIntToStr(QWord(LwptProcess.ProcessID)));
     Started := Now;
     while LwptProcess.Running
       and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do

@@ -99,6 +99,11 @@ procedure ExecuteUnmanagedProcess(const AProcess: TProcess);
 function FeedProcessTreeProtocol(var ABuffer: string;
   const ABytes: string; out ALine: string): TLWPTProtocolReadResult;
 
+{$IF DEFINED(MSWINDOWS) AND DEFINED(LWPT_WINDOWS_WINE_DIAGNOSTIC)}
+function ValidInheritedPipeHandle(const AHandle: PtrInt;
+  const ARequiredAccess: LongWord): Boolean;
+{$ENDIF}
+
 {$IFDEF OBJECTSTORE_TESTING}
 type
   TLWPTProcessSpawnAttemptHook = procedure;
@@ -1530,13 +1535,13 @@ end;
 
 {$IFDEF MSWINDOWS}
 function ValidInheritedPipeHandle(const AHandle: PtrInt;
-  const ARequiredAccess: DWORD): Boolean;
+  const ARequiredAccess: LongWord): Boolean;
 var
-  Duplicate: THandle;
+  BytesAvailable, BytesTransferred: DWORD;
   HandleFlags: DWORD;
   PipeFlags: DWORD;
+  ProbeByte: Byte;
 begin
-  Duplicate := 0;
   if not Windows.GetHandleInformation(THandle(AHandle), @HandleFlags) then
     Exit(False);
   if (HandleFlags and Windows.HANDLE_FLAG_INHERIT) = 0 then Exit(False);
@@ -1544,14 +1549,21 @@ begin
     nil) then
     Exit(False);
   if (PipeFlags and Windows.PIPE_TYPE_MESSAGE) <> 0 then Exit(False);
-  { Narrow file-data access cannot be added when duplicating a handle. This
-    metadata-only probe stays bounded while distinguishing the status write
-    end from the control read end. }
-  if not Windows.DuplicateHandle(Windows.GetCurrentProcess, THandle(AHandle),
-    Windows.GetCurrentProcess, @Duplicate, ARequiredAccess, False, 0) then
-    Exit(False);
-  Windows.CloseHandle(Duplicate);
-  Result := True;
+  { Probe the capability itself without consuming or producing bytes.
+    DuplicateHandle is not a reliable access-direction query for anonymous
+    pipes: compatibility layers can duplicate both ends for either narrow
+    access mask while retaining the original end's actual capability. }
+  BytesAvailable := 0;
+  BytesTransferred := 0;
+  ProbeByte := 0;
+  if ARequiredAccess = Windows.FILE_READ_DATA then
+    Result := Windows.PeekNamedPipe(THandle(AHandle), @ProbeByte, 0,
+      @BytesTransferred, @BytesAvailable, nil)
+  else if ARequiredAccess = Windows.FILE_WRITE_DATA then
+    Result := Windows.WriteFile(THandle(AHandle), ProbeByte, 0,
+      BytesTransferred, nil)
+  else
+    Result := False;
 end;
 {$ENDIF}
 
@@ -1653,9 +1665,10 @@ begin
       ErrorCode, BytesWritten);
   if Result then Exit;
   AFailure := 'could not send process-tree termination acknowledgement '
-    + '(emitter pid ' + UIntToStr(Windows.GetCurrentProcessId)
-    + ', wrote ' + UIntToStr(BytesWritten) + '/' + UIntToStr(Length(Frame))
-    + ' bytes, Win32 error ' + UIntToStr(ErrorCode) + ': '
+    + '(emitter pid ' + UIntToStr(QWord(Windows.GetCurrentProcessId))
+    + ', wrote ' + UIntToStr(QWord(BytesWritten)) + '/'
+    + UIntToStr(QWord(Length(Frame)))
+    + ' bytes, Win32 error ' + UIntToStr(QWord(ErrorCode)) + ': '
     + SysErrorMessage(ErrorCode) + ')';
 end;
 {$ENDIF}
