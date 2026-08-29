@@ -2361,7 +2361,7 @@ var
   WrongReadHandle, WrongWriteHandle: THandle;
   SecurityAttributes: Windows.TSecurityAttributes;
   Started: TDateTime;
-  StatePath: string;
+  ProcessContext, StatePath: string;
 begin
   Result := 1;
   CompilerPID := -1;
@@ -2414,8 +2414,10 @@ begin
     LwptProcess.InheritHandles := True;
     LwptProcess.Options := [poNewProcessGroup];
     LwptProcess.Execute;
-    RecordWindowsControllerState(StatePath, 'LWPT started pid '
-      + UIntToStr(QWord(LwptProcess.ProcessID)));
+    ProcessContext := 'LWPT pid '
+      + UIntToStr(QWord(LwptProcess.ProcessID));
+    RecordWindowsControllerState(StatePath, 'LWPT started, '
+      + ProcessContext);
     Windows.CloseHandle(WrongReadHandle);
     WrongReadHandle := 0;
     Windows.CloseHandle(WrongWriteHandle);
@@ -2427,9 +2429,11 @@ begin
       Sleep(ProcessPollMilliseconds);
     if not FileExists(ParamStr(5)) then Exit(3);
     CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
-    RecordWindowsControllerState(StatePath, 'compiler ready pid '
-      + IntToStr(CompilerPID) + ', LWPT pid '
-      + UIntToStr(QWord(LwptProcess.ProcessID)));
+    ProcessContext := 'LWPT pid '
+      + UIntToStr(QWord(LwptProcess.ProcessID)) + ', compiler pid '
+      + IntToStr(CompilerPID);
+    RecordWindowsControllerState(StatePath, 'compiler ready, '
+      + ProcessContext);
     { Ctrl-C cannot target one process group, so broadcast it while this
       controller keeps the inherited ignore attribute. Ctrl-Break ignores that
       attribute and targets LWPT's process group, excluding this controller
@@ -2441,8 +2445,7 @@ begin
     if not Windows.GenerateConsoleCtrlEvent(ControlType,
       ControlProcessGroupID) then Exit(7);
     RecordWindowsControllerState(StatePath, 'control sent '
-      + UIntToStr(QWord(ControlType)) + ', LWPT pid '
-      + UIntToStr(QWord(LwptProcess.ProcessID)));
+      + UIntToStr(QWord(ControlType)) + ', ' + ProcessContext);
     Started := Now;
     while LwptProcess.Running
       and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
@@ -2450,12 +2453,13 @@ begin
     if LwptProcess.Running then Exit(8);
     LwptProcess.WaitOnExit;
     RecordWindowsControllerState(StatePath, 'LWPT exited '
-      + IntToStr(LwptProcess.ExitStatus));
+      + IntToStr(LwptProcess.ExitStatus) + ', ' + ProcessContext);
     if DWORD(LwptProcess.ExitStatus) <> WindowsControlExitCode then Exit(9);
     if ProcessIsRunning(CompilerPID) then Exit(10);
-    RecordWindowsControllerState(StatePath, 'compiler reaped');
+    RecordWindowsControllerState(StatePath, 'compiler reaped, '
+      + ProcessContext);
     Result := 0;
-    RecordWindowsControllerState(StatePath, 'complete');
+    RecordWindowsControllerState(StatePath, 'complete, ' + ProcessContext);
   finally
     if LwptProcess.Running then LwptProcess.Terminate(1);
     TerminateWindowsProcess(CompilerPID);
