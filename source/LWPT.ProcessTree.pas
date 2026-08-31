@@ -99,6 +99,11 @@ procedure ExecuteUnmanagedProcess(const AProcess: TProcess);
 function FeedProcessTreeProtocol(var ABuffer: string;
   const ABytes: string; out ALine: string): TLWPTProtocolReadResult;
 
+{$IF DEFINED(MSWINDOWS) AND DEFINED(LWPT_WINDOWS_WINE_DIAGNOSTIC)}
+function ValidInheritedPipeHandle(const AHandle: PtrInt;
+  const ARequiredAccess: LongWord): Boolean;
+{$ENDIF}
+
 {$IFDEF OBJECTSTORE_TESTING}
 type
   TLWPTProcessSpawnAttemptHook = procedure;
@@ -399,6 +404,29 @@ begin
     BytesWritten, nil) and (BytesWritten = DWORD(Length(AFrame)));
   {$ENDIF}
 end;
+
+{$IFDEF MSWINDOWS}
+function WriteProtocolFrameWithFailure(const AHandle: PtrInt;
+  const AFrame: string; out AErrorCode, ABytesWritten: DWORD): Boolean;
+begin
+  AErrorCode := Windows.ERROR_INVALID_HANDLE;
+  ABytesWritten := 0;
+  if (AHandle < 0) or (AFrame = '') then Exit(False);
+  if not Windows.WriteFile(THandle(AHandle), AFrame[1], Length(AFrame),
+    ABytesWritten, nil) then
+  begin
+    AErrorCode := Windows.GetLastError;
+    Exit(False);
+  end;
+  if ABytesWritten <> DWORD(Length(AFrame)) then
+  begin
+    AErrorCode := Windows.ERROR_WRITE_FAULT;
+    Exit(False);
+  end;
+  AErrorCode := Windows.ERROR_SUCCESS;
+  Result := True;
+end;
+{$ENDIF}
 
 procedure CloseProtocolHandle(var AHandle: PtrInt);
 begin
@@ -1507,13 +1535,13 @@ end;
 
 {$IFDEF MSWINDOWS}
 function ValidInheritedPipeHandle(const AHandle: PtrInt;
-  const ARequiredAccess: DWORD): Boolean;
+  const ARequiredAccess: LongWord): Boolean;
 var
-  Duplicate: THandle;
+  BytesAvailable, BytesTransferred: DWORD;
   HandleFlags: DWORD;
   PipeFlags: DWORD;
+  ProbeByte: Byte;
 begin
-  Duplicate := 0;
   if not Windows.GetHandleInformation(THandle(AHandle), @HandleFlags) then
     Exit(False);
   if (HandleFlags and Windows.HANDLE_FLAG_INHERIT) = 0 then Exit(False);
@@ -1521,14 +1549,21 @@ begin
     nil) then
     Exit(False);
   if (PipeFlags and Windows.PIPE_TYPE_MESSAGE) <> 0 then Exit(False);
-  { Narrow file-data access cannot be added when duplicating a handle. This
-    metadata-only probe stays bounded while distinguishing the status write
-    end from the control read end. }
-  if not Windows.DuplicateHandle(Windows.GetCurrentProcess, THandle(AHandle),
-    Windows.GetCurrentProcess, @Duplicate, ARequiredAccess, False, 0) then
-    Exit(False);
-  Windows.CloseHandle(Duplicate);
-  Result := True;
+  { Probe the capability itself without consuming or producing bytes.
+    DuplicateHandle is not a reliable access-direction query for anonymous
+    pipes: compatibility layers can duplicate both ends for either narrow
+    access mask while retaining the original end's actual capability. }
+  BytesAvailable := 0;
+  BytesTransferred := 0;
+  ProbeByte := 0;
+  if ARequiredAccess = Windows.FILE_READ_DATA then
+    Result := Windows.PeekNamedPipe(THandle(AHandle), @ProbeByte, 0,
+      @BytesTransferred, @BytesAvailable, nil)
+  else if ARequiredAccess = Windows.FILE_WRITE_DATA then
+    Result := Windows.WriteFile(THandle(AHandle), ProbeByte, 0,
+      BytesTransferred, nil)
+  else
+    Result := False;
 end;
 {$ENDIF}
 
@@ -1616,6 +1651,28 @@ begin
       ProtocolFrame(InheritedChannelToken, AKind));
 end;
 
+{$IFDEF MSWINDOWS}
+function SendInheritedAcknowledgementWithFailure(const AKind: string;
+  out AFailure: string): Boolean;
+var
+  BytesWritten, ErrorCode: DWORD;
+  Frame: string;
+begin
+  AFailure := '';
+  Frame := ProtocolFrame(InheritedChannelToken, AKind);
+  Result := (InheritedStatusWriteHandle >= 0)
+    and WriteProtocolFrameWithFailure(InheritedStatusWriteHandle, Frame,
+      ErrorCode, BytesWritten);
+  if Result then Exit;
+  AFailure := 'could not send process-tree termination acknowledgement '
+    + '(emitter pid ' + UIntToStr(QWord(Windows.GetCurrentProcessId))
+    + ', wrote ' + UIntToStr(QWord(BytesWritten)) + '/'
+    + UIntToStr(QWord(Length(Frame)))
+    + ' bytes, Win32 error ' + UIntToStr(QWord(ErrorCode)) + ': '
+    + SysErrorMessage(ErrorCode) + ')';
+end;
+{$ENDIF}
+
 procedure IncomingCancellationDeadlines(out ADescendantDeadline,
   AAcknowledgementDeadline: QWord);
 var
@@ -1693,7 +1750,7 @@ end;
 procedure TLWPTInheritedControlForwarder.Execute;
 var
   AcknowledgementDeadline, DescendantDeadline: QWord;
-  CancellationBuffer, CancellationLine: string;
+  AcknowledgementFailure, CancellationBuffer, CancellationLine: string;
 begin
   CancellationBuffer := '';
   repeat
@@ -1715,10 +1772,10 @@ begin
       Windows.ExitProcess(ProcessTreeCancellationExitCode);
     end;
   end;
-  if not SendInheritedAcknowledgement(AcknowledgementReaped) then
+  if not SendInheritedAcknowledgementWithFailure(AcknowledgementReaped,
+    AcknowledgementFailure) then
   begin
-    ReportForwardingFailure(
-      'could not send process-tree termination acknowledgement');
+    ReportForwardingFailure(AcknowledgementFailure);
     Windows.ExitProcess(ProcessTreeCancellationExitCode);
   end;
   Windows.ExitProcess(WindowsControlExitCode);

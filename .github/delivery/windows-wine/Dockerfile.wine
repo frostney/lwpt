@@ -1,0 +1,15 @@
+FROM debian:bookworm
+
+RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      wine wine32 xauth xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV WINEARCH=win32
+ENV WINEDEBUG=-all
+ENV WINEPREFIX=/wine-prefix
+
+COPY smoke.sh /usr/local/bin/run-lwpt-win32-smoke
+RUN chmod +x /usr/local/bin/run-lwpt-win32-smoke
+
+ENTRYPOINT ["/usr/local/bin/run-lwpt-win32-smoke"]

@@ -22,6 +22,11 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
   Every command also inherits long-only `--silent` for final-result-only use;
   silent success writes its sole completion line to stdout, and neither mode
   changes the command's exit code.
+- **Local Win32 iteration is cached.** On the maintainer Mac,
+  [`.github/delivery/windows-wine/run.sh`](../.github/delivery/windows-wine/run.sh)
+  uses OrbStack's Docker engine to cross-compile i386-win32 and run bounded
+  Wine-compatible smoke checks. Wine does not replace the final native Windows
+  console-control proof.
 - **Duplication analysis is Pascal-native and offline.** `lwpt duplication`
   reports deterministic Type-2 token clones in manifest-owned root and
   workspace sources. The remaining deferred stack contracts stay tracked
