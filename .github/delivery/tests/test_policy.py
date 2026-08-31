@@ -5,7 +5,6 @@ import os
 import re
 import subprocess
 import tempfile
-import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -207,19 +206,15 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn('LWPT_ENABLE_NETWORK: "1"', pr_workflow)
         self.assertIn('LWPT_ENABLE_NETWORK: "1"', ci_workflow)
 
-    def test_windows_compiler_discovery_skips_absent_roots(self) -> None:
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        pr_workflow = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")
-        self.assertIn("for candidate_root in /c/tools/freepascal /c/fpc", workflow)
-        self.assertIn('if [ -d "$candidate_root" ]; then', workflow)
-        self.assertNotIn("TARGET_FPC=$(find /c/tools/freepascal /c/fpc", workflow)
-        self.assertNotIn("Chocolatey FPC install: x86_64 compiler not found", workflow)
-        self.assertIn('echo "LWPT_FPC=$LWPT_FPC_VALUE"', workflow)
-        self.assertNotIn("FPC target mismatch", workflow)
-        self.assertIn('head -1 || true)\n          if [ -n "$INSTANTFPC_BIN" ]', workflow)
-        self.assertIn('head -1 || true)\n          if [ -n "$INSTANTFPC_BIN" ]', pr_workflow)
-        self.assertIn("for unit_target in i386-win32 x86_64-win64", workflow)
-        self.assertNotIn('for unit_target in "${{ matrix.target }}"', workflow)
+    def test_windows_compiler_setup_publishes_required_paths(self) -> None:
+        installer = (
+            ROOT / ".github/delivery/install-windows-fpc.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('fpc_bin="${install_root}/bin/i386-win32/fpc.exe"', installer)
+        self.assertIn('echo "LWPT_FPC=$LWPT_FPC_VALUE"', installer)
+        self.assertIn('head -1 || true)\nif [ -n "${instantfpc_bin}" ]', installer)
+        self.assertIn("for unit_target in i386-win32 x86_64-win64", installer)
+        self.assertIn('"${fpc_bin}" -iV', installer)
 
     def test_native_test_jobs_have_twenty_minute_timeout(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -231,87 +226,40 @@ class RepositoryPolicyTests(unittest.TestCase):
                 "    timeout-minutes: 20\n", workflow_job(pr_workflow, name)
             )
 
-    def test_chocolatey_install_retries_once_with_attempt_diagnostics(self) -> None:
+    def test_windows_fpc_uses_pinned_official_distribution(self) -> None:
         workflows = [
             (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"),
             (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8"),
         ]
-        retry_contract = (
-            "for attempt in 1 2; do",
-            'echo "::group::Chocolatey FPC install attempt ${attempt}/2"',
-            "choco install -y freepascal || install_status=$?",
-            'if [ "$install_status" -eq 0 ] && [ -n "$FPC_BIN" ]; then',
-            'echo "::error::Chocolatey FPC install failed after 2 attempts',
-            'echo "::warning::Chocolatey FPC install attempt 1/2 did not produce a usable compiler',
-            'exit "$install_status"',
-        )
-
-        retry_blocks = []
         for workflow in workflows:
-            for line in retry_contract:
-                self.assertEqual(1, workflow.count(line), line)
-            start = workflow.index("          for attempt in 1 2; do\n")
-            end = workflow.index('          echo "Using FPC at $FPC_BIN"\n', start)
-            retry_blocks.append(workflow[start:end])
-        self.assertEqual(retry_blocks[0], retry_blocks[1])
-
-        probe = (
-            "set -euo pipefail\n"
-            "attempt_count=0\n"
-            'command_succeed_at="$1"\n'
-            'artifact_appears_at="$2"\n'
-            "choco() {\n"
-            "  attempt_count=$((attempt_count + 1))\n"
-            '  echo "simulated Chocolatey output ${attempt_count}"\n'
-            '  if [ "$attempt_count" -lt "$command_succeed_at" ]; then return 7; fi\n'
-            "}\n"
-            "find() {\n"
-            '  if [ "$attempt_count" -ge "$artifact_appears_at" ]; then\n'
-            '    echo "/c/fpc/bin/fpc.exe"\n'
-            "  fi\n"
-            "}\n"
-            + textwrap.dedent(retry_blocks[0]).replace(
-                "/c/tools/freepascal /c/fpc", '"."'
+            self.assertEqual(
+                1,
+                workflow.count(".github/delivery/install-windows-fpc.sh"),
             )
-            + 'echo "attempt-count=${attempt_count}"\n'
-        )
-        succeeds_on_retry = subprocess.run(
-            ["bash", "-c", probe, "retry-probe", "2", "2"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(0, succeeds_on_retry.returncode, succeeds_on_retry.stderr)
-        self.assertIn("attempt-count=2", succeeds_on_retry.stdout)
-        self.assertIn("attempt 1/2 did not produce", succeeds_on_retry.stdout)
-        self.assertIn("attempt 2/2", succeeds_on_retry.stdout)
+            self.assertNotIn("choco install -y freepascal", workflow)
+            self.assertNotIn('"fpc-install":"choco"', workflow)
 
-        false_success_retries = subprocess.run(
-            ["bash", "-c", probe, "retry-probe", "1", "2"],
-            capture_output=True,
-            text=True,
-            check=False,
+        installer = (
+            ROOT / ".github/delivery/install-windows-fpc.sh"
+        ).read_text(encoding="utf-8")
+        self.assertTrue(
+            os.access(ROOT / ".github/delivery/install-windows-fpc.sh", os.X_OK)
         )
-        self.assertEqual(
-            0, false_success_retries.returncode, false_success_retries.stderr
-        )
-        self.assertIn("attempt-count=2", false_success_retries.stdout)
-        self.assertIn("fpc.exe not found", false_success_retries.stdout)
-        self.assertIn("attempt 2/2", false_success_retries.stdout)
-
-        both_fail = subprocess.run(
-            ["bash", "-c", probe, "retry-probe", "3", "3"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(7, both_fail.returncode)
-        self.assertIn("simulated Chocolatey output 1", both_fail.stdout)
-        self.assertIn("simulated Chocolatey output 2", both_fail.stdout)
         self.assertIn(
-            "failed after 2 attempts (exit code 7; fpc.exe not found)",
-            both_fail.stdout,
+            "https://downloads.freepascal.org/fpc/dist/3.2.2/i386-win32/"
+            "fpc-3.2.2.i386-win32.exe",
+            installer,
         )
+        self.assertIn(
+            "7ec78b1790ecac7685f440b17f9e03865bc09846b7c068a9270c4d37704b5ac8",
+            installer,
+        )
+        self.assertIn("--retry 2", installer)
+        self.assertIn("--retry-max-time 240", installer)
+        self.assertIn("--max-time 120", installer)
+        self.assertIn("sha256sum", installer)
+        self.assertIn("/VERYSILENT", installer)
+        self.assertIn('echo "LWPT_FPC=$LWPT_FPC_VALUE"', installer)
 
     def test_scheduling_diagnostic_accepts_final_interval_completion(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
