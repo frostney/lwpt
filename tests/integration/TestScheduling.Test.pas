@@ -85,6 +85,7 @@ const
   {$IFDEF MSWINDOWS}
   WindowsConsoleControllerOption = '--' + PROGRAM_NAME
     + '-console-controller';
+  WindowsControllerStateSuffix = '-controller-state';
   WindowsControlExitCode = DWORD($C000013A);
   WindowsIgnoreControlCompilerProxyMode = 'ignore-control';
   {$ENDIF}
@@ -2280,12 +2281,13 @@ var
   CompilerPID: Integer;
   Controller: TProcess;
   ControllerTree: TLWPTProcessTree;
-  PIDFile, ProjectRoot: string;
+  ControllerState, ControllerStateFile, PIDFile, ProjectRoot: string;
   Started: TDateTime;
 begin
   CompilerPID := -1;
   ProjectRoot := FScratch + '/' + AProjectName;
   PIDFile := FScratch + '/control/' + AProjectName + '-compiler-pid';
+  ControllerStateFile := PIDFile + WindowsControllerStateSuffix;
   WriteBuildProject(ProjectRoot);
   Controller := TProcess.Create(nil);
   ControllerTree := nil;
@@ -2307,7 +2309,15 @@ begin
       Sleep(ProcessPollMilliseconds);
     Expect<Boolean>(Controller.Running).ToBe(False);
     Controller.WaitOnExit;
-    Expect<Integer>(Controller.ExitStatus).ToBe(0);
+    if Controller.ExitStatus <> 0 then
+    begin
+      ControllerState := 'not recorded';
+      if FileExists(ControllerStateFile) then
+        ControllerState := Trim(ReadBinaryFile(ControllerStateFile));
+      Fail('console controller exited with '
+        + IntToStr(Controller.ExitStatus) + '; last state: '
+        + ControllerState);
+    end;
     Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
     CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
     Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
@@ -2322,6 +2332,12 @@ begin
       Controller.Free;
     end;
   end;
+end;
+
+procedure RecordWindowsControllerState(const APath, AState: string);
+begin
+  WriteTextFile(APath + WindowsControllerStateSuffix,
+    UIntToStr(GetTickCount64) + ' ' + AState);
 end;
 
 procedure TTestScheduling.TestCtrlCTerminatesActiveProcessTree;
@@ -2345,9 +2361,12 @@ var
   WrongReadHandle, WrongWriteHandle: THandle;
   SecurityAttributes: Windows.TSecurityAttributes;
   Started: TDateTime;
+  ProcessContext, StatePath: string;
 begin
   Result := 1;
   CompilerPID := -1;
+  StatePath := ParamStr(5);
+  RecordWindowsControllerState(StatePath, 'entered');
   WrongReadHandle := 0;
   WrongWriteHandle := 0;
   { Controller failures: 2 invalid control type; 3 missing compiler PID;
@@ -2371,6 +2390,7 @@ begin
   SecurityAttributes.bInheritHandle := True;
   if not Windows.CreatePipe(WrongReadHandle, WrongWriteHandle,
     @SecurityAttributes, 4096) then Exit(4);
+  RecordWindowsControllerState(StatePath, 'wrong-direction pipes created');
   { Both handles are valid, inheritable pipes, but their directions are
     deliberately reversed. LWPT must reject them and use console fallback. }
   Environment[6] := ProcessTreeStatusHandleEnvironment + '='
@@ -2386,6 +2406,7 @@ begin
     { Pin the inherited Ctrl-C-ignore case explicitly. Production LWPT must
       restore Ctrl-C delivery before installing its forwarding handler. }
     if not Windows.SetConsoleCtrlHandler(nil, True) then Exit(5);
+    RecordWindowsControllerState(StatePath, 'Ctrl-C ignore installed');
     LwptProcess.Executable := ParamStr(3);
     LwptProcess.Parameters.Add('build');
     LwptProcess.CurrentDirectory := ParamStr(4);
@@ -2393,6 +2414,10 @@ begin
     LwptProcess.InheritHandles := True;
     LwptProcess.Options := [poNewProcessGroup];
     LwptProcess.Execute;
+    ProcessContext := 'LWPT pid '
+      + UIntToStr(QWord(LwptProcess.ProcessID));
+    RecordWindowsControllerState(StatePath, 'LWPT started, '
+      + ProcessContext);
     Windows.CloseHandle(WrongReadHandle);
     WrongReadHandle := 0;
     Windows.CloseHandle(WrongWriteHandle);
@@ -2404,6 +2429,11 @@ begin
       Sleep(ProcessPollMilliseconds);
     if not FileExists(ParamStr(5)) then Exit(3);
     CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
+    ProcessContext := 'LWPT pid '
+      + UIntToStr(QWord(LwptProcess.ProcessID)) + ', compiler pid '
+      + IntToStr(CompilerPID);
+    RecordWindowsControllerState(StatePath, 'compiler ready, '
+      + ProcessContext);
     { Ctrl-C cannot target one process group, so broadcast it while this
       controller keeps the inherited ignore attribute. Ctrl-Break ignores that
       attribute and targets LWPT's process group, excluding this controller
@@ -2414,15 +2444,22 @@ begin
       ControlProcessGroupID := 0;
     if not Windows.GenerateConsoleCtrlEvent(ControlType,
       ControlProcessGroupID) then Exit(7);
+    RecordWindowsControllerState(StatePath, 'control sent '
+      + UIntToStr(QWord(ControlType)) + ', ' + ProcessContext);
     Started := Now;
     while LwptProcess.Running
       and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
     if LwptProcess.Running then Exit(8);
     LwptProcess.WaitOnExit;
+    RecordWindowsControllerState(StatePath, 'LWPT exited '
+      + IntToStr(LwptProcess.ExitStatus) + ', ' + ProcessContext);
     if DWORD(LwptProcess.ExitStatus) <> WindowsControlExitCode then Exit(9);
     if ProcessIsRunning(CompilerPID) then Exit(10);
+    RecordWindowsControllerState(StatePath, 'compiler reaped, '
+      + ProcessContext);
     Result := 0;
+    RecordWindowsControllerState(StatePath, 'complete, ' + ProcessContext);
   finally
     if LwptProcess.Running then LwptProcess.Terminate(1);
     TerminateWindowsProcess(CompilerPID);

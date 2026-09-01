@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+compiler_args=()
+for compiler_arg in "$@"; do
+  case "${compiler_arg}" in
+    -P*) ;;
+    *) compiler_args+=("${compiler_arg}") ;;
+  esac
+done
+
+exec /opt/fpc-cross/lib/fpc/3.2.2/ppcross386 "${compiler_args[@]}"

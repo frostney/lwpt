@@ -66,8 +66,8 @@ include = [
   "packages/**/*.inc",
 ]
 
-# Enables deterministic HTTPClient syscall outcomes and the object-store race
-# interleaving only while compiling tests. Production builds expose neither
-# seam.
+# Enables deterministic HTTPClient syscall outcomes, the object-store race
+# interleaving, and registry publication crash points only while compiling
+# tests. Production builds expose none of these hooks.
 [test]
-flags = ["-dHTTPCLIENT_TESTING", "-dOBJECTSTORE_TESTING"]
+flags = ["-dHTTPCLIENT_TESTING", "-dOBJECTSTORE_TESTING", "-dREGISTRY_TESTING"]

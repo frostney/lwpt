@@ -1,7 +1,7 @@
 { TransportSecurity.Test -- deterministic in-memory TLS server coverage.
 
-  Darwin deliberately runs only the actionable server stub. Unix-not-Darwin
-  pairs the production server API with a raw in-memory OpenSSL client;
+  Darwin exercises the public Secure Transport server lifecycle directly.
+  Unix-not-Darwin pairs the production server API with a raw in-memory OpenSSL client;
   Windows pairs it with a raw in-memory SChannel client, because the Windows
   server backend is native SChannel and pulls in no OpenSSL at all. Identity,
   flow-configuration, and fatal-handshake coverage is backend-neutral and runs
@@ -20,6 +20,10 @@ program TransportSecurity.Test;
 {$DEFINE TRANSPORT_SECURITY_SCHANNEL_SERVER}
 {$DEFINE TRANSPORT_SECURITY_SERVER}
 {$ENDIF}
+{$IFDEF DARWIN}
+{$DEFINE TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
+{$DEFINE TRANSPORT_SECURITY_SERVER}
+{$ENDIF}
 {$IFDEF UNIX}
 {$IFNDEF DARWIN}
 {$DEFINE TRANSPORT_SECURITY_OPENSSL}
@@ -36,6 +40,9 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
+  {$IFDEF DARWIN}
+  Process,
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   Process,
   Windows,
@@ -48,8 +55,13 @@ uses
   TransportSecurity;
 
 const
+  {$IFDEF DARWIN}
+  PKCS12_PATH =
+    'tests/fixtures/registry/localhost-native-identity.p12';
+  {$ELSE}
   PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-test-identity.p12';
+  {$ENDIF}
   EMPTY_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-empty-passphrase.p12';
   UTF8_PKCS12_PATH =
@@ -81,8 +93,7 @@ const
   CLIENT_REQUEST = 'hello from the memory-BIO client';
   SERVER_RESPONSE = 'hello from TransportSecurity server';
   DARWIN_SKIP_REASON =
-    'OpenSSL server accept is intentionally unsupported on Darwin; ' +
-    'duetto uses Network.framework there';
+    'the raw in-memory Secure Transport client is not built for this case';
   OPENSSL_RUNTIME_SKIP_REASON =
     'OpenSSL runtime not available on this host';
   OPENSSL_CLIENT_SKIP_REASON =
@@ -100,7 +111,13 @@ type
     procedure TestActiveOnlyAfterHandshake;
     procedure TestBoundsClamp;
     procedure TestCertificateChainDelivered;
-    procedure TestDarwinReportsUnsupportedServerTLS;
+    procedure TestDarwinConcurrentSecureTransportFirstUse;
+    procedure TestDarwinSecureTransportCleanupFailures;
+    procedure TestDarwinSecureTransportNetworkFetchDisabled;
+    procedure TestDarwinSecureTransportServerLifecycle;
+    procedure TestDarwinSecureTransportReplacementRacesNeverUnlinkReplacements;
+    procedure TestDarwinSecureTransportRoundTrip;
+    procedure TestDarwinSecureTransportWriteWantRetryRetainsPlaintext;
     procedure TestEmptyAndUTF8Passphrases;
     procedure TestEmbeddedNULPassphraseRejected;
     procedure TestFatalHandshakePoisonsConnection;
@@ -136,6 +153,329 @@ type
     procedure TestWriteWantRetryRetainsPlaintext;
     procedure TestReloadRetainsSnapshotsAndFailedReloadKeepsActive;
   end;
+
+{$IFDEF DARWIN}
+type
+  TTestSSLContextRef = Pointer;
+  TTestSSLConnectionRef = Pointer;
+  TTestSSLReadFunc = function(AConnection: TTestSSLConnectionRef;
+    AData: Pointer; var ADataLength: PtrUInt): LongInt; cdecl;
+  TTestSSLWriteFunc = function(AConnection: TTestSSLConnectionRef;
+    AData: Pointer; var ADataLength: PtrUInt): LongInt; cdecl;
+  TRawSecureTransportClient = record
+    Context: TTestSSLContextRef;
+    Input: TBytes;
+    Output: TBytes;
+  end;
+
+  TSecureTransportContextWorker = class(TThread)
+  private
+    FErrorMessage: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    property ErrorMessage: string read FErrorMessage;
+  end;
+
+const
+  TEST_ERR_SEC_SUCCESS = 0;
+  TEST_ERR_SSL_WOULD_BLOCK = -9803;
+  TEST_K_SSL_CLIENT_SIDE = 1;
+  TEST_K_SSL_STREAM_TYPE = 0;
+  TEST_K_TLS_PROTOCOL_11 = 7;
+  TEST_K_TLS_PROTOCOL_12 = 8;
+
+function TestSSLCreateContext(AAllocator: Pointer; AProtocolSide,
+  AConnectionType: Integer): TTestSSLContextRef; cdecl;
+  external name 'SSLCreateContext';
+function TestSSLSetIOFuncs(AContext: TTestSSLContextRef;
+  AReadFunc: TTestSSLReadFunc; AWriteFunc: TTestSSLWriteFunc): LongInt; cdecl;
+  external name 'SSLSetIOFuncs';
+function TestSSLSetConnection(AContext: TTestSSLContextRef;
+  AConnection: TTestSSLConnectionRef): LongInt; cdecl;
+  external name 'SSLSetConnection';
+function TestSSLSetEnableCertVerify(AContext: TTestSSLContextRef;
+  AEnable: ByteBool): LongInt; cdecl;
+  external name 'SSLSetEnableCertVerify';
+function TestSSLSetProtocolVersionMin(AContext: TTestSSLContextRef;
+  AVersion: Integer): LongInt; cdecl;
+  external name 'SSLSetProtocolVersionMin';
+function TestSSLSetProtocolVersionMax(AContext: TTestSSLContextRef;
+  AVersion: Integer): LongInt; cdecl;
+  external name 'SSLSetProtocolVersionMax';
+function TestSSLCopyPeerTrust(AContext: TTestSSLContextRef;
+  out ATrust: Pointer): LongInt; cdecl;
+  external name 'SSLCopyPeerTrust';
+function TestSecTrustGetCertificateCount(ATrust: Pointer): NativeInt; cdecl;
+  external name 'SecTrustGetCertificateCount';
+function TestSSLHandshake(AContext: TTestSSLContextRef): LongInt; cdecl;
+  external name 'SSLHandshake';
+function TestSSLRead(AContext: TTestSSLContextRef; AData: Pointer;
+  ADataLength: PtrUInt; var AProcessed: PtrUInt): LongInt; cdecl;
+  external name 'SSLRead';
+function TestSSLWrite(AContext: TTestSSLContextRef; AData: Pointer;
+  ADataLength: PtrUInt; var AProcessed: PtrUInt): LongInt; cdecl;
+  external name 'SSLWrite';
+procedure TestCFRelease(AObject: Pointer); cdecl; external name 'CFRelease';
+
+function RawSecureTransportRead(AConnection: TTestSSLConnectionRef;
+  AData: Pointer; var ADataLength: PtrUInt): LongInt; cdecl;
+var
+  Available, Requested, Taken: Integer;
+  Client: ^TRawSecureTransportClient;
+begin
+  Client := AConnection;
+  Available := Length(Client^.Input);
+  Requested := Integer(ADataLength);
+  Taken := Requested;
+  if Taken > Available then Taken := Available;
+  if Taken > 0 then
+  begin
+    Move(Client^.Input[0], AData^, Taken);
+    if Taken < Available then
+      Move(Client^.Input[Taken], Client^.Input[0], Available - Taken);
+    SetLength(Client^.Input, Available - Taken);
+  end;
+  ADataLength := Taken;
+  if Taken = Requested then Result := TEST_ERR_SEC_SUCCESS
+  else Result := TEST_ERR_SSL_WOULD_BLOCK;
+end;
+
+function RawSecureTransportWrite(AConnection: TTestSSLConnectionRef;
+  AData: Pointer; var ADataLength: PtrUInt): LongInt; cdecl;
+var
+  Client: ^TRawSecureTransportClient;
+  Existing: Integer;
+begin
+  Client := AConnection;
+  Existing := Length(Client^.Output);
+  SetLength(Client^.Output, Existing + Integer(ADataLength));
+  if ADataLength > 0 then
+    Move(AData^, Client^.Output[Existing], ADataLength);
+  Result := TEST_ERR_SEC_SUCCESS;
+end;
+
+procedure CreateRawSecureTransportClientWithRange(
+  var AClient: TRawSecureTransportClient; const AMinimum,
+  AMaximum: Integer);
+begin
+  FillChar(AClient, SizeOf(AClient), 0);
+  AClient.Context := TestSSLCreateContext(nil, TEST_K_SSL_CLIENT_SIDE,
+    TEST_K_SSL_STREAM_TYPE);
+  if (AClient.Context = nil)
+    or (TestSSLSetIOFuncs(AClient.Context, RawSecureTransportRead,
+      RawSecureTransportWrite) <> TEST_ERR_SEC_SUCCESS)
+    or (TestSSLSetConnection(AClient.Context, @AClient)
+      <> TEST_ERR_SEC_SUCCESS)
+    or (TestSSLSetEnableCertVerify(AClient.Context, False)
+      <> TEST_ERR_SEC_SUCCESS)
+    or (TestSSLSetProtocolVersionMin(AClient.Context, AMinimum)
+      <> TEST_ERR_SEC_SUCCESS)
+    or ((AMaximum <> 0) and (TestSSLSetProtocolVersionMax(AClient.Context,
+      AMaximum) <> TEST_ERR_SEC_SUCCESS)) then
+    raise Exception.Create('Raw Secure Transport client setup failed');
+end;
+
+procedure CreateRawSecureTransportClient(
+  var AClient: TRawSecureTransportClient);
+begin
+  CreateRawSecureTransportClientWithRange(AClient,
+    TEST_K_TLS_PROTOCOL_12, 0);
+end;
+
+procedure FreeRawSecureTransportClient(
+  var AClient: TRawSecureTransportClient);
+begin
+  if AClient.Context <> nil then TestCFRelease(AClient.Context);
+  AClient.Context := nil;
+  SetLength(AClient.Input, 0);
+  SetLength(AClient.Output, 0);
+end;
+
+procedure PumpRawSecureTransportClient(
+  var AClient: TRawSecureTransportClient;
+  var AConnection: TTransportSecurityConnection);
+var
+  Accepted: Integer;
+begin
+  if Length(AClient.Output) = 0 then Exit;
+  Accepted := TransportSecurityFeedCiphertext(AConnection,
+    @AClient.Output[0], Length(AClient.Output));
+  if Accepted <> Length(AClient.Output) then
+    raise Exception.Create('Secure Transport server rejected client output');
+  SetLength(AClient.Output, 0);
+end;
+
+procedure PumpRawSecureTransportServer(
+  var AConnection: TTransportSecurityConnection;
+  var AClient: TRawSecureTransportClient);
+var
+  Buffer: Pointer;
+  Existing, Pending: Integer;
+begin
+  Pending := TransportSecurityGetCiphertext(AConnection, Buffer);
+  if Pending <= 0 then Exit;
+  Existing := Length(AClient.Input);
+  SetLength(AClient.Input, Existing + Pending);
+  Move(Buffer^, AClient.Input[Existing], Pending);
+  TransportSecurityConsumeCiphertext(AConnection, Pending);
+end;
+
+procedure WriteRawSecureTransportClientPlaintext(
+  var AClient: TRawSecureTransportClient; const AText: AnsiString);
+var
+  Processed: PtrUInt;
+  Status: LongInt;
+begin
+  Processed := 0;
+  Status := TestSSLWrite(AClient.Context, @AText[1], Length(AText), Processed);
+  if (Status <> TEST_ERR_SEC_SUCCESS) or (Processed <> PtrUInt(Length(AText))) then
+    raise Exception.CreateFmt(
+      'Raw Secure Transport client plaintext write failed: %d/%d',
+      [Status, Processed]);
+end;
+
+function ReadRawSecureTransportClientPlaintext(
+  var AClient: TRawSecureTransportClient): string;
+var
+  Buffer: array[0..255] of Byte;
+  Processed: PtrUInt;
+  Status: LongInt;
+begin
+  Processed := 0;
+  Status := TestSSLRead(AClient.Context, @Buffer[0], Length(Buffer), Processed);
+  if (Status <> TEST_ERR_SEC_SUCCESS) or (Processed = 0) then
+    raise Exception.CreateFmt(
+      'Raw Secure Transport client plaintext read failed: %d/%d',
+      [Status, Processed]);
+  Result := Copy(PAnsiChar(@Buffer[0]), 1, Processed);
+end;
+
+function RawSecureTransportPeerCertificateCount(
+  const AClient: TRawSecureTransportClient): NativeInt;
+var
+  Status: LongInt;
+  Trust: Pointer;
+begin
+  Trust := nil;
+  Status := TestSSLCopyPeerTrust(AClient.Context, Trust);
+  if (Status <> TEST_ERR_SEC_SUCCESS) or (Trust = nil) then
+    raise Exception.CreateFmt(
+      'Raw Secure Transport client peer trust failed: %d', [Status]);
+  try
+    Result := TestSecTrustGetCertificateCount(Trust);
+  finally
+    TestCFRelease(Trust);
+  end;
+end;
+
+procedure DriveRawSecureTransportHandshake(
+  var AConnection: TTransportSecurityConnection;
+  var AClient: TRawSecureTransportClient);
+var
+  ClientDone, ServerDone: Boolean;
+  ClientStatus: LongInt;
+  ServerState: TTransportSecurityState;
+  Step: Integer;
+begin
+  ClientDone := False;
+  ServerDone := False;
+  for Step := 1 to 100 do
+  begin
+    if not ClientDone then
+    begin
+      ClientStatus := TestSSLHandshake(AClient.Context);
+      if ClientStatus = TEST_ERR_SEC_SUCCESS then ClientDone := True
+      else if ClientStatus <> TEST_ERR_SSL_WOULD_BLOCK then
+        raise Exception.CreateFmt('Raw Secure Transport client handshake failed: %d',
+          [ClientStatus]);
+    end;
+    PumpRawSecureTransportClient(AClient, AConnection);
+    if not ServerDone then
+    begin
+      ServerState := TransportSecurityServerHandshake(AConnection);
+      if ServerState = tssDone then ServerDone := True
+      else if not (ServerState in [tssWantRead, tssWantWrite]) then
+        raise Exception.Create('Secure Transport server handshake failed');
+    end;
+    PumpRawSecureTransportServer(AConnection, AClient);
+    if ClientDone and ServerDone
+      and (Length(AClient.Output) = 0)
+      and (TransportSecurityPendingCiphertext(AConnection) = 0) then Exit;
+  end;
+  raise Exception.Create('Secure Transport in-memory handshake timed out');
+end;
+
+constructor TSecureTransportContextWorker.Create;
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FErrorMessage := '';
+end;
+
+procedure TSecureTransportContextWorker.Execute;
+var
+  Context: TTransportSecurityServerContext;
+begin
+  Context := nil;
+  try
+    try
+      Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+        PKCS12_PASSPHRASE);
+    except
+      on E: Exception do FErrorMessage := E.Message;
+    end;
+  finally
+    try
+      CloseTransportSecurityServerContext(Context);
+    except
+      on E: Exception do
+        if FErrorMessage = '' then FErrorMessage := E.Message;
+    end;
+  end;
+  end;
+
+procedure CreateExclusiveDarwinTestFile(const APath: string;
+  const AByte: Byte = $5a);
+const
+  TEST_O_NOFOLLOW = $00000100;
+var
+  Descriptor: LongInt;
+begin
+  Descriptor := FpOpen(PChar(APath), O_WRONLY or O_CREAT or O_EXCL or
+    TEST_O_NOFOLLOW, S_IRUSR or S_IWUSR);
+  if Descriptor < 0 then
+    raise Exception.Create('Could not create exclusive Darwin test fixture');
+  try
+    if FpWrite(Descriptor, AByte, SizeOf(AByte)) <> SizeOf(AByte) then
+      raise Exception.Create('Could not write exclusive Darwin test fixture');
+  finally
+    FpClose(Descriptor);
+  end;
+end;
+{$ENDIF}
+
+{$IFDEF DARWIN}
+function DarwinTemporaryServerKeychainCount: Integer;
+var
+  Search: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(IncludeTrailingPathDelimiter(GetTempDir) +
+    'secure-transport-server-' + IntToStr(GetProcessID) + '-*.keychain',
+    faAnyFile, Search) <> 0 then
+    Exit;
+  try
+    repeat
+      Inc(Result);
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+{$ENDIF}
 
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   TBeginAbortWorker = class(TThread)
@@ -1649,6 +1989,13 @@ var
   Observed: THandshakeObservations;
   State: TTransportSecurityState;
 {$ENDIF}
+{$IFDEF DARWIN}
+var
+  Client: TRawSecureTransportClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  State: TTransportSecurityState;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
@@ -1667,6 +2014,26 @@ begin
   finally
     AbortTransportSecurityServer(Connection);
     FreeRawClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    Expect<Boolean>(Connection.Active).ToBe(False);
+    State := TransportSecurityServerHandshake(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssWantRead));
+    Expect<Boolean>(Connection.Active).ToBe(False);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    Expect<Boolean>(Connection.Active).ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
     CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
@@ -1713,6 +2080,12 @@ var
   Context: TTransportSecurityServerContext;
   Observed: THandshakeObservations;
 {$ENDIF}
+{$IFDEF DARWIN}
+var
+  Client: TRawSecureTransportClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
@@ -1728,15 +2101,570 @@ begin
     CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
+  {$IFDEF DARWIN}
+  FillChar(Client, SizeOf(Client), 0);
+  FillChar(Connection, SizeOf(Connection), 0);
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    Expect<Boolean>(RawSecureTransportPeerCertificateCount(Client) >= 2)
+      .ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
 end;
 
-procedure TTransportSecurityServerTests.TestDarwinReportsUnsupportedServerTLS;
+procedure TTransportSecurityServerTests.TestDarwinConcurrentSecureTransportFirstUse;
+{$IFDEF DARWIN}
+const
+  WORKER_COUNT = 8;
 var
-  ErrorMessage: string;
+  Index: Integer;
+  Workers: array[0..WORKER_COUNT - 1] of TSecureTransportContextWorker;
+{$ENDIF}
 begin
-  ErrorMessage := CaptureContextError(PKCS12_PATH, PKCS12_PASSPHRASE);
-  Expect<Boolean>(Pos('not supported on macOS', ErrorMessage) > 0).ToBe(True);
-  Expect<Boolean>(Pos('Network.framework', ErrorMessage) > 0).ToBe(True);
+  {$IFDEF DARWIN}
+  for Index := Low(Workers) to High(Workers) do
+    Workers[Index] := TSecureTransportContextWorker.Create;
+  try
+    for Index := Low(Workers) to High(Workers) do Workers[Index].Start;
+    for Index := Low(Workers) to High(Workers) do Workers[Index].WaitFor;
+    for Index := Low(Workers) to High(Workers) do
+      Expect<string>(Workers[Index].ErrorMessage).ToBe('');
+  finally
+    for Index := Low(Workers) to High(Workers) do Workers[Index].Free;
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.TestDarwinSecureTransportCleanupFailures;
+{$IFDEF DARWIN}
+var
+  CleanupOnlyRaised, PrimaryPreserved: Boolean;
+  Context: TTransportSecurityServerContext;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  CleanupOnlyRaised := False;
+  TransportSecurityTestForceSecureTransportCleanupFileFailure(True);
+  try
+    try
+      CloseTransportSecurityServerContext(Context);
+    except
+      on E: ETransportSecurityError do
+      begin
+        Context := nil;
+        CleanupOnlyRaised := Pos('temporary TLS keychain storage',
+          E.Message) > 0;
+      end;
+    end;
+  finally
+    Context := nil;
+    TransportSecurityTestForceSecureTransportCleanupFileFailure(False);
+  end;
+  Expect<Boolean>(CleanupOnlyRaised).ToBe(True);
+
+  PrimaryPreserved := False;
+  TransportSecurityTestForceSecureTransportCleanupFileFailure(True);
+  try
+    try
+      Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+        'wrong-passphrase');
+    except
+      on E: ETransportSecurityError do
+        PrimaryPreserved := Pos('Failed to parse configured TLS PKCS#12',
+          E.Message) = 1;
+    end;
+  finally
+    Context := nil;
+    TransportSecurityTestForceSecureTransportCleanupFileFailure(False);
+  end;
+  Expect<Boolean>(PrimaryPreserved).ToBe(True);
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.TestDarwinSecureTransportNetworkFetchDisabled;
+{$IFDEF DARWIN}
+const
+  TEST_FETCH_POLICY_STATUS = -50;
+var
+  Context: TTransportSecurityServerContext;
+  FailedClosed: Boolean;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  Context := nil;
+  FailedClosed := False;
+  TransportSecurityTestForceSecureTransportNetworkFetchStatus(
+    TEST_FETCH_POLICY_STATUS);
+  try
+    try
+      Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+        PKCS12_PASSPHRASE);
+    except
+      on E: ETransportSecurityError do
+        FailedClosed := E.Message =
+          'Configured TLS identity does not form a valid bundled server chain';
+    end;
+    Expect<Boolean>(
+      TransportSecurityTestSecureTransportNetworkFetchWasDisabled).ToBe(True);
+    Expect<Boolean>(FailedClosed).ToBe(True);
+  finally
+    TransportSecurityTestForceSecureTransportNetworkFetchStatus(0);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.TestDarwinSecureTransportServerLifecycle;
+{$IFDEF DARWIN}
+const
+  TEST_DEAD_OWNER_PID = 2147483647;
+var
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  KeychainsBefore: Integer;
+  LinkCreationRefused: Boolean;
+  StaleKeychainPath: string;
+  SymlinkTargetPath: string;
+  TargetByte: Byte;
+  TargetStream: TFileStream;
+  State: TTransportSecurityState;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  KeychainsBefore := DarwinTemporaryServerKeychainCount;
+  Context := nil;
+  FillChar(Connection, SizeOf(Connection), 0);
+  StaleKeychainPath := IncludeTrailingPathDelimiter(GetTempDir)
+    + 'secure-transport-server-' + IntToStr(TEST_DEAD_OWNER_PID)
+    + '-00000000000000000000000000000000.keychain';
+  SysUtils.DeleteFile(StaleKeychainPath);
+  SymlinkTargetPath := StaleKeychainPath + '.target';
+  SysUtils.DeleteFile(SymlinkTargetPath);
+  CreateExclusiveDarwinTestFile(SymlinkTargetPath);
+  if FpSymlink(PChar(SymlinkTargetPath), PChar(StaleKeychainPath)) <> 0 then
+    raise Exception.Create('Could not create stale-keychain symlink fixture');
+  LinkCreationRefused := False;
+  try
+    try
+      CreateExclusiveDarwinTestFile(StaleKeychainPath, $a5);
+    except
+      on E: Exception do LinkCreationRefused := True;
+    end;
+    Expect<Boolean>(LinkCreationRefused).ToBe(True);
+    TargetStream := TFileStream.Create(SymlinkTargetPath, fmOpenRead);
+    try
+      Expect<Int64>(TargetStream.Size).ToBe(1);
+      TargetStream.ReadBuffer(TargetByte, SizeOf(TargetByte));
+      Expect<Integer>(TargetByte).ToBe($5a);
+    finally
+      TargetStream.Free;
+    end;
+  finally
+    SysUtils.DeleteFile(StaleKeychainPath);
+    SysUtils.DeleteFile(SymlinkTargetPath);
+  end;
+  TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
+    TEST_DEAD_OWNER_PID);
+  try
+    CreateExclusiveDarwinTestFile(StaleKeychainPath);
+    Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+      PKCS12_PASSPHRASE);
+    Expect<Boolean>(FileExists(StaleKeychainPath)).ToBe(False);
+    CreateExclusiveDarwinTestFile(StaleKeychainPath);
+    TransportSecurityTestForceSecureTransportRecoveryUnlinkRace(True);
+    Context.Reload(PKCS12_PATH, PKCS12_PASSPHRASE);
+    Expect<Boolean>(FileExists(StaleKeychainPath)).ToBe(False);
+    Expect<Boolean>(TransportSecurityServerBackendAvailable).ToBe(True);
+    BeginTransportSecurityServer(Connection, Context);
+    Expect<Boolean>(Connection.Active).ToBe(False);
+    State := TransportSecurityServerHandshake(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssWantRead));
+    Expect<Boolean>(Connection.Active).ToBe(False);
+  finally
+    TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(0);
+    TransportSecurityTestForceSecureTransportRecoveryUnlinkRace(False);
+    AbortTransportSecurityServer(Connection);
+    CloseTransportSecurityServerContext(Context);
+    SysUtils.DeleteFile(StaleKeychainPath);
+  end;
+  Expect<Integer>(DarwinTemporaryServerKeychainCount).ToBe(KeychainsBefore);
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestDarwinSecureTransportReplacementRacesNeverUnlinkReplacements;
+{$IFDEF DARWIN}
+const
+  TEST_DEAD_OWNER_PID = 2147483647;
+var
+  ABARaceStage: Integer;
+  Context: TTransportSecurityServerContext;
+  FailedClosed: Boolean;
+  ImportRaceStage: Integer;
+  OriginalPath, PreservedPath, StalePath: string;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FailedClosed := False;
+  OriginalPath := '';
+  PreservedPath := '';
+  TransportSecurityTestForceSecureTransportCleanupFileFailure(False);
+  TransportSecurityTestForceSecureTransportReplacementRace(True, False);
+  try
+    try
+      CloseTransportSecurityServerContext(Context);
+    except
+      on E: ETransportSecurityError do
+      begin
+        Context := nil;
+        FailedClosed := True;
+      end;
+    end;
+    TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+      PreservedPath);
+    Expect<Boolean>(FailedClosed).ToBe(True);
+    Expect<Boolean>(FileExists(OriginalPath)).ToBe(True);
+    Expect<Boolean>(FileExists(PreservedPath)).ToBe(False);
+  finally
+    Context := nil;
+    TransportSecurityTestForceSecureTransportReplacementRace(False, False);
+    TransportSecurityTestForceSecureTransportCleanupFileFailure(False);
+    SysUtils.DeleteFile(OriginalPath);
+    SysUtils.DeleteFile(PreservedPath);
+  end;
+
+  StalePath := IncludeTrailingPathDelimiter(GetTempDir)
+    + 'secure-transport-server-' + IntToStr(TEST_DEAD_OWNER_PID)
+    + '-00000000000000000000000000000001.keychain';
+  SysUtils.DeleteFile(StalePath);
+  CreateExclusiveDarwinTestFile(StalePath);
+  FailedClosed := False;
+  OriginalPath := '';
+  PreservedPath := '';
+  TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
+    TEST_DEAD_OWNER_PID);
+  TransportSecurityTestForceSecureTransportReplacementRace(False, True);
+  try
+    try
+      Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+        PKCS12_PASSPHRASE);
+    except
+      on E: ETransportSecurityError do FailedClosed := True;
+    end;
+    TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+      PreservedPath);
+    Expect<Boolean>(FailedClosed).ToBe(True);
+    Expect<Boolean>(FileExists(OriginalPath)).ToBe(True);
+    Expect<Boolean>(FileExists(PreservedPath)).ToBe(True);
+  finally
+    CloseTransportSecurityServerContext(Context);
+    TransportSecurityTestForceSecureTransportReplacementRace(False, False);
+    TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(0);
+    SysUtils.DeleteFile(OriginalPath);
+    SysUtils.DeleteFile(PreservedPath);
+    SysUtils.DeleteFile(StalePath);
+  end;
+
+  for ImportRaceStage := 0 to 2 do
+  begin
+    Context := nil;
+    FailedClosed := False;
+    OriginalPath := '';
+    PreservedPath := '';
+    TransportSecurityTestForceSecureTransportImportReplacementRace(
+      ImportRaceStage = 0, ImportRaceStage = 1, ImportRaceStage = 2);
+    try
+      try
+        Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+          PKCS12_PASSPHRASE);
+      except
+        on E: ETransportSecurityError do
+        begin
+          FailedClosed := E.Message =
+            'Temporary TLS keychain storage changed identity during import';
+        end;
+      end;
+      TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+        PreservedPath);
+      Expect<Boolean>(FailedClosed).ToBe(True);
+      Expect<Boolean>(FileExists(OriginalPath)).ToBe(True);
+      Expect<Boolean>(FileExists(PreservedPath)).ToBe(True);
+    finally
+      CloseTransportSecurityServerContext(Context);
+      TransportSecurityTestForceSecureTransportImportReplacementRace(False,
+        False, False);
+      SysUtils.DeleteFile(OriginalPath);
+      SysUtils.DeleteFile(PreservedPath);
+    end;
+  end;
+
+  for ABARaceStage := 0 to 1 do
+  begin
+    Context := nil;
+    FailedClosed := False;
+    OriginalPath := '';
+    PreservedPath := '';
+    TransportSecurityTestForceSecureTransportBindABARace(True,
+      ABARaceStage);
+    try
+      try
+        Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+          PKCS12_PASSPHRASE);
+      except
+        on E: ETransportSecurityError do FailedClosed := True;
+      end;
+      TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+        PreservedPath);
+      Expect<Boolean>(FailedClosed).ToBe(True);
+      Expect<Boolean>(FileExists(OriginalPath)).ToBe(True);
+      Expect<Boolean>(FileExists(PreservedPath)).ToBe(False);
+    finally
+      CloseTransportSecurityServerContext(Context);
+      TransportSecurityTestForceSecureTransportBindABARace(False, 0);
+      SysUtils.DeleteFile(OriginalPath);
+      SysUtils.DeleteFile(PreservedPath);
+    end;
+  end;
+
+  StalePath := IncludeTrailingPathDelimiter(GetTempDir)
+    + 'secure-transport-server-' + IntToStr(TEST_DEAD_OWNER_PID)
+    + '-00000000000000000000000000000003.keychain';
+  SysUtils.DeleteFile(StalePath);
+  CreateExclusiveDarwinTestFile(StalePath);
+  Context := nil;
+  FailedClosed := False;
+  OriginalPath := '';
+  PreservedPath := '';
+  TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
+    TEST_DEAD_OWNER_PID);
+  TransportSecurityTestForceSecureTransportBindABARace(True, 0);
+  try
+    try
+      Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+        PKCS12_PASSPHRASE);
+    except
+      on E: ETransportSecurityError do FailedClosed := True;
+    end;
+    TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+      PreservedPath);
+    Expect<Boolean>(FailedClosed).ToBe(True);
+    Expect<Boolean>(FileExists(StalePath)).ToBe(True);
+    Expect<Boolean>(OriginalPath <> '').ToBe(True);
+    Expect<Boolean>(FileExists(PreservedPath)).ToBe(False);
+  finally
+    CloseTransportSecurityServerContext(Context);
+    TransportSecurityTestForceSecureTransportBindABARace(False, 0);
+    TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(0);
+    SysUtils.DeleteFile(OriginalPath);
+    SysUtils.DeleteFile(PreservedPath);
+    SysUtils.DeleteFile(StalePath);
+  end;
+
+  StalePath := IncludeTrailingPathDelimiter(GetTempDir)
+    + 'secure-transport-server-' + IntToStr(TEST_DEAD_OWNER_PID)
+    + '-00000000000000000000000000000002.keychain';
+  SysUtils.DeleteFile(StalePath);
+  CreateExclusiveDarwinTestFile(StalePath);
+  Context := nil;
+  FailedClosed := False;
+  OriginalPath := '';
+  PreservedPath := '';
+  TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(
+    TEST_DEAD_OWNER_PID);
+  TransportSecurityTestForceSecureTransportFinalUnlinkReplacementRace(True);
+  try
+    try
+      Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+        PKCS12_PASSPHRASE);
+    except
+      on E: ETransportSecurityError do
+        FailedClosed := True;
+    end;
+    TransportSecurityTestSecureTransportReplacementRacePaths(OriginalPath,
+      PreservedPath);
+    Expect<Boolean>(FailedClosed).ToBe(True);
+    Expect<Boolean>(FileExists(OriginalPath)).ToBe(True);
+    Expect<Boolean>(FileExists(PreservedPath)).ToBe(False);
+  finally
+    CloseTransportSecurityServerContext(Context);
+    TransportSecurityTestForceSecureTransportFinalUnlinkReplacementRace(
+      False);
+    TransportSecurityTestForceSecureTransportRecoveryDeadOwnerPID(0);
+    SysUtils.DeleteFile(OriginalPath);
+    SysUtils.DeleteFile(PreservedPath);
+    SysUtils.DeleteFile(StalePath);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.TestDarwinSecureTransportRoundTrip;
+{$IFDEF DARWIN}
+const
+  REQUEST = 'secure transport request';
+  RESPONSE = 'secure transport response';
+var
+  Buffer: array[0..255] of Byte;
+  Client: TRawSecureTransportClient;
+  ClientProcessed: PtrUInt;
+  ClientStatus: LongInt;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  IOResult: TTransportSecurityIOResult;
+  Received: string;
+  State: TTransportSecurityState;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  FillChar(Client, SizeOf(Client), 0);
+  FillChar(Connection, SizeOf(Connection), 0);
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    Expect<Boolean>(Connection.Active).ToBe(True);
+
+    ClientProcessed := 0;
+    ClientStatus := TestSSLWrite(Client.Context, @REQUEST[1],
+      Length(REQUEST), ClientProcessed);
+    Expect<Boolean>((ClientStatus = TEST_ERR_SEC_SUCCESS)
+      or (ClientStatus = TEST_ERR_SSL_WOULD_BLOCK)).ToBe(True);
+    Expect<Integer>(Integer(ClientProcessed)).ToBe(Length(REQUEST));
+    PumpRawSecureTransportClient(Client, Connection);
+    IOResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(IOResult.BytesProcessed).ToBe(Length(REQUEST));
+    SetString(Received, PAnsiChar(@Buffer[0]), IOResult.BytesProcessed);
+    Expect<string>(Received).ToBe(REQUEST);
+
+    IOResult := TransportSecurityServerWrite(Connection, @RESPONSE[1],
+      Length(RESPONSE));
+    Expect<Integer>(IOResult.BytesProcessed).ToBe(Length(RESPONSE));
+    PumpRawSecureTransportServer(Connection, Client);
+    ClientProcessed := 0;
+    ClientStatus := TestSSLRead(Client.Context, @Buffer[0], Length(Buffer),
+      ClientProcessed);
+    Expect<Boolean>((ClientStatus = TEST_ERR_SEC_SUCCESS)
+      or (ClientStatus = TEST_ERR_SSL_WOULD_BLOCK)).ToBe(True);
+    SetString(Received, PAnsiChar(@Buffer[0]), ClientProcessed);
+    Expect<string>(Received).ToBe(RESPONSE);
+
+    State := CloseTransportSecurityServerGracefully(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssWantWrite));
+    Expect<Boolean>(TransportSecurityPendingCiphertext(Connection) > 0).ToBe(
+      True);
+    PumpRawSecureTransportServer(Connection, Client);
+    State := CloseTransportSecurityServerGracefully(Connection);
+    Expect<Boolean>(State in [tssDone, tssPeerClosed]).ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+end;
+
+procedure TTransportSecurityServerTests.
+  TestDarwinSecureTransportWriteWantRetryRetainsPlaintext;
+{$IFDEF DARWIN}
+const
+  LARGE_WRITE_SIZE = 64 * 1024 + 137;
+var
+  Buffer: array[0..4095] of Byte;
+  Client: TRawSecureTransportClient;
+  ClientProcessed: PtrUInt;
+  ClientStatus: LongInt;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Expected: TBytes;
+  I: Integer;
+  Offset: Integer;
+  Payload: TBytes;
+  ReadLength: Integer;
+  Received: TBytes;
+  Step: Integer;
+  WriteCompleted: Boolean;
+  WriteResult: TTransportSecurityIOResult;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  FillChar(Client, SizeOf(Client), 0);
+  FillChar(Connection, SizeOf(Connection), 0);
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE, TLS_SERVER_DEFAULT_INPUT_CAPACITY,
+    TLS_SERVER_MIN_OUTPUT_CAPACITY);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    SetLength(Payload, LARGE_WRITE_SIZE);
+    for I := 0 to High(Payload) do
+      Payload[I] := Byte((I * 31 + 17) and $FF);
+    Expected := Copy(Payload, 0, Length(Payload));
+
+    WriteResult := TransportSecurityServerWrite(Connection, @Payload[0],
+      Length(Payload));
+    Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(WriteResult.BytesProcessed).ToBe(0);
+    FillChar(Payload[0], Length(Payload), $A5);
+
+    WriteCompleted := False;
+    for Step := 1 to 128 do
+    begin
+      PumpRawSecureTransportServer(Connection, Client);
+      WriteResult := TransportSecurityServerWrite(Connection, nil, 0);
+      if WriteResult.BytesProcessed > 0 then
+      begin
+        Expect<Integer>(WriteResult.BytesProcessed).ToBe(Length(Expected));
+        WriteCompleted := True;
+      end;
+      if WriteResult.State = tssError then
+        raise Exception.Create('Retained Secure Transport write retry failed');
+      if WriteCompleted
+        and (TransportSecurityPendingCiphertext(Connection) = 0) then Break;
+    end;
+    PumpRawSecureTransportServer(Connection, Client);
+    Expect<Boolean>(WriteCompleted).ToBe(True);
+
+    SetLength(Received, Length(Expected));
+    Offset := 0;
+    while Offset < Length(Received) do
+    begin
+      ClientProcessed := 0;
+      ReadLength := Length(Received) - Offset;
+      if ReadLength > Length(Buffer) then ReadLength := Length(Buffer);
+      ClientStatus := TestSSLRead(Client.Context, @Buffer[0], ReadLength,
+        ClientProcessed);
+      if ((ClientStatus <> TEST_ERR_SEC_SUCCESS)
+        and (ClientStatus <> TEST_ERR_SSL_WOULD_BLOCK))
+        or (ClientProcessed = 0) then
+        raise Exception.CreateFmt(
+          'Raw Secure Transport client large read failed: %d/%d',
+          [ClientStatus, ClientProcessed]);
+      Move(Buffer[0], Received[Offset], ClientProcessed);
+      Inc(Offset, Integer(ClientProcessed));
+    end;
+    Expect<Boolean>(CompareByte(Expected[0], Received[0],
+      Length(Expected)) = 0).ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
 end;
 
 procedure TTransportSecurityServerTests.TestEmptyAndUTF8Passphrases;
@@ -1945,6 +2873,23 @@ var
   ReadResult: TTransportSecurityIOResult;
   Remainder: Integer;
 {$ENDIF}
+{$IFDEF DARWIN}
+const
+  DARWIN_PAYLOAD_LENGTH = 16000;
+var
+  Accepted: Integer;
+  BaselineAccepted: QWord;
+  BaselineConsumed: QWord;
+  Buffer: array[0..DARWIN_PAYLOAD_LENGTH - 1] of Byte;
+  Ciphertext: TBytes;
+  Client: TRawSecureTransportClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  Flow: TTransportSecurityInputFlow;
+  Payload: AnsiString;
+  ReadResult: TTransportSecurityIOResult;
+  Remainder: Integer;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
@@ -2008,6 +2953,66 @@ begin
     CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
+  {$IFDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE, TLS_SERVER_MIN_INPUT_CAPACITY, 0,
+    TLS_SERVER_DEFAULT_OUTPUT_CAPACITY);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    BaselineAccepted := Flow.AcceptedBytes;
+    BaselineConsumed := Flow.ConsumedBytes;
+    Expect<Int64>(Int64(BaselineAccepted)).ToBe(Int64(BaselineConsumed));
+    SetLength(Payload, DARWIN_PAYLOAD_LENGTH);
+    FillChar(Payload[1], Length(Payload), Ord('a'));
+    WriteRawSecureTransportClientPlaintext(Client, Payload);
+    FillChar(Payload[1], Length(Payload), Ord('b'));
+    WriteRawSecureTransportClientPlaintext(Client, Payload);
+    Ciphertext := Copy(Client.Output);
+    SetLength(Client.Output, 0);
+    Expect<Boolean>(Length(Ciphertext) > TLS_SERVER_MIN_INPUT_CAPACITY)
+      .ToBe(True);
+    Accepted := TransportSecurityFeedCiphertext(Connection, @Ciphertext[0],
+      Length(Ciphertext));
+    Expect<Integer>(Accepted).ToBe(TLS_SERVER_MIN_INPUT_CAPACITY);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Integer>(Flow.BufferedBytes).ToBe(TLS_SERVER_MIN_INPUT_CAPACITY);
+    Expect<Int64>(Int64(Flow.AcceptedBytes)).ToBe(
+      Int64(BaselineAccepted + QWord(Accepted)));
+    Expect<Int64>(Int64(Flow.ConsumedBytes)).ToBe(Int64(BaselineConsumed));
+    Expect<Boolean>(Flow.Backpressured).ToBe(True);
+    Expect<Integer>(TransportSecurityFeedCiphertext(Connection,
+      @Ciphertext[Accepted], Length(Ciphertext) - Accepted)).ToBe(0);
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(DARWIN_PAYLOAD_LENGTH);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Boolean>(Flow.ConsumedBytes > BaselineConsumed).ToBe(True);
+    Expect<Boolean>(Flow.BufferedBytes < TLS_SERVER_MIN_INPUT_CAPACITY)
+      .ToBe(True);
+    Remainder := Length(Ciphertext) - Accepted;
+    Expect<Integer>(TransportSecurityFeedCiphertext(Connection,
+      @Ciphertext[Accepted], Remainder)).ToBe(Remainder);
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(DARWIN_PAYLOAD_LENGTH);
+    Flow := TransportSecurityServerInputFlow(Connection);
+    Expect<Int64>(Int64(Flow.AcceptedBytes)).ToBe(
+      Int64(BaselineAccepted + QWord(Length(Ciphertext))));
+    Expect<Int64>(Int64(Flow.ConsumedBytes)).ToBe(
+      Int64(BaselineConsumed + QWord(Length(Ciphertext))));
+    Expect<Integer>(Flow.BufferedBytes).ToBe(0);
+    Expect<Boolean>(Flow.Backpressured).ToBe(False);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
 end;
 
 procedure TTransportSecurityServerTests.TestPeerCloseNotifyReportsPeerClosed;
@@ -2020,6 +3025,13 @@ var
   Observed: THandshakeObservations;
   ReadResult: TTransportSecurityIOResult;
   ShutdownResult: Integer;
+{$ENDIF}
+{$IFDEF DARWIN}
+var
+  Client: TRawSecureTransportClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  State: TTransportSecurityState;
 {$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
@@ -2047,6 +3059,25 @@ begin
     CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
+  {$IFDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    State := TransportSecurityTestInjectSecureTransportPeerClose(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssPeerClosed));
+    Expect<Boolean>(Connection.Active).ToBe(False);
+    Expect<Integer>(TransportSecurityPendingCiphertext(Connection)).ToBe(0);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
 end;
 
 procedure TTransportSecurityServerTests.TestPendingCiphertextPointerIsStable;
@@ -2058,6 +3089,20 @@ var
   Connection: TTransportSecurityConnection;
   Context: TTransportSecurityServerContext;
   Observed: THandshakeObservations;
+  OriginalCiphertext: Pointer;
+  Pending: Integer;
+  ReadResult: TTransportSecurityIOResult;
+  RetryText: AnsiString;
+  State: TTransportSecurityState;
+  WriteResult: TTransportSecurityIOResult;
+{$ENDIF}
+{$IFDEF DARWIN}
+var
+  Buffer: array[0..255] of Byte;
+  Ciphertext: Pointer;
+  Client: TRawSecureTransportClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
   OriginalCiphertext: Pointer;
   Pending: Integer;
   ReadResult: TTransportSecurityIOResult;
@@ -2128,6 +3173,51 @@ begin
   finally
     AbortTransportSecurityServer(Connection);
     FreeRawClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    WriteResult := TransportSecurityServerWrite(Connection,
+      @SERVER_RESPONSE[1], Length(SERVER_RESPONSE));
+    Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
+    Pending := TransportSecurityGetCiphertext(Connection, OriginalCiphertext);
+    Expect<Boolean>(Pending > 0).ToBe(True);
+    State := TransportSecurityServerHandshake(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(TransportSecurityGetCiphertext(Connection,
+      Ciphertext)).ToBe(Pending);
+    Expect<Boolean>(Ciphertext = OriginalCiphertext).ToBe(True);
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(Ord(ReadResult.State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(0);
+    Expect<Integer>(TransportSecurityGetCiphertext(Connection,
+      Ciphertext)).ToBe(Pending);
+    Expect<Boolean>(Ciphertext = OriginalCiphertext).ToBe(True);
+    RetryText := 'write waits without consuming caller plaintext';
+    WriteResult := TransportSecurityServerWrite(Connection, @RetryText[1],
+      Length(RetryText));
+    Expect<Integer>(Ord(WriteResult.State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(WriteResult.BytesProcessed).ToBe(0);
+    Expect<Integer>(TransportSecurityGetCiphertext(Connection,
+      Ciphertext)).ToBe(Pending);
+    Expect<Boolean>(Ciphertext = OriginalCiphertext).ToBe(True);
+    State := CloseTransportSecurityServerGracefully(Connection);
+    Expect<Integer>(Ord(State)).ToBe(Ord(tssWantWrite));
+    Expect<Integer>(TransportSecurityGetCiphertext(Connection,
+      Ciphertext)).ToBe(Pending);
+    Expect<Boolean>(Ciphertext = OriginalCiphertext).ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
     CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
@@ -2226,7 +3316,7 @@ begin
 end;
 
 procedure TTransportSecurityServerTests.TestPKCS12PathRefusesSymbolicLink;
-{$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
+{$IFDEF UNIX}
 var
   Context: TTransportSecurityServerContext;
   ErrorMessage: string;
@@ -2242,7 +3332,7 @@ var
   RemovalSucceeded: Boolean;
 {$ENDIF}
 begin
-  {$IF DEFINED(UNIX) AND NOT DEFINED(DARWIN)}
+  {$IFDEF UNIX}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   CloseTransportSecurityServerContext(Context);
@@ -2336,6 +3426,7 @@ var
 {$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_SERVER}
+  {$IFNDEF DARWIN}
   ErrorMessage := CaptureContextError(FUTURE_PKCS12_PATH,
     PKCS12_PASSPHRASE);
   if Pos('validity window', ErrorMessage) = 0 then
@@ -2393,6 +3484,18 @@ begin
   finally
     CloseTransportSecurityServerContext(Context);
   end;
+  {$ELSE}
+  Context := nil;
+  TransportSecurityTestForceSecureTransportTrustEvaluationFailure(True);
+  try
+    ErrorMessage := CaptureContextError(PKCS12_PATH, PKCS12_PASSPHRASE);
+    Expect<string>(ErrorMessage).ToBe(
+      'Configured TLS identity does not form a valid bundled server chain');
+  finally
+    TransportSecurityTestForceSecureTransportTrustEvaluationFailure(False);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
   {$ENDIF}
 end;
 
@@ -2415,6 +3518,16 @@ var
   WorkerOperations: LongInt;
   WorkerOperationsBeforeReload: LongInt;
   WorkerStarted: Boolean;
+{$ENDIF}
+{$IFDEF DARWIN}
+var
+  Client: TRawSecureTransportClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  ErrorMessage: string;
+  Identity: TBytes;
+  SecondClient: TRawSecureTransportClient;
+  SecondConnection: TTransportSecurityConnection;
 {$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
@@ -2490,6 +3603,45 @@ begin
     CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
+  {$IFDEF DARWIN}
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  FillChar(SecondConnection, SizeOf(SecondConnection), 0);
+  FillChar(SecondClient, SizeOf(SecondClient), 0);
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    Identity := LoadFixtureBytes(PKCS12_PATH);
+    try
+      Context.Reload(Identity, PKCS12_PASSPHRASE);
+    finally
+      FillChar(Identity[0], Length(Identity), 0);
+    end;
+    ErrorMessage := '';
+    try
+      Context.Reload(PKCS12_PATH, 'wrong-passphrase');
+    except
+      on E: ETransportSecurityError do ErrorMessage := E.Message;
+    end;
+    Expect<Boolean>(Pos('Failed to parse configured TLS PKCS#12',
+      ErrorMessage) = 1).ToBe(True);
+    BeginTransportSecurityServer(SecondConnection, Context);
+    CloseTransportSecurityServerContext(Context);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    CreateRawSecureTransportClient(SecondClient);
+    DriveRawSecureTransportHandshake(SecondConnection, SecondClient);
+    Expect<Boolean>(Connection.Active).ToBe(True);
+    Expect<Boolean>(SecondConnection.Active).ToBe(True);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
+    AbortTransportSecurityServer(SecondConnection);
+    FreeRawSecureTransportClient(SecondClient);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
 end;
 
 procedure TTransportSecurityServerTests.TestHandshakeTransitionsAndContextReuse;
@@ -2548,6 +3700,19 @@ var
   ReadResult: TTransportSecurityIOResult;
   WriteResult: TTransportSecurityIOResult;
 {$ENDIF}
+{$IFDEF DARWIN}
+var
+  Buffer: array[0..255] of Byte;
+  Client: TRawSecureTransportClient;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  OutputFlow: TTransportSecurityOutputFlow;
+  Partial: Integer;
+  Pending: Integer;
+  ReadResult: TTransportSecurityIOResult;
+  ServerCiphertext: Pointer;
+  WriteResult: TTransportSecurityIOResult;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
@@ -2604,6 +3769,57 @@ begin
   finally
     AbortTransportSecurityServer(Connection);
     FreeRawClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    WriteRawSecureTransportClientPlaintext(Client, CLIENT_REQUEST);
+    Expect<Boolean>(Length(Client.Output) > 1).ToBe(True);
+    Partial := Length(Client.Output) div 2;
+    Expect<Integer>(TransportSecurityFeedCiphertext(Connection,
+      @Client.Output[0], Partial)).ToBe(Partial);
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(Ord(ReadResult.State)).ToBe(Ord(tssWantRead));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(0);
+    Expect<Integer>(TransportSecurityFeedCiphertext(Connection,
+      @Client.Output[Partial], Length(Client.Output) - Partial)).ToBe(
+      Length(Client.Output) - Partial);
+    SetLength(Client.Output, 0);
+    ReadResult := TransportSecurityServerRead(Connection, Buffer,
+      Length(Buffer));
+    Expect<Integer>(ReadResult.BytesProcessed).ToBe(Length(CLIENT_REQUEST));
+    Expect<string>(Copy(PAnsiChar(@Buffer[0]), 1,
+      ReadResult.BytesProcessed)).ToBe(CLIENT_REQUEST);
+    WriteResult := TransportSecurityServerWrite(Connection,
+      @SERVER_RESPONSE[1], Length(SERVER_RESPONSE));
+    Expect<Integer>(WriteResult.BytesProcessed).ToBe(Length(SERVER_RESPONSE));
+    Pending := TransportSecurityGetCiphertext(Connection, ServerCiphertext);
+    Expect<Boolean>(Pending > 1).ToBe(True);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.PendingBytes).ToBe(Pending);
+    Partial := Pending div 2;
+    SetLength(Client.Input, Partial);
+    Move(ServerCiphertext^, Client.Input[0], Partial);
+    TransportSecurityConsumeCiphertext(Connection, Partial);
+    Expect<Integer>(TransportSecurityPendingCiphertext(Connection)).ToBe(
+      Pending - Partial);
+    OutputFlow := TransportSecurityServerOutputFlow(Connection);
+    Expect<Integer>(OutputFlow.PendingBytes).ToBe(Pending - Partial);
+    PumpRawSecureTransportServer(Connection, Client);
+    Expect<string>(ReadRawSecureTransportClientPlaintext(Client)).ToBe(
+      SERVER_RESPONSE);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
     CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
@@ -2837,29 +4053,64 @@ end;
 
 procedure TTransportSecurityServerTests.TestFatalHandshakePoisonsConnection;
 {$IFDEF TRANSPORT_SECURITY_SERVER}
+{$IFNDEF DARWIN}
 const
+  { Complete non-TLS input is a provider-independent fatal handshake. A
+    TLS-shaped record with only one handshake byte is incomplete, so OpenSSL
+    correctly buffers it and reports WANT_READ instead of a protocol error. }
   INVALID_HANDSHAKE = 'GET / HTTP/1.0'#13#10#13#10;
+{$ENDIF}
 var
   Connection: TTransportSecurityConnection;
   Context: TTransportSecurityServerContext;
+  {$IFNDEF DARWIN}
+  I: Integer;
+  {$ENDIF}
   State: TTransportSecurityState;
+  {$IFDEF DARWIN}
+  Client: TRawSecureTransportClient;
+  WriteResult: TTransportSecurityIOResult;
+  {$ENDIF}
 {$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_SERVER}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
     PKCS12_PASSPHRASE);
   FillChar(Connection, SizeOf(Connection), 0);
+  {$IFDEF DARWIN}
+  FillChar(Client, SizeOf(Client), 0);
+  {$ENDIF}
   try
     BeginTransportSecurityServer(Connection, Context);
+    {$IFDEF DARWIN}
+    CreateRawSecureTransportClient(Client);
+    DriveRawSecureTransportHandshake(Connection, Client);
+    WriteResult := TransportSecurityServerWrite(Connection,
+      @SERVER_RESPONSE[1], Length(SERVER_RESPONSE));
+    Expect<Integer>(WriteResult.BytesProcessed).ToBe(Length(SERVER_RESPONSE));
+    Expect<Boolean>(TransportSecurityPendingCiphertext(Connection) > 0).ToBe(
+      True);
+    State := TransportSecurityTestInjectSecureTransportFatalStatus(Connection);
+    {$ELSE}
     Expect<Integer>(TransportSecurityFeedCiphertext(Connection,
       @INVALID_HANDSHAKE[1], Length(INVALID_HANDSHAKE))).ToBe(
       Length(INVALID_HANDSHAKE));
-    State := TransportSecurityServerHandshake(Connection);
+    State := tssWantRead;
+    for I := 1 to 3 do
+    begin
+      State := TransportSecurityServerHandshake(Connection);
+      if State <> tssWantRead then
+        Break;
+    end;
+    {$ENDIF}
     Expect<Integer>(Ord(State)).ToBe(Ord(tssError));
     Expect<Boolean>(Connection.Active).ToBe(False);
     Expect<Integer>(TransportSecurityPendingCiphertext(Connection)).ToBe(0);
   finally
     AbortTransportSecurityServer(Connection);
+    {$IFDEF DARWIN}
+    FreeRawSecureTransportClient(Client);
+    {$ENDIF}
     CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
@@ -2979,6 +4230,15 @@ var
   I: Integer;
   ServerState: TTransportSecurityState;
 {$ENDIF}
+{$IFDEF DARWIN}
+var
+  Client: TRawSecureTransportClient;
+  ClientStatus: LongInt;
+  Connection: TTransportSecurityConnection;
+  Context: TTransportSecurityServerContext;
+  I: Integer;
+  ServerState: TTransportSecurityState;
+{$ENDIF}
 begin
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
@@ -3005,6 +4265,35 @@ begin
   finally
     AbortTransportSecurityServer(Connection);
     FreeRawClient(Client);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(Connection, SizeOf(Connection), 0);
+  FillChar(Client, SizeOf(Client), 0);
+  try
+    BeginTransportSecurityServer(Connection, Context);
+    CreateRawSecureTransportClientWithRange(Client,
+      TEST_K_TLS_PROTOCOL_11, TEST_K_TLS_PROTOCOL_11);
+    ServerState := tssWantRead;
+    for I := 1 to 100 do
+    begin
+      ClientStatus := TestSSLHandshake(Client.Context);
+      PumpRawSecureTransportClient(Client, Connection);
+      ServerState := TransportSecurityServerHandshake(Connection);
+      if ServerState = tssError then Break;
+      PumpRawSecureTransportServer(Connection, Client);
+      if (ClientStatus <> TEST_ERR_SEC_SUCCESS)
+        and (ClientStatus <> TEST_ERR_SSL_WOULD_BLOCK)
+        and (Length(Client.Output) = 0) then Break;
+    end;
+    Expect<Integer>(Ord(ServerState)).ToBe(Ord(tssError));
+    Expect<Boolean>(Connection.Active).ToBe(False);
+  finally
+    AbortTransportSecurityServer(Connection);
+    FreeRawSecureTransportClient(Client);
     CloseTransportSecurityServerContext(Context);
   end;
   {$ENDIF}
@@ -3630,68 +4919,66 @@ end;
 procedure TTransportSecurityServerTests.SetupTests;
 begin
   {$IFDEF DARWIN}
-  Test('Darwin server API reports Network.framework alternative',
-    TestDarwinReportsUnsupportedServerTLS);
+  FServerBackendAvailable := TransportSecurityServerBackendAvailable;
+  Test('Darwin Secure Transport resolves server symbols concurrently once',
+    TestDarwinConcurrentSecureTransportFirstUse);
+  Test('Darwin Secure Transport cleanup failures preserve primary errors',
+    TestDarwinSecureTransportCleanupFailures);
+  Test('Darwin Secure Transport disables trust network fetching',
+    TestDarwinSecureTransportNetworkFetchDisabled);
+  Test('Darwin Secure Transport server begins and aborts cleanly',
+    TestDarwinSecureTransportServerLifecycle);
+  Test('Darwin Secure Transport replacement races never unlink replacements',
+    TestDarwinSecureTransportReplacementRacesNeverUnlinkReplacements);
+  Test('Darwin Secure Transport handshake and IO round-trip in memory',
+    TestDarwinSecureTransportRoundTrip);
+  Test('Darwin Secure Transport write retry retains caller plaintext',
+    TestDarwinSecureTransportWriteWantRetryRetainsPlaintext);
   Skip('empty and UTF-8 PKCS#12 passphrases load',
     TestEmptyAndUTF8Passphrases,
-    DARWIN_SKIP_REASON);
-  Skip('embedded-NUL PKCS#12 passphrase is rejected',
-    TestEmbeddedNULPassphraseRejected,
-    DARWIN_SKIP_REASON);
-  Skip('missing PKCS#12 fails without disclosing path',
-    TestMissingPKCS12FailsWithoutPathDisclosure,
-    DARWIN_SKIP_REASON);
-  Skip('server input flow validates and publishes watermarks',
-    TestInputFlowConfiguration,
-    DARWIN_SKIP_REASON);
-  Skip('garbage and wrong-pass PKCS#12 fail actionably',
-    TestPKCS12LoadFailures,
-    DARWIN_SKIP_REASON);
-  Skip('PKCS#12 identities above 16 MiB fail without disclosure',
-    TestPKCS12SizeLimit,
-    DARWIN_SKIP_REASON);
-  Skip('strict identity policy rejects invalid production certificates',
-    TestStrictIdentityValidation,
-    DARWIN_SKIP_REASON);
+    'the existing OpenSSL-generated fixtures use PKCS#12 algorithms unsupported by Security.framework');
+  ServerTest('embedded-NUL PKCS#12 passphrase is rejected',
+    TestEmbeddedNULPassphraseRejected);
+  ServerTest('missing PKCS#12 fails without disclosing path',
+    TestMissingPKCS12FailsWithoutPathDisclosure);
+  ServerTest('server input flow validates and publishes watermarks',
+    TestInputFlowConfiguration);
+  ServerTest('garbage and wrong-pass PKCS#12 fail actionably',
+    TestPKCS12LoadFailures);
+  ServerTest('PKCS#12 identities above 16 MiB fail without disclosure',
+    TestPKCS12SizeLimit);
+  ServerTest('strict identity policy rejects invalid production certificates',
+    TestStrictIdentityValidation);
   Skip('strict identity allows a leaf without basic constraints',
     TestStrictIdentityAllowsLeafWithoutBasicConstraints,
     DARWIN_SKIP_REASON);
-  Skip('fatal handshake poisons connection',
-    TestFatalHandshakePoisonsConnection,
-    DARWIN_SKIP_REASON);
-  Skip('PKCS#12 path loading refuses links in every component',
-    TestPKCS12PathRefusesSymbolicLink,
-    DARWIN_SKIP_REASON);
-  Skip('Active becomes true only after the server handshake',
-    TestActiveOnlyAfterHandshake,
-    DARWIN_SKIP_REASON);
+  ServerTest('fatal handshake poisons connection',
+    TestFatalHandshakePoisonsConnection);
+  ServerTest('PKCS#12 path loading refuses links in every component',
+    TestPKCS12PathRefusesSymbolicLink);
+  ServerTest('Active becomes true only after the server handshake',
+    TestActiveOnlyAfterHandshake);
   Skip('server read clamps oversized lengths on a handshaken connection',
     TestBoundsClamp,
     DARWIN_SKIP_REASON);
-  Skip('PKCS#12 chain delivers the intermediate certificate',
-    TestCertificateChainDelivered,
-    DARWIN_SKIP_REASON);
-  Skip('server input flow accepts bounded prefixes and counts consumption',
-    TestInputFlowPrefixAdmissionAndCounters,
-    DARWIN_SKIP_REASON);
-  Skip('peer close_notify reports peer-closed and poisons the connection',
-    TestPeerCloseNotifyReportsPeerClosed,
-    DARWIN_SKIP_REASON);
-  Skip('pending ciphertext pointer stays stable across protocol calls',
-    TestPendingCiphertextPointerIsStable,
-    DARWIN_SKIP_REASON);
+  ServerTest('PKCS#12 chain delivers the intermediate certificate',
+    TestCertificateChainDelivered);
+  ServerTest('server input flow accepts bounded prefixes and counts consumption',
+    TestInputFlowPrefixAdmissionAndCounters);
+  ServerTest('peer close_notify reports peer-closed and poisons the connection',
+    TestPeerCloseNotifyReportsPeerClosed);
+  ServerTest('pending ciphertext pointer stays stable across protocol calls',
+    TestPendingCiphertextPointerIsStable);
   Skip('caller PKCS#12 bytes are copied before synchronous parsing',
     TestPKCS12BytesArePrimaryInput,
     DARWIN_SKIP_REASON);
-  Skip('identity reload retains immutable connection snapshots',
-    TestReloadRetainsSnapshotsAndFailedReloadKeepsActive,
-    DARWIN_SKIP_REASON);
+  ServerTest('identity reload retains immutable connection snapshots',
+    TestReloadRetainsSnapshotsAndFailedReloadKeepsActive);
   Skip('memory-BIO handshake exposes want states and reuses context',
     TestHandshakeTransitionsAndContextReuse,
     DARWIN_SKIP_REASON);
-  Skip('plaintext roundtrip retains partial ciphertext',
-    TestPlaintextRoundtripAndPartialCiphertextConsumption,
-    DARWIN_SKIP_REASON);
+  ServerTest('plaintext roundtrip retains partial ciphertext',
+    TestPlaintextRoundtripAndPartialCiphertextConsumption);
   Skip('fatal shutdown poisons before retaining alert output',
     TestFatalShutdownPoisonsBeforeOutput,
     DARWIN_SKIP_REASON);
@@ -3707,9 +4994,8 @@ begin
   Skip('SSL_ERROR_SYSCALL poisons the connection',
     TestSyscallErrorPoisonsConnection,
     DARWIN_SKIP_REASON);
-  Skip('TLS floor rejects TLS 1.1',
-    TestTLSFloorRejectsTLS11,
-    DARWIN_SKIP_REASON);
+  ServerTest('TLS floor rejects TLS 1.1',
+    TestTLSFloorRejectsTLS11);
   Skip('SSL_write WANT retry retains the original plaintext',
     TestWriteWantRetryRetainsPlaintext,
     DARWIN_SKIP_REASON);
@@ -3745,8 +5031,22 @@ begin
     DARWIN_SKIP_REASON);
   {$ELSE}
   FServerBackendAvailable := TransportSecurityServerBackendAvailable;
-  Skip('Darwin server API reports Network.framework alternative',
-    TestDarwinReportsUnsupportedServerTLS, 'Darwin-only behavior');
+  Skip('Darwin Secure Transport server begins and aborts cleanly',
+    TestDarwinSecureTransportServerLifecycle, 'Darwin-only behavior');
+  Skip('Darwin Secure Transport replacement races never unlink replacements',
+    TestDarwinSecureTransportReplacementRacesNeverUnlinkReplacements,
+    'Darwin-only behavior');
+  Skip('Darwin Secure Transport handshake and IO round-trip in memory',
+    TestDarwinSecureTransportRoundTrip, 'Darwin-only behavior');
+  Skip('Darwin Secure Transport write retry retains caller plaintext',
+    TestDarwinSecureTransportWriteWantRetryRetainsPlaintext,
+    'Darwin-only behavior');
+  Skip('Darwin Secure Transport resolves server symbols concurrently once',
+    TestDarwinConcurrentSecureTransportFirstUse, 'Darwin-only behavior');
+  Skip('Darwin Secure Transport cleanup failures preserve primary errors',
+    TestDarwinSecureTransportCleanupFailures, 'Darwin-only behavior');
+  Skip('Darwin Secure Transport disables trust network fetching',
+    TestDarwinSecureTransportNetworkFetchDisabled, 'Darwin-only behavior');
 
   { Backend-neutral coverage: identity policy, flow configuration, and
     fatal-handshake poisoning need no loopback peer, so every platform

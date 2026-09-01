@@ -189,16 +189,16 @@ jobs:
                 ;;
               x86_64-win64)
                 BUILD='{"include":[{"target":"x86_64-win64","cpu":"x86_64","os":"win64"}]}'
-                TEST='{"include":[{"target":"x86_64-win64","runner":"windows-latest","fpc-install":"choco"}]}'
+                TEST='{"include":[{"target":"x86_64-win64","runner":"windows-latest","fpc-install":"official"}]}'
                 ;;
               i386-win32)
                 BUILD='{"include":[{"target":"i386-win32","cpu":"i386","os":"win32"}]}'
-                TEST='{"include":[{"target":"i386-win32","runner":"windows-latest","fpc-install":"choco"}]}'
+                TEST='{"include":[{"target":"i386-win32","runner":"windows-latest","fpc-install":"official"}]}'
                 ;;
             esac
           else
             BUILD='{"include":[{"target":"aarch64-darwin","cpu":"aarch64","os":"darwin","native":true},{"target":"x86_64-darwin","cpu":"x86_64","os":"darwin"},{"target":"x86_64-linux","cpu":"x86_64","os":"linux"},{"target":"aarch64-linux","cpu":"aarch64","os":"linux"},{"target":"x86_64-win64","cpu":"x86_64","os":"win64"},{"target":"i386-win32","cpu":"i386","os":"win32"}]}'
-            TEST='{"include":[{"target":"aarch64-darwin","runner":"macos-latest","fpc-install":"brew","format-check":true},{"target":"x86_64-darwin","runner":"macos-15-intel","fpc-install":"brew"},{"target":"x86_64-linux","runner":"ubuntu-latest","fpc-install":"apt"},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","fpc-install":"apt"},{"target":"x86_64-win64","runner":"windows-latest","fpc-install":"choco","bootstrap-check":true},{"target":"i386-win32","runner":"windows-latest","fpc-install":"choco"}]}'
+            TEST='{"include":[{"target":"aarch64-darwin","runner":"macos-latest","fpc-install":"brew","format-check":true},{"target":"x86_64-darwin","runner":"macos-15-intel","fpc-install":"brew"},{"target":"x86_64-linux","runner":"ubuntu-latest","fpc-install":"apt"},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","fpc-install":"apt"},{"target":"x86_64-win64","runner":"windows-latest","fpc-install":"official","bootstrap-check":true},{"target":"i386-win32","runner":"windows-latest","fpc-install":"official"}]}'
           fi
           echo "build-matrix=$BUILD" >> "$GITHUB_OUTPUT"
           echo "test-matrix=$TEST" >> "$GITHUB_OUTPUT"
@@ -452,76 +452,9 @@ jobs:
           sudo apt-get install -y fpc
           fpc -iV
 
-      # Copied verbatim into pr.yml's windows-test job — when this
-      # step changes, change that copy too.
-      - name: Install FPC (choco)
-        if: matrix.fpc-install == 'choco'
-        run: |
-          FPC_BIN=""
-          for attempt in 1 2; do
-            echo "::group::Chocolatey FPC install attempt ${attempt}/2"
-            install_status=0
-            choco install -y freepascal || install_status=$?
-            FPC_BIN=""
-            for candidate_root in /c/tools/freepascal /c/fpc; do
-              if [ -d "$candidate_root" ]; then
-                FPC_BIN=$(find "$candidate_root" -name fpc.exe -type f 2>/dev/null | head -1 || true)
-                if [ -n "$FPC_BIN" ]; then break; fi
-              fi
-            done
-            if [ "$install_status" -eq 0 ] && [ -n "$FPC_BIN" ]; then
-              echo "::endgroup::"
-              break
-            fi
-            if [ "$install_status" -eq 0 ]; then
-              install_status=1
-              failure_reason="fpc.exe not found after Chocolatey exited 0"
-            elif [ -z "$FPC_BIN" ]; then
-              failure_reason="fpc.exe not found"
-            else
-              failure_reason="Chocolatey command failed"
-            fi
-            echo "::endgroup::"
-            if [ "$attempt" -eq 2 ]; then
-              echo "::error::Chocolatey FPC install failed after 2 attempts (exit code ${install_status}; ${failure_reason})"
-              exit "$install_status"
-            fi
-            echo "::warning::Chocolatey FPC install attempt 1/2 did not produce a usable compiler (exit code ${install_status}; ${failure_reason}); retrying once"
-          done
-          # Add the FPC bin to PATH for subsequent steps. Chocolatey has
-          # used both C:\fpc and C:\tools\freepascal layouts over time.
-          echo "Using FPC at $FPC_BIN"
-          echo "$(cygpath -w "$(dirname "$FPC_BIN")")" >> "$GITHUB_PATH"
-          # Chocolatey currently installs i386 FPC. It is the native test
-          # compiler on both Windows runners; x64 Windows executes its output
-          # under WoW64 while the downloaded LWPT artifact keeps its own target.
-          LWPT_FPC_VALUE=$(cygpath -w "$FPC_BIN")
-          echo "LWPT_FPC=$LWPT_FPC_VALUE" >> "$GITHUB_ENV"
-          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1 || true)
-          if [ -n "$INSTANTFPC_BIN" ]; then
-            echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
-          fi
-          FPC_UNIT_PATHS=""
-          # fcl-json: InstallScript.E2E.Test uses fpjson. fcl-net stays for
-          # its RTL consumers. openssl is retained only so a future unit that
-          # needs it still resolves: per ADR-0033 no Windows source `uses
-          # OpenSSL` any more — both TLS directions are native SChannel.
-          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process fcl-net fcl-json openssl paszlib hash; do
-            UNIT_PATH=""
-            for unit_target in i386-win32 x86_64-win64; do
-              UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
-              if [ -n "$UNIT_PATH" ]; then break; fi
-            done
-            if [ -n "$UNIT_PATH" ]; then
-              UNIT_PATH_WIN=$(cygpath -w "$UNIT_PATH")
-              if [ -z "$FPC_UNIT_PATHS" ]; then
-                FPC_UNIT_PATHS="$UNIT_PATH_WIN"
-              else
-                FPC_UNIT_PATHS="${FPC_UNIT_PATHS};${UNIT_PATH_WIN}"
-              fi
-            fi
-          done
-          echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
+      - name: Install FPC (official distribution)
+        if: matrix.fpc-install == 'official'
+        run: .github/delivery/install-windows-fpc.sh
 
       - name: bootstrap.bat (Windows cold build)
         if: matrix.bootstrap-check == true && inputs.mode != 'diagnostic'

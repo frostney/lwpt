@@ -427,73 +427,10 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
 
-      # Verbatim copy of ci.yml's "Install FPC (choco)" step (test
-      # matrix) — lwpt test compiles *.Test.pas with the native FPC,
-      # so this runner needs the same compiler + unit-path discovery.
-      # When ci.yml's copy changes, change this one too.
-      - name: Install FPC (choco)
-        run: |
-          FPC_BIN=""
-          for attempt in 1 2; do
-            echo "::group::Chocolatey FPC install attempt ${attempt}/2"
-            install_status=0
-            choco install -y freepascal || install_status=$?
-            FPC_BIN=""
-            for candidate_root in /c/tools/freepascal /c/fpc; do
-              if [ -d "$candidate_root" ]; then
-                FPC_BIN=$(find "$candidate_root" -name fpc.exe -type f 2>/dev/null | head -1 || true)
-                if [ -n "$FPC_BIN" ]; then break; fi
-              fi
-            done
-            if [ "$install_status" -eq 0 ] && [ -n "$FPC_BIN" ]; then
-              echo "::endgroup::"
-              break
-            fi
-            if [ "$install_status" -eq 0 ]; then
-              install_status=1
-              failure_reason="fpc.exe not found after Chocolatey exited 0"
-            elif [ -z "$FPC_BIN" ]; then
-              failure_reason="fpc.exe not found"
-            else
-              failure_reason="Chocolatey command failed"
-            fi
-            echo "::endgroup::"
-            if [ "$attempt" -eq 2 ]; then
-              echo "::error::Chocolatey FPC install failed after 2 attempts (exit code ${install_status}; ${failure_reason})"
-              exit "$install_status"
-            fi
-            echo "::warning::Chocolatey FPC install attempt 1/2 did not produce a usable compiler (exit code ${install_status}; ${failure_reason}); retrying once"
-          done
-          # Add the FPC bin to PATH for subsequent steps. Chocolatey has
-          # used both C:\fpc and C:\tools\freepascal layouts over time.
-          echo "Using FPC at $FPC_BIN"
-          echo "$(cygpath -w "$(dirname "$FPC_BIN")")" >> "$GITHUB_PATH"
-          echo "LWPT_FPC=$(cygpath -w "$FPC_BIN")" >> "$GITHUB_ENV"
-          INSTANTFPC_BIN=$(find "$(dirname "$FPC_BIN")" -name instantfpc.exe -type f 2>/dev/null | head -1 || true)
-          if [ -n "$INSTANTFPC_BIN" ]; then
-            echo "LWPT_INSTANTFPC=$(cygpath -w "$INSTANTFPC_BIN")" >> "$GITHUB_ENV"
-          fi
-          FPC_UNIT_PATHS=""
-          # fcl-json: InstallScript.E2E.Test uses fpjson. fcl-net stays for
-          # its RTL consumers. openssl is retained only so a future unit that
-          # needs it still resolves: per ADR-0033 no Windows source `uses
-          # OpenSSL` any more — both TLS directions are native SChannel.
-          for unit_dir in rtl rtl-objpas rtl-generics rtl-extra fcl-base fcl-process fcl-net fcl-json openssl paszlib hash; do
-            UNIT_PATH=""
-            for unit_target in i386-win32 x86_64-win64; do
-              UNIT_PATH=$(find /c/tools/freepascal /c/fpc -path "*/units/${unit_target}/${unit_dir}" -type d 2>/dev/null | head -1 || true)
-              if [ -n "$UNIT_PATH" ]; then break; fi
-            done
-            if [ -n "$UNIT_PATH" ]; then
-              UNIT_PATH_WIN=$(cygpath -w "$UNIT_PATH")
-              if [ -z "$FPC_UNIT_PATHS" ]; then
-                FPC_UNIT_PATHS="$UNIT_PATH_WIN"
-              else
-                FPC_UNIT_PATHS="${FPC_UNIT_PATHS};${UNIT_PATH_WIN}"
-              fi
-            fi
-          done
-          echo "LWPT_FPC_UNIT_PATHS=$FPC_UNIT_PATHS" >> "$GITHUB_ENV"
+      # lwpt test compiles *.Test.pas with the native FPC. The shared setup
+      # script pins the official distribution and publishes its unit paths.
+      - name: Install FPC (official distribution)
+        run: .github/delivery/install-windows-fpc.sh
 
       - name: Download lwpt artefact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

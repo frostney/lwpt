@@ -1,13 +1,12 @@
-# Memory-BIO OpenSSL terminates server TLS on Windows and Unix-not-Darwin
+# Memory-BIO OpenSSL terminates server TLS on Unix-not-Darwin
 
 ## Executive Summary
 
-- **Server TLS is socket-independent.** One nonblocking memory-BIO OpenSSL
-  state machine serves Windows IOCP and Unix reactors; Darwin continues to use
-  Network.framework.
-- **OpenSSL 3 or newer is mandatory for servers.** It is runtime-loaded, never
-  import-linked or shipped by LWPT, and Windows loading excludes the current
-  directory and ordinary `PATH` search.
+- **Server TLS is socket-independent.** The nonblocking feed/drain state
+  machine serves native SChannel on Windows, public Secure Transport on
+  Darwin, and memory-BIO OpenSSL on Unix-not-Darwin.
+- **OpenSSL 3 or newer is mandatory for Unix-not-Darwin servers.** It is
+  runtime-loaded, never import-linked, and never shipped by LWPT.
 - **A connection is active only after authentication.** `Active` remains false
   until `SSL_accept` succeeds; `tssPeerClosed` explicitly reports a peer
   `close_notify` from the read path.
@@ -23,15 +22,19 @@
 SChannel on Windows, SecureTransport on macOS, and runtime-loaded OpenSSL on
 other Unix systems. Server transports have a different seam. Duetto's Linux
 epoll backend owns a nonblocking file descriptor, its Windows IOCP backend owns
-an overlapped socket that cannot be handed to OpenSSL, and its macOS backend
-already terminates TLS with Network.framework. All three receive the same
-identity shape: PKCS#12 bytes or a path plus passphrase.
+an overlapped socket that cannot be handed to OpenSSL, and the registry's
+preferred modern macOS backend terminates TLS with Network.framework. All
+three receive the same identity shape: PKCS#12 bytes or a path plus
+passphrase.
 
-`TransportSecurity` therefore provides a socket-independent memory-BIO OpenSSL
-server implementation on Windows and Unix-not-Darwin. This ADR amends ADR-0016
-only for server accept. The blocking client API and its per-platform backend
-choices are unchanged. OpenSSL remains runtime-loaded and is neither
-import-linked nor included in LWPT release archives.
+`TransportSecurity` therefore provides a socket-independent server contract,
+originally implemented with memory-BIO OpenSSL on Windows and Unix-not-Darwin.
+[ADR-0033](./0033-schannel-server-tls-accept-on-windows.md) replaces the
+Windows implementation with SChannel; [ADR-0043](./0043-self-hosted-registry-origin.md)
+adds the public Secure Transport implementation used by the Darwin portable
+listener. The blocking client API and its per-platform backend choices are
+unchanged. OpenSSL remains runtime-loaded only on Unix-not-Darwin and is
+neither import-linked nor included in LWPT release archives.
 
 ## Decision
 
@@ -226,13 +229,12 @@ path directly. Neither path owns or closes the transport socket.
 - **Linux and other Unix-not-Darwin:** client and server paths share the
   runtime-loaded system libraries; server context construction additionally
   enforces OpenSSL 3 or newer. The caller-owned reactor feeds and drains bytes.
-- **Windows:** outbound clients remain on SChannel. Server consumers supply an
-  OpenSSL 3 runtime discoverable through the restricted DLL search. IOCP feeds
-  receive completions and submits retained ciphertext through asynchronous
-  sends.
-- **Darwin:** the server types and functions remain compile-present, but the
-  context constructor raises an actionable error directing the caller to
-  Network.framework. There is no OpenSSL server backdoor on macOS.
+- **Windows:** outbound clients and server accept use native SChannel per
+  ADR-0033. There is no OpenSSL relationship.
+- **Darwin:** the server contract uses public Secure Transport. Registry
+  runtimes on macOS 26 and newer use Network.framework directly; macOS 15 and
+  older use the shared portable listener and this Secure Transport seam. There
+  is no OpenSSL server backdoor on macOS.
 
 The guards in `pr.yml`, `ci.yml`, and `release.yml` inspect normal and delay PE
 imports, imported OpenSSL symbol families regardless of DLL filename, and
@@ -250,11 +252,12 @@ remain permitted because they are not imports.
 - **Separate SChannel and OpenSSL server implementations.** Rejected. Server
   identity presentation does not benefit from client trust-store integration,
   and two state machines would create needless platform divergence.
-- **One memory-BIO OpenSSL implementation for epoll and IOCP.** Chosen. It
-  separates protocol state from socket ownership and makes the protocol core
-  deterministic in tests.
-- **OpenSSL server support on Darwin.** Rejected. Duetto's macOS transport owns
-  native TLS through Network.framework.
+- **One memory-BIO OpenSSL implementation for epoll and IOCP.** Originally
+  chosen because it separated protocol state from socket ownership; ADR-0033
+  later replaced the Windows half with native SChannel while retaining the
+  feed/drain contract.
+- **OpenSSL server support on Darwin.** Rejected. Native TLS is available
+  through Network.framework and the HTTPClient Secure Transport server seam.
 - **Require callers to replay the same write buffer after WANT.** Rejected.
   Retaining the plaintext inside the connection is safer for asynchronous
   callers and makes buffer lifetime unambiguous.

@@ -1,0 +1,29 @@
+FROM debian:bookworm
+
+ARG FPC_VERSION=3.2.2
+ARG FPC_SOURCE_SHA256=d542e349de246843d4f164829953d1f5b864126c5b62fd17c9b45b33e23d2f44
+
+RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      binutils-mingw-w64-i686 build-essential ca-certificates curl fp-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY build-toolchain.sh /usr/local/bin/build-lwpt-win32-toolchain
+COPY ppcross386-wrapper /usr/local/bin/ppcross386-wrapper
+
+RUN chmod +x /usr/local/bin/build-lwpt-win32-toolchain \
+      /usr/local/bin/ppcross386-wrapper \
+    && curl -fsSL \
+      "https://downloads.freepascal.org/fpc/dist/${FPC_VERSION}/source/fpc-${FPC_VERSION}.source.tar.gz" \
+      -o "/tmp/fpc-${FPC_VERSION}.source.tar.gz" \
+    && printf '%s  %s\n' "${FPC_SOURCE_SHA256}" \
+      "/tmp/fpc-${FPC_VERSION}.source.tar.gz" | sha256sum --check \
+    && /usr/local/bin/build-lwpt-win32-toolchain \
+      "/tmp/fpc-${FPC_VERSION}.source.tar.gz" \
+    && rm "/tmp/fpc-${FPC_VERSION}.source.tar.gz"
+
+COPY compile.sh /usr/local/bin/compile-lwpt-win32
+COPY Win32PipeDirectionProbe.pas /opt/lwpt-diagnostic/Win32PipeDirectionProbe.pas
+RUN chmod +x /usr/local/bin/compile-lwpt-win32
+
+ENTRYPOINT ["/usr/local/bin/compile-lwpt-win32"]
