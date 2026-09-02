@@ -104,6 +104,8 @@ and stay unqualified.
 - Uses-clause grouped, alphabetised within groups, blank line between groups.
 - Identifier casing for declared types (auto-cased to declared form).
 
+**A uses clause that carries a compiler directive or a comment is left exactly as written.** Reordering across `{$IFDEF}` would change which units a build sees, and a comment inside a uses clause exists to pin a position — see the `cthreads, { must come first so TThread has a driver }` clauses in the test programs. The formatter therefore treats any clause containing `{$…}`, `//`, `{ … }`, or `(* … *)` as author-owned and emits it verbatim; grouping and alphabetisation are on you in those clauses. Everything else the formatter does (trailing whitespace, line endings, identifier casing) still applies to the rest of the file.
+
 What the formatter does *not* do (today):
 
 - Indentation normalisation. Pascal's free-form syntax makes this a much larger formatter project; deferred until there's evidence reviewers are bothered by indentation drift.
