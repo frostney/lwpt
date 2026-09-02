@@ -455,8 +455,17 @@ begin
     end;
     Sleep(100);
     Expect<Boolean>(Server.Running).ToBe(True);
-    Expect<Boolean>(Pos('registry-discovery-v1', Curl(DiscoveryURL,
-      False)) > 0).ToBe(True);
+    { Every reset connection above still costs the origin a client thread
+      that parses the request, builds the response and only then learns
+      the peer is gone. Under MAX_ACTIVE_CLIENTS that backlog drains in
+      milliseconds on a workstation and in noticeably more on a loaded
+      two-core runner, where a single probe fired 100 ms after the burst
+      met the cap and came back empty. The property under test is that
+      the process survives and serves again — so wait for it the way the
+      start-up already does, bounded by the same readiness deadline, with
+      the same exit-state diagnostics if it never comes back. }
+    WaitUntilReady(DiscoveryURL, False, Server);
+    Expect<Boolean>(Server.Running).ToBe(True);
   finally
     StopServer(Server);
   end;
