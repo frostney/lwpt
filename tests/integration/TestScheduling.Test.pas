@@ -1,4 +1,12 @@
-{ TestScheduling.Test — parallel test scheduling and numeric bail policy. }
+{ TestScheduling.Test — parallel test scheduling and numeric bail policy.
+
+  Every PID or timestamp payload a parent reads back from a child is handed
+  over with the Tests.PayloadHandoff ownership-transfer marker: on Windows a
+  written file becomes visible before its writer's handle is released, so
+  path existence alone never grants read ownership. Same defect class as
+  issues #205 and #262, reproduced for this suite on PR #289's Windows CI
+  run. Markers that are only ever tested for existence stay existence-only,
+  per #262. }
 program TestScheduling.Test;
 
 {$mode delphi}{$H+}
@@ -18,6 +26,7 @@ uses
   Platform,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.PayloadHandoff,
   Tests.ProcessSupport,
   Tests.Scratch,
 
@@ -198,6 +207,7 @@ type
     procedure TestSiblingTerminationAcknowledgementsShareFanout;
     procedure TestProtocolFramingIsBoundedAndIncremental;
     procedure TestProcessFailureSurvivesDelegationCleanupFailure;
+    procedure TestVisiblePayloadIsNotReadableUntilPublished;
     {$IFDEF UNIX}
     procedure TestSIGINTTerminatesActiveProcessTree;
     procedure TestSIGTERMTerminatesActiveProcessTree;
@@ -1121,7 +1131,8 @@ begin
       'program SlowFixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'uses Classes, Process, SysUtils;'#10
-    + 'var Child: TProcess; PIDFile: TStringList; StartedFile: Text;'#10
+    + 'var Child: TProcess; PIDFile: TStringList;'#10
+    + '  CompleteFile, StartedFile: Text;'#10
     + 'begin'#10
     + '  if (ParamCount = 1) and (ParamStr(1) = ''--grandchild'') then'#10
     + '  begin Sleep(' + IntToStr(LongRunningFixtureMilliseconds)
@@ -1146,10 +1157,13 @@ begin
     + '    PIDFile.SaveToFile('
     + PascalString(FScratch + '/control/grandchild-pid') + ');'#10
     + '  finally PIDFile.Free end;'#10
+    + EmitPayloadCompletion('CompleteFile',
+      PascalString(FScratch + '/control/grandchild-pid'))
     + '  Assign(StartedFile, ' + PascalString(SlowStartedAtPath) + ');'#10
     + '  Rewrite(StartedFile);'#10
     + '  Write(StartedFile, GetTickCount64);'#10
     + '  Close(StartedFile);'#10
+    + EmitPayloadCompletion('CompleteFile', PascalString(SlowStartedAtPath))
     + '  TFileStream.Create('
     + PascalString(FScratch + '/control/slow-started')
     + ', fmCreate).Free;'#10
@@ -1198,9 +1212,9 @@ begin
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
   if not FileExists(SlowTestStartedPath) then
     Fail('slow test did not reach its runtime startup barrier');
-  if not FileExists(SlowStartedAtPath) then
+  if not PayloadIsReadable(SlowStartedAtPath) then
     Fail('slow test did not record its monotonic readiness time');
-  SlowStartedAt := StrToQWord(Trim(ReadBinaryFile(SlowStartedAtPath)));
+  SlowStartedAt := StrToQWord(Trim(ReadPayloadText(SlowStartedAtPath)));
   if ReturnedAt < SlowStartedAt then
     Fail('slow test readiness time followed command return');
   CancellationElapsed := ReturnedAt - SlowStartedAt;
@@ -1212,8 +1226,9 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/control/slow-started')).ToBe(True);
   Expect<Boolean>(FileExists(FScratch + '/control/slow-completed')).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/control/pending-ran')).ToBe(False);
-  Expect<Boolean>(FileExists(FScratch + '/control/grandchild-pid')).ToBe(True);
-  GrandchildPID := StrToInt(Trim(ReadBinaryFile(
+  Expect<Boolean>(PayloadIsReadable(FScratch + '/control/grandchild-pid'))
+    .ToBe(True);
+  GrandchildPID := StrToInt(Trim(ReadPayloadText(
     FScratch + '/control/grandchild-pid')));
   Started := Now;
   while ProcessIsRunning(GrandchildPID)
@@ -1352,11 +1367,11 @@ begin
   AssertPreparedFixturesUsed(CommandResult, 2);
   if not FileExists(NestedTestStartedPath) then
     Fail('nested test did not reach its runtime startup barrier');
-  if not FileExists(PIDFile) then
+  if not PayloadIsReadable(PIDFile) then
     Fail('nested compiler did not reach its startup barrier');
-  if not FileExists(PIDFile + NestedCompilerStartedAtSuffix) then
+  if not PayloadIsReadable(PIDFile + NestedCompilerStartedAtSuffix) then
     Fail('nested compiler did not record its monotonic startup time');
-  CompilerStartedAt := StrToQWord(Trim(ReadBinaryFile(
+  CompilerStartedAt := StrToQWord(Trim(ReadPayloadText(
     PIDFile + NestedCompilerStartedAtSuffix)));
   if ReturnedAt < CompilerStartedAt then
     Fail('nested compiler startup time followed command return');
@@ -1369,7 +1384,7 @@ begin
   Expect<Boolean>(FileExists(PIDFile + NestedCompilerNaturalExitSuffix))
     .ToBe(False);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+  CompilerPID := StrToInt(Trim(ReadPayloadText(PIDFile)));
   { Reap-until-empty is part of the command-return contract: no retry loop. }
   Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   Expect<Boolean>(FileExists(FScratch + '/control/nested-pending-ran'))
@@ -1398,8 +1413,8 @@ begin
   CommandResult := RunTestsWithCompilerProxy(['--jobs=2'],
     WorkerErrorCompilerProxyMode, PIDFile);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
-  CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+  Expect<Boolean>(PayloadIsReadable(PIDFile)).ToBe(True);
+  CompilerPID := StrToInt(Trim(ReadPayloadText(PIDFile)));
   Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   { AbortWithError must assign the documented internal failure outcome before
     the reporter accepts the typed terminal event. }
@@ -1503,13 +1518,13 @@ begin
     ConfigureProcessEnvironment(Child, Environment);
     ChildTree.Execute;
     Started := Now;
-    while (not FileExists(PIDFile)) and Child.Running
+    while (not PayloadIsReadable(PIDFile)) and Child.Running
       and ((Now - Started) * SecondsPerDay
         < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    if not FileExists(PIDFile) then
+    if not PayloadIsReadable(PIDFile) then
       Fail('missing-acknowledgement child did not publish its PID');
-    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+    CompilerPID := StrToInt(Trim(ReadPayloadText(PIDFile)));
     {$IFDEF MSWINDOWS}
     ChildProcessHandle := Child.ProcessHandle;
     {$ENDIF}
@@ -1561,10 +1576,10 @@ begin
   CommandResult := RunTestsWithCompilerProxy(['--jobs=2'],
     SuccessfulAcknowledgementCompilerProxyMode, PIDFile);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  Expect<Boolean>(FileExists(PIDFile + '-owner')).ToBe(True);
-  Expect<Boolean>(FileExists(PIDFile + '-descendant')).ToBe(True);
-  OwnerPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-owner')));
-  DescendantPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-descendant')));
+  Expect<Boolean>(PayloadIsReadable(PIDFile + '-owner')).ToBe(True);
+  Expect<Boolean>(PayloadIsReadable(PIDFile + '-descendant')).ToBe(True);
+  OwnerPID := StrToInt(Trim(ReadPayloadText(PIDFile + '-owner')));
+  DescendantPID := StrToInt(Trim(ReadPayloadText(PIDFile + '-descendant')));
   Expect<Boolean>(ProcessIsRunning(OwnerPID)).ToBe(False);
   Expect<Boolean>(ProcessIsRunning(DescendantPID)).ToBe(False);
   Expect<Boolean>(Pos('process-tree termination failed',
@@ -1782,10 +1797,10 @@ begin
   CommandResult := RunTestsWithCompilerProxy(['--jobs=2'],
     FailedAcknowledgementCompilerProxyMode, PIDFile);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  Expect<Boolean>(FileExists(PIDFile + '-owner')).ToBe(True);
-  Expect<Boolean>(FileExists(PIDFile + '-descendant')).ToBe(True);
-  OwnerPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-owner')));
-  DescendantPID := StrToInt(Trim(ReadBinaryFile(PIDFile + '-descendant')));
+  Expect<Boolean>(PayloadIsReadable(PIDFile + '-owner')).ToBe(True);
+  Expect<Boolean>(PayloadIsReadable(PIDFile + '-descendant')).ToBe(True);
+  OwnerPID := StrToInt(Trim(ReadPayloadText(PIDFile + '-owner')));
+  DescendantPID := StrToInt(Trim(ReadPayloadText(PIDFile + '-descendant')));
   Expect<Boolean>(ProcessIsRunning(OwnerPID)).ToBe(False);
   Expect<Boolean>(ProcessIsRunning(DescendantPID)).ToBe(False);
   Expect<Boolean>(Pos('nested process reported failed process-tree '
@@ -1818,7 +1833,7 @@ begin
       for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
       begin
         SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
-        if not FileExists(SourcePIDFile) then
+        if not PayloadIsReadable(SourcePIDFile) then
         begin
           if MissingMarkerSources <> '' then
             MissingMarkerSources := MissingMarkerSources + ', ';
@@ -1885,10 +1900,10 @@ begin
     for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
     begin
       SourcePIDFile := PIDFile + '-' + SiblingSlowSources[SourceIndex];
-      if not FileExists(SourcePIDFile) then
+      if not PayloadIsReadable(SourcePIDFile) then
         Fail(Format('fanout iteration %d did not publish the PID marker for %s',
           [Iteration, SiblingSlowSources[SourceIndex]]));
-      CompilerPID := StrToInt(Trim(ReadBinaryFile(SourcePIDFile)));
+      CompilerPID := StrToInt(Trim(ReadPayloadText(SourcePIDFile)));
       if ProcessIsRunning(CompilerPID) then
         Fail(Format('fanout iteration %d left %s running as PID %d',
           [Iteration, SiblingSlowSources[SourceIndex], CompilerPID]));
@@ -1964,6 +1979,55 @@ begin
     .ToBe(True);
 end;
 
+{ The #262 acceptance criterion, held for this suite's PID payloads: a
+  reader that trusts the payload path's own existence has no read ownership.
+  The Windows condition is simulated rather than depended on — the writer
+  keeps its handle open past the moment the path becomes visible, which is
+  exactly the window PR #289's Windows CI run opened into a sharing
+  violation, and the simulation runs identically on every platform. Native
+  Windows CI remains the decisive proof of the underlying share-mode
+  failure; this case pins the ordering contract that avoids it. }
+procedure TTestScheduling.TestVisiblePayloadIsNotReadableUntilPublished;
+var
+  Payload, PayloadPath, RoundTripPath: string;
+  Raised: Boolean;
+  Writer: TFileStream;
+begin
+  PayloadPath := FScratch + '/control/handoff-payload';
+  RoundTripPath := FScratch + '/control/handoff-round-trip';
+  Payload := IntToStr(GetProcessID);
+  Raised := False;
+  Writer := TFileStream.Create(PayloadPath, fmCreate);
+  try
+    Expect<Boolean>(FileExists(PayloadPath)).ToBe(True);
+    Expect<Boolean>(PayloadIsReadable(PayloadPath)).ToBe(False);
+    try
+      ReadPayloadText(PayloadPath);
+    except
+      on EPayloadNotPublished do Raised := True;
+    end;
+    Writer.WriteBuffer(Payload[1], Length(Payload));
+  finally
+    Writer.Free;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  { The writer has returned, but has not yet transferred ownership. }
+  Expect<Boolean>(PayloadIsReadable(PayloadPath)).ToBe(False);
+  PublishPayloadCompletion(PayloadPath);
+  Expect<Boolean>(PayloadIsReadable(PayloadPath)).ToBe(True);
+  Expect<string>(ReadPayloadText(PayloadPath)).ToBe(Payload);
+
+  PublishReadablePayload(RoundTripPath, Payload);
+  Expect<Boolean>(PayloadIsReadable(RoundTripPath)).ToBe(True);
+  Expect<string>(Trim(ReadPayloadText(RoundTripPath))).ToBe(Payload);
+  { A retracted payload must not keep claiming read ownership. }
+  RetractPayload(RoundTripPath);
+  Expect<Boolean>(PayloadIsReadable(RoundTripPath)).ToBe(False);
+  Expect<Boolean>(FileExists(RoundTripPath)).ToBe(False);
+  Expect<Boolean>(FileExists(RoundTripPath + PayloadCompleteSuffix))
+    .ToBe(False);
+end;
+
 {$IFDEF UNIX}
 procedure TTestScheduling.RunSignalForwardingTest(const ASignal: Integer;
   const AProjectName: string);
@@ -1997,12 +2061,12 @@ begin
     ConfigureProcessEnvironment(Process, Environment);
     Process.Execute;
     Started := Now;
-    while (not FileExists(PIDFile))
+    while (not PayloadIsReadable(PIDFile))
       and ((Now - Started) * SecondsPerDay
         < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
-    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+    Expect<Boolean>(PayloadIsReadable(PIDFile)).ToBe(True);
+    CompilerPID := StrToInt(Trim(ReadPayloadText(PIDFile)));
     Expect<Integer>(FpKill(Process.ProcessID, ASignal)).ToBe(0);
     Started := Now;
     while Process.Running
@@ -2184,7 +2248,7 @@ begin
       'program InheritPipeFixture;'#10
     + '{$mode delphi}{$H+}'#10
     + 'uses Process, SysUtils;'#10
-    + 'var Child: TProcess; PIDFile: Text;'#10
+    + 'var Child: TProcess; CompleteFile, PIDFile: Text;'#10
     + 'begin'#10
     + '  Child := TProcess.Create(nil);'#10
     + '  try'#10
@@ -2196,19 +2260,21 @@ begin
     + '    Write(PIDFile, Child.ProcessID);'#10
     + '    Close(PIDFile);'#10
     + '  finally Child.Free end;'#10
+    + EmitPayloadCompletion('CompleteFile', PascalString(HolderPIDPath))
     + '  Assign(PIDFile, ' + PascalString(FixtureCompletedPath) + ');'#10
     + '  Rewrite(PIDFile);'#10
     + '  Write(PIDFile, GetTickCount64);'#10
     + '  Close(PIDFile);'#10
+    + EmitPayloadCompletion('CompleteFile', PascalString(FixtureCompletedPath))
     + 'end.'#10);
   try
     RunResult := RunTests(['--jobs=1']);
     ReturnedAt := GetTickCount64;
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
     { Compilation and worker acquisition precede the behavior under test. }
-    if not FileExists(FixtureCompletedPath) then
+    if not PayloadIsReadable(FixtureCompletedPath) then
       Fail('pipe fixture did not record its monotonic completion time');
-    FixtureCompletedAt := StrToQWord(Trim(ReadBinaryFile(
+    FixtureCompletedAt := StrToQWord(Trim(ReadPayloadText(
       FixtureCompletedPath)));
     if ReturnedAt < FixtureCompletedAt then
       Fail('pipe fixture completion time followed command return');
@@ -2217,9 +2283,9 @@ begin
       Fail('subprocess drain took ' + UIntToStr(DrainElapsed)
         + ' ms after fixture completion; ceiling is '
         + IntToStr(SubprocessDrainCompletionCeilingMilliseconds) + ' ms');
-    Expect<Boolean>(FileExists(HolderPIDPath)).ToBe(True);
-    if FileExists(HolderPIDPath) then
-      HolderPID := StrToInt(Trim(ReadBinaryFile(HolderPIDPath)));
+    Expect<Boolean>(PayloadIsReadable(HolderPIDPath)).ToBe(True);
+    if PayloadIsReadable(HolderPIDPath) then
+      HolderPID := StrToInt(Trim(ReadPayloadText(HolderPIDPath)));
     Expect<Boolean>(ProcessIsRunning(HolderPID)).ToBe(True);
   finally
     if (HolderPID > 0) and ProcessIsRunning(HolderPID) then
@@ -2244,8 +2310,8 @@ begin
   APID := -1;
   Result := False;
   try
-    if not FileExists(APath) then Exit;
-    if not TryStrToInt(Trim(ReadBinaryFile(APath)), CandidatePID) then Exit;
+    if not PayloadIsReadable(APath) then Exit;
+    if not TryStrToInt(Trim(ReadPayloadText(APath)), CandidatePID) then Exit;
     APID := CandidatePID;
     Result := True;
   except
@@ -2312,14 +2378,17 @@ begin
     if Controller.ExitStatus <> 0 then
     begin
       ControllerState := 'not recorded';
+      { The controller rewrites this file at every step, so a one-shot
+        completion marker could not describe which write it covers. The
+        controller has already exited here, so no writer handle survives. }
       if FileExists(ControllerStateFile) then
         ControllerState := Trim(ReadBinaryFile(ControllerStateFile));
       Fail('console controller exited with '
         + IntToStr(Controller.ExitStatus) + '; last state: '
         + ControllerState);
     end;
-    Expect<Boolean>(FileExists(PIDFile)).ToBe(True);
-    CompilerPID := StrToInt(Trim(ReadBinaryFile(PIDFile)));
+    Expect<Boolean>(PayloadIsReadable(PIDFile)).ToBe(True);
+    CompilerPID := StrToInt(Trim(ReadPayloadText(PIDFile)));
     Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   finally
     if CompilerPID < 0 then
@@ -2423,12 +2492,12 @@ begin
     Windows.CloseHandle(WrongWriteHandle);
     WrongWriteHandle := 0;
     Started := Now;
-    while (not FileExists(ParamStr(5))) and LwptProcess.Running
+    while (not PayloadIsReadable(ParamStr(5))) and LwptProcess.Running
       and ((Now - Started) * SecondsPerDay
         < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    if not FileExists(ParamStr(5)) then Exit(3);
-    CompilerPID := StrToInt(Trim(ReadBinaryFile(ParamStr(5))));
+    if not PayloadIsReadable(ParamStr(5)) then Exit(3);
+    CompilerPID := StrToInt(Trim(ReadPayloadText(ParamStr(5))));
     ProcessContext := 'LWPT pid '
       + UIntToStr(QWord(LwptProcess.ProcessID)) + ', compiler pid '
       + IntToStr(CompilerPID);
@@ -2508,7 +2577,7 @@ begin
     WriteTextFile(APIDFile, IntToStr(GetProcessID));
     Exit(0);
   end;
-  WriteTextFile(APIDFile + '-descendant', IntToStr(GetProcessID));
+  PublishReadablePayload(APIDFile + '-descendant', IntToStr(GetProcessID));
   {$IFDEF UNIX}
   if not ReadAcknowledgementControlBefore(ControlHandle,
     GetTickCount64 + QWord(ProcessExitCeilingSeconds) * 1000) then Exit(3);
@@ -2592,7 +2661,7 @@ begin
         < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
     if not FileExists(APIDFile + '-descendant') then Exit(2);
-    WriteTextFile(APIDFile + '-owner', IntToStr(GetProcessID));
+    PublishReadablePayload(APIDFile + '-owner', IntToStr(GetProcessID));
     while Child.Running do Sleep(ProcessPollMilliseconds);
     Child.WaitOnExit;
     { The forwarding thread owns the cancellation decision, while this main
@@ -2617,7 +2686,7 @@ var
   SourceIndex: Integer;
 begin
   for SourceIndex := Low(SiblingSlowSources) to High(SiblingSlowSources) do
-    if not FileExists(APIDFile + '-'
+    if not PayloadIsReadable(APIDFile + '-'
       + SiblingSlowSources[SourceIndex]) then
       Exit(False);
   Result := True;
@@ -2692,11 +2761,11 @@ begin
     BytesWritten, nil) or (BytesWritten <> DWORD(Length(Frame))) then Exit(3);
   {$ENDIF}
   PIDFile := ARootPIDFile + '-' + ASourceFile;
-  WriteTextFile(PIDFile, IntToStr(GetProcessID));
+  PublishReadablePayload(PIDFile, IntToStr(GetProcessID));
   if not WaitForSiblingAcknowledgementMarkers(ARootPIDFile) then
   begin
     WriteLn(StdErr, 'sibling compiler startup barrier timed out');
-    DeleteFile(PIDFile);
+    RetractPayload(PIDFile);
     WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
       UIntToStr(GetTickCount64));
     Exit(4);
@@ -2705,7 +2774,7 @@ begin
     GetTickCount64 + QWord(SiblingStartupBarrierCeilingSeconds) * 1000) then
   begin
     WriteLn(StdErr, 'sibling compiler cancellation frame timed out');
-    DeleteFile(PIDFile);
+    RetractPayload(PIDFile);
     WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
       UIntToStr(GetTickCount64));
     Exit(5);
@@ -2719,7 +2788,7 @@ begin
   if not WaitForSiblingCancellationMarkers(ARootPIDFile) then
   begin
     WriteLn(StdErr, 'sibling compiler fanout barrier timed out');
-    DeleteFile(PIDFile);
+    RetractPayload(PIDFile);
     WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
       UIntToStr(GetTickCount64));
     Exit(6);
@@ -2728,7 +2797,7 @@ begin
     UIntToStr(GetTickCount64));
   Sleep(LongRunningFixtureMilliseconds);
   { A healthy parent reaps this proxy after its missing acknowledgement. }
-  DeleteFile(PIDFile);
+  RetractPayload(PIDFile);
   WriteTextFile(PIDFile + NestedCompilerNaturalExitSuffix,
     UIntToStr(GetTickCount64));
   Result := 0;
@@ -2812,9 +2881,9 @@ begin
        and SameText(SourceFile, 'A.Slow.Test.pas')) then
   begin
     if Mode = IgnoreTerminateCompilerProxyMode then
-      WriteTextFile(PIDFile + NestedCompilerStartedAtSuffix,
+      PublishReadablePayload(PIDFile + NestedCompilerStartedAtSuffix,
         UIntToStr(GetTickCount64));
-    WriteTextFile(PIDFile, IntToStr(GetProcessID));
+    PublishReadablePayload(PIDFile, IntToStr(GetProcessID));
     Sleep(LongRunningFixtureMilliseconds);
     if Mode = IgnoreTerminateCompilerProxyMode then
     begin
@@ -2844,11 +2913,11 @@ begin
     end
     else
     begin
-      while not FileExists(PIDFile)
+      while not PayloadIsReadable(PIDFile)
         and ((Now - Started) * SecondsPerDay
           < ProcessStartupCeilingSeconds) do
         Sleep(ProcessPollMilliseconds);
-      if not FileExists(PIDFile) then
+      if not PayloadIsReadable(PIDFile) then
       begin
         WriteLn(StdErr, 'compiler proxy startup barrier timed out');
         Exit(2);
@@ -2896,6 +2965,8 @@ begin
     TestProtocolFramingIsBoundedAndIncremental);
   Test('process failure survives delegation cleanup failure',
     TestProcessFailureSurvivesDelegationCleanupFailure);
+  Test('a visible payload is not readable until its writer publishes it',
+    TestVisiblePayloadIsNotReadableUntilPublished);
   {$IFDEF UNIX}
   Test('SIGINT reaps the active compiler tree',
     TestSIGINTTerminatesActiveProcessTree);
