@@ -88,6 +88,6 @@ program	*	tests/integration/Run.Test.pas	1	9
 program	*	tests/integration/Scratch.Test.pas	1	2
 program	*	tests/integration/TestCache.Test.pas	1	10
 program	*	tests/integration/TestFlags.Test.pas	1	3
-program	*	tests/integration/TestScheduling.Test.pas	1	27
-program	windows/*	tests/integration/TestScheduling.Test.pas	1	23
+program	*	tests/integration/TestScheduling.Test.pas	1	28
+program	windows/*	tests/integration/TestScheduling.Test.pas	1	24
 program	*	tests/integration/Version.Test.pas	1	4
