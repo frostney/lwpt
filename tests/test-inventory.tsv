@@ -38,7 +38,7 @@ program	*	source/LWPT.Core.Test.pas	21	145
 program	windows/*	source/LWPT.Core.Test.pas	21	146
 program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
-program	*	source/LWPT.Formatter.Test.pas	4	25
+program	*	source/LWPT.Formatter.Test.pas	5	35
 program	*	source/LWPT.Health.Test.pas	1	11
 program	*	source/LWPT.TestArtifactSet.Test.pas	1	7
 program	*	source/LWPT.TestInventory.Test.pas	1	7
