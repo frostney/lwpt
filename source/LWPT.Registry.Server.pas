@@ -461,9 +461,11 @@ function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
   const AMethod, ATarget: string; AProgress: TSHA256Progress):
   TLWPTRegistryHTTPResponse;
 var
-  APIPath, Digest, KeyID, Prefix, Relative, RequestID: string;
+  APIPath, Digest, KeyID, Prefix, Relative, RequestID, RoleName: string;
   State: TLWPTRegistryState;
 begin
+  RoleName := 'origin';
+  if AStore.Config.Role = rrMirror then RoleName := 'mirror';
   try
     AStore.EnsureFreshCheckpoint(RegistryTimestampNow, AProgress);
   except
@@ -514,7 +516,7 @@ begin
       + '-registry-discovery-v1"' + #10 + 'protocol = 1' + #10
       + 'origin = "' + AStore.Config.Identity + '"' + #10
       + 'base_url = "' + AStore.Config.BaseURL + '"' + #10
-      + 'role = "origin"' + #10 + 'api = "' + AStore.Config.BaseURL
+      + 'role = "' + RoleName + '"' + #10 + 'api = "' + AStore.Config.BaseURL
       + '/v1"' + #10 + 'capabilities = "' + AStore.Config.BaseURL
       + '/v1/capabilities"' + #10 + 'checkpoint = "'
       + AStore.Config.BaseURL + '/v1/checkpoints/latest.toml"' + #10);
@@ -1270,7 +1272,7 @@ begin
     if RegistrySocketListen(ListenSocket) <> 0 then
       raise ELWPTRegistryError.CreateStable('listen_failed',
         'could not listen on the configured registry socket');
-    WriteLn('registry origin ', FStore.Config.Identity, ' listening at ',
+    WriteLn('registry ', FStore.Config.Identity, ' listening at ',
       FStore.Config.BaseURL);
     while not FStopping do
     begin

@@ -35,13 +35,17 @@ type
     rdttNetworkFramework
   );
 
+  TLWPTRegistryRole = (rrOrigin, rrMirror);
+
   TLWPTRegistryConfig = record
+    Role: TLWPTRegistryRole;
     Identity: string;
     BaseURL: string;
     ListenAddress: string;
     Port: Word;
     TLSPKCS12Path: string;
     TLSPasswordEnvironment: string;
+    UpstreamURL, TrustKeyID, TrustPublicKey: string;
   end;
 
   TLWPTRegistryState = record
@@ -49,6 +53,7 @@ type
     SnapshotHash: string;
     CheckpointPath: string;
     SignaturePath: string;
+    TrustKeyID, TrustPublicKey, CheckpointHash, LastSync: string;
   end;
 
   TLWPTRegistryPublication = record
@@ -64,32 +69,34 @@ type
     FConfig: TLWPTRegistryConfig;
     function HashResource(const ARelative: string;
       AProgress: TSHA256Progress): string;
-    function RootPath(const ARelative: string): string;
-    function TmpRoot: string;
     function LoadSeed(AProgress: TSHA256Progress = nil): TBytes;
-    function ReadCurrentState(AProgress: TSHA256Progress = nil):
-      TLWPTRegistryState;
     procedure VerifyState(const AState: TLWPTRegistryState;
       AProgress: TSHA256Progress = nil);
     procedure RecoverDerivedState(const AState: TLWPTRegistryState);
+  protected
+    function RootPath(const ARelative: string): string;
+    function TmpRoot: string;
+    function ReadCurrentState(AProgress: TSHA256Progress = nil):
+      TLWPTRegistryState;
     procedure WriteImmutable(const ARelative: string;
       const ABytes: TBytes);
+    procedure ActivateState(const AState: TLWPTRegistryState);
   public
-    constructor Create(const ARoot: string);
+    constructor Create(const ARoot: string); virtual;
     class function Initialize(const ARoot: string;
       const ARequested: TLWPTRegistryConfig;
       const APublishedAt: string): TLWPTRegistryStore;
-    procedure Recover;
+    procedure Recover; virtual;
     procedure EnsureFreshCheckpoint(const ANow: string;
-      AProgress: TSHA256Progress = nil);
+      AProgress: TSHA256Progress = nil); virtual;
     procedure DescribeResource(const ARelative: string; out APath: string;
       out ASize: Int64);
     function LoadCurrentState(AProgress: TSHA256Progress = nil):
-      TLWPTRegistryState;
+      TLWPTRegistryState; virtual;
     function LoadResource(const ARelative: string;
       AProgress: TSHA256Progress = nil;
       const AMaxBytes: Int64 = MAX_REGISTRY_RESOURCE_BYTES): TBytes;
-    procedure Publish(const APublication: TLWPTRegistryPublication);
+    procedure Publish(const APublication: TLWPTRegistryPublication); virtual;
     property Config: TLWPTRegistryConfig read FConfig;
     property Root: string read FRoot;
   end;
@@ -103,6 +110,7 @@ function RegistryConfiguration(const AIdentity, ABaseURL,
   AListenAddress: string; const APort: Word; const ATLSPKCS12Path,
   ATLSPasswordEnvironment: string): TLWPTRegistryConfig;
 procedure ValidateRegistryConfiguration(const AConfig: TLWPTRegistryConfig);
+function LoadRegistryConfiguration(const ARoot: string): TLWPTRegistryConfig;
 function RegistryDarwinTLSTransportForKernelMajor(
   const AKernelMajor: Cardinal): TRegistryDarwinTLSTransport;
 function RegistryDarwinListenAddressSupportedForKernelMajor(
@@ -1061,6 +1069,7 @@ function RegistryConfiguration(const AIdentity, ABaseURL,
   AListenAddress: string; const APort: Word; const ATLSPKCS12Path,
   ATLSPasswordEnvironment: string): TLWPTRegistryConfig;
 begin
+  Result := Default(TLWPTRegistryConfig);
   Result.Identity := AIdentity;
   Result.BaseURL := ABaseURL;
   Result.ListenAddress := AListenAddress;
@@ -1087,6 +1096,9 @@ begin
   ValidatePersistedConfigurationString(AConfig.ListenAddress);
   ValidatePersistedConfigurationString(AConfig.TLSPKCS12Path);
   ValidatePersistedConfigurationString(AConfig.TLSPasswordEnvironment);
+  ValidatePersistedConfigurationString(AConfig.UpstreamURL);
+  ValidatePersistedConfigurationString(AConfig.TrustKeyID);
+  ValidatePersistedConfigurationString(AConfig.TrustPublicKey);
 end;
 
 procedure ValidateRegistryConfiguration(const AConfig: TLWPTRegistryConfig);
@@ -1135,9 +1147,13 @@ begin
 end;
 
 function ConfigDocument(const AConfig: TLWPTRegistryConfig): string;
+var
+  SchemaRole: string;
 begin
+  SchemaRole := 'origin';
+  if AConfig.Role = rrMirror then SchemaRole := 'mirror';
   Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
-    + '-registry-origin-config-v1') + #10
+    + '-registry-' + SchemaRole + '-config-v1') + #10
     + 'identity = ' + PersistedTOMLQuote(AConfig.Identity) + #10
     + 'base_url = ' + PersistedTOMLQuote(AConfig.BaseURL) + #10
     + 'listen_address = ' + PersistedTOMLQuote(AConfig.ListenAddress) + #10
@@ -1145,15 +1161,29 @@ begin
     + 'tls_pkcs12 = ' + PersistedTOMLQuote(AConfig.TLSPKCS12Path) + #10
     + 'tls_password_env = '
     + PersistedTOMLQuote(AConfig.TLSPasswordEnvironment) + #10;
+  if AConfig.Role = rrMirror then
+    Result := Result + 'upstream = ' + PersistedTOMLQuote(AConfig.UpstreamURL)
+      + #10 + 'trust_key_id = ' + PersistedTOMLQuote(AConfig.TrustKeyID)
+      + #10 + 'trust_public_key = ' + PersistedTOMLQuote(AConfig.TrustPublicKey)
+      + #10;
 end;
 
 function ParseConfig(const ADocument: string): TLWPTRegistryConfig;
 var
   PortValue: QWord;
 begin
+  Result := Default(TLWPTRegistryConfig);
   if StringValue(ADocument, 'schema') <> PROGRAM_NAME
     + '-registry-origin-config-v1' then
-    raise ELWPTRegistryError.CreateStable('state_corrupt', 'unsupported registry configuration schema');
+  begin
+    if StringValue(ADocument, 'schema') <> PROGRAM_NAME
+      + '-registry-mirror-config-v1' then
+      raise ELWPTRegistryError.CreateStable('state_corrupt', 'unsupported registry configuration schema');
+    Result.Role := rrMirror;
+    Result.UpstreamURL := StringValue(ADocument, 'upstream');
+    Result.TrustKeyID := StringValue(ADocument, 'trust_key_id');
+    Result.TrustPublicKey := StringValue(ADocument, 'trust_public_key');
+  end;
   Result.Identity := StringValue(ADocument, 'identity');
   Result.BaseURL := StringValue(ADocument, 'base_url');
   Result.ListenAddress := StringValue(ADocument, 'listen_address');
@@ -1294,24 +1324,50 @@ begin
 end;
 
 function StateDocument(const AState: TLWPTRegistryState): string;
+var
+  SchemaName: string;
 begin
+  SchemaName := '-registry-state-v1';
+  if AState.CheckpointHash <> '' then SchemaName := '-registry-mirror-state-v1';
   Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
-    + '-registry-state-v1') + #10
+    + SchemaName) + #10
     + 'sequence = ' + UIntToStr(AState.Sequence) + #10
     + 'snapshot = ' + PersistedTOMLQuote(AState.SnapshotHash) + #10
     + 'checkpoint = ' + PersistedTOMLQuote(AState.CheckpointPath) + #10
     + 'signature = ' + PersistedTOMLQuote(AState.SignaturePath) + #10;
+  if AState.CheckpointHash <> '' then
+    Result := Result + 'trust_key_id = ' + PersistedTOMLQuote(AState.TrustKeyID)
+      + #10 + 'trust_public_key = ' + PersistedTOMLQuote(AState.TrustPublicKey)
+      + #10 + 'checkpoint_hash = ' + PersistedTOMLQuote(AState.CheckpointHash)
+      + #10 + 'last_sync = ' + PersistedTOMLQuote(AState.LastSync) + #10;
 end;
 
 function ParseState(const ADocument: string): TLWPTRegistryState;
 begin
+  Result := Default(TLWPTRegistryState);
   if StringValue(ADocument, 'schema') <> PROGRAM_NAME
     + '-registry-state-v1' then
-    raise ELWPTRegistryError.CreateStable('state_corrupt', 'unsupported committed-state schema');
+  begin
+    if StringValue(ADocument, 'schema') <> PROGRAM_NAME + '-registry-mirror-state-v1' then
+      raise ELWPTRegistryError.CreateStable('state_corrupt', 'unsupported committed-state schema');
+    Result.TrustKeyID := StringValue(ADocument, 'trust_key_id');
+    Result.TrustPublicKey := StringValue(ADocument, 'trust_public_key');
+    Result.CheckpointHash := StringValue(ADocument, 'checkpoint_hash');
+    Result.LastSync := StringValue(ADocument, 'last_sync');
+  end;
   Result.Sequence := UIntValue(ADocument, 'sequence');
   Result.SnapshotHash := StringValue(ADocument, 'snapshot');
   Result.CheckpointPath := StringValue(ADocument, 'checkpoint');
   Result.SignaturePath := StringValue(ADocument, 'signature');
+end;
+
+function LoadRegistryConfiguration(const ARoot: string): TLWPTRegistryConfig;
+var
+  ConfigPath: string;
+begin
+  ConfigPath := IncludeTrailingPathDelimiter(ExpandFileName(ARoot)) + CONFIG_FILE;
+  ValidateRegistryPath(ConfigPath);
+  Result := ParseConfig(ReadText(ConfigPath, nil, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
 end;
 
 constructor TLWPTRegistryStore.Create(const ARoot: string);
@@ -1340,6 +1396,12 @@ end;
 function TLWPTRegistryStore.TmpRoot: string;
 begin
   Result := RootPath('tmp');
+end;
+
+procedure TLWPTRegistryStore.ActivateState(const AState: TLWPTRegistryState);
+begin
+  AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
+    Bytes(StateDocument(AState)));
 end;
 
 function TLWPTRegistryStore.LoadSeed(AProgress: TSHA256Progress): TBytes;
@@ -1486,7 +1548,7 @@ begin
     ForceDirectories(RootDir);
     if FileExists(IncludeTrailingPathDelimiter(RootDir) + CONFIG_FILE) then
     begin
-      Existing := TLWPTRegistryStore.Create(ARoot);
+      Existing := Self.Create(ARoot);
       try
         if FileExists(AtRoot(INITIALIZATION_MARKER)) then
         begin
@@ -1504,18 +1566,23 @@ begin
         if Config.Identity <> Existing.Config.Identity then
           raise ELWPTRegistryError.CreateStable('identity_conflict',
             'initialized origin identity cannot be changed');
+        if (Config.Role <> Existing.Config.Role)
+          or (Config.TrustKeyID <> Existing.Config.TrustKeyID)
+          or (Config.TrustPublicKey <> Existing.Config.TrustPublicKey) then
+          raise ELWPTRegistryError.CreateStable('identity_conflict',
+            'initialized registry role and pinned root cannot be changed');
         ValidateRegistryConfiguration(Config);
         AtomicWriteBytes(Existing.RootPath(CONFIG_FILE), Existing.TmpRoot,
           Bytes(ConfigDocument(Config)));
       finally
         Existing.Free;
       end;
-      Exit(TLWPTRegistryStore.Create(ARoot));
+      Exit(Self.Create(ARoot));
     end;
     Config := ARequested;
     Config.BaseURL := CanonicalRegistryURL(Config.BaseURL, False);
     if Config.Identity = '' then Config.Identity := Config.BaseURL
-    else Config.Identity := CanonicalRegistryURL(Config.Identity, True);
+    else Config.Identity := CanonicalRegistryURL(Config.Identity, Config.Role = rrOrigin);
     if Config.TLSPKCS12Path <> '' then
       Config.TLSPKCS12Path := ExpandFileName(Config.TLSPKCS12Path);
     ValidateRegistryConfiguration(Config);
@@ -1524,6 +1591,12 @@ begin
     AtomicWriteBytes(AtRoot(INITIALIZATION_MARKER), TemporaryRoot,
       Bytes('registry initialization in progress' + #10));
     ConfigBytes := Bytes(ConfigDocument(Config));
+    if Config.Role = rrMirror then
+    begin
+      AtomicWriteBytes(AtRoot(CONFIG_FILE), TemporaryRoot, ConfigBytes);
+      SysUtils.DeleteFile(AtRoot(INITIALIZATION_MARKER));
+      Exit(Self.Create(ARoot));
+    end;
     GenerateEd25519Seed(Seed);
     AtomicCreatePrivateBytes(AtRoot(SIGNING_SEED_FILE), TemporaryRoot,
       Bytes(BytesToHex(Seed, SizeOf(Seed)) + #10));
@@ -1567,7 +1640,7 @@ begin
       InjectRegistryFailure('initialization-activation');
       {$ENDIF}
       SysUtils.DeleteFile(AtRoot(INITIALIZATION_MARKER));
-      Result := TLWPTRegistryStore.Create(ARoot);
+      Result := Self.Create(ARoot);
     except
       FreeAndNil(Result);
       raise;
@@ -1983,6 +2056,7 @@ var
   Seed: TLWPTEd25519Seed;
   State: TLWPTRegistryState;
 begin
+  if FConfig.Role = rrMirror then Exit;
   TimestampPlusSevenDays(ANow);
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
   Lease := nil;
@@ -2056,6 +2130,9 @@ var
   BarrierStartedAt: QWord;
   {$ENDIF}
 begin
+  if FConfig.Role = rrMirror then
+    raise ELWPTRegistryError.CreateStable('mirror_read_only',
+      'mirrors cannot publish packages');
   if (Length(APublication.Name) < 1) or (Length(APublication.Name) > 128)
     or not (APublication.Name[1] in ['a'..'z', '0'..'9']) then
     raise ELWPTRegistryError.CreateStable('invalid_package_name', 'package name is not canonical');

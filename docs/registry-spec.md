@@ -452,6 +452,10 @@ per metadata document, 64 MiB total metadata, 10,000 documents, 10,000
 snapshots, and 1,000 rotations. Exceeding a limit fails closed; it never
 truncates history or accepts partial verification.
 
+Discovery and capability parsing share the same canonical decoder.
+`InspectRegistryCheckpoint` returns untrusted retrieval hints only; its result
+does not establish identity, key trust, or freshness without proof verification.
+
 ## Trust roots and key rotation
 
 Public key records are available at:
@@ -661,13 +665,18 @@ Synchronization is pull-based and requires only the read protocol:
 7. Validate record identity, uniqueness, archive size, archive hash, snapshot predecessor,
    and any key rotation.
 8. Atomically expose the new checkpoint only after all referenced resources
-   are verified and durable.
+   are verified and persisted. The executable's atomic-write implementation
+   guarantees process-interruption recovery and atomic visibility, not
+   power-loss persistence through file and directory flushes.
 
 Repeated synchronization is idempotent. Two mirrors may use different storage
 or HTTP server implementations and still serve byte-identical protocol
 resources. An origin or mirror MAY offer an authenticated administrative
 trigger, but that control surface is not part of the interoperable registry
 protocol.
+
+The executable mirror lifecycle, local storage, transfer limits, and freshness
+diagnostics are defined in [ADR-0045](adr/0045-verified-registry-mirror.md).
 
 ## Errors and HTTP behavior
 

@@ -19,6 +19,15 @@ type
   TLWPTRegistryDependency = record
     Origin, Name, Version: string;
   end;
+  TLWPTRegistryDiscovery = record
+    Origin, BaseURL, RoleName, API, Capabilities, Checkpoint, Rotations: string;
+  end;
+  { Retrieval hints only. No identity or key is trusted until VerifyRegistryProof. }
+  TLWPTUntrustedRegistryCheckpoint = record
+    Origin, Snapshot, PublishedAt, ExpiresAt, KeyId: string;
+    Sequence: Int64;
+    Bytes: TBytes;
+  end;
   TLWPTRegistryDependencyArray = array of TLWPTRegistryDependency;
 
   TLWPTRegistryPackage = record
@@ -80,6 +89,10 @@ type
   end;
 
 function DefaultRegistryVerificationLimits: TLWPTRegistryVerificationLimits;
+function ParseRegistryDiscovery(const AContent: string): TLWPTRegistryDiscovery;
+function InspectRegistryCheckpoint(const ABody: TBytes): TLWPTUntrustedRegistryCheckpoint;
+function ValidateRegistryCapabilities(const AContent, ARole: string;
+  out AHasRotations: Boolean): Integer;
 function RegistryURIIsCanonical(const AValue: string;
   AAllowLocalhostHTTP: Boolean): Boolean;
 function RegistryHashIsCanonical(const AValue: string): Boolean;
@@ -120,11 +133,7 @@ const
 
 type
   TStringArray = array of string;
-  TRegistryCheckpoint = record
-    Origin, Snapshot, PublishedAt, ExpiresAt, KeyId: string;
-    Sequence: Int64;
-    Bytes: TBytes;
-  end;
+  TRegistryCheckpoint = TLWPTUntrustedRegistryCheckpoint;
   TRegistrySignature = record
     KeyId, Payload, Signature: string;
   end;
@@ -521,7 +530,7 @@ begin
   Result := Node.ScalarText = 'true';
 end;
 
-function ParseCheckpoint(const ABody: TBytes): TRegistryCheckpoint;
+function InspectRegistryCheckpoint(const ABody: TBytes): TLWPTUntrustedRegistryCheckpoint;
 var
   Root: TTOMLNode;
 begin
@@ -699,6 +708,105 @@ type
       const AMode: TLWPTRegistryVerificationMode): TLWPTVerifiedRegistry;
   end;
 
+function ParseRegistryDiscovery(const AContent: string): TLWPTRegistryDiscovery;
+var
+  Root: TTOMLNode;
+begin
+  if Pos(#10 + 'rotations = ', AContent) > 0 then
+    Root := ParseCanonical(AContent, PROGRAM_NAME + '-registry-discovery-v1',
+      ['schema', 'protocol', 'origin', 'base_url', 'role', 'api',
+       'capabilities', 'checkpoint', 'rotations'])
+  else
+    Root := ParseCanonical(AContent, PROGRAM_NAME + '-registry-discovery-v1',
+      ['schema', 'protocol', 'origin', 'base_url', 'role', 'api',
+       'capabilities', 'checkpoint']);
+  try
+    if UnsignedField(Root, 'protocol') <> 1 then
+      raise ELWPTRegistryError.Create('unsupported_registry_protocol');
+    Result.Origin := TomlStr(Root, 'origin', '');
+    Result.BaseURL := TomlStr(Root, 'base_url', '');
+    Result.RoleName := TomlStr(Root, 'role', '');
+    Result.API := TomlStr(Root, 'api', '');
+    Result.Capabilities := TomlStr(Root, 'capabilities', '');
+    Result.Checkpoint := TomlStr(Root, 'checkpoint', '');
+    Result.Rotations := TomlStr(Root, 'rotations', '');
+    if (Result.RoleName <> 'origin') and (Result.RoleName <> 'mirror') then
+      raise ELWPTRegistryError.Create('invalid_registry_role');
+    if not RegistryURIIsCanonical(Result.Origin, True)
+      or not RegistryURIIsCanonical(Result.BaseURL, True)
+      or not RegistryURIIsCanonical(Result.API, True)
+      or not RegistryURIIsCanonical(Result.Capabilities, True)
+      or not RegistryURIIsCanonical(Result.Checkpoint, True)
+      or ((TomlGet(Root, 'rotations') <> nil)
+        and not RegistryURIIsCanonical(Result.Rotations, True)) then
+      raise ELWPTRegistryError.Create('invalid_registry_discovery_uri');
+    if (Length(Result.Checkpoint) <= 5)
+      or (Copy(Result.Checkpoint, Length(Result.Checkpoint) - 4, 5)
+        <> '.toml') then
+      raise ELWPTRegistryError.Create('invalid_registry_checkpoint_uri');
+  finally
+    Root.Free;
+  end;
+end;
+
+function ValidateRegistryCapabilities(const AContent: string;
+  const ARole: string; out AHasRotations: Boolean): Integer;
+const
+  REQUIRED_SCHEMAS: array[0..4] of string = (
+    PROGRAM_NAME + '-registry-checkpoint-v1', PROGRAM_NAME + '-registry-discovery-v1',
+    PROGRAM_NAME + '-registry-package-v1', PROGRAM_NAME + '-registry-signature-v1',
+    PROGRAM_NAME + '-registry-snapshot-v1');
+var
+  Root: TTOMLNode;
+  Hashes, Signatures, Schemas, Features, AuthSchemes: TStringArray;
+  I: Integer;
+  function Contains(const AValues: TStringArray; const AValue: string): Boolean;
+  var J: Integer;
+  begin
+    for J := 0 to High(AValues) do if AValues[J] = AValue then Exit(True);
+    Result := False;
+  end;
+begin
+  Root := ParseCanonical(AContent, PROGRAM_NAME + '-registry-capabilities-v1',
+    ['schema', 'protocol', 'hashes', 'signatures', 'schemas', 'features',
+     'auth_schemes', 'max_page_size']);
+  try
+    if UnsignedField(Root, 'protocol') <> 1 then
+      raise ELWPTRegistryError.Create('unsupported_registry_protocol');
+    Hashes := NodeStringArray(Root, 'hashes');
+    Signatures := NodeStringArray(Root, 'signatures');
+    Schemas := NodeStringArray(Root, 'schemas');
+    Features := NodeStringArray(Root, 'features');
+    AHasRotations := Contains(Features, 'rotation-chain-v1');
+    AuthSchemes := NodeStringArray(Root, 'auth_schemes');
+    if UnsignedField(Root, 'max_page_size') > High(Integer) then
+      raise ELWPTRegistryError.Create('registry_capability_missing');
+    Result := UnsignedField(Root, 'max_page_size');
+    if not Contains(Hashes, 'sha256') or not Contains(Signatures, 'ed25519')
+      or not Contains(Features, 'snapshot-sync-v1')
+      or (Result < 1) then
+      raise ELWPTRegistryError.Create('registry_capability_missing');
+    for I := 0 to High(REQUIRED_SCHEMAS) do
+      if not Contains(Schemas, REQUIRED_SCHEMAS[I]) then
+        raise ELWPTRegistryError.Create('registry_schema_capability_missing');
+    if ARole = 'mirror' then
+    begin
+      if Contains(Features, 'publication-v1') then
+        raise ELWPTRegistryError.Create('mirror_advertises_publication');
+      if Length(AuthSchemes) <> 0 then
+        raise ELWPTRegistryError.Create('mirror_advertises_authentication');
+    end
+    else if Contains(Features, 'publication-v1')
+      and (Length(AuthSchemes) = 0) then
+      raise ELWPTRegistryError.Create('origin_publication_capability_missing');
+    if (ARole = 'origin') and not Contains(Features, 'publication-v1')
+      and (Length(AuthSchemes) <> 0) then
+      raise ELWPTRegistryError.Create('read_only_origin_advertises_authentication');
+  finally
+    Root.Free;
+  end;
+end;
+
 function DefaultRegistryVerificationLimits: TLWPTRegistryVerificationLimits;
 begin
   Result.DocumentBytes := MAXIMUM_CANONICAL_DOCUMENT_BYTES;
@@ -834,7 +942,7 @@ begin
   if (AMode = rvmLockedProof)
     and (APrior.CheckpointHash <> SHA256BytesPrefixed(AProof.Checkpoint)) then
     raise ELWPTRegistryError.Create('locked_proof_state_mismatch');
-  Checkpoint := ParseCheckpoint(AProof.Checkpoint);
+  Checkpoint := InspectRegistryCheckpoint(AProof.Checkpoint);
   if Checkpoint.Origin <> ATrust.Origin then
     raise ELWPTRegistryError.Create('checkpoint_origin_mismatch');
   KeyId := ATrust.KeyId;

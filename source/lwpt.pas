@@ -458,14 +458,14 @@ function HandleRegistry(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
   BaseURL, DataDirectory, Identity, ListenAddress, TLSPKCS12,
-    TLSPasswordEnvironment: string;
+    TLSPasswordEnvironment, RoleName, Upstream, KeyID, PublicKey: string;
   Index, Port: Integer;
   ServeConfigurationPresent: Boolean;
 begin
   if APositionals.Count <> 1 then
   begin
     WriteLn(ErrOutput, ErrPrefix('registry'),
-      'expected exactly one operation: init or serve');
+      'expected exactly one operation: init, sync, verify or serve');
     Exit(1);
   end;
   DataDirectory := REGISTRY_DEFAULT_DATA_DIR;
@@ -475,6 +475,10 @@ begin
   Port := REGISTRY_DEFAULT_PORT;
   TLSPKCS12 := '';
   TLSPasswordEnvironment := '';
+  RoleName := 'origin';
+  Upstream := '';
+  KeyID := '';
+  PublicKey := '';
   ServeConfigurationPresent := False;
   for Index := 0 to High(AOptions) do
   begin
@@ -496,7 +500,15 @@ begin
         TLSPKCS12 := TStringOption(AOptions[Index]).ValueOr(TLSPKCS12)
       else if SameText(AOptions[Index].LongName, 'tls-password-env') then
         TLSPasswordEnvironment := TStringOption(AOptions[Index]).ValueOr(
-          TLSPasswordEnvironment);
+          TLSPasswordEnvironment)
+      else if SameText(AOptions[Index].LongName, 'role') then
+        RoleName := TStringOption(AOptions[Index]).ValueOr(RoleName)
+      else if SameText(AOptions[Index].LongName, 'upstream') then
+        Upstream := TStringOption(AOptions[Index]).ValueOr(Upstream)
+      else if SameText(AOptions[Index].LongName, 'key-id') then
+        KeyID := TStringOption(AOptions[Index]).ValueOr(KeyID)
+      else if SameText(AOptions[Index].LongName, 'public-key') then
+        PublicKey := TStringOption(AOptions[Index]).ValueOr(PublicKey);
     end
     else if SameText(AOptions[Index].LongName, 'port') then
       Port := TIntegerOption(AOptions[Index]).ValueOr(Port);
@@ -504,21 +516,25 @@ begin
   try
     if SameText(APositionals[0], 'init') then
       Result := CmdRegistryInit(DataDirectory, Identity, BaseURL,
-        ListenAddress, Port, TLSPKCS12, TLSPasswordEnvironment)
-    else if SameText(APositionals[0], 'serve') then
+        ListenAddress, Port, TLSPKCS12, TLSPasswordEnvironment,
+        RoleName, Upstream, KeyID, PublicKey)
+    else if SameText(APositionals[0], 'serve') or SameText(APositionals[0], 'sync')
+      or SameText(APositionals[0], 'verify') then
     begin
       if ServeConfigurationPresent then
       begin
         WriteLn(ErrOutput, ErrPrefix('registry'),
-          'serve accepts only --data-dir; change persisted configuration with init');
+          APositionals[0], ' accepts only --data-dir; change persisted configuration with init');
         Exit(1);
       end;
-      Result := CmdRegistryServe(DataDirectory);
+      if SameText(APositionals[0], 'sync') then Result := CmdRegistrySync(DataDirectory)
+      else if SameText(APositionals[0], 'verify') then Result := CmdRegistryVerify(DataDirectory)
+      else Result := CmdRegistryServe(DataDirectory);
     end
     else
     begin
       WriteLn(ErrOutput, ErrPrefix('registry'), 'unknown operation "',
-        APositionals[0], '"; expected init or serve');
+        APositionals[0], '"; expected init, sync, verify or serve');
       Result := 1;
     end;
   except
@@ -848,9 +864,9 @@ begin
       'Recover project and shared-cache residue', '',
       @HandleRepair, RepairOpts));
 
-    SetLength(RegistryOpts, 7);
+    SetLength(RegistryOpts, 11);
     RegistryOpts[0] := TStringOption.Create('data-dir',
-      'Origin data directory (default: ' + REGISTRY_DEFAULT_DATA_DIR + ')');
+      'Registry data directory (default: ' + REGISTRY_DEFAULT_DATA_DIR + ')');
     RegistryOpts[1] := TStringOption.Create('identity',
       'Stable canonical HTTPS origin identity (init only)');
     RegistryOpts[2] := TStringOption.Create('base-url',
@@ -863,9 +879,17 @@ begin
       'PKCS#12 identity path required by HTTPS (init only)');
     RegistryOpts[6] := TStringOption.Create('tls-password-env',
       'Environment variable containing the PKCS#12 password (init only)');
+    RegistryOpts[7] := TStringOption.Create('role',
+      'Registry role: origin (default) or mirror (init only)');
+    RegistryOpts[8] := TStringOption.Create('upstream',
+      'Canonical upstream base URL (required for mirror init)');
+    RegistryOpts[9] := TStringOption.Create('key-id',
+      'Pinned origin root ed25519 key ID (required for mirror init)');
+    RegistryOpts[10] := TStringOption.Create('public-key',
+      'Pinned origin root public key in hex: encoding (required for mirror init)');
     Registry.Add(TSubcommand.Create('registry',
-      'Initialize or serve a self-hosted registry origin',
-      '<init|serve> [--data-dir <path>] [configuration options]',
+      'Initialize, synchronize, verify or serve a self-hosted registry',
+      '<init|sync|verify|serve> [--data-dir <path>] [configuration options]',
       @HandleRegistry, RegistryOpts));
 
     SetLength(InitOpts, 3);

@@ -63,6 +63,7 @@ program	*	tests/e2e/InstallGitHub.E2E.Test.pas	1	6
 program	*	tests/e2e/InstallGitLab.E2E.Test.pas	1	4
 program	*	tests/e2e/InstallScript.E2E.Test.pas	3	13
 program	*	tests/e2e/Registry.E2E.Test.pas	1	8
+program	*	tests/e2e/RegistryMirror.E2E.Test.pas	1	4
 program	*	tests/integration/AddRemove.Test.pas	1	8
 program	*	tests/integration/Agents.Test.pas	1	15
 program	*	tests/integration/BuildClean.Test.pas	1	6
