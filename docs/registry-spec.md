@@ -426,6 +426,32 @@ An origin SHOULD issue checkpoints with a validity window of no more than seven
 days. Short expiry limits replay for a client without prior state; persisted
 highest-sequence state prevents downgrade for returning clients.
 
+### Acquisition and locked proof verification
+
+New acquisition and mirror synchronization enforce checkpoint expiry against
+the current UTC time and reject checkpoints published in the future. The
+checkpoint's publication time must precede its expiry.
+
+A network-free operation reproducing an already locked selection may verify
+that retained proof after its checkpoint expires. It must require the exact
+recorded checkpoint hash, sequence, snapshot, origin, and signing key; verify
+the signature and rotation chain from the configured trust root; and verify
+record membership, snapshot history, archive identity, and available archive
+bytes. This exception does not accept a new checkpoint, change a locked
+selection, or make an expired mirror fresh. Acquisition and locked proof are
+explicit validation modes, not a replacement evaluation time supplied to
+evade an expiry check.
+
+`LWPT.Registry.Verification` provides that shared validation independently of
+transport and persistence. Its caller supplies bounded reads of metadata
+relative to the API path. Successful verification returns the current package
+records and exact checkpoint, signatures, rotations, snapshots, and record
+bytes needed to preserve the proof. The caller still owns archive retrieval,
+atomic persistence, and the configured trust root. Default limits are 4 MiB
+per metadata document, 64 MiB total metadata, 10,000 documents, 10,000
+snapshots, and 1,000 rotations. Exceeding a limit fails closed; it never
+truncates history or accepts partial verification.
+
 ## Trust roots and key rotation
 
 Public key records are available at:
