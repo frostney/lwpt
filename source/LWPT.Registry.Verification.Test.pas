@@ -71,6 +71,10 @@ type
     procedure BothRotationSignaturesRequired;
     procedure ReusedRotationRejected;
     procedure NonCanonicalProofRejected;
+    procedure LiteralStringsCannotMaskNesting;
+    procedure MalformedDelimitersRejectedBeforeParsing;
+    procedure QuotedSyntaxRemainsCanonical;
+    procedure SharedEncoderPinsEscapeBytes;
     procedure SnapshotTamperingRejected;
     procedure MissingAncestryRejected;
     procedure DuplicateIdentityRejected;
@@ -244,7 +248,7 @@ begin
     except
       on E: ELWPTRegistryError do Actual := E.Message;
     end;
-    Expect<Boolean>(Pos(AReason, Actual) = 1).ToBe(True);
+    Expect<string>(Copy(Actual, 1, Length(AReason))).ToBe(AReason);
   finally
     if Owned then ASource.Free;
   end;
@@ -411,6 +415,76 @@ begin
   Candidate.Checkpoint := AsBytes(StringReplace(AsText(Candidate.Checkpoint),
     'sequence = 1', 'sequence = [[[[1]]]]', []));
   ExpectFailure(Candidate, 'non_canonical_document', Default(TLWPTRegistryAcceptedState));
+end;
+
+procedure TRegistryVerificationTests.LiteralStringsCannotMaskNesting;
+var
+  Candidate: TLWPTRegistryProof;
+  Text: string;
+begin
+  Candidate := Proof(1);
+  { Eight levels safely demonstrate the old counter bypass without a
+    stack-exhaustion payload. The guard must reject before TOML parsing. }
+  Text := StringReplace(AsText(Candidate.Checkpoint),
+    'origin = "' + Trust.Origin + '"', 'origin = ' + #39
+    + StringOfChar(']', 8) + #39, []);
+  Text := StringReplace(Text, 'sequence = 1', 'sequence = '
+    + StringOfChar('[', 8) + '1' + StringOfChar(']', 8), []);
+  Candidate.Checkpoint := AsBytes(Text);
+  ExpectFailure(Candidate, 'non_canonical_document: literal strings',
+    Default(TLWPTRegistryAcceptedState));
+end;
+
+procedure TRegistryVerificationTests.MalformedDelimitersRejectedBeforeParsing;
+const
+  VALUES: array[0..4] of string = (']', '[1', '[}', '"unterminated', '"""text"""');
+var
+  Candidate: TLWPTRegistryProof;
+  Value: string;
+begin
+  for Value in VALUES do
+  begin
+    Candidate := Proof(1);
+    Candidate.Checkpoint := AsBytes(StringReplace(AsText(Candidate.Checkpoint),
+      'sequence = 1', 'sequence = ' + Value, []));
+    ExpectFailure(Candidate, 'non_canonical_document: delimiters',
+      Default(TLWPTRegistryAcceptedState));
+  end;
+end;
+
+procedure TRegistryVerificationTests.QuotedSyntaxRemainsCanonical;
+var
+  Text, Actual: string;
+begin
+  Text := AsText(ReadFixture('records/' + Copy(ROOT_RECORD, 8, 64) + '.toml'));
+  Text := StringReplace(Text, 'published_at = "2026-01-01T00:00:00Z"',
+    'published_at = ' + RegistryTOMLQuote('[]{}' + #39 + '"\' + #9), []);
+  Actual := '';
+  try
+    ParseRegistryPackage(Text, SHA256BytesPrefixed(AsBytes(Text)), Trust.Origin);
+  except
+    on E: ELWPTRegistryError do Actual := E.Message;
+  end;
+  { Canonical quoting passes; only the timestamp's domain validation fails. }
+  Expect<string>(Actual).ToBe('invalid_registry_record');
+end;
+
+procedure TRegistryVerificationTests.SharedEncoderPinsEscapeBytes;
+var
+  Text, Actual: string;
+begin
+  Expect<string>(RegistryTOMLQuote('"\' + #8#9#10#12#13#0#11#27#31#127))
+    .ToBe('"\"\\\b\t\n\f\r\u0000\u000b\u001b\u001f\u007f"');
+  Text := AsText(ReadFixture('records/' + Copy(ROOT_RECORD, 8, 64) + '.toml'));
+  Text := StringReplace(Text, 'published_at = "2026-01-01T00:00:00Z"',
+    'published_at = ' + RegistryTOMLQuote(#27), []);
+  Actual := '';
+  try
+    ParseRegistryPackage(Text, SHA256BytesPrefixed(AsBytes(Text)), Trust.Origin);
+  except
+    on E: ELWPTRegistryError do Actual := E.Message;
+  end;
+  Expect<string>(Actual).ToBe('invalid_registry_record');
 end;
 
 procedure TRegistryVerificationTests.SnapshotTamperingRejected;
@@ -712,6 +786,10 @@ begin
   Test('both rotation signatures are mandatory', BothRotationSignaturesRequired);
   Test('reused rotation fails closed', ReusedRotationRejected);
   Test('noncanonical and deeply nested proofs fail', NonCanonicalProofRejected);
+  Test('literal strings cannot mask parser nesting', LiteralStringsCannotMaskNesting);
+  Test('malformed delimiters fail before TOML parsing', MalformedDelimitersRejectedBeforeParsing);
+  Test('quoted brackets apostrophes and escapes remain canonical', QuotedSyntaxRemainsCanonical);
+  Test('shared encoder pins canonical escape bytes', SharedEncoderPinsEscapeBytes);
   Test('snapshot byte tampering fails', SnapshotTamperingRejected);
   Test('missing ancestry fails', MissingAncestryRejected);
   Test('signed snapshot cannot include duplicate package identity', DuplicateIdentityRejected);

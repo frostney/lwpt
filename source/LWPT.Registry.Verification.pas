@@ -289,33 +289,6 @@ begin
   Result := Pos('||', StringReplace(AValue, ' || ', '', [rfReplaceAll])) = 0;
 end;
 
-function CanonicalTomlString(const AValue: string): string;
-var
-  I: Integer;
-  C: Char;
-begin
-  Result := '"';
-  for I := 1 to Length(AValue) do
-  begin
-    C := AValue[I];
-    case C of
-      '"': Result := Result + '\"';
-      '\': Result := Result + '\\';
-      #8: Result := Result + '\b';
-      #9: Result := Result + '\t';
-      #10: Result := Result + '\n';
-      #12: Result := Result + '\f';
-      #13: Result := Result + '\r';
-    else
-      if (Ord(C) < 32) or (Ord(C) = 127) then
-        Result := Result + '\u' + IntToHex(Ord(C), 4)
-      else
-        Result := Result + C;
-    end;
-  end;
-  Result := Result + '"';
-end;
-
 function CanonicalTomlKey(const AValue: string): Boolean;
 var
   I: Integer;
@@ -336,7 +309,7 @@ begin
   case ANode.Kind of
     tnkScalar:
       case ANode.ScalarKind of
-        tskString: Result := CanonicalTomlString(ANode.ScalarText);
+        tskString: Result := RegistryTOMLQuote(ANode.ScalarText);
         tskInteger:
         begin
           if not TryStrToInt64(ANode.ScalarText, IntegerValue)
@@ -392,6 +365,7 @@ var
   I, EqualAt, Depth: Integer;
   Key: string;
   InString, Escaped: Boolean;
+  Delimiters: array[1..MAXIMUM_CANONICAL_DEPTH] of Char;
 begin
   Result := nil;
   if Length(AContent) > MAXIMUM_CANONICAL_DOCUMENT_BYTES then
@@ -408,19 +382,39 @@ begin
   begin
     if InString then
     begin
+      if AContent[I] = #10 then
+        raise ELWPTRegistryError.Create('non_canonical_document: delimiters');
       if Escaped then Escaped := False
       else if AContent[I] = '\' then Escaped := True
       else if AContent[I] = '"' then InString := False;
     end
-    else if AContent[I] = '"' then InString := True
+    else if AContent[I] = #39 then
+      raise ELWPTRegistryError.Create('non_canonical_document: literal strings')
+    else if AContent[I] = '"' then
+    begin
+      if Copy(AContent, I, 3) = '"""' then
+        raise ELWPTRegistryError.Create('non_canonical_document: delimiters');
+      InString := True;
+    end
     else if AContent[I] in ['[', '{'] then
     begin
       Inc(Depth);
       if Depth > MAXIMUM_CANONICAL_DEPTH then
         raise ELWPTRegistryError.Create('non_canonical_document: nesting');
+      Delimiters[Depth] := AContent[I];
     end
-    else if AContent[I] in [']', '}'] then Dec(Depth);
+    else if AContent[I] in [']', '}'] then
+    begin
+      if Depth = 0 then
+        raise ELWPTRegistryError.Create('non_canonical_document: delimiters');
+      if ((AContent[I] = ']') and (Delimiters[Depth] <> '['))
+        or ((AContent[I] = '}') and (Delimiters[Depth] <> '{')) then
+        raise ELWPTRegistryError.Create('non_canonical_document: delimiters');
+      Dec(Depth);
+    end;
   end;
+  if InString or (Depth <> 0) then
+    raise ELWPTRegistryError.Create('non_canonical_document: delimiters');
   Lines := TStringList.Create;
   try
     Lines.Text := AContent;
