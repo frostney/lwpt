@@ -45,7 +45,9 @@ interface
 uses
   Classes,
   Process,
-  SysUtils;
+  SysUtils,
+
+  Pipes;
 
 type
   TLwptResult = record
@@ -80,6 +82,8 @@ function ExpectedExe(const APath: string): string;
 procedure SetLwptBinaryPath(const APath: string);
 procedure ConfigureProcessEnvironment(const AProcess: TProcess;
   const AOverrides: array of string);
+function DrainAvailableStream(AStream: TInputPipeStream;
+  const AMaximumBytes: Integer = High(Integer)): string;
 
 { When a nested LWPT run exits with an unexpected code, its captured
   output is the only evidence of why. Call this before the exit-code
@@ -115,9 +119,6 @@ function SkipNetworkTests: Boolean;
 function IsNetworkUnavailable(const AResult: TLwptResult): Boolean;
 
 implementation
-
-uses
-  Pipes;
 
 var
   GLwptBinaryPath: string = '';
@@ -171,7 +172,8 @@ end;
   live after producing one progress line, and descendants can inherit its pipe
   writer. Reading until EOF would block the caller before it can poll process
   state or enforce a requested timeout. }
-function DrainAvailableStream(AStream: TInputPipeStream): string;
+function DrainAvailableStream(AStream: TInputPipeStream;
+  const AMaximumBytes: Integer): string;
 const
   CHUNK = 4 * 1024;
 var
@@ -180,6 +182,7 @@ var
 begin
   Result := '';
   Available := AStream.NumBytesAvailable;
+  if Available > AMaximumBytes then Available := AMaximumBytes;
   Total := 0;
   while Available > 0 do
   begin

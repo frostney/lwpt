@@ -1381,7 +1381,7 @@ procedure TNetworkFrameworkRegistryServer.Run;
 var
   Index: Integer;
 begin
-  WriteLn('registry origin ', FStore.Config.Identity, ' listening at ',
+  WriteLn('registry ', FStore.Config.Identity, ' listening at ',
     FStore.Config.BaseURL);
   while not FStopping do
   begin
