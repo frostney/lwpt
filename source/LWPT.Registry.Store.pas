@@ -1365,13 +1365,18 @@ end;
 
 function LoadRegistryConfiguration(const ARoot: string): TLWPTRegistryConfig;
 var
-  ConfigPath: string;
+  Root, ConfigPath: string;
 begin
-  ConfigPath := IncludeTrailingPathDelimiter(ExpandFileName(ARoot)) + CONFIG_FILE;
+  Root := ExpandFileName(ARoot);
+  ValidateRegistryPath(Root);
+  if FileExists(Root) and not DirectoryExists(Root) then
+    raise ELWPTRegistryError.CreateStable('invalid_registry_path',
+      'registry data root is not a directory');
+  ConfigPath := IncludeTrailingPathDelimiter(Root) + CONFIG_FILE;
   ValidateRegistryPath(ConfigPath);
   if not FileExists(ConfigPath) then
     raise ELWPTRegistryError.CreateStable('origin_not_initialized',
-      'registry data directory is not initialized: ' + ExpandFileName(ARoot));
+      'registry data directory is not initialized: ' + Root);
   Result := ParseConfig(ReadText(ConfigPath, nil, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
 end;
 
@@ -1379,10 +1384,6 @@ constructor TLWPTRegistryStore.Create(const ARoot: string);
 begin
   inherited Create;
   FRoot := ExpandFileName(ARoot);
-  ValidateRegistryPath(FRoot);
-  if FileExists(FRoot) and not DirectoryExists(FRoot) then
-    raise ELWPTRegistryError.CreateStable('invalid_registry_path',
-      'registry data root is not a directory');
   FConfig := LoadRegistryConfiguration(FRoot);
   Recover;
 end;

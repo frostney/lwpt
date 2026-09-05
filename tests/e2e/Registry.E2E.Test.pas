@@ -304,6 +304,17 @@ begin
     .ToBe(True);
   Expect<Boolean>(Pos('origin_not_initialized:', ResultValue.Stderr) > 0)
     .ToBe(True);
+  Expect<Boolean>(ForceDirectories(FScratch + '/uninitialized')).ToBe(True);
+  ResultValue := RunLwpt(['registry', 'serve', '--silent', '--data-dir',
+    FScratch + '/uninitialized']);
+  Expect<Integer>(ResultValue.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('origin_not_initialized:', ResultValue.Stderr) > 0)
+    .ToBe(True);
+  ResultValue := RunLwpt(['registry', 'serve', '--silent', '--data-dir',
+    LwptBinaryPath]);
+  Expect<Integer>(ResultValue.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('invalid_registry_path:', ResultValue.Stderr) > 0)
+    .ToBe(True);
 end;
 
 procedure TRegistryE2EContract.TestSlowClientsAreBoundedByOneDeadline;
