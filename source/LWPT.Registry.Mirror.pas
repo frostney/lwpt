@@ -29,6 +29,7 @@ type
   private
     {$IFDEF REGISTRY_TESTING}
     FTransferStats: TRegistryMirrorTransferStats;
+    FBeforeActivate: TSHA256Progress;
     {$ENDIF}
     function Trust: TLWPTRegistryTrust;
     function Accepted(const AState: TLWPTRegistryState): TLWPTRegistryAcceptedState;
@@ -53,6 +54,8 @@ function RegistryMirrorCanAdmitForTesting(const AReserved, ASize: Int64;
 procedure RegistryMirrorTransferForTesting(AMirror: TLWPTRegistryMirror;
   const AAPI: string; const APackages: TLWPTRegistryPackageArray);
 function RegistryMirrorTransferStatsForTesting(AMirror: TLWPTRegistryMirror): TRegistryMirrorTransferStats;
+procedure RegistryMirrorBeforeActivateForTesting(AMirror: TLWPTRegistryMirror;
+  ACallback: TSHA256Progress);
 {$ENDIF}
 
 implementation
@@ -77,6 +80,12 @@ var
 function RegistryMirrorProofChecksForTesting: Integer;
 begin
   Result := MirrorProofChecks;
+end;
+
+procedure RegistryMirrorBeforeActivateForTesting(AMirror: TLWPTRegistryMirror;
+  ACallback: TSHA256Progress);
+begin
+  AMirror.FBeforeActivate := ACallback;
 end;
 {$ENDIF}
 
@@ -703,8 +712,8 @@ begin
       Verified := VerifyRegistryProof(Proof, Trust, Prior, RegistryTimestampNow,
         rvmAcquire, Source, DefaultRegistryVerificationLimits);
       TransferArchives(Discovery.API, Verified.Packages);
-      { Recheck current freshness immediately before activation, using only
-        retained resources. Expiry during transfer cannot become a fresh head. }
+      { Recheck the complete retained proof after transfer. A final clock check
+        below also covers time spent verifying and storing that proof. }
       Source.API := '';
       Verified := VerifyRegistryProof(Proof, Trust, Prior, RegistryTimestampNow,
         rvmAcquire, Source, DefaultRegistryVerificationLimits);
@@ -714,7 +723,6 @@ begin
       State.CheckpointHash := Verified.State.CheckpointHash;
       State.TrustKeyID := Verified.State.KeyId;
       State.TrustPublicKey := Verified.State.PublicKey;
-      State.LastSync := RegistryTimestampNow;
       Prefix := 'checkpoints/renewals/sha256/' + Copy(State.CheckpointHash, 8, 64);
       State.CheckpointPath := Prefix + '.toml';
       State.SignaturePath := Prefix + '.sig.toml';
@@ -732,6 +740,12 @@ begin
       SaveAttempt('verified');
       { All immutable files are closed and verified before this atomic pointer.
         This is process-interruption recovery, not an fsync power-loss promise. }
+      {$IFDEF REGISTRY_TESTING}
+      if Assigned(FBeforeActivate) then FBeforeActivate;
+      {$ENDIF}
+      State.LastSync := RegistryTimestampNow;
+      if Verified.ExpiresAt <= State.LastSync then
+        raise ELWPTRegistryError.Create('checkpoint_expired');
       ActivateState(State);
     except
       on E: Exception do

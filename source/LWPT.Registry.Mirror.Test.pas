@@ -50,6 +50,8 @@ type
   private
     FRoot: string;
     FMirror: TLWPTRegistryMirror;
+    FActivationExpiry, FActivationEnteredAt: string;
+    procedure WaitForActivationExpiry;
     function ObjectPath(const APackage: TLWPTRegistryPackage): string;
     procedure PrepareSignedFixture(AServer: TRegistryTestServer;
       const APublishedAt: string; const ACount: Integer;
@@ -67,6 +69,7 @@ type
     procedure ConflictingSizesFailBeforeFetch;
     procedure FailedSiblingDrainsAndRetainsVerifiedObject;
     procedure ExpiryDuringTransferPreventsActivation;
+    procedure ExpiryBeforeActivationPreventsPublication;
     procedure CLIInterruptionReusesCompletedPair;
     procedure IncompleteClientShutdownIsBounded;
   end;
@@ -504,6 +507,60 @@ begin
   end;
 end;
 
+procedure TMirrorTransferTests.WaitForActivationExpiry;
+var
+  Started: QWord;
+begin
+  FActivationEnteredAt := RegistryTimestampNow;
+  Started := GetTickCount64;
+  while (RegistryTimestampNow < FActivationExpiry)
+    and (GetTickCount64 - Started < 15000) do Sleep(20);
+  if RegistryTimestampNow < FActivationExpiry then
+    raise Exception.Create('activation expiry fixture deadline elapsed');
+end;
+
+procedure TMirrorTransferTests.ExpiryBeforeActivationPreventsPublication;
+var
+  Server: TRegistryTestServer;
+  Origin: TCapturedOrigin;
+  TimedMirror: TLWPTRegistryMirror;
+  Routes: TRegistryHTTPRouteArray;
+  Packages: TLWPTRegistryPackageArray;
+  PublishedAt, Failure: string;
+begin
+  Server := TRegistryTestServer.Create(nil, True);
+  Origin := nil;
+  TimedMirror := nil;
+  try
+    FActivationExpiry := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
+      IncSecond(ISO8601ToDate(RegistryTimestampNow, True), 10));
+    PublishedAt := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
+      IncDay(ISO8601ToDate(FActivationExpiry, True), -7));
+    PrepareSignedFixture(Server, PublishedAt, 1, Origin, TimedMirror, Routes, Packages);
+    Server.SetRoutes(Routes);
+    Server.Start;
+    FActivationEnteredAt := '';
+    RegistryMirrorBeforeActivateForTesting(TimedMirror, WaitForActivationExpiry);
+    Failure := '';
+    try
+      TimedMirror.Synchronize;
+    except
+      on E: Exception do Failure := E.Message;
+    end;
+    Expect<Boolean>(FActivationEnteredAt <> '').ToBe(True);
+    Expect<Boolean>(FActivationEnteredAt < FActivationExpiry).ToBe(True);
+    Expect<Boolean>(RegistryTimestampNow >= FActivationExpiry).ToBe(True);
+    Expect<Boolean>(Pos('checkpoint_expired', Failure) > 0).ToBe(True);
+    Expect<Boolean>(FileExists(TimedMirror.Root + '/state/current.toml')).ToBe(False);
+    Expect<Boolean>(FileExists(TimedMirror.Root + '/objects/sha256/'
+      + Copy(Packages[0].ArchiveHash, 8, 64))).ToBe(True);
+  finally
+    Server.Free;
+    TimedMirror.Free;
+    Origin.Free;
+  end;
+end;
+
 procedure TMirrorTransferTests.CLIInterruptionReusesCompletedPair;
 var
   Server: TRegistryTestServer;
@@ -583,6 +640,7 @@ begin
   Test('conflicting signed sizes fail before any archive request', ConflictingSizesFailBeforeFetch);
   Test('failed sibling drains without third admission and retains verified retry objects', FailedSiblingDrainsAndRetainsVerifiedObject);
   Test('checkpoint expiry during archive transfer prevents activation', ExpiryDuringTransferPreventsActivation);
+  Test('checkpoint expiry after verification and storage prevents activation', ExpiryBeforeActivationPreventsPublication);
   Test('actual CLI interruption resumes a verified archive pair', CLIInterruptionReusesCompletedPair);
   Test('concurrent fixture closes an incomplete client inside a child watchdog', IncompleteClientShutdownIsBounded);
 end;

@@ -35,6 +35,7 @@ type
   public
     procedure SetupTests; override;
     procedure BootstrapOutageAndRestart;
+    procedure MirrorClientVerifiesOriginDuringOutage;
     procedure IncrementalSyncReusesVerifiedObjects;
     procedure FailedSyncPreservesAcceptedPointer;
     procedure MissingAndWrongPinsFailClosed;
@@ -180,6 +181,90 @@ begin
   Run := RunLwpt(['registry', 'verify', '--data-dir', FMirrorRoot]);
   RequireSuccess('verify records failed sync without losing fresh content', Run);
   Expect<Boolean>(Pos('registry_transport_failed', Run.Stdout) > 0).ToBe(True);
+end;
+
+procedure TRegistryMirrorE2E.MirrorClientVerifiesOriginDuringOutage;
+var
+  Replay: TRegistryTestServer;
+  Routes: TRegistryHTTPRouteArray;
+  Archive, Signature: TBytes;
+  ClientRoot, ClientURL, ReplayURL, ArtifactHash, Checkpoint, SignatureText: string;
+  Run: TLwptResult;
+  Port: Word;
+  Offset: Integer;
+
+  function InitClient(const ARoot, AUpstream: string): TLwptResult;
+  begin
+    Result := RunLwpt(['registry', 'init', '--role', 'mirror', '--data-dir', ARoot,
+      '--identity', FOrigin.BaseURL, '--base-url', ClientURL, '--port', IntToStr(Port),
+      '--upstream', AUpstream, '--key-id', FOrigin.KeyID, '--public-key', FOrigin.PublicKey]);
+  end;
+
+  procedure Capture(const APath, AKind: string; const ARewrite: Boolean = False);
+  var
+    Body: TBytes;
+  begin
+    Body := RegistryHTTPBody(FMirrorURL + APath);
+    if ARewrite then
+      Body := BytesOf(StringReplace(Text(Body), FMirrorURL, ReplayURL, [rfReplaceAll]));
+    SetLength(Routes, Length(Routes) + 1);
+    Routes[High(Routes)] := RegistryRoute('/replay' + APath,
+      'application/vnd.' + RegistryProgramName + '.registry-' + AKind + '+toml', Body);
+  end;
+
+begin
+  Archive := BytesOf('origin-bound archive' + #0 + 'binary');
+  ArtifactHash := RegistryArtifactHash(Archive);
+  FOrigin.Publish('verified-package', '1.0.0', Archive);
+  FOrigin.Start;
+  RequireSuccess('first mirror init', InitMirror(FOrigin.KeyID, FOrigin.PublicKey));
+  RequireSuccess('first mirror sync', Sync);
+  FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
+  FOrigin.Stop;
+  Checkpoint := Text(RegistryHTTPBody(FMirrorURL + '/v1/checkpoints/latest.toml'));
+  Port := ReserveRegistryTestPort;
+  ClientURL := 'http://localhost:' + IntToStr(Port) + '/client';
+  ClientRoot := FScratch + '/client';
+  RequireSuccess('second mirror pins origin while contacting first mirror', InitClient(ClientRoot, FMirrorURL));
+  RequireSuccess('second mirror bootstrap during origin outage',
+    RunLwpt(['registry', 'sync', '--data-dir', ClientRoot]));
+  RequireSuccess('second mirror repeated sync during origin outage',
+    RunLwpt(['registry', 'sync', '--data-dir', ClientRoot]));
+  Run := RunLwpt(['registry', 'verify', '--data-dir', ClientRoot]);
+  RequireSuccess('second mirror verifies retained origin proof and artifact', Run);
+  Expect<Boolean>(Pos('origin = "' + FOrigin.BaseURL + '"', Run.Stdout) > 0).ToBe(True);
+  Expect<string>(RegistryArtifactHash(ReadBytes(ClientRoot + '/objects/sha256/'
+    + Copy(ArtifactHash, 8, 64)))).ToBe(ArtifactHash);
+  Expect<string>(Field(Text(ReadBytes(ClientRoot + '/state/current.toml')), 'checkpoint_hash'))
+    .ToBe(RegistryArtifactHash(BytesOf(Checkpoint)));
+
+  Replay := TRegistryTestServer.Create(nil);
+  try
+    ReplayURL := 'http://localhost:' + IntToStr(Replay.Port) + '/replay';
+    Capture('/.well-known/' + RegistryProgramName + '-registry', 'discovery', True);
+    Capture('/v1/capabilities', 'capabilities', True);
+    Capture('/v1/checkpoints/latest.toml', 'checkpoint');
+    Capture('/v1/checkpoints/latest.sig.toml', 'signature');
+    Signature := Routes[High(Routes)].Body;
+    SignatureText := Text(Signature);
+    Offset := Pos('signature = "hex:', SignatureText) + Length('signature = "hex:');
+    Expect<Boolean>(Offset > Length('signature = "hex:')).ToBe(True);
+    if SignatureText[Offset] = '0' then SignatureText[Offset] := '1'
+    else SignatureText[Offset] := '0';
+    Routes[High(Routes)].Body := BytesOf(SignatureText);
+    Capture('/v1/keys/' + FOrigin.KeyID + '.toml', 'key');
+    Replay.SetRoutes(Routes);
+    Replay.Start;
+    StopRegistryCLI(FMirrorServer);
+    ClientRoot := FScratch + '/rejected-client';
+    RequireSuccess('tampered replay client retains same origin pin', InitClient(ClientRoot, ReplayURL));
+    Run := RunLwpt(['registry', 'sync', '--data-dir', ClientRoot]);
+    Expect<Integer>(Run.ExitCode).ToBe(1);
+    Expect<Boolean>(Pos('signature_invalid', Run.Stderr + Run.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(FileExists(ClientRoot + '/state/current.toml')).ToBe(False);
+  finally
+    Replay.Free;
+  end;
 end;
 
 procedure TRegistryMirrorE2E.IncrementalSyncReusesVerifiedObjects;
@@ -493,6 +578,7 @@ end;
 procedure TRegistryMirrorE2E.SetupTests;
 begin
   Test('CLI mirror bootstrap survives origin outage and restart', BootstrapOutageAndRestart);
+  Test('origin-pinned mirror client verifies served mirror bytes and rejects altered signature', MirrorClientVerifiesOriginDuringOutage);
   Test('incremental and idempotent sync reuse verified objects', IncrementalSyncReusesVerifiedObjects);
   Test('tampered or missing objects preserve the live accepted pointer', FailedSyncPreservesAcceptedPointer);
   Test('missing and wrong root pins fail without trust replacement', MissingAndWrongPinsFailClosed);

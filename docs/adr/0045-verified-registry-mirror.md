@@ -94,7 +94,10 @@ followed, encoded response bodies are rejected, and discovery endpoints must
 remain under the configured upstream base URL.
 
 Synchronization checks current expiry before fetching content and again
-immediately before activation. Local verification and serving retain exact
+immediately before activation, after retained-proof verification and immutable
+resource writes. The final check compares fresh UTC with the already
+authenticated expiry and does not repeat cryptographic verification. Local
+verification and serving retain exact
 accepted proof without renewing or changing its timestamps. `verify` reports
 `fresh`, `expired`, or `uninitialized`; an expired retained proof does not
 authorize acquisition. The current transfer resumes at verified-object
