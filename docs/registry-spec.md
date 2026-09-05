@@ -678,6 +678,34 @@ protocol.
 The executable mirror lifecycle, local storage, transfer limits, and freshness
 diagnostics are defined in [ADR-0045](adr/0045-verified-registry-mirror.md).
 
+## Client contact selection and failover
+
+For online acquisition, clients MUST try configured mirrors in declaration
+order, followed by the configured origin endpoint, stopping at the first
+successfully verified discovery and proof transaction. Each attempt MUST use
+one contact with the same expected origin identity, configured trust root,
+and previously accepted per-origin history. Changing contact MUST NOT replace
+those trust inputs or change package identity.
+
+A request-layer failure MUST advance to the next configured contact when one
+remains. This includes HTTPClient exceptions, including HTTP framing, read,
+and response-body-limit errors, and non-2xx HTTP responses. After a successful
+HTTP response, media-type, encoding, metadata, schema, identity, signature,
+hash, history, or expiry validation failure MUST abort acquisition instead of
+trying another contact. Redirects remain subject to the transport and identity
+revalidation requirements under [Errors and HTTP behavior](#errors-and-http-behavior).
+
+Archive fetching MUST NOT automatically select an alternate contact. A failed
+install MUST preserve committed project state; a subsequent explicit online
+acquisition may select contacts again. Frozen and offline operations MUST NOT
+select contacts or construct a network transport. They follow the retained
+identity and [locked-proof rules](#acquisition-and-locked-proof-verification),
+including their explicit expiry policy.
+
+This defines the client policy, not a claim that the mirror service ships an
+installer consumer. [Issue #62](https://github.com/frostney/lwpt/issues/62) owns
+dependency-consumer integration; its manifest syntax is outside this protocol.
+
 ## Errors and HTTP behavior
 
 Errors use `application/vnd.lwpt.registry-error+toml`:
