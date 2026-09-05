@@ -29,13 +29,15 @@ type
   public
     procedure Recover; override;
     function LoadCurrentState(AProgress: TSHA256Progress = nil): TLWPTRegistryState; override;
-    function ResourceIsPublished(const AState: TLWPTRegistryState;
-      const ARelative: string; AProgress: TSHA256Progress = nil): Boolean; override;
+    function CaptureReadView(AProgress: TSHA256Progress = nil): TLWPTRegistryReadView; override;
     procedure Synchronize;
     function VerifyMirror: string;
   end;
 
 procedure ValidateMirrorConfiguration(const AConfig: TLWPTRegistryConfig);
+{$IFDEF REGISTRY_TESTING}
+function RegistryMirrorProofChecksForTesting: Integer;
+{$ENDIF}
 
 implementation
 
@@ -49,6 +51,16 @@ uses
 const
   MIRROR_REQUEST_TIMEOUT_MS = 120 * 1000;
   MIRROR_ATTEMPT_PATH = 'state/sync-attempt.toml';
+
+{$IFDEF REGISTRY_TESTING}
+var
+  MirrorProofChecks: Integer;
+
+function RegistryMirrorProofChecksForTesting: Integer;
+begin
+  Result := MirrorProofChecks;
+end;
+{$ENDIF}
 
 type
   TMirrorDocumentSource = class(TLWPTRegistryDocumentSource)
@@ -216,6 +228,9 @@ var
   end;
 begin
   Prefix := 'checkpoints/renewals/sha256/' + Copy(AState.CheckpointHash, 8, 64);
+  {$IFDEF REGISTRY_TESTING}
+  InterlockedIncrement(MirrorProofChecks);
+  {$ENDIF}
   if not RegistryHashIsCanonical(AState.CheckpointHash)
     or (AState.CheckpointPath <> Prefix + '.toml')
     or (AState.SignaturePath <> Prefix + '.sig.toml') then
@@ -271,32 +286,43 @@ begin
   VerifyStateProof(Result, AProgress);
 end;
 
-function TLWPTRegistryMirror.ResourceIsPublished(const AState: TLWPTRegistryState;
-  const ARelative: string; AProgress: TSHA256Progress): Boolean;
+function TLWPTRegistryMirror.CaptureReadView(AProgress: TSHA256Progress): TLWPTRegistryReadView;
 var
+  State: TLWPTRegistryState;
   Verified: TLWPTVerifiedRegistry;
   Document: TLWPTRegistryDocument;
   RotationProof: TLWPTRegistryRotationProof;
   Rotation: TLWPTUntrustedRegistryRotation;
   Prefix: string;
+  Paths, Rotations: TStringList;
 begin
-  if StartsStr('checkpoints/', ARelative) then
-    Exit((ARelative = AState.CheckpointPath) or (ARelative = AState.SignaturePath));
-  if not StartsStr('snapshots/', ARelative) and not StartsStr('rotations/', ARelative)
-    and not StartsStr('keys/', ARelative) then Exit(True);
-  Verified := VerifyStateProof(AState, AProgress);
-  if ARelative = RegistryKeyStoragePath(Config.TrustKeyID) then Exit(True);
-  for RotationProof in Verified.Proof.Rotations do
-  begin
-    Rotation := InspectRegistryRotation(RotationProof.Document);
-    Prefix := 'rotations/' + IntToStr(Rotation.EffectiveSequence);
-    if (ARelative = Prefix + '.toml') or (ARelative = Prefix + '.old.sig.toml')
-      or (ARelative = Prefix + '.new.sig.toml')
-      or (ARelative = RegistryKeyStoragePath(Rotation.ToKey)) then Exit(True);
+  State := ReadCurrentState(AProgress);
+  Verified := VerifyStateProof(State, AProgress);
+  Paths := TStringList.Create;
+  Rotations := TStringList.Create;
+  try
+    Paths.Add(State.CheckpointPath);
+    Paths.Add(State.SignaturePath);
+    Paths.Add(RegistryKeyStoragePath(Config.TrustKeyID));
+    for Document in Verified.Documents do
+      if StartsStr('snapshots/', Document.Path) then Paths.Add(Document.Path);
+    for RotationProof in Verified.Proof.Rotations do
+    begin
+      Rotation := InspectRegistryRotation(RotationProof.Document);
+      Rotations.Add(IntToStr(Rotation.EffectiveSequence));
+      Prefix := 'rotations/' + IntToStr(Rotation.EffectiveSequence);
+      Paths.Add(Prefix + '.toml');
+      Paths.Add(Prefix + '.old.sig.toml');
+      Paths.Add(Prefix + '.new.sig.toml');
+      Paths.Add(RegistryKeyStoragePath(Rotation.ToKey));
+    end;
+    Result := TLWPTRegistryReadView.Create(Self, State, Paths, Rotations);
+    Paths := nil;
+    Rotations := nil;
+  finally
+    Rotations.Free;
+    Paths.Free;
   end;
-  for Document in Verified.Documents do
-    if Document.Path = ARelative then Exit(True);
-  Result := False;
 end;
 
 procedure TLWPTRegistryMirror.SaveAttempt(const AOutcome: string);

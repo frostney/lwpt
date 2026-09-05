@@ -40,7 +40,7 @@ Per the freeze policy (ADR-0017): **all the below are LWPT-canonical; GocciaScri
 
 | GocciaScript path | LWPT-canonical path | Status | Notes |
 |------|---------------------|--------|-------|
-| `source/shared/HTTPClient.pas` | `packages/httpclient/source/HTTPClient.pas` | **Diverged** (LWPT ahead) | Four byte-safety fixes — header-recv accumulator + chunked-body seed-buffer cast — plus byte-safe POST, generated entity headers, and explicit redirect semantics. Without the byte fixes, every binary download corrupts at the first `#0` byte. |
+| `source/shared/HTTPClient.pas` | `packages/httpclient/source/HTTPClient.pas` | **Diverged** (LWPT ahead) | Four byte-safety fixes — header-recv accumulator + chunked-body seed-buffer cast — plus byte-safe POST, generated entity headers, and explicit redirect semantics. Version 0.4.1 also uses native Linux and Darwin system hostname resolution while preserving the original Host and TLS names. Without the byte fixes, every binary download corrupts at the first `#0` byte. |
 | `source/shared/TransportSecurity.pas` | `packages/httpclient/source/TransportSecurity.pas` | **Diverged** (LWPT ahead) | Server accept, independently bounded encrypted-input/output flow, input counters, watermark admission, strict identity validation, and atomic snapshot reload live only in the LWPT-canonical package pending GocciaScript Path A adoption; the Duetto companion update is tracked separately. |
 | `source/shared/FileUtils.pas` | `packages/httpclient/source/FileUtils.pas` | Identical | |
 | `source/shared/StringBuffer.pas` | `packages/httpclient/source/StringBuffer.pas` + `packages/cli/source/StringBuffer.pas` | Identical | Bundled copy in each consuming package per ADR-0014 |

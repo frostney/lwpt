@@ -459,7 +459,7 @@ begin
 end;
 
 function RotationPageResponse(AStore: TLWPTRegistryStore;
-  const AState: TLWPTRegistryState; const AQuery: string;
+  AView: TLWPTRegistryReadView; const AQuery: string;
   AProgress: TSHA256Progress): TLWPTRegistryHTTPResponse;
 var
   Parameters, Sequences, Seen: TStringList;
@@ -512,7 +512,7 @@ begin
         or (Cursor <> CursorFor(LastSequence)) then
         Exit(ErrorResponse(400, 'Bad Request', 'invalid_cursor', 'rotation cursor scope mismatch'));
     end;
-    Sequences := AStore.RotationSequences(AState, AProgress);
+    Sequences := AView.RotationSequences(AProgress);
     Count := 0;
     NextCursor := '';
     Body := 'schema = ' + RegistryTOMLQuote(PROGRAM_NAME + '-registry-rotation-page-v1') + #10
@@ -546,7 +546,6 @@ begin
     Result.Body := Bytes(Body);
   finally
     Seen.Free;
-    Sequences.Free;
     Parameters.Free;
   end;
 end;
@@ -557,6 +556,7 @@ function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
 var
   APIPath, Digest, KeyID, Prefix, Relative, RequestID, RoleName, Target, Query: string;
   State: TLWPTRegistryState;
+  View: TLWPTRegistryReadView;
 begin
   RoleName := 'origin';
   if AStore.Config.Role = rrMirror then RoleName := 'mirror';
@@ -655,94 +655,99 @@ begin
       + 'max_page_size = 100' + #10);
     Exit;
   end;
-  State := AStore.LoadCurrentState(AProgress);
-  if APIPath = '/v1/rotations' then Exit(RotationPageResponse(AStore, State, Query, AProgress));
-  if StartsStr('/v1/rotations/', APIPath) then
-  begin
-    Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
-    if not AStore.ResourceIsPublished(State, Relative, AProgress) then
-      Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
-    if EndsStr('.sig.toml', Relative) then Digest := 'signature'
-    else Digest := 'key-rotation';
-    Exit(ResourceResponse(AStore, Relative, 'application/vnd.' + PROGRAM_NAME
-      + '.registry-' + Digest + '+toml', '', '', True, AProgress));
-  end;
-  if APIPath = '/v1/checkpoints/latest.toml' then
-    Exit(ResourceResponse(AStore, State.CheckpointPath,
-      'application/vnd.' + PROGRAM_NAME + '.registry-checkpoint+toml', '',
-      '', False, AProgress));
-  if APIPath = '/v1/checkpoints/latest.sig.toml' then
-    Exit(ResourceResponse(AStore, State.SignaturePath,
-      'application/vnd.' + PROGRAM_NAME + '.registry-signature+toml', '',
-      '', False, AProgress));
-  if StartsStr('/v1/objects/sha256/', APIPath) then
-  begin
-    Digest := Copy(APIPath, Length('/v1/objects/sha256/') + 1, MaxInt);
-    if not IsLowerHex64(Digest) then
-      Exit(ErrorResponse(404, 'Not Found', 'not_found',
-        'registry resource was not found'));
-    Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
-    Exit(ResourceResponse(AStore, Relative, 'application/gzip',
-      '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
-  end;
-  if StartsStr('/v1/records/sha256/', APIPath) then
-  begin
-    Digest := Copy(APIPath, Length('/v1/records/sha256/') + 1,
-      Length(APIPath) - Length('/v1/records/sha256/') - Length('.toml'));
-    if not EndsStr('.toml', APIPath) or not IsLowerHex64(Digest) then
-      Exit(ErrorResponse(404, 'Not Found', 'not_found',
-        'registry resource was not found'));
-    Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
-    Exit(ResourceResponse(AStore, Relative,
-      'application/vnd.' + PROGRAM_NAME + '.registry-package+toml',
-      '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
-  end;
-  if StartsStr('/v1/snapshots/sha256/', APIPath) then
-  begin
-    Digest := Copy(APIPath, Length('/v1/snapshots/sha256/') + 1,
-      Length(APIPath) - Length('/v1/snapshots/sha256/') - Length('.toml'));
-    if not EndsStr('.toml', APIPath) or not IsLowerHex64(Digest) then
-      Exit(ErrorResponse(404, 'Not Found', 'not_found',
-        'registry resource was not found'));
-    Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
-    if not AStore.ResourceIsPublished(State, Relative, AProgress) then
-      Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
-    Exit(ResourceResponse(AStore, Relative,
-      'application/vnd.' + PROGRAM_NAME + '.registry-snapshot+toml',
-      '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
-  end;
-  if StartsStr('/v1/keys/ed25519:', APIPath) then
-  begin
-    KeyID := Copy(APIPath, Length('/v1/keys/') + 1,
-      Length(APIPath) - Length('/v1/keys/') - Length('.toml'));
-    if not EndsStr('.toml', APIPath) or not StartsStr('ed25519:', KeyID)
-      or not IsLowerHex64(Copy(KeyID, Length('ed25519:') + 1,
-        MaxInt)) then
-      Exit(ErrorResponse(404, 'Not Found', 'not_found',
-        'registry resource was not found'));
-    Relative := RegistryKeyStoragePath(KeyID);
-    if not AStore.ResourceIsPublished(State, Relative, AProgress) then
-      Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
-    Exit(ResourceResponse(AStore, Relative,
-      'application/vnd.' + PROGRAM_NAME + '.registry-key+toml', '', '',
-      True, AProgress));
-  end;
-  if StartsStr('/v1/checkpoints/', APIPath) then
-  begin
-    Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
-    if not AStore.ResourceIsPublished(State, Relative, AProgress) then
-      Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
-    if EndsStr('.sig.toml', APIPath) then
-      Exit(ResourceResponse(AStore, Relative,
-        'application/vnd.' + PROGRAM_NAME + '.registry-signature+toml', '',
-        '', False, AProgress));
-    if EndsStr('.toml', APIPath) then
-      Exit(ResourceResponse(AStore, Relative,
+  View := AStore.CaptureReadView(AProgress);
+  try
+    State := View.State;
+    if APIPath = '/v1/rotations' then Exit(RotationPageResponse(AStore, View, Query, AProgress));
+    if StartsStr('/v1/rotations/', APIPath) then
+    begin
+      Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
+      if not View.ResourceIsPublished(Relative, AProgress) then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
+      if EndsStr('.sig.toml', Relative) then Digest := 'signature'
+      else Digest := 'key-rotation';
+      Exit(ResourceResponse(AStore, Relative, 'application/vnd.' + PROGRAM_NAME
+        + '.registry-' + Digest + '+toml', '', '', True, AProgress));
+    end;
+    if APIPath = '/v1/checkpoints/latest.toml' then
+      Exit(ResourceResponse(AStore, State.CheckpointPath,
         'application/vnd.' + PROGRAM_NAME + '.registry-checkpoint+toml', '',
         '', False, AProgress));
+    if APIPath = '/v1/checkpoints/latest.sig.toml' then
+      Exit(ResourceResponse(AStore, State.SignaturePath,
+        'application/vnd.' + PROGRAM_NAME + '.registry-signature+toml', '',
+        '', False, AProgress));
+    if StartsStr('/v1/objects/sha256/', APIPath) then
+    begin
+      Digest := Copy(APIPath, Length('/v1/objects/sha256/') + 1, MaxInt);
+      if not IsLowerHex64(Digest) then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found',
+          'registry resource was not found'));
+      Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
+      Exit(ResourceResponse(AStore, Relative, 'application/gzip',
+        '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
+    end;
+    if StartsStr('/v1/records/sha256/', APIPath) then
+    begin
+      Digest := Copy(APIPath, Length('/v1/records/sha256/') + 1,
+        Length(APIPath) - Length('/v1/records/sha256/') - Length('.toml'));
+      if not EndsStr('.toml', APIPath) or not IsLowerHex64(Digest) then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found',
+          'registry resource was not found'));
+      Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
+      Exit(ResourceResponse(AStore, Relative,
+        'application/vnd.' + PROGRAM_NAME + '.registry-package+toml',
+        '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
+    end;
+    if StartsStr('/v1/snapshots/sha256/', APIPath) then
+    begin
+      Digest := Copy(APIPath, Length('/v1/snapshots/sha256/') + 1,
+        Length(APIPath) - Length('/v1/snapshots/sha256/') - Length('.toml'));
+      if not EndsStr('.toml', APIPath) or not IsLowerHex64(Digest) then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found',
+          'registry resource was not found'));
+      Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
+      if not View.ResourceIsPublished(Relative, AProgress) then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
+      Exit(ResourceResponse(AStore, Relative,
+        'application/vnd.' + PROGRAM_NAME + '.registry-snapshot+toml',
+        '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
+    end;
+    if StartsStr('/v1/keys/ed25519:', APIPath) then
+    begin
+      KeyID := Copy(APIPath, Length('/v1/keys/') + 1,
+        Length(APIPath) - Length('/v1/keys/') - Length('.toml'));
+      if not EndsStr('.toml', APIPath) or not StartsStr('ed25519:', KeyID)
+        or not IsLowerHex64(Copy(KeyID, Length('ed25519:') + 1,
+          MaxInt)) then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found',
+          'registry resource was not found'));
+      Relative := RegistryKeyStoragePath(KeyID);
+      if not View.ResourceIsPublished(Relative, AProgress) then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
+      Exit(ResourceResponse(AStore, Relative,
+        'application/vnd.' + PROGRAM_NAME + '.registry-key+toml', '', '',
+        True, AProgress));
+    end;
+    if StartsStr('/v1/checkpoints/', APIPath) then
+    begin
+      Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
+      if not View.ResourceIsPublished(Relative, AProgress) then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
+      if EndsStr('.sig.toml', APIPath) then
+        Exit(ResourceResponse(AStore, Relative,
+          'application/vnd.' + PROGRAM_NAME + '.registry-signature+toml', '',
+          '', False, AProgress));
+      if EndsStr('.toml', APIPath) then
+        Exit(ResourceResponse(AStore, Relative,
+          'application/vnd.' + PROGRAM_NAME + '.registry-checkpoint+toml', '',
+          '', False, AProgress));
+    end;
+    Result := ErrorResponse(404, 'Not Found', 'not_found',
+      'registry resource was not found');
+  finally
+    View.Free;
   end;
-  Result := ErrorResponse(404, 'Not Found', 'not_found',
-    'registry resource was not found');
 end;
 
 function RegistryHTTPWireResponse(const AResponse: TLWPTRegistryHTTPResponse;

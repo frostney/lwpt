@@ -63,6 +63,28 @@ type
     Archive: TBytes;
   end;
 
+  TLWPTRegistryStore = class;
+
+  { One authenticated pointer and its request-owned metadata membership.
+    The store must outlive the view; no membership survives this request. }
+  TLWPTRegistryReadView = class
+  private
+    FStore: TLWPTRegistryStore;
+    FState: TLWPTRegistryState;
+    FPublishedPaths, FSnapshotPaths, FRotations: TStringList;
+  public
+    { Takes ownership of supplied verified membership lists. Nil membership
+      selects origin policy with lazy history validation. }
+    constructor Create(AStore: TLWPTRegistryStore; const AState: TLWPTRegistryState;
+      APublishedPaths: TStringList = nil; ARotations: TStringList = nil);
+    destructor Destroy; override;
+    function ResourceIsPublished(const ARelative: string;
+      AProgress: TSHA256Progress = nil): Boolean;
+    { Returned list belongs to this view and must not be changed or freed. }
+    function RotationSequences(AProgress: TSHA256Progress = nil): TStringList;
+    property State: TLWPTRegistryState read FState;
+  end;
+
   TLWPTRegistryStore = class
   private
     FRoot: string;
@@ -94,8 +116,7 @@ type
       out ASize: Int64);
     function LoadCurrentState(AProgress: TSHA256Progress = nil):
       TLWPTRegistryState; virtual;
-    function ResourceIsPublished(const AState: TLWPTRegistryState;
-      const ARelative: string; AProgress: TSHA256Progress = nil): Boolean; virtual;
+    function CaptureReadView(AProgress: TSHA256Progress = nil): TLWPTRegistryReadView; virtual;
     function RotationSequences(const AState: TLWPTRegistryState;
       AProgress: TSHA256Progress = nil): TStringList;
     function LoadResource(const ARelative: string;
@@ -2044,47 +2065,117 @@ begin
   end;
 end;
 
-function TLWPTRegistryStore.ResourceIsPublished(const AState: TLWPTRegistryState;
-  const ARelative: string; AProgress: TSHA256Progress): Boolean;
+type
+  TRegistryStoredDocumentSource = class(TLWPTRegistryDocumentSource)
+  public
+    Store: TLWPTRegistryStore;
+    Progress: TSHA256Progress;
+    function ReadDocument(const APath: string; const AMaximumBytes: Int64): TBytes; override;
+  end;
+
+function TRegistryStoredDocumentSource.ReadDocument(const APath: string;
+  const AMaximumBytes: Int64): TBytes;
+begin
+  Result := Store.LoadResource(APath, Progress, AMaximumBytes);
+end;
+
+constructor TLWPTRegistryReadView.Create(AStore: TLWPTRegistryStore;
+  const AState: TLWPTRegistryState; APublishedPaths, ARotations: TStringList);
+begin
+  inherited Create;
+  FStore := AStore;
+  FState := AState;
+  FPublishedPaths := APublishedPaths;
+  if FPublishedPaths <> nil then FPublishedPaths.CaseSensitive := True;
+  FRotations := ARotations;
+end;
+
+destructor TLWPTRegistryReadView.Destroy;
+begin
+  FRotations.Free;
+  FSnapshotPaths.Free;
+  FPublishedPaths.Free;
+  inherited Destroy;
+end;
+
+function TLWPTRegistryStore.CaptureReadView(AProgress: TSHA256Progress): TLWPTRegistryReadView;
+begin
+  Result := TLWPTRegistryReadView.Create(Self, LoadCurrentState(AProgress));
+end;
+
+function TLWPTRegistryReadView.RotationSequences(AProgress: TSHA256Progress): TStringList;
+begin
+  if FRotations = nil then FRotations := FStore.RotationSequences(FState, AProgress);
+  Result := FRotations;
+end;
+
+function TLWPTRegistryReadView.ResourceIsPublished(const ARelative: string;
+  AProgress: TSHA256Progress): Boolean;
 var
-  Sequences: TStringList;
   Entry, Name: string;
   Sequence: Int64;
   Rotation: TLWPTUntrustedRegistryRotation;
+  Source: TRegistryStoredDocumentSource;
+  Document: TLWPTRegistryDocument;
+  Paths: TStringList;
 begin
+  if FPublishedPaths <> nil then
+  begin
+    if StartsStr('checkpoints/', ARelative) or StartsStr('snapshots/', ARelative)
+      or StartsStr('rotations/', ARelative) or StartsStr('keys/', ARelative) then
+      Exit(FPublishedPaths.IndexOf(ARelative) >= 0);
+    Exit(True);
+  end;
+  if StartsStr('snapshots/', ARelative) then
+  begin
+    if FSnapshotPaths = nil then
+    begin
+      Source := TRegistryStoredDocumentSource.Create;
+      Paths := TStringList.Create;
+      Paths.CaseSensitive := True;
+      try
+        Source.Store := FStore;
+        Source.Progress := AProgress;
+        for Document in VerifyRegistrySnapshotHistory(FStore.Config.Identity,
+          FState.SnapshotHash, FState.Sequence, Source, DefaultRegistryVerificationLimits) do
+          if StartsStr('snapshots/', Document.Path) then Paths.Add(Document.Path);
+        FSnapshotPaths := Paths;
+        Paths := nil;
+      finally
+        Paths.Free;
+        Source.Free;
+      end;
+    end;
+    Exit(FSnapshotPaths.IndexOf(ARelative) >= 0);
+  end;
   if StartsStr('checkpoints/', ARelative) then
   begin
-    if (ARelative = AState.CheckpointPath) or (ARelative = AState.SignaturePath) then Exit(True);
+    if (ARelative = FState.CheckpointPath) or (ARelative = FState.SignaturePath) then Exit(True);
     Name := Copy(ARelative, Length('checkpoints/') + 1, MaxInt);
     if EndsStr('.sig.toml', Name) then Delete(Name, Length(Name) - 8, 9)
     else if EndsStr('.toml', Name) then Delete(Name, Length(Name) - 4, 5)
     else Exit(False);
     Exit(TryStrToInt64(Name, Sequence) and (Sequence > 0)
-      and (IntToStr(Sequence) = Name) and (QWord(Sequence) <= AState.Sequence));
+      and (IntToStr(Sequence) = Name) and (QWord(Sequence) <= FState.Sequence));
   end;
   if StartsStr('rotations/', ARelative) or StartsStr('keys/', ARelative) then
   begin
     if StartsStr('keys/', ARelative)
-      and (ARelative = RegistryKeyStoragePath(StringValue(Text(LoadResource('checkpoints/1.toml',
+      and (ARelative = RegistryKeyStoragePath(StringValue(Text(FStore.LoadResource('checkpoints/1.toml',
         AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES)), 'key_id'))) then Exit(True);
-    Sequences := RotationSequences(AState, AProgress);
-    try
-      for Entry in Sequences do
+    for Entry in RotationSequences(AProgress) do
+    begin
+      if (ARelative = 'rotations/' + Entry + '.toml')
+        or (ARelative = 'rotations/' + Entry + '.old.sig.toml')
+        or (ARelative = 'rotations/' + Entry + '.new.sig.toml') then Exit(True);
+      if StartsStr('keys/', ARelative) then
       begin
-        if (ARelative = 'rotations/' + Entry + '.toml')
-          or (ARelative = 'rotations/' + Entry + '.old.sig.toml')
-          or (ARelative = 'rotations/' + Entry + '.new.sig.toml') then Exit(True);
-        if StartsStr('keys/', ARelative) then
-        begin
-          Rotation := InspectRegistryRotation(LoadResource('rotations/' + Entry + '.toml',
-            AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
-          if ARelative = RegistryKeyStoragePath(Rotation.ToKey) then Exit(True);
-        end;
+        Rotation := InspectRegistryRotation(FStore.LoadResource('rotations/' + Entry + '.toml',
+          AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+        if ARelative = RegistryKeyStoragePath(Rotation.ToKey) then Exit(True);
       end;
-      Exit(False);
-    finally
-      Sequences.Free;
     end;
+    Exit(False);
   end;
   Result := True;
 end;

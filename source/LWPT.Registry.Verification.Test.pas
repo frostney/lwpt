@@ -12,6 +12,8 @@ uses
 
   LWPT.Core,
   LWPT.Registry.Crypto,
+  LWPT.Registry.Mirror,
+  LWPT.Registry.Server,
   LWPT.Registry.Store,
   LWPT.Registry.Verification,
   TestingPascalLibrary,
@@ -25,6 +27,12 @@ const
   ROOT_RECORD = 'sha256:6b464cebeb83b982d076b52f4152b05623fa410fef78c0ce159422097eff4948';
 
 type
+  TMirrorFixtureStore = class(TLWPTRegistryMirror)
+  public
+    procedure Retain(const AVerified: TLWPTVerifiedRegistry);
+    procedure Corrupt(const APath: string);
+  end;
+
   TFixtureSource = class(TLWPTRegistryDocumentSource)
   public
     Overrides: TDictionary<string, TBytes>;
@@ -91,6 +99,7 @@ type
     procedure PinnedKeyDocumentValidated;
     procedure RotationPagesAreBoundedAndCanonical;
     procedure RetrievalDocumentsShareProofBudget;
+    procedure MirrorReadViewReusesCapturedProof;
   end;
 
 function ReadFixture(const APath: string): TBytes;
@@ -134,6 +143,112 @@ begin
     end;
   finally
     Parser.Free;
+  end;
+end;
+
+procedure TMirrorFixtureStore.Retain(const AVerified: TLWPTVerifiedRegistry);
+const
+  KeyNames: array[0..1] of string = ('root', 'rotated');
+var
+  State: TLWPTRegistryState;
+  Document: TLWPTRegistryDocument;
+  Rotation: TLWPTRegistryRotationProof;
+  KeyBytes: TBytes;
+  Prefix, KeyName: string;
+begin
+  for Document in AVerified.Documents do WriteImmutable(Document.Path, Document.Bytes);
+  for KeyName in KeyNames do
+  begin
+    KeyBytes := ReadFixture('keys/' + KeyName + '.toml');
+    WriteImmutable(RegistryKeyStoragePath(Field(KeyBytes, 'key_id')), KeyBytes);
+  end;
+  for Rotation in AVerified.Proof.Rotations do
+  begin
+    Prefix := 'rotations/' + IntToStr(InspectRegistryRotation(Rotation.Document).EffectiveSequence);
+    WriteImmutable(Prefix + '.toml', Rotation.Document);
+    WriteImmutable(Prefix + '.old.sig.toml', Rotation.OldSignature);
+    WriteImmutable(Prefix + '.new.sig.toml', Rotation.NewSignature);
+  end;
+  State := Default(TLWPTRegistryState);
+  State.Sequence := AVerified.State.Sequence;
+  State.SnapshotHash := AVerified.State.Snapshot;
+  State.TrustKeyID := AVerified.State.KeyId;
+  State.TrustPublicKey := AVerified.State.PublicKey;
+  State.CheckpointHash := AVerified.State.CheckpointHash;
+  State.LastSync := EVALUATION_TIME;
+  Prefix := 'checkpoints/renewals/sha256/' + Copy(State.CheckpointHash, 8, 64);
+  State.CheckpointPath := Prefix + '.toml';
+  State.SignaturePath := Prefix + '.sig.toml';
+  WriteImmutable(State.CheckpointPath, AVerified.Proof.Checkpoint);
+  WriteImmutable(State.SignaturePath, AVerified.Proof.Signature);
+  ActivateState(State);
+end;
+
+procedure TMirrorFixtureStore.Corrupt(const APath: string);
+begin
+  AtomicWriteBytes(RootPath(APath), TmpRoot, AsBytes('tampered'));
+end;
+
+procedure TRegistryVerificationTests.MirrorReadViewReusesCapturedProof;
+var
+  Scratch, Path, Diagnostic: string;
+  Mirror: TMirrorFixtureStore;
+  View: TLWPTRegistryReadView;
+  Config: TLWPTRegistryConfig;
+  First, Latest: TLWPTVerifiedRegistry;
+  Before: Integer;
+  Paths: TStringList;
+begin
+  Scratch := CreateScratchRoot('registry-read-view');
+  Mirror := nil;
+  View := nil;
+  Paths := TStringList.Create;
+  try
+    Config := RegistryConfiguration(Trust.Origin, 'http://localhost:8181', 'localhost', 8181, '', '');
+    Config.Role := rrMirror;
+    Config.UpstreamURL := Trust.Origin;
+    Config.TrustKeyID := Trust.KeyId;
+    Config.TrustPublicKey := Trust.PublicKey;
+    Mirror := TMirrorFixtureStore(TMirrorFixtureStore.Initialize(Scratch, Config, EVALUATION_TIME));
+    First := Verify(Proof(1), Default(TLWPTRegistryAcceptedState));
+    Latest := Verify(Proof(5), First.State);
+    Mirror.Retain(First);
+    Before := RegistryMirrorProofChecksForTesting;
+    View := Mirror.CaptureReadView;
+    Mirror.Retain(Latest);
+    Expect<Boolean>(View.ResourceIsPublished('rotations/2.toml')).ToBe(False);
+    Expect<Boolean>(View.ResourceIsPublished('snapshots/sha256/' + Copy(Latest.State.Snapshot, 8, 64) + '.toml')).ToBe(False);
+    Expect<Boolean>(View.ResourceIsPublished('snapshots/sha256/' + Copy(First.State.Snapshot, 8, 64) + '.toml')).ToBe(True);
+    Expect<Boolean>(View.ResourceIsPublished('snapshots/sha256/' + UpperCase(Copy(First.State.Snapshot, 8, 64)) + '.toml')).ToBe(False);
+    Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(1);
+    Paths.Add('/v1/keys/' + Trust.KeyId + '.toml');
+    Paths.Add('/v1/keys/' + Latest.State.KeyId + '.toml');
+    Paths.Add('/v1/rotations/2.toml');
+    Paths.Add('/v1/rotations/2.old.sig.toml');
+    Paths.Add('/v1/rotations?after=0&limit=1');
+    Paths.Add('/v1/snapshots/sha256/' + Copy(Latest.State.Snapshot, 8, 64) + '.toml');
+    for Path in Paths do
+    begin
+      Before := RegistryMirrorProofChecksForTesting;
+      Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', Path).Status).ToBe(200);
+      Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(1);
+    end;
+    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/rotations/2.OLD.SIG.TOML').Status).ToBe(404);
+    Mirror.Corrupt('rotations/2.old.sig.toml');
+    Diagnostic := '';
+    Before := RegistryMirrorProofChecksForTesting;
+    try
+      RegistryHTTPResponse(Mirror, 'GET', Paths[0]);
+    except
+      on E: ELWPTRegistryError do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Diagnostic <> '').ToBe(True);
+    Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(1);
+  finally
+    Paths.Free;
+    View.Free;
+    Mirror.Free;
+    RecursiveDelete(Scratch);
   end;
 end;
 
@@ -911,6 +1026,7 @@ procedure TRegistryVerificationTests.SetupTests;
 begin
   Test('rotation pages enforce item counts, order, scope and canonical fields', RotationPagesAreBoundedAndCanonical);
   Test('retrieval pages and key documents share signed-proof aggregate limits', RetrievalDocumentsShareProofBudget);
+  Test('read views verify once and retain captured membership without a global cache', MirrorReadViewReusesCapturedProof);
   Test('key documents retain canonical bytes and match immutable trust and sequence', PinnedKeyDocumentValidated);
   Test('bootstrap and yank/restore corpus verifies', CorpusBootstrapAndLifecycle);
   Test('anchored history returns a complete offline bundle', AnchoredHistoryAndCompleteBundle);

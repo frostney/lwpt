@@ -1701,7 +1701,7 @@ const
 var
   Store: TLWPTRegistryStore;
   State: TLWPTRegistryState;
-  RootKey, PendingKey, RootPath, PointerBefore, Diagnostic: string;
+  RootKey, PendingKey, PendingSnapshot, RootPath, PointerBefore, Diagnostic: string;
   Index: Integer;
 begin
   for Index := 0 to High(Points) do
@@ -1726,6 +1726,14 @@ begin
       Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/rotations/2.old.sig.toml').Status).ToBe(404);
       Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/checkpoints/2.toml').Status).ToBe(404);
       Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/keys/' + PendingKey + '.toml').Status).ToBe(404);
+      if Points[Index] = 'rotation-checkpoint' then
+      begin
+        PendingSnapshot := InspectRegistryCheckpoint(Store.LoadResource('checkpoints/2.toml')).Snapshot;
+        Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/snapshots/sha256/'
+          + Copy(PendingSnapshot, 8, 64) + '.toml').Status).ToBe(404);
+      end;
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/snapshots/sha256/'
+        + Copy(State.SnapshotHash, 8, 64) + '.toml').Status).ToBe(200);
       Expect<string>(ReadBinaryFile(RootPath + '/state/current.toml')).ToBe(PointerBefore);
     finally
       SetFailurePoint('');
@@ -1739,6 +1747,8 @@ begin
       Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/rotations/2.new.sig.toml').Status).ToBe(200);
       Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/keys/' + PendingKey + '.toml').Status).ToBe(404);
       Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/checkpoints/1.toml').Status).ToBe(200);
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/snapshots/sha256/'
+        + Copy(State.SnapshotHash, 8, 64) + '.toml').Status).ToBe(200);
     finally
       Store.Free;
     end;
@@ -1748,6 +1758,7 @@ end;
 procedure TRegistryStoreContract.TestRotationActivationRetryAndSeedSelection;
 var
   Store: TLWPTRegistryStore;
+  View: TLWPTRegistryReadView;
   State: TLWPTRegistryState;
   Publication: TLWPTRegistryPublication;
   RootKey, ActiveKey, SeedPath, Diagnostic: string;
@@ -1806,8 +1817,23 @@ begin
     finally
       if not RenameFile(SeedPath + '.held', SeedPath) then RaiseLastOSError;
     end;
-    Store.Publish(Publication);
-    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(3);
+    View := Store.CaptureReadView;
+    try
+      Store.Publish(Publication);
+      State := Store.LoadCurrentState;
+      Expect<Int64>(State.Sequence).ToBe(3);
+      Expect<Int64>(View.State.Sequence).ToBe(2);
+      Expect<Boolean>(View.ResourceIsPublished('snapshots/sha256/'
+        + Copy(State.SnapshotHash, 8, 64) + '.toml')).ToBe(False);
+      Expect<Boolean>(View.ResourceIsPublished('snapshots/sha256/'
+        + Copy(View.State.SnapshotHash, 8, 64) + '.toml')).ToBe(True);
+      Expect<Boolean>(View.ResourceIsPublished('snapshots/sha256/'
+        + UpperCase(Copy(View.State.SnapshotHash, 8, 64)) + '.toml')).ToBe(False);
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/snapshots/sha256/'
+        + Copy(State.SnapshotHash, 8, 64) + '.toml').Status).ToBe(200);
+    finally
+      View.Free;
+    end;
     Store.EnsureFreshCheckpoint('2099-01-01T00:00:00Z');
     State := Store.LoadCurrentState;
     Expect<Int64>(State.Sequence).ToBe(3);

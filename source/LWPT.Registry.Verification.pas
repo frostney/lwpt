@@ -136,6 +136,12 @@ function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;
 function ParseRegistryPackage(const AContent, AExpectedHash,
   AExpectedOrigin: string): TLWPTRegistryPackage;
 
+{ The caller must authenticate the captured head first. This verifies its
+  complete hash-linked history and immutable package consistency, not trust. }
+function VerifyRegistrySnapshotHistory(const AOrigin, AHeadHash: string;
+  const ASequence: Int64; ASource: TLWPTRegistryDocumentSource;
+  const ALimits: TLWPTRegistryVerificationLimits): TLWPTRegistryDocumentArray;
+
 { Acquisition enforces expiry at evaluation time. Locked proof requires the
   exact already-recorded checkpoint identity and permits its later expiry.
   Prior state is caller-trusted, and must belong to the same pinned origin.
@@ -841,6 +847,8 @@ type
     procedure Account(const ABytes: TBytes);
     function Read(const APath: string): TBytes;
     function PackageRecord(const AHash, AOrigin: string): TLWPTRegistryPackage;
+    function VerifyHistory(const AOrigin, AHeadHash: string; const ASequence: Int64;
+      const APrior: TLWPTRegistryAcceptedState): TLWPTRegistryPackageArray;
   public
     constructor Create(ASource: TLWPTRegistryDocumentSource;
       const ALimits: TLWPTRegistryVerificationLimits);
@@ -1071,6 +1079,94 @@ begin
     raise ELWPTRegistryError.Create('identity_conflict: invalid lifecycle change');
 end;
 
+function TLWPTRegistryVerifier.VerifyHistory(const AOrigin, AHeadHash: string;
+  const ASequence: Int64; const APrior: TLWPTRegistryAcceptedState): TLWPTRegistryPackageArray;
+var
+  CurrentHash, Previous, Identity: string;
+  ExpectedSequence: Int64;
+  RecordIndex, SnapshotCount: Integer;
+  SnapshotBytes: TBytes;
+  Root: TTOMLNode;
+  Records: TStringArray;
+  Packages: TLWPTRegistryPackageArray;
+  Package, NewerPackage: TLWPTRegistryPackage;
+  NewerPackages, CurrentPackages: TDictionary<string, TLWPTRegistryPackage>;
+  PriorReached: Boolean;
+begin
+  Result := nil;
+  if not RegistryURIIsCanonical(AOrigin, True) or not ValidHash(AHeadHash)
+    or (ASequence < 1) then
+    raise ELWPTRegistryError.Create('snapshot_consistency_failed');
+  CurrentHash := AHeadHash;
+  ExpectedSequence := ASequence;
+  SnapshotCount := 0;
+  PriorReached := APrior.Sequence = 0;
+  NewerPackages := nil;
+  CurrentPackages := nil;
+  try
+    repeat
+      Inc(SnapshotCount);
+      if SnapshotCount > FLimits.Snapshots then
+        raise ELWPTRegistryError.Create('proof_limit_exceeded: snapshots');
+      if (ExpectedSequence = APrior.Sequence) and (APrior.Sequence > 0) then
+      begin
+        if CurrentHash <> APrior.Snapshot then
+          raise ELWPTRegistryError.Create('snapshot_consistency_failed');
+        PriorReached := True;
+      end;
+      SnapshotBytes := Read('snapshots/sha256/' + Copy(CurrentHash, 8, 64)
+        + '.toml');
+      if SHA256BytesPrefixed(SnapshotBytes) <> CurrentHash then
+        raise ELWPTRegistryError.Create('snapshot_hash_mismatch');
+      Root := ParseCanonical(BytesText(SnapshotBytes),
+        PROGRAM_NAME + '-registry-snapshot-v1', ['schema', 'origin',
+          'sequence', 'published_at', 'previous', 'records']);
+      try
+        if (TomlStr(Root, 'origin', '') <> AOrigin)
+          or (UnsignedField(Root, 'sequence') <> ExpectedSequence)
+          or not RegistryTimestampIsCanonical(TomlStr(Root, 'published_at', '')) then
+          raise ELWPTRegistryError.Create('snapshot_consistency_failed');
+        Previous := StringField(Root, 'previous');
+        if ((ExpectedSequence = 1) and (Previous <> ''))
+          or ((ExpectedSequence > 1) and not ValidHash(Previous)) then
+          raise ELWPTRegistryError.Create('snapshot_consistency_failed');
+        Records := NodeStringArray(Root, 'records');
+      finally
+        Root.Free;
+      end;
+      SetLength(Packages, Length(Records));
+      CurrentPackages := TDictionary<string, TLWPTRegistryPackage>.Create;
+      for RecordIndex := 0 to High(Records) do
+      begin
+        Package := PackageRecord(Records[RecordIndex], AOrigin);
+        Identity := PackageIdentity(Package);
+        if CurrentPackages.ContainsKey(Identity) then
+          raise ELWPTRegistryError.Create('duplicate_package_identity');
+        CurrentPackages.Add(Identity, Package);
+        Packages[RecordIndex] := Package;
+        if Assigned(NewerPackages) then
+        begin
+          if not NewerPackages.TryGetValue(Identity, NewerPackage) then
+            raise ELWPTRegistryError.Create('identity_conflict: package removed');
+          VerifyImmutablePackage(Package, NewerPackage);
+        end;
+      end;
+      if SnapshotCount = 1 then Result := Copy(Packages);
+      FreeAndNil(NewerPackages);
+      NewerPackages := CurrentPackages;
+      CurrentPackages := nil;
+      if ExpectedSequence = 1 then Break;
+      CurrentHash := Previous;
+      Dec(ExpectedSequence);
+    until False;
+  finally
+    CurrentPackages.Free;
+    NewerPackages.Free;
+  end;
+  if not PriorReached then
+    raise ELWPTRegistryError.Create('snapshot_consistency_failed: missing accepted head');
+end;
+
 function TLWPTRegistryVerifier.Verify(const AProof: TLWPTRegistryProof;
   const ATrust: TLWPTRegistryTrust;
   const APrior: TLWPTRegistryAcceptedState; const AEvaluationTime: string;
@@ -1078,18 +1174,11 @@ function TLWPTRegistryVerifier.Verify(const AProof: TLWPTRegistryProof;
 var
   Checkpoint: TRegistryCheckpoint;
   Rotation: TLWPTUntrustedRegistryRotation;
-  Root: TTOMLNode;
-  KeyId, PublicKey, ToKey, ToPublicKey, CurrentHash, Previous: string;
-  PriorKeyId, PriorPublicKey, Identity: string;
-  EffectiveSequence, LastEffectiveSequence, ExpectedSequence: Int64;
-  Index, RecordIndex, SnapshotCount: Integer;
-  Records: TStringArray;
-  Packages: TLWPTRegistryPackageArray;
-  Package, NewerPackage: TLWPTRegistryPackage;
-  NewerPackages, CurrentPackages: TDictionary<string, TLWPTRegistryPackage>;
+  KeyId, PublicKey, ToKey, ToPublicKey: string;
+  PriorKeyId, PriorPublicKey: string;
+  EffectiveSequence, LastEffectiveSequence: Int64;
+  Index: Integer;
   UsedKeys: TStringList;
-  SnapshotBytes: TBytes;
-  PriorReached: Boolean;
 begin
   Result := Default(TLWPTVerifiedRegistry);
   if not RegistryURIIsCanonical(ATrust.Origin, True)
@@ -1182,74 +1271,7 @@ begin
     if (AMode = rvmLockedProof) and (Checkpoint.Sequence <> APrior.Sequence) then
       raise ELWPTRegistryError.Create('locked_proof_state_mismatch');
   end;
-  CurrentHash := Checkpoint.Snapshot;
-  ExpectedSequence := Checkpoint.Sequence;
-  SnapshotCount := 0;
-  PriorReached := APrior.Sequence = 0;
-  NewerPackages := nil;
-  CurrentPackages := nil;
-  try
-    repeat
-      Inc(SnapshotCount);
-      if SnapshotCount > FLimits.Snapshots then
-        raise ELWPTRegistryError.Create('proof_limit_exceeded: snapshots');
-      if (ExpectedSequence = APrior.Sequence) and (APrior.Sequence > 0) then
-      begin
-        if CurrentHash <> APrior.Snapshot then
-          raise ELWPTRegistryError.Create('snapshot_consistency_failed');
-        PriorReached := True;
-      end;
-      SnapshotBytes := Read('snapshots/sha256/' + Copy(CurrentHash, 8, 64)
-        + '.toml');
-      if SHA256BytesPrefixed(SnapshotBytes) <> CurrentHash then
-        raise ELWPTRegistryError.Create('snapshot_hash_mismatch');
-      Root := ParseCanonical(BytesText(SnapshotBytes),
-        PROGRAM_NAME + '-registry-snapshot-v1', ['schema', 'origin',
-          'sequence', 'published_at', 'previous', 'records']);
-      try
-        if (TomlStr(Root, 'origin', '') <> ATrust.Origin)
-          or (UnsignedField(Root, 'sequence') <> ExpectedSequence)
-          or not RegistryTimestampIsCanonical(TomlStr(Root, 'published_at', '')) then
-          raise ELWPTRegistryError.Create('snapshot_consistency_failed');
-        Previous := StringField(Root, 'previous');
-        if ((ExpectedSequence = 1) and (Previous <> ''))
-          or ((ExpectedSequence > 1) and not ValidHash(Previous)) then
-          raise ELWPTRegistryError.Create('snapshot_consistency_failed');
-        Records := NodeStringArray(Root, 'records');
-      finally
-        Root.Free;
-      end;
-      SetLength(Packages, Length(Records));
-      CurrentPackages := TDictionary<string, TLWPTRegistryPackage>.Create;
-      for RecordIndex := 0 to High(Records) do
-      begin
-        Package := PackageRecord(Records[RecordIndex], ATrust.Origin);
-        Identity := PackageIdentity(Package);
-        if CurrentPackages.ContainsKey(Identity) then
-          raise ELWPTRegistryError.Create('duplicate_package_identity');
-        CurrentPackages.Add(Identity, Package);
-        Packages[RecordIndex] := Package;
-        if Assigned(NewerPackages) then
-        begin
-          if not NewerPackages.TryGetValue(Identity, NewerPackage) then
-            raise ELWPTRegistryError.Create('identity_conflict: package removed');
-          VerifyImmutablePackage(Package, NewerPackage);
-        end;
-      end;
-      if SnapshotCount = 1 then Result.Packages := Copy(Packages);
-      FreeAndNil(NewerPackages);
-      NewerPackages := CurrentPackages;
-      CurrentPackages := nil;
-      if ExpectedSequence = 1 then Break;
-      CurrentHash := Previous;
-      Dec(ExpectedSequence);
-    until False;
-  finally
-    CurrentPackages.Free;
-    NewerPackages.Free;
-  end;
-  if not PriorReached then
-    raise ELWPTRegistryError.Create('snapshot_consistency_failed: missing accepted head');
+  Result.Packages := VerifyHistory(ATrust.Origin, Checkpoint.Snapshot, Checkpoint.Sequence, APrior);
   Result.State.Origin := ATrust.Origin;
   Result.State.KeyId := KeyId;
   Result.State.PublicKey := PublicKey;
@@ -1267,6 +1289,21 @@ begin
     Result.Proof.Rotations[Index].Document := Copy(AProof.Rotations[Index].Document);
     Result.Proof.Rotations[Index].OldSignature := Copy(AProof.Rotations[Index].OldSignature);
     Result.Proof.Rotations[Index].NewSignature := Copy(AProof.Rotations[Index].NewSignature);
+  end;
+end;
+
+function VerifyRegistrySnapshotHistory(const AOrigin, AHeadHash: string;
+  const ASequence: Int64; ASource: TLWPTRegistryDocumentSource;
+  const ALimits: TLWPTRegistryVerificationLimits): TLWPTRegistryDocumentArray;
+var
+  Verifier: TLWPTRegistryVerifier;
+begin
+  Verifier := TLWPTRegistryVerifier.Create(ASource, ALimits);
+  try
+    Verifier.VerifyHistory(AOrigin, AHeadHash, ASequence, Default(TLWPTRegistryAcceptedState));
+    Result := Verifier.FDocuments;
+  finally
+    Verifier.Free;
   end;
 end;
 

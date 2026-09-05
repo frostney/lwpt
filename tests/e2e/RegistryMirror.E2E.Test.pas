@@ -372,7 +372,7 @@ var
     end;
     SetLength(Routes, Length(Routes) + 1);
     Routes[High(Routes)] := RegistryRoute('/proxy' + APath,
-      'application/vnd.lwpt.registry-' + AKind + '+toml', Body);
+      'application/vnd.' + RegistryProgramName + '.registry-' + AKind + '+toml', Body);
   end;
 
   procedure AddPublicDirectory(const ADirectory, AKind: string);
@@ -406,7 +406,7 @@ begin
   Proxy := TRegistryTestServer.Create(nil);
   try
     ProxyURL := 'http://localhost:' + IntToStr(Proxy.Port) + '/proxy';
-    AddRoute('/.well-known/lwpt-registry', 'discovery', True);
+    AddRoute('/.well-known/' + RegistryProgramName + '-registry', 'discovery', True);
     AddRoute('/v1/capabilities', 'capabilities', True);
     AddRoute('/v1/checkpoints/latest.toml', 'checkpoint');
     AddRoute('/v1/checkpoints/latest.sig.toml', 'signature');

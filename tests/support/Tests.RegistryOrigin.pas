@@ -32,6 +32,7 @@ function StartRegistryCLI(const ADataDirectory, ABaseURL: string): TProcess;
 procedure StopRegistryCLI(var AProcess: TProcess);
 function RegistryHTTPBody(const AURL: string): TBytes;
 function RegistryArtifactHash(const AArchive: TBytes): string;
+function RegistryProgramName: string;
 
 implementation
 
@@ -48,6 +49,11 @@ uses
 function RegistryArtifactHash(const AArchive: TBytes): string;
 begin
   Result := SHA256BytesPrefixed(AArchive);
+end;
+
+function RegistryProgramName: string;
+begin
+  Result := PROGRAM_NAME;
 end;
 
 function ReserveRegistryTestPort: Word;

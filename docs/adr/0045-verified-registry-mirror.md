@@ -42,6 +42,14 @@ immutable pin and checkpoint sequence, and retained byte-for-byte.
 The same rule applies to rotated key documents and dual-signed rotation
 triplets. Their HTTP routes expose only the accepted chain, not staged files.
 
+Each metadata request owns one captured state and membership view. Mirrors
+verify their complete retained proof once and reuse that result for routing.
+Origins validate snapshot ancestry lazily, only for snapshot requests, using
+the same bounded traversal and package-consistency checks as the shared
+verifier. Pending origin snapshots remain hidden. The view never reloads the
+current pointer, survives no later request, and does not replace the existing
+serving-time resource hash checks.
+
 `state/sync-attempt.toml` records the most recent verification attempt or
 failure separately. An attempt marked `verified` is not activation proof;
 the current pointer and its successful sync time remain authoritative.
