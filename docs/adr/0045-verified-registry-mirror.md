@@ -60,11 +60,29 @@ platform equivalent.
 
 ## Transfer and freshness bounds
 
-The current transfer path fetches one archive at a time through HTTPClient's
-whole-body API. Archives are limited to 256 MiB; the response is also capped
-at the signed archive size before body allocation. HTTP framing and conversion
-can temporarily retain multiple copies, so 256 MiB is a payload cap, not a
-total process-memory cap. Discovery, checkpoint, key, rotation, signature, and
+Metadata verification stays serial. Missing archives are deduplicated by their
+authenticated hash; conflicting signed sizes fail before any archive request.
+The archive path admits pairs of at most two private workers through HTTPClient's
+whole-body API. Each worker owns its request, bytes, verification and error.
+Only the coordinator adopts verified objects or changes the activation pointer.
+A pair drains before another pair starts. Failed transfers stop further
+admission, but successful siblings remain available for retry. Active requests
+are joined under their existing deadlines; synchronous system DNS resolution
+is still outside the transport's enforceable deadline.
+
+Archives are limited to 256 MiB individually and in aggregate across admitted
+workers. Each response is capped at its signed archive size. Reservations use
+overflow-safe Int64 arithmetic and remain charged through completion, adoption
+and buffer release. A completed sibling therefore cannot admit extra bytes
+while another transfer is still active. A conservative four-copy allowance for
+HTTP framing and conversion gives a 1 GiB payload envelope, not a measured RSS
+limit or a guarantee of allocation success on 32-bit systems. Metadata, TLS,
+allocator fragmentation and runtime state require separate headroom. FPC 3.2.2's
+read-only `TBytesStream` initially shares its supplied dynamic array; it does
+not eagerly copy the archive. Native 32-bit allocation validation remains
+required before making a stronger memory claim.
+
+Discovery, checkpoint, key, rotation, signature, and
 rotation-page control documents are limited to 1 MiB. The shared verifier
 limits a complete proof to 64 MiB, 10,000 documents, and 1,000 rotations;
 content-addressed metadata also has a 4 MiB per-document limit. Acquisition
@@ -80,8 +98,7 @@ immediately before activation. Local verification and serving retain exact
 accepted proof without renewing or changing its timestamps. `verify` reports
 `fresh`, `expired`, or `uninitialized`; an expired retained proof does not
 authorize acquisition. The current transfer resumes at verified-object
-boundaries, not at partial byte offsets. Parallel transfer remains outside
-this implementation packet. Unknown signing keys require a complete verified
+boundaries, not at partial byte offsets. Unknown signing keys require a complete verified
 rotation chain from the immutable root pin.
 
 ## Local signing-key rotation

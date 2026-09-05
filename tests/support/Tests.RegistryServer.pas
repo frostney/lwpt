@@ -23,6 +23,11 @@ type
     MediaType: string;
     Status: Integer;
     Body: TBytes;
+    { Optional bounded response barrier for concurrent transfer tests. }
+    Gate: PRTLEvent;
+    GateTimeoutMilliseconds: Cardinal;
+    GateRequestLimit: Integer;
+    Arrived: PLongInt;
   end;
   TRegistryHTTPRouteArray = array of TRegistryHTTPRoute;
 
@@ -31,17 +36,23 @@ type
     FListenSocket: TRegistryTestSocket;
     FPort: Word;
     FRequestCount: Integer;
+    FAcceptedCount: Integer;
     FRoutes: TRegistryHTTPRouteArray;
-    FStopping: Boolean;
+    FStopping: LongInt;
     FStarted: Boolean;
     FThread: TThread;
     FError: string;
+    FConcurrent: Boolean;
+    FClients: TList;
     {$IFDEF MSWINDOWS}
     FWinSockStarted: Boolean;
     {$ENDIF}
     procedure Serve;
+    procedure ServeClient(const AClient: TRegistryTestSocket);
+    function StopRequested: Boolean;
   public
-    constructor Create(const ARoutes: TRegistryHTTPRouteArray);
+    constructor Create(const ARoutes: TRegistryHTTPRouteArray;
+      const AConcurrent: Boolean = False);
     destructor Destroy; override;
     procedure SetRoutes(const ARoutes: TRegistryHTTPRouteArray);
     procedure Start;
@@ -49,6 +60,7 @@ type
       const ATimeoutMilliseconds: Cardinal = 5000): Boolean;
     property Port: Word read FPort;
     property RequestCount: Integer read FRequestCount;
+    property AcceptedCount: Integer read FAcceptedCount;
   end;
 
 function RegistryRoute(const APath, AMediaType: string;
@@ -56,10 +68,34 @@ function RegistryRoute(const APath, AMediaType: string;
 
 implementation
 
+{$IFDEF UNIX}
+uses
+  BaseUnix;
+{$ENDIF}
+
 const
   CRLF = #13#10;
+  CLIENT_IO_TIMEOUT_MS = 2000;
+  {$IFDEF LINUX}
+  TEST_SEND_FLAGS = $4000; { MSG_NOSIGNAL, as in the native registry listener. }
+  {$ELSE}
+  TEST_SEND_FLAGS = 0;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  TEST_SO_NOSIGPIPE = $1022;
+  {$ENDIF}
 
 type
+  TRegistryClientThread = class(TThread)
+  private
+    FOwner: TRegistryTestServer;
+    FSocket: TRegistryTestSocket;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AOwner: TRegistryTestServer; const ASocket: TRegistryTestSocket);
+  end;
+
   TRegistryServerThread = class(TThread)
   private
     FOwner: TRegistryTestServer;
@@ -72,6 +108,8 @@ type
 function RegistryRoute(const APath, AMediaType: string;
   const ABody: TBytes; const AStatus: Integer): TRegistryHTTPRoute;
 begin
+  Result := Default(TRegistryHTTPRoute);
+  Result.GateTimeoutMilliseconds := 5000;
   Result.Path := APath;
   Result.MediaType := AMediaType;
   Result.Status := AStatus;
@@ -113,35 +151,89 @@ begin
   {$ENDIF}
 end;
 
-function SendBytes(const ASocket: TRegistryTestSocket;
+function PrepareClient(const ASocket: TRegistryTestSocket): Boolean;
+var
+  {$IFDEF UNIX}
+  Flags: LongInt;
+  {$ELSE}
+  Mode: u_long;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  Enabled: LongInt;
+  {$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Flags := fpFcntl(ASocket, F_GETFL, 0);
+  Result := (Flags >= 0) and (fpFcntl(ASocket, F_SETFL, Flags or O_NONBLOCK) = 0);
+  {$ELSE}
+  Mode := 1;
+  Result := WinSock2.ioctlsocket(ASocket, LongInt(FIONBIO), Mode) = 0;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  Enabled := 1;
+  Result := Result and (fpSetSockOpt(ASocket, SOL_SOCKET, TEST_SO_NOSIGPIPE,
+    @Enabled, SizeOf(Enabled)) = 0);
+  {$ENDIF}
+end;
+
+function RetrySocket: Boolean;
+var
+  Code: Integer;
+begin
+  {$IFDEF UNIX}
+  Code := fpGetErrNo;
+  Result := (Code = ESysEAGAIN) or (Code = ESysEWOULDBLOCK) or (Code = ESysEINTR);
+  {$ELSE}
+  Code := WSAGetLastError;
+  Result := (Code = WSAEWOULDBLOCK) or (Code = WSAEINTR);
+  {$ENDIF}
+end;
+
+function TRegistryTestServer.StopRequested: Boolean;
+begin
+  Result := InterlockedCompareExchange(FStopping, 0, 0) <> 0;
+end;
+
+function SendBytes(AOwner: TRegistryTestServer; const ASocket: TRegistryTestSocket;
   const ABytes: TBytes): Boolean;
 var
   Sent, Offset: Integer;
+  Started: QWord;
 begin
   Offset := 0;
+  Started := GetTickCount64;
   while Offset < Length(ABytes) do
   begin
+    if AOwner.StopRequested or (GetTickCount64 - Started >= CLIENT_IO_TIMEOUT_MS) then Exit(False);
     {$IFDEF UNIX}
-    Sent := fpSend(ASocket, @ABytes[Offset], Length(ABytes) - Offset, 0);
+    Sent := fpSend(ASocket, @ABytes[Offset], Length(ABytes) - Offset, TEST_SEND_FLAGS);
     {$ENDIF}
     {$IFDEF MSWINDOWS}
     Sent := WinSock2.send(ASocket, PAnsiChar(@ABytes[Offset]),
       Length(ABytes) - Offset, 0);
     {$ENDIF}
+    if (Sent < 0) and RetrySocket then
+    begin
+      Sleep(1);
+      Continue;
+    end;
     if Sent <= 0 then Exit(False);
     Inc(Offset, Sent);
   end;
   Result := True;
 end;
 
-function ReceiveRequest(const ASocket: TRegistryTestSocket): string;
+function ReceiveRequest(AOwner: TRegistryTestServer; const ASocket: TRegistryTestSocket): string;
 var
   Buffer: array[0..4095] of Byte;
   Received: Integer;
   Chunk: AnsiString;
+  Started: QWord;
 begin
   Result := '';
+  Started := GetTickCount64;
   repeat
+    if AOwner.StopRequested or (GetTickCount64 - Started >= CLIENT_IO_TIMEOUT_MS) then Exit('');
     {$IFDEF UNIX}
     Received := fpRecv(ASocket, @Buffer[0], SizeOf(Buffer), 0);
     {$ENDIF}
@@ -149,7 +241,12 @@ begin
     Received := WinSock2.recv(ASocket, PAnsiChar(@Buffer[0]),
       SizeOf(Buffer), 0);
     {$ENDIF}
-    if Received <= 0 then Exit;
+    if (Received < 0) and RetrySocket then
+    begin
+      Sleep(1);
+      Continue;
+    end;
+    if Received <= 0 then Exit('');
     SetString(Chunk, PAnsiChar(@Buffer[0]), Received);
     Result := Result + string(Chunk);
     if Pos(CRLF + CRLF, Result) > 0 then Exit;
@@ -203,7 +300,7 @@ begin
 end;
 
 constructor TRegistryTestServer.Create(
-  const ARoutes: TRegistryHTTPRouteArray);
+  const ARoutes: TRegistryHTTPRouteArray; const AConcurrent: Boolean);
 var
   Addr: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
   AddrLength: LongInt;
@@ -212,6 +309,8 @@ var
   {$ENDIF}
 begin
   inherited Create;
+  FConcurrent := AConcurrent;
+  FClients := TList.Create;
   FListenSocket := InvalidSocketValue;
   SetRoutes(ARoutes);
   {$IFDEF MSWINDOWS}
@@ -269,10 +368,11 @@ end;
 
 destructor TRegistryTestServer.Destroy;
 var
+  I: Integer;
   WakeSocket: TRegistryTestSocket;
   Addr: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
 begin
-  FStopping := True;
+  InterlockedExchange(FStopping, 1);
   { A caller may release a reserved listener or fail while preparing routes
     before Start. Let its suspended worker observe FStopping before joining. }
   if Assigned(FThread) and not FStarted then FThread.Start;
@@ -302,6 +402,9 @@ begin
     FThread.WaitFor;
   end;
   FThread.Free;
+  if Assigned(FClients) then
+    for I := 0 to FClients.Count - 1 do TObject(FClients[I]).Free;
+  FClients.Free;
   CloseTestSocket(FListenSocket);
   {$IFDEF MSWINDOWS}
   if FWinSockStarted then WinSock2.WSACleanup;
@@ -315,18 +418,59 @@ begin
   FThread.Start;
 end;
 
+constructor TRegistryClientThread.Create(AOwner: TRegistryTestServer;
+  const ASocket: TRegistryTestSocket);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FOwner := AOwner;
+  FSocket := ASocket;
+end;
+
+procedure TRegistryClientThread.Execute;
+begin
+  try
+    FOwner.ServeClient(FSocket);
+  finally
+    CloseTestSocket(FSocket);
+  end;
+end;
+
+procedure TRegistryTestServer.ServeClient(const AClient: TRegistryTestSocket);
+var
+  I, Arrival: Integer;
+  Request, Path: string;
+  Response: TBytes;
+begin
+  Request := ReceiveRequest(Self, AClient);
+  if Request = '' then Exit;
+  Path := RequestPath(Request);
+  InterlockedIncrement(FRequestCount);
+  for I := 0 to High(FRoutes) do
+    if FRoutes[I].Path = Path then
+    begin
+      Arrival := 0;
+      if Assigned(FRoutes[I].Arrived) then Arrival := InterlockedIncrement(FRoutes[I].Arrived^);
+      if Assigned(FRoutes[I].Gate) and ((FRoutes[I].GateRequestLimit = 0)
+        or (Arrival <= FRoutes[I].GateRequestLimit)) then
+        RTLEventWaitFor(FRoutes[I].Gate, FRoutes[I].GateTimeoutMilliseconds);
+      Response := ResponseBytes(FRoutes[I].Status, FRoutes[I].MediaType, FRoutes[I].Body);
+      SendBytes(Self, AClient, Response);
+      Exit;
+    end;
+  Response := ResponseBytes(404, 'text/plain', BytesOf('missing route: ' + Path));
+  SendBytes(Self, AClient, Response);
+end;
+
 procedure TRegistryTestServer.Serve;
 var
   Client: TRegistryTestSocket;
+  Worker: TRegistryClientThread;
   Addr: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
   AddrLength: LongInt;
-  I: Integer;
-  Request, Path: string;
-  Response: TBytes;
-  Found: Boolean;
 begin
   try
-    while not FStopping do
+    while not StopRequested do
     begin
       AddrLength := SizeOf(Addr);
       {$IFDEF UNIX}
@@ -336,27 +480,17 @@ begin
       Client := WinSock2.accept(FListenSocket, PSockAddr(@Addr), @AddrLength);
       {$ENDIF}
       if not SocketIsValid(Client) then Continue;
+      InterlockedIncrement(FAcceptedCount);
       try
-        if FStopping then Continue;
-        Request := ReceiveRequest(Client);
-        Path := RequestPath(Request);
-        InterlockedIncrement(FRequestCount);
-        Found := False;
-        for I := 0 to High(FRoutes) do
-          if FRoutes[I].Path = Path then
-          begin
-            Response := ResponseBytes(FRoutes[I].Status,
-              FRoutes[I].MediaType, FRoutes[I].Body);
-            SendBytes(Client, Response);
-            Found := True;
-            Break;
-          end;
-        if not Found then
+        if StopRequested or not PrepareClient(Client) then Continue;
+        if FConcurrent then
         begin
-          Response := ResponseBytes(404, 'text/plain',
-            BytesOf('missing route: ' + Path));
-          SendBytes(Client, Response);
-        end;
+          Worker := TRegistryClientThread.Create(Self, Client);
+          FClients.Add(Worker);
+          Client := InvalidSocketValue;
+          Worker.Start;
+        end
+        else ServeClient(Client);
       finally
         CloseTestSocket(Client);
       end;

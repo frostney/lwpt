@@ -205,7 +205,7 @@ end;
 procedure TRegistryMirrorE2E.FailedSyncPreservesAcceptedPointer;
 var
   Archive: TBytes;
-  PointerBefore, ObjectPath, Checkpoint, Candidate, CandidateHash,
+  PointerBefore, ObjectPath, SiblingPath, Checkpoint, Candidate, CandidateHash,
     CandidateSnapshot, PreviousSnapshot, CandidatePrefix: string;
   Run: TLwptResult;
 begin
@@ -219,6 +219,8 @@ begin
   PreviousSnapshot := Field(Checkpoint, 'snapshot');
   Archive := BytesOf('second');
   FOrigin.Publish('second-package', '1.0.0', Archive);
+  FOrigin.Publish('verified-sibling', '1.0.0', BytesOf('verified sibling'));
+  SiblingPath := '/objects/sha256/' + Copy(RegistryArtifactHash(BytesOf('verified sibling')), 8, 64);
   Candidate := Text(RegistryHTTPBody(FOrigin.BaseURL + '/v1/checkpoints/latest.toml'));
   CandidateSnapshot := Field(Candidate, 'snapshot');
   CandidateHash := RegistryArtifactHash(BytesOf(Candidate));
@@ -234,6 +236,8 @@ begin
   Run := Sync;
   Expect<Integer>(Run.ExitCode).ToBe(1);
   Expect<string>(Text(ReadBytes(FMirrorRoot + '/state/current.toml'))).ToBe(PointerBefore);
+  Expect<string>(Text(ReadBytes(FMirrorRoot + SiblingPath))).ToBe('verified sibling');
+  Expect<Boolean>(DeleteFile(FOrigin.Root + SiblingPath)).ToBe(True);
   Expect<string>(Text(RegistryHTTPBody(FMirrorURL + '/v1/checkpoints/latest.toml'))).ToBe(Checkpoint);
   Expect<Integer>(HTTPStatus(FMirrorURL + '/v1/snapshots/sha256/'
     + Copy(CandidateSnapshot, 8, 64) + '.toml')).ToBe(404);

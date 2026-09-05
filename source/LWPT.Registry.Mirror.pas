@@ -18,14 +18,25 @@ const
   MAXIMUM_MIRROR_ARCHIVE_BYTES = Int64(256) * 1024 * 1024;
 
 type
+  {$IFDEF REGISTRY_TESTING}
+  TRegistryMirrorTransferStats = record
+    PeakReserved, CompletedReserved: Int64;
+    MaximumWorkers: Integer;
+  end;
+  {$ENDIF}
+
   TLWPTRegistryMirror = class(TLWPTRegistryStore)
   private
+    {$IFDEF REGISTRY_TESTING}
+    FTransferStats: TRegistryMirrorTransferStats;
+    {$ENDIF}
     function Trust: TLWPTRegistryTrust;
     function Accepted(const AState: TLWPTRegistryState): TLWPTRegistryAcceptedState;
     function VerifyStateProof(const AState: TLWPTRegistryState;
       AProgress: TSHA256Progress = nil): TLWPTVerifiedRegistry;
     procedure SaveAttempt(const AOutcome: string);
     procedure CacheDocument(const APath: string; const ABytes: TBytes);
+    procedure TransferArchives(const AAPI: string; const APackages: TLWPTRegistryPackageArray);
   public
     procedure Recover; override;
     function LoadCurrentState(AProgress: TSHA256Progress = nil): TLWPTRegistryState; override;
@@ -37,11 +48,17 @@ type
 procedure ValidateMirrorConfiguration(const AConfig: TLWPTRegistryConfig);
 {$IFDEF REGISTRY_TESTING}
 function RegistryMirrorProofChecksForTesting: Integer;
+function RegistryMirrorCanAdmitForTesting(const AReserved, ASize: Int64;
+  const AWorkers: Integer): Boolean;
+procedure RegistryMirrorTransferForTesting(AMirror: TLWPTRegistryMirror;
+  const AAPI: string; const APackages: TLWPTRegistryPackageArray);
+function RegistryMirrorTransferStatsForTesting(AMirror: TLWPTRegistryMirror): TRegistryMirrorTransferStats;
 {$ENDIF}
 
 implementation
 
 uses
+  Generics.Collections,
   StrUtils,
 
   HTTPClient,
@@ -51,6 +68,7 @@ uses
 const
   MIRROR_REQUEST_TIMEOUT_MS = 120 * 1000;
   MIRROR_ATTEMPT_PATH = 'state/sync-attempt.toml';
+  MAXIMUM_MIRROR_ARCHIVE_WORKERS = 2;
 
 {$IFDEF REGISTRY_TESTING}
 var
@@ -63,6 +81,18 @@ end;
 {$ENDIF}
 
 type
+  TMirrorArchiveWorker = class(TThread)
+  private
+    FURL: string;
+    FPackage: TLWPTRegistryPackage;
+  protected
+    procedure Execute; override;
+  public
+    Archive: TBytes;
+    Error: string;
+    constructor Create(const AAPI: string; const APackage: TLWPTRegistryPackage);
+  end;
+
   TMirrorDocumentSource = class(TLWPTRegistryDocumentSource)
   public
     Store: TLWPTRegistryMirror;
@@ -130,6 +160,183 @@ begin
     raise ELWPTRegistryError.CreateStable('registry_media_type_mismatch',
       'upstream returned an unexpected media type');
   Result := Response.Body;
+end;
+
+constructor TMirrorArchiveWorker.Create(const AAPI: string;
+  const APackage: TLWPTRegistryPackage);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FPackage := APackage;
+  FURL := AAPI + '/objects/sha256/' + Copy(APackage.ArchiveHash, 8, 64);
+end;
+
+procedure TMirrorArchiveWorker.Execute;
+var
+  Stream: TBytesStream;
+begin
+  try
+    Archive := GetDocument(FURL, 'application/gzip', FPackage.ArchiveSize);
+    Stream := TBytesStream.Create(Archive);
+    try
+      VerifyRegistryArtifact(FPackage, Stream);
+    finally
+      Stream.Free;
+    end;
+  except
+    on E: Exception do
+    begin
+      Error := E.Message;
+      Archive := nil;
+    end;
+  end;
+end;
+
+function MirrorCanAdmit(const AReserved, ASize: Int64;
+  const AWorkers: Integer): Boolean;
+begin
+  { Subtraction after range checks avoids overflow even for hostile sizes.
+    A reservation includes completed buffers until their owner is freed. }
+  if (AWorkers < 0) or (AWorkers >= MAXIMUM_MIRROR_ARCHIVE_WORKERS)
+    or (AReserved < 0) or (AReserved > MAXIMUM_MIRROR_ARCHIVE_BYTES)
+    or (ASize < 0) then Exit(False);
+  Result := ASize <= MAXIMUM_MIRROR_ARCHIVE_BYTES - AReserved;
+end;
+
+{$IFDEF REGISTRY_TESTING}
+function RegistryMirrorCanAdmitForTesting(const AReserved, ASize: Int64;
+  const AWorkers: Integer): Boolean;
+begin
+  Result := MirrorCanAdmit(AReserved, ASize, AWorkers);
+end;
+
+procedure RegistryMirrorTransferForTesting(AMirror: TLWPTRegistryMirror;
+  const AAPI: string; const APackages: TLWPTRegistryPackageArray);
+begin
+  AMirror.TransferArchives(AAPI, APackages);
+end;
+
+function RegistryMirrorTransferStatsForTesting(AMirror: TLWPTRegistryMirror): TRegistryMirrorTransferStats;
+begin
+  Result := AMirror.FTransferStats;
+end;
+{$ENDIF}
+
+procedure TLWPTRegistryMirror.TransferArchives(const AAPI: string;
+  const APackages: TLWPTRegistryPackageArray);
+var
+  Sizes: TDictionary<string, Int64>;
+  Missing: TLWPTRegistryPackageArray;
+  Package: TLWPTRegistryPackage;
+  Workers: array[0..MAXIMUM_MIRROR_ARCHIVE_WORKERS - 1] of TMirrorArchiveWorker;
+  Reserved, PreviousSize: Int64;
+  Count, Next, Admitted, I: Integer;
+  Path, Failure: string;
+  Stream: TStream;
+begin
+  {$IFDEF REGISTRY_TESTING}
+  FTransferStats := Default(TRegistryMirrorTransferStats);
+  {$ENDIF}
+  Sizes := TDictionary<string, Int64>.Create;
+  try
+    { Validate the complete authenticated plan before any archive request.
+      The same bytes may serve several records, but their size cannot differ. }
+    for Package in APackages do
+    begin
+      if (Package.ArchiveSize < 0) or (Package.ArchiveSize > MAXIMUM_MIRROR_ARCHIVE_BYTES) then
+        raise ELWPTRegistryError.CreateStable('mirror_archive_limit_exceeded',
+          'archive exceeds the bounded whole-body transfer limit');
+      if Sizes.TryGetValue(Package.ArchiveHash, PreviousSize) then
+      begin
+        if PreviousSize <> Package.ArchiveSize then
+          raise ELWPTRegistryError.CreateStable('registry_archive_size_conflict',
+            'authenticated records disagree on one archive size');
+      end
+      else Sizes.Add(Package.ArchiveHash, Package.ArchiveSize);
+    end;
+    SetLength(Missing, Sizes.Count);
+    Count := 0;
+    for Package in APackages do
+      if Sizes.ContainsKey(Package.ArchiveHash) then
+      begin
+        Sizes.Remove(Package.ArchiveHash);
+        Path := RootPath('objects/sha256/' + Copy(Package.ArchiveHash, 8, 64));
+        if FileExists(Path) then
+        begin
+          Stream := OpenRegistryFileWithoutFollowingLinks(Path);
+          try
+            VerifyRegistryArtifact(Package, Stream);
+          finally
+            Stream.Free;
+          end;
+        end
+        else
+        begin
+          Missing[Count] := Package;
+          Inc(Count);
+        end;
+      end;
+  finally
+    Sizes.Free;
+  end;
+  Next := 0;
+  while Next < Count do
+  begin
+    Reserved := 0;
+    Admitted := 0;
+    Failure := '';
+    for I := Low(Workers) to High(Workers) do Workers[I] := nil;
+    try
+      { Bounded pairs deliberately drain before admitting another pair. This
+        also keeps finished sibling buffers charged during slow transfers. }
+      while (Next < Count) and MirrorCanAdmit(Reserved,
+        Missing[Next].ArchiveSize, Admitted) do
+      begin
+        Workers[Admitted] := TMirrorArchiveWorker.Create(AAPI, Missing[Next]);
+        Inc(Reserved, Missing[Next].ArchiveSize);
+        Inc(Admitted);
+        Inc(Next);
+        Workers[Admitted - 1].Start;
+      end;
+      {$IFDEF REGISTRY_TESTING}
+      if Reserved > FTransferStats.PeakReserved then FTransferStats.PeakReserved := Reserved;
+      if Admitted > FTransferStats.MaximumWorkers then FTransferStats.MaximumWorkers := Admitted;
+      {$ENDIF}
+      for I := 0 to Admitted - 1 do Workers[I].WaitFor;
+      {$IFDEF REGISTRY_TESTING}
+      if Reserved > FTransferStats.CompletedReserved then FTransferStats.CompletedReserved := Reserved;
+      {$ENDIF}
+      { Join every active request even after failure. Successful siblings are
+        immutable retry material, never permission to activate a partial head. }
+      for I := 0 to Admitted - 1 do
+      begin
+        if Assigned(Workers[I].FatalException) then
+        begin
+          if Failure = '' then Failure := 'registry_archive_worker_failed: '
+            + Workers[I].FatalException.ClassName;
+        end
+        else if Workers[I].Error <> '' then
+        begin
+          if Failure = '' then Failure := Workers[I].Error;
+        end
+        else
+          try
+            WriteImmutable('objects/sha256/' + Copy(Workers[I].FPackage.ArchiveHash, 8, 64),
+              Workers[I].Archive);
+          except
+            on E: Exception do if Failure = '' then Failure := E.Message;
+          end;
+      end;
+    finally
+      for I := 0 to Admitted - 1 do
+      begin
+        PreviousSize := Workers[I].FPackage.ArchiveSize;
+        Workers[I].Free;
+        Dec(Reserved, PreviousSize);
+      end;
+    end;
+    if Failure <> '' then raise ELWPTRegistryError.Create(Failure);
+  end;
 end;
 
 procedure ValidateMirrorConfiguration(const AConfig: TLWPTRegistryConfig);
@@ -342,11 +549,9 @@ var
   Verified, PriorVerified: TLWPTVerifiedRegistry;
   Source: TMirrorDocumentSource;
   State: TLWPTRegistryState;
-  Package: TLWPTRegistryPackage;
-  Document, Archive, KeyDocument: TBytes;
-  ArchiveStream: TStream;
+  Document, KeyDocument: TBytes;
   HasRotations: Boolean;
-  ObjectPath, FullPath, Prefix: string;
+  Prefix: string;
   Budget: TLWPTRegistryMetadataBudget;
   Hint: TLWPTUntrustedRegistryCheckpoint;
   Rotation: TLWPTUntrustedRegistryRotation;
@@ -497,30 +702,7 @@ begin
       Source.API := Discovery.API;
       Verified := VerifyRegistryProof(Proof, Trust, Prior, RegistryTimestampNow,
         rvmAcquire, Source, DefaultRegistryVerificationLimits);
-      for Package in Verified.Packages do
-      begin
-        if Package.ArchiveSize > MAXIMUM_MIRROR_ARCHIVE_BYTES then
-          raise ELWPTRegistryError.CreateStable('mirror_archive_limit_exceeded',
-            'archive exceeds the bounded whole-body transfer limit');
-        ObjectPath := 'objects/sha256/' + Copy(Package.ArchiveHash, 8, 64);
-        FullPath := RootPath(ObjectPath);
-        ArchiveStream := nil;
-        try
-          if FileExists(FullPath) then
-            ArchiveStream := OpenRegistryFileWithoutFollowingLinks(FullPath)
-          else
-          begin
-            Archive := GetDocument(Discovery.API + '/' + ObjectPath, 'application/gzip',
-              Package.ArchiveSize);
-            ArchiveStream := TBytesStream.Create(Archive);
-          end;
-          VerifyRegistryArtifact(Package, ArchiveStream);
-          if not FileExists(FullPath) then WriteImmutable(ObjectPath, Archive);
-        finally
-          ArchiveStream.Free;
-          Archive := nil;
-        end;
-      end;
+      TransferArchives(Discovery.API, Verified.Packages);
       { Recheck current freshness immediately before activation, using only
         retained resources. Expiry during transfer cannot become a fresh head. }
       Source.API := '';
