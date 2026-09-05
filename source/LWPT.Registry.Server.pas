@@ -82,6 +82,7 @@ uses
   LWPT.Registry.Server.NetworkFramework,
   {$ENDIF}
   LWPT.Registry.Filesystem,
+  LWPT.Registry.Verification,
   TransportSecurity;
 
 const
@@ -457,11 +458,104 @@ begin
   end;
 end;
 
+function RotationPageResponse(AStore: TLWPTRegistryStore;
+  const AState: TLWPTRegistryState; const AQuery: string;
+  AProgress: TSHA256Progress): TLWPTRegistryHTTPResponse;
+var
+  Parameters, Sequences, Seen: TStringList;
+  Entry, Name, Value, Cursor, NextCursor, Scope, Prefix, Body: string;
+  AfterSequence, LastSequence, Sequence, PageLimit: Int64;
+  EqualsAt, Count: Integer;
+  function CursorFor(const ASequence: Int64): string;
+  begin
+    Result := SHA256Hex(Bytes(AStore.Config.Identity + #10 + IntToStr(AfterSequence)
+      + #10 + IntToStr(ASequence))) + '.' + IntToStr(ASequence);
+  end;
+begin
+  Parameters := TStringList.Create;
+  Sequences := nil;
+  Seen := TStringList.Create;
+  try
+    Parameters.StrictDelimiter := True;
+    Parameters.Delimiter := '&';
+    Parameters.QuoteChar := #0;
+    Parameters.DelimitedText := AQuery;
+    AfterSequence := 0;
+    PageLimit := 100;
+    Cursor := '';
+    for Entry in Parameters do
+    begin
+      EqualsAt := Pos('=', Entry);
+      Name := Copy(Entry, 1, EqualsAt - 1);
+      Value := Copy(Entry, EqualsAt + 1, MaxInt);
+      if (EqualsAt = 0) or (Seen.IndexOf(Name) >= 0) then
+        Exit(ErrorResponse(400, 'Bad Request', 'invalid_cursor', 'invalid rotation query'));
+      Seen.Add(Name);
+      if Name = 'cursor' then Cursor := Value
+      else
+      begin
+        if not TryStrToInt64(Value, Sequence) or (Sequence < 0)
+          or (IntToStr(Sequence) <> Value) then
+          Exit(ErrorResponse(400, 'Bad Request', 'invalid_cursor', 'invalid rotation query'));
+        if Name = 'after' then AfterSequence := Sequence
+        else if Name = 'limit' then PageLimit := Sequence
+        else Exit(ErrorResponse(400, 'Bad Request', 'invalid_cursor', 'unknown rotation query'));
+      end;
+    end;
+    if (PageLimit < 1) or (PageLimit > 100) then
+      Exit(ErrorResponse(400, 'Bad Request', 'invalid_cursor', 'rotation page limit must be 1 to 100'));
+    LastSequence := AfterSequence;
+    if Cursor <> '' then
+    begin
+      Scope := Copy(Cursor, 66, MaxInt);
+      if not TryStrToInt64(Scope, LastSequence) or (LastSequence <= AfterSequence)
+        or (Cursor <> CursorFor(LastSequence)) then
+        Exit(ErrorResponse(400, 'Bad Request', 'invalid_cursor', 'rotation cursor scope mismatch'));
+    end;
+    Sequences := AStore.RotationSequences(AState, AProgress);
+    Count := 0;
+    NextCursor := '';
+    Body := 'schema = ' + RegistryTOMLQuote(PROGRAM_NAME + '-registry-rotation-page-v1') + #10
+      + 'origin = ' + RegistryTOMLQuote(AStore.Config.Identity) + #10 + 'items = [';
+    for Entry in Sequences do
+    begin
+      Sequence := StrToInt64(Entry);
+      if Sequence <= LastSequence then Continue;
+      if Count >= PageLimit then
+      begin
+        NextCursor := CursorFor(LastSequence);
+        Break;
+      end;
+      if Count > 0 then Body := Body + ', ';
+      Prefix := AStore.Config.BaseURL + '/v1/rotations/' + Entry;
+      Body := Body + '{ effective_sequence = ' + Entry
+        + ', rotation = ' + RegistryTOMLQuote(Prefix + '.toml')
+        + ', old_signature = ' + RegistryTOMLQuote(Prefix + '.old.sig.toml')
+        + ', new_signature = ' + RegistryTOMLQuote(Prefix + '.new.sig.toml') + ' }';
+      Inc(Count);
+      LastSequence := Sequence;
+    end;
+    Body := Body + ']' + #10 + 'next_cursor = ' + RegistryTOMLQuote(NextCursor) + #10;
+    if Length(Body) > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then
+      Exit(ErrorResponse(500, 'Internal Server Error', 'resource_too_large', 'rotation page exceeds metadata limit'));
+    Result := Default(TLWPTRegistryHTTPResponse);
+    Result.Status := 200;
+    Result.Reason := 'OK';
+    Result.ContentType := 'application/vnd.' + PROGRAM_NAME + '.registry-rotation-page+toml';
+    Result.CacheControl := 'no-cache';
+    Result.Body := Bytes(Body);
+  finally
+    Seen.Free;
+    Sequences.Free;
+    Parameters.Free;
+  end;
+end;
+
 function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
   const AMethod, ATarget: string; AProgress: TSHA256Progress):
   TLWPTRegistryHTTPResponse;
 var
-  APIPath, Digest, KeyID, Prefix, Relative, RequestID, RoleName: string;
+  APIPath, Digest, KeyID, Prefix, Relative, RequestID, RoleName, Target, Query: string;
   State: TLWPTRegistryState;
 begin
   RoleName := 'origin';
@@ -489,15 +583,24 @@ begin
   if not SameText(AMethod, 'GET') and not SameText(AMethod, 'HEAD') then
     Exit(ErrorResponse(405, 'Method Not Allowed', 'method_not_allowed',
       'only GET and HEAD are supported'));
-  if (Pos('?', ATarget) > 0) or (Pos('#', ATarget) > 0) then
+  if Pos('#', ATarget) > 0 then
     Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target',
       'request target is not canonical'));
   Prefix := BasePath(AStore.Config.BaseURL);
+  Target := ATarget;
+  Query := '';
+  if Pos('?', Target) > 0 then
+  begin
+    Query := Copy(Target, Pos('?', Target) + 1, MaxInt);
+    Target := Copy(Target, 1, Pos('?', Target) - 1);
+    if Target <> Prefix + '/v1/rotations' then
+      Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target', 'query is only supported for rotation pages'));
+  end;
   if Prefix = '' then Prefix := '';
-  if not StartsStr(Prefix + '/', ATarget) then
+  if not StartsStr(Prefix + '/', Target) then
     Exit(ErrorResponse(404, 'Not Found', 'not_found',
       'request target is outside the configured registry base path'));
-  APIPath := Copy(ATarget, Length(Prefix) + 1, MaxInt);
+  APIPath := Copy(Target, Length(Prefix) + 1, MaxInt);
   if (Pos('..', APIPath) > 0) or (Pos('%', APIPath) > 0) then
     Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target',
       'request target is not canonical'));
@@ -519,7 +622,8 @@ begin
       + 'role = "' + RoleName + '"' + #10 + 'api = "' + AStore.Config.BaseURL
       + '/v1"' + #10 + 'capabilities = "' + AStore.Config.BaseURL
       + '/v1/capabilities"' + #10 + 'checkpoint = "'
-      + AStore.Config.BaseURL + '/v1/checkpoints/latest.toml"' + #10);
+      + AStore.Config.BaseURL + '/v1/checkpoints/latest.toml"' + #10
+      + 'rotations = "' + AStore.Config.BaseURL + '/v1/rotations"' + #10);
     Exit;
   end;
   if APIPath = '/v1/capabilities' then
@@ -540,16 +644,29 @@ begin
       + PROGRAM_NAME + '-registry-checkpoint-v1", "' + PROGRAM_NAME
       + '-registry-discovery-v1", "' + PROGRAM_NAME
       + '-registry-error-v1", "' + PROGRAM_NAME
+      + '-registry-key-rotation-v1", "' + PROGRAM_NAME
       + '-registry-key-v1", "' + PROGRAM_NAME
       + '-registry-package-v1", "' + PROGRAM_NAME
+      + '-registry-rotation-page-v1", "' + PROGRAM_NAME
       + '-registry-signature-v1", "' + PROGRAM_NAME
       + '-registry-snapshot-v1"]' + #10
-      + 'features = ["snapshot-sync-v1"]' + #10
+      + 'features = ["rotation-chain-v1", "snapshot-sync-v1"]' + #10
       + 'auth_schemes = []' + #10
       + 'max_page_size = 100' + #10);
     Exit;
   end;
   State := AStore.LoadCurrentState(AProgress);
+  if APIPath = '/v1/rotations' then Exit(RotationPageResponse(AStore, State, Query, AProgress));
+  if StartsStr('/v1/rotations/', APIPath) then
+  begin
+    Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
+    if not AStore.ResourceIsPublished(State, Relative, AProgress) then
+      Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
+    if EndsStr('.sig.toml', Relative) then Digest := 'signature'
+    else Digest := 'key-rotation';
+    Exit(ResourceResponse(AStore, Relative, 'application/vnd.' + PROGRAM_NAME
+      + '.registry-' + Digest + '+toml', '', '', True, AProgress));
+  end;
   if APIPath = '/v1/checkpoints/latest.toml' then
     Exit(ResourceResponse(AStore, State.CheckpointPath,
       'application/vnd.' + PROGRAM_NAME + '.registry-checkpoint+toml', '',
@@ -604,6 +721,8 @@ begin
       Exit(ErrorResponse(404, 'Not Found', 'not_found',
         'registry resource was not found'));
     Relative := RegistryKeyStoragePath(KeyID);
+    if not AStore.ResourceIsPublished(State, Relative, AProgress) then
+      Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
     Exit(ResourceResponse(AStore, Relative,
       'application/vnd.' + PROGRAM_NAME + '.registry-key+toml', '', '',
       True, AProgress));

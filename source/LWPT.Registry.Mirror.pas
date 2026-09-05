@@ -79,9 +79,12 @@ var
   Headers: THTTPHeaders;
   Response: THTTPResponse;
   Header: THTTPHeader;
-  ContentType: string;
+  ContentType, CanonicalBase: string;
 begin
-  if not RegistryURIIsCanonical(AURL, True) then
+  CanonicalBase := AURL;
+  if Pos('?', CanonicalBase) > 0 then
+    CanonicalBase := Copy(CanonicalBase, 1, Pos('?', CanonicalBase) - 1);
+  if not RegistryURIIsCanonical(CanonicalBase, True) or (Pos('#', AURL) > 0) then
     raise ELWPTRegistryError.CreateStable('invalid_registry_uri', 'noncanonical request URI');
   Options := DefaultHTTPRequestOptions;
   Options.MaxResponseBodyBytes := AMaximumBytes;
@@ -181,12 +184,36 @@ begin
   if API <> '' then Store.CacheDocument(APath, Result);
 end;
 
+procedure RememberRetrieval(var AProof: TLWPTRegistryProof; const ABytes: TBytes);
+var
+  Index: Integer;
+begin
+  Index := Length(AProof.RetrievalDocuments);
+  SetLength(AProof.RetrievalDocuments, Index + 1);
+  AProof.RetrievalDocuments[Index] := ABytes;
+end;
+
 function TLWPTRegistryMirror.VerifyStateProof(const AState: TLWPTRegistryState;
   AProgress: TSHA256Progress): TLWPTVerifiedRegistry;
 var
   Source: TMirrorDocumentSource;
   Proof: TLWPTRegistryProof;
-  Prefix: string;
+  Prefix, Sequence: string;
+  Sequences: TStringList;
+  Budget: TLWPTRegistryMetadataBudget;
+  Index: Integer;
+  Rotation: TLWPTUntrustedRegistryRotation;
+  KeyTrust: TLWPTRegistryTrust;
+  function ReadBounded(const APath: string; const AAuxiliary: Boolean = False): TBytes;
+  var
+    Allowance: Int64;
+  begin
+    Allowance := Budget.Allowance;
+    if Allowance > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then Allowance := MAX_REGISTRY_CONTROL_DOCUMENT_BYTES;
+    Result := LoadResource(APath, AProgress, Allowance);
+    Budget.Account(Result);
+    if AAuxiliary then RememberRetrieval(Proof, Result);
+  end;
 begin
   Prefix := 'checkpoints/renewals/sha256/' + Copy(AState.CheckpointHash, 8, 64);
   if not RegistryHashIsCanonical(AState.CheckpointHash)
@@ -194,17 +221,38 @@ begin
     or (AState.SignaturePath <> Prefix + '.sig.toml') then
     raise ELWPTRegistryError.CreateStable('state_corrupt', 'invalid mirror proof paths');
   Proof := Default(TLWPTRegistryProof);
-  Proof.Checkpoint := LoadResource(AState.CheckpointPath, AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
-  Proof.Signature := LoadResource(AState.SignaturePath, AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
-  ValidateRegistryKeyDocument(LoadResource(RegistryKeyStoragePath(Config.TrustKeyID),
-    AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES), Trust, AState.Sequence);
   Source := TMirrorDocumentSource.Create;
+  Budget := TLWPTRegistryMetadataBudget.Create(DefaultRegistryVerificationLimits);
+  Sequences := nil;
   try
+    Proof.Checkpoint := ReadBounded(AState.CheckpointPath);
+    Proof.Signature := ReadBounded(AState.SignaturePath);
+    ValidateRegistryKeyDocument(ReadBounded(RegistryKeyStoragePath(Config.TrustKeyID), True),
+      Trust, AState.Sequence);
+    Sequences := RotationSequences(AState, AProgress);
+    SetLength(Proof.Rotations, Sequences.Count);
+    Index := 0;
+    for Sequence in Sequences do
+    begin
+      Prefix := 'rotations/' + Sequence;
+      Proof.Rotations[Index].Document := ReadBounded(Prefix + '.toml');
+      Proof.Rotations[Index].OldSignature := ReadBounded(Prefix + '.old.sig.toml');
+      Proof.Rotations[Index].NewSignature := ReadBounded(Prefix + '.new.sig.toml');
+      Rotation := InspectRegistryRotation(Proof.Rotations[Index].Document);
+      KeyTrust.Origin := Config.Identity;
+      KeyTrust.KeyId := Rotation.ToKey;
+      KeyTrust.PublicKey := Rotation.ToPublicKey;
+      ValidateRegistryKeyDocument(ReadBounded(RegistryKeyStoragePath(Rotation.ToKey), True),
+        KeyTrust, Rotation.EffectiveSequence, True);
+      Inc(Index);
+    end;
     Source.Store := Self;
     Source.Progress := AProgress;
     Result := VerifyRegistryProof(Proof, Trust, Accepted(AState), RegistryTimestampNow,
       rvmLockedProof, Source, DefaultRegistryVerificationLimits);
   finally
+    Sequences.Free;
+    Budget.Free;
     Source.Free;
   end;
 end;
@@ -228,11 +276,24 @@ function TLWPTRegistryMirror.ResourceIsPublished(const AState: TLWPTRegistryStat
 var
   Verified: TLWPTVerifiedRegistry;
   Document: TLWPTRegistryDocument;
+  RotationProof: TLWPTRegistryRotationProof;
+  Rotation: TLWPTUntrustedRegistryRotation;
+  Prefix: string;
 begin
   if StartsStr('checkpoints/', ARelative) then
     Exit((ARelative = AState.CheckpointPath) or (ARelative = AState.SignaturePath));
-  if not StartsStr('snapshots/', ARelative) then Exit(True);
+  if not StartsStr('snapshots/', ARelative) and not StartsStr('rotations/', ARelative)
+    and not StartsStr('keys/', ARelative) then Exit(True);
   Verified := VerifyStateProof(AState, AProgress);
+  if ARelative = RegistryKeyStoragePath(Config.TrustKeyID) then Exit(True);
+  for RotationProof in Verified.Proof.Rotations do
+  begin
+    Rotation := InspectRegistryRotation(RotationProof.Document);
+    Prefix := 'rotations/' + IntToStr(Rotation.EffectiveSequence);
+    if (ARelative = Prefix + '.toml') or (ARelative = Prefix + '.old.sig.toml')
+      or (ARelative = Prefix + '.new.sig.toml')
+      or (ARelative = RegistryKeyStoragePath(Rotation.ToKey)) then Exit(True);
+  end;
   for Document in Verified.Documents do
     if Document.Path = ARelative then Exit(True);
   Result := False;
@@ -252,7 +313,7 @@ var
   Discovery: TLWPTRegistryDiscovery;
   Proof: TLWPTRegistryProof;
   Prior: TLWPTRegistryAcceptedState;
-  Verified: TLWPTVerifiedRegistry;
+  Verified, PriorVerified: TLWPTVerifiedRegistry;
   Source: TMirrorDocumentSource;
   State: TLWPTRegistryState;
   Package: TLWPTRegistryPackage;
@@ -260,6 +321,40 @@ var
   ArchiveStream: TStream;
   HasRotations: Boolean;
   ObjectPath, FullPath, Prefix: string;
+  Budget: TLWPTRegistryMetadataBudget;
+  Hint: TLWPTUntrustedRegistryCheckpoint;
+  Rotation: TLWPTUntrustedRegistryRotation;
+  RotationProof: TLWPTRegistryRotationProof;
+  KeyTrust: TLWPTRegistryTrust;
+  KeyDocuments: TLWPTRegistryDocumentArray;
+  KeyResource: TLWPTRegistryDocument;
+  Page: TLWPTRegistryRotationPage;
+  PageItem: TLWPTRegistryRotationPageItem;
+  Cursors: TStringList;
+  PageSize, Index: Integer;
+  AfterSequence, PreviousSequence, PinnedSequence: Int64;
+  CurrentKey, Cursor, PageURL: string;
+
+  function Control(const AURL, AKind: string; const AAuxiliary: Boolean = True): TBytes;
+  var
+    Allowance: Int64;
+  begin
+    Allowance := Budget.Allowance;
+    if Allowance > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then Allowance := MAX_REGISTRY_CONTROL_DOCUMENT_BYTES;
+    Result := GetDocument(AURL, 'application/vnd.' + PROGRAM_NAME + '.registry-' + AKind + '+toml', Allowance);
+    Budget.Account(Result);
+    if AAuxiliary then RememberRetrieval(Proof, Result);
+  end;
+
+  procedure KeepKey(const AKeyID: string; const ABytes: TBytes);
+  var
+    KeyIndex: Integer;
+  begin
+    KeyIndex := Length(KeyDocuments);
+    SetLength(KeyDocuments, KeyIndex + 1);
+    KeyDocuments[KeyIndex].Path := RegistryKeyStoragePath(AKeyID);
+    KeyDocuments[KeyIndex].Bytes := ABytes;
+  end;
 
   procedure RequireScope(const AURL: string);
   begin
@@ -271,16 +366,29 @@ begin
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
   Lease := nil;
   Source := nil;
+  Budget := TLWPTRegistryMetadataBudget.Create(DefaultRegistryVerificationLimits);
+  Cursors := TStringList.Create;
+  Proof := Default(TLWPTRegistryProof);
   try
     Lease := Coordinator.TryAcquire('registry-publication', 'registry mirror synchronization');
     if not Assigned(Lease) then
       raise ELWPTRegistryError.CreateStable('publication_locked', 'another synchronization owns this mirror');
     try
       Prior := Default(TLWPTRegistryAcceptedState);
-      if FileExists(RootPath('state/current.toml')) then Prior := Accepted(LoadCurrentState);
-      Document := GetDocument(Config.UpstreamURL + '/.well-known/' + PROGRAM_NAME
-        + '-registry', 'application/vnd.' + PROGRAM_NAME + '.registry-discovery+toml',
-        MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
+      if FileExists(RootPath('state/current.toml')) then
+      begin
+        State := ReadCurrentState;
+        PriorVerified := VerifyStateProof(State);
+        Prior := Accepted(State);
+        Proof.Rotations := PriorVerified.Proof.Rotations;
+        for RotationProof in Proof.Rotations do
+        begin
+          Budget.Account(RotationProof.Document);
+          Budget.Account(RotationProof.OldSignature);
+          Budget.Account(RotationProof.NewSignature);
+        end;
+      end;
+      Document := Control(Config.UpstreamURL + '/.well-known/' + PROGRAM_NAME + '-registry', 'discovery');
       Discovery := ParseRegistryDiscovery(Text(Document));
       if Discovery.Origin <> Config.Identity then
         raise ELWPTRegistryError.CreateStable('registry_origin_mismatch', 'discovery changed the pinned identity');
@@ -290,25 +398,79 @@ begin
       RequireScope(Discovery.Capabilities);
       RequireScope(Discovery.Checkpoint);
       if Discovery.Rotations <> '' then RequireScope(Discovery.Rotations);
-      Document := GetDocument(Discovery.Capabilities, 'application/vnd.' + PROGRAM_NAME
-        + '.registry-capabilities+toml', MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
-      ValidateRegistryCapabilities(Text(Document), Discovery.RoleName, HasRotations);
+      Document := Control(Discovery.Capabilities, 'capabilities');
+      PageSize := ValidateRegistryCapabilities(Text(Document), Discovery.RoleName, HasRotations);
+      if PageSize > 100 then PageSize := 100;
       if HasRotations <> (Discovery.Rotations <> '') then
         raise ELWPTRegistryError.CreateStable('registry_rotation_capability_mismatch', 'inconsistent discovery capabilities');
-      Proof := Default(TLWPTRegistryProof);
-      Proof.Checkpoint := GetDocument(Discovery.Checkpoint, 'application/vnd.' + PROGRAM_NAME
-        + '.registry-checkpoint+toml', MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
-      Proof.Signature := GetDocument(Copy(Discovery.Checkpoint, 1, Length(Discovery.Checkpoint) - 5)
-        + '.sig.toml', 'application/vnd.' + PROGRAM_NAME + '.registry-signature+toml',
-        MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
+      Proof.Checkpoint := Control(Discovery.Checkpoint, 'checkpoint', False);
+      Proof.Signature := Control(Copy(Discovery.Checkpoint, 1, Length(Discovery.Checkpoint) - 5)
+        + '.sig.toml', 'signature', False);
+      Hint := InspectRegistryCheckpoint(Proof.Checkpoint);
+      KeyDocument := Control(Discovery.API + '/keys/' + Config.TrustKeyID + '.toml', 'key');
+      PinnedSequence := ValidateRegistryKeyDocument(KeyDocument, Trust, Hint.Sequence);
+      KeepKey(Config.TrustKeyID, KeyDocument);
+      CurrentKey := Config.TrustKeyID;
+      AfterSequence := 0;
+      if PinnedSequence > 1 then AfterSequence := PinnedSequence;
+      if Length(Proof.Rotations) > 0 then
+      begin
+        Rotation := InspectRegistryRotation(Proof.Rotations[High(Proof.Rotations)].Document);
+        CurrentKey := Rotation.ToKey;
+        AfterSequence := Rotation.EffectiveSequence;
+      end;
+      PreviousSequence := AfterSequence;
+      Cursor := '';
+      while CurrentKey <> Hint.KeyId do
+      begin
+        if not HasRotations then
+          raise ELWPTRegistryError.Create('registry_key_rotation_incomplete');
+        PageURL := Discovery.Rotations + '?after=' + IntToStr(AfterSequence)
+          + '&limit=' + IntToStr(PageSize);
+        if Cursor <> '' then PageURL := PageURL + '&cursor=' + RegistryQueryEncode(Cursor);
+        Document := Control(PageURL, 'rotation-page');
+        Page := ParseRegistryRotationPage(Document, Config.Identity, Discovery.API,
+          PreviousSequence, PageSize);
+        for PageItem in Page.Items do
+        begin
+          if (PageItem.EffectiveSequence > Hint.Sequence)
+            or (Length(Proof.Rotations) >= DefaultRegistryVerificationLimits.Rotations) then
+            raise ELWPTRegistryError.Create('rotation_chain_invalid');
+          RotationProof.Document := Control(PageItem.Rotation, 'key-rotation', False);
+          Rotation := InspectRegistryRotation(RotationProof.Document);
+          if (Rotation.Origin <> Config.Identity) or (Rotation.FromKey <> CurrentKey)
+            or (Rotation.EffectiveSequence <> PageItem.EffectiveSequence) then
+            raise ELWPTRegistryError.Create('rotation_chain_invalid');
+          RotationProof.OldSignature := Control(PageItem.OldSignature, 'signature', False);
+          RotationProof.NewSignature := Control(PageItem.NewSignature, 'signature', False);
+          Index := Length(Proof.Rotations);
+          SetLength(Proof.Rotations, Index + 1);
+          Proof.Rotations[Index] := RotationProof;
+          CurrentKey := Rotation.ToKey;
+          PreviousSequence := Rotation.EffectiveSequence;
+          if CurrentKey = Hint.KeyId then Break;
+        end;
+        if CurrentKey = Hint.KeyId then Break;
+        if (Page.NextCursor = '') or (Cursors.IndexOf(Page.NextCursor) >= 0) then
+          raise ELWPTRegistryError.Create('registry_key_rotation_incomplete');
+        Cursors.Add(Page.NextCursor);
+        Cursor := Page.NextCursor;
+      end;
+      for RotationProof in Proof.Rotations do
+      begin
+        Rotation := InspectRegistryRotation(RotationProof.Document);
+        KeyTrust.Origin := Config.Identity;
+        KeyTrust.KeyId := Rotation.ToKey;
+        KeyTrust.PublicKey := Rotation.ToPublicKey;
+        KeyDocument := Control(Discovery.API + '/keys/' + Rotation.ToKey + '.toml', 'key');
+        ValidateRegistryKeyDocument(KeyDocument, KeyTrust, Rotation.EffectiveSequence, True);
+        KeepKey(Rotation.ToKey, KeyDocument);
+      end;
       Source := TMirrorDocumentSource.Create;
       Source.Store := Self;
       Source.API := Discovery.API;
       Verified := VerifyRegistryProof(Proof, Trust, Prior, RegistryTimestampNow,
         rvmAcquire, Source, DefaultRegistryVerificationLimits);
-      KeyDocument := GetDocument(Discovery.API + '/keys/' + Config.TrustKeyID + '.toml',
-        'application/vnd.' + PROGRAM_NAME + '.registry-key+toml', MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
-      ValidateRegistryKeyDocument(KeyDocument, Trust, Verified.State.Sequence);
       for Package in Verified.Packages do
       begin
         if Package.ArchiveSize > MAXIMUM_MIRROR_ARCHIVE_BYTES then
@@ -350,7 +512,15 @@ begin
       State.SignaturePath := Prefix + '.sig.toml';
       WriteImmutable(State.CheckpointPath, Proof.Checkpoint);
       WriteImmutable(State.SignaturePath, Proof.Signature);
-      WriteImmutable(RegistryKeyStoragePath(Config.TrustKeyID), KeyDocument);
+      for KeyResource in KeyDocuments do WriteImmutable(KeyResource.Path, KeyResource.Bytes);
+      for RotationProof in Proof.Rotations do
+      begin
+        Rotation := InspectRegistryRotation(RotationProof.Document);
+        Prefix := 'rotations/' + IntToStr(Rotation.EffectiveSequence);
+        WriteImmutable(Prefix + '.toml', RotationProof.Document);
+        WriteImmutable(Prefix + '.old.sig.toml', RotationProof.OldSignature);
+        WriteImmutable(Prefix + '.new.sig.toml', RotationProof.NewSignature);
+      end;
       SaveAttempt('verified');
       { All immutable files are closed and verified before this atomic pointer.
         This is process-interruption recovery, not an fsync power-loss promise. }
@@ -363,6 +533,8 @@ begin
       end;
     end;
   finally
+    Cursors.Free;
+    Budget.Free;
     Source.Free;
     Lease.Free;
     Coordinator.Free;

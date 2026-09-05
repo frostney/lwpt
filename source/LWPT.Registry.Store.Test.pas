@@ -22,6 +22,7 @@ uses
   LWPT.Registry.Server,
   LWPT.Registry.Server.NetworkFramework,
   LWPT.Registry.Store,
+  LWPT.Registry.Verification,
   TransportSecurity,
   TestingPascalLibrary,
   Tests.Scratch;
@@ -227,6 +228,8 @@ type
     procedure TestCheckpointResponsesRequireRevalidation;
     procedure TestReadersObserveCompleteStateDuringPublication;
     procedure TestTamperedSignatureHasStableDiagnostic;
+    procedure TestRotationFailureDoesNotPublish;
+    procedure TestRotationActivationRetryAndSeedSelection;
   end;
 
 procedure TRegistryStoreContract.TestDarwinTLSTransportSelection;
@@ -1430,12 +1433,13 @@ begin
     Body := TEncoding.UTF8.GetString(Response.Body);
     Expect<Boolean>(Pos('package-list-v1', Body) = 0).ToBe(True);
     Expect<Boolean>(Pos('publication-v1', Body) = 0).ToBe(True);
-    Expect<Boolean>(Pos('rotation-chain-v1', Body) = 0).ToBe(True);
+    Expect<Boolean>(Pos('rotation-chain-v1', Body) > 0).ToBe(True);
     Expect<Boolean>(Pos('auth_schemes = []', Body) > 0).ToBe(True);
     Response := RegistryHTTPResponse(Store, 'GET',
       '/.well-known/' + PROGRAM_NAME + '-registry');
     Body := TEncoding.UTF8.GetString(Response.Body);
-    Expect<Boolean>(Pos('rotations =', Body) = 0).ToBe(True);
+    Expect<Boolean>(Pos('rotations =', Body) > 0).ToBe(True);
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/rotations?after=0&limit=1').Status).ToBe(200);
   finally
     Store.Free;
   end;
@@ -1691,8 +1695,132 @@ begin
   Expect<Boolean>(Pos('signature_invalid:', Diagnostic) = 1).ToBe(True);
 end;
 
+procedure TRegistryStoreContract.TestRotationFailureDoesNotPublish;
+const
+  Points: array[0..1] of string = ('rotation-record', 'rotation-checkpoint');
+var
+  Store: TLWPTRegistryStore;
+  State: TLWPTRegistryState;
+  RootKey, PendingKey, RootPath, PointerBefore, Diagnostic: string;
+  Index: Integer;
+begin
+  for Index := 0 to High(Points) do
+  begin
+    RootPath := FScratch + '/' + IntToStr(Index);
+    Store := TLWPTRegistryStore.Initialize(RootPath, DefaultConfig, RegistryTimestampNow);
+    try
+      State := Store.LoadCurrentState;
+      RootKey := InspectRegistryCheckpoint(Store.LoadResource(State.CheckpointPath)).KeyId;
+      PointerBefore := ReadBinaryFile(RootPath + '/state/current.toml');
+      SetFailurePoint(Points[Index]);
+      Diagnostic := '';
+      try
+        Store.RotateKey(RootKey, RegistryTimestampNow);
+      except
+        on E: Exception do Diagnostic := E.Message;
+      end;
+      SetFailurePoint('');
+      Expect<Boolean>(Pos('injected_registry_failure:', Diagnostic) = 1).ToBe(True);
+      PendingKey := InspectRegistryRotation(Store.LoadResource('rotations/2.toml')).ToKey;
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/rotations/2.toml').Status).ToBe(404);
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/rotations/2.old.sig.toml').Status).ToBe(404);
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/checkpoints/2.toml').Status).ToBe(404);
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/keys/' + PendingKey + '.toml').Status).ToBe(404);
+      Expect<string>(ReadBinaryFile(RootPath + '/state/current.toml')).ToBe(PointerBefore);
+    finally
+      SetFailurePoint('');
+      Store.Free;
+    end;
+    Store := TLWPTRegistryStore.Create(RootPath);
+    try
+      Expect<Boolean>(FileExists(RootPath + '/rotations/2.toml')).ToBe(False);
+      Store.RotateKey(RootKey, RegistryTimestampNow);
+      Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(2);
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/rotations/2.new.sig.toml').Status).ToBe(200);
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/keys/' + PendingKey + '.toml').Status).ToBe(404);
+      Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/checkpoints/1.toml').Status).ToBe(200);
+    finally
+      Store.Free;
+    end;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestRotationActivationRetryAndSeedSelection;
+var
+  Store: TLWPTRegistryStore;
+  State: TLWPTRegistryState;
+  Publication: TLWPTRegistryPublication;
+  RootKey, ActiveKey, SeedPath, Diagnostic: string;
+  {$IFDEF UNIX}
+  Info: BaseUnix.Stat;
+  {$ENDIF}
+begin
+  Store := TLWPTRegistryStore.Initialize(FScratch, DefaultConfig, RegistryTimestampNow);
+  try
+    RootKey := InspectRegistryCheckpoint(Store.LoadResource(Store.LoadCurrentState.CheckpointPath)).KeyId;
+    SetFailurePoint('rotation-activation');
+    Diagnostic := '';
+    try
+      Store.RotateKey(RootKey, RegistryTimestampNow);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Pos('injected_registry_failure:', Diagnostic) = 1).ToBe(True);
+  finally
+    SetFailurePoint('');
+    Store.Free;
+  end;
+  Store := TLWPTRegistryStore.Create(FScratch);
+  try
+    State := Store.LoadCurrentState;
+    Expect<Int64>(State.Sequence).ToBe(2);
+    ActiveKey := InspectRegistryCheckpoint(Store.LoadResource(State.CheckpointPath)).KeyId;
+    Diagnostic := '';
+    try
+      Store.RotateKey(RootKey, RegistryTimestampNow);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Pos('rotation_precondition_failed:', Diagnostic) = 1).ToBe(True);
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(2);
+    SeedPath := FScratch + '/' + ChangeFileExt(RegistryKeyStoragePath(ActiveKey), '.seed');
+    {$IFDEF UNIX}
+    if FpStat(SeedPath, Info) <> 0 then RaiseLastOSError;
+    Expect<Integer>(Info.st_mode and &777).ToBe(&600);
+    {$ENDIF}
+    Expect<Boolean>(FileExists(FScratch + '/keys/root.seed')).ToBe(True);
+    Publication.Name := 'after-rotation';
+    Publication.Version := '1.0.0';
+    Publication.PublishedAt := RegistryTimestampNow;
+    Publication.Archive := BytesOf('after rotation');
+    Expect<Boolean>(RenameFile(SeedPath, SeedPath + '.held')).ToBe(True);
+    try
+      Diagnostic := '';
+      try
+        Store.Publish(Publication);
+      except
+        on E: Exception do Diagnostic := E.Message;
+      end;
+      Expect<Boolean>(Pos('key_id_mismatch:', Diagnostic) = 1).ToBe(True);
+      Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(2);
+    finally
+      if not RenameFile(SeedPath + '.held', SeedPath) then RaiseLastOSError;
+    end;
+    Store.Publish(Publication);
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(3);
+    Store.EnsureFreshCheckpoint('2099-01-01T00:00:00Z');
+    State := Store.LoadCurrentState;
+    Expect<Int64>(State.Sequence).ToBe(3);
+    Expect<string>(InspectRegistryCheckpoint(Store.LoadResource(State.CheckpointPath)).KeyId).ToBe(ActiveKey);
+  finally
+    Store.Free;
+  end;
+end;
+
 procedure TRegistryStoreContract.SetupTests;
 begin
+  Test('uncommitted rotations and keys stay hidden and recover for retry', TestRotationFailureDoesNotPublish);
+  Test('rotation activation guards retries and reloads the active private seed', TestRotationActivationRetryAndSeedSelection);
   Test('default identity is deterministic', TestDefaultIdentityIsDeterministic);
   Test('default identity survives HTTPS reconfiguration',
     TestDefaultIdentitySurvivesHTTPSReconfiguration);

@@ -16,6 +16,7 @@ uses
   Tests.LwptSubprocess,
   Tests.RegistryOrigin,
   Tests.RegistryProcess,
+  Tests.RegistryServer,
   Tests.Scratch,
   TOML;
 
@@ -25,7 +26,7 @@ type
     FScratch, FMirrorRoot, FMirrorURL: string;
     FOrigin: TRegistryOriginFixture;
     FMirrorServer: TProcess;
-    function InitMirror(const AKeyID, APublicKey: string): TLwptResult;
+    function InitMirror(const AKeyID, APublicKey: string; const AUpstream: string = ''): TLwptResult;
     function Sync: TLwptResult;
     procedure RequireSuccess(const ALabel: string; const ARun: TLwptResult);
   protected
@@ -39,6 +40,9 @@ type
     procedure MissingAndWrongPinsFailClosed;
     procedure UpstreamKeyBytesArePreserved;
     procedure ForcedShutdownIsBounded;
+    procedure SignedRotationsSurviveOutage;
+    procedure ReadinessPreservesCLIDiagnostic;
+    procedure BootstrapConsumesMultipleRotationPages;
   end;
 
 function ReadBytes(const APath: string): TBytes;
@@ -126,15 +130,17 @@ begin
   if ARun.ExitCode <> 0 then raise Exception.Create(ALabel + ': ' + ARun.Stderr);
 end;
 
-function TRegistryMirrorE2E.InitMirror(const AKeyID, APublicKey: string): TLwptResult;
+function TRegistryMirrorE2E.InitMirror(const AKeyID, APublicKey: string; const AUpstream: string): TLwptResult;
 var
-  Port: string;
+  Port, Upstream: string;
 begin
+  Upstream := AUpstream;
+  if Upstream = '' then Upstream := FOrigin.BaseURL;
   Port := Copy(FMirrorURL, Length('http://localhost:') + 1, MaxInt);
   Port := Copy(Port, 1, Pos('/', Port) - 1);
   Result := RunLwpt(['registry', 'init', '--role', 'mirror', '--data-dir', FMirrorRoot,
     '--identity', FOrigin.BaseURL, '--base-url', FMirrorURL, '--port', Port,
-    '--upstream', FOrigin.BaseURL, '--key-id', AKeyID, '--public-key', APublicKey]);
+    '--upstream', Upstream, '--key-id', AKeyID, '--public-key', APublicKey]);
 end;
 
 function TRegistryMirrorE2E.Sync: TLwptResult;
@@ -263,6 +269,168 @@ begin
     + FOrigin.KeyID + '.toml'))).ToBe(KeyDocument);
 end;
 
+procedure TRegistryMirrorE2E.SignedRotationsSurviveOutage;
+var
+  KeyTwo, KeyThree, PointerBefore, RotationPath, Page, Cursor: string;
+  OldSignature, RotationDocument: TBytes;
+begin
+  FOrigin.Publish('rotating-package', '1.0.0', BytesOf('rotating archive'));
+  FOrigin.Start;
+  RequireSuccess('first local rotation', RunLwpt(['registry', 'rotate-key', '--data-dir',
+    FOrigin.Root, '--from-key', FOrigin.KeyID]));
+  KeyTwo := Field(Text(RegistryHTTPBody(FOrigin.BaseURL + '/v1/checkpoints/latest.toml')), 'key_id');
+  RequireSuccess('second local rotation', RunLwpt(['registry', 'rotate-key', '--data-dir',
+    FOrigin.Root, '--from-key', KeyTwo]));
+  KeyThree := Field(Text(RegistryHTTPBody(FOrigin.BaseURL + '/v1/checkpoints/latest.toml')), 'key_id');
+  Expect<Integer>(RunLwpt(['registry', 'rotate-key', '--data-dir', FOrigin.Root,
+    '--from-key', KeyTwo]).ExitCode).ToBe(1);
+  Expect<string>(Field(Text(RegistryHTTPBody(FOrigin.BaseURL + '/v1/checkpoints/latest.toml')), 'key_id')).ToBe(KeyThree);
+  RequireSuccess('root-pinned mirror init after two rotations', InitMirror(FOrigin.KeyID, FOrigin.PublicKey));
+  RequireSuccess('bootstrap verifies both complete signed transitions', Sync);
+  FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
+  Page := Text(RegistryHTTPBody(FMirrorURL + '/v1/rotations?after=0&limit=1'));
+  Expect<Boolean>(Pos('effective_sequence = 3', Page) > 0).ToBe(True);
+  Cursor := Field(Page, 'next_cursor');
+  Expect<Boolean>(Cursor <> '').ToBe(True);
+  Page := Text(RegistryHTTPBody(FMirrorURL + '/v1/rotations?after=0&limit=1&cursor=' + Cursor));
+  Expect<Boolean>(Pos('effective_sequence = 4', Page) > 0).ToBe(True);
+  Expect<string>(Field(Page, 'next_cursor')).ToBe('');
+  Expect<Integer>(HTTPStatus(FMirrorURL + '/v1/rotations?after=1&limit=1&cursor=' + Cursor)).ToBe(400);
+  PointerBefore := Text(ReadBytes(FMirrorRoot + '/state/current.toml'));
+  RequireSuccess('incremental local rotation', RunLwpt(['registry', 'rotate-key', '--data-dir',
+    FOrigin.Root, '--from-key', KeyThree]));
+  RotationPath := FOrigin.Root + '/rotations/5';
+  OldSignature := ReadBytes(RotationPath + '.old.sig.toml');
+  RotationDocument := ReadBytes(RotationPath + '.toml');
+  WriteBytes(RotationPath + '.old.sig.toml', BytesOf('tampered'));
+  Expect<Integer>(Sync.ExitCode).ToBe(1);
+  Expect<string>(Text(ReadBytes(FMirrorRoot + '/state/current.toml'))).ToBe(PointerBefore);
+  Expect<Integer>(HTTPStatus(FMirrorURL + '/v1/rotations/5.toml')).ToBe(404);
+  WriteBytes(RotationPath + '.old.sig.toml', OldSignature);
+  WriteBytes(RotationPath + '.toml', BytesOf(StringReplace(Text(RotationDocument),
+    'from_key = "' + KeyThree + '"', 'from_key = "' + FOrigin.KeyID + '"', [])));
+  Expect<Integer>(Sync.ExitCode).ToBe(1);
+  Expect<string>(Text(ReadBytes(FMirrorRoot + '/state/current.toml'))).ToBe(PointerBefore);
+  WriteBytes(RotationPath + '.toml', RotationDocument);
+  Expect<Boolean>(DeleteFile(RotationPath + '.old.sig.toml')).ToBe(True);
+  Expect<Integer>(Sync.ExitCode).ToBe(1);
+  Expect<string>(Text(ReadBytes(FMirrorRoot + '/state/current.toml'))).ToBe(PointerBefore);
+  WriteBytes(RotationPath + '.old.sig.toml', OldSignature);
+  RequireSuccess('retry accepts only the verified new transition', Sync);
+  Expect<Integer>(HTTPStatus(FMirrorURL + '/v1/rotations/3.old.sig.toml')).ToBe(200);
+  Expect<Integer>(HTTPStatus(FMirrorURL + '/v1/keys/' + KeyTwo + '.toml')).ToBe(200);
+  FOrigin.Stop;
+  StopRegistryCLI(FMirrorServer);
+  FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
+  Expect<Integer>(HTTPStatus(FMirrorURL + '/v1/rotations/5.new.sig.toml')).ToBe(200);
+  RequireSuccess('offline verification retains the entire signed chain',
+    RunLwpt(['registry', 'verify', '--data-dir', FMirrorRoot]));
+  Expect<Boolean>(FileExists(FMirrorRoot + '/keys/root.seed')).ToBe(False);
+end;
+
+procedure TRegistryMirrorE2E.ReadinessPreservesCLIDiagnostic;
+var
+  Child: TProcess;
+  Diagnostic: string;
+begin
+  Child := nil;
+  Diagnostic := '';
+  try
+    try
+      Child := StartRegistryCLI(FScratch + '/missing', FMirrorURL);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    if Pos('exit=1', Diagnostic) = 0 then WriteLn(StdErr, Diagnostic);
+    Expect<Boolean>(Pos('exit=1', Diagnostic) > 0).ToBe(True);
+    Expect<Boolean>(Pos('origin_not_initialized:', Diagnostic) > 0).ToBe(True);
+    Expect<Boolean>(Pos('last probe:', Diagnostic) > 0).ToBe(True);
+  finally
+    StopRegistryCLI(Child);
+  end;
+end;
+
+procedure TRegistryMirrorE2E.BootstrapConsumesMultipleRotationPages;
+var
+  Proxy: TRegistryTestServer;
+  Routes: TRegistryHTTPRouteArray;
+  ProxyURL, KeyTwo, Page, Cursor: string;
+
+  procedure AddRoute(const APath, AKind: string; const ARewrite: Boolean = False);
+  var
+    Body: TBytes;
+    Document: string;
+  begin
+    Body := RegistryHTTPBody(FOrigin.BaseURL + APath);
+    if ARewrite then
+    begin
+      Document := StringReplace(Text(Body), FOrigin.BaseURL + '/v1', ProxyURL + '/v1', [rfReplaceAll]);
+      Document := StringReplace(Document, 'base_url = "' + FOrigin.BaseURL + '"',
+        'base_url = "' + ProxyURL + '"', []);
+      Document := StringReplace(Document, 'max_page_size = 100', 'max_page_size = 1', []);
+      Body := BytesOf(Document);
+    end;
+    SetLength(Routes, Length(Routes) + 1);
+    Routes[High(Routes)] := RegistryRoute('/proxy' + APath,
+      'application/vnd.lwpt.registry-' + AKind + '+toml', Body);
+  end;
+
+  procedure AddPublicDirectory(const ADirectory, AKind: string);
+  var
+    Entry: TSearchRec;
+    Name, Kind: string;
+  begin
+    if FindFirst(FOrigin.Root + '/' + ADirectory + '/*.toml', faAnyFile, Entry) <> 0 then Exit;
+    try
+      repeat
+        if Entry.Attr and faDirectory <> 0 then Continue;
+        Name := Entry.Name;
+        Kind := AKind;
+        if ADirectory = 'keys' then
+          Name := Field(Text(ReadBytes(FOrigin.Root + '/keys/' + Name)), 'key_id') + '.toml';
+        if Pos('.sig.toml', Name) > 0 then Kind := 'signature';
+        AddRoute('/v1/' + ADirectory + '/' + Name, Kind);
+      until FindNext(Entry) <> 0;
+    finally
+      FindClose(Entry);
+    end;
+  end;
+
+begin
+  FOrigin.Start;
+  RequireSuccess('first pagination rotation', RunLwpt(['registry', 'rotate-key',
+    '--data-dir', FOrigin.Root, '--from-key', FOrigin.KeyID]));
+  KeyTwo := Field(Text(RegistryHTTPBody(FOrigin.BaseURL + '/v1/checkpoints/latest.toml')), 'key_id');
+  RequireSuccess('second pagination rotation', RunLwpt(['registry', 'rotate-key',
+    '--data-dir', FOrigin.Root, '--from-key', KeyTwo]));
+  Proxy := TRegistryTestServer.Create(nil);
+  try
+    ProxyURL := 'http://localhost:' + IntToStr(Proxy.Port) + '/proxy';
+    AddRoute('/.well-known/lwpt-registry', 'discovery', True);
+    AddRoute('/v1/capabilities', 'capabilities', True);
+    AddRoute('/v1/checkpoints/latest.toml', 'checkpoint');
+    AddRoute('/v1/checkpoints/latest.sig.toml', 'signature');
+    AddPublicDirectory('keys', 'key');
+    AddPublicDirectory('rotations', 'key-rotation');
+    AddPublicDirectory('snapshots/sha256', 'snapshot');
+    Page := Text(RegistryHTTPBody(FOrigin.BaseURL + '/v1/rotations?after=0&limit=1'));
+    Cursor := Field(Page, 'next_cursor');
+    Expect<Boolean>(Cursor <> '').ToBe(True);
+    AddRoute('/v1/rotations?after=0&limit=1', 'rotation-page', True);
+    AddRoute('/v1/rotations?after=0&limit=1&cursor=' + Cursor, 'rotation-page', True);
+    Proxy.SetRoutes(Routes);
+    Proxy.Start;
+    FOrigin.Stop;
+    RequireSuccess('mirror initialized against one-item-page transport',
+      InitMirror(FOrigin.KeyID, FOrigin.PublicKey, ProxyURL));
+    RequireSuccess('actual CLI consumes both pages and original signed bytes', Sync);
+    RequireSuccess('retained multi-page proof verifies without origin',
+      RunLwpt(['registry', 'verify', '--data-dir', FMirrorRoot]));
+  finally
+    Proxy.Free;
+  end;
+end;
+
 procedure TRegistryMirrorE2E.ForcedShutdownIsBounded;
 var
   Child: TProcess;
@@ -326,6 +494,9 @@ begin
   Test('missing and wrong root pins fail without trust replacement', MissingAndWrongPinsFailClosed);
   Test('mirror preserves exact pinned upstream key bytes', UpstreamKeyBytesArePreserved);
   Test('shared listener shutdown force-kills and reaps within its bound', ForcedShutdownIsBounded);
+  Test('signed rotation bootstrap and incremental retry retain offline provenance', SignedRotationsSurviveOutage);
+  Test('readiness failures retain the original CLI diagnostic and exit status', ReadinessPreservesCLIDiagnostic);
+  Test('bootstrap consumes multiple bounded rotation pages with exact signed bytes', BootstrapConsumesMultipleRotationPages);
 end;
 
 begin

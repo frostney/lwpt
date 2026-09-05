@@ -28,6 +28,18 @@ type
     Sequence: Int64;
     Bytes: TBytes;
   end;
+  TLWPTUntrustedRegistryRotation = record
+    Origin, FromKey, ToKey, ToPublicKey: string;
+    EffectiveSequence: Int64;
+  end;
+  TLWPTRegistryRotationPageItem = record
+    EffectiveSequence: Int64;
+    Rotation, OldSignature, NewSignature: string;
+  end;
+  TLWPTRegistryRotationPage = record
+    Items: array of TLWPTRegistryRotationPageItem;
+    NextCursor: string;
+  end;
   TLWPTRegistryDependencyArray = array of TLWPTRegistryDependency;
 
   TLWPTRegistryPackage = record
@@ -63,11 +75,24 @@ type
   TLWPTRegistryProof = record
     Checkpoint, Signature: TBytes;
     Rotations: TLWPTRegistryRotationProofArray;
+    { Untrusted acquisition bytes, charged to limits only. They grant no trust
+      and are unnecessary for a retained signed proof's offline verification. }
+    RetrievalDocuments: array of TBytes;
   end;
 
   TLWPTRegistryVerificationLimits = record
     DocumentBytes, TotalBytes: Int64;
     Documents, Snapshots, Rotations: Integer;
+  end;
+  TLWPTRegistryMetadataBudget = class
+  private
+    FLimits: TLWPTRegistryVerificationLimits;
+    FBytes: Int64;
+    FCount: Integer;
+  public
+    constructor Create(const ALimits: TLWPTRegistryVerificationLimits);
+    function Allowance: Int64;
+    procedure Account(const ABytes: TBytes);
   end;
 
   TLWPTRegistryVerificationMode = (rvmAcquire, rvmLockedProof);
@@ -91,8 +116,14 @@ type
 function DefaultRegistryVerificationLimits: TLWPTRegistryVerificationLimits;
 function ParseRegistryDiscovery(const AContent: string): TLWPTRegistryDiscovery;
 function InspectRegistryCheckpoint(const ABody: TBytes): TLWPTUntrustedRegistryCheckpoint;
-procedure ValidateRegistryKeyDocument(const ABytes: TBytes;
-  const ATrust: TLWPTRegistryTrust; const ACheckpointSequence: Int64);
+function InspectRegistryRotation(const ABytes: TBytes): TLWPTUntrustedRegistryRotation;
+function ParseRegistryRotationPage(const ABytes: TBytes;
+  const AOrigin, AAPI: string; const AAfter: Int64;
+  const AMaximumItems: Integer): TLWPTRegistryRotationPage;
+function RegistryQueryEncode(const AValue: string): string;
+function ValidateRegistryKeyDocument(const ABytes: TBytes;
+  const ATrust: TLWPTRegistryTrust; const ACheckpointSequence: Int64;
+  const AExactSequence: Boolean = False): Int64;
 function ValidateRegistryCapabilities(const AContent, ARole: string;
   out AHasRotations: Boolean): Integer;
 function RegistryURIIsCanonical(const AValue: string;
@@ -532,8 +563,9 @@ begin
   Result := Node.ScalarText = 'true';
 end;
 
-procedure ValidateRegistryKeyDocument(const ABytes: TBytes;
-  const ATrust: TLWPTRegistryTrust; const ACheckpointSequence: Int64);
+function ValidateRegistryKeyDocument(const ABytes: TBytes;
+  const ATrust: TLWPTRegistryTrust; const ACheckpointSequence: Int64;
+  const AExactSequence: Boolean): Int64;
 var
   Root: TTOMLNode;
   ValidFrom: Int64;
@@ -547,8 +579,96 @@ begin
       or (StringField(Root, 'key_id') <> ATrust.KeyId)
       or (StringField(Root, 'public_key') <> ATrust.PublicKey)
       or (StringField(Root, 'algorithm') <> 'ed25519')
-      or (ValidFrom < 1) or (ValidFrom > ACheckpointSequence) then
+      or (ValidFrom < 1) or (ValidFrom > ACheckpointSequence)
+      or (AExactSequence and (ValidFrom <> ACheckpointSequence)) then
       raise ELWPTRegistryError.Create('registry_key_pin_mismatch');
+    Result := ValidFrom;
+  finally
+    Root.Free;
+  end;
+end;
+
+function RegistryQueryEncode(const AValue: string): string;
+const
+  Hex: array[0..15] of Char = '0123456789ABCDEF';
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Length(AValue) do
+    if AValue[I] in ['A'..'Z', 'a'..'z', '0'..'9', '-', '.', '_', '~'] then
+      Result := Result + AValue[I]
+    else Result := Result + '%' + Hex[Ord(AValue[I]) shr 4] + Hex[Ord(AValue[I]) and $F];
+end;
+
+function InspectRegistryRotation(const ABytes: TBytes): TLWPTUntrustedRegistryRotation;
+var
+  Root: TTOMLNode;
+begin
+  Root := ParseCanonical(BytesText(ABytes), PROGRAM_NAME + '-registry-key-rotation-v1',
+    ['schema', 'origin', 'from_key', 'to_key', 'to_public_key', 'effective_sequence']);
+  try
+    Result.Origin := StringField(Root, 'origin');
+    Result.FromKey := StringField(Root, 'from_key');
+    Result.ToKey := StringField(Root, 'to_key');
+    Result.ToPublicKey := StringField(Root, 'to_public_key');
+    Result.EffectiveSequence := UnsignedField(Root, 'effective_sequence');
+    if not RegistryURIIsCanonical(Result.Origin, True)
+      or (Result.EffectiveSequence < 2)
+      or not RegistryTrustRootIsValid(Result.ToKey, Result.ToPublicKey) then
+      raise ELWPTRegistryError.Create('rotation_chain_invalid');
+    RegistryKeyStoragePath(Result.FromKey);
+  finally
+    Root.Free;
+  end;
+end;
+
+function ParseRegistryRotationPage(const ABytes: TBytes;
+  const AOrigin, AAPI: string; const AAfter: Int64;
+  const AMaximumItems: Integer): TLWPTRegistryRotationPage;
+var
+  Root, Items, Item: TTOMLNode;
+  I: Integer;
+  Previous: Int64;
+  Entry: TLWPTRegistryRotationPageItem;
+  Prefix: string;
+begin
+  Result := Default(TLWPTRegistryRotationPage);
+  Root := ParseCanonical(BytesText(ABytes), PROGRAM_NAME + '-registry-rotation-page-v1',
+    ['schema', 'origin', 'items', 'next_cursor']);
+  try
+    if StringField(Root, 'origin') <> AOrigin then
+      raise ELWPTRegistryError.Create('registry_rotation_origin_mismatch');
+    Result.NextCursor := StringField(Root, 'next_cursor');
+    Items := TomlGet(Root, 'items');
+    if not TomlIsArray(Items) or (Items.Items.Count > AMaximumItems)
+      or (Length(Result.NextCursor) > 1024)
+      or ((Items.Items.Count = 0) and (Result.NextCursor <> '')) then
+      raise ELWPTRegistryError.Create('invalid_registry_rotation_page');
+    SetLength(Result.Items, Items.Items.Count);
+    Previous := AAfter;
+    for I := 0 to Items.Items.Count - 1 do
+    begin
+      Item := Items.Items[I];
+      if not TomlIsTable(Item) or (Item.Children.Count <> 4) then
+        raise ELWPTRegistryError.Create('invalid_registry_rotation_page');
+      Entry.EffectiveSequence := UnsignedField(Item, 'effective_sequence');
+      Entry.Rotation := StringField(Item, 'rotation');
+      Entry.OldSignature := StringField(Item, 'old_signature');
+      Entry.NewSignature := StringField(Item, 'new_signature');
+      Prefix := AAPI + '/rotations/' + IntToStr(Entry.EffectiveSequence);
+      if (Entry.EffectiveSequence <= Previous)
+        or (Entry.Rotation <> Prefix + '.toml')
+        or (Entry.OldSignature <> Prefix + '.old.sig.toml')
+        or (Entry.NewSignature <> Prefix + '.new.sig.toml')
+        or (CanonicalTomlValue(Item) <> '{ effective_sequence = '
+          + IntToStr(Entry.EffectiveSequence) + ', rotation = ' + RegistryTOMLQuote(Entry.Rotation)
+          + ', old_signature = ' + RegistryTOMLQuote(Entry.OldSignature)
+          + ', new_signature = ' + RegistryTOMLQuote(Entry.NewSignature) + ' }') then
+        raise ELWPTRegistryError.Create('invalid_registry_rotation_page');
+      Previous := Entry.EffectiveSequence;
+      Result.Items[I] := Entry;
+    end;
   finally
     Root.Free;
   end;
@@ -714,8 +834,7 @@ type
   private
     FSource: TLWPTRegistryDocumentSource;
     FLimits: TLWPTRegistryVerificationLimits;
-    FBytes: Int64;
-    FCount: Integer;
+    FBudget: TLWPTRegistryMetadataBudget;
     FDocuments: TLWPTRegistryDocumentArray;
     FDocumentIndexes: TDictionary<string, Integer>;
     FPackages: TDictionary<string, TLWPTRegistryPackage>;
@@ -802,6 +921,9 @@ begin
     Schemas := NodeStringArray(Root, 'schemas');
     Features := NodeStringArray(Root, 'features');
     AHasRotations := Contains(Features, 'rotation-chain-v1');
+    if AHasRotations and (not Contains(Schemas, PROGRAM_NAME + '-registry-key-rotation-v1')
+      or not Contains(Schemas, PROGRAM_NAME + '-registry-rotation-page-v1')) then
+      raise ELWPTRegistryError.Create('registry_schema_capability_missing');
     AuthSchemes := NodeStringArray(Root, 'auth_schemes');
     if UnsignedField(Root, 'max_page_size') > High(Integer) then
       raise ELWPTRegistryError.Create('registry_capability_missing');
@@ -852,6 +974,7 @@ begin
     raise ELWPTRegistryError.Create('invalid_verification_limits');
   FSource := ASource;
   FLimits := ALimits;
+  FBudget := TLWPTRegistryMetadataBudget.Create(ALimits);
   FDocumentIndexes := TDictionary<string, Integer>.Create;
   FPackages := TDictionary<string, TLWPTRegistryPackage>.Create;
 end;
@@ -860,10 +983,33 @@ destructor TLWPTRegistryVerifier.Destroy;
 begin
   FPackages.Free;
   FDocumentIndexes.Free;
+  FBudget.Free;
   inherited Destroy;
 end;
 
 procedure TLWPTRegistryVerifier.Account(const ABytes: TBytes);
+begin
+  FBudget.Account(ABytes);
+end;
+
+constructor TLWPTRegistryMetadataBudget.Create(const ALimits: TLWPTRegistryVerificationLimits);
+begin
+  inherited Create;
+  FLimits := ALimits;
+  if (FLimits.DocumentBytes < 1) or (FLimits.TotalBytes < FLimits.DocumentBytes)
+    or (FLimits.Documents < 1) then
+    raise ELWPTRegistryError.Create('invalid_verification_limits');
+end;
+
+function TLWPTRegistryMetadataBudget.Allowance: Int64;
+begin
+  Result := FLimits.DocumentBytes;
+  if Result > FLimits.TotalBytes - FBytes then Result := FLimits.TotalBytes - FBytes;
+  if (Result < 1) or (FCount >= FLimits.Documents) then
+    raise ELWPTRegistryError.Create('proof_limit_exceeded: metadata budget');
+end;
+
+procedure TLWPTRegistryMetadataBudget.Account(const ABytes: TBytes);
 begin
   if (Length(ABytes) > FLimits.DocumentBytes)
     or (Length(ABytes) > FLimits.TotalBytes - FBytes)
@@ -880,11 +1026,7 @@ var
 begin
   if FDocumentIndexes.TryGetValue(APath, Index) then
     Exit(FDocuments[Index].Bytes);
-  Allowance := FLimits.DocumentBytes;
-  if Allowance > FLimits.TotalBytes - FBytes then
-    Allowance := FLimits.TotalBytes - FBytes;
-  if (Allowance < 1) or (FCount >= FLimits.Documents) then
-    raise ELWPTRegistryError.Create('proof_limit_exceeded: metadata budget');
+  Allowance := FBudget.Allowance;
   Result := FSource.ReadDocument(APath, Allowance);
   Account(Result);
   Result := Copy(Result);
@@ -935,6 +1077,7 @@ function TLWPTRegistryVerifier.Verify(const AProof: TLWPTRegistryProof;
   const AMode: TLWPTRegistryVerificationMode): TLWPTVerifiedRegistry;
 var
   Checkpoint: TRegistryCheckpoint;
+  Rotation: TLWPTUntrustedRegistryRotation;
   Root: TTOMLNode;
   KeyId, PublicKey, ToKey, ToPublicKey, CurrentHash, Previous: string;
   PriorKeyId, PriorPublicKey, Identity: string;
@@ -963,6 +1106,7 @@ begin
     raise ELWPTRegistryError.Create('locked_proof_requires_accepted_state');
   Account(AProof.Checkpoint);
   Account(AProof.Signature);
+  for Index := 0 to High(AProof.RetrievalDocuments) do Account(AProof.RetrievalDocuments[Index]);
   if (AMode = rvmLockedProof)
     and (APrior.CheckpointHash <> SHA256BytesPrefixed(AProof.Checkpoint)) then
     raise ELWPTRegistryError.Create('locked_proof_state_mismatch');
@@ -986,23 +1130,15 @@ begin
       Account(AProof.Rotations[Index].Document);
       Account(AProof.Rotations[Index].OldSignature);
       Account(AProof.Rotations[Index].NewSignature);
-      Root := ParseCanonical(BytesText(AProof.Rotations[Index].Document),
-        PROGRAM_NAME + '-registry-key-rotation-v1', ['schema', 'origin',
-          'from_key', 'to_key', 'to_public_key', 'effective_sequence']);
-      try
-        ToKey := TomlStr(Root, 'to_key', '');
-        ToPublicKey := TomlStr(Root, 'to_public_key', '');
-        EffectiveSequence := UnsignedField(Root, 'effective_sequence');
-        if (TomlStr(Root, 'origin', '') <> ATrust.Origin)
-          or (TomlStr(Root, 'from_key', '') <> KeyId)
-          or not RegistryTrustRootIsValid(ToKey, ToPublicKey)
-          or (UsedKeys.IndexOf(ToKey) >= 0)
-          or (EffectiveSequence <= LastEffectiveSequence)
-          or (EffectiveSequence > Checkpoint.Sequence) then
-          raise ELWPTRegistryError.Create('rotation_chain_invalid');
-      finally
-        Root.Free;
-      end;
+      Rotation := InspectRegistryRotation(AProof.Rotations[Index].Document);
+      ToKey := Rotation.ToKey;
+      ToPublicKey := Rotation.ToPublicKey;
+      EffectiveSequence := Rotation.EffectiveSequence;
+      if (Rotation.Origin <> ATrust.Origin) or (Rotation.FromKey <> KeyId)
+        or (UsedKeys.IndexOf(ToKey) >= 0)
+        or (EffectiveSequence <= LastEffectiveSequence)
+        or (EffectiveSequence > Checkpoint.Sequence) then
+        raise ELWPTRegistryError.Create('rotation_chain_invalid');
       VerifySignature(PROJECT_NAME + '-REGISTRY-KEY-ROTATION-V1',
         AProof.Rotations[Index].Document,
         ParseSignature(BytesText(AProof.Rotations[Index].OldSignature)),

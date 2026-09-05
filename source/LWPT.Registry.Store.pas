@@ -69,7 +69,8 @@ type
     FConfig: TLWPTRegistryConfig;
     function HashResource(const ARelative: string;
       AProgress: TSHA256Progress): string;
-    function LoadSeed(AProgress: TSHA256Progress = nil): TBytes;
+    function LoadSeed(const AKeyID: string;
+      AProgress: TSHA256Progress = nil): TBytes;
     procedure VerifyState(const AState: TLWPTRegistryState;
       AProgress: TSHA256Progress = nil);
     procedure RecoverDerivedState(const AState: TLWPTRegistryState);
@@ -95,10 +96,13 @@ type
       TLWPTRegistryState; virtual;
     function ResourceIsPublished(const AState: TLWPTRegistryState;
       const ARelative: string; AProgress: TSHA256Progress = nil): Boolean; virtual;
+    function RotationSequences(const AState: TLWPTRegistryState;
+      AProgress: TSHA256Progress = nil): TStringList;
     function LoadResource(const ARelative: string;
       AProgress: TSHA256Progress = nil;
       const AMaxBytes: Int64 = MAX_REGISTRY_RESOURCE_BYTES): TBytes;
     procedure Publish(const APublication: TLWPTRegistryPublication); virtual;
+    procedure RotateKey(const AExpectedKeyID, APublishedAt: string);
     property Config: TLWPTRegistryConfig read FConfig;
     property Root: string read FRoot;
   end;
@@ -147,6 +151,7 @@ uses
   LWPT.ProducerLease,
   LWPT.Registry.Crypto,
   LWPT.Registry.Filesystem,
+  LWPT.Registry.Verification,
   Semver;
 
 const
@@ -1293,6 +1298,18 @@ begin
   Result := Result + ']' + #10;
 end;
 
+function PublicKeyDocument(const AOrigin, AKeyID: string;
+  const APublicKey: TLWPTEd25519PublicKey; const ASequence: QWord): string;
+begin
+  Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME + '-registry-key-v1') + #10
+    + 'origin = ' + PersistedTOMLQuote(AOrigin) + #10
+    + 'key_id = ' + PersistedTOMLQuote(AKeyID) + #10
+    + 'algorithm = "ed25519"' + #10
+    + 'public_key = ' + PersistedTOMLQuote('hex:' + BytesToHex(APublicKey,
+      SizeOf(APublicKey))) + #10
+    + 'valid_from_sequence = ' + UIntToStr(ASequence) + #10;
+end;
+
 function CheckpointDocument(const AOrigin: string; const ASequence: QWord;
   const ASnapshotHash, APublishedAt, AKeyID: string): string;
 begin
@@ -1308,12 +1325,13 @@ begin
 end;
 
 function SignatureDocument(const ACheckpoint: TBytes;
-  const ASeed: TLWPTEd25519Seed; const AKeyID: string): string;
+  const ASeed: TLWPTEd25519Seed; const AKeyID: string;
+  const ADomain: string = CHECKPOINT_DOMAIN): string;
 var
   SigningInput: TBytes;
   Signature: TLWPTEd25519Signature;
 begin
-  SigningInput := Bytes(CHECKPOINT_DOMAIN + Text(ACheckpoint));
+  SigningInput := Bytes(ADomain + Text(ACheckpoint));
   Ed25519Sign(SigningInput, ASeed, Signature);
   Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
     + '-registry-signature-v1') + #10
@@ -1406,15 +1424,31 @@ begin
     Bytes(StateDocument(AState)));
 end;
 
-function TLWPTRegistryStore.LoadSeed(AProgress: TSHA256Progress): TBytes;
+function TLWPTRegistryStore.LoadSeed(const AKeyID: string;
+  AProgress: TSHA256Progress): TBytes;
 var
   Seed: TLWPTEd25519Seed;
+  PublicKey: TLWPTEd25519PublicKey;
+  PublicBytes: TBytes;
+  SeedPath: string;
 begin
-  if not HexToBytes(Trim(Text(LoadResource(SIGNING_SEED_FILE, AProgress,
-    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES))), Seed, SizeOf(Seed)) then
-    raise ELWPTRegistryError.CreateStable('state_corrupt', 'registry signing seed is invalid');
-  SetLength(Result, SizeOf(Seed));
-  Move(Seed[0], Result[0], SizeOf(Seed));
+  SeedPath := ChangeFileExt(RegistryKeyStoragePath(AKeyID), '.seed');
+  if not FileExists(RootPath(SeedPath)) then SeedPath := SIGNING_SEED_FILE;
+  try
+    if not HexToBytes(Trim(Text(LoadResource(SeedPath, AProgress,
+      MAX_REGISTRY_CONTROL_DOCUMENT_BYTES))), Seed, SizeOf(Seed)) then
+      raise ELWPTRegistryError.CreateStable('state_corrupt', 'registry signing seed is invalid');
+    Ed25519PublicKey(Seed, PublicKey);
+    SetLength(PublicBytes, SizeOf(PublicKey));
+    Move(PublicKey[0], PublicBytes[0], SizeOf(PublicKey));
+    if AKeyID <> 'ed25519:' + SHA256Hex(PublicBytes) then
+      raise ELWPTRegistryError.CreateStable('key_id_mismatch',
+        'registry signing seed does not match the active key');
+    SetLength(Result, SizeOf(Seed));
+    Move(Seed[0], Result[0], SizeOf(Seed));
+  finally
+    FillChar(Seed, SizeOf(Seed), 0);
+  end;
 end;
 
 procedure TLWPTRegistryStore.WriteImmutable(const ARelative: string;
@@ -1607,15 +1641,8 @@ begin
       SetLength(PublicKeyBytes, SizeOf(PublicKey));
       Move(PublicKey[0], PublicKeyBytes[0], SizeOf(PublicKey));
       KeyID := 'ed25519:' + SHA256Hex(PublicKeyBytes);
-      WriteInitialImmutable(RegistryKeyStoragePath(KeyID), Bytes(
-        'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
-        + '-registry-key-v1') + #10
-        + 'origin = ' + PersistedTOMLQuote(Config.Identity) + #10
-        + 'key_id = ' + PersistedTOMLQuote(KeyID) + #10
-        + 'algorithm = "ed25519"' + #10
-        + 'public_key = ' + PersistedTOMLQuote('hex:' + BytesToHex(PublicKey,
-          SizeOf(PublicKey))) + #10
-        + 'valid_from_sequence = 1' + #10));
+      WriteInitialImmutable(RegistryKeyStoragePath(KeyID),
+        Bytes(PublicKeyDocument(Config.Identity, KeyID, PublicKey, 1)));
       Records := TStringList.Create;
       try
         Snapshot := Bytes(SnapshotDocument(Config.Identity, 1,
@@ -1787,6 +1814,14 @@ var
   Entry, FileName, Name, RecordHash, RecordText, Version: string;
   Index: Integer;
   Search: TSearchRec;
+  Rotation: TLWPTUntrustedRegistryRotation;
+  Sequence: Int64;
+  procedure RemoveFutureRotationFile(const AName: string);
+  begin
+    if FileExists(RootPath('rotations/' + AName))
+      and not SysUtils.DeleteFile(RootPath('rotations/' + AName)) then
+      raise ELWPTRegistryError.CreateStable('recovery_failed', 'could not remove an uncommitted rotation');
+  end;
 begin
   Records := ReadSnapshotRecords(Text(LoadResource('snapshots/sha256/'
     + Copy(AState.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml')));
@@ -1872,6 +1907,23 @@ begin
     finally
       SysUtils.FindClose(Search);
     end;
+    if FindFirst(RootPath('rotations/*.toml'), faAnyFile, Search) = 0 then
+    try
+      repeat
+        Name := ChangeFileExt(Search.Name, '');
+        if not TryStrToInt64(Name, Sequence) or (Sequence < 2)
+          or (IntToStr(Sequence) <> Name) or (QWord(Sequence) <= AState.Sequence) then Continue;
+        Rotation := InspectRegistryRotation(LoadResource('rotations/' + Search.Name,
+          nil, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+        if (Rotation.Origin <> FConfig.Identity) or (Rotation.EffectiveSequence <> Sequence) then
+          raise ELWPTRegistryError.CreateStable('recovery_failed', 'uncommitted rotation identity mismatch');
+        RemoveFutureRotationFile(Name + '.old.sig.toml');
+        RemoveFutureRotationFile(Name + '.new.sig.toml');
+        RemoveFutureRotationFile(Name + '.toml');
+      until FindNext(Search) <> 0;
+    finally
+      SysUtils.FindClose(Search);
+    end;
   finally
     ActiveIndexFiles.Free;
     ActiveNames.Free;
@@ -1941,9 +1993,99 @@ begin
   VerifyState(Result, AProgress);
 end;
 
+function CompareRotationSequences(AList: TStringList; AIndex1, AIndex2: Integer): Integer;
+var
+  Left, Right: Int64;
+begin
+  Left := StrToInt64(AList[AIndex1]);
+  Right := StrToInt64(AList[AIndex2]);
+  if Left < Right then Result := -1
+  else if Left > Right then Result := 1
+  else Result := 0;
+end;
+
+function TLWPTRegistryStore.RotationSequences(const AState: TLWPTRegistryState;
+  AProgress: TSHA256Progress): TStringList;
+var
+  Search: TSearchRec;
+  Name: string;
+  Sequence: Int64;
+  Rotation: TLWPTUntrustedRegistryRotation;
+  Scanned: Integer;
+begin
+  Result := TStringList.Create;
+  try
+    Scanned := 0;
+    if FindFirst(RootPath('rotations/*.toml'), faAnyFile, Search) = 0 then
+    try
+      repeat
+        if Assigned(AProgress) then AProgress;
+        Inc(Scanned);
+        if Scanned > DefaultRegistryVerificationLimits.Documents then
+          raise ELWPTRegistryError.Create('proof_limit_exceeded: rotation directory');
+        Name := ChangeFileExt(Search.Name, '');
+        if not TryStrToInt64(Name, Sequence) or (Sequence < 2)
+          or (IntToStr(Sequence) <> Name) or (QWord(Sequence) > AState.Sequence) then Continue;
+        if Result.Count >= DefaultRegistryVerificationLimits.Rotations then
+          raise ELWPTRegistryError.Create('proof_limit_exceeded: rotations');
+        Rotation := InspectRegistryRotation(LoadResource('rotations/' + Search.Name,
+          AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+        if (Rotation.EffectiveSequence <> Sequence) or (Rotation.Origin <> FConfig.Identity) then
+          raise ELWPTRegistryError.Create('rotation_chain_invalid');
+        Result.Add(Name);
+      until FindNext(Search) <> 0;
+    finally
+      SysUtils.FindClose(Search);
+    end;
+    Result.CustomSort(@CompareRotationSequences);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
 function TLWPTRegistryStore.ResourceIsPublished(const AState: TLWPTRegistryState;
   const ARelative: string; AProgress: TSHA256Progress): Boolean;
+var
+  Sequences: TStringList;
+  Entry, Name: string;
+  Sequence: Int64;
+  Rotation: TLWPTUntrustedRegistryRotation;
 begin
+  if StartsStr('checkpoints/', ARelative) then
+  begin
+    if (ARelative = AState.CheckpointPath) or (ARelative = AState.SignaturePath) then Exit(True);
+    Name := Copy(ARelative, Length('checkpoints/') + 1, MaxInt);
+    if EndsStr('.sig.toml', Name) then Delete(Name, Length(Name) - 8, 9)
+    else if EndsStr('.toml', Name) then Delete(Name, Length(Name) - 4, 5)
+    else Exit(False);
+    Exit(TryStrToInt64(Name, Sequence) and (Sequence > 0)
+      and (IntToStr(Sequence) = Name) and (QWord(Sequence) <= AState.Sequence));
+  end;
+  if StartsStr('rotations/', ARelative) or StartsStr('keys/', ARelative) then
+  begin
+    if StartsStr('keys/', ARelative)
+      and (ARelative = RegistryKeyStoragePath(StringValue(Text(LoadResource('checkpoints/1.toml',
+        AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES)), 'key_id'))) then Exit(True);
+    Sequences := RotationSequences(AState, AProgress);
+    try
+      for Entry in Sequences do
+      begin
+        if (ARelative = 'rotations/' + Entry + '.toml')
+          or (ARelative = 'rotations/' + Entry + '.old.sig.toml')
+          or (ARelative = 'rotations/' + Entry + '.new.sig.toml') then Exit(True);
+        if StartsStr('keys/', ARelative) then
+        begin
+          Rotation := InspectRegistryRotation(LoadResource('rotations/' + Entry + '.toml',
+            AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+          if ARelative = RegistryKeyStoragePath(Rotation.ToKey) then Exit(True);
+        end;
+      end;
+      Exit(False);
+    finally
+      Sequences.Free;
+    end;
+  end;
   Result := True;
 end;
 
@@ -2060,7 +2202,6 @@ var
   Coordinator: TLWPTProducerLeaseCoordinator;
   ExpiresDate, NowDate: TDateTime;
   Lease: TLWPTProducerLease;
-  PublicKey: TLWPTEd25519PublicKey;
   Seed: TLWPTEd25519Seed;
   State: TLWPTRegistryState;
 begin
@@ -2084,18 +2225,12 @@ begin
     if ExpiresDate > IncHour(NowDate,
       CHECKPOINT_RENEWAL_THRESHOLD_HOURS) then Exit;
     KeyID := StringValue(CheckpointText, 'key_id');
-    SeedBytes := LoadSeed(AProgress);
+    SeedBytes := LoadSeed(KeyID, AProgress);
     try
       if Length(SeedBytes) <> SizeOf(Seed) then
         raise ELWPTRegistryError.CreateStable('state_corrupt',
           'registry signing seed has the wrong length');
       Move(SeedBytes[0], Seed[0], SizeOf(Seed));
-      Ed25519PublicKey(Seed, PublicKey);
-      SetLength(SeedBytes, SizeOf(PublicKey));
-      Move(PublicKey[0], SeedBytes[0], SizeOf(PublicKey));
-      if KeyID <> 'ed25519:' + SHA256Hex(SeedBytes) then
-        raise ELWPTRegistryError.CreateStable('key_id_mismatch',
-          'registry signing seed does not match the active key');
       Checkpoint := Bytes(CheckpointDocument(FConfig.Identity,
         State.Sequence, State.SnapshotHash, ANow, KeyID));
       Signature := Bytes(SignatureDocument(Checkpoint, Seed, KeyID));
@@ -2120,6 +2255,104 @@ begin
   end;
 end;
 
+procedure TLWPTRegistryStore.RotateKey(const AExpectedKeyID, APublishedAt: string);
+var
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
+  State: TLWPTRegistryState;
+  OldSeed, NewSeed: TLWPTEd25519Seed;
+  PublicKey: TLWPTEd25519PublicKey;
+  SeedBytes, PublicBytes, Rotation, Snapshot, Checkpoint, Signature: TBytes;
+  KeyID, NextKeyID, Prefix, CurrentSnapshot: string;
+  Records, Rotations: TStringList;
+begin
+  if FConfig.Role <> rrOrigin then
+    raise ELWPTRegistryError.CreateStable('mirror_read_only', 'mirrors cannot rotate signing keys');
+  RegistryKeyStoragePath(AExpectedKeyID);
+  TimestampPlusSevenDays(APublishedAt);
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
+  Lease := nil;
+  try
+    Lease := Coordinator.TryAcquire('registry-publication', 'registry signing key rotation');
+    if Lease = nil then
+      raise ELWPTRegistryError.CreateStable('publication_locked', 'another publication owns the origin');
+    State := ReadCurrentState;
+    VerifyState(State);
+    KeyID := StringValue(Text(LoadResource(State.CheckpointPath)), 'key_id');
+    if AExpectedKeyID <> KeyID then
+      raise ELWPTRegistryError.CreateStable('rotation_precondition_failed',
+        'active signing key differs from the expected key');
+    if State.Sequence >= QWord(High(Int64)) then
+      raise ELWPTRegistryError.CreateStable('sequence_exhausted', 'registry sequence cannot advance');
+    RecoverDerivedState(State);
+    Rotations := RotationSequences(State);
+    try
+      if Rotations.Count >= DefaultRegistryVerificationLimits.Rotations then
+        raise ELWPTRegistryError.CreateStable('proof_limit_exceeded',
+          'rotation history has reached the supported verification limit');
+    finally
+      Rotations.Free;
+    end;
+    SeedBytes := LoadSeed(KeyID);
+    Move(SeedBytes[0], OldSeed[0], SizeOf(OldSeed));
+    GenerateEd25519Seed(NewSeed);
+    Ed25519PublicKey(NewSeed, PublicKey);
+    SetLength(PublicBytes, SizeOf(PublicKey));
+    Move(PublicKey[0], PublicBytes[0], SizeOf(PublicKey));
+    NextKeyID := 'ed25519:' + SHA256Hex(PublicBytes);
+    AtomicCreatePrivateBytes(RootPath(ChangeFileExt(RegistryKeyStoragePath(NextKeyID), '.seed')),
+      TmpRoot, Bytes(BytesToHex(NewSeed, SizeOf(NewSeed)) + #10));
+    WriteImmutable(RegistryKeyStoragePath(NextKeyID),
+      Bytes(PublicKeyDocument(FConfig.Identity, NextKeyID, PublicKey, State.Sequence + 1)));
+    Rotation := Bytes('schema = ' + PersistedTOMLQuote(PROGRAM_NAME + '-registry-key-rotation-v1') + #10
+      + 'origin = ' + PersistedTOMLQuote(FConfig.Identity) + #10
+      + 'from_key = ' + PersistedTOMLQuote(KeyID) + #10
+      + 'to_key = ' + PersistedTOMLQuote(NextKeyID) + #10
+      + 'to_public_key = ' + PersistedTOMLQuote('hex:' + BytesToHex(PublicKey, SizeOf(PublicKey))) + #10
+      + 'effective_sequence = ' + UIntToStr(State.Sequence + 1) + #10);
+    Prefix := 'rotations/' + UIntToStr(State.Sequence + 1);
+    WriteImmutable(Prefix + '.toml', Rotation);
+    WriteImmutable(Prefix + '.old.sig.toml', Bytes(SignatureDocument(Rotation,
+      OldSeed, KeyID, PROJECT_NAME + '-REGISTRY-KEY-ROTATION-V1' + #10)));
+    WriteImmutable(Prefix + '.new.sig.toml', Bytes(SignatureDocument(Rotation,
+      NewSeed, NextKeyID, PROJECT_NAME + '-REGISTRY-KEY-ROTATION-V1' + #10)));
+    {$IFDEF REGISTRY_TESTING}
+    InjectRegistryFailure('rotation-record');
+    {$ENDIF}
+    CurrentSnapshot := Text(LoadResource('snapshots/sha256/' + Copy(State.SnapshotHash, 8, 64) + '.toml'));
+    Records := ReadSnapshotRecords(CurrentSnapshot);
+    try
+      Snapshot := Bytes(SnapshotDocument(FConfig.Identity, State.Sequence + 1,
+        APublishedAt, State.SnapshotHash, Records));
+    finally
+      Records.Free;
+    end;
+    Inc(State.Sequence);
+    State.SnapshotHash := SHA256BytesPrefixed(Snapshot);
+    WriteImmutable('snapshots/sha256/' + Copy(State.SnapshotHash, 8, 64) + '.toml', Snapshot);
+    Checkpoint := Bytes(CheckpointDocument(FConfig.Identity, State.Sequence,
+      State.SnapshotHash, APublishedAt, NextKeyID));
+    Signature := Bytes(SignatureDocument(Checkpoint, NewSeed, NextKeyID));
+    State.CheckpointPath := 'checkpoints/' + UIntToStr(State.Sequence) + '.toml';
+    State.SignaturePath := 'checkpoints/' + UIntToStr(State.Sequence) + '.sig.toml';
+    WriteImmutable(State.CheckpointPath, Checkpoint);
+    WriteImmutable(State.SignaturePath, Signature);
+    {$IFDEF REGISTRY_TESTING}
+    InjectRegistryFailure('rotation-checkpoint');
+    {$ENDIF}
+    ActivateState(State);
+    {$IFDEF REGISTRY_TESTING}
+    InjectRegistryFailure('rotation-activation');
+    {$ENDIF}
+  finally
+    FillChar(OldSeed, SizeOf(OldSeed), 0);
+    FillChar(NewSeed, SizeOf(NewSeed), 0);
+    if Length(SeedBytes) > 0 then FillChar(SeedBytes[0], Length(SeedBytes), 0);
+    Lease.Free;
+    Coordinator.Free;
+  end;
+end;
+
 procedure TLWPTRegistryStore.Publish(
   const APublication: TLWPTRegistryPublication);
 var
@@ -2130,7 +2363,6 @@ var
   ActiveRecordDocument, CurrentSnapshot, IndexDocument, RecordDocument: string;
   Coordinator: TLWPTProducerLeaseCoordinator;
   Lease: TLWPTProducerLease;
-  PublicKey: TLWPTEd25519PublicKey;
   Records, VersionEntries: TStringList;
   Seed: TLWPTEd25519Seed;
   State: TLWPTRegistryState;
@@ -2232,13 +2464,10 @@ begin
     SnapshotHash := SHA256BytesPrefixed(Snapshot);
     WriteImmutable('snapshots/sha256/' + Copy(SnapshotHash,
       Length('sha256:') + 1, MaxInt) + '.toml', Snapshot);
-    SeedBytes := LoadSeed;
+    KeyID := StringValue(Text(LoadResource(State.CheckpointPath)), 'key_id');
+    SeedBytes := LoadSeed(KeyID);
     try
       Move(SeedBytes[0], Seed[0], SizeOf(Seed));
-      Ed25519PublicKey(Seed, PublicKey);
-      SetLength(SeedBytes, SizeOf(PublicKey));
-      Move(PublicKey[0], SeedBytes[0], SizeOf(PublicKey));
-      KeyID := 'ed25519:' + SHA256Hex(SeedBytes);
       Checkpoint := Bytes(CheckpointDocument(FConfig.Identity,
         State.Sequence + 1, SnapshotHash, APublication.PublishedAt, KeyID));
       Signature := Bytes(SignatureDocument(Checkpoint, Seed, KeyID));

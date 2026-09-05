@@ -458,14 +458,14 @@ function HandleRegistry(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
   BaseURL, DataDirectory, Identity, ListenAddress, TLSPKCS12,
-    TLSPasswordEnvironment, RoleName, Upstream, KeyID, PublicKey: string;
+    TLSPasswordEnvironment, RoleName, Upstream, KeyID, PublicKey, FromKey: string;
   Index, Port: Integer;
-  ServeConfigurationPresent: Boolean;
+  ServeConfigurationPresent, FromKeyPresent: Boolean;
 begin
   if APositionals.Count <> 1 then
   begin
     WriteLn(ErrOutput, ErrPrefix('registry'),
-      'expected exactly one operation: init, sync, verify or serve');
+      'expected exactly one operation: init, sync, verify, rotate-key or serve');
     Exit(1);
   end;
   DataDirectory := REGISTRY_DEFAULT_DATA_DIR;
@@ -479,13 +479,16 @@ begin
   Upstream := '';
   KeyID := '';
   PublicKey := '';
+  FromKey := '';
+  FromKeyPresent := False;
   ServeConfigurationPresent := False;
   for Index := 0 to High(AOptions) do
   begin
     if AOptions[Index].Present
       and not SameText(AOptions[Index].LongName, 'data-dir')
       and not SameText(AOptions[Index].LongName, 'silent') then
-      ServeConfigurationPresent := True;
+      if not (SameText(APositionals[0], 'rotate-key')
+        and SameText(AOptions[Index].LongName, 'from-key')) then ServeConfigurationPresent := True;
     if AOptions[Index] is TStringOption then
     begin
       if SameText(AOptions[Index].LongName, 'data-dir') then
@@ -508,33 +511,43 @@ begin
       else if SameText(AOptions[Index].LongName, 'key-id') then
         KeyID := TStringOption(AOptions[Index]).ValueOr(KeyID)
       else if SameText(AOptions[Index].LongName, 'public-key') then
-        PublicKey := TStringOption(AOptions[Index]).ValueOr(PublicKey);
+        PublicKey := TStringOption(AOptions[Index]).ValueOr(PublicKey)
+      else if SameText(AOptions[Index].LongName, 'from-key') then
+      begin
+        FromKey := TStringOption(AOptions[Index]).ValueOr(FromKey);
+        FromKeyPresent := AOptions[Index].Present;
+      end;
     end
     else if SameText(AOptions[Index].LongName, 'port') then
       Port := TIntegerOption(AOptions[Index]).ValueOr(Port);
   end;
   try
-    if SameText(APositionals[0], 'init') then
+    if SameText(APositionals[0], 'init') and FromKeyPresent then
+      raise ELWPTRegistryError.CreateStable('invalid_configuration', '--from-key is rotate-key only')
+    else if SameText(APositionals[0], 'init') then
       Result := CmdRegistryInit(DataDirectory, Identity, BaseURL,
         ListenAddress, Port, TLSPKCS12, TLSPasswordEnvironment,
         RoleName, Upstream, KeyID, PublicKey)
     else if SameText(APositionals[0], 'serve') or SameText(APositionals[0], 'sync')
-      or SameText(APositionals[0], 'verify') then
+      or SameText(APositionals[0], 'verify') or SameText(APositionals[0], 'rotate-key') then
     begin
       if ServeConfigurationPresent then
       begin
-        WriteLn(ErrOutput, ErrPrefix('registry'),
+        if SameText(APositionals[0], 'rotate-key') then
+          WriteLn(ErrOutput, ErrPrefix('registry'), 'rotate-key accepts only --data-dir and --from-key')
+        else WriteLn(ErrOutput, ErrPrefix('registry'),
           APositionals[0], ' accepts only --data-dir; change persisted configuration with init');
         Exit(1);
       end;
       if SameText(APositionals[0], 'sync') then Result := CmdRegistrySync(DataDirectory)
       else if SameText(APositionals[0], 'verify') then Result := CmdRegistryVerify(DataDirectory)
+      else if SameText(APositionals[0], 'rotate-key') then Result := CmdRegistryRotateKey(DataDirectory, FromKey)
       else Result := CmdRegistryServe(DataDirectory);
     end
     else
     begin
       WriteLn(ErrOutput, ErrPrefix('registry'), 'unknown operation "',
-        APositionals[0], '"; expected init, sync, verify or serve');
+        APositionals[0], '"; expected init, sync, verify, rotate-key or serve');
       Result := 1;
     end;
   except
@@ -864,7 +877,7 @@ begin
       'Recover project and shared-cache residue', '',
       @HandleRepair, RepairOpts));
 
-    SetLength(RegistryOpts, 11);
+    SetLength(RegistryOpts, 12);
     RegistryOpts[0] := TStringOption.Create('data-dir',
       'Registry data directory (default: ' + REGISTRY_DEFAULT_DATA_DIR + ')');
     RegistryOpts[1] := TStringOption.Create('identity',
@@ -887,9 +900,11 @@ begin
       'Pinned origin root ed25519 key ID (required for mirror init)');
     RegistryOpts[10] := TStringOption.Create('public-key',
       'Pinned origin root public key in hex: encoding (required for mirror init)');
+    RegistryOpts[11] := TStringOption.Create('from-key',
+      'Expected current signing key ID (required for rotate-key; guards retries)');
     Registry.Add(TSubcommand.Create('registry',
-      'Initialize, synchronize, verify or serve a self-hosted registry',
-      '<init|sync|verify|serve> [--data-dir <path>] [configuration options]',
+      'Initialize, synchronize, verify, rotate keys or serve a self-hosted registry',
+      '<init|sync|verify|rotate-key|serve> [--data-dir <path>] [configuration options]',
       @HandleRegistry, RegistryOpts));
 
     SetLength(InitOpts, 3);

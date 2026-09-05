@@ -16,7 +16,7 @@ adding `upstream`, `trust_key_id`, and `trust_public_key` to the operational
 configuration. Reconfiguration cannot change an initialized role, origin
 identity, or root pin. An upstream URL may move without changing identity.
 Mirror initialization does not generate a private seed, and publication and
-checkpoint renewal are disabled for the mirror role.
+checkpoint renewal and key rotation are disabled for the mirror role.
 
 `LWPT.Registry.Verification` owns the signed read contract. Discovery and
 capabilities use its bounded canonical parser; checkpoint inspection returns
@@ -39,6 +39,8 @@ their hash paths. Optional historical checkpoint URLs are not supported;
 previously accepted snapshot ancestors remain readable. The upstream key
 document is fetched under the 1 MiB control-document limit, checked against the
 immutable pin and checkpoint sequence, and retained byte-for-byte.
+The same rule applies to rotated key documents and dual-signed rotation
+triplets. Their HTTP routes expose only the accepted chain, not staged files.
 
 `state/sync-attempt.toml` records the most recent verification attempt or
 failure separately. An attempt marked `verified` is not activation proof;
@@ -54,9 +56,14 @@ The current transfer path fetches one archive at a time through HTTPClient's
 whole-body API. Archives are limited to 256 MiB; the response is also capped
 at the signed archive size before body allocation. HTTP framing and conversion
 can temporarily retain multiple copies, so 256 MiB is a payload cap, not a
-total process-memory cap. Discovery and checkpoint control documents are
-limited to 1 MiB, with the shared verifier's metadata limits applying to the
-complete proof. Each request has a 120-second deadline. Redirects are not
+total process-memory cap. Discovery, checkpoint, key, rotation, signature, and
+rotation-page control documents are limited to 1 MiB. The shared verifier
+limits a complete proof to 64 MiB, 10,000 documents, and 1,000 rotations;
+content-addressed metadata also has a 4 MiB per-document limit. Acquisition
+charges discovery, capabilities, key records, and pagination bytes against
+that same budget before retention. These untrusted retrieval documents confer
+no authority and are unnecessary for offline verification. Each request has a
+120-second deadline. Redirects are not
 followed, encoded response bodies are rejected, and discovery endpoints must
 remain under the configured upstream base URL.
 
@@ -65,9 +72,42 @@ immediately before activation. Local verification and serving retain exact
 accepted proof without renewing or changing its timestamps. `verify` reports
 `fresh`, `expired`, or `uninitialized`; an expired retained proof does not
 authorize acquisition. The current transfer resumes at verified-object
-boundaries, not at partial byte offsets. Rotation production and parallel
-transfer remain outside this initial runnable implementation; unknown signing
-keys fail closed through the shared verifier.
+boundaries, not at partial byte offsets. Parallel transfer remains outside
+this implementation packet. Unknown signing keys require a complete verified
+rotation chain from the immutable root pin.
+
+## Local signing-key rotation
+
+`registry rotate-key --data-dir <directory> --from-key <expected-key-id>` is an
+operator-local origin command. It acquires the publication lease and compares
+the expected key with the captured active checkpoint before writing. A retry
+after activation fails that precondition instead of rotating again.
+
+The origin generates a private seed at `keys/ed25519-<hash>.seed` using the
+existing private-file helper. Publication and renewal select this seed from
+the captured checkpoint. Legacy `keys/root.seed` is usable only when its
+derived public key matches that checkpoint exactly. Old seeds and public
+metadata remain retained; this operation does not import keys, revoke them,
+or define retired-key deletion policy.
+
+Rotation advances the sequence by one, writes the existing dual-signed
+transition and public key record, and creates an unchanged-record snapshot
+whose predecessor is the old snapshot. The new key signs the new checkpoint.
+Only the existing atomic current-pointer replacement activates those files.
+Recovery removes owned future rotation triplets and numeric checkpoints;
+orphan candidate keys are retained but are not served. Numeric committed
+checkpoint history remains readable; content-addressed renewal aliases are
+served only when selected by the current pointer. The origin rejects rotation
+at the shared verifier's 1,000-transition ceiling before creating a new key.
+
+Origins and mirrors advertise `rotation-chain-v1`. Rotation pages contain at
+most 100 ordered items and stay below 1 MiB. Their cursor binds the origin,
+`after` sequence, and last item; it is a pagination selector, not authentication.
+Mirrors follow bounded pages, verify both signatures for every transition,
+and retain exact key and transition bytes for offline replay. Invalid pages,
+missing signatures, or a chain that does not reach the checkpoint key leave
+the accepted pointer unchanged. This uses the existing protocol schemas and
+canonical Ed25519 implementation without a second provenance attestation.
 
 ## Rejected alternatives
 

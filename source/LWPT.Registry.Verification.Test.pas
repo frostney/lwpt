@@ -89,6 +89,8 @@ type
     procedure DowngradeRejected;
     procedure EqualSequenceEquivocationRejected;
     procedure PinnedKeyDocumentValidated;
+    procedure RotationPagesAreBoundedAndCanonical;
+    procedure RetrievalDocumentsShareProofBudget;
   end;
 
 function ReadFixture(const APath: string): TBytes;
@@ -802,8 +804,113 @@ begin
   end;
 end;
 
+procedure TRegistryVerificationTests.RotationPagesAreBoundedAndCanonical;
+var
+  Original, Candidate: string;
+  Page: TLWPTRegistryRotationPage;
+  Index, Maximum: Integer;
+  AfterSequence: Int64;
+  Rejected: Boolean;
+begin
+  Original := AsText(ReadFixture('pages/rotations.toml'));
+  Page := ParseRegistryRotationPage(AsBytes(Original), Trust.Origin, Trust.Origin + '/v1', 0, 1);
+  Expect<Integer>(Length(Page.Items)).ToBe(1);
+  Expect<Int64>(Page.Items[0].EffectiveSequence).ToBe(2);
+  Expect<string>(RegistryQueryEncode('a b&%=/')).ToBe('a%20b%26%25%3D%2F');
+  for Index := 0 to 7 do
+  begin
+    Candidate := Original;
+    Maximum := 1;
+    AfterSequence := 0;
+    case Index of
+      0: Maximum := 0;
+      1: AfterSequence := 2;
+      2: Candidate := StringReplace(Original, 'origin = "' + Trust.Origin,
+        'origin = "https://wrong.example', []);
+      3: Candidate := StringReplace(Original, '/v1/rotations/2.toml', '/v1/rotations/3.toml', []);
+      4: Candidate := StringReplace(Original, 'effective_sequence = 2', 'effective_sequence = "2"', []);
+      5: Candidate := StringReplace(Original, 'next_cursor = ""',
+        'next_cursor = "' + StringOfChar('x', 1025) + '"', []);
+      6: Candidate := Copy(Original, 1, Pos('items =', Original) - 1)
+        + 'items = []' + #10 + 'next_cursor = "again"' + #10;
+      7: Candidate := StringReplace(Original, '{ effective_sequence', '{ extra = 1, effective_sequence', []);
+    end;
+    Rejected := False;
+    try
+      ParseRegistryRotationPage(AsBytes(Candidate), Trust.Origin, Trust.Origin + '/v1', AfterSequence, Maximum);
+    except
+      on E: ELWPTRegistryError do Rejected := True;
+    end;
+    Expect<Boolean>(Rejected).ToBe(True);
+  end;
+end;
+
+procedure TRegistryVerificationTests.RetrievalDocumentsShareProofBudget;
+var
+  Candidate: TLWPTRegistryProof;
+  Rotation: TLWPTRegistryRotationProof;
+  Limits: TLWPTRegistryVerificationLimits;
+  Source: TFixtureSource;
+  Budget: TLWPTRegistryMetadataBudget;
+  Diagnostic: string;
+  procedure Count(const ABytes: TBytes);
+  begin
+    Inc(Limits.TotalBytes, Length(ABytes));
+    if Length(ABytes) > Limits.DocumentBytes then Limits.DocumentBytes := Length(ABytes);
+  end;
+begin
+  Candidate := Proof(2);
+  Limits := DefaultRegistryVerificationLimits;
+  Limits.TotalBytes := 15;
+  Limits.DocumentBytes := 16;
+  Count(Candidate.Checkpoint);
+  Count(Candidate.Signature);
+  for Rotation in Candidate.Rotations do
+  begin
+    Count(Rotation.Document);
+    Count(Rotation.OldSignature);
+    Count(Rotation.NewSignature);
+  end;
+  SetLength(Candidate.RetrievalDocuments, 1);
+  Candidate.RetrievalDocuments[0] := AsBytes(StringOfChar('p', 16));
+  Source := TFixtureSource.Create;
+  try
+    Diagnostic := '';
+    try
+      VerifyRegistryProof(Candidate, Trust, Default(TLWPTRegistryAcceptedState),
+        EVALUATION_TIME, rvmAcquire, Source, Limits);
+    except
+      on E: ELWPTRegistryError do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Pos('proof_limit_exceeded:', Diagnostic) = 1).ToBe(True);
+    Expect<Integer>(Source.Requested.Count).ToBe(0);
+  finally
+    Source.Free;
+  end;
+  Limits.DocumentBytes := 4;
+  Limits.TotalBytes := 8;
+  Limits.Documents := 2;
+  Budget := TLWPTRegistryMetadataBudget.Create(Limits);
+  try
+    Expect<Int64>(Budget.Allowance).ToBe(4);
+    Budget.Account(AsBytes('page'));
+    Budget.Account(AsBytes('keys'));
+    Diagnostic := '';
+    try
+      Budget.Allowance;
+    except
+      on E: ELWPTRegistryError do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Pos('proof_limit_exceeded:', Diagnostic) = 1).ToBe(True);
+  finally
+    Budget.Free;
+  end;
+end;
+
 procedure TRegistryVerificationTests.SetupTests;
 begin
+  Test('rotation pages enforce item counts, order, scope and canonical fields', RotationPagesAreBoundedAndCanonical);
+  Test('retrieval pages and key documents share signed-proof aggregate limits', RetrievalDocumentsShareProofBudget);
   Test('key documents retain canonical bytes and match immutable trust and sequence', PinnedKeyDocumentValidated);
   Test('bootstrap and yank/restore corpus verifies', CorpusBootstrapAndLifecycle);
   Test('anchored history returns a complete offline bundle', AnchoredHistoryAndCompleteBundle);

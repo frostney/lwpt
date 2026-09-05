@@ -79,9 +79,11 @@ function StartRegistryCLI(const ADataDirectory, ABaseURL: string): TProcess;
 var
   Started: QWord;
   Ready: Boolean;
+  LastProbe, ExitState, Diagnostics: string;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := LwptBinaryPath;
+  Result.Options := [poUsePipes];
   Result.Parameters.Add('registry');
   Result.Parameters.Add('serve');
   Result.Parameters.Add('--data-dir');
@@ -89,19 +91,25 @@ begin
   try
     Result.Execute;
     Started := GetTickCount64;
+    LastProbe := '';
     repeat
       Ready := False;
       try
         RegistryHTTPBody(ABaseURL + '/.well-known/' + PROGRAM_NAME + '-registry');
         Ready := True;
       except
-        on E: Exception do Ready := False;
+        on E: Exception do LastProbe := Copy(E.Message, 1, 1024);
       end;
       if Ready then Exit;
       if not Result.Running then Break;
       Sleep(10);
     until GetTickCount64 - Started >= 5000;
-    raise Exception.Create('registry CLI listener did not become ready');
+    ExitState := 'running';
+    if not Result.Running then ExitState := IntToStr(Result.ExitCode)
+      + ' (status=' + IntToStr(Result.ExitStatus) + ')';
+    Diagnostics := DrainAvailableStream(Result.Stderr, 4096);
+    raise Exception.Create('registry CLI listener did not become ready; exit='
+      + ExitState + '; last probe: ' + LastProbe + '; stderr: ' + Diagnostics);
   except
     StopRegistryCLI(Result);
     raise;

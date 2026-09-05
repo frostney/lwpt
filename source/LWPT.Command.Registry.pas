@@ -14,6 +14,7 @@ function CmdRegistryInit(const ADataDirectory, AIdentity, ABaseURL,
 function CmdRegistryServe(const ADataDirectory: string): Integer;
 function CmdRegistrySync(const ADataDirectory: string): Integer;
 function CmdRegistryVerify(const ADataDirectory: string): Integer;
+function CmdRegistryRotateKey(const ADataDirectory, AExpectedKeyID: string): Integer;
 
 implementation
 
@@ -109,6 +110,22 @@ begin
   if LoadRegistryConfiguration(ADataDirectory).Role = rrMirror then
     Result := TLWPTRegistryMirror.Create(ADataDirectory)
   else Result := TLWPTRegistryStore.Create(ADataDirectory);
+end;
+
+function CmdRegistryRotateKey(const ADataDirectory, AExpectedKeyID: string): Integer;
+var
+  Store: TLWPTRegistryStore;
+begin
+  if AExpectedKeyID = '' then
+    raise ELWPTRegistryError.CreateStable('invalid_configuration', 'rotate-key requires --from-key');
+  Store := OpenRegistryStore(ADataDirectory);
+  try
+    Store.RotateKey(AExpectedKeyID, CurrentTimestamp);
+    WriteLn('rotated registry signing key at sequence ', Store.LoadCurrentState.Sequence);
+  finally
+    Store.Free;
+  end;
+  Result := 0;
 end;
 
 function CmdRegistrySync(const ADataDirectory: string): Integer;
