@@ -588,6 +588,8 @@ begin
       Exit(ErrorResponse(404, 'Not Found', 'not_found',
         'registry resource was not found'));
     Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
+    if not AStore.ResourceIsPublished(State, Relative, AProgress) then
+      Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
     Exit(ResourceResponse(AStore, Relative,
       'application/vnd.' + PROGRAM_NAME + '.registry-snapshot+toml',
       '"sha256:' + Digest + '"', 'sha256:' + Digest, True, AProgress));
@@ -609,6 +611,8 @@ begin
   if StartsStr('/v1/checkpoints/', APIPath) then
   begin
     Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
+    if not AStore.ResourceIsPublished(State, Relative, AProgress) then
+      Exit(ErrorResponse(404, 'Not Found', 'not_found', 'registry resource was not found'));
     if EndsStr('.sig.toml', APIPath) then
       Exit(ResourceResponse(AStore, Relative,
         'application/vnd.' + PROGRAM_NAME + '.registry-signature+toml', '',

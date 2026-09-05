@@ -29,6 +29,8 @@ type
   public
     procedure Recover; override;
     function LoadCurrentState(AProgress: TSHA256Progress = nil): TLWPTRegistryState; override;
+    function ResourceIsPublished(const AState: TLWPTRegistryState;
+      const ARelative: string; AProgress: TSHA256Progress = nil): Boolean; override;
     procedure Synchronize;
     function VerifyMirror: string;
   end;
@@ -194,6 +196,8 @@ begin
   Proof := Default(TLWPTRegistryProof);
   Proof.Checkpoint := LoadResource(AState.CheckpointPath, AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
   Proof.Signature := LoadResource(AState.SignaturePath, AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
+  ValidateRegistryKeyDocument(LoadResource(RegistryKeyStoragePath(Config.TrustKeyID),
+    AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES), Trust, AState.Sequence);
   Source := TMirrorDocumentSource.Create;
   try
     Source.Store := Self;
@@ -219,6 +223,21 @@ begin
   VerifyStateProof(Result, AProgress);
 end;
 
+function TLWPTRegistryMirror.ResourceIsPublished(const AState: TLWPTRegistryState;
+  const ARelative: string; AProgress: TSHA256Progress): Boolean;
+var
+  Verified: TLWPTVerifiedRegistry;
+  Document: TLWPTRegistryDocument;
+begin
+  if StartsStr('checkpoints/', ARelative) then
+    Exit((ARelative = AState.CheckpointPath) or (ARelative = AState.SignaturePath));
+  if not StartsStr('snapshots/', ARelative) then Exit(True);
+  Verified := VerifyStateProof(AState, AProgress);
+  for Document in Verified.Documents do
+    if Document.Path = ARelative then Exit(True);
+  Result := False;
+end;
+
 procedure TLWPTRegistryMirror.SaveAttempt(const AOutcome: string);
 begin
   AtomicWriteBytes(RootPath(MIRROR_ATTEMPT_PATH), TmpRoot,
@@ -237,10 +256,10 @@ var
   Source: TMirrorDocumentSource;
   State: TLWPTRegistryState;
   Package: TLWPTRegistryPackage;
-  Document, Archive: TBytes;
+  Document, Archive, KeyDocument: TBytes;
   ArchiveStream: TStream;
   HasRotations: Boolean;
-  ObjectPath, FullPath, Prefix, KeyDocument: string;
+  ObjectPath, FullPath, Prefix: string;
 
   procedure RequireScope(const AURL: string);
   begin
@@ -287,6 +306,9 @@ begin
       Source.API := Discovery.API;
       Verified := VerifyRegistryProof(Proof, Trust, Prior, RegistryTimestampNow,
         rvmAcquire, Source, DefaultRegistryVerificationLimits);
+      KeyDocument := GetDocument(Discovery.API + '/keys/' + Config.TrustKeyID + '.toml',
+        'application/vnd.' + PROGRAM_NAME + '.registry-key+toml', MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
+      ValidateRegistryKeyDocument(KeyDocument, Trust, Verified.State.Sequence);
       for Package in Verified.Packages do
       begin
         if Package.ArchiveSize > MAXIMUM_MIRROR_ARCHIVE_BYTES then
@@ -328,12 +350,7 @@ begin
       State.SignaturePath := Prefix + '.sig.toml';
       WriteImmutable(State.CheckpointPath, Proof.Checkpoint);
       WriteImmutable(State.SignaturePath, Proof.Signature);
-      KeyDocument := 'schema = ' + RegistryTOMLQuote(PROGRAM_NAME + '-registry-key-v1')
-        + #10 + 'origin = ' + RegistryTOMLQuote(Config.Identity)
-        + #10 + 'key_id = ' + RegistryTOMLQuote(Config.TrustKeyID)
-        + #10 + 'algorithm = "ed25519"' + #10 + 'public_key = '
-        + RegistryTOMLQuote(Config.TrustPublicKey) + #10 + 'valid_from_sequence = 1' + #10;
-      WriteImmutable(RegistryKeyStoragePath(Config.TrustKeyID), Bytes(KeyDocument));
+      WriteImmutable(RegistryKeyStoragePath(Config.TrustKeyID), KeyDocument);
       SaveAttempt('verified');
       { All immutable files are closed and verified before this atomic pointer.
         This is process-interruption recovery, not an fsync power-loss promise. }

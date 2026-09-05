@@ -49,7 +49,7 @@ program	*	source/LWPT.ObjectStore.Test.pas	1	14
 program	unix/*	source/LWPT.ObjectStore.Test.pas	1	15
 program	*	source/LWPT.Registry.Crypto.Test.pas	1	6
 program	*	source/LWPT.Registry.Store.Test.pas	1	40
-program	*	source/LWPT.Registry.Verification.Test.pas	1	30
+program	*	source/LWPT.Registry.Verification.Test.pas	1	31
 program	*	source/LWPT.OutputRenderer.Test.pas	1	1
 program	*	source/LWPT.ProducerLease.Test.pas	1	6
 program	unix/*	source/LWPT.ProducerLease.Test.pas	1	7
@@ -63,7 +63,7 @@ program	*	tests/e2e/InstallGitHub.E2E.Test.pas	1	6
 program	*	tests/e2e/InstallGitLab.E2E.Test.pas	1	4
 program	*	tests/e2e/InstallScript.E2E.Test.pas	3	13
 program	*	tests/e2e/Registry.E2E.Test.pas	1	8
-program	*	tests/e2e/RegistryMirror.E2E.Test.pas	1	4
+program	*	tests/e2e/RegistryMirror.E2E.Test.pas	1	6
 program	*	tests/integration/AddRemove.Test.pas	1	8
 program	*	tests/integration/Agents.Test.pas	1	15
 program	*	tests/integration/BuildClean.Test.pas	1	6

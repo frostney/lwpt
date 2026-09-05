@@ -91,6 +91,8 @@ type
 function DefaultRegistryVerificationLimits: TLWPTRegistryVerificationLimits;
 function ParseRegistryDiscovery(const AContent: string): TLWPTRegistryDiscovery;
 function InspectRegistryCheckpoint(const ABody: TBytes): TLWPTUntrustedRegistryCheckpoint;
+procedure ValidateRegistryKeyDocument(const ABytes: TBytes;
+  const ATrust: TLWPTRegistryTrust; const ACheckpointSequence: Int64);
 function ValidateRegistryCapabilities(const AContent, ARole: string;
   out AHasRotations: Boolean): Integer;
 function RegistryURIIsCanonical(const AValue: string;
@@ -528,6 +530,28 @@ begin
     or (Node.ScalarKind <> tskBool) then
     raise ELWPTRegistryError.Create('non_canonical_document: boolean required');
   Result := Node.ScalarText = 'true';
+end;
+
+procedure ValidateRegistryKeyDocument(const ABytes: TBytes;
+  const ATrust: TLWPTRegistryTrust; const ACheckpointSequence: Int64);
+var
+  Root: TTOMLNode;
+  ValidFrom: Int64;
+begin
+  Root := ParseCanonical(BytesText(ABytes), PROGRAM_NAME + '-registry-key-v1',
+    ['schema', 'origin', 'key_id', 'algorithm', 'public_key', 'valid_from_sequence']);
+  try
+    ValidFrom := UnsignedField(Root, 'valid_from_sequence');
+    if not RegistryTrustRootIsValid(ATrust.KeyId, ATrust.PublicKey)
+      or (StringField(Root, 'origin') <> ATrust.Origin)
+      or (StringField(Root, 'key_id') <> ATrust.KeyId)
+      or (StringField(Root, 'public_key') <> ATrust.PublicKey)
+      or (StringField(Root, 'algorithm') <> 'ed25519')
+      or (ValidFrom < 1) or (ValidFrom > ACheckpointSequence) then
+      raise ELWPTRegistryError.Create('registry_key_pin_mismatch');
+  finally
+    Root.Free;
+  end;
 end;
 
 function InspectRegistryCheckpoint(const ABody: TBytes): TLWPTUntrustedRegistryCheckpoint;

@@ -33,6 +33,13 @@ state schema includes the accepted signing key, checkpoint hash, and last
 successful sync time. Files verified during an interrupted attempt remain
 available to its retry; a failed attempt does not replace the active pointer.
 
+The mirror serves only the current checkpoint/signature pair and snapshots in
+that checkpoint's verified ancestry. Cached candidates are not published by
+their hash paths. Optional historical checkpoint URLs are not supported;
+previously accepted snapshot ancestors remain readable. The upstream key
+document is fetched under the 1 MiB control-document limit, checked against the
+immutable pin and checkpoint sequence, and retained byte-for-byte.
+
 `state/sync-attempt.toml` records the most recent verification attempt or
 failure separately. An attempt marked `verified` is not activation proof;
 the current pointer and its successful sync time remain authoritative.

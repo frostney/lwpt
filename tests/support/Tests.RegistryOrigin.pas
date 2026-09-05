@@ -36,14 +36,12 @@ function RegistryArtifactHash(const AArchive: TBytes): string;
 implementation
 
 uses
-  {$IFDEF UNIX}
-  BaseUnix,
-  {$ENDIF}
   HTTPClient,
   LWPT.Core,
   LWPT.Registry.Store,
   LWPT.Registry.Verification,
   Tests.LwptSubprocess,
+  Tests.RegistryProcess,
   Tests.RegistryServer,
   TOML;
 
@@ -112,27 +110,20 @@ end;
 
 procedure StopRegistryCLI(var AProcess: TProcess);
 var
-  Started: QWord;
+  Stopped: TRegistryStopResult;
+  FailureMessage: string;
 begin
-  if AProcess = nil then Exit;
-  try
-    if AProcess.Running then
-    begin
-      {$IFDEF UNIX}
-      FpKill(AProcess.ProcessID, SIGTERM);
-      {$ELSE}
-      AProcess.Terminate(0);
-      {$ENDIF}
-      Started := GetTickCount64;
-      while AProcess.Running and (GetTickCount64 - Started < 12000) do Sleep(10);
-      if AProcess.Running then
-      begin
-        AProcess.Terminate(1);
-        raise Exception.Create('registry CLI listener failed bounded shutdown');
-      end;
-    end;
-  finally
-    FreeAndNil(AProcess);
+  Stopped := StopRegistryProcess(AProcess);
+  FailureMessage := '';
+  if not Stopped.Stopped then
+    FailureMessage := 'registry CLI listener did not stop after forced termination'
+  else if Stopped.Forced then
+    FailureMessage := 'registry CLI listener exceeded its 12000 ms shutdown bound';
+  if FailureMessage <> '' then
+  begin
+    if ExceptObject <> nil then
+      WriteLn(StdErr, 'registry E2E cleanup: ', FailureMessage)
+    else raise Exception.Create(FailureMessage);
   end;
 end;
 

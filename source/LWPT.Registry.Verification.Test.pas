@@ -88,6 +88,7 @@ type
     procedure LockedCheckpointSubstitutionRejected;
     procedure DowngradeRejected;
     procedure EqualSequenceEquivocationRejected;
+    procedure PinnedKeyDocumentValidated;
   end;
 
 function ReadFixture(const APath: string): TBytes;
@@ -771,8 +772,39 @@ begin
   ExpectFailure(Candidate, 'checkpoint_equivocation', Prior.State);
 end;
 
+procedure TRegistryVerificationTests.PinnedKeyDocumentValidated;
+var
+  Original, Candidate: string;
+  Rejected: Boolean;
+  Index: Integer;
+begin
+  Original := AsText(ReadFixture('keys/root.toml'));
+  ValidateRegistryKeyDocument(AsBytes(Original), Trust, 1);
+  ValidateRegistryKeyDocument(AsBytes(StringReplace(Original,
+    'valid_from_sequence = 1', 'valid_from_sequence = 2', [])), Trust, 2);
+  for Index := 0 to 5 do
+  begin
+    case Index of
+      0: Candidate := StringReplace(Original, Trust.Origin, 'https://wrong.example', []);
+      1: Candidate := StringReplace(Original, Trust.KeyId, 'ed25519:' + StringOfChar('0', 64), []);
+      2: Candidate := StringReplace(Original, Trust.PublicKey, 'hex:' + StringOfChar('0', 64), []);
+      3: Candidate := StringReplace(Original, 'valid_from_sequence = 1', 'valid_from_sequence = 0', []);
+      4: Candidate := StringReplace(Original, 'valid_from_sequence = 1', 'valid_from_sequence = 2', []);
+      5: Candidate := StringReplace(Original, 'valid_from_sequence = 1', 'valid_from_sequence = "1"', []);
+    end;
+    Rejected := False;
+    try
+      ValidateRegistryKeyDocument(AsBytes(Candidate), Trust, 1);
+    except
+      on E: ELWPTRegistryError do Rejected := True;
+    end;
+    Expect<Boolean>(Rejected).ToBe(True);
+  end;
+end;
+
 procedure TRegistryVerificationTests.SetupTests;
 begin
+  Test('key documents retain canonical bytes and match immutable trust and sequence', PinnedKeyDocumentValidated);
   Test('bootstrap and yank/restore corpus verifies', CorpusBootstrapAndLifecycle);
   Test('anchored history returns a complete offline bundle', AnchoredHistoryAndCompleteBundle);
   Test('conflicting previously accepted history fails', ConflictingHistoryRejected);

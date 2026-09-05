@@ -93,6 +93,8 @@ type
       out ASize: Int64);
     function LoadCurrentState(AProgress: TSHA256Progress = nil):
       TLWPTRegistryState; virtual;
+    function ResourceIsPublished(const AState: TLWPTRegistryState;
+      const ARelative: string; AProgress: TSHA256Progress = nil): Boolean; virtual;
     function LoadResource(const ARelative: string;
       AProgress: TSHA256Progress = nil;
       const AMaxBytes: Int64 = MAX_REGISTRY_RESOURCE_BYTES): TBytes;
@@ -1367,6 +1369,9 @@ var
 begin
   ConfigPath := IncludeTrailingPathDelimiter(ExpandFileName(ARoot)) + CONFIG_FILE;
   ValidateRegistryPath(ConfigPath);
+  if not FileExists(ConfigPath) then
+    raise ELWPTRegistryError.CreateStable('origin_not_initialized',
+      'registry data directory is not initialized: ' + ExpandFileName(ARoot));
   Result := ParseConfig(ReadText(ConfigPath, nil, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
 end;
 
@@ -1378,11 +1383,7 @@ begin
   if FileExists(FRoot) and not DirectoryExists(FRoot) then
     raise ELWPTRegistryError.CreateStable('invalid_registry_path',
       'registry data root is not a directory');
-  if not FileExists(RootPath(CONFIG_FILE)) then
-    raise ELWPTRegistryError.CreateStable('origin_not_initialized',
-      'registry data directory is not initialized: ' + FRoot);
-  FConfig := ParseConfig(ReadText(RootPath(CONFIG_FILE), nil,
-    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+  FConfig := LoadRegistryConfiguration(FRoot);
   Recover;
 end;
 
@@ -1937,6 +1938,12 @@ function TLWPTRegistryStore.LoadCurrentState(AProgress: TSHA256Progress):
 begin
   Result := ReadCurrentState(AProgress);
   VerifyState(Result, AProgress);
+end;
+
+function TLWPTRegistryStore.ResourceIsPublished(const AState: TLWPTRegistryState;
+  const ARelative: string; AProgress: TSHA256Progress): Boolean;
+begin
+  Result := True;
 end;
 
 function TLWPTRegistryStore.LoadResource(const ARelative: string;
