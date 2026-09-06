@@ -7,6 +7,10 @@ unit HTTPClient;
 
 {$I Shared.inc}
 
+{$IF DEFINED(DARWIN) OR (DEFINED(LINUX) AND NOT DEFINED(ANDROID))}
+{$DEFINE HTTPCLIENT_NATIVE_RESOLVER}
+{$ENDIF}
+
 interface
 
 uses
@@ -80,7 +84,18 @@ implementation
 
 uses
   {$IFDEF UNIX}
-  Sockets, BaseUnix, NetDB,
+  Sockets, BaseUnix,
+  {$IFDEF DARWIN}
+  CTypes, InitC,
+  {$ELSE}
+  {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
+  cNetDB,
+  {$ELSE}
+  { Preserve the existing resolver on other Unix targets until their native
+    bindings have platform evidence; do not infer their addrinfo ABI. }
+  NetDB,
+  {$ENDIF}
+  {$ENDIF}
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   WinSock2,
@@ -114,6 +129,30 @@ type
     Port: Integer;
     Path: string;
   end;
+
+{$IFDEF DARWIN}
+{ Darwin netdb.h places canonname before addr, unlike Linux. socklen_t is
+  unsigned 32-bit on both Darwin release architectures, not pointer-sized. }
+{$push}
+{$packrecords c}
+type
+  PAddrInfo = ^TAddrInfo;
+  TAddrInfo = record
+    ai_flags, ai_family, ai_socktype, ai_protocol: cint;
+    ai_addrlen: cuint32;
+    ai_canonname: PAnsiChar;
+    ai_addr: PSockAddr;
+    ai_next: PAddrInfo;
+  end;
+  PPAddrInfo = ^PAddrInfo;
+{$pop}
+
+function Getaddrinfo(ANodeName, AServName: PAnsiChar;
+  AHints: PAddrInfo; AResult: PPAddrInfo): cint; cdecl;
+  external clib name 'getaddrinfo';
+procedure Freeaddrinfo(AInfo: PAddrInfo); cdecl;
+  external clib name 'freeaddrinfo';
+{$ENDIF}
 
 {$IFDEF MSWINDOWS}
 type
@@ -435,25 +474,58 @@ end;
 // ---------------------------------------------------------------------------
 
 {$IFDEF UNIX}
+function ResolveSocketAddress(const AHost: string): in_addr;
+var
+  {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
+  Hints: TAddrInfo;
+  Addresses, Current: PAddrInfo;
+  {$ELSE}
+  HostEntry: THostEntry;
+  {$ENDIF}
+begin
+  Result := StrToNetAddr(AHost);
+  if Result.s_addr <> 0 then Exit;
+  {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
+  FillChar(Hints, SizeOf(Hints), 0);
+  Hints.ai_family := AF_INET;
+  Hints.ai_socktype := SOCK_STREAM;
+  Hints.ai_protocol := IPPROTO_TCP;
+  Addresses := nil;
+  { Native resolution honors system host databases and keeps its result list
+    request-local. It remains synchronous; ConnectSocket checks the shared
+    request deadline immediately after this lookup returns. }
+  if Getaddrinfo(PAnsiChar(AHost), nil, @Hints, @Addresses) <> 0 then
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  try
+    Current := Addresses;
+    while Current <> nil do
+    begin
+      if (Current^.ai_family = AF_INET) and (Current^.ai_addr <> nil)
+        and (Current^.ai_addrlen >= SizeOf(TInetSockAddr)) then
+        Exit(PInetSockAddr(Current^.ai_addr)^.sin_addr);
+      Current := Current^.ai_next;
+    end;
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  finally
+    if Addresses <> nil then Freeaddrinfo(Addresses);
+  end;
+  {$ELSE}
+  if not ResolveHostByName(AHost, HostEntry) then
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  Result := HostEntry.Addr;
+  {$ENDIF}
+end;
+
 function ConnectSocket(const AHost: string; const APort: Integer;
   const ADeadline, ATimeoutMilliseconds: QWord): TSocket;
 var
   SockAddr: TInetSockAddr;
-  HostEntry: THostEntry;
   Addr: in_addr;
   ConnectResult: Integer;
   SocketError: Integer;
   SocketErrorLength: TSockLen;
 begin
-  // Try as numeric IP first
-  Addr := StrToNetAddr(AHost);
-  if Addr.s_addr = 0 then
-  begin
-    // DNS lookup via netdb
-    if not ResolveHostByName(AHost, HostEntry) then
-      raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
-    Addr := HostEntry.Addr;
-  end;
+  Addr := ResolveSocketAddress(AHost);
   CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
 
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);

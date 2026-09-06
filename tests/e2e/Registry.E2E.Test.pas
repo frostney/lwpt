@@ -17,15 +17,12 @@ uses
 
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.RegistryProcess,
   Tests.Scratch;
 
 const
   TLS_PASSWORD_ENV = 'LWPT_REGISTRY_E2E_PASSWORD';
   TLS_PASSWORD = 'test-only';
-  { The server's connection deadline is 10 seconds; retain two seconds for
-    listener and connection teardown before the test force-terminates it. }
-  SERVER_STOP_TIMEOUT_MILLISECONDS = 12000;
-  SERVER_KILL_TIMEOUT_MILLISECONDS = 2000;
   REGISTRY_TLS_FIXTURE =
     'tests/fixtures/registry/localhost-native-identity.p12';
 
@@ -267,65 +264,20 @@ begin
   end;
 end;
 
-function WaitForServerExit(AProcess: TProcess;
-  const ATimeoutMilliseconds: QWord): Boolean;
-var
-  StartedAt: QWord;
-begin
-  StartedAt := GetTickCount64;
-  while AProcess.Running
-    and (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do Sleep(10);
-  Result := not AProcess.Running;
-end;
-
 function TRegistryE2EContract.StopServerAndReturnExit(
   var AProcess: TProcess): Integer;
 var
-  Forced: Boolean;
+  Stopped: TRegistryStopResult;
   FailureMessage: string;
-  ProcessInstance: TProcess;
 begin
-  Result := -1;
-  if not Assigned(AProcess) then Exit;
-  ProcessInstance := AProcess;
-  AProcess := nil;
-  Forced := False;
+  Stopped := StopRegistryProcess(AProcess);
+  Result := Stopped.ExitStatus;
   FailureMessage := '';
-  try
-    if ProcessInstance.Running then
-    begin
-      {$IFDEF UNIX}
-      FpKill(ProcessInstance.ProcessID, SIGTERM);
-      {$ELSE}
-      ProcessInstance.Terminate(1);
-      {$ENDIF}
-    end;
-    if not WaitForServerExit(ProcessInstance,
-      SERVER_STOP_TIMEOUT_MILLISECONDS) then
-    begin
-      Forced := True;
-      {$IFDEF UNIX}
-      FpKill(ProcessInstance.ProcessID, SIGKILL);
-      {$ELSE}
-      ProcessInstance.Terminate(1);
-      {$ENDIF}
-      if not WaitForServerExit(ProcessInstance,
-        SERVER_KILL_TIMEOUT_MILLISECONDS) then
-        FailureMessage := 'registry server did not stop after forced '
-          + 'termination';
-    end;
-  finally
-    if not ProcessInstance.Running then
-    begin
-      ProcessInstance.WaitOnExit;
-      Result := ProcessInstance.ExitStatus;
-    end;
-    ProcessInstance.Free;
-  end;
-  if Forced and (FailureMessage = '') then
-    FailureMessage := Format('registry server exceeded its %d ms shutdown '
-      + 'bound and required forced termination',
-      [SERVER_STOP_TIMEOUT_MILLISECONDS]);
+  if not Stopped.Stopped then
+    FailureMessage := 'registry server did not stop after forced termination'
+  else if Stopped.Forced then
+    FailureMessage := 'registry server exceeded its 12000 ms shutdown '
+      + 'bound and required forced termination';
   if FailureMessage <> '' then
   begin
     if ExceptObject <> nil then
@@ -351,6 +303,17 @@ begin
   Expect<Boolean>(Pos('serve accepts only', ResultValue.Stderr) = 0)
     .ToBe(True);
   Expect<Boolean>(Pos('origin_not_initialized:', ResultValue.Stderr) > 0)
+    .ToBe(True);
+  Expect<Boolean>(ForceDirectories(FScratch + '/uninitialized')).ToBe(True);
+  ResultValue := RunLwpt(['registry', 'serve', '--silent', '--data-dir',
+    FScratch + '/uninitialized']);
+  Expect<Integer>(ResultValue.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('origin_not_initialized:', ResultValue.Stderr) > 0)
+    .ToBe(True);
+  ResultValue := RunLwpt(['registry', 'serve', '--silent', '--data-dir',
+    LwptBinaryPath]);
+  Expect<Integer>(ResultValue.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('invalid_registry_path:', ResultValue.Stderr) > 0)
     .ToBe(True);
 end;
 
