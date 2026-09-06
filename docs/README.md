@@ -1,11 +1,17 @@
 # LWPT documentation
 
+**Using LWPT:** start with the [consumer guide](consumer-guide.md) for installation,
+a working project, and capability selection. **Contributing to LWPT:** follow the
+[contributor quick start](quick-start.md). [llms.txt](../llms.txt) provides a compact
+index linking to the same canonical Markdown sources.
+
 Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md), [`CONTRIBUTING.md`](../CONTRIBUTING.md), and [`CONTEXT.md`](../CONTEXT.md) are the entry points; everything below is the deep dive.
 
 | File | Covers |
 | --- | --- |
+| [`consumer-guide.md`](./consumer-guide.md) | Released-tool installation, CLI and testing dependencies, runnable consumer example, tasks, and capability references |
 | [`architecture.md`](./architecture.md) | Tech stack, the package-manager-is-the-foundation through-line, manifest model, resolver shape, fetch/extract/build/test pipeline, `.lwpt/` layout, error/idempotency model, deferred-contracts note |
-| [`quick-start.md`](./quick-start.md) | Install FPC + InstantFPC + Lefthook, bootstrap, build, write a test, add a dependency, common errors |
+| [`quick-start.md`](./quick-start.md) | Contributor setup: install FPC + InstantFPC + Lefthook, bootstrap LWPT itself, build, test, and common errors |
 | [`tooling.md`](./tooling.md) | Pinned tool versions, environment variables, lint/format/test commands, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), EXDEV fallback, where each deferred contract lives |
 | [`code-style.md`](./code-style.md) | Naming, file layout, formatter rules, manifest scope with protected toolkit state, line-endings, design tokens |
 | [`build-system.md`](./build-system.md) | Bootstrap pattern, `lwpt build` contract, `[build]` section + lifecycle hooks (`[prebuild]` / `[postbuild]` / `[pretest]` / etc.), `build/` output rules, cross-compile |
