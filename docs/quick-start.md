@@ -1,6 +1,9 @@
-# Quick start
+# Contributor quick start
 
-The top-to-bottom walkthrough for getting from `git clone` to passing tests on a fresh machine.
+This walkthrough builds and tests **LWPT itself** from a source checkout.
+To install the released toolkit and scaffold another project, follow the
+[consumer guide](consumer-guide.md). The [documentation index](README.md) and
+[llms.txt](../llms.txt) cover the full capability set.
 
 ## Executive Summary
 
@@ -165,9 +168,7 @@ Source kinds for v1: `github`, `gitlab`, `bitbucket`, `release`, `local`. See [`
 ```toml
 # lwpt.toml — non-monorepo consumer
 [dependencies]
-testing = "frostney/lwpt-testing@^1.0.0"   # Phase 2 form, post-graduation
-# or, until Phase 2 lands:
-testing = { source = "frostney/lwpt@^0.1.0", include = ["packages/testing/**"] }
+testing = { source = "frostney/lwpt", version = "0.7.0", include = ["packages/testing/**"] }
 ```
 
 Include filters keep the repo-relative path prefix, so the filtered tree lands at `.lwpt/modules/testing/packages/testing/…`. That's fine: the resolver finds the package's `lwpt.toml` wherever it sits in the module tree (the shallowest one wins; if two manifests tie at the same minimal depth there is no defensible winner, so the resolver falls back to manifest-less module-root behavior — `-Fu`/`-Fi` point at the module root and no transitive deps are walked), reads its `units` array, and emits `-Fu`/`-Fi` paths relative to the module root — no extra configuration in the consumer manifest.

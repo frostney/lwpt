@@ -1,0 +1,34 @@
+# LWPT
+
+> A Pascal toolkit for dependency management, builds, tests, CLI libraries,
+> formatting, health, duplication, run tasks, lifecycle hooks, and agent sync.
+
+Use the consumer guide when creating a project with LWPT. The contributor guide
+and AGENTS.md govern changes to LWPT itself. Run `lwpt --help` for the installed
+command set and `lwpt <command> --help` for options. The consumer example pins
+released packages; main-branch references may describe newer behavior.
+
+## Start here
+
+- [Consumer guide](https://raw.githubusercontent.com/frostney/lwpt/main/docs/consumer-guide.md): Homebrew installation, a complete CLI and native test, and capability selection.
+- [README](https://raw.githubusercontent.com/frostney/lwpt/main/README.md): Command overview and manifest examples.
+- [Documentation index](https://raw.githubusercontent.com/frostney/lwpt/main/docs/README.md): Canonical topic references.
+
+## Capabilities
+
+- [Build system](https://raw.githubusercontent.com/frostney/lwpt/main/docs/build-system.md): Build entries and lifecycle integration.
+- [Testing](https://raw.githubusercontent.com/frostney/lwpt/main/docs/testing.md): Native test programs, selectors, and compiled-test reuse.
+- [Code style](https://raw.githubusercontent.com/frostney/lwpt/main/docs/code-style.md): Formatter behavior and source scope.
+- [Health](https://raw.githubusercontent.com/frostney/lwpt/main/docs/health.md): Complexity thresholds and reports.
+- [Tooling](https://raw.githubusercontent.com/frostney/lwpt/main/docs/tooling.md): Duplication checks and tool configuration.
+- [Run tasks](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0013-run-subcommand-and-build-rename.md): Manifest commands for project-specific work.
+- [Lifecycle hooks](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0011-build-lifecycle-hooks.md): Hook commands and staleness checks.
+- [Agent reference](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0027-agents-subcommand.md): Generate and check project command documentation.
+- [CLI options](https://raw.githubusercontent.com/frostney/lwpt/main/packages/cli/source/CLI.Options.pas): Application argument types.
+- [CLI subcommands](https://raw.githubusercontent.com/frostney/lwpt/main/packages/cli/source/CLI.Subcommands.pas): Command registration, dispatch, and help.
+
+## Optional
+
+- [Contributor setup](https://raw.githubusercontent.com/frostney/lwpt/main/docs/quick-start.md): Build and test LWPT itself from source.
+- [Contributor instructions](https://raw.githubusercontent.com/frostney/lwpt/main/AGENTS.md): Repository-specific constraints.
+- [Package architecture](https://raw.githubusercontent.com/frostney/lwpt/main/docs/packages.md): Package ownership and migration history.

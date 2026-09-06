@@ -29,8 +29,8 @@ LWPT is pre-1.0. The package model, install pipeline, formatter, test runner,
 duplication analysis, codebase-health report, and release flow are in place.
 The project-only release architecture check remains separate from the customer
 commands originally deferred by
-[ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md). See
-[`AGENTS.md`](./AGENTS.md) for the full operating manual and
+[ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md). See the [consumer guide](./docs/consumer-guide.md) for using LWPT,
+[`AGENTS.md`](./AGENTS.md) for contributing to LWPT, and
 [`docs/adr/`](./docs/adr/) for the architectural decisions that shape
 the v1 design.
 
@@ -41,35 +41,28 @@ The project's durable direction and delivery gates live in
 
 ## Quick start
 
-```sh
-# One-time bootstrap (produces the first build/lwpt binary)
-./bootstrap.sh     # Unix
-bootstrap.bat      # Windows
+Install the released toolkit on macOS, then scaffold in your own project:
 
-# Steady state — all driven by the LWPT binary
-./build/lwpt init --yes         # scaffold a fresh project
-./build/lwpt init --adopt       # fill in scaffold around an existing manifest
-./build/lwpt build              # dev build, all manifest entries
-./build/lwpt build --mode release
-./build/lwpt build <entry>      # single build entry
-./build/lwpt format             # rewrite project sources to canonical style
-./build/lwpt format --check     # exit non-zero on any deviation
-./build/lwpt duplication        # deterministic human clone report
-./build/lwpt duplication --json # versioned machine-readable envelope
-./build/lwpt test               # discover/compile/run *.Test.pas
-./build/lwpt install            # fetch any new deps
-./build/lwpt install --frozen   # CI: verify, refuse to update
-./build/lwpt install --offline  # restore exact locked state from local bytes
-./build/lwpt add owner/repo@^1.0    # add a dependency + install it
-./build/lwpt remove <name>      # remove a dependency + prune its modules
-./build/lwpt outdated           # report newer advertised tags
-./build/lwpt update             # bump constraints + refresh the lock
-./build/lwpt repair             # recover install, build, and worker residue
-./build/lwpt registry init      # initialize a self-hosted registry origin
-./build/lwpt registry serve     # serve the origin in the foreground
-./build/lwpt health             # deterministic complexity report
-./build/lwpt health --hotspots  # add local Git churn and hotspot ranking
+```sh
+brew install fpc frostney/tap/lwpt
+mkdir my-project
+cd my-project
+lwpt --help
+lwpt init --yes
+lwpt build
 ```
+
+Continue with **[Use LWPT in your project](docs/consumer-guide.md)** for a
+complete CLI, native test, dependency manifest, run task, and quality commands.
+It also covers release installation on other platforms. Each subcommand's help
+links back to `lwpt --help` so its other capabilities remain discoverable.
+
+**Contributing to LWPT itself?** Follow the [contributor quick start](docs/quick-start.md)
+for the source bootstrap and self-host build. The bootstrap belongs to the
+LWPT repository; a consumer uses the installed executable.
+
+**Documentation for agents:** [llms.txt](llms.txt) links directly to the same
+canonical Markdown guides and references.
 
 ## Architecture
 
@@ -237,6 +230,10 @@ Source kinds: `skGitHost` (default `github`, with `gitlab:` / `bitbucket:` / any
 
 ## Writing tests
 
+For a consumer dependency manifest and a runnable example, start with the
+[consumer guide](docs/consumer-guide.md#scaffold-a-cli-with-a-native-test).
+The workspace auto-discovery below describes LWPT’s own monorepo.
+
 `TestingPascalLibrary` lives in the `testing` workspace package and is
 auto-discovered via `[workspaces] include = ["packages/*"]` in the
 root manifest — `lwpt install` publishes its validated snapshot into
@@ -322,8 +319,10 @@ story.
 
 ## Documentation
 
-- [`AGENTS.md`](./AGENTS.md) — operating manual for AI assistants (and
-  the canonical source of truth while `docs/` is still being built out).
+- [Consumer guide](docs/consumer-guide.md) — install LWPT and use its capabilities in your project.
+- [Documentation index](docs/README.md) — topic-by-topic navigation.
+- [llms.txt](llms.txt) — compact index with direct Markdown links for agents.
+- [`AGENTS.md`](./AGENTS.md) — contributor instructions for AI assistants changing LWPT itself.
 - [`docs/adr/`](./docs/adr/) — architectural decision records.
 - [`docs/spikes/`](./docs/spikes/) — point-in-time snapshots of
   investigations (e.g. the archived HTTP registry spike that informs
