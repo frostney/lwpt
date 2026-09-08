@@ -213,7 +213,10 @@ writable, LWPT fails with an error directing the user to
 working but forfeits cross-worktree budget sharing. An explicit
 `LWPT_WORKER_STATE_DIR` remains authoritative and fails if unwritable. The
 effective budget is the first invocation's configured `LWPT_WORKER_BUDGET`, or
-the logical processor count when unset. Later invocations adopt that active
+the logical processor count when unset. On macOS, LWPT reads `hw.logicalcpu`
+directly because Free Pascal 3.2.2 can report only one processor through
+`TThread.ProcessorCount`; if the OS query fails, LWPT falls back to the runtime
+count with a minimum of one. Later invocations adopt that active
 budget until all current requests finish. A request cannot hold more than its
 own requested worker count or the effective machine budget.
 

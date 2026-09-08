@@ -108,6 +108,9 @@ type
     procedure SetupTests; override;
     procedure TestContendersShareCapacityAndBothProgress;
     procedure TestRequestIsBoundedByMachineCapacity;
+    {$IFDEF DARWIN}
+    procedure TestDefaultBudgetMatchesMacOS;
+    {$ENDIF}
     procedure TestCrashedOwnerIsReclaimed;
     procedure TestHeartbeatPreservesLongRunningOwner;
     procedure TestLiveUnreadableRequestsFailClosed;
@@ -1503,6 +1506,28 @@ begin
   end;
 end;
 
+{$IFDEF DARWIN}
+procedure TWorkerBudgetProcesses.TestDefaultBudgetMatchesMacOS;
+var
+  OutputPath, ProcessorCountText : string;
+  Values : TStringList;
+  ExpectedCount : Integer;
+begin
+  Expect<Boolean>(RunCommand('/usr/sbin/sysctl',
+    ['-n', 'hw.logicalcpu'], ProcessorCountText)).ToBe(True);
+  ExpectedCount := StrToInt(Trim(ProcessorCountText));
+  Expect<Boolean>(ExpectedCount > 0).ToBe(True);
+  OutputPath := FScratch + '/default-budget';
+  RunUtilityWithBudget(SNAPSHOT_SWITCH, OutputPath, '');
+  Values := ReadUtilityValues(OutputPath);
+  try
+    Expect<Integer>(StrToInt(Values.Values['budget'])).ToBe(ExpectedCount);
+  finally
+    Values.Free;
+  end;
+end;
+{$ENDIF}
+
 procedure TWorkerBudgetProcesses.TestCrashedOwnerIsReclaimed;
 var
   FirstProcess, SecondProcess : TProcess;
@@ -2194,6 +2219,10 @@ end;
 
 procedure TWorkerBudgetProcesses.SetupTests;
 begin
+  {$IFDEF DARWIN}
+  Test('default worker budget matches macOS logical CPUs',
+    TestDefaultBudgetMatchesMacOS);
+  {$ENDIF}
   Test('separate worktrees share one budget and both contenders progress',
     TestContendersShareCapacityAndBothProgress);
   Test('an invocation request is bounded by machine capacity',
