@@ -54,6 +54,7 @@ program	*	source/LWPT.ProducerLease.Test.pas	1	6
 program	unix/*	source/LWPT.ProducerLease.Test.pas	1	7
 program	*	source/LWPT.Resolver.Test.pas	1	7
 program	*	source/LWPT.WorkerBudget.Test.pas	1	22
+program	darwin/*	source/LWPT.WorkerBudget.Test.pas	1	23
 program	windows/*	source/LWPT.WorkerBudget.Test.pas	1	17
 program	*	tests/e2e/HealthGit.E2E.Test.pas	1	4
 program	*	tests/e2e/InstallBitbucket.E2E.Test.pas	1	4

@@ -730,9 +730,19 @@ begin
   end;
 end;
 
+{$IFDEF DARWIN}
+function CSysCtlByName(AName: PAnsiChar; AOldValue: Pointer;
+  var AOldLength: PtrUInt; ANewValue: Pointer; ANewLength: PtrUInt): LongInt;
+  cdecl; external name 'sysctlbyname';
+{$ENDIF}
+
 function ConfiguredBudget: Integer;
 var
   Raw : string;
+  {$IFDEF DARWIN}
+  ProcessorCount : LongInt;
+  ValueSize : PtrUInt;
+  {$ENDIF}
 begin
   Raw := Trim(SysUtils.GetEnvironmentVariable(WORKER_BUDGET_ENV));
   if Raw <> '' then
@@ -744,6 +754,15 @@ begin
         [WORKER_BUDGET_ENV, Raw]);
     Exit;
   end;
+  {$IFDEF DARWIN}
+  { FPC 3.2.2 reports one processor through TThread on macOS, including
+    multicore Apple Silicon hosts. Query the OS before using that fallback. }
+  ProcessorCount := 0;
+  ValueSize := SizeOf(ProcessorCount);
+  if (CSysCtlByName('hw.logicalcpu', @ProcessorCount, ValueSize, nil, 0) = 0)
+    and (ValueSize = SizeOf(ProcessorCount)) and (ProcessorCount > 0) then
+    Exit(ProcessorCount);
+  {$ENDIF}
   Result := TThread.ProcessorCount;
   if Result < 1 then Result := 1;
 end;

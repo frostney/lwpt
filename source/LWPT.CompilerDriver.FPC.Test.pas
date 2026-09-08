@@ -34,11 +34,10 @@ const
   IsolatedUnitPathsCase = 'unit-paths';
   ProbeTimeoutGrandchildOption = '--' + PROGRAM_NAME
     + '-probe-timeout-grandchild';
-  ProbeTimeoutProxyName = PROGRAM_NAME + '-probe-timeout-proxy';
+  ProbeTimeoutProxyOption = '--' + PROGRAM_NAME + '-probe-timeout-proxy';
   ProbeTimeoutSleepMilliseconds = 30000;
   TestProbeTimeoutMilliseconds = 1000;
   TestProbeCompletionTimeoutSeconds = 10;
-  ProbeTimeoutProxyReleaseMilliseconds = 5000;
 
 type
   TMockFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
@@ -65,8 +64,15 @@ type
   end;
 
   TTimeoutFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
+  private
+    FGrandchildPIDPath: string;
   protected
+    function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
+      out AOutput: string): Integer; override;
     function ProbeTimeoutMilliseconds: QWord; override;
+  public
+    property GrandchildPIDPath: string read FGrandchildPIDPath
+      write FGrandchildPIDPath;
   end;
 
   TLWPTFPCCompilerDriverTests = class(TTestSuite)
@@ -129,30 +135,6 @@ begin
   {$ENDIF}
 end;
 
-procedure DeleteProbeTimeoutScratch(const AScratch, AProxyPath: string);
-{$IFDEF MSWINDOWS}
-var
-  StartedAt: QWord;
-{$ENDIF}
-begin
-  {$IFDEF MSWINDOWS}
-  { TerminateProcess has completed before the driver returns, but Windows can
-    retain the executable image briefly while the process object is reaped.
-    Retry only this known proxy instead of weakening RecursiveDelete for every
-    test fixture. }
-  StartedAt := GetTickCount64;
-  while FileExists(AProxyPath) and not SysUtils.DeleteFile(AProxyPath) do
-  begin
-    if GetTickCount64 - StartedAt >= ProbeTimeoutProxyReleaseMilliseconds then
-      raise Exception.CreateFmt(
-        'probe-timeout proxy remained locked after %d ms: %s',
-        [ProbeTimeoutProxyReleaseMilliseconds, AProxyPath]);
-    Sleep(10);
-  end;
-  {$ENDIF}
-  RecursiveDelete(AScratch);
-end;
-
 function RunProbeTimeoutGrandchild: Integer;
 begin
   {$IFDEF UNIX}
@@ -163,22 +145,20 @@ begin
   Result := 0;
 end;
 
-function RunProbeTimeoutProxy: Integer;
+function RunProbeTimeoutProxy(const AGrandchildPIDPath: string): Integer;
 var
   Grandchild: TProcess;
-  GrandchildPIDPath: string;
 begin
   {$IFDEF UNIX}
   FpSignal(SIGTERM, SignalHandler(SIG_IGN));
   {$ENDIF}
-  GrandchildPIDPath := ExtractFileDir(ParamStr(0)) + '/grandchild-pid';
   Grandchild := TProcess.Create(nil);
   try
     Grandchild.Executable := ExpandFileName(ParamStr(0));
     Grandchild.Parameters.Add(ProbeTimeoutGrandchildOption);
-    Grandchild.Parameters.Add(GrandchildPIDPath);
+    Grandchild.Parameters.Add(AGrandchildPIDPath);
     Grandchild.Execute;
-    while not FileExists(GrandchildPIDPath) and Grandchild.Running do
+    while not FileExists(AGrandchildPIDPath) and Grandchild.Running do
       Sleep(ProcessPollMilliseconds);
     Sleep(ProbeTimeoutSleepMilliseconds);
   finally
@@ -231,6 +211,20 @@ begin
   else
     AOutput := FProbeOutput;
   Result := FProbeExitCode;
+end;
+
+function TTimeoutFPCCompilerDriver.ExecuteProbe(
+  const AArguments: LWPT.Core.TStringArray; out AOutput: string): Integer;
+var
+  Arguments: LWPT.Core.TStringArray;
+  I: Integer;
+begin
+  SetLength(Arguments, Length(AArguments) + 2);
+  Arguments[0] := ProbeTimeoutProxyOption;
+  Arguments[1] := FGrandchildPIDPath;
+  for I := 0 to High(AArguments) do
+    Arguments[I + 2] := AArguments[I];
+  Result := inherited ExecuteProbe(Arguments, AOutput);
 end;
 
 function TTimeoutFPCCompilerDriver.ProbeTimeoutMilliseconds: QWord;
@@ -553,21 +547,18 @@ var
   Driver: TTimeoutFPCCompilerDriver;
   ElapsedMilliseconds, StartedAt: QWord;
   GrandchildPID: Integer;
-  ErrorMessage, GrandchildPIDPath, ProxyPath, Scratch: string;
+  ErrorMessage, GrandchildPIDPath, Scratch: string;
   Raised: Boolean;
 begin
   Scratch := ExpandFileName('build/tests/tmp/compiler-driver-probe-timeout');
   GrandchildPIDPath := Scratch + '/grandchild-pid';
-  ProxyPath := Scratch + '/' + ProbeTimeoutProxyName
-    + ExtractFileExt(ParamStr(0));
   RecursiveDelete(Scratch);
   ForceDirectories(Scratch);
-  if not CopyFileContent(ExpandFileName(ParamStr(0)), ProxyPath) then
-    raise Exception.Create('could not create probe-timeout proxy');
-  {$IFDEF UNIX}
-  if FpChmod(PChar(ProxyPath), &755) <> 0 then RaiseLastOSError;
-  {$ENDIF}
-  Driver := TTimeoutFPCCompilerDriver.Create(ProxyPath);
+  { Reuse the executable already running this suite. A newly copied image can
+    spend the entire probe deadline in OS startup before creating its child,
+    especially when the machine's full worker budget is active. }
+  Driver := TTimeoutFPCCompilerDriver.Create(ExpandFileName(ParamStr(0)));
+  Driver.GrandchildPIDPath := GrandchildPIDPath;
   GrandchildPID := 0;
   try
     Raised := False;
@@ -587,7 +578,7 @@ begin
     ElapsedMilliseconds := GetTickCount64 - StartedAt;
     if not Raised then
       WriteLn('PROBE-TIMEOUT TEST FAILURE: elapsed=', ElapsedMilliseconds,
-        ' error="', ErrorMessage, '" proxy="', ProxyPath, '" pidFile=',
+        ' error="', ErrorMessage, '" pidFile=',
         FileExists(GrandchildPIDPath));
     Expect<Boolean>(Raised).ToBe(True);
     Expect<Boolean>(ElapsedMilliseconds
@@ -601,7 +592,7 @@ begin
   finally
     Driver.Free;
     TerminateTestProcess(GrandchildPID);
-    DeleteProbeTimeoutScratch(Scratch, ProxyPath);
+    RecursiveDelete(Scratch);
   end;
 end;
 
@@ -1241,9 +1232,8 @@ begin
   if (ParamCount >= 2)
      and (ParamStr(1) = ProbeTimeoutGrandchildOption) then
     Halt(RunProbeTimeoutGrandchild);
-  if SameText(ChangeFileExt(ExtractFileName(ParamStr(0)), ''),
-    ProbeTimeoutProxyName) then
-    Halt(RunProbeTimeoutProxy);
+  if (ParamCount >= 2) and (ParamStr(1) = ProbeTimeoutProxyOption) then
+    Halt(RunProbeTimeoutProxy(ParamStr(2)));
   TestRunnerProgram.AddSuite(TLWPTFPCCompilerDriverTests.Create(
     'FPC compiler driver'));
   TestRunnerProgram.Run;
