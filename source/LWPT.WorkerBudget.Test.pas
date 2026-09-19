@@ -27,6 +27,7 @@ const
   NESTED_CHILD_SWITCH = '--worker-budget-nested-child';
   RELEASE_RETRY_SWITCH = '--worker-budget-release-retry';
   THREAD_SWITCH = '--worker-budget-threads';
+  POLL_SWITCH = '--worker-budget-poll';
   CORRUPT_OWNER_SWITCH = '--worker-budget-corrupt-owner';
   FANOUT_SWITCH = '--worker-budget-fanout';
   REUSE_SWITCH = '--worker-budget-token-reuse';
@@ -106,6 +107,7 @@ type
     procedure BeforeEach; override;
   public
     procedure SetupTests; override;
+    procedure TestPersistentPolling;
     procedure TestContendersShareCapacityAndBothProgress;
     procedure TestRequestIsBoundedByMachineCapacity;
     {$IFDEF DARWIN}
@@ -287,6 +289,89 @@ end;
 procedure AddWorkerEnvironment(AProcess: TProcess;
   const AStateRoot: string; const ABudget: string = TEST_BUDGET); forward;
 
+procedure CheckPersistentPolling;
+var
+  Holder, First, Later : TLWPTWorkerBudgetSession;
+  HeldLease, Acquired : TLWPTWorkerLease;
+  Ticket : Int64;
+
+  procedure Check(ACondition: Boolean; const AMessage: string);
+  begin
+    if not ACondition then raise Exception.Create(AMessage);
+  end;
+
+  function WaitTicket(const ASession: string): Int64;
+  var
+    Snapshot : TLWPTWorkerBudgetSnapshot;
+    Entry : TLWPTWorkerBudgetEntry;
+  begin
+    Result := 0;
+    Snapshot := GetWorkerBudgetSnapshot;
+    for Entry in Snapshot.Entries do
+      if Entry.SessionId = ASession then Exit(Entry.WaitTicket);
+  end;
+
+begin
+  Holder := nil;
+  First := nil;
+  Later := nil;
+  HeldLease := nil;
+  Acquired := nil;
+  try
+    Holder := TLWPTWorkerBudgetSession.Create('holder', 1);
+    First := TLWPTWorkerBudgetSession.Create('first', 1);
+    Later := TLWPTWorkerBudgetSession.Create('later', 1);
+    HeldLease := Holder.Acquire(0);
+    Check(Assigned(HeldLease), 'holder must acquire');
+    Check(First.Acquire(0) = nil, 'zero timeout must return');
+    Check(WaitTicket('first') = 0, 'ordinary timeout must withdraw');
+    Check(First.Acquire(20) = nil, 'finite timeout must return');
+    Check(WaitTicket('first') = 0, 'finite timeout must withdraw');
+    Check(First.PollAcquire = nil, 'poll must return without capacity');
+    Ticket := WaitTicket('first');
+    Check(Ticket > 0, 'poll must retain a ticket');
+    Check(First.PollAcquire = nil, 'repeated poll must return');
+    Check(WaitTicket('first') = Ticket, 'repeated poll must retain position');
+    Check(First.Acquire(20) = nil, 'same-session finite wait must return');
+    Check(WaitTicket('first') = Ticket, 'finite wait must preserve pending poll');
+    Check(Later.PollAcquire = nil, 'later poll must queue');
+    FreeAndNil(HeldLease);
+    Check(Later.PollAcquire = nil, 'later waiter must not overtake');
+    Acquired := First.Acquire(0);
+    Check(Assigned(Acquired), 'ordinary acquire must consume pending poll');
+    Check(WaitTicket('first') = 0, 'grant must consume queue demand');
+    First.CancelPendingAcquire;
+    Check(GetWorkerBudgetSnapshot.ActiveWorkers = 1,
+      'cancellation must not release a granted lease');
+    FreeAndNil(Acquired);
+    Check(First.PollAcquire = nil, 'reacquisition must follow existing waiter');
+    Acquired := Later.PollAcquire;
+    Check(Assigned(Acquired), 'existing waiter must progress');
+    FreeAndNil(Acquired);
+    Check(Later.PollAcquire = nil, 'later poll must queue behind first');
+    First.CancelPendingAcquire;
+    First.CancelPendingAcquire;
+    Check(WaitTicket('first') = 0, 'cancellation must withdraw queue demand');
+    Acquired := Later.PollAcquire;
+    Check(Assigned(Acquired), 'cancellation must unblock next waiter');
+    Check(First.PollAcquire = nil, 'first must queue while lease held');
+    FreeAndNil(Acquired);
+    Check(Later.PollAcquire = nil, 'later must queue behind first again');
+    FreeAndNil(First);
+    Acquired := Later.PollAcquire;
+    Check(Assigned(Acquired), 'destruction must withdraw pending demand');
+    FreeAndNil(Acquired);
+    Check(GetWorkerBudgetSnapshot.ActiveWorkers = 0, 'no leaked capacity');
+    Check(GetWorkerBudgetSnapshot.WaitingInvocations = 0, 'no ghost waiter');
+  finally
+    Acquired.Free;
+    HeldLease.Free;
+    Later.Free;
+    First.Free;
+    Holder.Free;
+  end;
+end;
+
 function RunChildMode: Boolean;
 var
   i, GrantedTotal, Cycles : Integer;
@@ -306,6 +391,13 @@ var
   ExistingTransactionLock : Boolean;
   {$ENDIF}
 begin
+  if (ParamCount = 2) and (ParamStr(1) = POLL_SWITCH) then
+  begin
+    CheckPersistentPolling;
+    WriteTextFile(ParamStr(2), 'passed');
+    ExitCode := 0;
+    Exit(True);
+  end;
   if (ParamCount = 1) and (ParamStr(1) = UNCONSUMED_CHILD_SWITCH) then
   begin
     ExitCode := 0;
@@ -2217,8 +2309,16 @@ begin
 end;
 {$ENDIF}
 
+procedure TWorkerBudgetProcesses.TestPersistentPolling;
+begin
+  RunUtility(POLL_SWITCH, FScratch + '/poll-result');
+  Expect<Boolean>(FileExists(FScratch + '/poll-result')).ToBe(True);
+end;
+
 procedure TWorkerBudgetProcesses.SetupTests;
 begin
+  Test('persistent polls retain FIFO position and withdraw abandoned demand',
+    TestPersistentPolling);
   {$IFDEF DARWIN}
   Test('default worker budget matches macOS logical CPUs',
     TestDefaultBudgetMatchesMacOS);
