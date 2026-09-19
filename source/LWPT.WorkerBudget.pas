@@ -97,6 +97,9 @@ type
     FAcquireCriticalSection : TRTLCriticalSection;
     FLocalCriticalSectionReady : Boolean;
     FAcquireCriticalSectionReady : Boolean;
+    FPersistentWait : Boolean;
+    function AcquireInternal(ATimeoutMilliseconds: Integer;
+      AKeepWaiting: Boolean): TLWPTWorkerLease;
     procedure TouchHeartbeat;
     procedure ReleaseLease(ALease: TLWPTWorkerLease);
     procedure CancelPendingDelegation(ALease: TLWPTWorkerLease);
@@ -108,6 +111,10 @@ type
     constructor Create(const ASessionId: string; ARequestedWorkers: Integer);
     destructor Destroy; override;
     function Acquire(ATimeoutMilliseconds: Integer = -1): TLWPTWorkerLease;
+    { Poll without losing FIFO position. A successful acquisition consumes the
+      pending request; otherwise cancel it when the scheduler has no demand. }
+    function PollAcquire: TLWPTWorkerLease;
+    procedure CancelPendingAcquire;
     property SessionId: string read FSessionId;
     property RequestedWorkers: Integer read FRequested;
     property EffectiveBudget: Integer read FEffectiveBudget;
@@ -1701,6 +1708,46 @@ end;
 
 function TLWPTWorkerBudgetSession.Acquire(
   ATimeoutMilliseconds: Integer): TLWPTWorkerLease;
+begin
+  Result := AcquireInternal(ATimeoutMilliseconds, False);
+end;
+
+function TLWPTWorkerBudgetSession.PollAcquire: TLWPTWorkerLease;
+begin
+  Result := AcquireInternal(0, True);
+end;
+
+procedure TLWPTWorkerBudgetSession.CancelPendingAcquire;
+var
+  Transaction : TLWPTWorkerStateTransaction;
+  Entries : TLWPTWorkerBudgetEntryArray;
+  Index : Integer;
+begin
+  EnterCriticalSection(FAcquireCriticalSection);
+  try
+    if not FPersistentWait then Exit;
+    Transaction := TLWPTWorkerStateTransaction.Create;
+    try
+      Entries := LoadEntries;
+      Index := FindEntry(Entries, FSessionId);
+      if Index >= 0 then
+      begin
+        Entries[Index].Waiting := False;
+        Entries[Index].WaitTicket := 0;
+        Entries[Index].HeartbeatAt := NowMilliseconds;
+        WriteEntry(Entries[Index]);
+      end;
+      FPersistentWait := False;
+    finally
+      Transaction.Free;
+    end;
+  finally
+    LeaveCriticalSection(FAcquireCriticalSection);
+  end;
+end;
+
+function TLWPTWorkerBudgetSession.AcquireInternal(
+  ATimeoutMilliseconds: Integer; AKeepWaiting: Boolean): TLWPTWorkerLease;
 var
   Started : QWord;
   Transaction : TLWPTWorkerStateTransaction;
@@ -1766,6 +1813,7 @@ begin
         end;
         WriteEntry(Entries[Index]);
 
+        if AKeepWaiting then FPersistentWait := True;
         Active := ActiveWorkerCount(Entries);
         Candidate := BestWaitingEntry(Entries);
         if (Active < FEffectiveBudget) and (Candidate = Index) then
@@ -1785,6 +1833,7 @@ begin
       end;
       if Granted then
       begin
+        FPersistentWait := False;
         Result := TLWPTWorkerLease.Create(Self, LeaseToken);
         EnterCriticalSection(FLocalCriticalSection);
         try
@@ -1799,6 +1848,9 @@ begin
       if (ATimeoutMilliseconds >= 0)
          and (GetTickCount64 - Started >= QWord(ATimeoutMilliseconds)) then
       begin
+        { A cache worker may use a finite wait on the same session as the
+          scheduler. Its timeout must not withdraw the scheduler's ticket. }
+        if FPersistentWait then Exit(nil);
         Transaction := TLWPTWorkerStateTransaction.Create;
         try
           Entries := LoadEntries;
