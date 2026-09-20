@@ -1,0 +1,131 @@
+name: agent skills weekly bump
+
+# Refreshes lock-managed project skills and opens a PR when their generated
+# files change. Repository-native skills absent from skills-lock.json remain
+# untouched.
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: agent-skills-weekly-bump
+  cancel-in-progress: true
+
+env:
+  SKILLS_ROOT: .
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.changed.outputs.changed }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Refresh lock-managed skills
+        working-directory: ${{ env.SKILLS_ROOT }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          npx -y skills@1.5.17 update --project --yes
+
+          if node -e \
+            'const lock = require("./skills-lock.json"); process.exit(lock.skills?.["find-skills"] ? 0 : 1)'; then
+            # The API-backed updater can retain stale find-skills content while
+            # reporting success. Force a full-depth clone for that known source.
+            npx -y skills@1.5.17 remove find-skills --yes
+            npx -y skills@1.5.17 add vercel-labs/skills \
+              --full-depth \
+              --skill find-skills \
+              --agent codex claude-code \
+              --yes
+          fi
+
+      - name: Verify project skill inventory
+        run: |
+          cd "$SKILLS_ROOT"
+          npx -y skills@1.5.17 list --json > skill-inventory.json
+          cd "$GITHUB_WORKSPACE"
+          node .github/scripts/validate-skill-inventory.cjs \
+            "$SKILLS_ROOT/skill-inventory.json"
+
+      - id: changed
+        run: |
+          if [ -z "$(git status --porcelain=v1 --untracked-files=all -- \
+            "$SKILLS_ROOT/.agents/skills" "$SKILLS_ROOT/skills-lock.json")" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Project skills are already current; no PR to open."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package refreshed skill tree
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          tar -C "$SKILLS_ROOT" -cf agent-skills-refresh.tar \
+            .agents/skills skills-lock.json skill-inventory.json
+
+      - name: Upload refreshed skill tree
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: agent-skills-refresh
+          path: agent-skills-refresh.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: refresh
+    if: needs.refresh.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Download refreshed skill tree
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: agent-skills-refresh
+
+      - name: Apply and verify refreshed skill tree
+        run: |
+          rm -rf "$SKILLS_ROOT/.agents/skills"
+          tar -C "$SKILLS_ROOT" -xf agent-skills-refresh.tar
+          rm agent-skills-refresh.tar
+          node .github/scripts/validate-skill-inventory.cjs \
+            "$SKILLS_ROOT/skill-inventory.json"
+          rm "$SKILLS_ROOT/skill-inventory.json"
+
+          if [ -z "$(git status --porcelain=v1 --untracked-files=all -- \
+            "$SKILLS_ROOT/.agents/skills" "$SKILLS_ROOT/skills-lock.json")" ]; then
+            echo "Refreshed skill artifact contains no repository changes."
+            exit 1
+          fi
+
+      - name: Open or update PR
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          branch: chore/agent-skills-bump
+          commit-message: "chore(skills): sync provisioned skills"
+          title: "chore(skills): sync provisioned skills"
+          body: |
+            Automated refresh of the lock-managed project skills and `skills-lock.json`.
+
+            Repository-native skills are not managed by this workflow. Review
+            upstream instruction changes before merging.
+
+            Cron: weekly, Mondays 08:00 UTC. See `.github/workflows/agent-skills-bump.yml`.
+          add-paths: |
+            ${{ env.SKILLS_ROOT }}/.agents/skills/**
+            ${{ env.SKILLS_ROOT }}/skills-lock.json
