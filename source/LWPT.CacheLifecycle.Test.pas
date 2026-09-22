@@ -42,6 +42,8 @@ type
     procedure TestAuxiliaryBytesConstrainAdmission;
     procedure TestFirstRecordCreatesLifecycleTemporaryRoot;
     procedure TestIndexGrowthCannotExceedBudget;
+    procedure TestRepeatedIndexNameKeepsLastValue;
+    procedure TestLargeIndexHitAndAdmissionStayFast;
     procedure TestLiveObjectIsPreservedAndAdmissionSkips;
     procedure TestRepairRebuildsIndexAndRemovesCorruption;
     procedure TestRepairRebuildsSemanticallyCorruptIndex;
@@ -628,6 +630,95 @@ begin
   end;
 end;
 
+procedure TCacheLifecycleContract.TestRepeatedIndexNameKeepsLastValue;
+var
+  Digest, Hit, IndexText, Key: string;
+  Store: TLWPTImmutableObjectStore;
+  Lines: TStringList;
+  Index, Occurrences: Integer;
+begin
+  { A name repeated in the index resolves to its last value, exactly as
+    the original Values[]-based loader did, and the next rewrite carries
+    the name once. }
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/dependency-archives', FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Lines := TStringList.Create;
+  try
+    Digest := WriteObject('repeated', 'repeated-name', Store);
+    Key := DEPENDENCY_ARCHIVE_NAMESPACE + ':' + Digest;
+    IndexText := 'schema=1'#10 + 'sequence=7'#10
+      + 'entry.' + Key + '=3'#10
+      + 'entry.' + Key + '=7'#10;
+    WriteTextFile(FCacheRoot + '/lifecycle/index', IndexText);
+    Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
+    Lines.LoadFromFile(FCacheRoot + '/lifecycle/index');
+    Occurrences := 0;
+    for Index := 0 to Lines.Count - 1 do
+      if Pos('entry.' + Key + '=', Lines[Index]) = 1 then
+        Inc(Occurrences);
+    Expect<Integer>(Occurrences).ToBe(1);
+    Expect<string>(Lines[1]).ToBe('sequence=8');
+    Expect<Integer>(Lines.IndexOf('entry.' + Key + '=8')).ToBe(2);
+  finally
+    Lines.Free;
+    Store.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.TestLargeIndexHitAndAdmissionStayFast;
+const
+  Entries = 20000;
+  BoundMs = 5000;
+var
+  Digest, Hit, NewDigest, Source: string;
+  Store: TLWPTImmutableObjectStore;
+  IndexLines: TStringList;
+  Index: Integer;
+  Started: QWord;
+  HitMs, AdmitMs: Int64;
+begin
+  { The lifecycle index of a shared cache grows with every build and
+    test result on the machine; loading it must not scan every earlier
+    entry per line. 20 000 entries took tens of seconds per cache hit
+    with the quadratic loader and take well under a second now; the
+    bound is generous so a slow CI runner does not flake it. }
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/dependency-archives', FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  IndexLines := TStringList.Create;
+  try
+    Digest := WriteObject('hot', 'hot-object', Store);
+    IndexLines.LineBreak := #10;
+    IndexLines.Add('schema=1');
+    IndexLines.Add('sequence=' + IntToStr(Entries + 1));
+    for Index := 1 to Entries do
+      IndexLines.Add(Format('entry.build-results:sha256:%.64x=%d',
+        [Index, Index]));
+    IndexLines.Add('entry.' + DEPENDENCY_ARCHIVE_NAMESPACE + ':' + Digest
+      + '=' + IntToStr(Entries + 1));
+    ForceDirectories(FCacheRoot + '/lifecycle');
+    IndexLines.SaveToFile(FCacheRoot + '/lifecycle/index');
+
+    Started := GetTickCount64;
+    Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
+    HitMs := Int64(GetTickCount64 - Started);
+
+    Source := FScratch + '/sources/cold';
+    WriteTextFile(Source, 'cold-object');
+    NewDigest := 'sha256:' + SHA256File(Source);
+    Started := GetTickCount64;
+    Expect<Boolean>(Store.Admit(Source, NewDigest) <> '').ToBe(True);
+    AdmitMs := Int64(GetTickCount64 - Started);
+
+    Expect<Boolean>(HitMs < BoundMs).ToBe(True);
+    Expect<Boolean>(AdmitMs < BoundMs).ToBe(True);
+  finally
+    IndexLines.Free;
+    Store.Free;
+  end;
+end;
+
 procedure TCacheLifecycleContract.
   TestLiveObjectIsPreservedAndAdmissionSkips;
 var
@@ -787,6 +878,10 @@ begin
     TestAuxiliaryBytesConstrainAdmission);
   Test('the first lifecycle record creates its atomic temporary root',
     TestFirstRecordCreatesLifecycleTemporaryRoot);
+  Test('a repeated index name keeps its last value and is written once',
+    TestRepeatedIndexNameKeepsLastValue);
+  Test('a 20 000-entry index keeps hits and admissions fast',
+    TestLargeIndexHitAndAdmissionStayFast);
   Test('index growth cannot take a cache hit above budget',
     TestIndexGrowthCannotExceedBudget);
   Test('live objects are preserved and an admission that cannot fit skips',
