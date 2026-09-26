@@ -111,6 +111,18 @@ Install once per fresh clone: `lefthook install`.
 
 Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the PR.
 
+## Code review (CodeRabbit)
+
+CodeRabbit reads `.coderabbit.config.ts`, which inherits the central
+`frostney/coderabbit` settings and the web-UI settings (`inheritance: true`)
+and adds LWPT's label-gated review policy (see [`ci.md`](./ci.md) for the
+managed-delivery phases). It also skips review of every Agent Skill listed in
+`skills-lock.json`: the skills CLI installs those from upstream, so findings on
+them belong upstream. A skill under `.agents/skills/` that the lock does not
+list, such as `prepare-release`, is project-authored and is reviewed like any
+other file. The config reads the lock through `skills-lock.yaml`, a symlink,
+because CodeRabbit's config sandbox imports `.yaml` but not `.json`.
+
 ## Environment variables
 
 | Variable | Effect | Default |
