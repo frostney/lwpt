@@ -114,12 +114,8 @@ begin
   Result := '';
   if ADep.SrcKind <> skGitHost then Exit;
   case ADep.SrcHost of
-    hkGitHub:
-      Result := 'https://github.com/' + ADep.SrcLocator + '.git';
-    hkGitLab:
-      Result := 'https://gitlab.com/' + ADep.SrcLocator + '.git';
-    hkBitbucket:
-      Result := 'https://bitbucket.org/' + ADep.SrcLocator + '.git';
+    hkGitHub, hkGitLab, hkBitbucket:
+      Result := BuiltInForgeOrigin(ADep.SrcHost) + ADep.SrcLocator + '.git';
     hkCustom:
     begin
       if not FindCustomSource(ACustomSources, ADep.SrcHostName, Custom) then

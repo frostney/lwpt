@@ -62,38 +62,52 @@ typical general-purpose HTTP response. Header limits retain the package
 default. HTTP-layer failures are wrapped as `EFetchError` with the requested
 URL, preserving install transaction cleanup and diagnostics.
 
-`THTTPRequestOptions.Destination` adds a per-request destination policy that
-applies to the initial request and to every redirect hop. `AllowedHosts` is a
-case-insensitive exact host allowlist. It is checked before any name
-resolution, so a refused host causes no DNS lookup and no connection.
-`PrivateAddresses` selects `papAllow` (the default), `papDeny`, or
-`papDenyAfterPublic`. With `papDeny`, every hop must resolve to a public
-address. With `papDenyAfterPublic`, a request that has reached a public
-address cannot be redirected to a private one. Private destinations are
-loopback, RFC 1918, link-local (including cloud metadata at
-`169.254.169.254`), CGNAT, multicast, reserved space, the IPv6 equivalents, and
-anything that is not a strict address literal. When either deny mode is
-active, the client resolves the host once, classifies that address, and
-connects to the same address. TLS still verifies the certificate against the
-host name.
+`THTTPRequestOptions.Destination` adds a per-request destination policy. It
+applies to the initial request and to every redirect hop, in this order:
+
+1. With `RequireHTTPS`, any hop whose scheme is not `https` is refused, so a
+   redirect cannot downgrade to plaintext.
+2. `AllowedHosts` is a case-insensitive exact host allowlist. It is checked
+   before any name resolution, so a refused host causes no DNS lookup and no
+   connection.
+3. `PrivateAddressPolicy` selects `papAllow` (the default) or `papDeny`. With
+   `papDeny`, every hop must resolve to a globally reachable address.
+
+The address check parses the host as an address literal, or resolves it once,
+into binary form. It rewrites IPv4-mapped, IPv4-compatible, and NAT64
+well-known-prefix IPv6 spellings to their IPv4 address. It then classifies
+the bytes against named blocks from the IANA IPv4 and IPv6 Special-Purpose
+Address Registries, plus multicast and reserved space. The client dials
+exactly the classified address, and TLS still verifies the certificate
+against the host name. Under an address policy the client dials IPv4 only
+and refuses a genuine IPv6 destination. [ADR-0045](./adr/0045-git-host-fetch-trust.md)
+lists the blocks and the globally reachable exceptions.
 
 LWPT derives each dependency's policy in `LWPT.FetchPolicy` and applies it to
-both ref listing and archive download:
+ref listing (install, `outdated`, `update`) and archive download. Every
+dependency request requires HTTPS, and every hop must resolve to a globally
+reachable address:
 
-| Source | Allowed hosts | Private addresses |
-| --- | --- | --- |
-| `owner/repo`, `github:` | `github.com`, `codeload.github.com` | Denied on every hop |
-| `gitlab:` | `gitlab.com` | Denied on every hop |
-| `bitbucket:` | `bitbucket.org` | Denied on every hop |
-| `[sources.<name>]` custom host | The hosts named by its `archive` and `git` templates | Denied after a public hop |
-| Direct `https://` archive URL | Any host | Denied after a public hop |
+| Source | Allowed hosts |
+| --- | --- |
+| `owner/repo`, `github:` | `github.com`, `codeload.github.com` |
+| `gitlab:` | `gitlab.com` |
+| `bitbucket:` | `bitbucket.org` |
+| `[sources.<name>]` custom host | The hosts named by its `archive` and `git` templates |
+| Direct `https://` archive URL | Any host |
 
-Custom sources and direct URLs keep working when the manifest author points
-them at a host on a private network. Such a host may redirect within that
-network. A fetch that starts on the public internet can never be redirected
-into a private network, and a git-host fetch can never leave its forge's hosts.
-A refused hop fails the install with `fetch host not allowed: <host>` or
-`fetch destination not allowed: <host> resolves to private address <address>`.
+The address rule has no exception. Private, loopback, link-local, and other
+non-globally-reachable destinations are refused for every dependency fetch,
+whether the root manifest or a fetched dependency's manifest declares the
+source, on the initial request and on every redirect. Self-hosted forges and
+archive hosts on private networks are therefore currently unsupported. A
+Git-host fetch never leaves its forge's hosts, and a custom-source template
+may not use `{ref}` in its host. A refused hop fails the command with one of
+these errors:
+
+- `fetch scheme not allowed: <scheme>://<host> (https is required)`
+- `fetch host not allowed: <host>`
+- `fetch destination not allowed: <host> resolves to <block> address <address>`
 
 ### Windows: SChannel clients and SChannel servers
 

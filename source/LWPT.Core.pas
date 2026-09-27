@@ -56,10 +56,13 @@ type
   TStringArray = array of string;
   TSHA256Progress = procedure of object;
 
-{ Value of the <PROJECT_NAME>_TEST_<AName> environment variable in a test
-  build (INSTALL_TESTING, ADR-0044) and always '' in a release build, so a
-  shipped binary ignores every fault-injection and fetch-redirection seam. }
+{$IFDEF INSTALL_TESTING}
+{ Value of the <PROJECT_NAME>_TEST_<AName> environment variable. Exists only
+  in a test build (ADR-0044): every fault-injection branch that reads it is
+  compiled only under INSTALL_TESTING, so a release binary contains neither
+  the branch nor the variable name. }
 function  TestSeamValue(const AName: string): string;
+{$ENDIF}
 function  FPCExecutable: string;
 function  InstantFPCExecutable: string;
 procedure AddEnvUnitPathParameters(AParameters: TStrings);
@@ -178,15 +181,12 @@ begin
   end;
 end;
 
+{$IFDEF INSTALL_TESTING}
 function TestSeamValue(const AName: string): string;
 begin
-  {$IFDEF INSTALL_TESTING}
   Result := SysUtils.GetEnvironmentVariable(PROJECT_NAME + '_TEST_' + AName);
-  {$ELSE}
-  if AName = '' then;
-  Result := '';
-  {$ENDIF}
 end;
+{$ENDIF}
 
 function FPCExecutable: string;
 begin
@@ -1183,10 +1183,12 @@ end;
 function AtomicRestorePath(const ABackupPath, ADestination: string): Boolean;
 var Meta: TStringList; Expected: string;
 begin
+  {$IFDEF INSTALL_TESTING}
   if SameText(TestSeamValue('THROW_RESTORE_FOR'),
        ExtractFileName(ExcludeTrailingPathDelimiter(ADestination))) then
     raise EExtractError.CreateFmt(
       'injected restore exception for "%s"', [ADestination]);
+  {$ENDIF}
   Result := False;
   if not FileExists(ABackupPath + '.rollback') then Exit;
   Meta := TStringList.Create;

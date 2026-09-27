@@ -21,6 +21,7 @@ type
   TResolverSelection = record
     RefName: string;
     CommitSHA: string;
+    RefKind: TGitRefKind;
   end;
 
   EResolverConflict = class(Exception);
@@ -214,6 +215,7 @@ begin
 
   Result.RefName := ARefs[Best].Name;
   Result.CommitSHA := RefCommitSHA(ARefs[Best]);
+  Result.RefKind := ARefs[Best].Kind;
 end;
 
 end.

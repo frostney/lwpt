@@ -166,7 +166,7 @@ begin
   {$IFDEF MSWINDOWS}
   FMissingDep := StringReplace(FMissingDep, '\', '/', [rfReplaceAll]);
   {$ENDIF}
-  SetLwptBinaryPath(LwptTestingBinaryPath);
+  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
   RecursiveDelete(FScratch);
   ForceDirectories(FScratch);
   SetupScratchProject;
@@ -435,7 +435,7 @@ function TInstallHTTPFetchFailure.InstallAgainstPort(const ARoot: string;
   const APort: Word; const ATimeoutMilliseconds: string;
   const AWatchdogMilliseconds: QWord; const AHost: string): TLwptResult;
 begin
-  Result := RunLwpt(['install'], ARoot,
+  Result := RunLwptTesting(['install'], ARoot,
     [ARCHIVE_FETCH_ORIGIN_ENV + '=http://' + AHost + ':' + IntToStr(APort),
      ARCHIVE_FETCH_TIMEOUT_ENV + '=' + ATimeoutMilliseconds,
      PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FGitFixtureRoot],
@@ -447,7 +447,7 @@ begin
   FOrigDir := GetCurrentDir;
   FScratch := CreateScratchRoot('install-http-fetch-failure');
   FGitFixtureRoot := FScratch + '/git-fixture';
-  SetLwptBinaryPath(LwptTestingBinaryPath);
+  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
   RecursiveDelete(FScratch);
   ForceDirectories(FGitFixtureRoot + '/refs');
   WriteTextFile(FGitFixtureRoot + '/refs/mock-dep.refs',
@@ -640,9 +640,168 @@ begin
     TestStalledServerFailsInsideTheRequestBudget);
 end;
 
+{ ── private destinations (ADR-0045) ───────────────────────────────── }
+
+type
+  { Drives the shipped binary (no test seams) against a refused local
+    endpoint. Every dependency source is refused a non-globally-reachable
+    destination by the fetch policy before any connection, whether the root
+    manifest or a fetched dependency's manifest declares it. }
+  TInstallPrivateDestinations = class(TTestSuite)
+  private
+    FScratch: string;
+    procedure WriteProject(const ARoot, ARootBody, AChildBody: string);
+    procedure ExpectRefused(const AName, ARootBody, AChildBody: string);
+  protected
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestTransitiveCustomSourceIsRefused;
+    procedure TestTransitiveDirectURLIsRefused;
+    procedure TestRootCustomSourceIsRefused;
+    procedure TestRootDirectURLIsRefused;
+  end;
+
+var
+  { The refused endpoint of the running case. }
+  GRefusedOrigin, GRefusedHost: string;
+
+procedure TInstallPrivateDestinations.BeforeAll;
+begin
+  FScratch := CreateScratchRoot('install-private-destinations');
+  RecursiveDelete(FScratch);
+  ForceDirectories(FScratch);
+  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
+end;
+
+{ ARootBody is appended to the root manifest; AChildBody, when set, becomes
+  the manifest of a local dependency the root requires. }
+procedure TInstallPrivateDestinations.WriteProject(const ARoot, ARootBody,
+  AChildBody: string);
+var Dependencies: string;
+begin
+  RecursiveDelete(ARoot);
+  ForceDirectories(ARoot + '/source');
+  WriteTextFile(ARoot + '/source/main.pas',
+    'program main;'#10 + '{$mode delphi}{$H+}'#10 + 'begin end.'#10);
+  Dependencies := '';
+  if AChildBody <> '' then
+  begin
+    ForceDirectories(ARoot + '/vendor/child/source');
+    WriteTextFile(ARoot + '/vendor/child/source/child.pas',
+      'unit child;'#10 + 'interface'#10 + 'implementation'#10 + 'end.'#10);
+    WriteTextFile(ARoot + '/vendor/child/lwpt.toml',
+      '[package]'#10 + 'name = "child"'#10 + 'version = "1.0.0"'#10
+      + 'units = ["source"]'#10 + AChildBody);
+    Dependencies := '[dependencies]'#10 + 'child = "./vendor/child"'#10;
+  end;
+  WriteTextFile(ARoot + '/lwpt.toml',
+    '[package]'#10 + 'name = "private-destinations"'#10
+    + 'version = "1.0.0"'#10 + 'units = ["source"]'#10 + ARootBody
+    + Dependencies);
+end;
+
+procedure TInstallPrivateDestinations.ExpectRefused(const AName, ARootBody,
+  AChildBody: string);
+var
+  Root: string;
+  Run: TLwptResult;
+begin
+  Root := FScratch + '/' + AName;
+  WriteProject(Root, ARootBody, AChildBody);
+  Run := RunLwpt(['install'], Root,
+    [PROJECT_NAME + '_CACHE_DIR=' + FScratch + '/cache']);
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  if Pos('fetch destination not allowed: ' + GRefusedHost + ' resolves to',
+     Run.Stderr) = 0 then
+    WriteLn('--- ', AName, ' ---'#10, Run.Stdout, Run.Stderr, '---');
+  Expect<Boolean>(Pos('fetch destination not allowed: ' + GRefusedHost
+    + ' resolves to', Run.Stderr) > 0).ToBe(True);
+  { Refused by policy, so the endpoint was never dialled. }
+  Expect<Boolean>(Pos('Failed to connect', Run.Stderr) > 0).ToBe(False);
+  Expect<Boolean>(FileExists(Root + '/lwpt.lock')).ToBe(False);
+end;
+
+function SourcesTable: string;
+begin
+  Result := '[sources.internal]'#10
+    + 'archive = "' + GRefusedOrigin + '/{user}/{repository}/{ref}.tar.gz"'#10
+    + 'git = "' + GRefusedOrigin + '/{user}/{repository}.git"'#10;
+end;
+
+procedure TInstallPrivateDestinations.TestTransitiveCustomSourceIsRefused;
+var Refused: TMockRefusedEndpoint;
+begin
+  Refused := TMockRefusedEndpoint.Create;
+  try
+    GRefusedHost := Refused.Host;
+    GRefusedOrigin := 'https://' + Refused.Host + ':' + IntToStr(Refused.Port);
+    ExpectRefused('transitive-custom', '', SourcesTable
+      + '[dependencies]'#10 + 'pivot = "internal:owner/pivot@main"'#10);
+  finally
+    Refused.Free;
+  end;
+end;
+
+procedure TInstallPrivateDestinations.TestTransitiveDirectURLIsRefused;
+var Refused: TMockRefusedEndpoint;
+begin
+  Refused := TMockRefusedEndpoint.Create;
+  try
+    GRefusedHost := Refused.Host;
+    GRefusedOrigin := 'https://' + Refused.Host + ':' + IntToStr(Refused.Port);
+    ExpectRefused('transitive-url', '', '[dependencies]'#10
+      + 'pivot = "' + GRefusedOrigin + '/pivot.tar.gz"'#10);
+  finally
+    Refused.Free;
+  end;
+end;
+
+procedure TInstallPrivateDestinations.TestRootCustomSourceIsRefused;
+var Refused: TMockRefusedEndpoint;
+begin
+  Refused := TMockRefusedEndpoint.Create;
+  try
+    GRefusedHost := Refused.Host;
+    GRefusedOrigin := 'https://' + Refused.Host + ':' + IntToStr(Refused.Port);
+    ExpectRefused('root-custom', SourcesTable + '[dependencies]'#10
+      + 'internal-lib = "internal:owner/lib@main"'#10, '');
+  finally
+    Refused.Free;
+  end;
+end;
+
+procedure TInstallPrivateDestinations.TestRootDirectURLIsRefused;
+var Refused: TMockRefusedEndpoint;
+begin
+  Refused := TMockRefusedEndpoint.Create;
+  try
+    GRefusedHost := Refused.Host;
+    GRefusedOrigin := 'https://' + Refused.Host + ':' + IntToStr(Refused.Port);
+    ExpectRefused('root-url', '[dependencies]'#10
+      + 'direct = "' + GRefusedOrigin + '/direct.tar.gz"'#10, '');
+  finally
+    Refused.Free;
+  end;
+end;
+
+procedure TInstallPrivateDestinations.SetupTests;
+begin
+  Test('a custom source from a dependency manifest cannot reach a private host',
+    TestTransitiveCustomSourceIsRefused);
+  Test('a direct URL from a dependency manifest cannot reach a private host',
+    TestTransitiveDirectURLIsRefused);
+  Test('a root-manifest custom source cannot reach a private host',
+    TestRootCustomSourceIsRefused);
+  Test('a root-manifest direct URL cannot reach a private host',
+    TestRootDirectURLIsRefused);
+end;
+
 begin
   TestRunnerProgram.AddSuite(TInstallFetchFailureE2E.Create(
     'install: fetch failure (E2E)'));
+  TestRunnerProgram.AddSuite(TInstallPrivateDestinations.Create(
+    'install: private dependency destinations are refused'));
   TestRunnerProgram.AddSuite(TArchiveFetchOriginContract.Create(
     'install: archive-fetch origin override contract'));
   TestRunnerProgram.AddSuite(TInstallHTTPFetchFailure.Create(

@@ -101,14 +101,29 @@ materialization and read-only `--frozen` verification are mutually exclusive.
 archives and extracted modules against `lwpt.lock` and never writes the lockfile.
 Some other package managers use "frozen" only to mean "don't write the lock".
 
-A tag names a reviewed commit. When `lwpt.lock` records the commit for a tag
-and an online install finds that the host now advertises the same tag at a
-different commit, the tag was moved upstream. The install, and the `add`,
-`remove`, and `update` flows that share its transaction, fails before fetching
-anything. The error names the dependency, the tag, and the old and new commits.
-Review the new commit, then run `lwpt install --accept-moved-tags` to re-pin
-it. The flag cannot be combined with `--frozen` or `--offline`, which never
-list refs. Branch requirements keep following their moving tip.
+A tag names a reviewed commit, and `lwpt.lock` records both the commit and
+whether the ref was a tag or a branch. An online install fails before fetching
+anything when a locked tag changes upstream:
+
+- the tag now points at a different commit;
+- the same version is re-published under another spelling (`v1.0.0` becomes
+  `1.0.0`) at a different commit;
+- the tag is replaced by a same-named branch.
+
+The error names the dependency, the ref, and the old and new commits. The
+`add`, `remove`, and `update` flows share the install transaction and fail the
+same way. A locked commit must also reproduce the archive bytes recorded in
+`lwpt.lock`, even when the ref listing is unreachable and the lock is reused.
+A lock written before LWPT recorded commits is checked the same way, by
+archive. Review the change, then run `lwpt install --accept-moved-tags` to
+re-pin it. The flag cannot be combined with `--frozen` or `--offline`, which
+never list refs. Branch requirements keep following their moving tip.
+
+Every dependency request uses HTTPS on every redirect, may reach only the
+hosts its source names, and is refused if any hop resolves to a private,
+loopback, link-local, or other non-globally-reachable address. Dependencies
+hosted on a private network are currently unsupported; see
+[`deployment.md`](./deployment.md).
 
 ## Start or adopt a project
 

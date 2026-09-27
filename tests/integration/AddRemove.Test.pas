@@ -260,13 +260,8 @@ begin
   CfgBefore := ReadFileText(FScratch + '/lwpt.cfg');
 
   { The fault-injection seam exists only in the test-flavoured binary. }
-  SetLwptBinaryPath(LwptTestingBinaryPath);
-  try
-    R := RunLwpt(['remove', 'leaf'], FScratch,
-      [PROJECT_NAME + '_TEST_FAIL_AFTER_ORPHAN_RETAIN=1']);
-  finally
-    SetLwptBinaryPath(ExpandFileName('build/lwpt'));
-  end;
+  R := RunLwptTesting(['remove', 'leaf'], FScratch,
+    [PROJECT_NAME + '_TEST_FAIL_AFTER_ORPHAN_RETAIN=1']);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<string>(ReadFileText(FScratch + '/lwpt.toml'))
     .ToBe(ManifestBefore);

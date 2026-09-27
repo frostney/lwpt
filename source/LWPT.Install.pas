@@ -19,6 +19,8 @@ type
     Name         : string;
     Version      : string;       { concrete tag / SHA / branch; '' for local + url }
     CommitSHA    : string;       { authoritative fetched commit identity }
+    RefKind      : string;       { RefKindTag / RefKindBranch for a named
+                                   ref; '' for SHA pins and non-Git sources }
     SourceIdentity: string;      { canonical source + extraction policy identity }
     ConstraintFingerprint: string; { complete graph requirements for frozen }
     SrcOriginal  : string;       { the manifest's source string, verbatim }
@@ -69,6 +71,7 @@ type
     CustomSources: TCustomSourceArray;
     Version     : string;            { concrete (resolved ref or SHA) }
     CommitSHA   : string;            { authoritative advertised identity }
+    RefKind     : string;            { RefKindTag / RefKindBranch or '' }
     SourceIdentity: string;
     ConstraintFingerprint: string;
     ResolvedURL : string;            { actual archive URL fetched }
@@ -112,6 +115,11 @@ const
 {$ENDIF}
 
 const
+  { Kind of the named ref a Git-host dependency was selected from, recorded
+    as `resolvedRefKind` in lwpt.lock (ADR-0045). }
+  RefKindTag    = 'tag';
+  RefKindBranch = 'branch';
+
   { The terminator written after every constraint line before hashing —
     including the last, reproducing TStrings.Text's trailing line break.
     Named and pinned because the fingerprint is compared across machines:
@@ -255,14 +263,14 @@ begin
       Repo := RepoBasename(ADep.SrcLocator);
       case ADep.SrcHost of
         hkGitHub:
-          Result := 'https://github.com/' + ADep.SrcLocator +
+          Result := BuiltInForgeOrigin(hkGitHub) + ADep.SrcLocator +
                     '/archive/' + AResolvedRef + '.tar.gz';
         hkGitLab:
-          Result := 'https://gitlab.com/' + ADep.SrcLocator +
+          Result := BuiltInForgeOrigin(hkGitLab) + ADep.SrcLocator +
                     '/-/archive/' + AResolvedRef + '/'
                     + Repo + '-' + AResolvedRef + '.tar.gz';
         hkBitbucket:
-          Result := 'https://bitbucket.org/' + ADep.SrcLocator +
+          Result := BuiltInForgeOrigin(hkBitbucket) + ADep.SrcLocator +
                     '/get/' + AResolvedRef + '.tar.gz';
         hkCustom:
         begin
@@ -463,9 +471,8 @@ function GitRepoURL(const ADep: TDependency;
 var Custom: TCustomSource; User, RepoName: string;
 begin
   case ADep.SrcHost of
-    hkGitHub    : Result := 'https://github.com/'    + ADep.SrcLocator + '.git';
-    hkGitLab    : Result := 'https://gitlab.com/'    + ADep.SrcLocator + '.git';
-    hkBitbucket : Result := 'https://bitbucket.org/' + ADep.SrcLocator + '.git';
+    hkGitHub, hkGitLab, hkBitbucket:
+      Result := BuiltInForgeOrigin(ADep.SrcHost) + ADep.SrcLocator + '.git';
     hkCustom:
     begin
       ResolveCustomSourceOrDie(ADep, ACustomSources, Custom);
@@ -842,12 +849,16 @@ begin
 end;
 {$ENDIF}
 
+{ AVerifyArchiveHash, when set, is the locked content identity the downloaded
+  bytes must reproduce (ADR-0045); a mismatch raises EVerifyError naming
+  AVerifyContext before the bytes are written, cached, or extracted. }
 function FetchToCache(const ADep: TDependency;
   const AResolvedRef, AModulesRoot, AArchivesRoot, ATmpRoot,
     AProjectRoot, AExpectedArchiveHash: string;
   const ACustomSources: TCustomSourceArray;
   const AWorkspaces: TWorkspaceArray;
   const AObjectStore: TLWPTImmutableObjectStore;
+  const AVerifyArchiveHash, AVerifyContext: string;
   out AUnitDir, AArchive, AArchiveHash, AResolvedURL: string): Boolean;
 var
   URL, LocalPath : string;
@@ -999,7 +1010,7 @@ begin
       AModulesRoot, AArchivesRoot, ATmpRoot, AProjectRoot,
       AExpectedArchiveHash,
       ACustomSources, AWorkspaces,
-      AObjectStore,
+      AObjectStore, AVerifyArchiveHash, AVerifyContext,
       AUnitDir, AArchive, AArchiveHash, AResolvedURL);
     Exit;
   end;
@@ -1060,9 +1071,11 @@ begin
     before it can touch the origin or publish bytes. Halt deliberately skips
     object cleanup so the cross-process integration test observes the same
     operating-system guard release as an abrupt producer death. }
+  {$IFDEF INSTALL_TESTING}
   if Assigned(ProducerLease)
      and (TestSeamValue('CRASH_DEPENDENCY_PRODUCER') = '1') then
     Halt(88);
+  {$ENDIF}
 
   try
   {$IFDEF INSTALL_TESTING}
@@ -1137,6 +1150,17 @@ begin
   { Archive filename uses an escaped resolved ref for git-host sources,
     or the stable "url" tag for direct archive URLs. }
   AArchiveHash := SHA256BytesPrefixed(Resp.Body);
+  { A locked identity must reproduce its locked bytes. Checked before the
+    archive is written, admitted to the shared cache, or extracted, so a
+    mismatch leaves no trace in the project or the cache. }
+  if (AVerifyArchiveHash <> '')
+     and not SameText(AArchiveHash, AVerifyArchiveHash) then
+    raise EVerifyError.CreateFmt(
+      'dependency "%s": %s (locked archive %s, received %s). Nothing was '
+      + 'published. Review the upstream change, then run `%s install '
+      + '--accept-moved-tags` to accept it.',
+      [ADep.Name, AVerifyContext, AVerifyArchiveHash, AArchiveHash,
+       PROGRAM_NAME]);
   AtomicWriteBytes(AArchive, ATmpRoot, Resp.Body);
   if AObjectStore <> nil then
     try
@@ -1556,6 +1580,9 @@ begin
       KV('source',       AResolved[i].SrcOriginal);
       KV('resolvedRef',  AResolved[i].Version);
       KV('resolvedCommit', AResolved[i].CommitSHA);
+      { Additive v3 evidence (ADR-0045), written only for named Git refs. }
+      if AResolved[i].RefKind <> '' then
+        KV('resolvedRefKind', AResolved[i].RefKind);
       KV('sourceIdentity', AResolved[i].SourceIdentity);
       KV('constraintFingerprint', AResolved[i].ConstraintFingerprint);
       KV('resolvedURL',  AResolved[i].ResolvedURL);
@@ -1709,6 +1736,7 @@ begin
       Entry.SrcOriginal := TomlStr(EntryNode, 'source',      '');
       Entry.Version     := TomlStr(EntryNode, 'resolvedRef', '');
       Entry.CommitSHA   := TomlStr(EntryNode, 'resolvedCommit', '');
+      Entry.RefKind     := TomlStr(EntryNode, 'resolvedRefKind', '');
       Entry.SourceIdentity := TomlStr(EntryNode, 'sourceIdentity', '');
       Entry.ConstraintFingerprint := TomlStr(EntryNode,
         'constraintFingerprint', '');
@@ -1787,6 +1815,7 @@ begin
     AResolved[i].Name := AResolution.Nodes[i].Name;
     AResolved[i].Version := AResolution.Nodes[i].Version;
     AResolved[i].CommitSHA := AResolution.Nodes[i].CommitSHA;
+    AResolved[i].RefKind := AResolution.Nodes[i].RefKind;
     AResolved[i].SourceIdentity := AResolution.Nodes[i].SourceIdentity;
     AResolved[i].ConstraintFingerprint :=
       AResolution.Nodes[i].ConstraintFingerprint;
@@ -2400,7 +2429,7 @@ procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
   const AOffline, AAcceptMovedTags: Boolean);
 type
   TSelectionState = record
-    Name, SourceIdentity, RefName, CommitSHA: string;
+    Name, SourceIdentity, RefName, CommitSHA, RefKind: string;
   end;
   TSelectionStateArray = array of TSelectionState;
   TRefCacheEntry = record
@@ -2420,7 +2449,7 @@ var
   LockedEntry: TResolved;
   ChildManifestPath, ManifestRelDir, ExtractTmp: string;
   UnitDir, Archive, ArchiveHash, ResolvedURL, CacheArchive,
-    ExpectedArchiveHash: string;
+    ExpectedArchiveHash, VerifyArchiveHash, VerifyContext: string;
   FetchRef, RollbackFailures: string;
   SelectionDeferred, Stable: Boolean;
 
@@ -2536,6 +2565,7 @@ var
         [ANode.Name]);
     AState.RefName := Entry.Version;
     AState.CommitSHA := LockedCommitIdentity(Entry);
+    AState.RefKind := Entry.RefKind;
   end;
 
   procedure StageLockedArchive(const ANode: TResolveNode;
@@ -2708,32 +2738,103 @@ var
     if Result then AVersion := Workspace.Version;
   end;
 
-  { A tag is an immutable name for a reviewed commit. When the lock already
-    records the commit behind the tag being selected again and the host now
-    advertises that tag at a different commit, the tag was moved upstream:
-    re-pinning silently would only surface as a lockfile diff. Refuse unless
-    the caller explicitly accepted moved tags after review. Branches are
-    mutable by design and keep moving; a lock without a recorded commit (an
-    early schema-v3 lock) has nothing to compare against. }
-  procedure RejectMovedTag(const ANode: TResolveNode;
-    const ARefs: TGitRefArray; const ASelection: TResolverSelection);
-  var Entry: TResolved; k: Integer; SelectedTag: Boolean;
+  function RefKindName(const AKind: TGitRefKind): string;
   begin
-    if AAcceptMovedTags then Exit;
-    if not FindPriorLock(ANode, Entry) then Exit;
-    if (Entry.CommitSHA = '') or (Entry.Version <> ASelection.RefName)
-       or SameText(Entry.CommitSHA, ASelection.CommitSHA) then Exit;
-    SelectedTag := False;
-    for k := 0 to High(ARefs) do
-      if (ARefs[k].Kind = rkTag) and (ARefs[k].Name = ASelection.RefName) then
-        SelectedTag := True;
-    if not SelectedTag then Exit;
-    raise EVerifyError.CreateFmt(
-      'dependency "%s": tag "%s" moved upstream since it was locked '
-      + '(locked commit %s, now advertised at %s). Review the new commit, '
-      + 'then run `%s install --accept-moved-tags` to accept it.',
-      [ANode.Name, ASelection.RefName, LowerCase(Entry.CommitSHA),
-       LowerCase(ASelection.CommitSHA), PROGRAM_NAME]);
+    if AKind = rkTag then Result := RefKindTag
+    else Result := RefKindBranch;
+  end;
+
+  { Two ref names identify the same tag when they are equal, or when both
+    are SemVer spellings of one version (`v1.0.0` and `1.0.0`). }
+  function SameRefName(const ALocked, ASelected: string): Boolean;
+  var LockedVersion: string;
+  begin
+    if ALocked = ASelected then Exit(True);
+    LockedVersion := Valid(StripVPrefix(ALocked), DefaultSemverOptions);
+    Result := (LockedVersion <> '')
+      and (LockedVersion = Valid(StripVPrefix(ASelected),
+        DefaultSemverOptions));
+  end;
+
+  procedure RaiseMovedRef(const ANode: TResolveNode; const AMessage: string);
+  begin
+    raise EVerifyError.Create('dependency "' + ANode.Name + '": ' + AMessage
+      + ' Review the upstream change, then run `' + PROGRAM_NAME
+      + ' install --accept-moved-tags` to accept it.');
+  end;
+
+  { A locked tag is an immutable name for a reviewed commit (ADR-0045).
+    Whenever resolution selects the same tag again -- under any manifest
+    requirement, deliberately -- it must still be a tag at the locked
+    commit. A tag that moved, or that was replaced by a same-named branch,
+    fails until the caller accepts it. Branches keep moving, and a branch
+    replaced by a same-named tag is not a moved tag. A lock that predates
+    `resolvedRefKind` cannot prove a ref was a branch, so a changed commit
+    behind a ref that now resolves as a branch also fails closed. A lock
+    that predates `resolvedCommit` is checked by archive identity instead
+    (ExpectedVerifyHash). }
+  procedure RejectMovedRef(const ANode: TResolveNode;
+    const ASelection: TSelectionState);
+  var Entry: TResolved; LockedCommit: string;
+  begin
+    if AAcceptMovedTags or not FindPriorLock(ANode, Entry) then Exit;
+    if not SameRefName(Entry.Version, ASelection.RefName) then Exit;
+    if Entry.RefKind = RefKindBranch then Exit;
+    LockedCommit := LockedCommitIdentity(Entry);
+    if (Entry.RefKind = RefKindTag)
+       and (ASelection.RefKind = RefKindBranch) then
+      RaiseMovedRef(ANode, Format('locked tag "%s" (commit %s) is now '
+        + 'advertised only as branch "%s" at %s.', [Entry.Version,
+        LowerCase(LockedCommit), ASelection.RefName,
+        LowerCase(ASelection.CommitSHA)]));
+    if (LockedCommit = '')
+       or SameText(LockedCommit, ASelection.CommitSHA) then Exit;
+    if (Entry.RefKind = RefKindTag)
+       or (ASelection.RefKind = RefKindTag) then
+      RaiseMovedRef(ANode, Format('tag "%s" moved upstream since it was '
+        + 'locked (locked commit %s, now advertised at %s).',
+        [ASelection.RefName, LowerCase(LockedCommit),
+         LowerCase(ASelection.CommitSHA)]));
+    RaiseMovedRef(ANode, Format('ref "%s" now resolves to branch commit %s, '
+      + 'but %s pinned commit %s before ref kinds were recorded, so it '
+      + 'cannot prove "%s" was a branch that may move.',
+      [ASelection.RefName, LowerCase(ASelection.CommitSHA), LWPT.Core.LOCKFILE,
+       LowerCase(LockedCommit), ASelection.RefName]));
+  end;
+
+  { The locked archive digest that a fresh download for ANode must
+    reproduce, or '' when the selection is not the locked identity. Same
+    commit means same bytes. A lock without a recorded commit is compared by
+    ref name, which is how a tag moved behind an early schema-v3 lock is
+    caught. }
+  function ExpectedVerifyHash(const ANode: TResolveNode;
+    out AContext: string): string;
+  var Entry: TResolved; LockedCommit: string;
+  begin
+    Result := '';
+    AContext := '';
+    if AAcceptMovedTags or (ANode.Dep.SrcKind <> skGitHost) then Exit;
+    if not FindPriorLock(ANode, Entry) or (Entry.ArchiveHash = '') then Exit;
+    LockedCommit := LockedCommitIdentity(Entry);
+    if LockedCommit <> '' then
+    begin
+      if (ANode.CommitSHA = '')
+         or not SameText(LockedCommit, ANode.CommitSHA) then Exit;
+      AContext := Format('the archive served for locked commit %s no longer '
+        + 'matches %s', [LowerCase(LockedCommit), LWPT.Core.LOCKFILE]);
+    end
+    else
+    begin
+      if not SameRefName(Entry.Version, ANode.Version) then Exit;
+      if ANode.RefKind = RefKindTag then
+        AContext := Format('tag "%s" moved upstream since it was locked: its '
+          + 'archive no longer matches %s', [ANode.Version, LWPT.Core.LOCKFILE])
+      else
+        AContext := Format('ref "%s" changed upstream since it was locked, '
+          + 'and %s records no commit that would allow it to move: its '
+          + 'archive no longer matches', [ANode.Version, LWPT.Core.LOCKFILE]);
+    end;
+    Result := Entry.ArchiveHash;
   end;
 
   function SelectNode(const ANode: TResolveNode): TSelectionState;
@@ -2807,8 +2908,12 @@ var
         if FindPriorLock(ANode, PriorEntry)
            and PriorSelectionSatisfies(ANode, PriorEntry) then
         begin
+          { The fetch that follows must reproduce the locked archive bytes
+            (ExpectedVerifyHash), so an unreachable advertisement cannot be
+            used to smuggle different content in under the locked identity. }
           Result.RefName := PriorEntry.Version;
           Result.CommitSHA := PriorEntry.CommitSHA;
+          Result.RefKind := PriorEntry.RefKind;
           WriteLn(ErrOutput, 'warning: tag resolution for ', ANode.Name,
             ' failed: ', E.Message, '; reusing verified lockfile identity');
           Exit;
@@ -2824,9 +2929,10 @@ var
           + '  canonical source: '
           + SourceKey(ANode.Dep, ANode.CustomSources));
     end;
-    RejectMovedTag(ANode, Refs, Selection);
     Result.RefName := Selection.RefName;
     Result.CommitSHA := Selection.CommitSHA;
+    Result.RefKind := RefKindName(Selection.RefKind);
+    RejectMovedRef(ANode, Result);
   end;
 
   procedure EnqueueNode(AIndex: Integer);
@@ -2904,9 +3010,11 @@ var
         ApplyIncludeExclude(RecheckPath,
           R.Nodes[k].Dep.IncludeGlobs, R.Nodes[k].Dep.ExcludeGlobs);
         try
+          {$IFDEF INSTALL_TESTING}
           if SameText(TestSeamValue('STALE_LOCAL_SNAPSHOT'),
              R.Nodes[k].Name) then
             R.Nodes[k].Hash := 'sha256:injected-stale-snapshot';
+          {$ENDIF}
           if HashTree(RecheckPath) <> R.Nodes[k].Hash then
             raise EFetchError.CreateFmt(
               'local/workspace source "%s" changed during resolution; '
@@ -2927,9 +3035,11 @@ var
         raise EFetchError.CreateFmt(
           'failed to retain rollback copy for module "%s"',
           [R.Nodes[k].Name]);
+      {$IFDEF INSTALL_TESTING}
       if SameText(TestSeamValue('HALT_AFTER_MODULE_RETAIN'),
          R.Nodes[k].Name) then
         Halt(87);
+      {$ENDIF}
       FinalArchive := '';
       if not (R.Nodes[k].Dep.SrcKind in [skLocal, skWorkspace]) then
       begin
@@ -2959,11 +3069,13 @@ var
       else
         R.Nodes[k].Archive := FinalArchive;
       R.Nodes[k].Hash := HashTree(FinalUnitDir);
+      {$IFDEF INSTALL_TESTING}
       if StrToIntDef(TestSeamValue('FAIL_PUBLISH_AFTER'), -1) = k + 1 then
         raise EFetchError.CreateFmt(
           'injected publication failure after package %d', [k + 1]);
       if StrToIntDef(TestSeamValue('HALT_PUBLISH_AFTER'), -1) = k + 1 then
         Halt(86);
+      {$ENDIF}
     end;
   end;
 
@@ -3015,6 +3127,7 @@ begin
             begin
               R.Nodes[idx].Version := Previous[j].RefName;
               R.Nodes[idx].CommitSHA := Previous[j].CommitSHA;
+              R.Nodes[idx].RefKind := Previous[j].RefKind;
             end
             else
             begin
@@ -3023,6 +3136,7 @@ begin
               Desired[0] := SelectNode(R.Nodes[idx]);
               R.Nodes[idx].Version := Desired[0].RefName;
               R.Nodes[idx].CommitSHA := Desired[0].CommitSHA;
+              R.Nodes[idx].RefKind := Desired[0].RefKind;
             end;
           end;
         except
@@ -3094,11 +3208,14 @@ begin
         else
         begin
           ExpectedArchiveHash := ExpectedHashForSelection(R.Nodes[idx]);
+          VerifyArchiveHash := ExpectedVerifyHash(R.Nodes[idx],
+            VerifyContext);
           FetchToCache(R.Nodes[idx].Dep, FetchRef,
             PlanModules, PlanArchives, PlanScratch, AProjectRoot,
             ExpectedArchiveHash,
             R.Nodes[idx].CustomSources, AWorkspaces,
             AObjectStore,
+            VerifyArchiveHash, VerifyContext,
             UnitDir, Archive, ArchiveHash, ResolvedURL);
           if (Archive <> '') and FileExists(Archive) then
           begin
@@ -3637,7 +3754,9 @@ var
   PublicationPending: Boolean;
   LockfileBackup, CfgBackup, ManifestBackup: string;
   OrphanRollbacks: TPathRollbackArray;
+  {$IFDEF INSTALL_TESTING}
   TestCorruption: TStringList;
+  {$ENDIF}
 begin
   Man := AContext.Manifest;
   Frozen := AMode = itmFrozenVerify;
@@ -3776,6 +3895,7 @@ begin
             [Resolved[i].Name]);
         Resolved[i].Version := FrozenLock.Version;
         Resolved[i].CommitSHA := FrozenLock.CommitSHA;
+        Resolved[i].RefKind := FrozenLock.RefKind;
         HasCommitConstraint := False;
         for j := 0 to High(R.Nodes[i].Kinds) do
           HasCommitConstraint := HasCommitConstraint
@@ -3847,6 +3967,7 @@ begin
       VerifyOfflineAgainstLockfile(Resolved, OldLock)
     else
       WriteLock(LockfilePath, TmpRoot, Resolved);
+    {$IFDEF INSTALL_TESTING}
     if (not Offline) and (TestSeamValue('FAIL_AFTER_LOCK_WRITE') = '1') then
     begin
       if TestSeamValue('CORRUPT_ROLLBACK_FOR') <> '' then
@@ -3868,6 +3989,7 @@ begin
       raise ELockfileError.Create(
         'injected failure after lockfile publication');
     end;
+    {$ENDIF}
     WriteCfg(CfgPath, TmpRoot, Resolved, Man, AContext.ProjectRoot);
     if Offline then
       WriteLn('[offline] restored ', Length(Resolved),
@@ -3884,9 +4006,11 @@ begin
         only best-effort tmp cleanup remains. }
       RetainOrphanedPackagePaths(OldLock, Resolved, ModulesRoot,
         ArchivesRoot, RollbackRoot, OrphanRollbacks);
+      {$IFDEF INSTALL_TESTING}
       if TestSeamValue('FAIL_AFTER_ORPHAN_RETAIN') = '1' then
         raise EExtractError.Create(
           'injected failure after orphan retention');
+      {$ENDIF}
       AtomicWriteText(ManifestPath, TmpRoot, AManifestLines);
     end;
 
