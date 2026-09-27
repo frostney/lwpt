@@ -484,6 +484,9 @@ begin
   Root := FScratch + '/offline-early-v3-sha';
   WriteRoot(Root, 'offline-early-v3-sha',
     'shared = "fixture/shared@' + SHARED_COMMIT + '"'#10);
+  { A commit pin is verified online (ADR-0045); advertising it as a tag tip
+    proves it without an upload-pack fixture. }
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10);
   WriteArchive('shared', SHARED_COMMIT,
     '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
     + 'units = ["source"]'#10);

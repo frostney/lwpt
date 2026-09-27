@@ -141,6 +141,7 @@ uses
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
   HTTPClient,
   LWPT.FetchPolicy,
+  LWPT.GitPack,
   LWPT.GitProtocol,
   LWPT.ObjectStore,
   LWPT.ProducerLease,
@@ -492,7 +493,8 @@ end;
                     without v as the repo published it).
     vkSemverExact → try the spec verbatim AND v<spec> against the
                     tag list; first match wins.
-    vkCommitSha   → returned verbatim (no tag lookup needed).
+    vkCommitSha   → returned verbatim once proven reachable from an
+                    advertised branch or tag (ADR-0045).
     vkLiteralTag  → returned verbatim (no SemVer logic). If the tag
                     isn't actually present in the repo, the eventual
                     fetch will 404 — we surface that as EFetchError.
@@ -2412,6 +2414,7 @@ var
   Previous, Desired: TSelectionStateArray;
   OfflineResolved: TResolvedArray;
   RefCache: TRefCache;
+  VerifiedPins: TStringList;
   SeenSignatures: TStringList;
   PlanRoot, PlanModules, PlanArchives, PlanScratch: string;
   Round, i, j, idx, Head: Integer;
@@ -2736,6 +2739,80 @@ var
        LowerCase(ASelection.CommitSHA), PROGRAM_NAME]);
   end;
 
+  function NewUploadPackTransport(
+    const ANode: TResolveNode): TGitUploadPackTransport;
+  {$IFDEF INSTALL_TESTING}
+  var FixtureRoot: string;
+  {$ENDIF}
+  begin
+    {$IFDEF INSTALL_TESTING}
+    FixtureRoot := SysUtils.GetEnvironmentVariable(
+      PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
+    if FixtureRoot <> '' then
+      Exit(TGitFixtureUploadPackTransport.Create(FixtureRoot, 0, True));
+    {$ENDIF}
+    { The same destination policy as ref listing and archive fetches. }
+    Result := THTTPGitUploadPackTransport.Create(DependencyFetchOptions(
+      ANode.Dep, ANode.CustomSources, DefaultHTTPRequestOptions));
+  end;
+
+  { A commit-SHA pin is accepted only when the commit is reachable from an
+    advertised refs/heads/* or refs/tags/* tip (ADR-0045): the archive
+    endpoint also serves commits that exist only in forks or pull requests.
+    The proof runs when the lock entry is created or its commit changes; a
+    prior lock entry for the same source at the same commit was proven when
+    it was written and is trusted like the committed archive it names. }
+  procedure VerifyCommitPin(const ANode: TResolveNode; const ACommit: string);
+  var
+    RepoURL: string;
+    Entry: TResolved;
+    Refs: TGitRefArray;
+    Transport: TGitUploadPackTransport;
+    Outcome: TGitReachabilityResult;
+  begin
+    RepoURL := GitRepoURL(ANode.Dep, ANode.CustomSources);
+    if VerifiedPins.IndexOf(RepoURL + '@' + LowerCase(ACommit)) >= 0 then
+      Exit;
+    if FindPriorLock(ANode, Entry)
+       and SameText(LockedCommitIdentity(Entry), ACommit) then
+      Exit;
+    Refs := CachedRefs(ANode);
+    WriteLn('  verifying commit ', LowerCase(ACommit), ' for ', ANode.Name,
+      '...');
+    Transport := NewUploadPackTransport(ANode);
+    try
+      try
+        Outcome := ProveCommitReachable(Transport, RepoURL, ACommit, Refs);
+      except
+        on E: ELWPTError do
+          raise;
+        on E: Exception do
+          raise EFetchError.CreateFmt(
+            'dependency "%s": cannot verify that commit %s belongs to %s: '
+            + '%s. Pin a tag or branch instead, or a commit that is an '
+            + 'advertised branch or tag tip.',
+            [ANode.Name, LowerCase(ACommit), RepoURL, E.Message]);
+      end;
+    finally
+      Transport.Free;
+    end;
+    if not Outcome.Known then
+      raise EVerifyError.CreateFmt(
+        'dependency "%s": commit %s does not exist in %s',
+        [ANode.Name, LowerCase(ACommit), RepoURL]);
+    if not Outcome.Reachable then
+      raise EVerifyError.CreateFmt(
+        'dependency "%s": commit %s is not reachable from any branch or tag '
+        + 'of %s. It may exist only in a fork or a pull request, or the '
+        + 'branch that contained it was deleted or force-pushed. Pin a '
+        + 'commit from the repository''s own history.',
+        [ANode.Name, LowerCase(ACommit), RepoURL]);
+    WriteLn('  verified commit ', LowerCase(ACommit), ' for ', ANode.Name,
+      ': reachable from ', Outcome.ProvingRef, ' (', Outcome.Requests,
+      ' requests, ', Outcome.BytesReceived, ' bytes)');
+    VerifiedPins.Add(RepoURL + '@' + LowerCase(ACommit));
+  end;
+
   function SelectNode(const ANode: TResolveNode): TSelectionState;
   var
     Requirements: TResolverRequirementArray;
@@ -2787,6 +2864,15 @@ var
              Copy(ANode.Specs[Longest], 1, Length(ANode.Specs[k]))) then
           RaiseNodeConflict(ANode, '', '',
             'SHA requirements do not identify the same commit');
+      { Only a full id can be proven: an abbreviated one could name a
+        different, fork-only commit on a host that resolves prefixes. }
+      if Length(ANode.Specs[Longest]) <> GIT_OBJECT_ID_LENGTH then
+        raise EManifestError.CreateFmt(
+          'dependency "%s": commit pin "%s" is abbreviated. %s verifies '
+          + 'that a pinned commit belongs to the repository and needs the '
+          + 'full %d-character SHA.', [ANode.Name, ANode.Specs[Longest],
+          PROGRAM_NAME, GIT_OBJECT_ID_LENGTH]);
+      VerifyCommitPin(ANode, ANode.Specs[Longest]);
       Result.RefName := ANode.Specs[Longest];
       Result.CommitSHA := ANode.Specs[Longest];
       Exit;
@@ -2974,6 +3060,7 @@ begin
   PlanScratch := PlanRoot + '/scratch';
   Previous := nil;
   RefCache := nil;
+  VerifiedPins := TStringList.Create;
   SeenSignatures := TStringList.Create;
   try
     Round := 0;
@@ -3214,6 +3301,7 @@ begin
     end;
   finally
     SeenSignatures.Free;
+    VerifiedPins.Free;
     if DirectoryExists(PlanRoot) then WipeDir(PlanRoot);
   end;
 end;

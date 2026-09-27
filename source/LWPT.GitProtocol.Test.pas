@@ -118,6 +118,7 @@ type
   TLiveReachabilityTests = class(TTestSuite)
   private
     FSkipped: Boolean;
+    FOptions: THTTPRequestOptions;
     FAdvertised: TGitRefArray;
     procedure ProveLive(const ACommit: string; AExpectReachable: Boolean);
   protected
@@ -769,8 +770,12 @@ begin
       + 'tests skipped');
     Exit;
   end;
+  { The same destination policy install applies to a GitHub dependency. }
+  FOptions := DefaultHTTPRequestOptions;
+  FOptions.Destination.AllowedHosts := ['github.com'];
+  FOptions.Destination.PrivateAddresses := papDeny;
   try
-    FAdvertised := ListRemoteRefs(CHECKOUT_URL);
+    FAdvertised := ListRemoteRefs(CHECKOUT_URL, FOptions);
   except
     on E: EHTTPError do
       if (Pos('Failed to connect', E.Message) > 0)
@@ -796,7 +801,7 @@ begin
     Expect<Boolean>(True).ToBe(True);
     Exit;
   end;
-  Transport := THTTPGitUploadPackTransport.Create(DefaultHTTPRequestOptions);
+  Transport := THTTPGitUploadPackTransport.Create(FOptions);
   try
     Started := GetTickCount64;
     Outcome := ProveCommitReachable(Transport, CHECKOUT_URL, ACommit,

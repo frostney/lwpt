@@ -121,10 +121,12 @@ type
       const ARequest: TBytes): TBytes; override;
   end;
 
-  { Replays recorded exchanges from <root>/upload-pack/<repository>/:
-    `advertisement` for the capability request and `<sha256>.response` for
-    the command request whose body hashes to <sha256>. Test fixture seam,
-    selected by the same variable as the ref-listing fixture. }
+  {$IFDEF INSTALL_TESTING}
+  { Test-build-only fixture transport (ADR-0044): replays recorded exchanges
+    from <root>/upload-pack/<repository>/ -- `advertisement` for the
+    capability request and `<sha256>.response` for the command request
+    whose body hashes to <sha256>. Install selects it through the same
+    variable as the ref-listing fixture; release builds do not compile it. }
   TGitFixtureUploadPackTransport = class(TGitUploadPackTransport)
   private
     FRoot: string;
@@ -141,6 +143,7 @@ type
     function Command(const ARepoURL: string;
       const ARequest: TBytes): TBytes; override;
   end;
+  {$ENDIF}
 
   TGitV2Capabilities = record
     Version2: Boolean;
@@ -828,11 +831,6 @@ begin
     SetLength(Result, Length(Result) - 1);
 end;
 
-function IsResponseTooLarge(const E: Exception): Boolean;
-begin
-  Result := Pos('response body exceeds configured limit', E.Message) > 0;
-end;
-
 function TooLarge(const AURL: string;
   ALimit: Int64): EGitResponseTooLarge;
 begin
@@ -869,11 +867,10 @@ begin
   try
     Resp := HTTPGet(URL, Headers, FOptions);
   except
+    on E: EHTTPResponseTooLarge do
+      raise TooLarge(URL, FMaxResponseBytes);
     on E: EHTTPError do
-      if IsResponseTooLarge(E) then
-        raise TooLarge(URL, FMaxResponseBytes)
-      else
-        raise EGitReachabilityError.CreateFmt('%s: %s', [URL, E.Message]);
+      raise EGitReachabilityError.CreateFmt('%s: %s', [URL, E.Message]);
   end;
   if Resp.StatusCode <> 200 then
     raise EGitReachabilityError.CreateFmt('%s: HTTP %d %s',
@@ -913,11 +910,10 @@ begin
     Resp := HTTPPost(URL, ARequest, 'application/x-git-upload-pack-request',
       Headers, Options);
   except
+    on E: EHTTPResponseTooLarge do
+      raise TooLarge(URL, FMaxResponseBytes);
     on E: EHTTPError do
-      if IsResponseTooLarge(E) then
-        raise TooLarge(URL, FMaxResponseBytes)
-      else
-        raise EGitReachabilityError.CreateFmt('%s: %s', [URL, E.Message]);
+      raise EGitReachabilityError.CreateFmt('%s: %s', [URL, E.Message]);
   end;
   if Resp.StatusCode <> 200 then
     raise EGitReachabilityError.CreateFmt('%s: HTTP %d %s',
@@ -925,6 +921,7 @@ begin
   Result := Resp.Body;
 end;
 
+{$IFDEF INSTALL_TESTING}
 constructor TGitFixtureUploadPackTransport.Create(const ARoot: string;
   AMaxResponseBytes: Int64; ALogRequests: Boolean);
 begin
@@ -987,6 +984,7 @@ begin
   Result := ReadResponse(FRoot + 'upload-pack/' + Repository + '/'
     + SHA256Hex(ARequest) + '.response');
 end;
+{$ENDIF}
 
 { ───────────────────────────────────────────────────────────────────
   Reachability proof
