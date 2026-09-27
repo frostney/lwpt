@@ -48,9 +48,9 @@ type
     policy is active the host is resolved once into a binary address, that
     address is classified, and the connection dials exactly that address;
     TLS still verifies the peer against the host name. Such a request dials
-    IPv4 only: an IPv6 destination, other than an IPv4-mapped or
-    IPv4-compatible spelling, which is treated as its IPv4 address, is
-    refused. }
+    IPv4 only: an IPv6 destination is refused unless it is an IPv4-mapped,
+    IPv4-compatible, or NAT64 well-known-prefix (64:ff9b::/96) spelling,
+    which is treated as its embedded IPv4 address. }
   THTTPDestinationPolicy = record
     { Case-insensitive exact host names; empty allows any host. }
     AllowedHosts: TStringArray;
@@ -89,6 +89,11 @@ type
     classification. Consulted only while an address policy is active. }
   THTTPClientResolveTestHook = function(const AHost: string;
     out AAddress: string; out APrivate: Boolean): Boolean;
+  { Test-only scheme seam. Production code must leave this nil. Returning
+    True lets a plaintext hop to AHost stand in for an authenticated https
+    hop under RequireHTTPS, so a loopback mock can play an HTTPS origin whose
+    redirect is then checked like every other hop. }
+  THTTPClientHTTPSStandInTestHook = function(const AHost: string): Boolean;
   {$ENDIF}
 
 const
@@ -104,6 +109,7 @@ var
 {$IFDEF HTTPCLIENT_TESTING}
 var
   HTTPClientResolveTestHook: THTTPClientResolveTestHook;
+  HTTPClientHTTPSStandInTestHook: THTTPClientHTTPSStandInTestHook;
 {$ENDIF}
 
 function DefaultHTTPRequestOptions: THTTPRequestOptions;
@@ -1350,9 +1356,9 @@ begin
 end;
 
 { Dotted-quad IPv4 text only. Deliberately strict: shortened forms ("127.1"),
-  hexadecimal or octal-looking octets, and bare integers are not literals.
-  They are left to name resolution, whose binary answer is what gets
-  classified and dialled. }
+  hexadecimal octets, octets with a leading zero ("010"), and bare integers
+  are not literals. They are left to name resolution, whose binary answer is
+  what gets classified and dialled. }
 function TryParseIPv4(const AValue: string;
   out AOctets: THTTPIPv4Octets): Boolean;
 var
@@ -1369,6 +1375,9 @@ begin
     Current := AValue[CharacterIndex];
     if (Current >= '0') and (Current <= '9') then
     begin
+      { A multi-digit octet may not start with 0: other parsers read it as
+        octal, so it is not a canonical literal. }
+      if (Digits = 1) and (Value = 0) then Exit;
       Inc(Digits);
       if Digits > 3 then Exit;
       Value := Value * 10 + (Ord(Current) - Ord('0'));
@@ -1665,7 +1674,11 @@ var
   {$ENDIF}
 begin
   Result := Default(THTTPDialTarget);
-  if APolicy.RequireHTTPS and (AParsed.Scheme <> 'https') then
+  if APolicy.RequireHTTPS and (AParsed.Scheme <> 'https')
+     {$IFDEF HTTPCLIENT_TESTING}
+     and not (Assigned(HTTPClientHTTPSStandInTestHook)
+       and HTTPClientHTTPSStandInTestHook(AParsed.Host))
+     {$ENDIF} then
     raise EHTTPError.CreateFmt(
       'fetch scheme not allowed: %s://%s (https is required)',
       [AParsed.Scheme, AParsed.Host]);
