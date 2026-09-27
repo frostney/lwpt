@@ -78,6 +78,7 @@ type
     procedure TestChunkSizeFailures;
     procedure TestChunkSizeNearIntegerMaxIsBounded;
     procedure TestCloseDelimitedBodyOverLimit;
+    procedure TestBodyLimitRaisesResponseTooLarge;
     procedure TestConflictingContentLengths;
     procedure TestDuplicateContentLengths;
     procedure TestFixedBodyAtLimit;
@@ -991,6 +992,53 @@ begin
     'HTTP chunk size exceeds supported frame limit of 2147483645 bytes');
 end;
 
+function BodyLimitErrorClass(const ARawResponse: TBytes): string;
+var
+  Mock: TMockHTTPServer;
+  NoHeaders: THTTPHeaders;
+begin
+  Result := '';
+  Mock := TMockHTTPServer.Create(ARawResponse);
+  try
+    Mock.Start;
+    NoHeaders := nil;
+    try
+      HTTPGet('http://127.0.0.1:' + IntToStr(Mock.Port) + '/x', NoHeaders,
+        TestOptions(4, 1024, 1000));
+    except
+      on E: EHTTPError do
+        Result := E.ClassName;
+    end;
+    Mock.WaitDone;
+  finally
+    Mock.Free;
+  end;
+end;
+
+procedure THTTPClientResourceBounds.TestBodyLimitRaisesResponseTooLarge;
+const
+  CRLF = #13#10;
+var
+  Chunks: TByteArrays;
+begin
+  { Every way a body can exceed the limit raises the same subclass, so
+    callers can refuse an oversized response without matching text. }
+  Expect<string>(BodyLimitErrorClass(FixedResponse('5', nil)))
+    .ToBe('EHTTPResponseTooLarge');
+  Expect<string>(BodyLimitErrorClass(ConcatBytes(
+    StringBytes('HTTP/1.1 200 OK' + CRLF + 'Connection: close' + CRLF
+      + CRLF), MakeBytes([$00, $01, $02, $03, $04]))))
+    .ToBe('EHTTPResponseTooLarge');
+  SetLength(Chunks, 1);
+  Chunks[0] := MakeBytes([$00, $01, $02, $03, $04]);
+  Expect<string>(BodyLimitErrorClass(BuildChunkedResponse(Chunks)))
+    .ToBe('EHTTPResponseTooLarge');
+  { Other response failures keep the base class. }
+  Expect<string>(BodyLimitErrorClass(StringBytes('HTTP/1.1 200 OK' + CRLF
+    + 'Transfer-Encoding: chunked' + CRLF + CRLF + 'nope' + CRLF)))
+    .ToBe('EHTTPError');
+end;
+
 procedure THTTPClientResourceBounds.TestCloseDelimitedBodyOverLimit;
 const
   CRLF = #13#10;
@@ -1205,6 +1253,8 @@ begin
     TestChunkSizeNearIntegerMaxIsBounded);
   Test('close-delimited body over limit fails',
     TestCloseDelimitedBodyOverLimit);
+  Test('every body-limit failure raises EHTTPResponseTooLarge',
+    TestBodyLimitRaisesResponseTooLarge);
   Test('invalid Content-Length values fail stably',
     TestInvalidContentLengths);
   Test('conflicting Content-Length headers fail stably',
