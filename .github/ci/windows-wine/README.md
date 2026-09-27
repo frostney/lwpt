@@ -4,7 +4,7 @@ Run the repository's i386 Win32 compile and Wine smoke gate through the local
 Docker-compatible engine (OrbStack on the maintainer Mac):
 
 ```sh
-.github/delivery/windows-wine/run.sh
+.github/ci/windows-wine/run.sh
 ```
 
 The first run downloads the pinned FPC 3.2.2 source archive, verifies its

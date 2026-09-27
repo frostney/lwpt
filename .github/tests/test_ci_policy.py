@@ -10,7 +10,12 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
+CI_TOOLING = ROOT / ".github/ci"
+
+
+def read(relative: str) -> str:
+    return (ROOT / relative).read_text(encoding="utf-8")
 
 
 def workflow_job(workflow: str, name: str) -> str:
@@ -24,80 +29,99 @@ def workflow_job(workflow: str, name: str) -> str:
     return match.group(0)
 
 
-class RepositoryPolicyTests(unittest.TestCase):
-    def test_orchestration_policy_has_stable_machine_consumer_headings(self) -> None:
-        policy = (ROOT / "ORCHESTRATION.md").read_text(encoding="utf-8")
-        headings = [
-            "## Authority and fallback",
-            "## Delivery integration endpoints",
-            "## Capability decision tree",
-            "## Coordinator and lane responsibilities",
-            "## Context packets",
-            "## Token ledger",
-            "## Intervention thresholds",
-            "## Unsupported or contradictory policy handling",
+def workflow_job_names(workflow: str) -> list[str]:
+    jobs = workflow.split("\njobs:\n", 1)[1]
+    return re.findall(r"^  ([a-zA-Z0-9_-]+):\n", jobs, re.MULTILINE)
+
+
+class PullRequestGateTests(unittest.TestCase):
+    def test_every_base_branch_runs_the_gate(self) -> None:
+        workflow = read(".github/workflows/pr.yml")
+        trigger = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("  pull_request:\n", trigger)
+        self.assertNotIn("branches:", trigger)
+        self.assertNotIn("codex/", workflow)
+
+    def test_gate_has_no_label_routing(self) -> None:
+        workflow = read(".github/workflows/pr.yml")
+        for retired in ("delivery-gate", "deferred", "delivery:managed", "ci:ready"):
+            self.assertNotIn(retired, workflow)
+        self.assertIn("cancel-in-progress: true", workflow)
+
+    def test_admission_job_requires_every_native_job(self) -> None:
+        workflow = read(".github/workflows/pr.yml")
+        admission = workflow_job(workflow, "delivery-admission")
+        self.assertIn("if: ${{ always() }}", admission)
+        others = [
+            name for name in workflow_job_names(workflow)
+            if name != "delivery-admission"
         ]
-        for heading in headings:
-            self.assertIn(heading, policy)
-        for operation in (
-            "enrol",
-            "ci",
-            "review",
-            "diagnostic",
-            "full-ci",
-            "merge",
-            "reset",
-        ):
-            self.assertIn(f"`{operation}`", policy)
-
-    def test_token_dispatched_full_ci_has_scheduled_terminal_recovery(self) -> None:
-        transition = (
-            ROOT / ".github/workflows/delivery-transition.yml"
-        ).read_text(encoding="utf-8")
-        watchdog = (
-            ROOT / ".github/workflows/delivery-watchdog.yml"
-        ).read_text(encoding="utf-8")
-        controller = (
-            ROOT / ".github/delivery/controller.py"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("GH_TOKEN: ${{ github.token }}", transition)
-        self.assertIn("cron: '*/15 * * * *'", watchdog)
-        self.assertIn("actions: write", watchdog)
-        self.assertIn("Reconcile managed delivery and orphaned proofs", watchdog)
-        self.assertIn("controller.py observe", watchdog)
-        self.assertLess(
-            watchdog.index("controller.py watchdog"),
-            watchdog.index("controller.py observe"),
+        self.assertEqual(
+            [
+                "build-and-test",
+                "docs",
+                "darwin-test",
+                "toolchain",
+                "windows-cross-compile",
+                "windows-test",
+            ],
+            others,
         )
-        self.assertIn("def recover_completed_full_ci", controller)
-        self.assertIn('"ci.yml", created_after, now', controller)
+        for name in others:
+            self.assertIn(f"      - {name}\n", admission)
+            self.assertIn(f"${{{{ needs.{name}.result }}}}", admission)
 
-    def test_delivery_observer_omits_no_op_pr_events_and_duplicate_schedule(self) -> None:
-        observer = (
-            ROOT / ".github/workflows/delivery-observer.yml"
-        ).read_text(encoding="utf-8")
-        pull_request_types = observer.split("  pull_request_review:", 1)[0]
+    def test_main_ruleset_binds_native_admission_job_to_github_actions(self) -> None:
+        ruleset = json.loads(read(".github/rulesets/protect-main.json"))
+        pull_rule = next(rule for rule in ruleset["rules"] if rule["type"] == "pull_request")
+        self.assertTrue(pull_rule["parameters"]["required_review_thread_resolution"])
+        self.assertEqual(["squash"], pull_rule["parameters"]["allowed_merge_methods"])
+        status_rule = next(
+            rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks"
+        )
+        self.assertEqual(
+            [{"context": "delivery-admission", "integration_id": 15368}],
+            status_rule["parameters"]["required_status_checks"],
+        )
 
-        self.assertNotIn("      - opened\n", pull_request_types)
-        self.assertNotIn("      - ready_for_review\n", pull_request_types)
-        self.assertNotIn("  schedule:\n", observer)
-        for action in (
-            "reopened",
-            "synchronize",
-            "edited",
-            "labeled",
-            "unlabeled",
-            "converted_to_draft",
-            "closed",
+
+class IntegratedWorkflowTests(unittest.TestCase):
+    def test_dispatch_offers_only_manual_and_diagnostic_modes(self) -> None:
+        workflow = read(".github/workflows/ci.yml")
+        mode = re.search(
+            r"^      mode:\n.*?options:\n((?:          - [^\n]+\n)+)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(mode)
+        self.assertEqual(
+            ["manual", "diagnostic"],
+            re.findall(r"- (\S+)", mode.group(1)),
+        )
+        for retired in (
+            "full-ci",
+            "candidate_pr_number",
+            "expected_head",
+            "topology_digest",
+            "check_id",
+            "gh api",
         ):
-            self.assertIn(f"      - {action}\n", pull_request_types)
+            self.assertNotIn(retired, workflow)
 
-    def test_diagnostics_are_allow_listed_and_proof_separated(self) -> None:
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        transition = (
-            ROOT / ".github/workflows/delivery-transition.yml"
-        ).read_text(encoding="utf-8")
+    def test_run_name_shows_mode_and_ref(self) -> None:
+        workflow = read(".github/workflows/ci.yml")
+        run_name = workflow.split("\non:\n", 1)[0]
+        self.assertIn("github.ref_name", run_name)
+        self.assertIn("inputs.mode || github.event_name", run_name)
+        self.assertIn("inputs.diagnostic_target", run_name)
+
+    def test_runs_check_out_the_dispatched_head(self) -> None:
+        workflow = read(".github/workflows/ci.yml")
+        refs = re.findall(r"^          ref: (.+)$", workflow, re.MULTILINE)
+        self.assertEqual(["${{ github.sha }}", "${{ github.sha }}"], refs)
+
+    def test_diagnostics_are_allow_listed_slices(self) -> None:
+        workflow = read(".github/workflows/ci.yml")
         for value in (
             "aarch64-darwin",
             "x86_64-darwin",
@@ -110,18 +134,15 @@ class RepositoryPolicyTests(unittest.TestCase):
             "tls",
         ):
             self.assertIn(f"- {value}", workflow)
-            self.assertIn(f"- {value}", transition)
         self.assertIn("macos-15-intel", workflow)
-        self.assertIn("Checkout trusted scheduling diagnostic", workflow)
-        self.assertIn("ref: ${{ github.sha }}", workflow)
-        self.assertIn("path: .trusted-delivery", workflow)
-        self.assertIn(
-            "run: .trusted-delivery/.github/delivery/scheduling-diagnostic.sh",
-            workflow,
-        )
-        diagnostic = (
-            ROOT / ".github/delivery/scheduling-diagnostic.sh"
-        ).read_text(encoding="utf-8")
+        self.assertIn("x86_64-linux/scheduling", workflow)
+        self.assertIn("aarch64-darwin/scheduling", workflow)
+        self.assertNotIn("aarch64-darwin/default", workflow)
+        self.assertNotIn("x86_64-linux/default", workflow)
+        self.assertIn("run: .github/ci/scheduling-diagnostic.sh", workflow)
+        self.assertIn("format('diagnostic-{0}', github.ref_name)", workflow)
+
+        diagnostic = (CI_TOOLING / "scheduling-diagnostic.sh").read_text(encoding="utf-8")
         self.assertIn("TestScheduling.Test.pas", diagnostic)
         self.assertIn("diagnostic exceeded its bounded runtime", diagnostic)
         self.assertIn('"source/*.Test.pas"', diagnostic)
@@ -129,17 +150,9 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn('"tests/integration/*.Test.pas"', diagnostic)
         self.assertIn("--jobs=1 --bail=1 --verbose", diagnostic)
         self.assertIn('"${test_command[@]}"', diagnostic)
-        self.assertIn("diagnostic/", workflow)
-        self.assertIn("- diagnostic", workflow)
-        self.assertIn("current same-repository PR head", workflow)
-        self.assertIn("x86_64-linux/scheduling", workflow)
-        self.assertIn("aarch64-darwin/scheduling", workflow)
-        self.assertNotIn("aarch64-darwin/default", workflow)
-        self.assertNotIn("x86_64-linux/default", workflow)
-        self.assertNotIn("diagnostic:v1", workflow)
 
     def test_arm_darwin_scheduling_diagnostic_uses_native_matrix(self) -> None:
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        workflow = read(".github/workflows/ci.yml")
         self.assertIn(
             'BUILD=\'{"include":[{"target":"aarch64-darwin","cpu":"aarch64",'
             '"os":"darwin","native":true}]}\'',
@@ -152,10 +165,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         )
 
     def test_scheduling_diagnostic_has_realistic_hosted_budget(self) -> None:
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        diagnostic = (
-            ROOT / ".github/delivery/scheduling-diagnostic.sh"
-        ).read_text(encoding="utf-8")
+        workflow = read(".github/workflows/ci.yml")
+        diagnostic = (CI_TOOLING / "scheduling-diagnostic.sh").read_text(encoding="utf-8")
         script_poll_seconds = re.search(
             r'poll_seconds="\$\{LWPT_SCHEDULING_DIAGNOSTIC_POLL_SECONDS:-(\d+)\}"',
             diagnostic,
@@ -186,65 +197,47 @@ class RepositoryPolicyTests(unittest.TestCase):
         # The focused suite was still making progress at 90.072 seconds on
         # macos-15-intel. Keep approximately one minute beyond that observed
         # lower bound.
-        self.assertGreaterEqual(
-            scheduling_poll_seconds * darwin_poll_count,
-            150,
-        )
+        self.assertGreaterEqual(scheduling_poll_seconds * darwin_poll_count, 150)
         self.assertEqual(420, scheduling_poll_seconds * default_poll_count)
         self.assertEqual(90, scheduling_poll_seconds * linux_poll_count)
 
     def test_test_routes_use_project_selectors_without_runner_tiers(self) -> None:
-        pr_workflow = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")
-        ci_workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        for workflow in (pr_workflow, ci_workflow):
+        for workflow in (read(".github/workflows/pr.yml"), read(".github/workflows/ci.yml")):
             self.assertNotIn("--tier", workflow)
             self.assertIn("'source/*.Test.pas'", workflow)
             self.assertIn("'packages/*/source/*.Test.pas'", workflow)
             self.assertIn("'tests/integration/*.Test.pas'", workflow)
             self.assertIn("'tests/e2e/*.Test.pas'", workflow)
             self.assertIn("'packages/*/tests/e2e/*.Test.pas'", workflow)
-        self.assertIn('LWPT_ENABLE_NETWORK: "1"', pr_workflow)
-        self.assertIn('LWPT_ENABLE_NETWORK: "1"', ci_workflow)
+            self.assertIn('LWPT_ENABLE_NETWORK: "1"', workflow)
 
+    def test_native_test_jobs_have_twenty_minute_timeout(self) -> None:
+        workflow = read(".github/workflows/ci.yml")
+        pr_workflow = read(".github/workflows/pr.yml")
+        self.assertIn("    timeout-minutes: 20\n", workflow_job(workflow, "test"))
+        for name in ("build-and-test", "darwin-test", "windows-test"):
+            self.assertIn("    timeout-minutes: 20\n", workflow_job(pr_workflow, name))
+
+
+class WindowsToolingTests(unittest.TestCase):
     def test_windows_compiler_setup_publishes_required_paths(self) -> None:
-        installer = (
-            ROOT / ".github/delivery/install-windows-fpc.sh"
-        ).read_text(encoding="utf-8")
+        installer = (CI_TOOLING / "install-windows-fpc.sh").read_text(encoding="utf-8")
         self.assertIn('fpc_bin="${install_root}/bin/i386-win32/fpc.exe"', installer)
         self.assertIn('echo "LWPT_FPC=$LWPT_FPC_VALUE"', installer)
         self.assertIn('head -1 || true)\nif [ -n "${instantfpc_bin}" ]', installer)
         self.assertIn("for unit_target in i386-win32 x86_64-win64", installer)
         self.assertIn('"${fpc_bin}" -iV', installer)
 
-    def test_native_test_jobs_have_twenty_minute_timeout(self) -> None:
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        pr_workflow = (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8")
-
-        self.assertIn("    timeout-minutes: 20\n", workflow_job(workflow, "test"))
-        for name in ("build-and-test", "darwin-test", "windows-test"):
-            self.assertIn(
-                "    timeout-minutes: 20\n", workflow_job(pr_workflow, name)
-            )
-
     def test_windows_fpc_uses_pinned_official_distribution(self) -> None:
-        workflows = [
-            (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"),
-            (ROOT / ".github/workflows/pr.yml").read_text(encoding="utf-8"),
-        ]
-        for workflow in workflows:
-            self.assertEqual(
-                1,
-                workflow.count(".github/delivery/install-windows-fpc.sh"),
-            )
+        for name in ("ci.yml", "pr.yml"):
+            workflow = read(f".github/workflows/{name}")
+            self.assertEqual(1, workflow.count(".github/ci/install-windows-fpc.sh"))
             self.assertNotIn("choco install -y freepascal", workflow)
             self.assertNotIn('"fpc-install":"choco"', workflow)
 
-        installer = (
-            ROOT / ".github/delivery/install-windows-fpc.sh"
-        ).read_text(encoding="utf-8")
-        self.assertTrue(
-            os.access(ROOT / ".github/delivery/install-windows-fpc.sh", os.X_OK)
-        )
+        installer_path = CI_TOOLING / "install-windows-fpc.sh"
+        installer = installer_path.read_text(encoding="utf-8")
+        self.assertTrue(os.access(installer_path, os.X_OK))
         self.assertIn(
             "https://downloads.freepascal.org/fpc/dist/3.2.2/i386-win32/"
             "fpc-3.2.2.i386-win32.exe",
@@ -259,8 +252,9 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("--max-time 120", installer)
         self.assertIn("sha256sum", installer)
         self.assertIn("/VERYSILENT", installer)
-        self.assertIn('echo "LWPT_FPC=$LWPT_FPC_VALUE"', installer)
 
+
+class SchedulingDiagnosticTests(unittest.TestCase):
     def test_scheduling_diagnostic_accepts_final_interval_completion(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
@@ -302,7 +296,7 @@ class RepositoryPolicyTests(unittest.TestCase):
                 }
             )
             result = subprocess.run(
-                [str(ROOT / ".github/delivery/scheduling-diagnostic.sh")],
+                [str(CI_TOOLING / "scheduling-diagnostic.sh")],
                 cwd=tmp,
                 env=env,
                 capture_output=True,
@@ -314,21 +308,13 @@ class RepositoryPolicyTests(unittest.TestCase):
             self.assertNotIn("exceeded", result.stdout)
 
     def test_active_case_marker_is_published_by_atomic_replacement(self) -> None:
-        testing_library = (
-            ROOT / "packages/testing/source/TestingPascalLibrary.pas"
-        ).read_text(encoding="utf-8")
+        testing_library = read("packages/testing/source/TestingPascalLibrary.pas")
         publish_start = testing_library.index("procedure PublishActiveTestCase")
-        publish_end = testing_library.index(
-            "function TestResultToExitCode", publish_start
-        )
+        publish_end = testing_library.index("function TestResultToExitCode", publish_start)
         publish = testing_library[publish_start:publish_end]
         self.assertIn(".tmp-", publish)
-        self.assertLess(
-            publish.index("Flush(MarkerFile)"), publish.index("CloseFile")
-        )
-        self.assertLess(
-            publish.index("CloseFile"), publish.index("ReplaceActiveTestCaseFile")
-        )
+        self.assertLess(publish.index("Flush(MarkerFile)"), publish.index("CloseFile"))
+        self.assertLess(publish.index("CloseFile"), publish.index("ReplaceActiveTestCaseFile"))
         self.assertIn("RenameFile(ATemporaryPath, ATargetPath)", testing_library)
         self.assertIn("MOVEFILE_REPLACE_EXISTING", testing_library)
 
@@ -375,9 +361,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             sample.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             sample.chmod(0o755)
             timeout = tmp / "timeout"
-            timeout.write_text(
-                "#!/usr/bin/env bash\nshift\nexec \"$@\"\n", encoding="utf-8"
-            )
+            timeout.write_text("#!/usr/bin/env bash\nshift\nexec \"$@\"\n", encoding="utf-8")
             timeout.chmod(0o755)
             env = os.environ.copy()
             env.update(
@@ -393,7 +377,7 @@ class RepositoryPolicyTests(unittest.TestCase):
                 }
             )
             result = subprocess.run(
-                [str(ROOT / ".github/delivery/scheduling-diagnostic.sh")],
+                [str(CI_TOOLING / "scheduling-diagnostic.sh")],
                 cwd=tmp,
                 env=env,
                 capture_output=True,
@@ -404,9 +388,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             self.assertEqual(1, result.returncode)
             self.assertIn("exceeded", result.stdout)
             self.assertIn("active test case", result.stdout)
-            self.assertIn(
-                "TSchedulingSuite > blocked nested case", result.stdout
-            )
+            self.assertIn("TSchedulingSuite > blocked nested case", result.stdout)
             self.assertIn("fixture_wait", result.stdout)
             self.assertIn("read(0x3, 0x4, 0x5)", result.stdout)
             self.assertIn("fixture_task_wait", result.stdout)
@@ -419,44 +401,107 @@ class RepositoryPolicyTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(grandchild_pid, 0)
 
-    def test_orchestration_policy_pins_every_initial_threshold(self) -> None:
-        policy = (ROOT / "ORCHESTRATION.md").read_text(encoding="utf-8")
+
+class OrchestrationPolicyTests(unittest.TestCase):
+    def test_policy_declares_the_sections_milestone_rush_requires(self) -> None:
+        policy = read("ORCHESTRATION.md")
+        for heading in (
+            "## Capability classes and routing",
+            "## Context packets",
+            "## Token checkpoints and interventions",
+            "## Monitoring and waits",
+            "## Escalation",
+            "## Lane-admission preflight",
+            "## Integration and merge",
+        ):
+            self.assertIn(heading, policy)
         for boundary in ("greater than 40%", "greater than 55%", "25th", "at most three"):
             self.assertIn(boundary, policy)
-        self.assertIn("fork_turns:none", policy)
-        self.assertIn("No token or context intervention may silently downgrade", policy)
 
-    def test_main_ruleset_binds_native_admission_job_to_github_actions(self) -> None:
-        ruleset = json.loads(
-            (ROOT / ".github/rulesets/protect-main.json").read_text(encoding="utf-8")
+    def test_policy_binds_repository_evidence(self) -> None:
+        policy = read("ORCHESTRATION.md")
+        self.assertIn("`delivery-admission`", policy)
+        self.assertIn("`ci:full-required`", policy)
+        self.assertIn("gh workflow run ci.yml --ref <branch> -f mode=manual", policy)
+        self.assertIn("--match-head-commit", policy)
+        self.assertIn("`.github/delivery/review-automations.json`", policy)
+        self.assertTrue((ROOT / ".github/delivery/review-automations.json").is_file())
+        for retired in ("delivery-transition", "merge:ready", "review:ready", "delivery:managed"):
+            self.assertNotIn(retired, policy)
+
+    def test_path_budget_fits_the_deepest_measured_path(self) -> None:
+        policy = read("ORCHESTRATION.md")
+        budget = re.search(r"wc -c\)\" -le (\d+)", policy)
+        self.assertIsNotNone(budget)
+        deepest = re.search(r"(\d+) characters below the root", policy)
+        self.assertIsNotNone(deepest)
+        limit = re.search(
+            r"COMPILER_PATH_LIMIT = (\d+);", read("source/LWPT.BuildSession.pas")
         )
-        pull_rule = next(rule for rule in ruleset["rules"] if rule["type"] == "pull_request")
-        self.assertTrue(pull_rule["parameters"]["required_review_thread_resolution"])
-        status_rule = next(
-            rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks"
-        )
-        self.assertEqual(
-            [{"context": "delivery-admission", "integration_id": 15368}],
-            status_rule["parameters"]["required_status_checks"],
+        self.assertIsNotNone(limit)
+        self.assertEqual("255", limit.group(1))
+        self.assertLessEqual(
+            int(budget.group(1)) + int(deepest.group(1)), int(limit.group(1))
         )
 
-    def test_live_review_adapter_accepts_only_the_exact_macroscope_no_code_skip(self) -> None:
-        config = json.loads(
-            (ROOT / ".github/delivery/review-automations.json").read_text(
-                encoding="utf-8"
+
+class ReviewPolicyTests(unittest.TestCase):
+    """The shape address-feedback's review_wait.py accepts as its default policy."""
+
+    LIST_FIELDS = (
+        "actors",
+        "check_contexts",
+        "check_app_slugs",
+        "terminal_check_conclusions",
+        "terminal_review_states",
+        "nonterminal_review_markers",
+    )
+
+    def test_review_automations_match_the_address_feedback_policy_shape(self) -> None:
+        policy = json.loads(read(".github/delivery/review-automations.json"))
+        self.assertIsInstance(policy, dict)
+        automations = policy["automations"]
+        self.assertIsInstance(automations, list)
+        self.assertTrue(automations)
+        identifiers = set()
+        for automation in automations:
+            self.assertIsInstance(automation, dict)
+            self.assertIsInstance(automation.get("id"), str)
+            identifiers.add(automation["id"])
+            for field in self.LIST_FIELDS:
+                values = automation.get(field, [])
+                self.assertIsInstance(values, list, field)
+                self.assertTrue(all(isinstance(value, str) for value in values), field)
+            self.assertTrue(
+                automation.get("check_contexts") or automation.get("terminal_review_states"),
+                f"{automation['id']} has no terminal evidence",
             )
-        )
-        self.assertEqual("macroscope", config["automations"][0]["id"])
+            self.assertTrue(automation.get("actors"), f"{automation['id']} has no actors")
+        self.assertEqual(len(automations), len(identifiers))
+
+    def test_macroscope_is_check_terminal(self) -> None:
+        policy = json.loads(read(".github/delivery/review-automations.json"))
+        macroscope = next(item for item in policy["automations"] if item["id"] == "macroscope")
+        self.assertEqual([], macroscope["terminal_review_states"])
+        self.assertEqual(["success", "neutral"], macroscope["terminal_check_conclusions"])
+        self.assertEqual(["Macroscope - Correctness Check"], macroscope["check_contexts"])
+
+
+class RetiredMachineryTests(unittest.TestCase):
+    def test_managed_delivery_machinery_is_gone(self) -> None:
+        for path in (
+            ".github/workflows/delivery-transition.yml",
+            ".github/workflows/delivery-observer.yml",
+            ".github/workflows/delivery-finalizer.yml",
+            ".github/workflows/delivery-watchdog.yml",
+            ".github/delivery/controller.py",
+            ".github/delivery/model.py",
+            ".github/delivery/tests",
+        ):
+            self.assertFalse((ROOT / path).exists(), path)
         self.assertEqual(
-            [], config["automations"][0]["terminal_review_states"]
-        )
-        self.assertEqual(
-            ["success", "neutral"],
-            config["automations"][0]["terminal_check_conclusions"],
-        )
-        self.assertEqual(
-            ["No code objects were reviewed."],
-            config["automations"][0]["terminal_skipped_output_titles"],
+            ["review-automations.json"],
+            sorted(item.name for item in (ROOT / ".github/delivery").iterdir()),
         )
 
 
