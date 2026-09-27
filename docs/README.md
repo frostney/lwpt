@@ -64,6 +64,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0036](./adr/0036-per-user-dependency-archive-cas.md) | Verified dependency archives reuse one per-user immutable SHA-256 object while project-owned archives and frozen verification remain authoritative |
 | [0037](./adr/0037-verified-build-result-cache.md) | Verified compiler-neutral build-result reuse through per-user immutable manifests and artifacts, with explicit bypass |
 | [0043](./adr/0043-self-hosted-registry-origin.md) | Self-hosted registry origin command family, content-addressed storage, atomic signed state, recovery, and native TLS lifecycle |
+| [0044](./adr/0044-test-seams-only-in-test-builds.md) | `LWPT_TEST_*` fetch and fault seams compile only into the `lwpt-testing` build (`INSTALL_TESTING`); release binaries ignore them |
 
 ## Spikes
 

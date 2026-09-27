@@ -281,6 +281,23 @@ jobs:
           done
           ls -la staged/
 
+      # ADR-0044: the LWPT_TEST_* fetch-redirection and fault-injection
+      # seams are compiled only with -dINSTALL_TESTING, which the compile
+      # above never passes. Their variable names are string constants that
+      # exist only in a test build, so finding one proves the define leaked.
+      # TestSeamIsolation.Test.pas pins the positive canary: the marker is
+      # present in build/lwpt-testing and absent from build/lwpt.
+      - name: Check test seams are compiled out
+        run: |
+          set -euo pipefail
+          for bin in staged/*; do
+            if grep -a -q 'LWPT_TEST_' "$bin"; then
+              echo "::error::$bin contains LWPT_TEST_ seams; release builds must not define INSTALL_TESTING"
+              exit 1
+            fi
+          done
+          echo "no LWPT_TEST_ seams in staged binaries"
+
       - name: Check Windows TLS linkage (native SChannel, no OpenSSL)
         if: matrix.os == 'win64' || matrix.os == 'win32'
         run: |

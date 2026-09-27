@@ -327,7 +327,7 @@ adds one module-specific subclass:
 | Class | Raised for |
 | --- | --- |
 | `EFetchError` | Network failures, HTTP non-2xx, local source dir missing |
-| `EVerifyError` | `--frozen` or `--offline` identity, archive-hash, or tree-hash mismatch against the lockfile |
+| `EVerifyError` | `--frozen` or `--offline` identity, archive-hash, or tree-hash mismatch against the lockfile; a locked tag advertised at a different commit during an online install (unless `--accept-moved-tags`) |
 | `EExtractError` | Archive parse failures, tar corruption, missing archive, atomic-move failure |
 | `ELockfileError` | Corrupt TOML in `lwpt.lock`, schema version mismatch, or missing lockfile when `--frozen` or `--offline` |
 | `EManifestError` | TOML errors, missing required keys, unsatisfiable constraints, unknown source kinds |
@@ -357,7 +357,7 @@ Older lockfile schemas (v1 or v2) fail to load with a clear migration hint: dele
 
 ## Self-host
 
-LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/{item.name}.pas"` and `output = "build/{item.name}"` (placeholder interpolation per [ADR-0012](./adr/0012-manifest-placeholder-interpolation.md)). The pre-commit hook runs `./build/lwpt format` and `./build/lwpt agents`; `./build/lwpt build` recompiles LWPT against itself when needed. The bootstrap (`scripts/bootstrap.pas` + `bootstrap.sh` / `bootstrap.bat`) is the once-per-fresh-clone seed that produces the first `build/lwpt`. See [`build-system.md`](./build-system.md) and [ADR-0005](./adr/0005-self-host-build.md).
+LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/{item.name}.pas"` and `output = "build/{item.name}"` (placeholder interpolation per [ADR-0012](./adr/0012-manifest-placeholder-interpolation.md)). A second entry, `lwpt-testing`, compiles the same program with `-dINSTALL_TESTING` into `build/lwpt-testing`, the only binary that honours the `LWPT_TEST_*` seams; a `[pretest]` hook rebuilds it before every `lwpt test` ([ADR-0044](./adr/0044-test-seams-only-in-test-builds.md)). The pre-commit hook runs `./build/lwpt format` and `./build/lwpt agents`; `./build/lwpt build` recompiles LWPT against itself when needed. The bootstrap (`scripts/bootstrap.pas` + `bootstrap.sh` / `bootstrap.bat`) is the once-per-fresh-clone seed that produces the first `build/lwpt`. See [`build-system.md`](./build-system.md) and [ADR-0005](./adr/0005-self-host-build.md).
 
 ## Source layout and package code
 
@@ -368,7 +368,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.Delphi.pas`,
 `LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
-`LWPT.GitProtocol.pas`, and the `LWPT.Registry.*` origin storage, signing,
+`LWPT.GitProtocol.pas`, `LWPT.FetchPolicy.pas` (per-dependency fetch
+destination policy), and the `LWPT.Registry.*` origin storage, signing,
 HTTP routing, and native macOS listener units) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
 LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` —

@@ -56,6 +56,10 @@ type
   TStringArray = array of string;
   TSHA256Progress = procedure of object;
 
+{ Value of the <PROJECT_NAME>_TEST_<AName> environment variable in a test
+  build (INSTALL_TESTING, ADR-0044) and always '' in a release build, so a
+  shipped binary ignores every fault-injection and fetch-redirection seam. }
+function  TestSeamValue(const AName: string): string;
 function  FPCExecutable: string;
 function  InstantFPCExecutable: string;
 procedure AddEnvUnitPathParameters(AParameters: TStrings);
@@ -172,6 +176,16 @@ begin
   finally
     LeaveCriticalSection(ProcessEnvironmentCriticalSection);
   end;
+end;
+
+function TestSeamValue(const AName: string): string;
+begin
+  {$IFDEF INSTALL_TESTING}
+  Result := SysUtils.GetEnvironmentVariable(PROJECT_NAME + '_TEST_' + AName);
+  {$ELSE}
+  if AName = '' then;
+  Result := '';
+  {$ENDIF}
 end;
 
 function FPCExecutable: string;
@@ -1169,8 +1183,7 @@ end;
 function AtomicRestorePath(const ABackupPath, ADestination: string): Boolean;
 var Meta: TStringList; Expected: string;
 begin
-  if SameText(SysUtils.GetEnvironmentVariable(
-       PROJECT_NAME + '_TEST_THROW_RESTORE_FOR'),
+  if SameText(TestSeamValue('THROW_RESTORE_FOR'),
        ExtractFileName(ExcludeTrailingPathDelimiter(ADestination))) then
     raise EExtractError.CreateFmt(
       'injected restore exception for "%s"', [ADestination]);

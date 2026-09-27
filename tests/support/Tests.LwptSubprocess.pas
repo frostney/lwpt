@@ -32,6 +32,7 @@
 
     function RunLwpt(const AArgs; AInDir; AExtraEnv): TLwptResult;
     function LwptBinaryPath: string;
+    function LwptTestingBinaryPath: string;
     function ExpectedExe(const APath: string): string;
     procedure SetLwptBinaryPath(const APath: string);
 }
@@ -76,6 +77,13 @@ function RunLwpt(const AArgs: array of string;
   point of the call. Override via SetLwptBinaryPath when running
   from a non-standard layout (e.g. a side-by-side comparison). }
 function LwptBinaryPath: string;
+{ Path to the test-flavoured binary (ADR-0044), built by the root manifest's
+  `lwpt-testing` [build] entry with INSTALL_TESTING and refreshed by its
+  [pretest] hook. Only that binary honours the LWPT_TEST_* fetch-redirection
+  and fault-injection variables; ./build/lwpt, like a release binary,
+  ignores them. Programs that drive those seams select it with
+  SetLwptBinaryPath(LwptTestingBinaryPath). }
+function LwptTestingBinaryPath: string;
 function ExpectedExe(const APath: string): string;
 procedure SetLwptBinaryPath(const APath: string);
 procedure ConfigureProcessEnvironment(const AProcess: TProcess;
@@ -127,6 +135,15 @@ function LwptBinaryPath: string;
 begin
   if GLwptBinaryPath <> '' then Exit(GLwptBinaryPath);
   Result := ExpandFileName('build/lwpt');
+end;
+
+function LwptTestingBinaryPath: string;
+begin
+  Result := ExpandFileName('build/lwpt-testing');
+  if not FileExists(ExpectedExe(Result)) then
+    raise Exception.Create(ExpectedExe(Result) + ' is missing; run '
+      + '`./build/lwpt build lwpt-testing` (the [pretest] hook does this '
+      + 'before every `lwpt test`)');
 end;
 
 function ExpectedExe(const APath: string): string;

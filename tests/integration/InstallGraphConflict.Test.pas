@@ -130,7 +130,7 @@ end;
 procedure TInstallGraphConflict.BeforeAll;
 begin
   FOriginalDir := GetCurrentDir;
-  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
+  SetLwptBinaryPath(LwptTestingBinaryPath);
   FScratch := CreateScratchRoot('install-graph-conflict');
   FRoot := FScratch + '/root';
   RecursiveDelete(FScratch);

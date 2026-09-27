@@ -16,6 +16,7 @@ interface
 uses
   SysUtils,
 
+  HTTPClient,
   LWPT.GitProtocol,
   LWPT.Install,
   LWPT.Manifest;
@@ -37,7 +38,8 @@ type
   end;
   TOutdatedEntryArray = array of TOutdatedEntry;
 
-  TListRemoteRefsFn = function(const ARepoURL: string): TGitRefArray;
+  TListRemoteRefsFn = function(const ARepoURL: string;
+    const AOptions: THTTPRequestOptions): TGitRefArray;
 
 function StripVersionPrefix(const S: string): string;
 function IsUpdatableSource(const ADep: TDependency): Boolean;
@@ -67,6 +69,7 @@ implementation
 
 uses
   LWPT.Core,
+  LWPT.FetchPolicy,
   Semver;
 
 function StripVersionPrefix(const S: string): string;
@@ -268,6 +271,7 @@ var
   Refs: TGitRefArray;
   Entry: TOutdatedEntry;
   RepoURL, LatestRef, LatestVersion: string;
+  FetchOptions: THTTPRequestOptions;
 begin
   SetLength(Result, 0);
   N := 0;
@@ -284,10 +288,12 @@ begin
     Entry.Locked := FindLockVersion(ALock, Entry.Name);
     RepoURL := GitHostRepoURL(AManifest.Deps[i], AManifest.CustomSources);
     if RepoURL = '' then Continue;
+    FetchOptions := DependencyFetchOptions(AManifest.Deps[i],
+      AManifest.CustomSources, DefaultHTTPRequestOptions);
     if Assigned(AListRefs) then
-      Refs := AListRefs(RepoURL)
+      Refs := AListRefs(RepoURL, FetchOptions)
     else
-      Refs := ListRemoteRefs(RepoURL);
+      Refs := ListRemoteRefs(RepoURL, FetchOptions);
     if not HighestSemverTag(Refs, LatestRef, LatestVersion) then Continue;
     Entry.LatestRef := LatestRef;
     Entry.Latest := LatestVersion;
