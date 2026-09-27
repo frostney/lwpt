@@ -101,24 +101,35 @@ function  AtomicReplaceFile(const ASrc, ADst: string): Boolean;
 procedure AtomicWriteText(const ADst: string; const ATmpRoot: string; const AContent: TStringList);
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
 
-{ Process-handle inheritance guard. FPC cannot restrict a spawn to an explicit
-  descriptor or handle list, and on Unix its TFileStream opens take a flock()
-  (shared for reads, exclusive for creates) on descriptors without
-  close-on-exec. A child spawned while such a descriptor is open keeps the
-  lock for its whole lifetime, so later share-mode opens of the same file fail
-  with EAGAIN. Every managed and unmanaged spawn therefore holds this guard,
-  and every toolkit-state open holds it only while opening and marking the
-  descriptor close-on-exec; all I/O happens after the guard is released.
-  Calls to Begin/End must be paired. }
+{ Process-handle inheritance protection. FPC cannot restrict a spawn to an
+  explicit descriptor or handle list, and on Unix its TFileStream opens take
+  a flock() (shared for reads, exclusive for creates) on descriptors without
+  close-on-exec. A child forked while such a descriptor is open shares its
+  lock: for its whole life without close-on-exec, and until its exec even
+  with it. Later non-blocking share-mode opens of that file then fail with
+  EAGAIN. Toolkit state therefore opens through the helpers below: they take
+  no flock (LWPT coordinates with explicit fcntl locks and atomic renames),
+  and they open and mark each descriptor close-on-exec under the same guard
+  every managed and unmanaged spawn holds. The guard covers only that step;
+  all I/O happens after it is released. Begin/End calls must be paired. }
 procedure BeginProcessHandleSetup;
 procedure EndProcessHandleSetup;
-{ TFileStream.Create equivalent whose descriptor never reaches a child. }
+
+type
+  { Owns its handle. On Unix the descriptor is close-on-exec and carries no
+    flock share-mode lock; on Windows the handle is non-inheritable and keeps
+    TFileStream's share modes. }
+  TLWPTProtectedFileStream = class(THandleStream)
+  public
+    destructor Destroy; override;
+  end;
+
+{ TFileStream.Create equivalent for toolkit state. AMode takes the same
+  fmCreate / fmOpenRead / fmOpenWrite / fmOpenReadWrite values; Unix ignores
+  share flags. Raises EFCreateError or EFOpenError. }
 function  OpenProtectedFileStream(const APath: string;
-  const AMode: Word): TFileStream;
-{ Replaces AStrings with the file's lines. On Unix the read takes no flock,
-  so a lock inherited by a foreign process (for example an older toolkit
-  binary sharing machine-wide state) cannot make published state unreadable.
-  Raises EFOpenError when the file cannot be opened or read. }
+  const AMode: Word): TLWPTProtectedFileStream;
+{ Replaces AStrings with the file's lines through OpenProtectedFileStream. }
 procedure LoadProtectedStrings(const AStrings: TStrings; const APath: string);
 {$IFDEF UNIX}
 { FpOpen equivalent for lock and marker files. Returns -1, leaving errno set,
@@ -540,7 +551,7 @@ begin
 end;
 
 function CopyFileContent(const ASrc, ADst: string): Boolean;
-var SrcS, DstS: TFileStream;
+var SrcS, DstS: TLWPTProtectedFileStream;
 begin
   Result := False;
   if not FileExists(ASrc) then Exit;
@@ -1351,7 +1362,8 @@ const
   {$ELSE}
   FD_CLOEXEC_LWPT = FD_CLOEXEC;
   {$ENDIF}
-  PROTECTED_READ_CHUNK_BYTES = 4096;
+  { TFileStream.Create's default rights; the process umask still applies. }
+  PROTECTED_CREATE_PERMISSIONS = &666;
 {$ENDIF}
 
 procedure BeginProcessHandleSetup;
@@ -1364,41 +1376,73 @@ begin
   LeaveCriticalSection(ProcessHandleSetupCriticalSection);
 end;
 
-function OpenProtectedFileStream(const APath: string;
-  const AMode: Word): TFileStream;
+destructor TLWPTProtectedFileStream.Destroy;
+begin
+  if Handle <> THandle(-1) then FileClose(Handle);
+  inherited Destroy;
+end;
+
 {$IFDEF UNIX}
-var
-  ErrorCode: Integer;
+function ProtectedOpenFlags(const AMode: Word): LongInt;
+begin
+  if (AMode and fmCreate) = fmCreate then
+    Exit(O_RDWR or O_CREAT or O_TRUNC);
+  case AMode and (fmOpenRead or fmOpenWrite or fmOpenReadWrite) of
+    fmOpenWrite: Result := O_WRONLY;
+    fmOpenReadWrite: Result := O_RDWR;
+  else
+    Result := O_RDONLY;
+  end;
+end;
 {$ENDIF}
+
+function OpenProtectedFileStream(const APath: string;
+  const AMode: Word): TLWPTProtectedFileStream;
+var
+  Handle: THandle;
+  {$IFDEF UNIX}
+  Descriptor, ErrorCode: LongInt;
+  Info: BaseUnix.Stat;
+  {$ENDIF}
 begin
   {$IFDEF UNIX}
-  Result := nil;
-  BeginProcessHandleSetup;
-  try
-    Result := TFileStream.Create(APath, AMode);
-    try
-      {$IFDEF OBJECTSTORE_TESTING}
-      if Assigned(ProtectedOpenBeforeProtectionTestHook) then
-        ProtectedOpenBeforeProtectionTestHook(APath);
-      {$ENDIF}
-      if FpFcntl(Result.Handle, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
-      begin
-        ErrorCode := FpGetErrNo;
-        raise EFOpenError.CreateFmt(
-          'failed to protect "%s" from child inheritance (system error %d)',
-          [APath, ErrorCode]);
-      end;
-    except
-      FreeAndNil(Result);
-      raise;
-    end;
-  finally
-    EndProcessHandleSetup;
+  Descriptor := OpenProtectedDescriptor(APath, ProtectedOpenFlags(AMode),
+    PROTECTED_CREATE_PERMISSIONS);
+  if Descriptor < 0 then
+  begin
+    ErrorCode := FpGetErrNo;
+    if (AMode and fmCreate) = fmCreate then
+      raise EFCreateError.CreateFmt('Unable to create file "%s": %s',
+        [APath, SysErrorMessage(ErrorCode)]);
+    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+      [APath, SysErrorMessage(ErrorCode)]);
   end;
+  { TFileStream refuses directories; keep that contract. }
+  if (FpFStat(Descriptor, Info) <> 0) or FpS_ISDIR(Info.st_mode) then
+  begin
+    FpClose(Descriptor);
+    raise EFOpenError.CreateFmt('Unable to open file "%s": is a directory',
+      [APath]);
+  end;
+  Handle := THandle(Descriptor);
   {$ELSE}
   { Windows file handles are created non-inheritable. }
-  Result := TFileStream.Create(APath, AMode);
+  if (AMode and fmCreate) = fmCreate then
+  begin
+    Handle := FileCreate(APath, AMode and not fmCreate, 438);
+    if Handle = THandle(-1) then
+      raise EFCreateError.CreateFmt('Unable to create file "%s": %s',
+        [APath, SysErrorMessage(GetLastOSError)]);
+  end
+  else
+  begin
+    Handle := FileOpen(APath, AMode);
+    if Handle = THandle(-1) then
+      raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+        [APath, SysErrorMessage(GetLastOSError)]);
+  end;
   {$ENDIF}
+  Result := TLWPTProtectedFileStream.Create(Handle);
 end;
 
 {$IFDEF UNIX}
@@ -1431,43 +1475,20 @@ end;
 {$ENDIF}
 
 procedure LoadProtectedStrings(const AStrings: TStrings; const APath: string);
-{$IFDEF UNIX}
 var
-  BytesRead, Descriptor, TotalBytes: LongInt;
-  Content: RawByteString;
-{$ENDIF}
+  Stream: TLWPTProtectedFileStream;
 begin
-  {$IFDEF UNIX}
-  Descriptor := OpenProtectedDescriptor(APath, O_RDONLY);
-  if Descriptor < 0 then
-    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
-      [APath, SysErrorMessage(FpGetErrNo)]);
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
-    Content := '';
-    TotalBytes := 0;
-    repeat
-      SetLength(Content, TotalBytes + PROTECTED_READ_CHUNK_BYTES);
-      BytesRead := FpRead(Descriptor, Content[TotalBytes + 1],
-        PROTECTED_READ_CHUNK_BYTES);
-      if BytesRead > 0 then
-        Inc(TotalBytes, BytesRead)
-      else if (BytesRead < 0) and (FpGetErrNo <> ESysEINTR) then
-        raise EFOpenError.CreateFmt('Unable to read file "%s": %s',
-          [APath, SysErrorMessage(FpGetErrNo)]);
-    until BytesRead = 0;
-    SetLength(Content, TotalBytes);
+    AStrings.LoadFromStream(Stream);
   finally
-    FpClose(Descriptor);
+    Stream.Free;
   end;
-  AStrings.Text := Content;
-  {$ELSE}
-  AStrings.LoadFromFile(APath);
-  {$ENDIF}
 end;
 
 procedure AtomicWriteText(const ADst: string;
   const ATmpRoot: string; const AContent: TStringList);
-var Tmp: string; Stream: TFileStream;
+var Tmp: string; Stream: TLWPTProtectedFileStream;
 begin
   { The destination name adds no uniqueness and can push a project-local
     staging path past Windows' directory-path ceiling in a deep checkout. }
@@ -1492,7 +1513,7 @@ begin
 end;
 
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
-var Tmp: string; Stream: TFileStream;
+var Tmp: string; Stream: TLWPTProtectedFileStream;
 begin
   Tmp := MakeTmpPath(ATmpRoot, 'write');
   EnsureDstDir(ADst);
@@ -1714,7 +1735,7 @@ end;
 
 function SHA256File(const APath: string): string;
 var
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
 begin
   if not FileExists(APath) then Exit('');
   Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
@@ -1876,7 +1897,7 @@ var
   i, n  : Integer;
   Chunk : TBytes;
   FileBytes : TBytes;
-  FS    : TFileStream;
+  FS    : TLWPTProtectedFileStream;
   FullPath : string;
 begin
   { directory: hash the sorted file tree }
@@ -1897,7 +1918,7 @@ begin
 
         FullPath := NativePath(IncludeTrailingPathDelimiter(APathOrArchive)
           + Files[i]);
-        FS := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
+        FS := OpenProtectedFileStream(FullPath, fmOpenRead or fmShareDenyNone);
         try
           SetLength(FileBytes, FS.Size);
           if FS.Size > 0 then FS.ReadBuffer(FileBytes[0], FS.Size);

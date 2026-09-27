@@ -38,6 +38,7 @@ type
     procedure TestPhysicalSourceAliasIsRejected;
     {$IFDEF UNIX}
     procedure TestMaterializationKeepsChildrenOutOfDestinations;
+    procedure TestProtectedStreamsHoldNoShareLock;
     {$ENDIF}
   end;
 
@@ -320,6 +321,46 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF UNIX}
+{ Close-on-exec only closes a descriptor at exec. A child forked while a
+  destination stream is open still shares it until then, which on macOS was
+  long enough for the next digest or bundle open to meet the stream's flock
+  (#275, reproduced natively with a guarded but flock-taking stream). The
+  protected stream must therefore take no share-mode lock at all. }
+procedure TTestArtifactSetContract.TestProtectedStreamsHoldNoShareLock;
+var
+  Path: string;
+  Stream: TLWPTProtectedFileStream;
+  Handle: THandle;
+  ErrorCode: Integer;
+begin
+  Path := FScratch + '/share-lock/artifact';
+  ForceDirectories(ExtractFileDir(Path));
+  Stream := OpenProtectedFileStream(Path, fmCreate);
+  try
+    Stream.WriteBuffer(Path[1], Length(Path));
+    Handle := FileOpen(Path, fmOpenRead or fmShareDenyWrite);
+    if Handle = THandle(-1) then ErrorCode := GetLastOSError
+    else
+    begin
+      ErrorCode := 0;
+      FileClose(Handle);
+    end;
+    Expect<Integer>(ErrorCode).ToBe(0);
+    Handle := FileOpen(Path, fmOpenReadWrite or fmShareExclusive);
+    if Handle = THandle(-1) then ErrorCode := GetLastOSError
+    else
+    begin
+      ErrorCode := 0;
+      FileClose(Handle);
+    end;
+    Expect<Integer>(ErrorCode).ToBe(0);
+  finally
+    Stream.Free;
+  end;
+end;
+{$ENDIF}
+
 procedure TTestArtifactSetContract.SetupTests;
 begin
   Test('round trip preserves the complete artifact set',
@@ -339,6 +380,8 @@ begin
   {$IFDEF UNIX}
   Test('materialization keeps concurrent children out of destinations',
     TestMaterializationKeepsChildrenOutOfDestinations);
+  Test('protected streams hold no share-mode lock a forked child could share',
+    TestProtectedStreamsHoldNoShareLock);
   {$ENDIF}
 end;
 

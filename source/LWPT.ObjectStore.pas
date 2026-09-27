@@ -105,7 +105,7 @@ function CopyFileContentAndHash(const ASrc, ADst, ADigest: string;
 var
   Buffer: TBytes;
   CopyCompleted: Boolean;
-  Destination, Source: TFileStream;
+  Destination, Source: TLWPTProtectedFileStream;
 begin
   Result := False;
   AHash := '';
@@ -119,9 +119,8 @@ begin
         if Source.Size > 0 then
           Destination.CopyFrom(Source, Source.Size);
         CopyCompleted := True;
-        { TFileStream creates staged files read-write. Read back through the
-          owned handle without a second FPC open; close-on-exec keeps its lock
-          from surviving in a compiler after this process closes the stream. }
+        { The protected stream creates staged files read-write. Read back
+          through the owned handle without a second open. }
       {$IFDEF OBJECTSTORE_TESTING}
         if Assigned(ObjectStoreAfterMaterializeCopyTestHook) then
           ObjectStoreAfterMaterializeCopyTestHook(ADigest, ADst);

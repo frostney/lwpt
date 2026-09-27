@@ -196,7 +196,7 @@ const
   MAX_CONTROL_BYTES = 16 * 1024 * 1024;
 var
   Bytes: TBytes;
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
 begin
   Result := False;
   AText := '';

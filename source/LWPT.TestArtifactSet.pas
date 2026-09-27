@@ -265,7 +265,7 @@ procedure WriteTestArtifactSet(const ABuildRoot, ADestination: string;
   const AArtifacts: TLWPTArtifactArray);
 var
   Artifacts: TLWPTBundledArtifactArray;
-  Bundle, Source: TFileStream;
+  Bundle, Source: TLWPTProtectedFileStream;
   i, j: Integer;
   Magic: RawByteString;
 begin
@@ -324,7 +324,7 @@ end;
 function MaterializeTestArtifactSet(const ABundlePath, ABuildRoot: string;
   out AArtifacts: TLWPTArtifactArray; out AReason: string): Boolean;
 var
-  Bundle, Destination: TFileStream;
+  Bundle, Destination: TLWPTProtectedFileStream;
   Count, ContentLength, Mode: QWord;
   CreatedPaths: TStringList;
   DestinationPath, Kind, Magic, OperationStage, RelativePath: string;

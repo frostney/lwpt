@@ -162,7 +162,7 @@ end;
 function TLWPTBuildCache.ReadSmallTextFile(const APath: string;
   out AText: string): Boolean;
 var
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
   Bytes: TBytes;
 begin
   Result := False;

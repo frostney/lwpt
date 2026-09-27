@@ -657,7 +657,7 @@ end;
 function ReadSmallTextFile(const APath: string; out AText: string): Boolean;
 var
   Bytes: TBytes;
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
 begin
   Result := False;
   AText := '';
