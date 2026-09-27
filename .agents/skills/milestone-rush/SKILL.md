@@ -2,8 +2,8 @@
 name: milestone-rush
 description: >-
   Autonomously completes a confirmed milestone by reconciling existing work,
-  parallelizing independent implementation, converging and merging pull
-  requests, and closing the verified milestone. Use when the user runs
+  coordinating work-item delivery and the configured milestone release, and
+  closing the verified milestone. Use when the user runs
   /milestone-rush for an exact milestone or selects it after /roadmap-review.
 license: Unlicense OR MIT
 compatibility: >-
@@ -15,23 +15,25 @@ compatibility: >-
 
 # Milestone rush
 
-Finish the named milestone from its actual current state. The run owns execution,
-not release publication.
+Finish the named milestone from its actual current state. Own the coordinated
+work-item deliveries and the release at the verified milestone boundary.
 
 ## Authority and gates
 
 - Require an exact repository and milestone. An explicit invocation authorizes
   scoped issue comments and replacement issues, branches and worktrees,
   implementation, validation, commits, plain pushes, pull requests, review
-  remediation, squash merges, branch cleanup, and closing that milestone.
-- Never create a release. After completion, offer `/run-retro` and wait for
-  explicit approval before invoking it.
+  remediation, squash merges, configured integration delivery, the milestone's
+  configured release path, branch cleanup, and closing that milestone.
+- After verified work-item delivery, invoke `/create-release` at the milestone
+  boundary. Reuse the settled release plan and version or deterministic project
+  version policy; ask only for an unresolved material release choice. After
+  completion, offer `/run-retro` and wait for approval before invoking it.
 - Accept either a confirmed `/roadmap-review` handoff or direct invocation. For
   direct invocation, verify current scope, direction, readiness, dependencies,
   and measures of success before executing. Stop for material replanning rather
   than silently changing the milestone.
-- Treat a confirmed roadmap item as the mini-spec for `/implement-idea
-  automatic` only when it states the outcome, scope and non-goals, and
+- Treat a confirmed roadmap item as the mini-spec for `/deliver` only when it states the outcome, scope and non-goals, and
   testable measures of success.
 - Respect project instructions, Definitions of Ready and Done, branch
   protection, review policy, and the remote default branch. Never amend, bypass
@@ -67,7 +69,14 @@ not release publication.
    a plan artifact, not authority to change workflows, labels, rulesets,
    controllers, credentials, or provider configuration. Make a required missing
    capability an explicit repository-owned prerequisite; otherwise document the
-   safe current-CI fallback and its cost.
+   safe current-CI fallback and its cost. File prerequisite issues through
+   `/create-issue automatic`, retaining its evidence and attribution gates in
+   any delegated packet. If those gates block posting, record the prerequisite
+   in the ignored checkpoint without claiming an issue was created. A delegation
+   request is not completion: inspect the returned result and verify the issue
+   URL, repository and intended prerequisite before reporting it as filed. If
+   the worker stops or its result is uncertain, reconcile GitHub and the
+   checkpoint before retrying so an accepted write is not duplicated.
 6. Build a dependency and likely-conflict graph. A native stack may represent a
    true dependency chain or a confirmed logical decomposition of one large
    issue, provided each layer is independently reviewable. Prioritize the
@@ -87,23 +96,23 @@ not release publication.
    graph state, worker admission and replacement, delivery-state promotion,
    integration, merge, and milestone closure. Detailed investigation,
    implementation, remediation, and validation belong to bounded workers.
-2. Give each worker one context-isolated task packet and its dependencies. Use
-   `/implement-issue automatic` for an issue or `/implement-idea automatic` for
-   a confirmed unfiled roadmap item. In either workflow, replace its required
-   pre-PR review with `/code-review subagents fix-all`; this is a milestone-rush
-   default, not a change to standalone implementation workflows. Automatic mode
-   selects the evidence-backed recommendation but never resolves material
-   ambiguity, risk, or vision conflict on the user's behalf.
+2. Give each worker one context-isolated task packet and its dependencies.
+   Use `/deliver` with the issue or confirmed roadmap item, required endpoint,
+   configured integration destination and applicable evidence. Pass the selected
+   approach so `/implement` need not reopen it. Retain this workflow's
+   `/code-review subagents fix-all` review default in the packet. A work item
+   defaults to its
+   configured integration delivery; the milestone owns shared sequencing and
+   release publication. Material choices remain with the user.
 3. Adopt an existing PR when it satisfies the issue and project gates. Adopt
    relevant local state only when its ownership and scope are clear; preserve
    ambiguous, dirty, pre-existing, or unrelated state and report it.
-4. Let the implementation workflow validate, review, and hand off through
-   `/create-pr`. As each ordinary PR becomes ready, run `/address-pr-feedback
-   automatic-merge`. For a native stack, invoke `/address-stack-feedback
-   <stack-number>` once for the stack identity. Accept only its exact-topology,
-   exact-head whole-stack `ready` result; then recheck that same snapshot and
-   atomically merge the complete ready stack through `git-workflow`. Never
-   merge a prefix beneath a required top fix layer.
+4. Let each `/deliver` own its implementation, publication, feedback and
+   integration loop. Reconcile returned revision, behavior, PR and destination
+   evidence before promoting its work item. Give a native dependency stack one
+   delivery owner for its complete readiness and atomic merge; never give
+   competing workers authority over the same stack or merge a partial prefix
+   beneath a required fix layer.
 5. Keep remediation validation focused on the changed behavior. Run the
    repository's complete local gate once only after implementation and bounded
    review fixes converge on the intended head, unless a new material source
@@ -131,7 +140,7 @@ not release publication.
    blockers.
 
 Manage implementation and review workers within the host's shared capacity.
-Keep implementation nodes running while useful work remains, and queue review
+Keep implementation nodes running while useful work remains, and queue
 review-axis lanes until slots free up; temporary slot exhaustion is not
 sub-agent unavailability. If review sub-agents are unsupported, remain
 unavailable after bounded retry, or return incomplete evidence, the
@@ -166,11 +175,27 @@ spawning; never substitute model heartbeats.
   ambiguous counter streams, silent null usage/resource fields, or absent
   command/CI identities block closure until corrected or explicitly marked
   unavailable under the schema.
-- Close the milestone only after that integrated gate passes. Remove only clean,
-  merged worktrees created by this run; preserve and report every other
-  worktree.
+- After the work-item and integrated gates pass, invoke `/create-release`
+  with the milestone's release authority, settled version or version policy,
+  and current evidence. It owns release preparation and publication through the
+  configured release path. A pending or failed required release keeps milestone
+  delivery active. A project with no release path requires a concrete decision,
+  not an invented publisher or an assumed successful release.
+- Close the milestone only after its required release outcome is verified.
+  Remove only clean, merged worktrees created by this run; preserve and report
+  every other worktree.
 
 ## Report
+
+Match each completion claim to a returned result for that specific action and
+target. Release success does not confirm cleanup or message delivery. Sending a
+retrospective question and receiving an acknowledgment does not establish that
+it was queued: ask it directly in the report or describe it as requested unless
+delivery was confirmed. Verify required outcomes; omit optional unconfirmed
+claims or label them unconfirmed, without implying failure. Apply this to the
+whole report, including tables and
+parenthetical remarks; see [agent-writing](../agent-writing/SKILL.md) for shared
+writing guidance.
 
 Return one audit-style summary covering:
 
@@ -186,6 +211,7 @@ Return one audit-style summary covering:
   telemetry fields;
 - validation and reviewer evidence for final PR heads and integrated default;
 - required additions, deferred follow-ups, blockers, and remaining work;
+- integration destinations, release result and revision/artifact evidence;
 - cleanup or preserved state and milestone closure status.
 
 If the milestone closed, ask whether to run `/run-retro`. Do not invoke it

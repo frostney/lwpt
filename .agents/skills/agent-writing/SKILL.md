@@ -1,11 +1,8 @@
 ---
 name: agent-writing
 description: >-
-  Applies the user's ambient writing rules to agent-authored chat, status,
-  review, issue, pull-request, engineering-documentation, and retrospective
-  prose. Use whenever an agent communicates progress, decisions, findings, or
-  outcomes to a person. Do not use it to govern application-generated or
-  branded product output.
+  Write clear, concise agent replies and engineering artifacts while
+  preserving evidence, decisions, and required detail.
 license: Unlicense OR MIT
 ---
 
@@ -46,6 +43,9 @@ do not follow this guide.
   retrospective, or another durable multi-paragraph artifact, read
   [references/generated-writing-patterns.md](references/generated-writing-patterns.md).
 
+For PR titles and bodies, also read
+[references/pr-descriptions.md](references/pr-descriptions.md).
+
 Use length thresholds as revision triggers, never as targets to fill. There is
 no minimum length.
 
@@ -57,8 +57,8 @@ no minimum length.
 - Revise a final handoff over 250 words. Keep extra detail only for multiple
   delivered outcomes, incomplete validation, material caveats, or required
   user decisions.
-- Keep each review reply and each retrospective impact item at 300 characters
-  or fewer.
+- Keep review replies concise while preserving the disposition, supporting
+  evidence, required attribution, and any unresolved action.
 - Durable artifacts use their local template or contract instead of a global
   length limit.
 
@@ -75,6 +75,14 @@ for reader effort.
   partial, name the evidence and limit the claim.
 - Do not present planned, proposed, partial, or unreleased behavior as shipped.
   Name its actual lifecycle state and owner.
+- Check each completion claim against the returned result or an authoritative
+  state observation. Success of the main operation does not confirm every
+  requested side effect: a merge does not establish branch deletion, and sending
+  a question does not establish queue delivery. Request arguments, defaults and
+  acknowledgments describe intent, not the resulting state. For a required
+  outcome, obtain the missing confirmation; otherwise omit the claim or mark
+  that action unconfirmed. Do not infer that it failed either. Apply this check
+  to summaries, tables and parenthetical remarks as well as the main verdict.
 - Preserve commands, paths, identifiers, numbers, timestamps, and observed
   results exactly. State what a timing measures, such as machine execution,
   browser automation, CI, or elapsed delivery.
@@ -134,22 +142,16 @@ Never use an em dash or the standalone words `seam`, `seams`, `honest`,
 - Use code formatting for commands, paths, filenames, identifiers, input, and
   literal output.
 
-## Revise before sending
+## Revise where it helps
 
-Before sending any response, answer these questions and revise when one fails:
+Check substantial or sensitive drafts for unsupported claims, lost decisions,
+unclear wording, and missing validation or artifact locations. Scale revision to
+the response; a short factual answer does not need a separate checklist pass.
+Length thresholds prompt judgment, not an automatic additional revision.
 
-1. Did I answer or report the outcome first?
-2. Is every factual claim current, source-backed, and limited to what the
-   evidence proves?
-3. Did I preserve the user's argument, settled decisions, and requested scope?
-4. Can I remove jargon, process narration, repetition, or formatting without
-   losing a material surface?
-5. Are validation results, caveats, next actions, and artifact locations exact?
-
-If the applicable length threshold is crossed, revise once more before sending.
-
-When editing this suite's Markdown, run
-`python3 agent-writing/scripts/check_prose.py` from the repository root.
+When editing this suite's Markdown, run `python3 scripts/check_prose.py`; the
+script path is relative to this skill directory. In a project install it checks
+only the skills that `skills-lock.json` records from this suite's source.
 
 Source guidance: [Google developer documentation style
 guide](https://developers.google.com/style) and [Cursor Unslop
