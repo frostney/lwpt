@@ -279,7 +279,7 @@ var
   Man : TManifest;
   Files, ExplicitIncludeSet, ExcludeSet, FinalFiles : TStringList;
   ProtectedRoots : TStringList;
-  i, Changed : Integer;
+  i, Changed, Skipped : Integer;
   Path, ProtectedCfgFile, SkipReason : string;
   RunMode : TRunMode;
 
@@ -376,6 +376,7 @@ begin
     end;
 
     Changed := 0;
+    Skipped := 0;
     for i := 0 to FinalFiles.Count - 1 do
       if FormatFile(FinalFiles[i], RunMode, SkipReason) then
       begin
@@ -388,9 +389,11 @@ begin
       end
       else if SkipReason <> '' then
       begin
-        { Not lexically valid Pascal: left untouched rather than guessed at. }
+        { Not lexically valid Pascal: left untouched rather than guessed
+          at, and never counted as correctly formatted. }
+        Inc(Skipped);
         if ACheckOnly then
-          WriteCommandResultLine('  left unformatted: ' + SkipReason)
+          WriteCommandResultLine('  could not check: ' + SkipReason)
         else
           WriteLn('  left unformatted: ', SkipReason);
       end;
@@ -401,24 +404,30 @@ begin
       if ExcludeSet.Count > 0 then
         WriteCommandResultLine(IntToStr(ExcludeSet.Count)
           + ' file(s) skipped via [format] exclude');
+      if Skipped > 0 then
+        WriteCommandResultLine(IntToStr(Skipped) + ' of '
+          + IntToStr(FinalFiles.Count)
+          + ' file(s) could not be checked: not lexically valid Pascal');
       if Changed > 0 then
-      begin
         WriteCommandResultLine(IntToStr(Changed) + ' of '
           + IntToStr(FinalFiles.Count) + ' file(s) need formatting');
-        Result := 1;
-      end
-      else
+      if (Changed = 0) and (Skipped = 0) then
       begin
         WriteCommandResultLine(IntToStr(FinalFiles.Count)
           + ' file(s) checked — all correctly formatted');
         Result := 0;
-      end;
+      end
+      else
+        Result := 1;
     end
     else
     begin
       WriteLn;
       if ExcludeSet.Count > 0 then
         WriteLn(ExcludeSet.Count, ' file(s) skipped via [format] exclude');
+      if Skipped > 0 then
+        WriteLn(Skipped, ' of ', FinalFiles.Count,
+                ' file(s) left unformatted: not lexically valid Pascal');
       WriteLn(Changed, ' of ', FinalFiles.Count,
               ' file(s) formatted');
       Result := 0;

@@ -178,6 +178,9 @@ type
     procedure Replace(const AIndex: Integer; const ANewText: string);
     procedure RemoveSpacesBefore(const AIndex, ACount: Integer);
     procedure ApplyEdits;
+    function LineText(const AIndex: Integer): string;
+    function SourceSpan(const AFirst, ALast: Integer): string;
+    procedure Rebind(const ALines: TStringList);
   end;
 
 constructor TSourceTokens.Create(const ALines: TStringList;
@@ -214,14 +217,18 @@ end;
 
 { Exact match against a keyword (lower case) or a symbol. }
 function TSourceTokens.IsText(const AIndex: Integer; const AText: string): Boolean;
+var
+  Wanted: TLWPTPascalTokenKind;
 begin
-  if (AIndex < 0) or (AIndex >= Length(FTokens)) or
-     (FTokens[AIndex].Text <> AText) then
+  if (AIndex < 0) or (AIndex >= Length(FTokens)) then
     Exit(False);
+  { The kind check first: most tokens are identifiers, and it spares
+    them the string comparison. }
   if AText[1] in ['a'..'z'] then
-    Result := FTokens[AIndex].Kind = ptKeyword
+    Wanted := ptKeyword
   else
-    Result := FTokens[AIndex].Kind = ptSymbol;
+    Wanted := ptSymbol;
+  Result := (FTokens[AIndex].Kind = Wanted) and (FTokens[AIndex].Text = AText);
 end;
 
 { An identifier-shaped token. The tokenizer's keyword list includes
@@ -368,6 +375,26 @@ begin
   FSpacesBefore[AIndex] := ACount;
 end;
 
+{ The line holding the token. }
+function TSourceTokens.LineText(const AIndex: Integer): string;
+begin
+  Result := FLines[LineIndex(AIndex)];
+end;
+
+{ The source text from the first token through the last, which must share
+  a line. }
+function TSourceTokens.SourceSpan(const AFirst, ALast: Integer): string;
+begin
+  Result := Copy(FLines[LineIndex(AFirst)], Column(AFirst),
+    Column(ALast) + FTokens[ALast].Length - Column(AFirst));
+end;
+
+{ Points the tokens at a line list holding exactly the same text. }
+procedure TSourceTokens.Rebind(const ALines: TStringList);
+begin
+  FLines := ALines;
+end;
+
 procedure TSourceTokens.ApplyEdits;
 var
   TokenIndex, CurrentLine, EditColumn: Integer;
@@ -430,9 +457,16 @@ begin
   Result := True;
 end;
 
-(* For each line that starts a formattable uses clause, the line of its
-   terminating semicolon; -1 elsewhere. AVerbatim marks clauses that are
-   emitted exactly as written.
+type
+  { A uses clause the formatter may regroup, keyed by its first line. }
+  TUsesClause = record
+    EndLine: Integer;      { line of the terminating semicolon; -1: none }
+    Verbatim: Boolean;     { emit the lines exactly as written }
+    Units: array of string;
+  end;
+  TUsesClauseArray = array of TUsesClause;
+
+(* The uses clause starting on each line, if any.
 
    The clause starts where `uses` is the first thing on its line. It is
    formattable only when a code-level semicolon closes it with nothing
@@ -441,117 +475,108 @@ end;
    comment is emitted verbatim: reordering across an $IFDEF changes which
    units a build sees, and a comment inside the clause exists to pin a
    position ("cthreads must come first so TThread has a driver"). The
-   same holds for a comment behind the terminating semicolon. *)
-function FindUsesClauses(const ALines: TStringList;
-  out AVerbatim: TLineIndexArray): TLineIndexArray;
+   same holds for a comment behind the terminating semicolon, and for a
+   unit entry that spans lines. Entries are split at comma tokens, so a
+   comma inside an `in 'path'` string stays in its entry. *)
+function FindUsesClauses(const ASource: TSourceTokens;
+  const ALineCount: Integer): TUsesClauseArray;
 var
-  Source: TSourceTokens;
-  TokenIndex, Terminator, Scan, StartLine: Integer;
-  Verbatim: Boolean;
+  TokenIndex, Terminator, Scan, StartLine, EntryStart, UnitCount: Integer;
+  Clause: TUsesClause;
 begin
   Result := nil;
-  AVerbatim := nil;
-  SetLength(Result, ALines.Count);
-  SetLength(AVerbatim, ALines.Count);
-  for StartLine := 0 to ALines.Count - 1 do
+  SetLength(Result, ALineCount);
+  for StartLine := 0 to ALineCount - 1 do
+    Result[StartLine].EndLine := -1;
+
+  for TokenIndex := 0 to ASource.Count - 1 do
   begin
-    Result[StartLine] := -1;
-    AVerbatim[StartLine] := 0;
-  end;
+    if not ASource.IsText(TokenIndex, 'uses') or not ASource.StartsLine(TokenIndex) then
+      Continue;
+    Terminator := TokenIndex + 1;
+    while (Terminator < ASource.Count) and IsUsesClauseToken(ASource, Terminator) do
+      Inc(Terminator);
+    if not ASource.IsText(Terminator, ';') then
+      Continue;
+    if (Terminator + 1 < ASource.Count) and
+       (ASource.LineIndex(Terminator + 1) = ASource.LineIndex(Terminator)) then
+      Continue;
 
-  Source := TSourceTokens.Create(ALines, '');
-  try
-    for TokenIndex := 0 to Source.Count - 1 do
-    begin
-      if not Source.IsText(TokenIndex, 'uses') or not Source.StartsLine(TokenIndex) then
-        Continue;
-      Terminator := TokenIndex + 1;
-      while (Terminator < Source.Count) and IsUsesClauseToken(Source, Terminator) do
-        Inc(Terminator);
-      if not Source.IsText(Terminator, ';') then
-        Continue;
-      if (Terminator + 1 < Source.Count) and
-         (Source.LineIndex(Terminator + 1) = Source.LineIndex(Terminator)) then
-        Continue;
+    Clause := Default(TUsesClause);
+    Clause.EndLine := ASource.LineIndex(Terminator);
+    Clause.Verbatim := not ASource.EndsLine(Terminator);
+    for Scan := TokenIndex to Terminator - 1 do
+      if ASource.IsDirective(Scan) or not ASource.OnlyBlanksBetween(Scan, Scan + 1) then
+        Clause.Verbatim := True;
 
-      Verbatim := not Source.EndsLine(Terminator);
-      for Scan := TokenIndex to Terminator - 1 do
-        if Source.IsDirective(Scan) or not Source.OnlyBlanksBetween(Scan, Scan + 1) then
-          Verbatim := True;
+    UnitCount := 0;
+    EntryStart := TokenIndex + 1;
+    for Scan := TokenIndex + 1 to Terminator do
+      if ASource.IsText(Scan, ',') or (Scan = Terminator) then
+      begin
+        if Scan > EntryStart then
+        begin
+          if ASource.LineIndex(EntryStart) <> ASource.LineIndex(Scan - 1) then
+            Clause.Verbatim := True;
+          SetLength(Clause.Units, UnitCount + 1);
+          Clause.Units[UnitCount] := ASource.SourceSpan(EntryStart, Scan - 1);
+          Inc(UnitCount);
+        end;
+        EntryStart := Scan + 1;
+      end;
+    if UnitCount = 0 then
+      Clause.Verbatim := True;
 
-      StartLine := Source.LineIndex(TokenIndex);
-      Result[StartLine] := Source.LineIndex(Terminator);
-      AVerbatim[StartLine] := Ord(Verbatim);
-    end;
-  finally
-    Source.Free;
+    Result[ASource.LineIndex(TokenIndex)] := Clause;
   end;
 end;
 
-procedure FormatUsesInLines(const AInput: TStringList; const AOutput: TStringList);
+{ Rewrites AInput into AOutput with each formattable uses clause grouped
+  and sorted. ASource is the tokenized AInput. }
+procedure FormatUsesInLines(const AInput: TStringList; const ASource: TSourceTokens;
+  const AOutput: TStringList);
 var
-  I, J, K: Integer;
-  UsesContent: string;
+  I, K: Integer;
+  Clauses: TUsesClauseArray;
   Units, Formatted: TStringList;
-  ClauseEnds, Verbatim: TLineIndexArray;
 begin
-  ClauseEnds := FindUsesClauses(AInput, Verbatim);
+  Clauses := FindUsesClauses(ASource, AInput.Count);
   I := 0;
   while I < AInput.Count do
   begin
-    J := ClauseEnds[I];
-    if J < 0 then
+    if Clauses[I].EndLine < 0 then
     begin
       AOutput.Add(AInput[I]);
       Inc(I);
       Continue;
     end;
 
-    if Verbatim[I] <> 0 then
+    if Clauses[I].Verbatim then
     begin
-      for K := I to J do
+      for K := I to Clauses[I].EndLine do
         AOutput.Add(AInput[K]);
-      I := J + 1;
+      I := Clauses[I].EndLine + 1;
       Continue;
     end;
 
-    UsesContent := Trim(Copy(Trim(AInput[I]), 5, MaxInt));
-    for K := I + 1 to J do
-      UsesContent := UsesContent + ' ' + Trim(AInput[K]);
-
     Units := TStringList.Create;
     try
-      while Pos(',', UsesContent) > 0 do
-      begin
-        Units.Add(Trim(Copy(UsesContent, 1, Pos(',', UsesContent) - 1)));
-        UsesContent := Trim(Copy(UsesContent, Pos(',', UsesContent) + 1, Length(UsesContent)));
+      for K := 0 to High(Clauses[I].Units) do
+        Units.Add(Clauses[I].Units[K]);
+      Formatted := FormatUsesClause(Units);
+      try
+        AOutput.Add('uses');
+        AOutput.AddStrings(Formatted);
+      finally
+        Formatted.Free;
       end;
-      UsesContent := Trim(UsesContent);
-      if (Length(UsesContent) > 0) and (UsesContent[Length(UsesContent)] = ';') then
-        UsesContent := Trim(Copy(UsesContent, 1, Length(UsesContent) - 1));
-      if UsesContent <> '' then
-        Units.Add(UsesContent);
-
-      if Units.Count > 0 then
-      begin
-        Formatted := FormatUsesClause(Units);
-        try
-          AOutput.Add('uses');
-          AOutput.AddStrings(Formatted);
-        finally
-          Formatted.Free;
-        end;
-      end
-      else
-        for K := I to J do
-          AOutput.Add(AInput[K]);
     finally
       Units.Free;
     end;
-
-    I := J + 1;
+    I := Clauses[I].EndLine + 1;
   end;
 end;
+
 
 { ═══════════════════════════════════════════════════════════════════════════
   Routine Index
@@ -569,11 +594,21 @@ type
     Parent: Integer;           { enclosing routine, or -1 }
     FirstChild: Integer;
     NextSibling: Integer;
-    Key: string;               { groups a declaration with its implementation }
+    Key: string;               { the qualified name: `tfoo.bar` or `bar` }
+    NameGroup: string;         { Key within its enclosing routine }
+    Group: string;             { NameGroup with the parameter signature }
     Body: TRoutineBody;
     HasParameterList: Boolean;
-    { Reached another header across a conditional directive before any
-      body: the two may be alternative headers of one routine. }
+    ParameterTokens: array of Integer;  { each parameter name, in order }
+    { A conditional or include directive inside the parameter list: the
+      declared parameters depend on text the formatter cannot settle. }
+    UncertainParameters: Boolean;
+    Signature: string;         { modifier and type of each parameter }
+    { The header reached from another across a conditional directive, or
+      NoRoutine. }
+    CrossedFrom: Integer;
+    { This header and one reached from it across a conditional directive
+      share one body: alternative headers of one routine. }
     ConditionalHeader: Boolean;
   end;
 
@@ -591,11 +626,13 @@ type
      the block's closing directive so every alternative body belongs to
      the routine.
 
-     Key joins a declaration with its implementation: `tfoo.bar` for a
-     method (from `TFoo.Bar` or from `Bar` declared inside `TFoo`) and
-     the bare name otherwise. FPC rejects an implementation whose
-     parameter names differ from its declaration's, so a rename is
-     applied to every header of a key or to none. *)
+     Group joins a declaration with its implementation: the qualified
+     name (`tfoo.bar` from `TFoo.Bar` or from `Bar` declared inside
+     `TFoo`, the bare name otherwise), the routine body it is nested in,
+     and the modifier and type of each parameter, which tell overloads
+     apart. FPC rejects an implementation whose parameter names differ
+     from its declaration's, so a rename is applied to every header of a
+     group or to none. *)
 
   { One header still looking for its body. }
   TParseFrame = record
@@ -617,24 +654,31 @@ type
     function AddRoutine(const AStartToken, AParent: Integer;
       const AQualifier: string): Integer;
     function CompositeName(const AIndex: Integer): string;
-    function CompositeOpening(const AIndex: Integer): Boolean;
     function EndsDeclarationList(const AIndex: Integer): Boolean;
     function ExtendConditionalBody(const AHeaderEnd, ABodyEnd: Integer): Integer;
     function FindHeaderEnd(const AStartToken: Integer): Integer;
-    function MatchingClose(const AOpenToken: Integer): Integer;
     function ParseRoutines(const AStartToken: Integer; const AQualifier: string): Integer;
+    procedure ReadParameters(var AHeader: TRoutineHeader; const AOpenToken: Integer);
+    procedure ResolveGroups;
   public
     constructor Create(const ASource: TSourceTokens);
     function Count: Integer;
     function Routine(const AIndex: Integer): TRoutineHeader;
     function IsRoutineHeaderAt(const AIndex: Integer): Boolean;
+    function CompositeOpening(const AIndex: Integer): Boolean;
     function FindBlockEnd(const AStartToken: Integer): Integer;
+    function MatchingClose(const AOpenToken: Integer): Integer;
   end;
 
 const
   NoRoutine = -1;
   { Blocks every parameter of a routine key; never a Pascal name. }
   AllNames = '*';
+
+function IsModifier(const AWord: string): Boolean;
+begin
+  Result := (AWord = 'const') or (AWord = 'var') or (AWord = 'out') or (AWord = 'constref');
+end;
 
 constructor TRoutineIndex.Create(const ASource: TSourceTokens);
 var
@@ -666,6 +710,120 @@ begin
       Dec(Depth);
     Inc(TokenIndex);
   end;
+  ResolveGroups;
+end;
+
+{ Group keys need every header's body kind, so they are settled after
+  parsing. A routine's enclosing routine is the nearest one with a body:
+  a declaration-only header only chains to its siblings in an interface
+  section or a type. }
+procedure TRoutineIndex.ResolveGroups;
+var
+  RoutineIndex, Enclosing, Source: Integer;
+begin
+  for RoutineIndex := 0 to FCount - 1 do
+  begin
+    Enclosing := FRoutines[RoutineIndex].Parent;
+    while (Enclosing <> NoRoutine) and (FRoutines[Enclosing].Body <> rbBody) do
+      Enclosing := FRoutines[Enclosing].Parent;
+    FRoutines[RoutineIndex].NameGroup :=
+      FRoutines[RoutineIndex].Key + '@' + IntToStr(Enclosing);
+    FRoutines[RoutineIndex].Group := FRoutines[RoutineIndex].NameGroup +
+      '(' + FRoutines[RoutineIndex].Signature + ')';
+
+    { Alternative headers: the later one owns the body the earlier one
+      never found. Independent headers that merely sit on either side of
+      a directive each keep their own outcome. }
+    Source := FRoutines[RoutineIndex].CrossedFrom;
+    if (Source <> NoRoutine) and (FRoutines[RoutineIndex].Body = rbBody) and
+       (FRoutines[Source].Body = rbDeclaration) then
+    begin
+      FRoutines[RoutineIndex].ConditionalHeader := True;
+      FRoutines[Source].ConditionalHeader := True;
+    end;
+  end;
+end;
+
+(* Reads the parameter list opened at AOpenToken: the token of each
+   parameter name, and a signature of each parameter's modifier and type
+   (defaults dropped, since an implementation may omit them). *)
+procedure TRoutineIndex.ReadParameters(var AHeader: TRoutineHeader;
+  const AOpenToken: Integer);
+var
+  Close, TokenIndex, Depth, GroupNames: Integer;
+  InNames, InDefault, GroupStart: Boolean;
+  Modifier, TypeText: string;
+
+  procedure FinishGroup;
+  var
+    NameIndex: Integer;
+  begin
+    for NameIndex := 1 to GroupNames do
+      AHeader.Signature := AHeader.Signature + Modifier + ':' + TypeText + ';';
+    GroupNames := 0;
+    Modifier := '';
+    TypeText := '';
+    InNames := True;
+    InDefault := False;
+    GroupStart := True;
+  end;
+
+begin
+  Close := MatchingClose(AOpenToken);
+  Depth := 0;
+  GroupNames := 0;
+  Modifier := '';
+  TypeText := '';
+  InNames := True;
+  InDefault := False;
+  GroupStart := True;
+  for TokenIndex := AOpenToken + 1 to Close - 1 do
+  begin
+    if FSource.IsDirective(TokenIndex) then
+    begin
+      if FSource.IsConditionalDirective(TokenIndex) or
+         FSource.IsIncludeDirective(TokenIndex) then
+        AHeader.UncertainParameters := True;
+      Continue;
+    end;
+    if (Depth = 0) and FSource.IsText(TokenIndex, ';') then
+    begin
+      FinishGroup;
+      Continue;
+    end;
+    if FSource.IsText(TokenIndex, '(') or FSource.IsText(TokenIndex, '[') then
+      Inc(Depth)
+    else if FSource.IsText(TokenIndex, ')') or FSource.IsText(TokenIndex, ']') then
+      Dec(Depth);
+    if (Depth = 0) and FSource.IsText(TokenIndex, '=') then
+      InDefault := True;
+    if InDefault then
+      Continue;
+    if InNames and (Depth = 0) then
+    begin
+      if FSource.IsText(TokenIndex, ':') then
+      begin
+        InNames := False;
+        Continue;
+      end;
+      if FSource.IsText(TokenIndex, ',') or not FSource.IsName(TokenIndex) then
+        Continue;
+      if GroupStart and IsModifier(FSource.Text(TokenIndex)) and
+         FSource.IsName(TokenIndex + 1) then
+      begin
+        Modifier := FSource.Text(TokenIndex);
+        GroupStart := False;
+        Continue;
+      end;
+      GroupStart := False;
+      SetLength(AHeader.ParameterTokens, Length(AHeader.ParameterTokens) + 1);
+      AHeader.ParameterTokens[High(AHeader.ParameterTokens)] := TokenIndex;
+      Inc(GroupNames);
+    end
+    else
+      TypeText := TypeText + ' ' + FSource.Text(TokenIndex);
+  end;
+  FinishGroup;
 end;
 
 function TRoutineIndex.Count: Integer;
@@ -849,9 +1007,11 @@ begin
 end;
 
 { A body that ends inside an open conditional block is one alternative;
-  the routine's extent then runs to the block's closing directive. A
-  routine header before that point means the block is not a set of
-  alternative bodies, and the extent stays at the first body. }
+  the routine's extent then runs to the block's closing directive. Only
+  directives, semicolons and further bodies may lie in between: anything
+  else (a declaration, a routine header) means the block is not a set of
+  alternative bodies, and the extent stays at the first body. The
+  routine's directives then do not balance, and no rename touches it. }
 function TRoutineIndex.ExtendConditionalBody(const AHeaderEnd, ABodyEnd: Integer): Integer;
 var
   Depth, TokenIndex: Integer;
@@ -865,7 +1025,12 @@ begin
   TokenIndex := ABodyEnd;
   while (TokenIndex < FSource.Count) and (Depth > 0) do
   begin
-    if IsRoutineHeaderAt(TokenIndex) then
+    if FSource.IsText(TokenIndex, 'begin') or FSource.IsText(TokenIndex, 'asm') then
+    begin
+      TokenIndex := FindBlockEnd(TokenIndex);
+      Continue;
+    end;
+    if not FSource.IsDirective(TokenIndex) and not FSource.IsText(TokenIndex, ';') then
       Exit;
     Inc(Depth, FSource.ConditionalDelta(TokenIndex));
     Inc(TokenIndex);
@@ -890,6 +1055,7 @@ begin
   Header.NextSibling := NoRoutine;
   Header.NameToken := -1;
   Header.Body := rbDeclaration;
+  Header.CrossedFrom := NoRoutine;
 
   Segments := TStringList.Create;
   try
@@ -906,6 +1072,7 @@ begin
         if FSource.IsText(TokenIndex, '(') then
         begin
           Header.HasParameterList := True;
+          ReadParameters(Header, TokenIndex);
           Break;
         end;
         if FSource.IsText(TokenIndex, ':') or FSource.IsText(TokenIndex, ';') then
@@ -1018,10 +1185,7 @@ begin
             Crossed := True;
         Push(TokenIndex, Current, Frames[Top].Qualifier, True);
         if Crossed then
-        begin
-          FRoutines[Current].ConditionalHeader := True;
-          FRoutines[Frames[Top].Routine].ConditionalHeader := True;
-        end;
+          FRoutines[Frames[Top].Routine].CrossedFrom := Current;
         Continue;
       end;
       if FSource.IsText(TokenIndex, 'begin') or FSource.IsText(TokenIndex, 'asm') then
@@ -1072,11 +1236,6 @@ type
   end;
   TRenamePairArray = array of TRenamePair;
 
-function IsModifier(const AWord: string): Boolean;
-begin
-  Result := (AWord = 'const') or (AWord = 'var') or (AWord = 'out') or (AWord = 'constref');
-end;
-
 function HasAPrefix(const AName: string): Boolean;
 begin
   Result := (Length(AName) > 1) and (AName[1] = 'A') and (AName[2] in ['A'..'Z']);
@@ -1099,30 +1258,30 @@ begin
   Result := False;
 end;
 
+
 { ═══════════════════════════════════════════════════════════════════════════
   Auto-Fix: PascalCase Function Names
   ═══════════════════════════════════════════════════════════════════════════ }
 
-function FixFuncNames(const ALines: TStringList): Boolean;
+{ Records the function-name fix: every code reference to a routine whose
+  name starts lower-case takes the declared spelling with a capital.
+  Assembler blocks are skipped. The edits change case only, so every
+  later pass reads the same token positions. }
+procedure FixFuncNames(const ASource: TSourceTokens; const AIndex: TRoutineIndex);
 var
-  Source: TSourceTokens;
-  Index: TRoutineIndex;
   Names: TNameMap;
   RoutineIndex, TokenIndex: Integer;
   Header: TRoutineHeader;
   Name, NewName: string;
 begin
-  Result := False;
-  Source := TSourceTokens.Create(ALines, '');
-  Index := TRoutineIndex.Create(Source);
   Names := TNameMap.Create;
   try
-    for RoutineIndex := 0 to Index.Count - 1 do
+    for RoutineIndex := 0 to AIndex.Count - 1 do
     begin
-      Header := Index.Routine(RoutineIndex);
+      Header := AIndex.Routine(RoutineIndex);
       if (Header.Body = rbExternal) or (Header.NameToken < 0) then
         Continue;
-      Name := Source.Spelling(Header.NameToken);
+      Name := ASource.Spelling(Header.NameToken);
       if (Name[1] in ['a'..'z']) and not Names.ContainsKey(LowerCase(Name)) then
         Names.Add(LowerCase(Name), UpCase(Name[1]) + Copy(Name, 2, MaxInt));
     end;
@@ -1130,26 +1289,20 @@ begin
       Exit;
 
     TokenIndex := 0;
-    while TokenIndex < Source.Count do
+    while TokenIndex < ASource.Count do
     begin
-      if Source.IsText(TokenIndex, 'asm') then
+      if ASource.IsText(TokenIndex, 'asm') then
       begin
-        TokenIndex := Index.FindBlockEnd(TokenIndex);
+        TokenIndex := AIndex.FindBlockEnd(TokenIndex);
         Continue;
       end;
-      if Source.IsName(TokenIndex) and not Source.IsText(TokenIndex - 1, '.') and
-         Names.TryGetValue(Source.Text(TokenIndex), NewName) then
-      begin
-        Source.Replace(TokenIndex, NewName);
-        Result := True;
-      end;
+      if ASource.IsName(TokenIndex) and not ASource.IsText(TokenIndex - 1, '.') and
+         Names.TryGetValue(ASource.Text(TokenIndex), NewName) then
+        ASource.Replace(TokenIndex, NewName);
       Inc(TokenIndex);
     end;
-    Source.ApplyEdits;
   finally
     Names.Free;
-    Index.Free;
-    Source.Free;
   end;
 end;
 
@@ -1158,24 +1311,33 @@ end;
   ═══════════════════════════════════════════════════════════════════════════ }
 
 type
+  { How a routine's own header or declaration part uses a name, in rising
+    order of concern. }
+  TMention = (mnNone, mnReference, mnBinding, mnUncertain);
+
   (* Plans the parameter A-prefix fix over one file. A parameter is renamed
      in every header of its routine and in the bodies those headers own,
-     or nowhere. Binding is established conservatively; a routine is left
-     untouched when:
-       - any of its headers is external (out of scope), or it contains
+     or nowhere. Binding is established conservatively; a parameter is
+     left as it is when:
+       - a header of its routine is external (out of scope), contains
          assembler, whose operands the formatter cannot tell from
-         registers, or an include directive, whose file it cannot see;
-       - its conditional directives do not balance within its extent,
-         a header has alternatives in conditional branches, or a
-         directive sits inside a parameter list;
-       - the old name appears in its own declaration part (a record
-         field, an `absolute` alias) or names a nested routine, or a
-         parameter is spelled like its routine;
-       - the new name already appears anywhere the parameter is visible;
+         registers, or an include directive, whose text it cannot see;
+       - its routine's conditional directives do not balance, its headers
+         are alternatives in conditional branches, or a conditional or
+         include directive sits inside a parameter list;
+       - the old name is used in a header other than as a parameter (a
+         type of the same name), is declared or used in the routine's own
+         declaration part other than as a record member or through
+         `absolute`, names a nested routine, or is the routine's name;
+       - a `with` statement precedes a use of the old name;
+       - the new name is already visible where the parameter is;
        - an implementation omits the parameter list a declaration gives,
-         or another header spells the parameter with its prefix already.
-     A nested routine that redeclares the old name keeps its own binding
-     and is excluded from the outer rename. *)
+         a declaration and an implementation of one name cannot be
+         paired by signature, or another header spells the parameter
+         with its prefix already.
+     A nested routine that binds the old name itself — as a parameter,
+     a variable, a constant or a type — keeps that binding and is
+     excluded from the outer rename. *)
   TParameterRenamer = class
   private
     FSource: TSourceTokens;
@@ -1184,21 +1346,25 @@ type
     FBlocked: TStringList;
     FExcluded: TLineIndexArray;
     FExcludedCount: Integer;
-    function BlockKey(const AKey, AOldName: string): string;
-    procedure Block(const AKey, AOldName: string);
-    function IsBlocked(const AKey, AOldName: string): Boolean;
+    procedure Block(const AGroup, AOldName: string);
+    function IsBlocked(const AHeader: TRoutineHeader; const AOldName: string): Boolean;
     function NameOccurs(const AName: string; const AFirst, ALast: Integer): Boolean;
-    function OwnDeclarationsMention(const ARoutine: Integer; const AName: string): Boolean;
+    function HeaderMentions(const ARoutine: Integer; const AName: string): TMention;
+    function DeclarationMentions(const ARoutine: Integer; const AName: string): TMention;
+    function BindsName(const ARoutine: Integer; const AName: string): Boolean;
     function RoutineIsSafe(const ARoutine: Integer): Boolean;
     function CollectScope(const ARoutine: Integer; const AName: string): Boolean;
+    function ExcludedRoot(const ATokenIndex: Integer): Integer;
+    function UsedAfterWith(const ARoutine: Integer; const AName: string): Boolean;
+    function NewNameCollides(const ARoutine: Integer; const ANewName: string): Boolean;
     function BodyRenameIsSafe(const ARoutine: Integer; const APair: TRenamePair): Boolean;
-    procedure BlockOmittedParameterLists;
+    procedure BlockAmbiguousGroups;
     procedure RenameRange(const AFirst, ALast: Integer; const APair: TRenamePair);
     function HeaderParameters(const ARoutine: Integer): TRenamePairArray;
   public
     constructor Create(const ASource: TSourceTokens; const AIndex: TRoutineIndex);
     destructor Destroy; override;
-    function Apply: Boolean;
+    procedure Apply;
   end;
 
 constructor TParameterRenamer.Create(const ASource: TSourceTokens;
@@ -1218,20 +1384,17 @@ begin
   inherited Destroy;
 end;
 
-function TParameterRenamer.BlockKey(const AKey, AOldName: string): string;
+procedure TParameterRenamer.Block(const AGroup, AOldName: string);
 begin
-  Result := AKey + '|' + AOldName;
+  FBlocked.Add(AGroup + '|' + AOldName);
 end;
 
-procedure TParameterRenamer.Block(const AKey, AOldName: string);
+function TParameterRenamer.IsBlocked(const AHeader: TRoutineHeader;
+  const AOldName: string): Boolean;
 begin
-  FBlocked.Add(BlockKey(AKey, AOldName));
-end;
-
-function TParameterRenamer.IsBlocked(const AKey, AOldName: string): Boolean;
-begin
-  Result := (FBlocked.IndexOf(BlockKey(AKey, AllNames)) >= 0) or
-            (FBlocked.IndexOf(BlockKey(AKey, AOldName)) >= 0);
+  Result := (FBlocked.IndexOf(AHeader.NameGroup + '|' + AllNames) >= 0) or
+            (FBlocked.IndexOf(AHeader.Group + '|' + AllNames) >= 0) or
+            (FBlocked.IndexOf(AHeader.Group + '|' + AOldName) >= 0);
 end;
 
 function TParameterRenamer.NameOccurs(const AName: string;
@@ -1245,19 +1408,53 @@ begin
   Result := False;
 end;
 
-{ Whether AName appears in the routine's own declaration part, outside
-  the routines nested there. }
-function TParameterRenamer.OwnDeclarationsMention(const ARoutine: Integer;
-  const AName: string): Boolean;
+{ A parameter of that name is a binding; the name anywhere else in the
+  header after the routine's own name (a parameter or result type of the
+  same name) is uncertain. }
+function TParameterRenamer.HeaderMentions(const ARoutine: Integer;
+  const AName: string): TMention;
+var
+  Header: TRoutineHeader;
+  TokenIndex, ParameterIndex: Integer;
+  IsParameter: Boolean;
+begin
+  Result := mnNone;
+  Header := FIndex.Routine(ARoutine);
+  for TokenIndex := Header.NameToken + 1 to Header.HeaderEnd - 1 do
+  begin
+    if not FSource.NameIs(TokenIndex, AName) then
+      Continue;
+    IsParameter := False;
+    for ParameterIndex := 0 to High(Header.ParameterTokens) do
+      if Header.ParameterTokens[ParameterIndex] = TokenIndex then
+        IsParameter := True;
+    if not IsParameter then
+      Exit(mnUncertain);
+    Result := mnBinding;
+  end;
+end;
+
+(* How the routine's own declaration part — outside the routines nested
+   there — uses AName:
+     - a member of a record, class or object type: no concern;
+     - the target of `absolute`: a reference to an outer binding;
+     - declared as a variable, constant, type or resource string: a
+       binding;
+     - anything else: uncertain. *)
+function TParameterRenamer.DeclarationMentions(const ARoutine: Integer;
+  const AName: string): TMention;
 var
   Header, Child: TRoutineHeader;
-  TokenIndex, ChildIndex: Integer;
+  TokenIndex, ChildIndex, Depth: Integer;
+  Mention: TMention;
 begin
+  Result := mnNone;
   Header := FIndex.Routine(ARoutine);
   if Header.BodyStart < 0 then
-    Exit(False);
+    Exit;
   TokenIndex := Header.HeaderEnd;
   ChildIndex := Header.FirstChild;
+  Depth := 0;
   while TokenIndex < Header.BodyStart do
   begin
     if ChildIndex <> NoRoutine then
@@ -1270,11 +1467,34 @@ begin
         Continue;
       end;
     end;
-    if FSource.NameIs(TokenIndex, AName) then
-      Exit(True);
+    if FIndex.CompositeOpening(TokenIndex) then
+      Inc(Depth)
+    else if FSource.IsText(TokenIndex, 'end') and (Depth > 0) then
+      Dec(Depth)
+    else if (Depth = 0) and FSource.NameIs(TokenIndex, AName) then
+    begin
+      if FSource.IsText(TokenIndex - 1, 'absolute') then
+        Mention := mnReference
+      else if (FSource.IsText(TokenIndex - 1, 'var') or FSource.IsText(TokenIndex - 1, 'const') or
+               FSource.IsText(TokenIndex - 1, 'type') or FSource.IsText(TokenIndex - 1, 'threadvar') or
+               FSource.IsText(TokenIndex - 1, 'resourcestring') or
+               FSource.IsText(TokenIndex - 1, ';') or FSource.IsText(TokenIndex - 1, ',')) and
+              (FSource.IsText(TokenIndex + 1, ':') or FSource.IsText(TokenIndex + 1, ',') or
+               FSource.IsText(TokenIndex + 1, '=')) then
+        Mention := mnBinding
+      else
+        Mention := mnUncertain;
+      if Mention > Result then
+        Result := Mention;
+    end;
     Inc(TokenIndex);
   end;
-  Result := False;
+end;
+
+function TParameterRenamer.BindsName(const ARoutine: Integer; const AName: string): Boolean;
+begin
+  Result := (HeaderMentions(ARoutine, AName) = mnBinding) or
+            (DeclarationMentions(ARoutine, AName) = mnBinding);
 end;
 
 function TParameterRenamer.RoutineIsSafe(const ARoutine: Integer): Boolean;
@@ -1285,26 +1505,29 @@ begin
   Header := FIndex.Routine(ARoutine);
   Depth := 0;
   for TokenIndex := Header.StartToken to Header.ExtentEnd - 1 do
-  begin
-    if FSource.IsText(TokenIndex, 'asm') or FSource.IsText(TokenIndex, 'assembler') or
-       FSource.IsIncludeDirective(TokenIndex) then
+    if FSource.IsDirective(TokenIndex) then
+    begin
+      if FSource.IsIncludeDirective(TokenIndex) then
+        Exit(False);
+      Inc(Depth, FSource.ConditionalDelta(TokenIndex));
+      if Depth < 0 then
+        Exit(False);
+    end
+    else if FSource.IsText(TokenIndex, 'asm') or FSource.IsText(TokenIndex, 'assembler') then
       Exit(False);
-    Inc(Depth, FSource.ConditionalDelta(TokenIndex));
-    if Depth < 0 then
-      Exit(False);
-  end;
   Result := Depth = 0;
 end;
 
 (* Walks the routines nested in ARoutine and records, in FExcluded, the
-   extent of every one that redeclares AName — in its header or its own
-   declaration part — so it keeps its own binding. Returns False when a
-   nested routine is itself named AName: inside the enclosing body the
-   name then refers to that routine, not to the parameter. *)
+   extent of every one that binds AName itself, so it keeps that binding.
+   Returns False when the binding cannot be settled: a nested routine is
+   named AName (inside the enclosing body the name then refers to it),
+   or uses AName in a way that is neither a binding nor a reference. *)
 function TParameterRenamer.CollectScope(const ARoutine: Integer; const AName: string): Boolean;
 var
   ChildIndex: Integer;
   Child: TRoutineHeader;
+  InHeader, InDeclarations: TMention;
 begin
   ChildIndex := FIndex.Routine(ARoutine).FirstChild;
   while ChildIndex <> NoRoutine do
@@ -1312,14 +1535,18 @@ begin
     Child := FIndex.Routine(ChildIndex);
     if FSource.NameIs(Child.NameToken, AName) then
       Exit(False);
-    if NameOccurs(AName, Child.StartToken, Child.HeaderEnd) or
-       OwnDeclarationsMention(ChildIndex, AName) then
+    InHeader := HeaderMentions(ChildIndex, AName);
+    InDeclarations := DeclarationMentions(ChildIndex, AName);
+    if (InHeader = mnUncertain) or (InDeclarations = mnUncertain) then
+      Exit(False);
+    if (InHeader = mnBinding) or (InDeclarations = mnBinding) then
     begin
-      if FExcludedCount + 2 > Length(FExcluded) then
-        SetLength(FExcluded, FExcludedCount * 2 + 8);
+      if FExcludedCount + 3 > Length(FExcluded) then
+        SetLength(FExcluded, FExcludedCount * 2 + 9);
       FExcluded[FExcludedCount] := Child.StartToken;
       FExcluded[FExcludedCount + 1] := Child.ExtentEnd;
-      Inc(FExcludedCount, 2);
+      FExcluded[FExcludedCount + 2] := ChildIndex;
+      Inc(FExcludedCount, 3);
     end
     else if not CollectScope(ChildIndex, AName) then
       Exit(False);
@@ -1328,45 +1555,143 @@ begin
   Result := True;
 end;
 
+{ The excluded nested routine whose extent holds the token, or NoRoutine. }
+function TParameterRenamer.ExcludedRoot(const ATokenIndex: Integer): Integer;
+var
+  Entry: Integer;
+begin
+  Entry := 0;
+  while Entry < FExcludedCount do
+  begin
+    if (ATokenIndex >= FExcluded[Entry]) and (ATokenIndex < FExcluded[Entry + 1]) then
+      Exit(FExcluded[Entry + 2]);
+    Inc(Entry, 3);
+  end;
+  Result := NoRoutine;
+end;
+
+{ Inside `with X do`, a name may resolve to a member of X; the formatter
+  cannot tell, so a use of the name after any `with` in the routine
+  blocks the rename. }
+function TParameterRenamer.UsedAfterWith(const ARoutine: Integer;
+  const AName: string): Boolean;
+var
+  Header: TRoutineHeader;
+  TokenIndex: Integer;
+  SeenWith: Boolean;
+begin
+  Header := FIndex.Routine(ARoutine);
+  SeenWith := False;
+  for TokenIndex := Header.HeaderEnd to Header.ExtentEnd - 1 do
+  begin
+    if ExcludedRoot(TokenIndex) <> NoRoutine then
+      Continue;
+    if FSource.IsText(TokenIndex, 'with') then
+      SeenWith := True
+    else if SeenWith and FSource.NameIs(TokenIndex, AName) and
+            not FSource.IsText(TokenIndex - 1, '.') then
+      Exit(True);
+  end;
+  Result := False;
+end;
+
+{ Whether the new name is already visible where the parameter will be:
+  any unqualified use of it in the routine's extent, except inside a
+  nested routine that binds the new name itself. A member access
+  (`Entry.ACount`) never collides. }
+function TParameterRenamer.NewNameCollides(const ARoutine: Integer;
+  const ANewName: string): Boolean;
+var
+  Header: TRoutineHeader;
+  TokenIndex, Root: Integer;
+begin
+  Header := FIndex.Routine(ARoutine);
+  for TokenIndex := Header.StartToken to Header.ExtentEnd - 1 do
+  begin
+    if not FSource.NameIs(TokenIndex, ANewName) or FSource.IsText(TokenIndex - 1, '.') then
+      Continue;
+    Root := ExcludedRoot(TokenIndex);
+    if (Root = NoRoutine) or not BindsName(Root, ANewName) then
+      Exit(True);
+  end;
+  Result := False;
+end;
+
 function TParameterRenamer.BodyRenameIsSafe(const ARoutine: Integer;
   const APair: TRenamePair): Boolean;
 var
-  Header: TRoutineHeader;
+  InDeclarations: TMention;
 begin
-  Header := FIndex.Routine(ARoutine);
   FExcludedCount := 0;
-  Result := not NameOccurs(LowerCase(APair.NewName), Header.StartToken, Header.ExtentEnd) and
-            not OwnDeclarationsMention(ARoutine, APair.OldName) and
-            CollectScope(ARoutine, APair.OldName);
+  if HeaderMentions(ARoutine, APair.OldName) = mnUncertain then
+    Exit(False);
+  InDeclarations := DeclarationMentions(ARoutine, APair.OldName);
+  if InDeclarations in [mnBinding, mnUncertain] then
+    Exit(False);
+  if not CollectScope(ARoutine, APair.OldName) then
+    Exit(False);
+  Result := not UsedAfterWith(ARoutine, APair.OldName) and
+            not NewNameCollides(ARoutine, LowerCase(APair.NewName));
 end;
 
-(* Delphi mode lets an implementation omit the parameter list its
-  declaration gives; its body then uses names only the declaration shows.
-  When a key has a declaration with parameters and more parameterless
-  bodies than parameterless declarations, some body may be such an
-  implementation, and none of the key's parameters are renamed. A
-  parameterless overload that has only a body is no such case. *)
-procedure TParameterRenamer.BlockOmittedParameterLists;
+(* Blocks every parameter of a name whose headers cannot be paired safely.
 
-  function Occurrences(const ATally: string; const AMark: Char): Integer;
+   Delphi mode lets an implementation omit the parameter list its
+   declaration gives; its body then uses names only the declaration shows.
+   When a name has a declaration with parameters and more parameterless
+   bodies than parameterless declarations, some body may be such an
+   implementation. A parameterless overload that has only a body is no
+   such case.
+
+   Headers are paired by signature. When one name has both a declaration
+   whose signature no body shares and a body whose signature no
+   declaration shares, the two may be one routine spelled differently
+   (a type alias, a unit-qualified type), so the pairing is not trusted. *)
+procedure TParameterRenamer.BlockAmbiguousGroups;
+var
+  Tally: TNameMap;
+  RoutineIndex: Integer;
+  Header: TRoutineHeader;
+  Mark, Existing, Key: string;
+  Entry: TPair<string, string>;
+  Declarations, Bodies, UnpairedDeclarations, UnpairedBodies: TStringList;
+
+  function Occurrences(const AText: string; const AMark: Char): Integer;
   var
     Position: Integer;
   begin
     Result := 0;
-    for Position := 1 to Length(ATally) do
-      if ATally[Position] = AMark then
+    for Position := 1 to Length(AText) do
+      if AText[Position] = AMark then
         Inc(Result);
   end;
 
-var
-  Counts: TNameMap;
-  RoutineIndex: Integer;
-  Header: TRoutineHeader;
-  Tally, Existing: string;
-  Entry: TPair<string, string>;
+  { Adds to AUnpaired the name group of every entry of AFrom whose group
+    AIn lacks. }
+  procedure CollectUnpaired(const AFrom, AIn, AUnpaired: TStringList);
+  var
+    Item: Integer;
+  begin
+    for Item := 0 to AFrom.Count - 1 do
+      if AIn.IndexOf(AFrom[Item]) < 0 then
+        AUnpaired.Add(AFrom.Names[Item]);
+  end;
+
 begin
-  Counts := TNameMap.Create;
+  Tally := TNameMap.Create;
+  Declarations := TStringList.Create;
+  Bodies := TStringList.Create;
+  UnpairedDeclarations := TStringList.Create;
+  UnpairedBodies := TStringList.Create;
   try
+    UnpairedDeclarations.Sorted := True;
+    UnpairedDeclarations.Duplicates := dupIgnore;
+    UnpairedBodies.Sorted := True;
+    UnpairedBodies.Duplicates := dupIgnore;
+    Declarations.Sorted := True;
+    Declarations.Duplicates := dupIgnore;
+    Bodies.Sorted := True;
+    Bodies.Duplicates := dupIgnore;
     for RoutineIndex := 0 to FIndex.Count - 1 do
     begin
       { Q: a declaration with a parameter list; D: one without; B: a body
@@ -1374,147 +1699,132 @@ begin
       Header := FIndex.Routine(RoutineIndex);
       if Header.Body = rbBody then
       begin
+        Bodies.Add(Header.NameGroup + '=' + Header.Group);
         if Header.HasParameterList then
-          Continue;
-        Tally := 'B';
+          Mark := ''
+        else
+          Mark := 'B';
       end
-      else if Header.HasParameterList then
-        Tally := 'Q'
       else
-        Tally := 'D';
-      if Counts.TryGetValue(Header.Key, Existing) then
-        Counts.AddOrSetValue(Header.Key, Existing + Tally)
+      begin
+        Declarations.Add(Header.NameGroup + '=' + Header.Group);
+        if Header.HasParameterList then
+          Mark := 'Q'
+        else
+          Mark := 'D';
+      end;
+      if Tally.TryGetValue(Header.NameGroup, Existing) then
+        Tally.AddOrSetValue(Header.NameGroup, Existing + Mark)
       else
-        Counts.Add(Header.Key, Tally);
+        Tally.Add(Header.NameGroup, Mark);
     end;
-    for Entry in Counts do
-      if (Occurrences(Entry.Value, 'Q') > 0) and
-         (Occurrences(Entry.Value, 'B') > Occurrences(Entry.Value, 'D')) then
-        Block(Entry.Key, AllNames);
+    CollectUnpaired(Declarations, Bodies, UnpairedDeclarations);
+    CollectUnpaired(Bodies, Declarations, UnpairedBodies);
+    for Entry in Tally do
+    begin
+      Key := Entry.Key;
+      if ((Occurrences(Entry.Value, 'Q') > 0) and
+          (Occurrences(Entry.Value, 'B') > Occurrences(Entry.Value, 'D'))) or
+         ((UnpairedDeclarations.IndexOf(Key) >= 0) and (UnpairedBodies.IndexOf(Key) >= 0)) then
+        Block(Key, AllNames);
+    end;
   finally
-    Counts.Free;
+    UnpairedBodies.Free;
+    UnpairedDeclarations.Free;
+    Bodies.Free;
+    Declarations.Free;
+    Tally.Free;
   end;
 end;
 
+{ Renames the parameter's uses in the range, outside excluded nested
+  routines, member accesses (`X.Name`), and the member lists of record,
+  class and object types declared there: a field of the same name is not
+  the parameter. }
 procedure TParameterRenamer.RenameRange(const AFirst, ALast: Integer;
   const APair: TRenamePair);
 var
-  TokenIndex, Excluded: Integer;
+  TokenIndex, Excluded, Depth: Integer;
 begin
   TokenIndex := AFirst;
   Excluded := 0;
+  Depth := 0;
   while TokenIndex < ALast do
   begin
     if (Excluded < FExcludedCount) and (TokenIndex >= FExcluded[Excluded]) then
     begin
       TokenIndex := FExcluded[Excluded + 1];
-      Inc(Excluded, 2);
+      Inc(Excluded, 3);
       Continue;
     end;
-    if FSource.NameIs(TokenIndex, APair.OldName) and
-       not FSource.IsText(TokenIndex - 1, '.') then
+    if FIndex.CompositeOpening(TokenIndex) then
+      Inc(Depth)
+    else if FSource.IsText(TokenIndex, 'end') and (Depth > 0) then
+      Dec(Depth)
+    else if (Depth = 0) and FSource.NameIs(TokenIndex, APair.OldName) and
+            not FSource.IsText(TokenIndex - 1, '.') then
       FSource.Replace(TokenIndex, APair.NewName);
     Inc(TokenIndex);
   end;
 end;
 
-(* Every parameter a header declares. A renameable one — two or more
-   letters, no A prefix yet, not Self, and not one whose prefixed form is
-   a keyword — carries its new name; any other carries an empty one, so
-   a header that spells the same parameter differently (`aValue` here,
-   `AValue` there, which FPC treats as one name) blocks the rename for
-   all of them. A parameter list containing a directive has alternatives
-   the formatter cannot read, and blocks every rename for the routine. *)
+(* Every parameter a header declares, keyed by its normalized name (an
+   `&` escape dropped). A renameable one — two or more letters, no A
+   prefix yet, not Self, and not one whose prefixed form is a keyword —
+   carries its new name; any other carries an empty one, so a header
+   that spells the same parameter differently (`aValue` here, `AValue`
+   there, which FPC treats as one name) blocks the rename for all. *)
 function TParameterRenamer.HeaderParameters(const ARoutine: Integer): TRenamePairArray;
 var
   Header: TRoutineHeader;
-  Open, Close, TokenIndex, Depth, Count, Existing: Integer;
-  InNames, GroupStart, Duplicate: Boolean;
+  ParameterIndex, Count, Existing: Integer;
+  Duplicate: Boolean;
   Spelling, NewName: string;
 begin
   Result := nil;
   Header := FIndex.Routine(ARoutine);
-  if not Header.HasParameterList then
-    Exit;
-  Open := Header.StartToken + 1;
-  while not FSource.IsText(Open, '(') do
-    Inc(Open);
-  Close := FIndex.MatchingClose(Open);
-  for TokenIndex := Open + 1 to Close - 1 do
-    if FSource.IsDirective(TokenIndex) then
-    begin
-      Block(Header.Key, AllNames);
-      Exit;
-    end;
-
   Count := 0;
-  Depth := 0;
-  InNames := True;
-  GroupStart := True;
-  for TokenIndex := Open + 1 to Close - 1 do
+  for ParameterIndex := 0 to High(Header.ParameterTokens) do
   begin
-    if FSource.IsText(TokenIndex, '(') or FSource.IsText(TokenIndex, '[') then
-      Inc(Depth)
-    else if FSource.IsText(TokenIndex, ')') or FSource.IsText(TokenIndex, ']') then
-      Dec(Depth);
-    if Depth > 0 then
-      Continue;
-    if FSource.IsText(TokenIndex, ';') then
-    begin
-      InNames := True;
-      GroupStart := True;
-      Continue;
-    end;
-    if FSource.IsText(TokenIndex, ':') or FSource.IsText(TokenIndex, '=') then
-      InNames := False;
-    if not InNames or not FSource.IsName(TokenIndex) then
-      Continue;
-    if GroupStart and IsModifier(FSource.Text(TokenIndex)) and
-       FSource.IsName(TokenIndex + 1) then
-    begin
-      GroupStart := False;
-      Continue;
-    end;
-    GroupStart := False;
-
-    Spelling := FSource.Spelling(TokenIndex);
+    Spelling := FSource.Spelling(Header.ParameterTokens[ParameterIndex]);
+    if (Spelling <> '') and (Spelling[1] = '&') then
+      Delete(Spelling, 1, 1);
     NewName := 'A' + UpCase(Spelling[1]) + Copy(Spelling, 2, MaxInt);
     if (LowerCase(Spelling) = 'self') or (Length(Spelling) < 2) or
        HasAPrefix(Spelling) or IsPascalKeyword(NewName) then
       NewName := '';
     Duplicate := False;
     for Existing := 0 to Count - 1 do
-      if Result[Existing].OldName = LowerCase(Spelling) then
+      if Result[Existing].OldName = FSource.Text(Header.ParameterTokens[ParameterIndex]) then
         Duplicate := True;
     if Duplicate then
       Continue;
     SetLength(Result, Count + 1);
-    Result[Count].OldName := LowerCase(Spelling);
+    Result[Count].OldName := FSource.Text(Header.ParameterTokens[ParameterIndex]);
     Result[Count].NewName := NewName;
     Inc(Count);
   end;
 end;
 
-function TParameterRenamer.Apply: Boolean;
+procedure TParameterRenamer.Apply;
 var
   RoutineIndex, PairIndex: Integer;
   Header: TRoutineHeader;
   Pair: TRenamePair;
 begin
-  Result := False;
   SetLength(FParameters, FIndex.Count);
   for RoutineIndex := 0 to FIndex.Count - 1 do
     FParameters[RoutineIndex] := HeaderParameters(RoutineIndex);
 
-  BlockOmittedParameterLists;
+  BlockAmbiguousGroups;
   for RoutineIndex := 0 to FIndex.Count - 1 do
   begin
     Header := FIndex.Routine(RoutineIndex);
     if (Header.Body = rbExternal) or Header.ConditionalHeader or
+       Header.UncertainParameters or
        ((Header.Body = rbBody) and not RoutineIsSafe(RoutineIndex)) then
     begin
-      for PairIndex := 0 to High(FParameters[RoutineIndex]) do
-        Block(Header.Key, FParameters[RoutineIndex][PairIndex].OldName);
+      Block(Header.Group, AllNames);
       Continue;
     end;
     for PairIndex := 0 to High(FParameters[RoutineIndex]) do
@@ -1523,14 +1833,15 @@ begin
       { A parameter spelled like its routine makes every mention of the
         name ambiguous. }
       if (Pair.NewName = '') or FSource.NameIs(Header.NameToken, Pair.OldName) then
-        Block(Header.Key, Pair.OldName)
+        Block(Header.Group, Pair.OldName)
       else if Header.Body = rbBody then
       begin
         if not BodyRenameIsSafe(RoutineIndex, Pair) then
-          Block(Header.Key, Pair.OldName);
+          Block(Header.Group, Pair.OldName);
       end
-      else if NameOccurs(LowerCase(Pair.NewName), Header.StartToken, Header.HeaderEnd) then
-        Block(Header.Key, Pair.OldName);
+      else if NameOccurs(LowerCase(Pair.NewName), Header.StartToken, Header.HeaderEnd) or
+              (HeaderMentions(RoutineIndex, Pair.OldName) = mnUncertain) then
+        Block(Header.Group, Pair.OldName);
     end;
   end;
 
@@ -1540,9 +1851,8 @@ begin
     for PairIndex := 0 to High(FParameters[RoutineIndex]) do
     begin
       Pair := FParameters[RoutineIndex][PairIndex];
-      if (Pair.NewName = '') or IsBlocked(Header.Key, Pair.OldName) then
+      if (Pair.NewName = '') or IsBlocked(Header, Pair.OldName) then
         Continue;
-      Result := True;
       if Header.Body = rbBody then
       begin
         BodyRenameIsSafe(RoutineIndex, Pair);
@@ -1557,22 +1867,15 @@ begin
   end;
 end;
 
-function FixParamNames(const ALines: TStringList): Boolean;
+procedure FixParamNames(const ASource: TSourceTokens; const AIndex: TRoutineIndex);
 var
-  Source: TSourceTokens;
-  Index: TRoutineIndex;
   Renamer: TParameterRenamer;
 begin
-  Source := TSourceTokens.Create(ALines, '');
-  Index := TRoutineIndex.Create(Source);
-  Renamer := TParameterRenamer.Create(Source, Index);
+  Renamer := TParameterRenamer.Create(ASource, AIndex);
   try
-    Result := Renamer.Apply;
-    Source.ApplyEdits;
+    Renamer.Apply;
   finally
     Renamer.Free;
-    Index.Free;
-    Source.Free;
   end;
 end;
 
@@ -1580,38 +1883,28 @@ end;
   Auto-Fix: Stray Spaces
   ═══════════════════════════════════════════════════════════════════════════ }
 
-{ Removes the spaces directly before a `;`, `)` or `,` token, unless they
-  follow a tab, `(` or `,` or start the line. Only spaces that separate
-  two code tokens can qualify, so comment and string text keeps its
-  spacing. }
-function FixStraySpaces(const ALines: TStringList): Boolean;
+{ Records removal of the spaces directly before a `;`, `)` or `,` token,
+  unless they follow a tab, `(` or `,` or start the line. Only spaces that
+  separate two code tokens can qualify, so comment and string text keeps
+  its spacing. The character before the spaces is never part of an
+  identifier another pass renames, so the checks hold after those edits. }
+procedure FixStraySpaces(const ASource: TSourceTokens);
 var
-  Source: TSourceTokens;
   TokenIndex, Before: Integer;
   Line: string;
 begin
-  Result := False;
-  Source := TSourceTokens.Create(ALines, '');
-  try
-    for TokenIndex := 0 to Source.Count - 1 do
-    begin
-      if not (Source.IsText(TokenIndex, ';') or Source.IsText(TokenIndex, ')') or
-              Source.IsText(TokenIndex, ',')) then
-        Continue;
-      Line := ALines[Source.LineIndex(TokenIndex)];
-      Before := Source.Column(TokenIndex) - 1;
-      while (Before >= 1) and (Line[Before] = ' ') do
-        Dec(Before);
-      if (Before >= 1) and (Before < Source.Column(TokenIndex) - 1) and
-         not (Line[Before] in [#9, '(', ',']) then
-      begin
-        Source.RemoveSpacesBefore(TokenIndex, Source.Column(TokenIndex) - 1 - Before);
-        Result := True;
-      end;
-    end;
-    Source.ApplyEdits;
-  finally
-    Source.Free;
+  for TokenIndex := 0 to ASource.Count - 1 do
+  begin
+    if not (ASource.IsText(TokenIndex, ';') or ASource.IsText(TokenIndex, ')') or
+            ASource.IsText(TokenIndex, ',')) then
+      Continue;
+    Line := ASource.LineText(TokenIndex);
+    Before := ASource.Column(TokenIndex) - 1;
+    while (Before >= 1) and (Line[Before] = ' ') do
+      Dec(Before);
+    if (Before >= 1) and (Before < ASource.Column(TokenIndex) - 1) and
+       not (Line[Before] in [#9, '(', ',']) then
+      ASource.RemoveSpacesBefore(TokenIndex, ASource.Column(TokenIndex) - 1 - Before);
   end;
 end;
 
@@ -1619,25 +1912,43 @@ end;
   File Processing
   ═══════════════════════════════════════════════════════════════════════════ }
 
+(* The uses pass rewrites lines; the other three passes record token edits
+   against one tokenization of its result and apply them together. The
+   file is tokenized twice at most: once as read, and once more only when
+   the uses pass changed it. *)
 function FormatFile(const AFilePath: string; const AMode: TRunMode;
   out ASkipReason: string): Boolean;
 var
   Lines, ResultLines: TStringList;
-  Probe: TSourceTokens;
+  Source: TSourceTokens;
+  Index: TRoutineIndex;
 begin
   Result := False;
   ASkipReason := '';
+  Source := nil;
+  Index := nil;
   Lines := TStringList.Create;
   ResultLines := TStringList.Create;
   try
     Lines.LoadFromFile(AFilePath);
-
-    { A file the tokenizer cannot read — an unterminated comment or
-      string — is left exactly as it is: without a trustworthy view of
-      what is code, no rewrite is safe. }
     try
-      Probe := TSourceTokens.Create(Lines, ExtractFileName(AFilePath));
-      Probe.Free;
+      { A file the tokenizer cannot read — an unterminated comment or
+        string — is left exactly as it is: without a trustworthy view of
+        what is code, no rewrite is safe. }
+      Source := TSourceTokens.Create(Lines, ExtractFileName(AFilePath));
+      FormatUsesInLines(Lines, Source, ResultLines);
+      if ResultLines.Text = Lines.Text then
+        Source.Rebind(ResultLines)
+      else
+      begin
+        FreeAndNil(Source);
+        Source := TSourceTokens.Create(ResultLines, ExtractFileName(AFilePath));
+      end;
+      Index := TRoutineIndex.Create(Source);
+      FixFuncNames(Source, Index);
+      FixParamNames(Source, Index);
+      FixStraySpaces(Source);
+      Source.ApplyEdits;
     except
       on E: ELWPTPascalAnalysisError do
       begin
@@ -1646,11 +1957,6 @@ begin
       end;
     end;
 
-    FormatUsesInLines(Lines, ResultLines);
-    FixFuncNames(ResultLines);
-    FixParamNames(ResultLines);
-    FixStraySpaces(ResultLines);
-
     if ResultLines.Text <> Lines.Text then
     begin
       Result := True;
@@ -1658,6 +1964,8 @@ begin
         ResultLines.SaveToFile(AFilePath);
     end;
   finally
+    Index.Free;
+    Source.Free;
     Lines.Free;
     ResultLines.Free;
   end;

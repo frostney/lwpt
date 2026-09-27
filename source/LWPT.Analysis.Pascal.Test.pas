@@ -144,6 +144,17 @@ begin
   end;
   Expect<Boolean>(Pos('broken.pas(2,1)', MessageText) > 0).ToBe(True);
   Expect<Boolean>(Pos('unterminated comment', MessageText) > 0).ToBe(True);
+
+  { FPC ends a string at its line ("String exceeds line"); a quote on a
+    later line does not close it. }
+  MessageText := '';
+  try
+    TokenizePascal('x := ''open'#10'still'';', 'broken.pas');
+  except
+    on Error: ELWPTPascalAnalysisError do MessageText := Error.Message;
+  end;
+  Expect<Boolean>(Pos('broken.pas(1,6)', MessageText) > 0).ToBe(True);
+  Expect<Boolean>(Pos('unterminated string literal', MessageText) > 0).ToBe(True);
 end;
 
 procedure TPascalTokenizerTests.SetupTests;

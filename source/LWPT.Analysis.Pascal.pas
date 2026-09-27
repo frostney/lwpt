@@ -125,6 +125,17 @@ begin
   Result := False;
 end;
 
+{ LowerCase always allocates; most tokens are already lower case. }
+function HasUpperCase(const AValue: string): Boolean;
+var
+  Position: Integer;
+begin
+  for Position := 1 to Length(AValue) do
+    if AValue[Position] in ['A'..'Z'] then
+      Exit(True);
+  Result := False;
+end;
+
 procedure RaiseLexicalError(const ASourceName, AMessage: string;
   const ALine, AColumn: Integer);
 var
@@ -181,8 +192,8 @@ var
     if AStripEscape and (Result[TokenCount].Text <> '')
       and (Result[TokenCount].Text[1] = '&') then
       Delete(Result[TokenCount].Text, 1, 1);
-    if ANormalize then Result[TokenCount].Text :=
-      LowerCase(Result[TokenCount].Text);
+    if ANormalize and HasUpperCase(Result[TokenCount].Text) then
+      Result[TokenCount].Text := LowerCase(Result[TokenCount].Text);
     Result[TokenCount].Offset := StartIndex - 1;
     Result[TokenCount].Length := Index - StartIndex;
     Result[TokenCount].Line := StartLine;
@@ -294,6 +305,10 @@ var
     Advance;
     while Index <= Length(ASource) do
     begin
+      { FPC ends a quoted string at the end of its line ("String exceeds
+        line"); reading on would take code for string text. }
+      if ASource[Index] in [#10, #13] then
+        Break;
       if ASource[Index] <> '''' then
       begin
         Advance;
@@ -357,16 +372,31 @@ var
     AddToken(ptNumber);
   end;
 
-  procedure ScanSymbol;
+  { The two-character symbols: `:=` `<=` `>=` `<>` `..` `**` `<<` `>>`
+    `><` `(.` `.)` `+=` `-=` `*=` `/=`. Compared character by character,
+    since this runs for every symbol in every file. }
+  function AtPairSymbol: Boolean;
   var
-    Pair: string;
+    First, Second: Char;
   begin
-    Pair := Copy(ASource, Index, 2);
-    if (Pair = ':=') or (Pair = '<=') or (Pair = '>=')
-      or (Pair = '<>') or (Pair = '..') or (Pair = '**')
-      or (Pair = '<<') or (Pair = '>>') or (Pair = '><')
-      or (Pair = '(.') or (Pair = '.)') or (Pair = '+=')
-      or (Pair = '-=') or (Pair = '*=') or (Pair = '/=') then
+    if Index >= Length(ASource) then Exit(False);
+    First := ASource[Index];
+    Second := ASource[Index + 1];
+    case First of
+      ':', '+', '-', '/': Result := Second = '=';
+      '<': Result := Second in ['=', '>', '<'];
+      '>': Result := Second in ['=', '>', '<'];
+      '.': Result := Second in ['.', ')'];
+      '*': Result := Second in ['*', '='];
+      '(': Result := Second = '.';
+    else
+      Result := False;
+    end;
+  end;
+
+  procedure ScanSymbol;
+  begin
+    if AtPairSymbol then
     begin
       Advance;
       Advance;
