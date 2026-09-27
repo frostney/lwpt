@@ -36,8 +36,10 @@ If any check fails on a hook autofix you didn't expect, do not commit with `--no
 
 Every PR runs `pr.yml` automatically, whatever its base branch. `main` accepts
 a squash merge once the `delivery-admission` check passes on the exact head
-and every review thread is resolved. CodeRabbit reviews non-draft PRs
-automatically.
+and every review thread is resolved. Review evidence is an independent
+review of the exact head, with its report recorded on the PR, as
+[`ORCHESTRATION.md`](./ORCHESTRATION.md) describes. CodeRabbit reviews
+non-draft PRs automatically as an advisory reviewer.
 
 A PR labelled `ci:full-required` also needs a green six-target run on its
 exact head before merge:

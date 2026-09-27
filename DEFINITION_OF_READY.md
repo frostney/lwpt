@@ -38,9 +38,9 @@ intermediary issue merely to satisfy process.
   decisions are explicit.
 - The delivery plan records standalone versus GitHub-native stack topology
   and whether `ci:full-required` applies.
-- The plan records every active review automation from
-  `.github/delivery/review-automations.json`, and any repository workflow,
-  ruleset, or provider configuration that must land first.
+- The plan records the review axes that apply (standards and specification,
+  plus security for trust surfaces) and any repository workflow, ruleset, or
+  provider configuration that must land first.
 - Agent-led plans have classified [`ORCHESTRATION.md`](./ORCHESTRATION.md) as
   valid, missing, invalid, contradictory, or unsupported. A generic workflow
   recommendation is planning input, not evidence that repository integration

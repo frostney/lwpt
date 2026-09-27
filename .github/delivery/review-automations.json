@@ -1,31 +1,3 @@
 {
-  "automations": [
-    {
-      "id": "macroscope",
-      "actors": [
-        "macroscopeapp",
-        "macroscopeapp[bot]"
-      ],
-      "check_contexts": [
-        "Macroscope - Correctness Check"
-      ],
-      "check_app_slugs": [
-        "macroscopeapp"
-      ],
-      "terminal_check_conclusions": [
-        "success",
-        "neutral"
-      ],
-      "terminal_skipped_output_titles": [
-        "No code objects were reviewed."
-      ],
-      "terminal_review_states": [],
-      "nonterminal_review_markers": [
-        "rate limit",
-        "rate-limit",
-        "quota exceeded",
-        "review incomplete"
-      ]
-    }
-  ]
+  "automations": []
 }

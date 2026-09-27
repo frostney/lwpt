@@ -10,14 +10,14 @@ export default defineConfig({
   inheritance: true,
   reviews: {
     auto_review: {
-      // Review every non-draft PR automatically (ADR-0046). Set explicitly so
-      // a web-UI default cannot silently turn automatic review off, and no
-      // label gates the first pass.
+      // Review every non-draft PR automatically as an advisory reviewer
+      // (ADR-0046); the required review evidence is the independent review in
+      // ORCHESTRATION.md. Set explicitly so a web-UI default cannot silently
+      // turn automatic review off, and no label gates the first pass.
       enabled: true,
       drafts: false,
       // Do not spend a review on every push. After the first automatic pass,
-      // /address-feedback requests one incremental pass for a later exact
-      // head through its CodeRabbit adapter.
+      // a later head is reviewed only on request (`@coderabbitai review`).
       auto_incremental_review: false,
     },
   },

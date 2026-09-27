@@ -22,10 +22,11 @@ requirement may be marked not applicable only with a recorded reason.
   recovery paths where applicable.
 - Required CI, review, and applicable full-CI evidence belongs to the exact
   final head. A new head invalidates earlier evidence.
-- Review completion includes terminal current-head evidence from every active
-  review automation, zero unresolved threads, and a reply from an account with
-  current maintainer authority on every automation thread, including resolved
-  threads.
+- Review completion includes the independent review that
+  [`ORCHESTRATION.md`](./ORCHESTRATION.md) requires for the exact final head,
+  with its report recorded on the PR, and zero unresolved threads. Every
+  review thread, including resolved ones, has a reply with an evidence-backed
+  disposition.
 - Each delivery, full-CI, or review requirement marked not applicable has an
   explicit evidence-backed reason.
 - FreePascal behavior relied upon by the change is checked against the live

@@ -59,6 +59,18 @@ missing authority, new infrastructure or spending, or policy that is malformed
 or contradictory. Name the exact rule and evidence, keep the durable work, and
 do not spawn lanes under guessed semantics.
 
+## Review evidence
+
+Review evidence is an independent review that the delivering agent runs on a
+separate frontier/high lane against the exact head. It runs before the PR is
+declared ready and again after every material change. Every review covers the
+standards and specification axes. Changes to trust surfaces (network, TLS,
+registry, install, lockfile, process isolation) add a security axis. Earlier
+findings are revalidated against the new head before they are fixed or
+dismissed, and the review report is recorded on the PR. The current reviewer is
+Codex with model `gpt-6-astra` at high reasoning. CodeRabbit is advisory: its
+valid findings are addressed, but its verdict is not required.
+
 ## Lane-admission preflight
 
 FPC 3.2.2 silently truncates paths longer than 255 characters in compiler
@@ -90,5 +102,7 @@ implementation or a local gate; never learn this limit from failing tests.
   `gh workflow run ci.yml --ref <branch> -f mode=manual` run whose head is the
   PR's exact head. Await it with `delivery-wait wait workflow-terminal`, then
   merge with `--match-head-commit <sha>`. A new head needs a new run.
-- **Review policy:** `.github/delivery/review-automations.json`.
+- **Review policy:** `.github/delivery/review-automations.json` lists no
+  hosted automations, so `/address-feedback` waits only on review threads.
+  The review evidence above is still required.
 - **Diagnostics** (`-f mode=diagnostic`) are remediation, never proof.

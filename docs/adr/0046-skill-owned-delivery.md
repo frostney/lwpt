@@ -12,7 +12,7 @@ and finished under the old machinery, no pull request had used it since
 2026-09-05. Meanwhile the refreshed known-good-route skills took over the same
 work without repository-specific infrastructure. `/deliver` awaits CI,
 converges feedback, merges, and verifies integration. `/address-feedback`
-converges review against `.github/delivery/review-automations.json`.
+converges review threads under `.github/delivery/review-automations.json`.
 `delivery-wait` provides deterministic, resumable waits on exact heads and
 workflow runs. milestone-rush coordinates fan-out.
 
@@ -29,8 +29,11 @@ LWPT now keeps only what those skills cannot provide:
   escalation, the worktree path budget, the integration destination, and the
   full-CI rule. A pull request labelled `ci:full-required` needs a green
   `mode=manual` run on its exact head before a head-matched squash merge.
-- `.github/delivery/review-automations.json` remains the review-automation
-  policy, at the path address-feedback reads by default.
+  It also names the review evidence: an independent review the delivering
+  agent runs on the exact head, currently Codex with `gpt-6-astra`.
+- `.github/delivery/review-automations.json` stays at the path
+  address-feedback reads by default. It lists no hosted automations, so
+  address-feedback waits only on review threads.
 
 ## Considered options
 
@@ -58,8 +61,11 @@ LWPT now keeps only what those skills cannot provide:
   review convergence, resolved threads, and full CI when the label applies. It
   is not a label. `delivery:managed`, `ci:ready`, `review:ready`,
   `merge:ready`, and `stack:managed` retire; `ci:full-required` remains.
-- CodeRabbit reviews non-draft pull requests automatically instead of waiting
-  for `review:ready`.
+- Macroscope, which had run out of credits, is no longer a review gate. An
+  independent review run by the delivering agent replaces it: standards and
+  specification axes, plus security for trust surfaces. CodeRabbit reviews
+  non-draft pull requests automatically instead of waiting for
+  `review:ready`, but it is advisory only.
 - Diagnostics can target any branch. The target/selector allow-list still
   refuses arbitrary commands, and diagnostics are remediation, never proof.
 - The scheduling diagnostic and Windows tooling move to `.github/ci/`.

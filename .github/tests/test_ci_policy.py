@@ -425,6 +425,9 @@ class OrchestrationPolicyTests(unittest.TestCase):
         self.assertIn("gh workflow run ci.yml --ref <branch> -f mode=manual", policy)
         self.assertIn("--match-head-commit", policy)
         self.assertIn("`.github/delivery/review-automations.json`", policy)
+        self.assertIn("## Review evidence", policy)
+        self.assertIn("`gpt-6-astra`", policy)
+        self.assertIn("CodeRabbit is advisory", policy)
         self.assertTrue((ROOT / ".github/delivery/review-automations.json").is_file())
         for retired in ("delivery-transition", "merge:ready", "review:ready", "delivery:managed"):
             self.assertNotIn(retired, policy)
@@ -462,12 +465,9 @@ class ReviewPolicyTests(unittest.TestCase):
         self.assertIsInstance(policy, dict)
         automations = policy["automations"]
         self.assertIsInstance(automations, list)
-        self.assertTrue(automations)
-        identifiers = set()
         for automation in automations:
             self.assertIsInstance(automation, dict)
             self.assertIsInstance(automation.get("id"), str)
-            identifiers.add(automation["id"])
             for field in self.LIST_FIELDS:
                 values = automation.get(field, [])
                 self.assertIsInstance(values, list, field)
@@ -476,15 +476,12 @@ class ReviewPolicyTests(unittest.TestCase):
                 automation.get("check_contexts") or automation.get("terminal_review_states"),
                 f"{automation['id']} has no terminal evidence",
             )
-            self.assertTrue(automation.get("actors"), f"{automation['id']} has no actors")
-        self.assertEqual(len(automations), len(identifiers))
 
-    def test_macroscope_is_check_terminal(self) -> None:
+    def test_no_hosted_automation_gates_review(self) -> None:
+        # Review evidence is the agent-run independent review (ORCHESTRATION.md);
+        # CodeRabbit is advisory and Macroscope is retired.
         policy = json.loads(read(".github/delivery/review-automations.json"))
-        macroscope = next(item for item in policy["automations"] if item["id"] == "macroscope")
-        self.assertEqual([], macroscope["terminal_review_states"])
-        self.assertEqual(["success", "neutral"], macroscope["terminal_check_conclusions"])
-        self.assertEqual(["Macroscope - Correctness Check"], macroscope["check_contexts"])
+        self.assertEqual([], policy["automations"])
 
 
 class RetiredMachineryTests(unittest.TestCase):
