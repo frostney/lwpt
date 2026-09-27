@@ -354,7 +354,7 @@ begin
     Child := TChild.Create(ExpandFileName(ParamStr(0)), Directory,
       Scratch + '/worker-state', [ChildArgument, 'exit', Scratch]);
     try
-      while Child.Running do ;
+      while Child.Running do;
       Expect<Integer>(Child.Status).ToBe(0);
       Expect<Boolean>(RemoveDir(Directory)).ToBe(True);
     finally
