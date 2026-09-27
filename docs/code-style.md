@@ -104,9 +104,20 @@ and stay unqualified.
 - Uses-clause grouped, alphabetised within groups, blank line between groups.
 - Identifier casing for declared types (auto-cased to declared form).
 
-**Comments, compiler directives, and string literals are never rewritten.** Every pass classifies the file lexically first, so routine declarations and uses clauses are recognised only in code. Prose inside `{ … }`, `(* … *)`, or `//` that happens to begin with `function`, `procedure`, or `uses` is left alone, and a routine or parameter rename never touches a comment or string that mentions the old name. A parameter's `A`-prefix rename covers its own declaration and the body that declaration owns; a declaration without a body (a class member, a `forward` declaration, or an interface-section declaration) keeps the rename in the declaration.
+**Comments, compiler directives, and string literals are never rewritten.** Every pass reads the file through the same mode-aware tokenizer as `lwpt health` and `lwpt duplication`, and rewrites whole code tokens only. Prose inside `{ … }`, `(* … *)`, or `//` that happens to begin with `function`, `procedure`, or `uses` is left alone, and a rename never touches a comment, directive, or string that mentions the old name. Comment nesting follows the file's own `{$mode}` and `{$modeswitch nestedcomments}` directives; with neither, comments nest as in FPC's default mode. A mode chosen only on the command line or in an include file is not seen. A file that is not lexically valid (an unterminated comment or string) is left untouched, and `lwpt format` names it and the reason. An InstantFPC script's leading `#!` line is skipped.
 
-**A uses clause that carries a compiler directive or a comment is left exactly as written.** Reordering across `{$IFDEF}` would change which units a build sees, and a comment inside a uses clause exists to pin a position — see the `cthreads, { must come first so TThread has a driver }` clauses in the test programs. The formatter therefore treats any clause containing `{$…}`, `//`, `{ … }`, or `(* … *)` as author-owned and emits it verbatim; grouping and alphabetisation are on you in those clauses. Everything else the formatter does (trailing whitespace, line endings, identifier casing) still applies to the rest of the file.
+**Parameter renames are scoped, and skipped when the binding is uncertain.** A parameter's `A`-prefix rename covers every header of its routine in the file (FPC rejects an implementation whose parameter names differ from its declaration) and the body each header owns. That body is found even when `begin` shares the header's line, and it includes every branch when alternative bodies sit in a conditional block. A header without a body keeps the rename in the header: a class or record member, a `forward` or `abstract` declaration, whose directive may be on a later line, or an interface-section declaration. A nested routine that redeclares the name keeps its own binding. The formatter leaves a routine's parameters as they are when:
+
+- any of its headers is `external`;
+- it contains assembler;
+- its conditional directives do not balance;
+- the name also appears in its own declaration part, or names a nested routine;
+- the new name already appears anywhere the parameter is visible;
+- an implementation omits the parameter list its declaration gives.
+
+The rename is decided per file. A routine declared in one file and implemented in another (through an include file) is only kept in step when both files reach the same decision.
+
+**A uses clause that carries a compiler directive or a comment is left exactly as written.** Reordering across `{$IFDEF}` would change which units a build sees, and a comment inside a uses clause exists to pin a position — see the `cthreads, { must come first so TThread has a driver }` clauses in the test programs. The formatter therefore treats any clause containing `{$…}`, `//`, `{ … }`, or `(* … *)` as author-owned and emits it verbatim; grouping and alphabetisation are on you in those clauses. A clause that no semicolon closes before the next declaration or the end of the file, or that has more code after its semicolon on the same line, is also emitted as written. Everything else the formatter does (trailing whitespace, line endings, identifier casing) still applies to the rest of the file.
 
 What the formatter does *not* do (today):
 
@@ -186,7 +197,7 @@ When you add a new package under `packages/<name>/`, it's auto-discovered via `[
 
 ## Comments
 
-- Pascal block comments `{ ... }` do **not** nest by default in FPC mode `objfpc`. If a comment body contains literal `{` or `}` (e.g. quoting TOML or FPC include syntax), use `(* ... *)` for the outer.
+- Whether Pascal block comments nest depends on the mode. They nest in FPC's default `fpc` mode and in `objfpc`, and `{$modeswitch nestedcomments+}` turns nesting on elsewhere. They do not nest in the `delphi` mode that `Shared.inc` selects. If a comment body contains literal `{` or `}` (e.g. quoting TOML or FPC include syntax), use `(* ... *)` for the outer so the comment reads the same in every mode.
 - **No patch markers.** Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT-canonical code does not carry `{ [LWPT patch] }` / `{ [gpm patch] }` markers — git history is the canonical record of every change. Inline Pascal comments still document *why* non-obvious code looks the way it does (e.g. why HTTPClient uses a byte-safe `AppendRawBytes` instead of `Copy(PAnsiChar)`).
 - Documentation comments should explain non-obvious intent, trade-offs, or constraints. **Do not narrate what the code does.** Don't write `{ Increment the counter }`. Do write `{ Skip the trailing CRLF — see RFC 7230 §3.5 }`.
 

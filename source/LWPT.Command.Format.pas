@@ -280,7 +280,7 @@ var
   Files, ExplicitIncludeSet, ExcludeSet, FinalFiles : TStringList;
   ProtectedRoots : TStringList;
   i, Changed : Integer;
-  Path, ProtectedCfgFile : string;
+  Path, ProtectedCfgFile, SkipReason : string;
   RunMode : TRunMode;
 
   procedure AddProtectedRoot(const ADir: string);
@@ -377,7 +377,7 @@ begin
 
     Changed := 0;
     for i := 0 to FinalFiles.Count - 1 do
-      if FormatFile(FinalFiles[i], RunMode) then
+      if FormatFile(FinalFiles[i], RunMode, SkipReason) then
       begin
         Inc(Changed);
         if ACheckOnly then
@@ -385,6 +385,14 @@ begin
             + ExtractFileName(FinalFiles[i]))
         else
           WriteLn('  formatted: ', ExtractFileName(FinalFiles[i]));
+      end
+      else if SkipReason <> '' then
+      begin
+        { Not lexically valid Pascal: left untouched rather than guessed at. }
+        if ACheckOnly then
+          WriteCommandResultLine('  left unformatted: ' + SkipReason)
+        else
+          WriteLn('  left unformatted: ', SkipReason);
       end;
 
     if ACheckOnly then

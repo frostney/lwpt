@@ -67,6 +67,11 @@ function AnalyzePascal(const ASource: string;
   const ASourceName: string = ''): TLWPTPascalDocument;
 function PascalRegionIsExecutable(const AKind: TLWPTPascalRegionKind):
   Boolean;
+{ +1 for a directive token that opens a conditional block ($IF, $IFDEF,
+  $IFNDEF, $IFOPT), -1 for one that closes it ($ENDIF, $IFEND), and 0 for
+  every other token. }
+function PascalConditionalDirectiveDelta(const AToken: TLWPTPascalToken):
+  Integer;
 
 implementation
 
@@ -617,14 +622,21 @@ end;
 
 function TLWPTPascalStructureParser.ConditionalDirectiveDelta(
   const AIndex: Integer): Integer;
+begin
+  Result := 0;
+  if (AIndex >= 0) and (AIndex < Length(FDocument.Tokens)) then
+    Result := PascalConditionalDirectiveDelta(FDocument.Tokens[AIndex]);
+end;
+
+function PascalConditionalDirectiveDelta(const AToken: TLWPTPascalToken):
+  Integer;
 var
   DirectiveText, DirectiveWord: string;
   WordEnd: Integer;
 begin
   Result := 0;
-  if (AIndex < 0) or (AIndex >= Length(FDocument.Tokens))
-    or (FDocument.Tokens[AIndex].Kind <> ptDirective) then Exit;
-  DirectiveText := LowerCase(Trim(FDocument.Tokens[AIndex].Text));
+  if AToken.Kind <> ptDirective then Exit;
+  DirectiveText := LowerCase(Trim(AToken.Text));
   if Copy(DirectiveText, 1, 2) = '{$' then
     DirectiveText := Copy(DirectiveText, 3, Length(DirectiveText) - 3)
   else if Copy(DirectiveText, 1, 3) = '(*$' then
