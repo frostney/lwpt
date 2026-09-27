@@ -25,6 +25,174 @@ implementation
 type
   TUnitCategory = (ucSystem, ucThirdParty, ucProject, ucRelative);
 
+  { Lexical state carried from one line to the next. A string literal
+    cannot span a line break and a double-slash comment always ends at
+    one, so only the two block-comment forms survive it. }
+  TLexState = (lsCode, lsBraceComment, lsParenStarComment);
+
+  TLineFlags = array of Boolean;
+
+  (* Which characters of each line are code. Every rewriting pass reads
+     the file through this map, so routine-header detection, identifier
+     renames, uses-clause detection and the spacing fix never act on text
+     inside a brace, parenthesis-star or double-slash comment, a compiler
+     directive, or a string literal. Brace comments do not nest, matching
+     FPC's delphi and objfpc modes. The map aliases the pass's line list;
+     a pass that rewrites a line calls Refresh for it. *)
+  TCodeMap = class
+  private
+    FLines: TStringList;
+    FStartStates: array of TLexState;
+    FKinds: array of string;
+  public
+    constructor Create(const ALines: TStringList);
+    procedure Refresh(AIndex: Integer);
+    function Count: Integer;
+    function IsCode(AIndex, APosition: Integer): Boolean;
+    function CodeText(AIndex: Integer): string;
+    function StartsWithCode(AIndex: Integer): Boolean;
+  end;
+
+const
+  KIND_CODE = 'c';
+  KIND_OTHER = '-';
+
+{ ═══════════════════════════════════════════════════════════════════════════
+  Lexical Code Map
+  ═══════════════════════════════════════════════════════════════════════════ }
+
+{ Returns the index just past the string literal that opens at AStart.
+  A doubled quote is an escaped quote; an unterminated literal ends at
+  the line end. }
+function SkipStringLiteral(const ALine: string; AStart: Integer): Integer;
+begin
+  Result := AStart + 1;
+  while Result <= Length(ALine) do
+  begin
+    if ALine[Result] <> '''' then
+      Inc(Result)
+    else if (Result < Length(ALine)) and (ALine[Result + 1] = '''') then
+      Inc(Result, 2)
+    else
+      Exit(Result + 1);
+  end;
+end;
+
+{ Marks each character of ALine as code or not, starting in AState, and
+  returns the state the next line starts in. }
+function ClassifyLine(const ALine: string; AState: TLexState;
+  out AKinds: string): TLexState;
+var
+  I, Len: Integer;
+begin
+  Len := Length(ALine);
+  AKinds := StringOfChar(KIND_OTHER, Len);
+  I := 1;
+  while I <= Len do
+  begin
+    case AState of
+      lsBraceComment:
+        begin
+          if ALine[I] = '}' then
+            AState := lsCode;
+          Inc(I);
+        end;
+      lsParenStarComment:
+        if (ALine[I] = '*') and (I < Len) and (ALine[I + 1] = ')') then
+        begin
+          AState := lsCode;
+          Inc(I, 2);
+        end
+        else
+          Inc(I);
+    else
+      if ALine[I] = '''' then
+        I := SkipStringLiteral(ALine, I)
+      else if ALine[I] = '{' then
+      begin
+        AState := lsBraceComment;
+        Inc(I);
+      end
+      else if (ALine[I] = '(') and (I < Len) and (ALine[I + 1] = '*') then
+      begin
+        AState := lsParenStarComment;
+        Inc(I, 2);
+      end
+      else if (ALine[I] = '/') and (I < Len) and (ALine[I + 1] = '/') then
+        Break
+      else
+      begin
+        AKinds[I] := KIND_CODE;
+        Inc(I);
+      end;
+    end;
+  end;
+  Result := AState;
+end;
+
+constructor TCodeMap.Create(const ALines: TStringList);
+var
+  I: Integer;
+  State: TLexState;
+begin
+  inherited Create;
+  FLines := ALines;
+  SetLength(FStartStates, ALines.Count);
+  SetLength(FKinds, ALines.Count);
+  State := lsCode;
+  for I := 0 to ALines.Count - 1 do
+  begin
+    FStartStates[I] := State;
+    State := ClassifyLine(ALines[I], State, FKinds[I]);
+  end;
+end;
+
+{ Reclassifies one line after a pass rewrote it. Passes only ever change
+  code characters (identifier renames, stray-space removal), and neither
+  can open or close a comment or literal, so every later line keeps its
+  recorded start state. }
+procedure TCodeMap.Refresh(AIndex: Integer);
+begin
+  ClassifyLine(FLines[AIndex], FStartStates[AIndex], FKinds[AIndex]);
+end;
+
+function TCodeMap.Count: Integer;
+begin
+  Result := Length(FKinds);
+end;
+
+function TCodeMap.IsCode(AIndex, APosition: Integer): Boolean;
+begin
+  Result := (APosition >= 1) and (APosition <= Length(FKinds[AIndex])) and
+            (FKinds[AIndex][APosition] = KIND_CODE);
+end;
+
+{ The line with every non-code character blanked, so column positions
+  still line up with the original text. }
+function TCodeMap.CodeText(AIndex: Integer): string;
+var
+  K: Integer;
+begin
+  Result := FLines[AIndex];
+  for K := 1 to Length(Result) do
+    if FKinds[AIndex][K] <> KIND_CODE then
+      Result[K] := ' ';
+end;
+
+{ True when the first non-blank character of the line is code rather
+  than the inside or opening of a comment, directive or literal. }
+function TCodeMap.StartsWithCode(AIndex: Integer): Boolean;
+var
+  Line: string;
+  K: Integer;
+begin
+  Line := FLines[AIndex];
+  for K := 1 to Length(Line) do
+    if Line[K] > ' ' then
+      Exit(FKinds[AIndex][K] = KIND_CODE);
+  Result := False;
+end;
+
 { ═══════════════════════════════════════════════════════════════════════════
   Uses-Clause Formatting
   ═══════════════════════════════════════════════════════════════════════════ }
@@ -215,58 +383,38 @@ begin
   Result := ALine;
 end;
 
-function UpdateBlockState(const ALine: string; AInBlock: Boolean): Boolean;
+{ Flags each line whose first code token is the uses keyword. The clause
+  parser reads the raw line, so a keyword that only follows a comment's
+  close on the same line is not flagged; prose inside any comment form
+  never is. }
+function MarkUsesClauseStarts(const ALines: TStringList): TLineFlags;
 var
-  K: Integer;
-  InStr: Boolean;
+  Map: TCodeMap;
+  I: Integer;
 begin
-  K := 1;
-  InStr := False;
-  while K <= Length(ALine) do
-  begin
-    if AInBlock then
-    begin
-      if ALine[K] = '}' then
-        AInBlock := False;
-    end
-    else if InStr then
-    begin
-      if ALine[K] = '''' then
-        InStr := False;
-    end
-    else if ALine[K] = '''' then
-      InStr := True
-    else if ALine[K] = '{' then
-      AInBlock := True
-    else if (ALine[K] = '/') and (K < Length(ALine)) and (ALine[K + 1] = '/') then
-      Break;
-    Inc(K);
+  Result := nil;
+  SetLength(Result, ALines.Count);
+  Map := TCodeMap.Create(ALines);
+  try
+    for I := 0 to ALines.Count - 1 do
+      Result[I] := Map.StartsWithCode(I) and IsUsesKeyword(ALines[I]);
+  finally
+    Map.Free;
   end;
-  Result := AInBlock;
 end;
 
 procedure FormatUsesInLines(const AInput: TStringList; const AOutput: TStringList);
 var
-  I, J, StartLine: Integer;
+  I, J: Integer;
   UsesContent, AfterUses, FullBlock, BeforeSC: string;
   Units, Formatted: TStringList;
-  InBlock: Boolean;
+  ClauseStarts: TLineFlags;
 begin
+  ClauseStarts := MarkUsesClauseStarts(AInput);
   I := 0;
-  InBlock := False;
   while I < AInput.Count do
   begin
-    if InBlock then
-    begin
-      InBlock := UpdateBlockState(AInput[I], InBlock);
-      AOutput.Add(AInput[I]);
-      Inc(I);
-      Continue;
-    end;
-
-    InBlock := UpdateBlockState(AInput[I], InBlock);
-
-    if IsUsesKeyword(AInput[I]) then
+    if ClauseStarts[I] then
     begin
       FullBlock := AInput[I];
       J := I;
@@ -281,32 +429,20 @@ begin
 
       if ContainsDirectiveOrComment(FullBlock) then
       begin
-        StartLine := I;
+        (* The clause starts are precomputed from the whole file, so a
+           brace opened inside the clause still reads as open on the
+           lines after the passthrough, and prose inside that comment is
+           never mistaken for the next clause.
+
+           One known limit, pre-existing and harmless now that a
+           commented clause is emitted verbatim: the terminator scan
+           above overshoots a clause that ends `{ … };` — StripLineComment
+           cuts at the brace, so the `;` behind it is invisible and J
+           runs on to the next semicolon. The overshot lines are
+           re-emitted unchanged; the only cost is that a clause landing
+           inside that range is left unformatted. *)
         while I <= J do
         begin
-          (* Keep the block-comment state machine in step across the
-             passthrough: a brace opened inside the clause must still
-             read as open on the lines that follow it, or a line of
-             prose inside that comment gets mistaken for the next
-             clause. Line I itself was already folded into InBlock
-             above.
-
-             Two known limits, both pre-existing and both harmless now
-             that a commented clause is emitted verbatim:
-               - UpdateBlockState tracks brace comments only, never the
-                 parenthesis-star form; do not read it as symmetric.
-                 A line of prose beginning with the clause keyword,
-                 inside a parenthesis-star comment, is still parsed as
-                 a clause — which is why no line of this comment starts
-                 with that word.
-               - the terminator scan above overshoots a clause that
-                 ends `{ … };` — StripLineComment cuts at the brace, so
-                 the `;` behind it is invisible and J runs on to the
-                 next semicolon. The overshot lines are re-emitted
-                 unchanged; the only cost is that a clause landing
-                 inside that range is left unformatted. *)
-          if I > StartLine then
-            InBlock := UpdateBlockState(AInput[I], InBlock);
           AOutput.Add(AInput[I]);
           Inc(I);
         end;
@@ -461,165 +597,45 @@ begin
     Result := NamePart;
 end;
 
-function IsExternalDeclaration(const ALines: TStringList; AStartLine: Integer): Boolean;
+{ Renames every code occurrence of AOld on one line; occurrences inside
+  comments, directives and string literals are left alone. Member access
+  (`X.Name`) is never renamed, nor is an AT&T assembler register
+  (`%name`): outside asm, `%` only prefixes a binary literal, never an
+  identifier. Returns True when the line changed. }
+function RenameWordInLine(const ALines: TStringList; const AMap: TCodeMap;
+  AIndex: Integer; const AOld, ANew: string): Boolean;
 var
-  DeclText: string;
-  K, Depth: Integer;
-begin
-  DeclText := ALines[AStartLine];
-  Depth := 0;
-  for K := 1 to Length(DeclText) do
-  begin
-    if DeclText[K] = '(' then Inc(Depth)
-    else if DeclText[K] = ')' then Dec(Depth);
-  end;
-  while (Depth > 0) and (AStartLine + 1 < ALines.Count) do
-  begin
-    Inc(AStartLine);
-    DeclText := DeclText + ' ' + ALines[AStartLine];
-    for K := 1 to Length(ALines[AStartLine]) do
-    begin
-      if ALines[AStartLine][K] = '(' then Inc(Depth)
-      else if ALines[AStartLine][K] = ')' then Dec(Depth);
-    end;
-  end;
-  Result := Pos(' external ', LowerCase(DeclText)) > 0;
-end;
-
-function ReplaceWordInLine(const ALine, AOld, ANew: string;
-  var AInBlock: Boolean): string;
-var
+  Line, Renamed: string;
   I, OldLen: Integer;
-  InStr: Boolean;
 begin
-  Result := '';
+  Result := False;
+  Line := ALines[AIndex];
+  Renamed := '';
   OldLen := Length(AOld);
   I := 1;
-  InStr := False;
-
-  while I <= Length(ALine) do
+  while I <= Length(Line) do
   begin
-    if AInBlock then
+    { An identifier never contains a comment, directive or literal
+      opener, so a match that starts on code is code throughout. }
+    if AMap.IsCode(AIndex, I) and (I + OldLen - 1 <= Length(Line)) and
+       (CompareText(Copy(Line, I, OldLen), AOld) = 0) and
+       ((I = 1) or (not IsIdentChar(Line[I - 1]) and
+         not (Line[I - 1] in ['.', '%']))) and
+       ((I + OldLen > Length(Line)) or not IsIdentChar(Line[I + OldLen])) then
     begin
-      if ALine[I] = '}' then
-        AInBlock := False;
-      Result := Result + ALine[I];
-      Inc(I);
+      Renamed := Renamed + ANew;
+      Inc(I, OldLen);
+      Result := True;
       Continue;
     end;
-
-    if InStr then
-    begin
-      if ALine[I] = '''' then
-      begin
-        if (I < Length(ALine)) and (ALine[I + 1] = '''') then
-        begin
-          Result := Result + ALine[I] + ALine[I + 1];
-          Inc(I, 2);
-          Continue;
-        end;
-        InStr := False;
-      end;
-      Result := Result + ALine[I];
-      Inc(I);
-      Continue;
-    end;
-
-    if ALine[I] = '''' then
-    begin
-      InStr := True;
-      Result := Result + ALine[I];
-      Inc(I);
-      Continue;
-    end;
-
-    if ALine[I] = '{' then
-    begin
-      if (I < Length(ALine)) and (ALine[I + 1] = '$') then
-      begin
-        Result := Result + ALine[I];
-        Inc(I);
-        Continue;
-      end;
-      AInBlock := True;
-      Result := Result + ALine[I];
-      Inc(I);
-      Continue;
-    end;
-
-    if (I < Length(ALine)) and (ALine[I] = '/') and (ALine[I + 1] = '/') then
-    begin
-      Result := Result + Copy(ALine, I, Length(ALine) - I + 1);
-      Exit;
-    end;
-
-    if (I + OldLen - 1 <= Length(ALine)) and
-       (CompareText(Copy(ALine, I, OldLen), AOld) = 0) then
-    begin
-      if ((I = 1) or (not IsIdentChar(ALine[I - 1]) and (ALine[I - 1] <> '.'))) and
-         ((I + OldLen > Length(ALine)) or not IsIdentChar(ALine[I + OldLen])) then
-      begin
-        Result := Result + ANew;
-        Inc(I, OldLen);
-        Continue;
-      end;
-    end;
-
-    Result := Result + ALine[I];
+    Renamed := Renamed + Line[I];
     Inc(I);
   end;
-end;
 
-function StripCodeLine(const ALine: string; var AInBlock: Boolean): string;
-var
-  I: Integer;
-  InStr: Boolean;
-begin
-  SetLength(Result, Length(ALine));
-  for I := 1 to Length(ALine) do
-    Result[I] := ' ';
-
-  I := 1;
-  InStr := False;
-  while I <= Length(ALine) do
+  if Result then
   begin
-    if AInBlock then
-    begin
-      if ALine[I] = '}' then
-        AInBlock := False;
-      Inc(I);
-      Continue;
-    end;
-    if InStr then
-    begin
-      if ALine[I] = '''' then
-      begin
-        if (I < Length(ALine)) and (ALine[I + 1] = '''') then
-        begin
-          Inc(I, 2);
-          Continue;
-        end;
-        InStr := False;
-      end;
-      Inc(I);
-      Continue;
-    end;
-    if ALine[I] = '''' then
-    begin
-      InStr := True;
-      Inc(I);
-      Continue;
-    end;
-    if ALine[I] = '{' then
-    begin
-      AInBlock := True;
-      Inc(I);
-      Continue;
-    end;
-    if (I < Length(ALine)) and (ALine[I] = '/') and (ALine[I + 1] = '/') then
-      Break;
-    Result[I] := ALine[I];
-    Inc(I);
+    ALines[AIndex] := Renamed;
+    AMap.Refresh(AIndex);
   end;
 end;
 
@@ -646,26 +662,63 @@ begin
   end;
 end;
 
-function FindDeclEnd(const ALines: TStringList; ADeclStart: Integer): Integer;
+{ A routine header is recognised only in code: its keyword must be the
+  first code token on the line. Prose inside a comment that begins with
+  `function` or `procedure` is blank in the code text and never matches. }
+function IsRoutineHeader(const AMap: TCodeMap; AIndex: Integer): Boolean;
+begin
+  Result := IsFuncDeclStart(AMap.CodeText(AIndex));
+end;
+
+{ The last line of the header's parameter list: parentheses are counted
+  in code only, so a parenthesis in a trailing comment or a default
+  string value cannot stretch the header over the lines after it. }
+function FindDeclEnd(const AMap: TCodeMap; ADeclStart: Integer): Integer;
+
+  function ParenBalance(const ACode: string): Integer;
+  var
+    K: Integer;
+  begin
+    Result := 0;
+    for K := 1 to Length(ACode) do
+      if ACode[K] = '(' then Inc(Result)
+      else if ACode[K] = ')' then Dec(Result);
+  end;
+
 var
-  K, Depth: Integer;
+  Depth, LastLine: Integer;
 begin
   Result := ADeclStart;
-  Depth := 0;
-  for K := 1 to Length(ALines[ADeclStart]) do
-  begin
-    if ALines[ADeclStart][K] = '(' then Inc(Depth)
-    else if ALines[ADeclStart][K] = ')' then Dec(Depth);
-  end;
-  while (Depth > 0) and (Result + 1 < ALines.Count) do
+  LastLine := AMap.Count - 1;
+  Depth := ParenBalance(AMap.CodeText(ADeclStart));
+  while (Depth > 0) and (Result < LastLine) do
   begin
     Inc(Result);
-    for K := 1 to Length(ALines[Result]) do
-    begin
-      if ALines[Result][K] = '(' then Inc(Depth)
-      else if ALines[Result][K] = ')' then Dec(Depth);
-    end;
+    Depth := Depth + ParenBalance(AMap.CodeText(Result));
   end;
+end;
+
+{ The code text of header lines ADeclStart..ADeclEnd, joined by spaces. }
+function HeaderCode(const AMap: TCodeMap; ADeclStart, ADeclEnd: Integer): string;
+var
+  J: Integer;
+begin
+  Result := AMap.CodeText(ADeclStart);
+  for J := ADeclStart + 1 to ADeclEnd do
+    Result := Result + ' ' + Trim(AMap.CodeText(J));
+end;
+
+function IsExternalDeclaration(const AMap: TCodeMap; AStartLine: Integer): Boolean;
+begin
+  Result := Pos(' external ', LowerCase(HeaderCode(AMap, AStartLine,
+    FindDeclEnd(AMap, AStartLine)))) > 0;
+end;
+
+{ A forward header owns no body: the code after it belongs to other
+  routines or to the enclosing program. }
+function IsForwardDeclaration(const AMap: TCodeMap; ADeclStart, ADeclEnd: Integer): Boolean;
+begin
+  Result := CountKeywordOnLine(HeaderCode(AMap, ADeclStart, ADeclEnd), 'forward') > 0;
 end;
 
 { Find the line index of the function's closing `end;`. Walks forward
@@ -684,52 +737,73 @@ end;
     - Local `type` / `var` / `const` sections themselves are inert —
       no early exit on those keywords.
   Unit-scope keywords (`implementation`, `interface`) DO indicate we've
-  walked out of the function entirely; bail in that case. }
-function FindFuncEnd(const ALines: TStringList; ADeclEnd: Integer): Integer;
+  walked out of the function entirely; bail in that case. So does an
+  `end` that closes more than the declaration section opened before any
+  body: the header was a member of a class, object or record type and
+  owns no body. An `asm` block opens a body the same way `begin` does.
+
+  -1 means the header owns no body. Callers then confine a parameter
+  rename to the header, so it can never run on into the code of the
+  routines or program block that follow. }
+function FindFuncEnd(const AMap: TCodeMap; ADeclEnd: Integer): Integer;
 var
-  I, Depth, NestedDeclEnd, NestedBodyEnd: Integer;
-  Stripped: string;
-  InBlock, FoundBegin: Boolean;
+  I, Depth, Opened, NestedDeclEnd, NestedBodyEnd: Integer;
+  Code: string;
+  FoundBegin: Boolean;
 begin
   Result := -1;
   Depth := 0;
   FoundBegin := False;
-  InBlock := False;
   I := ADeclEnd + 1;
 
-  while I < ALines.Count do
+  while I < AMap.Count do
   begin
-    Stripped := StripCodeLine(ALines[I], InBlock);
+    Code := AMap.CodeText(I);
 
     if not FoundBegin then
     begin
       { Nested function / procedure declaration in the outer function's
         var section. Recursively find its body end and skip past it so
-        its begin/end pair is not counted toward our outer depth. }
-      if IsFuncDeclStart(Stripped)
-         and not IsExternalDeclaration(ALines, I) then
+        its begin/end pair is not counted toward our outer depth. A
+        nested external or forward header has no body to skip. }
+      if IsRoutineHeader(AMap, I) then
       begin
-        NestedDeclEnd := FindDeclEnd(ALines, I);
-        NestedBodyEnd := FindFuncEnd(ALines, NestedDeclEnd);
+        NestedDeclEnd := FindDeclEnd(AMap, I);
+        if IsExternalDeclaration(AMap, I) or
+           IsForwardDeclaration(AMap, I, NestedDeclEnd) then
+        begin
+          I := NestedDeclEnd + 1;
+          Continue;
+        end;
+        NestedBodyEnd := FindFuncEnd(AMap, NestedDeclEnd);
         if NestedBodyEnd = -1 then
           Exit(-1);
         I := NestedBodyEnd + 1;
         Continue;
       end;
       { Walking out of the function entirely without finding a begin. }
-      if (CountKeywordOnLine(Stripped, 'implementation') > 0) or
-         (CountKeywordOnLine(Stripped, 'interface') > 0) then
+      if (CountKeywordOnLine(Code, 'implementation') > 0) or
+         (CountKeywordOnLine(Code, 'interface') > 0) then
         Exit(-1);
     end;
 
-    Depth := Depth + CountKeywordOnLine(Stripped, 'begin')
-                    + CountKeywordOnLine(Stripped, 'try')
-                    + CountKeywordOnLine(Stripped, 'case')
-                    + CountKeywordOnLine(Stripped, 'record')
-                    - CountKeywordOnLine(Stripped, 'end');
+    Opened := CountKeywordOnLine(Code, 'begin') + CountKeywordOnLine(Code, 'asm');
+    Depth := Depth + Opened
+                    + CountKeywordOnLine(Code, 'try')
+                    + CountKeywordOnLine(Code, 'record')
+                    - CountKeywordOnLine(Code, 'end');
+    { Before the body, `case` can only select a variant record's part and
+      shares the record's `end`; only a case statement has its own. }
+    if FoundBegin or (Opened > 0) then
+      Depth := Depth + CountKeywordOnLine(Code, 'case');
 
-    if (not FoundBegin) and (CountKeywordOnLine(Stripped, 'begin') > 0) then
-      FoundBegin := True;
+    if not FoundBegin then
+    begin
+      if Opened > 0 then
+        FoundBegin := True
+      else if Depth < 0 then
+        Exit(-1);
+    end;
 
     if FoundBegin and (Depth <= 0) then
     begin
@@ -750,17 +824,18 @@ var
   I, J, K: Integer;
   FuncName, NewName: string;
   OldNames, NewNames: TStringList;
-  InBlock: Boolean;
+  Map: TCodeMap;
 begin
   Result := False;
+  Map := TCodeMap.Create(ALines);
   OldNames := TStringList.Create;
   NewNames := TStringList.Create;
   try
     for I := 0 to ALines.Count - 1 do
     begin
-      if IsFuncDeclStart(ALines[I]) and not IsExternalDeclaration(ALines, I) then
+      if IsRoutineHeader(Map, I) and not IsExternalDeclaration(Map, I) then
       begin
-        FuncName := ExtractFuncName(ALines[I]);
+        FuncName := ExtractFuncName(Map.CodeText(I));
         if (FuncName <> '') and not IsPascalCase(FuncName) then
         begin
           NewName := UpCase(FuncName[1]) + Copy(FuncName, 2, Length(FuncName));
@@ -778,16 +853,13 @@ begin
     begin
       Result := True;
       for K := 0 to OldNames.Count - 1 do
-      begin
-        InBlock := False;
         for J := 0 to ALines.Count - 1 do
-          ALines[J] := ReplaceWordInLine(ALines[J],
-            OldNames[K], NewNames[K], InBlock);
-      end;
+          RenameWordInLine(ALines, Map, J, OldNames[K], NewNames[K]);
     end;
   finally
     OldNames.Free;
     NewNames.Free;
+    Map.Free;
   end;
 end;
 
@@ -917,52 +989,53 @@ end;
 function FixParamNames(const ALines: TStringList): Boolean;
 var
   I, J, K, DeclEnd, BodyEnd: Integer;
-  DeclText: string;
   OldNames, NewNames: TStringList;
-  InBlock: Boolean;
+  Map: TCodeMap;
 begin
   Result := False;
-  I := 0;
-  while I < ALines.Count do
-  begin
-    if IsFuncDeclStart(ALines[I]) and not IsExternalDeclaration(ALines, I) then
+  Map := TCodeMap.Create(ALines);
+  try
+    I := 0;
+    while I < ALines.Count do
     begin
-      DeclEnd := FindDeclEnd(ALines, I);
+      if IsRoutineHeader(Map, I) and not IsExternalDeclaration(Map, I) then
+      begin
+        DeclEnd := FindDeclEnd(Map, I);
 
-      DeclText := ALines[I];
-      for J := I + 1 to DeclEnd do
-        DeclText := DeclText + ' ' + Trim(ALines[J]);
+        OldNames := TStringList.Create;
+        NewNames := TStringList.Create;
+        try
+          ParseParamNames(HeaderCode(Map, I, DeclEnd), OldNames, NewNames);
 
-      OldNames := TStringList.Create;
-      NewNames := TStringList.Create;
-      try
-        ParseParamNames(DeclText, OldNames, NewNames);
-
-        if OldNames.Count > 0 then
-        begin
-          Result := True;
-
-          BodyEnd := FindFuncEnd(ALines, DeclEnd);
-          if BodyEnd = -1 then
-            BodyEnd := DeclEnd;
-
-          for K := 0 to OldNames.Count - 1 do
+          if OldNames.Count > 0 then
           begin
-            InBlock := False;
-            for J := I to BodyEnd do
-              ALines[J] := ReplaceWordInLine(ALines[J],
-                OldNames[K], NewNames[K], InBlock);
-          end;
-        end;
-      finally
-        OldNames.Free;
-        NewNames.Free;
-      end;
+            Result := True;
 
-      I := DeclEnd + 1;
-    end
-    else
-      Inc(I);
+            { The rename covers the header and the body it owns, nothing
+              more: a header without a body keeps it in the header. }
+            if IsForwardDeclaration(Map, I, DeclEnd) then
+              BodyEnd := -1
+            else
+              BodyEnd := FindFuncEnd(Map, DeclEnd);
+            if BodyEnd = -1 then
+              BodyEnd := DeclEnd;
+
+            for K := 0 to OldNames.Count - 1 do
+              for J := I to BodyEnd do
+                RenameWordInLine(ALines, Map, J, OldNames[K], NewNames[K]);
+          end;
+        finally
+          OldNames.Free;
+          NewNames.Free;
+        end;
+
+        I := DeclEnd + 1;
+      end
+      else
+        Inc(I);
+    end;
+  finally
+    Map.Free;
   end;
 end;
 
@@ -974,56 +1047,40 @@ function FixStraySpaces(const ALines: TStringList): Boolean;
 var
   I, J, SpaceStart: Integer;
   Line: string;
-  InStr, InLineComment, InBlockComment: Boolean;
+  Map: TCodeMap;
 begin
   Result := False;
-  InBlockComment := False;
-  for I := 0 to ALines.Count - 1 do
-  begin
-    Line := ALines[I];
-    InStr := False;
-    InLineComment := False;
-    J := 1;
-    while J <= Length(Line) do
+  Map := TCodeMap.Create(ALines);
+  try
+    for I := 0 to ALines.Count - 1 do
     begin
-      if InLineComment then
-        Break;
-      if InStr then
+      Line := ALines[I];
+      J := 1;
+      while J <= Length(Line) do
       begin
-        if Line[J] = '''' then
-          InStr := False;
-        Inc(J);
-        Continue;
-      end;
-      if InBlockComment then
-      begin
-        if Line[J] = '}' then
-          InBlockComment := False;
-        Inc(J);
-        Continue;
-      end;
-      if Line[J] = '''' then
-        InStr := True
-      else if Line[J] = '{' then
-        InBlockComment := True
-      else if (J + 1 <= Length(Line)) and (Line[J] = '/') and (Line[J + 1] = '/') then
-        InLineComment := True
-      else if (Line[J] = ' ') and (J > 1) and (Line[J - 1] <> ' ') and (not (Line[J - 1] in [#9, '(', ','])) then
-      begin
-        SpaceStart := J;
-        while (J + 1 <= Length(Line)) and (Line[J + 1] = ' ') do
-          Inc(J);
-        if (J + 1 <= Length(Line)) and (Line[J + 1] in [';', ')', ',']) then
+        { A space that is code is followed by code up to the next
+          non-space character, so only that character needs checking. }
+        if Map.IsCode(I, J) and (Line[J] = ' ') and (J > 1) and
+           (Line[J - 1] <> ' ') and (not (Line[J - 1] in [#9, '(', ','])) then
         begin
-          Delete(Line, SpaceStart, J - SpaceStart + 1);
-          Result := True;
-          J := SpaceStart;
-          Continue;
+          SpaceStart := J;
+          while (J + 1 <= Length(Line)) and (Line[J + 1] = ' ') do
+            Inc(J);
+          if Map.IsCode(I, J + 1) and (Line[J + 1] in [';', ')', ',']) then
+          begin
+            Delete(Line, SpaceStart, J - SpaceStart + 1);
+            ALines[I] := Line;
+            Map.Refresh(I);
+            Result := True;
+            J := SpaceStart;
+            Continue;
+          end;
         end;
+        Inc(J);
       end;
-      Inc(J);
     end;
-    ALines[I] := Line;
+  finally
+    Map.Free;
   end;
 end;
 

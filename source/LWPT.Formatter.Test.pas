@@ -33,6 +33,8 @@ type
     procedure TestNestedProcedureBodyRefsRenamed;
     procedure TestNestedFunctionBodyRefsRenamed;
     procedure TestBothNestedShapesAtOnce;
+    procedure TestNestedVariantRecordBodyRefsRenamed;
+    procedure TestAssemblerBodyRefsRenamed;
   end;
 
   (* A comment between unit names used to desynchronise the uses-clause
@@ -58,6 +60,24 @@ type
     procedure TestCommentedClauseIsIdempotent;
     procedure TestCheckAgreesWithRewrite;
     procedure TestUncommentedClauseIsStillSorted;
+  end;
+
+  { Issue #301: prose inside a comment whose line began with `function`
+    or `procedure` read as a routine header. Its parenthesised words were
+    A-prefixed, and the rename then ran on into the next routine's code.
+    Every fixture asserts on the formatter's output bytes. }
+  TFormatCommentsAndStrings = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestIssueProbeIsUnchanged;
+    procedure TestHeaderShapedProseIsUnchanged;
+    procedure TestParenStarContinuationIsUnchanged;
+    procedure TestCommentsInsideARealBodyAreNotRenamed;
+    procedure TestStringLiteralsAreNotDeclarationsOrRenamed;
+    procedure TestRealParameterStillGetsItsPrefix;
+    procedure TestBodylessHeadersKeepTheirRenameInTheHeader;
+    procedure TestParenStarProseIsNotAUsesClause;
+    procedure TestParenStarProseKeepsItsSpacing;
   end;
 
   { ADR-0007 — exercises the scope-resolution algorithm via the
@@ -355,6 +375,68 @@ begin
   Expect<Boolean>(Contains(Out, 'Cardinal(AValue)')).ToBe(True);
 end;
 
+procedure TFormatParamRename.TestNestedVariantRecordBodyRefsRenamed;
+const
+  { A variant part's `case` shares the record's `end`. Counted as a
+    block of its own, it leaves the body unbalanced and the rename
+    stops at the header. }
+  INPUT =
+    'unit NestedVariant;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'implementation'#10 +
+    'procedure Fill(count: Integer);'#10 +
+    'type'#10 +
+    '  TCell = record'#10 +
+    '    case Byte of'#10 +
+    '      0: (Whole: LongInt);'#10 +
+    '      1: (Parts: array[0..3] of Byte);'#10 +
+    '  end;'#10 +
+    'var'#10 +
+    '  Cell: TCell;'#10 +
+    'begin'#10 +
+    '  case count of'#10 +
+    '    0: Cell.Whole := 0;'#10 +
+    '  else'#10 +
+    '    Cell.Whole := count;'#10 +
+    '  end;'#10 +
+    'end;'#10 +
+    'end.'#10;
+var Out: string;
+begin
+  Out := FormatAndRead('nested-variant-record', INPUT);
+  Expect<Boolean>(Contains(Out, 'procedure Fill(ACount: Integer);')).ToBe(True);
+  Expect<Boolean>(Contains(Out, '  case ACount of')).ToBe(True);
+  Expect<Boolean>(Contains(Out, '    Cell.Whole := ACount;')).ToBe(True);
+end;
+
+procedure TFormatParamRename.TestAssemblerBodyRefsRenamed;
+const
+  { An asm block is the routine's body: the parameter operand follows
+    the header's rename, while the `%fsr` register of the same spelling
+    is not an identifier and stays. }
+  INPUT =
+    'unit AssemblerBody;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'implementation'#10 +
+    'procedure SetFsr(fsr: LongWord); assembler;'#10 +
+    'var'#10 +
+    '  Scratch: LongWord;'#10 +
+    'asm'#10 +
+    '  st fsr, Scratch'#10 +
+    '  ld Scratch, %fsr'#10 +
+    'end;'#10 +
+    'end.'#10;
+var Out: string;
+begin
+  Out := FormatAndRead('assembler-body', INPUT);
+  Expect<Boolean>(Contains(Out, 'procedure SetFsr(AFsr: LongWord); assembler;'))
+    .ToBe(True);
+  Expect<Boolean>(Contains(Out, '  st AFsr, Scratch')).ToBe(True);
+  Expect<Boolean>(Contains(Out, '  ld Scratch, %fsr')).ToBe(True);
+end;
+
 procedure TFormatParamRename.SetupTests;
 begin
   Test('nested record type: body refs renamed',
@@ -365,6 +447,10 @@ begin
     TestNestedFunctionBodyRefsRenamed);
   Test('both shapes at once: nothing leaks across scopes',
     TestBothNestedShapesAtOnce);
+  Test('nested variant record: body refs renamed',
+    TestNestedVariantRecordBodyRefsRenamed);
+  Test('asm body: parameter operand renamed, register left alone',
+    TestAssemblerBodyRefsRenamed);
 end;
 
 { ───────── TFormatUsesComments ─────────
@@ -653,6 +739,311 @@ begin
     TestCheckAgreesWithRewrite);
   Test('uncommented clause is still grouped and alphabetised',
     TestUncommentedClauseIsStillSorted);
+end;
+
+{ ───────── TFormatCommentsAndStrings ───────── }
+
+const
+  { The reproduction from issue #301, verbatim. }
+  PROBE_BRACE_COMMENT =
+    'program Probe;'#10 +
+    #10 +
+    '{ Counts down. The loop runs until this'#10 +
+    '  procedure reaches (count) zero. }'#10 +
+    'procedure Countdown;'#10 +
+    'var'#10 +
+    '  count: Integer;'#10 +
+    'begin'#10 +
+    '  count := 3;'#10 +
+    '  while count > 0 do'#10 +
+    '    Dec(count);'#10 +
+    '  WriteLn(count);'#10 +
+    'end;'#10 +
+    #10 +
+    'begin'#10 +
+    '  Countdown;'#10 +
+    'end.'#10;
+
+  PROBE_PAREN_STAR_COMMENT =
+    'program ProbeParenStar;'#10 +
+    #10 +
+    '(* Counts down. The loop runs until this'#10 +
+    '  procedure reaches (count) zero.'#10 +
+    '  function returns (count, total) as well. *)'#10 +
+    'procedure Countdown;'#10 +
+    'var'#10 +
+    '  count, total: Integer;'#10 +
+    'begin'#10 +
+    '  count := 3;'#10 +
+    '  total := count;'#10 +
+    '  WriteLn(count, total);'#10 +
+    'end;'#10 +
+    #10 +
+    'begin'#10 +
+    '  Countdown;'#10 +
+    'end.'#10;
+
+  { The frostney/wasmlight#142 comment, which each format run garbled
+    into `(AA parameter only read, ASuch as a loop bound)`. }
+  HEADER_SHAPED_PROSE =
+    'unit HeaderShapedProse;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'implementation'#10 +
+    '{ Mark each static fixed host whose slot AWritten says no instruction of the'#10 +
+    '  function writes (a parameter only read, such as a loop bound) as Stable. }'#10 +
+    'procedure MarkStable(const AWritten: array of Boolean);'#10 +
+    'begin'#10 +
+    'end;'#10 +
+    'end.'#10;
+
+{ Formats ASource twice and returns the first result. A second run that
+  changes the file again means the formatter has no fixed point for the
+  input, which `lwpt format --check` could never agree with. }
+function FormatToFixedPoint(const ASuffix, ASource: string): string;
+var
+  Path, Pass2: string;
+begin
+  Path := WriteTempPas(ASuffix, ASource);
+  FormatFile(Path, rmFormat);
+  Result := ReadFile(Path);
+  FormatFile(Path, rmFormat);
+  Pass2 := ReadFile(Path);
+  Expect<string>(Pass2).ToBe(Result);
+end;
+
+procedure TFormatCommentsAndStrings.TestIssueProbeIsUnchanged;
+var
+  Out, Path: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('comment-probe',
+    PROBE_BRACE_COMMENT, Out)).ToBe(True);
+  { The regression signature: the comment word and every local `count`
+    in the following routine became `ACount`. }
+  Expect<Boolean>(Contains(Out, 'ACount')).ToBe(False);
+  Expect<Boolean>(Contains(Out, '  procedure reaches (count) zero. }'))
+    .ToBe(True);
+
+  Path := WriteTempPas('comment-probe-check', PROBE_BRACE_COMMENT);
+  Expect<Boolean>(FormatFile(Path, rmCheck)).ToBe(False);
+end;
+
+procedure TFormatCommentsAndStrings.TestHeaderShapedProseIsUnchanged;
+var Out: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('comment-header-prose',
+    HEADER_SHAPED_PROSE, Out)).ToBe(True);
+  Expect<Boolean>(Contains(Out,
+    '  function writes (a parameter only read, such as a loop bound) as Stable. }'))
+    .ToBe(True);
+end;
+
+procedure TFormatCommentsAndStrings.TestParenStarContinuationIsUnchanged;
+var Out: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('comment-paren-star',
+    PROBE_PAREN_STAR_COMMENT, Out)).ToBe(True);
+  Expect<Boolean>(Contains(Out, 'ACount')).ToBe(False);
+  Expect<Boolean>(Contains(Out, 'ATotal')).ToBe(False);
+end;
+
+procedure TFormatCommentsAndStrings.TestCommentsInsideARealBodyAreNotRenamed;
+const
+  INPUT =
+    'unit BodyComments;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'implementation'#10 +
+    'procedure Drain(count: Integer);'#10 +
+    'begin'#10 +
+    '  // count reaches zero here'#10 +
+    '  (* count is never negative *)'#10 +
+    '  { count is a value parameter }'#10 +
+    '  while count > 0 do'#10 +
+    '    Dec(count); // stop at count = 0'#10 +
+    'end;'#10 +
+    'end.'#10;
+var Out: string;
+begin
+  Out := FormatToFixedPoint('comment-real-body', INPUT);
+  Expect<Boolean>(Contains(Out, 'procedure Drain(ACount: Integer);'))
+    .ToBe(True);
+  Expect<Boolean>(Contains(Out, '  while ACount > 0 do')).ToBe(True);
+  Expect<Boolean>(Contains(Out, '    Dec(ACount); // stop at count = 0'))
+    .ToBe(True);
+  Expect<Boolean>(Contains(Out, '  // count reaches zero here')).ToBe(True);
+  Expect<Boolean>(Contains(Out, '  (* count is never negative *)'))
+    .ToBe(True);
+  Expect<Boolean>(Contains(Out, '  { count is a value parameter }'))
+    .ToBe(True);
+end;
+
+procedure TFormatCommentsAndStrings.TestStringLiteralsAreNotDeclarationsOrRenamed;
+const
+  INPUT =
+    'unit StringLiterals;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'implementation'#10 +
+    'procedure Describe(count: Integer);'#10 +
+    'begin'#10 +
+    '  WriteLn(''function (x) is not a declaration'', count);'#10 +
+    '  WriteLn('#10 +
+    '    ''procedure (count, total) neither'');'#10 +
+    'end;'#10 +
+    'procedure Tally;'#10 +
+    'var'#10 +
+    '  total: Integer;'#10 +
+    'begin'#10 +
+    '  total := 0;'#10 +
+    '  WriteLn(total);'#10 +
+    'end;'#10 +
+    'end.'#10;
+var Out: string;
+begin
+  Out := FormatToFixedPoint('string-literals', INPUT);
+  Expect<Boolean>(Contains(Out,
+    '  WriteLn(''function (x) is not a declaration'', ACount);')).ToBe(True);
+  Expect<Boolean>(Contains(Out,
+    '    ''procedure (count, total) neither'');')).ToBe(True);
+  Expect<Boolean>(Contains(Out, 'ATotal')).ToBe(False);
+  Expect<Boolean>(Contains(Out, '  total := 0;')).ToBe(True);
+end;
+
+procedure TFormatCommentsAndStrings.TestRealParameterStillGetsItsPrefix;
+const
+  INPUT =
+    'program RealParameter;'#10 +
+    #10 +
+    '{ Counts down. The loop runs until this'#10 +
+    '  procedure reaches (count) zero. }'#10 +
+    'procedure Countdown(count: Integer);'#10 +
+    'begin'#10 +
+    '  while count > 0 do'#10 +
+    '    Dec(count);'#10 +
+    'end;'#10 +
+    #10 +
+    'begin'#10 +
+    '  Countdown(3);'#10 +
+    'end.'#10;
+var Out: string;
+begin
+  Out := FormatToFixedPoint('comment-real-parameter', INPUT);
+  Expect<Boolean>(Contains(Out, 'procedure Countdown(ACount: Integer);'))
+    .ToBe(True);
+  Expect<Boolean>(Contains(Out, '  while ACount > 0 do')).ToBe(True);
+  Expect<Boolean>(Contains(Out, '    Dec(ACount);')).ToBe(True);
+  Expect<Boolean>(Contains(Out, '  procedure reaches (count) zero. }'))
+    .ToBe(True);
+end;
+
+procedure TFormatCommentsAndStrings.TestBodylessHeadersKeepTheirRenameInTheHeader;
+const
+  { Neither the class member nor the forward header owns the code that
+    follows it, so the program's own `count` and `total` must survive. }
+  INPUT =
+    'program BodylessHeaders;'#10 +
+    #10 +
+    'type'#10 +
+    '  TCounter = class'#10 +
+    '    procedure Step(count: Integer);'#10 +
+    '  end;'#10 +
+    #10 +
+    'procedure Report(total: Integer); forward;'#10 +
+    #10 +
+    'procedure TCounter.Step(count: Integer);'#10 +
+    'begin'#10 +
+    '  Report(count);'#10 +
+    'end;'#10 +
+    #10 +
+    'procedure Report(total: Integer);'#10 +
+    'begin'#10 +
+    '  WriteLn(total);'#10 +
+    'end;'#10 +
+    #10 +
+    'var'#10 +
+    '  count, total: Integer;'#10 +
+    'begin'#10 +
+    '  count := 1;'#10 +
+    '  total := count;'#10 +
+    '  Report(total);'#10 +
+    'end.'#10;
+var Out: string;
+begin
+  Out := FormatToFixedPoint('bodyless-headers', INPUT);
+  Expect<Boolean>(Contains(Out, '    procedure Step(ACount: Integer);'))
+    .ToBe(True);
+  Expect<Boolean>(Contains(Out,
+    'procedure Report(ATotal: Integer); forward;')).ToBe(True);
+  Expect<Boolean>(Contains(Out,
+    'procedure TCounter.Step(ACount: Integer);' + LineEnding + 'begin' +
+    LineEnding + '  Report(ACount);')).ToBe(True);
+  Expect<Boolean>(Contains(Out, '  WriteLn(ATotal);')).ToBe(True);
+  Expect<Boolean>(Contains(Out,
+    '  count, total: Integer;' + LineEnding + 'begin' + LineEnding +
+    '  count := 1;' + LineEnding + '  total := count;' + LineEnding +
+    '  Report(total);')).ToBe(True);
+end;
+
+procedure TFormatCommentsAndStrings.TestParenStarProseIsNotAUsesClause;
+const
+  INPUT =
+    'unit ParenStarUses;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    '(* Callers pick their own order:'#10 +
+    '  uses C, B; would be a clause if this were code. *)'#10 +
+    'implementation'#10 +
+    'end.'#10;
+var Out: string;
+begin
+  Expect<Boolean>(FormatLeavesFileUnchanged('paren-star-uses', INPUT, Out))
+    .ToBe(True);
+  Expect<Boolean>(Contains(Out, 'uses' + LineEnding)).ToBe(False);
+end;
+
+procedure TFormatCommentsAndStrings.TestParenStarProseKeepsItsSpacing;
+const
+  INPUT =
+    'unit ParenStarSpacing;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'interface'#10 +
+    'implementation'#10 +
+    '(* Spacing is prose here : keep ( as is ) , please ; *)'#10 +
+    'procedure Tidy;'#10 +
+    'begin'#10 +
+    '  WriteLn(''a'' , ''b'' ) ;'#10 +
+    'end;'#10 +
+    'end.'#10;
+var Out: string;
+begin
+  Out := FormatToFixedPoint('paren-star-spacing', INPUT);
+  Expect<Boolean>(Contains(Out,
+    '(* Spacing is prose here : keep ( as is ) , please ; *)')).ToBe(True);
+  { Positive control: the same shapes in code are still tightened. }
+  Expect<Boolean>(Contains(Out, '  WriteLn(''a'', ''b'');')).ToBe(True);
+end;
+
+procedure TFormatCommentsAndStrings.SetupTests;
+begin
+  Test('issue #301 probe: comment and the next routine''s locals unchanged',
+    TestIssueProbeIsUnchanged);
+  Test('header-shaped prose in a brace comment is unchanged',
+    TestHeaderShapedProseIsUnchanged);
+  Test('header-shaped prose in a (* *) comment is unchanged',
+    TestParenStarContinuationIsUnchanged);
+  Test('comments inside a real routine body keep the parameter name',
+    TestCommentsInsideARealBodyAreNotRenamed);
+  Test('string literals are neither headers nor rename targets',
+    TestStringLiteralsAreNotDeclarationsOrRenamed);
+  Test('a real parameter after a header-shaped comment is still prefixed',
+    TestRealParameterStillGetsItsPrefix);
+  Test('bodyless headers confine their rename to the header',
+    TestBodylessHeadersKeepTheirRenameInTheHeader);
+  Test('(* *) prose beginning with uses is not parsed as a clause',
+    TestParenStarProseIsNotAUsesClause);
+  Test('(* *) prose keeps its spacing',
+    TestParenStarProseKeepsItsSpacing);
 end;
 
 { ───────── TFormatScopeExpansion (ADR-0007) ───────── }
@@ -1115,6 +1506,7 @@ begin
   TestRunnerProgram.AddSuite(TFormatIdempotence.Create(PROJECT_NAME + '.Formatter: idempotence'));
   TestRunnerProgram.AddSuite(TFormatParamRename.Create(PROJECT_NAME + '.Formatter: param-rename regression'));
   TestRunnerProgram.AddSuite(TFormatUsesComments.Create(PROJECT_NAME + '.Formatter: uses-clause comments'));
+  TestRunnerProgram.AddSuite(TFormatCommentsAndStrings.Create(PROJECT_NAME + '.Formatter: comments and strings'));
   TestRunnerProgram.AddSuite(TFormatScopeExpansion.Create(PROJECT_NAME + '.Formatter: scope expansion (ADR-0007)'));
   TestRunnerProgram.AddSuite(TLWPTFormatToolkitStateDefault.Create(PROJECT_NAME + '.Formatter: toolkit-state default'));
   TestRunnerProgram.Run;

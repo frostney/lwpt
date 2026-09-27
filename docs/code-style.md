@@ -104,6 +104,8 @@ and stay unqualified.
 - Uses-clause grouped, alphabetised within groups, blank line between groups.
 - Identifier casing for declared types (auto-cased to declared form).
 
+**Comments, compiler directives, and string literals are never rewritten.** Every pass classifies the file lexically first, so routine declarations and uses clauses are recognised only in code. Prose inside `{ … }`, `(* … *)`, or `//` that happens to begin with `function`, `procedure`, or `uses` is left alone, and a routine or parameter rename never touches a comment or string that mentions the old name. A parameter's `A`-prefix rename covers its own declaration and the body that declaration owns; a declaration without a body (a class member, a `forward` declaration, or an interface-section declaration) keeps the rename in the declaration.
+
 **A uses clause that carries a compiler directive or a comment is left exactly as written.** Reordering across `{$IFDEF}` would change which units a build sees, and a comment inside a uses clause exists to pin a position — see the `cthreads, { must come first so TThread has a driver }` clauses in the test programs. The formatter therefore treats any clause containing `{$…}`, `//`, `{ … }`, or `(* … *)` as author-owned and emits it verbatim; grouping and alphabetisation are on you in those clauses. Everything else the formatter does (trailing whitespace, line endings, identifier casing) still applies to the rest of the file.
 
 What the formatter does *not* do (today):
