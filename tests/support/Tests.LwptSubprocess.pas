@@ -73,6 +73,18 @@ function RunLwpt(const AArgs: array of string;
   const AExtraEnv: array of string;
   const ATimeoutMilliseconds: QWord): TLwptResult; overload;
 
+{ RunLwpt against the test-flavoured binary (LwptTestingBinaryPath) for this
+  one call; the configured binary is restored afterwards. Use it only for
+  runs that set an LWPT_TEST_* variable, so every other case keeps
+  exercising the binary users run. }
+function RunLwptTesting(const AArgs: array of string;
+  const AInDir: string;
+  const AExtraEnv: array of string): TLwptResult; overload;
+function RunLwptTesting(const AArgs: array of string;
+  const AInDir: string;
+  const AExtraEnv: array of string;
+  const ATimeoutMilliseconds: QWord): TLwptResult; overload;
+
 { Path to the lwpt binary. Defaults to './build/lwpt' resolved at the
   point of the call. Override via SetLwptBinaryPath when running
   from a non-standard layout (e.g. a side-by-side comparison). }
@@ -81,8 +93,7 @@ function LwptBinaryPath: string;
   `lwpt-testing` [build] entry with INSTALL_TESTING and refreshed by its
   [pretest] hook. Only that binary honours the LWPT_TEST_* fetch-redirection
   and fault-injection variables; ./build/lwpt, like a release binary,
-  ignores them. Programs that drive those seams select it with
-  SetLwptBinaryPath(LwptTestingBinaryPath). }
+  ignores them. Runs that set those variables go through RunLwptTesting. }
 function LwptTestingBinaryPath: string;
 function ExpectedExe(const APath: string): string;
 procedure SetLwptBinaryPath(const APath: string);
@@ -129,6 +140,9 @@ uses
 
 var
   GLwptBinaryPath: string = '';
+  { The test program's starting directory, which lwpt test sets to the
+    project root; programs may change directory afterwards. }
+  GStartDirectory: string = '';
   GForwardWorkerLease: Boolean = True;
 
 function LwptBinaryPath: string;
@@ -139,11 +153,35 @@ end;
 
 function LwptTestingBinaryPath: string;
 begin
-  Result := ExpandFileName('build/lwpt-testing');
+  Result := IncludeTrailingPathDelimiter(GStartDirectory) + 'build'
+    + PathDelim + 'lwpt-testing';
   if not FileExists(ExpectedExe(Result)) then
     raise Exception.Create(ExpectedExe(Result) + ' is missing; run '
       + '`./build/lwpt build lwpt-testing` (the [pretest] hook does this '
       + 'before every `lwpt test`)');
+end;
+
+function RunLwptTesting(const AArgs: array of string;
+  const AInDir: string;
+  const AExtraEnv: array of string): TLwptResult;
+begin
+  Result := RunLwptTesting(AArgs, AInDir, AExtraEnv, 0);
+end;
+
+function RunLwptTesting(const AArgs: array of string;
+  const AInDir: string;
+  const AExtraEnv: array of string;
+  const ATimeoutMilliseconds: QWord): TLwptResult;
+var
+  SavedBinaryPath: string;
+begin
+  SavedBinaryPath := GLwptBinaryPath;
+  GLwptBinaryPath := LwptTestingBinaryPath;
+  try
+    Result := RunLwpt(AArgs, AInDir, AExtraEnv, ATimeoutMilliseconds);
+  finally
+    GLwptBinaryPath := SavedBinaryPath;
+  end;
 end;
 
 function ExpectedExe(const APath: string): string;
@@ -488,5 +526,8 @@ begin
   WriteRunDiagnostic(ARun.Stderr, ADiagnostics);
   WriteRunDiagnostic('--- end captured output ---', ADiagnostics);
 end;
+
+initialization
+  GStartDirectory := GetCurrentDir;
 
 end.

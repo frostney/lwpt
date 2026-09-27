@@ -94,9 +94,14 @@ begin
   Result.SHA := ASHA;
 end;
 
+var
+  { The destination policy the last mocked ref listing was asked to use. }
+  LastListOptions: THTTPRequestOptions;
+
 function MockLeafRefs(const ARepoURL: string;
   const AOptions: THTTPRequestOptions): TGitRefArray;
 begin
+  LastListOptions := AOptions;
   SetLength(Result, 0);
   if Pos('leaf', ARepoURL) > 0 then
   begin
@@ -201,11 +206,21 @@ begin
   Manifest.Deps[3].Name := 'dist';
   SetLength(Lock, 1);
   Lock[0] := LockEntry('leaf', 'v0.6.1');
+  LastListOptions := Default(THTTPRequestOptions);
   Entries := CollectOutdated(Manifest, Lock, @MockLeafRefs);
   Expect<Integer>(Length(Entries)).ToBe(1);
   Expect<string>(Entries[0].Name).ToBe('leaf');
   Expect<string>(Entries[0].Latest).ToBe('0.7.0');
   Expect<Integer>(Ord(Entries[0].Status)).ToBe(Ord(ousMajor));
+  { outdated/update list refs under the same destination policy as install
+    (ADR-0048): the forge's own hosts, https on every hop, no private
+    address. }
+  Expect<Boolean>(LastListOptions.Destination.RequireHTTPS).ToBe(True);
+  Expect<Boolean>(LastListOptions.Destination.PrivateAddressPolicy = papDeny)
+    .ToBe(True);
+  Expect<Integer>(Length(LastListOptions.Destination.AllowedHosts)).ToBe(2);
+  Expect<string>(LastListOptions.Destination.AllowedHosts[0])
+    .ToBe('github.com');
 end;
 
 procedure TSkipSuite.SetupTests;

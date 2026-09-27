@@ -115,7 +115,7 @@ begin
   FArchiveBytes := Gzip(BuildTar(Entries));
   WriteBytesToFile(ArchivePath, FArchiveBytes);
 
-  Run := RunLwpt(['install'], SeedRoot,
+  Run := RunLwptTesting(['install'], SeedRoot,
     [PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot,
      CACHE_DIR_ENV + '=' + SeedCache]);
   DumpRunFailure('producer lease lock seed', Run, 0);
@@ -146,7 +146,7 @@ begin
   else
     Environment[4] := CRASH_PRODUCER_ENV + '=';
   Result := TProcess.Create(nil);
-  Result.Executable := LwptBinaryPath;
+  Result.Executable := LwptTestingBinaryPath;
   Result.Parameters.Add('install');
   Result.CurrentDirectory := ARoot;
   Result.Options := [poUsePipes];
@@ -202,7 +202,7 @@ end;
 procedure TInstallProducerLease.BeforeAll;
 begin
   FOriginalDir := GetCurrentDir;
-  SetLwptBinaryPath(LwptTestingBinaryPath);
+  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
   FScratch := CreateScratchRoot('install-producer-lease');
 end;
 

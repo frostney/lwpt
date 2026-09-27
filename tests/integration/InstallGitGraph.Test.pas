@@ -49,11 +49,16 @@ type
     procedure TestOfflineRestoresDirectURLWithoutTransport;
     procedure TestOfflineRequiresExistingLock;
     procedure TestOfflineAndFrozenAreMutuallyExclusive;
-    procedure TestMovedTagRefetchesWhenLockHasNoCommitIdentity;
+    procedure TestMovedTagBehindEarlyLockFailsUntilAccepted;
     procedure TestMovedLockedTagFailsUntilAccepted;
     procedure TestMovedLockedTagFailsManifestMutation;
     procedure TestMovedBranchKeepsFollowing;
     procedure TestAcceptMovedTagsRequiresOnlineInstall;
+    procedure TestMovedTagRespelledAsSemverFails;
+    procedure TestTagReplacedByBranchFails;
+    procedure TestBranchReplacedByTagIsNotAMovedTag;
+    procedure TestLockWithoutRefKindFailsClosedForMovedBranch;
+    procedure TestLockedCommitMustReproduceLockedArchive;
   end;
 
 const
@@ -139,6 +144,20 @@ begin
   end;
 end;
 
+procedure RemoveLockKey(const APath, AKey: string);
+var Lines: TStringList; LineIndex: Integer;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(APath);
+    for LineIndex := Lines.Count - 1 downto 0 do
+      if Pos(AKey + ' = ', Lines[LineIndex]) = 1 then Lines.Delete(LineIndex);
+    Lines.SaveToFile(APath);
+  finally
+    Lines.Free;
+  end;
+end;
+
 procedure RemoveResolvedCommit(const APath: string);
 var Lines: TStringList; i: Integer;
 begin
@@ -212,7 +231,7 @@ end;
 function TInstallGitGraph.RunInstall(const ARoot: string;
   const AArguments: array of string): TLwptResult;
 begin
-  Result := RunLwpt(AArguments, ARoot,
+  Result := RunLwptTesting(AArguments, ARoot,
     [PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot,
      PROJECT_NAME + '_CACHE_DIR=' + FCacheRoot]);
 end;
@@ -235,7 +254,7 @@ end;
 procedure TInstallGitGraph.BeforeAll;
 begin
   FOriginalDir := GetCurrentDir;
-  SetLwptBinaryPath(LwptTestingBinaryPath);
+  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
   FScratch := CreateScratchRoot('install-git-graph');
   FFixtureRoot := FScratch + '/git-fixture';
   FCacheRoot := FScratch + '/user-cache';
@@ -436,7 +455,7 @@ begin
     'shared = "fixture/shared@>=1.0.0 <2.0.0"'#10);
   WriteTextFile(FFixtureRoot + '/requests.log', '');
 
-  Run := RunLwpt(['install', '--offline'], Root,
+  Run := RunLwptTesting(['install', '--offline'], Root,
     [PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot,
      PROJECT_NAME + '_CACHE_DIR=' + FCacheRoot,
      PROJECT_NAME + '_TEST_HALT_AFTER_MODULE_RETAIN=shared']);
@@ -574,7 +593,7 @@ begin
   Mock := TMockHTTPServer.Create(BuildSimpleResponse(ArchiveBytes));
   try
     Mock.Start;
-    Run := RunLwpt(['install'], Root,
+    Run := RunLwptTesting(['install'], Root,
       [PROJECT_NAME + '_CACHE_DIR=' + FCacheRoot,
        ARCHIVE_ORIGIN_ENV + '=http://127.0.0.1:'
          + IntToStr(Mock.Port),
@@ -594,7 +613,7 @@ begin
 
   Refused := TMockRefusedEndpoint.Create;
   try
-    Run := RunLwpt(['install', '--offline'], Root,
+    Run := RunLwptTesting(['install', '--offline'], Root,
       [PROJECT_NAME + '_CACHE_DIR=' + FCacheRoot,
        ARCHIVE_ORIGIN_ENV + '=http://' + Refused.Host + ':'
          + IntToStr(Refused.Port),
@@ -615,7 +634,7 @@ var Root, Combined: string; Run: TLwptResult;
 begin
   Root := FScratch + '/offline-frozen-conflict';
   WriteRoot(Root, 'offline-frozen-conflict', '');
-  Run := RunInstall(Root, ['install', '--offline', '--frozen']);
+  Run := RunLwpt(['install', '--offline', '--frozen'], Root);
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('--offline cannot be combined with --frozen',
@@ -644,8 +663,10 @@ begin
 end;
 
 procedure TInstallGitGraph.
-  TestMovedTagRefetchesWhenLockHasNoCommitIdentity;
-var Root, ArchivePath, LockText, Combined: string; Run: TLwptResult;
+  TestMovedTagBehindEarlyLockFailsUntilAccepted;
+var
+  Root, ArchivePath, LockText, LockBefore, Combined: string;
+  Run: TLwptResult;
 begin
   Root := FScratch + '/moved-tag-with-early-lock';
   WriteRoot(Root, 'moved-tag-with-early-lock',
@@ -661,14 +682,28 @@ begin
     WriteLn('--- original tag install ---'#10, Run.Stdout, Run.Stderr, '---');
   Expect<Integer>(Run.ExitCode).ToBe(0);
   RemoveResolvedCommit(Root + '/lwpt.lock');
+  LockBefore := ReadBinaryFile(Root + '/lwpt.lock');
 
+  { An early schema-v3 lock records no commit, so the move is caught by the
+    archive it pinned: the new commit serves different bytes. }
   WriteRefs('shared', 'tag|v1.0.0|' + MUTATED_SHARED_COMMIT + '|'#10);
   WriteArchive('shared', MUTATED_SHARED_COMMIT,
-    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.1"'#10
     + 'units = ["source"]'#10);
   WriteTextFile(FFixtureRoot + '/requests.log', '');
 
   Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('dependency "shared": tag "v1.0.0" moved upstream '
+    + 'since it was locked: its archive no longer matches lwpt.lock',
+    Combined) > 0).ToBe(True);
+  Expect<Boolean>(Pos('install --accept-moved-tags', Combined) > 0)
+    .ToBe(True);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockBefore);
+
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+  Run := RunInstall(Root, ['install', '--accept-moved-tags']);
   Combined := Run.Stdout + Run.Stderr;
   if Run.ExitCode <> 0 then
     WriteLn('--- moved tag install ---'#10, Combined, '---');
@@ -679,8 +714,192 @@ begin
   LockText := ReadText(Root + '/lwpt.lock');
   Expect<Boolean>(Pos('resolvedCommit = "' + MUTATED_SHARED_COMMIT + '"',
     LockText) > 0).ToBe(True);
+  Expect<Boolean>(Pos('resolvedRefKind = "tag"', LockText) > 0).ToBe(True);
   Expect<Boolean>(Pos('archiveHash = "sha256:' + SHA256File(ArchivePath)
     + '"', LockText) > 0).ToBe(True);
+end;
+
+procedure TInstallGitGraph.TestMovedTagRespelledAsSemverFails;
+var Root, LockBefore, Combined: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/moved-tag-respelled';
+  WriteRoot(Root, 'moved-tag-respelled', 'shared = "fixture/shared@^1.0.0"'#10);
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('respelled tag seed', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  LockBefore := ReadBinaryFile(Root + '/lwpt.lock');
+
+  { v1.0.0 is deleted and the same version is re-published as 1.0.0 at a
+    different commit: the same SemVer tag moved. }
+  WriteRefs('shared', 'tag|1.0.0|' + MUTATED_SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', MUTATED_SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.1"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+  Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('tag "1.0.0" moved upstream since it was locked '
+    + '(locked commit ' + SHARED_COMMIT + ', now advertised at '
+    + MUTATED_SHARED_COMMIT + ')', Combined) > 0).ToBe(True);
+  Expect<Integer>(RequestCount(
+    'archive|shared|' + MUTATED_SHARED_COMMIT)).ToBe(0);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockBefore);
+end;
+
+procedure TInstallGitGraph.TestTagReplacedByBranchFails;
+var Root, LockBefore, Combined: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/tag-replaced-by-branch';
+  WriteRoot(Root, 'tag-replaced-by-branch',
+    'shared = "fixture/shared@release"'#10);
+  WriteRefs('shared', 'tag|release|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('tag seed', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('resolvedRefKind = "tag"',
+    ReadText(Root + '/lwpt.lock')) > 0).ToBe(True);
+  LockBefore := ReadBinaryFile(Root + '/lwpt.lock');
+
+  WriteRefs('shared', 'branch|release|' + MUTATED_SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', MUTATED_SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.1"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(FFixtureRoot + '/requests.log', '');
+  Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('locked tag "release" (commit ' + SHARED_COMMIT
+    + ') is now advertised only as branch "release" at '
+    + MUTATED_SHARED_COMMIT, Combined) > 0).ToBe(True);
+  Expect<Integer>(RequestCount(
+    'archive|shared|' + MUTATED_SHARED_COMMIT)).ToBe(0);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockBefore);
+end;
+
+procedure TInstallGitGraph.TestBranchReplacedByTagIsNotAMovedTag;
+var Root, LockText: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/branch-replaced-by-tag';
+  WriteRoot(Root, 'branch-replaced-by-tag', 'shared = "fixture/shared@main"'#10);
+  WriteRefs('shared', 'branch|main|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('branch seed', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+
+  WriteRefs('shared', 'tag|main|' + MUTATED_SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', MUTATED_SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.1"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('branch replaced by tag', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  LockText := ReadText(Root + '/lwpt.lock');
+  Expect<Boolean>(Pos('resolvedCommit = "' + MUTATED_SHARED_COMMIT + '"',
+    LockText) > 0).ToBe(True);
+  Expect<Boolean>(Pos('resolvedRefKind = "tag"', LockText) > 0).ToBe(True);
+end;
+
+procedure TInstallGitGraph.TestLockWithoutRefKindFailsClosedForMovedBranch;
+var Root, LockBefore, Combined, LockText: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/moved-branch-without-kind';
+  WriteRoot(Root, 'moved-branch-without-kind',
+    'shared = "fixture/shared@main"'#10);
+  WriteRefs('shared', 'branch|main|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('branch seed', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  { A lock written before ref kinds were recorded. }
+  RemoveLockKey(Root + '/lwpt.lock', 'resolvedRefKind');
+  LockBefore := ReadBinaryFile(Root + '/lwpt.lock');
+
+  WriteRefs('shared', 'branch|main|' + MUTATED_SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', MUTATED_SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.1"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('cannot prove "main" was a branch that may move',
+    Combined) > 0).ToBe(True);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockBefore);
+
+  Run := RunInstall(Root, ['install', '--accept-moved-tags']);
+  DumpRunFailure('accept moved branch', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  LockText := ReadText(Root + '/lwpt.lock');
+  Expect<Boolean>(Pos('resolvedRefKind = "branch"', LockText) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('resolvedCommit = "' + MUTATED_SHARED_COMMIT + '"',
+    LockText) > 0).ToBe(True);
+end;
+
+procedure TInstallGitGraph.TestLockedCommitMustReproduceLockedArchive;
+var Root, LockBefore, Combined, OtherCache: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/locked-archive-identity';
+  FCacheRoot := FScratch + '/locked-archive-identity-cache';
+  RecursiveDelete(FCacheRoot);
+  WriteRoot(Root, 'locked-archive-identity',
+    'shared = "fixture/shared@^1.0.0"'#10);
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('archive identity seed', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  LockBefore := ReadBinaryFile(Root + '/lwpt.lock');
+
+  { The forge now serves different bytes for the same locked commit, and
+    the per-user cache that held the verified bytes is gone. }
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "6.6.6"'#10
+    + 'units = ["source"]'#10);
+  OtherCache := FScratch + '/locked-archive-identity-cold-cache';
+  RecursiveDelete(OtherCache);
+  FCacheRoot := OtherCache;
+  Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('the archive served for locked commit ' + SHARED_COMMIT
+    + ' no longer matches lwpt.lock', Combined) > 0).ToBe(True);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockBefore);
+
+  { An unreachable ref advertisement falls back to the locked identity; the
+    fallback must still reproduce the locked bytes. }
+  SysUtils.DeleteFile(FFixtureRoot + '/refs/shared.refs');
+  RecursiveDelete(OtherCache);
+  Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('reusing verified lockfile identity', Combined) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('the archive served for locked commit ' + SHARED_COMMIT
+    + ' no longer matches lwpt.lock', Combined) > 0).ToBe(True);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockBefore);
+  Expect<Boolean>(Pos('version = "1.0.0"',
+    ReadText(Root + '/.lwpt/modules/shared/lwpt.toml')) > 0).ToBe(True);
+
+  { Later cases share the fixture root and the default cache. }
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  FCacheRoot := FScratch + '/user-cache';
 end;
 
 procedure TInstallGitGraph.TestMovedLockedTagFailsUntilAccepted;
@@ -809,6 +1028,8 @@ begin
   Expect<Integer>(Run.ExitCode).ToBe(0);
   LockText := ReadText(Root + '/lwpt.lock');
   Expect<Boolean>(Pos('resolvedRef = "main"', LockText) > 0).ToBe(True);
+  Expect<Boolean>(Pos('resolvedRefKind = "branch"', LockText) > 0)
+    .ToBe(True);
   Expect<Boolean>(Pos('resolvedCommit = "' + MUTATED_SHARED_COMMIT + '"',
     LockText) > 0).ToBe(True);
 end;
@@ -818,11 +1039,11 @@ var Root: string; Run: TLwptResult;
 begin
   Root := FScratch + '/accept-moved-tags-modes';
   WriteRoot(Root, 'accept-moved-tags-modes', '');
-  Run := RunInstall(Root, ['install', '--frozen', '--accept-moved-tags']);
+  Run := RunLwpt(['install', '--frozen', '--accept-moved-tags'], Root);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('--accept-moved-tags cannot be combined with --frozen '
     + 'or --offline', Run.Stderr) > 0).ToBe(True);
-  Run := RunInstall(Root, ['install', '--offline', '--accept-moved-tags']);
+  Run := RunLwpt(['install', '--offline', '--accept-moved-tags'], Root);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('--accept-moved-tags cannot be combined with --frozen '
     + 'or --offline', Run.Stderr) > 0).ToBe(True);
@@ -1026,8 +1247,9 @@ begin
     TestOfflineRequiresExistingLock);
   Test('offline and frozen install modes are mutually exclusive',
     TestOfflineAndFrozenAreMutuallyExclusive);
-  Test('a moved tag is refetched when the prior lock has no commit identity',
-    TestMovedTagRefetchesWhenLockHasNoCommitIdentity);
+  Test('a tag moved behind a lock without commit identity fails on its '
+    + 'archive until accepted',
+    TestMovedTagBehindEarlyLockFailsUntilAccepted);
   Test('a locked tag moved upstream fails until explicitly accepted',
     TestMovedLockedTagFailsUntilAccepted);
   Test('a manifest mutation refuses a moved locked tag and keeps the manifest',
@@ -1036,6 +1258,16 @@ begin
     TestMovedBranchKeepsFollowing);
   Test('accepting moved tags requires an online install',
     TestAcceptMovedTagsRequiresOnlineInstall);
+  Test('a locked tag re-published under another SemVer spelling fails',
+    TestMovedTagRespelledAsSemverFails);
+  Test('a locked tag replaced by a same-named branch fails',
+    TestTagReplacedByBranchFails);
+  Test('a locked branch replaced by a same-named tag is not a moved tag',
+    TestBranchReplacedByTagIsNotAMovedTag);
+  Test('a moved ref behind a lock without ref kinds fails closed until '
+    + 'accepted', TestLockWithoutRefKindFailsClosedForMovedBranch);
+  Test('a locked commit must reproduce its locked archive, including after '
+    + 'a failed ref listing', TestLockedCommitMustReproduceLockedArchive);
 end;
 
 begin

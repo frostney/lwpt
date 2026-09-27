@@ -382,6 +382,21 @@ begin
         and (Copy(AHaystack, 1, Length(ANeedle)) = ANeedle);
 end;
 
+{ The authority (userinfo, host and port) of a scheme://authority/... URL
+  template: everything between the scheme separator and the first '/', '?'
+  or '#'. }
+function TemplateAuthority(const ATemplate: string): string;
+var SchemeEnd, CharacterIndex: Integer;
+begin
+  Result := '';
+  SchemeEnd := Pos('://', ATemplate);
+  if SchemeEnd = 0 then Exit;
+  Result := Copy(ATemplate, SchemeEnd + 3, MaxInt);
+  for CharacterIndex := 1 to Length(Result) do
+    if Result[CharacterIndex] in ['/', '?', '#'] then
+      Exit(Copy(Result, 1, CharacterIndex - 1));
+end;
+
 function LooksLikeWindowsAbsolutePath(const S: string): Boolean; inline;
 begin
   Result := (Length(S) >= 3)
@@ -1394,6 +1409,17 @@ begin
           raise EManifestError.CreateFmt(
             '[sources] %s: git template "%s" must use https://',
             [CS.Name, CS.GitTemplate]);
+        { The fetch destination policy allows exactly the hosts these
+          templates name (ADR-0048), so the host must not depend on the
+          resolved ref; it may still carry the user or repository. }
+        if Pos(PLACEHOLDER_REF, TemplateAuthority(CS.ArchiveTemplate)) > 0 then
+          raise EManifestError.CreateFmt(
+            '[sources] %s: archive template "%s" must not use %s in its host',
+            [CS.Name, CS.ArchiveTemplate, PLACEHOLDER_REF]);
+        if Pos(PLACEHOLDER_REF, TemplateAuthority(CS.GitTemplate)) > 0 then
+          raise EManifestError.CreateFmt(
+            '[sources] %s: git template "%s" must not use %s in its host',
+            [CS.Name, CS.GitTemplate, PLACEHOLDER_REF]);
         { The archive template needs {ref} (the git template doesn't
           — it points at the smart-HTTP info/refs endpoint, which
           we then list to discover refs). Catch missing {user} /

@@ -130,7 +130,7 @@ end;
 procedure TInstallGraphConflict.BeforeAll;
 begin
   FOriginalDir := GetCurrentDir;
-  SetLwptBinaryPath(LwptTestingBinaryPath);
+  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
   FScratch := CreateScratchRoot('install-graph-conflict');
   FRoot := FScratch + '/root';
   RecursiveDelete(FScratch);
@@ -206,7 +206,7 @@ begin
   WriteTextFile(Root + '/.lwpt/archives/sentinel.tar.gz', 'old-archive');
   WriteTextFile(Root + '/lwpt.lock', EMPTY_SCHEMA_V3_LOCK);
   WriteTextFile(Root + '/lwpt.cfg', 'old-cfg');
-  Run := RunLwpt(['install'], Root,
+  Run := RunLwptTesting(['install'], Root,
     [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<string>(ReadText(Root + '/.lwpt/modules/branch-a/old.txt'))
@@ -448,7 +448,7 @@ begin
   WritePackage(FScratch + '/mutation-a', 'branch-a', '');
   ForceDirectories(Root + '/.lwpt/modules/sentinel');
   WriteTextFile(Root + '/.lwpt/modules/sentinel/old.txt', 'old');
-  Run := RunLwpt(['install'], Root,
+  Run := RunLwptTesting(['install'], Root,
     [PROJECT_NAME + '_TEST_STALE_LOCAL_SNAPSHOT=branch-a']);
   Combined := Run.Stdout + Run.Stderr;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
@@ -469,7 +469,7 @@ begin
   WritePackage(FScratch + '/crash-recovery-a', 'branch-a', '');
   ForceDirectories(Root + '/.lwpt/modules/branch-a');
   WriteTextFile(Root + '/.lwpt/modules/branch-a/old.txt', 'old');
-  Run := RunLwpt(['install'], Root,
+  Run := RunLwptTesting(['install'], Root,
     [PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER=1']);
   Expect<Integer>(Run.ExitCode).ToBe(86);
   Expect<Boolean>(FileExists(
@@ -493,7 +493,7 @@ begin
   WritePackage(FScratch + '/retention-reader-a', 'branch-a', '');
   ForceDirectories(Root + '/.lwpt/modules/branch-a');
   WriteTextFile(Root + '/.lwpt/modules/branch-a/old.txt', 'old');
-  Run := RunLwpt(['install'], Root,
+  Run := RunLwptTesting(['install'], Root,
     [PROJECT_NAME + '_TEST_HALT_AFTER_MODULE_RETAIN=branch-a']);
   Expect<Integer>(Run.ExitCode).ToBe(87);
   Expect<string>(ReadText(
@@ -520,7 +520,7 @@ begin
   WriteTextFile(Root + '/.lwpt/modules/branch-b/old.txt', 'old-b');
   WriteTextFile(Root + '/lwpt.lock', EMPTY_SCHEMA_V3_LOCK);
   WriteTextFile(Root + '/lwpt.cfg', 'old-cfg');
-  Run := RunLwpt(['install'], Root,
+  Run := RunLwptTesting(['install'], Root,
     [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1',
      PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR=branch-a']);
   Combined := Run.Stdout + Run.Stderr;
@@ -553,7 +553,7 @@ begin
   WriteTextFile(Root + '/.lwpt/modules/branch-b/old.txt', 'old-b');
   WriteTextFile(Root + '/lwpt.lock', EMPTY_SCHEMA_V3_LOCK);
   WriteTextFile(Root + '/lwpt.cfg', 'old-cfg');
-  Run := RunLwpt(['install'], Root,
+  Run := RunLwptTesting(['install'], Root,
     [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1',
      PROJECT_NAME + '_TEST_THROW_RESTORE_FOR=branch-b']);
   Combined := Run.Stdout + Run.Stderr;
@@ -589,10 +589,10 @@ begin
   ForceDirectories(Root + '/.lwpt/modules/branch-b');
   WriteTextFile(Root + '/.lwpt/modules/branch-a/old.txt', 'old-a');
   WriteTextFile(Root + '/.lwpt/modules/branch-b/old.txt', 'old-b');
-  Run := RunLwpt(['install'], Root,
+  Run := RunLwptTesting(['install'], Root,
     [PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER=2']);
   Expect<Integer>(Run.ExitCode).ToBe(86);
-  Run := RunLwpt(['repair'], Root,
+  Run := RunLwptTesting(['repair'], Root,
     [PROJECT_NAME + '_CACHE_DIR=' + FScratch + '/shared-cache',
      PROJECT_NAME + '_TEST_THROW_RESTORE_FOR=branch-a']);
   Combined := Run.Stdout + Run.Stderr;
@@ -623,7 +623,7 @@ begin
   ForceDirectories(Root + '/.lwpt/modules');
   ModulePath := Root + '/.lwpt/modules/branch-a';
   Expect<Integer>(FpSymlink(PChar(LinkTarget), PChar(ModulePath))).ToBe(0);
-  Run := RunLwpt(['install'], Root,
+  Run := RunLwptTesting(['install'], Root,
     [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(IsDirSymlinkOrJunction(ModulePath)).ToBe(True);
@@ -661,7 +661,7 @@ begin
   finally
     P.Free;
   end;
-  Run := RunLwpt(['install'], Root,
+  Run := RunLwptTesting(['install'], Root,
     [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(IsDirSymlinkOrJunction(ModulePath)).ToBe(True);

@@ -7,9 +7,9 @@
 
   Each case runs one scenario twice: the test-flavoured binary proves the
   variable is effective, and ./build/lwpt proves the same variable changes
-  nothing. Dependencies point at an endpoint that refuses connections, so
-  the release binary's ordinary network attempt fails locally and
-  deterministically without touching the internet. }
+  nothing. Dependencies point at a local endpoint that refuses connections,
+  so the release binary's ordinary request is refused by the fetch policy
+  (ADR-0048) deterministically, without touching the internet. }
 program TestSeamIsolation.Test;
 
 {$mode delphi}{$H+}
@@ -131,7 +131,10 @@ begin
     Refused.Free;
   end;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
-  Expect<Boolean>(Pos('Failed to connect to', Run.Stderr) > 0).ToBe(True);
+  { The ordinary request path is taken, and the fetch policy refuses the
+    loopback endpoint (ADR-0048) instead of reading the fixture. }
+  Expect<Boolean>(Pos('fetch destination not allowed', Run.Stderr) > 0)
+    .ToBe(True);
   Expect<Boolean>(FileExists(FixtureRoot + '/requests.log')).ToBe(False);
   Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/seam')).ToBe(False);
   Expect<Boolean>(FileExists(Root + '/lwpt.lock')).ToBe(False);
@@ -186,7 +189,8 @@ begin
     Refused.Free;
   end;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
-  Expect<Boolean>(Pos('Failed to connect to', Run.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('fetch destination not allowed', Run.Stderr) > 0)
+    .ToBe(True);
   Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/seam')).ToBe(False);
 end;
 
@@ -219,17 +223,40 @@ begin
     .ToBe(True);
 end;
 
-{ release.yml refuses to publish a binary containing the seam prefix. This is
-  the guard's positive canary: the prefix is compiled into the test build and
-  absent from a binary built without INSTALL_TESTING. }
+{ release.yml refuses to publish a binary containing any marker listed in
+  tests/test-seam-markers.txt. This is the guard's positive canary: every
+  marker is compiled into the test build and absent from a binary built
+  without INSTALL_TESTING, so the list can neither go stale nor match
+  release code. }
 procedure TTestSeamIsolation.TestReleaseGuardMarkerIsTestBuildOnly;
-const
-  MARKER = PROJECT_NAME + '_TEST_';
+var
+  Markers: TStringList;
+  TestingBytes, ReleaseBytes: string;
+  MarkerIndex: Integer;
 begin
-  Expect<Boolean>(Pos(MARKER, ReadBinaryFile(ExpectedExe(FTestingBinary)))
-    > 0).ToBe(True);
-  Expect<Boolean>(Pos(MARKER, ReadBinaryFile(ExpectedExe(FReleaseBinary)))
-    > 0).ToBe(False);
+  TestingBytes := ReadBinaryFile(ExpectedExe(FTestingBinary));
+  ReleaseBytes := ReadBinaryFile(ExpectedExe(FReleaseBinary));
+  Markers := TStringList.Create;
+  try
+    Markers.LoadFromFile(ExpandFileName('tests/test-seam-markers.txt'));
+    Expect<Boolean>(Markers.Count > 0).ToBe(True);
+    Expect<Boolean>(Markers.IndexOf(PROJECT_NAME + '_TEST_') >= 0)
+      .ToBe(True);
+    for MarkerIndex := 0 to Markers.Count - 1 do
+    begin
+      Expect<Boolean>(Markers[MarkerIndex] <> '').ToBe(True);
+      if Pos(Markers[MarkerIndex], TestingBytes) = 0 then
+        WriteLn('marker missing from test build: ', Markers[MarkerIndex]);
+      Expect<Boolean>(Pos(Markers[MarkerIndex], TestingBytes) > 0)
+        .ToBe(True);
+      if Pos(Markers[MarkerIndex], ReleaseBytes) > 0 then
+        WriteLn('marker present in release build: ', Markers[MarkerIndex]);
+      Expect<Boolean>(Pos(Markers[MarkerIndex], ReleaseBytes) > 0)
+        .ToBe(False);
+    end;
+  finally
+    Markers.Free;
+  end;
 end;
 
 procedure TTestSeamIsolation.BeforeAll;
@@ -255,7 +282,7 @@ begin
     TestArchiveOriginIsIgnored);
   Test('the release binary ignores fault-injection variables',
     TestFaultInjectionIsIgnored);
-  Test('the release guard marker exists only in the test build',
+  Test('every release guard marker exists only in the test build',
     TestReleaseGuardMarkerIsTestBuildOnly);
 end;
 
