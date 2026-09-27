@@ -9,6 +9,7 @@ uses
   {$IFDEF UNIX}
   cthreads,
   BaseUnix,
+  Unix,
   {$ENDIF}
   Classes,
   Process,
@@ -28,6 +29,8 @@ const
   RELEASE_RETRY_SWITCH = '--worker-budget-release-retry';
   THREAD_SWITCH = '--worker-budget-threads';
   POLL_SWITCH = '--worker-budget-poll';
+  INHERITED_LOCK_SWITCH = '--worker-budget-inherited-lock';
+  UNREADABLE_OWN_SWITCH = '--worker-budget-unreadable-own';
   CORRUPT_OWNER_SWITCH = '--worker-budget-corrupt-owner';
   FANOUT_SWITCH = '--worker-budget-fanout';
   REUSE_SWITCH = '--worker-budget-token-reuse';
@@ -108,6 +111,10 @@ type
   public
     procedure SetupTests; override;
     procedure TestPersistentPolling;
+    {$IFDEF UNIX}
+    procedure TestInheritedWriterLockKeepsLeases;
+    procedure TestUnreadableOwnRequestIsNotPersisted;
+    {$ENDIF}
     procedure TestContendersShareCapacityAndBothProgress;
     procedure TestRequestIsBoundedByMachineCapacity;
     {$IFDEF DARWIN}
@@ -289,6 +296,112 @@ end;
 procedure AddWorkerEnvironment(AProcess: TProcess;
   const AStateRoot: string; const ABudget: string = TEST_BUDGET); forward;
 
+{$IFDEF UNIX}
+{ FPC's TFileStream takes a flock() share lock on every Unix open and creates
+  descriptors without close-on-exec. A child spawned while a coordinator write
+  is in flight therefore keeps an exclusive flock on the published request
+  inode for its whole lifetime. Hold that lock here as such a child would. }
+procedure CheckInheritedWriterLock;
+var
+  Session : TLWPTWorkerBudgetSession;
+  Lease, Second : TLWPTWorkerLease;
+  Environment : TStringList;
+  Snapshot : TLWPTWorkerBudgetSnapshot;
+  Entry : TLWPTWorkerBudgetEntry;
+  RequestPath : string;
+  Descriptor : LongInt;
+
+  procedure Check(ACondition: Boolean; const AMessage: string);
+  begin
+    if not ACondition then raise Exception.Create(AMessage);
+  end;
+
+begin
+  Session := nil;
+  Lease := nil;
+  Second := nil;
+  Environment := nil;
+  Descriptor := -1;
+  try
+    Session := TLWPTWorkerBudgetSession.Create('inherited-lock', 2);
+    Lease := Session.Acquire(0);
+    Check(Assigned(Lease), 'session must acquire its first lease');
+    RequestPath := IncludeTrailingPathDelimiter(WorkerStateRoot)
+      + 'inherited-lock.request';
+    Descriptor := FpOpen(PChar(RequestPath), O_RDONLY);
+    Check(Descriptor >= 0, 'request must be openable');
+    Check(fpFlock(Descriptor, LOCK_EX or LOCK_NB) = 0,
+      'simulated inherited writer lock must be held');
+
+    Second := Session.Acquire(0);
+    Check(Assigned(Second), 'held request lock must not consume capacity');
+    Environment := TStringList.Create;
+    AppendWorkerLeaseEnvironment(Environment, Lease);
+    Snapshot := GetWorkerBudgetSnapshot;
+    Check(Snapshot.ActiveWorkers = 2, 'both grants must remain counted');
+    for Entry in Snapshot.Entries do
+      Check(not Entry.Uncertain, 'readable entry reported as uncertain');
+    Lease.CancelPendingDelegation;
+    FreeAndNil(Second);
+    FreeAndNil(Lease);
+    Check(GetWorkerBudgetSnapshot.ActiveWorkers = 0, 'no leaked capacity');
+  finally
+    if Descriptor >= 0 then
+    begin
+      fpFlock(Descriptor, LOCK_UN);
+      FpClose(Descriptor);
+    end;
+    Environment.Free;
+    Second.Free;
+    Lease.Free;
+    Session.Free;
+  end;
+end;
+
+{ An unreadable own request must fail the owner loudly. Persisting the
+  conservative full-budget placeholder would starve every session on the
+  machine until this owner exits. }
+procedure CheckUnreadableOwnRequestIsNotPersisted;
+var
+  Session : TLWPTWorkerBudgetSession;
+  Lease : TLWPTWorkerLease;
+  Contents : TStringList;
+  RequestPath : string;
+  Raised : Boolean;
+
+  procedure Check(ACondition: Boolean; const AMessage: string);
+  begin
+    if not ACondition then raise Exception.Create(AMessage);
+  end;
+
+begin
+  Session := nil;
+  Lease := nil;
+  Contents := nil;
+  try
+    Session := TLWPTWorkerBudgetSession.Create('unreadable-own', 2);
+    RequestPath := IncludeTrailingPathDelimiter(WorkerStateRoot)
+      + 'unreadable-own.request';
+    WriteTextFile(RequestPath, 'corrupt');
+    Raised := False;
+    try
+      Lease := Session.Acquire(0);
+    except
+      on E: ELWPTWorkerBudgetError do Raised := True;
+    end;
+    Check(Raised, 'acquisition must fail on an unreadable own request');
+    Contents := TStringList.Create;
+    Contents.LoadFromFile(RequestPath);
+    Check(Trim(Contents.Text) = 'corrupt',
+      'conservative placeholder must not replace the request');
+  finally
+    Contents.Free;
+    Lease.Free;
+    Session.Free;
+  end;
+end;
+{$ENDIF}
+
 procedure CheckPersistentPolling;
 var
   Holder, First, Later : TLWPTWorkerBudgetSession;
@@ -398,6 +511,22 @@ begin
     ExitCode := 0;
     Exit(True);
   end;
+  {$IFDEF UNIX}
+  if (ParamCount = 2) and (ParamStr(1) = INHERITED_LOCK_SWITCH) then
+  begin
+    CheckInheritedWriterLock;
+    WriteTextFile(ParamStr(2), 'passed');
+    ExitCode := 0;
+    Exit(True);
+  end;
+  if (ParamCount = 2) and (ParamStr(1) = UNREADABLE_OWN_SWITCH) then
+  begin
+    CheckUnreadableOwnRequestIsNotPersisted;
+    WriteTextFile(ParamStr(2), 'passed');
+    ExitCode := 0;
+    Exit(True);
+  end;
+  {$ENDIF}
   if (ParamCount = 1) and (ParamStr(1) = UNCONSUMED_CHILD_SWITCH) then
   begin
     ExitCode := 0;
@@ -2315,10 +2444,32 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/poll-result')).ToBe(True);
 end;
 
+{$IFDEF UNIX}
+procedure TWorkerBudgetProcesses.TestInheritedWriterLockKeepsLeases;
+begin
+  RunUtilityWithBudget(INHERITED_LOCK_SWITCH,
+    FScratch + '/inherited-lock-result', '2');
+  Expect<Boolean>(FileExists(FScratch + '/inherited-lock-result')).ToBe(True);
+end;
+
+procedure TWorkerBudgetProcesses.TestUnreadableOwnRequestIsNotPersisted;
+begin
+  RunUtilityWithBudget(UNREADABLE_OWN_SWITCH,
+    FScratch + '/unreadable-own-result', '2');
+  Expect<Boolean>(FileExists(FScratch + '/unreadable-own-result')).ToBe(True);
+end;
+{$ENDIF}
+
 procedure TWorkerBudgetProcesses.SetupTests;
 begin
   Test('persistent polls retain FIFO position and withdraw abandoned demand',
     TestPersistentPolling);
+  {$IFDEF UNIX}
+  Test('an inherited writer lock on a request keeps its leases active',
+    TestInheritedWriterLockKeepsLeases);
+  Test('an unreadable own request is never overwritten with a placeholder',
+    TestUnreadableOwnRequestIsNotPersisted);
+  {$ENDIF}
   {$IFDEF DARWIN}
   Test('default worker budget matches macOS logical CPUs',
     TestDefaultBudgetMatchesMacOS);

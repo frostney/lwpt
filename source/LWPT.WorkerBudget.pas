@@ -142,11 +142,12 @@ uses
   DateUtils,
   {$IFDEF UNIX}
   BaseUnix,
-  Unix
+  Unix,
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  Windows
-  {$ENDIF};
+  Windows,
+  {$ENDIF}
+  LWPT.ProcessTree;
 
 const
   REQUEST_EXTENSION = '.request';
@@ -1084,6 +1085,66 @@ begin
 end;
 {$ENDIF}
 
+{ FPC's Unix TFileStream emulates share modes with flock(): reads take a
+  shared lock and creates take an exclusive one, on descriptors without
+  close-on-exec. A child spawned while such a descriptor is open keeps the
+  flock for its whole lifetime, and later share-mode opens of the published
+  file then fail with EAGAIN. Coordinator state is published by atomic rename,
+  so reads need no lock at all: read it through a plain descriptor. }
+function ReadStateLines(const APath: string; ALines: TStrings): Boolean;
+{$IFDEF UNIX}
+var
+  Descriptor, Count, Total : LongInt;
+  Content : string;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Result := False;
+  repeat
+    Descriptor := FpOpen(PChar(APath), O_RDONLY);
+  until (Descriptor >= 0) or (FpGetErrNo <> ESysEINTR);
+  if Descriptor < 0 then Exit;
+  try
+    Content := '';
+    Total := 0;
+    repeat
+      SetLength(Content, Total + 4096);
+      Count := FpRead(Descriptor, Content[Total + 1], 4096);
+      if Count > 0 then Inc(Total, Count)
+      else if (Count < 0) and (FpGetErrNo <> ESysEINTR) then Exit;
+    until Count = 0;
+    SetLength(Content, Total);
+  finally
+    FpClose(Descriptor);
+  end;
+  ALines.Text := Content;
+  Result := True;
+  {$ELSE}
+  try
+    ALines.LoadFromFile(APath);
+    Result := True;
+  except
+    Result := False;
+  end;
+  {$ENDIF}
+end;
+
+{ Publish coordinator state with no spawn in flight, so no child can inherit
+  the temporary file's descriptor and its exclusive flock. }
+procedure WriteStateLines(const APath: string; ALines: TStringList);
+begin
+  {$IFDEF UNIX}
+  BeginProcessHandleSetup;
+  try
+    AtomicWriteText(APath, StatePath(STATE_TMP_DIR), ALines);
+  finally
+    EndProcessHandleSetup;
+  end;
+  {$ELSE}
+  AtomicWriteText(APath, StatePath(STATE_TMP_DIR), ALines);
+  {$ENDIF}
+end;
+
 function BoolText(AValue: Boolean): string;
 begin
   if AValue then Result := '1' else Result := '0';
@@ -1097,11 +1158,7 @@ begin
   AEntry := Default(TLWPTWorkerBudgetEntry);
   Lines := TStringList.Create;
   try
-    try
-      Lines.LoadFromFile(APath);
-    except
-      Exit;
-    end;
+    if not ReadStateLines(APath, Lines) then Exit;
     if StrToIntDef(Lines.Values['schema'], 0) <> REQUEST_SCHEMA then Exit;
     AEntry.SessionId := Lines.Values['session'];
     AEntry.ProcessId := StrToIntDef(Lines.Values['pid'], 0);
@@ -1135,6 +1192,13 @@ procedure WriteEntry(const AEntry: TLWPTWorkerBudgetEntry);
 var
   Lines : TStringList;
 begin
+  { A conservative placeholder has no owner PID or lease tokens. Persisting it
+    would make the request permanently unreadable and reserve the whole
+    budget until its owner exits, so fail the caller instead. }
+  if AEntry.Uncertain then
+    raise ELWPTWorkerBudgetError.CreateFmt(
+      'worker session "%s" request is unreadable; refusing to replace it '
+      + 'with a conservative placeholder', [AEntry.SessionId]);
   Lines := TStringList.Create;
   try
     Lines.Add('schema=' + IntToStr(REQUEST_SCHEMA));
@@ -1149,8 +1213,7 @@ begin
     Lines.Add('wait-ticket=' + IntToStr(AEntry.WaitTicket));
     Lines.Add('lease-tokens=' + AEntry.LeaseTokens);
     Lines.Add('delegations=' + AEntry.Delegations);
-    AtomicWriteText(RequestPath(AEntry.SessionId),
-      StatePath(STATE_TMP_DIR), Lines);
+    WriteStateLines(RequestPath(AEntry.SessionId), Lines);
   finally
     Lines.Free;
   end;
@@ -1342,12 +1405,9 @@ begin
   if not FileExists(StatePath(BUDGET_FILE)) then Exit;
   Lines := TStringList.Create;
   try
-    try
-      Lines.LoadFromFile(StatePath(BUDGET_FILE));
-      if Lines.Count > 0 then Result := StrToIntDef(Trim(Lines[0]), 0);
-    except
-      Result := 0;
-    end;
+    if ReadStateLines(StatePath(BUDGET_FILE), Lines)
+       and (Lines.Count > 0) then
+      Result := StrToIntDef(Trim(Lines[0]), 0);
   finally
     Lines.Free;
   end;
@@ -1360,7 +1420,7 @@ begin
   Lines := TStringList.Create;
   try
     Lines.Add(IntToStr(AValue));
-    AtomicWriteText(StatePath(BUDGET_FILE), StatePath(STATE_TMP_DIR), Lines);
+    WriteStateLines(StatePath(BUDGET_FILE), Lines);
   finally
     Lines.Free;
   end;
@@ -1374,13 +1434,9 @@ begin
   if not FileExists(StatePath(QUEUE_FILE)) then Exit;
   Lines := TStringList.Create;
   try
-    try
-      Lines.LoadFromFile(StatePath(QUEUE_FILE));
-      if Lines.Count > 0 then
-        Result := StrToInt64Def(Trim(Lines[0]), 0);
-    except
-      Result := 0;
-    end;
+    if ReadStateLines(StatePath(QUEUE_FILE), Lines)
+       and (Lines.Count > 0) then
+      Result := StrToInt64Def(Trim(Lines[0]), 0);
   finally
     Lines.Free;
   end;
@@ -1393,7 +1449,7 @@ begin
   Lines := TStringList.Create;
   try
     Lines.Add(IntToStr(AValue));
-    AtomicWriteText(StatePath(QUEUE_FILE), StatePath(STATE_TMP_DIR), Lines);
+    WriteStateLines(StatePath(QUEUE_FILE), Lines);
   finally
     Lines.Free;
   end;
