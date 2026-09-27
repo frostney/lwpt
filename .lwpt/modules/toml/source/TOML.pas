@@ -37,6 +37,8 @@ uses
 
 type
   ETOMLParseError = class(Exception);
+  { Raised when a document exceeds the parser's structural resource limits. }
+  ETOMLLimitError = class(ETOMLParseError);
 
   TTOMLNode = class;
   TTOMLNodeMap = TOrderedStringMap<TTOMLNode>;
@@ -99,9 +101,14 @@ type
   TTOMLParser = class
   private
     FCurrentTable: TTOMLNode;
+    FCurrentTableDepth: Integer;
     FIndex: Integer;
+    FMaximumDepth: Integer;
+    FMaximumNodes: Integer;
+    FNodeCount: Integer;
     FRoot: TTOMLNode;
     FText: UTF8String;
+    FValueDepth: Integer;
 
     procedure Advance(const ACount: Integer = 1);
     procedure AppendCodePointUTF8(var ATarget: UTF8String;
@@ -115,6 +122,7 @@ type
       const AInlineTableNode: TTOMLNode; const AAllowSealed: Boolean);
     procedure AttachChild(const ATable: TTOMLNode; const AKey: string;
       const ANode: TTOMLNode);
+    procedure CheckDepth(const ADepth: Integer);
     function ConsumeComment: Boolean;
     function ConsumeNewline: Boolean;
     function CurrentChar: Char;
@@ -131,7 +139,7 @@ type
     function ParseBasicString(const AMultiline, AIsKey: Boolean): string;
     function ParseHexCodePoint(const ADigits: Integer): Cardinal;
     function ParseInlineTable: TTOMLNode;
-    function ParseKeyPath: TArray<string>;
+    function ParseKeyPath(const ABaseDepth: Integer): TArray<string>;
     procedure ParseKeyValuePair;
     function ParseLiteralString(const AMultiline, AIsKey: Boolean): string;
     function ParseQuotedKey: string;
@@ -145,6 +153,7 @@ type
     procedure RequireNotSealed(const ANode: TTOMLNode; const AKey: string);
     procedure Reset(const AText: UTF8String);
     procedure SkipBlankLinesAndComments;
+    procedure NoteNode;
     procedure PrepareInput;
     procedure SkipWhitespace(const AAllowNewlines: Boolean);
     function TryParseBinaryInteger(const AToken: string;
@@ -176,10 +185,22 @@ type
     function ValidateDigitsWithSeparators(const AText, AAllowedDigits: string;
       const AAllowEmpty: Boolean): Boolean;
   public
+    constructor Create;
     { Canonical parse entry. The caller manages the returned root
       node's lifetime (Free it when done). }
     function ParseDocument(const AText: UTF8String): TTOMLNode;
+    { Structural depth counts the root table as 0; each table, array item, or
+      dotted-key component below it adds one level. Zero disables the limit.
+      Limits apply before recursion or allocation of the offending node. }
+    property MaximumDepth: Integer read FMaximumDepth write FMaximumDepth;
+    { Counts every parsed value and every table created by a header or dotted
+      key. Zero disables the limit. }
+    property MaximumNodes: Integer read FMaximumNodes write FMaximumNodes;
   end;
+
+const
+  { Bounds parser and destructor recursion for untrusted documents. }
+  TOMLDefaultMaximumDepth = 128;
 
 implementation
 
@@ -478,10 +499,36 @@ end;
 
 { TTOMLParser }
 
+constructor TTOMLParser.Create;
+begin
+  inherited Create;
+  FMaximumDepth := TOMLDefaultMaximumDepth;
+end;
+
+procedure TTOMLParser.CheckDepth(const ADepth: Integer);
+begin
+  if (FMaximumDepth > 0) and (ADepth > FMaximumDepth) then
+    raise ETOMLLimitError.CreateFmt(
+      'TOML document exceeds the maximum structural depth of %d.',
+      [FMaximumDepth]);
+end;
+
+procedure TTOMLParser.NoteNode;
+begin
+  Inc(FNodeCount);
+  if (FMaximumNodes > 0) and (FNodeCount > FMaximumNodes) then
+    raise ETOMLLimitError.CreateFmt(
+      'TOML document exceeds the maximum of %d values and tables.',
+      [FMaximumNodes]);
+end;
+
 procedure TTOMLParser.Reset(const AText: UTF8String);
 begin
   FText := AText;
   FIndex := 1;
+  FNodeCount := 0;
+  FCurrentTableDepth := 0;
+  FValueDepth := 0;
   FRoot.Free;
   FRoot := TTOMLNode.CreateTable(False, False,
     False, False);
@@ -904,7 +951,7 @@ begin
     RaiseParseError('Expected a quoted TOML key.');
 end;
 
-function TTOMLParser.ParseKeyPath: TArray<string>;
+function TTOMLParser.ParseKeyPath(const ABaseDepth: Integer): TArray<string>;
 var
   Key: string;
 begin
@@ -919,6 +966,8 @@ begin
     else
       Key := ParseBareKey;
 
+    { Each dotted component creates one nested table level. }
+    CheckDepth(ABaseDepth + Length(Result) + 1);
     SetLength(Result, Length(Result) + 1);
     Result[Length(Result) - 1] := Key;
 
@@ -970,6 +1019,7 @@ begin
   Existing := GetChild(AContext, AKey);
   if not Assigned(Existing) then
   begin
+    NoteNode;
     Result := TTOMLNode.CreateTable(False, False,
       AAllowSealed or AContext.Sealed, True);
     AttachChild(AContext, AKey, Result);
@@ -1061,6 +1111,7 @@ begin
     Existing := GetChild(Context, APath[I]);
     if not Assigned(Existing) then
     begin
+      NoteNode;
       Existing := TTOMLNode.CreateTable(
         I = Length(APath) - 1, I <> Length(APath) - 1, False, False);
       AttachChild(Context, APath[I], Existing);
@@ -1120,6 +1171,7 @@ begin
     Existing := GetChild(Context, APath[I]);
     if not Assigned(Existing) then
     begin
+      NoteNode;
       Existing := TTOMLNode.CreateTable(False, True,
         False, False);
       AttachChild(Context, APath[I], Existing);
@@ -1147,6 +1199,7 @@ begin
   Existing := GetChild(Context, APath[Length(APath) - 1]);
   if not Assigned(Existing) then
   begin
+    NoteNode;
     ArrayNode := TTOMLNode.CreateArrayOfTables(False);
     AttachChild(Context, APath[Length(APath) - 1], ArrayNode);
   end
@@ -1163,6 +1216,7 @@ begin
     ArrayNode := Existing;
   end;
 
+  NoteNode;
   NewItem := TTOMLNode.CreateTable(True, False,
     False, False);
   ArrayNode.Items.Add(NewItem);
@@ -1180,7 +1234,7 @@ begin
   else
     Advance;
 
-  Path := ParseKeyPath;
+  Path := ParseKeyPath(0);
   SkipWhitespace(False);
 
   if IsArrayHeader then
@@ -1188,7 +1242,10 @@ begin
     if not MatchText(']]') then
       RaiseParseError('Unterminated array-of-tables header.');
     Advance(2);
+    { The array occupies the path's depth; its current item is one below. }
+    CheckDepth(Length(Path) + 1);
     FCurrentTable := ParseTableArray(Path);
+    FCurrentTableDepth := Length(Path) + 1;
   end
   else
   begin
@@ -1196,6 +1253,7 @@ begin
       RaiseParseError('Unterminated table header.');
     Advance;
     FCurrentTable := ParseRegularTable(Path);
+    FCurrentTableDepth := Length(Path);
   end;
 
   while IsSpaceOrTab(CurrentChar) do
@@ -1212,15 +1270,21 @@ var
   KeyPath: TArray<string>;
   ValueNode: TTOMLNode;
 begin
-  KeyPath := ParseKeyPath;
+  KeyPath := ParseKeyPath(FCurrentTableDepth);
   SkipWhitespace(False);
   if CurrentChar <> '=' then
     RaiseParseError('Expected "=" after TOML key.');
   Advance;
   SkipWhitespace(False);
 
+  FValueDepth := FCurrentTableDepth + Length(KeyPath);
   ValueNode := ParseValue('');
-  AssignValue(FCurrentTable, KeyPath, ValueNode, ValueNode, False);
+  try
+    AssignValue(FCurrentTable, KeyPath, ValueNode, ValueNode, False);
+  except
+    ValueNode.Free;
+    raise;
+  end;
 
   while IsSpaceOrTab(CurrentChar) do
     Advance;
@@ -1234,38 +1298,47 @@ end;
 function TTOMLParser.ParseArray: TTOMLNode;
 var
   ElementNode: TTOMLNode;
+  ArrayDepth: Integer;
 begin
+  ArrayDepth := FValueDepth;
   Result := TTOMLNode.CreateArray;
-  Advance;
-  SkipWhitespace(True);
-  if CurrentChar = ']' then
-  begin
+  try
     Advance;
-    Exit;
-  end;
-
-  while True do
-  begin
-    ElementNode := ParseValue(',]');
-    Result.Items.Add(ElementNode);
     SkipWhitespace(True);
-    if CurrentChar = ',' then
-    begin
-      Advance;
-      SkipWhitespace(True);
-      if CurrentChar = ']' then
-      begin
-        Advance;
-        Exit;
-      end;
-      Continue;
-    end;
     if CurrentChar = ']' then
     begin
       Advance;
       Exit;
     end;
-    RaiseParseError('Expected "," or "]" after TOML array element.');
+
+    while True do
+    begin
+      FValueDepth := ArrayDepth + 1;
+      ElementNode := ParseValue(',]');
+      FValueDepth := ArrayDepth;
+      Result.Items.Add(ElementNode);
+      SkipWhitespace(True);
+      if CurrentChar = ',' then
+      begin
+        Advance;
+        SkipWhitespace(True);
+        if CurrentChar = ']' then
+        begin
+          Advance;
+          Exit;
+        end;
+        Continue;
+      end;
+      if CurrentChar = ']' then
+      begin
+        Advance;
+        Exit;
+      end;
+      RaiseParseError('Expected "," or "]" after TOML array element.');
+    end;
+  except
+    Result.Free;
+    raise;
   end;
 end;
 
@@ -1273,46 +1346,60 @@ function TTOMLParser.ParseInlineTable: TTOMLNode;
 var
   InlineNode, ValueNode: TTOMLNode;
   KeyPath: TArray<string>;
+  TableDepth: Integer;
 begin
+  TableDepth := FValueDepth;
   InlineNode := TTOMLNode.CreateTable(False, False,
     True, False);
-  Advance;
-  SkipWhitespace(True);
-  if CurrentChar = '}' then
-  begin
-    Advance;
-    Exit(InlineNode);
-  end;
-
-  while True do
-  begin
-    KeyPath := ParseKeyPath;
-    SkipWhitespace(True);
-    if CurrentChar <> '=' then
-      RaiseParseError('Expected "=" inside inline table.');
+  try
     Advance;
     SkipWhitespace(True);
-    ValueNode := ParseValue(',}');
-    AssignValue(InlineNode, KeyPath, ValueNode, ValueNode, True);
-
-    SkipWhitespace(True);
-    if CurrentChar = ',' then
-    begin
-      Advance;
-      SkipWhitespace(True);
-      if CurrentChar = '}' then
-      begin
-        Advance;
-        Exit(InlineNode);
-      end;
-      Continue;
-    end;
     if CurrentChar = '}' then
     begin
       Advance;
       Exit(InlineNode);
     end;
-    RaiseParseError('Expected "," or "}" after inline table entry.');
+
+    while True do
+    begin
+      KeyPath := ParseKeyPath(TableDepth);
+      SkipWhitespace(True);
+      if CurrentChar <> '=' then
+        RaiseParseError('Expected "=" inside inline table.');
+      Advance;
+      SkipWhitespace(True);
+      FValueDepth := TableDepth + Length(KeyPath);
+      ValueNode := ParseValue(',}');
+      FValueDepth := TableDepth;
+      try
+        AssignValue(InlineNode, KeyPath, ValueNode, ValueNode, True);
+      except
+        ValueNode.Free;
+        raise;
+      end;
+
+      SkipWhitespace(True);
+      if CurrentChar = ',' then
+      begin
+        Advance;
+        SkipWhitespace(True);
+        if CurrentChar = '}' then
+        begin
+          Advance;
+          Exit(InlineNode);
+        end;
+        Continue;
+      end;
+      if CurrentChar = '}' then
+      begin
+        Advance;
+        Exit(InlineNode);
+      end;
+      RaiseParseError('Expected "," or "}" after inline table entry.');
+    end;
+  except
+    InlineNode.Free;
+    raise;
   end;
 end;
 
@@ -1320,6 +1407,8 @@ function TTOMLParser.ParseValue(const ADelimiters: string): TTOMLNode;
 var
   StringValue: string;
 begin
+  CheckDepth(FValueDepth);
+  NoteNode;
   if MatchText('"""') then
   begin
     StringValue := ParseBasicString(True, False);
