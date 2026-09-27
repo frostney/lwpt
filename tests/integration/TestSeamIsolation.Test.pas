@@ -9,7 +9,7 @@
   variable is effective, and ./build/lwpt proves the same variable changes
   nothing. Dependencies point at a local endpoint that refuses connections,
   so the release binary's ordinary request is refused by the fetch policy
-  (ADR-0045) deterministically, without touching the internet. }
+  (ADR-0048) deterministically, without touching the internet. }
 program TestSeamIsolation.Test;
 
 {$mode delphi}{$H+}
@@ -132,7 +132,7 @@ begin
   end;
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   { The ordinary request path is taken, and the fetch policy refuses the
-    loopback endpoint (ADR-0045) instead of reading the fixture. }
+    loopback endpoint (ADR-0048) instead of reading the fixture. }
   Expect<Boolean>(Pos('fetch destination not allowed', Run.Stderr) > 0)
     .ToBe(True);
   Expect<Boolean>(FileExists(FixtureRoot + '/requests.log')).ToBe(False);

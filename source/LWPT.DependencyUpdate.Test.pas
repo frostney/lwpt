@@ -213,7 +213,7 @@ begin
   Expect<string>(Entries[0].Latest).ToBe('0.7.0');
   Expect<Integer>(Ord(Entries[0].Status)).ToBe(Ord(ousMajor));
   { outdated/update list refs under the same destination policy as install
-    (ADR-0045): the forge's own hosts, https on every hop, no private
+    (ADR-0048): the forge's own hosts, https on every hop, no private
     address. }
   Expect<Boolean>(LastListOptions.Destination.RequireHTTPS).ToBe(True);
   Expect<Boolean>(LastListOptions.Destination.PrivateAddressPolicy = papDeny)

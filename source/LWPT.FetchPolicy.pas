@@ -1,5 +1,5 @@
 { LWPT.FetchPolicy — built-in forge origins and the destination policy for
-  dependency fetches (ADR-0045).
+  dependency fetches (ADR-0048).
 
   Every network request made on behalf of a dependency (ref listing and
   archive download) carries an HTTPClient destination policy derived from the

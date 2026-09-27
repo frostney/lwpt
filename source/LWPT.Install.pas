@@ -116,7 +116,7 @@ const
 
 const
   { Kind of the named ref a Git-host dependency was selected from, recorded
-    as `resolvedRefKind` in lwpt.lock (ADR-0045). }
+    as `resolvedRefKind` in lwpt.lock (ADR-0048). }
   RefKindTag    = 'tag';
   RefKindBranch = 'branch';
 
@@ -850,7 +850,7 @@ end;
 {$ENDIF}
 
 { AVerifyArchiveHash, when set, is the locked content identity the downloaded
-  bytes must reproduce (ADR-0045); a mismatch raises EVerifyError naming
+  bytes must reproduce (ADR-0048); a mismatch raises EVerifyError naming
   AVerifyContext before the bytes are written, cached, or extracted. }
 function FetchToCache(const ADep: TDependency;
   const AResolvedRef, AModulesRoot, AArchivesRoot, ATmpRoot,
@@ -1580,7 +1580,7 @@ begin
       KV('source',       AResolved[i].SrcOriginal);
       KV('resolvedRef',  AResolved[i].Version);
       KV('resolvedCommit', AResolved[i].CommitSHA);
-      { Additive v3 evidence (ADR-0045), written only for named Git refs. }
+      { Additive v3 evidence (ADR-0048), written only for named Git refs. }
       if AResolved[i].RefKind <> '' then
         KV('resolvedRefKind', AResolved[i].RefKind);
       KV('sourceIdentity', AResolved[i].SourceIdentity);
@@ -2763,7 +2763,7 @@ var
       + ' install --accept-moved-tags` to accept it.');
   end;
 
-  { A locked tag is an immutable name for a reviewed commit (ADR-0045).
+  { A locked tag is an immutable name for a reviewed commit (ADR-0048).
     Whenever resolution selects the same tag again -- under any manifest
     requirement, deliberately -- it must still be a tag at the locked
     commit. A tag that moved, or that was replaced by a same-named branch,

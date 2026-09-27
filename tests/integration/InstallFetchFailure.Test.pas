@@ -640,7 +640,7 @@ begin
     TestStalledServerFailsInsideTheRequestBudget);
 end;
 
-{ ── private destinations (ADR-0045) ───────────────────────────────── }
+{ ── private destinations (ADR-0048) ───────────────────────────────── }
 
 type
   { Drives the shipped binary (no test seams) against a refused local

@@ -80,7 +80,7 @@ the bytes against named blocks from the IANA IPv4 and IPv6 Special-Purpose
 Address Registries, plus multicast and reserved space. The client dials
 exactly the classified address, and TLS still verifies the certificate
 against the host name. Under an address policy the client dials IPv4 only
-and refuses a genuine IPv6 destination. [ADR-0045](./adr/0045-git-host-fetch-trust.md)
+and refuses a genuine IPv6 destination. [ADR-0048](./adr/0048-git-host-fetch-trust.md)
 lists the blocks and the globally reachable exceptions.
 
 LWPT derives each dependency's policy in `LWPT.FetchPolicy` and applies it to

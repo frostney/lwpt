@@ -1408,7 +1408,7 @@ begin
             '[sources] %s: git template "%s" must use https://',
             [CS.Name, CS.GitTemplate]);
         { The fetch destination policy allows exactly the hosts these
-          templates name (ADR-0045), so the host must not depend on the
+          templates name (ADR-0048), so the host must not depend on the
           resolved ref; it may still carry the user or repository. }
         if Pos(PLACEHOLDER_REF, TemplateAuthority(CS.ArchiveTemplate)) > 0 then
           raise EManifestError.CreateFmt(

@@ -1,4 +1,4 @@
-{ LWPT.FetchPolicy.Test — dependency fetch destination policy (ADR-0045).
+{ LWPT.FetchPolicy.Test — dependency fetch destination policy (ADR-0048).
 
   Pins which hosts, address policy, and scheme requirement each source kind
   carries: every network source requires https and a globally reachable
