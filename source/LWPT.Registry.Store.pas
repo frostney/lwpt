@@ -12,9 +12,11 @@ interface
 
 uses
   Classes,
+  Generics.Collections,
   SysUtils,
 
-  LWPT.Core;
+  LWPT.Core,
+  LWPT.Registry.Crypto;
 
 const
   REGISTRY_DEFAULT_DATA_DIR = LWPT_DIR + '/registry';
@@ -23,6 +25,11 @@ const
   REGISTRY_DEFAULT_PORT = 8080;
   MAX_REGISTRY_CONTROL_DOCUMENT_BYTES = 1024 * 1024;
   MAX_REGISTRY_RESOURCE_BYTES = High(Integer);
+  { Operator-configurable mirror disk budgets. The attempt budget bounds what
+    one synchronization may add; the store budget bounds the data directory. }
+  RegistryDefaultMirrorStoreBytes = Int64(32) * 1024 * 1024 * 1024;
+  RegistryDefaultMirrorSyncBytes = Int64(8) * 1024 * 1024 * 1024;
+  RegistryMinimumMirrorSyncBytes = Int64(1024) * 1024;
 
 type
   ELWPTRegistryError = class(ELWPTError)
@@ -46,14 +53,27 @@ type
     TLSPKCS12Path: string;
     TLSPasswordEnvironment: string;
     UpstreamURL, TrustKeyID, TrustPublicKey: string;
+    StoreBudgetBytes, SyncBudgetBytes: Int64;
   end;
 
+  { One accepted mirror rotation, bound to the exact content-addressed bytes
+    of its document, both signatures, and the new key's public record. }
+  TLWPTRegistryRotationBinding = record
+    Sequence: Int64;
+    Document, OldSignature, NewSignature, KeyDocument: string;
+  end;
+  TLWPTRegistryRotationBindingArray = array of TLWPTRegistryRotationBinding;
+
   TLWPTRegistryState = record
+    Role: TLWPTRegistryRole;
     Sequence: QWord;
     SnapshotHash: string;
     CheckpointPath: string;
     SignaturePath: string;
     TrustKeyID, TrustPublicKey, CheckpointHash, LastSync: string;
+    { Mirror only: the accepted root key record and exact rotation chain. }
+    TrustKeyDocument: string;
+    Rotations: TLWPTRegistryRotationBindingArray;
   end;
 
   TLWPTRegistryPublication = record
@@ -65,19 +85,53 @@ type
 
   TLWPTRegistryStore = class;
 
-  { One authenticated pointer and its request-owned metadata membership.
-    The store must outlive the view; no membership survives this request. }
+  TLWPTRegistryServedResource = record
+    StoredPath, Digest: string;
+  end;
+
+  { Immutable membership of one accepted generation, shared by every request
+    that captures the same authenticated state. Route paths map to stored
+    content-addressed bytes and the digest authenticated when it was built. }
+  TLWPTRegistryGeneration = class(TInterfacedObject)
+  private
+    FKey: string;
+    FResources: TDictionary<string, TLWPTRegistryServedResource>;
+    FRotations: TStringList;
+  public
+    constructor Create(const AKey: string);
+    destructor Destroy; override;
+    procedure Add(const ARoutePath, AStoredPath, ADigest: string);
+    procedure AddRotation(const ASequence: Int64);
+    function Resolve(const ARoutePath: string;
+      out AResource: TLWPTRegistryServedResource): Boolean;
+    procedure AppendStoredPaths(AList: TStrings);
+    property Key: string read FKey;
+    property Rotations: TStringList read FRotations;
+  end;
+
+  { One authenticated pointer and its shared generation membership. The store
+    must outlive the view. }
   TLWPTRegistryReadView = class
   private
     FStore: TLWPTRegistryStore;
     FState: TLWPTRegistryState;
-    FPublishedPaths, FSnapshotPaths, FRotations: TStringList;
+    FGeneration: TLWPTRegistryGeneration;
+    FGenerationReference: IInterface;
+    FHistory: TLWPTRegistryGeneration;
+    FHistoryReference: IInterface;
+    FRotations: TStringList;
+    FCheckpointDigest, FSignatureDigest: string;
   public
-    { Takes ownership of supplied verified membership lists. Nil membership
-      selects origin policy with lazy history validation. }
+    { A nil generation selects origin policy: history membership is loaded
+      once per accepted snapshot and shared through the store. }
     constructor Create(AStore: TLWPTRegistryStore; const AState: TLWPTRegistryState;
-      APublishedPaths: TStringList = nil; ARotations: TStringList = nil);
+      AGeneration: TLWPTRegistryGeneration = nil;
+      const ACheckpointDigest: string = ''; const ASignatureDigest: string = '');
     destructor Destroy; override;
+    { Maps a route-relative path to its stored bytes and, when known, the
+      authenticated digest the response must match. }
+    function Resolve(const ARoutePath: string; out AStoredPath, ADigest: string;
+      AProgress: TSHA256Progress = nil): Boolean;
     function ResourceIsPublished(const ARelative: string;
       AProgress: TSHA256Progress = nil): Boolean;
     { Returned list belongs to this view and must not be changed or freed. }
@@ -89,23 +143,44 @@ type
   private
     FRoot: string;
     FConfig: TLWPTRegistryConfig;
+    FGenerationLock: TRTLCriticalSection;
+    FHistory: TLWPTRegistryGeneration;
+    FHistoryReference: IInterface;
     function HashResource(const ARelative: string;
       AProgress: TSHA256Progress): string;
+    procedure CommitCheckpoint(var AState: TLWPTRegistryState;
+      const ASnapshot: TBytes; const APublishedAt, AKeyID: string;
+      const ASeed: TLWPTEd25519Seed);
     function LoadSeed(const AKeyID: string;
       AProgress: TSHA256Progress = nil): TBytes;
     procedure VerifyState(const AState: TLWPTRegistryState;
-      AProgress: TSHA256Progress = nil);
+      AProgress: TSHA256Progress = nil); overload;
+    procedure VerifyState(const AState: TLWPTRegistryState;
+      AProgress: TSHA256Progress; out ACheckpointDigest,
+      ASignatureDigest: string); overload;
     procedure RecoverDerivedState(const AState: TLWPTRegistryState);
   protected
     function RootPath(const ARelative: string): string;
     function TmpRoot: string;
     function ReadCurrentState(AProgress: TSHA256Progress = nil):
       TLWPTRegistryState;
+    function ReadCurrentStateBytes(AProgress: TSHA256Progress = nil): TBytes;
+    function StateFromBytes(const ABytes: TBytes): TLWPTRegistryState;
     procedure WriteImmutable(const ARelative: string;
       const ABytes: TBytes);
     procedure ActivateState(const AState: TLWPTRegistryState);
+    { Serializes generation construction. Waiting callers keep reporting
+      progress, so their request deadlines still apply. }
+    procedure EnterGeneration(AProgress: TSHA256Progress);
+    procedure LeaveGeneration;
   public
     constructor Create(const ARoot: string); virtual;
+    destructor Destroy; override;
+    { Snapshot, record, and object membership of an accepted head, verified
+      once and shared by every view of that head. }
+    procedure AcquireHistory(const AState: TLWPTRegistryState;
+      AProgress: TSHA256Progress; out AGeneration: TLWPTRegistryGeneration;
+      out AReference: IInterface);
     class function Initialize(const ARoot: string;
       const ARequested: TLWPTRegistryConfig;
       const APublishedAt: string): TLWPTRegistryStore;
@@ -122,7 +197,7 @@ type
     function LoadResource(const ARelative: string;
       AProgress: TSHA256Progress = nil;
       const AMaxBytes: Int64 = MAX_REGISTRY_RESOURCE_BYTES): TBytes;
-    procedure Publish(const APublication: TLWPTRegistryPublication); virtual;
+    procedure Publish(const APublication: TLWPTRegistryPublication);
     procedure RotateKey(const AExpectedKeyID, APublishedAt: string);
     property Config: TLWPTRegistryConfig read FConfig;
     property Root: string read FRoot;
@@ -155,6 +230,9 @@ procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
   AReleasePath: string);
 procedure SetRegistryRecoveryBarrierForTesting(const AReadyPath,
   AReleasePath: string);
+{ Overrides RegistryTimestampNow; an empty value restores the system clock. }
+procedure SetRegistryClockForTesting(const AValue: string);
+function RegistryHistoryBuildsForTesting: Integer;
 {$ENDIF}
 
 implementation
@@ -170,7 +248,6 @@ uses
   {$ENDIF}
 
   LWPT.ProducerLease,
-  LWPT.Registry.Crypto,
   LWPT.Registry.Filesystem,
   LWPT.Registry.Verification,
   Semver;
@@ -189,6 +266,9 @@ type
 
 {$IFDEF REGISTRY_TESTING}
 var
+  RegistryClockLockForTesting: TRTLCriticalSection;
+  RegistryClockForTesting: string;
+  RegistryHistoryBuilds: LongInt;
   RegistryFailurePointForTesting: string;
   RegistryPublicationReadyPathForTesting: string;
   RegistryPublicationReleasePathForTesting: string;
@@ -230,6 +310,15 @@ end;
 
 function RegistryTimestampNow: string;
 begin
+  {$IFDEF REGISTRY_TESTING}
+  EnterCriticalSection(RegistryClockLockForTesting);
+  try
+    Result := RegistryClockForTesting;
+  finally
+    LeaveCriticalSection(RegistryClockLockForTesting);
+  end;
+  if Result <> '' then Exit;
+  {$ENDIF}
   Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
     LocalTimeToUniversal(Now));
 end;
@@ -514,6 +603,16 @@ begin
   Raw := KeyValue(ADocument, AKey);
   if not TryStrToQWord(Raw, Result) then
     raise ELWPTRegistryError.CreateStable('state_corrupt', 'invalid non-negative integer field ' + AKey);
+end;
+
+function Int64Value(const ADocument, AKey: string): Int64;
+var
+  Value: QWord;
+begin
+  Value := UIntValue(ADocument, AKey);
+  if Value > QWord(High(Int64)) then
+    raise ELWPTRegistryError.CreateStable('state_corrupt', 'integer field is out of range: ' + AKey);
+  Result := Int64(Value);
 end;
 
 function IsLowerHex(const AValue: string; const ALength: Integer): Boolean;
@@ -1104,6 +1203,8 @@ begin
   Result.Port := APort;
   Result.TLSPKCS12Path := ATLSPKCS12Path;
   Result.TLSPasswordEnvironment := ATLSPasswordEnvironment;
+  Result.StoreBudgetBytes := RegistryDefaultMirrorStoreBytes;
+  Result.SyncBudgetBytes := RegistryDefaultMirrorSyncBytes;
 end;
 
 procedure ValidatePersistedConfigurationString(const AValue: string);
@@ -1162,6 +1263,11 @@ begin
     and not IsLoopbackListenAddress(AConfig.ListenAddress) then
     raise ELWPTRegistryError.CreateStable('insecure_transport',
       'plain HTTP registry must bind only to localhost or a loopback address');
+  if (AConfig.Role = rrMirror)
+    and ((AConfig.SyncBudgetBytes < RegistryMinimumMirrorSyncBytes)
+      or (AConfig.StoreBudgetBytes < AConfig.SyncBudgetBytes)) then
+    raise ELWPTRegistryError.CreateStable('invalid_configuration',
+      'mirror sync budget must be at least 1048576 bytes and no larger than the store budget');
   if StartsText('https://', AConfig.BaseURL) then
   begin
     if AConfig.TLSPKCS12Path = '' then
@@ -1193,7 +1299,8 @@ begin
     Result := Result + 'upstream = ' + PersistedTOMLQuote(AConfig.UpstreamURL)
       + #10 + 'trust_key_id = ' + PersistedTOMLQuote(AConfig.TrustKeyID)
       + #10 + 'trust_public_key = ' + PersistedTOMLQuote(AConfig.TrustPublicKey)
-      + #10;
+      + #10 + 'max_store_bytes = ' + IntToStr(AConfig.StoreBudgetBytes)
+      + #10 + 'max_sync_bytes = ' + IntToStr(AConfig.SyncBudgetBytes) + #10;
 end;
 
 function ParseConfig(const ADocument: string): TLWPTRegistryConfig;
@@ -1201,6 +1308,8 @@ var
   PortValue: QWord;
 begin
   Result := Default(TLWPTRegistryConfig);
+  Result.StoreBudgetBytes := RegistryDefaultMirrorStoreBytes;
+  Result.SyncBudgetBytes := RegistryDefaultMirrorSyncBytes;
   if StringValue(ADocument, 'schema') <> PROGRAM_NAME
     + '-registry-origin-config-v1' then
   begin
@@ -1211,6 +1320,8 @@ begin
     Result.UpstreamURL := StringValue(ADocument, 'upstream');
     Result.TrustKeyID := StringValue(ADocument, 'trust_key_id');
     Result.TrustPublicKey := StringValue(ADocument, 'trust_public_key');
+    Result.StoreBudgetBytes := Int64Value(ADocument, 'max_store_bytes');
+    Result.SyncBudgetBytes := Int64Value(ADocument, 'max_sync_bytes');
   end;
   Result.Identity := StringValue(ADocument, 'identity');
   Result.BaseURL := StringValue(ADocument, 'base_url');
@@ -1258,14 +1369,14 @@ begin
 end;
 
 function ReadStringArray(const ADocument, AKey,
-  ADescription: string): TStringList;
+  ADescription: string; const ASorted: Boolean = True): TStringList;
 var
   ArrayValue, Item: string;
   Index: Integer;
 begin
   Result := TStringList.Create;
-  Result.Sorted := True;
-  Result.Duplicates := dupError;
+  Result.Sorted := ASorted;
+  if ASorted then Result.Duplicates := dupError;
   ArrayValue := Trim(KeyValue(ADocument, AKey));
   if (Length(ArrayValue) < 2) or (ArrayValue[1] <> '[')
     or (ArrayValue[Length(ArrayValue)] <> ']') then
@@ -1364,26 +1475,70 @@ begin
       SizeOf(Signature))) + #10;
 end;
 
-function StateDocument(const AState: TLWPTRegistryState): string;
+function RotationBindingText(const ABinding: TLWPTRegistryRotationBinding): string;
+begin
+  Result := IntToStr(ABinding.Sequence) + ' ' + ABinding.Document + ' '
+    + ABinding.OldSignature + ' ' + ABinding.NewSignature + ' '
+    + ABinding.KeyDocument;
+end;
+
+function ParseRotationBinding(const AText: string): TLWPTRegistryRotationBinding;
+var
+  Parts: TStringList;
+  Index: Integer;
+begin
+  Parts := TStringList.Create;
+  try
+    Parts.StrictDelimiter := True;
+    Parts.Delimiter := ' ';
+    Parts.DelimitedText := AText;
+    if (Parts.Count <> 5) or not TryStrToInt64(Parts[0], Result.Sequence)
+      or (Result.Sequence < 2) or (IntToStr(Result.Sequence) <> Parts[0]) then
+      raise ELWPTRegistryError.CreateStable('state_corrupt', 'invalid rotation binding');
+    for Index := 1 to 4 do
+      if not IsSHA256(Parts[Index]) then
+        raise ELWPTRegistryError.CreateStable('state_corrupt', 'invalid rotation binding hash');
+    Result.Document := Parts[1];
+    Result.OldSignature := Parts[2];
+    Result.NewSignature := Parts[3];
+    Result.KeyDocument := Parts[4];
+  finally
+    Parts.Free;
+  end;
+end;
+
+function RegistryStateDocument(const AState: TLWPTRegistryState): string;
 var
   SchemaName: string;
+  Index: Integer;
 begin
   SchemaName := '-registry-state-v1';
-  if AState.CheckpointHash <> '' then SchemaName := '-registry-mirror-state-v1';
+  if AState.Role = rrMirror then SchemaName := '-registry-mirror-state-v1';
   Result := 'schema = ' + PersistedTOMLQuote(PROGRAM_NAME
     + SchemaName) + #10
     + 'sequence = ' + UIntToStr(AState.Sequence) + #10
     + 'snapshot = ' + PersistedTOMLQuote(AState.SnapshotHash) + #10
     + 'checkpoint = ' + PersistedTOMLQuote(AState.CheckpointPath) + #10
     + 'signature = ' + PersistedTOMLQuote(AState.SignaturePath) + #10;
-  if AState.CheckpointHash <> '' then
-    Result := Result + 'trust_key_id = ' + PersistedTOMLQuote(AState.TrustKeyID)
-      + #10 + 'trust_public_key = ' + PersistedTOMLQuote(AState.TrustPublicKey)
-      + #10 + 'checkpoint_hash = ' + PersistedTOMLQuote(AState.CheckpointHash)
-      + #10 + 'last_sync = ' + PersistedTOMLQuote(AState.LastSync) + #10;
+  if AState.Role <> rrMirror then Exit;
+  Result := Result + 'trust_key_id = ' + PersistedTOMLQuote(AState.TrustKeyID)
+    + #10 + 'trust_public_key = ' + PersistedTOMLQuote(AState.TrustPublicKey)
+    + #10 + 'checkpoint_hash = ' + PersistedTOMLQuote(AState.CheckpointHash)
+    + #10 + 'last_sync = ' + PersistedTOMLQuote(AState.LastSync)
+    + #10 + 'trust_key_document = ' + PersistedTOMLQuote(AState.TrustKeyDocument)
+    + #10 + 'rotations = [';
+  for Index := 0 to High(AState.Rotations) do
+  begin
+    if Index > 0 then Result := Result + ', ';
+    Result := Result + PersistedTOMLQuote(RotationBindingText(AState.Rotations[Index]));
+  end;
+  Result := Result + ']' + #10;
 end;
 
 function ParseState(const ADocument: string): TLWPTRegistryState;
+var
+  Bindings: TStringList;
+  Index: Integer;
 begin
   Result := Default(TLWPTRegistryState);
   if StringValue(ADocument, 'schema') <> PROGRAM_NAME
@@ -1391,10 +1546,27 @@ begin
   begin
     if StringValue(ADocument, 'schema') <> PROGRAM_NAME + '-registry-mirror-state-v1' then
       raise ELWPTRegistryError.CreateStable('state_corrupt', 'unsupported committed-state schema');
+    Result.Role := rrMirror;
     Result.TrustKeyID := StringValue(ADocument, 'trust_key_id');
     Result.TrustPublicKey := StringValue(ADocument, 'trust_public_key');
     Result.CheckpointHash := StringValue(ADocument, 'checkpoint_hash');
     Result.LastSync := StringValue(ADocument, 'last_sync');
+    Result.TrustKeyDocument := StringValue(ADocument, 'trust_key_document');
+    if not IsSHA256(Result.TrustKeyDocument) then
+      raise ELWPTRegistryError.CreateStable('state_corrupt', 'invalid trust key document binding');
+    Bindings := ReadStringArray(ADocument, 'rotations', 'rotation bindings', False);
+    try
+      SetLength(Result.Rotations, Bindings.Count);
+      for Index := 0 to Bindings.Count - 1 do
+      begin
+        Result.Rotations[Index] := ParseRotationBinding(Bindings[Index]);
+        if (Index > 0) and (Result.Rotations[Index].Sequence
+          <= Result.Rotations[Index - 1].Sequence) then
+          raise ELWPTRegistryError.CreateStable('state_corrupt', 'rotation bindings are out of order');
+      end;
+    finally
+      Bindings.Free;
+    end;
   end;
   Result.Sequence := UIntValue(ADocument, 'sequence');
   Result.SnapshotHash := StringValue(ADocument, 'snapshot');
@@ -1422,9 +1594,17 @@ end;
 constructor TLWPTRegistryStore.Create(const ARoot: string);
 begin
   inherited Create;
+  InitCriticalSection(FGenerationLock);
   FRoot := ExpandFileName(ARoot);
   FConfig := LoadRegistryConfiguration(FRoot);
   Recover;
+end;
+
+destructor TLWPTRegistryStore.Destroy;
+begin
+  FHistoryReference := nil;
+  DoneCriticalSection(FGenerationLock);
+  inherited Destroy;
 end;
 
 function TLWPTRegistryStore.RootPath(const ARelative: string): string;
@@ -1442,7 +1622,7 @@ end;
 procedure TLWPTRegistryStore.ActivateState(const AState: TLWPTRegistryState);
 begin
   AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
-    Bytes(StateDocument(AState)));
+    Bytes(RegistryStateDocument(AState)));
 end;
 
 function TLWPTRegistryStore.LoadSeed(const AKeyID: string;
@@ -1506,7 +1686,7 @@ var
 begin
   Entries := TStringList.Create;
   try
-    if FindFirst(IncludeTrailingPathDelimiter(ARoot) + '*',
+    if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ARoot) + '*',
       faAnyFile or faSymLink, Search) = 0 then
     try
       repeat
@@ -1516,7 +1696,7 @@ begin
             'uninitialized registry root contains caller-owned entry '
             + Search.Name);
         Entries.Add(Search.Name);
-      until FindNext(Search) <> 0;
+      until SysUtils.FindNext(Search) <> 0;
     finally
       SysUtils.FindClose(Search);
     end;
@@ -1679,12 +1859,13 @@ begin
       Signature := Bytes(SignatureDocument(Checkpoint, Seed, KeyID));
       WriteInitialImmutable('checkpoints/1.toml', Checkpoint);
       WriteInitialImmutable('checkpoints/1.sig.toml', Signature);
+      State := Default(TLWPTRegistryState);
       State.Sequence := 1;
       State.SnapshotHash := SnapshotHash;
       State.CheckpointPath := 'checkpoints/1.toml';
       State.SignaturePath := 'checkpoints/1.sig.toml';
       AtomicWriteBytes(AtRoot(CURRENT_STATE_FILE), TemporaryRoot,
-        Bytes(StateDocument(State)));
+        Bytes(RegistryStateDocument(State)));
       AtomicWriteBytes(AtRoot(CONFIG_FILE), TemporaryRoot, ConfigBytes);
       {$IFDEF REGISTRY_TESTING}
       InjectRegistryFailure('initialization-activation');
@@ -1704,6 +1885,14 @@ end;
 
 procedure TLWPTRegistryStore.VerifyState(const AState: TLWPTRegistryState;
   AProgress: TSHA256Progress);
+var
+  CheckpointDigest, SignatureDigest: string;
+begin
+  VerifyState(AState, AProgress, CheckpointDigest, SignatureDigest);
+end;
+
+procedure TLWPTRegistryStore.VerifyState(const AState: TLWPTRegistryState;
+  AProgress: TSHA256Progress; out ACheckpointDigest, ASignatureDigest: string);
 var
   CheckpointBytes, KeyBytes, SignatureBytes, SigningInput: TBytes;
   CheckpointDocumentText, KeyDocumentText, SignatureDocumentText: string;
@@ -1826,6 +2015,8 @@ begin
   if not Ed25519Verify(SigningInput, PublicKey, Signature) then
     raise ELWPTRegistryError.CreateStable('signature_invalid', 'checkpoint signature verification failed');
   if Assigned(AProgress) then AProgress;
+  ACheckpointDigest := 'sha256:' + SHA256BytesWithProgress(CheckpointBytes, AProgress);
+  ASignatureDigest := 'sha256:' + SHA256BytesWithProgress(SignatureBytes, AProgress);
 end;
 
 procedure TLWPTRegistryStore.RecoverDerivedState(
@@ -1891,17 +2082,17 @@ begin
     end;
     { Indexes are internal derived state. Remove the pre-hash layout rather
       than retaining aliases that are not portable to every release host. }
-    if FindFirst(RootPath('indexes/*.toml'), faAnyFile, Search) = 0 then
+    if SysUtils.FindFirst(RootPath('indexes/*.toml'), faAnyFile, Search) = 0 then
     try
       repeat
         if not SysUtils.DeleteFile(RootPath('indexes/' + Search.Name)) then
           raise ELWPTRegistryError.CreateStable('recovery_failed',
             'could not remove an index from the non-portable layout');
-      until FindNext(Search) <> 0;
+      until SysUtils.FindNext(Search) <> 0;
     finally
       SysUtils.FindClose(Search);
     end;
-    if FindFirst(RootPath('indexes/sha256/*.toml'), faAnyFile, Search) = 0 then
+    if SysUtils.FindFirst(RootPath('indexes/sha256/*.toml'), faAnyFile, Search) = 0 then
     try
       repeat
         if ActiveIndexFiles.IndexOf(Search.Name) < 0 then
@@ -1909,11 +2100,11 @@ begin
             + Search.Name)) then
             raise ELWPTRegistryError.CreateStable('recovery_failed',
               'could not remove an index absent from committed state');
-      until FindNext(Search) <> 0;
+      until SysUtils.FindNext(Search) <> 0;
     finally
       SysUtils.FindClose(Search);
     end;
-    if FindFirst(RootPath('checkpoints/*.toml'), faAnyFile, Search) = 0 then
+    if SysUtils.FindFirst(RootPath('checkpoints/*.toml'), faAnyFile, Search) = 0 then
     try
       repeat
         FileName := Search.Name;
@@ -1924,11 +2115,11 @@ begin
           and not SysUtils.DeleteFile(RootPath('checkpoints/' + FileName)) then
           raise ELWPTRegistryError.CreateStable('recovery_failed',
             'could not remove an uncommitted checkpoint');
-      until FindNext(Search) <> 0;
+      until SysUtils.FindNext(Search) <> 0;
     finally
       SysUtils.FindClose(Search);
     end;
-    if FindFirst(RootPath('rotations/*.toml'), faAnyFile, Search) = 0 then
+    if SysUtils.FindFirst(RootPath('rotations/*.toml'), faAnyFile, Search) = 0 then
     try
       repeat
         Name := ChangeFileExt(Search.Name, '');
@@ -1941,7 +2132,7 @@ begin
         RemoveFutureRotationFile(Name + '.old.sig.toml');
         RemoveFutureRotationFile(Name + '.new.sig.toml');
         RemoveFutureRotationFile(Name + '.toml');
-      until FindNext(Search) <> 0;
+      until SysUtils.FindNext(Search) <> 0;
     finally
       SysUtils.FindClose(Search);
     end;
@@ -2003,8 +2194,21 @@ end;
 function TLWPTRegistryStore.ReadCurrentState(AProgress: TSHA256Progress):
   TLWPTRegistryState;
 begin
-  Result := ParseState(ReadText(RootPath(CURRENT_STATE_FILE), AProgress,
-    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+  Result := StateFromBytes(ReadCurrentStateBytes(AProgress));
+end;
+
+function TLWPTRegistryStore.StateFromBytes(const ABytes: TBytes): TLWPTRegistryState;
+begin
+  Result := ParseState(Text(ABytes));
+  if Result.Role <> FConfig.Role then
+    raise ELWPTRegistryError.CreateStable('state_corrupt',
+      'committed state role differs from the configured role');
+end;
+
+function TLWPTRegistryStore.ReadCurrentStateBytes(AProgress: TSHA256Progress): TBytes;
+begin
+  Result := ReadBytes(RootPath(CURRENT_STATE_FILE), AProgress,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
 end;
 
 function TLWPTRegistryStore.LoadCurrentState(AProgress: TSHA256Progress):
@@ -2037,7 +2241,7 @@ begin
   Result := TStringList.Create;
   try
     Scanned := 0;
-    if FindFirst(RootPath('rotations/*.toml'), faAnyFile, Search) = 0 then
+    if SysUtils.FindFirst(RootPath('rotations/*.toml'), faAnyFile, Search) = 0 then
     try
       repeat
         if Assigned(AProgress) then AProgress;
@@ -2052,9 +2256,10 @@ begin
         Rotation := InspectRegistryRotation(LoadResource('rotations/' + Search.Name,
           AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
         if (Rotation.EffectiveSequence <> Sequence) or (Rotation.Origin <> FConfig.Identity) then
-          raise ELWPTRegistryError.Create('rotation_chain_invalid');
+          raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
+            'retained rotation does not match its sequence or origin');
         Result.Add(Name);
-      until FindNext(Search) <> 0;
+      until SysUtils.FindNext(Search) <> 0;
     finally
       SysUtils.FindClose(Search);
     end;
@@ -2079,105 +2284,245 @@ begin
   Result := Store.LoadResource(APath, Progress, AMaximumBytes);
 end;
 
+constructor TLWPTRegistryGeneration.Create(const AKey: string);
+begin
+  inherited Create;
+  FKey := AKey;
+  FResources := TDictionary<string, TLWPTRegistryServedResource>.Create;
+  FRotations := TStringList.Create;
+end;
+
+destructor TLWPTRegistryGeneration.Destroy;
+begin
+  FRotations.Free;
+  FResources.Free;
+  inherited Destroy;
+end;
+
+procedure TLWPTRegistryGeneration.Add(const ARoutePath, AStoredPath,
+  ADigest: string);
+var
+  Resource: TLWPTRegistryServedResource;
+begin
+  Resource.StoredPath := AStoredPath;
+  Resource.Digest := ADigest;
+  FResources.AddOrSetValue(ARoutePath, Resource);
+end;
+
+procedure TLWPTRegistryGeneration.AddRotation(const ASequence: Int64);
+begin
+  FRotations.Add(IntToStr(ASequence));
+end;
+
+function TLWPTRegistryGeneration.Resolve(const ARoutePath: string;
+  out AResource: TLWPTRegistryServedResource): Boolean;
+begin
+  Result := FResources.TryGetValue(ARoutePath, AResource);
+end;
+
+procedure TLWPTRegistryGeneration.AppendStoredPaths(AList: TStrings);
+var
+  Resource: TLWPTRegistryServedResource;
+begin
+  for Resource in FResources.Values do AList.Add(Resource.StoredPath);
+end;
+
 constructor TLWPTRegistryReadView.Create(AStore: TLWPTRegistryStore;
-  const AState: TLWPTRegistryState; APublishedPaths, ARotations: TStringList);
+  const AState: TLWPTRegistryState; AGeneration: TLWPTRegistryGeneration;
+  const ACheckpointDigest, ASignatureDigest: string);
 begin
   inherited Create;
   FStore := AStore;
   FState := AState;
-  FPublishedPaths := APublishedPaths;
-  if FPublishedPaths <> nil then FPublishedPaths.CaseSensitive := True;
-  FRotations := ARotations;
+  FGeneration := AGeneration;
+  FGenerationReference := AGeneration;
+  FCheckpointDigest := ACheckpointDigest;
+  FSignatureDigest := ASignatureDigest;
 end;
 
 destructor TLWPTRegistryReadView.Destroy;
 begin
   FRotations.Free;
-  FSnapshotPaths.Free;
-  FPublishedPaths.Free;
+  FHistoryReference := nil;
+  FGenerationReference := nil;
   inherited Destroy;
 end;
 
 function TLWPTRegistryStore.CaptureReadView(AProgress: TSHA256Progress): TLWPTRegistryReadView;
+var
+  State: TLWPTRegistryState;
+  CheckpointDigest, SignatureDigest: string;
 begin
-  Result := TLWPTRegistryReadView.Create(Self, LoadCurrentState(AProgress));
+  State := ReadCurrentState(AProgress);
+  VerifyState(State, AProgress, CheckpointDigest, SignatureDigest);
+  Result := TLWPTRegistryReadView.Create(Self, State, nil, CheckpointDigest,
+    SignatureDigest);
 end;
 
 function TLWPTRegistryReadView.RotationSequences(AProgress: TSHA256Progress): TStringList;
 begin
+  if FGeneration <> nil then Exit(FGeneration.Rotations);
   if FRotations = nil then FRotations := FStore.RotationSequences(FState, AProgress);
   Result := FRotations;
 end;
 
-function TLWPTRegistryReadView.ResourceIsPublished(const ARelative: string;
-  AProgress: TSHA256Progress): Boolean;
+function DigestPath(const ARoutePath, APrefix, ASuffix: string;
+  out ADigest: string): Boolean;
 var
+  Hex: string;
+begin
+  Result := StartsStr(APrefix, ARoutePath) and EndsStr(ASuffix, ARoutePath);
+  if not Result then Exit;
+  Hex := Copy(ARoutePath, Length(APrefix) + 1,
+    Length(ARoutePath) - Length(APrefix) - Length(ASuffix));
+  Result := IsLowerHex(Hex, 64);
+  if Result then ADigest := 'sha256:' + Hex;
+end;
+
+function TLWPTRegistryReadView.Resolve(const ARoutePath: string;
+  out AStoredPath, ADigest: string; AProgress: TSHA256Progress): Boolean;
+var
+  Resource: TLWPTRegistryServedResource;
   Entry, Name: string;
   Sequence: Int64;
   Rotation: TLWPTUntrustedRegistryRotation;
-  Source: TRegistryStoredDocumentSource;
-  Document: TLWPTRegistryDocument;
-  Paths: TStringList;
 begin
-  if FPublishedPaths <> nil then
+  AStoredPath := ARoutePath;
+  ADigest := '';
+  if FGeneration <> nil then
   begin
-    if StartsStr('checkpoints/', ARelative) or StartsStr('snapshots/', ARelative)
-      or StartsStr('rotations/', ARelative) or StartsStr('keys/', ARelative) then
-      Exit(FPublishedPaths.IndexOf(ARelative) >= 0);
-    Exit(True);
-  end;
-  if StartsStr('snapshots/', ARelative) then
-  begin
-    if FSnapshotPaths = nil then
+    Result := FGeneration.Resolve(ARoutePath, Resource);
+    if Result then
     begin
-      Source := TRegistryStoredDocumentSource.Create;
-      Paths := TStringList.Create;
-      Paths.CaseSensitive := True;
-      try
-        Source.Store := FStore;
-        Source.Progress := AProgress;
-        for Document in VerifyRegistrySnapshotHistory(FStore.Config.Identity,
-          FState.SnapshotHash, FState.Sequence, Source, DefaultRegistryVerificationLimits) do
-          if StartsStr('snapshots/', Document.Path) then Paths.Add(Document.Path);
-        FSnapshotPaths := Paths;
-        Paths := nil;
-      finally
-        Paths.Free;
-        Source.Free;
-      end;
+      AStoredPath := Resource.StoredPath;
+      ADigest := Resource.Digest;
     end;
-    Exit(FSnapshotPaths.IndexOf(ARelative) >= 0);
+    Exit;
   end;
-  if StartsStr('checkpoints/', ARelative) then
+  if StartsStr('snapshots/', ARoutePath) or StartsStr('records/', ARoutePath)
+    or StartsStr('objects/', ARoutePath) then
   begin
-    if (ARelative = FState.CheckpointPath) or (ARelative = FState.SignaturePath) then Exit(True);
-    Name := Copy(ARelative, Length('checkpoints/') + 1, MaxInt);
+    if FHistory = nil then
+      FStore.AcquireHistory(FState, AProgress, FHistory, FHistoryReference);
+    Result := FHistory.Resolve(ARoutePath, Resource);
+    if Result then ADigest := Resource.Digest;
+    Exit;
+  end;
+  if StartsStr('checkpoints/', ARoutePath) then
+  begin
+    if ARoutePath = FState.CheckpointPath then
+    begin
+      ADigest := FCheckpointDigest;
+      Exit(True);
+    end;
+    if ARoutePath = FState.SignaturePath then
+    begin
+      ADigest := FSignatureDigest;
+      Exit(True);
+    end;
+    Name := Copy(ARoutePath, Length('checkpoints/') + 1, MaxInt);
     if EndsStr('.sig.toml', Name) then Delete(Name, Length(Name) - 8, 9)
     else if EndsStr('.toml', Name) then Delete(Name, Length(Name) - 4, 5)
     else Exit(False);
     Exit(TryStrToInt64(Name, Sequence) and (Sequence > 0)
       and (IntToStr(Sequence) = Name) and (QWord(Sequence) <= FState.Sequence));
   end;
-  if StartsStr('rotations/', ARelative) or StartsStr('keys/', ARelative) then
+  if StartsStr('rotations/', ARoutePath) or StartsStr('keys/', ARoutePath) then
   begin
-    if StartsStr('keys/', ARelative)
-      and (ARelative = RegistryKeyStoragePath(StringValue(Text(FStore.LoadResource('checkpoints/1.toml',
+    if StartsStr('keys/', ARoutePath)
+      and (ARoutePath = RegistryKeyStoragePath(StringValue(Text(FStore.LoadResource('checkpoints/1.toml',
         AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES)), 'key_id'))) then Exit(True);
     for Entry in RotationSequences(AProgress) do
     begin
-      if (ARelative = 'rotations/' + Entry + '.toml')
-        or (ARelative = 'rotations/' + Entry + '.old.sig.toml')
-        or (ARelative = 'rotations/' + Entry + '.new.sig.toml') then Exit(True);
-      if StartsStr('keys/', ARelative) then
+      if (ARoutePath = 'rotations/' + Entry + '.toml')
+        or (ARoutePath = 'rotations/' + Entry + '.old.sig.toml')
+        or (ARoutePath = 'rotations/' + Entry + '.new.sig.toml') then Exit(True);
+      if StartsStr('keys/', ARoutePath) then
       begin
         Rotation := InspectRegistryRotation(FStore.LoadResource('rotations/' + Entry + '.toml',
           AProgress, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
-        if ARelative = RegistryKeyStoragePath(Rotation.ToKey) then Exit(True);
+        if ARoutePath = RegistryKeyStoragePath(Rotation.ToKey) then Exit(True);
       end;
     end;
     Exit(False);
   end;
-  Result := True;
+  Result := False;
+end;
+
+function TLWPTRegistryReadView.ResourceIsPublished(const ARelative: string;
+  AProgress: TSHA256Progress): Boolean;
+var
+  StoredPath, Digest: string;
+begin
+  Result := Resolve(ARelative, StoredPath, Digest, AProgress);
+end;
+
+procedure TLWPTRegistryStore.EnterGeneration(AProgress: TSHA256Progress);
+begin
+  while TryEnterCriticalSection(FGenerationLock) = 0 do
+  begin
+    if Assigned(AProgress) then AProgress;
+    Sleep(1);
+  end;
+end;
+
+procedure TLWPTRegistryStore.LeaveGeneration;
+begin
+  LeaveCriticalSection(FGenerationLock);
+end;
+
+procedure TLWPTRegistryStore.AcquireHistory(const AState: TLWPTRegistryState;
+  AProgress: TSHA256Progress; out AGeneration: TLWPTRegistryGeneration;
+  out AReference: IInterface);
+var
+  Key, Digest: string;
+  Source: TRegistryStoredDocumentSource;
+  Document: TLWPTRegistryDocument;
+  Generation: TLWPTRegistryGeneration;
+  Reference: IInterface;
+  Package: TLWPTRegistryPackage;
+begin
+  Key := UIntToStr(AState.Sequence) + ' ' + AState.SnapshotHash;
+  EnterGeneration(AProgress);
+  try
+    if (FHistory <> nil) and (FHistory.Key = Key) then
+    begin
+      AGeneration := FHistory;
+      AReference := FHistoryReference;
+      Exit;
+    end;
+    {$IFDEF REGISTRY_TESTING}
+    InterlockedIncrement(RegistryHistoryBuilds);
+    {$ENDIF}
+    Generation := TLWPTRegistryGeneration.Create(Key);
+    Reference := Generation;
+    Source := TRegistryStoredDocumentSource.Create;
+    try
+      Source.Store := Self;
+      Source.Progress := AProgress;
+      for Document in VerifyRegistrySnapshotHistory(FConfig.Identity,
+        AState.SnapshotHash, AState.Sequence, Source, DefaultRegistryVerificationLimits) do
+      begin
+        if DigestPath(Document.Path, 'snapshots/sha256/', '.toml', Digest)
+          or DigestPath(Document.Path, 'records/sha256/', '.toml', Digest) then
+          Generation.Add(Document.Path, Document.Path, Digest);
+        if StartsStr('records/sha256/', Document.Path) then
+        begin
+          Package := ParseRegistryPackage(Text(Document.Bytes), Digest, FConfig.Identity);
+          Generation.Add('objects/sha256/' + Copy(Package.ArchiveHash, 8, 64),
+            'objects/sha256/' + Copy(Package.ArchiveHash, 8, 64), Package.ArchiveHash);
+        end;
+      end;
+    finally
+      Source.Free;
+    end;
+    FHistory := Generation;
+    FHistoryReference := Reference;
+    AGeneration := Generation;
+    AReference := Reference;
+  finally
+    LeaveGeneration;
+  end;
 end;
 
 function TLWPTRegistryStore.LoadResource(const ARelative: string;
@@ -2277,6 +2622,21 @@ begin
   RegistryRecoveryReleasePathForTesting := AReleasePath;
 end;
 
+procedure SetRegistryClockForTesting(const AValue: string);
+begin
+  EnterCriticalSection(RegistryClockLockForTesting);
+  try
+    RegistryClockForTesting := AValue;
+  finally
+    LeaveCriticalSection(RegistryClockLockForTesting);
+  end;
+end;
+
+function RegistryHistoryBuildsForTesting: Integer;
+begin
+  Result := InterlockedCompareExchange(RegistryHistoryBuilds, 0, 0);
+end;
+
 procedure InjectRegistryFailure(const APoint: string);
 begin
   if RegistryFailurePointForTesting = APoint then
@@ -2339,11 +2699,45 @@ begin
     State.CheckpointPath := RenewalPath + '.toml';
     State.SignaturePath := RenewalPath + '.sig.toml';
     AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
-      Bytes(StateDocument(State)));
+      Bytes(RegistryStateDocument(State)));
   finally
     Lease.Free;
     Coordinator.Free;
   end;
+end;
+
+procedure TLWPTRegistryStore.CommitCheckpoint(var AState: TLWPTRegistryState;
+  const ASnapshot: TBytes; const APublishedAt, AKeyID: string;
+  const ASeed: TLWPTEd25519Seed);
+var
+  Checkpoint, Signature: TBytes;
+  Source: TRegistryStoredDocumentSource;
+  SnapshotHash: string;
+  NextSequence: QWord;
+begin
+  NextSequence := AState.Sequence + 1;
+  SnapshotHash := SHA256BytesPrefixed(ASnapshot);
+  WriteImmutable('snapshots/sha256/' + Copy(SnapshotHash, 8, 64) + '.toml', ASnapshot);
+  { Serving validates the complete history under the shared verifier limits.
+    A head that verifier would refuse is never named by a checkpoint, so the
+    previous pointer remains the served head. }
+  Source := TRegistryStoredDocumentSource.Create;
+  try
+    Source.Store := Self;
+    VerifyRegistrySnapshotHistory(FConfig.Identity, SnapshotHash, NextSequence,
+      Source, DefaultRegistryVerificationLimits);
+  finally
+    Source.Free;
+  end;
+  Checkpoint := Bytes(CheckpointDocument(FConfig.Identity, NextSequence,
+    SnapshotHash, APublishedAt, AKeyID));
+  Signature := Bytes(SignatureDocument(Checkpoint, ASeed, AKeyID));
+  AState.Sequence := NextSequence;
+  AState.SnapshotHash := SnapshotHash;
+  AState.CheckpointPath := 'checkpoints/' + UIntToStr(NextSequence) + '.toml';
+  AState.SignaturePath := 'checkpoints/' + UIntToStr(NextSequence) + '.sig.toml';
+  WriteImmutable(AState.CheckpointPath, Checkpoint);
+  WriteImmutable(AState.SignaturePath, Signature);
 end;
 
 procedure TLWPTRegistryStore.RotateKey(const AExpectedKeyID, APublishedAt: string);
@@ -2353,7 +2747,7 @@ var
   State: TLWPTRegistryState;
   OldSeed, NewSeed: TLWPTEd25519Seed;
   PublicKey: TLWPTEd25519PublicKey;
-  SeedBytes, PublicBytes, Rotation, Snapshot, Checkpoint, Signature: TBytes;
+  SeedBytes, PublicBytes, Rotation, Snapshot: TBytes;
   KeyID, NextKeyID, Prefix, CurrentSnapshot: string;
   Records, Rotations: TStringList;
 begin
@@ -2418,16 +2812,7 @@ begin
     finally
       Records.Free;
     end;
-    Inc(State.Sequence);
-    State.SnapshotHash := SHA256BytesPrefixed(Snapshot);
-    WriteImmutable('snapshots/sha256/' + Copy(State.SnapshotHash, 8, 64) + '.toml', Snapshot);
-    Checkpoint := Bytes(CheckpointDocument(FConfig.Identity, State.Sequence,
-      State.SnapshotHash, APublishedAt, NextKeyID));
-    Signature := Bytes(SignatureDocument(Checkpoint, NewSeed, NextKeyID));
-    State.CheckpointPath := 'checkpoints/' + UIntToStr(State.Sequence) + '.toml';
-    State.SignaturePath := 'checkpoints/' + UIntToStr(State.Sequence) + '.sig.toml';
-    WriteImmutable(State.CheckpointPath, Checkpoint);
-    WriteImmutable(State.SignaturePath, Signature);
+    CommitCheckpoint(State, Snapshot, APublishedAt, NextKeyID, NewSeed);
     {$IFDEF REGISTRY_TESTING}
     InjectRegistryFailure('rotation-checkpoint');
     {$ENDIF}
@@ -2448,9 +2833,8 @@ procedure TLWPTRegistryStore.Publish(
   const APublication: TLWPTRegistryPublication);
 var
   Character: Char;
-  ArchiveHash, ExistingRecordHash, IndexPath, KeyID, RecordHash,
-    SnapshotHash: string;
-  Checkpoint, RecordBytes, SeedBytes, Signature, Snapshot: TBytes;
+  ArchiveHash, ExistingRecordHash, IndexPath, KeyID, RecordHash: string;
+  RecordBytes, SeedBytes, Snapshot: TBytes;
   ActiveRecordDocument, CurrentSnapshot, IndexDocument, RecordDocument: string;
   Coordinator: TLWPTProducerLeaseCoordinator;
   Lease: TLWPTProducerLease;
@@ -2552,32 +2936,18 @@ begin
       Immutable publication bytes are prepared first. Only current.toml
       activates them; indexes are derived aliases and follow activation.
     }
-    SnapshotHash := SHA256BytesPrefixed(Snapshot);
-    WriteImmutable('snapshots/sha256/' + Copy(SnapshotHash,
-      Length('sha256:') + 1, MaxInt) + '.toml', Snapshot);
     KeyID := StringValue(Text(LoadResource(State.CheckpointPath)), 'key_id');
     SeedBytes := LoadSeed(KeyID);
     try
       Move(SeedBytes[0], Seed[0], SizeOf(Seed));
-      Checkpoint := Bytes(CheckpointDocument(FConfig.Identity,
-        State.Sequence + 1, SnapshotHash, APublication.PublishedAt, KeyID));
-      Signature := Bytes(SignatureDocument(Checkpoint, Seed, KeyID));
+      CommitCheckpoint(State, Snapshot, APublication.PublishedAt, KeyID, Seed);
     finally
       FillChar(Seed, SizeOf(Seed), 0);
       if Length(SeedBytes) > 0 then FillChar(SeedBytes[0], Length(SeedBytes), 0);
     end;
-    WriteImmutable('checkpoints/' + UIntToStr(State.Sequence + 1) + '.toml',
-      Checkpoint);
-    WriteImmutable('checkpoints/' + UIntToStr(State.Sequence + 1)
-      + '.sig.toml', Signature);
     {$IFDEF REGISTRY_TESTING}
     InjectRegistryFailure('checkpoint');
     {$ENDIF}
-    State.Sequence := State.Sequence + 1;
-    State.SnapshotHash := SnapshotHash;
-    State.CheckpointPath := 'checkpoints/' + UIntToStr(State.Sequence) + '.toml';
-    State.SignaturePath := 'checkpoints/' + UIntToStr(State.Sequence)
-      + '.sig.toml';
     {$IFDEF REGISTRY_TESTING}
     if RegistryPublicationReadyPathForTesting <> '' then
     begin
@@ -2594,7 +2964,7 @@ begin
     end;
     {$ENDIF}
     AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
-      Bytes(StateDocument(State)));
+      Bytes(RegistryStateDocument(State)));
     {$IFDEF REGISTRY_TESTING}
     InjectRegistryFailure('activation');
     {$ENDIF}
@@ -2606,5 +2976,13 @@ begin
     Coordinator.Free;
   end;
 end;
+
+{$IFDEF REGISTRY_TESTING}
+initialization
+  InitCriticalSection(RegistryClockLockForTesting);
+
+finalization
+  DoneCriticalSection(RegistryClockLockForTesting);
+{$ENDIF}
 
 end.

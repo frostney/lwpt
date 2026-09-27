@@ -13,8 +13,15 @@ uses
 
   LWPT.Registry.Store;
 
+const
+  { Protocol 1 rotation pages carry at most this many items. }
+  RegistryRotationPageLimit = 100;
+
 type
   ELWPTRegistryError = LWPT.Registry.Store.ELWPTRegistryError;
+  { A correctly authenticated response that is older than accepted state or
+    expired. It identifies a stale contact, not a trust failure. }
+  ELWPTRegistryStaleContactError = class(ELWPTRegistryError);
 
   TLWPTRegistryDependency = record
     Origin, Name, Version: string;
@@ -55,6 +62,8 @@ type
     Origin, KeyId, PublicKey: string;
     Sequence: Int64;
     Snapshot, CheckpointHash: string;
+    { Authenticated renewal times of the accepted checkpoint. }
+    PublishedAt, ExpiresAt: string;
   end;
 
   TLWPTRegistryTrust = record
@@ -127,12 +136,19 @@ function ValidateRegistryKeyDocument(const ABytes: TBytes;
 function ValidateRegistryCapabilities(const AContent, ARole: string;
   out AHasRotations: Boolean): Integer;
 function RegistryURIIsCanonical(const AValue: string;
-  AAllowLocalhostHTTP: Boolean): Boolean;
+  const AAllowLocalhostHTTP: Boolean): Boolean;
 function RegistryHashIsCanonical(const AValue: string): Boolean;
-function RegistryPackageNameIsCanonical(const AValue: string): Boolean;
-function RegistryVersionIsCanonical(const AValue: string): Boolean;
-function RegistryConstraintIsCanonical(const AValue: string): Boolean;
 function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;
+{ Byte-preserving conversions between protocol bytes and RawByteString text. }
+function RegistryBytesText(const ABytes: TBytes): string;
+function RegistryTextBytes(const AText: string): TBytes;
+{ Untrusted retrieval hint: the checkpoint hash a signature envelope claims. }
+function InspectRegistrySignaturePayload(const ABytes: TBytes): string;
+{ Verifies one dual-signed transition from an already trusted key, before a
+  caller follows further retrieval hints. Returns the authenticated rotation. }
+function VerifyRegistryRotation(const ARotation: TLWPTRegistryRotationProof;
+  const AOrigin, AFromKey, AFromPublicKey: string;
+  const APreviousSequence, ACheckpointSequence: Int64): TLWPTUntrustedRegistryRotation;
 function ParseRegistryPackage(const AContent, AExpectedHash,
   AExpectedOrigin: string): TLWPTRegistryPackage;
 
@@ -154,6 +170,10 @@ function VerifyRegistryProof(const AProof: TLWPTRegistryProof;
   const ALimits: TLWPTRegistryVerificationLimits): TLWPTVerifiedRegistry;
 procedure VerifyRegistryArtifact(const APackage: TLWPTRegistryPackage;
   AArchive: TStream);
+{$IFDEF REGISTRY_TESTING}
+procedure SetRegistryVerificationLimitsForTesting(
+  const ALimits: TLWPTRegistryVerificationLimits; const AEnabled: Boolean);
+{$ENDIF}
 
 implementation
 
@@ -167,8 +187,11 @@ uses
   TOML;
 
 const
-  MAXIMUM_CANONICAL_DOCUMENT_BYTES = 4 * 1024 * 1024;
-  MAXIMUM_CANONICAL_DEPTH = 3;
+  MaximumCanonicalDocumentBytes = 4 * 1024 * 1024;
+  MaximumCanonicalDepth = 3;
+  { Every value and table below the root, far above a 4 MiB snapshot's
+    record count, but finite before allocation. }
+  MaximumCanonicalNodes = 262144;
 
 type
   TStringArray = array of string;
@@ -177,8 +200,21 @@ type
     KeyId, Payload, Signature: string;
   end;
 
+{$IFDEF REGISTRY_TESTING}
+var
+  VerificationLimitsForTesting: TLWPTRegistryVerificationLimits;
+  VerificationLimitsForTestingEnabled: Boolean;
+
+procedure SetRegistryVerificationLimitsForTesting(
+  const ALimits: TLWPTRegistryVerificationLimits; const AEnabled: Boolean);
+begin
+  VerificationLimitsForTesting := ALimits;
+  VerificationLimitsForTestingEnabled := AEnabled;
+end;
+{$ENDIF}
+
 function RegistryURIIsCanonical(const AValue: string;
-  AAllowLocalhostHTTP: Boolean): Boolean;
+  const AAllowLocalhostHTTP: Boolean): Boolean;
 begin
   try
     Result := CanonicalRegistryURL(AValue, not AAllowLocalhostHTTP) = AValue;
@@ -187,16 +223,66 @@ begin
   end;
 end;
 
-function BytesText(const ABytes: TBytes): string;
+function RegistryBytesText(const ABytes: TBytes): string;
 begin
   if Length(ABytes) = 0 then Exit('');
   SetString(Result, PAnsiChar(@ABytes[0]), Length(ABytes));
 end;
 
-function TextBytes(const AText: string): TBytes;
+function RegistryTextBytes(const AText: string): TBytes;
 begin
   SetLength(Result, Length(AText));
   if Length(AText) > 0 then Move(AText[1], Result[0], Length(AText));
+end;
+
+{ Strict RFC 3629: no overlong forms, surrogates, or scalars above U+10FFFF. }
+function IsValidUTF8(const AText: string): Boolean;
+var
+  Index, Remaining: Integer;
+  Lead: Byte;
+  Minimum, Scalar: Cardinal;
+begin
+  Index := 1;
+  while Index <= Length(AText) do
+  begin
+    Lead := Byte(AText[Index]);
+    if Lead < $80 then
+    begin
+      Inc(Index);
+      Continue;
+    end;
+    if (Lead and $E0) = $C0 then
+    begin
+      Remaining := 1;
+      Scalar := Lead and $1F;
+      Minimum := $80;
+    end
+    else if (Lead and $F0) = $E0 then
+    begin
+      Remaining := 2;
+      Scalar := Lead and $0F;
+      Minimum := $800;
+    end
+    else if (Lead and $F8) = $F0 then
+    begin
+      Remaining := 3;
+      Scalar := Lead and $07;
+      Minimum := $10000;
+    end
+    else Exit(False);
+    if Index + Remaining > Length(AText) then Exit(False);
+    while Remaining > 0 do
+    begin
+      Inc(Index);
+      if (Byte(AText[Index]) and $C0) <> $80 then Exit(False);
+      Scalar := (Scalar shl 6) or (Byte(AText[Index]) and $3F);
+      Dec(Remaining);
+    end;
+    if (Scalar < Minimum) or (Scalar > $10FFFF)
+      or ((Scalar >= $D800) and (Scalar <= $DFFF)) then Exit(False);
+    Inc(Index);
+  end;
+  Result := True;
 end;
 
 function IsLowerHex(const AValue: string): Boolean;
@@ -208,7 +294,7 @@ begin
     if not (AValue[I] in ['0'..'9', 'a'..'f']) then Exit(False);
 end;
 
-function ValidHash(const AValue: string): Boolean;
+function RegistryHashIsCanonical(const AValue: string): Boolean;
 begin
   Result := (Length(AValue) = 71)
     and (Copy(AValue, 1, 7) = 'sha256:')
@@ -231,16 +317,6 @@ begin
   for I := 2 to Length(AValue) do
     if not (AValue[I] in ['a'..'z', '0'..'9', '.', '_', '-']) then
       Exit(False);
-end;
-
-function RegistryHashIsCanonical(const AValue: string): Boolean;
-begin
-  Result := ValidHash(AValue);
-end;
-
-function RegistryVersionIsCanonical(const AValue: string): Boolean;
-begin
-  Result := IsCanonicalVersion(AValue);
 end;
 
 function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;
@@ -413,16 +489,20 @@ var
   I, EqualAt, Depth: Integer;
   Key: string;
   InString, Escaped: Boolean;
-  Delimiters: array[1..MAXIMUM_CANONICAL_DEPTH] of Char;
+  Delimiters: array[1..MaximumCanonicalDepth] of Char;
 begin
   Result := nil;
-  if Length(AContent) > MAXIMUM_CANONICAL_DOCUMENT_BYTES then
+  if Length(AContent) > MaximumCanonicalDocumentBytes then
     raise ELWPTRegistryError.Create('proof_limit_exceeded: document bytes');
   if (AContent = '') or (AContent[Length(AContent)] <> #10)
     or (Pos(#13, AContent) > 0) or (Copy(AContent, 1, 3) = #$EF#$BB#$BF)
     or (Pos(#10#10, AContent) > 0) then
     raise ELWPTRegistryError.Create('non_canonical_document: byte framing');
-  { Bound parser recursion before passing untrusted nested values to TOML. }
+  if not IsValidUTF8(AContent) then
+    raise ELWPTRegistryError.Create('non_canonical_document: invalid UTF-8');
+  { Reject delimiter nesting and comments before TOML parsing. Quoted bytes,
+    including "#" in an opaque cursor, are string content. The parser also
+    enforces structural depth, because dotted keys nest without brackets. }
   InString := False;
   Escaped := False;
   Depth := 0;
@@ -438,6 +518,8 @@ begin
     end
     else if AContent[I] = #39 then
       raise ELWPTRegistryError.Create('non_canonical_document: literal strings')
+    else if AContent[I] = '#' then
+      raise ELWPTRegistryError.Create('non_canonical_document: comments')
     else if AContent[I] = '"' then
     begin
       if Copy(AContent, I, 3) = '"""' then
@@ -447,7 +529,7 @@ begin
     else if AContent[I] in ['[', '{'] then
     begin
       Inc(Depth);
-      if Depth > MAXIMUM_CANONICAL_DEPTH then
+      if Depth > MaximumCanonicalDepth then
         raise ELWPTRegistryError.Create('non_canonical_document: nesting');
       Delimiters[Depth] := AContent[I];
     end
@@ -471,9 +553,9 @@ begin
         'non_canonical_document: %s field count', [ASchema]);
     for I := 0 to Lines.Count - 1 do
     begin
-      if (Lines[I] = '') or (Pos('#', Lines[I]) > 0) then
+      if Lines[I] = '' then
         raise ELWPTRegistryError.Create(
-          'non_canonical_document: comments or blank lines');
+          'non_canonical_document: blank lines');
       EqualAt := Pos(' = ', Lines[I]);
       if EqualAt = 0 then
         raise ELWPTRegistryError.Create('non_canonical_document: assignment');
@@ -485,9 +567,13 @@ begin
     end;
     Parser := TTOMLParser.Create;
     try
+      Parser.MaximumDepth := MaximumCanonicalDepth;
+      Parser.MaximumNodes := MaximumCanonicalNodes;
       try
         Result := Parser.ParseDocument(AContent);
       except
+        on E: ETOMLLimitError do
+          raise ELWPTRegistryError.Create('non_canonical_document: nesting');
         on E: ETOMLParseError do
           raise ELWPTRegistryError.Create('non_canonical_document: invalid TOML');
       end;
@@ -557,8 +643,7 @@ begin
   end;
 end;
 
-function NodeBoolean(ARoot: TTOMLNode; const AName: string;
-  ADefault: Boolean): Boolean;
+function NodeBoolean(ARoot: TTOMLNode; const AName: string): Boolean;
 var
   Node: TTOMLNode;
 begin
@@ -576,7 +661,7 @@ var
   Root: TTOMLNode;
   ValidFrom: Int64;
 begin
-  Root := ParseCanonical(BytesText(ABytes), PROGRAM_NAME + '-registry-key-v1',
+  Root := ParseCanonical(RegistryBytesText(ABytes), PROGRAM_NAME + '-registry-key-v1',
     ['schema', 'origin', 'key_id', 'algorithm', 'public_key', 'valid_from_sequence']);
   try
     ValidFrom := UnsignedField(Root, 'valid_from_sequence');
@@ -587,7 +672,8 @@ begin
       or (StringField(Root, 'algorithm') <> 'ed25519')
       or (ValidFrom < 1) or (ValidFrom > ACheckpointSequence)
       or (AExactSequence and (ValidFrom <> ACheckpointSequence)) then
-      raise ELWPTRegistryError.Create('registry_key_pin_mismatch');
+      raise ELWPTRegistryError.CreateStable('registry_key_pin_mismatch',
+        'key document does not match the pinned key or sequence');
     Result := ValidFrom;
   finally
     Root.Free;
@@ -611,7 +697,7 @@ function InspectRegistryRotation(const ABytes: TBytes): TLWPTUntrustedRegistryRo
 var
   Root: TTOMLNode;
 begin
-  Root := ParseCanonical(BytesText(ABytes), PROGRAM_NAME + '-registry-key-rotation-v1',
+  Root := ParseCanonical(RegistryBytesText(ABytes), PROGRAM_NAME + '-registry-key-rotation-v1',
     ['schema', 'origin', 'from_key', 'to_key', 'to_public_key', 'effective_sequence']);
   try
     Result.Origin := StringField(Root, 'origin');
@@ -622,7 +708,8 @@ begin
     if not RegistryURIIsCanonical(Result.Origin, True)
       or (Result.EffectiveSequence < 2)
       or not RegistryTrustRootIsValid(Result.ToKey, Result.ToPublicKey) then
-      raise ELWPTRegistryError.Create('rotation_chain_invalid');
+      raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
+        'rotation document is not a valid transition');
     RegistryKeyStoragePath(Result.FromKey);
   finally
     Root.Free;
@@ -640,24 +727,27 @@ var
   Prefix: string;
 begin
   Result := Default(TLWPTRegistryRotationPage);
-  Root := ParseCanonical(BytesText(ABytes), PROGRAM_NAME + '-registry-rotation-page-v1',
+  Root := ParseCanonical(RegistryBytesText(ABytes), PROGRAM_NAME + '-registry-rotation-page-v1',
     ['schema', 'origin', 'items', 'next_cursor']);
   try
     if StringField(Root, 'origin') <> AOrigin then
-      raise ELWPTRegistryError.Create('registry_rotation_origin_mismatch');
+      raise ELWPTRegistryError.CreateStable('registry_rotation_origin_mismatch',
+        'rotation page names a different origin');
     Result.NextCursor := StringField(Root, 'next_cursor');
     Items := TomlGet(Root, 'items');
     if not TomlIsArray(Items) or (Items.Items.Count > AMaximumItems)
       or (Length(Result.NextCursor) > 1024)
       or ((Items.Items.Count = 0) and (Result.NextCursor <> '')) then
-      raise ELWPTRegistryError.Create('invalid_registry_rotation_page');
+      raise ELWPTRegistryError.CreateStable('invalid_registry_rotation_page',
+        'rotation page is out of order, oversized, or malformed');
     SetLength(Result.Items, Items.Items.Count);
     Previous := AAfter;
     for I := 0 to Items.Items.Count - 1 do
     begin
       Item := Items.Items[I];
       if not TomlIsTable(Item) or (Item.Children.Count <> 4) then
-        raise ELWPTRegistryError.Create('invalid_registry_rotation_page');
+        raise ELWPTRegistryError.CreateStable('invalid_registry_rotation_page',
+          'rotation page is out of order, oversized, or malformed');
       Entry.EffectiveSequence := UnsignedField(Item, 'effective_sequence');
       Entry.Rotation := StringField(Item, 'rotation');
       Entry.OldSignature := StringField(Item, 'old_signature');
@@ -671,7 +761,8 @@ begin
           + IntToStr(Entry.EffectiveSequence) + ', rotation = ' + RegistryTOMLQuote(Entry.Rotation)
           + ', old_signature = ' + RegistryTOMLQuote(Entry.OldSignature)
           + ', new_signature = ' + RegistryTOMLQuote(Entry.NewSignature) + ' }') then
-        raise ELWPTRegistryError.Create('invalid_registry_rotation_page');
+        raise ELWPTRegistryError.CreateStable('invalid_registry_rotation_page',
+          'rotation page is out of order, oversized, or malformed');
       Previous := Entry.EffectiveSequence;
       Result.Items[I] := Entry;
     end;
@@ -686,7 +777,7 @@ var
 begin
   Result := Default(TRegistryCheckpoint);
   Result.Bytes := Copy(ABody);
-  Root := ParseCanonical(BytesText(ABody), PROGRAM_NAME + '-registry-checkpoint-v1',
+  Root := ParseCanonical(RegistryBytesText(ABody), PROGRAM_NAME + '-registry-checkpoint-v1',
     ['schema', 'origin', 'sequence', 'snapshot', 'published_at',
      'expires_at', 'key_id']);
   try
@@ -696,11 +787,12 @@ begin
     Result.PublishedAt := StringField(Root, 'published_at');
     Result.ExpiresAt := StringField(Root, 'expires_at');
     Result.KeyId := StringField(Root, 'key_id');
-    if (Result.Sequence < 1) or not ValidHash(Result.Snapshot)
+    if (Result.Sequence < 1) or not RegistryHashIsCanonical(Result.Snapshot)
       or not RegistryTimestampIsCanonical(Result.PublishedAt)
       or not RegistryTimestampIsCanonical(Result.ExpiresAt)
       or (Result.PublishedAt >= Result.ExpiresAt) then
-      raise ELWPTRegistryError.Create('invalid_registry_checkpoint');
+      raise ELWPTRegistryError.CreateStable('invalid_registry_checkpoint',
+        'checkpoint fields are invalid');
   finally
     Root.Free;
   end;
@@ -714,18 +806,20 @@ begin
     ['schema', 'algorithm', 'key_id', 'payload', 'signature']);
   try
     if TomlStr(Root, 'algorithm', '') <> 'ed25519' then
-      raise ELWPTRegistryError.Create('unsupported_registry_signature');
+      raise ELWPTRegistryError.CreateStable('unsupported_registry_signature',
+        'signature algorithm is not ed25519');
     Result.KeyId := TomlStr(Root, 'key_id', '');
     Result.Payload := TomlStr(Root, 'payload', '');
     Result.Signature := TomlStr(Root, 'signature', '');
     if (Length(Result.KeyId) <> 72)
       or (Copy(Result.KeyId, 1, 8) <> 'ed25519:')
       or not IsLowerHex(Copy(Result.KeyId, 9, 64))
-      or not ValidHash(Result.Payload)
+      or not RegistryHashIsCanonical(Result.Payload)
       or (Length(Result.Signature) <> 132)
       or (Copy(Result.Signature, 1, 4) <> 'hex:')
       or not IsLowerHex(Copy(Result.Signature, 5, 128)) then
-      raise ELWPTRegistryError.Create('invalid_registry_signature_encoding');
+      raise ELWPTRegistryError.CreateStable('invalid_registry_signature_encoding',
+        'signature envelope encoding is invalid');
   finally
     Root.Free;
   end;
@@ -747,8 +841,9 @@ begin
   if not HexToBytes(Copy(APublicKey, 5, MaxInt), Key, SizeOf(Key))
     or not HexToBytes(Copy(AEnvelope.Signature, 5, MaxInt), Signature,
       SizeOf(Signature)) then
-    raise ELWPTRegistryError.Create('invalid_registry_signature_encoding');
-  DomainBytes := TextBytes(ADomain + #10);
+    raise ELWPTRegistryError.CreateStable('invalid_registry_signature_encoding',
+      'signature envelope encoding is invalid');
+  DomainBytes := RegistryTextBytes(ADomain + #10);
   SetLength(MessageBytes, Length(DomainBytes) + Length(APayload));
   if Length(DomainBytes) > 0 then
     Move(DomainBytes[0], MessageBytes[0], Length(DomainBytes));
@@ -756,6 +851,29 @@ begin
     Move(APayload[0], MessageBytes[Length(DomainBytes)], Length(APayload));
   if not Ed25519Verify(MessageBytes, Key, Signature) then
     raise ELWPTRegistryError.Create('signature_invalid: Ed25519 verification failed');
+end;
+
+function InspectRegistrySignaturePayload(const ABytes: TBytes): string;
+begin
+  Result := ParseSignature(RegistryBytesText(ABytes)).Payload;
+end;
+
+function VerifyRegistryRotation(const ARotation: TLWPTRegistryRotationProof;
+  const AOrigin, AFromKey, AFromPublicKey: string;
+  const APreviousSequence, ACheckpointSequence: Int64): TLWPTUntrustedRegistryRotation;
+begin
+  Result := InspectRegistryRotation(ARotation.Document);
+  if (Result.Origin <> AOrigin) or (Result.FromKey <> AFromKey)
+    or (Result.ToKey = AFromKey)
+    or (Result.EffectiveSequence <= APreviousSequence)
+    or (Result.EffectiveSequence > ACheckpointSequence) then
+    raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
+      'rotation does not extend the trusted chain');
+  VerifySignature(PROJECT_NAME + '-REGISTRY-KEY-ROTATION-V1', ARotation.Document,
+    ParseSignature(RegistryBytesText(ARotation.OldSignature)), AFromKey, AFromPublicKey);
+  VerifySignature(PROJECT_NAME + '-REGISTRY-KEY-ROTATION-V1', ARotation.Document,
+    ParseSignature(RegistryBytesText(ARotation.NewSignature)), Result.ToKey,
+    Result.ToPublicKey);
 end;
 
 function ParseRegistryPackage(const AContent, AExpectedHash,
@@ -767,8 +885,9 @@ var
 begin
   Result := Default(TLWPTRegistryPackage);
   if (AExpectedHash <> '')
-    and (SHA256BytesPrefixed(TextBytes(AContent)) <> AExpectedHash) then
-    raise ELWPTRegistryError.Create('registry_record_hash_mismatch');
+    and (SHA256BytesPrefixed(RegistryTextBytes(AContent)) <> AExpectedHash) then
+    raise ELWPTRegistryError.CreateStable('registry_record_hash_mismatch',
+      'package record bytes do not match their hash');
   Root := ParseCanonical(AContent, PROGRAM_NAME + '-registry-package-v1',
     ['schema', 'origin', 'name', 'version', 'archive', 'archive_size',
      'published_at', 'yanked', 'dependencies']);
@@ -780,16 +899,18 @@ begin
     Result.ArchiveHash := TomlStr(Root, 'archive', '');
     Result.ArchiveSize := UnsignedField(Root, 'archive_size');
     Result.PublishedAt := TomlStr(Root, 'published_at', '');
-    Result.Yanked := NodeBoolean(Root, 'yanked', False);
+    Result.Yanked := NodeBoolean(Root, 'yanked');
     if (Result.Origin <> AExpectedOrigin)
       or not RegistryPackageNameIsCanonical(Result.Name)
       or not IsCanonicalVersion(Result.Version)
-      or not ValidHash(Result.ArchiveHash) or (Result.ArchiveSize < 0)
+      or not RegistryHashIsCanonical(Result.ArchiveHash) or (Result.ArchiveSize < 0)
       or not RegistryTimestampIsCanonical(Result.PublishedAt) then
-      raise ELWPTRegistryError.Create('invalid_registry_record');
+      raise ELWPTRegistryError.CreateStable('invalid_registry_record',
+        'package record fields are invalid');
     Deps := TomlGet(Root, 'dependencies');
     if not TomlIsArray(Deps) then
-      raise ELWPTRegistryError.Create('invalid_registry_record_dependencies');
+      raise ELWPTRegistryError.CreateStable('invalid_registry_record_dependencies',
+        'package record dependencies must be an array');
     SetLength(Result.Dependencies, Deps.Items.Count);
     CanonicalDependencyLine := 'dependencies = [';
     PreviousSortKey := '';
@@ -797,7 +918,8 @@ begin
     begin
       Item := Deps.Items[I];
       if not TomlIsTable(Item) then
-        raise ELWPTRegistryError.Create('invalid_registry_dependency');
+        raise ELWPTRegistryError.CreateStable('invalid_registry_dependency',
+          'package dependency is invalid');
       ExplicitOrigin := TomlStr(Item, 'origin', '');
       if ExplicitOrigin = '' then
         Result.Dependencies[I].Origin := Result.Origin
@@ -808,7 +930,8 @@ begin
       if not RegistryPackageNameIsCanonical(Result.Dependencies[I].Name)
         or not RegistryConstraintIsCanonical(Result.Dependencies[I].Version)
         or not RegistryURIIsCanonical(Result.Dependencies[I].Origin, True) then
-        raise ELWPTRegistryError.Create('invalid_registry_dependency');
+        raise ELWPTRegistryError.CreateStable('invalid_registry_dependency',
+          'package dependency is invalid');
       SortKey := Result.Dependencies[I].Origin + #0
         + Result.Dependencies[I].Name + #0 + Result.Dependencies[I].Version;
       if (I > 0) and (SortKey <= PreviousSortKey) then
@@ -844,7 +967,6 @@ type
     FDocuments: TLWPTRegistryDocumentArray;
     FDocumentIndexes: TDictionary<string, Integer>;
     FPackages: TDictionary<string, TLWPTRegistryPackage>;
-    procedure Account(const ABytes: TBytes);
     function Read(const APath: string): TBytes;
     function PackageRecord(const AHash, AOrigin: string): TLWPTRegistryPackage;
     function VerifyHistory(const AOrigin, AHeadHash: string; const ASequence: Int64;
@@ -873,7 +995,8 @@ begin
        'capabilities', 'checkpoint']);
   try
     if UnsignedField(Root, 'protocol') <> 1 then
-      raise ELWPTRegistryError.Create('unsupported_registry_protocol');
+      raise ELWPTRegistryError.CreateStable('unsupported_registry_protocol',
+        'only protocol 1 is supported');
     Result.Origin := TomlStr(Root, 'origin', '');
     Result.BaseURL := TomlStr(Root, 'base_url', '');
     Result.RoleName := TomlStr(Root, 'role', '');
@@ -882,7 +1005,8 @@ begin
     Result.Checkpoint := TomlStr(Root, 'checkpoint', '');
     Result.Rotations := TomlStr(Root, 'rotations', '');
     if (Result.RoleName <> 'origin') and (Result.RoleName <> 'mirror') then
-      raise ELWPTRegistryError.Create('invalid_registry_role');
+      raise ELWPTRegistryError.CreateStable('invalid_registry_role',
+        'role must be origin or mirror');
     if not RegistryURIIsCanonical(Result.Origin, True)
       or not RegistryURIIsCanonical(Result.BaseURL, True)
       or not RegistryURIIsCanonical(Result.API, True)
@@ -890,11 +1014,13 @@ begin
       or not RegistryURIIsCanonical(Result.Checkpoint, True)
       or ((TomlGet(Root, 'rotations') <> nil)
         and not RegistryURIIsCanonical(Result.Rotations, True)) then
-      raise ELWPTRegistryError.Create('invalid_registry_discovery_uri');
+      raise ELWPTRegistryError.CreateStable('invalid_registry_discovery_uri',
+        'discovery endpoint is not a canonical URL');
     if (Length(Result.Checkpoint) <= 5)
       or (Copy(Result.Checkpoint, Length(Result.Checkpoint) - 4, 5)
         <> '.toml') then
-      raise ELWPTRegistryError.Create('invalid_registry_checkpoint_uri');
+      raise ELWPTRegistryError.CreateStable('invalid_registry_checkpoint_uri',
+        'checkpoint endpoint must name a .toml resource');
   finally
     Root.Free;
   end;
@@ -903,7 +1029,7 @@ end;
 function ValidateRegistryCapabilities(const AContent: string;
   const ARole: string; out AHasRotations: Boolean): Integer;
 const
-  REQUIRED_SCHEMAS: array[0..4] of string = (
+  RequiredSchemas: array[0..4] of string = (
     PROGRAM_NAME + '-registry-checkpoint-v1', PROGRAM_NAME + '-registry-discovery-v1',
     PROGRAM_NAME + '-registry-package-v1', PROGRAM_NAME + '-registry-signature-v1',
     PROGRAM_NAME + '-registry-snapshot-v1');
@@ -923,7 +1049,8 @@ begin
      'auth_schemes', 'max_page_size']);
   try
     if UnsignedField(Root, 'protocol') <> 1 then
-      raise ELWPTRegistryError.Create('unsupported_registry_protocol');
+      raise ELWPTRegistryError.CreateStable('unsupported_registry_protocol',
+        'only protocol 1 is supported');
     Hashes := NodeStringArray(Root, 'hashes');
     Signatures := NodeStringArray(Root, 'signatures');
     Schemas := NodeStringArray(Root, 'schemas');
@@ -931,31 +1058,39 @@ begin
     AHasRotations := Contains(Features, 'rotation-chain-v1');
     if AHasRotations and (not Contains(Schemas, PROGRAM_NAME + '-registry-key-rotation-v1')
       or not Contains(Schemas, PROGRAM_NAME + '-registry-rotation-page-v1')) then
-      raise ELWPTRegistryError.Create('registry_schema_capability_missing');
+      raise ELWPTRegistryError.CreateStable('registry_schema_capability_missing',
+        'a required schema is not advertised');
     AuthSchemes := NodeStringArray(Root, 'auth_schemes');
     if UnsignedField(Root, 'max_page_size') > High(Integer) then
-      raise ELWPTRegistryError.Create('registry_capability_missing');
+      raise ELWPTRegistryError.CreateStable('registry_capability_missing',
+        'a required capability is not advertised');
     Result := UnsignedField(Root, 'max_page_size');
     if not Contains(Hashes, 'sha256') or not Contains(Signatures, 'ed25519')
       or not Contains(Features, 'snapshot-sync-v1')
       or (Result < 1) then
-      raise ELWPTRegistryError.Create('registry_capability_missing');
-    for I := 0 to High(REQUIRED_SCHEMAS) do
-      if not Contains(Schemas, REQUIRED_SCHEMAS[I]) then
-        raise ELWPTRegistryError.Create('registry_schema_capability_missing');
+      raise ELWPTRegistryError.CreateStable('registry_capability_missing',
+        'a required capability is not advertised');
+    for I := 0 to High(RequiredSchemas) do
+      if not Contains(Schemas, RequiredSchemas[I]) then
+        raise ELWPTRegistryError.CreateStable('registry_schema_capability_missing',
+          'a required schema is not advertised');
     if ARole = 'mirror' then
     begin
       if Contains(Features, 'publication-v1') then
-        raise ELWPTRegistryError.Create('mirror_advertises_publication');
+        raise ELWPTRegistryError.CreateStable('mirror_advertises_publication',
+          'a mirror cannot advertise publication');
       if Length(AuthSchemes) <> 0 then
-        raise ELWPTRegistryError.Create('mirror_advertises_authentication');
+        raise ELWPTRegistryError.CreateStable('mirror_advertises_authentication',
+          'a mirror cannot advertise authentication');
     end
     else if Contains(Features, 'publication-v1')
       and (Length(AuthSchemes) = 0) then
-      raise ELWPTRegistryError.Create('origin_publication_capability_missing');
+      raise ELWPTRegistryError.CreateStable('origin_publication_capability_missing',
+        'publication requires an authentication scheme');
     if (ARole = 'origin') and not Contains(Features, 'publication-v1')
       and (Length(AuthSchemes) <> 0) then
-      raise ELWPTRegistryError.Create('read_only_origin_advertises_authentication');
+      raise ELWPTRegistryError.CreateStable('read_only_origin_advertises_authentication',
+        'a read-only origin cannot advertise authentication');
   finally
     Root.Free;
   end;
@@ -963,7 +1098,10 @@ end;
 
 function DefaultRegistryVerificationLimits: TLWPTRegistryVerificationLimits;
 begin
-  Result.DocumentBytes := MAXIMUM_CANONICAL_DOCUMENT_BYTES;
+  {$IFDEF REGISTRY_TESTING}
+  if VerificationLimitsForTestingEnabled then Exit(VerificationLimitsForTesting);
+  {$ENDIF}
+  Result.DocumentBytes := MaximumCanonicalDocumentBytes;
   Result.TotalBytes := 64 * 1024 * 1024;
   Result.Documents := 10000;
   Result.Snapshots := 10000;
@@ -975,11 +1113,12 @@ constructor TLWPTRegistryVerifier.Create(ASource: TLWPTRegistryDocumentSource;
 begin
   inherited Create;
   if not Assigned(ASource) or (ALimits.DocumentBytes < 1)
-    or (ALimits.DocumentBytes > MAXIMUM_CANONICAL_DOCUMENT_BYTES)
+    or (ALimits.DocumentBytes > MaximumCanonicalDocumentBytes)
     or (ALimits.TotalBytes < ALimits.DocumentBytes)
     or (ALimits.Documents < 2) or (ALimits.Snapshots < 1)
     or (ALimits.Rotations < 0) then
-    raise ELWPTRegistryError.Create('invalid_verification_limits');
+    raise ELWPTRegistryError.CreateStable('invalid_verification_limits',
+      'verification limits are invalid');
   FSource := ASource;
   FLimits := ALimits;
   FBudget := TLWPTRegistryMetadataBudget.Create(ALimits);
@@ -995,18 +1134,14 @@ begin
   inherited Destroy;
 end;
 
-procedure TLWPTRegistryVerifier.Account(const ABytes: TBytes);
-begin
-  FBudget.Account(ABytes);
-end;
-
 constructor TLWPTRegistryMetadataBudget.Create(const ALimits: TLWPTRegistryVerificationLimits);
 begin
   inherited Create;
   FLimits := ALimits;
   if (FLimits.DocumentBytes < 1) or (FLimits.TotalBytes < FLimits.DocumentBytes)
     or (FLimits.Documents < 1) then
-    raise ELWPTRegistryError.Create('invalid_verification_limits');
+    raise ELWPTRegistryError.CreateStable('invalid_verification_limits',
+      'verification limits are invalid');
 end;
 
 function TLWPTRegistryMetadataBudget.Allowance: Int64;
@@ -1036,7 +1171,7 @@ begin
     Exit(FDocuments[Index].Bytes);
   Allowance := FBudget.Allowance;
   Result := FSource.ReadDocument(APath, Allowance);
-  Account(Result);
+  FBudget.Account(Result);
   Result := Copy(Result);
   Index := Length(FDocuments);
   SetLength(FDocuments, Index + 1);
@@ -1048,10 +1183,10 @@ end;
 function TLWPTRegistryVerifier.PackageRecord(const AHash,
   AOrigin: string): TLWPTRegistryPackage;
 begin
-  if not ValidHash(AHash) then
+  if not RegistryHashIsCanonical(AHash) then
     raise ELWPTRegistryError.Create('record_hash_mismatch: invalid digest');
   if FPackages.TryGetValue(AHash, Result) then Exit;
-  Result := ParseRegistryPackage(BytesText(Read('records/sha256/'
+  Result := ParseRegistryPackage(RegistryBytesText(Read('records/sha256/'
     + Copy(AHash, 8, 64) + '.toml')), AHash, AOrigin);
   FPackages.Add(AHash, Result);
 end;
@@ -1094,9 +1229,10 @@ var
   PriorReached: Boolean;
 begin
   Result := nil;
-  if not RegistryURIIsCanonical(AOrigin, True) or not ValidHash(AHeadHash)
+  if not RegistryURIIsCanonical(AOrigin, True) or not RegistryHashIsCanonical(AHeadHash)
     or (ASequence < 1) then
-    raise ELWPTRegistryError.Create('snapshot_consistency_failed');
+    raise ELWPTRegistryError.CreateStable('snapshot_consistency_failed',
+      'snapshot history is inconsistent');
   CurrentHash := AHeadHash;
   ExpectedSequence := ASequence;
   SnapshotCount := 0;
@@ -1111,25 +1247,29 @@ begin
       if (ExpectedSequence = APrior.Sequence) and (APrior.Sequence > 0) then
       begin
         if CurrentHash <> APrior.Snapshot then
-          raise ELWPTRegistryError.Create('snapshot_consistency_failed');
+          raise ELWPTRegistryError.CreateStable('snapshot_consistency_failed',
+            'snapshot history is inconsistent');
         PriorReached := True;
       end;
       SnapshotBytes := Read('snapshots/sha256/' + Copy(CurrentHash, 8, 64)
         + '.toml');
       if SHA256BytesPrefixed(SnapshotBytes) <> CurrentHash then
-        raise ELWPTRegistryError.Create('snapshot_hash_mismatch');
-      Root := ParseCanonical(BytesText(SnapshotBytes),
+        raise ELWPTRegistryError.CreateStable('snapshot_hash_mismatch',
+          'snapshot bytes do not match their hash');
+      Root := ParseCanonical(RegistryBytesText(SnapshotBytes),
         PROGRAM_NAME + '-registry-snapshot-v1', ['schema', 'origin',
           'sequence', 'published_at', 'previous', 'records']);
       try
         if (TomlStr(Root, 'origin', '') <> AOrigin)
           or (UnsignedField(Root, 'sequence') <> ExpectedSequence)
           or not RegistryTimestampIsCanonical(TomlStr(Root, 'published_at', '')) then
-          raise ELWPTRegistryError.Create('snapshot_consistency_failed');
+          raise ELWPTRegistryError.CreateStable('snapshot_consistency_failed',
+            'snapshot history is inconsistent');
         Previous := StringField(Root, 'previous');
         if ((ExpectedSequence = 1) and (Previous <> ''))
-          or ((ExpectedSequence > 1) and not ValidHash(Previous)) then
-          raise ELWPTRegistryError.Create('snapshot_consistency_failed');
+          or ((ExpectedSequence > 1) and not RegistryHashIsCanonical(Previous)) then
+          raise ELWPTRegistryError.CreateStable('snapshot_consistency_failed',
+            'snapshot history is inconsistent');
         Records := NodeStringArray(Root, 'records');
       finally
         Root.Free;
@@ -1141,7 +1281,8 @@ begin
         Package := PackageRecord(Records[RecordIndex], AOrigin);
         Identity := PackageIdentity(Package);
         if CurrentPackages.ContainsKey(Identity) then
-          raise ELWPTRegistryError.Create('duplicate_package_identity');
+          raise ELWPTRegistryError.CreateStable('duplicate_package_identity',
+            'snapshot contains one package identity twice');
         CurrentPackages.Add(Identity, Package);
         Packages[RecordIndex] := Package;
         if Assigned(NewerPackages) then
@@ -1174,34 +1315,43 @@ function TLWPTRegistryVerifier.Verify(const AProof: TLWPTRegistryProof;
 var
   Checkpoint: TRegistryCheckpoint;
   Rotation: TLWPTUntrustedRegistryRotation;
-  KeyId, PublicKey, ToKey, ToPublicKey: string;
+  KeyId, PublicKey: string;
   PriorKeyId, PriorPublicKey: string;
-  EffectiveSequence, LastEffectiveSequence: Int64;
+  LastEffectiveSequence: Int64;
   Index: Integer;
   UsedKeys: TStringList;
 begin
   Result := Default(TLWPTVerifiedRegistry);
   if not RegistryURIIsCanonical(ATrust.Origin, True)
     or not RegistryTrustRootIsValid(ATrust.KeyId, ATrust.PublicKey) then
-    raise ELWPTRegistryError.Create('invalid_trust_root');
+    raise ELWPTRegistryError.CreateStable('invalid_trust_root',
+      'origin identity or pinned root key is invalid');
   if not RegistryTimestampIsCanonical(AEvaluationTime) then
-    raise ELWPTRegistryError.Create('invalid_evaluation_time');
+    raise ELWPTRegistryError.CreateStable('invalid_evaluation_time',
+      'evaluation time must be canonical UTC');
   if (APrior.Sequence < 0)
     or ((APrior.Sequence > 0) and ((APrior.Origin <> ATrust.Origin)
-      or not ValidHash(APrior.Snapshot)
-      or not RegistryTrustRootIsValid(APrior.KeyId, APrior.PublicKey))) then
-    raise ELWPTRegistryError.Create('invalid_accepted_state');
+      or not RegistryHashIsCanonical(APrior.Snapshot)
+      or not RegistryTrustRootIsValid(APrior.KeyId, APrior.PublicKey)
+      or not RegistryTimestampIsCanonical(APrior.PublishedAt)
+      or not RegistryTimestampIsCanonical(APrior.ExpiresAt))) then
+    raise ELWPTRegistryError.CreateStable('invalid_accepted_state',
+      'prior accepted state is incomplete or belongs to another origin');
   if (AMode = rvmLockedProof) and (APrior.Sequence = 0) then
-    raise ELWPTRegistryError.Create('locked_proof_requires_accepted_state');
-  Account(AProof.Checkpoint);
-  Account(AProof.Signature);
-  for Index := 0 to High(AProof.RetrievalDocuments) do Account(AProof.RetrievalDocuments[Index]);
+    raise ELWPTRegistryError.CreateStable('locked_proof_requires_accepted_state',
+      'locked proof verification requires the recorded checkpoint');
+  FBudget.Account(AProof.Checkpoint);
+  FBudget.Account(AProof.Signature);
+  for Index := 0 to High(AProof.RetrievalDocuments) do
+    FBudget.Account(AProof.RetrievalDocuments[Index]);
   if (AMode = rvmLockedProof)
     and (APrior.CheckpointHash <> SHA256BytesPrefixed(AProof.Checkpoint)) then
-    raise ELWPTRegistryError.Create('locked_proof_state_mismatch');
+    raise ELWPTRegistryError.CreateStable('locked_proof_state_mismatch',
+      'retained checkpoint bytes differ from the recorded checkpoint');
   Checkpoint := InspectRegistryCheckpoint(AProof.Checkpoint);
   if Checkpoint.Origin <> ATrust.Origin then
-    raise ELWPTRegistryError.Create('checkpoint_origin_mismatch');
+    raise ELWPTRegistryError.CreateStable('checkpoint_origin_mismatch',
+      'checkpoint names a different origin');
   KeyId := ATrust.KeyId;
   PublicKey := ATrust.PublicKey;
   PriorKeyId := KeyId;
@@ -1216,31 +1366,19 @@ begin
     UsedKeys.Add(KeyId);
     for Index := 0 to High(AProof.Rotations) do
     begin
-      Account(AProof.Rotations[Index].Document);
-      Account(AProof.Rotations[Index].OldSignature);
-      Account(AProof.Rotations[Index].NewSignature);
-      Rotation := InspectRegistryRotation(AProof.Rotations[Index].Document);
-      ToKey := Rotation.ToKey;
-      ToPublicKey := Rotation.ToPublicKey;
-      EffectiveSequence := Rotation.EffectiveSequence;
-      if (Rotation.Origin <> ATrust.Origin) or (Rotation.FromKey <> KeyId)
-        or (UsedKeys.IndexOf(ToKey) >= 0)
-        or (EffectiveSequence <= LastEffectiveSequence)
-        or (EffectiveSequence > Checkpoint.Sequence) then
-        raise ELWPTRegistryError.Create('rotation_chain_invalid');
-      VerifySignature(PROJECT_NAME + '-REGISTRY-KEY-ROTATION-V1',
-        AProof.Rotations[Index].Document,
-        ParseSignature(BytesText(AProof.Rotations[Index].OldSignature)),
-        KeyId, PublicKey);
-      VerifySignature(PROJECT_NAME + '-REGISTRY-KEY-ROTATION-V1',
-        AProof.Rotations[Index].Document,
-        ParseSignature(BytesText(AProof.Rotations[Index].NewSignature)),
-        ToKey, ToPublicKey);
-      KeyId := ToKey;
-      PublicKey := ToPublicKey;
-      LastEffectiveSequence := EffectiveSequence;
+      FBudget.Account(AProof.Rotations[Index].Document);
+      FBudget.Account(AProof.Rotations[Index].OldSignature);
+      FBudget.Account(AProof.Rotations[Index].NewSignature);
+      Rotation := VerifyRegistryRotation(AProof.Rotations[Index], ATrust.Origin,
+        KeyId, PublicKey, LastEffectiveSequence, Checkpoint.Sequence);
+      if UsedKeys.IndexOf(Rotation.ToKey) >= 0 then
+        raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
+          'rotation reuses an earlier key');
+      KeyId := Rotation.ToKey;
+      PublicKey := Rotation.ToPublicKey;
+      LastEffectiveSequence := Rotation.EffectiveSequence;
       UsedKeys.Add(KeyId);
-      if EffectiveSequence <= APrior.Sequence then
+      if Rotation.EffectiveSequence <= APrior.Sequence then
       begin
         PriorKeyId := KeyId;
         PriorPublicKey := PublicKey;
@@ -1250,26 +1388,41 @@ begin
     UsedKeys.Free;
   end;
   if Checkpoint.KeyId <> KeyId then
-    raise ELWPTRegistryError.Create('rotation_chain_invalid: checkpoint key');
+    raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
+      'checkpoint key is not reached by the verified rotation chain');
   VerifySignature(PROJECT_NAME + '-REGISTRY-CHECKPOINT-V1',
-    AProof.Checkpoint, ParseSignature(BytesText(AProof.Signature)),
+    AProof.Checkpoint, ParseSignature(RegistryBytesText(AProof.Signature)),
     KeyId, PublicKey);
   if (AMode = rvmAcquire) and (Checkpoint.ExpiresAt <= AEvaluationTime) then
-    raise ELWPTRegistryError.Create('checkpoint_expired');
+    raise ELWPTRegistryStaleContactError.CreateStable('checkpoint_expired',
+      'checkpoint expired at ' + Checkpoint.ExpiresAt);
   if (AMode = rvmAcquire) and (Checkpoint.PublishedAt > AEvaluationTime) then
-    raise ELWPTRegistryError.Create('checkpoint_from_future');
+    raise ELWPTRegistryError.CreateStable('checkpoint_from_future',
+      'checkpoint publication time is later than the evaluation time');
   if APrior.Sequence > 0 then
   begin
     if Checkpoint.Sequence < APrior.Sequence then
-      raise ELWPTRegistryError.Create('checkpoint_downgrade');
+      raise ELWPTRegistryStaleContactError.CreateStable('checkpoint_downgrade',
+        'checkpoint sequence is lower than accepted state');
     if (PriorKeyId <> APrior.KeyId) or (PriorPublicKey <> APrior.PublicKey) then
-      raise ELWPTRegistryError.Create('rotation_chain_invalid: accepted key');
+      raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
+        'rotation chain does not preserve the accepted signing key');
     if (Checkpoint.Sequence = APrior.Sequence)
       and ((Checkpoint.Snapshot <> APrior.Snapshot)
         or (Checkpoint.KeyId <> APrior.KeyId)) then
-      raise ELWPTRegistryError.Create('checkpoint_equivocation');
+      raise ELWPTRegistryError.CreateStable('checkpoint_equivocation',
+        'same sequence names a different snapshot or key');
+    { A renewal may only move both authenticated times forward. Identical
+      bytes remain an idempotent replay. }
+    if (Checkpoint.Sequence = APrior.Sequence)
+      and ((Checkpoint.PublishedAt < APrior.PublishedAt)
+        or (Checkpoint.ExpiresAt < APrior.ExpiresAt)) then
+      raise ELWPTRegistryStaleContactError.CreateStable(
+        'checkpoint_renewal_rollback',
+        'same-sequence checkpoint is older than the accepted renewal');
     if (AMode = rvmLockedProof) and (Checkpoint.Sequence <> APrior.Sequence) then
-      raise ELWPTRegistryError.Create('locked_proof_state_mismatch');
+      raise ELWPTRegistryError.CreateStable('locked_proof_state_mismatch',
+        'retained checkpoint sequence differs from the recorded state');
   end;
   Result.Packages := VerifyHistory(ATrust.Origin, Checkpoint.Snapshot, Checkpoint.Sequence, APrior);
   Result.State.Origin := ATrust.Origin;
@@ -1278,6 +1431,8 @@ begin
   Result.State.Sequence := Checkpoint.Sequence;
   Result.State.Snapshot := Checkpoint.Snapshot;
   Result.State.CheckpointHash := SHA256BytesPrefixed(AProof.Checkpoint);
+  Result.State.PublishedAt := Checkpoint.PublishedAt;
+  Result.State.ExpiresAt := Checkpoint.ExpiresAt;
   Result.PublishedAt := Checkpoint.PublishedAt;
   Result.ExpiresAt := Checkpoint.ExpiresAt;
   Result.Documents := FDocuments;
@@ -1327,13 +1482,14 @@ end;
 procedure VerifyRegistryArtifact(const APackage: TLWPTRegistryPackage;
   AArchive: TStream);
 begin
-  if not Assigned(AArchive) or not ValidHash(APackage.ArchiveHash)
+  if not Assigned(AArchive) or not RegistryHashIsCanonical(APackage.ArchiveHash)
     or (APackage.ArchiveSize < 0) then
     raise ELWPTRegistryError.Create('object_hash_mismatch: invalid artifact');
   AArchive.Position := 0;
   if (AArchive.Size <> APackage.ArchiveSize)
     or ('sha256:' + SHA256Stream(AArchive) <> APackage.ArchiveHash) then
-    raise ELWPTRegistryError.Create('object_hash_mismatch');
+    raise ELWPTRegistryError.CreateStable('object_hash_mismatch',
+      'archive bytes do not match the signed record');
   AArchive.Position := 0;
 end;
 

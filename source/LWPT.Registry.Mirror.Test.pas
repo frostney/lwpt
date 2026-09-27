@@ -12,27 +12,65 @@ uses
   {$ENDIF}
   Classes,
   DateUtils,
+  Generics.Collections,
   Process,
   SysUtils,
+
+  TestingPascalLibrary,
+  TOML,
 
   LWPT.Core,
   LWPT.Registry.Mirror,
   LWPT.Registry.Server,
   LWPT.Registry.Store,
   LWPT.Registry.Verification,
-  TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.RegistryProcess,
   Tests.RegistryServer,
-  Tests.Scratch,
-  TOML;
+  Tests.Scratch;
+
+const
+  { Fixed signing times; the registry clock is controlled per test. }
+  FixturePublishedAt = '2031-01-01T00:00:00Z';
+  FixtureNow = '2031-01-02T00:00:00Z';
+  FixtureExpiry = '2031-01-08T00:00:00Z';
 
 type
-  { A captured origin fixture cannot renew its deliberately near-expiry proof. }
+  { A captured origin renews only when a test asks for it. }
   TCapturedOrigin = class(TLWPTRegistryStore)
   public
+    AllowRenewal: Boolean;
     procedure EnsureFreshCheckpoint(const ANow: string;
       AProgress: TSHA256Progress = nil); override;
+  end;
+
+  { An in-process origin behind the loopback test server. Overrides replace
+    individual responses; sequences serve successive bodies to one target. }
+  TOriginHarness = class
+  private
+    FLock: TRTLCriticalSection;
+    FOverrides: TDictionary<string, TBytes>;
+    FSequences: TObjectDictionary<string, TList<TBytes>>;
+    FStarted: Boolean;
+  public
+    Root: string;
+    Server: TRegistryTestServer;
+    Origin: TCapturedOrigin;
+    Mirror: TLWPTRegistryMirror;
+    constructor Create(const AName: string; const APublishedAt: string = '';
+      const AStoreBudget: Int64 = 0; const ASyncBudget: Int64 = 0);
+    destructor Destroy; override;
+    function Handle(const ATarget: string; out AMediaType: string;
+      out ABody: TBytes): Integer;
+    function Body(const ATarget: string): TBytes;
+    procedure Override(const ATarget: string; const ABody: TBytes);
+    procedure Sequence(const ATarget: string; const ABodies: array of TBytes);
+    procedure ClearOverrides;
+    procedure UseOrigin(AOrigin: TCapturedOrigin);
+    procedure Publish(const AName: string; const APublishedAt: string = '';
+      const ASize: Integer = 0);
+    function Sync: string;
+    function Requested(const AFragment: string): Integer;
   end;
 
   TTransferThread = class(TThread)
@@ -50,8 +88,11 @@ type
   private
     FRoot: string;
     FMirror: TLWPTRegistryMirror;
-    FActivationExpiry, FActivationEnteredAt: string;
-    procedure WaitForActivationExpiry;
+    FActivationMirror: TLWPTRegistryMirror;
+    FActivationEntered: Boolean;
+    procedure ExpireBeforeActivation;
+    procedure BlockAttemptAndFail;
+    procedure FailBeforeActivation;
     function ObjectPath(const APackage: TLWPTRegistryPackage): string;
     procedure PrepareSignedFixture(AServer: TRegistryTestServer;
       const APublishedAt: string; const ACount: Integer;
@@ -72,6 +113,20 @@ type
     procedure ExpiryBeforeActivationPreventsPublication;
     procedure CLIInterruptionReusesCompletedPair;
     procedure IncompleteClientShutdownIsBounded;
+    procedure PoisonedRootKeyRecordIsNotPermanent;
+    procedure ForgedRotationStopsFurtherRetrieval;
+    procedure SynchronizationBudgetBoundsRequests;
+    procedure AmbiguousDiscoveryEndpointsAreRefused;
+    procedure AdvancingCheckpointPairIsRetried;
+    procedure InconsistentCheckpointPairFailsBounded;
+    procedure AttemptRecordingFailurePreservesError;
+    procedure SyncBudgetRejectsBeforeTransfer;
+    procedure StoreBudgetPrunesUnacceptedCandidates;
+    procedure BackwardsRenewalKeepsAcceptedPointer;
+    procedure AbandonedRotationCannotContaminateLaterHistory;
+    procedure UnsupportedUpstreamsAreRejectedAtConfiguration;
+    procedure LocalhostTransportUsesLoopback;
+    procedure StaleActivatedMirrorReportsExpiry;
   end;
 
 function Package(const ABytes: TBytes): TLWPTRegistryPackage;
@@ -93,8 +148,73 @@ var
 begin
   Started := GetTickCount64;
   while (InterlockedCompareExchange(ACounter, 0, 0) < ACount)
-    and (GetTickCount64 - Started < 3000) do Sleep(1);
+    and (GetTickCount64 - Started < 5000) do Sleep(1);
   Result := InterlockedCompareExchange(ACounter, 0, 0) >= ACount;
+end;
+
+function AsText(const ABytes: TBytes): string;
+begin
+  Result := RegistryBytesText(ABytes);
+end;
+
+function ReadFileBytes(const APath: string): TBytes;
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmOpenRead);
+  try
+    SetLength(Result, Stream.Size);
+    if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
+  finally
+    Stream.Free;
+  end;
+end;
+
+function ServedBytes(AStore: TLWPTRegistryStore; const ATarget: string): TBytes;
+var
+  Response: TLWPTRegistryHTTPResponse;
+  Stream: TStream;
+begin
+  Response := RegistryHTTPResponse(AStore, 'GET', ATarget);
+  if Response.Status <> 200 then
+    raise Exception.CreateFmt('HTTP %d for %s', [Response.Status, ATarget]);
+  if Response.ResourcePath = '' then Exit(Response.Body);
+  Stream := OpenRegistryHTTPResource(Response);
+  try
+    SetLength(Result, Stream.Size);
+    if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure CopyTree(const ASource, ATarget: string);
+var
+  Search: TSearchRec;
+  Stream: TFileStream;
+  Bytes: TBytes;
+begin
+  ForceDirectories(ATarget);
+  if FindFirst(ASource + '/*', faAnyFile, Search) <> 0 then Exit;
+  try
+    repeat
+      if (Search.Name = '.') or (Search.Name = '..') or (Search.Name = 'locks') then Continue;
+      if (Search.Attr and faDirectory) <> 0 then
+        CopyTree(ASource + '/' + Search.Name, ATarget + '/' + Search.Name)
+      else
+      begin
+        Bytes := ReadFileBytes(ASource + '/' + Search.Name);
+        Stream := TFileStream.Create(ATarget + '/' + Search.Name, fmCreate);
+        try
+          if Length(Bytes) > 0 then Stream.WriteBuffer(Bytes[0], Length(Bytes));
+        finally
+          Stream.Free;
+        end;
+      end;
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
 end;
 
 constructor TTransferThread.Create;
@@ -116,12 +236,216 @@ end;
 procedure TCapturedOrigin.EnsureFreshCheckpoint(const ANow: string;
   AProgress: TSHA256Progress);
 begin
+  if AllowRenewal then inherited EnsureFreshCheckpoint(ANow, AProgress);
+end;
+
+constructor TOriginHarness.Create(const AName, APublishedAt: string;
+  const AStoreBudget, ASyncBudget: Int64);
+var
+  Config: TLWPTRegistryConfig;
+  KeyID, PublishedAt: string;
+  Parser: TTOMLParser;
+  Key: TTOMLNode;
+begin
+  inherited Create;
+  InitCriticalSection(FLock);
+  FOverrides := TDictionary<string, TBytes>.Create;
+  FSequences := TObjectDictionary<string, TList<TBytes>>.Create([doOwnsValues]);
+  Root := CreateScratchRoot(AName);
+  PublishedAt := APublishedAt;
+  if PublishedAt = '' then PublishedAt := RegistryTimestampNow;
+  Server := TRegistryTestServer.Create(nil, True);
+  Server.Handler := Handle;
+  Config := RegistryConfiguration('', 'http://localhost:' + IntToStr(Server.Port),
+    'localhost', Server.Port, '', '');
+  Origin := TCapturedOrigin(TCapturedOrigin.Initialize(Root + '/origin', Config, PublishedAt));
+  KeyID := InspectRegistryCheckpoint(Origin.LoadResource(Origin.LoadCurrentState.CheckpointPath)).KeyId;
+  Parser := TTOMLParser.Create;
+  Key := Parser.ParseDocument(AsText(Origin.LoadResource(RegistryKeyStoragePath(KeyID))));
+  try
+    Config := Origin.Config;
+    Config.Role := rrMirror;
+    Config.BaseURL := 'http://localhost:8182';
+    Config.Port := 8182;
+    Config.UpstreamURL := Origin.Config.BaseURL;
+    Config.TrustKeyID := KeyID;
+    Config.TrustPublicKey := TomlStr(Key, 'public_key', '');
+    if AStoreBudget > 0 then Config.StoreBudgetBytes := AStoreBudget;
+    if ASyncBudget > 0 then Config.SyncBudgetBytes := ASyncBudget;
+  finally
+    Key.Free;
+    Parser.Free;
+  end;
+  Mirror := TLWPTRegistryMirror(TLWPTRegistryMirror.Initialize(Root + '/mirror', Config, PublishedAt));
+end;
+
+destructor TOriginHarness.Destroy;
+begin
+  Server.Free;
+  Mirror.Free;
+  Origin.Free;
+  FSequences.Free;
+  FOverrides.Free;
+  DoneCriticalSection(FLock);
+  RecursiveDelete(Root);
+  inherited Destroy;
+end;
+
+function TOriginHarness.Handle(const ATarget: string; out AMediaType: string;
+  out ABody: TBytes): Integer;
+var
+  Response: TLWPTRegistryHTTPResponse;
+  Stream: TStream;
+  Bodies: TList<TBytes>;
+  Replacement: TBytes;
+begin
+  EnterCriticalSection(FLock);
+  try
+    Response := RegistryHTTPResponse(Origin, 'GET', ATarget);
+    Result := Response.Status;
+    AMediaType := Response.ContentType;
+    ABody := Response.Body;
+    if FSequences.TryGetValue(ATarget, Bodies) and (Bodies.Count > 0) then
+    begin
+      ABody := Bodies[0];
+      if Bodies.Count > 1 then Bodies.Delete(0);
+      Exit(200);
+    end;
+    if FOverrides.TryGetValue(ATarget, Replacement) then
+    begin
+      ABody := Replacement;
+      Exit(200);
+    end;
+    if Response.ResourcePath <> '' then
+    begin
+      Stream := OpenRegistryHTTPResource(Response);
+      try
+        SetLength(ABody, Stream.Size);
+        if Length(ABody) > 0 then Stream.ReadBuffer(ABody[0], Length(ABody));
+      finally
+        Stream.Free;
+      end;
+    end;
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+function TOriginHarness.Body(const ATarget: string): TBytes;
+var
+  MediaType: string;
+begin
+  if Handle(ATarget, MediaType, Result) <> 200 then
+    raise Exception.Create('origin fixture has no ' + ATarget);
+end;
+
+procedure TOriginHarness.Override(const ATarget: string; const ABody: TBytes);
+begin
+  EnterCriticalSection(FLock);
+  try
+    FOverrides.AddOrSetValue(ATarget, ABody);
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+procedure TOriginHarness.Sequence(const ATarget: string; const ABodies: array of TBytes);
+var
+  Bodies: TList<TBytes>;
+  Index: Integer;
+begin
+  Bodies := TList<TBytes>.Create;
+  for Index := 0 to High(ABodies) do Bodies.Add(ABodies[Index]);
+  EnterCriticalSection(FLock);
+  try
+    FSequences.AddOrSetValue(ATarget, Bodies);
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+procedure TOriginHarness.ClearOverrides;
+begin
+  EnterCriticalSection(FLock);
+  try
+    FOverrides.Clear;
+    FSequences.Clear;
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+procedure TOriginHarness.UseOrigin(AOrigin: TCapturedOrigin);
+begin
+  EnterCriticalSection(FLock);
+  try
+    Origin.Free;
+    Origin := AOrigin;
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+procedure TOriginHarness.Publish(const AName, APublishedAt: string;
+  const ASize: Integer);
+var
+  Publication: TLWPTRegistryPublication;
+begin
+  Publication := Default(TLWPTRegistryPublication);
+  Publication.Name := AName;
+  Publication.Version := '1.0.0';
+  Publication.PublishedAt := APublishedAt;
+  if Publication.PublishedAt = '' then Publication.PublishedAt := RegistryTimestampNow;
+  if ASize > 0 then
+  begin
+    SetLength(Publication.Archive, ASize);
+    FillChar(Publication.Archive[0], ASize, Ord(AName[1]));
+  end
+  else Publication.Archive := BytesOf('archive ' + AName);
+  EnterCriticalSection(FLock);
+  try
+    Origin.Publish(Publication);
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+function TOriginHarness.Sync: string;
+begin
+  { Static routes can be installed until the first synchronization. }
+  if not FStarted then
+  begin
+    Server.Start;
+    FStarted := True;
+  end;
+  Result := 'ok';
+  try
+    Mirror.Synchronize;
+  except
+    on E: Exception do Result := E.Message;
+  end;
+end;
+
+function TOriginHarness.Requested(const AFragment: string): Integer;
+var
+  Targets: TStringList;
+  Target: string;
+begin
+  Result := 0;
+  Targets := Server.RequestedTargets;
+  try
+    for Target in Targets do
+      if Pos(AFragment, Target) > 0 then Inc(Result);
+  finally
+    Targets.Free;
+  end;
 end;
 
 procedure TMirrorTransferTests.BeforeEach;
 var
   Config: TLWPTRegistryConfig;
 begin
+  SetRegistryClockForTesting('');
   FRoot := CreateScratchRoot('mirror-transfer');
   Config := RegistryConfiguration('http://localhost:8181', 'http://localhost:8182',
     'localhost', 8182, '', '');
@@ -135,6 +459,7 @@ end;
 
 procedure TMirrorTransferTests.AfterEach;
 begin
+  SetRegistryClockForTesting('');
   FMirror.Free;
   RecursiveDelete(FRoot);
 end;
@@ -146,10 +471,10 @@ end;
 
 procedure TMirrorTransferTests.AdmissionArithmetic;
 begin
-  Expect<Boolean>(RegistryMirrorCanAdmitForTesting(0, MAXIMUM_MIRROR_ARCHIVE_BYTES, 0)).ToBe(True);
-  Expect<Boolean>(RegistryMirrorCanAdmitForTesting(MAXIMUM_MIRROR_ARCHIVE_BYTES, 0, 1)).ToBe(True);
-  Expect<Boolean>(RegistryMirrorCanAdmitForTesting(MAXIMUM_MIRROR_ARCHIVE_BYTES, 1, 1)).ToBe(False);
-  Expect<Boolean>(RegistryMirrorCanAdmitForTesting(MAXIMUM_MIRROR_ARCHIVE_BYTES - 1, 1, 1)).ToBe(True);
+  Expect<Boolean>(RegistryMirrorCanAdmitForTesting(0, RegistryMaximumMirrorArchiveBytes, 0)).ToBe(True);
+  Expect<Boolean>(RegistryMirrorCanAdmitForTesting(RegistryMaximumMirrorArchiveBytes, 0, 1)).ToBe(True);
+  Expect<Boolean>(RegistryMirrorCanAdmitForTesting(RegistryMaximumMirrorArchiveBytes, 1, 1)).ToBe(False);
+  Expect<Boolean>(RegistryMirrorCanAdmitForTesting(RegistryMaximumMirrorArchiveBytes - 1, 1, 1)).ToBe(True);
   Expect<Boolean>(RegistryMirrorCanAdmitForTesting(0, 0, 2)).ToBe(False);
   Expect<Boolean>(RegistryMirrorCanAdmitForTesting(High(Int64), 1, 0)).ToBe(False);
   Expect<Boolean>(RegistryMirrorCanAdmitForTesting(1, High(Int64), 0)).ToBe(False);
@@ -165,7 +490,7 @@ var
   Routes: TRegistryHTTPRouteArray;
   Gate, FirstGate: PRTLEvent;
   Arrived, Third: LongInt;
-  Stats: TRegistryMirrorTransferStats;
+  Stats: PRegistryMirrorTransferStats;
   I: Integer;
 begin
   Gate := RTLEventCreate;
@@ -188,23 +513,25 @@ begin
     Routes[2].Arrived := @Third;
     Server := TRegistryTestServer.Create(Routes, True);
     Server.Start;
+    Stats := RegistryMirrorTransferStatsForTesting(FMirror);
     Transfer.Mirror := FMirror;
     Transfer.API := 'http://localhost:' + IntToStr(Server.Port) + '/v1';
     Transfer.Start;
     Expect<Boolean>(WaitForCounter(Arrived, 2)).ToBe(True);
     { Neither response can finish before both requests reach their barriers. }
     RTLEventSetEvent(FirstGate);
-    Sleep(50); { The first response can finish while its sibling is blocked. }
+    { Observe the first worker's completion instead of sleeping. Its sibling
+      is still blocked, so the pair must not admit the third archive. }
+    Expect<Boolean>(WaitForCounter(Stats^.CompletedWorkers, 1)).ToBe(True);
     Expect<Integer>(InterlockedCompareExchange(Third, 0, 0)).ToBe(0);
     Expect<Boolean>(FileExists(ObjectPath(Transfer.Packages[0]))).ToBe(False);
     RTLEventSetEvent(Gate);
     Transfer.WaitFor;
     Expect<string>(Transfer.Error).ToBe('');
     Expect<Integer>(Third).ToBe(1);
-    Stats := RegistryMirrorTransferStatsForTesting(FMirror);
-    Expect<Integer>(Stats.MaximumWorkers).ToBe(2);
-    Expect<Int64>(Stats.PeakReserved).ToBe(18);
-    Expect<Int64>(Stats.CompletedReserved).ToBe(18);
+    Expect<Integer>(Stats^.MaximumWorkers).ToBe(2);
+    Expect<Int64>(Stats^.PeakReserved).ToBe(18);
+    Expect<Int64>(Stats^.CompletedReserved).ToBe(18);
     for I := 0 to 2 do Expect<Boolean>(FileExists(ObjectPath(Transfer.Packages[I]))).ToBe(True);
   finally
     RTLEventSetEvent(Gate);
@@ -223,6 +550,7 @@ var
   Routes: TRegistryHTTPRouteArray;
   Gate: PRTLEvent;
   First, Second: LongInt;
+  Stats: PRegistryMirrorTransferStats;
 begin
   Gate := RTLEventCreate;
   Server := nil;
@@ -232,7 +560,7 @@ begin
   try
     SetLength(Transfer.Packages, 2);
     Transfer.Packages[0] := Package(BytesOf('small'));
-    Transfer.Packages[0].ArchiveSize := MAXIMUM_MIRROR_ARCHIVE_BYTES;
+    Transfer.Packages[0].ArchiveSize := RegistryMaximumMirrorArchiveBytes;
     Transfer.Packages[1] := Package(BytesOf('sibling'));
     SetLength(Routes, 2);
     Routes[0] := Route(Transfer.Packages[0], BytesOf('small'));
@@ -242,17 +570,20 @@ begin
     Routes[1].Arrived := @Second;
     Server := TRegistryTestServer.Create(Routes, True);
     Server.Start;
+    Stats := RegistryMirrorTransferStatsForTesting(FMirror);
     Transfer.Mirror := FMirror;
     Transfer.API := 'http://localhost:' + IntToStr(Server.Port) + '/v1';
     Transfer.Start;
     Expect<Boolean>(WaitForCounter(First, 1)).ToBe(True);
-    Sleep(50);
+    { Admission for this pair is complete once the coordinator closes it. }
+    Expect<Boolean>(WaitForCounter(Stats^.AdmissionsClosed, 1)).ToBe(True);
+    Expect<Integer>(Stats^.MaximumWorkers).ToBe(1);
     Expect<Integer>(InterlockedCompareExchange(Second, 0, 0)).ToBe(0);
     RTLEventSetEvent(Gate);
     Transfer.WaitFor;
     Expect<Boolean>(Pos('object_hash_mismatch', Transfer.Error) > 0).ToBe(True);
     Expect<Integer>(Second).ToBe(0);
-    Expect<Int64>(RegistryMirrorTransferStatsForTesting(FMirror).PeakReserved).ToBe(MAXIMUM_MIRROR_ARCHIVE_BYTES);
+    Expect<Int64>(Stats^.PeakReserved).ToBe(RegistryMaximumMirrorArchiveBytes);
   finally
     RTLEventSetEvent(Gate);
     Transfer.Free;
@@ -424,7 +755,7 @@ begin
     finally
       Key.Free;
     end;
-    ATimedMirror := TLWPTRegistryMirror(TLWPTRegistryMirror.Initialize(FRoot + '/timed-mirror', Config, RegistryTimestampNow));
+    ATimedMirror := TLWPTRegistryMirror(TLWPTRegistryMirror.Initialize(FRoot + '/timed-mirror', Config, APublishedAt));
     Add('/.well-known/' + PROGRAM_NAME + '-registry', 'discovery',
       RegistryHTTPResponse(AOrigin, 'GET', '/.well-known/' + PROGRAM_NAME + '-registry').Body);
     Add('/v1/capabilities', 'capabilities', RegistryHTTPResponse(AOrigin, 'GET', '/v1/capabilities').Body);
@@ -461,7 +792,6 @@ var
   Packages: TLWPTRegistryPackageArray;
   Gate: PRTLEvent;
   Arrived: LongInt;
-  PublishedAt, Expiry: string;
 begin
   Server := TRegistryTestServer.Create(nil, True);
   Origin := nil;
@@ -470,11 +800,8 @@ begin
   Gate := RTLEventCreate;
   Arrived := 0;
   try
-    Expiry := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
-      IncSecond(ISO8601ToDate(RegistryTimestampNow, True), 10));
-    PublishedAt := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
-      IncDay(ISO8601ToDate(Expiry, True), -7));
-    PrepareSignedFixture(Server, PublishedAt, 1, Origin, TimedMirror, Routes, Packages);
+    SetRegistryClockForTesting(FixtureNow);
+    PrepareSignedFixture(Server, FixturePublishedAt, 1, Origin, TimedMirror, Routes, Packages);
     Routes[High(Routes)].Gate := Gate;
     Routes[High(Routes)].GateTimeoutMilliseconds := 15000;
     Routes[High(Routes)].Arrived := @Arrived;
@@ -484,16 +811,16 @@ begin
     Transfer.Mirror := TimedMirror;
     Transfer.FullSync := True;
     Transfer.Start;
-    Expect<Boolean>(WaitForCounter(Arrived, 1)).ToBe(True);
-    if Arrived = 0 then
+    if not WaitForCounter(Arrived, 1) then
     begin
       Transfer.WaitFor;
       raise Exception.Create('expiry fixture never reached archive request: ' + Transfer.Error);
     end;
-    while RegistryTimestampNow < Expiry do Sleep(20);
+    { The controlled clock reaches expiry while the archive is in flight. }
+    SetRegistryClockForTesting(FixtureExpiry);
     RTLEventSetEvent(Gate);
     Transfer.WaitFor;
-    Expect<Boolean>(Pos('checkpoint_expired', Transfer.Error) > 0).ToBe(True);
+    Expect<Boolean>(Pos('checkpoint_expired:', Transfer.Error) = 1).ToBe(True);
     Expect<Boolean>(FileExists(TimedMirror.Root + '/state/current.toml')).ToBe(False);
     Expect<Boolean>(FileExists(TimedMirror.Root + '/objects/sha256/'
       + Copy(Packages[0].ArchiveHash, 8, 64))).ToBe(True);
@@ -507,16 +834,10 @@ begin
   end;
 end;
 
-procedure TMirrorTransferTests.WaitForActivationExpiry;
-var
-  Started: QWord;
+procedure TMirrorTransferTests.ExpireBeforeActivation;
 begin
-  FActivationEnteredAt := RegistryTimestampNow;
-  Started := GetTickCount64;
-  while (RegistryTimestampNow < FActivationExpiry)
-    and (GetTickCount64 - Started < 15000) do Sleep(20);
-  if RegistryTimestampNow < FActivationExpiry then
-    raise Exception.Create('activation expiry fixture deadline elapsed');
+  FActivationEntered := True;
+  SetRegistryClockForTesting(FixtureExpiry);
 end;
 
 procedure TMirrorTransferTests.ExpiryBeforeActivationPreventsPublication;
@@ -526,31 +847,27 @@ var
   TimedMirror: TLWPTRegistryMirror;
   Routes: TRegistryHTTPRouteArray;
   Packages: TLWPTRegistryPackageArray;
-  PublishedAt, Failure: string;
+  Failure: string;
 begin
   Server := TRegistryTestServer.Create(nil, True);
   Origin := nil;
   TimedMirror := nil;
   try
-    FActivationExpiry := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
-      IncSecond(ISO8601ToDate(RegistryTimestampNow, True), 10));
-    PublishedAt := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
-      IncDay(ISO8601ToDate(FActivationExpiry, True), -7));
-    PrepareSignedFixture(Server, PublishedAt, 1, Origin, TimedMirror, Routes, Packages);
+    SetRegistryClockForTesting(FixtureNow);
+    PrepareSignedFixture(Server, FixturePublishedAt, 1, Origin, TimedMirror, Routes, Packages);
     Server.SetRoutes(Routes);
     Server.Start;
-    FActivationEnteredAt := '';
-    RegistryMirrorBeforeActivateForTesting(TimedMirror, WaitForActivationExpiry);
+    FActivationEntered := False;
+    { Expiry occurs after verification and storage, before the pointer. }
+    RegistryMirrorBeforeActivateForTesting(TimedMirror, ExpireBeforeActivation);
     Failure := '';
     try
       TimedMirror.Synchronize;
     except
       on E: Exception do Failure := E.Message;
     end;
-    Expect<Boolean>(FActivationEnteredAt <> '').ToBe(True);
-    Expect<Boolean>(FActivationEnteredAt < FActivationExpiry).ToBe(True);
-    Expect<Boolean>(RegistryTimestampNow >= FActivationExpiry).ToBe(True);
-    Expect<Boolean>(Pos('checkpoint_expired', Failure) > 0).ToBe(True);
+    Expect<Boolean>(FActivationEntered).ToBe(True);
+    Expect<Boolean>(Pos('checkpoint_expired:', Failure) = 1).ToBe(True);
     Expect<Boolean>(FileExists(TimedMirror.Root + '/state/current.toml')).ToBe(False);
     Expect<Boolean>(FileExists(TimedMirror.Root + '/objects/sha256/'
       + Copy(Packages[0].ArchiveHash, 8, 64))).ToBe(True);
@@ -608,6 +925,14 @@ begin
     Stopped := StopRegistryProcess(Child, 0, 2000);
     Expect<Boolean>(Stopped.Stopped).ToBe(True);
     RTLEventSetEvent(Gate);
+    { The killed attempt recorded its identifier and start state; the next
+      process to open the mirror reports it as abandoned. }
+    Run := RunLwpt(['registry', 'verify', '--data-dir', Mirror.Root]);
+    DumpRunFailure('report abandoned attempt', Run, 0);
+    Expect<Integer>(Run.ExitCode).ToBe(0);
+    Expect<Boolean>(Pos('outcome = "abandoned"', Run.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('attempt_id = "', Run.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('freshness = "uninitialized"', Run.Stdout) > 0).ToBe(True);
     { Completed objects are also removed at the origin; retry must use CAS. }
     for I := 0 to 1 do
       Expect<Boolean>(DeleteFile(Origin.Root + '/objects/sha256/'
@@ -621,6 +946,8 @@ begin
       control resources and the interrupted third archive are fetched again. }
     Expect<Integer>(Server.RequestCount - CountBefore).ToBe(6);
     Expect<Integer>(Arrived).ToBe(2);
+    Run := RunLwpt(['registry', 'verify', '--data-dir', Mirror.Root]);
+    Expect<Boolean>(Pos('outcome = "activated"', Run.Stdout) > 0).ToBe(True);
   finally
     StopRegistryProcess(Child, 0, 2000);
     RTLEventSetEvent(Gate);
@@ -628,6 +955,403 @@ begin
     Mirror.Free;
     Origin.Free;
     RTLEventDestroy(Gate);
+  end;
+end;
+
+procedure TMirrorTransferTests.PoisonedRootKeyRecordIsNotPermanent;
+var
+  Harness: TOriginHarness;
+  KeyTarget, Honest: string;
+begin
+  Harness := TOriginHarness.Create('mirror-key-poison');
+  try
+    Harness.Publish('one');
+    KeyTarget := '/v1/keys/' + Harness.Mirror.Config.TrustKeyID + '.toml';
+    Honest := AsText(Harness.Body(KeyTarget));
+    { Only the unsigned effective sequence differs. }
+    Harness.Override(KeyTarget, BytesOf(StringReplace(Honest,
+      'valid_from_sequence = 1', 'valid_from_sequence = 2', [])));
+    Expect<string>(Harness.Sync).ToBe('ok');
+    Harness.ClearOverrides;
+    Harness.Publish('two');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    { The mirror serves the record bound to its newest accepted state. }
+    Expect<string>(AsText(ServedBytes(Harness.Mirror, KeyTarget))).ToBe(Honest);
+    Expect<Boolean>(Pos('sequence = 3', Harness.Mirror.VerifyMirror) > 0).ToBe(True);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.ForgedRotationStopsFurtherRetrieval;
+var
+  Harness: TOriginHarness;
+  Key, Signature, Outcome: string;
+  Index: Integer;
+begin
+  Harness := TOriginHarness.Create('mirror-forged-rotation');
+  try
+    for Index := 1 to 3 do
+    begin
+      Key := InspectRegistryCheckpoint(Harness.Body('/v1/checkpoints/latest.toml')).KeyId;
+      Harness.Origin.RotateKey(Key, RegistryTimestampNow);
+    end;
+    { A structurally valid but forged old-key signature on the first step. }
+    Signature := AsText(Harness.Body('/v1/rotations/2.old.sig.toml'));
+    Signature := Copy(Signature, 1, Pos('signature = "hex:', Signature) + 16)
+      + StringOfChar('0', 128) + '"' + #10;
+    Harness.Override('/v1/rotations/2.old.sig.toml', BytesOf(Signature));
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('signature_invalid:', Outcome) = 1).ToBe(True);
+    Expect<Integer>(Harness.Requested('/v1/rotations/2.')).ToBe(3);
+    Expect<Integer>(Harness.Requested('/v1/rotations/3')).ToBe(0);
+    Expect<Integer>(Harness.Requested('/v1/rotations/4')).ToBe(0);
+    { Only the pinned root key record was requested. }
+    Expect<Integer>(Harness.Requested('/v1/keys/')).ToBe(1);
+    Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.SynchronizationBudgetBoundsRequests;
+var
+  Harness: TOriginHarness;
+  Gate: PRTLEvent;
+  Routes: TRegistryHTTPRouteArray;
+  Started, Elapsed: QWord;
+  Outcome: string;
+begin
+  Harness := TOriginHarness.Create('mirror-sync-budget');
+  Gate := RTLEventCreate;
+  try
+    { The capabilities response stalls far beyond the synchronization budget. }
+    SetLength(Routes, 1);
+    Routes[0] := RegistryRoute('/v1/capabilities', 'application/vnd.' + PROGRAM_NAME
+      + '.registry-capabilities+toml', Harness.Body('/v1/capabilities'));
+    Routes[0].Gate := Gate;
+    Routes[0].GateTimeoutMilliseconds := 30000;
+    Harness.Server.SetRoutes(Routes);
+    RegistryMirrorSynchronizationBudgetForTesting(Harness.Mirror, 500);
+    Started := GetTickCount64;
+    Outcome := Harness.Sync;
+    Elapsed := GetTickCount64 - Started;
+    Expect<Boolean>((Pos('registry_transport_failed:', Outcome) = 1)
+      or (Pos('mirror_sync_deadline_exceeded:', Outcome) = 1)).ToBe(True);
+    { Bounded by the 500 ms budget, not the 120 s per-request deadline. }
+    Expect<Boolean>(Elapsed < 20000).ToBe(True);
+    Expect<Integer>(Harness.Requested('/v1/checkpoints/')).ToBe(0);
+  finally
+    RTLEventSetEvent(Gate);
+    Harness.Free;
+    RTLEventDestroy(Gate);
+  end;
+end;
+
+procedure TMirrorTransferTests.AmbiguousDiscoveryEndpointsAreRefused;
+const
+  Replacements: array[0..2] of string = ('/..%2Fadmin/capabilities',
+    '/v1%2Fcapabilities', '/v1/%2E%2E/capabilities');
+var
+  Harness: TOriginHarness;
+  Discovery, Replacement, Outcome: string;
+begin
+  for Replacement in Replacements do
+  begin
+    Harness := TOriginHarness.Create('mirror-encoded-scope');
+    try
+      Discovery := AsText(Harness.Body('/.well-known/' + PROGRAM_NAME + '-registry'));
+      Harness.Override('/.well-known/' + PROGRAM_NAME + '-registry', BytesOf(StringReplace(
+        Discovery, '/v1/capabilities', Replacement, [])));
+      Outcome := Harness.Sync;
+      Expect<Boolean>(Pos('registry_discovery_scope_mismatch:', Outcome)
+        + Pos('invalid_registry_discovery_uri:', Outcome) = 1).ToBe(True);
+      Expect<Integer>(Harness.Server.RequestCount).ToBe(1);
+    finally
+      Harness.Free;
+    end;
+  end;
+end;
+
+procedure TMirrorTransferTests.AdvancingCheckpointPairIsRetried;
+var
+  Harness: TOriginHarness;
+  Stale: TBytes;
+begin
+  Harness := TOriginHarness.Create('mirror-checkpoint-race');
+  try
+    Stale := Harness.Body('/v1/checkpoints/latest.toml');
+    Harness.Publish('published-between-reads');
+    { The first checkpoint read predates publication; its signature read and
+      every later checkpoint read observe the new head. }
+    Harness.Sequence('/v1/checkpoints/latest.toml',
+      [Stale, Harness.Body('/v1/checkpoints/latest.toml')]);
+    Expect<string>(Harness.Sync).ToBe('ok');
+    Expect<Integer>(Harness.Requested('/v1/checkpoints/latest.toml')).ToBe(2);
+    Expect<Integer>(Harness.Requested('/v1/checkpoints/latest.sig.toml')).ToBe(2);
+    Expect<Boolean>(Pos('sequence = 2', Harness.Mirror.VerifyMirror) > 0).ToBe(True);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.InconsistentCheckpointPairFailsBounded;
+var
+  Harness: TOriginHarness;
+  Current: TBytes;
+  Outcome: string;
+begin
+  Harness := TOriginHarness.Create('mirror-checkpoint-mismatch');
+  try
+    Current := Harness.Body('/v1/checkpoints/latest.toml');
+    Harness.Publish('other-head');
+    { A stable checkpoint paired with another head's signature is invalid. }
+    Harness.Override('/v1/checkpoints/latest.toml', Current);
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('signature_payload_mismatch:', Outcome) = 1).ToBe(True);
+    Expect<Integer>(Harness.Requested('/v1/checkpoints/latest.toml')).ToBe(2);
+    Expect<Integer>(Harness.Requested('/v1/checkpoints/latest.sig.toml')).ToBe(1);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.BlockAttemptAndFail;
+begin
+  DeleteFile(FActivationMirror.Root + '/state/sync-attempt.toml');
+  ForceDirectories(FActivationMirror.Root + '/state/sync-attempt.toml');
+  raise ELWPTRegistryError.CreateStable('primary_failure', 'activation failed first');
+end;
+
+procedure TMirrorTransferTests.AttemptRecordingFailurePreservesError;
+var
+  Harness: TOriginHarness;
+begin
+  Harness := TOriginHarness.Create('mirror-attempt-record');
+  try
+    FActivationMirror := Harness.Mirror;
+    RegistryMirrorBeforeActivateForTesting(Harness.Mirror, BlockAttemptAndFail);
+    Expect<string>(Harness.Sync).ToBe('primary_failure: activation failed first');
+    Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.SyncBudgetRejectsBeforeTransfer;
+var
+  Harness: TOriginHarness;
+  Outcome: string;
+begin
+  Harness := TOriginHarness.Create('mirror-sync-bytes', '',
+    Int64(64) * 1024 * 1024, RegistryMinimumMirrorSyncBytes);
+  try
+    Harness.Publish('large', '', 2 * 1024 * 1024);
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('mirror_sync_budget_exceeded:', Outcome) = 1).ToBe(True);
+    Expect<Integer>(Harness.Requested('/v1/objects/')).ToBe(0);
+    Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.StoreBudgetPrunesUnacceptedCandidates;
+var
+  Harness: TOriginHarness;
+  Residue: TBytes;
+  ResiduePath, Outcome: string;
+  Stream: TFileStream;
+begin
+  { Store budget 4 MiB with a 2 MiB attempt budget: an attempt only fits
+    while less than 2 MiB is already used. }
+  Harness := TOriginHarness.Create('mirror-store-bytes', '',
+    Int64(4) * 1024 * 1024, Int64(2) * 1024 * 1024);
+  try
+    Harness.Publish('small');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    { An abandoned candidate archive of 3 MiB is not accepted state. }
+    SetLength(Residue, 3 * 1024 * 1024);
+    FillChar(Residue[0], Length(Residue), $41);
+    ResiduePath := Harness.Mirror.Root + '/objects/sha256/' + SHA256Hex(Residue);
+    Stream := TFileStream.Create(ResiduePath, fmCreate);
+    try
+      Stream.WriteBuffer(Residue[0], Length(Residue));
+    finally
+      Stream.Free;
+    end;
+    Harness.Publish('next');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    Expect<Boolean>(FileExists(ResiduePath)).ToBe(False);
+    { Accepted content alone can also exhaust the store budget. }
+    Harness.Publish('too-large', '', 1536 * 1024);
+    Harness.Publish('also-large', '', 1536 * 1024);
+    Outcome := Harness.Sync;
+    Expect<Boolean>((Pos('mirror_sync_budget_exceeded:', Outcome) = 1)
+      or (Pos('mirror_store_budget_exceeded:', Outcome) = 1)).ToBe(True);
+    Expect<Integer>(Harness.Requested('/v1/objects/sha256/' + SHA256Hex(
+      BytesOf(StringOfChar('t', 1536 * 1024))))).ToBe(0);
+    Expect<Boolean>(Pos('sequence = 3', Harness.Mirror.VerifyMirror) > 0).ToBe(True);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.BackwardsRenewalKeepsAcceptedPointer;
+var
+  Harness: TOriginHarness;
+  Checkpoint, Signature: TBytes;
+  PointerBefore, Outcome: string;
+begin
+  SetRegistryClockForTesting(FixtureNow);
+  Harness := TOriginHarness.Create('mirror-renewal-rollback', FixturePublishedAt);
+  try
+    Checkpoint := Harness.Body('/v1/checkpoints/latest.toml');
+    Signature := Harness.Body('/v1/checkpoints/latest.sig.toml');
+    SetRegistryClockForTesting('2031-01-07T12:00:00Z');
+    Harness.Origin.AllowRenewal := True;
+    Harness.Origin.EnsureFreshCheckpoint(RegistryTimestampNow);
+    Harness.Origin.AllowRenewal := False;
+    Expect<string>(Harness.Sync).ToBe('ok');
+    PointerBefore := AsText(ReadFileBytes(Harness.Mirror.Root + '/state/current.toml'));
+    { Replay the older, still unexpired checkpoint of the same sequence. }
+    Harness.Override('/v1/checkpoints/latest.toml', Checkpoint);
+    Harness.Override('/v1/checkpoints/latest.sig.toml', Signature);
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('checkpoint_renewal_rollback:', Outcome) = 1).ToBe(True);
+    Expect<string>(AsText(ReadFileBytes(Harness.Mirror.Root + '/state/current.toml')))
+      .ToBe(PointerBefore);
+    { An exact replay of the accepted renewal remains idempotent. }
+    Harness.ClearOverrides;
+    Expect<string>(Harness.Sync).ToBe('ok');
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.FailBeforeActivation;
+begin
+  raise ELWPTRegistryError.CreateStable('interrupted_attempt', 'stopped before activation');
+end;
+
+procedure TMirrorTransferTests.AbandonedRotationCannotContaminateLaterHistory;
+var
+  Harness: TOriginHarness;
+  Alternative: TCapturedOrigin;
+  View: TLWPTRegistryReadView;
+begin
+  Harness := TOriginHarness.Create('mirror-abandoned-rotation');
+  Alternative := nil;
+  try
+    Harness.Publish('one');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    { A second history extends the same accepted head without rotating. }
+    CopyTree(Harness.Origin.Root, Harness.Root + '/alternative');
+    Harness.Origin.RotateKey(Harness.Mirror.Config.TrustKeyID, RegistryTimestampNow);
+    RegistryMirrorBeforeActivateForTesting(Harness.Mirror, FailBeforeActivation);
+    Expect<Boolean>(Pos('interrupted_attempt:', Harness.Sync) = 1).ToBe(True);
+    RegistryMirrorBeforeActivateForTesting(Harness.Mirror, nil);
+    Alternative := TCapturedOrigin(TCapturedOrigin.Create(Harness.Root + '/alternative'));
+    Harness.UseOrigin(Alternative);
+    Alternative := nil;
+    Harness.Publish('two');
+    Harness.Publish('three');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    View := Harness.Mirror.CaptureReadView;
+    try
+      Expect<Integer>(View.RotationSequences.Count).ToBe(0);
+      Expect<Int64>(View.State.Sequence).ToBe(4);
+    finally
+      View.Free;
+    end;
+    Expect<Boolean>(Pos('sequence = 4', Harness.Mirror.VerifyMirror) > 0).ToBe(True);
+    Expect<Integer>(RegistryHTTPResponse(Harness.Mirror, 'GET', '/v1/rotations/3.toml').Status).ToBe(404);
+    Expect<Integer>(RegistryHTTPResponse(Harness.Mirror, 'GET', '/v1/checkpoints/latest.toml').Status).ToBe(200);
+  finally
+    Alternative.Free;
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.UnsupportedUpstreamsAreRejectedAtConfiguration;
+var
+  Config: TLWPTRegistryConfig;
+  Diagnostic: string;
+begin
+  Config := FMirror.Config;
+  Config.UpstreamURL := 'https://[2001:db8::1]:8443';
+  Diagnostic := '';
+  try
+    ValidateMirrorConfiguration(Config);
+  except
+    on E: ELWPTRegistryError do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('invalid_mirror_configuration:', Diagnostic) = 1).ToBe(True);
+  Expect<Boolean>(Pos('IPv6', Diagnostic) > 0).ToBe(True);
+  Config.UpstreamURL := 'https://registry.example.test';
+  ValidateMirrorConfiguration(Config);
+end;
+
+procedure TMirrorTransferTests.LocalhostTransportUsesLoopback;
+var
+  Harness: TOriginHarness;
+begin
+  Expect<string>(RegistryMirrorTransportURLForTesting('http://localhost:8080/v1/capabilities'))
+    .ToBe('http://127.0.0.1:8080/v1/capabilities');
+  Expect<string>(RegistryMirrorTransportURLForTesting('http://localhost/v1'))
+    .ToBe('http://127.0.0.1/v1');
+  Expect<string>(RegistryMirrorTransportURLForTesting('http://localhost'))
+    .ToBe('http://127.0.0.1');
+  Expect<string>(RegistryMirrorTransportURLForTesting('http://localhost.example/v1'))
+    .ToBe('http://localhost.example/v1');
+  Expect<string>(RegistryMirrorTransportURLForTesting('https://localhost:8443/v1'))
+    .ToBe('https://localhost:8443/v1');
+  { The configured identity still names localhost end to end. }
+  Harness := TOriginHarness.Create('mirror-loopback');
+  try
+    Expect<Boolean>(Pos('http://localhost:', Harness.Mirror.Config.UpstreamURL) = 1).ToBe(True);
+    Expect<string>(Harness.Sync).ToBe('ok');
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.StaleActivatedMirrorReportsExpiry;
+var
+  Harness: TOriginHarness;
+  Checkpoint, Served: TBytes;
+  CheckpointPath: string;
+  Run: TLwptResult;
+  Stream: TStream;
+  Response: TLWPTRegistryHTTPResponse;
+begin
+  { Accept a proof while it is fresh, then report it with the real clock. }
+  SetRegistryClockForTesting('2026-01-02T00:00:00Z');
+  Harness := TOriginHarness.Create('mirror-stale-activated', '2026-01-01T00:00:00Z');
+  try
+    Harness.Publish('stale', '2026-01-01T00:00:00Z');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    SetRegistryClockForTesting('');
+    CheckpointPath := Harness.Mirror.Root + '/' + Harness.Mirror.LoadCurrentState.CheckpointPath;
+    Checkpoint := ReadFileBytes(CheckpointPath);
+    Run := RunLwpt(['registry', 'verify', '--data-dir', Harness.Mirror.Root]);
+    DumpRunFailure('verify stale activated mirror', Run, 0);
+    Expect<Integer>(Run.ExitCode).ToBe(0);
+    Expect<Boolean>(Pos('freshness = "expired"', Run.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('expires_at = "2026-01-08T00:00:00Z"', Run.Stdout) > 0).ToBe(True);
+    { Retained proof is served unchanged; the mirror never renews it. }
+    Expect<string>(AsText(ReadFileBytes(CheckpointPath))).ToBe(AsText(Checkpoint));
+    Response := RegistryHTTPResponse(Harness.Mirror, 'GET', '/v1/checkpoints/latest.toml');
+    Stream := OpenRegistryHTTPResource(Response);
+    try
+      SetLength(Served, Stream.Size);
+      if Length(Served) > 0 then Stream.ReadBuffer(Served[0], Length(Served));
+    finally
+      Stream.Free;
+    end;
+    Expect<string>(AsText(Served)).ToBe(AsText(Checkpoint));
+  finally
+    Harness.Free;
   end;
 end;
 
@@ -641,8 +1365,22 @@ begin
   Test('failed sibling drains without third admission and retains verified retry objects', FailedSiblingDrainsAndRetainsVerifiedObject);
   Test('checkpoint expiry during archive transfer prevents activation', ExpiryDuringTransferPreventsActivation);
   Test('checkpoint expiry after verification and storage prevents activation', ExpiryBeforeActivationPreventsPublication);
-  Test('actual CLI interruption resumes a verified archive pair', CLIInterruptionReusesCompletedPair);
+  Test('actual CLI interruption is reported as abandoned and resumes a verified archive pair', CLIInterruptionReusesCompletedPair);
   Test('concurrent fixture closes an incomplete client inside a child watchdog', IncompleteClientShutdownIsBounded);
+  Test('an unsigned root key record cannot poison later synchronization', PoisonedRootKeyRecordIsNotPermanent);
+  Test('a forged rotation stops retrieval before later items and keys', ForgedRotationStopsFurtherRetrieval);
+  Test('a whole-synchronization budget bounds every request', SynchronizationBudgetBoundsRequests);
+  Test('encoded or dot-segment discovery endpoints are refused before use', AmbiguousDiscoveryEndpointsAreRefused);
+  Test('a checkpoint that advances between pair reads is retried', AdvancingCheckpointPairIsRetried);
+  Test('a stable inconsistent checkpoint pair fails after one recheck', InconsistentCheckpointPairFailsBounded);
+  Test('attempt recording failure preserves the synchronization error', AttemptRecordingFailurePreservesError);
+  Test('the attempt byte budget rejects archives before transfer', SyncBudgetRejectsBeforeTransfer);
+  Test('the store budget prunes unaccepted candidates and refuses overflow', StoreBudgetPrunesUnacceptedCandidates);
+  Test('an older same-sequence renewal leaves the accepted pointer', BackwardsRenewalKeepsAcceptedPointer);
+  Test('an abandoned rotation cannot contaminate a later accepted history', AbandonedRotationCannotContaminateLaterHistory);
+  Test('IPv6 upstreams are rejected at configuration time', UnsupportedUpstreamsAreRejectedAtConfiguration);
+  Test('the localhost HTTP exception connects to loopback directly', LocalhostTransportUsesLoopback);
+  Test('an activated mirror becoming stale is reported with unchanged proof', StaleActivatedMirrorReportsExpiry);
 end;
 
 procedure RunIncompleteClient;

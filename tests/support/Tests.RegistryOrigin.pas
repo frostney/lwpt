@@ -27,7 +27,7 @@ type
     property PublicKey: string read FPublicKey;
   end;
 
-function ReserveRegistryTestPort: Word;
+function FindAvailableRegistryTestPort: Word;
 function StartRegistryCLI(const ADataDirectory, ABaseURL: string): TProcess;
 procedure StopRegistryCLI(var AProcess: TProcess);
 function RegistryHTTPBody(const AURL: string): TBytes;
@@ -56,7 +56,9 @@ begin
   Result := PROGRAM_NAME;
 end;
 
-function ReserveRegistryTestPort: Word;
+{ The port is free when observed but not reserved; StartRegistryCLI proves
+  that the listener it reaches is the registry it started. }
+function FindAvailableRegistryTestPort: Word;
 var
   Reservation: TRegistryTestServer;
 begin
@@ -85,7 +87,8 @@ function StartRegistryCLI(const ADataDirectory, ABaseURL: string): TProcess;
 var
   Started: QWord;
   Ready: Boolean;
-  LastProbe, ExitState, Diagnostics: string;
+  LastProbe, ExitState, Diagnostics, Discovery: string;
+  Body: TBytes;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := LwptBinaryPath;
@@ -101,8 +104,12 @@ begin
     repeat
       Ready := False;
       try
-        RegistryHTTPBody(ABaseURL + '/.well-known/' + PROGRAM_NAME + '-registry');
-        Ready := True;
+        Body := RegistryHTTPBody(ABaseURL + '/.well-known/' + PROGRAM_NAME + '-registry');
+        SetString(Discovery, PAnsiChar(@Body[0]), Length(Body));
+        { Another process may have bound the port first; only this registry's
+          discovery document proves readiness. }
+        Ready := Result.Running and (Pos('base_url = "' + ABaseURL + '"', Discovery) > 0);
+        if not Ready then LastProbe := 'listener did not serve this registry''s discovery';
       except
         on E: Exception do LastProbe := Copy(E.Message, 1, 1024);
       end;
@@ -154,7 +161,7 @@ var
 begin
   inherited Create;
   FRoot := ARoot;
-  Port := ReserveRegistryTestPort;
+  Port := FindAvailableRegistryTestPort;
   FBaseURL := 'http://localhost:' + IntToStr(Port) + '/origin';
   Run := RunLwpt(['registry', 'init', '--data-dir', FRoot,
     '--base-url', FBaseURL, '--port', IntToStr(Port)]);

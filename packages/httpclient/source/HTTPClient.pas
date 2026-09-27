@@ -84,9 +84,11 @@ implementation
 
 uses
   {$IFDEF UNIX}
-  Sockets, BaseUnix,
+  BaseUnix,
+  Sockets,
   {$IFDEF DARWIN}
-  CTypes, InitC,
+  CTypes,
+  InitC,
   {$ELSE}
   {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
   cNetDB,

@@ -230,6 +230,8 @@ type
     procedure TestTamperedSignatureHasStableDiagnostic;
     procedure TestRotationFailureDoesNotPublish;
     procedure TestRotationActivationRetryAndSeedSelection;
+    procedure TestPublicationRefusesUnservableHead;
+    procedure TestOriginHistoryIsVerifiedOncePerHead;
   end;
 
 procedure TRegistryStoreContract.TestDarwinTLSTransportSelection;
@@ -1181,18 +1183,31 @@ end;
 
 procedure TRegistryStoreContract.TestOversizedResourceIsRejectedBeforeHashing;
 const
-  OBJECT_NAME =
+  UNACCEPTED_OBJECT_NAME =
     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 var
-  ObjectPath: string;
+  ObjectName, ObjectPath: string;
+  Publication: TLWPTRegistryPublication;
   Response: TLWPTRegistryHTTPResponse;
   Store: TLWPTRegistryStore;
   Stream: TFileStream;
 begin
   Store := InitializeStore;
   try
-    ForceDirectories(FScratch + '/objects/sha256');
-    ObjectPath := FScratch + '/objects/sha256/' + OBJECT_NAME;
+    Publication.Name := 'oversized-lib';
+    Publication.Version := '1.0.0';
+    Publication.PublishedAt := SECOND_TIME;
+    Publication.Archive := TEncoding.UTF8.GetBytes('accepted archive');
+    Store.Publish(Publication);
+    ObjectName := SHA256Hex(Publication.Archive);
+    { Objects outside accepted history are not addressable at all. }
+    WriteTextFile(FScratch + '/objects/sha256/' + UNACCEPTED_OBJECT_NAME, 'staged');
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET',
+      '/v1/objects/sha256/' + UNACCEPTED_OBJECT_NAME).Status).ToBe(404);
+    { An accepted object whose stored bytes exceed the service limit is
+      refused from its size before any hashing. }
+    ObjectPath := FScratch + '/objects/sha256/' + ObjectName;
+    Expect<Boolean>(DeleteFile(ObjectPath)).ToBe(True);
     Stream := TFileStream.Create(ObjectPath, fmCreate);
     try
       {$IFDEF MSWINDOWS}
@@ -1203,7 +1218,7 @@ begin
       Stream.Free;
     end;
     Response := RegistryHTTPResponse(Store, 'GET',
-      '/v1/objects/sha256/' + OBJECT_NAME);
+      '/v1/objects/sha256/' + ObjectName);
     Expect<Integer>(Response.Status).ToBe(500);
     Expect<Boolean>(Pos('resource_too_large',
       TEncoding.UTF8.GetString(Response.Body)) > 0).ToBe(True);
@@ -1843,10 +1858,93 @@ begin
   end;
 end;
 
+procedure TRegistryStoreContract.TestPublicationRefusesUnservableHead;
+var
+  Store: TLWPTRegistryStore;
+  Limits: TLWPTRegistryVerificationLimits;
+  Publication: TLWPTRegistryPublication;
+  State: TLWPTRegistryState;
+  Diagnostic, RootKey: string;
+begin
+  Limits := DefaultRegistryVerificationLimits;
+  Limits.Snapshots := 2;
+  SetRegistryVerificationLimitsForTesting(Limits, True);
+  Store := nil;
+  try
+    Store := InitializeStore;
+    Publication.Name := 'first';
+    Publication.Version := '1.0.0';
+    Publication.PublishedAt := SECOND_TIME;
+    Publication.Archive := TEncoding.UTF8.GetBytes('first');
+    Store.Publish(Publication);
+    State := Store.LoadCurrentState;
+    Expect<Int64>(State.Sequence).ToBe(2);
+    { A third snapshot exceeds what the serving verifier accepts. }
+    Publication.Name := 'second';
+    Publication.Archive := TEncoding.UTF8.GetBytes('second');
+    Diagnostic := '';
+    try
+      Store.Publish(Publication);
+    except
+      on E: ELWPTRegistryError do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Pos('proof_limit_exceeded:', Diagnostic) = 1).ToBe(True);
+    RootKey := InspectRegistryCheckpoint(Store.LoadResource(State.CheckpointPath)).KeyId;
+    Diagnostic := '';
+    try
+      Store.RotateKey(RootKey, SECOND_TIME);
+    except
+      on E: ELWPTRegistryError do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Pos('proof_limit_exceeded:', Diagnostic) = 1).ToBe(True);
+    Expect<Int64>(Store.LoadCurrentState.Sequence).ToBe(2);
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/snapshots/sha256/'
+      + Copy(State.SnapshotHash, 8, 64) + '.toml').Status).ToBe(200);
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET',
+      '/v1/checkpoints/latest.toml').Status).ToBe(200);
+  finally
+    SetRegistryVerificationLimitsForTesting(Limits, False);
+    Store.Free;
+  end;
+end;
+
+procedure TRegistryStoreContract.TestOriginHistoryIsVerifiedOncePerHead;
+var
+  Store: TLWPTRegistryStore;
+  Publication: TLWPTRegistryPublication;
+  State: TLWPTRegistryState;
+  Before: Integer;
+  Snapshot: string;
+begin
+  Store := InitializeStore;
+  try
+    Publication.Name := 'history';
+    Publication.Version := '1.0.0';
+    Publication.PublishedAt := SECOND_TIME;
+    Publication.Archive := TEncoding.UTF8.GetBytes('history archive');
+    Store.Publish(Publication);
+    State := Store.LoadCurrentState;
+    Snapshot := '/v1/snapshots/sha256/' + Copy(State.SnapshotHash, 8, 64) + '.toml';
+    Before := RegistryHistoryBuildsForTesting;
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/unknown').Status).ToBe(404);
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/objects/sha256/zz').Status).ToBe(404);
+    Expect<Integer>(RegistryHistoryBuildsForTesting - Before).ToBe(0);
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET', Snapshot).Status).ToBe(200);
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET', Snapshot).Status).ToBe(200);
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/objects/sha256/'
+      + SHA256Hex(Publication.Archive)).Status).ToBe(200);
+    Expect<Integer>(RegistryHistoryBuildsForTesting - Before).ToBe(1);
+  finally
+    Store.Free;
+  end;
+end;
+
 procedure TRegistryStoreContract.SetupTests;
 begin
   Test('uncommitted rotations and keys stay hidden and recover for retry', TestRotationFailureDoesNotPublish);
   Test('rotation activation guards retries and reloads the active private seed', TestRotationActivationRetryAndSeedSelection);
+  Test('publication and rotation refuse a head the serving verifier would reject', TestPublicationRefusesUnservableHead);
+  Test('origin history membership is verified once per accepted head', TestOriginHistoryIsVerifiedOncePerHead);
   Test('default identity is deterministic', TestDefaultIdentityIsDeterministic);
   Test('default identity survives HTTPS reconfiguration',
     TestDefaultIdentitySurvivesHTTPSReconfiguration);

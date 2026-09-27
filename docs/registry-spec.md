@@ -154,11 +154,12 @@ serialization.
 
 Canonical documents:
 
-- are UTF-8 without a byte-order mark;
+- are strict UTF-8 without a byte-order mark: no overlong encodings,
+  surrogate code points, code points above U+10FFFF, or truncated sequences;
 - use LF line endings and exactly one final LF;
 - contain no comments, blank lines, tables, datetimes, floats, or multiline
-  strings;
-- use only lowercase `snake_case` bare keys;
+  strings; a `#` inside a quoted string is string content, not a comment;
+- use only lowercase `snake_case` bare keys, never dotted keys;
 - use double-quoted basic strings with the shortest valid TOML escape;
 - encode booleans as `true` or `false`;
 - encode non-negative integers in decimal without a sign or leading zeroes;
@@ -170,6 +171,9 @@ Canonical documents:
 Clients MUST verify canonical form before trusting a hash or signature. An
 implementation may parse a non-canonical publication request to produce an
 actionable error, but it MUST NOT admit those bytes as a canonical record.
+No Protocol 1 schema nests values more than three levels below the document
+root; an implementation MAY reject deeper structure, including structure
+created by dotted keys, before allocating it.
 
 Hashes use:
 
@@ -417,7 +421,10 @@ Clients MUST:
    origin. At the same sequence, accept only the identical snapshot and
    `key_id`; a different value is checkpoint equivocation. A later
    `published_at`, `expires_at`, and valid signature MAY renew an otherwise
-   identical checkpoint.
+   identical checkpoint. A same-sequence checkpoint whose `published_at` or
+   `expires_at` is earlier than the accepted checkpoint's value MUST be
+   rejected as a renewal rollback, even while it remains unexpired.
+   Identical checkpoint bytes are an idempotent replay and remain acceptable.
 9. Fetch and hash the snapshot, require its sequence to equal the checkpoint's
    sequence, then validate its predecessor and sequence against the snapshot
    chain.
@@ -541,7 +548,9 @@ next_cursor = ""
 Items are ordered by `effective_sequence`. A client with only its initial trust
 root uses `after=0`; thereafter it persists and sends the last accepted
 `effective_sequence`. Starting from its pinned key, it fetches and verifies
-each dual-signed rotation in order until the checkpoint's key is trusted. The
+each dual-signed rotation in order until the checkpoint's key is trusted.
+Both signatures of a transition MUST verify before the client trusts its new
+key, requests that key's record, or follows a later item or page. The
 page itself is discovery data, not a trust root: omitting or reordering entries
 can only make synchronization fail because the signed chain will not verify.
 Cursors are scoped to the origin and the `after` value.
@@ -689,11 +698,23 @@ those trust inputs or change package identity.
 
 A request-layer failure MUST advance to the next configured contact when one
 remains. This includes HTTPClient exceptions, including HTTP framing, read,
-and response-body-limit errors, and non-2xx HTTP responses. After a successful
-HTTP response, media-type, encoding, metadata, schema, identity, signature,
-hash, history, or expiry validation failure MUST abort acquisition instead of
-trying another contact. Redirects remain subject to the transport and identity
-revalidation requirements under [Errors and HTTP behavior](#errors-and-http-behavior).
+and response-body-limit errors, and non-2xx HTTP responses.
+
+A stale contact serves a correctly authenticated proof for the expected origin
+and trust root that is nevertheless unusable: its checkpoint has expired, its
+sequence is lower than accepted history, or it is an older same-sequence
+renewal. A stale-contact failure MUST also advance to the next configured
+contact when one remains. The next attempt keeps the unchanged origin identity,
+configured trust root, and previously accepted history, so a stale contact can
+never lower the sequence or freshness the client requires. When every contact
+is stale, acquisition fails with the stale diagnostic.
+
+Every other validation failure after a successful HTTP response is a trust
+failure and MUST abort acquisition instead of trying another contact. This
+includes media-type, encoding, metadata, schema, identity, signature, hash,
+history, future-dated checkpoint, equivocation, and rotation-chain failures.
+Redirects remain subject to the transport and identity revalidation
+requirements under [Errors and HTTP behavior](#errors-and-http-behavior).
 
 Archive fetching MUST NOT automatically select an alternate contact. A failed
 install MUST preserve committed project state; a subsequent explicit online

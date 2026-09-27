@@ -8,7 +8,11 @@ uses
   {$ENDIF}
   Classes,
   Generics.Collections,
+  StrUtils,
   SysUtils,
+
+  TestingPascalLibrary,
+  TOML,
 
   LWPT.Core,
   LWPT.Registry.Crypto,
@@ -16,9 +20,7 @@ uses
   LWPT.Registry.Server,
   LWPT.Registry.Store,
   LWPT.Registry.Verification,
-  TestingPascalLibrary,
-  Tests.Scratch,
-  TOML;
+  Tests.Scratch;
 
 const
   FIXTURE_ROOT = 'tests/fixtures/registry/v1/';
@@ -29,8 +31,22 @@ const
 type
   TMirrorFixtureStore = class(TLWPTRegistryMirror)
   public
-    procedure Retain(const AVerified: TLWPTVerifiedRegistry);
+    procedure Retain(const AVerified: TLWPTVerifiedRegistry;
+      const ALastSync: string = EVALUATION_TIME);
+    procedure RetainArchives(const AVerified: TLWPTVerifiedRegistry);
+    procedure Put(const APath: string; const ABytes: TBytes);
     procedure Corrupt(const APath: string);
+    function StatePath: string;
+  end;
+
+  TMirrorRequestThread = class(TThread)
+  protected
+    procedure Execute; override;
+  public
+    Mirror: TLWPTRegistryMirror;
+    Gate: PRTLEvent;
+    Status: Integer;
+    Error: string;
   end;
 
   TFixtureSource = class(TLWPTRegistryDocumentSource)
@@ -100,6 +116,17 @@ type
     procedure RotationPagesAreBoundedAndCanonical;
     procedure RetrievalDocumentsShareProofBudget;
     procedure MirrorReadViewReusesCapturedProof;
+    procedure UnknownRoutesSkipProofVerification;
+    procedure ConcurrentRequestsShareOneVerification;
+    procedure ServedBytesMatchAuthenticatedDigests;
+    procedure UnacceptedRecordsAndObjectsStayHidden;
+    procedure StrayRotationFilesDoNotJoinTheChain;
+    procedure BackwardsRenewalRejected;
+    procedure QuotedHashIsNotAComment;
+    procedure InvalidUTF8Rejected;
+    procedure DottedKeyNestingRejected;
+    procedure StaleContactFailuresAreDistinguished;
+    procedure RotationStepVerifiesBothSignatures;
   end;
 
 function ReadFixture(const APath: string): TBytes;
@@ -146,42 +173,39 @@ begin
   end;
 end;
 
-procedure TMirrorFixtureStore.Retain(const AVerified: TLWPTVerifiedRegistry);
-const
-  KeyNames: array[0..1] of string = ('root', 'rotated');
+procedure TMirrorFixtureStore.Retain(const AVerified: TLWPTVerifiedRegistry;
+  const ALastSync: string);
 var
-  State: TLWPTRegistryState;
-  Document: TLWPTRegistryDocument;
-  Rotation: TLWPTRegistryRotationProof;
-  KeyBytes: TBytes;
-  Prefix, KeyName: string;
+  Keys: array of TBytes;
+  Index: Integer;
 begin
-  for Document in AVerified.Documents do WriteImmutable(Document.Path, Document.Bytes);
-  for KeyName in KeyNames do
+  SetLength(Keys, Length(AVerified.Proof.Rotations) + 1);
+  Keys[0] := ReadFixture('keys/root.toml');
+  for Index := 1 to High(Keys) do Keys[Index] := ReadFixture('keys/rotated.toml');
+  RegistryMirrorRetainForTesting(Self, AVerified, Keys, ALastSync);
+end;
+
+procedure TMirrorFixtureStore.RetainArchives(const AVerified: TLWPTVerifiedRegistry);
+var
+  Package: TLWPTRegistryPackage;
+  Hex, Digest: string;
+  Archive: TBytes;
+  Index: Integer;
+begin
+  for Package in AVerified.Packages do
   begin
-    KeyBytes := ReadFixture('keys/' + KeyName + '.toml');
-    WriteImmutable(RegistryKeyStoragePath(Field(KeyBytes, 'key_id')), KeyBytes);
+    Digest := Copy(Package.ArchiveHash, 8, 64);
+    Hex := Trim(AsText(ReadFixture('objects/' + Digest + '.hex')));
+    SetLength(Archive, Length(Hex) div 2);
+    for Index := 0 to High(Archive) do
+      Archive[Index] := StrToInt('$' + Copy(Hex, Index * 2 + 1, 2));
+    WriteImmutable('objects/sha256/' + Digest, Archive);
   end;
-  for Rotation in AVerified.Proof.Rotations do
-  begin
-    Prefix := 'rotations/' + IntToStr(InspectRegistryRotation(Rotation.Document).EffectiveSequence);
-    WriteImmutable(Prefix + '.toml', Rotation.Document);
-    WriteImmutable(Prefix + '.old.sig.toml', Rotation.OldSignature);
-    WriteImmutable(Prefix + '.new.sig.toml', Rotation.NewSignature);
-  end;
-  State := Default(TLWPTRegistryState);
-  State.Sequence := AVerified.State.Sequence;
-  State.SnapshotHash := AVerified.State.Snapshot;
-  State.TrustKeyID := AVerified.State.KeyId;
-  State.TrustPublicKey := AVerified.State.PublicKey;
-  State.CheckpointHash := AVerified.State.CheckpointHash;
-  State.LastSync := EVALUATION_TIME;
-  Prefix := 'checkpoints/renewals/sha256/' + Copy(State.CheckpointHash, 8, 64);
-  State.CheckpointPath := Prefix + '.toml';
-  State.SignaturePath := Prefix + '.sig.toml';
-  WriteImmutable(State.CheckpointPath, AVerified.Proof.Checkpoint);
-  WriteImmutable(State.SignaturePath, AVerified.Proof.Signature);
-  ActivateState(State);
+end;
+
+procedure TMirrorFixtureStore.Put(const APath: string; const ABytes: TBytes);
+begin
+  WriteImmutable(APath, ABytes);
 end;
 
 procedure TMirrorFixtureStore.Corrupt(const APath: string);
@@ -189,12 +213,40 @@ begin
   AtomicWriteBytes(RootPath(APath), TmpRoot, AsBytes('tampered'));
 end;
 
+function TMirrorFixtureStore.StatePath: string;
+begin
+  Result := ReadCurrentState.CheckpointPath;
+end;
+
+procedure TMirrorRequestThread.Execute;
+begin
+  try
+    RTLEventWaitFor(Gate, 5000);
+    Status := RegistryHTTPResponse(Mirror, 'GET', '/v1/checkpoints/latest.toml').Status;
+  except
+    on E: Exception do Error := E.Message;
+  end;
+end;
+
+function NewFixtureMirror(const AScratch: string; const ATrust: TLWPTRegistryTrust): TMirrorFixtureStore;
+var
+  Config: TLWPTRegistryConfig;
+begin
+  Config := RegistryConfiguration(ATrust.Origin, 'http://localhost:8181', 'localhost', 8181, '', '');
+  Config.Role := rrMirror;
+  Config.UpstreamURL := ATrust.Origin;
+  Config.TrustKeyID := ATrust.KeyId;
+  Config.TrustPublicKey := ATrust.PublicKey;
+  Result := TMirrorFixtureStore(TMirrorFixtureStore.Initialize(AScratch, Config, EVALUATION_TIME));
+end;
+
+procedure ResignRoot(var AProof: TLWPTRegistryProof); forward;
+
 procedure TRegistryVerificationTests.MirrorReadViewReusesCapturedProof;
 var
-  Scratch, Path, Diagnostic: string;
+  Scratch, Path: string;
   Mirror: TMirrorFixtureStore;
   View: TLWPTRegistryReadView;
-  Config: TLWPTRegistryConfig;
   First, Latest: TLWPTVerifiedRegistry;
   Before: Integer;
   Paths: TStringList;
@@ -204,52 +256,402 @@ begin
   View := nil;
   Paths := TStringList.Create;
   try
-    Config := RegistryConfiguration(Trust.Origin, 'http://localhost:8181', 'localhost', 8181, '', '');
-    Config.Role := rrMirror;
-    Config.UpstreamURL := Trust.Origin;
-    Config.TrustKeyID := Trust.KeyId;
-    Config.TrustPublicKey := Trust.PublicKey;
-    Mirror := TMirrorFixtureStore(TMirrorFixtureStore.Initialize(Scratch, Config, EVALUATION_TIME));
+    Mirror := NewFixtureMirror(Scratch, Trust);
     First := Verify(Proof(1), Default(TLWPTRegistryAcceptedState));
     Latest := Verify(Proof(5), First.State);
     Mirror.Retain(First);
     Before := RegistryMirrorProofChecksForTesting;
     View := Mirror.CaptureReadView;
     Mirror.Retain(Latest);
+    { A captured view keeps its own generation after activation. }
     Expect<Boolean>(View.ResourceIsPublished('rotations/2.toml')).ToBe(False);
     Expect<Boolean>(View.ResourceIsPublished('snapshots/sha256/' + Copy(Latest.State.Snapshot, 8, 64) + '.toml')).ToBe(False);
     Expect<Boolean>(View.ResourceIsPublished('snapshots/sha256/' + Copy(First.State.Snapshot, 8, 64) + '.toml')).ToBe(True);
     Expect<Boolean>(View.ResourceIsPublished('snapshots/sha256/' + UpperCase(Copy(First.State.Snapshot, 8, 64)) + '.toml')).ToBe(False);
     Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(1);
+    FreeAndNil(View);
     Paths.Add('/v1/keys/' + Trust.KeyId + '.toml');
     Paths.Add('/v1/keys/' + Latest.State.KeyId + '.toml');
     Paths.Add('/v1/rotations/2.toml');
     Paths.Add('/v1/rotations/2.old.sig.toml');
     Paths.Add('/v1/rotations?after=0&limit=1');
     Paths.Add('/v1/snapshots/sha256/' + Copy(Latest.State.Snapshot, 8, 64) + '.toml');
-    for Path in Paths do
-    begin
-      Before := RegistryMirrorProofChecksForTesting;
-      Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', Path).Status).ToBe(200);
-      Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(1);
-    end;
-    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/rotations/2.OLD.SIG.TOML').Status).ToBe(404);
-    Mirror.Corrupt('rotations/2.old.sig.toml');
-    Diagnostic := '';
+    { The new accepted state is verified once, then shared by every request. }
     Before := RegistryMirrorProofChecksForTesting;
-    try
-      RegistryHTTPResponse(Mirror, 'GET', Paths[0]);
-    except
-      on E: ELWPTRegistryError do Diagnostic := E.Message;
-    end;
-    Expect<Boolean>(Diagnostic <> '').ToBe(True);
+    for Path in Paths do
+      Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', Path).Status).ToBe(200);
     Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(1);
+    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/rotations/2.OLD.SIG.TOML').Status).ToBe(404);
   finally
     Paths.Free;
     View.Free;
     Mirror.Free;
     RecursiveDelete(Scratch);
   end;
+end;
+
+procedure TRegistryVerificationTests.UnknownRoutesSkipProofVerification;
+const
+  Targets: array[0..6] of string = ('/v1/not-found', '/v1/objects/sha256/zz',
+    '/v1/rotations/1.toml', '/v1/rotations/x.toml', '/v1/rotations/02.toml',
+    '/v1/records/sha256/abc.toml', '/v1/checkpoints/latest');
+var
+  Scratch, Target: string;
+  Mirror: TMirrorFixtureStore;
+  Before: Integer;
+begin
+  Scratch := CreateScratchRoot('registry-unknown-route');
+  Mirror := nil;
+  try
+    Mirror := NewFixtureMirror(Scratch, Trust);
+    Mirror.Retain(Verify(Proof(1), Default(TLWPTRegistryAcceptedState)));
+    Before := RegistryMirrorProofChecksForTesting;
+    for Target in Targets do
+      Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', Target).Status).ToBe(404);
+    Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(0);
+  finally
+    Mirror.Free;
+    RecursiveDelete(Scratch);
+  end;
+end;
+
+procedure TRegistryVerificationTests.ConcurrentRequestsShareOneVerification;
+const
+  RequestCount = 8;
+var
+  Scratch: string;
+  Mirror: TMirrorFixtureStore;
+  Threads: array[0..RequestCount - 1] of TMirrorRequestThread;
+  Gate: PRTLEvent;
+  Before, Index: Integer;
+  Verified: TLWPTVerifiedRegistry;
+begin
+  Scratch := CreateScratchRoot('registry-concurrent-view');
+  Mirror := nil;
+  Gate := RTLEventCreate;
+  FillChar(Threads, SizeOf(Threads), 0);
+  try
+    Mirror := NewFixtureMirror(Scratch, Trust);
+    Verified := Verify(Proof(5), Default(TLWPTRegistryAcceptedState));
+    Mirror.Retain(Verified);
+    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/checkpoints/latest.toml').Status).ToBe(200);
+    { A new pointer with identical proof is a new generation. }
+    Mirror.Retain(Verified, '2026-01-07T00:00:00Z');
+    Before := RegistryMirrorProofChecksForTesting;
+    for Index := 0 to RequestCount - 1 do
+    begin
+      Threads[Index] := TMirrorRequestThread.Create(True);
+      Threads[Index].FreeOnTerminate := False;
+      Threads[Index].Mirror := Mirror;
+      Threads[Index].Gate := Gate;
+      Threads[Index].Start;
+    end;
+    RTLEventSetEvent(Gate);
+    for Index := 0 to RequestCount - 1 do
+    begin
+      Threads[Index].WaitFor;
+      Expect<string>(Threads[Index].Error).ToBe('');
+      Expect<Integer>(Threads[Index].Status).ToBe(200);
+    end;
+    Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(1);
+  finally
+    RTLEventSetEvent(Gate);
+    for Index := 0 to RequestCount - 1 do Threads[Index].Free;
+    RTLEventDestroy(Gate);
+    Mirror.Free;
+    RecursiveDelete(Scratch);
+  end;
+end;
+
+procedure TRegistryVerificationTests.ServedBytesMatchAuthenticatedDigests;
+const
+  Targets: array[0..1] of string = ('/v1/checkpoints/latest.toml',
+    '/v1/rotations/2.old.sig.toml');
+var
+  Scratch, Diagnostic: string;
+  Mirror: TMirrorFixtureStore;
+  Verified: TLWPTVerifiedRegistry;
+  Response: TLWPTRegistryHTTPResponse;
+  Stream: TStream;
+  Target: string;
+begin
+  Scratch := CreateScratchRoot('registry-served-digest');
+  Mirror := nil;
+  try
+    Mirror := NewFixtureMirror(Scratch, Trust);
+    Verified := Verify(Proof(5), Default(TLWPTRegistryAcceptedState));
+    Mirror.Retain(Verified);
+    Response := RegistryHTTPResponse(Mirror, 'GET', '/v1/checkpoints/latest.toml');
+    Expect<string>(Response.ResourceDigest).ToBe(Verified.State.CheckpointHash);
+    { Replace verified bytes after the generation was authenticated. }
+    Mirror.Corrupt(Mirror.StatePath);
+    for Target in Targets do
+    begin
+      if Target = '/v1/rotations/2.old.sig.toml' then
+        Mirror.Corrupt('proofs/sha256/' + Copy(SHA256BytesPrefixed(
+          Verified.Proof.Rotations[0].OldSignature), 8, 64) + '.toml');
+      Response := RegistryHTTPResponse(Mirror, 'GET', Target);
+      Expect<Integer>(Response.Status).ToBe(200);
+      Diagnostic := '';
+      Stream := nil;
+      try
+        Stream := OpenRegistryHTTPResource(Response);
+      except
+        on E: ELWPTRegistryError do Diagnostic := E.Message;
+      end;
+      Stream.Free;
+      Expect<Boolean>(Pos('resource_hash_mismatch:', Diagnostic) = 1).ToBe(True);
+    end;
+    Expect<Boolean>(Response.ResourceDigest = SHA256BytesPrefixed(AsBytes('tampered'))).ToBe(False);
+  finally
+    Mirror.Free;
+    RecursiveDelete(Scratch);
+  end;
+end;
+
+procedure TRegistryVerificationTests.UnacceptedRecordsAndObjectsStayHidden;
+var
+  Scratch, Stray: string;
+  Mirror: TMirrorFixtureStore;
+  Verified: TLWPTVerifiedRegistry;
+begin
+  Scratch := CreateScratchRoot('registry-unaccepted');
+  Mirror := nil;
+  try
+    Mirror := NewFixtureMirror(Scratch, Trust);
+    Verified := Verify(Proof(1), Default(TLWPTRegistryAcceptedState));
+    Mirror.Retain(Verified);
+    Mirror.RetainArchives(Verified);
+    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/objects/sha256/'
+      + Copy(Verified.Packages[0].ArchiveHash, 8, 64)).Status).ToBe(200);
+    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/records/sha256/'
+      + Copy(ROOT_RECORD, 8, 64) + '.toml').Status).ToBe(200);
+    Stray := SHA256Hex(AsBytes('unaccepted candidate'));
+    Mirror.Put('objects/sha256/' + Stray, AsBytes('unaccepted candidate'));
+    Mirror.Put('records/sha256/' + Stray + '.toml', AsBytes('unaccepted candidate'));
+    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/objects/sha256/' + Stray).Status).ToBe(404);
+    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/records/sha256/' + Stray + '.toml').Status).ToBe(404);
+  finally
+    Mirror.Free;
+    RecursiveDelete(Scratch);
+  end;
+end;
+
+procedure TRegistryVerificationTests.StrayRotationFilesDoNotJoinTheChain;
+const
+  Suffixes: array[0..2] of string = ('.toml', '.old.sig.toml', '.new.sig.toml');
+var
+  Scratch, Suffix: string;
+  Mirror: TMirrorFixtureStore;
+  Alternative: TLWPTRegistryProof;
+  Verified: TLWPTVerifiedRegistry;
+  View: TLWPTRegistryReadView;
+begin
+  Scratch := CreateScratchRoot('registry-stray-rotation');
+  Mirror := nil;
+  try
+    Mirror := NewFixtureMirror(Scratch, Trust);
+    { An accepted root-signed sequence 3 that never rotated. }
+    Alternative := Proof(3);
+    Alternative.Rotations := nil;
+    Alternative.Checkpoint := AsBytes(StringReplace(AsText(Alternative.Checkpoint),
+      Field(Alternative.Checkpoint, 'key_id'), Trust.KeyId, []));
+    ResignRoot(Alternative);
+    Verified := Verify(Alternative, Default(TLWPTRegistryAcceptedState));
+    Mirror.Retain(Verified);
+    Mirror.RetainArchives(Verified);
+    { An abandoned candidate left a valid rotation at an earlier sequence,
+      in both the numeric and the content-addressed layouts. }
+    for Suffix in Suffixes do
+    begin
+      Mirror.Put('rotations/2' + Suffix, ReadFixture('rotations/2' + Suffix));
+      Mirror.Put('proofs/sha256/' + Copy(SHA256BytesPrefixed(ReadFixture('rotations/2'
+        + Suffix)), 8, 64) + '.toml', ReadFixture('rotations/2' + Suffix));
+    end;
+    View := Mirror.CaptureReadView;
+    try
+      Expect<Integer>(View.RotationSequences.Count).ToBe(0);
+    finally
+      View.Free;
+    end;
+    Expect<Boolean>(Pos('sequence = 3', Mirror.VerifyMirror) > 0).ToBe(True);
+    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/rotations/2.toml').Status).ToBe(404);
+    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/checkpoints/latest.toml').Status).ToBe(200);
+  finally
+    Mirror.Free;
+    RecursiveDelete(Scratch);
+  end;
+end;
+
+function Renewed(const APublishedDay, AExpiresDay: string): TLWPTRegistryProof;
+var
+  Text: string;
+begin
+  Result := Default(TLWPTRegistryProof);
+  Text := AsText(ReadFixture('checkpoints/1.toml'));
+  Text := StringReplace(Text, 'published_at = "2026-01-01', 'published_at = "2026-01-' + APublishedDay, []);
+  Text := StringReplace(Text, 'expires_at = "2026-01-08', 'expires_at = "2026-01-' + AExpiresDay, []);
+  Result.Checkpoint := AsBytes(Text);
+  ResignRoot(Result);
+end;
+
+procedure TRegistryVerificationTests.BackwardsRenewalRejected;
+var
+  Newer, Replayed, Forward: TLWPTVerifiedRegistry;
+  Actual: string;
+  Stale: Boolean;
+begin
+  Newer := Verify(Renewed('05', '12'), Default(TLWPTRegistryAcceptedState));
+  { Exact replay of the accepted renewal is idempotent. }
+  Replayed := Verify(Renewed('05', '12'), Newer.State);
+  Expect<string>(Replayed.State.CheckpointHash).ToBe(Newer.State.CheckpointHash);
+  Forward := Verify(Renewed('05', '13'), Newer.State);
+  Expect<string>(Forward.ExpiresAt).ToBe('2026-01-13T00:00:00Z');
+  ExpectFailure(Proof(1), 'checkpoint_renewal_rollback:', Newer.State);
+  ExpectFailure(Renewed('04', '12'), 'checkpoint_renewal_rollback:', Newer.State);
+  Actual := '';
+  Stale := False;
+  try
+    Verify(Renewed('05', '11'), Newer.State);
+  except
+    on E: ELWPTRegistryStaleContactError do
+    begin
+      Actual := E.Message;
+      Stale := True;
+    end;
+  end;
+  Expect<Boolean>(Stale).ToBe(True);
+  Expect<Boolean>(Pos('checkpoint_renewal_rollback:', Actual) = 1).ToBe(True);
+end;
+
+procedure TRegistryVerificationTests.QuotedHashIsNotAComment;
+var
+  Original: string;
+  Page: TLWPTRegistryRotationPage;
+  Diagnostic: string;
+begin
+  Original := AsText(ReadFixture('pages/rotations.toml'));
+  Page := ParseRegistryRotationPage(AsBytes(StringReplace(Original,
+    'next_cursor = ""', 'next_cursor = "page#2"', [])), Trust.Origin,
+    Trust.Origin + '/v1', 0, 100);
+  Expect<string>(Page.NextCursor).ToBe('page#2');
+  Diagnostic := '';
+  try
+    ParseRegistryRotationPage(AsBytes(StringReplace(Original,
+      'next_cursor = ""', 'next_cursor = "" # page', [])), Trust.Origin,
+      Trust.Origin + '/v1', 0, 100);
+  except
+    on E: ELWPTRegistryError do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('non_canonical_document: comments', Diagnostic) = 1).ToBe(True);
+end;
+
+procedure TRegistryVerificationTests.InvalidUTF8Rejected;
+const
+  Invalid: array[0..6] of string = (#$C0#$AF, #$E0#$80#$AF, #$C3, #$E2#$82,
+    #$80, #$ED#$A0#$80, #$F4#$90#$80#$80);
+  Valid: array[0..2] of string = (#$C3#$A9, #$E2#$82#$AC, #$F0#$9F#$98#$80);
+var
+  Original, Value, Diagnostic: string;
+begin
+  Original := AsText(ReadFixture('pages/rotations.toml'));
+  for Value in Valid do
+    Expect<string>(ParseRegistryRotationPage(AsBytes(StringReplace(Original,
+      'next_cursor = ""', 'next_cursor = "a' + Value + 'b"', [])), Trust.Origin,
+      Trust.Origin + '/v1', 0, 100).NextCursor).ToBe('a' + Value + 'b');
+  for Value in Invalid do
+  begin
+    Diagnostic := '';
+    try
+      ParseRegistryRotationPage(AsBytes(StringReplace(Original,
+        'next_cursor = ""', 'next_cursor = "a' + Value + 'b"', [])), Trust.Origin,
+        Trust.Origin + '/v1', 0, 100);
+    except
+      on E: ELWPTRegistryError do Diagnostic := E.Message;
+    end;
+    Expect<string>(Diagnostic).ToBe('non_canonical_document: invalid UTF-8');
+  end;
+end;
+
+procedure TRegistryVerificationTests.DottedKeyNestingRejected;
+var
+  Keys, Document, Diagnostic: string;
+  Index: Integer;
+begin
+  Keys := 'a';
+  for Index := 2 to 100000 do Keys := Keys + '.a';
+  Document := AsText(ReadFixture('discovery-origin.toml'));
+  Document := Copy(Document, 1, Pos('api = ', Document) - 1) + 'api = { ' + Keys
+    + ' = 0 }' + Copy(Document, PosEx(#10, Document, Pos('api = ', Document)), MaxInt);
+  Diagnostic := '';
+  try
+    ParseRegistryDiscovery(Document);
+  except
+    on E: ELWPTRegistryError do Diagnostic := E.Message;
+  end;
+  Expect<string>(Diagnostic).ToBe('non_canonical_document: nesting');
+end;
+
+procedure TRegistryVerificationTests.StaleContactFailuresAreDistinguished;
+var
+  Prior: TLWPTVerifiedRegistry;
+  Candidate: TLWPTRegistryProof;
+
+  function StaleFailure(const AProof: TLWPTRegistryProof;
+    const APrior: TLWPTRegistryAcceptedState; const ATime: string): string;
+  begin
+    Result := 'accepted';
+    try
+      Verify(AProof, APrior, rvmAcquire, ATime);
+    except
+      on E: ELWPTRegistryStaleContactError do Result := 'stale';
+      on E: ELWPTRegistryError do Result := 'trust';
+    end;
+  end;
+begin
+  Prior := Verify(Proof(2), Default(TLWPTRegistryAcceptedState));
+  Expect<string>(StaleFailure(Proof(1), Default(TLWPTRegistryAcceptedState),
+    '2026-01-08T00:00:00Z')).ToBe('stale');
+  Expect<string>(StaleFailure(Proof(1), Prior.State, EVALUATION_TIME)).ToBe('stale');
+  Candidate := Proof(2);
+  Candidate.Signature := ReadFixture('invalid/checkpoint-2-invalid-signature.sig.toml');
+  Expect<string>(StaleFailure(Candidate, Default(TLWPTRegistryAcceptedState),
+    EVALUATION_TIME)).ToBe('trust');
+  Candidate := Proof(2);
+  Candidate.Checkpoint := ReadFixture('invalid/checkpoint-2-equivocation.toml');
+  Candidate.Signature := ReadFixture('invalid/checkpoint-2-equivocation.sig.toml');
+  Expect<string>(StaleFailure(Candidate, Prior.State, EVALUATION_TIME)).ToBe('trust');
+end;
+
+procedure TRegistryVerificationTests.RotationStepVerifiesBothSignatures;
+var
+  Rotation: TLWPTRegistryRotationProof;
+  Accepted: TLWPTUntrustedRegistryRotation;
+  Diagnostic, Forged: string;
+begin
+  Rotation := Proof(2).Rotations[0];
+  Accepted := VerifyRegistryRotation(Rotation, Trust.Origin, Trust.KeyId,
+    Trust.PublicKey, 1, 2);
+  Expect<Int64>(Accepted.EffectiveSequence).ToBe(2);
+  Forged := AsText(Rotation.OldSignature);
+  Forged := Copy(Forged, 1, Pos('signature = "hex:', Forged) + 16)
+    + StringOfChar('0', 128) + '"' + #10;
+  Rotation.OldSignature := AsBytes(Forged);
+  Diagnostic := '';
+  try
+    VerifyRegistryRotation(Rotation, Trust.Origin, Trust.KeyId, Trust.PublicKey, 1, 2);
+  except
+    on E: ELWPTRegistryError do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('signature_invalid:', Diagnostic) = 1).ToBe(True);
+  Rotation := Proof(2).Rotations[0];
+  Diagnostic := '';
+  try
+    VerifyRegistryRotation(Rotation, Trust.Origin, Trust.KeyId, Trust.PublicKey, 2, 2);
+  except
+    on E: ELWPTRegistryError do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('rotation_chain_invalid:', Diagnostic) = 1).ToBe(True);
 end;
 
 procedure ResignRoot(var AProof: TLWPTRegistryProof);
@@ -434,7 +836,7 @@ begin
   except
     on E: ELWPTRegistryError do Actual := E.Message;
   end;
-  Expect<string>(Actual).ToBe('checkpoint_expired');
+  Expect<Boolean>(Pos('checkpoint_expired:', Actual) = 1).ToBe(True);
 end;
 
 procedure TRegistryVerificationTests.LockedExpiredProofAccepted;
@@ -584,7 +986,7 @@ begin
     on E: ELWPTRegistryError do Actual := E.Message;
   end;
   { Canonical quoting passes; only the timestamp's domain validation fails. }
-  Expect<string>(Actual).ToBe('invalid_registry_record');
+  Expect<Boolean>(Pos('invalid_registry_record:', Actual) = 1).ToBe(True);
 end;
 
 procedure TRegistryVerificationTests.SharedEncoderPinsEscapeBytes;
@@ -602,7 +1004,7 @@ begin
   except
     on E: ELWPTRegistryError do Actual := E.Message;
   end;
-  Expect<string>(Actual).ToBe('invalid_registry_record');
+  Expect<Boolean>(Pos('invalid_registry_record:', Actual) = 1).ToBe(True);
 end;
 
 procedure TRegistryVerificationTests.SnapshotTamperingRejected;
@@ -730,7 +1132,7 @@ begin
     except
       on E: ELWPTRegistryError do Actual := E.Message;
     end;
-    Expect<string>(Actual).ToBe('object_hash_mismatch');
+    Expect<Boolean>(Pos('object_hash_mismatch:', Actual) = 1).ToBe(True);
   finally
     Stream.Free;
   end;
@@ -758,7 +1160,7 @@ begin
     except
       on E: ELWPTRegistryError do Actual := E.Message;
     end;
-    Expect<string>(Actual).ToBe('invalid_trust_root');
+    Expect<Boolean>(Pos('invalid_trust_root:', Actual) = 1).ToBe(True);
   finally
     Source.Free;
   end;
@@ -1026,7 +1428,18 @@ procedure TRegistryVerificationTests.SetupTests;
 begin
   Test('rotation pages enforce item counts, order, scope and canonical fields', RotationPagesAreBoundedAndCanonical);
   Test('retrieval pages and key documents share signed-proof aggregate limits', RetrievalDocumentsShareProofBudget);
-  Test('read views verify once and retain captured membership without a global cache', MirrorReadViewReusesCapturedProof);
+  Test('read views share one verified generation per accepted state', MirrorReadViewReusesCapturedProof);
+  Test('unknown and malformed routes never verify retained proof', UnknownRoutesSkipProofVerification);
+  Test('concurrent requests after activation share one verification', ConcurrentRequestsShareOneVerification);
+  Test('served proof bytes must match their authenticated digests', ServedBytesMatchAuthenticatedDigests);
+  Test('records and objects outside accepted history are not addressable', UnacceptedRecordsAndObjectsStayHidden);
+  Test('stray rotation files cannot join the accepted chain', StrayRotationFilesDoNotJoinTheChain);
+  Test('same-sequence renewal cannot move backwards', BackwardsRenewalRejected);
+  Test('a quoted hash in an opaque cursor is not a comment', QuotedHashIsNotAComment);
+  Test('canonical documents require strict UTF-8', InvalidUTF8Rejected);
+  Test('dotted inline keys cannot bypass the nesting bound', DottedKeyNestingRejected);
+  Test('stale contacts are distinguished from trust failures', StaleContactFailuresAreDistinguished);
+  Test('each rotation step verifies both signatures before advancing', RotationStepVerifiesBothSignatures);
   Test('key documents retain canonical bytes and match immutable trust and sequence', PinnedKeyDocumentValidated);
   Test('bootstrap and yank/restore corpus verifies', CorpusBootstrapAndLifecycle);
   Test('anchored history returns a complete offline bundle', AnchoredHistoryAndCompleteBundle);

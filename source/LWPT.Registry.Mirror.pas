@@ -15,32 +15,58 @@ uses
   LWPT.Registry.Verification;
 
 const
-  MAXIMUM_MIRROR_ARCHIVE_BYTES = Int64(256) * 1024 * 1024;
+  RegistryMaximumMirrorArchiveBytes = Int64(256) * 1024 * 1024;
 
 type
   {$IFDEF REGISTRY_TESTING}
   TRegistryMirrorTransferStats = record
     PeakReserved, CompletedReserved: Int64;
     MaximumWorkers: Integer;
+    { Barriers for deterministic transfer tests, updated with Interlocked*. }
+    CompletedWorkers, AdmissionsClosed: LongInt;
   end;
+  PRegistryMirrorTransferStats = ^TRegistryMirrorTransferStats;
   {$ENDIF}
 
   TLWPTRegistryMirror = class(TLWPTRegistryStore)
   private
+    FGeneration: TLWPTRegistryGeneration;
+    FGenerationReference: IInterface;
+    FGenerationState: TLWPTRegistryState;
+    FSynchronizationDeadline: QWord;
+    FStoreUsed, FAttemptWritten: Int64;
+    FAttemptID, FAttemptStartedAt: string;
     {$IFDEF REGISTRY_TESTING}
     FTransferStats: TRegistryMirrorTransferStats;
     FBeforeActivate: TSHA256Progress;
+    FSynchronizationMilliseconds: QWord;
     {$ENDIF}
     function Trust: TLWPTRegistryTrust;
-    function Accepted(const AState: TLWPTRegistryState): TLWPTRegistryAcceptedState;
+    function Accepted(const AState: TLWPTRegistryState;
+      const ACheckpoint: TBytes): TLWPTRegistryAcceptedState;
     function VerifyStateProof(const AState: TLWPTRegistryState;
       AProgress: TSHA256Progress = nil): TLWPTVerifiedRegistry;
-    procedure SaveAttempt(const AOutcome: string);
-    procedure CacheDocument(const APath: string; const ABytes: TBytes);
+    function BuildGeneration(const AKey: string; const AState: TLWPTRegistryState;
+      const AVerified: TLWPTVerifiedRegistry): TLWPTRegistryGeneration;
+    function RemainingSynchronizationMilliseconds: QWord;
+    procedure BeginAttempt;
+    procedure SaveAttempt(const AOutcome, AError: string);
+    procedure MarkAbandonedAttempt;
+    procedure PrepareStorageBudget(AAccepted: TLWPTRegistryGeneration);
+    procedure PruneUnaccepted(AAccepted: TLWPTRegistryGeneration);
+    procedure Reserve(const ABytes: Int64);
+    procedure WriteBudgeted(const ARelative: string; const ABytes: TBytes);
     procedure TransferArchives(const AAPI: string; const APackages: TLWPTRegistryPackageArray);
+    {$IFDEF REGISTRY_TESTING}
+    procedure RetainForTesting(const AVerified: TLWPTVerifiedRegistry;
+      const AKeyDocuments: array of TBytes; const ALastSync: string);
+    {$ENDIF}
   public
+    destructor Destroy; override;
     procedure Recover; override;
     function LoadCurrentState(AProgress: TSHA256Progress = nil): TLWPTRegistryState; override;
+    { Reuses one verified generation while the accepted state bytes are
+      unchanged. At most one verification runs per store at a time. }
     function CaptureReadView(AProgress: TSHA256Progress = nil): TLWPTRegistryReadView; override;
     procedure Synchronize;
     function VerifyMirror: string;
@@ -53,9 +79,17 @@ function RegistryMirrorCanAdmitForTesting(const AReserved, ASize: Int64;
   const AWorkers: Integer): Boolean;
 procedure RegistryMirrorTransferForTesting(AMirror: TLWPTRegistryMirror;
   const AAPI: string; const APackages: TLWPTRegistryPackageArray);
-function RegistryMirrorTransferStatsForTesting(AMirror: TLWPTRegistryMirror): TRegistryMirrorTransferStats;
+function RegistryMirrorTransferStatsForTesting(AMirror: TLWPTRegistryMirror): PRegistryMirrorTransferStats;
 procedure RegistryMirrorBeforeActivateForTesting(AMirror: TLWPTRegistryMirror;
   ACallback: TSHA256Progress);
+procedure RegistryMirrorSynchronizationBudgetForTesting(AMirror: TLWPTRegistryMirror;
+  const AMilliseconds: QWord);
+function RegistryMirrorTransportURLForTesting(const AURL: string): string;
+{ Persists a verified proof in the synchronized layout for fixtures. Key
+  documents are the root record followed by one record per rotation. }
+procedure RegistryMirrorRetainForTesting(AMirror: TLWPTRegistryMirror;
+  const AVerified: TLWPTVerifiedRegistry; const AKeyDocuments: array of TBytes;
+  const ALastSync: string);
 {$ENDIF}
 
 implementation
@@ -66,26 +100,42 @@ uses
 
   HTTPClient,
   LWPT.ProducerLease,
-  LWPT.Registry.Filesystem;
+  LWPT.Registry.Filesystem,
+  TOML;
 
 const
-  MIRROR_REQUEST_TIMEOUT_MS = 120 * 1000;
-  MIRROR_ATTEMPT_PATH = 'state/sync-attempt.toml';
-  MAXIMUM_MIRROR_ARCHIVE_WORKERS = 2;
+  MirrorRequestTimeoutMilliseconds = 120 * 1000;
+  { Bounds one complete synchronization, including every metadata request and
+    archive transfer. Each request uses the smaller remaining budget. }
+  MirrorSynchronizationMilliseconds = 60 * 60 * 1000;
+  MirrorAttemptPath = 'state/sync-attempt.toml';
+  MaximumMirrorArchiveWorkers = 2;
+  { A checkpoint and its signature come from two mutable latest URLs. Retry
+    only while the checkpoint itself advances between the reads. }
+  MirrorCheckpointPairAttempts = 3;
+  MirrorProofPrefix = 'proofs/sha256/';
+  MirrorLocalHTTPPrefix = 'http://localhost';
+  MirrorLoopbackHTTPPrefix = 'http://127.0.0.1';
 
 {$IFDEF REGISTRY_TESTING}
 var
-  MirrorProofChecks: Integer;
+  MirrorProofChecks: LongInt;
 
 function RegistryMirrorProofChecksForTesting: Integer;
 begin
-  Result := MirrorProofChecks;
+  Result := InterlockedCompareExchange(MirrorProofChecks, 0, 0);
 end;
 
 procedure RegistryMirrorBeforeActivateForTesting(AMirror: TLWPTRegistryMirror;
   ACallback: TSHA256Progress);
 begin
   AMirror.FBeforeActivate := ACallback;
+end;
+
+procedure RegistryMirrorSynchronizationBudgetForTesting(AMirror: TLWPTRegistryMirror;
+  const AMilliseconds: QWord);
+begin
+  AMirror.FSynchronizationMilliseconds := AMilliseconds;
 end;
 {$ENDIF}
 
@@ -94,12 +144,17 @@ type
   private
     FURL: string;
     FPackage: TLWPTRegistryPackage;
+    FTimeoutMilliseconds: QWord;
+    {$IFDEF REGISTRY_TESTING}
+    FStats: PRegistryMirrorTransferStats;
+    {$ENDIF}
   protected
     procedure Execute; override;
   public
     Archive: TBytes;
     Error: string;
-    constructor Create(const AAPI: string; const APackage: TLWPTRegistryPackage);
+    constructor Create(const AAPI: string; const APackage: TLWPTRegistryPackage;
+      const ATimeoutMilliseconds: QWord);
   end;
 
   TMirrorDocumentSource = class(TLWPTRegistryDocumentSource)
@@ -111,20 +166,66 @@ type
       const AMaximumBytes: Int64): TBytes; override;
   end;
 
-function Bytes(const AText: string): TBytes;
+function ProofPath(const AHash: string): string;
 begin
-  SetLength(Result, Length(AText));
-  if Length(Result) > 0 then Move(AText[1], Result[0], Length(Result));
+  Result := MirrorProofPrefix + Copy(AHash, Length('sha256:') + 1, MaxInt) + '.toml';
 end;
 
-function Text(const ABytes: TBytes): string;
+function DigestFromPath(const APath, APrefix, ASuffix: string): string;
 begin
-  Result := '';
-  if Length(ABytes) > 0 then SetString(Result, PAnsiChar(@ABytes[0]), Length(ABytes));
+  Result := 'sha256:' + Copy(APath, Length(APrefix) + 1,
+    Length(APath) - Length(APrefix) - Length(ASuffix));
+end;
+
+{ The development exception for plain HTTP names exactly localhost. Connect to
+  the loopback address directly instead of trusting resolver configuration,
+  matching the listener, which binds localhost as 127.0.0.1. }
+function MirrorTransportURL(const AURL: string): string;
+begin
+  Result := AURL;
+  if StartsStr(MirrorLocalHTTPPrefix, AURL)
+    and ((Length(AURL) = Length(MirrorLocalHTTPPrefix))
+      or (AURL[Length(MirrorLocalHTTPPrefix) + 1] in [':', '/', '?'])) then
+    Result := MirrorLoopbackHTTPPrefix + Copy(AURL, Length(MirrorLocalHTTPPrefix) + 1, MaxInt);
+end;
+
+{$IFDEF REGISTRY_TESTING}
+function RegistryMirrorTransportURLForTesting(const AURL: string): string;
+begin
+  Result := MirrorTransportURL(AURL);
+end;
+{$ENDIF}
+
+{ Discovery may only name protocol resources below the configured upstream.
+  Percent-encoded or dot segments can be decoded into another path by an
+  intermediary, so they are refused rather than interpreted. }
+function EndpointSuffixIsUnambiguous(const ASuffix: string): Boolean;
+var
+  Segments: TStringList;
+  Segment: string;
+  Character: Char;
+begin
+  Result := ASuffix <> '';
+  if not Result then Exit;
+  Segments := TStringList.Create;
+  try
+    Segments.StrictDelimiter := True;
+    Segments.Delimiter := '/';
+    Segments.DelimitedText := ASuffix;
+    for Segment in Segments do
+    begin
+      if (Segment = '') or (Segment = '.') or (Segment = '..') then Exit(False);
+      for Character in Segment do
+        if not (Character in ['A'..'Z', 'a'..'z', '0'..'9', '-', '.', '_', '~']) then
+          Exit(False);
+    end;
+  finally
+    Segments.Free;
+  end;
 end;
 
 function GetDocument(const AURL, AMediaType: string;
-  const AMaximumBytes: Int64): TBytes;
+  const AMaximumBytes: Int64; const ATimeoutMilliseconds: QWord): TBytes;
 var
   Options: THTTPRequestOptions;
   Headers: THTTPHeaders;
@@ -137,9 +238,12 @@ begin
     CanonicalBase := Copy(CanonicalBase, 1, Pos('?', CanonicalBase) - 1);
   if not RegistryURIIsCanonical(CanonicalBase, True) or (Pos('#', AURL) > 0) then
     raise ELWPTRegistryError.CreateStable('invalid_registry_uri', 'noncanonical request URI');
+  if ATimeoutMilliseconds = 0 then
+    raise ELWPTRegistryError.CreateStable('mirror_sync_deadline_exceeded',
+      'synchronization exceeded its total time budget');
   Options := DefaultHTTPRequestOptions;
   Options.MaxResponseBodyBytes := AMaximumBytes;
-  Options.RequestTimeoutMilliseconds := MIRROR_REQUEST_TIMEOUT_MS;
+  Options.RequestTimeoutMilliseconds := ATimeoutMilliseconds;
   { Discovery endpoints are scoped to the configured transport. Never follow
     a redirect before checking its target's transport and scope. }
   Options.MaximumRedirects := 0;
@@ -147,7 +251,7 @@ begin
   Headers[0].Name := 'Accept';
   Headers[0].Value := AMediaType;
   try
-    Response := HTTPGet(AURL, Headers, Options);
+    Response := HTTPGet(MirrorTransportURL(AURL), Headers, Options);
   except
     on E: EHTTPError do
       raise ELWPTRegistryError.CreateStable('registry_transport_failed', E.Message);
@@ -172,11 +276,12 @@ begin
 end;
 
 constructor TMirrorArchiveWorker.Create(const AAPI: string;
-  const APackage: TLWPTRegistryPackage);
+  const APackage: TLWPTRegistryPackage; const ATimeoutMilliseconds: QWord);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
   FPackage := APackage;
+  FTimeoutMilliseconds := ATimeoutMilliseconds;
   FURL := AAPI + '/objects/sha256/' + Copy(APackage.ArchiveHash, 8, 64);
 end;
 
@@ -185,19 +290,26 @@ var
   Stream: TBytesStream;
 begin
   try
-    Archive := GetDocument(FURL, 'application/gzip', FPackage.ArchiveSize);
-    Stream := TBytesStream.Create(Archive);
     try
-      VerifyRegistryArtifact(FPackage, Stream);
-    finally
-      Stream.Free;
+      Archive := GetDocument(FURL, 'application/gzip', FPackage.ArchiveSize,
+        FTimeoutMilliseconds);
+      Stream := TBytesStream.Create(Archive);
+      try
+        VerifyRegistryArtifact(FPackage, Stream);
+      finally
+        Stream.Free;
+      end;
+    except
+      on E: Exception do
+      begin
+        Error := E.Message;
+        Archive := nil;
+      end;
     end;
-  except
-    on E: Exception do
-    begin
-      Error := E.Message;
-      Archive := nil;
-    end;
+  finally
+    {$IFDEF REGISTRY_TESTING}
+    if Assigned(FStats) then InterlockedIncrement(FStats^.CompletedWorkers);
+    {$ENDIF}
   end;
 end;
 
@@ -206,10 +318,10 @@ function MirrorCanAdmit(const AReserved, ASize: Int64;
 begin
   { Subtraction after range checks avoids overflow even for hostile sizes.
     A reservation includes completed buffers until their owner is freed. }
-  if (AWorkers < 0) or (AWorkers >= MAXIMUM_MIRROR_ARCHIVE_WORKERS)
-    or (AReserved < 0) or (AReserved > MAXIMUM_MIRROR_ARCHIVE_BYTES)
+  if (AWorkers < 0) or (AWorkers >= MaximumMirrorArchiveWorkers)
+    or (AReserved < 0) or (AReserved > RegistryMaximumMirrorArchiveBytes)
     or (ASize < 0) then Exit(False);
-  Result := ASize <= MAXIMUM_MIRROR_ARCHIVE_BYTES - AReserved;
+  Result := ASize <= RegistryMaximumMirrorArchiveBytes - AReserved;
 end;
 
 {$IFDEF REGISTRY_TESTING}
@@ -225,11 +337,118 @@ begin
   AMirror.TransferArchives(AAPI, APackages);
 end;
 
-function RegistryMirrorTransferStatsForTesting(AMirror: TLWPTRegistryMirror): TRegistryMirrorTransferStats;
+function RegistryMirrorTransferStatsForTesting(AMirror: TLWPTRegistryMirror): PRegistryMirrorTransferStats;
 begin
-  Result := AMirror.FTransferStats;
+  Result := @AMirror.FTransferStats;
 end;
 {$ENDIF}
+
+destructor TLWPTRegistryMirror.Destroy;
+begin
+  FGenerationReference := nil;
+  inherited Destroy;
+end;
+
+function TLWPTRegistryMirror.RemainingSynchronizationMilliseconds: QWord;
+var
+  Now: QWord;
+begin
+  if FSynchronizationDeadline = 0 then Exit(MirrorRequestTimeoutMilliseconds);
+  Now := GetTickCount64;
+  if Now >= FSynchronizationDeadline then Exit(0);
+  Result := FSynchronizationDeadline - Now;
+  if Result > MirrorRequestTimeoutMilliseconds then Result := MirrorRequestTimeoutMilliseconds;
+end;
+
+procedure TLWPTRegistryMirror.Reserve(const ABytes: Int64);
+begin
+  if (ABytes < 0) or (ABytes > Config.SyncBudgetBytes - FAttemptWritten) then
+    raise ELWPTRegistryError.CreateStable('mirror_sync_budget_exceeded',
+      'synchronization would write more than max_sync_bytes');
+  if ABytes > Config.StoreBudgetBytes - FStoreUsed then
+    raise ELWPTRegistryError.CreateStable('mirror_store_budget_exceeded',
+      'synchronization would grow the data directory beyond max_store_bytes');
+  Inc(FAttemptWritten, ABytes);
+  Inc(FStoreUsed, ABytes);
+end;
+
+procedure TLWPTRegistryMirror.WriteBudgeted(const ARelative: string;
+  const ABytes: TBytes);
+begin
+  { Existing content-addressed bytes are compared, not charged again. }
+  if not FileExists(RootPath(ARelative)) then Reserve(Length(ABytes));
+  WriteImmutable(ARelative, ABytes);
+end;
+
+function DirectoryBytes(const ADirectory: string): Int64;
+var
+  Search: TSearchRec;
+begin
+  Result := 0;
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ADirectory) + '*',
+    faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    repeat
+      if (Search.Name = '.') or (Search.Name = '..')
+        or ((Search.Attr and faSymLink) <> 0) then Continue;
+      if (Search.Attr and faDirectory) <> 0 then
+        Inc(Result, DirectoryBytes(IncludeTrailingPathDelimiter(ADirectory) + Search.Name))
+      else Inc(Result, Search.Size);
+    until SysUtils.FindNext(Search) <> 0;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
+
+procedure TLWPTRegistryMirror.PruneUnaccepted(AAccepted: TLWPTRegistryGeneration);
+const
+  ContentDirectories: array[0..4] of string = ('objects/sha256', 'records/sha256',
+    'snapshots/sha256', 'proofs/sha256', 'checkpoints/renewals/sha256');
+var
+  Relative: string;
+  Search: TSearchRec;
+  Retained: TStringList;
+begin
+  Retained := TStringList.Create;
+  try
+    Retained.Sorted := True;
+    Retained.Duplicates := dupIgnore;
+    if AAccepted <> nil then AAccepted.AppendStoredPaths(Retained);
+    for Relative in ContentDirectories do
+    begin
+      if SysUtils.FindFirst(RootPath(Relative + '/*'), faAnyFile or faSymLink, Search) <> 0 then
+        Continue;
+      try
+        repeat
+          if (Search.Attr and faDirectory) <> 0 then Continue;
+          if Retained.IndexOf(Relative + '/' + Search.Name) >= 0 then Continue;
+          { A concurrent reader of an older generation may hold the file open;
+            retention is then retried by the next attempt. }
+          DeleteFile(RootPath(Relative + '/' + Search.Name));
+        until SysUtils.FindNext(Search) <> 0;
+      finally
+        SysUtils.FindClose(Search);
+      end;
+    end;
+  finally
+    Retained.Free;
+  end;
+end;
+
+procedure TLWPTRegistryMirror.PrepareStorageBudget(AAccepted: TLWPTRegistryGeneration);
+begin
+  if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
+  ForceDirectories(TmpRoot);
+  FAttemptWritten := 0;
+  FStoreUsed := DirectoryBytes(Root);
+  { Unaccepted candidates stay available for retry only while a complete
+    attempt still fits. Otherwise they are removed before reservation. }
+  if FStoreUsed > Config.StoreBudgetBytes - Config.SyncBudgetBytes then
+  begin
+    PruneUnaccepted(AAccepted);
+    FStoreUsed := DirectoryBytes(Root);
+  end;
+end;
 
 procedure TLWPTRegistryMirror.TransferArchives(const AAPI: string;
   const APackages: TLWPTRegistryPackageArray);
@@ -237,8 +456,8 @@ var
   Sizes: TDictionary<string, Int64>;
   Missing: TLWPTRegistryPackageArray;
   Package: TLWPTRegistryPackage;
-  Workers: array[0..MAXIMUM_MIRROR_ARCHIVE_WORKERS - 1] of TMirrorArchiveWorker;
-  Reserved, PreviousSize: Int64;
+  Workers: array[0..MaximumMirrorArchiveWorkers - 1] of TMirrorArchiveWorker;
+  Reserved, PreviousSize, Planned: Int64;
   Count, Next, Admitted, I: Integer;
   Path, Failure: string;
   Stream: TStream;
@@ -252,7 +471,7 @@ begin
       The same bytes may serve several records, but their size cannot differ. }
     for Package in APackages do
     begin
-      if (Package.ArchiveSize < 0) or (Package.ArchiveSize > MAXIMUM_MIRROR_ARCHIVE_BYTES) then
+      if (Package.ArchiveSize < 0) or (Package.ArchiveSize > RegistryMaximumMirrorArchiveBytes) then
         raise ELWPTRegistryError.CreateStable('mirror_archive_limit_exceeded',
           'archive exceeds the bounded whole-body transfer limit');
       if Sizes.TryGetValue(Package.ArchiveHash, PreviousSize) then
@@ -265,6 +484,7 @@ begin
     end;
     SetLength(Missing, Sizes.Count);
     Count := 0;
+    Planned := 0;
     for Package in APackages do
       if Sizes.ContainsKey(Package.ArchiveHash) then
       begin
@@ -283,11 +503,14 @@ begin
         begin
           Missing[Count] := Package;
           Inc(Count);
+          Inc(Planned, Package.ArchiveSize);
         end;
       end;
   finally
     Sizes.Free;
   end;
+  { Reserve the complete authenticated plan before the first transfer. }
+  Reserve(Planned);
   Next := 0;
   while Next < Count do
   begin
@@ -301,7 +524,11 @@ begin
       while (Next < Count) and MirrorCanAdmit(Reserved,
         Missing[Next].ArchiveSize, Admitted) do
       begin
-        Workers[Admitted] := TMirrorArchiveWorker.Create(AAPI, Missing[Next]);
+        Workers[Admitted] := TMirrorArchiveWorker.Create(AAPI, Missing[Next],
+          RemainingSynchronizationMilliseconds);
+        {$IFDEF REGISTRY_TESTING}
+        Workers[Admitted].FStats := @FTransferStats;
+        {$ENDIF}
         Inc(Reserved, Missing[Next].ArchiveSize);
         Inc(Admitted);
         Inc(Next);
@@ -310,6 +537,7 @@ begin
       {$IFDEF REGISTRY_TESTING}
       if Reserved > FTransferStats.PeakReserved then FTransferStats.PeakReserved := Reserved;
       if Admitted > FTransferStats.MaximumWorkers then FTransferStats.MaximumWorkers := Admitted;
+      InterlockedIncrement(FTransferStats.AdmissionsClosed);
       {$ENDIF}
       for I := 0 to Admitted - 1 do Workers[I].WaitFor;
       {$IFDEF REGISTRY_TESTING}
@@ -357,6 +585,11 @@ begin
     or not RegistryTrustRootIsValid(AConfig.TrustKeyID, AConfig.TrustPublicKey) then
     raise ELWPTRegistryError.CreateStable('invalid_mirror_configuration',
       'mirror role, canonical origin and upstream, and an explicit valid root pin are required');
+  { HTTPClient connects over IPv4 only. Reject a bracketed IPv6 upstream at
+    configuration time instead of accepting an endpoint sync cannot reach. }
+  if Pos('://[', AConfig.UpstreamURL) > 0 then
+    raise ELWPTRegistryError.CreateStable('invalid_mirror_configuration',
+      'IPv6 upstream addresses are not supported; use a DNS name or IPv4 address');
 end;
 
 function TLWPTRegistryMirror.Trust: TLWPTRegistryTrust;
@@ -366,21 +599,23 @@ begin
   Result.PublicKey := Config.TrustPublicKey;
 end;
 
-function TLWPTRegistryMirror.Accepted(const AState: TLWPTRegistryState): TLWPTRegistryAcceptedState;
+function TLWPTRegistryMirror.Accepted(const AState: TLWPTRegistryState;
+  const ACheckpoint: TBytes): TLWPTRegistryAcceptedState;
+var
+  Checkpoint: TLWPTUntrustedRegistryCheckpoint;
 begin
   if (AState.Sequence > High(Int64)) or not RegistryHashIsCanonical(AState.CheckpointHash) then
     raise ELWPTRegistryError.CreateStable('state_corrupt', 'invalid accepted mirror state');
+  { Locked-proof verification binds these times to the recorded hash. }
+  Checkpoint := InspectRegistryCheckpoint(ACheckpoint);
   Result.Origin := Config.Identity;
   Result.Sequence := AState.Sequence;
   Result.Snapshot := AState.SnapshotHash;
   Result.CheckpointHash := AState.CheckpointHash;
   Result.KeyId := AState.TrustKeyID;
   Result.PublicKey := AState.TrustPublicKey;
-end;
-
-procedure TLWPTRegistryMirror.CacheDocument(const APath: string; const ABytes: TBytes);
-begin
-  WriteImmutable(APath, ABytes);
+  Result.PublishedAt := Checkpoint.PublishedAt;
+  Result.ExpiresAt := Checkpoint.ExpiresAt;
 end;
 
 function TMirrorDocumentSource.ReadDocument(const APath: string;
@@ -406,10 +641,11 @@ begin
     Result := Store.LoadResource(APath, Progress, AMaximumBytes)
   else
     Result := GetDocument(API + '/' + APath, 'application/vnd.' + PROGRAM_NAME
-      + '.registry-' + MediaType + '+toml', AMaximumBytes);
+      + '.registry-' + MediaType + '+toml', AMaximumBytes,
+      Store.RemainingSynchronizationMilliseconds);
   if SHA256BytesPrefixed(Result) <> 'sha256:' + Digest then
     raise ELWPTRegistryError.CreateStable('resource_hash_mismatch', 'proof resource hash does not match');
-  if API <> '' then Store.CacheDocument(APath, Result);
+  if API <> '' then Store.WriteBudgeted(APath, Result);
 end;
 
 procedure RememberRetrieval(var AProof: TLWPTRegistryProof; const ABytes: TBytes);
@@ -426,13 +662,14 @@ function TLWPTRegistryMirror.VerifyStateProof(const AState: TLWPTRegistryState;
 var
   Source: TMirrorDocumentSource;
   Proof: TLWPTRegistryProof;
-  Prefix, Sequence: string;
-  Sequences: TStringList;
+  Prefix: string;
   Budget: TLWPTRegistryMetadataBudget;
   Index: Integer;
   Rotation: TLWPTUntrustedRegistryRotation;
   KeyTrust: TLWPTRegistryTrust;
-  function ReadBounded(const APath: string; const AAuxiliary: Boolean = False): TBytes;
+  Binding: TLWPTRegistryRotationBinding;
+
+  function ReadBounded(const APath: string): TBytes;
   var
     Allowance: Int64;
   begin
@@ -440,6 +677,16 @@ var
     if Allowance > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then Allowance := MAX_REGISTRY_CONTROL_DOCUMENT_BYTES;
     Result := LoadResource(APath, AProgress, Allowance);
     Budget.Account(Result);
+  end;
+
+  { Proof documents are addressed by the hash the accepted state binds, so
+    files left by unaccepted attempts can never join the chain. }
+  function ReadProof(const AHash: string; const AAuxiliary: Boolean): TBytes;
+  begin
+    Result := ReadBounded(ProofPath(AHash));
+    if SHA256BytesPrefixed(Result) <> AHash then
+      raise ELWPTRegistryError.CreateStable('resource_hash_mismatch',
+        'retained proof document does not match its accepted hash');
     if AAuxiliary then RememberRetrieval(Proof, Result);
   end;
 begin
@@ -447,44 +694,90 @@ begin
   {$IFDEF REGISTRY_TESTING}
   InterlockedIncrement(MirrorProofChecks);
   {$ENDIF}
-  if not RegistryHashIsCanonical(AState.CheckpointHash)
+  if (AState.Role <> rrMirror) or not RegistryHashIsCanonical(AState.CheckpointHash)
     or (AState.CheckpointPath <> Prefix + '.toml')
     or (AState.SignaturePath <> Prefix + '.sig.toml') then
     raise ELWPTRegistryError.CreateStable('state_corrupt', 'invalid mirror proof paths');
   Proof := Default(TLWPTRegistryProof);
   Source := TMirrorDocumentSource.Create;
   Budget := TLWPTRegistryMetadataBudget.Create(DefaultRegistryVerificationLimits);
-  Sequences := nil;
   try
     Proof.Checkpoint := ReadBounded(AState.CheckpointPath);
     Proof.Signature := ReadBounded(AState.SignaturePath);
-    ValidateRegistryKeyDocument(ReadBounded(RegistryKeyStoragePath(Config.TrustKeyID), True),
-      Trust, AState.Sequence);
-    Sequences := RotationSequences(AState, AProgress);
-    SetLength(Proof.Rotations, Sequences.Count);
-    Index := 0;
-    for Sequence in Sequences do
+    ValidateRegistryKeyDocument(ReadProof(AState.TrustKeyDocument, True), Trust,
+      AState.Sequence);
+    SetLength(Proof.Rotations, Length(AState.Rotations));
+    for Index := 0 to High(AState.Rotations) do
     begin
-      Prefix := 'rotations/' + Sequence;
-      Proof.Rotations[Index].Document := ReadBounded(Prefix + '.toml');
-      Proof.Rotations[Index].OldSignature := ReadBounded(Prefix + '.old.sig.toml');
-      Proof.Rotations[Index].NewSignature := ReadBounded(Prefix + '.new.sig.toml');
+      Binding := AState.Rotations[Index];
+      Proof.Rotations[Index].Document := ReadProof(Binding.Document, False);
+      Proof.Rotations[Index].OldSignature := ReadProof(Binding.OldSignature, False);
+      Proof.Rotations[Index].NewSignature := ReadProof(Binding.NewSignature, False);
       Rotation := InspectRegistryRotation(Proof.Rotations[Index].Document);
+      if Rotation.EffectiveSequence <> Binding.Sequence then
+        raise ELWPTRegistryError.CreateStable('state_corrupt',
+          'rotation binding sequence differs from its document');
       KeyTrust.Origin := Config.Identity;
       KeyTrust.KeyId := Rotation.ToKey;
       KeyTrust.PublicKey := Rotation.ToPublicKey;
-      ValidateRegistryKeyDocument(ReadBounded(RegistryKeyStoragePath(Rotation.ToKey), True),
-        KeyTrust, Rotation.EffectiveSequence, True);
-      Inc(Index);
+      ValidateRegistryKeyDocument(ReadProof(Binding.KeyDocument, True), KeyTrust,
+        Rotation.EffectiveSequence, True);
     end;
     Source.Store := Self;
     Source.Progress := AProgress;
-    Result := VerifyRegistryProof(Proof, Trust, Accepted(AState), RegistryTimestampNow,
-      rvmLockedProof, Source, DefaultRegistryVerificationLimits);
+    Result := VerifyRegistryProof(Proof, Trust, Accepted(AState, Proof.Checkpoint),
+      RegistryTimestampNow, rvmLockedProof, Source, DefaultRegistryVerificationLimits);
   finally
-    Sequences.Free;
     Budget.Free;
     Source.Free;
+  end;
+end;
+
+function TLWPTRegistryMirror.BuildGeneration(const AKey: string;
+  const AState: TLWPTRegistryState;
+  const AVerified: TLWPTVerifiedRegistry): TLWPTRegistryGeneration;
+var
+  Document: TLWPTRegistryDocument;
+  Package: TLWPTRegistryPackage;
+  Binding: TLWPTRegistryRotationBinding;
+  Rotation: TLWPTUntrustedRegistryRotation;
+  Index: Integer;
+  Prefix: string;
+begin
+  Result := TLWPTRegistryGeneration.Create(AKey);
+  try
+    Result.Add(AState.CheckpointPath, AState.CheckpointPath, AState.CheckpointHash);
+    Result.Add(AState.SignaturePath, AState.SignaturePath,
+      SHA256BytesPrefixed(AVerified.Proof.Signature));
+    Result.Add(RegistryKeyStoragePath(Config.TrustKeyID),
+      ProofPath(AState.TrustKeyDocument), AState.TrustKeyDocument);
+    for Index := 0 to High(AState.Rotations) do
+    begin
+      Binding := AState.Rotations[Index];
+      Rotation := InspectRegistryRotation(AVerified.Proof.Rotations[Index].Document);
+      Prefix := 'rotations/' + IntToStr(Binding.Sequence);
+      Result.Add(Prefix + '.toml', ProofPath(Binding.Document), Binding.Document);
+      Result.Add(Prefix + '.old.sig.toml', ProofPath(Binding.OldSignature), Binding.OldSignature);
+      Result.Add(Prefix + '.new.sig.toml', ProofPath(Binding.NewSignature), Binding.NewSignature);
+      Result.Add(RegistryKeyStoragePath(Rotation.ToKey), ProofPath(Binding.KeyDocument),
+        Binding.KeyDocument);
+      Result.AddRotation(Binding.Sequence);
+    end;
+    for Document in AVerified.Documents do
+      if StartsStr('snapshots/sha256/', Document.Path) then
+        Result.Add(Document.Path, Document.Path,
+          DigestFromPath(Document.Path, 'snapshots/sha256/', '.toml'))
+      else if StartsStr('records/sha256/', Document.Path) then
+        Result.Add(Document.Path, Document.Path,
+          DigestFromPath(Document.Path, 'records/sha256/', '.toml'));
+    { Identities cannot leave history, so the head's archives are the complete
+      accepted object set. }
+    for Package in AVerified.Packages do
+      Result.Add('objects/sha256/' + Copy(Package.ArchiveHash, 8, 64),
+        'objects/sha256/' + Copy(Package.ArchiveHash, 8, 64), Package.ArchiveHash);
+  except
+    Result.Free;
+    raise;
   end;
 end;
 
@@ -494,6 +787,7 @@ begin
   { Verified immutable resources survive interrupted synchronization. There is
     no origin seed, derived publication index, or temporary-directory sweep. }
   if FileExists(RootPath('state/current.toml')) then LoadCurrentState;
+  MarkAbandonedAttempt;
 end;
 
 function TLWPTRegistryMirror.LoadCurrentState(AProgress: TSHA256Progress): TLWPTRegistryState;
@@ -504,48 +798,92 @@ end;
 
 function TLWPTRegistryMirror.CaptureReadView(AProgress: TSHA256Progress): TLWPTRegistryReadView;
 var
+  StateBytes: TBytes;
+  Key: string;
   State: TLWPTRegistryState;
-  Verified: TLWPTVerifiedRegistry;
-  Document: TLWPTRegistryDocument;
-  RotationProof: TLWPTRegistryRotationProof;
-  Rotation: TLWPTUntrustedRegistryRotation;
-  Prefix: string;
-  Paths, Rotations: TStringList;
+  Generation: TLWPTRegistryGeneration;
+  Reference: IInterface;
 begin
-  State := ReadCurrentState(AProgress);
-  Verified := VerifyStateProof(State, AProgress);
-  Paths := TStringList.Create;
-  Rotations := TStringList.Create;
+  StateBytes := ReadCurrentStateBytes(AProgress);
+  Key := SHA256BytesPrefixed(StateBytes);
+  EnterGeneration(AProgress);
   try
-    Paths.Add(State.CheckpointPath);
-    Paths.Add(State.SignaturePath);
-    Paths.Add(RegistryKeyStoragePath(Config.TrustKeyID));
-    for Document in Verified.Documents do
-      if StartsStr('snapshots/', Document.Path) then Paths.Add(Document.Path);
-    for RotationProof in Verified.Proof.Rotations do
+    if (FGeneration = nil) or (FGeneration.Key <> Key) then
     begin
-      Rotation := InspectRegistryRotation(RotationProof.Document);
-      Rotations.Add(IntToStr(Rotation.EffectiveSequence));
-      Prefix := 'rotations/' + IntToStr(Rotation.EffectiveSequence);
-      Paths.Add(Prefix + '.toml');
-      Paths.Add(Prefix + '.old.sig.toml');
-      Paths.Add(Prefix + '.new.sig.toml');
-      Paths.Add(RegistryKeyStoragePath(Rotation.ToKey));
+      State := StateFromBytes(StateBytes);
+      Generation := BuildGeneration(Key, State, VerifyStateProof(State, AProgress));
+      Reference := Generation;
+      FGeneration := Generation;
+      FGenerationReference := Reference;
+      FGenerationState := State;
     end;
-    Result := TLWPTRegistryReadView.Create(Self, State, Paths, Rotations);
-    Paths := nil;
-    Rotations := nil;
+    Result := TLWPTRegistryReadView.Create(Self, FGenerationState, FGeneration);
   finally
-    Rotations.Free;
-    Paths.Free;
+    LeaveGeneration;
   end;
 end;
 
-procedure TLWPTRegistryMirror.SaveAttempt(const AOutcome: string);
+function NewAttemptID: string;
 begin
-  AtomicWriteBytes(RootPath(MIRROR_ATTEMPT_PATH), TmpRoot,
-    Bytes('attempted_at = ' + RegistryTOMLQuote(RegistryTimestampNow) + #10
-      + 'outcome = ' + RegistryTOMLQuote(AOutcome) + #10));
+  Result := Copy(SHA256Hex(RegistryTextBytes(RegistryTimestampNow + ':'
+    + IntToStr(GetProcessID) + ':' + IntToStr(GetTickCount64) + ':'
+    + IntToStr(Random(MaxInt)))), 1, 26);
+end;
+
+procedure TLWPTRegistryMirror.SaveAttempt(const AOutcome, AError: string);
+var
+  Document: string;
+begin
+  Document := 'attempt_id = ' + RegistryTOMLQuote(FAttemptID) + #10
+    + 'started_at = ' + RegistryTOMLQuote(FAttemptStartedAt) + #10
+    + 'attempted_at = ' + RegistryTOMLQuote(RegistryTimestampNow) + #10
+    + 'outcome = ' + RegistryTOMLQuote(AOutcome) + #10;
+  if AError <> '' then Document := Document + 'error = ' + RegistryTOMLQuote(AError) + #10;
+  ForceDirectories(TmpRoot);
+  AtomicWriteBytes(RootPath(MirrorAttemptPath), TmpRoot, RegistryTextBytes(Document));
+end;
+
+procedure TLWPTRegistryMirror.BeginAttempt;
+begin
+  FAttemptID := NewAttemptID;
+  FAttemptStartedAt := RegistryTimestampNow;
+  ForceDirectories(TmpRoot);
+  SaveAttempt('in_progress', '');
+end;
+
+{ An in-progress record whose lease is free belongs to a process that stopped
+  without recording its result. }
+procedure TLWPTRegistryMirror.MarkAbandonedAttempt;
+var
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
+  Parser: TTOMLParser;
+  Root: TTOMLNode;
+begin
+  if not FileExists(RootPath(MirrorAttemptPath)) then Exit;
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
+  Lease := nil;
+  Parser := TTOMLParser.Create;
+  Root := nil;
+  try
+    Lease := Coordinator.TryAcquire('registry-publication', 'registry mirror attempt recovery');
+    if not Assigned(Lease) then Exit;
+    try
+      Root := Parser.ParseDocument(RegistryBytesText(LoadResource(MirrorAttemptPath,
+        nil, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES)));
+    except
+      on E: ETOMLParseError do Exit;
+    end;
+    if TomlStr(Root, 'outcome', '') <> 'in_progress' then Exit;
+    FAttemptID := TomlStr(Root, 'attempt_id', '');
+    FAttemptStartedAt := TomlStr(Root, 'started_at', '');
+    SaveAttempt('abandoned', 'synchronization stopped before recording a result');
+  finally
+    Root.Free;
+    Parser.Free;
+    Lease.Free;
+    Coordinator.Free;
+  end;
 end;
 
 procedure TLWPTRegistryMirror.Synchronize;
@@ -558,7 +896,7 @@ var
   Verified, PriorVerified: TLWPTVerifiedRegistry;
   Source: TMirrorDocumentSource;
   State: TLWPTRegistryState;
-  Document, KeyDocument: TBytes;
+  Document, KeyDocument, NextCheckpoint: TBytes;
   HasRotations: Boolean;
   Prefix: string;
   Budget: TLWPTRegistryMetadataBudget;
@@ -566,14 +904,15 @@ var
   Rotation: TLWPTUntrustedRegistryRotation;
   RotationProof: TLWPTRegistryRotationProof;
   KeyTrust: TLWPTRegistryTrust;
-  KeyDocuments: TLWPTRegistryDocumentArray;
-  KeyResource: TLWPTRegistryDocument;
+  Bindings: TLWPTRegistryRotationBindingArray;
   Page: TLWPTRegistryRotationPage;
   PageItem: TLWPTRegistryRotationPageItem;
   Cursors: TStringList;
-  PageSize, Index: Integer;
+  PageSize, Index, PairAttempt: Integer;
   AfterSequence, PreviousSequence, PinnedSequence: Int64;
-  CurrentKey, Cursor, PageURL: string;
+  CurrentKey, CurrentPublicKey, Cursor, PageURL, SignatureURL: string;
+  AcceptedGeneration: TLWPTRegistryGeneration;
+  AcceptedReference: IInterface;
 
   function Control(const AURL, AKind: string; const AAuxiliary: Boolean = True): TBytes;
   var
@@ -581,26 +920,36 @@ var
   begin
     Allowance := Budget.Allowance;
     if Allowance > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then Allowance := MAX_REGISTRY_CONTROL_DOCUMENT_BYTES;
-    Result := GetDocument(AURL, 'application/vnd.' + PROGRAM_NAME + '.registry-' + AKind + '+toml', Allowance);
+    Result := GetDocument(AURL, 'application/vnd.' + PROGRAM_NAME + '.registry-' + AKind + '+toml',
+      Allowance, RemainingSynchronizationMilliseconds);
     Budget.Account(Result);
     if AAuxiliary then RememberRetrieval(Proof, Result);
   end;
 
-  procedure KeepKey(const AKeyID: string; const ABytes: TBytes);
-  var
-    KeyIndex: Integer;
-  begin
-    KeyIndex := Length(KeyDocuments);
-    SetLength(KeyDocuments, KeyIndex + 1);
-    KeyDocuments[KeyIndex].Path := RegistryKeyStoragePath(AKeyID);
-    KeyDocuments[KeyIndex].Bytes := ABytes;
-  end;
-
   procedure RequireScope(const AURL: string);
   begin
-    if not StartsStr(Config.UpstreamURL + '/', AURL) then
+    if not StartsStr(Config.UpstreamURL + '/', AURL)
+      or not EndpointSuffixIsUnambiguous(Copy(AURL, Length(Config.UpstreamURL) + 2, MaxInt)) then
       raise ELWPTRegistryError.CreateStable('registry_discovery_scope_mismatch',
-        'discovery endpoint escapes configured transport');
+        'discovery endpoint escapes or ambiguously encodes the configured transport');
+  end;
+
+  procedure Bind(const ARotation: TLWPTRegistryRotationProof; const ASequence: Int64;
+    const AKeyDocument: TBytes);
+  var
+    BindingIndex: Integer;
+  begin
+    BindingIndex := Length(Bindings);
+    SetLength(Bindings, BindingIndex + 1);
+    Bindings[BindingIndex].Sequence := ASequence;
+    Bindings[BindingIndex].Document := SHA256BytesPrefixed(ARotation.Document);
+    Bindings[BindingIndex].OldSignature := SHA256BytesPrefixed(ARotation.OldSignature);
+    Bindings[BindingIndex].NewSignature := SHA256BytesPrefixed(ARotation.NewSignature);
+    Bindings[BindingIndex].KeyDocument := SHA256BytesPrefixed(AKeyDocument);
+    WriteBudgeted(ProofPath(Bindings[BindingIndex].Document), ARotation.Document);
+    WriteBudgeted(ProofPath(Bindings[BindingIndex].OldSignature), ARotation.OldSignature);
+    WriteBudgeted(ProofPath(Bindings[BindingIndex].NewSignature), ARotation.NewSignature);
+    WriteBudgeted(ProofPath(Bindings[BindingIndex].KeyDocument), AKeyDocument);
   end;
 begin
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
@@ -609,18 +958,29 @@ begin
   Budget := TLWPTRegistryMetadataBudget.Create(DefaultRegistryVerificationLimits);
   Cursors := TStringList.Create;
   Proof := Default(TLWPTRegistryProof);
+  Bindings := nil;
+  AcceptedGeneration := nil;
   try
     Lease := Coordinator.TryAcquire('registry-publication', 'registry mirror synchronization');
     if not Assigned(Lease) then
       raise ELWPTRegistryError.CreateStable('publication_locked', 'another synchronization owns this mirror');
+    BeginAttempt;
     try
+      FSynchronizationDeadline := GetTickCount64 + MirrorSynchronizationMilliseconds;
+      {$IFDEF REGISTRY_TESTING}
+      if FSynchronizationMilliseconds > 0 then
+        FSynchronizationDeadline := GetTickCount64 + FSynchronizationMilliseconds;
+      {$ENDIF}
       Prior := Default(TLWPTRegistryAcceptedState);
       if FileExists(RootPath('state/current.toml')) then
       begin
         State := ReadCurrentState;
         PriorVerified := VerifyStateProof(State);
-        Prior := Accepted(State);
+        Prior := Accepted(State, PriorVerified.Proof.Checkpoint);
+        AcceptedGeneration := BuildGeneration('', State, PriorVerified);
+        AcceptedReference := AcceptedGeneration;
         Proof.Rotations := PriorVerified.Proof.Rotations;
+        Bindings := Copy(State.Rotations);
         for RotationProof in Proof.Rotations do
         begin
           Budget.Account(RotationProof.Document);
@@ -628,8 +988,9 @@ begin
           Budget.Account(RotationProof.NewSignature);
         end;
       end;
+      PrepareStorageBudget(AcceptedGeneration);
       Document := Control(Config.UpstreamURL + '/.well-known/' + PROGRAM_NAME + '-registry', 'discovery');
-      Discovery := ParseRegistryDiscovery(Text(Document));
+      Discovery := ParseRegistryDiscovery(RegistryBytesText(Document));
       if Discovery.Origin <> Config.Identity then
         raise ELWPTRegistryError.CreateStable('registry_origin_mismatch', 'discovery changed the pinned identity');
       if Discovery.BaseURL <> Config.UpstreamURL then
@@ -639,24 +1000,43 @@ begin
       RequireScope(Discovery.Checkpoint);
       if Discovery.Rotations <> '' then RequireScope(Discovery.Rotations);
       Document := Control(Discovery.Capabilities, 'capabilities');
-      PageSize := ValidateRegistryCapabilities(Text(Document), Discovery.RoleName, HasRotations);
-      if PageSize > 100 then PageSize := 100;
+      PageSize := ValidateRegistryCapabilities(RegistryBytesText(Document), Discovery.RoleName, HasRotations);
+      if PageSize > RegistryRotationPageLimit then PageSize := RegistryRotationPageLimit;
       if HasRotations <> (Discovery.Rotations <> '') then
         raise ELWPTRegistryError.CreateStable('registry_rotation_capability_mismatch', 'inconsistent discovery capabilities');
+      SignatureURL := Copy(Discovery.Checkpoint, 1, Length(Discovery.Checkpoint) - 5) + '.sig.toml';
       Proof.Checkpoint := Control(Discovery.Checkpoint, 'checkpoint', False);
-      Proof.Signature := Control(Copy(Discovery.Checkpoint, 1, Length(Discovery.Checkpoint) - 5)
-        + '.sig.toml', 'signature', False);
+      PairAttempt := 1;
+      repeat
+        Proof.Signature := Control(SignatureURL, 'signature', False);
+        try
+          if InspectRegistrySignaturePayload(Proof.Signature)
+            = SHA256BytesPrefixed(Proof.Checkpoint) then Break;
+        except
+          on E: ELWPTRegistryError do Break;
+        end;
+        { An unchanged checkpoint means the pair is genuinely inconsistent;
+          verification reports it. Only an advancing checkpoint is retried. }
+        if PairAttempt >= MirrorCheckpointPairAttempts then Break;
+        Inc(PairAttempt);
+        NextCheckpoint := Control(Discovery.Checkpoint, 'checkpoint', False);
+        if SHA256BytesPrefixed(NextCheckpoint) = SHA256BytesPrefixed(Proof.Checkpoint) then Break;
+        Proof.Checkpoint := NextCheckpoint;
+      until False;
       Hint := InspectRegistryCheckpoint(Proof.Checkpoint);
+      { The root key record's effective sequence is unsigned retrieval data.
+        It is bound to this attempt's state only, never to a fixed path. }
       KeyDocument := Control(Discovery.API + '/keys/' + Config.TrustKeyID + '.toml', 'key');
       PinnedSequence := ValidateRegistryKeyDocument(KeyDocument, Trust, Hint.Sequence);
-      KeepKey(Config.TrustKeyID, KeyDocument);
       CurrentKey := Config.TrustKeyID;
+      CurrentPublicKey := Config.TrustPublicKey;
       AfterSequence := 0;
       if PinnedSequence > 1 then AfterSequence := PinnedSequence;
       if Length(Proof.Rotations) > 0 then
       begin
         Rotation := InspectRegistryRotation(Proof.Rotations[High(Proof.Rotations)].Document);
         CurrentKey := Rotation.ToKey;
+        CurrentPublicKey := Rotation.ToPublicKey;
         AfterSequence := Rotation.EffectiveSequence;
       end;
       PreviousSequence := AfterSequence;
@@ -664,7 +1044,8 @@ begin
       while CurrentKey <> Hint.KeyId do
       begin
         if not HasRotations then
-          raise ELWPTRegistryError.Create('registry_key_rotation_incomplete');
+          raise ELWPTRegistryError.CreateStable('registry_key_rotation_incomplete',
+            'checkpoint key is untrusted and the upstream offers no rotation chain');
         PageURL := Discovery.Rotations + '?after=' + IntToStr(AfterSequence)
           + '&limit=' + IntToStr(PageSize);
         if Cursor <> '' then PageURL := PageURL + '&cursor=' + RegistryQueryEncode(Cursor);
@@ -675,36 +1056,38 @@ begin
         begin
           if (PageItem.EffectiveSequence > Hint.Sequence)
             or (Length(Proof.Rotations) >= DefaultRegistryVerificationLimits.Rotations) then
-            raise ELWPTRegistryError.Create('rotation_chain_invalid');
+            raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
+              'rotation page exceeds the checkpoint or rotation limit');
           RotationProof.Document := Control(PageItem.Rotation, 'key-rotation', False);
-          Rotation := InspectRegistryRotation(RotationProof.Document);
-          if (Rotation.Origin <> Config.Identity) or (Rotation.FromKey <> CurrentKey)
-            or (Rotation.EffectiveSequence <> PageItem.EffectiveSequence) then
-            raise ELWPTRegistryError.Create('rotation_chain_invalid');
           RotationProof.OldSignature := Control(PageItem.OldSignature, 'signature', False);
           RotationProof.NewSignature := Control(PageItem.NewSignature, 'signature', False);
+          { Authenticate this transition before trusting its key or following
+            any further page item. }
+          Rotation := VerifyRegistryRotation(RotationProof, Config.Identity, CurrentKey,
+            CurrentPublicKey, PreviousSequence, Hint.Sequence);
+          if Rotation.EffectiveSequence <> PageItem.EffectiveSequence then
+            raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
+              'rotation page item names a different sequence');
+          KeyTrust.Origin := Config.Identity;
+          KeyTrust.KeyId := Rotation.ToKey;
+          KeyTrust.PublicKey := Rotation.ToPublicKey;
+          Document := Control(Discovery.API + '/keys/' + Rotation.ToKey + '.toml', 'key');
+          ValidateRegistryKeyDocument(Document, KeyTrust, Rotation.EffectiveSequence, True);
           Index := Length(Proof.Rotations);
           SetLength(Proof.Rotations, Index + 1);
           Proof.Rotations[Index] := RotationProof;
+          Bind(RotationProof, Rotation.EffectiveSequence, Document);
           CurrentKey := Rotation.ToKey;
+          CurrentPublicKey := Rotation.ToPublicKey;
           PreviousSequence := Rotation.EffectiveSequence;
           if CurrentKey = Hint.KeyId then Break;
         end;
         if CurrentKey = Hint.KeyId then Break;
         if (Page.NextCursor = '') or (Cursors.IndexOf(Page.NextCursor) >= 0) then
-          raise ELWPTRegistryError.Create('registry_key_rotation_incomplete');
+          raise ELWPTRegistryError.CreateStable('registry_key_rotation_incomplete',
+            'rotation pages end before the checkpoint key');
         Cursors.Add(Page.NextCursor);
         Cursor := Page.NextCursor;
-      end;
-      for RotationProof in Proof.Rotations do
-      begin
-        Rotation := InspectRegistryRotation(RotationProof.Document);
-        KeyTrust.Origin := Config.Identity;
-        KeyTrust.KeyId := Rotation.ToKey;
-        KeyTrust.PublicKey := Rotation.ToPublicKey;
-        KeyDocument := Control(Discovery.API + '/keys/' + Rotation.ToKey + '.toml', 'key');
-        ValidateRegistryKeyDocument(KeyDocument, KeyTrust, Rotation.EffectiveSequence, True);
-        KeepKey(Rotation.ToKey, KeyDocument);
       end;
       Source := TMirrorDocumentSource.Create;
       Source.Store := Self;
@@ -718,26 +1101,21 @@ begin
       Verified := VerifyRegistryProof(Proof, Trust, Prior, RegistryTimestampNow,
         rvmAcquire, Source, DefaultRegistryVerificationLimits);
       State := Default(TLWPTRegistryState);
+      State.Role := rrMirror;
       State.Sequence := Verified.State.Sequence;
       State.SnapshotHash := Verified.State.Snapshot;
       State.CheckpointHash := Verified.State.CheckpointHash;
       State.TrustKeyID := Verified.State.KeyId;
       State.TrustPublicKey := Verified.State.PublicKey;
+      State.TrustKeyDocument := SHA256BytesPrefixed(KeyDocument);
+      State.Rotations := Bindings;
       Prefix := 'checkpoints/renewals/sha256/' + Copy(State.CheckpointHash, 8, 64);
       State.CheckpointPath := Prefix + '.toml';
       State.SignaturePath := Prefix + '.sig.toml';
-      WriteImmutable(State.CheckpointPath, Proof.Checkpoint);
-      WriteImmutable(State.SignaturePath, Proof.Signature);
-      for KeyResource in KeyDocuments do WriteImmutable(KeyResource.Path, KeyResource.Bytes);
-      for RotationProof in Proof.Rotations do
-      begin
-        Rotation := InspectRegistryRotation(RotationProof.Document);
-        Prefix := 'rotations/' + IntToStr(Rotation.EffectiveSequence);
-        WriteImmutable(Prefix + '.toml', RotationProof.Document);
-        WriteImmutable(Prefix + '.old.sig.toml', RotationProof.OldSignature);
-        WriteImmutable(Prefix + '.new.sig.toml', RotationProof.NewSignature);
-      end;
-      SaveAttempt('verified');
+      WriteBudgeted(State.CheckpointPath, Proof.Checkpoint);
+      WriteBudgeted(State.SignaturePath, Proof.Signature);
+      WriteBudgeted(ProofPath(State.TrustKeyDocument), KeyDocument);
+      SaveAttempt('verified', '');
       { All immutable files are closed and verified before this atomic pointer.
         This is process-interruption recovery, not an fsync power-loss promise. }
       {$IFDEF REGISTRY_TESTING}
@@ -745,16 +1123,29 @@ begin
       {$ENDIF}
       State.LastSync := RegistryTimestampNow;
       if Verified.ExpiresAt <= State.LastSync then
-        raise ELWPTRegistryError.Create('checkpoint_expired');
+        raise ELWPTRegistryStaleContactError.CreateStable('checkpoint_expired',
+          'checkpoint expired before activation');
       ActivateState(State);
     except
       on E: Exception do
       begin
-        SaveAttempt(E.Message);
+        { Recording is best-effort; the synchronization failure is primary. }
+        try
+          SaveAttempt('failed', E.Message);
+        except
+          on Exception do;
+        end;
         raise;
       end;
     end;
+    try
+      SaveAttempt('activated', '');
+    except
+      on Exception do;
+    end;
   finally
+    FSynchronizationDeadline := 0;
+    AcceptedReference := nil;
     Cursors.Free;
     Budget.Free;
     Source.Free;
@@ -762,6 +1153,59 @@ begin
     Coordinator.Free;
   end;
 end;
+
+{$IFDEF REGISTRY_TESTING}
+procedure TLWPTRegistryMirror.RetainForTesting(const AVerified: TLWPTVerifiedRegistry;
+  const AKeyDocuments: array of TBytes; const ALastSync: string);
+var
+  State: TLWPTRegistryState;
+  Document: TLWPTRegistryDocument;
+  Rotation: TLWPTRegistryRotationProof;
+  Binding: TLWPTRegistryRotationBinding;
+  Index: Integer;
+  Prefix: string;
+begin
+  for Document in AVerified.Documents do WriteImmutable(Document.Path, Document.Bytes);
+  State := Default(TLWPTRegistryState);
+  State.Role := rrMirror;
+  State.Sequence := AVerified.State.Sequence;
+  State.SnapshotHash := AVerified.State.Snapshot;
+  State.TrustKeyID := AVerified.State.KeyId;
+  State.TrustPublicKey := AVerified.State.PublicKey;
+  State.CheckpointHash := AVerified.State.CheckpointHash;
+  State.LastSync := ALastSync;
+  State.TrustKeyDocument := SHA256BytesPrefixed(AKeyDocuments[0]);
+  WriteImmutable(ProofPath(State.TrustKeyDocument), AKeyDocuments[0]);
+  SetLength(State.Rotations, Length(AVerified.Proof.Rotations));
+  for Index := 0 to High(AVerified.Proof.Rotations) do
+  begin
+    Rotation := AVerified.Proof.Rotations[Index];
+    Binding.Sequence := InspectRegistryRotation(Rotation.Document).EffectiveSequence;
+    Binding.Document := SHA256BytesPrefixed(Rotation.Document);
+    Binding.OldSignature := SHA256BytesPrefixed(Rotation.OldSignature);
+    Binding.NewSignature := SHA256BytesPrefixed(Rotation.NewSignature);
+    Binding.KeyDocument := SHA256BytesPrefixed(AKeyDocuments[Index + 1]);
+    WriteImmutable(ProofPath(Binding.Document), Rotation.Document);
+    WriteImmutable(ProofPath(Binding.OldSignature), Rotation.OldSignature);
+    WriteImmutable(ProofPath(Binding.NewSignature), Rotation.NewSignature);
+    WriteImmutable(ProofPath(Binding.KeyDocument), AKeyDocuments[Index + 1]);
+    State.Rotations[Index] := Binding;
+  end;
+  Prefix := 'checkpoints/renewals/sha256/' + Copy(State.CheckpointHash, 8, 64);
+  State.CheckpointPath := Prefix + '.toml';
+  State.SignaturePath := Prefix + '.sig.toml';
+  WriteImmutable(State.CheckpointPath, AVerified.Proof.Checkpoint);
+  WriteImmutable(State.SignaturePath, AVerified.Proof.Signature);
+  ActivateState(State);
+end;
+
+procedure RegistryMirrorRetainForTesting(AMirror: TLWPTRegistryMirror;
+  const AVerified: TLWPTVerifiedRegistry; const AKeyDocuments: array of TBytes;
+  const ALastSync: string);
+begin
+  AMirror.RetainForTesting(AVerified, AKeyDocuments, ALastSync);
+end;
+{$ENDIF}
 
 function TLWPTRegistryMirror.VerifyMirror: string;
 var
@@ -794,8 +1238,9 @@ begin
       + 'last_successful_sync = ' + RegistryTOMLQuote(State.LastSync) + #10;
   end
   else Result := Result + 'freshness = "uninitialized"' + #10;
-  if FileExists(RootPath(MIRROR_ATTEMPT_PATH)) then
-    Result := Result + Text(LoadResource(MIRROR_ATTEMPT_PATH, nil, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+  if FileExists(RootPath(MirrorAttemptPath)) then
+    Result := Result + RegistryBytesText(LoadResource(MirrorAttemptPath, nil,
+      MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
 end;
 
 end.

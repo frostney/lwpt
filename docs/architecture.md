@@ -16,8 +16,13 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 - **The registry origin is self-hosted.** `lwpt registry init|serve` owns stable
   identity, content-addressed archives and metadata, atomically activated
   signed snapshots, crash recovery, and the foreground HTTP/TLS lifecycle per
-  [ADR-0043](./adr/0043-self-hosted-registry-origin.md). Publication, clients,
-  and mirrors build on the wire contract in [`registry-spec.md`](./registry-spec.md).
+  [ADR-0043](./adr/0043-self-hosted-registry-origin.md). `registry rotate-key`
+  adds dual-signed local key rotation, and `registry init --role mirror` with
+  `registry sync|verify|serve` runs a read-only mirror. The mirror verifies the
+  origin's signed proof and serves it without contacting the origin while it
+  serves requests, per [ADR-0045](./adr/0045-verified-registry-mirror.md).
+  Publication and clients build on the wire contract in
+  [`registry-spec.md`](./registry-spec.md).
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
 - **Compiler work is session-private.** Build/test compiler outputs stay below a project-owned build-session root (project-local by default, relocatable for path budget); successful build outputs are revalidated and atomically published, while completed-session logs remain available until `lwpt repair` reclaims the session. See ADR-0020.
 - **Build scheduling follows the manifest DAG.** Ready build entries overlap within
@@ -369,7 +374,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
 `LWPT.GitProtocol.pas`, and the `LWPT.Registry.*` origin storage, signing,
-HTTP routing, and native macOS listener units) plus a small remainder of utility units
+shared proof verification, mirror synchronization, HTTP routing, and native
+macOS listener units) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
 LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` —
 live under `packages/<name>/` per

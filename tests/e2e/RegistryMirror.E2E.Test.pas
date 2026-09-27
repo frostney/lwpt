@@ -44,6 +44,7 @@ type
     procedure SignedRotationsSurviveOutage;
     procedure ReadinessPreservesCLIDiagnostic;
     procedure BootstrapConsumesMultipleRotationPages;
+    procedure ByteBudgetsAreMirrorInitOptions;
   end;
 
 function ReadBytes(const APath: string): TBytes;
@@ -113,7 +114,7 @@ begin
   FScratch := CreateScratchRoot('registry-mirror-e2e');
   FOrigin := TRegistryOriginFixture.Create(FScratch + '/origin');
   FMirrorRoot := FScratch + '/mirror';
-  Port := ReserveRegistryTestPort;
+  Port := FindAvailableRegistryTestPort;
   FMirrorURL := 'http://localhost:' + IntToStr(Port) + '/mirror';
 end;
 
@@ -222,7 +223,7 @@ begin
   FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
   FOrigin.Stop;
   Checkpoint := Text(RegistryHTTPBody(FMirrorURL + '/v1/checkpoints/latest.toml'));
-  Port := ReserveRegistryTestPort;
+  Port := FindAvailableRegistryTestPort;
   ClientURL := 'http://localhost:' + IntToStr(Port) + '/client';
   ClientRoot := FScratch + '/client';
   RequireSuccess('second mirror pins origin while contacting first mirror', InitClient(ClientRoot, FMirrorURL));
@@ -341,21 +342,31 @@ end;
 
 procedure TRegistryMirrorE2E.UpstreamKeyBytesArePreserved;
 var
-  KeyPath, KeyDocument: string;
+  KeyPath, HonestDocument, KeyDocument: string;
 begin
   FOrigin.Publish('package', '1.0.0', BytesOf('archive'));
   KeyPath := '/keys/ed25519-' + Copy(FOrigin.KeyID, Length('ed25519:') + 1, 64) + '.toml';
-  KeyDocument := StringReplace(Text(ReadBytes(FOrigin.Root + KeyPath)),
+  HonestDocument := Text(ReadBytes(FOrigin.Root + KeyPath));
+  KeyDocument := StringReplace(HonestDocument,
     'valid_from_sequence = 1', 'valid_from_sequence = 2', []);
   WriteBytes(FOrigin.Root + KeyPath, BytesOf(KeyDocument));
   FOrigin.Start;
   RequireSuccess('mirror init pins key effective at current sequence',
     InitMirror(FOrigin.KeyID, FOrigin.PublicKey));
   RequireSuccess('mirror sync preserves upstream key record', Sync);
-  Expect<string>(Text(ReadBytes(FMirrorRoot + KeyPath))).ToBe(KeyDocument);
   FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
   Expect<string>(Text(RegistryHTTPBody(FMirrorURL + '/v1/keys/'
     + FOrigin.KeyID + '.toml'))).ToBe(KeyDocument);
+  StopRegistryCLI(FMirrorServer);
+  { The unsigned effective sequence is bound to one accepted state only; the
+    upstream's corrected record replaces it on the next synchronization. }
+  WriteBytes(FOrigin.Root + KeyPath, BytesOf(HonestDocument));
+  RequireSuccess('corrected upstream key record rebinds', Sync);
+  RequireSuccess('verify rebound key record offline',
+    RunLwpt(['registry', 'verify', '--data-dir', FMirrorRoot]));
+  FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
+  Expect<string>(Text(RegistryHTTPBody(FMirrorURL + '/v1/keys/'
+    + FOrigin.KeyID + '.toml'))).ToBe(HonestDocument);
 end;
 
 procedure TRegistryMirrorE2E.SignedRotationsSurviveOutage;
@@ -575,6 +586,40 @@ begin
   end;
 end;
 
+procedure TRegistryMirrorE2E.ByteBudgetsAreMirrorInitOptions;
+var
+  Port: string;
+  Run: TLwptResult;
+  Config: string;
+
+  function InitWith(const AStore, ASync: string): TLwptResult;
+  begin
+    Result := RunLwpt(['registry', 'init', '--role', 'mirror', '--data-dir', FMirrorRoot,
+      '--identity', FOrigin.BaseURL, '--base-url', FMirrorURL, '--port', Port,
+      '--upstream', FOrigin.BaseURL, '--key-id', FOrigin.KeyID,
+      '--public-key', FOrigin.PublicKey, '--max-store-bytes', AStore,
+      '--max-sync-bytes', ASync]);
+  end;
+begin
+  Port := Copy(FMirrorURL, Length('http://localhost:') + 1, MaxInt);
+  Port := Copy(Port, 1, Pos('/', Port) - 1);
+  Run := InitWith('4194304', '8388608');
+  Expect<Integer>(Run.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('invalid_configuration:', Run.Stderr) > 0).ToBe(True);
+  Expect<Integer>(InitWith('0', '1048576').ExitCode).ToBe(1);
+  Expect<Boolean>(FileExists(FMirrorRoot + '/registry.toml')).ToBe(False);
+  RequireSuccess('mirror init with explicit byte budgets', InitWith('4194304', '2097152'));
+  Config := Text(ReadBytes(FMirrorRoot + '/registry.toml'));
+  Expect<Boolean>(Pos('max_store_bytes = 4194304' + #10, Config) > 0).ToBe(True);
+  Expect<Boolean>(Pos('max_sync_bytes = 2097152' + #10, Config) > 0).ToBe(True);
+  Run := RunLwpt(['registry', 'init', '--data-dir', FScratch + '/origin-budget',
+    '--max-store-bytes', '4194304']);
+  Expect<Integer>(Run.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('mirror-only', Run.Stderr) > 0).ToBe(True);
+  Expect<Integer>(RunLwpt(['registry', 'sync', '--data-dir', FMirrorRoot,
+    '--max-sync-bytes', '2097152']).ExitCode).ToBe(1);
+end;
+
 procedure TRegistryMirrorE2E.SetupTests;
 begin
   Test('CLI mirror bootstrap survives origin outage and restart', BootstrapOutageAndRestart);
@@ -582,11 +627,12 @@ begin
   Test('incremental and idempotent sync reuse verified objects', IncrementalSyncReusesVerifiedObjects);
   Test('tampered or missing objects preserve the live accepted pointer', FailedSyncPreservesAcceptedPointer);
   Test('missing and wrong root pins fail without trust replacement', MissingAndWrongPinsFailClosed);
-  Test('mirror preserves exact pinned upstream key bytes', UpstreamKeyBytesArePreserved);
+  Test('mirror preserves exact upstream key bytes and rebinds a corrected record', UpstreamKeyBytesArePreserved);
   Test('shared listener shutdown force-kills and reaps within its bound', ForcedShutdownIsBounded);
   Test('signed rotation bootstrap and incremental retry retain offline provenance', SignedRotationsSurviveOutage);
   Test('readiness failures retain the original CLI diagnostic and exit status', ReadinessPreservesCLIDiagnostic);
   Test('bootstrap consumes multiple bounded rotation pages with exact signed bytes', BootstrapConsumesMultipleRotationPages);
+  Test('byte budgets are validated mirror init options', ByteBudgetsAreMirrorInitOptions);
 end;
 
 begin

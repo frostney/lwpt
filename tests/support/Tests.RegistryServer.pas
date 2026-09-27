@@ -6,10 +6,14 @@ unit Tests.RegistryServer;
 interface
 
 uses
+  {$IFDEF UNIX}
+  Sockets,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  WinSock2,
+  {$ENDIF}
   Classes,
-  SysUtils
-  {$IFDEF UNIX}, Sockets {$ENDIF}
-  {$IFDEF MSWINDOWS}, Windows, WinSock2 {$ENDIF};
+  SysUtils;
 
 type
   {$IF DEFINED(UNIX) OR DEFINED(MSWINDOWS)}
@@ -30,6 +34,10 @@ type
     Arrived: PLongInt;
   end;
   TRegistryHTTPRouteArray = array of TRegistryHTTPRoute;
+  { Optional dynamic responder for targets without a static route. It runs on
+    the serving thread and must be safe for concurrent calls. }
+  TRegistryHTTPRouteHandler = function(const ATarget: string;
+    out AMediaType: string; out ABody: TBytes): Integer of object;
 
   TRegistryTestServer = class
   private
@@ -44,6 +52,9 @@ type
     FError: string;
     FConcurrent: Boolean;
     FClients: TList;
+    FHandler: TRegistryHTTPRouteHandler;
+    FRequestLock: TRTLCriticalSection;
+    FRequestedTargets: TStringList;
     {$IFDEF MSWINDOWS}
     FWinSockStarted: Boolean;
     {$ENDIF}
@@ -58,6 +69,9 @@ type
     procedure Start;
     function WaitForRequests(const ACount: Integer;
       const ATimeoutMilliseconds: Cardinal = 5000): Boolean;
+    { A snapshot of request targets in arrival order; the caller owns it. }
+    function RequestedTargets: TStringList;
+    property Handler: TRegistryHTTPRouteHandler read FHandler write FHandler;
     property Port: Word read FPort;
     property RequestCount: Integer read FRequestCount;
     property AcceptedCount: Integer read FAcceptedCount;
@@ -311,6 +325,8 @@ begin
   inherited Create;
   FConcurrent := AConcurrent;
   FClients := TList.Create;
+  InitCriticalSection(FRequestLock);
+  FRequestedTargets := TStringList.Create;
   FListenSocket := InvalidSocketValue;
   SetRoutes(ARoutes);
   {$IFDEF MSWINDOWS}
@@ -405,6 +421,8 @@ begin
   if Assigned(FClients) then
     for I := 0 to FClients.Count - 1 do TObject(FClients[I]).Free;
   FClients.Free;
+  FRequestedTargets.Free;
+  DoneCriticalSection(FRequestLock);
   CloseTestSocket(FListenSocket);
   {$IFDEF MSWINDOWS}
   if FWinSockStarted then WinSock2.WSACleanup;
@@ -438,13 +456,19 @@ end;
 
 procedure TRegistryTestServer.ServeClient(const AClient: TRegistryTestSocket);
 var
-  I, Arrival: Integer;
-  Request, Path: string;
-  Response: TBytes;
+  I, Arrival, Status: Integer;
+  Request, Path, MediaType: string;
+  Response, Body: TBytes;
 begin
   Request := ReceiveRequest(Self, AClient);
   if Request = '' then Exit;
   Path := RequestPath(Request);
+  EnterCriticalSection(FRequestLock);
+  try
+    FRequestedTargets.Add(Path);
+  finally
+    LeaveCriticalSection(FRequestLock);
+  end;
   InterlockedIncrement(FRequestCount);
   for I := 0 to High(FRoutes) do
     if FRoutes[I].Path = Path then
@@ -458,8 +482,34 @@ begin
       SendBytes(Self, AClient, Response);
       Exit;
     end;
+  if Assigned(FHandler) then
+  begin
+    try
+      Status := FHandler(Path, MediaType, Body);
+    except
+      on E: Exception do
+      begin
+        Status := 500;
+        MediaType := 'text/plain';
+        Body := BytesOf('route handler failed: ' + E.Message);
+      end;
+    end;
+    SendBytes(Self, AClient, ResponseBytes(Status, MediaType, Body));
+    Exit;
+  end;
   Response := ResponseBytes(404, 'text/plain', BytesOf('missing route: ' + Path));
   SendBytes(Self, AClient, Response);
+end;
+
+function TRegistryTestServer.RequestedTargets: TStringList;
+begin
+  Result := TStringList.Create;
+  EnterCriticalSection(FRequestLock);
+  try
+    Result.Assign(FRequestedTargets);
+  finally
+    LeaveCriticalSection(FRequestLock);
+  end;
 end;
 
 procedure TRegistryTestServer.Serve;
