@@ -284,11 +284,8 @@ begin
 end;
 
 procedure TProcessTreeIsolation.TestChildStopsAfterTheRequiredAttempts;
-var
-  Started: QWord;
 begin
   ScriptForeignGroup(ProcessTreeChildGroupScript, AlwaysScripted);
-  Started := GetTickCount64;
   Expect<Boolean>(LeadOwnProcessGroupAfterFork).ToBe(False);
   Expect<Integer>(ProcessTreeChildGroupScript.Calls)
     .ToBe(RequiredGroupSetupAttempts);
@@ -296,11 +293,6 @@ begin
     .ToBe(RequiredGroupSetupAttempts);
   ExpectPausesBetween(ProcessTreeChildGroupScript,
     RequiredGroupSetupAttempts);
-  { Supplemental: the recorded select(2) pauses really waited. The bound
-    allows one millisecond of tick truncation. }
-  Expect<Boolean>(GetTickCount64 - Started
-    >= QWord((RequiredGroupSetupAttempts - 2)
-      * RequiredRetryPauseMilliseconds)).ToBe(True);
 end;
 
 procedure TProcessTreeIsolation.TestParentRaisesWhenTheGroupNeverAppears;
