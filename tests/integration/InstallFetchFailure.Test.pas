@@ -166,7 +166,7 @@ begin
   {$IFDEF MSWINDOWS}
   FMissingDep := StringReplace(FMissingDep, '\', '/', [rfReplaceAll]);
   {$ENDIF}
-  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
+  SetLwptBinaryPath(LwptTestingBinaryPath);
   RecursiveDelete(FScratch);
   ForceDirectories(FScratch);
   SetupScratchProject;
@@ -447,7 +447,7 @@ begin
   FOrigDir := GetCurrentDir;
   FScratch := CreateScratchRoot('install-http-fetch-failure');
   FGitFixtureRoot := FScratch + '/git-fixture';
-  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
+  SetLwptBinaryPath(LwptTestingBinaryPath);
   RecursiveDelete(FScratch);
   ForceDirectories(FGitFixtureRoot + '/refs');
   WriteTextFile(FGitFixtureRoot + '/refs/mock-dep.refs',

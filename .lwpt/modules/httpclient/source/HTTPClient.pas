@@ -29,11 +29,38 @@ type
     Redirected: Boolean;
   end;
 
+  { How a request treats destinations that resolve into address space that
+    is not routable on the public internet (see IsPrivateNetworkAddress). }
+  THTTPPrivateAddressPolicy = (
+    { No address classification; the host name is dialled as given. }
+    papAllow,
+    { Every hop, including the first, must resolve to a public address. }
+    papDeny,
+    { Once any hop has resolved to a public address, no later redirect hop
+      may resolve to a private one. A request that starts inside a private
+      network may stay there; a request that starts on the public internet
+      cannot be redirected into it. }
+    papDenyAfterPublic
+  );
+
+  { Per-request destination policy, applied to the initial request and to
+    every redirect hop. The host check runs before any name resolution, so a
+    refused host causes no DNS lookup and no connection. When a private
+    address policy is active the host is resolved once, the resolved address
+    is classified, and the connection dials that exact address; TLS still
+    verifies the peer against the host name. }
+  THTTPDestinationPolicy = record
+    { Case-insensitive exact host names; empty allows any host. }
+    AllowedHosts: TStringArray;
+    PrivateAddresses: THTTPPrivateAddressPolicy;
+  end;
+
   THTTPRequestOptions = record
     MaxResponseBodyBytes: Int64;
     MaxResponseHeaderBytes: Integer;
     RequestTimeoutMilliseconds: QWord;
     MaximumRedirects: Integer;
+    Destination: THTTPDestinationPolicy;
   end;
 
   EHTTPError = class(Exception);
@@ -49,6 +76,16 @@ type
     const AAttempt: Integer): THTTPClientSelectTestAction;
   {$ENDIF}
 
+  {$IFDEF HTTPCLIENT_TESTING}
+  { Test-only resolver seam. Production code must leave this nil. Returning
+    True supplies the address to dial for AHost and whether the destination
+    policy must treat it as private, so a loopback mock server can stand in
+    for a public host. Returning False keeps real resolution and
+    classification. Consulted only while a private address policy is active. }
+  THTTPClientResolveTestHook = function(const AHost: string;
+    out AAddress: string; out APrivate: Boolean): Boolean;
+  {$ENDIF}
+
 const
   DEFAULT_MAX_RESPONSE_BODY_BYTES = Int64(64) * 1024 * 1024;
   DEFAULT_MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
@@ -59,8 +96,22 @@ const
 var
   HTTPClientSelectTestHook: THTTPClientSelectTestHook;
 {$ENDIF}
+{$IFDEF HTTPCLIENT_TESTING}
+var
+  HTTPClientResolveTestHook: THTTPClientResolveTestHook;
+{$ENDIF}
 
 function DefaultHTTPRequestOptions: THTTPRequestOptions;
+{ True when AAddressText is not a strict public IPv4 or IPv6 literal: RFC 1918,
+  loopback, link-local (including the 169.254.169.254 metadata endpoint),
+  CGNAT, "this host", IETF protocol assignments, multicast and reserved IPv4
+  space; IPv6 loopback, unspecified, ULA, link-local and IPv4-mapped forms.
+  Anything that is not an address literal, including shortened or numeric
+  IPv4 spellings, is treated as private so it can never slip through. }
+function IsPrivateNetworkAddress(const AAddressText: string): Boolean;
+{ True when AHost may be contacted under APolicy's host allowlist. }
+function IsHTTPHostAllowed(const APolicy: THTTPDestinationPolicy;
+  const AHost: string): Boolean;
 function HTTPGet(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse; overload;
 function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
@@ -1079,6 +1130,205 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Destination resolution and address policy
+//
+// Ported from GocciaScript's HTTPClient (per-hop host allowlist plus a
+// private-range deny) and adapted to this client's options record.
+// ---------------------------------------------------------------------------
+
+{ Dotted-quad IPv4 text only. Deliberately strict: shortened forms ("127.1"),
+  hexadecimal or octal-looking octets, and bare integers are not literals.
+  Those spellings are a classic way to smuggle a loopback address past a
+  textual filter, so they are left to resolution and, failing that, refused. }
+function TryParseIPv4(const AValue: string;
+  out AOctets: array of Byte): Boolean;
+var
+  I, Part, Digits, Value: Integer;
+  Ch: Char;
+begin
+  Result := False;
+  Part := 0;
+  Value := 0;
+  Digits := 0;
+  for I := 1 to Length(AValue) do
+  begin
+    Ch := AValue[I];
+    if (Ch >= '0') and (Ch <= '9') then
+    begin
+      Inc(Digits);
+      if Digits > 3 then Exit;
+      Value := Value * 10 + (Ord(Ch) - Ord('0'));
+      if Value > 255 then Exit;
+    end
+    else if Ch = '.' then
+    begin
+      if (Digits = 0) or (Part > 2) then Exit;
+      AOctets[Part] := Byte(Value);
+      Inc(Part);
+      Value := 0;
+      Digits := 0;
+    end
+    else
+      Exit;
+  end;
+  if (Digits = 0) or (Part <> 3) then Exit;
+  AOctets[3] := Byte(Value);
+  Result := True;
+end;
+
+function IsPrivateNetworkAddress(const AAddressText: string): Boolean;
+var
+  Octets: array[0..3] of Byte;
+  Normalized: string;
+begin
+  Normalized := LowerCase(Trim(AAddressText));
+  if Normalized = '' then
+    Exit(True);
+
+  { Strip the brackets an IPv6 authority carries in a URL. }
+  if (Length(Normalized) >= 2) and (Normalized[1] = '[') and
+     (Normalized[Length(Normalized)] = ']') then
+    Normalized := Copy(Normalized, 2, Length(Normalized) - 2);
+
+  if TryParseIPv4(Normalized, Octets) then
+  begin
+    Result :=
+      (Octets[0] = 10) or                                        // 10/8
+      (Octets[0] = 127) or                                       // loopback
+      (Octets[0] = 0) or                                         // this host
+      ((Octets[0] = 172) and (Octets[1] >= 16) and
+       (Octets[1] <= 31)) or                                     // 172.16/12
+      ((Octets[0] = 192) and (Octets[1] = 168)) or               // 192.168/16
+      ((Octets[0] = 169) and (Octets[1] = 254)) or               // link-local
+      ((Octets[0] = 100) and (Octets[1] >= 64) and
+       (Octets[1] <= 127)) or                                    // CGNAT
+      ((Octets[0] = 192) and (Octets[1] = 0) and
+       (Octets[2] = 0)) or                                       // IETF proto
+      (Octets[0] >= 224);                                        // multicast +
+    Exit;
+  end;
+
+  { IPv6. The connect paths are AF_INET-only, so an IPv6 literal can only be
+    classified here, never dialled; stay deny-biased for anything unusual. }
+  if Pos(':', Normalized) > 0 then
+  begin
+    Result :=
+      (Normalized = '::1') or                                    // loopback
+      (Normalized = '::') or                                     // unspecified
+      (Copy(Normalized, 1, 2) = 'fc') or                         // ULA fc00::/7
+      (Copy(Normalized, 1, 2) = 'fd') or
+      (Copy(Normalized, 1, 4) = 'fe80') or                       // link-local
+      (Copy(Normalized, 1, 7) = '::ffff:');                      // v4-mapped
+    Exit;
+  end;
+
+  { Not an address literal. Callers pass resolved addresses here, so this is
+    an unclassifiable target; refuse it. }
+  Result := True;
+end;
+
+function IsHTTPHostAllowed(const APolicy: THTTPDestinationPolicy;
+  const AHost: string): Boolean;
+var
+  I: Integer;
+begin
+  if Length(APolicy.AllowedHosts) = 0 then
+    Exit(True);
+  for I := 0 to High(APolicy.AllowedHosts) do
+    if SameText(APolicy.AllowedHosts[I], AHost) then
+      Exit(True);
+  Result := False;
+end;
+
+{ Resolves AHost to one numeric IPv4 address, once. Dialling the returned
+  literal closes the check-then-use window in which a second lookup could
+  answer differently from the one that was classified. An IPv4 literal is
+  returned unchanged; an IPv6 literal is returned unchanged for
+  classification (the AF_INET connect paths cannot dial it). }
+function ResolveHostToAddress(const AHost: string): string;
+var
+  Octets: array[0..3] of Byte;
+{$IFDEF UNIX}
+  HostEntry: THostEntry;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+  Hints, Res: PAddrInfo;
+  SockAddr: PSockAddrIn;
+{$ENDIF}
+begin
+  if AHost = '' then
+    raise EHTTPError.Create('Failed to resolve host: (empty)');
+  if TryParseIPv4(AHost, Octets) or (Pos(':', AHost) > 0) then
+    Exit(AHost);
+
+  Result := '';
+  {$IFDEF UNIX}
+  if not ResolveHostByName(AHost, HostEntry) then
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  Result := NetAddrToStr(HostEntry.Addr);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  EnsureWinSockInit;
+  New(Hints);
+  try
+    FillChar(Hints^, SizeOf(TAddrInfo), 0);
+    Hints^.ai_family := AF_INET;
+    Hints^.ai_socktype := SOCK_STREAM;
+    Hints^.ai_protocol := IPPROTO_TCP;
+    Res := nil;
+    if Getaddrinfo(PAnsiChar(AnsiString(AHost)), nil, Hints, Res) <> 0 then
+      raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+    try
+      if not Assigned(Res) or not Assigned(Res^.ai_addr) then
+        raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+      SockAddr := PSockAddrIn(Res^.ai_addr);
+      Result := Format('%d.%d.%d.%d', [
+        SockAddr^.sin_addr.S_un_b.s_b1, SockAddr^.sin_addr.S_un_b.s_b2,
+        SockAddr^.sin_addr.S_un_b.s_b3, SockAddr^.sin_addr.S_un_b.s_b4]);
+    finally
+      Freeaddrinfo(Res);
+    end;
+  finally
+    Dispose(Hints);
+  end;
+  {$ENDIF}
+  if Result = '' then
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+end;
+
+{ Applies APolicy to one hop and returns the name or address to dial.
+  Order matters: the allowlist runs first so a refused host is never
+  resolved, and the address check runs on the resolved value because that is
+  the only form in which "is this target internal" is meaningful. }
+function ResolveAllowedDestination(const APolicy: THTTPDestinationPolicy;
+  const AHost: string; var APublicHopSeen: Boolean): string;
+var
+  IsPrivate: Boolean;
+begin
+  if not IsHTTPHostAllowed(APolicy, AHost) then
+    raise EHTTPError.CreateFmt('fetch host not allowed: %s', [AHost]);
+  if APolicy.PrivateAddresses = papAllow then
+    Exit(AHost);
+
+  {$IFDEF HTTPCLIENT_TESTING}
+  if not (Assigned(HTTPClientResolveTestHook) and
+     HTTPClientResolveTestHook(AHost, Result, IsPrivate)) then
+  {$ENDIF}
+  begin
+    Result := ResolveHostToAddress(AHost);
+    IsPrivate := IsPrivateNetworkAddress(Result);
+  end;
+
+  if IsPrivate and ((APolicy.PrivateAddresses = papDeny) or
+     APublicHopSeen) then
+    raise EHTTPError.CreateFmt(
+      'fetch destination not allowed: %s resolves to private address %s',
+      [AHost, Result]);
+  if not IsPrivate then
+    APublicHopSeen := True;
+end;
+
+// ---------------------------------------------------------------------------
 // Core request logic
 // ---------------------------------------------------------------------------
 
@@ -1121,8 +1371,8 @@ var
   Request: AnsiString;
   Raw: TRawHTTPResponse;
   I, Redirects: Integer;
-  CurrentURL, Location, HostHeader: string;
-  HasRequestContent, HasUserAgent, IsHead: Boolean;
+  CurrentURL, Location, HostHeader, DialHost: string;
+  HasRequestContent, HasUserAgent, IsHead, PublicHopSeen: Boolean;
   HeaderName, Method, ContentType: string;
   Body: TBytes;
   Deadline, StartedAt: QWord;
@@ -1143,13 +1393,21 @@ begin
   Body := ABody;
   ContentType := AContentType;
   HasRequestContent := AManagesContentHeaders;
+  PublicHopSeen := False;
 
   while True do
   begin
     CheckRequestDeadline(Deadline, AOptions.RequestTimeoutMilliseconds);
     Parsed := ParseHTTPURL(CurrentURL);
+    { Runs on every pass, so each redirect hop is checked exactly like the
+      initial request before any connection is attempted. }
+    DialHost := ResolveAllowedDestination(AOptions.Destination, Parsed.Host,
+      PublicHopSeen);
+    CheckRequestDeadline(Deadline, AOptions.RequestTimeoutMilliseconds);
     FillChar(Transport, SizeOf(Transport), 0);
-    Sock := ConnectSocket(Parsed.Host, Parsed.Port, Deadline,
+    { TLS below still verifies Parsed.Host: pinning changes which address is
+      dialled, never which identity the peer must prove. }
+    Sock := ConnectSocket(DialHost, Parsed.Port, Deadline,
       AOptions.RequestTimeoutMilliseconds);
     try
       if Parsed.Scheme = 'https' then
@@ -1269,6 +1527,8 @@ begin
   Result.RequestTimeoutMilliseconds :=
     DEFAULT_REQUEST_TIMEOUT_MILLISECONDS;
   Result.MaximumRedirects := DEFAULT_MAXIMUM_REDIRECTS;
+  Result.Destination.AllowedHosts := nil;
+  Result.Destination.PrivateAddresses := papAllow;
 end;
 
 function HTTPGet(const AURL: string;

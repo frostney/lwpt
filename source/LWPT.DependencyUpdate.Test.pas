@@ -7,6 +7,7 @@ program LWPT.DependencyUpdate.Test;
 uses
   SysUtils,
 
+  HTTPClient,
   LWPT.Core,
   LWPT.DependencyUpdate,
   LWPT.GitProtocol,
@@ -93,7 +94,8 @@ begin
   Result.SHA := ASHA;
 end;
 
-function MockLeafRefs(const ARepoURL: string): TGitRefArray;
+function MockLeafRefs(const ARepoURL: string;
+  const AOptions: THTTPRequestOptions): TGitRefArray;
 begin
   SetLength(Result, 0);
   if Pos('leaf', ARepoURL) > 0 then

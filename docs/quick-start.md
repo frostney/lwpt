@@ -76,6 +76,7 @@ After bootstrap:
 ./build/lwpt install            # fetch any new deps; rewrite lwpt.lock + lwpt.cfg
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt install --offline  # restore exact locked state from local bytes
+./build/lwpt install --accept-moved-tags  # re-pin reviewed upstream tag moves
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt outdated           # compare locked git-host deps to advertised tags
@@ -95,6 +96,19 @@ and `lwpt.cfg`. Local and workspace dependencies are copied from their declared
 paths. The lockfile remains byte-identical. A missing object, corrupt archive,
 or manifest/lock mismatch fails without fetching around the problem. Offline
 materialization and read-only `--frozen` verification are mutually exclusive.
+
+`install --frozen` makes no network requests at all. It verifies the committed
+archives and extracted modules against `lwpt.lock` and never writes the lockfile.
+Some other package managers use "frozen" only to mean "don't write the lock".
+
+A tag names a reviewed commit. When `lwpt.lock` records the commit for a tag
+and an online install finds that the host now advertises the same tag at a
+different commit, the tag was moved upstream. The install, and the `add`,
+`remove`, and `update` flows that share its transaction, fails before fetching
+anything. The error names the dependency, the tag, and the old and new commits.
+Review the new commit, then run `lwpt install --accept-moved-tags` to re-pin
+it. The flag cannot be combined with `--frozen` or `--offline`, which never
+list refs. Branch requirements keep following their moving tip.
 
 ## Start or adopt a project
 

@@ -202,7 +202,7 @@ end;
 procedure TInstallProducerLease.BeforeAll;
 begin
   FOriginalDir := GetCurrentDir;
-  SetLwptBinaryPath(ExpandFileName('build/lwpt'));
+  SetLwptBinaryPath(LwptTestingBinaryPath);
   FScratch := CreateScratchRoot('install-producer-lease');
 end;
 

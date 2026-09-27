@@ -7,8 +7,11 @@ unit LWPT.Command.Install;
 
 interface
 
+{ AAcceptMovedTags lets an online install re-pin a locked tag that the host
+  now advertises at a different commit; without it such a tag fails the
+  install. }
 procedure CmdInstall(const AManifestPath: string; AFrozen: Boolean;
-  AOffline: Boolean = False);
+  AOffline: Boolean = False; AAcceptMovedTags: Boolean = False);
 
 implementation
 
@@ -20,7 +23,7 @@ uses
   LWPT.Manifest;
 
 procedure CmdInstall(const AManifestPath: string; AFrozen: Boolean;
-  AOffline: Boolean);
+  AOffline: Boolean; AAcceptMovedTags: Boolean);
 var
   Ctx : TManifestContext;
   Mode : TInstallTransactionMode;
@@ -34,7 +37,7 @@ begin
     Mode := itmOfflineMaterialize
   else
     Mode := itmMaterialize;
-  RunInstallTransaction(Ctx, Mode);
+  RunInstallTransaction(Ctx, Mode, AAcceptMovedTags);
   RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot);
 end;
 

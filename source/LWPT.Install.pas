@@ -84,6 +84,7 @@ type
     UnitBackup, ArchiveBackup: string;
   end;
 
+{$IFDEF INSTALL_TESTING}
 const
   { Test-only archive-fetch redirection. ARCHIVE_FETCH_ORIGIN_ENV is read
     at the archive-fetch boundary AFTER canonical URL construction, so the
@@ -97,8 +98,9 @@ const
     else is refused: a remote host, a name that would need DNS (including
     `localhost`), a missing port, a path, user information, and any non-http
     scheme. That keeps the seam unable to express an arbitrary insecure
-    download, which is the reason it can live in the shipped binary rather
-    than behind a build flag.
+    download even in a test build. Per ADR-0044 the seam exists only in
+    test builds (INSTALL_TESTING); a release binary compiles none of it and
+    ignores the variable.
 
     ARCHIVE_FETCH_TIMEOUT_ENV bounds the loopback archive request and is honoured
     only while the origin override is active, so it cannot become a
@@ -107,7 +109,9 @@ const
   ARCHIVE_FETCH_TIMEOUT_ENV = PROJECT_NAME + '_TEST_ARCHIVE_TIMEOUT_MS';
   DEFAULT_ARCHIVE_FETCH_TIMEOUT = 5000;
   MAXIMUM_ARCHIVE_FETCH_TIMEOUT = 600000;
+{$ENDIF}
 
+const
   { The terminator written after every constraint line before hashing —
     including the last, reproducing TStrings.Text's trailing line break.
     Named and pinned because the fingerprint is compared across machines:
@@ -119,12 +123,14 @@ const
 function  LoadLockfile(const APath: string): TResolvedArray;
 function  ConstraintFingerprintForLines(const ALines: TStrings): string;
 function  ConstraintFingerprintForNode(const ANode: TResolveNode; const AProjectRoot: string): string;
+{$IFDEF INSTALL_TESTING}
 function  ApplyArchiveFetchOrigin(const ACanonicalURL, AOverride: string): string;
 function  ResolveArchiveFetchTimeout(const ARawMilliseconds: string): Integer;
+{$ENDIF}
 function  ExtractArchive(const AArchivePath, ADest: string; const ASubDir: string = ''): Integer;
 procedure VerifyAgainstLockfile(const AResolved: array of TResolved; const ALockEntries: array of TResolved);
 function  PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved; const AModulesRoot, AArchivesRoot: string): Integer;
-function  RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode): TInstallTransactionResult;
+function  RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode; const AAcceptMovedTags: Boolean = False): TInstallTransactionResult;
 function  RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
 procedure RecoverInterruptedInstall(const AContext: TManifestContext);
 
@@ -134,6 +140,7 @@ uses
   {$IFDEF UNIX} BaseUnix, {$ENDIF}
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
   HTTPClient,
+  LWPT.FetchPolicy,
   LWPT.GitProtocol,
   LWPT.ObjectStore,
   LWPT.ProducerLease,
@@ -275,6 +282,7 @@ begin
   end;
 end;
 
+{$IFDEF INSTALL_TESTING}
 { ───────────────────────────────────────────────────────────────────
   Test-only archive-fetch redirection. See the ARCHIVE_FETCH_*
   declarations in the interface for the contract this enforces.
@@ -282,6 +290,7 @@ end;
   Deliberately NOT a proxy, a mirror, or an origin-selection feature:
   it rewrites nothing but the origin, refuses every value that is not a
   numeric loopback plain-HTTP endpoint, and is inert when unset.
+  Compiled only into test builds (ADR-0044).
   ─────────────────────────────────────────────────────────────────── }
 const
   LOOPBACK_FIRST_OCTET = 127;
@@ -442,6 +451,7 @@ begin
       [ARCHIVE_FETCH_TIMEOUT_ENV, MAXIMUM_ARCHIVE_FETCH_TIMEOUT,
        ARawMilliseconds]);
 end;
+{$ENDIF}
 
 { Build the git smart-HTTP base URL for tag listing. Same host
   templates as the archive endpoints but pointing at the .git
@@ -785,6 +795,10 @@ begin
           + AName + '-' + ArchiveTag + '.tar.gz';
 end;
 
+{$IFDEF INSTALL_TESTING}
+{ Test-build-only archive fixture (ADR-0044), paired with the ref fixture in
+  LWPT.GitProtocol: <root>/archives/<name>/<ref>.tar.gz stands in for the
+  git-host archive endpoint. }
 function LoadTestFixtureArchive(const ARoot, AName, ARef: string;
   out ABody: TBytes): Boolean;
 var ArchivePath, RequestPath: string; Stream: TFileStream;
@@ -826,6 +840,7 @@ begin
   end;
   Result := True;
 end;
+{$ENDIF}
 
 function FetchToCache(const ADep: TDependency;
   const AResolvedRef, AModulesRoot, AArchivesRoot, ATmpRoot,
@@ -835,7 +850,7 @@ function FetchToCache(const ADep: TDependency;
   const AObjectStore: TLWPTImmutableObjectStore;
   out AUnitDir, AArchive, AArchiveHash, AResolvedURL: string): Boolean;
 var
-  URL, LocalPath, OriginOverride : string;
+  URL, LocalPath : string;
   Resp : THTTPResponse;
   NoHeaders : THTTPHeaders;
   HTTPOptions : THTTPRequestOptions;
@@ -843,8 +858,11 @@ var
   k : Integer;
   WSPath : string;
   AvailableNames : string;
-  StagePath, FixtureRoot : string;
+  StagePath : string;
   ProducerLease: TLWPTProducerLease;
+  {$IFDEF INSTALL_TESTING}
+  OriginOverride, FixtureRoot : string;
+  {$ENDIF}
 
   procedure StageLocalCopy(const AMessage: string);
   begin
@@ -1043,19 +1061,19 @@ begin
     object cleanup so the cross-process integration test observes the same
     operating-system guard release as an abrupt producer death. }
   if Assigned(ProducerLease)
-     and (SysUtils.GetEnvironmentVariable(
-       PROJECT_NAME + '_TEST_CRASH_DEPENDENCY_PRODUCER') = '1') then
+     and (TestSeamValue('CRASH_DEPENDENCY_PRODUCER') = '1') then
     Halt(88);
 
+  try
+  {$IFDEF INSTALL_TESTING}
   { The archive-fetch boundary, and the only place the test-only origin
     override applies: canonical construction above is untouched, and the
-    redirect below is inert unless the environment asks for it. }
-  try
-    OriginOverride := SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_ORIGIN_ENV);
-  { Record the canonical URL in the lockfile, captured before the redirect.
+    redirect below is inert unless the environment asks for it.
+    Record the canonical URL in the lockfile, captured before the redirect.
     The override only aims the fetch at a loopback mock server; the
     loopback origin must never persist into lwpt.lock, so AResolvedURL
     keeps the URL as constructed while URL below carries the rewrite. }
+  OriginOverride := SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_ORIGIN_ENV);
   FixtureRoot := SysUtils.GetEnvironmentVariable(
     PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
   { The ref fixture and archive-origin seams compose deliberately. A fixture
@@ -1071,21 +1089,28 @@ begin
     Resp.StatusCode := 200;
   end
   else
+  {$ENDIF}
   begin
-    URL := ApplyArchiveFetchOrigin(URL, OriginOverride);
     NoHeaders := nil;
-    HTTPOptions := DefaultHTTPRequestOptions;
+    { The dependency's destination policy (host allowlist and private-address
+      refusal) is enforced on the request and every redirect hop. }
+    HTTPOptions := DependencyFetchOptions(ADep, ACustomSources,
+      DefaultHTTPRequestOptions);
     HTTPOptions.MaxResponseBodyBytes := MAX_ARCHIVE_RESPONSE_BYTES;
+    HTTPOptions.RequestTimeoutMilliseconds :=
+      ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;
+    {$IFDEF INSTALL_TESTING}
+    URL := ApplyArchiveFetchOrigin(URL, OriginOverride);
     if OriginOverride <> '' then
     begin
       HTTPOptions.RequestTimeoutMilliseconds := ResolveArchiveFetchTimeout(
         SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_TIMEOUT_ENV));
-      { A loopback fixture must not escape through a remote Location header. }
+      { A loopback fixture must not escape through a remote Location header,
+        and the validated loopback origin replaces the source's hosts. }
       HTTPOptions.MaximumRedirects := 0;
-    end
-    else
-      HTTPOptions.RequestTimeoutMilliseconds :=
-        ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;
+      HTTPOptions.Destination := Default(THTTPDestinationPolicy);
+    end;
+    {$ENDIF}
     { Every transport failure below the client (refused connection, read
       timeout, truncated body, malformed response) arrives here as some
       HTTPClient-shaped exception whose text names neither the dependency
@@ -2372,7 +2397,7 @@ procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
   const AWorkspaces: TWorkspaceArray;
   const APriorLock: TResolvedArray;
   const AObjectStore: TLWPTImmutableObjectStore;
-  const AOffline: Boolean);
+  const AOffline, AAcceptMovedTags: Boolean);
 type
   TSelectionState = record
     Name, SourceIdentity, RefName, CommitSHA: string;
@@ -2644,7 +2669,8 @@ var
     { A failed advertisement is not a reusable empty advertisement. Resolve
       before extending the cache so a later complete-set selection can take
       the same lock-identity fallback as the discovery pass. }
-    Refs := ListRemoteRefs(RepoURL);
+    Refs := ListRemoteRefs(RepoURL, DependencyFetchOptions(ANode.Dep,
+      ANode.CustomSources, DefaultHTTPRequestOptions));
     n := Length(RefCache);
     SetLength(RefCache, n + 1);
     RefCache[n].RepoURL := RepoURL;
@@ -2680,6 +2706,34 @@ var
     Result := NodePath = WorkspacePath;
     {$ENDIF}
     if Result then AVersion := Workspace.Version;
+  end;
+
+  { A tag is an immutable name for a reviewed commit. When the lock already
+    records the commit behind the tag being selected again and the host now
+    advertises that tag at a different commit, the tag was moved upstream:
+    re-pinning silently would only surface as a lockfile diff. Refuse unless
+    the caller explicitly accepted moved tags after review. Branches are
+    mutable by design and keep moving; a lock without a recorded commit (an
+    early schema-v3 lock) has nothing to compare against. }
+  procedure RejectMovedTag(const ANode: TResolveNode;
+    const ARefs: TGitRefArray; const ASelection: TResolverSelection);
+  var Entry: TResolved; k: Integer; SelectedTag: Boolean;
+  begin
+    if AAcceptMovedTags then Exit;
+    if not FindPriorLock(ANode, Entry) then Exit;
+    if (Entry.CommitSHA = '') or (Entry.Version <> ASelection.RefName)
+       or SameText(Entry.CommitSHA, ASelection.CommitSHA) then Exit;
+    SelectedTag := False;
+    for k := 0 to High(ARefs) do
+      if (ARefs[k].Kind = rkTag) and (ARefs[k].Name = ASelection.RefName) then
+        SelectedTag := True;
+    if not SelectedTag then Exit;
+    raise EVerifyError.CreateFmt(
+      'dependency "%s": tag "%s" moved upstream since it was locked '
+      + '(locked commit %s, now advertised at %s). Review the new commit, '
+      + 'then run `%s install --accept-moved-tags` to accept it.',
+      [ANode.Name, ASelection.RefName, LowerCase(Entry.CommitSHA),
+       LowerCase(ASelection.CommitSHA), PROGRAM_NAME]);
   end;
 
   function SelectNode(const ANode: TResolveNode): TSelectionState;
@@ -2770,6 +2824,7 @@ var
           + '  canonical source: '
           + SourceKey(ANode.Dep, ANode.CustomSources));
     end;
+    RejectMovedTag(ANode, Refs, Selection);
     Result.RefName := Selection.RefName;
     Result.CommitSHA := Selection.CommitSHA;
   end;
@@ -2849,8 +2904,7 @@ var
         ApplyIncludeExclude(RecheckPath,
           R.Nodes[k].Dep.IncludeGlobs, R.Nodes[k].Dep.ExcludeGlobs);
         try
-      if SameText(SysUtils.GetEnvironmentVariable(
-               PROJECT_NAME + '_TEST_STALE_LOCAL_SNAPSHOT'),
+          if SameText(TestSeamValue('STALE_LOCAL_SNAPSHOT'),
              R.Nodes[k].Name) then
             R.Nodes[k].Hash := 'sha256:injected-stale-snapshot';
           if HashTree(RecheckPath) <> R.Nodes[k].Hash then
@@ -2873,8 +2927,7 @@ var
         raise EFetchError.CreateFmt(
           'failed to retain rollback copy for module "%s"',
           [R.Nodes[k].Name]);
-      if SameText(SysUtils.GetEnvironmentVariable(
-           PROJECT_NAME + '_TEST_HALT_AFTER_MODULE_RETAIN'),
+      if SameText(TestSeamValue('HALT_AFTER_MODULE_RETAIN'),
          R.Nodes[k].Name) then
         Halt(87);
       FinalArchive := '';
@@ -2906,16 +2959,10 @@ var
       else
         R.Nodes[k].Archive := FinalArchive;
       R.Nodes[k].Hash := HashTree(FinalUnitDir);
-      if (SysUtils.GetEnvironmentVariable(
-          PROJECT_NAME + '_TEST_FAIL_PUBLISH_AFTER') <>
-          '') and (StrToIntDef(SysUtils.GetEnvironmentVariable(
-          PROJECT_NAME + '_TEST_FAIL_PUBLISH_AFTER'), -1) = k + 1) then
+      if StrToIntDef(TestSeamValue('FAIL_PUBLISH_AFTER'), -1) = k + 1 then
         raise EFetchError.CreateFmt(
           'injected publication failure after package %d', [k + 1]);
-      if (SysUtils.GetEnvironmentVariable(
-          PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER') <>
-          '') and (StrToIntDef(SysUtils.GetEnvironmentVariable(
-          PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER'), -1) = k + 1) then
+      if StrToIntDef(TestSeamValue('HALT_PUBLISH_AFTER'), -1) = k + 1 then
         Halt(86);
     end;
   end;
@@ -3563,10 +3610,13 @@ end;
   lockfile diff prunes orphaned module trees + archives — all INSIDE
   the cross-process install lock, so a concurrent install can neither
   observe a manifest/lockfile mismatch nor race the prune deletions.
-  AManifestLines = nil is the plain `lwpt install` flow. }
+  AManifestLines = nil is the plain `lwpt install` flow.
+  AAcceptMovedTags lets resolution re-pin a locked tag that the host now
+  advertises at a different commit (`install --accept-moved-tags`). }
 function RunInstallTransactionCore(const AContext: TManifestContext;
   const AMode: TInstallTransactionMode;
-  const AManifestLines: TStringList): TInstallTransactionResult;
+  const AManifestLines: TStringList;
+  const AAcceptMovedTags: Boolean): TInstallTransactionResult;
 var
   Man : TManifest;
   R   : TResolution;
@@ -3673,7 +3723,8 @@ begin
     begin
       ResolveGraphFixedPoint(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
                              RollbackRoot, AContext.ProjectRoot,
-                             Man.Workspaces, OldLock, ObjectStore, Offline);
+                             Man.Workspaces, OldLock, ObjectStore, Offline,
+                             AAcceptMovedTags);
       PublicationPending := True;
     end;
     WriteLn('resolved ', Length(R.Nodes), ' packages, no conflicts.');
@@ -3796,15 +3847,12 @@ begin
       VerifyOfflineAgainstLockfile(Resolved, OldLock)
     else
       WriteLock(LockfilePath, TmpRoot, Resolved);
-    if (not Offline) and (SysUtils.GetEnvironmentVariable(
-      PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE') = '1') then
+    if (not Offline) and (TestSeamValue('FAIL_AFTER_LOCK_WRITE') = '1') then
     begin
-      if SysUtils.GetEnvironmentVariable(
-        PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR') <> '' then
+      if TestSeamValue('CORRUPT_ROLLBACK_FOR') <> '' then
         for i := 0 to High(R.Nodes) do
           if SameText(R.Nodes[i].Name,
-               SysUtils.GetEnvironmentVariable(
-                 PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR'))
+               TestSeamValue('CORRUPT_ROLLBACK_FOR'))
              and (R.Nodes[i].UnitBackup <> '') then
           begin
             ForceDirectories(R.Nodes[i].UnitBackup);
@@ -3836,8 +3884,7 @@ begin
         only best-effort tmp cleanup remains. }
       RetainOrphanedPackagePaths(OldLock, Resolved, ModulesRoot,
         ArchivesRoot, RollbackRoot, OrphanRollbacks);
-      if SysUtils.GetEnvironmentVariable(
-           PROJECT_NAME + '_TEST_FAIL_AFTER_ORPHAN_RETAIN') = '1' then
+      if TestSeamValue('FAIL_AFTER_ORPHAN_RETAIN') = '1' then
         raise EExtractError.Create(
           'injected failure after orphan retention');
       AtomicWriteText(ManifestPath, TmpRoot, AManifestLines);
@@ -3891,9 +3938,9 @@ begin
   end;
 end;
 
-function RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode): TInstallTransactionResult;
+function RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode; const AAcceptMovedTags: Boolean): TInstallTransactionResult;
 begin
-  Result := RunInstallTransactionCore(AContext, AMode, nil);
+  Result := RunInstallTransactionCore(AContext, AMode, nil, AAcceptMovedTags);
 end;
 
 procedure RecoverInterruptedInstall(const AContext: TManifestContext);
@@ -3909,7 +3956,8 @@ end;
 
 function RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
 begin
-  Result := RunInstallTransactionCore(AContext, itmMaterialize, AManifestLines);
+  Result := RunInstallTransactionCore(AContext, itmMaterialize, AManifestLines,
+    False);
 end;
 
 end.

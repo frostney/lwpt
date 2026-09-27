@@ -187,9 +187,11 @@ const
 
 { Hit <ARepoURL>/info/refs?service=git-upload-pack and parse the
   pkt-line response into the ref list. ARepoURL must end in `.git`
-  (the standard git-host convention); callers in LWPT.Core build
-  the URL via GitRepoURL which appends `.git`. }
-function ListRemoteRefs(const ARepoURL: string): TGitRefArray;
+  (the standard git-host convention); callers build the URL via
+  GitRepoURL which appends `.git`. AOptions carries the dependency's
+  destination policy (LWPT.FetchPolicy), enforced on every redirect hop. }
+function ListRemoteRefs(const ARepoURL: string;
+  const AOptions: THTTPRequestOptions): TGitRefArray;
 
 { Lower-level: parse a raw pkt-line stream into refs. Exposed for
   unit tests that feed a captured info/refs fixture without going
@@ -228,6 +230,11 @@ uses
 const
   PKT_PREFIX_LEN = 4;
 
+{$IFDEF INSTALL_TESTING}
+{ Test-build-only fixture transport (ADR-0044): with
+  <PROJECT_NAME>_TEST_GIT_FIXTURE_DIR set, ref advertisements are read from
+  <dir>/refs/<repository>.refs instead of the network. Release builds do not
+  compile this seam and ignore the variable. }
 function FixtureRepositoryName(const ARepoURL: string): string;
 var URL: string; Slash: Integer;
 begin
@@ -301,6 +308,7 @@ begin
   AppendFixtureRequest(ARoot,
     'refs|' + FixtureRepositoryName(ARepoURL));
 end;
+{$ENDIF}
 
 function HexCharToInt(C: AnsiChar): Integer; inline;
 begin
@@ -440,10 +448,13 @@ begin
   end;
 end;
 
-function ListRemoteRefs(const ARepoURL: string): TGitRefArray;
+function ListRemoteRefs(const ARepoURL: string;
+  const AOptions: THTTPRequestOptions): TGitRefArray;
 var
   URL : string;
+  {$IFDEF INSTALL_TESTING}
   FixtureRoot: string;
+  {$ENDIF}
   Resp : THTTPResponse;
   Headers : THTTPHeaders;
   Body : string;
@@ -452,10 +463,12 @@ begin
   if ARepoURL = '' then
     raise EGitProtocolError.Create('ListRemoteRefs: empty repo URL');
 
+  {$IFDEF INSTALL_TESTING}
   FixtureRoot := SysUtils.GetEnvironmentVariable(
     PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
   if FixtureRoot <> '' then
     Exit(LoadFixtureRefs(FixtureRoot, ARepoURL));
+  {$ENDIF}
 
   URL := ARepoURL;
   if Pos('?', URL) > 0 then
@@ -472,7 +485,7 @@ begin
   Headers[0].Value := 'application/x-git-upload-pack-advertisement';
   Headers[1].Name  := 'Git-Protocol';
   Headers[1].Value := 'version=1';   { force v1 framing }
-  Resp := HTTPGet(URL, Headers);
+  Resp := HTTPGet(URL, Headers, AOptions);
   if (Resp.StatusCode < 200) or (Resp.StatusCode >= 300) then
     raise EGitProtocolError.CreateFmt(
       'ListRemoteRefs %s: HTTP %d %s',

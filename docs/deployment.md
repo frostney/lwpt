@@ -62,6 +62,39 @@ typical general-purpose HTTP response. Header limits retain the package
 default. HTTP-layer failures are wrapped as `EFetchError` with the requested
 URL, preserving install transaction cleanup and diagnostics.
 
+`THTTPRequestOptions.Destination` adds a per-request destination policy that
+applies to the initial request and to every redirect hop. `AllowedHosts` is a
+case-insensitive exact host allowlist. It is checked before any name
+resolution, so a refused host causes no DNS lookup and no connection.
+`PrivateAddresses` selects `papAllow` (the default), `papDeny`, or
+`papDenyAfterPublic`. With `papDeny`, every hop must resolve to a public
+address. With `papDenyAfterPublic`, a request that has reached a public
+address cannot be redirected to a private one. Private destinations are
+loopback, RFC 1918, link-local (including cloud metadata at
+`169.254.169.254`), CGNAT, multicast, reserved space, the IPv6 equivalents, and
+anything that is not a strict address literal. When either deny mode is
+active, the client resolves the host once, classifies that address, and
+connects to the same address. TLS still verifies the certificate against the
+host name.
+
+LWPT derives each dependency's policy in `LWPT.FetchPolicy` and applies it to
+both ref listing and archive download:
+
+| Source | Allowed hosts | Private addresses |
+| --- | --- | --- |
+| `owner/repo`, `github:` | `github.com`, `codeload.github.com` | Denied on every hop |
+| `gitlab:` | `gitlab.com` | Denied on every hop |
+| `bitbucket:` | `bitbucket.org` | Denied on every hop |
+| `[sources.<name>]` custom host | The hosts named by its `archive` and `git` templates | Denied after a public hop |
+| Direct `https://` archive URL | Any host | Denied after a public hop |
+
+Custom sources and direct URLs keep working when the manifest author points
+them at a host on a private network. Such a host may redirect within that
+network. A fetch that starts on the public internet can never be redirected
+into a private network, and a git-host fetch can never leave its forge's hosts.
+A refused hop fails the install with `fetch host not allowed: <host>` or
+`fetch destination not allowed: <host> resolves to private address <address>`.
+
 ### Windows: SChannel clients and SChannel servers
 
 Outbound HTTPS calls into Windows' Security Service Provider Interface (SSPI) directly via the `Windows` unit and the SChannel constants in `TransportSecurity.pas`. Running LWPT as a client therefore has no third-party DLL prerequisite. The Windows release archive contains exactly:
