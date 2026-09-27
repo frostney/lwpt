@@ -309,11 +309,12 @@ begin
     Expect<Boolean>(Materialized).ToBe(True);
     Expect<string>(SpawnGuardProbeError).ToBe('');
     Expect<Integer>(SpawnGuardProbeEscapes).ToBe(0);
+    Expect<Integer>(SpawnGuardProbeUnprotectedDescriptors).ToBe(0);
     Expect<Boolean>(SpawnGuardProbeAttempts >= Length(Source)).ToBe(True);
     Expect<Integer>(SpawnGuardProbeLiveChildren)
       .ToBe(SpawnGuardProbeAttempts);
-    Expect<Integer>(SpawnGuardProbeInheritedDescriptors(DestinationRoot))
-      .ToBe(0);
+    Expect<Integer>(SpawnGuardProbeInheritedFiles([Cached[0].Path,
+      Cached[1].Path, Bundle])).ToBe(0);
     Expect<string>(ReadBytes(Cached[0].Path)).ToBe('executable'#0'bytes');
   finally
     ReleaseSpawnGuardProbeChildren;

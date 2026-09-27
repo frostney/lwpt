@@ -404,26 +404,31 @@ end;
 { Starts a real child through the production spawn path inside every state
   publication's open window. Each child must wait for the inheritance guard,
   and none may keep a state descriptor or its exclusive flock afterwards.
-  Removing the guard from the shared protected open makes this fail. }
+  Removing the guard from the shared protected open, or its close-on-exec
+  step, makes this fail on every Unix target. Lease tokens read
+  /dev/urandom while other scheduler threads spawn, so that read is probed
+  too. }
 procedure CheckStatePublicationKeepsChildrenOut;
 var
   Session : TLWPTWorkerBudgetSession;
-  Lease : TLWPTWorkerLease;
+  Lease, Second : TLWPTWorkerLease;
   Environment : TStringList;
   Snapshot : TLWPTWorkerBudgetSnapshot;
   Entry : TLWPTWorkerBudgetEntry;
   Descriptor : LongInt;
   Index : Integer;
-  StateRoot : string;
+  MarkerRoot, StateRoot : string;
 begin
   Session := nil;
   Lease := nil;
+  Second := nil;
   Environment := nil;
   StateRoot := IncludeTrailingPathDelimiter(WorkerStateRoot);
+  MarkerRoot := ExtractFileDir(ExcludeTrailingPathDelimiter(StateRoot))
+    + '/spawn-guard-probe';
   try
-    ArmSpawnGuardProbe(StateRoot + 'tmp' + PathDelim,
-      ExtractFileDir(ExcludeTrailingPathDelimiter(StateRoot))
-        + '/spawn-guard-probe', PROBE_MAXIMUM_SPAWNS);
+    ArmSpawnGuardProbe(StateRoot + 'tmp' + PathDelim, MarkerRoot,
+      PROBE_MAXIMUM_SPAWNS);
     try
       Session := TLWPTWorkerBudgetSession.Create('guarded', 2);
       Lease := Session.Acquire(0);
@@ -436,10 +441,14 @@ begin
       'budget, request and queue publications must all be probed');
     Require(SpawnGuardProbeEscapes = 0,
       'a child started inside a state publication open window');
+    Require(SpawnGuardProbeUnprotectedDescriptors = 0,
+      'a state publication descriptor lacks close-on-exec');
     Require(SpawnGuardProbeLiveChildren = SpawnGuardProbeAttempts,
       'every probe child must start once the guard is released');
-    Require(SpawnGuardProbeInheritedDescriptors(
-      ExcludeTrailingPathDelimiter(StateRoot)) = 0,
+    Require(SpawnGuardProbeInheritedFiles([
+      StateRoot + GUARDED_STATE_FILES[0], StateRoot + GUARDED_STATE_FILES[1],
+      StateRoot + GUARDED_STATE_FILES[2], StateRoot + 'transaction.lock',
+      StateRoot + 'guarded.owner']) = 0,
       'a probe child inherited a worker-state descriptor');
     for Index := Low(GUARDED_STATE_FILES) to High(GUARDED_STATE_FILES) do
     begin
@@ -463,9 +472,30 @@ begin
     for Entry in Snapshot.Entries do
       Require(not Entry.Uncertain, 'readable entry reported as uncertain');
     Lease.CancelPendingDelegation;
+    ReleaseSpawnGuardProbeChildren;
+
+    ArmSpawnGuardProbe('/dev/urandom', MarkerRoot + '/token',
+      PROBE_MAXIMUM_SPAWNS);
+    try
+      Second := Session.Acquire(0);
+    finally
+      DisarmSpawnGuardProbe;
+    end;
+    Require(SpawnGuardProbeError = '', SpawnGuardProbeError);
+    Require(Assigned(Second), 'the second grant must succeed');
+    Require(SpawnGuardProbeAttempts >= 1,
+      'lease-token randomness must be read through the protected open');
+    Require(SpawnGuardProbeEscapes = 0,
+      'a child started inside the lease-token open window');
+    Require(SpawnGuardProbeUnprotectedDescriptors = 0,
+      'the lease-token randomness descriptor lacks close-on-exec');
+    Require(SpawnGuardProbeInheritedFiles(['/dev/urandom']) = 0,
+      'a probe child inherited the lease-token randomness descriptor');
+    FreeAndNil(Second);
     FreeAndNil(Lease);
   finally
     Environment.Free;
+    Second.Free;
     Lease.Free;
     Session.Free;
     ReleaseSpawnGuardProbeChildren;

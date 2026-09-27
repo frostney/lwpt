@@ -1,14 +1,19 @@
 { Tests.SpawnGuardProbe — deterministic proof that toolkit-state opens keep
-  concurrent child spawns out of their open window.
+  concurrent child spawns out of their open window and out of their
+  descriptors.
 
   While armed, every protected open whose path contains the armed fragment
   starts a real child through ExecuteUnmanagedProcess from another thread,
   while the opener still holds the process-handle inheritance guard and has
-  not yet marked the descriptor close-on-exec. The probe waits until that
-  spawn attempt reaches the guard, then checks that the child has not started.
-  Each child records its start in a ready marker and then stays alive, so a
-  caller can prove afterwards that the children never kept an inherited
-  descriptor or its flock. Compile the caller with -dOBJECTSTORE_TESTING. }
+  not yet marked the descriptor close-on-exec. The probe then waits for
+  LWPT.Core's guard observation of the spawning thread: blocked waiting for
+  the guard proves exclusion, having entered it is an escape. No elapsed
+  time is interpreted.
+
+  Every child is a descriptor reporter. It records the device and inode of
+  each descriptor it holds after exec, then stays alive. Callers compare the
+  reports with the files under test on every Unix target. Compile the caller
+  with -dOBJECTSTORE_TESTING. }
 unit Tests.SpawnGuardProbe;
 
 {$mode delphi}{$H+}
@@ -23,17 +28,22 @@ procedure ArmSpawnGuardProbe(const APathFragment, AMarkerDirectory: string;
 { Stops probing and waits until every spawn attempt has returned. }
 procedure DisarmSpawnGuardProbe;
 function SpawnGuardProbeAttempts: Integer;
-{ Children that started while their opener still held the guard. }
+{ Children that entered the guard while their opener still held it. }
 function SpawnGuardProbeEscapes: Integer;
-{ Children that started and are still alive after disarming. }
+{ Probed descriptors whose close-on-exec flag was clear after protection. }
+function SpawnGuardProbeUnprotectedDescriptors: Integer;
+{ Children that started, reported their descriptors and are still alive. }
 function SpawnGuardProbeLiveChildren: Integer;
-{ Open descriptors in live children whose target contains APathFragment.
-  Linux reads /proc; other Unix targets report zero and rely on the
-  caller's flock assertions instead. }
-function SpawnGuardProbeInheritedDescriptors(
-  const APathFragment: string): Integer;
+{ Reported child descriptors that refer to any of APaths. }
+function SpawnGuardProbeInheritedFiles(const APaths: array of string): Integer;
 function SpawnGuardProbeError: string;
 procedure ReleaseSpawnGuardProbeChildren;
+
+{ Starts one reporter child through the production spawn path now, waits for
+  its report and stops it. Returns how many of its descriptors refer to any
+  of APaths, or -1 when the child produced no report. }
+function ChildInheritedFileCount(const APaths: array of string;
+  const AMarkerDirectory: string): Integer;
 {$ENDIF}
 
 implementation
@@ -41,9 +51,6 @@ implementation
 {$IFDEF UNIX}
 uses
   BaseUnix,
-  {$IFDEF LINUX}
-  Unix,
-  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -52,22 +59,35 @@ uses
   LWPT.ProcessTree;
 
 const
-  SPAWN_ATTEMPT_TIMEOUT_MILLISECONDS = 10000;
-  CHILD_START_TIMEOUT_MILLISECONDS = 10000;
-  GUARD_OBSERVATION_MILLISECONDS = 100;
-  POLL_MILLISECONDS = 10;
+  GUARD_OBSERVATION_TIMEOUT_MILLISECONDS = 10000;
+  CHILD_REPORT_TIMEOUT_MILLISECONDS = 10000;
+  POLL_MILLISECONDS = 1;
+  REPORT_POLL_MILLISECONDS = 10;
+  { POSIX fixes FD_CLOEXEC at 1; Linux FPC 3.2.2 does not declare it. }
+  FD_CLOEXEC_PROBE = 1;
   CHILD_LIFETIME_SECONDS = '30';
+  {$IFDEF DARWIN}
+  STAT_IDENTITY_ARGUMENTS = '-L -f %d:%i';
+  {$ELSE}
+  STAT_IDENTITY_ARGUMENTS = '-L -c %d:%i';
+  {$ENDIF}
+  { Report every descriptor the shell holds after exec, publish the report
+    atomically, then stay alive so the caller can compare. The glob's own
+    listing descriptor is closed by then and never names a caller file. }
+  REPORTER_SCRIPT = 'for d in /dev/fd/*; do stat '
+    + STAT_IDENTITY_ARGUMENTS + ' "$d" 2>/dev/null; done > "$1.partial"; '
+    + 'mv "$1.partial" "$1"; exec sleep ' + CHILD_LIFETIME_SECONDS;
 
 type
   TProbeSpawner = class(TThread)
   private
-    FReadyPath: string;
+    FReportPath: string;
     FChild: TProcess;
     FErrorMessage: string;
   protected
     procedure Execute; override;
   public
-    constructor Create(const AReadyPath: string);
+    constructor Create(const AReportPath: string);
     destructor Destroy; override;
   end;
 
@@ -77,45 +97,93 @@ var
   ProbeMaximumSpawns: Integer = 0;
   ProbeAttempts: Integer = 0;
   ProbeEscapes: Integer = 0;
+  ProbeUnprotected: Integer = 0;
   ProbeError: string = '';
-  CurrentAttemptPath: string = '';
   Spawners: TList = nil;
-  ReadyPaths: TStringList = nil;
+  ReportPaths: TStringList = nil;
 
-procedure CreateMarker(const APath: string);
-var
-  Handle: THandle;
+function StartReporter(const AReportPath: string): TProcess;
 begin
-  Handle := FileCreate(APath);
-  if Handle <> THandle(-1) then FileClose(Handle);
+  Result := TProcess.Create(nil);
+  try
+    Result.Executable := '/bin/sh';
+    Result.Parameters.Add('-c');
+    Result.Parameters.Add(REPORTER_SCRIPT);
+    Result.Parameters.Add('spawn-guard-probe');
+    Result.Parameters.Add(AReportPath);
+    Result.Options := [poNoConsole];
+    ExecuteUnmanagedProcess(Result);
+  except
+    Result.Free;
+    raise;
+  end;
 end;
 
-function WaitForMarker(const APath: string;
-  const ATimeoutMilliseconds: Integer): Boolean;
+procedure StopReporter(var AChild: TProcess);
+begin
+  if not Assigned(AChild) then Exit;
+  if AChild.Running then
+  begin
+    AChild.Terminate(0);
+    AChild.WaitOnExit;
+  end;
+  FreeAndNil(AChild);
+end;
+
+function WaitForReport(const APath: string): Boolean;
 var
   Started: QWord;
 begin
   Started := GetTickCount64;
   repeat
     if FileExists(APath) then Exit(True);
-    Sleep(POLL_MILLISECONDS);
-  until GetTickCount64 - Started >= QWord(ATimeoutMilliseconds);
+    Sleep(REPORT_POLL_MILLISECONDS);
+  until GetTickCount64 - Started >= CHILD_REPORT_TIMEOUT_MILLISECONDS;
   Result := FileExists(APath);
 end;
 
-procedure RecordError(const AMessage: string);
+function FileIdentity(const APath: string): string;
+var
+  Info: Stat;
 begin
-  if ProbeError = '' then ProbeError := AMessage;
+  Result := '';
+  if FpStat(PChar(APath), Info) = 0 then
+    Result := IntToStr(QWord(Info.st_dev)) + ':' + IntToStr(QWord(Info.st_ino));
 end;
 
-procedure MarkSpawnAttempt;
+function CountReportedFiles(const AReportPath: string;
+  const AIdentities: TStrings): Integer;
+var
+  Report: TStringList;
+  Index: Integer;
 begin
-  CreateMarker(CurrentAttemptPath);
+  Result := 0;
+  Report := TStringList.Create;
+  try
+    Report.LoadFromFile(AReportPath);
+    for Index := 0 to Report.Count - 1 do
+      if AIdentities.IndexOf(Trim(Report[Index])) >= 0 then Inc(Result);
+  finally
+    Report.Free;
+  end;
 end;
 
-constructor TProbeSpawner.Create(const AReadyPath: string);
+function IdentitiesOf(const APaths: array of string): TStringList;
+var
+  Index: Integer;
+  Identity: string;
 begin
-  FReadyPath := AReadyPath;
+  Result := TStringList.Create;
+  for Index := Low(APaths) to High(APaths) do
+  begin
+    Identity := FileIdentity(APaths[Index]);
+    if Identity <> '' then Result.Add(Identity);
+  end;
+end;
+
+constructor TProbeSpawner.Create(const AReportPath: string);
+begin
+  FReportPath := AReportPath;
   FChild := nil;
   FErrorMessage := '';
   FreeOnTerminate := False;
@@ -124,57 +192,67 @@ end;
 
 destructor TProbeSpawner.Destroy;
 begin
-  if Assigned(FChild) then
-  begin
-    if FChild.Running then
-    begin
-      FChild.Terminate(0);
-      FChild.WaitOnExit;
-    end;
-    FChild.Free;
-  end;
+  StopReporter(FChild);
   inherited Destroy;
 end;
 
 procedure TProbeSpawner.Execute;
 begin
   try
-    FChild := TProcess.Create(nil);
-    FChild.Executable := '/bin/sh';
-    FChild.Parameters.Add('-c');
-    FChild.Parameters.Add(': > "$1"; exec sleep ' + CHILD_LIFETIME_SECONDS);
-    FChild.Parameters.Add('spawn-guard-probe');
-    FChild.Parameters.Add(FReadyPath);
-    FChild.Options := [poNoConsole];
-    ExecuteUnmanagedProcess(FChild);
+    FChild := StartReporter(FReportPath);
   except
     on E: Exception do FErrorMessage := E.Message;
   end;
 end;
 
+procedure RecordError(const AMessage: string);
+begin
+  if ProbeError = '' then ProbeError := AMessage;
+end;
+
 procedure ProbeProtectedOpen(const APath: string);
 var
-  AttemptPath, ReadyPath: string;
+  Spawner: TProbeSpawner;
+  Started: QWord;
 begin
   if (ProbeFragment = '') or (Pos(ProbeFragment, APath) = 0) then Exit;
   if ProbeAttempts >= ProbeMaximumSpawns then Exit;
   Inc(ProbeAttempts);
-  AttemptPath := ProbeMarkerDirectory + '/spawn-attempt-'
-    + IntToStr(ProbeAttempts);
-  ReadyPath := ProbeMarkerDirectory + '/child-ready-'
-    + IntToStr(ProbeAttempts);
-  CurrentAttemptPath := AttemptPath;
-  ProcessTreeBeforeUnmanagedSpawnLockTestHook := MarkSpawnAttempt;
-  ReadyPaths.Add(ReadyPath);
-  Spawners.Add(TProbeSpawner.Create(ReadyPath));
-  if not WaitForMarker(AttemptPath, SPAWN_ATTEMPT_TIMEOUT_MILLISECONDS) then
-  begin
-    RecordError('timed out waiting for a concurrent spawn attempt on '
-      + APath);
-    Exit;
-  end;
-  Sleep(GUARD_OBSERVATION_MILLISECONDS);
-  if FileExists(ReadyPath) then Inc(ProbeEscapes);
+  ReportPaths.Add(ProbeMarkerDirectory + '/child-report-'
+    + IntToStr(ProbeAttempts));
+  Spawner := TProbeSpawner.Create(ReportPaths[ReportPaths.Count - 1]);
+  Spawners.Add(Spawner);
+  Started := GetTickCount64;
+  repeat
+    case ObserveProcessHandleSetup(Spawner.ThreadID) of
+      phsWaiting: Exit;
+      phsEntered:
+        begin
+          Inc(ProbeEscapes);
+          Exit;
+        end;
+    end;
+    if Spawner.Finished then
+    begin
+      RecordError('probe spawn ended before reaching the guard: '
+        + Spawner.FErrorMessage);
+      Exit;
+    end;
+    if GetTickCount64 - Started >= GUARD_OBSERVATION_TIMEOUT_MILLISECONDS then
+    begin
+      RecordError('probe spawn never reached the guard for ' + APath);
+      Exit;
+    end;
+    Sleep(POLL_MILLISECONDS);
+  until False;
+end;
+
+procedure InspectProtectedDescriptor(const APath: string;
+  const ADescriptor: LongInt);
+begin
+  if (ProbeFragment = '') or (Pos(ProbeFragment, APath) = 0) then Exit;
+  if (FpFcntl(ADescriptor, F_GETFD) and FD_CLOEXEC_PROBE) = 0 then
+    Inc(ProbeUnprotected);
 end;
 
 procedure ArmSpawnGuardProbe(const APathFragment, AMarkerDirectory: string;
@@ -186,10 +264,13 @@ begin
   ProbeMaximumSpawns := AMaximumSpawns;
   ProbeAttempts := 0;
   ProbeEscapes := 0;
+  ProbeUnprotected := 0;
   ProbeError := '';
   if not Assigned(Spawners) then Spawners := TList.Create;
-  if not Assigned(ReadyPaths) then ReadyPaths := TStringList.Create;
+  if not Assigned(ReportPaths) then ReportPaths := TStringList.Create;
+  ResetProcessHandleSetupObservation;
   ProtectedOpenBeforeProtectionTestHook := ProbeProtectedOpen;
+  ProtectedOpenAfterProtectionTestHook := InspectProtectedDescriptor;
 end;
 
 procedure DisarmSpawnGuardProbe;
@@ -198,6 +279,7 @@ var
   Spawner: TProbeSpawner;
 begin
   ProtectedOpenBeforeProtectionTestHook := nil;
+  ProtectedOpenAfterProtectionTestHook := nil;
   ProbeFragment := '';
   for Index := 0 to Spawners.Count - 1 do
   begin
@@ -206,7 +288,6 @@ begin
     if Spawner.FErrorMessage <> '' then
       RecordError('probe spawn failed: ' + Spawner.FErrorMessage);
   end;
-  ProcessTreeBeforeUnmanagedSpawnLockTestHook := nil;
 end;
 
 function SpawnGuardProbeAttempts: Integer;
@@ -219,6 +300,11 @@ begin
   Result := ProbeEscapes;
 end;
 
+function SpawnGuardProbeUnprotectedDescriptors: Integer;
+begin
+  Result := ProbeUnprotected;
+end;
+
 function SpawnGuardProbeLiveChildren: Integer;
 var
   Index: Integer;
@@ -228,44 +314,26 @@ begin
   for Index := 0 to Spawners.Count - 1 do
   begin
     Spawner := TProbeSpawner(Spawners[Index]);
-    if WaitForMarker(ReadyPaths[Index], CHILD_START_TIMEOUT_MILLISECONDS)
+    if WaitForReport(ReportPaths[Index])
        and Assigned(Spawner.FChild) and Spawner.FChild.Running then
       Inc(Result);
   end;
 end;
 
-function SpawnGuardProbeInheritedDescriptors(
-  const APathFragment: string): Integer;
-{$IFDEF LINUX}
+function SpawnGuardProbeInheritedFiles(const APaths: array of string): Integer;
 var
+  Identities: TStringList;
   Index: Integer;
-  Search: TSearchRec;
-  DescriptorDirectory, Target: string;
-  Spawner: TProbeSpawner;
-{$ENDIF}
 begin
   Result := 0;
-  {$IFDEF LINUX}
-  for Index := 0 to Spawners.Count - 1 do
-  begin
-    Spawner := TProbeSpawner(Spawners[Index]);
-    if not Assigned(Spawner.FChild) or not Spawner.FChild.Running then
-      Continue;
-    DescriptorDirectory := '/proc/' + IntToStr(Spawner.FChild.ProcessID)
-      + '/fd';
-    if FindFirst(DescriptorDirectory + '/*', faAnyFile, Search) <> 0 then
-      Continue;
-    try
-      repeat
-        if (Search.Name = '.') or (Search.Name = '..') then Continue;
-        Target := FpReadLink(DescriptorDirectory + '/' + Search.Name);
-        if Pos(APathFragment, Target) > 0 then Inc(Result);
-      until FindNext(Search) <> 0;
-    finally
-      FindClose(Search);
-    end;
+  Identities := IdentitiesOf(APaths);
+  try
+    for Index := 0 to ReportPaths.Count - 1 do
+      if WaitForReport(ReportPaths[Index]) then
+        Inc(Result, CountReportedFiles(ReportPaths[Index], Identities));
+  finally
+    Identities.Free;
   end;
-  {$ENDIF}
 end;
 
 function SpawnGuardProbeError: string;
@@ -283,7 +351,29 @@ begin
       TProbeSpawner(Spawners[Index]).Free;
     Spawners.Clear;
   end;
-  if Assigned(ReadyPaths) then ReadyPaths.Clear;
+  if Assigned(ReportPaths) then ReportPaths.Clear;
+end;
+
+function ChildInheritedFileCount(const APaths: array of string;
+  const AMarkerDirectory: string): Integer;
+var
+  Child: TProcess;
+  Identities: TStringList;
+  ReportPath: string;
+begin
+  ForceDirectories(AMarkerDirectory);
+  ReportPath := IncludeTrailingPathDelimiter(AMarkerDirectory)
+    + 'reporter-' + IntToStr(GetProcessID) + '-' + IntToStr(GetTickCount64);
+  Identities := IdentitiesOf(APaths);
+  Child := nil;
+  try
+    Child := StartReporter(ReportPath);
+    if not WaitForReport(ReportPath) then Exit(-1);
+    Result := CountReportedFiles(ReportPath, Identities);
+  finally
+    StopReporter(Child);
+    Identities.Free;
+  end;
 end;
 
 initialization
@@ -291,7 +381,7 @@ initialization
 finalization
   ReleaseSpawnGuardProbeChildren;
   Spawners.Free;
-  ReadyPaths.Free;
+  ReportPaths.Free;
 {$ENDIF}
 
 end.

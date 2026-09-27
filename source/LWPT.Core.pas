@@ -141,11 +141,25 @@ function  OpenProtectedDescriptor(const APath: string; const AFlags: LongInt;
 {$IFDEF OBJECTSTORE_TESTING}
 type
   TLWPTProtectedOpenTestHook = procedure(const APath: string);
+  TLWPTProtectedDescriptorTestHook = procedure(const APath: string;
+    const ADescriptor: LongInt);
 
 var
   { Test-only: runs inside the inheritance guard after the open and before
     close-on-exec protection. Production code must leave it nil. }
   ProtectedOpenBeforeProtectionTestHook: TLWPTProtectedOpenTestHook;
+  { Test-only: runs inside the guard once a Unix descriptor is protected, so
+    a test can inspect its close-on-exec flag. Production must leave it nil. }
+  ProtectedOpenAfterProtectionTestHook: TLWPTProtectedDescriptorTestHook;
+
+type
+  TLWPTProcessHandleSetupState = (phsUnobserved, phsWaiting, phsEntered);
+
+{ Test-only observation of the inheritance guard: whether a thread is blocked
+  waiting for it or has entered it since the last reset. }
+procedure ResetProcessHandleSetupObservation;
+function  ObserveProcessHandleSetup(
+  const AThreadID: TThreadID): TLWPTProcessHandleSetupState;
 {$ENDIF}
 
 function  SHA256BytesPrefixed(const ABytes: TBytes): string;
@@ -1353,8 +1367,10 @@ begin
   if D <> '' then ForceDirectories(D);
 end;
 
-{$IFDEF UNIX}
 const
+  { TFileStream.Create's default rights; the process umask still applies. }
+  PROTECTED_CREATE_PERMISSIONS = &666;
+{$IFDEF UNIX}
   { Darwin's BaseUnix declares FD_CLOEXEC; Linux FPC 3.2.2 does not. POSIX
     fixes the value at 1. }
   {$IFDEF LINUX}
@@ -1362,13 +1378,78 @@ const
   {$ELSE}
   FD_CLOEXEC_LWPT = FD_CLOEXEC;
   {$ENDIF}
-  { TFileStream.Create's default rights; the process umask still applies. }
-  PROTECTED_CREATE_PERMISSIONS = &666;
+{$ENDIF}
+
+{$IFDEF OBJECTSTORE_TESTING}
+type
+  TLWPTProcessHandleSetupObservation = record
+    ThreadID: TThreadID;
+    State: TLWPTProcessHandleSetupState;
+  end;
+
+var
+  ProcessHandleSetupObservationCriticalSection: TRTLCriticalSection;
+  ProcessHandleSetupObservations: array of TLWPTProcessHandleSetupObservation;
+
+procedure RecordProcessHandleSetup(const AState: TLWPTProcessHandleSetupState);
+var
+  Index: Integer;
+  ThreadID: TThreadID;
+begin
+  ThreadID := GetCurrentThreadId;
+  EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  try
+    for Index := 0 to High(ProcessHandleSetupObservations) do
+      if ProcessHandleSetupObservations[Index].ThreadID = ThreadID then
+      begin
+        ProcessHandleSetupObservations[Index].State := AState;
+        Exit;
+      end;
+    Index := Length(ProcessHandleSetupObservations);
+    SetLength(ProcessHandleSetupObservations, Index + 1);
+    ProcessHandleSetupObservations[Index].ThreadID := ThreadID;
+    ProcessHandleSetupObservations[Index].State := AState;
+  finally
+    LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  end;
+end;
+
+procedure ResetProcessHandleSetupObservation;
+begin
+  EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  try
+    SetLength(ProcessHandleSetupObservations, 0);
+  finally
+    LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  end;
+end;
+
+function ObserveProcessHandleSetup(
+  const AThreadID: TThreadID): TLWPTProcessHandleSetupState;
+var
+  Index: Integer;
+begin
+  Result := phsUnobserved;
+  EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  try
+    for Index := 0 to High(ProcessHandleSetupObservations) do
+      if ProcessHandleSetupObservations[Index].ThreadID = AThreadID then
+        Exit(ProcessHandleSetupObservations[Index].State);
+  finally
+    LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  end;
+end;
 {$ENDIF}
 
 procedure BeginProcessHandleSetup;
 begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  RecordProcessHandleSetup(phsWaiting);
+  {$ENDIF}
   EnterCriticalSection(ProcessHandleSetupCriticalSection);
+  {$IFDEF OBJECTSTORE_TESTING}
+  RecordProcessHandleSetup(phsEntered);
+  {$ENDIF}
 end;
 
 procedure EndProcessHandleSetup;
@@ -1418,7 +1499,14 @@ begin
       [APath, SysErrorMessage(ErrorCode)]);
   end;
   { TFileStream refuses directories; keep that contract. }
-  if (FpFStat(Descriptor, Info) <> 0) or FpS_ISDIR(Info.st_mode) then
+  if FpFStat(Descriptor, Info) <> 0 then
+  begin
+    ErrorCode := FpGetErrNo;
+    FpClose(Descriptor);
+    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+      [APath, SysErrorMessage(ErrorCode)]);
+  end;
+  if FpS_ISDIR(Info.st_mode) then
   begin
     FpClose(Descriptor);
     raise EFOpenError.CreateFmt('Unable to open file "%s": is a directory',
@@ -1429,7 +1517,8 @@ begin
   { Windows file handles are created non-inheritable. }
   if (AMode and fmCreate) = fmCreate then
   begin
-    Handle := FileCreate(APath, AMode and not fmCreate, 438);
+    Handle := FileCreate(APath, AMode and not fmCreate,
+      PROTECTED_CREATE_PERMISSIONS);
     if Handle = THandle(-1) then
       raise EFCreateError.CreateFmt('Unable to create file "%s": %s',
         [APath, SysErrorMessage(GetLastOSError)]);
@@ -1467,7 +1556,12 @@ begin
       FpClose(Result);
       FpSetErrNo(ErrorCode);
       Result := -1;
+      Exit;
     end;
+    {$IFDEF OBJECTSTORE_TESTING}
+    if Assigned(ProtectedOpenAfterProtectionTestHook) then
+      ProtectedOpenAfterProtectionTestHook(APath, Result);
+    {$ENDIF}
   finally
     EndProcessHandleSetup;
   end;
@@ -1954,5 +2048,8 @@ initialization
   TmpPathStartedAt := Round(Now * MSecsPerDay);
   InitCriticalSection(ProcessEnvironmentCriticalSection);
   InitCriticalSection(ProcessHandleSetupCriticalSection);
+  {$IFDEF OBJECTSTORE_TESTING}
+  InitCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  {$ENDIF}
 
 end.

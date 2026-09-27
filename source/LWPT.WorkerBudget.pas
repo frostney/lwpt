@@ -501,12 +501,12 @@ function NewOpaqueToken: string;
 var
   Bytes : TBytes;
   {$IFDEF UNIX}
-  Stream : TFileStream;
+  Stream : TLWPTProtectedFileStream;
   {$ENDIF}
 begin
   SetLength(Bytes, 32);
   {$IFDEF UNIX}
-  Stream := TFileStream.Create('/dev/urandom',
+  Stream := OpenProtectedFileStream('/dev/urandom',
     fmOpenRead or fmShareDenyNone);
   try
     Stream.ReadBuffer(Bytes[0], Length(Bytes));
