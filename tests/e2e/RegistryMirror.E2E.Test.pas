@@ -13,12 +13,13 @@ uses
 
   HTTPClient,
   TestingPascalLibrary,
+  TOML,
+
   Tests.LwptSubprocess,
   Tests.RegistryOrigin,
   Tests.RegistryProcess,
   Tests.RegistryServer,
-  Tests.Scratch,
-  TOML;
+  Tests.Scratch;
 
 type
   TRegistryMirrorE2E = class(TTestSuite)

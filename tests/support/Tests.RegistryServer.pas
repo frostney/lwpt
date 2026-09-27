@@ -54,7 +54,7 @@ type
     FClients: TList;
     FHandler: TRegistryHTTPRouteHandler;
     FRequestLock: TRTLCriticalSection;
-    FRequestedTargets: TStringList;
+    FRequestedTargets, FRequestedHosts: TStringList;
     {$IFDEF MSWINDOWS}
     FWinSockStarted: Boolean;
     {$ENDIF}
@@ -71,6 +71,8 @@ type
       const ATimeoutMilliseconds: Cardinal = 5000): Boolean;
     { A snapshot of request targets in arrival order; the caller owns it. }
     function RequestedTargets: TStringList;
+    { Host header values in arrival order; the caller owns the list. }
+    function RequestedHosts: TStringList;
     property Handler: TRegistryHTTPRouteHandler read FHandler write FHandler;
     property Port: Word read FPort;
     property RequestCount: Integer read FRequestCount;
@@ -279,6 +281,18 @@ begin
   Result := Copy(ARequest, FirstSpace + 1, SecondSpace - 1);
 end;
 
+function RequestHost(const ARequest: string): string;
+var
+  Start, Finish: Integer;
+begin
+  Result := '';
+  Start := Pos(CRLF + 'Host: ', ARequest);
+  if Start = 0 then Exit;
+  Inc(Start, Length(CRLF + 'Host: '));
+  Finish := Pos(CRLF, Copy(ARequest, Start, MaxInt));
+  if Finish > 0 then Result := Copy(ARequest, Start, Finish - 1);
+end;
+
 function ResponseBytes(const AStatus: Integer; const AMediaType: string;
   const ABody: TBytes): TBytes;
 var
@@ -327,6 +341,7 @@ begin
   FClients := TList.Create;
   InitCriticalSection(FRequestLock);
   FRequestedTargets := TStringList.Create;
+  FRequestedHosts := TStringList.Create;
   FListenSocket := InvalidSocketValue;
   SetRoutes(ARoutes);
   {$IFDEF MSWINDOWS}
@@ -422,6 +437,7 @@ begin
     for I := 0 to FClients.Count - 1 do TObject(FClients[I]).Free;
   FClients.Free;
   FRequestedTargets.Free;
+  FRequestedHosts.Free;
   DoneCriticalSection(FRequestLock);
   CloseTestSocket(FListenSocket);
   {$IFDEF MSWINDOWS}
@@ -466,6 +482,7 @@ begin
   EnterCriticalSection(FRequestLock);
   try
     FRequestedTargets.Add(Path);
+    FRequestedHosts.Add(RequestHost(Request));
   finally
     LeaveCriticalSection(FRequestLock);
   end;
@@ -499,6 +516,17 @@ begin
   end;
   Response := ResponseBytes(404, 'text/plain', BytesOf('missing route: ' + Path));
   SendBytes(Self, AClient, Response);
+end;
+
+function TRegistryTestServer.RequestedHosts: TStringList;
+begin
+  Result := TStringList.Create;
+  EnterCriticalSection(FRequestLock);
+  try
+    Result.Assign(FRequestedHosts);
+  finally
+    LeaveCriticalSection(FRequestLock);
+  end;
 end;
 
 function TRegistryTestServer.RequestedTargets: TStringList;

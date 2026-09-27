@@ -127,6 +127,13 @@ type
     procedure UnsupportedUpstreamsAreRejectedAtConfiguration;
     procedure LocalhostTransportUsesLoopback;
     procedure StaleActivatedMirrorReportsExpiry;
+    procedure OversizedDiagnosticIsBoundedAndNonFatal;
+    procedure RetainedProofMustFitBeforeActivation;
+    procedure PruningKeepsCapturedResources;
+    procedure ActivationStateIsWithinStoreBudget;
+    procedure SleepPastSynchronizationBudget;
+    procedure DeadlineCoversLocalWorkAndActivation;
+    procedure StaleOlderKeyContactKeepsAcceptedState;
   end;
 
 function Package(const ABytes: TBytes): TLWPTRegistryPackage;
@@ -1111,6 +1118,8 @@ begin
     Expect<Boolean>(Pos('signature_payload_mismatch:', Outcome) = 1).ToBe(True);
     Expect<Integer>(Harness.Requested('/v1/checkpoints/latest.toml')).ToBe(2);
     Expect<Integer>(Harness.Requested('/v1/checkpoints/latest.sig.toml')).ToBe(1);
+    { A pair already known to be unusable stops before key retrieval. }
+    Expect<Integer>(Harness.Requested('/v1/keys/')).ToBe(0);
   finally
     Harness.Free;
   end;
@@ -1295,23 +1304,28 @@ end;
 procedure TMirrorTransferTests.LocalhostTransportUsesLoopback;
 var
   Harness: TOriginHarness;
+  Hosts: TStringList;
+  Host: string;
 begin
-  Expect<string>(RegistryMirrorTransportURLForTesting('http://localhost:8080/v1/capabilities'))
-    .ToBe('http://127.0.0.1:8080/v1/capabilities');
-  Expect<string>(RegistryMirrorTransportURLForTesting('http://localhost/v1'))
-    .ToBe('http://127.0.0.1/v1');
-  Expect<string>(RegistryMirrorTransportURLForTesting('http://localhost'))
-    .ToBe('http://127.0.0.1');
-  Expect<string>(RegistryMirrorTransportURLForTesting('http://localhost.example/v1'))
-    .ToBe('http://localhost.example/v1');
-  Expect<string>(RegistryMirrorTransportURLForTesting('https://localhost:8443/v1'))
-    .ToBe('https://localhost:8443/v1');
+  Expect<string>(RegistryMirrorConnectAddressForTesting('http://localhost:8080/v1/capabilities'))
+    .ToBe('127.0.0.1');
+  Expect<string>(RegistryMirrorConnectAddressForTesting('http://localhost/v1')).ToBe('127.0.0.1');
+  Expect<string>(RegistryMirrorConnectAddressForTesting('http://localhost')).ToBe('127.0.0.1');
+  Expect<string>(RegistryMirrorConnectAddressForTesting('http://localhost.example/v1')).ToBe('');
+  Expect<string>(RegistryMirrorConnectAddressForTesting('https://localhost:8443/v1')).ToBe('');
   { The configured identity still names localhost end to end. }
   Harness := TOriginHarness.Create('mirror-loopback');
+  Hosts := nil;
   try
     Expect<Boolean>(Pos('http://localhost:', Harness.Mirror.Config.UpstreamURL) = 1).ToBe(True);
     Expect<string>(Harness.Sync).ToBe('ok');
+    { Only the connection address is pinned; the authority is preserved. }
+    Hosts := Harness.Server.RequestedHosts;
+    Expect<Boolean>(Hosts.Count > 0).ToBe(True);
+    for Host in Hosts do
+      Expect<string>(Host).ToBe('localhost:' + IntToStr(Harness.Server.Port));
   finally
+    Hosts.Free;
     Harness.Free;
   end;
 end;
@@ -1355,6 +1369,233 @@ begin
   end;
 end;
 
+function TreeBytes(const ADirectory: string): Int64;
+var
+  Search: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(ADirectory + '/*', faAnyFile, Search) <> 0 then Exit;
+  try
+    repeat
+      if (Search.Name = '.') or (Search.Name = '..') then Continue;
+      if (Search.Attr and faDirectory) <> 0 then
+        Inc(Result, TreeBytes(ADirectory + '/' + Search.Name))
+      else Inc(Result, Search.Size);
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+procedure TMirrorTransferTests.OversizedDiagnosticIsBoundedAndNonFatal;
+var
+  Harness: TOriginHarness;
+  Discovery, Outcome: string;
+  Reopened: TLWPTRegistryMirror;
+  Lines: TStringList;
+begin
+  Harness := TOriginHarness.Create('mirror-oversized-diagnostic');
+  Reopened := nil;
+  Lines := TStringList.Create;
+  try
+    Lines.Text := AsText(Harness.Body('/.well-known/' + PROGRAM_NAME + '-registry'));
+    { An unsigned field name of 600,000 backslashes, reflected by the parser. }
+    Lines[0] := StringOfChar('\', 600000) + ' = "x"';
+    Discovery := Lines.Text;
+    Harness.Override('/.well-known/' + PROGRAM_NAME + '-registry', BytesOf(Discovery));
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('non_canonical_document:', Outcome) = 1).ToBe(True);
+    Expect<Boolean>(Length(Outcome) < 1024).ToBe(True);
+    Expect<Boolean>(TreeBytes(Harness.Mirror.Root + '/state') < 16384).ToBe(True);
+    { The failure record never prevents reopening, verifying, or serving. }
+    Reopened := TLWPTRegistryMirror.Create(Harness.Mirror.Root);
+    Expect<Boolean>(Pos('outcome = "failed"', Reopened.VerifyMirror) > 0).ToBe(True);
+    Harness.ClearOverrides;
+    Expect<string>(Harness.Sync).ToBe('ok');
+  finally
+    Lines.Free;
+    Reopened.Free;
+    Harness.Free;
+  end;
+end;
+
+{ Three prior rotations make retained proof larger than the acquisition
+  bundle if their key records are not counted. }
+function RetainedProofDocuments(const ALimit: Integer; out AAccepted: Boolean): Integer;
+var
+  Harness: TOriginHarness;
+  Limits: TLWPTRegistryVerificationLimits;
+  Index: Integer;
+  Key: string;
+begin
+  Harness := TOriginHarness.Create('mirror-retained-count');
+  try
+    for Index := 1 to 3 do
+    begin
+      Key := InspectRegistryCheckpoint(Harness.Body('/v1/checkpoints/latest.toml')).KeyId;
+      Harness.Origin.RotateKey(Key, RegistryTimestampNow);
+    end;
+    if Harness.Sync <> 'ok' then raise Exception.Create('initial rotated sync failed');
+    Harness.Publish('after-rotations');
+    Limits := DefaultRegistryVerificationLimits;
+    if ALimit > 0 then
+    begin
+      Limits.Documents := ALimit;
+      SetRegistryVerificationLimitsForTesting(Limits, True);
+    end;
+    try
+      AAccepted := Harness.Sync = 'ok';
+      { The smallest document limit the retained state verifies under. }
+      Result := 0;
+      for Index := 2 to 200 do
+      begin
+        Limits.Documents := Index;
+        SetRegistryVerificationLimitsForTesting(Limits, True);
+        try
+          Harness.Mirror.VerifyMirror;
+          Exit(Index);
+        except
+          on E: ELWPTRegistryError do;
+        end;
+      end;
+    finally
+      SetRegistryVerificationLimitsForTesting(Limits, False);
+    end;
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.RetainedProofMustFitBeforeActivation;
+var
+  Required, Constrained: Integer;
+  Accepted: Boolean;
+begin
+  Required := RetainedProofDocuments(0, Accepted);
+  Expect<Boolean>(Accepted).ToBe(True);
+  Expect<Boolean>(Required > 0).ToBe(True);
+  { One document short of what serving needs for the incremental head. }
+  Constrained := RetainedProofDocuments(Required - 1, Accepted);
+  Expect<Boolean>(Accepted).ToBe(False);
+  { The previous accepted state stays loadable under the same limit. }
+  Expect<Boolean>((Constrained > 0) and (Constrained <= Required - 1)).ToBe(True);
+end;
+
+procedure TMirrorTransferTests.PruningKeepsCapturedResources;
+var
+  Harness: TOriginHarness;
+  View: TLWPTRegistryReadView;
+  CheckpointPath, CheckpointHash: string;
+begin
+  { Equal budgets leave no headroom, so every synchronization prunes. }
+  Harness := TOriginHarness.Create('mirror-prune-captured', '',
+    Int64(64) * 1024 * 1024, Int64(64) * 1024 * 1024);
+  View := nil;
+  try
+    Harness.Publish('one');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    View := Harness.Mirror.CaptureReadView;
+    CheckpointPath := Harness.Mirror.Root + '/' + View.State.CheckpointPath;
+    CheckpointHash := View.State.CheckpointHash;
+    Harness.Publish('two');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    Harness.Publish('three');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    { A request that captured the first generation can still read it. }
+    Expect<Boolean>(FileExists(CheckpointPath)).ToBe(True);
+    Expect<string>(SHA256BytesPrefixed(ReadFileBytes(CheckpointPath))).ToBe(CheckpointHash);
+  finally
+    View.Free;
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.ActivationStateIsWithinStoreBudget;
+var
+  Harness: TOriginHarness;
+  Required: Int64;
+  Outcome: string;
+begin
+  Harness := TOriginHarness.Create('mirror-budget-measure', FixturePublishedAt,
+    Int64(64) * 1024 * 1024, Int64(64) * 1024 * 1024);
+  try
+    SetRegistryClockForTesting(FixtureNow);
+    Harness.Publish('large', FixturePublishedAt, 1536 * 1024);
+    Expect<string>(Harness.Sync).ToBe('ok');
+    Required := TreeBytes(Harness.Mirror.Root);
+  finally
+    Harness.Free;
+  end;
+  { The same synchronization with one byte less than its final directory
+    size must fail before activation instead of overshooting the cap. }
+  Harness := TOriginHarness.Create('mirror-budget-exact', FixturePublishedAt,
+    Required - 1, Required - 1);
+  try
+    Harness.Publish('large', FixturePublishedAt, 1536 * 1024);
+    Outcome := Harness.Sync;
+    Expect<Boolean>((Pos('mirror_store_budget_exceeded:', Outcome) = 1)
+      or (Pos('mirror_sync_budget_exceeded:', Outcome) = 1)).ToBe(True);
+    Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
+    Expect<Boolean>(TreeBytes(Harness.Mirror.Root) <= Required - 1).ToBe(True);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.SleepPastSynchronizationBudget;
+begin
+  Sleep(2500);
+end;
+
+procedure TMirrorTransferTests.DeadlineCoversLocalWorkAndActivation;
+var
+  Harness: TOriginHarness;
+  Outcome: string;
+begin
+  Harness := TOriginHarness.Create('mirror-deadline-local');
+  try
+    Harness.Publish('one');
+    RegistryMirrorSynchronizationBudgetForTesting(Harness.Mirror, 2000);
+    { Every request completes; only local work runs past the budget. }
+    RegistryMirrorBeforeActivateForTesting(Harness.Mirror, SleepPastSynchronizationBudget);
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('mirror_sync_deadline_exceeded:', Outcome) = 1).ToBe(True);
+    Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.StaleOlderKeyContactKeepsAcceptedState;
+var
+  Harness: TOriginHarness;
+  OldCheckpoint, OldSignature: TBytes;
+  PointerBefore, Outcome: string;
+  PagesBefore: Integer;
+begin
+  Harness := TOriginHarness.Create('mirror-stale-older-key');
+  try
+    Harness.Publish('one');
+    OldCheckpoint := Harness.Body('/v1/checkpoints/latest.toml');
+    OldSignature := Harness.Body('/v1/checkpoints/latest.sig.toml');
+    Harness.Origin.RotateKey(Harness.Mirror.Config.TrustKeyID, RegistryTimestampNow);
+    Expect<string>(Harness.Sync).ToBe('ok');
+    PointerBefore := AsText(ReadFileBytes(Harness.Mirror.Root + '/state/current.toml'));
+    PagesBefore := Harness.Requested('/v1/rotations?');
+    { A contact still serving the pre-rotation checkpoint, signed by the
+      root key that the accepted chain has already rotated away from. }
+    Harness.Override('/v1/checkpoints/latest.toml', OldCheckpoint);
+    Harness.Override('/v1/checkpoints/latest.sig.toml', OldSignature);
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('checkpoint_downgrade:', Outcome) = 1).ToBe(True);
+    Expect<Integer>(Harness.Requested('/v1/rotations?')).ToBe(PagesBefore);
+    Expect<string>(AsText(ReadFileBytes(Harness.Mirror.Root + '/state/current.toml')))
+      .ToBe(PointerBefore);
+  finally
+    Harness.Free;
+  end;
+end;
+
 procedure TMirrorTransferTests.SetupTests;
 begin
   Test('archive admission arithmetic is overflow safe', AdmissionArithmetic);
@@ -1381,6 +1622,12 @@ begin
   Test('IPv6 upstreams are rejected at configuration time', UnsupportedUpstreamsAreRejectedAtConfiguration);
   Test('the localhost HTTP exception connects to loopback directly', LocalhostTransportUsesLoopback);
   Test('an activated mirror becoming stale is reported with unchanged proof', StaleActivatedMirrorReportsExpiry);
+  Test('an oversized upstream diagnostic is bounded and never blocks reopening', OversizedDiagnosticIsBoundedAndNonFatal);
+  Test('an incremental head is activated only if its retained proof fits serving limits', RetainedProofMustFitBeforeActivation);
+  Test('pruning keeps resources a captured read still needs', PruningKeepsCapturedResources);
+  Test('activation state is charged to the store budget', ActivationStateIsWithinStoreBudget);
+  Test('the synchronization deadline covers local work and activation', DeadlineCoversLocalWorkAndActivation);
+  Test('a stale contact under an earlier chain key keeps accepted state', StaleOlderKeyContactKeepsAcceptedState);
 end;
 
 procedure RunIncompleteClient;

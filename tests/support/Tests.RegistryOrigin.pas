@@ -83,11 +83,48 @@ begin
   Result := Response.Body;
 end;
 
+{ The checkpoint this data directory serves, or nothing before activation.
+  Its bytes name a unique key and time, so they identify the listener. }
+function ServedCheckpoint(const ADataDirectory: string): string;
+var
+  Parser: TTOMLParser;
+  Root: TTOMLNode;
+  StateText: string;
+  Stream: TFileStream;
+begin
+  Result := '';
+  if not FileExists(ADataDirectory + '/state/current.toml') then Exit;
+  Stream := TFileStream.Create(ADataDirectory + '/state/current.toml', fmOpenRead);
+  try
+    SetLength(StateText, Stream.Size);
+    if Length(StateText) > 0 then Stream.ReadBuffer(StateText[1], Length(StateText));
+  finally
+    Stream.Free;
+  end;
+  Parser := TTOMLParser.Create;
+  try
+    Root := Parser.ParseDocument(StateText);
+    try
+      Stream := TFileStream.Create(ADataDirectory + '/' + TomlStr(Root, 'checkpoint', ''), fmOpenRead);
+      try
+        SetLength(Result, Stream.Size);
+        if Length(Result) > 0 then Stream.ReadBuffer(Result[1], Length(Result));
+      finally
+        Stream.Free;
+      end;
+    finally
+      Root.Free;
+    end;
+  finally
+    Parser.Free;
+  end;
+end;
+
 function StartRegistryCLI(const ADataDirectory, ABaseURL: string): TProcess;
 var
   Started: QWord;
   Ready: Boolean;
-  LastProbe, ExitState, Diagnostics, Discovery: string;
+  LastProbe, ExitState, Diagnostics, Discovery, Checkpoint, Expected: string;
   Body: TBytes;
 begin
   Result := TProcess.Create(nil);
@@ -109,7 +146,16 @@ begin
         { Another process may have bound the port first; only this registry's
           discovery document proves readiness. }
         Ready := Result.Running and (Pos('base_url = "' + ABaseURL + '"', Discovery) > 0);
-        if not Ready then LastProbe := 'listener did not serve this registry''s discovery';
+        { Colliding fixtures can share a base URL; the served checkpoint
+          proves the listener serves this data directory. }
+        Expected := ServedCheckpoint(ADataDirectory);
+        if Ready and (Expected <> '') then
+        begin
+          Body := RegistryHTTPBody(ABaseURL + '/v1/checkpoints/latest.toml');
+          SetString(Checkpoint, PAnsiChar(@Body[0]), Length(Body));
+          Ready := Checkpoint = Expected;
+        end;
+        if not Ready then LastProbe := 'listener did not serve this registry';
       except
         on E: Exception do LastProbe := Copy(E.Message, 1, 1024);
       end;

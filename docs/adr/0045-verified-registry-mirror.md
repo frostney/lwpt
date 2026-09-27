@@ -60,15 +60,23 @@ checkpoint sequence. The same rule applies to rotated key records and
 dual-signed rotation triplets. Their HTTP routes expose only the bound chain.
 
 The server classifies each request target before it captures any state, so
-unknown or malformed routes never load or verify retained proof. A mirror
-verifies its complete retained proof once per accepted state and shares that
-immutable generation with every request that captures the same
-`state/current.toml` bytes. Generation construction is serialized per store,
-so concurrent requests after an activation perform one verification, and
-waiting requests keep observing their own deadlines. Each served resource is
-opened against the digest authenticated when the generation was built. Bytes
-replaced afterwards are refused with `resource_hash_mismatch` instead of being
-served. Origins keep verifying the current checkpoint on every request and
+unknown or malformed routes, including checkpoint paths other than numeric
+and content-addressed renewal forms, never load or verify retained proof. A
+mirror that has never activated publishes nothing and answers 404; corrupt
+state after activation still fails. A mirror verifies its complete retained
+proof once per accepted state and shares that immutable generation with every
+request that captures the same `state/current.toml` bytes. Each request reads
+the pointer only after taking the per-store generation lock, so construction
+is serialized, concurrent requests after an activation perform one
+verification, and a delayed reader cannot replace a newer generation with the
+one it would otherwise have observed earlier. Waiting requests keep observing
+their own deadlines, and verification checks them between rotation and
+history steps. Each served resource is opened against the digest
+authenticated when the generation was built. Bytes replaced at their path
+afterwards are refused with `resource_hash_mismatch` instead of being served.
+The server hashes an opened file and then reads it again to send it, so this
+guarantee does not cover a local writer modifying an already-open file in
+place; that writer is outside the trusted-storage boundary below. Origins keep verifying the current checkpoint on every request and
 share one bounded history verification per accepted head for snapshot, record,
 and object membership. Pending origin snapshots remain hidden.
 
@@ -79,10 +87,14 @@ previous pointer remains current.
 
 `state/sync-attempt.toml` records the current attempt separately from the
 accepted state. After acquiring the publication lease, synchronization writes
-an `attempt_id`, `started_at`, and `outcome = "in_progress"`. It then records
-`verified`, `activated`, or `failed` with the original error. Recording an
-outcome is best-effort: if that write fails, synchronization reports its own
-failure rather than the recording error. When a process opens a mirror whose
+an `attempt_id`, `started_at`, and `outcome = "in_progress"`; that initial
+record is required. It then records `verified`, `activated`, or `failed` with
+the original error. Those later outcomes are best-effort: if a write fails,
+synchronization neither aborts an otherwise verified activation nor replaces
+its own failure with the recording error. An error may reflect upstream
+bytes, so the record persists at most 1,024 characters of it and never
+exceeds 2 KiB. A malformed or oversized record never prevents opening,
+verifying, or serving accepted state. When a process opens a mirror whose
 record is still `in_progress` while the lease is free, it marks that attempt
 `abandoned`. An attempt marked `verified` is not activation proof; the current
 pointer and its successful sync time remain authoritative. Writes use the
@@ -122,10 +134,18 @@ Disk use has two operator-configurable budgets, set with
 8 GiB; it must be at least 1 MiB and no larger than the store budget. Every new
 metadata document is charged before it is written. The complete authenticated
 archive plan is reserved before the first archive request, so an oversized
-plan fails without transferring anything. Unaccepted candidates are kept for
-retry only while a complete attempt still fits. When the data directory has
-less than one attempt budget of headroom, synchronization first removes
-content outside the accepted generation, then reserves.
+plan fails without transferring anything. Two attempt-record copies and the
+complete new activation pointer, which is staged beside the old one, are
+reserved too, so a synchronization that fits its reservations also fits the
+directory cap. Unaccepted candidates are kept for retry only while a complete
+attempt still fits. When the data directory has less than one attempt budget
+of headroom, synchronization first removes unaccepted archives, records, and
+snapshots, then reserves. Accepted bulk content only grows along one history,
+so every earlier generation's archives, records, and snapshots remain in the
+current one. Signed control documents, meaning checkpoints, signatures, key
+records, and rotation documents, are never pruned: a request that captured an
+earlier generation may still open them. Creating new ones requires a valid
+origin signature, and they remain charged to the store budget.
 
 Discovery, checkpoint, key, rotation, signature, and
 rotation-page control documents are limited to 1 MiB. The shared verifier
@@ -135,7 +155,13 @@ charges discovery, capabilities, key records, and pagination bytes against
 that same budget before retention. These untrusted retrieval documents confer
 no authority and are unnecessary for offline verification. Each request has a
 120-second deadline, and one complete synchronization has a 60-minute budget;
-every request uses the smaller of the two remaining allowances. Redirects are
+every request uses the smaller of the two remaining allowances. The budget is
+also checked between local steps: each retained-proof read, each rotation and
+snapshot verification step, cached-archive hashing, archive pairs, the
+pre-activation verification, and immediately before the pointer is replaced.
+A synchronization that exceeds it is never activated. Individual Ed25519
+operations, single-document parsing, and synchronous DNS resolution are not
+interruptible. Redirects are
 not followed, and encoded response bodies are rejected. Discovery endpoints
 must remain under the configured upstream base URL, and the path below it may
 contain only unreserved characters in non-empty, non-dot segments. A
@@ -143,12 +169,24 @@ percent-encoded separator such as `..%2F` could otherwise be decoded into
 another path by an intermediary. The plain-HTTP `localhost` development
 exception connects to `127.0.0.1` directly rather than trusting resolver
 configuration, matching the listener, which binds `localhost` as `127.0.0.1`.
+HTTPClient's `ConnectAddress` option pins only the connection address. The
+request keeps its URL authority, so the `Host` header still names `localhost`
+and its port.
 
 The checkpoint and its signature come from two mutable `latest` URLs. When the
 signature names a different checkpoint, synchronization re-reads the
 checkpoint. A changed checkpoint means the upstream published between the
-reads, and the pair is fetched again, at most three times. An unchanged
-checkpoint is a genuine mismatch and verification rejects it.
+reads, and the pair is fetched again, at most three times. A malformed
+signature envelope, an unchanged checkpoint, or an exhausted retry fails
+immediately with `signature_payload_mismatch`, before any key record or
+rotation page is requested.
+
+Acquisition charges the retained key records of previously accepted rotations
+against the same limits as the proof itself. After archives are transferred,
+synchronization writes the prospective state's proof documents and verifies
+that exact state from disk, as serving and restart will, under the same
+limits. A head whose retained proof could not be loaded again is never
+activated.
 
 Synchronization checks current expiry before fetching content and again
 immediately before activation, after retained-proof verification and immutable
@@ -160,7 +198,14 @@ renewal therefore cannot shorten established freshness, while identical bytes
 remain an idempotent replay. Expired, downgraded, and rolled-back checkpoints
 raise `ELWPTRegistryStaleContactError`, a subclass of the registry error. It
 marks a stale contact rather than a trust failure, which is what the client
-failover rule in the protocol specification needs. Executable contact
+failover rule in the protocol specification needs. The verifier classifies a
+response as stale only after every trust check has passed: the signature,
+the rotation chain, the accepted key, same-sequence equivocation, and history.
+An older checkpoint is authenticated by the key its own sequence falls under
+in the accepted chain, so a contact still serving a pre-rotation checkpoint
+is stale rather than untrusted. Its snapshot must match the accepted history
+at that sequence; otherwise it is equivocation. Synchronization never
+retrieves rotations for a checkpoint that is not newer than accepted state. Executable contact
 selection belongs to [issue #62](https://github.com/frostney/lwpt/issues/62).
 Local verification and serving retain exact accepted proof without renewing or
 changing its timestamps. `verify` reports `fresh`, `expired`, or

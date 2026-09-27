@@ -458,6 +458,22 @@ begin
   end;
 end;
 
+{ Numeric checkpoints and content-addressed renewals, each with its signature. }
+function CheckpointRouteIsWellFormed(const AName: string): Boolean;
+var
+  Name: string;
+  Sequence: Int64;
+begin
+  Name := AName;
+  if EndsStr('.sig.toml', Name) then Delete(Name, Length(Name) - 8, 9)
+  else if EndsStr('.toml', Name) then Delete(Name, Length(Name) - 4, 5)
+  else Exit(False);
+  if StartsStr('renewals/sha256/', Name) then
+    Exit(IsLowerHex64(Copy(Name, Length('renewals/sha256/') + 1, MaxInt)));
+  Result := TryStrToInt64(Name, Sequence) and (Sequence > 0)
+    and (IntToStr(Sequence) = Name);
+end;
+
 function RotationPageResponse(AStore: TLWPTRegistryStore;
   AView: TLWPTRegistryReadView; const AQuery: string;
   AProgress: TSHA256Progress): TLWPTRegistryHTTPResponse;
@@ -527,11 +543,14 @@ begin
         Break;
       end;
       if Count > 0 then Body := Body + ', ';
-      Prefix := AStore.Config.BaseURL + '/v1/rotations/' + Entry;
+      Prefix := AStore.Config.BaseURL + '/v1/';
       Body := Body + '{ effective_sequence = ' + Entry
-        + ', rotation = ' + RegistryTOMLQuote(Prefix + '.toml')
-        + ', old_signature = ' + RegistryTOMLQuote(Prefix + '.old.sig.toml')
-        + ', new_signature = ' + RegistryTOMLQuote(Prefix + '.new.sig.toml') + ' }';
+        + ', rotation = ' + RegistryTOMLQuote(Prefix + RegistryRotationPath(Sequence,
+          RegistryRotationDocumentSuffix))
+        + ', old_signature = ' + RegistryTOMLQuote(Prefix + RegistryRotationPath(Sequence,
+          RegistryRotationOldSignatureSuffix))
+        + ', new_signature = ' + RegistryTOMLQuote(Prefix + RegistryRotationPath(Sequence,
+          RegistryRotationNewSignatureSuffix)) + ' }';
       Inc(Count);
       LastSequence := Sequence;
     end;
@@ -729,7 +748,8 @@ begin
     Relative := RegistryKeyStoragePath(KeyID);
     MediaType := 'key';
   end
-  else if StartsStr('/v1/checkpoints/', APIPath) and EndsStr('.toml', APIPath) then
+  else if StartsStr('/v1/checkpoints/', APIPath)
+    and CheckpointRouteIsWellFormed(Copy(APIPath, Length('/v1/checkpoints/') + 1, MaxInt)) then
   begin
     Relative := Copy(APIPath, Length('/v1/') + 1, MaxInt);
     if EndsStr('.sig.toml', APIPath) then MediaType := 'signature'
@@ -737,6 +757,10 @@ begin
     Immutable := False;
   end
   else
+    Exit(ErrorResponse(404, 'Not Found', 'not_found',
+      'registry resource was not found'));
+  { A mirror publishes nothing before its first activation. }
+  if not AStore.HasAcceptedState then
     Exit(ErrorResponse(404, 'Not Found', 'not_found',
       'registry resource was not found'));
   View := AStore.CaptureReadView(AProgress);

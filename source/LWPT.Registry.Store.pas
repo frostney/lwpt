@@ -166,6 +166,7 @@ type
       TLWPTRegistryState;
     function ReadCurrentStateBytes(AProgress: TSHA256Progress = nil): TBytes;
     function StateFromBytes(const ABytes: TBytes): TLWPTRegistryState;
+    function StateDocumentBytes(const AState: TLWPTRegistryState): TBytes;
     procedure WriteImmutable(const ARelative: string;
       const ABytes: TBytes);
     procedure ActivateState(const AState: TLWPTRegistryState);
@@ -174,6 +175,8 @@ type
     procedure EnterGeneration(AProgress: TSHA256Progress);
     procedure LeaveGeneration;
   public
+    { False only before a mirror's first activation. }
+    function HasAcceptedState: Boolean;
     constructor Create(const ARoot: string); virtual;
     destructor Destroy; override;
     { Snapshot, record, and object membership of an accepted head, verified
@@ -2197,6 +2200,16 @@ begin
   Result := StateFromBytes(ReadCurrentStateBytes(AProgress));
 end;
 
+function TLWPTRegistryStore.StateDocumentBytes(const AState: TLWPTRegistryState): TBytes;
+begin
+  Result := Bytes(RegistryStateDocument(AState));
+end;
+
+function TLWPTRegistryStore.HasAcceptedState: Boolean;
+begin
+  Result := FileExists(RootPath(CURRENT_STATE_FILE));
+end;
+
 function TLWPTRegistryStore.StateFromBytes(const ABytes: TBytes): TLWPTRegistryState;
 begin
   Result := ParseState(Text(ABytes));
@@ -2271,14 +2284,14 @@ begin
 end;
 
 type
-  TRegistryStoredDocumentSource = class(TLWPTRegistryDocumentSource)
+  TLWPTRegistryStoredDocumentSource = class(TLWPTRegistryDocumentSource)
   public
     Store: TLWPTRegistryStore;
     Progress: TSHA256Progress;
     function ReadDocument(const APath: string; const AMaximumBytes: Int64): TBytes; override;
   end;
 
-function TRegistryStoredDocumentSource.ReadDocument(const APath: string;
+function TLWPTRegistryStoredDocumentSource.ReadDocument(const APath: string;
   const AMaximumBytes: Int64): TBytes;
 begin
   Result := Store.LoadResource(APath, Progress, AMaximumBytes);
@@ -2476,7 +2489,7 @@ procedure TLWPTRegistryStore.AcquireHistory(const AState: TLWPTRegistryState;
   out AReference: IInterface);
 var
   Key, Digest: string;
-  Source: TRegistryStoredDocumentSource;
+  Source: TLWPTRegistryStoredDocumentSource;
   Document: TLWPTRegistryDocument;
   Generation: TLWPTRegistryGeneration;
   Reference: IInterface;
@@ -2496,7 +2509,7 @@ begin
     {$ENDIF}
     Generation := TLWPTRegistryGeneration.Create(Key);
     Reference := Generation;
-    Source := TRegistryStoredDocumentSource.Create;
+    Source := TLWPTRegistryStoredDocumentSource.Create;
     try
       Source.Store := Self;
       Source.Progress := AProgress;
@@ -2711,7 +2724,7 @@ procedure TLWPTRegistryStore.CommitCheckpoint(var AState: TLWPTRegistryState;
   const ASeed: TLWPTEd25519Seed);
 var
   Checkpoint, Signature: TBytes;
-  Source: TRegistryStoredDocumentSource;
+  Source: TLWPTRegistryStoredDocumentSource;
   SnapshotHash: string;
   NextSequence: QWord;
 begin
@@ -2721,7 +2734,7 @@ begin
   { Serving validates the complete history under the shared verifier limits.
     A head that verifier would refuse is never named by a checkpoint, so the
     previous pointer remains the served head. }
-  Source := TRegistryStoredDocumentSource.Create;
+  Source := TLWPTRegistryStoredDocumentSource.Create;
   try
     Source.Store := Self;
     VerifyRegistrySnapshotHistory(FConfig.Identity, SnapshotHash, NextSequence,
