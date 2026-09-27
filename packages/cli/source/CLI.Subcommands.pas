@@ -242,30 +242,34 @@ begin
     Write(' ', ASub.UsageArg);
   WriteLn;
 
-  if Length(ASub.Options) = 0 then Exit;
+  if Length(ASub.Options) > 0 then
+  begin
+    WriteLn;
+    WriteLn('options:');
+
+    { compute max option-token width for aligned descriptions.
+      FormatForHelp (not the bare long name) so valued options show
+      their value shape (--name=<value>, --name=<N>, --name=a|b) and
+      every surface rendered from the registry — this help text and the
+      host program's agents block — stays identical by construction. }
+    MaxOptWidth := 0;
+    for i := 0 to High(ASub.Options) do
+    begin
+      W := Length(ASub.Options[i].FormatForHelp);
+      if W > MaxOptWidth then MaxOptWidth := W;
+    end;
+
+    for i := 0 to High(ASub.Options) do
+    begin
+      OptName := ASub.Options[i].FormatForHelp;
+      Write('  ', OptName);
+      for W := Length(OptName) to MaxOptWidth do Write(' ');
+      WriteLn('  ', ASub.Options[i].HelpText);
+    end;
+  end;
 
   WriteLn;
-  WriteLn('options:');
-
-  { compute max option-token width for aligned descriptions.
-    FormatForHelp (not the bare long name) so valued options show
-    their value shape (--name=<value>, --name=<N>, --name=a|b) and
-    every surface rendered from the registry — this help text and the
-    host program's agents block — stays identical by construction. }
-  MaxOptWidth := 0;
-  for i := 0 to High(ASub.Options) do
-  begin
-    W := Length(ASub.Options[i].FormatForHelp);
-    if W > MaxOptWidth then MaxOptWidth := W;
-  end;
-
-  for i := 0 to High(ASub.Options) do
-  begin
-    OptName := ASub.Options[i].FormatForHelp;
-    Write('  ', OptName);
-    for W := Length(OptName) to MaxOptWidth do Write(' ');
-    WriteLn('  ', ASub.Options[i].HelpText);
-  end;
+  WriteLn('run "', AProgramName, ' --help" to see all commands');
 end;
 
 { Walk the real argv (positions 2..) looking for --help / -h / help.

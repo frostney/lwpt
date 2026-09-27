@@ -1317,7 +1317,7 @@ var
   CurrentCompilerCapabilities: TLWPTCompilerCapabilities;
   WholePostBuild: THookArray;
   HookEnvironment: array of string;
-  HasEdges, MadeProgress: Boolean;
+  HasEdges, MadeProgress, AwaitingCapacity: Boolean;
   StartedAt, NowTick: QWord;
   StartTicks: array of QWord;
   Reported: array of Boolean;
@@ -1708,6 +1708,7 @@ begin
         while Completed < SelectedCount do
         begin
           MadeProgress := False;
+          AwaitingCapacity := False;
 
           for i := 0 to High(Man.BuildEntries) do
             if (States[i] = besPending)
@@ -1732,8 +1733,12 @@ begin
                  States) then Continue;
             { Never block the scheduler waiting for a machine slot: an
               already-running entry may be the work that returns it. }
-            Lease := WorkerSession.Acquire(0);
-            if not Assigned(Lease) then Break;
+            Lease := WorkerSession.PollAcquire;
+            if not Assigned(Lease) then
+            begin
+              AwaitingCapacity := True;
+              Break;
+            end;
             try
               try
                 PrintStart(i);
@@ -1774,6 +1779,8 @@ begin
             end;
             MadeProgress := True;
           end;
+
+          if not AwaitingCapacity then WorkerSession.CancelPendingAcquire;
 
           for i := 0 to High(Jobs) do
             if Assigned(Jobs[i]) and Jobs[i].IsDone then

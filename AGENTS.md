@@ -1,5 +1,8 @@
 # Agent Instructions
 
+Using LWPT to scaffold another project? Start with the [consumer guide](docs/consumer-guide.md)
+and [llms.txt](llms.txt). The constraints below govern changes to LWPT itself.
+
 LWPT is a single-binary Pascal toolkit driven by a single `lwpt.toml` manifest. Fifteen command families (`init`, `install`, `add`, `remove`, `outdated`, `update`, `build`, `format`, `duplication`, `test`, `repair`, `registry`, `run`, `health`, `agents`) sit on top of a shared core that emits FPC response fragments the rest of the toolkit consumes.
 
 This file is the operating manual for AI assistants and the canonical contract for what agents may not violate. Detailed how-to material lives under [`docs/`](./docs/); when this file mentions a topic in a sentence or two, the canonical home is one link away.

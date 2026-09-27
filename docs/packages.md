@@ -22,6 +22,13 @@ transition window, and the bootstrap chicken-and-egg story.
 - **No patch markers** in source. Per ADR-0017's "No patch markers" Hard Constraint, the codebase has no `{ [gpm patch] }` or `{ [LWPT patch] }` syntax — git history is the canonical record of every change. The historical explanations of *why* the code looks the way it does survive as plain Pascal comments.
 - **No drift-check infrastructure.** With packages canonical-at-LWPT (not vendored from elsewhere), there's nothing external to drift against. The transition-window divergence with GocciaScript is documented here as a known state, not a defect to actively monitor.
 
+## Consumer help navigation
+
+The CLI package appends a program-wide `--help` link to every subcommand help
+page, including commands without options. The link uses the consumer-supplied
+program name. This shared renderer keeps LWPT commands and aliases consistent;
+GocciaScript’s older CLI copy does not include this addition.
+
 ## The package set
 
 | Package | Location | Origin | LWPT-canonical state vs GocciaScript's older copy |

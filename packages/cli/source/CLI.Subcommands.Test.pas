@@ -222,8 +222,18 @@ begin
 end;
 
 procedure TSubcommandRegistrySuite.TestCompletionCallbackReceivesDispatchMetadata;
+var
+  HelpOutput: string;
 begin
   Expect<Integer>(RunCompletionChild(False)).ToBe(0);
+  { Help for a command without options still completes and links to the
+    program-wide command list, using the consumer's program name. }
+  Expect<Boolean>(RunCommand(ExpandFileName(ParamStr(0)),
+    ['alpha', '--help'], HelpOutput)).ToBe(True);
+  Expect<Boolean>(Pos('fixture alpha', HelpOutput) > 0).ToBe(True);
+  Expect<Boolean>(Pos('options:', HelpOutput) = 0).ToBe(True);
+  Expect<Boolean>(Pos('run "fixture --help" to see all commands',
+    HelpOutput) > 0).ToBe(True);
 end;
 
 procedure TSubcommandRegistrySuite.TestCompletionCallbackCannotReplaceDispatchResult;

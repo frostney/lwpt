@@ -563,3 +563,9 @@ consuming a second slot. The parent reacquires through the FIFO after the child
 finishes. See
 [`tooling.md`](./tooling.md#machine-wide-worker-budget) for configuration and
 [ADR-0021](./adr/0021-machine-wide-worker-budget.md) for the decision.
+
+The build scheduler uses nonblocking `PollAcquire` calls to retain its FIFO
+ticket while it continues collecting completed jobs. A successful acquisition
+consumes that ticket; `CancelPendingAcquire` withdraws it when no ready entry
+needs capacity. Ordinary `Acquire(timeout)` calls still withdraw on timeout,
+unless they share an already pending scheduler request in the same session.

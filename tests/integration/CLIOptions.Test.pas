@@ -62,7 +62,7 @@ type
     procedure TestRepairRejectsUnexpectedPositionalBeforeSideEffects;
     procedure TestInitRejectsUnexpectedPositionalBeforeSideEffects;
     procedure TestVerboseFlagIsLongOnly;
-    procedure TestSilentFlagIsSharedByEverySubcommand;
+    procedure TestSubcommandHelpSurface;
     procedure TestSuccessfulCommandReportsCompletion;
     procedure TestFailedCommandReportsCompletion;
     procedure TestRunAliasReportsResolvedCommand;
@@ -416,11 +416,11 @@ begin
   Expect<Boolean>(Pos('-v, --verbose', TestHelp.Stdout) = 0).ToBe(True);
 end;
 
-procedure TCLIOptionsE2E.TestSilentFlagIsSharedByEverySubcommand;
+procedure TCLIOptionsE2E.TestSubcommandHelpSurface;
 const
-  Commands: array[0..13] of string = ('install', 'add', 'remove', 'outdated',
+  Commands: array[0..14] of string = ('install', 'add', 'remove', 'outdated',
     'update', 'build', 'format', 'duplication', 'test', 'repair', 'init',
-    'run', 'health', 'agents');
+    'run', 'health', 'agents', 'registry');
 var
   CommandIndex: Integer;
   HelpResult: TLwptResult;
@@ -430,7 +430,22 @@ begin
     HelpResult := RunLwpt([Commands[CommandIndex], '--help']);
     Expect<Integer>(HelpResult.ExitCode).ToBe(0);
     Expect<Boolean>(Pos('--silent', HelpResult.Stdout) > 0).ToBe(True);
+    Expect<Integer>(CountOccurrences(HelpResult.Stdout,
+      'run "lwpt --help" to see all commands')).ToBe(1);
+    HelpResult := RunLwpt([Commands[CommandIndex], '-h']);
+    Expect<Integer>(HelpResult.ExitCode).ToBe(0);
+    Expect<Integer>(CountOccurrences(HelpResult.Stdout,
+      'run "lwpt --help" to see all commands')).ToBe(1);
   end;
+  HelpResult := RunLwpt(['registry', 'init', '--help'], FScratch);
+  Expect<Integer>(HelpResult.ExitCode).ToBe(0);
+  Expect<Integer>(CountOccurrences(HelpResult.Stdout,
+    'run "lwpt --help" to see all commands')).ToBe(1);
+  Expect<Boolean>(DirectoryExists(FScratch + '/.lwpt/registry')).ToBe(False);
+  HelpResult := RunLwpt(['registry', 'serve', '--help'], FScratch);
+  Expect<Integer>(HelpResult.ExitCode).ToBe(0);
+  Expect<Integer>(CountOccurrences(HelpResult.Stdout,
+    'run "lwpt --help" to see all commands')).ToBe(1);
 end;
 
 procedure TCLIOptionsE2E.TestSuccessfulCommandReportsCompletion;
@@ -467,9 +482,11 @@ var
   BuildPrefix, RunPrefix : string;
 begin
   R := RunLwpt(['run', 'build', '--help']);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Integer>(CountOccurrences(R.Stdout,
+    'run "lwpt --help" to see all commands')).ToBe(1);
   BuildPrefix := CompletionPrefix('build', 'completed in ');
   RunPrefix := CompletionPrefix('run', 'completed in ');
-  Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Integer>(CountOccurrences(R.Stderr, BuildPrefix)).ToBe(1);
   Expect<Integer>(CountOccurrences(R.Stderr, RunPrefix)).ToBe(0);
 end;
@@ -950,8 +967,8 @@ begin
     TestInitRejectsUnexpectedPositionalBeforeSideEffects);
   Test('--verbose is long-only for build and test',
     TestVerboseFlagIsLongOnly);
-  Test('--silent is inherited by every registered subcommand',
-    TestSilentFlagIsSharedByEverySubcommand);
+  Test('every subcommand help exposes shared options and top-level navigation',
+    TestSubcommandHelpSurface);
   Test('successful subcommand reports one final completion line',
     TestSuccessfulCommandReportsCompletion);
   Test('failed subcommand reports its diagnostic and one final completion line',
