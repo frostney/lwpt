@@ -104,19 +104,56 @@ function ValidInheritedPipeHandle(const AHandle: PtrInt;
   const ARequiredAccess: LongWord): Boolean;
 {$ENDIF}
 
+const
+  { Exit status of a managed child whose pre-exec isolation setup failed. }
+  ProcessTreeSetupExitCode = 127;
+  ProcessTreeSetupFailure = 'process tree isolation setup failed';
+  { Each side of Unix process-group setup makes at most this many attempts,
+    pausing between them, before reporting an isolation failure. }
+  ProcessTreeGroupSetupAttempts = 5;
+  ProcessTreeGroupSetupRetryMilliseconds = 1;
+
 {$IFDEF OBJECTSTORE_TESTING}
 type
   TLWPTProcessSpawnAttemptHook = procedure;
-  { Replaces setpgid(2) in both the parent and the forked child. A hook runs
-    after fork, so it must stay async-signal-safe and report failures through
-    libc's errno exactly as setpgid(2) does. }
-  TLWPTSetProcessGroupHook = function(const APID,
-    AProcessGroupID: LongInt): LongInt;
 
 var
   ProcessTreeBeforeUnmanagedSpawnLockTestHook:
     TLWPTProcessSpawnAttemptHook;
-  ProcessTreeSetProcessGroupTestHook: TLWPTSetProcessGroupHook;
+{$ENDIF}
+
+{$IF DEFINED(UNIX) AND DEFINED(PROCESSTREE_TESTING)}
+type
+  { Scripted setpgid(2) outcomes for one side of process-group setup. The
+    zero value is the real kernel behavior. The script is plain data, so a
+    forked child inherits it and follows it without leaving
+    async-signal-safe code. The child side is every setpgid(0, 0) call; the
+    parent side is every call naming a process. }
+  TLWPTProcessGroupScript = record
+    { The first RejectedCalls calls report EPERM. }
+    RejectedCalls: Integer;
+    { A rejected call still performs the real setpgid(2) first, reproducing
+      Darwin's applied-but-rejected outcome (#299). }
+    RejectionTakesEffect: Boolean;
+    { The first HiddenQueries postcondition checks report no group. }
+    HiddenQueries: Integer;
+    { Hidden parent-side checks report an exited child instead. }
+    HiddenQueriesReportExit: Boolean;
+    { Observed counts. }
+    Calls: Integer;
+    Queries: Integer;
+  end;
+  PLWPTProcessGroupScript = ^TLWPTProcessGroupScript;
+
+var
+  ProcessTreeChildGroupScript: TLWPTProcessGroupScript;
+  ProcessTreeParentGroupScript: TLWPTProcessGroupScript;
+
+{ The child's pre-exec side of group setup, applied to the calling process. }
+function LeadOwnProcessGroupAfterFork: Boolean;
+{ The parent's side of group setup for a direct, unreaped child. }
+function IsolateChildProcessGroup(const APID: LongInt;
+  out AErrorCode: Integer): Boolean;
 {$ENDIF}
 
 implementation
@@ -142,12 +179,9 @@ const
   ProcessTreeTerminatePollMilliseconds = 10;
   ProcessTreeReapTimeoutMilliseconds = 3000;
   ForwardedReapTimeoutMilliseconds = 100;
-  ProcessTreeSetupExitCode = 127;
-  ProcessGroupSetupAttempts = 5;
-  ProcessGroupSetupRetryMilliseconds = 1;
   ProcessTreeCancellationExitCode = 1;
   SignalExitCodeBase = 128;
-  ProcessGroupSetupError = 'process tree isolation setup failed'#10;
+  ProcessGroupSetupError = ProcessTreeSetupFailure + #10;
   ManagedProcessTreeEnvironment = PROJECT_NAME + '_PROCESS_TREE_PARENT';
   StatusHandleEnvironment = PROJECT_NAME + '_PROCESS_TREE_STATUS_HANDLE';
   ControlHandleEnvironment = PROJECT_NAME + '_PROCESS_TREE_CONTROL_HANDLE';
@@ -199,15 +233,6 @@ function CSetProcessGroup(const APID,
   external name 'setpgid';
   {$ENDIF}
 
-function SetProcessGroup(const APID, AProcessGroupID: LongInt): LongInt;
-begin
-  {$IFDEF OBJECTSTORE_TESTING}
-  if Assigned(ProcessTreeSetProcessGroupTestHook) then
-    Exit(ProcessTreeSetProcessGroupTestHook(APID, AProcessGroupID));
-  {$ENDIF}
-  Result := CSetProcessGroup(APID, AProcessGroupID);
-end;
-
 function CSignal(const ASignal: LongInt;
   const AHandler: Pointer): Pointer; cdecl;
   {$IFDEF LINUX}
@@ -247,6 +272,47 @@ function CGetProcessGroup(const APID: LongInt): LongInt; cdecl;
   external name 'getpgid';
   {$ENDIF}
 
+{ select(2) with no descriptors is the pre-exec pause: POSIX lists it as
+  async-signal-safe, unlike nanosleep(2). }
+function CSelect(const ADescriptorCount: LongInt; const AReadSet, AWriteSet,
+  AExceptionSet: Pointer; const ATimeout: PTimeVal): LongInt; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'select';
+  {$ELSE}
+  external name 'select';
+  {$ENDIF}
+
+type
+  TProcessGroupQuery = (pgqLeader, pgqNotLeader, pgqExited);
+
+{$IFDEF PROCESSTREE_TESTING}
+function ProcessGroupScript(const APID: LongInt): PLWPTProcessGroupScript;
+begin
+  if APID = 0 then Result := @ProcessTreeChildGroupScript
+  else Result := @ProcessTreeParentGroupScript;
+end;
+{$ENDIF}
+
+function SetProcessGroup(const APID, AProcessGroupID: LongInt): LongInt;
+{$IFDEF PROCESSTREE_TESTING}
+var
+  Script: PLWPTProcessGroupScript;
+{$ENDIF}
+begin
+  {$IFDEF PROCESSTREE_TESTING}
+  Script := ProcessGroupScript(APID);
+  Inc(Script^.Calls);
+  if Script^.Calls <= Script^.RejectedCalls then
+  begin
+    if Script^.RejectionTakesEffect then
+      CSetProcessGroup(APID, AProcessGroupID);
+    CErrnoLocation()^ := ESysEPERM;
+    Exit(-1);
+  end;
+  {$ENDIF}
+  Result := CSetProcessGroup(APID, AProcessGroupID);
+end;
+
 { The parent and the forked child both call setpgid(2) so the group exists
   before either side proceeds. Darwin can apply one side's call and still
   report EPERM to the other (#299: observed on macOS 26 arm64 with the target
@@ -255,22 +321,70 @@ function CGetProcessGroup(const APID: LongInt): LongInt; cdecl;
   mid-transition. Any other error, or an EPERM that outlives the retries, is a
   real isolation failure. }
 
-{ Runs in the forked child before exec: only async-signal-safe calls. }
+{ Runs in the forked child before exec: setpgid(2), getpgrp(2), getpid(2),
+  and select(2) only, all async-signal-safe. }
+function LeadsOwnProcessGroup: Boolean;
+begin
+  {$IFDEF PROCESSTREE_TESTING}
+  Inc(ProcessTreeChildGroupScript.Queries);
+  if ProcessTreeChildGroupScript.Queries
+    <= ProcessTreeChildGroupScript.HiddenQueries then Exit(False);
+  {$ENDIF}
+  Result := FpGetpgrp = FpGetpid;
+end;
+
+procedure PauseBeforeGroupSetupRetryAfterFork;
+var
+  Timeout: TTimeVal;
+begin
+  Timeout.tv_sec := 0;
+  Timeout.tv_usec := ProcessTreeGroupSetupRetryMilliseconds * 1000;
+  CSelect(0, nil, nil, nil, @Timeout);
+end;
+
 function LeadOwnProcessGroupAfterFork: Boolean;
 var
   Attempt: Integer;
-  Delay: TTimeSpec;
 begin
-  for Attempt := 1 to ProcessGroupSetupAttempts do
+  for Attempt := 1 to ProcessTreeGroupSetupAttempts do
   begin
+    if Attempt > 1 then PauseBeforeGroupSetupRetryAfterFork;
     if SetProcessGroup(0, 0) = 0 then Exit(True);
     if CErrnoLocation()^ <> ESysEPERM then Exit(False);
-    if FpGetpgrp = FpGetpid then Exit(True);
-    Delay.tv_sec := 0;
-    Delay.tv_nsec := ProcessGroupSetupRetryMilliseconds * 1000000;
-    FpNanoSleep(@Delay, nil);
+    if LeadsOwnProcessGroup then Exit(True);
   end;
   Result := False;
+end;
+
+{ APID is this tree's direct child and is still unreaped: TProcess reaps only
+  through its own waitpid on that PID, which cannot run before Execute
+  returns, and LWPT installs no SIGCHLD disposition or wildcard wait. The PID
+  therefore cannot be recycled while it is queried here. }
+function QueryChildProcessGroup(const APID: LongInt): TProcessGroupQuery;
+var
+  ErrorCode: Integer;
+  ProcessGroupID: LongInt;
+begin
+  {$IFDEF PROCESSTREE_TESTING}
+  Inc(ProcessTreeParentGroupScript.Queries);
+  if ProcessTreeParentGroupScript.Queries
+    <= ProcessTreeParentGroupScript.HiddenQueries then
+  begin
+    if ProcessTreeParentGroupScript.HiddenQueriesReportExit then
+      Exit(pgqExited);
+    Exit(pgqNotLeader);
+  end;
+  {$ENDIF}
+  ProcessGroupID := CGetProcessGroup(APID);
+  if ProcessGroupID = APID then Exit(pgqLeader);
+  if ProcessGroupID = -1 then
+  begin
+    ErrorCode := CErrnoLocation()^;
+    { Darwin cannot query an exited child. Its exit status still reaches
+      the caller through the ordinary wait. }
+    if ErrorCode = ESysESRCH then Exit(pgqExited);
+  end;
+  Result := pgqNotLeader;
 end;
 
 function IsolateChildProcessGroup(const APID: LongInt;
@@ -279,8 +393,9 @@ var
   Attempt: Integer;
 begin
   AErrorCode := 0;
-  for Attempt := 1 to ProcessGroupSetupAttempts do
+  for Attempt := 1 to ProcessTreeGroupSetupAttempts do
   begin
+    if Attempt > 1 then Sleep(ProcessTreeGroupSetupRetryMilliseconds);
     if SetProcessGroup(APID, APID) = 0 then Exit(True);
     { SetProcessGroup is a libc call: read libc's errno, not FpGetErrNo, or
       the benign post-exec EACCES race reads as a stale unrelated code and
@@ -289,8 +404,8 @@ begin
     AErrorCode := CErrnoLocation()^;
     if AErrorCode in [ESysEACCES, ESysESRCH] then Exit(True);
     if AErrorCode <> ESysEPERM then Exit(False);
-    if CGetProcessGroup(APID) = APID then Exit(True);
-    Sleep(ProcessGroupSetupRetryMilliseconds);
+    if QueryChildProcessGroup(APID) in [pgqLeader, pgqExited] then
+      Exit(True);
   end;
   Result := False;
 end;
