@@ -49,14 +49,17 @@ unit LWPT.GitProtocol;
   smart-HTTP endpoint:
 
     GET  <repo>/info/refs?service=git-upload-pack   capability advertisement
-    POST <repo>/git-upload-pack  command=ls-refs    tips, peeled, HEAD target
+    POST <repo>/git-upload-pack  command=ls-refs    tips and HEAD target
     POST <repo>/git-upload-pack  command=fetch      commits-only packs
 
   Every fetch sends `filter tree:0` and never `thin-pack`, so the host
-  returns only commits and every delta base is in the pack. With
-  `want <tip>` and `have <pin>` the host sends exactly the commits reachable
-  from the tip but not from the pin; LWPT.GitPack recomputes their ids and
-  the pin is reachable iff one of them lists it as a parent. Archives remain
+  returns only commits and annotated tags, and every delta base is in the
+  pack. With `want <tip>` and `have <pin>` the host sends exactly the
+  objects reachable from the tip but not from the pin; LWPT.GitPack
+  recomputes their ids and the pin is reachable iff one of them names it as
+  a parent (or, for a tag object, as its target). Peel claims in listings
+  are never trusted. The whole proof shares one deadline and byte budget,
+  and listings are capped in ref count and distinct tips. Archives remain
   the only source of dependency content: no tree or blob is ever requested
   or accepted. }
 
@@ -89,20 +92,29 @@ type
     is neither accepted nor declared unreachable. }
   EGitReachabilityError = class(EGitProtocolError);
   EGitResponseTooLarge = class(EGitReachabilityError);
+  { The proof's single monotonic deadline passed. }
+  EGitProofDeadlineExceeded = class(EGitReachabilityError);
+
+  { What one request may still spend of its proof's shared budget. }
+  TGitRequestBudget = record
+    TimeoutMilliseconds: QWord;
+    MaxResponseBytes: Int64;
+  end;
 
   { Transport for the smart-HTTP upload-pack service. Implementations must
-    refuse any response larger than their byte cap with
+    finish within ABudget.TimeoutMilliseconds and refuse any response larger
+    than the smaller of their own cap and ABudget.MaxResponseBytes with
     EGitResponseTooLarge rather than truncating it. }
   TGitUploadPackTransport = class
   public
     { Protocol v2 capability advertisement. AEffectiveRepoURL is the
       repository URL that later commands must use (it differs from
       ARepoURL when the advertisement request was redirected). }
-    function Advertise(const ARepoURL: string;
-      out AEffectiveRepoURL: string): TBytes; virtual; abstract;
+    function Advertise(const ARepoURL: string; out AEffectiveRepoURL: string;
+      const ABudget: TGitRequestBudget): TBytes; virtual; abstract;
     { One protocol v2 command request; returns the raw response body. }
-    function Command(const ARepoURL: string;
-      const ARequest: TBytes): TBytes; virtual; abstract;
+    function Command(const ARepoURL: string; const ARequest: TBytes;
+      const ABudget: TGitRequestBudget): TBytes; virtual; abstract;
   end;
 
   THTTPGitUploadPackTransport = class(TGitUploadPackTransport)
@@ -115,10 +127,10 @@ type
       MAX_UPLOAD_PACK_RESPONSE_BYTES) and the request timeout. }
     constructor Create(const AOptions: THTTPRequestOptions;
       AMaxResponseBytes: Int64 = 0);
-    function Advertise(const ARepoURL: string;
-      out AEffectiveRepoURL: string): TBytes; override;
-    function Command(const ARepoURL: string;
-      const ARequest: TBytes): TBytes; override;
+    function Advertise(const ARepoURL: string; out AEffectiveRepoURL: string;
+      const ABudget: TGitRequestBudget): TBytes; override;
+    function Command(const ARepoURL: string; const ARequest: TBytes;
+      const ABudget: TGitRequestBudget): TBytes; override;
   end;
 
   {$IFDEF INSTALL_TESTING}
@@ -132,16 +144,17 @@ type
     FRoot: string;
     FMaxResponseBytes: Int64;
     FLogRequests: Boolean;
-    function ReadResponse(const APath: string): TBytes;
+    function ReadResponse(const APath: string;
+      const ABudget: TGitRequestBudget): TBytes;
   public
     { ALogRequests appends each exchange to <root>/requests.log, as the
       ref-listing fixture does, so install tests can count requests. }
     constructor Create(const ARoot: string; AMaxResponseBytes: Int64 = 0;
       ALogRequests: Boolean = False);
-    function Advertise(const ARepoURL: string;
-      out AEffectiveRepoURL: string): TBytes; override;
-    function Command(const ARepoURL: string;
-      const ARequest: TBytes): TBytes; override;
+    function Advertise(const ARepoURL: string; out AEffectiveRepoURL: string;
+      const ABudget: TGitRequestBudget): TBytes; override;
+    function Command(const ARepoURL: string; const ARequest: TBytes;
+      const ABudget: TGitRequestBudget): TBytes; override;
   end;
   {$ENDIF}
 
@@ -154,7 +167,9 @@ type
     ObjectFormat: string;   { '' when not advertised }
   end;
 
-  { A branch or tag tip from ls-refs; Id is the peeled commit for tags. }
+  { A branch or tag tip from ls-refs. Id is the object the ref names (an
+    annotated tag's own object id); a peel is only ever taken from a
+    hash-verified tag object in a pack, never from the listing. }
   TGitTip = record
     Name: string;           { full ref name, e.g. refs/tags/v1.0.0 }
     Id: string;
@@ -179,6 +194,12 @@ type
     BytesReceived: Int64;
   end;
 
+  { Budget shared by every request of one proof. }
+  TGitProofLimits = record
+    TimeoutMilliseconds: QWord;
+    MaxTotalBytes: Int64;
+  end;
+
 const
   { Largest upload-pack response accepted in one request. A proof that
     needs more is refused (EGitResponseTooLarge) rather than trusted. }
@@ -187,6 +208,16 @@ const
   { Tips probed individually, nearest commit date first, before the
     all-tips round. }
   MAX_NEAREST_TIP_PROBES = 4;
+  { Hostile-listing limits: ls-refs lines accepted, bytes in one ref name,
+    and distinct tip commits a proof will name in its requests. }
+  MAX_ADVERTISED_REFS = 100000;
+  MAX_REF_NAME_LENGTH = 1024;
+  MAX_PROOF_TIPS = 20000;
+  { Largest request body a proof sends (MAX_PROOF_TIPS wants fit). }
+  MAX_UPLOAD_PACK_REQUEST_BYTES = 2 * 1024 * 1024;
+  { One monotonic budget for the whole proof, shared by its requests. }
+  MAX_REACHABILITY_PROOF_MILLISECONDS = 180 * 1000;
+  MAX_REACHABILITY_PROOF_BYTES = Int64(128) * 1024 * 1024;
 
 { Hit <ARepoURL>/info/refs?service=git-upload-pack and parse the
   pkt-line response into the ref list. ARepoURL must end in `.git`
@@ -206,6 +237,14 @@ function PktLine(const APayload: string): AnsiString;
 function PktFlush: AnsiString;
 function PktDelim: AnsiString;
 
+{ True when AName is a well-formed ref name by git's check-ref-format rules
+  (no control characters, spaces, `~^:?*[\`, `..`, an at-sign before an
+  opening brace, empty or dot-led components, `.lock` components, or a
+  trailing `/` or `.`) and at most MAX_REF_NAME_LENGTH bytes. }
+function IsValidGitRefName(const AName: string): Boolean;
+
+function DefaultGitProofLimits: TGitProofLimits;
+
 { Protocol v2 pieces, exposed for tests that replay captured responses. }
 function ParseV2Capabilities(const ABody: TBytes): TGitV2Capabilities;
 function BuildV2CommandRequest(const ACapabilities: TGitV2Capabilities;
@@ -218,12 +257,17 @@ function ParseFetchResponse(var ABody: TBytes): TGitFetchResponse;
 
 { Prove that ACommit (40 hex characters) is reachable from an advertised
   refs/heads/* or refs/tags/* tip. AAdvertised is the ref listing the
-  resolver already holds; a pin equal to one of its tips is accepted without
-  any request. Raises EGitReachabilityError when no verdict can be reached
-  (unsupported host, limit, malformed response). }
+  resolver already holds; a pin equal to the object a well-named branch or
+  tag names is accepted without any request (peeled claims are not). The
+  whole proof shares one deadline and byte budget (ALimits, default
+  DefaultGitProofLimits). Raises EGitReachabilityError when no verdict can
+  be reached (unsupported host, limit, malformed response). }
 function ProveCommitReachable(const ATransport: TGitUploadPackTransport;
   const ARepoURL, ACommit: string;
-  const AAdvertised: TGitRefArray): TGitReachabilityResult;
+  const AAdvertised: TGitRefArray): TGitReachabilityResult; overload;
+function ProveCommitReachable(const ATransport: TGitUploadPackTransport;
+  const ARepoURL, ACommit: string; const AAdvertised: TGitRefArray;
+  const ALimits: TGitProofLimits): TGitReachabilityResult; overload;
 
 implementation
 
@@ -582,6 +626,35 @@ begin
   Result := Copy(AText, 1, Length(APrefix)) = APrefix;
 end;
 
+function IsValidGitRefName(const AName: string): Boolean;
+var i, ComponentStart: Integer; C: Char; Component: string;
+begin
+  Result := False;
+  if (AName = '') or (Length(AName) > MAX_REF_NAME_LENGTH) then Exit;
+  if (AName[Length(AName)] = '/') or (AName[Length(AName)] = '.') then Exit;
+  if (Pos('..', AName) > 0) or (Pos('@{', AName) > 0)
+     or (Pos('//', AName) > 0) or (AName[1] = '/') or (AName = '@') then
+    Exit;
+  for i := 1 to Length(AName) do
+  begin
+    C := AName[i];
+    if (Ord(C) < $20) or (Ord(C) = $7F)
+       or (C in [' ', '~', '^', ':', '?', '*', '[', '\']) then Exit;
+  end;
+  ComponentStart := 1;
+  for i := 1 to Length(AName) + 1 do
+    if (i > Length(AName)) or (AName[i] = '/') then
+    begin
+      Component := Copy(AName, ComponentStart, i - ComponentStart);
+      if (Component = '') or (Component[1] = '.')
+         or ((Length(Component) >= 5)
+           and (Copy(Component, Length(Component) - 4, 5) = '.lock')) then
+        Exit;
+      ComponentStart := i + 1;
+    end;
+  Result := True;
+end;
+
 function IsLowerHexId(const AValue: string): Boolean;
 begin
   Result := IsFullGitObjectId(AValue) and (LowerCase(AValue) = AValue);
@@ -649,80 +722,126 @@ end;
 
 function BuildV2CommandRequest(const ACapabilities: TGitV2Capabilities;
   const ACommand: string; const AArguments: array of string): TBytes;
-var Request: AnsiString; i: Integer;
+var
+  Lines: array of AnsiString;
+  Size: Int64;
+  i, n, Offset: Integer;
+
+  procedure Add(const ALine: AnsiString);
+  begin
+    Lines[n] := ALine;
+    Inc(Size, Length(ALine));
+    Inc(n);
+  end;
+
 begin
-  Request := PktLine('command=' + ACommand);
+  SetLength(Lines, Length(AArguments) + 5);
+  n := 0;
+  Size := 0;
+  Add(PktLine('command=' + ACommand));
   { A constant agent keeps recorded request bodies (and so the fixture
     keys that name their responses) independent of the LWPT version. }
-  if ACapabilities.Agent then
-    Request := Request + PktLine('agent=' + PROGRAM_NAME);
+  if ACapabilities.Agent then Add(PktLine('agent=' + PROGRAM_NAME));
   if ACapabilities.ObjectFormat <> '' then
-    Request := Request + PktLine('object-format='
-      + ACapabilities.ObjectFormat);
-  Request := Request + PktDelim;
+    Add(PktLine('object-format=' + ACapabilities.ObjectFormat));
+  Add(PktDelim);
   for i := 0 to High(AArguments) do
-    Request := Request + PktLine(AArguments[i]);
-  Result := BytesOf(Request + PktFlush);
+  begin
+    Add(PktLine(AArguments[i]));
+    if Size > MAX_UPLOAD_PACK_REQUEST_BYTES then
+      raise EGitReachabilityError.CreateFmt(
+        'upload-pack %s request would exceed the %d-byte request limit',
+        [ACommand, MAX_UPLOAD_PACK_REQUEST_BYTES]);
+  end;
+  Add(PktFlush);
+  { One allocation: joining thousands of want lines by repeated
+    concatenation would be quadratic. }
+  SetLength(Result, Size);
+  Offset := 0;
+  for i := 0 to n - 1 do
+  begin
+    Move(Lines[i][1], Result[Offset], Length(Lines[i]));
+    Inc(Offset, Length(Lines[i]));
+  end;
 end;
 
 function ParseLsRefsResponse(const ABody: TBytes;
   out AHeadTarget: string): TGitTipArray;
 var
-  Offset, Start, Len, i, n: Integer;
+  Offset, Start, Len, i, n, Lines: Integer;
   Kind: TPktKind;
-  Line, Id, Name, Peeled, Target: string;
+  Line, Id, Name, Target: string;
   Fields: TStringArray;
   Terminated: Boolean;
+  Seen: TDictionary<string, Boolean>;
 begin
   SetLength(Result, 0);
   AHeadTarget := '';
   Offset := 0;
+  n := 0;
+  Lines := 0;
   Terminated := False;
-  while NextPkt(ABody, Offset, Kind, Start, Len) do
-  begin
-    if Kind = pkFlush then
+  Seen := TDictionary<string, Boolean>.Create;
+  try
+    while NextPkt(ABody, Offset, Kind, Start, Len) do
     begin
-      Terminated := True;
-      Break;
+      if Kind = pkFlush then
+      begin
+        Terminated := True;
+        Break;
+      end;
+      if Kind <> pkData then
+        raise EGitReachabilityError.Create('unexpected ls-refs framing');
+      Inc(Lines);
+      if Lines > MAX_ADVERTISED_REFS then
+        raise EGitReachabilityError.CreateFmt(
+          'ls-refs advertised more than %d refs', [MAX_ADVERTISED_REFS]);
+      Line := PktText(ABody, Start, Len);
+      if StartsWith(Line, 'ERR ') then
+        raise EGitReachabilityError.Create('remote error: '
+          + Copy(Line, 5, MaxInt));
+      Fields := Line.Split([' ']);
+      if Length(Fields) < 2 then
+        raise EGitReachabilityError.Create('malformed ls-refs line');
+      Id := Fields[0];
+      Name := Fields[1];
+      Target := '';
+      { `peeled:` attributes are the host's unverified claims and are
+        ignored; a tag is peeled only through its hash-verified object. }
+      for i := 2 to High(Fields) do
+        if StartsWith(Fields[i], 'symref-target:') then
+          Target := Copy(Fields[i], 15, MaxInt);
+      if Name = 'HEAD' then
+      begin
+        if IsValidGitRefName(Target) then AHeadTarget := Target;
+        Continue;
+      end;
+      { Only branch and tag tips can prove reachability. Hosts also keep
+        refs/pull/* and refs/merge-requests/* for fork contributions; those
+        are never requested and are ignored if a host sends them anyway. }
+      if not (StartsWith(Name, 'refs/heads/')
+         or StartsWith(Name, 'refs/tags/')) then
+        Continue;
+      if not IsValidGitRefName(Name) then
+        raise EGitReachabilityError.Create(
+          'ls-refs advertised an invalid ref name');
+      if not IsLowerHexId(Id) then
+        raise EGitReachabilityError.CreateFmt(
+          'ls-refs advertised a malformed id for %s', [Name]);
+      if Seen.ContainsKey(Id) then Continue;
+      if Seen.Count >= MAX_PROOF_TIPS then
+        raise EGitReachabilityError.CreateFmt(
+          'ls-refs advertised more than %d distinct tips', [MAX_PROOF_TIPS]);
+      Seen.Add(Id, True);
+      if n >= Length(Result) then SetLength(Result, 2 * n + 16);
+      Result[n].Name := Name;
+      Result[n].Id := Id;
+      Inc(n);
     end;
-    if Kind <> pkData then
-      raise EGitReachabilityError.Create('unexpected ls-refs framing');
-    Line := PktText(ABody, Start, Len);
-    if StartsWith(Line, 'ERR ') then
-      raise EGitReachabilityError.Create('remote error: '
-        + Copy(Line, 5, MaxInt));
-    Fields := Line.Split([' ']);
-    if Length(Fields) < 2 then
-      raise EGitReachabilityError.Create('malformed ls-refs line');
-    Id := Fields[0];
-    Name := Fields[1];
-    Peeled := '';
-    Target := '';
-    for i := 2 to High(Fields) do
-      if StartsWith(Fields[i], 'peeled:') then
-        Peeled := Copy(Fields[i], 8, MaxInt)
-      else if StartsWith(Fields[i], 'symref-target:') then
-        Target := Copy(Fields[i], 15, MaxInt);
-    if Name = 'HEAD' then
-    begin
-      AHeadTarget := Target;
-      Continue;
-    end;
-    { Only branch and tag tips can prove reachability. Hosts also keep
-      refs/pull/* and refs/merge-requests/* for fork contributions; those
-      are never requested and are ignored if a host sends them anyway. }
-    if not (StartsWith(Name, 'refs/heads/')
-       or StartsWith(Name, 'refs/tags/')) then
-      Continue;
-    if Peeled <> '' then Id := Peeled;
-    if not IsLowerHexId(Id) then
-      raise EGitReachabilityError.CreateFmt(
-        'ls-refs advertised a malformed id for %s', [Name]);
-    n := Length(Result);
-    SetLength(Result, n + 1);
-    Result[n].Name := Name;
-    Result[n].Id := Id;
+  finally
+    Seen.Free;
   end;
+  SetLength(Result, n);
   if not Terminated then
     raise EGitReachabilityError.Create('ls-refs response is truncated');
 end;
@@ -839,6 +958,13 @@ begin
     [AURL, ALimit]);
 end;
 
+function EffectiveLimit(AOwn: Int64; const ABudget: TGitRequestBudget): Int64;
+begin
+  Result := AOwn;
+  if ABudget.MaxResponseBytes < Result then
+    Result := ABudget.MaxResponseBytes;
+end;
+
 constructor THTTPGitUploadPackTransport.Create(
   const AOptions: THTTPRequestOptions; AMaxResponseBytes: Int64);
 begin
@@ -848,27 +974,40 @@ begin
   else
     FMaxResponseBytes := AMaxResponseBytes;
   FOptions := AOptions;
-  FOptions.MaxResponseBodyBytes := FMaxResponseBytes;
-  FOptions.RequestTimeoutMilliseconds :=
-    UPLOAD_PACK_REQUEST_TIMEOUT_MILLISECONDS;
+end;
+
+function BudgetedOptions(const ABase: THTTPRequestOptions; AOwnLimit: Int64;
+  const ABudget: TGitRequestBudget; out ALimit: Int64): THTTPRequestOptions;
+begin
+  Result := ABase;
+  ALimit := EffectiveLimit(AOwnLimit, ABudget);
+  Result.MaxResponseBodyBytes := ALimit;
+  { The request may use what is left of the proof's shared deadline; the
+    per-request ceiling stays the upload-pack request timeout. }
+  Result.RequestTimeoutMilliseconds := UPLOAD_PACK_REQUEST_TIMEOUT_MILLISECONDS;
+  if ABudget.TimeoutMilliseconds < Result.RequestTimeoutMilliseconds then
+    Result.RequestTimeoutMilliseconds := ABudget.TimeoutMilliseconds;
 end;
 
 function THTTPGitUploadPackTransport.Advertise(const ARepoURL: string;
-  out AEffectiveRepoURL: string): TBytes;
+  out AEffectiveRepoURL: string; const ABudget: TGitRequestBudget): TBytes;
 var
   URL, Final: string;
   Headers: THTTPHeaders;
+  Options: THTTPRequestOptions;
+  Limit: Int64;
   Resp: THTTPResponse;
 begin
   URL := UploadPackBaseURL(ARepoURL) + INFO_REFS_SUFFIX;
   SetLength(Headers, 1);
   Headers[0].Name := 'Git-Protocol';
   Headers[0].Value := 'version=2';
+  Options := BudgetedOptions(FOptions, FMaxResponseBytes, ABudget, Limit);
   try
-    Resp := HTTPGet(URL, Headers, FOptions);
+    Resp := HTTPGet(URL, Headers, Options);
   except
     on E: EHTTPResponseTooLarge do
-      raise TooLarge(URL, FMaxResponseBytes);
+      raise TooLarge(URL, Limit);
     on E: EHTTPError do
       raise EGitReachabilityError.CreateFmt('%s: %s', [URL, E.Message]);
   end;
@@ -889,11 +1028,12 @@ begin
 end;
 
 function THTTPGitUploadPackTransport.Command(const ARepoURL: string;
-  const ARequest: TBytes): TBytes;
+  const ARequest: TBytes; const ABudget: TGitRequestBudget): TBytes;
 var
   URL: string;
   Headers: THTTPHeaders;
   Options: THTTPRequestOptions;
+  Limit: Int64;
   Resp: THTTPResponse;
 begin
   URL := UploadPackBaseURL(ARepoURL) + UPLOAD_PACK_SUFFIX;
@@ -902,7 +1042,7 @@ begin
   Headers[0].Value := 'version=2';
   Headers[1].Name := 'Accept';
   Headers[1].Value := 'application/x-git-upload-pack-result';
-  Options := FOptions;
+  Options := BudgetedOptions(FOptions, FMaxResponseBytes, ABudget, Limit);
   { A redirected POST would be replayed as a GET; the advertisement has
     already resolved any redirect. }
   Options.MaximumRedirects := 0;
@@ -911,7 +1051,7 @@ begin
       Headers, Options);
   except
     on E: EHTTPResponseTooLarge do
-      raise TooLarge(URL, FMaxResponseBytes);
+      raise TooLarge(URL, Limit);
     on E: EHTTPError do
       raise EGitReachabilityError.CreateFmt('%s: %s', [URL, E.Message]);
   end;
@@ -934,19 +1074,17 @@ begin
     FMaxResponseBytes := AMaxResponseBytes;
 end;
 
-function TGitFixtureUploadPackTransport.ReadResponse(
-  const APath: string): TBytes;
-var Stream: TFileStream;
+function TGitFixtureUploadPackTransport.ReadResponse(const APath: string;
+  const ABudget: TGitRequestBudget): TBytes;
+var Stream: TFileStream; Limit: Int64;
 begin
   if not FileExists(APath) then
     raise EGitReachabilityError.CreateFmt(
       'test git fixture has no recorded upload-pack response (%s)', [APath]);
+  Limit := EffectiveLimit(FMaxResponseBytes, ABudget);
   Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
   try
-    if Stream.Size > FMaxResponseBytes then
-      raise EGitResponseTooLarge.CreateFmt(
-        'upload-pack response from %s exceeds the %d-byte proof limit',
-        [APath, FMaxResponseBytes]);
+    if Stream.Size > Limit then raise TooLarge(APath, Limit);
     SetLength(Result, Stream.Size);
     if Stream.Size > 0 then Stream.ReadBuffer(Result[0], Stream.Size);
   finally
@@ -955,7 +1093,7 @@ begin
 end;
 
 function TGitFixtureUploadPackTransport.Advertise(const ARepoURL: string;
-  out AEffectiveRepoURL: string): TBytes;
+  out AEffectiveRepoURL: string; const ABudget: TGitRequestBudget): TBytes;
 var Repository: string;
 begin
   Repository := FixtureRepositoryName(ARepoURL);
@@ -963,11 +1101,11 @@ begin
   if FLogRequests then
     AppendFixtureRequest(FRoot, 'upload-pack|' + Repository + '|advertise');
   Result := ReadResponse(FRoot + 'upload-pack/' + Repository
-    + '/advertisement');
+    + '/advertisement', ABudget);
 end;
 
 function TGitFixtureUploadPackTransport.Command(const ARepoURL: string;
-  const ARequest: TBytes): TBytes;
+  const ARequest: TBytes; const ABudget: TGitRequestBudget): TBytes;
 var
   Repository, CommandLine: string;
   Offset, Start, Len: Integer;
@@ -982,7 +1120,7 @@ begin
     AppendFixtureRequest(FRoot, 'upload-pack|' + Repository + '|'
       + Copy(CommandLine, Length('command=') + 1, MaxInt));
   Result := ReadResponse(FRoot + 'upload-pack/' + Repository + '/'
-    + SHA256Hex(ARequest) + '.response');
+    + SHA256Hex(ARequest) + '.response', ABudget);
 end;
 {$ENDIF}
 
@@ -990,22 +1128,63 @@ end;
   Reachability proof
   ─────────────────────────────────────────────────────────────────── }
 
+function DefaultGitProofLimits: TGitProofLimits;
+begin
+  Result.TimeoutMilliseconds := MAX_REACHABILITY_PROOF_MILLISECONDS;
+  Result.MaxTotalBytes := MAX_REACHABILITY_PROOF_BYTES;
+end;
+
 type
   TReachabilityRun = record
     Transport: TGitUploadPackTransport;
     RepoURL: string;
     Capabilities: TGitV2Capabilities;
+    Limits: TGitProofLimits;
+    StartedAt: QWord;
     Requests: Integer;
     BytesReceived: Int64;
   end;
 
+{ What the next request may spend: the time left before the proof's single
+  monotonic deadline and the bytes left in its total budget. }
+function NextBudget(const ARun: TReachabilityRun): TGitRequestBudget;
+var Elapsed: QWord;
+begin
+  Elapsed := GetTickCount64 - ARun.StartedAt;
+  if Elapsed >= ARun.Limits.TimeoutMilliseconds then
+    raise EGitProofDeadlineExceeded.CreateFmt(
+      'reachability proof exceeded its %d ms deadline',
+      [ARun.Limits.TimeoutMilliseconds]);
+  if ARun.BytesReceived >= ARun.Limits.MaxTotalBytes then
+    raise EGitResponseTooLarge.CreateFmt(
+      'reachability proof exceeded its %d-byte budget',
+      [ARun.Limits.MaxTotalBytes]);
+  Result.TimeoutMilliseconds := ARun.Limits.TimeoutMilliseconds - Elapsed;
+  Result.MaxResponseBytes := ARun.Limits.MaxTotalBytes - ARun.BytesReceived;
+end;
+
+procedure Received(var ARun: TReachabilityRun; const ABody: TBytes);
+begin
+  Inc(ARun.Requests);
+  Inc(ARun.BytesReceived, Length(ABody));
+  { A transport that overran its allowance is still bounded here. }
+  if GetTickCount64 - ARun.StartedAt > ARun.Limits.TimeoutMilliseconds then
+    raise EGitProofDeadlineExceeded.CreateFmt(
+      'reachability proof exceeded its %d ms deadline',
+      [ARun.Limits.TimeoutMilliseconds]);
+  if ARun.BytesReceived > ARun.Limits.MaxTotalBytes then
+    raise EGitResponseTooLarge.CreateFmt(
+      'reachability proof exceeded its %d-byte budget',
+      [ARun.Limits.MaxTotalBytes]);
+end;
+
 function RunCommand(var ARun: TReachabilityRun; const ACommand: string;
   const AArguments: array of string): TBytes;
+var Request: TBytes;
 begin
-  Result := ARun.Transport.Command(ARun.RepoURL,
-    BuildV2CommandRequest(ARun.Capabilities, ACommand, AArguments));
-  Inc(ARun.Requests);
-  Inc(ARun.BytesReceived, Length(Result));
+  Request := BuildV2CommandRequest(ARun.Capabilities, ACommand, AArguments);
+  Result := ARun.Transport.Command(ARun.RepoURL, Request, NextBudget(ARun));
+  Received(ARun, Result);
 end;
 
 function RunFetch(var ARun: TReachabilityRun; const AWants,
@@ -1055,30 +1234,10 @@ begin
     Result := 'refs/heads/' + ARef.Name;
 end;
 
-function DistinctTips(const ATips: TGitTipArray): TGitTipArray;
-var i, j, n: Integer; Seen: Boolean;
-begin
-  SetLength(Result, Length(ATips));
-  n := 0;
-  for i := 0 to High(ATips) do
-  begin
-    Seen := False;
-    for j := 0 to n - 1 do
-      if Result[j].Id = ATips[i].Id then
-      begin
-        Seen := True;
-        Break;
-      end;
-    if Seen then Continue;
-    Result[n] := ATips[i];
-    Inc(n);
-  end;
-  SetLength(Result, n);
-end;
-
 { Committer times of the tips and the target, from one shallow commits-only
-  fetch. They only choose which tips to probe first, so a host that refuses
-  the request simply leaves the probes unordered. }
+  fetch. A tag tip's time is its verified target commit's. The times only
+  choose which tips to probe first, so a host that refuses the request
+  simply leaves the probes unordered. }
 function CollectCommitTimes(var ARun: TReachabilityRun;
   const ATips: TGitTipArray; const ATarget: string): TDictionary<string, Int64>;
 var
@@ -1099,6 +1258,8 @@ begin
   except
     on E: EGitResponseTooLarge do
       raise;
+    on E: EGitProofDeadlineExceeded do
+      raise;
     on E: EGitProtocolError do
       Exit;
     on E: EGitPackError do
@@ -1109,56 +1270,57 @@ begin
     Result := TDictionary<string, Int64>.Create;
     Result.AddOrSetValue(ATarget, Commit.CommitTime);
     for i := 0 to High(ATips) do
-      if Graph.TryGetCommit(ATips[i].Id, Commit) then
+      if Graph.TryGetCommit(Graph.PeelToCommit(ATips[i].Id), Commit) then
         Result.AddOrSetValue(ATips[i].Id, Commit.CommitTime);
   finally
     Graph.Free;
   end;
 end;
 
-{ Tips to probe one at a time: those committed closest after the target
-  (the release that first contains an old pin is usually the next one),
-  then the default branch. }
+{ Tips to probe one at a time: the MAX_NEAREST_TIP_PROBES committed closest
+  after the target (the release that first contains an old pin is usually
+  the next one), then the default branch. Selecting the few nearest in one
+  pass keeps this linear in the tip count. }
 function ChooseProbes(const ATips: TGitTipArray; const AHeadTarget,
   ATarget: string; const ATimes: TDictionary<string, Int64>): TGitTipArray;
 var
-  Candidates: TGitTipArray;
-  TargetTime, TimeA, TimeB: Int64;
+  TargetTime, Time, Other: Int64;
   i, j, n: Integer;
-  Swap: TGitTip;
   Present: Boolean;
+
+  function Before(const AFirst: TGitTip; AFirstTime: Int64;
+    const ASecond: TGitTip; ASecondTime: Int64): Boolean;
+  begin
+    Result := (AFirstTime < ASecondTime) or ((AFirstTime = ASecondTime)
+      and (AFirst.Name < ASecond.Name));
+  end;
+
 begin
   SetLength(Result, 0);
   if (ATimes <> nil) and ATimes.TryGetValue(ATarget, TargetTime) then
   begin
-    SetLength(Candidates, 0);
+    SetLength(Result, MAX_NEAREST_TIP_PROBES);
+    n := 0;
     for i := 0 to High(ATips) do
-      if ATimes.TryGetValue(ATips[i].Id, TimeA) and (TimeA >= TargetTime) then
-      begin
-        n := Length(Candidates);
-        SetLength(Candidates, n + 1);
-        Candidates[n] := ATips[i];
-      end;
-    { Insertion sort by (commit time, ref name): tip counts are small and
-      the order must be deterministic. }
-    for i := 1 to High(Candidates) do
     begin
-      j := i;
+      if not ATimes.TryGetValue(ATips[i].Id, Time)
+         or (Time < TargetTime) then Continue;
+      { Insert into the small sorted prefix, dropping the farthest. }
+      j := n;
       while j > 0 do
       begin
-        TimeA := ATimes[Candidates[j - 1].Id];
-        TimeB := ATimes[Candidates[j].Id];
-        if (TimeA < TimeB) or ((TimeA = TimeB)
-           and (Candidates[j - 1].Name <= Candidates[j].Name)) then Break;
-        Swap := Candidates[j - 1];
-        Candidates[j - 1] := Candidates[j];
-        Candidates[j] := Swap;
+        Other := ATimes[Result[j - 1].Id];
+        if not Before(ATips[i], Time, Result[j - 1], Other) then Break;
+        if j < MAX_NEAREST_TIP_PROBES then Result[j] := Result[j - 1];
         Dec(j);
       end;
+      if j < MAX_NEAREST_TIP_PROBES then
+      begin
+        Result[j] := ATips[i];
+        if n < MAX_NEAREST_TIP_PROBES then Inc(n);
+      end;
     end;
-    n := Length(Candidates);
-    if n > MAX_NEAREST_TIP_PROBES then n := MAX_NEAREST_TIP_PROBES;
-    Result := Copy(Candidates, 0, n);
+    SetLength(Result, n);
   end;
   for i := 0 to High(ATips) do
     if ATips[i].Name = AHeadTarget then
@@ -1182,8 +1344,8 @@ begin
 end;
 
 function ProveCommitReachableCore(const ATransport: TGitUploadPackTransport;
-  const ARepoURL, ACommit: string;
-  const AAdvertised: TGitRefArray): TGitReachabilityResult;
+  const ARepoURL, ACommit: string; const AAdvertised: TGitRefArray;
+  const ALimits: TGitProofLimits): TGitReachabilityResult;
 var
   Run: TReachabilityRun;
   Target, HeadTarget: string;
@@ -1203,11 +1365,13 @@ begin
       '"%s" is not a full 40-character commit id', [ACommit]);
   Target := LowerCase(ACommit);
 
-  { Exact tip: the pin is itself an advertised branch head, tag, or peeled
-    tag. Needs no request beyond the listing the resolver already made. }
+  { Exact tip: the pin is the very object a well-named branch or tag names
+    in the listing the resolver already made. A `^`-peel is only the host's
+    claim about an annotated tag's target, so it is never an exact tip; such
+    a pin is proven below from the hash-verified tag object. }
   for i := 0 to High(AAdvertised) do
     if SameText(AAdvertised[i].SHA, Target)
-       or SameText(AAdvertised[i].PeeledSHA, Target) then
+       and IsValidGitRefName(RefFullName(AAdvertised[i])) then
     begin
       Result.Reachable := True;
       Result.ProvingRef := RefFullName(AAdvertised[i]);
@@ -1216,10 +1380,11 @@ begin
 
   Run := Default(TReachabilityRun);
   Run.Transport := ATransport;
+  Run.Limits := ALimits;
+  Run.StartedAt := GetTickCount64;
   try
-    Body := ATransport.Advertise(ARepoURL, Run.RepoURL);
-    Inc(Run.Requests);
-    Inc(Run.BytesReceived, Length(Body));
+    Body := ATransport.Advertise(ARepoURL, Run.RepoURL, NextBudget(Run));
+    Received(Run, Body);
     Run.Capabilities := ParseV2Capabilities(Body);
     if not (Run.Capabilities.Version2 and Run.Capabilities.LsRefs
        and Run.Capabilities.Fetch) then
@@ -1234,9 +1399,10 @@ begin
         '%s uses object format %s; only sha1 repositories can be verified',
         [ARepoURL, Run.Capabilities.ObjectFormat]);
 
-    Body := RunCommand(Run, 'ls-refs', ['symrefs', 'peel', 'ref-prefix HEAD',
+    Body := RunCommand(Run, 'ls-refs', ['symrefs', 'ref-prefix HEAD',
       'ref-prefix refs/heads/', 'ref-prefix refs/tags/']);
-    Tips := DistinctTips(ParseLsRefsResponse(Body, HeadTarget));
+    Tips := ParseLsRefsResponse(Body, HeadTarget);
+    Body := nil;
     for i := 0 to High(Tips) do
       if Tips[i].Id = Target then
       begin
@@ -1265,7 +1431,11 @@ begin
       Response := RunFetch(Run, [Probes[i].Id], [Target], False);
       if not Response.Acknowledged and not Response.Ready then
       begin
-        { NAK: no have was common, so the host has no such object. }
+        { Only an explicit NAK says no have was common, i.e. the host has
+          no such object; silence is a malformed answer, not a verdict. }
+        if not Response.Nak then
+          raise EGitReachabilityError.Create(
+            'upload-pack acknowledged neither ACK nor NAK');
         Result.Known := False;
         Exit;
       end;
@@ -1291,16 +1461,18 @@ begin
     { Every remaining tip at once. A commit on any path tip -> ... -> pin is
       neither an ancestor of the pin nor of an excluded tip (that tip would
       then contain the pin), so the set difference always holds the path. }
-    SetLength(Remaining, 0);
+    SetLength(Remaining, Length(Tips));
+    j := 0;
     for i := 0 to High(Tips) do
     begin
       IsExcluded := False;
-      for j := 0 to High(Excluded) do
-        IsExcluded := IsExcluded or (Excluded[j].Id = Tips[i].Id);
+      for Found := 0 to High(Excluded) do
+        IsExcluded := IsExcluded or (Excluded[Found].Id = Tips[i].Id);
       if IsExcluded then Continue;
-      SetLength(Remaining, Length(Remaining) + 1);
-      Remaining[High(Remaining)] := Tips[i];
+      Remaining[j] := Tips[i];
+      Inc(j);
     end;
+    SetLength(Remaining, j);
     if Length(Remaining) = 0 then Exit;
     SetLength(Wants, Length(Remaining));
     for i := 0 to High(Remaining) do Wants[i] := Remaining[i].Id;
@@ -1329,17 +1501,25 @@ begin
 end;
 
 function ProveCommitReachable(const ATransport: TGitUploadPackTransport;
-  const ARepoURL, ACommit: string;
-  const AAdvertised: TGitRefArray): TGitReachabilityResult;
+  const ARepoURL, ACommit: string; const AAdvertised: TGitRefArray;
+  const ALimits: TGitProofLimits): TGitReachabilityResult;
 begin
   try
     Result := ProveCommitReachableCore(ATransport, ARepoURL, ACommit,
-      AAdvertised);
+      AAdvertised, ALimits);
   except
     on E: EGitPackError do
       raise EGitReachabilityError.CreateFmt('%s sent an invalid pack: %s',
         [ARepoURL, E.Message]);
   end;
+end;
+
+function ProveCommitReachable(const ATransport: TGitUploadPackTransport;
+  const ARepoURL, ACommit: string;
+  const AAdvertised: TGitRefArray): TGitReachabilityResult;
+begin
+  Result := ProveCommitReachable(ATransport, ARepoURL, ACommit, AAdvertised,
+    DefaultGitProofLimits);
 end;
 
 end.

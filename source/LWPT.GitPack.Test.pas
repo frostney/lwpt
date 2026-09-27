@@ -41,6 +41,7 @@ type
     procedure TestRejectsMalformedParent;
     procedure TestWalkFindsReachingStart;
     procedure TestWalkStopsAtMissingCommits;
+    procedure TestWalkFollowsVerifiedTagObjects;
   end;
 
 { Pack construction helpers. Entries are assembled by hand so each hostile
@@ -520,6 +521,38 @@ begin
   end;
 end;
 
+procedure TGitPackTests.TestWalkFollowsVerifiedTagObjects;
+var
+  Commit, Tag, Nested: AnsiString;
+  CommitId, TagId, NestedId: string;
+  Graph: TGitCommitGraph;
+begin
+  Commit := CommitText([], 1000, 'tagged');
+  CommitId := GitObjectId('commit', Commit);
+  Tag := 'object ' + CommitId + #10 + 'type commit'#10 + 'tag v1'#10
+    + 'tagger A <a@example.invalid> 1000 +0000'#10#10 + 'v1'#10;
+  TagId := GitObjectId('tag', Tag);
+  Nested := 'object ' + TagId + #10 + 'type tag'#10 + 'tag v1-signed'#10
+    + 'tagger A <a@example.invalid> 1000 +0000'#10#10 + 'nested'#10;
+  NestedId := GitObjectId('tag', Nested);
+  Graph := ReadCommitPack(AssemblePack([WholeEntry(4, Nested),
+    WholeEntry(4, Tag), WholeEntry(1, Commit)]), DefaultGitPackLimits);
+  try
+    { The tag object's id is recomputed from its bytes, so its target is
+      verified; the walk peels through it (and through a tag of a tag). }
+    Expect<Integer>(Graph.FindReachingStart([TagId], CommitId)).ToBe(0);
+    Expect<Integer>(Graph.FindReachingStart([NestedId], CommitId)).ToBe(0);
+    Expect<string>(Graph.PeelToCommit(NestedId)).ToBe(CommitId);
+    Expect<string>(Graph.PeelToCommit(StringOfChar('7', 40))).ToBe('');
+  finally
+    Graph.Free;
+  end;
+  { A tag whose object line is not an id is malformed. }
+  Expect<Boolean>(ReadFails(AssemblePack([WholeEntry(4,
+    'object nope'#10'type commit'#10'tag x'#10#10)]),
+    DefaultGitPackLimits, 'malformed object line')).ToBe(True);
+end;
+
 procedure TGitPackTests.SetupTests;
 begin
   Test('reads an OFS_DELTA commit pack written by git',
@@ -557,6 +590,8 @@ begin
     TestRejectsMalformedParent);
   Test('walk reports which start reaches the target',
     TestWalkFindsReachingStart);
+  Test('walk peels through hash-verified tag objects',
+    TestWalkFollowsVerifiedTagObjects);
   Test('walk never crosses commits missing from the pack',
     TestWalkStopsAtMissingCommits);
 end;

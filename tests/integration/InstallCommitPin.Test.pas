@@ -32,6 +32,10 @@ type
     function Commit(const AName: string): string;
     procedure WriteRoot(const ARoot, ADependencies: string);
     procedure WriteArchive(const ACommit: string);
+    procedure WritePackageArchive(const ARepository, ACommit,
+      ADependencies: string);
+    procedure WriteReachRefs(const AExtra: string);
+    procedure StripReachableFrom(const ARoot: string);
     procedure ResetRequests;
     function RunLwptIn(const ARoot: string;
       const AArguments: array of string): TLwptResult;
@@ -47,6 +51,8 @@ type
     procedure TestChangedPinIsProvenAgain;
     procedure TestAbbreviatedCommitIsRefused;
     procedure TestAddOfForkOnlyCommitKeepsManifest;
+    procedure TestUnmarkedLockedPinIsProvenAgain;
+    procedure TestMixedAbbreviatedPinIsRefused;
   end;
 
 function TInstallCommitPin.Commit(const AName: string): string;
@@ -75,19 +81,55 @@ begin
     + 'units = ["source"]'#10 + '[dependencies]'#10 + ADependencies);
 end;
 
-procedure TInstallCommitPin.WriteArchive(const ACommit: string);
-var Entries: TByteArrays; Path: string;
+procedure TInstallCommitPin.WritePackageArchive(const ARepository, ACommit,
+  ADependencies: string);
+var Entries: TByteArrays; Path, Manifest: string;
 begin
+  Manifest := '[package]'#10 + 'name = "' + ARepository + '"'#10
+    + 'version = "1.0.0"'#10 + 'units = ["source"]'#10;
+  if ADependencies <> '' then
+    Manifest := Manifest + '[dependencies]'#10 + ADependencies;
   SetLength(Entries, 2);
-  Entries[0] := MakeRegularFileEntry('reach-fixture/lwpt.toml',
-    BytesOf('[package]'#10 + 'name = "reach"'#10 + 'version = "1.0.0"'#10
-      + 'units = ["source"]'#10));
-  Entries[1] := MakeRegularFileEntry('reach-fixture/source/reach.pas',
-    BytesOf('unit reach;'#10 + 'interface'#10 + 'implementation'#10
-      + 'end.'#10));
-  Path := FFixtureRoot + '/archives/reach/' + ACommit + '.tar.gz';
+  Entries[0] := MakeRegularFileEntry(ARepository + '-fixture/lwpt.toml',
+    BytesOf(Manifest));
+  Entries[1] := MakeRegularFileEntry(ARepository + '-fixture/source/'
+    + ARepository + '.pas', BytesOf('unit ' + ARepository + ';'#10
+      + 'interface'#10 + 'implementation'#10 + 'end.'#10));
+  Path := FFixtureRoot + '/archives/' + ARepository + '/' + ACommit
+    + '.tar.gz';
   ForceDirectories(ExtractFileDir(Path));
   WriteBytesToFile(Path, Gzip(BuildTar(Entries)));
+end;
+
+procedure TInstallCommitPin.WriteArchive(const ACommit: string);
+begin
+  WritePackageArchive('reach', ACommit, '');
+end;
+
+procedure TInstallCommitPin.WriteReachRefs(const AExtra: string);
+begin
+  { The resolver's v1 listing of the same repository: branch and tag tips
+    only, like a real advertisement filtered by the parser. }
+  WriteTextFile(FFixtureRoot + '/refs/reach.refs',
+    'branch|main|' + Commit('c6') + '|'#10
+    + 'branch|release/0.1|' + Commit('r2') + '|'#10
+    + 'tag|v0.1.0|' + Commit('c2') + '|'#10
+    + 'tag|v0.2.0|' + Commit('v0.2.0-tag') + '|' + Commit('c4') + #10
+    + AExtra);
+end;
+
+procedure TInstallCommitPin.StripReachableFrom(const ARoot: string);
+var Lines: TStringList; i: Integer;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ARoot + '/lwpt.lock');
+    for i := Lines.Count - 1 downto 0 do
+      if Pos('reachableFrom = ', Lines[i]) = 1 then Lines.Delete(i);
+    Lines.SaveToFile(ARoot + '/lwpt.lock');
+  finally
+    Lines.Free;
+  end;
 end;
 
 procedure TInstallCommitPin.ResetRequests;
@@ -139,14 +181,9 @@ begin
   finally
     FindClose(Search);
   end;
-  { The resolver's v1 listing of the same repository: branch and tag tips
-    only, like a real advertisement filtered by the parser. }
-  WriteTextFile(FFixtureRoot + '/refs/reach.refs',
-    'branch|main|' + Commit('c6') + '|'#10
-    + 'branch|release/0.1|' + Commit('r2') + '|'#10
-    + 'tag|v0.1.0|' + Commit('c2') + '|'#10
-    + 'tag|v0.2.0|' + Commit('v0.2.0-tag') + '|' + Commit('c4') + #10);
+  WriteReachRefs('');
   WriteArchive(Commit('c1'));
+  WriteArchive(Commit('c2'));
   WriteArchive(Commit('c6'));
   WriteArchive(Commit('f1'));
 end;
@@ -164,6 +201,9 @@ begin
     + ' for reach: reachable from refs/tags/v0.1.0', Run.Stdout) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('resolvedCommit = "' + Commit('c1') + '"',
+    ReadBinaryFile(Root + '/lwpt.lock')) > 0).ToBe(True);
+  { The lock records which ref proved the pin. }
+  Expect<Boolean>(Pos('reachableFrom = "refs/tags/v0.1.0"',
     ReadBinaryFile(Root + '/lwpt.lock')) > 0).ToBe(True);
   Expect<Integer>(RequestCount('upload-pack|reach|advertise')).ToBe(1);
   Expect<Integer>(RequestCount('upload-pack|reach|fetch')).ToBe(2);
@@ -252,7 +292,8 @@ begin
   Run := RunLwptIn(Root, ['install']);
   Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos('commit pin "' + Copy(Commit('c1'), 1, 12)
-    + '" is abbreviated', Run.Stderr) > 0).ToBe(True);
+    + '" (required by ', Run.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('is abbreviated', Run.Stderr) > 0).ToBe(True);
   Expect<Boolean>(Pos('full 40-character SHA', Run.Stderr) > 0).ToBe(True);
   Expect<Integer>(RequestCount('refs|reach')).ToBe(0);
   Expect<Integer>(RequestCount('upload-pack|')).ToBe(0);
@@ -272,6 +313,67 @@ begin
   Expect<Integer>(RequestCount('archive|reach|')).ToBe(0);
 end;
 
+procedure TInstallCommitPin.TestUnmarkedLockedPinIsProvenAgain;
+var Root: string; Run: TLwptResult;
+begin
+  { A lock written before proofs existed: seed it while the host still
+    advertises f1 as a branch tip, drop the proof marker, then withdraw
+    the branch. The entry carries no evidence and must be proven again. }
+  Root := FScratch + '/legacy-lock';
+  WriteRoot(Root, 'reach = "fixture/reach@' + Commit('f1') + '"'#10);
+  WriteReachRefs('branch|feature|' + Commit('f1') + '|'#10);
+  try
+    Run := RunLwptIn(Root, ['install']);
+    DumpRunFailure('legacy lock seed', Run, 0);
+    Expect<Integer>(Run.ExitCode).ToBe(0);
+  finally
+    WriteReachRefs('');
+  end;
+  StripReachableFrom(Root);
+
+  { Frozen and offline stay network-free but say the entry is unproven. }
+  ResetRequests;
+  Run := RunLwptIn(Root, ['install', '--frozen']);
+  DumpRunFailure('legacy lock frozen', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('without a reachability proof', Run.Stderr) > 0)
+    .ToBe(True);
+  Run := RunLwptIn(Root, ['install', '--offline']);
+  DumpRunFailure('legacy lock offline', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('without a reachability proof', Run.Stderr) > 0)
+    .ToBe(True);
+  Expect<Integer>(RequestCount('upload-pack|')).ToBe(0);
+  Expect<Integer>(RequestCount('refs|')).ToBe(0);
+
+  Run := RunLwptIn(Root, ['install']);
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('is not reachable', Run.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(RequestCount('upload-pack|reach|fetch') > 0).ToBe(True);
+end;
+
+procedure TInstallCommitPin.TestMixedAbbreviatedPinIsRefused;
+const
+  WRAPPER_COMMIT = '1234567890123456789012345678901234567890';
+var Root: string; Run: TLwptResult;
+begin
+  { The root names a tag; a dependency names an abbreviated SHA for the same
+    package. The mixed requirement set must still refuse the abbreviation. }
+  WriteTextFile(FFixtureRoot + '/refs/wrapper.refs',
+    'tag|v1.0.0|' + WRAPPER_COMMIT + '|'#10);
+  WritePackageArchive('wrapper', WRAPPER_COMMIT,
+    'reach = "fixture/reach@' + Copy(Commit('c2'), 1, 12) + '"'#10);
+  Root := FScratch + '/mixed-abbreviated';
+  WriteRoot(Root, 'reach = "fixture/reach@v0.1.0"'#10
+    + 'wrapper = "fixture/wrapper@1.0.0"'#10);
+  Run := RunLwptIn(Root, ['install']);
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('commit pin "' + Copy(Commit('c2'), 1, 12)
+    + '" (required by ', Run.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('is abbreviated', Run.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(FileExists(Root + '/lwpt.lock')).ToBe(False);
+end;
+
 procedure TInstallCommitPin.SetupTests;
 begin
   Test('a pin to an older reachable commit installs',
@@ -288,6 +390,10 @@ begin
     TestAbbreviatedCommitIsRefused);
   Test('add of a fork-only commit leaves the manifest unchanged',
     TestAddOfForkOnlyCommitKeepsManifest);
+  Test('a locked pin without a proof marker is proven again online',
+    TestUnmarkedLockedPinIsProvenAgain);
+  Test('an abbreviated pin is refused beside a named requirement',
+    TestMixedAbbreviatedPinIsRefused);
 end;
 
 begin

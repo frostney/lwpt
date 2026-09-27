@@ -57,19 +57,52 @@ type
     function OutputDir(const ARepoURL: string): string;
   public
     constructor Create(const ARepository: string);
-    function Advertise(const ARepoURL: string;
-      out AEffectiveRepoURL: string): TBytes; override;
-    function Command(const ARepoURL: string;
-      const ARequest: TBytes): TBytes; override;
+    function Advertise(const ARepoURL: string; out AEffectiveRepoURL: string;
+      const ABudget: TGitRequestBudget): TBytes; override;
+    function Command(const ARepoURL: string; const ARequest: TBytes;
+      const ABudget: TGitRequestBudget): TBytes; override;
   end;
 
   { Fails the test if the prover makes any request. }
   TRefusingTransport = class(TGitUploadPackTransport)
   public
-    function Advertise(const ARepoURL: string;
-      out AEffectiveRepoURL: string): TBytes; override;
-    function Command(const ARepoURL: string;
-      const ARequest: TBytes): TBytes; override;
+    function Advertise(const ARepoURL: string; out AEffectiveRepoURL: string;
+      const ABudget: TGitRequestBudget): TBytes; override;
+    function Command(const ARepoURL: string; const ARequest: TBytes;
+      const ABudget: TGitRequestBudget): TBytes; override;
+  end;
+
+  { Wraps another transport and replaces its ls-refs answer, so a host can
+    lie about tips while every fetch still reaches real upload-pack. }
+  TLsRefsOverrideTransport = class(TGitUploadPackTransport)
+  private
+    FInner: TGitUploadPackTransport;
+    FLsRefs: TBytes;
+  public
+    constructor Create(AInner: TGitUploadPackTransport;
+      const ALsRefs: TBytes);
+    destructor Destroy; override;
+    function Advertise(const ARepoURL: string; out AEffectiveRepoURL: string;
+      const ABudget: TGitRequestBudget): TBytes; override;
+    function Command(const ARepoURL: string; const ARequest: TBytes;
+      const ABudget: TGitRequestBudget): TBytes; override;
+  end;
+
+  { Answers from fixed bytes per command, for framing cases no real host
+    produces. }
+  TCannedTransport = class(TGitUploadPackTransport)
+  private
+    FAdvertisement, FLsRefs, FFetch: TBytes;
+    function Answer(const ABody: TBytes;
+      const ABudget: TGitRequestBudget): TBytes;
+  public
+    DelayMilliseconds: Cardinal;
+    Budgets: array of TGitRequestBudget;
+    constructor Create(const AAdvertisement, ALsRefs, AFetch: TBytes);
+    function Advertise(const ARepoURL: string; out AEffectiveRepoURL: string;
+      const ABudget: TGitRequestBudget): TBytes; override;
+    function Command(const ARepoURL: string; const ARequest: TBytes;
+      const ABudget: TGitRequestBudget): TBytes; override;
   end;
 
   TReachabilityTests = class(TTestSuite)
@@ -83,7 +116,12 @@ type
   public
     procedure SetupTests; override;
     procedure TestAdvertisedTipNeedsNoRequest;
-    procedure TestPeeledTagNeedsNoRequest;
+    procedure TestPeeledTagMatchNeedsProof;
+    procedure TestLyingPeeledTagIsNotTrusted;
+    procedure TestInvalidAdvertisedNameIsNotAShortcut;
+    procedure TestMissingNakIsAProtocolError;
+    procedure TestProofSharesOneDeadline;
+    procedure TestProofSharesOneByteBudget;
     procedure TestCommitProvenFromNearestTag;
     procedure TestOldCommitProvenFromNearestTag;
     procedure TestLsRefsTipNeedsNoFetch;
@@ -106,6 +144,11 @@ type
     procedure TestFetchDemultiplexesSideBand;
     procedure TestFetchReportsRemoteErrors;
     procedure TestFetchRejectsMalformedFraming;
+    procedure TestLsRefsIgnoresPeeledClaims;
+    procedure TestLsRefsRejectsInvalidRefNames;
+    procedure TestLsRefsDeduplicatesLinearly;
+    procedure TestLsRefsEnforcesCountLimits;
+    procedure TestRequestSizeIsCapped;
   end;
 
   THTTPTransportTests = class(TTestSuite)
@@ -229,7 +272,7 @@ begin
 end;
 
 function TRecordingTransport.Advertise(const ARepoURL: string;
-  out AEffectiveRepoURL: string): TBytes;
+  out AEffectiveRepoURL: string; const ABudget: TGitRequestBudget): TBytes;
 begin
   AEffectiveRepoURL := ARepoURL;
   { Smart-HTTP hosts such as GitHub put the service announcement in front
@@ -241,7 +284,7 @@ begin
 end;
 
 function TRecordingTransport.Command(const ARepoURL: string;
-  const ARequest: TBytes): TBytes;
+  const ARequest: TBytes; const ABudget: TGitRequestBudget): TBytes;
 var Key: string;
 begin
   Result := RunUploadPack(ARepoURL, ['--stateless-rpc'], ARequest);
@@ -253,15 +296,89 @@ end;
 { TRefusingTransport }
 
 function TRefusingTransport.Advertise(const ARepoURL: string;
-  out AEffectiveRepoURL: string): TBytes;
+  out AEffectiveRepoURL: string; const ABudget: TGitRequestBudget): TBytes;
 begin
   raise Exception.Create('unexpected upload-pack advertisement request');
 end;
 
 function TRefusingTransport.Command(const ARepoURL: string;
-  const ARequest: TBytes): TBytes;
+  const ARequest: TBytes; const ABudget: TGitRequestBudget): TBytes;
 begin
   raise Exception.Create('unexpected upload-pack command request');
+end;
+
+function IsLsRefsRequest(const ARequest: TBytes): Boolean;
+var Head: AnsiString;
+begin
+  SetLength(Head, 19);
+  if Length(ARequest) < 19 then Exit(False);
+  Move(ARequest[0], Head[1], 19);
+  Result := Head = '0014command=ls-refs';
+end;
+
+constructor TLsRefsOverrideTransport.Create(AInner: TGitUploadPackTransport;
+  const ALsRefs: TBytes);
+begin
+  inherited Create;
+  FInner := AInner;
+  FLsRefs := ALsRefs;
+end;
+
+destructor TLsRefsOverrideTransport.Destroy;
+begin
+  FInner.Free;
+  inherited Destroy;
+end;
+
+function TLsRefsOverrideTransport.Advertise(const ARepoURL: string;
+  out AEffectiveRepoURL: string; const ABudget: TGitRequestBudget): TBytes;
+begin
+  Result := FInner.Advertise(ARepoURL, AEffectiveRepoURL, ABudget);
+end;
+
+function TLsRefsOverrideTransport.Command(const ARepoURL: string;
+  const ARequest: TBytes; const ABudget: TGitRequestBudget): TBytes;
+begin
+  if IsLsRefsRequest(ARequest) then
+    Result := Copy(FLsRefs)
+  else
+    Result := FInner.Command(ARepoURL, ARequest, ABudget);
+end;
+
+constructor TCannedTransport.Create(const AAdvertisement, ALsRefs,
+  AFetch: TBytes);
+begin
+  inherited Create;
+  FAdvertisement := AAdvertisement;
+  FLsRefs := ALsRefs;
+  FFetch := AFetch;
+end;
+
+function TCannedTransport.Answer(const ABody: TBytes;
+  const ABudget: TGitRequestBudget): TBytes;
+begin
+  SetLength(Budgets, Length(Budgets) + 1);
+  Budgets[High(Budgets)] := ABudget;
+  if DelayMilliseconds > 0 then Sleep(DelayMilliseconds);
+  if Length(ABody) > ABudget.MaxResponseBytes then
+    raise EGitResponseTooLarge.Create('canned response exceeds the budget');
+  Result := Copy(ABody);
+end;
+
+function TCannedTransport.Advertise(const ARepoURL: string;
+  out AEffectiveRepoURL: string; const ABudget: TGitRequestBudget): TBytes;
+begin
+  AEffectiveRepoURL := ARepoURL;
+  Result := Answer(FAdvertisement, ABudget);
+end;
+
+function TCannedTransport.Command(const ARepoURL: string;
+  const ARequest: TBytes; const ABudget: TGitRequestBudget): TBytes;
+begin
+  if IsLsRefsRequest(ARequest) then
+    Result := Answer(FLsRefs, ABudget)
+  else
+    Result := Answer(FFetch, ABudget);
 end;
 
 { TReachabilityTests }
@@ -350,24 +467,92 @@ begin
   Expect<Integer>(Outcome.Requests).ToBe(0);
 end;
 
-procedure TReachabilityTests.TestPeeledTagNeedsNoRequest;
-var Refs: TGitRefArray; Transport: TRefusingTransport;
-  Outcome: TGitReachabilityResult;
+procedure TReachabilityTests.TestPeeledTagMatchNeedsProof;
+var Refs: TGitRefArray; Outcome: TGitReachabilityResult;
 begin
+  { A peeled (^-brace) line is the host's unverified claim about what the tag object
+    points to. Matching it is not proof: the tag object and its target
+    must arrive hash-verified in a pack. }
   SetLength(Refs, 1);
   Refs[0] := Default(TGitRef);
   Refs[0].Kind := rkTag;
   Refs[0].Name := 'v0.2.0';
   Refs[0].SHA := Commit('v0.2.0-tag');
   Refs[0].PeeledSHA := Commit('c4');
-  Transport := TRefusingTransport.Create;
+  Outcome := Prove(Commit('c4'), Refs);
+  Expect<Boolean>(Outcome.Reachable).ToBe(True);
+  Expect<string>(Outcome.ProvingRef).ToBe('refs/tags/v0.2.0');
+  Expect<Boolean>(Outcome.Requests > 0).ToBe(True);
+end;
+
+procedure TReachabilityTests.TestLyingPeeledTagIsNotTrusted;
+var
+  Transport: TGitUploadPackTransport;
+  Outcome: TGitReachabilityResult;
+begin
+  { The host advertises the genuine v0.2.0 tag object but claims it peels
+    to the fork-only f1, and gives main a peel it cannot have. The pack
+    for the real tag object shows it points at c4. }
+  Transport := TLsRefsOverrideTransport.Create(NewTransport, Bytes(
+    PktLine(Commit('c6') + ' HEAD symref-target:refs/heads/main')
+    + PktLine(Commit('c6') + ' refs/heads/main peeled:' + Commit('f1'))
+    + PktLine(Commit('v0.2.0-tag') + ' refs/tags/v0.2.0 peeled:'
+      + Commit('f1'))
+    + PktFlush));
   try
-    Outcome := ProveCommitReachable(Transport, REPO_URL, Commit('c4'), Refs);
+    Outcome := ProveCommitReachable(Transport, REPO_URL, Commit('f1'), nil);
   finally
     Transport.Free;
   end;
-  Expect<Boolean>(Outcome.Reachable).ToBe(True);
-  Expect<string>(Outcome.ProvingRef).ToBe('refs/tags/v0.2.0');
+  Expect<Boolean>(Outcome.Reachable).ToBe(False);
+  Expect<Boolean>(Outcome.Known).ToBe(True);
+end;
+
+procedure TReachabilityTests.TestInvalidAdvertisedNameIsNotAShortcut;
+var Refs: TGitRefArray; Transport: TRefusingTransport; Raised: Boolean;
+begin
+  { A resolver listing entry whose name is not a valid ref (here carrying a
+    terminal escape) never proves anything by itself. }
+  SetLength(Refs, 1);
+  Refs[0] := Default(TGitRef);
+  Refs[0].Kind := rkBranch;
+  Refs[0].Name := 'main'#27'[2J';
+  Refs[0].SHA := Commit('c6');
+  Transport := TRefusingTransport.Create;
+  Raised := False;
+  try
+    try
+      ProveCommitReachable(Transport, REPO_URL, Commit('c6'), Refs);
+    except
+      on E: Exception do Raised := True;
+    end;
+  finally
+    Transport.Free;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TReachabilityTests.TestMissingNakIsAProtocolError;
+var Transport: TCannedTransport; Message: string;
+begin
+  { An acknowledgments section with neither ACK, ready, nor NAK is not an
+    answer; it must not be read as "the host has no such object". }
+  Transport := TCannedTransport.Create(
+    Bytes(PktLine('version 2') + PktLine('ls-refs') + PktLine('fetch=shallow filter')
+      + PktFlush),
+    Bytes(PktLine(Commit('c6') + ' refs/heads/main') + PktFlush),
+    Bytes(PktLine('acknowledgments') + PktFlush));
+  Message := '';
+  try
+    try
+      ProveCommitReachable(Transport, REPO_URL, Commit('c3'), nil);
+    except
+      on E: EGitReachabilityError do Message := E.Message;
+    end;
+  finally
+    Transport.Free;
+  end;
+  Expect<Boolean>(Pos('neither ACK nor NAK', Message) > 0).ToBe(True);
 end;
 
 procedure TReachabilityTests.TestCommitProvenFromNearestTag;
@@ -467,12 +652,90 @@ begin
     .ToBe(True);
 end;
 
+function CannedHost: TCannedTransport;
+begin
+  Result := TCannedTransport.Create(
+    Bytes(PktLine('version 2') + PktLine('ls-refs')
+      + PktLine('fetch=shallow filter') + PktFlush),
+    Bytes(PktLine(StringOfChar('6', 40) + ' refs/heads/main') + PktFlush),
+    Bytes(PktLine('acknowledgments') + PktLine('NAK') + PktFlush));
+end;
+
+procedure TReachabilityTests.TestProofSharesOneDeadline;
+var
+  Transport: TCannedTransport;
+  Limits: TGitProofLimits;
+  Message: string;
+begin
+  { Each request is well inside any per-request timeout, but together they
+    outlast the proof's single deadline; later requests get only what is
+    left of it. }
+  Transport := CannedHost;
+  Transport.DelayMilliseconds := 120;
+  Limits := DefaultGitProofLimits;
+  Limits.TimeoutMilliseconds := 300;
+  Message := '';
+  try
+    try
+      ProveCommitReachable(Transport, REPO_URL, StringOfChar('3', 40), nil,
+        Limits);
+    except
+      on E: EGitProofDeadlineExceeded do Message := E.Message;
+    end;
+    Expect<Boolean>(Pos('300 ms deadline', Message) > 0).ToBe(True);
+    Expect<Boolean>(Length(Transport.Budgets) >= 2).ToBe(True);
+    Expect<Boolean>(Transport.Budgets[1].TimeoutMilliseconds
+      < Transport.Budgets[0].TimeoutMilliseconds).ToBe(True);
+    Expect<Boolean>(Transport.Budgets[0].TimeoutMilliseconds <= 300)
+      .ToBe(True);
+  finally
+    Transport.Free;
+  end;
+end;
+
+procedure TReachabilityTests.TestProofSharesOneByteBudget;
+var
+  Transport: TCannedTransport;
+  Limits: TGitProofLimits;
+  Raised: Boolean;
+begin
+  { The advertisement alone fits; the ls-refs answer only fits what is
+    left of the proof's total, not a fresh per-response allowance. }
+  Transport := CannedHost;
+  Limits := DefaultGitProofLimits;
+  Limits.MaxTotalBytes := 80;
+  Raised := False;
+  try
+    try
+      ProveCommitReachable(Transport, REPO_URL, StringOfChar('3', 40), nil,
+        Limits);
+    except
+      on E: EGitResponseTooLarge do Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(Transport.Budgets[1].MaxResponseBytes
+      < Transport.Budgets[0].MaxResponseBytes).ToBe(True);
+  finally
+    Transport.Free;
+  end;
+end;
+
 procedure TReachabilityTests.SetupTests;
 begin
   Test('a pin equal to an advertised tip needs no request',
     TestAdvertisedTipNeedsNoRequest);
-  Test('a pin equal to a peeled annotated tag needs no request',
-    TestPeeledTagNeedsNoRequest);
+  Test('a pin matching only a peeled tag claim is proven from the tag object',
+    TestPeeledTagMatchNeedsProof);
+  Test('a host that lies about peeled tips cannot prove a fork commit',
+    TestLyingPeeledTagIsNotTrusted);
+  Test('an advertised ref with an invalid name is not an exact-tip proof',
+    TestInvalidAdvertisedNameIsNotAShortcut);
+  Test('an acknowledgments section without ACK or NAK is refused',
+    TestMissingNakIsAProtocolError);
+  Test('all requests of a proof share one monotonic deadline',
+    TestProofSharesOneDeadline);
+  Test('all responses of a proof share one byte budget',
+    TestProofSharesOneByteBudget);
   Test('a commit below a tag is proven from the nearest tag',
     TestCommitProvenFromNearestTag);
   Test('an old commit is proven from the first tag after it',
@@ -564,7 +827,7 @@ begin
   Expect<Integer>(Length(Tips)).ToBe(2);
   Expect<string>(Tips[0].Name).ToBe('refs/heads/main');
   Expect<string>(Tips[1].Name).ToBe('refs/tags/v1');
-  Expect<string>(Tips[1].Id).ToBe(StringOfChar('3', 40));
+  Expect<string>(Tips[1].Id).ToBe(StringOfChar('2', 40));
 end;
 
 procedure TProtocolMessageTests.TestLsRefsRejectsTruncation;
@@ -658,6 +921,120 @@ begin
     .ToBe(True);
 end;
 
+procedure TProtocolMessageTests.TestLsRefsIgnoresPeeledClaims;
+var Tips: TGitTipArray; Head: string;
+begin
+  Tips := ParseLsRefsResponse(Bytes(
+    Pkt(StringOfChar('1', 40) + ' refs/heads/main peeled:'
+      + StringOfChar('9', 40))
+    + Pkt(StringOfChar('2', 40) + ' refs/tags/v1 peeled:'
+      + StringOfChar('3', 40))
+    + PktFlush), Head);
+  Expect<Integer>(Length(Tips)).ToBe(2);
+  Expect<string>(Tips[0].Id).ToBe(StringOfChar('1', 40));
+  Expect<string>(Tips[1].Id).ToBe(StringOfChar('2', 40));
+end;
+
+procedure TProtocolMessageTests.TestLsRefsRejectsInvalidRefNames;
+
+  function Rejected(const AName: string): Boolean;
+  var Head: string;
+  begin
+    Result := False;
+    try
+      ParseLsRefsResponse(Bytes(Pkt(StringOfChar('1', 40) + ' ' + AName)
+        + PktFlush), Head);
+    except
+      on E: EGitReachabilityError do Result := True;
+    end;
+  end;
+
+begin
+  Expect<Boolean>(Rejected('refs/heads/ok'#27'[31mfake')).ToBe(True);
+  Expect<Boolean>(Rejected('refs/heads/a..b')).ToBe(True);
+  Expect<Boolean>(Rejected('refs/tags/x.lock')).ToBe(True);
+  Expect<Boolean>(Rejected('refs/heads/a@{1}')).ToBe(True);
+  Expect<Boolean>(Rejected('refs/heads/.hidden')).ToBe(True);
+  Expect<Boolean>(Rejected('refs/heads/trailing/')).ToBe(True);
+  Expect<Boolean>(Rejected('refs/heads/star*')).ToBe(True);
+  Expect<Boolean>(Rejected('refs/heads/release/1.0')).ToBe(False);
+end;
+
+function RepeatedLsRefs(ACount: Integer; ADistinct: Boolean): TBytes;
+var Text: AnsiString; Line: AnsiString; i, n: Integer; Id: string;
+begin
+  Line := Pkt(StringOfChar('a', 40) + ' refs/tags/t0000000');
+  SetLength(Text, ACount * Length(Line) + 4);
+  n := 0;
+  for i := 1 to ACount do
+  begin
+    if ADistinct then
+      Id := LowerCase(IntToHex(i, 40))
+    else
+      Id := StringOfChar('a', 40);
+    Line := Pkt(Id + ' refs/tags/t' + Format('%.7d', [i]));
+    Move(Line[1], Text[n + 1], Length(Line));
+    Inc(n, Length(Line));
+  end;
+  Line := PktFlush;
+  Move(Line[1], Text[n + 1], Length(Line));
+  Inc(n, Length(Line));
+  SetLength(Text, n);
+  Result := Bytes(Text);
+end;
+
+procedure TProtocolMessageTests.TestLsRefsDeduplicatesLinearly;
+var Tips: TGitTipArray; Head: string; Started: QWord;
+begin
+  { 50,000 tags on one commit: one proof tip, parsed in linear time. }
+  Started := GetTickCount64;
+  Tips := ParseLsRefsResponse(RepeatedLsRefs(50000, False), Head);
+  Expect<Integer>(Length(Tips)).ToBe(1);
+  Expect<Boolean>(GetTickCount64 - Started < 5000).ToBe(True);
+end;
+
+procedure TProtocolMessageTests.TestLsRefsEnforcesCountLimits;
+
+  function Rejected(const ABody: TBytes; const AExpected: string): Boolean;
+  var Head, Message: string;
+  begin
+    Message := '';
+    try
+      ParseLsRefsResponse(ABody, Head);
+    except
+      on E: EGitReachabilityError do Message := E.Message;
+    end;
+    Result := Pos(AExpected, Message) > 0;
+    if not Result then
+      WriteLn('    expected "', AExpected, '", got "', Message, '"');
+  end;
+
+begin
+  Expect<Boolean>(Rejected(RepeatedLsRefs(MAX_ADVERTISED_REFS + 1, False),
+    'more than')).ToBe(True);
+  Expect<Boolean>(Rejected(RepeatedLsRefs(MAX_PROOF_TIPS + 1, True),
+    'distinct tips')).ToBe(True);
+end;
+
+procedure TProtocolMessageTests.TestRequestSizeIsCapped;
+var Arguments: array of string; i: Integer; Raised: Boolean;
+begin
+  SetLength(Arguments, MAX_UPLOAD_PACK_REQUEST_BYTES div 40);
+  for i := 0 to High(Arguments) do
+    Arguments[i] := 'want ' + StringOfChar('a', 40);
+  Raised := False;
+  try
+    BuildV2CommandRequest(Default(TGitV2Capabilities), 'fetch', Arguments);
+  except
+    on E: EGitReachabilityError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  { MAX_PROOF_TIPS wants fit. }
+  SetLength(Arguments, MAX_PROOF_TIPS + 8);
+  Expect<Boolean>(Length(BuildV2CommandRequest(Default(TGitV2Capabilities),
+    'fetch', Arguments)) <= MAX_UPLOAD_PACK_REQUEST_BYTES).ToBe(True);
+end;
+
 procedure TProtocolMessageTests.SetupTests;
 begin
   Test('pkt-lines and v2 command requests are framed exactly',
@@ -666,7 +1043,7 @@ begin
     TestCapabilitiesAcceptServicePreamble);
   Test('a v0 advertisement is not mistaken for v2',
     TestCapabilitiesRejectVersion0);
-  Test('ls-refs keeps branches and peeled tags and drops fork refs',
+  Test('ls-refs keeps branch and tag tips and drops fork refs',
     TestLsRefsKeepsOnlyBranchesAndTags);
   Test('ls-refs rejects truncated or malformed responses',
     TestLsRefsRejectsTruncation);
@@ -676,9 +1053,25 @@ begin
     TestFetchReportsRemoteErrors);
   Test('fetch responses with malformed framing are rejected',
     TestFetchRejectsMalformedFraming);
+  Test('ls-refs uses raw ids and ignores unverified peeled claims',
+    TestLsRefsIgnoresPeeledClaims);
+  Test('ls-refs rejects names that are not valid refs',
+    TestLsRefsRejectsInvalidRefNames);
+  Test('ls-refs deduplicates many tags on one commit in linear time',
+    TestLsRefsDeduplicatesLinearly);
+  Test('ls-refs enforces ref-count and distinct-tip limits',
+    TestLsRefsEnforcesCountLimits);
+  Test('upload-pack request bodies are capped',
+    TestRequestSizeIsCapped);
 end;
 
 { THTTPTransportTests }
+
+function FullBudget: TGitRequestBudget;
+begin
+  Result.TimeoutMilliseconds := 10000;
+  Result.MaxResponseBytes := MAX_UPLOAD_PACK_RESPONSE_BYTES;
+end;
 
 function MockResponse(const ABody: AnsiString): TBytes;
 begin
@@ -700,7 +1093,8 @@ begin
     try
       Response := Transport.Command('http://127.0.0.1:'
         + IntToStr(Server.Port) + '/fixture/reach.git/',
-        Bytes(PktLine('command=fetch') + PktDelim + PktFlush));
+        Bytes(PktLine('command=fetch') + PktDelim + PktFlush),
+        FullBudget);
     finally
       Transport.Free;
     end;
@@ -736,7 +1130,7 @@ begin
     try
       try
         Transport.Advertise('http://127.0.0.1:' + IntToStr(Server.Port)
-          + '/fixture/reach.git', Effective);
+          + '/fixture/reach.git', Effective, FullBudget);
       except
         on E: EGitResponseTooLarge do Message := E.Message;
       end;
@@ -773,7 +1167,8 @@ begin
   { The same destination policy install applies to a GitHub dependency. }
   FOptions := DefaultHTTPRequestOptions;
   FOptions.Destination.AllowedHosts := ['github.com'];
-  FOptions.Destination.PrivateAddresses := papDeny;
+  FOptions.Destination.PrivateAddressPolicy := papDeny;
+  FOptions.Destination.RequireHTTPS := True;
   try
     FAdvertised := ListRemoteRefs(CHECKOUT_URL, FOptions);
   except

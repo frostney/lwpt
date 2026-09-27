@@ -71,23 +71,30 @@ type
     CommitTime: Int64;
   end;
 
-  { Commits whose ids were recomputed from pack bytes. }
+  { Commits and annotated tags whose ids were recomputed from pack bytes. }
   TGitCommitGraph = class
   private
     FCommits: TDictionary<string, TGitCommitRecord>;
+    FTags: TDictionary<string, string>;
   public
     constructor Create;
     destructor Destroy; override;
     procedure Add(const AId: string; const ARecord: TGitCommitRecord);
+    { An annotated tag whose object line names a commit or another tag. }
+    procedure AddTag(const AId, ATarget: string);
+    { The commit AId names, following verified tag objects; '' when the
+      chain leaves the graph or does not end at a commit. }
+    function PeelToCommit(const AId: string): string;
     function Contains(const AId: string): Boolean;
     function TryGetCommit(const AId: string;
       out ARecord: TGitCommitRecord): Boolean;
     function Count: Integer;
     { Index of the first start from which ATarget is reachable through
-      commits held in this graph, or -1. ATarget itself need not be in the
-      graph: it is reached when a visited commit lists it as a parent (or a
-      start equals it). A walk stops at commits the graph does not hold, so
-      a pack that omits part of a path can only produce a false negative. }
+      objects held in this graph, or -1. ATarget itself need not be in the
+      graph: it is reached when a visited commit lists it as a parent, a
+      visited tag object names it, or a start equals it. A walk stops at
+      ids the graph does not hold, so a pack that omits part of a path can
+      only produce a false negative. }
     function FindReachingStart(const AStarts: array of string;
       const ATarget: string): Integer;
   end;
@@ -217,10 +224,12 @@ constructor TGitCommitGraph.Create;
 begin
   inherited Create;
   FCommits := TDictionary<string, TGitCommitRecord>.Create;
+  FTags := TDictionary<string, string>.Create;
 end;
 
 destructor TGitCommitGraph.Destroy;
 begin
+  FTags.Free;
   FCommits.Free;
   inherited Destroy;
 end;
@@ -229,6 +238,25 @@ procedure TGitCommitGraph.Add(const AId: string;
   const ARecord: TGitCommitRecord);
 begin
   FCommits.AddOrSetValue(AId, ARecord);
+end;
+
+procedure TGitCommitGraph.AddTag(const AId, ATarget: string);
+begin
+  FTags.AddOrSetValue(AId, ATarget);
+end;
+
+function TGitCommitGraph.PeelToCommit(const AId: string): string;
+var Id, Target: string; Hops: Integer;
+begin
+  Result := '';
+  Id := AId;
+  { Tag chains are short; the bound also stops a self-referencing chain. }
+  for Hops := 0 to 16 do
+  begin
+    if FCommits.ContainsKey(Id) then Exit(Id);
+    if not FTags.TryGetValue(Id, Target) then Exit;
+    Id := Target;
+  end;
 end;
 
 function TGitCommitGraph.Contains(const AId: string): Boolean;
@@ -253,7 +281,7 @@ var
   Visited: TDictionary<string, Boolean>;
   Stack: TList<string>;
   StartIndex, p: Integer;
-  Id, Parent: string;
+  Id, Parent, Target: string;
   Commit: TGitCommitRecord;
 begin
   Result := -1;
@@ -273,6 +301,12 @@ begin
         Stack.Delete(Stack.Count - 1);
         if Visited.ContainsKey(Id) then Continue;
         Visited.Add(Id, True);
+        if FTags.TryGetValue(Id, Target) then
+        begin
+          if Target = ATarget then Exit(StartIndex);
+          if not Visited.ContainsKey(Target) then Stack.Add(Target);
+          Continue;
+        end;
         if not FCommits.TryGetValue(Id, Commit) then Continue;
         p := 1;
         while p + GIT_OBJECT_ID_LENGTH - 1 <= Length(Commit.Parents) do
@@ -338,6 +372,24 @@ begin
   end;
   if not SeenTree then
     raise EGitPackError.CreateFmt('commit %s has no tree header', [AId]);
+end;
+
+{ The target of an annotated tag that names a commit or another tag; ''
+  for tags of trees and blobs, which never lead to a commit. }
+function ParseTagTarget(const AId: string; const AData: AnsiString): string;
+var LineEnd: Integer; Line, Kind: string;
+begin
+  Result := '';
+  LineEnd := Pos(#10, AData);
+  Line := Copy(AData, 1, LineEnd - 1);
+  if (LineEnd = 0) or (Copy(Line, 1, 7) <> 'object ')
+     or not IsLowerObjectId(Copy(Line, 8, MaxInt)) then
+    raise EGitPackError.CreateFmt('tag %s has a malformed object line',
+      [AId]);
+  Kind := Copy(AData, LineEnd + 1, MaxInt);
+  Kind := Copy(Kind, 1, Pos(#10, Kind) - 1);
+  if (Kind = 'type commit') or (Kind = 'type tag') then
+    Result := Copy(Line, 8, MaxInt);
 end;
 
 { Pack reader }
@@ -629,13 +681,19 @@ end;
 
 procedure TPackReader.Complete(AIndex: Integer; AKind: Integer;
   const AData: AnsiString);
+var Target: string;
 begin
   FEntries[AIndex].Kind := AKind;
   FEntries[AIndex].Data := AData;
   FEntries[AIndex].Id := GitObjectId(KindName(AKind), AData);
   if AKind = OBJ_COMMIT then
     FGraph.Add(FEntries[AIndex].Id,
-      ParseCommit(FEntries[AIndex].Id, AData));
+      ParseCommit(FEntries[AIndex].Id, AData))
+  else if AKind = OBJ_TAG then
+  begin
+    Target := ParseTagTarget(FEntries[AIndex].Id, AData);
+    if Target <> '' then FGraph.AddTag(FEntries[AIndex].Id, Target);
+  end;
 end;
 
 procedure TPackReader.Resolve;
