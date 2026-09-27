@@ -38,6 +38,10 @@ type
     MaxResponseHeaderBytes: Integer;
     RequestTimeoutMilliseconds: QWord;
     MaximumRedirects: Integer;
+    { Optional literal IPv4 address for the first connection. The URL still
+      supplies the Host header and TLS server name; redirects resolve their
+      own hosts. Empty uses normal host resolution. }
+    ConnectAddress: string;
   end;
 
   EHTTPError = class(Exception);
@@ -1156,6 +1160,28 @@ end;
 // Core request logic
 // ---------------------------------------------------------------------------
 
+function ConnectAddressIsIPv4(const AValue: string): Boolean;
+var
+  Parts: array of string;
+  Part: string;
+  Index, Start, Octet: Integer;
+begin
+  Parts := nil;
+  Start := 1;
+  for Index := 1 to Length(AValue) + 1 do
+    if (Index > Length(AValue)) or (AValue[Index] = '.') then
+    begin
+      SetLength(Parts, Length(Parts) + 1);
+      Parts[High(Parts)] := Copy(AValue, Start, Index - Start);
+      Start := Index + 1;
+    end;
+  Result := Length(Parts) = 4;
+  if not Result then Exit;
+  for Part in Parts do
+    if (Part = '') or (Length(Part) > 3) or not TryStrToInt(Part, Octet)
+      or (Octet > 255) or (IntToStr(Octet) <> Part) then Exit(False);
+end;
+
 procedure ValidateRequestOptions(const AOptions: THTTPRequestOptions);
 begin
   if (AOptions.MaxResponseBodyBytes < 0) or
@@ -1173,6 +1199,8 @@ begin
     raise EHTTPError.Create('HTTP request timeout must be greater than zero');
   if AOptions.MaximumRedirects < 0 then
     raise EHTTPError.Create('HTTP maximum redirects must not be negative');
+  if (AOptions.ConnectAddress <> '') and not ConnectAddressIsIPv4(AOptions.ConnectAddress) then
+    raise EHTTPError.Create('HTTP connect address must be a literal IPv4 address');
 end;
 
 procedure ValidateRequestContentType(const AContentType: string);
@@ -1195,7 +1223,7 @@ var
   Request: AnsiString;
   Raw: TRawHTTPResponse;
   I, Redirects: Integer;
-  CurrentURL, Location, HostHeader: string;
+  CurrentURL, Location, HostHeader, ConnectHost: string;
   HasRequestContent, HasUserAgent, IsHead: Boolean;
   HeaderName, Method, ContentType: string;
   Body: TBytes;
@@ -1223,7 +1251,10 @@ begin
     CheckRequestDeadline(Deadline, AOptions.RequestTimeoutMilliseconds);
     Parsed := ParseHTTPURL(CurrentURL);
     FillChar(Transport, SizeOf(Transport), 0);
-    Sock := ConnectSocket(Parsed.Host, Parsed.Port, Deadline,
+    ConnectHost := Parsed.Host;
+    if (AOptions.ConnectAddress <> '') and (Redirects = 0) then
+      ConnectHost := AOptions.ConnectAddress;
+    Sock := ConnectSocket(ConnectHost, Parsed.Port, Deadline,
       AOptions.RequestTimeoutMilliseconds);
     try
       if Parsed.Scheme = 'https' then
@@ -1343,6 +1374,7 @@ begin
   Result.RequestTimeoutMilliseconds :=
     DEFAULT_REQUEST_TIMEOUT_MILLISECONDS;
   Result.MaximumRedirects := DEFAULT_MAXIMUM_REDIRECTS;
+  Result.ConnectAddress := '';
 end;
 
 function HTTPGet(const AURL: string;

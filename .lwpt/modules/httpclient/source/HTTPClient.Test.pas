@@ -64,6 +64,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestSimpleResponseBodyStartsWithNul;
+    procedure TestConnectAddressKeepsURLAuthority;
     procedure TestSimpleResponseBodyInterspersedNul;
     procedure TestChunkedResponseChunkStartsWithNul;
     procedure TestChunkedResponseMultipleChunksWithNul;
@@ -1311,8 +1312,43 @@ begin
     TestTLSHandshakeDeadlineRejectsIdlePeer);
 end;
 
+procedure THTTPClientByteFetch.TestConnectAddressKeepsURLAuthority;
+var
+  Mock: TMockHTTPServer;
+  Options: THTTPRequestOptions;
+  Response: THTTPResponse;
+  Diagnostic: string;
+begin
+  Mock := TMockHTTPServer.Create(BuildSimpleResponse(MakeBytes([$00, $01])));
+  try
+    Mock.Start;
+    Options := TestOptions(1024, 4096, 1000);
+    Options.ConnectAddress := '127.0.0.1';
+    { The reserved name never resolves; only the pinned address is used. }
+    Response := HTTPGet('http://registry.invalid:' + IntToStr(Mock.Port) + '/x',
+      nil, Options);
+    Mock.WaitDone;
+    Expect<Integer>(Response.StatusCode).ToBe(200);
+    Expect<Boolean>(Pos(#13#10 + 'Host: registry.invalid:' + IntToStr(Mock.Port) + #13#10,
+      RequestHeaderText(Mock.ReceivedRequest)) > 0).ToBe(True);
+  finally
+    Mock.Free;
+  end;
+  Options := TestOptions(1024, 4096, 1000);
+  Options.ConnectAddress := '::1';
+  Diagnostic := '';
+  try
+    HTTPGet('http://registry.invalid/x', nil, Options);
+  except
+    on E: EHTTPError do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('connect address', Diagnostic) > 0).ToBe(True);
+end;
+
 procedure THTTPClientByteFetch.SetupTests;
 begin
+  Test('a pinned connect address keeps the URL authority',
+    TestConnectAddressKeepsURLAuthority);
   Test('hostname resolution preserves binary body and original Host header',
     TestHostnamePreservesBodyAndHost);
   Test('concurrent hostname requests retain independent results',
