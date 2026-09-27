@@ -24,3 +24,8 @@
 # sha256 of their own bytes — a rewritten byte would corrupt the fixture.
 *.p12 binary
 *.hex binary
+
+# Recorded git upload-pack exchanges and packfiles for the commit-reachability
+# tests (ADR-0045) are exact protocol bytes.
+tests/fixtures/git-reachability/*.pack binary
+tests/fixtures/git-reachability/upload-pack/** binary
