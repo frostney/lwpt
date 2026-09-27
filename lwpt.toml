@@ -67,7 +67,8 @@ include = [
 ]
 
 # Enables deterministic HTTPClient syscall outcomes, the object-store race
-# interleaving, and registry publication crash points only while compiling
-# tests. Production builds expose none of these hooks.
+# interleaving, process-group setup outcomes, and registry publication crash
+# points only while compiling tests. Production builds expose none of these
+# hooks.
 [test]
 flags = ["-dHTTPCLIENT_TESTING", "-dOBJECTSTORE_TESTING", "-dREGISTRY_TESTING"]
