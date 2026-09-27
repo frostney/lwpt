@@ -1,6 +1,6 @@
 program InstallCommitPin.Test;
 
-{ Commit-SHA pins through the real CLI (ADR-0045). The git host is the
+{ Commit-SHA pins through the real CLI (ADR-0047). The git host is the
   test-build fixture seam: ref listings from refs/<repo>.refs, archives from
   archives/<repo>/<ref>.tar.gz, and upload-pack exchanges replayed from the
   recordings in tests/fixtures/git-reachability/upload-pack/reach, which

@@ -494,7 +494,7 @@ end;
     vkSemverExact → try the spec verbatim AND v<spec> against the
                     tag list; first match wins.
     vkCommitSha   → returned verbatim once proven reachable from an
-                    advertised branch or tag (ADR-0045).
+                    advertised branch or tag (ADR-0047).
     vkLiteralTag  → returned verbatim (no SemVer logic). If the tag
                     isn't actually present in the repo, the eventual
                     fetch will 404 — we surface that as EFetchError.
@@ -2757,7 +2757,7 @@ var
   end;
 
   { A commit-SHA pin is accepted only when the commit is reachable from an
-    advertised refs/heads/* or refs/tags/* tip (ADR-0045): the archive
+    advertised refs/heads/* or refs/tags/* tip (ADR-0047): the archive
     endpoint also serves commits that exist only in forks or pull requests.
     The proof runs when the lock entry is created or its commit changes; a
     prior lock entry for the same source at the same commit was proven when

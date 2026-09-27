@@ -42,7 +42,7 @@ unit LWPT.GitProtocol;
                          underlying commit identity advertised by Git)
     HEAD               → ignored (not a useful target for fetches)
 
-  Commit reachability (ADR-0045). A commit-SHA pin is accepted only when the
+  Commit reachability (ADR-0047). A commit-SHA pin is accepted only when the
   commit is reachable from an advertised refs/heads/* or refs/tags/* tip.
   ProveCommitReachable first compares the pin with the advertised tips
   (no extra request). Otherwise it speaks protocol v2 over the same

@@ -1,6 +1,6 @@
 program LWPT.GitProtocol.Test;
 
-{ Commit-reachability proofs (ADR-0045) against recorded git upload-pack
+{ Commit-reachability proofs (ADR-0047) against recorded git upload-pack
   exchanges, plus the protocol v2 message parsers and the HTTP transport.
 
   The exchanges under tests/fixtures/git-reachability/upload-pack/ were

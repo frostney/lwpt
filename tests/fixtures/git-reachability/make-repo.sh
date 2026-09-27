@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the deterministic git repository behind the commit-reachability
-# fixtures (ADR-0045) and regenerates the committed pack files.
+# fixtures (ADR-0047) and regenerates the committed pack files.
 #
 #   tests/fixtures/git-reachability/make-repo.sh <empty-or-missing-dir>
 #

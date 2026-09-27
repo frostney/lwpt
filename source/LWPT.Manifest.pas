@@ -101,7 +101,7 @@ type
       vkCommitSha    — 7-40 hex chars. Fetched at the archive-at-sha
                        endpoint for the host. A pin used on its own
                        must be the full 40 characters and reachable
-                       from an advertised branch or tag (ADR-0045).
+                       from an advertised branch or tag (ADR-0047).
       vkLiteralTag   — anything else, including v1.0.0 (which is NOT
                        a SemVer 2.0.0 version — it's a Git tag string
                        that happens to contain one). Literal tag-list

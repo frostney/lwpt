@@ -4,7 +4,7 @@ unit LWPT.GitPack;
 
 { LWPT.GitPack — a bounded reader for commits-only git packfiles.
 
-  Commit-pin verification (ADR-0045) asks a git host for the commits between
+  Commit-pin verification (ADR-0047) asks a git host for the commits between
   its advertised branch and tag tips and the pinned commit, then walks their
   parent links. This unit turns such a pack into a commit graph whose every
   node id was recomputed locally from the received bytes, so the walk never
