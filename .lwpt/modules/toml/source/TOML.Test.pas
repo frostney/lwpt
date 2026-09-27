@@ -126,6 +126,15 @@ begin
     { An array-of-tables item sits one level below its array. }
     Expect<string>(ParseOutcome(Parser, '[[a]]' + #10 + 'b = 1' + #10)).ToBe('parsed');
     Expect<string>(ParseOutcome(Parser, '[[a.b]]' + #10 + 'c = 1' + #10)).ToBe('limit');
+    { Headers that descend through an existing array of tables also pass
+      through its current item. }
+    Expect<string>(ParseOutcome(Parser, '[[a]]' + #10 + '[a.b]' + #10)).ToBe('parsed');
+    Expect<string>(ParseOutcome(Parser, '[[a]]' + #10 + '[a.b]' + #10 + 'c = 1' + #10)).ToBe('limit');
+    Expect<string>(ParseOutcome(Parser, '[[a]]' + #10 + '[[a.b]]' + #10)).ToBe('limit');
+    Expect<string>(ParseOutcome(Parser, '[[a]]' + #10 + 'x.y = 1' + #10)).ToBe('limit');
+    Parser.MaximumDepth := 4;
+    Expect<string>(ParseOutcome(Parser, '[[a]]' + #10 + '[[a.b]]' + #10)).ToBe('parsed');
+    Expect<string>(ParseOutcome(Parser, '[[a]]' + #10 + '[[a.b]]' + #10 + 'c = 1' + #10)).ToBe('limit');
   finally
     Parser.Free;
   end;

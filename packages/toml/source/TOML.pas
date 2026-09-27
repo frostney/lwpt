@@ -143,8 +143,10 @@ type
     procedure ParseKeyValuePair;
     function ParseLiteralString(const AMultiline, AIsKey: Boolean): string;
     function ParseQuotedKey: string;
-    function ParseRegularTable(const APath: TArray<string>): TTOMLNode;
-    function ParseTableArray(const APath: TArray<string>): TTOMLNode;
+    function ParseRegularTable(const APath: TArray<string>;
+      out ADepth: Integer): TTOMLNode;
+    function ParseTableArray(const APath: TArray<string>;
+      out ADepth: Integer): TTOMLNode;
     procedure ParseTableHeader;
     function ParseTokenValue(const AToken: string): TTOMLNode;
     function ParseValue(const ADelimiters: string): TTOMLNode;
@@ -1091,7 +1093,7 @@ begin
 end;
 
 function TTOMLParser.ParseRegularTable(
-  const APath: TArray<string>): TTOMLNode;
+  const APath: TArray<string>; out ADepth: Integer): TTOMLNode;
 var
   Context, Existing: TTOMLNode;
   I: Integer;
@@ -1101,8 +1103,11 @@ begin
     RaiseParseError('Table headers require at least one key part.');
 
   Context := FRoot;
+  ADepth := 0;
   for I := 0 to Length(APath) - 1 do
   begin
+    Inc(ADepth);
+    CheckDepth(ADepth);
     if Context.Sealed then
       RaiseParseError(Format(
         'Inline table "%s" is fully defined and cannot be extended.',
@@ -1126,6 +1131,9 @@ begin
         RaiseParseError(Format(
           'Cannot redefine array of tables "%s" as a regular table.',
           [JoinPath(APath)]));
+      { Descending through an array of tables enters its current item. }
+      Inc(ADepth);
+      CheckDepth(ADepth);
       Existing := Existing.LastItem;
       if not Assigned(Existing) then
         RaiseParseError(Format('Array of tables "%s" has no current item.',
@@ -1157,7 +1165,7 @@ begin
 end;
 
 function TTOMLParser.ParseTableArray(
-  const APath: TArray<string>): TTOMLNode;
+  const APath: TArray<string>; out ADepth: Integer): TTOMLNode;
 var
   ArrayNode, Context, Existing, NewItem: TTOMLNode;
   I: Integer;
@@ -1166,8 +1174,11 @@ begin
     RaiseParseError('Array-of-table headers require at least one key part.');
 
   Context := FRoot;
+  ADepth := 0;
   for I := 0 to Length(APath) - 2 do
   begin
+    Inc(ADepth);
+    CheckDepth(ADepth);
     Existing := GetChild(Context, APath[I]);
     if not Assigned(Existing) then
     begin
@@ -1182,6 +1193,8 @@ begin
         [JoinPathPrefix(APath, I + 1)]))
     else if Existing.Kind = tnkArrayOfTables then
     begin
+      Inc(ADepth);
+      CheckDepth(ADepth);
       Existing := Existing.LastItem;
       if not Assigned(Existing) then
         RaiseParseError(Format('Array of tables "%s" has no current item.',
@@ -1196,6 +1209,9 @@ begin
     Context := Existing;
   end;
 
+  { The array occupies the next level; its new item is one below it. }
+  CheckDepth(ADepth + 2);
+  ADepth := ADepth + 2;
   Existing := GetChild(Context, APath[Length(APath) - 1]);
   if not Assigned(Existing) then
   begin
@@ -1242,18 +1258,14 @@ begin
     if not MatchText(']]') then
       RaiseParseError('Unterminated array-of-tables header.');
     Advance(2);
-    { The array occupies the path's depth; its current item is one below. }
-    CheckDepth(Length(Path) + 1);
-    FCurrentTable := ParseTableArray(Path);
-    FCurrentTableDepth := Length(Path) + 1;
+    FCurrentTable := ParseTableArray(Path, FCurrentTableDepth);
   end
   else
   begin
     if CurrentChar <> ']' then
       RaiseParseError('Unterminated table header.');
     Advance;
-    FCurrentTable := ParseRegularTable(Path);
-    FCurrentTableDepth := Length(Path);
+    FCurrentTable := ParseRegularTable(Path, FCurrentTableDepth);
   end;
 
   while IsSpaceOrTab(CurrentChar) do
