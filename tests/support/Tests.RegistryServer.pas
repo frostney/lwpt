@@ -348,7 +348,7 @@ begin
   if WinSock2.listen(FListenSocket, 16) <> 0 then
     raise Exception.Create('registry test server listen failed');
   AddrLength := SizeOf(Addr);
-  if WinSock2.getsockname(FListenSocket, PSockAddr(@Addr), AddrLength) <> 0 then
+  if WinSock2.getsockname(FListenSocket, Addr, AddrLength) <> 0 then
     raise Exception.Create('registry test server getsockname failed');
   FPort := WinSock2.ntohs(Addr.sin_port);
   {$ENDIF}
