@@ -34,6 +34,7 @@ type
     procedure TestExtraArtifactOutsideRootsIsRejected;
     procedure TestForcedRebuildIsRejectedExplicitly;
     procedure TestEmptyInputShortLivedChildCycles;
+    procedure TestUnreadInputLeavesResultToExitedChild;
     procedure TestTimeoutKillsNonReadingProxy;
     procedure TestTimeoutDoesNotWaitForEscapedStdinHolder;
     procedure TestCaptureOverflowRetainsBoundedPrefixAndTerminates;
@@ -47,6 +48,23 @@ procedure CountStreamedOutput(const AData: RawByteString;
   const AStandardError: Boolean);
 begin
   if not AStandardError then Inc(StreamedOutputBytes, Length(AData));
+end;
+
+{ Closes the child's standard input and, on Unix, every other inherited
+  descriptor except standard output and error: TProcess children also inherit
+  a duplicate of the input pipe's read end, which would keep the pipe open. }
+procedure CloseEveryInputDescriptor;
+{$IFDEF UNIX}
+var
+  Descriptor: Integer;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  for Descriptor := 0 to 1023 do
+    if (Descriptor <> 1) and (Descriptor <> 2) then FpClose(Descriptor);
+  {$ELSE}
+  FileClose(StdInputHandle);
+  {$ENDIF}
 end;
 
 function ReadStandardInput: string;
@@ -494,6 +512,43 @@ begin
   end;
 end;
 
+procedure TLWPTExternalCompilerDriverTests.
+  TestUnreadInputLeavesResultToExitedChild;
+const
+  { Larger than any platform pipe buffer, so the writer is still blocked when
+    the child closes its input and keeps running. }
+  CYCLE_COUNT = 3;
+  INPUT_BYTES = 1024 * 1024;
+var
+  Cycle: Integer;
+  Input: string;
+  Options: TLWPTProcessRunOptions;
+  P: TProcess;
+  Runner: TLWPTDuplexProcessRunner;
+  StandardError, StandardOutput: string;
+begin
+  Input := StringOfChar('x', INPUT_BYTES);
+  for Cycle := 1 to CYCLE_COUNT do
+  begin
+    P := TProcess.Create(nil);
+    Runner := nil;
+    try
+      P.Executable := ParamStr(0);
+      P.Parameters.Add('close-input-then-exit-3');
+      Runner := TLWPTDuplexProcessRunner.Create(P);
+      Options := DefaultProcessRunOptions('unread-input child');
+      Options.SeparateStandardError := True;
+      Options.TimeoutMilliseconds := 10000;
+      Expect<Integer>(Runner.Run(Input, Options, StandardOutput,
+        StandardError)).ToBe(3);
+      Expect<Boolean>(Runner.UsedStandardInputWriter).ToBe(True);
+    finally
+      Runner.Free;
+      P.Free;
+    end;
+  end;
+end;
+
 procedure TLWPTExternalCompilerDriverTests.TestTimeoutKillsNonReadingProxy;
 var
   Options: TLWPTProcessRunOptions;
@@ -610,6 +665,8 @@ begin
     TestForcedRebuildIsRejectedExplicitly);
   Test('empty input does not race short-lived child cleanup',
     TestEmptyInputShortLivedChildCycles);
+  Test('unread input leaves the result to a child that exited',
+    TestUnreadInputLeavesResultToExitedChild);
   Test('timeout kills a sleeping proxy that never reads stdin',
     TestTimeoutKillsNonReadingProxy);
   Test('timeout does not wait for an escaped descendant retaining stdin',
@@ -622,6 +679,12 @@ end;
 
 begin
   if (ParamCount = 1) and (ParamStr(1) = 'exit-without-reading') then Halt(0);
+  if (ParamCount = 1) and (ParamStr(1) = 'close-input-then-exit-3') then
+  begin
+    CloseEveryInputDescriptor;
+    Sleep(300);
+    Halt(3);
+  end;
   if (ParamCount = 1) and (ParamStr(1) = 'sleep-noread') then
   begin
     Sleep(30000);
