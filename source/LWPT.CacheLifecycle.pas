@@ -201,7 +201,7 @@ begin
   Result := False;
   AText := '';
   try
-    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
     try
       if Stream.Size > MAX_CONTROL_BYTES then Exit;
       SetLength(Bytes, Stream.Size);

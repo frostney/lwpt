@@ -40,7 +40,8 @@ program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
 program	*	source/LWPT.Formatter.Test.pas	5	35
 program	*	source/LWPT.Health.Test.pas	1	11
-program	*	source/LWPT.TestArtifactSet.Test.pas	1	7
+program	*	source/LWPT.TestArtifactSet.Test.pas	1	8
+program	windows/*	source/LWPT.TestArtifactSet.Test.pas	1	7
 program	*	source/LWPT.TestInventory.Test.pas	1	7
 program	*	source/LWPT.Manifest.Schema.Test.pas	1	7
 program	*	source/LWPT.ManifestEdit.Test.pas	5	31
@@ -53,9 +54,9 @@ program	*	source/LWPT.OutputRenderer.Test.pas	1	1
 program	*	source/LWPT.ProducerLease.Test.pas	1	6
 program	unix/*	source/LWPT.ProducerLease.Test.pas	1	7
 program	*	source/LWPT.Resolver.Test.pas	1	7
-program	*	source/LWPT.WorkerBudget.Test.pas	1	25
-program	darwin/*	source/LWPT.WorkerBudget.Test.pas	1	26
-program	windows/*	source/LWPT.WorkerBudget.Test.pas	1	18
+program	*	source/LWPT.WorkerBudget.Test.pas	1	26
+program	darwin/*	source/LWPT.WorkerBudget.Test.pas	1	27
+program	windows/*	source/LWPT.WorkerBudget.Test.pas	1	19
 program	*	tests/e2e/HealthGit.E2E.Test.pas	1	4
 program	*	tests/e2e/InstallBitbucket.E2E.Test.pas	1	4
 program	*	tests/e2e/InstallDirectArchivesWindows.E2E.Test.pas	1	3

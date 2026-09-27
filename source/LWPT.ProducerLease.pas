@@ -98,11 +98,9 @@ const
   DEFAULT_STALE_SECONDS = 30;
   {$IFDEF UNIX}
   {$IFDEF LINUX}
-  FD_CLOEXEC_LWPT = 1;
   F_WRLCK_LWPT = 1;
   F_UNLCK_LWPT = 2;
   {$ELSE}
-  FD_CLOEXEC_LWPT = FD_CLOEXEC;
   F_WRLCK_LWPT = F_WRLCK;
   F_UNLCK_LWPT = F_UNLCK;
   {$ENDIF}
@@ -273,21 +271,13 @@ begin
   AGuard.FRegistered := True;
   {$IFDEF UNIX}
   AGuard.FDescriptor := -1;
-  AGuard.FDescriptor := FpOpen(PChar(APath), O_RDWR or O_CREAT, &600);
+  AGuard.FDescriptor := OpenProtectedDescriptor(APath, O_RDWR or O_CREAT);
   if AGuard.FDescriptor < 0 then
   begin
     AGuard.Free;
     AGuard := nil;
     raise ELWPTProducerLeaseError.CreateFmt(
       'failed to open producer guard at %s', [APath]);
-  end;
-  if FpFcntl(AGuard.FDescriptor, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
-  begin
-    AGuard.Free;
-    AGuard := nil;
-    raise ELWPTProducerLeaseError.CreateFmt(
-      'failed to protect producer guard from child inheritance at %s',
-      [APath]);
   end;
   try
     Result := AcquireDescriptorLock(AGuard.FDescriptor, APath);
@@ -672,7 +662,7 @@ begin
   Result := False;
   AText := '';
   if not FileExists(APath) then Exit;
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
     if Stream.Size > STATE_MAX_BYTES then Exit;
     SetLength(Bytes, Stream.Size);

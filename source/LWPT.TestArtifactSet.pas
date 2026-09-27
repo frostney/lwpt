@@ -297,7 +297,7 @@ begin
           [Artifacts[i].RelativePath]);
 
   ForceDirectories(ExtractFileDir(ADestination));
-  Bundle := TFileStream.Create(ADestination, fmCreate);
+  Bundle := OpenProtectedFileStream(ADestination, fmCreate);
   try
     Magic := RawByteString(ARTIFACT_SET_MAGIC);
     Bundle.WriteBuffer(Magic[1], Length(Magic));
@@ -307,7 +307,7 @@ begin
       WriteString(Bundle, Artifacts[i].RelativePath);
       WriteString(Bundle, Artifacts[i].Kind);
       WriteUInt64(Bundle, Artifacts[i].UnixMode);
-      Source := TFileStream.Create(Artifacts[i].SourcePath,
+      Source := OpenProtectedFileStream(Artifacts[i].SourcePath,
         fmOpenRead or fmShareDenyNone);
       try
         WriteUInt64(Bundle, Source.Size);
@@ -345,7 +345,8 @@ begin
   Bundle := nil;
   try
     try
-      Bundle := TFileStream.Create(ABundlePath, fmOpenRead or fmShareDenyNone);
+      Bundle := OpenProtectedFileStream(ABundlePath,
+        fmOpenRead or fmShareDenyNone);
       SetLength(RawMagic, Length(ARTIFACT_SET_MAGIC));
       OperationStage := 'bundle-magic';
       if Bundle.Read(RawMagic[1], Length(RawMagic)) <> Length(RawMagic) then
@@ -426,7 +427,7 @@ begin
         OperationStage := 'destination-directory';
         ForceDirectories(ExtractFileDir(DestinationPath));
         OperationStage := 'destination-create';
-        Destination := TFileStream.Create(DestinationPath, fmCreate);
+        Destination := OpenProtectedFileStream(DestinationPath, fmCreate);
         try
           OperationStage := 'destination-copy';
           CopyBytes(Bundle, Destination, ContentLength);

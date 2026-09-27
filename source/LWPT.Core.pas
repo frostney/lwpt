@@ -100,6 +100,43 @@ procedure AtomicDiscardRetainedPath(const ABackupPath: string);
 function  AtomicReplaceFile(const ASrc, ADst: string): Boolean;
 procedure AtomicWriteText(const ADst: string; const ATmpRoot: string; const AContent: TStringList);
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
+
+{ Process-handle inheritance guard. FPC cannot restrict a spawn to an explicit
+  descriptor or handle list, and on Unix its TFileStream opens take a flock()
+  (shared for reads, exclusive for creates) on descriptors without
+  close-on-exec. A child spawned while such a descriptor is open keeps the
+  lock for its whole lifetime, so later share-mode opens of the same file fail
+  with EAGAIN. Every managed and unmanaged spawn therefore holds this guard,
+  and every toolkit-state open holds it only while opening and marking the
+  descriptor close-on-exec; all I/O happens after the guard is released.
+  Calls to Begin/End must be paired. }
+procedure BeginProcessHandleSetup;
+procedure EndProcessHandleSetup;
+{ TFileStream.Create equivalent whose descriptor never reaches a child. }
+function  OpenProtectedFileStream(const APath: string;
+  const AMode: Word): TFileStream;
+{ Replaces AStrings with the file's lines. On Unix the read takes no flock,
+  so a lock inherited by a foreign process (for example an older toolkit
+  binary sharing machine-wide state) cannot make published state unreadable.
+  Raises EFOpenError when the file cannot be opened or read. }
+procedure LoadProtectedStrings(const AStrings: TStrings; const APath: string);
+{$IFDEF UNIX}
+{ FpOpen equivalent for lock and marker files. Returns -1, leaving errno set,
+  when the open or the close-on-exec protection fails. }
+function  OpenProtectedDescriptor(const APath: string; const AFlags: LongInt;
+  const APermissions: LongInt = &600): LongInt;
+{$ENDIF}
+
+{$IFDEF OBJECTSTORE_TESTING}
+type
+  TLWPTProtectedOpenTestHook = procedure(const APath: string);
+
+var
+  { Test-only: runs inside the inheritance guard after the open and before
+    close-on-exec protection. Production code must leave it nil. }
+  ProtectedOpenBeforeProtectionTestHook: TLWPTProtectedOpenTestHook;
+{$ENDIF}
+
 function  SHA256BytesPrefixed(const ABytes: TBytes): string;
 function  SHA256Hex(const AData: TBytes): string;
 function  SHA256Stream(AStream: TStream;
@@ -154,6 +191,7 @@ var
   TmpPathStartedAt: Int64;
   ProcessEnvironmentSnapshot: TStringList = nil;
   ProcessEnvironmentCriticalSection: TRTLCriticalSection;
+  ProcessHandleSetupCriticalSection: TRTLCriticalSection;
 
 procedure AppendProcessEnvironment(const ATarget: TStrings);
 var
@@ -507,9 +545,9 @@ begin
   Result := False;
   if not FileExists(ASrc) then Exit;
   try
-    SrcS := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
+    SrcS := OpenProtectedFileStream(ASrc, fmOpenRead or fmShareDenyNone);
     try
-      DstS := TFileStream.Create(ADst, fmCreate);
+      DstS := OpenProtectedFileStream(ADst, fmCreate);
       try
         if SrcS.Size > 0 then DstS.CopyFrom(SrcS, SrcS.Size);
       finally
@@ -1304,15 +1342,143 @@ begin
   if D <> '' then ForceDirectories(D);
 end;
 
+{$IFDEF UNIX}
+const
+  { Darwin's BaseUnix declares FD_CLOEXEC; Linux FPC 3.2.2 does not. POSIX
+    fixes the value at 1. }
+  {$IFDEF LINUX}
+  FD_CLOEXEC_LWPT = 1;
+  {$ELSE}
+  FD_CLOEXEC_LWPT = FD_CLOEXEC;
+  {$ENDIF}
+  PROTECTED_READ_CHUNK_BYTES = 4096;
+{$ENDIF}
+
+procedure BeginProcessHandleSetup;
+begin
+  EnterCriticalSection(ProcessHandleSetupCriticalSection);
+end;
+
+procedure EndProcessHandleSetup;
+begin
+  LeaveCriticalSection(ProcessHandleSetupCriticalSection);
+end;
+
+function OpenProtectedFileStream(const APath: string;
+  const AMode: Word): TFileStream;
+{$IFDEF UNIX}
+var
+  ErrorCode: Integer;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Result := nil;
+  BeginProcessHandleSetup;
+  try
+    Result := TFileStream.Create(APath, AMode);
+    try
+      {$IFDEF OBJECTSTORE_TESTING}
+      if Assigned(ProtectedOpenBeforeProtectionTestHook) then
+        ProtectedOpenBeforeProtectionTestHook(APath);
+      {$ENDIF}
+      if FpFcntl(Result.Handle, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
+      begin
+        ErrorCode := FpGetErrNo;
+        raise EFOpenError.CreateFmt(
+          'failed to protect "%s" from child inheritance (system error %d)',
+          [APath, ErrorCode]);
+      end;
+    except
+      FreeAndNil(Result);
+      raise;
+    end;
+  finally
+    EndProcessHandleSetup;
+  end;
+  {$ELSE}
+  { Windows file handles are created non-inheritable. }
+  Result := TFileStream.Create(APath, AMode);
+  {$ENDIF}
+end;
+
+{$IFDEF UNIX}
+function OpenProtectedDescriptor(const APath: string; const AFlags: LongInt;
+  const APermissions: LongInt): LongInt;
+var
+  ErrorCode: LongInt;
+begin
+  BeginProcessHandleSetup;
+  try
+    repeat
+      Result := FpOpen(PChar(APath), AFlags, APermissions);
+    until (Result >= 0) or (FpGetErrNo <> ESysEINTR);
+    if Result < 0 then Exit;
+    {$IFDEF OBJECTSTORE_TESTING}
+    if Assigned(ProtectedOpenBeforeProtectionTestHook) then
+      ProtectedOpenBeforeProtectionTestHook(APath);
+    {$ENDIF}
+    if FpFcntl(Result, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
+    begin
+      ErrorCode := FpGetErrNo;
+      FpClose(Result);
+      FpSetErrNo(ErrorCode);
+      Result := -1;
+    end;
+  finally
+    EndProcessHandleSetup;
+  end;
+end;
+{$ENDIF}
+
+procedure LoadProtectedStrings(const AStrings: TStrings; const APath: string);
+{$IFDEF UNIX}
+var
+  BytesRead, Descriptor, TotalBytes: LongInt;
+  Content: RawByteString;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Descriptor := OpenProtectedDescriptor(APath, O_RDONLY);
+  if Descriptor < 0 then
+    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+      [APath, SysErrorMessage(FpGetErrNo)]);
+  try
+    Content := '';
+    TotalBytes := 0;
+    repeat
+      SetLength(Content, TotalBytes + PROTECTED_READ_CHUNK_BYTES);
+      BytesRead := FpRead(Descriptor, Content[TotalBytes + 1],
+        PROTECTED_READ_CHUNK_BYTES);
+      if BytesRead > 0 then
+        Inc(TotalBytes, BytesRead)
+      else if (BytesRead < 0) and (FpGetErrNo <> ESysEINTR) then
+        raise EFOpenError.CreateFmt('Unable to read file "%s": %s',
+          [APath, SysErrorMessage(FpGetErrNo)]);
+    until BytesRead = 0;
+    SetLength(Content, TotalBytes);
+  finally
+    FpClose(Descriptor);
+  end;
+  AStrings.Text := Content;
+  {$ELSE}
+  AStrings.LoadFromFile(APath);
+  {$ENDIF}
+end;
+
 procedure AtomicWriteText(const ADst: string;
   const ATmpRoot: string; const AContent: TStringList);
-var Tmp: string;
+var Tmp: string; Stream: TFileStream;
 begin
   { The destination name adds no uniqueness and can push a project-local
     staging path past Windows' directory-path ceiling in a deep checkout. }
   Tmp := MakeTmpPath(ATmpRoot, 'write');
   EnsureDstDir(ADst);
-  AContent.SaveToFile(Tmp);
+  Stream := OpenProtectedFileStream(Tmp, fmCreate);
+  try
+    AContent.SaveToStream(Stream);
+  finally
+    Stream.Free;
+  end;
   { The common same-filesystem path is one replacement operation and avoids
     AtomicMoveFile's recoverable sibling backup, whose longer name can exceed
     the Windows path ceiling in a deep project. Keep its EXDEV fallback. }
@@ -1330,7 +1496,7 @@ var Tmp: string; Stream: TFileStream;
 begin
   Tmp := MakeTmpPath(ATmpRoot, 'write');
   EnsureDstDir(ADst);
-  Stream := TFileStream.Create(Tmp, fmCreate);
+  Stream := OpenProtectedFileStream(Tmp, fmCreate);
   try
     if Length(ABytes) > 0 then Stream.WriteBuffer(ABytes[0], Length(ABytes));
   finally
@@ -1551,7 +1717,7 @@ var
   Stream: TFileStream;
 begin
   if not FileExists(APath) then Exit('');
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
     Result := SHA256Stream(Stream);
   finally
@@ -1766,5 +1932,6 @@ initialization
     defends against a stale path from PID/stamp reuse. }
   TmpPathStartedAt := Round(Now * MSecsPerDay);
   InitCriticalSection(ProcessEnvironmentCriticalSection);
+  InitCriticalSection(ProcessHandleSetupCriticalSection);
 
 end.

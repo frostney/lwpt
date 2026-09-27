@@ -5,6 +5,7 @@ program LWPT.TestArtifactSet.Test;
 
 uses
   {$IFDEF UNIX}
+  cthreads,
   BaseUnix,
   {$ENDIF}
   Classes,
@@ -14,7 +15,8 @@ uses
   LWPT.Core,
   LWPT.TestArtifactSet,
   TestingPascalLibrary,
-  Tests.Scratch;
+  Tests.Scratch,
+  Tests.SpawnGuardProbe;
 
 type
   TTestArtifactSetContract = class(TTestSuite)
@@ -34,6 +36,9 @@ type
     procedure TestExistingDestinationIsRejected;
     procedure TestExceptionStagesRemainDistinct;
     procedure TestPhysicalSourceAliasIsRejected;
+    {$IFDEF UNIX}
+    procedure TestMaterializationKeepsChildrenOutOfDestinations;
+    {$ENDIF}
   end;
 
 procedure TTestArtifactSetContract.WriteBytes(const APath, AText: string);
@@ -261,6 +266,60 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF UNIX}
+{ Issue #275: a test program or compiler spawned while a destination stream
+  was open inherited its exclusive flock, so the destination digest could not
+  reopen the file and a valid cache hit became "cache corruption:
+  artifact-set-invalid: exception-destination-digest-EFOpenError". Spawn a
+  real child inside every destination open window through the production
+  spawn path and prove materialization still hits. }
+procedure TTestArtifactSetContract.
+  TestMaterializationKeepsChildrenOutOfDestinations;
+const
+  PROBE_MAXIMUM_SPAWNS = 6;
+var
+  Bundle, DestinationRoot, SourceRoot: string;
+  Cached, Source: TLWPTArtifactArray;
+  Materialized: Boolean;
+  Reason: string;
+begin
+  SourceRoot := FScratch + '/guarded/source';
+  DestinationRoot := FScratch + '/guarded/destination';
+  Bundle := FScratch + '/guarded/artifacts.bundle';
+  WriteBytes(SourceRoot + '/bin/program', 'executable'#0'bytes');
+  WriteBytes(SourceRoot + '/resources/runtime.dat', 'runtime data');
+  SetLength(Source, 2);
+  Source[0].Kind := 'runtime-resource';
+  Source[0].Path := SourceRoot + '/resources/runtime.dat';
+  Source[1].Kind := BUILD_OUTPUT_EXECUTABLE;
+  Source[1].Path := SourceRoot + '/bin/program';
+  WriteTestArtifactSet(SourceRoot, Bundle, Source);
+
+  try
+    ArmSpawnGuardProbe(DestinationRoot + '/', FScratch + '/guarded/probe',
+      PROBE_MAXIMUM_SPAWNS);
+    try
+      Materialized := MaterializeTestArtifactSet(Bundle, DestinationRoot,
+        Cached, Reason);
+    finally
+      DisarmSpawnGuardProbe;
+    end;
+    Expect<string>(Reason).ToBe('hit');
+    Expect<Boolean>(Materialized).ToBe(True);
+    Expect<string>(SpawnGuardProbeError).ToBe('');
+    Expect<Integer>(SpawnGuardProbeEscapes).ToBe(0);
+    Expect<Boolean>(SpawnGuardProbeAttempts >= Length(Source)).ToBe(True);
+    Expect<Integer>(SpawnGuardProbeLiveChildren)
+      .ToBe(SpawnGuardProbeAttempts);
+    Expect<Integer>(SpawnGuardProbeInheritedDescriptors(DestinationRoot))
+      .ToBe(0);
+    Expect<string>(ReadBytes(Cached[0].Path)).ToBe('executable'#0'bytes');
+  finally
+    ReleaseSpawnGuardProbeChildren;
+  end;
+end;
+{$ENDIF}
+
 procedure TTestArtifactSetContract.SetupTests;
 begin
   Test('round trip preserves the complete artifact set',
@@ -277,6 +336,10 @@ begin
     TestExceptionStagesRemainDistinct);
   Test('physical source aliases are rejected',
     TestPhysicalSourceAliasIsRejected);
+  {$IFDEF UNIX}
+  Test('materialization keeps concurrent children out of destinations',
+    TestMaterializationKeepsChildrenOutOfDestinations);
+  {$ENDIF}
 end;
 
 begin

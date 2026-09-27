@@ -39,7 +39,6 @@ type
     APath: string);
   TLWPTObjectStoreMaterializeStreamHook = procedure(
     const ADigest: string; const AStream: TStream);
-  TLWPTObjectStoreStreamOpenedHook = procedure(const APath: string);
   {$ENDIF}
 
   TLWPTImmutableObjectStore = class
@@ -97,61 +96,9 @@ var
     TLWPTObjectStoreMaterializeHook;
   ObjectStoreAfterMaterializeCopyStreamTestHook:
     TLWPTObjectStoreMaterializeStreamHook;
-  ObjectStoreBeforeStreamProtectionTestHook:
-    TLWPTObjectStoreStreamOpenedHook;
 {$ENDIF}
 
 implementation
-
-uses
-  {$IFDEF UNIX}
-  BaseUnix,
-  {$ENDIF}
-  LWPT.ProcessTree;
-
-{$IFDEF UNIX}
-const
-  {$IFDEF LINUX}
-  FD_CLOEXEC_LWPT = 1;
-  {$ELSE}
-  FD_CLOEXEC_LWPT = FD_CLOEXEC;
-  {$ENDIF}
-
-procedure ProtectStreamFromChildInheritance(const AStream: TFileStream;
-  const APath: string);
-var
-  ErrorCode: Integer;
-begin
-  if FpFcntl(AStream.Handle, F_SETFD, FD_CLOEXEC_LWPT) = 0 then Exit;
-  ErrorCode := FpGetErrNo;
-  raise ELWPTObjectStoreError.CreateFmt(
-    'failed to protect object-store stream from child inheritance at %s '
-    + '(system error %d)', [APath, ErrorCode]);
-end;
-
-function OpenProtectedObjectStream(const APath: string;
-  const AMode: Word): TFileStream;
-begin
-  Result := nil;
-  BeginProcessHandleSetup;
-  try
-    Result := TFileStream.Create(APath, AMode);
-    try
-      {$IFDEF OBJECTSTORE_TESTING}
-      if Assigned(ObjectStoreBeforeStreamProtectionTestHook) then
-        ObjectStoreBeforeStreamProtectionTestHook(APath);
-      {$ENDIF}
-      ProtectStreamFromChildInheritance(Result, APath);
-    except
-      Result.Free;
-      Result := nil;
-      raise;
-    end;
-  finally
-    EndProcessHandleSetup;
-  end;
-end;
-{$ENDIF}
 
 function CopyFileContentAndHash(const ASrc, ADst, ADigest: string;
   out AHash: string): Boolean;
@@ -165,18 +112,9 @@ begin
   if not FileExists(ASrc) then Exit;
   CopyCompleted := False;
   try
-    {$IFDEF UNIX}
-    Source := OpenProtectedObjectStream(ASrc,
-      fmOpenRead or fmShareDenyNone);
-    {$ELSE}
-    Source := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
-    {$ENDIF}
+    Source := OpenProtectedFileStream(ASrc, fmOpenRead or fmShareDenyNone);
     try
-      {$IFDEF UNIX}
-      Destination := OpenProtectedObjectStream(ADst, fmCreate);
-      {$ELSE}
-      Destination := TFileStream.Create(ADst, fmCreate);
-      {$ENDIF}
+      Destination := OpenProtectedFileStream(ADst, fmCreate);
       try
         if Source.Size > 0 then
           Destination.CopyFrom(Source, Source.Size);
