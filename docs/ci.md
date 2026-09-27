@@ -251,8 +251,8 @@ Each runner installs FPC natively (`brew` / `apt` / `choco`), then the `x86_64-w
 1. **Sanity** — `lwpt --help` (does the binary even load?)
 2. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
 3. **`lwpt format --check`** — only on `aarch64-darwin` runner (formatting is platform-independent; one check is enough)
-4. **`lwpt test <ordinary paths> --bail=1`** — the repository's co-located and integration programs; compiles them via the runner's native FPC, runs them concurrently, and stops quickly on the first failure
-5. **`lwpt test <E2E paths> --bail=1`** — with `LWPT_ENABLE_NETWORK=1` set in the job environment, the repository's E2E programs run on every platform (Q23 decision: surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
+4. **`lwpt test <ordinary paths> --bail=0`** — the repository's co-located and integration programs; compiles them via the runner's native FPC, runs them concurrently, and runs the full queue so one run reports every failing program (a first-failure bail hid independent intermittent failures behind separate reruns, #299)
+5. **`lwpt test <E2E paths> --bail=0`** — with `LWPT_ENABLE_NETWORK=1` set in the job environment, the repository's E2E programs run on every platform (Q23 decision: surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
 
 Per [Q22=b](./adr/0014-packages-extraction.md), the runner side compiles tests at runtime via `lwpt test` rather than pre-compiling them on the cross-build stage. This exercises the full LWPT pipeline natively — including the resolver, the per-target cfg emitter, FPC's per-platform `{$IFDEF}` paths, and the install loop's symlink-vs-copy decision (junctions on Windows, symlinks on Unix).
 
@@ -268,7 +268,7 @@ Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR
 6. `./build/lwpt format --check`
 7. `./build/lwpt build` (manifest build-entry compile)
 8. `./build/lwpt agents --check` (generated command-reference drift)
-9. `./build/lwpt test <ordinary paths> --bail=1`
+9. `./build/lwpt test <ordinary paths> --bail=0`
 
 The live-network E2E paths run pre-merge on the Linux leg only. Their dedicated selector invocation sets the repository-owned `LWPT_ENABLE_NETWORK=1` opt-in, added per [issue #102](https://github.com/frostney/lwpt/issues/102) after the #84 TLS-close class proved invisible to the ordinary route. The ordinary pass still carries the concurrency suites which cover the #101 timing class; E2E does not rerun them as accidental stress. Every platform still runs the E2E paths post-merge via `ci.yml`. The native `build-and-test`, `darwin-test`, and `windows-test` jobs each have a 20-minute ceiling. The Windows job uses the same two-attempt Chocolatey setup contract as `ci.yml`. A second PR job, `darwin-test`, natively bootstraps on `macos-latest` (brew FPC, independent of the cross-toolchain cache) and runs the ordinary paths — the #105 env-race family and its masks all first surfaced on darwin legs. Bounded cost: ~5–6 min warm, parallel to `build-and-test`. The remaining `ci.yml`-only legs (`x86_64-darwin`, `aarch64-linux`, `i386-win32`) stay post-merge. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
 
@@ -278,7 +278,7 @@ The PR workflow deliberately uses the distro FPC (same as the install instructio
 
 A second job reuses `toolchain.yml` (`workflow_call`, exactly like `ci.yml`) and cross-compiles `source/lwpt.pas` for **`x86_64-win64` only**, mirroring `ci.yml`'s build-stage flags and unit paths. It exists because `{$IFDEF WINDOWS}` codepaths never compile on the Ubuntu runner: PR #17 merged green while breaking `main` with a `SysUtils.FindClose` vs `Windows.FindClose` unit-shadowing error that PR #21 then had to fix. One target suffices — win32 and win64 share the same `{$IFDEF WINDOWS}` sources. The job also runs the no-OpenSSL guard (ADR-0016 for clients, ADR-0033 for servers — Windows must contain no OpenSSL linkage in either direction) against the produced `lwpt.exe`, surfacing that release-blocker on the PR instead of post-merge.
 
-The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC via choco (a verbatim copy of `ci.yml`'s step — `lwpt test` compiles `*.Test.pas` with the native FPC at run time per Q22=b), download the binary, then `lwpt install` + `lwpt test <ordinary paths> --bail=1` (offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
+The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC via choco (a verbatim copy of `ci.yml`'s step — `lwpt test` compiles `*.Test.pas` with the native FPC at run time per Q22=b), download the binary, then `lwpt install` + `lwpt test <ordinary paths> --bail=0` (offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
 
 Deliberate scope limits — still post-merge only (`ci.yml`):
 
