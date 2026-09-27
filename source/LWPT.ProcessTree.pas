@@ -123,6 +123,9 @@ var
 {$ENDIF}
 
 {$IF DEFINED(UNIX) AND DEFINED(PROCESSTREE_TESTING)}
+const
+  ProcessTreeGroupScriptPauseCapacity = 16;
+
 type
   { Scripted setpgid(2) outcomes for one side of process-group setup. The
     zero value is the real kernel behavior. The script is plain data, so a
@@ -135,13 +138,22 @@ type
     { A rejected call still performs the real setpgid(2) first, reproducing
       Darwin's applied-but-rejected outcome (#299). }
     RejectionTakesEffect: Boolean;
-    { The first HiddenQueries postcondition checks report no group. }
-    HiddenQueries: Integer;
-    { Hidden parent-side checks report an exited child instead. }
-    HiddenQueriesReportExit: Boolean;
+    { The first ScriptedQueries raw group queries (getpgrp(2) in the child,
+      getpgid(2) in the parent) return QueryResult instead of asking the
+      kernel. A QueryResult of -1 leaves QueryErrorCode in errno. The
+      production classification still runs on the scripted raw result. }
+    ScriptedQueries: Integer;
+    QueryResult: LongInt;
+    QueryErrorCode: Integer;
     { Observed counts. }
     Calls: Integer;
     Queries: Integer;
+    { Observed retry pauses: how many occurred, the timeout of the most
+      recent one, and the setpgid(2) call count when each began. }
+    Pauses: Integer;
+    PauseMicroseconds: Integer;
+    PauseAfterCalls: array[0..ProcessTreeGroupScriptPauseCapacity - 1]
+      of Integer;
   end;
   PLWPTProcessGroupScript = ^TLWPTProcessGroupScript;
 
@@ -282,14 +294,29 @@ function CSelect(const ADescriptorCount: LongInt; const AReadSet, AWriteSet,
   external name 'select';
   {$ENDIF}
 
+const
+  MicrosecondsPerMillisecond = 1000;
+  { Failure return of the libc process-group calls; errno holds the cause. }
+  LibcCallFailed = -1;
+
 type
-  TProcessGroupQuery = (pgqLeader, pgqNotLeader, pgqExited);
+  TLWPTProcessGroupQuery = (pgqLeader, pgqNotLeader, pgqExited);
 
 {$IFDEF PROCESSTREE_TESTING}
 function ProcessGroupScript(const APID: LongInt): PLWPTProcessGroupScript;
 begin
   if APID = 0 then Result := @ProcessTreeChildGroupScript
   else Result := @ProcessTreeParentGroupScript;
+end;
+
+{ Plain record writes only, so the forked child may record. }
+procedure RecordGroupSetupPause(var AScript: TLWPTProcessGroupScript;
+  const AMicroseconds: Integer);
+begin
+  if AScript.Pauses <= High(AScript.PauseAfterCalls) then
+    AScript.PauseAfterCalls[AScript.Pauses] := AScript.Calls;
+  Inc(AScript.Pauses);
+  AScript.PauseMicroseconds := AMicroseconds;
 end;
 {$ENDIF}
 
@@ -323,14 +350,20 @@ end;
 
 { Runs in the forked child before exec: setpgid(2), getpgrp(2), getpid(2),
   and select(2) only, all async-signal-safe. }
-function LeadsOwnProcessGroup: Boolean;
+function CurrentProcessGroup: LongInt;
 begin
   {$IFDEF PROCESSTREE_TESTING}
   Inc(ProcessTreeChildGroupScript.Queries);
   if ProcessTreeChildGroupScript.Queries
-    <= ProcessTreeChildGroupScript.HiddenQueries then Exit(False);
+    <= ProcessTreeChildGroupScript.ScriptedQueries then
+    Exit(ProcessTreeChildGroupScript.QueryResult);
   {$ENDIF}
-  Result := FpGetpgrp = FpGetpid;
+  Result := FpGetpgrp;
+end;
+
+function LeadsOwnProcessGroup: Boolean;
+begin
+  Result := CurrentProcessGroup = FpGetpid;
 end;
 
 procedure PauseBeforeGroupSetupRetryAfterFork;
@@ -338,7 +371,11 @@ var
   Timeout: TTimeVal;
 begin
   Timeout.tv_sec := 0;
-  Timeout.tv_usec := ProcessTreeGroupSetupRetryMilliseconds * 1000;
+  Timeout.tv_usec := ProcessTreeGroupSetupRetryMilliseconds
+    * MicrosecondsPerMillisecond;
+  {$IFDEF PROCESSTREE_TESTING}
+  RecordGroupSetupPause(ProcessTreeChildGroupScript, Timeout.tv_usec);
+  {$ENDIF}
   CSelect(0, nil, nil, nil, @Timeout);
 end;
 
@@ -360,24 +397,29 @@ end;
   through its own waitpid on that PID, which cannot run before Execute
   returns, and LWPT installs no SIGCHLD disposition or wildcard wait. The PID
   therefore cannot be recycled while it is queried here. }
-function QueryChildProcessGroup(const APID: LongInt): TProcessGroupQuery;
-var
-  ErrorCode: Integer;
-  ProcessGroupID: LongInt;
+function ProcessGroupOf(const APID: LongInt): LongInt;
 begin
   {$IFDEF PROCESSTREE_TESTING}
   Inc(ProcessTreeParentGroupScript.Queries);
   if ProcessTreeParentGroupScript.Queries
-    <= ProcessTreeParentGroupScript.HiddenQueries then
+    <= ProcessTreeParentGroupScript.ScriptedQueries then
   begin
-    if ProcessTreeParentGroupScript.HiddenQueriesReportExit then
-      Exit(pgqExited);
-    Exit(pgqNotLeader);
+    if ProcessTreeParentGroupScript.QueryResult = LibcCallFailed then
+      CErrnoLocation()^ := ProcessTreeParentGroupScript.QueryErrorCode;
+    Exit(ProcessTreeParentGroupScript.QueryResult);
   end;
   {$ENDIF}
-  ProcessGroupID := CGetProcessGroup(APID);
+  Result := CGetProcessGroup(APID);
+end;
+
+function QueryChildProcessGroup(const APID: LongInt): TLWPTProcessGroupQuery;
+var
+  ErrorCode: Integer;
+  ProcessGroupID: LongInt;
+begin
+  ProcessGroupID := ProcessGroupOf(APID);
   if ProcessGroupID = APID then Exit(pgqLeader);
-  if ProcessGroupID = -1 then
+  if ProcessGroupID = LibcCallFailed then
   begin
     ErrorCode := CErrnoLocation()^;
     { Darwin cannot query an exited child. Its exit status still reaches
@@ -385,6 +427,15 @@ begin
     if ErrorCode = ESysESRCH then Exit(pgqExited);
   end;
   Result := pgqNotLeader;
+end;
+
+procedure PauseBeforeGroupSetupRetry;
+begin
+  {$IFDEF PROCESSTREE_TESTING}
+  RecordGroupSetupPause(ProcessTreeParentGroupScript,
+    ProcessTreeGroupSetupRetryMilliseconds * MicrosecondsPerMillisecond);
+  {$ENDIF}
+  Sleep(ProcessTreeGroupSetupRetryMilliseconds);
 end;
 
 function IsolateChildProcessGroup(const APID: LongInt;
@@ -395,7 +446,7 @@ begin
   AErrorCode := 0;
   for Attempt := 1 to ProcessTreeGroupSetupAttempts do
   begin
-    if Attempt > 1 then Sleep(ProcessTreeGroupSetupRetryMilliseconds);
+    if Attempt > 1 then PauseBeforeGroupSetupRetry;
     if SetProcessGroup(APID, APID) = 0 then Exit(True);
     { SetProcessGroup is a libc call: read libc's errno, not FpGetErrNo, or
       the benign post-exec EACCES race reads as a stale unrelated code and

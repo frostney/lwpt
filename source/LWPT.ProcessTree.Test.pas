@@ -1,8 +1,9 @@
 { Unix process-group isolation contract for managed process trees. The same
   executable acts as the spawned child and reports the process group it runs
   in, so the spawn cases observe the real kernel state after LWPT's setup.
-  Scripted setpgid(2) outcomes replay the Darwin race from #299 and pin the
-  bounded retry on both sides. }
+  Scripted setpgid(2) outcomes and raw group-query results replay the Darwin
+  race from #299 beneath the production classification, and pin the bounded
+  retry and its pauses on both sides. }
 program LWPT.ProcessTree.Test;
 
 {$mode delphi}{$H+}
@@ -26,6 +27,17 @@ const
   ReporterTimeoutMilliseconds = 30000;
   ScriptedRejections = 2;
   AlwaysScripted = High(Integer);
+  { The retry contract, stated independently of the production constants so
+    a change on either side fails here. }
+  RequiredGroupSetupAttempts = 5;
+  RequiredRetryPauseMilliseconds = 1;
+  MicrosecondsPerMillisecond = 1000;
+  RequiredRetryPauseMicroseconds = RequiredRetryPauseMilliseconds
+    * MicrosecondsPerMillisecond;
+  { A process group no test process can lead: the system's first process. }
+  ForeignProcessGroupID = 1;
+  FailedQueryResult = -1;
+  IsolationFailure = 'could not isolate process tree';
 
 {$IFDEF UNIX}
 type
@@ -38,18 +50,23 @@ type
 
   TProcessTreeIsolation = class(TTestSuite)
   public
+    procedure BeforeEach; override;
     procedure AfterEach; override;
     procedure SetupTests; override;
     procedure TestChildLeadsItsOwnGroup;
     procedure TestChildToleratesEPERMAfterItsCallApplied;
     procedure TestParentToleratesEPERMAfterItsCallApplied;
     procedure TestParentRetriesUntilTheGroupExists;
-    procedure TestParentStopsAfterExactAttemptBudget;
+    procedure TestParentAcceptsAQueriedLeader;
     procedure TestParentAcceptsAChildThatAlreadyExited;
+    procedure TestParentRejectsOtherQueryFailures;
+    procedure TestParentStopsAfterTheRequiredAttempts;
     procedure TestChildRetriesUntilItLeadsItsGroup;
-    procedure TestChildStopsAfterExactAttemptBudget;
-    procedure TestParentFailsWhenTheGroupNeverAppears;
+    procedure TestChildAcceptsAQueriedLeader;
+    procedure TestChildStopsAfterTheRequiredAttempts;
+    procedure TestParentRaisesWhenTheGroupNeverAppears;
     procedure TestChildExitsWithSetupCodeWhenItCannotIsolate;
+    procedure TestIneffectiveIsolationFails;
   end;
 
 function SpawnReporter: TSpawnResult;
@@ -109,10 +126,56 @@ begin
   Expect<Boolean>(FpGetpgrp = FpGetpid).ToBe(True);
 end;
 
-procedure TProcessTreeIsolation.AfterEach;
+{ Rejects the first ACount setpgid(2) calls without effect, and reports the
+  first ACount raw group queries as a group the target does not lead. }
+procedure ScriptForeignGroup(var AScript: TLWPTProcessGroupScript;
+  const ACount: Integer);
+begin
+  AScript.RejectedCalls := ACount;
+  AScript.ScriptedQueries := ACount;
+  AScript.QueryResult := ForeignProcessGroupID;
+end;
+
+procedure ScriptQueryFailure(var AScript: TLWPTProcessGroupScript;
+  const AErrorCode: Integer);
+begin
+  AScript.RejectedCalls := AlwaysScripted;
+  AScript.ScriptedQueries := AlwaysScripted;
+  AScript.QueryResult := FailedQueryResult;
+  AScript.QueryErrorCode := AErrorCode;
+end;
+
+{ Pauses occur only between attempts: one before each retry, none before the
+  first call or after the last, each for the required timeout. }
+procedure ExpectPausesBetween(const AScript: TLWPTProcessGroupScript;
+  const ACalls: Integer);
+var
+  PauseIndex: Integer;
+begin
+  Expect<Integer>(AScript.Pauses).ToBe(ACalls - 1);
+  for PauseIndex := 0 to AScript.Pauses - 1 do
+    Expect<Integer>(AScript.PauseAfterCalls[PauseIndex]).ToBe(PauseIndex + 1);
+  if AScript.Pauses > 0 then
+    Expect<Integer>(AScript.PauseMicroseconds)
+      .ToBe(RequiredRetryPauseMicroseconds);
+end;
+
+procedure ResetGroupScripts;
 begin
   ProcessTreeChildGroupScript := Default(TLWPTProcessGroupScript);
   ProcessTreeParentGroupScript := Default(TLWPTProcessGroupScript);
+end;
+
+{ The runner skips AfterEach when a case raises, so each case also starts
+  from real kernel behavior. }
+procedure TProcessTreeIsolation.BeforeEach;
+begin
+  ResetGroupScripts;
+end;
+
+procedure TProcessTreeIsolation.AfterEach;
+begin
+  ResetGroupScripts;
 end;
 
 procedure TProcessTreeIsolation.TestChildLeadsItsOwnGroup;
@@ -141,94 +204,141 @@ var
   ErrorCode: Integer;
 begin
   ExpectLeadsOwnGroup;
-  ProcessTreeParentGroupScript.RejectedCalls := ScriptedRejections;
-  ProcessTreeParentGroupScript.HiddenQueries := ScriptedRejections;
+  ScriptForeignGroup(ProcessTreeParentGroupScript, ScriptedRejections);
   Expect<Boolean>(IsolateChildProcessGroup(FpGetpid, ErrorCode)).ToBe(True);
   Expect<Integer>(ProcessTreeParentGroupScript.Calls)
     .ToBe(ScriptedRejections + 1);
   Expect<Integer>(ProcessTreeParentGroupScript.Queries)
     .ToBe(ScriptedRejections);
+  ExpectPausesBetween(ProcessTreeParentGroupScript, ScriptedRejections + 1);
 end;
 
-procedure TProcessTreeIsolation.TestParentStopsAfterExactAttemptBudget;
+procedure TProcessTreeIsolation.TestParentAcceptsAQueriedLeader;
 var
   ErrorCode: Integer;
 begin
   ProcessTreeParentGroupScript.RejectedCalls := AlwaysScripted;
-  ProcessTreeParentGroupScript.HiddenQueries := AlwaysScripted;
-  Expect<Boolean>(IsolateChildProcessGroup(FpGetpid, ErrorCode)).ToBe(False);
-  Expect<Integer>(ErrorCode).ToBe(ESysEPERM);
-  Expect<Integer>(ProcessTreeParentGroupScript.Calls)
-    .ToBe(ProcessTreeGroupSetupAttempts);
-  Expect<Integer>(ProcessTreeParentGroupScript.Queries)
-    .ToBe(ProcessTreeGroupSetupAttempts);
+  ProcessTreeParentGroupScript.ScriptedQueries := AlwaysScripted;
+  ProcessTreeParentGroupScript.QueryResult := FpGetpid;
+  Expect<Boolean>(IsolateChildProcessGroup(FpGetpid, ErrorCode)).ToBe(True);
+  Expect<Integer>(ProcessTreeParentGroupScript.Calls).ToBe(1);
+  ExpectPausesBetween(ProcessTreeParentGroupScript, 1);
 end;
 
 procedure TProcessTreeIsolation.TestParentAcceptsAChildThatAlreadyExited;
 var
   ErrorCode: Integer;
 begin
-  ProcessTreeParentGroupScript.RejectedCalls := AlwaysScripted;
-  ProcessTreeParentGroupScript.HiddenQueries := AlwaysScripted;
-  ProcessTreeParentGroupScript.HiddenQueriesReportExit := True;
+  ScriptQueryFailure(ProcessTreeParentGroupScript, ESysESRCH);
   Expect<Boolean>(IsolateChildProcessGroup(FpGetpid, ErrorCode)).ToBe(True);
   Expect<Integer>(ProcessTreeParentGroupScript.Calls).ToBe(1);
+  ExpectPausesBetween(ProcessTreeParentGroupScript, 1);
+end;
+
+procedure TProcessTreeIsolation.TestParentRejectsOtherQueryFailures;
+var
+  ErrorCode: Integer;
+begin
+  ScriptQueryFailure(ProcessTreeParentGroupScript, ESysEINVAL);
+  Expect<Boolean>(IsolateChildProcessGroup(FpGetpid, ErrorCode)).ToBe(False);
+  Expect<Integer>(ErrorCode).ToBe(ESysEPERM);
+  Expect<Integer>(ProcessTreeParentGroupScript.Calls)
+    .ToBe(RequiredGroupSetupAttempts);
+end;
+
+procedure TProcessTreeIsolation.TestParentStopsAfterTheRequiredAttempts;
+var
+  ErrorCode: Integer;
+begin
+  ScriptForeignGroup(ProcessTreeParentGroupScript, AlwaysScripted);
+  Expect<Boolean>(IsolateChildProcessGroup(FpGetpid, ErrorCode)).ToBe(False);
+  Expect<Integer>(ErrorCode).ToBe(ESysEPERM);
+  Expect<Integer>(ProcessTreeParentGroupScript.Calls)
+    .ToBe(RequiredGroupSetupAttempts);
+  Expect<Integer>(ProcessTreeParentGroupScript.Queries)
+    .ToBe(RequiredGroupSetupAttempts);
+  ExpectPausesBetween(ProcessTreeParentGroupScript,
+    RequiredGroupSetupAttempts);
 end;
 
 procedure TProcessTreeIsolation.TestChildRetriesUntilItLeadsItsGroup;
 begin
   ExpectLeadsOwnGroup;
-  ProcessTreeChildGroupScript.RejectedCalls := ScriptedRejections;
-  ProcessTreeChildGroupScript.HiddenQueries := ScriptedRejections;
+  ScriptForeignGroup(ProcessTreeChildGroupScript, ScriptedRejections);
   Expect<Boolean>(LeadOwnProcessGroupAfterFork).ToBe(True);
   Expect<Integer>(ProcessTreeChildGroupScript.Calls)
     .ToBe(ScriptedRejections + 1);
   Expect<Integer>(ProcessTreeChildGroupScript.Queries)
     .ToBe(ScriptedRejections);
+  ExpectPausesBetween(ProcessTreeChildGroupScript, ScriptedRejections + 1);
 end;
 
-procedure TProcessTreeIsolation.TestChildStopsAfterExactAttemptBudget;
+procedure TProcessTreeIsolation.TestChildAcceptsAQueriedLeader;
+begin
+  ProcessTreeChildGroupScript.RejectedCalls := AlwaysScripted;
+  ProcessTreeChildGroupScript.ScriptedQueries := AlwaysScripted;
+  ProcessTreeChildGroupScript.QueryResult := FpGetpid;
+  Expect<Boolean>(LeadOwnProcessGroupAfterFork).ToBe(True);
+  Expect<Integer>(ProcessTreeChildGroupScript.Calls).ToBe(1);
+  ExpectPausesBetween(ProcessTreeChildGroupScript, 1);
+end;
+
+procedure TProcessTreeIsolation.TestChildStopsAfterTheRequiredAttempts;
 var
   Started: QWord;
 begin
-  ProcessTreeChildGroupScript.RejectedCalls := AlwaysScripted;
-  ProcessTreeChildGroupScript.HiddenQueries := AlwaysScripted;
+  ScriptForeignGroup(ProcessTreeChildGroupScript, AlwaysScripted);
   Started := GetTickCount64;
   Expect<Boolean>(LeadOwnProcessGroupAfterFork).ToBe(False);
   Expect<Integer>(ProcessTreeChildGroupScript.Calls)
-    .ToBe(ProcessTreeGroupSetupAttempts);
+    .ToBe(RequiredGroupSetupAttempts);
   Expect<Integer>(ProcessTreeChildGroupScript.Queries)
-    .ToBe(ProcessTreeGroupSetupAttempts);
-  { The pre-exec pause really waits between attempts. The bound allows one
-    millisecond of tick truncation. }
+    .ToBe(RequiredGroupSetupAttempts);
+  ExpectPausesBetween(ProcessTreeChildGroupScript,
+    RequiredGroupSetupAttempts);
+  { Supplemental: the recorded select(2) pauses really waited. The bound
+    allows one millisecond of tick truncation. }
   Expect<Boolean>(GetTickCount64 - Started
-    >= QWord((ProcessTreeGroupSetupAttempts - 2)
-      * ProcessTreeGroupSetupRetryMilliseconds)).ToBe(True);
+    >= QWord((RequiredGroupSetupAttempts - 2)
+      * RequiredRetryPauseMilliseconds)).ToBe(True);
 end;
 
-procedure TProcessTreeIsolation.TestParentFailsWhenTheGroupNeverAppears;
+procedure TProcessTreeIsolation.TestParentRaisesWhenTheGroupNeverAppears;
 var
   R: TSpawnResult;
 begin
-  ProcessTreeParentGroupScript.RejectedCalls := AlwaysScripted;
-  ProcessTreeParentGroupScript.HiddenQueries := AlwaysScripted;
+  ScriptForeignGroup(ProcessTreeParentGroupScript, AlwaysScripted);
   R := SpawnReporter;
-  Expect<Boolean>(Pos('could not isolate process tree', R.ErrorMessage) > 0)
-    .ToBe(True);
+  Expect<Boolean>(Pos(IsolationFailure, R.ErrorMessage) > 0).ToBe(True);
   Expect<Integer>(ProcessTreeParentGroupScript.Calls)
-    .ToBe(ProcessTreeGroupSetupAttempts);
+    .ToBe(RequiredGroupSetupAttempts);
 end;
 
 procedure TProcessTreeIsolation.TestChildExitsWithSetupCodeWhenItCannotIsolate;
 var
   R: TSpawnResult;
 begin
-  ProcessTreeChildGroupScript.RejectedCalls := AlwaysScripted;
-  ProcessTreeChildGroupScript.HiddenQueries := AlwaysScripted;
+  ScriptForeignGroup(ProcessTreeChildGroupScript, AlwaysScripted);
   R := SpawnReporter;
   Expect<string>(R.ErrorMessage).ToBe('');
   Expect<Integer>(R.ExitCode).ToBe(ProcessTreeSetupExitCode);
   Expect<Boolean>(Pos(ProcessTreeSetupFailure, R.Stderr) > 0).ToBe(True);
+  Expect<string>(Trim(R.Stdout)).ToBe('');
+end;
+
+procedure TProcessTreeIsolation.TestIneffectiveIsolationFails;
+var
+  R: TSpawnResult;
+begin
+  { Both sides are rejected without effect and query the real kernel, so
+    the group genuinely never exists. Whichever side notices first reports
+    it: the parent raises, or the child exits with the setup code. }
+  ProcessTreeChildGroupScript.RejectedCalls := AlwaysScripted;
+  ProcessTreeParentGroupScript.RejectedCalls := AlwaysScripted;
+  R := SpawnReporter;
+  Expect<Boolean>((Pos(IsolationFailure, R.ErrorMessage) > 0)
+    or ((R.ExitCode = ProcessTreeSetupExitCode)
+      and (Pos(ProcessTreeSetupFailure, R.Stderr) > 0))).ToBe(True);
   Expect<string>(Trim(R.Stdout)).ToBe('');
 end;
 
@@ -242,18 +352,26 @@ begin
     TestParentToleratesEPERMAfterItsCallApplied);
   Test('parent retries until the child group exists',
     TestParentRetriesUntilTheGroupExists);
-  Test('parent stops after the exact attempt budget',
-    TestParentStopsAfterExactAttemptBudget);
-  Test('parent accepts a child that exited before the group check',
+  Test('parent accepts EPERM once getpgid shows the child leading',
+    TestParentAcceptsAQueriedLeader);
+  Test('parent accepts a child whose getpgid fails with ESRCH',
     TestParentAcceptsAChildThatAlreadyExited);
+  Test('parent rejects other getpgid failures',
+    TestParentRejectsOtherQueryFailures);
+  Test('parent stops after exactly five attempts with pauses between',
+    TestParentStopsAfterTheRequiredAttempts);
   Test('child retries until it leads its group',
     TestChildRetriesUntilItLeadsItsGroup);
-  Test('child stops after the exact attempt budget with real pauses',
-    TestChildStopsAfterExactAttemptBudget);
-  Test('parent fails when the child group never appears',
-    TestParentFailsWhenTheGroupNeverAppears);
+  Test('child accepts EPERM once getpgrp shows it leading',
+    TestChildAcceptsAQueriedLeader);
+  Test('child stops after exactly five attempts with pauses between',
+    TestChildStopsAfterTheRequiredAttempts);
+  Test('parent raises when the child group never appears',
+    TestParentRaisesWhenTheGroupNeverAppears);
   Test('child exits with the setup code when it cannot isolate',
     TestChildExitsWithSetupCodeWhenItCannotIsolate);
+  Test('ineffective isolation on both sides fails',
+    TestIneffectiveIsolationFails);
 end;
 {$ENDIF}
 
