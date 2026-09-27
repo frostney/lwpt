@@ -59,6 +59,9 @@ type
     procedure TestBranchReplacedByTagIsNotAMovedTag;
     procedure TestLockWithoutRefKindFailsClosedForMovedBranch;
     procedure TestLockedCommitMustReproduceLockedArchive;
+    procedure TestSharedCandidateCannotBypassLockedArchive;
+    procedure TestLegacyTagCannotBecomeMovableBranch;
+    procedure TestSurvivingTagWinsOverSameNamedBranch;
   end;
 
 const
@@ -1047,6 +1050,117 @@ begin
   Expect<Boolean>(FileExists(Root + '/lwpt.lock')).ToBe(False);
 end;
 
+{ Two dependencies can name the same repository and commit. The first one
+  fetched becomes the resolver candidate that the second reuses, so the
+  reuse must still reproduce the second one's locked archive. }
+procedure TInstallGitGraph.TestSharedCandidateCannotBypassLockedArchive;
+var Root, LockBefore, Combined, SavedCache: string; Run: TLwptResult;
+begin
+  SavedCache := FCacheRoot;
+  Root := FScratch + '/shared-candidate';
+  FCacheRoot := FScratch + '/shared-candidate-cache';
+  RecursiveDelete(FCacheRoot);
+  WriteRoot(Root, 'shared-candidate', 'z = "fixture/shared@v1.0.0"'#10);
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('z', SHARED_COMMIT,
+    '[package]'#10 + 'name = "z"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('shared candidate seed', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  LockBefore := ReadBinaryFile(Root + '/lwpt.lock');
+
+  { A new dependency, resolved first, fetches different bytes for the same
+    repository and commit; the verified cache is cold. }
+  WriteRoot(Root, 'shared-candidate', 'a = "fixture/shared@v1.0.0"'#10
+    + 'z = "fixture/shared@v1.0.0"'#10);
+  WriteArchive('a', SHARED_COMMIT,
+    '[package]'#10 + 'name = "a"'#10 + 'version = "6.6.6"'#10
+    + 'units = ["source"]'#10);
+  FCacheRoot := FScratch + '/shared-candidate-cold-cache';
+  RecursiveDelete(FCacheRoot);
+  Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  FCacheRoot := SavedCache;
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('dependency "z": the archive served for locked commit '
+    + SHARED_COMMIT + ' no longer matches lwpt.lock', Combined) > 0)
+    .ToBe(True);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockBefore);
+end;
+
+{ A lock written before ref kinds were recorded cannot prove whether a ref
+  was a tag. Seeing it as a branch at the same commit must not quietly
+  grant it permission to move later. }
+procedure TInstallGitGraph.TestLegacyTagCannotBecomeMovableBranch;
+var Root, LockText, Combined: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/legacy-tag-to-branch';
+  WriteRoot(Root, 'legacy-tag-to-branch',
+    'shared = "fixture/shared@release"'#10);
+  WriteRefs('shared', 'tag|release|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('legacy tag seed', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  RemoveLockKey(Root + '/lwpt.lock', 'resolvedRefKind');
+
+  { Same commit, now advertised as a branch: the install may proceed, but
+    the lock keeps the kind unknown. }
+  WriteRefs('shared', 'branch|release|' + SHARED_COMMIT + '|'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('legacy ref now a branch', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  LockText := ReadText(Root + '/lwpt.lock');
+  Expect<Boolean>(Pos('resolvedRefKind', LockText) > 0).ToBe(False);
+
+  { The branch then moves: still unproven, so it fails closed. }
+  WriteRefs('shared', 'branch|release|' + MUTATED_SHARED_COMMIT + '|'#10);
+  WriteArchive('shared', MUTATED_SHARED_COMMIT,
+    '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.1"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('cannot prove "release" was a branch that may move',
+    Combined) > 0).ToBe(True);
+  Expect<Boolean>(Pos('resolvedCommit = "' + SHARED_COMMIT + '"',
+    ReadText(Root + '/lwpt.lock')) > 0).ToBe(True);
+end;
+
+{ A locked tag that is still advertised is not replaced just because a
+  same-named branch at the same commit is listed first. }
+procedure TInstallGitGraph.TestSurvivingTagWinsOverSameNamedBranch;
+var Root, LockText: string; Run: TLwptResult; Order: Integer;
+begin
+  for Order := 0 to 1 do
+  begin
+    Root := FScratch + '/surviving-tag-' + IntToStr(Order);
+    WriteRoot(Root, 'surviving-tag', 'shared = "fixture/shared@release"'#10);
+    WriteRefs('shared', 'tag|release|' + SHARED_COMMIT + '|'#10);
+    WriteArchive('shared', SHARED_COMMIT,
+      '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
+      + 'units = ["source"]'#10);
+    Run := RunInstall(Root, ['install']);
+    DumpRunFailure('surviving tag seed', Run, 0);
+    Expect<Integer>(Run.ExitCode).ToBe(0);
+
+    if Order = 0 then
+      WriteRefs('shared', 'branch|release|' + SHARED_COMMIT + '|'#10
+        + 'tag|release|' + SHARED_COMMIT + '|'#10)
+    else
+      WriteRefs('shared', 'tag|release|' + SHARED_COMMIT + '|'#10
+        + 'branch|release|' + SHARED_COMMIT + '|'#10);
+    Run := RunInstall(Root, ['install']);
+    DumpRunFailure('surviving tag with branch', Run, 0);
+    Expect<Integer>(Run.ExitCode).ToBe(0);
+    LockText := ReadText(Root + '/lwpt.lock');
+    Expect<Boolean>(Pos('resolvedRefKind = "tag"', LockText) > 0).ToBe(True);
+  end;
+end;
+
 procedure TInstallGitGraph.AfterAll;
 begin
   SetCurrentDir(FOriginalDir);
@@ -1265,6 +1379,12 @@ begin
     + 'accepted', TestLockWithoutRefKindFailsClosedForMovedBranch);
   Test('a locked commit must reproduce its locked archive, including after '
     + 'a failed ref listing', TestLockedCommitMustReproduceLockedArchive);
+  Test('a resolver candidate shared by another dependency must reproduce '
+    + 'the locked archive', TestSharedCandidateCannotBypassLockedArchive);
+  Test('a ref locked without a kind never silently becomes a movable branch',
+    TestLegacyTagCannotBecomeMovableBranch);
+  Test('a surviving locked tag is kept when a same-named branch is '
+    + 'advertised in either order', TestSurvivingTagWinsOverSameNamedBranch);
 end;
 
 begin

@@ -100,8 +100,9 @@ The address rule has no exception. Private, loopback, link-local, and other
 non-globally-reachable destinations are refused for every dependency fetch,
 whether the root manifest or a fetched dependency's manifest declares the
 source, on the initial request and on every redirect. Self-hosted forges and
-archive hosts on private networks are therefore currently unsupported. A
-Git-host fetch never leaves its forge's hosts, and a custom-source template
+archive hosts on private networks are therefore currently unsupported; an
+opt-in through user-level configuration is tracked in
+[#313](https://github.com/frostney/lwpt/issues/313). A Git-host fetch never leaves its forge's hosts, and a custom-source template
 may not use `{ref}` in its host. A refused hop fails the command with one of
 these errors:
 

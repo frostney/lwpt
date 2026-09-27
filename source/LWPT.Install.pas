@@ -849,6 +849,21 @@ begin
 end;
 {$ENDIF}
 
+{ A locked identity must reproduce its locked bytes (ADR-0048). AExpected is
+  '' when the selection is not a locked identity. Every path that supplies
+  archive bytes for a dependency -- a fresh download or a resolver candidate
+  another dependency already fetched -- calls this before using them. }
+procedure EnsureLockedArchiveIdentity(const ADependency, AContext,
+  AExpected, AActual: string);
+begin
+  if (AExpected <> '') and not SameText(AActual, AExpected) then
+    raise EVerifyError.CreateFmt(
+      'dependency "%s": %s (locked archive %s, received %s). Nothing was '
+      + 'published. Review the upstream change, then run `%s install '
+      + '--accept-moved-tags` to accept it.',
+      [ADependency, AContext, AExpected, AActual, PROGRAM_NAME]);
+end;
+
 { AVerifyArchiveHash, when set, is the locked content identity the downloaded
   bytes must reproduce (ADR-0048); a mismatch raises EVerifyError naming
   AVerifyContext before the bytes are written, cached, or extracted. }
@@ -1150,17 +1165,10 @@ begin
   { Archive filename uses an escaped resolved ref for git-host sources,
     or the stable "url" tag for direct archive URLs. }
   AArchiveHash := SHA256BytesPrefixed(Resp.Body);
-  { A locked identity must reproduce its locked bytes. Checked before the
-    archive is written, admitted to the shared cache, or extracted, so a
-    mismatch leaves no trace in the project or the cache. }
-  if (AVerifyArchiveHash <> '')
-     and not SameText(AArchiveHash, AVerifyArchiveHash) then
-    raise EVerifyError.CreateFmt(
-      'dependency "%s": %s (locked archive %s, received %s). Nothing was '
-      + 'published. Review the upstream change, then run `%s install '
-      + '--accept-moved-tags` to accept it.',
-      [ADep.Name, AVerifyContext, AVerifyArchiveHash, AArchiveHash,
-       PROGRAM_NAME]);
+  { Checked before the archive is written, admitted to the shared cache, or
+    extracted, so a mismatch leaves no trace in the project or the cache. }
+  EnsureLockedArchiveIdentity(ADep.Name, AVerifyContext, AVerifyArchiveHash,
+    AArchiveHash);
   AtomicWriteBytes(AArchive, ATmpRoot, Resp.Body);
   if AObjectStore <> nil then
     try
@@ -2738,9 +2746,31 @@ var
     if Result then AVersion := Workspace.Version;
   end;
 
-  function RefKindName(const AKind: TGitRefKind): string;
+  { The kind of the selected ref. A tag and a branch may share a name and
+    commit; advertisement order then must not decide the kind. The lock's
+    recorded branch is kept; otherwise the tag wins, as the stricter kind. }
+  function SelectedRefKind(const ANode: TResolveNode;
+    const ARefs: TGitRefArray; const ASelection: TResolverSelection): string;
+  var
+    Entry: TResolved;
+    RefIndex: Integer;
+    HasTag, HasBranch: Boolean;
   begin
-    if AKind = rkTag then Result := RefKindTag
+    HasTag := False;
+    HasBranch := False;
+    for RefIndex := 0 to High(ARefs) do
+      if (ARefs[RefIndex].Name = ASelection.RefName)
+         and SameText(RefCommitSHA(ARefs[RefIndex]), ASelection.CommitSHA) then
+        if ARefs[RefIndex].Kind = rkTag then HasTag := True
+        else HasBranch := True;
+    if HasTag and HasBranch then
+    begin
+      if FindPriorLock(ANode, Entry) and (Entry.RefKind = RefKindBranch)
+         and (Entry.Version = ASelection.RefName) then
+        Exit(RefKindBranch);
+      Exit(RefKindTag);
+    end;
+    if ASelection.RefKind = rkTag then Result := RefKindTag
     else Result := RefKindBranch;
   end;
 
@@ -2774,12 +2804,18 @@ var
     that predates `resolvedCommit` is checked by archive identity instead
     (ExpectedVerifyHash). }
   procedure RejectMovedRef(const ANode: TResolveNode;
-    const ASelection: TSelectionState);
+    var ASelection: TSelectionState);
   var Entry: TResolved; LockedCommit: string;
   begin
     if AAcceptMovedTags or not FindPriorLock(ANode, Entry) then Exit;
     if not SameRefName(Entry.Version, ASelection.RefName) then Exit;
     if Entry.RefKind = RefKindBranch then Exit;
+    { An unknown locked kind is never promoted to branch without explicit
+      acceptance: seeing a branch at the locked commit proves nothing about
+      what the ref was, so the lock keeps the kind unknown and a later move
+      still fails closed. Promotion to tag only tightens the rule. }
+    if (Entry.RefKind = '') and (ASelection.RefKind = RefKindBranch) then
+      ASelection.RefKind := '';
     LockedCommit := LockedCommitIdentity(Entry);
     if (Entry.RefKind = RefKindTag)
        and (ASelection.RefKind = RefKindBranch) then
@@ -2931,7 +2967,7 @@ var
     end;
     Result.RefName := Selection.RefName;
     Result.CommitSHA := Selection.CommitSHA;
-    Result.RefKind := RefKindName(Selection.RefKind);
+    Result.RefKind := SelectedRefKind(ANode, Refs, Selection);
     RejectMovedRef(ANode, Result);
   end;
 
@@ -3192,6 +3228,15 @@ begin
         else if (R.Nodes[idx].Dep.SrcKind in [skGitHost, skURL])
            and FileExists(CacheArchive) then
         begin
+          { The candidate may have been fetched for another dependency that
+            names the same source and commit but has no locked identity of
+            its own, so this node's lock is checked before the bytes are
+            used. }
+          ArchiveHash := 'sha256:' + SHA256File(CacheArchive);
+          VerifyArchiveHash := ExpectedVerifyHash(R.Nodes[idx],
+            VerifyContext);
+          EnsureLockedArchiveIdentity(R.Nodes[idx].Name, VerifyContext,
+            VerifyArchiveHash, ArchiveHash);
           UnitDir := IncludeTrailingPathDelimiter(PlanModules)
             + R.Nodes[idx].Name;
           Archive := ArchivePathForRef(PlanArchives, R.Nodes[idx].Name,
