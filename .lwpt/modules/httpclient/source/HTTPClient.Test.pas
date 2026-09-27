@@ -107,18 +107,24 @@ type
   THTTPClientDestinationPolicy = class(TTestSuite)
   public
     procedure SetupTests; override;
-    procedure TestPrivateAddressClassification;
-    procedure TestHostAllowlistMatching;
     procedure TestDefaultOptionsAllowEveryDestination;
+    procedure TestHTTPURLHostMatchesRequestParsing;
+    procedure TestRequireHTTPSRefusesPlaintextBeforeConnect;
     procedure TestDisallowedInitialHostIsRefusedBeforeConnect;
     procedure TestRedirectToDisallowedHostIsRefused;
     procedure TestRedirectWithinAllowedHostsSucceeds;
-    procedure TestDenyRefusesPrivateInitialDestination;
-    procedure TestDenyAfterPublicAllowsPrivateOrigin;
+    procedure TestDenyRefusesResolvedLoopbackBeforeConnect;
+    procedure TestDenyRefusesNonGlobalLiteralsBeforeConnect;
     {$IFDEF HTTPCLIENT_TESTING}
+    procedure TestIPv4RegistryBlockBoundaries;
+    procedure TestIPv4GlobalExceptionsAndNeighbours;
+    procedure TestIPv6RegistryBlockBoundaries;
+    procedure TestIPv4EmbeddingSpellingsAreCanonical;
+    procedure TestNonLiteralTextIsNotGlobal;
+    procedure TestHostAllowlistMatching;
     procedure TestPublicDestinationDialsTheCheckedAddress;
     procedure TestDenyRefusesRedirectIntoPrivateAddress;
-    procedure TestDenyAfterPublicRefusesRedirectIntoPrivateAddress;
+    procedure TestExpandedMappedIPv6RedirectCannotReachLoopback;
     {$ENDIF}
   end;
 
@@ -1245,18 +1251,18 @@ end;
 { ── destination policy ─────────────────────────────────────────────── }
 
 const
-  POLICY_PUBLIC_TEST_HOST = 'forge.test';
+  PolicyPublicTestHost = 'forge.test';
 
 function PolicyOptions(const AAllowedHosts: array of string;
-  const APrivateAddresses: THTTPPrivateAddressPolicy): THTTPRequestOptions;
+  const APrivateAddressPolicy: THTTPPrivateAddressPolicy): THTTPRequestOptions;
 var
-  I: Integer;
+  HostIndex: Integer;
 begin
   Result := TestOptions(1024, 4096, 2000);
   SetLength(Result.Destination.AllowedHosts, Length(AAllowedHosts));
-  for I := 0 to High(AAllowedHosts) do
-    Result.Destination.AllowedHosts[I] := AAllowedHosts[I];
-  Result.Destination.PrivateAddresses := APrivateAddresses;
+  for HostIndex := 0 to High(AAllowedHosts) do
+    Result.Destination.AllowedHosts[HostIndex] := AAllowedHosts[HostIndex];
+  Result.Destination.PrivateAddressPolicy := APrivateAddressPolicy;
 end;
 
 function GetErrorMessage(const AURL: string;
@@ -1273,9 +1279,9 @@ begin
   end;
 end;
 
-{ Serves a redirect from Origin to ATargetURLForPort(Target.Port) and returns
-  the error the policy raised, or '' after a successful fetch. ATargetServed
-  reports whether the redirect target accepted a request at all. }
+{ Serves a redirect from an origin mock to ATargetHost on a target mock and
+  returns the error the policy raised, or '' after a successful fetch.
+  ATargetServed reports whether the redirect target was contacted at all. }
 function FollowRedirectUnderPolicy(const AOriginHost, ATargetHost: string;
   const AOptions: THTTPRequestOptions; out ATargetServed: Boolean): string;
 var
@@ -1312,63 +1318,21 @@ begin
   end;
 end;
 
-procedure THTTPClientDestinationPolicy.TestPrivateAddressClassification;
-begin
-  Expect<Boolean>(IsPrivateNetworkAddress('10.0.0.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('10.255.255.255')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('172.16.0.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('172.31.255.254')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('192.168.1.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('127.0.0.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('169.254.169.254')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('100.64.0.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('0.0.0.0')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('192.0.0.8')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('224.0.0.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('255.255.255.255')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('::1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('::')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('fd00::1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('fe80::1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('::ffff:127.0.0.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('[::1]')).ToBe(True);
-
-  Expect<Boolean>(IsPrivateNetworkAddress('8.8.8.8')).ToBe(False);
-  Expect<Boolean>(IsPrivateNetworkAddress('140.82.112.3')).ToBe(False);
-  Expect<Boolean>(IsPrivateNetworkAddress('172.15.255.255')).ToBe(False);
-  Expect<Boolean>(IsPrivateNetworkAddress('172.32.0.1')).ToBe(False);
-  Expect<Boolean>(IsPrivateNetworkAddress('192.169.0.1')).ToBe(False);
-  Expect<Boolean>(IsPrivateNetworkAddress('100.63.255.255')).ToBe(False);
-  Expect<Boolean>(IsPrivateNetworkAddress('100.128.0.1')).ToBe(False);
-  Expect<Boolean>(IsPrivateNetworkAddress('2606:4700::1111')).ToBe(False);
-
-  { Non-canonical spellings are not literals and are refused outright. }
-  Expect<Boolean>(IsPrivateNetworkAddress('127.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('0x7f.0.0.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('2130706433')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('localhost')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('999.1.1.1')).ToBe(True);
-  Expect<Boolean>(IsPrivateNetworkAddress('1.2.3.4.5')).ToBe(True);
-end;
-
-procedure THTTPClientDestinationPolicy.TestHostAllowlistMatching;
+{ Asserts the request is refused with AExpected before any connection. }
+procedure ExpectRefusedBeforeConnect(const AScheme, AHost: string;
+  const AOptions: THTTPRequestOptions; const AExpected: string);
 var
-  Options: THTTPRequestOptions;
+  Mock: TMockHTTPServer;
 begin
-  Options := PolicyOptions([], papAllow);
-  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination, 'anything.example'))
-    .ToBe(True);
-  Options := PolicyOptions(['github.com', 'codeload.github.com'], papAllow);
-  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination, 'github.com'))
-    .ToBe(True);
-  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination,
-    'CodeLoad.GitHub.com')).ToBe(True);
-  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination,
-    'evil.github.com')).ToBe(False);
-  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination,
-    'github.com.evil.example')).ToBe(False);
-  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination, '')).ToBe(False);
+  Mock := TMockHTTPServer.Create(BuildSimpleResponse(StringBytes('ok')));
+  try
+    Mock.Start;
+    Expect<string>(GetErrorMessage(AScheme + '://' + AHost + ':'
+      + IntToStr(Mock.Port) + '/x', AOptions)).ToBe(AExpected);
+    Expect<Boolean>(Mock.WaitDone(200)).ToBe(False);
+  finally
+    Mock.Free;
+  end;
 end;
 
 procedure THTTPClientDestinationPolicy.TestDefaultOptionsAllowEveryDestination;
@@ -1378,29 +1342,51 @@ var
 begin
   Options := DefaultHTTPRequestOptions;
   Expect<Integer>(Length(Options.Destination.AllowedHosts)).ToBe(0);
-  Expect<Boolean>(Options.Destination.PrivateAddresses = papAllow)
+  Expect<Boolean>(Options.Destination.PrivateAddressPolicy = papAllow)
     .ToBe(True);
+  Expect<Boolean>(Options.Destination.RequireHTTPS).ToBe(False);
   Options.RequestTimeoutMilliseconds := 2000;
   Expect<string>(FollowRedirectUnderPolicy('127.0.0.1', '127.0.0.1',
     Options, Served)).ToBe('');
   Expect<Boolean>(Served).ToBe(True);
 end;
 
+procedure THTTPClientDestinationPolicy.TestHTTPURLHostMatchesRequestParsing;
+var
+  Message: string;
+begin
+  Expect<string>(HTTPURLHost('https://GitHub.com/owner/repo.git'))
+    .ToBe('github.com');
+  Expect<string>(HTTPURLHost('https://user@Host.Example:8443/x')).ToBe(
+    'host.example');
+  Expect<string>(HTTPURLHost('https://[::1]:443/x')).ToBe('::1');
+  Expect<string>(HTTPURLHost('http://127.0.0.1')).ToBe('127.0.0.1');
+  Message := '';
+  try
+    HTTPURLHost('ftp://host.example/x');
+  except
+    on E: EHTTPError do Message := E.Message;
+  end;
+  Expect<string>(Message).ToBe('Unsupported scheme: ftp');
+end;
+
+procedure THTTPClientDestinationPolicy.
+  TestRequireHTTPSRefusesPlaintextBeforeConnect;
+var
+  Options: THTTPRequestOptions;
+begin
+  Options := PolicyOptions([], papAllow);
+  Options.Destination.RequireHTTPS := True;
+  ExpectRefusedBeforeConnect('http', '127.0.0.1', Options,
+    'fetch scheme not allowed: http://127.0.0.1 (https is required)');
+end;
+
 procedure THTTPClientDestinationPolicy.
   TestDisallowedInitialHostIsRefusedBeforeConnect;
-var
-  Mock: TMockHTTPServer;
 begin
-  Mock := TMockHTTPServer.Create(BuildSimpleResponse(StringBytes('ok')));
-  try
-    Mock.Start;
-    Expect<string>(GetErrorMessage(MockURL(Mock.Port),
-      PolicyOptions(['github.com'], papAllow)))
-      .ToBe('fetch host not allowed: 127.0.0.1');
-    Expect<Boolean>(Mock.WaitDone(200)).ToBe(False);
-  finally
-    Mock.Free;
-  end;
+  ExpectRefusedBeforeConnect('http', '127.0.0.1',
+    PolicyOptions(['github.com'], papAllow),
+    'fetch host not allowed: 127.0.0.1');
 end;
 
 procedure THTTPClientDestinationPolicy.TestRedirectToDisallowedHostIsRefused;
@@ -1422,45 +1408,220 @@ begin
   Expect<Boolean>(Served).ToBe(True);
 end;
 
-procedure THTTPClientDestinationPolicy.TestDenyRefusesPrivateInitialDestination;
-var
-  Mock: TMockHTTPServer;
+procedure THTTPClientDestinationPolicy.
+  TestDenyRefusesResolvedLoopbackBeforeConnect;
 begin
-  Mock := TMockHTTPServer.Create(BuildSimpleResponse(StringBytes('ok')));
-  try
-    Mock.Start;
-    Expect<string>(GetErrorMessage(MockURL(Mock.Port),
-      PolicyOptions([], papDeny))).ToBe(
-      'fetch destination not allowed: 127.0.0.1 resolves to private '
-      + 'address 127.0.0.1');
-    Expect<Boolean>(Mock.WaitDone(200)).ToBe(False);
-  finally
-    Mock.Free;
-  end;
-  { An IPv6 literal is classified without resolution or connection. }
-  Expect<string>(GetErrorMessage('http://[::1]:1/x',
-    PolicyOptions([], papDeny))).ToBe(
-    'fetch destination not allowed: ::1 resolves to private address ::1');
+  { The name is resolved once; the binary answer is classified and named in
+    the refusal, which also pins the resolver's byte order. }
+  ExpectRefusedBeforeConnect('http', 'localhost', PolicyOptions([], papDeny),
+    'fetch destination not allowed: localhost resolves to loopback address '
+    + '127.0.0.1');
 end;
 
-procedure THTTPClientDestinationPolicy.TestDenyAfterPublicAllowsPrivateOrigin;
-var
-  Served: Boolean;
+procedure THTTPClientDestinationPolicy.
+  TestDenyRefusesNonGlobalLiteralsBeforeConnect;
 begin
-  { No hop resolved publicly, so an origin that starts inside a private
-    network may redirect within it. }
-  Expect<string>(FollowRedirectUnderPolicy('127.0.0.1', '127.0.0.1',
-    PolicyOptions([], papDenyAfterPublic), Served)).ToBe('');
-  Expect<Boolean>(Served).ToBe(True);
+  ExpectRefusedBeforeConnect('http', '127.0.0.1', PolicyOptions([], papDeny),
+    'fetch destination not allowed: 127.0.0.1 resolves to loopback address '
+    + '127.0.0.1');
+  ExpectRefusedBeforeConnect('http', '[0:0:0:0:0:ffff:127.0.0.1]',
+    PolicyOptions([], papDeny),
+    'fetch destination not allowed: 0:0:0:0:0:ffff:127.0.0.1 resolves to '
+    + 'loopback address 127.0.0.1');
+  ExpectRefusedBeforeConnect('http', '[fe90::1]', PolicyOptions([], papDeny),
+    'fetch destination not allowed: fe90::1 resolves to link-local address '
+    + 'fe90:0:0:0:0:0:0:1');
 end;
 
 {$IFDEF HTTPCLIENT_TESTING}
+{ Asserts the first and last address of a non-global block, and the
+  addresses just outside it, classify as expected. AOutsideBelow and
+  AOutsideAbove are '' when that neighbour belongs to another block. }
+procedure ExpectBlock(const AFirst, ALast, AName, AOutsideBelow,
+  AOutsideAbove: string);
+begin
+  Expect<string>(NonGlobalAddressReason(AFirst)).ToBe(AName);
+  Expect<string>(NonGlobalAddressReason(ALast)).ToBe(AName);
+  if AOutsideBelow <> '' then
+    Expect<string>(NonGlobalAddressReason(AOutsideBelow)).ToBe('');
+  if AOutsideAbove <> '' then
+    Expect<string>(NonGlobalAddressReason(AOutsideAbove)).ToBe('');
+end;
+
+procedure THTTPClientDestinationPolicy.TestIPv4RegistryBlockBoundaries;
+begin
+  ExpectBlock('0.0.0.0', '0.255.255.255', 'this network', '', '1.0.0.0');
+  ExpectBlock('10.0.0.0', '10.255.255.255', 'private-use', '9.255.255.255',
+    '11.0.0.0');
+  ExpectBlock('100.64.0.0', '100.127.255.255', 'shared address space',
+    '100.63.255.255', '100.128.0.0');
+  ExpectBlock('127.0.0.0', '127.255.255.255', 'loopback', '126.255.255.255',
+    '128.0.0.0');
+  ExpectBlock('169.254.0.0', '169.254.255.255', 'link-local',
+    '169.253.255.255', '169.255.0.0');
+  ExpectBlock('172.16.0.0', '172.31.255.255', 'private-use',
+    '172.15.255.255', '172.32.0.0');
+  ExpectBlock('192.0.0.0', '192.0.0.255', 'IETF protocol assignments',
+    '191.255.255.255', '192.0.1.0');
+  ExpectBlock('192.0.2.0', '192.0.2.255', 'documentation', '192.0.1.255',
+    '192.0.3.0');
+  ExpectBlock('192.88.99.0', '192.88.99.255', 'deprecated 6to4 relay anycast',
+    '192.88.98.255', '192.88.100.0');
+  ExpectBlock('192.168.0.0', '192.168.255.255', 'private-use',
+    '192.167.255.255', '192.169.0.0');
+  ExpectBlock('198.18.0.0', '198.19.255.255', 'benchmarking',
+    '198.17.255.255', '198.20.0.0');
+  ExpectBlock('198.51.100.0', '198.51.100.255', 'documentation',
+    '198.51.99.255', '198.51.101.0');
+  ExpectBlock('203.0.113.0', '203.0.113.255', 'documentation',
+    '203.0.112.255', '203.0.114.0');
+  ExpectBlock('224.0.0.0', '239.255.255.255', 'multicast', '223.255.255.255',
+    '');
+  ExpectBlock('240.0.0.0', '255.255.255.255',
+    'reserved (including limited broadcast)', '', '');
+  { The cloud instance-metadata endpoint is link-local. }
+  Expect<string>(NonGlobalAddressReason('169.254.169.254')).ToBe(
+    'link-local');
+end;
+
+procedure THTTPClientDestinationPolicy.TestIPv4GlobalExceptionsAndNeighbours;
+begin
+  Expect<string>(NonGlobalAddressReason('192.0.0.9')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('192.0.0.10')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('192.0.0.8')).ToBe(
+    'IETF protocol assignments');
+  Expect<string>(NonGlobalAddressReason('192.0.0.11')).ToBe(
+    'IETF protocol assignments');
+  Expect<string>(NonGlobalAddressReason('192.0.0.170')).ToBe(
+    'IETF protocol assignments');
+  Expect<string>(NonGlobalAddressReason('8.8.8.8')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('140.82.112.3')).ToBe('');
+end;
+
+procedure THTTPClientDestinationPolicy.TestIPv6RegistryBlockBoundaries;
+begin
+  Expect<string>(NonGlobalAddressReason('::')).ToBe('unspecified');
+  Expect<string>(NonGlobalAddressReason('::1')).ToBe('loopback');
+  Expect<string>(NonGlobalAddressReason('[::1]')).ToBe('loopback');
+  ExpectBlock('64:ff9b:1::', '64:ff9b:1:ffff:ffff:ffff:ffff:ffff',
+    'local-use IPv4/IPv6 translation', '', '');
+  ExpectBlock('100::', '100::ffff:ffff:ffff:ffff', 'discard-only', '', '');
+  ExpectBlock('100:0:0:1::', '100::1:ffff:ffff:ffff:ffff', 'dummy prefix',
+    '', '');
+  ExpectBlock('2001::', '2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff',
+    'IETF protocol assignments', '2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+    '2001:200::');
+  ExpectBlock('2001:db8::', '2001:db8:ffff:ffff:ffff:ffff:ffff:ffff',
+    'documentation', '2001:db7:ffff:ffff:ffff:ffff:ffff:ffff', '2001:db9::');
+  ExpectBlock('2002::', '2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff', '6to4',
+    '2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff', '2003::');
+  ExpectBlock('3fff::', '3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff',
+    'documentation', '3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff', '3fff:1000::');
+  ExpectBlock('5f00::', '5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+    'segment routing', '', '');
+  ExpectBlock('fc00::', 'fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+    'unique-local', '', '');
+  { fe80::/10 is masked, not matched by its first group. }
+  ExpectBlock('fe80::', 'febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+    'link-local', '', '');
+  Expect<string>(NonGlobalAddressReason('fe90::1')).ToBe('link-local');
+  Expect<string>(NonGlobalAddressReason('fea0::1')).ToBe('link-local');
+  Expect<string>(NonGlobalAddressReason('fec0::1')).ToBe(
+    'deprecated site-local');
+  Expect<string>(NonGlobalAddressReason('fe7f::1')).ToBe(
+    'outside global unicast');
+  ExpectBlock('ff00::', 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+    'multicast', '', '');
+  Expect<string>(NonGlobalAddressReason('1fff:ffff::1')).ToBe(
+    'outside global unicast');
+  Expect<string>(NonGlobalAddressReason('4000::1')).ToBe(
+    'outside global unicast');
+  { Globally reachable exceptions inside 2001::/23. }
+  Expect<string>(NonGlobalAddressReason('2001:1::1')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('2001:1::2')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('2001:1::3')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('2001:1::4')).ToBe(
+    'IETF protocol assignments');
+  Expect<string>(NonGlobalAddressReason('2001:3::1')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('2001:4:112::1')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('2001:20::1')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('2001:3f::1')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('2001:40::1')).ToBe(
+    'IETF protocol assignments');
+  Expect<string>(NonGlobalAddressReason('2606:4700::1111')).ToBe('');
+end;
+
+procedure THTTPClientDestinationPolicy.TestIPv4EmbeddingSpellingsAreCanonical;
+begin
+  Expect<string>(NonGlobalAddressReason('::ffff:127.0.0.1')).ToBe(
+    'loopback');
+  Expect<string>(NonGlobalAddressReason('0:0:0:0:0:ffff:127.0.0.1')).ToBe(
+    'loopback');
+  Expect<string>(NonGlobalAddressReason('[0:0:0:0:0:ffff:127.0.0.1]'))
+    .ToBe('loopback');
+  Expect<string>(NonGlobalAddressReason('::ffff:7f00:1')).ToBe('loopback');
+  Expect<string>(NonGlobalAddressReason('0:0:0:0:0:FFFF:0A00:0001')).ToBe(
+    'private-use');
+  Expect<string>(NonGlobalAddressReason('::127.0.0.1')).ToBe('loopback');
+  Expect<string>(NonGlobalAddressReason('::a9fe:a9fe')).ToBe('link-local');
+  Expect<string>(NonGlobalAddressReason('64:ff9b::7f00:1')).ToBe(
+    'loopback');
+  Expect<string>(NonGlobalAddressReason('64:ff9b::c612:1')).ToBe(
+    'benchmarking');
+  Expect<string>(NonGlobalAddressReason('::ffff:8.8.8.8')).ToBe('');
+  Expect<string>(NonGlobalAddressReason('64:ff9b::808:808')).ToBe('');
+end;
+
+procedure THTTPClientDestinationPolicy.TestNonLiteralTextIsNotGlobal;
+begin
+  Expect<string>(NonGlobalAddressReason('127.1')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('0x7f.0.0.1')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('2130706433')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('localhost')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('')).ToBe('not an address literal');
+  Expect<string>(NonGlobalAddressReason('999.1.1.1')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('1.2.3.4.5')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('fe80::1%eth0')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('1::2::3')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('1:2:3:4:5:6:7:8:9')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('12345::1')).ToBe(
+    'not an address literal');
+end;
+
+procedure THTTPClientDestinationPolicy.TestHostAllowlistMatching;
+var
+  Options: THTTPRequestOptions;
+begin
+  Options := PolicyOptions([], papAllow);
+  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination, 'anything.example'))
+    .ToBe(True);
+  Options := PolicyOptions(['github.com', 'codeload.github.com'], papAllow);
+  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination, 'github.com'))
+    .ToBe(True);
+  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination,
+    'CodeLoad.GitHub.com')).ToBe(True);
+  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination,
+    'evil.github.com')).ToBe(False);
+  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination,
+    'github.com.evil.example')).ToBe(False);
+  Expect<Boolean>(IsHTTPHostAllowed(Options.Destination, '')).ToBe(False);
+end;
+
 { Stands in for DNS: the named test host dials the loopback mock server but
   is classified as a public destination. Every other host resolves for real. }
 function ResolvePublicTestHost(const AHost: string; out AAddress: string;
   out APrivate: Boolean): Boolean;
 begin
-  Result := SameText(AHost, POLICY_PUBLIC_TEST_HOST);
+  Result := SameText(AHost, PolicyPublicTestHost);
   AAddress := '';
   APrivate := False;
   if Result then AAddress := '127.0.0.1';
@@ -1479,13 +1640,13 @@ begin
     try
       Mock.Start;
       NoHeaders := nil;
-      Response := HTTPGet('http://' + POLICY_PUBLIC_TEST_HOST + ':'
+      Response := HTTPGet('http://' + PolicyPublicTestHost + ':'
         + IntToStr(Mock.Port) + '/x', NoHeaders,
-        PolicyOptions([POLICY_PUBLIC_TEST_HOST], papDeny));
+        PolicyOptions([PolicyPublicTestHost], papDeny));
       Expect<Boolean>(Mock.WaitDone(2000)).ToBe(True);
       Expect<Integer>(Response.StatusCode).ToBe(200);
       { The resolved address is dialled; the request still names the host. }
-      Expect<Boolean>(Pos('Host: ' + POLICY_PUBLIC_TEST_HOST + ':'
+      Expect<Boolean>(Pos('Host: ' + PolicyPublicTestHost + ':'
         + IntToStr(Mock.Port) + #13#10,
         StringOf(Mock.ReceivedRequest)) > 0).ToBe(True);
     finally
@@ -1503,9 +1664,9 @@ var
 begin
   HTTPClientResolveTestHook := @ResolvePublicTestHost;
   try
-    Expect<string>(FollowRedirectUnderPolicy(POLICY_PUBLIC_TEST_HOST,
+    Expect<string>(FollowRedirectUnderPolicy(PolicyPublicTestHost,
       '127.0.0.1', PolicyOptions([], papDeny), Served)).ToBe(
-      'fetch destination not allowed: 127.0.0.1 resolves to private '
+      'fetch destination not allowed: 127.0.0.1 resolves to loopback '
       + 'address 127.0.0.1');
     Expect<Boolean>(Served).ToBe(False);
   finally
@@ -1513,17 +1674,20 @@ begin
   end;
 end;
 
+{ Regression for the review finding: an expanded IPv4-mapped IPv6 literal
+  was classified public and then re-resolved to loopback. }
 procedure THTTPClientDestinationPolicy.
-  TestDenyAfterPublicRefusesRedirectIntoPrivateAddress;
+  TestExpandedMappedIPv6RedirectCannotReachLoopback;
 var
   Served: Boolean;
 begin
   HTTPClientResolveTestHook := @ResolvePublicTestHost;
   try
-    Expect<string>(FollowRedirectUnderPolicy(POLICY_PUBLIC_TEST_HOST,
-      '127.0.0.1', PolicyOptions([], papDenyAfterPublic), Served)).ToBe(
-      'fetch destination not allowed: 127.0.0.1 resolves to private '
-      + 'address 127.0.0.1');
+    Expect<string>(FollowRedirectUnderPolicy(PolicyPublicTestHost,
+      '[0:0:0:0:0:ffff:127.0.0.1]', PolicyOptions([], papDeny),
+      Served)).ToBe(
+      'fetch destination not allowed: 0:0:0:0:0:ffff:127.0.0.1 resolves to '
+      + 'loopback address 127.0.0.1');
     Expect<Boolean>(Served).ToBe(False);
   finally
     HTTPClientResolveTestHook := nil;
@@ -1533,29 +1697,41 @@ end;
 
 procedure THTTPClientDestinationPolicy.SetupTests;
 begin
-  Test('private, loopback, link-local and non-canonical addresses classify '
-    + 'as private', TestPrivateAddressClassification);
-  Test('the host allowlist matches exact names case-insensitively',
-    TestHostAllowlistMatching);
   Test('default options keep every destination reachable',
     TestDefaultOptionsAllowEveryDestination);
+  Test('HTTPURLHost parses hosts exactly as a request does',
+    TestHTTPURLHostMatchesRequestParsing);
+  Test('RequireHTTPS refuses a plaintext hop before connecting',
+    TestRequireHTTPSRefusesPlaintextBeforeConnect);
   Test('a host outside the allowlist is refused before connecting',
     TestDisallowedInitialHostIsRefusedBeforeConnect);
   Test('a redirect to a host outside the allowlist is refused',
     TestRedirectToDisallowedHostIsRefused);
   Test('a redirect within the allowlist is followed',
     TestRedirectWithinAllowedHostsSucceeds);
-  Test('deny refuses a private initial destination before connecting',
-    TestDenyRefusesPrivateInitialDestination);
-  Test('deny-after-public lets a private origin redirect privately',
-    TestDenyAfterPublicAllowsPrivateOrigin);
+  Test('deny refuses a name that resolves to loopback before connecting',
+    TestDenyRefusesResolvedLoopbackBeforeConnect);
+  Test('deny refuses non-global IPv4, mapped IPv6 and link-local literals',
+    TestDenyRefusesNonGlobalLiteralsBeforeConnect);
   {$IFDEF HTTPCLIENT_TESTING}
+  Test('every IPv4 registry block classifies at and beyond its boundaries',
+    TestIPv4RegistryBlockBoundaries);
+  Test('globally reachable IPv4 exceptions and neighbours classify correctly',
+    TestIPv4GlobalExceptionsAndNeighbours);
+  Test('every IPv6 registry block classifies at and beyond its boundaries',
+    TestIPv6RegistryBlockBoundaries);
+  Test('IPv4-mapped, compatible and NAT64 spellings classify as their IPv4',
+    TestIPv4EmbeddingSpellingsAreCanonical);
+  Test('non-literal and malformed text is never global',
+    TestNonLiteralTextIsNotGlobal);
+  Test('the host allowlist matches exact names case-insensitively',
+    TestHostAllowlistMatching);
   Test('a public destination dials the checked address under its host name',
     TestPublicDestinationDialsTheCheckedAddress);
   Test('deny refuses a redirect from a public host into private space',
     TestDenyRefusesRedirectIntoPrivateAddress);
-  Test('deny-after-public refuses a public-to-private redirect',
-    TestDenyAfterPublicRefusesRedirectIntoPrivateAddress);
+  Test('an expanded IPv4-mapped IPv6 redirect cannot reach loopback',
+    TestExpandedMappedIPv6RedirectCannotReachLoopback);
   {$ENDIF}
 end;
 
