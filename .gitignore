@@ -26,3 +26,6 @@ Thumbs.db
 # Per-session agent handoff state — local working notes only, never
 # committed (.agents/ with an "s" is the committed skills dir).
 .agent/
+
+# Python bytecode from running bundled skill scripts and tests.
+__pycache__/
