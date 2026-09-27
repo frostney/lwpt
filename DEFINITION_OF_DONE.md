@@ -20,13 +20,12 @@ requirement may be marked not applicable only with a recorded reason.
 
 - Focused tests covering the changed behavior pass, including negative and
   recovery paths where applicable.
-- Every applicable delivery proof is successful for the exact final head or
-  unchanged atomic native prefix. Any head, base, order, or prefix change
-  invalidates prior CI, review, full-CI, and merge-readiness evidence.
-- Managed completion includes terminal current-head evidence from every active
-  inline review automation, zero unresolved threads, and a reply from an
-  account with current maintainer authority on every automation thread,
-  including resolved threads.
+- Required CI, review, and applicable full-CI evidence belongs to the exact
+  final head. A new head invalidates earlier evidence.
+- Review completion includes terminal current-head evidence from every active
+  review automation, zero unresolved threads, and a reply from an account with
+  current maintainer authority on every automation thread, including resolved
+  threads.
 - Each delivery, full-CI, or review requirement marked not applicable has an
   explicit evidence-backed reason.
 - FreePascal behavior relied upon by the change is checked against the live
@@ -56,13 +55,14 @@ requirement may be marked not applicable only with a recorded reason.
   affected focused suites before the preparation PR; that PR's required CI and
   the resulting integrated-main CI become the final full-suite evidence.
 - A change touching process management, concurrency, platform-specific code,
-  or the CI workflows themselves dispatches the full CI workflow on the
-  branch and watches it to completion before merge when the change targets
-  platforms or test routes the PR gate does not cover. During remediation, use an
-  allow-listed native diagnostic slice. Dispatch the full matrix only once the
-  branch contains the current base and focused checks, required PR CI, and
-  active review evidence have converged; a later change invalidates that proof
-  (post-#102 the gate covers Linux ordinary+E2E,
+  or the CI workflows themselves is labelled `ci:full-required` when it
+  targets platforms or test routes the PR gate does not cover. It merges only
+  after a green `ci.yml` `mode=manual` run on its exact head, as
+  [`ORCHESTRATION.md`](./ORCHESTRATION.md) describes. During remediation, use an
+  allow-listed diagnostic slice; a diagnostic is never that evidence. Dispatch
+  the full matrix only once the branch contains the current base and focused
+  checks, required PR CI, and active review evidence have converged; a later
+  head invalidates it (post-#102 the gate covers Linux ordinary+E2E,
   aarch64-darwin ordinary, and win64 offline; `x86_64-darwin`,
   `aarch64-linux`, `i386-win32`, and non-Linux E2E remain
   post-merge-only).

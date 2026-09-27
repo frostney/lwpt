@@ -59,11 +59,13 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0029](./adr/0029-fpc-compiler-driver.md) | Neutral compiler-driver seam with on-demand FPC target probes, unified argument translation, failure classification, and normalized diagnostics |
 | [0030](./adr/0030-root-compiler-profiles.md) | Root-owned named compiler commands, out-of-process host registration, deterministic selection precedence, and the short-lived external-driver TOML protocol |
 | [0031](./adr/0031-fixed-point-single-version-resolution.md) | Deterministic fixed-point dependency discovery, authoritative Git ref identity, graph-wide highest-version selection, and publish-after-validation |
+| [0032](./adr/0032-managed-delivery-state-and-proof.md) | (Superseded by [0046](./adr/0046-skill-owned-delivery.md).) Managed delivery through an explicit transition endpoint, phase labels, and exact native-topology full-CI proofs — kept as historical record |
 | [0033](./adr/0033-schannel-server-tls-accept-on-windows.md) | Windows server TLS accept moves to native SChannel + crypt32, removing OpenSSL from Windows entirely and giving `i386-win32` server accept; supersedes the Windows half of [0024](./adr/0024-openssl-server-tls-accept.md) |
 | [0034](./adr/0034-freeze-test-selection-before-pretest.md) | Test discovery and file/directory/glob selection freeze before `pretest`; hooks may prepare inputs but cannot add programs to the invocation |
 | [0036](./adr/0036-per-user-dependency-archive-cas.md) | Verified dependency archives reuse one per-user immutable SHA-256 object while project-owned archives and frozen verification remain authoritative |
 | [0037](./adr/0037-verified-build-result-cache.md) | Verified compiler-neutral build-result reuse through per-user immutable manifests and artifacts, with explicit bypass |
 | [0043](./adr/0043-self-hosted-registry-origin.md) | Self-hosted registry origin command family, content-addressed storage, atomic signed state, recovery, and native TLS lifecycle |
+| [0046](./adr/0046-skill-owned-delivery.md) | Delivery is skill-owned: the repository keeps the `delivery-admission` PR gate, manual and diagnostic `ci.yml` dispatch, and the `ci:full-required` rule; supersedes [0032](./adr/0032-managed-delivery-state-and-proof.md) |
 
 ## Spikes
 

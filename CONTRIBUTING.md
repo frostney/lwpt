@@ -32,40 +32,20 @@ The pre-commit hook runs `lwpt format` and `lwpt agents` locally (both with `sta
 
 If any check fails on a hook autofix you didn't expect, do not commit with `--no-verify`. Investigate, then fix.
 
-### Managed delivery
+### Merging
 
-Ordinary PRs run the PR matrix automatically. A deferred PR uses the explicit
-endpoint in [`ORCHESTRATION.md`](./ORCHESTRATION.md) and the ordered
-`delivery:managed` → `ci:ready` → `review:ready` → `merge:ready` phases.
-`ci:full-required` independently marks work that needs the six-target full-CI
-proof before merge admission.
+Every PR runs `pr.yml` automatically, whatever its base branch. `main` accepts
+a squash merge once the `delivery-admission` check passes on the exact head
+and every review thread is resolved. CodeRabbit reviews non-draft PRs
+automatically.
 
-The labels expose current phase; the native exact-head `delivery-admission` job,
-current review evidence, and conditional `full-ci` check are proof. GitHub's
-native stack is the only source of prefix order. A managed PR may be standalone,
-and a native stack need not be managed. New heads or changed base/order/prefix
-return affected work to waiting and invalidate stale evidence automatically.
-
-After PR CI succeeds, the coordinator marks the managed draft ready with its
-ordinary authenticated PR operation, revalidates the exact head, and invokes
-the review transition. The transition requires the PR to be ready before it
-applies `review:ready`; that label opens the repository's review lane and does
-not mean review is complete. `merge:ready` is accepted only after the machine
-gate observes terminal current-head evidence from every active configured
-review automation, no unresolved threads, a current maintainer reply on every
-automation thread, and applicable exact-SHA full CI. Merge admission does not
-change draft state, and the endpoint never merges;
-the coordinator or maintainer integrates
-the accepted singleton or prefix. Because `merge:ready` records point-in-time
-acceptance rather than proof of future eligibility, the coordinator invokes
-the `merge` operation immediately before a singleton merge or preflights every
-managed member of one frozen native prefix before integrating it bottom to top
-without unrelated work in between. Ordinary members retain their protected
-automatic route.
-
-Returning a managed PR to draft invalidates both `review:ready` and
-`merge:ready`; merge admission fails closed until the PR is ready and review
-evidence converges again.
+A PR labelled `ci:full-required` also needs a green six-target run on its
+exact head before merge:
+`gh workflow run ci.yml --ref <branch> -f mode=manual`. Merge with
+`gh pr merge --squash --match-head-commit <sha>` so a later push cannot slip
+past that evidence. A diagnostic slice (`-f mode=diagnostic`) helps with
+remediation but never counts as that evidence. Agent-led delivery follows
+[`ORCHESTRATION.md`](./ORCHESTRATION.md).
 
 ## Commit messages
 
