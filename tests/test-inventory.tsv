@@ -41,7 +41,7 @@ program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
 program	*	source/LWPT.FetchPolicy.Test.pas	1	10
 program	*	source/LWPT.Formatter.Test.pas	7	97
-program	*	source/LWPT.GitPack.Test.pas	1	24
+program	*	source/LWPT.GitPack.Test.pas	1	23
 program	*	source/LWPT.GitProtocol.Test.pas	4	48
 program	*	source/LWPT.Health.Test.pas	1	11
 program	*	source/LWPT.TestArtifactSet.Test.pas	1	9
