@@ -154,15 +154,16 @@ jobs:
       # the PR's own command surface — is what the committed AGENTS.md
       # block is checked against (ADR-0027).
       - name: lwpt agents --check (AGENTS.md command reference fresh?)
+        id: agents-check
         run: ./build/lwpt agents --check
 
-      - name: lwpt test --bail=1 (ordinary project paths)
+      - name: lwpt test --bail=0 (ordinary project paths)
         run: >-
           ./build/lwpt test
           'source/*.Test.pas'
           'packages/*/source/*.Test.pas'
           'tests/integration/*.Test.pas'
-          --bail=1
+          --bail=0
 
       # PR-gate extension (#102): the project-owned E2E paths run on this
       # one Linux leg pre-merge. Evidence: the #84 TLS-close regression
@@ -172,7 +173,10 @@ jobs:
       # connect failures self-skip (transient third-party downtime);
       # content, protocol, and TLS failures remain blocking, which is
       # the point. Post-merge ci.yml still runs these paths on every platform.
-      - name: lwpt test --bail=1 (E2E project paths, live network)
+      - name: lwpt test --bail=0 (E2E project paths, live network)
+        # Run even when the ordinary queue failed, so one run reports both;
+        # a failed setup step (bootstrap through agents --check) still skips it.
+        if: ${{ !cancelled() && steps.agents-check.outcome == 'success' }}
         timeout-minutes: 15
         env:
           LWPT_ENABLE_NETWORK: "1"
@@ -180,7 +184,7 @@ jobs:
           ./build/lwpt test
           'tests/e2e/*.Test.pas'
           'packages/*/tests/e2e/*.Test.pas'
-          --bail=1
+          --bail=0
 
   docs:
     needs: delivery-gate
@@ -241,13 +245,13 @@ jobs:
       - name: lwpt install (workspace auto-discovery + symlinks)
         run: ./build/lwpt install
 
-      - name: lwpt test --bail=1 (ordinary project paths)
+      - name: lwpt test --bail=0 (ordinary project paths)
         run: >-
           ./build/lwpt test
           'source/*.Test.pas'
           'packages/*/source/*.Test.pas'
           'tests/integration/*.Test.pas'
-          --bail=1
+          --bail=0
 
   # Reuses toolchain.yml exactly like ci.yml/release.yml do. The cache
   # key (lwpt-fpc-cross-<fpc>-macos-arm64-<n>) has no branch or ref
@@ -455,13 +459,13 @@ jobs:
       - name: lwpt install (workspace auto-discovery + junctions)
         run: ./build/lwpt.exe install
 
-      - name: lwpt test --bail=1 (ordinary project paths)
+      - name: lwpt test --bail=0 (ordinary project paths)
         run: >-
           ./build/lwpt.exe test
           'source/*.Test.pas'
           'packages/*/source/*.Test.pas'
           'tests/integration/*.Test.pas'
-          --bail=1
+          --bail=0
 
   delivery-admission:
     if: ${{ always() }}

@@ -162,13 +162,13 @@ end;
 function TLWPTBuildCache.ReadSmallTextFile(const APath: string;
   out AText: string): Boolean;
 var
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
   Bytes: TBytes;
 begin
   Result := False;
   AText := '';
   try
-    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
     try
       if Stream.Size > BUILD_RESULT_MANIFEST_MAX_BYTES then Exit;
       SetLength(Bytes, Stream.Size);

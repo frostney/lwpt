@@ -36,8 +36,8 @@ run-name: >-
 #           full pipeline:
 #             ./build/lwpt install
 #             ./build/lwpt format --check        (one runner is enough)
-#             ./build/lwpt test <ordinary paths> --bail=1
-#             ./build/lwpt test <E2E paths> --bail=1  (live network, Q23=c)
+#             ./build/lwpt test <ordinary paths> --bail=0
+#             ./build/lwpt test <E2E paths> --bail=0  (live network, Q23=c)
 #           This exercises lwpt itself + the underlying native FPC on
 #           each platform end-to-end, including live GitHub/GitLab/
 #           Bitbucket fetches.
@@ -505,6 +505,7 @@ jobs:
           fi
 
       - name: lwpt install (workspace auto-discovery + linking)
+        id: workspace-install
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             ./build/lwpt.exe install
@@ -517,7 +518,7 @@ jobs:
         run: |
           ./build/lwpt format --check
 
-      - name: lwpt test --bail=1 (ordinary project paths)
+      - name: lwpt test --bail=0 (ordinary project paths)
         if: >-
           inputs.mode != 'diagnostic' ||
           (inputs.diagnostic_selector == 'default' &&
@@ -528,17 +529,20 @@ jobs:
               'source/*.Test.pas' \
               'packages/*/source/*.Test.pas' \
               'tests/integration/*.Test.pas' \
-              --bail=1
+              --bail=0
           else
             ./build/lwpt test \
               'source/*.Test.pas' \
               'packages/*/source/*.Test.pas' \
               'tests/integration/*.Test.pas' \
-              --bail=1
+              --bail=0
           fi
 
-      - name: lwpt test --bail=1 (E2E project paths, live network — every platform per Q23=c)
-        if: inputs.mode != 'diagnostic' || inputs.diagnostic_selector == 'e2e'
+      - name: lwpt test --bail=0 (E2E project paths, live network — every platform per Q23=c)
+        # Run even when the ordinary queue failed, so one run reports both.
+        if: >-
+          !cancelled() && steps.workspace-install.outcome == 'success' &&
+          (inputs.mode != 'diagnostic' || inputs.diagnostic_selector == 'e2e')
         env:
           LWPT_ENABLE_NETWORK: "1"
         run: |
@@ -546,12 +550,12 @@ jobs:
             ./build/lwpt.exe test \
               'tests/e2e/*.Test.pas' \
               'packages/*/tests/e2e/*.Test.pas' \
-              --bail=1
+              --bail=0
           else
             ./build/lwpt test \
               'tests/e2e/*.Test.pas' \
               'packages/*/tests/e2e/*.Test.pas' \
-              --bail=1
+              --bail=0
           fi
 
       - name: TLS diagnostic test
