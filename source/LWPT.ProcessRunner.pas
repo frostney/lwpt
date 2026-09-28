@@ -213,6 +213,11 @@ begin
           if (ErrorCode = ESysEAGAIN) or (ErrorCode = ESysEWOULDBLOCK)
              or (ErrorCode = ESysEINTR) then
             Sleep(PROCESS_RUNNER_POLL_MILLISECONDS)
+          else if ErrorCode = ESysEPIPE then
+            { The child closed its input before consuming all of it. That is
+              the child's decision, not a write failure: its exit status and
+              output decide the result. }
+            Break
           else if not Terminated then
             raise EOSError.Create(SysErrorMessage(ErrorCode));
         end;
@@ -231,10 +236,14 @@ begin
           if Written > 0 then Inc(Offset, Written)
           else Sleep(PROCESS_RUNNER_POLL_MILLISECONDS);
         end
-        else if not Terminated then
+        else
         begin
           ErrorCode := Windows.GetLastError;
-          raise EOSError.Create(SysErrorMessage(ErrorCode));
+          { See the EPIPE case above: a closed read end ends the input. }
+          if (ErrorCode = ERROR_BROKEN_PIPE) or (ErrorCode = ERROR_NO_DATA) then
+            Break;
+          if not Terminated then
+            raise EOSError.Create(SysErrorMessage(ErrorCode));
         end;
       end
       {$ENDIF}

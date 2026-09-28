@@ -91,10 +91,7 @@ type
   end;
 
 procedure InstallProcessTreeSignalForwarding;
-{ Serializes creation and close-on-exec protection of file descriptors with
-  every managed and unmanaged process spawn. Calls must be paired. }
-procedure BeginProcessHandleSetup;
-procedure EndProcessHandleSetup;
+{ Spawns under LWPT.Core's process-handle inheritance guard. }
 procedure ExecuteUnmanagedProcess(const AProcess: TProcess);
 function FeedProcessTreeProtocol(var ABuffer: string;
   const ABytes: string; out ALine: string): TLWPTProtocolReadResult;
@@ -214,7 +211,6 @@ const
 var
   ActiveProcessTrees: TList;
   ActiveProcessTreesCriticalSection: TRTLCriticalSection;
-  ProcessSpawnCriticalSection: TRTLCriticalSection;
   SignalForwardingInstalled: Boolean = False;
   InheritedStatusWriteHandle: PtrInt = -1;
   InheritedControlReadHandle: PtrInt = -1;
@@ -1046,22 +1042,12 @@ begin
   if Assigned(ProcessTreeBeforeUnmanagedSpawnLockTestHook) then
     ProcessTreeBeforeUnmanagedSpawnLockTestHook;
   {$ENDIF}
-  EnterCriticalSection(ProcessSpawnCriticalSection);
+  BeginProcessHandleSetup;
   try
     AProcess.Execute;
   finally
-    LeaveCriticalSection(ProcessSpawnCriticalSection);
+    EndProcessHandleSetup;
   end;
-end;
-
-procedure BeginProcessHandleSetup;
-begin
-  EnterCriticalSection(ProcessSpawnCriticalSection);
-end;
-
-procedure EndProcessHandleSetup;
-begin
-  LeaveCriticalSection(ProcessSpawnCriticalSection);
 end;
 
 procedure TLWPTProcessTree.Execute;
@@ -1079,7 +1065,7 @@ begin
     arriving during Execute wait until the new group/job is fully addressable.
     Channel creation through child-handle closure is process-serialised because
     FPC cannot restrict inheritance to an explicit descriptor/handle list. }
-  EnterCriticalSection(ProcessSpawnCriticalSection);
+  BeginProcessHandleSetup;
   try
     CreateAcknowledgementChannels;
     try
@@ -1143,7 +1129,7 @@ begin
       raise;
     end;
   finally
-    LeaveCriticalSection(ProcessSpawnCriticalSection);
+    EndProcessHandleSetup;
   end;
 end;
 
@@ -2160,6 +2146,5 @@ end;
 initialization
   ActiveProcessTrees := TList.Create;
   InitCriticalSection(ActiveProcessTreesCriticalSection);
-  InitCriticalSection(ProcessSpawnCriticalSection);
 
 end.
