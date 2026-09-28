@@ -83,7 +83,9 @@ The lock records `resolvedRefKind` (`tag` or `branch`) for every dependency
 selected from a named Git ref. This is additive schema-v3 evidence, following
 the `resolvedCommit` precedent in
 [ADR-0031](./0031-fixed-point-single-version-resolution.md). The field is
-omitted for SHA pins and non-Git sources.
+omitted for SHA pins and non-Git sources, and for a named ref whose kind is
+still unknown because its lock predates the field and it has been seen only
+as a branch (see "Lock without `resolvedRefKind`" below).
 
 When resolution selects the same ref name as the lock, the following rules
 apply:
@@ -121,7 +123,9 @@ When the lock pins the selected commit, a download must reproduce the lock's
 pins the same ref name. The check runs before the bytes are written, admitted
 to the per-user cache, or extracted, on every path that supplies archive
 bytes. That includes a resolver candidate fetched earlier in the same install
-for another dependency naming the same source and commit. This covers:
+for another dependency naming the same source and commit, online or with
+`--offline`, where the offline form refuses and points to an online install.
+This covers:
 
 - a locked commit whose forge now serves different bytes;
 - another dependency aliasing the same repository and commit, whose fetch

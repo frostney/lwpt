@@ -62,6 +62,7 @@ type
     procedure TestSharedCandidateCannotBypassLockedArchive;
     procedure TestLegacyTagCannotBecomeMovableBranch;
     procedure TestSurvivingTagWinsOverSameNamedBranch;
+    procedure TestOfflineSharedCandidateIsCheckedBeforeExtraction;
   end;
 
 const
@@ -1164,6 +1165,81 @@ begin
   end;
 end;
 
+{ Replaces the archiveHash of one lock entry, simulating a lock whose two
+  aliases of one repository and commit record different archive bytes. }
+procedure SetLockArchiveHash(const APath, APackage, AHash: string);
+var Lines: TStringList; LineIndex: Integer; InPackage: Boolean;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(APath);
+    InPackage := False;
+    for LineIndex := 0 to Lines.Count - 1 do
+    begin
+      if Pos('[', Lines[LineIndex]) = 1 then
+        InPackage := Lines[LineIndex] = '[package.' + APackage + ']'
+      else if InPackage and (Pos('archiveHash = ', Lines[LineIndex]) = 1) then
+        Lines[LineIndex] := 'archiveHash = "' + AHash + '"';
+    end;
+    Lines.SaveToFile(APath);
+  finally
+    Lines.Free;
+  end;
+end;
+
+{ Offline, the first alias of a repository and commit stages its verified
+  committed archive as the resolver candidate. A second alias whose lock
+  records different bytes must be refused before those bytes are copied or
+  extracted for it, not only at the final offline lock comparison. }
+procedure TInstallGitGraph.TestOfflineSharedCandidateIsCheckedBeforeExtraction;
+var
+  Root, LockBefore, Combined, OtherArchive, OtherHash, SavedCache: string;
+  Run: TLwptResult;
+begin
+  SavedCache := FCacheRoot;
+  Root := FScratch + '/offline-shared-candidate';
+  FCacheRoot := FScratch + '/offline-shared-candidate-cache';
+  RecursiveDelete(FCacheRoot);
+  WriteRoot(Root, 'offline-shared-candidate',
+    'a = "fixture/shared@v1.0.0"'#10 + 'z = "fixture/shared@v1.0.0"'#10);
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10);
+  WriteArchive('a', SHARED_COMMIT,
+    '[package]'#10 + 'name = "a"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('offline shared candidate seed', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+
+  { z's committed archive and lock entry agree with each other but not with
+    a's bytes for the same commit. }
+  WriteArchive('z', SHARED_COMMIT,
+    '[package]'#10 + 'name = "z"'#10 + 'version = "6.6.6"'#10
+    + 'units = ["source"]'#10);
+  OtherArchive := FFixtureRoot + '/archives/z/' + SHARED_COMMIT + '.tar.gz';
+  Expect<Boolean>(CopyFileContent(OtherArchive,
+    Root + '/.lwpt/archives/z-v1.0.0.tar.gz')).ToBe(True);
+  OtherHash := 'sha256:' + SHA256File(OtherArchive);
+  SetLockArchiveHash(Root + '/lwpt.lock', 'z', OtherHash);
+  LockBefore := ReadBinaryFile(Root + '/lwpt.lock');
+  RecursiveDelete(Root + '/.lwpt/modules');
+  FCacheRoot := FScratch + '/offline-shared-candidate-cold-cache';
+  RecursiveDelete(FCacheRoot);
+
+  Run := RunInstall(Root, ['install', '--offline']);
+  Combined := Run.Stdout + Run.Stderr;
+  FCacheRoot := SavedCache;
+  if Pos('by another dependency', Combined) = 0 then
+    WriteLn('--- offline shared candidate ---'#10, Combined, '---');
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('dependency "z": [offline] the archive staged for '
+    + 'locked commit ' + SHARED_COMMIT + ' by another dependency does not '
+    + 'match lwpt.lock (locked archive ' + OtherHash, Combined) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('online', Combined) > 0).ToBe(True);
+  Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockBefore);
+  Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/z')).ToBe(False);
+end;
+
 procedure TInstallGitGraph.AfterAll;
 begin
   SetCurrentDir(FOriginalDir);
@@ -1388,6 +1464,9 @@ begin
     TestLegacyTagCannotBecomeMovableBranch);
   Test('a surviving locked tag is kept when a same-named branch is '
     + 'advertised in either order', TestSurvivingTagWinsOverSameNamedBranch);
+  Test('offline reuse of another dependency''s staged archive is checked '
+    + 'against the lock before extraction',
+    TestOfflineSharedCandidateIsCheckedBeforeExtraction);
 end;
 
 begin
