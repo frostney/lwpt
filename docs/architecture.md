@@ -21,6 +21,10 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   `registry sync|verify|serve` runs a read-only mirror. The mirror verifies the
   origin's signed proof and serves it without contacting the origin while it
   serves requests, per [ADR-0045](./adr/0045-verified-registry-mirror.md).
+  Synchronization rejects checkpoints signed for longer than seven days plus
+  five minutes of clock skew, and refuses to run while the local UTC clock is
+  behind the highest accepted `published_at`, so mirror hosts need a
+  synchronized clock that is never set back.
   Publication and clients build on the wire contract in
   [`registry-spec.md`](./registry-spec.md).
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.

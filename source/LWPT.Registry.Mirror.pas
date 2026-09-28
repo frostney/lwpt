@@ -36,7 +36,7 @@ type
     FSynchronizationDeadline: QWord;
     FStoreUsed, FAttemptWritten: Int64;
     FAttemptID, FAttemptStartedAt: string;
-    FActivationExpiresAt: string;
+    FActivationExpiresAt, FActivationClockFloor: string;
     {$IFDEF REGISTRY_TESTING}
     FTransferStats: TRegistryMirrorTransferStats;
     FBeforeActivate: TSHA256Progress;
@@ -451,12 +451,16 @@ begin
 end;
 
 procedure TLWPTRegistryMirror.CheckActivationGate;
+var
+  Now: string;
 begin
   {$IFDEF REGISTRY_TESTING}
   if Assigned(FBeforeReplace) then FBeforeReplace;
   {$ENDIF}
   CheckSynchronizationDeadline;
-  if FActivationExpiresAt <= RegistryTimestampNow then
+  Now := RegistryTimestampNow;
+  RequireRegistryClockAtFloor(Now, FActivationClockFloor);
+  if FActivationExpiresAt <= Now then
     raise ELWPTRegistryStaleContactError.CreateStable('checkpoint_expired',
       'checkpoint expired before activation');
 end;
@@ -757,6 +761,7 @@ begin
   Result.PublicKey := AState.TrustPublicKey;
   Result.PublishedAt := Checkpoint.PublishedAt;
   Result.ExpiresAt := Checkpoint.ExpiresAt;
+  Result.ClockFloor := AState.ClockFloor;
 end;
 
 function TLWPTMirrorDocumentSource.ReadDocument(const APath: string;
@@ -1173,6 +1178,9 @@ begin
           RememberRetrieval(Proof, Document);
         end;
       end;
+      { A clock behind accepted state fails before any upstream request. }
+      RequireRegistryClockAtFloor(RegistryTimestampNow,
+        RegistryLaterTimestamp(Prior.ClockFloor, Prior.PublishedAt));
       PrepareStorageBudget(AcceptedGeneration);
       Document := Control(Config.UpstreamURL + '/.well-known/' + PROGRAM_NAME + '-registry', 'discovery');
       Discovery := ParseRegistryDiscovery(RegistryBytesText(Document));
@@ -1301,6 +1309,7 @@ begin
       State.TrustPublicKey := Verified.State.PublicKey;
       State.TrustKeyDocument := SHA256BytesPrefixed(KeyDocument);
       State.Rotations := Bindings;
+      State.ClockFloor := Verified.State.ClockFloor;
       Prefix := 'checkpoints/renewals/sha256/' + Copy(State.CheckpointHash, 8, 64);
       State.CheckpointPath := Prefix + '.toml';
       State.SignaturePath := Prefix + '.sig.toml';
@@ -1326,6 +1335,7 @@ begin
         raise ELWPTRegistryStaleContactError.CreateStable('checkpoint_expired',
           'checkpoint expired before activation');
       FActivationExpiresAt := Verified.ExpiresAt;
+      FActivationClockFloor := State.ClockFloor;
       ActivateBudgeted(State);
     except
       on E: Exception do
@@ -1375,6 +1385,7 @@ begin
   State.TrustPublicKey := AVerified.State.PublicKey;
   State.CheckpointHash := AVerified.State.CheckpointHash;
   State.LastSync := ALastSync;
+  State.ClockFloor := AVerified.State.ClockFloor;
   State.TrustKeyDocument := SHA256BytesPrefixed(AKeyDocuments[0]);
   WriteImmutable(ProofPath(State.TrustKeyDocument), AKeyDocuments[0]);
   SetLength(State.Rotations, Length(AVerified.Proof.Rotations));
@@ -1436,6 +1447,7 @@ begin
     Result := Result + 'sequence = ' + UIntToStr(State.Sequence) + #10
       + 'freshness = ' + RegistryTOMLQuote(Freshness) + #10
       + 'expires_at = ' + RegistryTOMLQuote(Verified.ExpiresAt) + #10
+      + 'clock_floor = ' + RegistryTOMLQuote(Verified.State.ClockFloor) + #10
       + 'last_successful_sync = ' + RegistryTOMLQuote(State.LastSync) + #10;
   end
   else Result := Result + 'freshness = "uninitialized"' + #10;
