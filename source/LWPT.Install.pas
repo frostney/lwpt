@@ -165,6 +165,22 @@ const
   MAX_ARCHIVE_RESPONSE_BYTES = Int64(256) * 1024 * 1024;
   ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS = 5 * 60 * 1000;
 
+{$IFDEF INSTALL_TESTING}
+{ Test-only crash injection. A real crash runs no unit finalization, and
+  Halt does: finalizing the RTL while a producer-lease heartbeat thread is
+  still writing state crashed the child with an access violation instead
+  of the expected exit code. End the process at once, as a crash would. }
+procedure TerminateAbruptlyForTesting(const AExitCode: Integer);
+begin
+  {$IFDEF MSWINDOWS}
+  Windows.TerminateProcess(Windows.GetCurrentProcess, UINT(AExitCode));
+  {$ENDIF}
+  {$IFDEF UNIX}
+  FpExit(AExitCode);
+  {$ENDIF}
+end;
+{$ENDIF}
+
 type
   TInstallLock = class
   private
@@ -1096,13 +1112,13 @@ begin
   end;
 
   { Test-only crash injection after this process has become the producer but
-    before it can touch the origin or publish bytes. Halt deliberately skips
-    object cleanup so the cross-process integration test observes the same
-    operating-system guard release as an abrupt producer death. }
+    before it can touch the origin or publish bytes. Abrupt termination skips
+    all cleanup so the cross-process integration test observes the same
+    operating-system guard release as a producer death. }
   {$IFDEF INSTALL_TESTING}
   if Assigned(ProducerLease)
      and (TestSeamValue('CRASH_DEPENDENCY_PRODUCER') = '1') then
-    Halt(88);
+    TerminateAbruptlyForTesting(88);
   {$ENDIF}
 
   try
@@ -3530,7 +3546,7 @@ var
       {$IFDEF INSTALL_TESTING}
       if SameText(TestSeamValue('HALT_AFTER_MODULE_RETAIN'),
          R.Nodes[k].Name) then
-        Halt(87);
+        TerminateAbruptlyForTesting(87);
       {$ENDIF}
       FinalArchive := '';
       if not (R.Nodes[k].Dep.SrcKind in [skLocal, skWorkspace]) then
@@ -3566,7 +3582,7 @@ var
         raise EFetchError.CreateFmt(
           'injected publication failure after package %d', [k + 1]);
       if StrToIntDef(TestSeamValue('HALT_PUBLISH_AFTER'), -1) = k + 1 then
-        Halt(86);
+        TerminateAbruptlyForTesting(86);
       {$ENDIF}
     end;
   end;
