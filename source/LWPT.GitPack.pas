@@ -55,12 +55,16 @@ const
 
 type
   EGitPackError = class(Exception);
+  { Parsing or walking passed the caller's deadline. }
+  EGitPackDeadlineExceeded = class(EGitPackError);
 
   TGitPackLimits = record
     MaxObjectCount: Integer;
     MaxObjectBytes: Integer;
     MaxInflatedBytes: Int64;
     MaxInflateRatio: Integer;
+    { GetTickCount64 value after which parsing stops; 0 for none. }
+    Deadline: QWord;
   end;
 
   TGitCommitRecord = record
@@ -96,7 +100,11 @@ type
       ids the graph does not hold, so a pack that omits part of a path can
       only produce a false negative. }
     function FindReachingStart(const AStarts: array of string;
-      const ATarget: string): Integer;
+      const ATarget: string): Integer; overload;
+    { As above, raising EGitPackDeadlineExceeded once GetTickCount64 passes
+      ADeadline (0 for none). }
+    function FindReachingStart(const AStarts: array of string;
+      const ATarget: string; ADeadline: QWord): Integer; overload;
   end;
 
   TGitPackStatistics = record
@@ -158,6 +166,7 @@ begin
   Result.MaxObjectBytes := MAX_PACK_OBJECT_BYTES;
   Result.MaxInflatedBytes := MAX_PACK_INFLATED_BYTES;
   Result.MaxInflateRatio := MAX_PACK_INFLATE_RATIO;
+  Result.Deadline := 0;
 end;
 
 function IsFullGitObjectId(const AValue: string): Boolean;
@@ -275,9 +284,23 @@ begin
   Result := FCommits.Count;
 end;
 
+procedure CheckDeadline(ADeadline: QWord);
+begin
+  if (ADeadline <> 0) and (GetTickCount64 > ADeadline) then
+    raise EGitPackDeadlineExceeded.Create(
+      'pack processing passed the proof deadline');
+end;
+
 function TGitCommitGraph.FindReachingStart(const AStarts: array of string;
   const ATarget: string): Integer;
+begin
+  Result := FindReachingStart(AStarts, ATarget, 0);
+end;
+
+function TGitCommitGraph.FindReachingStart(const AStarts: array of string;
+  const ATarget: string; ADeadline: QWord): Integer;
 var
+  Steps: Integer;
   Visited: TDictionary<string, Boolean>;
   Stack: TList<string>;
   StartIndex, p: Integer;
@@ -285,6 +308,7 @@ var
   Commit: TGitCommitRecord;
 begin
   Result := -1;
+  Steps := 0;
   Visited := TDictionary<string, Boolean>.Create;
   Stack := TList<string>.Create;
   try
@@ -297,7 +321,9 @@ begin
       Stack.Add(AStarts[StartIndex]);
       while Stack.Count > 0 do
       begin
-        Id := Stack[Stack.Count - 1];
+        Inc(Steps);
+      if (Steps and $3FF) = 1 then CheckDeadline(ADeadline);
+      Id := Stack[Stack.Count - 1];
         Stack.Delete(Stack.Count - 1);
         if Visited.ContainsKey(Id) then Continue;
         Visited.Add(Id, True);
@@ -377,19 +403,39 @@ end;
 { The target of an annotated tag that names a commit or another tag; ''
   for tags of trees and blobs, which never lead to a commit. }
 function ParseTagTarget(const AId: string; const AData: AnsiString): string;
-var LineEnd: Integer; Line, Kind: string;
+var
+  Lines: array[0..2] of string;
+  Start, Stop, i: Integer;
+  Kind: string;
 begin
-  Result := '';
-  LineEnd := Pos(#10, AData);
-  Line := Copy(AData, 1, LineEnd - 1);
-  if (LineEnd = 0) or (Copy(Line, 1, 7) <> 'object ')
-     or not IsLowerObjectId(Copy(Line, 8, MaxInt)) then
+  { A tag object starts with exactly `object <id>`, `type <kind>`, and
+    `tag <name>`, the headers git's own fsck requires. }
+  Start := 1;
+  for i := 0 to 2 do
+  begin
+    Stop := Start;
+    while (Stop <= Length(AData)) and (AData[Stop] <> #10) do Inc(Stop);
+    if Stop > Length(AData) then
+      raise EGitPackError.CreateFmt('tag %s is malformed', [AId]);
+    Lines[i] := Copy(AData, Start, Stop - Start);
+    Start := Stop + 1;
+  end;
+  if (Copy(Lines[0], 1, 7) <> 'object ')
+     or not IsLowerObjectId(Copy(Lines[0], 8, MaxInt)) then
     raise EGitPackError.CreateFmt('tag %s has a malformed object line',
       [AId]);
-  Kind := Copy(AData, LineEnd + 1, MaxInt);
-  Kind := Copy(Kind, 1, Pos(#10, Kind) - 1);
-  if (Kind = 'type commit') or (Kind = 'type tag') then
-    Result := Copy(Line, 8, MaxInt);
+  Kind := Copy(Lines[1], 6, MaxInt);
+  if (Copy(Lines[1], 1, 5) <> 'type ')
+     or not ((Kind = 'commit') or (Kind = 'tree') or (Kind = 'blob')
+       or (Kind = 'tag')) then
+    raise EGitPackError.CreateFmt('tag %s has a malformed type line', [AId]);
+  if (Copy(Lines[2], 1, 4) <> 'tag ') or (Length(Lines[2]) <= 4) then
+    raise EGitPackError.CreateFmt('tag %s has a malformed tag line', [AId]);
+  { Tags of trees and blobs never lead to a commit. }
+  if (Kind = 'commit') or (Kind = 'tag') then
+    Result := Copy(Lines[0], 8, MaxInt)
+  else
+    Result := '';
 end;
 
 { Pack reader }
@@ -734,6 +780,7 @@ begin
     wait on it by offset or by id, in whatever order they appeared. }
   while Head < Tail do
   begin
+    if (Head and $3F) = 0 then CheckDeadline(FLimits.Deadline);
     Index := Queue[Head];
     Inc(Head);
     ApplyWaiters(FOffsetWaiters[Index], Index);
@@ -790,6 +837,7 @@ begin
   Pos := PACK_HEADER_BYTES;
   for i := 1 to Integer(Count) do
   begin
+    if (i and $3F) = 1 then CheckDeadline(FLimits.Deadline);
     if Length(FOffsetWaiters) <= FEntryCount then
     begin
       SetLength(FOffsetWaiters, 2 * Length(FOffsetWaiters) + 16);

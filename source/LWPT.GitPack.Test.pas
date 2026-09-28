@@ -42,6 +42,8 @@ type
     procedure TestWalkFindsReachingStart;
     procedure TestWalkStopsAtMissingCommits;
     procedure TestWalkFollowsVerifiedTagObjects;
+    procedure TestRejectsIncompleteTagHeaders;
+    procedure TestParsingAndWalkingHonourTheDeadline;
   end;
 
 { Pack construction helpers. Entries are assembled by hand so each hostile
@@ -553,6 +555,60 @@ begin
     DefaultGitPackLimits, 'malformed object line')).ToBe(True);
 end;
 
+procedure TGitPackTests.TestRejectsIncompleteTagHeaders;
+var Target: string;
+begin
+  { git hash-object -t tag rejects each of these; so does the reader,
+    instead of skipping them or adding an edge. }
+  Target := GitObjectId('commit', CommitText([], 1, 'x'));
+  Expect<Boolean>(ReadFails(AssemblePack([WholeEntry(4,
+    'object ' + Target + #10 + 'tag v1'#10#10)]),
+    DefaultGitPackLimits, 'malformed')).ToBe(True);
+  Expect<Boolean>(ReadFails(AssemblePack([WholeEntry(4,
+    'object ' + Target + #10 + 'type bogus'#10 + 'tag v1'#10#10)]),
+    DefaultGitPackLimits, 'malformed')).ToBe(True);
+  Expect<Boolean>(ReadFails(AssemblePack([WholeEntry(4,
+    'object ' + Target + #10 + 'type commit'#10
+    + 'tagger A <a@example.invalid> 1 +0000'#10#10)]),
+    DefaultGitPackLimits, 'malformed')).ToBe(True);
+end;
+
+procedure TGitPackTests.TestParsingAndWalkingHonourTheDeadline;
+var
+  Limits: TGitPackLimits;
+  Graph: TGitCommitGraph;
+  Raised: Boolean;
+begin
+  { A deadline already in the past stops parsing, even for a valid pack
+    that arrived in time. }
+  Limits := DefaultGitPackLimits;
+  Limits.Deadline := 1;
+  Raised := False;
+  try
+    ReadCommitPack(ReadFileBytes(FIXTURE_DIR + 'commits-ofs.pack'),
+      Limits).Free;
+  except
+    on E: EGitPackDeadlineExceeded do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  { And the walk. }
+  Graph := ReadCommitPack(ReadFileBytes(FIXTURE_DIR + 'commits-ofs.pack'),
+    DefaultGitPackLimits);
+  try
+    Raised := False;
+    try
+      Graph.FindReachingStart([FixtureCommit('c6')], FixtureCommit('c1'), 1);
+    except
+      on E: EGitPackDeadlineExceeded do Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Integer>(Graph.FindReachingStart([FixtureCommit('c6')],
+      FixtureCommit('c1'), GetTickCount64 + 60000)).ToBe(0);
+  finally
+    Graph.Free;
+  end;
+end;
+
 procedure TGitPackTests.SetupTests;
 begin
   Test('reads an OFS_DELTA commit pack written by git',
@@ -592,6 +648,10 @@ begin
     TestWalkFindsReachingStart);
   Test('walk peels through hash-verified tag objects',
     TestWalkFollowsVerifiedTagObjects);
+  Test('rejects tag objects with missing or unknown headers',
+    TestRejectsIncompleteTagHeaders);
+  Test('parsing and walking stop at the deadline',
+    TestParsingAndWalkingHonourTheDeadline);
   Test('walk never crosses commits missing from the pack',
     TestWalkStopsAtMissingCommits);
 end;

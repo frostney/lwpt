@@ -36,6 +36,7 @@ type
       ADependencies: string);
     procedure WriteReachRefs(const AExtra: string);
     procedure StripReachableFrom(const ARoot: string);
+    procedure SetReachableFrom(const ARoot, AValue: string);
     procedure ResetRequests;
     function RunLwptIn(const ARoot: string;
       const AArguments: array of string): TLwptResult;
@@ -53,6 +54,9 @@ type
     procedure TestAddOfForkOnlyCommitKeepsManifest;
     procedure TestUnmarkedLockedPinIsProvenAgain;
     procedure TestMixedAbbreviatedPinIsRefused;
+    procedure TestMixedPinWithLyingPeelIsRefused;
+    procedure TestMixedPinRecordsItsProof;
+    procedure TestInvalidProvenanceIsProvenAgain;
   end;
 
 function TInstallCommitPin.Commit(const AName: string): string;
@@ -116,6 +120,21 @@ begin
     + 'tag|v0.1.0|' + Commit('c2') + '|'#10
     + 'tag|v0.2.0|' + Commit('v0.2.0-tag') + '|' + Commit('c4') + #10
     + AExtra);
+end;
+
+procedure TInstallCommitPin.SetReachableFrom(const ARoot, AValue: string);
+var Lines: TStringList; i: Integer;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ARoot + '/lwpt.lock');
+    for i := 0 to Lines.Count - 1 do
+      if Pos('reachableFrom = ', Lines[i]) = 1 then
+        Lines[i] := 'reachableFrom = "' + AValue + '"';
+    Lines.SaveToFile(ARoot + '/lwpt.lock');
+  finally
+    Lines.Free;
+  end;
 end;
 
 procedure TInstallCommitPin.StripReachableFrom(const ARoot: string);
@@ -374,6 +393,99 @@ begin
   Expect<Boolean>(FileExists(Root + '/lwpt.lock')).ToBe(False);
 end;
 
+procedure TInstallCommitPin.TestMixedPinWithLyingPeelIsRefused;
+const
+  PINNER_COMMIT = '2345678901234567890123456789012345678901';
+var Root: string; Run: TLwptResult;
+begin
+  { The root names tag v0.2.0; a dependency pins the fork-only f1 by SHA.
+    The listing's peel line claims v0.2.0 peels to f1, so the resolver's
+    tag selection agrees with the pin. The SHA requirement must still be
+    proven, and the hash-verified tag object points at c4. }
+  WriteTextFile(FFixtureRoot + '/refs/pinner.refs',
+    'tag|v1.0.0|' + PINNER_COMMIT + '|'#10);
+  WritePackageArchive('pinner', PINNER_COMMIT,
+    'reach = "fixture/reach@' + Commit('f1') + '"'#10);
+  WriteTextFile(FFixtureRoot + '/refs/reach.refs',
+    'branch|main|' + Commit('c6') + '|'#10
+    + 'branch|release/0.1|' + Commit('r2') + '|'#10
+    + 'tag|v0.1.0|' + Commit('c2') + '|'#10
+    + 'tag|v0.2.0|' + Commit('v0.2.0-tag') + '|' + Commit('f1') + #10);
+  try
+    Root := FScratch + '/mixed-lying-peel';
+    WriteRoot(Root, 'reach = "fixture/reach@v0.2.0"'#10
+      + 'pinner = "fixture/pinner@1.0.0"'#10);
+    ResetRequests;
+    Run := RunLwptIn(Root, ['install']);
+    Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+    Expect<Boolean>(Pos('is not reachable', Run.Stderr) > 0).ToBe(True);
+    { Round one stages the tag alone (the SHA arrives with pinner), so a
+      candidate archive may already be fetched; nothing is published. }
+    Expect<Boolean>(FileExists(Root + '/lwpt.lock')).ToBe(False);
+    Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/reach'))
+      .ToBe(False);
+  finally
+    WriteReachRefs('');
+  end;
+end;
+
+procedure TInstallCommitPin.TestMixedPinRecordsItsProof;
+const
+  PINNER_COMMIT = '3456789012345678901234567890123456789012';
+var Root: string; Run: TLwptResult;
+begin
+  { Honest listing: the tag and the SHA agree on c4. The SHA requirement is
+    proven like a lone pin and the lock records the proof. }
+  WriteTextFile(FFixtureRoot + '/refs/pinner2.refs',
+    'tag|v1.0.0|' + PINNER_COMMIT + '|'#10);
+  WritePackageArchive('pinner2', PINNER_COMMIT,
+    'reach = "fixture/reach@' + Commit('c4') + '"'#10);
+  WriteArchive(Commit('c4'));
+  Root := FScratch + '/mixed-proof';
+  WriteRoot(Root, 'reach = "fixture/reach@v0.2.0"'#10
+    + 'pinner2 = "fixture/pinner2@1.0.0"'#10);
+  Run := RunLwptIn(Root, ['install']);
+  DumpRunFailure('mixed proof', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('reachableFrom = "refs/tags/v0.2.0"',
+    ReadBinaryFile(Root + '/lwpt.lock')) > 0).ToBe(True);
+  { Without the marker a mixed entry is unproven too. }
+  StripReachableFrom(Root);
+  ResetRequests;
+  Run := RunLwptIn(Root, ['install', '--frozen']);
+  DumpRunFailure('mixed frozen', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('without a reachability proof', Run.Stderr) > 0)
+    .ToBe(True);
+end;
+
+procedure TInstallCommitPin.TestInvalidProvenanceIsProvenAgain;
+var Root: string; Run: TLwptResult;
+begin
+  { A marker naming a ref outside refs/heads/* and refs/tags/* proves
+    nothing: warn offline, prove again online. }
+  Root := FScratch + '/invalid-provenance';
+  WriteRoot(Root, 'reach = "fixture/reach@' + Commit('f1') + '"'#10);
+  WriteReachRefs('branch|feature|' + Commit('f1') + '|'#10);
+  try
+    Run := RunLwptIn(Root, ['install']);
+    DumpRunFailure('invalid provenance seed', Run, 0);
+    Expect<Integer>(Run.ExitCode).ToBe(0);
+  finally
+    WriteReachRefs('');
+  end;
+  SetReachableFrom(Root, 'refs/pull/1/head');
+  ResetRequests;
+  Run := RunLwptIn(Root, ['install', '--offline']);
+  DumpRunFailure('invalid provenance offline', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('without a reachability proof', Run.Stderr) > 0)
+    .ToBe(True);
+  Run := RunLwptIn(Root, ['install']);
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('is not reachable', Run.Stderr) > 0).ToBe(True);
+end;
+
 procedure TInstallCommitPin.SetupTests;
 begin
   Test('a pin to an older reachable commit installs',
@@ -394,6 +506,12 @@ begin
     TestUnmarkedLockedPinIsProvenAgain);
   Test('an abbreviated pin is refused beside a named requirement',
     TestMixedAbbreviatedPinIsRefused);
+  Test('a SHA pin beside a tag is proven, whatever the peel claims',
+    TestMixedPinWithLyingPeelIsRefused);
+  Test('a SHA pin beside a tag records its proof',
+    TestMixedPinRecordsItsProof);
+  Test('a proof marker outside branches and tags is proven again',
+    TestInvalidProvenanceIsProvenAgain);
 end;
 
 begin

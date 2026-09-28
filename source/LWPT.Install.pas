@@ -1560,21 +1560,24 @@ end;
   lockfile writer and the manifest editor can't drift apart. }
 
 { Frozen and offline installs never contact the host, so they cannot prove
-  a commit-SHA pin. A lock entry without `reachableFrom` was written before
-  proofs existed (or by hand); it is still installed from its hashes, but
-  the user is told it is unproven (ADR-0047). }
+  a commit-SHA pin. A lock entry without a valid `reachableFrom` (a ref
+  under refs/heads/ or refs/tags/) was written before proofs existed, or by
+  hand; it is still installed from its hashes, but the user is told it is
+  unproven (ADR-0047). }
 procedure WarnUnprovenPin(const AMode, AName: string;
   const AKinds: array of TVersionKind; ASrcKind: TSourceKind;
   const AEntry: TResolved);
-var k: Integer; ShaOnly: Boolean; Commit: string;
+var k: Integer; HasCommitPin: Boolean; Commit: string;
 begin
-  if (ASrcKind <> skGitHost) or (AEntry.ReachableFrom <> '') then Exit;
+  if (ASrcKind <> skGitHost) or IsProvingRefName(AEntry.ReachableFrom) then
+    Exit;
   Commit := AEntry.CommitSHA;
   if Commit = '' then Commit := AEntry.Version;
-  ShaOnly := Length(AKinds) > 0;
+  { Any SHA requirement, alone or beside a named one, needs a proof. }
+  HasCommitPin := False;
   for k := 0 to High(AKinds) do
-    ShaOnly := ShaOnly and (AKinds[k] = vkCommitSha);
-  if not ShaOnly then Exit;
+    HasCommitPin := HasCommitPin or (AKinds[k] = vkCommitSha);
+  if not HasCommitPin then Exit;
   WriteLn(ErrOutput, 'warning: ', AMode, ' lock entry for "', AName,
     '" pins commit ', LowerCase(Commit), ' without a ',
     'reachability proof; run `', PROGRAM_NAME, ' install` online to prove ',
@@ -2950,8 +2953,7 @@ var
       `reachableFrom` predates proofs and is proven now. }
     if FindPriorLock(ANode, Entry)
        and SameText(LockedCommitIdentity(Entry), ACommit)
-       and (Entry.ReachableFrom <> '')
-       and IsValidGitRefName(Entry.ReachableFrom) then
+       and IsProvingRefName(Entry.ReachableFrom) then
       Exit(Entry.ReachableFrom);
     Refs := CachedRefs(ANode);
     WriteLn('  verifying commit ', LowerCase(ACommit), ' for ', ANode.Name,
@@ -2989,6 +2991,14 @@ var
       ' requests, ', Outcome.BytesReceived, ' bytes)');
     Result := Outcome.ProvingRef;
     VerifiedPins.Values[RepoURL + '@' + LowerCase(ACommit)] := Result;
+  end;
+
+  function NodeHasCommitPin(const ANode: TResolveNode): Boolean;
+  var k: Integer;
+  begin
+    Result := False;
+    for k := 0 to High(ANode.Kinds) do
+      Result := Result or (ANode.Kinds[k] = vkCommitSha);
   end;
 
   function SelectNode(const ANode: TResolveNode): TSelectionState;
@@ -3078,9 +3088,15 @@ var
           { The fetch that follows must reproduce the locked archive bytes
             (ExpectedVerifyHash), so an unreachable advertisement cannot be
             used to smuggle different content in under the locked identity. }
+          { A SHA requirement cannot fall back on an entry that never
+            recorded a proof: without the listing it cannot be proven. }
+          if NodeHasCommitPin(ANode)
+             and not IsProvingRefName(PriorEntry.ReachableFrom) then
+            raise;
           Result.RefName := PriorEntry.Version;
           Result.CommitSHA := PriorEntry.CommitSHA;
           Result.RefKind := PriorEntry.RefKind;
+          Result.ReachableFrom := PriorEntry.ReachableFrom;
           WriteLn(ErrOutput, 'warning: tag resolution for ', ANode.Name,
             ' failed: ', E.Message, '; reusing verified lockfile identity');
           Exit;
@@ -3100,6 +3116,15 @@ var
     Result.CommitSHA := Selection.CommitSHA;
     Result.RefKind := SelectedRefKind(ANode, Refs, Selection);
     RejectMovedRef(ANode, Result);
+    { A SHA requirement beside named ones selects the same commit as the
+      named ref, but only through the listing's (possibly peeled) claim.
+      It is proven exactly like a lone pin (ADR-0047). }
+    for k := 0 to High(ANode.Kinds) do
+      if ANode.Kinds[k] = vkCommitSha then
+      begin
+        Result.ReachableFrom := VerifyCommitPin(ANode, ANode.Specs[k]);
+        Break;
+      end;
   end;
 
   procedure EnqueueNode(AIndex: Integer);
@@ -3478,6 +3503,10 @@ begin
         Stable := Stable
           and (Desired[i].RefName = R.Nodes[i].Version)
           and SameText(Desired[i].CommitSHA, R.Nodes[i].CommitSHA);
+        { The node may have been staged before a later round added a SHA
+          requirement; the proof belongs to the complete requirement set. }
+        if SameText(Desired[i].CommitSHA, R.Nodes[i].CommitSHA) then
+          R.Nodes[i].ReachableFrom := Desired[i].ReachableFrom;
       end;
       if not Stable then
       begin

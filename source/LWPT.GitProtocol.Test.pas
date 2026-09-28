@@ -97,6 +97,7 @@ type
       const ABudget: TGitRequestBudget): TBytes;
   public
     DelayMilliseconds: Cardinal;
+    DatesResponse: TBytes;
     Budgets: array of TGitRequestBudget;
     constructor Create(const AAdvertisement, ALsRefs, AFetch: TBytes);
     function Advertise(const ARepoURL: string; out AEffectiveRepoURL: string;
@@ -122,6 +123,9 @@ type
     procedure TestMissingNakIsAProtocolError;
     procedure TestProofSharesOneDeadline;
     procedure TestProofSharesOneByteBudget;
+    procedure TestDateFetchInvalidPackFailsTheProof;
+    procedure TestDateFetchRefusalIsTolerated;
+    procedure TestAckForUnofferedObjectIsRefused;
     procedure TestCommitProvenFromNearestTag;
     procedure TestOldCommitProvenFromNearestTag;
     procedure TestLsRefsTipNeedsNoFetch;
@@ -149,6 +153,12 @@ type
     procedure TestLsRefsDeduplicatesLinearly;
     procedure TestLsRefsEnforcesCountLimits;
     procedure TestRequestSizeIsCapped;
+    procedure TestRequestSizeCountsTheFlush;
+    procedure TestAcknowledgmentsAreValidated;
+    procedure TestLegacyListingRejectsInvalidNames;
+    procedure TestLegacyListingRejectsMalformedFraming;
+    procedure TestLegacyListingIndexesPeelsLinearly;
+    procedure TestLegacyListingEnforcesLimits;
   end;
 
   THTTPTransportTests = class(TTestSuite)
@@ -156,6 +166,7 @@ type
     procedure SetupTests; override;
     procedure TestCommandPostsProtocolV2Request;
     procedure TestOversizedBodyIsRefused;
+    procedure TestRedirectBodiesCountAgainstTheBudget;
   end;
 
   TLiveReachabilityTests = class(TTestSuite)
@@ -377,6 +388,9 @@ function TCannedTransport.Command(const ARepoURL: string;
 begin
   if IsLsRefsRequest(ARequest) then
     Result := Answer(FLsRefs, ABudget)
+  else if (Length(DatesResponse) > 0)
+     and (Pos('deepen 1', Text(ARequest)) > 0) then
+    Result := Answer(DatesResponse, ABudget)
   else
     Result := Answer(FFetch, ABudget);
 end;
@@ -720,6 +734,84 @@ begin
   end;
 end;
 
+function TwoTipHost(const AFetch: AnsiString): TCannedTransport;
+begin
+  Result := TCannedTransport.Create(
+    Bytes(PktLine('version 2') + PktLine('ls-refs')
+      + PktLine('fetch=shallow filter') + PktFlush),
+    Bytes(PktLine(StringOfChar('6', 40) + ' refs/heads/main')
+      + PktLine(StringOfChar('7', 40) + ' refs/tags/v1') + PktFlush),
+    Bytes(AFetch));
+end;
+
+function ProofError(ATransport: TGitUploadPackTransport;
+  out AOutcome: TGitReachabilityResult): string;
+begin
+  Result := '';
+  AOutcome := Default(TGitReachabilityResult);
+  try
+    AOutcome := ProveCommitReachable(ATransport, REPO_URL,
+      StringOfChar('3', 40), nil);
+  except
+    on E: EGitReachabilityError do Result := E.Message;
+  end;
+end;
+
+procedure TReachabilityTests.TestDateFetchInvalidPackFailsTheProof;
+var Transport: TCannedTransport; Outcome: TGitReachabilityResult;
+  Message: string;
+begin
+  { The date fetch only orders probes, but its pack is still evidence the
+    host sent: a pack that fails validation fails the proof instead of
+    being skipped. }
+  Transport := TwoTipHost(PktLine('acknowledgments') + PktLine('NAK')
+    + PktFlush);
+  try
+    Transport.DatesResponse := Bytes(PktLine('packfile')
+      + LowerCase(IntToHex(4 + 1 + 32, 4)) + #1 + 'PACK'
+      + StringOfChar(#0, 28) + PktFlush);
+    Message := ProofError(Transport, Outcome);
+  finally
+    Transport.Free;
+  end;
+  Expect<Boolean>(Pos('invalid pack', Message) > 0).ToBe(True);
+end;
+
+procedure TReachabilityTests.TestDateFetchRefusalIsTolerated;
+var Transport: TCannedTransport; Outcome: TGitReachabilityResult;
+  Message: string;
+begin
+  { A host that refuses the optional shallow fetch (an ERR line) only
+    leaves the probes unordered. }
+  Transport := TwoTipHost(PktLine('acknowledgments') + PktLine('NAK')
+    + PktFlush);
+  try
+    Transport.DatesResponse := Bytes(PktLine('ERR upload-pack: deepen '
+      + 'is not supported'));
+    Message := ProofError(Transport, Outcome);
+  finally
+    Transport.Free;
+  end;
+  Expect<string>(Message).ToBe('');
+  Expect<Boolean>(Outcome.Known).ToBe(False);
+end;
+
+procedure TReachabilityTests.TestAckForUnofferedObjectIsRefused;
+var Transport: TCannedTransport; Outcome: TGitReachabilityResult;
+  Message: string;
+begin
+  { The probe offered only the pin as a have; an ACK for anything else is
+    not an answer to that request. }
+  Transport := TwoTipHost(PktLine('acknowledgments')
+    + PktLine('ACK ' + StringOfChar('9', 40)) + PktFlush);
+  try
+    Message := ProofError(Transport, Outcome);
+  finally
+    Transport.Free;
+  end;
+  Expect<Boolean>(Pos('not offered', Message) > 0).ToBe(True);
+end;
+
 procedure TReachabilityTests.SetupTests;
 begin
   Test('a pin equal to an advertised tip needs no request',
@@ -736,6 +828,12 @@ begin
     TestProofSharesOneDeadline);
   Test('all responses of a proof share one byte budget',
     TestProofSharesOneByteBudget);
+  Test('an invalid pack from the date fetch fails the proof',
+    TestDateFetchInvalidPackFailsTheProof);
+  Test('a host refusing the date fetch leaves probes unordered',
+    TestDateFetchRefusalIsTolerated);
+  Test('an ACK for an object that was not offered is refused',
+    TestAckForUnofferedObjectIsRefused);
   Test('a commit below a tag is proven from the nearest tag',
     TestCommitProvenFromNearestTag);
   Test('an old commit is proven from the first tag after it',
@@ -1035,6 +1133,144 @@ begin
     'fetch', Arguments)) <= MAX_UPLOAD_PACK_REQUEST_BYTES).ToBe(True);
 end;
 
+procedure TProtocolMessageTests.TestRequestSizeCountsTheFlush;
+var
+  Arguments: array of string;
+  Base, Count, Rest, i: Integer;
+  Request: TBytes;
+  Raised: Boolean;
+begin
+  { Arguments that bring the body to two bytes under the limit before the
+    closing flush: with the flush the request is over the limit. }
+  Base := Length(PktLine('command=fetch')) + Length(PktDelim);
+  Count := (MAX_UPLOAD_PACK_REQUEST_BYTES - Base - 16) div 1005;
+  Rest := MAX_UPLOAD_PACK_REQUEST_BYTES - Base - 1005 * Count;
+  SetLength(Arguments, Count + 1);
+  for i := 0 to Count - 1 do Arguments[i] := StringOfChar('x', 1000);
+  Arguments[Count] := StringOfChar('y', Rest - 2 - 5);
+  Raised := False;
+  Request := nil;
+  try
+    Request := BuildV2CommandRequest(Default(TGitV2Capabilities), 'fetch',
+      Arguments);
+  except
+    on E: EGitReachabilityError do Raised := True;
+  end;
+  Expect<Boolean>(Raised or (Length(Request) <= MAX_UPLOAD_PACK_REQUEST_BYTES))
+    .ToBe(True);
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TProtocolMessageTests.TestAcknowledgmentsAreValidated;
+
+  function Fails(const AResponse: AnsiString): Boolean;
+  var Body: TBytes;
+  begin
+    Body := Bytes(AResponse);
+    Result := False;
+    try
+      ParseFetchResponse(Body);
+    except
+      on E: EGitReachabilityError do Result := True;
+    end;
+  end;
+
+var Body: TBytes; Response: TGitFetchResponse;
+begin
+  Expect<Boolean>(Fails(Pkt('acknowledgments') + Pkt('ACK garbage')
+    + PktFlush)).ToBe(True);
+  Expect<Boolean>(Fails(Pkt('acknowledgments') + Pkt('ACK '
+    + StringOfChar('a', 40)) + Pkt('NAK') + PktFlush)).ToBe(True);
+  Body := Bytes(Pkt('acknowledgments') + Pkt('ACK ' + StringOfChar('a', 40))
+    + PktFlush);
+  Response := ParseFetchResponse(Body);
+  Expect<Integer>(Length(Response.AckedIds)).ToBe(1);
+  Expect<string>(Response.AckedIds[0]).ToBe(StringOfChar('a', 40));
+end;
+
+function LegacyLine(const S: string): AnsiString;
+begin
+  Result := LowerCase(IntToHex(Length(S) + 5, 4)) + S + #10;
+end;
+
+function LegacyFails(const APayload: AnsiString): Boolean;
+begin
+  Result := False;
+  try
+    ParseInfoRefs(APayload);
+  except
+    on E: EGitProtocolError do Result := True;
+  end;
+end;
+
+procedure TProtocolMessageTests.TestLegacyListingRejectsInvalidNames;
+begin
+  Expect<Boolean>(LegacyFails(LegacyLine('# service=git-upload-pack')
+    + '0000' + LegacyLine(StringOfChar('1', 40) + ' refs/tags/v1'#27'[2J')
+    + '0000')).ToBe(True);
+  Expect<Boolean>(LegacyFails(LegacyLine(StringOfChar('1', 40)
+    + ' refs/heads/a..b') + '0000')).ToBe(True);
+  { Fork namespaces are dropped, not validated. }
+  Expect<Boolean>(LegacyFails(LegacyLine(StringOfChar('1', 40)
+    + ' refs/pull/1/head') + LegacyLine(StringOfChar('2', 40)
+    + ' refs/tags/v1') + '0000')).ToBe(False);
+end;
+
+procedure TProtocolMessageTests.TestLegacyListingRejectsMalformedFraming;
+begin
+  Expect<Boolean>(LegacyFails(LegacyLine(StringOfChar('1', 40)
+    + ' refs/tags/v1') + 'zzzz')).ToBe(True);
+  Expect<Boolean>(LegacyFails(LegacyLine(StringOfChar('1', 40)
+    + ' refs/tags/v1') + '00ff' + 'short')).ToBe(True);
+  Expect<Boolean>(LegacyFails(LegacyLine(StringOfChar('1', 40)
+    + ' refs/tags/v1') + '0003')).ToBe(True);
+end;
+
+function LegacyTags(ACount: Integer; APeeled: Boolean): AnsiString;
+var Text, Line: AnsiString; i, n: Integer; Name: string;
+begin
+  SetLength(Text, ACount * 150 + 8);
+  n := 0;
+  for i := 1 to ACount do
+  begin
+    Name := 'refs/tags/t' + Format('%.7d', [i]);
+    Line := LegacyLine(LowerCase(IntToHex(i, 40)) + ' ' + Name);
+    if APeeled then
+      Line := Line + LegacyLine(LowerCase(IntToHex(i + 1, 40)) + ' ' + Name
+        + '^{}');
+    Move(Line[1], Text[n + 1], Length(Line));
+    Inc(n, Length(Line));
+  end;
+  Text[n + 1] := '0'; Text[n + 2] := '0'; Text[n + 3] := '0';
+  Text[n + 4] := '0';
+  SetLength(Text, n + 4);
+  Result := Text;
+end;
+
+procedure TProtocolMessageTests.TestLegacyListingIndexesPeelsLinearly;
+var Refs: TGitRefArray; Started: QWord;
+begin
+  { 15,000 annotated tags with peel lines: each peel is found by index,
+    not by scanning every earlier tag. }
+  Started := GetTickCount64;
+  Refs := ParseInfoRefs(LegacyTags(15000, True));
+  Expect<Integer>(Length(Refs)).ToBe(15000);
+  Expect<string>(Refs[14999].PeeledSHA).ToBe(LowerCase(IntToHex(15001, 40)));
+  Expect<Boolean>(GetTickCount64 - Started < 2000).ToBe(True);
+end;
+
+procedure TProtocolMessageTests.TestLegacyListingEnforcesLimits;
+var Message: string;
+begin
+  Message := '';
+  try
+    ParseInfoRefs(LegacyTags(MAX_PROOF_TIPS + 1, False));
+  except
+    on E: EGitProtocolError do Message := E.Message;
+  end;
+  Expect<Boolean>(Pos('distinct', Message) > 0).ToBe(True);
+end;
+
 procedure TProtocolMessageTests.SetupTests;
 begin
   Test('pkt-lines and v2 command requests are framed exactly',
@@ -1063,6 +1299,18 @@ begin
     TestLsRefsEnforcesCountLimits);
   Test('upload-pack request bodies are capped',
     TestRequestSizeIsCapped);
+  Test('the request cap includes the closing flush',
+    TestRequestSizeCountsTheFlush);
+  Test('acknowledgments must be well-formed and consistent',
+    TestAcknowledgmentsAreValidated);
+  Test('the legacy listing rejects invalid branch and tag names',
+    TestLegacyListingRejectsInvalidNames);
+  Test('the legacy listing rejects malformed framing',
+    TestLegacyListingRejectsMalformedFraming);
+  Test('the legacy listing indexes peel lines in linear time',
+    TestLegacyListingIndexesPeelsLinearly);
+  Test('the legacy listing enforces the distinct-tip limit',
+    TestLegacyListingEnforcesLimits);
 end;
 
 { THTTPTransportTests }
@@ -1145,12 +1393,59 @@ begin
     .ToBe(True);
 end;
 
+procedure THTTPTransportTests.TestRedirectBodiesCountAgainstTheBudget;
+var
+  Final, Hop: TMockHTTPServer;
+  Transport: THTTPGitUploadPackTransport;
+  Budget: TGitRequestBudget;
+  Message, Effective: string;
+begin
+  { A 600-byte redirect body and a 100-byte final body: each fits a
+    650-byte allowance alone, together they do not. }
+  Final := TMockHTTPServer.Create(MockResponse(StringOfChar('f', 100)));
+  try
+    Final.Start;
+    Hop := TMockHTTPServer.Create(Bytes('HTTP/1.1 302 Found'#13#10
+      + 'Location: http://127.0.0.1:' + IntToStr(Final.Port)
+      + '/moved/reach.git/info/refs?service=git-upload-pack'#13#10
+      + 'Content-Length: 600'#13#10 + 'Connection: close'#13#10#13#10
+      + StringOfChar('r', 600)));
+    try
+      Hop.Start;
+      Transport := THTTPGitUploadPackTransport.Create(
+        DefaultHTTPRequestOptions);
+      Budget := FullBudget;
+      Budget.MaxResponseBytes := 650;
+      Message := '';
+      try
+        try
+          Transport.Advertise('http://127.0.0.1:' + IntToStr(Hop.Port)
+            + '/fixture/reach.git', Effective, Budget);
+        except
+          on E: EGitResponseTooLarge do Message := E.Message;
+        end;
+      finally
+        Transport.Free;
+      end;
+      Hop.WaitDone;
+    finally
+      Hop.Free;
+    end;
+    Final.WaitDone(2000);
+  finally
+    Final.Free;
+  end;
+  Expect<Boolean>(Pos('650', Message) > 0).ToBe(True);
+end;
+
 procedure THTTPTransportTests.SetupTests;
 begin
   Test('commands are POSTed to git-upload-pack as protocol v2',
     TestCommandPostsProtocolV2Request);
   Test('a response over the cap is refused as too large',
     TestOversizedBodyIsRefused);
+  Test('redirect bodies count against the request budget',
+    TestRedirectBodiesCountAgainstTheBudget);
 end;
 
 { TLiveReachabilityTests }

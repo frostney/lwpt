@@ -40,8 +40,8 @@ program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
 program	*	source/LWPT.FetchPolicy.Test.pas	1	10
 program	*	source/LWPT.Formatter.Test.pas	5	35
-program	*	source/LWPT.GitPack.Test.pas	1	20
-program	*	source/LWPT.GitProtocol.Test.pas	4	33
+program	*	source/LWPT.GitPack.Test.pas	1	22
+program	*	source/LWPT.GitProtocol.Test.pas	4	43
 program	*	source/LWPT.Health.Test.pas	1	11
 program	*	source/LWPT.TestArtifactSet.Test.pas	1	7
 program	*	source/LWPT.TestInventory.Test.pas	1	7
@@ -81,7 +81,7 @@ program	*	tests/integration/Duplication.Test.pas	1	6
 program	*	tests/integration/ExtractPathological.Test.pas	2	14
 program	*	tests/integration/Hooks.Test.pas	1	11
 program	*	tests/integration/Init.Test.pas	1	21
-program	*	tests/integration/InstallCommitPin.Test.pas	1	9
+program	*	tests/integration/InstallCommitPin.Test.pas	1	12
 program	*	tests/integration/InstallFetchFailure.Test.pas	4	24
 program	*	tests/integration/InstallGitGraph.Test.pas	1	29
 program	*	tests/integration/InstallGraphConflict.Test.pas	1	20

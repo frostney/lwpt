@@ -94,6 +94,9 @@ type
   EGitResponseTooLarge = class(EGitReachabilityError);
   { The proof's single monotonic deadline passed. }
   EGitProofDeadlineExceeded = class(EGitReachabilityError);
+  { The host answered with an ERR line or side-band error: it declined the
+    request. The only failure an optional request may absorb. }
+  EGitRemoteError = class(EGitReachabilityError);
 
   { What one request may still spend of its proof's shared budget. }
   TGitRequestBudget = record
@@ -107,6 +110,11 @@ type
     EGitResponseTooLarge rather than truncating it. }
   TGitUploadPackTransport = class
   public
+    { Bytes the last call received across every HTTP hop, including the
+      bodies of redirects it followed; 0 when it only returned its result.
+      The prover resets it before each call and charges the larger of this
+      and the returned body against the proof's byte budget. }
+    LastTransferred: Int64;
     { Protocol v2 capability advertisement. AEffectiveRepoURL is the
       repository URL that later commands must use (it differs from
       ARepoURL when the advertisement request was redirected). }
@@ -178,6 +186,7 @@ type
 
   TGitFetchResponse = record
     Acknowledged: Boolean;  { an ACK line arrived }
+    AckedIds: TStringArray; { the ids the ACK lines named }
     Nak: Boolean;           { an explicit NAK arrived }
     Ready: Boolean;
     HasPack: Boolean;
@@ -211,6 +220,9 @@ const
   { Hostile-listing limits: ls-refs lines accepted, bytes in one ref name,
     and distinct tip commits a proof will name in its requests. }
   MAX_ADVERTISED_REFS = 100000;
+  { pkt-lines of any kind in a legacy (v0/v1) advertisement, whose lines
+    include refs/pull/* and other refs that are dropped. }
+  MAX_LEGACY_ADVERTISEMENT_LINES = 1000000;
   MAX_REF_NAME_LENGTH = 1024;
   MAX_PROOF_TIPS = 20000;
   { Largest request body a proof sends (MAX_PROOF_TIPS wants fit). }
@@ -242,6 +254,10 @@ function PktDelim: AnsiString;
   opening brace, empty or dot-led components, `.lock` components, or a
   trailing `/` or `.`) and at most MAX_REF_NAME_LENGTH bytes. }
 function IsValidGitRefName(const AName: string): Boolean;
+
+{ True for a valid full ref name under refs/heads/ or refs/tags/: the only
+  refs that can prove, or be recorded as having proven, a commit pin. }
+function IsProvingRefName(const AName: string): Boolean;
 
 function DefaultGitProofLimits: TGitProofLimits;
 
@@ -447,52 +463,93 @@ end;
 
 function ParseInfoRefs(const APayload: string): TGitRefArray;
 var
-  Offset, PktLen, BodyLen, N, i: Integer;
-  PktBody: string;
+  Offset, PktLen, BodyLen, N, Lines, Index: Integer;
+  PktBody, FullName, PeeledName: string;
   Ref: TGitRef;
-  PeeledName: string;
+  TagIndex: TDictionary<string, Integer>;
+  Ids: TDictionary<string, Boolean>;
 begin
   SetLength(Result, 0);
   Offset := 1;
   N := 0;
-  while Offset <= Length(APayload) do
-  begin
-    if not ReadPktLength(APayload, Offset, PktLen) then Break;
-    if PktLen = 0 then
+  Lines := 0;
+  TagIndex := TDictionary<string, Integer>.Create;
+  Ids := TDictionary<string, Boolean>.Create;
+  try
+    while Offset <= Length(APayload) do
     begin
-      { flush packet — section boundary. Advance past it and keep
-        reading; there may be a second section. }
-      Inc(Offset, PKT_PREFIX_LEN);
-      Continue;
-    end;
-    if PktLen < PKT_PREFIX_LEN then Break;
-    BodyLen := PktLen - PKT_PREFIX_LEN;
-    if Offset + PktLen - 1 > Length(APayload) then Break;
-    PktBody := Copy(APayload, Offset + PKT_PREFIX_LEN, BodyLen);
-    Inc(Offset, PktLen);
+      { The advertisement is hostile input: malformed framing fails the
+        listing instead of silently returning what parsed so far. }
+      if not ReadPktLength(APayload, Offset, PktLen) then
+        raise EGitProtocolError.Create(
+          'ref advertisement has an invalid pkt-line length');
+      Inc(Lines);
+      if Lines > MAX_LEGACY_ADVERTISEMENT_LINES then
+        raise EGitProtocolError.CreateFmt(
+          'ref advertisement has more than %d lines',
+          [MAX_LEGACY_ADVERTISEMENT_LINES]);
+      if PktLen = 0 then
+      begin
+        { flush packet — section boundary. Advance past it and keep
+          reading; there may be a second section. }
+        Inc(Offset, PKT_PREFIX_LEN);
+        Continue;
+      end;
+      if PktLen < PKT_PREFIX_LEN then
+        raise EGitProtocolError.Create(
+          'ref advertisement has an unexpected control pkt-line');
+      BodyLen := PktLen - PKT_PREFIX_LEN;
+      if Offset + PktLen - 1 > Length(APayload) then
+        raise EGitProtocolError.Create('ref advertisement is truncated');
+      PktBody := Copy(APayload, Offset + PKT_PREFIX_LEN, BodyLen);
+      Inc(Offset, PktLen);
 
-    { Skip the service-announce line and HEAD. }
-    if (Length(PktBody) >= 1) and (PktBody[1] = '#') then Continue;
+      { Skip the service-announce line and HEAD. }
+      if (Length(PktBody) >= 1) and (PktBody[1] = '#') then Continue;
 
-    if ParseRefLine(PktBody, Ref) then
-    begin
+      if not ParseRefLine(PktBody, Ref) then Continue;
+      if not IsFullGitObjectId(Ref.SHA) then
+        raise EGitProtocolError.Create(
+          'ref advertisement has a malformed object id');
       if (Ref.Kind = rkTag) and (Length(Ref.Name) > 3)
          and (Copy(Ref.Name, Length(Ref.Name) - 2, 3) = '^{}') then
       begin
+        { Indexed, not scanned: a listing of many annotated tags stays
+          linear. The peel is still only the host's claim. }
         PeeledName := Copy(Ref.Name, 1, Length(Ref.Name) - 3);
-        for i := 0 to High(Result) do
-          if (Result[i].Kind = rkTag) and (Result[i].Name = PeeledName) then
-          begin
-            Result[i].PeeledSHA := Ref.SHA;
-            Break;
-          end;
+        if TagIndex.TryGetValue(PeeledName, Index) then
+          Result[Index].PeeledSHA := Ref.SHA;
         Continue;
       end;
-      SetLength(Result, N + 1);
+      if Ref.Kind = rkTag then
+        FullName := 'refs/tags/' + Ref.Name
+      else
+        FullName := 'refs/heads/' + Ref.Name;
+      if not IsValidGitRefName(FullName) then
+        raise EGitProtocolError.Create(
+          'ref advertisement names an invalid branch or tag');
+      if N >= MAX_ADVERTISED_REFS then
+        raise EGitProtocolError.CreateFmt(
+          'ref advertisement has more than %d branches and tags',
+          [MAX_ADVERTISED_REFS]);
+      if not Ids.ContainsKey(LowerCase(Ref.SHA)) then
+      begin
+        if Ids.Count >= MAX_PROOF_TIPS then
+          raise EGitProtocolError.CreateFmt(
+            'ref advertisement has more than %d distinct branch and tag '
+            + 'tips', [MAX_PROOF_TIPS]);
+        Ids.Add(LowerCase(Ref.SHA), True);
+      end;
+      if N >= Length(Result) then SetLength(Result, 2 * N + 16);
       Result[N] := Ref;
+      if Ref.Kind = rkTag then TagIndex.AddOrSetValue(Ref.Name, N);
       Inc(N);
     end;
+  finally
+    Ids.Free;
+    TagIndex.Free;
   end;
+  SetLength(Result, N);
 end;
 
 function ListRemoteRefs(const ARepoURL: string;
@@ -631,6 +688,8 @@ var i, ComponentStart: Integer; C: Char; Component: string;
 begin
   Result := False;
   if (AName = '') or (Length(AName) > MAX_REF_NAME_LENGTH) then Exit;
+  { check-ref-format requires at least one slash (refs/<kind>/...). }
+  if Pos('/', AName) = 0 then Exit;
   if (AName[Length(AName)] = '/') or (AName[Length(AName)] = '.') then Exit;
   if (Pos('..', AName) > 0) or (Pos('@{', AName) > 0)
      or (Pos('//', AName) > 0) or (AName[1] = '/') or (AName = '@') then
@@ -653,6 +712,12 @@ begin
       ComponentStart := i + 1;
     end;
   Result := True;
+end;
+
+function IsProvingRefName(const AName: string): Boolean;
+begin
+  Result := IsValidGitRefName(AName)
+    and (StartsWith(AName, 'refs/heads/') or StartsWith(AName, 'refs/tags/'));
 end;
 
 function IsLowerHexId(const AValue: string): Boolean;
@@ -754,6 +819,10 @@ begin
         [ACommand, MAX_UPLOAD_PACK_REQUEST_BYTES]);
   end;
   Add(PktFlush);
+  if Size > MAX_UPLOAD_PACK_REQUEST_BYTES then
+    raise EGitReachabilityError.CreateFmt(
+      'upload-pack %s request would exceed the %d-byte request limit',
+      [ACommand, MAX_UPLOAD_PACK_REQUEST_BYTES]);
   { One allocation: joining thousands of want lines by repeated
     concatenation would be quadratic. }
   SetLength(Result, Size);
@@ -798,7 +867,7 @@ begin
           'ls-refs advertised more than %d refs', [MAX_ADVERTISED_REFS]);
       Line := PktText(ABody, Start, Len);
       if StartsWith(Line, 'ERR ') then
-        raise EGitReachabilityError.Create('remote error: '
+        raise EGitRemoteError.Create('remote error: '
           + Copy(Line, 5, MaxInt));
       Fields := Line.Split([' ']);
       if Length(Fields) < 2 then
@@ -887,7 +956,7 @@ begin
           Inc(WritePos, Len - 1);
         end;
         2:;  { progress }
-        3: raise EGitReachabilityError.Create('remote error: '
+        3: raise EGitRemoteError.Create('remote error: '
              + PktText(ABody, Start + 1, Len - 1));
       else
         raise EGitReachabilityError.CreateFmt(
@@ -897,7 +966,7 @@ begin
     end;
     Line := PktText(ABody, Start, Len);
     if StartsWith(Line, 'ERR ') then
-      raise EGitReachabilityError.Create('remote error: '
+      raise EGitRemoteError.Create('remote error: '
         + Copy(Line, 5, MaxInt));
     if Section = '' then
     begin
@@ -914,8 +983,13 @@ begin
         Result.Nak := True
       else if Line = 'ready' then
         Result.Ready := True
-      else if StartsWith(Line, 'ACK ') then
-        Result.Acknowledged := True
+      else if StartsWith(Line, 'ACK ')
+         and IsLowerHexId(Copy(Line, 5, MaxInt)) then
+      begin
+        Result.Acknowledged := True;
+        SetLength(Result.AckedIds, Length(Result.AckedIds) + 1);
+        Result.AckedIds[High(Result.AckedIds)] := Copy(Line, 5, MaxInt);
+      end
       else
         raise EGitReachabilityError.CreateFmt(
           'unexpected acknowledgment "%s"', [Line]);
@@ -924,6 +998,9 @@ begin
   end;
   if not Terminated then
     raise EGitReachabilityError.Create('fetch response is truncated');
+  if Result.Nak and (Result.Acknowledged or Result.Ready) then
+    raise EGitReachabilityError.Create(
+      'upload-pack acknowledgments contradict each other (NAK with ACK)');
   if Result.HasPack then
   begin
     SetLength(ABody, WritePos);
@@ -989,27 +1066,92 @@ begin
     Result.RequestTimeoutMilliseconds := ABudget.TimeoutMilliseconds;
 end;
 
+function HeaderValue(const AHeaders: THTTPHeaders;
+  const AName: string): string;
+var i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(AHeaders) do
+    if SameText(AHeaders[i].Name, AName) then Exit(AHeaders[i].Value);
+end;
+
+{ Absolute http(s) Location, or an origin-relative path resolved against
+  ACurrent's scheme and authority. Anything else is refused. }
+function RedirectTarget(const ACurrent, ALocation: string): string;
+var SchemeEnd, PathStart: Integer;
+begin
+  if StartsWith(LowerCase(ALocation), 'https://')
+     or StartsWith(LowerCase(ALocation), 'http://') then
+    Exit(ALocation);
+  if (ALocation <> '') and (ALocation[1] = '/')
+     and not StartsWith(ALocation, '//') then
+  begin
+    SchemeEnd := Pos('://', ACurrent);
+    PathStart := PosEx('/', ACurrent, SchemeEnd + 3);
+    if (SchemeEnd > 0) and (PathStart > 0) then
+      Exit(Copy(ACurrent, 1, PathStart - 1) + ALocation);
+  end;
+  raise EGitReachabilityError.CreateFmt(
+    'upload-pack advertisement redirected to an unsupported location "%s"',
+    [ALocation]);
+end;
+
 function THTTPGitUploadPackTransport.Advertise(const ARepoURL: string;
   out AEffectiveRepoURL: string; const ABudget: TGitRequestBudget): TBytes;
 var
-  URL, Final: string;
+  URL, Location: string;
   Headers: THTTPHeaders;
   Options: THTTPRequestOptions;
-  Limit: Int64;
+  Limit, Remaining: Int64;
   Resp: THTTPResponse;
+  Hop: Integer;
+  StartedAt, Elapsed: QWord;
+  Budget: TGitRequestBudget;
 begin
+  LastTransferred := 0;
   URL := UploadPackBaseURL(ARepoURL) + INFO_REFS_SUFFIX;
   SetLength(Headers, 1);
   Headers[0].Name := 'Git-Protocol';
   Headers[0].Value := 'version=2';
   Options := BudgetedOptions(FOptions, FMaxResponseBytes, ABudget, Limit);
-  try
-    Resp := HTTPGet(URL, Headers, Options);
-  except
-    on E: EHTTPResponseTooLarge do
-      raise TooLarge(URL, Limit);
-    on E: EHTTPError do
-      raise EGitReachabilityError.CreateFmt('%s: %s', [URL, E.Message]);
+  Remaining := Limit;
+  StartedAt := GetTickCount64;
+  { Redirects are followed here, one hop per request, so every hop's body
+    is charged to the same byte allowance and every hop gets only the time
+    that is left. The destination policy in FOptions still applies to each
+    hop's request. }
+  Hop := 0;
+  while True do
+  begin
+    Elapsed := GetTickCount64 - StartedAt;
+    if Elapsed >= ABudget.TimeoutMilliseconds then
+      raise EGitProofDeadlineExceeded.CreateFmt(
+        '%s: redirects exhausted the request deadline', [URL]);
+    Budget.TimeoutMilliseconds := ABudget.TimeoutMilliseconds - Elapsed;
+    Budget.MaxResponseBytes := Remaining;
+    Options := BudgetedOptions(FOptions, FMaxResponseBytes, Budget, Limit);
+    Options.MaximumRedirects := 0;
+    try
+      Resp := HTTPGet(URL, Headers, Options);
+    except
+      on E: EHTTPResponseTooLarge do
+        raise TooLarge(URL, EffectiveLimit(FMaxResponseBytes, ABudget));
+      on E: EHTTPError do
+        raise EGitReachabilityError.CreateFmt('%s: %s', [URL, E.Message]);
+    end;
+    Inc(LastTransferred, Length(Resp.Body));
+    Dec(Remaining, Length(Resp.Body));
+    if not ((Resp.StatusCode >= 301) and (Resp.StatusCode <= 308)
+       and (Resp.StatusCode <> 304) and (Resp.StatusCode <> 305)
+       and (Resp.StatusCode <> 306)) then Break;
+    Inc(Hop);
+    if Hop > FOptions.MaximumRedirects then
+      raise EGitReachabilityError.CreateFmt('%s: too many redirects',
+        [URL]);
+    Location := HeaderValue(Resp.Headers, 'Location');
+    URL := RedirectTarget(URL, Location);
+    if Remaining < 0 then
+      raise TooLarge(URL, EffectiveLimit(FMaxResponseBytes, ABudget));
   end;
   if Resp.StatusCode <> 200 then
     raise EGitReachabilityError.CreateFmt('%s: HTTP %d %s',
@@ -1018,12 +1160,10 @@ begin
   { Commands follow a redirected advertisement, as git clients do, so a
     renamed repository keeps working; the destination policy has already
     vetted every hop. }
-  Final := Resp.FinalURL;
-  if Resp.Redirected and (Length(Final) > Length(INFO_REFS_SUFFIX))
-     and (Copy(Final, Length(Final) - Length(INFO_REFS_SUFFIX) + 1,
+  if (Hop > 0) and (Length(URL) > Length(INFO_REFS_SUFFIX))
+     and (Copy(URL, Length(URL) - Length(INFO_REFS_SUFFIX) + 1,
        MaxInt) = INFO_REFS_SUFFIX) then
-    AEffectiveRepoURL := Copy(Final, 1,
-      Length(Final) - Length(INFO_REFS_SUFFIX));
+    AEffectiveRepoURL := Copy(URL, 1, Length(URL) - Length(INFO_REFS_SUFFIX));
   Result := Resp.Body;
 end;
 
@@ -1042,6 +1182,7 @@ begin
   Headers[0].Value := 'version=2';
   Headers[1].Name := 'Accept';
   Headers[1].Value := 'application/x-git-upload-pack-result';
+  LastTransferred := 0;
   Options := BudgetedOptions(FOptions, FMaxResponseBytes, ABudget, Limit);
   { A redirected POST would be replayed as a GET; the advertisement has
     already resolved any redirect. }
@@ -1164,9 +1305,14 @@ begin
 end;
 
 procedure Received(var ARun: TReachabilityRun; const ABody: TBytes);
+var Transferred: Int64;
 begin
   Inc(ARun.Requests);
-  Inc(ARun.BytesReceived, Length(ABody));
+  { Redirect bodies the transport followed count as well. }
+  Transferred := Length(ABody);
+  if ARun.Transport.LastTransferred > Transferred then
+    Transferred := ARun.Transport.LastTransferred;
+  Inc(ARun.BytesReceived, Transferred);
   { A transport that overran its allowance is still bounded here. }
   if GetTickCount64 - ARun.StartedAt > ARun.Limits.TimeoutMilliseconds then
     raise EGitProofDeadlineExceeded.CreateFmt(
@@ -1178,11 +1324,32 @@ begin
       [ARun.Limits.MaxTotalBytes]);
 end;
 
+function ProofDeadline(const ARun: TReachabilityRun): QWord;
+begin
+  Result := ARun.StartedAt + ARun.Limits.TimeoutMilliseconds;
+end;
+
+function ProofPackLimits(const ARun: TReachabilityRun): TGitPackLimits;
+begin
+  Result := DefaultGitPackLimits;
+  Result.Deadline := ProofDeadline(ARun);
+end;
+
+{ Nothing is accepted after the deadline, however the time was spent. }
+procedure CheckProofDeadline(const ARun: TReachabilityRun);
+begin
+  if GetTickCount64 > ProofDeadline(ARun) then
+    raise EGitProofDeadlineExceeded.CreateFmt(
+      'reachability proof exceeded its %d ms deadline',
+      [ARun.Limits.TimeoutMilliseconds]);
+end;
+
 function RunCommand(var ARun: TReachabilityRun; const ACommand: string;
   const AArguments: array of string): TBytes;
 var Request: TBytes;
 begin
   Request := BuildV2CommandRequest(ARun.Capabilities, ACommand, AArguments);
+  ARun.Transport.LastTransferred := 0;
   Result := ARun.Transport.Command(ARun.RepoURL, Request, NextBudget(ARun));
   Received(ARun, Result);
 end;
@@ -1251,20 +1418,18 @@ begin
   SetLength(Wants, Length(ATips) + 1);
   for i := 0 to High(ATips) do Wants[i] := ATips[i].Id;
   Wants[High(Wants)] := ATarget;
+  { Only the host declining the request (an ERR line or side-band error)
+    is tolerated. Anything it did send is evidence and must be valid and
+    within limits: an invalid pack, a limit, or the deadline fails the
+    proof. }
   try
     Response := RunFetch(ARun, Wants, [], True, True);
-    if not Response.HasPack then Exit;
-    Graph := ReadCommitPack(Response.Pack, DefaultGitPackLimits);
   except
-    on E: EGitResponseTooLarge do
-      raise;
-    on E: EGitProofDeadlineExceeded do
-      raise;
-    on E: EGitProtocolError do
-      Exit;
-    on E: EGitPackError do
+    on E: EGitRemoteError do
       Exit;
   end;
+  if not Response.HasPack then Exit;
+  Graph := ReadCommitPack(Response.Pack, ProofPackLimits(ARun));
   try
     if not Graph.TryGetCommit(ATarget, Commit) then Exit;
     Result := TDictionary<string, Int64>.Create;
@@ -1383,6 +1548,7 @@ begin
   Run.Limits := ALimits;
   Run.StartedAt := GetTickCount64;
   try
+    ATransport.LastTransferred := 0;
     Body := ATransport.Advertise(ARepoURL, Run.RepoURL, NextBudget(Run));
     Received(Run, Body);
     Run.Capabilities := ParseV2Capabilities(Body);
@@ -1439,14 +1605,20 @@ begin
         Result.Known := False;
         Exit;
       end;
+      for j := 0 to High(Response.AckedIds) do
+        if Response.AckedIds[j] <> Target then
+          raise EGitReachabilityError.Create(
+            'upload-pack acknowledged an object that was not offered');
       if not Response.Ready then Continue;
       if not Response.HasPack then
         raise EGitReachabilityError.Create(
           'upload-pack reported ready without sending a pack');
-      Graph := ReadCommitPack(Response.Pack, DefaultGitPackLimits);
+      Graph := ReadCommitPack(Response.Pack, ProofPackLimits(Run));
       try
-        if Graph.FindReachingStart([Probes[i].Id], Target) = 0 then
+        if Graph.FindReachingStart([Probes[i].Id], Target,
+             ProofDeadline(Run)) = 0 then
         begin
+          CheckProofDeadline(Run);
           Result.Reachable := True;
           Result.ProvingRef := Probes[i].Name;
           Exit;
@@ -1483,11 +1655,12 @@ begin
     if not Response.HasPack then
       raise EGitReachabilityError.Create(
         'upload-pack answered the final round without a pack');
-    Graph := ReadCommitPack(Response.Pack, DefaultGitPackLimits);
+    Graph := ReadCommitPack(Response.Pack, ProofPackLimits(Run));
     try
-      Found := Graph.FindReachingStart(Wants, Target);
+      Found := Graph.FindReachingStart(Wants, Target, ProofDeadline(Run));
       if Found >= 0 then
       begin
+        CheckProofDeadline(Run);
         Result.Reachable := True;
         Result.ProvingRef := Remaining[Found].Name;
       end;
@@ -1508,6 +1681,10 @@ begin
     Result := ProveCommitReachableCore(ATransport, ARepoURL, ACommit,
       AAdvertised, ALimits);
   except
+    on E: EGitPackDeadlineExceeded do
+      raise EGitProofDeadlineExceeded.CreateFmt(
+        'reachability proof exceeded its %d ms deadline',
+        [ALimits.TimeoutMilliseconds]);
     on E: EGitPackError do
       raise EGitReachabilityError.CreateFmt('%s sent an invalid pack: %s',
         [ARepoURL, E.Message]);
