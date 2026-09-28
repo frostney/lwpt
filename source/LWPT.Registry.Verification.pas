@@ -155,6 +155,8 @@ function RegistryDigestHex(const AHash: string): string;
 function RegistryRotationPath(const ASequence: Int64; const ASuffix: string): string;
 { Untrusted retrieval hint: the checkpoint hash a signature envelope claims. }
 function InspectRegistrySignaturePayload(const ABytes: TBytes): string;
+{ Untrusted retrieval hint: the key a signature envelope claims. }
+function InspectRegistrySignatureKey(const ABytes: TBytes): string;
 { Verifies one dual-signed transition from an already trusted key, before a
   caller follows further retrieval hints. Returns the authenticated rotation. }
 function VerifyRegistryRotation(const ARotation: TLWPTRegistryRotationProof;
@@ -880,6 +882,11 @@ begin
   Result := ParseSignature(RegistryBytesText(ABytes)).Payload;
 end;
 
+function InspectRegistrySignatureKey(const ABytes: TBytes): string;
+begin
+  Result := ParseSignature(RegistryBytesText(ABytes)).KeyId;
+end;
+
 function VerifyRegistryRotation(const ARotation: TLWPTRegistryRotationProof;
   const AOrigin, AFromKey, AFromPublicKey: string;
   const APreviousSequence, ACheckpointSequence: Int64): TLWPTUntrustedRegistryRotation;
@@ -1484,9 +1491,10 @@ begin
   Downgrade := False;
   if APrior.Sequence > 0 then
   begin
-    { An older checkpoint needs only the chain up to its own sequence. }
-    if (Checkpoint.Sequence >= APrior.Sequence)
-      and ((PriorKeyId <> APrior.KeyId) or (PriorPublicKey <> APrior.PublicKey)) then
+    { Every candidate, including an older one, must carry the chain that
+      reaches the accepted key. Only then does the key selected for an older
+      checkpoint come from authenticated accepted key history. }
+    if (PriorKeyId <> APrior.KeyId) or (PriorPublicKey <> APrior.PublicKey) then
       raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
         'rotation chain does not preserve the accepted signing key');
     if (Checkpoint.Sequence = APrior.Sequence)

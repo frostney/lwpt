@@ -714,8 +714,9 @@ failure and MUST abort acquisition instead of trying another contact. A
 response that is both stale and fails a trust check is a trust failure:
 clients MUST complete the signature, rotation-chain, accepted-key,
 equivocation, and history checks before classifying a response as stale. An
-older checkpoint is checked against the accepted chain key for its own
-sequence and against the accepted snapshot at that sequence. This
+older checkpoint is checked against the key that the client's accepted
+rotation chain assigns to its sequence, and against the accepted snapshot at
+that sequence. This
 includes media-type, encoding, metadata, schema, identity, signature, hash,
 history, future-dated checkpoint, equivocation, and rotation-chain failures.
 Redirects remain subject to the transport and identity revalidation

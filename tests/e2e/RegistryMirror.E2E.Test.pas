@@ -46,6 +46,7 @@ type
     procedure ReadinessPreservesCLIDiagnostic;
     procedure BootstrapConsumesMultipleRotationPages;
     procedure ByteBudgetsAreMirrorInitOptions;
+    procedure ReadinessRequiresServedCheckpoint;
   end;
 
 function ReadBytes(const APath: string): TBytes;
@@ -621,6 +622,39 @@ begin
     '--max-sync-bytes', '2097152']).ExitCode).ToBe(1);
 end;
 
+procedure TRegistryMirrorE2E.ReadinessRequiresServedCheckpoint;
+var
+  Impostor: TRegistryTestServer;
+  Routes: TRegistryHTTPRouteArray;
+  BaseURL, Diagnostic: string;
+  Child: TProcess;
+begin
+  { Another listener answers discovery for this base URL but cannot serve
+    the data directory's checkpoint; readiness must not be claimed. }
+  Impostor := TRegistryTestServer.Create(nil, True);
+  Child := nil;
+  try
+    BaseURL := 'http://localhost:' + IntToStr(Impostor.Port) + '/origin';
+    SetLength(Routes, 1);
+    Routes[0] := RegistryRoute('/origin/.well-known/' + RegistryProgramName + '-registry',
+      'application/vnd.' + RegistryProgramName + '.registry-discovery+toml',
+      BytesOf('base_url = "' + BaseURL + '"' + #10));
+    Impostor.SetRoutes(Routes);
+    Impostor.Start;
+    Diagnostic := '';
+    try
+      Child := StartRegistryCLI(FOrigin.Root, BaseURL);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    Expect<Boolean>(Child = nil).ToBe(True);
+    Expect<Boolean>(Pos('did not become ready', Diagnostic) > 0).ToBe(True);
+  finally
+    StopRegistryCLI(Child);
+    Impostor.Free;
+  end;
+end;
+
 procedure TRegistryMirrorE2E.SetupTests;
 begin
   Test('CLI mirror bootstrap survives origin outage and restart', BootstrapOutageAndRestart);
@@ -634,6 +668,7 @@ begin
   Test('readiness failures retain the original CLI diagnostic and exit status', ReadinessPreservesCLIDiagnostic);
   Test('bootstrap consumes multiple bounded rotation pages with exact signed bytes', BootstrapConsumesMultipleRotationPages);
   Test('byte budgets are validated mirror init options', ByteBudgetsAreMirrorInitOptions);
+  Test('readiness requires the listener to serve this data directory', ReadinessRequiresServedCheckpoint);
 end;
 
 begin

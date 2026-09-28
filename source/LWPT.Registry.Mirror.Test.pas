@@ -89,7 +89,7 @@ type
     FRoot: string;
     FMirror: TLWPTRegistryMirror;
     FActivationMirror: TLWPTRegistryMirror;
-    FActivationEntered: Boolean;
+    FActivationEntered, FStagedPointerSeen: Boolean;
     procedure ExpireBeforeActivation;
     procedure BlockAttemptAndFail;
     procedure FailBeforeActivation;
@@ -132,8 +132,14 @@ type
     procedure PruningKeepsCapturedResources;
     procedure ActivationStateIsWithinStoreBudget;
     procedure SleepPastSynchronizationBudget;
+    procedure SleepOnceInDeadlineCheck;
+    procedure SleepAfterStaging;
+    procedure RemoveStoreHeadroom;
     procedure DeadlineCoversLocalWorkAndActivation;
     procedure StaleOlderKeyContactKeepsAcceptedState;
+    procedure ContradictoryPairStopsBeforeRetrieval;
+    procedure RecoveryRecordFailureDoesNotBlockServing;
+    procedure InitialAttemptRespectsStoreBudget;
   end;
 
 function Package(const ABytes: TBytes): TLWPTRegistryPackage;
@@ -1510,33 +1516,27 @@ begin
   end;
 end;
 
+procedure TMirrorTransferTests.RemoveStoreHeadroom;
+begin
+  { Everything before activation is already accounted; leave no room for
+    the new pointer while the attempt budget keeps ample headroom. }
+  RegistryMirrorStoreHeadroomForTesting(FActivationMirror, 0);
+end;
+
 procedure TMirrorTransferTests.ActivationStateIsWithinStoreBudget;
 var
   Harness: TOriginHarness;
-  Required: Int64;
   Outcome: string;
 begin
-  Harness := TOriginHarness.Create('mirror-budget-measure', FixturePublishedAt,
+  Harness := TOriginHarness.Create('mirror-budget-activation', '',
     Int64(64) * 1024 * 1024, Int64(64) * 1024 * 1024);
   try
-    SetRegistryClockForTesting(FixtureNow);
-    Harness.Publish('large', FixturePublishedAt, 1536 * 1024);
-    Expect<string>(Harness.Sync).ToBe('ok');
-    Required := TreeBytes(Harness.Mirror.Root);
-  finally
-    Harness.Free;
-  end;
-  { The same synchronization with one byte less than its final directory
-    size must fail before activation instead of overshooting the cap. }
-  Harness := TOriginHarness.Create('mirror-budget-exact', FixturePublishedAt,
-    Required - 1, Required - 1);
-  try
-    Harness.Publish('large', FixturePublishedAt, 1536 * 1024);
+    Harness.Publish('one');
+    FActivationMirror := Harness.Mirror;
+    RegistryMirrorBeforeActivateForTesting(Harness.Mirror, RemoveStoreHeadroom);
     Outcome := Harness.Sync;
-    Expect<Boolean>((Pos('mirror_store_budget_exceeded:', Outcome) = 1)
-      or (Pos('mirror_sync_budget_exceeded:', Outcome) = 1)).ToBe(True);
+    Expect<Boolean>(Pos('mirror_store_budget_exceeded:', Outcome) = 1).ToBe(True);
     Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
-    Expect<Boolean>(TreeBytes(Harness.Mirror.Root) <= Required - 1).ToBe(True);
   finally
     Harness.Free;
   end;
@@ -1544,23 +1544,71 @@ end;
 
 procedure TMirrorTransferTests.SleepPastSynchronizationBudget;
 begin
+  FActivationEntered := True;
   Sleep(2500);
+end;
+
+procedure TMirrorTransferTests.SleepAfterStaging;
+var
+  Search: TSearchRec;
+begin
+  { Record that the new pointer is already staged when the gate runs. }
+  FStagedPointerSeen := FindFirst(FActivationMirror.Root + '/tmp/state*', faAnyFile, Search) = 0;
+  FindClose(Search);
+  SleepPastSynchronizationBudget;
+end;
+
+procedure TMirrorTransferTests.SleepOnceInDeadlineCheck;
+begin
+  if FActivationEntered then Exit;
+  FActivationEntered := True;
+  Sleep(600);
 end;
 
 procedure TMirrorTransferTests.DeadlineCoversLocalWorkAndActivation;
 var
   Harness: TOriginHarness;
   Outcome: string;
+  RequestsBefore: Integer;
 begin
   Harness := TOriginHarness.Create('mirror-deadline-local');
   try
     Harness.Publish('one');
     RegistryMirrorSynchronizationBudgetForTesting(Harness.Mirror, 2000);
     { Every request completes; only local work runs past the budget. }
+    FActivationEntered := False;
     RegistryMirrorBeforeActivateForTesting(Harness.Mirror, SleepPastSynchronizationBudget);
     Outcome := Harness.Sync;
+    Expect<Boolean>(FActivationEntered).ToBe(True);
     Expect<Boolean>(Pos('mirror_sync_deadline_exceeded:', Outcome) = 1).ToBe(True);
     Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
+    { The budget also covers the interval after the pointer is staged. }
+    RegistryMirrorBeforeActivateForTesting(Harness.Mirror, nil);
+    FActivationEntered := False;
+    FStagedPointerSeen := False;
+    FActivationMirror := Harness.Mirror;
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, nil, SleepAfterStaging);
+    Outcome := Harness.Sync;
+    Expect<Boolean>(FActivationEntered).ToBe(True);
+    Expect<Boolean>(FStagedPointerSeen).ToBe(True);
+    Expect<Boolean>(Pos('mirror_sync_deadline_exceeded:', Outcome) = 1).ToBe(True);
+    Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, nil, nil);
+    { And the retained-proof verification that starts an incremental sync. }
+    RegistryMirrorSynchronizationBudgetForTesting(Harness.Mirror, 0);
+    Expect<string>(Harness.Sync).ToBe('ok');
+    RegistryMirrorSynchronizationBudgetForTesting(Harness.Mirror, 300);
+    FActivationEntered := False;
+    RequestsBefore := Harness.Server.RequestCount;
+    { Storage preparation wipes staging after retained verification, so a
+      surviving marker shows the deadline stopped that verification itself. }
+    WriteTextFile(Harness.Mirror.Root + '/tmp/verification-marker', 'marker');
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, SleepOnceInDeadlineCheck, nil);
+    Outcome := Harness.Sync;
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, nil, nil);
+    Expect<Boolean>(Pos('mirror_sync_deadline_exceeded:', Outcome) = 1).ToBe(True);
+    Expect<Integer>(Harness.Server.RequestCount).ToBe(RequestsBefore);
+    Expect<Boolean>(FileExists(Harness.Mirror.Root + '/tmp/verification-marker')).ToBe(True);
   finally
     Harness.Free;
   end;
@@ -1591,6 +1639,116 @@ begin
     Expect<Integer>(Harness.Requested('/v1/rotations?')).ToBe(PagesBefore);
     Expect<string>(AsText(ReadFileBytes(Harness.Mirror.Root + '/state/current.toml')))
       .ToBe(PointerBefore);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.ContradictoryPairStopsBeforeRetrieval;
+var
+  Harness: TOriginHarness;
+  Checkpoint, Signature, Other: string;
+  Outcome: string;
+begin
+  Harness := TOriginHarness.Create('mirror-contradictory-pair');
+  try
+    Harness.Origin.RotateKey(Harness.Mirror.Config.TrustKeyID, RegistryTimestampNow);
+    Signature := AsText(Harness.Body('/v1/checkpoints/latest.sig.toml'));
+    { The payload still matches, but the envelope names a different key. }
+    Other := 'ed25519:' + StringOfChar('a', 64);
+    Harness.Override('/v1/checkpoints/latest.sig.toml', BytesOf(StringReplace(Signature,
+      'key_id = "' + InspectRegistryCheckpoint(Harness.Body('/v1/checkpoints/latest.toml')).KeyId + '"',
+      'key_id = "' + Other + '"', [])));
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('signature_key_mismatch:', Outcome) = 1).ToBe(True);
+    Expect<Integer>(Harness.Requested('/v1/keys/')).ToBe(0);
+    Expect<Integer>(Harness.Requested('/v1/rotations')).ToBe(0);
+  finally
+    Harness.Free;
+  end;
+  Harness := TOriginHarness.Create('mirror-foreign-checkpoint');
+  try
+    Checkpoint := StringReplace(AsText(Harness.Body('/v1/checkpoints/latest.toml')),
+      'origin = "' + Harness.Mirror.Config.Identity + '"', 'origin = "https://other.example.test"', []);
+    Signature := AsText(Harness.Body('/v1/checkpoints/latest.sig.toml'));
+    Signature := StringReplace(Signature, InspectRegistrySignaturePayload(BytesOf(Signature)),
+      SHA256BytesPrefixed(BytesOf(Checkpoint)), []);
+    Harness.Override('/v1/checkpoints/latest.toml', BytesOf(Checkpoint));
+    Harness.Override('/v1/checkpoints/latest.sig.toml', BytesOf(Signature));
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('checkpoint_origin_mismatch:', Outcome) = 1).ToBe(True);
+    Expect<Integer>(Harness.Requested('/v1/keys/')).ToBe(0);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.RecoveryRecordFailureDoesNotBlockServing;
+var
+  Harness: TOriginHarness;
+  Reopened: TLWPTRegistryMirror;
+  Diagnostic, Root: string;
+begin
+  Harness := TOriginHarness.Create('mirror-recovery-write');
+  Reopened := nil;
+  try
+    Harness.Publish('one');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    Root := Harness.Mirror.Root;
+    { An interrupted attempt, and a staging area that can no longer be written. }
+    WriteTextFile(Root + '/state/sync-attempt.toml', 'attempt_id = "x"' + #10
+      + 'outcome = "in_progress"' + #10);
+    RecursiveDelete(Root + '/tmp');
+    WriteTextFile(Root + '/tmp', 'not a directory');
+    Diagnostic := '';
+    try
+      Reopened := TLWPTRegistryMirror.Create(Root);
+    except
+      on E: Exception do Diagnostic := E.Message;
+    end;
+    Expect<string>(Diagnostic).ToBe('');
+    if Reopened <> nil then
+      Expect<Integer>(RegistryHTTPResponse(Reopened, 'GET', '/v1/checkpoints/latest.toml').Status).ToBe(200);
+  finally
+    Reopened.Free;
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.InitialAttemptRespectsStoreBudget;
+var
+  Harness: TOriginHarness;
+  Config: TLWPTRegistryConfig;
+  Root, AttemptBefore, Outcome: string;
+  Used: Int64;
+begin
+  Harness := TOriginHarness.Create('mirror-initial-attempt');
+  try
+    Harness.Publish('large', '', 1200 * 1024);
+    Expect<string>(Harness.Sync).ToBe('ok');
+    Root := Harness.Mirror.Root;
+    Used := TreeBytes(Root);
+    { Lower the cap so less than one attempt record of headroom remains. }
+    Config := Harness.Mirror.Config;
+    Config.StoreBudgetBytes := Used + 1000;
+    Config.SyncBudgetBytes := RegistryMinimumMirrorSyncBytes;
+    Harness.Mirror.Free;
+    Harness.Mirror := nil;
+    Harness.Mirror := TLWPTRegistryMirror(TLWPTRegistryMirror.Initialize(Root, Config,
+      RegistryTimestampNow));
+    Used := TreeBytes(Root);
+    Config.StoreBudgetBytes := Used + 1000;
+    Harness.Mirror.Free;
+    Harness.Mirror := nil;
+    Harness.Mirror := TLWPTRegistryMirror(TLWPTRegistryMirror.Initialize(Root, Config,
+      RegistryTimestampNow));
+    AttemptBefore := AsText(ReadFileBytes(Root + '/state/sync-attempt.toml'));
+    Harness.Publish('next');
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('mirror_store_budget_exceeded:', Outcome) = 1).ToBe(True);
+    { Nothing, not even the attempt record, was written past the cap. }
+    Expect<string>(AsText(ReadFileBytes(Root + '/state/sync-attempt.toml'))).ToBe(AttemptBefore);
+    Expect<Boolean>(TreeBytes(Root) <= Config.StoreBudgetBytes).ToBe(True);
   finally
     Harness.Free;
   end;
@@ -1628,6 +1786,9 @@ begin
   Test('activation state is charged to the store budget', ActivationStateIsWithinStoreBudget);
   Test('the synchronization deadline covers local work and activation', DeadlineCoversLocalWorkAndActivation);
   Test('a stale contact under an earlier chain key keeps accepted state', StaleOlderKeyContactKeepsAcceptedState);
+  Test('a contradictory checkpoint and signature stop before key retrieval', ContradictoryPairStopsBeforeRetrieval);
+  Test('a failing recovery record never blocks serving accepted state', RecoveryRecordFailureDoesNotBlockServing);
+  Test('the initial attempt record respects the store budget', InitialAttemptRespectsStoreBudget);
 end;
 
 procedure RunIncompleteClient;

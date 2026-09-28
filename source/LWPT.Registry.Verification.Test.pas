@@ -39,6 +39,14 @@ type
     function StatePath: string;
   end;
 
+  TDelayedViewThread = class(TThread)
+  protected
+    procedure Execute; override;
+  public
+    Mirror: TLWPTRegistryMirror;
+    LastSync, Error: string;
+  end;
+
   TMirrorRequestThread = class(TThread)
   protected
     procedure Execute; override;
@@ -71,6 +79,7 @@ type
   private
     function Trust: TLWPTRegistryTrust;
     function Proof(const ASequence: Integer): TLWPTRegistryProof;
+    function WithAcceptedChain(const AProof: TLWPTRegistryProof): TLWPTRegistryProof;
     function Verify(const AProof: TLWPTRegistryProof;
       const APrior: TLWPTRegistryAcceptedState;
       const AMode: TLWPTRegistryVerificationMode = rvmAcquire;
@@ -134,6 +143,7 @@ type
     procedure HoldBuildUntilAllArrive;
     procedure PauseFirstReader;
     procedure DelayedReaderKeepsNewerGeneration;
+    procedure ObsoleteKeyDowngradeIsTrustFailure;
   end;
 
 function ReadFixture(const APath: string): TBytes;
@@ -311,15 +321,16 @@ end;
 
 var
   GenerationArrivals, GenerationStart, DelayedReaderPaused, DelayedReaderRelease,
-    DelayedReaderClaimed: LongInt;
+    DelayedReaderClaimed, BarrierTimedOut: LongInt;
 
-procedure WaitForValue(var AValue: LongInt; const ATarget: LongInt);
+function WaitForValue(var AValue: LongInt; const ATarget: LongInt): Boolean;
 var
   Started: QWord;
 begin
   Started := GetTickCount64;
   while (InterlockedCompareExchange(AValue, 0, 0) < ATarget)
     and (GetTickCount64 - Started < 5000) do Sleep(1);
+  Result := InterlockedCompareExchange(AValue, 0, 0) >= ATarget;
 end;
 
 procedure TMirrorRequestThread.Execute;
@@ -339,8 +350,10 @@ end;
 
 procedure TRegistryVerificationTests.HoldBuildUntilAllArrive;
 begin
-  { The first builder waits inside the lock until every reader is queued. }
-  WaitForValue(GenerationArrivals, 8);
+  { The first builder waits inside the lock until every reader is queued.
+    A timeout would let late readers find a warm cache, so it fails. }
+  if not WaitForValue(GenerationArrivals, 8) then
+    InterlockedExchange(BarrierTimedOut, 1);
 end;
 
 procedure TRegistryVerificationTests.ConcurrentRequestsShareOneVerification;
@@ -358,6 +371,7 @@ begin
   FillChar(Threads, SizeOf(Threads), 0);
   GenerationArrivals := 0;
   GenerationStart := 0;
+  BarrierTimedOut := 0;
   try
     Mirror := NewFixtureMirror(Scratch, Trust);
     Verified := Verify(Proof(5), Default(TLWPTRegistryAcceptedState));
@@ -379,6 +393,7 @@ begin
       Expect<string>(Threads[Index].Error).ToBe('');
       Expect<Integer>(Threads[Index].Status).ToBe(200);
     end;
+    Expect<Integer>(InterlockedCompareExchange(BarrierTimedOut, 0, 0)).ToBe(0);
     Expect<Integer>(InterlockedCompareExchange(GenerationArrivals, 0, 0)).ToBe(RequestCount);
     Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(1);
   finally
@@ -394,48 +409,78 @@ procedure TRegistryVerificationTests.PauseFirstReader;
 begin
   if InterlockedCompareExchange(DelayedReaderClaimed, 1, 0) <> 0 then Exit;
   InterlockedExchange(DelayedReaderPaused, 1);
-  WaitForValue(DelayedReaderRelease, 1);
+  if not WaitForValue(DelayedReaderRelease, 1) then
+    InterlockedExchange(BarrierTimedOut, 1);
+end;
+
+procedure TDelayedViewThread.Execute;
+var
+  View: TLWPTRegistryReadView;
+begin
+  try
+    View := Mirror.CaptureReadView;
+    try
+      LastSync := View.State.LastSync;
+    finally
+      View.Free;
+    end;
+  except
+    on E: Exception do Error := E.Message;
+  end;
 end;
 
 procedure TRegistryVerificationTests.DelayedReaderKeepsNewerGeneration;
 var
   Scratch: string;
   Mirror: TMirrorFixtureStore;
-  Delayed: TMirrorRequestThread;
+  Builder: TMirrorRequestThread;
+  Delayed: TDelayedViewThread;
   Verified: TLWPTVerifiedRegistry;
-  Before: Integer;
+  Waits: Integer;
 begin
   Scratch := CreateScratchRoot('registry-delayed-reader');
   Mirror := nil;
+  Builder := nil;
   Delayed := nil;
   DelayedReaderPaused := 0;
   DelayedReaderRelease := 0;
   DelayedReaderClaimed := 0;
+  BarrierTimedOut := 0;
   GenerationStart := 1;
   try
     Mirror := NewFixtureMirror(Scratch, Trust);
     Verified := Verify(Proof(5), Default(TLWPTRegistryAcceptedState));
     Mirror.Retain(Verified);
     Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/checkpoints/latest.toml').Status).ToBe(200);
-    RegistryMirrorGenerationHooksForTesting(Mirror, PauseFirstReader, nil);
-    Before := RegistryMirrorProofChecksForTesting;
-    Delayed := TMirrorRequestThread.Create(True);
+    Mirror.Retain(Verified, '2026-01-06T01:00:00Z');
+    { A builder takes the lock for the second pointer and pauses there. }
+    RegistryMirrorGenerationHooksForTesting(Mirror, nil, PauseFirstReader);
+    Builder := TMirrorRequestThread.Create(True);
+    Builder.FreeOnTerminate := False;
+    Builder.Mirror := Mirror;
+    Builder.Start;
+    Expect<Boolean>(WaitForValue(DelayedReaderPaused, 1)).ToBe(True);
+    { A second reader starts while the second pointer is current and is
+      observed waiting for the lock before a third pointer is activated. }
+    Waits := RegistryGenerationWaitsForTesting;
+    Delayed := TDelayedViewThread.Create(True);
     Delayed.FreeOnTerminate := False;
     Delayed.Mirror := Mirror;
     Delayed.Start;
-    WaitForValue(DelayedReaderPaused, 1);
-    Expect<Integer>(DelayedReaderPaused).ToBe(1);
-    { A newer pointer is activated and served while the first reader waits. }
-    Mirror.Retain(Verified, '2026-01-07T00:00:00Z');
-    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/checkpoints/latest.toml').Status).ToBe(200);
+    while (RegistryGenerationWaitsForTesting = Waits) and not Delayed.Finished do Sleep(1);
+    Mirror.Retain(Verified, '2026-01-06T02:00:00Z');
     InterlockedExchange(DelayedReaderRelease, 1);
+    Builder.WaitFor;
     Delayed.WaitFor;
+    Expect<string>(Builder.Error).ToBe('');
     Expect<string>(Delayed.Error).ToBe('');
-    Expect<Integer>(RegistryHTTPResponse(Mirror, 'GET', '/v1/checkpoints/latest.toml').Status).ToBe(200);
-    { Only the newer generation was ever built; nothing rebuilt it. }
-    Expect<Integer>(RegistryMirrorProofChecksForTesting - Before).ToBe(1);
+    Expect<Integer>(InterlockedCompareExchange(BarrierTimedOut, 0, 0)).ToBe(0);
+    { The waiting reader resolves the pointer only after taking the lock, so
+      it serves the newest activation, not the one current when it began. }
+    Expect<string>(Delayed.LastSync).ToBe('2026-01-06T02:00:00Z');
   finally
     InterlockedExchange(DelayedReaderRelease, 1);
+    Builder.Free;
     Delayed.Free;
     if Mirror <> nil then RegistryMirrorGenerationHooksForTesting(Mirror, nil, nil);
     Mirror.Free;
@@ -692,7 +737,7 @@ begin
   Prior := Verify(Proof(2), Default(TLWPTRegistryAcceptedState));
   Expect<string>(StaleFailure(Proof(1), Default(TLWPTRegistryAcceptedState),
     '2026-01-08T00:00:00Z')).ToBe('stale');
-  Expect<string>(StaleFailure(Proof(1), Prior.State, EVALUATION_TIME)).ToBe('stale');
+  Expect<string>(StaleFailure(WithAcceptedChain(Proof(1)), Prior.State, EVALUATION_TIME)).ToBe('stale');
   Candidate := Proof(2);
   Candidate.Signature := ReadFixture('invalid/checkpoint-2-invalid-signature.sig.toml');
   Expect<string>(StaleFailure(Candidate, Default(TLWPTRegistryAcceptedState),
@@ -1351,12 +1396,20 @@ begin
   Verify(Candidate, Prior.State);
 end;
 
+{ An older checkpoint carrying the accepted rotation chain, as a mirror
+  supplies it, so its classification rests on authenticated key history. }
+function TRegistryVerificationTests.WithAcceptedChain(const AProof: TLWPTRegistryProof): TLWPTRegistryProof;
+begin
+  Result := AProof;
+  Result.Rotations := Proof(5).Rotations;
+end;
+
 procedure TRegistryVerificationTests.DowngradeRejected;
 var
   Prior: TLWPTVerifiedRegistry;
 begin
   Prior := Verify(Proof(2), Default(TLWPTRegistryAcceptedState));
-  ExpectFailure(Proof(1), 'checkpoint_downgrade', Prior.State);
+  ExpectFailure(WithAcceptedChain(Proof(1)), 'checkpoint_downgrade', Prior.State);
 end;
 
 procedure TRegistryVerificationTests.EqualSequenceEquivocationRejected;
@@ -1569,8 +1622,28 @@ begin
   Candidate.Checkpoint := BytesOf(StringReplace(AsText(Candidate.Checkpoint),
     ROOT_SNAPSHOT, 'sha256:' + StringOfChar('0', 64), []));
   ResignRoot(Candidate);
+  Candidate := WithAcceptedChain(Candidate);
   Expect<string>(StaleOrTrust(Self, Candidate, Prior.State, EVALUATION_TIME, Message)).ToBe('trust');
   Expect<Boolean>(Pos('checkpoint_equivocation:', Message) = 1).ToBe(True);
+end;
+
+procedure TRegistryVerificationTests.ObsoleteKeyDowngradeIsTrustFailure;
+var
+  Prior: TLWPTVerifiedRegistry;
+  Candidate: TLWPTRegistryProof;
+  Message: string;
+begin
+  { The root key was replaced at sequence 2. A sequence-3 checkpoint signed
+    by it names the accepted snapshot, but no accepted key signed it. }
+  Prior := Verify(Proof(5), Default(TLWPTRegistryAcceptedState));
+  Candidate := Proof(3);
+  Candidate.Rotations := nil;
+  Candidate.Checkpoint := BytesOf(StringReplace(AsText(Candidate.Checkpoint),
+    Field(Candidate.Checkpoint, 'key_id'), Trust.KeyId, []));
+  ResignRoot(Candidate);
+  Expect<string>(StaleOrTrust(Self, Candidate, Prior.State, EVALUATION_TIME, Message)).ToBe('trust');
+  Candidate.Rotations := Proof(5).Rotations;
+  Expect<string>(StaleOrTrust(Self, Candidate, Prior.State, EVALUATION_TIME, Message)).ToBe('trust');
 end;
 
 procedure TRegistryVerificationTests.UninitializedMirrorServesNothing;
@@ -1628,6 +1701,7 @@ begin
   Test('an older checkpoint under an earlier chain key is a stale downgrade', OlderKeyCheckpointIsStaleDowngrade);
   Test('an older checkpoint contradicting accepted history is equivocation', InconsistentDowngradeIsEquivocation);
   Test('an uninitialized mirror publishes no resources', UninitializedMirrorServesNothing);
+  Test('an older checkpoint signed by an obsolete key is a trust failure', ObsoleteKeyDowngradeIsTrustFailure);
   Test('key documents retain canonical bytes and match immutable trust and sequence', PinnedKeyDocumentValidated);
   Test('bootstrap and yank/restore corpus verifies', CorpusBootstrapAndLifecycle);
   Test('anchored history returns a complete offline bundle', AnchoredHistoryAndCompleteBundle);

@@ -123,7 +123,7 @@ end;
 function StartRegistryCLI(const ADataDirectory, ABaseURL: string): TProcess;
 var
   Started: QWord;
-  Ready: Boolean;
+  Ready, Serving: Boolean;
   LastProbe, ExitState, Diagnostics, Discovery, Checkpoint, Expected: string;
   Body: TBytes;
 begin
@@ -143,21 +143,25 @@ begin
       try
         Body := RegistryHTTPBody(ABaseURL + '/.well-known/' + PROGRAM_NAME + '-registry');
         SetString(Discovery, PAnsiChar(@Body[0]), Length(Body));
-        { Another process may have bound the port first; only this registry's
-          discovery document proves readiness. }
-        Ready := Result.Running and (Pos('base_url = "' + ABaseURL + '"', Discovery) > 0);
-        { Colliding fixtures can share a base URL; the served checkpoint
-          proves the listener serves this data directory. }
+        { Another process may have bound the port first; readiness requires
+          this registry's discovery and, once activated, its own checkpoint.
+          Colliding fixtures can share a base URL, but not a checkpoint. }
+        Serving := Result.Running and (Pos('base_url = "' + ABaseURL + '"', Discovery) > 0);
         Expected := ServedCheckpoint(ADataDirectory);
-        if Ready and (Expected <> '') then
+        if Serving and (Expected <> '') then
         begin
           Body := RegistryHTTPBody(ABaseURL + '/v1/checkpoints/latest.toml');
           SetString(Checkpoint, PAnsiChar(@Body[0]), Length(Body));
-          Ready := Checkpoint = Expected;
+          Serving := Checkpoint = Expected;
         end;
-        if not Ready then LastProbe := 'listener did not serve this registry';
+        if not Serving then LastProbe := 'listener did not serve this registry';
+        Ready := Serving;
       except
-        on E: Exception do LastProbe := Copy(E.Message, 1, 1024);
+        on E: Exception do
+        begin
+          Ready := False;
+          LastProbe := Copy(E.Message, 1, 1024);
+        end;
       end;
       if Ready then Exit;
       if not Result.Running then Break;

@@ -36,10 +36,12 @@ type
     FSynchronizationDeadline: QWord;
     FStoreUsed, FAttemptWritten: Int64;
     FAttemptID, FAttemptStartedAt: string;
+    FActivationExpiresAt: string;
     {$IFDEF REGISTRY_TESTING}
     FTransferStats: TRegistryMirrorTransferStats;
     FBeforeActivate: TSHA256Progress;
     FBeforeGenerationLock, FBeforeGenerationBuild: TSHA256Progress;
+    FDeadlineProbe, FBeforeReplace: TSHA256Progress;
     FSynchronizationMilliseconds: QWord;
     {$ENDIF}
     function Trust: TLWPTRegistryTrust;
@@ -58,6 +60,7 @@ type
     procedure PruneUnaccepted(AAccepted: TLWPTRegistryGeneration);
     procedure Reserve(const ABytes: Int64);
     procedure ActivateBudgeted(const AState: TLWPTRegistryState);
+    procedure CheckActivationGate;
     procedure WriteBudgeted(const ARelative: string; const ABytes: TBytes);
     procedure TransferArchives(const AAPI: string; const APackages: TLWPTRegistryPackageArray);
     {$IFDEF REGISTRY_TESTING}
@@ -91,6 +94,13 @@ procedure RegistryMirrorSynchronizationBudgetForTesting(AMirror: TLWPTRegistryMi
   a generation is verified, so tests can order concurrent readers. }
 procedure RegistryMirrorGenerationHooksForTesting(AMirror: TLWPTRegistryMirror;
   ABeforeLock, ABeforeBuild: TSHA256Progress);
+{ ADeadlineProbe runs inside every synchronization deadline check;
+  ABeforeReplace runs after the new pointer is staged, before its gate. }
+procedure RegistryMirrorActivationHooksForTesting(AMirror: TLWPTRegistryMirror;
+  ADeadlineProbe, ABeforeReplace: TSHA256Progress);
+{ Lowers max_store_bytes to the bytes already accounted plus AHeadroom. }
+procedure RegistryMirrorStoreHeadroomForTesting(AMirror: TLWPTRegistryMirror;
+  const AHeadroom: Int64);
 function RegistryMirrorConnectAddressForTesting(const AURL: string): string;
 { Persists a verified proof in the synchronized layout for fixtures. Key
   documents are the root record followed by one record per rotation. }
@@ -148,6 +158,19 @@ begin
   AMirror.FSynchronizationMilliseconds := AMilliseconds;
 end;
 
+procedure RegistryMirrorActivationHooksForTesting(AMirror: TLWPTRegistryMirror;
+  ADeadlineProbe, ABeforeReplace: TSHA256Progress);
+begin
+  AMirror.FDeadlineProbe := ADeadlineProbe;
+  AMirror.FBeforeReplace := ABeforeReplace;
+end;
+
+procedure RegistryMirrorStoreHeadroomForTesting(AMirror: TLWPTRegistryMirror;
+  const AHeadroom: Int64);
+begin
+  AMirror.OverrideStoreBudgetForTesting(AMirror.FStoreUsed + AHeadroom);
+end;
+
 procedure RegistryMirrorGenerationHooksForTesting(AMirror: TLWPTRegistryMirror;
   ABeforeLock, ABeforeBuild: TSHA256Progress);
 begin
@@ -162,6 +185,7 @@ type
     FURL: string;
     FPackage: TLWPTRegistryPackage;
     FTimeoutMilliseconds: QWord;
+    FProgress: TSHA256Progress;
     {$IFDEF REGISTRY_TESTING}
     FStats: PRegistryMirrorTransferStats;
     {$ENDIF}
@@ -320,7 +344,7 @@ begin
         FTimeoutMilliseconds);
       Stream := TBytesStream.Create(Archive);
       try
-        VerifyRegistryArtifact(FPackage, Stream);
+        VerifyRegistryArtifact(FPackage, Stream, FProgress);
       finally
         Stream.Free;
       end;
@@ -387,6 +411,9 @@ end;
 
 procedure TLWPTRegistryMirror.CheckSynchronizationDeadline;
 begin
+  {$IFDEF REGISTRY_TESTING}
+  if Assigned(FDeadlineProbe) then FDeadlineProbe;
+  {$ENDIF}
   if (FSynchronizationDeadline > 0) and (GetTickCount64 >= FSynchronizationDeadline) then
     raise ELWPTRegistryError.CreateStable('mirror_sync_deadline_exceeded',
       'synchronization exceeded its total time budget');
@@ -405,12 +432,24 @@ begin
 end;
 
 { The replacement is staged beside the old pointer before the rename, so the
-  complete new document is reserved. }
+  complete new document is reserved. Deadline and expiry are rechecked after
+  staging, immediately before the atomic replacement. }
 procedure TLWPTRegistryMirror.ActivateBudgeted(const AState: TLWPTRegistryState);
 begin
   Reserve(Length(StateDocumentBytes(AState)));
   CheckSynchronizationDeadline;
-  ActivateState(AState);
+  ActivateStateGated(AState, CheckActivationGate);
+end;
+
+procedure TLWPTRegistryMirror.CheckActivationGate;
+begin
+  {$IFDEF REGISTRY_TESTING}
+  if Assigned(FBeforeReplace) then FBeforeReplace;
+  {$ENDIF}
+  CheckSynchronizationDeadline;
+  if FActivationExpiresAt <= RegistryTimestampNow then
+    raise ELWPTRegistryStaleContactError.CreateStable('checkpoint_expired',
+      'checkpoint expired before activation');
 end;
 
 procedure TLWPTRegistryMirror.WriteBudgeted(const ARelative: string;
@@ -421,11 +460,12 @@ begin
   WriteImmutable(ARelative, ABytes);
 end;
 
-function DirectoryBytes(const ADirectory: string): Int64;
+function DirectoryBytes(const ADirectory: string; const AProgress: TSHA256Progress): Int64;
 var
   Search: TSearchRec;
 begin
   Result := 0;
+  if Assigned(AProgress) then AProgress;
   if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ADirectory) + '*',
     faAnyFile or faSymLink, Search) <> 0 then Exit;
   try
@@ -433,7 +473,8 @@ begin
       if (Search.Name = '.') or (Search.Name = '..')
         or ((Search.Attr and faSymLink) <> 0) then Continue;
       if (Search.Attr and faDirectory) <> 0 then
-        Inc(Result, DirectoryBytes(IncludeTrailingPathDelimiter(ADirectory) + Search.Name))
+        Inc(Result, DirectoryBytes(IncludeTrailingPathDelimiter(ADirectory) + Search.Name,
+          AProgress))
       else Inc(Result, Search.Size);
     until SysUtils.FindNext(Search) <> 0;
   finally
@@ -465,6 +506,7 @@ begin
         Continue;
       try
         repeat
+          CheckSynchronizationDeadline;
           if (Search.Attr and faDirectory) <> 0 then Continue;
           if Retained.IndexOf(Relative + '/' + Search.Name) >= 0 then Continue;
           { A concurrent reader of an older generation may hold the file open;
@@ -485,13 +527,13 @@ begin
   if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
   ForceDirectories(TmpRoot);
   FAttemptWritten := 0;
-  FStoreUsed := DirectoryBytes(Root);
+  FStoreUsed := DirectoryBytes(Root, CheckSynchronizationDeadline);
   { Unaccepted candidates stay available for retry only while a complete
     attempt still fits. Otherwise they are removed before reservation. }
   if FStoreUsed > Config.StoreBudgetBytes - Config.SyncBudgetBytes then
   begin
     PruneUnaccepted(AAccepted);
-    FStoreUsed := DirectoryBytes(Root);
+    FStoreUsed := DirectoryBytes(Root, CheckSynchronizationDeadline);
   end;
   { Later attempt records replace the current one through a staged copy. }
   Reserve(2 * MirrorAttemptRecordBytes);
@@ -574,6 +616,7 @@ begin
       begin
         Workers[Admitted] := TLWPTMirrorArchiveWorker.Create(AAPI, Missing[Next],
           RemainingSynchronizationMilliseconds);
+        Workers[Admitted].FProgress := CheckSynchronizationDeadline;
         {$IFDEF REGISTRY_TESTING}
         Workers[Admitted].FStats := @FTransferStats;
         {$ENDIF}
@@ -593,24 +636,31 @@ begin
       {$ENDIF}
       { Join every active request even after failure. Successful siblings are
         immutable retry material, never permission to activate a partial head. }
-      for I := 0 to Admitted - 1 do
-      begin
-        if Assigned(Workers[I].FatalException) then
-        begin
-          if Failure = '' then Failure := 'registry_archive_worker_failed: '
-            + Workers[I].FatalException.ClassName;
-        end
-        else if Workers[I].Error <> '' then
-        begin
-          if Failure = '' then Failure := Workers[I].Error;
-        end
-        else
-          try
-            WriteImmutable(ObjectPath(Workers[I].FPackage.ArchiveHash), Workers[I].Archive);
-          except
-            on E: Exception do if Failure = '' then Failure := E.Message;
-          end;
+      { Adopt verified buffers only while the synchronization budget holds. }
+      try
+        CheckSynchronizationDeadline;
+      except
+        on E: Exception do Failure := E.Message;
       end;
+      if Failure = '' then
+        for I := 0 to Admitted - 1 do
+        begin
+          if Assigned(Workers[I].FatalException) then
+          begin
+            if Failure = '' then Failure := 'registry_archive_worker_failed: '
+              + Workers[I].FatalException.ClassName;
+          end
+          else if Workers[I].Error <> '' then
+          begin
+            if Failure = '' then Failure := Workers[I].Error;
+          end
+          else
+            try
+              WriteImmutable(ObjectPath(Workers[I].FPackage.ArchiveHash), Workers[I].Archive);
+            except
+              on E: Exception do if Failure = '' then Failure := E.Message;
+            end;
+        end;
     finally
       for I := 0 to Admitted - 1 do
       begin
@@ -914,6 +964,11 @@ end;
 
 procedure TLWPTRegistryMirror.BeginAttempt;
 begin
+  { The record and its staged replacement need headroom before the first
+    write; without it the attempt stops without writing anything. }
+  if 2 * MirrorAttemptRecordBytes > Config.StoreBudgetBytes - DirectoryBytes(Root, nil) then
+    raise ELWPTRegistryError.CreateStable('mirror_store_budget_exceeded',
+      'the data directory has no room for an attempt record under max_store_bytes');
   FAttemptID := NewAttemptID;
   FAttemptStartedAt := RegistryTimestampNow;
   ForceDirectories(TmpRoot);
@@ -930,25 +985,28 @@ var
   Root: TTOMLNode;
 begin
   if not FileExists(RootPath(MirrorAttemptPath)) then Exit;
-  Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
+  Coordinator := nil;
   Lease := nil;
-  Parser := TTOMLParser.Create;
+  Parser := nil;
   Root := nil;
+  { Diagnostic maintenance is nonauthoritative. Any failure here, including
+    the lease or the abandoned-record write, must never prevent opening and
+    serving verified accepted state. }
   try
-    Lease := Coordinator.TryAcquire('registry-publication', 'registry mirror attempt recovery');
-    if not Assigned(Lease) then Exit;
-    { A diagnostic record never controls whether accepted state can load. }
     try
+      Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
+      Lease := Coordinator.TryAcquire('registry-publication', 'registry mirror attempt recovery');
+      if not Assigned(Lease) then Exit;
+      Parser := TTOMLParser.Create;
       Root := Parser.ParseDocument(RegistryBytesText(LoadResource(MirrorAttemptPath,
         nil, MirrorAttemptRecordBytes)));
+      if TomlStr(Root, 'outcome', '') <> 'in_progress' then Exit;
+      FAttemptID := TomlStr(Root, 'attempt_id', '');
+      FAttemptStartedAt := TomlStr(Root, 'started_at', '');
+      SaveAttempt('abandoned', 'synchronization stopped before recording a result');
     except
-      on E: ETOMLParseError do Exit;
-      on E: ELWPTRegistryError do Exit;
+      on Exception do;
     end;
-    if TomlStr(Root, 'outcome', '') <> 'in_progress' then Exit;
-    FAttemptID := TomlStr(Root, 'attempt_id', '');
-    FAttemptStartedAt := TomlStr(Root, 'started_at', '');
-    SaveAttempt('abandoned', 'synchronization stopped before recording a result');
   finally
     Root.Free;
     Parser.Free;
@@ -1046,8 +1104,8 @@ begin
       Prior := Default(TLWPTRegistryAcceptedState);
       if FileExists(RootPath('state/current.toml')) then
       begin
-        State := ReadCurrentState;
-        PriorVerified := VerifyStateProof(State);
+        State := ReadCurrentState(CheckSynchronizationDeadline);
+        PriorVerified := VerifyStateProof(State, CheckSynchronizationDeadline);
         Prior := Accepted(State, PriorVerified.Proof.Checkpoint);
         AcceptedGeneration := BuildGeneration('', State, PriorVerified);
         AcceptedReference := AcceptedGeneration;
@@ -1063,8 +1121,8 @@ begin
           acquisition charges them under the same limits. }
         for Binding in State.Rotations do
         begin
-          Document := LoadResource(ProofPath(Binding.KeyDocument), nil,
-            MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
+          Document := LoadResource(ProofPath(Binding.KeyDocument),
+            CheckSynchronizationDeadline, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
           Budget.Account(Document);
           RememberRetrieval(Proof, Document);
         end;
@@ -1106,6 +1164,14 @@ begin
         Proof.Checkpoint := NextCheckpoint;
       until False;
       Hint := InspectRegistryCheckpoint(Proof.Checkpoint);
+      { Identity contradictions are decidable now; reject them before any key
+        record or rotation request. Cryptography still follows the chain. }
+      if Hint.Origin <> Config.Identity then
+        raise ELWPTRegistryError.CreateStable('checkpoint_origin_mismatch',
+          'checkpoint names a different origin');
+      if InspectRegistrySignatureKey(Proof.Signature) <> Hint.KeyId then
+        raise ELWPTRegistryError.CreateStable('signature_key_mismatch',
+          'signature names a different key than its checkpoint');
       { The root key record's effective sequence is unsigned retrieval data.
         It is bound to this attempt's state only, never to a fixed path. }
       KeyDocument := Control(Discovery.API + '/keys/' + Config.TrustKeyID + '.toml', 'key');
@@ -1213,6 +1279,7 @@ begin
       if Verified.ExpiresAt <= State.LastSync then
         raise ELWPTRegistryStaleContactError.CreateStable('checkpoint_expired',
           'checkpoint expired before activation');
+      FActivationExpiresAt := Verified.ExpiresAt;
       ActivateBudgeted(State);
     except
       on E: Exception do

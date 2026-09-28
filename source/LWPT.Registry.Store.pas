@@ -170,6 +170,13 @@ type
     procedure WriteImmutable(const ARelative: string;
       const ABytes: TBytes);
     procedure ActivateState(const AState: TLWPTRegistryState);
+    { Stages the new pointer, runs AGate, then replaces atomically. A raising
+      gate leaves the previous pointer and removes the staged copy. }
+    procedure ActivateStateGated(const AState: TLWPTRegistryState;
+      const AGate: TSHA256Progress);
+    {$IFDEF REGISTRY_TESTING}
+    procedure OverrideStoreBudgetForTesting(const ABytes: Int64);
+    {$ENDIF}
     { Serializes generation construction. Waiting callers keep reporting
       progress, so their request deadlines still apply. }
     procedure EnterGeneration(AProgress: TSHA256Progress);
@@ -236,6 +243,8 @@ procedure SetRegistryRecoveryBarrierForTesting(const AReadyPath,
 { Overrides RegistryTimestampNow; an empty value restores the system clock. }
 procedure SetRegistryClockForTesting(const AValue: string);
 function RegistryHistoryBuildsForTesting: Integer;
+{ Requests that had to wait for the generation lock. }
+function RegistryGenerationWaitsForTesting: Integer;
 {$ENDIF}
 
 implementation
@@ -272,6 +281,7 @@ var
   RegistryClockLockForTesting: TRTLCriticalSection;
   RegistryClockForTesting: string;
   RegistryHistoryBuilds: LongInt;
+  RegistryGenerationWaits: LongInt;
   RegistryFailurePointForTesting: string;
   RegistryPublicationReadyPathForTesting: string;
   RegistryPublicationReleasePathForTesting: string;
@@ -1628,6 +1638,40 @@ begin
     Bytes(RegistryStateDocument(AState)));
 end;
 
+procedure TLWPTRegistryStore.ActivateStateGated(const AState: TLWPTRegistryState;
+  const AGate: TSHA256Progress);
+var
+  Staged: string;
+  Document: TBytes;
+  Stream: TFileStream;
+begin
+  Document := Bytes(RegistryStateDocument(AState));
+  ForceDirectories(TmpRoot);
+  Staged := MakeTmpPath(TmpRoot, 'state');
+  try
+    Stream := TFileStream.Create(Staged, fmCreate);
+    try
+      if Length(Document) > 0 then Stream.WriteBuffer(Document[0], Length(Document));
+    finally
+      Stream.Free;
+    end;
+    if Assigned(AGate) then AGate;
+    if not AtomicReplaceFile(Staged, RootPath(CURRENT_STATE_FILE)) then
+      raise ELWPTRegistryError.CreateStable('state_write_failed',
+        'could not atomically replace the activation pointer');
+  except
+    SysUtils.DeleteFile(Staged);
+    raise;
+  end;
+end;
+
+{$IFDEF REGISTRY_TESTING}
+procedure TLWPTRegistryStore.OverrideStoreBudgetForTesting(const ABytes: Int64);
+begin
+  FConfig.StoreBudgetBytes := ABytes;
+end;
+{$ENDIF}
+
 function TLWPTRegistryStore.LoadSeed(const AKeyID: string;
   AProgress: TSHA256Progress): TBytes;
 var
@@ -2471,9 +2515,20 @@ begin
 end;
 
 procedure TLWPTRegistryStore.EnterGeneration(AProgress: TSHA256Progress);
+{$IFDEF REGISTRY_TESTING}
+var
+  Counted: Boolean;
+{$ENDIF}
 begin
+  {$IFDEF REGISTRY_TESTING}
+  Counted := False;
+  {$ENDIF}
   while TryEnterCriticalSection(FGenerationLock) = 0 do
   begin
+    {$IFDEF REGISTRY_TESTING}
+    if not Counted then InterlockedIncrement(RegistryGenerationWaits);
+    Counted := True;
+    {$ENDIF}
     if Assigned(AProgress) then AProgress;
     Sleep(1);
   end;
@@ -2643,6 +2698,11 @@ begin
   finally
     LeaveCriticalSection(RegistryClockLockForTesting);
   end;
+end;
+
+function RegistryGenerationWaitsForTesting: Integer;
+begin
+  Result := InterlockedCompareExchange(RegistryGenerationWaits, 0, 0);
 end;
 
 function RegistryHistoryBuildsForTesting: Integer;
