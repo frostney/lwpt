@@ -126,6 +126,7 @@ type
     procedure TestPublicDestinationDialsTheCheckedAddress;
     procedure TestDenyRefusesRedirectIntoPrivateAddress;
     procedure TestExpandedMappedIPv6RedirectCannotReachLoopback;
+    procedure TestHTTPSOriginCannotRedirectToPlaintext;
     {$ENDIF}
   end;
 
@@ -1628,6 +1629,14 @@ begin
     'not an address literal');
   Expect<string>(NonGlobalAddressReason('0x7f.0.0.1')).ToBe(
     'not an address literal');
+  { Leading zeros read as octal elsewhere, so they are not literals here. }
+  Expect<string>(NonGlobalAddressReason('010.0.0.1')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('127.000.0.1')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('::ffff:010.0.0.1')).ToBe(
+    'not an address literal');
+  Expect<string>(NonGlobalAddressReason('0.0.0.0')).ToBe('this network');
   Expect<string>(NonGlobalAddressReason('2130706433')).ToBe(
     'not an address literal');
   Expect<string>(NonGlobalAddressReason('localhost')).ToBe(
@@ -1743,6 +1752,34 @@ begin
     HTTPClientResolveTestHook := nil;
   end;
 end;
+
+{ The named test host stands in for an authenticated HTTPS origin. }
+function PublicTestHostIsHTTPS(const AHost: string): Boolean;
+begin
+  Result := SameText(AHost, PolicyPublicTestHost);
+end;
+
+{ RequireHTTPS is enforced on every hop, not only the first: an HTTPS
+  origin redirecting to plaintext is refused before the target is dialled. }
+procedure THTTPClientDestinationPolicy.TestHTTPSOriginCannotRedirectToPlaintext;
+var
+  Options: THTTPRequestOptions;
+  Served: Boolean;
+begin
+  HTTPClientResolveTestHook := @ResolvePublicTestHost;
+  HTTPClientHTTPSStandInTestHook := @PublicTestHostIsHTTPS;
+  try
+    Options := PolicyOptions([], papDeny);
+    Options.Destination.RequireHTTPS := True;
+    Expect<string>(FollowRedirectUnderPolicy(PolicyPublicTestHost,
+      '127.0.0.1', Options, Served)).ToBe(
+      'fetch scheme not allowed: http://127.0.0.1 (https is required)');
+    Expect<Boolean>(Served).ToBe(False);
+  finally
+    HTTPClientHTTPSStandInTestHook := nil;
+    HTTPClientResolveTestHook := nil;
+  end;
+end;
 {$ENDIF}
 
 procedure THTTPClientDestinationPolicy.SetupTests;
@@ -1782,6 +1819,8 @@ begin
     TestDenyRefusesRedirectIntoPrivateAddress);
   Test('an expanded IPv4-mapped IPv6 redirect cannot reach loopback',
     TestExpandedMappedIPv6RedirectCannotReachLoopback);
+  Test('an https origin cannot redirect a RequireHTTPS request to plaintext',
+    TestHTTPSOriginCannotRedirectToPlaintext);
   {$ENDIF}
 end;
 

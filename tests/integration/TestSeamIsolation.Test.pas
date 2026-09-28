@@ -17,8 +17,10 @@ program TestSeamIsolation.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
+  Process,
   SysUtils,
 
   LWPT.Core,
@@ -45,6 +47,9 @@ type
     procedure TestArchiveOriginIsIgnored;
     procedure TestFaultInjectionIsIgnored;
     procedure TestReleaseGuardMarkerIsTestBuildOnly;
+    {$IFDEF UNIX}
+    procedure TestReleaseGuardFailsClosed;
+    {$ENDIF}
   end;
 
 const
@@ -259,6 +264,108 @@ begin
   end;
 end;
 
+{$IFDEF UNIX}
+{ The run: block of release.yml's test-seam guard step, dedented, so the
+  test exercises exactly the shell the release job runs. }
+function ReleaseGuardScript: string;
+const
+  StepName = '- name: Check test seams are compiled out';
+var
+  Workflow: TStringList;
+  LineIndex, RunIndent, BodyIndent: Integer;
+  Line: string;
+
+  function Indent(const AText: string): Integer;
+  begin
+    Result := 0;
+    while (Result < Length(AText)) and (AText[Result + 1] = ' ') do
+      Inc(Result);
+  end;
+
+begin
+  Result := '';
+  Workflow := TStringList.Create;
+  try
+    Workflow.LoadFromFile(ExpandFileName('.github/workflows/release.yml'));
+    LineIndex := 0;
+    while (LineIndex < Workflow.Count)
+          and (Trim(Workflow[LineIndex]) <> StepName) do
+      Inc(LineIndex);
+    Expect<Boolean>(LineIndex < Workflow.Count).ToBe(True);
+    while (LineIndex < Workflow.Count)
+          and (Trim(Workflow[LineIndex]) <> 'run: |') do
+      Inc(LineIndex);
+    Expect<Boolean>(LineIndex < Workflow.Count).ToBe(True);
+    RunIndent := Indent(Workflow[LineIndex]);
+    BodyIndent := -1;
+    Inc(LineIndex);
+    while LineIndex < Workflow.Count do
+    begin
+      Line := Workflow[LineIndex];
+      if Trim(Line) <> '' then
+      begin
+        if Indent(Line) <= RunIndent then Break;
+        if BodyIndent < 0 then BodyIndent := Indent(Line);
+        Line := Copy(Line, BodyIndent + 1, MaxInt);
+      end;
+      Result := Result + Line + #10;
+      Inc(LineIndex);
+    end;
+  finally
+    Workflow.Free;
+  end;
+end;
+
+{ Runs the guard in AWorkDir, returning its exit code and output. }
+function RunReleaseGuard(const AWorkDir, AScript: string;
+  out AOutput: string): Integer;
+var ScriptPath: string;
+begin
+  ScriptPath := AWorkDir + '/guard.sh';
+  WriteTextFile(ScriptPath, AScript);
+  RunCommandInDir(AWorkDir, '/bin/sh', ['-c', 'bash ./guard.sh 2>&1'],
+    AOutput, Result, []);
+end;
+
+{ Clean staged binaries pass; a test build fails; a binary the scanner
+  cannot read fails too instead of passing as "no markers". }
+procedure TTestSeamIsolation.TestReleaseGuardFailsClosed;
+var
+  Script, WorkDir, Output: string;
+  ExitStatus: Integer;
+begin
+  Script := ReleaseGuardScript;
+  Expect<Boolean>(Pos('grep', Script) > 0).ToBe(True);
+  WorkDir := FScratch + '/release-guard';
+  RecursiveDelete(WorkDir);
+  ForceDirectories(WorkDir + '/tests');
+  ForceDirectories(WorkDir + '/staged');
+  Expect<Boolean>(CopyFileContent(ExpandFileName(
+    'tests/test-seam-markers.txt'), WorkDir + '/tests/test-seam-markers.txt'))
+    .ToBe(True);
+
+  Expect<Boolean>(CopyFileContent(ExpectedExe(FReleaseBinary),
+    WorkDir + '/staged/lwpt')).ToBe(True);
+  ExitStatus := RunReleaseGuard(WorkDir, Script, Output);
+  Expect<Integer>(ExitStatus).ToBe(0);
+  Expect<Boolean>(Pos('no test seam markers in staged binaries', Output) > 0)
+    .ToBe(True);
+
+  Expect<Boolean>(CopyFileContent(ExpectedExe(FTestingBinary),
+    WorkDir + '/staged/lwpt')).ToBe(True);
+  ExitStatus := RunReleaseGuard(WorkDir, Script, Output);
+  Expect<Boolean>(ExitStatus <> 0).ToBe(True);
+  Expect<Boolean>(Pos('contains test seam markers', Output) > 0).ToBe(True);
+
+  SysUtils.DeleteFile(WorkDir + '/staged/lwpt');
+  Expect<Integer>(fpSymlink(PChar(WorkDir + '/missing-binary'),
+    PChar(WorkDir + '/staged/lwpt'))).ToBe(0);
+  ExitStatus := RunReleaseGuard(WorkDir, Script, Output);
+  Expect<Boolean>(ExitStatus <> 0).ToBe(True);
+  Expect<Boolean>(Pos('cannot scan staged/lwpt', Output) > 0).ToBe(True);
+end;
+{$ENDIF}
+
 procedure TTestSeamIsolation.BeforeAll;
 begin
   FReleaseBinary := ExpandFileName('build/lwpt');
@@ -284,6 +391,10 @@ begin
     TestFaultInjectionIsIgnored);
   Test('every release guard marker exists only in the test build',
     TestReleaseGuardMarkerIsTestBuildOnly);
+  {$IFDEF UNIX}
+  Test('the release guard passes clean binaries and fails contaminated or '
+    + 'unreadable ones', TestReleaseGuardFailsClosed);
+  {$ENDIF}
 end;
 
 begin

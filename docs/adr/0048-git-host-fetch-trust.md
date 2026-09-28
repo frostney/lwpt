@@ -66,8 +66,10 @@ dependencies: the resolver passes each child manifest's custom sources along
 with its requirements. A fetched package could otherwise make LWPT contact
 services on the user's network. The maintainer chose one rule for all
 sources over a root-manifest exception. Self-hosted forges and archive hosts
-on private networks are currently unsupported, and the decision may be
-revisited when a real need appears.
+on private networks are currently unsupported. The follow-up is
+[#313](https://github.com/frostney/lwpt/issues/313): an opt-in in user-level
+configuration, never in a manifest, so a fetched package can never grant
+itself private access. Until it lands, the denial above stays unconditional.
 
 A custom-source template may not use `{ref}` in its host, because the
 allowlist is derived from the templates before any ref is known. `{user}` and
@@ -95,10 +97,18 @@ apply:
   because the ref would otherwise start moving silently.
 - **Branch.** A locked branch may move, and a branch replaced by a same-named
   tag is accepted.
+- **Tag and branch with one name.** When a tag and a branch share the
+  selected name and commit, advertisement order does not decide the kind: a
+  locked branch stays a branch, and otherwise the tag wins. A locked tag that
+  is still advertised is therefore never reported as replaced.
 - **Lock without `resolvedRefKind`.** A changed commit fails when the ref
   now resolves as a tag (a moved tag). It also fails when the ref resolves as
   a branch, because the lock cannot prove the ref was a branch. The failure
-  is closed rather than open.
+  is closed rather than open. Without `--accept-moved-tags`, an unknown kind
+  is never promoted to `branch`: an install that sees a branch at the locked
+  commit succeeds but keeps the kind unknown, so a later move still fails.
+  Promotion to `tag` happens automatically, because it only tightens the
+  rule.
 - **Any requirement.** The rule applies whenever the same tag is selected
   again, even after the manifest requirement changed, for example from `^1.0`
   to exact `v1.2.3`. This is deliberately stronger than "only while the
@@ -109,9 +119,13 @@ Archive identity backs these rules and covers locks that record no commit.
 When the lock pins the selected commit, a download must reproduce the lock's
 `archiveHash`. The same applies when the lock has no `resolvedCommit` but
 pins the same ref name. The check runs before the bytes are written, admitted
-to the per-user cache, or extracted. This covers:
+to the per-user cache, or extracted, on every path that supplies archive
+bytes. That includes a resolver candidate fetched earlier in the same install
+for another dependency naming the same source and commit. This covers:
 
 - a locked commit whose forge now serves different bytes;
+- another dependency aliasing the same repository and commit, whose fetch
+  would otherwise be reused unchecked;
 - the listing-failure fallback, which reuses the locked identity;
 - a tag moved behind an early schema-v3 lock, reported as a moved tag.
 
@@ -135,10 +149,11 @@ instead of accepting it themselves.
   would have been allowed to start on a private network, but never to move
   from a public hop to a private one. Transitive declarations would still
   have been denied. This keeps self-hosted forges working, but it adds a
-  trust distinction to the resolver. Rejected for now; it may be revisited
-  if a real need appears.
-- **A root-only opt-in naming permitted CIDRs.** This is more precise, but it
-  is new manifest surface. Deferred for the same reason.
+  trust distinction to the resolver, and any manifest-level trust lets the
+  project's own dependency graph widen it. Rejected.
+- **A manifest-level opt-in naming permitted hosts or CIDRs.** Rejected for
+  the same reason. Private access, when it lands, belongs to user-level
+  configuration ([#313](https://github.com/frostney/lwpt/issues/313)).
 - **Keep the textual classifier from GocciaScript's HTTPClient.** It missed
   expanded IPv4-mapped IPv6, several non-global IPv4 blocks, and most of
   `fe80::/10`, and a classified string could be resolved again at connect
@@ -153,8 +168,10 @@ instead of accepting it themselves.
   or a direct URL, fails to install with `fetch destination not allowed`.
 - LWPT dials only IPv4 when a destination policy is active. An IPv6-only
   forge would need connect support first.
-- Existing locks gain `resolvedRefKind` on their next online install. Until
-  then, a moved branch in such a lock needs one `--accept-moved-tags`.
+- Existing locks gain `resolvedRefKind = "tag"` on their next online install
+  that sees a tag. A ref seen only as a branch keeps an unknown kind until
+  one `--accept-moved-tags` records it, which a moved branch in such a lock
+  requires anyway.
 - A forge that regenerates archives for unchanged commits makes installs fail
   until the change is reviewed and accepted.
 - The HTTPClient classifier helpers are test-only (`HTTPCLIENT_TESTING`).

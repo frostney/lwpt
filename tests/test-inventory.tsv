@@ -10,8 +10,8 @@ platform	windows/x86_64
 program	*	packages/cli/source/CLI.Events.Test.pas	1	5
 program	*	packages/cli/source/CLI.Parser.Test.pas	1	9
 program	*	packages/cli/source/CLI.Subcommands.Test.pas	1	8
-program	*	packages/httpclient/source/HTTPClient.Test.pas	5	53
-program	windows/*	packages/httpclient/source/HTTPClient.Test.pas	5	51
+program	*	packages/httpclient/source/HTTPClient.Test.pas	5	54
+program	windows/*	packages/httpclient/source/HTTPClient.Test.pas	5	52
 program	*	packages/httpclient/source/TransportSecurity.Test.pas	1	44
 program	*	packages/httpclient/tests/e2e/TransportSecuritySocket.E2E.Test.pas	0	0
 program	linux/*	packages/httpclient/tests/e2e/TransportSecuritySocket.E2E.Test.pas	1	3
@@ -83,7 +83,7 @@ program	*	tests/integration/Hooks.Test.pas	1	11
 program	*	tests/integration/Init.Test.pas	1	21
 program	*	tests/integration/InstallCommitPin.Test.pas	1	9
 program	*	tests/integration/InstallFetchFailure.Test.pas	4	24
-program	*	tests/integration/InstallGitGraph.Test.pas	1	26
+program	*	tests/integration/InstallGitGraph.Test.pas	1	29
 program	*	tests/integration/InstallGraphConflict.Test.pas	1	20
 program	*	tests/integration/InstallLocalDiamond.Test.pas	2	10
 program	*	tests/integration/InstallNestedManifest.Test.pas	1	4
@@ -96,5 +96,6 @@ program	*	tests/integration/TestCache.Test.pas	1	10
 program	*	tests/integration/TestFlags.Test.pas	1	3
 program	*	tests/integration/TestScheduling.Test.pas	1	28
 program	windows/*	tests/integration/TestScheduling.Test.pas	1	24
-program	*	tests/integration/TestSeamIsolation.Test.pas	1	4
+program	*	tests/integration/TestSeamIsolation.Test.pas	1	5
+program	windows/*	tests/integration/TestSeamIsolation.Test.pas	1	4
 program	*	tests/integration/Version.Test.pas	1	4
