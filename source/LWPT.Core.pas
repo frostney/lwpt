@@ -1497,7 +1497,7 @@ begin
   {$IFDEF OBJECTSTORE_TESTING}
   { Record contention only after a real failed attempt on the guard itself,
     so an observer never mistakes an uncontended thread for a blocked one. }
-  if TryEnterCriticalSection(ProcessHandleSetupCriticalSection) = 0 then
+  if System.TryEnterCriticalSection(ProcessHandleSetupCriticalSection) = 0 then
   begin
     RecordProcessHandleSetupContention;
     EnterCriticalSection(ProcessHandleSetupCriticalSection);
