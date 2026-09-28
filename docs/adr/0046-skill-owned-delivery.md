@@ -28,8 +28,8 @@ LWPT now keeps only what those skills cannot provide:
   consume: capability routing, context packets, token interventions, waits,
   escalation, the worktree path budget, the integration destination, and the
   full-CI rule. Every pull request needs a green `mode=manual` run on its
-  exact head before a head-matched squash merge, and nothing merges while
-  `main` is red.
+  exact head before a head-matched squash merge, and only while the current
+  `main` commit has a successful push run.
   It also names the review evidence: an independent review the delivering
   agent runs on the exact head, currently Codex with `gpt-6-astra`.
 - `.github/delivery/review-automations.json` stays at the path

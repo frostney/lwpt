@@ -14,22 +14,21 @@ name: PR
 #                 offline ordinary tests natively on
 #                 windows-latest. Typical wall-clock
 #                 < 10 min on a warm toolchain cache (hard caps per job/step).
-#   ci.yml      — push to main: full 6-target cross-build +
-#                 per-platform native test runs (including E2E paths on
-#                 every platform). Post-merge confirmation. Also
-#                 dispatchable on any ref for the full matrix or one
-#                 allow-listed diagnostic slice.
+#   ci.yml      — full 6-target cross-build + per-platform native test
+#                 runs (including E2E paths on every platform). Required
+#                 as a manual run on every PR's exact head before merge,
+#                 and runs again on the push to main. One allow-listed
+#                 diagnostic slice is also dispatchable on any ref.
 #   release.yml — tag-triggered cross-build + package + publish.
 #
-# Trade-off, deliberate: a PR that introduces a regression on the
-# legs the gate still omits (x86_64-darwin, aarch64-linux,
-# i386-win32, or non-Linux e2e) will pass pr.yml and only fail on
-# the main-branch ci.yml run. The maintainer reverts/forwards-fixes
-# from main. Pre-merge coverage now spans Linux ordinary+E2E,
-# aarch64-darwin ordinary, and win64 offline (#102 extended the
-# original Ubuntu+win64 gate). This bounded trade keeps PR feedback
-# cheap, which is the conscious GocciaScript design
-# choice we mirror.
+# Trade-off, deliberate: this automatic gate stays cheap enough to run
+# on every push, so it omits x86_64-darwin, aarch64-linux, i386-win32,
+# and non-Linux e2e. Those legs are not post-merge only: every PR also
+# needs a green manual ci.yml run on its exact head before merge
+# (ORCHESTRATION.md), because the automatic gate alone repeatedly let
+# Intel-Darwin, i386 and cross-toolchain breaks reach main. The gate
+# covers Linux ordinary+E2E, aarch64-darwin ordinary, and win64
+# offline (#102 extended the original Ubuntu+win64 gate).
 #
 # The first carve-out from that trade-off was Windows, via the
 # win64 leg. {$IFDEF WINDOWS} codepaths never compile on the Ubuntu
@@ -43,9 +42,9 @@ name: PR
 # process env) and compile breaks in test sources, which lwpt test
 # compiles with the native FPC. #102 added the next two carve-outs
 # (the Linux E2E step and the darwin-test leg below) after the
-# #84/#105 escape classes. Still post-merge only: the i386-win32
-# leg, E2E paths on non-Linux platforms, bootstrap.bat, and the
-# x86_64-darwin / aarch64-linux permutations.
+# #84/#105 escape classes. Left to the required manual ci.yml run:
+# the i386-win32 leg, E2E paths on non-Linux platforms,
+# bootstrap.bat, and the x86_64-darwin / aarch64-linux permutations.
 #
 # The Ubuntu native build deliberately uses the distro FPC (same
 # as the install instructions in README.md), so a regression that
@@ -176,11 +175,11 @@ jobs:
   # and darwin-only runtime breaks (the fpc-proxy misroute) were
   # invisible to the Linux-only gate. Native
   # bootstrap via brew keeps this independent of the cross-toolchain
-  # cache. Ordinary paths only; E2E stays on the Linux leg above and on
-  # post-merge ci.yml. Cost bound: ~5-6 min warm (brew fpc ~40 s +
-  # bootstrap ~1 min + ordinary tests). The remaining ci.yml-only legs
-  # (x86_64-darwin, aarch64-linux, i386-win32) stay post-merge: their
-  # unique-catch rate has not justified per-PR cost.
+  # cache. Ordinary paths only; E2E stays on the Linux leg above and in
+  # the required manual ci.yml run. Cost bound: ~5-6 min warm (brew fpc
+  # ~40 s + bootstrap ~1 min + ordinary tests). The remaining
+  # ci.yml-only legs (x86_64-darwin, aarch64-linux, i386-win32) run in
+  # that manual run rather than on every push.
   darwin-test:
     runs-on: macos-latest
     timeout-minutes: 20

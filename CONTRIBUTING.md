@@ -42,7 +42,7 @@ review of the exact head, with its report recorded on the PR, as
 non-draft PRs automatically as an advisory reviewer.
 
 Every PR also needs a green six-target run on its exact head before merge,
-and nothing merges while `main` is red:
+and merges only while the current `main` commit has a green push run:
 `gh workflow run ci.yml --ref <branch> -f mode=manual`. Merge with
 `gh pr merge --squash --match-head-commit <sha>` so a later push cannot slip
 past that evidence. A diagnostic slice (`-f mode=diagnostic`) helps with

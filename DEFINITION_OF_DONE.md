@@ -56,15 +56,16 @@ requirement may be marked not applicable only with a recorded reason.
   affected focused suites before the preparation PR; that PR's required CI and
   the resulting integrated-main CI become the final full-suite evidence.
 - Every change merges only after a green `ci.yml` `mode=manual` run on its
-  exact head, and only while `main` is green, as
+  exact head, and only while the current `main` commit has a green push run,
+  as
   [`ORCHESTRATION.md`](./ORCHESTRATION.md) describes. During remediation, use an
   allow-listed diagnostic slice; a diagnostic is never that evidence. Dispatch
   the full matrix only once the branch contains the current base and focused
   checks, required PR CI, and active review evidence have converged; a later
-  head invalidates it (post-#102 the gate covers Linux ordinary+E2E,
+  head invalidates it (the automatic gate covers Linux ordinary+E2E,
   aarch64-darwin ordinary, and win64 offline; `x86_64-darwin`,
-  `aarch64-linux`, `i386-win32`, and non-Linux E2E remain
-  post-merge-only).
+  `aarch64-linux`, `i386-win32`, and non-Linux E2E run only in that
+  manual run and on `main`).
 - An intermittent-failure fix names the pinned mechanism and its evidence;
   timeout bumps, retries, and quarantines are mitigations and link a
   tracking issue instead.

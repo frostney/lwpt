@@ -105,8 +105,10 @@ implementation or a local gate; never learn this limit from failing tests.
   with every review thread resolved. Merge a single PR with
   `gh pr merge --squash --match-head-commit <sha>`; a native stack merges
   through `git-workflow`.
-- **Main stays green:** nothing merges while the latest push run of `ci.yml`
-  on `main` is red; fix `main` first.
+- **Main stays green:** immediately before a merge, the latest push run of
+  `ci.yml` for the current `main` commit must have concluded `success`. A
+  pending, cancelled, missing, or failed run blocks the merge; fix `main`
+  first.
 - **Full CI:** every PR also needs a green
   `gh workflow run ci.yml --ref <branch> -f mode=manual` run whose head is the
   PR's exact head. Await it with `delivery-wait wait workflow-terminal`, then

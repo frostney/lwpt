@@ -34,6 +34,36 @@ def workflow_job_names(workflow: str) -> list[str]:
     return re.findall(r"^  ([a-zA-Z0-9_-]+):\n", jobs, re.MULTILINE)
 
 
+def workflow_step(workflow: str, name: str) -> tuple[list[str], str]:
+    """Returns a step's env variable names and its dedented run script."""
+    match = re.search(
+        rf"^      - name: {re.escape(name)}\n(.*?)(?=^      - name: |^  [a-zA-Z0-9_-]+:\n|\Z)",
+        workflow,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"workflow step {name!r} not found")
+    step = match.group(1)
+    env = re.findall(r"^          ([A-Z_]+): ", step, re.MULTILINE)
+    run = step.split("        run: |\n", 1)[1]
+    script = "".join(
+        line[10:] if line.startswith("          ") else line.lstrip()
+        for line in run.splitlines(keepends=True)
+    )
+    return env, script
+
+
+def run_step(script: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": os.environ["PATH"], **env},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+
 class PullRequestGateTests(unittest.TestCase):
     def test_every_base_branch_runs_the_gate(self) -> None:
         workflow = read(".github/workflows/pr.yml")
@@ -70,6 +100,31 @@ class PullRequestGateTests(unittest.TestCase):
         for name in others:
             self.assertIn(f"      - {name}\n", admission)
             self.assertIn(f"${{{{ needs.{name}.result }}}}", admission)
+
+    def test_admission_accepts_only_all_successful_jobs(self) -> None:
+        workflow = read(".github/workflows/pr.yml")
+        env_names, script = workflow_step(workflow, "Require the native PR gate")
+        self.assertEqual(6, len(env_names))
+        all_success = {name: "success" for name in env_names}
+        self.assertEqual(0, run_step(script, all_success).returncode)
+        for name in env_names:
+            for result in ("failure", "cancelled", "skipped", ""):
+                with self.subTest(job=name, result=result):
+                    outcome = run_step(script, {**all_success, name: result})
+                    self.assertNotEqual(0, outcome.returncode)
+
+    def test_workflows_running_pr_code_stay_read_only(self) -> None:
+        for name in ("pr.yml", "ci.yml"):
+            workflow = read(f".github/workflows/{name}")
+            with self.subTest(workflow=name):
+                top = re.search(r"^permissions:\n((?:  .*\n)+)", workflow, re.MULTILINE)
+                self.assertIsNotNone(top)
+                self.assertEqual("  contents: read\n", top.group(1))
+                self.assertEqual(1, len(re.findall(r"^\s*permissions:", workflow, re.MULTILINE)))
+                self.assertNotIn(": write", workflow)
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            with self.subTest(workflow=path.name):
+                self.assertNotIn("pull_request_target", path.read_text(encoding="utf-8"))
 
     def test_main_ruleset_binds_native_admission_job_to_github_actions(self) -> None:
         ruleset = json.loads(read(".github/rulesets/protect-main.json"))
@@ -150,6 +205,58 @@ class IntegratedWorkflowTests(unittest.TestCase):
         self.assertIn('"tests/integration/*.Test.pas"', diagnostic)
         self.assertIn("--jobs=1 --bail=1 --verbose", diagnostic)
         self.assertIn('"${test_command[@]}"', diagnostic)
+
+    def test_diagnostic_validation_refuses_unlisted_slices(self) -> None:
+        workflow = read(".github/workflows/ci.yml")
+        _, script = workflow_step(workflow, "Validate dispatch inputs")
+        allowed = (
+            "aarch64-darwin/scheduling",
+            "x86_64-darwin/default",
+            "x86_64-darwin/scheduling",
+            "x86_64-linux/scheduling",
+            "x86_64-win64/default",
+            "x86_64-win64/e2e",
+            "x86_64-win64/tls",
+            "i386-win32/default",
+            "i386-win32/e2e",
+            "i386-win32/tls",
+        )
+        for slice_name in allowed:
+            target, selector = slice_name.split("/")
+            with self.subTest(slice=slice_name):
+                outcome = run_step(script, {
+                    "MODE": "diagnostic",
+                    "DIAGNOSTIC_TARGET": target,
+                    "DIAGNOSTIC_SELECTOR": selector,
+                })
+                self.assertEqual(0, outcome.returncode, outcome.stdout)
+        refused = (
+            ("x86_64-linux", "default"),
+            ("aarch64-darwin", "default"),
+            ("aarch64-linux", "default"),
+            ("x86_64-win64", "all"),
+            ("", ""),
+            ("x86_64-win64; touch \"$SENTINEL\"", "default"),
+            ("x86_64-win64", "default $(touch \"$SENTINEL\")"),
+            ("x86_64-win64/default", "default"),
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            sentinel = Path(raw_tmp) / "injected"
+            for target, selector in refused:
+                with self.subTest(target=target, selector=selector):
+                    outcome = run_step(script, {
+                        "MODE": "diagnostic",
+                        "DIAGNOSTIC_TARGET": target,
+                        "DIAGNOSTIC_SELECTOR": selector,
+                        "SENTINEL": str(sentinel),
+                    })
+                    self.assertNotEqual(0, outcome.returncode)
+                    self.assertFalse(sentinel.exists())
+        self.assertEqual(0, run_step(script, {
+            "MODE": "manual",
+            "DIAGNOSTIC_TARGET": "",
+            "DIAGNOSTIC_SELECTOR": "",
+        }).returncode)
 
     def test_arm_darwin_scheduling_diagnostic_uses_native_matrix(self) -> None:
         workflow = read(".github/workflows/ci.yml")
@@ -421,7 +528,11 @@ class OrchestrationPolicyTests(unittest.TestCase):
     def test_policy_binds_repository_evidence(self) -> None:
         policy = read("ORCHESTRATION.md")
         self.assertIn("`delivery-admission`", policy)
-        self.assertIn("every pr also needs a green", policy.replace("\n", " ").lower())
+        flat = " ".join(policy.split())
+        self.assertIn("every PR also needs a green", flat)
+        self.assertIn("the PR's exact head", flat)
+        self.assertIn("latest push run of `ci.yml` for the current `main` commit", flat)
+        self.assertIn("concluded `success`", flat)
         self.assertIn("gh workflow run ci.yml --ref <branch> -f mode=manual", policy)
         self.assertIn("--match-head-commit", policy)
         self.assertIn("`.github/delivery/review-automations.json`", policy)
