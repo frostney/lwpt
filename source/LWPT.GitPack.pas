@@ -132,12 +132,14 @@ function IsFullGitObjectId(const AValue: string): Boolean;
 implementation
 
 uses
-  sha1,
-  { zbase and zinflate rather than the paszlib wrapper: the cross-compile
-    toolchain ships only the units zstream depends on. zbase declares an
+  { The cross-compile toolchain ships only the units LWPT already depends
+    on, so SHA-1 comes from LWPT.SHA1 and inflation from zbase and zinflate
+    rather than FPC's sha1 unit and the paszlib wrapper. zbase declares an
     enum value COPY, so this unit calls System.Copy explicitly. }
   zbase,
-  zinflate;
+  zinflate,
+
+  LWPT.SHA1;
 
 const
   OBJ_COMMIT = 1;

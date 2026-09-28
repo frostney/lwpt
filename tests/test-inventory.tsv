@@ -44,6 +44,7 @@ program	*	source/LWPT.Formatter.Test.pas	7	97
 program	*	source/LWPT.GitPack.Test.pas	1	23
 program	*	source/LWPT.GitProtocol.Test.pas	4	48
 program	*	source/LWPT.Health.Test.pas	1	11
+program	*	source/LWPT.SHA1.Test.pas	1	2
 program	*	source/LWPT.TestArtifactSet.Test.pas	1	9
 program	windows/*	source/LWPT.TestArtifactSet.Test.pas	1	7
 program	*	source/LWPT.TestInventory.Test.pas	1	7

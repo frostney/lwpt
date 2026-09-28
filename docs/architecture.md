@@ -373,7 +373,7 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
 `LWPT.GitProtocol.pas` (ref listing and commit-reachability proofs),
-`LWPT.GitPack.pas` (bounded commits-only packfile reader),
+`LWPT.GitPack.pas` (bounded commits-only packfile reader), `LWPT.SHA1.pas` (self-contained SHA-1 for git object ids; the cross toolchain ships no `sha1` unit),
 `LWPT.FetchPolicy.pas` (built-in forge origins and per-dependency fetch
 destination policy), and the `LWPT.Registry.*` origin storage, signing,
 HTTP routing, and native macOS listener units) plus a small remainder of utility units
