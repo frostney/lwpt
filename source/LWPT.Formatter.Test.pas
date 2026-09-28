@@ -107,7 +107,13 @@ type
     procedure TestNewNameBoundOnlyInAShadowingScopeIsNoCollision;
     procedure TestMemberOfTheNewNameIsNoCollision;
     procedure TestNestedRecordFieldIsNotABinding;
-    procedure TestAbsoluteAliasFollowsTheRename;
+    procedure TestNestedAbsoluteAliasBlocksTheRename;
+    procedure TestOwnAbsoluteAliasFollowsTheRename;
+    procedure TestInitializerLabelBlocksTheRename;
+    procedure TestInitializerLabelWithAGlobalBlocksTheRename;
+    procedure TestSwitchAfterAModifierKeepsTheModifier;
+    procedure TestEscapedKeywordParametersRenameOnlyIdentifiers;
+    procedure TestDirectiveWordParameterIsLeftAlone;
     procedure TestUncertainNestedMentionBlocksTheRename;
     procedure TestNestedRoutineNamedLikeTheParameterBlocksTheRename;
     procedure TestSameNamedRecordFieldIsNotTheParameter;
@@ -1782,12 +1788,12 @@ begin
     'end.']));
 end;
 
-procedure TFormatRoutineScope.TestAbsoluteAliasFollowsTheRename;
+procedure TFormatRoutineScope.TestNestedAbsoluteAliasBlocksTheRename;
 begin
-  { Review D-1: `absolute count` refers to the parameter; it is renamed
-    with it rather than read as a shadowing declaration. }
-  ExpectFormats('AbsoluteAlias', SourceLines([
-    'program AbsoluteAlias;',
+  { A nested `absolute` target may name a binding the formatter cannot
+    place, so the outer parameter keeps its name (review D-1, N-3). }
+  ExpectUnchanged('NestedAbsoluteAlias', SourceLines([
+    'program NestedAbsoluteAlias;',
     '{$mode objfpc}',
     '',
     'procedure Outer(count: Integer);',
@@ -1804,24 +1810,186 @@ begin
     '',
     'begin',
     '  Outer(1);',
-    'end.']), SourceLines([
-    'program AbsoluteAlias;',
+    'end.']));
+end;
+
+procedure TFormatRoutineScope.TestOwnAbsoluteAliasFollowsTheRename;
+begin
+  { In the routine that owns the parameter, `absolute count` can only
+    name the parameter, so it is renamed with it. }
+  ExpectFormats('OwnAbsoluteAlias', SourceLines([
+    'program OwnAbsoluteAlias;',
     '{$mode objfpc}',
     '',
-    'procedure Outer(ACount: Integer);',
+    'procedure Show(count: Integer);',
+    'var',
+    '  Alias: Integer absolute count;',
+    'begin',
+    '  WriteLn(Alias, count);',
+    'end;',
+    '',
+    'begin',
+    '  Show(1);',
+    'end.']), SourceLines([
+    'program OwnAbsoluteAlias;',
+    '{$mode objfpc}',
+    '',
+    'procedure Show(ACount: Integer);',
+    'var',
+    '  Alias: Integer absolute ACount;',
+    'begin',
+    '  WriteLn(Alias, ACount);',
+    'end;',
+    '',
+    'begin',
+    '  Show(1);',
+    'end.']));
+end;
+
+procedure TFormatRoutineScope.TestInitializerLabelBlocksTheRename;
+begin
+  { Review N-3: `count: 7` labels a field of a typed constant; read as a
+    nested binding, it used to exclude Inner and leave its use of the
+    parameter stale. }
+  ExpectUnchanged('InitializerLabel', SourceLines([
+    'program InitializerLabel;',
+    '{$mode objfpc}',
+    '',
+    'type',
+    '  TRec = record',
+    '    first, count: Integer;',
+    '  end;',
+    '',
+    'procedure Outer(count: Integer);',
     '  procedure Inner;',
-    '  var',
-    '    Alias: Integer absolute ACount;',
+    '  const',
+    '    Data: TRec = (first: 1; count: 7);',
     '  begin',
-    '    WriteLn(Alias);',
+    '    WriteLn(count, Data.count);',
     '  end;',
     'begin',
     '  Inner;',
+    '  WriteLn(count);',
+    'end;',
+    '',
+    'begin',
+    '  Outer(3);',
+    'end.']));
+end;
+
+procedure TFormatRoutineScope.TestInitializerLabelWithAGlobalBlocksTheRename;
+begin
+  { The same shape with a global `count`: the stale reference used to
+    compile against the global, and the program printed 997 instead of
+    37. }
+  ExpectUnchanged('InitializerGlobal', SourceLines([
+    'program InitializerGlobal;',
+    '{$mode objfpc}',
+    '',
+    'type',
+    '  TRec = record',
+    '    first, count: Integer;',
+    '  end;',
+    '',
+    'var',
+    '  count: Integer = 99;',
+    '',
+    'procedure Outer(count: Integer);',
+    '  procedure Inner;',
+    '  const',
+    '    Data: TRec = (first: 1; count: 7);',
+    '  begin',
+    '    WriteLn(count, Data.count);',
+    '  end;',
+    'begin',
+    '  Inner;',
+    '  WriteLn(count);',
+    'end;',
+    '',
+    'begin',
+    '  Outer(3);',
+    'end.']));
+end;
+
+procedure TFormatRoutineScope.TestSwitchAfterAModifierKeepsTheModifier;
+begin
+  (* Review N-1: a switch between `const` or `var` and the name made the
+     modifier read as a parameter (`AConst {$R+} ACount`). *)
+  ExpectFormats('SwitchAfterModifier', SourceLines([
+    'program SwitchAfterModifier;',
+    '',
+    'procedure Show(const {$R+} count: Integer);',
+    'begin',
+    '  WriteLn(count);',
+    'end;',
+    '',
+    'procedure Fill(var {$R+} total: Integer);',
+    'begin',
+    '  total := 1;',
+    'end;',
+    '',
+    'var',
+    '  Value: Integer;',
+    'begin',
+    '  Show(1);',
+    '  Fill(Value);',
+    'end.']), SourceLines([
+    'program SwitchAfterModifier;',
+    '',
+    'procedure Show(const {$R+} ACount: Integer);',
+    'begin',
     '  WriteLn(ACount);',
+    'end;',
+    '',
+    'procedure Fill(var {$R+} ATotal: Integer);',
+    'begin',
+    '  ATotal := 1;',
+    'end;',
+    '',
+    'var',
+    '  Value: Integer;',
+    'begin',
+    '  Show(1);',
+    '  Fill(Value);',
+    'end.']));
+end;
+
+procedure TFormatRoutineScope.TestEscapedKeywordParametersRenameOnlyIdentifiers;
+begin
+  { Review N-2: `&begin` and `&end` are identifiers; the `begin` and `end`
+    keywords around them used to be renamed too. }
+  ExpectFormats('EscapedKeywords', SourceLines([
+    'program EscapedKeywords;',
+    '',
+    'procedure Outer(&begin: Integer);',
+    'begin',
+    '  WriteLn(&begin);',
+    'end;',
+    '',
+    'procedure Last(&end: Integer);',
+    'begin',
+    '  WriteLn(&end);',
     'end;',
     '',
     'begin',
     '  Outer(1);',
+    '  Last(2);',
+    'end.']), SourceLines([
+    'program EscapedKeywords;',
+    '',
+    'procedure Outer(ABegin: Integer);',
+    'begin',
+    '  WriteLn(ABegin);',
+    'end;',
+    '',
+    'procedure Last(AEnd: Integer);',
+    'begin',
+    '  WriteLn(AEnd);',
+    'end;',
+    '',
+    'begin',
+    '  Outer(1);',
+    '  Last(2);',
     'end.']));
 end;
 
@@ -2327,20 +2495,19 @@ end;
 
 procedure TFormatRoutineScope.TestInterfaceDeclarationAndImplementationStayInStep;
 begin
-  { `message` is a directive word, not a reserved one: still renamed. }
   ExpectFormats('InterfaceInStep', SourceLines([
     'unit InterfaceInStep;',
     '{$mode objfpc}',
     '',
     'interface',
     '',
-    'procedure Announce(message: string);',
+    'procedure Announce(note: string);',
     '',
     'implementation',
     '',
-    'procedure Announce(message: string);',
+    'procedure Announce(note: string);',
     'begin',
-    '  WriteLn(message);',
+    '  WriteLn(note);',
     'end;',
     '',
     'end.']), SourceLines([
@@ -2349,15 +2516,33 @@ begin
     '',
     'interface',
     '',
-    'procedure Announce(AMessage: string);',
+    'procedure Announce(ANote: string);',
     '',
     'implementation',
     '',
-    'procedure Announce(AMessage: string);',
+    'procedure Announce(ANote: string);',
     'begin',
-    '  WriteLn(AMessage);',
+    '  WriteLn(ANote);',
     'end;',
     '',
+    'end.']));
+end;
+
+procedure TFormatRoutineScope.TestDirectiveWordParameterIsLeftAlone;
+begin
+  { `message` is read as a keyword token. Renames never touch keyword
+    tokens, so a parameter spelled like a directive word keeps its name. }
+  ExpectUnchanged('DirectiveWordParameter', SourceLines([
+    'program DirectiveWordParameter;',
+    '{$mode objfpc}',
+    '',
+    'procedure Announce(message: string);',
+    'begin',
+    '  WriteLn(message);',
+    'end;',
+    '',
+    'begin',
+    '  Announce(''x'');',
     'end.']));
 end;
 
@@ -2645,8 +2830,20 @@ begin
     TestMemberOfTheNewNameIsNoCollision);
   Test('a nested record field is not a binding',
     TestNestedRecordFieldIsNotABinding);
-  Test('an absolute alias follows the rename',
-    TestAbsoluteAliasFollowsTheRename);
+  Test('a nested absolute alias blocks the rename',
+    TestNestedAbsoluteAliasBlocksTheRename);
+  Test('the owning routine''s absolute alias follows the rename',
+    TestOwnAbsoluteAliasFollowsTheRename);
+  Test('a typed-constant initializer label blocks the rename',
+    TestInitializerLabelBlocksTheRename);
+  Test('an initializer label with a same-named global blocks the rename',
+    TestInitializerLabelWithAGlobalBlocksTheRename);
+  Test('a switch after a parameter modifier keeps the modifier',
+    TestSwitchAfterAModifierKeepsTheModifier);
+  Test('escaped keyword parameters rename only identifiers',
+    TestEscapedKeywordParametersRenameOnlyIdentifiers);
+  Test('a parameter spelled like a directive word is left alone',
+    TestDirectiveWordParameterIsLeftAlone);
   Test('an uncertain nested mention blocks the rename',
     TestUncertainNestedMentionBlocksTheRename);
   Test('a with statement blocks the rename',

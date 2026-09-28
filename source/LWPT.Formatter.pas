@@ -162,6 +162,8 @@ type
     function IsText(const AIndex: Integer; const AText: string): Boolean;
     function IsName(const AIndex: Integer): Boolean;
     function NameIs(const AIndex: Integer; const AName: string): Boolean;
+    function IsIdentifier(const AIndex: Integer): Boolean;
+    function IdentifierIs(const AIndex: Integer; const AName: string): Boolean;
     function Text(const AIndex: Integer): string;
     function Spelling(const AIndex: Integer): string;
     function LineIndex(const AIndex: Integer): Integer;
@@ -204,7 +206,8 @@ begin
       Inc(Position);
     end;
   end;
-  FTokens := TokenizePascal(Source, ASourceName);
+  { Strict strings: a rewrite must not read code as string text. }
+  FTokens := TokenizePascal(Source, ASourceName, True);
   SetLength(FReplacements, Length(FTokens));
   SetLength(FReplaced, Length(FTokens));
   SetLength(FSpacesBefore, Length(FTokens));
@@ -244,6 +247,22 @@ end;
 function TSourceTokens.NameIs(const AIndex: Integer; const AName: string): Boolean;
 begin
   Result := IsName(AIndex) and (FTokens[AIndex].Text = AName);
+end;
+
+(* An identifier token, never a keyword one. Renames touch only these:
+   an escaped `&begin` is the identifier `begin`, while `begin` itself is
+   syntax, so matching by text alone would rewrite the keyword. Directive
+   words such as `name` or `message` are keyword tokens too, so a
+   parameter spelled like one is never renamed. *)
+function TSourceTokens.IsIdentifier(const AIndex: Integer): Boolean;
+begin
+  Result := (AIndex >= 0) and (AIndex < Length(FTokens)) and
+            (FTokens[AIndex].Kind = ptIdentifier);
+end;
+
+function TSourceTokens.IdentifierIs(const AIndex: Integer; const AName: string): Boolean;
+begin
+  Result := IsIdentifier(AIndex) and (FTokens[AIndex].Text = AName);
 end;
 
 function TSourceTokens.Text(const AIndex: Integer): string;
@@ -750,7 +769,7 @@ end;
 procedure TRoutineIndex.ReadParameters(var AHeader: TRoutineHeader;
   const AOpenToken: Integer);
 var
-  Close, TokenIndex, Depth, GroupNames: Integer;
+  Close, TokenIndex, Depth, GroupNames, Following: Integer;
   InNames, InDefault, GroupStart: Boolean;
   Modifier, TypeText: string;
 
@@ -808,8 +827,13 @@ begin
       end;
       if FSource.IsText(TokenIndex, ',') or not FSource.IsName(TokenIndex) then
         Continue;
+      (* A switch directive may sit between a modifier and its name
+         (`const {$R+} count`); look past it. *)
+      Following := TokenIndex + 1;
+      while (Following < Close) and FSource.IsDirective(Following) do
+        Inc(Following);
       if GroupStart and IsModifier(FSource.Text(TokenIndex)) and
-         FSource.IsName(TokenIndex + 1) then
+         FSource.IsName(Following) then
       begin
         Modifier := FSource.Text(TokenIndex);
         GroupStart := False;
@@ -1296,7 +1320,7 @@ begin
         TokenIndex := AIndex.FindBlockEnd(TokenIndex);
         Continue;
       end;
-      if ASource.IsName(TokenIndex) and not ASource.IsText(TokenIndex - 1, '.') and
+      if ASource.IsIdentifier(TokenIndex) and not ASource.IsText(TokenIndex - 1, '.') and
          Names.TryGetValue(ASource.Text(TokenIndex), NewName) then
         ASource.Replace(TokenIndex, NewName);
       Inc(TokenIndex);
@@ -1328,7 +1352,11 @@ type
        - the old name is used in a header other than as a parameter (a
          type of the same name), is declared or used in the routine's own
          declaration part other than as a record member or through
-         `absolute`, names a nested routine, or is the routine's name;
+         `absolute`, appears in a nested routine's initializer or
+         `absolute` target, names a nested routine, or is the routine's
+         name;
+       - the parameter token is a keyword token (a directive word such as
+         `message`): renames touch identifier tokens only;
        - a `with` statement precedes a use of the old name;
        - the new name is already visible where the parameter is;
        - an implementation omits the parameter list a declaration gives,
@@ -1350,7 +1378,8 @@ type
     function IsBlocked(const AHeader: TRoutineHeader; const AOldName: string): Boolean;
     function NameOccurs(const AName: string; const AFirst, ALast: Integer): Boolean;
     function HeaderMentions(const ARoutine: Integer; const AName: string): TMention;
-    function DeclarationMentions(const ARoutine: Integer; const AName: string): TMention;
+    function DeclarationMentions(const ARoutine: Integer; const AName: string;
+      const ANested: Boolean): TMention;
     function BindsName(const ARoutine: Integer; const AName: string): Boolean;
     function RoutineIsSafe(const ARoutine: Integer): Boolean;
     function CollectScope(const ARoutine: Integer; const AName: string): Boolean;
@@ -1422,7 +1451,7 @@ begin
   Header := FIndex.Routine(ARoutine);
   for TokenIndex := Header.NameToken + 1 to Header.HeaderEnd - 1 do
   begin
-    if not FSource.NameIs(TokenIndex, AName) then
+    if not FSource.IdentifierIs(TokenIndex, AName) then
       Continue;
     IsParameter := False;
     for ParameterIndex := 0 to High(Header.ParameterTokens) do
@@ -1437,15 +1466,20 @@ end;
 (* How the routine's own declaration part — outside the routines nested
    there — uses AName:
      - a member of a record, class or object type: no concern;
-     - the target of `absolute`: a reference to an outer binding;
+     - the target of `absolute` in the routine that owns the parameter:
+       a reference to it. In a nested routine the target may be a
+       binding the formatter cannot place, so it is uncertain;
      - declared as a variable, constant, type or resource string: a
        binding;
+     - anything in an initializer, after a declaration's `=` (a typed
+       constant's record labels look like declarations): uncertain;
      - anything else: uncertain. *)
 function TParameterRenamer.DeclarationMentions(const ARoutine: Integer;
-  const AName: string): TMention;
+  const AName: string; const ANested: Boolean): TMention;
 var
   Header, Child: TRoutineHeader;
-  TokenIndex, ChildIndex, Depth: Integer;
+  TokenIndex, ChildIndex, Depth, Brackets: Integer;
+  InInitializer: Boolean;
   Mention: TMention;
 begin
   Result := mnNone;
@@ -1455,6 +1489,8 @@ begin
   TokenIndex := Header.HeaderEnd;
   ChildIndex := Header.FirstChild;
   Depth := 0;
+  Brackets := 0;
+  InInitializer := False;
   while TokenIndex < Header.BodyStart do
   begin
     if ChildIndex <> NoRoutine then
@@ -1467,14 +1503,31 @@ begin
         Continue;
       end;
     end;
+    if FSource.IsText(TokenIndex, '(') or FSource.IsText(TokenIndex, '[') then
+      Inc(Brackets)
+    else if (FSource.IsText(TokenIndex, ')') or FSource.IsText(TokenIndex, ']')) and
+            (Brackets > 0) then
+      Dec(Brackets)
+    else if (Brackets = 0) and FSource.IsText(TokenIndex, ';') then
+      InInitializer := False
+    else if (Brackets = 0) and (Depth = 0) and FSource.IsText(TokenIndex, '=') then
+      InInitializer := True;
+
     if FIndex.CompositeOpening(TokenIndex) then
       Inc(Depth)
     else if FSource.IsText(TokenIndex, 'end') and (Depth > 0) then
       Dec(Depth)
-    else if (Depth = 0) and FSource.NameIs(TokenIndex, AName) then
+    else if (Depth = 0) and FSource.IdentifierIs(TokenIndex, AName) then
     begin
-      if FSource.IsText(TokenIndex - 1, 'absolute') then
-        Mention := mnReference
+      if InInitializer then
+        Mention := mnUncertain
+      else if FSource.IsText(TokenIndex - 1, 'absolute') then
+      begin
+        if ANested then
+          Mention := mnUncertain
+        else
+          Mention := mnReference;
+      end
       else if (FSource.IsText(TokenIndex - 1, 'var') or FSource.IsText(TokenIndex - 1, 'const') or
                FSource.IsText(TokenIndex - 1, 'type') or FSource.IsText(TokenIndex - 1, 'threadvar') or
                FSource.IsText(TokenIndex - 1, 'resourcestring') or
@@ -1494,7 +1547,7 @@ end;
 function TParameterRenamer.BindsName(const ARoutine: Integer; const AName: string): Boolean;
 begin
   Result := (HeaderMentions(ARoutine, AName) = mnBinding) or
-            (DeclarationMentions(ARoutine, AName) = mnBinding);
+            (DeclarationMentions(ARoutine, AName, True) = mnBinding);
 end;
 
 function TParameterRenamer.RoutineIsSafe(const ARoutine: Integer): Boolean;
@@ -1536,7 +1589,7 @@ begin
     if FSource.NameIs(Child.NameToken, AName) then
       Exit(False);
     InHeader := HeaderMentions(ChildIndex, AName);
-    InDeclarations := DeclarationMentions(ChildIndex, AName);
+    InDeclarations := DeclarationMentions(ChildIndex, AName, True);
     if (InHeader = mnUncertain) or (InDeclarations = mnUncertain) then
       Exit(False);
     if (InHeader = mnBinding) or (InDeclarations = mnBinding) then
@@ -1625,7 +1678,7 @@ begin
   FExcludedCount := 0;
   if HeaderMentions(ARoutine, APair.OldName) = mnUncertain then
     Exit(False);
-  InDeclarations := DeclarationMentions(ARoutine, APair.OldName);
+  InDeclarations := DeclarationMentions(ARoutine, APair.OldName, False);
   if InDeclarations in [mnBinding, mnUncertain] then
     Exit(False);
   if not CollectScope(ARoutine, APair.OldName) then
@@ -1761,7 +1814,7 @@ begin
       Inc(Depth)
     else if FSource.IsText(TokenIndex, 'end') and (Depth > 0) then
       Dec(Depth)
-    else if (Depth = 0) and FSource.NameIs(TokenIndex, APair.OldName) and
+    else if (Depth = 0) and FSource.IdentifierIs(TokenIndex, APair.OldName) and
             not FSource.IsText(TokenIndex - 1, '.') then
       FSource.Replace(TokenIndex, APair.NewName);
     Inc(TokenIndex);
@@ -1790,8 +1843,11 @@ begin
     if (Spelling <> '') and (Spelling[1] = '&') then
       Delete(Spelling, 1, 1);
     NewName := 'A' + UpCase(Spelling[1]) + Copy(Spelling, 2, MaxInt);
+    { A parameter read as a keyword token (a directive word such as
+      `message`) cannot be renamed by token role, so it is left alone. }
     if (LowerCase(Spelling) = 'self') or (Length(Spelling) < 2) or
-       HasAPrefix(Spelling) or IsPascalKeyword(NewName) then
+       HasAPrefix(Spelling) or IsPascalKeyword(NewName) or
+       not FSource.IsIdentifier(Header.ParameterTokens[ParameterIndex]) then
       NewName := '';
     Duplicate := False;
     for Existing := 0 to Count - 1 do

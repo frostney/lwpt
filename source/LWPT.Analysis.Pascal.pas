@@ -61,8 +61,14 @@ type
     Regions: TLWPTPascalRegionArray;
   end;
 
+{ AStrictStrings rejects a quoted string that reaches the end of its line,
+  as FPC does for code it compiles. The analyses keep the default: they
+  also read inactive conditional branches, where FPC tolerates such
+  text, so a string there runs on to its closing quote. A caller that
+  rewrites the source (the formatter) asks for the strict reading. }
 function TokenizePascal(const ASource: string;
-  const ASourceName: string = ''): TLWPTPascalTokenArray;
+  const ASourceName: string = '';
+  const AStrictStrings: Boolean = False): TLWPTPascalTokenArray;
 function AnalyzePascal(const ASource: string;
   const ASourceName: string = ''): TLWPTPascalDocument;
 function PascalRegionIsExecutable(const AKind: TLWPTPascalRegionKind):
@@ -147,8 +153,8 @@ begin
     [Prefix, ALine, AColumn, AMessage]);
 end;
 
-function TokenizePascal(const ASource, ASourceName: string):
-  TLWPTPascalTokenArray;
+function TokenizePascal(const ASource, ASourceName: string;
+  const AStrictStrings: Boolean): TLWPTPascalTokenArray;
 var
   Column, Index, Line, StartColumn, StartIndex, StartLine, TokenCapacity,
     TokenCount: Integer;
@@ -306,8 +312,9 @@ var
     while Index <= Length(ASource) do
     begin
       { FPC ends a quoted string at the end of its line ("String exceeds
-        line"); reading on would take code for string text. }
-      if ASource[Index] in [#10, #13] then
+        line"); in strict mode, reading on would take code for string
+        text. }
+      if AStrictStrings and (ASource[Index] in [#10, #13]) then
         Break;
       if ASource[Index] <> '''' then
       begin
