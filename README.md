@@ -136,7 +136,7 @@ units = ["src"]
 horse        = "HashLoad/horse@^4.0.0"                  # GitHub by default, SemVer range
 hello        = "octocat/Hello-World@1.0.0"              # exact SemVer (matches tag `1.0.0` or `v1.0.0`)
 ci-debug     = "gitlab:gitlab-examples/ci-debug-trace@dd648b2e48ce6518303b0bb580b2ee32fadaf045" # GitLab via prefix, commit SHA
-atlaskit     = "bitbucket:atlassian/atlaskit@d7ac1ac"   # Bitbucket via prefix, commit SHA
+atlaskit     = "bitbucket:atlassian/atlaskit@d7ac1acad54ed82e3fc244398cd29044f9bf1775" # Bitbucket via prefix, full commit SHA (must be on a branch or tag)
 custom       = "https://example.com/custom-1.0.0.tar.gz" # arbitrary HTTPS tarball
 leaf         = "../leaf"                                # local sibling path
 # Inline-table form for advanced options (include / exclude filters,

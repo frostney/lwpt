@@ -1,0 +1,8 @@
+0014command=ls-refs
+000fagent=lwpt
+0017object-format=sha1
+0001000csymrefs
+0014ref-prefix HEAD
+001bref-prefix refs/heads/
+001aref-prefix refs/tags/
+0000
