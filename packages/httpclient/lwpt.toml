@@ -6,11 +6,12 @@
 # package — there's only ONE copy of HTTPClient now, lives here.
 #
 # Bundles FileUtils + StringBuffer as transitive deps (per
-# ADR-0014's "bundled shared utils" decision); both stay verbatim
-# from GocciaScript's earlier copy. HTTPClient.Test.pas + the Tests.HTTPMockServer.pas
-# support unit live here too so the package is self-testable.
+# ADR-0014's "bundled shared utils" decision); both have since diverged
+# from GocciaScript's copies (see docs/packages.md). HTTPClient.Test.pas +
+# the Tests.HTTPMockServer.pas support unit live here too so the package
+# is self-testable.
 
 [package]
 name    = "httpclient"
-version = "0.4.0"
+version = "0.6.0"
 units   = ["source"]

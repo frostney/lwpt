@@ -55,10 +55,8 @@ requirement may be marked not applicable only with a recorded reason.
   locally merely to restate the same proof. Approved source fixes run their
   affected focused suites before the preparation PR; that PR's required CI and
   the resulting integrated-main CI become the final full-suite evidence.
-- A change touching process management, concurrency, platform-specific code,
-  or the CI workflows themselves is labelled `ci:full-required` when it
-  targets platforms or test routes the PR gate does not cover. It merges only
-  after a green `ci.yml` `mode=manual` run on its exact head, as
+- Every change merges only after a green `ci.yml` `mode=manual` run on its
+  exact head, and only while `main` is green, as
   [`ORCHESTRATION.md`](./ORCHESTRATION.md) describes. During remediation, use an
   allow-listed diagnostic slice; a diagnostic is never that evidence. Dispatch
   the full matrix only once the branch contains the current base and focused

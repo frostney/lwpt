@@ -421,7 +421,7 @@ class OrchestrationPolicyTests(unittest.TestCase):
     def test_policy_binds_repository_evidence(self) -> None:
         policy = read("ORCHESTRATION.md")
         self.assertIn("`delivery-admission`", policy)
-        self.assertIn("`ci:full-required`", policy)
+        self.assertIn("every pr also needs a green", policy.replace("\n", " ").lower())
         self.assertIn("gh workflow run ci.yml --ref <branch> -f mode=manual", policy)
         self.assertIn("--match-head-commit", policy)
         self.assertIn("`.github/delivery/review-automations.json`", policy)
@@ -429,7 +429,8 @@ class OrchestrationPolicyTests(unittest.TestCase):
         self.assertIn("`gpt-6-astra`", policy)
         self.assertIn("CodeRabbit is advisory", policy)
         self.assertTrue((ROOT / ".github/delivery/review-automations.json").is_file())
-        for retired in ("delivery-transition", "merge:ready", "review:ready", "delivery:managed"):
+        for retired in ("delivery-transition", "merge:ready", "review:ready", "delivery:managed",
+                        "ci:full-required"):
             self.assertNotIn(retired, policy)
 
     def test_path_budget_fits_the_deepest_measured_path(self) -> None:

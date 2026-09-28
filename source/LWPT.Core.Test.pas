@@ -404,6 +404,7 @@ type
     procedure TestGitTemplateMissingRepositoryPlaceholderRejected;
     procedure TestArchiveTemplateHttpRejected;
     procedure TestGitTemplateHttpRejected;
+    procedure TestRefPlaceholderInHostRejected;
     procedure TestShadowingBuiltinPrefixRejected;
     procedure TestDepWithCustomPrefixRoutes;
     procedure TestDepWithUndeclaredCustomPrefixRejected;
@@ -2081,21 +2082,25 @@ procedure TGitProtocolParsing.TestServiceAnnounceIsSkipped;
 const
   PAYLOAD =
     '001e# service=git-upload-pack'#10 +
+    '0000' +
     '0000';
 begin
-  { Service-announce line + flush packet; no refs. Should yield
-    an empty array, not error out. }
+  { Service-announce line + its flush, then an advertisement with no refs
+    and its own terminating flush. Should yield an empty array, not error
+    out. (Without the second flush the advertisement is truncated.) }
   Expect<Integer>(Length(ParseInfoRefs(PAYLOAD))).ToBe(0);
 end;
 
 procedure TGitProtocolParsing.TestHeadWithCapabilitiesIsRecognised;
 const
   { 4-char hex length + payload. 40-char SHA + space + "HEAD"
-    + NUL + capability string + LF. Total payload = 56 chars,
-    +4 prefix = 60 = $003c. HEAD is dropped by the filter, so
-    the result is still empty. }
+    + NUL + capability string (19) + LF. Total payload = 66 chars,
+    +4 prefix = 70 = $0046. (The length was once 3c; the lenient parser
+    stopped at the short frame and returned the same empty result, which
+    hid the error. The strict parser refuses a frame that overruns.)
+    HEAD is dropped by the filter, so the result is still empty. }
   PAYLOAD =
-    '003c0123456789012345678901234567890123456789 HEAD'#0 +
+    '00460123456789012345678901234567890123456789 HEAD'#0 +
     'multi_ack thin-pack'#10 +
     '0000';
 begin
@@ -2830,6 +2835,45 @@ begin
     'must use https://', Self);
 end;
 
+procedure TCustomSources.TestRefPlaceholderInHostRejected;
+var Man: TManifest;
+begin
+  ExpectManifestLoadError(WriteCustomSourceManifest('ref-in-archive-host',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'gitea = { '
+    + 'archive = "https://{ref}.downloads.example/{user}/{repository}.tar.gz", '
+    + 'git = "https://git.example.com/{user}/{repository}.git"'
+    + ' }'#10),
+    'must not use {ref} in its host', Self);
+  ExpectManifestLoadError(WriteCustomSourceManifest('ref-in-git-host',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'gitea = { '
+    + 'archive = "https://git.example.com/{user}/{repository}/{ref}.tar.gz", '
+    + 'git = "https://{ref}.git.example.com/{user}/{repository}.git"'
+    + ' }'#10),
+    'must not use {ref} in its host', Self);
+  { User and repository may name the host; ref in the path stays valid. }
+  Man := LoadManifest(WriteCustomSourceManifest('user-in-host',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'pages = { '
+    + 'archive = "https://{user}.pages.example/{repository}/{ref}.tar.gz", '
+    + 'git = "https://{user}.pages.example/{repository}.git"'
+    + ' }'#10));
+  Expect<Integer>(Length(Man.CustomSources)).ToBe(1);
+end;
+
 procedure TCustomSources.TestShadowingBuiltinPrefixRejected;
 begin
   ExpectManifestLoadError(WriteCustomSourceManifest('shadow-github',
@@ -2919,6 +2963,8 @@ begin
     TestArchiveTemplateHttpRejected);
   Test('git template using plain HTTP hard-errors',
     TestGitTemplateHttpRejected);
+  Test('a ref placeholder in a template host hard-errors',
+    TestRefPlaceholderInHostRejected);
   Test('[sources] entry shadowing a built-in name hard-errors',
     TestShadowingBuiltinPrefixRejected);
   Test('dep with custom prefix routes to hkCustom + correct host name',

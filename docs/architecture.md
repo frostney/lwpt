@@ -16,8 +16,13 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
 - **The registry origin is self-hosted.** `lwpt registry init|serve` owns stable
   identity, content-addressed archives and metadata, atomically activated
   signed snapshots, crash recovery, and the foreground HTTP/TLS lifecycle per
-  [ADR-0043](./adr/0043-self-hosted-registry-origin.md). Publication, clients,
-  and mirrors build on the wire contract in [`registry-spec.md`](./registry-spec.md).
+  [ADR-0043](./adr/0043-self-hosted-registry-origin.md). `registry rotate-key`
+  adds dual-signed local key rotation, and `registry init --role mirror` with
+  `registry sync|verify|serve` runs a read-only mirror. The mirror verifies the
+  origin's signed proof and serves it without contacting the origin while it
+  serves requests, per [ADR-0045](./adr/0045-verified-registry-mirror.md).
+  Publication and clients build on the wire contract in
+  [`registry-spec.md`](./registry-spec.md).
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
 - **Compiler work is session-private.** Build/test compiler outputs stay below a project-owned build-session root (project-local by default, relocatable for path budget); successful build outputs are revalidated and atomically published, while completed-session logs remain available until `lwpt repair` reclaims the session. See ADR-0020.
 - **Build scheduling follows the manifest DAG.** Ready build entries overlap within
@@ -107,7 +112,9 @@ Sections currently supported:
 | `[health]` | optional strict maxima for routine/file cyclomatic and cognitive complexity plus the separate `0..100` hotspot score. Workspaces inherit root limits unless they declare their own table. See [`health.md`](./health.md). |
 | `[duplication]` | command-owned clone policy: `minimum-tokens` defaults to 100 and must be at least 25; optional integer `maximum-percent` fails only when aggregate duplication is greater than the configured value. Workspaces inherit the root table unless they declare their own. |
 
-Dependency source shapes (per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md)): bare `owner/repo` defaults to GitHub; `gitlab:owner/repo` and `bitbucket:owner/repo` prefixes route to those hosts; any `[sources.<name>]` table declares a custom prefix (Gitea, Forgejo, self-hosted GitHub Enterprise / GitLab / Bitbucket Server); `https://...` is an arbitrary tarball URL; paths (`./foo`, `../foo`, `/abs/foo`, `~/foo`, or `local:./foo`) are local sources. Version specs accept SemVer 2.0.0 ranges (`^1.0.0`, `>=1.0.0 <2.0.0`), exact SemVer versions (`1.0.0` — preferred per [semver.org](https://semver.org/#is-v123-a-semantic-version)), commit SHAs (7–40 hex), or arbitrary Git tag names (`v1.0.0`, `release-2024`). SemVer-shaped specs resolve through git smart-HTTP tag listing (uniform across GitHub / GitLab / Bitbucket / Gitea / Forgejo / self-hosted, no JSON, no auth). Explicitly *not* supported: `[[target]]` array-of-tables syntax, the legacy separate `source = "github|gitlab|..." + repo/ref/tag/asset/path` shape (hard-errored with a migration hint), and `git clone` (HTTP archives only — preserves the single-binary RTL-only constraint).
+Dependency source shapes (per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md)): bare `owner/repo` defaults to GitHub; `gitlab:owner/repo` and `bitbucket:owner/repo` prefixes route to those hosts; any `[sources.<name>]` table declares a custom prefix (Gitea, Forgejo, self-hosted GitHub Enterprise / GitLab / Bitbucket Server); `https://...` is an arbitrary tarball URL; paths (`./foo`, `../foo`, `/abs/foo`, `~/foo`, or `local:./foo`) are local sources. Version specs accept SemVer 2.0.0 ranges (`^1.0.0`, `>=1.0.0 <2.0.0`), exact SemVer versions (`1.0.0` — preferred per [semver.org](https://semver.org/#is-v123-a-semantic-version)), commit SHAs, or arbitrary Git tag names (`v1.0.0`, `release-2024`). SemVer-shaped specs resolve through git smart-HTTP tag listing (uniform across GitHub / GitLab / Bitbucket / Gitea / Forgejo / self-hosted, no JSON, no auth). Explicitly *not* supported: `[[target]]` array-of-tables syntax, the legacy separate `source = "github|gitlab|..." + repo/ref/tag/asset/path` shape (hard-errored with a migration hint), and `git clone` (HTTP archives only — preserves the single-binary RTL-only constraint).
+
+Commit-SHA pins (per [ADR-0047](./adr/0047-commit-pins-must-be-reachable.md)): every commit requirement must use the full 40-character SHA and be reachable from an advertised `refs/heads/*` or `refs/tags/*` tip, whether it stands alone or beside a named requirement. Hosts serve fork-only and pull-request commits under the upstream name, so the archive endpoint alone proves nothing. A pin equal to the object an advertised branch or tag names is accepted from the tag listing; peel claims never count. Otherwise `LWPT.GitProtocol.ProveCommitReachable` asks the host's upload-pack service (protocol v2, `filter tree:0`, commits and annotated tags only) for the objects between the tips and the pin, and `LWPT.GitPack` recomputes their ids and walks tag targets and parents. A pin that is unknown, unreachable, abbreviated, or unprovable (host without `filter`, invalid listing, response or proof budget exceeded) fails before its archive is fetched. The lock records the proving ref as `reachableFrom`. The proof runs when a lock entry is created, its commit changes, or it lacks a valid `reachableFrom` (a ref under `refs/heads/` or `refs/tags/`); `--frozen` and `--offline` never contact the host and warn about unproven entries. The resolver's legacy ref listing is parsed with the same name rules, strict framing, and its own count limits; the proof-only 20,000-tip cap does not restrict named requirements. The proof trusts the host for archive contents; see the ADR's threat model.
 
 ## Shared analysis foundation
 
@@ -327,7 +334,7 @@ adds one module-specific subclass:
 | Class | Raised for |
 | --- | --- |
 | `EFetchError` | Network failures, HTTP non-2xx, local source dir missing |
-| `EVerifyError` | `--frozen` or `--offline` identity, archive-hash, or tree-hash mismatch against the lockfile |
+| `EVerifyError` | `--frozen` or `--offline` identity, archive-hash, or tree-hash mismatch against the lockfile; a locked tag that moved or became a branch, or a locked commit whose downloaded archive no longer matches, during an online install (unless `--accept-moved-tags`) |
 | `EExtractError` | Archive parse failures, tar corruption, missing archive, atomic-move failure |
 | `ELockfileError` | Corrupt TOML in `lwpt.lock`, schema version mismatch, or missing lockfile when `--frozen` or `--offline` |
 | `EManifestError` | TOML errors, missing required keys, unsatisfiable constraints, unknown source kinds |
@@ -347,6 +354,8 @@ Each error class carries an `Operation` and a `Recovery` field. The subcommand w
 | `source` | string | The verbatim source string from the manifest (e.g. `"HashLoad/horse"`, `"gitlab:org/repo"`, `"../path"`). Host + kind are inferable by re-running `ParseDependencySource` on this value. |
 | `resolvedRef` | string | The concrete tag name or commit SHA the resolver picked. Empty for `skLocal` + `skURL`. |
 | `resolvedCommit` | string | The authoritative advertised commit fetched for a Git ref. Newly generated v3 entries record it; compatible early v3 entries remain frozen-verifiable when their existing fields prove an unambiguous identity. |
+| `resolvedRefKind` | string | `tag` or `branch` for a dependency selected from a named Git ref; omitted for SHA pins and non-Git sources. Additive v3 evidence ([ADR-0048](./adr/0048-git-host-fetch-trust.md)): a locked tag is immutable, a locked branch may move. |
+| `reachableFrom` | string | For a commit-SHA pin, the branch or tag ref that proved the commit reachable (for example `refs/tags/v1.2.0`); omitted otherwise. Additive v3 evidence ([ADR-0047](./adr/0047-commit-pins-must-be-reachable.md)): an online install proves an entry without it again, and `--frozen` / `--offline` warn. |
 | `sourceIdentity` | string | Canonical source plus normalized include/exclude extraction policy. |
 | `constraintFingerprint` | string | Digest of every accumulated requirement and requirer used to select this package. Requirement lines are sorted by ordinal byte value and each — including the last — is terminated with a pinned LF (never the platform line ending, and never a between-lines join), so the digest is byte-identical on every platform and a lockfile written on one verifies on another. Missing additive evidence in an early v3 entry is accepted only when the remaining identity is unambiguous; mixed named-ref/SHA identity without an authoritative commit requires regeneration. |
 | `resolvedURL` | string | The actual archive URL fetched. Empty for `skLocal`. Self-documents the host: a `gitlab:` dep shows up as `https://gitlab.com/...`. |
@@ -357,7 +366,7 @@ Older lockfile schemas (v1 or v2) fail to load with a clear migration hint: dele
 
 ## Self-host
 
-LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/{item.name}.pas"` and `output = "build/{item.name}"` (placeholder interpolation per [ADR-0012](./adr/0012-manifest-placeholder-interpolation.md)). The pre-commit hook runs `./build/lwpt format` and `./build/lwpt agents`; `./build/lwpt build` recompiles LWPT against itself when needed. The bootstrap (`scripts/bootstrap.pas` + `bootstrap.sh` / `bootstrap.bat`) is the once-per-fresh-clone seed that produces the first `build/lwpt`. See [`build-system.md`](./build-system.md) and [ADR-0005](./adr/0005-self-host-build.md).
+LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/{item.name}.pas"` and `output = "build/{item.name}"` (placeholder interpolation per [ADR-0012](./adr/0012-manifest-placeholder-interpolation.md)). A second entry, `lwpt-testing`, compiles the same program with `-dINSTALL_TESTING` into `build/lwpt-testing`, the only binary that honours the `LWPT_TEST_*` seams; a `[pretest]` hook rebuilds it before every `lwpt test` ([ADR-0044](./adr/0044-test-seams-only-in-test-builds.md)). The pre-commit hook runs `./build/lwpt format` and `./build/lwpt agents`; `./build/lwpt build` recompiles LWPT against itself when needed. The bootstrap (`scripts/bootstrap.pas` + `bootstrap.sh` / `bootstrap.bat`) is the once-per-fresh-clone seed that produces the first `build/lwpt`. See [`build-system.md`](./build-system.md) and [ADR-0005](./adr/0005-self-host-build.md).
 
 ## Source layout and package code
 
@@ -368,8 +377,12 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.Delphi.pas`,
 `LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
-`LWPT.GitProtocol.pas`, and the `LWPT.Registry.*` origin storage, signing,
-HTTP routing, and native macOS listener units) plus a small remainder of utility units
+`LWPT.GitProtocol.pas` (ref listing and commit-reachability proofs),
+`LWPT.GitPack.pas` (bounded commits-only packfile reader), `LWPT.SHA1.pas` (self-contained SHA-1 for git object ids; the cross toolchain ships no `sha1` unit),
+`LWPT.FetchPolicy.pas` (built-in forge origins and per-dependency fetch
+destination policy), and the `LWPT.Registry.*` origin storage, signing,
+shared proof verification, mirror synchronization, HTTP routing, and native
+macOS listener units) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
 LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` —
 live under `packages/<name>/` per

@@ -52,6 +52,13 @@ never with model heartbeats. A monitor makes at most three inferences without
 an external state change, then hands the wait to a non-LLM command. Time-based
 wakes use the exact reported timestamp.
 
+A lane never waits more than five minutes inside its own context. Before a
+longer wait (CI, a queued build or test run, a release workflow, or a
+usage-limit reset), it checkpoints durable state, hands the wait to the
+coordinator or a non-LLM watcher, and ends its turn. It resumes when the
+result arrives. Hosts may expire a lane's context cache within minutes; the
+next turn after an expiry rewrites the whole context.
+
 ## Escalation
 
 Escalate to the maintainer for a material product or architecture decision,
@@ -98,7 +105,9 @@ implementation or a local gate; never learn this limit from failing tests.
   with every review thread resolved. Merge a single PR with
   `gh pr merge --squash --match-head-commit <sha>`; a native stack merges
   through `git-workflow`.
-- **Full CI:** a PR labelled `ci:full-required` also needs a green
+- **Main stays green:** nothing merges while the latest push run of `ci.yml`
+  on `main` is red; fix `main` first.
+- **Full CI:** every PR also needs a green
   `gh workflow run ci.yml --ref <branch> -f mode=manual` run whose head is the
   PR's exact head. Await it with `delivery-wait wait workflow-terminal`, then
   merge with `--match-head-commit <sha>`. A new head needs a new run.

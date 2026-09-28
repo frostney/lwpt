@@ -12,6 +12,14 @@ units = ["source"]
 
 [build]
 lwpt = { source = "source/{item.name}.pas", output = "build/{item.name}" }
+# Test-flavoured binary (ADR-0044). INSTALL_TESTING compiles the
+# fetch-redirection and fault-injection seams (LWPT_TEST_*) that the
+# integration programs drive through a spawned binary. The `lwpt` entry
+# above, bootstrap, and release.yml never pass the define, so the shipped
+# binary ignores those variables.
+lwpt-testing = { source = "source/lwpt.pas",
+                 output = "build/lwpt-testing",
+                 flags = ["-dINSTALL_TESTING"] }
 
 # [workspaces] — monorepo workspace declaration per the ADR-0014
 # amendment "Workspaces" (Q19=b, Q21=a). Each matching dir that
@@ -36,6 +44,12 @@ stamp-version = { command = "instantfpc",
                   args = ["scripts/stamp-version.pas"],
                   inputs = ["lwpt.toml"],
                   output = "source/Version.inc" }
+
+# [pretest] — refresh the test-flavoured binary before every test run so
+# the programs that spawn it never exercise stale sources. The build
+# cache keeps an unchanged tree to a verification pass.
+[pretest]
+lwpt-testing = { command = "build/lwpt", args = ["build", "lwpt-testing"] }
 
 # [lwpt] — toolkit-state overrides. None needed: the defaults
 # (.lwpt/modules/, .lwpt/archives/, .lwpt/tmp/, lwpt.cfg) match this
@@ -66,8 +80,16 @@ include = [
   "packages/**/*.inc",
 ]
 
-# Enables deterministic HTTPClient syscall outcomes, the object-store race
-# interleaving, and registry publication crash points only while compiling
-# tests. Production builds expose none of these hooks.
+# Enables deterministic HTTPClient syscall and resolver outcomes, the
+# object-store race interleaving, scripted process-group setup outcomes,
+# registry publication crash points, and the install fetch/fault seams
+# (ADR-0044) only while compiling tests. Production builds expose none of
+# these hooks.
 [test]
-flags = ["-dHTTPCLIENT_TESTING", "-dOBJECTSTORE_TESTING", "-dREGISTRY_TESTING"]
+flags = [
+  "-dHTTPCLIENT_TESTING",
+  "-dOBJECTSTORE_TESTING",
+  "-dPROCESSTREE_TESTING",
+  "-dREGISTRY_TESTING",
+  "-dINSTALL_TESTING",
+]

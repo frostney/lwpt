@@ -154,11 +154,12 @@ serialization.
 
 Canonical documents:
 
-- are UTF-8 without a byte-order mark;
+- are strict UTF-8 without a byte-order mark: no overlong encodings,
+  surrogate code points, code points above U+10FFFF, or truncated sequences;
 - use LF line endings and exactly one final LF;
 - contain no comments, blank lines, tables, datetimes, floats, or multiline
-  strings;
-- use only lowercase `snake_case` bare keys;
+  strings; a `#` inside a quoted string is string content, not a comment;
+- use only lowercase `snake_case` bare keys, never dotted keys;
 - use double-quoted basic strings with the shortest valid TOML escape;
 - encode booleans as `true` or `false`;
 - encode non-negative integers in decimal without a sign or leading zeroes;
@@ -170,6 +171,9 @@ Canonical documents:
 Clients MUST verify canonical form before trusting a hash or signature. An
 implementation may parse a non-canonical publication request to produce an
 actionable error, but it MUST NOT admit those bytes as a canonical record.
+No Protocol 1 schema nests values more than three levels below the document
+root; an implementation MAY reject deeper structure, including structure
+created by dotted keys, before allocating it.
 
 Hashes use:
 
@@ -417,7 +421,10 @@ Clients MUST:
    origin. At the same sequence, accept only the identical snapshot and
    `key_id`; a different value is checkpoint equivocation. A later
    `published_at`, `expires_at`, and valid signature MAY renew an otherwise
-   identical checkpoint.
+   identical checkpoint. A same-sequence checkpoint whose `published_at` or
+   `expires_at` is earlier than the accepted checkpoint's value MUST be
+   rejected as a renewal rollback, even while it remains unexpired.
+   Identical checkpoint bytes are an idempotent replay and remain acceptable.
 9. Fetch and hash the snapshot, require its sequence to equal the checkpoint's
    sequence, then validate its predecessor and sequence against the snapshot
    chain.
@@ -425,6 +432,36 @@ Clients MUST:
 An origin SHOULD issue checkpoints with a validity window of no more than seven
 days. Short expiry limits replay for a client without prior state; persisted
 highest-sequence state prevents downgrade for returning clients.
+
+### Acquisition and locked proof verification
+
+New acquisition and mirror synchronization enforce checkpoint expiry against
+the current UTC time and reject checkpoints published in the future. The
+checkpoint's publication time must precede its expiry.
+
+A network-free operation reproducing an already locked selection may verify
+that retained proof after its checkpoint expires. It must require the exact
+recorded checkpoint hash, sequence, snapshot, origin, and signing key; verify
+the signature and rotation chain from the configured trust root; and verify
+record membership, snapshot history, archive identity, and available archive
+bytes. This exception does not accept a new checkpoint, change a locked
+selection, or make an expired mirror fresh. Acquisition and locked proof are
+explicit validation modes, not a replacement evaluation time supplied to
+evade an expiry check.
+
+`LWPT.Registry.Verification` provides that shared validation independently of
+transport and persistence. Its caller supplies bounded reads of metadata
+relative to the API path. Successful verification returns the current package
+records and exact checkpoint, signatures, rotations, snapshots, and record
+bytes needed to preserve the proof. The caller still owns archive retrieval,
+atomic persistence, and the configured trust root. Default limits are 4 MiB
+per metadata document, 64 MiB total metadata, 10,000 documents, 10,000
+snapshots, and 1,000 rotations. Exceeding a limit fails closed; it never
+truncates history or accepts partial verification.
+
+Discovery and capability parsing share the same canonical decoder.
+`InspectRegistryCheckpoint` returns untrusted retrieval hints only; its result
+does not establish identity, key trust, or freshness without proof verification.
 
 ## Trust roots and key rotation
 
@@ -511,7 +548,9 @@ next_cursor = ""
 Items are ordered by `effective_sequence`. A client with only its initial trust
 root uses `after=0`; thereafter it persists and sends the last accepted
 `effective_sequence`. Starting from its pinned key, it fetches and verifies
-each dual-signed rotation in order until the checkpoint's key is trusted. The
+each dual-signed rotation in order until the checkpoint's key is trusted.
+Both signatures of a transition MUST verify before the client trusts its new
+key, requests that key's record, or follows a later item or page. The
 page itself is discovery data, not a trust root: omitting or reordering entries
 can only make synchronization fail because the signed chain will not verify.
 Cursors are scoped to the origin and the `after` value.
@@ -635,13 +674,64 @@ Synchronization is pull-based and requires only the read protocol:
 7. Validate record identity, uniqueness, archive size, archive hash, snapshot predecessor,
    and any key rotation.
 8. Atomically expose the new checkpoint only after all referenced resources
-   are verified and durable.
+   are verified and persisted. The executable's atomic-write implementation
+   guarantees process-interruption recovery and atomic visibility, not
+   power-loss persistence through file and directory flushes.
 
 Repeated synchronization is idempotent. Two mirrors may use different storage
 or HTTP server implementations and still serve byte-identical protocol
 resources. An origin or mirror MAY offer an authenticated administrative
 trigger, but that control surface is not part of the interoperable registry
 protocol.
+
+The executable mirror lifecycle, local storage, transfer limits, and freshness
+diagnostics are defined in [ADR-0045](adr/0045-verified-registry-mirror.md).
+
+## Client contact selection and failover
+
+For online acquisition, clients MUST try configured mirrors in declaration
+order, followed by the configured origin endpoint, stopping at the first
+successfully verified discovery and proof transaction. Each attempt MUST use
+one contact with the same expected origin identity, configured trust root,
+and previously accepted per-origin history. Changing contact MUST NOT replace
+those trust inputs or change package identity.
+
+A request-layer failure MUST advance to the next configured contact when one
+remains. This includes HTTPClient exceptions, including HTTP framing, read,
+and response-body-limit errors, and non-2xx HTTP responses.
+
+A stale contact serves a correctly authenticated proof for the expected origin
+and trust root that is nevertheless unusable: its checkpoint has expired, its
+sequence is lower than accepted history, or it is an older same-sequence
+renewal. A stale-contact failure MUST also advance to the next configured
+contact when one remains. The next attempt keeps the unchanged origin identity,
+configured trust root, and previously accepted history, so a stale contact can
+never lower the sequence or freshness the client requires. When every contact
+is stale, acquisition fails with the stale diagnostic.
+
+Every other validation failure after a successful HTTP response is a trust
+failure and MUST abort acquisition instead of trying another contact. A
+response that is both stale and fails a trust check is a trust failure:
+clients MUST complete the signature, rotation-chain, accepted-key,
+equivocation, and history checks before classifying a response as stale. An
+older checkpoint is checked against the key that the client's accepted
+rotation chain assigns to its sequence, and against the accepted snapshot at
+that sequence. This
+includes media-type, encoding, metadata, schema, identity, signature, hash,
+history, future-dated checkpoint, equivocation, and rotation-chain failures.
+Redirects remain subject to the transport and identity revalidation
+requirements under [Errors and HTTP behavior](#errors-and-http-behavior).
+
+Archive fetching MUST NOT automatically select an alternate contact. A failed
+install MUST preserve committed project state; a subsequent explicit online
+acquisition may select contacts again. Frozen and offline operations MUST NOT
+select contacts or construct a network transport. They follow the retained
+identity and [locked-proof rules](#acquisition-and-locked-proof-verification),
+including their explicit expiry policy.
+
+This defines the client policy, not a claim that the mirror service ships an
+installer consumer. [Issue #62](https://github.com/frostney/lwpt/issues/62) owns
+dependency-consumer integration; its manifest syntax is outside this protocol.
 
 ## Errors and HTTP behavior
 

@@ -7,6 +7,10 @@ unit HTTPClient;
 
 {$I Shared.inc}
 
+{$IF DEFINED(DARWIN) OR (DEFINED(LINUX) AND NOT DEFINED(ANDROID))}
+{$DEFINE HTTPCLIENT_NATIVE_RESOLVER}
+{$ENDIF}
+
 interface
 
 uses
@@ -29,14 +33,55 @@ type
     Redirected: Boolean;
   end;
 
+  { How a request treats destinations whose address is not globally
+    reachable according to the IANA IPv4 and IPv6 special-purpose address
+    registries (loopback, private-use, link-local, shared, documentation,
+    benchmarking, multicast, reserved, and similar ranges). }
+  THTTPPrivateAddressPolicy = (
+    { No address classification; the host name is dialled as given. }
+    papAllow,
+    { Every hop, including the first, must resolve to a globally reachable
+      address. }
+    papDeny
+  );
+
+  { Per-request destination policy, applied to the initial request and to
+    every redirect hop, in this order: the scheme check, then the host
+    allowlist (before any name resolution, so a refused host causes no DNS
+    lookup and no connection), then the address policy. When an address
+    policy is active the host is resolved once into a binary address, that
+    address is classified, and the connection dials exactly that address;
+    TLS still verifies the peer against the host name. Such a request dials
+    IPv4 only: an IPv6 destination is refused unless it is an IPv4-mapped,
+    IPv4-compatible, or NAT64 well-known-prefix (64:ff9b::/96) spelling,
+    which is treated as its embedded IPv4 address. }
+  THTTPDestinationPolicy = record
+    { Case-insensitive exact host names; empty allows any host. }
+    AllowedHosts: TStringArray;
+    PrivateAddressPolicy: THTTPPrivateAddressPolicy;
+    { Refuse any hop, including a redirect target, whose scheme is not
+      https, so a redirect can never downgrade to plaintext. }
+    RequireHTTPS: Boolean;
+  end;
+
   THTTPRequestOptions = record
     MaxResponseBodyBytes: Int64;
     MaxResponseHeaderBytes: Integer;
     RequestTimeoutMilliseconds: QWord;
     MaximumRedirects: Integer;
+    Destination: THTTPDestinationPolicy;
+    { Optional canonical literal IPv4 address dialled for the first hop
+      without name resolution. The URL still supplies the Host header and
+      the TLS server name; redirects dial their own hosts. Cannot be combined
+      with an address policy. Empty dials the URL host as usual. }
+    ConnectAddress: string;
   end;
 
   EHTTPError = class(Exception);
+  { The response body is larger than MaxResponseBodyBytes. Raised as soon as
+    the limit is known to be exceeded (a declared Content-Length, a chunk
+    size, or the received bytes), before the excess is read. }
+  EHTTPResponseTooLarge = class(EHTTPError);
 
   {$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
   { Test-only select seam. Production code must leave this nil. The hook can
@@ -49,6 +94,21 @@ type
     const AAttempt: Integer): THTTPClientSelectTestAction;
   {$ENDIF}
 
+  {$IFDEF HTTPCLIENT_TESTING}
+  { Test-only resolver seam. Production code must leave this nil. Returning
+    True supplies the IPv4 literal to dial for AHost and whether the
+    destination policy must treat it as private, so a loopback mock server can
+    stand in for a public host. Returning False keeps real resolution and
+    classification. Consulted only while an address policy is active. }
+  THTTPClientResolveTestHook = function(const AHost: string;
+    out AAddress: string; out APrivate: Boolean): Boolean;
+  { Test-only scheme seam. Production code must leave this nil. Returning
+    True lets a plaintext hop to AHost stand in for an authenticated https
+    hop under RequireHTTPS, so a loopback mock can play an HTTPS origin whose
+    redirect is then checked like every other hop. }
+  THTTPClientHTTPSStandInTestHook = function(const AHost: string): Boolean;
+  {$ENDIF}
+
 const
   DEFAULT_MAX_RESPONSE_BODY_BYTES = Int64(64) * 1024 * 1024;
   DEFAULT_MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
@@ -59,8 +119,27 @@ const
 var
   HTTPClientSelectTestHook: THTTPClientSelectTestHook;
 {$ENDIF}
+{$IFDEF HTTPCLIENT_TESTING}
+var
+  HTTPClientResolveTestHook: THTTPClientResolveTestHook;
+  HTTPClientHTTPSStandInTestHook: THTTPClientHTTPSStandInTestHook;
+{$ENDIF}
 
 function DefaultHTTPRequestOptions: THTTPRequestOptions;
+{ Lowercased host of an absolute http or https URL, parsed exactly as a
+  request would parse it (userinfo, port and IPv6 brackets removed). Raises
+  EHTTPError for a URL a request would reject. }
+function HTTPURLHost(const AURL: string): string;
+{$IFDEF HTTPCLIENT_TESTING}
+{ Test-only views of the destination classifier. '' when AAddressText is a
+  strict IPv4 or IPv6 literal of a globally reachable address, otherwise the
+  name of the registry block that makes it non-global ('not an address
+  literal' for any other text, including shortened or numeric IPv4). }
+function NonGlobalAddressReason(const AAddressText: string): string;
+{ True when AHost may be contacted under APolicy's host allowlist. }
+function IsHTTPHostAllowed(const APolicy: THTTPDestinationPolicy;
+  const AHost: string): Boolean;
+{$ENDIF}
 function HTTPGet(const AURL: string;
   const AHeaders: THTTPHeaders): THTTPResponse; overload;
 function HTTPGet(const AURL: string; const AHeaders: THTTPHeaders;
@@ -80,7 +159,20 @@ implementation
 
 uses
   {$IFDEF UNIX}
-  Sockets, BaseUnix, NetDB,
+  BaseUnix,
+  Sockets,
+  {$IFDEF DARWIN}
+  CTypes,
+  InitC,
+  {$ELSE}
+  {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
+  cNetDB,
+  {$ELSE}
+  { Preserve the existing resolver on other Unix targets until their native
+    bindings have platform evidence; do not infer their addrinfo ABI. }
+  NetDB,
+  {$ENDIF}
+  {$ENDIF}
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   WinSock2,
@@ -114,6 +206,30 @@ type
     Port: Integer;
     Path: string;
   end;
+
+{$IFDEF DARWIN}
+{ Darwin netdb.h places canonname before addr, unlike Linux. socklen_t is
+  unsigned 32-bit on both Darwin release architectures, not pointer-sized. }
+{$push}
+{$packrecords c}
+type
+  PAddrInfo = ^TAddrInfo;
+  TAddrInfo = record
+    ai_flags, ai_family, ai_socktype, ai_protocol: cint;
+    ai_addrlen: cuint32;
+    ai_canonname: PAnsiChar;
+    ai_addr: PSockAddr;
+    ai_next: PAddrInfo;
+  end;
+  PPAddrInfo = ^PAddrInfo;
+{$pop}
+
+function Getaddrinfo(ANodeName, AServName: PAnsiChar;
+  AHints: PAddrInfo; AResult: PPAddrInfo): cint; cdecl;
+  external clib name 'getaddrinfo';
+procedure Freeaddrinfo(AInfo: PAddrInfo); cdecl;
+  external clib name 'freeaddrinfo';
+{$ENDIF}
 
 {$IFDEF MSWINDOWS}
 type
@@ -434,26 +550,64 @@ end;
 // Socket connect (cross-platform)
 // ---------------------------------------------------------------------------
 
+type
+  { An IPv4 address in network byte order, first octet first. }
+  THTTPIPv4Octets = array[0..3] of Byte;
+
 {$IFDEF UNIX}
-function ConnectSocket(const AHost: string; const APort: Integer;
+function ResolveSocketAddress(const AHost: string): in_addr;
+var
+  {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
+  Hints: TAddrInfo;
+  Addresses, Current: PAddrInfo;
+  {$ELSE}
+  HostEntry: THostEntry;
+  {$ENDIF}
+begin
+  Result := StrToNetAddr(AHost);
+  if Result.s_addr <> 0 then Exit;
+  {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
+  FillChar(Hints, SizeOf(Hints), 0);
+  Hints.ai_family := AF_INET;
+  Hints.ai_socktype := SOCK_STREAM;
+  Hints.ai_protocol := IPPROTO_TCP;
+  Addresses := nil;
+  { Native resolution honors system host databases and keeps its result list
+    request-local. It remains synchronous; ConnectSocket checks the shared
+    request deadline immediately after this lookup returns. }
+  if Getaddrinfo(PAnsiChar(AHost), nil, @Hints, @Addresses) <> 0 then
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  try
+    Current := Addresses;
+    while Current <> nil do
+    begin
+      if (Current^.ai_family = AF_INET) and (Current^.ai_addr <> nil)
+        and (Current^.ai_addrlen >= SizeOf(TInetSockAddr)) then
+        Exit(PInetSockAddr(Current^.ai_addr)^.sin_addr);
+      Current := Current^.ai_next;
+    end;
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  finally
+    if Addresses <> nil then Freeaddrinfo(Addresses);
+  end;
+  {$ELSE}
+  if not ResolveHostByName(AHost, HostEntry) then
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  Result := HostEntry.Addr;
+  {$ENDIF}
+end;
+
+{ Connects to exactly AAddress; no name resolution happens here. AHost only
+  names the destination in error messages. }
+function ConnectIPv4Socket(const AAddress: THTTPIPv4Octets;
+  const AHost: string; const APort: Integer;
   const ADeadline, ATimeoutMilliseconds: QWord): TSocket;
 var
   SockAddr: TInetSockAddr;
-  HostEntry: THostEntry;
-  Addr: in_addr;
   ConnectResult: Integer;
   SocketError: Integer;
   SocketErrorLength: TSockLen;
 begin
-  // Try as numeric IP first
-  Addr := StrToNetAddr(AHost);
-  if Addr.s_addr = 0 then
-  begin
-    // DNS lookup via netdb
-    if not ResolveHostByName(AHost, HostEntry) then
-      raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
-    Addr := HostEntry.Addr;
-  end;
   CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
 
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
@@ -469,7 +623,7 @@ begin
   FillChar(SockAddr, SizeOf(SockAddr), 0);
   SockAddr.sin_family := AF_INET;
   SockAddr.sin_port := htons(APort);
-  SockAddr.sin_addr := Addr;
+  Move(AAddress[0], SockAddr.sin_addr, SizeOf(AAddress));
 
   ConnectResult := fpConnect(Result, @SockAddr, SizeOf(SockAddr));
   if (ConnectResult <> 0) and not SocketWouldBlock then
@@ -498,18 +652,94 @@ begin
     end;
   end;
 end;
+
+function ConnectSocket(const AHost: string; const APort: Integer;
+  const ADeadline, ATimeoutMilliseconds: QWord): TSocket;
+var
+  Addr: in_addr;
+  Octets: THTTPIPv4Octets;
+begin
+  Addr := ResolveSocketAddress(AHost);
+  CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
+  Move(Addr, Octets[0], SizeOf(Octets));
+  Result := ConnectIPv4Socket(Octets, AHost, APort, ADeadline,
+    ATimeoutMilliseconds);
+end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
+{ One nonblocking connect attempt to exactly AAddress. Returns False with
+  ASocket = INVALID_SOCKET when the attempt fails; raises only for deadline
+  or readiness-wait failures, after closing the socket. }
+function TryConnectSockAddr(const AFamily, ASocketType, AProtocol: LongInt;
+  const AAddress: PSockAddr; const AAddressLength: LongInt;
+  const ADeadline, ATimeoutMilliseconds: QWord;
+  out ASocket: TSocket): Boolean;
+var
+  ConnectResult: Integer;
+  SocketError: Integer;
+  SocketErrorLength: Integer;
+begin
+  Result := False;
+  ASocket := WinSock2.socket(AFamily, ASocketType, AProtocol);
+  if ASocket = INVALID_SOCKET then
+    Exit;
+  try
+    SetSocketNonBlocking(ASocket);
+  except
+    WinSock2.closesocket(ASocket);
+    ASocket := INVALID_SOCKET;
+    raise;
+  end;
+  ConnectResult := WinSock2.connect(ASocket, AAddress, AAddressLength);
+  if ConnectResult = 0 then
+    Exit(True);
+  if SocketWouldBlock then
+  begin
+    try
+      WaitForSocket(ASocket, False, True, ADeadline, ATimeoutMilliseconds);
+      SocketError := 0;
+      SocketErrorLength := SizeOf(SocketError);
+      if (WinSock2.getsockopt(ASocket, SOL_SOCKET, SO_ERROR,
+         PChar(@SocketError), SocketErrorLength) = 0) and
+         (SocketError = 0) then
+        Exit(True);
+    except
+      WinSock2.closesocket(ASocket);
+      ASocket := INVALID_SOCKET;
+      raise;
+    end;
+  end;
+  WinSock2.closesocket(ASocket);
+  ASocket := INVALID_SOCKET;
+end;
+
+{ Connects to exactly AAddress; no name resolution happens here. AHost only
+  names the destination in error messages. }
+function ConnectIPv4Socket(const AAddress: THTTPIPv4Octets;
+  const AHost: string; const APort: Integer;
+  const ADeadline, ATimeoutMilliseconds: QWord): TSocket;
+var
+  SockAddr: TSockAddrIn;
+begin
+  EnsureWinSockInit;
+  CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
+  FillChar(SockAddr, SizeOf(SockAddr), 0);
+  SockAddr.sin_family := AF_INET;
+  SockAddr.sin_port := htons(APort);
+  Move(AAddress[0], SockAddr.sin_addr, SizeOf(AAddress));
+  if not TryConnectSockAddr(AF_INET, SOCK_STREAM, IPPROTO_TCP,
+     PSockAddr(@SockAddr), SizeOf(SockAddr), ADeadline,
+     ATimeoutMilliseconds, Result) then
+    raise EHTTPError.CreateFmt('Failed to connect to %s:%d', [AHost, APort]);
+end;
+
 function ConnectSocket(const AHost: string; const APort: Integer;
   const ADeadline, ATimeoutMilliseconds: QWord): TSocket;
 var
   Hints, Res, Cur: PAddrInfo;
   PortStr: AnsiString;
   Sock: TSocket;
-  ConnectResult: Integer;
-  SocketError: Integer;
-  SocketErrorLength: Integer;
 begin
   EnsureWinSockInit;
 
@@ -536,43 +766,10 @@ begin
     Sock := INVALID_SOCKET;
     while Assigned(Cur) do
     begin
-      Sock := WinSock2.socket(Cur^.ai_family, Cur^.ai_socktype,
-                               Cur^.ai_protocol);
-      if Sock = INVALID_SOCKET then
-      begin
-        Cur := Cur^.ai_next;
-        Continue;
-      end;
-
-      try
-        SetSocketNonBlocking(Sock);
-      except
-        WinSock2.closesocket(Sock);
-        raise;
-      end;
-      ConnectResult := WinSock2.connect(Sock, Cur^.ai_addr,
-        Cur^.ai_addrlen);
-      if ConnectResult = 0 then
+      if TryConnectSockAddr(Cur^.ai_family, Cur^.ai_socktype,
+         Cur^.ai_protocol, Cur^.ai_addr, LongInt(Cur^.ai_addrlen),
+         ADeadline, ATimeoutMilliseconds, Sock) then
         Break;
-      if SocketWouldBlock then
-      begin
-        try
-          WaitForSocket(Sock, False, True, ADeadline,
-            ATimeoutMilliseconds);
-          SocketError := 0;
-          SocketErrorLength := SizeOf(SocketError);
-          if (WinSock2.getsockopt(Sock, SOL_SOCKET, SO_ERROR,
-             PChar(@SocketError), SocketErrorLength) = 0) and
-             (SocketError = 0) then
-            Break;
-        except
-          WinSock2.closesocket(Sock);
-          raise;
-        end;
-      end;
-
-      WinSock2.closesocket(Sock);
-      Sock := INVALID_SOCKET;
       Cur := Cur^.ai_next;
     end;
 
@@ -735,7 +932,7 @@ begin
     Exit;
   PreviousLength := Length(ABody);
   if (Int64(PreviousLength) > AMaxBodyBytes - ALength) then
-    raise EHTTPError.CreateFmt(
+    raise EHTTPResponseTooLarge.CreateFmt(
       'HTTP response body exceeds configured limit of %d bytes',
       [AMaxBodyBytes]);
   SetLength(ABody, PreviousLength + ALength);
@@ -815,7 +1012,7 @@ begin
     end;
 
   if AHasContentLength and (AContentLength > AMaxBodyBytes) then
-    raise EHTTPError.CreateFmt(
+    raise EHTTPResponseTooLarge.CreateFmt(
       'HTTP response body exceeds configured limit of %d bytes',
       [AMaxBodyBytes]);
 end;
@@ -998,7 +1195,7 @@ begin
         raise EHTTPError.CreateFmt('Invalid HTTP chunk size: %s', [Line]);
       if ChunkSizeValue > AOptions.MaxResponseBodyBytes -
          Length(Result.Body) then
-        raise EHTTPError.CreateFmt(
+        raise EHTTPResponseTooLarge.CreateFmt(
           'HTTP response body exceeds configured limit of %d bytes',
           [AOptions.MaxResponseBodyBytes]);
       { ChunkBuf must hold both the payload and its trailing CRLF. Reject a
@@ -1079,6 +1276,533 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Destination resolution and address policy
+//
+// The per-hop host allowlist and non-global address deny follow GocciaScript's
+// HTTPClient. Classification works on binary addresses, never on text, against
+// named blocks transcribed from the IANA IPv4 and IPv6 Special-Purpose Address
+// Registries (entries whose "Globally Reachable" is False or N/A), plus the
+// multicast and reserved spaces. A request under an address policy dials the
+// exact IPv4 address it classified.
+// ---------------------------------------------------------------------------
+
+type
+  THTTPIPv6Octets = array[0..15] of Byte;
+
+  { A parsed destination address. IPv4 occupies Octets[0..3]. }
+  THTTPAddress = record
+    IsIPv6: Boolean;
+    Octets: THTTPIPv6Octets;
+  end;
+
+  THTTPIPv4Block = record
+    Prefix: THTTPIPv4Octets;
+    PrefixBits: Byte;
+    Name: string;
+  end;
+
+  THTTPIPv6Block = record
+    Prefix: THTTPIPv6Octets;
+    PrefixBits: Byte;
+    Name: string;
+  end;
+
+  { What the address policy decided for one hop. Pinned destinations are
+    dialled at Address instead of resolving the host name again. }
+  THTTPDialTarget = record
+    Pinned: Boolean;
+    Address: THTTPIPv4Octets;
+  end;
+
+const
+  IPv4NonGlobalBlocks: array[0..14] of THTTPIPv4Block = (
+    (Prefix: (0, 0, 0, 0); PrefixBits: 8; Name: 'this network'),
+    (Prefix: (10, 0, 0, 0); PrefixBits: 8; Name: 'private-use'),
+    (Prefix: (100, 64, 0, 0); PrefixBits: 10; Name: 'shared address space'),
+    (Prefix: (127, 0, 0, 0); PrefixBits: 8; Name: 'loopback'),
+    (Prefix: (169, 254, 0, 0); PrefixBits: 16; Name: 'link-local'),
+    (Prefix: (172, 16, 0, 0); PrefixBits: 12; Name: 'private-use'),
+    (Prefix: (192, 0, 0, 0); PrefixBits: 24;
+      Name: 'IETF protocol assignments'),
+    (Prefix: (192, 0, 2, 0); PrefixBits: 24; Name: 'documentation'),
+    (Prefix: (192, 88, 99, 0); PrefixBits: 24;
+      Name: 'deprecated 6to4 relay anycast'),
+    (Prefix: (192, 168, 0, 0); PrefixBits: 16; Name: 'private-use'),
+    (Prefix: (198, 18, 0, 0); PrefixBits: 15; Name: 'benchmarking'),
+    (Prefix: (198, 51, 100, 0); PrefixBits: 24; Name: 'documentation'),
+    (Prefix: (203, 0, 113, 0); PrefixBits: 24; Name: 'documentation'),
+    (Prefix: (224, 0, 0, 0); PrefixBits: 4; Name: 'multicast'),
+    (Prefix: (240, 0, 0, 0); PrefixBits: 4;
+      Name: 'reserved (including limited broadcast)')
+  );
+
+  { Globally reachable exceptions inside a non-global block. }
+  IPv4GlobalExceptions: array[0..1] of THTTPIPv4Block = (
+    (Prefix: (192, 0, 0, 9); PrefixBits: 32;
+      Name: 'port control protocol anycast'),
+    (Prefix: (192, 0, 0, 10); PrefixBits: 32; Name: 'TURN anycast')
+  );
+
+  { Global unicast; every IPv6 address outside it is not globally reachable. }
+  IPv6GlobalUnicast: THTTPIPv6Block = (
+    Prefix: ($20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    PrefixBits: 3; Name: 'global unicast');
+
+  IPv6NonGlobalBlocks: array[0..14] of THTTPIPv6Block = (
+    (Prefix: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 128; Name: 'unspecified'),
+    (Prefix: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1);
+      PrefixBits: 128; Name: 'loopback'),
+    (Prefix: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $FF, $FF, 0, 0, 0, 0);
+      PrefixBits: 96; Name: 'IPv4-mapped'),
+    (Prefix: (0, $64, $FF, $9B, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 48; Name: 'local-use IPv4/IPv6 translation'),
+    (Prefix: (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 64; Name: 'discard-only'),
+    (Prefix: (1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 64; Name: 'dummy prefix'),
+    (Prefix: ($20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 23; Name: 'IETF protocol assignments'),
+    (Prefix: ($20, 1, $0D, $B8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 32; Name: 'documentation'),
+    (Prefix: ($20, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 16; Name: '6to4'),
+    (Prefix: ($3F, $FF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 20; Name: 'documentation'),
+    (Prefix: ($5F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 16; Name: 'segment routing'),
+    (Prefix: ($FC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 7; Name: 'unique-local'),
+    (Prefix: ($FE, $80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 10; Name: 'link-local'),
+    (Prefix: ($FE, $C0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 10; Name: 'deprecated site-local'),
+    (Prefix: ($FF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 8; Name: 'multicast')
+  );
+
+  IPv6GlobalExceptions: array[0..6] of THTTPIPv6Block = (
+    (Prefix: ($20, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1);
+      PrefixBits: 128; Name: 'port control protocol anycast'),
+    (Prefix: ($20, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2);
+      PrefixBits: 128; Name: 'TURN anycast'),
+    (Prefix: ($20, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3);
+      PrefixBits: 128; Name: 'DNS-SD service registration anycast'),
+    (Prefix: ($20, 1, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 32; Name: 'AMT'),
+    (Prefix: ($20, 1, 0, 4, 1, $12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 48; Name: 'AS112-v6'),
+    (Prefix: ($20, 1, 0, $20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 28; Name: 'ORCHIDv2'),
+    (Prefix: ($20, 1, 0, $30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 28; Name: 'drone remote ID')
+  );
+
+  { IPv6 prefixes whose low 32 bits carry an IPv4 address that the
+    destination is treated as: IPv4-mapped, IPv4-compatible, and the NAT64
+    well-known prefix (RFC 6052), which may only embed global IPv4. }
+  IPv4EmbeddingPrefixes: array[0..2] of THTTPIPv6Block = (
+    (Prefix: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, $FF, $FF, 0, 0, 0, 0);
+      PrefixBits: 96; Name: 'IPv4-mapped'),
+    (Prefix: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 96; Name: 'IPv4-compatible'),
+    (Prefix: (0, $64, $FF, $9B, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      PrefixBits: 96; Name: 'IPv4/IPv6 translation')
+  );
+
+  IPv4OctetCount = 4;
+  IPv6GroupCount = 8;
+  IPv6EmbeddedIPv4Offset = 12;
+
+{ True when the first APrefixBits bits of AAddress equal APrefix. }
+function PrefixMatches(const AAddress, APrefix: array of Byte;
+  const APrefixBits: Integer): Boolean;
+var
+  ByteIndex, RemainingBits: Integer;
+  Mask: Byte;
+begin
+  RemainingBits := APrefixBits;
+  ByteIndex := 0;
+  while RemainingBits >= 8 do
+  begin
+    if AAddress[ByteIndex] <> APrefix[ByteIndex] then
+      Exit(False);
+    Inc(ByteIndex);
+    Dec(RemainingBits, 8);
+  end;
+  if RemainingBits > 0 then
+  begin
+    Mask := Byte($FF shl (8 - RemainingBits));
+    if (AAddress[ByteIndex] and Mask) <> (APrefix[ByteIndex] and Mask) then
+      Exit(False);
+  end;
+  Result := True;
+end;
+
+{ Dotted-quad IPv4 text only. Deliberately strict: shortened forms ("127.1"),
+  hexadecimal octets, octets with a leading zero ("010"), and bare integers
+  are not literals. They are left to name resolution, whose binary answer is
+  what gets classified and dialled. }
+function TryParseIPv4(const AValue: string;
+  out AOctets: THTTPIPv4Octets): Boolean;
+var
+  CharacterIndex, Part, Digits, Value: Integer;
+  Current: Char;
+begin
+  Result := False;
+  FillChar(AOctets, SizeOf(AOctets), 0);
+  Part := 0;
+  Value := 0;
+  Digits := 0;
+  for CharacterIndex := 1 to Length(AValue) do
+  begin
+    Current := AValue[CharacterIndex];
+    if (Current >= '0') and (Current <= '9') then
+    begin
+      { A multi-digit octet may not start with 0: other parsers read it as
+        octal, so it is not a canonical literal. }
+      if (Digits = 1) and (Value = 0) then Exit;
+      Inc(Digits);
+      if Digits > 3 then Exit;
+      Value := Value * 10 + (Ord(Current) - Ord('0'));
+      if Value > 255 then Exit;
+    end
+    else if Current = '.' then
+    begin
+      if (Digits = 0) or (Part >= IPv4OctetCount - 1) then Exit;
+      AOctets[Part] := Byte(Value);
+      Inc(Part);
+      Value := 0;
+      Digits := 0;
+    end
+    else
+      Exit;
+  end;
+  if (Digits = 0) or (Part <> IPv4OctetCount - 1) then Exit;
+  AOctets[IPv4OctetCount - 1] := Byte(Value);
+  Result := True;
+end;
+
+{ Parses colon-separated hexadecimal groups; the last group may be a dotted
+  IPv4 tail when AAllowIPv4Tail, counting as two groups. }
+function TryParseIPv6Groups(const AText: string;
+  const AAllowIPv4Tail: Boolean; var AGroups: array of Word;
+  out ACount: Integer): Boolean;
+var
+  Parts: TStringArray;
+  PartIndex, CharacterIndex, Digit: Integer;
+  Value: Cardinal;
+  Tail: THTTPIPv4Octets;
+begin
+  Result := False;
+  ACount := 0;
+  if AText = '' then Exit(True);
+  Parts := AText.Split([':']);
+  for PartIndex := 0 to High(Parts) do
+  begin
+    if (PartIndex = High(Parts)) and AAllowIPv4Tail
+       and (Pos('.', Parts[PartIndex]) > 0) then
+    begin
+      if (ACount + 2 > Length(AGroups))
+         or not TryParseIPv4(Parts[PartIndex], Tail) then Exit;
+      AGroups[ACount] := (Word(Tail[0]) shl 8) or Tail[1];
+      AGroups[ACount + 1] := (Word(Tail[2]) shl 8) or Tail[3];
+      Inc(ACount, 2);
+      Continue;
+    end;
+    if (Length(Parts[PartIndex]) = 0) or (Length(Parts[PartIndex]) > 4)
+       or (ACount >= Length(AGroups)) then Exit;
+    Value := 0;
+    for CharacterIndex := 1 to Length(Parts[PartIndex]) do
+    begin
+      case Parts[PartIndex][CharacterIndex] of
+        '0'..'9': Digit := Ord(Parts[PartIndex][CharacterIndex]) - Ord('0');
+        'a'..'f': Digit := Ord(Parts[PartIndex][CharacterIndex]) - Ord('a')
+          + 10;
+        'A'..'F': Digit := Ord(Parts[PartIndex][CharacterIndex]) - Ord('A')
+          + 10;
+      else
+        Exit;
+      end;
+      Value := Value * 16 + Cardinal(Digit);
+    end;
+    AGroups[ACount] := Word(Value);
+    Inc(ACount);
+  end;
+  Result := True;
+end;
+
+{ Parses every textual IPv6 form (compressed, uncompressed, mixed with a
+  dotted IPv4 tail) into its 16 bytes. Zone identifiers are refused. }
+function TryParseIPv6(const AValue: string;
+  out AOctets: THTTPIPv6Octets): Boolean;
+var
+  Head, Tail: array[0..IPv6GroupCount - 1] of Word;
+  Groups: array[0..IPv6GroupCount - 1] of Word;
+  HeadCount, TailCount, GroupIndex, CompressAt: Integer;
+  Text: string;
+begin
+  Result := False;
+  FillChar(AOctets, SizeOf(AOctets), 0);
+  Text := AValue;
+  if (Length(Text) >= 2) and (Text[1] = '[')
+     and (Text[Length(Text)] = ']') then
+    Text := Copy(Text, 2, Length(Text) - 2);
+  if (Text = '') or (Pos('%', Text) > 0) then Exit;
+  FillChar(Groups, SizeOf(Groups), 0);
+  CompressAt := Pos('::', Text);
+  if CompressAt > 0 then
+  begin
+    if Pos('::', Copy(Text, CompressAt + 2, MaxInt)) > 0 then Exit;
+    if not TryParseIPv6Groups(Copy(Text, 1, CompressAt - 1), False, Head,
+       HeadCount) then Exit;
+    if not TryParseIPv6Groups(Copy(Text, CompressAt + 2, MaxInt), True,
+       Tail, TailCount) then Exit;
+    if HeadCount + TailCount > IPv6GroupCount - 1 then Exit;
+    for GroupIndex := 0 to HeadCount - 1 do
+      Groups[GroupIndex] := Head[GroupIndex];
+    for GroupIndex := 0 to TailCount - 1 do
+      Groups[IPv6GroupCount - TailCount + GroupIndex] := Tail[GroupIndex];
+  end
+  else
+  begin
+    if not TryParseIPv6Groups(Text, True, Groups, HeadCount) then Exit;
+    if HeadCount <> IPv6GroupCount then Exit;
+  end;
+  for GroupIndex := 0 to IPv6GroupCount - 1 do
+  begin
+    AOctets[GroupIndex * 2] := Byte(Groups[GroupIndex] shr 8);
+    AOctets[GroupIndex * 2 + 1] := Byte(Groups[GroupIndex] and $FF);
+  end;
+  Result := True;
+end;
+
+{ Rewrites an IPv6 address that embeds an IPv4 destination (see
+  IPv4EmbeddingPrefixes) as that IPv4 address, so every spelling of the same
+  IPv4 destination is classified and dialled identically. The unspecified
+  and loopback addresses stay IPv6. }
+procedure CanonicalizeAddress(var AAddress: THTTPAddress);
+var
+  BlockIndex: Integer;
+  Embedded: THTTPIPv4Octets;
+begin
+  if not AAddress.IsIPv6 then Exit;
+  if PrefixMatches(AAddress.Octets, IPv6NonGlobalBlocks[0].Prefix, 128)
+     or PrefixMatches(AAddress.Octets, IPv6NonGlobalBlocks[1].Prefix, 128) then
+    Exit;
+  for BlockIndex := 0 to High(IPv4EmbeddingPrefixes) do
+    if PrefixMatches(AAddress.Octets, IPv4EmbeddingPrefixes[BlockIndex].Prefix,
+       IPv4EmbeddingPrefixes[BlockIndex].PrefixBits) then
+    begin
+      Move(AAddress.Octets[IPv6EmbeddedIPv4Offset], Embedded[0],
+        SizeOf(Embedded));
+      AAddress := Default(THTTPAddress);
+      Move(Embedded[0], AAddress.Octets[0], SizeOf(Embedded));
+      Exit;
+    end;
+end;
+
+{ '' when AAddress is globally reachable, otherwise the name of the
+  registry block that makes it non-global. }
+function NonGlobalReason(const AAddress: THTTPAddress): string;
+var
+  BlockIndex: Integer;
+begin
+  Result := '';
+  if not AAddress.IsIPv6 then
+  begin
+    for BlockIndex := 0 to High(IPv4GlobalExceptions) do
+      if PrefixMatches(AAddress.Octets, IPv4GlobalExceptions[BlockIndex].Prefix,
+         IPv4GlobalExceptions[BlockIndex].PrefixBits) then
+        Exit('');
+    for BlockIndex := 0 to High(IPv4NonGlobalBlocks) do
+      if PrefixMatches(AAddress.Octets, IPv4NonGlobalBlocks[BlockIndex].Prefix,
+         IPv4NonGlobalBlocks[BlockIndex].PrefixBits) then
+        Exit(IPv4NonGlobalBlocks[BlockIndex].Name);
+    Exit('');
+  end;
+  for BlockIndex := 0 to High(IPv6GlobalExceptions) do
+    if PrefixMatches(AAddress.Octets, IPv6GlobalExceptions[BlockIndex].Prefix,
+       IPv6GlobalExceptions[BlockIndex].PrefixBits) then
+      Exit('');
+  for BlockIndex := 0 to High(IPv6NonGlobalBlocks) do
+    if PrefixMatches(AAddress.Octets, IPv6NonGlobalBlocks[BlockIndex].Prefix,
+       IPv6NonGlobalBlocks[BlockIndex].PrefixBits) then
+      Exit(IPv6NonGlobalBlocks[BlockIndex].Name);
+  if not PrefixMatches(AAddress.Octets, IPv6GlobalUnicast.Prefix,
+     IPv6GlobalUnicast.PrefixBits) then
+    Result := 'outside global unicast';
+end;
+
+function FormatAddress(const AAddress: THTTPAddress): string;
+var
+  GroupIndex: Integer;
+begin
+  if not AAddress.IsIPv6 then
+    Exit(Format('%d.%d.%d.%d', [AAddress.Octets[0], AAddress.Octets[1],
+      AAddress.Octets[2], AAddress.Octets[3]]));
+  Result := '';
+  for GroupIndex := 0 to IPv6GroupCount - 1 do
+  begin
+    if GroupIndex > 0 then Result := Result + ':';
+    Result := Result + LowerCase(IntToHex(
+      (Word(AAddress.Octets[GroupIndex * 2]) shl 8)
+      or AAddress.Octets[GroupIndex * 2 + 1], 1));
+  end;
+end;
+
+{ Parses AHost as an address literal, or resolves it once to one IPv4
+  address. The binary result is what gets classified and dialled. }
+function ResolveDestinationAddress(const AHost: string): THTTPAddress;
+{$IFDEF UNIX}
+var
+  ResolvedAddress: in_addr;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Hints, Res: PAddrInfo;
+  SockAddr: PSockAddrIn;
+{$ENDIF}
+var
+  IPv4: THTTPIPv4Octets;
+begin
+  Result := Default(THTTPAddress);
+  if AHost = '' then
+    raise EHTTPError.Create('Failed to resolve host: (empty)');
+  if TryParseIPv4(AHost, IPv4) then
+    Move(IPv4[0], Result.Octets[0], SizeOf(IPv4))
+  else if Pos(':', AHost) > 0 then
+  begin
+    if not TryParseIPv6(AHost, Result.Octets) then
+      raise EHTTPError.CreateFmt('Invalid IPv6 address: %s', [AHost]);
+    Result.IsIPv6 := True;
+  end
+  else
+  begin
+    {$IFDEF UNIX}
+    ResolvedAddress := ResolveSocketAddress(AHost);
+    Move(ResolvedAddress, Result.Octets[0], IPv4OctetCount);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    EnsureWinSockInit;
+    New(Hints);
+    try
+      FillChar(Hints^, SizeOf(TAddrInfo), 0);
+      Hints^.ai_family := AF_INET;
+      Hints^.ai_socktype := SOCK_STREAM;
+      Hints^.ai_protocol := IPPROTO_TCP;
+      Res := nil;
+      if Getaddrinfo(PAnsiChar(AnsiString(AHost)), nil, Hints, Res) <> 0 then
+        raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+      try
+        if not Assigned(Res) or not Assigned(Res^.ai_addr) then
+          raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+        SockAddr := PSockAddrIn(Res^.ai_addr);
+        Move(SockAddr^.sin_addr, Result.Octets[0], IPv4OctetCount);
+      finally
+        Freeaddrinfo(Res);
+      end;
+    finally
+      Dispose(Hints);
+    end;
+    {$ENDIF}
+  end;
+  CanonicalizeAddress(Result);
+end;
+
+{$IFDEF HTTPCLIENT_TESTING}
+function NonGlobalAddressReason(const AAddressText: string): string;
+var
+  Address: THTTPAddress;
+  IPv4: THTTPIPv4Octets;
+begin
+  Address := Default(THTTPAddress);
+  if TryParseIPv4(Trim(AAddressText), IPv4) then
+    Move(IPv4[0], Address.Octets[0], SizeOf(IPv4))
+  else if TryParseIPv6(Trim(AAddressText), Address.Octets) then
+    Address.IsIPv6 := True
+  else
+    Exit('not an address literal');
+  CanonicalizeAddress(Address);
+  Result := NonGlobalReason(Address);
+end;
+{$ENDIF}
+
+function IsHTTPHostAllowed(const APolicy: THTTPDestinationPolicy;
+  const AHost: string): Boolean;
+var
+  HostIndex: Integer;
+begin
+  if Length(APolicy.AllowedHosts) = 0 then
+    Exit(True);
+  for HostIndex := 0 to High(APolicy.AllowedHosts) do
+    if SameText(APolicy.AllowedHosts[HostIndex], AHost) then
+      Exit(True);
+  Result := False;
+end;
+
+{ Applies APolicy to one hop. The scheme and host checks run before any
+  resolution, so a refused hop causes no DNS lookup and no connection. The
+  address check runs on the resolved binary address, which the caller then
+  dials without resolving the name again. }
+function ResolveAllowedDestination(const APolicy: THTTPDestinationPolicy;
+  const AParsed: THTTPParsedURL): THTTPDialTarget;
+var
+  Address: THTTPAddress;
+  Reason: string;
+  {$IFDEF HTTPCLIENT_TESTING}
+  TestAddress: string;
+  TestPrivate: Boolean;
+  TestOctets: THTTPIPv4Octets;
+  {$ENDIF}
+begin
+  Result := Default(THTTPDialTarget);
+  if APolicy.RequireHTTPS and (AParsed.Scheme <> 'https')
+     {$IFDEF HTTPCLIENT_TESTING}
+     and not (Assigned(HTTPClientHTTPSStandInTestHook)
+       and HTTPClientHTTPSStandInTestHook(AParsed.Host))
+     {$ENDIF} then
+    raise EHTTPError.CreateFmt(
+      'fetch scheme not allowed: %s://%s (https is required)',
+      [AParsed.Scheme, AParsed.Host]);
+  if not IsHTTPHostAllowed(APolicy, AParsed.Host) then
+    raise EHTTPError.CreateFmt('fetch host not allowed: %s', [AParsed.Host]);
+  if APolicy.PrivateAddressPolicy = papAllow then
+    Exit;
+
+  {$IFDEF HTTPCLIENT_TESTING}
+  if Assigned(HTTPClientResolveTestHook) and
+     HTTPClientResolveTestHook(AParsed.Host, TestAddress, TestPrivate) then
+  begin
+    if not TryParseIPv4(TestAddress, TestOctets) then
+      raise EHTTPError.CreateFmt('test resolver returned "%s"',
+        [TestAddress]);
+    Address := Default(THTTPAddress);
+    Move(TestOctets[0], Address.Octets[0], SizeOf(TestOctets));
+    if TestPrivate then Reason := 'test-designated private'
+    else Reason := '';
+  end
+  else
+  {$ENDIF}
+  begin
+    Address := ResolveDestinationAddress(AParsed.Host);
+    Reason := NonGlobalReason(Address);
+  end;
+
+  if Reason <> '' then
+    raise EHTTPError.CreateFmt(
+      'fetch destination not allowed: %s resolves to %s address %s',
+      [AParsed.Host, Reason, FormatAddress(Address)]);
+  if Address.IsIPv6 then
+    raise EHTTPError.CreateFmt(
+      'fetch destination not supported: %s resolves to IPv6 address %s, '
+      + 'which a policy-checked request cannot dial', [AParsed.Host,
+      FormatAddress(Address)]);
+  Result.Pinned := True;
+  Move(Address.Octets[0], Result.Address[0], IPv4OctetCount);
+end;
+
+// ---------------------------------------------------------------------------
 // Core request logic
 // ---------------------------------------------------------------------------
 
@@ -1122,12 +1846,21 @@ var
   Raw: TRawHTTPResponse;
   I, Redirects: Integer;
   CurrentURL, Location, HostHeader: string;
+  DialTarget: THTTPDialTarget;
+  ConnectOctets: THTTPIPv4Octets;
   HasRequestContent, HasUserAgent, IsHead: Boolean;
   HeaderName, Method, ContentType: string;
   Body: TBytes;
   Deadline, StartedAt: QWord;
 begin
   ValidateRequestOptions(AOptions);
+  if AOptions.ConnectAddress <> '' then
+  begin
+    if not TryParseIPv4(AOptions.ConnectAddress, ConnectOctets) then
+      raise EHTTPError.Create('HTTP connect address must be a canonical literal IPv4 address');
+    if AOptions.Destination.PrivateAddressPolicy <> papAllow then
+      raise EHTTPError.Create('HTTP connect address cannot be combined with an address policy');
+  end;
   if AManagesContentHeaders then
     ValidateRequestContentType(AContentType);
   StartedAt := GetTickCount64;
@@ -1148,9 +1881,24 @@ begin
   begin
     CheckRequestDeadline(Deadline, AOptions.RequestTimeoutMilliseconds);
     Parsed := ParseHTTPURL(CurrentURL);
+    { Runs on every pass, so each redirect hop is checked exactly like the
+      initial request before any connection is attempted. }
+    DialTarget := ResolveAllowedDestination(AOptions.Destination, Parsed);
+    CheckRequestDeadline(Deadline, AOptions.RequestTimeoutMilliseconds);
     FillChar(Transport, SizeOf(Transport), 0);
-    Sock := ConnectSocket(Parsed.Host, Parsed.Port, Deadline,
-      AOptions.RequestTimeoutMilliseconds);
+    if (AOptions.ConnectAddress <> '') and (Redirects = 0) then
+    begin
+      DialTarget.Pinned := True;
+      DialTarget.Address := ConnectOctets;
+    end;
+    { TLS below still verifies Parsed.Host: pinning changes which address is
+      dialled, never which identity the peer must prove. }
+    if DialTarget.Pinned then
+      Sock := ConnectIPv4Socket(DialTarget.Address, Parsed.Host, Parsed.Port,
+        Deadline, AOptions.RequestTimeoutMilliseconds)
+    else
+      Sock := ConnectSocket(Parsed.Host, Parsed.Port, Deadline,
+        AOptions.RequestTimeoutMilliseconds);
     try
       if Parsed.Scheme = 'https' then
         StartTransportSecurity(Transport, Sock, Parsed.Host, Deadline,
@@ -1269,6 +2017,15 @@ begin
   Result.RequestTimeoutMilliseconds :=
     DEFAULT_REQUEST_TIMEOUT_MILLISECONDS;
   Result.MaximumRedirects := DEFAULT_MAXIMUM_REDIRECTS;
+  Result.Destination.AllowedHosts := nil;
+  Result.Destination.PrivateAddressPolicy := papAllow;
+  Result.Destination.RequireHTTPS := False;
+  Result.ConnectAddress := '';
+end;
+
+function HTTPURLHost(const AURL: string): string;
+begin
+  Result := LowerCase(ParseHTTPURL(AURL).Host);
 end;
 
 function HTTPGet(const AURL: string;

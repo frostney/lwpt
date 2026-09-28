@@ -185,8 +185,9 @@ aliases and historical checkpoint paths require cache revalidation.
 
 Discovery and capabilities advertise only the implemented read surface:
 checkpoint, key, package-record, snapshot, and object schemas with
-`snapshot-sync-v1`. Package lists and publication remain issue #54; rotation
-chains remain issue #55. Neither future feature is advertised by this origin.
+`snapshot-sync-v1`. [ADR-0045](0045-verified-registry-mirror.md) extends this
+with local signed key rotation and the `rotation-chain-v1` read endpoints.
+Package lists and remote publication remain issue #54 and are not advertised.
 
 ## Rejected alternatives
 

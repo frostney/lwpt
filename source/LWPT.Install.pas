@@ -19,6 +19,10 @@ type
     Name         : string;
     Version      : string;       { concrete tag / SHA / branch; '' for local + url }
     CommitSHA    : string;       { authoritative fetched commit identity }
+    RefKind      : string;       { RefKindTag / RefKindBranch for a named
+                                   ref; '' for SHA pins and non-Git sources }
+    ReachableFrom: string;       { ref that proved a commit-SHA pin
+                                   reachable (ADR-0047); '' otherwise }
     SourceIdentity: string;      { canonical source + extraction policy identity }
     ConstraintFingerprint: string; { complete graph requirements for frozen }
     SrcOriginal  : string;       { the manifest's source string, verbatim }
@@ -69,6 +73,8 @@ type
     CustomSources: TCustomSourceArray;
     Version     : string;            { concrete (resolved ref or SHA) }
     CommitSHA   : string;            { authoritative advertised identity }
+    RefKind     : string;            { RefKindTag / RefKindBranch or '' }
+    ReachableFrom: string;           { proving ref of a SHA pin or '' }
     SourceIdentity: string;
     ConstraintFingerprint: string;
     ResolvedURL : string;            { actual archive URL fetched }
@@ -84,6 +90,7 @@ type
     UnitBackup, ArchiveBackup: string;
   end;
 
+{$IFDEF INSTALL_TESTING}
 const
   { Test-only archive-fetch redirection. ARCHIVE_FETCH_ORIGIN_ENV is read
     at the archive-fetch boundary AFTER canonical URL construction, so the
@@ -97,8 +104,9 @@ const
     else is refused: a remote host, a name that would need DNS (including
     `localhost`), a missing port, a path, user information, and any non-http
     scheme. That keeps the seam unable to express an arbitrary insecure
-    download, which is the reason it can live in the shipped binary rather
-    than behind a build flag.
+    download even in a test build. Per ADR-0044 the seam exists only in
+    test builds (INSTALL_TESTING); a release binary compiles none of it and
+    ignores the variable.
 
     ARCHIVE_FETCH_TIMEOUT_ENV bounds the loopback archive request and is honoured
     only while the origin override is active, so it cannot become a
@@ -107,6 +115,13 @@ const
   ARCHIVE_FETCH_TIMEOUT_ENV = PROJECT_NAME + '_TEST_ARCHIVE_TIMEOUT_MS';
   DEFAULT_ARCHIVE_FETCH_TIMEOUT = 5000;
   MAXIMUM_ARCHIVE_FETCH_TIMEOUT = 600000;
+{$ENDIF}
+
+const
+  { Kind of the named ref a Git-host dependency was selected from, recorded
+    as `resolvedRefKind` in lwpt.lock (ADR-0048). }
+  RefKindTag    = 'tag';
+  RefKindBranch = 'branch';
 
   { The terminator written after every constraint line before hashing —
     including the last, reproducing TStrings.Text's trailing line break.
@@ -119,12 +134,14 @@ const
 function  LoadLockfile(const APath: string): TResolvedArray;
 function  ConstraintFingerprintForLines(const ALines: TStrings): string;
 function  ConstraintFingerprintForNode(const ANode: TResolveNode; const AProjectRoot: string): string;
+{$IFDEF INSTALL_TESTING}
 function  ApplyArchiveFetchOrigin(const ACanonicalURL, AOverride: string): string;
 function  ResolveArchiveFetchTimeout(const ARawMilliseconds: string): Integer;
+{$ENDIF}
 function  ExtractArchive(const AArchivePath, ADest: string; const ASubDir: string = ''): Integer;
 procedure VerifyAgainstLockfile(const AResolved: array of TResolved; const ALockEntries: array of TResolved);
 function  PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved; const AModulesRoot, AArchivesRoot: string): Integer;
-function  RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode): TInstallTransactionResult;
+function  RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode; const AAcceptMovedTags: Boolean = False): TInstallTransactionResult;
 function  RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
 procedure RecoverInterruptedInstall(const AContext: TManifestContext);
 
@@ -134,6 +151,8 @@ uses
   {$IFDEF UNIX} BaseUnix, {$ENDIF}
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
   HTTPClient,
+  LWPT.FetchPolicy,
+  LWPT.GitPack,
   LWPT.GitProtocol,
   LWPT.ObjectStore,
   LWPT.ProducerLease,
@@ -248,14 +267,14 @@ begin
       Repo := RepoBasename(ADep.SrcLocator);
       case ADep.SrcHost of
         hkGitHub:
-          Result := 'https://github.com/' + ADep.SrcLocator +
+          Result := BuiltInForgeOrigin(hkGitHub) + ADep.SrcLocator +
                     '/archive/' + AResolvedRef + '.tar.gz';
         hkGitLab:
-          Result := 'https://gitlab.com/' + ADep.SrcLocator +
+          Result := BuiltInForgeOrigin(hkGitLab) + ADep.SrcLocator +
                     '/-/archive/' + AResolvedRef + '/'
                     + Repo + '-' + AResolvedRef + '.tar.gz';
         hkBitbucket:
-          Result := 'https://bitbucket.org/' + ADep.SrcLocator +
+          Result := BuiltInForgeOrigin(hkBitbucket) + ADep.SrcLocator +
                     '/get/' + AResolvedRef + '.tar.gz';
         hkCustom:
         begin
@@ -275,6 +294,7 @@ begin
   end;
 end;
 
+{$IFDEF INSTALL_TESTING}
 { ───────────────────────────────────────────────────────────────────
   Test-only archive-fetch redirection. See the ARCHIVE_FETCH_*
   declarations in the interface for the contract this enforces.
@@ -282,6 +302,7 @@ end;
   Deliberately NOT a proxy, a mirror, or an origin-selection feature:
   it rewrites nothing but the origin, refuses every value that is not a
   numeric loopback plain-HTTP endpoint, and is inert when unset.
+  Compiled only into test builds (ADR-0044).
   ─────────────────────────────────────────────────────────────────── }
 const
   LOOPBACK_FIRST_OCTET = 127;
@@ -442,6 +463,7 @@ begin
       [ARCHIVE_FETCH_TIMEOUT_ENV, MAXIMUM_ARCHIVE_FETCH_TIMEOUT,
        ARawMilliseconds]);
 end;
+{$ENDIF}
 
 { Build the git smart-HTTP base URL for tag listing. Same host
   templates as the archive endpoints but pointing at the .git
@@ -453,9 +475,8 @@ function GitRepoURL(const ADep: TDependency;
 var Custom: TCustomSource; User, RepoName: string;
 begin
   case ADep.SrcHost of
-    hkGitHub    : Result := 'https://github.com/'    + ADep.SrcLocator + '.git';
-    hkGitLab    : Result := 'https://gitlab.com/'    + ADep.SrcLocator + '.git';
-    hkBitbucket : Result := 'https://bitbucket.org/' + ADep.SrcLocator + '.git';
+    hkGitHub, hkGitLab, hkBitbucket:
+      Result := BuiltInForgeOrigin(ADep.SrcHost) + ADep.SrcLocator + '.git';
     hkCustom:
     begin
       ResolveCustomSourceOrDie(ADep, ACustomSources, Custom);
@@ -482,7 +503,8 @@ end;
                     without v as the repo published it).
     vkSemverExact → try the spec verbatim AND v<spec> against the
                     tag list; first match wins.
-    vkCommitSha   → returned verbatim (no tag lookup needed).
+    vkCommitSha   → returned verbatim once proven reachable from an
+                    advertised branch or tag (ADR-0047).
     vkLiteralTag  → returned verbatim (no SemVer logic). If the tag
                     isn't actually present in the repo, the eventual
                     fetch will 404 — we surface that as EFetchError.
@@ -785,6 +807,10 @@ begin
           + AName + '-' + ArchiveTag + '.tar.gz';
 end;
 
+{$IFDEF INSTALL_TESTING}
+{ Test-build-only archive fixture (ADR-0044), paired with the ref fixture in
+  LWPT.GitProtocol: <root>/archives/<name>/<ref>.tar.gz stands in for the
+  git-host archive endpoint. }
 function LoadTestFixtureArchive(const ARoot, AName, ARef: string;
   out ABody: TBytes): Boolean;
 var ArchivePath, RequestPath: string; Stream: TFileStream;
@@ -826,16 +852,44 @@ begin
   end;
   Result := True;
 end;
+{$ENDIF}
 
+{ A locked identity must reproduce its locked bytes (ADR-0048). AExpected is
+  '' when the selection is not a locked identity. Every path that supplies
+  archive bytes for a dependency -- a fresh download or a resolver candidate
+  another dependency already fetched -- calls this before using them. }
+procedure EnsureLockedArchiveIdentity(const ADependency, AContext,
+  AExpected, AActual, ARecovery: string); overload;
+begin
+  if (AExpected <> '') and not SameText(AActual, AExpected) then
+    raise EVerifyError.CreateFmt(
+      'dependency "%s": %s (locked archive %s, received %s). Nothing was '
+      + 'published. %s',
+      [ADependency, AContext, AExpected, AActual, ARecovery]);
+end;
+
+{ The online form: the recovery is a reviewed `--accept-moved-tags`. }
+procedure EnsureLockedArchiveIdentity(const ADependency, AContext,
+  AExpected, AActual: string); overload;
+begin
+  EnsureLockedArchiveIdentity(ADependency, AContext, AExpected, AActual,
+    'Review the upstream change, then run `' + PROGRAM_NAME + ' install '
+    + '--accept-moved-tags` to accept it.');
+end;
+
+{ AVerifyArchiveHash, when set, is the locked content identity the downloaded
+  bytes must reproduce (ADR-0048); a mismatch raises EVerifyError naming
+  AVerifyContext before the bytes are written, cached, or extracted. }
 function FetchToCache(const ADep: TDependency;
   const AResolvedRef, AModulesRoot, AArchivesRoot, ATmpRoot,
     AProjectRoot, AExpectedArchiveHash: string;
   const ACustomSources: TCustomSourceArray;
   const AWorkspaces: TWorkspaceArray;
   const AObjectStore: TLWPTImmutableObjectStore;
+  const AVerifyArchiveHash, AVerifyContext: string;
   out AUnitDir, AArchive, AArchiveHash, AResolvedURL: string): Boolean;
 var
-  URL, LocalPath, OriginOverride : string;
+  URL, LocalPath : string;
   Resp : THTTPResponse;
   NoHeaders : THTTPHeaders;
   HTTPOptions : THTTPRequestOptions;
@@ -843,8 +897,11 @@ var
   k : Integer;
   WSPath : string;
   AvailableNames : string;
-  StagePath, FixtureRoot : string;
+  StagePath : string;
   ProducerLease: TLWPTProducerLease;
+  {$IFDEF INSTALL_TESTING}
+  OriginOverride, FixtureRoot : string;
+  {$ENDIF}
 
   procedure StageLocalCopy(const AMessage: string);
   begin
@@ -981,7 +1038,7 @@ begin
       AModulesRoot, AArchivesRoot, ATmpRoot, AProjectRoot,
       AExpectedArchiveHash,
       ACustomSources, AWorkspaces,
-      AObjectStore,
+      AObjectStore, AVerifyArchiveHash, AVerifyContext,
       AUnitDir, AArchive, AArchiveHash, AResolvedURL);
     Exit;
   end;
@@ -1042,20 +1099,22 @@ begin
     before it can touch the origin or publish bytes. Halt deliberately skips
     object cleanup so the cross-process integration test observes the same
     operating-system guard release as an abrupt producer death. }
+  {$IFDEF INSTALL_TESTING}
   if Assigned(ProducerLease)
-     and (SysUtils.GetEnvironmentVariable(
-       PROJECT_NAME + '_TEST_CRASH_DEPENDENCY_PRODUCER') = '1') then
+     and (TestSeamValue('CRASH_DEPENDENCY_PRODUCER') = '1') then
     Halt(88);
+  {$ENDIF}
 
+  try
+  {$IFDEF INSTALL_TESTING}
   { The archive-fetch boundary, and the only place the test-only origin
     override applies: canonical construction above is untouched, and the
-    redirect below is inert unless the environment asks for it. }
-  try
-    OriginOverride := SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_ORIGIN_ENV);
-  { Record the canonical URL in the lockfile, captured before the redirect.
+    redirect below is inert unless the environment asks for it.
+    Record the canonical URL in the lockfile, captured before the redirect.
     The override only aims the fetch at a loopback mock server; the
     loopback origin must never persist into lwpt.lock, so AResolvedURL
     keeps the URL as constructed while URL below carries the rewrite. }
+  OriginOverride := SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_ORIGIN_ENV);
   FixtureRoot := SysUtils.GetEnvironmentVariable(
     PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
   { The ref fixture and archive-origin seams compose deliberately. A fixture
@@ -1071,21 +1130,28 @@ begin
     Resp.StatusCode := 200;
   end
   else
+  {$ENDIF}
   begin
-    URL := ApplyArchiveFetchOrigin(URL, OriginOverride);
     NoHeaders := nil;
-    HTTPOptions := DefaultHTTPRequestOptions;
+    { The dependency's destination policy (host allowlist and private-address
+      refusal) is enforced on the request and every redirect hop. }
+    HTTPOptions := DependencyFetchOptions(ADep, ACustomSources,
+      DefaultHTTPRequestOptions);
     HTTPOptions.MaxResponseBodyBytes := MAX_ARCHIVE_RESPONSE_BYTES;
+    HTTPOptions.RequestTimeoutMilliseconds :=
+      ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;
+    {$IFDEF INSTALL_TESTING}
+    URL := ApplyArchiveFetchOrigin(URL, OriginOverride);
     if OriginOverride <> '' then
     begin
       HTTPOptions.RequestTimeoutMilliseconds := ResolveArchiveFetchTimeout(
         SysUtils.GetEnvironmentVariable(ARCHIVE_FETCH_TIMEOUT_ENV));
-      { A loopback fixture must not escape through a remote Location header. }
+      { A loopback fixture must not escape through a remote Location header,
+        and the validated loopback origin replaces the source's hosts. }
       HTTPOptions.MaximumRedirects := 0;
-    end
-    else
-      HTTPOptions.RequestTimeoutMilliseconds :=
-        ARCHIVE_REQUEST_TIMEOUT_MILLISECONDS;
+      HTTPOptions.Destination := Default(THTTPDestinationPolicy);
+    end;
+    {$ENDIF}
     { Every transport failure below the client (refused connection, read
       timeout, truncated body, malformed response) arrives here as some
       HTTPClient-shaped exception whose text names neither the dependency
@@ -1112,6 +1178,10 @@ begin
   { Archive filename uses an escaped resolved ref for git-host sources,
     or the stable "url" tag for direct archive URLs. }
   AArchiveHash := SHA256BytesPrefixed(Resp.Body);
+  { Checked before the archive is written, admitted to the shared cache, or
+    extracted, so a mismatch leaves no trace in the project or the cache. }
+  EnsureLockedArchiveIdentity(ADep.Name, AVerifyContext, AVerifyArchiveHash,
+    AArchiveHash);
   AtomicWriteBytes(AArchive, ATmpRoot, Resp.Body);
   if AObjectStore <> nil then
     try
@@ -1497,6 +1567,31 @@ end;
 { TomlEscape lives in LWPT.Core — shared with LWPT.ManifestEdit so the
   lockfile writer and the manifest editor can't drift apart. }
 
+{ Frozen and offline installs never contact the host, so they cannot prove
+  a commit-SHA pin. A lock entry without a valid `reachableFrom` (a ref
+  under refs/heads/ or refs/tags/) was written before proofs existed, or by
+  hand; it is still installed from its hashes, but the user is told it is
+  unproven (ADR-0047). }
+procedure WarnUnprovenPin(const AMode, AName: string;
+  const AKinds: array of TVersionKind; ASrcKind: TSourceKind;
+  const AEntry: TResolved);
+var k: Integer; HasCommitPin: Boolean; Commit: string;
+begin
+  if (ASrcKind <> skGitHost) or IsProvingRefName(AEntry.ReachableFrom) then
+    Exit;
+  Commit := AEntry.CommitSHA;
+  if Commit = '' then Commit := AEntry.Version;
+  { Any SHA requirement, alone or beside a named one, needs a proof. }
+  HasCommitPin := False;
+  for k := 0 to High(AKinds) do
+    HasCommitPin := HasCommitPin or (AKinds[k] = vkCommitSha);
+  if not HasCommitPin then Exit;
+  WriteLn(ErrOutput, 'warning: ', AMode, ' lock entry for "', AName,
+    '" pins commit ', LowerCase(Commit), ' without a ',
+    'reachability proof; run `', PROGRAM_NAME, ' install` online to prove ',
+    'it belongs to the repository''s branches or tags');
+end;
+
 procedure WriteLock(const APath, ATmpRoot: string;
   const AResolved: array of TResolved);
 var
@@ -1531,6 +1626,13 @@ begin
       KV('source',       AResolved[i].SrcOriginal);
       KV('resolvedRef',  AResolved[i].Version);
       KV('resolvedCommit', AResolved[i].CommitSHA);
+      { Additive v3 evidence (ADR-0048), written only for named Git refs. }
+      if AResolved[i].RefKind <> '' then
+        KV('resolvedRefKind', AResolved[i].RefKind);
+      { Additive v3 evidence (ADR-0047): the ref that proved a commit-SHA
+        pin reachable. Its absence means the pin was never proven. }
+      if AResolved[i].ReachableFrom <> '' then
+        KV('reachableFrom', AResolved[i].ReachableFrom);
       KV('sourceIdentity', AResolved[i].SourceIdentity);
       KV('constraintFingerprint', AResolved[i].ConstraintFingerprint);
       KV('resolvedURL',  AResolved[i].ResolvedURL);
@@ -1684,6 +1786,8 @@ begin
       Entry.SrcOriginal := TomlStr(EntryNode, 'source',      '');
       Entry.Version     := TomlStr(EntryNode, 'resolvedRef', '');
       Entry.CommitSHA   := TomlStr(EntryNode, 'resolvedCommit', '');
+      Entry.RefKind     := TomlStr(EntryNode, 'resolvedRefKind', '');
+      Entry.ReachableFrom := TomlStr(EntryNode, 'reachableFrom', '');
       Entry.SourceIdentity := TomlStr(EntryNode, 'sourceIdentity', '');
       Entry.ConstraintFingerprint := TomlStr(EntryNode,
         'constraintFingerprint', '');
@@ -1762,6 +1866,8 @@ begin
     AResolved[i].Name := AResolution.Nodes[i].Name;
     AResolved[i].Version := AResolution.Nodes[i].Version;
     AResolved[i].CommitSHA := AResolution.Nodes[i].CommitSHA;
+    AResolved[i].RefKind := AResolution.Nodes[i].RefKind;
+    AResolved[i].ReachableFrom := AResolution.Nodes[i].ReachableFrom;
     AResolved[i].SourceIdentity := AResolution.Nodes[i].SourceIdentity;
     AResolved[i].ConstraintFingerprint :=
       AResolution.Nodes[i].ConstraintFingerprint;
@@ -2372,10 +2478,10 @@ procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
   const AWorkspaces: TWorkspaceArray;
   const APriorLock: TResolvedArray;
   const AObjectStore: TLWPTImmutableObjectStore;
-  const AOffline: Boolean);
+  const AOffline, AAcceptMovedTags: Boolean);
 type
   TSelectionState = record
-    Name, SourceIdentity, RefName, CommitSHA: string;
+    Name, SourceIdentity, RefName, CommitSHA, RefKind, ReachableFrom: string;
   end;
   TSelectionStateArray = array of TSelectionState;
   TRefCacheEntry = record
@@ -2387,6 +2493,7 @@ var
   Previous, Desired: TSelectionStateArray;
   OfflineResolved: TResolvedArray;
   RefCache: TRefCache;
+  VerifiedPins: TStringList;
   SeenSignatures: TStringList;
   PlanRoot, PlanModules, PlanArchives, PlanScratch: string;
   Round, i, j, idx, Head: Integer;
@@ -2395,8 +2502,8 @@ var
   LockedEntry: TResolved;
   ChildManifestPath, ManifestRelDir, ExtractTmp: string;
   UnitDir, Archive, ArchiveHash, ResolvedURL, CacheArchive,
-    ExpectedArchiveHash: string;
-  FetchRef, RollbackFailures: string;
+    ExpectedArchiveHash, VerifyArchiveHash, VerifyContext: string;
+  FetchRef, RollbackFailures, StagedRefLabel: string;
   SelectionDeferred, Stable: Boolean;
 
   procedure CopyCustomSources(const ASrc: TCustomSourceArray;
@@ -2511,6 +2618,10 @@ var
         [ANode.Name]);
     AState.RefName := Entry.Version;
     AState.CommitSHA := LockedCommitIdentity(Entry);
+    AState.RefKind := Entry.RefKind;
+    AState.ReachableFrom := Entry.ReachableFrom;
+    WarnUnprovenPin('[offline]', ANode.Name, ANode.Kinds, ANode.Dep.SrcKind,
+      Entry);
   end;
 
   procedure StageLockedArchive(const ANode: TResolveNode;
@@ -2644,7 +2755,8 @@ var
     { A failed advertisement is not a reusable empty advertisement. Resolve
       before extending the cache so a later complete-set selection can take
       the same lock-identity fallback as the discovery pass. }
-    Refs := ListRemoteRefs(RepoURL);
+    Refs := ListRemoteRefs(RepoURL, DependencyFetchOptions(ANode.Dep,
+      ANode.CustomSources, DefaultHTTPRequestOptions));
     n := Length(RefCache);
     SetLength(RefCache, n + 1);
     RefCache[n].RepoURL := RepoURL;
@@ -2680,6 +2792,221 @@ var
     Result := NodePath = WorkspacePath;
     {$ENDIF}
     if Result then AVersion := Workspace.Version;
+  end;
+
+  { The kind of the selected ref. A tag and a branch may share a name and
+    commit; advertisement order then must not decide the kind. The lock's
+    recorded branch is kept; otherwise the tag wins, as the stricter kind. }
+  function SelectedRefKind(const ANode: TResolveNode;
+    const ARefs: TGitRefArray; const ASelection: TResolverSelection): string;
+  var
+    Entry: TResolved;
+    RefIndex: Integer;
+    HasTag, HasBranch: Boolean;
+  begin
+    HasTag := False;
+    HasBranch := False;
+    for RefIndex := 0 to High(ARefs) do
+      if (ARefs[RefIndex].Name = ASelection.RefName)
+         and SameText(RefCommitSHA(ARefs[RefIndex]), ASelection.CommitSHA) then
+        if ARefs[RefIndex].Kind = rkTag then HasTag := True
+        else HasBranch := True;
+    if HasTag and HasBranch then
+    begin
+      if FindPriorLock(ANode, Entry) and (Entry.RefKind = RefKindBranch)
+         and (Entry.Version = ASelection.RefName) then
+        Exit(RefKindBranch);
+      Exit(RefKindTag);
+    end;
+    if ASelection.RefKind = rkTag then Result := RefKindTag
+    else Result := RefKindBranch;
+  end;
+
+  { Two ref names identify the same tag when they are equal, or when both
+    are SemVer spellings of one version (`v1.0.0` and `1.0.0`). }
+  function SameRefName(const ALocked, ASelected: string): Boolean;
+  var LockedVersion: string;
+  begin
+    if ALocked = ASelected then Exit(True);
+    LockedVersion := Valid(StripVPrefix(ALocked), DefaultSemverOptions);
+    Result := (LockedVersion <> '')
+      and (LockedVersion = Valid(StripVPrefix(ASelected),
+        DefaultSemverOptions));
+  end;
+
+  procedure RaiseMovedRef(const ANode: TResolveNode; const AMessage: string);
+  begin
+    raise EVerifyError.Create('dependency "' + ANode.Name + '": ' + AMessage
+      + ' Review the upstream change, then run `' + PROGRAM_NAME
+      + ' install --accept-moved-tags` to accept it.');
+  end;
+
+  { A locked tag is an immutable name for a reviewed commit (ADR-0048).
+    Whenever resolution selects the same tag again -- under any manifest
+    requirement, deliberately -- it must still be a tag at the locked
+    commit. A tag that moved, or that was replaced by a same-named branch,
+    fails until the caller accepts it. Branches keep moving, and a branch
+    replaced by a same-named tag is not a moved tag. A lock that predates
+    `resolvedRefKind` cannot prove a ref was a branch, so a changed commit
+    behind a ref that now resolves as a branch also fails closed. A lock
+    that predates `resolvedCommit` is checked by archive identity instead
+    (ExpectedVerifyHash). }
+  procedure RejectMovedRef(const ANode: TResolveNode;
+    var ASelection: TSelectionState);
+  var Entry: TResolved; LockedCommit: string;
+  begin
+    if AAcceptMovedTags or not FindPriorLock(ANode, Entry) then Exit;
+    if not SameRefName(Entry.Version, ASelection.RefName) then Exit;
+    if Entry.RefKind = RefKindBranch then Exit;
+    { An unknown locked kind is never promoted to branch without explicit
+      acceptance: seeing a branch at the locked commit proves nothing about
+      what the ref was, so the lock keeps the kind unknown and a later move
+      still fails closed. Promotion to tag only tightens the rule. }
+    if (Entry.RefKind = '') and (ASelection.RefKind = RefKindBranch) then
+      ASelection.RefKind := '';
+    LockedCommit := LockedCommitIdentity(Entry);
+    if (Entry.RefKind = RefKindTag)
+       and (ASelection.RefKind = RefKindBranch) then
+      RaiseMovedRef(ANode, Format('locked tag "%s" (commit %s) is now '
+        + 'advertised only as branch "%s" at %s.', [Entry.Version,
+        LowerCase(LockedCommit), ASelection.RefName,
+        LowerCase(ASelection.CommitSHA)]));
+    if (LockedCommit = '')
+       or SameText(LockedCommit, ASelection.CommitSHA) then Exit;
+    if (Entry.RefKind = RefKindTag)
+       or (ASelection.RefKind = RefKindTag) then
+      RaiseMovedRef(ANode, Format('tag "%s" moved upstream since it was '
+        + 'locked (locked commit %s, now advertised at %s).',
+        [ASelection.RefName, LowerCase(LockedCommit),
+         LowerCase(ASelection.CommitSHA)]));
+    RaiseMovedRef(ANode, Format('ref "%s" now resolves to branch commit %s, '
+      + 'but %s pinned commit %s before ref kinds were recorded, so it '
+      + 'cannot prove "%s" was a branch that may move.',
+      [ASelection.RefName, LowerCase(ASelection.CommitSHA), LWPT.Core.LOCKFILE,
+       LowerCase(LockedCommit), ASelection.RefName]));
+  end;
+
+  { The locked archive digest that a fresh download for ANode must
+    reproduce, or '' when the selection is not the locked identity. Same
+    commit means same bytes. A lock without a recorded commit is compared by
+    ref name, which is how a tag moved behind an early schema-v3 lock is
+    caught. }
+  function ExpectedVerifyHash(const ANode: TResolveNode;
+    out AContext: string): string;
+  var Entry: TResolved; LockedCommit: string;
+  begin
+    Result := '';
+    AContext := '';
+    if AAcceptMovedTags or (ANode.Dep.SrcKind <> skGitHost) then Exit;
+    if not FindPriorLock(ANode, Entry) or (Entry.ArchiveHash = '') then Exit;
+    LockedCommit := LockedCommitIdentity(Entry);
+    if LockedCommit <> '' then
+    begin
+      if (ANode.CommitSHA = '')
+         or not SameText(LockedCommit, ANode.CommitSHA) then Exit;
+      AContext := Format('the archive served for locked commit %s no longer '
+        + 'matches %s', [LowerCase(LockedCommit), LWPT.Core.LOCKFILE]);
+    end
+    else
+    begin
+      if not SameRefName(Entry.Version, ANode.Version) then Exit;
+      if ANode.RefKind = RefKindTag then
+        AContext := Format('tag "%s" moved upstream since it was locked: its '
+          + 'archive no longer matches %s', [ANode.Version, LWPT.Core.LOCKFILE])
+      else
+        AContext := Format('ref "%s" changed upstream since it was locked, '
+          + 'and %s records no commit that would allow it to move: its '
+          + 'archive no longer matches', [ANode.Version, LWPT.Core.LOCKFILE]);
+    end;
+    Result := Entry.ArchiveHash;
+  end;
+
+  function NewUploadPackTransport(
+    const ANode: TResolveNode): TGitUploadPackTransport;
+  {$IFDEF INSTALL_TESTING}
+  var FixtureRoot: string;
+  {$ENDIF}
+  begin
+    {$IFDEF INSTALL_TESTING}
+    FixtureRoot := SysUtils.GetEnvironmentVariable(
+      PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
+    if FixtureRoot <> '' then
+      Exit(TGitFixtureUploadPackTransport.Create(FixtureRoot, 0, True));
+    {$ENDIF}
+    { The same destination policy as ref listing and archive fetches. }
+    Result := THTTPGitUploadPackTransport.Create(DependencyFetchOptions(
+      ANode.Dep, ANode.CustomSources, DefaultHTTPRequestOptions));
+  end;
+
+  { A commit-SHA pin is accepted only when the commit is reachable from an
+    advertised refs/heads/* or refs/tags/* tip (ADR-0047): the archive
+    endpoint also serves commits that exist only in forks or pull requests.
+    The proof runs when the lock entry is created, when its commit changes,
+    and when a locked entry lacks `reachableFrom`. An entry for the same
+    source at the same commit that records its proving ref is trusted like
+    the committed archive it names. Returns the proving ref. }
+  function VerifyCommitPin(const ANode: TResolveNode;
+    const ACommit: string): string;
+  var
+    RepoURL: string;
+    Entry: TResolved;
+    Refs: TGitRefArray;
+    Transport: TGitUploadPackTransport;
+    Outcome: TGitReachabilityResult;
+  begin
+    RepoURL := GitRepoURL(ANode.Dep, ANode.CustomSources);
+    Result := VerifiedPins.Values[RepoURL + '@' + LowerCase(ACommit)];
+    if Result <> '' then Exit;
+    { Only an entry that records its proof is trusted; a v3 entry without
+      `reachableFrom` predates proofs and is proven now. }
+    if FindPriorLock(ANode, Entry)
+       and SameText(LockedCommitIdentity(Entry), ACommit)
+       and IsProvingRefName(Entry.ReachableFrom) then
+      Exit(Entry.ReachableFrom);
+    Refs := CachedRefs(ANode);
+    WriteLn('  verifying commit ', LowerCase(ACommit), ' for ', ANode.Name,
+      '...');
+    Transport := NewUploadPackTransport(ANode);
+    try
+      try
+        Outcome := ProveCommitReachable(Transport, RepoURL, ACommit, Refs);
+      except
+        on E: ELWPTError do
+          raise;
+        on E: Exception do
+          raise EFetchError.CreateFmt(
+            'dependency "%s": cannot verify that commit %s belongs to %s: '
+            + '%s. Pin a tag or branch instead, or a commit that is an '
+            + 'advertised branch or tag tip.',
+            [ANode.Name, LowerCase(ACommit), RepoURL, E.Message]);
+      end;
+    finally
+      Transport.Free;
+    end;
+    if not Outcome.Known then
+      raise EVerifyError.CreateFmt(
+        'dependency "%s": commit %s does not exist in %s',
+        [ANode.Name, LowerCase(ACommit), RepoURL]);
+    if not Outcome.Reachable then
+      raise EVerifyError.CreateFmt(
+        'dependency "%s": commit %s is not reachable from any branch or tag '
+        + 'of %s. It may exist only in a fork or a pull request, or the '
+        + 'branch that contained it was deleted or force-pushed. Pin a '
+        + 'commit from the repository''s own history.',
+        [ANode.Name, LowerCase(ACommit), RepoURL]);
+    WriteLn('  verified commit ', LowerCase(ACommit), ' for ', ANode.Name,
+      ': reachable from ', Outcome.ProvingRef, ' (', Outcome.Requests,
+      ' requests, ', Outcome.BytesReceived, ' bytes)');
+    Result := Outcome.ProvingRef;
+    VerifiedPins.Values[RepoURL + '@' + LowerCase(ACommit)] := Result;
+  end;
+
+  function NodeHasCommitPin(const ANode: TResolveNode): Boolean;
+  var k: Integer;
+  begin
+    Result := False;
+    for k := 0 to High(ANode.Kinds) do
+      Result := Result or (ANode.Kinds[k] = vkCommitSha);
   end;
 
   function SelectNode(const ANode: TResolveNode): TSelectionState;
@@ -2718,6 +3045,18 @@ var
       Exit;
     end;
 
+    { Only a full id can be proven or unambiguously compared: an
+      abbreviated one could name a different, fork-only commit on a host
+      that resolves prefixes. This holds beside named requirements too. }
+    for k := 0 to High(ANode.Kinds) do
+      if (ANode.Kinds[k] = vkCommitSha)
+         and (Length(ANode.Specs[k]) <> GIT_OBJECT_ID_LENGTH) then
+        raise EManifestError.CreateFmt(
+          'dependency "%s": commit pin "%s" (required by %s) is abbreviated. '
+          + '%s verifies that a pinned commit belongs to the repository and '
+          + 'needs the full %d-character SHA.', [ANode.Name, ANode.Specs[k],
+          ANode.Requirers[k], PROGRAM_NAME, GIT_OBJECT_ID_LENGTH]);
+
     AllSHA := Length(ANode.Kinds) > 0;
     Longest := 0;
     for k := 0 to High(ANode.Kinds) do
@@ -2733,6 +3072,7 @@ var
              Copy(ANode.Specs[Longest], 1, Length(ANode.Specs[k]))) then
           RaiseNodeConflict(ANode, '', '',
             'SHA requirements do not identify the same commit');
+      Result.ReachableFrom := VerifyCommitPin(ANode, ANode.Specs[Longest]);
       Result.RefName := ANode.Specs[Longest];
       Result.CommitSHA := ANode.Specs[Longest];
       Exit;
@@ -2753,8 +3093,18 @@ var
         if FindPriorLock(ANode, PriorEntry)
            and PriorSelectionSatisfies(ANode, PriorEntry) then
         begin
+          { The fetch that follows must reproduce the locked archive bytes
+            (ExpectedVerifyHash), so an unreachable advertisement cannot be
+            used to smuggle different content in under the locked identity. }
+          { A SHA requirement cannot fall back on an entry that never
+            recorded a proof: without the listing it cannot be proven. }
+          if NodeHasCommitPin(ANode)
+             and not IsProvingRefName(PriorEntry.ReachableFrom) then
+            raise;
           Result.RefName := PriorEntry.Version;
           Result.CommitSHA := PriorEntry.CommitSHA;
+          Result.RefKind := PriorEntry.RefKind;
+          Result.ReachableFrom := PriorEntry.ReachableFrom;
           WriteLn(ErrOutput, 'warning: tag resolution for ', ANode.Name,
             ' failed: ', E.Message, '; reusing verified lockfile identity');
           Exit;
@@ -2772,6 +3122,17 @@ var
     end;
     Result.RefName := Selection.RefName;
     Result.CommitSHA := Selection.CommitSHA;
+    Result.RefKind := SelectedRefKind(ANode, Refs, Selection);
+    RejectMovedRef(ANode, Result);
+    { A SHA requirement beside named ones selects the same commit as the
+      named ref, but only through the listing's (possibly peeled) claim.
+      It is proven exactly like a lone pin (ADR-0047). }
+    for k := 0 to High(ANode.Kinds) do
+      if ANode.Kinds[k] = vkCommitSha then
+      begin
+        Result.ReachableFrom := VerifyCommitPin(ANode, ANode.Specs[k]);
+        Break;
+      end;
   end;
 
   procedure EnqueueNode(AIndex: Integer);
@@ -2849,10 +3210,11 @@ var
         ApplyIncludeExclude(RecheckPath,
           R.Nodes[k].Dep.IncludeGlobs, R.Nodes[k].Dep.ExcludeGlobs);
         try
-      if SameText(SysUtils.GetEnvironmentVariable(
-               PROJECT_NAME + '_TEST_STALE_LOCAL_SNAPSHOT'),
+          {$IFDEF INSTALL_TESTING}
+          if SameText(TestSeamValue('STALE_LOCAL_SNAPSHOT'),
              R.Nodes[k].Name) then
             R.Nodes[k].Hash := 'sha256:injected-stale-snapshot';
+          {$ENDIF}
           if HashTree(RecheckPath) <> R.Nodes[k].Hash then
             raise EFetchError.CreateFmt(
               'local/workspace source "%s" changed during resolution; '
@@ -2873,10 +3235,11 @@ var
         raise EFetchError.CreateFmt(
           'failed to retain rollback copy for module "%s"',
           [R.Nodes[k].Name]);
-      if SameText(SysUtils.GetEnvironmentVariable(
-           PROJECT_NAME + '_TEST_HALT_AFTER_MODULE_RETAIN'),
+      {$IFDEF INSTALL_TESTING}
+      if SameText(TestSeamValue('HALT_AFTER_MODULE_RETAIN'),
          R.Nodes[k].Name) then
         Halt(87);
+      {$ENDIF}
       FinalArchive := '';
       if not (R.Nodes[k].Dep.SrcKind in [skLocal, skWorkspace]) then
       begin
@@ -2906,17 +3269,13 @@ var
       else
         R.Nodes[k].Archive := FinalArchive;
       R.Nodes[k].Hash := HashTree(FinalUnitDir);
-      if (SysUtils.GetEnvironmentVariable(
-          PROJECT_NAME + '_TEST_FAIL_PUBLISH_AFTER') <>
-          '') and (StrToIntDef(SysUtils.GetEnvironmentVariable(
-          PROJECT_NAME + '_TEST_FAIL_PUBLISH_AFTER'), -1) = k + 1) then
+      {$IFDEF INSTALL_TESTING}
+      if StrToIntDef(TestSeamValue('FAIL_PUBLISH_AFTER'), -1) = k + 1 then
         raise EFetchError.CreateFmt(
           'injected publication failure after package %d', [k + 1]);
-      if (SysUtils.GetEnvironmentVariable(
-          PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER') <>
-          '') and (StrToIntDef(SysUtils.GetEnvironmentVariable(
-          PROJECT_NAME + '_TEST_HALT_PUBLISH_AFTER'), -1) = k + 1) then
+      if StrToIntDef(TestSeamValue('HALT_PUBLISH_AFTER'), -1) = k + 1 then
         Halt(86);
+      {$ENDIF}
     end;
   end;
 
@@ -2927,6 +3286,7 @@ begin
   PlanScratch := PlanRoot + '/scratch';
   Previous := nil;
   RefCache := nil;
+  VerifiedPins := TStringList.Create;
   SeenSignatures := TStringList.Create;
   try
     Round := 0;
@@ -2968,6 +3328,8 @@ begin
             begin
               R.Nodes[idx].Version := Previous[j].RefName;
               R.Nodes[idx].CommitSHA := Previous[j].CommitSHA;
+              R.Nodes[idx].RefKind := Previous[j].RefKind;
+              R.Nodes[idx].ReachableFrom := Previous[j].ReachableFrom;
             end
             else
             begin
@@ -2976,6 +3338,8 @@ begin
               Desired[0] := SelectNode(R.Nodes[idx]);
               R.Nodes[idx].Version := Desired[0].RefName;
               R.Nodes[idx].CommitSHA := Desired[0].CommitSHA;
+              R.Nodes[idx].RefKind := Desired[0].RefKind;
+              R.Nodes[idx].ReachableFrom := Desired[0].ReachableFrom;
             end;
           end;
         except
@@ -3001,6 +3365,24 @@ begin
         begin
           if FileExists(CacheArchive) then
           begin
+            { The candidate was staged for another dependency naming the same
+              source and ref, so this node's own locked archive identity is
+              checked before its bytes are copied or extracted (ADR-0048). }
+            if not FindPriorLock(R.Nodes[idx], LockedEntry) then
+              raise EVerifyError.CreateFmt(
+                '[offline] dependency "%s" has no compatible lock entry',
+                [R.Nodes[idx].Name]);
+            if R.Nodes[idx].CommitSHA <> '' then
+              StagedRefLabel := 'commit ' + LowerCase(FetchRef)
+            else
+              StagedRefLabel := 'ref ' + FetchRef;
+            EnsureLockedArchiveIdentity(R.Nodes[idx].Name,
+              Format('[offline] the archive staged for locked %s by '
+                + 'another dependency does not match %s',
+                [StagedRefLabel, LWPT.Core.LOCKFILE]),
+              LockedEntry.ArchiveHash, 'sha256:' + SHA256File(CacheArchive),
+              'Restore the committed archives, or run `' + PROGRAM_NAME
+              + ' install` online to resolve the dependency again.');
             UnitDir := IncludeTrailingPathDelimiter(PlanModules)
               + R.Nodes[idx].Name;
             Archive := ArchivePathForRef(PlanArchives, R.Nodes[idx].Name,
@@ -3011,10 +3393,6 @@ begin
                 '[offline] failed to restore staged candidate "%s"',
                 [R.Nodes[idx].Name]);
             ArchiveHash := 'sha256:' + SHA256File(Archive);
-            if not FindPriorLock(R.Nodes[idx], LockedEntry) then
-              raise EVerifyError.CreateFmt(
-                '[offline] dependency "%s" has no compatible lock entry',
-                [R.Nodes[idx].Name]);
             ResolvedURL := LockedEntry.ResolvedURL;
           end
           else
@@ -3031,6 +3409,15 @@ begin
         else if (R.Nodes[idx].Dep.SrcKind in [skGitHost, skURL])
            and FileExists(CacheArchive) then
         begin
+          { The candidate may have been fetched for another dependency that
+            names the same source and commit but has no locked identity of
+            its own, so this node's lock is checked before the bytes are
+            used. }
+          ArchiveHash := 'sha256:' + SHA256File(CacheArchive);
+          VerifyArchiveHash := ExpectedVerifyHash(R.Nodes[idx],
+            VerifyContext);
+          EnsureLockedArchiveIdentity(R.Nodes[idx].Name, VerifyContext,
+            VerifyArchiveHash, ArchiveHash);
           UnitDir := IncludeTrailingPathDelimiter(PlanModules)
             + R.Nodes[idx].Name;
           Archive := ArchivePathForRef(PlanArchives, R.Nodes[idx].Name,
@@ -3047,11 +3434,14 @@ begin
         else
         begin
           ExpectedArchiveHash := ExpectedHashForSelection(R.Nodes[idx]);
+          VerifyArchiveHash := ExpectedVerifyHash(R.Nodes[idx],
+            VerifyContext);
           FetchToCache(R.Nodes[idx].Dep, FetchRef,
             PlanModules, PlanArchives, PlanScratch, AProjectRoot,
             ExpectedArchiveHash,
             R.Nodes[idx].CustomSources, AWorkspaces,
             AObjectStore,
+            VerifyArchiveHash, VerifyContext,
             UnitDir, Archive, ArchiveHash, ResolvedURL);
           if (Archive <> '') and FileExists(Archive) then
           begin
@@ -3135,6 +3525,10 @@ begin
         Stable := Stable
           and (Desired[i].RefName = R.Nodes[i].Version)
           and SameText(Desired[i].CommitSHA, R.Nodes[i].CommitSHA);
+        { The node may have been staged before a later round added a SHA
+          requirement; the proof belongs to the complete requirement set. }
+        if SameText(Desired[i].CommitSHA, R.Nodes[i].CommitSHA) then
+          R.Nodes[i].ReachableFrom := Desired[i].ReachableFrom;
       end;
       if not Stable then
       begin
@@ -3167,6 +3561,7 @@ begin
     end;
   finally
     SeenSignatures.Free;
+    VerifiedPins.Free;
     if DirectoryExists(PlanRoot) then WipeDir(PlanRoot);
   end;
 end;
@@ -3563,10 +3958,13 @@ end;
   lockfile diff prunes orphaned module trees + archives — all INSIDE
   the cross-process install lock, so a concurrent install can neither
   observe a manifest/lockfile mismatch nor race the prune deletions.
-  AManifestLines = nil is the plain `lwpt install` flow. }
+  AManifestLines = nil is the plain `lwpt install` flow.
+  AAcceptMovedTags lets resolution re-pin a locked tag that the host now
+  advertises at a different commit (`install --accept-moved-tags`). }
 function RunInstallTransactionCore(const AContext: TManifestContext;
   const AMode: TInstallTransactionMode;
-  const AManifestLines: TStringList): TInstallTransactionResult;
+  const AManifestLines: TStringList;
+  const AAcceptMovedTags: Boolean): TInstallTransactionResult;
 var
   Man : TManifest;
   R   : TResolution;
@@ -3587,7 +3985,9 @@ var
   PublicationPending: Boolean;
   LockfileBackup, CfgBackup, ManifestBackup: string;
   OrphanRollbacks: TPathRollbackArray;
+  {$IFDEF INSTALL_TESTING}
   TestCorruption: TStringList;
+  {$ENDIF}
 begin
   Man := AContext.Manifest;
   Frozen := AMode = itmFrozenVerify;
@@ -3673,7 +4073,8 @@ begin
     begin
       ResolveGraphFixedPoint(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
                              RollbackRoot, AContext.ProjectRoot,
-                             Man.Workspaces, OldLock, ObjectStore, Offline);
+                             Man.Workspaces, OldLock, ObjectStore, Offline,
+                             AAcceptMovedTags);
       PublicationPending := True;
     end;
     WriteLn('resolved ', Length(R.Nodes), ' packages, no conflicts.');
@@ -3725,6 +4126,10 @@ begin
             [Resolved[i].Name]);
         Resolved[i].Version := FrozenLock.Version;
         Resolved[i].CommitSHA := FrozenLock.CommitSHA;
+        Resolved[i].RefKind := FrozenLock.RefKind;
+        Resolved[i].ReachableFrom := FrozenLock.ReachableFrom;
+        WarnUnprovenPin('[frozen]', Resolved[i].Name, R.Nodes[i].Kinds,
+          Resolved[i].SrcKind, FrozenLock);
         HasCommitConstraint := False;
         for j := 0 to High(R.Nodes[i].Kinds) do
           HasCommitConstraint := HasCommitConstraint
@@ -3796,15 +4201,13 @@ begin
       VerifyOfflineAgainstLockfile(Resolved, OldLock)
     else
       WriteLock(LockfilePath, TmpRoot, Resolved);
-    if (not Offline) and (SysUtils.GetEnvironmentVariable(
-      PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE') = '1') then
+    {$IFDEF INSTALL_TESTING}
+    if (not Offline) and (TestSeamValue('FAIL_AFTER_LOCK_WRITE') = '1') then
     begin
-      if SysUtils.GetEnvironmentVariable(
-        PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR') <> '' then
+      if TestSeamValue('CORRUPT_ROLLBACK_FOR') <> '' then
         for i := 0 to High(R.Nodes) do
           if SameText(R.Nodes[i].Name,
-               SysUtils.GetEnvironmentVariable(
-                 PROJECT_NAME + '_TEST_CORRUPT_ROLLBACK_FOR'))
+               TestSeamValue('CORRUPT_ROLLBACK_FOR'))
              and (R.Nodes[i].UnitBackup <> '') then
           begin
             ForceDirectories(R.Nodes[i].UnitBackup);
@@ -3820,6 +4223,7 @@ begin
       raise ELockfileError.Create(
         'injected failure after lockfile publication');
     end;
+    {$ENDIF}
     WriteCfg(CfgPath, TmpRoot, Resolved, Man, AContext.ProjectRoot);
     if Offline then
       WriteLn('[offline] restored ', Length(Resolved),
@@ -3836,10 +4240,11 @@ begin
         only best-effort tmp cleanup remains. }
       RetainOrphanedPackagePaths(OldLock, Resolved, ModulesRoot,
         ArchivesRoot, RollbackRoot, OrphanRollbacks);
-      if SysUtils.GetEnvironmentVariable(
-           PROJECT_NAME + '_TEST_FAIL_AFTER_ORPHAN_RETAIN') = '1' then
+      {$IFDEF INSTALL_TESTING}
+      if TestSeamValue('FAIL_AFTER_ORPHAN_RETAIN') = '1' then
         raise EExtractError.Create(
           'injected failure after orphan retention');
+      {$ENDIF}
       AtomicWriteText(ManifestPath, TmpRoot, AManifestLines);
     end;
 
@@ -3891,9 +4296,9 @@ begin
   end;
 end;
 
-function RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode): TInstallTransactionResult;
+function RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode; const AAcceptMovedTags: Boolean): TInstallTransactionResult;
 begin
-  Result := RunInstallTransactionCore(AContext, AMode, nil);
+  Result := RunInstallTransactionCore(AContext, AMode, nil, AAcceptMovedTags);
 end;
 
 procedure RecoverInterruptedInstall(const AContext: TManifestContext);
@@ -3909,7 +4314,8 @@ end;
 
 function RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
 begin
-  Result := RunInstallTransactionCore(AContext, itmMaterialize, AManifestLines);
+  Result := RunInstallTransactionCore(AContext, itmMaterialize, AManifestLines,
+    False);
 end;
 
 end.

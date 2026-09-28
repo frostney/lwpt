@@ -21,6 +21,7 @@ type
     procedure TestReservedWordsAndEscapedIdentifiers;
     procedure TestCommentNestingFollowsSourceMode;
     procedure TestLexicalErrorsCarrySourceLocations;
+    procedure TestDefaultReadingToleratesLineBrokenStrings;
   end;
 
   TPascalRegionTests = class(TTestSuite)
@@ -144,6 +145,32 @@ begin
   end;
   Expect<Boolean>(Pos('broken.pas(2,1)', MessageText) > 0).ToBe(True);
   Expect<Boolean>(Pos('unterminated comment', MessageText) > 0).ToBe(True);
+
+  { Strict reading, as the formatter asks for it: FPC ends a string at its
+    line ("String exceeds line"), so a quote on a later line does not
+    close it. }
+  MessageText := '';
+  try
+    TokenizePascal('x := ''open'#10'still'';', 'broken.pas', True);
+  except
+    on Error: ELWPTPascalAnalysisError do MessageText := Error.Message;
+  end;
+  Expect<Boolean>(Pos('broken.pas(1,6)', MessageText) > 0).ToBe(True);
+  Expect<Boolean>(Pos('unterminated string literal', MessageText) > 0).ToBe(True);
+end;
+
+procedure TPascalTokenizerTests.TestDefaultReadingToleratesLineBrokenStrings;
+var
+  Tokens: TLWPTPascalTokenArray;
+begin
+  { The analyses read inactive conditional branches too, where FPC
+    tolerates such text: the default reading runs the string on to its
+    closing quote, as `lwpt health` and `lwpt duplication` always have. }
+  Tokens := TokenizePascal('{$ifdef NEVER} x := ''open'#10'still''; {$endif} y',
+    'inactive.pas');
+  Expect<Integer>(Length(Tokens)).ToBe(7);
+  Expect<Boolean>(Tokens[3].Kind = ptString).ToBe(True);
+  Expect<string>(Tokens[5].Text).ToBe('{$endif}');
 end;
 
 procedure TPascalTokenizerTests.SetupTests;
@@ -162,6 +189,8 @@ begin
     TestCommentNestingFollowsSourceMode);
   Test('reports lexical errors with source locations',
     TestLexicalErrorsCarrySourceLocations);
+  Test('default reading tolerates line-broken strings in inactive code',
+    TestDefaultReadingToleratesLineBrokenStrings);
 end;
 
 procedure TPascalRegionTests.TestNestedRoutinesAndUnitSectionsAreSeparate;

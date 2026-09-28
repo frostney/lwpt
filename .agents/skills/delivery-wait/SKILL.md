@@ -17,11 +17,33 @@ must await external GitHub state. The harness passively waits for the command to
 finish; it must not simulate waiting with model heartbeats.
 
 The caller supplies the repository, expected identity, absolute deadline, and
-an optional checkpoint path. The command reconciles any checkpoint with fresh
+an optional state path. The command reconciles any saved state with fresh
 GitHub state, waits while nothing relevant changes, and exits with one result.
 Use `--json` from workflow skills; human output is for direct terminal use.
-Skills default checkpoints beneath gitignored `.agent/waits/`; another harness
-may supply any private state path.
+Skills default state files beneath gitignored `.agent/waits/`; another harness
+may supply any private state path through `--state`.
+
+## Invocation
+
+`wait <kind> --repo <owner/repo> --deadline <ISO 8601> [--interval <seconds>]
+[--state <path>] [--json]` runs a foreground wait; `inspect <kind>` takes the
+same identity flags without `--deadline`, `--interval`, or `--state`. Each kind
+requires its own identity flags:
+
+- `checks-terminal`: `--pr <number>`, `--head <sha>`, and one `--check <name>`
+  per expected check context. Repeat `--check` for every context the caller
+  needs; a run with no `--check` exits with an operational error instead of
+  waiting.
+- `pr-merged`: `--pr <number>` and `--head <sha>`.
+- `workflow-terminal`: `--run-id <id>` and `--head <sha>`.
+- `tag-target`: `--tag <name>` and `--head <sha>`.
+- `release-assets`: `--tag <name>`, `--head <sha>`, and one `--asset <name>` per
+  required asset.
+- `wake-at` (`wait` only): `--deadline` alone. It keeps no state file, so
+  `--state` has no effect.
+
+There is no `--checkpoint` flag. The state path is `--state`, and the command
+derives a default path from the kind and identity when it is omitted.
 
 Use `inspect` for a single authoritative delivery snapshot and `wait` for a
 foreground transition wait. Supported predicates are exact-head checks,

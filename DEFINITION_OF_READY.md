@@ -10,14 +10,13 @@ not applicable only with a recorded reason.
 - The proposal is consistent with [`VISION.md`](./VISION.md), or the intended
   Vision change is explicit.
 - The applicable contributor instructions and project skills have been read.
-- The implementation route is selected:
-  - an investigated GitHub issue, normally prepared through
-    `/implement-issue`; or
-  - a user-confirmed mini-spec, prepared to the same standard through
-    `/implement-idea`.
+- The implementation route is selected through `/implement` (or `/deliver`
+  when the work item should continue through publication and merge):
+  - an investigated GitHub issue; or
+  - a user-confirmed mini-spec, prepared to the same standard.
 
 A GitHub issue is the recommended roadmap path, but it is not mandatory for a
-user-confirmed implementation idea. `/implement-idea` must not create an
+user-confirmed implementation idea. `/implement` must not create an
 intermediary issue merely to satisfy process.
 
 ## Ready to plan
@@ -36,8 +35,7 @@ intermediary issue merely to satisfy process.
 - Required test groups and cross-platform checks are identified.
 - Dependencies, migration or compatibility expectations, and unresolved
   decisions are explicit.
-- The delivery plan records standalone versus GitHub-native stack topology
-  and whether `ci:full-required` applies.
+- The delivery plan records standalone versus GitHub-native stack topology.
 - The plan records the review axes that apply (standards and specification,
   plus security for trust surfaces) and any repository workflow, ruleset, or
   provider configuration that must land first.

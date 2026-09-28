@@ -1,0 +1,9 @@
+001e# service=git-upload-pack
+0000000eversion 2
+0015agent=git/2.43.0
+0013ls-refs=unborn
+0020fetch=shallow wait-for-done
+0012server-option
+0017object-format=sha1
+0010object-info
+0000

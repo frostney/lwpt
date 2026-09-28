@@ -27,8 +27,9 @@ LWPT now keeps only what those skills cannot provide:
 - [`ORCHESTRATION.md`](../../ORCHESTRATION.md) declares the policy the skills
   consume: capability routing, context packets, token interventions, waits,
   escalation, the worktree path budget, the integration destination, and the
-  full-CI rule. A pull request labelled `ci:full-required` needs a green
-  `mode=manual` run on its exact head before a head-matched squash merge.
+  full-CI rule. Every pull request needs a green `mode=manual` run on its
+  exact head before a head-matched squash merge, and nothing merges while
+  `main` is red.
   It also names the review evidence: an independent review the delivering
   agent runs on the exact head, currently Codex with `gpt-6-astra`.
 - `.github/delivery/review-automations.json` stays at the path
@@ -43,8 +44,7 @@ LWPT now keeps only what those skills cannot provide:
 - **Keep full CI as a machine-checked proof with a finalizer.** Rejected.
   `delivery-wait wait workflow-terminal` binds a manual run to its exact head,
   and `gh pr merge --match-head-commit` refuses a head that moved after the
-  proof. A required full-CI check would need the finalizer back to write it,
-  for the few pull requests that carry the label. The repository is
+  proof. A required full-CI check would need the finalizer back to write it. The repository is
   user-owned, so merge queue is unavailable and cannot carry that proof either.
 - **Replace the endpoint with labels that trigger workflows.** Rejected for the
   reason ADR-0032 gave: a label would be both the request and the accepted
@@ -58,9 +58,11 @@ LWPT now keeps only what those skills cannot provide:
 - Native stacked pull requests get PR CI whatever their base branch is called.
   They are no longer limited to `codex/**` bases.
 - Readiness is exact-head evidence that the skills observe: the required check,
-  review convergence, resolved threads, and full CI when the label applies. It
-  is not a label. `delivery:managed`, `ci:ready`, `review:ready`,
-  `merge:ready`, and `stack:managed` retire; `ci:full-required` remains.
+  review convergence, resolved threads, and full CI. It is not a label.
+  `delivery:managed`, `ci:ready`, `review:ready`, `merge:ready`,
+  `stack:managed`, and `ci:full-required` retire. Full CI applies to every
+  pull request, because the September 2026 flake work showed the PR gate
+  alone repeatedly missing Intel-Darwin, i386 and cross-toolchain breaks.
 - Macroscope, which had run out of credits, is no longer a review gate. An
   independent review run by the delivering agent replaces it: standards and
   specification axes, plus security for trust surfaces. CodeRabbit reviews

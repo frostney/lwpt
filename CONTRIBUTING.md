@@ -41,8 +41,8 @@ review of the exact head, with its report recorded on the PR, as
 [`ORCHESTRATION.md`](./ORCHESTRATION.md) describes. CodeRabbit reviews
 non-draft PRs automatically as an advisory reviewer.
 
-A PR labelled `ci:full-required` also needs a green six-target run on its
-exact head before merge:
+Every PR also needs a green six-target run on its exact head before merge,
+and nothing merges while `main` is red:
 `gh workflow run ci.yml --ref <branch> -f mode=manual`. Merge with
 `gh pr merge --squash --match-head-commit <sha>` so a later push cannot slip
 past that evidence. A diagnostic slice (`-f mode=diagnostic`) helps with

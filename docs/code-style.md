@@ -104,7 +104,34 @@ and stay unqualified.
 - Uses-clause grouped, alphabetised within groups, blank line between groups.
 - Identifier casing for declared types (auto-cased to declared form).
 
-**A uses clause that carries a compiler directive or a comment is left exactly as written.** Reordering across `{$IFDEF}` would change which units a build sees, and a comment inside a uses clause exists to pin a position — see the `cthreads, { must come first so TThread has a driver }` clauses in the test programs. The formatter therefore treats any clause containing `{$…}`, `//`, `{ … }`, or `(* … *)` as author-owned and emits it verbatim; grouping and alphabetisation are on you in those clauses. Everything else the formatter does (trailing whitespace, line endings, identifier casing) still applies to the rest of the file.
+**Comments, compiler directives, and string literals are never rewritten.** Every pass reads the file through the same mode-aware tokenizer as `lwpt health` and `lwpt duplication`, and rewrites whole code tokens only. Prose inside `{ … }`, `(* … *)`, or `//` that happens to begin with `function`, `procedure`, or `uses` is left alone, and a rename never touches a comment, directive, or string that mentions the old name. Comment nesting follows the file's own `{$mode}` and `{$modeswitch nestedcomments}` directives; with neither, comments nest as in FPC's default mode. A mode chosen only on the command line or in an include file is not seen, and a mode directive counts wherever it appears, even inside a conditional branch the build does not take. A file that is not lexically valid (an unterminated comment, or a string whose closing quote is not on its line) is left untouched. The formatter applies that string rule even inside a conditional branch the build does not take, where FPC tolerates such text. `lwpt health` and `lwpt duplication` keep reading those strings on to their closing quote. `lwpt format` names it and the reason. `lwpt format --check` counts it as a file it could not check and exits non-zero, because it cannot vouch for the file's formatting. An InstantFPC script's leading `#!` line is skipped.
+
+**Parameter renames are scoped, and skipped when the binding is uncertain.** A parameter's `A`-prefix rename covers every header of its routine in the file and the body each header owns: FPC rejects an implementation whose parameter names differ from its declaration. Headers belong to one routine when they share the qualified name, the enclosing routine, and each parameter's modifier and type, so overloads and same-named nested routines are decided separately. The body is found even when `begin` shares the header's line. It includes every branch when alternative bodies sit in a conditional block with nothing else between them. A header without a body keeps the rename in the header: a class or record member, a `forward` or `abstract` declaration (whose directive may be on a later line), or an interface-section declaration.
+
+A nested routine that binds the name itself, as a parameter, variable, constant or type, keeps its own binding. A record or class field of the same name is not the parameter and keeps its name. An `absolute` alias of the parameter in the routine that owns it is renamed with it. A member access (`Entry.ACount`) is never a collision. Only identifier tokens are renamed, never keyword tokens: an escaped `&begin` becomes `ABegin` while the `begin` keywords around it stay. The formatter leaves a parameter as it is when:
+
+- a header of its routine is `external` (renaming external parameters is out of scope);
+- the parameter is spelled like a directive word the tokenizer reads as a keyword (`message`, `name`, `index`);
+- the routine contains assembler, whose operands cannot be told from registers, or an include directive, whose text the formatter cannot see;
+- the routine's conditional directives do not balance, its headers are alternatives in conditional branches, or a conditional or include directive sits inside a parameter list;
+- the name is used in a header other than as a parameter (a type of the same name), or in the routine's own declaration part other than as a field or an `absolute` target (an initializer label, for example);
+- a nested routine uses the name in its declarations other than as a binding or a field (an initializer such as a typed constant's `(count: 7)`, or an `absolute` target), or a nested routine has the name;
+- the parameter has its routine's name;
+- a `with` statement precedes a use of the name, since the name may then be a member of the `with` subject;
+- the new name is already used, unqualified, where the parameter would be visible;
+- an implementation omits the parameter list its declaration gives, or declarations and implementations of one name cannot be paired by signature;
+- another header spells the parameter with its prefix already (`aValue` against `AValue`).
+
+The rename is decided per file. A routine declared in one file and implemented in another (through an include file) is only kept in step when both files reach the same decision.
+
+Two known limits err on the side of leaving a parameter as it is:
+
+- The qualified name keeps only the last type: `TFirst.TInner.Show` and `TSecond.TInner.Show` group together, so a reason to skip one skips both.
+- A field of the new name in a record or class declared in the routine counts as a collision, although a field cannot be reached unqualified.
+
+Parameter renaming is heuristic and token-based; a move to syntax-tree-based renaming is tracked separately.
+
+**A uses clause that carries a compiler directive or a comment is left exactly as written.** Reordering across `{$IFDEF}` would change which units a build sees, and a comment inside a uses clause exists to pin a position — see the `cthreads, { must come first so TThread has a driver }` clauses in the test programs. The formatter therefore treats any clause containing `{$…}`, `//`, `{ … }`, or `(* … *)` as author-owned and emits it verbatim; grouping and alphabetisation are on you in those clauses. A clause that no semicolon closes before the next declaration or the end of the file, or that has more code after its semicolon on the same line, is also emitted as written, as is one whose unit entry spans lines. Entries are split at comma tokens, so a comma inside an `in 'path'` string stays in its entry. Sorting can change which unit a name resolves to when two units declare it; such a clause needs a comment to pin its order. Everything else the formatter does (trailing whitespace, line endings, identifier casing) still applies to the rest of the file.
 
 What the formatter does *not* do (today):
 
@@ -116,7 +143,7 @@ What the formatter does *not* do (today):
 
 ```sh
 ./build/lwpt format             # rewrite in place
-./build/lwpt format --check     # exit non-zero on any deviation; do not write
+./build/lwpt format --check     # exit non-zero on any deviation or unreadable file; do not write
 ```
 
 `--check` is the form CI uses; pre-commit runs the rewriting form and stages
@@ -184,7 +211,7 @@ When you add a new package under `packages/<name>/`, it's auto-discovered via `[
 
 ## Comments
 
-- Pascal block comments `{ ... }` do **not** nest by default in FPC mode `objfpc`. If a comment body contains literal `{` or `}` (e.g. quoting TOML or FPC include syntax), use `(* ... *)` for the outer.
+- Whether Pascal block comments nest depends on the mode. They nest in FPC's default `fpc` mode and in `objfpc`, and `{$modeswitch nestedcomments+}` turns nesting on elsewhere. They do not nest in the `delphi` mode that `Shared.inc` selects. If a comment body contains literal `{` or `}` (e.g. quoting TOML or FPC include syntax), use `(* ... *)` for the outer so the comment reads the same in every mode.
 - **No patch markers.** Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT-canonical code does not carry `{ [LWPT patch] }` / `{ [gpm patch] }` markers — git history is the canonical record of every change. Inline Pascal comments still document *why* non-obvious code looks the way it does (e.g. why HTTPClient uses a byte-safe `AppendRawBytes` instead of `Copy(PAnsiChar)`).
 - Documentation comments should explain non-obvious intent, trade-offs, or constraints. **Do not narrate what the code does.** Don't write `{ Increment the counter }`. Do write `{ Skip the trailing CRLF — see RFC 7230 §3.5 }`.
 

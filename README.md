@@ -17,7 +17,7 @@ lwpt format    format uses-clauses + identifiers   [--check]
 lwpt duplication report manifest-scoped Pascal token clones   [--json]
 lwpt test      discover, compile and run *.Test.pas files   [--jobs N] [--bail N]
 lwpt repair    reclaim install, build-session, and worker-lease residue
-lwpt registry  initialize or serve a self-hosted registry origin   <init|serve>
+lwpt registry  run a self-hosted registry origin or verified mirror   <init|sync|verify|rotate-key|serve>
 lwpt run       invoke a user-declared run task (or alias a subcommand)
 lwpt health    report Pascal complexity and optional Git hotspots   [--json] [--hotspots]
 lwpt agents    write/verify the agent-facing command reference in AGENTS.md   [--check]
@@ -136,7 +136,7 @@ units = ["src"]
 horse        = "HashLoad/horse@^4.0.0"                  # GitHub by default, SemVer range
 hello        = "octocat/Hello-World@1.0.0"              # exact SemVer (matches tag `1.0.0` or `v1.0.0`)
 ci-debug     = "gitlab:gitlab-examples/ci-debug-trace@dd648b2e48ce6518303b0bb580b2ee32fadaf045" # GitLab via prefix, commit SHA
-atlaskit     = "bitbucket:atlassian/atlaskit@d7ac1ac"   # Bitbucket via prefix, commit SHA
+atlaskit     = "bitbucket:atlassian/atlaskit@d7ac1acad54ed82e3fc244398cd29044f9bf1775" # Bitbucket via prefix, full commit SHA (must be on a branch or tag)
 custom       = "https://example.com/custom-1.0.0.tar.gz" # arbitrary HTTPS tarball
 leaf         = "../leaf"                                # local sibling path
 # Inline-table form for advanced options (include / exclude filters,
