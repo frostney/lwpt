@@ -179,6 +179,8 @@ begin
   Expect<Boolean>(Pos(FOrigin.Identity, Run.Stdout) > 0).ToBe(True);
   StopRegistryCLI(FMirrorServer);
   FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
+  { Restart may relocate the mirror to a new port. }
+  ArtifactURL := FMirrorURL + '/v1/objects/sha256/' + Copy(RegistryArtifactHash(Archive), 8, 64);
   Expect<string>(Text(RegistryHTTPBody(ArtifactURL))).ToBe(Text(Archive));
   Run := Sync;
   Expect<Integer>(Run.ExitCode).ToBe(1);
@@ -674,13 +676,21 @@ begin
   FOrigin.Publish('package', '1.0.0', BytesOf('archive'));
   { Another listener takes the origin's configured port before it starts. }
   BaseBefore := FOrigin.BaseURL;
-  Occupier := TRegistryTestServer.Create(nil, True, URLPort(BaseBefore));
+  { The port was chosen and released earlier, so another process may hold
+    it already. Either way it is occupied, which is the scenario under
+    test; the occupier's own request count is only checked when it bound. }
+  try
+    Occupier := TRegistryTestServer.Create(nil, True, URLPort(BaseBefore));
+  except
+    Occupier := nil;
+  end;
   try
     FOrigin.Start;
     Expect<Boolean>(FOrigin.BaseURL <> BaseBefore).ToBe(True);
     Expect<Boolean>(Pos('base_url = "' + FOrigin.BaseURL + '"', Text(RegistryHTTPBody(
       FOrigin.BaseURL + '/.well-known/' + RegistryProgramName + '-registry'))) > 0).ToBe(True);
-    Expect<Integer>(Occupier.RequestCount).ToBe(0);
+    if Assigned(Occupier) then
+      Expect<Integer>(Occupier.RequestCount).ToBe(0);
     { The identity pinned by mirrors is unchanged by relocation. }
     RequireSuccess('mirror init against the relocated origin',
       InitMirror(FOrigin.KeyID, FOrigin.PublicKey));
@@ -705,9 +715,16 @@ begin
   Routes[0] := RegistryRoute('/mirror/.well-known/' + RegistryProgramName + '-registry',
     'application/vnd.' + RegistryProgramName + '.registry-discovery+toml',
     BytesOf('base_url = "' + URLBefore + '"' + #10));
-  Impostor := TRegistryTestServer.Create(Routes, True, URLPort(URLBefore));
+  { As above: if another process already holds the released port, the
+    mirror still faces an occupied port and must relocate. }
   try
-    Impostor.Start;
+    Impostor := TRegistryTestServer.Create(Routes, True, URLPort(URLBefore));
+  except
+    Impostor := nil;
+  end;
+  try
+    if Assigned(Impostor) then
+      Impostor.Start;
     FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
     Expect<Boolean>(FMirrorURL <> URLBefore).ToBe(True);
     Expect<Boolean>(Pos('role = "mirror"', Text(RegistryHTTPBody(
