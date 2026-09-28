@@ -227,10 +227,11 @@ jobs:
   toolchain:
     uses: ./.github/workflows/toolchain.yml
 
-  # Windows compile signal, pre-merge. ci.yml's full cross-build
-  # matrix runs only on push to main, so without this job a
-  # Windows-only compile error inside {$IFDEF WINDOWS} blocks merges
-  # green and breaks main (see the header comment). One target is
+  # Windows compile signal on every push. ci.yml's full cross-build
+  # matrix runs automatically only on push to main, and manually once
+  # on the PR's final head, so this job reports a Windows-only compile
+  # error inside {$IFDEF WINDOWS} blocks on every push instead of only
+  # at that required manual run (see the header comment). One target is
   # enough: win32 and win64 share the same {$IFDEF WINDOWS} sources,
   # and the failure class is compile-time. The produced lwpt.exe is
   # uploaded for the windows-test job below, which runs the ordinary
