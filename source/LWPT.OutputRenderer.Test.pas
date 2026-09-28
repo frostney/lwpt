@@ -131,6 +131,7 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF UNIX}
 { Positive control above the historical 1024-descriptor scan bound, and
   above the reporter's direct-scan bound where the process limit allows it.
   A target the hard limit cannot reach is skipped. }
@@ -180,6 +181,7 @@ begin
     WriteLn('note: descriptor limits allow no high-descriptor control; '
       + 'skipped');
 end;
+{$ENDIF}
 
 procedure TLWPTEmergencyRingTests.SetupTests;
 begin
