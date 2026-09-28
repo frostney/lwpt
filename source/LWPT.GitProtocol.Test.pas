@@ -126,6 +126,9 @@ type
     procedure TestDateFetchInvalidPackFailsTheProof;
     procedure TestDateFetchRefusalIsTolerated;
     procedure TestAckForUnofferedObjectIsRefused;
+    procedure TestLsRefsAcceptanceHonoursTheDeadline;
+    procedure TestAcknowledgmentsAfterDoneAreRefused;
+    procedure TestProofTipCapHasAClearError;
     procedure TestCommitProvenFromNearestTag;
     procedure TestOldCommitProvenFromNearestTag;
     procedure TestLsRefsTipNeedsNoFetch;
@@ -159,6 +162,8 @@ type
     procedure TestLegacyListingRejectsMalformedFraming;
     procedure TestLegacyListingIndexesPeelsLinearly;
     procedure TestLegacyListingEnforcesLimits;
+    procedure TestLegacyListingRequiresItsTerminalFlush;
+    procedure TestCapabilitiesRequireTheirTerminalFlush;
   end;
 
   THTTPTransportTests = class(TTestSuite)
@@ -805,11 +810,90 @@ begin
   Transport := TwoTipHost(PktLine('acknowledgments')
     + PktLine('ACK ' + StringOfChar('9', 40)) + PktFlush);
   try
+    { Decline the date fetch so the probe is what answers. }
+    Transport.DatesResponse := Bytes(PktLine('ERR deepen unsupported'));
     Message := ProofError(Transport, Outcome);
   finally
     Transport.Free;
   end;
   Expect<Boolean>(Pos('not offered', Message) > 0).ToBe(True);
+end;
+
+procedure TReachabilityTests.TestLsRefsAcceptanceHonoursTheDeadline;
+var
+  Transport: TCannedTransport;
+  Listing: AnsiString;
+  Limits: TGitProofLimits;
+  Raised: Boolean;
+  i: Integer;
+begin
+  { The listing arrives at once, but checking 90,000 refs outlasts a 25 ms
+    budget; the pin (a listed tip) must not be accepted after the
+    deadline. }
+  Listing := '';
+  for i := 1 to 90000 do
+    Listing := Listing + PktLine(LowerCase(IntToHex(i mod 10000 + 1, 40))
+      + ' refs/tags/t' + IntToStr(i));
+  Transport := TCannedTransport.Create(
+    Bytes(PktLine('version 2') + PktLine('ls-refs')
+      + PktLine('fetch=shallow filter') + PktFlush),
+    Bytes(Listing + PktFlush), nil);
+  Limits := DefaultGitProofLimits;
+  Limits.TimeoutMilliseconds := 25;
+  Raised := False;
+  try
+    try
+      ProveCommitReachable(Transport, REPO_URL, LowerCase(IntToHex(1, 40)),
+        nil, Limits);
+    except
+      on E: EGitProofDeadlineExceeded do Raised := True;
+    end;
+  finally
+    Transport.Free;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TReachabilityTests.TestAcknowledgmentsAfterDoneAreRefused;
+var Transport: TCannedTransport; Outcome: TGitReachabilityResult;
+  Message: string;
+begin
+  { The date fetch sends `done`; git omits the acknowledgments section for
+    such a request, so an ACK there is malformed evidence. }
+  Transport := TwoTipHost(PktLine('acknowledgments') + PktLine('NAK')
+    + PktFlush);
+  try
+    Transport.DatesResponse := Bytes(PktLine('acknowledgments')
+      + PktLine('ACK ' + StringOfChar('9', 40)) + PktFlush);
+    Message := ProofError(Transport, Outcome);
+  finally
+    Transport.Free;
+  end;
+  Expect<Boolean>(Pos('acknowledg', Message) > 0).ToBe(True);
+end;
+
+procedure TReachabilityTests.TestProofTipCapHasAClearError;
+var
+  Transport: TCannedTransport;
+  Listing: AnsiString;
+  Outcome: TGitReachabilityResult;
+  Message: string;
+  i: Integer;
+begin
+  Listing := '';
+  for i := 1 to MAX_PROOF_TIPS + 1 do
+    Listing := Listing + PktLine(LowerCase(IntToHex(i, 40))
+      + ' refs/tags/t' + IntToStr(i));
+  Transport := TCannedTransport.Create(
+    Bytes(PktLine('version 2') + PktLine('ls-refs')
+      + PktLine('fetch=shallow filter') + PktFlush),
+    Bytes(Listing + PktFlush), nil);
+  try
+    Message := ProofError(Transport, Outcome);
+  finally
+    Transport.Free;
+  end;
+  Expect<Boolean>(Pos('pin a tag or branch', Message) > 0).ToBe(True);
 end;
 
 procedure TReachabilityTests.SetupTests;
@@ -834,6 +918,12 @@ begin
     TestDateFetchRefusalIsTolerated);
   Test('an ACK for an object that was not offered is refused',
     TestAckForUnofferedObjectIsRefused);
+  Test('an exact ls-refs tip is not accepted after the deadline',
+    TestLsRefsAcceptanceHonoursTheDeadline);
+  Test('acknowledgments in the answer to a done request are refused',
+    TestAcknowledgmentsAfterDoneAreRefused);
+  Test('a repository past the proof tip cap gets an actionable error',
+    TestProofTipCapHasAClearError);
   Test('a commit below a tag is proven from the nearest tag',
     TestCommitProvenFromNearestTag);
   Test('an old commit is proven from the first tag after it',
@@ -1111,7 +1201,7 @@ begin
   Expect<Boolean>(Rejected(RepeatedLsRefs(MAX_ADVERTISED_REFS + 1, False),
     'more than')).ToBe(True);
   Expect<Boolean>(Rejected(RepeatedLsRefs(MAX_PROOF_TIPS + 1, True),
-    'distinct tips')).ToBe(True);
+    'distinct branch and tag tips')).ToBe(True);
 end;
 
 procedure TProtocolMessageTests.TestRequestSizeIsCapped;
@@ -1260,15 +1350,51 @@ begin
 end;
 
 procedure TProtocolMessageTests.TestLegacyListingEnforcesLimits;
-var Message: string;
+var Message: string; Refs: TGitRefArray;
 begin
+  { The resolver's listing serves named requirements, so it is not bound
+    by the proof's distinct-tip cap: 20,001 distinct tags still list. }
+  Refs := ParseInfoRefs(LegacyTags(MAX_PROOF_TIPS + 1, False));
+  Expect<Integer>(Length(Refs)).ToBe(MAX_PROOF_TIPS + 1);
+  { Its own, larger branch-and-tag bound still holds. }
   Message := '';
   try
-    ParseInfoRefs(LegacyTags(MAX_PROOF_TIPS + 1, False));
+    ParseInfoRefs(LegacyTags(MAX_ADVERTISED_REFS + 1, False));
   except
     on E: EGitProtocolError do Message := E.Message;
   end;
-  Expect<Boolean>(Pos('distinct', Message) > 0).ToBe(True);
+  Expect<Boolean>(Pos('more than 100000 branches and tags', Message) > 0)
+    .ToBe(True);
+end;
+
+procedure TProtocolMessageTests.TestLegacyListingRequiresItsTerminalFlush;
+var Ref: AnsiString;
+begin
+  Ref := LegacyLine(StringOfChar('1', 40) + ' refs/tags/v1');
+  { Truncated at a packet boundary: the service preamble's flush is not
+    the advertisement's terminator. }
+  Expect<Boolean>(LegacyFails(LegacyLine('# service=git-upload-pack')
+    + '0000' + Ref)).ToBe(True);
+  Expect<Boolean>(LegacyFails(Ref)).ToBe(True);
+  Expect<Boolean>(LegacyFails(LegacyLine('# service=git-upload-pack')
+    + '0000')).ToBe(True);
+  { Complete forms. }
+  Expect<Boolean>(LegacyFails(LegacyLine('# service=git-upload-pack')
+    + '0000' + Ref + '0000')).ToBe(False);
+  Expect<Boolean>(LegacyFails(Ref + '0000')).ToBe(False);
+end;
+
+procedure TProtocolMessageTests.TestCapabilitiesRequireTheirTerminalFlush;
+var Raised: Boolean;
+begin
+  Raised := False;
+  try
+    ParseV2Capabilities(Bytes(Pkt('# service=git-upload-pack') + PktFlush
+      + Pkt('version 2') + Pkt('ls-refs') + Pkt('fetch=shallow filter')));
+  except
+    on E: EGitReachabilityError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
 end;
 
 procedure TProtocolMessageTests.SetupTests;
@@ -1309,8 +1435,12 @@ begin
     TestLegacyListingRejectsMalformedFraming);
   Test('the legacy listing indexes peel lines in linear time',
     TestLegacyListingIndexesPeelsLinearly);
-  Test('the legacy listing enforces the distinct-tip limit',
+  Test('the legacy listing lists past the proof cap within its own limit',
     TestLegacyListingEnforcesLimits);
+  Test('the legacy listing must end with its terminating flush',
+    TestLegacyListingRequiresItsTerminalFlush);
+  Test('a v2 capability advertisement must end with a flush',
+    TestCapabilitiesRequireTheirTerminalFlush);
 end;
 
 { THTTPTransportTests }

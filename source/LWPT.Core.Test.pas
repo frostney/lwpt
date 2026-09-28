@@ -2082,10 +2082,12 @@ procedure TGitProtocolParsing.TestServiceAnnounceIsSkipped;
 const
   PAYLOAD =
     '001e# service=git-upload-pack'#10 +
+    '0000' +
     '0000';
 begin
-  { Service-announce line + flush packet; no refs. Should yield
-    an empty array, not error out. }
+  { Service-announce line + its flush, then an advertisement with no refs
+    and its own terminating flush. Should yield an empty array, not error
+    out. (Without the second flush the advertisement is truncated.) }
   Expect<Integer>(Length(ParseInfoRefs(PAYLOAD))).ToBe(0);
 end;
 

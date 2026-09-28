@@ -185,6 +185,7 @@ type
   TGitTipArray = array of TGitTip;
 
   TGitFetchResponse = record
+    AcknowledgmentsSent: Boolean; { the section was present at all }
     Acknowledged: Boolean;  { an ACK line arrived }
     AckedIds: TStringArray; { the ids the ACK lines named }
     Nak: Boolean;           { an explicit NAK arrived }
@@ -467,14 +468,16 @@ var
   PktBody, FullName, PeeledName: string;
   Ref: TGitRef;
   TagIndex: TDictionary<string, Integer>;
-  Ids: TDictionary<string, Boolean>;
+  HasPreamble, PreambleClosed, Terminated: Boolean;
 begin
   SetLength(Result, 0);
   Offset := 1;
   N := 0;
   Lines := 0;
+  HasPreamble := False;
+  PreambleClosed := False;
+  Terminated := False;
   TagIndex := TDictionary<string, Integer>.Create;
-  Ids := TDictionary<string, Boolean>.Create;
   try
     while Offset <= Length(APayload) do
     begin
@@ -490,11 +493,16 @@ begin
           [MAX_LEGACY_ADVERTISEMENT_LINES]);
       if PktLen = 0 then
       begin
-        { flush packet — section boundary. Advance past it and keep
-          reading; there may be a second section. }
+        { flush packet. The one after a "# service=" preamble only closes
+          the preamble; the advertisement itself must end with its own. }
         Inc(Offset, PKT_PREFIX_LEN);
+        if HasPreamble and not PreambleClosed then
+          PreambleClosed := True
+        else
+          Terminated := True;
         Continue;
       end;
+      Terminated := False;
       if PktLen < PKT_PREFIX_LEN then
         raise EGitProtocolError.Create(
           'ref advertisement has an unexpected control pkt-line');
@@ -505,7 +513,12 @@ begin
       Inc(Offset, PktLen);
 
       { Skip the service-announce line and HEAD. }
-      if (Length(PktBody) >= 1) and (PktBody[1] = '#') then Continue;
+      if (Length(PktBody) >= 1) and (PktBody[1] = '#') then
+      begin
+        if (Lines = 1) and (Copy(PktBody, 1, 10) = '# service=') then
+          HasPreamble := True;
+        Continue;
+      end;
 
       if not ParseRefLine(PktBody, Ref) then Continue;
       if not IsFullGitObjectId(Ref.SHA) then
@@ -528,27 +541,26 @@ begin
       if not IsValidGitRefName(FullName) then
         raise EGitProtocolError.Create(
           'ref advertisement names an invalid branch or tag');
+      { No distinct-tip cap here: this listing serves named requirements,
+        and processing is linear. MAX_PROOF_TIPS bounds proof requests and
+        applies only to the proof's ls-refs listing. }
       if N >= MAX_ADVERTISED_REFS then
         raise EGitProtocolError.CreateFmt(
           'ref advertisement has more than %d branches and tags',
           [MAX_ADVERTISED_REFS]);
-      if not Ids.ContainsKey(LowerCase(Ref.SHA)) then
-      begin
-        if Ids.Count >= MAX_PROOF_TIPS then
-          raise EGitProtocolError.CreateFmt(
-            'ref advertisement has more than %d distinct branch and tag '
-            + 'tips', [MAX_PROOF_TIPS]);
-        Ids.Add(LowerCase(Ref.SHA), True);
-      end;
       if N >= Length(Result) then SetLength(Result, 2 * N + 16);
       Result[N] := Ref;
       if Ref.Kind = rkTag then TagIndex.AddOrSetValue(Ref.Name, N);
       Inc(N);
     end;
   finally
-    Ids.Free;
     TagIndex.Free;
   end;
+  { Git's grammar ends the advertisement with a flush; a body cut at a
+    packet boundary must not pass for a complete, shorter listing. }
+  if (Length(APayload) > 0) and not Terminated then
+    raise EGitProtocolError.Create(
+      'ref advertisement is truncated (no terminating flush)');
   SetLength(Result, N);
 end;
 
@@ -737,16 +749,22 @@ var
   SeenLine: Boolean;
   Features: TStringArray;
   Feature: string;
+  Terminated: Boolean;
 begin
   Result := Default(TGitV2Capabilities);
   Offset := 0;
   SeenLine := False;
+  Terminated := False;
   while NextPkt(ABody, Offset, Kind, Start, Len) do
   begin
     if Kind <> pkData then
     begin
       { The optional "# service=" preamble ends with its own flush. }
-      if SeenLine then Break;
+      if SeenLine then
+      begin
+        Terminated := Kind = pkFlush;
+        Break;
+      end;
       Continue;
     end;
     Line := PktText(ABody, Start, Len);
@@ -783,6 +801,10 @@ begin
         if Feature = 'filter' then Result.FetchFilter := True;
     end;
   end;
+  { A v2 advertisement ends with a flush; a truncated one is not trusted. }
+  if Result.Version2 and not Terminated then
+    raise EGitReachabilityError.Create(
+      'capability advertisement is truncated (no terminating flush)');
 end;
 
 function BuildV2CommandRequest(const ACapabilities: TGitV2Capabilities;
@@ -900,7 +922,9 @@ begin
       if Seen.ContainsKey(Id) then Continue;
       if Seen.Count >= MAX_PROOF_TIPS then
         raise EGitReachabilityError.CreateFmt(
-          'ls-refs advertised more than %d distinct tips', [MAX_PROOF_TIPS]);
+          'the repository advertises more than %d distinct branch and tag '
+          + 'tips, too many to prove a commit pin against; pin a tag or '
+          + 'branch instead', [MAX_PROOF_TIPS]);
       Seen.Add(Id, True);
       if n >= Length(Result) then SetLength(Result, 2 * n + 16);
       Result[n].Name := Name;
@@ -976,6 +1000,7 @@ begin
           'unexpected fetch response section "%s"', [Line]);
       Section := Line;
       if Section = 'packfile' then Result.HasPack := True;
+      if Section = 'acknowledgments' then Result.AcknowledgmentsSent := True;
     end
     else if Section = 'acknowledgments' then
     begin
@@ -1391,6 +1416,21 @@ begin
   SetLength(Arguments, n);
   Body := RunCommand(ARun, 'fetch', Arguments);
   Result := ParseFetchResponse(Body);
+  { Every answer is checked against its own request: git omits the
+    acknowledgments section after `done`, and otherwise may only ACK an
+    object the request offered as a have. }
+  if ADone and Result.AcknowledgmentsSent then
+    raise EGitReachabilityError.Create(
+      'upload-pack sent acknowledgments in answer to a done request');
+  for i := 0 to High(Result.AckedIds) do
+  begin
+    n := 0;
+    while (n <= High(AHaves)) and (AHaves[n] <> Result.AckedIds[i]) do
+      Inc(n);
+    if n > High(AHaves) then
+      raise EGitReachabilityError.Create(
+        'upload-pack acknowledged an object that was not offered');
+  end;
 end;
 
 function RefFullName(const ARef: TGitRef): string;
@@ -1569,6 +1609,7 @@ begin
       'ref-prefix refs/heads/', 'ref-prefix refs/tags/']);
     Tips := ParseLsRefsResponse(Body, HeadTarget);
     Body := nil;
+    CheckProofDeadline(Run);
     for i := 0 to High(Tips) do
       if Tips[i].Id = Target then
       begin
@@ -1602,13 +1643,10 @@ begin
         if not Response.Nak then
           raise EGitReachabilityError.Create(
             'upload-pack acknowledged neither ACK nor NAK');
+        CheckProofDeadline(Run);
         Result.Known := False;
         Exit;
       end;
-      for j := 0 to High(Response.AckedIds) do
-        if Response.AckedIds[j] <> Target then
-          raise EGitReachabilityError.Create(
-            'upload-pack acknowledged an object that was not offered');
       if not Response.Ready then Continue;
       if not Response.HasPack then
         raise EGitReachabilityError.Create(
@@ -1658,6 +1696,7 @@ begin
     Graph := ReadCommitPack(Response.Pack, ProofPackLimits(Run));
     try
       Found := Graph.FindReachingStart(Wants, Target, ProofDeadline(Run));
+      CheckProofDeadline(Run);
       if Found >= 0 then
       begin
         CheckProofDeadline(Run);

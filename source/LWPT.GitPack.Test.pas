@@ -44,6 +44,7 @@ type
     procedure TestWalkFollowsVerifiedTagObjects;
     procedure TestRejectsIncompleteTagHeaders;
     procedure TestParsingAndWalkingHonourTheDeadline;
+    procedure TestDeadlinePassingMidProcessingStopsIt;
   end;
 
 { Pack construction helpers. Entries are assembled by hand so each hostile
@@ -609,6 +610,56 @@ begin
   end;
 end;
 
+function ManyCommitsPack(ACount: Integer): TBytes;
+var
+  Body, Entry: AnsiString;
+  Used, i: Integer;
+  Digest: TSHA1Digest;
+begin
+  { One allocation: repeated concatenation would be quadratic. }
+  SetLength(Body, 12 + ACount * 256 + 20);
+  Body[1] := 'P'; Body[2] := 'A'; Body[3] := 'C'; Body[4] := 'K';
+  Body[5] := #0; Body[6] := #0; Body[7] := #0; Body[8] := #2;
+  Body[9] := AnsiChar((ACount shr 24) and $FF);
+  Body[10] := AnsiChar((ACount shr 16) and $FF);
+  Body[11] := AnsiChar((ACount shr 8) and $FF);
+  Body[12] := AnsiChar(ACount and $FF);
+  Used := 12;
+  for i := 1 to ACount do
+  begin
+    Entry := WholeEntry(1, CommitText([], i, 'commit ' + IntToStr(i)));
+    Move(Entry[1], Body[Used + 1], Length(Entry));
+    Inc(Used, Length(Entry));
+  end;
+  SetLength(Body, Used + 20);
+  Digest := SHA1Buffer(Body[1], Used);
+  Move(Digest[0], Body[Used + 1], 20);
+  Result := Bytes(Body);
+end;
+
+procedure TGitPackTests.TestDeadlinePassingMidProcessingStopsIt;
+var
+  Pack: TBytes;
+  Limits: TGitPackLimits;
+  Raised: Boolean;
+begin
+  { The deadline is still ahead when parsing starts and passes while the
+    reader works through 20,000 objects. }
+  Pack := ManyCommitsPack(20000);
+  Limits := DefaultGitPackLimits;
+  Limits.Deadline := GetTickCount64 + 10;
+  Raised := False;
+  try
+    ReadCommitPack(Pack, Limits).Free;
+  except
+    on E: EGitPackDeadlineExceeded do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  { With time to spare the same pack reads completely. }
+  Limits.Deadline := GetTickCount64 + 600000;
+  ReadCommitPack(Pack, Limits).Free;
+end;
+
 procedure TGitPackTests.SetupTests;
 begin
   Test('reads an OFS_DELTA commit pack written by git',
@@ -652,6 +703,8 @@ begin
     TestRejectsIncompleteTagHeaders);
   Test('parsing and walking stop at the deadline',
     TestParsingAndWalkingHonourTheDeadline);
+  Test('a deadline passing mid-processing stops the reader',
+    TestDeadlinePassingMidProcessingStopsIt);
   Test('walk never crosses commits missing from the pack',
     TestWalkStopsAtMissingCommits);
 end;

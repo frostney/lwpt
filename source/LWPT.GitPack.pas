@@ -745,7 +745,7 @@ end;
 procedure TPackReader.Resolve;
 var
   Queue: array of Integer;
-  Head, Tail, Index, Waiter, Next, i: Integer;
+  Head, Tail, Index, Waiter, Next, i, Work: Integer;
 
   procedure ApplyWaiters(AFirst, ABase: Integer);
   begin
@@ -755,6 +755,8 @@ var
       Next := FEntries[Waiter].NextWaiter;
       if FEntries[Waiter].Kind = 0 then
       begin
+        Inc(Work);
+        if (Work and $3F) = 0 then CheckDeadline(FLimits.Deadline);
         Complete(Waiter, FEntries[ABase].Kind,
           ApplyDelta(FEntries[ABase].Data, FEntries[Waiter].Data));
         Inc(FStatistics.DeltaCount);
@@ -769,9 +771,11 @@ begin
   SetLength(Queue, FEntryCount);
   Head := 0;
   Tail := 0;
+  Work := 0;
   for i := 0 to FEntryCount - 1 do
     if FEntries[i].Kind <> 0 then
     begin
+      if (i and $3F) = 0 then CheckDeadline(FLimits.Deadline);
       Complete(i, FEntries[i].Kind, FEntries[i].Data);
       Queue[Tail] := i;
       Inc(Tail);
