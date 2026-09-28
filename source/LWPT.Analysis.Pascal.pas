@@ -61,12 +61,23 @@ type
     Regions: TLWPTPascalRegionArray;
   end;
 
+{ AStrictStrings rejects a quoted string that reaches the end of its line,
+  as FPC does for code it compiles. The analyses keep the default: they
+  also read inactive conditional branches, where FPC tolerates such
+  text, so a string there runs on to its closing quote. A caller that
+  rewrites the source (the formatter) asks for the strict reading. }
 function TokenizePascal(const ASource: string;
-  const ASourceName: string = ''): TLWPTPascalTokenArray;
+  const ASourceName: string = '';
+  const AStrictStrings: Boolean = False): TLWPTPascalTokenArray;
 function AnalyzePascal(const ASource: string;
   const ASourceName: string = ''): TLWPTPascalDocument;
 function PascalRegionIsExecutable(const AKind: TLWPTPascalRegionKind):
   Boolean;
+{ +1 for a directive token that opens a conditional block ($IF, $IFDEF,
+  $IFNDEF, $IFOPT), -1 for one that closes it ($ENDIF, $IFEND), and 0 for
+  every other token. }
+function PascalConditionalDirectiveDelta(const AToken: TLWPTPascalToken):
+  Integer;
 
 implementation
 
@@ -120,6 +131,17 @@ begin
   Result := False;
 end;
 
+{ LowerCase always allocates; most tokens are already lower case. }
+function HasUpperCase(const AValue: string): Boolean;
+var
+  Position: Integer;
+begin
+  for Position := 1 to Length(AValue) do
+    if AValue[Position] in ['A'..'Z'] then
+      Exit(True);
+  Result := False;
+end;
+
 procedure RaiseLexicalError(const ASourceName, AMessage: string;
   const ALine, AColumn: Integer);
 var
@@ -131,8 +153,8 @@ begin
     [Prefix, ALine, AColumn, AMessage]);
 end;
 
-function TokenizePascal(const ASource, ASourceName: string):
-  TLWPTPascalTokenArray;
+function TokenizePascal(const ASource, ASourceName: string;
+  const AStrictStrings: Boolean): TLWPTPascalTokenArray;
 var
   Column, Index, Line, StartColumn, StartIndex, StartLine, TokenCapacity,
     TokenCount: Integer;
@@ -176,8 +198,8 @@ var
     if AStripEscape and (Result[TokenCount].Text <> '')
       and (Result[TokenCount].Text[1] = '&') then
       Delete(Result[TokenCount].Text, 1, 1);
-    if ANormalize then Result[TokenCount].Text :=
-      LowerCase(Result[TokenCount].Text);
+    if ANormalize and HasUpperCase(Result[TokenCount].Text) then
+      Result[TokenCount].Text := LowerCase(Result[TokenCount].Text);
     Result[TokenCount].Offset := StartIndex - 1;
     Result[TokenCount].Length := Index - StartIndex;
     Result[TokenCount].Line := StartLine;
@@ -289,6 +311,11 @@ var
     Advance;
     while Index <= Length(ASource) do
     begin
+      { FPC ends a quoted string at the end of its line ("String exceeds
+        line"); in strict mode, reading on would take code for string
+        text. }
+      if AStrictStrings and (ASource[Index] in [#10, #13]) then
+        Break;
       if ASource[Index] <> '''' then
       begin
         Advance;
@@ -352,16 +379,31 @@ var
     AddToken(ptNumber);
   end;
 
-  procedure ScanSymbol;
+  { The two-character symbols: `:=` `<=` `>=` `<>` `..` `**` `<<` `>>`
+    `><` `(.` `.)` `+=` `-=` `*=` `/=`. Compared character by character,
+    since this runs for every symbol in every file. }
+  function AtPairSymbol: Boolean;
   var
-    Pair: string;
+    First, Second: Char;
   begin
-    Pair := Copy(ASource, Index, 2);
-    if (Pair = ':=') or (Pair = '<=') or (Pair = '>=')
-      or (Pair = '<>') or (Pair = '..') or (Pair = '**')
-      or (Pair = '<<') or (Pair = '>>') or (Pair = '><')
-      or (Pair = '(.') or (Pair = '.)') or (Pair = '+=')
-      or (Pair = '-=') or (Pair = '*=') or (Pair = '/=') then
+    if Index >= Length(ASource) then Exit(False);
+    First := ASource[Index];
+    Second := ASource[Index + 1];
+    case First of
+      ':', '+', '-', '/': Result := Second = '=';
+      '<': Result := Second in ['=', '>', '<'];
+      '>': Result := Second in ['=', '>', '<'];
+      '.': Result := Second in ['.', ')'];
+      '*': Result := Second in ['*', '='];
+      '(': Result := Second = '.';
+    else
+      Result := False;
+    end;
+  end;
+
+  procedure ScanSymbol;
+  begin
+    if AtPairSymbol then
     begin
       Advance;
       Advance;
@@ -617,14 +659,21 @@ end;
 
 function TLWPTPascalStructureParser.ConditionalDirectiveDelta(
   const AIndex: Integer): Integer;
+begin
+  Result := 0;
+  if (AIndex >= 0) and (AIndex < Length(FDocument.Tokens)) then
+    Result := PascalConditionalDirectiveDelta(FDocument.Tokens[AIndex]);
+end;
+
+function PascalConditionalDirectiveDelta(const AToken: TLWPTPascalToken):
+  Integer;
 var
   DirectiveText, DirectiveWord: string;
   WordEnd: Integer;
 begin
   Result := 0;
-  if (AIndex < 0) or (AIndex >= Length(FDocument.Tokens))
-    or (FDocument.Tokens[AIndex].Kind <> ptDirective) then Exit;
-  DirectiveText := LowerCase(Trim(FDocument.Tokens[AIndex].Text));
+  if AToken.Kind <> ptDirective then Exit;
+  DirectiveText := LowerCase(Trim(AToken.Text));
   if Copy(DirectiveText, 1, 2) = '{$' then
     DirectiveText := Copy(DirectiveText, 3, Length(DirectiveText) - 3)
   else if Copy(DirectiveText, 1, 3) = '(*$' then
