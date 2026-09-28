@@ -168,27 +168,39 @@ end;
 function HandleInstall(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 var
-  Frozen, Offline : Boolean;
+  Frozen, Offline, AcceptMovedTags : Boolean;
   i : Integer;
 begin
   if RejectUnexpectedPositionals('install', APositionals) then Exit(1);
   Frozen := False;
   Offline := False;
+  AcceptMovedTags := False;
   for i := 0 to High(AOptions) do
     if SameText(AOptions[i].LongName, 'frozen')
        and AOptions[i].Present then
       Frozen := True
     else if SameText(AOptions[i].LongName, 'offline')
        and AOptions[i].Present then
-      Offline := True;
+      Offline := True
+    else if SameText(AOptions[i].LongName, 'accept-moved-tags')
+       and AOptions[i].Present then
+      AcceptMovedTags := True;
   if Frozen and Offline then
   begin
     WriteLn(ErrOutput, ErrPrefix('install'),
       '--offline cannot be combined with --frozen');
     Exit(1);
   end;
+  { Frozen and offline never list refs, so there is no moved tag to accept;
+    refusing the combination keeps the acceptance an explicit online act. }
+  if AcceptMovedTags and (Frozen or Offline) then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('install'),
+      '--accept-moved-tags cannot be combined with --frozen or --offline');
+    Exit(1);
+  end;
   try
-    CmdInstall(MANIFEST_FILE, Frozen, Offline);
+    CmdInstall(MANIFEST_FILE, Frozen, Offline, AcceptMovedTags);
     Result := 0;
   except
     on E: Exception do
@@ -757,13 +769,16 @@ begin
     Registry.OnCommandPrepared := @PrepareCommandOutput;
     Registry.OnCommandCompleted := @ReportCommandCompletion;
 
-    SetLength(InstallOpts, 2);
+    SetLength(InstallOpts, 3);
     InstallOpts[0] := TFlagOption.Create('frozen',
       'CI mode: refuse to update the lockfile, refuse network, verify hashes');
     InstallOpts[1] := TFlagOption.Create('offline',
       'Restore locked dependency state without network access');
+    InstallOpts[2] := TFlagOption.Create('accept-moved-tags',
+      'Re-pin locked tags that now point at a different commit (after review)');
     Registry.Add(TSubcommand.Create('install',
-      'Resolve and fetch dependencies', '[--frozen] [--offline]',
+      'Resolve and fetch dependencies',
+      '[--frozen] [--offline] [--accept-moved-tags]',
       @HandleInstall, InstallOpts));
 
     SetLength(AddOpts, 1);

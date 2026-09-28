@@ -259,7 +259,8 @@ begin
   LockBefore := ReadFileText(FScratch + '/lwpt.lock');
   CfgBefore := ReadFileText(FScratch + '/lwpt.cfg');
 
-  R := RunLwpt(['remove', 'leaf'], FScratch,
+  { The fault-injection seam exists only in the test-flavoured binary. }
+  R := RunLwptTesting(['remove', 'leaf'], FScratch,
     [PROJECT_NAME + '_TEST_FAIL_AFTER_ORPHAN_RETAIN=1']);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
   Expect<string>(ReadFileText(FScratch + '/lwpt.toml'))

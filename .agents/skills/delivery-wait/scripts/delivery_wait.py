@@ -52,6 +52,18 @@ query($owner:String!,$name:String!,$qualified:String!,$tag:String!){
 """
 
 
+TERMINAL_CHECK_CONCLUSIONS = {
+    "SUCCESS",
+    "FAILURE",
+    "ERROR",
+    "CANCELLED",
+    "SKIPPED",
+    "NEUTRAL",
+    "TIMED_OUT",
+    "ACTION_REQUIRED",
+}
+
+
 def repo_parts(repo: str) -> tuple[str, str]:
     pieces = repo.split("/", 1)
     if len(pieces) != 2 or not all(pieces):
@@ -77,7 +89,7 @@ def pr_snapshot(gh: Gh, repo: str, number: int) -> dict[str, Any]:
         checks = []
         for node in nodes or []:
             if node.get("__typename") == "CheckRun":
-                checks.append({"name": node.get("name"), "status": node.get("status"), "conclusion": node.get("conclusion"), "observedAt": node.get("startedAt") or node.get("completedAt")})
+                checks.append({"name": node.get("name"), "status": node.get("status"), "conclusion": node.get("conclusion"), "completedAt": node.get("completedAt"), "observedAt": node.get("startedAt") or node.get("completedAt")})
             else:
                 checks.append({"name": node.get("context"), "status": "COMPLETED", "conclusion": node.get("state"), "observedAt": node.get("createdAt")})
         return {"head": pull.get("headRefOid"), "merged": bool(pull.get("merged")), "mergedAt": pull.get("mergedAt"), "mergeCommit": (pull.get("mergeCommit") or {}).get("oid"), "checks": sorted(checks, key=lambda item: str(item["name"]))}
@@ -93,13 +105,23 @@ def pr_snapshot(gh: Gh, repo: str, number: int) -> dict[str, Any]:
         runs = [run for page in run_pages for run in page.get("check_runs", [])]
         statuses = [status for page in status_pages for status in page]
         checks = [
-            {"name": run.get("name"), "status": str(run.get("status", "")).upper(), "conclusion": str(run.get("conclusion") or "").upper(), "observedAt": run.get("started_at") or run.get("completed_at")}
+            {"name": run.get("name"), "status": str(run.get("status", "")).upper(), "conclusion": str(run.get("conclusion") or "").upper(), "completedAt": run.get("completed_at"), "observedAt": run.get("started_at") or run.get("completed_at")}
             for run in runs
         ] + [
             {"name": item.get("context"), "status": "COMPLETED", "conclusion": str(item.get("state", "")).upper(), "observedAt": item.get("created_at")}
             for item in statuses
         ]
         return {"head": pull["head"]["sha"], "merged": bool(pull.get("merged")), "mergedAt": pull.get("merged_at"), "mergeCommit": pull.get("merge_commit_sha"), "checks": sorted(checks, key=lambda item: str(item["name"]))}
+
+
+def check_is_terminal(check: dict[str, Any]) -> bool:
+    return (
+        str(check.get("conclusion", "")).upper() in TERMINAL_CHECK_CONCLUSIONS
+        and (
+            str(check.get("status", "")).upper() == "COMPLETED"
+            or check.get("completedAt") is not None
+        )
+    )
 
 
 def classify_pr(
@@ -124,12 +146,7 @@ def classify_pr(
     if missing:
         return "waiting", f"expected checks have not appeared: {', '.join(sorted(missing))}"
     checks = [observed[name] for name in sorted(expected_checks)]
-    terminal_conclusions = {"SUCCESS", "FAILURE", "ERROR", "CANCELLED", "SKIPPED", "NEUTRAL", "TIMED_OUT", "ACTION_REQUIRED"}
-    if not checks or any(
-        str(check.get("status", "")).upper() != "COMPLETED"
-        or str(check.get("conclusion", "")).upper() not in terminal_conclusions
-        for check in checks
-    ):
+    if not checks or any(not check_is_terminal(check) for check in checks):
         return "waiting", "checks are not terminal"
     successful = {"SUCCESS", "NEUTRAL", "SKIPPED"}
     if any(str(check.get("conclusion", "")).upper() not in successful for check in checks):
@@ -215,12 +232,11 @@ def main() -> int:
         "assets": sorted(args.asset),
     }
     try:
+        # wake-at observes nothing external, so it keeps no checkpoint.
         state_path = (
-            args.state
-            if args.command == "wait" and args.state is not None
-            else default_state_path(args.kind, identity)
-            if args.command == "wait"
-            else None
+            None
+            if args.command != "wait" or args.kind == "wake-at"
+            else args.state or default_state_path(args.kind, identity)
         )
         if args.kind == "wake-at":
             args.interval = positive_interval(args.interval)
@@ -297,7 +313,7 @@ def main() -> int:
                             "nonSuccess": sorted(
                                 check.get("name")
                                 for check in value.get("checks", [])
-                                if str(check.get("status", "")).upper() == "COMPLETED"
+                                if check_is_terminal(check)
                                 and str(check.get("conclusion", "")).upper() != "SUCCESS"
                             ),
                             "terminal": terminal == "satisfied",

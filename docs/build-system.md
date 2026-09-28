@@ -510,7 +510,7 @@ hook is not part of that invocation. With no selector every discovered program
 runs; with selectors every match runs, without path-derived groups or skips. See
 [ADR-0034](./adr/0034-freeze-test-selection-before-pretest.md).
 
-LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) removed that embedded-blob hook. The current root manifest instead declares the `[prebuild]` `stamp-version` hook, which derives `source/Version.inc` from `lwpt.toml`.
+LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) removed that embedded-blob hook. The current root manifest instead declares the `[prebuild]` `stamp-version` hook, which derives `source/Version.inc` from `lwpt.toml`, and a `[pretest]` `lwpt-testing` hook that runs `./build/lwpt build lwpt-testing` so the test-flavoured binary is current before any test program spawns it ([ADR-0044](./adr/0044-test-seams-only-in-test-builds.md)).
 
 ## Pre-commit hook (Lefthook)
 

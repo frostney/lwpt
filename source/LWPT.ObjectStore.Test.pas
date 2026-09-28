@@ -514,7 +514,7 @@ begin
   ObjectStoreBeforeMaterializeCopyTestHook := nil;
   ObjectStoreAfterMaterializeCopyTestHook := nil;
   ObjectStoreAfterMaterializeCopyStreamTestHook := nil;
-  ObjectStoreBeforeStreamProtectionTestHook := nil;
+  ProtectedOpenBeforeProtectionTestHook := nil;
   {$IFDEF UNIX}
   ProcessTreeBeforeUnmanagedSpawnLockTestHook := nil;
   ProtectedStageSpawnAttemptPath := '';
@@ -543,7 +543,7 @@ begin
     FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
   try
     Store.Admit(FSource, FDigest);
-    ObjectStoreBeforeStreamProtectionTestHook :=
+    ProtectedOpenBeforeProtectionTestHook :=
       AttemptSpawnBeforeStreamProtection;
     Destination := FScratch + '/project/materialized';
     Expect<Boolean>(Store.Materialize(FDigest, Destination,
@@ -562,7 +562,7 @@ begin
     end;
     Expect<Integer>(ErrorCode).ToBe(0);
   finally
-    ObjectStoreBeforeStreamProtectionTestHook := nil;
+    ProtectedOpenBeforeProtectionTestHook := nil;
     ProcessTreeBeforeUnmanagedSpawnLockTestHook := nil;
     if Assigned(ProtectedStageSpawner) then
     begin

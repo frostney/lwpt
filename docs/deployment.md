@@ -62,6 +62,54 @@ typical general-purpose HTTP response. Header limits retain the package
 default. HTTP-layer failures are wrapped as `EFetchError` with the requested
 URL, preserving install transaction cleanup and diagnostics.
 
+`THTTPRequestOptions.Destination` adds a per-request destination policy. It
+applies to the initial request and to every redirect hop, in this order:
+
+1. With `RequireHTTPS`, any hop whose scheme is not `https` is refused, so a
+   redirect cannot downgrade to plaintext.
+2. `AllowedHosts` is a case-insensitive exact host allowlist. It is checked
+   before any name resolution, so a refused host causes no DNS lookup and no
+   connection.
+3. `PrivateAddressPolicy` selects `papAllow` (the default) or `papDeny`. With
+   `papDeny`, every hop must resolve to a globally reachable address.
+
+The address check parses the host as an address literal, or resolves it once,
+into binary form. It rewrites IPv4-mapped, IPv4-compatible, and NAT64
+well-known-prefix IPv6 spellings to their IPv4 address. It then classifies
+the bytes against named blocks from the IANA IPv4 and IPv6 Special-Purpose
+Address Registries, plus multicast and reserved space. The client dials
+exactly the classified address, and TLS still verifies the certificate
+against the host name. Under an address policy the client dials IPv4 only
+and refuses a genuine IPv6 destination. [ADR-0048](./adr/0048-git-host-fetch-trust.md)
+lists the blocks and the globally reachable exceptions.
+
+LWPT derives each dependency's policy in `LWPT.FetchPolicy` and applies it to
+ref listing (install, `outdated`, `update`) and archive download. Every
+dependency request requires HTTPS, and every hop must resolve to a globally
+reachable address:
+
+| Source | Allowed hosts |
+| --- | --- |
+| `owner/repo`, `github:` | `github.com`, `codeload.github.com` |
+| `gitlab:` | `gitlab.com` |
+| `bitbucket:` | `bitbucket.org` |
+| `[sources.<name>]` custom host | The hosts named by its `archive` and `git` templates |
+| Direct `https://` archive URL | Any host |
+
+The address rule has no exception. Private, loopback, link-local, and other
+non-globally-reachable destinations are refused for every dependency fetch,
+whether the root manifest or a fetched dependency's manifest declares the
+source, on the initial request and on every redirect. Self-hosted forges and
+archive hosts on private networks are therefore currently unsupported; an
+opt-in through user-level configuration is tracked in
+[#313](https://github.com/frostney/lwpt/issues/313). A Git-host fetch never leaves its forge's hosts, and a custom-source template
+may not use `{ref}` in its host. A refused hop fails the command with one of
+these errors:
+
+- `fetch scheme not allowed: <scheme>://<host> (https is required)`
+- `fetch host not allowed: <host>`
+- `fetch destination not allowed: <host> resolves to <block> address <address>`
+
 ### Windows: SChannel clients and SChannel servers
 
 Outbound HTTPS calls into Windows' Security Service Provider Interface (SSPI) directly via the `Windows` unit and the SChannel constants in `TransportSecurity.pas`. Running LWPT as a client therefore has no third-party DLL prerequisite. The Windows release archive contains exactly:
