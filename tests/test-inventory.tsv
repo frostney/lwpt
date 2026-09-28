@@ -53,6 +53,8 @@ program	*	source/LWPT.Registry.Mirror.Test.pas	1	30
 program	*	source/LWPT.Registry.Store.Test.pas	1	44
 program	*	source/LWPT.Registry.Verification.Test.pas	1	50
 program	*	source/LWPT.OutputRenderer.Test.pas	1	1
+program	*	source/LWPT.ProcessTree.Test.pas	0	0
+program	unix/*	source/LWPT.ProcessTree.Test.pas	1	14
 program	*	source/LWPT.ProducerLease.Test.pas	1	6
 program	unix/*	source/LWPT.ProducerLease.Test.pas	1	7
 program	*	source/LWPT.Resolver.Test.pas	1	7
