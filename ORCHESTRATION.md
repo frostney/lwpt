@@ -170,6 +170,12 @@ inferences in the lane; before ten exist, use all completed inferences.
   decision before inference 26.
 - A monitor may perform at most three model inferences without external state
   change. Before a fourth, move polling to a non-LLM watcher.
+- A lane never waits more than five minutes inside its own context. Before a
+  longer wait (CI, a queued build or test run, a release workflow, or a
+  usage-limit reset), the lane checkpoints durable state, hands the wait to
+  the coordinator or a non-LLM watcher, and ends its turn. It resumes when
+  the result arrives. Hosts may expire a lane's context cache within
+  minutes; the next turn after an expiry rewrites the whole context.
 
 An intervention never silently downgrades capability, silently stops required
 work, or ignores the threshold. The first lean Milestone Rush records totals
