@@ -1,0 +1,11 @@
+0012command=fetch
+000fagent=lwpt
+0017object-format=sha1
+00010010no-progress
+000eofs-delta
+0012filter tree:0
+0032want 75d4b5bb458411a2b7a54b64090c17a30e264839
+0032want d539338ba8c63edfae7d0688f6142e0cbe159fa4
+0032have e5ee94c29c4d6ea41841f0913af182ba68e8e4d0
+0009done
+0000

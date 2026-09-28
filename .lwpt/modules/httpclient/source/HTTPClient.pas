@@ -69,6 +69,10 @@ type
   end;
 
   EHTTPError = class(Exception);
+  { The response body is larger than MaxResponseBodyBytes. Raised as soon as
+    the limit is known to be exceeded (a declared Content-Length, a chunk
+    size, or the received bytes), before the excess is read. }
+  EHTTPResponseTooLarge = class(EHTTPError);
 
   {$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
   { Test-only select seam. Production code must leave this nil. The hook can
@@ -848,7 +852,7 @@ begin
     Exit;
   PreviousLength := Length(ABody);
   if (Int64(PreviousLength) > AMaxBodyBytes - ALength) then
-    raise EHTTPError.CreateFmt(
+    raise EHTTPResponseTooLarge.CreateFmt(
       'HTTP response body exceeds configured limit of %d bytes',
       [AMaxBodyBytes]);
   SetLength(ABody, PreviousLength + ALength);
@@ -928,7 +932,7 @@ begin
     end;
 
   if AHasContentLength and (AContentLength > AMaxBodyBytes) then
-    raise EHTTPError.CreateFmt(
+    raise EHTTPResponseTooLarge.CreateFmt(
       'HTTP response body exceeds configured limit of %d bytes',
       [AMaxBodyBytes]);
 end;
@@ -1111,7 +1115,7 @@ begin
         raise EHTTPError.CreateFmt('Invalid HTTP chunk size: %s', [Line]);
       if ChunkSizeValue > AOptions.MaxResponseBodyBytes -
          Length(Result.Body) then
-        raise EHTTPError.CreateFmt(
+        raise EHTTPResponseTooLarge.CreateFmt(
           'HTTP response body exceeds configured limit of %d bytes',
           [AOptions.MaxResponseBodyBytes]);
       { ChunkBuf must hold both the payload and its trailing CRLF. Reject a
