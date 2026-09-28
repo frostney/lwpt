@@ -1,14 +1,16 @@
 # Milestone Rush event ledger
 
 The bundled one-shot command owns normalized event ingestion, validation, and
-aggregation. It never polls, runs as a daemon, or wakes a model:
+aggregation. It never polls, runs as a daemon, or wakes a model. Run it from
+the project root, which holds the ledger; `SKILL_DIR` is this skill's
+directory, such as `.agents/skills/milestone-rush` in a project install:
 
 ```bash
-python3 milestone-rush/scripts/event_ledger.py ingest \
+python3 "$SKILL_DIR/scripts/event_ledger.py" ingest \
   --ledger .agent/milestone-rush-events.jsonl --input normalized-events.jsonl
-python3 milestone-rush/scripts/event_ledger.py validate \
+python3 "$SKILL_DIR/scripts/event_ledger.py" validate \
   --ledger .agent/milestone-rush-events.jsonl --run-id "$RUN_ID" --json
-python3 milestone-rush/scripts/event_ledger.py summarize \
+python3 "$SKILL_DIR/scripts/event_ledger.py" summarize \
   --ledger .agent/milestone-rush-events.jsonl --run-id "$RUN_ID" --json
 ```
 
@@ -103,7 +105,8 @@ Every null usage or resource value must appear in its adjacent
 `unavailableFields`; zero is a measured value. `session_started`,
 `manual_resume`, `model_sample`, and `tool_sample` make session boundaries,
 manual continuation, model usage, and tool usage explicit. Their matching
-identity fields are required.
+identity fields are required. Each identity value is a non-empty string or
+null; `issue` and `pullRequest` may also be positive integers.
 
 ## Counter semantics
 
@@ -119,13 +122,15 @@ baseline:
   stream instead;
 - missing baselines, sequence gaps, mixed modes, and changed baselines are
   invalid; and
-- `effectiveWorkers` is a gauge summarized as minimum, maximum, and latest. It
-  is never added to counters.
+- `effectiveWorkers` is a gauge summarized as minimum, maximum, and latest by
+  event timestamp across all streams, with ties broken by `eventId`. It is
+  never added to counters.
 
 The summary reports session and segment identities, manual resumes, usage and
 resource counters, gauges, per-model usage, per-tool and per-wait totals,
 unavailable fields, non-aggregatable evidence, and source/stream provenance.
-Schema-v1 lifecycle events remain readable. Their numeric values are listed as
+Schema-v1 lifecycle events remain readable; of their identity values, only
+`sessionId` and `segmentId` must be non-empty strings or null. Their numeric values are listed as
 non-aggregatable because v1 did not identify delta versus snapshot semantics or
 the baseline; they never enter totals.
 

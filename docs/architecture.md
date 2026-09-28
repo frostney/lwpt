@@ -332,7 +332,7 @@ adds one module-specific subclass:
 | Class | Raised for |
 | --- | --- |
 | `EFetchError` | Network failures, HTTP non-2xx, local source dir missing |
-| `EVerifyError` | `--frozen` or `--offline` identity, archive-hash, or tree-hash mismatch against the lockfile |
+| `EVerifyError` | `--frozen` or `--offline` identity, archive-hash, or tree-hash mismatch against the lockfile; a locked tag that moved or became a branch, or a locked commit whose downloaded archive no longer matches, during an online install (unless `--accept-moved-tags`) |
 | `EExtractError` | Archive parse failures, tar corruption, missing archive, atomic-move failure |
 | `ELockfileError` | Corrupt TOML in `lwpt.lock`, schema version mismatch, or missing lockfile when `--frozen` or `--offline` |
 | `EManifestError` | TOML errors, missing required keys, unsatisfiable constraints, unknown source kinds |
@@ -352,6 +352,7 @@ Each error class carries an `Operation` and a `Recovery` field. The subcommand w
 | `source` | string | The verbatim source string from the manifest (e.g. `"HashLoad/horse"`, `"gitlab:org/repo"`, `"../path"`). Host + kind are inferable by re-running `ParseDependencySource` on this value. |
 | `resolvedRef` | string | The concrete tag name or commit SHA the resolver picked. Empty for `skLocal` + `skURL`. |
 | `resolvedCommit` | string | The authoritative advertised commit fetched for a Git ref. Newly generated v3 entries record it; compatible early v3 entries remain frozen-verifiable when their existing fields prove an unambiguous identity. |
+| `resolvedRefKind` | string | `tag` or `branch` for a dependency selected from a named Git ref; omitted for SHA pins and non-Git sources. Additive v3 evidence ([ADR-0048](./adr/0048-git-host-fetch-trust.md)): a locked tag is immutable, a locked branch may move. |
 | `sourceIdentity` | string | Canonical source plus normalized include/exclude extraction policy. |
 | `constraintFingerprint` | string | Digest of every accumulated requirement and requirer used to select this package. Requirement lines are sorted by ordinal byte value and each — including the last — is terminated with a pinned LF (never the platform line ending, and never a between-lines join), so the digest is byte-identical on every platform and a lockfile written on one verifies on another. Missing additive evidence in an early v3 entry is accepted only when the remaining identity is unambiguous; mixed named-ref/SHA identity without an authoritative commit requires regeneration. |
 | `resolvedURL` | string | The actual archive URL fetched. Empty for `skLocal`. Self-documents the host: a `gitlab:` dep shows up as `https://gitlab.com/...`. |
@@ -362,7 +363,7 @@ Older lockfile schemas (v1 or v2) fail to load with a clear migration hint: dele
 
 ## Self-host
 
-LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/{item.name}.pas"` and `output = "build/{item.name}"` (placeholder interpolation per [ADR-0012](./adr/0012-manifest-placeholder-interpolation.md)). The pre-commit hook runs `./build/lwpt format` and `./build/lwpt agents`; `./build/lwpt build` recompiles LWPT against itself when needed. The bootstrap (`scripts/bootstrap.pas` + `bootstrap.sh` / `bootstrap.bat`) is the once-per-fresh-clone seed that produces the first `build/lwpt`. See [`build-system.md`](./build-system.md) and [ADR-0005](./adr/0005-self-host-build.md).
+LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/{item.name}.pas"` and `output = "build/{item.name}"` (placeholder interpolation per [ADR-0012](./adr/0012-manifest-placeholder-interpolation.md)). A second entry, `lwpt-testing`, compiles the same program with `-dINSTALL_TESTING` into `build/lwpt-testing`, the only binary that honours the `LWPT_TEST_*` seams; a `[pretest]` hook rebuilds it before every `lwpt test` ([ADR-0044](./adr/0044-test-seams-only-in-test-builds.md)). The pre-commit hook runs `./build/lwpt format` and `./build/lwpt agents`; `./build/lwpt build` recompiles LWPT against itself when needed. The bootstrap (`scripts/bootstrap.pas` + `bootstrap.sh` / `bootstrap.bat`) is the once-per-fresh-clone seed that produces the first `build/lwpt`. See [`build-system.md`](./build-system.md) and [ADR-0005](./adr/0005-self-host-build.md).
 
 ## Source layout and package code
 
@@ -373,7 +374,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.Delphi.pas`,
 `LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
-`LWPT.GitProtocol.pas`, and the `LWPT.Registry.*` origin storage, signing,
+`LWPT.GitProtocol.pas`, `LWPT.FetchPolicy.pas` (built-in forge origins and per-dependency fetch
+destination policy), and the `LWPT.Registry.*` origin storage, signing,
 shared proof verification, mirror synchronization, HTTP routing, and native
 macOS listener units) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five

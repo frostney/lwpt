@@ -247,6 +247,47 @@ class EventLedgerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("non-negative number", output["reason"])
 
+    def test_identity_values_must_be_strings_or_issue_numbers(self) -> None:
+        for field, value in (
+            ("sessionId", ["session-1"]),
+            ("sessionId", 7),
+            ("branch", ""),
+            ("issue", True),
+            ("pullRequest", 0),
+        ):
+            with self.subTest(field=field, value=value):
+                result, output = self.ingest(
+                    event("event-1", usage={"inferences": 1}, identity={field: value})
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(output["state"], "invalid")
+                self.assertIn(f"identity.{field}", output["reason"])
+
+        for identity in (
+            {"issue": 48, "pullRequest": 52},
+            {"issue": "48", "pullRequest": "52"},
+            {field: None for field in ("laneId", "issue", "branch", "sessionId", "model")},
+        ):
+            with self.subTest(identity=identity):
+                self.ledger.unlink(missing_ok=True)
+                result, _ = self.ingest(
+                    event(
+                        "event-1", event_type="lane_sample",
+                        usage={"inferences": 1}, identity=identity,
+                    )
+                )
+                self.assertEqual(result.returncode, 0)
+
+    def test_summarize_reports_a_stored_invalid_identity_as_invalid(self) -> None:
+        stored = event(
+            "event-1", usage={"inferences": 1}, identity={"sessionId": ["session-1"]}
+        )
+        self.ledger.write_text(json.dumps(stored) + "\n")
+        result, output = self.summarize()
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(output["state"], "invalid")
+        self.assertIn("identity.sessionId", output["reason"])
+
     def test_spans_require_one_matching_start_and_finish(self) -> None:
         start = event(
             "event-1", event_type="span_started", sequence=None,
@@ -297,6 +338,16 @@ class EventLedgerTest(unittest.TestCase):
         self.assertEqual(first["segments"], ["segment-a", "segment-b"])
         self.assertEqual(first["manualResumes"], 1)
 
+    def test_schema_v1_identity_types_stay_readable(self) -> None:
+        legacy = event(
+            "event-1", schema_version=1, sequence=None,
+            identity={"issue": 0, "pullRequest": [52]},
+        )
+        self.ledger.write_text(json.dumps(legacy) + "\n")
+        result, output = self.summarize()
+        self.assertEqual(result.returncode, 0, output)
+        self.assertEqual(output["legacyEventCount"], 1)
+
     def test_schema_v1_lifecycle_is_readable_but_counters_are_not_aggregated(self) -> None:
         legacy = event(
             "event-1", schema_version=1, sequence=None,
@@ -336,6 +387,37 @@ class EventLedgerTest(unittest.TestCase):
             {"latest": 4, "max": 4, "min": 2},
         )
         self.assertEqual(output["provenance"][0]["source"], "claude-hooks")
+
+    def test_gauge_latest_follows_time_across_streams(self) -> None:
+        self.ingest(
+            event("event-5", stream_id="a", resources={"effectiveWorkers": 8}),
+            event("event-1", stream_id="b", resources={"effectiveWorkers": 2}),
+        )
+        _, output = self.summarize()
+        self.assertEqual(
+            output["gauges"]["resources.effectiveWorkers"],
+            {"latest": 8, "max": 8, "min": 2},
+        )
+
+    def test_gauge_latest_breaks_timestamp_ties_by_event_id(self) -> None:
+        for later_stream, earlier_stream in (("a", "b"), ("b", "a")):
+            with self.subTest(later_stream=later_stream):
+                self.ledger.unlink(missing_ok=True)
+                self.ingest(
+                    event("event-65", stream_id=later_stream, resources={"effectiveWorkers": 8}),
+                    event("event-5", stream_id=earlier_stream, resources={"effectiveWorkers": 2}),
+                )
+                _, output = self.summarize()
+                self.assertEqual(output["gauges"]["resources.effectiveWorkers"]["latest"], 8)
+
+    def test_gauge_latest_compares_timestamps_across_offsets(self) -> None:
+        later = event("event-1", stream_id="a", resources={"effectiveWorkers": 8})
+        later["timestamp"] = "2026-08-21T09:00:05-05:00"
+        earlier = event("event-2", stream_id="b", resources={"effectiveWorkers": 2})
+        earlier["timestamp"] = "2026-08-21T12:00:04Z"
+        self.ingest(later, earlier)
+        _, output = self.summarize()
+        self.assertEqual(output["gauges"]["resources.effectiveWorkers"]["latest"], 8)
 
     def test_concurrent_ingest_serializes_complete_json_lines(self) -> None:
         first = self.write_input(
