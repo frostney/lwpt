@@ -54,6 +54,13 @@ procedure ReleaseSpawnGuardProbeChildren;
   descriptor. Removes its own markers. }
 function ChildInheritedFileCount(const APaths: array of string;
   const AMarkerDirectory: string): Integer;
+
+const
+  { Reporters fstat every descriptor below min(RLIMIT_NOFILE, this bound)
+    directly, then take any higher descriptors from the per-process
+    descriptor directory. A report that cannot cover its whole limit is
+    invalid. }
+  SPAWN_GUARD_PROBE_DIRECT_SCAN_LIMIT = 65536;
 {$ENDIF}
 
 implementation
@@ -83,8 +90,11 @@ const
     initialization, before any test code runs, so the evidence does not
     depend on a shell, stat(1) or a /dev/fd implementation. }
   REPORTER_SWITCH = '--spawn-guard-probe-reporter';
-  { Upper bound on descriptor numbers a reporter inspects. }
-  REPORTER_DESCRIPTOR_LIMIT = 1024;
+  {$IFDEF LINUX}
+  REPORTER_DESCRIPTOR_DIRECTORY = '/proc/self/fd';
+  {$ELSE}
+  REPORTER_DESCRIPTOR_DIRECTORY = '/dev/fd';
+  {$ENDIF}
   REPORTER_LIFETIME_MILLISECONDS = 30000;
 
 type
@@ -555,20 +565,65 @@ end;
 { Runs in the spawned reporter child: records the device and inode of every
   descriptor it holds right after exec, publishes the report atomically and
   stays alive until the caller stops it. }
+procedure ReportDescriptor(const AReport: TStrings;
+  const ADescriptor: LongInt);
+var
+  Info: Stat;
+begin
+  if FpFStat(ADescriptor, Info) = 0 then
+    AReport.Add(IdentityOfInfo(Info))
+  else if FpGetErrNo <> ESysEBADF then
+    AReport.Add(REPORT_ERROR_PREFIX + IntToStr(ADescriptor));
+end;
+
+{ Descriptors at or above ADirectScanLimit come from the per-process
+  descriptor directory. Returns False when that listing is unavailable. }
+function ReportHighDescriptors(const AReport: TStrings;
+  const ADirectScanLimit: QWord): Boolean;
+var
+  Search: TSearchRec;
+  Descriptor: LongInt;
+begin
+  Result := FindFirst(REPORTER_DESCRIPTOR_DIRECTORY + '/*', faAnyFile,
+    Search) = 0;
+  if not Result then Exit;
+  try
+    repeat
+      if TryStrToInt(Search.Name, Descriptor) and (Descriptor >= 0)
+         and (QWord(Descriptor) >= ADirectScanLimit) then
+        ReportDescriptor(AReport, Descriptor);
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
 procedure RunDescriptorReporter(const AReportPath: string);
 var
   Descriptor: LongInt;
-  Info: Stat;
+  Limit: TRLimit;
+  OpenLimit, ScanLimit: QWord;
   Report: TStringList;
   Started: QWord;
 begin
   Report := TStringList.Create;
   try
-    for Descriptor := 0 to REPORTER_DESCRIPTOR_LIMIT - 1 do
-      if FpFStat(Descriptor, Info) = 0 then
-        Report.Add(IdentityOfInfo(Info))
-      else if FpGetErrNo <> ESysEBADF then
-        Report.Add(REPORT_ERROR_PREFIX + IntToStr(Descriptor));
+    if FpGetRLimit(RLIMIT_NOFILE, @Limit) <> 0 then
+      Report.Add(REPORT_ERROR_PREFIX + 'getrlimit')
+    else
+    begin
+      { Darwin reports an unlimited soft limit as a huge positive value. }
+      OpenLimit := QWord(Limit.rlim_cur);
+      ScanLimit := OpenLimit;
+      if ScanLimit > SPAWN_GUARD_PROBE_DIRECT_SCAN_LIMIT then
+        ScanLimit := SPAWN_GUARD_PROBE_DIRECT_SCAN_LIMIT;
+      for Descriptor := 0 to LongInt(ScanLimit) - 1 do
+        ReportDescriptor(Report, Descriptor);
+      if (OpenLimit > ScanLimit)
+         and not ReportHighDescriptors(Report, ScanLimit) then
+        Report.Add(REPORT_ERROR_PREFIX + 'descriptors above '
+          + IntToStr(ScanLimit) + ' cannot be listed');
+    end;
     Report.Add(REPORT_END_MARKER);
     Report.SaveToFile(AReportPath + '.partial');
   finally

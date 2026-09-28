@@ -5,6 +5,7 @@ program LWPT.OutputRenderer.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
   SysUtils,
@@ -22,6 +23,7 @@ type
     {$IFDEF UNIX}
     procedure TestSilentJournalStaysOutOfChildren;
     procedure TestDescriptorReporterSeesInheritance;
+    procedure TestDescriptorReporterSeesHighDescriptors;
     {$ENDIF}
   end;
 
@@ -129,6 +131,56 @@ begin
 end;
 {$ENDIF}
 
+{ Positive control above the historical 1024-descriptor scan bound, and
+  above the reporter's direct-scan bound where the process limit allows it.
+  A target the hard limit cannot reach is skipped. }
+procedure TLWPTEmergencyRingTests.TestDescriptorReporterSeesHighDescriptors;
+const
+  TARGETS: array[0..1] of LongInt = (1500,
+    SPAWN_GUARD_PROBE_DIRECT_SCAN_LIMIT + 100);
+var
+  Original, Raised: TRLimit;
+  Handle: THandle;
+  Checked, Index: Integer;
+  Path: string;
+begin
+  Checked := 0;
+  Expect<Integer>(FpGetRLimit(RLIMIT_NOFILE, @Original)).ToBe(0);
+  for Index := Low(TARGETS) to High(TARGETS) do
+  begin
+    Raised := Original;
+    if QWord(Raised.rlim_cur) <= QWord(TARGETS[Index]) then
+    begin
+      if QWord(Raised.rlim_max) <= QWord(TARGETS[Index]) then Continue;
+      Raised.rlim_cur := TARGETS[Index] + 1;
+      if FpSetRLimit(RLIMIT_NOFILE, @Raised) <> 0 then Continue;
+    end;
+    Path := GetTempDir(False) + PROGRAM_NAME + '-high-control-'
+      + IntToStr(GetProcessID) + '-' + IntToStr(TARGETS[Index]);
+    Handle := FileCreate(Path);
+    try
+      Expect<Boolean>(Handle <> THandle(-1)).ToBe(True);
+      if FpDup2(Handle, TARGETS[Index]) <> TARGETS[Index] then Continue;
+      FileClose(Handle);
+      Handle := THandle(-1);
+      try
+        Expect<Integer>(ChildInheritedFileCount([Path],
+          Path + '.probe')).ToBe(1);
+        Inc(Checked);
+      finally
+        FpClose(TARGETS[Index]);
+      end;
+    finally
+      if Handle <> THandle(-1) then FileClose(Handle);
+      DeleteFile(Path);
+      FpSetRLimit(RLIMIT_NOFILE, @Original);
+    end;
+  end;
+  if Checked = 0 then
+    WriteLn('note: descriptor limits allow no high-descriptor control; '
+      + 'skipped');
+end;
+
 procedure TLWPTEmergencyRingTests.SetupTests;
 begin
   Test('chunked output preserves the exact most-recent 1 MiB tail',
@@ -136,6 +188,8 @@ begin
   {$IFDEF UNIX}
   Test('descriptor reporter sees a deliberately inherited descriptor',
     TestDescriptorReporterSeesInheritance);
+  Test('descriptor reporter sees inherited descriptors above 1023',
+    TestDescriptorReporterSeesHighDescriptors);
   Test('silent output journal stays out of spawned children',
     TestSilentJournalStaysOutOfChildren);
   {$ENDIF}
