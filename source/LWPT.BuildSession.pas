@@ -135,11 +135,9 @@ const
   SESSION_ROOT_IDENTITY_FILE = 'project.identity';
   {$IFDEF UNIX}
   {$IFDEF LINUX}
-  FD_CLOEXEC_LWPT = 1;
   F_WRLCK_LWPT = 1;
   F_UNLCK_LWPT = 2;
   {$ELSE}
-  FD_CLOEXEC_LWPT = FD_CLOEXEC;
   F_WRLCK_LWPT = F_WRLCK;
   F_UNLCK_LWPT = F_UNLCK;
   {$ENDIF}
@@ -274,7 +272,7 @@ begin
   if not FileExists(ACfgPath) then Exit;
   Lines := TStringList.Create;
   try
-    Lines.LoadFromFile(ACfgPath);
+    LoadProtectedStrings(Lines, ACfgPath);
     AppendUnitDirsFromOptions(Lines, ADirs);
   finally
     Lines.Free;
@@ -718,7 +716,7 @@ begin
   if not FileExists(APath) then Exit;
   Lines := TStringList.Create;
   try
-    Lines.LoadFromFile(APath);
+    LoadProtectedStrings(Lines, APath);
     if Lines.Count > 0 then
       Result := StrToIntDef(Trim(Lines[0]), -1);
   finally
@@ -756,7 +754,7 @@ begin
   if not FileExists(APath) then Exit;
   Lines := TStringList.Create;
   try
-    Lines.LoadFromFile(APath);
+    LoadProtectedStrings(Lines, APath);
     if Lines.Count > 1 then Result := Trim(Lines[1]);
   finally
     Lines.Free;
@@ -787,18 +785,10 @@ begin
   FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
   {$ENDIF}
   {$IFDEF UNIX}
-  FDescriptor := FpOpen(PChar(FPath), O_RDWR or O_CREAT, &600);
+  FDescriptor := OpenProtectedDescriptor(FPath, O_RDWR or O_CREAT);
   if FDescriptor < 0 then
     raise ELWPTError.CreateFmt(
       'could not open build session owner guard %s', [FPath]);
-  if FpFcntl(FDescriptor, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
-  begin
-    FpClose(FDescriptor);
-    FDescriptor := -1;
-    raise ELWPTError.CreateFmt(
-      'could not protect build session owner guard from inheritance %s',
-      [FPath]);
-  end;
   FillChar(LockSpec, SizeOf(LockSpec), 0);
   LockSpec.l_type := F_WRLCK_LWPT;
   LockSpec.l_whence := SEEK_SET;
@@ -885,7 +875,7 @@ var
   ErrorCode: Integer;
   LockSpec: TLWPTFlock;
 begin
-  Descriptor := FpOpen(PChar(APath), O_RDWR);
+  Descriptor := OpenProtectedDescriptor(APath, O_RDWR);
   if Descriptor < 0 then
   begin
     ErrorCode := FpGetErrNo;
@@ -978,7 +968,7 @@ begin
     Started := Now;
     Acquired := False;
     {$IFDEF UNIX}
-    FDescriptor := FpOpen(PChar(FPath), O_RDWR or O_CREAT, &644);
+    FDescriptor := OpenProtectedDescriptor(FPath, O_RDWR or O_CREAT, &644);
     if FDescriptor < 0 then
       raise EConcurrencyError.CreateFmt(
         'could not open build publication lock %s', [FPath]);
@@ -1147,7 +1137,7 @@ begin
   if IsDirSymlinkOrJunction(IdentityPath) then Exit;
   Lines := TStringList.Create;
   try
-    Lines.LoadFromFile(IdentityPath);
+    LoadProtectedStrings(Lines, IdentityPath);
     Result := (Lines.Count = 3)
       and (Lines[0] = 'schema='
         + IntToStr(SESSION_ROOT_IDENTITY_SCHEMA_VERSION))
@@ -1212,7 +1202,7 @@ begin
   if not FileExists(LedgerPath) then Exit;
   Lines := TStringList.Create;
   try
-    Lines.LoadFromFile(LedgerPath);
+    LoadProtectedStrings(Lines, LedgerPath);
     if (Lines.Count < 2)
       or (Lines[0] <> 'schema='
         + IntToStr(SESSION_ROOT_LEDGER_SCHEMA_VERSION))

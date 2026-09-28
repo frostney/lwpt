@@ -5,6 +5,7 @@ program LWPT.TestArtifactSet.Test;
 
 uses
   {$IFDEF UNIX}
+  cthreads,
   BaseUnix,
   {$ENDIF}
   Classes,
@@ -14,7 +15,8 @@ uses
   LWPT.Core,
   LWPT.TestArtifactSet,
   TestingPascalLibrary,
-  Tests.Scratch;
+  Tests.Scratch,
+  Tests.SpawnGuardProbe;
 
 type
   TTestArtifactSetContract = class(TTestSuite)
@@ -34,6 +36,10 @@ type
     procedure TestExistingDestinationIsRejected;
     procedure TestExceptionStagesRemainDistinct;
     procedure TestPhysicalSourceAliasIsRejected;
+    {$IFDEF UNIX}
+    procedure TestMaterializationKeepsChildrenOutOfDestinations;
+    procedure TestProtectedStreamsHoldNoShareLock;
+    {$ENDIF}
   end;
 
 procedure TTestArtifactSetContract.WriteBytes(const APath, AText: string);
@@ -261,6 +267,101 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF UNIX}
+{ Issue #275: a test program or compiler spawned while a destination stream
+  was open inherited its exclusive flock, so the destination digest could not
+  reopen the file and a valid cache hit became "cache corruption:
+  artifact-set-invalid: exception-destination-digest-EFOpenError". Spawn a
+  real child inside every destination open window through the production
+  spawn path and prove materialization still hits. }
+procedure TTestArtifactSetContract.
+  TestMaterializationKeepsChildrenOutOfDestinations;
+const
+  PROBE_MAXIMUM_SPAWNS = 6;
+var
+  Bundle, DestinationRoot, SourceRoot: string;
+  Cached, Source: TLWPTArtifactArray;
+  Materialized: Boolean;
+  Reason: string;
+begin
+  SourceRoot := FScratch + '/guarded/source';
+  DestinationRoot := FScratch + '/guarded/destination';
+  Bundle := FScratch + '/guarded/artifacts.bundle';
+  WriteBytes(SourceRoot + '/bin/program', 'executable'#0'bytes');
+  WriteBytes(SourceRoot + '/resources/runtime.dat', 'runtime data');
+  SetLength(Source, 2);
+  Source[0].Kind := 'runtime-resource';
+  Source[0].Path := SourceRoot + '/resources/runtime.dat';
+  Source[1].Kind := BUILD_OUTPUT_EXECUTABLE;
+  Source[1].Path := SourceRoot + '/bin/program';
+  WriteTestArtifactSet(SourceRoot, Bundle, Source);
+
+  try
+    ArmSpawnGuardProbe(DestinationRoot + '/', FScratch + '/guarded/probe',
+      PROBE_MAXIMUM_SPAWNS);
+    try
+      Materialized := MaterializeTestArtifactSet(Bundle, DestinationRoot,
+        Cached, Reason);
+    finally
+      DisarmSpawnGuardProbe;
+    end;
+    Expect<string>(Reason).ToBe('hit');
+    Expect<Boolean>(Materialized).ToBe(True);
+    Expect<string>(SpawnGuardProbeError).ToBe('');
+    Expect<Integer>(SpawnGuardProbeEscapes).ToBe(0);
+    Expect<Integer>(SpawnGuardProbeUnprotectedDescriptors).ToBe(0);
+    Expect<Boolean>(SpawnGuardProbeAttempts >= Length(Source)).ToBe(True);
+    Expect<Integer>(SpawnGuardProbeLiveChildren)
+      .ToBe(SpawnGuardProbeAttempts);
+    Expect<Integer>(SpawnGuardProbeInheritedPublications).ToBe(0);
+    Expect<Integer>(SpawnGuardProbeInheritedFiles([Bundle])).ToBe(0);
+    Expect<string>(ReadBytes(Cached[0].Path)).ToBe('executable'#0'bytes');
+  finally
+    ReleaseSpawnGuardProbeChildren;
+  end;
+end;
+{$ENDIF}
+
+{$IFDEF UNIX}
+{ Close-on-exec only closes a descriptor at exec. A child forked while a
+  destination stream is open still shares it until then, which on macOS was
+  long enough for the next digest or bundle open to meet the stream's flock
+  (#275, reproduced natively with a guarded but flock-taking stream). The
+  protected stream must therefore take no share-mode lock at all. }
+procedure TTestArtifactSetContract.TestProtectedStreamsHoldNoShareLock;
+var
+  Path: string;
+  Stream: TLWPTProtectedFileStream;
+  Handle: THandle;
+  ErrorCode: Integer;
+begin
+  Path := FScratch + '/share-lock/artifact';
+  ForceDirectories(ExtractFileDir(Path));
+  Stream := OpenProtectedFileStream(Path, fmCreate);
+  try
+    Stream.WriteBuffer(Path[1], Length(Path));
+    Handle := FileOpen(Path, fmOpenRead or fmShareDenyWrite);
+    if Handle = THandle(-1) then ErrorCode := GetLastOSError
+    else
+    begin
+      ErrorCode := 0;
+      FileClose(Handle);
+    end;
+    Expect<Integer>(ErrorCode).ToBe(0);
+    Handle := FileOpen(Path, fmOpenReadWrite or fmShareExclusive);
+    if Handle = THandle(-1) then ErrorCode := GetLastOSError
+    else
+    begin
+      ErrorCode := 0;
+      FileClose(Handle);
+    end;
+    Expect<Integer>(ErrorCode).ToBe(0);
+  finally
+    Stream.Free;
+  end;
+end;
+{$ENDIF}
+
 procedure TTestArtifactSetContract.SetupTests;
 begin
   Test('round trip preserves the complete artifact set',
@@ -277,6 +378,12 @@ begin
     TestExceptionStagesRemainDistinct);
   Test('physical source aliases are rejected',
     TestPhysicalSourceAliasIsRejected);
+  {$IFDEF UNIX}
+  Test('materialization keeps concurrent children out of destinations',
+    TestMaterializationKeepsChildrenOutOfDestinations);
+  Test('protected streams hold no share-mode lock a forked child could share',
+    TestProtectedStreamsHoldNoShareLock);
+  {$ENDIF}
 end;
 
 begin
