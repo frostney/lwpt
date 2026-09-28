@@ -182,7 +182,10 @@ begin
   SetLength(Plain, 300 * 1024);
   for i := 0 to High(Plain) do
     if (i div 4096) mod 2 = 0 then
-      Plain[i] := Byte((i * 7919) xor (i shr 5))
+      { The product passes High(Integer) near the end of the payload. FPC
+        widens Integer arithmetic to the ALU size, so only 32-bit targets
+        overflowed; Int64 keeps the noise identical everywhere. }
+      Plain[i] := Byte((Int64(i) * 7919) xor (i shr 5))
     else
       Plain[i] := Byte(i div 4096);
   Decoded := Decode(Gzip(Plain), True);
