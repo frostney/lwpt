@@ -27,7 +27,13 @@ type
     FCacheRoot: string;
     FOriginalBudget: string;
     FScratch: string;
+    function BuildObjectFile(const ADigest: string): string;
     function CacheBytes(const APath: string): Int64;
+    function DependencyObjectFile(const ADigest: string): string;
+    function ManifestFile(const ANamespace, ADigest: string): string;
+    function RecordFabricatedObject(const ALifecycle: TLWPTCacheLifecycle;
+      const AObjectRoot: string; const AHexDigit: Char;
+      const ASize: Integer): string;
     procedure ResetScratch;
     procedure SetBudget(const AValue: string);
     function WriteObject(const AName, ABytes: string;
@@ -43,7 +49,9 @@ type
     procedure TestFirstRecordCreatesLifecycleTemporaryRoot;
     procedure TestIndexGrowthCannotExceedBudget;
     procedure TestRepeatedIndexNameKeepsLastValue;
-    procedure TestLargeIndexHitAndAdmissionStayFast;
+    procedure TestLargeCacheHitAndAdmissionStayFast;
+    procedure TestEvictionCountsDeletedReferences;
+    procedure TestUndeletedManifestIsNotCountedAsReclaimed;
     procedure TestLiveObjectIsPreservedAndAdmissionSkips;
     procedure TestRepairRebuildsIndexAndRemovesCorruption;
     procedure TestRepairRebuildsSemanticallyCorruptIndex;
@@ -459,6 +467,60 @@ begin
   SetProcessEnvironment(CACHE_MAX_BYTES_ENV, AValue);
 end;
 
+function ShardPath(const ARoot, ADigest: string): string;
+var
+  Hex: string;
+begin
+  Hex := Copy(ADigest, Length('sha256:') + 1, MaxInt);
+  Result := ARoot + '/sha256/' + Copy(Hex, 1, 2) + '/' + Copy(Hex, 3, MaxInt);
+end;
+
+function FileSizeOf(const APath: string): Int64;
+var
+  Search: TSearchRec;
+begin
+  if FindFirst(APath, faAnyFile, Search) <> 0 then
+    raise Exception.Create('missing fixture file ' + APath);
+  try
+    Result := Search.Size;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
+
+function TCacheLifecycleContract.BuildObjectFile(
+  const ADigest: string): string;
+begin
+  Result := ShardPath(FCacheRoot + '/build-results/objects', ADigest);
+end;
+
+function TCacheLifecycleContract.DependencyObjectFile(
+  const ADigest: string): string;
+begin
+  Result := ShardPath(FCacheRoot + '/dependency-archives', ADigest);
+end;
+
+function TCacheLifecycleContract.ManifestFile(const ANamespace,
+  ADigest: string): string;
+begin
+  Result := ShardPath(FCacheRoot + '/lifecycle/manifests/' + ANamespace,
+    ADigest);
+end;
+
+{ Places an object of ASize bytes whose digest is AHexDigit repeated, and
+  records it as the most recently used; the caller holds the mutation. }
+function TCacheLifecycleContract.RecordFabricatedObject(
+  const ALifecycle: TLWPTCacheLifecycle; const AObjectRoot: string;
+  const AHexDigit: Char; const ASize: Integer): string;
+var
+  Path: string;
+begin
+  Result := 'sha256:' + StringOfChar(AHexDigit, 64);
+  Path := ShardPath(AObjectRoot, Result);
+  WriteTextFile(Path, StringOfChar('x', ASize));
+  ALifecycle.RecordObjectLocked(Result, Path);
+end;
+
 function TCacheLifecycleContract.CacheBytes(const APath: string): Int64;
 var
   Child: string;
@@ -632,71 +694,109 @@ end;
 
 procedure TCacheLifecycleContract.TestRepeatedIndexNameKeepsLastValue;
 var
-  Digest, Hit, IndexText, Key: string;
+  Digest, Hit, IndexText, Key, OtherDigest, OtherKey: string;
   Store: TLWPTImmutableObjectStore;
   Lines: TStringList;
   Index, Occurrences: Integer;
 begin
   { A name repeated in the index resolves to its last value, exactly as
     the original Values[]-based loader did, and the next rewrite carries
-    the name once. }
+    the name once. The hit touches a different object, so the repeated
+    entry's rewritten value can only come from the loader: 7 when the
+    last write wins, 3 when the first does. Another entry sits between
+    the repeats, so they do not arrive adjacent. }
   Store := TLWPTImmutableObjectStore.Create(
     FCacheRoot + '/dependency-archives', FCacheRoot,
     DEPENDENCY_ARCHIVE_NAMESPACE);
   Lines := TStringList.Create;
   try
     Digest := WriteObject('repeated', 'repeated-name', Store);
+    OtherDigest := WriteObject('other', 'other-name', Store);
     Key := DEPENDENCY_ARCHIVE_NAMESPACE + ':' + Digest;
+    OtherKey := DEPENDENCY_ARCHIVE_NAMESPACE + ':' + OtherDigest;
     IndexText := 'schema=1'#10 + 'sequence=7'#10
       + 'entry.' + Key + '=3'#10
+      + 'entry.' + OtherKey + '=5'#10
       + 'entry.' + Key + '=7'#10;
     WriteTextFile(FCacheRoot + '/lifecycle/index', IndexText);
-    Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
+    Expect<Boolean>(Store.Lookup(OtherDigest, Hit)).ToBe(True);
     Lines.LoadFromFile(FCacheRoot + '/lifecycle/index');
     Occurrences := 0;
     for Index := 0 to Lines.Count - 1 do
       if Pos('entry.' + Key + '=', Lines[Index]) = 1 then
         Inc(Occurrences);
     Expect<Integer>(Occurrences).ToBe(1);
+    Expect<Integer>(Lines.Count).ToBe(4);
     Expect<string>(Lines[1]).ToBe('sequence=8');
-    Expect<Integer>(Lines.IndexOf('entry.' + Key + '=8')).ToBe(2);
+    Expect<Boolean>(Lines.IndexOf('entry.' + Key + '=7') >= 2).ToBe(True);
+    Expect<Boolean>(Lines.IndexOf('entry.' + OtherKey + '=8') >= 2)
+      .ToBe(True);
   finally
     Lines.Free;
     Store.Free;
   end;
 end;
 
-procedure TCacheLifecycleContract.TestLargeIndexHitAndAdmissionStayFast;
+procedure TCacheLifecycleContract.TestLargeCacheHitAndAdmissionStayFast;
 const
-  Entries = 20000;
+  ObjectCount = 20000;
+  Evictions = 2000;
+  ObjectBytes = 100;
+  { Enforcement also sees the admitted object, its manifest and its index
+    entry, which cost a few more evictions of about ObjectBytes each. }
+  EvictionSlack = 10;
   BoundMs = 5000;
 var
   Digest, Hit, NewDigest, Source: string;
   Store: TLWPTImmutableObjectStore;
   IndexLines: TStringList;
-  Index: Integer;
+  Digests: array of string;
+  LastUses: array of Integer;
+  Budget: Int64;
+  Index, Evicted: Integer;
   Started: QWord;
   HitMs, AdmitMs: Int64;
+  EvictedInOrder: Boolean;
 begin
-  { The lifecycle index of a shared cache grows with every build and
-    test result on the machine; loading it must not scan every earlier
-    entry per line. 20 000 entries took tens of seconds per cache hit
-    with the quadratic loader and take well under a second now; the
-    bound is generous so a slow CI runner does not flake it. }
+  { A grown shared cache holds tens of thousands of objects and index
+    entries. Every hit loads the index, and an admission over budget also
+    matches each object to its entry, orders them by recency, and evicts
+    many of them. Each step used to be quadratic: the loader and the
+    per-object lookup scanned the index, the insertion sort shifted
+    objects, and every eviction re-walked the tree and rescanned the
+    index for its entry. This fixture makes those steps expensive: 20 000
+    real objects whose recency is unrelated to the order discovery
+    returns them in, an index written in reverse name order, and a
+    budget that forces 2 000 evictions. The bound is generous so a slow
+    CI runner does not flake it. }
   Store := TLWPTImmutableObjectStore.Create(
     FCacheRoot + '/dependency-archives', FCacheRoot,
     DEPENDENCY_ARCHIVE_NAMESPACE);
   IndexLines := TStringList.Create;
   try
     Digest := WriteObject('hot', 'hot-object', Store);
-    IndexLines.LineBreak := #10;
-    IndexLines.Add('schema=1');
-    IndexLines.Add('sequence=' + IntToStr(Entries + 1));
-    for Index := 1 to Entries do
-      IndexLines.Add(Format('entry.build-results:sha256:%.64x=%d',
-        [Index, Index]));
+    SetLength(Digests, ObjectCount);
+    SetLength(LastUses, ObjectCount);
+    for Index := 0 to ObjectCount - 1 do
+    begin
+      Digests[Index] := 'sha256:' + LowerCase(SHA256Hex(BytesOf(
+        'scale-object-' + IntToStr(Index))));
+      { 7919 is coprime with ObjectCount, so this is a permutation of
+        1..ObjectCount that is unrelated to the digests' order. }
+      LastUses[Index] := Int64(Index) * 7919 mod ObjectCount + 1;
+      WriteTextFile(Store.ObjectPath(Digests[Index]),
+        StringOfChar('s', ObjectBytes));
+      IndexLines.Add('entry.' + DEPENDENCY_ARCHIVE_NAMESPACE + ':'
+        + Digests[Index] + '=' + IntToStr(LastUses[Index]));
+    end;
     IndexLines.Add('entry.' + DEPENDENCY_ARCHIVE_NAMESPACE + ':' + Digest
-      + '=' + IntToStr(Entries + 1));
+      + '=' + IntToStr(ObjectCount + 1));
+    IndexLines.Sort;
+    for Index := 0 to IndexLines.Count div 2 - 1 do
+      IndexLines.Exchange(Index, IndexLines.Count - 1 - Index);
+    IndexLines.Insert(0, 'sequence=' + IntToStr(ObjectCount + 1));
+    IndexLines.Insert(0, 'schema=1');
+    IndexLines.LineBreak := #10;
     ForceDirectories(FCacheRoot + '/lifecycle');
     IndexLines.SaveToFile(FCacheRoot + '/lifecycle/index');
 
@@ -707,15 +807,142 @@ begin
     Source := FScratch + '/sources/cold';
     WriteTextFile(Source, 'cold-object');
     NewDigest := 'sha256:' + SHA256File(Source);
+    { WriteTextFile adds the platform line break to each payload. }
+    Budget := CacheBytes(FCacheRoot)
+      - Evictions * FileSizeOf(Store.ObjectPath(Digests[0]));
+    SetBudget(IntToStr(Budget));
     Started := GetTickCount64;
     Expect<Boolean>(Store.Admit(Source, NewDigest) <> '').ToBe(True);
     AdmitMs := Int64(GetTickCount64 - Started);
 
+    { The evicted objects are exactly the least recently used ones, and
+      no more of them than the budget needed. }
+    Evicted := 0;
+    for Index := 0 to ObjectCount - 1 do
+      if not FileExists(Store.ObjectPath(Digests[Index])) then Inc(Evicted);
+    EvictedInOrder := True;
+    for Index := 0 to ObjectCount - 1 do
+      if FileExists(Store.ObjectPath(Digests[Index]))
+         <> (LastUses[Index] > Evicted) then
+        EvictedInOrder := False;
+    Expect<Boolean>(Evicted >= Evictions).ToBe(True);
+    Expect<Boolean>(Evicted <= Evictions + EvictionSlack).ToBe(True);
+    Expect<Boolean>(EvictedInOrder).ToBe(True);
+    Expect<Boolean>(FileExists(Store.ObjectPath(Digest))).ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= Budget).ToBe(True);
     Expect<Boolean>(HitMs < BoundMs).ToBe(True);
     Expect<Boolean>(AdmitMs < BoundMs).ToBe(True);
   finally
     IndexLines.Free;
     Store.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.TestEvictionCountsDeletedReferences;
+var
+  Budget: Int64;
+  Evicted, Kept, Newest, Reference: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+  Index: Integer;
+  References: array[0..2] of string;
+begin
+  { Evicting a build result also deletes the references that name it.
+    Those bytes are freed too: when they are what brings the cache under
+    budget, eviction stops there instead of taking the next object. }
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot, 'build-results');
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Evicted := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/build-results/objects', 'a', 1000);
+    Kept := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/build-results/objects', 'c', 1000);
+    Newest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/build-results/objects', 'e', 1000);
+    for Index := 0 to High(References) do
+    begin
+      References[Index] := FCacheRoot + '/build-results/refs/sha256/'
+        + IntToStr(Index + 1) + '1/' + StringOfChar('1', 62);
+      WriteTextFile(References[Index], Evicted + #10);
+    end;
+    Budget := CacheBytes(FCacheRoot)
+      - FileSizeOf(BuildObjectFile(Evicted))
+      - FileSizeOf(ManifestFile('build-results', Evicted));
+    for Reference in References do
+      Dec(Budget, FileSizeOf(Reference));
+    SetBudget(IntToStr(Budget));
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Expect<Boolean>(FileExists(BuildObjectFile(Evicted))).ToBe(False);
+    for Reference in References do
+      Expect<Boolean>(FileExists(Reference)).ToBe(False);
+    Expect<Boolean>(FileExists(BuildObjectFile(Kept))).ToBe(True);
+    Expect<Boolean>(FileExists(BuildObjectFile(Newest))).ToBe(True);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.
+  TestUndeletedManifestIsNotCountedAsReclaimed;
+var
+  Budget: Int64;
+  Manifest, Oldest, Next, Newest: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+  {$IFDEF MSWINDOWS}
+  ManifestHandle: THandle;
+  {$ENDIF}
+begin
+  { A payload that is deleted while its manifest is not frees only the
+    payload's bytes. Counting the manifest too would stop eviction early
+    and then reject the admission on the final walk, although the next
+    object could still have been evicted. }
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Oldest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'a', 1000);
+    Next := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'c', 1000);
+    Newest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'e', 1000);
+    Manifest := ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, Oldest);
+    Budget := CacheBytes(FCacheRoot)
+      - FileSizeOf(DependencyObjectFile(Oldest)) - FileSizeOf(Manifest);
+    SetBudget(IntToStr(Budget));
+    {$IFDEF UNIX}
+    if FpChmod(PChar(ExtractFileDir(Manifest)), &555) <> 0 then
+      raise Exception.Create('failed to protect manifest fixture');
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    ManifestHandle := Windows.CreateFileW(
+      PWideChar(UnicodeString(Manifest)), Windows.GENERIC_READ,
+      Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE, nil,
+      Windows.OPEN_EXISTING, Windows.FILE_ATTRIBUTE_NORMAL, 0);
+    if ManifestHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
+      raise Exception.Create('failed to protect manifest fixture');
+    {$ENDIF}
+    try
+      Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+      Expect<Boolean>(FileExists(Manifest)).ToBe(True);
+    finally
+      {$IFDEF UNIX}
+      if FpChmod(PChar(ExtractFileDir(Manifest)), &755) <> 0 then
+        raise Exception.Create('failed to restore manifest fixture');
+      {$ENDIF}
+      {$IFDEF MSWINDOWS}
+      Windows.CloseHandle(ManifestHandle);
+      {$ENDIF}
+    end;
+    Expect<Boolean>(FileExists(DependencyObjectFile(Oldest))).ToBe(False);
+    Expect<Boolean>(FileExists(DependencyObjectFile(Next))).ToBe(False);
+    Expect<Boolean>(FileExists(DependencyObjectFile(Newest))).ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= Budget).ToBe(True);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
   end;
 end;
 
@@ -880,8 +1107,12 @@ begin
     TestFirstRecordCreatesLifecycleTemporaryRoot);
   Test('a repeated index name keeps its last value and is written once',
     TestRepeatedIndexNameKeepsLastValue);
-  Test('a 20 000-entry index keeps hits and admissions fast',
-    TestLargeIndexHitAndAdmissionStayFast);
+  Test('a 20 000-object cache keeps hits and multi-eviction admissions '
+    + 'fast', TestLargeCacheHitAndAdmissionStayFast);
+  Test('eviction counts the references it deletes as reclaimed',
+    TestEvictionCountsDeletedReferences);
+  Test('a manifest that cannot be deleted is not counted as reclaimed',
+    TestUndeletedManifestIsNotCountedAsReclaimed);
   Test('index growth cannot take a cache hit above budget',
     TestIndexGrowthCannotExceedBudget);
   Test('live objects are preserved and an admission that cannot fit skips',
