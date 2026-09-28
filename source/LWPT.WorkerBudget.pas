@@ -161,11 +161,9 @@ const
   ACQUIRE_POLL_MILLISECONDS = 50;
   {$IFDEF UNIX}
   {$IFDEF LINUX}
-  FD_CLOEXEC_LWPT = 1;
   F_WRLCK_LWPT = 1;
   F_UNLCK_LWPT = 2;
   {$ELSE}
-  FD_CLOEXEC_LWPT = FD_CLOEXEC;
   F_WRLCK_LWPT = F_WRLCK;
   F_UNLCK_LWPT = F_UNLCK;
   {$ENDIF}
@@ -392,7 +390,7 @@ begin
   ProbePath := IncludeTrailingPathDelimiter(ARoot) + WRITE_PROBE_PREFIX
              + IntToStr(GetProcessID) + '-' + IntToStr(NowMilliseconds);
   {$IFDEF UNIX}
-  Descriptor := FpOpen(PChar(ProbePath),
+  Descriptor := OpenProtectedDescriptor(ProbePath,
     O_RDWR or O_CREAT or O_EXCL, &600);
   if Descriptor < 0 then Exit(False);
   Result := FpClose(Descriptor) = 0;
@@ -503,12 +501,12 @@ function NewOpaqueToken: string;
 var
   Bytes : TBytes;
   {$IFDEF UNIX}
-  Stream : TFileStream;
+  Stream : TLWPTProtectedFileStream;
   {$ENDIF}
 begin
   SetLength(Bytes, 32);
   {$IFDEF UNIX}
-  Stream := TFileStream.Create('/dev/urandom',
+  Stream := OpenProtectedFileStream('/dev/urandom',
     fmOpenRead or fmShareDenyNone);
   try
     Stream.ReadBuffer(Bytes[0], Length(Bytes));
@@ -810,19 +808,11 @@ begin
     EnsureWorkerStateRootExists(WorkerStateRoot);
     LockPath := StatePath(TRANSACTION_LOCK_FILE);
     {$IFDEF UNIX}
-    FDescriptor := FpOpen(PChar(LockPath), O_RDWR or O_CREAT, &600);
+    FDescriptor := OpenProtectedDescriptor(LockPath, O_RDWR or O_CREAT);
     if FDescriptor < 0 then
       raise ELWPTWorkerBudgetError.CreateFmt(
         'failed to open worker-budget transaction lock at %s',
         [LockPath]);
-    if FpFcntl(FDescriptor, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
-    begin
-      FpClose(FDescriptor);
-      FDescriptor := -1;
-      raise ELWPTWorkerBudgetError.CreateFmt(
-        'failed to protect worker-budget transaction lock from child '
-        + 'inheritance at %s', [LockPath]);
-    end;
     if not AcquireDescriptorLock(FDescriptor, True) then
     begin
       FpClose(FDescriptor);
@@ -938,18 +928,10 @@ begin
   {$ENDIF}
   EnsureWorkerStateRootExists(WorkerStateRoot);
   {$IFDEF UNIX}
-  FDescriptor := FpOpen(PChar(FPath), O_RDWR or O_CREAT, &600);
+  FDescriptor := OpenProtectedDescriptor(FPath, O_RDWR or O_CREAT);
   if FDescriptor < 0 then
     raise ELWPTWorkerBudgetError.CreateFmt(
       'failed to open worker owner guard at %s', [FPath]);
-  if FpFcntl(FDescriptor, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
-  begin
-    FpClose(FDescriptor);
-    FDescriptor := -1;
-    raise ELWPTWorkerBudgetError.CreateFmt(
-      'failed to protect worker owner guard from child inheritance at %s',
-      [FPath]);
-  end;
   if not AcquireDescriptorLock(FDescriptor, False) then
   begin
     FpClose(FDescriptor);
@@ -1034,7 +1016,7 @@ var
   ErrorCode : Integer;
 begin
   if LocalOwnerHeld(ASessionId) then Exit(True);
-  Descriptor := FpOpen(PChar(OwnerPath(ASessionId)), O_RDWR);
+  Descriptor := OpenProtectedDescriptor(OwnerPath(ASessionId), O_RDWR);
   if Descriptor < 0 then
   begin
     ErrorCode := FpGetErrNo;
@@ -1098,7 +1080,7 @@ begin
   Lines := TStringList.Create;
   try
     try
-      Lines.LoadFromFile(APath);
+      LoadProtectedStrings(Lines, APath);
     except
       Exit;
     end;
@@ -1135,6 +1117,13 @@ procedure WriteEntry(const AEntry: TLWPTWorkerBudgetEntry);
 var
   Lines : TStringList;
 begin
+  { A conservative placeholder has no owner PID or lease tokens. Persisting it
+    would make the request permanently unreadable and reserve the whole
+    budget until its owner exits, so fail the caller instead. }
+  if AEntry.Uncertain then
+    raise ELWPTWorkerBudgetError.CreateFmt(
+      'worker session "%s" request is unreadable; refusing to replace it '
+      + 'with a conservative placeholder', [AEntry.SessionId]);
   Lines := TStringList.Create;
   try
     Lines.Add('schema=' + IntToStr(REQUEST_SCHEMA));
@@ -1343,7 +1332,7 @@ begin
   Lines := TStringList.Create;
   try
     try
-      Lines.LoadFromFile(StatePath(BUDGET_FILE));
+      LoadProtectedStrings(Lines, StatePath(BUDGET_FILE));
       if Lines.Count > 0 then Result := StrToIntDef(Trim(Lines[0]), 0);
     except
       Result := 0;
@@ -1375,7 +1364,7 @@ begin
   Lines := TStringList.Create;
   try
     try
-      Lines.LoadFromFile(StatePath(QUEUE_FILE));
+      LoadProtectedStrings(Lines, StatePath(QUEUE_FILE));
       if Lines.Count > 0 then
         Result := StrToInt64Def(Trim(Lines[0]), 0);
     except

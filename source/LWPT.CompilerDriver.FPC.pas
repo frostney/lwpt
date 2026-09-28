@@ -341,7 +341,7 @@ begin
   end;
   ConfigurationLines := TStringList.Create;
   try
-    ConfigurationLines.LoadFromFile(APath);
+    LoadProtectedStrings(ConfigurationLines, APath);
     for LineIndex := 0 to ConfigurationLines.Count - 1 do
     begin
       ConfigurationLine := Trim(ConfigurationLines[LineIndex]);
