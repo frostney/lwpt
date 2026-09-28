@@ -2523,7 +2523,8 @@ begin
   {$IFDEF REGISTRY_TESTING}
   Counted := False;
   {$ENDIF}
-  while TryEnterCriticalSection(FGenerationLock) = 0 do
+  { System.: on Windows the Windows unit's LongBool overload would win. }
+  while System.TryEnterCriticalSection(FGenerationLock) = 0 do
   begin
     {$IFDEF REGISTRY_TESTING}
     if not Counted then InterlockedIncrement(RegistryGenerationWaits);
