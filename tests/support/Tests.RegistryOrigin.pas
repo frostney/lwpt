@@ -35,7 +35,8 @@ function FindAvailableRegistryTestPort: Word;
   serves ABaseURL. A port taken between selection and bind is recovered
   deterministically: the data directory is moved to a fresh port, ABaseURL is
   updated, and the start is retried a bounded number of times. }
-function StartRegistryCLI(const ADataDirectory: string; var ABaseURL: string): TProcess;
+function StartRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
+  const AAllowRelocation: Boolean = True): TProcess;
 procedure StopRegistryCLI(var AProcess: TProcess);
 function RegistryHTTPBody(const AURL: string): TBytes;
 function RegistryArtifactHash(const AArchive: TBytes): string;
@@ -161,7 +162,8 @@ begin
   end;
 end;
 
-function StartRegistryCLI(const ADataDirectory: string; var ABaseURL: string): TProcess;
+function StartRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
+  const AAllowRelocation: Boolean): TProcess;
 var
   Started: QWord;
   Attempt: Integer;
@@ -224,7 +226,10 @@ begin
         + ' (status=' + IntToStr(Result.ExitStatus) + ')';
       Diagnostics := DrainAvailableStream(Result.Stderr, 4096);
       Collided := (not Result.Running) and (Pos('listen_failed:', Diagnostics) > 0);
-      if not Collided or (Attempt = RegistryStartAttempts) then
+      { A caller that asserts readiness is refused must not be rescued by
+        relocating to a free port. }
+      if not Collided or not AAllowRelocation
+         or (Attempt = RegistryStartAttempts) then
         raise Exception.Create('registry CLI listener did not become ready after '
           + IntToStr(Attempt) + ' start attempt(s); exit=' + ExitState
           + '; last probe: ' + LastProbe + '; stderr: ' + Diagnostics);

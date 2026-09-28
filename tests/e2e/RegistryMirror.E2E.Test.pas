@@ -646,8 +646,10 @@ begin
     Impostor.SetRoutes(Routes);
     Impostor.Start;
     Diagnostic := '';
+    { No relocation: the origin's own configured port may be held by another
+      process, and relocating would make an unrelated listener ready. }
     try
-      Child := StartRegistryCLI(FOrigin.Root, BaseURL);
+      Child := StartRegistryCLI(FOrigin.Root, BaseURL, False);
     except
       on E: Exception do Diagnostic := E.Message;
     end;
