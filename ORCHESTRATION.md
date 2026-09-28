@@ -174,8 +174,8 @@ inferences in the lane; before ten exist, use all completed inferences.
   longer wait (CI, a queued build or test run, a release workflow, or a
   usage-limit reset), the lane checkpoints durable state, hands the wait to
   the coordinator or a non-LLM watcher, and ends its turn. It resumes when
-  the result arrives. Lane context caches can expire within minutes, so each
-  longer wait rewrites the lane's whole context.
+  the result arrives. Hosts may expire a lane's context cache within
+  minutes; the next turn after an expiry rewrites the whole context.
 
 An intervention never silently downgrades capability, silently stops required
 work, or ignores the threshold. The first lean Milestone Rush records totals
