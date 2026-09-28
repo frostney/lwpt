@@ -132,8 +132,12 @@ function IsFullGitObjectId(const AValue: string): Boolean;
 implementation
 
 uses
-  paszlib,
-  sha1;
+  sha1,
+  { zbase and zinflate rather than the paszlib wrapper: the cross-compile
+    toolchain ships only the units zstream depends on. zbase declares an
+    enum value COPY, so this unit calls System.Copy explicitly. }
+  zbase,
+  zinflate;
 
 const
   OBJ_COMMIT = 1;
@@ -337,7 +341,7 @@ begin
         p := 1;
         while p + GIT_OBJECT_ID_LENGTH - 1 <= Length(Commit.Parents) do
         begin
-          Parent := Copy(Commit.Parents, p, GIT_OBJECT_ID_LENGTH);
+          Parent := System.Copy(Commit.Parents, p, GIT_OBJECT_ID_LENGTH);
           if Parent = ATarget then Exit(StartIndex);
           if not Visited.ContainsKey(Parent) then Stack.Add(Parent);
           Inc(p, GIT_OBJECT_ID_LENGTH);
@@ -364,7 +368,7 @@ begin
   Start := i;
   while (i <= Length(ALine)) and (ALine[i] in ['0'..'9']) do Inc(i);
   if (i = Start) or (i - Start > 18) then Exit;
-  Result := StrToInt64Def(Copy(ALine, Start, i - Start), 0);
+  Result := StrToInt64Def(System.Copy(ALine, Start, i - Start), 0);
 end;
 
 function ParseCommit(const AId: string;
@@ -380,20 +384,20 @@ begin
   for i := 1 to Length(AData) do
   begin
     if AData[i] <> #10 then Continue;
-    Line := Copy(AData, LineStart, i - LineStart);
+    Line := System.Copy(AData, LineStart, i - LineStart);
     LineStart := i + 1;
     if Line = '' then Break;   { end of header; the message follows }
-    if Copy(Line, 1, 5) = 'tree ' then
+    if System.Copy(Line, 1, 5) = 'tree ' then
       SeenTree := True
-    else if Copy(Line, 1, 7) = 'parent ' then
+    else if System.Copy(Line, 1, 7) = 'parent ' then
     begin
-      Parent := Copy(Line, 8, MaxInt);
+      Parent := System.Copy(Line, 8, MaxInt);
       if not IsLowerObjectId(Parent) then
         raise EGitPackError.CreateFmt(
           'commit %s has a malformed parent line', [AId]);
       Result.Parents := Result.Parents + Parent;
     end
-    else if Copy(Line, 1, 10) = 'committer ' then
+    else if System.Copy(Line, 1, 10) = 'committer ' then
       Result.CommitTime := ParseCommitTime(Line);
   end;
   if not SeenTree then
@@ -417,23 +421,23 @@ begin
     while (Stop <= Length(AData)) and (AData[Stop] <> #10) do Inc(Stop);
     if Stop > Length(AData) then
       raise EGitPackError.CreateFmt('tag %s is malformed', [AId]);
-    Lines[i] := Copy(AData, Start, Stop - Start);
+    Lines[i] := System.Copy(AData, Start, Stop - Start);
     Start := Stop + 1;
   end;
-  if (Copy(Lines[0], 1, 7) <> 'object ')
-     or not IsLowerObjectId(Copy(Lines[0], 8, MaxInt)) then
+  if (System.Copy(Lines[0], 1, 7) <> 'object ')
+     or not IsLowerObjectId(System.Copy(Lines[0], 8, MaxInt)) then
     raise EGitPackError.CreateFmt('tag %s has a malformed object line',
       [AId]);
-  Kind := Copy(Lines[1], 6, MaxInt);
-  if (Copy(Lines[1], 1, 5) <> 'type ')
+  Kind := System.Copy(Lines[1], 6, MaxInt);
+  if (System.Copy(Lines[1], 1, 5) <> 'type ')
      or not ((Kind = 'commit') or (Kind = 'tree') or (Kind = 'blob')
        or (Kind = 'tag')) then
     raise EGitPackError.CreateFmt('tag %s has a malformed type line', [AId]);
-  if (Copy(Lines[2], 1, 4) <> 'tag ') or (Length(Lines[2]) <= 4) then
+  if (System.Copy(Lines[2], 1, 4) <> 'tag ') or (Length(Lines[2]) <= 4) then
     raise EGitPackError.CreateFmt('tag %s has a malformed tag line', [AId]);
   { Tags of trees and blobs never lead to a commit. }
   if (Kind = 'commit') or (Kind = 'tag') then
-    Result := Copy(Lines[0], 8, MaxInt)
+    Result := System.Copy(Lines[0], 8, MaxInt)
   else
     Result := '';
 end;
@@ -510,7 +514,7 @@ end;
 
 function TPackReader.Inflate(var APos: Integer; ASize: Int64): AnsiString;
 var
-  Stream: TZStream;
+  Stream: z_stream;
   Status: Integer;
   Spare: Byte;
 begin
@@ -539,7 +543,7 @@ begin
       Stream.next_out := @Spare;
       Stream.avail_out := 1;
     end;
-    Status := paszlib.inflate(Stream, Z_FINISH);
+    Status := zinflate.inflate(Stream, Z_FINISH);
     if Status <> Z_STREAM_END then
       raise EGitPackError.CreateFmt(
         'pack entry at offset %d is not a complete zlib stream '
