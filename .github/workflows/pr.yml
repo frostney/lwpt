@@ -1,9 +1,11 @@
 name: PR
 
-# Fast PR gate. Mirrors the GocciaScript pattern: ci.yml runs only
-# on push to main, so pr.yml is the sole pre-merge signal a PR sees.
+# Fast PR gate. Mirrors the GocciaScript pattern: ci.yml runs
+# automatically only on push to main, so pr.yml is the sole automatic
+# pre-merge signal a PR sees. Every PR also needs a green manual ci.yml
+# run on its exact head (ORCHESTRATION.md).
 #
-#   pr.yml      — every ordinary and managed PR:
+#   pr.yml      — every PR, whatever its base branch:
 #                 Ubuntu native bootstrap + install + format --check + build +
 #                 ordinary tests, then the live-network E2E paths on the
 #                 same Linux leg (#102); a native aarch64-darwin
@@ -12,20 +14,21 @@ name: PR
 #                 offline ordinary tests natively on
 #                 windows-latest. Typical wall-clock
 #                 < 10 min on a warm toolchain cache (hard caps per job/step).
-#   ci.yml      — push to main only: full 6-target cross-build +
-#                 per-platform native test runs (including E2E paths on
-#                 every platform). Post-merge confirmation.
+#   ci.yml      — full 6-target cross-build + per-platform native test
+#                 runs (including E2E paths on every platform). Required
+#                 as a manual run on every PR's exact head before merge,
+#                 and runs again on the push to main. One allow-listed
+#                 diagnostic slice is also dispatchable on any ref.
 #   release.yml — tag-triggered cross-build + package + publish.
 #
-# Trade-off, deliberate: a PR that introduces a regression on the
-# legs the gate still omits (x86_64-darwin, aarch64-linux,
-# i386-win32, or non-Linux e2e) will pass pr.yml and only fail on
-# the main-branch ci.yml run. The maintainer reverts/forwards-fixes
-# from main. Pre-merge coverage now spans Linux ordinary+E2E,
-# aarch64-darwin ordinary, and win64 offline (#102 extended the
-# original Ubuntu+win64 gate). This bounded trade keeps PR feedback
-# cheap, which is the conscious GocciaScript design
-# choice we mirror.
+# Trade-off, deliberate: this automatic gate stays cheap enough to run
+# on every push, so it omits x86_64-darwin, aarch64-linux, i386-win32,
+# and non-Linux e2e. Those legs are not post-merge only: every PR also
+# needs a green manual ci.yml run on its exact head before merge
+# (ORCHESTRATION.md), because the automatic gate alone repeatedly let
+# Intel-Darwin, i386 and cross-toolchain breaks reach main. The gate
+# covers Linux ordinary+E2E, aarch64-darwin ordinary, and win64
+# offline (#102 extended the original Ubuntu+win64 gate).
 #
 # The first carve-out from that trade-off was Windows, via the
 # win64 leg. {$IFDEF WINDOWS} codepaths never compile on the Ubuntu
@@ -39,29 +42,26 @@ name: PR
 # process env) and compile breaks in test sources, which lwpt test
 # compiles with the native FPC. #102 added the next two carve-outs
 # (the Linux E2E step and the darwin-test leg below) after the
-# #84/#105 escape classes. Still post-merge only: the i386-win32
-# leg, E2E paths on non-Linux platforms, bootstrap.bat, and the
-# x86_64-darwin / aarch64-linux permutations.
+# #84/#105 escape classes. Left to the required manual ci.yml run:
+# the i386-win32 leg, E2E paths on non-Linux platforms,
+# bootstrap.bat, and the x86_64-darwin / aarch64-linux permutations.
 #
 # The Ubuntu native build deliberately uses the distro FPC (same
 # as the install instructions in README.md), so a regression that
 # only shows up with the system FPC's slightly older RTL gets
 # caught here too.
 
+# No base-branch filter: a native stacked PR targets the branch immediately
+# below it, whatever that branch is called, and still needs the gate.
 on:
   pull_request:
-    branches:
-      - main
-      # Native stacked PRs target the branch immediately below them. Rush
-      # branches use the codex/ prefix, so include those bases as well as main.
-      - 'codex/**'
     types:
       - opened
       - reopened
       - synchronize
+
 permissions:
   contents: read
-  pull-requests: read
 
 # The commit-amend-push PR cycle is the canonical cancel-in-progress
 # case: a superseded push should not keep burning the macOS runner
@@ -71,39 +71,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  delivery-gate:
-    runs-on: ubuntu-latest
-    outputs:
-      deferred: ${{ steps.route.outputs.deferred }}
-    steps:
-      - name: Defer unadmitted managed work
-        id: route
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          IS_DRAFT: ${{ github.event.pull_request.draft }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-
-          attempts=1
-          if [ "$IS_DRAFT" = "true" ]; then attempts=6; fi
-          for attempt in $(seq 1 "$attempts"); do
-            LABELS="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.labels[].name')"
-            if grep -Fxq 'delivery:managed' <<<"$LABELS" && { \
-               [ "$RUN_ATTEMPT" = "1" ] || \
-               ! grep -Fxq 'ci:ready' <<<"$LABELS"; }; then
-              echo 'deferred=true' >> "$GITHUB_OUTPUT"
-              echo 'Managed work remains deferred until its explicit ci transition.'
-              exit 0
-            fi
-            if [ "$attempt" -lt "$attempts" ]; then sleep 3; fi
-          done
-          echo 'deferred=false' >> "$GITHUB_OUTPUT"
-
   build-and-test:
-    needs: delivery-gate
-    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -172,7 +140,8 @@ jobs:
       # they are not rerun here as accidental stress. Clean DNS/
       # connect failures self-skip (transient third-party downtime);
       # content, protocol, and TLS failures remain blocking, which is
-      # the point. Post-merge ci.yml still runs these paths on every platform.
+      # the point. The required manual ci.yml run and the push to main
+      # run these paths on every platform.
       - name: lwpt test --bail=0 (E2E project paths, live network)
         # Run even when the ordinary queue failed, so one run reports both;
         # a failed setup step (bootstrap through agents --check) still skips it.
@@ -187,8 +156,6 @@ jobs:
           --bail=0
 
   docs:
-    needs: delivery-gate
-    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -202,23 +169,19 @@ jobs:
           globs: "**/*.md"
 
       - name: Exercise repository workflow fixtures
-        run: |
-          python3 -m unittest discover -s .github/delivery/tests -v
-          python3 -m unittest discover -s .github/tests -v
+        run: python3 -m unittest discover -s .github/tests -v
 
   # PR-gate extension (#102): one native aarch64-darwin leg. The #105
   # env-race family and its masks all first surfaced on darwin legs,
   # and darwin-only runtime breaks (the fpc-proxy misroute) were
   # invisible to the Linux-only gate. Native
   # bootstrap via brew keeps this independent of the cross-toolchain
-  # cache. Ordinary paths only; E2E stays on the Linux leg above and on
-  # post-merge ci.yml. Cost bound: ~5-6 min warm (brew fpc ~40 s +
-  # bootstrap ~1 min + ordinary tests). The remaining ci.yml-only legs
-  # (x86_64-darwin, aarch64-linux, i386-win32) stay post-merge: their
-  # unique-catch rate has not justified per-PR cost.
+  # cache. Ordinary paths only; E2E stays on the Linux leg above and in
+  # the required manual ci.yml run. Cost bound: ~5-6 min warm (brew fpc
+  # ~40 s + bootstrap ~1 min + ordinary tests). The remaining
+  # ci.yml-only legs (x86_64-darwin, aarch64-linux, i386-win32) run in
+  # that manual run rather than on every push.
   darwin-test:
-    needs: delivery-gate
-    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     runs-on: macos-latest
     timeout-minutes: 20
     defaults:
@@ -262,14 +225,13 @@ jobs:
   # the PR's own cache scope); the next main push repopulates the
   # shared copy.
   toolchain:
-    needs: delivery-gate
-    if: ${{ needs.delivery-gate.outputs.deferred != 'true' }}
     uses: ./.github/workflows/toolchain.yml
 
-  # Windows compile signal, pre-merge. ci.yml's full cross-build
-  # matrix runs only on push to main, so without this job a
-  # Windows-only compile error inside {$IFDEF WINDOWS} blocks merges
-  # green and breaks main (see the header comment). One target is
+  # Windows compile signal on every push. ci.yml's full cross-build
+  # matrix runs automatically only on push to main, and manually once
+  # on the PR's final head, so this job reports a Windows-only compile
+  # error inside {$IFDEF WINDOWS} blocks on every push instead of only
+  # at that required manual run (see the header comment). One target is
   # enough: win32 and win64 share the same {$IFDEF WINDOWS} sources,
   # and the failure class is compile-time. The produced lwpt.exe is
   # uploaded for the windows-test job below, which runs the ordinary
@@ -281,15 +243,7 @@ jobs:
   # Linux/Darwin branches that don't apply to win64. When ci.yml's
   # build flags change, change them here too.
   windows-cross-compile:
-    if: >-
-      ${{
-        always() &&
-        needs.delivery-gate.outputs.deferred != 'true' &&
-        needs.toolchain.result == 'success'
-      }}
-    needs:
-      - delivery-gate
-      - toolchain
+    needs: toolchain
     runs-on: macos-latest
     env:
       # Single source of truth is toolchain.yml's FPC_VERSION (called
@@ -405,18 +359,11 @@ jobs:
   # (junction-vs-symlink installs, path handling, subprocess
   # environment handling) and compile breaks in test sources, which
   # lwpt test compiles with the native FPC at run time (Q22=b).
-  # Post-merge ci.yml still owns the i386-win32 leg, E2E paths
-  # on non-Linux platforms, and the bootstrap.bat smoke.
+  # The required manual ci.yml run (and the push to main) owns the
+  # i386-win32 leg, E2E paths on non-Linux platforms, and the
+  # bootstrap.bat smoke.
   windows-test:
-    if: >-
-      ${{
-        always() &&
-        needs.delivery-gate.outputs.deferred != 'true' &&
-        needs.windows-cross-compile.result == 'success'
-      }}
-    needs:
-      - delivery-gate
-      - windows-cross-compile
+    needs: windows-cross-compile
     runs-on: windows-latest
     timeout-minutes: 20
     defaults:
@@ -434,7 +381,7 @@ jobs:
       # lwpt test compiles *.Test.pas with the native FPC. The shared setup
       # script pins the official distribution and publishes its unit paths.
       - name: Install FPC (official distribution)
-        run: .github/delivery/install-windows-fpc.sh
+        run: .github/ci/install-windows-fpc.sh
 
       - name: Download lwpt artefact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -467,10 +414,12 @@ jobs:
           'tests/integration/*.Test.pas'
           --bail=0
 
+  # The single required status check (.github/rulesets/protect-main.json).
+  # It runs even when a dependency fails or is skipped, and passes only when
+  # every native PR job succeeded, so the ruleset names one stable context.
   delivery-admission:
     if: ${{ always() }}
     needs:
-      - delivery-gate
       - build-and-test
       - docs
       - darwin-test
@@ -481,7 +430,6 @@ jobs:
     steps:
       - name: Require the native PR gate
         env:
-          DEFERRED: ${{ needs.delivery-gate.outputs.deferred }}
           BUILD_AND_TEST: ${{ needs.build-and-test.result }}
           DOCS: ${{ needs.docs.result }}
           DARWIN_TEST: ${{ needs.darwin-test.result }}
@@ -490,10 +438,6 @@ jobs:
           WINDOWS_TEST: ${{ needs.windows-test.result }}
         run: |
           set -euo pipefail
-          if [ "$DEFERRED" = "true" ]; then
-            echo '::error::Managed delivery is deferred until its explicit ci transition.'
-            exit 1
-          fi
           for result in \
             "$BUILD_AND_TEST" "$DOCS" "$DARWIN_TEST" "$TOOLCHAIN" \
             "$WINDOWS_CROSS_COMPILE" "$WINDOWS_TEST"; do

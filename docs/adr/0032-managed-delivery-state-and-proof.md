@@ -1,5 +1,15 @@
 # Managed delivery uses explicit transitions and exact native-topology proofs
 
+> **Superseded by [ADR-0046](./0046-skill-owned-delivery.md).** The
+> transition endpoint, observer, finalizer, watchdog, controller, the
+> `delivery:managed` / `ci:ready` / `review:ready` / `merge:ready` phase labels,
+> and the `ci:full-required` label are retired. The known-good-route skills
+> own delivery; the repository keeps the `delivery-admission` PR gate,
+> `ci.yml`'s manual and diagnostic modes, the full-CI rule in
+> `ORCHESTRATION.md`, and
+> `.github/delivery/review-automations.json`. The text below is the historical
+> decision.
+
 The 0.5.0 stack trial conflated delivery ownership with stack membership and
 used an intentional failed first run as admission. LWPT now models those
 concerns separately. `delivery:managed` opts a standalone or native-stack PR

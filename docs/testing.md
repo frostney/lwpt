@@ -21,7 +21,7 @@ How LWPT tests itself: repository-owned test groups, the mock HTTP server, the b
 | --- | --- | --- | --- | --- |
 | **Unit** | Never | Co-located in `source/` (`Foo.pas` ↔ `Foo.Test.pas`) | Yes | No |
 | **Integration** | Never (mock server + local fixtures) | `tests/integration/` | Yes | No |
-| **E2E** | Sometimes (live hosts or loopback only) | `tests/e2e/` and package-owned `tests/e2e/` | Linux leg only (dedicated `pr.yml` step per #102); every platform post-merge via `ci.yml` | No |
+| **E2E** | Sometimes (live hosts or loopback only) | `tests/e2e/` and package-owned `tests/e2e/` | Linux leg of the automatic gate (dedicated `pr.yml` step per #102); every platform in the required manual `ci.yml` run and on `main` | No |
 | **Manual / spike** | N/A | Anywhere maintainer wants | No | No |
 
 These names and paths belong to this repository, not to the runner. With no selector, `./build/lwpt test` runs every discovered `*.Test.pas` program. Positional selectors run exactly the matching programs and accept exact files, recursive directories, or LWPT globs (`*`, `?`, and `**`):
@@ -34,7 +34,7 @@ LWPT_ENABLE_NETWORK=1 ./build/lwpt test 'tests/e2e/Install*.Test.pas'
 
 Quote globs so LWPT—not the shell—matches them consistently. Multiple selectors form a deduplicated union and each must match at least one discovered test program. Discovery and selection freeze before `[pretest]`; the hook can prepare inputs for selected programs but cannot add programs to the current invocation.
 
-Live-network behavior is also repository policy. LWPT's network-touching test programs self-skip unless `LWPT_ENABLE_NETWORK=1`; the PR and post-merge workflows set that variable only on their explicit E2E-path invocation. Other projects choose their own paths, environment, and `lwpt run` tasks without teaching the generic runner those categories.
+Live-network behavior is also repository policy. LWPT's network-touching test programs self-skip unless `LWPT_ENABLE_NETWORK=1`; the PR and full-matrix workflows set that variable only on their explicit E2E-path invocation. Other projects choose their own paths, environment, and `lwpt run` tasks without teaching the generic runner those categories.
 
 ## Compiled-test reuse
 

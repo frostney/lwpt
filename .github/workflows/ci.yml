@@ -1,12 +1,10 @@
 name: CI
 run-name: >-
-  ${{ inputs.mode == 'full-ci' &&
-      format('full-ci/{0}/{1}/{2}/{3}', inputs.candidate_pr_number,
-      inputs.expected_head, inputs.topology_digest, inputs.check_id) ||
-      inputs.mode == 'diagnostic' &&
-      format('diagnostic/{0}/{1}/{2}/{3}', inputs.candidate_pr_number,
-      inputs.expected_head, inputs.diagnostic_target, inputs.diagnostic_selector) ||
-      format('CI / {0}', github.ref_name) }}
+  ${{ inputs.mode == 'diagnostic' &&
+      format('CI / diagnostic / {0} / {1}/{2}', github.ref_name,
+      inputs.diagnostic_target, inputs.diagnostic_selector) ||
+      format('CI / {0} / {1}', inputs.mode || github.event_name,
+      github.ref_name) }}
 
 # Two stages, mirroring the GocciaScript CI pattern (the upstream of
 # LWPT's vendored units). Sister workflows:
@@ -23,6 +21,15 @@ run-name: >-
 # duplicate-build cost that comes from triggering on both push and
 # pull_request for the same commit. Post-merge, ci.yml runs once
 # on main to confirm the merged tree is green.
+#
+# workflow_dispatch runs on any ref (dispatch requires write access):
+#
+#   mode=manual     — the same full native matrix as a push to main,
+#                     on the dispatched ref's head. Every PR needs one
+#                     green manual run on its exact head before merge
+#                     (ORCHESTRATION.md).
+#   mode=diagnostic — one allow-listed target/selector slice for
+#                     remediation. Never proof that a change is ready.
 #
 #   build:  Cross-compile the lwpt binary on macos-latest for each of
 #           six targets using the cross-FPC toolchain produced by
@@ -49,30 +56,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Manual full-CI proof or ordinary manual verification
+        description: Full native matrix (manual) or one allow-listed diagnostic slice
         required: true
         type: choice
         default: manual
         options:
           - manual
-          - full-ci
           - diagnostic
-      candidate_pr_number:
-        description: Singleton or native-prefix top PR for full-ci
-        required: false
-        type: string
-      expected_head:
-        description: Exact candidate head for full-ci; blank uses the dispatched ref
-        required: false
-        type: string
-      topology_digest:
-        description: Exact native singleton or prefix digest for full-ci
-        required: false
-        type: string
-      check_id:
-        description: Exact full-ci check run concluded by the trusted finalizer
-        required: false
-        type: string
       diagnostic_target:
         description: Native target for diagnostic mode
         required: false
@@ -95,15 +85,15 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
-# Rapid prefix merges still create distinct main commits. Keep only the latest
-# integrated-main verification running; explicit full-ci dispatches remain
-# independent exact-candidate proofs and are never silently coalesced.
+# Rapid merges still create distinct main commits. Keep only the latest
+# integrated-main verification running. A new diagnostic on the same ref
+# cancels the superseded one. Manual full-matrix runs are exact-head
+# evidence and are never silently coalesced.
 concurrency:
   group: >-
     ${{ github.event_name == 'push' && 'integrated-main' ||
-        inputs.mode == 'diagnostic' && format('diagnostic-{0}', inputs.candidate_pr_number) ||
+        inputs.mode == 'diagnostic' && format('diagnostic-{0}', github.ref_name) ||
         format('ci-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'push' || inputs.mode == 'diagnostic' }}
 
@@ -114,24 +104,14 @@ jobs:
       build-matrix: ${{ steps.route.outputs.build-matrix }}
       test-matrix: ${{ steps.route.outputs.test-matrix }}
     steps:
-      - name: Validate trusted dispatch inputs
+      - name: Validate dispatch inputs
         env:
           MODE: ${{ inputs.mode }}
-          CANDIDATE_PR_NUMBER: ${{ inputs.candidate_pr_number }}
-          EXPECTED_HEAD: ${{ inputs.expected_head }}
-          TOPOLOGY_DIGEST: ${{ inputs.topology_digest }}
-          CHECK_ID: ${{ inputs.check_id }}
           DIAGNOSTIC_TARGET: ${{ inputs.diagnostic_target }}
           DIAGNOSTIC_SELECTOR: ${{ inputs.diagnostic_selector }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$MODE" = "diagnostic" ]; then
-            if ! [[ "$CANDIDATE_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
-               ! [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::error::diagnostic mode requires a candidate PR and exact head."
-              exit 1
-            fi
             case "$DIAGNOSTIC_TARGET" in
               aarch64-darwin|x86_64-darwin|x86_64-linux|x86_64-win64|i386-win32) ;;
               *) echo "::error::unsupported diagnostic target: $DIAGNOSTIC_TARGET"; exit 1 ;;
@@ -148,22 +128,6 @@ jobs:
               i386-win32/default|i386-win32/e2e|i386-win32/tls) ;;
               *) echo "::error::unsupported diagnostic slice: $DIAGNOSTIC_TARGET/$DIAGNOSTIC_SELECTOR"; exit 1 ;;
             esac
-            PULL="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$CANDIDATE_PR_NUMBER")"
-            if [ "$(jq -r '.state' <<<"$PULL")" != "open" ] ||
-               [ "$(jq -r '.head.sha' <<<"$PULL")" != "$EXPECTED_HEAD" ] ||
-               [ "$(jq -r '.head.repo.full_name' <<<"$PULL")" != "$GITHUB_REPOSITORY" ]; then
-              echo "::error::diagnostic inputs do not identify a current same-repository PR head."
-              exit 1
-            fi
-            exit 0
-          fi
-          if [ "$MODE" != "full-ci" ]; then exit 0; fi
-          if ! [[ "$CANDIDATE_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] ||
-             ! [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]] ||
-             ! [[ "$TOPOLOGY_DIGEST" =~ ^[0-9a-f]{64}$ ]] ||
-             ! [[ "$CHECK_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::full-ci requires a candidate PR, exact head, topology digest, and check ID."
-            exit 1
           fi
 
       - name: Select exact matrix
@@ -224,7 +188,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ inputs.expected_head || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Restore toolchain cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -437,7 +401,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ inputs.expected_head || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Install FPC (brew)
         if: matrix.fpc-install == 'brew'
@@ -454,7 +418,7 @@ jobs:
 
       - name: Install FPC (official distribution)
         if: matrix.fpc-install == 'official'
-        run: .github/delivery/install-windows-fpc.sh
+        run: .github/ci/install-windows-fpc.sh
 
       - name: bootstrap.bat (Windows cold build)
         if: matrix.bootstrap-check == true && inputs.mode != 'diagnostic'
@@ -567,24 +531,6 @@ jobs:
             ./build/lwpt test packages/httpclient/source/TransportSecurity.Test.pas --bail=1 --verbose
           fi
 
-      - name: Checkout trusted scheduling diagnostic
-        if: >-
-          inputs.mode == 'diagnostic' &&
-          ((inputs.diagnostic_target == 'x86_64-darwin' &&
-            inputs.diagnostic_selector == 'default') ||
-           ((inputs.diagnostic_target == 'x86_64-darwin' ||
-             inputs.diagnostic_target == 'aarch64-darwin') &&
-            inputs.diagnostic_selector == 'scheduling') ||
-           (inputs.diagnostic_target == 'x86_64-linux' &&
-            inputs.diagnostic_selector == 'scheduling'))
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-          ref: ${{ github.sha }}
-          path: .trusted-delivery
-          sparse-checkout: .github/delivery/scheduling-diagnostic.sh
-
       - name: Scheduling diagnostic test
         if: >-
           inputs.mode == 'diagnostic' &&
@@ -599,4 +545,4 @@ jobs:
         env:
           LWPT_SCHEDULING_DIAGNOSTIC_SCOPE: ${{ inputs.diagnostic_selector }}
           LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT: ${{ inputs.diagnostic_selector == 'default' && '84' || (inputs.diagnostic_target == 'x86_64-darwin' || inputs.diagnostic_target == 'aarch64-darwin') && '30' || '18' }}
-        run: .trusted-delivery/.github/delivery/scheduling-diagnostic.sh
+        run: .github/ci/scheduling-diagnostic.sh

@@ -35,13 +35,10 @@ intermediary issue merely to satisfy process.
 - Required test groups and cross-platform checks are identified.
 - Dependencies, migration or compatibility expectations, and unresolved
   decisions are explicit.
-- The delivery plan records ordinary versus `delivery:managed` routing,
-  standalone versus GitHub-native topology, and the intended atomic singleton
-  or prefix merge unit.
-- The plan records whether `ci:full-required` applies, the exact singleton or
-  cumulative prefix SHA that must prove it, every active inline review
-  automation and the terminal evidence required from each, and any repository
-  workflow, controller, ruleset, or provider adapter that must land first.
+- The delivery plan records standalone versus GitHub-native stack topology.
+- The plan records the review axes that apply (standards and specification,
+  plus security for trust surfaces) and any repository workflow, ruleset, or
+  provider configuration that must land first.
 - Agent-led plans have classified [`ORCHESTRATION.md`](./ORCHESTRATION.md) as
   valid, missing, invalid, contradictory, or unsupported. A generic workflow
   recommendation is planning input, not evidence that repository integration
