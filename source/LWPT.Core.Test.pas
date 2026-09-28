@@ -2092,11 +2092,13 @@ end;
 procedure TGitProtocolParsing.TestHeadWithCapabilitiesIsRecognised;
 const
   { 4-char hex length + payload. 40-char SHA + space + "HEAD"
-    + NUL + capability string + LF. Total payload = 56 chars,
-    +4 prefix = 60 = $003c. HEAD is dropped by the filter, so
-    the result is still empty. }
+    + NUL + capability string (19) + LF. Total payload = 66 chars,
+    +4 prefix = 70 = $0046. (The length was once 3c; the lenient parser
+    stopped at the short frame and returned the same empty result, which
+    hid the error. The strict parser refuses a frame that overruns.)
+    HEAD is dropped by the filter, so the result is still empty. }
   PAYLOAD =
-    '003c0123456789012345678901234567890123456789 HEAD'#0 +
+    '00460123456789012345678901234567890123456789 HEAD'#0 +
     'multi_ack thin-pack'#10 +
     '0000';
 begin
