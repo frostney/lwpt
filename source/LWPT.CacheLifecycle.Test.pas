@@ -751,7 +751,13 @@ const
   { Enforcement also sees the admitted object, its manifest and its index
     entry, which cost a few more evictions of about ObjectBytes each. }
   EvictionSlack = 10;
-  BoundMs = 5000;
+  { Hit and admission must stay within a small multiple of one full cache
+    walk measured on the same machine. The linear code needs a few walks'
+    worth of work; each quadratic variant this guards against costs
+    hundreds of walks. A relative bound keeps slow runners from failing
+    correct code while still catching the regression anywhere. }
+  WalkMultiple = 40;
+  BoundSlackMs = 1000;
 var
   Digest, Hit, NewDigest, Source: string;
   Store: TLWPTImmutableObjectStore;
@@ -761,7 +767,7 @@ var
   Budget: Int64;
   Index, Evicted: Integer;
   Started: QWord;
-  HitMs, AdmitMs: Int64;
+  HitMs, AdmitMs, WalkMs, BoundMs: Int64;
   EvictedInOrder: Boolean;
 begin
   { A grown shared cache holds tens of thousands of objects and index
@@ -773,8 +779,7 @@ begin
     index for its entry. This fixture makes those steps expensive: 20 000
     real objects whose recency is unrelated to the order discovery
     returns them in, an index written in reverse name order, and a
-    budget that forces 2 000 evictions. The bound is generous so a slow
-    CI runner does not flake it. }
+    budget that forces 2 000 evictions. }
   Store := TLWPTImmutableObjectStore.Create(
     FCacheRoot + '/dependency-archives', FCacheRoot,
     DEPENDENCY_ARCHIVE_NAMESPACE);
@@ -807,6 +812,11 @@ begin
     IndexLines.SaveToFile(FCacheRoot + '/lifecycle/index');
 
     Started := GetTickCount64;
+    CacheBytes(FCacheRoot);
+    WalkMs := Int64(GetTickCount64 - Started);
+    BoundMs := WalkMultiple * WalkMs + BoundSlackMs;
+
+    Started := GetTickCount64;
     Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
     HitMs := Int64(GetTickCount64 - Started);
 
@@ -831,13 +841,22 @@ begin
       if FileExists(Store.ObjectPath(Digests[Index]))
          <> (LastUses[Index] > Evicted) then
         EvictedInOrder := False;
-    Expect<Boolean>(Evicted >= Evictions).ToBe(True);
-    Expect<Boolean>(Evicted <= Evictions + EvictionSlack).ToBe(True);
-    Expect<Boolean>(EvictedInOrder).ToBe(True);
-    Expect<Boolean>(FileExists(Store.ObjectPath(Digest))).ToBe(True);
-    Expect<Boolean>(CacheBytes(FCacheRoot) <= Budget).ToBe(True);
-    Expect<Boolean>(HitMs < BoundMs).ToBe(True);
-    Expect<Boolean>(AdmitMs < BoundMs).ToBe(True);
+    if (Evicted < Evictions) or (Evicted > Evictions + EvictionSlack) then
+      Fail(Format('evicted %d objects, expected %d to %d',
+        [Evicted, Evictions, Evictions + EvictionSlack]));
+    if not EvictedInOrder then
+      Fail('eviction did not remove exactly the least recently used objects');
+    if not FileExists(Store.ObjectPath(Digest)) then
+      Fail('the recently used hot object was evicted');
+    if CacheBytes(FCacheRoot) > Budget then
+      Fail('the cache is still over budget after admission');
+    if HitMs >= BoundMs then
+      Fail(Format('hit took %d ms; bound %d ms (%d x one %d ms cache walk '
+        + '+ %d ms)', [HitMs, BoundMs, WalkMultiple, WalkMs, BoundSlackMs]));
+    if AdmitMs >= BoundMs then
+      Fail(Format('admission took %d ms; bound %d ms (%d x one %d ms cache '
+        + 'walk + %d ms)', [AdmitMs, BoundMs, WalkMultiple, WalkMs,
+        BoundSlackMs]));
   finally
     IndexLines.Free;
     Store.Free;
