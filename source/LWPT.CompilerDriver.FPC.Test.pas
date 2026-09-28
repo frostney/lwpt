@@ -24,7 +24,8 @@ uses
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.ProcessSupport,
-  Tests.Scratch;
+  Tests.Scratch,
+  Tests.SpawnGuardProbe;
 
 const
   IsolatedCompilerDriverOption = '--' + PROGRAM_NAME
@@ -89,6 +90,9 @@ type
     procedure AssertDefaultBuildRequestUsesBareProbeTarget;
     procedure AssertExplicitProcessorOverrideStillDispatches;
     procedure AssertBuildArgumentsPreserveTestCompileFlagSet;
+    {$IFDEF UNIX}
+    procedure TestConfigurationExpansionKeepsChildrenOut;
+    {$ENDIF}
   public
     procedure SetupTests; override;
     procedure TestProbeCachesPerTargetAndRefreshesOnDemand;
@@ -880,6 +884,52 @@ begin
   end;
 end;
 
+{$IFDEF UNIX}
+{ Test workers expand lwpt.cfg while sibling workers launch compilers. A
+  child spawned inside that read must neither start in the open window nor
+  keep the configuration descriptor. }
+procedure TLWPTFPCCompilerDriverTests.
+  TestConfigurationExpansionKeepsChildrenOut;
+const
+  PROBE_MAXIMUM_SPAWNS = 2;
+var
+  ConfigurationPath, Scratch: string;
+  Driver: TMockFPCCompilerDriver;
+  Request: TLWPTBuildRequest;
+begin
+  Scratch := ExpandFileName('build/tests/tmp/compiler-driver-cfg-guard-'
+    + IntToStr(GetProcessID) + '-' + IntToStr(GetTickCount64));
+  ForceDirectories(Scratch);
+  ConfigurationPath := Scratch + '/guarded.cfg';
+  WriteTextFile(ConfigurationPath, '-Fuconfig/unit' + LineEnding);
+  Request := FixtureRequest('source/example.pas', 'session/example');
+  Driver := TMockFPCCompilerDriver.Create('fpc-under-test');
+  try
+    Driver.ProbeOutput := FixtureProbeOutput('3.2.2', Request.Target);
+    ArmSpawnGuardProbe(ConfigurationPath, Scratch + '/probe',
+      PROBE_MAXIMUM_SPAWNS);
+    try
+      Driver.BuildArguments(Request,
+        PascalSourceCompilerInvocationOptions(ConfigurationPath));
+    finally
+      DisarmSpawnGuardProbe;
+    end;
+    Expect<string>(SpawnGuardProbeError).ToBe('');
+    Expect<Boolean>(SpawnGuardProbeAttempts >= 1).ToBe(True);
+    Expect<Integer>(SpawnGuardProbeEscapes).ToBe(0);
+    Expect<Integer>(SpawnGuardProbeUnprotectedDescriptors).ToBe(0);
+    Expect<Integer>(SpawnGuardProbeLiveChildren)
+      .ToBe(SpawnGuardProbeAttempts);
+    Expect<Integer>(SpawnGuardProbeInheritedPublications).ToBe(0);
+    Expect<string>(SpawnGuardProbeError).ToBe('');
+  finally
+    ReleaseSpawnGuardProbeChildren;
+    Driver.Free;
+    RecursiveDelete(Scratch);
+  end;
+end;
+{$ENDIF}
+
 procedure TLWPTFPCCompilerDriverTests.
   TestIncompatibleVersionNamesCompilerAndRequirement;
 var
@@ -1179,6 +1229,10 @@ begin
     TestExtraArgumentValidation);
   Test('build argument translation preserves the test-compile flag set',
     TestBuildArgumentsPreserveTestCompileFlagSet);
+  {$IFDEF UNIX}
+  Test('configuration expansion keeps concurrent children out',
+    TestConfigurationExpansionKeepsChildrenOut);
+  {$ENDIF}
   Test('version mismatch names compiler and requirement',
     TestIncompatibleVersionNamesCompilerAndRequirement);
   Test('failure classification owns stale-artifact and exit shaping',
