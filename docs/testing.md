@@ -127,8 +127,9 @@ flags = ["-dTEST_FEATURE"]
 `--bail=N` overrides the manifest for one invocation. A positive threshold
 stops new scheduling as soon as that many failures have been observed,
 terminates and reaps active compiler/test children, and reports the remaining
-programs as cancelled. `--bail=0` always runs the complete queue. CI should
-use `--bail=1` for fast feedback.
+programs as cancelled. `--bail=0` always runs the complete queue. LWPT's CI
+gates use `--bail=0`, so one failing run reports every failing program; only
+the focused diagnostic slices keep `--bail=1` (see [`ci.md`](./ci.md)).
 
 `flags` is an optional root-manifest array of non-empty compiler-driver
 arguments applied, in order, to every selected test-program compile.

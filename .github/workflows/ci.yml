@@ -505,6 +505,7 @@ jobs:
           fi
 
       - name: lwpt install (workspace auto-discovery + linking)
+        id: workspace-install
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             ./build/lwpt.exe install
@@ -538,7 +539,10 @@ jobs:
           fi
 
       - name: lwpt test --bail=0 (E2E project paths, live network — every platform per Q23=c)
-        if: inputs.mode != 'diagnostic' || inputs.diagnostic_selector == 'e2e'
+        # Run even when the ordinary queue failed, so one run reports both.
+        if: >-
+          !cancelled() && steps.workspace-install.outcome == 'success' &&
+          (inputs.mode != 'diagnostic' || inputs.diagnostic_selector == 'e2e')
         env:
           LWPT_ENABLE_NETWORK: "1"
         run: |
