@@ -1550,12 +1550,29 @@ type
     procedure AddLink(const ALinkPath, ATargetName, AFromRel: string);
   end;
 
+const
+  { Windows file systems resolve names case-insensitively, so the deferred
+    link pass finds a target however the link spells it. }
+  {$IFDEF MSWINDOWS}
+  ArchivePathsCaseSensitive = False;
+  {$ELSE}
+  ArchivePathsCaseSensitive = True;
+  {$ENDIF}
+
 function NewPathList: TStringList;
 begin
   Result := TStringList.Create;
   Result.Sorted := True;
   Result.Duplicates := dupIgnore;
-  Result.CaseSensitive := True;
+  Result.CaseSensitive := ArchivePathsCaseSensitive;
+end;
+
+function ArchivePathHasPrefix(const APath, APrefix: string): Boolean;
+begin
+  if ArchivePathsCaseSensitive then
+    Result := Copy(APath, 1, Length(APrefix)) = APrefix
+  else
+    Result := SameText(Copy(APath, 1, Length(APrefix)), APrefix);
 end;
 
 constructor TLWPTArchivePlan.Create(const ADest: string);
@@ -1633,13 +1650,17 @@ begin
   try
     { Collected first: CheckAndAdd grows the lists being scanned. }
     for i := 0 to FDirectories.Count - 1 do
-      if Copy(FDirectories[i], 1, Length(Prefix)) = Prefix then
+      if ArchivePathHasPrefix(FDirectories[i], Prefix) then
         Copies.AddObject(LinkPath + PathDelim
           + Copy(FDirectories[i], Length(Prefix) + 1, MaxInt), TObject(1));
     for i := 0 to FFiles.Count - 1 do
-      if Copy(FFiles[i], 1, Length(Prefix)) = Prefix then
+      if ArchivePathHasPrefix(FFiles[i], Prefix) then
         Copies.AddObject(LinkPath + PathDelim
           + Copy(FFiles[i], Length(Prefix) + 1, MaxInt), nil);
+    { The deferred pass deletes a file at the link path before copying the
+      tree there, so later links must see a directory. }
+    i := FFiles.IndexOf(LinkPath);
+    if i >= 0 then FFiles.Delete(i);
     CheckAndAdd(LinkPath, AFromRel, True);
     for i := 0 to Copies.Count - 1 do
       CheckAndAdd(Copies[i], AFromRel, Copies.Objects[i] <> nil);

@@ -72,6 +72,8 @@ type
     procedure TestOverlongEntryPathFailsBeforeWriting;
     procedure TestDirectoryLinkAliasFailsBeforeWriting;
     procedure TestOverlongNameComponentFailsBeforeWriting;
+    procedure TestMixedCaseDirectoryLinkFailsBeforeWriting;
+    procedure TestLinkThroughReplacedFileFailsBeforeWriting;
     procedure TestTarTruncatedMidEntryRaises;
     procedure TestParentTraversalPathRejected;
     procedure TestAbsoluteTraversalPathRejected;
@@ -656,6 +658,61 @@ begin
   Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
 end;
 
+{ A deep file below Dest/r that lands 10 characters inside the file limit. }
+function DeepLeafBelowR(const ADest: string): string;
+begin
+  Result := FillPath(PlatformFilePathLimit - 10 - Length(ADest)
+    - Length('/r/') - Length('/leaf.txt')) + '/leaf.txt';
+end;
+
+procedure TExtractFailureModes.TestMixedCaseDirectoryLinkFailsBeforeWriting;
+{ Windows resolves the link target 'R' to the stored directory 'r' and
+  copies its tree below the longer alias, so the check must match paths the
+  way the file system does. }
+var
+  Archive, Dest: string;
+begin
+  Archive := FScratch + '/mixed-case-link.tar.gz';
+  Dest := ExpandFileName(FScratch + '/mixed-case-link-out');
+  ForceDirectories(Dest);
+  WriteBytesToFile(Archive, Gzip(BuildTar([
+    MakeRegularFileEntry('top/first.txt', BytesOf('written first')),
+    MakeDirectoryEntry('top/r'),
+    MakeGnuLongNameRegularFileEntry('top/r/' + DeepLeafBelowR(Dest),
+      BytesOf('deep')),
+    MakeSymlinkEntry('top/' + StringOfChar('a', 100), 'R')
+  ])));
+
+  Expect<Boolean>(Pos('too long', ExtractErrorMessage(Archive, Dest)) > 0)
+    .ToBe(True);
+  Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
+end;
+
+procedure TExtractFailureModes.TestLinkThroughReplacedFileFailsBeforeWriting;
+{ The link 'a -> r' replaces the stored file 'a' with a copy of r's tree;
+  the later 'long-alias -> a' then copies that tree again below the longer
+  alias, past the limit. }
+var
+  Archive, Dest: string;
+begin
+  Archive := FScratch + '/replaced-file-link.tar.gz';
+  Dest := ExpandFileName(FScratch + '/replaced-file-link-out');
+  ForceDirectories(Dest);
+  WriteBytesToFile(Archive, Gzip(BuildTar([
+    MakeRegularFileEntry('top/first.txt', BytesOf('written first')),
+    MakeRegularFileEntry('top/a', BytesOf('replaced by the link')),
+    MakeDirectoryEntry('top/r'),
+    MakeGnuLongNameRegularFileEntry('top/r/' + DeepLeafBelowR(Dest),
+      BytesOf('deep')),
+    MakeSymlinkEntry('top/a', 'r'),
+    MakeSymlinkEntry('top/' + StringOfChar('l', 100), 'a')
+  ])));
+
+  Expect<Boolean>(Pos('too long', ExtractErrorMessage(Archive, Dest)) > 0)
+    .ToBe(True);
+  Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
+end;
+
 procedure TExtractFailureModes.TestOverlongNameComponentFailsBeforeWriting;
 { A 256-character file name is past every platform's component limit even
   though the whole path is short; moving the project cannot fix it. }
@@ -798,6 +855,19 @@ begin
     + 'is written', TestDirectoryLinkAliasFailsBeforeWriting);
   Test('an over-long entry name component fails before any entry is written',
     TestOverlongNameComponentFailsBeforeWriting);
+  {$IFDEF MSWINDOWS}
+  Test('a directory link naming its target in another case is checked '
+    + 'before any entry is written',
+    TestMixedCaseDirectoryLinkFailsBeforeWriting);
+  {$ELSE}
+  Skip('a directory link naming its target in another case is checked '
+    + 'before any entry is written',
+    TestMixedCaseDirectoryLinkFailsBeforeWriting,
+    'LWPT treats archive paths case-sensitively outside Windows');
+  {$ENDIF}
+  Test('a link through a file replaced by a directory link is checked '
+    + 'before any entry is written',
+    TestLinkThroughReplacedFileFailsBeforeWriting);
   Test('tar truncated mid-entry raises or extracts nothing',
     TestTarTruncatedMidEntryRaises);
   Test('archive entry with parent traversal is rejected',
