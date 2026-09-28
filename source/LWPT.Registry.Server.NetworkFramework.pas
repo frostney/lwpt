@@ -1381,8 +1381,11 @@ procedure TNetworkFrameworkRegistryServer.Run;
 var
   Index: Integer;
 begin
-  WriteLn('registry origin ', FStore.Config.Identity, ' listening at ',
+  WriteLn('registry ', FStore.Config.Identity, ' listening at ',
     FStore.Config.BaseURL);
+  { Announce the bound listener promptly, even when stdout is a pipe, so a
+    supervisor can tell that this process owns the configured port. }
+  Flush(Output);
   while not FStopping do
   begin
     if Assigned(FStopFlag) and FStopFlag^ then Break;

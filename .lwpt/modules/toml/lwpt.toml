@@ -6,12 +6,11 @@
 # inside LWPT, and shipping them inside the package keeps the unit
 # fully self-contained.
 #
-# No tests bundled yet — TOML is exercised heavily via
-# LWPT.Core.Test.pas's manifest-loading suite (round-trip tests
-# against the parser's output). Dedicated unit tests inside the
-# package land later.
+# Manifest round-tripping is exercised through LWPT.Core.Test.pas.
+# source/TOML.Test.pas owns the parser's structural depth and node
+# limits for untrusted documents.
 
 [package]
 name    = "toml"
-version = "0.1.1"
+version = "0.2.1"
 units   = ["source"]

@@ -41,6 +41,7 @@ uses
   {$ENDIF}
   Classes,
   Process,
+  SyncObjs,
   SysUtils,
   TestingPascalLibrary,
   HTTPClient,
@@ -63,11 +64,14 @@ type
   public
     procedure SetupTests; override;
     procedure TestSimpleResponseBodyStartsWithNul;
+    procedure TestConnectAddressKeepsURLAuthority;
     procedure TestSimpleResponseBodyInterspersedNul;
     procedure TestChunkedResponseChunkStartsWithNul;
     procedure TestChunkedResponseMultipleChunksWithNul;
     procedure TestLargeBodyForcesMultiRecv;
     procedure TestSegmentedWritesPreserveNul;
+    procedure TestHostnamePreservesBodyAndHost;
+    procedure TestConcurrentHostnameRequests;
   end;
 
   THTTPClientResourceBounds = class(TTestSuite)
@@ -349,6 +353,117 @@ begin
   Result := Copy(ARequest, HeaderEnd, Length(ARequest) - HeaderEnd);
 end;
 
+const
+  { Hostname cases go through the system resolver, whose first lookup on a
+    loaded Windows runner can take longer than a second. The deadline under
+    test lives in the resource-bounds suite, so these cases only need a
+    bound; the child-process watchdog still catches a blocked resolver. }
+  HostnameDeadlineMs = 10000;
+  { Two sequential lookups plus cold child startup. }
+  HostnameWatchdogMs = 2 * HostnameDeadlineMs
+    + MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS;
+
+type
+  THostnameRequest = class(TThread)
+  private
+    FURL: string;
+    FGate: TEvent;
+  protected
+    procedure Execute; override;
+  public
+    Response: THTTPResponse;
+    ErrorMessage: string;
+    constructor Create(const AURL: string; AGate: TEvent);
+  end;
+
+constructor THostnameRequest.Create(const AURL: string; AGate: TEvent);
+begin
+  inherited Create(True);
+  FURL := AURL;
+  FGate := AGate;
+end;
+
+procedure THostnameRequest.Execute;
+begin
+  try
+    if FGate.WaitFor(HostnameDeadlineMs) <> wrSignaled then
+      raise Exception.Create('hostname request start gate timed out');
+    Response := HTTPGet(FURL, nil,
+      TestOptions(1024, 4096, HostnameDeadlineMs));
+  except
+    on E: Exception do ErrorMessage := E.Message;
+  end;
+end;
+
+procedure RunHostnameRequests(const AConcurrent: Boolean);
+const
+  CRLF = #13#10;
+var
+  Mocks: array[0..3] of TMockHTTPServer;
+  Requests: array[0..3] of THostnameRequest;
+  Gate: TEvent;
+  Body: TBytes;
+  Response: THTTPResponse;
+  Host: string;
+  I, Count: Integer;
+begin
+  FillChar(Mocks, SizeOf(Mocks), 0);
+  FillChar(Requests, SizeOf(Requests), 0);
+  Gate := TEvent.Create(nil, True, False, '');
+  Count := 2;
+  if AConcurrent then Count := Length(Mocks);
+  try
+    for I := 0 to Count - 1 do
+    begin
+      Body := MakeBytes([$00, $ff, Byte(I), $7f]);
+      Mocks[I] := TMockHTTPServer.Create(BuildSimpleResponse(Body));
+      Mocks[I].Start;
+      Host := 'localhost';
+      if not AConcurrent and (I = 0) then Host := '127.0.0.1';
+      if AConcurrent then
+      begin
+        Requests[I] := THostnameRequest.Create('http://' + Host + ':'
+          + IntToStr(Mocks[I].Port) + '/x', Gate);
+        Requests[I].Start;
+      end
+      else
+      begin
+        Response := HTTPGet('http://' + Host + ':' + IntToStr(Mocks[I].Port)
+          + '/x', nil, TestOptions(1024, 4096, HostnameDeadlineMs));
+        Mocks[I].WaitDone;
+        Expect<Integer>(Response.StatusCode).ToBe(200);
+        Expect<string>(BytesToHex(Response.Body)).ToBe(BytesToHex(Body));
+        Expect<Boolean>(Pos(CRLF + 'Host: ' + Host + ':'
+          + IntToStr(Mocks[I].Port) + CRLF,
+          RequestHeaderText(Mocks[I].ReceivedRequest)) > 0).ToBe(True);
+      end;
+    end;
+    if AConcurrent then
+    begin
+      Gate.SetEvent;
+      for I := 0 to Count - 1 do
+      begin
+        { The child-process watchdog also bounds a blocked native resolver. }
+        Requests[I].WaitFor;
+        if Requests[I].ErrorMessage <> '' then
+          raise Exception.Create(Requests[I].ErrorMessage);
+        Mocks[I].WaitDone;
+        Expect<Integer>(Requests[I].Response.StatusCode).ToBe(200);
+        Expect<string>(BytesToHex(Requests[I].Response.Body)).ToBe(
+          BytesToHex(MakeBytes([$00, $ff, Byte(I), $7f])));
+        Expect<Boolean>(Pos(CRLF + 'Host: localhost:'
+          + IntToStr(Mocks[I].Port) + CRLF,
+          RequestHeaderText(Mocks[I].ReceivedRequest)) > 0).ToBe(True);
+      end;
+    end;
+  finally
+    Gate.SetEvent;
+    for I := 0 to High(Requests) do Requests[I].Free;
+    for I := 0 to High(Mocks) do Mocks[I].Free;
+    Gate.Free;
+  end;
+end;
+
 function RedirectResponse(const AStatusCode: Integer;
   const ALocation: string): TBytes;
 const
@@ -398,6 +513,11 @@ procedure RunMockLifecycleChild(const AScenario: string);
 var
   Mock: TMockHTTPServer;
 begin
+  if (AScenario = 'hostname') or (AScenario = 'hostname-concurrent') then
+  begin
+    RunHostnameRequests(AScenario = 'hostname-concurrent');
+    Exit;
+  end;
   Mock := TMockHTTPServer.Create(nil);
   try
     Mock.Start;
@@ -436,13 +556,8 @@ begin
     AChild.WaitOnExit;
     Exit;
   end;
-  AChild.Terminate(1);
-  if AChild.WaitOnExit(MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS)
-     or not AChild.Running then
-  begin
-    AChild.WaitOnExit;
-    Exit;
-  end;
+  { FPC's Unix Terminate waits without a deadline; kill through the native
+    nonblocking primitive before entering the bounded reap path. }
   ForceKillMockLifecycleChild(AChild);
   if not AChild.WaitOnExit(MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS)
      and AChild.Running then
@@ -450,7 +565,8 @@ begin
   AChild.WaitOnExit;
 end;
 
-procedure RunBoundedMockLifecycleChild(const AScenario: string);
+procedure RunBoundedMockLifecycleChild(const AScenario: string;
+  const ATimeoutMilliseconds: QWord = MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS);
 var
   Child: TProcess;
   StartedAt: QWord;
@@ -464,8 +580,7 @@ begin
     Child.Execute;
     StartedAt := GetTickCount64;
     while Child.Running and
-      (GetTickCount64 - StartedAt <
-        MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS) do
+      (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do
       Sleep(10);
     TimedOut := Child.Running;
     if TimedOut then StopMockLifecycleChild(Child)
@@ -1283,8 +1398,47 @@ begin
     TestTLSHandshakeDeadlineRejectsIdlePeer);
 end;
 
+procedure THTTPClientByteFetch.TestConnectAddressKeepsURLAuthority;
+var
+  Mock: TMockHTTPServer;
+  Options: THTTPRequestOptions;
+  Response: THTTPResponse;
+  Diagnostic: string;
+begin
+  Mock := TMockHTTPServer.Create(BuildSimpleResponse(MakeBytes([$00, $01])));
+  try
+    Mock.Start;
+    Options := TestOptions(1024, 4096, 1000);
+    Options.ConnectAddress := '127.0.0.1';
+    { The reserved name never resolves; only the pinned address is used. }
+    Response := HTTPGet('http://registry.invalid:' + IntToStr(Mock.Port) + '/x',
+      nil, Options);
+    Mock.WaitDone;
+    Expect<Integer>(Response.StatusCode).ToBe(200);
+    Expect<Boolean>(Pos(#13#10 + 'Host: registry.invalid:' + IntToStr(Mock.Port) + #13#10,
+      RequestHeaderText(Mock.ReceivedRequest)) > 0).ToBe(True);
+  finally
+    Mock.Free;
+  end;
+  Options := TestOptions(1024, 4096, 1000);
+  Options.ConnectAddress := '::1';
+  Diagnostic := '';
+  try
+    HTTPGet('http://registry.invalid/x', nil, Options);
+  except
+    on E: EHTTPError do Diagnostic := E.Message;
+  end;
+  Expect<Boolean>(Pos('connect address', Diagnostic) > 0).ToBe(True);
+end;
+
 procedure THTTPClientByteFetch.SetupTests;
 begin
+  Test('a pinned connect address keeps the URL authority',
+    TestConnectAddressKeepsURLAuthority);
+  Test('hostname resolution preserves binary body and original Host header',
+    TestHostnamePreservesBodyAndHost);
+  Test('concurrent hostname requests retain independent results',
+    TestConcurrentHostnameRequests);
   Test('simple response: body starts with #0 (header-accumulation path)',
     TestSimpleResponseBodyStartsWithNul);
   Test('simple response: #0 interspersed in body',
@@ -1297,6 +1451,16 @@ begin
     TestLargeBodyForcesMultiRecv);
   Test('one-byte server writes preserve embedded #0 bytes',
     TestSegmentedWritesPreserveNul);
+end;
+
+procedure THTTPClientByteFetch.TestHostnamePreservesBodyAndHost;
+begin
+  RunBoundedMockLifecycleChild('hostname', HostnameWatchdogMs);
+end;
+
+procedure THTTPClientByteFetch.TestConcurrentHostnameRequests;
+begin
+  RunBoundedMockLifecycleChild('hostname-concurrent', HostnameWatchdogMs);
 end;
 
 { ── destination policy ─────────────────────────────────────────────── }
