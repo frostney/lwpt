@@ -342,6 +342,7 @@ var
   Scratch, Directory: string;
   Child: TChild;
   Iteration: Integer;
+  StartedAt: QWord;
 begin
   { Poll without sleeping so the first observed exit is the earliest one
     the platform reports. Native Windows publishes that exit before the
@@ -354,7 +355,11 @@ begin
     Child := TChild.Create(ExpandFileName(ParamStr(0)), Directory,
       Scratch + '/worker-state', [ChildArgument, 'exit', Scratch]);
     try
-      while Child.Running do;
+      StartedAt := GetTickCount64;
+      while Child.Running do
+        if GetTickCount64 - StartedAt >= ChildMilliseconds then
+          raise Exception.CreateFmt('child did not exit within %d ms',
+            [ChildMilliseconds]);
       Expect<Integer>(Child.Status).ToBe(0);
       Expect<Boolean>(RemoveDir(Directory)).ToBe(True);
     finally
