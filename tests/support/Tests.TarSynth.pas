@@ -70,6 +70,9 @@ function MakeDirectoryEntry(const APath: string): TBytes;
 function MakeGnuLongNameRegularFileEntry(const ALongPath: string;
   const AData: TBytes): TBytes;
 
+{ The same GNU 'L' shape for a directory entry (typeflag '5'). }
+function MakeGnuLongNameDirectoryEntry(const ALongPath: string): TBytes;
+
 { Concatenate any number of entries, append the two end-of-archive
   zero blocks, return the complete raw tar. }
 function BuildTar(const AEntries: TByteArrays): TBytes;
@@ -304,8 +307,8 @@ begin
   Result := HdrBytes;
 end;
 
-function MakeGnuLongNameRegularFileEntry(const ALongPath: string;
-  const AData: TBytes): TBytes;
+function MakeGnuLongNameEntry(const ALongPath: string;
+  const AData: TBytes; const AMode: Integer; const ATypeFlag: Char): TBytes;
 var
   LongHdr, FileHdr: array[0..TAR_BLOCK - 1] of Byte;
   LongHdrBytes, FileHdrBytes, NamePayload: TBytes;
@@ -339,7 +342,7 @@ begin
     StubName := Copy(ALongPath, 1, 100)
   else
     StubName := ALongPath;
-  StampHeader(FileHdr, StubName, '', '', $1A4, Length(AData), '0');
+  StampHeader(FileHdr, StubName, '', '', AMode, Length(AData), ATypeFlag);
   SetLength(FileHdrBytes, TAR_BLOCK);
   for i := 0 to TAR_BLOCK - 1 do FileHdrBytes[i] := FileHdr[i];
 
@@ -349,6 +352,17 @@ begin
     FileHdrBytes,
     PadToBlock(AData)
   ]);
+end;
+
+function MakeGnuLongNameRegularFileEntry(const ALongPath: string;
+  const AData: TBytes): TBytes;
+begin
+  Result := MakeGnuLongNameEntry(ALongPath, AData, $1A4, '0');
+end;
+
+function MakeGnuLongNameDirectoryEntry(const ALongPath: string): TBytes;
+begin
+  Result := MakeGnuLongNameEntry(ALongPath, nil, $1ED, '5');
 end;
 
 function BuildTar(const AEntries: TByteArrays): TBytes;

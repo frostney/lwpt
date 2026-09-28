@@ -63,6 +63,7 @@ type
     procedure TestLegacyTagCannotBecomeMovableBranch;
     procedure TestSurvivingTagWinsOverSameNamedBranch;
     procedure TestOfflineSharedCandidateIsCheckedBeforeExtraction;
+    procedure TestDeepProjectRootExtractsArchive;
   end;
 
 const
@@ -1400,6 +1401,58 @@ begin
     .ToBe(True);
 end;
 
+function LockValue(const ALockText, AKey: string): string;
+var Lines: TStringList; LineIndex: Integer;
+begin
+  Result := '';
+  Lines := TStringList.Create;
+  try
+    Lines.Text := ALockText;
+    for LineIndex := 0 to Lines.Count - 1 do
+      if Pos(AKey + ' = ', Lines[LineIndex]) = 1 then
+        Exit(Copy(Lines[LineIndex], Length(AKey) + 4, MaxInt));
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TInstallGitGraph.TestDeepProjectRootExtractsArchive;
+{ Issue #309: archives were opened through paszlib's gzopen, whose
+  shortstring path truncated anything over 255 characters, so every
+  archive-backed install from a deep checkout failed with "Could not open
+  gzip compressed file". }
+var
+  ShallowRoot, ShallowLock, Root, ArchivePath: string;
+  Run: TLwptResult;
+begin
+  PrepareOfflineSeed('deep-root-reference', ShallowRoot, ShallowLock);
+  Expect<Boolean>(LockValue(ShallowLock, 'computedHash') <> '').ToBe(True);
+
+  FCacheRoot := FScratch + '/deep-root-cache';
+  RecursiveDelete(FCacheRoot);
+  Root := ExpandFileName(FScratch + '/deep-root/' + StringOfChar('d', 100)
+    + '/' + StringOfChar('e', 100) + '/project');
+  ArchivePath := Root + '/.lwpt/archives/shared-v1.0.0.tar.gz';
+  { Fixture precondition: even the committed archive path, the shortest
+    one install extracts from, is past the old limit. }
+  Expect<Boolean>(Length(ArchivePath) > 255).ToBe(True);
+  WriteRoot(Root, 'deep-root', 'shared = "fixture/shared@^1.0.0"'#10);
+
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('deep project root install', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(FileExists(ArchivePath)).ToBe(True);
+  Expect<string>(ReadBinaryFile(Root
+    + '/.lwpt/modules/shared/source/shared.pas')).ToBe(
+    'unit shared;'#10 + 'interface'#10 + 'implementation'#10 + 'end.'#10);
+  Expect<string>(LockValue(ReadBinaryFile(Root + '/lwpt.lock'),
+    'computedHash')).ToBe(LockValue(ShallowLock, 'computedHash'));
+
+  Run := RunInstall(Root, ['install', '--frozen']);
+  DumpRunFailure('deep project root frozen install', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+end;
+
 procedure TInstallGitGraph.SetupTests;
 begin
   Test('multi-round SemVer graph rejects pairwise overlap with '
@@ -1467,6 +1520,14 @@ begin
   Test('offline reuse of another dependency''s staged archive is checked '
     + 'against the lock before extraction',
     TestOfflineSharedCandidateIsCheckedBeforeExtraction);
+  {$IFDEF MSWINDOWS}
+  Skip('a project root whose archive path exceeds 255 characters installs '
+    + 'the same tree as a shallow root', TestDeepProjectRootExtractsArchive,
+    'the project root exceeds legacy Windows MAX_PATH');
+  {$ELSE}
+  Test('a project root whose archive path exceeds 255 characters installs '
+    + 'the same tree as a shallow root', TestDeepProjectRootExtractsArchive);
+  {$ENDIF}
 end;
 
 begin
