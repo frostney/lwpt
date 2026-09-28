@@ -47,6 +47,8 @@ type
     procedure BootstrapConsumesMultipleRotationPages;
     procedure ByteBudgetsAreMirrorInitOptions;
     procedure ReadinessRequiresServedCheckpoint;
+    procedure OriginStartRecoversFromPortCollision;
+    procedure MirrorStartProvesListenerOwnership;
   end;
 
 function ReadBytes(const APath: string): TBytes;
@@ -143,7 +145,7 @@ begin
   Port := Copy(FMirrorURL, Length('http://localhost:') + 1, MaxInt);
   Port := Copy(Port, 1, Pos('/', Port) - 1);
   Result := RunLwpt(['registry', 'init', '--role', 'mirror', '--data-dir', FMirrorRoot,
-    '--identity', FOrigin.BaseURL, '--base-url', FMirrorURL, '--port', Port,
+    '--identity', FOrigin.Identity, '--base-url', FMirrorURL, '--port', Port,
     '--upstream', Upstream, '--key-id', AKeyID, '--public-key', APublicKey]);
 end;
 
@@ -174,7 +176,7 @@ begin
   RequireSuccess('mirror verify during outage', Run);
   Expect<Boolean>(Pos('freshness = "fresh"', Run.Stdout) > 0).ToBe(True);
   Expect<Boolean>(Pos('last_successful_sync = "', Run.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos(FOrigin.BaseURL, Run.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(FOrigin.Identity, Run.Stdout) > 0).ToBe(True);
   StopRegistryCLI(FMirrorServer);
   FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
   Expect<string>(Text(RegistryHTTPBody(ArtifactURL))).ToBe(Text(Archive));
@@ -199,7 +201,7 @@ var
   function InitClient(const ARoot, AUpstream: string): TLwptResult;
   begin
     Result := RunLwpt(['registry', 'init', '--role', 'mirror', '--data-dir', ARoot,
-      '--identity', FOrigin.BaseURL, '--base-url', ClientURL, '--port', IntToStr(Port),
+      '--identity', FOrigin.Identity, '--base-url', ClientURL, '--port', IntToStr(Port),
       '--upstream', AUpstream, '--key-id', FOrigin.KeyID, '--public-key', FOrigin.PublicKey]);
   end;
 
@@ -235,7 +237,7 @@ begin
     RunLwpt(['registry', 'sync', '--data-dir', ClientRoot]));
   Run := RunLwpt(['registry', 'verify', '--data-dir', ClientRoot]);
   RequireSuccess('second mirror verifies retained origin proof and artifact', Run);
-  Expect<Boolean>(Pos('origin = "' + FOrigin.BaseURL + '"', Run.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('origin = "' + FOrigin.Identity + '"', Run.Stdout) > 0).ToBe(True);
   Expect<string>(RegistryArtifactHash(ReadBytes(ClientRoot + '/objects/sha256/'
     + Copy(ArtifactHash, 8, 64)))).ToBe(ArtifactHash);
   Expect<string>(Field(Text(ReadBytes(ClientRoot + '/state/current.toml')), 'checkpoint_hash'))
@@ -597,7 +599,7 @@ var
   function InitWith(const AStore, ASync: string): TLwptResult;
   begin
     Result := RunLwpt(['registry', 'init', '--role', 'mirror', '--data-dir', FMirrorRoot,
-      '--identity', FOrigin.BaseURL, '--base-url', FMirrorURL, '--port', Port,
+      '--identity', FOrigin.Identity, '--base-url', FMirrorURL, '--port', Port,
       '--upstream', FOrigin.BaseURL, '--key-id', FOrigin.KeyID,
       '--public-key', FOrigin.PublicKey, '--max-store-bytes', AStore,
       '--max-sync-bytes', ASync]);
@@ -655,6 +657,66 @@ begin
   end;
 end;
 
+function URLPort(const AURL: string): Word;
+var
+  Authority: string;
+begin
+  Authority := Copy(AURL, Pos('://', AURL) + 3, MaxInt);
+  if Pos('/', Authority) > 0 then Authority := Copy(Authority, 1, Pos('/', Authority) - 1);
+  Result := StrToInt(Copy(Authority, Pos(':', Authority) + 1, MaxInt));
+end;
+
+procedure TRegistryMirrorE2E.OriginStartRecoversFromPortCollision;
+var
+  Occupier: TRegistryTestServer;
+  BaseBefore: string;
+begin
+  FOrigin.Publish('package', '1.0.0', BytesOf('archive'));
+  { Another listener takes the origin's configured port before it starts. }
+  BaseBefore := FOrigin.BaseURL;
+  Occupier := TRegistryTestServer.Create(nil, True, URLPort(BaseBefore));
+  try
+    FOrigin.Start;
+    Expect<Boolean>(FOrigin.BaseURL <> BaseBefore).ToBe(True);
+    Expect<Boolean>(Pos('base_url = "' + FOrigin.BaseURL + '"', Text(RegistryHTTPBody(
+      FOrigin.BaseURL + '/.well-known/' + RegistryProgramName + '-registry'))) > 0).ToBe(True);
+    Expect<Integer>(Occupier.RequestCount).ToBe(0);
+    { The identity pinned by mirrors is unchanged by relocation. }
+    RequireSuccess('mirror init against the relocated origin',
+      InitMirror(FOrigin.KeyID, FOrigin.PublicKey));
+    RequireSuccess('sync from the relocated origin', Sync);
+  finally
+    Occupier.Free;
+  end;
+end;
+
+procedure TRegistryMirrorE2E.MirrorStartProvesListenerOwnership;
+var
+  Impostor: TRegistryTestServer;
+  Routes: TRegistryHTTPRouteArray;
+  URLBefore: string;
+begin
+  FOrigin.Start;
+  RequireSuccess('uninitialized mirror init', InitMirror(FOrigin.KeyID, FOrigin.PublicKey));
+  { A listener on the never-synchronized mirror's port answers discovery
+    with the mirror's own base URL; it must not be mistaken for the mirror. }
+  URLBefore := FMirrorURL;
+  SetLength(Routes, 1);
+  Routes[0] := RegistryRoute('/mirror/.well-known/' + RegistryProgramName + '-registry',
+    'application/vnd.' + RegistryProgramName + '.registry-discovery+toml',
+    BytesOf('base_url = "' + URLBefore + '"' + #10));
+  Impostor := TRegistryTestServer.Create(Routes, True, URLPort(URLBefore));
+  try
+    Impostor.Start;
+    FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
+    Expect<Boolean>(FMirrorURL <> URLBefore).ToBe(True);
+    Expect<Boolean>(Pos('role = "mirror"', Text(RegistryHTTPBody(
+      FMirrorURL + '/.well-known/' + RegistryProgramName + '-registry'))) > 0).ToBe(True);
+  finally
+    Impostor.Free;
+  end;
+end;
+
 procedure TRegistryMirrorE2E.SetupTests;
 begin
   Test('CLI mirror bootstrap survives origin outage and restart', BootstrapOutageAndRestart);
@@ -669,6 +731,8 @@ begin
   Test('bootstrap consumes multiple bounded rotation pages with exact signed bytes', BootstrapConsumesMultipleRotationPages);
   Test('byte budgets are validated mirror init options', ByteBudgetsAreMirrorInitOptions);
   Test('readiness requires the listener to serve this data directory', ReadinessRequiresServedCheckpoint);
+  Test('an origin start recovers from a port collision with a new port', OriginStartRecoversFromPortCollision);
+  Test('an uninitialized mirror start proves it owns its listener', MirrorStartProvesListenerOwnership);
 end;
 
 begin

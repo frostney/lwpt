@@ -1432,6 +1432,9 @@ begin
         'could not listen on the configured registry socket');
     WriteLn('registry ', FStore.Config.Identity, ' listening at ',
       FStore.Config.BaseURL);
+    { Announce the bound listener promptly, even when stdout is a pipe, so a
+      supervisor can tell that this process owns the configured port. }
+    Flush(Output);
     while not FStopping do
     begin
       ReapClients;

@@ -62,8 +62,9 @@ type
     procedure ServeClient(const AClient: TRegistryTestSocket);
     function StopRequested: Boolean;
   public
+    { APort 0 lets the kernel choose; a fixed port lets a test occupy it. }
     constructor Create(const ARoutes: TRegistryHTTPRouteArray;
-      const AConcurrent: Boolean = False);
+      const AConcurrent: Boolean = False; const APort: Word = 0);
     destructor Destroy; override;
     procedure SetRoutes(const ARoutes: TRegistryHTTPRouteArray);
     procedure Start;
@@ -328,7 +329,8 @@ begin
 end;
 
 constructor TRegistryTestServer.Create(
-  const ARoutes: TRegistryHTTPRouteArray; const AConcurrent: Boolean);
+  const ARoutes: TRegistryHTTPRouteArray; const AConcurrent: Boolean;
+  const APort: Word);
 var
   Addr: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
   AddrLength: LongInt;
@@ -361,7 +363,7 @@ begin
   Addr.sin_family := AF_INET;
   {$IFDEF UNIX}
   Addr.sin_addr := StrToNetAddr('127.0.0.1');
-  Addr.sin_port := htons(0);
+  Addr.sin_port := htons(APort);
   if fpBind(FListenSocket, @Addr, SizeOf(Addr)) <> 0 then
     raise Exception.Create('registry test server bind failed');
   if fpListen(FListenSocket, 16) <> 0 then
@@ -373,7 +375,7 @@ begin
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Addr.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
-  Addr.sin_port := WinSock2.htons(0);
+  Addr.sin_port := WinSock2.htons(APort);
   if WinSock2.bind(FListenSocket, PSockAddr(@Addr), SizeOf(Addr)) <> 0 then
     raise Exception.Create('registry test server bind failed');
   if WinSock2.listen(FListenSocket, 16) <> 0 then

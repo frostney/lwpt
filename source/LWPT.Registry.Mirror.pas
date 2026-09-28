@@ -41,7 +41,7 @@ type
     FTransferStats: TRegistryMirrorTransferStats;
     FBeforeActivate: TSHA256Progress;
     FBeforeGenerationLock, FBeforeGenerationBuild: TSHA256Progress;
-    FDeadlineProbe, FBeforeReplace: TSHA256Progress;
+    FDeadlineProbe, FBeforeReplace, FAfterAdoption: TSHA256Progress;
     FSynchronizationMilliseconds: QWord;
     {$ENDIF}
     function Trust: TLWPTRegistryTrust;
@@ -98,6 +98,9 @@ procedure RegistryMirrorGenerationHooksForTesting(AMirror: TLWPTRegistryMirror;
   ABeforeReplace runs after the new pointer is staged, before its gate. }
 procedure RegistryMirrorActivationHooksForTesting(AMirror: TLWPTRegistryMirror;
   ADeadlineProbe, ABeforeReplace: TSHA256Progress);
+{ Runs after each verified archive is adopted into the object store. }
+procedure RegistryMirrorAdoptionHookForTesting(AMirror: TLWPTRegistryMirror;
+  AAfterAdoption: TSHA256Progress);
 { Lowers max_store_bytes to the bytes already accounted plus AHeadroom. }
 procedure RegistryMirrorStoreHeadroomForTesting(AMirror: TLWPTRegistryMirror;
   const AHeadroom: Int64);
@@ -163,6 +166,12 @@ procedure RegistryMirrorActivationHooksForTesting(AMirror: TLWPTRegistryMirror;
 begin
   AMirror.FDeadlineProbe := ADeadlineProbe;
   AMirror.FBeforeReplace := ABeforeReplace;
+end;
+
+procedure RegistryMirrorAdoptionHookForTesting(AMirror: TLWPTRegistryMirror;
+  AAfterAdoption: TSHA256Progress);
+begin
+  AMirror.FAfterAdoption := AAfterAdoption;
 end;
 
 procedure RegistryMirrorStoreHeadroomForTesting(AMirror: TLWPTRegistryMirror;
@@ -460,16 +469,42 @@ begin
   WriteImmutable(ARelative, ABytes);
 end;
 
+{ Empties ADirectory entry by entry, reporting progress for each one. Links
+  are removed, never followed. }
+procedure ClearDirectory(const ADirectory: string; const AProgress: TSHA256Progress);
+var
+  Search: TSearchRec;
+  Path: string;
+begin
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ADirectory) + '*',
+    faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    repeat
+      if Assigned(AProgress) then AProgress;
+      if (Search.Name = '.') or (Search.Name = '..') then Continue;
+      Path := IncludeTrailingPathDelimiter(ADirectory) + Search.Name;
+      if ((Search.Attr and faDirectory) <> 0) and ((Search.Attr and faSymLink) = 0) then
+      begin
+        ClearDirectory(Path, AProgress);
+        RemoveDir(Path);
+      end
+      else DeleteFile(Path);
+    until SysUtils.FindNext(Search) <> 0;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
+
 function DirectoryBytes(const ADirectory: string; const AProgress: TSHA256Progress): Int64;
 var
   Search: TSearchRec;
 begin
   Result := 0;
-  if Assigned(AProgress) then AProgress;
   if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ADirectory) + '*',
     faAnyFile or faSymLink, Search) <> 0 then Exit;
   try
     repeat
+      if Assigned(AProgress) then AProgress;
       if (Search.Name = '.') or (Search.Name = '..')
         or ((Search.Attr and faSymLink) <> 0) then Continue;
       if (Search.Attr and faDirectory) <> 0 then
@@ -524,7 +559,7 @@ end;
 
 procedure TLWPTRegistryMirror.PrepareStorageBudget(AAccepted: TLWPTRegistryGeneration);
 begin
-  if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
+  ClearDirectory(TmpRoot, CheckSynchronizationDeadline);
   ForceDirectories(TmpRoot);
   FAttemptWritten := 0;
   FStoreUsed := DirectoryBytes(Root, CheckSynchronizationDeadline);
@@ -636,31 +671,39 @@ begin
       {$ENDIF}
       { Join every active request even after failure. Successful siblings are
         immutable retry material, never permission to activate a partial head. }
-      { Adopt verified buffers only while the synchronization budget holds. }
-      try
-        CheckSynchronizationDeadline;
-      except
-        on E: Exception do Failure := E.Message;
-      end;
-      if Failure = '' then
-        for I := 0 to Admitted - 1 do
-        begin
-          if Assigned(Workers[I].FatalException) then
+      { Adopt each verified buffer only while the synchronization budget
+        holds; once it expires, no later sibling is adopted. A failed sibling
+        does not prevent adopting the others as retry material. }
+      for I := 0 to Admitted - 1 do
+      begin
+        try
+          CheckSynchronizationDeadline;
+        except
+          on E: Exception do
           begin
-            if Failure = '' then Failure := 'registry_archive_worker_failed: '
-              + Workers[I].FatalException.ClassName;
-          end
-          else if Workers[I].Error <> '' then
-          begin
-            if Failure = '' then Failure := Workers[I].Error;
-          end
-          else
-            try
-              WriteImmutable(ObjectPath(Workers[I].FPackage.ArchiveHash), Workers[I].Archive);
-            except
-              on E: Exception do if Failure = '' then Failure := E.Message;
-            end;
+            Failure := E.Message;
+            Break;
+          end;
         end;
+        if Assigned(Workers[I].FatalException) then
+        begin
+          if Failure = '' then Failure := 'registry_archive_worker_failed: '
+            + Workers[I].FatalException.ClassName;
+        end
+        else if Workers[I].Error <> '' then
+        begin
+          if Failure = '' then Failure := Workers[I].Error;
+        end
+        else
+          try
+            WriteImmutable(ObjectPath(Workers[I].FPackage.ArchiveHash), Workers[I].Archive);
+            {$IFDEF REGISTRY_TESTING}
+            if Assigned(FAfterAdoption) then FAfterAdoption;
+            {$ENDIF}
+          except
+            on E: Exception do if Failure = '' then Failure := E.Message;
+          end;
+      end;
     finally
       for I := 0 to Admitted - 1 do
       begin
@@ -966,7 +1009,8 @@ procedure TLWPTRegistryMirror.BeginAttempt;
 begin
   { The record and its staged replacement need headroom before the first
     write; without it the attempt stops without writing anything. }
-  if 2 * MirrorAttemptRecordBytes > Config.StoreBudgetBytes - DirectoryBytes(Root, nil) then
+  if 2 * MirrorAttemptRecordBytes > Config.StoreBudgetBytes
+    - DirectoryBytes(Root, CheckSynchronizationDeadline) then
     raise ELWPTRegistryError.CreateStable('mirror_store_budget_exceeded',
       'the data directory has no room for an attempt record under max_store_bytes');
   FAttemptID := NewAttemptID;
@@ -1094,13 +1138,15 @@ begin
     Lease := Coordinator.TryAcquire('registry-publication', 'registry mirror synchronization');
     if not Assigned(Lease) then
       raise ELWPTRegistryError.CreateStable('publication_locked', 'another synchronization owns this mirror');
+    { The budget starts before the first directory scan, so initial
+      accounting, cleanup, and the attempt record are all inside it. }
+    FSynchronizationDeadline := GetTickCount64 + MirrorSynchronizationMilliseconds;
+    {$IFDEF REGISTRY_TESTING}
+    if FSynchronizationMilliseconds > 0 then
+      FSynchronizationDeadline := GetTickCount64 + FSynchronizationMilliseconds;
+    {$ENDIF}
     BeginAttempt;
     try
-      FSynchronizationDeadline := GetTickCount64 + MirrorSynchronizationMilliseconds;
-      {$IFDEF REGISTRY_TESTING}
-      if FSynchronizationMilliseconds > 0 then
-        FSynchronizationDeadline := GetTickCount64 + FSynchronizationMilliseconds;
-      {$ENDIF}
       Prior := Default(TLWPTRegistryAcceptedState);
       if FileExists(RootPath('state/current.toml')) then
       begin

@@ -90,6 +90,7 @@ type
     FMirror: TLWPTRegistryMirror;
     FActivationMirror: TLWPTRegistryMirror;
     FActivationEntered, FStagedPointerSeen: Boolean;
+    FProbeCalls: Integer;
     procedure ExpireBeforeActivation;
     procedure BlockAttemptAndFail;
     procedure FailBeforeActivation;
@@ -140,6 +141,11 @@ type
     procedure ContradictoryPairStopsBeforeRetrieval;
     procedure RecoveryRecordFailureDoesNotBlockServing;
     procedure InitialAttemptRespectsStoreBudget;
+    procedure SleepAtTwoHundredthCheck;
+    procedure SleepAfterFirstAdoption;
+    procedure DeadlineCoversInitialAccounting;
+    procedure DeadlineCheckedPerDirectoryEntry;
+    procedure DeadlineCheckedBeforeEachAdoption;
   end;
 
 function Package(const ABytes: TBytes): TLWPTRegistryPackage;
@@ -1754,6 +1760,108 @@ begin
   end;
 end;
 
+procedure TMirrorTransferTests.SleepAtTwoHundredthCheck;
+begin
+  Inc(FProbeCalls);
+  if FProbeCalls = 200 then Sleep(600);
+end;
+
+procedure TMirrorTransferTests.DeadlineCoversInitialAccounting;
+var
+  Harness: TOriginHarness;
+  AttemptBefore, Outcome: string;
+  RequestsBefore: Integer;
+begin
+  Harness := TOriginHarness.Create('mirror-deadline-accounting');
+  try
+    Harness.Publish('one');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    AttemptBefore := AsText(ReadFileBytes(Harness.Mirror.Root + '/state/sync-attempt.toml'));
+    RequestsBefore := Harness.Server.RequestCount;
+    RegistryMirrorSynchronizationBudgetForTesting(Harness.Mirror, 300);
+    FActivationEntered := False;
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, SleepOnceInDeadlineCheck, nil);
+    Outcome := Harness.Sync;
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, nil, nil);
+    { The budget starts before the first directory scan, so the attempt is
+      refused before its record is written or any request is made. }
+    Expect<Boolean>(Pos('mirror_sync_deadline_exceeded:', Outcome) = 1).ToBe(True);
+    Expect<string>(AsText(ReadFileBytes(Harness.Mirror.Root + '/state/sync-attempt.toml')))
+      .ToBe(AttemptBefore);
+    Expect<Integer>(Harness.Server.RequestCount).ToBe(RequestsBefore);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.DeadlineCheckedPerDirectoryEntry;
+var
+  Harness: TOriginHarness;
+  Outcome: string;
+  RequestsBefore, Index: Integer;
+begin
+  Harness := TOriginHarness.Create('mirror-deadline-entries');
+  try
+    Harness.Publish('one');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    { Three hundred entries in one directory: only per-entry checks reach the
+      probe's two hundredth call before the first request. }
+    for Index := 1 to 300 do
+      WriteTextFile(Harness.Mirror.Root + '/objects/sha256/residue-' + IntToStr(Index), 'x');
+    RequestsBefore := Harness.Server.RequestCount;
+    RegistryMirrorSynchronizationBudgetForTesting(Harness.Mirror, 300);
+    FProbeCalls := 0;
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, SleepAtTwoHundredthCheck, nil);
+    Outcome := Harness.Sync;
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, nil, nil);
+    Expect<Boolean>(Pos('mirror_sync_deadline_exceeded:', Outcome) = 1).ToBe(True);
+    Expect<Integer>(Harness.Server.RequestCount).ToBe(RequestsBefore);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.SleepAfterFirstAdoption;
+begin
+  Inc(FProbeCalls);
+  if FProbeCalls = 1 then Sleep(2500);
+end;
+
+procedure TMirrorTransferTests.DeadlineCheckedBeforeEachAdoption;
+var
+  Harness: TOriginHarness;
+  Outcome: string;
+  Search: TSearchRec;
+  Objects: Integer;
+begin
+  Harness := TOriginHarness.Create('mirror-deadline-adoption');
+  try
+    { Two archives transfer as one pair and are adopted one by one. }
+    Harness.Publish('first');
+    Harness.Publish('second');
+    RegistryMirrorSynchronizationBudgetForTesting(Harness.Mirror, 2000);
+    FProbeCalls := 0;
+    RegistryMirrorAdoptionHookForTesting(Harness.Mirror, SleepAfterFirstAdoption);
+    Outcome := Harness.Sync;
+    RegistryMirrorAdoptionHookForTesting(Harness.Mirror, nil);
+    Expect<Integer>(FProbeCalls).ToBe(1);
+    Expect<Boolean>(Pos('mirror_sync_deadline_exceeded:', Outcome) = 1).ToBe(True);
+    Objects := 0;
+    if FindFirst(Harness.Mirror.Root + '/objects/sha256/*', faAnyFile, Search) = 0 then
+    try
+      repeat
+        if (Search.Attr and faDirectory) = 0 then Inc(Objects);
+      until FindNext(Search) <> 0;
+    finally
+      FindClose(Search);
+    end;
+    { The second verified archive is not adopted after the budget expired. }
+    Expect<Integer>(Objects).ToBe(1);
+  finally
+    Harness.Free;
+  end;
+end;
+
 procedure TMirrorTransferTests.SetupTests;
 begin
   Test('archive admission arithmetic is overflow safe', AdmissionArithmetic);
@@ -1789,6 +1897,9 @@ begin
   Test('a contradictory checkpoint and signature stop before key retrieval', ContradictoryPairStopsBeforeRetrieval);
   Test('a failing recovery record never blocks serving accepted state', RecoveryRecordFailureDoesNotBlockServing);
   Test('the initial attempt record respects the store budget', InitialAttemptRespectsStoreBudget);
+  Test('the synchronization deadline covers initial accounting', DeadlineCoversInitialAccounting);
+  Test('the synchronization deadline is checked per directory entry', DeadlineCheckedPerDirectoryEntry);
+  Test('the synchronization deadline is checked before each archive adoption', DeadlineCheckedBeforeEachAdoption);
 end;
 
 procedure RunIncompleteClient;

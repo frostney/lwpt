@@ -13,7 +13,7 @@ uses
 type
   TRegistryOriginFixture = class
   private
-    FRoot, FBaseURL, FKeyID, FPublicKey: string;
+    FRoot, FBaseURL, FIdentity, FKeyID, FPublicKey: string;
     FProcess: TProcess;
   public
     constructor Create(const ARoot: string);
@@ -22,13 +22,20 @@ type
     procedure Start;
     procedure Stop;
     property Root: string read FRoot;
+    { The current transport URL; it changes if a start relocates the port. }
     property BaseURL: string read FBaseURL;
+    { The stable origin identity, fixed at initialization. }
+    property Identity: string read FIdentity;
     property KeyID: string read FKeyID;
     property PublicKey: string read FPublicKey;
   end;
 
 function FindAvailableRegistryTestPort: Word;
-function StartRegistryCLI(const ADataDirectory, ABaseURL: string): TProcess;
+{ Starts `registry serve` and waits until this child, not another process,
+  serves ABaseURL. A port taken between selection and bind is recovered
+  deterministically: the data directory is moved to a fresh port, ABaseURL is
+  updated, and the start is retried a bounded number of times. }
+function StartRegistryCLI(const ADataDirectory: string; var ABaseURL: string): TProcess;
 procedure StopRegistryCLI(var AProcess: TProcess);
 function RegistryHTTPBody(const AURL: string): TBytes;
 function RegistryArtifactHash(const AArchive: TBytes): string;
@@ -120,62 +127,114 @@ begin
   end;
 end;
 
-function StartRegistryCLI(const ADataDirectory, ABaseURL: string): TProcess;
+const
+  RegistryStartAttempts = 5;
+  RegistryReadyMilliseconds = 5000;
+
+{ Moves an initialized data directory to a newly selected port. Only the
+  transport lines change; the origin identity and role stay as initialized. }
+function RelocateRegistryPort(const ADataDirectory, ABaseURL: string): string;
+var
+  Lines: TStringList;
+  Index: Integer;
+  Port: Word;
+  Authority, Path: string;
+begin
+  Port := FindAvailableRegistryTestPort;
+  Authority := Copy(ABaseURL, Pos('://', ABaseURL) + 3, MaxInt);
+  Path := '';
+  if Pos('/', Authority) > 0 then
+    Path := Copy(Authority, Pos('/', Authority), MaxInt);
+  Result := 'http://localhost:' + IntToStr(Port) + Path;
+  Lines := TStringList.Create;
+  try
+    Lines.LineBreak := #10;
+    Lines.LoadFromFile(ADataDirectory + '/registry.toml');
+    for Index := 0 to Lines.Count - 1 do
+      if Pos('base_url = ', Lines[Index]) = 1 then
+        Lines[Index] := 'base_url = "' + Result + '"'
+      else if Pos('port = ', Lines[Index]) = 1 then
+        Lines[Index] := 'port = ' + IntToStr(Port);
+    Lines.SaveToFile(ADataDirectory + '/registry.toml');
+  finally
+    Lines.Free;
+  end;
+end;
+
+function StartRegistryCLI(const ADataDirectory: string; var ABaseURL: string): TProcess;
 var
   Started: QWord;
-  Ready, Serving: Boolean;
-  LastProbe, ExitState, Diagnostics, Discovery, Checkpoint, Expected: string;
+  Attempt: Integer;
+  Announced, Ready, Serving, Collided: Boolean;
+  LastProbe, ExitState, Diagnostics, Discovery, Checkpoint, Expected, Output: string;
   Body: TBytes;
 begin
-  Result := TProcess.Create(nil);
-  Result.Executable := LwptBinaryPath;
-  Result.Options := [poUsePipes];
-  Result.Parameters.Add('registry');
-  Result.Parameters.Add('serve');
-  Result.Parameters.Add('--data-dir');
-  Result.Parameters.Add(ADataDirectory);
-  try
-    Result.Execute;
-    Started := GetTickCount64;
-    LastProbe := '';
-    repeat
-      Ready := False;
-      try
-        Body := RegistryHTTPBody(ABaseURL + '/.well-known/' + PROGRAM_NAME + '-registry');
-        SetString(Discovery, PAnsiChar(@Body[0]), Length(Body));
-        { Another process may have bound the port first; readiness requires
-          this registry's discovery and, once activated, its own checkpoint.
-          Colliding fixtures can share a base URL, but not a checkpoint. }
-        Serving := Result.Running and (Pos('base_url = "' + ABaseURL + '"', Discovery) > 0);
-        Expected := ServedCheckpoint(ADataDirectory);
-        if Serving and (Expected <> '') then
+  Result := nil;
+  for Attempt := 1 to RegistryStartAttempts do
+  begin
+    Result := TProcess.Create(nil);
+    Result.Executable := LwptBinaryPath;
+    Result.Options := [poUsePipes];
+    Result.Parameters.Add('registry');
+    Result.Parameters.Add('serve');
+    Result.Parameters.Add('--data-dir');
+    Result.Parameters.Add(ADataDirectory);
+    try
+      Result.Execute;
+      Started := GetTickCount64;
+      LastProbe := 'listener has not announced its bound port';
+      Output := '';
+      Announced := False;
+      repeat
+        Ready := False;
+        { The child announces only after binding its own socket, so another
+          process answering on the same URL can never satisfy readiness. }
+        if not Announced then
         begin
-          Body := RegistryHTTPBody(ABaseURL + '/v1/checkpoints/latest.toml');
-          SetString(Checkpoint, PAnsiChar(@Body[0]), Length(Body));
-          Serving := Checkpoint = Expected;
+          Output := Output + DrainAvailableStream(Result.Output, 4096);
+          Announced := Pos(' listening at ' + ABaseURL, Output) > 0;
         end;
-        if not Serving then LastProbe := 'listener did not serve this registry';
-        Ready := Serving;
-      except
-        on E: Exception do
-        begin
-          Ready := False;
-          LastProbe := Copy(E.Message, 1, 1024);
-        end;
-      end;
-      if Ready then Exit;
-      if not Result.Running then Break;
-      Sleep(10);
-    until GetTickCount64 - Started >= 5000;
-    ExitState := 'running';
-    if not Result.Running then ExitState := IntToStr(Result.ExitCode)
-      + ' (status=' + IntToStr(Result.ExitStatus) + ')';
-    Diagnostics := DrainAvailableStream(Result.Stderr, 4096);
-    raise Exception.Create('registry CLI listener did not become ready; exit='
-      + ExitState + '; last probe: ' + LastProbe + '; stderr: ' + Diagnostics);
-  except
+        if Announced then
+          try
+            Body := RegistryHTTPBody(ABaseURL + '/.well-known/' + PROGRAM_NAME + '-registry');
+            SetString(Discovery, PAnsiChar(@Body[0]), Length(Body));
+            Serving := Result.Running and (Pos('base_url = "' + ABaseURL + '"', Discovery) > 0);
+            Expected := ServedCheckpoint(ADataDirectory);
+            if Serving and (Expected <> '') then
+            begin
+              Body := RegistryHTTPBody(ABaseURL + '/v1/checkpoints/latest.toml');
+              SetString(Checkpoint, PAnsiChar(@Body[0]), Length(Body));
+              Serving := Checkpoint = Expected;
+            end;
+            if not Serving then LastProbe := 'listener did not serve this registry';
+            Ready := Serving;
+          except
+            on E: Exception do
+            begin
+              Ready := False;
+              LastProbe := Copy(E.Message, 1, 1024);
+            end;
+          end;
+        if Ready then Exit;
+        if not Result.Running then Break;
+        Sleep(10);
+      until GetTickCount64 - Started >= RegistryReadyMilliseconds;
+      ExitState := 'running';
+      if not Result.Running then ExitState := IntToStr(Result.ExitCode)
+        + ' (status=' + IntToStr(Result.ExitStatus) + ')';
+      Diagnostics := DrainAvailableStream(Result.Stderr, 4096);
+      Collided := (not Result.Running) and (Pos('listen_failed:', Diagnostics) > 0);
+      if not Collided or (Attempt = RegistryStartAttempts) then
+        raise Exception.Create('registry CLI listener did not become ready after '
+          + IntToStr(Attempt) + ' start attempt(s); exit=' + ExitState
+          + '; last probe: ' + LastProbe + '; stderr: ' + Diagnostics);
+    except
+      StopRegistryCLI(Result);
+      raise;
+    end;
+    { Another process took the port after it was selected. }
     StopRegistryCLI(Result);
-    raise;
+    ABaseURL := RelocateRegistryPort(ADataDirectory, ABaseURL);
   end;
 end;
 
@@ -213,6 +272,7 @@ begin
   FRoot := ARoot;
   Port := FindAvailableRegistryTestPort;
   FBaseURL := 'http://localhost:' + IntToStr(Port) + '/origin';
+  FIdentity := FBaseURL;
   Run := RunLwpt(['registry', 'init', '--data-dir', FRoot,
     '--base-url', FBaseURL, '--port', IntToStr(Port)]);
   if Run.ExitCode <> 0 then raise Exception.Create(Run.Stderr);

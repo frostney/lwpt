@@ -161,14 +161,16 @@ charges discovery, capabilities, key records, and pagination bytes against
 that same budget before retention. These untrusted retrieval documents confer
 no authority and are unnecessary for offline verification. Each request has a
 120-second deadline, and one complete synchronization has a 60-minute budget;
-every request uses the smaller of the two remaining allowances. The budget is
-also checked between local steps: the initial verification of the accepted
-state and its retained key records, directory size scans and pruning, each
-retained-proof read, each rotation and snapshot verification step, archive
-hashing in the coordinator and in transfer workers, before verified archives
-are adopted, the pre-activation verification, and after the new pointer is
-staged, together with a final expiry check, immediately before the atomic
-replacement. A synchronization that exceeds the budget is never activated.
+every request uses the smaller of the two remaining allowances. The budget
+starts when the publication lease is acquired, before the first directory
+scan, so it covers initial accounting and the attempt record. It is then
+checked between local steps: the initial verification of the accepted state
+and its retained key records; every directory entry visited by size scans,
+pruning, and staging cleanup; each retained-proof read; each rotation and
+snapshot verification step; archive hashing in the coordinator and in
+transfer workers; before each verified archive is adopted; the
+pre-activation verification; and after the new pointer is staged, together
+with a final expiry check, immediately before the atomic replacement. A synchronization that exceeds the budget is never activated.
 These single operations are not interruptible: one Ed25519 signature
 verification, parsing or hashing one metadata document already in memory,
 one file-system call (such as one write, rename, or directory entry), and
