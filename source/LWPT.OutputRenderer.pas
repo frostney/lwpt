@@ -97,7 +97,7 @@ type
     FEntries: array of TLWPTJournalEntry;
     FJournalPath: string;
     FNextOperationID: QWord;
-    FStream: TFileStream;
+    FStream: TLWPTProtectedFileStream;
     procedure AppendEmergency(const AData: RawByteString);
     procedure Degrade(const AReason: string);
     procedure Retain(const ASequence: QWord;
@@ -267,7 +267,7 @@ begin
   end;
   try
     FJournalPath := GetTempFileName(GetTempDir(False), PROGRAM_NAME);
-    FStream := TFileStream.Create(FJournalPath, fmCreate or fmShareDenyWrite);
+    FStream := OpenProtectedFileStream(FJournalPath, fmCreate);
   except
     on E: Exception do Degrade('temporary journal unavailable: ' + E.Message);
   end;

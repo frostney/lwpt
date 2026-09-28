@@ -76,6 +76,7 @@ After bootstrap:
 ./build/lwpt install            # fetch any new deps; rewrite lwpt.lock + lwpt.cfg
 ./build/lwpt install --frozen   # CI: verify, refuse to update
 ./build/lwpt install --offline  # restore exact locked state from local bytes
+./build/lwpt install --accept-moved-tags  # re-pin reviewed upstream tag moves
 ./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt outdated           # compare locked git-host deps to advertised tags
@@ -95,6 +96,34 @@ and `lwpt.cfg`. Local and workspace dependencies are copied from their declared
 paths. The lockfile remains byte-identical. A missing object, corrupt archive,
 or manifest/lock mismatch fails without fetching around the problem. Offline
 materialization and read-only `--frozen` verification are mutually exclusive.
+
+`install --frozen` makes no network requests at all. It verifies the committed
+archives and extracted modules against `lwpt.lock` and never writes the lockfile.
+Some other package managers use "frozen" only to mean "don't write the lock".
+
+A tag names a reviewed commit, and `lwpt.lock` records both the commit and
+whether the ref was a tag or a branch. An online install fails before fetching
+anything when a locked tag changes upstream:
+
+- the tag now points at a different commit;
+- the same version is re-published under another spelling (`v1.0.0` becomes
+  `1.0.0`) at a different commit;
+- the tag is replaced by a same-named branch.
+
+The error names the dependency, the ref, and the old and new commits. The
+`add`, `remove`, and `update` flows share the install transaction and fail the
+same way. A locked commit must also reproduce the archive bytes recorded in
+`lwpt.lock`, even when the ref listing is unreachable and the lock is reused.
+A lock written before LWPT recorded commits is checked the same way, by
+archive. Review the change, then run `lwpt install --accept-moved-tags` to
+re-pin it. The flag cannot be combined with `--frozen` or `--offline`, which
+never list refs. Branch requirements keep following their moving tip.
+
+Every dependency request uses HTTPS on every redirect, may reach only the
+hosts its source names, and is refused if any hop resolves to a private,
+loopback, link-local, or other non-globally-reachable address. Dependencies
+hosted on a private network are currently unsupported; see
+[`deployment.md`](./deployment.md).
 
 ## Start or adopt a project
 

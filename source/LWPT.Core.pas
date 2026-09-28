@@ -56,6 +56,13 @@ type
   TStringArray = array of string;
   TSHA256Progress = procedure of object;
 
+{$IFDEF INSTALL_TESTING}
+{ Value of the <PROJECT_NAME>_TEST_<AName> environment variable. Exists only
+  in a test build (ADR-0044): every fault-injection branch that reads it is
+  compiled only under INSTALL_TESTING, so a release binary contains neither
+  the branch nor the variable name. }
+function  TestSeamValue(const AName: string): string;
+{$ENDIF}
 function  FPCExecutable: string;
 function  InstantFPCExecutable: string;
 procedure AddEnvUnitPathParameters(AParameters: TStrings);
@@ -100,6 +107,72 @@ procedure AtomicDiscardRetainedPath(const ABackupPath: string);
 function  AtomicReplaceFile(const ASrc, ADst: string): Boolean;
 procedure AtomicWriteText(const ADst: string; const ATmpRoot: string; const AContent: TStringList);
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
+
+{ Process-handle inheritance protection. FPC cannot restrict a spawn to an
+  explicit descriptor or handle list, and on Unix its TFileStream opens take
+  a flock() (shared for reads, exclusive for creates) on descriptors without
+  close-on-exec. A child forked while such a descriptor is open shares its
+  lock: for its whole life without close-on-exec, and until its exec even
+  with it. Later non-blocking share-mode opens of that file then fail with
+  EAGAIN. Toolkit state therefore opens through the helpers below: they take
+  no flock (LWPT coordinates with explicit fcntl locks and atomic renames),
+  and they open and mark each descriptor close-on-exec under the same guard
+  every managed and unmanaged spawn holds. The guard covers only that step;
+  all I/O happens after it is released. Begin/End calls must be paired. }
+procedure BeginProcessHandleSetup;
+procedure EndProcessHandleSetup;
+
+type
+  { Owns its handle. On Unix the descriptor is close-on-exec and carries no
+    flock share-mode lock; on Windows the handle is non-inheritable and keeps
+    TFileStream's share modes. }
+  TLWPTProtectedFileStream = class(THandleStream)
+  public
+    destructor Destroy; override;
+  end;
+
+{ TFileStream.Create equivalent for toolkit state. AMode takes the same
+  fmCreate / fmOpenRead / fmOpenWrite / fmOpenReadWrite values; Unix ignores
+  share flags. Raises EFCreateError or EFOpenError. }
+function  OpenProtectedFileStream(const APath: string;
+  const AMode: Word): TLWPTProtectedFileStream;
+{ Replaces AStrings with the file's lines through OpenProtectedFileStream. }
+procedure LoadProtectedStrings(const AStrings: TStrings; const APath: string);
+{$IFDEF UNIX}
+{ FpOpen equivalent for lock and marker files. Returns -1, leaving errno set,
+  when the open or the close-on-exec protection fails. }
+function  OpenProtectedDescriptor(const APath: string; const AFlags: LongInt;
+  const APermissions: LongInt = &600): LongInt;
+{$ENDIF}
+
+{$IFDEF OBJECTSTORE_TESTING}
+type
+  TLWPTProtectedOpenTestHook = procedure(const APath: string);
+  TLWPTProtectedDescriptorTestHook = procedure(const APath: string;
+    const ADescriptor: LongInt);
+
+var
+  { Test-only: runs inside the inheritance guard after the open and before
+    close-on-exec protection. Production code must leave it nil. }
+  ProtectedOpenBeforeProtectionTestHook: TLWPTProtectedOpenTestHook;
+  { Test-only: runs inside the guard once a Unix descriptor is protected, so
+    a test can inspect its close-on-exec flag. Production must leave it nil. }
+  ProtectedOpenAfterProtectionTestHook: TLWPTProtectedDescriptorTestHook;
+
+type
+  { phfContended: the thread's non-blocking attempt failed because another
+    thread held the guard, and the thread is now blocked waiting for it.
+    phfHeld: the thread holds the guard now. phfEntered: the thread has held
+    it at least once since the last reset. }
+  TLWPTProcessHandleSetupFlag = (phfContended, phfHeld, phfEntered);
+  TLWPTProcessHandleSetupFlags = set of TLWPTProcessHandleSetupFlag;
+
+{ Test-only observation of the inheritance guard per thread. }
+procedure ResetProcessHandleSetupObservation;
+function  ObserveProcessHandleSetup(
+  const AThreadID: TThreadID): TLWPTProcessHandleSetupFlags;
+{$ENDIF}
+
 function  SHA256BytesPrefixed(const ABytes: TBytes): string;
 function  SHA256Hex(const AData: TBytes): string;
 function  SHA256Stream(AStream: TStream;
@@ -154,6 +227,7 @@ var
   TmpPathStartedAt: Int64;
   ProcessEnvironmentSnapshot: TStringList = nil;
   ProcessEnvironmentCriticalSection: TRTLCriticalSection;
+  ProcessHandleSetupCriticalSection: TRTLCriticalSection;
 
 procedure AppendProcessEnvironment(const ATarget: TStrings);
 var
@@ -173,6 +247,13 @@ begin
     LeaveCriticalSection(ProcessEnvironmentCriticalSection);
   end;
 end;
+
+{$IFDEF INSTALL_TESTING}
+function TestSeamValue(const AName: string): string;
+begin
+  Result := SysUtils.GetEnvironmentVariable(PROJECT_NAME + '_TEST_' + AName);
+end;
+{$ENDIF}
 
 function FPCExecutable: string;
 begin
@@ -502,14 +583,14 @@ begin
 end;
 
 function CopyFileContent(const ASrc, ADst: string): Boolean;
-var SrcS, DstS: TFileStream;
+var SrcS, DstS: TLWPTProtectedFileStream;
 begin
   Result := False;
   if not FileExists(ASrc) then Exit;
   try
-    SrcS := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
+    SrcS := OpenProtectedFileStream(ASrc, fmOpenRead or fmShareDenyNone);
     try
-      DstS := TFileStream.Create(ADst, fmCreate);
+      DstS := OpenProtectedFileStream(ADst, fmCreate);
       try
         if SrcS.Size > 0 then DstS.CopyFrom(SrcS, SrcS.Size);
       finally
@@ -1169,11 +1250,12 @@ end;
 function AtomicRestorePath(const ABackupPath, ADestination: string): Boolean;
 var Meta: TStringList; Expected: string;
 begin
-  if SameText(SysUtils.GetEnvironmentVariable(
-       PROJECT_NAME + '_TEST_THROW_RESTORE_FOR'),
+  {$IFDEF INSTALL_TESTING}
+  if SameText(TestSeamValue('THROW_RESTORE_FOR'),
        ExtractFileName(ExcludeTrailingPathDelimiter(ADestination))) then
     raise EExtractError.CreateFmt(
       'injected restore exception for "%s"', [ADestination]);
+  {$ENDIF}
   Result := False;
   if not FileExists(ABackupPath + '.rollback') then Exit;
   Meta := TStringList.Create;
@@ -1304,15 +1386,288 @@ begin
   if D <> '' then ForceDirectories(D);
 end;
 
+const
+  { TFileStream.Create's default rights; the process umask still applies. }
+  PROTECTED_CREATE_PERMISSIONS = &666;
+{$IFDEF UNIX}
+  { Darwin's BaseUnix declares FD_CLOEXEC; Linux FPC 3.2.2 does not. POSIX
+    fixes the value at 1. }
+  {$IFDEF LINUX}
+  FD_CLOEXEC_LWPT = 1;
+  {$ELSE}
+  FD_CLOEXEC_LWPT = FD_CLOEXEC;
+  {$ENDIF}
+{$ENDIF}
+
+{$IFDEF OBJECTSTORE_TESTING}
+type
+  TLWPTProcessHandleSetupObservation = record
+    ThreadID: TThreadID;
+    Contended: Boolean;
+    Depth: Integer;
+    Entered: Boolean;
+  end;
+
+var
+  ProcessHandleSetupObservationCriticalSection: TRTLCriticalSection;
+  ProcessHandleSetupObservations: array of TLWPTProcessHandleSetupObservation;
+
+function ProcessHandleSetupObservationIndex(
+  const AThreadID: TThreadID): Integer;
+var
+  Index: Integer;
+begin
+  for Index := 0 to High(ProcessHandleSetupObservations) do
+    if ProcessHandleSetupObservations[Index].ThreadID = AThreadID then
+      Exit(Index);
+  Result := Length(ProcessHandleSetupObservations);
+  SetLength(ProcessHandleSetupObservations, Result + 1);
+  ProcessHandleSetupObservations[Result] :=
+    Default(TLWPTProcessHandleSetupObservation);
+  ProcessHandleSetupObservations[Result].ThreadID := AThreadID;
+end;
+
+procedure RecordProcessHandleSetupContention;
+var
+  Index: Integer;
+begin
+  EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  try
+    { Resolve the index first: it may grow and move the array. }
+    Index := ProcessHandleSetupObservationIndex(GetCurrentThreadId);
+    ProcessHandleSetupObservations[Index].Contended := True;
+  finally
+    LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  end;
+end;
+
+procedure RecordProcessHandleSetupDepth(const ADelta: Integer);
+var
+  Index: Integer;
+begin
+  EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  try
+    Index := ProcessHandleSetupObservationIndex(GetCurrentThreadId);
+    Inc(ProcessHandleSetupObservations[Index].Depth, ADelta);
+    if ADelta > 0 then
+    begin
+      ProcessHandleSetupObservations[Index].Entered := True;
+      ProcessHandleSetupObservations[Index].Contended := False;
+    end;
+  finally
+    LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  end;
+end;
+
+procedure ResetProcessHandleSetupObservation;
+var
+  Index, Kept: Integer;
+begin
+  EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  try
+    { A thread that holds the guard right now keeps its depth. }
+    Kept := 0;
+    for Index := 0 to High(ProcessHandleSetupObservations) do
+      if ProcessHandleSetupObservations[Index].Depth > 0 then
+      begin
+        ProcessHandleSetupObservations[Kept] :=
+          ProcessHandleSetupObservations[Index];
+        ProcessHandleSetupObservations[Kept].Contended := False;
+        ProcessHandleSetupObservations[Kept].Entered := False;
+        Inc(Kept);
+      end;
+    SetLength(ProcessHandleSetupObservations, Kept);
+  finally
+    LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  end;
+end;
+
+function ObserveProcessHandleSetup(
+  const AThreadID: TThreadID): TLWPTProcessHandleSetupFlags;
+var
+  Index: Integer;
+begin
+  Result := [];
+  EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  try
+    for Index := 0 to High(ProcessHandleSetupObservations) do
+      if ProcessHandleSetupObservations[Index].ThreadID = AThreadID then
+      begin
+        if ProcessHandleSetupObservations[Index].Contended then
+          Include(Result, phfContended);
+        if ProcessHandleSetupObservations[Index].Depth > 0 then
+          Include(Result, phfHeld);
+        if ProcessHandleSetupObservations[Index].Entered then
+          Include(Result, phfEntered);
+        Exit;
+      end;
+  finally
+    LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  end;
+end;
+{$ENDIF}
+
+procedure BeginProcessHandleSetup;
+begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  { Record contention only after a real failed attempt on the guard itself,
+    so an observer never mistakes an uncontended thread for a blocked one. }
+  if System.TryEnterCriticalSection(ProcessHandleSetupCriticalSection) = 0 then
+  begin
+    RecordProcessHandleSetupContention;
+    EnterCriticalSection(ProcessHandleSetupCriticalSection);
+  end;
+  RecordProcessHandleSetupDepth(1);
+  {$ELSE}
+  EnterCriticalSection(ProcessHandleSetupCriticalSection);
+  {$ENDIF}
+end;
+
+procedure EndProcessHandleSetup;
+begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  RecordProcessHandleSetupDepth(-1);
+  {$ENDIF}
+  LeaveCriticalSection(ProcessHandleSetupCriticalSection);
+end;
+
+destructor TLWPTProtectedFileStream.Destroy;
+begin
+  if Handle <> THandle(-1) then FileClose(Handle);
+  inherited Destroy;
+end;
+
+{$IFDEF UNIX}
+function ProtectedOpenFlags(const AMode: Word): LongInt;
+begin
+  if (AMode and fmCreate) = fmCreate then
+    Exit(O_RDWR or O_CREAT or O_TRUNC);
+  case AMode and (fmOpenRead or fmOpenWrite or fmOpenReadWrite) of
+    fmOpenWrite: Result := O_WRONLY;
+    fmOpenReadWrite: Result := O_RDWR;
+  else
+    Result := O_RDONLY;
+  end;
+end;
+{$ENDIF}
+
+function OpenProtectedFileStream(const APath: string;
+  const AMode: Word): TLWPTProtectedFileStream;
+var
+  Handle: THandle;
+  {$IFDEF UNIX}
+  Descriptor, ErrorCode: LongInt;
+  Info: BaseUnix.Stat;
+  {$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Descriptor := OpenProtectedDescriptor(APath, ProtectedOpenFlags(AMode),
+    PROTECTED_CREATE_PERMISSIONS);
+  if Descriptor < 0 then
+  begin
+    ErrorCode := FpGetErrNo;
+    if (AMode and fmCreate) = fmCreate then
+      raise EFCreateError.CreateFmt('Unable to create file "%s": %s',
+        [APath, SysErrorMessage(ErrorCode)]);
+    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+      [APath, SysErrorMessage(ErrorCode)]);
+  end;
+  { TFileStream refuses directories; keep that contract. }
+  if FpFStat(Descriptor, Info) <> 0 then
+  begin
+    ErrorCode := FpGetErrNo;
+    FpClose(Descriptor);
+    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+      [APath, SysErrorMessage(ErrorCode)]);
+  end;
+  if FpS_ISDIR(Info.st_mode) then
+  begin
+    FpClose(Descriptor);
+    raise EFOpenError.CreateFmt('Unable to open file "%s": is a directory',
+      [APath]);
+  end;
+  Handle := THandle(Descriptor);
+  {$ELSE}
+  { Windows file handles are created non-inheritable. }
+  if (AMode and fmCreate) = fmCreate then
+  begin
+    Handle := FileCreate(APath, AMode and not fmCreate,
+      PROTECTED_CREATE_PERMISSIONS);
+    if Handle = THandle(-1) then
+      raise EFCreateError.CreateFmt('Unable to create file "%s": %s',
+        [APath, SysErrorMessage(GetLastOSError)]);
+  end
+  else
+  begin
+    Handle := FileOpen(APath, AMode);
+    if Handle = THandle(-1) then
+      raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+        [APath, SysErrorMessage(GetLastOSError)]);
+  end;
+  {$ENDIF}
+  Result := TLWPTProtectedFileStream.Create(Handle);
+end;
+
+{$IFDEF UNIX}
+function OpenProtectedDescriptor(const APath: string; const AFlags: LongInt;
+  const APermissions: LongInt): LongInt;
+var
+  ErrorCode: LongInt;
+begin
+  BeginProcessHandleSetup;
+  try
+    repeat
+      Result := FpOpen(PChar(APath), AFlags, APermissions);
+    until (Result >= 0) or (FpGetErrNo <> ESysEINTR);
+    if Result < 0 then Exit;
+    {$IFDEF OBJECTSTORE_TESTING}
+    if Assigned(ProtectedOpenBeforeProtectionTestHook) then
+      ProtectedOpenBeforeProtectionTestHook(APath);
+    {$ENDIF}
+    if FpFcntl(Result, F_SETFD, FD_CLOEXEC_LWPT) <> 0 then
+    begin
+      ErrorCode := FpGetErrNo;
+      FpClose(Result);
+      FpSetErrNo(ErrorCode);
+      Result := -1;
+      Exit;
+    end;
+    {$IFDEF OBJECTSTORE_TESTING}
+    if Assigned(ProtectedOpenAfterProtectionTestHook) then
+      ProtectedOpenAfterProtectionTestHook(APath, Result);
+    {$ENDIF}
+  finally
+    EndProcessHandleSetup;
+  end;
+end;
+{$ENDIF}
+
+procedure LoadProtectedStrings(const AStrings: TStrings; const APath: string);
+var
+  Stream: TLWPTProtectedFileStream;
+begin
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
+  try
+    AStrings.LoadFromStream(Stream);
+  finally
+    Stream.Free;
+  end;
+end;
+
 procedure AtomicWriteText(const ADst: string;
   const ATmpRoot: string; const AContent: TStringList);
-var Tmp: string;
+var Tmp: string; Stream: TLWPTProtectedFileStream;
 begin
   { The destination name adds no uniqueness and can push a project-local
     staging path past Windows' directory-path ceiling in a deep checkout. }
   Tmp := MakeTmpPath(ATmpRoot, 'write');
   EnsureDstDir(ADst);
-  AContent.SaveToFile(Tmp);
+  Stream := OpenProtectedFileStream(Tmp, fmCreate);
+  try
+    AContent.SaveToStream(Stream);
+  finally
+    Stream.Free;
+  end;
   { The common same-filesystem path is one replacement operation and avoids
     AtomicMoveFile's recoverable sibling backup, whose longer name can exceed
     the Windows path ceiling in a deep project. Keep its EXDEV fallback. }
@@ -1326,11 +1681,11 @@ begin
 end;
 
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
-var Tmp: string; Stream: TFileStream;
+var Tmp: string; Stream: TLWPTProtectedFileStream;
 begin
   Tmp := MakeTmpPath(ATmpRoot, 'write');
   EnsureDstDir(ADst);
-  Stream := TFileStream.Create(Tmp, fmCreate);
+  Stream := OpenProtectedFileStream(Tmp, fmCreate);
   try
     if Length(ABytes) > 0 then Stream.WriteBuffer(ABytes[0], Length(ABytes));
   finally
@@ -1548,10 +1903,10 @@ end;
 
 function SHA256File(const APath: string): string;
 var
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
 begin
   if not FileExists(APath) then Exit('');
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
     Result := SHA256Stream(Stream);
   finally
@@ -1710,7 +2065,7 @@ var
   i, n  : Integer;
   Chunk : TBytes;
   FileBytes : TBytes;
-  FS    : TFileStream;
+  FS    : TLWPTProtectedFileStream;
   FullPath : string;
 begin
   { directory: hash the sorted file tree }
@@ -1731,7 +2086,7 @@ begin
 
         FullPath := NativePath(IncludeTrailingPathDelimiter(APathOrArchive)
           + Files[i]);
-        FS := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
+        FS := OpenProtectedFileStream(FullPath, fmOpenRead or fmShareDenyNone);
         try
           SetLength(FileBytes, FS.Size);
           if FS.Size > 0 then FS.ReadBuffer(FileBytes[0], FS.Size);
@@ -1766,5 +2121,9 @@ initialization
     defends against a stale path from PID/stamp reuse. }
   TmpPathStartedAt := Round(Now * MSecsPerDay);
   InitCriticalSection(ProcessEnvironmentCriticalSection);
+  InitCriticalSection(ProcessHandleSetupCriticalSection);
+  {$IFDEF OBJECTSTORE_TESTING}
+  InitCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  {$ENDIF}
 
 end.

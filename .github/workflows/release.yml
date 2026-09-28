@@ -281,6 +281,39 @@ jobs:
           done
           ls -la staged/
 
+      # ADR-0044: the LWPT_TEST_* fetch-redirection and fault-injection
+      # seams are compiled only with -dINSTALL_TESTING, which the compile
+      # above never passes. tests/test-seam-markers.txt lists the variable
+      # prefix and every fault name; each exists only as a string constant
+      # of a test build, so finding one proves a seam leaked into release.
+      # TestSeamIsolation.Test.pas pins the positive canary: every marker is
+      # present in build/lwpt-testing and absent from build/lwpt.
+      # grep exits 0 on a match and 1 on no match; anything else (an
+      # unreadable or missing binary, a bad marker file) is a scan failure
+      # and fails the release. TestSeamIsolation.Test.pas runs this exact
+      # block against clean, contaminated and unreadable inputs.
+      - name: Check test seams are compiled out
+        run: |
+          set -euo pipefail
+          test -s tests/test-seam-markers.txt
+          for bin in staged/*; do
+            status=0
+            grep -a -q -F -f tests/test-seam-markers.txt "$bin" || status=$?
+            case "$status" in
+              0)
+                echo "::error::$bin contains test seam markers; release builds must not define INSTALL_TESTING"
+                grep -a -o -F -f tests/test-seam-markers.txt "$bin" | sort -u || true
+                exit 1
+                ;;
+              1) ;;
+              *)
+                echo "::error::cannot scan $bin for test seam markers (grep exit $status)"
+                exit 1
+                ;;
+            esac
+          done
+          echo "no test seam markers in staged binaries"
+
       - name: Check Windows TLS linkage (native SChannel, no OpenSSL)
         if: matrix.os == 'win64' || matrix.os == 'win32'
         run: |
