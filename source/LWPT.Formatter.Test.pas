@@ -115,6 +115,8 @@ type
     procedure TestEscapedKeywordParametersRenameOnlyIdentifiers;
     procedure TestDirectiveWordParameterIsLeftAlone;
     procedure TestEscapedDirectiveWordWithUnescapedUseIsLeftAlone;
+    procedure TestEscapedContextWordWithUnescapedUseIsLeftAlone;
+    procedure TestQualifiedMemberDoesNotBlockEscapedRename;
     procedure TestUncertainNestedMentionBlocksTheRename;
     procedure TestNestedRoutineNamedLikeTheParameterBlocksTheRename;
     procedure TestSameNamedRecordFieldIsNotTheParameter;
@@ -2569,6 +2571,80 @@ begin
     'end.']));
 end;
 
+procedure TFormatRoutineScope.TestEscapedContextWordWithUnescapedUseIsLeftAlone;
+
+  procedure ExpectUnchangedIn(const AMode: string);
+  begin
+    ExpectUnchanged('EscapedContextWord' + AMode, SourceLines([
+      'program EscapedContextWord;',
+      '{$mode ' + AMode + '}',
+      '',
+      'var',
+      '  &inline: Integer = 99;',
+      '',
+      'procedure Show(&inline: Integer);',
+      'begin',
+      '  WriteLn(inline);',
+      'end;',
+      '',
+      'begin',
+      '  Show(3);',
+      'end.']));
+  end;
+
+begin
+  { `inline` is context-sensitive in FPC 3.2.2 (keyword:[m_none]), so it may
+    be used unescaped in every mode; renaming only `&inline` would rebind
+    the body's use to the global. }
+  ExpectUnchangedIn('objfpc');
+  ExpectUnchangedIn('delphi');
+end;
+
+procedure TFormatRoutineScope.TestQualifiedMemberDoesNotBlockEscapedRename;
+begin
+  { `data.message` is a member access, not a use of the parameter, so it
+    must not block renaming an escaped parameter used only escaped. }
+  ExpectFormats('QualifiedMember', SourceLines([
+    'program QualifiedMember;',
+    '{$mode objfpc}',
+    '',
+    'type',
+    '  TNote = record',
+    '    message: Integer;',
+    '  end;',
+    '',
+    'procedure Show(&message: Integer);',
+    'var',
+    '  data: TNote;',
+    'begin',
+    '  data.message := 1;',
+    '  WriteLn(&message + data.message);',
+    'end;',
+    '',
+    'begin',
+    '  Show(3);',
+    'end.']), SourceLines([
+    'program QualifiedMember;',
+    '{$mode objfpc}',
+    '',
+    'type',
+    '  TNote = record',
+    '    message: Integer;',
+    '  end;',
+    '',
+    'procedure Show(AMessage: Integer);',
+    'var',
+    '  data: TNote;',
+    'begin',
+    '  data.message := 1;',
+    '  WriteLn(AMessage + data.message);',
+    'end;',
+    '',
+    'begin',
+    '  Show(3);',
+    'end.']));
+end;
+
 procedure TFormatRoutineScope.TestOmittedImplementationParametersBlockTheRename;
 begin
   { Delphi mode lets the implementation omit the parameter list, so its
@@ -2869,6 +2945,10 @@ begin
     TestDirectiveWordParameterIsLeftAlone);
   Test('an escaped directive-word parameter used unescaped keeps its name',
     TestEscapedDirectiveWordWithUnescapedUseIsLeftAlone);
+  Test('an escaped context-sensitive parameter used unescaped keeps its name',
+    TestEscapedContextWordWithUnescapedUseIsLeftAlone);
+  Test('a qualified member does not block an escaped parameter rename',
+    TestQualifiedMemberDoesNotBlockEscapedRename);
   Test('an uncertain nested mention blocks the rename',
     TestUncertainNestedMentionBlocksTheRename);
   Test('a with statement blocks the rename',

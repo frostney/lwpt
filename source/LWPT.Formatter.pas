@@ -1831,19 +1831,20 @@ end;
 function TParameterRenamer.KeywordSpelledAs(const AName: string;
   const AFirst, ALast: Integer): Boolean;
 const
-  { FPC's reserved words in the objfpc and delphi modes. These can only be
-    used escaped, so every unescaped occurrence is syntax, not a use. }
-  ReservedWords: array[0..66] of string = (
-    'and', 'array', 'as', 'asm', 'begin', 'case', 'class', 'const',
-    'constructor', 'destructor', 'dispinterface', 'div', 'do', 'downto',
-    'else', 'end', 'except', 'exports', 'file', 'finalization', 'finally',
-    'for', 'function', 'goto', 'if', 'implementation', 'in', 'inherited',
-    'initialization', 'inline', 'interface', 'is', 'label', 'library', 'mod',
-    'nil', 'not', 'object', 'of', 'on', 'operator', 'or', 'out', 'packed',
-    'procedure', 'program', 'property', 'raise', 'record', 'repeat',
-    'resourcestring', 'set', 'shl', 'shr', 'string', 'then', 'threadvar',
-    'to', 'try', 'type', 'unit', 'until', 'uses', 'var', 'while', 'with',
-    'xor');
+  { The words FPC 3.2.2 reserves in every language mode
+    (keyword:alllanguagemodes in compiler/tokens.pas). They can only be
+    used escaped, so every unescaped occurrence is syntax, not a use.
+    Mode-dependent (class, try, property, ...) and context-sensitive
+    (inline, on, out, operator) words are deliberately absent. }
+  ReservedWords: array[0..53] of string = (
+    'do', 'if', 'in', 'of', 'or', 'to', 'and', 'asm', 'div', 'end', 'for',
+    'mod', 'nil', 'not', 'set', 'shl', 'shr', 'var', 'xor', 'case', 'else',
+    'file', 'goto', 'then', 'type', 'unit', 'uses', 'with', 'array', 'begin',
+    'const', 'label', 'until', 'while', 'downto', 'object', 'packed',
+    'record', 'repeat', 'string', 'exports', 'library', 'program',
+    'function', 'bitpacked', 'inherited', 'interface', 'otherwise',
+    'procedure', 'threadvar', 'destructor', 'constructor', 'implementation',
+    'resourcestring');
 var
   TokenIndex, WordIndex: Integer;
 begin
@@ -1852,6 +1853,7 @@ begin
       Exit(False);
   for TokenIndex := AFirst to ALast do
     if FSource.IsName(TokenIndex) and not FSource.IsIdentifier(TokenIndex) and
+       not FSource.IsText(TokenIndex - 1, '.') and
        SameText(FSource.Text(TokenIndex), AName) then
       Exit(True);
   Result := False;
