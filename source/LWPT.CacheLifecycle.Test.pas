@@ -745,24 +745,110 @@ end;
 
 procedure TCacheLifecycleContract.TestLargeCacheHitAndAdmissionStayFast;
 const
-  ObjectCount = 20000;
-  Evictions = 2000;
+  SmallObjects = 2000;
+  LargeObjects = 20000;
   ObjectBytes = 100;
   { Enforcement also sees the admitted object, its manifest and its index
     entry, which cost a few more evictions of about ObjectBytes each. }
   EvictionSlack = 10;
-  BoundMs = 5000;
+  { Ten times the objects and evictions costs about ten times as much when
+    hit and admission are linear, and about a hundred times for each
+    quadratic variant this guards against. Comparing two sizes on the same
+    machine keeps runner speed and per-file costs (far higher on NTFS) out
+    of the bound. }
+  ScaleMultiple = 30;
+  ScaleSlackMs = 500;
+
+  procedure Measure(const AObjectCount: Integer; out AHitMs, AAdmitMs: Int64);
+  var
+    Digest, Hit, NewDigest, Source: string;
+    Store: TLWPTImmutableObjectStore;
+    IndexLines: TStringList;
+    Digests: array of string;
+    LastUses: array of Integer;
+    Budget: Int64;
+    Index, Evicted, Evictions: Integer;
+    Started: QWord;
+    EvictedInOrder: Boolean;
+  begin
+    ResetScratch;
+    Evictions := AObjectCount div 10;
+    Store := TLWPTImmutableObjectStore.Create(
+      FCacheRoot + '/dependency-archives', FCacheRoot,
+      DEPENDENCY_ARCHIVE_NAMESPACE);
+    IndexLines := TStringList.Create;
+    try
+      Digest := WriteObject('hot', 'hot-object', Store);
+      SetLength(Digests, AObjectCount);
+      SetLength(LastUses, AObjectCount);
+      for Index := 0 to AObjectCount - 1 do
+      begin
+        Digests[Index] := 'sha256:' + LowerCase(SHA256Hex(BytesOf(
+          'scale-object-' + IntToStr(Index))));
+        { 7919 is prime and coprime with both sizes, so this is a
+          permutation of 1..AObjectCount unrelated to the digests' order. }
+        LastUses[Index] := Int64(Index) * 7919 mod AObjectCount + 1;
+        WriteTextFile(Store.ObjectPath(Digests[Index]),
+          StringOfChar('s', ObjectBytes));
+        IndexLines.Add('entry.' + DEPENDENCY_ARCHIVE_NAMESPACE + ':'
+          + Digests[Index] + '=' + IntToStr(LastUses[Index]));
+      end;
+      IndexLines.Add('entry.' + DEPENDENCY_ARCHIVE_NAMESPACE + ':' + Digest
+        + '=' + IntToStr(AObjectCount + 1));
+      IndexLines.Sort;
+      for Index := 0 to IndexLines.Count div 2 - 1 do
+        IndexLines.Exchange(Index, IndexLines.Count - 1 - Index);
+      IndexLines.Insert(0, 'sequence=' + IntToStr(AObjectCount + 1));
+      IndexLines.Insert(0, 'schema=1');
+      IndexLines.LineBreak := #10;
+      ForceDirectories(FCacheRoot + '/lifecycle');
+      IndexLines.SaveToFile(FCacheRoot + '/lifecycle/index');
+
+      Started := GetTickCount64;
+      Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
+      AHitMs := Int64(GetTickCount64 - Started);
+
+      Source := FScratch + '/sources/cold';
+      WriteTextFile(Source, 'cold-object');
+      NewDigest := 'sha256:' + SHA256File(Source);
+      { WriteTextFile adds the platform line break to each payload. }
+      Budget := CacheBytes(FCacheRoot)
+        - Evictions * FileSizeOf(Store.ObjectPath(Digests[0]));
+      SetBudget(IntToStr(Budget));
+      Started := GetTickCount64;
+      Expect<Boolean>(Store.Admit(Source, NewDigest) <> '').ToBe(True);
+      AAdmitMs := Int64(GetTickCount64 - Started);
+
+      { The evicted objects are exactly the least recently used ones, and
+        no more of them than the budget needed. }
+      Evicted := 0;
+      for Index := 0 to AObjectCount - 1 do
+        if not FileExists(Store.ObjectPath(Digests[Index])) then Inc(Evicted);
+      EvictedInOrder := True;
+      for Index := 0 to AObjectCount - 1 do
+        if FileExists(Store.ObjectPath(Digests[Index]))
+           <> (LastUses[Index] > Evicted) then
+          EvictedInOrder := False;
+      if (Evicted < Evictions) or (Evicted > Evictions + EvictionSlack) then
+        Fail(Format('%d objects: evicted %d, expected %d to %d',
+          [AObjectCount, Evicted, Evictions, Evictions + EvictionSlack]));
+      if not EvictedInOrder then
+        Fail(Format('%d objects: eviction did not remove exactly the least '
+          + 'recently used objects', [AObjectCount]));
+      if not FileExists(Store.ObjectPath(Digest)) then
+        Fail(Format('%d objects: the recently used hot object was evicted',
+          [AObjectCount]));
+      if CacheBytes(FCacheRoot) > Budget then
+        Fail(Format('%d objects: the cache is still over budget after '
+          + 'admission', [AObjectCount]));
+    finally
+      IndexLines.Free;
+      Store.Free;
+    end;
+  end;
+
 var
-  Digest, Hit, NewDigest, Source: string;
-  Store: TLWPTImmutableObjectStore;
-  IndexLines: TStringList;
-  Digests: array of string;
-  LastUses: array of Integer;
-  Budget: Int64;
-  Index, Evicted: Integer;
-  Started: QWord;
-  HitMs, AdmitMs: Int64;
-  EvictedInOrder: Boolean;
+  SmallHitMs, SmallAdmitMs, LargeHitMs, LargeAdmitMs: Int64;
 begin
   { A grown shared cache holds tens of thousands of objects and index
     entries. Every hit loads the index, and an admission over budget also
@@ -770,78 +856,20 @@ begin
     many of them. Each step used to be quadratic: the loader and the
     per-object lookup scanned the index, the insertion sort shifted
     objects, and every eviction re-walked the tree and rescanned the
-    index for its entry. This fixture makes those steps expensive: 20 000
-    real objects whose recency is unrelated to the order discovery
-    returns them in, an index written in reverse name order, and a
-    budget that forces 2 000 evictions. The bound is generous so a slow
-    CI runner does not flake it. }
-  Store := TLWPTImmutableObjectStore.Create(
-    FCacheRoot + '/dependency-archives', FCacheRoot,
-    DEPENDENCY_ARCHIVE_NAMESPACE);
-  IndexLines := TStringList.Create;
-  try
-    Digest := WriteObject('hot', 'hot-object', Store);
-    SetLength(Digests, ObjectCount);
-    SetLength(LastUses, ObjectCount);
-    for Index := 0 to ObjectCount - 1 do
-    begin
-      Digests[Index] := 'sha256:' + LowerCase(SHA256Hex(BytesOf(
-        'scale-object-' + IntToStr(Index))));
-      { 7919 is coprime with ObjectCount, so this is a permutation of
-        1..ObjectCount that is unrelated to the digests' order. }
-      LastUses[Index] := Int64(Index) * 7919 mod ObjectCount + 1;
-      WriteTextFile(Store.ObjectPath(Digests[Index]),
-        StringOfChar('s', ObjectBytes));
-      IndexLines.Add('entry.' + DEPENDENCY_ARCHIVE_NAMESPACE + ':'
-        + Digests[Index] + '=' + IntToStr(LastUses[Index]));
-    end;
-    IndexLines.Add('entry.' + DEPENDENCY_ARCHIVE_NAMESPACE + ':' + Digest
-      + '=' + IntToStr(ObjectCount + 1));
-    IndexLines.Sort;
-    for Index := 0 to IndexLines.Count div 2 - 1 do
-      IndexLines.Exchange(Index, IndexLines.Count - 1 - Index);
-    IndexLines.Insert(0, 'sequence=' + IntToStr(ObjectCount + 1));
-    IndexLines.Insert(0, 'schema=1');
-    IndexLines.LineBreak := #10;
-    ForceDirectories(FCacheRoot + '/lifecycle');
-    IndexLines.SaveToFile(FCacheRoot + '/lifecycle/index');
-
-    Started := GetTickCount64;
-    Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
-    HitMs := Int64(GetTickCount64 - Started);
-
-    Source := FScratch + '/sources/cold';
-    WriteTextFile(Source, 'cold-object');
-    NewDigest := 'sha256:' + SHA256File(Source);
-    { WriteTextFile adds the platform line break to each payload. }
-    Budget := CacheBytes(FCacheRoot)
-      - Evictions * FileSizeOf(Store.ObjectPath(Digests[0]));
-    SetBudget(IntToStr(Budget));
-    Started := GetTickCount64;
-    Expect<Boolean>(Store.Admit(Source, NewDigest) <> '').ToBe(True);
-    AdmitMs := Int64(GetTickCount64 - Started);
-
-    { The evicted objects are exactly the least recently used ones, and
-      no more of them than the budget needed. }
-    Evicted := 0;
-    for Index := 0 to ObjectCount - 1 do
-      if not FileExists(Store.ObjectPath(Digests[Index])) then Inc(Evicted);
-    EvictedInOrder := True;
-    for Index := 0 to ObjectCount - 1 do
-      if FileExists(Store.ObjectPath(Digests[Index]))
-         <> (LastUses[Index] > Evicted) then
-        EvictedInOrder := False;
-    Expect<Boolean>(Evicted >= Evictions).ToBe(True);
-    Expect<Boolean>(Evicted <= Evictions + EvictionSlack).ToBe(True);
-    Expect<Boolean>(EvictedInOrder).ToBe(True);
-    Expect<Boolean>(FileExists(Store.ObjectPath(Digest))).ToBe(True);
-    Expect<Boolean>(CacheBytes(FCacheRoot) <= Budget).ToBe(True);
-    Expect<Boolean>(HitMs < BoundMs).ToBe(True);
-    Expect<Boolean>(AdmitMs < BoundMs).ToBe(True);
-  finally
-    IndexLines.Free;
-    Store.Free;
-  end;
+    index for its entry. The fixture makes those steps expensive: real
+    objects whose recency is unrelated to the order discovery returns them
+    in, an index written in reverse name order, and a budget that forces
+    a tenth of the objects out. }
+  Measure(SmallObjects, SmallHitMs, SmallAdmitMs);
+  Measure(LargeObjects, LargeHitMs, LargeAdmitMs);
+  if LargeHitMs >= ScaleMultiple * SmallHitMs + ScaleSlackMs then
+    Fail(Format('hit took %d ms at %d objects against %d ms at %d; bound '
+      + '%d x + %d ms', [LargeHitMs, LargeObjects, SmallHitMs, SmallObjects,
+      ScaleMultiple, ScaleSlackMs]));
+  if LargeAdmitMs >= ScaleMultiple * SmallAdmitMs + ScaleSlackMs then
+    Fail(Format('admission took %d ms at %d objects against %d ms at %d; '
+      + 'bound %d x + %d ms', [LargeAdmitMs, LargeObjects, SmallAdmitMs,
+      SmallObjects, ScaleMultiple, ScaleSlackMs]));
 end;
 
 procedure TCacheLifecycleContract.TestEvictionCountsDeletedReferences;
