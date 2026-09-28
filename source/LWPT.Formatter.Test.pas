@@ -200,9 +200,12 @@ var
    segments specially, and an absolute checkout path may contain one. *)
 function ScratchRoot: string;
 begin
+  { Format-scope patterns use `/`; ExtractRelativePath returns the native
+    separator, and a Windows backslash would break the glob fixtures. }
   if ScratchDirectory = '' then
-    ScratchDirectory := ExtractRelativePath(
-      IncludeTrailingPathDelimiter(GetCurrentDir), CreateScratchRoot('formatter'));
+    ScratchDirectory := StringReplace(ExtractRelativePath(
+      IncludeTrailingPathDelimiter(GetCurrentDir), CreateScratchRoot('formatter')),
+      '\', '/', [rfReplaceAll]);
   Result := ScratchDirectory;
 end;
 
