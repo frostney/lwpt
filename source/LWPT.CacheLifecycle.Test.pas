@@ -751,12 +751,14 @@ const
   { Enforcement also sees the admitted object, its manifest and its index
     entry, which cost a few more evictions of about ObjectBytes each. }
   EvictionSlack = 10;
-  { Hit and admission must stay within a small multiple of one full cache
-    walk measured on the same machine. The linear code needs a few walks'
-    worth of work; each quadratic variant this guards against costs
-    hundreds of walks. A relative bound keeps slow runners from failing
-    correct code while still catching the regression anywhere. }
+  { Hit and admission are bounded relative to linear work measured on the
+    same machine: one full cache walk, and deleting as many files as the
+    admission must evict (deletion is far costlier than a walk on NTFS).
+    The linear code needs a few of each; the quadratic variants this guards
+    against cost hundreds of walks. Relative bounds keep slow runners from
+    failing correct code while still catching the regression. }
   WalkMultiple = 40;
+  DeleteMultiple = 4;
   BoundSlackMs = 1000;
 var
   Digest, Hit, NewDigest, Source: string;
@@ -767,7 +769,8 @@ var
   Budget: Int64;
   Index, Evicted: Integer;
   Started: QWord;
-  HitMs, AdmitMs, WalkMs, BoundMs: Int64;
+  HitMs, AdmitMs, WalkMs, DeleteMs, HitBoundMs, BoundMs: Int64;
+  BaselineRoot: string;
   EvictedInOrder: Boolean;
 begin
   { A grown shared cache holds tens of thousands of objects and index
@@ -814,7 +817,17 @@ begin
     Started := GetTickCount64;
     CacheBytes(FCacheRoot);
     WalkMs := Int64(GetTickCount64 - Started);
-    BoundMs := WalkMultiple * WalkMs + BoundSlackMs;
+    BaselineRoot := FScratch + '/delete-baseline';
+    ForceDirectories(BaselineRoot);
+    for Index := 0 to Evictions - 1 do
+      WriteTextFile(BaselineRoot + '/' + IntToStr(Index),
+        StringOfChar('s', ObjectBytes));
+    Started := GetTickCount64;
+    for Index := 0 to Evictions - 1 do
+      SysUtils.DeleteFile(BaselineRoot + '/' + IntToStr(Index));
+    DeleteMs := Int64(GetTickCount64 - Started);
+    HitBoundMs := WalkMultiple * WalkMs + BoundSlackMs;
+    BoundMs := HitBoundMs + DeleteMultiple * DeleteMs;
 
     Started := GetTickCount64;
     Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
@@ -850,12 +863,13 @@ begin
       Fail('the recently used hot object was evicted');
     if CacheBytes(FCacheRoot) > Budget then
       Fail('the cache is still over budget after admission');
-    if HitMs >= BoundMs then
+    if HitMs >= HitBoundMs then
       Fail(Format('hit took %d ms; bound %d ms (%d x one %d ms cache walk '
-        + '+ %d ms)', [HitMs, BoundMs, WalkMultiple, WalkMs, BoundSlackMs]));
+        + '+ %d ms)', [HitMs, HitBoundMs, WalkMultiple, WalkMs, BoundSlackMs]));
     if AdmitMs >= BoundMs then
       Fail(Format('admission took %d ms; bound %d ms (%d x one %d ms cache '
-        + 'walk + %d ms)', [AdmitMs, BoundMs, WalkMultiple, WalkMs,
+        + 'walk + %d x %d ms deleting %d files + %d ms)', [AdmitMs, BoundMs,
+        WalkMultiple, WalkMs, DeleteMultiple, DeleteMs, Evictions,
         BoundSlackMs]));
   finally
     IndexLines.Free;
