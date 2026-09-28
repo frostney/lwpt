@@ -21,6 +21,8 @@ type
     procedure Publish(const AName, AVersion: string; const AArchive: TBytes);
     procedure Start;
     procedure Stop;
+    { Points the stopped origin at APort, e.g. one a test already holds. }
+    procedure MoveToPort(const APort: Word);
     property Root: string read FRoot;
     { The current transport URL; it changes if a start relocates the port. }
     property BaseURL: string read FBaseURL;
@@ -31,6 +33,10 @@ type
   end;
 
 function FindAvailableRegistryTestPort: Word;
+{ Moves an initialized data directory's transport to APort and returns the
+  new base URL. The origin identity and role stay as initialized. }
+function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
+  const APort: Word): string;
 { Starts `registry serve` and waits until this child, not another process,
   serves ABaseURL. A port taken between selection and bind is recovered
   deterministically: the data directory is moved to a fresh port, ABaseURL is
@@ -132,21 +138,18 @@ const
   RegistryStartAttempts = 5;
   RegistryReadyMilliseconds = 5000;
 
-{ Moves an initialized data directory to a newly selected port. Only the
-  transport lines change; the origin identity and role stay as initialized. }
-function RelocateRegistryPort(const ADataDirectory, ABaseURL: string): string;
+function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
+  const APort: Word): string;
 var
   Lines: TStringList;
   Index: Integer;
-  Port: Word;
   Authority, Path: string;
 begin
-  Port := FindAvailableRegistryTestPort;
   Authority := Copy(ABaseURL, Pos('://', ABaseURL) + 3, MaxInt);
   Path := '';
   if Pos('/', Authority) > 0 then
     Path := Copy(Authority, Pos('/', Authority), MaxInt);
-  Result := 'http://localhost:' + IntToStr(Port) + Path;
+  Result := 'http://localhost:' + IntToStr(APort) + Path;
   Lines := TStringList.Create;
   try
     Lines.LineBreak := #10;
@@ -155,11 +158,18 @@ begin
       if Pos('base_url = ', Lines[Index]) = 1 then
         Lines[Index] := 'base_url = "' + Result + '"'
       else if Pos('port = ', Lines[Index]) = 1 then
-        Lines[Index] := 'port = ' + IntToStr(Port);
+        Lines[Index] := 'port = ' + IntToStr(APort);
     Lines.SaveToFile(ADataDirectory + '/registry.toml');
   finally
     Lines.Free;
   end;
+end;
+
+{ Moves an initialized data directory to a newly selected port. }
+function RelocateRegistryPort(const ADataDirectory, ABaseURL: string): string;
+begin
+  Result := RelocateRegistryPortTo(ADataDirectory, ABaseURL,
+    FindAvailableRegistryTestPort);
 end;
 
 function StartRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
@@ -333,6 +343,13 @@ end;
 procedure TRegistryOriginFixture.Stop;
 begin
   StopRegistryCLI(FProcess);
+end;
+
+procedure TRegistryOriginFixture.MoveToPort(const APort: Word);
+begin
+  if Assigned(FProcess) then
+    raise Exception.Create('registry origin must be stopped before moving');
+  FBaseURL := RelocateRegistryPortTo(FRoot, FBaseURL, APort);
 end;
 
 end.

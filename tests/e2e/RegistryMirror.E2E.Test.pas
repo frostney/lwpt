@@ -661,38 +661,23 @@ begin
   end;
 end;
 
-function URLPort(const AURL: string): Word;
-var
-  Authority: string;
-begin
-  Authority := Copy(AURL, Pos('://', AURL) + 3, MaxInt);
-  if Pos('/', Authority) > 0 then Authority := Copy(Authority, 1, Pos('/', Authority) - 1);
-  Result := StrToInt(Copy(Authority, Pos(':', Authority) + 1, MaxInt));
-end;
-
 procedure TRegistryMirrorE2E.OriginStartRecoversFromPortCollision;
 var
   Occupier: TRegistryTestServer;
   BaseBefore: string;
 begin
   FOrigin.Publish('package', '1.0.0', BytesOf('archive'));
-  { Another listener takes the origin's configured port before it starts. }
-  BaseBefore := FOrigin.BaseURL;
-  { The port was chosen and released earlier, so another process may hold
-    it already. Either way it is occupied, which is the scenario under
-    test; the occupier's own request count is only checked when it bound. }
+  { The occupier binds a kernel-chosen port first and the origin is then
+    configured for it, so the collision is certain rather than raced. }
+  Occupier := TRegistryTestServer.Create(nil, True);
   try
-    Occupier := TRegistryTestServer.Create(nil, True, URLPort(BaseBefore));
-  except
-    Occupier := nil;
-  end;
-  try
+    FOrigin.MoveToPort(Occupier.Port);
+    BaseBefore := FOrigin.BaseURL;
     FOrigin.Start;
     Expect<Boolean>(FOrigin.BaseURL <> BaseBefore).ToBe(True);
     Expect<Boolean>(Pos('base_url = "' + FOrigin.BaseURL + '"', Text(RegistryHTTPBody(
       FOrigin.BaseURL + '/.well-known/' + RegistryProgramName + '-registry'))) > 0).ToBe(True);
-    if Assigned(Occupier) then
-      Expect<Integer>(Occupier.RequestCount).ToBe(0);
+    Expect<Integer>(Occupier.RequestCount).ToBe(0);
     { The identity pinned by mirrors is unchanged by relocation. }
     RequireSuccess('mirror init against the relocated origin',
       InitMirror(FOrigin.KeyID, FOrigin.PublicKey));
@@ -710,23 +695,19 @@ var
 begin
   FOrigin.Start;
   RequireSuccess('uninitialized mirror init', InitMirror(FOrigin.KeyID, FOrigin.PublicKey));
-  { A listener on the never-synchronized mirror's port answers discovery
-    with the mirror's own base URL; it must not be mistaken for the mirror. }
-  URLBefore := FMirrorURL;
-  SetLength(Routes, 1);
-  Routes[0] := RegistryRoute('/mirror/.well-known/' + RegistryProgramName + '-registry',
-    'application/vnd.' + RegistryProgramName + '.registry-discovery+toml',
-    BytesOf('base_url = "' + URLBefore + '"' + #10));
-  { As above: if another process already holds the released port, the
-    mirror still faces an occupied port and must relocate. }
+  { The impostor binds a kernel-chosen port first and the never-synchronized
+    mirror is then configured for it. It answers discovery with the mirror's
+    own base URL and must not be mistaken for the mirror. }
+  Impostor := TRegistryTestServer.Create(nil, True);
   try
-    Impostor := TRegistryTestServer.Create(Routes, True, URLPort(URLBefore));
-  except
-    Impostor := nil;
-  end;
-  try
-    if Assigned(Impostor) then
-      Impostor.Start;
+    FMirrorURL := RelocateRegistryPortTo(FMirrorRoot, FMirrorURL, Impostor.Port);
+    URLBefore := FMirrorURL;
+    SetLength(Routes, 1);
+    Routes[0] := RegistryRoute('/mirror/.well-known/' + RegistryProgramName + '-registry',
+      'application/vnd.' + RegistryProgramName + '.registry-discovery+toml',
+      BytesOf('base_url = "' + URLBefore + '"' + #10));
+    Impostor.SetRoutes(Routes);
+    Impostor.Start;
     FMirrorServer := StartRegistryCLI(FMirrorRoot, FMirrorURL);
     Expect<Boolean>(FMirrorURL <> URLBefore).ToBe(True);
     Expect<Boolean>(Pos('role = "mirror"', Text(RegistryHTTPBody(
