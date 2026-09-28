@@ -10,8 +10,8 @@ platform	windows/x86_64
 program	*	packages/cli/source/CLI.Events.Test.pas	1	5
 program	*	packages/cli/source/CLI.Parser.Test.pas	1	9
 program	*	packages/cli/source/CLI.Subcommands.Test.pas	1	8
-program	*	packages/httpclient/source/HTTPClient.Test.pas	5	56
-program	windows/*	packages/httpclient/source/HTTPClient.Test.pas	5	54
+program	*	packages/httpclient/source/HTTPClient.Test.pas	5	57
+program	windows/*	packages/httpclient/source/HTTPClient.Test.pas	5	55
 program	*	packages/httpclient/source/TransportSecurity.Test.pas	1	44
 program	*	packages/httpclient/tests/e2e/TransportSecuritySocket.E2E.Test.pas	0	0
 program	linux/*	packages/httpclient/tests/e2e/TransportSecuritySocket.E2E.Test.pas	1	3
@@ -42,7 +42,10 @@ program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
 program	*	source/LWPT.FetchPolicy.Test.pas	1	10
 program	*	source/LWPT.Formatter.Test.pas	7	97
+program	*	source/LWPT.GitPack.Test.pas	1	23
+program	*	source/LWPT.GitProtocol.Test.pas	4	48
 program	*	source/LWPT.Health.Test.pas	1	11
+program	*	source/LWPT.SHA1.Test.pas	1	2
 program	*	source/LWPT.TestArtifactSet.Test.pas	1	9
 program	windows/*	source/LWPT.TestArtifactSet.Test.pas	1	7
 program	*	source/LWPT.TestInventory.Test.pas	1	7
@@ -89,6 +92,7 @@ program	*	tests/integration/Duplication.Test.pas	1	6
 program	*	tests/integration/ExtractPathological.Test.pas	2	14
 program	*	tests/integration/Hooks.Test.pas	1	11
 program	*	tests/integration/Init.Test.pas	1	21
+program	*	tests/integration/InstallCommitPin.Test.pas	1	12
 program	*	tests/integration/InstallFetchFailure.Test.pas	4	24
 program	*	tests/integration/InstallGitGraph.Test.pas	1	30
 program	*	tests/integration/InstallGraphConflict.Test.pas	1	20

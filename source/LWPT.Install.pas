@@ -21,6 +21,8 @@ type
     CommitSHA    : string;       { authoritative fetched commit identity }
     RefKind      : string;       { RefKindTag / RefKindBranch for a named
                                    ref; '' for SHA pins and non-Git sources }
+    ReachableFrom: string;       { ref that proved a commit-SHA pin
+                                   reachable (ADR-0047); '' otherwise }
     SourceIdentity: string;      { canonical source + extraction policy identity }
     ConstraintFingerprint: string; { complete graph requirements for frozen }
     SrcOriginal  : string;       { the manifest's source string, verbatim }
@@ -72,6 +74,7 @@ type
     Version     : string;            { concrete (resolved ref or SHA) }
     CommitSHA   : string;            { authoritative advertised identity }
     RefKind     : string;            { RefKindTag / RefKindBranch or '' }
+    ReachableFrom: string;           { proving ref of a SHA pin or '' }
     SourceIdentity: string;
     ConstraintFingerprint: string;
     ResolvedURL : string;            { actual archive URL fetched }
@@ -149,6 +152,7 @@ uses
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
   HTTPClient,
   LWPT.FetchPolicy,
+  LWPT.GitPack,
   LWPT.GitProtocol,
   LWPT.ObjectStore,
   LWPT.ProducerLease,
@@ -499,7 +503,8 @@ end;
                     without v as the repo published it).
     vkSemverExact → try the spec verbatim AND v<spec> against the
                     tag list; first match wins.
-    vkCommitSha   → returned verbatim (no tag lookup needed).
+    vkCommitSha   → returned verbatim once proven reachable from an
+                    advertised branch or tag (ADR-0047).
     vkLiteralTag  → returned verbatim (no SemVer logic). If the tag
                     isn't actually present in the repo, the eventual
                     fetch will 404 — we surface that as EFetchError.
@@ -1562,6 +1567,31 @@ end;
 { TomlEscape lives in LWPT.Core — shared with LWPT.ManifestEdit so the
   lockfile writer and the manifest editor can't drift apart. }
 
+{ Frozen and offline installs never contact the host, so they cannot prove
+  a commit-SHA pin. A lock entry without a valid `reachableFrom` (a ref
+  under refs/heads/ or refs/tags/) was written before proofs existed, or by
+  hand; it is still installed from its hashes, but the user is told it is
+  unproven (ADR-0047). }
+procedure WarnUnprovenPin(const AMode, AName: string;
+  const AKinds: array of TVersionKind; ASrcKind: TSourceKind;
+  const AEntry: TResolved);
+var k: Integer; HasCommitPin: Boolean; Commit: string;
+begin
+  if (ASrcKind <> skGitHost) or IsProvingRefName(AEntry.ReachableFrom) then
+    Exit;
+  Commit := AEntry.CommitSHA;
+  if Commit = '' then Commit := AEntry.Version;
+  { Any SHA requirement, alone or beside a named one, needs a proof. }
+  HasCommitPin := False;
+  for k := 0 to High(AKinds) do
+    HasCommitPin := HasCommitPin or (AKinds[k] = vkCommitSha);
+  if not HasCommitPin then Exit;
+  WriteLn(ErrOutput, 'warning: ', AMode, ' lock entry for "', AName,
+    '" pins commit ', LowerCase(Commit), ' without a ',
+    'reachability proof; run `', PROGRAM_NAME, ' install` online to prove ',
+    'it belongs to the repository''s branches or tags');
+end;
+
 procedure WriteLock(const APath, ATmpRoot: string;
   const AResolved: array of TResolved);
 var
@@ -1599,6 +1629,10 @@ begin
       { Additive v3 evidence (ADR-0048), written only for named Git refs. }
       if AResolved[i].RefKind <> '' then
         KV('resolvedRefKind', AResolved[i].RefKind);
+      { Additive v3 evidence (ADR-0047): the ref that proved a commit-SHA
+        pin reachable. Its absence means the pin was never proven. }
+      if AResolved[i].ReachableFrom <> '' then
+        KV('reachableFrom', AResolved[i].ReachableFrom);
       KV('sourceIdentity', AResolved[i].SourceIdentity);
       KV('constraintFingerprint', AResolved[i].ConstraintFingerprint);
       KV('resolvedURL',  AResolved[i].ResolvedURL);
@@ -1753,6 +1787,7 @@ begin
       Entry.Version     := TomlStr(EntryNode, 'resolvedRef', '');
       Entry.CommitSHA   := TomlStr(EntryNode, 'resolvedCommit', '');
       Entry.RefKind     := TomlStr(EntryNode, 'resolvedRefKind', '');
+      Entry.ReachableFrom := TomlStr(EntryNode, 'reachableFrom', '');
       Entry.SourceIdentity := TomlStr(EntryNode, 'sourceIdentity', '');
       Entry.ConstraintFingerprint := TomlStr(EntryNode,
         'constraintFingerprint', '');
@@ -1832,6 +1867,7 @@ begin
     AResolved[i].Version := AResolution.Nodes[i].Version;
     AResolved[i].CommitSHA := AResolution.Nodes[i].CommitSHA;
     AResolved[i].RefKind := AResolution.Nodes[i].RefKind;
+    AResolved[i].ReachableFrom := AResolution.Nodes[i].ReachableFrom;
     AResolved[i].SourceIdentity := AResolution.Nodes[i].SourceIdentity;
     AResolved[i].ConstraintFingerprint :=
       AResolution.Nodes[i].ConstraintFingerprint;
@@ -2445,7 +2481,7 @@ procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
   const AOffline, AAcceptMovedTags: Boolean);
 type
   TSelectionState = record
-    Name, SourceIdentity, RefName, CommitSHA, RefKind: string;
+    Name, SourceIdentity, RefName, CommitSHA, RefKind, ReachableFrom: string;
   end;
   TSelectionStateArray = array of TSelectionState;
   TRefCacheEntry = record
@@ -2457,6 +2493,7 @@ var
   Previous, Desired: TSelectionStateArray;
   OfflineResolved: TResolvedArray;
   RefCache: TRefCache;
+  VerifiedPins: TStringList;
   SeenSignatures: TStringList;
   PlanRoot, PlanModules, PlanArchives, PlanScratch: string;
   Round, i, j, idx, Head: Integer;
@@ -2582,6 +2619,9 @@ var
     AState.RefName := Entry.Version;
     AState.CommitSHA := LockedCommitIdentity(Entry);
     AState.RefKind := Entry.RefKind;
+    AState.ReachableFrom := Entry.ReachableFrom;
+    WarnUnprovenPin('[offline]', ANode.Name, ANode.Kinds, ANode.Dep.SrcKind,
+      Entry);
   end;
 
   procedure StageLockedArchive(const ANode: TResolveNode;
@@ -2881,6 +2921,94 @@ var
     Result := Entry.ArchiveHash;
   end;
 
+  function NewUploadPackTransport(
+    const ANode: TResolveNode): TGitUploadPackTransport;
+  {$IFDEF INSTALL_TESTING}
+  var FixtureRoot: string;
+  {$ENDIF}
+  begin
+    {$IFDEF INSTALL_TESTING}
+    FixtureRoot := SysUtils.GetEnvironmentVariable(
+      PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR');
+    if FixtureRoot <> '' then
+      Exit(TGitFixtureUploadPackTransport.Create(FixtureRoot, 0, True));
+    {$ENDIF}
+    { The same destination policy as ref listing and archive fetches. }
+    Result := THTTPGitUploadPackTransport.Create(DependencyFetchOptions(
+      ANode.Dep, ANode.CustomSources, DefaultHTTPRequestOptions));
+  end;
+
+  { A commit-SHA pin is accepted only when the commit is reachable from an
+    advertised refs/heads/* or refs/tags/* tip (ADR-0047): the archive
+    endpoint also serves commits that exist only in forks or pull requests.
+    The proof runs when the lock entry is created, when its commit changes,
+    and when a locked entry lacks `reachableFrom`. An entry for the same
+    source at the same commit that records its proving ref is trusted like
+    the committed archive it names. Returns the proving ref. }
+  function VerifyCommitPin(const ANode: TResolveNode;
+    const ACommit: string): string;
+  var
+    RepoURL: string;
+    Entry: TResolved;
+    Refs: TGitRefArray;
+    Transport: TGitUploadPackTransport;
+    Outcome: TGitReachabilityResult;
+  begin
+    RepoURL := GitRepoURL(ANode.Dep, ANode.CustomSources);
+    Result := VerifiedPins.Values[RepoURL + '@' + LowerCase(ACommit)];
+    if Result <> '' then Exit;
+    { Only an entry that records its proof is trusted; a v3 entry without
+      `reachableFrom` predates proofs and is proven now. }
+    if FindPriorLock(ANode, Entry)
+       and SameText(LockedCommitIdentity(Entry), ACommit)
+       and IsProvingRefName(Entry.ReachableFrom) then
+      Exit(Entry.ReachableFrom);
+    Refs := CachedRefs(ANode);
+    WriteLn('  verifying commit ', LowerCase(ACommit), ' for ', ANode.Name,
+      '...');
+    Transport := NewUploadPackTransport(ANode);
+    try
+      try
+        Outcome := ProveCommitReachable(Transport, RepoURL, ACommit, Refs);
+      except
+        on E: ELWPTError do
+          raise;
+        on E: Exception do
+          raise EFetchError.CreateFmt(
+            'dependency "%s": cannot verify that commit %s belongs to %s: '
+            + '%s. Pin a tag or branch instead, or a commit that is an '
+            + 'advertised branch or tag tip.',
+            [ANode.Name, LowerCase(ACommit), RepoURL, E.Message]);
+      end;
+    finally
+      Transport.Free;
+    end;
+    if not Outcome.Known then
+      raise EVerifyError.CreateFmt(
+        'dependency "%s": commit %s does not exist in %s',
+        [ANode.Name, LowerCase(ACommit), RepoURL]);
+    if not Outcome.Reachable then
+      raise EVerifyError.CreateFmt(
+        'dependency "%s": commit %s is not reachable from any branch or tag '
+        + 'of %s. It may exist only in a fork or a pull request, or the '
+        + 'branch that contained it was deleted or force-pushed. Pin a '
+        + 'commit from the repository''s own history.',
+        [ANode.Name, LowerCase(ACommit), RepoURL]);
+    WriteLn('  verified commit ', LowerCase(ACommit), ' for ', ANode.Name,
+      ': reachable from ', Outcome.ProvingRef, ' (', Outcome.Requests,
+      ' requests, ', Outcome.BytesReceived, ' bytes)');
+    Result := Outcome.ProvingRef;
+    VerifiedPins.Values[RepoURL + '@' + LowerCase(ACommit)] := Result;
+  end;
+
+  function NodeHasCommitPin(const ANode: TResolveNode): Boolean;
+  var k: Integer;
+  begin
+    Result := False;
+    for k := 0 to High(ANode.Kinds) do
+      Result := Result or (ANode.Kinds[k] = vkCommitSha);
+  end;
+
   function SelectNode(const ANode: TResolveNode): TSelectionState;
   var
     Requirements: TResolverRequirementArray;
@@ -2917,6 +3045,18 @@ var
       Exit;
     end;
 
+    { Only a full id can be proven or unambiguously compared: an
+      abbreviated one could name a different, fork-only commit on a host
+      that resolves prefixes. This holds beside named requirements too. }
+    for k := 0 to High(ANode.Kinds) do
+      if (ANode.Kinds[k] = vkCommitSha)
+         and (Length(ANode.Specs[k]) <> GIT_OBJECT_ID_LENGTH) then
+        raise EManifestError.CreateFmt(
+          'dependency "%s": commit pin "%s" (required by %s) is abbreviated. '
+          + '%s verifies that a pinned commit belongs to the repository and '
+          + 'needs the full %d-character SHA.', [ANode.Name, ANode.Specs[k],
+          ANode.Requirers[k], PROGRAM_NAME, GIT_OBJECT_ID_LENGTH]);
+
     AllSHA := Length(ANode.Kinds) > 0;
     Longest := 0;
     for k := 0 to High(ANode.Kinds) do
@@ -2932,6 +3072,7 @@ var
              Copy(ANode.Specs[Longest], 1, Length(ANode.Specs[k]))) then
           RaiseNodeConflict(ANode, '', '',
             'SHA requirements do not identify the same commit');
+      Result.ReachableFrom := VerifyCommitPin(ANode, ANode.Specs[Longest]);
       Result.RefName := ANode.Specs[Longest];
       Result.CommitSHA := ANode.Specs[Longest];
       Exit;
@@ -2955,9 +3096,15 @@ var
           { The fetch that follows must reproduce the locked archive bytes
             (ExpectedVerifyHash), so an unreachable advertisement cannot be
             used to smuggle different content in under the locked identity. }
+          { A SHA requirement cannot fall back on an entry that never
+            recorded a proof: without the listing it cannot be proven. }
+          if NodeHasCommitPin(ANode)
+             and not IsProvingRefName(PriorEntry.ReachableFrom) then
+            raise;
           Result.RefName := PriorEntry.Version;
           Result.CommitSHA := PriorEntry.CommitSHA;
           Result.RefKind := PriorEntry.RefKind;
+          Result.ReachableFrom := PriorEntry.ReachableFrom;
           WriteLn(ErrOutput, 'warning: tag resolution for ', ANode.Name,
             ' failed: ', E.Message, '; reusing verified lockfile identity');
           Exit;
@@ -2977,6 +3124,15 @@ var
     Result.CommitSHA := Selection.CommitSHA;
     Result.RefKind := SelectedRefKind(ANode, Refs, Selection);
     RejectMovedRef(ANode, Result);
+    { A SHA requirement beside named ones selects the same commit as the
+      named ref, but only through the listing's (possibly peeled) claim.
+      It is proven exactly like a lone pin (ADR-0047). }
+    for k := 0 to High(ANode.Kinds) do
+      if ANode.Kinds[k] = vkCommitSha then
+      begin
+        Result.ReachableFrom := VerifyCommitPin(ANode, ANode.Specs[k]);
+        Break;
+      end;
   end;
 
   procedure EnqueueNode(AIndex: Integer);
@@ -3130,6 +3286,7 @@ begin
   PlanScratch := PlanRoot + '/scratch';
   Previous := nil;
   RefCache := nil;
+  VerifiedPins := TStringList.Create;
   SeenSignatures := TStringList.Create;
   try
     Round := 0;
@@ -3172,6 +3329,7 @@ begin
               R.Nodes[idx].Version := Previous[j].RefName;
               R.Nodes[idx].CommitSHA := Previous[j].CommitSHA;
               R.Nodes[idx].RefKind := Previous[j].RefKind;
+              R.Nodes[idx].ReachableFrom := Previous[j].ReachableFrom;
             end
             else
             begin
@@ -3181,6 +3339,7 @@ begin
               R.Nodes[idx].Version := Desired[0].RefName;
               R.Nodes[idx].CommitSHA := Desired[0].CommitSHA;
               R.Nodes[idx].RefKind := Desired[0].RefKind;
+              R.Nodes[idx].ReachableFrom := Desired[0].ReachableFrom;
             end;
           end;
         except
@@ -3366,6 +3525,10 @@ begin
         Stable := Stable
           and (Desired[i].RefName = R.Nodes[i].Version)
           and SameText(Desired[i].CommitSHA, R.Nodes[i].CommitSHA);
+        { The node may have been staged before a later round added a SHA
+          requirement; the proof belongs to the complete requirement set. }
+        if SameText(Desired[i].CommitSHA, R.Nodes[i].CommitSHA) then
+          R.Nodes[i].ReachableFrom := Desired[i].ReachableFrom;
       end;
       if not Stable then
       begin
@@ -3398,6 +3561,7 @@ begin
     end;
   finally
     SeenSignatures.Free;
+    VerifiedPins.Free;
     if DirectoryExists(PlanRoot) then WipeDir(PlanRoot);
   end;
 end;
@@ -3963,6 +4127,9 @@ begin
         Resolved[i].Version := FrozenLock.Version;
         Resolved[i].CommitSHA := FrozenLock.CommitSHA;
         Resolved[i].RefKind := FrozenLock.RefKind;
+        Resolved[i].ReachableFrom := FrozenLock.ReachableFrom;
+        WarnUnprovenPin('[frozen]', Resolved[i].Name, R.Nodes[i].Kinds,
+          Resolved[i].SrcKind, FrozenLock);
         HasCommitConstraint := False;
         for j := 0 to High(R.Nodes[i].Kinds) do
           HasCommitConstraint := HasCommitConstraint

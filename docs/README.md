@@ -65,6 +65,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0037](./adr/0037-verified-build-result-cache.md) | Verified compiler-neutral build-result reuse through per-user immutable manifests and artifacts, with explicit bypass |
 | [0043](./adr/0043-self-hosted-registry-origin.md) | Self-hosted registry origin command family, content-addressed storage, atomic signed state, recovery, and native TLS lifecycle |
 | [0044](./adr/0044-test-seams-only-in-test-builds.md) | `LWPT_TEST_*` fetch and fault seams compile only into the `lwpt-testing` build (`INSTALL_TESTING`); release binaries ignore them |
+| [0047](./adr/0047-commit-pins-must-be-reachable.md) | Commit-SHA pins must be full SHAs reachable from an advertised branch or tag, proven with a commits-only protocol v2 fetch; amends [0009](./adr/0009-source-syntax-and-tag-resolution.md) |
 | [0048](./adr/0048-git-host-fetch-trust.md) | Dependency fetches require HTTPS and declared hosts on every hop, refuse every non-globally-reachable address (classified in binary against the IANA registries), and treat locked tags and archives as immutable unless `--accept-moved-tags` |
 
 ## Spikes
