@@ -854,14 +854,22 @@ end;
   archive bytes for a dependency -- a fresh download or a resolver candidate
   another dependency already fetched -- calls this before using them. }
 procedure EnsureLockedArchiveIdentity(const ADependency, AContext,
-  AExpected, AActual: string);
+  AExpected, AActual, ARecovery: string); overload;
 begin
   if (AExpected <> '') and not SameText(AActual, AExpected) then
     raise EVerifyError.CreateFmt(
       'dependency "%s": %s (locked archive %s, received %s). Nothing was '
-      + 'published. Review the upstream change, then run `%s install '
-      + '--accept-moved-tags` to accept it.',
-      [ADependency, AContext, AExpected, AActual, PROGRAM_NAME]);
+      + 'published. %s',
+      [ADependency, AContext, AExpected, AActual, ARecovery]);
+end;
+
+{ The online form: the recovery is a reviewed `--accept-moved-tags`. }
+procedure EnsureLockedArchiveIdentity(const ADependency, AContext,
+  AExpected, AActual: string); overload;
+begin
+  EnsureLockedArchiveIdentity(ADependency, AContext, AExpected, AActual,
+    'Review the upstream change, then run `' + PROGRAM_NAME + ' install '
+    + '--accept-moved-tags` to accept it.');
 end;
 
 { AVerifyArchiveHash, when set, is the locked content identity the downloaded
@@ -2458,7 +2466,7 @@ var
   ChildManifestPath, ManifestRelDir, ExtractTmp: string;
   UnitDir, Archive, ArchiveHash, ResolvedURL, CacheArchive,
     ExpectedArchiveHash, VerifyArchiveHash, VerifyContext: string;
-  FetchRef, RollbackFailures: string;
+  FetchRef, RollbackFailures, StagedRefLabel: string;
   SelectionDeferred, Stable: Boolean;
 
   procedure CopyCustomSources(const ASrc: TCustomSourceArray;
@@ -3198,6 +3206,24 @@ begin
         begin
           if FileExists(CacheArchive) then
           begin
+            { The candidate was staged for another dependency naming the same
+              source and ref, so this node's own locked archive identity is
+              checked before its bytes are copied or extracted (ADR-0048). }
+            if not FindPriorLock(R.Nodes[idx], LockedEntry) then
+              raise EVerifyError.CreateFmt(
+                '[offline] dependency "%s" has no compatible lock entry',
+                [R.Nodes[idx].Name]);
+            if R.Nodes[idx].CommitSHA <> '' then
+              StagedRefLabel := 'commit ' + LowerCase(FetchRef)
+            else
+              StagedRefLabel := 'ref ' + FetchRef;
+            EnsureLockedArchiveIdentity(R.Nodes[idx].Name,
+              Format('[offline] the archive staged for locked %s by '
+                + 'another dependency does not match %s',
+                [StagedRefLabel, LWPT.Core.LOCKFILE]),
+              LockedEntry.ArchiveHash, 'sha256:' + SHA256File(CacheArchive),
+              'Restore the committed archives, or run `' + PROGRAM_NAME
+              + ' install` online to resolve the dependency again.');
             UnitDir := IncludeTrailingPathDelimiter(PlanModules)
               + R.Nodes[idx].Name;
             Archive := ArchivePathForRef(PlanArchives, R.Nodes[idx].Name,
@@ -3208,10 +3234,6 @@ begin
                 '[offline] failed to restore staged candidate "%s"',
                 [R.Nodes[idx].Name]);
             ArchiveHash := 'sha256:' + SHA256File(Archive);
-            if not FindPriorLock(R.Nodes[idx], LockedEntry) then
-              raise EVerifyError.CreateFmt(
-                '[offline] dependency "%s" has no compatible lock entry',
-                [R.Nodes[idx].Name]);
             ResolvedURL := LockedEntry.ResolvedURL;
           end
           else
