@@ -9,6 +9,7 @@ uses
   {$IFDEF UNIX}
   cthreads,
   BaseUnix,
+  Unix,
   {$ENDIF}
   Classes,
   Process,
@@ -18,7 +19,8 @@ uses
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
-  Tests.Scratch;
+  Tests.Scratch,
+  Tests.SpawnGuardProbe;
 
 const
   CHILD_SWITCH = '--worker-budget-child';
@@ -28,6 +30,9 @@ const
   RELEASE_RETRY_SWITCH = '--worker-budget-release-retry';
   THREAD_SWITCH = '--worker-budget-threads';
   POLL_SWITCH = '--worker-budget-poll';
+  FOREIGN_LOCK_SWITCH = '--worker-budget-foreign-lock';
+  GUARDED_PUBLICATION_SWITCH = '--worker-budget-guarded-publication';
+  UNREADABLE_OWN_SWITCH = '--worker-budget-unreadable-own';
   CORRUPT_OWNER_SWITCH = '--worker-budget-corrupt-owner';
   FANOUT_SWITCH = '--worker-budget-fanout';
   REUSE_SWITCH = '--worker-budget-token-reuse';
@@ -108,6 +113,11 @@ type
   public
     procedure SetupTests; override;
     procedure TestPersistentPolling;
+    {$IFDEF UNIX}
+    procedure TestForeignLocksAreTolerated;
+    procedure TestStatePublicationKeepsChildrenOut;
+    {$ENDIF}
+    procedure TestUnreadableOwnRequestIsNotPersisted;
     procedure TestContendersShareCapacityAndBothProgress;
     procedure TestRequestIsBoundedByMachineCapacity;
     {$IFDEF DARWIN}
@@ -289,6 +299,245 @@ end;
 procedure AddWorkerEnvironment(AProcess: TProcess;
   const AStateRoot: string; const ABudget: string = TEST_BUDGET); forward;
 
+procedure Require(const ACondition: Boolean; const AMessage: string);
+begin
+  if not ACondition then raise Exception.Create(AMessage);
+end;
+
+function ReadStateValue(const AName: string): string;
+var
+  Contents : TStringList;
+begin
+  Contents := TStringList.Create;
+  try
+    Contents.LoadFromFile(IncludeTrailingPathDelimiter(WorkerStateRoot)
+      + AName);
+    Result := Trim(Contents.Text);
+  finally
+    Contents.Free;
+  end;
+end;
+
+{$IFDEF UNIX}
+const
+  LOCKED_STATE_FILES : array[0..2] of string = (
+    'foreign-lock.request', 'budget', 'queue-sequence');
+  GUARDED_STATE_FILES : array[0..2] of string = (
+    'guarded.request', 'budget', 'queue-sequence');
+  PROBE_MAXIMUM_SPAWNS = 8;
+  PROBE_MINIMUM_PUBLICATIONS = 3;
+
+{ A process outside this toolkit's guard (for example an older LWPT binary
+  sharing the machine-wide state root) can still leave an exclusive flock on
+  published coordinator state. Reads must not depend on flock, so the owner
+  keeps its lease tokens, the stored budget and the queue sequence. }
+procedure CheckForeignLocksAreTolerated;
+var
+  Owner, Reader : TLWPTWorkerBudgetSession;
+  Lease, Second : TLWPTWorkerLease;
+  Environment : TStringList;
+  Snapshot : TLWPTWorkerBudgetSnapshot;
+  Entry : TLWPTWorkerBudgetEntry;
+  Descriptors : array[0..2] of LongInt;
+  Index : Integer;
+  QueueBefore : Int64;
+begin
+  Owner := nil;
+  Reader := nil;
+  Lease := nil;
+  Second := nil;
+  Environment := nil;
+  for Index := Low(Descriptors) to High(Descriptors) do
+    Descriptors[Index] := -1;
+  try
+    Owner := TLWPTWorkerBudgetSession.Create('foreign-lock', 2);
+    Lease := Owner.Acquire(0);
+    Require(Assigned(Lease), 'owner must acquire its first lease');
+    { The stored budget, not the configured one, is authoritative while any
+      session is registered. Make the two differ so a failed read shows. }
+    WriteTextFile(IncludeTrailingPathDelimiter(WorkerStateRoot) + 'budget',
+      '3');
+    QueueBefore := StrToInt64(ReadStateValue('queue-sequence'));
+    for Index := Low(LOCKED_STATE_FILES) to High(LOCKED_STATE_FILES) do
+    begin
+      Descriptors[Index] := FpOpen(PChar(
+        IncludeTrailingPathDelimiter(WorkerStateRoot)
+        + LOCKED_STATE_FILES[Index]), O_RDONLY);
+      Require(Descriptors[Index] >= 0,
+        LOCKED_STATE_FILES[Index] + ' must be openable');
+      Require(fpFlock(Descriptors[Index], LOCK_EX or LOCK_NB) = 0,
+        LOCKED_STATE_FILES[Index] + ' foreign lock must be held');
+    end;
+
+    Reader := TLWPTWorkerBudgetSession.Create('foreign-reader', 1);
+    Require(Reader.EffectiveBudget = 3,
+      'a locked budget file must still be read');
+    Second := Owner.Acquire(0);
+    Require(Assigned(Second), 'a locked request must not consume capacity');
+    Require(StrToInt64(ReadStateValue('queue-sequence')) = QueueBefore + 1,
+      'a locked queue sequence must still advance monotonically');
+    Environment := TStringList.Create;
+    AppendWorkerLeaseEnvironment(Environment, Lease);
+    Snapshot := GetWorkerBudgetSnapshot;
+    Require(Snapshot.ActiveWorkers = 2, 'both grants must remain counted');
+    for Entry in Snapshot.Entries do
+      Require(not Entry.Uncertain, 'readable entry reported as uncertain');
+    Lease.CancelPendingDelegation;
+    FreeAndNil(Second);
+    FreeAndNil(Lease);
+    Require(GetWorkerBudgetSnapshot.ActiveWorkers = 0, 'no leaked capacity');
+  finally
+    for Index := Low(Descriptors) to High(Descriptors) do
+      if Descriptors[Index] >= 0 then
+      begin
+        fpFlock(Descriptors[Index], LOCK_UN);
+        FpClose(Descriptors[Index]);
+      end;
+    Environment.Free;
+    Second.Free;
+    Lease.Free;
+    Reader.Free;
+    Owner.Free;
+  end;
+end;
+
+{ Starts a real child through the production spawn path inside every state
+  publication's open window. Each child must wait for the inheritance guard,
+  and none may keep a state descriptor or its exclusive flock afterwards.
+  Removing the guard from the shared protected open, or its close-on-exec
+  step, makes this fail on every Unix target. Lease tokens read
+  /dev/urandom while other scheduler threads spawn, so that read is probed
+  too. }
+procedure CheckStatePublicationKeepsChildrenOut;
+var
+  Session : TLWPTWorkerBudgetSession;
+  Lease, Second : TLWPTWorkerLease;
+  Environment : TStringList;
+  Snapshot : TLWPTWorkerBudgetSnapshot;
+  Entry : TLWPTWorkerBudgetEntry;
+  Descriptor : LongInt;
+  Index : Integer;
+  MarkerRoot, StateRoot : string;
+begin
+  Session := nil;
+  Lease := nil;
+  Second := nil;
+  Environment := nil;
+  StateRoot := IncludeTrailingPathDelimiter(WorkerStateRoot);
+  MarkerRoot := ExtractFileDir(ExcludeTrailingPathDelimiter(StateRoot))
+    + '/spawn-guard-probe';
+  try
+    ArmSpawnGuardProbe(StateRoot + 'tmp' + PathDelim, MarkerRoot,
+      PROBE_MAXIMUM_SPAWNS);
+    try
+      Session := TLWPTWorkerBudgetSession.Create('guarded', 2);
+      Lease := Session.Acquire(0);
+    finally
+      DisarmSpawnGuardProbe;
+    end;
+    Require(SpawnGuardProbeError = '', SpawnGuardProbeError);
+    Require(Assigned(Lease), 'guarded session must acquire');
+    Require(SpawnGuardProbeAttempts >= PROBE_MINIMUM_PUBLICATIONS,
+      'budget, request and queue publications must all be probed');
+    Require(SpawnGuardProbeEscapes = 0,
+      'a child started inside a state publication open window');
+    Require(SpawnGuardProbeUnprotectedDescriptors = 0,
+      'a state publication descriptor lacks close-on-exec');
+    Require(SpawnGuardProbeLiveChildren = SpawnGuardProbeAttempts,
+      'every probe child must start once the guard is released');
+    Require(SpawnGuardProbeInheritedPublications = 0,
+      'a probe child inherited a published worker-state version: '
+      + SpawnGuardProbeError);
+    Require(SpawnGuardProbeInheritedFiles([StateRoot + 'transaction.lock',
+      StateRoot + 'guarded.owner']) = 0,
+      'a probe child inherited a worker-state lock descriptor: '
+      + SpawnGuardProbeError);
+    for Index := Low(GUARDED_STATE_FILES) to High(GUARDED_STATE_FILES) do
+    begin
+      Descriptor := FpOpen(PChar(StateRoot + GUARDED_STATE_FILES[Index]),
+        O_RDONLY);
+      Require(Descriptor >= 0, GUARDED_STATE_FILES[Index]
+        + ' must be openable');
+      try
+        Require(fpFlock(Descriptor, LOCK_EX or LOCK_NB) = 0,
+          'a probe child kept the publication lock on '
+          + GUARDED_STATE_FILES[Index]);
+        fpFlock(Descriptor, LOCK_UN);
+      finally
+        FpClose(Descriptor);
+      end;
+    end;
+    Environment := TStringList.Create;
+    AppendWorkerLeaseEnvironment(Environment, Lease);
+    Snapshot := GetWorkerBudgetSnapshot;
+    Require(Snapshot.ActiveWorkers = 1, 'the guarded grant must be counted');
+    for Entry in Snapshot.Entries do
+      Require(not Entry.Uncertain, 'readable entry reported as uncertain');
+    Lease.CancelPendingDelegation;
+    ReleaseSpawnGuardProbeChildren;
+
+    ArmSpawnGuardProbe('/dev/urandom', MarkerRoot + '/token',
+      PROBE_MAXIMUM_SPAWNS);
+    try
+      Second := Session.Acquire(0);
+    finally
+      DisarmSpawnGuardProbe;
+    end;
+    Require(SpawnGuardProbeError = '', SpawnGuardProbeError);
+    Require(Assigned(Second), 'the second grant must succeed');
+    Require(SpawnGuardProbeAttempts >= 1,
+      'lease-token randomness must be read through the protected open');
+    Require(SpawnGuardProbeEscapes = 0,
+      'a child started inside the lease-token open window');
+    Require(SpawnGuardProbeUnprotectedDescriptors = 0,
+      'the lease-token randomness descriptor lacks close-on-exec');
+    Require(SpawnGuardProbeLiveChildren = SpawnGuardProbeAttempts,
+      'every token probe child must report: ' + SpawnGuardProbeError);
+    Require(SpawnGuardProbeInheritedPublications = 0,
+      'a probe child inherited the lease-token randomness descriptor: '
+      + SpawnGuardProbeError);
+    FreeAndNil(Second);
+    FreeAndNil(Lease);
+  finally
+    Environment.Free;
+    Second.Free;
+    Lease.Free;
+    Session.Free;
+    ReleaseSpawnGuardProbeChildren;
+  end;
+end;
+{$ENDIF}
+
+{ An unreadable own request must fail the owner loudly. Persisting the
+  conservative full-budget placeholder would starve every session on the
+  machine until this owner exits. }
+procedure CheckUnreadableOwnRequestIsNotPersisted;
+var
+  Session : TLWPTWorkerBudgetSession;
+  Lease : TLWPTWorkerLease;
+  Raised : Boolean;
+begin
+  Session := nil;
+  Lease := nil;
+  try
+    Session := TLWPTWorkerBudgetSession.Create('unreadable-own', 2);
+    WriteTextFile(IncludeTrailingPathDelimiter(WorkerStateRoot)
+      + 'unreadable-own.request', 'corrupt');
+    Raised := False;
+    try
+      Lease := Session.Acquire(0);
+    except
+      on E: ELWPTWorkerBudgetError do Raised := True;
+    end;
+    Require(Raised, 'acquisition must fail on an unreadable own request');
+    Require(ReadStateValue('unreadable-own.request') = 'corrupt',
+      'conservative placeholder must not replace the request');
+  finally
+    Lease.Free;
+    Session.Free;
+  end;
+end;
+
 procedure CheckPersistentPolling;
 var
   Holder, First, Later : TLWPTWorkerBudgetSession;
@@ -394,6 +643,29 @@ begin
   if (ParamCount = 2) and (ParamStr(1) = POLL_SWITCH) then
   begin
     CheckPersistentPolling;
+    WriteTextFile(ParamStr(2), 'passed');
+    ExitCode := 0;
+    Exit(True);
+  end;
+  {$IFDEF UNIX}
+  if (ParamCount = 2) and (ParamStr(1) = FOREIGN_LOCK_SWITCH) then
+  begin
+    CheckForeignLocksAreTolerated;
+    WriteTextFile(ParamStr(2), 'passed');
+    ExitCode := 0;
+    Exit(True);
+  end;
+  if (ParamCount = 2) and (ParamStr(1) = GUARDED_PUBLICATION_SWITCH) then
+  begin
+    CheckStatePublicationKeepsChildrenOut;
+    WriteTextFile(ParamStr(2), 'passed');
+    ExitCode := 0;
+    Exit(True);
+  end;
+  {$ENDIF}
+  if (ParamCount = 2) and (ParamStr(1) = UNREADABLE_OWN_SWITCH) then
+  begin
+    CheckUnreadableOwnRequestIsNotPersisted;
     WriteTextFile(ParamStr(2), 'passed');
     ExitCode := 0;
     Exit(True);
@@ -2315,10 +2587,42 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/poll-result')).ToBe(True);
 end;
 
+{$IFDEF UNIX}
+procedure TWorkerBudgetProcesses.TestForeignLocksAreTolerated;
+begin
+  RunUtilityWithBudget(FOREIGN_LOCK_SWITCH,
+    FScratch + '/foreign-lock-result', '2');
+  Expect<Boolean>(FileExists(FScratch + '/foreign-lock-result')).ToBe(True);
+end;
+
+procedure TWorkerBudgetProcesses.TestStatePublicationKeepsChildrenOut;
+begin
+  RunUtilityWithBudget(GUARDED_PUBLICATION_SWITCH,
+    FScratch + '/guarded-publication-result', '2');
+  Expect<Boolean>(FileExists(
+    FScratch + '/guarded-publication-result')).ToBe(True);
+end;
+{$ENDIF}
+
+procedure TWorkerBudgetProcesses.TestUnreadableOwnRequestIsNotPersisted;
+begin
+  RunUtilityWithBudget(UNREADABLE_OWN_SWITCH,
+    FScratch + '/unreadable-own-result', '2');
+  Expect<Boolean>(FileExists(FScratch + '/unreadable-own-result')).ToBe(True);
+end;
+
 procedure TWorkerBudgetProcesses.SetupTests;
 begin
   Test('persistent polls retain FIFO position and withdraw abandoned demand',
     TestPersistentPolling);
+  {$IFDEF UNIX}
+  Test('foreign locks on request, budget and queue state are tolerated',
+    TestForeignLocksAreTolerated);
+  Test('state publications keep concurrent children out of the open window',
+    TestStatePublicationKeepsChildrenOut);
+  {$ENDIF}
+  Test('an unreadable own request is never overwritten with a placeholder',
+    TestUnreadableOwnRequestIsNotPersisted);
   {$IFDEF DARWIN}
   Test('default worker budget matches macOS logical CPUs',
     TestDefaultBudgetMatchesMacOS);
