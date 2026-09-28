@@ -1746,8 +1746,18 @@ begin
     TestRedirectToDisallowedHostIsRefused);
   Test('a redirect within the allowlist is followed',
     TestRedirectWithinAllowedHostsSucceeds);
+  {$IFDEF DARWIN}
+  { FPC 3.2.2's resolver on Darwin does not resolve hosts-file names such as
+    localhost (native macOS CI answers "Failed to resolve host"), so this
+    real-resolution case cannot observe the classification there. The
+    literal and registry-block cases below cover the classification itself. }
+  Skip('deny refuses a name that resolves to loopback before connecting',
+    TestDenyRefusesResolvedLoopbackBeforeConnect,
+    'the Darwin resolver does not resolve hosts-file names');
+  {$ELSE}
   Test('deny refuses a name that resolves to loopback before connecting',
     TestDenyRefusesResolvedLoopbackBeforeConnect);
+  {$ENDIF}
   Test('deny refuses non-global IPv4, mapped IPv6 and link-local literals',
     TestDenyRefusesNonGlobalLiteralsBeforeConnect);
   {$IFDEF HTTPCLIENT_TESTING}
