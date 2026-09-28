@@ -7,6 +7,10 @@ unit HTTPClient;
 
 {$I Shared.inc}
 
+{$IF DEFINED(DARWIN) OR (DEFINED(LINUX) AND NOT DEFINED(ANDROID))}
+{$DEFINE HTTPCLIENT_NATIVE_RESOLVER}
+{$ENDIF}
+
 interface
 
 uses
@@ -66,6 +70,11 @@ type
     RequestTimeoutMilliseconds: QWord;
     MaximumRedirects: Integer;
     Destination: THTTPDestinationPolicy;
+    { Optional canonical literal IPv4 address dialled for the first hop
+      without name resolution. The URL still supplies the Host header and
+      the TLS server name; redirects dial their own hosts. Cannot be combined
+      with an address policy. Empty dials the URL host as usual. }
+    ConnectAddress: string;
   end;
 
   EHTTPError = class(Exception);
@@ -150,7 +159,20 @@ implementation
 
 uses
   {$IFDEF UNIX}
-  Sockets, BaseUnix, NetDB,
+  BaseUnix,
+  Sockets,
+  {$IFDEF DARWIN}
+  CTypes,
+  InitC,
+  {$ELSE}
+  {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
+  cNetDB,
+  {$ELSE}
+  { Preserve the existing resolver on other Unix targets until their native
+    bindings have platform evidence; do not infer their addrinfo ABI. }
+  NetDB,
+  {$ENDIF}
+  {$ENDIF}
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   WinSock2,
@@ -184,6 +206,30 @@ type
     Port: Integer;
     Path: string;
   end;
+
+{$IFDEF DARWIN}
+{ Darwin netdb.h places canonname before addr, unlike Linux. socklen_t is
+  unsigned 32-bit on both Darwin release architectures, not pointer-sized. }
+{$push}
+{$packrecords c}
+type
+  PAddrInfo = ^TAddrInfo;
+  TAddrInfo = record
+    ai_flags, ai_family, ai_socktype, ai_protocol: cint;
+    ai_addrlen: cuint32;
+    ai_canonname: PAnsiChar;
+    ai_addr: PSockAddr;
+    ai_next: PAddrInfo;
+  end;
+  PPAddrInfo = ^PAddrInfo;
+{$pop}
+
+function Getaddrinfo(ANodeName, AServName: PAnsiChar;
+  AHints: PAddrInfo; AResult: PPAddrInfo): cint; cdecl;
+  external clib name 'getaddrinfo';
+procedure Freeaddrinfo(AInfo: PAddrInfo); cdecl;
+  external clib name 'freeaddrinfo';
+{$ENDIF}
 
 {$IFDEF MSWINDOWS}
 type
@@ -509,6 +555,48 @@ type
   THTTPIPv4Octets = array[0..3] of Byte;
 
 {$IFDEF UNIX}
+function ResolveSocketAddress(const AHost: string): in_addr;
+var
+  {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
+  Hints: TAddrInfo;
+  Addresses, Current: PAddrInfo;
+  {$ELSE}
+  HostEntry: THostEntry;
+  {$ENDIF}
+begin
+  Result := StrToNetAddr(AHost);
+  if Result.s_addr <> 0 then Exit;
+  {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
+  FillChar(Hints, SizeOf(Hints), 0);
+  Hints.ai_family := AF_INET;
+  Hints.ai_socktype := SOCK_STREAM;
+  Hints.ai_protocol := IPPROTO_TCP;
+  Addresses := nil;
+  { Native resolution honors system host databases and keeps its result list
+    request-local. It remains synchronous; ConnectSocket checks the shared
+    request deadline immediately after this lookup returns. }
+  if Getaddrinfo(PAnsiChar(AHost), nil, @Hints, @Addresses) <> 0 then
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  try
+    Current := Addresses;
+    while Current <> nil do
+    begin
+      if (Current^.ai_family = AF_INET) and (Current^.ai_addr <> nil)
+        and (Current^.ai_addrlen >= SizeOf(TInetSockAddr)) then
+        Exit(PInetSockAddr(Current^.ai_addr)^.sin_addr);
+      Current := Current^.ai_next;
+    end;
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  finally
+    if Addresses <> nil then Freeaddrinfo(Addresses);
+  end;
+  {$ELSE}
+  if not ResolveHostByName(AHost, HostEntry) then
+    raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
+  Result := HostEntry.Addr;
+  {$ENDIF}
+end;
+
 { Connects to exactly AAddress; no name resolution happens here. AHost only
   names the destination in error messages. }
 function ConnectIPv4Socket(const AAddress: THTTPIPv4Octets;
@@ -568,19 +656,11 @@ end;
 function ConnectSocket(const AHost: string; const APort: Integer;
   const ADeadline, ATimeoutMilliseconds: QWord): TSocket;
 var
-  HostEntry: THostEntry;
   Addr: in_addr;
   Octets: THTTPIPv4Octets;
 begin
-  // Try as numeric IP first
-  Addr := StrToNetAddr(AHost);
-  if Addr.s_addr = 0 then
-  begin
-    // DNS lookup via netdb
-    if not ResolveHostByName(AHost, HostEntry) then
-      raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
-    Addr := HostEntry.Addr;
-  end;
+  Addr := ResolveSocketAddress(AHost);
+  CheckRequestDeadline(ADeadline, ATimeoutMilliseconds);
   Move(Addr, Octets[0], SizeOf(Octets));
   Result := ConnectIPv4Socket(Octets, AHost, APort, ADeadline,
     ATimeoutMilliseconds);
@@ -1576,7 +1656,7 @@ end;
 function ResolveDestinationAddress(const AHost: string): THTTPAddress;
 {$IFDEF UNIX}
 var
-  HostEntry: THostEntry;
+  ResolvedAddress: in_addr;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
 var
@@ -1600,9 +1680,8 @@ begin
   else
   begin
     {$IFDEF UNIX}
-    if not ResolveHostByName(AHost, HostEntry) then
-      raise EHTTPError.CreateFmt('Failed to resolve host: %s', [AHost]);
-    Move(HostEntry.Addr, Result.Octets[0], IPv4OctetCount);
+    ResolvedAddress := ResolveSocketAddress(AHost);
+    Move(ResolvedAddress, Result.Octets[0], IPv4OctetCount);
     {$ENDIF}
     {$IFDEF MSWINDOWS}
     EnsureWinSockInit;
@@ -1768,12 +1847,20 @@ var
   I, Redirects: Integer;
   CurrentURL, Location, HostHeader: string;
   DialTarget: THTTPDialTarget;
+  ConnectOctets: THTTPIPv4Octets;
   HasRequestContent, HasUserAgent, IsHead: Boolean;
   HeaderName, Method, ContentType: string;
   Body: TBytes;
   Deadline, StartedAt: QWord;
 begin
   ValidateRequestOptions(AOptions);
+  if AOptions.ConnectAddress <> '' then
+  begin
+    if not TryParseIPv4(AOptions.ConnectAddress, ConnectOctets) then
+      raise EHTTPError.Create('HTTP connect address must be a canonical literal IPv4 address');
+    if AOptions.Destination.PrivateAddressPolicy <> papAllow then
+      raise EHTTPError.Create('HTTP connect address cannot be combined with an address policy');
+  end;
   if AManagesContentHeaders then
     ValidateRequestContentType(AContentType);
   StartedAt := GetTickCount64;
@@ -1799,6 +1886,11 @@ begin
     DialTarget := ResolveAllowedDestination(AOptions.Destination, Parsed);
     CheckRequestDeadline(Deadline, AOptions.RequestTimeoutMilliseconds);
     FillChar(Transport, SizeOf(Transport), 0);
+    if (AOptions.ConnectAddress <> '') and (Redirects = 0) then
+    begin
+      DialTarget.Pinned := True;
+      DialTarget.Address := ConnectOctets;
+    end;
     { TLS below still verifies Parsed.Host: pinning changes which address is
       dialled, never which identity the peer must prove. }
     if DialTarget.Pinned then
@@ -1928,6 +2020,7 @@ begin
   Result.Destination.AllowedHosts := nil;
   Result.Destination.PrivateAddressPolicy := papAllow;
   Result.Destination.RequireHTTPS := False;
+  Result.ConnectAddress := '';
 end;
 
 function HTTPURLHost(const AURL: string): string;
