@@ -51,6 +51,7 @@ type
     procedure TestLinkTargetIsOwnParentSkipped;
     procedure TestLinkTargetIsAncestorSkipped;
     procedure TestGnuLongNameOverridesHeaderName;
+    procedure TestArchivePathBeyond255Extracts;
   end;
 
   { ExtractArchive's failure modes — every bad-input path must
@@ -66,6 +67,8 @@ type
     procedure TestMissingArchiveRaisesEExtractError;
     procedure TestTruncatedGzipRaises;
     procedure TestInvalidGzipMagicRaises;
+    procedure TestGzipCrcMismatchRaisesAndCleansUp;
+    procedure TestOverlongEntryPathFailsBeforeWriting;
     procedure TestTarTruncatedMidEntryRaises;
     procedure TestParentTraversalPathRejected;
     procedure TestAbsoluteTraversalPathRejected;
@@ -367,6 +370,39 @@ begin
   Expect<Boolean>(BytesEqual(ExtractedBytes, Body)).ToBe(True);
 end;
 
+procedure TExtractPathological.TestArchivePathBeyond255Extracts;
+{ Issue #309: FPC's TGZFileStream passes the archive path to paszlib's
+  gzopen as a 255-character shortstring, so a longer path was truncated and
+  the open failed. The archive and its temporary tar both sit past that
+  limit here. }
+var
+  ArchiveDir, Archive, Dest: string;
+  Body: TBytes;
+  Count: Integer;
+begin
+  {$IFDEF MSWINDOWS}
+  { The fixture path itself exceeds legacy Windows MAX_PATH. }
+  Expect<Boolean>(True).ToBe(True);
+  Exit;
+  {$ENDIF}
+  ArchiveDir := ExpandFileName(FScratch + '/' + StringOfChar('a', 100) + '/'
+    + StringOfChar('b', 100) + '/' + StringOfChar('c', 60));
+  Archive := ArchiveDir + '/long-archive-path.tar.gz';
+  Expect<Boolean>(Length(Archive) > 255).ToBe(True);
+  Body := BytesOf('extracted from beyond the shortstring limit');
+  WriteBytesToFile(Archive, Gzip(BuildTar(
+    [MakeRegularFileEntry('top/leaf.txt', Body)])));
+  Dest := FScratch + '/long-archive-path-out';
+  ForceDirectories(Dest);
+
+  Count := ExtractArchive(Archive, Dest);
+
+  Expect<Integer>(Count).ToBe(1);
+  Expect<Boolean>(BytesEqual(ReadFileBytes(Dest + '/leaf.txt'), Body))
+    .ToBe(True);
+  Expect<Boolean>(FileExists(Archive + '.tar')).ToBe(False);
+end;
+
 procedure TExtractPathological.SetupTests;
 begin
   Test('regular file with short path: baseline sanity',
@@ -383,6 +419,8 @@ begin
     TestLinkTargetIsAncestorSkipped);
   Test('GNU L long-name entry overrides truncated header name',
     TestGnuLongNameOverridesHeaderName);
+  Test('an archive whose own path exceeds 255 characters extracts',
+    TestArchivePathBeyond255Extracts);
 end;
 
 { ── TExtractFailureModes ─────────────────────────────────────── }
@@ -423,12 +461,19 @@ begin
   end;
 end;
 
+function RaisesExtractError(const AArchive, ADest: string): Boolean;
+begin
+  Result := False;
+  try
+    ExtractArchive(AArchive, ADest);
+  except
+    on E: EExtractError do Result := True;
+  end;
+end;
+
 procedure TExtractFailureModes.TestTruncatedGzipRaises;
-{ zstream is tolerant of incomplete deflate streams (it stops at the
-  first error rather than raising). The contract we care about is
-  "no garbage is silently extracted as a real file" — the empty Dest
-  proves the corruption was noticed at some level (gzip → empty tar
-  → no entries → no files written). }
+{ A gzip header with no deflate data must raise, and nothing may be
+  extracted from it. }
 var
   Archive, Dest: string;
   Bytes: TBytes;
@@ -440,13 +485,13 @@ begin
   Bytes[0] := $1F; Bytes[1] := $8B;
   Bytes[2] := $08; Bytes[3] := $00;
   WriteBytesToFile(Archive, Bytes);
-  try ExtractArchive(Archive, Dest); except on Exception do; end;
+  Expect<Boolean>(RaisesExtractError(Archive, Dest)).ToBe(True);
   Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
 end;
 
 procedure TExtractFailureModes.TestInvalidGzipMagicRaises;
-{ Same contract: even though the input isn't gzip at all, the
-  extractor must not produce any output files. }
+{ Input that is not gzip at all must raise rather than be read as a raw
+  tar stream. }
 var
   Archive, Dest: string;
 begin
@@ -455,7 +500,59 @@ begin
   ForceDirectories(Dest);
   WriteBytesToFile(Archive,
     BytesOf('this is not a gzip stream; just plain text'));
-  try ExtractArchive(Archive, Dest); except on Exception do; end;
+  Expect<Boolean>(RaisesExtractError(Archive, Dest)).ToBe(True);
+  Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
+end;
+
+procedure TExtractFailureModes.TestGzipCrcMismatchRaisesAndCleansUp;
+{ Every deflate byte decodes, but the trailer CRC-32 does not match: the
+  archive must be rejected, nothing extracted, and the partial tar removed. }
+var
+  Archive, Dest: string;
+  Bytes: TBytes;
+begin
+  Archive := FScratch + '/bad-crc.tar.gz';
+  Dest    := FScratch + '/bad-crc-out';
+  ForceDirectories(Dest);
+  Bytes := Gzip(BuildTar(
+    [MakeRegularFileEntry('top/file.txt', BytesOf('checked content'))]));
+  { The trailer is CRC-32 then ISIZE, little-endian. }
+  Bytes[Length(Bytes) - 8] := Bytes[Length(Bytes) - 8] xor $01;
+  WriteBytesToFile(Archive, Bytes);
+  Expect<Boolean>(RaisesExtractError(Archive, Dest)).ToBe(True);
+  Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
+  Expect<Boolean>(FileExists(Archive + '.tar')).ToBe(False);
+end;
+
+procedure TExtractFailureModes.TestOverlongEntryPathFailsBeforeWriting;
+{ An entry whose destination is past every platform's path limit fails
+  with a path-length error before any entry, even an earlier short one, is
+  written. The operating system would otherwise fail part-way through with
+  an error that does not name the cause. }
+var
+  Archive, Dest, LongPath, Message: string;
+  i: Integer;
+begin
+  Archive := FScratch + '/overlong-entry.tar.gz';
+  Dest    := FScratch + '/overlong-entry-out';
+  ForceDirectories(Dest);
+  LongPath := 'top/';
+  for i := 1 to 20 do
+    LongPath := LongPath + StringOfChar('s', 240) + '/';
+  LongPath := LongPath + 'leaf.txt';
+  WriteBytesToFile(Archive, Gzip(BuildTar([
+    MakeRegularFileEntry('top/first.txt', BytesOf('written first')),
+    MakeGnuLongNameRegularFileEntry(LongPath, BytesOf('never written'))
+  ])));
+
+  Message := '';
+  try
+    ExtractArchive(Archive, Dest);
+  except
+    on E: EExtractError do Message := E.Message;
+  end;
+
+  Expect<Boolean>(Pos('too long', Message) > 0).ToBe(True);
   Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
 end;
 
@@ -571,10 +668,12 @@ procedure TExtractFailureModes.SetupTests;
 begin
   Test('missing archive path raises EExtractError',
     TestMissingArchiveRaisesEExtractError);
-  Test('truncated gzip stream raises (zstream rejects it)',
-    TestTruncatedGzipRaises);
-  Test('invalid gzip magic raises (zstream rejects it)',
-    TestInvalidGzipMagicRaises);
+  Test('truncated gzip stream raises EExtractError', TestTruncatedGzipRaises);
+  Test('invalid gzip magic raises EExtractError', TestInvalidGzipMagicRaises);
+  Test('gzip CRC-32 mismatch raises and removes the partial tar',
+    TestGzipCrcMismatchRaisesAndCleansUp);
+  Test('an over-long entry path fails before any entry is written',
+    TestOverlongEntryPathFailsBeforeWriting);
   Test('tar truncated mid-entry raises or extracts nothing',
     TestTarTruncatedMidEntryRaises);
   Test('archive entry with parent traversal is rejected',

@@ -370,7 +370,8 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
 `LWPT.GitProtocol.pas`, `LWPT.FetchPolicy.pas` (built-in forge origins and per-dependency fetch
-destination policy), and the `LWPT.Registry.*` origin storage, signing,
+destination policy), `LWPT.Gzip.pas` (stream-based RFC 1952 decoding for archive
+extraction), and the `LWPT.Registry.*` origin storage, signing,
 HTTP routing, and native macOS listener units) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
 LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` —

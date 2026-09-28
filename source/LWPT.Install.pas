@@ -150,12 +150,12 @@ uses
   HTTPClient,
   LWPT.FetchPolicy,
   LWPT.GitProtocol,
+  LWPT.Gzip,
   LWPT.ObjectStore,
   LWPT.ProducerLease,
   LWPT.Resolver,
   Semver,
-  TOML,
-  zstream;
+  TOML;
 
 const
   MAX_ARCHIVE_RESPONSE_BYTES = Int64(256) * 1024 * 1024;
@@ -1194,8 +1194,8 @@ begin
 end;
 
 { ===========================================================================
-  Archive extraction — gunzip (zstream) then untar (libtar).
-  GitHub serves .tar.gz; libtar reads plain tar, so this is a two-step:
+  Archive extraction — gunzip (LWPT.Gzip) then untar.
+  GitHub serves .tar.gz; the tar reader reads plain tar, so this is a two-step:
   decompress to a temp .tar, then walk entries and write files under Dest.
   GitHub archives wrap everything in a single top-level dir
   (e.g. GocciaScript-main/...); StripComponents=1 removes it so Dest holds
@@ -1242,7 +1242,7 @@ begin
 end;
 
 { ===========================================================================
-  Archive extraction — gunzip (zstream) then a direct ustar/POSIX tar reader.
+  Archive extraction — gunzip (LWPT.Gzip) then a direct ustar/POSIX tar reader.
 
   This replaces FPC's libtar, which has an incomplete ustar reader: it
   ignores the 155-byte `prefix` field (header offset 345). GitHub tarballs
@@ -1351,6 +1351,166 @@ begin
   Result := NativePath(Candidate);
 end;
 
+{ Opens the archive through the protected stream helper rather than
+  TGZFileStream, whose paszlib gzopen truncates paths over 255 characters
+  (issue #309). A partial tar is removed when decoding fails. }
+procedure GunzipArchive(const AArchivePath, ATarPath: string);
+var
+  ArchiveIn, TarOut: TStream;
+begin
+  ArchiveIn := OpenProtectedFileStream(AArchivePath,
+    fmOpenRead or fmShareDenyNone);
+  try
+    TarOut := OpenProtectedFileStream(ATarPath, fmCreate);
+    try
+      GunzipStream(ArchiveIn, TarOut);
+    except
+      TarOut.Free;
+      SysUtils.DeleteFile(ATarPath);
+      raise;
+    end;
+    TarOut.Free;
+  finally
+    ArchiveIn.Free;
+  end;
+end;
+
+type
+  { One tar entry header, with any GNU long name or ustar prefix folded in
+    and the name re-rooted below the extraction root. RelName is '' for an
+    entry that is not extracted; its payload must still be skipped. }
+  TTarEntry = record
+    TypeFlag: Byte;
+    Size: Int64;
+    Pad: Integer;
+    LinkName, RelName: string;
+  end;
+
+{ Reads the next entry header from ATar, leaving the stream at the entry's
+  payload. False at the end of the archive. }
+function ReadTarEntry(const ATar: TStream; const ASubDir: string;
+  out AEntry: TTarEntry): Boolean;
+var
+  Hdr: array[0..511] of Byte;
+  Name, Prefix, PendingLongName: string;
+  ZeroBlocks, Pad, i: Integer;
+  AllZero: Boolean;
+begin
+  AEntry := Default(TTarEntry);
+  PendingLongName := '';
+  ZeroBlocks := 0;
+  while ATar.Read(Hdr, 512) = 512 do
+  begin
+    { two consecutive all-zero blocks mark end of archive }
+    AllZero := True;
+    for i := 0 to 511 do
+      if Hdr[i] <> 0 then begin AllZero := False; Break; end;
+    if AllZero then
+    begin
+      Inc(ZeroBlocks);
+      if ZeroBlocks >= 2 then Exit(False);
+      Continue;
+    end;
+    ZeroBlocks := 0;
+
+    Name            := TarStr(Hdr, 0, 100);
+    AEntry.Size     := TarOctal(Hdr, 124, 12);
+    AEntry.TypeFlag := Hdr[156];
+    AEntry.LinkName := TarStr(Hdr, 157, 100);
+    Prefix          := TarStr(Hdr, 345, 155);
+
+    { GNU long-name ('L') / long-link ('K'): body holds the real name }
+    if (AEntry.TypeFlag = Ord('L')) or (AEntry.TypeFlag = Ord('K')) then
+    begin
+      SetLength(PendingLongName, AEntry.Size);
+      if AEntry.Size > 0 then
+        ATar.ReadBuffer(PendingLongName[1], AEntry.Size);
+      PendingLongName := Trim(StringReplace(PendingLongName, #0, '',
+                           [rfReplaceAll]));
+      Pad := (512 - (AEntry.Size mod 512)) mod 512;
+      if Pad > 0 then ATar.Seek(Pad, soCurrent);
+      Continue;   { real entry follows }
+    end;
+
+    { full path = prefix + '/' + name, unless a pending GNU long name }
+    if PendingLongName <> '' then
+      Name := PendingLongName
+    else if Prefix <> '' then
+      Name := Prefix + '/' + Name;
+
+    AEntry.RelName := StripFirstComponent(Name);
+    { if a subsection was requested, keep only entries inside it }
+    if ASubDir <> '' then
+      AEntry.RelName := ReRootToSubDir(AEntry.RelName, ASubDir);
+    AEntry.Pad := Integer((512 - (AEntry.Size mod 512)) mod 512);
+    Exit(True);
+  end;
+  Result := False;
+end;
+
+const
+  {$IFDEF MSWINDOWS}
+  { LWPT is not long-path aware, so the Win32 file APIs keep the legacy
+    MAX_PATH budget: 259 characters for a file, and 247 for a directory,
+    whose creation reserves room for an 8.3 file name. }
+  ARCHIVE_FILE_PATH_LIMIT = MAX_PATH - 1;
+  ARCHIVE_DIRECTORY_PATH_LIMIT = MAX_PATH - 13;
+  {$ELSE}
+  { PATH_MAX, which counts the terminating NUL. }
+  ARCHIVE_FILE_PATH_LIMIT = MaxPathLen - 1;
+  ARCHIVE_DIRECTORY_PATH_LIMIT = MaxPathLen - 1;
+  {$ENDIF}
+
+function PlatformPathLength(const APath: string): Integer;
+begin
+  {$IFDEF MSWINDOWS}
+  { Win32 limits count UTF-16 code units. }
+  Result := Length(UnicodeString(APath));
+  {$ELSE}
+  Result := Length(APath);
+  {$ENDIF}
+end;
+
+{ Raises when writing APath would exceed the platform's path limit. The
+  operating system would otherwise fail part-way through extraction with an
+  error such as "No such file or directory" that does not name the cause. }
+procedure EnsureArchivePathFits(const APath, AEntryName, ADest: string;
+  const AIsDirectory: Boolean);
+var
+  PathLength, ParentLength, Limit, Excess: Integer;
+  Kind: string;
+begin
+  PathLength := PlatformPathLength(APath);
+  if AIsDirectory then
+  begin
+    Kind := 'directory';
+    Limit := ARCHIVE_DIRECTORY_PATH_LIMIT;
+    Excess := PathLength - Limit;
+  end
+  else
+  begin
+    Kind := 'file';
+    Limit := ARCHIVE_FILE_PATH_LIMIT;
+    Excess := PathLength - Limit;
+    { A file also needs its parent directory created, and on Windows the
+      directory budget is the tighter one. }
+    ParentLength := PlatformPathLength(ExtractFileDir(APath));
+    if ParentLength - ARCHIVE_DIRECTORY_PATH_LIMIT > Excess then
+    begin
+      Kind := 'directory';
+      PathLength := ParentLength;
+      Limit := ARCHIVE_DIRECTORY_PATH_LIMIT;
+      Excess := PathLength - Limit;
+    end;
+  end;
+  if Excess <= 0 then Exit;
+  raise EExtractError.CreateFmt(
+    'archive path is too long: entry "%s" needs a %d-character %s path '
+    + 'below "%s", but this platform limits %s paths to %d characters; '
+    + 'move the project to a path at least %d characters shorter',
+    [AEntryName, PathLength, Kind, ADest, Kind, Limit, Excess]);
+end;
+
 function ExtractArchive(const AArchivePath, ADest: string;
   const ASubDir: string = ''): Integer;
 type
@@ -1358,14 +1518,12 @@ type
     LinkPath, TargetName, FromRel: string;
   end;
 var
-  GZ      : TGZFileStream;
   TarPath : string;
-  TarOut  : TFileStream;
-  TarIn   : TFileStream;
+  TarIn   : TStream;
   Buf     : array[0..65535] of Byte;
-  Hdr     : array[0..511] of Byte;
   N       : Integer;
-  Name, Prefix, LinkName, RelName, OutName, OutDir : string;
+  Entry   : TTarEntry;
+  OutName, OutDir : string;
   TypeFlag : Byte;
   Size, Remaining, ToRead : Int64;
   Pad     : Integer;
@@ -1373,88 +1531,40 @@ var
   PendingLinks : array of TPendingLink;
   li      : Integer;
   ResolvedTarget : string;
-  PendingLongName : string;
-  ZeroBlocks : Integer;
-  AllZero : Boolean;
-  i       : Integer;
 begin
   Result := 0;
   PendingLinks := nil;
-  PendingLongName := '';
   if not FileExists(AArchivePath) then
     raise EExtractError.CreateFmt('archive not found: %s', [AArchivePath]);
 
   { step 1: gunzip AArchivePath -> TarPath }
   TarPath := AArchivePath + '.tar';
-  GZ := TGZFileStream.Create(AArchivePath, gzopenread);
-  try
-    TarOut := TFileStream.Create(TarPath, fmCreate);
-    try
-      repeat
-        N := GZ.Read(Buf, SizeOf(Buf));
-        if N > 0 then TarOut.WriteBuffer(Buf, N);
-      until N <= 0;
-    finally
-      TarOut.Free;
-    end;
-  finally
-    GZ.Free;
-  end;
+  EnsureArchivePathFits(TarPath, ExtractFileName(TarPath),
+    ExtractFileDir(TarPath), False);
+  GunzipArchive(AArchivePath, TarPath);
 
-  { step 2: walk the tar 512-byte blocks directly }
-  ForceDirectories(ADest);
-  TarIn := TFileStream.Create(TarPath, fmOpenRead or fmShareDenyNone);
+  TarIn := OpenProtectedFileStream(TarPath, fmOpenRead or fmShareDenyNone);
   try
-    ZeroBlocks := 0;
-    while TarIn.Read(Hdr, 512) = 512 do
+    { step 2: check every entry's destination before writing any of them,
+      so a traversal or an over-long path fails before extraction starts }
+    while ReadTarEntry(TarIn, ASubDir, Entry) do
     begin
-      { two consecutive all-zero blocks mark end of archive }
-      AllZero := True;
-      for i := 0 to 511 do
-        if Hdr[i] <> 0 then begin AllZero := False; Break; end;
-      if AllZero then
-      begin
-        Inc(ZeroBlocks);
-        if ZeroBlocks >= 2 then Break;
-        Continue;
-      end;
-      ZeroBlocks := 0;
+      if Entry.RelName <> '' then
+        EnsureArchivePathFits(ResolveArchiveOutputPath(ADest, Entry.RelName),
+          Entry.RelName, ADest, Chr(Entry.TypeFlag) = '5');
+      TarIn.Seek(Entry.Size + Entry.Pad, soCurrent);
+    end;
+    TarIn.Position := 0;
 
-      Name     := TarStr(Hdr, 0, 100);
-      Size     := TarOctal(Hdr, 124, 12);
-      TypeFlag := Hdr[156];
-      LinkName := TarStr(Hdr, 157, 100);
-      Prefix   := TarStr(Hdr, 345, 155);
+    { step 3: walk the tar 512-byte blocks directly }
+    ForceDirectories(ADest);
+    while ReadTarEntry(TarIn, ASubDir, Entry) do
+    begin
+      Size     := Entry.Size;
+      Pad      := Entry.Pad;
+      TypeFlag := Entry.TypeFlag;
 
-      { GNU long-name ('L') / long-link ('K'): body holds the real name }
-      if (TypeFlag = Ord('L')) or (TypeFlag = Ord('K')) then
-      begin
-        SetLength(PendingLongName, Size);
-        if Size > 0 then
-          TarIn.ReadBuffer(PendingLongName[1], Size);
-        PendingLongName := Trim(StringReplace(PendingLongName, #0, '',
-                             [rfReplaceAll]));
-        Pad := (512 - (Size mod 512)) mod 512;
-        if Pad > 0 then TarIn.Seek(Pad, soCurrent);
-        Continue;   { real entry follows }
-      end;
-
-      { full path = prefix + '/' + name, unless a pending GNU long name }
-      if PendingLongName <> '' then
-      begin
-        Name := PendingLongName;
-        PendingLongName := '';
-      end
-      else if Prefix <> '' then
-        Name := Prefix + '/' + Name;
-
-      RelName := StripFirstComponent(Name);
-      { if a subsection was requested, keep only entries inside it }
-      if ASubDir <> '' then
-        RelName := ReRootToSubDir(RelName, ASubDir);
-      Pad := Integer((512 - (Size mod 512)) mod 512);
-
-      if RelName = '' then
+      if Entry.RelName = '' then
       begin
         { top-level dir entry, outside-subdir entry, or skipped —
           still must consume any data payload }
@@ -1463,7 +1573,7 @@ begin
         Continue;
       end;
 
-      OutName := ResolveArchiveOutputPath(ADest, RelName);
+      OutName := ResolveArchiveOutputPath(ADest, Entry.RelName);
 
       case Chr(TypeFlag) of
         '5':   { directory }
@@ -1472,8 +1582,8 @@ begin
           begin
             SetLength(PendingLinks, Length(PendingLinks) + 1);
             PendingLinks[High(PendingLinks)].LinkPath   := OutName;
-            PendingLinks[High(PendingLinks)].TargetName := LinkName;
-            PendingLinks[High(PendingLinks)].FromRel    := RelName;
+            PendingLinks[High(PendingLinks)].TargetName := Entry.LinkName;
+            PendingLinks[High(PendingLinks)].FromRel    := Entry.RelName;
           end;
       else
         { '0', #0, or anything else: a regular file }
