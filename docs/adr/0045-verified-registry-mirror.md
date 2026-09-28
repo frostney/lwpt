@@ -40,7 +40,9 @@ under `proofs/sha256/`. The mirror state (`lwpt-registry-mirror-state-v1`)
 records its role explicitly and binds the exact accepted proof: the checkpoint
 hash, the root key record's hash, and, for each accepted rotation, its
 sequence and the hashes of the rotation document, both signatures, and the new
-key's record. Verification reads only those bound hashes. A file left by an
+key's record. It also records `clock_floor`, the highest accepted checkpoint
+`published_at`, in the same atomic pointer (see the lifetime and clock-rollback
+decision below). Verification reads only those bound hashes. A file left by an
 unaccepted attempt can therefore never join the accepted rotation chain, and
 an unsigned key record never acquires authority through a fixed path: the next
 synchronization rebinds whatever record the upstream currently serves, after
@@ -205,10 +207,12 @@ that exact state from disk, as serving and restart will, under the same
 limits. A head whose retained proof could not be loaded again is never
 activated.
 
-Synchronization checks current expiry before fetching content and again
-immediately before activation, after retained-proof verification and immutable
-resource writes. The final check compares fresh UTC with the already
-authenticated expiry and does not repeat cryptographic verification. At an
+Synchronization checks the clock-rollback floor before its first upstream
+request, and checks the floor and current expiry before fetching content and
+again immediately before activation, after retained-proof verification and
+immutable resource writes. The final check compares fresh UTC with the already
+authenticated expiry and floor and does not repeat cryptographic
+verification. At an
 unchanged sequence, the verifier rejects a checkpoint whose `published_at` or
 `expires_at` is earlier than the accepted checkpoint's. A replayed older
 renewal therefore cannot shorten established freshness, while identical bytes
@@ -229,7 +233,8 @@ retrieves rotations for a checkpoint that is not newer than accepted state. Exec
 selection belongs to [issue #62](https://github.com/frostney/lwpt/issues/62).
 Local verification and serving retain exact accepted proof without renewing or
 changing its timestamps. `verify` reports `fresh`, `expired`, or
-`uninitialized`; an expired retained proof does not authorize acquisition.
+`uninitialized`, together with the accepted `clock_floor`; an expired retained
+proof does not authorize acquisition.
 The current transfer resumes at verified-object boundaries, not at partial
 byte offsets. Unknown signing keys require a complete verified rotation chain
 from the immutable root pin.
@@ -300,24 +305,51 @@ predates the mirror and is tracked by
 [issue #314](https://github.com/frostney/lwpt/issues/314). Until then, the
 ownership requirement above is the mitigation.
 
-### Open policy decision: maximum signed lifetime and clock rollback
+### Maximum signed lifetime and clock-rollback floor
+
+Amended for [issue #320](https://github.com/frostney/lwpt/issues/320). This
+section replaces the open policy decision this ADR originally recorded.
 
 Freshness depends only on the signed `expires_at` and the local UTC clock.
-The protocol's seven-day checkpoint lifetime is a `SHOULD`, not an enforced
-limit. A temporarily compromised signing key can therefore issue a checkpoint
-that expires in 2099. Any contact can then replay it to a client that has no
-newer accepted state, and a mirror accepts it. Separately, moving the system
-clock backwards makes an old checkpoint appear unexpired again. This change
-does not choose a policy. The decision belongs to the maintainer.
+With a seven-day `SHOULD`, a temporarily compromised signing key could issue a
+checkpoint that expires in 2099, and any contact could replay that frozen view
+to a client or mirror with no newer accepted state. Separately, moving the
+system clock backwards made an old checkpoint appear unexpired again. The
+maintainer decided:
 
-Recommendation: reject, during acquisition, any checkpoint whose
-`expires_at - published_at` exceeds seven days plus a small allowance for
-clock skew. Record the highest accepted `published_at` per origin in the
-state as a clock-rollback floor, and refuse acquisition while the local clock
-is earlier than that floor. Locked-proof replay would stay exempt, as it is
-from expiry today. The cost is that an origin issuing longer-lived
-checkpoints becomes unreadable, and the ceiling would become a protocol
-`MUST`.
+- **Maximum lifetime.** The protocol ceiling is now a `MUST`. The shared
+  verifier's acquisition mode rejects an authenticated checkpoint whose
+  `expires_at - published_at` exceeds seven days plus a five-minute clock-skew
+  allowance, with `checkpoint_lifetime_exceeded`; exactly seven days and five
+  minutes is accepted. The check runs after signature verification and before
+  history retrieval, and it is a trust failure, not a stale contact. Every
+  acquirer that uses the verifier, today `registry sync`, inherits it.
+- **Origin signing.** The origin derives every checkpoint's expiry from the
+  same seven-day constant at initialization, publication, renewal, and
+  rotation, and refuses to write any other window. Loading origin state
+  already rejects a checkpoint whose expiry is not exactly that window.
+- **Clock-rollback floor.** The accepted state carries the highest accepted
+  `published_at` per origin. For a mirror, it is `clock_floor` in
+  `state/current.toml`, written by the same atomic replacement that activates
+  the accepted head, so it survives restart and never runs ahead of the
+  accepted proof. A pointer written before this field existed uses its
+  checkpoint's `published_at`. A later checkpoint published earlier never
+  lowers the floor. While the local clock is earlier than the floor,
+  acquisition fails with `local_clock_behind_accepted_state`, whose message
+  states the clock, the floor, and that synchronization resumes once the clock
+  reaches it. `registry sync` checks this before any upstream request and
+  again at the activation gate. It is a local condition: it is not stale and
+  does not try another contact.
+- **Serving is unchanged.** Locked-proof replay, and therefore serving and
+  `registry verify`, apply neither the ceiling nor the floor. Accepted content
+  stays servable after expiry and is reported as `expired`.
+
+The cost is that an origin issuing longer-lived checkpoints becomes
+unreadable, and a mirror whose clock falls behind accepted state stops
+synchronizing until the clock is corrected. Operators must run mirrors with a
+synchronized UTC clock. The floor is trusted local state like the rest of the
+pointer: restoring an older genuine `state/current.toml` also restores its
+older floor, which is within the storage-rollback limitation above.
 
 ## Rejected alternatives
 

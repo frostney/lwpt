@@ -7,8 +7,8 @@
 - Package identity is `(origin identity, package name, version)`, never the URL
   of the server currently answering a request.
 - Immutable package records, snapshots, and archive objects are addressed by
-  SHA-256. A short-lived checkpoint signed with Ed25519 identifies the current
-  snapshot.
+  SHA-256. A short-lived checkpoint, valid for at most seven days and signed
+  with Ed25519, identifies the current snapshot.
 - Origins may start read-only and advertise authenticated, atomic publication
   through the HTTP API only when that surface is enabled.
   Mirrors synchronize the same immutable objects and publish a checkpoint only
@@ -416,7 +416,8 @@ Clients MUST:
 4. Resolve `key_id` from a trusted key or verified rotation chain.
 5. Verify the Ed25519 signature over the signing input.
 6. Require matching origin identities.
-7. Reject an expired checkpoint.
+7. Reject an expired checkpoint, and reject a checkpoint whose validity window
+   exceeds the maximum lifetime defined below.
 8. Reject a sequence lower than the highest sequence already accepted for that
    origin. At the same sequence, accept only the identical snapshot and
    `key_id`; a different value is checkpoint equivocation. A later
@@ -429,23 +430,48 @@ Clients MUST:
    sequence, then validate its predecessor and sequence against the snapshot
    chain.
 
-An origin SHOULD issue checkpoints with a validity window of no more than seven
-days. Short expiry limits replay for a client without prior state; persisted
+An origin MUST NOT issue a checkpoint whose validity window,
+`expires_at - published_at`, is longer than seven days. A client or mirror
+acquiring a checkpoint MUST reject one whose window exceeds seven days plus a
+clock-skew allowance of five minutes (604,800 + 300 seconds), with the stable
+reason `checkpoint_lifetime_exceeded`. A window of exactly seven days and five
+minutes is accepted. This is an authenticated signing-policy violation, so it
+is a trust failure rather than a stale contact. The ceiling bounds how long a
+checkpoint signed by a temporarily compromised key can be replayed. Short
+expiry limits replay for a client without prior state; persisted
 highest-sequence state prevents downgrade for returning clients.
+
+### Clock requirement and rollback floor
+
+Expiry is judged against the acquirer's UTC clock. A client or mirror MUST
+persist, per origin identity, the highest `published_at` it has accepted, and
+update it atomically with the accepted state. This value is the clock-rollback
+floor. While the local clock is earlier than the floor, acquisition MUST fail
+with the stable reason `local_clock_behind_accepted_state`, never silently
+accepting or rejecting network content; implementations SHOULD check the
+floor before contacting any upstream. The
+condition is local, so it is neither a stale contact nor a reason to try
+another contact. Acquisition succeeds again once the clock reaches the floor.
+A later checkpoint published earlier than the floor never lowers it.
+Operators therefore need a UTC clock that is synchronized and never set back
+behind registry state they have already accepted.
 
 ### Acquisition and locked proof verification
 
-New acquisition and mirror synchronization enforce checkpoint expiry against
-the current UTC time and reject checkpoints published in the future. The
-checkpoint's publication time must precede its expiry.
+New acquisition and mirror synchronization enforce checkpoint expiry, the
+maximum lifetime, and the clock-rollback floor against the current UTC time,
+and reject checkpoints published in the future. The checkpoint's publication
+time must precede its expiry.
 
 A network-free operation reproducing an already locked selection may verify
 that retained proof after its checkpoint expires. It must require the exact
 recorded checkpoint hash, sequence, snapshot, origin, and signing key; verify
 the signature and rotation chain from the configured trust root; and verify
 record membership, snapshot history, archive identity, and available archive
-bytes. This exception does not accept a new checkpoint, change a locked
-selection, or make an expired mirror fresh. Acquisition and locked proof are
+bytes. It applies neither the maximum lifetime nor the clock-rollback floor,
+so already accepted content remains verifiable and servable, and is reported
+as expired once its checkpoint expires. This exception does not accept a new
+checkpoint, change a locked selection, or make an expired mirror fresh. Acquisition and locked proof are
 explicit validation modes, not a replacement evaluation time supplied to
 evade an expiry check.
 
@@ -664,8 +690,8 @@ Synchronization is pull-based and requires only the read protocol:
    without trusting its contents yet.
 3. If `key_id` is unknown, discover and verify the ordered dual-signed rotation
    chain from the already trusted key.
-4. Authenticate the checkpoint and enforce expiry, downgrade, and
-   equal-sequence equivocation rules.
+4. Authenticate the checkpoint and enforce the clock-rollback floor, expiry,
+   maximum lifetime, downgrade, and equal-sequence equivocation rules.
 5. If its sequence is new, fetch and hash its snapshot. Walk the `previous`
    snapshot chain back to sequence 1 or a locally accepted hash, verifying each
    link before accepting the new head.
@@ -770,6 +796,8 @@ Conformance clients also report stable local validation reasons:
 - `duplicate_package_identity`;
 - `checkpoint_downgrade`;
 - `checkpoint_equivocation`;
+- `checkpoint_lifetime_exceeded`;
+- `local_clock_behind_accepted_state`;
 - `rotation_chain_invalid`.
 
 Servers SHOULD include `Retry-After` for retryable `429` and `503` responses.
@@ -787,8 +815,8 @@ to a different authority.
   publication protections.
 - Origins MUST authenticate publication and authorize package ownership.
 - Mirrors MUST not rewrite signed or hashed resources.
-- Highest accepted sequence and trusted-key state are stored per origin
-  identity, not per mirror URL.
+- Highest accepted sequence, trusted-key state, and the clock-rollback floor
+  are stored per origin identity, not per mirror URL.
 - Error responses and fixtures MUST contain no credentials or private keys.
 - Implementations MUST bound response sizes, pagination, concurrent transfers,
   timeouts, and decompressed archive sizes.
