@@ -153,13 +153,17 @@ var
   ProtectedOpenAfterProtectionTestHook: TLWPTProtectedDescriptorTestHook;
 
 type
-  TLWPTProcessHandleSetupState = (phsUnobserved, phsWaiting, phsEntered);
+  { phfContended: the thread's non-blocking attempt failed because another
+    thread held the guard, and the thread is now blocked waiting for it.
+    phfHeld: the thread holds the guard now. phfEntered: the thread has held
+    it at least once since the last reset. }
+  TLWPTProcessHandleSetupFlag = (phfContended, phfHeld, phfEntered);
+  TLWPTProcessHandleSetupFlags = set of TLWPTProcessHandleSetupFlag;
 
-{ Test-only observation of the inheritance guard: whether a thread is blocked
-  waiting for it or has entered it since the last reset. }
+{ Test-only observation of the inheritance guard per thread. }
 procedure ResetProcessHandleSetupObservation;
 function  ObserveProcessHandleSetup(
-  const AThreadID: TThreadID): TLWPTProcessHandleSetupState;
+  const AThreadID: TThreadID): TLWPTProcessHandleSetupFlags;
 {$ENDIF}
 
 function  SHA256BytesPrefixed(const ABytes: TBytes): string;
@@ -1384,57 +1388,104 @@ const
 type
   TLWPTProcessHandleSetupObservation = record
     ThreadID: TThreadID;
-    State: TLWPTProcessHandleSetupState;
+    Contended: Boolean;
+    Depth: Integer;
+    Entered: Boolean;
   end;
 
 var
   ProcessHandleSetupObservationCriticalSection: TRTLCriticalSection;
   ProcessHandleSetupObservations: array of TLWPTProcessHandleSetupObservation;
 
-procedure RecordProcessHandleSetup(const AState: TLWPTProcessHandleSetupState);
+function ProcessHandleSetupObservationIndex(
+  const AThreadID: TThreadID): Integer;
 var
   Index: Integer;
-  ThreadID: TThreadID;
 begin
-  ThreadID := GetCurrentThreadId;
+  for Index := 0 to High(ProcessHandleSetupObservations) do
+    if ProcessHandleSetupObservations[Index].ThreadID = AThreadID then
+      Exit(Index);
+  Result := Length(ProcessHandleSetupObservations);
+  SetLength(ProcessHandleSetupObservations, Result + 1);
+  ProcessHandleSetupObservations[Result] :=
+    Default(TLWPTProcessHandleSetupObservation);
+  ProcessHandleSetupObservations[Result].ThreadID := AThreadID;
+end;
+
+procedure RecordProcessHandleSetupContention;
+var
+  Index: Integer;
+begin
   EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
   try
-    for Index := 0 to High(ProcessHandleSetupObservations) do
-      if ProcessHandleSetupObservations[Index].ThreadID = ThreadID then
-      begin
-        ProcessHandleSetupObservations[Index].State := AState;
-        Exit;
-      end;
-    Index := Length(ProcessHandleSetupObservations);
-    SetLength(ProcessHandleSetupObservations, Index + 1);
-    ProcessHandleSetupObservations[Index].ThreadID := ThreadID;
-    ProcessHandleSetupObservations[Index].State := AState;
+    { Resolve the index first: it may grow and move the array. }
+    Index := ProcessHandleSetupObservationIndex(GetCurrentThreadId);
+    ProcessHandleSetupObservations[Index].Contended := True;
+  finally
+    LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  end;
+end;
+
+procedure RecordProcessHandleSetupDepth(const ADelta: Integer);
+var
+  Index: Integer;
+begin
+  EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  try
+    Index := ProcessHandleSetupObservationIndex(GetCurrentThreadId);
+    Inc(ProcessHandleSetupObservations[Index].Depth, ADelta);
+    if ADelta > 0 then
+    begin
+      ProcessHandleSetupObservations[Index].Entered := True;
+      ProcessHandleSetupObservations[Index].Contended := False;
+    end;
   finally
     LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
   end;
 end;
 
 procedure ResetProcessHandleSetupObservation;
+var
+  Index, Kept: Integer;
 begin
   EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
   try
-    SetLength(ProcessHandleSetupObservations, 0);
+    { A thread that holds the guard right now keeps its depth. }
+    Kept := 0;
+    for Index := 0 to High(ProcessHandleSetupObservations) do
+      if ProcessHandleSetupObservations[Index].Depth > 0 then
+      begin
+        ProcessHandleSetupObservations[Kept] :=
+          ProcessHandleSetupObservations[Index];
+        ProcessHandleSetupObservations[Kept].Contended := False;
+        ProcessHandleSetupObservations[Kept].Entered := False;
+        Inc(Kept);
+      end;
+    SetLength(ProcessHandleSetupObservations, Kept);
   finally
     LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
   end;
 end;
 
 function ObserveProcessHandleSetup(
-  const AThreadID: TThreadID): TLWPTProcessHandleSetupState;
+  const AThreadID: TThreadID): TLWPTProcessHandleSetupFlags;
 var
   Index: Integer;
 begin
-  Result := phsUnobserved;
+  Result := [];
   EnterCriticalSection(ProcessHandleSetupObservationCriticalSection);
   try
     for Index := 0 to High(ProcessHandleSetupObservations) do
       if ProcessHandleSetupObservations[Index].ThreadID = AThreadID then
-        Exit(ProcessHandleSetupObservations[Index].State);
+      begin
+        if ProcessHandleSetupObservations[Index].Contended then
+          Include(Result, phfContended);
+        if ProcessHandleSetupObservations[Index].Depth > 0 then
+          Include(Result, phfHeld);
+        if ProcessHandleSetupObservations[Index].Entered then
+          Include(Result, phfEntered);
+        Exit;
+      end;
   finally
     LeaveCriticalSection(ProcessHandleSetupObservationCriticalSection);
   end;
@@ -1444,16 +1495,24 @@ end;
 procedure BeginProcessHandleSetup;
 begin
   {$IFDEF OBJECTSTORE_TESTING}
-  RecordProcessHandleSetup(phsWaiting);
-  {$ENDIF}
+  { Record contention only after a real failed attempt on the guard itself,
+    so an observer never mistakes an uncontended thread for a blocked one. }
+  if TryEnterCriticalSection(ProcessHandleSetupCriticalSection) = 0 then
+  begin
+    RecordProcessHandleSetupContention;
+    EnterCriticalSection(ProcessHandleSetupCriticalSection);
+  end;
+  RecordProcessHandleSetupDepth(1);
+  {$ELSE}
   EnterCriticalSection(ProcessHandleSetupCriticalSection);
-  {$IFDEF OBJECTSTORE_TESTING}
-  RecordProcessHandleSetup(phsEntered);
   {$ENDIF}
 end;
 
 procedure EndProcessHandleSetup;
 begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  RecordProcessHandleSetupDepth(-1);
+  {$ENDIF}
   LeaveCriticalSection(ProcessHandleSetupCriticalSection);
 end;
 

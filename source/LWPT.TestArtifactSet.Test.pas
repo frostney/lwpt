@@ -313,8 +313,8 @@ begin
     Expect<Boolean>(SpawnGuardProbeAttempts >= Length(Source)).ToBe(True);
     Expect<Integer>(SpawnGuardProbeLiveChildren)
       .ToBe(SpawnGuardProbeAttempts);
-    Expect<Integer>(SpawnGuardProbeInheritedFiles([Cached[0].Path,
-      Cached[1].Path, Bundle])).ToBe(0);
+    Expect<Integer>(SpawnGuardProbeInheritedPublications).ToBe(0);
+    Expect<Integer>(SpawnGuardProbeInheritedFiles([Bundle])).ToBe(0);
     Expect<string>(ReadBytes(Cached[0].Path)).ToBe('executable'#0'bytes');
   finally
     ReleaseSpawnGuardProbeChildren;

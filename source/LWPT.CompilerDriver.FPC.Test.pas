@@ -897,8 +897,8 @@ var
   Driver: TMockFPCCompilerDriver;
   Request: TLWPTBuildRequest;
 begin
-  Scratch := ExpandFileName('build/tests/tmp/compiler-driver-cfg-guard');
-  RecursiveDelete(Scratch);
+  Scratch := ExpandFileName('build/tests/tmp/compiler-driver-cfg-guard-'
+    + IntToStr(GetProcessID) + '-' + IntToStr(GetTickCount64));
   ForceDirectories(Scratch);
   ConfigurationPath := Scratch + '/guarded.cfg';
   WriteTextFile(ConfigurationPath, '-Fuconfig/unit' + LineEnding);
@@ -918,8 +918,10 @@ begin
     Expect<Boolean>(SpawnGuardProbeAttempts >= 1).ToBe(True);
     Expect<Integer>(SpawnGuardProbeEscapes).ToBe(0);
     Expect<Integer>(SpawnGuardProbeUnprotectedDescriptors).ToBe(0);
-    Expect<Integer>(SpawnGuardProbeInheritedFiles([ConfigurationPath]))
-      .ToBe(0);
+    Expect<Integer>(SpawnGuardProbeLiveChildren)
+      .ToBe(SpawnGuardProbeAttempts);
+    Expect<Integer>(SpawnGuardProbeInheritedPublications).ToBe(0);
+    Expect<string>(SpawnGuardProbeError).ToBe('');
   finally
     ReleaseSpawnGuardProbeChildren;
     Driver.Free;

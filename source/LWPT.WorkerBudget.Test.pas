@@ -445,11 +445,13 @@ begin
       'a state publication descriptor lacks close-on-exec');
     Require(SpawnGuardProbeLiveChildren = SpawnGuardProbeAttempts,
       'every probe child must start once the guard is released');
-    Require(SpawnGuardProbeInheritedFiles([
-      StateRoot + GUARDED_STATE_FILES[0], StateRoot + GUARDED_STATE_FILES[1],
-      StateRoot + GUARDED_STATE_FILES[2], StateRoot + 'transaction.lock',
+    Require(SpawnGuardProbeInheritedPublications = 0,
+      'a probe child inherited a published worker-state version: '
+      + SpawnGuardProbeError);
+    Require(SpawnGuardProbeInheritedFiles([StateRoot + 'transaction.lock',
       StateRoot + 'guarded.owner']) = 0,
-      'a probe child inherited a worker-state descriptor');
+      'a probe child inherited a worker-state lock descriptor: '
+      + SpawnGuardProbeError);
     for Index := Low(GUARDED_STATE_FILES) to High(GUARDED_STATE_FILES) do
     begin
       Descriptor := FpOpen(PChar(StateRoot + GUARDED_STATE_FILES[Index]),
@@ -489,8 +491,11 @@ begin
       'a child started inside the lease-token open window');
     Require(SpawnGuardProbeUnprotectedDescriptors = 0,
       'the lease-token randomness descriptor lacks close-on-exec');
-    Require(SpawnGuardProbeInheritedFiles(['/dev/urandom']) = 0,
-      'a probe child inherited the lease-token randomness descriptor');
+    Require(SpawnGuardProbeLiveChildren = SpawnGuardProbeAttempts,
+      'every token probe child must report: ' + SpawnGuardProbeError);
+    Require(SpawnGuardProbeInheritedPublications = 0,
+      'a probe child inherited the lease-token randomness descriptor: '
+      + SpawnGuardProbeError);
     FreeAndNil(Second);
     FreeAndNil(Lease);
   finally

@@ -9,6 +9,7 @@ uses
   Classes,
   SysUtils,
 
+  LWPT.Core,
   LWPT.OutputRenderer,
   TestingPascalLibrary,
   Tests.SpawnGuardProbe;
@@ -57,7 +58,8 @@ var
 begin
   Result := TStringList.Create;
   Result.Sorted := True;
-  if FindFirst(GetTempDir(False) + 'lwpt*', faAnyFile, Search) = 0 then
+  if FindFirst(GetTempDir(False) + PROGRAM_NAME + '*', faAnyFile,
+    Search) = 0 then
   try
     repeat
       Result.Add(GetTempDir(False) + Search.Name);
@@ -92,7 +94,8 @@ begin
           Journals[High(Journals)] := After[Index];
         end;
       InheritedCount := ChildInheritedFileCount(Journals,
-        GetTempDir(False) + 'lwpt-journal-probe-' + IntToStr(GetProcessID));
+        GetTempDir(False) + PROGRAM_NAME + '-journal-probe-'
+        + IntToStr(GetProcessID) + '-' + IntToStr(GetTickCount64));
     finally
       Renderer.FinishSilent(0, 0);
     end;
@@ -112,8 +115,8 @@ var
   Descriptor: THandle;
   Path: string;
 begin
-  Path := GetTempDir(False) + 'lwpt-inheritance-control-'
-    + IntToStr(GetProcessID);
+  Path := GetTempDir(False) + PROGRAM_NAME + '-inheritance-control-'
+    + IntToStr(GetProcessID) + '-' + IntToStr(GetTickCount64);
   Descriptor := FileCreate(Path);
   Expect<Boolean>(Descriptor <> THandle(-1)).ToBe(True);
   try
