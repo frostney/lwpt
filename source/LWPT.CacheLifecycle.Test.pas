@@ -52,6 +52,7 @@ type
     procedure TestLargeCacheHitAndAdmissionStayFast;
     procedure TestEvictionCountsDeletedReferences;
     procedure TestUndeletedManifestIsNotCountedAsReclaimed;
+    procedure TestConcurrentStagingGrowthKeepsEvicting;
     procedure TestLiveObjectIsPreservedAndAdmissionSkips;
     procedure TestRepairRebuildsIndexAndRemovesCorruption;
     procedure TestRepairRebuildsSemanticallyCorruptIndex;
@@ -694,17 +695,19 @@ end;
 
 procedure TCacheLifecycleContract.TestRepeatedIndexNameKeepsLastValue;
 var
-  Digest, Hit, IndexText, Key, OtherDigest, OtherKey: string;
+  Digest, Hit, IndexText, Key, LastSpelling, OtherDigest,
+    OtherKey: string;
   Store: TLWPTImmutableObjectStore;
   Lines: TStringList;
   Index, Occurrences: Integer;
 begin
-  { A name repeated in the index resolves to its last value, exactly as
-    the original Values[]-based loader did, and the next rewrite carries
-    the name once. The hit touches a different object, so the repeated
-    entry's rewritten value can only come from the loader: 7 when the
-    last write wins, 3 when the first does. Another entry sits between
-    the repeats, so they do not arrive adjacent. }
+  { A name repeated in the index (names compare case-insensitively)
+    resolves to its last row, spelling and value, exactly as the original
+    Values[]-based loader did, and the next rewrite carries the name
+    once. The hit touches a different object, so the repeated entry's
+    rewritten value can only come from the loader: 7 when the last write
+    wins, 3 when the first does. Another entry sits between the repeats,
+    so they do not arrive adjacent. }
   Store := TLWPTImmutableObjectStore.Create(
     FCacheRoot + '/dependency-archives', FCacheRoot,
     DEPENDENCY_ARCHIVE_NAMESPACE);
@@ -714,21 +717,24 @@ begin
     OtherDigest := WriteObject('other', 'other-name', Store);
     Key := DEPENDENCY_ARCHIVE_NAMESPACE + ':' + Digest;
     OtherKey := DEPENDENCY_ARCHIVE_NAMESPACE + ':' + OtherDigest;
+    LastSpelling := DEPENDENCY_ARCHIVE_NAMESPACE + ':' + UpperCase(Digest);
     IndexText := 'schema=1'#10 + 'sequence=7'#10
       + 'entry.' + Key + '=3'#10
       + 'entry.' + OtherKey + '=5'#10
-      + 'entry.' + Key + '=7'#10;
+      + 'entry.' + LastSpelling + '=7'#10;
     WriteTextFile(FCacheRoot + '/lifecycle/index', IndexText);
     Expect<Boolean>(Store.Lookup(OtherDigest, Hit)).ToBe(True);
+    Lines.CaseSensitive := True;
     Lines.LoadFromFile(FCacheRoot + '/lifecycle/index');
     Occurrences := 0;
     for Index := 0 to Lines.Count - 1 do
-      if Pos('entry.' + Key + '=', Lines[Index]) = 1 then
+      if Pos('entry.' + Key + '=', LowerCase(Lines[Index])) = 1 then
         Inc(Occurrences);
     Expect<Integer>(Occurrences).ToBe(1);
     Expect<Integer>(Lines.Count).ToBe(4);
     Expect<string>(Lines[1]).ToBe('sequence=8');
-    Expect<Boolean>(Lines.IndexOf('entry.' + Key + '=7') >= 2).ToBe(True);
+    Expect<Boolean>(Lines.IndexOf('entry.' + LastSpelling + '=7') >= 2)
+      .ToBe(True);
     Expect<Boolean>(Lines.IndexOf('entry.' + OtherKey + '=8') >= 2)
       .ToBe(True);
   finally
@@ -877,6 +883,73 @@ begin
       Expect<Boolean>(FileExists(Reference)).ToBe(False);
     Expect<Boolean>(FileExists(BuildObjectFile(Kept))).ToBe(True);
     Expect<Boolean>(FileExists(BuildObjectFile(Newest))).ToBe(True);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+end;
+
+var
+  ConcurrentStagingPath: string;
+  ConcurrentStagingBytes: Integer;
+
+{ Stands in for another writer copying into object staging, which it does
+  before taking the mutation guard: the tree grows once, mid-eviction. }
+procedure GrowStagingOnce(const ACacheRoot: string);
+begin
+  if ConcurrentStagingPath = '' then Exit;
+  WriteTextFile(ConcurrentStagingPath,
+    StringOfChar('g', ConcurrentStagingBytes));
+  ConcurrentStagingPath := '';
+end;
+
+procedure TCacheLifecycleContract.
+  TestConcurrentStagingGrowthKeepsEvicting;
+var
+  Budget: Int64;
+  Oldest, Second, Third, Newest, Staged: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  { The budget fits once the oldest object goes, but another writer's
+    staging grows the tree by more than one object in the meantime. The
+    running total then fits while the tree does not; eviction must
+    continue from the next candidates rather than refuse the admission
+    with eligible objects left. }
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Oldest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'a', 1000);
+    Second := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'b', 1000);
+    Third := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'c', 1000);
+    Newest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'e', 1000);
+    Budget := CacheBytes(FCacheRoot)
+      - FileSizeOf(DependencyObjectFile(Oldest))
+      - FileSizeOf(ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, Oldest));
+    SetBudget(IntToStr(Budget));
+    Staged := FCacheRoot + '/dependency-archives/tmp/'
+      + StringOfChar('d', 64) + '/object';
+    ConcurrentStagingPath := Staged;
+    ConcurrentStagingBytes := 1500;
+    CacheLifecycleAfterEvictionTestHook := GrowStagingOnce;
+    try
+      Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    finally
+      CacheLifecycleAfterEvictionTestHook := nil;
+      ConcurrentStagingPath := '';
+    end;
+    Expect<Boolean>(FileExists(Staged)).ToBe(True);
+    Expect<Boolean>(FileExists(DependencyObjectFile(Oldest))).ToBe(False);
+    Expect<Boolean>(FileExists(DependencyObjectFile(Second))).ToBe(False);
+    Expect<Boolean>(FileExists(DependencyObjectFile(Newest))).ToBe(True);
+    { Whether Third also goes depends on manifest and index sizes; the
+      growth is under two objects, so the newest always survives. }
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= Budget).ToBe(True);
   finally
     Mutation.Free;
     Lifecycle.Free;
@@ -1113,6 +1186,8 @@ begin
     TestEvictionCountsDeletedReferences);
   Test('a manifest that cannot be deleted is not counted as reclaimed',
     TestUndeletedManifestIsNotCountedAsReclaimed);
+  Test('eviction continues when concurrent staging outgrows its total',
+    TestConcurrentStagingGrowthKeepsEvicting);
   Test('index growth cannot take a cache hit above budget',
     TestIndexGrowthCannotExceedBudget);
   Test('live objects are preserved and an admission that cannot fit skips',

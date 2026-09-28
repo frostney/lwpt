@@ -56,6 +56,16 @@ function ResolveCacheMaxBytesFromValue(const AValue: string): Int64;
 function RepairSharedCache(const ACacheRoot: string):
   TLWPTCacheRepairReport;
 
+{$IFDEF OBJECTSTORE_TESTING}
+type
+  TLWPTCacheEvictionTestHook = procedure(const ACacheRoot: string);
+
+var
+  { Runs after each eviction attempt, before the next budget check, so a
+    test can change unguarded staging bytes at a deterministic point. }
+  CacheLifecycleAfterEvictionTestHook: TLWPTCacheEvictionTestHook;
+{$ENDIF}
+
 implementation
 
 uses
@@ -269,7 +279,7 @@ procedure LoadIndex(const ACacheRoot: string; out ASequence: Int64;
   const AEntries: TStringList; out AValid: Boolean);
 var
   Lines, Parsed: TStringList;
-  Index, RunStart, Separator: Integer;
+  Index, Separator: Integer;
   Line, Name, Text: string;
   Value: Int64;
   Values: array of Int64;
@@ -309,17 +319,15 @@ begin
       Parsed.AddObject(Name, TObject(PtrInt(Index)));
     end;
     Parsed.CustomSort(CompareIndexNameThenLine);
-    { Each run of one name keeps its first spelling and its last value,
-      exactly as repeated Values[Name] := ... assignments did. }
-    RunStart := 0;
+    { Each run of one name keeps its last row, spelling and value, exactly
+      as repeated Values[Name] := ... assignments (TStrings.SetValue) did. }
     for Index := 0 to Parsed.Count - 1 do
     begin
       if (Index < Parsed.Count - 1)
          and (AnsiCompareText(Parsed[Index], Parsed[Index + 1]) = 0) then
         Continue;
-      AEntries.Add(Parsed[RunStart] + '='
+      AEntries.Add(Parsed[Index] + '='
         + IntToStr(Values[PtrInt(Parsed.Objects[Index])]));
-      RunStart := Index + 1;
     end;
     AValid := True;
   finally
@@ -941,9 +949,12 @@ begin
   if Index >= 0 then AEntries.Delete(Index);
 end;
 
-{ Drops the entries whose Removed flag is set, in one pass. Deleting them
-  one IndexOfName at a time costs a scan of the whole index per eviction. }
-procedure DeleteFlaggedEntries(const AEntries: TStringList;
+{ Persists the index without the entries whose Removed flag is set, in one
+  pass; deleting them one IndexOfName at a time costs a scan of the whole
+  index per eviction. AEntries itself is left intact, so a name lookup
+  built over it stays valid for further evictions. }
+procedure WriteIndexWithoutFlagged(const ACacheRoot: string;
+  const ASequence: Int64; const AEntries: TStringList;
   const ARemoved: array of Boolean);
 var
   Index: Integer;
@@ -951,11 +962,14 @@ var
 begin
   Kept := TStringList.Create;
   try
+    Kept.NameValueSeparator := AEntries.NameValueSeparator;
     Kept.Capacity := AEntries.Count;
     for Index := 0 to AEntries.Count - 1 do
       if not ARemoved[Index] then Kept.Add(AEntries[Index]);
-    AEntries.Clear;
-    AEntries.AddStrings(Kept);
+    if Kept.Count = 0 then
+      SysUtils.DeleteFile(IndexPath(ACacheRoot))
+    else
+      WriteIndex(ACacheRoot, ASequence, Kept);
   finally
     Kept.Free;
   end;
@@ -965,14 +979,52 @@ function EnforceBudgetLocked(const ACacheRoot: string;
   const AAdditionalBytes: Int64; out ALivePreserved: Integer;
   out AReclaimed: Int64; const AKnownLive: TStrings): Boolean;
 var
-  Budget, CurrentBytes, FreedBytes, Sequence: Int64;
+  Budget, CurrentBytes, Sequence: Int64;
   Entries, Lookup: TStringList;
   Coordinator: TLWPTProducerLeaseCoordinator;
-  Index, EntryIndex: Integer;
-  IndexValid, Removable: Boolean;
-  Lease: TObject;
+  Index, EntryIndex, Next: Integer;
+  IndexValid: Boolean;
   Objects: TLWPTCacheObjectArray;
   Removed: array of Boolean;
+
+  { Tries one candidate once: a live object is preserved and reported, any
+    other is removed and its deleted bytes leave the running total. }
+  procedure EvictCandidate(const ACandidate: Integer);
+  var
+    Key: string;
+    Lease: TObject;
+    Removable: Boolean;
+    FreedBytes: Int64;
+    Position: Integer;
+  begin
+    Key := ObjectKey(Objects[ACandidate].Namespace,
+      Objects[ACandidate].Digest);
+    Lease := Coordinator.TryAcquireGuard('cache-object:' + Key);
+    if Lease = nil then
+    begin
+      if (AKnownLive = nil) or (AKnownLive.IndexOf(Key) < 0) then
+        Inc(ALivePreserved);
+      if (AKnownLive <> nil) and (AKnownLive.IndexOf(Key) < 0) then
+        AKnownLive.Add(Key);
+      Exit;
+    end;
+    try
+      { A partial failure still deleted what it reports, so those bytes
+        count whatever the result. }
+      Removable := RemoveObjectFiles(ACacheRoot, Objects[ACandidate],
+        FreedBytes);
+      Dec(CurrentBytes, FreedBytes);
+      Inc(AReclaimed, FreedBytes);
+      if Removable then
+      begin
+        Position := LookupEntryIndex(Lookup, Key);
+        if Position >= 0 then Removed[Position] := True;
+      end;
+    finally
+      Lease.Free;
+    end;
+  end;
+
 begin
   Result := False;
   ALivePreserved := 0;
@@ -999,7 +1051,7 @@ begin
     { One sorted lookup instead of a Values[] scan per discovered object:
       with thousands of objects and thousands of index entries the scan
       was the dominant cost of every admission. The lookup also locates
-      each evicted object's entry, which is dropped after the loop. }
+      each evicted object's entry, which the index rewrite drops. }
     Lookup := BuildNameLookup(Entries);
     try
       SetLength(Removed, Entries.Count);
@@ -1014,53 +1066,33 @@ begin
           Objects[Index].LastUse := 0;
       end;
       SortByLRU(Objects);
-      for Index := 0 to High(Objects) do
-      begin
-        if CurrentBytes + AAdditionalBytes <= Budget then Break;
-        Lease := Coordinator.TryAcquireGuard(
-            'cache-object:' + ObjectKey(Objects[Index].Namespace,
-              Objects[Index].Digest));
-        if Lease = nil then
+      { Evict in LRU order against a running total, then settle it with one
+        authoritative walk. The mutation guard does not cover object
+        staging, which other writers fill before taking it, so the tree can
+        grow while this runs. When the walk still finds the cache over
+        budget, resume from the next candidate with the measured total.
+        Without concurrent growth this is one pass and one walk; with it,
+        every extra walk follows at least one further candidate, so the
+        loop ends once the candidates run out. }
+      Next := 0;
+      repeat
+        while (Next <= High(Objects))
+              and (CurrentBytes + AAdditionalBytes > Budget) do
         begin
-          if (AKnownLive = nil)
-             or (AKnownLive.IndexOf(ObjectKey(Objects[Index].Namespace,
-               Objects[Index].Digest)) < 0) then
-            Inc(ALivePreserved);
-          if (AKnownLive <> nil)
-             and (AKnownLive.IndexOf(ObjectKey(Objects[Index].Namespace,
-               Objects[Index].Digest)) < 0) then
-            AKnownLive.Add(ObjectKey(Objects[Index].Namespace,
-              Objects[Index].Digest));
-          Continue;
+          EvictCandidate(Next);
+          Inc(Next);
+          {$IFDEF OBJECTSTORE_TESTING}
+          if Assigned(CacheLifecycleAfterEvictionTestHook) then
+            CacheLifecycleAfterEvictionTestHook(ACacheRoot);
+          {$ENDIF}
         end;
-        try
-          { Account each removal by the bytes it deleted rather than
-            re-walking the whole tree per object; the walk after the loop
-            is the authoritative figure. A partial failure still deleted
-            what it reports, so those bytes count whatever the result. }
-          Removable := RemoveObjectFiles(ACacheRoot, Objects[Index],
-            FreedBytes);
-          Dec(CurrentBytes, FreedBytes);
-          Inc(AReclaimed, FreedBytes);
-          if Removable then
-          begin
-            EntryIndex := LookupEntryIndex(Lookup,
-              ObjectKey(Objects[Index].Namespace, Objects[Index].Digest));
-            if EntryIndex >= 0 then Removed[EntryIndex] := True;
-          end;
-        finally
-          Lease.Free;
-        end;
-      end;
+        WriteIndexWithoutFlagged(ACacheRoot, Sequence, Entries, Removed);
+        CurrentBytes := DirectoryBytes(ACacheRoot);
+      until (CurrentBytes + AAdditionalBytes <= Budget)
+            or (Next > High(Objects));
     finally
       Lookup.Free;
     end;
-    DeleteFlaggedEntries(Entries, Removed);
-    if Entries.Count = 0 then
-      SysUtils.DeleteFile(IndexPath(ACacheRoot))
-    else
-      WriteIndex(ACacheRoot, Sequence, Entries);
-    CurrentBytes := DirectoryBytes(ACacheRoot);
     Result := CurrentBytes + AAdditionalBytes <= Budget;
   finally
     Coordinator.Free;
