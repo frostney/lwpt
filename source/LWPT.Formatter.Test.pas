@@ -114,6 +114,7 @@ type
     procedure TestSwitchAfterAModifierKeepsTheModifier;
     procedure TestEscapedKeywordParametersRenameOnlyIdentifiers;
     procedure TestDirectiveWordParameterIsLeftAlone;
+    procedure TestEscapedDirectiveWordWithUnescapedUseIsLeftAlone;
     procedure TestUncertainNestedMentionBlocksTheRename;
     procedure TestNestedRoutineNamedLikeTheParameterBlocksTheRename;
     procedure TestSameNamedRecordFieldIsNotTheParameter;
@@ -2546,6 +2547,28 @@ begin
     'end.']));
 end;
 
+procedure TFormatRoutineScope.TestEscapedDirectiveWordWithUnescapedUseIsLeftAlone;
+begin
+  { An escaped `&message` parameter may be used unescaped, and those uses
+    are keyword tokens a rename cannot touch. Renaming only the escaped
+    header would rebind `message` to the global and print 99 instead of 3. }
+  ExpectUnchanged('EscapedDirectiveWord', SourceLines([
+    'program EscapedDirectiveWord;',
+    '{$mode objfpc}',
+    '',
+    'var',
+    '  message: Integer = 99;',
+    '',
+    'procedure Show(&message: Integer);',
+    'begin',
+    '  WriteLn(message);',
+    'end;',
+    '',
+    'begin',
+    '  Show(3);',
+    'end.']));
+end;
+
 procedure TFormatRoutineScope.TestOmittedImplementationParametersBlockTheRename;
 begin
   { Delphi mode lets the implementation omit the parameter list, so its
@@ -2844,6 +2867,8 @@ begin
     TestEscapedKeywordParametersRenameOnlyIdentifiers);
   Test('a parameter spelled like a directive word is left alone',
     TestDirectiveWordParameterIsLeftAlone);
+  Test('an escaped directive-word parameter used unescaped keeps its name',
+    TestEscapedDirectiveWordWithUnescapedUseIsLeftAlone);
   Test('an uncertain nested mention blocks the rename',
     TestUncertainNestedMentionBlocksTheRename);
   Test('a with statement blocks the rename',

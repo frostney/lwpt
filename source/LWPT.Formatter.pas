@@ -1377,6 +1377,7 @@ type
     procedure Block(const AGroup, AOldName: string);
     function IsBlocked(const AHeader: TRoutineHeader; const AOldName: string): Boolean;
     function NameOccurs(const AName: string; const AFirst, ALast: Integer): Boolean;
+    function KeywordSpelledAs(const AName: string; const AFirst, ALast: Integer): Boolean;
     function HeaderMentions(const ARoutine: Integer; const AName: string): TMention;
     function DeclarationMentions(const ARoutine: Integer; const AName: string;
       const ANested: Boolean): TMention;
@@ -1821,6 +1822,41 @@ begin
   end;
 end;
 
+(* True when a keyword token in the range is spelled like AName and AName
+   is not a reserved word. An `&`-escaped parameter named after a directive
+   word (`&message`) may be used unescaped, and those uses are keyword
+   tokens the rename cannot touch, so renaming only the escaped spellings
+   would rebind them. A reserved word (`&begin`) can only be used escaped,
+   so its unescaped occurrences are syntax and do not block the rename. *)
+function TParameterRenamer.KeywordSpelledAs(const AName: string;
+  const AFirst, ALast: Integer): Boolean;
+const
+  { FPC's reserved words in the objfpc and delphi modes. These can only be
+    used escaped, so every unescaped occurrence is syntax, not a use. }
+  ReservedWords: array[0..66] of string = (
+    'and', 'array', 'as', 'asm', 'begin', 'case', 'class', 'const',
+    'constructor', 'destructor', 'dispinterface', 'div', 'do', 'downto',
+    'else', 'end', 'except', 'exports', 'file', 'finalization', 'finally',
+    'for', 'function', 'goto', 'if', 'implementation', 'in', 'inherited',
+    'initialization', 'inline', 'interface', 'is', 'label', 'library', 'mod',
+    'nil', 'not', 'object', 'of', 'on', 'operator', 'or', 'out', 'packed',
+    'procedure', 'program', 'property', 'raise', 'record', 'repeat',
+    'resourcestring', 'set', 'shl', 'shr', 'string', 'then', 'threadvar',
+    'to', 'try', 'type', 'unit', 'until', 'uses', 'var', 'while', 'with',
+    'xor');
+var
+  TokenIndex, WordIndex: Integer;
+begin
+  for WordIndex := Low(ReservedWords) to High(ReservedWords) do
+    if SameText(AName, ReservedWords[WordIndex]) then
+      Exit(False);
+  for TokenIndex := AFirst to ALast do
+    if FSource.IsName(TokenIndex) and not FSource.IsIdentifier(TokenIndex) and
+       SameText(FSource.Text(TokenIndex), AName) then
+      Exit(True);
+  Result := False;
+end;
+
 (* Every parameter a header declares, keyed by its normalized name (an
    `&` escape dropped). A renameable one — two or more letters, no A
    prefix yet, not Self, and not one whose prefixed form is a keyword —
@@ -1888,7 +1924,8 @@ begin
       Pair := FParameters[RoutineIndex][PairIndex];
       { A parameter spelled like its routine makes every mention of the
         name ambiguous. }
-      if (Pair.NewName = '') or FSource.NameIs(Header.NameToken, Pair.OldName) then
+      if (Pair.NewName = '') or FSource.NameIs(Header.NameToken, Pair.OldName) or
+         KeywordSpelledAs(Pair.OldName, Header.StartToken, Header.ExtentEnd - 1) then
         Block(Header.Group, Pair.OldName)
       else if Header.Body = rbBody then
       begin
