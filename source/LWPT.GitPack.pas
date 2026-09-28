@@ -775,7 +775,10 @@ begin
   for i := 0 to FEntryCount - 1 do
     if FEntries[i].Kind <> 0 then
     begin
-      if (i and $3F) = 0 then CheckDeadline(FLimits.Deadline);
+      { Count completions, not entry indices: a pack that places deltas at
+        every checkpoint index would otherwise skip every check. }
+      Inc(Work);
+      if (Work and $3F) = 0 then CheckDeadline(FLimits.Deadline);
       Complete(i, FEntries[i].Kind, FEntries[i].Data);
       Queue[Tail] := i;
       Inc(Tail);
