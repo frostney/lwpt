@@ -1831,11 +1831,13 @@ end;
 function TParameterRenamer.KeywordSpelledAs(const AName: string;
   const AFirst, ALast: Integer): Boolean;
 const
-  { The words FPC 3.2.2 reserves in every language mode
-    (keyword:alllanguagemodes in compiler/tokens.pas). They can only be
-    used escaped, so every unescaped occurrence is syntax, not a use.
-    Mode-dependent (class, try, property, ...) and context-sensitive
-    (inline, on, out, operator) words are deliberately absent. }
+  { The words FPC 3.2.2 reserves in every mode that accepts `&` escapes:
+    the keyword:alllanguagemodes entries of compiler/tokens.pas, including
+    those excluded only from the ISO and Extended Pascal modes, which have
+    no `&` escapes. They can only be used escaped, so every unescaped
+    occurrence is syntax, not a use. Mode-dependent (class, try, property,
+    ...) and context-sensitive (inline, on, out, operator) words are
+    deliberately absent. }
   ReservedWords: array[0..53] of string = (
     'do', 'if', 'in', 'of', 'or', 'to', 'and', 'asm', 'div', 'end', 'for',
     'mod', 'nil', 'not', 'set', 'shl', 'shr', 'var', 'xor', 'case', 'else',
