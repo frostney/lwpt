@@ -1334,7 +1334,6 @@ begin
       if Verified.ExpiresAt <= State.LastSync then
         raise ELWPTRegistryStaleContactError.CreateStable('checkpoint_expired',
           'checkpoint expired before activation');
-      RequireRegistryClockAtFloor(State.LastSync, State.ClockFloor);
       FActivationExpiresAt := Verified.ExpiresAt;
       FActivationClockFloor := State.ClockFloor;
       ActivateBudgeted(State);

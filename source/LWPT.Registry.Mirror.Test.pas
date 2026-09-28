@@ -127,6 +127,9 @@ type
     procedure BackwardsRenewalKeepsAcceptedPointer;
     procedure OverlongCheckpointIsRejectedAtSynchronization;
     procedure ClockBehindFloorRefusesSynchronization;
+    procedure LegacyPointerFloorIsCheckpointPublication;
+    procedure MoveClockBehindFloor;
+    procedure ClockBehindFloorAtActivationKeepsPointer;
     procedure AbandonedRotationCannotContaminateLaterHistory;
     procedure UnsupportedUpstreamsAreRejectedAtConfiguration;
     procedure LocalhostTransportUsesLoopback;
@@ -1361,6 +1364,100 @@ begin
   end;
 end;
 
+function SynchronizeOutcome(AMirror: TLWPTRegistryMirror): string;
+begin
+  Result := 'ok';
+  try
+    AMirror.Synchronize;
+  except
+    on E: Exception do Result := E.Message;
+  end;
+end;
+
+procedure TMirrorTransferTests.LegacyPointerFloorIsCheckpointPublication;
+var
+  Harness: TOriginHarness;
+  Restarted: TLWPTRegistryMirror;
+  PointerPath, Current, Legacy, Outcome: string;
+  RequestsBefore: Integer;
+begin
+  SetRegistryClockForTesting(FixtureNow);
+  Harness := TOriginHarness.Create('mirror-legacy-floor', FixturePublishedAt);
+  Restarted := nil;
+  try
+    Harness.Publish('legacy', FixtureNow);
+    Expect<string>(Harness.Sync).ToBe('ok');
+    { Rewrite the pointer as it was written before clock_floor existed. }
+    PointerPath := Harness.Mirror.Root + '/state/current.toml';
+    Current := AsText(ReadFileBytes(PointerPath));
+    Legacy := StringReplace(Current, 'clock_floor = "' + FixtureNow + '"' + #10, '', []);
+    Expect<Boolean>(Legacy <> Current).ToBe(True);
+    AtomicWriteBytes(PointerPath, Harness.Mirror.Root + '/tmp', BytesOf(Legacy));
+    Restarted := TLWPTRegistryMirror.Create(Harness.Mirror.Root);
+    Expect<string>(Restarted.LoadCurrentState.ClockFloor).ToBe('');
+    Expect<Boolean>(Pos('clock_floor = "' + FixtureNow + '"',
+      Restarted.VerifyMirror) > 0).ToBe(True);
+    { The accepted checkpoint's published_at is the floor. }
+    SetRegistryClockForTesting('2031-01-01T23:59:59Z');
+    RequestsBefore := Harness.Server.RequestCount;
+    Outcome := SynchronizeOutcome(Restarted);
+    Expect<Boolean>(Pos('local_clock_behind_accepted_state:', Outcome) = 1).ToBe(True);
+    Expect<Integer>(Harness.Server.RequestCount).ToBe(RequestsBefore);
+    Expect<string>(AsText(ReadFileBytes(PointerPath))).ToBe(Legacy);
+    { At the floor, synchronization proceeds and persists the floor. }
+    SetRegistryClockForTesting(FixtureNow);
+    Expect<string>(SynchronizeOutcome(Restarted)).ToBe('ok');
+    Expect<Boolean>(Pos('clock_floor = "' + FixtureNow + '"',
+      AsText(ReadFileBytes(PointerPath))) > 0).ToBe(True);
+  finally
+    Restarted.Free;
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.MoveClockBehindFloor;
+begin
+  FActivationEntered := True;
+  SetRegistryClockForTesting('2031-01-02T12:00:00Z');
+end;
+
+procedure TMirrorTransferTests.ClockBehindFloorAtActivationKeepsPointer;
+var
+  Harness: TOriginHarness;
+  PointerPath, PointerBefore, Outcome: string;
+  Accepted: TBytes;
+begin
+  SetRegistryClockForTesting(FixtureNow);
+  Harness := TOriginHarness.Create('mirror-activation-floor', FixturePublishedAt);
+  try
+    Expect<string>(Harness.Sync).ToBe('ok');
+    PointerPath := Harness.Mirror.Root + '/state/current.toml';
+    PointerBefore := AsText(ReadFileBytes(PointerPath));
+    Accepted := ServedBytes(Harness.Mirror, '/v1/checkpoints/latest.toml');
+    { The new head raises the floor to 2031-01-03; the clock then falls back
+      to 2031-01-02T12:00:00Z after the new pointer is staged. }
+    SetRegistryClockForTesting('2031-01-03T00:00:00Z');
+    Harness.Publish('next', '2031-01-03T00:00:00Z');
+    FActivationEntered := False;
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, nil, MoveClockBehindFloor);
+    Outcome := Harness.Sync;
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, nil, nil);
+    Expect<Boolean>(FActivationEntered).ToBe(True);
+    Expect<Boolean>(Pos('local_clock_behind_accepted_state:', Outcome) = 1).ToBe(True);
+    Expect<string>(AsText(ReadFileBytes(PointerPath))).ToBe(PointerBefore);
+    Expect<string>(AsText(ServedBytes(Harness.Mirror, '/v1/checkpoints/latest.toml')))
+      .ToBe(AsText(Accepted));
+    { Once the clock reaches the new floor, the same head activates. }
+    SetRegistryClockForTesting('2031-01-03T00:00:00Z');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    Expect<Boolean>(Pos('clock_floor = "2031-01-03T00:00:00Z"',
+      AsText(ReadFileBytes(PointerPath))) > 0).ToBe(True);
+  finally
+    RegistryMirrorActivationHooksForTesting(Harness.Mirror, nil, nil);
+    Harness.Free;
+  end;
+end;
+
 procedure TMirrorTransferTests.FailBeforeActivation;
 begin
   raise ELWPTRegistryError.CreateStable('interrupted_attempt', 'stopped before activation');
@@ -1998,6 +2095,10 @@ begin
   Test('synchronization enforces the maximum checkpoint lifetime', OverlongCheckpointIsRejectedAtSynchronization);
   Test('a clock behind the persisted floor refuses synchronization until it catches up',
     ClockBehindFloorRefusesSynchronization);
+  Test('a pointer without a stored floor uses its checkpoint publication time',
+    LegacyPointerFloorIsCheckpointPublication);
+  Test('a clock behind the new floor at activation keeps the accepted pointer',
+    ClockBehindFloorAtActivationKeepsPointer);
   Test('an abandoned rotation cannot contaminate a later accepted history', AbandonedRotationCannotContaminateLaterHistory);
   Test('IPv6 upstreams are rejected at configuration time', UnsupportedUpstreamsAreRejectedAtConfiguration);
   Test('the localhost HTTP exception connects to loopback directly', LocalhostTransportUsesLoopback);

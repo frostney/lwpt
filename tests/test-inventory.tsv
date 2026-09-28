@@ -56,7 +56,7 @@ program	*	source/LWPT.Observability.Test.pas	1	6
 program	*	source/LWPT.ObjectStore.Test.pas	1	14
 program	unix/*	source/LWPT.ObjectStore.Test.pas	1	15
 program	*	source/LWPT.Registry.Crypto.Test.pas	1	6
-program	*	source/LWPT.Registry.Mirror.Test.pas	1	38
+program	*	source/LWPT.Registry.Mirror.Test.pas	1	40
 program	*	source/LWPT.Registry.Store.Test.pas	1	45
 program	*	source/LWPT.Registry.Verification.Test.pas	1	53
 program	*	source/LWPT.OutputRenderer.Test.pas	1	4
