@@ -39,6 +39,9 @@ type
     procedure TestDecodesLargePayloadAcrossReadBoundaries;
     procedure TestDecodesConcatenatedMembers;
     procedure TestIgnoresTrailingZeroPadding;
+    procedure TestRejectsLoneMagicByteAfterMember;
+    procedure TestRejectsDamagedSecondMemberMagic;
+    procedure TestRejectsDataAfterZeroPadding;
     procedure TestRejectsNonGzipInput;
     procedure TestRejectsEmptyInput;
     procedure TestRejectsTruncatedHeader;
@@ -204,6 +207,34 @@ begin
     .ToBe(HELLO);
 end;
 
+procedure TGzipSuite.TestRejectsLoneMagicByteAfterMember;
+begin
+  { A second member truncated after its first header byte. }
+  Expect<Boolean>(RaisesExtractError(JoinBytes(ToBytes(HELLO_GZIP),
+    ToBytes([$1F])))).ToBe(True);
+end;
+
+procedure TGzipSuite.TestRejectsDamagedSecondMemberMagic;
+var
+  Second: TBytes;
+begin
+  Second := ToBytes(HELLO_GZIP);
+  Second[1] := $8C;
+  Expect<Boolean>(RaisesExtractError(JoinBytes(ToBytes(HELLO_GZIP), Second)))
+    .ToBe(True);
+end;
+
+procedure TGzipSuite.TestRejectsDataAfterZeroPadding;
+var
+  Tail: TBytes;
+begin
+  SetLength(Tail, 16);
+  FillChar(Tail[0], Length(Tail), 0);
+  Tail[High(Tail)] := $01;
+  Expect<Boolean>(RaisesExtractError(JoinBytes(ToBytes(HELLO_GZIP), Tail)))
+    .ToBe(True);
+end;
+
 procedure TGzipSuite.TestRejectsNonGzipInput;
 begin
   Expect<Boolean>(RaisesExtractError(
@@ -305,6 +336,12 @@ begin
     TestDecodesConcatenatedMembers);
   Test('ignores zero padding after the last member',
     TestIgnoresTrailingZeroPadding);
+  Test('rejects a lone magic byte after a member',
+    TestRejectsLoneMagicByteAfterMember);
+  Test('rejects a damaged second-member magic',
+    TestRejectsDamagedSecondMemberMagic);
+  Test('rejects nonzero data after zero padding',
+    TestRejectsDataAfterZeroPadding);
   Test('rejects input that is not gzip', TestRejectsNonGzipInput);
   Test('rejects empty input', TestRejectsEmptyInput);
   Test('rejects a truncated header', TestRejectsTruncatedHeader);

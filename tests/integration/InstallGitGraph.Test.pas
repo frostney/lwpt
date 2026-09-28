@@ -1422,11 +1422,6 @@ var
   ShallowRoot, ShallowLock, Root, ArchivePath: string;
   Run: TLwptResult;
 begin
-  {$IFDEF MSWINDOWS}
-  { This root exceeds legacy Windows MAX_PATH before LWPT runs. }
-  Expect<Boolean>(True).ToBe(True);
-  Exit;
-  {$ENDIF}
   PrepareOfflineSeed('deep-root-reference', ShallowRoot, ShallowLock);
   Expect<Boolean>(LockValue(ShallowLock, 'computedHash') <> '').ToBe(True);
 
@@ -1522,8 +1517,14 @@ begin
   Test('offline reuse of another dependency''s staged archive is checked '
     + 'against the lock before extraction',
     TestOfflineSharedCandidateIsCheckedBeforeExtraction);
+  {$IFDEF MSWINDOWS}
+  Skip('a project root whose archive path exceeds 255 characters installs '
+    + 'the same tree as a shallow root', TestDeepProjectRootExtractsArchive,
+    'the project root exceeds legacy Windows MAX_PATH');
+  {$ELSE}
   Test('a project root whose archive path exceeds 255 characters installs '
     + 'the same tree as a shallow root', TestDeepProjectRootExtractsArchive);
+  {$ENDIF}
 end;
 
 begin

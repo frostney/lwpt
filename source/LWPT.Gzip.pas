@@ -10,10 +10,14 @@
   Every member is verified in full: the deflate method, the reserved flag
   bits, the optional FEXTRA, FNAME and FCOMMENT fields, the FHCRC header
   checksum, and the CRC-32 and ISIZE trailer. Concatenated members decode in
-  sequence, as RFC 1952 section 2.2 allows. Bytes after the last member that
-  do not begin another member are ignored, as gzip(1) ignores them. Any other
-  malformation raises EExtractError, so a truncated or corrupt archive can
-  never be mistaken for a complete one. }
+  sequence, as RFC 1952 section 2.2 allows. After a member, the stream may
+  end or continue with zero padding to its end; any other byte starts a
+  member that must decode in full. Every other malformation raises
+  EExtractError, so a truncated or corrupt archive can never be mistaken for
+  a complete one.
+
+  Decompressed output is not size-limited here, as it was not by paszlib's
+  gzread: the fetched archive is bounded, the expansion is not. }
 unit LWPT.Gzip;
 
 {$I Shared.inc}
@@ -39,23 +43,23 @@ uses
   zinflate;
 
 const
-  GZIP_ID1 = $1F;
-  GZIP_ID2 = $8B;
-  GZIP_METHOD_DEFLATE = 8;
-  GZIP_FLAG_HEADER_CRC = $02;
-  GZIP_FLAG_EXTRA = $04;
-  GZIP_FLAG_NAME = $08;
-  GZIP_FLAG_COMMENT = $10;
-  GZIP_FLAG_RESERVED = $E0;
+  GzipId1 = $1F;
+  GzipId2 = $8B;
+  GzipMethodDeflate = 8;
+  GzipFlagHeaderCrc = $02;
+  GzipFlagExtra = $04;
+  GzipFlagName = $08;
+  GzipFlagComment = $10;
+  GzipFlagReserved = $E0;
   { Bytes after the flag byte that carry no structure: MTIME (4), XFL, OS. }
-  GZIP_FIXED_TAIL_LENGTH = 6;
-  GZIP_BUFFER_SIZE = 64 * 1024;
+  GzipFixedTailLength = 6;
+  GzipBufferSize = 64 * 1024;
 
 type
-  TGzipDecoder = class
+  TLWPTGzipDecoder = class
   private
     FSource, FTarget: TStream;
-    FInput, FOutput: array[0..GZIP_BUFFER_SIZE - 1] of Byte;
+    FInput, FOutput: array[0..GzipBufferSize - 1] of Byte;
     FPosition, FCount: Integer;
     FHeaderCrc: Cardinal;
     function Available: Integer;
@@ -67,6 +71,7 @@ type
     procedure ReadHeader;
     procedure Inflate(out ACrc: Cardinal; out ASize: QWord);
     procedure DecodeMember;
+    procedure SkipZeroPadding;
   public
     constructor Create(const ASource, ATarget: TStream);
     procedure Run;
@@ -78,20 +83,20 @@ begin
     [APart]);
 end;
 
-constructor TGzipDecoder.Create(const ASource, ATarget: TStream);
+constructor TLWPTGzipDecoder.Create(const ASource, ATarget: TStream);
 begin
   inherited Create;
   FSource := ASource;
   FTarget := ATarget;
 end;
 
-function TGzipDecoder.Available: Integer;
+function TLWPTGzipDecoder.Available: Integer;
 begin
   Result := FCount - FPosition;
 end;
 
 { Buffers at least ACount unread bytes; False when the source ends first. }
-function TGzipDecoder.Ensure(const ACount: Integer): Boolean;
+function TLWPTGzipDecoder.Ensure(const ACount: Integer): Boolean;
 var
   Remaining, ReadCount: Integer;
 begin
@@ -103,27 +108,27 @@ begin
   FCount := Remaining;
   while FCount < ACount do
   begin
-    ReadCount := FSource.Read(FInput[FCount], GZIP_BUFFER_SIZE - FCount);
+    ReadCount := FSource.Read(FInput[FCount], GzipBufferSize - FCount);
     if ReadCount <= 0 then Exit(False);
     Inc(FCount, ReadCount);
   end;
   Result := True;
 end;
 
-function TGzipDecoder.ReadByte(const APart: string): Byte;
+function TLWPTGzipDecoder.ReadByte(const APart: string): Byte;
 begin
   if not Ensure(1) then RaiseTruncated(APart);
   Result := FInput[FPosition];
   Inc(FPosition);
 end;
 
-function TGzipDecoder.ReadHeaderByte: Byte;
+function TLWPTGzipDecoder.ReadHeaderByte: Byte;
 begin
   Result := ReadByte('header');
   FHeaderCrc := crc32(FHeaderCrc, @Result, 1);
 end;
 
-function TGzipDecoder.ReadLittleEndian32: Cardinal;
+function TLWPTGzipDecoder.ReadLittleEndian32: Cardinal;
 var
   i: Integer;
 begin
@@ -132,42 +137,42 @@ begin
     Result := Result or (Cardinal(ReadByte('trailer')) shl (8 * i));
 end;
 
-procedure TGzipDecoder.SkipZeroTerminatedHeaderField;
+procedure TLWPTGzipDecoder.SkipZeroTerminatedHeaderField;
 begin
   while ReadHeaderByte <> 0 do;
 end;
 
-procedure TGzipDecoder.ReadHeader;
+procedure TLWPTGzipDecoder.ReadHeader;
 var
   Method, Flags: Byte;
   ExtraLength, StoredCrc: Cardinal;
   i: Integer;
 begin
   FHeaderCrc := crc32(0, nil, 0);
-  if (ReadHeaderByte <> GZIP_ID1) or (ReadHeaderByte <> GZIP_ID2) then
+  if (ReadHeaderByte <> GzipId1) or (ReadHeaderByte <> GzipId2) then
     raise EExtractError.Create('archive is not a gzip stream');
   Method := ReadHeaderByte;
-  if Method <> GZIP_METHOD_DEFLATE then
+  if Method <> GzipMethodDeflate then
     raise EExtractError.CreateFmt(
       'gzip header names unsupported compression method %d', [Method]);
   Flags := ReadHeaderByte;
-  if (Flags and GZIP_FLAG_RESERVED) <> 0 then
+  if (Flags and GzipFlagReserved) <> 0 then
     raise EExtractError.CreateFmt(
       'gzip header sets reserved flag bits ($%.2x)', [Flags]);
-  for i := 1 to GZIP_FIXED_TAIL_LENGTH do
+  for i := 1 to GzipFixedTailLength do
     ReadHeaderByte;
-  if (Flags and GZIP_FLAG_EXTRA) <> 0 then
+  if (Flags and GzipFlagExtra) <> 0 then
   begin
     ExtraLength := ReadHeaderByte;
     ExtraLength := ExtraLength or (Cardinal(ReadHeaderByte) shl 8);
     for i := 1 to Integer(ExtraLength) do
       ReadHeaderByte;
   end;
-  if (Flags and GZIP_FLAG_NAME) <> 0 then
+  if (Flags and GzipFlagName) <> 0 then
     SkipZeroTerminatedHeaderField;
-  if (Flags and GZIP_FLAG_COMMENT) <> 0 then
+  if (Flags and GzipFlagComment) <> 0 then
     SkipZeroTerminatedHeaderField;
-  if (Flags and GZIP_FLAG_HEADER_CRC) <> 0 then
+  if (Flags and GzipFlagHeaderCrc) <> 0 then
   begin
     { The CRC16 is the low half of the CRC-32 of every preceding header
       byte, so it is read without folding it into FHeaderCrc. }
@@ -180,7 +185,7 @@ begin
   end;
 end;
 
-procedure TGzipDecoder.Inflate(out ACrc: Cardinal; out ASize: QWord);
+procedure TLWPTGzipDecoder.Inflate(out ACrc: Cardinal; out ASize: QWord);
 var
   Stream: z_stream;
   Status, Offered, Consumed, Produced: Integer;
@@ -201,11 +206,11 @@ begin
       Stream.next_in := @FInput[FPosition];
       Stream.avail_in := Offered;
       Stream.next_out := @FOutput[0];
-      Stream.avail_out := GZIP_BUFFER_SIZE;
+      Stream.avail_out := GzipBufferSize;
       Status := zinflate.inflate(Stream, Z_NO_FLUSH);
       Consumed := Offered - Integer(Stream.avail_in);
       Inc(FPosition, Consumed);
-      Produced := GZIP_BUFFER_SIZE - Integer(Stream.avail_out);
+      Produced := GzipBufferSize - Integer(Stream.avail_out);
       if Produced > 0 then
       begin
         ACrc := crc32(ACrc, @FOutput[0], Produced);
@@ -237,7 +242,7 @@ begin
   end;
 end;
 
-procedure TGzipDecoder.DecodeMember;
+procedure TLWPTGzipDecoder.DecodeMember;
 var
   ComputedCrc, StoredCrc, StoredSize: Cardinal;
   Size: QWord;
@@ -256,19 +261,33 @@ begin
       'gzip length mismatch: stored %d, decoded %d', [StoredSize, Size]);
 end;
 
-procedure TGzipDecoder.Run;
+{ Consumes the rest of the stream, which must be all zero bytes. }
+procedure TLWPTGzipDecoder.SkipZeroPadding;
+begin
+  while Ensure(1) do
+  begin
+    if FInput[FPosition] <> 0 then
+      raise EExtractError.Create(
+        'gzip stream has data after its trailing zero padding');
+    Inc(FPosition);
+  end;
+end;
+
+procedure TLWPTGzipDecoder.Run;
 begin
   DecodeMember;
-  while Ensure(2) and (FInput[FPosition] = GZIP_ID1)
-    and (FInput[FPosition + 1] = GZIP_ID2) do
-    DecodeMember;
+  while Ensure(1) do
+    if FInput[FPosition] = 0 then
+      SkipZeroPadding
+    else
+      DecodeMember;
 end;
 
 procedure GunzipStream(const ASource, ATarget: TStream);
 var
-  Decoder: TGzipDecoder;
+  Decoder: TLWPTGzipDecoder;
 begin
-  Decoder := TGzipDecoder.Create(ASource, ATarget);
+  Decoder := TLWPTGzipDecoder.Create(ASource, ATarget);
   try
     Decoder.Run;
   finally

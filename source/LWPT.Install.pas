@@ -1379,7 +1379,7 @@ type
   { One tar entry header, with any GNU long name or ustar prefix folded in
     and the name re-rooted below the extraction root. RelName is '' for an
     entry that is not extracted; its payload must still be skipped. }
-  TTarEntry = record
+  TLWPTTarEntry = record
     TypeFlag: Byte;
     Size: Int64;
     Pad: Integer;
@@ -1389,14 +1389,14 @@ type
 { Reads the next entry header from ATar, leaving the stream at the entry's
   payload. False at the end of the archive. }
 function ReadTarEntry(const ATar: TStream; const ASubDir: string;
-  out AEntry: TTarEntry): Boolean;
+  out AEntry: TLWPTTarEntry): Boolean;
 var
   Hdr: array[0..511] of Byte;
   Name, Prefix, PendingLongName: string;
   ZeroBlocks, Pad, i: Integer;
   AllZero: Boolean;
 begin
-  AEntry := Default(TTarEntry);
+  AEntry := Default(TLWPTTarEntry);
   PendingLongName := '';
   ZeroBlocks := 0;
   while ATar.Read(Hdr, 512) = 512 do
@@ -1453,13 +1453,15 @@ const
   { LWPT is not long-path aware, so the Win32 file APIs keep the legacy
     MAX_PATH budget: 259 characters for a file, and 247 for a directory,
     whose creation reserves room for an 8.3 file name. }
-  ARCHIVE_FILE_PATH_LIMIT = MAX_PATH - 1;
-  ARCHIVE_DIRECTORY_PATH_LIMIT = MAX_PATH - 13;
+  ArchiveFilePathLimit = MAX_PATH - 1;
+  ArchiveDirectoryPathLimit = MAX_PATH - 13;
   {$ELSE}
   { PATH_MAX, which counts the terminating NUL. }
-  ARCHIVE_FILE_PATH_LIMIT = MaxPathLen - 1;
-  ARCHIVE_DIRECTORY_PATH_LIMIT = MaxPathLen - 1;
+  ArchiveFilePathLimit = MaxPathLen - 1;
+  ArchiveDirectoryPathLimit = MaxPathLen - 1;
   {$ENDIF}
+  { NAME_MAX on Unix; the per-component limit on Windows. }
+  ArchiveNameComponentLimit = 255;
 
 function PlatformPathLength(const APath: string): Integer;
 begin
@@ -1480,26 +1482,27 @@ var
   PathLength, ParentLength, Limit, Excess: Integer;
   Kind: string;
 begin
-  PathLength := PlatformPathLength(APath);
+  PathLength := PlatformPathLength(ExcludeTrailingPathDelimiter(APath));
   if AIsDirectory then
   begin
     Kind := 'directory';
-    Limit := ARCHIVE_DIRECTORY_PATH_LIMIT;
+    Limit := ArchiveDirectoryPathLimit;
     Excess := PathLength - Limit;
   end
   else
   begin
     Kind := 'file';
-    Limit := ARCHIVE_FILE_PATH_LIMIT;
+    Limit := ArchiveFilePathLimit;
     Excess := PathLength - Limit;
     { A file also needs its parent directory created, and on Windows the
       directory budget is the tighter one. }
-    ParentLength := PlatformPathLength(ExtractFileDir(APath));
-    if ParentLength - ARCHIVE_DIRECTORY_PATH_LIMIT > Excess then
+    ParentLength := PlatformPathLength(
+      ExtractFileDir(ExcludeTrailingPathDelimiter(APath)));
+    if ParentLength - ArchiveDirectoryPathLimit > Excess then
     begin
       Kind := 'directory';
       PathLength := ParentLength;
-      Limit := ARCHIVE_DIRECTORY_PATH_LIMIT;
+      Limit := ArchiveDirectoryPathLimit;
       Excess := PathLength - Limit;
     end;
   end;
@@ -1509,6 +1512,140 @@ begin
     + 'below "%s", but this platform limits %s paths to %d characters; '
     + 'move the project to a path at least %d characters shorter',
     [AEntryName, PathLength, Kind, ADest, Kind, Limit, Excess]);
+end;
+
+{ Raises when a component of an entry's relative name is longer than any
+  file system accepts. Moving the project cannot fix this. }
+procedure EnsureArchiveNameComponentsFit(const AEntryName: string);
+var
+  Parts: TStringArray;
+  i: Integer;
+begin
+  Parts := StringReplace(AEntryName, '\', '/', [rfReplaceAll]).Split(['/']);
+  for i := 0 to High(Parts) do
+    if PlatformPathLength(Parts[i]) > ArchiveNameComponentLimit then
+      raise EExtractError.CreateFmt(
+        'archive entry name is too long: "%s" has a %d-character name '
+        + 'component, but this platform limits file names to %d characters; '
+        + 'the entry cannot be extracted here',
+        [AEntryName, PlatformPathLength(Parts[i]),
+         ArchiveNameComponentLimit]);
+end;
+
+type
+  { The destinations extraction will create, as absolute paths, so that
+    directory-link copies can be checked before anything is written. }
+  TLWPTArchivePlan = class
+  private
+    FDest: string;
+    FFiles, FDirectories: TStringList;
+    procedure AddDirectoryChain(const APath: string);
+    procedure CheckAndAdd(const APath, AEntryName: string;
+      const AIsDirectory: Boolean);
+  public
+    constructor Create(const ADest: string);
+    destructor Destroy; override;
+    procedure AddEntry(const APath, AEntryName: string;
+      const AIsDirectory: Boolean);
+    procedure AddLink(const ALinkPath, ATargetName, AFromRel: string);
+  end;
+
+function NewPathList: TStringList;
+begin
+  Result := TStringList.Create;
+  Result.Sorted := True;
+  Result.Duplicates := dupIgnore;
+  Result.CaseSensitive := True;
+end;
+
+constructor TLWPTArchivePlan.Create(const ADest: string);
+begin
+  inherited Create;
+  FDest := ExcludeTrailingPathDelimiter(ExpandFileName(ADest));
+  FFiles := NewPathList;
+  FDirectories := NewPathList;
+end;
+
+destructor TLWPTArchivePlan.Destroy;
+begin
+  FFiles.Free;
+  FDirectories.Free;
+  inherited Destroy;
+end;
+
+procedure TLWPTArchivePlan.AddDirectoryChain(const APath: string);
+var
+  Dir: string;
+begin
+  Dir := ExcludeTrailingPathDelimiter(APath);
+  while (Length(Dir) > Length(FDest)) and (FDirectories.IndexOf(Dir) < 0) do
+  begin
+    FDirectories.Add(Dir);
+    Dir := ExtractFileDir(Dir);
+  end;
+end;
+
+procedure TLWPTArchivePlan.CheckAndAdd(const APath, AEntryName: string;
+  const AIsDirectory: Boolean);
+begin
+  EnsureArchivePathFits(APath, AEntryName, FDest, AIsDirectory);
+  if AIsDirectory then
+    AddDirectoryChain(APath)
+  else
+  begin
+    AddDirectoryChain(ExtractFileDir(APath));
+    FFiles.Add(APath);
+  end;
+end;
+
+procedure TLWPTArchivePlan.AddEntry(const APath, AEntryName: string;
+  const AIsDirectory: Boolean);
+begin
+  EnsureArchiveNameComponentsFit(AEntryName);
+  CheckAndAdd(ExcludeTrailingPathDelimiter(APath), AEntryName, AIsDirectory);
+end;
+
+{ Mirrors the deferred link pass: a file link becomes a copy of its target,
+  and a directory link becomes a copy of the target's tree as it stands
+  after the links resolved before it. }
+procedure TLWPTArchivePlan.AddLink(const ALinkPath, ATargetName,
+  AFromRel: string);
+var
+  Target, LinkPath, Prefix: string;
+  Copies: TStringList;
+  i: Integer;
+begin
+  EnsureArchiveNameComponentsFit(AFromRel);
+  LinkPath := ExcludeTrailingPathDelimiter(ALinkPath);
+  EnsureArchivePathFits(LinkPath, AFromRel, FDest, False);
+  Target := ExcludeTrailingPathDelimiter(
+    ResolveArchiveLinkTarget(FDest, LinkPath, ATargetName, AFromRel));
+  if FFiles.IndexOf(Target) >= 0 then
+  begin
+    CheckAndAdd(LinkPath, AFromRel, False);
+    Exit;
+  end;
+  if (FDirectories.IndexOf(Target) < 0)
+     or PathContains(Target, LinkPath) then
+    Exit;
+  Prefix := IncludeTrailingPathDelimiter(Target);
+  Copies := TStringList.Create;
+  try
+    { Collected first: CheckAndAdd grows the lists being scanned. }
+    for i := 0 to FDirectories.Count - 1 do
+      if Copy(FDirectories[i], 1, Length(Prefix)) = Prefix then
+        Copies.AddObject(LinkPath + PathDelim
+          + Copy(FDirectories[i], Length(Prefix) + 1, MaxInt), TObject(1));
+    for i := 0 to FFiles.Count - 1 do
+      if Copy(FFiles[i], 1, Length(Prefix)) = Prefix then
+        Copies.AddObject(LinkPath + PathDelim
+          + Copy(FFiles[i], Length(Prefix) + 1, MaxInt), nil);
+    CheckAndAdd(LinkPath, AFromRel, True);
+    for i := 0 to Copies.Count - 1 do
+      CheckAndAdd(Copies[i], AFromRel, Copies.Objects[i] <> nil);
+  finally
+    Copies.Free;
+  end;
 end;
 
 function ExtractArchive(const AArchivePath, ADest: string;
@@ -1522,7 +1659,7 @@ var
   TarIn   : TStream;
   Buf     : array[0..65535] of Byte;
   N       : Integer;
-  Entry   : TTarEntry;
+  Entry   : TLWPTTarEntry;
   OutName, OutDir : string;
   TypeFlag : Byte;
   Size, Remaining, ToRead : Int64;
@@ -1531,6 +1668,9 @@ var
   PendingLinks : array of TPendingLink;
   li      : Integer;
   ResolvedTarget : string;
+  Plan    : TLWPTArchivePlan;
+  Links   : TStringList;
+  LinkFields : TStringArray;
 begin
   Result := 0;
   PendingLinks := nil;
@@ -1545,14 +1685,35 @@ begin
 
   TarIn := OpenProtectedFileStream(TarPath, fmOpenRead or fmShareDenyNone);
   try
-    { step 2: check every entry's destination before writing any of them,
-      so a traversal or an over-long path fails before extraction starts }
-    while ReadTarEntry(TarIn, ASubDir, Entry) do
-    begin
-      if Entry.RelName <> '' then
-        EnsureArchivePathFits(ResolveArchiveOutputPath(ADest, Entry.RelName),
-          Entry.RelName, ADest, Chr(Entry.TypeFlag) = '5');
-      TarIn.Seek(Entry.Size + Entry.Pad, soCurrent);
+    { step 2: check every destination, including directory-link copies,
+      before writing any of them, so a traversal or an over-long path fails
+      before extraction starts }
+    Plan := TLWPTArchivePlan.Create(ADest);
+    try
+      Links := TStringList.Create;
+      try
+        while ReadTarEntry(TarIn, ASubDir, Entry) do
+        begin
+          if Entry.RelName <> '' then
+          begin
+            OutName := ResolveArchiveOutputPath(ADest, Entry.RelName);
+            if Chr(Entry.TypeFlag) in ['1', '2'] then
+              Links.Add(OutName + #0 + Entry.LinkName + #0 + Entry.RelName)
+            else
+              Plan.AddEntry(OutName, Entry.RelName, Chr(Entry.TypeFlag) = '5');
+          end;
+          TarIn.Seek(Entry.Size + Entry.Pad, soCurrent);
+        end;
+        for li := 0 to Links.Count - 1 do
+        begin
+          LinkFields := Links[li].Split([#0]);
+          Plan.AddLink(LinkFields[0], LinkFields[1], LinkFields[2]);
+        end;
+      finally
+        Links.Free;
+      end;
+    finally
+      Plan.Free;
     end;
     TarIn.Position := 0;
 

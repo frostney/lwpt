@@ -52,6 +52,7 @@ type
     procedure TestLinkTargetIsAncestorSkipped;
     procedure TestGnuLongNameOverridesHeaderName;
     procedure TestArchivePathBeyond255Extracts;
+    procedure TestDirectoryAtPathLimitExtracts;
   end;
 
   { ExtractArchive's failure modes — every bad-input path must
@@ -69,6 +70,8 @@ type
     procedure TestInvalidGzipMagicRaises;
     procedure TestGzipCrcMismatchRaisesAndCleansUp;
     procedure TestOverlongEntryPathFailsBeforeWriting;
+    procedure TestDirectoryLinkAliasFailsBeforeWriting;
+    procedure TestOverlongNameComponentFailsBeforeWriting;
     procedure TestTarTruncatedMidEntryRaises;
     procedure TestParentTraversalPathRejected;
     procedure TestAbsoluteTraversalPathRejected;
@@ -76,6 +79,29 @@ type
   end;
 
 { ── helpers ───────────────────────────────────────────────────────── }
+
+const
+  { The operating system's own path budgets, not LWPT's: PATH_MAX less its
+    NUL on Unix; legacy MAX_PATH on Windows, where directory creation also
+    reserves room for an 8.3 file name. }
+  {$IFDEF MSWINDOWS}
+  PlatformFilePathLimit = 259;
+  PlatformDirectoryPathLimit = 247;
+  {$ELSE}
+  PlatformFilePathLimit = MaxPathLen - 1;
+  PlatformDirectoryPathLimit = MaxPathLen - 1;
+  {$ENDIF}
+  PathFillComponentLength = 199;
+
+{ A relative path of exactly ALength characters whose components stay
+  well inside every platform's file-name limit. }
+function FillPath(const ALength: Integer): string;
+begin
+  Result := '';
+  while ALength - Length(Result) > PathFillComponentLength + 1 do
+    Result := Result + StringOfChar('x', PathFillComponentLength) + '/';
+  Result := Result + StringOfChar('y', ALength - Length(Result));
+end;
 
 function ReadFileBytes(const APath: string): TBytes;
 var Stream: TFileStream;
@@ -380,11 +406,6 @@ var
   Body: TBytes;
   Count: Integer;
 begin
-  {$IFDEF MSWINDOWS}
-  { The fixture path itself exceeds legacy Windows MAX_PATH. }
-  Expect<Boolean>(True).ToBe(True);
-  Exit;
-  {$ENDIF}
   ArchiveDir := ExpandFileName(FScratch + '/' + StringOfChar('a', 100) + '/'
     + StringOfChar('b', 100) + '/' + StringOfChar('c', 60));
   Archive := ArchiveDir + '/long-archive-path.tar.gz';
@@ -403,6 +424,37 @@ begin
   Expect<Boolean>(FileExists(Archive + '.tar')).ToBe(False);
 end;
 
+procedure TExtractPathological.TestDirectoryAtPathLimitExtracts;
+{ A directory whose path is exactly the platform limit is creatable, and
+  tar spells directory entries both with and without a trailing '/'. The
+  separator is not part of the created path, so neither spelling may be
+  rejected as too long. }
+const
+  Suffixes: array[0..1] of string = ('/', '');
+  Outputs: array[0..1] of string = ('/dir-limit-slash-out',
+    '/dir-limit-bare-out');
+var
+  Suffix, Dest, RelPath, DirPath: string;
+  Count, Variant: Integer;
+begin
+  for Variant := 0 to High(Suffixes) do
+  begin
+    Suffix := Suffixes[Variant];
+    Dest := ExpandFileName(FScratch + Outputs[Variant]);
+    ForceDirectories(Dest);
+    RelPath := FillPath(PlatformDirectoryPathLimit - Length(Dest) - 1);
+    DirPath := Dest + '/' + RelPath;
+    Expect<Integer>(Length(DirPath)).ToBe(PlatformDirectoryPathLimit);
+    WriteBytesToFile(FScratch + '/dir-limit.tar.gz', Gzip(BuildTar(
+      [MakeGnuLongNameDirectoryEntry('top/' + RelPath + Suffix)])));
+
+    Count := ExtractArchive(FScratch + '/dir-limit.tar.gz', Dest);
+
+    Expect<Integer>(Count).ToBe(0);
+    Expect<Boolean>(DirectoryExists(DirPath)).ToBe(True);
+  end;
+end;
+
 procedure TExtractPathological.SetupTests;
 begin
   Test('regular file with short path: baseline sanity',
@@ -419,8 +471,16 @@ begin
     TestLinkTargetIsAncestorSkipped);
   Test('GNU L long-name entry overrides truncated header name',
     TestGnuLongNameOverridesHeaderName);
+  {$IFDEF MSWINDOWS}
+  Skip('an archive whose own path exceeds 255 characters extracts',
+    TestArchivePathBeyond255Extracts,
+    'the fixture path exceeds legacy Windows MAX_PATH');
+  {$ELSE}
   Test('an archive whose own path exceeds 255 characters extracts',
     TestArchivePathBeyond255Extracts);
+  {$ENDIF}
+  Test('a directory at the platform path limit extracts with or without '
+    + 'a trailing separator', TestDirectoryAtPathLimitExtracts);
 end;
 
 { ── TExtractFailureModes ─────────────────────────────────────── }
@@ -556,6 +616,66 @@ begin
   Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
 end;
 
+function ExtractErrorMessage(const AArchive, ADest: string): string;
+begin
+  Result := '';
+  try
+    ExtractArchive(AArchive, ADest);
+  except
+    on E: EExtractError do Result := E.Message;
+  end;
+end;
+
+procedure TExtractFailureModes.TestDirectoryLinkAliasFailsBeforeWriting;
+{ Every stored entry fits, but materializing the directory link copies the
+  deep file below the longer alias, past the platform limit. That copy must
+  be checked with the stored entries, before anything is written. }
+var
+  Archive, Dest, Deep: string;
+  DestLength: Integer;
+begin
+  Archive := FScratch + '/dir-link-alias.tar.gz';
+  Dest := ExpandFileName(FScratch + '/dir-link-alias-out');
+  ForceDirectories(Dest);
+  DestLength := Length(Dest);
+  { Dest/r/<Deep>/leaf.txt lands 10 characters inside the file limit. }
+  Deep := FillPath(PlatformFilePathLimit - 10 - DestLength
+    - Length('/r/') - Length('/leaf.txt'));
+  Expect<Integer>(Length(Dest + '/r/' + Deep + '/leaf.txt'))
+    .ToBe(PlatformFilePathLimit - 10);
+  WriteBytesToFile(Archive, Gzip(BuildTar([
+    MakeRegularFileEntry('top/first.txt', BytesOf('written first')),
+    MakeDirectoryEntry('top/r'),
+    MakeGnuLongNameRegularFileEntry('top/r/' + Deep + '/leaf.txt',
+      BytesOf('deep')),
+    MakeSymlinkEntry('top/' + StringOfChar('a', 100), 'r')
+  ])));
+
+  Expect<Boolean>(Pos('too long', ExtractErrorMessage(Archive, Dest)) > 0)
+    .ToBe(True);
+  Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
+end;
+
+procedure TExtractFailureModes.TestOverlongNameComponentFailsBeforeWriting;
+{ A 256-character file name is past every platform's component limit even
+  though the whole path is short; moving the project cannot fix it. }
+var
+  Archive, Dest: string;
+begin
+  Archive := FScratch + '/long-component.tar.gz';
+  Dest := FScratch + '/long-component-out';
+  ForceDirectories(Dest);
+  WriteBytesToFile(Archive, Gzip(BuildTar([
+    MakeRegularFileEntry('top/first.txt', BytesOf('written first')),
+    MakeGnuLongNameRegularFileEntry('top/' + StringOfChar('n', 256),
+      BytesOf('never written'))
+  ])));
+
+  Expect<Boolean>(Pos('too long', ExtractErrorMessage(Archive, Dest)) > 0)
+    .ToBe(True);
+  Expect<Boolean>(DirIsEmpty(Dest)).ToBe(True);
+end;
+
 procedure TExtractFailureModes.TestTarTruncatedMidEntryRaises;
 { Build a tar entry whose body is large enough that truncating the
   back half of the archive actually slices through the body bytes
@@ -674,6 +794,10 @@ begin
     TestGzipCrcMismatchRaisesAndCleansUp);
   Test('an over-long entry path fails before any entry is written',
     TestOverlongEntryPathFailsBeforeWriting);
+  Test('a directory-link copy past the path limit fails before any entry '
+    + 'is written', TestDirectoryLinkAliasFailsBeforeWriting);
+  Test('an over-long entry name component fails before any entry is written',
+    TestOverlongNameComponentFailsBeforeWriting);
   Test('tar truncated mid-entry raises or extracts nothing',
     TestTarTruncatedMidEntryRaises);
   Test('archive entry with parent traversal is rejected',
