@@ -123,6 +123,9 @@ type
     {$IFDEF DARWIN}
     procedure TestDefaultBudgetMatchesMacOS;
     {$ENDIF}
+    {$IFDEF LINUX}
+    procedure TestDefaultBudgetMatchesLinux;
+    {$ENDIF}
     procedure TestCrashedOwnerIsReclaimed;
     procedure TestHeartbeatPreservesLongRunningOwner;
     procedure TestLiveUnreadableRequestsFailClosed;
@@ -1892,6 +1895,28 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF LINUX}
+procedure TWorkerBudgetProcesses.TestDefaultBudgetMatchesLinux;
+var
+  OutputPath, ProcessorCountText : string;
+  Values : TStringList;
+  ExpectedCount : Integer;
+begin
+  Expect<Boolean>(RunCommand('/usr/bin/getconf',
+    ['_NPROCESSORS_ONLN'], ProcessorCountText)).ToBe(True);
+  ExpectedCount := StrToInt(Trim(ProcessorCountText));
+  Expect<Boolean>(ExpectedCount > 0).ToBe(True);
+  OutputPath := FScratch + '/default-budget';
+  RunUtilityWithBudget(SNAPSHOT_SWITCH, OutputPath, '');
+  Values := ReadUtilityValues(OutputPath);
+  try
+    Expect<Integer>(StrToInt(Values.Values['budget'])).ToBe(ExpectedCount);
+  finally
+    Values.Free;
+  end;
+end;
+{$ENDIF}
+
 procedure TWorkerBudgetProcesses.TestCrashedOwnerIsReclaimed;
 var
   FirstProcess, SecondProcess : TProcess;
@@ -2626,6 +2651,10 @@ begin
   {$IFDEF DARWIN}
   Test('default worker budget matches macOS logical CPUs',
     TestDefaultBudgetMatchesMacOS);
+  {$ENDIF}
+  {$IFDEF LINUX}
+  Test('default worker budget matches Linux online processors',
+    TestDefaultBudgetMatchesLinux);
   {$ENDIF}
   Test('separate worktrees share one budget and both contenders progress',
     TestContendersShareCapacityAndBothProgress);
