@@ -24,6 +24,7 @@ const
   BarrierMilliseconds = 30000;
   ChildMilliseconds = 90000;
   PollMilliseconds = 10;
+  ReleaseIterations = 10;
 
 type
   TChild = class
@@ -45,6 +46,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestOlderBuildPrecedesBlockingContender;
+    procedure TestReportedExitReleasesWorkingDirectory;
   end;
 
 constructor TChild.Create(const AExecutable, ADirectory, AState: string;
@@ -100,6 +102,13 @@ function TChild.Running: Boolean;
 begin
   Drain;
   Result := FProcess.Running;
+  { On Windows, Running reads GetExitCodeProcess, which publishes the final
+    status before the kernel runs down the child's handles. Until then the
+    child's working-directory handle still blocks deleting that directory.
+    The process handle is signalled only after the rundown, so wait for it
+    before reporting the exit. On Unix, Running has already reaped the child
+    and WaitOnExit returns at once. }
+  if not Result then FProcess.WaitOnExit;
 end;
 
 function TChild.Status: Integer;
@@ -328,10 +337,44 @@ begin
   RecursiveDelete(Scratch);
 end;
 
+procedure TBuildFairness.TestReportedExitReleasesWorkingDirectory;
+var
+  Scratch, Directory: string;
+  Child: TChild;
+  Iteration: Integer;
+  StartedAt: QWord;
+begin
+  { Poll without sleeping so the first observed exit is the earliest one
+    the platform reports. Native Windows publishes that exit before the
+    child's working-directory handle is closed on every attempt. }
+  Scratch := CreateScratchRoot('build-fairness');
+  for Iteration := 1 to ReleaseIterations do
+  begin
+    Directory := Scratch + '/working-' + IntToStr(Iteration);
+    Expect<Boolean>(ForceDirectories(Directory)).ToBe(True);
+    Child := TChild.Create(ExpandFileName(ParamStr(0)), Directory,
+      Scratch + '/worker-state', [ChildArgument, 'exit', Scratch]);
+    try
+      StartedAt := GetTickCount64;
+      while Child.Running do
+        if GetTickCount64 - StartedAt >= ChildMilliseconds then
+          raise Exception.CreateFmt('child did not exit within %d ms',
+            [ChildMilliseconds]);
+      Expect<Integer>(Child.Status).ToBe(0);
+      Expect<Boolean>(RemoveDir(Directory)).ToBe(True);
+    finally
+      Child.Free;
+    end;
+  end;
+  RecursiveDelete(Scratch);
+end;
+
 procedure TBuildFairness.SetupTests;
 begin
   Test('older queued build precedes a later blocking contender',
     TestOlderBuildPrecedesBlockingContender);
+  Test('reported child exit releases its working directory',
+    TestReportedExitReleasesWorkingDirectory);
 end;
 
 begin
@@ -339,6 +382,7 @@ begin
   begin
     if ParamStr(2) = 'holder' then Halt(RunHolder(ParamStr(3)));
     if ParamStr(2) = 'contender' then Halt(RunContender(ParamStr(3)));
+    if ParamStr(2) = 'exit' then Halt(0);
     if ParamStr(2) = 'entry' then
     begin
       Mark(ParamStr(3), 'build-started');

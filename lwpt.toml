@@ -81,9 +81,15 @@ include = [
 ]
 
 # Enables deterministic HTTPClient syscall and resolver outcomes, the
-# object-store race interleaving, registry publication crash points, and the
-# install fetch/fault seams (ADR-0044) only while compiling tests.
-# Production builds expose none of these hooks.
+# object-store race interleaving, scripted process-group setup outcomes,
+# registry publication crash points, and the install fetch/fault seams
+# (ADR-0044) only while compiling tests. Production builds expose none of
+# these hooks.
 [test]
-flags = ["-dHTTPCLIENT_TESTING", "-dOBJECTSTORE_TESTING", "-dREGISTRY_TESTING",
-         "-dINSTALL_TESTING"]
+flags = [
+  "-dHTTPCLIENT_TESTING",
+  "-dOBJECTSTORE_TESTING",
+  "-dPROCESSTREE_TESTING",
+  "-dREGISTRY_TESTING",
+  "-dINSTALL_TESTING",
+]
