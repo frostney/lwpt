@@ -310,8 +310,10 @@ begin
   Expect<Integer>(ResultValue.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('origin_not_initialized:', ResultValue.Stderr) > 0)
     .ToBe(True);
+  { A regular file, not a directory: the binary itself (with its Windows
+    extension, since build/lwpt does not exist there). }
   ResultValue := RunLwpt(['registry', 'serve', '--silent', '--data-dir',
-    LwptBinaryPath]);
+    ExpectedExe(LwptBinaryPath)]);
   Expect<Integer>(ResultValue.ExitCode).ToBe(1);
   Expect<Boolean>(Pos('invalid_registry_path:', ResultValue.Stderr) > 0)
     .ToBe(True);

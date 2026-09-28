@@ -1207,7 +1207,7 @@ begin
     { An accepted object whose stored bytes exceed the service limit is
       refused from its size before any hashing. }
     ObjectPath := FScratch + '/objects/sha256/' + ObjectName;
-    Expect<Boolean>(DeleteFile(ObjectPath)).ToBe(True);
+    Expect<Boolean>(SysUtils.DeleteFile(ObjectPath)).ToBe(True);
     Stream := TFileStream.Create(ObjectPath, fmCreate);
     try
       {$IFDEF MSWINDOWS}
