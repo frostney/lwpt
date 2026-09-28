@@ -1,6 +1,6 @@
 # Pull-request readiness
 
-`address-pr-feedback` owns one PR and one exact current head at a time. Re-read
+`address-feedback` in PR scope owns one PR and one exact current head at a time. Re-read
 GitHub state after every thread action, commit, push, baseline update, automation
 response, or check transition; delegated output is evidence to verify, not gate
 state.
@@ -34,19 +34,51 @@ together.
 
 The bundled review helper owns GitHub mechanics: inspect current findings and
 thread state, wait while unchanged, publish an explicitly supplied inline reply,
-and resolve an explicitly selected thread. `address-pr-feedback` owns every
+and resolve an explicitly selected thread. `address-feedback` in PR scope owns every
 judgment, source edit, validation choice, and decision to mark the PR ready.
 Re-read GitHub through the helper after each mutation and verify the final head,
 unresolved count, unanswered automation-thread count, findings, checks, and
 automation states.
 
-The helper flattens unhandled inline threads, non-empty exact-head automation
-reviews, and non-empty automation top-level comments into `findingSurfaces`.
+The helper flattens unhandled inline threads, non-empty exact-head reviews,
+change-request reviews, and non-empty top-level comments into `findingSurfaces`,
+including authors outside the configured automation accounts.
 When automation is terminal and that collection is non-empty, the helper returns
 `judgment-required`, even when its check conclusion is success or neutral. Read
 and classify the bodies; do not translate check completion into "no findings."
 Review bodies are exact-head bound, while thread state and pull-request comments
 carry their explicit weaker bindings for the workflow to validate.
+
+If review policy is missing or invalid, `inspect` still returns current feedback
+and check facts, with `policyAvailable: false` and unknown automation-reply
+status. It cannot establish completion. Discover the applicable requirements
+from repository policy and actual activity; do not interpret missing policy as
+an empty provider list. `wait` requires a valid supplied policy.
+
+Inspection follows all pages of reviews, top-level comments, threads, nested
+comments and check contexts, and compares two complete censuses. A head change,
+edited finding, missing page or inconsistent count cannot establish readiness;
+`wait` retries a racing census. `--page-size` can reduce each page below the
+default of 100 items when a large query needs smaller responses.
+
+Automation completion uses the newest observable attempts, not any historical
+success. A newer incomplete attempt or ambiguous ordering stays pending. A
+later terminal result can supersede an older completed failure or rate-limit
+notice. Empty review records created only to carry inline replies do not count
+as new verdicts; explicit approval and reviews containing original inline
+comments retain their configured meaning.
+
+Replies use a durable caller-owned `--state` checkpoint. Their operation ID is
+bound to the repository, PR, expected head, comment/thread root, authenticated
+author and exact body. A marker alone, including an unbound legacy marker, is
+not a successful receipt. The helper re-reads the created comment independently;
+after an uncertain write, reuse the same checkpoint and operation to reconcile
+without another POST. `pending` means the receipt or current head is unverified.
+
+Resolution verifies the thread's repository, PR and head before mutation and
+re-reads its state afterward. A head change invalidates readiness even if the
+reply or resolution happened. GitHub does not make these multi-request
+operations atomic; retain any returned receipt and refresh the affected evidence.
 
 The helper is a transition source for this workflow loop, not another
 orchestrator. Its foreground wait stays silent while unchanged and returns only

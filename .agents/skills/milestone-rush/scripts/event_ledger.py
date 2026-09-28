@@ -43,6 +43,9 @@ IDENTITY_FIELDS_V2 = (
     "waitId",
     "model",
 )
+NUMBERED_IDENTITY_FIELDS = ("issue", "pullRequest")
+# Schema v1 never constrained identity types; summaries still aggregate these.
+AGGREGATED_IDENTITY_FIELDS_V1 = ("sessionId", "segmentId")
 ENVELOPE_FIELDS = (
     "schemaVersion",
     "runId",
@@ -197,6 +200,29 @@ def validate_event(event: Any) -> dict[str, Any]:
         raise LedgerError(
             f"event {event_id} identity is missing fields: {', '.join(sorted(missing_identity))}"
         )
+    typed_identity = (
+        IDENTITY_FIELDS_V2 if version == 2 else AGGREGATED_IDENTITY_FIELDS_V1
+    )
+    for field in typed_identity:
+        item = identity.get(field)
+        numbered = field in NUMBERED_IDENTITY_FIELDS
+        if (
+            item is None
+            or (isinstance(item, str) and item)
+            or (
+                numbered
+                and isinstance(item, int)
+                and not isinstance(item, bool)
+                and item > 0
+            )
+        ):
+            continue
+        expected = (
+            "a non-empty string, a positive integer or null"
+            if numbered
+            else "a non-empty string or null"
+        )
+        raise LedgerError(f"event {event_id} identity.{field} must be {expected}")
     actor = require_object(value["actor"], f"event {event_id} actor")
     if "kind" not in actor or "capabilityClass" not in actor:
         raise LedgerError(f"event {event_id} actor requires kind and capabilityClass")
@@ -496,7 +522,11 @@ def summarize_run(events: list[dict[str, Any]], run_id: str) -> dict[str, Any]:
         if event["runId"] == run_id:
             unique[event["eventId"]] = event
     selected = sorted(
-        unique.values(), key=lambda event: (event["timestamp"], event["eventId"])
+        unique.values(),
+        key=lambda event: (
+            parse_timestamp(event["timestamp"], f"event {event['eventId']} timestamp"),
+            event["eventId"],
+        ),
     )
 
     totals = zero_counters()
@@ -545,6 +575,15 @@ def summarize_run(events: list[dict[str, Any]], run_id: str) -> dict[str, Any]:
         measurement = event["measurement"]
         if measurement is None:
             continue
+        gauge = event["resources"]["effectiveWorkers"]
+        if gauge is not None:
+            summary = gauges.setdefault(
+                "resources.effectiveWorkers",
+                {"min": gauge, "max": gauge, "latest": gauge},
+            )
+            summary["min"] = min(summary["min"], gauge)
+            summary["max"] = max(summary["max"], gauge)
+            summary["latest"] = gauge
         key = (measurement["source"], measurement["streamId"])
         streams.setdefault(key, []).append(event)
         provenance.setdefault(measurement["source"], set()).add(
@@ -593,16 +632,6 @@ def summarize_run(events: list[dict[str, Any]], run_id: str) -> dict[str, Any]:
                 target = waits.setdefault(wait_id, {})
                 for path, contribution in contributions.items():
                     add_counter(target, path, contribution)
-
-            gauge = event["resources"]["effectiveWorkers"]
-            if gauge is not None:
-                summary = gauges.setdefault(
-                    "resources.effectiveWorkers",
-                    {"min": gauge, "max": gauge, "latest": gauge},
-                )
-                summary["min"] = min(summary["min"], gauge)
-                summary["max"] = max(summary["max"], gauge)
-                summary["latest"] = gauge
 
     return {
         **validation,
