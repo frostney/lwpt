@@ -55,12 +55,20 @@ end;
   a duplicate of the input pipe's read end, which would keep the pipe open. }
 procedure CloseEveryInputDescriptor;
 {$IFDEF UNIX}
+const
+  { Upper bound when the soft limit is unlimited or implausibly large. }
+  MaximumDescriptorScan = 65536;
 var
-  Descriptor: Integer;
+  Descriptor, Limit: Integer;
+  FileLimit: TRLimit;
 {$ENDIF}
 begin
   {$IFDEF UNIX}
-  for Descriptor := 0 to 1023 do
+  Limit := MaximumDescriptorScan;
+  if (FpGetRLimit(RLIMIT_NOFILE, @FileLimit) = 0)
+     and (QWord(FileLimit.rlim_cur) < QWord(MaximumDescriptorScan)) then
+    Limit := FileLimit.rlim_cur;
+  for Descriptor := 0 to Limit - 1 do
     if (Descriptor <> 1) and (Descriptor <> 2) then FpClose(Descriptor);
   {$ELSE}
   FileClose(StdInputHandle);
