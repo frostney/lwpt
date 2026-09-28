@@ -741,12 +741,24 @@ function CSysCtlByName(AName: PAnsiChar; AOldValue: Pointer;
   cdecl; external name 'sysctlbyname';
 {$ENDIF}
 
+{$IFDEF LINUX}
+const
+  { glibc and musl both number _SC_NPROCESSORS_ONLN 84. }
+  SC_NPROCESSORS_ONLN_LINUX = 84;
+
+{ C long is pointer-sized on the supported Linux targets. }
+function CSysConf(AName: LongInt): PtrInt; cdecl; external 'c' name 'sysconf';
+{$ENDIF}
+
 function ConfiguredBudget: Integer;
 var
   Raw : string;
   {$IFDEF DARWIN}
   ProcessorCount : LongInt;
   ValueSize : PtrUInt;
+  {$ENDIF}
+  {$IFDEF LINUX}
+  OnlineCount : PtrInt;
   {$ENDIF}
 begin
   Raw := Trim(SysUtils.GetEnvironmentVariable(WORKER_BUDGET_ENV));
@@ -767,6 +779,13 @@ begin
   if (CSysCtlByName('hw.logicalcpu', @ProcessorCount, ValueSize, nil, 0) = 0)
     and (ValueSize = SizeOf(ProcessorCount)) and (ProcessorCount > 0) then
     Exit(ProcessorCount);
+  {$ENDIF}
+  {$IFDEF LINUX}
+  { FPC 3.2.2 also reports one processor through TThread on Linux, whatever
+    the core count. Ask libc for the online processor count first. }
+  OnlineCount := CSysConf(SC_NPROCESSORS_ONLN_LINUX);
+  if OnlineCount > 0 then
+    Exit(Integer(OnlineCount));
   {$ENDIF}
   Result := TThread.ProcessorCount;
   if Result < 1 then Result := 1;
