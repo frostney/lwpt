@@ -37,9 +37,13 @@ Pre-commit gate (`lefthook.yml`): `lwpt format` + `lwpt agents` (both with `stag
 
 ## Agent Workflows
 
-Repository-owned capability, context, token-intervention, and delivery endpoint
-policy lives in [`ORCHESTRATION.md`](./ORCHESTRATION.md). Generic orchestrators
-consume that policy; they do not infer or install LWPT-specific infrastructure.
+The known-good-route skills own delivery: `/deliver` merges and verifies
+integration, `/address-feedback` converges review, and `delivery-wait` awaits
+GitHub state. [`ORCHESTRATION.md`](./ORCHESTRATION.md) holds the policy they
+consume from LWPT: capability routing, context packets, token interventions,
+the worktree path budget, the integration destination, and the full-CI
+rule. Orchestrators do not infer or install LWPT-specific
+infrastructure ([ADR-0046](./docs/adr/0046-skill-owned-delivery.md)).
 
 Use the project-local [`/prepare-release`](./.agents/skills/prepare-release/SKILL.md) workflow before cutting a release. It reuses exact-main project and E2E CI evidence, runs release-specific checks, audits LWPT's architecture conformance, and previews the changelog. It stops before version selection, changelog generation, tagging, and publishing.
 

@@ -1,49 +1,36 @@
 # CI
 
-Ten GitHub Actions workflows retain the existing build-once/test-natively
-matrix, add a repository-owned managed-delivery adapter, and expose the reusable
-LWPT dependency updater. Expensive workflows that execute pull-request code have
-read-only permissions. Controllers and finalizers with write permission always
-run trusted default-branch code.
+Six GitHub Actions workflows provide the build-once/test-natively matrix, the
+release pipeline, and the reusable LWPT dependency updater. Workflows that
+execute pull-request code have read-only permissions. Delivery itself (waiting
+for CI, converging review, merging, and verifying integration) belongs to the
+known-good-route skills under [`ORCHESTRATION.md`](../ORCHESTRATION.md), per
+[ADR-0046](./adr/0046-skill-owned-delivery.md).
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch`, weekly `schedule` | Build + cache the cross-FPC toolchain |
-| `ci.yml` | `push` to `main`, `workflow_dispatch` | Full integrated-main/terminal promotion matrix or one allow-listed native diagnostic slice |
-| `pr.yml` | `pull_request` | Automatic native gate for ordinary and managed PRs |
+| `ci.yml` | `push` to `main`, `workflow_dispatch` | Full native matrix on `main` or any dispatched ref, or one allow-listed diagnostic slice |
+| `pr.yml` | `pull_request` | Automatic native gate for every PR, whatever its base branch |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
 | `delphi-native.yml` | `workflow_dispatch` | Optional Delphi 12+ Win64 smoke on a licensed self-hosted runner; never a required gate |
-| `delivery-transition.yml` | `workflow_dispatch` | Trusted explicit `enrol`, `ci`, `review`, `diagnostic`, `full-ci`, `merge`, or `reset` endpoint |
-| `delivery-observer.yml` | State-changing PR metadata, manual | Invalidate stale managed readiness and full-CI evidence |
-| `delivery-finalizer.yml` | `workflow_run` completion | Conclude full-CI proof when GitHub emits the event |
-| `delivery-watchdog.yml` | 15-minute schedule, manual | Reconcile managed state and terminal full-CI runs, then fail full-CI proofs left nonterminal for 120 minutes |
 | `lwpt-update.yml` | `workflow_call`, manual | Update git-host dependencies and open or refresh one bot-owned pull request |
 
 Trigger split, mirroring GocciaScript's CI shape:
 
-- **Ordinary PR checks remain automatic.** `pr.yml` runs its Ubuntu, native
-  Darwin, documentation, and win64 legs without controller involvement.
-- **Managed PRs retain cheap deferral and explicit phase transitions.** Their
-  initial automatic PR run stops after the routing job. Every first attempt for
-  a managed head defers even when an older head left `ci:ready` attached. The
-  `ci` transition adds `ci:ready` and reruns that exact PR/head workflow. Both
-  the label and a rerun attempt are required, so an automatic or manual
-  first attempt remains deferred. The rerun produces the same six native
-  checks as an ordinary PR. `delivery:managed` does not assert stack membership.
-  GitHub bounds reruns to 30 days and 50 attempts; a candidate outside that
-  delivery window must receive a new synchronized head rather than entering a
-  second execution route.
-- **`ci.yml` has three exact uses.** A push to `main` verifies the integrated tree;
-  rapid main pushes cancel older integrated-main runs. The `full-ci` operation
-  checks out one frozen singleton or cumulative native-prefix top SHA. Those
-  promotion runs are never coalesced. The `diagnostic` operation selects one
-  allow-listed native target and test scope and cannot produce a proof check.
+- **PR checks are automatic.** `pr.yml` runs its Ubuntu, native Darwin,
+  documentation, and win64 legs on every PR, including native stacked PRs whose
+  base is another branch. A superseded push cancels the older run.
+- **`ci.yml` has three uses.** A push to `main` verifies the integrated tree;
+  rapid main pushes cancel older integrated-main runs. `mode=manual` runs the
+  same full matrix on any dispatched ref and is never coalesced. `mode=diagnostic`
+  runs one allow-listed native target and test scope on any dispatched ref.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
 Repository rules make these contracts enforceable. The desired main ruleset is
-versioned at `.github/rulesets/protect-main.json`: it requires resolved review
-threads and the native `delivery-admission` job from GitHub Actions integration
-ID `15368`. The integration binding means a same-named status or check from
+versioned at `.github/rulesets/protect-main.json`: it allows only squash merges,
+requires resolved review threads, and requires the native `delivery-admission`
+job from GitHub Actions integration ID `15368`. The integration binding means a same-named status or check from
 another user or app cannot satisfy the rule:
 
 ```sh
@@ -113,48 +100,27 @@ Optional inputs change `working-directory`, the bot `branch-name`, `pr-title`,
 or the bootstrapped `lwpt-ref`. Concurrent runs targeting the same repository
 and branch serialize rather than racing the fixed update branch.
 
-### Managed-delivery proof lifecycle
+### Manual and diagnostic dispatch
 
-GitHub binds each PR workflow run to the pull request's exact head. Ordinary
-heads execute the native jobs immediately. A managed head first records a cheap
-routing run whose native `delivery-admission` job fails closed; its `ci`
-transition adds `ci:ready` and reruns that exact PR/head workflow so the full
-job set executes and the aggregation job can pass. The controller samples that
-native job before later transitions. GitHub does not permit the workflow's
-`GITHUB_TOKEN` to mark a draft ready, so the coordinator uses its ordinary
-authenticated PR operation after CI succeeds, revalidates the exact head, and
-then invokes the review transition. That transition requires the PR to be ready
-before applying `review:ready`, allowing review automation to converge before
-full CI and merge admission. Returning a managed PR to draft invalidates its
-review and merge phases; merge admission refuses drafts and does not change
-draft state.
-`reset` clears readiness and returns the PR to draft; it never rewrites native
-check history. Managed forks fail closed.
+`ci.yml` accepts `workflow_dispatch` on any ref; dispatch already requires
+write access. Every job checks out the run's own head SHA, so a run is
+evidence for exactly that commit.
 
-Full-CI remains a separate conditional proof. A full-CI run dispatched
-by `delivery-transition.yml` inherits the repository `GITHUB_TOKEN`; GitHub
-allows that explicit `workflow_dispatch` but suppresses its subsequent
-`workflow_run` event. The trusted watchdog therefore discovers terminal
-full-CI runs every 15 minutes and passes their bound identity through the same
-finalizer before applying its 120-minute timeout. Creation-time queries are
-split until each result fits one page, avoiding both GitHub's filtered
-1,000-result cap and offset pagination over a changing completed-run set.
-Cancelled runs are failures, and duplicate or reordered observations are
-harmless because a completed full-CI check is terminal.
+```sh
+gh workflow run ci.yml --ref <branch> -f mode=manual
+gh workflow run ci.yml --ref <branch> -f mode=diagnostic \
+  -f diagnostic_target=<target> -f diagnostic_selector=<selector>
+```
 
-The observer listens only for PR actions that can alter a managed head,
-topology, review proof, phase label, draft state, or closure. Opening an
-unenrolled PR and marking a draft ready cannot invalidate managed state, so
-those actions do not start reconciliation. The watchdog's existing scheduled
-run recovers orphaned proofs before performing the periodic all-PR sweep, while
-manual observer dispatch remains available for an immediate repair. External
-check events that do not match a configured review adapter return before that
-sweep.
+`mode=manual` runs the full six-target build and native test matrix. Every
+PR needs one green manual run whose head is the PR's exact head before merge; [`ORCHESTRATION.md`](../ORCHESTRATION.md) owns that
+rule. The run name shows the mode and ref (`CI / manual / <branch>`).
 
-The `diagnostic` operation runs one allow-listed native remediation slice. The
-surface covers Windows x86_64/i386 ordinary, E2E, and TLS slices, plus ARM- and
-Intel-Darwin scheduling slices that run only `TestScheduling.Test.pas` with a
-150-second ceiling. ARM-Darwin captures the active case and process state for
+`mode=diagnostic` runs one allow-listed native remediation slice and is never
+merge evidence. The surface covers Windows x86_64/i386 ordinary, E2E, and TLS
+slices, plus ARM- and Intel-Darwin scheduling slices that run only
+`TestScheduling.Test.pas` with a 150-second ceiling. ARM-Darwin captures the
+active case and process state for
 [issue #278](https://github.com/frostney/lwpt/issues/278). The focused Intel
 inventory remained healthy past the earlier 90-second boundary in
 [issue #260](https://github.com/frostney/lwpt/issues/260).
@@ -165,46 +131,10 @@ a native process sample on timeout; Linux records the active test case and
 captures `/proc` process and thread status, wait channels, syscalls, stacks, and
 file descriptors. Target and selector combinations are allow-listed as pairs:
 Windows-only selectors cannot silently run on Darwin or Linux, and the
-scheduling probe cannot run on Windows. The endpoint
-checks out the exact current PR head,
-cannot accept a shell command or fork, uses a `diagnostic/...` run identity, and
-never creates or satisfies a `full-ci` proof. A later diagnostic for the same
-PR cancels the prior run.
-
-The `review` operation opens the repository's review lane after PR admission.
-The controller discovers active review automations from configured check names
-and current-head review actors. At least one configured automation must emit
-current-head evidence. Every automation that does is active and must reach its
-configured terminal check conclusion and review state; configured but inactive
-adapters do not block. Before `merge`, the controller also requires no
-unresolved thread and a reply from an account with current maintain or admin
-permission on every automation thread. Provider identities and terminal states
-are data in `.github/delivery/review-automations.json`; controller logic does
-not name vendors, and retry and quota policy remain external.
-An adapter may bind one or more check names to trusted GitHub App slugs, accept
-provider-specific terminal check conclusions, require or omit a terminal review
-event, accept an exact allow-list of output titles for completed current-head
-`skipped` checks, and list review-body markers that mean "not terminal". A
-skipped check is never accepted through the generic terminal-conclusion list;
-its check name, app slug, head SHA, completion state, conclusion, and output
-title must all match the adapter policy. Those fields are enough to replace a
-hosted reviewer or add a check-only custom reviewer without changing controller
-code.
-`merge:ready` records that point-in-time acceptance, so the coordinator invokes
-the idempotent `merge` operation immediately before a singleton merge. For a
-native prefix it preflights each `delivery:managed` member against the same
-candidate, then integrates the frozen prefix bottom to top without unrelated
-work in between. An ordinary member never uses the endpoint; at its merge turn
-it remains individually subject to current branch protection and the ordinary
-review policy. The coordinator never treats labels left by an earlier preflight
-as durable proof.
-
-`full-ci` is dispatched only as terminal promotion for a `ci:full-required`
-candidate after current-base integration, exact-head PR admission, and review
-convergence. Its frozen topology digest separates it from diagnostics. A head,
-base/topology, or review change fails the pending proof and the observer cancels
-the superseded matrix. Ordinary changes covered by PR CI do not receive a
-pre-merge full matrix.
+scheduling probe cannot run on Windows. A diagnostic accepts no shell command,
+its run name is `CI / diagnostic / <ref> / <target>/<selector>`, and a later
+diagnostic on the same ref cancels the prior run. The scheduling probe lives at
+`.github/ci/scheduling-diagnostic.sh`.
 
 ### `toolchain.yml` — cross-FPC toolchain build
 
@@ -233,7 +163,7 @@ The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a
 
 ### `ci.yml` — build + test
 
-**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, `packages/testing/source/`, plus the target's FPC packages slice, including `paszlib` for `ZStream`). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `TLWPTFPCCompilerDriver.BuildArguments`' release translation. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`. An explicit `full-ci` dispatch checks out its controller-validated SHA rather than the default-branch workflow SHA.
+**Build stage** (`macos-latest`, six-target matrix): restores the cached toolchain via the `toolchain.outputs.cache-key` value, invokes the matched cross-FPC against `source/lwpt.pas` with the `-Fu` / `-Fi` paths LWPT needs (`source/`, `packages/httpclient/source/`, `packages/cli/source/`, `packages/semver/source/`, `packages/toml/source/`, `packages/testing/source/`, plus the target's FPC packages slice, including `paszlib` for `ZStream`). Release flags `-O4 -dPRODUCTION -Xs -CX -XX -B` mirror `TLWPTFPCCompilerDriver.BuildArguments`' release translation. The resulting `lwpt` binary (or `lwpt.exe` for Windows targets) is `llvm-strip`-ped and uploaded as `lwpt-<target>`.
 
 **Test stage** (per-platform native runners, six-target matrix → five runners):
 
@@ -246,7 +176,7 @@ The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a
 | `x86_64-win64` | `windows-latest` |
 | `i386-win32` | `windows-latest` |
 
-Each runner installs FPC natively (`brew` / `apt` / `choco`), then the `x86_64-win64` leg runs a one-off `bootstrap.bat` cold-build smoke and deletes `build/` again so the rest of the stage still validates the downloaded cross-built artefact. Every native test-matrix job has a 20-minute ceiling, containing a stalled test process without treating the bound as a root-cause fix. Chocolatey setup gets up to two visible attempts because its community feed can time out before LWPT starts; each attempt must both exit successfully and expose `fpc.exe`, so a false-success package result is retried too. Tests themselves are never retried. After setup, every runner downloads the cross-built `lwpt` binary and runs the full pipeline:
+Each runner installs FPC natively (`brew`, `apt`, or the pinned official Windows distribution through `.github/ci/install-windows-fpc.sh`), then the `x86_64-win64` leg runs a one-off `bootstrap.bat` cold-build smoke and deletes `build/` again so the rest of the stage still validates the downloaded cross-built artefact. Every native test-matrix job has a 20-minute ceiling, containing a stalled test process without treating the bound as a root-cause fix. The Windows installer verifies the download's SHA-256 and retries only the download. Tests themselves are never retried. After setup, every runner downloads the cross-built `lwpt` binary and runs the full pipeline:
 
 1. **Sanity** — `lwpt --help` (does the binary even load?)
 2. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
@@ -258,7 +188,7 @@ Per [Q22=b](./adr/0014-packages-extraction.md), the runner side compiles tests a
 
 ### `pr.yml` — pre-merge PR gate
 
-Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR sees (because `ci.yml` doesn't trigger on PRs). The main `build-and-test` job is a single Ubuntu runner:
+Mirrors GocciaScript's `pr.yml` shape, and is the only **automatic** pre-merge signal a PR sees (because `ci.yml` doesn't trigger on PRs); the required manual `ci.yml` run on the PR's exact head supplies the rest of the pre-merge coverage. The main `build-and-test` job is a single Ubuntu runner:
 
 1. Install FPC via `apt`
 2. `./bootstrap.sh` — cold build of `build/lwpt` from a freshly-cloned repo
@@ -270,27 +200,27 @@ Mirrors GocciaScript's `pr.yml` shape, and is the **sole** pre-merge signal a PR
 8. `./build/lwpt agents --check` (generated command-reference drift)
 9. `./build/lwpt test <ordinary paths> --bail=0`
 
-The live-network E2E paths run pre-merge on the Linux leg only. Their dedicated selector invocation sets the repository-owned `LWPT_ENABLE_NETWORK=1` opt-in, added per [issue #102](https://github.com/frostney/lwpt/issues/102) after the #84 TLS-close class proved invisible to the ordinary route. The ordinary pass still carries the concurrency suites which cover the #101 timing class; E2E does not rerun them as accidental stress. Every platform still runs the E2E paths post-merge via `ci.yml`. The native `build-and-test`, `darwin-test`, and `windows-test` jobs each have a 20-minute ceiling. The Windows job uses the same two-attempt Chocolatey setup contract as `ci.yml`. A second PR job, `darwin-test`, natively bootstraps on `macos-latest` (brew FPC, independent of the cross-toolchain cache) and runs the ordinary paths — the #105 env-race family and its masks all first surfaced on darwin legs. Bounded cost: ~5–6 min warm, parallel to `build-and-test`. The remaining `ci.yml`-only legs (`x86_64-darwin`, `aarch64-linux`, `i386-win32`) stay post-merge. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
+In the automatic gate, the live-network E2E paths run on the Linux leg only. Their dedicated selector invocation sets the repository-owned `LWPT_ENABLE_NETWORK=1` opt-in, added per [issue #102](https://github.com/frostney/lwpt/issues/102) after the #84 TLS-close class proved invisible to the ordinary route. The ordinary pass still carries the concurrency suites which cover the #101 timing class; E2E does not rerun them as accidental stress. Every platform runs the E2E paths in the required manual `ci.yml` run on the PR's exact head, and again on the push to `main`. The native `build-and-test`, `darwin-test`, and `windows-test` jobs each have a 20-minute ceiling. The Windows job uses the same pinned installer as `ci.yml`. A second PR job, `darwin-test`, natively bootstraps on `macos-latest` (brew FPC, independent of the cross-toolchain cache) and runs the ordinary paths — the #105 env-race family and its masks all first surfaced on darwin legs. Bounded cost: ~5–6 min warm, parallel to `build-and-test`. The remaining `ci.yml`-only legs (`x86_64-darwin`, `aarch64-linux`, `i386-win32`) run in that required manual run rather than on every push. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
 
 The PR workflow deliberately uses the distro FPC (same as the install instructions in `README.md`), so any regression that only shows up with the system FPC's slightly older RTL gets caught before merge.
 
 #### Windows signal (`windows-cross-compile` + `windows-test`)
 
-A second job reuses `toolchain.yml` (`workflow_call`, exactly like `ci.yml`) and cross-compiles `source/lwpt.pas` for **`x86_64-win64` only**, mirroring `ci.yml`'s build-stage flags and unit paths. It exists because `{$IFDEF WINDOWS}` codepaths never compile on the Ubuntu runner: PR #17 merged green while breaking `main` with a `SysUtils.FindClose` vs `Windows.FindClose` unit-shadowing error that PR #21 then had to fix. One target suffices — win32 and win64 share the same `{$IFDEF WINDOWS}` sources. The job also runs the no-OpenSSL guard (ADR-0016 for clients, ADR-0033 for servers — Windows must contain no OpenSSL linkage in either direction) against the produced `lwpt.exe`, surfacing that release-blocker on the PR instead of post-merge.
+A second job reuses `toolchain.yml` (`workflow_call`, exactly like `ci.yml`) and cross-compiles `source/lwpt.pas` for **`x86_64-win64` only**, mirroring `ci.yml`'s build-stage flags and unit paths. It exists because `{$IFDEF WINDOWS}` codepaths never compile on the Ubuntu runner: PR #17 merged green while breaking `main` with a `SysUtils.FindClose` vs `Windows.FindClose` unit-shadowing error that PR #21 then had to fix. One target suffices — win32 and win64 share the same `{$IFDEF WINDOWS}` sources. The job also runs the no-OpenSSL guard (ADR-0016 for clients, ADR-0033 for servers — Windows must contain no OpenSSL linkage in either direction) against the produced `lwpt.exe`, surfacing that release-blocker in the automatic gate instead of waiting for the full matrix.
 
-The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC via choco (a verbatim copy of `ci.yml`'s step — `lwpt test` compiles `*.Test.pas` with the native FPC at run time per Q22=b), download the binary, then `lwpt install` + `lwpt test <ordinary paths> --bail=0` (offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
+The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC through the shared `.github/ci/install-windows-fpc.sh` (`lwpt test` compiles `*.Test.pas` with the native FPC at run time per Q22=b), download the binary, then `lwpt install` + `lwpt test <ordinary paths> --bail=0` (offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
 
-Deliberate scope limits — still post-merge only (`ci.yml`):
+Deliberately outside the automatic gate, and covered by the required manual `ci.yml` run before merge:
 
 - **The `i386-win32` leg** (win32 and win64 share `{$IFDEF WINDOWS}` sources; the 32-bit leg re-verifies, it rarely diverges).
 - **The E2E paths on non-Linux platforms** and the `bootstrap.bat` cold-build smoke (the Linux E2E leg runs pre-merge per #102).
-- **`x86_64-darwin` and `aarch64-linux` runtime.** The aarch64-darwin PR leg covers `{$IFDEF DARWIN}` compile + arm64 runtime pre-merge (added per #102 after the #105 env-race family surfaced on darwin legs first); the intel-mac and arm-linux permutations stay post-merge — their unique-catch rate has not justified per-PR cost.
+- **`x86_64-darwin` and `aarch64-linux` runtime.** The aarch64-darwin PR leg covers `{$IFDEF DARWIN}` compile + arm64 runtime pre-merge (added per #102 after the #105 env-race family surfaced on darwin legs first); the intel-mac and arm-linux permutations run only in the manual and push matrices.
 
 Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`) has no branch component, and GitHub Actions lets PR runs restore caches created on the base branch — so PR runs hit the toolchain that `ci.yml` pushes to `main` keep warm, and the `toolchain` job is a seconds-long cache lookup. On eviction, the PR run rebuilds the toolchain (~30 min) into its own cache scope (not shared across PRs); a weekly `schedule` cron on `toolchain.yml` re-warms the default-branch copy so that window is bounded even when `main` is quiet. `pr.yml` also sets `concurrency` with `cancel-in-progress`, so a superseded push doesn't keep burning the macOS runner.
 
-#### Why not fully cross-platform on PRs?
+#### Why not run the full matrix automatically on every push?
 
-A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 min cold), per PR push. Multiplied across the typical commit-amend-push-amend-push PR cycle, that's an order of magnitude more CI minutes than a single Ubuntu run. GocciaScript made the same trade-off: cheap iteration on PRs, exhaustive verification on the merged main tree. Platform-specific *runtime* regressions that slip through pr.yml surface in the post-merge ci.yml run on `main`; the maintainer reverts the offending commit or rolls a forward-fix PR. The win64 leg (cross-compile + native offline test run, ~3 min total on a warm cache) was the first deliberate exception, buying back the most common post-merge breakage class without paying for the full matrix; #102 extended the same reasoning to the Linux e2e step and the aarch64-darwin leg once those classes had bitten too.
+A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 min cold). Running it on every push of the typical commit-amend-push PR cycle costs an order of magnitude more CI minutes than the automatic gate, so `pr.yml` stays cheap for iteration. The full matrix is still required before merge, but only once, as a manual run on the PR's final exact head ([`ORCHESTRATION.md`](../ORCHESTRATION.md)). That rule replaced the earlier GocciaScript-style trade of verifying the other platforms only after merge: in September 2026 the automatic gate repeatedly let Intel-Darwin, i386 and cross-toolchain breaks reach `main`. The win64 leg (cross-compile + native offline test run, ~3 min total on a warm cache), the Linux e2e step and the aarch64-darwin leg remain in the automatic gate because they catch the most common breakage classes early.
 
 ### `release.yml` — tag-triggered release pipeline
 
@@ -353,8 +283,6 @@ The scripts mirror the shape of [GocciaScript's installers](https://gocciascript
 - `pr.yml`: `pull_request`
 - `release.yml`: `push` of a `v?N.N.N` or `v?N.N.N-*` tag
 - `toolchain.yml`: invoked by `ci.yml`, `pr.yml`, and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming and a weekly `schedule` cron (Mondays 05:00 UTC) that keeps the default-branch cache warm
-- managed delivery: explicit transition dispatch, PR metadata observer,
-  workflow-run finalizer, and scheduled watchdog as listed above
 
 A normal commit triggers one heavyweight cross-build pipeline through `ci.yml`
 after merge. A release commit later triggers `release.yml` again when tagged:
