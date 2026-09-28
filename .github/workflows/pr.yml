@@ -140,7 +140,8 @@ jobs:
       # they are not rerun here as accidental stress. Clean DNS/
       # connect failures self-skip (transient third-party downtime);
       # content, protocol, and TLS failures remain blocking, which is
-      # the point. Post-merge ci.yml still runs these paths on every platform.
+      # the point. The required manual ci.yml run and the push to main
+      # run these paths on every platform.
       - name: lwpt test --bail=0 (E2E project paths, live network)
         # Run even when the ordinary queue failed, so one run reports both;
         # a failed setup step (bootstrap through agents --check) still skips it.
@@ -357,8 +358,9 @@ jobs:
   # (junction-vs-symlink installs, path handling, subprocess
   # environment handling) and compile breaks in test sources, which
   # lwpt test compiles with the native FPC at run time (Q22=b).
-  # Post-merge ci.yml still owns the i386-win32 leg, E2E paths
-  # on non-Linux platforms, and the bootstrap.bat smoke.
+  # The required manual ci.yml run (and the push to main) owns the
+  # i386-win32 leg, E2E paths on non-Linux platforms, and the
+  # bootstrap.bat smoke.
   windows-test:
     needs: windows-cross-compile
     runs-on: windows-latest
