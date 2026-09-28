@@ -404,6 +404,7 @@ type
     procedure TestGitTemplateMissingRepositoryPlaceholderRejected;
     procedure TestArchiveTemplateHttpRejected;
     procedure TestGitTemplateHttpRejected;
+    procedure TestRefPlaceholderInHostRejected;
     procedure TestShadowingBuiltinPrefixRejected;
     procedure TestDepWithCustomPrefixRoutes;
     procedure TestDepWithUndeclaredCustomPrefixRejected;
@@ -2830,6 +2831,45 @@ begin
     'must use https://', Self);
 end;
 
+procedure TCustomSources.TestRefPlaceholderInHostRejected;
+var Man: TManifest;
+begin
+  ExpectManifestLoadError(WriteCustomSourceManifest('ref-in-archive-host',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'gitea = { '
+    + 'archive = "https://{ref}.downloads.example/{user}/{repository}.tar.gz", '
+    + 'git = "https://git.example.com/{user}/{repository}.git"'
+    + ' }'#10),
+    'must not use {ref} in its host', Self);
+  ExpectManifestLoadError(WriteCustomSourceManifest('ref-in-git-host',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'gitea = { '
+    + 'archive = "https://git.example.com/{user}/{repository}/{ref}.tar.gz", '
+    + 'git = "https://{ref}.git.example.com/{user}/{repository}.git"'
+    + ' }'#10),
+    'must not use {ref} in its host', Self);
+  { User and repository may name the host; ref in the path stays valid. }
+  Man := LoadManifest(WriteCustomSourceManifest('user-in-host',
+    '[package]'#10 +
+    'name = "x"'#10 +
+    'version = "0"'#10 +
+    ''#10 +
+    '[sources]'#10 +
+    'pages = { '
+    + 'archive = "https://{user}.pages.example/{repository}/{ref}.tar.gz", '
+    + 'git = "https://{user}.pages.example/{repository}.git"'
+    + ' }'#10));
+  Expect<Integer>(Length(Man.CustomSources)).ToBe(1);
+end;
+
 procedure TCustomSources.TestShadowingBuiltinPrefixRejected;
 begin
   ExpectManifestLoadError(WriteCustomSourceManifest('shadow-github',
@@ -2919,6 +2959,8 @@ begin
     TestArchiveTemplateHttpRejected);
   Test('git template using plain HTTP hard-errors',
     TestGitTemplateHttpRejected);
+  Test('a ref placeholder in a template host hard-errors',
+    TestRefPlaceholderInHostRejected);
   Test('[sources] entry shadowing a built-in name hard-errors',
     TestShadowingBuiltinPrefixRejected);
   Test('dep with custom prefix routes to hkCustom + correct host name',

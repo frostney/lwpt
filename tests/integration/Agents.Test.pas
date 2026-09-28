@@ -148,7 +148,8 @@ begin
   Expect<Boolean>(Pos(MARKER_END, Content) > 0).ToBe(True);
   { Representative built-ins with their usage + option detail. }
   Expect<Boolean>(Pos(
-    '- `lwpt install [--frozen] [--offline] [--silent]`', Content) > 0)
+    '- `lwpt install [--frozen] [--offline] [--accept-moved-tags] [--silent]`',
+    Content) > 0)
     .ToBe(True);
   Expect<Boolean>(Pos('`--frozen`', Content) > 0).ToBe(True);
   Expect<Boolean>(Pos('`--offline`', Content) > 0).ToBe(True);
