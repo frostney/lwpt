@@ -20,6 +20,7 @@ uses
   TOML,
 
   LWPT.Core,
+  LWPT.Registry.Crypto,
   LWPT.Registry.Mirror,
   LWPT.Registry.Server,
   LWPT.Registry.Store,
@@ -124,6 +125,8 @@ type
     procedure SyncBudgetRejectsBeforeTransfer;
     procedure StoreBudgetPrunesUnacceptedCandidates;
     procedure BackwardsRenewalKeepsAcceptedPointer;
+    procedure OverlongCheckpointIsRejectedAtSynchronization;
+    procedure ClockBehindFloorRefusesSynchronization;
     procedure AbandonedRotationCannotContaminateLaterHistory;
     procedure UnsupportedUpstreamsAreRejectedAtConfiguration;
     procedure LocalhostTransportUsesLoopback;
@@ -1250,6 +1253,114 @@ begin
   end;
 end;
 
+{ Re-signs the origin's latest checkpoint with its own key and a different
+  expiry, as a compromised origin key could. }
+procedure ServeResignedCheckpoint(AHarness: TOriginHarness; const AExpiresAt: string);
+var
+  Checkpoint, SigningInput: TBytes;
+  Original, KeyID, SeedPath: string;
+  Seed: TLWPTEd25519Seed;
+  Signature: TLWPTEd25519Signature;
+begin
+  Original := AsText(AHarness.Body('/v1/checkpoints/latest.toml'));
+  Checkpoint := BytesOf(StringReplace(Original, 'expires_at = "'
+    + InspectRegistryCheckpoint(BytesOf(Original)).ExpiresAt + '"',
+    'expires_at = "' + AExpiresAt + '"', []));
+  KeyID := InspectRegistryCheckpoint(Checkpoint).KeyId;
+  SeedPath := AHarness.Origin.Root + '/' + ChangeFileExt(RegistryKeyStoragePath(KeyID), '.seed');
+  if not FileExists(SeedPath) then SeedPath := AHarness.Origin.Root + '/keys/root.seed';
+  if not HexToBytes(Trim(AsText(ReadFileBytes(SeedPath))), Seed, SizeOf(Seed)) then
+    raise Exception.Create('origin seed is not hexadecimal');
+  SigningInput := BytesOf(PROJECT_NAME + '-REGISTRY-CHECKPOINT-V1' + #10 + AsText(Checkpoint));
+  Ed25519Sign(SigningInput, Seed, Signature);
+  FillChar(Seed, SizeOf(Seed), 0);
+  AHarness.Override('/v1/checkpoints/latest.toml', Checkpoint);
+  AHarness.Override('/v1/checkpoints/latest.sig.toml', BytesOf('schema = "' + PROGRAM_NAME
+    + '-registry-signature-v1"' + #10 + 'algorithm = "ed25519"' + #10
+    + 'key_id = "' + KeyID + '"' + #10 + 'payload = "'
+    + SHA256BytesPrefixed(Checkpoint) + '"' + #10
+    + 'signature = "hex:' + BytesToHex(Signature, SizeOf(Signature)) + '"' + #10));
+end;
+
+procedure TMirrorTransferTests.OverlongCheckpointIsRejectedAtSynchronization;
+var
+  Harness: TOriginHarness;
+  Outcome: string;
+begin
+  SetRegistryClockForTesting(FixtureNow);
+  Harness := TOriginHarness.Create('mirror-lifetime', FixturePublishedAt);
+  try
+    { A validly signed checkpoint that would stay fresh for decades. }
+    ServeResignedCheckpoint(Harness, '2099-01-01T00:00:00Z');
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('checkpoint_lifetime_exceeded:', Outcome) = 1).ToBe(True);
+    Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
+    { One second past the maximum plus the skew allowance is still refused. }
+    ServeResignedCheckpoint(Harness, '2031-01-08T00:05:01Z');
+    Outcome := Harness.Sync;
+    Expect<Boolean>(Pos('checkpoint_lifetime_exceeded:', Outcome) = 1).ToBe(True);
+    Expect<Boolean>(FileExists(Harness.Mirror.Root + '/state/current.toml')).ToBe(False);
+    { Exactly the maximum plus the skew allowance is accepted. }
+    ServeResignedCheckpoint(Harness, '2031-01-08T00:05:00Z');
+    Expect<string>(Harness.Sync).ToBe('ok');
+    Expect<Boolean>(Pos('expires_at = "2031-01-08T00:05:00Z"',
+      Harness.Mirror.VerifyMirror) > 0).ToBe(True);
+  finally
+    Harness.Free;
+  end;
+end;
+
+procedure TMirrorTransferTests.ClockBehindFloorRefusesSynchronization;
+var
+  Harness: TOriginHarness;
+  Restarted: TLWPTRegistryMirror;
+  PointerBefore, Outcome: string;
+  RequestsBefore: Integer;
+begin
+  SetRegistryClockForTesting(FixtureNow);
+  Harness := TOriginHarness.Create('mirror-clock-floor', FixturePublishedAt);
+  Restarted := nil;
+  try
+    Harness.Publish('floor', FixtureNow);
+    Expect<string>(Harness.Sync).ToBe('ok');
+    PointerBefore := AsText(ReadFileBytes(Harness.Mirror.Root + '/state/current.toml'));
+    Expect<Boolean>(Pos('clock_floor = "' + FixtureNow + '"', PointerBefore) > 0).ToBe(True);
+    { The floor is part of the atomically replaced pointer and survives a restart. }
+    Restarted := TLWPTRegistryMirror.Create(Harness.Mirror.Root);
+    Expect<string>(Restarted.LoadCurrentState.ClockFloor).ToBe(FixtureNow);
+    SetRegistryClockForTesting('2031-01-01T23:59:59Z');
+    RequestsBefore := Harness.Server.RequestCount;
+    Outcome := 'ok';
+    try
+      Restarted.Synchronize;
+    except
+      on E: Exception do Outcome := E.Message;
+    end;
+    Expect<Boolean>(Pos('local_clock_behind_accepted_state:', Outcome) = 1).ToBe(True);
+    Expect<Boolean>(Pos('local clock is behind accepted registry state', Outcome) > 0).ToBe(True);
+    Expect<Integer>(Harness.Server.RequestCount).ToBe(RequestsBefore);
+    Expect<string>(AsText(ReadFileBytes(Harness.Mirror.Root + '/state/current.toml')))
+      .ToBe(PointerBefore);
+    { Accepted content is still verified and served while acquisition waits. }
+    Expect<string>(AsText(ServedBytes(Restarted, '/v1/checkpoints/latest.toml')))
+      .ToBe(AsText(Harness.Body('/v1/checkpoints/latest.toml')));
+    Expect<Boolean>(Pos('clock_floor = "' + FixtureNow + '"',
+      Restarted.VerifyMirror) > 0).ToBe(True);
+    { Once the clock reaches the floor, acquisition resumes. }
+    SetRegistryClockForTesting(FixtureNow);
+    Outcome := 'ok';
+    try
+      Restarted.Synchronize;
+    except
+      on E: Exception do Outcome := E.Message;
+    end;
+    Expect<string>(Outcome).ToBe('ok');
+  finally
+    Restarted.Free;
+    Harness.Free;
+  end;
+end;
+
 procedure TMirrorTransferTests.FailBeforeActivation;
 begin
   raise ELWPTRegistryError.CreateStable('interrupted_attempt', 'stopped before activation');
@@ -1884,6 +1995,9 @@ begin
   Test('the attempt byte budget rejects archives before transfer', SyncBudgetRejectsBeforeTransfer);
   Test('the store budget prunes unaccepted candidates and refuses overflow', StoreBudgetPrunesUnacceptedCandidates);
   Test('an older same-sequence renewal leaves the accepted pointer', BackwardsRenewalKeepsAcceptedPointer);
+  Test('synchronization enforces the maximum checkpoint lifetime', OverlongCheckpointIsRejectedAtSynchronization);
+  Test('a clock behind the persisted floor refuses synchronization until it catches up',
+    ClockBehindFloorRefusesSynchronization);
   Test('an abandoned rotation cannot contaminate a later accepted history', AbandonedRotationCannotContaminateLaterHistory);
   Test('IPv6 upstreams are rejected at configuration time', UnsupportedUpstreamsAreRejectedAtConfiguration);
   Test('the localhost HTTP exception connects to loopback directly', LocalhostTransportUsesLoopback);

@@ -20,6 +20,12 @@ const
   RegistryRotationDocumentSuffix = '.toml';
   RegistryRotationOldSignatureSuffix = '.old.sig.toml';
   RegistryRotationNewSignatureSuffix = '.new.sig.toml';
+  { Protocol 1 checkpoint validity ceiling. Origins sign exactly this window;
+    acquisition rejects a window longer than it plus the clock-skew allowance. }
+  RegistryCheckpointMaximumLifetimeDays = 7;
+  RegistryCheckpointMaximumLifetimeSeconds =
+    Int64(RegistryCheckpointMaximumLifetimeDays) * 24 * 60 * 60;
+  RegistryCheckpointClockSkewSeconds = 5 * 60;
 
 type
   ELWPTRegistryError = LWPT.Registry.Store.ELWPTRegistryError;
@@ -68,6 +74,9 @@ type
     Snapshot, CheckpointHash: string;
     { Authenticated renewal times of the accepted checkpoint. }
     PublishedAt, ExpiresAt: string;
+    { Highest published_at ever accepted for this origin. Acquisition refuses
+      an earlier evaluation time. Empty means PublishedAt alone. }
+    ClockFloor: string;
   end;
 
   TLWPTRegistryTrust = record
@@ -136,6 +145,13 @@ function ParseRegistryRotationPage(const ABytes: TBytes;
   const AOrigin, AAPI: string; const AAfter: Int64;
   const AMaximumItems: Integer): TLWPTRegistryRotationPage;
 function RegistryQueryEncode(const AValue: string): string;
+{ Signed validity window of canonical checkpoint times, in whole seconds. }
+function RegistryCheckpointLifetimeSeconds(const APublishedAt,
+  AExpiresAt: string): Int64;
+{ The later of two canonical times; an empty value is ignored. }
+function RegistryLaterTimestamp(const AFirst, ASecond: string): string;
+{ Refuses acquisition while ANow is earlier than the accepted clock floor. }
+procedure RequireRegistryClockAtFloor(const ANow, AFloor: string);
 function ValidateRegistryKeyDocument(const ABytes: TBytes;
   const ATrust: TLWPTRegistryTrust; const ACheckpointSequence: Int64;
   const AExactSequence: Boolean = False): Int64;
@@ -144,6 +160,8 @@ function ValidateRegistryCapabilities(const AContent, ARole: string;
 function RegistryURIIsCanonical(const AValue: string;
   const AAllowLocalhostHTTP: Boolean): Boolean;
 function RegistryHashIsCanonical(const AValue: string): Boolean;
+{ RFC 3339 UTC with whole seconds and the Z suffix. }
+function RegistryTimestampIsCanonical(const AValue: string): Boolean;
 function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;
 { Byte-preserving conversion of protocol bytes to RawByteString text. The
   reverse conversion is SysUtils.BytesOf. }
@@ -355,12 +373,13 @@ begin
   Result := AKeyId = 'ed25519:' + SHA256Hex(RawKey);
 end;
 
-function RegistryTimestampIsCanonical(const AValue: string): Boolean;
+function TryRegistryTimestamp(const AValue: string;
+  out AStamp: TDateTime): Boolean;
 var
   Year, Month, Day, Hour, Minute, Second: Integer;
-  Stamp: TDateTime;
   Index: Integer;
 begin
+  AStamp := 0;
   if Length(AValue) <> 20 then Exit(False);
   for Index := 1 to 19 do
     if not (Index in [5, 8, 11, 14, 17])
@@ -375,7 +394,43 @@ begin
     and TryStrToInt(Copy(AValue, 15, 2), Minute)
     and TryStrToInt(Copy(AValue, 18, 2), Second)
     and TryEncodeDateTime(Word(Year), Word(Month), Word(Day), Word(Hour),
-      Word(Minute), Word(Second), 0, Stamp);
+      Word(Minute), Word(Second), 0, AStamp);
+end;
+
+function RegistryTimestampIsCanonical(const AValue: string): Boolean;
+var
+  Stamp: TDateTime;
+begin
+  Result := TryRegistryTimestamp(AValue, Stamp);
+end;
+
+function RegistryCheckpointLifetimeSeconds(const APublishedAt,
+  AExpiresAt: string): Int64;
+var
+  Published, Expires: TDateTime;
+begin
+  if not TryRegistryTimestamp(APublishedAt, Published)
+    or not TryRegistryTimestamp(AExpiresAt, Expires) then
+    raise ELWPTRegistryError.CreateStable('invalid_registry_checkpoint',
+      'checkpoint times are not canonical UTC');
+  { Both stamps are whole seconds, so the rounded difference is exact. }
+  Result := DateTimeToUnix(Expires) - DateTimeToUnix(Published);
+end;
+
+function RegistryLaterTimestamp(const AFirst, ASecond: string): string;
+begin
+  { Canonical UTC stamps have fixed width, so they order lexicographically. }
+  if AFirst > ASecond then Result := AFirst else Result := ASecond;
+end;
+
+procedure RequireRegistryClockAtFloor(const ANow, AFloor: string);
+begin
+  if (AFloor <> '') and (ANow < AFloor) then
+    raise ELWPTRegistryError.CreateStable('local_clock_behind_accepted_state',
+      'local clock is behind accepted registry state: the clock reads ' + ANow
+      + ' but a checkpoint published at ' + AFloor
+      + ' was already accepted; correct the system clock, and acquisition'
+      + ' resumes once it reaches ' + AFloor);
 end;
 
 function RegistryConstraintArmIsCanonical(const AValue: string): Boolean;
@@ -1394,6 +1449,7 @@ var
   Index: Integer;
   UsedKeys: TStringList;
   Downgrade: Boolean;
+  ClockFloor: string;
 begin
   Result := Default(TLWPTVerifiedRegistry);
   if not RegistryURIIsCanonical(ATrust.Origin, True)
@@ -1408,9 +1464,17 @@ begin
       or not RegistryHashIsCanonical(APrior.Snapshot)
       or not RegistryTrustRootIsValid(APrior.KeyId, APrior.PublicKey)
       or not RegistryTimestampIsCanonical(APrior.PublishedAt)
-      or not RegistryTimestampIsCanonical(APrior.ExpiresAt))) then
+      or not RegistryTimestampIsCanonical(APrior.ExpiresAt)
+      or ((APrior.ClockFloor <> '')
+        and not RegistryTimestampIsCanonical(APrior.ClockFloor)))) then
     raise ELWPTRegistryError.CreateStable('invalid_accepted_state',
       'prior accepted state is incomplete or belongs to another origin');
+  ClockFloor := '';
+  if APrior.Sequence > 0 then
+    ClockFloor := RegistryLaterTimestamp(APrior.ClockFloor, APrior.PublishedAt);
+  { A clock set behind accepted state could make an expired checkpoint look
+    fresh again. This is a local condition, so no contact can satisfy it. }
+  if AMode = rvmAcquire then RequireRegistryClockAtFloor(AEvaluationTime, ClockFloor);
   if (AMode = rvmLockedProof) and (APrior.Sequence = 0) then
     raise ELWPTRegistryError.CreateStable('locked_proof_requires_accepted_state',
       'locked proof verification requires the recorded checkpoint');
@@ -1488,6 +1552,16 @@ begin
   if (AMode = rvmAcquire) and (Checkpoint.PublishedAt > AEvaluationTime) then
     raise ELWPTRegistryError.CreateStable('checkpoint_from_future',
       'checkpoint publication time is later than the evaluation time');
+  { An authenticated window beyond the ceiling is a signing-policy violation,
+    not a stale contact. Locked proof keeps its already accepted bytes. }
+  if (AMode = rvmAcquire) and (RegistryCheckpointLifetimeSeconds(
+    Checkpoint.PublishedAt, Checkpoint.ExpiresAt)
+    > RegistryCheckpointMaximumLifetimeSeconds + RegistryCheckpointClockSkewSeconds) then
+    raise ELWPTRegistryError.CreateStable('checkpoint_lifetime_exceeded',
+      'checkpoint is valid from ' + Checkpoint.PublishedAt + ' to '
+      + Checkpoint.ExpiresAt + ', longer than the '
+      + IntToStr(RegistryCheckpointMaximumLifetimeDays) + '-day maximum plus '
+      + IntToStr(RegistryCheckpointClockSkewSeconds) + ' seconds of clock skew');
   Downgrade := False;
   if APrior.Sequence > 0 then
   begin
@@ -1539,6 +1613,7 @@ begin
   Result.State.CheckpointHash := SHA256BytesPrefixed(AProof.Checkpoint);
   Result.State.PublishedAt := Checkpoint.PublishedAt;
   Result.State.ExpiresAt := Checkpoint.ExpiresAt;
+  Result.State.ClockFloor := RegistryLaterTimestamp(ClockFloor, Checkpoint.PublishedAt);
   Result.PublishedAt := Checkpoint.PublishedAt;
   Result.ExpiresAt := Checkpoint.ExpiresAt;
   Result.Documents := FDocuments;

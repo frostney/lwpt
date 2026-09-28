@@ -74,6 +74,9 @@ type
     { Mirror only: the accepted root key record and exact rotation chain. }
     TrustKeyDocument: string;
     Rotations: TLWPTRegistryRotationBindingArray;
+    { Mirror only: highest accepted checkpoint published_at, the clock-rollback
+      floor below which synchronization is refused. }
+    ClockFloor: string;
   end;
 
   TLWPTRegistryPublication = record
@@ -586,22 +589,32 @@ begin
   end;
 end;
 
-function KeyValue(const ADocument, AKey: string): string;
+function TryKeyValue(const ADocument, AKey: string; out AValue: string): Boolean;
 var
   Line, Prefix: string;
   Lines: TStringList;
 begin
+  AValue := '';
   Prefix := AKey + ' = ';
   Lines := TStringList.Create;
   try
     Lines.Text := ADocument;
     for Line in Lines do
       if StartsText(Prefix, Line) then
-        Exit(Copy(Line, Length(Prefix) + 1, MaxInt));
+      begin
+        AValue := Copy(Line, Length(Prefix) + 1, MaxInt);
+        Exit(True);
+      end;
   finally
     Lines.Free;
   end;
-  raise ELWPTRegistryError.CreateStable('state_corrupt', 'missing field ' + AKey);
+  Result := False;
+end;
+
+function KeyValue(const ADocument, AKey: string): string;
+begin
+  if not TryKeyValue(ADocument, AKey, Result) then
+    raise ELWPTRegistryError.CreateStable('state_corrupt', 'missing field ' + AKey);
 end;
 
 function StringValue(const ADocument, AKey: string): string;
@@ -1349,7 +1362,9 @@ begin
   ValidateRegistryConfiguration(Result);
 end;
 
-function TimestampPlusSevenDays(const AValue: string): string;
+{ The origin signs exactly the protocol's maximum checkpoint lifetime and
+  never a longer one. }
+function CheckpointExpiry(const AValue: string): string;
 var
   Parsed: TDateTime;
 begin
@@ -1358,7 +1373,12 @@ begin
   if FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"', Parsed) <> AValue then
     raise ELWPTRegistryError.CreateStable('invalid_timestamp',
       'published_at must use whole UTC seconds and the Z suffix');
-  Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"', IncDay(Parsed, 7));
+  Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
+    IncDay(Parsed, RegistryCheckpointMaximumLifetimeDays));
+  if RegistryCheckpointLifetimeSeconds(AValue, Result)
+    <> RegistryCheckpointMaximumLifetimeSeconds then
+    raise ELWPTRegistryError.CreateStable('invalid_timestamp',
+      'checkpoint lifetime differs from the protocol maximum');
 end;
 
 function SnapshotDocument(const AOrigin: string; const ASequence: QWord;
@@ -1465,7 +1485,7 @@ begin
     + 'snapshot = ' + PersistedTOMLQuote(ASnapshotHash) + #10
     + 'published_at = ' + PersistedTOMLQuote(APublishedAt) + #10
     + 'expires_at = '
-    + PersistedTOMLQuote(TimestampPlusSevenDays(APublishedAt)) + #10
+    + PersistedTOMLQuote(CheckpointExpiry(APublishedAt)) + #10
     + 'key_id = ' + PersistedTOMLQuote(AKeyID) + #10;
 end;
 
@@ -1538,6 +1558,7 @@ begin
     + #10 + 'trust_public_key = ' + PersistedTOMLQuote(AState.TrustPublicKey)
     + #10 + 'checkpoint_hash = ' + PersistedTOMLQuote(AState.CheckpointHash)
     + #10 + 'last_sync = ' + PersistedTOMLQuote(AState.LastSync)
+    + #10 + 'clock_floor = ' + PersistedTOMLQuote(AState.ClockFloor)
     + #10 + 'trust_key_document = ' + PersistedTOMLQuote(AState.TrustKeyDocument)
     + #10 + 'rotations = [';
   for Index := 0 to High(AState.Rotations) do
@@ -1551,6 +1572,7 @@ end;
 function ParseState(const ADocument: string): TLWPTRegistryState;
 var
   Bindings: TStringList;
+  Floor: string;
   Index: Integer;
 begin
   Result := Default(TLWPTRegistryState);
@@ -1564,6 +1586,12 @@ begin
     Result.TrustPublicKey := StringValue(ADocument, 'trust_public_key');
     Result.CheckpointHash := StringValue(ADocument, 'checkpoint_hash');
     Result.LastSync := StringValue(ADocument, 'last_sync');
+    { Absent from states written before the floor existed; the accepted
+      checkpoint's own published_at then serves as the floor. }
+    if TryKeyValue(ADocument, 'clock_floor', Floor) then
+      Result.ClockFloor := Unquote(Floor);
+    if (Result.ClockFloor <> '') and not RegistryTimestampIsCanonical(Result.ClockFloor) then
+      raise ELWPTRegistryError.CreateStable('state_corrupt', 'invalid clock floor');
     Result.TrustKeyDocument := StringValue(ADocument, 'trust_key_document');
     if not IsSHA256(Result.TrustKeyDocument) then
       raise ELWPTRegistryError.CreateStable('state_corrupt', 'invalid trust key document binding');
@@ -1870,7 +1898,7 @@ begin
     if Config.TLSPKCS12Path <> '' then
       Config.TLSPKCS12Path := ExpandFileName(Config.TLSPKCS12Path);
     ValidateRegistryConfiguration(Config);
-    TimestampPlusSevenDays(APublishedAt);
+    CheckpointExpiry(APublishedAt);
     ForceDirectories(TemporaryRoot);
     AtomicWriteBytes(AtRoot(INITIALIZATION_MARKER), TemporaryRoot,
       Bytes('registry initialization in progress' + #10));
@@ -2008,7 +2036,7 @@ begin
       'checkpoint snapshot differs from committed state');
   PublishedAt := StringValue(CheckpointDocumentText, 'published_at');
   if StringValue(CheckpointDocumentText, 'expires_at')
-    <> TimestampPlusSevenDays(PublishedAt) then
+    <> CheckpointExpiry(PublishedAt) then
     raise ELWPTRegistryError.CreateStable('checkpoint_expiry_invalid',
       'checkpoint expiry is not seven days after publication');
   KeyID := StringValue(CheckpointDocumentText, 'key_id');
@@ -2731,7 +2759,7 @@ var
   State: TLWPTRegistryState;
 begin
   if FConfig.Role = rrMirror then Exit;
-  TimestampPlusSevenDays(ANow);
+  CheckpointExpiry(ANow);
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
   Lease := nil;
   try
@@ -2828,7 +2856,7 @@ begin
   if FConfig.Role <> rrOrigin then
     raise ELWPTRegistryError.CreateStable('mirror_read_only', 'mirrors cannot rotate signing keys');
   RegistryKeyStoragePath(AExpectedKeyID);
-  TimestampPlusSevenDays(APublishedAt);
+  CheckpointExpiry(APublishedAt);
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
   Lease := nil;
   try
@@ -2930,7 +2958,7 @@ begin
       raise ELWPTRegistryError.CreateStable('invalid_package_name', 'package name is not canonical');
   if Valid(APublication.Version, DefaultSemverOptions) <> APublication.Version then
     raise ELWPTRegistryError.CreateStable('invalid_version', 'package version is not canonical SemVer 2.0.0');
-  TimestampPlusSevenDays(APublication.PublishedAt);
+  CheckpointExpiry(APublication.PublishedAt);
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
   Lease := nil;
   try

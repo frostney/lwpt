@@ -97,6 +97,8 @@ type
     procedure LockedExpiredProofAccepted;
     procedure LockedProofRequiresExactState;
     procedure FutureCheckpointRejected;
+    procedure CheckpointLifetimeCeilingEnforced;
+    procedure ClockBehindFloorRefusesAcquisition;
     procedure TamperedCheckpointRejected;
     procedure InvalidSignatureRejected;
     procedure MissingRotationRejected;
@@ -626,18 +628,19 @@ var
   Actual: string;
   Stale: Boolean;
 begin
-  Newer := Verify(Renewed('05', '12'), Default(TLWPTRegistryAcceptedState));
+  { Every window stays within the seven-day maximum lifetime. }
+  Newer := Verify(Renewed('05', '11'), Default(TLWPTRegistryAcceptedState));
   { Exact replay of the accepted renewal is idempotent. }
-  Replayed := Verify(Renewed('05', '12'), Newer.State);
+  Replayed := Verify(Renewed('05', '11'), Newer.State);
   Expect<string>(Replayed.State.CheckpointHash).ToBe(Newer.State.CheckpointHash);
-  Forward := Verify(Renewed('05', '13'), Newer.State);
+  Forward := Verify(Renewed('06', '13'), Newer.State);
   Expect<string>(Forward.ExpiresAt).ToBe('2026-01-13T00:00:00Z');
   ExpectFailure(Proof(1), 'checkpoint_renewal_rollback:', Newer.State);
-  ExpectFailure(Renewed('04', '12'), 'checkpoint_renewal_rollback:', Newer.State);
+  ExpectFailure(Renewed('04', '11'), 'checkpoint_renewal_rollback:', Newer.State);
   Actual := '';
   Stale := False;
   try
-    Verify(Renewed('05', '11'), Newer.State);
+    Verify(Renewed('05', '10'), Newer.State);
   except
     on E: ELWPTRegistryStaleContactError do
     begin
@@ -982,6 +985,95 @@ begin
   Prior := Verify(Proof(1), Default(TLWPTRegistryAcceptedState));
   ExpectFailure(Proof(2), 'locked_proof_state_mismatch', Prior.State, nil,
     rvmLockedProof);
+end;
+
+{ Root-signed sequence 1, published 2026-01-01T00:00:00Z, with another expiry. }
+function WithExpiry(const AExpiresAt: string): TLWPTRegistryProof;
+begin
+  Result := Default(TLWPTRegistryProof);
+  Result.Checkpoint := BytesOf(StringReplace(AsText(ReadFixture('checkpoints/1.toml')),
+    'expires_at = "2026-01-08T00:00:00Z"', 'expires_at = "' + AExpiresAt + '"', []));
+  ResignRoot(Result);
+end;
+
+procedure TRegistryVerificationTests.CheckpointLifetimeCeilingEnforced;
+var
+  Verified: TLWPTVerifiedRegistry;
+  Prior: TLWPTRegistryAcceptedState;
+  Overlong: TLWPTRegistryProof;
+
+  function Failure(const AProof: TLWPTRegistryProof): string;
+  begin
+    Result := 'accepted';
+    try
+      Verify(AProof, Default(TLWPTRegistryAcceptedState));
+    except
+      on E: ELWPTRegistryStaleContactError do Result := 'stale ' + E.Message;
+      on E: ELWPTRegistryError do Result := E.Message;
+    end;
+  end;
+begin
+  Expect<Int64>(RegistryCheckpointMaximumLifetimeSeconds).ToBe(7 * 24 * 60 * 60);
+  Expect<Int64>(RegistryCheckpointClockSkewSeconds).ToBe(5 * 60);
+  Expect<Int64>(RegistryCheckpointLifetimeSeconds('2026-01-01T00:00:00Z',
+    '2026-01-08T00:05:00Z')).ToBe(RegistryCheckpointMaximumLifetimeSeconds
+    + RegistryCheckpointClockSkewSeconds);
+  { Exactly the maximum plus the skew allowance is accepted. }
+  Verified := Verify(WithExpiry('2026-01-08T00:05:00Z'), Default(TLWPTRegistryAcceptedState));
+  Expect<string>(Verified.ExpiresAt).ToBe('2026-01-08T00:05:00Z');
+  { One second longer is a trust failure, not a stale contact. }
+  Expect<Boolean>(Pos('checkpoint_lifetime_exceeded:',
+    Failure(WithExpiry('2026-01-08T00:05:01Z'))) = 1).ToBe(True);
+  Overlong := WithExpiry('2099-01-01T00:00:00Z');
+  Expect<Boolean>(Pos('checkpoint_lifetime_exceeded:', Failure(Overlong)) = 1).ToBe(True);
+  { Retained proof is replayed unchanged: the ceiling guards acquisition only. }
+  Prior := Verify(Proof(1), Default(TLWPTRegistryAcceptedState)).State;
+  Prior.CheckpointHash := SHA256BytesPrefixed(Overlong.Checkpoint);
+  Prior.ExpiresAt := '2099-01-01T00:00:00Z';
+  Verified := Verify(Overlong, Prior, rvmLockedProof, '2030-01-01T00:00:00Z');
+  Expect<string>(Verified.ExpiresAt).ToBe('2099-01-01T00:00:00Z');
+end;
+
+procedure TRegistryVerificationTests.ClockBehindFloorRefusesAcquisition;
+var
+  First, Second: TLWPTVerifiedRegistry;
+  Prior: TLWPTRegistryAcceptedState;
+
+  function Failure(const AProof: TLWPTRegistryProof;
+    const APrior: TLWPTRegistryAcceptedState; const ATime: string;
+    const AMode: TLWPTRegistryVerificationMode = rvmAcquire): string;
+  begin
+    Result := 'accepted';
+    try
+      Verify(AProof, APrior, AMode, ATime);
+    except
+      on E: ELWPTRegistryStaleContactError do Result := 'stale ' + E.Message;
+      on E: ELWPTRegistryError do Result := E.Message;
+    end;
+  end;
+begin
+  First := Verify(Proof(1), Default(TLWPTRegistryAcceptedState));
+  Expect<string>(First.State.ClockFloor).ToBe('2026-01-01T00:00:00Z');
+  { A clock behind the accepted publication time refuses acquisition. }
+  Expect<Boolean>(Pos('local_clock_behind_accepted_state:',
+    Failure(Proof(2), First.State, '2025-12-31T23:59:59Z')) = 1).ToBe(True);
+  { Acquisition succeeds again once the clock reaches the floor. }
+  Second := Verify(Proof(2), First.State, rvmAcquire, '2026-01-02T00:00:00Z');
+  Expect<string>(Second.State.ClockFloor).ToBe('2026-01-02T00:00:00Z');
+  { A persisted floor above the accepted checkpoint still governs, and a
+    checkpoint published earlier never lowers it. }
+  Prior := First.State;
+  Prior.ClockFloor := '2026-01-04T00:00:00Z';
+  Expect<Boolean>(Pos('local_clock_behind_accepted_state:',
+    Failure(Proof(2), Prior, '2026-01-03T23:59:59Z')) = 1).ToBe(True);
+  Second := Verify(Proof(2), Prior, rvmAcquire, '2026-01-04T00:00:00Z');
+  Expect<string>(Second.State.ClockFloor).ToBe('2026-01-04T00:00:00Z');
+  { Locked proof replay of accepted content does not consult the clock. }
+  Expect<string>(Failure(Proof(1), Prior, '2025-06-01T00:00:00Z', rvmLockedProof))
+    .ToBe('accepted');
+  Prior.ClockFloor := '2026-01-04';
+  Expect<Boolean>(Pos('invalid_accepted_state:',
+    Failure(Proof(2), Prior, EVALUATION_TIME)) = 1).ToBe(True);
 end;
 
 procedure TRegistryVerificationTests.FutureCheckpointRejected;
@@ -1388,8 +1480,9 @@ var
 begin
   Prior := Verify(Proof(1), Default(TLWPTRegistryAcceptedState));
   Candidate := Proof(1);
-  Candidate.Checkpoint := BytesOf(StringReplace(AsText(Candidate.Checkpoint),
-    'expires_at = "2026-01-08', 'expires_at = "2026-01-09', []));
+  Candidate.Checkpoint := BytesOf(StringReplace(StringReplace(AsText(Candidate.Checkpoint),
+    'expires_at = "2026-01-08', 'expires_at = "2026-01-09', []),
+    'published_at = "2026-01-01', 'published_at = "2026-01-02', []));
   ResignRoot(Candidate);
   ExpectFailure(Candidate, 'locked_proof_state_mismatch', Prior.State,
     nil, rvmLockedProof);
@@ -1710,6 +1803,9 @@ begin
   Test('locked proof permits later checkpoint expiry', LockedExpiredProofAccepted);
   Test('locked proof requires the exact recorded state', LockedProofRequiresExactState);
   Test('acquisition rejects a correctly signed future checkpoint', FutureCheckpointRejected);
+  Test('acquisition enforces the maximum checkpoint lifetime at its boundary',
+    CheckpointLifetimeCeilingEnforced);
+  Test('acquisition refuses a clock behind the accepted floor', ClockBehindFloorRefusesAcquisition);
   Test('checkpoint tampering fails payload binding', TamperedCheckpointRejected);
   Test('cryptographically invalid signatures fail', InvalidSignatureRejected);
   Test('unknown checkpoint key requires verified rotation', MissingRotationRejected);

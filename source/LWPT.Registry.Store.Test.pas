@@ -207,6 +207,7 @@ type
     procedure TestCheckpointCrashDoesNotActivatePublication;
     procedure TestActivationCrashRebuildsDerivedIndex;
     procedure TestCheckpointRenewsWithoutNewSequence;
+    procedure TestOriginSignsOnlyTheMaximumLifetime;
     procedure TestRegistryPathsRejectLinks;
     procedure TestCanonicalURLValidation;
     procedure TestConfiguredEncodedBasePathRoutes;
@@ -848,6 +849,43 @@ begin
   finally
     Store.Free;
   end;
+end;
+
+procedure TRegistryStoreContract.TestOriginSignsOnlyTheMaximumLifetime;
+var
+  Store: TLWPTRegistryStore;
+  Checkpoint: TLWPTUntrustedRegistryCheckpoint;
+  Lifetimes: array of Int64;
+
+  procedure RecordLifetime;
+  begin
+    Checkpoint := InspectRegistryCheckpoint(Store.LoadResource(
+      Store.LoadCurrentState.CheckpointPath));
+    SetLength(Lifetimes, Length(Lifetimes) + 1);
+    Lifetimes[High(Lifetimes)] := RegistryCheckpointLifetimeSeconds(
+      Checkpoint.PublishedAt, Checkpoint.ExpiresAt);
+  end;
+
+var
+  Lifetime: Int64;
+begin
+  Lifetimes := nil;
+  Store := InitializeStore;
+  try
+    { Initialization, publication, renewal, and rotation all sign. }
+    RecordLifetime;
+    PublishExample(Store, $61);
+    RecordLifetime;
+    Store.EnsureFreshCheckpoint('2026-08-29T11:00:00Z');
+    RecordLifetime;
+    Store.RotateKey(Checkpoint.KeyId, '2026-08-29T12:00:00Z');
+    RecordLifetime;
+  finally
+    Store.Free;
+  end;
+  Expect<Integer>(Length(Lifetimes)).ToBe(4);
+  for Lifetime in Lifetimes do
+    Expect<Int64>(Lifetime).ToBe(RegistryCheckpointMaximumLifetimeSeconds);
 end;
 
 procedure TRegistryStoreContract.TestRegistryPathsRejectLinks;
@@ -1981,6 +2019,8 @@ begin
     TestActivationCrashRebuildsDerivedIndex);
   Test('checkpoint renews without new sequence',
     TestCheckpointRenewsWithoutNewSequence);
+  Test('origin signs every checkpoint for exactly the maximum lifetime',
+    TestOriginSignsOnlyTheMaximumLifetime);
   Test('registry paths reject links', TestRegistryPathsRejectLinks);
   Test('canonical URL validation', TestCanonicalURLValidation);
   Test('configured encoded base path routes',
