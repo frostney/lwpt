@@ -45,6 +45,11 @@ const
 
 type
   ETransportSecurityError = class(Exception);
+  { The client refused the peer: its certificate chain, validity, purpose,
+    or host name failed verification. Raised by every client backend, with
+    or without options, so a caller can tell a trust refusal, which a retry
+    cannot fix, from a transient transport failure. }
+  ETransportSecurityVerificationError = class(ETransportSecurityError);
 
   TTransportSecurityState = (
     tssDone,
@@ -319,7 +324,17 @@ function TransportSecurityTestKeyContainerExists(
   can be pinned without an SChannel server building its own chain. }
 function TransportSecurityTestVerifyServerChain(const ALeaf,
   AIntermediates: TBytes; const AHost: string;
-  const AOptions: TTransportSecurityClientOptions): string;
+  const AOptions: TTransportSecurityClientOptions): string; overload;
+{ As above; ARefused is True only for ETransportSecurityVerificationError. }
+function TransportSecurityTestVerifyServerChain(const ALeaf,
+  AIntermediates: TBytes; const AHost: string;
+  const AOptions: TTransportSecurityClientOptions;
+  out ARefused: Boolean): string; overload;
+{ Makes the next chain evaluations fail to execute: 1 in
+  CertGetCertificateChain, 2 in CertVerifyCertificateChainPolicy, 0 for
+  none. }
+procedure TransportSecurityTestForceSChannelChainExecutionFailure(
+  const AStage: Integer);
 {$ENDIF}
 {$ENDIF}
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
@@ -927,6 +942,21 @@ function SSLSetCertificate(AContext: SSLContextRef;
   external name 'SSLSetCertificate';
 function SSLHandshake(AContext: SSLContextRef): OSStatus; cdecl;
   external name 'SSLHandshake';
+
+{ Certificate statuses Secure Transport's own evaluation ends a client
+  handshake with (errSSLXCertChainInvalid, errSSLBadCert,
+  errSSLUnknownRootCert, errSSLNoRootCert, errSSLCertExpired,
+  errSSLCertNotYetValid, errSSLHostNameMismatch). }
+function SecureTransportStatusIsVerificationFailure(const AStatus: OSStatus): Boolean;
+begin
+  case AStatus of
+    -9807, -9808, -9812, -9813, -9814, -9815, -9843:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
 function SSLRead(AContext: SSLContextRef; AData: Pointer;
   ADataLength: PtrUInt; var AProcessed: PtrUInt): OSStatus; cdecl;
   external name 'SSLRead';
@@ -2020,7 +2050,7 @@ begin
   try
     Status := SSLCopyPeerTrust(AContext, Trust);
     if (Status <> ERR_SEC_SUCCESS) or (Trust = nil) then
-      raise ETransportSecurityError.CreateFmt(
+      raise ETransportSecurityVerificationError.CreateFmt(
         '%s: the server presented no certificate', [TLS_VERIFICATION_ERROR]);
     EncodedHost := UTF8Encode(UnicodeString(AHost));
     HostName := CFStringCreateWithCString(nil, PAnsiChar(EncodedHost),
@@ -2060,9 +2090,9 @@ begin
         Exit;
     end;
     if ErrorReference <> nil then
-      raise ETransportSecurityError.CreateFmt('%s: %d',
+      raise ETransportSecurityVerificationError.CreateFmt('%s: %d',
         [TLS_VERIFICATION_ERROR, Int64(CFErrorGetCode(ErrorReference))]);
-    raise ETransportSecurityError.Create(TLS_VERIFICATION_ERROR);
+    raise ETransportSecurityVerificationError.Create(TLS_VERIFICATION_ERROR);
   finally
     if ErrorReference <> nil then
       CFRelease(ErrorReference);
@@ -2245,6 +2275,11 @@ begin
           Data.WantWrite);
     until Status <> ERR_SSL_WOULD_BLOCK;
 
+    { Without options Secure Transport evaluates the chain itself and
+      ends the handshake with one of its certificate statuses. }
+    if SecureTransportStatusIsVerificationFailure(Status) then
+      raise ETransportSecurityVerificationError.CreateFmt('%s: %d',
+        [TLS_HANDSHAKE_ERROR, Status]);
     if Status <> ERR_SEC_SUCCESS then
       raise ETransportSecurityError.CreateFmt('%s: %d',
         [TLS_HANDSHAKE_ERROR, Status]);
@@ -4103,9 +4138,9 @@ var
 begin
   Reason := OpenSSLClientVerifyErrorString(AVerifyResult);
   if Assigned(Reason) then
-    raise ETransportSecurityError.CreateFmt('%s: %s',
+    raise ETransportSecurityVerificationError.CreateFmt('%s: %s',
       [TLS_VERIFICATION_ERROR, string(AnsiString(Reason))]);
-  raise ETransportSecurityError.CreateFmt('%s: %d',
+  raise ETransportSecurityVerificationError.CreateFmt('%s: %d',
     [TLS_VERIFICATION_ERROR, AVerifyResult]);
 end;
 
@@ -4204,7 +4239,7 @@ begin
     if not AUseOptions then
     begin
       if SSLGetVerifyResult(Data.SSL) <> X509_V_OK then
-        raise ETransportSecurityError.Create('OpenSSL certificate verification failed');
+        raise ETransportSecurityVerificationError.Create('OpenSSL certificate verification failed');
     end
     else if not AOptions.InsecureSkipVerify then
     begin
@@ -5603,6 +5638,24 @@ begin
     Result := Result + ' ' + Name;
 end;
 
+{ Certificate statuses SChannel's own server validation ends a client
+  handshake with: an untrusted, unknown, expired, misused, or misnamed
+  server certificate, and every CERT_E_ trust-policy status. }
+function SChannelStatusIsVerificationFailure(const AStatus: LongWord): Boolean;
+begin
+  case AStatus of
+    $80090322, { SEC_E_WRONG_PRINCIPAL }
+    $80090325, { SEC_E_UNTRUSTED_ROOT }
+    $80090327, { SEC_E_CERT_UNKNOWN }
+    $80090328, { SEC_E_CERT_EXPIRED }
+    $80090349, { SEC_E_CERT_WRONG_USAGE }
+    $80090352: { SEC_E_ISSUING_CA_UNTRUSTED }
+      Result := True;
+  else
+    Result := (AStatus and $FFFFFF00) = $800B0100;
+  end;
+end;
+
 { A handshake that ends because the server closed the connection names the
   last status the client saw and whether it answered a certificate request
   anonymously, which is where a refused client identity shows up. }
@@ -5796,6 +5849,12 @@ begin
         Continue;
       end;
 
+      { Without options SChannel validates the server itself and fails
+        the handshake with a certificate status. }
+      if SChannelStatusIsVerificationFailure(LongWord(Status)) then
+        raise ETransportSecurityVerificationError.CreateFmt(
+          '%s: %s (client handshake)',
+          [TLS_HANDSHAKE_ERROR, SChannelStatusText(LongWord(Status))]);
       if Status <> SEC_E_OK then
         raise ETransportSecurityError.CreateFmt('%s: %s (client handshake)',
           [TLS_HANDSHAKE_ERROR, SChannelStatusText(LongWord(Status))]);
@@ -6323,6 +6382,9 @@ type
     IntermediatesFromPeer: Boolean;
     PeerStoreCount: Integer;
     PolicyError: LongWord;
+    { Empty when both chain calls ran; otherwise which call failed to
+      execute and its GetLastError. PolicyError then reports no verdict. }
+    ExecutionFailure: string;
   end;
 
 {$IFDEF CPU64}
@@ -6507,6 +6569,8 @@ const
 {$IFNDEF PRODUCTION}
 var
   SChannelTestImportedKeyContainers: TUnicodeStringArray;
+  { 0, or the chain call the test seam makes fail to execute. }
+  SChannelTestChainExecutionFailure: Integer;
 {$ENDIF}
 
 function NCryptOpenStorageProvider(out AProvider: PtrUInt;
@@ -7429,9 +7493,21 @@ begin
   ChainPara.RequestedUsage.Usage.cUsageIdentifier := 1;
   ChainPara.RequestedUsage.Usage.rgpszUsageIdentifier := @Usages[0];
   Chain := nil;
+  {$IFNDEF PRODUCTION}
+  if SChannelTestChainExecutionFailure = 1 then
+  begin
+    AReport.ExecutionFailure := 'CertGetCertificateChain failed: '
+      + SChannelStatusText(LongWord(14 { ERROR_OUTOFMEMORY }));
+    Exit;
+  end;
+  {$ENDIF}
   if not CertGetCertificateChain(AEngine, APeer, nil, APeer^.hCertStore,
     ChainPara, AChainFlags, nil, Chain) or not Assigned(Chain) then
+  begin
+    AReport.ExecutionFailure := 'CertGetCertificateChain failed: '
+      + SChannelStatusText(LongWord(Windows.GetLastError));
     Exit;
+  end;
   try
     ChainContext := PCertChainContextLWPT(Chain);
     AReport.ChainErrorStatus := ChainContext^.TrustStatus.dwErrorStatus;
@@ -7466,13 +7542,34 @@ begin
     PolicyPara.pvExtraPolicyPara := @SSLPara;
     FillChar(PolicyStatus, SizeOf(PolicyStatus), 0);
     PolicyStatus.cbSize := SizeOf(PolicyStatus);
+    { A False result means the policy check could not run, not that it
+      rejected the chain; only a completed check reports dwError. }
+    {$IFNDEF PRODUCTION}
+    if SChannelTestChainExecutionFailure = 2 then
+      AReport.ExecutionFailure := 'CertVerifyCertificateChainPolicy failed: '
+        + SChannelStatusText(LongWord(14 { ERROR_OUTOFMEMORY }))
+    else
+    {$ENDIF}
     if CertVerifyCertificateChainPolicy(
       PAnsiChar(PtrUInt(CERT_CHAIN_POLICY_SSL)), Chain, PolicyPara,
       PolicyStatus) then
-      AReport.PolicyError := PolicyStatus.dwError;
+      AReport.PolicyError := PolicyStatus.dwError
+    else
+      AReport.ExecutionFailure := 'CertVerifyCertificateChainPolicy failed: '
+        + SChannelStatusText(LongWord(Windows.GetLastError));
   finally
     CertFreeCertificateChain(Chain);
   end;
+end;
+
+{ An evaluation that could not run is an operational failure, which a
+  retry may overcome, never a verdict on the peer. }
+procedure RequireSChannelChainEvaluated(const AReport: TSChannelChainReport);
+begin
+  if AReport.ExecutionFailure <> '' then
+    raise ETransportSecurityError.CreateFmt(
+      'TLS certificate chain evaluation could not run: %s',
+      [AReport.ExecutionFailure]);
 end;
 
 function SChannelChainPolicyError(const AEngine: Pointer;
@@ -7484,6 +7581,7 @@ var
 begin
   SChannelEvaluateChain(AEngine, APeer, AHost, AServerAuthentication,
     AChainFlags, Report);
+  RequireSChannelChainEvaluated(Report);
   Result := Report.PolicyError;
 end;
 
@@ -7551,6 +7649,7 @@ var
 begin
   SChannelEvaluateAnchorChain(AAnchors, APeer, AHost, AServerAuthentication,
     False, Report);
+  RequireSChannelChainEvaluated(Report);
   Result := Report.PolicyError;
 end;
 
@@ -7561,7 +7660,7 @@ var
   ErrorCode: LongWord;
 begin
   if not Assigned(AAnchorStore) then
-    raise ETransportSecurityError.CreateFmt('%s: no trust anchors',
+    raise ETransportSecurityVerificationError.CreateFmt('%s: no trust anchors',
       [TLS_VERIFICATION_ERROR]);
   { The offline anchor evaluation runs first, so a server issued by a
     configured anchor is accepted without any network work in either mode.
@@ -7572,7 +7671,7 @@ begin
   if (ErrorCode <> 0) and (AOptions.TrustMode = tstmSystemAndAnchors) then
     ErrorCode := SChannelChainPolicyError(nil, APeer, AHost, True, 0);
   if ErrorCode <> 0 then
-    raise ETransportSecurityError.CreateFmt('%s: %s',
+    raise ETransportSecurityVerificationError.CreateFmt('%s: %s',
       [TLS_VERIFICATION_ERROR, SChannelStatusText(ErrorCode)]);
 end;
 
@@ -7589,7 +7688,7 @@ begin
   Peer := nil;
   if (QueryContextAttributesW(@Context, SECPKG_ATTR_REMOTE_CERT_CONTEXT,
      @Peer) <> SEC_E_OK) or not Assigned(Peer) then
-    raise ETransportSecurityError.CreateFmt(
+    raise ETransportSecurityVerificationError.CreateFmt(
       '%s: the server presented no certificate', [TLS_VERIFICATION_ERROR]);
   try
     VerifySChannelPeerCertificate(Peer, AHost, AOptions, AAnchorStore);
@@ -9498,9 +9597,26 @@ begin
     Result[I] := SChannelTestImportedKeyContainers[I];
 end;
 
+procedure TransportSecurityTestForceSChannelChainExecutionFailure(
+  const AStage: Integer);
+begin
+  SChannelTestChainExecutionFailure := AStage;
+end;
+
 function TransportSecurityTestVerifyServerChain(const ALeaf,
   AIntermediates: TBytes; const AHost: string;
   const AOptions: TTransportSecurityClientOptions): string;
+var
+  Refused: Boolean;
+begin
+  Result := TransportSecurityTestVerifyServerChain(ALeaf, AIntermediates,
+    AHost, AOptions, Refused);
+end;
+
+function TransportSecurityTestVerifyServerChain(const ALeaf,
+  AIntermediates: TBytes; const AHost: string;
+  const AOptions: TTransportSecurityClientOptions;
+  out ARefused: Boolean): string;
 const
   CERT_STORE_PROV_MEMORY = 2;
   CERT_STORE_ADD_USE_EXISTING = 2;
@@ -9534,11 +9650,15 @@ begin
           'Test peer intermediate is not a valid X.509 certificate');
     if Length(AOptions.TrustAnchors) > 0 then
       AnchorStore := CreateSChannelAnchorStore(AOptions.TrustAnchors);
+    ARefused := False;
     try
       VerifySChannelPeerCertificate(Leaf, AHost, AOptions, AnchorStore);
     except
       on E: ETransportSecurityError do
+      begin
         Result := E.Message;
+        ARefused := E is ETransportSecurityVerificationError;
+      end;
     end;
   finally
     if Assigned(Leaf) then

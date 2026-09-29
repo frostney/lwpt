@@ -17,7 +17,8 @@
     health    report Pascal complexity and optional Git hotspots
     agents    write/verify the agent-facing command reference in
               AGENTS.md (ADR-0027)
-    registry  initialize, serve, or accept publication on a self-hosted origin (ADR-0043, ADR-0049)
+    registry  initialize, serve, or accept publication on a self-hosted
+              origin, or publish to one (ADR-0043, ADR-0049)
 
   earlier (ADR-0015) there was an eighth subcommand, `export`, which
   extruded the embedded TestingPascalLibrary blob into the consumer's
@@ -61,6 +62,7 @@ uses
   LWPT.Core,
   LWPT.OutputRenderer,
   LWPT.ProcessTree,
+  LWPT.Registry.Publish,
   LWPT.Registry.Store;
 
 const
@@ -102,8 +104,13 @@ begin
   else
     StatusText := 'failed after ';
   if (ACompletion.ExitCode = 0) and WasSilent then
-    WriteLn(Output, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
-      StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds))
+  begin
+    { A command whose result is one outcome line (registry publish,
+      issue-token) prints only that line when silent. }
+    if not OutputRenderer.OutcomeWritten then
+      WriteLn(Output, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
+        StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds));
+  end
   else
     WriteLn(ErrOutput, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
       StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds));
@@ -469,11 +476,11 @@ end;
 function HandleRegistry(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 const
-  OPERATIONS = 'init, sync, verify, rotate-key, issue-token, revoke-token or serve';
+  OPERATIONS = 'init, sync, verify, rotate-key, publish, issue-token, revoke-token or serve';
 var
   Init: TLWPTRegistryInitOptions;
   FromKey, Packages, Actions, ExpiresDays, TokenLabel, TokenID, Operation,
-    OptionName: string;
+    OptionName, Origin, TokenEnvironment: string;
   Index: Integer;
   ServeConfigurationPresent, FromKeyPresent: Boolean;
 
@@ -484,8 +491,16 @@ var
       or SameText(AName, 'token-id');
   end;
 
+  function PublishOption(const AName: string): Boolean;
+  begin
+    Result := SameText(AName, 'origin') or SameText(AName, 'token-env');
+  end;
+
   function OwnOption(const AName: string): Boolean;
   begin
+    if SameText(Operation, 'publish') then
+      Exit(PublishOption(AName) or SameText(AName, 'key-id')
+        or SameText(AName, 'public-key') or SameText(AName, 'silent'));
     if SameText(AName, 'data-dir') or SameText(AName, 'silent') then Exit(True);
     if SameText(Operation, 'issue-token') then
       Exit(SameText(AName, 'packages') or SameText(AName, 'actions')
@@ -495,13 +510,22 @@ var
     Result := False;
   end;
 begin
-  if APositionals.Count <> 1 then
+  if APositionals.Count > 0 then Operation := APositionals[0]
+  else Operation := '';
+  if SameText(Operation, 'publish') and (APositionals.Count <> 2) then
+  begin
+    WriteLn(ErrOutput, ErrPrefix('registry'),
+      'invalid_configuration: publish expects exactly one archive path');
+    Exit(1);
+  end;
+  if not SameText(Operation, 'publish') and (APositionals.Count <> 1) then
   begin
     WriteLn(ErrOutput, ErrPrefix('registry'),
       'expected exactly one operation: ', OPERATIONS);
     Exit(1);
   end;
-  Operation := APositionals[0];
+  Origin := '';
+  TokenEnvironment := '';
   Init := RegistryInitDefaults;
   FromKey := '';
   Packages := '';
@@ -518,10 +542,14 @@ begin
       if AOptions[Index].Present then
       begin
         if (SameText(Operation, 'issue-token')
-          or SameText(Operation, 'revoke-token'))
+          or SameText(Operation, 'revoke-token')
+          or SameText(Operation, 'publish'))
           and not OwnOption(OptionName) then
           raise ELWPTRegistryError.CreateStable('invalid_configuration',
             Operation + ' does not accept --' + OptionName);
+        if PublishOption(OptionName) and not SameText(Operation, 'publish') then
+          raise ELWPTRegistryError.CreateStable('invalid_configuration',
+            '--' + OptionName + ' is accepted only by publish');
         if TokenOption(OptionName) and not SameText(Operation, 'issue-token')
           and not SameText(Operation, 'revoke-token') then
           raise ELWPTRegistryError.CreateStable('invalid_configuration',
@@ -569,6 +597,10 @@ begin
           TokenLabel := TStringOption(AOptions[Index]).ValueOr(TokenLabel)
         else if SameText(OptionName, 'token-id') then
           TokenID := TStringOption(AOptions[Index]).ValueOr(TokenID)
+        else if SameText(OptionName, 'origin') then
+          Origin := TStringOption(AOptions[Index]).ValueOr(Origin)
+        else if SameText(OptionName, 'token-env') then
+          TokenEnvironment := TStringOption(AOptions[Index]).ValueOr(TokenEnvironment)
         else if SameText(OptionName, 'from-key') then
         begin
           FromKey := TStringOption(AOptions[Index]).ValueOr(FromKey);
@@ -582,6 +614,9 @@ begin
       raise ELWPTRegistryError.CreateStable('invalid_configuration', '--from-key is rotate-key only')
     else if SameText(Operation, 'init') then
       Result := CmdRegistryInit(Init)
+    else if SameText(Operation, 'publish') then
+      Result := CmdRegistryPublish(APositionals[1], Origin, Init.KeyID,
+        Init.PublicKey, TokenEnvironment)
     else if SameText(Operation, 'issue-token') then
       Result := CmdRegistryIssueToken(Init.DataDirectory, Packages, Actions,
         ExpiresDays, TokenLabel)
@@ -940,7 +975,7 @@ begin
       + 'to v4', '',
       @HandleRepair, RepairOpts));
 
-    SetLength(RegistryOpts, 19);
+    SetLength(RegistryOpts, 21);
     RegistryOpts[0] := TStringOption.Create('data-dir',
       'Registry data directory (default: ' + REGISTRY_DEFAULT_DATA_DIR + ')');
     RegistryOpts[1] := TStringOption.Create('identity',
@@ -960,9 +995,9 @@ begin
     RegistryOpts[8] := TStringOption.Create('upstream',
       'Canonical upstream base URL (required for mirror init)');
     RegistryOpts[9] := TStringOption.Create('key-id',
-      'Pinned origin root ed25519 key ID (required for mirror init)');
+      'Pinned origin root ed25519 key ID (required for mirror init and publish)');
     RegistryOpts[10] := TStringOption.Create('public-key',
-      'Pinned origin root public key in hex: encoding (required for mirror init)');
+      'Pinned origin root public key in hex: encoding (required for mirror init and publish)');
     RegistryOpts[11] := TStringOption.Create('from-key',
       'Expected current signing key ID (required for rotate-key; guards retries)');
     RegistryOpts[12] := TStringOption.Create('max-store-bytes',
@@ -979,9 +1014,14 @@ begin
       'Printable token label shown by verify (issue-token only)');
     RegistryOpts[18] := TStringOption.Create('token-id',
       'ID of the token to revoke (revoke-token only)');
+    RegistryOpts[19] := TStringOption.Create('origin',
+      'Origin contact base URL to publish to (publish only; the archive path follows publish)');
+    RegistryOpts[20] := TStringOption.Create('token-env',
+      'Environment variable holding the publication token (publish only; default: '
+      + REGISTRY_DEFAULT_TOKEN_ENVIRONMENT + ')');
     Registry.Add(TSubcommand.Create('registry',
-      'Initialize, synchronize, verify, rotate keys, manage publication tokens or serve a self-hosted registry',
-      '<init|sync|verify|rotate-key|issue-token|revoke-token|serve> [--data-dir <path>] [configuration options]',
+      'Initialize, synchronize, verify, rotate keys, publish, manage publication tokens or serve a self-hosted registry',
+      '<init|sync|verify|rotate-key|publish|issue-token|revoke-token|serve> [<archive>] [--data-dir <path>] [configuration options]',
       @HandleRegistry, RegistryOpts));
 
     SetLength(InitOpts, 3);

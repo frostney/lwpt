@@ -48,6 +48,10 @@ type
     FOriginalError: TextRec;
     FOriginalOutput: TextRec;
     FOutputStream: TObject;
+    { Outcome lines kept through silent capture and written to the real
+      stdout when the command succeeds. }
+    FOutcome: string;
+    FOutcomeWritten: Boolean;
     procedure ClearInvocation;
     procedure PublishChild(const AStandardOutput,
       AStandardError: RawByteString);
@@ -59,6 +63,9 @@ type
     procedure FinishSilent(const AExitCode: Integer;
       const AElapsedMilliseconds: QWord);
     property Capturing: Boolean read FCapturing;
+    { True after FinishSilent wrote a retained outcome line; the outcome
+      then replaces the generic silent completion line. }
+    property OutcomeWritten: Boolean read FOutcomeWritten;
   end;
 
 procedure CaptureSilentChildOutput(const AStandardOutput,
@@ -69,6 +76,10 @@ function SilentOutputActive: Boolean;
 procedure SetActiveOutputRenderer(ARenderer: TLWPTOutputRenderer);
 procedure WriteCommandResult(const AText: string);
 procedure WriteCommandResultLine(const AText: string);
+{ One outcome line that --silent keeps: in silent mode it is held and
+  written to stdout after capture ends, only when the command succeeds, and
+  it replaces the generic completion line. Otherwise it is written at once. }
+procedure WriteCommandOutcomeLine(const AText: string);
 
 implementation
 
@@ -187,6 +198,14 @@ end;
 procedure WriteCommandResultLine(const AText: string);
 begin
   WriteCommandResult(AText + LineEnding);
+end;
+
+procedure WriteCommandOutcomeLine(const AText: string);
+begin
+  if SilentOutputActive then
+    ActiveRenderer.FOutcome := ActiveRenderer.FOutcome + AText + LineEnding
+  else
+    Write(Output, AText + LineEnding);
 end;
 
 constructor TLWPTEmergencyRing.Create(const ACapacity: SizeInt);
@@ -492,6 +511,13 @@ end;
 
 procedure TLWPTOutputRenderer.ClearInvocation;
 begin
+  { An outcome may be a credential (registry issue-token). }
+  if FOutcome <> '' then
+  begin
+    UniqueString(FOutcome);
+    FillChar(FOutcome[1], Length(FOutcome), 0);
+    FOutcome := '';
+  end;
   FOutputStream.Free;
   FOutputStream := nil;
   FErrorStream.Free;
@@ -512,6 +538,7 @@ begin
   if FCapturing then
     raise ELWPTOutputRendererError.Create(
       'silent-output journal is already active');
+  FOutcomeWritten := False;
   FCommandName := ACommandName;
   FCorrelationID := ACommandName + ':' + UIntToStr(GetTickCount64);
   Journal := TLWPTSilentJournal.Create;
@@ -608,6 +635,12 @@ begin
   end;
   try
     try
+      if (AExitCode = 0) and (FOutcome <> '') then
+      begin
+        Write(Output, FOutcome);
+        Flush(Output);
+        FOutcomeWritten := True;
+      end;
       if AExitCode <> 0 then
       begin
         if CloseError <> '' then

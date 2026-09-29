@@ -157,6 +157,10 @@ function ValidateRegistryKeyDocument(const ABytes: TBytes;
   const AExactSequence: Boolean = False): Int64;
 function ValidateRegistryCapabilities(const AContent, ARole: string;
   out AHasRotations: Boolean): Integer;
+{ True when capabilities already accepted by ValidateRegistryCapabilities
+  advertise publication-v1 with the bearer authentication scheme. }
+function RegistryCapabilitiesAcceptBearerPublication(
+  const AContent: string): Boolean;
 function RegistryURIIsCanonical(const AValue: string;
   const AAllowLocalhostHTTP: Boolean): Boolean;
 function RegistryHashIsCanonical(const AValue: string): Boolean;
@@ -1229,6 +1233,32 @@ begin
       and (Length(AuthSchemes) <> 0) then
       raise ELWPTRegistryError.CreateStable('read_only_origin_advertises_authentication',
         'a read-only origin cannot advertise authentication');
+  finally
+    Root.Free;
+  end;
+end;
+
+function RegistryCapabilitiesAcceptBearerPublication(
+  const AContent: string): Boolean;
+var
+  Root: TTOMLNode;
+  Values: TLWPTRegistryStringArray;
+  HasPublication, HasBearer: Boolean;
+  Index: Integer;
+begin
+  Root := ParseCanonical(AContent, PROGRAM_NAME + '-registry-capabilities-v1',
+    ['schema', 'protocol', 'hashes', 'signatures', 'schemas', 'features',
+     'auth_schemes', 'max_page_size']);
+  try
+    HasPublication := False;
+    Values := NodeStringArray(Root, 'features');
+    for Index := 0 to High(Values) do
+      if Values[Index] = 'publication-v1' then HasPublication := True;
+    HasBearer := False;
+    Values := NodeStringArray(Root, 'auth_schemes');
+    for Index := 0 to High(Values) do
+      if Values[Index] = 'bearer' then HasBearer := True;
+    Result := HasPublication and HasBearer;
   finally
     Root.Free;
   end;
