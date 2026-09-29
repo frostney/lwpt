@@ -67,6 +67,8 @@ type
     function LatestSequence: Integer;
     function PartFiles: Integer;
     function IncompleteAudits: Integer;
+    procedure ExpectCurl(const AExpected: string;
+      const AArguments: array of string);
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -524,11 +526,16 @@ end;
 
 { Status code of one curl request against the TLS listener; curl trusts the
   self-signed test identity only through --insecure. }
-function CurlStatus(const AArguments: array of string): string;
+{ One curl request against the TLS listener; curl trusts the self-signed
+  test identity only through --insecure. Returns the status code and keeps
+  the response body and curl's diagnostics for failure reports. }
+function CurlRequest(const AArguments: array of string; const ABodyPath: string;
+  out AStandardError: string): string;
 var
   ProcessInstance: TProcess;
   Argument: string;
 begin
+  AStandardError := '';
   ProcessInstance := TProcess.Create(nil);
   try
     {$IFDEF MSWINDOWS}
@@ -537,15 +544,12 @@ begin
     ProcessInstance.Executable := 'curl';
     {$ENDIF}
     ProcessInstance.Parameters.Add('--silent');
+    ProcessInstance.Parameters.Add('--show-error');
     ProcessInstance.Parameters.Add('--insecure');
     ProcessInstance.Parameters.Add('--max-time');
     ProcessInstance.Parameters.Add('20');
     ProcessInstance.Parameters.Add('--output');
-    {$IFDEF MSWINDOWS}
-    ProcessInstance.Parameters.Add('NUL');
-    {$ELSE}
-    ProcessInstance.Parameters.Add('/dev/null');
-    {$ENDIF}
+    ProcessInstance.Parameters.Add(ABodyPath);
     ProcessInstance.Parameters.Add('--write-out');
     ProcessInstance.Parameters.Add('%{http_code}');
     for Argument in AArguments do ProcessInstance.Parameters.Add(Argument);
@@ -555,16 +559,62 @@ begin
     while ProcessInstance.Running do
     begin
       Result := Result + DrainAvailableStream(ProcessInstance.Output, 4096);
-      DrainAvailableStream(ProcessInstance.Stderr, 4096);
+      AStandardError := AStandardError
+        + DrainAvailableStream(ProcessInstance.Stderr, 4096);
       Sleep(10);
     end;
     Result := Trim(Result + DrainAvailableStream(ProcessInstance.Output, 4096));
+    AStandardError := AStandardError
+      + DrainAvailableStream(ProcessInstance.Stderr, 4096);
     { Windows reports the exit status before it releases the child's
       handles; wait for the signalled handle before the scratch file curl
       read can be removed. }
     ProcessInstance.WaitOnExit;
   finally
     ProcessInstance.Free;
+  end;
+end;
+
+function CurlStatus(const AArguments: array of string): string;
+var
+  StandardError: string;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := CurlRequest(AArguments, 'NUL', StandardError);
+  {$ELSE}
+  Result := CurlRequest(AArguments, '/dev/null', StandardError);
+  {$ENDIF}
+end;
+
+procedure TRegistryPublicationE2E.ExpectCurl(const AExpected: string;
+  const AArguments: array of string);
+var
+  BodyPath, Status, StandardError, Body: string;
+begin
+  BodyPath := FScratch + '/curl-response.bin';
+  if FileExists(BodyPath) then DeleteFile(BodyPath);
+  Status := CurlRequest(AArguments, BodyPath, StandardError);
+  if Status <> AExpected then
+  begin
+    Body := '';
+    if FileExists(BodyPath) then Body := ReadBinaryFile(BodyPath);
+    WriteLn(StdErr, 'curl expected ', AExpected, ' but got ', Status,
+      '; response body: ', Body, '; curl stderr: ', StandardError);
+  end;
+  Expect<string>(Status).ToBe(AExpected);
+end;
+
+procedure WriteBinaryText(const APath, AText: string);
+var
+  Stream: TFileStream;
+begin
+  { Protocol bytes: exactly these characters, LF line endings included, on
+    every platform. }
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    if AText <> '' then Stream.WriteBuffer(AText[1], Length(AText));
+  finally
+    Stream.Free;
   end;
 end;
 
@@ -616,21 +666,19 @@ begin
     Stream.Free;
   end;
   Hex := Copy(RegistryArtifactHash(Archive), 8, 64);
-  Expect<string>(CurlStatus(['-X', 'PUT', '--data-binary', '@' + ArchivePath,
-    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/objects/sha256/' + Hex]))
-    .ToBe('201');
-  Expect<string>(CurlStatus(['-X', 'PUT', '--data-binary', '@' + ArchivePath,
-    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/objects/sha256/' + Hex]))
-    .ToBe('204');
+  ExpectCurl('201', ['-X', 'PUT', '--data-binary', '@' + ArchivePath,
+    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/objects/sha256/' + Hex]);
+  ExpectCurl('204', ['-X', 'PUT', '--data-binary', '@' + ArchivePath,
+    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/objects/sha256/' + Hex]);
+  { A text-mode write would turn LF into CRLF on Windows and make the record
+    non-canonical. }
   RecordPath := FScratch + '/tls-record.toml';
-  WriteTextFile(RecordPath, RecordText('tls-lib', '1.0.0', Archive));
-  Expect<string>(CurlStatus(['-X', 'PUT', '--data-binary', '@' + RecordPath,
-    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/packages/tls-lib/1.0.0']))
-    .ToBe('201');
-  Expect<string>(CurlStatus(['-X', 'PUT', '--data-binary', '@' + RecordPath,
-    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/packages/tls-lib/1.0.0']))
-    .ToBe('204');
-  Expect<string>(CurlStatus([Base + '/v1/objects/sha256/' + Hex])).ToBe('200');
+  WriteBinaryText(RecordPath, RecordText('tls-lib', '1.0.0', Archive));
+  ExpectCurl('201', ['-X', 'PUT', '--data-binary', '@' + RecordPath,
+    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/packages/tls-lib/1.0.0']);
+  ExpectCurl('204', ['-X', 'PUT', '--data-binary', '@' + RecordPath,
+    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/packages/tls-lib/1.0.0']);
+  ExpectCurl('200', [Base + '/v1/objects/sha256/' + Hex]);
   { A mutating head cut off by the peer over TLS is audited exactly once. }
   Truncated := TRawHTTPConnection.Create(FPort);
   try
