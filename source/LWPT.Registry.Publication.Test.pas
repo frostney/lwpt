@@ -727,10 +727,15 @@ var
   Archive: TBytes;
   Response: TRawHTTPResponse;
   Revoked, Expired, IssuedYesterday: string;
+  WrongLast: Char;
   TokenRecord: TLWPTRegistryToken;
   Audits: string;
 begin
   StartOrigin('', '', RegistryTimestampNow);
+  { A different base64url character keeps the credential well formed, so
+    the failure is a secret mismatch. }
+  WrongLast := 'A';
+  if FToken[Length(FToken)] = 'A' then WrongLast := 'B';
   Archive := Bytes('auth archive');
   Response := Request('PUT', '/v1/objects/sha256/' + SHA256Hex(Archive), '',
     Archive);
@@ -742,7 +747,7 @@ begin
   Expect<Integer>(Upload(Archive, PROGRAM_NAME + '_rt1_'
     + StringOfChar('0', 32) + '_' + StringOfChar('A', 43)).Status).ToBe(401);
   Expect<Integer>(Upload(Archive, Copy(FToken, 1, Length(FToken) - 1)
-    + Chr(Ord(FToken[Length(FToken)]) xor 1)).Status).ToBe(401);
+    + WrongLast).Status).ToBe(401);
   Revoked := IssueToken(['*'], [rtaPublish]);
   Expect<Integer>(Upload(Archive, Revoked).Status).ToBe(201);
   RevokeRegistryToken(FRoot, Copy(Revoked, Length(PROGRAM_NAME + '_rt1_') + 1, 32),
