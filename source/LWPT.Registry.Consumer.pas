@@ -133,6 +133,7 @@ type
     FSessions: TList;
     FLockTables: TLWPTRegistryLockTableArray;
     FArchivesRoot: string;
+    FNetworkFree: Boolean;
     function SessionAt(AIndex: Integer): TLWPTRegistrySession;
   public
     constructor Create(const ARoot: TManifest;
@@ -150,6 +151,10 @@ type
       install: a failure raises. }
     procedure PersistAcceptedState;
     property ArchivesRoot: string read FArchivesRoot;
+    { --frozen and --offline: sessions only bind identities from the manifest
+      and the lock. Acquisition raises instead of selecting a contact, and
+      SessionForIdentity never acquires to establish an identity. }
+    property NetworkFree: Boolean read FNetworkFree write FNetworkFree;
     function SessionForAlias(const AAlias: string): TLWPTRegistrySession;
     { The session for a record dependency's origin identity: a declared
       identity, or one established in this install or recorded in the lock.
@@ -1148,6 +1153,10 @@ var
   Floor: string;
 begin
   if FAttempted then Exit;
+  if FOwner.NetworkFree then
+    raise ELWPTRegistryError.CreateStable('registry_network_forbidden',
+      'registry ' + FDeclaration.Alias + ' cannot be acquired: network-free '
+      + 'verification never selects a contact');
   if FLockAmbiguity <> '' then
     raise EManifestError.Create(FLockAmbiguity);
   FAttempted := True;
@@ -1316,15 +1325,27 @@ end;
   concurrent install already relies on. The install still fails and rolls
   project state back (see MergeRegistryConsumerStateAt). }
 procedure TLWPTRegistryConsumer.PersistAcceptedState;
-var Index: Integer; Session: TLWPTRegistrySession;
+var
+  Index, Count: Integer;
+  Session: TLWPTRegistrySession;
+  Documents: TLWPTRegistryDocumentArray;
 begin
   for Index := 0 to FSessions.Count - 1 do
   begin
     Session := SessionAt(Index);
     if not Session.Acquired then Continue;
+    { The checkpoint and its signature join the verified history, so
+      --offline can restore every committed proof document by hash. }
+    Documents := Copy(Session.Verified.Documents);
+    Count := Length(Documents);
+    SetLength(Documents, Count + 2);
+    Documents[Count].Path := 'checkpoint';
+    Documents[Count].Bytes := Session.Verified.Proof.Checkpoint;
+    Documents[Count + 1].Path := 'signature';
+    Documents[Count + 1].Bytes := Session.Verified.Proof.Signature;
     try
       MergeRegistryConsumerState(Session.Identity, Session.Declaration.KeyId,
-        Session.UserAccepted, Session.ProofRotations, Session.Verified.Documents);
+        Session.UserAccepted, Session.ProofRotations, Documents);
     except
       on E: Exception do
         raise ELWPTRegistryError.CreateStable('registry_state_not_persisted',
@@ -1387,11 +1408,12 @@ begin
       Exit(Session);
   end;
   { An advertised identity may be established by acquiring a declaration
-    that omits it. }
+    that omits it; network-free modes only use the lock's bindings. }
   for Index := 0 to High(FRoot.Registries) do
   begin
     Session := SessionForAlias(FRoot.Registries[Index].Alias);
-    if (Session.Declaration.Identity = '') and not Session.Attempted then
+    if not FNetworkFree and (Session.Declaration.Identity = '')
+       and not Session.Attempted then
     begin
       Session.Acquire;
       if Session.Identity = AIdentity then Exit(Session);

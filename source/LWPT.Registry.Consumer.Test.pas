@@ -385,6 +385,27 @@ begin
   Result.PublicKey := ARegistry.PublicKey;
 end;
 
+{ The lock's claims for ASelection: its own bytes' hashes, and the one
+  record recorded as AName@AVersion with its signed archive. }
+function ClaimsOf(ARegistry: TSyntheticRegistry;
+  const ASelection: TLWPTRegistryLockedSelection;
+  const AName, AVersion: string): TLWPTRegistryLockedClaims;
+var Checkpoint: TLWPTUntrustedRegistryCheckpoint;
+begin
+  Checkpoint := InspectRegistryCheckpoint(ASelection.Checkpoint);
+  Result := Default(TLWPTRegistryLockedClaims);
+  Result.Checkpoint := SHA256BytesPrefixed(ASelection.Checkpoint);
+  Result.Signature := SHA256BytesPrefixed(ASelection.Signature);
+  Result.Snapshot := Checkpoint.Snapshot;
+  Result.KeyId := Checkpoint.KeyId;
+  Result.Sequence := Checkpoint.Sequence;
+  SetLength(Result.Records, 1);
+  Result.Records[0].RecordHash := SHA256BytesPrefixed(ASelection.Records[0]);
+  Result.Records[0].Name := AName;
+  Result.Records[0].Version := AVersion;
+  Result.Records[0].ArchiveHash := ARegistry.ArchiveHashOf(AName, AVersion);
+end;
+
 procedure TRegistryConsumerTests.TestLockedSelectionVerifiesWithoutHistory;
 var
   Synthetic: TSyntheticRegistry;
@@ -401,7 +422,7 @@ begin
     Index := Synthetic.Publish(RegistryStamp(-10 * 86400), RegistryStamp(-4 * 86400));
     Selection := SelectionOf(Synthetic, Index, Synthetic.RecordHash('json', '1.1.0'));
     Verified := VerifyRegistryLockedSelection(Selection, TrustOf(Synthetic),
-      SHA256BytesPrefixed(Selection.Checkpoint));
+      ClaimsOf(Synthetic, Selection, 'json', '1.1.0'));
     Expect<Int64>(Verified.Sequence).ToBe(2);
     Expect<string>(Verified.Packages[0].Version).ToBe('1.1.0');
   finally
@@ -417,15 +438,18 @@ var
   Message: string;
 
   function Failure(const ASelection: TLWPTRegistryLockedSelection;
-    const ATrust: TLWPTRegistryTrust; const AHash: string): string;
+    const ATrust: TLWPTRegistryTrust;
+    const AClaims: TLWPTRegistryLockedClaims): string;
   begin
     Result := '';
     try
-      VerifyRegistryLockedSelection(ASelection, ATrust, AHash);
+      VerifyRegistryLockedSelection(ASelection, ATrust, AClaims);
     except
       on E: Exception do Result := E.Message;
     end;
   end;
+
+var Claims: TLWPTRegistryLockedClaims;
 
 begin
   Synthetic := TSyntheticRegistry.Create('https://packages.example.com');
@@ -435,25 +459,56 @@ begin
     Index := Synthetic.Publish(RegistryStamp(-60), RegistryStamp(86400));
     Selection := SelectionOf(Synthetic, Index, Synthetic.RecordHash('json', '1.0.0'));
     { The recorded checkpoint hash must name these bytes. }
-    Message := Failure(Selection, TrustOf(Synthetic), 'sha256:' + StringOfChar('0', 64));
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Checkpoint := 'sha256:' + StringOfChar('0', 64);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
+    { So must the recorded signature hash. }
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Signature := 'sha256:' + StringOfChar('0', 64);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
+    { The recorded sequence, key, and snapshot are the checkpoint's. }
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Sequence := Claims.Sequence + 1;
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Snapshot := 'sha256:' + StringOfChar('1', 64);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
     Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
     { A different pin cannot verify the signature. }
     Message := Failure(Selection, TrustOf(Other),
-      SHA256BytesPrefixed(Selection.Checkpoint));
+      ClaimsOf(Synthetic, Selection, 'json', '1.0.0'));
     Expect<Boolean>(Message <> '').ToBe(True);
     { A record outside the signed snapshot is not a member. }
     Tampered := Selection;
+    { The outer array is shared by the record copy: copy it first. }
+    Tampered.Records := Copy(Selection.Records);
     Tampered.Records[0] := Copy(Selection.Records[0]);
     Tampered.Records[0][Length(Tampered.Records[0]) - 3] := Ord('X');
     Message := Failure(Tampered, TrustOf(Synthetic),
-      SHA256BytesPrefixed(Selection.Checkpoint));
+      ClaimsOf(Synthetic, Tampered, 'json', '1.0.0'));
     Expect<Boolean>(Pos('registry_record_not_in_snapshot', Message) > 0).ToBe(True);
+    { Record bytes must be the ones the lock names. }
+    Message := Failure(Tampered, TrustOf(Synthetic),
+      ClaimsOf(Synthetic, Selection, 'json', '1.0.0'));
+    Expect<Boolean>(Pos('locked_record_mismatch', Message) > 0).ToBe(True);
+    { A member record whose fields differ from the lock fails. }
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Records[0].Version := '1.0.1';
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_record_mismatch', Message) > 0).ToBe(True);
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Records[0].ArchiveHash := 'sha256:' + StringOfChar('2', 64);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_record_mismatch', Message) > 0).ToBe(True);
     { A snapshot that is not the checkpoint's fails. }
     Tampered := Selection;
     Tampered.Snapshot := Copy(Selection.Snapshot);
     Tampered.Snapshot[10] := Ord('X');
     Message := Failure(Tampered, TrustOf(Synthetic),
-      SHA256BytesPrefixed(Selection.Checkpoint));
+      ClaimsOf(Synthetic, Selection, 'json', '1.0.0'));
     Expect<Boolean>(Pos('snapshot_hash_mismatch', Message) > 0).ToBe(True);
   finally
     Other.Free;
@@ -484,7 +539,7 @@ begin
     Message := '';
     try
       VerifyRegistryLockedSelection(Selection, TrustOf(Synthetic),
-        SHA256BytesPrefixed(Selection.Checkpoint));
+        ClaimsOf(Synthetic, Selection, 'json', '1.0.0'));
     except
       on E: Exception do Message := E.Message;
     end;

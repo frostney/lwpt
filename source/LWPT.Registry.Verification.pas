@@ -223,17 +223,31 @@ type
     KeyId, Snapshot, PublishedAt, ExpiresAt: string;
     Packages: TLWPTRegistryPackageArray;
   end;
+  { What a lock records for one selected record. }
+  TLWPTRegistryLockedRecord = record
+    RecordHash, Name, Version, ArchiveHash: string;
+  end;
+  TLWPTRegistryLockedRecordArray = array of TLWPTRegistryLockedRecord;
+  { What a lock records for one origin's selection proof, and for each record
+    of TLWPTRegistryLockedSelection.Records, in the same order. }
+  TLWPTRegistryLockedClaims = record
+    Checkpoint, Signature, Snapshot, KeyId: string;
+    Sequence: Int64;
+    Records: TLWPTRegistryLockedRecordArray;
+  end;
 
-{ Network-free verification of a consumer's locked selection proof: the
-  checkpoint is the recorded one, its signature verifies under the key the
-  committed rotation chain reaches from the pin, the snapshot is the
-  checkpoint's, and every selected record is a member of that snapshot. It
-  walks no history and applies neither expiry nor the clock floor; the
-  caller compares the returned records with its lock (ADR-0051 decision 4). }
+{ Network-free verification of a consumer's locked selection proof against
+  the lock's claims: the checkpoint and signature bytes are the recorded ones,
+  the signature verifies under the key the committed rotation chain reaches
+  from the pin, the checkpoint's sequence, key, and snapshot are the recorded
+  ones, the snapshot bytes are the checkpoint's, and every selected record is
+  a member of that snapshot whose origin, name, version, and archive equal
+  the lock. It walks no history and applies neither expiry nor the clock
+  floor (ADR-0051 decision 4). }
 function VerifyRegistryLockedSelection(
   const ASelection: TLWPTRegistryLockedSelection;
   const ATrust: TLWPTRegistryTrust;
-  const ACheckpointHash: string): TLWPTVerifiedRegistrySelection;
+  const AClaims: TLWPTRegistryLockedClaims): TLWPTVerifiedRegistrySelection;
 {$IFDEF REGISTRY_TESTING}
 procedure SetRegistryVerificationLimitsForTesting(
   const ALimits: TLWPTRegistryVerificationLimits; const AEnabled: Boolean);
@@ -1711,8 +1725,10 @@ end;
 function VerifyRegistryLockedSelection(
   const ASelection: TLWPTRegistryLockedSelection;
   const ATrust: TLWPTRegistryTrust;
-  const ACheckpointHash: string): TLWPTVerifiedRegistrySelection;
+  const AClaims: TLWPTRegistryLockedClaims): TLWPTVerifiedRegistrySelection;
 var
+  Claimed: TLWPTRegistryLockedRecord;
+  Package: TLWPTRegistryPackage;
   Checkpoint: TLWPTUntrustedRegistryCheckpoint;
   Rotation: TLWPTUntrustedRegistryRotation;
   KeyId, PublicKey: string;
@@ -1728,11 +1744,23 @@ begin
     or not RegistryTrustRootIsValid(ATrust.KeyId, ATrust.PublicKey) then
     raise ELWPTRegistryError.CreateStable('invalid_trust_root',
       'origin identity or pinned root key is invalid');
-  if not RegistryHashIsCanonical(ACheckpointHash)
-    or (SHA256BytesPrefixed(ASelection.Checkpoint) <> ACheckpointHash) then
+  if not RegistryHashIsCanonical(AClaims.Checkpoint)
+    or (SHA256BytesPrefixed(ASelection.Checkpoint) <> AClaims.Checkpoint) then
     raise ELWPTRegistryError.CreateStable('locked_proof_state_mismatch',
       'retained checkpoint bytes differ from the recorded checkpoint');
+  if not RegistryHashIsCanonical(AClaims.Signature)
+    or (SHA256BytesPrefixed(ASelection.Signature) <> AClaims.Signature) then
+    raise ELWPTRegistryError.CreateStable('locked_proof_state_mismatch',
+      'retained signature bytes differ from the recorded signature');
+  if Length(ASelection.Records) <> Length(AClaims.Records) then
+    raise ELWPTRegistryError.CreateStable('locked_proof_state_mismatch',
+      'the retained records differ from the recorded selection');
   Checkpoint := InspectRegistryCheckpoint(ASelection.Checkpoint);
+  if (Checkpoint.Sequence <> AClaims.Sequence)
+    or (Checkpoint.KeyId <> AClaims.KeyId)
+    or (Checkpoint.Snapshot <> AClaims.Snapshot) then
+    raise ELWPTRegistryError.CreateStable('locked_proof_state_mismatch',
+      'the retained checkpoint differs from the recorded selection proof');
   if Checkpoint.Origin <> ATrust.Origin then
     raise ELWPTRegistryError.CreateStable('checkpoint_origin_mismatch',
       'checkpoint names a different origin');
@@ -1775,6 +1803,10 @@ begin
   for Index := 0 to High(ASelection.Records) do
   begin
     RecordHash := SHA256BytesPrefixed(ASelection.Records[Index]);
+    Claimed := AClaims.Records[Index];
+    if RecordHash <> Claimed.RecordHash then
+      raise ELWPTRegistryError.CreateStable('locked_record_mismatch',
+        'retained record bytes differ from the recorded record hash');
     Member := False;
     for RecordIndex := 0 to High(Members) do
       if Members[RecordIndex] = RecordHash then
@@ -1785,8 +1817,16 @@ begin
     if not Member then
       raise ELWPTRegistryError.CreateStable('registry_record_not_in_snapshot',
         'a selected record is not a member of the signed snapshot');
-    Result.Packages[Index] := ParseRegistryPackage(
+    Package := ParseRegistryPackage(
       RegistryBytesText(ASelection.Records[Index]), RecordHash, ATrust.Origin);
+    if (Package.Name <> Claimed.Name) or (Package.Version <> Claimed.Version)
+      or (Package.ArchiveHash <> Claimed.ArchiveHash) then
+      raise ELWPTRegistryError.CreateStable('locked_record_mismatch',
+        'signed record ' + RecordHash + ' is ' + Package.Name + '@'
+        + Package.Version + ' with archive ' + Package.ArchiveHash
+        + ', but the lock records ' + Claimed.Name + '@' + Claimed.Version
+        + ' with archive ' + Claimed.ArchiveHash);
+    Result.Packages[Index] := Package;
   end;
   Result.Sequence := Checkpoint.Sequence;
   Result.KeyId := Checkpoint.KeyId;
