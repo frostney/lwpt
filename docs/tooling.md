@@ -349,6 +349,9 @@ Each session holds an OS owner guard from before it becomes visible until final
 state is written. Successful completion removes compiler jobs and compiled hooks
 but retains stable job logs; `lwpt repair` removes only unlocked sessions and
 conservatively retains live guards even when their state file is malformed.
+Repair also deletes retired executable images (`.lwpt-retired-*.tmp`) that a
+Windows build publication left beside a declared build output because the
+replaced image was still running; images still in use stay and are reported.
 Relocated roots are atomically recorded in `.lwpt/session-roots`; repair reads
 only exact historical entries whose full project identity matches.
 

@@ -105,7 +105,20 @@ FPC driver produces:
 
 After FPC exits successfully, LWPT revalidates the build publication
 fingerprint under a short output-specific lock and atomically replaces
-`build/lwpt`. The full mode-flag sets are in
+`build/lwpt` (`build\lwpt.exe` on Windows).
+
+On Windows that destination is the image the rebuilding process is running
+from. `ReplaceFileW` swaps the path atomically, but Windows refuses to delete
+the old image while it runs. Build publication therefore renames the old
+image to a retired sibling (`build\.lwpt-retired-<pid>-<stamp>-<n>.tmp`) and
+reports success; the destination is never missing. Every later publication
+into that directory deletes retired images whose process has exited, and
+`lwpt repair` does the same for every declared build output directory. Only
+build publication tolerates an in-use old image: other atomic replacements
+of toolkit state still fail when their backup cannot be removed. Unix renames
+over the running executable and leaves nothing behind.
+
+The full mode-flag sets are in
 `TLWPTFPCCompilerDriver.BuildArguments`:
 
 | Mode | Flags |
@@ -182,7 +195,7 @@ bootstrap.bat          # Windows
 Both wrappers:
 
 1. Check whether `instantfpc` is on `PATH`.
-2. If yes, run `scripts/bootstrap.pas`, which invokes `fpc -Mdelphi -Sh <dev-flags> -FE build -Fu source -Fi source -Fu packages/<name>/source -Fi packages/<name>/source ... -o build/lwpt source/lwpt.pas` (one `-Fu` / `-Fi` pair per workspace package: `httpclient`, `cli`, `semver`, `toml`, `testing`) to produce the binary.
+2. If yes, run `scripts/bootstrap.pas`, which invokes `fpc -Mdelphi -Sh <dev-flags> -FE build -Fu source -Fi source -Fu packages/<name>/source -Fi packages/<name>/source ... -o build/lwpt source/lwpt.pas` (one `-Fu` / `-Fi` pair per workspace package: `httpclient`, `cli`, `semver`, `toml`, `testing`) to produce the binary. On Windows the output is `build/lwpt.exe`, the same name the fallback and `lwpt build` publish.
 3. If `instantfpc` is not found, the wrapper falls back to a direct `fpc` invocation with the same flag set.
 
 Both code paths are dev-mode only; release builds always go through `./build/lwpt build --mode release`.

@@ -40,6 +40,42 @@ begin
   Result := ExpandFileName(IncludeTrailingPathDelimiter(AProjectRoot) + APath);
 end;
 
+{ AtomicReplaceExecutable retires an old executable image it cannot delete
+  because a process still runs it (Windows self-hosted rebuilds). Sweep each
+  declared build output directory once; images still in use stay. }
+procedure RemoveRetiredBuildOutputs(const ACtx: TManifestContext;
+  out ARemoved, ARetained: Integer);
+var
+  Directories: TStringList;
+  OutputPath: string;
+  Retained, i: Integer;
+begin
+  ARemoved := 0;
+  ARetained := 0;
+  Directories := TStringList.Create;
+  try
+    Directories.Sorted := True;
+    Directories.Duplicates := dupIgnore;
+    for i := 0 to High(ACtx.Manifest.BuildEntries) do
+    begin
+      OutputPath := ACtx.Manifest.BuildEntries[i].Output;
+      if OutputPath = '' then
+        OutputPath := ChangeFileExt(ACtx.Manifest.BuildEntries[i].Source, '');
+      if OutputPath = '' then Continue;
+      Directories.Add(ExtractFileDir(
+        ResolveRepairPath(ACtx.ProjectRoot, OutputPath)));
+    end;
+    for i := 0 to Directories.Count - 1 do
+    begin
+      if not DirectoryExists(Directories[i]) then Continue;
+      Inc(ARemoved, RemoveRetiredExecutables(Directories[i], Retained));
+      Inc(ARetained, Retained);
+    end;
+  finally
+    Directories.Free;
+  end;
+end;
+
 procedure CmdRepair(const AManifestPath: string);
 var
   Ctx : TManifestContext;
@@ -50,6 +86,7 @@ var
   WorkerSnapshot : TLWPTWorkerBudgetSnapshot;
   CacheReport: TLWPTCacheRepairReport;
   Reclaimed, i : Integer;
+  RetiredRemoved, RetiredInUse : Integer;
 begin
   Ctx := LoadManifestContext(AManifestPath);
   TmpRoot := ResolveRepairPath(Ctx.ProjectRoot, ResolveTmpDir(Ctx.Manifest));
@@ -80,6 +117,10 @@ begin
 
   WriteLn('repair: removed ', SessionsRemoved, ' abandoned build session(s), ',
     SessionsRetained, ' live session(s) retained');
+
+  RemoveRetiredBuildOutputs(Ctx, RetiredRemoved, RetiredInUse);
+  WriteLn('repair: removed ', RetiredRemoved, ' retired executable image(s), ',
+    RetiredInUse, ' still in use');
 
   Reclaimed := RepairWorkerBudget;
   WorkerSnapshot := GetWorkerBudgetSnapshot;

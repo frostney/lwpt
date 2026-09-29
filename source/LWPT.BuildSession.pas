@@ -1556,7 +1556,9 @@ begin
       end;
       if CurrentFingerprint <> AExpectedFingerprint then
         Exit(bprStale);
-      if not AtomicReplaceFile(ACandidatePath, Destination) then
+      { The destination may be the running LWPT (self-hosted rebuild) or
+        another live executable; see AtomicReplaceExecutable. }
+      if not AtomicReplaceExecutable(ACandidatePath, Destination) then
         raise ELWPTError.CreateFmt(
           'could not atomically publish "%s" to "%s"; the completed '
           + 'candidate remains private', [ACandidatePath, Destination]);

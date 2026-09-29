@@ -18,6 +18,9 @@ uses
   cthreads,
   BaseUnix,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   Classes,
   SysUtils,
 
@@ -378,9 +381,12 @@ type
     procedure TestSiblingOfBareFilenameStaysRelative;
     procedure TestMoveFileReplacesExistingBareDestination;
     procedure TestMoveDirReplacesExistingBareDestination;
+    procedure TestRetiredExecutableSweepMatchesOnlyRetiredImages;
     {$IFDEF MSWINDOWS}
     procedure TestReplaceFileAtDeepExistingDestination;
     procedure TestReplaceFileRejectsDirectorySource;
+    procedure TestReplaceExecutableRetiresMappedImage;
+    procedure TestReplaceFileStaysStrictForMappedImage;
     {$ENDIF}
     {$IFDEF UNIX}
     procedure TestMoveFileReplacesExistingAcrossFilesystems;
@@ -3487,6 +3493,67 @@ begin
     end;
 end;
 
+function CountRetiredExecutables(const APath: string): Integer;
+var
+  SR: TSearchRec;
+begin
+  Result := 0;
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(APath) + '*',
+      faAnyFile, SR) = 0 then
+    try
+      repeat
+        if IsRetiredExecutableName(SR.Name) then Inc(Result);
+      until SysUtils.FindNext(SR) <> 0;
+    finally
+      SysUtils.FindClose(SR);
+    end;
+end;
+
+{$IFDEF MSWINDOWS}
+const
+  SEC_IMAGE_TEST = $01000000;
+  GENERIC_EXECUTE_TEST = $20000000;
+
+type
+  { An executable mapped as an image section, the way the loader maps a
+    running program: the file handle closes once the section exists. }
+  TMappedImage = record
+    Section: THandle;
+    View: Pointer;
+  end;
+
+function MapExecutableImage(const APath: string;
+  out AImage: TMappedImage): Boolean;
+var
+  FileHandle: THandle;
+begin
+  AImage.Section := 0;
+  AImage.View := nil;
+  FileHandle := Windows.CreateFileW(PWideChar(UnicodeString(
+    ExpandFileName(APath))), GENERIC_READ or GENERIC_EXECUTE_TEST,
+    FILE_SHARE_READ or FILE_SHARE_DELETE, nil, OPEN_EXISTING, 0, 0);
+  if FileHandle = INVALID_HANDLE_VALUE then Exit(False);
+  try
+    AImage.Section := Windows.CreateFileMappingW(FileHandle, nil,
+      PAGE_READONLY or SEC_IMAGE_TEST, 0, 0, nil);
+  finally
+    Windows.CloseHandle(FileHandle);
+  end;
+  if AImage.Section = 0 then Exit(False);
+  AImage.View := Windows.MapViewOfFile(AImage.Section, FILE_MAP_READ,
+    0, 0, 0);
+  Result := AImage.View <> nil;
+end;
+
+procedure UnmapExecutableImage(var AImage: TMappedImage);
+begin
+  if AImage.View <> nil then Windows.UnmapViewOfFile(AImage.View);
+  if AImage.Section <> 0 then Windows.CloseHandle(AImage.Section);
+  AImage.View := nil;
+  AImage.Section := 0;
+end;
+{$ENDIF}
+
 {$IFDEF UNIX}
 function FindCrossDeviceBase(const AReferencePath: string;
   out AReason: string): string;
@@ -3596,7 +3663,101 @@ begin
   Expect<Integer>(CountDirEntries('.')).ToBe(1);
 end;
 
+procedure TAtomicMoveBareDestination.
+  TestRetiredExecutableSweepMatchesOnlyRetiredImages;
+const
+  RetiredName = RetiredExecutablePrefix + '4242-1f1huft3e-7'
+    + TmpPathExtension;
+var
+  Retained: Integer;
+begin
+  Expect<Boolean>(IsRetiredExecutableName(RetiredName)).ToBe(True);
+  Expect<Boolean>(IsRetiredExecutableName(RetiredExecutablePrefix
+    + '4242-1F1-7' + TmpPathExtension)).ToBe(False);
+  Expect<Boolean>(IsRetiredExecutableName(RetiredExecutablePrefix
+    + '4242-1f1' + TmpPathExtension)).ToBe(False);
+  Expect<Boolean>(IsRetiredExecutableName(RetiredExecutablePrefix
+    + '4242-1f1-7-8' + TmpPathExtension)).ToBe(False);
+  Expect<Boolean>(IsRetiredExecutableName('.r-4242-1f1huft3e-7'
+    + TmpPathExtension)).ToBe(False);
+
+  WriteBareFile('app', 'current');
+  WriteBareFile(RetiredName, 'retired');
+  { An in-flight replacement backup and a look-alike stay untouched. }
+  WriteBareFile('.r-4242-1f1huft3e-8' + TmpPathExtension, 'in flight');
+  WriteBareFile(RetiredExecutablePrefix + 'notes' + TmpPathExtension, 'user');
+  ForceDirectories(RetiredExecutablePrefix + '4242-1f1huft3e-9'
+    + TmpPathExtension);
+
+  Expect<Integer>(RemoveRetiredExecutables('.', Retained)).ToBe(1);
+  Expect<Integer>(Retained).ToBe(0);
+  Expect<Boolean>(FileExists(RetiredName)).ToBe(False);
+  Expect<Integer>(CountDirEntries('.')).ToBe(4);
+  Expect<Integer>(RemoveRetiredExecutables('missing-dir', Retained)).ToBe(0);
+  Expect<Integer>(Retained).ToBe(0);
+end;
+
 {$IFDEF MSWINDOWS}
+procedure TAtomicMoveBareDestination.TestReplaceExecutableRetiresMappedImage;
+var
+  Image: TMappedImage;
+  Retained: Integer;
+begin
+  ForceDirectories('images');
+  Expect<Boolean>(CopyFileContent(ParamStr(0), 'images\app.exe')).ToBe(True);
+  WriteBareFile('images\incoming.tmp', 'fresh');
+  Expect<Boolean>(MapExecutableImage('images\app.exe', Image)).ToBe(True);
+  try
+    { A self-hosted rebuild replaces the image it is running from. The
+      replacement commits and the undeletable old image is retired. }
+    Expect<Boolean>(AtomicReplaceExecutable('images\incoming.tmp',
+      'images\app.exe')).ToBe(True);
+    Expect<string>(ReadBareFile('images\app.exe')).ToBe('fresh');
+    Expect<Boolean>(FileExists('images\incoming.tmp')).ToBe(False);
+    Expect<Integer>(CountRetiredExecutables('images')).ToBe(1);
+    Expect<Integer>(CountDirEntries('images')).ToBe(2);
+    { A sweep while the image is still mapped retains it. }
+    Expect<Integer>(RemoveRetiredExecutables('images', Retained)).ToBe(0);
+    Expect<Integer>(Retained).ToBe(1);
+  finally
+    UnmapExecutableImage(Image);
+  end;
+
+  { Once the image is released, the next executable replacement in the
+    directory removes the retired image. }
+  WriteBareFile('images\incoming.tmp', 'newer');
+  Expect<Boolean>(AtomicReplaceExecutable('images\incoming.tmp',
+    'images\app.exe')).ToBe(True);
+  Expect<string>(ReadBareFile('images\app.exe')).ToBe('newer');
+  Expect<Integer>(CountDirEntries('images')).ToBe(1);
+end;
+
+procedure TAtomicMoveBareDestination.TestReplaceFileStaysStrictForMappedImage;
+var
+  Image: TMappedImage;
+  Raised: Boolean;
+begin
+  ForceDirectories('images');
+  Expect<Boolean>(CopyFileContent(ParamStr(0), 'images\app.exe')).ToBe(True);
+  WriteBareFile('images\incoming.tmp', 'fresh');
+  Expect<Boolean>(MapExecutableImage('images\app.exe', Image)).ToBe(True);
+  try
+    { Toolkit state keeps the strict contract: an undeletable backup is
+      reported, never silently retired. }
+    Raised := False;
+    try
+      AtomicReplaceFile('images\incoming.tmp', 'images\app.exe');
+    except
+      on E: EExtractError do Raised := True;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<string>(ReadBareFile('images\app.exe')).ToBe('fresh');
+    Expect<Integer>(CountRetiredExecutables('images')).ToBe(0);
+  finally
+    UnmapExecutableImage(Image);
+  end;
+end;
+
 procedure TAtomicMoveBareDestination.TestReplaceFileAtDeepExistingDestination;
 const
   DestinationName = 'destination-with-existing-bytes.txt';
@@ -3684,11 +3845,17 @@ begin
     TestMoveFileReplacesExistingBareDestination);
   Test('bare-dirname destination with existing directory is replaced',
     TestMoveDirReplacesExistingBareDestination);
+  Test('retired-image sweep removes only retired executable images',
+    TestRetiredExecutableSweepMatchesOnlyRetiredImages);
   {$IFDEF MSWINDOWS}
   Test('deep existing destination is replaced without a longer-path backup',
     TestReplaceFileAtDeepExistingDestination);
   Test('file replacement rejects a directory source',
     TestReplaceFileRejectsDirectorySource);
+  Test('executable replacement retires a mapped image and cleans it later',
+    TestReplaceExecutableRetiresMappedImage);
+  Test('file replacement stays strict when its backup is a mapped image',
+    TestReplaceFileStaysStrictForMappedImage);
   {$ENDIF}
   {$IFDEF UNIX}
   if FCrossDeviceBase <> '' then
