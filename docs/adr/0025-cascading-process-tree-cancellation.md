@@ -125,6 +125,24 @@ terminal status frame. A missing, failed, or late terminal frame escalates to
 `TerminateJobObject`. Nested console callbacks acknowledge the broadcast but
 leave pipe, registry, and Job Object work to that control thread.
 
+Forwarding threads never outlive the process-tree unit. Its finalization runs
+before the runtime units the threads rely on (Classes, SysUtils, the heap and
+thread-local storage) and stops every forwarder in order. First it sets a stop
+flag. It then waits until no handler is between its stop check and its wake-up.
+A handler that sees the flag gives the signal the disposition that forwarding
+displaced; on Windows it lets the default handler end the process with
+`STATUS_CONTROL_C_EXIT`. Next it wakes each forwarder: the Unix thread by a
+zero sentinel queued behind any signal already in the pipe, the console thread
+through its event (it forwards only when the handler has recorded a control
+event), and the inherited-control thread, which polls its pipe without
+blocking, by its terminated flag after one more read pass. Finally it joins
+each thread. A forwarder that has already committed to forwarding still ends
+the process itself, as before. If an idle forwarder does not stop within five
+seconds, the process ends at once with its chosen exit code instead of
+finalizing beside the live thread. Without this, a short-lived command that
+failed fast crashed or hung in runtime finalization while a forwarder was
+starting or blocked (#330).
+
 The root fixes the descendant-reap deadline at 100 ms and the ancestor ACK
 deadline at 250 ms. Every level forwards those absolute `GetTickCount64`
 values unchanged, so depth cannot restart either allowance. Each level fans
