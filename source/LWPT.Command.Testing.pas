@@ -444,10 +444,12 @@ destructor TTestScheduler.Destroy;
 var
   i: Integer;
 begin
-  FExpectedInventory.Free;
-  FReporter.Free;
+  { Workers use the reporter, inventory, and budget session, so join them
+    before freeing anything they share. }
   for i := 0 to FWorkers.Count - 1 do TTestWorker(FWorkers[i]).Free;
   FWorkers.Free;
+  FExpectedInventory.Free;
+  FReporter.Free;
   FBudgetSession.Free;
   DoneCriticalSection(FCriticalSection);
   inherited Destroy;
@@ -1333,14 +1335,32 @@ end;
 
 procedure TTestScheduler.Run;
 var
-  i: Integer;
+  i, Started: Integer;
   Event: TTestProgressEvent;
   InvocationStartedAt, NowTick: QWord;
   HeartbeatEvent: TLWPTHeartbeatEvent;
 begin
   InvocationStartedAt := GetTickCount64;
   FReporter.StartHeartbeatClock(InvocationStartedAt, InvocationStartedAt);
-  for i := 0 to FWorkers.Count - 1 do TTestWorker(FWorkers[i]).Start;
+  Started := 0;
+  try
+    while Started < FWorkers.Count do
+    begin
+      TTestWorker(FWorkers[Started]).Start;
+      Inc(Started);
+    end;
+  except
+    { A worker that failed to start must not leave its started siblings
+      running the queue unobserved: cancel and join them first. }
+    EnterCriticalSection(FCriticalSection);
+    try
+      CancelPendingAndActiveLocked;
+    finally
+      LeaveCriticalSection(FCriticalSection);
+    end;
+    for i := 0 to Started - 1 do TTestWorker(FWorkers[i]).WaitFor;
+    raise;
+  end;
   try
     repeat
       while NextProgressEvent(Event) do
