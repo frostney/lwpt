@@ -113,7 +113,10 @@ the old image while it runs. Build publication therefore renames the old
 image to a retired sibling (`build\.lwpt-retired-<pid>-<stamp>-<n>.tmp`) and
 reports success; the destination is never missing. Every later publication
 into that directory deletes retired images whose process has exited, and
-`lwpt repair` does the same for every declared build output directory. Only
+`lwpt repair` does the same for every declared build output directory. Both
+sweeps delete by name only in directories inside the project that are reached
+without a symlink or junction on any component, and never follow or remove a
+link; `lwpt repair` reports a skipped redirected or external directory. Only
 build publication tolerates an in-use old image: other atomic replacements
 of toolkit state still fail when their backup cannot be removed. Unix renames
 over the running executable and leaves nothing behind.

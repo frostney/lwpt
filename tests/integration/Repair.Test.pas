@@ -20,7 +20,9 @@
        is absent.
     7. Shared-cache corruption and incomplete state are repaired repeatably.
     8. Transitive build references with missing artifacts are removed.
-    9. Retired executable images beside build outputs are removed. }
+    9. Retired executable images beside build outputs are removed.
+   10. A build output directory reached through a link is never swept
+       (Unix; directory symlinks need no privilege there). }
 
 program Repair.Test;
 
@@ -29,6 +31,7 @@ program Repair.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
   SysUtils,
@@ -60,6 +63,9 @@ type
     procedure TestRepairRemovesTransitiveBuildReference;
     procedure TestRepairReclaimsWorkerRequests;
     procedure TestRepairRemovesRetiredExecutableImages;
+    {$IFDEF UNIX}
+    procedure TestRepairSkipsRedirectedOutputDirectory;
+    {$ENDIF}
   end;
 
 procedure TRepairE2E.SetupScratchProject;
@@ -370,6 +376,38 @@ begin
   end;
 end;
 
+{$IFDEF UNIX}
+procedure TRepairE2E.TestRepairSkipsRedirectedOutputDirectory;
+var
+  BuildDir, SavedBuildDir, ForeignDir, ForeignPath: string;
+  R: TLwptResult;
+begin
+  { Redirecting the output directory must not let repair delete matching
+    files in a directory the project does not own. }
+  BuildDir := FScratch + '/build';
+  SavedBuildDir := FScratch + '/build.saved';
+  ForeignDir := FScratch + '/foreign-output';
+  ForeignPath := ForeignDir + '/' + RetiredExecutablePrefix
+    + '4242-1f1huft3e-7' + TmpPathExtension;
+  WriteTextFile(ForeignPath, 'not owned by the project');
+  if DirectoryExists(BuildDir) then
+    Expect<Boolean>(RenameFile(BuildDir, SavedBuildDir)).ToBe(True);
+  Expect<Integer>(FpSymlink(PChar(ForeignDir), PChar(BuildDir))).ToBe(0);
+  try
+    R := RunRepair;
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(FileExists(ForeignPath)).ToBe(True);
+    Expect<Boolean>(Pos('skipped retired-image sweep', R.Stdout) > 0)
+      .ToBe(True);
+  finally
+    FpUnlink(PChar(BuildDir));
+    if DirectoryExists(SavedBuildDir) then
+      RenameFile(SavedBuildDir, BuildDir);
+    RecursiveDelete(ForeignDir);
+  end;
+end;
+{$ENDIF}
+
 procedure TRepairE2E.SetupTests;
 begin
   Test('repair on a clean tree is a no-op exit 0',
@@ -390,6 +428,10 @@ begin
     TestRepairReclaimsWorkerRequests);
   Test('repair removes retired executable images beside build outputs',
     TestRepairRemovesRetiredExecutableImages);
+  {$IFDEF UNIX}
+  Test('repair never sweeps a link-redirected build output directory',
+    TestRepairSkipsRedirectedOutputDirectory);
+  {$ENDIF}
 end;
 
 begin

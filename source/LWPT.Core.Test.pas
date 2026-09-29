@@ -20,6 +20,7 @@ uses
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Windows,
+  Process,
   {$ENDIF}
   Classes,
   SysUtils,
@@ -372,6 +373,9 @@ type
     FCrossDeviceBase: string;
     FCrossDeviceSkipReason: string;
     {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    FJunctionSkipReason: string;
+    {$ENDIF}
   protected
     procedure AfterAll; override;
     procedure BeforeAll; override;
@@ -382,14 +386,18 @@ type
     procedure TestMoveFileReplacesExistingBareDestination;
     procedure TestMoveDirReplacesExistingBareDestination;
     procedure TestRetiredExecutableSweepMatchesOnlyRetiredImages;
+    procedure TestRetiredExecutableSweepStaysInsideOwnerRoot;
     {$IFDEF MSWINDOWS}
     procedure TestReplaceFileAtDeepExistingDestination;
     procedure TestReplaceFileRejectsDirectorySource;
     procedure TestReplaceExecutableRetiresMappedImage;
     procedure TestReplaceFileStaysStrictForMappedImage;
+    procedure TestRetiredExecutableSweepRefusesJunctions;
     {$ENDIF}
     {$IFDEF UNIX}
     procedure TestMoveFileReplacesExistingAcrossFilesystems;
+    procedure TestRetiredExecutableSweepSkipsFileLinks;
+    procedure TestRetiredExecutableSweepRefusesDirectoryLinks;
     {$ENDIF}
   end;
 
@@ -3689,13 +3697,182 @@ begin
   ForceDirectories(RetiredExecutablePrefix + '4242-1f1huft3e-9'
     + TmpPathExtension);
 
-  Expect<Integer>(RemoveRetiredExecutables('.', Retained)).ToBe(1);
+  Expect<Integer>(RemoveRetiredExecutables('.', '.', Retained)).ToBe(1);
   Expect<Integer>(Retained).ToBe(0);
   Expect<Boolean>(FileExists(RetiredName)).ToBe(False);
   Expect<Integer>(CountDirEntries('.')).ToBe(4);
-  Expect<Integer>(RemoveRetiredExecutables('missing-dir', Retained)).ToBe(0);
+  Expect<Integer>(RemoveRetiredExecutables('.', 'missing-dir', Retained))
+    .ToBe(0);
   Expect<Integer>(Retained).ToBe(0);
 end;
+
+const
+  SweepFixtureName = RetiredExecutablePrefix + '4242-1f1huft3e-7'
+    + TmpPathExtension;
+
+procedure TAtomicMoveBareDestination.
+  TestRetiredExecutableSweepStaysInsideOwnerRoot;
+var
+  Retained: Integer;
+begin
+  ForceDirectories('outside');
+  WriteBareFile('outside' + PathDelim + SweepFixtureName, 'foreign');
+  ForceDirectories('project' + PathDelim + 'build');
+  WriteBareFile('project' + PathDelim + 'build' + PathDelim
+    + SweepFixtureName, 'retired');
+
+  { A directory outside the owner root is never swept, however it is
+    spelled. }
+  Expect<Boolean>(RetiredExecutableSweepAllowed('project', 'outside'))
+    .ToBe(False);
+  Expect<Boolean>(RetiredExecutableSweepAllowed('project',
+    'project' + PathDelim + '..' + PathDelim + 'outside')).ToBe(False);
+  Expect<Integer>(RemoveRetiredExecutables('project', 'outside', Retained))
+    .ToBe(0);
+  Expect<Integer>(Retained).ToBe(0);
+  Expect<Boolean>(FileExists('outside' + PathDelim + SweepFixtureName))
+    .ToBe(True);
+
+  Expect<Boolean>(RetiredExecutableSweepAllowed('project', 'project'))
+    .ToBe(True);
+  Expect<Integer>(RemoveRetiredExecutables('project',
+    'project' + PathDelim + 'build', Retained)).ToBe(1);
+  Expect<Boolean>(FileExists('project' + PathDelim + 'build' + PathDelim
+    + SweepFixtureName)).ToBe(False);
+end;
+
+{$IFDEF UNIX}
+function LinkEntryExists(const APath: string): Boolean;
+var
+  Info: BaseUnix.Stat;
+begin
+  Result := (FpLstat(APath, Info) = 0) and FpS_ISLNK(Info.st_mode);
+end;
+
+procedure TAtomicMoveBareDestination.TestRetiredExecutableSweepSkipsFileLinks;
+const
+  LiveLink = RetiredExecutablePrefix + '4242-1f1huft3e-8' + TmpPathExtension;
+  DanglingLink = RetiredExecutablePrefix + '4242-1f1huft3e-9'
+    + TmpPathExtension;
+var
+  Retained: Integer;
+begin
+  WriteBareFile('link-target', 'user-owned');
+  WriteBareFile(SweepFixtureName, 'retired');
+  Expect<Integer>(FpSymlink('link-target', LiveLink)).ToBe(0);
+  Expect<Integer>(FpSymlink('missing-target', DanglingLink)).ToBe(0);
+
+  { Only the regular retired image goes; matching links, live or dangling,
+    are neither followed nor removed. }
+  Expect<Integer>(RemoveRetiredExecutables('.', '.', Retained)).ToBe(1);
+  Expect<Integer>(Retained).ToBe(0);
+  Expect<Boolean>(FileExists(SweepFixtureName)).ToBe(False);
+  Expect<Boolean>(LinkEntryExists(LiveLink)).ToBe(True);
+  Expect<Boolean>(LinkEntryExists(DanglingLink)).ToBe(True);
+  Expect<string>(ReadBareFile('link-target')).ToBe('user-owned');
+end;
+
+procedure TAtomicMoveBareDestination.
+  TestRetiredExecutableSweepRefusesDirectoryLinks;
+var
+  Retained: Integer;
+begin
+  ForceDirectories('project');
+  ForceDirectories('elsewhere/bin');
+  WriteBareFile('elsewhere/' + SweepFixtureName, 'foreign');
+  WriteBareFile('elsewhere/bin/' + SweepFixtureName, 'foreign');
+  Expect<Integer>(FpSymlink('../elsewhere', 'project/build')).ToBe(0);
+  Expect<Integer>(FpSymlink('../elsewhere', 'project/redirect')).ToBe(0);
+
+  { The output directory itself is a link. }
+  Expect<Boolean>(RetiredExecutableSweepAllowed('project', 'project/build'))
+    .ToBe(False);
+  Expect<Integer>(RemoveRetiredExecutables('project', 'project/build',
+    Retained)).ToBe(0);
+  { A link on an ancestor redirects an ordinary-looking directory. }
+  Expect<Boolean>(RetiredExecutableSweepAllowed('project',
+    'project/redirect/bin')).ToBe(False);
+  Expect<Integer>(RemoveRetiredExecutables('project', 'project/redirect/bin',
+    Retained)).ToBe(0);
+  Expect<Boolean>(FileExists('elsewhere/' + SweepFixtureName)).ToBe(True);
+  Expect<Boolean>(FileExists('elsewhere/bin/' + SweepFixtureName))
+    .ToBe(True);
+end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+{ mklink /J reports success under Wine without creating anything, so the
+  result is the junction's presence, not the exit status. }
+function TryCreateJunction(const ALink, ATarget: string): Boolean;
+var
+  Command: TProcess;
+begin
+  Command := TProcess.Create(nil);
+  try
+    Command.Executable := SysUtils.GetEnvironmentVariable('COMSPEC');
+    if Command.Executable = '' then Command.Executable := 'cmd.exe';
+    Command.Parameters.Add('/C');
+    Command.Parameters.Add('mklink /J "' + ExpandFileName(ALink) + '" "'
+      + ExpandFileName(ATarget) + '"');
+    Command.Options := [poWaitOnExit, poNoConsole];
+    try
+      Command.Execute;
+    except
+      Exit(False);
+    end;
+  finally
+    Command.Free;
+  end;
+  Result := IsDirSymlinkOrJunction(ALink);
+end;
+
+function JunctionSkipReason: string;
+var
+  Probe: string;
+begin
+  Probe := ExpandFileName('build\tests\tmp\junction-probe-'
+    + IntToStr(GetProcessID));
+  ForceDirectories(Probe + '\target');
+  try
+    if TryCreateJunction(Probe + '\link', Probe + '\target') then
+      Result := ''
+    else
+      Result := 'directory junctions cannot be created on this host';
+  finally
+    Windows.RemoveDirectoryW(PWideChar(UnicodeString(Probe + '\link')));
+    WipeDir(Probe);
+  end;
+end;
+
+procedure TAtomicMoveBareDestination.
+  TestRetiredExecutableSweepRefusesJunctions;
+var
+  Retained: Integer;
+begin
+  ForceDirectories('project');
+  ForceDirectories('elsewhere\bin');
+  WriteBareFile('elsewhere\' + SweepFixtureName, 'foreign');
+  WriteBareFile('elsewhere\bin\' + SweepFixtureName, 'foreign');
+  Expect<Boolean>(TryCreateJunction('project\build', 'elsewhere'))
+    .ToBe(True);
+  Expect<Boolean>(TryCreateJunction('project\redirect', 'elsewhere'))
+    .ToBe(True);
+  try
+    Expect<Integer>(RemoveRetiredExecutables('project', 'project\build',
+      Retained)).ToBe(0);
+    Expect<Integer>(RemoveRetiredExecutables('project',
+      'project\redirect\bin', Retained)).ToBe(0);
+    Expect<Boolean>(FileExists('elsewhere\' + SweepFixtureName)).ToBe(True);
+    Expect<Boolean>(FileExists('elsewhere\bin\' + SweepFixtureName))
+      .ToBe(True);
+  finally
+    Windows.RemoveDirectoryW(PWideChar(UnicodeString(
+      ExpandFileName('project\build'))));
+    Windows.RemoveDirectoryW(PWideChar(UnicodeString(
+      ExpandFileName('project\redirect'))));
+  end;
+end;
+{$ENDIF}
 
 {$IFDEF MSWINDOWS}
 procedure TAtomicMoveBareDestination.TestReplaceExecutableRetiresMappedImage;
@@ -3711,13 +3888,14 @@ begin
     { A self-hosted rebuild replaces the image it is running from. The
       replacement commits and the undeletable old image is retired. }
     Expect<Boolean>(AtomicReplaceExecutable('images\incoming.tmp',
-      'images\app.exe')).ToBe(True);
+      'images\app.exe', '.')).ToBe(True);
     Expect<string>(ReadBareFile('images\app.exe')).ToBe('fresh');
     Expect<Boolean>(FileExists('images\incoming.tmp')).ToBe(False);
     Expect<Integer>(CountRetiredExecutables('images')).ToBe(1);
     Expect<Integer>(CountDirEntries('images')).ToBe(2);
     { A sweep while the image is still mapped retains it. }
-    Expect<Integer>(RemoveRetiredExecutables('images', Retained)).ToBe(0);
+    Expect<Integer>(RemoveRetiredExecutables('.', 'images', Retained))
+      .ToBe(0);
     Expect<Integer>(Retained).ToBe(1);
   finally
     UnmapExecutableImage(Image);
@@ -3727,7 +3905,7 @@ begin
     directory removes the retired image. }
   WriteBareFile('images\incoming.tmp', 'newer');
   Expect<Boolean>(AtomicReplaceExecutable('images\incoming.tmp',
-    'images\app.exe')).ToBe(True);
+    'images\app.exe', '.')).ToBe(True);
   Expect<string>(ReadBareFile('images\app.exe')).ToBe('newer');
   Expect<Integer>(CountDirEntries('images')).ToBe(1);
 end;
@@ -3839,6 +4017,9 @@ begin
   FCrossDeviceBase := FindCrossDeviceBase(GetCurrentDir,
     FCrossDeviceSkipReason);
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  FJunctionSkipReason := JunctionSkipReason;
+  {$ENDIF}
   Test('sibling of a bare filename resolves under the current directory',
     TestSiblingOfBareFilenameStaysRelative);
   Test('bare-filename destination with existing file is replaced',
@@ -3847,6 +4028,8 @@ begin
     TestMoveDirReplacesExistingBareDestination);
   Test('retired-image sweep removes only retired executable images',
     TestRetiredExecutableSweepMatchesOnlyRetiredImages);
+  Test('retired-image sweep stays inside its owner root',
+    TestRetiredExecutableSweepStaysInsideOwnerRoot);
   {$IFDEF MSWINDOWS}
   Test('deep existing destination is replaced without a longer-path backup',
     TestReplaceFileAtDeepExistingDestination);
@@ -3856,8 +4039,18 @@ begin
     TestReplaceExecutableRetiresMappedImage);
   Test('file replacement stays strict when its backup is a mapped image',
     TestReplaceFileStaysStrictForMappedImage);
+  if FJunctionSkipReason = '' then
+    Test('retired-image sweep refuses junction-redirected directories',
+      TestRetiredExecutableSweepRefusesJunctions)
+  else
+    Skip('retired-image sweep refuses junction-redirected directories',
+      TestRetiredExecutableSweepRefusesJunctions, FJunctionSkipReason);
   {$ENDIF}
   {$IFDEF UNIX}
+  Test('retired-image sweep never follows or removes file links',
+    TestRetiredExecutableSweepSkipsFileLinks);
+  Test('retired-image sweep refuses link-redirected directories',
+    TestRetiredExecutableSweepRefusesDirectoryLinks);
   if FCrossDeviceBase <> '' then
     Test('existing file is atomically replaced across filesystems',
       TestMoveFileReplacesExistingAcrossFilesystems)

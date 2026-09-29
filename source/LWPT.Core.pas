@@ -113,13 +113,25 @@ function  AtomicReplaceFile(const ASrc, ADst: string): Boolean;
   an undeletable old image is renamed to a retired-image sibling and the
   replacement still succeeds; each later executable replacement in that
   directory, and `lwpt repair`, removes retired images no longer in use.
-  Identical to AtomicReplaceFile on Unix. }
-function  AtomicReplaceExecutable(const ASrc, ADst: string): Boolean;
+  The sweep runs only where RetiredExecutableSweepAllowed(AOwnerRoot, ...)
+  holds for the destination directory. Identical to AtomicReplaceFile on
+  Unix. }
+function  AtomicReplaceExecutable(const ASrc, ADst,
+  AOwnerRoot: string): Boolean;
 { True for names only AtomicReplaceExecutable produces for retired images. }
 function  IsRetiredExecutableName(const AName: string): Boolean;
+{ A retired-image sweep deletes by name alone, so it is allowed only in an
+  existing directory that lies lexically inside AOwnerRoot and that LWPT
+  reaches without following a link: no component from AOwnerRoot down to
+  ADirectory, inclusive, may be a symlink or junction. The owner root itself
+  is the caller's trust anchor. }
+function  RetiredExecutableSweepAllowed(const AOwnerRoot,
+  ADirectory: string): Boolean;
 { Delete every retired executable image in ADirectory that is no longer in
-  use; returns the removed count and reports those still in use. }
-function  RemoveRetiredExecutables(const ADirectory: string;
+  use; returns the removed count and reports those still in use. Links are
+  never followed or removed, and a directory refused by
+  RetiredExecutableSweepAllowed is left untouched. }
+function  RemoveRetiredExecutables(const AOwnerRoot, ADirectory: string;
   out ARetained: Integer): Integer;
 procedure AtomicWriteText(const ADst: string; const ATmpRoot: string; const AContent: TStringList);
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
@@ -901,7 +913,37 @@ begin
   Result := (Field = 2) and (FieldLength[2] > 0);
 end;
 
-function RemoveRetiredExecutables(const ADirectory: string;
+function RetiredExecutableSweepAllowed(const AOwnerRoot,
+  ADirectory: string): Boolean;
+var
+  Root, Dir, Current, Component: string;
+  i: Integer;
+begin
+  Result := False;
+  if (AOwnerRoot = '') or (ADirectory = '') then Exit;
+  Root := ExcludeTrailingPathDelimiter(ExpandFileName(AOwnerRoot));
+  Dir := ExcludeTrailingPathDelimiter(ExpandFileName(ADirectory));
+  if not PathContains(Root, Dir) then Exit;
+  { Walk every component below the root: a link anywhere on the way
+    redirects the sweep into a directory LWPT does not own. }
+  Current := Root;
+  Component := '';
+  for i := Length(IncludeTrailingPathDelimiter(Root)) + 1 to Length(Dir) + 1 do
+    if (i > Length(Dir)) or (Dir[i] = '/') or (Dir[i] = '\') then
+    begin
+      if Component <> '' then
+      begin
+        Current := IncludeTrailingPathDelimiter(Current) + Component;
+        if IsDirSymlinkOrJunction(Current) then Exit;
+      end;
+      Component := '';
+    end
+    else
+      Component := Component + Dir[i];
+  Result := DirectoryExists(Dir) and not IsDirSymlinkOrJunction(Dir);
+end;
+
+function RemoveRetiredExecutables(const AOwnerRoot, ADirectory: string;
   out ARetained: Integer): Integer;
 var
   Dir, Full: string;
@@ -911,14 +953,21 @@ begin
   ARetained := 0;
   Dir := ADirectory;
   if Dir = '' then Dir := '.';
+  if not RetiredExecutableSweepAllowed(AOwnerRoot, Dir) then Exit;
+  { faSymLink makes Unix FindFirst lstat entries, so a link reports itself
+    instead of its target and is skipped below. }
   if SysUtils.FindFirst(IncludeTrailingPathDelimiter(Dir)
-    + RetiredExecutablePrefix + '*' + TmpPathExtension, faAnyFile,
-    Search) <> 0 then Exit;
+    + RetiredExecutablePrefix + '*' + TmpPathExtension,
+    faAnyFile or faSymLink, Search) <> 0 then Exit;
   try
     repeat
       if not IsRetiredExecutableName(Search.Name) then Continue;
       if (Search.Attr and (faDirectory or faSymLink)) <> 0 then Continue;
       Full := IncludeTrailingPathDelimiter(Dir) + Search.Name;
+      if IsDirSymlinkOrJunction(Full) then Continue;
+      { Revalidate the directory before each deletion so a link swapped in
+        during the scan stops the sweep. }
+      if not RetiredExecutableSweepAllowed(AOwnerRoot, Dir) then Break;
       {$IFDEF MSWINDOWS}
       if Windows.DeleteFileW(PWideChar(WindowsExtendedPath(Full))) then
       {$ELSE}
@@ -1520,7 +1569,8 @@ begin
   Result := ReplaceFileInOneOperation(ASrc, ADst, False);
 end;
 
-function AtomicReplaceExecutable(const ASrc, ADst: string): Boolean;
+function AtomicReplaceExecutable(const ASrc, ADst,
+  AOwnerRoot: string): Boolean;
 {$IFDEF MSWINDOWS}
 var
   Retained: Integer;
@@ -1530,7 +1580,8 @@ begin
   {$IFDEF MSWINDOWS}
   { Earlier self-hosted rebuilds retire the image they ran from; once that
     process exits its retired image becomes deletable. }
-  if Result then RemoveRetiredExecutables(ExtractFileDir(ADst), Retained);
+  if Result then
+    RemoveRetiredExecutables(AOwnerRoot, ExtractFileDir(ADst), Retained);
   {$ENDIF}
 end;
 

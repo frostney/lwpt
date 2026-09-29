@@ -352,6 +352,8 @@ conservatively retains live guards even when their state file is malformed.
 Repair also deletes retired executable images (`.lwpt-retired-*.tmp`) that a
 Windows build publication left beside a declared build output because the
 replaced image was still running; images still in use stay and are reported.
+It never follows or removes links and skips, with a message, any output
+directory outside the project or reached through a symlink or junction.
 Relocated roots are atomically recorded in `.lwpt/session-roots`; repair reads
 only exact historical entries whose full project identity matches.
 

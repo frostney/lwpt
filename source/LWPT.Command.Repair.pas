@@ -42,7 +42,9 @@ end;
 
 { AtomicReplaceExecutable retires an old executable image it cannot delete
   because a process still runs it (Windows self-hosted rebuilds). Sweep each
-  declared build output directory once; images still in use stay. }
+  declared build output directory once; images still in use stay. A
+  directory outside the project or reached through a link is reported and
+  never swept. }
 procedure RemoveRetiredBuildOutputs(const ACtx: TManifestContext;
   out ARemoved, ARetained: Integer);
 var
@@ -68,7 +70,15 @@ begin
     for i := 0 to Directories.Count - 1 do
     begin
       if not DirectoryExists(Directories[i]) then Continue;
-      Inc(ARemoved, RemoveRetiredExecutables(Directories[i], Retained));
+      if not RetiredExecutableSweepAllowed(ACtx.ProjectRoot,
+        Directories[i]) then
+      begin
+        WriteLn('repair: skipped retired-image sweep of ', Directories[i],
+          ' (outside the project or reached through a link)');
+        Continue;
+      end;
+      Inc(ARemoved, RemoveRetiredExecutables(ACtx.ProjectRoot,
+        Directories[i], Retained));
       Inc(ARetained, Retained);
     end;
   finally
