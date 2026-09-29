@@ -33,7 +33,8 @@ decision 4), and specifies the consumer side of the
   per-origin table records the checkpoint that the selection was verified
   against. The signed documents that prove inclusion are committed next to
   the archives. `--frozen` and `--offline` then verify registry identity
-  offline from the manifest pin, and never construct a transport.
+  offline from the manifest pin, re-derive each module tree from its
+  authenticated archive, and never construct a transport.
 - Accepted registry state and the clock-rollback floor live in two places:
   per-user state, which rises monotonically across projects, and the lock's
   per-origin table, which covers fresh machines and CI. Acquisition must
@@ -110,9 +111,15 @@ These facts decide whether registry entries can extend schema v3:
 - **No offline verification shape for a consumer.** The shipped locked-proof
   mode needs the complete snapshot history. A consumer project does not
   retain it.
-- **Dependency-bearing publications are refused.** Under ADR-0049 decision
-  4, `registry publish` refuses an archive whose `lwpt.toml` declares
-  `[dependencies]` until this ADR defines registry dependency sources.
+- **Remote publication is accepted but not implemented.** ADR-0049 is
+  accepted, but `registry publish` does not exist yet: the CLI offers
+  `init|sync|verify|rotate-key|serve` (`source/lwpt.pas:916`), and the
+  in-process `Publish` hard-codes `dependencies = []`
+  (`source/LWPT.Registry.Store.pas:2986`). ADR-0049 decision 4, which
+  refuses archives whose `lwpt.toml` declares `[dependencies]` until this
+  ADR defines registry dependency sources, is therefore an accepted contract
+  still pending implementation under
+  [#54](https://github.com/frostney/lwpt/issues/54).
 - **`install --offline` does not yet cover registry dependencies.** It shipped
   in PR #283 for git-host, direct-URL, local, and workspace dependencies
   (`tests/integration/InstallGitGraph.Test.pas:41-65`). The PR left
@@ -272,13 +279,34 @@ records (decision 3):
     inside the state directory.
   - Keying by the pin as well as the identity prevents a project with a
     stale pin from poisoning another project's state.
-- **Project lock state.** The lock's per-origin table records the checkpoint
-  that the current selection was verified against. On a machine with no
-  per-user state, such as fresh CI, it is the prior.
-- **Acquisition prior.** It is the newer of the two records, and the new head
-  must extend both. Both snapshots must lie on its verified history, or the
-  result is `checkpoint_equivocation`. The clock floor is the later of the
-  user floor and the locked `published_at`.
+- **Project lock state.** The lock's per-origin table holds two separate
+  things (see "Lockfile representation"):
+  - the **selection proof**: the checkpoint that the current selection was
+    verified against, backed by committed documents; and
+  - the **high-water state**: the highest accepted sequence with its
+    snapshot, checkpoint hash, key, and times, plus `clockFloor`, the
+    highest `published_at` ever accepted.
+
+  They differ because acquisition can advance without changing the
+  selection, and because a later checkpoint may carry an earlier
+  `published_at` while the floor keeps the historical maximum
+  (`registry-spec.md:444-457`; `Verification.pas:1616`). On a machine with
+  no per-user state, such as fresh CI, the high-water state is the prior.
+- **Acquisition prior.** It is the newer of the per-user state and the
+  lock's high-water state, and the new head must extend both, as well as
+  the selection proof's snapshot. Each must lie on its verified history, or
+  the result is `checkpoint_equivocation`. The clock floor is the later of
+  the per-user `clock_floor` and the lock's `clockFloor`.
+- **What the lock can and cannot prove.** The high-water fields are
+  unsigned, trusted project state, like the rest of the lock. Editing them
+  can only weaken protection for that checkout or cause a denial of
+  service; it cannot introduce trust, because keys must still be reached
+  from the pin. Signatures also cannot detect a checkout whose proof
+  documents and lock were replaced together by an older authentic pair: on
+  fresh CI that older state verifies. The committed state supplies
+  authenticity, not an independently remembered minimum. Reviewing lock
+  diffs, and per-user state on long-lived machines, remain the controls for
+  project-state rollback.
 - **`--frozen` and `--offline`** apply neither the floor nor expiry. They
   follow the protocol's locked-proof exception.
 - **Corrupt state.** Corrupt per-user state fails acquisition, naming the
@@ -413,15 +441,35 @@ signature = "sha256:..."
 publishedAt = "2026-09-29T00:00:00Z"
 expiresAt = "2026-10-06T00:00:00Z"
 rotations = ["sha256:...", "sha256:...", "sha256:..."]  # document, old, new per rotation
+acceptedSequence = 57                                   # high-water state
+acceptedSnapshot = "sha256:..."
+acceptedCheckpoint = "sha256:..."
+acceptedKeyId = "ed25519:..."
+acceptedPublishedAt = "2026-10-20T00:00:00Z"
+acceptedExpiresAt = "2026-10-27T00:00:00Z"
+acceptedRotations = ["sha256:..."]
+clockFloor = "2026-10-20T00:00:00Z"                    # highest published_at accepted
 ```
 
-- **No rewrite without cause.** An origin's table and entries are carried
-  forward byte for byte unless:
+The keys from `keyId` through `rotations` are the selection proof. The
+`accepted*` keys and `clockFloor` are the high-water state, with the same
+meaning as `TLWPTRegistryAcceptedState`. The high-water state is never
+behind the selection proof, and never moves backwards.
+
+- **When the selection proof changes.** An origin's selection proof and
+  entries are carried forward byte for byte unless:
   - the set of selected records for that origin changes;
   - the pin changes; or
   - the retained proof fails verification.
+- **When the high-water state advances.** The transaction first computes
+  the new lock with every origin's high-water state unchanged. If that lock
+  differs from the old one in any byte, for any reason, it is written with
+  every origin's high-water state set to the merged maximum of the old
+  lock, the per-user state, and this install's acquisitions. If it is
+  byte-identical, the file is not written at all.
 
-  Checkpoint renewals therefore do not rewrite the lock. Per-user state still
+  Checkpoint renewals alone therefore never rewrite the lock, while any
+  lock change carries the project's floor forward. Per-user state still
   advances on every acquisition.
 - **A yanked locked version.** When a locked version is yanked upstream and a
   re-record is needed, the entry takes the new record of the same identity.
@@ -461,9 +509,10 @@ rotations = ["sha256:...", "sha256:...", "sha256:..."]  # document, old, new per
 
 ### `--frozen`
 
-`--frozen` stays read-only and network-free: no contact is selected and no
-transport is constructed. For each registry node it runs the existing
-identity, fingerprint, constraint, archive, and tree checks, and in addition:
+`--frozen` stays network-free: no contact is selected and no transport is
+constructed. It changes no committed state, lockfile, or cfg. For each
+registry node it runs the existing identity, fingerprint, constraint,
+archive, and tree checks, and in addition:
 
 1. The manifest's pin for the node's origin has the same key ID as the lock's
    `trustKeyId`. When a declaration omits `identity`, the lock supplies the
@@ -478,10 +527,27 @@ identity, fingerprint, constraint, archive, and tree checks, and in addition:
    - the record's origin, name, version, and archive equal the lock.
 
    It walks no history (decision 4).
-4. The graph edges of a registry node come from its committed record. The
+4. The installed module tree is authenticated, not only the archive. The
+   existing tree check compares the installed tree with the lock's
+   `computedHash` (`LWPT.Install.pas:4023`), which is unsigned: a pull
+   request could edit a unit and recompute it. For each registry node,
+   `--frozen` therefore extracts the proof-authenticated archive under the
+   declared `include` and `exclude` policy into a private, uniquely named
+   scratch directory below `.lwpt/tmp/`, hashes it with `HashTree`, and
+   requires that hash to equal both the installed tree's hash and
+   `computedHash`. The scratch directory is removed on exit. Frozen
+   verification still skips the recovery and cleanup of other `tmp/`
+   state, and an interrupted run's residue is reclaimed by the next
+   materializing install or `lwpt repair`. No network is used.
+5. The graph edges of a registry node come from its committed record. The
    frozen graph therefore equals the online one.
-5. Expiry and the clock floor are not applied. An expired proof is reported
+6. Expiry and the clock floor are not applied. An expired proof is reported
    for information only.
+
+The same gap exists for git-host and direct-URL sources. There it is an
+existing limitation by design: their `archiveHash` is unsigned too, so
+re-deriving the tree from the archive would add no authenticity. Closing it
+for those kinds is out of scope.
 
 ### `--offline` (#226)
 
@@ -490,6 +556,10 @@ any registry client exists. `--offline` runs the same verification as
 `--frozen`, and then materializes the state:
 
 - **Archives** come from the committed archive or the CAS.
+- **Modules** are always re-extracted from the proof-authenticated archive
+  under the declared extraction policy. The staged tree's hash must equal
+  `computedHash`, and the staged tree replaces the installed one, so an
+  edited unit is detected even when `computedHash` was recomputed to match.
 - **Missing proof documents** come from the per-user `registry-documents`
   store, verified by hash, and are published with the modules and cfg.
 - **The lockfile** is left byte-identical.
@@ -528,12 +598,23 @@ any registry client exists. `--offline` runs the same verification as
 ### Dependency-bearing publication
 
 This lifts [ADR-0049](0049-registry-remote-publication.md) decision 4
-(decision 10):
+(decision 10). It specifies behavior for `registry publish`, which ADR-0049
+accepted but #54 has not yet implemented; that implementation is a
+prerequisite for these rules and for the publication end-to-end tests.
 
 - **Mapping.** `registry publish` maps the archive manifest's
   `[dependencies]` to record `dependencies`.
 - **Only registry sources.** Every entry must be a `registry:` source.
   Anything else fails with `unsupported_dependencies`.
+- **No extraction filters.** A protocol 1 record dependency carries only
+  `origin`, `name`, and `version`, and the canonical decoder accepts exactly
+  that (`Verification.pas:1026`). A dependency with `include` or `exclude`
+  would lose its filter in the record, so consumers could install other
+  units or hit source conflicts the publisher never saw. Such a dependency
+  fails with `unsupported_dependencies`. Protocol 1 is not extended.
+  Consumers therefore install record-derived dependencies unfiltered; a root
+  dependency on the same package with its own filters has a different
+  source identity and conflicts, as today.
 - **Aliases.** They resolve through the archive manifest's own
   `[registries]`, which must declare `identity` explicitly. There is no
   endpoint-advertised identity at publish time.
@@ -571,6 +652,14 @@ amendment below in the same change as the code it describes.
     the snapshot hash, record membership, the record fields, and archive
     identity without retained history. The mirror's retained proof still
     verifies full history. Neither applies expiry or the clock floor.
+  - **Trust roots and key rotation (decision 2).** The paragraph stating
+    that initial trust pins an origin identity and a key out of band
+    (`registry-spec.md:513-515`) gains a consumer exception: a consumer
+    may pin only the key and take the identity that its contacts
+    advertise, accepted only after a checkpoint that verifies through that
+    key names it, and never replaced once locked. Mirrors keep the
+    configured-identity requirement unchanged: `registry init --role
+    mirror` still requires an explicit origin identity with the key.
   - **Contact selection and failover.** Contacts from user configuration
     precede manifest mirrors, and consumer acquisition follows no redirects:
     a 3xx is a request-layer failure.
@@ -610,7 +699,9 @@ amendment below in the same change as the code it describes.
 Deterministic tests run in the `lwpt-testing` build against local
 `registry serve` origins and mirrors (`tests/support/Tests.RegistryOrigin.pas`,
 `Tests.RegistryServer.pas`) and the v1 conformance corpus. The CI matrix runs
-them on all six release targets.
+them on all six release targets. Rows that publish through
+`registry publish` depend on the #54 implementation of ADR-0049; until it
+lands, consumer tests seed origins through the in-process test publisher.
 
 | Acceptance criterion | Evidence |
 | --- | --- |
@@ -623,7 +714,7 @@ them on all six release targets.
 | #55: contact selection and failover | Scripted contacts. A request failure or 3xx advances; an expired, older, or renewal-rolled-back contact advances; a trust failure on the first contact aborts, and the second contact receives zero requests; all-stale produces the stale diagnostic; all request failures reuse a satisfying locked selection with a warning and fail without one (decision 8); a clock behind the floor aborts before any request. The archive is fetched only from the contact that produced the accepted proof. |
 | #54 amendment: inclusion, consistency, stale checkpoints, malformed proofs, offline and frozen | A record missing from the head snapshot fails. A head that does not extend the per-user or locked snapshot is `checkpoint_equivocation`. Non-canonical documents and malformed envelopes are rejected. Stale-checkpoint cases are covered above; offline and frozen cases below. |
 | #62: the lock records enough for network-free frozen verification | Clone the project into a fresh directory with an empty cache and state directory; `--frozen` passes with a transport seam counting zero requests. |
-| #62: `--frozen` succeeds offline and fails on drift | Each mutation fails with its named error and changes nothing: flipping an archive byte, editing a module file, editing `registryRecord`, `checkpoint`, or `trustKeyId`, flipping a byte in a proof document, deleting a proof document, changing the manifest pin, schema version 2. An expired proof still passes. |
+| #62: `--frozen` succeeds offline and fails on drift | Each mutation fails with its named error and changes nothing: flipping an archive byte, editing a module file, editing `registryRecord`, `checkpoint`, or `trustKeyId`, flipping a byte in a proof document, deleting a proof document, changing the manifest pin, schema version 2. A coordinated tamper, editing a unit under `.lwpt/modules/json` and recomputing `computedHash` to match, fails because the tree re-extracted from the authenticated archive differs; the same tamper under `--offline` fails before publication. An expired proof still passes. |
 | #62: every client platform; localhost HTTP test-only; remote HTTPS | Six-target CI. A release-build test rejects an `http://localhost` contact at load, and an `http://` non-localhost contact is rejected in both builds. The HTTPS path uses the committed test root through the test-only anchor seam (ADR-0049 decision 7). |
 | #62: existing behavior unchanged | The existing install, offline, frozen, and commit-pin suites pass unchanged, and lock bytes for projects without registry dependencies are golden-compared. |
 | #62: the ADR records syntax, defaults, trust, and schema | This ADR. |
@@ -634,7 +725,10 @@ them on all six release targets.
 | #226: corruption rejected, not fetched around | A flipped archive, a flipped proof document, and a flipped CAS object each fail with zero requests. |
 | #226: manifest and lock drift fails | A changed range, alias identity, or pin. |
 | #226: lockfile byte-identical; normal and frozen unchanged | The lock hash is compared before and after, and the frozen and normal registry suites above pass. |
-| Per-user state | Two projects share an origin and the floor never decreases. Corrupt state fails and names the file. Two concurrent installs merge monotonically under the lease. On an empty state directory, the lock supplies the prior and the floor. |
+| Per-user state | Two projects share an origin and the floor never decreases. Corrupt state fails and names the file. Two concurrent installs merge monotonically under the lease. |
+| Fresh-CI restoration of the high-water state | With an empty state directory, an online install uses the lock's `accepted*` state and `clockFloor` as the prior: a contact serving a checkpoint older than `acceptedSequence` is stale, a clock behind `clockFloor` aborts before any request, and a later checkpoint whose `published_at` is earlier than `clockFloor` leaves the floor unchanged. A renewal-only install leaves the lock byte-identical; an install that changes any lock byte advances every origin's high-water state to the merged maximum. |
+| Where registry dependencies may be declared (decision 5) | A workspace member declaring `registry:corp/json` installs through the root's `[registries.corp]`; a member whose own `[registries.corp]` names a different identity or pin fails at load. A git-host, URL, or local dependency whose `lwpt.toml` declares a `registry:` dependency fails with the actionable error, and nothing is published. |
+| Publication refuses unsupported dependencies (requires #54) | Archives whose `lwpt.toml` declares a git-host dependency, a `registry:` dependency with `include` or `exclude`, a non-canonical constraint, or an alias without explicit `identity` each fail locally with `unsupported_dependencies` before any connection. A dependency-bearing archive without those issues publishes a record whose dependencies equal the mapped manifest. |
 | Limits | A `REGISTRY_TESTING` limits seam makes an acquisition exceed its documents or bytes limit; it fails with `proof_limit_exceeded` and changes nothing. |
 
 ## Considered options
@@ -672,9 +766,17 @@ them on all six release targets.
   - Losing it is recoverable, because the lock supplies the prior.
 - **Verification cost grows with the registry.** Acquisition still verifies
   the full history to sequence 1.
-  - The per-user document store makes repeat downloads cheap, but the
-    verifier's 10,000-document limit caps an origin at roughly 5,000
-    publications before consumers fail closed with `proof_limit_exceeded`.
+  - The per-user document store saves transfer only. The verifier charges
+    every distinct snapshot and record against its 64 MiB budget whether it
+    was downloaded or read from the store (`Verification.pas:1251-1266`).
+  - Each snapshot lists every identity visible at its sequence, so history
+    bytes grow roughly quadratically. With one new identity per
+    publication, the quoted record hashes alone take about 75 bytes each
+    per snapshot, so the budget is exhausted around 1,300 publications,
+    earlier with larger records and other metadata. Yanks and restores
+    replace a hash rather than adding one. Beyond that, consumers fail
+    closed with `proof_limit_exceeded`, well before the 10,000-document
+    limit.
   - The protocol already lets a returning client stop at its accepted
     snapshot. An incremental verifier mode is a follow-up issue, shared with
     the mirror.
@@ -706,11 +808,13 @@ sections above already apply them.
 3. **Accepted state and the clock floor live both in per-user state and in
    the lock.** Acquisition extends the newer and checks the floor against
    both. The lock alone gives no protection across projects on one machine,
-   and per-user state alone gives none on fresh CI.
+   and per-user state alone gives none on fresh CI. The lock keeps its
+   high-water state and floor separately from the selection proof.
 4. **`--frozen` and `--offline` verify a committed inclusion proof from the
    manifest pin**, through `VerifyRegistryLockedSelection` and the
    specification amendment. This detects a pull request that consistently
-   rewrites the lock, archives, and modules, at the cost of one snapshot per
+   rewrites the lock, archives, and modules, because the installed tree is
+   re-derived from the authenticated archive. It costs one snapshot per
    origin rather than up to 64 MiB of history.
 5. **Registry dependencies are refused in git-host, URL, and local package
    manifests for now.** Workspace members use the root's registries, and
@@ -739,6 +843,8 @@ sections above already apply them.
    transport policy; blocking #62 on #313 would delay public origins for no
    security gain.
 10. **ADR-0049 decision 4 is lifted in the #62 implementation**, as
-    specified under "Dependency-bearing publication". Consumer end-to-end
+    specified under "Dependency-bearing publication", including the refusal
+    of dependencies with extraction filters. The #54 implementation of
+    `registry publish` is a prerequisite. Consumer end-to-end
     tests publish real dependency chains through `registry publish`, and one
     ADR owns the mapping from manifest sources to records.
