@@ -22,7 +22,8 @@ uses
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.RegistryConsumer,
-  Tests.Scratch;
+  Tests.Scratch,
+  Tests.TarSynth;
 
 const
   DAY = 24 * 60 * 60;
@@ -1643,7 +1644,8 @@ begin
     Bytes := BytesOf(Text);
     NewHash := SHA256BytesPrefixed(Bytes);
     DeleteFile(ProofRoot + Copy(OldHash, 8, 64) + '.toml');
-    WriteTextFile(ProofRoot + Copy(NewHash, 8, 64) + '.toml', Text);
+    { Exact bytes: the file name is the hash of its content. }
+    WriteBytesToFile(ProofRoot + Copy(NewHash, 8, 64) + '.toml', Bytes);
     WriteTextFile(CaseRoot + '/project/lwpt.lock',
       StringReplace(Lock, 'signature = "' + OldHash + '"',
         'signature = "' + NewHash + '"', []));
