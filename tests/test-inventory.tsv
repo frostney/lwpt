@@ -22,6 +22,8 @@ program	*	packages/toml/source/TOML.Test.pas	1	6
 program	*	source/LWPT.Analysis.JSON.Test.pas	1	4
 program	*	source/LWPT.Analysis.Pascal.Test.pas	2	19
 program	*	source/LWPT.Analysis.Scope.Test.pas	1	5
+program	*	source/LWPT.Archive.Test.pas	1	8
+program	*	source/LWPT.ArchiveNormalize.Test.pas	7	47
 program	*	source/LWPT.BuildRequest.Test.pas	1	12
 program	*	source/LWPT.BuildCache.Test.pas	1	13
 program	*	source/LWPT.CacheLifecycle.Test.pas	1	20
@@ -46,6 +48,8 @@ program	*	source/LWPT.Formatter.Test.pas	7	97
 program	*	source/LWPT.GitPack.Test.pas	1	23
 program	*	source/LWPT.GitProtocol.Test.pas	4	48
 program	*	source/LWPT.Gzip.Test.pas	1	20
+program	*	source/LWPT.TarWriter.Test.pas	1	11
+program	*	source/LWPT.Zip.Test.pas	3	24
 program	*	source/LWPT.Health.Test.pas	1	11
 program	*	source/LWPT.SHA1.Test.pas	1	2
 program	*	source/LWPT.TestArtifactSet.Test.pas	1	9

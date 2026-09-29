@@ -29,3 +29,8 @@
 # tests (ADR-0047) are exact protocol bytes.
 tests/fixtures/git-reachability/*.pack binary
 tests/fixtures/git-reachability/upload-pack/** binary
+
+# Archive-normalizer fixtures written by independent tools (ADR-0049); the
+# pinned canonical hash depends on their exact bytes.
+tests/fixtures/archive-normalize/*.zip binary
+tests/fixtures/archive-normalize/*.tar.gz binary
