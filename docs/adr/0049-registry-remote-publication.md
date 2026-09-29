@@ -212,9 +212,21 @@ on memory in one process.
   The resulting order is publication lease, then upload lease, then
   `registry-incoming`. Another upload's lease is only ever tried without
   waiting, including under `registry-incoming` during reclamation, so a
-  held lease just means "live, skip it". No cycle can form. A bounded wait
-  that times out answers `503 temporary_failure` with `Retry-After` and holds
-  no reservation.
+  held lease just means "live, skip it". No cycle can form. Every bounded
+  wait that times out answers `503 temporary_failure` with `Retry-After`,
+  which the client retries. What it leaves behind depends on the caller:
+  - **Admission** holds nothing when it times out, so it leaves no
+    reservation behind.
+  - **An upload owner** already owns a charged `.part`. It can time out
+    while completing, or while deleting its `.part` after a failure,
+    cancellation, or digest mismatch. The owner cannot remove that file
+    without the guard, so it leaves the `.part` in place, still counted,
+    and releases its own upload lease. The file is then reclaimable, and
+    the reclamation path below deletes it and frees the charge. The
+    client's retry uploads again under a new upload ID.
+  - **A commit** times out before it moves anything, so it leaves
+    `incoming/` and `objects/` unchanged and releases the publication
+    lease.
 - **Reservation.** After the headers pass authentication and the length
   check, admission takes `registry-incoming`. It sums the lengths of every
   file under `incoming/`. When the declared `Content-Length` still fits the
@@ -231,8 +243,11 @@ on memory in one process.
   mismatch. Deleting the file releases the reservation.
 - **Reclaiming.** An upload admission or a publication-lease holder, while
   holding `registry-incoming`, may delete another upload's `.part` only after
-  it acquires that upload's lease without waiting. Acquiring it proves the
-  owning process has exited.
+  it acquires that upload's lease without waiting. Acquiring it proves that
+  no live request owns the file: either the owning process exited, or its
+  owner gave the file up after a guard timeout. Every admission and every
+  publication-lease holder runs this sweep, so an abandoned reservation is
+  freed at the next such operation, not after some age.
 - **Completion.** A verified upload takes `registry-incoming`. If
   `incoming/sha256/<hex>` or `objects/sha256/<hex>` already exists, it
   deletes its `.part` and answers `204`. Otherwise it renames the `.part` to
@@ -650,6 +665,7 @@ The implementation PR applies these amendments; this ADR does not.
 | A CI client publishes to a running origin | E2E: `registry init`, then `serve`, then `issue-token`, then `publish` over localhost HTTP. The server PID stays the same and served reads show the new head. |
 | Readers see the old or new head | E2E: a reader loop verifies every checkpoint, signature, and snapshot with the shared verifier while `publish` holds the publication barrier. Store test: the `checkpoint` failure point leaves the old head, and a retry commits at the same next sequence. The `activation` failure point, which comes after the pointer replacement, leaves the new head served and the index missing. Recovery rebuilds the index, and a retry returns `204` (extending `LWPT.Registry.Store.Test.pas:800-826`). |
 | Crash mid-publish | E2E: kill `serve` at the barrier, restart, get the old head, retry, and get `201` at the same next sequence. Kill during an upload: the `.part` file is reclaimed only after its upload lease is free. A live upload's `.part` survives a concurrent admission and commit. |
+| Guard timeout leaves a reclaimable reservation | A `REGISTRY_TESTING` seam holds `registry-incoming` past the 2-second wait. A completing upload answers `503` with `Retry-After`, leaves its `.part` counted at full length, and releases its upload lease. The same holds for an owner deleting after a digest mismatch. Once the guard is free, the next admission reclaims the `.part`, frees its charge, and fits an upload that did not fit before. The client's retry, under a new upload ID, returns `201`. A timed-out admission leaves no file behind. A timed-out commit leaves `incoming/`, `objects/`, and the served head unchanged. |
 | Completion versus admission race | A `REGISTRY_TESTING` barrier pauses an admission scan after `incoming/sha256/` and before the root. An upload that finishes meanwhile blocks on `registry-incoming` until the scan releases it. Starting from exactly 1 GiB reserved (three completed 256 MiB objects plus one 256 MiB upload), the paused admission of another 256 MiB gets `507`, and reservations never exceed 1 GiB. Reclamation, expiry, and the move into `objects/` get the same barrier test. Admission, completion, and a commit running together finish within their bounded waits without deadlock. |
 | Upload accounting | Two admissions that would together exceed 1 GiB: exactly one proceeds and the other gets `507`. An in-progress upload counts at its declared length. A digest mismatch, an abort, or an existing object releases its reservation. An object moved into `objects/` before a failed activation is unserved, answers `204` on re-upload, and is referenced by the retried commit. |
 | Identical retry succeeds | Same archive, a fresh `published_at`, and a lost-response retry each return `204` with an unchanged sequence and exit 0. |
