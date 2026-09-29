@@ -19,6 +19,12 @@ type
   dies, so a killed test run leaves no orphaned registry server. Other
   platforms rely on the fixture's own stop path. }
 procedure BindRegistryChildToParent(AProcess: TProcess);
+{ After AProcess.Running has reported an exit: waits, bounded, until the
+  child has released its handles. Windows signals the process handle only
+  after that rundown; Unix has already reaped the child. False means the
+  wait timed out. }
+function WaitForRegistryHandleRelease(AProcess: TProcess;
+  const ATimeoutMilliseconds: Cardinal): Boolean;
 
 function StopRegistryProcess(var AProcess: TProcess;
   const AGraceMilliseconds: QWord = 12000;
@@ -49,12 +55,30 @@ type
 
 var
   RegistryChildBinder: TRegistryChildBinder;
+  {$IFDEF UNIX}
+  RegistryParentPID: TPid;
+  {$ENDIF}
 
 procedure TRegistryChildBinder.ChildForked(ASender: TObject);
 begin
   {$IFDEF LINUX}
-  { Runs in the forked child before exec. }
-  prctl(PR_SET_PDEATHSIG, SIGKILL);
+  { Runs in the forked child before exec. FPC forks, prepares the child,
+    and only then calls this, so the parent may already have died: the
+    death signal would then never arrive. Exit at once when the request
+    fails or the child has been reparented. }
+  if (prctl(PR_SET_PDEATHSIG, SIGKILL) <> 0)
+    or (FpGetppid <> RegistryParentPID) then
+    FpExit(127);
+  {$ENDIF}
+end;
+
+function WaitForRegistryHandleRelease(AProcess: TProcess;
+  const ATimeoutMilliseconds: Cardinal): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := AProcess.WaitOnExit(ATimeoutMilliseconds);
+  {$ELSE}
+  Result := not AProcess.Running;
   {$ENDIF}
 end;
 
@@ -108,10 +132,12 @@ begin
     end;
     if Result.Stopped then
     begin
-      { Running uses a nonblocking status query; never enter FPC's unbounded
-        Unix Terminate/WaitOnExit path while the child is still running. }
-      Instance.WaitOnExit;
-      Result.ExitStatus := Instance.ExitStatus;
+      { Running uses a nonblocking status query. Never enter FPC's unbounded
+        WaitOnExit: on Windows it waits forever, so the handle wait is
+        bounded and a timeout is reported as not stopped. }
+      Result.Stopped := WaitForRegistryHandleRelease(Instance,
+        AKillMilliseconds);
+      if Result.Stopped then Result.ExitStatus := Instance.ExitStatus;
     end;
   finally
     Instance.Free;
@@ -120,6 +146,9 @@ end;
 
 initialization
   RegistryChildBinder := TRegistryChildBinder.Create;
+  {$IFDEF UNIX}
+  RegistryParentPID := FpGetpid;
+  {$ENDIF}
 
 finalization
   RegistryChildBinder.Free;

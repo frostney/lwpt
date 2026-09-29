@@ -304,6 +304,9 @@ end;
 
 procedure TRegistryPublicationE2E.BeforeEach;
 begin
+  { A failed assertion skips AfterEach; stop a server the previous case
+    left running before its scratch is removed. }
+  StopServe;
   ReleaseScratch;
   FScratch := CreateScratchRoot('registry-publication-e2e');
   FOutputs := '';
@@ -531,9 +534,12 @@ end;
   the response body and curl's diagnostics for failure reports. }
 function CurlRequest(const AArguments: array of string; const ABodyPath: string;
   out AStandardError: string): string;
+const
+  CURL_BOUND_MILLISECONDS = 40000;
 var
   ProcessInstance: TProcess;
   Argument: string;
+  Started: QWord;
 begin
   AStandardError := '';
   ProcessInstance := TProcess.Create(nil);
@@ -556,20 +562,30 @@ begin
     ProcessInstance.Options := [poUsePipes];
     ProcessInstance.Execute;
     Result := '';
+    Started := GetTickCount64;
     while ProcessInstance.Running do
     begin
       Result := Result + DrainAvailableStream(ProcessInstance.Output, 4096);
       AStandardError := AStandardError
         + DrainAvailableStream(ProcessInstance.Stderr, 4096);
+      if GetTickCount64 - Started > CURL_BOUND_MILLISECONDS then
+      begin
+        { curl's own --max-time normally ends it far sooner. }
+        AStandardError := AStandardError + ' [curl exceeded its bound]';
+        ProcessInstance.Terminate(1);
+        Break;
+      end;
       Sleep(10);
     end;
     Result := Trim(Result + DrainAvailableStream(ProcessInstance.Output, 4096));
     AStandardError := AStandardError
       + DrainAvailableStream(ProcessInstance.Stderr, 4096);
     { Windows reports the exit status before it releases the child's
-      handles; wait for the signalled handle before the scratch file curl
-      read can be removed. }
-    ProcessInstance.WaitOnExit;
+      handles; wait, bounded, for the signalled handle before the scratch
+      file curl read can be removed. }
+    if not WaitForRegistryHandleRelease(ProcessInstance, 5000) then
+      WriteLn(StdErr, 'registry publication e2e: curl did not release its '
+        + 'handles within 5000 ms');
   finally
     ProcessInstance.Free;
   end;
