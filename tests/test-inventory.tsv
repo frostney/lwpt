@@ -116,7 +116,7 @@ program	*	tests/integration/InstallLocalDiamond.Test.pas	2	10
 program	*	tests/integration/InstallNestedManifest.Test.pas	1	4
 program	*	tests/integration/InstallProducerLease.Test.pas	1	2
 program	*	tests/integration/InstallSymlinkCycle.Test.pas	1	3
-program	*	tests/integration/PayloadHandoffGuard.Test.pas	1	9
+program	*	tests/integration/PayloadHandoffGuard.Test.pas	1	10
 program	*	tests/integration/Repair.Test.pas	1	10
 program	windows/*	tests/integration/Repair.Test.pas	1	9
 program	*	tests/integration/Run.Test.pas	1	9
