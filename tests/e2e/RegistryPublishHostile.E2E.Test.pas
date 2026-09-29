@@ -55,6 +55,8 @@ type
     Backend, SecondBackend, Other: Word;
     Mode: TProxyMode;
     Token, Base: string;
+    { Response content that is not a credential; it must not be printed. }
+    Marker: string;
     CheckpointSequence: Integer;
     constructor Create;
     destructor Destroy; override;
@@ -272,8 +274,8 @@ begin
             + 'Connection: close', nil));
       pmEchoTransport:
         if IsDiscovery then
-          Exit(RawHTTPBytes('HTTP/1.1 200 OK' + CRLF + 'Content-Length: ' + Token
-            + CRLF + 'Connection: close' + CRLF + CRLF));
+          Exit(RawHTTPBytes('HTTP/1.1 200 OK' + CRLF + 'Content-Length: '
+            + Marker + Token + CRLF + 'Connection: close' + CRLF + CRLF));
       pmEchoError:
         if IsObject then
           Exit(ErrorResponse(403, Token, Token, Token, Token,
@@ -531,11 +533,16 @@ begin
   ExpectRefused(PublishThroughProxy('echo-lib', 'a'),
     'registry: unsupported_registry_schema: the origin sent a document with '
     + 'an unsupported schema' + LineEnding);
-  { A transport error whose text would carry it is redacted. }
+  { HTTPClient quotes a malformed Content-Length; after the retries only
+    fixed local text is printed, with neither the marker nor the token. }
+  FProxy.Marker := 'remote_marker_7f3a';
   FProxy.SetMode(pmEchoTransport);
   Run := PublishThroughProxy('echo-lib', 'a');
-  ExpectRefused(Run, 'registry: registry_transport_failed: ');
-  Expect<Boolean>(Pos('[redacted]', Run.Stderr) > 0).ToBe(True);
+  ExpectRefused(Run, 'registry: registry_transport_failed: the request for '
+    + 'discovery failed at the transport (connection, TLS, or HTTP framing) '
+    + 'after 5 attempt(s)' + LineEnding);
+  Expect<Integer>(FProxy.Count('GET')).ToBe(5);
+  Expect<Boolean>(Pos('remote_marker', Run.Stdout + Run.Stderr) = 0).ToBe(True);
   { A retry after a reflected Retry-After still succeeds. }
   FProxy.SetMode(pmEchoRetryAfter);
   Run := PublishThroughProxy('echo-lib', 'a');

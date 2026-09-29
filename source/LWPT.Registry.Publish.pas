@@ -656,16 +656,17 @@ begin
       except
         { Neither an oversized response nor a peer the TLS client refused
           can change on retry; every other transport failure is retried. }
+        { Only fixed local text: HTTPClient messages can quote response
+          bytes, such as a malformed header value. }
         on E: EHTTPResponseTooLarge do
-          Fail('registry_transport_failed', RedactRegistryCredential(
-            'request for ' + AWhat + ' failed: ' + E.Message, FToken));
+          Fail('registry_transport_failed', 'the origin''s answer to ' + AWhat
+            + ' exceeded its size limit');
         on E: EHTTPTLSVerificationError do
-          Fail('registry_tls_verification_failed', RedactRegistryCredential(
-            'the origin''s certificate was refused for ' + AWhat + ': '
-            + E.Message, FToken));
+          Fail('registry_tls_verification_failed',
+            'the origin''s TLS certificate was refused for ' + AWhat);
         on E: EHTTPError do
         begin
-          Failure := RedactRegistryCredential(E.Message, FToken);
+          Failure := 'failed at the transport (connection, TLS, or HTTP framing)';
           Retryable := True;
         end;
       end;
@@ -683,8 +684,8 @@ begin
       if not Retryable or (Attempt >= RegistryPublishMaximumAttempts) then
       begin
         if Failure <> '' then
-          Fail('registry_transport_failed', 'request for ' + AWhat
-            + ' failed: ' + Failure);
+          Fail('registry_transport_failed', 'the request for ' + AWhat + ' '
+            + Failure + ' after ' + IntToStr(Attempt) + ' attempt(s)');
         FailResponse(Result, AWhat);
       end;
       Sleep(RegistryPublishBackoffSeconds(Attempt, RetryAfter) * 1000);
@@ -1120,7 +1121,7 @@ begin
       on E: ELWPTArchiveError do
         Message := E.Message;
       on E: EHTTPError do
-        Message := 'registry_transport_failed: ' + E.Message;
+        Message := 'registry_transport_failed: a request to the origin failed at the transport';
       on E: Exception do
         { Anything else arose while handling a response: its text may hold
           response bytes, so only a local description is kept. }
