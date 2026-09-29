@@ -23,7 +23,7 @@ program	*	source/LWPT.Analysis.JSON.Test.pas	1	4
 program	*	source/LWPT.Analysis.Pascal.Test.pas	2	19
 program	*	source/LWPT.Analysis.Scope.Test.pas	1	5
 program	*	source/LWPT.Archive.Test.pas	1	8
-program	*	source/LWPT.ArchiveNormalize.Test.pas	7	47
+program	*	source/LWPT.ArchiveNormalize.Test.pas	7	50
 program	*	source/LWPT.BuildRequest.Test.pas	1	12
 program	*	source/LWPT.BuildCache.Test.pas	1	13
 program	*	source/LWPT.CacheLifecycle.Test.pas	1	20
@@ -65,7 +65,7 @@ program	*	source/LWPT.Registry.Crypto.Test.pas	1	6
 program	*	source/LWPT.Registry.Incoming.Test.pas	1	11
 program	*	source/LWPT.Registry.Mirror.Test.pas	1	40
 program	*	source/LWPT.Registry.Publication.Test.pas	1	28
-program	*	source/LWPT.Registry.Publish.Test.pas	1	9
+program	*	source/LWPT.Registry.Publish.Test.pas	1	10
 program	*	source/LWPT.Registry.Store.Test.pas	1	45
 program	*	source/LWPT.Registry.Tokens.Test.pas	1	9
 program	*	source/LWPT.Registry.Verification.Test.pas	1	53

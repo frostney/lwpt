@@ -169,6 +169,10 @@ function RegistryHashIsCanonical(const AValue: string): Boolean;
 function RegistryPackageNameIsCanonical(const AValue: string): Boolean;
 { Canonical SemVer 2.0.0 with no 'v' prefix. }
 function RegistryVersionIsCanonical(const AValue: string): Boolean;
+{ Protocol 1's canonical dependency constraint grammar: an exact version,
+  ^ or ~ before a version, space-separated comparators, or alternatives
+  joined by ' || '. }
+function RegistryConstraintIsCanonical(const AValue: string): Boolean;
 { RFC 3339 UTC with whole seconds and the Z suffix. }
 function RegistryTimestampIsCanonical(const AValue: string): Boolean;
 function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;
