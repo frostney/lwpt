@@ -936,7 +936,8 @@ begin
 
     SetLength(RepairOpts, 0);
     Registry.Add(TSubcommand.Create('repair',
-      'Recover project and shared-cache residue', '',
+      'Recover project and shared-cache residue and upgrade a v3 lockfile '
+      + 'to v4', '',
       @HandleRepair, RepairOpts));
 
     SetLength(RegistryOpts, 19);

@@ -81,7 +81,7 @@ After bootstrap:
 ./build/lwpt remove <name>      # remove a dependency + prune its modules
 ./build/lwpt outdated           # compare locked git-host deps to advertised tags
 ./build/lwpt update             # bump constraints + reinstall newer git-host deps
-./build/lwpt repair             # recover project and shared-cache residue
+./build/lwpt repair             # recover residue; upgrade a v3 lockfile to v4
 ./build/lwpt registry init      # initialize a self-hosted registry origin
 ./build/lwpt registry serve     # serve the origin in the foreground
 ```
