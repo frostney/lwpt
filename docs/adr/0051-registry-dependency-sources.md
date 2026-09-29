@@ -2,10 +2,11 @@
 
 ## Status
 
-Proposed on 2026-09-29 for [issue #62](https://github.com/frostney/lwpt/issues/62).
-Not yet accepted: the maintainer settles the decisions listed at the end of
-this record, and the implementation PR applies the rule amendments. It
-completes the deferral recorded in
+Accepted on 2026-09-29 by the maintainer, who settled the ten decisions at
+the end of this record as recommended. Issue
+[#62](https://github.com/frostney/lwpt/issues/62). The implementation PR
+applies the amendments listed under "Rule amendments"; this record does not
+edit other documents. It completes the deferral recorded in
 [ADR-0004](0004-http-registry-deferred-to-v2.md), amends
 [ADR-0009](0009-source-syntax-and-tag-resolution.md) (a new source kind and
 manifest section), [ADR-0048](0048-git-host-fetch-trust.md) (registry
@@ -129,9 +130,10 @@ http   = "registry:corp/http@~2.0.0"     # an explicit registry alias
 extras = { source = "registry:corp/extras", version = "^0.3.0", include = ["source/**"] }
 ```
 
-- **Grammar.** `registry:<package>` or `registry:<alias>/<package>`. The
-  kind is visible in the string, as ADR-0009 requires, and the bare-string
-  and inline-table forms share one parser.
+- **Grammar (decision 1).** `registry:<package>` or
+  `registry:<alias>/<package>`. The kind is visible in the string, as
+  ADR-0009 requires, and the bare-string and inline-table forms share one
+  parser.
   - The package segment uses the consumer package grammar
     `[a-z0-9][a-z0-9_-]{0,127}`. This is the protocol grammar without `.`
     (see decision 6).
@@ -314,9 +316,14 @@ records (decision 3):
   - `local_clock_behind_accepted_state` aborts before any request.
   - Every other failure aborts without trying another contact. This
     includes unsupported protocols, schemas, or capabilities.
-  - When every contact is stale, the stale diagnostic lists each contact.
-    When every contact fails at the request layer, the fetch error lists
-    them.
+  - When every contact is stale, the install fails with the stale
+    diagnostic, which lists each contact.
+  - When every contact fails at the request layer, the install reuses the
+    locked selection for that origin's nodes, after verifying it from the
+    committed proof as `--frozen` does, and warns (decision 8). It does so
+    only while the locked version still satisfies every accumulated
+    requirement. Otherwise, or with no lock entry, the fetch error lists
+    each contact. A trust failure never falls back.
 - **One head per origin.** An install acquires each origin once and caches
   the result across fixed-point rounds, so every dependency from that origin
   is selected from the same verified head.
@@ -553,32 +560,50 @@ This lifts [ADR-0049](0049-registry-remote-publication.md) decision 4
 
 ## Rule amendments
 
-The implementation PR applies these amendments; this ADR does not.
+ADRs and the specification are edited only by the implementation PR, so the
+documents it touches describe shipped behavior. That PR must apply each
+amendment below in the same change as the code it describes.
 
-- **`AGENTS.md`:**
-  - **Source kinds.** Add `registry:` to the source kinds in the "Git
-    sources use HTTP archive endpoints" constraint, citing this ADR.
-  - **Zero-install.** Add `<archives-dir>/registry-proofs/` to the committed
-    state as a lock-derived set, written only by the install transaction.
-  - **Network operations.** Registry contacts are reached by `install`,
-    `add`, `remove`, and `update`.
-  - **Lockfile.** List the additive v3 registry fields.
 - **`docs/registry-spec.md`:**
-  - **Consumer locked selection proof.** Amend "Acquisition and locked proof
-    verification": the proof verifies the signature, rotation chain,
-    snapshot membership, record, and archive without retained history. The
-    mirror's retained proof still verifies history.
-  - **Contact order.** Contacts from user configuration precede manifest
-    mirrors.
-  - **Redirects.** Consumer acquisition follows no redirects.
-  - **Implementation boundary.** Replace the "Implementation boundary"
-    sentence that says the protocol adds no source kind.
+  - **Locked-proof paragraph (decision 4).** Amend "Acquisition and locked
+    proof verification". A consumer's locked selection proof verifies the
+    checkpoint hash, the signature through the rotation chain from the pin,
+    the snapshot hash, record membership, the record fields, and archive
+    identity without retained history. The mirror's retained proof still
+    verifies full history. Neither applies expiry or the clock floor.
+  - **Contact selection and failover.** Contacts from user configuration
+    precede manifest mirrors, and consumer acquisition follows no redirects:
+    a 3xx is a request-layer failure.
+  - **Implementation boundary.** Replace the sentence saying the protocol
+    adds no source kind with a pointer to this ADR.
+- **ADR-0049, decision 4 (lifted by decision 10).** Add an amendment note
+  that dependency-bearing archives are accepted under "Dependency-bearing
+  publication" above, and add the consumer package-name grammar (decision 6)
+  to its archive contract.
+- **ADR-0009 and ADR-0048.** Add amendment notes pointing here for the
+  `registry:` source kind and `[registries]` section, and for the registry
+  destination policy.
+- **`AGENTS.md` Hard Constraints:**
+  - **"Git sources use HTTP archive endpoints for content".** List
+    `registry:` as a source kind, citing this ADR.
+  - **"Zero-install by default".** Add `<archives-dir>/registry-proofs/` to
+    committed state as a set derived from the lock.
+  - **"All multi-step file writes go through `.lwpt/tmp/`".** Name proof
+    documents as toolkit-owned committed state written through the atomic
+    helpers, and per-user registry state as replaced atomically inside its
+    own state directory.
+  - **"`lwpt.lock` is machine-written, schema v3".** Add the additive
+    registry fields and the per-origin `[registry."<identity>"]` table.
+- **`AGENTS.md` Safety / Boundaries:**
+  - **Committed state.** The install transaction, and its `add` and
+    `remove` frontends, is the only writer of `registry-proofs/`, and removes
+    unreferenced proof documents.
+  - **"Network operations are explicit".** `install`, `add`, `remove`, and
+    `update` reach registry contacts; `--frozen` and `--offline` never do.
 - **`docs/architecture.md`.** Add the lockfile table rows, the
   `registry-proofs` layout row, and the `registry:` source rows.
-- **ADR-0049.** Record that decision 4 is lifted, and add the package-name
-  grammar to its archive contract.
-- **Manifest schema registry.** Register `[registries]` and the
-  `registry:` prefix, then regenerate the `lwpt agents` block.
+- **Manifest schema registry.** Register `[registries]` and the `registry:`
+  prefix, then regenerate the `lwpt agents` block.
 
 ## Test plan
 
@@ -595,13 +620,13 @@ them on all six release targets.
 | #62: origin and mirror URLs change without identity changes | Install, then change `origin` and `mirrors` and install again. `sourceIdentity`, `registryOrigin`, `registryRecord`, and the lock bytes are unchanged, and `--frozen` passes. |
 | #62: identity, signatures, hashes, expiry, and sequence verified before state changes; tampered, downgraded, expired, conflicting, or unsupported state fails | Tamper matrix: a bad checkpoint signature, a record whose bytes do not match its hash, an archive whose bytes do not match its hash, an extracted manifest with the wrong identity, a checkpoint lifetime over the limit, a checkpoint from the future, a checkpoint older than the lock, same-sequence equivocation, a discovery naming another origin, an unsupported protocol, a missing capability. Each asserts that modules, archives, the lock, the cfg, proof documents, and per-user state are byte-identical. |
 | #62 and #55: a verified mirror satisfies an install and keeps the origin identity | E2E: origin, then `registry sync` to a mirror, then stop the origin and install through the mirror. The lock names the origin identity, `resolvedURL` names the mirror, and the CAS object key equals the record `archive` and the lock `archiveHash`. |
-| #55: contact selection and failover | Scripted contacts. A request failure or 3xx advances; an expired, older, or renewal-rolled-back contact advances; a trust failure on the first contact aborts, and the second contact receives zero requests; all-stale produces the stale diagnostic; a clock behind the floor aborts before any request. The archive is fetched only from the contact that produced the accepted proof. |
+| #55: contact selection and failover | Scripted contacts. A request failure or 3xx advances; an expired, older, or renewal-rolled-back contact advances; a trust failure on the first contact aborts, and the second contact receives zero requests; all-stale produces the stale diagnostic; all request failures reuse a satisfying locked selection with a warning and fail without one (decision 8); a clock behind the floor aborts before any request. The archive is fetched only from the contact that produced the accepted proof. |
 | #54 amendment: inclusion, consistency, stale checkpoints, malformed proofs, offline and frozen | A record missing from the head snapshot fails. A head that does not extend the per-user or locked snapshot is `checkpoint_equivocation`. Non-canonical documents and malformed envelopes are rejected. Stale-checkpoint cases are covered above; offline and frozen cases below. |
 | #62: the lock records enough for network-free frozen verification | Clone the project into a fresh directory with an empty cache and state directory; `--frozen` passes with a transport seam counting zero requests. |
 | #62: `--frozen` succeeds offline and fails on drift | Each mutation fails with its named error and changes nothing: flipping an archive byte, editing a module file, editing `registryRecord`, `checkpoint`, or `trustKeyId`, flipping a byte in a proof document, deleting a proof document, changing the manifest pin, schema version 2. An expired proof still passes. |
 | #62: every client platform; localhost HTTP test-only; remote HTTPS | Six-target CI. A release-build test rejects an `http://localhost` contact at load, and an `http://` non-localhost contact is rejected in both builds. The HTTPS path uses the committed test root through the test-only anchor seam (ADR-0049 decision 7). |
 | #62: existing behavior unchanged | The existing install, offline, frozen, and commit-pin suites pass unchanged, and lock bytes for projects without registry dependencies are golden-compared. |
-| #62: the ADR records syntax, defaults, trust, and schema | This ADR, once accepted. |
+| #62: the ADR records syntax, defaults, trust, and schema | This ADR. |
 | #226: restored from the shared cache without network | A registry lock with a deleted committed archive restores from the CAS with zero transport requests. |
 | #226: committed archives satisfy offline installs without the cache | An empty cache directory, restored from committed archives and proofs. |
 | #226: missing modules and configuration reconstructed | Deleted `.lwpt/modules/json`, `lwpt.cfg`, and one proof document are rebuilt, the proof from the document store. |
@@ -663,116 +688,57 @@ them on all six release targets.
   with certificates from the system trust store.
 - **`outdated` and `update`** do not yet report registry dependencies.
 
-## Open decisions for the maintainer
+## Decisions
 
-1. **Bare-string syntax.**
-   - **(a)** `registry:<package>` for the default registry and
-     `registry:<alias>/<package>` for a named one: one reserved prefix, the
-     kind visible, no namespace shared with `[sources]`.
-   - **(b)** The alias as the prefix (`corp:<package>`), mirroring
-     `[sources]` prefixes, with a shared namespace between sources and
-     registries and a separate spelling for the default.
-   - **(c)** A bare version (`json = "^1.2.0"`) meaning the default
-     registry, like the archived spike.
+The maintainer settled these on 2026-09-29, each as recommended. The
+sections above already apply them.
 
-   **Recommendation: (a).** (c) contradicts ADR-0009's rule that the locator
-   is the source string, and turns typos into registry lookups.
-2. **Meaning of "endpoint-advertised default".**
-   - **(a)** When a declaration omits `identity`, use the identity that its
-     contacts advertise, accepted only under the configured pin, recorded in
-     the lock, and never replaced.
-   - **(b)** Remove the level: `identity` is mandatory.
-   - **(c)** Read it only as the protocol's rule that an origin-less record
-     dependency uses the record's origin.
-
-   **Recommendation: (a).** It satisfies #62's acceptance criterion as
-   written, and the pin prevents trust on first use. The residual risk is an
-   operator reusing one key for several origins, which the lock then
-   freezes.
-3. **Where accepted state and the clock floor live.**
-   - **(a)** Only in the lock's per-origin table.
-   - **(b)** Only in per-user state.
-   - **(c)** Both; acquisition extends the newer and checks the floor
-     against both.
-
-   **Recommendation: (c).** (a) gives no protection across projects on one
-   machine. (b) gives none on fresh CI, and cannot make `--frozen`
-   self-contained.
-4. **Depth of `--frozen` and `--offline` registry verification.**
-   - **(a)** Hashes and lock identity only, as for git sources.
-   - **(b)** A committed inclusion proof verified from the manifest pin.
-     This needs a new `VerifyRegistryLockedSelection` entry point and an
-     amendment to the specification's locked-proof paragraph.
-   - **(c)** Commit the complete history and reuse the shipped locked-proof
-     mode.
-
-   **Recommendation: (b).** It detects a pull request that consistently
-   rewrites the lock, archive, and modules, which git sources cannot. It
-   costs one snapshot per origin instead of up to 64 MiB of history.
-5. **Registry dependencies declared in manifests that are not project
-   manifests.**
-   - **(a)** Refuse them in git-host, URL, and local package manifests for
-     now. Workspace members use the root's registries, and registry packages
-     get their edges from signed records.
-   - **(b)** Allow them when they name an identity explicitly (for example an
-     inline `origin = "<identity>"`), with trust still coming only from the
-     root.
-   - **(c)** Let those manifests declare their own `[registries]` pins.
-
-   **Recommendation: (a) now, (b) as a follow-up.** Aliases are local names
-   that a dependency cannot share with the root. (c) lets a dependency choose
-   trust roots.
-6. **Package-name grammar.**
-   - **(a)** Consumers install only `[a-z0-9][a-z0-9_-]{0,127}`, the
-     manifest key must equal the package name, and `registry publish`
-     enforces the same grammar.
-   - **(b)** Accept dotted protocol names and map them to safe module
-     directory names.
-   - **(c)** Allow any manifest alias for a registry package.
-
-   **Recommendation: (a).** Dots conflict with `ValidPackageName` and with
-   Windows trailing-dot paths. (c) would let one package occupy two graph
-   slots and duplicate its units.
-7. **Yanked versions.**
-   - **(a)** Never newly selected, even by an exact version. A locked yanked
-     version stays, with a warning, and frozen and offline modes are
-     unaffected.
-   - **(b)** An exact version may select a yanked release, with a warning.
-   - **(c)** Yanked versions are treated as absent, so an online install of
-     a locked yanked version fails.
-
-   **Recommendation: (a)**, which matches Cargo's lock-respecting semantics
-   and keeps reproducibility.
-8. **Online install when every contact is unreachable.**
-   - **(a)** Reuse the locked selection, verified from the committed proof,
-     when every contact failed at the request layer, and warn. Never reuse
-     it after a trust failure or when every contact is stale.
-   - **(b)** Always fail.
-   - **(c)** Also reuse it when every contact is stale.
-
-   **Recommendation: (a).** It matches the git ref-listing fallback
-   (`LWPT.Install.pas:3396-3420`). Reusing it after all-stale answers would
-   hide a freeze attack.
-9. **Machine-local contacts, private networks, and private certificate
-   authorities.**
-   - **(a)** #62 ships public HTTPS contacts with the system trust store
-     only. User-level mirrors, private-host allowances, and trust anchors
-     keyed by exact host arrive with #313's configuration file. Nothing is
-     added to `lwpt.toml`.
-   - **(b)** Also allow a project-committed CA anchor file per registry in
-     `lwpt.toml`.
-   - **(c)** Block #62 on #313.
-
-   **Recommendation: (a).** Registry content is authenticated by
-   signatures, so TLS anchors add only transport assurance. That makes them
-   machine policy, which #313 already places in user configuration. (c)
-   delays the public-origin case for no security gain.
-10. **Dependency-bearing publication.**
-    - **(a)** Lift ADR-0049 decision 4 in the #62 implementation, as
-      specified above.
-    - **(b)** Defer it to a separate issue, and use crafted fixture records
-      for consumer tests.
-
-    **Recommendation: (a).** Consumer end-to-end tests should publish real
-    dependency chains through `registry publish`, and one ADR should own the
-    mapping from manifest sources to records.
+1. **Syntax: `registry:<package>` and `registry:<alias>/<package>`.** One
+   reserved prefix keeps the kind visible in the string, as ADR-0009
+   requires, and shares no namespace with `[sources]`. The rejected options
+   were the alias as the prefix (`corp:<package>`) and a bare version
+   (`json = "^1.2.0"`), which would turn typos into registry lookups.
+2. **An endpoint-advertised identity is used when a declaration omits
+   `identity`.** It is accepted only under the configured pin, recorded in
+   the lock, and never replaced. This meets #62's precedence as written
+   without trust on first use. The residual risk, an operator reusing one
+   key for several origins, is frozen by the lock.
+3. **Accepted state and the clock floor live both in per-user state and in
+   the lock.** Acquisition extends the newer and checks the floor against
+   both. The lock alone gives no protection across projects on one machine,
+   and per-user state alone gives none on fresh CI.
+4. **`--frozen` and `--offline` verify a committed inclusion proof from the
+   manifest pin**, through `VerifyRegistryLockedSelection` and the
+   specification amendment. This detects a pull request that consistently
+   rewrites the lock, archives, and modules, at the cost of one snapshot per
+   origin rather than up to 64 MiB of history.
+5. **Registry dependencies are refused in git-host, URL, and local package
+   manifests for now.** Workspace members use the root's registries, and
+   registry packages take their edges from signed records. Naming an
+   identity explicitly from such manifests, with trust still from the root,
+   is a follow-up. Letting them declare their own pins was rejected because
+   a dependency would choose trust roots.
+6. **Consumers install only `[a-z0-9][a-z0-9_-]{0,127}`, the dependency key
+   equals the package name, and `registry publish` enforces the same
+   grammar.** Dots conflict with `ValidPackageName` and with Windows
+   trailing-dot paths, and aliasing would let one package occupy two graph
+   slots.
+7. **Yanked versions are never newly selected, even by an exact version.**
+   A locked yanked version stays, with a warning, and `--frozen` and
+   `--offline` are unaffected. This matches Cargo's lock-respecting
+   semantics.
+8. **When every contact fails at the request layer, an online install
+   reuses the locked selection, verified from the committed proof, and
+   warns.** It never does so after a trust failure or when every contact is
+   stale, which would hide a freeze attack. This matches the git
+   ref-listing fallback (`LWPT.Install.pas:3396-3420`).
+9. **#62 ships public HTTPS contacts with the system trust store.**
+   User-level mirrors, private-host allowances, and trust anchors keyed by
+   exact host arrive with #313's configuration file, never in `lwpt.toml`.
+   Registry content is authenticated by signatures, so anchors are machine
+   transport policy; blocking #62 on #313 would delay public origins for no
+   security gain.
+10. **ADR-0049 decision 4 is lifted in the #62 implementation**, as
+    specified under "Dependency-bearing publication". Consumer end-to-end
+    tests publish real dependency chains through `registry publish`, and one
+    ADR owns the mapping from manifest sources to records.
