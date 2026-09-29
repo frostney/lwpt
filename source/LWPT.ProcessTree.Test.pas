@@ -3,7 +3,13 @@
   in, so the spawn cases observe the real kernel state after LWPT's setup.
   Scripted setpgid(2) outcomes and raw group-query results replay the Darwin
   race from #299 beneath the production classification, and pin the bounded
-  retry and its pauses on both sides. }
+  retry and its pauses on both sides.
+
+  On every platform, shutdown cases spawn the same executable as a child that
+  installs signal forwarding and returns from its main program at once. The
+  Tests.ShutdownProbe unit finalizes after every LWPT unit and fails the
+  child if a forwarder thread is still alive, pinning #330: a forwarder left
+  running while the runtime finalized crashed or hung short-lived commands. }
 program LWPT.ProcessTree.Test;
 
 {$mode delphi}{$H+}
@@ -13,10 +19,12 @@ uses
   cthreads,
   BaseUnix,
   {$ENDIF}
+  Tests.ShutdownProbe, { before Classes, SysUtils and LWPT units: finalizes after them }
   Classes,
   Process,
   SysUtils,
 
+  LWPT.Command.Common,
   LWPT.Core,
   LWPT.ProcessRunner,
   LWPT.ProcessTree,
@@ -24,6 +32,15 @@ uses
 
 const
   ReportGroupSwitch = '--process-tree-report-group';
+  ShutdownChildSwitch = '--process-tree-shutdown-child';
+  { The child returns from its main program the moment forwarding is
+    installed, racing the forwarder's startup, or after the forwarder has had
+    time to block. }
+  ShutdownImmediately = 'immediate';
+  ShutdownAfterSettling = 'settled';
+  ShutdownSettleMilliseconds = 50;
+  ShutdownChildExitCode = 42;
+  ShutdownRunsPerMode = 10;
   ReporterTimeoutMilliseconds = 30000;
   ScriptedRejections = 2;
   AlwaysScripted = High(Integer);
@@ -39,7 +56,6 @@ const
   FailedQueryResult = -1;
   IsolationFailure = 'could not isolate process tree';
 
-{$IFDEF UNIX}
 type
   TSpawnResult = record
     ExitCode: Integer;
@@ -48,6 +64,115 @@ type
     ErrorMessage: string;
   end;
 
+  TProcessTreeShutdown = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestUnmanagedChildJoinsForwarders;
+    procedure TestManagedChildJoinsForwarders;
+  end;
+
+{ Spawns this executable in shutdown-child mode. A managed child runs under
+  a process tree and inherits its acknowledgement channel, which on Windows
+  adds the inherited-control forwarder; an unmanaged child has only the
+  console-control or signal forwarder. }
+function SpawnShutdownChild(const AManaged: Boolean;
+  const AMode: string): TSpawnResult;
+var
+  Buffer: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
+  BytesRead: Integer;
+  Options: TLWPTProcessRunOptions;
+  P: TProcess;
+  Runner: TLWPTDuplexProcessRunner;
+begin
+  Result := Default(TSpawnResult);
+  Result.ExitCode := -1;
+  P := TProcess.Create(nil);
+  try
+    P.Executable := ExpandFileName(ParamStr(0));
+    P.Parameters.Add(ShutdownChildSwitch);
+    P.Parameters.Add(AMode);
+    if AManaged then
+    begin
+      Runner := TLWPTDuplexProcessRunner.Create(P);
+      try
+        Options := DefaultProcessRunOptions('process-tree shutdown child');
+        Options.SeparateStandardError := True;
+        Options.TimeoutMilliseconds := ReporterTimeoutMilliseconds;
+        try
+          Result.ExitCode := Runner.Run('', Options, Result.Stdout,
+            Result.Stderr);
+        except
+          on E: Exception do Result.ErrorMessage := E.Message;
+        end;
+      finally
+        Runner.Free;
+      end;
+    end
+    else
+    begin
+      P.Options := [poUsePipes, poStderrToOutPut];
+      ExecuteUnmanagedProcess(P);
+      repeat
+        BytesRead := P.Output.Read(Buffer[0], SizeOf(Buffer));
+        if BytesRead > 0 then
+          AppendRawBytes(Result.Stderr, Buffer[0], BytesRead);
+      until BytesRead <= 0;
+      P.WaitOnExit;
+      Result.ExitCode := NormalisedExitCode(P);
+    end;
+  finally
+    P.Free;
+  end;
+end;
+
+procedure ExpectCleanShutdown(const AManaged: Boolean);
+var
+  ModeIndex, Run: Integer;
+  R: TSpawnResult;
+const
+  Modes: array[0..1] of string = (ShutdownImmediately, ShutdownAfterSettling);
+begin
+  for ModeIndex := Low(Modes) to High(Modes) do
+    for Run := 1 to ShutdownRunsPerMode do
+    begin
+      R := SpawnShutdownChild(AManaged, Modes[ModeIndex]);
+      Expect<string>(R.ErrorMessage).ToBe('');
+      Expect<string>(Trim(R.Stderr)).ToBe('');
+      Expect<Integer>(R.ExitCode).ToBe(ShutdownChildExitCode);
+      if (R.ErrorMessage <> '') or (R.ExitCode <> ShutdownChildExitCode) then
+        Exit;
+    end;
+end;
+
+procedure TProcessTreeShutdown.TestUnmanagedChildJoinsForwarders;
+begin
+  ExpectCleanShutdown(False);
+end;
+
+procedure TProcessTreeShutdown.TestManagedChildJoinsForwarders;
+begin
+  ExpectCleanShutdown(True);
+end;
+
+procedure TProcessTreeShutdown.SetupTests;
+begin
+  Test('unmanaged child joins its forwarders before the runtime finalizes',
+    TestUnmanagedChildJoinsForwarders);
+  Test('managed child joins its forwarders before the runtime finalizes',
+    TestManagedChildJoinsForwarders);
+end;
+
+procedure RunShutdownChild;
+begin
+  ArmShutdownProbe(ProcessTreeLiveForwardersForTesting);
+  InstallProcessTreeSignalForwarding;
+  if ParamStr(2) = ShutdownAfterSettling then
+    Sleep(ShutdownSettleMilliseconds);
+  ExitCode := ShutdownChildExitCode;
+end;
+
+{$IFDEF UNIX}
+type
   TProcessTreeIsolation = class(TTestSuite)
   public
     procedure BeforeEach; override;
@@ -368,6 +493,13 @@ end;
 {$ENDIF}
 
 begin
+  { The child returns from here, like the lwpt program, so unit
+    finalization runs exactly as it does after a fast command failure. }
+  if ParamStr(1) = ShutdownChildSwitch then
+  begin
+    RunShutdownChild;
+    Exit;
+  end;
   {$IFDEF UNIX}
   if ParamStr(1) = ReportGroupSwitch then
   begin
@@ -377,6 +509,8 @@ begin
   TestRunnerProgram.AddSuite(TProcessTreeIsolation.Create(
     PROJECT_NAME + '.ProcessTree: Unix process-group isolation'));
   {$ENDIF}
+  TestRunnerProgram.AddSuite(TProcessTreeShutdown.Create(
+    PROJECT_NAME + '.ProcessTree: forwarder shutdown'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

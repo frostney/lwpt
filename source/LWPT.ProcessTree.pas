@@ -110,6 +110,10 @@ const
   ProcessTreeGroupSetupAttempts = 5;
   ProcessTreeGroupSetupRetryMilliseconds = 1;
 
+{$IFDEF PROCESSTREE_TESTING}
+function ProcessTreeLiveForwardersForTesting: Integer;
+{$ENDIF}
+
 {$IFDEF OBJECTSTORE_TESTING}
 type
   TLWPTProcessSpawnAttemptHook = procedure;
@@ -510,6 +514,10 @@ var
   ConsoleControlEvent: THandle = 0;
   ConsoleControlForwarder: TLWPTConsoleControlForwarder = nil;
   InheritedControlForwarder: TLWPTInheritedControlForwarder = nil;
+  {$IFDEF PROCESSTREE_TESTING}
+  ForwarderThreadHandles: array[0..1] of THandle;
+  ForwarderThreadHandleCount: Integer = 0;
+  {$ENDIF}
 
 function LWPTCreateJobObject(const ASecurityAttributes: Pointer;
   const AName: PWideChar): THandle; stdcall;
@@ -1964,6 +1972,20 @@ end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
+{$IFDEF PROCESSTREE_TESTING}
+procedure RetainForwarderForTesting(const AForwarder: TThread);
+var
+  Duplicate: THandle;
+begin
+  if ForwarderThreadHandleCount > High(ForwarderThreadHandles) then Exit;
+  if not Windows.DuplicateHandle(Windows.GetCurrentProcess, AForwarder.Handle,
+    Windows.GetCurrentProcess, @Duplicate, Windows.SYNCHRONIZE, False, 0) then
+    RaiseLastOSError;
+  ForwarderThreadHandles[ForwarderThreadHandleCount] := Duplicate;
+  Inc(ForwarderThreadHandleCount);
+end;
+{$ENDIF}
+
 procedure TLWPTInheritedControlForwarder.Execute;
 var
   AcknowledgementDeadline, DescendantDeadline: QWord;
@@ -2113,11 +2135,17 @@ begin
   try
     ConsoleControlForwarder := TLWPTConsoleControlForwarder.Create(True);
     ConsoleControlForwarder.FreeOnTerminate := False;
+    {$IFDEF PROCESSTREE_TESTING}
+    RetainForwarderForTesting(ConsoleControlForwarder);
+    {$ENDIF}
     ConsoleControlForwarder.Start;
     if InheritedControlReadHandle >= 0 then
     begin
       InheritedControlForwarder := TLWPTInheritedControlForwarder.Create(True);
       InheritedControlForwarder.FreeOnTerminate := False;
+      {$IFDEF PROCESSTREE_TESTING}
+      RetainForwarderForTesting(InheritedControlForwarder);
+      {$ENDIF}
       InheritedControlForwarder.Start;
     end;
     SignalForwardingInstalled := True;
@@ -2142,6 +2170,26 @@ begin
   end;
   {$ENDIF}
 end;
+
+{$IFDEF PROCESSTREE_TESTING}
+function ProcessTreeLiveForwardersForTesting: Integer;
+{$IFDEF MSWINDOWS}
+var
+  Index: Integer;
+{$ENDIF}
+begin
+  Result := 0;
+  {$IFDEF UNIX}
+  if Assigned(SignalForwarder) then Inc(Result);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  for Index := 0 to ForwarderThreadHandleCount - 1 do
+    if Windows.WaitForSingleObject(ForwarderThreadHandles[Index], 0)
+       <> Windows.WAIT_OBJECT_0 then
+      Inc(Result);
+  {$ENDIF}
+end;
+{$ENDIF}
 
 initialization
   ActiveProcessTrees := TList.Create;
