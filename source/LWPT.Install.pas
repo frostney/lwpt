@@ -5626,6 +5626,256 @@ begin
   end;
 end;
 
+{ Writes the v4 lock of the v3-to-v4 upgrade by editing the v3 document
+  rather than rendering a new one (ADR-0052 section 5, step 4): only the
+  `version` line, every entry's `computedHash`, and the accepted-state lines
+  of an origin whose merged accepted state moved (decision 11) change. Every
+  other line, including fields an older writer omitted and tolerated unknown
+  keys and tables, keeps its bytes and line ending. The result is reloaded
+  as v4 and must carry exactly the re-derived digests. }
+procedure WriteUpgradedLock(const APath, ATmpRoot: string;
+  const AResolved: TResolvedArray;
+  const AOldTables, ANewTables: TLWPTRegistryLockTableArray);
+type
+  TLockLine = record
+    Content, Ending: string;
+  end;
+var
+  Source: string;
+  Lines: array of TLockLine;
+  Output: array of TLockLine;
+  Ending, Header, Trimmed, Key, Written: string;
+  i, k, Start, SectionLast, EntryIndex, TableIndex: Integer;
+  VersionSeen: Boolean;
+  HashWritten: array of Boolean;
+  Accepted: TStringList;
+  AcceptedWritten: array of Boolean;
+  Reloaded: TResolvedArray;
+
+  function AcceptedChanged(ATable: Integer): Boolean;
+  var Old: TLWPTRegistryLockTable; j: Integer;
+  begin
+    Old := Default(TLWPTRegistryLockTable);
+    for j := 0 to High(AOldTables) do
+      if AOldTables[j].Identity = ANewTables[ATable].Identity then
+        Old := AOldTables[j];
+    Result := not RegistryAcceptedStatesEqual(Old.Accepted,
+      ANewTables[ATable].Accepted);
+    if not Result then
+    begin
+      Result := Length(Old.Accepted.Rotations)
+        <> Length(ANewTables[ATable].Accepted.Rotations);
+      if not Result then
+        for j := 0 to High(Old.Accepted.Rotations) do
+          if Old.Accepted.Rotations[j]
+             <> ANewTables[ATable].Accepted.Rotations[j] then
+            Exit(True);
+    end;
+  end;
+
+  procedure Emit(const AContent, AEnding: string);
+  begin
+    SetLength(Output, Length(Output) + 1);
+    Output[High(Output)].Content := AContent;
+    Output[High(Output)].Ending := AEnding;
+  end;
+
+  { Inserts a missing line after the section's last non-blank line. }
+  procedure InsertInSection(const AContent: string);
+  var j, At: Integer; LineEnding: string;
+  begin
+    At := SectionLast + 1;
+    LineEnding := Ending;
+    { After an unterminated last line, the new line becomes the last one. }
+    if (At > 0) and (Output[At - 1].Ending = '') then
+    begin
+      Output[At - 1].Ending := Ending;
+      LineEnding := '';
+    end;
+    SetLength(Output, Length(Output) + 1);
+    for j := High(Output) downto At + 1 do Output[j] := Output[j - 1];
+    Output[At].Content := AContent;
+    Output[At].Ending := LineEnding;
+    SectionLast := At;
+  end;
+
+  function EntryOf(const AHeader: string): Integer;
+  var j: Integer;
+  begin
+    for j := 0 to High(AResolved) do
+      if AHeader = '[package.' + AResolved[j].Name + ']' then Exit(j);
+    Result := -1;
+  end;
+
+  function TableOf(const AHeader: string): Integer;
+  var j: Integer;
+  begin
+    for j := 0 to High(ANewTables) do
+      if AHeader = '[registry."' + TomlEscape(ANewTables[j].Identity)
+           + '"]' then
+        Exit(j);
+    Result := -1;
+  end;
+
+  procedure CloseSection;
+  var j: Integer;
+  begin
+    if (EntryIndex >= 0) and not HashWritten[EntryIndex] then
+    begin
+      InsertInSection('computedHash = "' + AResolved[EntryIndex].Hash + '"');
+      HashWritten[EntryIndex] := True;
+    end;
+    if TableIndex >= 0 then
+      for j := 0 to Accepted.Count - 1 do
+        if not AcceptedWritten[j] then
+          InsertInSection(Accepted[j]);
+  end;
+
+  procedure OpenSection(const AHeader: string);
+  var j: Integer;
+  begin
+    Header := AHeader;
+    EntryIndex := EntryOf(AHeader);
+    TableIndex := TableOf(AHeader);
+    Accepted.Clear;
+    if (TableIndex >= 0) and AcceptedChanged(TableIndex) then
+      RenderRegistryAcceptedState(ANewTables[TableIndex].Accepted, Accepted)
+    else
+      TableIndex := -1;
+    SetLength(AcceptedWritten, Accepted.Count);
+    for j := 0 to High(AcceptedWritten) do AcceptedWritten[j] := False;
+  end;
+
+begin
+  for i := 0 to High(AResolved) do
+    if not IsTreeDigest(AResolved[i].Hash) then
+      raise ELockfileError.CreateFmt(
+        'refusing to write %s: "%s" has no %s tree digest (computedHash "%s")',
+        [LWPT.Core.LOCKFILE, AResolved[i].Name, TREE_DIGEST_ALGORITHM,
+         AResolved[i].Hash]);
+  Source := ReadFileText(APath);
+  { Split into lines, keeping each line's own terminator. }
+  Lines := nil;
+  Start := 1;
+  i := 1;
+  while i <= Length(Source) do
+  begin
+    if Source[i] = #10 then
+    begin
+      SetLength(Lines, Length(Lines) + 1);
+      if (i > Start) and (Source[i - 1] = #13) then
+      begin
+        Lines[High(Lines)].Content := Copy(Source, Start, i - 1 - Start);
+        Lines[High(Lines)].Ending := #13#10;
+      end
+      else
+      begin
+        Lines[High(Lines)].Content := Copy(Source, Start, i - Start);
+        Lines[High(Lines)].Ending := #10;
+      end;
+      Start := i + 1;
+    end;
+    Inc(i);
+  end;
+  if Start <= Length(Source) then
+  begin
+    SetLength(Lines, Length(Lines) + 1);
+    Lines[High(Lines)].Content := Copy(Source, Start, MaxInt);
+    Lines[High(Lines)].Ending := '';
+  end;
+  Ending := #10;
+  for i := 0 to High(Lines) do
+    if Lines[i].Ending <> '' then
+    begin
+      Ending := Lines[i].Ending;
+      Break;
+    end;
+
+  SetLength(HashWritten, Length(AResolved));
+  for i := 0 to High(HashWritten) do HashWritten[i] := False;
+  Accepted := TStringList.Create;
+  try
+    Output := nil;
+    VersionSeen := False;
+    Header := '';
+    EntryIndex := -1;
+    TableIndex := -1;
+    SectionLast := -1;
+    for i := 0 to High(Lines) do
+    begin
+      Trimmed := Trim(Lines[i].Content);
+      if Copy(Trimmed, 1, 1) = '[' then
+      begin
+        CloseSection;
+        OpenSection(Trimmed);
+        Emit(Lines[i].Content, Lines[i].Ending);
+        SectionLast := High(Output);
+        Continue;
+      end;
+      Written := Lines[i].Content;
+      if (Trimmed <> '') and (Copy(Trimmed, 1, 1) <> '#')
+         and (Pos('=', Trimmed) > 0) then
+      begin
+        Key := Trim(Copy(Trimmed, 1, Pos('=', Trimmed) - 1));
+        if (Header = '') and (Key = 'version') then
+        begin
+          if StringReplace(Trimmed, ' ', '', [rfReplaceAll])
+             <> 'version=' + IntToStr(LOCKFILE_SCHEMA_V3) then
+            raise ELockfileError.CreateFmt(
+              'internal: %s is not a schema-v3 lockfile', [APath]);
+          Written := 'version = ' + IntToStr(LOCKFILE_SCHEMA_VERSION);
+          VersionSeen := True;
+        end
+        else if (EntryIndex >= 0) and (Key = 'computedHash') then
+        begin
+          Written := 'computedHash = "' + AResolved[EntryIndex].Hash + '"';
+          HashWritten[EntryIndex] := True;
+        end
+        else if TableIndex >= 0 then
+          for k := 0 to Accepted.Count - 1 do
+            if Copy(Accepted[k], 1, Length(Key) + 3) = Key + ' = ' then
+            begin
+              Written := Accepted[k];
+              AcceptedWritten[k] := True;
+              Break;
+            end;
+      end;
+      Emit(Written, Lines[i].Ending);
+      if Trimmed <> '' then SectionLast := High(Output);
+    end;
+    CloseSection;
+  finally
+    Accepted.Free;
+  end;
+  if not VersionSeen then
+    raise ELockfileError.CreateFmt(
+      'internal: %s has no top-level schema version line', [APath]);
+  for i := 0 to High(AResolved) do
+    if not HashWritten[i] then
+      raise ELockfileError.CreateFmt(
+        'cannot upgrade %s: it has no [package.%s] table to carry the new '
+        + 'digest', [LWPT.Core.LOCKFILE, AResolved[i].Name]);
+
+  Written := '';
+  for i := 0 to High(Output) do
+    Written := Written + Output[i].Content + Output[i].Ending;
+  AtomicWriteBytes(APath, ATmpRoot, BytesOf(Written));
+
+  { The written document must load as v4 with exactly these digests. }
+  Reloaded := LoadLockfile(APath);
+  for i := 0 to High(AResolved) do
+  begin
+    k := -1;
+    for EntryIndex := 0 to High(Reloaded) do
+      if SameText(Reloaded[EntryIndex].Name, AResolved[i].Name) then
+        k := EntryIndex;
+    if (k < 0) or (Reloaded[k].Hash <> AResolved[i].Hash) then
+      raise ELockfileError.CreateFmt(
+        'internal: the upgraded %s does not record the re-derived digest of '
+        + '"%s"', [LWPT.Core.LOCKFILE, AResolved[i].Name]);
+  end;
+end;
+
 { The upgrade's proof anchors, checked before anything is staged: every
   document a v3 lock table references must be committed under its hash or,
   when absent, available from the per-user document store. A missing or
@@ -5636,45 +5886,34 @@ var
   k, n: Integer;
   Table: TLWPTRegistryLockTable;
   Claims: TLWPTRegistryLockedRecordArray;
-  Hashes: TStringArray;
-
-  procedure Add(const AHash: string);
-  begin
-    SetLength(Hashes, Length(Hashes) + 1);
-    Hashes[High(Hashes)] := AHash;
-  end;
-
-  procedure Require(const AName, AHash: string);
-  var Path: string;
-  begin
-    Path := RegistryProofPath(AArchivesRoot, AHash);
-    if FileExists(Path) then
-    begin
-      if 'sha256:' + SHA256File(Path) = AHash then Exit;
-    end
-    else if LoadRegistryStateDocument(RegistryStateRoot, AHash) <> nil then
-      Exit;
-    raise ELockfileError.Create(SchemaUpgradeProofMessage(AName,
-      ProjectDisplayPath(AProjectRoot, Path)));
-  end;
-
+  Records: TStringArray;
 begin
   for k := 0 to High(AConsumer.LockTables) do
   begin
     Table := AConsumer.LockTables[k];
     Claims := RegistryClaimsFor(ALock, Table.Identity);
     if Length(Claims) = 0 then Continue;
-    Hashes := nil;
-    Add(Table.Checkpoint);
-    Add(Table.Signature);
-    Add(Table.Snapshot);
-    for n := 0 to High(Table.Rotations) do Add(Table.Rotations[n]);
-    for n := 0 to High(Hashes) do
-      if RegistryHashIsCanonical(Hashes[n]) then
-        Require(Claims[0].Name, Hashes[n]);
-    for n := 0 to High(Claims) do
-      if RegistryHashIsCanonical(Claims[n].RecordHash) then
-        Require(Claims[n].Name, Claims[n].RecordHash);
+    SetLength(Records, Length(Claims));
+    for n := 0 to High(Claims) do Records[n] := Claims[n].RecordHash;
+    { The bounded loader checks the rotation count and repeats before any
+      read, and every size before allocation, exactly as --frozen and
+      --offline do. }
+    try
+      LoadLockedRegistrySelection(AArchivesRoot, RegistryStateRoot, Table,
+        Records, DefaultRegistryVerificationLimits);
+    except
+      on E: ELWPTRegistryDocumentError do
+        raise ELockfileError.Create(SchemaUpgradeProofMessage(Claims[0].Name,
+          ProjectDisplayPath(AProjectRoot, E.DocumentPath)));
+      on E: ELWPTRegistryError do
+        raise ELockfileError.Create(SchemaUpgradePrefix
+          + 'the committed selection proof of ' + Table.Identity + ' for "'
+          + Claims[0].Name + '" cannot be loaded within the verification '
+          + 'limits (' + E.Message + '). Restore the committed proof '
+          + 'documents and the lock table, for example from version control, '
+          + 'and run `' + PROGRAM_NAME + ' repair` again.'
+          + SCHEMA_UPGRADE_ALTERNATIVE);
+    end;
   end;
 end;
 
@@ -6214,10 +6453,10 @@ begin
         merged accepted state. Nothing else moves. }
       if Upgrade then
       begin
-        RegistryTables := UpgradedRegistryLockTables(Consumer, Locked,
-          OldLock);
         LockChanged := True;
-        WriteLock(LockfilePath, TmpRoot, Resolved, RegistryTables);
+        WriteUpgradedLock(LockfilePath, TmpRoot, Resolved,
+          Consumer.LockTables, UpgradedRegistryLockTables(Consumer, Locked,
+            OldLock));
       end;
     end
     else

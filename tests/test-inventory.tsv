@@ -107,13 +107,13 @@ program	*	tests/integration/InstallCommitPin.Test.pas	1	12
 program	*	tests/integration/InstallFetchFailure.Test.pas	4	24
 program	*	tests/integration/InstallGitGraph.Test.pas	1	31
 program	*	tests/integration/InstallRegistry.Test.pas	1	48
-program	*	tests/integration/InstallRegistryLocked.Test.pas	1	36
+program	*	tests/integration/InstallRegistryLocked.Test.pas	1	38
 program	*	tests/integration/InstallGraphConflict.Test.pas	1	20
 program	*	tests/integration/InstallLocalDiamond.Test.pas	2	10
 program	*	tests/integration/InstallNestedManifest.Test.pas	1	4
 program	*	tests/integration/InstallProducerLease.Test.pas	1	2
 program	*	tests/integration/InstallSymlinkCycle.Test.pas	1	3
-program	*	tests/integration/LockSchemaUpgrade.Test.pas	1	14
+program	*	tests/integration/LockSchemaUpgrade.Test.pas	1	15
 program	*	tests/integration/Repair.Test.pas	1	10
 program	windows/*	tests/integration/Repair.Test.pas	1	9
 program	*	tests/integration/Run.Test.pas	1	9

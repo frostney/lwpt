@@ -166,6 +166,14 @@ type
     property LockTables: TLWPTRegistryLockTableArray read FLockTables;
   end;
 
+type
+  { A locked proof document that is missing, or whose committed bytes do
+    not hash to its name. DocumentPath is the committed path. }
+  ELWPTRegistryDocumentError = class(ELWPTRegistryError)
+  public
+    DocumentPath: string;
+  end;
+
 function RegistryStateRoot: string;
 function RegistryStatePath(const AIdentity, ATrustKeyId: string): string;
 function RegistryStatePathAt(const ARoot, AIdentity, ATrustKeyId: string): string;
@@ -239,6 +247,10 @@ function RegistryAcceptedStatesEqual(const ALeft,
 function RegistryRotationHashes(
   const ARotations: TLWPTRegistryRotationProofArray): TStringArray;
 function LoadRegistryLockTables(const APath: string; const AAcceptSchemaV3: Boolean = False): TLWPTRegistryLockTableArray;
+{ The accepted-state lines of one [registry."<identity>"] table, exactly as
+  RenderRegistryLockTables writes them. }
+procedure RenderRegistryAcceptedState(const AAccepted: TLWPTRegistryConsumerState;
+  ALines: TStrings);
 procedure RenderRegistryLockTables(const ATables: TLWPTRegistryLockTableArray;
   ALines: TStrings);
 function RegistryProofPath(const AArchivesRoot, AHash: string): string;
@@ -458,6 +470,15 @@ end;
 function ReadLockedRegistryDocument(const AArchivesRoot, AStateRoot,
   AHash: string; const AAllowance: Int64): TBytes;
 var Path: string; Stream: TFileStream;
+
+  procedure RaiseDocument(const ACode, AMessage: string);
+  var Error: ELWPTRegistryDocumentError;
+  begin
+    Error := ELWPTRegistryDocumentError.CreateStable(ACode, AMessage);
+    Error.DocumentPath := Path;
+    raise Error;
+  end;
+
 begin
   Result := nil;
   if not RegistryHashIsCanonical(AHash) then
@@ -474,12 +495,12 @@ begin
       Result := ReadBoundedDocument(RegistryStateDocumentPath(AStateRoot,
         AHash), AHash, AAllowance);
       if Result <> nil then Exit;
-      raise ELWPTRegistryError.CreateStable('registry_proof_missing',
+      RaiseDocument('registry_proof_missing',
         'committed proof document ' + Path + ' is missing, and the per-user '
         + 'document store under ' + AStateRoot + ' has no verified copy '
         + 'within the verification limits');
     end;
-    raise ELWPTRegistryError.CreateStable('registry_proof_missing',
+    RaiseDocument('registry_proof_missing',
       'committed proof document ' + Path + ' is missing');
   end;
   Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
@@ -495,7 +516,7 @@ begin
     Stream.Free;
   end;
   if SHA256BytesPrefixed(Result) <> AHash then
-    raise ELWPTRegistryError.CreateStable('registry_proof_corrupt',
+    RaiseDocument('registry_proof_corrupt',
       'committed proof document ' + Path + ' does not match its hash');
 end;
 
@@ -912,18 +933,30 @@ begin
       KV('publishedAt', Table.PublishedAt);
       KV('expiresAt', Table.ExpiresAt);
       ALines.Add('rotations = ' + QuoteList(Table.Rotations));
-      ALines.Add('acceptedSequence = ' + IntToStr(Table.Accepted.State.Sequence));
-      KV('acceptedSnapshot', Table.Accepted.State.Snapshot);
-      KV('acceptedCheckpoint', Table.Accepted.State.CheckpointHash);
-      KV('acceptedKeyId', Table.Accepted.State.KeyId);
-      KV('acceptedPublishedAt', Table.Accepted.State.PublishedAt);
-      KV('acceptedExpiresAt', Table.Accepted.State.ExpiresAt);
-      ALines.Add('acceptedRotations = ' + QuoteList(Table.Accepted.Rotations));
-      KV('clockFloor', Table.Accepted.State.ClockFloor);
+      RenderRegistryAcceptedState(Table.Accepted, ALines);
     end;
   finally
     Order.Free;
   end;
+end;
+
+procedure RenderRegistryAcceptedState(const AAccepted: TLWPTRegistryConsumerState;
+  ALines: TStrings);
+
+  procedure KV(const AKey, AValue: string);
+  begin
+    ALines.Add(AKey + ' = "' + TomlEscape(AValue) + '"');
+  end;
+
+begin
+  ALines.Add('acceptedSequence = ' + IntToStr(AAccepted.State.Sequence));
+  KV('acceptedSnapshot', AAccepted.State.Snapshot);
+  KV('acceptedCheckpoint', AAccepted.State.CheckpointHash);
+  KV('acceptedKeyId', AAccepted.State.KeyId);
+  KV('acceptedPublishedAt', AAccepted.State.PublishedAt);
+  KV('acceptedExpiresAt', AAccepted.State.ExpiresAt);
+  ALines.Add('acceptedRotations = ' + QuoteList(AAccepted.Rotations));
+  KV('clockFloor', AAccepted.State.ClockFloor);
 end;
 
 { ---------------------------------------------------------------------------

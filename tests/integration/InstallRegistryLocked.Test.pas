@@ -125,6 +125,8 @@ type
     procedure TestRegistryRepairUpgradesWithoutNetwork;
     procedure TestRegistryRepairReplacesForgedTree;
     procedure TestRegistryRepairNeedsItsProofs;
+    procedure TestRegistryRepairRecordsMergedAcceptedState;
+    procedure TestRegistryRepairBoundsProofDocuments;
     procedure TestFrozenLeavesArchiveStorageUntouched;
     procedure TestRepeatedRotationHashesAreRefused;
     procedure TestRotationCountIsBoundedBeforeReading;
@@ -1154,6 +1156,72 @@ begin
   FOrigin.Mode := scmServe;
 end;
 
+procedure TInstallRegistryLocked.TestRegistryRepairRecordsMergedAcceptedState;
+var CaseRoot, V4, V3, Stripped: string; Lines: TStringList; Index: Integer;
+begin
+  { Decision 11: the upgrade is a lock change, so an origin whose recorded
+    accepted state is behind is written with the merged state, here lifted
+    to the selection proof; the edit inserts the missing lines in place. }
+  CaseRoot := Clone(Baseline, 'v3-accepted');
+  V4 := LockText(CaseRoot);
+  V3 := DowngradeLockToV3(CaseRoot + '/project');
+  Lines := TStringList.Create;
+  try
+    Lines.Text := V3;
+    for Index := Lines.Count - 1 downto 0 do
+      if (Copy(Lines[Index], 1, 8) = 'accepted')
+         or (Copy(Lines[Index], 1, 10) = 'clockFloor') then
+        Lines.Delete(Index);
+    Stripped := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+  Expect<Boolean>(Stripped <> V3).ToBe(True);
+  WriteBytesToFile(CaseRoot + '/project/lwpt.lock', BytesOf(Stripped));
+  FOrigin.Mode := scmFail;
+  ExpectSuccess('registry repair accepted state', Run(CaseRoot, ['repair']));
+  Expect<string>(LockText(CaseRoot)).ToBe(V4);
+  Expect<string>(Journal(CaseRoot)).ToBe('');
+  FOrigin.Mode := scmServe;
+end;
+
+procedure TInstallRegistryLocked.TestRegistryRepairBoundsProofDocuments;
+var CaseRoot, V3, Snapshot, Before: string; Oversized: TBytes;
+begin
+  { Repair loads proofs through the bounded loader: an oversized document is
+    refused by its size before it is read, and repeated rotation hashes
+    before any read, with the migration prefix and the lock left v3. }
+  CaseRoot := Clone(Baseline, 'v3-oversized');
+  V3 := DowngradeLockToV3(CaseRoot + '/project');
+  Snapshot := Copy(TableField(CaseRoot, 'snapshot'), 8, 64);
+  SetLength(Oversized, 5 * 1024 * 1024);
+  FillChar(Oversized[0], Length(Oversized), Ord('x'));
+  WriteBytesToFile(CaseRoot + PROOFS + Snapshot + '.toml', Oversized);
+  Before := Fingerprint(CaseRoot);
+  FOrigin.Mode := scmFail;
+  ExpectFailure(Run(CaseRoot, ['repair']), '`' + PROGRAM_NAME
+    + ' repair` cannot upgrade `' + LOCKFILE + '` from schema v3: the '
+    + 'committed selection proof of ' + IDENTITY);
+  ExpectFailure(Run(CaseRoot, ['repair']), 'proof_limit_exceeded');
+  Expect<string>(LockText(CaseRoot)).ToBe(V3);
+  Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+
+  CaseRoot := Clone(Baseline, 'v3-repeated');
+  DowngradeLockToV3(CaseRoot + '/project');
+  Snapshot := TableField(CaseRoot, 'snapshot');
+  EditLock(CaseRoot, #10'rotations = []', #10'rotations = ["' + Snapshot
+    + '", "' + Snapshot + '", "' + Snapshot + '"]');
+  V3 := LockText(CaseRoot);
+  Before := Fingerprint(CaseRoot);
+  ExpectFailure(Run(CaseRoot, ['repair']), 'repeat');
+  ExpectFailure(Run(CaseRoot, ['repair']), 'cannot upgrade `' + LOCKFILE
+    + '` from schema v3');
+  Expect<string>(LockText(CaseRoot)).ToBe(V3);
+  Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  Expect<string>(Journal(CaseRoot)).ToBe('');
+  FOrigin.Mode := scmServe;
+end;
+
 procedure TInstallRegistryLocked.SetArchivesReadOnly(const ACase: string;
   const AReadOnly: Boolean);
 var Entry: TSearchRec; Root: string;
@@ -1307,6 +1375,10 @@ begin
     TestRegistryRepairReplacesForgedTree);
   Test('ADR-0052: repair names a missing registry proof document',
     TestRegistryRepairNeedsItsProofs);
+  Test('ADR-0052: repair writes the merged accepted state into the old table',
+    TestRegistryRepairRecordsMergedAcceptedState);
+  Test('ADR-0052: repair loads proofs within the verification budgets',
+    TestRegistryRepairBoundsProofDocuments);
   Test('review: --frozen never writes beside committed archives, even on failure',
     TestFrozenLeavesArchiveStorageUntouched);
   Test('review: repeated rotation hashes in the lock are refused',
