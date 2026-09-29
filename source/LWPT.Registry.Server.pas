@@ -1710,6 +1710,11 @@ begin
           400, 'Bad Request', 'invalid_request', 'request line is invalid')
       else
       begin
+        { Admission and its refusal get their own processing deadline, so
+          bounded lease waits cannot outlast the header deadline and drop
+          a retryable answer. }
+        if not RegistryMethodIsRead(Head.Method) then
+          FDeadline := GetTickCount64 + RegistryMutationProcessingMilliseconds;
         Response := RegistryDispatch(FStore, FHandler, Head, CheckDeadline,
           Mutation);
         if Assigned(Mutation) then
@@ -1928,8 +1933,13 @@ begin
       Head) then
       Response := RegistryMalformedRequestResponse(FHandler, Request, FPeer,
         400, 'Bad Request', 'invalid_request', 'request line is invalid')
-    else Response := RegistryDispatch(FStore, FHandler, Head, CheckDeadline,
-      Mutation);
+    else
+    begin
+      if not RegistryMethodIsRead(Head.Method) then
+        FDeadline := GetTickCount64 + RegistryMutationProcessingMilliseconds;
+      Response := RegistryDispatch(FStore, FHandler, Head, CheckDeadline,
+        Mutation);
+    end;
     if Assigned(Mutation) then
     begin
       Remaining := Mutation.BodyLength;

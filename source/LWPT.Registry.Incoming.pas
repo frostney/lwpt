@@ -117,7 +117,8 @@ type
 { Runs while the guard is held at 'admission-scan' (after incoming/sha256/,
   before the root), 'reclaim', 'expire', 'complete', and 'adopt'; and at
   'expiry-owned' once admission owns the publication lease to remove
-  expired uploads, before it waits for the guard. }
+  expired uploads, before it waits for the guard; and at 'admission-final'
+  before the admission attempt that follows that removal, holding nothing. }
 procedure SetRegistryIncomingHookForTesting(AHook: TRegistryIncomingHook);
 {$ENDIF}
 
@@ -408,6 +409,9 @@ var
   UploadID, PartPath: string;
   Stream: TFileStream;
 begin
+  {$IFDEF REGISTRY_TESTING}
+  if AFinal then RunHook('admission-final');
+  {$ENDIF}
   UploadID := NewUploadID;
   { The upload's own lease is taken before its reservation exists and before
     any other lease is held. }

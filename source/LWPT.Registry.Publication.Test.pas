@@ -55,6 +55,21 @@ type
       AToken: string; const ABody: TBytes);
   end;
 
+  { Takes a guard as soon as it is free and holds it for a while. }
+  TGuardHolder = class(TThread)
+  private
+    FCoordinator: TLWPTProducerLeaseCoordinator;
+    FKey: string;
+    FHoldMilliseconds: Cardinal;
+  protected
+    procedure Execute; override;
+  public
+    Acquired: PRTLEvent;
+    constructor Create(const ALocks, AKey: string;
+      const AHoldMilliseconds: Cardinal);
+    destructor Destroy; override;
+  end;
+
   TRegistryPublicationContract = class(TTestSuite)
   private
     FScratch, FRoot, FBase, FPrefix, FToken: string;
@@ -123,7 +138,46 @@ type
     procedure TestMalformedMutationsAreAudited;
     procedure TestSlowBodiesHitTheDeadline;
     procedure TestIncompleteMutatingHeadsAreAudited;
+    procedure TestLongAdmissionStillAnswersRetryably;
+  private
+    FFinalHolder: TGuardHolder;
+    procedure SlowAdmissionHook(const APoint: string);
   end;
+
+constructor TGuardHolder.Create(const ALocks, AKey: string;
+  const AHoldMilliseconds: Cardinal);
+begin
+  FCoordinator := TLWPTProducerLeaseCoordinator.Create(ALocks);
+  FKey := AKey;
+  FHoldMilliseconds := AHoldMilliseconds;
+  Acquired := RTLEventCreate;
+  FreeOnTerminate := False;
+  inherited Create(True);
+end;
+
+destructor TGuardHolder.Destroy;
+begin
+  RTLEventDestroy(Acquired);
+  FCoordinator.Free;
+  inherited Destroy;
+end;
+
+procedure TGuardHolder.Execute;
+var
+  Guard: TObject;
+  Started: QWord;
+begin
+  Guard := nil;
+  Started := GetTickCount64;
+  while not Assigned(Guard) and (GetTickCount64 - Started < 10000) do
+  begin
+    Guard := FCoordinator.TryAcquireGuard(FKey);
+    if not Assigned(Guard) then Sleep(1);
+  end;
+  RTLEventSetEvent(Acquired);
+  Sleep(FHoldMilliseconds);
+  Guard.Free;
+end;
 
 constructor TServeThread.Create(AServer: TLWPTRegistryServer);
 begin
@@ -1568,6 +1622,65 @@ begin
   end;
 end;
 
+procedure TRegistryPublicationContract.SlowAdmissionHook(const APoint: string);
+begin
+  { Slow progress while admission owns the publication lease, then another
+    operation holding the accounting guard through the final attempt. }
+  if APoint = 'expiry-owned' then Sleep(3000)
+  else if (APoint = 'admission-final') and Assigned(FFinalHolder) then
+  begin
+    FFinalHolder.Start;
+    RTLEventWaitFor(FFinalHolder.Acquired, 10000);
+  end;
+end;
+
+procedure TRegistryPublicationContract.TestLongAdmissionStillAnswersRetryably;
+var
+  Incoming, Publication: TGuardHolder;
+  Response: TRawHTTPResponse;
+  Started, Elapsed: QWord;
+  Filler: string;
+begin
+  StartOrigin('', '', RegistryTimestampNow);
+  Filler := FRoot + '/incoming/sha256/' + StringOfChar('d', 64);
+  CreateSparseFile(Filler, RegistryIncomingBudgetBytes - 10);
+  FileSetDate(Filler, DateTimeToFileDate(Now - 2 / 24));
+  { Each wait stays inside its bound: 1.5 s for the accounting guard, 4 s
+    more for the publication lease, 3 s of slow expiry, then a final
+    accounting wait that times out. Together they pass the 10-second header
+    deadline, and the retryable answer must still arrive. }
+  Incoming := TGuardHolder.Create(FRoot + '/locks', REGISTRY_INCOMING_LEASE, 1500);
+  Publication := TGuardHolder.Create(FRoot + '/locks', 'registry-publication',
+    5500);
+  FFinalHolder := TGuardHolder.Create(FRoot + '/locks', REGISTRY_INCOMING_LEASE,
+    3000);
+  try
+    Incoming.Start;
+    Publication.Start;
+    RTLEventWaitFor(Incoming.Acquired, 5000);
+    RTLEventWaitFor(Publication.Acquired, 5000);
+    SetRegistryIncomingHookForTesting(SlowAdmissionHook);
+    Started := GetTickCount64;
+    Response := Upload(Bytes('patient upload'));
+    Elapsed := GetTickCount64 - Started;
+    Expect<Integer>(Response.Status).ToBe(503);
+    Expect<Boolean>(RawHTTPHeader(Response, 'Retry-After') <> '').ToBe(True);
+    Expect<Boolean>(Elapsed >= 10000).ToBe(True);
+    { The expired upload was removed; only the final wait failed. }
+    Expect<Boolean>(FileExists(Filler)).ToBe(False);
+  finally
+    SetRegistryIncomingHookForTesting(nil);
+    if FFinalHolder.Suspended then FFinalHolder.Start;
+    FFinalHolder.WaitFor;
+    FreeAndNil(FFinalHolder);
+    Incoming.WaitFor;
+    Publication.WaitFor;
+    Incoming.Free;
+    Publication.Free;
+  end;
+  Expect<Integer>(Upload(Bytes('patient upload')).Status).ToBe(201);
+end;
+
 procedure TRegistryPublicationContract.SetupTests;
 begin
   Test('a token holder uploads and publishes over HTTP', TestPublicationRoundTrip);
@@ -1615,6 +1728,8 @@ begin
   Test('a slow body is cut off at its deadline', TestSlowBodiesHitTheDeadline);
   Test('incomplete mutating heads are audited once on EOF and deadline',
     TestIncompleteMutatingHeadsAreAudited);
+  Test('an admission that waits past the header deadline still answers 503',
+    TestLongAdmissionStillAnswersRetryably);
 end;
 
 begin

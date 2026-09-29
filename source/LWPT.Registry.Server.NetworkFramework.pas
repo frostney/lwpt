@@ -776,6 +776,11 @@ begin
     Exit;
   end;
   FMethod := Head.Method;
+  { Admission and its refusal get their own processing deadline, so bounded
+    lease waits cannot outlast the header deadline and drop a retryable
+    answer. }
+  if not RegistryMethodIsRead(Head.Method) then
+    FDeadline := GetTickCount64 + RegistryMutationProcessingMilliseconds;
   Response := RegistryDispatch(FServer.FStore, FServer.FHandler, Head,
     CheckDeadline, Mutation);
   if not Assigned(Mutation) then
