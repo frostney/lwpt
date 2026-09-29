@@ -176,13 +176,34 @@ function LoadRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string
   acquisition can authenticate an older contact against it. }
 procedure MergeRegistryConsumerState(const AIdentity, ATrustKeyId: string;
   const AState: TLWPTRegistryConsumerState;
-  const ARotations: TLWPTRegistryRotationProofArray);
+  const ARotations: TLWPTRegistryRotationProofArray;
+  const AHistory: TLWPTRegistryDocumentArray);
+{ Failure contract: documents are admitted to the content-addressed store
+  before the state file is replaced, and nothing is rolled back when a later
+  step fails. A retained document only ever adds authenticated history, and
+  the state file only ever moves forward, so a failure leaves per-user state
+  at the old or the new high-water mark, never lower. No atomicity across
+  origins, documents, and project state is claimed. }
 procedure MergeRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
   const AState: TLWPTRegistryConsumerState;
-  const ARotations: TLWPTRegistryRotationProofArray);
+  const ARotations: TLWPTRegistryRotationProofArray;
+  const AHistory: TLWPTRegistryDocumentArray);
 { One document of the per-user store, or nil when it is absent or its bytes
   do not hash to AHash. }
 function LoadRegistryStateDocument(const ARoot, AHash: string): TBytes;
+{ A document by hash from the per-user store, then the committed proofs.
+  Nil when absent, larger than AMaximumBytes (checked before reading), or
+  not hashing to AHash. }
+function ReadLocalRegistryDocument(const AStateRoot, AArchivesRoot,
+  AHash: string; const AMaximumBytes: Int64): TBytes;
+{ The rotation chain named by AHashes (document, old, new per rotation),
+  loaded locally within ALimits: the count and every hash are checked before
+  anything is allocated, each size before it is read, and the running total
+  before each read. False for a repeated hash, an exceeded limit, or any
+  unavailable document; the chain is then simply not supplied. }
+function LoadRegistryRotationChain(const AStateRoot, AArchivesRoot: string;
+  const AHashes: TStringArray; const ALimits: TLWPTRegistryVerificationLimits;
+  out AChain: TLWPTRegistryRotationProofArray): Boolean;
 { The newer of two accepted states; the floor is the later of both. }
 function MergeRegistryAcceptedStates(const ALeft,
   ARight: TLWPTRegistryConsumerState): TLWPTRegistryConsumerState;
@@ -253,6 +274,15 @@ end;
   Per-user accepted state
   --------------------------------------------------------------------------- }
 
+const
+  { One protocol metadata document never exceeds this, as in verification. }
+  MaximumRegistryDocumentBytes = 4 * 1024 * 1024;
+
+function Min64(const ALeft, ARight: Int64): Int64;
+begin
+  if ALeft < ARight then Result := ALeft else Result := ARight;
+end;
+
 function RegistryStateRoot: string;
 var Configured: string;
 begin
@@ -280,22 +310,100 @@ begin
     + RegistryDigestHex(AHash) + '.toml';
 end;
 
-function LoadRegistryStateDocument(const ARoot, AHash: string): TBytes;
-var Path: string; Stream: TFileStream;
+function ReadBoundedDocument(const APath, AHash: string;
+  const AMaximumBytes: Int64): TBytes;
+var Stream: TFileStream;
 begin
   Result := nil;
-  if not RegistryHashIsCanonical(AHash) then Exit;
-  Path := RegistryStateDocumentPath(ARoot, AHash);
-  if not FileExists(Path) then Exit;
-  Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+  if not FileExists(APath) then Exit;
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
-    if Stream.Size > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then Exit;
+    if (Stream.Size > AMaximumBytes)
+       or (Stream.Size > MaximumRegistryDocumentBytes) then Exit;
     SetLength(Result, Stream.Size);
     if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
   finally
     Stream.Free;
   end;
   if SHA256BytesPrefixed(Result) <> AHash then Result := nil;
+end;
+
+function LoadRegistryStateDocument(const ARoot, AHash: string): TBytes;
+begin
+  Result := nil;
+  if not RegistryHashIsCanonical(AHash) then Exit;
+  Result := ReadBoundedDocument(RegistryStateDocumentPath(ARoot, AHash), AHash,
+    MaximumRegistryDocumentBytes);
+end;
+
+function ReadLocalRegistryDocument(const AStateRoot, AArchivesRoot,
+  AHash: string; const AMaximumBytes: Int64): TBytes;
+begin
+  Result := nil;
+  if not RegistryHashIsCanonical(AHash) then Exit;
+  if AStateRoot <> '' then
+    Result := ReadBoundedDocument(RegistryStateDocumentPath(AStateRoot, AHash),
+      AHash, AMaximumBytes);
+  if (Result = nil) and (AArchivesRoot <> '') then
+    Result := ReadBoundedDocument(RegistryProofPath(AArchivesRoot, AHash),
+      AHash, AMaximumBytes);
+end;
+
+function LoadRegistryRotationChain(const AStateRoot, AArchivesRoot: string;
+  const AHashes: TStringArray; const ALimits: TLWPTRegistryVerificationLimits;
+  out AChain: TLWPTRegistryRotationProofArray): Boolean;
+var
+  Seen: TStringList;
+  Index, Count: Integer;
+  Total: Int64;
+  Parts: array[0..2] of TBytes;
+  Part: Integer;
+begin
+  AChain := nil;
+  Result := False;
+  if (Length(AHashes) = 0) or ((Length(AHashes) mod 3) <> 0) then
+    Exit(Length(AHashes) = 0);
+  Count := Length(AHashes) div 3;
+  if Count > ALimits.Rotations then Exit;
+  Seen := TStringList.Create;
+  try
+    Seen.Sorted := True;
+    Seen.CaseSensitive := True;
+    for Index := 0 to High(AHashes) do
+    begin
+      if not RegistryHashIsCanonical(AHashes[Index])
+         or (Seen.IndexOf(AHashes[Index]) >= 0) then Exit;
+      Seen.Add(AHashes[Index]);
+    end;
+  finally
+    Seen.Free;
+  end;
+  Total := 0;
+  SetLength(AChain, Count);
+  for Index := 0 to Count - 1 do
+  begin
+    for Part := 0 to 2 do
+    begin
+      if ALimits.TotalBytes - Total < 1 then
+      begin
+        AChain := nil;
+        Exit;
+      end;
+      Parts[Part] := ReadLocalRegistryDocument(AStateRoot, AArchivesRoot,
+        AHashes[3 * Index + Part], Min64(ALimits.DocumentBytes,
+          ALimits.TotalBytes - Total));
+      if Parts[Part] = nil then
+      begin
+        AChain := nil;
+        Exit;
+      end;
+      Inc(Total, Length(Parts[Part]));
+    end;
+    AChain[Index].Document := Parts[0];
+    AChain[Index].OldSignature := Parts[1];
+    AChain[Index].NewSignature := Parts[2];
+  end;
+  Result := True;
 end;
 
 function QuoteList(const AValues: TStringArray): string;
@@ -459,10 +567,11 @@ end;
 
 procedure MergeRegistryConsumerState(const AIdentity, ATrustKeyId: string;
   const AState: TLWPTRegistryConsumerState;
-  const ARotations: TLWPTRegistryRotationProofArray);
+  const ARotations: TLWPTRegistryRotationProofArray;
+  const AHistory: TLWPTRegistryDocumentArray);
 begin
   MergeRegistryConsumerStateAt(RegistryStateRoot, AIdentity, ATrustKeyId,
-    AState, ARotations);
+    AState, ARotations, AHistory);
 end;
 
 function StateLeaseWaitMilliseconds: QWord;
@@ -476,7 +585,8 @@ end;
 
 procedure MergeRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
   const AState: TLWPTRegistryConsumerState;
-  const ARotations: TLWPTRegistryRotationProofArray);
+  const ARotations: TLWPTRegistryRotationProofArray;
+  const AHistory: TLWPTRegistryDocumentArray);
 var
   Root, Path: string;
   Coordinator: TLWPTProducerLeaseCoordinator;
@@ -514,7 +624,8 @@ begin
       Sleep(PRODUCER_LEASE_POLL_MILLISECONDS);
     until False;
     {$IFDEF INSTALL_TESTING}
-    if TestSeamValue('FAIL_REGISTRY_STATE_WRITE') = '1' then
+    if (TestSeamValue('FAIL_REGISTRY_STATE_WRITE') = '1')
+       or (TestSeamValue('FAIL_REGISTRY_STATE_WRITE') = AIdentity) then
       raise ELWPTRegistryError.CreateStable('registry_state_write_failed',
         'injected per-user registry state write failure');
     {$ENDIF}
@@ -524,6 +635,11 @@ begin
       StoreDocument(ARotations[Index].OldSignature);
       StoreDocument(ARotations[Index].NewSignature);
     end;
+    { The verified snapshots and records let a later acquisition classify
+      a lagging contact that lacks newer history, as the mirror does with
+      its retained proof. }
+    for Index := 0 to High(AHistory) do
+      StoreDocument(AHistory[Index].Bytes);
     Merged := AState;
     Merged.State.Origin := AIdentity;
     Current := Default(TLWPTRegistryConsumerState);
@@ -679,7 +795,7 @@ type
 
   TLWPTConsumerDocumentSource = class(TLWPTRegistryDocumentSource)
   public
-    API: string;
+    API, StateRoot, ArchivesRoot: string;
     Policy: THTTPDestinationPolicy;
     Deadline: QWord;
     function ReadDocument(const APath: string;
@@ -718,6 +834,11 @@ begin
   else
     raise ELWPTRegistryError.CreateStable('invalid_resource_path',
       'unexpected proof resource');
+  { Authenticated history retained locally is consulted first; the
+    verifier hashes every document again. }
+  Result := ReadLocalRegistryDocument(StateRoot, ArchivesRoot, 'sha256:'
+    + Copy(APath, Pos('/sha256/', APath) + Length('/sha256/'), 64), AMaximumBytes);
+  if Result <> nil then Exit;
   Result := GetRegistryDocument(API + '/' + APath, RegistryMediaType(Kind),
     AMaximumBytes, RemainingMilliseconds(Deadline), Policy);
 end;
@@ -790,46 +911,12 @@ begin
 end;
 
 { The exact rotation chain of an accepted state, from the per-user document
-  store or the committed proofs. False when any document is unavailable. }
+  store or the committed proofs, within the verifier's limits. }
 function TLWPTRegistrySession.AcceptedChain(const AHashes: TStringArray;
   out AChain: TLWPTRegistryRotationProofArray): Boolean;
-
-  function Load(const AHash: string): TBytes;
-  var Path: string; Stream: TFileStream;
-  begin
-    Result := LoadRegistryStateDocument(RegistryStateRoot, AHash);
-    if (Result <> nil) or (FOwner.ArchivesRoot = '') then Exit;
-    Path := RegistryProofPath(FOwner.ArchivesRoot, AHash);
-    if not FileExists(Path) then Exit;
-    Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
-    try
-      if Stream.Size > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then Exit;
-      SetLength(Result, Stream.Size);
-      if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
-    finally
-      Stream.Free;
-    end;
-    if SHA256BytesPrefixed(Result) <> AHash then Result := nil;
-  end;
-
-var Index: Integer;
 begin
-  AChain := nil;
-  Result := (Length(AHashes) mod 3) = 0;
-  if not Result then Exit;
-  SetLength(AChain, Length(AHashes) div 3);
-  for Index := 0 to High(AChain) do
-  begin
-    AChain[Index].Document := Load(AHashes[3 * Index]);
-    AChain[Index].OldSignature := Load(AHashes[3 * Index + 1]);
-    AChain[Index].NewSignature := Load(AHashes[3 * Index + 2]);
-    if (AChain[Index].Document = nil) or (AChain[Index].OldSignature = nil)
-       or (AChain[Index].NewSignature = nil) then
-    begin
-      AChain := nil;
-      Exit(False);
-    end;
-  end;
+  Result := LoadRegistryRotationChain(RegistryStateRoot, FOwner.ArchivesRoot,
+    AHashes, DefaultRegistryVerificationLimits, AChain);
 end;
 
 { True when ALeft's hashes are a prefix of ARight's. }
@@ -1011,6 +1098,8 @@ begin
     TrustRoot.PublicKey := FDeclaration.PublicKey;
     Source := TLWPTConsumerDocumentSource.Create;
     Source.API := Acquisition.Discovery.API;
+    Source.StateRoot := RegistryStateRoot;
+    Source.ArchivesRoot := FOwner.ArchivesRoot;
     Source.Policy := RegistryContactDestination(AContact);
     Source.Deadline := Acquisition.Deadline;
     { Freshness is judged when the proof is verified, not when the install
@@ -1221,6 +1310,11 @@ begin
   end;
 end;
 
+{ Origins persist one after another. When a later origin fails, earlier
+  origins' advances and every admitted document remain: they are
+  authenticated and monotonic, and undoing them could lower state another
+  concurrent install already relies on. The install still fails and rolls
+  project state back (see MergeRegistryConsumerStateAt). }
 procedure TLWPTRegistryConsumer.PersistAcceptedState;
 var Index: Integer; Session: TLWPTRegistrySession;
 begin
@@ -1230,7 +1324,7 @@ begin
     if not Session.Acquired then Continue;
     try
       MergeRegistryConsumerState(Session.Identity, Session.Declaration.KeyId,
-        Session.UserAccepted, Session.ProofRotations);
+        Session.UserAccepted, Session.ProofRotations, Session.Verified.Documents);
     except
       on E: Exception do
         raise ELWPTRegistryError.CreateStable('registry_state_not_persisted',
