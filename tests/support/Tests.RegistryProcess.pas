@@ -38,7 +38,8 @@ function StopRegistryProcess(var AProcess: TProcess;
   recovery when another process takes it before the registry binds. }
 function FindAvailableRegistryTestPort: Word;
 { Moves an initialized data directory's transport to APort and returns the
-  new base URL. The origin identity and role stay as initialized. }
+  new base URL, keeping its scheme, host, and path. The origin identity and
+  role stay as initialized. }
 function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
   const APort: Word): string;
 { Starts `registry serve` and returns once this child has announced that it
@@ -47,11 +48,13 @@ function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
   directory is moved to a fresh port, ABaseURL is updated (keeping its scheme
   and path), and the start is retried a bounded number of times. AEnvironment
   entries ("KEY=value") are added to the inherited environment, and a
-  nonempty AWorkingDirectory becomes the child's current directory. Callers
+  nonempty AWorkingDirectory becomes the child's current directory, and a
+  nonempty AExecutable replaces LwptBinaryPath (e.g. the test build). Callers
   that serve HTTPS, or that probe readiness themselves, use this directly. }
 function LaunchRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
   const AEnvironment: array of string; const AWorkingDirectory: string = '';
-  const AAllowRelocation: Boolean = True): TProcess;
+  const AAllowRelocation: Boolean = True;
+  const AExecutable: string = ''): TProcess;
 procedure StopRegistryCLI(var AProcess: TProcess);
 
 implementation
@@ -193,13 +196,19 @@ function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
 var
   Lines: TStringList;
   Index: Integer;
-  Authority, Path: string;
+  Authority, Host, Path: string;
 begin
   Authority := Copy(ABaseURL, Pos('://', ABaseURL) + 3, MaxInt);
   Path := '';
   if Pos('/', Authority) > 0 then
+  begin
     Path := Copy(Authority, Pos('/', Authority), MaxInt);
-  Result := Copy(ABaseURL, 1, Pos('://', ABaseURL) + 2) + 'localhost:'
+    Authority := Copy(Authority, 1, Pos('/', Authority) - 1);
+  end;
+  { Test registries use a DNS name or an IPv4 address, never IPv6. }
+  Host := Authority;
+  if Pos(':', Host) > 0 then Host := Copy(Host, 1, Pos(':', Host) - 1);
+  Result := Copy(ABaseURL, 1, Pos('://', ABaseURL) + 2) + Host + ':'
     + IntToStr(APort) + Path;
   Lines := TStringList.Create;
   try
@@ -225,7 +234,7 @@ end;
 
 function LaunchRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
   const AEnvironment: array of string; const AWorkingDirectory: string;
-  const AAllowRelocation: Boolean): TProcess;
+  const AAllowRelocation: Boolean; const AExecutable: string): TProcess;
 var
   Started: QWord;
   Attempt: Integer;
@@ -236,7 +245,8 @@ begin
   for Attempt := 1 to RegistryStartAttempts do
   begin
     Result := TProcess.Create(nil);
-    Result.Executable := LwptBinaryPath;
+    if AExecutable <> '' then Result.Executable := AExecutable
+    else Result.Executable := LwptBinaryPath;
     Result.Options := [poUsePipes];
     if AWorkingDirectory <> '' then
       Result.CurrentDirectory := AWorkingDirectory;

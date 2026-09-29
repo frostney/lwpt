@@ -10,8 +10,9 @@ portability assumptions behind them.
 - **Registry service deployment is Linux-container-first.** The example image in
   [`docs/examples/registry/`](./examples/registry/) installs a released `lwpt`
   binary pinned by SHA-256, runs `lwpt registry serve` as UID 10001 with a
-  read-only root file system, keeps all state on one data volume, and
-  checks health through the discovery endpoint. It is documentation, not a
+  read-only root file system and a read-only configuration mount, keeps all
+  other state on one data volume, and checks health through the discovery
+  endpoint. It is documentation, not a
   second build system. `./build/lwpt build` remains LWPT's only build.
 - **Clients and verification work on every release platform.** `registry
   publish`, mirror `sync` and `verify`, and registry-backed `lwpt install`
@@ -107,10 +108,25 @@ docker run --rm \
 ```
 
 `init` writes `registry.toml`, generates the Ed25519 signing key inside the
-volume, and signs sequence 1. Re-running `init` later may move the base URL,
-listener, or TLS paths. It never changes the identity.
+volume, and signs sequence 1.
 
-**2. Publish the trust pin out of band.** Consumers (`[registries]` `key-id`
+**2. Export the configuration.** `registry.toml` holds the identity, the
+listener, and the TLS paths, and on a mirror the root pin. Only `init`
+writes it. `serve`, `issue-token`, `revoke-token`, `rotate-key`, `verify`,
+and `sync` read it and write only other paths in the data directory. Copy
+it to a root-owned host file that the serving container mounts read-only
+over the volume's copy, so the serving account cannot rewrite, replace, or
+remove its own identity or pin:
+
+```sh
+install -d -m 0755 /srv/lwpt-registry/config
+docker run --rm --entrypoint cat -v lwpt-registry:/var/lib/lwpt-registry:ro \
+  lwpt-registry:<version> /var/lib/lwpt-registry/registry.toml \
+  > /srv/lwpt-registry/config/registry.toml
+chmod 0444 /srv/lwpt-registry/config/registry.toml
+```
+
+**3. Publish the trust pin out of band.** Consumers (`[registries]` `key-id`
 and `public-key`), mirrors, and publishers pin the root key:
 
 ```sh
@@ -119,20 +135,37 @@ docker run --rm --entrypoint sh -v lwpt-registry:/var/lib/lwpt-registry:ro \
 ```
 
 Copy `key_id` and `public_key` from that record. After a key rotation this
-directory holds several records. The root pin stays the first one, and
-clients follow the signed rotation chain from it.
+directory holds several records. The root pin stays the record with
+`valid_from_sequence = 1`, and clients follow the signed rotation chain from
+it.
 
-**3. Serve.**
+**4. Serve.**
 
 ```sh
 docker run --detach --name lwpt-registry --restart unless-stopped \
   --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
   --stop-timeout 15 -p 443:8443 \
   -v lwpt-registry:/var/lib/lwpt-registry \
+  -v /srv/lwpt-registry/config/registry.toml:/var/lib/lwpt-registry/registry.toml:ro \
   -v /srv/lwpt-registry/secrets:/run/secrets:ro \
   -e LWPT_REGISTRY_TLS_PASSWORD_FILE=/run/secrets/tls-password \
   lwpt-registry:<version>
 ```
+
+**Reconfiguration.** `init` cannot rewrite a read-only mount, and a serving
+process never needs to. To move the base URL, listener, or TLS paths:
+
+1. Stop and remove the serving container. Replacing the host file while a
+   container has it mounted would leave that container on the old file.
+2. Run `registry init` with the new values in a one-off container that
+   mounts the volume and the secrets but not the configuration file, as in
+   step 1. It updates the volume's copy atomically and refuses to change
+   the identity or, on a mirror, the root pin.
+3. Export the configuration again, as in step 2.
+4. Start the serving container as in step 4.
+
+The volume's copy and the host file are then identical. Back up the host
+file with the volume.
 
 A read-only root needs a writable `/tmp`: `registry init` keeps its
 initialization lease in the temporary directory, and `--silent` journals
@@ -177,8 +210,11 @@ Mirrors keep serving during the restart.
   named at `init` (`--tls-password-env`) while constructing the listener,
   and never persists it. Set `LWPT_REGISTRY_TLS_PASSWORD_FILE` to a mounted
   file to keep the value out of `docker inspect`. The entry point exports
-  the file's content under the variable name used above. The process
-  environment still holds it for the life of the process.
+  the file's content under the variable name used above, so the process
+  environment holds it for the life of the process. Only the same UID and
+  a sufficiently privileged root can read `/proc/<pid>/environ`, and they
+  can already read the mounted password file, so the environment copy
+  exposes nothing the file does not.
 - **Publication tokens.** Issue one per publisher and scope it to package
   patterns. The token is printed once and stored only as a hash:
 
@@ -203,9 +239,12 @@ Mirrors keep serving during the restart.
   verify the dual-signed rotation. A retry after a completed rotation fails
   its precondition instead of rotating twice.
 - **The volume is the trust boundary.** Anyone who can write it can replace
-  the identity, root pin, or keys (ADR-0045). Give it to UID 10001 alone, and
-  run `docker exec` operations as that user, which is the image default. Do
-  not place it on shared or network-writable storage.
+  the keys, tokens, and signed state, and without the read-only
+  configuration mount the identity and root pin too (ADR-0045). Give it to
+  UID 10001 alone, and run `docker exec` operations as that user, which is
+  the image default. `issue-token`, `revoke-token`, and `rotate-key` work in
+  the serving container with the configuration mounted read-only. Do not
+  place the volume on shared or network-writable storage.
 
 ## Behind a reverse proxy
 
@@ -266,7 +305,9 @@ docker run --rm -v lwpt-mirror:/var/lib/lwpt-registry \
     --tls-password-env LWPT_REGISTRY_TLS_PASSWORD
 ```
 
-Serve it like an origin. Synchronization is explicit. Run it from the host's
+Export its configuration and serve it like an origin; the read-only mount
+matters most here because a mirror's `registry.toml` holds its root pin.
+Synchronization is explicit. Run it from the host's
 scheduler, such as cron or a systemd timer, against the serving container:
 
 ```sh
@@ -300,7 +341,7 @@ reference in [`architecture.md`](./architecture.md).
 
 | Path | Contents | Notes |
 | --- | --- | --- |
-| `registry.toml` | Identity, base URL, listener, TLS paths, mirror pin | Needed to open the store |
+| `registry.toml` | Identity, base URL, listener, TLS paths, mirror pin | Needed to open the store. Back up the read-only host copy too; it must match the volume's. |
 | `state/current.toml` | The activation pointer: sequence, snapshot, checkpoint, signature, clock floor | Defines what the registry serves |
 | `keys/` | Public key records and the **private signing seeds** | Secret. Encrypt the backup and preserve owner-only permissions. |
 | `auth/tokens/` | Token metadata and secret hashes | Owner-only. A restore reinstates the tokens it contains. |
@@ -328,10 +369,11 @@ removed. Any of these produces a restorable copy:
 
 **Restore.** Restore onto a volume owned by UID 10001, with permissions
 preserved. Run `lwpt registry verify --data-dir <dir>` to confirm the
-sequence, then start the image. The first start re-verifies the activated
-checkpoint, signature, and snapshot, reclaims staging, and rebuilds indexes.
-To move the base URL or listener, re-run `registry init` with the new
-values. The identity is kept.
+sequence, export the configuration again, then start the image. The first
+start re-verifies the activated checkpoint, signature, and snapshot, reclaims
+staging, and rebuilds indexes. To move the base URL or listener, follow the
+[reconfiguration](#run-an-origin-with-direct-tls) steps. The identity is
+kept.
 
 **Rollback hazard.** A restored origin serves the sequence its backup
 recorded. Consumers and mirrors that already accepted a later sequence
@@ -434,7 +476,7 @@ retention or checkpointed-history design would need a protocol change.
 | Evidence | Where | Platforms |
 | --- | --- | --- |
 | Registry E2E matrix: localhost HTTP development with live publication, reads, install, and restart; mirror sync, outage serving, and failover both ways; a publication crashed before activation and its recovery; key rotation while serving; HTTPS by host name and by IP address; future schemas failing closed; pointer-first backup, restore, and the refused rollback | [`tests/e2e/RegistryMatrix.E2E.Test.pas`](../tests/e2e/RegistryMatrix.E2E.Test.pas) in every `ci.yml` E2E run; a failing case uploads its scratch directory | All six release targets (Linux, macOS, and Windows runners) |
-| Container smoke: a wrong pin fails the build; the image runs as UID 10001 on a read-only root; health check; live publication from the runner; graceful stop, container replacement, and data survival; the re-encrypting nginx proxy | [`.github/ci/registry-container/smoke.sh`](../.github/ci/registry-container/smoke.sh): `ci.yml` job `registry-container` on the binary under test, and `release.yml` job `registry-container-smoke` on the published assets | Linux x86-64 |
+| Container smoke: a wrong pin fails the build; the image runs as UID 10001 with a read-only root and configuration that the service account cannot write, replace, or remove; health check; token issuance and key rotation in the serving container; live publication from the runner; graceful stop, the reconfiguration procedure, container replacement, and data survival; the re-encrypting nginx proxy | [`.github/ci/registry-container/smoke.sh`](../.github/ci/registry-container/smoke.sh): `ci.yml` job `registry-container` on the binary under test, and `release.yml` job `registry-container-smoke` on the published assets | Linux x86-64 |
 
 The E2E matrix trusts the committed test root through the test build only,
 so HTTPS consumers and mirrors are exercised over localhost HTTP. The

@@ -27,7 +27,8 @@ const
 type
   TPublishOrigin = class
   private
-    FScratch, FData, FBase, FHost, FKeyID, FPublicKey, FOutputs: string;
+    FScratch, FData, FBase, FHost, FIdentity, FKeyID, FPublicKey,
+      FOutputs: string;
     FListenPort: Word;
     FHTTPS: Boolean;
     FServe: TProcess;
@@ -53,7 +54,11 @@ type
     procedure ExpireToken(const AToken: string);
     procedure Start(const ATesting: Boolean = False);
     { Start with AEnvironment ("KEY=value") added to the child's
-      environment, e.g. a test-build seam. }
+      environment, e.g. a test-build seam. Readiness requires the child's
+      own bind announcement, then this registry's discovery document. When
+      the base URL and listener share a port, a port another process took
+      after it was chosen moves the origin to a fresh one (Base changes,
+      Identity does not). }
     procedure StartWith(const ATesting: Boolean;
       const AEnvironment: array of string);
     procedure Stop;
@@ -67,6 +72,8 @@ type
     function LatestSequence: Integer;
     property Base: string read FBase;
     property Host: string read FHost;
+    { The origin identity fixed at initialization; Base may move. }
+    property Identity: string read FIdentity;
     property DataDirectory: string read FData;
     property KeyID: string read FKeyID;
     property PublicKey: string read FPublicKey;
@@ -107,6 +114,8 @@ uses
   {$IFDEF MSWINDOWS}
   Windows,
   {$ENDIF}
+  StrUtils,
+
   HTTPClient,
   Tests.RegistryOrigin,
   Tests.Scratch,
@@ -320,16 +329,23 @@ begin
   if AHTTPS then
     Run := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
       '--port', IntToStr(AListenPort), '--tls-pkcs12', TLSFixturePath,
-      '--tls-password-env', PasswordVariable], FScratch, Environment)
+      '--tls-password-env', PasswordVariable], FScratch, Environment,
+      PUBLISH_RUN_TIMEOUT_MILLISECONDS)
   else if AIdentity <> '' then
     Run := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
-      '--port', IntToStr(AListenPort), '--identity', AIdentity], FScratch)
+      '--port', IntToStr(AListenPort), '--identity', AIdentity], FScratch, [],
+      PUBLISH_RUN_TIMEOUT_MILLISECONDS)
   else
     Run := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
-      '--port', IntToStr(AListenPort)], FScratch);
+      '--port', IntToStr(AListenPort)], FScratch, [],
+      PUBLISH_RUN_TIMEOUT_MILLISECONDS);
+  if Run.TimedOut then
+    raise Exception.Create('registry init exceeded its bound');
   FOutputs := FOutputs + Run.Stdout + Run.Stderr;
   if Run.ExitCode <> 0 then
     raise Exception.Create('registry init failed: ' + Run.Stderr);
+  if AIdentity <> '' then FIdentity := AIdentity
+  else FIdentity := FBase;
   ReadPin;
 end;
 
@@ -381,7 +397,7 @@ var
   Run: TLwptResult;
 begin
   Run := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
-    '--port', IntToStr(APort)], FScratch);
+    '--port', IntToStr(APort)], FScratch, [], PUBLISH_RUN_TIMEOUT_MILLISECONDS);
   if Run.ExitCode <> 0 then
     raise Exception.Create('registry re-init failed: ' + Run.Stderr);
   FListenPort := APort;
@@ -400,7 +416,7 @@ begin
   Arguments[2] := '--data-dir';
   Arguments[3] := FData;
   for Index := 0 to High(AExtra) do Arguments[4 + Index] := AExtra[Index];
-  Run := RunLwpt(Arguments, FScratch);
+  Run := RunLwpt(Arguments, FScratch, [], PUBLISH_RUN_TIMEOUT_MILLISECONDS);
   if Run.ExitCode <> 0 then
     raise Exception.Create('issue-token failed: ' + Run.Stderr);
   Result := Trim(Run.Stdout);
@@ -422,7 +438,7 @@ var
   Run: TLwptResult;
 begin
   Run := RunLwpt(['registry', 'revoke-token', '--data-dir', FData, '--token-id',
-    TokenID(AToken)], FScratch);
+    TokenID(AToken)], FScratch, [], PUBLISH_RUN_TIMEOUT_MILLISECONDS);
   if Run.ExitCode <> 0 then
     raise Exception.Create('revoke-token failed: ' + Run.Stderr);
 end;
@@ -511,47 +527,54 @@ var
   Ready: Boolean;
   Variables: TStringArray;
   Index: Integer;
+  Executable, BaseURL, LastProbe, Discovery: string;
+  Relocatable: Boolean;
 begin
   if FServe <> nil then raise Exception.Create('origin already serving');
-  FServe := TProcess.Create(nil);
-  try
-    if ATesting then FServe.Executable := ExpectedExe(LwptTestingBinaryPath)
-    else FServe.Executable := ExpectedExe(LwptBinaryPath);
-    FServe.CurrentDirectory := FScratch;
-    FServe.Options := [poUsePipes];
-    FServe.Parameters.Add('registry');
-    FServe.Parameters.Add('serve');
-    FServe.Parameters.Add('--data-dir');
-    FServe.Parameters.Add(FData);
-    Variables := Environment;
-    for Index := 0 to High(AEnvironment) do
-    begin
-      SetLength(Variables, Length(Variables) + 1);
-      Variables[High(Variables)] := AEnvironment[Index];
-    end;
-    if Length(Variables) > 0 then ConfigureProcessEnvironment(FServe, Variables);
-    BindRegistryChildToParent(FServe);
-    FServe.Execute;
-  except
-    FreeAndNil(FServe);
-    raise;
+  if ATesting then Executable := ExpectedExe(LwptTestingBinaryPath)
+  else Executable := ExpectedExe(LwptBinaryPath);
+  Variables := Environment;
+  for Index := 0 to High(AEnvironment) do
+  begin
+    SetLength(Variables, Length(Variables) + 1);
+    Variables[High(Variables)] := AEnvironment[Index];
   end;
+  { A relay may own the advertised port; only a direct origin can move. }
+  Relocatable := EndsStr(':' + IntToStr(FListenPort), FBase);
+  BaseURL := FBase;
+  FServe := LaunchRegistryCLI(FData, BaseURL, Variables, FScratch, Relocatable,
+    Executable);
+  if BaseURL <> FBase then
+  begin
+    FBase := BaseURL;
+    FListenPort := StrToInt(Copy(BaseURL, LastDelimiter(':', BaseURL) + 1,
+      MaxInt));
+  end;
+  { The child owns the port now; its discovery must name this registry. }
   Started := GetTickCount64;
   Ready := False;
+  LastProbe := 'no probe';
   repeat
     FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
       + DrainAvailableStream(FServe.Stderr, 65536);
     try
-      Ready := Request('GET', '/.well-known/' + RegistryProgramName + '-registry',
-        [], nil).Status = 200;
+      Discovery := RawHTTPBodyText(Request('GET', '/.well-known/'
+        + RegistryProgramName + '-registry', [], nil));
+      Ready := Pos('base_url = "' + FBase + '"', Discovery) > 0;
+      LastProbe := Copy(Discovery, 1, 512);
     except
-      Ready := False;
+      on E: Exception do LastProbe := Copy(E.Message, 1, 512);
     end;
     if Ready or not FServe.Running then Break;
-    Sleep(50);
-  until GetTickCount64 - Started > 15000;
+    Sleep(20);
+  until GetTickCount64 - Started > RegistryReadyMilliseconds;
   if not Ready then
-    raise Exception.Create('registry serve did not become ready: ' + FOutputs);
+  begin
+    StopGracefully;
+    raise Exception.Create('registry serve announced ' + FBase
+      + ' but did not serve its discovery; last probe: ' + LastProbe
+      + '; output: ' + FOutputs);
+  end;
 end;
 
 procedure TPublishOrigin.Stop;

@@ -712,13 +712,12 @@ class RegistryContainerTests(unittest.TestCase):
         self.assertIn("      - validate-inputs\n      - build\n", job)
         self.assertIn("    if: inputs.mode != 'diagnostic'\n", job)
         self.assertIn("    runs-on: ubuntu-latest\n", job)
-        self.assertIn("    timeout-minutes: 15\n", job)
+        self.assertIn("    timeout-minutes: 20\n", job)
         self.assertIn("          name: lwpt-x86_64-linux\n", job)
-        self.assertIn(
-            "timeout 780 .github/ci/registry-container/smoke.sh --binary build/lwpt", job
+        self.assert_bounded_smoke(
+            job, "timeout --kill-after=30 600 .github/ci/registry-container/smoke.sh"
+            " --binary build/lwpt",
         )
-        self.assertIn("        if: failure()\n", job)
-        self.assertIn("registry-container-artifacts", job)
         # Expensive and Docker-bound: never part of the automatic PR gate.
         pr_workflow = read(".github/workflows/pr.yml")
         self.assertNotIn("registry-container", pr_workflow)
@@ -728,13 +727,43 @@ class RegistryContainerTests(unittest.TestCase):
         workflow = read(".github/workflows/release.yml")
         job = workflow_job(workflow, "registry-container-smoke")
         self.assertIn("    needs: publish\n", job)
-        self.assertIn("    timeout-minutes: 15\n", job)
+        self.assertIn("    timeout-minutes: 20\n", job)
         self.assertIn("    permissions:\n      contents: read\n", job)
-        self.assertIn(
-            'timeout 780 .github/ci/registry-container/smoke.sh --release "${GITHUB_REF_NAME}"',
-            job,
+        self.assert_bounded_smoke(
+            job, "timeout --kill-after=30 600 .github/ci/registry-container/smoke.sh"
+            ' --release "${GITHUB_REF_NAME}"',
         )
-        self.assertIn("        if: failure()\n", job)
+
+    def assert_bounded_smoke(self, job: str, command: str) -> None:
+        """Smoke, diagnostics, and upload each have a step bound that fits the
+        job, and diagnostics run as their own step so a killed smoke keeps them."""
+        self.assertIn(command, job)
+        steps = {}
+        for block in job.split("\n      - ")[1:]:
+            name = re.match(r"name: (.+)", block)
+            if name:
+                steps[name.group(1)] = block
+        smoke = next(v for k, v in steps.items() if k.startswith("Registry container smoke"))
+        collect = steps["Collect registry container diagnostics on failure"]
+        upload = steps["Upload registry container artifacts on failure"]
+        self.assertIn(
+            "timeout --kill-after=10 200 .github/ci/registry-container/smoke.sh --collect",
+            collect,
+        )
+        for step in (collect, upload):
+            self.assertIn("        if: failure()\n", step)
+        bounds = [
+            int(re.search(r"        timeout-minutes: (\d+)\n", step).group(1))
+            for step in (smoke, collect, upload)
+        ]
+        self.assertEqual([11, 4, 3], bounds)
+        # Checkout and artefact download fit in the remaining two minutes.
+        self.assertLessEqual(sum(bounds) + 2, 20)
+        # The smoke's own deadline, plus its kill grace, ends inside its step.
+        self.assertLessEqual(600 + 30, 11 * 60)
+        # No engine call outside the bounded script.
+        self.assertNotRegex(job, r"(?m)^\s+(timeout \d+ )?docker ")
+        self.assertIn("registry-container-artifacts", job)
 
     def test_matrix_keeps_failing_scratch_as_an_artifact(self) -> None:
         job = workflow_job(read(".github/workflows/ci.yml"), "test")
@@ -836,11 +865,30 @@ class RegistryContainerTests(unittest.TestCase):
         script = read(REGISTRY_SMOKE)
         self.assertIn("set -euo pipefail", script)
         self.assertIn("trap cleanup EXIT", script)
+        self.assertIn("trap 'exit 143' TERM INT", script)
         self.assertIn("collect_artifacts", script)
-        for line in script.splitlines():
-            if re.search(r"\bdocker (run|build|stop|exec|logs|rm|volume|network)\b", line):
-                with self.subTest(line=line.strip()):
-                    self.assertRegex(line, r"timeout \d+ docker ")
+        # Exactly one place reaches the engine, and it always has a deadline
+        # in this shell's process group.
+        helper = '  timeout --foreground "$seconds" docker "$@"'
+        self.assertEqual(1, script.count(helper))
+        code = [
+            line for line in script.splitlines()
+            if not line.lstrip().startswith("#") and line != helper
+        ]
+        for line in code:
+            with self.subTest(line=line.strip()):
+                self.assertNotRegex(line, r"(^|[\s;&|(`$])docker(\s|$)")
+        engine_calls = [line for line in code if re.search(r"\bdk \d+ ", line)]
+        self.assertGreater(len(engine_calls), 20)
+        for subcommand in ("version", "build", "image inspect", "inspect", "run", "exec",
+                           "stop", "logs", "rm", "volume create", "network create", "ps"):
+            self.assertRegex(script, rf"\bdk \d+ {subcommand}\b")
+        # Every smoke container gets the read-only configuration mount, and
+        # the protection check covers the binary and the configuration.
+        self.assertIn('-v "$config:$DATA/registry.toml:ro"', script)
+        self.assertIn("touch /usr/local/bin/lwpt", script)
+        self.assertIn("the service account can write the configuration", script)
+        self.assertIn("the service account can replace the configuration", script)
         # The smoke uses the example unchanged and proves the pin is enforced.
         self.assertIn('CONTEXT="$REPO_ROOT/docs/examples/registry"', script)
         self.assertIn("a wrong SHA-256 pin must fail the image build", script)

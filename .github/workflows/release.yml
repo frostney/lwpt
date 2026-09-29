@@ -561,7 +561,7 @@ jobs:
     needs: publish
     if: ${{ needs.publish.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
     defaults:
@@ -573,14 +573,21 @@ jobs:
           persist-credentials: false
 
       - name: Registry container smoke against the published release
+        timeout-minutes: 11
         env:
           ARTIFACTS: ${{ runner.temp }}/registry-container-artifacts
-        run: |
-          docker version
-          timeout 780 .github/ci/registry-container/smoke.sh --release "${GITHUB_REF_NAME}"
+        run: timeout --kill-after=30 600 .github/ci/registry-container/smoke.sh --release "${GITHUB_REF_NAME}"
+
+      - name: Collect registry container diagnostics on failure
+        if: failure()
+        timeout-minutes: 4
+        env:
+          ARTIFACTS: ${{ runner.temp }}/registry-container-artifacts
+        run: timeout --kill-after=10 200 .github/ci/registry-container/smoke.sh --collect
 
       - name: Upload registry container artifacts on failure
         if: failure()
+        timeout-minutes: 3
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: registry-container-smoke

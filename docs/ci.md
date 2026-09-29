@@ -201,7 +201,7 @@ keeps for a failing case, holding its data directories, consumer projects,
 and command log. The registries in it are loopback-only test registries with
 throwaway keys.
 
-**Registry container stage** (`registry-container`, `ubuntu-latest`, 15-minute
+**Registry container stage** (`registry-container`, `ubuntu-latest`, 20-minute
 ceiling, full matrix only, skipped in diagnostic mode): downloads the
 `lwpt-x86_64-linux` artefact and runs
 [`.github/ci/registry-container/smoke.sh`](../.github/ci/registry-container/smoke.sh)
@@ -209,16 +209,22 @@ ceiling, full matrix only, skipped in diagnostic mode): downloads the
 archive, serves it on loopback, and builds the unchanged example image from
 [`docs/examples/registry/`](./examples/registry/). It first proves that a
 wrong SHA-256 pin fails the build. It then runs the registry as UID 10001 on
-a read-only root file system and waits for the image's health check. A
-`registry publish` from the runner commits while the server runs, the record
-and archive are read back, and a graceful stop is checked for exit status 0
-within the stop timeout. A replacement container on the same volume serves
-the same head and accepts the next publication, and the reverse-proxy example
-(nginx re-encrypting to the registry) serves the same protocol. Every Docker
-command is bounded by `timeout`. On failure, the job uploads
-`registry-container-smoke` with container logs, `docker inspect` output
-including health history, and data-volume listings, but never signing seeds
-or tokens. The stage stays off `pr.yml` because it needs Docker and image
+a read-only root file system with `registry.toml` exported and mounted
+read-only, checks that the service account can modify neither the binary nor
+the configuration, and waits for the image's health check. A token is issued
+in the serving container, a `registry publish` from the runner commits while
+the server runs, the record and archive are read back, and a graceful stop is
+checked for exit status 0 within the stop timeout. The documented
+reconfiguration procedure runs, a replacement container on the same volume
+serves the same head, a key rotation in the serving container is followed by
+a root-pinned publication, and the reverse-proxy example (nginx re-encrypting
+to the registry) serves the same protocol. Every engine call goes through one
+helper bounded by `timeout --foreground`, and the script itself runs under a
+600-second `timeout` inside an 11-minute step. A separate bounded step,
+`smoke.sh --collect`, then writes container logs, `docker inspect` output
+including health history, and data-volume listings (never signing seeds or
+tokens) even when the smoke was killed, and the job uploads them as
+`registry-container-smoke`. The stage stays off `pr.yml` because it needs Docker and image
 pulls. [`registry-deployment.md`](./registry-deployment.md) is the operator
 guide.
 

@@ -592,8 +592,9 @@ jobs:
 
   # Builds the example registry image (docs/examples/registry) from a
   # release-shaped archive of the x86_64-linux binary under test and runs the
-  # container smoke: pinned-checksum install, non-root read-only runtime,
-  # health check, live publication from the runner, graceful stop and
+  # container smoke: pinned-checksum install, non-root runtime with a
+  # read-only root and configuration, health check, operator commands in the
+  # serving container, live publication from the runner, graceful stop and
   # container replacement on the same volume, and the reverse-proxy example.
   # Full matrix only; release.yml repeats it against the published assets.
   registry-container:
@@ -602,7 +603,7 @@ jobs:
       - build
     if: inputs.mode != 'diagnostic'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
@@ -618,16 +619,26 @@ jobs:
           name: lwpt-x86_64-linux
           path: build/
 
+      # The smoke bounds each engine call and itself; the step bound and the
+      # separate diagnostics step keep artifacts even if it is killed.
       - name: Registry container smoke
+        timeout-minutes: 11
         env:
           ARTIFACTS: ${{ runner.temp }}/registry-container-artifacts
         run: |
           chmod +x build/lwpt
-          docker version
-          timeout 780 .github/ci/registry-container/smoke.sh --binary build/lwpt
+          timeout --kill-after=30 600 .github/ci/registry-container/smoke.sh --binary build/lwpt
+
+      - name: Collect registry container diagnostics on failure
+        if: failure()
+        timeout-minutes: 4
+        env:
+          ARTIFACTS: ${{ runner.temp }}/registry-container-artifacts
+        run: timeout --kill-after=10 200 .github/ci/registry-container/smoke.sh --collect
 
       - name: Upload registry container artifacts on failure
         if: failure()
+        timeout-minutes: 3
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: registry-container-smoke

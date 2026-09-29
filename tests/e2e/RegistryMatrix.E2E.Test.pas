@@ -97,11 +97,13 @@ type
     function Sync(AMirror: TMatrixServer): TLwptResult;
     function Verify(const ARoot: string): TLwptResult;
     procedure Serve(AServer: TMatrixServer);
+    procedure FollowOrigin(AMirror: TMatrixServer; AOrigin: TPublishOrigin;
+      const AUpstream: string);
     function WriteArchive(const AVersion, AContent: string): string;
     function Publish(const ALabel, AOrigin, AKeyID, APublicKey, AToken,
       AVersion, AContent: string; const ATesting: Boolean = False;
       const AEnvironment: TStringArray = nil): TLwptResult;
-    procedure ExpectPublished(const ARun: TLwptResult; const AOrigin,
+    procedure ExpectPublished(const ARun: TLwptResult; const AIdentity,
       AVersion: string; const ASequence: Integer);
     function Registries(const AIdentity, AKeyID, APublicKey, AOrigin: string;
       const AMirrors: array of string): string;
@@ -117,6 +119,8 @@ type
     procedure BodyHTTPSDeployments;
     procedure DeployHTTPS(const ATag, AHost: string);
     procedure BodySchemaVersions;
+    procedure ExpectSchemaRefused(const ARoot, AFile, AOld, ANew,
+      ACode: string; const ACommands: array of string);
     procedure BodyBackupAndRestore;
   protected
     procedure BeforeAll; override;
@@ -516,6 +520,19 @@ begin
   { Readiness requires this child's own bind announcement, then discovery
     and the checkpoint this data directory holds. }
   AServer.Process := StartRegistryCLI(AServer.Root, AServer.URL);
+  { A start that recovered from a port collision moved the listener. }
+  AServer.Port := StrToInt(Copy(AServer.URL, LastDelimiter(':', AServer.URL)
+    + 1, MaxInt));
+end;
+
+{ An origin restart that recovered from a port collision moved its base
+  URL; the mirror's upstream follows it, as an operator would. }
+procedure TRegistryMatrixE2E.FollowOrigin(AMirror: TMatrixServer;
+  AOrigin: TPublishOrigin; const AUpstream: string);
+begin
+  if AOrigin.Base = AUpstream then Exit;
+  Require(AMirror.Name + ' follows the moved origin', InitMirror(AMirror,
+    AOrigin.Identity, AOrigin.Base, AOrigin.KeyID, AOrigin.PublicKey));
 end;
 
 function TRegistryMatrixE2E.WriteArchive(const AVersion,
@@ -535,12 +552,14 @@ begin
   Log(ALabel, Result);
 end;
 
+{ The success line names the authenticated origin identity, not the
+  contacted base URL. }
 procedure TRegistryMatrixE2E.ExpectPublished(const ARun: TLwptResult;
-  const AOrigin, AVersion: string; const ASequence: Integer);
+  const AIdentity, AVersion: string; const ASequence: Integer);
 var
   Expected: string;
 begin
-  Expected := 'published ' + PACKAGE_NAME + '@' + AVersion + ' to ' + AOrigin
+  Expected := 'published ' + PACKAGE_NAME + '@' + AVersion + ' to ' + AIdentity
     + ' at sequence ' + IntToStr(ASequence) + ' (archive ';
   if Pos(Expected, PublishLine(ARun)) <> 1 then
     raise Exception.Create('expected "' + Expected + '", got "'
@@ -669,7 +688,7 @@ begin
   Archive := PublishTarGz(PACKAGE_NAME, '1.0.0', 'one');
   Run := Publish('publish 1.0.0', Origin.Base, Origin.KeyID, Origin.PublicKey,
     Token, '1.0.0', 'one');
-  ExpectPublished(Run, Origin.Base, '1.0.0', 2);
+  ExpectPublished(Run, Origin.Identity, '1.0.0', 2);
   Expect<Boolean>(Origin.Serve.Running).ToBe(True);
   Expect<Integer>(Origin.Serve.ProcessID).ToBe(PID);
 
@@ -692,7 +711,7 @@ begin
     + Copy(RegistryArtifactHash(Archive), 8, 64))).ToBe(BytesText(Archive));
 
   { A consumer resolves, verifies, and installs from the running origin. }
-  Run := Install('c1', Registries(Origin.Base, Origin.KeyID, Origin.PublicKey,
+  Run := Install('c1', Registries(Origin.Identity, Origin.KeyID, Origin.PublicKey,
     Origin.Base, []), '^1.0.0');
   Require('consumer install', Run);
   ExpectInstalled('c1', 'one');
@@ -718,9 +737,9 @@ begin
   Expect<string>(OriginText(Origin, CHECKPOINT_PATH)).ToBe(Checkpoint);
   Run := Publish('publish 1.1.0 after restart', Origin.Base, Origin.KeyID,
     Origin.PublicKey, Token, '1.1.0', 'two');
-  ExpectPublished(Run, Origin.Base, '1.1.0', 3);
+  ExpectPublished(Run, Origin.Identity, '1.1.0', 3);
   Require('consumer install after restart', Install('c2',
-    Registries(Origin.Base, Origin.KeyID, Origin.PublicKey, Origin.Base, []),
+    Registries(Origin.Identity, Origin.KeyID, Origin.PublicKey, Origin.Base, []),
     '^1.0.0'));
   ExpectInstalled('c2', 'two');
 end;
@@ -734,7 +753,7 @@ procedure TRegistryMatrixE2E.BodyMirrorOutageAndFailover;
 var
   Origin: TPublishOrigin;
   Mirror: TMatrixServer;
-  Token, Checkpoint, Dead, Lock: string;
+  Token, Checkpoint, Dead, Lock, Upstream: string;
   Archive: TBytes;
   Run: TLwptResult;
 begin
@@ -742,11 +761,11 @@ begin
   Token := Origin.IssueToken(['--packages', PACKAGE_NAME]);
   Origin.Start;
   ExpectPublished(Publish('publish 1.0.0', Origin.Base, Origin.KeyID,
-    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Base, '1.0.0', 2);
+    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Identity, '1.0.0', 2);
   Archive := PublishTarGz(PACKAGE_NAME, '1.0.0', 'one');
 
   { The mirror synchronizes and verifies the origin's signed history. }
-  Mirror := NewMirror('m', Origin.Base, Origin.Base, Origin.KeyID,
+  Mirror := NewMirror('m', Origin.Identity, Origin.Base, Origin.KeyID,
     Origin.PublicKey);
   Require('mirror sync', Sync(Mirror));
   Serve(Mirror);
@@ -769,26 +788,28 @@ begin
   { Failover: an unreachable mirror is skipped, the serving mirror answers,
     and the origin (down) is never needed. }
   Dead := 'http://localhost:' + IntToStr(FindAvailableRegistryTestPort);
-  Run := Install('c1', Registries(Origin.Base, Origin.KeyID, Origin.PublicKey,
+  Run := Install('c1', Registries(Origin.Identity, Origin.KeyID, Origin.PublicKey,
     Origin.Base, [Dead, Mirror.URL]), '^1.0.0');
   Require('install through the mirror during the outage', Run);
   ExpectInstalled('c1', 'one');
   Lock := ReadBinaryFile(ConsumerRoot('c1') + '/p/lwpt.lock');
   Expect<Boolean>(Contains(Lock, 'resolvedURL = "' + Mirror.URL
     + '/v1/objects/')).ToBe(True);
-  Expect<Boolean>(Contains(Lock, 'registryOrigin = "' + Origin.Base + '"'))
+  Expect<Boolean>(Contains(Lock, 'registryOrigin = "' + Origin.Identity + '"'))
     .ToBe(True);
 
   { The origin returns and publishes; an incremental sync catches up. }
+  Upstream := Origin.Base;
   Origin.Start;
+  FollowOrigin(Mirror, Origin, Upstream);
   ExpectPublished(Publish('publish 1.1.0', Origin.Base, Origin.KeyID,
-    Origin.PublicKey, Token, '1.1.0', 'two'), Origin.Base, '1.1.0', 3);
+    Origin.PublicKey, Token, '1.1.0', 'two'), Origin.Identity, '1.1.0', 3);
   Require('incremental mirror sync', Sync(Mirror));
   Expect<Integer>(DocumentSequence(ServerText(Mirror, CHECKPOINT_PATH))).ToBe(3);
 
   { The mirror goes down instead: the consumer falls back to the origin. }
   Mirror.Stop;
-  Run := Install('c2', Registries(Origin.Base, Origin.KeyID, Origin.PublicKey,
+  Run := Install('c2', Registries(Origin.Identity, Origin.KeyID, Origin.PublicKey,
     Origin.Base, [Mirror.URL]), '^1.0.0');
   Require('install through the origin while the mirror is down', Run);
   ExpectInstalled('c2', 'two');
@@ -876,7 +897,7 @@ begin
     verifies end to end. }
   Origin.Start;
   Expect<string>(OriginText(Origin, CHECKPOINT_PATH)).ToBe(Before);
-  Mirror := NewMirror('m', Origin.Base, Origin.Base, Origin.KeyID,
+  Mirror := NewMirror('m', Origin.Identity, Origin.Base, Origin.KeyID,
     Origin.PublicKey);
   Require('mirror sync after recovery', Sync(Mirror));
   Expect<Integer>(DocumentSequence(Verify(Mirror.Root).Stdout)).ToBe(1);
@@ -884,7 +905,7 @@ begin
   { The retried publication commits the same identity at the next
     sequence: the interrupted attempt consumed nothing. }
   ExpectPublished(Publish('retried publish', Origin.Base, Origin.KeyID,
-    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Base, '1.0.0', 2);
+    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Identity, '1.0.0', 2);
   Require('mirror sync after the retry', Sync(Mirror));
   Run := Verify(Mirror.Root);
   Expect<Integer>(DocumentSequence(Run.Stdout)).ToBe(2);
@@ -909,8 +930,8 @@ begin
   Origin.Start;
   PID := Origin.Serve.ProcessID;
   ExpectPublished(Publish('publish 1.0.0', Origin.Base, Origin.KeyID,
-    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Base, '1.0.0', 2);
-  Mirror := NewMirror('m', Origin.Base, Origin.Base, Origin.KeyID,
+    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Identity, '1.0.0', 2);
+  Mirror := NewMirror('m', Origin.Identity, Origin.Base, Origin.KeyID,
     Origin.PublicKey);
   Require('mirror sync before rotation', Sync(Mirror));
 
@@ -929,7 +950,7 @@ begin
 
   { Every client keeps only the root pin and walks the dual-signed chain. }
   ExpectPublished(Publish('publish 1.1.0 after rotation', Origin.Base,
-    Origin.KeyID, Origin.PublicKey, Token, '1.1.0', 'two'), Origin.Base,
+    Origin.KeyID, Origin.PublicKey, Token, '1.1.0', 'two'), Origin.Identity,
     '1.1.0', 4);
   Require('mirror sync across the rotation', Sync(Mirror));
   Expect<Integer>(DocumentSequence(Verify(Mirror.Root).Stdout)).ToBe(4);
@@ -943,7 +964,7 @@ begin
     its root pin through the mirror. }
   Serve(Mirror);
   Origin.Stop;
-  Require('install across the rotation', Install('c1', Registries(Origin.Base,
+  Require('install across the rotation', Install('c1', Registries(Origin.Identity,
     Origin.KeyID, Origin.PublicKey, Origin.Base, [Mirror.URL]), '^1.0.0'));
   ExpectInstalled('c1', 'two');
 end;
@@ -974,14 +995,14 @@ begin
   Origin.Start;
   Discovery := OriginText(Origin, '/.well-known/' + RegistryProgramName
     + '-registry');
-  Expect<string>(DocumentField(Discovery, 'origin')).ToBe(Origin.Base);
+  Expect<string>(DocumentField(Discovery, 'origin')).ToBe(Origin.Identity);
   Expect<string>(DocumentField(Discovery, 'base_url')).ToBe(Origin.Base);
   SetLength(Trust, 1);
   Trust[0] := ProjectPrefix + '_TEST_REGISTRY_TRUST_ANCHORS='
     + TestRootCertificatePath;
   ExpectPublished(Publish('publish over https ' + AHost, Origin.Base,
     Origin.KeyID, Origin.PublicKey, Token, '1.0.0', 'tls ' + AHost, True, Trust),
-    Origin.Base, '1.0.0', 2);
+    Origin.Identity, '1.0.0', 2);
   { The release binary verifies against the system store only, for the host
     name and the IP address alike. }
   Run := Publish('release publish over https ' + AHost, Origin.Base,
@@ -997,52 +1018,80 @@ begin
   Guard('f', BodySchemaVersions);
 end;
 
+{ Replaces AFile below ARoot with AOld changed to ANew, runs each command
+  and requires it to fail with ACode, and requires the data directory to be
+  byte-identical to the altered tree right after every rejection. Only then
+  is the original file restored. }
+procedure TRegistryMatrixE2E.ExpectSchemaRefused(const ARoot, AFile, AOld,
+  ANew, ACode: string; const ACommands: array of string);
+var
+  Original, Altered, Fingerprint: string;
+  Index: Integer;
+  Run: TLwptResult;
+begin
+  Original := ReadBinaryFile(ARoot + '/' + AFile);
+  Altered := StringReplace(Original, AOld, ANew, []);
+  if Altered = Original then
+    raise Exception.Create(AFile + ' does not contain ' + AOld);
+  WriteBinaryFile(ARoot + '/' + AFile, BytesOf(Altered));
+  Fingerprint := TreeFingerprint(ARoot);
+  for Index := 0 to High(ACommands) do
+  begin
+    Run := RunCLI(ACommands[Index] + ' with ' + ANew, ['registry',
+      ACommands[Index], '--data-dir', ARoot], SERVE_REFUSAL_TIMEOUT_MILLISECONDS);
+    RequireFailure(ACommands[Index] + ' with ' + ANew, Run, ACode);
+    Expect<Boolean>(Contains(Run.Stdout, 'listening at')).ToBe(False);
+    Expect<string>(TreeFingerprint(ARoot)).ToBe(Fingerprint);
+  end;
+  WriteBinaryFile(ARoot + '/' + AFile, BytesOf(Original));
+end;
+
 procedure TRegistryMatrixE2E.BodySchemaVersions;
+const
+  CONFIG_REFUSED = 'state_corrupt: unsupported registry configuration schema';
+  STATE_REFUSED = 'state_corrupt: unsupported committed-state schema';
 var
   Origin: TPublishOrigin;
-  Token, Checkpoint, Config, State, Before, Data: string;
-  Run: TLwptResult;
+  Mirror: TMatrixServer;
+  Token, Checkpoint, Before, MirrorBefore, Upstream: string;
 begin
   Origin := NewOrigin('o');
   Token := Origin.IssueToken(['--packages', PACKAGE_NAME]);
   Origin.Start;
   ExpectPublished(Publish('publish 1.0.0', Origin.Base, Origin.KeyID,
-    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Base, '1.0.0', 2);
+    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Identity, '1.0.0', 2);
   Checkpoint := OriginText(Origin, CHECKPOINT_PATH);
+  Mirror := NewMirror('m', Origin.Identity, Origin.Base, Origin.KeyID,
+    Origin.PublicKey);
+  Require('mirror sync', Sync(Mirror));
   Origin.Stop;
-  Data := Origin.DataDirectory;
-  Config := ReadBinaryFile(Data + '/registry.toml');
-  State := ReadBinaryFile(Data + '/state/current.toml');
-  Before := TreeFingerprint(Data);
+  Before := TreeFingerprint(Origin.DataDirectory);
+  MirrorBefore := TreeFingerprint(Mirror.Root);
 
-  { A configuration written by a newer schema is refused before anything is
-    opened, served, or rewritten. }
-  WriteBinaryFile(Data + '/registry.toml', BytesOf(StringReplace(Config,
-    '-registry-origin-config-v1"', '-registry-origin-config-v2"', [])));
-  Run := RunCLI('serve future configuration', ['registry', 'serve',
-    '--data-dir', Data], SERVE_REFUSAL_TIMEOUT_MILLISECONDS);
-  RequireFailure('future configuration schema', Run,
-    'state_corrupt: unsupported registry configuration schema');
-  Expect<Boolean>(Contains(Run.Stdout, 'listening at')).ToBe(False);
-  RequireFailure('verify future configuration schema', Verify(Data),
-    'state_corrupt: unsupported registry configuration schema');
-  WriteBinaryFile(Data + '/registry.toml', BytesOf(Config));
-  Expect<string>(TreeFingerprint(Data)).ToBe(Before);
-
-  { The same holds for committed state from a newer schema. }
-  WriteBinaryFile(Data + '/state/current.toml', BytesOf(StringReplace(State,
-    '-registry-state-v1"', '-registry-state-v2"', [])));
-  Run := RunCLI('serve future state', ['registry', 'serve', '--data-dir', Data],
-    SERVE_REFUSAL_TIMEOUT_MILLISECONDS);
-  RequireFailure('future state schema', Run,
-    'state_corrupt: unsupported committed-state schema');
-  Expect<Boolean>(Contains(Run.Stdout, 'listening at')).ToBe(False);
-  WriteBinaryFile(Data + '/state/current.toml', BytesOf(State));
-  Expect<string>(TreeFingerprint(Data)).ToBe(Before);
+  { Documents written by a newer schema are refused before anything is
+    opened, served, recovered, or rewritten: an origin's configuration and
+    committed state for serve and verify, a mirror's for sync and verify. }
+  ExpectSchemaRefused(Origin.DataDirectory, 'registry.toml',
+    '-registry-origin-config-v1"', '-registry-origin-config-v2"',
+    CONFIG_REFUSED, ['serve', 'verify']);
+  ExpectSchemaRefused(Origin.DataDirectory, 'state/current.toml',
+    '-registry-state-v1"', '-registry-state-v2"', STATE_REFUSED,
+    ['serve', 'verify']);
+  ExpectSchemaRefused(Mirror.Root, 'registry.toml',
+    '-registry-mirror-config-v1"', '-registry-mirror-config-v2"',
+    CONFIG_REFUSED, ['sync', 'verify', 'serve']);
+  ExpectSchemaRefused(Mirror.Root, 'state/current.toml',
+    '-registry-mirror-state-v1"', '-registry-mirror-state-v2"', STATE_REFUSED,
+    ['sync', 'verify', 'serve']);
+  Expect<string>(TreeFingerprint(Origin.DataDirectory)).ToBe(Before);
+  Expect<string>(TreeFingerprint(Mirror.Root)).ToBe(MirrorBefore);
 
   { The supported schema serves the same signed head again. }
+  Upstream := Origin.Base;
   Origin.Start;
+  FollowOrigin(Mirror, Origin, Upstream);
   Expect<string>(OriginText(Origin, CHECKPOINT_PATH)).ToBe(Checkpoint);
+  Require('mirror sync after the restore', Sync(Mirror));
 end;
 
 procedure TRegistryMatrixE2E.TestBackupAndRestore;
@@ -1061,8 +1110,8 @@ begin
   Token := Origin.IssueToken(['--packages', PACKAGE_NAME]);
   Origin.Start;
   ExpectPublished(Publish('publish 1.0.0', Origin.Base, Origin.KeyID,
-    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Base, '1.0.0', 2);
-  Witness := NewMirror('m1', Origin.Base, Origin.Base, Origin.KeyID,
+    Origin.PublicKey, Token, '1.0.0', 'one'), Origin.Identity, '1.0.0', 2);
+  Witness := NewMirror('m1', Origin.Identity, Origin.Base, Origin.KeyID,
     Origin.PublicKey);
   Require('witness sync', Sync(Witness));
 
@@ -1074,7 +1123,7 @@ begin
   CopyFileBytes(Origin.DataDirectory + '/registry.toml', Backup + '/registry.toml');
   CopyTree(Origin.DataDirectory + '/state', Backup + '/state', []);
   ExpectPublished(Publish('publish 1.1.0 during the backup', Origin.Base,
-    Origin.KeyID, Origin.PublicKey, Token, '1.1.0', 'two'), Origin.Base,
+    Origin.KeyID, Origin.PublicKey, Token, '1.1.0', 'two'), Origin.Identity,
     '1.1.0', 3);
   Require('witness sync of sequence 3', Sync(Witness));
   CopyTree(Origin.DataDirectory, Backup, ['registry.toml', 'state', 'tmp',
@@ -1094,7 +1143,7 @@ begin
   Serve(Restored);
   Head := ServerText(Restored, CHECKPOINT_PATH);
   Expect<Integer>(DocumentSequence(Head)).ToBe(2);
-  Fresh := NewMirror('m2', Origin.Base, Restored.URL, Origin.KeyID,
+  Fresh := NewMirror('m2', Origin.Identity, Restored.URL, Origin.KeyID,
     Origin.PublicKey);
   Require('fresh mirror of the restored origin', Sync(Fresh));
   Expect<Integer>(DocumentSequence(Verify(Fresh.Root).Stdout)).ToBe(2);
@@ -1103,9 +1152,9 @@ begin
     content. A mirror that already accepted the lost sequence 3 refuses the
     rolled-back history as equivocation and keeps serving what it had. }
   ExpectPublished(Publish('publish diverging 1.1.0', Restored.URL, Origin.KeyID,
-    Origin.PublicKey, Token, '1.1.0', 'diverged'), Restored.URL, '1.1.0', 3);
+    Origin.PublicKey, Token, '1.1.0', 'diverged'), Origin.Identity, '1.1.0', 3);
   Require('point the witness at the restored origin', InitMirror(Witness,
-    Origin.Base, Restored.URL, Origin.KeyID, Origin.PublicKey));
+    Origin.Identity, Restored.URL, Origin.KeyID, Origin.PublicKey));
   RequireFailure('witness sync after rollback', Sync(Witness),
     'checkpoint_equivocation');
   Run := Verify(Witness.Root);
@@ -1125,7 +1174,7 @@ begin
     TestKeyRotationWhileServing);
   Test('HTTPS origins addressed by host name and by IP address publish and verify',
     TestHTTPSDeployments);
-  Test('future configuration and state schemas fail closed without changing data',
+  Test('future configuration and state schemas fail serve, verify, and sync without changing data',
     TestSchemaVersions);
   Test('a pointer-first backup restores a verifiable origin and a rollback is refused',
     TestBackupAndRestore);

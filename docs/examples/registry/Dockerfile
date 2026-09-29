@@ -16,7 +16,8 @@
 #     -t lwpt-registry:<version> docs/examples/registry
 #
 # The image holds no credentials, keys, or TLS identities. The data volume
-# holds the registry, and secrets are mounted at run time.
+# holds the registry; secrets and a read-only copy of registry.toml are
+# mounted at run time.
 
 # Pin the base image by digest in production (debian:bookworm-slim@sha256:...).
 # The release binary links glibc and loads OpenSSL 3 at run time for TLS.
