@@ -137,6 +137,12 @@ A package name is lowercase ASCII matching:
 
 A version is a canonical SemVer 2.0.0 version without a leading `v`.
 
+LWPT's dependency consumer installs only names without `.`, because a name is
+also a module directory and a dependency key, and `lwpt registry publish`
+refuses the rest ([ADR-0051](./adr/0051-registry-dependency-sources.md)
+decision 6). The protocol grammar itself is unchanged, so other clients and
+LWPT origins still accept such names.
+
 The stable identity is:
 
 ```text
@@ -315,6 +321,13 @@ constraints are not protocol 1 canonical forms. This subset is accepted by
 LWPT's Semver package while remaining straightforward for independent
 implementations. A dependency omitting `origin` uses the record's origin;
 otherwise its origin is explicit and canonical.
+
+LWPT's `registry publish` derives `dependencies` from the archive
+`lwpt.toml`'s `registry:` dependencies, as
+[ADR-0051](./adr/0051-registry-dependency-sources.md) ("Dependency-bearing
+publication") specifies. A manifest dependency this list cannot express, such
+as another source kind or one with extraction filters, is refused before
+anything is uploaded, never dropped.
 
 Records are immutable. Yank status changes through the dedicated lifecycle
 operation below, which publishes a new record for the same package identity
