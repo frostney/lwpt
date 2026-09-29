@@ -69,6 +69,7 @@ type
     procedure TestTokenOptionsAndExpiryBounds;
     procedure TestKilledPublicationKeepsTheOldHead;
     procedure TestKilledUploadIsReclaimedOnlyAfterItsLeaseIsFree;
+    procedure TestTLSListenerReadsRequestBodies;
   end;
 
 constructor TRequestThread.Create(const APort: Word; const ATarget,
@@ -469,6 +470,120 @@ begin
   Expect<Integer>(PartFiles).ToBe(0);
 end;
 
+{ Status code of one curl request against the TLS listener; curl trusts the
+  self-signed test identity only through --insecure. }
+function CurlStatus(const AArguments: array of string): string;
+var
+  ProcessInstance: TProcess;
+  Argument: string;
+begin
+  ProcessInstance := TProcess.Create(nil);
+  try
+    {$IFDEF MSWINDOWS}
+    ProcessInstance.Executable := 'curl.exe';
+    {$ELSE}
+    ProcessInstance.Executable := 'curl';
+    {$ENDIF}
+    ProcessInstance.Parameters.Add('--silent');
+    ProcessInstance.Parameters.Add('--insecure');
+    ProcessInstance.Parameters.Add('--max-time');
+    ProcessInstance.Parameters.Add('20');
+    ProcessInstance.Parameters.Add('--output');
+    {$IFDEF MSWINDOWS}
+    ProcessInstance.Parameters.Add('NUL');
+    {$ELSE}
+    ProcessInstance.Parameters.Add('/dev/null');
+    {$ENDIF}
+    ProcessInstance.Parameters.Add('--write-out');
+    ProcessInstance.Parameters.Add('%{http_code}');
+    for Argument in AArguments do ProcessInstance.Parameters.Add(Argument);
+    ProcessInstance.Options := [poUsePipes];
+    ProcessInstance.Execute;
+    Result := '';
+    while ProcessInstance.Running do
+    begin
+      Result := Result + DrainAvailableStream(ProcessInstance.Output, 4096);
+      DrainAvailableStream(ProcessInstance.Stderr, 4096);
+      Sleep(10);
+    end;
+    Result := Trim(Result + DrainAvailableStream(ProcessInstance.Output, 4096));
+  finally
+    ProcessInstance.Free;
+  end;
+end;
+
+procedure TRegistryPublicationE2E.TestTLSListenerReadsRequestBodies;
+const
+  TLS_PASSWORD_ENV = 'LWPT_REGISTRY_PUBLICATION_E2E_PASSWORD';
+  TLS_PASSWORD = 'test-only';
+var
+  Init: TLwptResult;
+  Token, ArchivePath, RecordPath, Hex, Base: string;
+  Archive: TBytes;
+  Stream: TFileStream;
+  Started: QWord;
+  Ready: Boolean;
+begin
+  FPort := FindAvailableRegistryTestPort;
+  Base := 'https://localhost:' + IntToStr(FPort);
+  FBase := Base;
+  FData := FScratch + '/tls-origin';
+  Init := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', Base,
+    '--port', IntToStr(FPort), '--tls-pkcs12',
+    ExpandFileName('tests/fixtures/registry/localhost-native-identity.p12'),
+    '--tls-password-env', TLS_PASSWORD_ENV], FScratch,
+    [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
+  Expect<Integer>(Init.ExitCode).ToBe(0);
+  Token := IssueToken(['--packages', 'tls-*']);
+  FServe := TProcess.Create(nil);
+  FServe.Executable := LwptBinaryPath;
+  FServe.CurrentDirectory := FScratch;
+  FServe.Options := [poUsePipes];
+  FServe.Parameters.Add('registry');
+  FServe.Parameters.Add('serve');
+  FServe.Parameters.Add('--data-dir');
+  FServe.Parameters.Add(FData);
+  ConfigureProcessEnvironment(FServe, [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
+  FServe.Execute;
+  Started := GetTickCount64;
+  repeat
+    FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
+      + DrainAvailableStream(FServe.Stderr, 65536);
+    Ready := CurlStatus([Base + '/.well-known/' + RegistryProgramName
+      + '-registry']) = '200';
+    if Ready or not FServe.Running then Break;
+    Sleep(50);
+  until GetTickCount64 - Started > 15000;
+  Expect<Boolean>(Ready).ToBe(True);
+  { A body spanning many TLS records, large enough that curl asks for
+    100-continue. }
+  SetLength(Archive, 2 * 1024 * 1024 + 11);
+  FillChar(Archive[0], Length(Archive), $6b);
+  ArchivePath := FScratch + '/tls-archive.bin';
+  Stream := TFileStream.Create(ArchivePath, fmCreate);
+  try
+    Stream.WriteBuffer(Archive[0], Length(Archive));
+  finally
+    Stream.Free;
+  end;
+  Hex := Copy(RegistryArtifactHash(Archive), 8, 64);
+  Expect<string>(CurlStatus(['-X', 'PUT', '--data-binary', '@' + ArchivePath,
+    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/objects/sha256/' + Hex]))
+    .ToBe('201');
+  Expect<string>(CurlStatus(['-X', 'PUT', '--data-binary', '@' + ArchivePath,
+    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/objects/sha256/' + Hex]))
+    .ToBe('204');
+  RecordPath := FScratch + '/tls-record.toml';
+  WriteTextFile(RecordPath, RecordText('tls-lib', '1.0.0', Archive));
+  Expect<string>(CurlStatus(['-X', 'PUT', '--data-binary', '@' + RecordPath,
+    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/packages/tls-lib/1.0.0']))
+    .ToBe('201');
+  Expect<string>(CurlStatus(['-X', 'PUT', '--data-binary', '@' + RecordPath,
+    '-H', 'Authorization: Bearer ' + Token, Base + '/v1/packages/tls-lib/1.0.0']))
+    .ToBe('204');
+  Expect<string>(CurlStatus([Base + '/v1/objects/sha256/' + Hex])).ToBe('200');
+end;
+
 procedure TRegistryPublicationE2E.SetupTests;
 begin
   Test('a CI token publishes to a running origin, then revocation applies',
@@ -479,6 +594,7 @@ begin
     TestKilledPublicationKeepsTheOldHead);
   Test('a killed upload is reclaimed only after its lease is free',
     TestKilledUploadIsReclaimedOnlyAfterItsLeaseIsFree);
+  Test('the TLS listener reads request bodies', TestTLSListenerReadsRequestBodies);
 end;
 
 begin
