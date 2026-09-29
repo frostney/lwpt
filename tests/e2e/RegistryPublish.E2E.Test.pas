@@ -178,7 +178,7 @@ begin
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Line := PublishLine(Run);
   RecordHash := PublishedRecordHash(Line);
-  Expected := 'published e2e-lib@1.0.0 to ' + FOrigin.Base + ' at sequence 2 (archive '
+  Expected := 'published e2e-lib@1.0.0 to ' + FOrigin.Identity + ' at sequence 2 (archive '
     + RegistryArtifactHash(Bytes) + ', record ' + RecordHash + ')';
   Expect<string>(Line).ToBe(Expected);
   Expect<string>(Trim(Run.Stdout)).ToBe(Line);
@@ -274,7 +274,7 @@ begin
   if Run.ExitCode <> 0 then WriteLn(StdErr, Run.Stderr);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Line := PublishLine(Run);
-  Expect<Boolean>(Pos('published zip-lib@1.0.0 to ' + FOrigin.Base
+  Expect<Boolean>(Pos('published zip-lib@1.0.0 to ' + FOrigin.Identity
     + ' at sequence 2 (archive sha256:', Line) = 1).ToBe(True);
   ArchiveHash := PublishedArchiveHash(Line);
   RecordHash := PublishedRecordHash(Line);
@@ -482,7 +482,7 @@ begin
     FOutputs := FOutputs + Run.Stdout + Run.Stderr;
     if Run.ExitCode <> 0 then WriteLn(StdErr, Run.Stderr);
     Expect<Integer>(Run.ExitCode).ToBe(0);
-    Expect<Boolean>(Pos('published tls-lib@1.0.0 to ' + FOrigin.Base
+    Expect<Boolean>(Pos('published tls-lib@1.0.0 to ' + FOrigin.Identity
       + ' at sequence 2 (archive ' + RegistryArtifactHash(Bytes),
       PublishLine(Run)) = 1).ToBe(True);
     Expect<Integer>(FOrigin.LatestSequence).ToBe(2);
@@ -542,7 +542,7 @@ begin
   if Run.ExitCode <> 0 then WriteLn(StdErr, Run.Stderr);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Line := PublishLine(Run);
-  Expect<Boolean>(Pos('published rotated-a@1.0.0 to ' + FOrigin.Base, Line) = 1)
+  Expect<Boolean>(Pos('published rotated-a@1.0.0 to ' + FOrigin.Identity, Line) = 1)
     .ToBe(True);
   { A second rotation while the origin serves. }
   Rotate(SigningKey);
@@ -550,7 +550,7 @@ begin
     Token, []);
   if Run.ExitCode <> 0 then WriteLn(StdErr, Run.Stderr);
   Expect<Integer>(Run.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('published rotated-b@1.0.0 to ' + FOrigin.Base,
+  Expect<Boolean>(Pos('published rotated-b@1.0.0 to ' + FOrigin.Identity,
     PublishLine(Run)) = 1).ToBe(True);
   ExpectSecretAbsent(Token);
 end;

@@ -233,6 +233,16 @@ For an urgent CVE in an LWPT-canonical package or in a system TLS backend on Lin
 
 TLS on Windows (SChannel, both directions) and macOS (SecureTransport) is updated by the OS vendor. Linux OpenSSL CVE responses belong to the runtime provider; LWPT loads that library but does not ship it.
 
+## Registry service deployment
+
+Registry clients (`registry publish`, mirror `sync` and `verify`, and
+registry-backed installs) run on every Tier 1 target. Operating `lwpt registry
+serve` as a service is Linux-container-first: [`registry-deployment.md`](./registry-deployment.md)
+owns the example image, TLS and proxy shapes, secrets, backup and restore,
+upgrades, operational limits, and portability assumptions. After each
+release, `release.yml` builds that image from the published linux-x64 asset
+and runs the container smoke.
+
 ## Self-hosted runners (Tier 3 path)
 
 Tier 1 / Tier 2 use GitHub-hosted runners (free for public repos; the platforms above are all supported on hosted runners as of 2025). Promoting a Tier 3 platform (FreeBSD, NetBSD, Linux ARM32) to Tier 1 requires a self-hosted runner — practical but a permanent operational cost. Not in scope for v1.

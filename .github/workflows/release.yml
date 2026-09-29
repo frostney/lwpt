@@ -552,3 +552,45 @@ jobs:
             exit 1
           fi
           echo "OK: install.sh installed ${TAG} and the binary reports it"
+
+  registry-container-smoke:
+    # Post-publish gate for the example registry image
+    # (docs/examples/registry): build it from the linux-x64 archive just
+    # published, pinned to the digest in the release's checksums file, and
+    # run the same container smoke as ci.yml with the released client.
+    needs: publish
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Registry container smoke against the published release
+        timeout-minutes: 11
+        env:
+          ARTIFACTS: ${{ runner.temp }}/registry-container-artifacts
+        run: timeout --kill-after=30 600 .github/ci/registry-container/smoke.sh --release "${GITHUB_REF_NAME}"
+
+      - name: Collect registry container diagnostics on failure
+        if: failure()
+        timeout-minutes: 4
+        env:
+          ARTIFACTS: ${{ runner.temp }}/registry-container-artifacts
+        run: timeout --kill-after=10 200 .github/ci/registry-container/smoke.sh --collect
+
+      - name: Upload registry container artifacts on failure
+        if: failure()
+        timeout-minutes: 3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: registry-container-smoke
+          path: ${{ runner.temp }}/registry-container-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
