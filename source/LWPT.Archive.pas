@@ -44,6 +44,18 @@ const
   ARCHIVE_MAXIMUM_ZIP_ENTRIES = 10000;
   ARCHIVE_MAXIMUM_EXPANDED_BYTES = Int64(1024) * 1024 * 1024;
   ARCHIVE_MAXIMUM_OUTPUT_BYTES = Int64(256) * 1024 * 1024;
+  { Implementation budgets that keep memory near input plus output plus
+    fixed buffers (ADR-0049, "Bounds"). lwpt.toml is buffered and parsed,
+    so its declared size and its TOML node count are bounded before either
+    happens. The normalized zip tree holds every explicit and implied path
+    (and an ASCII-folded copy of each), so the total bytes of its distinct
+    paths are bounded as it is built. }
+  ARCHIVE_MAXIMUM_MANIFEST_BYTES = 256 * 1024;
+  ARCHIVE_MAXIMUM_MANIFEST_NODES = 10000;
+  ARCHIVE_MAXIMUM_TREE_PATH_BYTES = Int64(16) * 1024 * 1024;
+  { The longest path ustar can hold: a 155-byte prefix, '/', and a 100-byte
+    name. }
+  USTAR_MAXIMUM_PATH_BYTES = 256;
 
 type
   { A local refusal with a stable machine code. Message is
@@ -65,6 +77,9 @@ type
     MaximumZipEntries: Integer;
     MaximumExpandedBytes: Int64;
     MaximumOutputBytes: Int64;
+    MaximumManifestBytes: Int64;
+    MaximumManifestNodes: Integer;
+    MaximumTreePathBytes: Int64;
   end;
 
 function DefaultArchiveLimits: TLWPTArchiveLimits;
@@ -120,6 +135,9 @@ begin
   Result.MaximumZipEntries := ARCHIVE_MAXIMUM_ZIP_ENTRIES;
   Result.MaximumExpandedBytes := ARCHIVE_MAXIMUM_EXPANDED_BYTES;
   Result.MaximumOutputBytes := ARCHIVE_MAXIMUM_OUTPUT_BYTES;
+  Result.MaximumManifestBytes := ARCHIVE_MAXIMUM_MANIFEST_BYTES;
+  Result.MaximumManifestNodes := ARCHIVE_MAXIMUM_MANIFEST_NODES;
+  Result.MaximumTreePathBytes := ARCHIVE_MAXIMUM_TREE_PATH_BYTES;
 end;
 
 function LooksLikeAbsoluteArchivePath(const APath: string): Boolean;

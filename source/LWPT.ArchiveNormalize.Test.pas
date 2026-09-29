@@ -27,7 +27,9 @@ uses
   LWPT.ArchiveNormalize,
   LWPT.Core,
   LWPT.Gzip,
+  LWPT.Install,
   TestingPascalLibrary,
+  Tests.Scratch,
   Tests.TarSynth,
   Tests.ZipSynth;
 
@@ -43,6 +45,7 @@ type
     procedure TestLargeZipMatchesGolden;
     procedure TestExecuteBits;
     procedure TestOutputIsACanonicalPackage;
+    procedure TestAcceptedOutputsRoundTrip;
   end;
 
   TNormalizeEntrySuite = class(TTestSuite)
@@ -58,6 +61,7 @@ type
     procedure TestRejectsInvalidNames;
     procedure TestRejectsDirectoryWithContent;
     procedure TestPackageRootLayouts;
+    procedure TestRootStrippingRevalidatesPaths;
   end;
 
   TNormalizeNamespaceSuite = class(TTestSuite)
@@ -83,6 +87,18 @@ type
     procedure TestInflationPastDeclaredSize;
     procedure TestOutputBound;
     procedure TestTarGzipExpansionBound;
+    procedure TestOverlongPathRefusedBeforeTree;
+    procedure TestTreePathBudget;
+    procedure TestManifestByteBudget;
+    procedure TestManifestNodeBudget;
+  end;
+
+  TManifestAliasSuite = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestTarManifestOverwriteIsRefused;
+    procedure TestTarManifestAliases;
+    procedure TestZipManifestAliases;
   end;
 
   TTarGzipScanSuite = class(TTestSuite)
@@ -155,10 +171,21 @@ end;
   message when it does not, 'accepted' when nothing is refused. }
 function Rejection(const AInput: TBytes; const AFragment: string;
   const ALimits: TLWPTArchiveLimits): string; overload;
+var
+  Prepared: TLWPTPublicationArchive;
 begin
   Result := 'accepted';
   try
-    PreparePublicationArchive(AInput, ALimits);
+    Prepared := PreparePublicationArchive(AInput, ALimits);
+    { Every accepted zip must yield a tar.gz that passes the tar.gz
+      contract it is published under. }
+    if Prepared.Kind = akZip then
+    try
+      ScanTarGzipArchive(Prepared.Archive, ALimits);
+    except
+      on E: ELWPTArchiveError do
+        Exit('normalized output fails the tar.gz scan: ' + E.Message);
+    end;
   except
     on E: ELWPTArchiveError do
       if Pos(AFragment, E.Message) > 0 then
@@ -489,6 +516,83 @@ begin
     .ToBe(GOLDEN_HASH);
 end;
 
+{ A seeded property check: random small trees drawn from names that
+  exercise every entry and namespace rule. Whatever is accepted must
+  normalize deterministically and pass the tar.gz scan. }
+procedure TNormalizeGoldenSuite.TestAcceptedOutputsRoundTrip;
+const
+  COMPONENTS: array[0..15] of RawByteString = ('a', 'B', 'b', 'C:', 'c:x',
+    'lwpt.toml', 'LWPT.toml', 'lwpt.toml.', '.', '..', '', 'x y',
+    #$C3#$BC, 'd', 'LWPT~1.TOM', 'a-b');
+var
+  Seed: Cardinal;
+  Round, Entries, Depth, k, j, Accepted: Integer;
+  Z: TZipSynth;
+  Name: RawByteString;
+  Input: TBytes;
+  First, Second: TLWPTPublicationArchive;
+  Failure: string;
+
+  function Next(const ABound: Integer): Integer;
+  begin
+    Seed := Seed xor (Seed shl 13);
+    Seed := Seed xor (Seed shr 17);
+    Seed := Seed xor (Seed shl 5);
+    Result := Integer(Seed mod Cardinal(ABound));
+  end;
+
+begin
+  Seed := $C0FFEE11;
+  Accepted := 0;
+  Failure := '';
+  for Round := 1 to 600 do
+  begin
+    Z := TZipSynth.Create;
+    try
+      if Next(4) = 0 then
+        Z.AddText('lwpt.toml', DEMO_MANIFEST)
+      else
+        Z.AddText('pkg/lwpt.toml', DEMO_MANIFEST);
+      Entries := 1 + Next(5);
+      for k := 1 to Entries do
+      begin
+        if Next(3) = 0 then Name := '' else Name := 'pkg/';
+        Depth := 1 + Next(3);
+        for j := 1 to Depth do
+        begin
+          if j > 1 then Name := Name + '/';
+          Name := Name + COMPONENTS[Next(Length(COMPONENTS))];
+        end;
+        if Next(3) = 0 then
+          Z.AddDirectory(Name + '/')
+        else
+          Z.AddText(Name, 'x');
+      end;
+      Input := Z.Build;
+    finally
+      Z.Free;
+    end;
+    try
+      First := PreparePublicationArchive(Input);
+    except
+      on E: ELWPTArchiveError do Continue;
+    end;
+    Inc(Accepted);
+    Second := PreparePublicationArchive(Input);
+    if SHA256Hex(First.Archive) <> SHA256Hex(Second.Archive) then
+      Failure := Failure + Format(' round %d: nondeterministic;', [Round]);
+    try
+      ScanTarGzipArchive(First.Archive, DefaultArchiveLimits);
+    except
+      on E: ELWPTArchiveError do
+        Failure := Failure + Format(' round %d: %s;', [Round, E.Message]);
+    end;
+  end;
+  Expect<string>(Failure).ToBe('');
+  { Enough accepted cases for the property to mean something. }
+  Expect<Boolean>(Accepted >= 50).ToBe(True);
+end;
+
 procedure TNormalizeGoldenSuite.SetupTests;
 begin
   Test('input type comes from the leading bytes',
@@ -506,6 +610,8 @@ begin
   Test('only Unix execute bits make a file 0755', TestExecuteBits);
   Test('the output passes the tar.gz contract unchanged',
     TestOutputIsACanonicalPackage);
+  Test('every accepted random tree round-trips through the tar.gz scan',
+    TestAcceptedOutputsRoundTrip);
 end;
 
 { ---- entry rules -------------------------------------------------------- }
@@ -715,6 +821,19 @@ begin
   end;
 end;
 
+procedure TNormalizeEntrySuite.TestRootStrippingRevalidatesPaths;
+begin
+  { Each name is relative until its top-level directory is removed. }
+  Expect<string>(Rejection(DemoZip(['pkg/C:/x']), 'is an absolute path'))
+    .ToBe(ARCHIVE_INVALID);
+  Expect<string>(Rejection(DemoZip(['pkg/c:x']), 'is an absolute path'))
+    .ToBe(ARCHIVE_INVALID);
+  Expect<string>(Rejection(DemoZip(['pkg/C:/']), 'is an absolute path'))
+    .ToBe(ARCHIVE_INVALID);
+  { A drive-like name deeper down stays a plain component. }
+  Expect<string>(Rejection(DemoZip(['pkg/sub/C:x']), '')).ToBe('accepted');
+end;
+
 procedure TNormalizeEntrySuite.SetupTests;
 begin
   Test('rejects symlinks, devices, FIFOs, and sockets',
@@ -734,6 +853,8 @@ begin
     TestRejectsDirectoryWithContent);
   Test('package root is the zip root or its single top-level directory',
     TestPackageRootLayouts);
+  Test('paths below the package root are revalidated',
+    TestRootStrippingRevalidatesPaths);
 end;
 
 { ---- namespace rules ---------------------------------------------------- }
@@ -761,7 +882,7 @@ begin
   Expect<string>(Rejection(DemoZip(['pkg/Src/', 'pkg/src/a']),
     'differ only in ASCII case')).ToBe(ARCHIVE_INVALID);
   Expect<string>(Rejection(DemoZip(['pkg/LWPT.toml']),
-    'differ only in ASCII case')).ToBe(ARCHIVE_INVALID);
+    'aliases lwpt.toml')).ToBe(ARCHIVE_INVALID);
   { Only ASCII folds: these are distinct paths everywhere. }
   Expect<string>(Rejection(DemoZip(['pkg/'#$C3#$9C, 'pkg/'#$C3#$BC]), ''))
     .ToBe('accepted');
@@ -978,6 +1099,121 @@ begin
     .ToBe(ARCHIVE_LIMIT_EXCEEDED);
 end;
 
+procedure TNormalizeLimitSuite.TestOverlongPathRefusedBeforeTree;
+var
+  Name: RawByteString;
+  i: Integer;
+  Started: QWord;
+begin
+  { 'a/' 32,760 times: a 64 KiB name whose implied parents would total
+    about 1 GiB. It is refused before a single parent is built. }
+  Name := 'pkg/';
+  for i := 1 to 32760 do Name := Name + 'a/';
+  Name := Name + 'b';
+  Started := GetTickCount64;
+  Expect<string>(Rejection(DemoZip([Name]),
+    'longer than any path ustar can hold')).ToBe(ARCHIVE_INVALID);
+  Expect<Boolean>(GetTickCount64 - Started < 5000).ToBe(True);
+  { Below the root, 254 bytes is the most any ustar path leaves. }
+  Name := 'pkg/';
+  for i := 1 to 127 do Name := Name + 'a/';
+  Name := Name + 'b';
+  Expect<string>(Rejection(DemoZip([Name]),
+    '255 bytes, longer than any path ustar can hold'))
+    .ToBe(ARCHIVE_INVALID);
+end;
+
+procedure TNormalizeLimitSuite.TestTreePathBudget;
+var
+  Z: TZipSynth;
+  Chain: RawByteString;
+  i: Integer;
+  Limits: TLWPTArchiveLimits;
+begin
+  { 2,000 distinct 120-deep chains imply about 30 MiB of distinct parent
+    paths: past the 16 MiB budget, which stops the build. }
+  Chain := '';
+  for i := 1 to 120 do Chain := Chain + 'a/';
+  Z := TZipSynth.Create;
+  try
+    Z.AddText('pkg/lwpt.toml', DEMO_MANIFEST);
+    for i := 1 to 2000 do
+      Z.Add(RawByteString(Format('pkg/d%.4d/', [i])) + Chain + 'f', nil, 0);
+    Expect<string>(Rejection(Z.Build, 'implied directories, pass 16777216'))
+      .ToBe(ARCHIVE_LIMIT_EXCEEDED);
+  finally
+    Z.Free;
+  end;
+  { The budget counts every distinct path once: 'demo' tree 'a', 'a/b',
+    and 'lwpt.toml' total 13 bytes. }
+  Limits := DefaultArchiveLimits;
+  Limits.MaximumTreePathBytes := 13;
+  Expect<string>(Rejection(DemoZip(['pkg/a/b']), '', Limits))
+    .ToBe('accepted');
+  Limits.MaximumTreePathBytes := 12;
+  Expect<string>(Rejection(DemoZip(['pkg/a/b']), 'pass 12 bytes', Limits))
+    .ToBe(ARCHIVE_LIMIT_EXCEEDED);
+end;
+
+function PaddedManifest(const ALength: Integer): string;
+begin
+  Result := DEMO_MANIFEST + '#';
+  Result := Result + StringOfChar('x', ALength - Length(Result) - 1) + #10;
+end;
+
+procedure TNormalizeLimitSuite.TestManifestByteBudget;
+var
+  Limits: TLWPTArchiveLimits;
+  Big: string;
+begin
+  { A comment makes the manifest large but trivially compressible: it is
+    refused by its declared size before it is decoded or scanned. }
+  Big := PaddedManifest(ARCHIVE_MAXIMUM_MANIFEST_BYTES + 1);
+  Expect<string>(Rejection(DemoZip([], Big), 'lwpt.toml is 262145 bytes'))
+    .ToBe(ARCHIVE_LIMIT_EXCEEDED);
+  Expect<string>(Rejection(Gzip(BuildTar([MakeRegularFileEntry(
+    'demo-1.0.0/lwpt.toml', TextBytes(Big))])), 'lwpt.toml is 262145 bytes'))
+    .ToBe(ARCHIVE_LIMIT_EXCEEDED);
+  Expect<string>(Rejection(DemoZip([], PaddedManifest(
+    ARCHIVE_MAXIMUM_MANIFEST_BYTES)), '')).ToBe('accepted');
+  Limits := DefaultArchiveLimits;
+  Limits.MaximumManifestBytes := 100;
+  Expect<string>(Rejection(DemoZip([], PaddedManifest(100)), '', Limits))
+    .ToBe('accepted');
+  Expect<string>(Rejection(Gzip(BuildTar([MakeRegularFileEntry(
+    'demo-1.0.0/lwpt.toml', TextBytes(PaddedManifest(100)))])), '', Limits))
+    .ToBe('accepted');
+  Expect<string>(Rejection(DemoZip([], PaddedManifest(101)),
+    'lwpt.toml is 101 bytes', Limits)).ToBe(ARCHIVE_LIMIT_EXCEEDED);
+  Expect<string>(Rejection(Gzip(BuildTar([MakeRegularFileEntry(
+    'demo-1.0.0/lwpt.toml', TextBytes(PaddedManifest(101)))])),
+    'lwpt.toml is 101 bytes', Limits)).ToBe(ARCHIVE_LIMIT_EXCEEDED);
+end;
+
+function ArrayManifest(const AItems: Integer): string;
+var
+  i: Integer;
+begin
+  Result := DEMO_MANIFEST + 'values = [';
+  for i := 1 to AItems do
+    Result := Result + '0,';
+  Result := Result + ']'#10;
+end;
+
+procedure TNormalizeLimitSuite.TestManifestNodeBudget;
+begin
+  { A flat array within the byte budget but past the node budget. }
+  Expect<Boolean>(Length(ArrayManifest(20000)) < ARCHIVE_MAXIMUM_MANIFEST_BYTES)
+    .ToBe(True);
+  Expect<string>(Rejection(DemoZip([], ArrayManifest(20000)),
+    'exceeds its parse budget')).ToBe(ARCHIVE_LIMIT_EXCEEDED);
+  Expect<string>(Rejection(Gzip(BuildTar([MakeRegularFileEntry(
+    'demo-1.0.0/lwpt.toml', TextBytes(ArrayManifest(20000)))])),
+    'exceeds its parse budget')).ToBe(ARCHIVE_LIMIT_EXCEEDED);
+  Expect<string>(Rejection(DemoZip([], ArrayManifest(1000)), ''))
+    .ToBe('accepted');
+end;
+
 procedure TNormalizeLimitSuite.SetupTests;
 begin
   Test('refuses zip and tar.gz input one byte over 256 MiB', TestInputBound);
@@ -987,9 +1223,16 @@ begin
     TestInflationPastDeclaredSize);
   Test('stops output that passes the output bound', TestOutputBound);
   Test('bounds a tar.gz''s expanded size', TestTarGzipExpansionBound);
+  Test('refuses an over-long path before building its parents',
+    TestOverlongPathRefusedBeforeTree);
+  Test('bounds the bytes of the normalized tree''s paths',
+    TestTreePathBudget);
+  Test('bounds lwpt.toml''s size before decoding it',
+    TestManifestByteBudget);
+  Test('bounds lwpt.toml''s TOML node count', TestManifestNodeBudget);
 end;
 
-{ ---- tar.gz scan -------------------------------------------------------- }
+{ ---- manifest aliases --------------------------------------------------- }
 
 { Rewrites an entry's type flag and restores its header checksum. }
 function Retyped(const AEntry: TBytes; const AType: Char): TBytes;
@@ -1006,6 +1249,118 @@ begin
   Move(Digits[1], Result[148], 6);
   Result[154] := 0;
 end;
+
+
+const
+  OTHER_MANIFEST = '[package]'#10'name = "other"'#10'version = "9.9.9"'#10
+    + '[dependencies]'#10'lib = "owner/lib@^1.0.0"'#10;
+
+function ManifestPairTarGz(const ASecond: TBytes): TBytes;
+begin
+  Result := Gzip(BuildTar([
+    MakeDirectoryEntry('demo-1.0.0/'),
+    MakeRegularFileEntry('demo-1.0.0/lwpt.toml', TextBytes(DEMO_MANIFEST)),
+    ASecond]));
+end;
+
+procedure TManifestAliasSuite.TestTarManifestOverwriteIsRefused;
+var
+  Scratch, Archive, Installed: string;
+  Input: TBytes;
+begin
+  { The installer expands 'demo-1.0.0/./lwpt.toml' to the manifest's own
+    destination, so the second entry replaces the first: installing this
+    archive yields "other" 9.9.9 with a dependency, not the "demo" identity
+    a literal comparison would have inspected. }
+  Input := ManifestPairTarGz(MakeRegularFileEntry('demo-1.0.0/./lwpt.toml',
+    TextBytes(OTHER_MANIFEST)));
+  Scratch := CreateScratchRoot('archive-normalize-overwrite');
+  try
+    Archive := IncludeTrailingPathDelimiter(Scratch) + 'alias.tar.gz';
+    WriteBytesToFile(Archive, Input);
+    ExtractArchive(Archive, IncludeTrailingPathDelimiter(Scratch) + 'out');
+    Installed := ReadBinaryFile(IncludeTrailingPathDelimiter(Scratch)
+      + 'out' + PathDelim + 'lwpt.toml');
+    Expect<string>(Installed).ToBe(OTHER_MANIFEST);
+  finally
+    RecursiveDelete(Scratch);
+  end;
+  Expect<string>(Rejection(Input, 'lwpt.toml appears more than once'))
+    .ToBe(ARCHIVE_INVALID);
+  { An empty component makes the path absolute once the root is stripped. }
+  Expect<string>(Rejection(ManifestPairTarGz(MakeRegularFileEntry(
+    'demo-1.0.0//lwpt.toml', TextBytes(OTHER_MANIFEST))),
+    'escapes the extraction root')).ToBe(ARCHIVE_INVALID);
+  Expect<string>(Rejection(ManifestPairTarGz(MakeRegularFileEntry(
+    'demo-1.0.0/./././lwpt.toml', TextBytes(OTHER_MANIFEST))),
+    'lwpt.toml appears more than once')).ToBe(ARCHIVE_INVALID);
+end;
+
+procedure TManifestAliasSuite.TestTarManifestAliases;
+const
+  { Typed arrays: FPC sizes an untyped string-array constructor in a for-in
+    loop to its first element. }
+  ALIASES: array[0..7] of string = ('LWPT.TOML', 'Lwpt.toml', 'lwpt.toml.',
+    'lwpt.toml ', 'lwpt.toml..', 'lwpt.toml::$DATA', 'LWPT~1.TOM',
+    'lwpt~2.tom');
+  DISTINCT: array[0..4] of string = ('sub/lwpt.toml', 'lwpt.toml.bak',
+    'lwpt.tomlx', 'xlwpt.toml', 'sub/LWPT.TOML');
+var
+  Spelling: string;
+begin
+  { Links and directories at the manifest's destination. }
+  Expect<string>(Rejection(ManifestPairTarGz(MakeSymlinkEntry(
+    'demo-1.0.0/./lwpt.toml', 'README')), 'is not a regular file'))
+    .ToBe(ARCHIVE_INVALID);
+  Expect<string>(Rejection(ManifestPairTarGz(Retyped(MakeSymlinkEntry(
+    'demo-1.0.0/lwpt.toml', 'README'), '1')), 'is not a regular file'))
+    .ToBe(ARCHIVE_INVALID);
+  Expect<string>(Rejection(ManifestPairTarGz(MakeDirectoryEntry(
+    'demo-1.0.0/lwpt.toml/')), 'is not a regular file'))
+    .ToBe(ARCHIVE_INVALID);
+  { Spellings a case-insensitive or Windows file system resolves to the
+    manifest. }
+  for Spelling in ALIASES do
+    Expect<string>(Rejection(ManifestPairTarGz(MakeRegularFileEntry(
+      'demo-1.0.0/' + Spelling, TextBytes(OTHER_MANIFEST))),
+      'aliases lwpt.toml')).ToBe(ARCHIVE_INVALID);
+  { An alias before the manifest is refused too. }
+  Expect<string>(Rejection(Gzip(BuildTar([
+    MakeRegularFileEntry('demo-1.0.0/LWPT.TOML', TextBytes(OTHER_MANIFEST)),
+    MakeRegularFileEntry('demo-1.0.0/lwpt.toml', TextBytes(DEMO_MANIFEST))])),
+    'aliases lwpt.toml')).ToBe(ARCHIVE_INVALID);
+  { Names that no platform resolves to the root manifest. }
+  for Spelling in DISTINCT do
+    Expect<string>(Rejection(ManifestPairTarGz(MakeRegularFileEntry(
+      'demo-1.0.0/' + Spelling, TextBytes(OTHER_MANIFEST))), ''))
+      .ToBe('accepted');
+end;
+
+procedure TManifestAliasSuite.TestZipManifestAliases;
+const
+  ALIASES: array[0..5] of RawByteString = ('pkg/lwpt.toml.',
+    'pkg/lwpt.toml ', 'pkg/lwpt.toml:x', 'pkg/LWPT~1.TOM', 'pkg/LWPT.TOML/',
+    'pkg/lwpt.toml./x');
+var
+  Spelling: RawByteString;
+begin
+  for Spelling in ALIASES do
+    Expect<string>(Rejection(DemoZip([Spelling]), 'aliases lwpt.toml'))
+      .ToBe(ARCHIVE_INVALID);
+  Expect<string>(Rejection(DemoZip(['pkg/sub/LWPT~1.TOM',
+    'pkg/lwpt.toml.bak']), '')).ToBe('accepted');
+end;
+
+procedure TManifestAliasSuite.SetupTests;
+begin
+  Test('a tar entry that would overwrite the inspected manifest is refused',
+    TestTarManifestOverwriteIsRefused);
+  Test('tar links, directories, and platform spellings of lwpt.toml',
+    TestTarManifestAliases);
+  Test('zip spellings of lwpt.toml', TestZipManifestAliases);
+end;
+
+{ ---- tar.gz scan -------------------------------------------------------- }
 
 function DemoTarGz(const AEntries: array of TBytes): TBytes;
 var
@@ -1201,6 +1556,8 @@ begin
     'LWPT.ArchiveNormalize identity'));
   TestRunnerProgram.AddSuite(TNormalizeLimitSuite.Create(
     'LWPT.ArchiveNormalize bounds'));
+  TestRunnerProgram.AddSuite(TManifestAliasSuite.Create(
+    'LWPT.ArchiveNormalize manifest aliases'));
   TestRunnerProgram.AddSuite(TTarGzipScanSuite.Create(
     'LWPT.ArchiveNormalize tar.gz scan'));
   TestRunnerProgram.Run;

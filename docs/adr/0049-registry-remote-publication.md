@@ -454,6 +454,13 @@ is a zip. Anything else fails with `unsupported_archive`.
   The archive must have exactly one top-level directory, which the installer
   strips (`:1221-1233`). That directory must contain `lwpt.toml`, whose
   `[package] name` and `version` are the protocol-valid publication identity.
+  Exactly one entry may reach that manifest's extraction destination, and
+  it must be a regular file. A second entry that expands to the same path
+  (such as `./lwpt.toml`), a link or directory there, or a spelling that a
+  case-insensitive or Windows file system resolves to it (ASCII case, a
+  trailing `.` or space, an NTFS stream suffix, or the `lwpt~` 8.3 short
+  name) is refused, because installing it would replace the identity that
+  was inspected. Zip normalization refuses the same spellings.
 - **zip** is normalized on the client into one canonical tar.gz, described
   in the next section. Only that tar.gz is uploaded, stored, hashed, and
   served.
@@ -594,6 +601,13 @@ hold the same names, bytes, and execute bits produce the same tar.gz.
   enforced as it inflates.
 - The canonical tar.gz must be at most 256 MiB. Generation stops once the
   output passes that size.
+- `lwpt.toml` may be at most 256 KiB and parse to at most 10,000 TOML
+  nodes. Its declared size is checked before it is decoded or buffered, in
+  both the zip and tar.gz paths.
+- A path longer than any ustar path could hold (256 bytes in the output,
+  so 254 below the package root) is refused with `invalid_archive` before
+  any implied parent is built. The distinct paths of the normalized tree, explicit and
+  implied, may total at most 16 MiB; the check runs as the tree is built.
 
 Peak memory is about the input size plus the output size plus fixed buffers.
 

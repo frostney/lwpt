@@ -30,7 +30,7 @@ golden/
 
 | File | Tool | What it exercises |
 | --- | --- | --- |
-| `infozip.zip` | Info-ZIP Zip 3.0 (`zip -r -X -9`) | Unix host, `UT`/`ux` extra fields, explicit directory entries including the top-level directory, stored and deflated entries |
+| `infozip.zip` | Info-ZIP Zip 3.0 (`zip -r -X -9`) | Unix host and modes, explicit directory entries including the top-level directory, stored and deflated entries. `-X` omits Info-ZIP's `UT`/`ux` extra fields, so every extra field is empty; extra-field parsing is covered by the synthesised zips in `LWPT.Zip.Test` |
 | `sevenzip-root.zip` | 7-Zip 23.01 (`7z a -tzip -mx=9`) | the package at the zip root, 7-Zip's own attribute encoding and entry order |
 | `python-descriptors.zip` | Python `zipfile`, written to an unseekable stream | a data descriptor with its signature on every entry, zero local CRC and sizes, an implied `bin/` directory, and an archive comment |
 | `git-archive.tar.gz` | `git archive --format=tar --prefix=golden-1.0.0/`, then `gzip -n -9` | a tar.gz as a release workflow produces it, with a leading pax global header; it is published unchanged |

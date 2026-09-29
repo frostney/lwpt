@@ -11,7 +11,8 @@
     header reading, and applies the installer's traversal and link rules and
     255-byte component limit plus the 1 GiB expanded bound. It must have
     exactly one top-level directory, which the installer strips, holding a
-    regular lwpt.toml.
+    regular lwpt.toml that no other entry can replace once extracted (see
+    ClassifyManifestPath).
   - A zip is normalized into the one canonical tar.gz (LWPT.TarWriter) after
     LWPT.Zip validates its container. Entry names must be strict UTF-8
     without control characters, relative, and free of '.', '..', and empty
@@ -23,8 +24,9 @@
     Output paths are <name>-<version>/<path below the root> and must fit
     ustar.
 
-  For both, lwpt.toml's [package] name and version must satisfy the
-  registry protocol grammar. Refusing a manifest that declares
+  For both, lwpt.toml is bounded in bytes (from its declared size, before
+  it is decoded) and in TOML nodes, and its [package] name and version
+  must satisfy the registry protocol grammar. Refusing a manifest that declares
   [dependencies] (ADR-0049 decision 4) is a separate policy step,
   RejectDeclaredDependencies, applied by PreparePublicationArchive only, so
   lifting it later removes one call.
@@ -68,10 +70,13 @@ type
 function DetectArchiveKind(const AInput: TBytes): TLWPTArchiveKind;
 
 { Reads the publication identity from lwpt.toml content. Raises
-  invalid_archive when it does not parse, invalid_package_name or
+  archive_limit_exceeded past the manifest byte or TOML node budget,
+  invalid_archive when it does not parse, and invalid_package_name or
   invalid_version when the identity is not protocol-valid. }
 function InspectPublicationManifest(
-  const AContent: TBytes): TLWPTPublicationManifest;
+  const AContent: TBytes): TLWPTPublicationManifest; overload;
+function InspectPublicationManifest(const AContent: TBytes;
+  const ALimits: TLWPTArchiveLimits): TLWPTPublicationManifest; overload;
 
 { ADR-0049 decision 4: refuses a manifest that declares [dependencies]
   with unsupported_dependencies. }
@@ -132,22 +137,43 @@ end;
   Manifest identity
   --------------------------------------------------------------------------- }
 
+procedure RequireManifestSize(const ASize: Int64;
+  const ALimits: TLWPTArchiveLimits);
+begin
+  if ASize > ALimits.MaximumManifestBytes then
+    raise ELWPTArchiveError.CreateStableFmt(ARCHIVE_LIMIT_EXCEEDED,
+      PUBLICATION_MANIFEST_NAME + ' is %d bytes; the limit is %d',
+      [ASize, ALimits.MaximumManifestBytes]);
+end;
+
 function InspectPublicationManifest(
   const AContent: TBytes): TLWPTPublicationManifest;
+begin
+  Result := InspectPublicationManifest(AContent, DefaultArchiveLimits);
+end;
+
+function InspectPublicationManifest(const AContent: TBytes;
+  const ALimits: TLWPTArchiveLimits): TLWPTPublicationManifest;
 var
   Parser: TTOMLParser;
   Root, PackageNode, NameNode, VersionNode: TTOMLNode;
   Text: UTF8String;
 begin
   Result := Default(TLWPTPublicationManifest);
+  RequireManifestSize(Length(AContent), ALimits);
   SetLength(Text, Length(AContent));
   if Length(AContent) > 0 then Move(AContent[0], Text[1], Length(AContent));
   Root := nil;
   Parser := TTOMLParser.Create;
   try
+    Parser.MaximumNodes := ALimits.MaximumManifestNodes;
     try
       Root := Parser.ParseDocument(Text);
     except
+      on E: ETOMLLimitError do
+        raise ELWPTArchiveError.CreateStable(ARCHIVE_LIMIT_EXCEEDED,
+          PUBLICATION_MANIFEST_NAME + ' exceeds its parse budget: '
+          + E.Message);
       on E: ETOMLParseError do
         raise ELWPTArchiveError.CreateStable(ARCHIVE_INVALID,
           PUBLICATION_MANIFEST_NAME + ' does not parse: ' + E.Message);
@@ -192,6 +218,62 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
+  Manifest aliases
+  --------------------------------------------------------------------------- }
+
+type
+  TManifestPathKind = (mpkNone, mpkExact, mpkAlias);
+
+function AsciiFold(const APath: string): string;
+var
+  i: Integer;
+begin
+  Result := APath;
+  UniqueString(Result);
+  for i := 1 to Length(Result) do
+    if Result[i] in ['A'..'Z'] then
+      Result[i] := Chr(Ord(Result[i]) + 32);
+end;
+
+{ Whether a path relative to the package root can name the root lwpt.toml.
+  Extraction expands the name, so '.' and empty components vanish
+  ('./lwpt.toml' is exact). A case-insensitive Windows or macOS file system
+  also equates ASCII case, and Windows equates a trailing '.' or ' ', an
+  NTFS stream suffix (':...'), and an 8.3 short name (PROGRAM_NAME is
+  short enough to be its own 8.3 stem, so that is PROGRAM_NAME + '~').
+  Any of those is an alias: on some platform it can replace, or be
+  replaced by, the manifest that was inspected. }
+function ClassifyManifestPath(const ARelPath: string): TManifestPathKind;
+var
+  Parts: TStringArray;
+  Kept, Folded: string;
+  Count, i, Colon: Integer;
+begin
+  Parts := StringReplace(ARelPath, '\', '/', [rfReplaceAll]).Split(['/']);
+  Count := 0;
+  Kept := '';
+  for i := 0 to High(Parts) do
+    if (Parts[i] <> '') and (Parts[i] <> '.') then
+    begin
+      Inc(Count);
+      Kept := Parts[i];
+    end;
+  if Count <> 1 then Exit(mpkNone);
+  if Kept = PUBLICATION_MANIFEST_NAME then Exit(mpkExact);
+  Folded := AsciiFold(Kept);
+  Colon := Pos(':', Folded);
+  if Colon > 0 then Folded := System.Copy(Folded, 1, Colon - 1);
+  while (Folded <> '') and (Folded[Length(Folded)] in ['.', ' ']) do
+    SetLength(Folded, Length(Folded) - 1);
+  if (Folded = PUBLICATION_MANIFEST_NAME)
+     or (System.Copy(Folded, 1, Length(PROGRAM_NAME) + 1)
+       = PROGRAM_NAME + '~') then
+    Result := mpkAlias
+  else
+    Result := mpkNone;
+end;
+
+{ ---------------------------------------------------------------------------
   tar.gz scan
   --------------------------------------------------------------------------- }
 
@@ -220,7 +302,7 @@ type
     FHasTop: Boolean;
     procedure HeaderComplete;
     procedure CheckEntry(const AName: string; const ATypeFlag: Byte;
-      const ALinkName: string);
+      const ALinkName: string; const ASize: Int64);
     procedure EnterData(const ASize: Int64);
   public
     constructor Create(const ALimits: TLWPTArchiveLimits);
@@ -262,7 +344,7 @@ begin
 end;
 
 procedure TLWPTTarScanner.CheckEntry(const AName: string;
-  const ATypeFlag: Byte; const ALinkName: string);
+  const ATypeFlag: Byte; const ALinkName: string; const ASize: Int64);
 var
   Normalized, Top, RelName: string;
   Slash: Integer;
@@ -304,14 +386,23 @@ begin
       RaiseInvalid(Format('link target escapes the extraction root: %s -> %s',
         [AName, ALinkName]));
   end;
-  if RelName = PUBLICATION_MANIFEST_NAME then
-  begin
-    if not (TypeChar in ['0', #0]) then
-      RaiseInvalid(PUBLICATION_MANIFEST_NAME + ' is not a regular file');
-    if FManifestSeen then
-      RaiseInvalid(PUBLICATION_MANIFEST_NAME + ' appears more than once');
-    FManifestSeen := True;
-    FCapture := True;
+  { Exactly one entry may reach the root manifest's destination, and it
+    must be a regular file: any second spelling of it would replace the
+    inspected identity when installed. }
+  case ClassifyManifestPath(RelName) of
+    mpkAlias:
+      RaiseInvalid(Format('entry "%s" aliases %s', [AName,
+        PUBLICATION_MANIFEST_NAME]));
+    mpkExact:
+      begin
+        if not (TypeChar in ['0', #0]) then
+          RaiseInvalid(PUBLICATION_MANIFEST_NAME + ' is not a regular file');
+        if FManifestSeen then
+          RaiseInvalid(PUBLICATION_MANIFEST_NAME + ' appears more than once');
+        RequireManifestSize(ASize, FLimits);
+        FManifestSeen := True;
+        FCapture := True;
+      end;
   end;
 end;
 
@@ -375,7 +466,7 @@ begin
     Name := Prefix + '/' + Name;
   FPendingLongName := '';
   FHasPendingLongName := False;
-  CheckEntry(Name, TypeFlag, LinkName);
+  CheckEntry(Name, TypeFlag, LinkName, Size);
   EnterData(Size);
 end;
 
@@ -490,7 +581,7 @@ begin
     end;
     Scanner.Finish;
     Result := InspectPublicationManifest(System.Copy(Scanner.FManifest.Bytes,
-      0, Scanner.FManifest.Size));
+      0, Scanner.FManifest.Size), ALimits);
   finally
     Scanner.Free;
     Source.Free;
@@ -540,6 +631,8 @@ type
     FDirectory: TArray<Boolean>;
     FExecutable: TArray<Boolean>;
     FItems: TTreeItemArray;
+    FItemCount: Integer;
+    FTreePathBytes: Int64;
     FIndex: TDictionary<string, Integer>;
     FFolded: TDictionary<string, string>;
     FRootEntries: TList<Integer>;
@@ -590,16 +683,46 @@ begin
   Result := 0;
 end;
 
-function AsciiFold(const APath: string): string;
+{ The entry rules for one '/'-separated relative path: non-empty, at most
+  AMaximumBytes long (checked first, so an absurd name is refused before it
+  is split), not absolute or drive-relative, and free of '..', '.', empty,
+  and over-long components. They run on every zip name and again on every
+  path below the package root, because removing the top-level directory
+  can expose a new first component such as 'C:'. }
+procedure CheckRelativePath(const APath, AWhere: string;
+  const AMaximumBytes: Integer);
 var
-  i: Integer;
+  Parts: TStringArray;
+  k: Integer;
 begin
-  Result := APath;
-  UniqueString(Result);
-  for i := 1 to Length(Result) do
-    if Result[i] in ['A'..'Z'] then
-      Result[i] := Chr(Ord(Result[i]) + 32);
+  if APath = '' then
+    RaiseInvalid(AWhere + ' has an empty path');
+  if Length(APath) > AMaximumBytes then
+    RaiseInvalid(Format('%s is %d bytes, longer than any path ustar can hold',
+      [AWhere, Length(APath)]));
+  if LooksLikeAbsoluteArchivePath(APath) then
+    RaiseInvalid(AWhere + ' is an absolute path');
+  if ArchiveRelPathHasParentSegment(APath) then
+    RaiseInvalid(AWhere + ' has a ".." component');
+  Parts := APath.Split(['/']);
+  for k := 0 to High(Parts) do
+  begin
+    if (Parts[k] = '') or (Parts[k] = '.') then
+      RaiseInvalid(AWhere + ' has an empty or "." component');
+    if Length(Parts[k]) > ARCHIVE_NAME_COMPONENT_LIMIT then
+      RaiseInvalid(Format('%s has a %d-byte component; the limit is %d',
+        [AWhere, Length(Parts[k]), ARCHIVE_NAME_COMPONENT_LIMIT]));
+  end;
 end;
+
+const
+  { A zip name may carry one top-level directory component and '/' above
+    its package-relative path. }
+  MAXIMUM_ZIP_NAME_BYTES = ARCHIVE_NAME_COMPONENT_LIMIT + 1
+    + USTAR_MAXIMUM_PATH_BYTES;
+  { Below the root '<name>-<version>/' (at least two bytes) of a ustar
+    path. }
+  MAXIMUM_PACKAGE_PATH_BYTES = USTAR_MAXIMUM_PATH_BYTES - 2;
 
 function FirstComponent(const APath: string): string;
 var
@@ -644,10 +767,9 @@ const
   MSDOS_VOLUME_LABEL = $08;
   MSDOS_DIRECTORY = $10;
 var
-  i, k: Integer;
+  i: Integer;
   E: TLWPTZipEntry;
   Name, Body, Where, Kind: string;
-  Parts: TStringArray;
   IsDirectory: Boolean;
   UnixMode: Cardinal;
 begin
@@ -668,21 +790,9 @@ begin
       Body := System.Copy(Name, 1, Length(Name) - 1)
     else
       Body := Name;
-    if Body = '' then
-      RaiseInvalid(Where + ' has an empty path');
-    if LooksLikeAbsoluteArchivePath(Body) then
-      RaiseInvalid(Where + ' is an absolute path');
-    if ArchiveRelPathHasParentSegment(Body) then
-      RaiseInvalid(Where + ' has a ".." component');
-    Parts := Body.Split(['/']);
-    for k := 0 to High(Parts) do
-    begin
-      if (Parts[k] = '') or (Parts[k] = '.') then
-        RaiseInvalid(Where + ' has an empty or "." component');
-      if Length(Parts[k]) > ARCHIVE_NAME_COMPONENT_LIMIT then
-        RaiseInvalid(Format('%s has a %d-byte component; the limit is %d',
-          [Where, Length(Parts[k]), ARCHIVE_NAME_COMPONENT_LIMIT]));
-    end;
+    if Length(Name) > MAXIMUM_ZIP_NAME_BYTES + 1 then
+      Where := Format('zip entry %d', [i]);
+    CheckRelativePath(Body, Where, MAXIMUM_ZIP_NAME_BYTES);
     if IsDirectory and ((E.UncompressedSize <> 0) or (E.Crc32 <> 0)) then
       RaiseInvalid(Where + ' is a directory with content');
     case E.HostSystem of
@@ -738,7 +848,13 @@ begin
   for i := 0 to High(FPaths) do
     if not FDirectory[i] and (FPaths[i] = PUBLICATION_MANIFEST_NAME) then
       RootHasManifest := True;
-  if RootHasManifest then Exit;
+  if RootHasManifest then
+  begin
+    for i := 0 to High(FPaths) do
+      CheckRelativePath(FPaths[i], Format('zip entry "%s"', [FPaths[i]]),
+        MAXIMUM_PACKAGE_PATH_BYTES);
+    Exit;
+  end;
   if Length(FPaths) = 0 then
     RaiseInvalid('zip has no ' + PUBLICATION_MANIFEST_NAME);
   Top := FirstComponent(FPaths[0]);
@@ -751,7 +867,11 @@ begin
     if FPaths[i] = Top then
       FPaths[i] := ''
     else
+    begin
       FPaths[i] := System.Copy(FPaths[i], Length(Top) + 2, MaxInt);
+      CheckRelativePath(FPaths[i], Format('zip entry "%s/%s"',
+        [Top, FPaths[i]]), MAXIMUM_PACKAGE_PATH_BYTES);
+    end;
 end;
 
 procedure TLWPTZipNormalizer.AddTreePath(const APath: string;
@@ -791,6 +911,16 @@ begin
     end;
     Exit;
   end;
+  { Every distinct path is held twice (exact and folded), so their bytes are
+    bounded before either copy is made. }
+  if FTreePathBytes + Length(APath) > FLimits.MaximumTreePathBytes then
+    raise ELWPTArchiveError.CreateStableFmt(ARCHIVE_LIMIT_EXCEEDED,
+      'zip tree paths, with implied directories, pass %d bytes',
+      [FLimits.MaximumTreePathBytes]);
+  Inc(FTreePathBytes, Length(APath));
+  if ClassifyManifestPath(APath) = mpkAlias then
+    RaiseInvalid(Format('zip path "%s" aliases %s',
+      [APath, PUBLICATION_MANIFEST_NAME]));
   Folded := AsciiFold(APath);
   if FFolded.TryGetValue(Folded, Other) then
     RaiseInvalid(Format('zip paths "%s" and "%s" differ only in ASCII case',
@@ -801,9 +931,11 @@ begin
   Item.Kind := AKind;
   Item.Entry := AEntry;
   Item.Executable := AExecutable;
-  SetLength(FItems, Length(FItems) + 1);
-  FItems[High(FItems)] := Item;
-  FIndex.Add(APath, High(FItems));
+  if FItemCount = Length(FItems) then
+    SetLength(FItems, 2 * FItemCount + 16);
+  FItems[FItemCount] := Item;
+  FIndex.Add(APath, FItemCount);
+  Inc(FItemCount);
 end;
 
 function ParentPath(const APath: string): string;
@@ -848,6 +980,7 @@ begin
       Path := ParentPath(Path);
     end;
   end;
+  SetLength(FItems, FItemCount);
   if FManifestEntry < 0 then
     RaiseInvalid('zip has no ' + PUBLICATION_MANIFEST_NAME
       + ' at its package root');
@@ -858,6 +991,10 @@ var
   Target: TBytesStream;
   Content: TBytes;
 begin
+  { Bounded by its declared size before anything is decoded; decoding then
+    enforces the declared size. }
+  RequireManifestSize(FZip.Entries[FManifestEntry].UncompressedSize,
+    FLimits);
   Target := TBytesStream.Create(nil);
   try
     FZip.DecodeEntry(FManifestEntry, Target);
@@ -865,7 +1002,7 @@ begin
   finally
     Target.Free;
   end;
-  FManifest := InspectPublicationManifest(Content);
+  FManifest := InspectPublicationManifest(Content, FLimits);
 end;
 
 procedure TLWPTZipNormalizer.AssignTarPaths;

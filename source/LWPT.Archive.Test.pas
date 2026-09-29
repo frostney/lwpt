@@ -36,6 +36,10 @@ begin
   Expect<Int64>(Limits.MaximumExpandedBytes).ToBe(1073741824);
   Expect<Int64>(Limits.MaximumOutputBytes).ToBe(268435456);
   Expect<Integer>(ARCHIVE_NAME_COMPONENT_LIMIT).ToBe(255);
+  Expect<Int64>(Limits.MaximumManifestBytes).ToBe(262144);
+  Expect<Integer>(Limits.MaximumManifestNodes).ToBe(10000);
+  Expect<Int64>(Limits.MaximumTreePathBytes).ToBe(16777216);
+  Expect<Integer>(USTAR_MAXIMUM_PATH_BYTES).ToBe(256);
 end;
 
 procedure TArchiveSuite.TestAbsolutePaths;
