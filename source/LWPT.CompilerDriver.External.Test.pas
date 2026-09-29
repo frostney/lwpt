@@ -18,7 +18,8 @@ uses
   LWPT.CompilerDriver.External,
   LWPT.Core,
   LWPT.ProcessRunner,
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  Tests.PayloadHandoff;
 
 const
   PROXY_COMPILER_ID = 'test-driver';
@@ -92,26 +93,20 @@ procedure RunEscapedStdinHolder(const APIDFile: string);
 var
   ChildPID: TPid;
   Deadline: QWord;
-  Lines: TStringList;
 begin
   ChildPID := FpFork;
   if ChildPID < 0 then Halt(2);
   if ChildPID = 0 then
   begin
     if FpSetSid < 0 then Halt(3);
-    Lines := TStringList.Create;
-    try
-      Lines.Text := IntToStr(FpGetPID);
-      Lines.SaveToFile(APIDFile);
-    finally
-      Lines.Free;
-    end;
+    PublishReadablePayload(APIDFile, IntToStr(FpGetPID));
     Sleep(30000);
     Halt(0);
   end;
   Deadline := GetTickCount64 + 1000;
-  while (not FileExists(APIDFile)) and (GetTickCount64 < Deadline) do Sleep(1);
-  if not FileExists(APIDFile) then Halt(4);
+  while (not PayloadIsReadable(APIDFile)) and (GetTickCount64 < Deadline) do
+    Sleep(1);
+  if not PayloadIsReadable(APIDFile) then Halt(4);
   Sleep(30000);
 end;
 {$ENDIF}
@@ -596,7 +591,6 @@ const
   ESCAPED_PID_FILE = PROXY_STATE_ROOT + '/escaped-stdin.pid';
 var
   EscapedPID: TPid;
-  Lines: TStringList;
   Options: TLWPTProcessRunOptions;
   P: TProcess;
   Raised: Boolean;
@@ -605,7 +599,7 @@ var
   StartedAt: QWord;
 begin
   ForceDirectories(PROXY_STATE_ROOT);
-  if FileExists(ESCAPED_PID_FILE) then DeleteFile(ESCAPED_PID_FILE);
+  RetractPayload(ESCAPED_PID_FILE);
   EscapedPID := 0;
   P := TProcess.Create(nil);
   Runner := nil;
@@ -626,16 +620,8 @@ begin
       on E: ELWPTProcessRunnerTimeout do
         Raised := Pos('timed out after 500 ms', E.Message) > 0;
     end;
-    Lines := TStringList.Create;
-    try
-      if FileExists(ESCAPED_PID_FILE) then
-      begin
-        Lines.LoadFromFile(ESCAPED_PID_FILE);
-        EscapedPID := StrToIntDef(Trim(Lines.Text), 0);
-      end;
-    finally
-      Lines.Free;
-    end;
+    if PayloadIsReadable(ESCAPED_PID_FILE) then
+      EscapedPID := StrToIntDef(Trim(ReadPayloadText(ESCAPED_PID_FILE)), 0);
     Expect<Boolean>(Raised).ToBe(True);
     { The retained read end must not turn the 500 ms operation deadline into
       an unbounded writer join. Leave room for process-tree and writer cleanup
