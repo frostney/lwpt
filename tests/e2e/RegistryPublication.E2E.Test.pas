@@ -540,8 +540,12 @@ var
   ProcessInstance: TProcess;
   Argument: string;
   Started: QWord;
+  Stopped: TRegistryStopResult;
+  TimedOut: Boolean;
 begin
   AStandardError := '';
+  Result := '';
+  TimedOut := False;
   ProcessInstance := TProcess.Create(nil);
   try
     {$IFDEF MSWINDOWS}
@@ -561,34 +565,32 @@ begin
     for Argument in AArguments do ProcessInstance.Parameters.Add(Argument);
     ProcessInstance.Options := [poUsePipes];
     ProcessInstance.Execute;
-    Result := '';
     Started := GetTickCount64;
-    while ProcessInstance.Running do
+    { curl's own --max-time normally ends it far sooner than this bound. }
+    while ProcessInstance.Running
+      and (GetTickCount64 - Started <= CURL_BOUND_MILLISECONDS) do
     begin
       Result := Result + DrainAvailableStream(ProcessInstance.Output, 4096);
       AStandardError := AStandardError
         + DrainAvailableStream(ProcessInstance.Stderr, 4096);
-      if GetTickCount64 - Started > CURL_BOUND_MILLISECONDS then
-      begin
-        { curl's own --max-time normally ends it far sooner. }
-        AStandardError := AStandardError + ' [curl exceeded its bound]';
-        ProcessInstance.Terminate(1);
-        Break;
-      end;
       Sleep(10);
     end;
+    TimedOut := ProcessInstance.Running;
     Result := Trim(Result + DrainAvailableStream(ProcessInstance.Output, 4096));
     AStandardError := AStandardError
       + DrainAvailableStream(ProcessInstance.Stderr, 4096);
-    { Windows reports the exit status before it releases the child's
-      handles; wait, bounded, for the signalled handle before the scratch
-      file curl read can be removed. }
-    if not WaitForRegistryHandleRelease(ProcessInstance, 5000) then
-      WriteLn(StdErr, 'registry publication e2e: curl did not release its '
-        + 'handles within 5000 ms');
   finally
-    ProcessInstance.Free;
+    { The registry stop path owns and frees the process: a direct signal
+      when curl is still running, bounded exit polling, a forced kill, and
+      a bounded wait until its handles are released, which on Windows
+      happens after the exit is reported. }
+    Stopped := StopRegistryProcess(ProcessInstance, 5000, 5000);
   end;
+  if TimedOut or Stopped.Forced then
+    raise Exception.Create('curl exceeded its bound and was stopped: '
+      + AStandardError);
+  if not Stopped.Stopped then
+    raise Exception.Create('curl did not exit and release its handles');
 end;
 
 function CurlStatus(const AArguments: array of string): string;
