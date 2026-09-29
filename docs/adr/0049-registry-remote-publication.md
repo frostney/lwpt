@@ -187,33 +187,64 @@ Uploads run outside the publication lease. Their ownership and accounting
 therefore rest on operating-system guards and on the directory itself, not
 on memory in one process.
 
+- **Accounting guard.** The `registry-incoming` producer lease (ADR-0038)
+  guards the whole `incoming/` namespace. Every accounting-relevant
+  transition happens while that lease is held:
+  - creating a `.part` file, which is a reservation;
+  - renaming a `.part` to `incoming/sha256/<hex>` on completion;
+  - deleting a `.part` or a completed entry, whether by its owner,
+    reclamation, or one-hour expiry;
+  - moving a completed entry into `objects/`.
+
+  An admission scan therefore sees a fixed namespace. No charged file can
+  move from an unscanned directory into one already scanned, so no charge is
+  missed. The lease is held only for the scan plus one namespace operation.
+  Hashing, reading the body, and verifying the commit all happen outside it.
+- **Lock ordering.** Only three acquisitions ever wait, and each wait is
+  bounded:
+  - the publication lease, up to 5 seconds, and never while any other
+    registry lease is held;
+  - `registry-incoming`, up to 2 seconds, possibly while holding the
+    publication lease or the caller's own upload lease;
+  - an upload's own lease, taken before its `.part` exists and so before any
+    other lease is held.
+
+  The resulting order is publication lease, then upload lease, then
+  `registry-incoming`. Another upload's lease is only ever tried without
+  waiting, including under `registry-incoming` during reclamation, so a
+  held lease just means "live, skip it". No cycle can form. A bounded wait
+  that times out answers `503 temporary_failure` with `Retry-After` and holds
+  no reservation.
 - **Reservation.** After the headers pass authentication and the length
-  check, the server takes the short-lived `registry-incoming` producer lease
-  (ADR-0038). It sums the lengths of every file under `incoming/`. When the
-  declared `Content-Length` still fits the 1 GiB and 1,000-entry budget, it
-  creates `incoming/<upload-id>.part` at exactly that length, then releases
-  the lease. The upload ID is 128 random bits. A file's length is its
-  reservation, so an in-progress upload counts in full from admission.
-  Concurrent admissions, whether in one process or several, are serialized
-  and cannot overcommit. An upload that does not fit gets
-  `507 storage_budget_exceeded` before any body byte is read.
+  check, admission takes `registry-incoming`. It sums the lengths of every
+  file under `incoming/`. When the declared `Content-Length` still fits the
+  1 GiB and 1,000-entry budget, it creates `incoming/<upload-id>.part` at
+  exactly that length and releases the lease. The upload ID is 128 random
+  bits. A file's length is its reservation, so an in-progress upload counts
+  in full from admission. Concurrent admissions, whether in one process or
+  several, are serialized and cannot overcommit. An upload that does not fit
+  gets `507 storage_budget_exceeded` before any body byte is read.
 - **Ownership.** Each upload holds a per-upload producer lease keyed by its
   upload ID from creation to completion. Liveness is the OS guard, so a
   `.part` file is never deleted because of its age. The owner deletes its own
-  `.part` on failure, cancellation, digest mismatch, or when its bytes turn
-  out to be an existing object (`204`). Deleting the file releases the
-  reservation.
-- **Reclaiming.** An upload admission or a publication-lease holder may
-  delete another upload's `.part` only after acquiring that upload's lease,
-  which proves the owning process has exited.
-- **Completion.** A verified upload is renamed to `incoming/sha256/<hex>`,
-  keeping its length and therefore its charge. Completed entries are removed
-  only by a publication-lease holder, either when a commit moves them into
-  `objects/` or after one hour without a commit. A commit can therefore never
-  lose its object to cleanup. A record that arrives after cleanup gets `424`,
-  and the client uploads again once.
+  `.part`, under `registry-incoming`, on failure, cancellation, or digest
+  mismatch. Deleting the file releases the reservation.
+- **Reclaiming.** An upload admission or a publication-lease holder, while
+  holding `registry-incoming`, may delete another upload's `.part` only after
+  it acquires that upload's lease without waiting. Acquiring it proves the
+  owning process has exited.
+- **Completion.** A verified upload takes `registry-incoming`. If
+  `incoming/sha256/<hex>` or `objects/sha256/<hex>` already exists, it
+  deletes its `.part` and answers `204`. Otherwise it renames the `.part` to
+  `incoming/sha256/<hex>` and answers `201`. The renamed file keeps its length
+  and therefore its charge. Completed entries are deleted, or moved into
+  `objects/` by a commit, only by a publication-lease holder that also holds
+  `registry-incoming` for that one operation. That holder rehashes the entry
+  before taking the lease. A commit can therefore never lose its object to
+  cleanup. A record that arrives after the one-hour expiry gets `424`, and
+  the client uploads again once.
 - **Failed activation.** The commit moves the object into `objects/` under the
-  publication lease, before activation. If activation then does not happen,
+  publication lease and `registry-incoming`, before activation. If activation then does not happen,
   the object stays in `objects/` without a reference. It is not served,
   because serving is membership-based. It no longer counts against the
   incoming budget. A re-upload of the same bytes answers `204`, and the retried
@@ -619,6 +650,7 @@ The implementation PR applies these amendments; this ADR does not.
 | A CI client publishes to a running origin | E2E: `registry init`, then `serve`, then `issue-token`, then `publish` over localhost HTTP. The server PID stays the same and served reads show the new head. |
 | Readers see the old or new head | E2E: a reader loop verifies every checkpoint, signature, and snapshot with the shared verifier while `publish` holds the publication barrier. Store test: the `checkpoint` failure point leaves the old head, and a retry commits at the same next sequence. The `activation` failure point, which comes after the pointer replacement, leaves the new head served and the index missing. Recovery rebuilds the index, and a retry returns `204` (extending `LWPT.Registry.Store.Test.pas:800-826`). |
 | Crash mid-publish | E2E: kill `serve` at the barrier, restart, get the old head, retry, and get `201` at the same next sequence. Kill during an upload: the `.part` file is reclaimed only after its upload lease is free. A live upload's `.part` survives a concurrent admission and commit. |
+| Completion versus admission race | A `REGISTRY_TESTING` barrier pauses an admission scan after `incoming/sha256/` and before the root. An upload that finishes meanwhile blocks on `registry-incoming` until the scan releases it. Starting from exactly 1 GiB reserved (three completed 256 MiB objects plus one 256 MiB upload), the paused admission of another 256 MiB gets `507`, and reservations never exceed 1 GiB. Reclamation, expiry, and the move into `objects/` get the same barrier test. Admission, completion, and a commit running together finish within their bounded waits without deadlock. |
 | Upload accounting | Two admissions that would together exceed 1 GiB: exactly one proceeds and the other gets `507`. An in-progress upload counts at its declared length. A digest mismatch, an abort, or an existing object releases its reservation. An object moved into `objects/` before a failed activation is unserved, answers `204` on re-upload, and is referenced by the retried commit. |
 | Identical retry succeeds | Same archive, a fresh `published_at`, and a lost-response retry each return `204` with an unchanged sequence and exit 0. |
 | Conflicting content rejected | A different archive for an existing version returns `409 identity_conflict`, leaves the sequence unchanged, writes an audit record, and exits 1. The amended corpus cases pass: genuine-content `409`, yanked-record `400`, and timestamp-only `204`. |
