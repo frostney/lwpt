@@ -52,6 +52,27 @@ the otherwise valid sequence-1 checkpoint must fail with
 | Package listing | `pages/packages.toml`, `pages/packages-first.toml`, `pages/packages-second.toml`, `pages/package-example-lib.toml` |
 | Endpoint contract | `endpoint-cases.toml` |
 | Error and idempotency outcomes | `outcome-cases.toml`, `errors/*.toml` |
-| Publication | The valid object and package-record bodies above plus `requests/package-missing-archive.toml` |
+| Publication | The valid object and package-record bodies above plus `requests/package-missing-archive.toml` and `requests/package-identity-conflict.toml` |
 | Yank and restore | The records and snapshots dated `2026-01-04` and `2026-01-05` |
 | URI validation | `uri-cases.toml`, `invalid/discovery-http-ip.toml` |
+
+## Publication outcomes
+
+Idempotency compares **content identity**: `archive`, `archive_size`, and
+`dependencies`, never `published_at` or `yanked`
+([ADR-0049](../../../../docs/adr/0049-registry-remote-publication.md)).
+
+- `package-identity-conflict` sends `requests/package-identity-conflict.toml`,
+  which names a different archive for `example-lib` 1.1.0, and expects `409`.
+- `publish-yanked-record-rejected` sends the yanked `ac8180e8…` record and
+  expects `400 invalid_request`: yanking goes only through the lifecycle
+  endpoints.
+- `publish-timestamp-only-retry` sends `7802b04a…`, which differs from the
+  active `3ed9d3d8…` record only in `published_at`, and expects `204` with the
+  active record's `Location`.
+- A server conformance run pins its registry clock to each new record's
+  `published_at` (and to the yank and restore record times), so the
+  five-minute skew rule and the server-assigned lifecycle times reproduce the
+  corpus bytes regardless of when the run happens. `publish-package-created`
+  declares dependencies, so an LWPT origin runs it with the ADR-0049
+  decision-4 refusal lifted through its test seam.

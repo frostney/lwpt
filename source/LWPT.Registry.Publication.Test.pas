@@ -1122,9 +1122,11 @@ begin
   Expect<string>(WithoutRequestID(RawHTTPBodyText(Response)))
     .ToBe(WithoutRequestID(ReadBinaryFile(FIXTURES + 'errors/identity-conflict.toml')));
   { publish-yanked-record-rejected }
-  Expect<Integer>(Request('PUT', '/v1/packages/example-lib/1.1.0', FToken,
-    Fixture('records/ac8180e85258202a3fa266525b0936b142e04a08924aa2738f80c608e853892e.toml'))
-    .Status).ToBe(400);
+  Response := Request('PUT', '/v1/packages/example-lib/1.1.0', FToken,
+    Fixture('records/ac8180e85258202a3fa266525b0936b142e04a08924aa2738f80c608e853892e.toml'));
+  Expect<Integer>(Response.Status).ToBe(400);
+  Expect<string>(WithoutRequestID(RawHTTPBodyText(Response)))
+    .ToBe(WithoutRequestID(ReadBinaryFile(FIXTURES + 'errors/invalid-request.toml')));
   { publish-timestamp-only-retry }
   Response := Request('PUT', '/v1/packages/example-lib/1.1.0', FToken,
     Fixture('records/7802b04acce9fe2768d56d7003ab4d3f4c714f9692513205781a64b6d4e767fa.toml'));
