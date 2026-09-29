@@ -19,7 +19,10 @@
     6. Historical relocated sessions remain reclaimable after the override
        is absent.
     7. Shared-cache corruption and incomplete state are repaired repeatably.
-    8. Transitive build references with missing artifacts are removed. }
+    8. Transitive build references with missing artifacts are removed.
+    9. Retired executable images beside build outputs are removed.
+   10. A build output directory reached through a link is never swept
+       (Unix; directory symlinks need no privilege there). }
 
 program Repair.Test;
 
@@ -28,11 +31,13 @@ program Repair.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
   SysUtils,
 
   LWPT.BuildSession,
+  LWPT.Core,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.Scratch;
@@ -57,6 +62,10 @@ type
     procedure TestRepairRecoversSharedCache;
     procedure TestRepairRemovesTransitiveBuildReference;
     procedure TestRepairReclaimsWorkerRequests;
+    procedure TestRepairRemovesRetiredExecutableImages;
+    {$IFDEF UNIX}
+    procedure TestRepairSkipsRedirectedOutputDirectory;
+    {$ENDIF}
   end;
 
 procedure TRepairE2E.SetupScratchProject;
@@ -342,6 +351,63 @@ begin
   Expect<Boolean>(FileExists(ReferencePath)).ToBe(False);
 end;
 
+procedure TRepairE2E.TestRepairRemovesRetiredExecutableImages;
+var
+  RetiredPath, BackupPath: string;
+  R: TLwptResult;
+begin
+  { A Windows self-hosted rebuild retires the image it runs from beside the
+    build output. Once unused, repair removes it; an in-flight replacement
+    backup is not retired residue and stays. }
+  RetiredPath := FScratch + '/build/' + RetiredExecutablePrefix
+    + '4242-1f1huft3e-7' + TmpPathExtension;
+  BackupPath := FScratch + '/build/.r-4242-1f1huft3e-8' + TmpPathExtension;
+  WriteTextFile(RetiredPath, 'old image');
+  WriteTextFile(BackupPath, 'in-flight backup');
+  try
+    R := RunRepair;
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(FileExists(RetiredPath)).ToBe(False);
+    Expect<Boolean>(FileExists(BackupPath)).ToBe(True);
+    Expect<Boolean>(Pos('removed 1 retired executable image(s), 0 still in '
+      + 'use', R.Stdout) > 0).ToBe(True);
+  finally
+    SysUtils.DeleteFile(BackupPath);
+  end;
+end;
+
+{$IFDEF UNIX}
+procedure TRepairE2E.TestRepairSkipsRedirectedOutputDirectory;
+var
+  BuildDir, SavedBuildDir, ForeignDir, ForeignPath: string;
+  R: TLwptResult;
+begin
+  { Redirecting the output directory must not let repair delete matching
+    files in a directory the project does not own. }
+  BuildDir := FScratch + '/build';
+  SavedBuildDir := FScratch + '/build.saved';
+  ForeignDir := FScratch + '/foreign-output';
+  ForeignPath := ForeignDir + '/' + RetiredExecutablePrefix
+    + '4242-1f1huft3e-7' + TmpPathExtension;
+  WriteTextFile(ForeignPath, 'not owned by the project');
+  if DirectoryExists(BuildDir) then
+    Expect<Boolean>(RenameFile(BuildDir, SavedBuildDir)).ToBe(True);
+  Expect<Integer>(FpSymlink(PChar(ForeignDir), PChar(BuildDir))).ToBe(0);
+  try
+    R := RunRepair;
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(FileExists(ForeignPath)).ToBe(True);
+    Expect<Boolean>(Pos('skipped retired-image sweep', R.Stdout) > 0)
+      .ToBe(True);
+  finally
+    FpUnlink(PChar(BuildDir));
+    if DirectoryExists(SavedBuildDir) then
+      RenameFile(SavedBuildDir, BuildDir);
+    RecursiveDelete(ForeignDir);
+  end;
+end;
+{$ENDIF}
+
 procedure TRepairE2E.SetupTests;
 begin
   Test('repair on a clean tree is a no-op exit 0',
@@ -360,6 +426,12 @@ begin
     TestRepairRemovesTransitiveBuildReference);
   Test('repair reclaims dead machine-wide worker requests',
     TestRepairReclaimsWorkerRequests);
+  Test('repair removes retired executable images beside build outputs',
+    TestRepairRemovesRetiredExecutableImages);
+  {$IFDEF UNIX}
+  Test('repair never sweeps a link-redirected build output directory',
+    TestRepairSkipsRedirectedOutputDirectory);
+  {$ENDIF}
 end;
 
 begin

@@ -92,6 +92,8 @@ procedure CopyDirTree(const ASrc, ADst: string);
 const
   TmpPathDelimiter = '.';
   TmpPathExtension = '.tmp';
+  { Prefix of old executable images retired by AtomicReplaceExecutable. }
+  RetiredExecutablePrefix = '.' + PROGRAM_NAME + '-retired-';
 
 function  MakeTmpPath(const ATmpRoot, AHint: string): string;
 function  MakeSiblingTmpPath(const APath, ATag: string): string;
@@ -105,6 +107,32 @@ function  AtomicRemovePath(const APath: string): Boolean;
 function  AtomicRetainedDestination(const ABackupPath: string): string;
 procedure AtomicDiscardRetainedPath(const ABackupPath: string);
 function  AtomicReplaceFile(const ASrc, ADst: string): Boolean;
+{ AtomicReplaceFile for a published executable image that a running process
+  may still map (the self-hosted `lwpt build` replaces the binary running it).
+  Windows refuses to delete a mapped image, so after a committed replacement
+  an undeletable old image is renamed to a retired-image sibling and the
+  replacement still succeeds; each later executable replacement in that
+  directory, and `lwpt repair`, removes retired images no longer in use.
+  The sweep runs only where RetiredExecutableSweepAllowed(AOwnerRoot, ...)
+  holds for the destination directory. Identical to AtomicReplaceFile on
+  Unix. }
+function  AtomicReplaceExecutable(const ASrc, ADst,
+  AOwnerRoot: string): Boolean;
+{ True for names only AtomicReplaceExecutable produces for retired images. }
+function  IsRetiredExecutableName(const AName: string): Boolean;
+{ A retired-image sweep deletes by name alone, so it is allowed only in an
+  existing directory that lies lexically inside AOwnerRoot and that LWPT
+  reaches without following a link: no component from AOwnerRoot down to
+  ADirectory, inclusive, may be a symlink or junction. The owner root itself
+  is the caller's trust anchor. }
+function  RetiredExecutableSweepAllowed(const AOwnerRoot,
+  ADirectory: string): Boolean;
+{ Delete every retired executable image in ADirectory that is no longer in
+  use; returns the removed count and reports those still in use. Links are
+  never followed or removed, and a directory refused by
+  RetiredExecutableSweepAllowed is left untouched. }
+function  RemoveRetiredExecutables(const AOwnerRoot, ADirectory: string;
+  out ARetained: Integer): Integer;
 procedure AtomicWriteText(const ADst: string; const ATmpRoot: string; const AContent: TStringList);
 procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
 
@@ -209,6 +237,7 @@ uses
 {$IFDEF MSWINDOWS}
 const
   MOVEFILE_WRITE_THROUGH_LWPT = $00000008;
+  MOVEFILE_DELAY_UNTIL_REBOOT_LWPT = $00000004;
   ERROR_UNABLE_TO_MOVE_REPLACEMENT_2_LWPT = 1177;
   FSCTL_GET_REPARSE_POINT_LWPT = $000900A8;
   FSCTL_SET_REPARSE_POINT_LWPT = $000900A4;
@@ -830,7 +859,128 @@ begin
       + IntToStr(Int64(Sequence)) + TmpPathExtension;
   until not WindowsPathExists(Result);
 end;
+
+{ A retired image is the old destination after a committed replacement.
+  Its compact, destination-independent name mirrors the in-flight backup's
+  length budget, while the distinct prefix marks it as committed residue that
+  is safe to delete whenever the operating system allows it. }
+function MakeRetiredExecutablePath(const ADirectory: string): string;
+var
+  Dir: string;
+  Sequence: Cardinal;
+begin
+  Dir := ADirectory;
+  if Dir = '' then Dir := '.';
+  repeat
+    Sequence := Cardinal(InterlockedIncrement(TmpPathCounter));
+    Result := IncludeTrailingPathDelimiter(Dir) + RetiredExecutablePrefix
+      + ProcessIdStr + '-' + EncodeBase36(TmpPathStartedAt) + '-'
+      + IntToStr(Int64(Sequence)) + TmpPathExtension;
+  until not WindowsPathExists(Result);
+end;
 {$ENDIF}
+
+function IsRetiredExecutableName(const AName: string): Boolean;
+var
+  Body: string;
+  Field, i: Integer;
+  FieldLength: array[0..2] of Integer;
+begin
+  Result := False;
+  if Length(AName) <= Length(RetiredExecutablePrefix)
+    + Length(TmpPathExtension) then Exit;
+  if Copy(AName, 1, Length(RetiredExecutablePrefix))
+    <> RetiredExecutablePrefix then Exit;
+  if Copy(AName, Length(AName) - Length(TmpPathExtension) + 1,
+    Length(TmpPathExtension)) <> TmpPathExtension then Exit;
+  { <pid>-<base36 start>-<sequence> }
+  Body := Copy(AName, Length(RetiredExecutablePrefix) + 1,
+    Length(AName) - Length(RetiredExecutablePrefix)
+    - Length(TmpPathExtension));
+  Field := 0;
+  FieldLength[0] := 0; FieldLength[1] := 0; FieldLength[2] := 0;
+  for i := 1 to Length(Body) do
+    if Body[i] = '-' then
+    begin
+      if (Field = 2) or (FieldLength[Field] = 0) then Exit;
+      Inc(Field);
+    end
+    else if (Body[i] in ['0'..'9'])
+      or ((Field = 1) and (Body[i] in ['a'..'z'])) then
+      Inc(FieldLength[Field])
+    else
+      Exit;
+  Result := (Field = 2) and (FieldLength[2] > 0);
+end;
+
+function RetiredExecutableSweepAllowed(const AOwnerRoot,
+  ADirectory: string): Boolean;
+var
+  Root, Dir, Current, Component: string;
+  i: Integer;
+begin
+  Result := False;
+  if (AOwnerRoot = '') or (ADirectory = '') then Exit;
+  Root := ExcludeTrailingPathDelimiter(ExpandFileName(AOwnerRoot));
+  Dir := ExcludeTrailingPathDelimiter(ExpandFileName(ADirectory));
+  if not PathContains(Root, Dir) then Exit;
+  { Walk every component below the root: a link anywhere on the way
+    redirects the sweep into a directory LWPT does not own. }
+  Current := Root;
+  Component := '';
+  for i := Length(IncludeTrailingPathDelimiter(Root)) + 1 to Length(Dir) + 1 do
+    if (i > Length(Dir)) or (Dir[i] = '/') or (Dir[i] = '\') then
+    begin
+      if Component <> '' then
+      begin
+        Current := IncludeTrailingPathDelimiter(Current) + Component;
+        if IsDirSymlinkOrJunction(Current) then Exit;
+      end;
+      Component := '';
+    end
+    else
+      Component := Component + Dir[i];
+  Result := DirectoryExists(Dir) and not IsDirSymlinkOrJunction(Dir);
+end;
+
+function RemoveRetiredExecutables(const AOwnerRoot, ADirectory: string;
+  out ARetained: Integer): Integer;
+var
+  Dir, Full: string;
+  Search: TSearchRec;
+begin
+  Result := 0;
+  ARetained := 0;
+  Dir := ADirectory;
+  if Dir = '' then Dir := '.';
+  if not RetiredExecutableSweepAllowed(AOwnerRoot, Dir) then Exit;
+  { faSymLink makes Unix FindFirst lstat entries, so a link reports itself
+    instead of its target and is skipped below. }
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(Dir)
+    + RetiredExecutablePrefix + '*' + TmpPathExtension,
+    faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    repeat
+      if not IsRetiredExecutableName(Search.Name) then Continue;
+      if (Search.Attr and (faDirectory or faSymLink)) <> 0 then Continue;
+      Full := IncludeTrailingPathDelimiter(Dir) + Search.Name;
+      if IsDirSymlinkOrJunction(Full) then Continue;
+      { Revalidate the directory before each deletion so a link swapped in
+        during the scan stops the sweep. }
+      if not RetiredExecutableSweepAllowed(AOwnerRoot, Dir) then Break;
+      {$IFDEF MSWINDOWS}
+      if Windows.DeleteFileW(PWideChar(WindowsExtendedPath(Full))) then
+      {$ELSE}
+      if SysUtils.DeleteFile(Full) then
+      {$ENDIF}
+        Inc(Result)
+      else
+        Inc(ARetained);
+    until SysUtils.FindNext(Search) <> 0;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
 
 function MakeUniqueTmpPath(const ARoot, APrefix: string): string;
 var
@@ -1307,17 +1457,47 @@ begin
   AtomicRemovePath(ABackupPath + '.rollback');
 end;
 
+{$IFDEF MSWINDOWS}
+{ A committed ReplaceFileW leaves the old destination at its backup name.
+  Windows refuses to delete that file while a process maps it as an image
+  (the running `lwpt.exe` during a self-hosted rebuild) and reports access
+  denied or a sharing violation. Only those in-use failures are tolerated:
+  the destination already holds the complete replacement, and renaming a
+  mapped image is permitted, so the backup moves to a retired-image name
+  that later executable replacements and `lwpt repair` delete once no
+  process uses it. Scheduling deletion at reboot is the last resort when the
+  rename is refused; any other outcome keeps the strict failure. }
+function RetireInUseReplaceBackup(const ABackupPath: string;
+  ADeleteError: LongWord): Boolean;
+var
+  BackupPathW, RetiredPathW: UnicodeString;
+begin
+  Result := False;
+  if (ADeleteError <> Windows.ERROR_ACCESS_DENIED)
+    and (ADeleteError <> Windows.ERROR_SHARING_VIOLATION) then Exit;
+  BackupPathW := WindowsExtendedPath(ABackupPath);
+  RetiredPathW := WindowsExtendedPath(
+    MakeRetiredExecutablePath(ExtractFileDir(ABackupPath)));
+  if Windows.MoveFileExW(PWideChar(BackupPathW), PWideChar(RetiredPathW),
+    MOVEFILE_WRITE_THROUGH_LWPT) then Exit(True);
+  Result := Windows.MoveFileExW(PWideChar(BackupPathW), nil,
+    MOVEFILE_DELAY_UNTIL_REBOOT_LWPT);
+end;
+{$ENDIF}
+
 { Replace a file in one filesystem operation. Unlike AtomicMoveFile this
   helper never renames the old destination aside, because doing so creates
   an observable missing-path window. It is intentionally strict: callers
-  must stage the source on the same filesystem as the destination. }
-function AtomicReplaceFile(const ASrc, ADst: string): Boolean;
+  must stage the source on the same filesystem as the destination.
+  ARetireInUseBackup is set only by AtomicReplaceExecutable. }
+function ReplaceFileInOneOperation(const ASrc, ADst: string;
+  ARetireInUseBackup: Boolean): Boolean;
 var
   DstDir: string;
   {$IFDEF MSWINDOWS}
   BackupPath: string;
   BackupPathW, DstPathW, SrcPathW: UnicodeString;
-  ReplaceError: LongWord;
+  DeleteError, ReplaceError: LongWord;
   {$ENDIF}
 begin
   {$IFDEF UNIX}
@@ -1352,8 +1532,13 @@ begin
     begin
       if WindowsPathExists(BackupPath) then
         if not Windows.DeleteFileW(PWideChar(BackupPathW)) then
-          raise EExtractError.CreateFmt(
-            'atomic replacement of "%s" left its retained backup', [ADst]);
+        begin
+          DeleteError := Windows.GetLastError;
+          if not (ARetireInUseBackup
+            and RetireInUseReplaceBackup(BackupPath, DeleteError)) then
+            raise EExtractError.CreateFmt(
+              'atomic replacement of "%s" left its retained backup', [ADst]);
+        end;
       Exit;
     end;
     ReplaceError := Windows.GetLastError;
@@ -1376,6 +1561,27 @@ begin
   end;
   Result := Windows.MoveFileExW(PWideChar(SrcPathW), PWideChar(DstPathW),
     MOVEFILE_WRITE_THROUGH_LWPT);
+  {$ENDIF}
+end;
+
+function AtomicReplaceFile(const ASrc, ADst: string): Boolean;
+begin
+  Result := ReplaceFileInOneOperation(ASrc, ADst, False);
+end;
+
+function AtomicReplaceExecutable(const ASrc, ADst,
+  AOwnerRoot: string): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Retained: Integer;
+{$ENDIF}
+begin
+  Result := ReplaceFileInOneOperation(ASrc, ADst, True);
+  {$IFDEF MSWINDOWS}
+  { Earlier self-hosted rebuilds retire the image they ran from; once that
+    process exits its retired image becomes deletable. }
+  if Result then
+    RemoveRetiredExecutables(AOwnerRoot, ExtractFileDir(ADst), Retained);
   {$ENDIF}
 end;
 
