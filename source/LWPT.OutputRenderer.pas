@@ -51,6 +51,7 @@ type
     { Outcome lines kept through silent capture and written to the real
       stdout when the command succeeds. }
     FOutcome: string;
+    FOutcomeWritten: Boolean;
     procedure ClearInvocation;
     procedure PublishChild(const AStandardOutput,
       AStandardError: RawByteString);
@@ -62,6 +63,9 @@ type
     procedure FinishSilent(const AExitCode: Integer;
       const AElapsedMilliseconds: QWord);
     property Capturing: Boolean read FCapturing;
+    { True after FinishSilent wrote a retained outcome line; the outcome
+      then replaces the generic silent completion line. }
+    property OutcomeWritten: Boolean read FOutcomeWritten;
   end;
 
 procedure CaptureSilentChildOutput(const AStandardOutput,
@@ -73,8 +77,8 @@ procedure SetActiveOutputRenderer(ARenderer: TLWPTOutputRenderer);
 procedure WriteCommandResult(const AText: string);
 procedure WriteCommandResultLine(const AText: string);
 { One outcome line that --silent keeps: in silent mode it is held and
-  written to stdout after capture ends, before the terminal line, and only
-  when the command succeeds. Otherwise it is written at once. }
+  written to stdout after capture ends, only when the command succeeds, and
+  it replaces the generic completion line. Otherwise it is written at once. }
 procedure WriteCommandOutcomeLine(const AText: string);
 
 implementation
@@ -534,6 +538,7 @@ begin
   if FCapturing then
     raise ELWPTOutputRendererError.Create(
       'silent-output journal is already active');
+  FOutcomeWritten := False;
   FCommandName := ACommandName;
   FCorrelationID := ACommandName + ':' + UIntToStr(GetTickCount64);
   Journal := TLWPTSilentJournal.Create;
@@ -634,6 +639,7 @@ begin
       begin
         Write(Output, FOutcome);
         Flush(Output);
+        FOutcomeWritten := True;
       end;
       if AExitCode <> 0 then
       begin

@@ -283,7 +283,7 @@ begin
   Options.KeyID := AKeyID;
   Options.PublicKey := APublicKey;
   Options.TokenEnvironment := ATokenEnvironment;
-  WriteCommandOutcomeLine(RegistryPublishResultLine(PublishToRegistry(Options)));
+  WriteCommandOutcomeLine(PublishToRegistry(Options).Line);
   Result := 0;
 end;
 

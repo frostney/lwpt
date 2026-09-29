@@ -13,6 +13,7 @@ uses
   cthreads,
   {$ENDIF}
   Classes,
+  DateUtils,
   SysUtils,
 
   LWPT.Core,
@@ -165,15 +166,41 @@ begin
 end;
 
 procedure TRegistryClientContract.TestRetryAfterAndBackoff;
+var
+  Now: TDateTime;
 begin
   Expect<Integer>(ParseRegistryRetryAfter('0')).ToBe(0);
   Expect<Integer>(ParseRegistryRetryAfter(' 7 ')).ToBe(7);
   Expect<Integer>(ParseRegistryRetryAfter('3600')).ToBe(60);
   Expect<Integer>(ParseRegistryRetryAfter('')).ToBe(-1);
   Expect<Integer>(ParseRegistryRetryAfter('+5')).ToBe(-1);
-  Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:28:00 GMT')).ToBe(-1);
   Expect<Integer>(ParseRegistryRetryAfter(SAMPLE_TOKEN)).ToBe(-1);
-  Expect<Integer>(ParseRegistryRetryAfter('99999999999999')).ToBe(-1);
+  Expect<Integer>(ParseRegistryRetryAfter('12a')).ToBe(-1);
+  Expect<Integer>(ParseRegistryRetryAfter('1.5')).ToBe(-1);
+  { delay-seconds has no digit limit; it saturates at the cap. }
+  Expect<Integer>(ParseRegistryRetryAfter('99999999999999999999999999')).ToBe(60);
+  Expect<Integer>(ParseRegistryRetryAfter('0000000000000000000000000030')).ToBe(30);
+  { HTTP-date in all three forms, relative to the clock, never negative. }
+  Now := EncodeDateTime(2026, 10, 21, 7, 28, 0, 0);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:28:30 GMT', Now))
+    .ToBe(30);
+  Expect<Integer>(ParseRegistryRetryAfter('Wednesday, 21-Oct-26 07:28:45 GMT', Now))
+    .ToBe(45);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed Oct 21 07:28:10 2026', Now)).ToBe(10);
+  Expect<Integer>(ParseRegistryRetryAfter('Sun Nov  6 08:49:37 1994', Now)).ToBe(0);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:27:00 GMT', Now))
+    .ToBe(0);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Oct 2026 09:00:00 GMT', Now))
+    .ToBe(60);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:28:30 UTC', Now))
+    .ToBe(-1);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed, 32 Oct 2026 07:28:30 GMT', Now))
+    .ToBe(-1);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Foo 2026 07:28:30 GMT', Now))
+    .ToBe(-1);
+  { A date 30 seconds ahead is honoured as the minimum wait. }
+  Expect<Integer>(RegistryPublishBackoffSeconds(1,
+    ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:28:30 GMT', Now))).ToBe(30);
   { Exponential from one second, never shorter than Retry-After, and at
     most 60 seconds. }
   Expect<Integer>(RegistryPublishBackoffSeconds(1, -1)).ToBe(1);

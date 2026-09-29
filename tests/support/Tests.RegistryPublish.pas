@@ -36,7 +36,11 @@ type
     { Runs `registry init`. ABasePort is advertised in the base URL (and so
       in the origin identity); AListenPort is where `serve` listens. }
     constructor Create(const AScratch, AName: string; const ABasePort,
-      AListenPort: Word; const AHTTPS: Boolean = False);
+      AListenPort: Word; const AHTTPS: Boolean = False;
+      const AIdentity: string = '');
+    { Copies another origin's token record here, so this origin accepts
+      that token too. }
+    procedure AdoptToken(ASource: TPublishOrigin; const AToken: string);
     destructor Destroy; override;
     { Re-runs init to move the listener, keeping identity and keys. }
     procedure Listen(const APort: Word);
@@ -282,7 +286,8 @@ end;
 { --- TPublishOrigin -------------------------------------------------------- }
 
 constructor TPublishOrigin.Create(const AScratch, AName: string;
-  const ABasePort, AListenPort: Word; const AHTTPS: Boolean);
+  const ABasePort, AListenPort: Word; const AHTTPS: Boolean;
+  const AIdentity: string);
 var
   Run: TLwptResult;
 begin
@@ -297,6 +302,9 @@ begin
     Run := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
       '--port', IntToStr(AListenPort), '--tls-pkcs12', TLSFixturePath,
       '--tls-password-env', PasswordVariable], FScratch, Environment)
+  else if AIdentity <> '' then
+    Run := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
+      '--port', IntToStr(AListenPort), '--identity', AIdentity], FScratch)
   else
     Run := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
       '--port', IntToStr(AListenPort)], FScratch);
@@ -379,6 +387,15 @@ begin
   Result := Trim(Run.Stdout);
   if Pos(RegistryProgramName + '_rt1_', Result) <> 1 then
     raise Exception.Create('issue-token printed no token');
+end;
+
+procedure TPublishOrigin.AdoptToken(ASource: TPublishOrigin; const AToken: string);
+var
+  Path: string;
+begin
+  Path := '/auth/tokens/' + TokenID(AToken) + '.toml';
+  ForceDirectories(FData + '/auth/tokens');
+  WriteBinaryFile(FData + Path, BytesOf(ReadBinaryFile(ASource.DataDirectory + Path)));
 end;
 
 procedure TPublishOrigin.RevokeToken(const AToken: string);

@@ -48,6 +48,8 @@ type
   public
     procedure SetupTests; override;
     procedure TestPublishesATarGzToARunningOrigin;
+    procedure TestSilentIssueTokenPrintsOnlyTheToken;
+    procedure TestSignedIdentityReflectingTheTokenIsRedacted;
     procedure TestZipRetriesAreIdempotent;
     procedure TestConflictingContentIsRefused;
     procedure TestAuthenticationAndScopeFailures;
@@ -189,17 +191,72 @@ begin
   Run := Publish(Path, Token, [], 'CI_PUBLISH_TOKEN');
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(PublishLine(Run)).ToBe('already ' + Expected);
-  { --silent keeps the outcome line. }
+  { --silent prints exactly the outcome line, instead of the completion. }
   Run := Publish(Path, Token, ['--silent']);
   Expect<Integer>(Run.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('already ' + Expected + LineEnding, Run.Stdout) = 1).ToBe(True);
-  Expect<string>(Trim(Run.Stderr)).ToBe('');
+  Expect<string>(Run.Stdout).ToBe('already ' + Expected + LineEnding);
+  Expect<string>(Run.Stderr).ToBe('');
   Expect<Integer>(FOrigin.LatestSequence).ToBe(2);
   Expect<Boolean>(FOrigin.Serve.Running).ToBe(True);
   Expect<Integer>(FOrigin.Serve.ProcessID).ToBe(PID);
   ExpectProjectUntouched;
   FOrigin.Stop;
   ExpectSecretAbsent(Token);
+end;
+
+procedure TRegistryPublishE2E.TestSilentIssueTokenPrintsOnlyTheToken;
+var
+  Run: TLwptResult;
+begin
+  FOrigin := NewOrigin('origin');
+  Run := RunLwpt(['registry', 'issue-token', '--data-dir', FOrigin.DataDirectory,
+    '--packages', 'x', '--silent'], FScratch);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos(RegistryProgramName + '_rt1_', Run.Stdout) = 1).ToBe(True);
+  Expect<string>(Run.Stdout).ToBe(Trim(Run.Stdout) + LineEnding);
+  Expect<Integer>(Length(Trim(Run.Stdout))).ToBe(Length(RegistryProgramName
+    + '_rt1_') + 32 + 1 + 43);
+  Expect<string>(Run.Stderr).ToBe('');
+end;
+
+{ An origin that controls its own key and issued the token can sign an
+  identity holding that token. Publication still succeeds, and the success
+  line prints the authenticated identity with the credential redacted. }
+procedure TRegistryPublishE2E.TestSignedIdentityReflectingTheTokenIsRedacted;
+var
+  Issuer: TPublishOrigin;
+  Token, Line: string;
+  Port: Word;
+  Run: TLwptResult;
+begin
+  { The token must exist before the identity that holds it: another data
+    directory issues it, and this origin adopts its record. }
+  Issuer := NewOrigin('issuer');
+  try
+    Token := Issuer.IssueToken(['--packages', '*']);
+    Port := FindAvailableRegistryTestPort;
+    FOrigin := TPublishOrigin.Create(FScratch, 'reflecting', Port, Port, False,
+      'https://reflect.example/' + Token + '/' + TokenSecret(Token));
+    FOrigin.AdoptToken(Issuer, Token);
+  finally
+    Issuer.Free;
+  end;
+  FOrigin.Start;
+  Run := Publish(Archive('reflect-lib.tar.gz', PublishTarGz('reflect-lib', '1.0.0',
+    'reflected')), Token, []);
+  if Run.ExitCode <> 0 then WriteLn(StdErr, Run.Stderr);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Line := PublishLine(Run);
+  Expect<Boolean>(Pos('published reflect-lib@1.0.0 to https://reflect.example/'
+    + '[redacted]/[redacted] at sequence 2 (archive sha256:', Line) = 1).ToBe(True);
+  Run := Publish(FScratch + '/reflect-lib.tar.gz', Token, ['--silent']);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('already published reflect-lib@1.0.0 to '
+    + 'https://reflect.example/[redacted]/[redacted] at', Run.Stdout) = 1).ToBe(True);
+  { Only the publish runs: the origin's own init and serve lines name its
+    identity by design. }
+  Expect<Boolean>(Pos(TokenSecret(Token), FOutputs) = 0).ToBe(True);
+  Expect<Boolean>(Pos(Token, FOutputs) = 0).ToBe(True);
 end;
 
 procedure TRegistryPublishE2E.TestZipRetriesAreIdempotent;
@@ -467,6 +524,10 @@ procedure TRegistryPublishE2E.SetupTests;
 begin
   Test('a tar.gz publishes to a running origin and an identical retry is a no-op',
     TestPublishesATarGzToARunningOrigin);
+  Test('silent issue-token prints exactly the token',
+    TestSilentIssueTokenPrintsOnlyTheToken);
+  Test('a correctly signed identity reflecting the token is redacted on success',
+    TestSignedIdentityReflectingTheTokenIsRedacted);
   Test('the same zip twice and its normalized tar.gz publish idempotently',
     TestZipRetriesAreIdempotent);
   Test('different content for a published version is refused',

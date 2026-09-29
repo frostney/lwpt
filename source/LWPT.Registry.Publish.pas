@@ -58,13 +58,18 @@ type
     Name, Version, Origin: string;
     Sequence: Int64;
     ArchiveHash, RecordHash: string;
+    { The success line, redacted for the credential while it was still
+      available: an origin that controls its own key and token can sign an
+      identity that holds the token. The only form to print. }
+    Line: string;
   end;
 
   { A publish failure whose message is '<code>: <local text>', already
     redacted for the credential. }
   ELWPTRegistryPublishError = class(ELWPTRegistryError);
 
-{ Runs one publication. Raises ELWPTRegistryPublishError only. }
+{ Runs one publication. Raises ELWPTRegistryPublishError only. Print
+  Result.Line, never a line formatted from the other fields. }
 function PublishToRegistry(
   const AOptions: TLWPTRegistryPublishOptions): TLWPTRegistryPublishResult;
 function RegistryPublishResultLine(
@@ -79,9 +84,13 @@ function RedactRegistryCredential(const AText, AToken: string): string;
 function RegistryPublicationErrorCode(const AValue: string): string;
 { True when AValue is 1 to 64 characters of [0-9a-z]. }
 function RegistryRequestIDIsValid(const AValue: string): Boolean;
-{ Whole seconds from a delta-seconds Retry-After value, or -1 when absent
-  or not plain decimal. Values above the backoff cap are capped. }
-function ParseRegistryRetryAfter(const AValue: string): Integer;
+{ Whole seconds to wait from a Retry-After value, capped at 60, or -1 when
+  it is absent or malformed. RFC 9110 allows delay-seconds, any number of
+  digits (read saturating), or an HTTP-date (IMF-fixdate, RFC 850, or
+  asctime), read relative to ANowUTC and never negative. }
+function ParseRegistryRetryAfter(const AValue: string): Integer; overload;
+function ParseRegistryRetryAfter(const AValue: string;
+  const ANowUTC: TDateTime): Integer; overload;
 { Delay before retry AAttempt + 1: 2^(AAttempt - 1) seconds, or longer
   when a valid Retry-After (ARetryAfter >= 0) asks for more, and never more
   than 60 seconds. }
@@ -104,6 +113,7 @@ implementation
 
 uses
   Classes,
+  DateUtils,
   Generics.Collections,
   StrUtils,
 
@@ -226,18 +236,151 @@ begin
     if not (AValue[Index] in ['0'..'9', 'a'..'z']) then Exit(False);
 end;
 
+const
+  HTTP_MONTHS: array[1..12] of string = ('Jan', 'Feb', 'Mar', 'Apr', 'May',
+    'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec');
+  HTTP_DAYS: array[1..7] of string = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri',
+    'Sat', 'Sun');
+  HTTP_LONG_DAYS: array[1..7] of string = ('Monday', 'Tuesday', 'Wednesday',
+    'Thursday', 'Friday', 'Saturday', 'Sunday');
+
+function HTTPMonth(const AName: string): Integer;
+var
+  Index: Integer;
+begin
+  for Index := 1 to 12 do
+    if HTTP_MONTHS[Index] = AName then Exit(Index);
+  Result := 0;
+end;
+
+function IsDigits(const AValue: string; const ALength: Integer): Boolean;
+var
+  Index: Integer;
+begin
+  Result := Length(AValue) = ALength;
+  if Result then
+    for Index := 1 to Length(AValue) do
+      if not (AValue[Index] in ['0'..'9']) then Exit(False);
+end;
+
+function InNames(const AValue: string; const ANames: array of string): Boolean;
+var
+  Name: string;
+begin
+  for Name in ANames do
+    if Name = AValue then Exit(True);
+  Result := False;
+end;
+
+{ HH:MM:SS into its parts. }
+function ParseHTTPTime(const AValue: string; out AHour, AMinute,
+  ASecond: Word): Boolean;
+begin
+  Result := (Length(AValue) = 8) and (AValue[3] = ':') and (AValue[6] = ':')
+    and IsDigits(Copy(AValue, 1, 2), 2) and IsDigits(Copy(AValue, 4, 2), 2)
+    and IsDigits(Copy(AValue, 7, 2), 2);
+  if not Result then Exit;
+  AHour := StrToInt(Copy(AValue, 1, 2));
+  AMinute := StrToInt(Copy(AValue, 4, 2));
+  ASecond := StrToInt(Copy(AValue, 7, 2));
+end;
+
+{ The three HTTP-date forms of RFC 9110 section 5.6.7, as UTC. }
+function TryParseHTTPDate(const AValue: string; const ANowUTC: TDateTime;
+  out ADate: TDateTime): Boolean;
+var
+  Parts, DateParts: TStringArray;
+  Year, Month, Day, Hour, Minute, Second, NowYear, NowMonth, NowDay: Word;
+  Text: string;
+begin
+  Result := False;
+  ADate := 0;
+  Year := 0;
+  Month := 0;
+  Day := 0;
+  Hour := 0;
+  Minute := 0;
+  Second := 0;
+  Parts := AValue.Split([' ']);
+  if (Length(Parts) = 6) and (Length(Parts[0]) = 4) and (Parts[0][4] = ',')
+    and InNames(Copy(Parts[0], 1, 3), HTTP_DAYS) and (Parts[5] = 'GMT') then
+  begin
+    { IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT }
+    if not IsDigits(Parts[1], 2) or not IsDigits(Parts[3], 4)
+      or not ParseHTTPTime(Parts[4], Hour, Minute, Second) then Exit;
+    Day := StrToInt(Parts[1]);
+    Month := HTTPMonth(Parts[2]);
+    Year := StrToInt(Parts[3]);
+  end
+  else if (Length(Parts) = 4) and (Length(Parts[0]) > 1)
+    and (Parts[0][Length(Parts[0])] = ',')
+    and InNames(Copy(Parts[0], 1, Length(Parts[0]) - 1), HTTP_LONG_DAYS)
+    and (Parts[3] = 'GMT') then
+  begin
+    { RFC 850: Sunday, 06-Nov-94 08:49:37 GMT. A two-digit year more than
+      50 years ahead names the previous century. }
+    DateParts := Parts[1].Split(['-']);
+    if (Length(DateParts) <> 3) or not IsDigits(DateParts[0], 2)
+      or not IsDigits(DateParts[2], 2)
+      or not ParseHTTPTime(Parts[2], Hour, Minute, Second) then Exit;
+    Day := StrToInt(DateParts[0]);
+    Month := HTTPMonth(DateParts[1]);
+    DecodeDate(ANowUTC, NowYear, NowMonth, NowDay);
+    Year := (NowYear div 100) * 100 + StrToInt(DateParts[2]);
+    if Year > NowYear + 50 then Dec(Year, 100);
+  end
+  else
+  begin
+    { asctime: Sun Nov  6 08:49:37 1994, the day space-padded. }
+    Text := StringReplace(AValue, '  ', ' 0', []);
+    Parts := Text.Split([' ']);
+    if (Length(Parts) <> 5) or not InNames(Parts[0], HTTP_DAYS)
+      or not IsDigits(Parts[2], 2) or not IsDigits(Parts[4], 4)
+      or not ParseHTTPTime(Parts[3], Hour, Minute, Second) then Exit;
+    Month := HTTPMonth(Parts[1]);
+    Day := StrToInt(Parts[2]);
+    Year := StrToInt(Parts[4]);
+  end;
+  if (Month = 0) or (Hour > 23) or (Minute > 59) or (Second > 60) then Exit;
+  if Second = 60 then Second := 59;
+  Result := TryEncodeDateTime(Year, Month, Day, Hour, Minute, Second, 0, ADate);
+end;
+
 function ParseRegistryRetryAfter(const AValue: string): Integer;
+begin
+  Result := ParseRegistryRetryAfter(AValue, LocalTimeToUniversal(Now));
+end;
+
+function ParseRegistryRetryAfter(const AValue: string;
+  const ANowUTC: TDateTime): Integer;
 var
   Index: Integer;
   Value: string;
+  Date: TDateTime;
+  Seconds: Int64;
 begin
   Value := Trim(AValue);
-  if (Value = '') or (Length(Value) > 9) then Exit(-1);
-  for Index := 1 to Length(Value) do
-    if not (Value[Index] in ['0'..'9']) then Exit(-1);
-  Result := StrToInt(Value);
-  if Result > RegistryPublishMaximumBackoffSeconds then
-    Result := RegistryPublishMaximumBackoffSeconds;
+  if Value = '' then Exit(-1);
+  if Value[1] in ['0'..'9'] then
+  begin
+    { delay-seconds: any number of digits, saturating at the cap. }
+    Result := 0;
+    for Index := 1 to Length(Value) do
+    begin
+      if not (Value[Index] in ['0'..'9']) then Exit(-1);
+      if Result < RegistryPublishMaximumBackoffSeconds then
+        Result := Result * 10 + Ord(Value[Index]) - Ord('0');
+    end;
+    if Result > RegistryPublishMaximumBackoffSeconds then
+      Result := RegistryPublishMaximumBackoffSeconds;
+    Exit;
+  end;
+  if not TryParseHTTPDate(Value, ANowUTC, Date) then Exit(-1);
+  Seconds := SecondsBetween(Date, ANowUTC);
+  if Date <= ANowUTC then Exit(0);
+  if Seconds > RegistryPublishMaximumBackoffSeconds then
+    Seconds := RegistryPublishMaximumBackoffSeconds;
+  Result := Seconds;
 end;
 
 function RegistryPublishBackoffSeconds(const AAttempt,
@@ -919,7 +1062,10 @@ begin
           response bytes, so only a local description is kept. }
         Message := 'unexpected_response: the origin sent a document that could not be processed';
     end;
-    if Message <> '' then
+    if Message = '' then
+      Result.Line := RedactRegistryCredential(RegistryPublishResultLine(Result),
+        Token)
+    else
     begin
       if not CodeGrammarIsValid(RegistryErrorCode(Message)) then
         Message := UNRECOGNIZED_ERROR + ': ' + Message;

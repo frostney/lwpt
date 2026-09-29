@@ -20,8 +20,9 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 - **Every resolved subcommand reports completion.** A status-aware elapsed-time
   line is written to stderr after ordinary success or failure diagnostics.
   Every command also inherits long-only `--silent` for final-result-only use;
-  silent success writes its sole completion line to stdout, and neither mode
-  changes the command's exit code.
+  silent success writes its sole completion line to stdout (or, for
+  `registry publish` and `registry issue-token`, their one outcome line
+  instead), and neither mode changes the command's exit code.
 - **Local Win32 iteration is cached.** On the maintainer Mac,
   [`.github/ci/windows-wine/run.sh`](../.github/ci/windows-wine/run.sh)
   uses OrbStack's Docker engine to cross-compile i386-win32 and run bounded
@@ -68,7 +69,11 @@ payload ownership are documented in the
 
 Every registered subcommand also inherits the long-only `--silent` flag after
 the command name. Silent success suppresses progress, summaries, and successful
-child output and writes exactly the final completion line to stdout. Silent
+child output and writes exactly the final completion line to stdout. The
+exception is a command whose result is a single outcome line: silent
+`registry publish` writes only its `published ...` or `already published ...`
+line, and silent `registry issue-token` only the token, each instead of the
+completion line ([ADR-0049](./adr/0049-registry-remote-publication.md)). Silent
 failure suppresses ordinary progress, replays retained diagnostics and failed
 child output in event order, and ends with exactly one failed completion line
 on stderr. `--silent --verbose` is rejected because the two policies

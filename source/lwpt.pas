@@ -104,8 +104,13 @@ begin
   else
     StatusText := 'failed after ';
   if (ACompletion.ExitCode = 0) and WasSilent then
-    WriteLn(Output, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
-      StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds))
+  begin
+    { A command whose result is one outcome line (registry publish,
+      issue-token) prints only that line when silent. }
+    if not OutputRenderer.OutcomeWritten then
+      WriteLn(Output, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
+        StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds));
+  end
   else
     WriteLn(ErrOutput, PROGRAM_NAME, ' ', ACompletion.CommandName, ': ',
       StatusText, FormatElapsedMilliseconds(ACompletion.ElapsedMilliseconds));
