@@ -157,16 +157,19 @@ begin
   Result := Pos(APart, AText) > 0;
 end;
 
-{ A top-level `key = value` field of a canonical registry document, with the
-  quotes of a string value removed. }
+{ A top-level `key = value` field of a canonical registry document or of
+  command output, with the quotes of a string value removed. Served
+  documents end lines with LF; console output on Windows uses CRLF. }
 function DocumentField(const ADocument, AKey: string): string;
 var
   Start: Integer;
+  Text: string;
 begin
   Result := '';
-  Start := Pos(#10 + AKey + ' = ', #10 + ADocument);
+  Text := StringReplace(ADocument, #13#10, #10, [rfReplaceAll]);
+  Start := Pos(#10 + AKey + ' = ', #10 + Text);
   if Start = 0 then Exit;
-  Result := Copy(ADocument, Start + Length(AKey) + 3, MaxInt);
+  Result := Copy(Text, Start + Length(AKey) + 3, MaxInt);
   if Pos(#10, Result) > 0 then Result := Copy(Result, 1, Pos(#10, Result) - 1);
   if (Length(Result) >= 2) and (Result[1] = '"') then
     Result := Copy(Result, 2, Length(Result) - 2);
