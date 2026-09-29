@@ -837,18 +837,11 @@ end;
 
 procedure TRegistryPublicationContract.TestStorageBudget;
 var
-  Stream: TFileStream;
   Response: TRawHTTPResponse;
 begin
   StartOrigin('', '', RegistryTimestampNow);
-  ForceDirectories(FRoot + '/incoming/sha256');
-  Stream := TFileStream.Create(FRoot + '/incoming/sha256/' + StringOfChar('e', 64),
-    fmCreate);
-  try
-    Stream.Size := RegistryIncomingBudgetBytes - 10;
-  finally
-    Stream.Free;
-  end;
+  CreateSparseFile(FRoot + '/incoming/sha256/' + StringOfChar('e', 64),
+    RegistryIncomingBudgetBytes - 10);
   Response := Upload(Bytes('eleven bytes'));
   Expect<Integer>(Response.Status).ToBe(507);
   Expect<Boolean>(Pos('storage_budget_exceeded', RawHTTPBodyText(Response)) > 0)

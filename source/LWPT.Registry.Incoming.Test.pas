@@ -149,17 +149,8 @@ end;
 
 procedure TRegistryIncomingContract.AddCompleted(const AName: string;
   const ASize: Int64);
-var
-  Stream: TFileStream;
 begin
-  ForceDirectories(FScratch + '/origin/incoming/sha256');
-  Stream := TFileStream.Create(FScratch + '/origin/incoming/sha256/' + AName,
-    fmCreate);
-  try
-    Stream.Size := ASize;
-  finally
-    Stream.Free;
-  end;
+  CreateSparseFile(FScratch + '/origin/incoming/sha256/' + AName, ASize);
 end;
 
 function TRegistryIncomingContract.PartCount: Integer;
