@@ -22,6 +22,7 @@ uses
   Tests.LwptSubprocess,
   Tests.RegistryHTTP,
   Tests.RegistryOrigin,
+  Tests.RegistryProcess,
   Tests.RegistryPublish,
   Tests.RegistryServer,
   Tests.Scratch,
