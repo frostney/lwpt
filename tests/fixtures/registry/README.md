@@ -17,3 +17,9 @@ validity period, and serial `0x7001`. The PKCS#12 bundle contains the leaf,
 intermediate, and test root so native validation can use only the supplied
 chain. Regenerate it when its leaf expires; keep the password and source PKI
 test-only.
+
+`localhost-native-leaf-cert.pem` is that leaf alone, extracted with
+`openssl pkcs12 -in localhost-native-identity.p12 -passin pass:test-only
+-nokeys -clcerts | openssl x509`. The HTTPClient client-options E2E test
+compares it with the peer certificate that the macOS client reads. Regenerate
+it with the bundle.

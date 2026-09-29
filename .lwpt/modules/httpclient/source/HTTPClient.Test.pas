@@ -353,6 +353,16 @@ begin
   Result := Copy(ARequest, HeaderEnd, Length(ARequest) - HeaderEnd);
 end;
 
+const
+  { Hostname cases go through the system resolver, whose first lookup on a
+    loaded Windows runner can take longer than a second. The deadline under
+    test lives in the resource-bounds suite, so these cases only need a
+    bound; the child-process watchdog still catches a blocked resolver. }
+  HostnameDeadlineMs = 10000;
+  { Two sequential lookups plus cold child startup. }
+  HostnameWatchdogMs = 2 * HostnameDeadlineMs
+    + MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS;
+
 type
   THostnameRequest = class(TThread)
   private
@@ -376,9 +386,10 @@ end;
 procedure THostnameRequest.Execute;
 begin
   try
-    if FGate.WaitFor(1000) <> wrSignaled then
+    if FGate.WaitFor(HostnameDeadlineMs) <> wrSignaled then
       raise Exception.Create('hostname request start gate timed out');
-    Response := HTTPGet(FURL, nil, TestOptions(1024, 4096, 1000));
+    Response := HTTPGet(FURL, nil,
+      TestOptions(1024, 4096, HostnameDeadlineMs));
   except
     on E: Exception do ErrorMessage := E.Message;
   end;
@@ -418,7 +429,7 @@ begin
       else
       begin
         Response := HTTPGet('http://' + Host + ':' + IntToStr(Mocks[I].Port)
-          + '/x', nil, TestOptions(1024, 4096, 1000));
+          + '/x', nil, TestOptions(1024, 4096, HostnameDeadlineMs));
         Mocks[I].WaitDone;
         Expect<Integer>(Response.StatusCode).ToBe(200);
         Expect<string>(BytesToHex(Response.Body)).ToBe(BytesToHex(Body));
@@ -554,7 +565,8 @@ begin
   AChild.WaitOnExit;
 end;
 
-procedure RunBoundedMockLifecycleChild(const AScenario: string);
+procedure RunBoundedMockLifecycleChild(const AScenario: string;
+  const ATimeoutMilliseconds: QWord = MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS);
 var
   Child: TProcess;
   StartedAt: QWord;
@@ -568,8 +580,7 @@ begin
     Child.Execute;
     StartedAt := GetTickCount64;
     while Child.Running and
-      (GetTickCount64 - StartedAt <
-        MOCK_LIFECYCLE_TIMEOUT_MILLISECONDS) do
+      (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do
       Sleep(10);
     TimedOut := Child.Running;
     if TimedOut then StopMockLifecycleChild(Child)
@@ -1444,12 +1455,12 @@ end;
 
 procedure THTTPClientByteFetch.TestHostnamePreservesBodyAndHost;
 begin
-  RunBoundedMockLifecycleChild('hostname');
+  RunBoundedMockLifecycleChild('hostname', HostnameWatchdogMs);
 end;
 
 procedure THTTPClientByteFetch.TestConcurrentHostnameRequests;
 begin
-  RunBoundedMockLifecycleChild('hostname-concurrent');
+  RunBoundedMockLifecycleChild('hostname-concurrent', HostnameWatchdogMs);
 end;
 
 { ── destination policy ─────────────────────────────────────────────── }
