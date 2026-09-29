@@ -58,6 +58,7 @@ type
     procedure TestLockedSelectionRejectsTampering;
     procedure TestLockedSelectionRequiresValidSignature;
     procedure TestConcurrentStateMergesAreMonotonic;
+    procedure TestRotationChainLoadingIsBounded;
   end;
 
   TMergeThread = class(TThread)
@@ -508,7 +509,7 @@ begin
     State.State.PublishedAt := Format('2026-10-%.2dT00:00:00Z', [Sequence]);
     State.State.ExpiresAt := Format('2026-10-%.2dT12:00:00Z', [Sequence]);
     State.State.ClockFloor := State.State.PublishedAt;
-    MergeRegistryConsumerStateAt(Root, Identity, KeyId, State, nil);
+    MergeRegistryConsumerStateAt(Root, Identity, KeyId, State, nil, nil);
   except
     on E: Exception do Error := E.Message;
   end;
@@ -546,6 +547,72 @@ begin
   Expect<Int64>(Loaded.State.Sequence).ToBe(MERGE_WORKERS);
   Expect<string>(Loaded.State.ClockFloor)
     .ToBe(Format('2026-10-%.2dT00:00:00Z', [MERGE_WORKERS]));
+end;
+
+procedure TRegistryConsumerTests.TestRotationChainLoadingIsBounded;
+var
+  Synthetic: TSyntheticRegistry;
+  Rotation: TSyntheticRotation;
+  Proofs: TLWPTRegistryRotationProofArray;
+  Chain: TLWPTRegistryRotationProofArray;
+  State: TLWPTRegistryConsumerState;
+  Hashes, Repeated, Many: TStringArray;
+  Limits: TLWPTRegistryVerificationLimits;
+  Root: string;
+  Index, Size: Integer;
+begin
+  Root := FScratch + '/bounded-chain';
+  Synthetic := TSyntheticRegistry.Create('https://packages.example.com');
+  try
+    Synthetic.Publish(RegistryStamp(-60), RegistryStamp(86400));
+    Synthetic.Rotate(11);
+    Rotation := Synthetic.Rotation(0);
+    SetLength(Proofs, 1);
+    Proofs[0].Document := Rotation.Document;
+    Proofs[0].OldSignature := Rotation.OldSignature;
+    Proofs[0].NewSignature := Rotation.NewSignature;
+    State := Default(TLWPTRegistryConsumerState);
+    State.State.KeyId := FKeyID;
+    State.State.PublicKey := FPublicKey;
+    State.State.Sequence := 1;
+    State.State.Snapshot := 'sha256:' + StringOfChar('a', 64);
+    State.State.CheckpointHash := 'sha256:' + StringOfChar('b', 64);
+    State.State.PublishedAt := '2026-10-01T00:00:00Z';
+    State.State.ExpiresAt := '2026-10-02T00:00:00Z';
+    State.State.ClockFloor := State.State.PublishedAt;
+    MergeRegistryConsumerStateAt(Root, 'https://packages.example.com', FKeyID,
+      State, Proofs, nil);
+    Hashes := RegistryRotationHashes(Proofs);
+    Limits := DefaultRegistryVerificationLimits;
+    Expect<Boolean>(LoadRegistryRotationChain(Root, '', Hashes, Limits, Chain))
+      .ToBe(True);
+    Expect<Integer>(Length(Chain)).ToBe(1);
+    { A repeated triplet is refused before anything is read. }
+    SetLength(Repeated, 6);
+    for Index := 0 to 5 do Repeated[Index] := Hashes[Index mod 3];
+    Expect<Boolean>(LoadRegistryRotationChain(Root, '', Repeated, Limits, Chain))
+      .ToBe(False);
+    Expect<Integer>(Length(Chain)).ToBe(0);
+    { More rotations than the verifier accepts are refused before any
+      allocation or read, even with distinct hashes. }
+    SetLength(Many, 3 * (Limits.Rotations + 1));
+    for Index := 0 to High(Many) do
+      Many[Index] := 'sha256:' + LowerCase(Format('%.64x', [Index]));
+    Expect<Boolean>(LoadRegistryRotationChain(Root, '', Many, Limits, Chain))
+      .ToBe(False);
+    { The cumulative byte budget applies across the chain. }
+    Size := Length(Proofs[0].Document) + Length(Proofs[0].OldSignature)
+      + Length(Proofs[0].NewSignature);
+    Limits.TotalBytes := Size - 1;
+    Expect<Boolean>(LoadRegistryRotationChain(Root, '', Hashes, Limits, Chain))
+      .ToBe(False);
+    Limits := DefaultRegistryVerificationLimits;
+    Limits.DocumentBytes := 16;
+    Expect<Boolean>(LoadRegistryRotationChain(Root, '', Hashes, Limits, Chain))
+      .ToBe(False);
+  finally
+    Synthetic.Free;
+  end;
 end;
 
 procedure TRegistryConsumerTests.SetupTests;
@@ -590,6 +657,8 @@ begin
     TestLockedSelectionRequiresValidSignature);
   Test('concurrent per-user state merges keep the highest sequence and floor',
     TestConcurrentStateMergesAreMonotonic);
+  Test('rotation chains load within count and byte limits and refuse repeats',
+    TestRotationChainLoadingIsBounded);
 end;
 
 begin

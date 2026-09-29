@@ -37,12 +37,15 @@ type
     FCurrentKeyID: string;
     FSeed: TLWPTEd25519Seed;
     FRotations: TList<TSyntheticRotation>;
+    { The sequence at which each document became reachable. }
+    FVisibleFrom: TDictionary<string, Integer>;
     FSequence: Integer;
     FDocuments: TDictionary<string, TBytes>;
     FActive: TDictionary<string, string>;
     FRecords: TDictionary<string, string>;
     FCheckpoints: TList<TSyntheticCheckpoint>;
     FLock: TRTLCriticalSection;
+    function ArchiveOfRecord(const AHash: string): string;
     function SignCheckpoint(const ASequence: Integer; const ASnapshot,
       APublishedAt, AExpiresAt: string): TSyntheticCheckpoint;
   public
@@ -72,6 +75,8 @@ type
     function Checkpoint(const AIndex: Integer): TSyntheticCheckpoint;
     function Document(const APath: string; out ABytes: TBytes): Boolean;
     function RecordHash(const AName, AVersion: string): string;
+    { The sequence at which APath became reachable; 0 when always. }
+    function VisibleFrom(const APath: string): Integer;
     function ArchiveHashOf(const AName, AVersion: string): string;
     property Identity: string read FIdentity;
     { The initial key: the pin consumers declare. }
@@ -98,7 +103,9 @@ type
       out ABody: TBytes): Integer;
   public
     Mode: TSyntheticContactMode;
-    { Checkpoint index served as latest; -1 serves the newest. }
+    { Checkpoint index served as latest; -1 serves the newest. A contact
+      serving an older checkpoint lags: it lacks every document published
+      after that checkpoint, as a real lagging mirror does. }
     CheckpointIndex: Integer;
     { Replaces the advertised discovery origin when not empty. }
     AdvertisedOrigin: string;
@@ -195,6 +202,7 @@ begin
   FKeyID := 'ed25519:' + SHA256Hex(Raw);
   FCurrentKeyID := FKeyID;
   FRotations := TList<TSyntheticRotation>.Create;
+  FVisibleFrom := TDictionary<string, Integer>.Create;
   FDocuments := TDictionary<string, TBytes>.Create;
   FActive := TDictionary<string, string>.Create;
   FRecords := TDictionary<string, string>.Create;
@@ -212,6 +220,7 @@ destructor TSyntheticRegistry.Destroy;
 begin
   FCheckpoints.Free;
   FRotations.Free;
+  FVisibleFrom.Free;
   FRecords.Free;
   FActive.Free;
   FDocuments.Free;
@@ -353,6 +362,25 @@ begin
     + 'signature = "hex:' + BytesToHex(Signature, SizeOf(Signature)) + '"'#10);
 end;
 
+function TSyntheticRegistry.ArchiveOfRecord(const AHash: string): string;
+var Bytes: TBytes; Text: string; Start: Integer;
+begin
+  Bytes := FDocuments['records/sha256/' + Hex(AHash) + '.toml'];
+  SetString(Text, PAnsiChar(@Bytes[0]), Length(Bytes));
+  Start := Pos('archive = "', Text) + Length('archive = "');
+  Result := Copy(Text, Start, 71);
+end;
+
+function TSyntheticRegistry.VisibleFrom(const APath: string): Integer;
+begin
+  EnterCriticalSection(FLock);
+  try
+    if not FVisibleFrom.TryGetValue(APath, Result) then Result := 0;
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
 function TSyntheticRegistry.Publish(const APublishedAt,
   AExpiresAt: string): Integer;
 var
@@ -386,6 +414,15 @@ begin
       + 'records = [' + Line + ']'#10);
     FHead := RegistrySHA256(Snapshot);
     FDocuments.AddOrSetValue('snapshots/sha256/' + Hex(FHead) + '.toml', Snapshot);
+    FVisibleFrom.AddOrSetValue('snapshots/sha256/' + Hex(FHead) + '.toml', FSequence);
+    for Hash in FActive.Values do
+    begin
+      if not FVisibleFrom.ContainsKey('records/sha256/' + Hex(Hash) + '.toml') then
+        FVisibleFrom.Add('records/sha256/' + Hex(Hash) + '.toml', FSequence);
+      Line := ArchiveOfRecord(Hash);
+      if not FVisibleFrom.ContainsKey('objects/sha256/' + Hex(Line)) then
+        FVisibleFrom.Add('objects/sha256/' + Hex(Line), FSequence);
+    end;
     FCheckpoints.Add(SignCheckpoint(FSequence, FHead, APublishedAt, AExpiresAt));
     Result := FCheckpoints.Count - 1;
   finally
@@ -450,6 +487,13 @@ begin
     FDocuments.AddOrSetValue('rotations/' + IntToStr(Entry.Sequence)
       + '.new.sig.toml', Entry.NewSignature);
     FRotations.Add(Entry);
+    FVisibleFrom.AddOrSetValue('keys/' + NewKeyID + '.toml', Entry.Sequence);
+    FVisibleFrom.AddOrSetValue('rotations/' + IntToStr(Entry.Sequence) + '.toml',
+      Entry.Sequence);
+    FVisibleFrom.AddOrSetValue('rotations/' + IntToStr(Entry.Sequence)
+      + '.old.sig.toml', Entry.Sequence);
+    FVisibleFrom.AddOrSetValue('rotations/' + IntToStr(Entry.Sequence)
+      + '.new.sig.toml', Entry.Sequence);
     FSeed := NewSeed;
     FCurrentKeyID := NewKeyID;
   finally
@@ -640,6 +684,7 @@ var
   Protocol, Index, Wait, After, RotationIndex: Integer;
   Items, Query: string;
   Entry: TSyntheticRotation;
+  Horizon: Integer;
 begin
   ABody := nil;
   AMediaType := 'text/plain';
@@ -681,6 +726,10 @@ begin
     if Copy(ATarget, 1, Length(FPath) + 4) <> FPath + '/v1/' then Exit(404);
     Relative := Copy(ATarget, Length(FPath) + 5, MaxInt);
     if FMissing.IndexOf(Relative) >= 0 then Exit(404);
+    Horizon := MaxInt;
+    if (CheckpointIndex >= 0) and (FRegistry.CheckpointCount > 0) then
+      Horizon := FRegistry.Checkpoint(CheckpointIndex).Sequence;
+    if FRegistry.VisibleFrom(Relative) > Horizon then Exit(404);
     AMediaType := MediaFor(Relative);
     if FOverrides.TryGetValue(Relative, ABody) then Exit(200);
     if (Relative = 'capabilities') and (FRegistry.RotationCount > 0) then
@@ -708,7 +757,7 @@ begin
       for RotationIndex := 0 to FRegistry.RotationCount - 1 do
       begin
         Entry := FRegistry.Rotation(RotationIndex);
-        if Entry.Sequence <= After then Continue;
+        if (Entry.Sequence <= After) or (Entry.Sequence > Horizon) then Continue;
         if Items <> '' then Items := Items + ', ';
         Items := Items + '{ effective_sequence = ' + IntToStr(Entry.Sequence)
           + ', rotation = "' + Base + '/v1/rotations/' + IntToStr(Entry.Sequence)

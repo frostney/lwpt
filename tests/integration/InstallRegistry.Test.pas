@@ -47,6 +47,8 @@ type
       const AArguments, AEnvironment: array of string): TLwptResult;
     function StateField(const ACase, AField: string): string;
     procedure WriteMember(const ACase, AContent: string);
+    function ProjectFingerprint(const ACase: string): string;
+    function StateSequenceOf(const ACase, AIdentity, AKeyID: string): Integer;
     function Declaration(const AAlias: string; ARegistry: TSyntheticRegistry;
       const AOrigin: string; const AMirrors: array of string;
       const AWithIdentity: Boolean = True): string;
@@ -125,6 +127,8 @@ type
     procedure TestFirstInstallRollsBackAfterLockWrite;
     procedure TestProofReplacementAndPruningRollBack;
     procedure TestLockFloorNeverReachesPerUserState;
+    procedure TestLaggingMirrorLackingHistoryIsStale;
+    procedure TestEarlierOriginAdvanceSurvivesLaterFailure;
   end;
 
 function ReadText(const APath: string): string;
@@ -1754,6 +1758,116 @@ begin
   end;
 end;
 
+function TInstallRegistry.ProjectFingerprint(const ACase: string): string;
+begin
+  Result := SHA256Hex(BytesOf(ReadText(ACase + '/project/lwpt.lock')))
+    + '|' + SHA256Hex(BytesOf(ReadText(ACase + '/project/lwpt.cfg')))
+    + '|' + TreeFingerprint(ACase + '/project/.lwpt/modules')
+    + '|' + TreeFingerprint(ACase + '/project/.lwpt/archives');
+end;
+
+function TInstallRegistry.StateSequenceOf(const ACase, AIdentity,
+  AKeyID: string): Integer;
+var Text: string; Start: Integer;
+begin
+  Result := 0;
+  Text := ReadText(RegistryStatePathAt(ACase + '/state', AIdentity, AKeyID));
+  Start := Pos(#10'sequence = ', Text);
+  if Start = 0 then Exit;
+  Text := Copy(Text, Start + Length(#10'sequence = '), MaxInt);
+  Result := StrToIntDef(Copy(Text, 1, Pos(#10, Text) - 1), 0);
+end;
+
+procedure TInstallRegistry.TestLaggingMirrorLackingHistoryIsStale;
+var
+  Registry: TSyntheticRegistry;
+  Origin, Lagging: TSyntheticContact;
+  CaseRoot, Before: string;
+  Run: TLwptResult;
+begin
+  CaseRoot := NewCase('lagging-history');
+  Registry := NewRegistry(IDENTITY, Origin);
+  Lagging := TSyntheticContact.Create(Registry, '/lagging', 'mirror');
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Registry.Publish(RegistryStamp(-7200), RegistryStamp(6 * DAY));
+    Registry.AddPackage('util', '1.0.0', RegistryPackageArchive('util', '1.0.0'), []);
+    Window(Registry);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    ExpectSuccess('history baseline', Install(CaseRoot, ['install']));
+    { The mirror stopped at sequence 1: it lacks sequence 2's snapshot. }
+    Lagging.CheckpointIndex := 0;
+    Expect<Integer>(Registry.VisibleFrom('snapshots/sha256/'
+      + Copy(Registry.Head, 8, 64) + '.toml')).ToBe(2);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL,
+      [Lagging.BaseURL]), 'json = "registry:json"'#10);
+    Before := Fingerprint(CaseRoot);
+    { A healthy next contact: the lagging one is stale, not unreachable. }
+    Run := Install(CaseRoot, ['install']);
+    ExpectSuccess('lagging then healthy', Run);
+    Expect<Boolean>(Pos(Lagging.BaseURL + ' is stale', Output(Run)) > 0).ToBe(True);
+    Expect<Integer>(Lagging.RequestedCount('snapshots/')).ToBe(0);
+    { No healthy contact: the stale diagnostic, never the locked fallback. }
+    Origin.Mode := scmFail;
+    Before := Fingerprint(CaseRoot);
+    Run := Install(CaseRoot, ['install']);
+    ExpectFailure(Run, 'registry_contacts_stale');
+    Expect<Boolean>(Pos('reusing the locked selection', Output(Run)) = 0).ToBe(True);
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    { Fresh CI: the committed proof holds the accepted snapshot. }
+    RecursiveDelete(CaseRoot + '/state');
+    ForceDirectories(CaseRoot + '/state');
+    ExpectFailure(Install(CaseRoot, ['install']), 'registry_contacts_stale');
+  finally
+    Lagging.Free;
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestEarlierOriginAdvanceSurvivesLaterFailure;
+var
+  First, Second: TSyntheticRegistry;
+  FirstContact, SecondContact: TSyntheticContact;
+  CaseRoot, Before: string;
+begin
+  CaseRoot := NewCase('partial-persistence');
+  First := NewRegistry(IDENTITY, FirstContact);
+  Second := NewRegistry(OTHER_IDENTITY, SecondContact, 9);
+  try
+    First.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    First.Publish(RegistryStamp(-7200), RegistryStamp(6 * DAY));
+    Second.AddPackage('util', '1.0.0', RegistryPackageArchive('util', '1.0.0'), []);
+    Second.Publish(RegistryStamp(-7200), RegistryStamp(6 * DAY));
+    WriteProject(CaseRoot, Declaration('corp', First, FirstContact.BaseURL, [])
+      + Declaration('oss', Second, SecondContact.BaseURL, []),
+      'json = "registry:corp/json"'#10 + 'util = "registry:oss/util"'#10);
+    ExpectSuccess('partial baseline', Install(CaseRoot, ['install']));
+    First.AddPackage('a', '1.0.0', RegistryPackageArchive('a', '1.0.0'), []);
+    Window(First);
+    Second.AddPackage('b', '1.0.0', RegistryPackageArchive('b', '1.0.0'), []);
+    Window(Second);
+    Before := ProjectFingerprint(CaseRoot);
+    { The second origin's state fails after the first advanced: the install
+      fails and project state rolls back, while the first origin's
+      authenticated, monotonic advance is retained, not undone. }
+    ExpectFailure(InstallWith(CaseRoot, ['install'],
+      [PROJECT_NAME + '_TEST_FAIL_REGISTRY_STATE_WRITE=' + OTHER_IDENTITY]),
+      'registry_state_not_persisted');
+    Expect<string>(ProjectFingerprint(CaseRoot)).ToBe(Before);
+    Expect<Integer>(StateSequenceOf(CaseRoot, IDENTITY, First.KeyID)).ToBe(2);
+    Expect<Integer>(StateSequenceOf(CaseRoot, OTHER_IDENTITY, Second.KeyID)).ToBe(1);
+    ExpectSuccess('partial recovers', Install(CaseRoot, ['install']));
+    Expect<Integer>(StateSequenceOf(CaseRoot, OTHER_IDENTITY, Second.KeyID)).ToBe(2);
+  finally
+    FirstContact.Free;
+    SecondContact.Free;
+    Second.Free;
+    First.Free;
+  end;
+end;
+
 procedure TInstallRegistry.SetupTests;
 begin
   Test('#62: a dependency selects a protocol-v1 origin explicitly',
@@ -1851,6 +1965,11 @@ begin
     TestProofReplacementAndPruningRollBack);
   Test('an unsigned lock floor never reaches per-user state',
     TestLockFloorNeverReachesPerUserState);
+  Test('#55: a lagging contact lacking newer history is stale, with a healthy '
+    + 'next contact and with none', TestLaggingMirrorLackingHistoryIsStale);
+  Test('per-user state failure contract: an earlier origin''s authenticated '
+    + 'advance survives a later origin''s failure',
+    TestEarlierOriginAdvanceSurvivesLaterFailure);
 end;
 
 begin
