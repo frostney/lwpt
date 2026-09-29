@@ -110,6 +110,35 @@ const
   ProcessTreeGroupSetupAttempts = 5;
   ProcessTreeGroupSetupRetryMilliseconds = 1;
 
+{$IFDEF PROCESSTREE_TESTING}
+type
+  { When InstallProcessTreeSignalForwarding starts its forwarder threads.
+    fstAtShutdown holds them, created but never run, until shutdown has
+    requested the stop and queued its wake-ups: the latest point a forwarder
+    can still be starting. fstNever never starts them, so shutdown's bounded
+    join expires and the process takes its emergency exit. }
+  TLWPTForwarderStartForTesting = (fstImmediate, fstAtShutdown, fstNever);
+
+var
+  ProcessTreeForwarderStartForTesting: TLWPTForwarderStartForTesting =
+    fstImmediate;
+
+{ Signal-forwarder threads this process started that have not ended: on
+  Windows, retained thread handles that are not yet signalled; on Unix, the
+  forwarder not yet joined. It reads only plain unit state, so a unit that
+  finalizes after this one can call it to verify that shutdown joined every
+  forwarder before the runtime tears down. }
+function ProcessTreeLiveForwardersForTesting: Integer;
+{$IFDEF MSWINDOWS}
+{ Runs the console-control handler as Windows would for AControlType,
+  without broadcasting a real event to every process on the console. }
+function ProcessTreeDeliverConsoleControlForTesting(
+  const AControlType: LongWord): Boolean;
+{ True once a parent's bytes wait unread on the inherited control pipe. }
+function ProcessTreeInheritedControlPendingForTesting: Boolean;
+{$ENDIF}
+{$ENDIF}
+
 {$IFDEF OBJECTSTORE_TESTING}
 type
   TLWPTProcessSpawnAttemptHook = procedure;
@@ -208,15 +237,79 @@ const
   ToolhelpSnapshotAttempts = 3;
   {$ENDIF}
 
+  { An idle forwarder observes a stop request within one poll interval; the
+    bound only matters if one never does. }
+  ForwarderStopTimeoutMilliseconds = 5000;
+  { A forwarder that has committed to forwarding ends the process itself
+    within its own cancellation deadlines, which this comfortably covers. }
+  ForwardingCompletionTimeoutMilliseconds = 30000;
+  { ForwardingState: the stop flag plus the count of handlers between
+    admission and release. }
+  ForwardingStoppedFlag = LongInt($40000000);
+  ForwardingHandlerCountMask = ForwardingStoppedFlag - 1;
+
 var
   ActiveProcessTrees: TList;
   ActiveProcessTreesCriticalSection: TRTLCriticalSection;
   SignalForwardingInstalled: Boolean = False;
+  { Shutdown handshake between the asynchronous signal or console-control
+    handlers, the forwarder threads, and unit finalization; see
+    AdmitForwardingHandler. A forwarder sets ForwardingInProgress once it has
+    committed to forwarding, after which it ends the process itself. }
+  ForwardingState: LongInt = 0;
+  ForwardingInProgress: LongInt = 0;
   InheritedStatusWriteHandle: PtrInt = -1;
   InheritedControlReadHandle: PtrInt = -1;
   InheritedChannelToken: string = '';
   InheritedControlBuffer: string = '';
   InheritedManagedProcessTree: Boolean = False;
+
+{ Admission and stopping share the single atomic word ForwardingState, so
+  every handler's increment and shutdown's setting of ForwardingStoppedFlag
+  are totally ordered in that word's modification order: a handler is
+  admitted exactly when its increment precedes the flag, and shutdown then
+  sees a non-zero count until that handler releases. Interlocked operations
+  are atomic but, on AArch64 in FPC 3.2.2, not ordering (plain LDXR/STXR), so
+  each is bracketed by ReadWriteBarrier (DMB ISH there, MFENCE or a locked
+  add on x86): a handler's wake-up (its pipe write, or its event and flag)
+  is ordered before its release, and shutdown's wake-up after it observes a
+  zero count. The barriers are single instructions and async-signal-safe. }
+function AdmitForwardingHandler: Boolean;
+begin
+  ReadWriteBarrier;
+  Result := (InterlockedIncrement(ForwardingState)
+    and ForwardingStoppedFlag) = 0;
+  ReadWriteBarrier;
+end;
+
+procedure ReleaseForwardingHandler;
+begin
+  ReadWriteBarrier;
+  InterlockedDecrement(ForwardingState);
+  ReadWriteBarrier;
+end;
+
+function ForwardingStopped: Boolean;
+begin
+  ReadWriteBarrier;
+  Result := (InterlockedCompareExchange(ForwardingState, 0, 0)
+    and ForwardingStoppedFlag) <> 0;
+  ReadWriteBarrier;
+end;
+
+procedure CommitToForwarding;
+begin
+  ReadWriteBarrier;
+  InterlockedExchange(ForwardingInProgress, 1);
+  ReadWriteBarrier;
+end;
+
+function ForwardingCommitted: Boolean;
+begin
+  ReadWriteBarrier;
+  Result := InterlockedCompareExchange(ForwardingInProgress, 0, 0) <> 0;
+  ReadWriteBarrier;
+end;
 
 {$IFDEF UNIX}
 const
@@ -228,6 +321,10 @@ type
   protected
     procedure Execute; override;
   end;
+
+const
+  { Written by shutdown, never by a handler: no signal is numbered zero. }
+  ForwarderStopSentinel = 0;
 
 var
   SignalForwarder: TLWPTSignalForwarder = nil;
@@ -508,8 +605,15 @@ type
 
 var
   ConsoleControlEvent: THandle = 0;
+  { Set by the console-control handler before it signals ConsoleControlEvent,
+    so the forwarder can tell a control event from a shutdown wake-up. }
+  ConsoleControlReceived: LongInt = 0;
   ConsoleControlForwarder: TLWPTConsoleControlForwarder = nil;
   InheritedControlForwarder: TLWPTInheritedControlForwarder = nil;
+  {$IFDEF PROCESSTREE_TESTING}
+  ForwarderThreadHandles: array[0..1] of THandle;
+  ForwarderThreadHandleCount: Integer = 0;
+  {$ENDIF}
 
 function LWPTCreateJobObject(const ASecurityAttributes: Pointer;
   const AName: PWideChar): THandle; stdcall;
@@ -1923,6 +2027,12 @@ begin
     BytesRead := FpRead(SignalPipe[SignalPipeReadEnd], ReceivedSignal,
       SizeOf(ReceivedSignal));
   until BytesRead = SizeOf(ReceivedSignal);
+  { Shutdown queues the sentinel only after every admitted handler has
+    written, so a signal received before shutdown is still read, and
+    forwarded, first. Shutdown never calls Terminate, which would make a
+    forwarder that has not started yet skip Execute and its queued signal. }
+  if ReceivedSignal = ForwarderStopSentinel then Exit;
+  CommitToForwarding;
   IncomingCancellationDeadlines(DescendantDeadline,
     AcknowledgementDeadline);
   try
@@ -1956,28 +2066,64 @@ end;
 
 procedure ProcessTreeSignalHandler(ASignal: LongInt); cdecl;
 begin
-  { write(2) is async-signal-safe. The pipe is nonblocking, and one complete
-    LongInt write is below PIPE_BUF; if repeated signals fill it, an earlier
-    queued signal already guarantees that forwarding will run. }
-  FpWrite(SignalPipe[SignalPipeWriteEnd], ASignal, SizeOf(ASignal));
+  { write(2), signal(2), raise(3), and the lock-free interlocked operations
+    are async-signal-safe. The pipe is nonblocking, and one complete LongInt
+    write is below PIPE_BUF; if repeated signals fill it, an earlier queued
+    signal already guarantees that forwarding will run. }
+  if AdmitForwardingHandler then
+    FpWrite(SignalPipe[SignalPipeWriteEnd], ASignal, SizeOf(ASignal))
+  else
+  begin
+    { Shutdown has stopped the forwarder, which would have forwarded this
+      signal and then re-raised it with the default disposition. Owned trees
+      are gone by now, so do the same here; the signal stays blocked until
+      this handler returns. }
+    CSignal(ASignal, nil);
+    CRaise(ASignal);
+  end;
+  ReleaseForwardingHandler;
 end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
+{$IFDEF PROCESSTREE_TESTING}
+{ Keeps a synchronisation handle to a forwarder thread so a test can ask the
+  operating system, after this unit finalizes, whether the thread ended. }
+procedure RetainForwarderForTesting(const AForwarder: TThread);
+var
+  Duplicate: THandle;
+begin
+  if ForwarderThreadHandleCount > High(ForwarderThreadHandles) then Exit;
+  if not Windows.DuplicateHandle(Windows.GetCurrentProcess, AForwarder.Handle,
+    Windows.GetCurrentProcess, @Duplicate, Windows.SYNCHRONIZE, False, 0) then
+    RaiseLastOSError;
+  ForwarderThreadHandles[ForwarderThreadHandleCount] := Duplicate;
+  Inc(ForwarderThreadHandleCount);
+end;
+{$ENDIF}
+
 procedure TLWPTInheritedControlForwarder.Execute;
 var
   AcknowledgementDeadline, DescendantDeadline: QWord;
   AcknowledgementFailure, CancellationBuffer, CancellationLine: string;
+  StopRequested: Boolean;
 begin
   CancellationBuffer := '';
+  { Shutdown uses the stop flag, never Terminate, which would keep a
+    not-yet-started forwarder out of Execute and away from a pending CANCEL
+    frame; only a failed install terminates this thread. }
   repeat
-    if Terminated then Exit;
+    StopRequested := Terminated or ForwardingStopped;
     if ReadProtocolLineBefore(InheritedControlReadHandle,
       GetTickCount64 + ProcessTreeTerminatePollMilliseconds,
       CancellationBuffer, CancellationLine)
        and ParseCancellationFrame(CancellationLine, InheritedChannelToken,
          DescendantDeadline, AcknowledgementDeadline) then Break;
+    { Stop only after a full read pass that began after the request, so a
+      CANCEL frame the parent wrote before shutdown is still forwarded. }
+    if StopRequested then Exit;
   until False;
+  CommitToForwarding;
   try
     TerminateRegisteredProcessTrees(True, DescendantDeadline,
       AcknowledgementDeadline);
@@ -2000,8 +2146,19 @@ end;
 
 procedure TLWPTConsoleControlForwarder.Execute;
 begin
-  Windows.WaitForSingleObject(ConsoleControlEvent, Windows.INFINITE);
-  if Terminated then Exit;
+  { A stop request and a control event share one wake-up; only the handler's
+    flag means a control event arrived, and it is forwarded even when a stop
+    request follows it. }
+  repeat
+    Windows.WaitForSingleObject(ConsoleControlEvent, Windows.INFINITE);
+    ReadWriteBarrier;
+    if InterlockedCompareExchange(ConsoleControlReceived, 0, 0) <> 0 then
+      Break;
+    { Terminate comes only from a failed install; shutdown uses the stop
+      flag, which cannot keep a not-yet-started forwarder out of Execute. }
+    if Terminated or ForwardingStopped then Exit;
+  until False;
+  CommitToForwarding;
   try
     TerminateRegisteredProcessTrees(InheritedManagedProcessTree);
   except
@@ -2022,11 +2179,27 @@ begin
   if InheritedControlReadHandle >= 0 then Exit(True);
   { Windows invokes this callback on an operating-system thread. It may only
     wake the FPC-owned forwarder; registry traversal, Job Object work,
-    reporting, and process exit all remain on that dedicated thread. }
-  if ConsoleControlEvent <> 0 then
+    reporting, and process exit all remain on that dedicated thread. Once
+    shutdown has stopped the forwarder, returning False hands the event to
+    the default handler, which ends the process with the same
+    STATUS_CONTROL_C_EXIT the forwarder uses. }
+  if AdmitForwardingHandler and (ConsoleControlEvent <> 0) then
+  begin
+    InterlockedExchange(ConsoleControlReceived, 1);
+    ReadWriteBarrier;
     Result := Windows.SetEvent(ConsoleControlEvent);
+  end;
+  ReleaseForwardingHandler;
 end;
 {$ENDIF}
+
+procedure StartForwarder(const AForwarder: TThread);
+begin
+  {$IFDEF PROCESSTREE_TESTING}
+  if ProcessTreeForwarderStartForTesting <> fstImmediate then Exit;
+  {$ENDIF}
+  AForwarder.Start;
+end;
 
 procedure InstallProcessTreeSignalForwarding;
 {$IFDEF UNIX}
@@ -2076,7 +2249,7 @@ begin
     InterruptHandlerInstalled := True;
     SignalForwarder := TLWPTSignalForwarder.Create(True);
     SignalForwarder.FreeOnTerminate := False;
-    SignalForwarder.Start;
+    StartForwarder(SignalForwarder);
     SignalForwardingInstalled := True;
     if InheritedStatusWriteHandle >= 0 then
       SendInheritedAcknowledgement(AcknowledgementHello);
@@ -2113,12 +2286,18 @@ begin
   try
     ConsoleControlForwarder := TLWPTConsoleControlForwarder.Create(True);
     ConsoleControlForwarder.FreeOnTerminate := False;
-    ConsoleControlForwarder.Start;
+    {$IFDEF PROCESSTREE_TESTING}
+    RetainForwarderForTesting(ConsoleControlForwarder);
+    {$ENDIF}
+    StartForwarder(ConsoleControlForwarder);
     if InheritedControlReadHandle >= 0 then
     begin
       InheritedControlForwarder := TLWPTInheritedControlForwarder.Create(True);
       InheritedControlForwarder.FreeOnTerminate := False;
-      InheritedControlForwarder.Start;
+      {$IFDEF PROCESSTREE_TESTING}
+      RetainForwarderForTesting(InheritedControlForwarder);
+      {$ENDIF}
+      StartForwarder(InheritedControlForwarder);
     end;
     SignalForwardingInstalled := True;
     if InheritedStatusWriteHandle >= 0 then
@@ -2143,8 +2322,179 @@ begin
   {$ENDIF}
 end;
 
+{ Ends the process at once, as a crash would, when a forwarder can be
+  neither joined nor safely left running into runtime finalization. It does
+  no I/O that could block: the runtime flushed the standard text files
+  before unit finalization began. }
+procedure AbandonFinalization(const AExitCode: LongInt);
+begin
+  {$IFDEF UNIX}
+  FpExit(AExitCode);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows.TerminateProcess(Windows.GetCurrentProcess, UINT(AExitCode));
+  {$ENDIF}
+end;
+
+{ Waits, within the deadlines, until AForwarder can no longer touch shared
+  state: on Windows until its thread object is signalled, which is the
+  operating-system thread end; on Unix until FPC has published Finished,
+  which it does after Execute and before an epilogue that runs only runtime
+  code and takes no lock this thread holds. Past the deadline the process
+  exits immediately instead of joining. }
+procedure JoinForwarder(const AForwarder: TThread; const AIdleDeadline,
+  ACommittedDeadline: QWord);
+begin
+  if not Assigned(AForwarder) then Exit;
+  repeat
+    {$IFDEF MSWINDOWS}
+    if Windows.WaitForSingleObject(AForwarder.Handle,
+      ProcessTreeTerminatePollMilliseconds) = Windows.WAIT_OBJECT_0 then
+      Break;
+    {$ENDIF}
+    {$IFDEF UNIX}
+    ReadWriteBarrier;
+    if AForwarder.Finished then Break;
+    Sleep(ProcessTreeTerminatePollMilliseconds);
+    {$ENDIF}
+    if ForwardingCommitted then
+    begin
+      if GetTickCount64 >= ACommittedDeadline then
+        AbandonFinalization(ProcessTreeCancellationExitCode);
+    end
+    else if GetTickCount64 >= AIdleDeadline then
+      AbandonFinalization(ExitCode);
+  until False;
+  {$IFDEF UNIX}
+  { pthread_join now waits only for FPC's own thread epilogue. }
+  AForwarder.WaitFor;
+  {$ENDIF}
+  AForwarder.Free;
+end;
+
+{$IFDEF PROCESSTREE_TESTING}
+procedure StartDeferredForwarder(const AForwarder: TThread);
+begin
+  if Assigned(AForwarder)
+     and (ProcessTreeForwarderStartForTesting = fstAtShutdown) then
+    AForwarder.Start;
+end;
+{$ENDIF}
+
+{ Stops and joins every forwarder before the runtime units it relies on
+  (Classes, SysUtils, the heap, thread-local storage) finalize. A forwarder
+  left running, or still starting, while they tear down crashed or hung
+  short-lived commands (#330). }
+procedure StopProcessTreeSignalForwarding;
+var
+  CommittedDeadline, IdleDeadline: QWord;
+  {$IFDEF UNIX}
+  Sentinel: LongInt;
+  {$ENDIF}
+begin
+  if not SignalForwardingInstalled then Exit;
+  { Admit no further handler. Once the count drains, every admitted handler
+    has queued its wake-up, and shutdown's wake-ups follow them. A handler
+    that never releases may still write or signal, so nothing is queued or
+    closed behind it: the process exits instead. }
+  ReadWriteBarrier;
+  InterlockedExchangeAdd(ForwardingState, ForwardingStoppedFlag);
+  ReadWriteBarrier;
+  IdleDeadline := GetTickCount64 + ForwarderStopTimeoutMilliseconds;
+  CommittedDeadline := GetTickCount64
+    + ForwardingCompletionTimeoutMilliseconds;
+  repeat
+    ReadWriteBarrier;
+    if (InterlockedCompareExchange(ForwardingState, 0, 0)
+      and ForwardingHandlerCountMask) = 0 then Break;
+    if GetTickCount64 >= IdleDeadline then AbandonFinalization(ExitCode);
+    Sleep(1);
+  until False;
+  ReadWriteBarrier;
+  {$IFDEF UNIX}
+  { The forwarder blocks reading the pipe, so the stop request travels
+    through it, behind any signal already queued. If a flood of signals has
+    filled the pipe, the forwarder is already forwarding one of them. }
+  Sentinel := ForwarderStopSentinel;
+  FpWrite(SignalPipe[SignalPipeWriteEnd], Sentinel, SizeOf(Sentinel));
+  {$IFDEF PROCESSTREE_TESTING}
+  StartDeferredForwarder(SignalForwarder);
+  {$ENDIF}
+  JoinForwarder(SignalForwarder, IdleDeadline, CommittedDeadline);
+  SignalForwarder := nil;
+  { Keep the forwarder's outcome for a late signal: the default action. }
+  CSignal(SIGINT, nil);
+  CSignal(SIGTERM, nil);
+  FpClose(SignalPipe[SignalPipeReadEnd]);
+  FpClose(SignalPipe[SignalPipeWriteEnd]);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  { The inherited-channel forwarder polls its pipe without blocking and sees
+    the stop flag within one poll; the console forwarder waits on its event.
+    The handler stays registered: once stopped it no longer touches the
+    event, and it keeps the managed-child and default-handler behaviour for
+    any later control event. }
+  Windows.SetEvent(ConsoleControlEvent);
+  {$IFDEF PROCESSTREE_TESTING}
+  StartDeferredForwarder(InheritedControlForwarder);
+  StartDeferredForwarder(ConsoleControlForwarder);
+  {$ENDIF}
+  JoinForwarder(InheritedControlForwarder, IdleDeadline, CommittedDeadline);
+  InheritedControlForwarder := nil;
+  JoinForwarder(ConsoleControlForwarder, IdleDeadline, CommittedDeadline);
+  ConsoleControlForwarder := nil;
+  Windows.CloseHandle(ConsoleControlEvent);
+  ConsoleControlEvent := 0;
+  {$ENDIF}
+  SignalForwardingInstalled := False;
+end;
+
+{$IFDEF PROCESSTREE_TESTING}
+function ProcessTreeLiveForwardersForTesting: Integer;
+{$IFDEF MSWINDOWS}
+var
+  Index: Integer;
+{$ENDIF}
+begin
+  Result := 0;
+  {$IFDEF UNIX}
+  if Assigned(SignalForwarder) then Inc(Result);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  for Index := 0 to ForwarderThreadHandleCount - 1 do
+    if Windows.WaitForSingleObject(ForwarderThreadHandles[Index], 0)
+       <> Windows.WAIT_OBJECT_0 then
+      Inc(Result);
+  {$ENDIF}
+end;
+
+{$IFDEF MSWINDOWS}
+function ProcessTreeDeliverConsoleControlForTesting(
+  const AControlType: LongWord): Boolean;
+begin
+  Result := ProcessTreeConsoleControlHandler(AControlType);
+end;
+
+function ProcessTreeInheritedControlPendingForTesting: Boolean;
+var
+  Available: DWORD;
+begin
+  Available := 0;
+  Result := (InheritedControlReadHandle >= 0)
+    and Windows.PeekNamedPipe(THandle(InheritedControlReadHandle), nil, 0,
+      nil, @Available, nil)
+    and (Available > 0);
+end;
+{$ENDIF}
+{$ENDIF}
+
 initialization
   ActiveProcessTrees := TList.Create;
   InitCriticalSection(ActiveProcessTreesCriticalSection);
+
+finalization
+  StopProcessTreeSignalForwarding;
+  DoneCriticalSection(ActiveProcessTreesCriticalSection);
+  ActiveProcessTrees.Free;
 
 end.
