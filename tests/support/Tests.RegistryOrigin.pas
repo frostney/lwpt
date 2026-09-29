@@ -32,18 +32,10 @@ type
     property PublicKey: string read FPublicKey;
   end;
 
-function FindAvailableRegistryTestPort: Word;
-{ Moves an initialized data directory's transport to APort and returns the
-  new base URL. The origin identity and role stay as initialized. }
-function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
-  const APort: Word): string;
-{ Starts `registry serve` and waits until this child, not another process,
-  serves ABaseURL. A port taken between selection and bind is recovered
-  deterministically: the data directory is moved to a fresh port, ABaseURL is
-  updated, and the start is retried a bounded number of times. }
+{ LaunchRegistryCLI, then waits until the announced child serves this
+  registry's discovery document and checkpoint over plain HTTP. }
 function StartRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
   const AAllowRelocation: Boolean = True): TProcess;
-procedure StopRegistryCLI(var AProcess: TProcess);
 function RegistryHTTPBody(const AURL: string): TBytes;
 function RegistryArtifactHash(const AArchive: TBytes): string;
 function RegistryProgramName: string;
@@ -57,7 +49,6 @@ uses
   LWPT.Registry.Verification,
   Tests.LwptSubprocess,
   Tests.RegistryProcess,
-  Tests.RegistryServer,
   TOML;
 
 function RegistryArtifactHash(const AArchive: TBytes): string;
@@ -68,20 +59,6 @@ end;
 function RegistryProgramName: string;
 begin
   Result := PROGRAM_NAME;
-end;
-
-{ The port is free when observed but not reserved; StartRegistryCLI proves
-  that the listener it reaches is the registry it started. }
-function FindAvailableRegistryTestPort: Word;
-var
-  Reservation: TRegistryTestServer;
-begin
-  Reservation := TRegistryTestServer.Create(nil);
-  try
-    Result := Reservation.Port;
-  finally
-    Reservation.Free;
-  end;
 end;
 
 function RegistryHTTPBody(const AURL: string): TBytes;
@@ -134,142 +111,48 @@ begin
   end;
 end;
 
-const
-  RegistryStartAttempts = 5;
-  RegistryReadyMilliseconds = 5000;
-
-function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
-  const APort: Word): string;
-var
-  Lines: TStringList;
-  Index: Integer;
-  Authority, Path: string;
-begin
-  Authority := Copy(ABaseURL, Pos('://', ABaseURL) + 3, MaxInt);
-  Path := '';
-  if Pos('/', Authority) > 0 then
-    Path := Copy(Authority, Pos('/', Authority), MaxInt);
-  Result := 'http://localhost:' + IntToStr(APort) + Path;
-  Lines := TStringList.Create;
-  try
-    Lines.LineBreak := #10;
-    Lines.LoadFromFile(ADataDirectory + '/registry.toml');
-    for Index := 0 to Lines.Count - 1 do
-      if Pos('base_url = ', Lines[Index]) = 1 then
-        Lines[Index] := 'base_url = "' + Result + '"'
-      else if Pos('port = ', Lines[Index]) = 1 then
-        Lines[Index] := 'port = ' + IntToStr(APort);
-    Lines.SaveToFile(ADataDirectory + '/registry.toml');
-  finally
-    Lines.Free;
-  end;
-end;
-
-{ Moves an initialized data directory to a newly selected port. }
-function RelocateRegistryPort(const ADataDirectory, ABaseURL: string): string;
-begin
-  Result := RelocateRegistryPortTo(ADataDirectory, ABaseURL,
-    FindAvailableRegistryTestPort);
-end;
-
 function StartRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
   const AAllowRelocation: Boolean): TProcess;
 var
   Started: QWord;
-  Attempt: Integer;
-  Announced, Ready, Serving, Collided: Boolean;
-  LastProbe, ExitState, Diagnostics, Discovery, Checkpoint, Expected, Output: string;
+  Serving: Boolean;
+  LastProbe, ExitState, Discovery, Checkpoint, Expected: string;
   Body: TBytes;
 begin
-  Result := nil;
-  for Attempt := 1 to RegistryStartAttempts do
-  begin
-    Result := TProcess.Create(nil);
-    Result.Executable := LwptBinaryPath;
-    Result.Options := [poUsePipes];
-    Result.Parameters.Add('registry');
-    Result.Parameters.Add('serve');
-    Result.Parameters.Add('--data-dir');
-    Result.Parameters.Add(ADataDirectory);
-    BindRegistryChildToParent(Result);
-    try
-      Result.Execute;
-      Started := GetTickCount64;
-      LastProbe := 'listener has not announced its bound port';
-      Output := '';
-      Announced := False;
-      repeat
-        Ready := False;
-        { The child announces only after binding its own socket, so another
-          process answering on the same URL can never satisfy readiness. }
-        if not Announced then
+  Result := LaunchRegistryCLI(ADataDirectory, ABaseURL, [], '',
+    AAllowRelocation);
+  try
+    Started := GetTickCount64;
+    LastProbe := 'listener did not answer';
+    repeat
+      try
+        Body := RegistryHTTPBody(ABaseURL + '/.well-known/' + PROGRAM_NAME + '-registry');
+        SetString(Discovery, PAnsiChar(@Body[0]), Length(Body));
+        Serving := Result.Running and (Pos('base_url = "' + ABaseURL + '"', Discovery) > 0);
+        Expected := ServedCheckpoint(ADataDirectory);
+        if Serving and (Expected <> '') then
         begin
-          Output := Output + DrainAvailableStream(Result.Output, 4096);
-          Announced := Pos(' listening at ' + ABaseURL, Output) > 0;
+          Body := RegistryHTTPBody(ABaseURL + '/v1/checkpoints/latest.toml');
+          SetString(Checkpoint, PAnsiChar(@Body[0]), Length(Body));
+          Serving := Checkpoint = Expected;
         end;
-        if Announced then
-          try
-            Body := RegistryHTTPBody(ABaseURL + '/.well-known/' + PROGRAM_NAME + '-registry');
-            SetString(Discovery, PAnsiChar(@Body[0]), Length(Body));
-            Serving := Result.Running and (Pos('base_url = "' + ABaseURL + '"', Discovery) > 0);
-            Expected := ServedCheckpoint(ADataDirectory);
-            if Serving and (Expected <> '') then
-            begin
-              Body := RegistryHTTPBody(ABaseURL + '/v1/checkpoints/latest.toml');
-              SetString(Checkpoint, PAnsiChar(@Body[0]), Length(Body));
-              Serving := Checkpoint = Expected;
-            end;
-            if not Serving then LastProbe := 'listener did not serve this registry';
-            Ready := Serving;
-          except
-            on E: Exception do
-            begin
-              Ready := False;
-              LastProbe := Copy(E.Message, 1, 1024);
-            end;
-          end;
-        if Ready then Exit;
-        if not Result.Running then Break;
-        Sleep(10);
-      until GetTickCount64 - Started >= RegistryReadyMilliseconds;
-      ExitState := 'running';
-      if not Result.Running then ExitState := IntToStr(Result.ExitCode)
-        + ' (status=' + IntToStr(Result.ExitStatus) + ')';
-      Diagnostics := DrainAvailableStream(Result.Stderr, 4096);
-      Collided := (not Result.Running) and (Pos('listen_failed:', Diagnostics) > 0);
-      { A caller that asserts readiness is refused must not be rescued by
-        relocating to a free port. }
-      if not Collided or not AAllowRelocation
-         or (Attempt = RegistryStartAttempts) then
-        raise Exception.Create('registry CLI listener did not become ready after '
-          + IntToStr(Attempt) + ' start attempt(s); exit=' + ExitState
-          + '; last probe: ' + LastProbe + '; stderr: ' + Diagnostics);
-    except
-      StopRegistryCLI(Result);
-      raise;
-    end;
-    { Another process took the port after it was selected. }
+        if Serving then Exit;
+        LastProbe := 'listener did not serve this registry';
+      except
+        on E: Exception do LastProbe := Copy(E.Message, 1, 1024);
+      end;
+      if not Result.Running then Break;
+      Sleep(10);
+    until GetTickCount64 - Started >= RegistryReadyMilliseconds;
+    ExitState := 'running';
+    if not Result.Running then ExitState := IntToStr(Result.ExitCode)
+      + ' (status=' + IntToStr(Result.ExitStatus) + ')';
+    raise Exception.Create('registry CLI listener did not become ready after '
+      + 'announcing its bound port; exit=' + ExitState + '; last probe: '
+      + LastProbe + '; stderr: ' + DrainAvailableStream(Result.Stderr, 4096));
+  except
     StopRegistryCLI(Result);
-    ABaseURL := RelocateRegistryPort(ADataDirectory, ABaseURL);
-  end;
-end;
-
-procedure StopRegistryCLI(var AProcess: TProcess);
-var
-  Stopped: TRegistryStopResult;
-  FailureMessage: string;
-begin
-  Stopped := StopRegistryProcess(AProcess);
-  FailureMessage := '';
-  if not Stopped.Stopped then
-    FailureMessage := 'registry CLI listener did not stop after forced termination'
-  else if Stopped.Forced then
-    FailureMessage := 'registry CLI listener exceeded its 12000 ms shutdown bound';
-  if FailureMessage <> '' then
-  begin
-    if ExceptObject <> nil then
-      WriteLn(StdErr, 'registry E2E cleanup: ', FailureMessage)
-    else raise Exception.Create(FailureMessage);
+    raise;
   end;
 end;
 
