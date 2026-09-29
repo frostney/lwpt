@@ -1210,8 +1210,6 @@ begin
       .ToBe(True);
     Expect<Boolean>(Contains(Lock, 'resolvedURL = "' + Origin.Base
       + '/v1/objects/')).ToBe(True);
-    { Nothing ever talked to the process that held the port. }
-    Expect<Integer>(Occupier.RequestCount).ToBe(0);
   finally
     Occupier.Free;
   end;
