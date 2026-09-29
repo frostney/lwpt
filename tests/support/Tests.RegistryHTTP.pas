@@ -79,6 +79,7 @@ end;
 
 function RawHTTPBodyText(const AResponse: TRawHTTPResponse): string;
 begin
+  if Length(AResponse.Body) = 0 then Exit('');
   SetString(Result, PAnsiChar(@AResponse.Body[0]), Length(AResponse.Body));
 end;
 
@@ -198,13 +199,13 @@ begin
     end;
     if Received = 0 then Break;
     {$IFDEF UNIX}
-    if not (fpGetErrNo in [ESysEAGAIN, ESysEWOULDBLOCK, ESysEINTR]) then Break;
+    if (fpGetErrNo <> ESysEAGAIN) and (fpGetErrNo <> ESysEINTR) then Break;
     {$ELSE}
     if WSAGetLastError <> WSAETIMEDOUT then Break;
     {$ENDIF}
   until GetTickCount64 >= Deadline;
   { Skip interim 1xx responses. }
-  while StartsText('HTTP/1.1 1', Raw) and (Pos(#13#10#13#10, Raw) > 0) do
+  while (Copy(Raw, 1, 10) = 'HTTP/1.1 1') and (Pos(#13#10#13#10, Raw) > 0) do
     Delete(Raw, 1, Pos(#13#10#13#10, Raw) + 3);
   HeaderEnd := Pos(#13#10#13#10, Raw);
   if HeaderEnd = 0 then Exit;

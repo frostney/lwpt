@@ -719,7 +719,8 @@ begin
             else
             begin
               Release;
-              Commit := FPublisher.Store.PublishRecord(FRecord);
+              Commit := FPublisher.Store.PublishRecord(FRecord, FAudit.Name,
+                FAudit.Version);
               Result := Default(TLWPTRegistryHTTPResponse);
               if Commit.Outcome = rcoCreated then Status := 201
               else Status := 204;

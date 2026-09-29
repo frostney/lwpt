@@ -770,6 +770,21 @@ begin
     if (Cursor <> '') and (Snapshot = '') then
       Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
         'a cursor requires its snapshot'));
+    if Cursor <> '' then
+    begin
+      Parts.StrictDelimiter := True;
+      Parts.Delimiter := ':';
+      Parts.QuoteChar := #0;
+      Parts.DelimitedText := Cursor;
+      { A position without a snapshot binding never belongs to the
+        requested snapshot. }
+      if Parts.Count = 2 then
+        Exit(ErrorResponse(409, 'Conflict', 'snapshot_conflict',
+          'cursor does not belong to the requested snapshot'));
+      if Parts.Count <> 3 then
+        Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
+          'package cursor is invalid'));
+    end;
     if Snapshot = '' then Snapshot := AView.State.SnapshotHash;
     Index := AStore.PackageIndex(AView, Snapshot, AProgress, Reference);
     if Index = nil then
@@ -785,20 +800,10 @@ begin
     end;
     if Cursor <> '' then
     begin
-      Parts.StrictDelimiter := True;
-      Parts.Delimiter := ':';
-      Parts.QuoteChar := #0;
-      Parts.DelimitedText := Cursor;
-      { A position without this origin's snapshot binding never belongs to
-        the requested snapshot. }
-      if (Parts.Count = 2) or ((Parts.Count = 3)
-        and (Parts[2] <> PackageCursorBinding(AStore.Config.Identity,
-          Snapshot, AName, Parts[0] + ':' + Parts[1]))) then
+      if Parts[2] <> PackageCursorBinding(AStore.Config.Identity, Snapshot,
+        AName, Parts[0] + ':' + Parts[1]) then
         Exit(ErrorResponse(409, 'Conflict', 'snapshot_conflict',
           'cursor does not belong to the requested snapshot'));
-      if Parts.Count <> 3 then
-        Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
-          'package cursor is invalid'));
       Start := Index.PositionAfter(Parts[0], Parts[1]);
       if (Start < 0) or ((AName <> '') and (Parts[0] <> AName)) then
         Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',

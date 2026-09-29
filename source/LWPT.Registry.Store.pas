@@ -265,7 +265,9 @@ type
     { Remote publication of a canonical record whose archive was uploaded to
       incoming/ or is already committed. The server clock stamps the snapshot
       and checkpoint. Idempotent by content identity. }
-    function PublishRecord(const ARecordBytes: TBytes): TLWPTRegistryCommitResult;
+    function PublishRecord(const ARecordBytes: TBytes;
+      const AExpectedName: string = ''; const AExpectedVersion: string = ''):
+      TLWPTRegistryCommitResult;
     { Yank (AYanked) or restore the active record of one identity. }
     function SetYanked(const AName, AVersion: string;
       const AYanked: Boolean): TLWPTRegistryCommitResult;
@@ -3335,8 +3337,8 @@ begin
   end;
 end;
 
-function TLWPTRegistryStore.PublishRecord(
-  const ARecordBytes: TBytes): TLWPTRegistryCommitResult;
+function TLWPTRegistryStore.PublishRecord(const ARecordBytes: TBytes;
+  const AExpectedName, AExpectedVersion: string): TLWPTRegistryCommitResult;
 var
   ActiveHash, ActiveText, CommitTime, RecordHash, RecordText: string;
   Active, Candidate: TLWPTRegistryPackage;
@@ -3363,6 +3365,10 @@ begin
       raise ELWPTRegistryError.CreateStable('invalid_request',
         'package record is not a canonical record for this origin');
   end;
+  if ((AExpectedName <> '') and (Candidate.Name <> AExpectedName))
+    or ((AExpectedVersion <> '') and (Candidate.Version <> AExpectedVersion)) then
+    raise ELWPTRegistryError.CreateStable('invalid_request',
+      'package record identity differs from the request path');
   if Candidate.Yanked then
     raise ELWPTRegistryError.CreateStable('invalid_request',
       'yanked state changes only through the yank endpoints');

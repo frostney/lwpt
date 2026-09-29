@@ -1484,7 +1484,11 @@ begin
   try
     Response := RegistryHTTPResponse(Store, 'GET', '/v1/capabilities');
     Body := TEncoding.UTF8.GetString(Response.Body);
-    Expect<Boolean>(Pos('package-list-v1', Body) = 0).ToBe(True);
+    { Package lists derive from accepted snapshots; publication stays off
+      until the operator issues a token. }
+    Expect<Boolean>(Pos('package-list-v1', Body) > 0).ToBe(True);
+    Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/packages').Status)
+      .ToBe(200);
     Expect<Boolean>(Pos('publication-v1', Body) = 0).ToBe(True);
     Expect<Boolean>(Pos('rotation-chain-v1', Body) > 0).ToBe(True);
     Expect<Boolean>(Pos('auth_schemes = []', Body) > 0).ToBe(True);
