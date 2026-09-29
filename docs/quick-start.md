@@ -315,5 +315,10 @@ Cleans `.lwpt/tmp/`, any stale install lock, and abandoned or failed sessions
 from the default and identity-verified historical build-session roots, then
 reclaims abandoned per-user worker requests and reports the remaining budget
 state. Live build/test sessions are retained.
-Repair never touches `.lwpt/modules/`, `.lwpt/archives/`, or the last
-successfully published build output.
+Repair never touches the last successfully published build output. It
+changes `.lwpt/modules/`, `.lwpt/archives/`, and `lwpt.lock` only when the
+lockfile is schema v3: it then upgrades the lockfile to v4 without network
+access and without changing dependency versions, re-deriving each module from
+its committed archive or source
+([ADR-0052](./adr/0052-lockfile-schema-v4-framed-tree-digest.md)). Commit the
+resulting `lwpt.lock`.
