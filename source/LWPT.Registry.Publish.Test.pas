@@ -198,6 +198,17 @@ begin
     .ToBe(-1);
   Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Foo 2026 07:28:30 GMT', Now))
     .ToBe(-1);
+  { A fractional clock rounds the remaining time up, never down. }
+  Now := EncodeDateTime(2026, 10, 21, 7, 28, 0, 400);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:28:30 GMT', Now))
+    .ToBe(30);
+  Now := EncodeDateTime(2026, 10, 21, 7, 28, 0, 999);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:28:01 GMT', Now))
+    .ToBe(1);
+  Now := EncodeDateTime(2026, 10, 21, 7, 28, 1, 1);
+  Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:28:01 GMT', Now))
+    .ToBe(0);
+  Now := EncodeDateTime(2026, 10, 21, 7, 28, 0, 0);
   { A date 30 seconds ahead is honoured as the minimum wait. }
   Expect<Integer>(RegistryPublishBackoffSeconds(1,
     ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:28:30 GMT', Now))).ToBe(30);

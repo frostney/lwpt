@@ -34,7 +34,7 @@ const
 type
   TProxyMode = (pmForward, pmRedirectDiscovery, pmRedirectUpload, pmForeignAPI,
     pmEchoError, pmEchoKnownError, pmEchoLocation, pmEchoETag,
-    pmEchoRetryAfter, pmEchoTransport, pmEchoOrigin, pmRetry, pmAlways503,
+    pmEchoRetryAfter, pmEchoTransport, pmEchoOrigin, pmEchoSchema, pmRetry, pmAlways503,
     pmCheckpointAfter, pmFakeCreated, pmTamperSignature, pmTamperSnapshot,
     pmSwitchBackend);
 
@@ -331,6 +331,10 @@ begin
         if IsDiscovery then
           Body := StringReplace(Body, 'origin = "' + Base + '"',
             'origin = "' + Base + '/' + Token + '"', []);
+      pmEchoSchema:
+        if IsDiscovery then
+          Body := StringReplace(Body, 'schema = "' + RegistryProgramName
+            + '-registry-discovery-v1"', 'schema = "' + Token + '"', []);
       pmEchoLocation:
         if IsRecord then
           Response.Head := WithHeader(Response.Head, 'Location',
@@ -519,7 +523,14 @@ begin
   ExpectRefused(PublishThroughProxy('echo-lib', 'a'), 'registry: unexpected_response: ');
   FProxy.SetMode(pmEchoOrigin);
   ExpectRefused(PublishThroughProxy('echo-lib', 'a'),
-    'registry: checkpoint_origin_mismatch: ');
+    'registry: checkpoint_origin_mismatch: the checkpoint names a different '
+    + 'origin than discovery' + LineEnding);
+  { The verifier quotes an unsupported schema value; only fixed local text
+    reaches the output. }
+  FProxy.SetMode(pmEchoSchema);
+  ExpectRefused(PublishThroughProxy('echo-lib', 'a'),
+    'registry: unsupported_registry_schema: the origin sent a document with '
+    + 'an unsupported schema' + LineEnding);
   { A transport error whose text would carry it is redacted. }
   FProxy.SetMode(pmEchoTransport);
   Run := PublishThroughProxy('echo-lib', 'a');
@@ -585,7 +596,8 @@ end;
 procedure TRegistryPublishHostileE2E.TestTamperedSignatureOrSnapshotFails;
 begin
   StartProxiedOrigin(pmTamperSignature);
-  ExpectRefused(PublishThroughProxy('signed-lib', 'a'), 'registry: signature_invalid: ');
+  ExpectRefused(PublishThroughProxy('signed-lib', 'a'), 'registry: signature_invalid: '
+    + 'the checkpoint signature does not verify' + LineEnding);
   Expect<Integer>(FOrigin.LatestSequence).ToBe(2);
   FProxy.SetMode(pmTamperSnapshot);
   ExpectRefused(PublishThroughProxy('snapshot-lib', 'a'),

@@ -376,8 +376,11 @@ begin
     Exit;
   end;
   if not TryParseHTTPDate(Value, ANowUTC, Date) then Exit(-1);
-  Seconds := SecondsBetween(Date, ANowUTC);
-  if Date <= ANowUTC then Exit(0);
+  { Whole milliseconds remaining, rounded up to whole seconds: the wait is
+    never shorter than the server asked for. }
+  Seconds := Round((Date - ANowUTC) * MSecsPerDay);
+  if Seconds <= 0 then Exit(0);
+  Seconds := (Seconds + 999) div 1000;
   if Seconds > RegistryPublishMaximumBackoffSeconds then
     Seconds := RegistryPublishMaximumBackoffSeconds;
   Result := Seconds;
@@ -1038,6 +1041,64 @@ begin
   end;
 end;
 
+const
+  VERIFICATION_MESSAGES: array[0..35, 0..1] of string = (
+    ('non_canonical_document', 'the origin sent a document that is not in canonical form'),
+    ('unsupported_registry_schema', 'the origin sent a document with an unsupported schema'),
+    ('unsupported_registry_protocol', 'the origin does not speak registry protocol 1'),
+    ('unsupported_registry_signature', 'the origin uses an unsupported signature algorithm'),
+    ('invalid_registry_signature_encoding', 'a signature is not encoded canonically'),
+    ('rotation_chain_invalid', 'the key rotation chain does not verify from the pinned key'),
+    ('registry_key_rotation_incomplete', 'the key rotation chain does not reach the checkpoint key'),
+    ('registry_rotation_origin_mismatch', 'a key rotation names a different origin'),
+    ('registry_rotation_capability_mismatch', 'discovery and capabilities disagree about key rotation'),
+    ('invalid_registry_rotation_page', 'a key rotation page is invalid'),
+    ('registry_key_pin_mismatch', 'a key record does not match the pinned key'),
+    ('snapshot_consistency_failed', 'the verified history does not extend the head seen before publication'),
+    ('snapshot_hash_mismatch', 'a snapshot does not match its hash'),
+    ('duplicate_package_identity', 'a snapshot lists one package identity twice'),
+    ('identity_conflict', 'the verified history changes published content'),
+    ('record_hash_mismatch', 'a package record does not match its hash'),
+    ('registry_record_hash_mismatch', 'a package record does not match its hash'),
+    ('invalid_registry_record', 'a package record is invalid'),
+    ('proof_limit_exceeded', 'the origin''s proof exceeds the verification limits'),
+    ('signature_payload_mismatch', 'the checkpoint signature names a different checkpoint'),
+    ('signature_key_mismatch', 'the signature names a different key than its checkpoint'),
+    ('signature_invalid', 'the checkpoint signature does not verify'),
+    ('checkpoint_origin_mismatch', 'the checkpoint names a different origin than discovery'),
+    ('checkpoint_equivocation', 'the origin signed conflicting checkpoints'),
+    ('checkpoint_downgrade', 'the origin served a checkpoint older than the head seen before publication'),
+    ('checkpoint_renewal_rollback', 'the origin served an older renewal of the checkpoint'),
+    ('checkpoint_expired', 'the origin''s latest checkpoint has expired'),
+    ('checkpoint_from_future', 'the checkpoint is dated later than the local clock'),
+    ('checkpoint_lifetime_exceeded', 'the checkpoint is valid for longer than the protocol allows'),
+    ('local_clock_behind_accepted_state', 'the local clock is behind the verified checkpoint'),
+    ('invalid_registry_checkpoint', 'the checkpoint is invalid'),
+    ('invalid_registry_role', 'discovery names an unknown registry role'),
+    ('invalid_registry_discovery_uri', 'discovery names an invalid endpoint URL'),
+    ('registry_discovery_scope_mismatch', 'discovery names an endpoint outside the origin named by --origin'),
+    ('registry_origin_mismatch', 'discovery changed the origin identity between requests'),
+    ('registry_capability_missing', 'the origin does not advertise a required capability'));
+  VERIFICATION_FAILED = 'registry_verification_failed';
+  VERIFICATION_GENERIC = 'the origin''s registry documents failed verification';
+
+{ '<code>: <fixed local text>' for a verification or protocol failure. The
+  code is a constant of LWPT's own verifier; the text is chosen here, so
+  nothing the verifier quoted from a response can reach the output. }
+function LocalRegistryFailure(const AMessage: string): string;
+var
+  Code: string;
+  Index: Integer;
+begin
+  Code := RegistryErrorCode(AMessage);
+  if not CodeGrammarIsValid(Code) then Exit(VERIFICATION_FAILED + ': '
+    + VERIFICATION_GENERIC);
+  for Index := 0 to High(VERIFICATION_MESSAGES) do
+    if VERIFICATION_MESSAGES[Index, 0] = Code then
+      Exit(Code + ': ' + VERIFICATION_MESSAGES[Index, 1]);
+  Result := Code + ': ' + VERIFICATION_GENERIC;
+end;
+
 function PublishToRegistry(
   const AOptions: TLWPTRegistryPublishOptions): TLWPTRegistryPublishResult;
 var
@@ -1052,7 +1113,10 @@ begin
       on E: ELWPTRegistryPublishError do
         Message := E.Message;
       on E: ELWPTRegistryError do
-        Message := E.Message;
+        { Verification and protocol failures: the stable code with local
+          text, never the verifier's own message, which may quote
+          response content. }
+        Message := LocalRegistryFailure(E.Message);
       on E: ELWPTArchiveError do
         Message := E.Message;
       on E: EHTTPError do
