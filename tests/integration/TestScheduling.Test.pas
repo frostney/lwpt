@@ -2574,7 +2574,7 @@ begin
     { This fixture needs only to register before a clean exit. Starting the
       production forwarding threads here races immediate process shutdown on
       Win32 and is unrelated to the already-empty Job Object contract. }
-    WriteTextFile(APIDFile, IntToStr(GetProcessID));
+    PublishReadablePayload(APIDFile, IntToStr(GetProcessID));
     Exit(0);
   end;
   PublishReadablePayload(APIDFile + '-descendant', IntToStr(GetProcessID));
@@ -2827,7 +2827,7 @@ begin
   if Mode = InheritedChannelProbeProxyMode then
   begin
     InstallProcessTreeSignalForwarding;
-    WriteTextFile(PIDFile, IntToStr(GetProcessID));
+    PublishReadablePayload(PIDFile, IntToStr(GetProcessID));
     Sleep(LongRunningFixtureMilliseconds);
     Exit(0);
   end;
