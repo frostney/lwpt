@@ -659,7 +659,7 @@ begin
   Origin := TSyntheticContact.Create(Registry, '/short');
   try
     Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
-    ExpiresAt := RegistryStamp(10);
+    ExpiresAt := RegistryStamp(15);
     Registry.Publish(RegistryStamp(-60), ExpiresAt);
     WriteTextFile(CaseRoot + '/project/lwpt.toml', '[package]'#10
       + 'name = "consumer"'#10 + 'version = "1.0.0"'#10

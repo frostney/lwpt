@@ -2707,7 +2707,7 @@ var
   Claims: TLWPTRegistryLockedClaims;
   Index: Integer;
 
-  function Read(const AHash: string): TBytes;
+  function ReadDocument(const AHash: string): TBytes;
   begin
     Result := ReadLockedRegistryProofDocument(AArchivesRoot, AStateRoot, AHash);
   end;
@@ -2727,21 +2727,21 @@ begin
     if Length(ATable.Rotations) div 3
        > DefaultRegistryVerificationLimits.Rotations then
       raise ELWPTRegistryError.Create('proof_limit_exceeded: rotations');
-    ASelection.Checkpoint := Read(ATable.Checkpoint);
-    ASelection.Signature := Read(ATable.Signature);
-    ASelection.Snapshot := Read(ATable.Snapshot);
+    ASelection.Checkpoint := ReadDocument(ATable.Checkpoint);
+    ASelection.Signature := ReadDocument(ATable.Signature);
+    ASelection.Snapshot := ReadDocument(ATable.Snapshot);
     SetLength(ASelection.Rotations, Length(ATable.Rotations) div 3);
     for Index := 0 to High(ASelection.Rotations) do
     begin
-      ASelection.Rotations[Index].Document := Read(ATable.Rotations[3 * Index]);
+      ASelection.Rotations[Index].Document := ReadDocument(ATable.Rotations[3 * Index]);
       ASelection.Rotations[Index].OldSignature :=
-        Read(ATable.Rotations[3 * Index + 1]);
+        ReadDocument(ATable.Rotations[3 * Index + 1]);
       ASelection.Rotations[Index].NewSignature :=
-        Read(ATable.Rotations[3 * Index + 2]);
+        ReadDocument(ATable.Rotations[3 * Index + 2]);
     end;
     SetLength(ASelection.Records, Length(ARecords));
     for Index := 0 to High(ARecords) do
-      ASelection.Records[Index] := Read(ARecords[Index].RecordHash);
+      ASelection.Records[Index] := ReadDocument(ARecords[Index].RecordHash);
     Claims := Default(TLWPTRegistryLockedClaims);
     Claims.Checkpoint := ATable.Checkpoint;
     Claims.Signature := ATable.Signature;
