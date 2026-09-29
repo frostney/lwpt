@@ -931,7 +931,8 @@ begin
           AddTextScopes(Builder.Text, Builder.Lines, ALabel + ' fixture ',
             Builder.GlueKeys, Builder.GlueLooseKeys, False, AScopes);
         except
-          on ELWPTPascalAnalysisError do ;
+          { A string that does not tokenize is not fixture source. }
+          on ELWPTPascalAnalysisError do Builder.Text := '';
         end;
     finally
       Builder.GlueLooseKeys.Free;
