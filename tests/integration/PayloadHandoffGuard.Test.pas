@@ -8,32 +8,48 @@
   fixed one site at a time while sibling sites kept the bug, so this program
   scans the repository's test code and fails when the pattern returns.
 
-  The scan is token-level. Comments are dropped, and string literals are
-  scanned as the Pascal source they usually carry, so generated fixture
-  programs are checked too. Three rules:
+  Each file is read with the repository's own Pascal tokenizer and routine
+  analysis (LWPT.Analysis.Pascal), so comments, strings, and routine bodies
+  are the compiler's, not a text search's. A string expression that decodes
+  to code is tokenized again as a generated fixture program, with every
+  spliced-in Pascal value (PascalString(X), IntToStr(...)) kept as a
+  placeholder that carries X's expression, and every
+  EmitPayloadCompletion(..., P) turned into a completion call on P. Payload
+  expressions are compared by their normalized tokens, with the Delphi
+  parameter prefix (APath -> Path) dropped. Four rules, each within one
+  routine body or one generated fixture:
 
-    raw-pid-write     A process ID reaches a file through a raw write: a
-                      Write* helper with the PID in a content argument,
-                      Write/WriteLn to a text-file variable, or X.Text :=
-                      or X.Add/Append with the PID followed by
-                      X.SaveToFile. A PID file exists only to be read by
-                      another process. The write passes when
-                      PublishPayloadCompletion or EmitPayloadCompletion
-                      follows within four statements; otherwise use
-                      PublishReadablePayload.
-    polled-raw-read   A routine polls FileExists(E) in a loop and reads E
-                      with a raw reader. Existence is not read ownership.
-    payload-raw-read  A routine gates E with PayloadIsReadable but reads it
-                      with a raw reader instead of ReadPayloadText.
+    raw-pid-write            A process ID is written to a file by a raw write
+                             (a Write* helper with the PID in a content
+                             argument, Write/WriteLn to a text file assigned
+                             to a path, or X.Text := / X.Add(...) with the
+                             PID followed by X.SaveToFile(path)), and no later
+                             PublishPayloadCompletion call in the same body
+                             names the same path. Use PublishReadablePayload.
+    polled-raw-read          FileExists(E) is called inside a while, for, or
+                             repeat loop and E is read with a raw reader.
+    payload-raw-read         E is gated by PayloadIsReadable but read without
+                             ReadPayloadText.
+    existence-polled-payload FileExists(E) is polled in a loop although E is
+                             published with PublishReadablePayload or a
+                             completion marker somewhere in the same file.
+                             The waiter can advance, and cancel its writer,
+                             between the payload and its marker.
 
-  Atomic writers (AtomicWrite*, write-then-rename) publish complete content
-  and are outside the rules. PIDs passed through an intermediate variable,
-  and polling helpers that read in a different routine, are out of reach
-  of a token scan; the rules target the shapes that actually recurred.
+  Limits: expressions are matched by text, so the same path under two
+  different variable names (a test's Marker handed to a proxy that calls it
+  PIDFile) is not recognized; PIDs passed through an intermediate variable,
+  and polling helpers whose reader lives in another routine, are out of
+  reach; include files are not followed; a string expression is treated as
+  a fixture only when it tokenizes as Pascal, and fixture source nested
+  inside a fixture's own literals is not decoded again. Atomic writers
+  (AtomicWrite*, write-then-rename) publish complete content and are outside
+  the rules.
 
-  Justified exceptions go in HandoffAllowlist, each with its reason. A
-  stale allowance fails the run, and self-tests prove every rule still
-  detects the historical violations. }
+  Justified exceptions go in HandoffAllowlist. An allowance names one site:
+  file, rule, routine, and the payload expression. It fails the run when it
+  matches no finding or more than one, and self-tests prove every rule
+  still detects the historical violations. }
 
 program PayloadHandoffGuard.Test;
 
@@ -42,7 +58,9 @@ program PayloadHandoffGuard.Test;
 uses
   Classes,
   SysUtils,
+  Types,
 
+  LWPT.Analysis.Pascal,
   TestingPascalLibrary,
   Tests.Scratch;
 
@@ -50,11 +68,9 @@ const
   RulePIDWrite = 'raw-pid-write';
   RulePolledRead = 'polled-raw-read';
   RulePayloadRead = 'payload-raw-read';
-  { Statements after a raw write that may publish its completion marker. }
-  CompletionWindowStatements = 4;
-  { Statements after X.Text := <pid> that may save X. }
-  SaveWindowStatements = 3;
-  EvidenceLimit = 160;
+  RulePolledPayload = 'existence-polled-payload';
+  RuleUnscannable = 'unscannable';
+  GluePrefix = 'lwpthandoffglue';
   { The self-tests below embed violating snippets as literals. }
   GuardProgramPath = 'tests/integration/PayloadHandoffGuard.Test.pas';
   { A scan that finds almost nothing is scanning the wrong tree. }
@@ -65,6 +81,8 @@ type
     Path: string;
     Line: Integer;
     Rule: string;
+    Routine: string;
+    Key: string;
     Evidence: string;
   end;
   THandoffFindings = array of THandoffFinding;
@@ -72,23 +90,26 @@ type
   THandoffAllowance = record
     Path: string;
     Rule: string;
-    { A substring of the finding's evidence. }
-    Evidence: string;
+    Routine: string;
+    { The normalized payload expression the finding reports. }
+    Key: string;
   end;
+  THandoffAllowances = array of THandoffAllowance;
 
-  TScanToken = record
-    Text: string;
-    Lower: string;
-    Line: Integer;
+  TGuardToken = record
+    Kind: TLWPTPascalTokenKind;
+    Text: string;     { lower case for identifiers and keywords }
+    Original: string; { the source spelling }
+    Line: Integer;    { line in the scanned file }
+    GlueKey: string;  { a fixture placeholder's spliced-in expression }
   end;
-  TScanTokens = array of TScanToken;
+  TGuardTokens = array of TGuardToken;
 
-  TScanStatement = record
-    First: Integer;
-    Last: Integer;
-    Routine: Integer;
+  TGuardScope = record
+    Routine: string;
+    Tokens: TGuardTokens;
   end;
-  TScanStatements = array of TScanStatement;
+  TGuardScopes = array of TGuardScope;
 
   TTokenRange = record
     First: Integer;
@@ -100,23 +121,34 @@ type
   public
     procedure SetupTests; override;
     procedure TestRepositoryFollowsTheProtocol;
-    procedure TestEveryAllowanceStillMatches;
+    procedure TestEveryAllowanceMatchesOneSite;
     procedure TestScanCoversTheTestTree;
     procedure TestRawPIDWritesAreDetected;
+    procedure TestCompletionMustNameThePayload;
     procedure TestExistenceGatedReadsAreDetected;
+    procedure TestPublishedPayloadPollsAreDetected;
     procedure TestPublishedHandoffsPass;
     procedure TestUnrelatedPIDUsesPass;
   end;
 
-type
-  THandoffAllowances = array of THandoffAllowance;
-
-{ Justified exceptions. Each entry names the file, the rule, and a
-  substring of the finding's evidence, and carries a comment saying why the
-  site is not a cross-process handoff. Empty while no exception is needed. }
+{ Justified exceptions, one site each, with the reason beside the entry. }
 function HandoffAllowlist: THandoffAllowances;
+
+  procedure Allow(const APath, ARule, ARoutine, AKey: string);
+  begin
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)].Path := APath;
+    Result[High(Result)].Rule := ARule;
+    Result[High(Result)].Routine := ARoutine;
+    Result[High(Result)].Key := AKey;
+  end;
+
 begin
   Result := nil;
+  { A delegation report the parent reads only after this utility exits
+    (RunUtility waits for it); the PID is diagnostic text in the report. }
+  Allow('source/LWPT.WorkerBudget.Test.pas', RulePIDWrite, 'runchildmode',
+    'outputpath');
 end;
 
 function AllowanceMatches(const AAllowance: THandoffAllowance;
@@ -124,211 +156,34 @@ function AllowanceMatches(const AAllowance: THandoffAllowance;
 begin
   Result := (AAllowance.Path = AFinding.Path)
     and (AAllowance.Rule = AFinding.Rule)
-    and (Pos(AAllowance.Evidence, AFinding.Evidence) > 0);
+    and (AAllowance.Routine = AFinding.Routine)
+    and (AAllowance.Key = AFinding.Key);
 end;
 
-function BuildScanText(const ASource: string): string;
-var
-  Index, Length_, Written: Integer;
+function IsCodeToken(const AToken: TGuardToken): Boolean;
 begin
-  Length_ := Length(ASource);
-  { Every transformation below emits at most as many characters as it
-    consumes, so the source length bounds the scan text. }
-  SetLength(Result, Length_);
-  Written := 0;
-  Index := 1;
-  while Index <= Length_ do
-  begin
-    if ASource[Index] = '{' then
-    begin
-      Inc(Index);
-      while (Index <= Length_) and (ASource[Index] <> '}') do
-      begin
-        if ASource[Index] = #10 then
-        begin
-          Inc(Written);
-          Result[Written] := #10;
-        end;
-        Inc(Index);
-      end;
-      Inc(Index);
-      Inc(Written);
-      Result[Written] := ' ';
-    end
-    else if (ASource[Index] = '(') and (Index < Length_)
-      and (ASource[Index + 1] = '*') then
-    begin
-      Inc(Index, 2);
-      while (Index < Length_)
-        and not ((ASource[Index] = '*') and (ASource[Index + 1] = ')')) do
-      begin
-        if ASource[Index] = #10 then
-        begin
-          Inc(Written);
-          Result[Written] := #10;
-        end;
-        Inc(Index);
-      end;
-      Inc(Index, 2);
-      Inc(Written);
-      Result[Written] := ' ';
-    end
-    else if (ASource[Index] = '/') and (Index < Length_)
-      and (ASource[Index + 1] = '/') then
-    begin
-      while (Index <= Length_) and (ASource[Index] <> #10) do Inc(Index);
-      Inc(Written);
-      Result[Written] := ' ';
-    end
-    else if ASource[Index] = '''' then
-    begin
-      { Keep the literal's decoded content: generated fixture programs are
-        Pascal source held in literals. }
-      Inc(Written);
-      Result[Written] := ' ';
-      Inc(Index);
-      while (Index <= Length_) and (ASource[Index] <> #10) do
-      begin
-        if ASource[Index] = '''' then
-        begin
-          if (Index < Length_) and (ASource[Index + 1] = '''') then
-          begin
-            Inc(Written);
-            Result[Written] := '''';
-            Inc(Index, 2);
-            Continue;
-          end;
-          Inc(Index);
-          Break;
-        end;
-        Inc(Written);
-        Result[Written] := ASource[Index];
-        Inc(Index);
-      end;
-      Inc(Written);
-      Result[Written] := ' ';
-    end
-    else if ASource[Index] = '#' then
-    begin
-      Inc(Index);
-      if (Index <= Length_) and (ASource[Index] = '$') then Inc(Index);
-      while (Index <= Length_)
-        and (ASource[Index] in ['0'..'9', 'A'..'F', 'a'..'f']) do
-        Inc(Index);
-      Inc(Written);
-      Result[Written] := ' ';
-    end
-    else
-    begin
-      Inc(Written);
-      Result[Written] := ASource[Index];
-      Inc(Index);
-    end;
-  end;
-  SetLength(Result, Written);
+  Result := AToken.Kind in [ptIdentifier, ptKeyword];
 end;
 
-function Tokenize(const AText: string): TScanTokens;
-var
-  Count, Index, Line, Start: Integer;
-
-  procedure Add(const AToken: string);
-  begin
-    if Count = Length(Result) then SetLength(Result, Count * 2 + 64);
-    Result[Count].Text := AToken;
-    Result[Count].Lower := LowerCase(AToken);
-    Result[Count].Line := Line;
-    Inc(Count);
-  end;
-
+function TokenIs(const ATokens: TGuardTokens; AIndex: Integer;
+  const AText: string): Boolean;
 begin
-  Result := nil;
-  Count := 0;
-  Line := 1;
-  Index := 1;
-  while Index <= Length(AText) do
-  begin
-    if AText[Index] = #10 then
-    begin
-      Inc(Line);
-      Inc(Index);
-    end
-    else if AText[Index] <= ' ' then
-      Inc(Index)
-    else if AText[Index] in ['A'..'Z', 'a'..'z', '_', '0'..'9'] then
-    begin
-      Start := Index;
-      while (Index <= Length(AText))
-        and (AText[Index] in ['A'..'Z', 'a'..'z', '_', '0'..'9']) do
-        Inc(Index);
-      Add(Copy(AText, Start, Index - Start));
-    end
-    else if (AText[Index] = ':') and (Index < Length(AText))
-      and (AText[Index + 1] = '=') then
-    begin
-      Add(':=');
-      Inc(Index, 2);
-    end
-    else
-    begin
-      Add(AText[Index]);
-      Inc(Index);
-    end;
-  end;
-  SetLength(Result, Count);
+  Result := (AIndex >= 0) and (AIndex <= High(ATokens))
+    and (ATokens[AIndex].Kind <> ptString) and (ATokens[AIndex].Text = AText);
 end;
 
-function IsRoutineKeyword(const ALower: string): Boolean;
-begin
-  Result := (ALower = 'procedure') or (ALower = 'function')
-    or (ALower = 'constructor') or (ALower = 'destructor');
-end;
-
-function SplitStatements(const ATokens: TScanTokens): TScanStatements;
-var
-  Count, Index, Routine, Start: Integer;
-
-  procedure Add(AFirst, ALast: Integer);
-  begin
-    if ALast < AFirst then Exit;
-    if Count = Length(Result) then SetLength(Result, Count * 2 + 64);
-    Result[Count].First := AFirst;
-    Result[Count].Last := ALast;
-    Result[Count].Routine := Routine;
-    Inc(Count);
-  end;
-
-begin
-  Result := nil;
-  Count := 0;
-  Routine := 0;
-  Start := 0;
-  for Index := 0 to High(ATokens) do
-  begin
-    if (Index = Start) and IsRoutineKeyword(ATokens[Index].Lower) then
-      Inc(Routine);
-    if ATokens[Index].Text = ';' then
-    begin
-      Add(Start, Index - 1);
-      Start := Index + 1;
-    end;
-  end;
-  Add(Start, High(ATokens));
-  SetLength(Result, Count);
-end;
-
-{ Splits the arguments of the call whose '(' is at AOpen, stopping at ALast
-  when the call is not closed within the statement. }
-function CallArguments(const ATokens: TScanTokens;
-  AOpen, ALast: Integer; out AClosed: Boolean): TTokenRanges;
+{ Paren- and bracket-balanced arguments of the call whose '(' is at AOpen.
+  AClosed is False when the tokens end before the call does. }
+function CallArguments(const ATokens: TGuardTokens; AOpen: Integer;
+  out AClosed: Boolean): TTokenRanges;
 var
   Depth, Index, Start: Integer;
 
-  procedure Add(AFirst, AArgumentLast: Integer);
+  procedure Add(AFirst, ALast: Integer);
   begin
     SetLength(Result, Length(Result) + 1);
     Result[High(Result)].First := AFirst;
-    Result[High(Result)].Last := AArgumentLast;
+    Result[High(Result)].Last := ALast;
   end;
 
 begin
@@ -336,41 +191,85 @@ begin
   AClosed := False;
   Depth := 0;
   Start := AOpen + 1;
-  for Index := AOpen to ALast do
+  for Index := AOpen to High(ATokens) do
   begin
-    if (ATokens[Index].Text = '(') or (ATokens[Index].Text = '[') then
+    if TokenIs(ATokens, Index, '(') or TokenIs(ATokens, Index, '[') then
       Inc(Depth)
-    else if (ATokens[Index].Text = ')') or (ATokens[Index].Text = ']') then
+    else if TokenIs(ATokens, Index, ')') or TokenIs(ATokens, Index, ']') then
     begin
       Dec(Depth);
       if Depth = 0 then
       begin
-        Add(Start, Index - 1);
+        if Index > Start then Add(Start, Index - 1);
         AClosed := True;
         Exit;
       end;
     end
-    else if (ATokens[Index].Text = ',') and (Depth = 1) then
+    else if TokenIs(ATokens, Index, ',') and (Depth = 1) then
     begin
       Add(Start, Index - 1);
       Start := Index + 1;
     end;
   end;
-  Add(Start, ALast);
 end;
 
-function IsPIDToken(const ATokens: TScanTokens; AIndex: Integer): Boolean;
-var
-  Lower: string;
+function IsCallAt(const ATokens: TGuardTokens; AIndex: Integer;
+  const AName: string): Boolean;
 begin
-  Lower := ATokens[AIndex].Lower;
-  Result := (Lower = 'getprocessid') or (Lower = 'getcurrentprocessid')
-    or (Lower = 'fpgetpid') or (Lower = 'getpid')
-    or ((Lower = 'processid') and (AIndex > 0)
-      and (ATokens[AIndex - 1].Text = '.'));
+  Result := IsCodeToken(ATokens[AIndex]) and (ATokens[AIndex].Text = AName)
+    and TokenIs(ATokens, AIndex + 1, '(');
 end;
 
-function RangeHasPID(const ATokens: TScanTokens;
+function NormalizedIdentifier(const AToken: TGuardToken): string;
+begin
+  Result := AToken.Text;
+  { Delphi parameters carry an A prefix: APIDFile and PIDFile name the same
+    path on the two sides of a handoff. }
+  if (Length(AToken.Original) > 2) and (AToken.Original[1] = 'A')
+     and (AToken.Original[2] in ['A'..'Z']) then
+    Delete(Result, 1, 1);
+end;
+
+function RangeKey(const ATokens: TGuardTokens;
+  const ARange: TTokenRange): string;
+var
+  Index: Integer;
+begin
+  Result := '';
+  for Index := ARange.First to ARange.Last do
+    if ATokens[Index].GlueKey <> '' then
+      Result := Result + ATokens[Index].GlueKey
+    else if ATokens[Index].Kind = ptIdentifier then
+      Result := Result + NormalizedIdentifier(ATokens[Index])
+    else if ATokens[Index].Kind = ptString then
+      Result := Result + ATokens[Index].Original
+    else
+      Result := Result + ATokens[Index].Text;
+end;
+
+function FirstArgumentKey(const ATokens: TGuardTokens; AOpen: Integer;
+  out AKey: string): Boolean;
+var
+  Arguments: TTokenRanges;
+  Closed: Boolean;
+begin
+  Arguments := CallArguments(ATokens, AOpen, Closed);
+  Result := Length(Arguments) > 0;
+  if Result then AKey := RangeKey(ATokens, Arguments[0]);
+end;
+
+function IsPIDToken(const ATokens: TGuardTokens; AIndex: Integer): Boolean;
+var
+  Text: string;
+begin
+  if not IsCodeToken(ATokens[AIndex]) then Exit(False);
+  Text := ATokens[AIndex].Text;
+  Result := (Text = 'getprocessid') or (Text = 'getcurrentprocessid')
+    or (Text = 'fpgetpid') or (Text = 'getpid')
+    or ((Text = 'processid') and TokenIs(ATokens, AIndex - 1, '.'));
+end;
+
+function RangeHasPID(const ATokens: TGuardTokens;
   const ARange: TTokenRange): Boolean;
 var
   Index: Integer;
@@ -380,260 +279,338 @@ begin
   Result := False;
 end;
 
-function RangeKey(const ATokens: TScanTokens;
-  const ARange: TTokenRange): string;
-var
-  Index: Integer;
+{ Loop bodies ------------------------------------------------------------ }
+
+function OpensBlock(const ATokens: TGuardTokens; AIndex: Integer): Boolean;
 begin
-  Result := '';
-  for Index := ARange.First to ARange.Last do
-    Result := Result + ATokens[Index].Lower;
+  Result := TokenIs(ATokens, AIndex, 'begin') or TokenIs(ATokens, AIndex, 'try')
+    or TokenIs(ATokens, AIndex, 'case') or TokenIs(ATokens, AIndex, 'asm')
+    or TokenIs(ATokens, AIndex, 'record');
 end;
 
-function StatementEvidence(const ATokens: TScanTokens;
-  const AStatement: TScanStatement): string;
+function MatchingEnd(const ATokens: TGuardTokens; AOpen: Integer): Integer;
 var
-  Index: Integer;
+  Depth, Index: Integer;
 begin
-  Result := '';
-  for Index := AStatement.First to AStatement.Last do
-  begin
-    if Result <> '' then Result := Result + ' ';
-    Result := Result + ATokens[Index].Text;
-    if Length(Result) >= EvidenceLimit then
-      Exit(Copy(Result, 1, EvidenceLimit));
-  end;
-end;
-
-function IsConsoleFile(const ALower: string): Boolean;
-begin
-  Result := (ALower = 'output') or (ALower = 'erroutput')
-    or (ALower = 'stdout') or (ALower = 'stderr') or (ALower = 'input');
-end;
-
-{ True when the call at AIndex (identifier followed by '(') writes a PID
-  into file content without publishing it. }
-function IsRawPIDWriteCall(const ATokens: TScanTokens;
-  const AStatement: TScanStatement; AIndex: Integer): Boolean;
-var
-  Arguments: TTokenRanges;
-  ArgumentIndex: Integer;
-  Closed, Qualified: Boolean;
-  Lower: string;
-begin
-  Result := False;
-  Lower := ATokens[AIndex].Lower;
-  if Copy(Lower, 1, 5) <> 'write' then Exit;
-  if (Lower = 'writefile') or (Lower = 'writebuffer') then Exit;
-  Qualified := (AIndex > 0) and (ATokens[AIndex - 1].Text = '.');
-  Arguments := CallArguments(ATokens, AIndex + 1, AStatement.Last, Closed);
-  { An unclosed call spans generated fixture source; the writes inside it
-    are checked on their own. }
-  if not Closed or (Length(Arguments) < 2) then Exit;
-  if (Lower = 'write') or (Lower = 'writeln') then
-  begin
-    { Only Write(TextFile, ...) reaches a file; stream methods and console
-      output do not. }
-    if Qualified then Exit;
-    if Arguments[0].First <> Arguments[0].Last then Exit;
-    if IsConsoleFile(ATokens[Arguments[0].First].Lower)
-      or IsPIDToken(ATokens, Arguments[0].First) then Exit;
-  end;
-  for ArgumentIndex := 1 to High(Arguments) do
-    if RangeHasPID(ATokens, Arguments[ArgumentIndex]) then Exit(True);
-end;
-
-function StatementHasToken(const ATokens: TScanTokens;
-  const AStatement: TScanStatement; const ALower: string): Boolean;
-var
-  Index: Integer;
-begin
-  for Index := AStatement.First to AStatement.Last do
-    if ATokens[Index].Lower = ALower then Exit(True);
-  Result := False;
-end;
-
-function CompletionFollows(const ATokens: TScanTokens;
-  const AStatements: TScanStatements; AStatementIndex: Integer): Boolean;
-var
-  Index: Integer;
-begin
-  for Index := AStatementIndex to AStatementIndex
-    + CompletionWindowStatements do
-  begin
-    if Index > High(AStatements) then Break;
-    if StatementHasToken(ATokens, AStatements[Index],
-         'publishpayloadcompletion')
-       or StatementHasToken(ATokens, AStatements[Index],
-         'emitpayloadcompletion') then Exit(True);
-  end;
-  Result := False;
-end;
-
-{ Returns the statement index saving collection AName within the window,
-  and the token index of its SaveToFile, or -1. }
-function FindSaveToFile(const ATokens: TScanTokens;
-  const AStatements: TScanStatements; AFrom: Integer; const AName: string;
-  out ATokenIndex: Integer): Integer;
-var
-  Index, StatementIndex: Integer;
-begin
-  ATokenIndex := -1;
-  for StatementIndex := AFrom to AFrom + SaveWindowStatements do
-  begin
-    if StatementIndex > High(AStatements) then Break;
-    for Index := AStatements[StatementIndex].First
-      to AStatements[StatementIndex].Last - 3 do
-      if (ATokens[Index].Lower = AName) and (ATokens[Index + 1].Text = '.')
-         and (ATokens[Index + 2].Lower = 'savetofile')
-         and (ATokens[Index + 3].Text = '(') then
-      begin
-        ATokenIndex := Index + 2;
-        Exit(StatementIndex);
-      end;
-  end;
-  Result := -1;
-end;
-
-{ Name of a collection filled with a PID in this statement, or ''. }
-function PIDFilledCollection(const ATokens: TScanTokens;
-  const AStatement: TScanStatement): string;
-var
-  Arguments: TTokenRanges;
-  Closed: Boolean;
-  Index, ArgumentIndex: Integer;
-  Member: string;
-  Rest: TTokenRange;
-begin
-  Result := '';
-  for Index := AStatement.First to AStatement.Last - 3 do
-  begin
-    if ATokens[Index + 1].Text <> '.' then Continue;
-    Member := ATokens[Index + 2].Lower;
-    if (Member = 'text') and (ATokens[Index + 3].Text = ':=') then
+  Depth := 0;
+  for Index := AOpen to High(ATokens) do
+    if OpensBlock(ATokens, Index) then Inc(Depth)
+    else if TokenIs(ATokens, Index, 'end') then
     begin
-      Rest.First := Index + 4;
-      Rest.Last := AStatement.Last;
-      if RangeHasPID(ATokens, Rest) then Exit(ATokens[Index].Lower);
-    end
-    else if ((Member = 'add') or (Member = 'append'))
-      and (ATokens[Index + 3].Text = '(') then
-    begin
-      Arguments := CallArguments(ATokens, Index + 3, AStatement.Last,
-        Closed);
-      for ArgumentIndex := 0 to High(Arguments) do
-        if RangeHasPID(ATokens, Arguments[ArgumentIndex]) then
-          Exit(ATokens[Index].Lower);
+      Dec(Depth);
+      if Depth = 0 then Exit(Index);
     end;
+  Result := High(ATokens);
+end;
+
+function MatchingUntil(const ATokens: TGuardTokens; ARepeat: Integer): Integer;
+var
+  Depth, Index: Integer;
+begin
+  Depth := 0;
+  for Index := ARepeat to High(ATokens) do
+    if TokenIs(ATokens, Index, 'repeat') then Inc(Depth)
+    else if TokenIs(ATokens, Index, 'until') then
+    begin
+      Dec(Depth);
+      if Depth = 0 then Exit(Index);
+    end;
+  Result := High(ATokens);
+end;
+
+{ Last token of the simple statement or expression starting at AStart. }
+function SimpleStatementEnd(const ATokens: TGuardTokens;
+  AStart: Integer): Integer;
+var
+  Blocks, Ifs, Index, Parens: Integer;
+begin
+  Blocks := 0;
+  Ifs := 0;
+  Parens := 0;
+  for Index := AStart to High(ATokens) do
+  begin
+    if TokenIs(ATokens, Index, '(') or TokenIs(ATokens, Index, '[') then
+      Inc(Parens)
+    else if TokenIs(ATokens, Index, ')') or TokenIs(ATokens, Index, ']') then
+      Dec(Parens)
+    else if Parens > 0 then
+      Continue
+    else if OpensBlock(ATokens, Index) or TokenIs(ATokens, Index, 'repeat') then
+      Inc(Blocks)
+    else if TokenIs(ATokens, Index, 'end')
+      or TokenIs(ATokens, Index, 'until') then
+    begin
+      if Blocks = 0 then Exit(Index - 1);
+      Dec(Blocks);
+    end
+    else if Blocks > 0 then
+      Continue
+    else if TokenIs(ATokens, Index, 'if') then
+      Inc(Ifs)
+    else if TokenIs(ATokens, Index, 'else') then
+    begin
+      if Ifs = 0 then Exit(Index - 1);
+      Dec(Ifs);
+    end
+    else if TokenIs(ATokens, Index, ';') or TokenIs(ATokens, Index, 'except')
+      or TokenIs(ATokens, Index, 'finally') then
+      Exit(Index - 1);
+  end;
+  Result := High(ATokens);
+end;
+
+function StatementEnd(const ATokens: TGuardTokens; AStart: Integer): Integer;
+begin
+  if AStart > High(ATokens) then Exit(High(ATokens));
+  if OpensBlock(ATokens, AStart) then Exit(MatchingEnd(ATokens, AStart));
+  if TokenIs(ATokens, AStart, 'repeat') then
+    Exit(SimpleStatementEnd(ATokens, MatchingUntil(ATokens, AStart) + 1));
+  Result := SimpleStatementEnd(ATokens, AStart);
+end;
+
+{ Marks every token of every while, for, and repeat loop, condition and
+  body alike. }
+function LoopMask(const ATokens: TGuardTokens): TBooleanDynArray;
+var
+  Index, LoopEnd, Mark, Parens, Search: Integer;
+begin
+  Result := nil;
+  SetLength(Result, Length(ATokens));
+  for Index := 0 to High(ATokens) do
+  begin
+    LoopEnd := -1;
+    if TokenIs(ATokens, Index, 'repeat') then
+      LoopEnd := SimpleStatementEnd(ATokens, MatchingUntil(ATokens, Index) + 1)
+    else if TokenIs(ATokens, Index, 'while') or TokenIs(ATokens, Index, 'for')
+    then
+    begin
+      Parens := 0;
+      Search := Index + 1;
+      while Search <= High(ATokens) do
+      begin
+        if TokenIs(ATokens, Search, '(') then Inc(Parens)
+        else if TokenIs(ATokens, Search, ')') then Dec(Parens)
+        else if (Parens = 0) and TokenIs(ATokens, Search, 'do') then Break;
+        Inc(Search);
+      end;
+      LoopEnd := StatementEnd(ATokens, Search + 1);
+    end;
+    for Mark := Index to LoopEnd do Result[Mark] := True;
   end;
 end;
+
+{ Rules ------------------------------------------------------------------ }
 
 procedure AddFinding(var AFindings: THandoffFindings; const APath: string;
-  ALine: Integer; const ARule, AEvidence: string);
+  const ALines: TStrings; ALine: Integer; const ARule, ARoutine,
+  AKey: string);
 begin
   SetLength(AFindings, Length(AFindings) + 1);
   AFindings[High(AFindings)].Path := APath;
   AFindings[High(AFindings)].Line := ALine;
   AFindings[High(AFindings)].Rule := ARule;
-  AFindings[High(AFindings)].Evidence := AEvidence;
+  AFindings[High(AFindings)].Routine := ARoutine;
+  AFindings[High(AFindings)].Key := AKey;
+  if (ALine >= 1) and (ALine <= ALines.Count) then
+    AFindings[High(AFindings)].Evidence := Trim(ALines[ALine - 1])
+  else
+    AFindings[High(AFindings)].Evidence := '';
 end;
 
-procedure ScanRawPIDWrites(const APath: string; const ATokens: TScanTokens;
-  const AStatements: TScanStatements; var AFindings: THandoffFindings);
+{ Every payload the scope publishes, with the token index of the call. }
+procedure CollectPublications(const ATokens: TGuardTokens;
+  APublished: TStrings);
 var
-  Collection: string;
-  Index, SaveStatement, SaveToken, StatementIndex: Integer;
+  Index: Integer;
+  Key: string;
 begin
-  for StatementIndex := 0 to High(AStatements) do
-  begin
-    for Index := AStatements[StatementIndex].First
-      to AStatements[StatementIndex].Last - 1 do
-      if (ATokens[Index + 1].Text = '(')
-         and IsRawPIDWriteCall(ATokens, AStatements[StatementIndex], Index)
-         and not CompletionFollows(ATokens, AStatements, StatementIndex) then
-        AddFinding(AFindings, APath, ATokens[Index].Line, RulePIDWrite,
-          StatementEvidence(ATokens, AStatements[StatementIndex]));
-    Collection := PIDFilledCollection(ATokens, AStatements[StatementIndex]);
-    if Collection = '' then Continue;
-    SaveStatement := FindSaveToFile(ATokens, AStatements, StatementIndex,
-      Collection, SaveToken);
-    if (SaveStatement >= 0)
-       and not CompletionFollows(ATokens, AStatements, SaveStatement) then
-      AddFinding(AFindings, APath, ATokens[SaveToken].Line, RulePIDWrite,
-        StatementEvidence(ATokens, AStatements[StatementIndex]) + ' ... '
-        + StatementEvidence(ATokens, AStatements[SaveStatement]));
-  end;
+  for Index := 0 to High(ATokens) - 1 do
+    if (IsCallAt(ATokens, Index, 'publishpayloadcompletion')
+        or IsCallAt(ATokens, Index, 'publishreadablepayload'))
+       and FirstArgumentKey(ATokens, Index + 1, Key) then
+      APublished.AddObject(Key, TObject(PtrInt(Index)));
 end;
 
-function IsRawReader(const ALower: string): Boolean;
+function CompletedAfter(APublished: TStrings; AIndex: Integer;
+  const AKey: string): Boolean;
+var
+  Index: Integer;
 begin
-  if ALower = 'loadfromfile' then Exit(True);
-  Result := (Copy(ALower, 1, 4) = 'read') and (ALower <> 'read')
-    and (ALower <> 'readln') and (ALower <> 'readbuffer')
-    and (ALower <> 'readpayloadtext');
+  for Index := 0 to APublished.Count - 1 do
+    if (APublished[Index] = AKey)
+       and (PtrInt(APublished.Objects[Index]) > AIndex) then Exit(True);
+  Result := False;
 end;
 
-{ Adds the first-argument key of every ACallee call in the statement. }
-procedure CollectCallKeys(const ATokens: TScanTokens;
-  const AStatement: TScanStatement; const ACallee: string;
-  AKeys: TStrings);
+function IsConsoleFile(const AText: string): Boolean;
+begin
+  Result := (AText = 'output') or (AText = 'erroutput') or (AText = 'stdout')
+    or (AText = 'stderr') or (AText = 'input');
+end;
+
+{ The path a text-file variable was last assigned before AIndex. }
+function AssignedPath(const ATokens: TGuardTokens; AIndex: Integer;
+  const AVariable: string): string;
 var
   Arguments: TTokenRanges;
   Closed: Boolean;
   Index: Integer;
 begin
-  for Index := AStatement.First to AStatement.Last - 1 do
-    if (ATokens[Index].Lower = ACallee)
-       and (ATokens[Index + 1].Text = '(') then
+  for Index := AIndex - 1 downto 0 do
+    if IsCallAt(ATokens, Index, 'assign')
+       or IsCallAt(ATokens, Index, 'assignfile') then
     begin
-      Arguments := CallArguments(ATokens, Index + 1, AStatement.Last,
-        Closed);
-      if Length(Arguments) > 0 then
-        AKeys.Add(RangeKey(ATokens, Arguments[0]));
+      Arguments := CallArguments(ATokens, Index + 1, Closed);
+      if (Length(Arguments) = 2)
+         and (RangeKey(ATokens, Arguments[0]) = AVariable) then
+        Exit(RangeKey(ATokens, Arguments[1]));
     end;
+  Result := AVariable;
 end;
 
-procedure ScanRoutineReads(const APath: string; const ATokens: TScanTokens;
-  const AStatements: TScanStatements; AFirst, ALast: Integer;
-  var AFindings: THandoffFindings);
+{ Returns the written path's key when the call at AIndex writes a PID into
+  file content. }
+function RawPIDWrite(const ATokens: TGuardTokens; AIndex: Integer;
+  out AKey: string): Boolean;
 var
   Arguments: TTokenRanges;
-  Closed: Boolean;
-  Gated, Polled: TStringList;
-  Index, StatementIndex: Integer;
-  Key: string;
+  ArgumentIndex: Integer;
+  Closed, Qualified: Boolean;
+  Name: string;
 begin
+  Result := False;
+  if not IsCodeToken(ATokens[AIndex])
+     or not TokenIs(ATokens, AIndex + 1, '(') then Exit;
+  Name := ATokens[AIndex].Text;
+  if (Copy(Name, 1, 5) <> 'write') or (Name = 'writefile')
+     or (Name = 'writebuffer') then Exit;
+  Qualified := TokenIs(ATokens, AIndex - 1, '.');
+  Arguments := CallArguments(ATokens, AIndex + 1, Closed);
+  if not Closed or (Length(Arguments) < 2) then Exit;
+  if (Name = 'write') or (Name = 'writeln') then
+  begin
+    { Only Write(TextFile, ...) reaches a file; stream methods and console
+      output do not. }
+    if Qualified or (Arguments[0].First <> Arguments[0].Last)
+       or (ATokens[Arguments[0].First].Kind <> ptIdentifier)
+       or IsConsoleFile(ATokens[Arguments[0].First].Text) then Exit;
+    AKey := AssignedPath(ATokens, AIndex, RangeKey(ATokens, Arguments[0]));
+  end
+  else
+    AKey := RangeKey(ATokens, Arguments[0]);
+  for ArgumentIndex := 1 to High(Arguments) do
+    if RangeHasPID(ATokens, Arguments[ArgumentIndex]) then Exit(True);
+end;
+
+{ The collection X filled with a PID at AIndex (X.Text := ... or
+  X.Add/Append(...)), or ''. }
+function PIDFilledCollection(const ATokens: TGuardTokens;
+  AIndex: Integer): string;
+var
+  Arguments: TTokenRanges;
+  ArgumentIndex: Integer;
+  Closed: Boolean;
+  Member: string;
+  Rest: TTokenRange;
+begin
+  Result := '';
+  if (ATokens[AIndex].Kind <> ptIdentifier)
+     or not TokenIs(ATokens, AIndex + 1, '.')
+     or (AIndex + 3 > High(ATokens)) then Exit;
+  Member := ATokens[AIndex + 2].Text;
+  if (Member = 'text') and TokenIs(ATokens, AIndex + 3, ':=') then
+  begin
+    Rest.First := AIndex + 4;
+    Rest.Last := SimpleStatementEnd(ATokens, AIndex + 4);
+    if RangeHasPID(ATokens, Rest) then Result := ATokens[AIndex].Text;
+  end
+  else if ((Member = 'add') or (Member = 'append'))
+    and TokenIs(ATokens, AIndex + 3, '(') then
+  begin
+    Arguments := CallArguments(ATokens, AIndex + 3, Closed);
+    for ArgumentIndex := 0 to High(Arguments) do
+      if RangeHasPID(ATokens, Arguments[ArgumentIndex]) then
+        Exit(ATokens[AIndex].Text);
+  end;
+end;
+
+procedure ScanRawPIDWrites(const APath: string; const ALines: TStrings;
+  const AScope: TGuardScope; APublished: TStrings;
+  var AFindings: THandoffFindings);
+var
+  Collection, Key: string;
+  Index, Save: Integer;
+  Tokens: TGuardTokens;
+begin
+  Tokens := AScope.Tokens;
+  for Index := 0 to High(Tokens) - 1 do
+  begin
+    if RawPIDWrite(Tokens, Index, Key)
+       and not CompletedAfter(APublished, Index, Key) then
+      AddFinding(AFindings, APath, ALines, Tokens[Index].Line, RulePIDWrite,
+        AScope.Routine, Key);
+    Collection := PIDFilledCollection(Tokens, Index);
+    if Collection = '' then Continue;
+    for Save := Index + 4 to High(Tokens) - 3 do
+      if (Tokens[Save].Kind = ptIdentifier)
+         and (Tokens[Save].Text = Collection) and TokenIs(Tokens, Save + 1, '.')
+         and IsCallAt(Tokens, Save + 2, 'savetofile') then
+      begin
+        if FirstArgumentKey(Tokens, Save + 3, Key)
+           and not CompletedAfter(APublished, Save, Key) then
+          AddFinding(AFindings, APath, ALines, Tokens[Save].Line,
+            RulePIDWrite, AScope.Routine, Key);
+        Break;
+      end;
+  end;
+end;
+
+function IsRawReader(const AToken: TGuardToken): Boolean;
+begin
+  if not IsCodeToken(AToken) then Exit(False);
+  if AToken.Text = 'loadfromfile' then Exit(True);
+  Result := (Copy(AToken.Text, 1, 4) = 'read') and (AToken.Text <> 'read')
+    and (AToken.Text <> 'readln') and (AToken.Text <> 'readbuffer')
+    and (AToken.Text <> 'readpayloadtext');
+end;
+
+procedure ScanReads(const APath: string; const ALines: TStrings;
+  const AScope: TGuardScope; AFilePublished: TStrings;
+  var AFindings: THandoffFindings);
+var
+  Gated, Polled: TStringList;
+  InLoop: TBooleanDynArray;
+  Index: Integer;
+  Key: string;
+  Tokens: TGuardTokens;
+begin
+  Tokens := AScope.Tokens;
+  InLoop := LoopMask(Tokens);
   Polled := TStringList.Create;
   Gated := TStringList.Create;
   try
-    for StatementIndex := AFirst to ALast do
-    begin
-      if StatementHasToken(ATokens, AStatements[StatementIndex], 'while')
-         or StatementHasToken(ATokens, AStatements[StatementIndex], 'until')
-         or StatementHasToken(ATokens, AStatements[StatementIndex],
-           'repeat') then
-        CollectCallKeys(ATokens, AStatements[StatementIndex], 'fileexists',
-          Polled);
-      CollectCallKeys(ATokens, AStatements[StatementIndex],
-        'payloadisreadable', Gated);
-    end;
-    if (Polled.Count = 0) and (Gated.Count = 0) then Exit;
-    for StatementIndex := AFirst to ALast do
-      for Index := AStatements[StatementIndex].First
-        to AStatements[StatementIndex].Last - 1 do
+    for Index := 0 to High(Tokens) - 1 do
+      if IsCallAt(Tokens, Index, 'fileexists') and InLoop[Index]
+         and FirstArgumentKey(Tokens, Index + 1, Key) then
       begin
-        if not IsRawReader(ATokens[Index].Lower)
-           or (ATokens[Index + 1].Text <> '(') then Continue;
-        Arguments := CallArguments(ATokens, Index + 1,
-          AStatements[StatementIndex].Last, Closed);
-        if Length(Arguments) = 0 then Continue;
-        Key := RangeKey(ATokens, Arguments[0]);
+        Polled.Add(Key);
+        if AFilePublished.IndexOf(Key) >= 0 then
+          AddFinding(AFindings, APath, ALines, Tokens[Index].Line,
+            RulePolledPayload, AScope.Routine, Key);
+      end
+      else if IsCallAt(Tokens, Index, 'payloadisreadable')
+        and FirstArgumentKey(Tokens, Index + 1, Key) then
+        Gated.Add(Key);
+    for Index := 0 to High(Tokens) - 1 do
+      if IsRawReader(Tokens[Index]) and TokenIs(Tokens, Index + 1, '(')
+         and FirstArgumentKey(Tokens, Index + 1, Key) then
+      begin
         if Polled.IndexOf(Key) >= 0 then
-          AddFinding(AFindings, APath, ATokens[Index].Line, RulePolledRead,
-            StatementEvidence(ATokens, AStatements[StatementIndex]))
+          AddFinding(AFindings, APath, ALines, Tokens[Index].Line,
+            RulePolledRead, AScope.Routine, Key)
         else if Gated.IndexOf(Key) >= 0 then
-          AddFinding(AFindings, APath, ATokens[Index].Line, RulePayloadRead,
-            StatementEvidence(ATokens, AStatements[StatementIndex]));
+          AddFinding(AFindings, APath, ALines, Tokens[Index].Line,
+            RulePayloadRead, AScope.Routine, Key);
       end;
   finally
     Gated.Free;
@@ -641,40 +618,335 @@ begin
   end;
 end;
 
-function ScanHandoffSource(const APath, ASource: string): THandoffFindings;
+{ Scopes ----------------------------------------------------------------- }
+
+function GuardTokens(const ASource: string;
+  const ATokens: TLWPTPascalTokenArray; AFirst, ALast: Integer;
+  const ALineMap: TIntegerDynArray): TGuardTokens;
 var
-  Statements: TScanStatements;
-  Tokens: TScanTokens;
-  First, Index: Integer;
+  Index: Integer;
 begin
   Result := nil;
-  Tokens := Tokenize(BuildScanText(ASource));
-  Statements := SplitStatements(Tokens);
-  ScanRawPIDWrites(APath, Tokens, Statements, Result);
-  First := 0;
-  for Index := 1 to Length(Statements) do
-    if (Index = Length(Statements))
-       or (Statements[Index].Routine <> Statements[First].Routine) then
-    begin
-      ScanRoutineReads(APath, Tokens, Statements, First, Index - 1, Result);
-      First := Index;
-    end;
+  SetLength(Result, ALast - AFirst + 1);
+  for Index := AFirst to ALast do
+  begin
+    Result[Index - AFirst].Kind := ATokens[Index].Kind;
+    Result[Index - AFirst].Text := ATokens[Index].Text;
+    Result[Index - AFirst].Original := Copy(ASource,
+      ATokens[Index].Offset + 1, ATokens[Index].Length);
+    if Length(ALineMap) > 0 then
+      Result[Index - AFirst].Line := ALineMap[ATokens[Index].Offset]
+    else
+      Result[Index - AFirst].Line := ATokens[Index].Line;
+    Result[Index - AFirst].GlueKey := '';
+  end;
 end;
+
+function DecodeLiteral(const AOriginal: string): string;
+var
+  Index: Integer;
+begin
+  if (AOriginal <> '') and (AOriginal[1] = '#') then
+  begin
+    if (Length(AOriginal) > 1) and (AOriginal[2] = '$') then
+      Exit(Chr(StrToIntDef('$' + Copy(AOriginal, 3, MaxInt), 32)));
+    Exit(Chr(StrToIntDef(Copy(AOriginal, 2, MaxInt), 32)));
+  end;
+  Result := '';
+  Index := 2;
+  while Index < Length(AOriginal) do
+  begin
+    Result := Result + AOriginal[Index];
+    if (AOriginal[Index] = '''') and (Index + 1 < Length(AOriginal)) then
+      Inc(Index);
+    Inc(Index);
+  end;
+end;
+
+{ Last token of a spliced-in value that starts at AStart. }
+function GlueEnd(const ATokens: TGuardTokens; AStart: Integer): Integer;
+var
+  Depth, Index: Integer;
+begin
+  Depth := 0;
+  for Index := AStart to High(ATokens) do
+  begin
+    if TokenIs(ATokens, Index, '(') or TokenIs(ATokens, Index, '[') then
+      Inc(Depth)
+    else if TokenIs(ATokens, Index, ')') or TokenIs(ATokens, Index, ']') then
+    begin
+      if Depth = 0 then Exit(Index - 1);
+      Dec(Depth);
+    end
+    else if (Depth = 0) and (TokenIs(ATokens, Index, '+')
+      or TokenIs(ATokens, Index, ',') or TokenIs(ATokens, Index, ';')
+      or TokenIs(ATokens, Index, ':=') or TokenIs(ATokens, Index, 'then')
+      or TokenIs(ATokens, Index, 'do') or TokenIs(ATokens, Index, 'of')
+      or TokenIs(ATokens, Index, 'else') or TokenIs(ATokens, Index, 'end')) then
+      Exit(Index - 1);
+  end;
+  Result := High(ATokens);
+end;
+
+{ Strips an enclosing PascalString(...) call from a spliced-in value. }
+function SplicedValue(const ATokens: TGuardTokens;
+  const ARange: TTokenRange): TTokenRange;
+begin
+  Result := ARange;
+  if IsCallAt(ATokens, ARange.First, 'pascalstring')
+     and TokenIs(ATokens, ARange.Last, ')') then
+  begin
+    Result.First := ARange.First + 2;
+    Result.Last := ARange.Last - 1;
+  end;
+end;
+
+type
+  TFixtureBuilder = record
+    Text: string;
+    Lines: TIntegerDynArray;
+    GlueKeys: TStringList;
+  end;
+
+procedure AppendFixture(var ABuilder: TFixtureBuilder; const AText: string;
+  ALine: Integer);
+var
+  Index, Start: Integer;
+begin
+  Start := Length(ABuilder.Text);
+  ABuilder.Text := ABuilder.Text + AText;
+  SetLength(ABuilder.Lines, Length(ABuilder.Text) + 1);
+  for Index := Start to Length(ABuilder.Text) do
+    ABuilder.Lines[Index] := ALine;
+end;
+
+procedure AppendGlue(var ABuilder: TFixtureBuilder;
+  const ATokens: TGuardTokens; const ARange: TTokenRange);
+var
+  Arguments: TTokenRanges;
+  Closed: Boolean;
+  Name: string;
+  Value: TTokenRange;
+begin
+  if IsCallAt(ATokens, ARange.First, 'emitpayloadcompletion') then
+  begin
+    Arguments := CallArguments(ATokens, ARange.First + 1, Closed);
+    if Length(Arguments) = 2 then
+    begin
+      Value := SplicedValue(ATokens, Arguments[1]);
+      Name := GluePrefix + IntToStr(ABuilder.GlueKeys.Add(
+        RangeKey(ATokens, Value)));
+      AppendFixture(ABuilder, ' PublishPayloadCompletion(' + Name + '); ',
+        ATokens[ARange.First].Line);
+      Exit;
+    end;
+  end;
+  Value := SplicedValue(ATokens, ARange);
+  Name := GluePrefix + IntToStr(ABuilder.GlueKeys.Add(
+    RangeKey(ATokens, Value)));
+  AppendFixture(ABuilder, ' ' + Name + ' ', ATokens[ARange.First].Line);
+end;
+
+{ Decodes the string expression starting at AStart into fixture source.
+  Returns the last token it consumed. }
+function DecodeStringExpression(const ATokens: TGuardTokens; AStart: Integer;
+  var ABuilder: TFixtureBuilder): Integer;
+var
+  Glue: TTokenRange;
+  Index: Integer;
+begin
+  Index := AStart;
+  Result := AStart;
+  while Index <= High(ATokens) do
+  begin
+    if ATokens[Index].Kind = ptString then
+    begin
+      AppendFixture(ABuilder, DecodeLiteral(ATokens[Index].Original),
+        ATokens[Index].Line);
+      Result := Index;
+      Inc(Index);
+      Continue;
+    end;
+    if not TokenIs(ATokens, Index, '+') or (Index = High(ATokens)) then Break;
+    Inc(Index);
+    if ATokens[Index].Kind = ptString then Continue;
+    Glue.First := Index;
+    Glue.Last := GlueEnd(ATokens, Index);
+    if Glue.Last < Glue.First then Break;
+    AppendGlue(ABuilder, ATokens, Glue);
+    Result := Glue.Last;
+    Index := Glue.Last + 1;
+  end;
+end;
+
+function FixtureScope(const ARoutine: string;
+  const ABuilder: TFixtureBuilder; out AScope: TGuardScope): Boolean;
+var
+  GlueIndex, Index: Integer;
+  Tokens: TLWPTPascalTokenArray;
+begin
+  Result := False;
+  { Only a string that reads as statements is fixture source. }
+  if Pos(';', ABuilder.Text) = 0 then Exit;
+  try
+    Tokens := TokenizePascal(ABuilder.Text, '<fixture>');
+  except
+    on ELWPTPascalAnalysisError do Exit;
+  end;
+  AScope.Routine := ARoutine + ' fixture';
+  AScope.Tokens := GuardTokens(ABuilder.Text, Tokens, 0, High(Tokens),
+    ABuilder.Lines);
+  for Index := 0 to High(AScope.Tokens) do
+    if (AScope.Tokens[Index].Kind = ptIdentifier)
+       and (Copy(AScope.Tokens[Index].Text, 1, Length(GluePrefix))
+         = GluePrefix) then
+    begin
+      GlueIndex := StrToIntDef(Copy(AScope.Tokens[Index].Text,
+        Length(GluePrefix) + 1, MaxInt), -1);
+      if (GlueIndex >= 0) and (GlueIndex < ABuilder.GlueKeys.Count) then
+        AScope.Tokens[Index].GlueKey := ABuilder.GlueKeys[GlueIndex];
+    end;
+  Result := True;
+end;
+
+procedure AddScope(var AScopes: TGuardScopes; const AScope: TGuardScope);
+begin
+  SetLength(AScopes, Length(AScopes) + 1);
+  AScopes[High(AScopes)] := AScope;
+end;
+
+procedure AddFixtureScopes(const AScope: TGuardScope;
+  var AScopes: TGuardScopes);
+var
+  Builder: TFixtureBuilder;
+  Fixture: TGuardScope;
+  Index: Integer;
+begin
+  Index := 0;
+  while Index <= High(AScope.Tokens) do
+  begin
+    if AScope.Tokens[Index].Kind <> ptString then
+    begin
+      Inc(Index);
+      Continue;
+    end;
+    Builder.Text := '';
+    Builder.Lines := nil;
+    Builder.GlueKeys := TStringList.Create;
+    try
+      Index := DecodeStringExpression(AScope.Tokens, Index, Builder) + 1;
+      if FixtureScope(AScope.Routine, Builder, Fixture) then
+        AddScope(AScopes, Fixture);
+    finally
+      Builder.GlueKeys.Free;
+    end;
+  end;
+end;
+
+function RoutineLabel(const ADocument: TLWPTPascalDocument;
+  const ARegion: TLWPTPascalRegion): string;
+begin
+  if ARegion.OwnerRoutine >= 0 then
+    Result := ADocument.Routines[ARegion.OwnerRoutine].Name
+  else if ARegion.Kind = pgInitialization then
+    Result := '<initialization>'
+  else if ARegion.Kind = pgFinalization then
+    Result := '<finalization>'
+  else
+    Result := '<main>';
+end;
+
+function SourceScopes(const ASource: string): TGuardScopes;
+var
+  Document: TLWPTPascalDocument;
+  CodeScopes: TGuardScopes;
+  Index: Integer;
+  Scope: TGuardScope;
+begin
+  Result := nil;
+  CodeScopes := nil;
+  Document := AnalyzePascal(ASource, '<source>');
+  for Index := 0 to High(Document.Regions) do
+    if PascalRegionIsExecutable(Document.Regions[Index].Kind)
+       and (Document.Regions[Index].Tokens.EndToken
+         > Document.Regions[Index].Tokens.StartToken) then
+    begin
+      Scope.Routine := RoutineLabel(Document, Document.Regions[Index]);
+      Scope.Tokens := GuardTokens(ASource, Document.Tokens,
+        Document.Regions[Index].Tokens.StartToken,
+        Document.Regions[Index].Tokens.EndToken - 1, nil);
+      AddScope(CodeScopes, Scope);
+    end;
+  { A fragment without routine bodies (an include file) is one scope. }
+  if (Length(CodeScopes) = 0) and (Length(Document.Tokens) > 0) then
+  begin
+    Scope.Routine := '<file>';
+    Scope.Tokens := GuardTokens(ASource, Document.Tokens, 0,
+      High(Document.Tokens), nil);
+    AddScope(CodeScopes, Scope);
+  end;
+  for Index := 0 to High(CodeScopes) do
+  begin
+    AddScope(Result, CodeScopes[Index]);
+    AddFixtureScopes(CodeScopes[Index], Result);
+  end;
+end;
+
+function ScanHandoffSource(const APath, ASource: string): THandoffFindings;
+var
+  FilePublished, ScopePublished: TStringList;
+  Index: Integer;
+  Lines: TStringList;
+  Scopes: TGuardScopes;
+begin
+  Result := nil;
+  Lines := TStringList.Create;
+  FilePublished := TStringList.Create;
+  ScopePublished := TStringList.Create;
+  try
+    Lines.Text := ASource;
+    try
+      Scopes := SourceScopes(ASource);
+    except
+      on E: ELWPTPascalAnalysisError do
+      begin
+        AddFinding(Result, APath, Lines, 0, RuleUnscannable, '<file>',
+          E.Message);
+        Exit;
+      end;
+    end;
+    for Index := 0 to High(Scopes) do
+      CollectPublications(Scopes[Index].Tokens, FilePublished);
+    for Index := 0 to High(Scopes) do
+    begin
+      ScopePublished.Clear;
+      CollectPublications(Scopes[Index].Tokens, ScopePublished);
+      ScanRawPIDWrites(APath, Lines, Scopes[Index], ScopePublished, Result);
+      ScanReads(APath, Lines, Scopes[Index], FilePublished, Result);
+    end;
+  finally
+    ScopePublished.Free;
+    FilePublished.Free;
+    Lines.Free;
+  end;
+end;
+
+{ Repository scan -------------------------------------------------------- }
 
 function IsScanTarget(const ARelativePath: string): Boolean;
 var
-  Name: string;
+  Extension, Name: string;
 begin
   if ARelativePath = GuardProgramPath then Exit(False);
   Name := ExtractFileName(ARelativePath);
+  Extension := ExtractFileExt(Name);
+  if (Extension <> '.pas') and (Extension <> '.inc') then Exit(False);
   if Copy(ARelativePath, 1, 7) = 'source/' then
-    Exit(Pos('.Test.pas', Name) = Length(Name) - Length('.Test.pas') + 1);
-  if Copy(ARelativePath, 1, 6) = 'tests/' then
-    Exit((ExtractFileExt(Name) = '.pas') or (ExtractFileExt(Name) = '.inc'));
+    Exit(Pos('.Test.', Name) > 0);
+  if Copy(ARelativePath, 1, 6) = 'tests/' then Exit(True);
   if Copy(ARelativePath, 1, 9) = 'packages/' then
-    Exit((ExtractFileExt(Name) = '.pas')
-      and ((Pos('.Test.pas', Name) > 0) or (Copy(Name, 1, 6) = 'Tests.')
-        or (Pos('/tests/', ARelativePath) > 0)));
+    Exit((Pos('.Test.', Name) > 0) or (Copy(Name, 1, 6) = 'Tests.')
+      or (Pos('/tests/', ARelativePath) > 0));
   Result := False;
 end;
 
@@ -712,6 +984,27 @@ begin
   CollectScanTargets('packages', Result);
 end;
 
+function RepositoryFindings: THandoffFindings;
+var
+  Files: TStringList;
+  Finding: THandoffFinding;
+  FileIndex: Integer;
+begin
+  Result := nil;
+  Files := ScanTargets;
+  try
+    for FileIndex := 0 to Files.Count - 1 do
+      for Finding in ScanHandoffSource(Files[FileIndex],
+        ReadBinaryFile(Files[FileIndex])) do
+      begin
+        SetLength(Result, Length(Result) + 1);
+        Result[High(Result)] := Finding;
+      end;
+  finally
+    Files.Free;
+  end;
+end;
+
 function IsAllowed(const AFinding: THandoffFinding): Boolean;
 var
   Allowance: THandoffAllowance;
@@ -721,92 +1014,68 @@ begin
   Result := False;
 end;
 
-function RepositoryFindings: THandoffFindings;
-var
-  Files: TStringList;
-  FileFindings: THandoffFindings;
-  FileIndex, Index: Integer;
-begin
-  Result := nil;
-  Files := ScanTargets;
-  try
-    for FileIndex := 0 to Files.Count - 1 do
-    begin
-      FileFindings := ScanHandoffSource(Files[FileIndex],
-        ReadBinaryFile(Files[FileIndex]));
-      for Index := 0 to High(FileFindings) do
-      begin
-        SetLength(Result, Length(Result) + 1);
-        Result[High(Result)] := FileFindings[Index];
-      end;
-    end;
-  finally
-    Files.Free;
-  end;
-end;
-
 function DescribeFinding(const AFinding: THandoffFinding): string;
 begin
   Result := AFinding.Path + ':' + IntToStr(AFinding.Line) + ': '
-    + AFinding.Rule + ': ' + AFinding.Evidence;
+    + AFinding.Rule + ' in ' + AFinding.Routine + ' on "' + AFinding.Key
+    + '": ' + AFinding.Evidence;
 end;
 
 function RulesOf(const ASource: string): string;
 var
-  Findings: THandoffFindings;
-  Index: Integer;
+  Finding: THandoffFinding;
 begin
-  Findings := ScanHandoffSource('synthetic.pas', ASource);
   Result := '';
-  for Index := 0 to High(Findings) do
+  for Finding in ScanHandoffSource('synthetic.pas', ASource) do
   begin
     if Result <> '' then Result := Result + ',';
-    Result := Result + Findings[Index].Rule + '@'
-      + IntToStr(Findings[Index].Line);
+    Result := Result + Finding.Rule + '@' + IntToStr(Finding.Line);
   end;
 end;
 
+{ Tests ------------------------------------------------------------------ }
+
 procedure TPayloadHandoffGuard.TestRepositoryFollowsTheProtocol;
 var
-  Findings: THandoffFindings;
-  Index, Violations: Integer;
+  Finding: THandoffFinding;
+  Violations: Integer;
 begin
-  Findings := RepositoryFindings;
   Violations := 0;
-  for Index := 0 to High(Findings) do
-    if not IsAllowed(Findings[Index]) then
+  for Finding in RepositoryFindings do
+    if not IsAllowed(Finding) then
     begin
-      WriteLn('PAYLOAD HANDOFF VIOLATION ', DescribeFinding(Findings[Index]));
+      WriteLn('PAYLOAD HANDOFF VIOLATION ', DescribeFinding(Finding));
       Inc(Violations);
     end;
   if Violations > 0 then
     WriteLn('Hand payloads over with Tests.PayloadHandoff: writers call ',
-      'PublishReadablePayload (or write, then PublishPayloadCompletion; ',
-      'EmitPayloadCompletion in generated fixtures), and readers wait for ',
-      'PayloadIsReadable and read with ReadPayloadText. See docs/testing.md.');
+      'PublishReadablePayload (or write, then PublishPayloadCompletion on ',
+      'the same path; EmitPayloadCompletion in generated fixtures), and ',
+      'readers and barriers wait for PayloadIsReadable (the .complete ',
+      'marker in generated fixtures) and read with ReadPayloadText. See ',
+      'docs/testing.md.');
   Expect<Integer>(Violations).ToBe(0);
 end;
 
-procedure TPayloadHandoffGuard.TestEveryAllowanceStillMatches;
+procedure TPayloadHandoffGuard.TestEveryAllowanceMatchesOneSite;
 var
   Allowance: THandoffAllowance;
   Finding: THandoffFinding;
   Findings: THandoffFindings;
-  Matched: Boolean;
+  Matches: Integer;
 begin
   Findings := RepositoryFindings;
   for Allowance in HandoffAllowlist do
   begin
-    Matched := False;
+    Matches := 0;
     for Finding in Findings do
-      if AllowanceMatches(Allowance, Finding) then Matched := True;
-    if not Matched then
-      WriteLn('STALE PAYLOAD HANDOFF ALLOWANCE ', Allowance.Path, ' ',
-        Allowance.Rule, ' "', Allowance.Evidence, '"');
-    Expect<Boolean>(Matched).ToBe(True);
+      if AllowanceMatches(Allowance, Finding) then Inc(Matches);
+    if Matches <> 1 then
+      WriteLn('PAYLOAD HANDOFF ALLOWANCE MATCHES ', Matches, ' SITES: ',
+        Allowance.Path, ' ', Allowance.Rule, ' ', Allowance.Routine, ' "',
+        Allowance.Key, '"');
+    Expect<Integer>(Matches).ToBe(1);
   end;
-  { An empty allowlist is a verified state, not a case without assertions. }
-  Expect<Boolean>(True).ToBe(True);
 end;
 
 procedure TPayloadHandoffGuard.TestScanCoversTheTestTree;
@@ -829,6 +1098,10 @@ begin
       >= 0).ToBe(True);
     Expect<Boolean>(Files.IndexOf('source/LWPT.Core.pas') >= 0).ToBe(False);
     Expect<Boolean>(Files.IndexOf(GuardProgramPath) >= 0).ToBe(False);
+    Expect<Boolean>(IsScanTarget('packages/demo/tests/Shared.inc'))
+      .ToBe(True);
+    Expect<Boolean>(IsScanTarget('packages/demo/source/Demo.pas'))
+      .ToBe(False);
   finally
     Files.Free;
   end;
@@ -838,14 +1111,18 @@ procedure TPayloadHandoffGuard.TestRawPIDWritesAreDetected;
 begin
   { The surviving-descendant proxy before 89f93a7 (run 36593670809). }
   Expect<string>(RulesOf(
-      'function RunProxy: Integer;'#10
+      'program P;'#10
+    + 'function RunProxy: Integer;'#10
     + 'begin'#10
     + '  WriteTextFile(ParamStr(2), IntToStr(GetProcessID));'#10
     + '  Sleep(1000);'#10
-    + 'end;'#10)).ToBe(RulePIDWrite + '@3');
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePIDWrite + '@4');
   { The escaped stdin holder's forked grandchild. }
   Expect<string>(RulesOf(
-      'begin'#10
+      'program P;'#10
+    + 'procedure Hold(const APIDFile: string);'#10
+    + 'begin'#10
     + '  Lines := TStringList.Create;'#10
     + '  try'#10
     + '    Lines.Text := IntToStr(FpGetPID);'#10
@@ -853,113 +1130,257 @@ begin
     + '  finally'#10
     + '    Lines.Free;'#10
     + '  end;'#10
-    + 'end;'#10)).ToBe(RulePIDWrite + '@5');
-  { Generated fixtures written as literals, without EmitPayloadCompletion. }
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePIDWrite + '@7');
+  { Generated fixtures without EmitPayloadCompletion (before #291). }
   Expect<string>(RulesOf(
-      '  WriteTextFile(Path,'#10
-    + '      ''    Child.Execute;''#10'#10
+      'program P;'#10
+    + 'begin'#10
+    + '  WriteTextFile(Path,'#10
+    + '      ''begin'''#10
     + '    + ''    PIDFile.Text := IntToStr(Child.ProcessID);''#10'#10
     + '    + ''    PIDFile.SaveToFile('' + PascalString(P) + '');''#10'#10
-    + '    + ''  finally PIDFile.Free end;''#10'#10
-    + '    + ''end.''#10);'#10)).ToBe(RulePIDWrite + '@4');
+    + '    + ''  PIDFile.Free;''#10'#10
+    + '    + ''end.''#10);'#10
+    + 'end.'#10)).ToBe(RulePIDWrite + '@6');
   Expect<string>(RulesOf(
-      '  WriteTextFile(Path,'#10
-    + '      ''    Rewrite(PIDFile);''#10'#10
+      'program P;'#10
+    + 'begin'#10
+    + '  WriteTextFile(Path,'#10
+    + '      ''begin''#10'#10
+    + '    + ''    Assign(PIDFile, '' + PascalString(HolderPath) + '');''#10'#10
+    + '    + ''    Rewrite(PIDFile);''#10'#10
     + '    + ''    Write(PIDFile, Child.ProcessID);''#10'#10
     + '    + ''    Close(PIDFile);''#10'#10
-    + '    + ''end.''#10);'#10)).ToBe(RulePIDWrite + '@3');
+    + '    + ''end.''#10);'#10
+    + 'end.'#10)).ToBe(RulePIDWrite + '@7');
+end;
+
+procedure TPayloadHandoffGuard.TestCompletionMustNameThePayload;
+begin
+  { A completion for another path. }
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'procedure Publish;'#10
+    + 'begin'#10
+    + '  WriteTextFile(PIDPath, IntToStr(GetProcessID));'#10
+    + '  PublishPayloadCompletion(UnrelatedPath);'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePIDWrite + '@4');
+  { A completion in the next routine. }
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'procedure Publish;'#10
+    + 'begin'#10
+    + '  WriteTextFile(PIDPath, IntToStr(GetProcessID));'#10
+    + 'end;'#10
+    + 'procedure Complete;'#10
+    + 'begin'#10
+    + '  PublishPayloadCompletion(PIDPath);'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePIDWrite + '@4');
+  { A completion that only appears in a diagnostic string. }
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'procedure Publish;'#10
+    + 'begin'#10
+    + '  WriteTextFile(PIDPath, IntToStr(GetProcessID));'#10
+    + '  WriteLn(''PublishPayloadCompletion'');'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePIDWrite + '@4');
+  { A completion before the write does not publish it. }
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'procedure Publish;'#10
+    + 'begin'#10
+    + '  PublishPayloadCompletion(PIDPath);'#10
+    + '  WriteTextFile(PIDPath, IntToStr(GetProcessID));'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePIDWrite + '@5');
+  { A generated fixture completing another path. }
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'begin'#10
+    + '  WriteTextFile(Path,'#10
+    + '      ''begin''#10'#10
+    + '    + ''    Assign(PIDFile, '' + PascalString(HolderPath) + '');''#10'#10
+    + '    + ''    Rewrite(PIDFile);''#10'#10
+    + '    + ''    Write(PIDFile, Child.ProcessID);''#10'#10
+    + '    + ''    Close(PIDFile);''#10'#10
+    + '    + EmitPayloadCompletion(''CompleteFile'', PascalString(OtherPath))'#10
+    + '    + ''end.''#10);'#10
+    + 'end.'#10)).ToBe(RulePIDWrite + '@7');
 end;
 
 procedure TPayloadHandoffGuard.TestExistenceGatedReadsAreDetected;
 begin
   Expect<string>(RulesOf(
-      'procedure WaitAndRead;'#10
+      'program P;'#10
+    + 'procedure WaitAndRead;'#10
     + 'begin'#10
     + '  while not FileExists(PIDPath) do Sleep(10);'#10
     + '  PID := StrToInt(Trim(ReadBinaryFile(PIDPath)));'#10
-    + 'end;'#10)).ToBe(RulePolledRead + '@4');
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePolledRead + '@5');
+  { Polling after an earlier statement of the loop body. }
   Expect<string>(RulesOf(
-      'procedure WaitAndLoad;'#10
+      'program P;'#10
+    + 'procedure WaitAndRead;'#10
     + 'begin'#10
     + '  repeat'#10
-    + '    if FileExists(APath + ''-owner'') then Break;'#10
-    + '    Sleep(25);'#10
+    + '    Sleep(10);'#10
+    + '    if FileExists(PayloadPath) then Break;'#10
     + '  until False;'#10
-    + '  Lines.LoadFromFile(APath + ''-owner'');'#10
-    + 'end;'#10)).ToBe(RulePolledRead + '@7');
+    + '  Contents := ReadBinaryFile(PayloadPath);'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePolledRead + '@8');
   Expect<string>(RulesOf(
-      'procedure ReadGated;'#10
+      'program P;'#10
+    + 'procedure WaitAndLoad(const APath: string);'#10
+    + 'begin'#10
+    + '  while Child.Running do'#10
+    + '  begin'#10
+    + '    Drain;'#10
+    + '    if FileExists(APath + ''-owner'') then Break;'#10
+    + '  end;'#10
+    + '  Lines.LoadFromFile(APath + ''-owner'');'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePolledRead + '@9');
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'procedure ReadGated;'#10
     + 'begin'#10
     + '  if PayloadIsReadable(PIDPath) then'#10
     + '    PID := StrToInt(Trim(ReadBinaryFile(PIDPath)));'#10
-    + 'end;'#10)).ToBe(RulePayloadRead + '@4');
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePayloadRead + '@5');
+end;
+
+procedure TPayloadHandoffGuard.TestPublishedPayloadPollsAreDetected;
+begin
+  { A barrier that advances on the payload of a PID published elsewhere
+    (the acknowledgement owner before this guard). }
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'procedure Leaf(const APIDFile: string);'#10
+    + 'begin'#10
+    + '  PublishReadablePayload(APIDFile + ''-descendant'', IntToStr(GetProcessID));'#10
+    + 'end;'#10
+    + 'procedure Owner(const PIDFile: string);'#10
+    + 'begin'#10
+    + '  while not FileExists(PIDFile + ''-descendant'') do Sleep(10);'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(RulePolledPayload + '@8');
+  { The same barrier in a generated fixture. }
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'procedure Compiler(const PIDFile: string);'#10
+    + 'begin'#10
+    + '  PublishReadablePayload(PIDFile, IntToStr(GetProcessID));'#10
+    + 'end;'#10
+    + 'begin'#10
+    + '  WriteTextFile(Path,'#10
+    + '      ''begin''#10'#10
+    + '    + ''  while (not FileExists('' + PascalString(PIDFile) + ''))''#10'#10
+    + '    + ''    do Sleep(10);''#10'#10
+    + '    + ''  Halt(1);''#10'#10
+    + '    + ''end.''#10);'#10
+    + 'end.'#10)).ToBe(RulePolledPayload + '@9');
 end;
 
 procedure TPayloadHandoffGuard.TestPublishedHandoffsPass;
 begin
   Expect<string>(RulesOf(
-      'begin'#10
+      'program P;'#10
+    + 'procedure Publish;'#10
+    + 'begin'#10
     + '  PublishReadablePayload(ParamStr(2), IntToStr(GetProcessID));'#10
-    + '  WriteTextFile(PIDPath, IntToStr(GetProcessID));'#10
+    + '  WriteTextFile(APIDPath, IntToStr(GetProcessID));'#10
     + '  PublishPayloadCompletion(PIDPath);'#10
-    + 'end;'#10)).ToBe('');
-  Expect<string>(RulesOf(
-      '  WriteTextFile(Path,'#10
-    + '      ''    PIDFile.Text := IntToStr(Child.ProcessID);''#10'#10
-    + '    + ''    PIDFile.SaveToFile('' + PascalString(P) + '');''#10'#10
-    + '    + ''  finally PIDFile.Free end;''#10'#10
-    + '    + EmitPayloadCompletion(''CompleteFile'', PascalString(P))'#10
-    + '    + ''    Write(PIDFile, Child.ProcessID);''#10'#10
-    + '    + ''    Close(PIDFile);''#10'#10
-    + '    + EmitPayloadCompletion(''CompleteFile'', PascalString(Q))'#10
-    + '    + ''end.''#10);'#10)).ToBe('');
-  Expect<string>(RulesOf(
-      'procedure WaitAndRead;'#10
+    + 'end;'#10
+    + 'procedure Wait;'#10
     + 'begin'#10
     + '  while not PayloadIsReadable(PIDPath) do Sleep(10);'#10
     + '  PID := StrToInt(Trim(ReadPayloadText(PIDPath)));'#10
-    + 'end;'#10)).ToBe('');
+    + '  while not FileExists(PIDPath + PayloadCompleteSuffix) do Sleep(1);'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe('');
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'begin'#10
+    + '  WriteTextFile(Path,'#10
+    + '      ''begin''#10'#10
+    + '    + ''    PIDFile.Text := IntToStr(Child.ProcessID);''#10'#10
+    + '    + ''    PIDFile.SaveToFile('' + PascalString(P) + '');''#10'#10
+    + '    + ''    PIDFile.Free;''#10'#10
+    + '    + EmitPayloadCompletion(''CompleteFile'', PascalString(P))'#10
+    + '    + ''    Assign(PIDFile, '' + PascalString(Q) + '');''#10'#10
+    + '    + ''    Rewrite(PIDFile);''#10'#10
+    + '    + ''    Write(PIDFile, Child.ProcessID);''#10'#10
+    + '    + ''    Close(PIDFile);''#10'#10
+    + '    + EmitPayloadCompletion(''CompleteFile'', PascalString(Q))'#10
+    + '    + ''end.''#10);'#10
+    + 'end.'#10)).ToBe('');
 end;
 
 procedure TPayloadHandoffGuard.TestUnrelatedPIDUsesPass;
 begin
-  { A PID in the path, on the console, in a comment, or read after a poll
-    in another routine is not a payload handoff. }
+  { A PID in the path, on the console, in a stream, in comments (nested and
+    inside fixture strings), or in a report saved long after the fill. }
   Expect<string>(RulesOf(
-      'begin'#10
+      'program P;'#10
+    + 'procedure Unrelated;'#10
+    + 'begin'#10
     + '  WriteTextFile(ReadyDir + ''/ready-'' + Name + ''-'''#10
     + '    + IntToStr(GetProcessID), ''ready'');'#10
     + '  WriteLn(ErrOutput, ''pid '', GetProcessID);'#10
     + '  WriteLn(FpGetpid, '' '', FpGetpgrp);'#10
     + '  Stream.Write(PID, SizeOf(GetProcessID));'#10
     + '  { WriteTextFile(Path, IntToStr(GetProcessID)); }'#10
+    + '  (* WriteTextFile(Path, IntToStr(GetProcessID)); *)'#10
     + '  // WriteTextFile(Path, IntToStr(GetProcessID));'#10
-    + '  Lines.Add(''pid='' + IntToStr(Child.ProcessID));'#10
-    + '  A; B; C; D;'#10
-    + '  Lines.SaveToFile(ReportPath);'#10
-    + 'end;'#10)).ToBe('');
+    + '  WriteLn(''a (b; c'', ''{ WriteTextFile(P, IntToStr(GetProcessID)); }'');'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe('');
+  { Polling and reading the same name in different routines. }
   Expect<string>(RulesOf(
-      'function WaitForFile(const APath: string): Boolean;'#10
+      'program P;'#10
+    + 'function WaitForFile(const APath: string): Boolean;'#10
     + 'begin'#10
     + '  while not FileExists(APath) do Sleep(10);'#10
     + 'end;'#10
     + 'function ReadMarkerText(const APath: string): string;'#10
     + 'begin'#10
     + '  Lines.LoadFromFile(APath);'#10
-    + 'end;'#10)).ToBe('');
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe('');
+  { An existence check after the loop is not polling. }
+  Expect<string>(RulesOf(
+      'program P;'#10
+    + 'procedure CheckAfterExit;'#10
+    + 'begin'#10
+    + '  while Child.Running do Sleep(10);'#10
+    + '  if FileExists(ResponsePath) then'#10
+    + '    Body := ReadBinaryFile(ResponsePath);'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe('');
 end;
 
 procedure TPayloadHandoffGuard.SetupTests;
 begin
   Test('repository test code follows the payload handoff protocol',
     TestRepositoryFollowsTheProtocol);
-  Test('every allowance still matches a finding',
-    TestEveryAllowanceStillMatches);
+  Test('every allowance matches exactly one site',
+    TestEveryAllowanceMatchesOneSite);
   Test('the scan covers the repository test tree',
     TestScanCoversTheTestTree);
   Test('raw PID writes are detected', TestRawPIDWritesAreDetected);
+  Test('a completion must name the written payload',
+    TestCompletionMustNameThePayload);
   Test('existence-gated raw reads are detected',
     TestExistenceGatedReadsAreDetected);
+  Test('existence polls of published payloads are detected',
+    TestPublishedPayloadPollsAreDetected);
   Test('published handoffs pass', TestPublishedHandoffsPass);
   Test('unrelated PID uses pass', TestUnrelatedPIDUsesPass);
 end;
