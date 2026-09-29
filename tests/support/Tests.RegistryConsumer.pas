@@ -523,7 +523,7 @@ begin
   AMediaType := 'text/plain';
   EnterCriticalSection(FLock);
   try
-    if Mode = scmFail then Exit(503);
+    if (Mode = scmFail) or (FRegistry = nil) then Exit(503);
     if Mode = scmRedirect then Exit(302);
     Base := BaseURL;
     if ATarget = FPath + '/.well-known/lwpt-registry' then

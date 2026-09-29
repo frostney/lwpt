@@ -159,7 +159,7 @@ begin
     for j := 0 to High(ARequirements) do
     begin
       case ARequirements[j].Kind of
-        vkNone: ;
+        vkNone:;
         vkSemverRange:
           Accepted := Satisfies(Version, ARequirements[j].Spec,
             DefaultSemverOptions);
