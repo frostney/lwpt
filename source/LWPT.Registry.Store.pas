@@ -3357,6 +3357,7 @@ var
   Lease: TLWPTProducerLease;
   Records, VersionEntries: TStringList;
   State: TLWPTRegistryState;
+  Index: Integer;
 begin
   Result := Default(TLWPTRegistryCommitResult);
   if FConfig.Role = rrMirror then
@@ -3381,6 +3382,11 @@ begin
   if Candidate.Yanked then
     raise ELWPTRegistryError.CreateStable('invalid_request',
       'yanked state changes only through the yank endpoints');
+  for Index := 0 to High(Candidate.Dependencies) do
+    if (Candidate.Dependencies[Index].Origin = Candidate.Origin)
+      and (Candidate.Dependencies[Index].Name = Candidate.Name) then
+      raise ELWPTRegistryError.CreateStable('invalid_request',
+        'package record depends on its own package');
   Result.Name := Candidate.Name;
   Result.Version := Candidate.Version;
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));

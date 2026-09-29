@@ -37,7 +37,8 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   decision 10, each must be a `registry:` source with a canonical constraint
   and no `include` or `exclude` key, and its alias must resolve through the
   archive manifest's own `[registries]` to an explicit canonical `identity`
-  (`https`, or `http://localhost` as `--origin` allows); the record omits the
+  (`https`, or `http://localhost` as `--origin` allows), and it must not name
+  the package itself on any origin; the record omits the
   publishing origin and sorts entries in protocol order, and the package name
   must use the consumer grammar. Anything else fails with
   `unsupported_dependencies` or `invalid_package_name`. It uploads to the one

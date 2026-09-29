@@ -1065,6 +1065,11 @@ begin
         raise ELWPTRegistryError.CreateStable('invalid_registry_dependency',
           'package dependency is invalid');
       ExplicitOrigin := TomlStr(Item, 'origin', '');
+      { One encoding per dependency: its own origin is written by omission,
+        so record hashes and content identity stay unambiguous. }
+      if (ExplicitOrigin <> '') and (ExplicitOrigin = Result.Origin) then
+        raise ELWPTRegistryError.Create('non_canonical_document: a dependency '
+          + 'on the record''s own origin omits origin');
       if ExplicitOrigin = '' then
         Result.Dependencies[I].Origin := Result.Origin
       else

@@ -381,6 +381,10 @@ begin
       PackageTarGz('dependent', '1.0.0', REGISTRY + '[dependencies]' + #10
       + 'plain = { source = "registry:plain", version = "^1.0.0", '
       + 'include = ["source/**"] }' + #10)), Origin)))).ToBe('unsupported_dependencies');
+    Expect<string>(RegistryErrorCode(Failure(Options(WriteArchive('self.tar.gz',
+      PackageTarGz('dependent', '1.0.0', REGISTRY + '[dependencies]' + #10
+      + 'dependent = "registry:dependent@^1.0.0"' + #10)), Origin))))
+      .ToBe('unsupported_dependencies');
     Expect<string>(RegistryErrorCode(Failure(Options(WriteArchive('dotted.zip',
       PackageZip('dotted.lib', '1.0.0', '')), Origin)))).ToBe('invalid_package_name');
     Expect<string>(RegistryErrorCode(Failure(Options(Unsupported, Origin))))

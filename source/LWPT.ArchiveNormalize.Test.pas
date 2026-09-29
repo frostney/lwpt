@@ -964,7 +964,8 @@ end;
 { The same manifest as a zip. }
 function DependencyZip(const ADependencies: string): TBytes;
 begin
-  Result := DemoZip([], DEMO_MANIFEST + ADependencies);
+  Result := DemoZip([], '[package]'#10'name = "dep"'#10'version = "1.0.0"'#10
+    + ADependencies);
 end;
 
 function DependencyLine(const ADependency: TLWPTRegistryDependency): string;
@@ -1080,6 +1081,11 @@ begin
     'must not be "default"');
   Refused(REGISTRIES + '[dependencies]'#10'json = { source = "registry:json", '
     + 'version = "^1.0.0", tag = "v1" }'#10, 'earlier manifest shape');
+  { Never on the package's own name, on its own origin or another. }
+  Refused(REGISTRIES + '[dependencies]'#10'dep = "registry:dep@^1.0.0"'#10,
+    'dependency "dep" names this package itself');
+  Refused(REGISTRIES + '[dependencies]'#10'dep = "registry:far/dep@^1.0.0"'#10,
+    'names this package itself');
   { Canonical constraints only. }
   Refused(REGISTRIES + '[dependencies]'#10'json = "registry:json"'#10,
     'has no version constraint');

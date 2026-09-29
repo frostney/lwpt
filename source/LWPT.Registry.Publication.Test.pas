@@ -720,8 +720,8 @@ begin
   Expect<Integer>(PublishText('dependent-lib', '1.0.0', RecordText(
     'dependent-lib', '1.0.0', Archive, RegistryTimestampNow, False,
     '[{ name = "base-lib", version = "^1.1.0" }]')).Status).ToBe(409);
-  { Non-canonical lists are refused: unsorted, or with a non-canonical
-    constraint. }
+  { Non-canonical lists are refused: unsorted, with a non-canonical
+    constraint, or naming the record's own origin explicitly. }
   Expect<Integer>(PublishText('other-lib', '1.0.0', RecordText('other-lib',
     '1.0.0', Archive, RegistryTimestampNow, False,
     '[{ origin = "https://other.example.com", name = "far-lib", '
@@ -730,6 +730,27 @@ begin
   Expect<Integer>(PublishText('other-lib', '1.0.0', RecordText('other-lib',
     '1.0.0', Archive, RegistryTimestampNow, False,
     '[{ name = "base-lib", version = ">= 1.0.0" }]')).Status).ToBe(400);
+  { A dependency on the origin's own identity has one encoding: origin
+    omitted. }
+  Response := PublishText('other-lib', '1.0.0', RecordText('other-lib',
+    '1.0.0', Archive, RegistryTimestampNow, False, '[{ origin = "'
+    + FStore.Config.Identity + '", name = "base-lib", version = "^1.0.0" }]'));
+  Expect<Integer>(Response.Status).ToBe(400);
+  Expect<Boolean>(Pos('code = "invalid_request"', RawHTTPBodyText(Response)) > 0)
+    .ToBe(True);
+  { A record never depends on its own package. }
+  Response := PublishText('other-lib', '1.0.0', RecordText('other-lib',
+    '1.0.0', Archive, RegistryTimestampNow, False,
+    '[{ name = "other-lib", version = "^1.0.0" }]'));
+  Expect<Integer>(Response.Status).ToBe(400);
+  Expect<Boolean>(Pos('code = "invalid_request"', RawHTTPBodyText(Response)) > 0)
+    .ToBe(True);
+  { The same name on another origin is another package. }
+  Expect<Integer>(PublishText('other-lib', '1.0.0', RecordText('other-lib',
+    '1.0.0', Archive, RegistryTimestampNow, False,
+    '[{ origin = "https://other.example.com", name = "other-lib", '
+    + 'version = "^1.0.0" }]')).Status).ToBe(201);
+  Head := LatestCheckpointHash;
   Expect<string>(LatestCheckpointHash).ToBe(Head);
 end;
 

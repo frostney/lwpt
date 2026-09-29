@@ -303,9 +303,12 @@ dependencies = []
 ```
 
 `published_at` is an RFC 3339 UTC string with whole seconds. Dependency inline
-tables have field order `origin`, `name`, `version`; `origin` is omitted only
-for the record's own origin. Dependency entries are sorted by origin, name,
-then version bytes.
+tables have field order `origin`, `name`, `version`. `origin` is omitted
+exactly when the dependency is on the record's own origin: an explicit
+`origin` equal to the record's `origin` is not canonical, so every dependency
+has one encoding and one record hash. Dependency entries are sorted by
+effective origin (the record's own for an omitted `origin`), name, then
+version bytes.
 
 Dependency `version` values use a deliberately restricted canonical SemVer
 constraint grammar:
@@ -697,7 +700,8 @@ identity, authorization, version ownership, archive hash, and archive size. The
 record's `name` and `version` MUST equal the path, its `origin` MUST equal the
 origin identity, and it MUST have `yanked = false`; yank state changes only
 through the lifecycle endpoints below, so a yanked record is `400
-invalid_request`.
+invalid_request`. A record MUST NOT depend on its own package identity, its own
+`name` at its own origin; such a record is `400 invalid_request`.
 
 A record's **immutable content** is its content identity: `archive`,
 `archive_size`, and `dependencies`. `published_at` and `yanked` are not part of

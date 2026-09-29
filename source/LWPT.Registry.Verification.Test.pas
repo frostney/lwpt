@@ -117,6 +117,7 @@ type
     procedure ArchiveIdentityMatchesCache;
     procedure WrongTrustAndPriorOriginRejected;
     procedure TypedPackageFieldsRequired;
+    procedure OwnOriginDependencyOmitsOrigin;
     procedure RealOriginPublicationVerified;
     procedure NumericPreviousRejected;
     procedure LockedCheckpointSubstitutionRejected;
@@ -1398,6 +1399,32 @@ begin
   Expect<Boolean>(Pos('non_canonical_document', Actual) = 1).ToBe(True);
 end;
 
+procedure TRegistryVerificationTests.OwnOriginDependencyOmitsOrigin;
+var
+  Text, Explicit, Actual: string;
+  Package: TLWPTRegistryPackage;
+begin
+  Text := AsText(ReadFixture('records/' + Copy(ROOT_RECORD, 8, 64) + '.toml'));
+  { Omitted, the dependency takes the record's origin. }
+  Text := StringReplace(Text, 'dependencies = []',
+    'dependencies = [{ name = "other-lib", version = "^1.0.0" }]', []);
+  Package := ParseRegistryPackage(Text, SHA256BytesPrefixed(BytesOf(Text)),
+    Trust.Origin);
+  Expect<string>(Package.Dependencies[0].Origin).ToBe(Trust.Origin);
+  { Written out, the same dependency is a second encoding, refused. }
+  Explicit := StringReplace(Text, '{ name = "other-lib"',
+    '{ origin = "' + Trust.Origin + '", name = "other-lib"', []);
+  Actual := '';
+  try
+    ParseRegistryPackage(Explicit, SHA256BytesPrefixed(BytesOf(Explicit)),
+      Trust.Origin);
+  except
+    on E: ELWPTRegistryError do Actual := E.Message;
+  end;
+  Expect<string>(Actual).ToBe('non_canonical_document: a dependency on the '
+    + 'record''s own origin omits origin');
+end;
+
 procedure TRegistryVerificationTests.RealOriginPublicationVerified;
 var
   Scratch: string;
@@ -1824,6 +1851,8 @@ begin
   Test('artifact proof binds the cache raw-byte digest', ArchiveIdentityMatchesCache);
   Test('pin mismatch and foreign prior state fail', WrongTrustAndPriorOriginRejected);
   Test('package booleans cannot be replaced by integers', TypedPackageFieldsRequired);
+  Test('a dependency on the record''s own origin has one encoding',
+    OwnOriginDependencyOmitsOrigin);
   Test('real origin publication verifies with localhost identity', RealOriginPublicationVerified);
   Test('snapshot previous hash cannot be an integer', NumericPreviousRejected);
   Test('locked checkpoint bytes cannot be substituted by renewal', LockedCheckpointSubstitutionRejected);

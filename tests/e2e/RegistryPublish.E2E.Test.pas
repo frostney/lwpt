@@ -357,7 +357,7 @@ const
   MALFORMED = 'not-a-token-value';
   { ADR-0051 "Dependency-bearing publication": each refused with its code,
     as a tar.gz and as a zip. }
-  REFUSALS: array[0..5, 0..3] of string = (
+  REFUSALS: array[0..6, 0..3] of string = (
     ('unsupported-lib', 'git-host', '[dependencies]' + #10
       + 'plain-lib = "owner/plain-lib@^1.0.0"' + #10, 'unsupported_dependencies'),
     ('unsupported-lib', 'filter', '[registries.home]' + #10
@@ -372,6 +372,10 @@ const
       + 'plain-lib = "registry:plain-lib@>= 1.0.0"' + #10, 'unsupported_dependencies'),
     ('unsupported-lib', 'workspace', '[dependencies]' + #10
       + 'plain-lib = "workspace:^1.0.0"' + #10, 'unsupported_dependencies'),
+    ('unsupported-lib', 'self', '[registries.home]' + #10
+      + 'identity = "https://home.example.com"' + #10 + '[dependencies]' + #10
+      + 'unsupported-lib = "registry:unsupported-lib@^1.0.0"' + #10,
+      'unsupported_dependencies'),
     ('dotted.lib', 'dotted-name', '', 'invalid_package_name'));
 var
   Listener: TRegistryTestServer;

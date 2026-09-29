@@ -36,7 +36,8 @@
   entry must be a registry: source without include or exclude filters, with
   a constraint already in the protocol's canonical grammar; its alias
   resolves through the manifest's own [registries], which must name the
-  identity explicitly. Anything else is unsupported_dependencies.
+  identity explicitly. A dependency on the package's own name is refused.
+  Anything else is unsupported_dependencies.
 
   Nothing here reads a clock, the environment, the network, or project
   state, or writes a file: input and output are caller-owned memory. }
@@ -281,7 +282,8 @@ end;
 { ADR-0051 decision 10: [dependencies] as record dependencies. Entries are
   read with the manifest's own dependency parser, so the key, alias,
   package-name, and version rules are the ones consumers apply. }
-function MapPublicationDependencies(ARoot: TTOMLNode): TLWPTRegistryDependencyArray;
+function MapPublicationDependencies(ARoot: TTOMLNode;
+  const APackageName: string): TLWPTRegistryDependencyArray;
 var
   Dependencies, Node: TTOMLNode;
   Pair: TTOMLNodeMap.TKeyValuePair;
@@ -326,6 +328,12 @@ begin
       on E: EManifestError do
         RaiseUnsupportedDependency(E.Message);
     end;
+    { Refused on every origin: on its own origin it is a cycle through one
+      identity, and on another it is a second package with this name,
+      which no graph can hold (one package per name). }
+    if Dependency.SrcLocator = APackageName then
+      RaiseUnsupportedDependency('dependency "' + Pair.Key + '" names this '
+        + 'package itself; a package cannot depend on its own name');
     if Dependency.VersionSpec = '' then
       RaiseUnsupportedDependency('dependency "' + Pair.Key + '" has no version '
         + 'constraint; a record dependency needs one, for example ^1.0.0');
@@ -414,7 +422,7 @@ begin
         + 'canonical SemVer 2.0.0');
     Result.Name := NameNode.ScalarText;
     Result.Version := VersionNode.ScalarText;
-    Result.Dependencies := MapPublicationDependencies(Root);
+    Result.Dependencies := MapPublicationDependencies(Root, Result.Name);
   finally
     Root.Free;
   end;
