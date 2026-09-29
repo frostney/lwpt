@@ -331,22 +331,6 @@ type
     property ErrorText: string read FErrorText;
   end;
 
-  { One concurrent writer of a shared destination, like each of two builds
-    regenerating the same version include. }
-  TConcurrentReplaceThread = class(TThread)
-  private
-    FDestination: string;
-    FErrorText: string;
-    FReplaced: Integer;
-    FTag: string;
-  protected
-    procedure Execute; override;
-  public
-    constructor Create(const ADestination, ATag: string);
-    property ErrorText: string read FErrorText;
-    property Replaced: Integer read FReplaced;
-  end;
-
   TMakeTmpPathSuite = class(TTestSuite)
   private
     FScratch: string;
@@ -403,7 +387,6 @@ type
     procedure TestMoveDirReplacesExistingBareDestination;
     procedure TestRetiredExecutableSweepMatchesOnlyRetiredImages;
     procedure TestRetiredExecutableSweepStaysInsideOwnerRoot;
-    procedure TestConcurrentReplacementsNeverAbort;
     {$IFDEF MSWINDOWS}
     procedure TestReplaceFileAtDeepExistingDestination;
     procedure TestReplaceFileRejectsDirectorySource;
@@ -3518,73 +3501,6 @@ begin
     end;
 end;
 
-const
-  ConcurrentReplaceThreadCount = 4;
-  ConcurrentReplaceAttempts = 200;
-
-constructor TConcurrentReplaceThread.Create(const ADestination, ATag: string);
-begin
-  inherited Create(True);
-  FreeOnTerminate := False;
-  FDestination := ADestination;
-  FTag := ATag;
-end;
-
-procedure TConcurrentReplaceThread.Execute;
-var
-  Attempt: Integer;
-  Staged: string;
-begin
-  try
-    for Attempt := 1 to ConcurrentReplaceAttempts do
-    begin
-      Staged := MakeTmpPath(ExtractFileDir(FDestination), 'concurrent');
-      WriteBareFile(Staged, FTag);
-      if AtomicReplaceFile(Staged, FDestination) then
-        Inc(FReplaced)
-      else
-        SysUtils.DeleteFile(Staged);
-    end;
-  except
-    on E: Exception do FErrorText := E.Message;
-  end;
-end;
-
-procedure TAtomicMoveBareDestination.TestConcurrentReplacementsNeverAbort;
-var
-  Content, Destination: string;
-  Index, Replaced: Integer;
-  Threads: array[0..ConcurrentReplaceThreadCount - 1]
-    of TConcurrentReplaceThread;
-begin
-  { Concurrent builds regenerate one version include. On Windows ReplaceFileW
-    can fail with error 1177 after moving the old destination to its backup
-    while a peer publishes into the emptied name. That is an ordinary failed
-    replacement: never an exception, a missing destination, or a leaked
-    backup. On Unix rename(2) makes every attempt succeed. }
-  Destination := IncludeTrailingPathDelimiter(FScratch) + 'shared.txt';
-  WriteBareFile(Destination, 'initial');
-  for Index := 0 to High(Threads) do
-    Threads[Index] := TConcurrentReplaceThread.Create(Destination,
-      'writer-' + IntToStr(Index));
-  try
-    for Index := 0 to High(Threads) do Threads[Index].Start;
-    for Index := 0 to High(Threads) do Threads[Index].WaitFor;
-    Replaced := 0;
-    for Index := 0 to High(Threads) do
-    begin
-      Expect<string>(Threads[Index].ErrorText).ToBe('');
-      Inc(Replaced, Threads[Index].Replaced);
-    end;
-    Expect<Boolean>(Replaced > 0).ToBe(True);
-    Content := ReadBareFile(Destination);
-    Expect<string>(Copy(Content, 1, Length('writer-'))).ToBe('writer-');
-    Expect<Integer>(CountDirEntries(FScratch)).ToBe(1);
-  finally
-    for Index := 0 to High(Threads) do Threads[Index].Free;
-  end;
-end;
-
 function CountRetiredExecutables(const APath: string): Integer;
 var
   SR: TSearchRec;
@@ -4114,8 +4030,6 @@ begin
     TestRetiredExecutableSweepMatchesOnlyRetiredImages);
   Test('retired-image sweep stays inside its owner root',
     TestRetiredExecutableSweepStaysInsideOwnerRoot);
-  Test('concurrent replacements of one file never abort or leak a backup',
-    TestConcurrentReplacementsNeverAbort);
   {$IFDEF MSWINDOWS}
   Test('deep existing destination is replaced without a longer-path backup',
     TestReplaceFileAtDeepExistingDestination);

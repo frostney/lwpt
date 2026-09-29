@@ -14,6 +14,7 @@ uses
 
   LWPT.CompilerRegistry,
   LWPT.Core,
+  LWPT.Manifest,
   LWPT.ProcessRunner,
   LWPT.ProcessTree;
 
@@ -47,6 +48,11 @@ type
     function IsCancelled: Boolean;
   end;
 
+{ Write the manifest's [version] include under the project's build-
+  coordination lock. Exposed for the concurrency regression test. }
+procedure GenerateVersionInclude(const AProjectRoot: string;
+  const AMan: TManifest);
+
 function CmdBuild(const AManifestPath: string;
   const AEntryNames: array of string; const ARelease, AClean: Boolean;
   const AJobs: Integer): Integer; overload;
@@ -70,7 +76,6 @@ uses
   LWPT.BuildSession,
   LWPT.Command.Common,
   LWPT.CompilerDriver,
-  LWPT.Manifest,
   LWPT.Observability,
   LWPT.ProducerLease,
   LWPT.ProgressReporter,
@@ -347,6 +352,7 @@ var
   Lines: TStringList;
   Destination, Pfx, Tmp: string;
   Attempt: Integer;
+  Coordination: TObject;
   Published: Boolean;
 begin
   if AMan.VersionIncOut = '' then Exit;   { [version] not configured }
@@ -372,26 +378,44 @@ begin
       '.' + ExtractFileName(Destination) + '-version');
     Lines.SaveToFile(Tmp);
     { Two `lwpt build` processes in the same project both write this include
-      before compile. Win32 MoveFileEx then fails if the destination is mid-
-      replace; the loser used to abort before it even had a session. A peer
-      that already published the same generated include is success.
-      Dest-exists or same version alone is not: a locked stale include
-      can keep yesterday's BUILD_DATE. }
+      before compile. Unserialized, their replacements interleave: on Windows
+      ReplaceFileW error 1177 leaves one writer's old include at its backup
+      name while a peer publishes into the emptied path, and that writer
+      cannot restore it and aborts before compiling. The project's build
+      coordination lock, which every build's publication already takes,
+      serializes the write across processes and relocated session roots. An
+      include that already holds the expected text is left alone, so a peer
+      compiling against it sees no input change. The retry covers a
+      compiler that still holds the include open. Dest-exists or same
+      version alone is not success: a locked stale include can keep
+      yesterday's BUILD_DATE. }
     Published := False;
-    for Attempt := 1 to ReplaceAttempts do
-    begin
-      if AtomicReplaceFile(Tmp, Destination) then
-      begin
-        Published := True;
-        Break;
-      end;
+    Coordination := AcquireBuildCoordinationLock(AProjectRoot);
+    try
       if VersionIncludeMatchesExpected(Destination, Tmp) then
       begin
         SysUtils.DeleteFile(Tmp);
         Published := True;
-        Break;
       end;
-      Sleep(1);
+      Attempt := 0;
+      while (not Published) and (Attempt < ReplaceAttempts) do
+      begin
+        Inc(Attempt);
+        if AtomicReplaceFile(Tmp, Destination) then
+        begin
+          Published := True;
+          Break;
+        end;
+        if VersionIncludeMatchesExpected(Destination, Tmp) then
+        begin
+          SysUtils.DeleteFile(Tmp);
+          Published := True;
+          Break;
+        end;
+        Sleep(1);
+      end;
+    finally
+      Coordination.Free;
     end;
     if not Published then
     begin

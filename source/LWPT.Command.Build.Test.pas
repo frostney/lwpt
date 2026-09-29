@@ -1,5 +1,6 @@
 { LWPT.Command.Build.Test — TLWPTCompilerProcess cancellation, reaping,
-  and exit-code coverage below the compiler-driver seam. }
+  and exit-code coverage below the compiler-driver seam, plus concurrent
+  version-include generation. }
 
 program LWPT.Command.Build.Test;
 
@@ -20,6 +21,7 @@ uses
 
   LWPT.Command.Build,
   LWPT.Core,
+  LWPT.Manifest,
   LWPT.ProcessTree,
   TestingPascalLibrary,
   Tests.PayloadHandoff,
@@ -49,6 +51,26 @@ type
     procedure TestCompilerNormalExitLeavesDescendantAlive;
     procedure TestCompilerNonZeroExitIsReported;
     procedure TestProcessTreeStateReleasesOwnedResources;
+  end;
+
+  { One build's version-include generation, repeated. }
+  TVersionIncludeThread = class(TThread)
+  private
+    FErrorText: string;
+    FManifest: TManifest;
+    FProjectRoot: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AProjectRoot: string;
+      const AManifest: TManifest);
+    property ErrorText: string read FErrorText;
+  end;
+
+  TLWPTVersionIncludeTests = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestConcurrentGenerationNeverAborts;
   end;
 
   TCompilerRunnerThread = class(TThread)
@@ -287,6 +309,101 @@ begin
     TestProcessTreeStateReleasesOwnedResources);
 end;
 
+const
+  VersionIncludeThreadCount = 4;
+  VersionIncludeGenerations = 50;
+
+constructor TVersionIncludeThread.Create(const AProjectRoot: string;
+  const AManifest: TManifest);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FProjectRoot := AProjectRoot;
+  FManifest := AManifest;
+end;
+
+procedure TVersionIncludeThread.Execute;
+var
+  Generation: Integer;
+begin
+  try
+    for Generation := 1 to VersionIncludeGenerations do
+      GenerateVersionInclude(FProjectRoot, FManifest);
+  except
+    on E: Exception do FErrorText := E.Message;
+  end;
+end;
+
+function CountDirectoryEntries(const APath: string): Integer;
+var
+  Found: TSearchRec;
+begin
+  Result := 0;
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(APath) + '*',
+      faAnyFile, Found) = 0 then
+    try
+      repeat
+        if (Found.Name <> '.') and (Found.Name <> '..') then Inc(Result);
+      until SysUtils.FindNext(Found) <> 0;
+    finally
+      SysUtils.FindClose(Found);
+    end;
+end;
+
+procedure TLWPTVersionIncludeTests.TestConcurrentGenerationNeverAborts;
+var
+  Include, Project: string;
+  Index: Integer;
+  Manifest, WriterManifest: TManifest;
+  Threads: array[0..VersionIncludeThreadCount - 1] of TVersionIncludeThread;
+begin
+  { Concurrent builds of one project each regenerate the version include.
+    Unserialized, Windows ReplaceFileW error 1177 let a peer publish into
+    the path one writer had emptied, and that writer aborted its build
+    (PR #355's BuildSessions failure). Generation now serializes on the
+    project's build-coordination lock. Each writer bakes its own version,
+    so every generation replaces the include instead of finding its text
+    already there: no writer fails, the include holds one writer's text,
+    and no staging or backup file is left beside it. }
+  Project := ExpandFileName('build/tests/tmp/version-include-concurrency');
+  RecursiveDelete(Project);
+  ForceDirectories(Project + '/source');
+  WriteTextFile(Project + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "version-concurrency"'#10
+    + 'version = "1.2.3"'#10
+    + #10
+    + '[version]'#10
+    + 'output = "source/Version.Generated.inc"'#10);
+  Manifest := LoadManifest(Project + '/lwpt.toml');
+  for Index := 0 to High(Threads) do Threads[Index] := nil;
+  try
+    for Index := 0 to High(Threads) do
+    begin
+      WriterManifest := Manifest;
+      WriterManifest.Version := '1.2.' + IntToStr(Index);
+      Threads[Index] := TVersionIncludeThread.Create(Project,
+        WriterManifest);
+    end;
+    for Index := 0 to High(Threads) do Threads[Index].Start;
+    for Index := 0 to High(Threads) do Threads[Index].WaitFor;
+    for Index := 0 to High(Threads) do
+      Expect<string>(Threads[Index].ErrorText).ToBe('');
+    Include := ReadBinaryFile(Project + '/source/Version.Generated.inc');
+    Expect<Boolean>(Pos('BAKED_VERSION = ''1.2.', Include) > 0).ToBe(True);
+    Expect<Integer>(CountDirectoryEntries(Project + '/source')).ToBe(1);
+  finally
+    for Index := 0 to High(Threads) do Threads[Index].Free;
+    RecursiveDelete(Project);
+  end;
+end;
+
+procedure TLWPTVersionIncludeTests.SetupTests;
+begin
+  Test('concurrent version-include generation never aborts',
+    TestConcurrentGenerationNeverAborts);
+end;
+
 function RunCompilerProcessProxy: Integer;
 var
   Child: TProcess;
@@ -377,6 +494,8 @@ begin
     Halt(RunCompilerSurvivingDescendantProxy);
   TestRunnerProgram.AddSuite(TLWPTCompilerProcessTests.Create(
     'build: compiler process'));
+  TestRunnerProgram.AddSuite(TLWPTVersionIncludeTests.Create(
+    'build: version include'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

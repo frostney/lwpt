@@ -1508,17 +1508,12 @@ end;
   ARetireInUseBackup is set only by AtomicReplaceExecutable. }
 function ReplaceFileInOneOperation(const ASrc, ADst: string;
   ARetireInUseBackup: Boolean): Boolean;
-{$IFDEF MSWINDOWS}
-const
-  ReplaceRestoreAttempts = 64;
-{$ENDIF}
 var
   DstDir: string;
   {$IFDEF MSWINDOWS}
   BackupPath: string;
   BackupPathW, DstPathW, SrcPathW: UnicodeString;
   DeleteError, ReplaceError: LongWord;
-  RestoreAttempt: Integer;
   {$ENDIF}
 begin
   {$IFDEF UNIX}
@@ -1565,36 +1560,13 @@ begin
     ReplaceError := Windows.GetLastError;
     if ReplaceError = ERROR_UNABLE_TO_MOVE_REPLACEMENT_2_LWPT then
     begin
-      { Error 1177 leaves the old destination at our backup name. Concurrent
-        writers of the same path (two builds regenerating one version
-        include) race for the emptied name: a peer can publish its own
-        complete file there, so MoveFileEx refuses to restore over it, and a
-        third writer's ReplaceFileW can empty the name again for a moment.
-        Either restore our backup or, when a peer's whole file holds the
-        destination, discard the superseded backup; both are an ordinary
-        failed replacement the caller can retry. Only a destination that
-        stays empty with our backup unrestorable loses the old bytes. }
-      for RestoreAttempt := 1 to ReplaceRestoreAttempts do
-      begin
-        if not WindowsPathExists(BackupPath) then Break;
-        if Windows.MoveFileExW(PWideChar(BackupPathW), PWideChar(DstPathW),
-          MOVEFILE_WRITE_THROUGH_LWPT) then
-          Exit(False);
-        if WindowsPathExists(ADst) then
-        begin
-          if not Windows.DeleteFileW(PWideChar(BackupPathW)) then
-            raise EExtractError.CreateFmt(
-              'atomic replacement of "%s" could not remove its unused backup',
-              [ADst]);
-          Exit(False);
-        end;
-        Sleep(1);
-      end;
-      if (not WindowsPathExists(BackupPath)) and WindowsPathExists(ADst) then
-        Exit(False);
-      raise EExtractError.CreateFmt(
-        'atomic replacement of "%s" could not restore its retained backup',
-        [ADst]);
+      if (not WindowsPathExists(BackupPath))
+        or not Windows.MoveFileExW(PWideChar(BackupPathW),
+          PWideChar(DstPathW), MOVEFILE_WRITE_THROUGH_LWPT) then
+        raise EExtractError.CreateFmt(
+          'atomic replacement of "%s" could not restore its retained backup',
+          [ADst]);
+      Exit(False);
     end;
     if WindowsPathExists(BackupPath)
       and not Windows.DeleteFileW(PWideChar(BackupPathW)) then
