@@ -101,6 +101,7 @@ type
       const ARequireClientCertificate: Boolean = False);
     destructor Destroy; override;
     procedure Join;
+    procedure WaitServed(const ACount: Integer);
     function Outcome(const AIndex: Integer): TServedConnection;
     property Port: Word read FPort;
     property Served: Integer read FServed;
@@ -475,6 +476,16 @@ begin
   WaitFor;
 end;
 
+procedure TLoopbackTLSServer.WaitServed(const ACount: Integer);
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while (FServed < ACount) and not Finished and
+        (GetTickCount64 - StartedAt <= SERVER_JOIN_MILLISECONDS) do
+    Sleep(1);
+end;
+
 function TLoopbackTLSServer.Outcome(const AIndex: Integer): TServedConnection;
 begin
   Result := FResults[AIndex];
@@ -562,7 +573,8 @@ begin
           tssWantWrite:
             Flush(ASocket, Connection);
         else
-          raise Exception.Create('server handshake failed');
+          raise Exception.Create('server handshake failed: ' +
+            TransportSecurityServerFailureReason);
         end;
       end;
       Sleep(1);
@@ -815,17 +827,20 @@ end;
 
 procedure TTransportSecurityClientOptionsE2ETests.TestClientIdentitySatisfiesRequiringServer;
 var
+  ClientError: string;
   Options: TTransportSecurityClientOptions;
   Peer: TBytes;
   Response: AnsiString;
   Served: TServedConnection;
 begin
   Options := ClientIdentityOptions;
-  Expect<string>(RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
-    Options, True, Response, Peer, Served)).ToBe('');
+  ClientError := RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
+    Options, True, Response, Peer, Served);
+  { The server's record comes first: it carries the backend's reason. }
+  Expect<string>(Served.Error).ToBe('');
+  Expect<string>(ClientError).ToBe('');
   Expect<string>(string(Response)).ToBe(OK_RESPONSE);
   Expect<Boolean>(Served.HandshakeSucceeded).ToBe(True);
-  Expect<string>(Served.Error).ToBe('');
 end;
 
 procedure TTransportSecurityClientOptionsE2ETests.TestRequiringServerRefusesAnonymousClient;
@@ -1221,14 +1236,29 @@ end;
 
 procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientSameOriginRedirectKeepsClientIdentity;
 var
+  ClientError: string;
   Response: THTTPResponse;
   Server: TLoopbackTLSServer;
 begin
   Server := TLoopbackTLSServer.Create(SERVER_PKCS12_PATH, tsivStrict,
     [RedirectResponse('/next'), OK_RESPONSE], True);
   try
-    Response := HTTPGet('https://localhost:' + IntToStr(Server.Port) + '/',
-      nil, HTTPSOptions(ClientIdentityOptions));
+    ClientError := '';
+    try
+      Response := HTTPGet('https://localhost:' + IntToStr(Server.Port) +
+        '/', nil, HTTPSOptions(ClientIdentityOptions));
+    except
+      on E: EHTTPError do
+        ClientError := E.Message;
+    end;
+    if ClientError <> '' then
+    begin
+      { The first hop failed, so the second connection never comes. }
+      Server.WaitServed(1);
+      Server.Terminate;
+      Expect<string>(Server.Outcome(0).Error).ToBe('');
+      Expect<string>(ClientError).ToBe('');
+    end;
     Server.Join;
     Expect<Integer>(Response.StatusCode).ToBe(200);
     Expect<Boolean>(Response.Redirected).ToBe(True);
@@ -1259,12 +1289,15 @@ begin
           Failed := True;
       end;
       Origin.Join;
+      { The origin hop must succeed with the identity before the target's
+        outcome means anything; its record carries the backend's reason. }
+      Expect<string>(Origin.Outcome(0).Error).ToBe('');
+      Expect<Boolean>(Origin.Outcome(0).HandshakeSucceeded).ToBe(True);
       Target.Join;
       { A carried identity would let the target's handshake succeed on
         every backend where the client finishes before judging the peer;
         without it the requiring target refuses the handshake itself. }
       Expect<Boolean>(Failed).ToBe(True);
-      Expect<Boolean>(Origin.Outcome(0).HandshakeSucceeded).ToBe(True);
       Expect<Integer>(Target.Served).ToBe(1);
       Expect<Boolean>(Target.Outcome(0).HandshakeSucceeded).ToBe(False);
     finally

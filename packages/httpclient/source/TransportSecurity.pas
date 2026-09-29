@@ -203,6 +203,12 @@ function TransportSecurityClientOptionsAreDefault(
   it imports without persisting keys and requires exactly one identity. }
 procedure ValidateTransportSecurityClientOptions(
   const AOptions: TTransportSecurityClientOptions);
+{ Describes the most recent server-side handshake failure on the calling
+  thread (backend, stage, and native status where the backend exposes one),
+  or '' when none was recorded. Diagnostic text only: it never contains key
+  material, passphrases, or plaintext. Cleared by
+  BeginTransportSecurityServer. }
+function TransportSecurityServerFailureReason: string;
 { DER encoding of the peer's leaf certificate on an active client
   connection; empty when the connection is not an active client or the peer
   presented no certificate. }
@@ -503,6 +509,19 @@ begin
       raise ETransportSecurityError.Create(TLS_WRITE_ERROR);
     Inc(Sent, Written);
   end;
+end;
+
+threadvar
+  ServerFailureReason: string;
+
+procedure RecordServerFailure(const AReason: string);
+begin
+  ServerFailureReason := AReason;
+end;
+
+function TransportSecurityServerFailureReason: string;
+begin
+  Result := ServerFailureReason;
 end;
 
 { Client options: backend-neutral validation and trust-anchor decoding.
@@ -2552,7 +2571,11 @@ begin
       anchors, then resume the paused handshake. }
     if not SecureTransportClientTrustAccepted(Data.Context,
        Data.ClientAnchorArray) then
-      Status := ERR_SSL_CLOSED_ABORT
+    begin
+      RecordServerFailure('Secure Transport server test seam refused the ' +
+        'client certificate chain');
+      Status := ERR_SSL_CLOSED_ABORT;
+    end
     else
       Status := SSLHandshake(Data.Context);
   end;
@@ -2560,7 +2583,11 @@ begin
   begin
     Data.HandshakeDone := True;
     AConnection.Active := True;
-  end;
+  end
+  else if (Status <> ERR_SSL_WOULD_BLOCK) and
+          (TransportSecurityServerFailureReason = '') then
+    RecordServerFailure(Format('Secure Transport server handshake failed: ' +
+      'OSStatus %d', [Status]));
   Result := SecureTransportServerState(AConnection, Status, False);
 end;
 
@@ -4448,6 +4475,11 @@ begin
     Exit;
   end;
 
+  if (ErrorCode <> SSL_ERROR_WANT_READ) and
+     (ErrorCode <> SSL_ERROR_WANT_WRITE) then
+    RecordServerFailure(Format('OpenSSL server handshake failed: SSL error ' +
+      '%d, peer verification result %d', [ErrorCode,
+      SSLGetVerifyResult(Data.SSL)]));
   Result := OpenSSLServerErrorState(AConnection, Data, ErrorCode,
     osoHandshake);
 end;
@@ -5431,6 +5463,80 @@ begin
     SendSocketAll(AConnection, ABuffer.pvBuffer, ABuffer.cbBuffer);
 end;
 
+{ '0x80090325 SEC_E_UNTRUSTED_ROOT' style text for SSPI statuses and the
+  certificate-policy HRESULTs SChannel and crypt32 report. }
+function SChannelStatusText(const AStatus: LongWord): string;
+var
+  Name: string;
+begin
+  case AStatus of
+    $00000000: Name := 'SEC_E_OK';
+    $00090312: Name := 'SEC_I_CONTINUE_NEEDED';
+    $00090317: Name := 'SEC_I_CONTEXT_EXPIRED';
+    $00090320: Name := 'SEC_I_INCOMPLETE_CREDENTIALS';
+    $00090321: Name := 'SEC_I_RENEGOTIATE';
+    $80090300: Name := 'SEC_E_INSUFFICIENT_MEMORY';
+    $80090301: Name := 'SEC_E_INVALID_HANDLE';
+    $80090302: Name := 'SEC_E_UNSUPPORTED_FUNCTION';
+    $80090303: Name := 'SEC_E_TARGET_UNKNOWN';
+    $80090304: Name := 'SEC_E_INTERNAL_ERROR';
+    $80090308: Name := 'SEC_E_INVALID_TOKEN';
+    $8009030C: Name := 'SEC_E_LOGON_DENIED';
+    $8009030D: Name := 'SEC_E_UNKNOWN_CREDENTIALS';
+    $8009030E: Name := 'SEC_E_NO_CREDENTIALS';
+    $8009030F: Name := 'SEC_E_MESSAGE_ALTERED';
+    $80090311: Name := 'SEC_E_NO_AUTHENTICATING_AUTHORITY';
+    $80090318: Name := 'SEC_E_INCOMPLETE_MESSAGE';
+    $80090322: Name := 'SEC_E_WRONG_PRINCIPAL';
+    $80090325: Name := 'SEC_E_UNTRUSTED_ROOT';
+    $80090326: Name := 'SEC_E_ILLEGAL_MESSAGE';
+    $80090327: Name := 'SEC_E_CERT_UNKNOWN';
+    $80090328: Name := 'SEC_E_CERT_EXPIRED';
+    $80090330: Name := 'SEC_E_DECRYPT_FAILURE';
+    $80090331: Name := 'SEC_E_ALGORITHM_MISMATCH';
+    $80090349: Name := 'SEC_E_CERT_WRONG_USAGE';
+    $8009035D: Name := 'SEC_E_INVALID_PARAMETER';
+    $80090363: Name := 'SEC_E_MUTUAL_AUTH_FAILED';
+    $80090367: Name := 'SEC_E_APPLICATION_PROTOCOL_MISMATCH';
+    $800B0101: Name := 'CERT_E_EXPIRED';
+    $800B0109: Name := 'CERT_E_UNTRUSTEDROOT';
+    $800B010A: Name := 'CERT_E_CHAINING';
+    $800B010F: Name := 'CERT_E_CN_NO_MATCH';
+    $800B0110: Name := 'CERT_E_WRONG_USAGE';
+    $80092012: Name := 'CRYPT_E_NO_REVOCATION_CHECK';
+    $80092013: Name := 'CRYPT_E_REVOCATION_OFFLINE';
+  else
+    Name := '';
+  end;
+  Result := Format('0x%.8x', [AStatus]);
+  if Name <> '' then
+    Result := Result + ' ' + Name;
+end;
+
+{ A handshake that ends because the server closed the connection names the
+  last status the client saw and whether it answered a certificate request
+  anonymously, which is where a refused client identity shows up. }
+procedure RaiseSChannelClientHandshakeClosed(const ALastStatus: LongWord;
+  const AReceiveCount: Integer; const ARetriedWithSuppliedCredentials: Boolean);
+var
+  Detail: string;
+begin
+  if AReceiveCount < 0 then
+    Detail := Format('client socket receive failed (WSA %d)',
+      [WSAGetLastError])
+  else
+    Detail := 'the server closed the connection';
+  Detail := Detail + ' after ' + SChannelStatusText(ALastStatus);
+  if ARetriedWithSuppliedCredentials then
+    Detail := Detail +
+      '; SChannel had reported SEC_I_INCOMPLETE_CREDENTIALS for the server''s certificate request';
+  if AReceiveCount < 0 then
+    raise ETransportSecurityError.CreateFmt('%s: %s (client handshake)',
+      [TLS_READ_ERROR, Detail]);
+  raise ETransportSecurityError.CreateFmt('%s: %s (client handshake)',
+    [TLS_HANDSHAKE_ERROR, Detail]);
+end;
+
 function SChannelRequestFlags: LongWord;
 begin
   Result := ISC_REQ_SEQUENCE_DETECT or ISC_REQ_REPLAY_DETECT or
@@ -5551,10 +5657,9 @@ begin
       begin
         ReceiveCount := ReceiveIntoBuffer(AConnection,
           Data.EncryptedInput);
-        if ReceiveCount < 0 then
-          raise ETransportSecurityError.Create(TLS_READ_ERROR);
-        if ReceiveCount = 0 then
-          raise ETransportSecurityError.Create(TLS_HANDSHAKE_ERROR);
+        if ReceiveCount <= 0 then
+          RaiseSChannelClientHandshakeClosed(LongWord(Status), ReceiveCount,
+            (RequestFlags and ISC_REQ_USE_SUPPLIED_CREDS) <> 0);
         Continue;
       end;
 
@@ -5577,7 +5682,15 @@ begin
         SetLength(Data.EncryptedInput, 0);
 
       if Status = SEC_I_INCOMPLETE_CREDENTIALS then
-        raise ETransportSecurityError.Create(TLS_HANDSHAKE_ERROR);
+      begin
+        if Assigned(Data.ClientIdentity) then
+          raise ETransportSecurityError.CreateFmt(
+            '%s: SChannel did not accept the configured client identity for the server''s certificate request (%s, client handshake)',
+            [TLS_HANDSHAKE_ERROR, SChannelStatusText(LongWord(Status))]);
+        raise ETransportSecurityError.CreateFmt(
+          '%s: the server requested a client certificate (%s, client handshake)',
+          [TLS_HANDSHAKE_ERROR, SChannelStatusText(LongWord(Status))]);
+      end;
 
       if Status = SEC_I_CONTINUE_NEEDED then
       begin
@@ -5585,17 +5698,17 @@ begin
         begin
           ReceiveCount := ReceiveIntoBuffer(AConnection,
             Data.EncryptedInput);
-          if ReceiveCount < 0 then
-            raise ETransportSecurityError.Create(TLS_READ_ERROR);
-          if ReceiveCount = 0 then
-            raise ETransportSecurityError.Create(TLS_HANDSHAKE_ERROR);
+          if ReceiveCount <= 0 then
+            RaiseSChannelClientHandshakeClosed(LongWord(Status),
+              ReceiveCount,
+              (RequestFlags and ISC_REQ_USE_SUPPLIED_CREDS) <> 0);
         end;
         Continue;
       end;
 
       if Status <> SEC_E_OK then
-        raise ETransportSecurityError.CreateFmt('%s: 0x%x',
-          [TLS_HANDSHAKE_ERROR, LongWord(Status)]);
+        raise ETransportSecurityError.CreateFmt('%s: %s (client handshake)',
+          [TLS_HANDSHAKE_ERROR, SChannelStatusText(LongWord(Status))]);
     until Status = SEC_E_OK;
 
     Status := QueryContextAttributesW(@Data.Context, SECPKG_ATTR_STREAM_SIZES,
@@ -6080,6 +6193,46 @@ type
     lChainIndex: LongInt;
     lElementIndex: LongInt;
     pvExtraPolicyStatus: Pointer;
+  end;
+
+  { Leading fields of CERT_CHAIN_CONTEXT, CERT_SIMPLE_CHAIN, and
+    CERT_CHAIN_ELEMENT; the structures are only read through the pointers
+    CertGetCertificateChain returns. }
+  TCertTrustStatus = record
+    dwErrorStatus: LongWord;
+    dwInfoStatus: LongWord;
+  end;
+
+  PCertChainElementLWPT = ^TCertChainElementLWPT;
+  TCertChainElementLWPT = record
+    cbSize: LongWord;
+    pCertContext: PCertContext;
+    TrustStatus: TCertTrustStatus;
+  end;
+
+  PCertSimpleChainLWPT = ^TCertSimpleChainLWPT;
+  TCertSimpleChainLWPT = record
+    cbSize: LongWord;
+    TrustStatus: TCertTrustStatus;
+    cElement: LongWord;
+    rgpElement: ^PCertChainElementLWPT;
+  end;
+
+  PCertChainContextLWPT = ^TCertChainContextLWPT;
+  TCertChainContextLWPT = record
+    cbSize: LongWord;
+    TrustStatus: TCertTrustStatus;
+    cChain: LongWord;
+    rgpChain: ^PCertSimpleChainLWPT;
+  end;
+
+  { What one chain evaluation found, for diagnostics and the test seam. }
+  TSChannelChainReport = record
+    ChainErrorStatus: LongWord;
+    ElementCount: Integer;
+    IntermediatesFromPeer: Boolean;
+    PeerStoreCount: Integer;
+    PolicyError: LongWord;
   end;
 
 {$IFDEF CPU64}
@@ -7113,14 +7266,45 @@ begin
   Identity.Release;
 end;
 
+function CountStoreCertificates(const AStore: HCERTSTORE): Integer;
+var
+  Enumerated: PCertContext;
+begin
+  Result := 0;
+  if not Assigned(AStore) then
+    Exit;
+  Enumerated := CertEnumCertificatesInStore(AStore, nil);
+  while Assigned(Enumerated) do
+  begin
+    Inc(Result);
+    Enumerated := CertEnumCertificatesInStore(AStore, Enumerated);
+  end;
+end;
+
+function SChannelStoreHasCertificate(const AStore: HCERTSTORE;
+  const ACertificate: PCertContext): Boolean;
+const
+  CERT_FIND_EXISTING = $000D0000;
+var
+  Found: PCertContext;
+begin
+  Found := CertFindCertificateInStore(AStore, CERT_ENCODING_TYPES, 0,
+    CERT_FIND_EXISTING, ACertificate, nil);
+  Result := Assigned(Found);
+  if Result then
+    CertFreeCertificateContext(Found);
+end;
+
 { Builds APeer's chain in AEngine (nil for the current user's default
-  engine) using only certificates APeer's store supplies as intermediates
-  beyond the engine's own, then applies the SSL chain policy for the given
-  authentication direction. Returns 0 when the chain is acceptable. }
-function SChannelChainPolicyError(const AEngine: Pointer;
+  engine), with APeer's own store as the extra source of intermediates, and
+  applies the SSL chain policy for the given authentication direction.
+  AReport.PolicyError is 0 when the chain is acceptable; the report also
+  records the chain trust flags and whether every intermediate the chain
+  used was among the certificates the peer sent. }
+procedure SChannelEvaluateChain(const AEngine: Pointer;
   const APeer: PCertContext; const AHost: string;
-  const AServerAuthentication: Boolean; const AChainFlags: LongWord):
-  LongWord;
+  const AServerAuthentication: Boolean; const AChainFlags: LongWord;
+  out AReport: TSChannelChainReport);
 const
   CERT_CHAIN_POLICY_SSL = 4;
   AUTHTYPE_CLIENT = 1;
@@ -7130,13 +7314,20 @@ const
   OID_CLIENT_AUTHENTICATION = '1.3.6.1.5.5.7.3.2';
 var
   Chain: Pointer;
+  ChainContext: PCertChainContextLWPT;
   ChainPara: TCertChainPara;
+  Element: PCertChainElementLWPT;
+  I: Integer;
   PolicyPara: TCertChainPolicyPara;
   PolicyStatus: TCertChainPolicyStatus;
   ServerName: UnicodeString;
+  SimpleChain: PCertSimpleChainLWPT;
   SSLPara: TSSLExtraCertChainPolicyPara;
   Usages: array[0..0] of PAnsiChar;
 begin
+  FillChar(AReport, SizeOf(AReport), 0);
+  AReport.PolicyError := CERT_E_CHAINING_LWPT;
+  AReport.PeerStoreCount := CountStoreCertificates(APeer^.hCertStore);
   if AServerAuthentication then
     Usages[0] := PAnsiChar(OID_SERVER_AUTHENTICATION)
   else
@@ -7149,8 +7340,26 @@ begin
   Chain := nil;
   if not CertGetCertificateChain(AEngine, APeer, nil, APeer^.hCertStore,
     ChainPara, AChainFlags, nil, Chain) or not Assigned(Chain) then
-    Exit(CERT_E_CHAINING_LWPT);
+    Exit;
   try
+    ChainContext := PCertChainContextLWPT(Chain);
+    AReport.ChainErrorStatus := ChainContext^.TrustStatus.dwErrorStatus;
+    AReport.IntermediatesFromPeer := True;
+    if ChainContext^.cChain > 0 then
+    begin
+      SimpleChain := ChainContext^.rgpChain^;
+      AReport.ElementCount := SimpleChain^.cElement;
+      { Element 0 is the peer's leaf and the last element the root; every
+        element between them is an intermediate. }
+      for I := 1 to Integer(SimpleChain^.cElement) - 2 do
+      begin
+        Element := PCertChainElementLWPT(PPointer(PtrUInt(
+          SimpleChain^.rgpElement) + PtrUInt(I) * SizeOf(Pointer))^);
+        if not SChannelStoreHasCertificate(APeer^.hCertStore,
+           Element^.pCertContext) then
+          AReport.IntermediatesFromPeer := False;
+      end;
+    end;
     ServerName := UnicodeString(AHost);
     FillChar(SSLPara, SizeOf(SSLPara), 0);
     SSLPara.cbSize := SizeOf(SSLPara);
@@ -7166,63 +7375,81 @@ begin
     PolicyPara.pvExtraPolicyPara := @SSLPara;
     FillChar(PolicyStatus, SizeOf(PolicyStatus), 0);
     PolicyStatus.cbSize := SizeOf(PolicyStatus);
-    if not CertVerifyCertificateChainPolicy(
+    if CertVerifyCertificateChainPolicy(
       PAnsiChar(PtrUInt(CERT_CHAIN_POLICY_SSL)), Chain, PolicyPara,
       PolicyStatus) then
-      Exit(CERT_E_CHAINING_LWPT);
-    Result := PolicyStatus.dwError;
+      AReport.PolicyError := PolicyStatus.dwError;
   finally
     CertFreeCertificateChain(Chain);
   end;
 end;
 
-{ Chain policy in an engine whose only roots are AAnchors. With
-  ARestrictIntermediates the engine also searches no system store for
-  intermediates and fetches nothing, so they can come only from the peer's
-  own certificate message. }
-function SChannelAnchorPolicyError(const AAnchors: HCERTSTORE;
+function SChannelChainPolicyError(const AEngine: Pointer;
   const APeer: PCertContext; const AHost: string;
-  const AServerAuthentication, ARestrictIntermediates: Boolean): LongWord;
+  const AServerAuthentication: Boolean; const AChainFlags: LongWord):
+  LongWord;
+var
+  Report: TSChannelChainReport;
+begin
+  SChannelEvaluateChain(AEngine, APeer, AHost, AServerAuthentication,
+    AChainFlags, Report);
+  Result := Report.PolicyError;
+end;
+
+function DescribeSChannelChainReport(
+  const AReport: TSChannelChainReport): string;
+begin
+  Result := Format('policy %s, chain trust errors 0x%.8x, %d chain ' +
+    'element(s), %d certificate(s) received',
+    [SChannelStatusText(AReport.PolicyError), AReport.ChainErrorStatus,
+     AReport.ElementCount, AReport.PeerStoreCount]);
+end;
+
+{ Chain evaluation in an engine whose only roots are AAnchors. With
+  ARequirePeerIntermediates the evaluation also fails unless every
+  intermediate the chain used arrived in the peer's own certificate
+  message, and AIA fetching is disabled. System stores are still searched,
+  so the check is observable rather than a quirk of engine restriction. }
+procedure SChannelEvaluateAnchorChain(const AAnchors: HCERTSTORE;
+  const APeer: PCertContext; const AHost: string;
+  const AServerAuthentication, ARequirePeerIntermediates: Boolean;
+  out AReport: TSChannelChainReport);
 const
-  CERT_STORE_PROV_MEMORY = 2;
   CERT_CHAIN_DISABLE_AIA = $00002000;
 var
   ChainFlags: LongWord;
   Config: TCertChainEngineConfig;
-  Empty: HCERTSTORE;
   Engine: Pointer;
 begin
   FillChar(Config, SizeOf(Config), 0);
   Config.cbSize := SizeOf(Config);
   Config.hExclusiveRoot := AAnchors;
-  Empty := nil;
   ChainFlags := 0;
-  if ARestrictIntermediates then
-  begin
-    Empty := CertOpenStore(PAnsiChar(PtrUInt(CERT_STORE_PROV_MEMORY)), 0, 0,
-      0, nil);
-    if not Assigned(Empty) then
-      raise ETransportSecurityError.Create(
-        'Failed to create the TLS intermediate restriction store');
-    Config.hRestrictedOther := Empty;
+  if ARequirePeerIntermediates then
     ChainFlags := CERT_CHAIN_DISABLE_AIA;
-  end;
+  Engine := nil;
+  if not CertCreateCertificateChainEngine(Config, Engine) or
+     not Assigned(Engine) then
+    raise ETransportSecurityError.CreateFmt(
+      'Failed to create the TLS trust-anchor chain engine: %s',
+      [SChannelStatusText(LongWord(Windows.GetLastError))]);
   try
-    Engine := nil;
-    if not CertCreateCertificateChainEngine(Config, Engine) or
-       not Assigned(Engine) then
-      raise ETransportSecurityError.Create(
-        'Failed to create the TLS trust-anchor chain engine');
-    try
-      Result := SChannelChainPolicyError(Engine, APeer, AHost,
-        AServerAuthentication, ChainFlags);
-    finally
-      CertFreeCertificateChainEngine(Engine);
-    end;
+    SChannelEvaluateChain(Engine, APeer, AHost, AServerAuthentication,
+      ChainFlags, AReport);
   finally
-    if Assigned(Empty) then
-      CertCloseStore(Empty, 0);
+    CertFreeCertificateChainEngine(Engine);
   end;
+end;
+
+function SChannelAnchorPolicyError(const AAnchors: HCERTSTORE;
+  const APeer: PCertContext; const AHost: string;
+  const AServerAuthentication: Boolean): LongWord;
+var
+  Report: TSChannelChainReport;
+begin
+  SChannelEvaluateAnchorChain(AAnchors, APeer, AHost, AServerAuthentication,
+    False, Report);
+  Result := Report.PolicyError;
 end;
 
 procedure VerifySChannelClientPeer(const AContext: TSecHandle;
@@ -7246,11 +7473,10 @@ begin
     if AOptions.TrustMode = tstmSystemAndAnchors then
       ErrorCode := SChannelChainPolicyError(nil, Peer, AHost, True, 0);
     if ErrorCode <> 0 then
-      ErrorCode := SChannelAnchorPolicyError(AAnchorStore, Peer, AHost, True,
-        False);
+      ErrorCode := SChannelAnchorPolicyError(AAnchorStore, Peer, AHost, True);
     if ErrorCode <> 0 then
-      raise ETransportSecurityError.CreateFmt('%s: 0x%x',
-        [TLS_VERIFICATION_ERROR, ErrorCode]);
+      raise ETransportSecurityError.CreateFmt('%s: %s',
+        [TLS_VERIFICATION_ERROR, SChannelStatusText(ErrorCode)]);
   finally
     CertFreeCertificateContext(Peer);
   end;
@@ -7345,24 +7571,34 @@ begin
   end;
 end;
 
-{ Whether an accepted server connection received a client certificate that
-  chains to the seam's anchors; used only by the test-only client-certificate
-  seam. }
-function SChannelServerClientCertificateAccepted(
-  const AData: TSChannelServerData): Boolean;
+{ Test-only seam: '' when the accepted server connection received a client
+  certificate that chains to the seam's anchors for client authentication
+  using only intermediates from the client's own Certificate message;
+  otherwise why not. }
+function SChannelServerClientCertificateRejection(
+  const AData: TSChannelServerData): string;
 var
   Peer: PCertContext;
+  Report: TSChannelChainReport;
+  Status: SECURITY_STATUS;
 begin
   Peer := nil;
-  Result := False;
-  if (QueryContextAttributesW(@AData.Context,
-     SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Peer) <> SEC_E_OK) or
-     not Assigned(Peer) then
-    Exit;
+  Status := QueryContextAttributesW(@AData.Context,
+    SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Peer);
+  if (Status <> SEC_E_OK) or not Assigned(Peer) then
+    Exit(Format('no client certificate (QueryContextAttributes %s)',
+      [SChannelStatusText(LongWord(Status))]));
   try
-    Result := Assigned(AData.ClientAnchorStore) and
-      (SChannelAnchorPolicyError(AData.ClientAnchorStore, Peer, '', False,
-       True) = 0);
+    if not Assigned(AData.ClientAnchorStore) then
+      Exit('no client anchors configured');
+    SChannelEvaluateAnchorChain(AData.ClientAnchorStore, Peer, '', False,
+      True, Report);
+    if Report.PolicyError <> 0 then
+      Exit('client chain rejected: ' + DescribeSChannelChainReport(Report));
+    if not Report.IntermediatesFromPeer then
+      Exit('client chain used an intermediate the client did not send: ' +
+        DescribeSChannelChainReport(Report));
+    Result := '';
   finally
     CertFreeCertificateContext(Peer);
   end;
@@ -7663,6 +7899,7 @@ var
   InputDescriptor: TSecBufferDesc;
   OutputBuffer: TSecBuffer;
   OutputDescriptor: TSecBufferDesc;
+  Rejection: string;
   RequestFlags: LongWord;
   Status: SECURITY_STATUS;
   TokenQueued: Boolean;
@@ -7749,6 +7986,9 @@ begin
     end;
     if not TokenQueued then
     begin
+      RecordServerFailure(Format('SChannel server handshake could not ' +
+        'stage its token after AcceptSecurityContext %s',
+        [SChannelStatusText(LongWord(Status))]));
       PoisonSChannelServerConnection(AConnection);
       Result := tssError;
       Exit;
@@ -7760,6 +8000,8 @@ begin
         SECPKG_ATTR_STREAM_SIZES, @Data.StreamSizes);
       if Status <> SEC_E_OK then
       begin
+        RecordServerFailure(Format('SChannel server stream-size query ' +
+          'failed: %s', [SChannelStatusText(LongWord(Status))]));
         PoisonSChannelServerConnection(AConnection);
         Result := tssError;
         Exit;
@@ -7774,12 +8016,17 @@ begin
         Exit;
       end;
       Data.Protocol := ConnectionInfo.dwProtocol;
-      if Data.RequireClientCertificate and
-         not SChannelServerClientCertificateAccepted(Data) then
+      if Data.RequireClientCertificate then
       begin
-        PoisonSChannelServerConnection(AConnection);
-        Result := tssError;
-        Exit;
+        Rejection := SChannelServerClientCertificateRejection(Data);
+        if Rejection <> '' then
+        begin
+          RecordServerFailure('SChannel server test seam refused the client ' +
+            'certificate: ' + Rejection);
+          PoisonSChannelServerConnection(AConnection);
+          Result := tssError;
+          Exit;
+        end;
       end;
       Data.HandshakeDone := True;
       AConnection.Active := True;
@@ -7793,6 +8040,8 @@ begin
 
     if Status <> SEC_I_CONTINUE_NEEDED then
     begin
+      RecordServerFailure(Format('SChannel server AcceptSecurityContext ' +
+        'failed: %s', [SChannelStatusText(LongWord(Status))]));
       PoisonSChannelServerConnection(AConnection);
       Result := tssError;
       Exit;
@@ -8673,6 +8922,7 @@ procedure BeginTransportSecurityServer(
   var AConnection: TTransportSecurityConnection;
   const AContext: TTransportSecurityServerContext);
 begin
+  RecordServerFailure('');
   FillChar(AConnection, SizeOf(AConnection), 0);
   AConnection.Backend := TSB_NONE;
 

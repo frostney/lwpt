@@ -54,7 +54,16 @@ function TransportSecurityPeerCertificate(const AConnection): TBytes;
 procedure ValidateTransportSecurityClientOptions(const AOptions);
 function DefaultTransportSecurityClientOptions: TTransportSecurityClientOptions;
 function TransportSecurityClientOptionsAreDefault(const AOptions): Boolean;
+function TransportSecurityServerFailureReason: string;
 ```
+
+SChannel client handshake failures name the stage and the last
+`SECURITY_STATUS` (hex and symbolic name), including whether SChannel
+reported `SEC_I_INCOMPLETE_CREDENTIALS` for a certificate request.
+`TransportSecurityServerFailureReason` describes the calling thread's most
+recent server-side handshake failure (the SChannel status or the OpenSSL
+error and peer-verification result) so feed/drain server owners can log why
+a handshake ended. Neither carries key material or plaintext.
 
 `ValidateTransportSecurityClientOptions` opens no socket and persists
 nothing, so callers can reject a bad configuration before connecting.
@@ -188,9 +197,12 @@ uses a connection-private verify store holding only the anchors with
 `SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT`; Secure Transport uses
 `kAlwaysAuthenticate`, breaks on client authentication, and evaluates with
 the client SSL policy, the anchors only, and network fetching disabled;
-SChannel adds `ASC_REQ_MUTUAL_AUTH` and builds the chain in an
-exclusive-anchor engine whose `hRestrictedOther` is empty and with AIA
-disabled. The test client identity uses its own root and intermediate, so
+SChannel adds `ASC_REQ_MUTUAL_AUTH`, builds the chain in an
+exclusive-anchor engine with AIA disabled, and refuses a chain that used any
+intermediate absent from the certificates the client sent (the remote
+certificate's store). That last check is explicit rather than an engine
+restriction, because the client's own published intermediates sit in the
+same user's store on a single test machine. The test client identity uses its own root and intermediate, so
 a client that omits its bundled intermediate is refused. The loopback
 E2E suite `packages/httpclient/tests/e2e/TransportSecurityClientOptions.E2E.Test.pas`
 drives the production client against these server backends on every
