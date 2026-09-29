@@ -109,7 +109,12 @@ begin
   { No MSG_NOSIGNAL on Darwin: a send to a peer that already closed must
     fail with EPIPE instead of raising SIGPIPE. }
   Enabled := 1;
-  fpSetSockOpt(FSocket, SOL_SOCKET, $1022 { SO_NOSIGPIPE }, @Enabled, SizeOf(Enabled));
+  if fpSetSockOpt(FSocket, SOL_SOCKET, $1022 { SO_NOSIGPIPE }, @Enabled,
+    SizeOf(Enabled)) <> 0 then
+  begin
+    CloseSocket(FSocket);
+    raise Exception.Create('raw HTTP socket could not suppress SIGPIPE');
+  end;
   {$ENDIF}
   {$ENDIF}
   FillChar(Address, SizeOf(Address), 0);
