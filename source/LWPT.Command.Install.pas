@@ -29,6 +29,8 @@ var
   Mode : TInstallTransactionMode;
 begin
   Ctx := LoadManifestContext(AManifestPath);
+  { A v3 lock is refused before hooks or any other change (ADR-0052). }
+  RequireProjectLockfileSchema(Ctx);
   WriteLn('package: ', Ctx.Manifest.Name, ' ', Ctx.Manifest.Version);
   RunHooks('preinstall', Ctx.Manifest.PreInstall, Ctx.ProjectRoot);
   if AFrozen then

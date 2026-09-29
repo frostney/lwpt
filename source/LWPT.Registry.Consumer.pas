@@ -238,7 +238,7 @@ function RegistryAcceptedStatesEqual(const ALeft,
   ARight: TLWPTRegistryConsumerState): Boolean;
 function RegistryRotationHashes(
   const ARotations: TLWPTRegistryRotationProofArray): TStringArray;
-function LoadRegistryLockTables(const APath: string): TLWPTRegistryLockTableArray;
+function LoadRegistryLockTables(const APath: string; const AAcceptSchemaV3: Boolean = False): TLWPTRegistryLockTableArray;
 procedure RenderRegistryLockTables(const ATables: TLWPTRegistryLockTableArray;
   ALines: TStrings);
 function RegistryProofPath(const AArchivesRoot, AHash: string): string;
@@ -808,7 +808,8 @@ end;
   Lock tables
   --------------------------------------------------------------------------- }
 
-function LoadRegistryLockTables(const APath: string): TLWPTRegistryLockTableArray;
+function LoadRegistryLockTables(const APath: string;
+  const AAcceptSchemaV3: Boolean): TLWPTRegistryLockTableArray;
 var
   Lines: TStringList;
   Parser: TTOMLParser;
@@ -829,6 +830,8 @@ begin
     except
       on E: ETOMLParseError do Exit;
     end;
+    { The shared lock schema gate (ADR-0052). }
+    CheckLockfileSchema(Root, APath, AAcceptSchemaV3);
     Tables := TomlGet(Root, 'registry');
     if not TomlIsTable(Tables) then Exit;
     for Pair in Tables.Children do

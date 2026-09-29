@@ -51,7 +51,11 @@ type
   TInstallTransactionMode = (
     itmMaterialize,
     itmFrozenVerify,
-    itmOfflineMaterialize
+    itmOfflineMaterialize,
+    { `lwpt repair` only (ADR-0052): read a schema-v3 lock, re-derive every
+      module without network from its archive, proof, or source anchor, and
+      write the v4 lock. }
+    itmSchemaUpgrade
   );
 
   TInstallTransactionResult = record
@@ -137,7 +141,9 @@ const
     fingerprint and invalidates every committed lockfile. }
   CONSTRAINT_FINGERPRINT_SEPARATOR = #10;
 
-function  LoadLockfile(const APath: string): TResolvedArray;
+{ AAcceptSchemaV3 is for the v3-to-v4 upgrade only; it skips the v4
+  computedHash format check, since v3 values are never trusted. }
+function  LoadLockfile(const APath: string; const AAcceptSchemaV3: Boolean = False): TResolvedArray;
 function  ConstraintFingerprintForLines(const ALines: TStrings): string;
 function  ConstraintFingerprintForNode(const ANode: TResolveNode; const AProjectRoot: string): string;
 {$IFDEF INSTALL_TESTING}
@@ -148,6 +154,9 @@ function  ExtractArchive(const AArchivePath, ADest: string; const ASubDir: strin
 procedure VerifyAgainstLockfile(const AResolved: array of TResolved; const ALockEntries: array of TResolved);
 function  PruneOrphanedPackages(const AOldLock, ANewLock: array of TResolved; const AModulesRoot, AArchivesRoot: string): Integer;
 function  RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode; const AAcceptMovedTags: Boolean = False): TInstallTransactionResult;
+{ The lock gate every lock-reading command runs before it changes anything
+  (ADR-0052): a v3 lock is refused with LockfileSchemaV3Message. }
+procedure RequireProjectLockfileSchema(const AContext: TManifestContext);
 function  RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
 procedure RecoverInterruptedInstall(const AContext: TManifestContext);
 
@@ -568,9 +577,6 @@ end;
   the source remains untouched until the copy completes. ADR-0002
   consequences mentions this; docs/tooling.md is the canonical reference.
   =========================================================================== }
-const
-  LOCKFILE_SCHEMA_VERSION = 3;
-
 { ── TInstallLock ──────────────────────────────────────────────────── }
 
 { Cross-process install lock. Uses O_CREAT|O_EXCL for atomic create-
@@ -1867,9 +1873,17 @@ begin
   ASL.Add('version = ' + IntToStr(LOCKFILE_SCHEMA_VERSION));
   for i := 0 to High(AResolved) do
   begin
+    { The writer never emits anything but a tree2 digest (ADR-0052): the
+      in-memory "unfetched" placeholder, or a legacy value, is an error
+      before any lock is written. }
+    if not IsTreeDigest(AResolved[i].Hash) then
+      raise ELockfileError.CreateFmt(
+        'refusing to write %s: "%s" has no %s tree digest (computedHash "%s")',
+        [LWPT.Core.LOCKFILE, AResolved[i].Name, TREE_DIGEST_ALGORITHM,
+         AResolved[i].Hash]);
     ASL.Add('');
     ASL.Add('[package.' + AResolved[i].Name + ']');
-    { Schema v3 (ADR-0009 / ADR-0010):
+    { Schema v4 (ADR-0009 / ADR-0010 / ADR-0052):
         locator       = the manifest's source string, verbatim. The
                         host + kind are inferable from this string
                         via ParseDependencySource — no separate
@@ -1877,7 +1891,8 @@ begin
         resolvedRef   = the concrete git ref (tag/SHA/branch); ''
                         for skLocal + skURL.
         resolvedURL   = the actual archive URL fetched; '' for skLocal.
-        computedHash  = sha256 of the extracted tree.
+        computedHash  = sha256-tree2 framed digest of the extracted tree
+                        (ADR-0052).
         archiveHash   = sha256 of the cached tarball; '' for skLocal. }
     KV('source',       AResolved[i].SrcOriginal);
     KV('resolvedRef',  AResolved[i].Version);
@@ -2031,11 +2046,12 @@ end;
   hashes for verification. Rejects v1 lockfiles with a clear migration
   hint; the user runs `lwpt install` (no --frozen) to regenerate.
   =========================================================================== }
-function LoadLockfile(const APath: string): TResolvedArray;
+function LoadLockfile(const APath: string;
+  const AAcceptSchemaV3: Boolean): TResolvedArray;
 var
   SL : TStringList;
   Parser : TTOMLParser;
-  Root, PkgTable, EntryNode, VersionNode : TTOMLNode;
+  Root, PkgTable, EntryNode : TTOMLNode;
   Pair : TTOMLNodeMap.TKeyValuePair;
   n, SchemaVer : Integer;
   Entry : TResolved;
@@ -2065,19 +2081,10 @@ begin
   end;
 
   try
-    { Schema check. Older lockfiles bail with a clear migration hint
-      rather than silently accepting them. }
-    VersionNode := TomlGet(Root, 'version');
-    if not TomlIsInt(VersionNode) then
-      raise ELockfileError.CreateFmt(
-        'lockfile %s has no schema version. Delete and re-run `lwpt install`.',
-        [APath]);
-    SchemaVer := StrToIntDef(VersionNode.ScalarText, -1);
-    if SchemaVer <> LOCKFILE_SCHEMA_VERSION then
-      raise ELockfileError.CreateFmt(
-        'lockfile %s is schema v%d; this lwpt expects v%d. '
-        + 'Delete %s and run `lwpt install` to regenerate.',
-        [APath, SchemaVer, LOCKFILE_SCHEMA_VERSION, APath]);
+    { The shared schema gate (ADR-0052): v1 and v2 bail with their
+      migration hint, v3 with the `repair` hint unless this is the upgrade,
+      and anything newer than v4 names the newer schema. }
+    SchemaVer := CheckLockfileSchema(Root, APath, AAcceptSchemaV3);
 
     PkgTable := TomlGet(Root, 'package');
     SetLength(Result, 0);
@@ -2100,6 +2107,16 @@ begin
       Entry.ResolvedURL := TomlStr(EntryNode, 'resolvedURL', '');
       Entry.Hash        := TomlStr(EntryNode, 'computedHash', '');
       Entry.ArchiveHash := TomlStr(EntryNode, 'archiveHash',  '');
+      { A v4 lock never holds a legacy digest: a v3 value edited into a v4
+        lock would reopen #352. }
+      if (SchemaVer = LOCKFILE_SCHEMA_VERSION)
+         and not IsTreeDigest(Entry.Hash) then
+        raise ELockfileError.CreateFmt(
+          'lockfile %s is incompatible: entry "%s" has computedHash "%s", but '
+          + 'schema v%d requires "%s" followed by 64 lowercase hex digits. '
+          + 'Do not edit %s by hand; restore it from version control.',
+          [APath, Entry.Name, Entry.Hash, LOCKFILE_SCHEMA_VERSION,
+           TREE_DIGEST_PREFIX, LWPT.Core.LOCKFILE]);
       Entry.RegistryOrigin := TomlStr(EntryNode, 'registryOrigin', '');
       Entry.RegistryRecord := TomlStr(EntryNode, 'registryRecord', '');
       { Infer the source kind + host from the verbatim source string
@@ -2203,7 +2220,64 @@ begin
 end;
 
 procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
-  const ALockEntries: array of TResolved); forward;
+  const ALockEntries: array of TResolved;
+  const ACheckTreeHash: Boolean); forward;
+
+{ The lock path as the user sees it: project-relative with '/' separators
+  when inside the project. }
+function ProjectDisplayPath(const AProjectRoot, APath: string): string;
+var RootAbs, PathAbs: string;
+begin
+  Result := APath;
+  if (AProjectRoot = '') or (APath = '') then Exit;
+  RootAbs := IncludeTrailingPathDelimiter(ExpandFileName(AProjectRoot));
+  PathAbs := ExpandFileName(APath);
+  if Copy(PathAbs, 1, Length(RootAbs)) = RootAbs then
+    Result := StringReplace(Copy(PathAbs, Length(RootAbs) + 1, MaxInt), '',
+      '/', [rfReplaceAll]);
+end;
+
+const
+  SCHEMA_UPGRADE_ALTERNATIVE = ' To give up the version-stable migration, '
+    + 'delete `' + LWPT.Core.LOCKFILE + '` and run `' + PROGRAM_NAME
+    + ' install`; that needs network access and moves range dependencies '
+    + 'to their newest matching versions.';
+
+function SchemaUpgradePrefix: string;
+begin
+  Result := '`' + PROGRAM_NAME + ' repair` cannot upgrade `'
+    + LWPT.Core.LOCKFILE + '` from schema v3: ';
+end;
+
+{ A missing or mismatching archive anchor during the v3-to-v4 upgrade
+  (ADR-0052 section 5). The --offline hint would point at an online install,
+  which refuses the remaining v3 lock. }
+function SchemaUpgradeArchiveMessage(const AName, ADisplayPath: string): string;
+begin
+  Result := SchemaUpgradePrefix + 'the archive for "' + AName + '" at `'
+    + ADisplayPath + '` is missing or does not match its locked '
+    + '`archiveHash`, and the per-user cache has no matching copy. Restore '
+    + 'that exact archive, for example from version control, and run `'
+    + PROGRAM_NAME + ' repair` again.' + SCHEMA_UPGRADE_ALTERNATIVE;
+end;
+
+function SchemaUpgradeProofMessage(const AName, ADisplayPath: string): string;
+begin
+  Result := SchemaUpgradePrefix + 'the registry proof document for "' + AName
+    + '" at `' + ADisplayPath + '` is missing or does not match its hash, '
+    + 'and the per-user document store has no matching copy. Restore that '
+    + 'exact document, for example from version control, and run `'
+    + PROGRAM_NAME + ' repair` again.' + SCHEMA_UPGRADE_ALTERNATIVE;
+end;
+
+function SchemaUpgradeAgreementMessage(const ADetail: string): string;
+begin
+  Result := SchemaUpgradePrefix + 'the manifest does not agree with the '
+    + 'lockfile (' + ADetail + '). Restore the ' + MANIFEST_FILE + ' that `'
+    + LWPT.Core.LOCKFILE + '` was written from, run `' + PROGRAM_NAME
+    + ' repair`, and then change the manifest.'
+    + SCHEMA_UPGRADE_ALTERNATIVE;
+end;
 
 procedure AppendRollbackFailure(var AFailures: string;
   const AMessage: string);
@@ -3040,25 +3114,24 @@ begin
 end;
 
 { The SHA-256 of one file's content, normalized as tree hashing normalizes
-  it, so a CRLF checkout compares equal to its LF extraction. }
+  it, so a CRLF checkout compares equal to its LF extraction. Streamed, as
+  the tree digest streams it. }
 function NormalizedFileDigest(const APath: string): string;
-var Stream: TLWPTProtectedFileStream; Bytes: TBytes;
+var Stream: TLWPTProtectedFileStream; Size: Int64;
 begin
   Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
-    SetLength(Bytes, Stream.Size);
-    if Length(Bytes) > 0 then Stream.ReadBuffer(Bytes[0], Length(Bytes));
+    Result := SHA256DigestHex(TreeContentDigest(Stream, Size));
   finally
     Stream.Free;
   end;
-  Result := SHA256Hex(NormalizeTreeHashContent(Bytes));
 end;
 
 { '' when AActual holds exactly the regular files of AExpected, at the same
   relative paths, with the same normalized contents, and no link; otherwise
-  the first difference. HashTree folds "path LF contents" without framing,
-  so equal tree hashes do not prove equal layouts; this comparison does
-  (ADR-0051 decision 4). }
+  the first difference. Under schema v4 equal tree digests already prove an
+  equal layout (ADR-0052); this comparison only names the first differing
+  path after a digest mismatch. }
 function RegistryTreeDifference(const AExpected, AActual: string): string;
 var Expected, Actual: TStringList; k: Integer;
 
@@ -3104,8 +3177,10 @@ begin
 end;
 
 { --frozen: re-derives a registry module from its proof-authenticated
-  archive under the declared extraction policy and requires the result to
-  equal the lock's computedHash and, file for file, the installed tree.
+  archive under the declared extraction policy and requires its tree digest
+  to equal both the lock's computedHash and the installed tree's digest.
+  Framed digests make equality prove an equal layout (ADR-0052); the file
+  comparison only names the first difference.
   Everything happens in a private scratch directory below ATmpRoot that is
   removed on every path: the archive is copied there and verified against
   the signed record before extraction, so the extractor's intermediate tar
@@ -3115,7 +3190,7 @@ procedure VerifyRederivedRegistryTree(const AArchive, ATmpRoot, AInstalled,
   const ADep: TDependency);
 var
   Stream: TFileStream;
-  Scratch, Copied, Tree, Rederived, Difference: string;
+  Scratch, Copied, Tree, Rederived, Installed, Difference: string;
 begin
   if not FileExists(AArchive) then
     raise EVerifyError.CreateFmt('[frozen] committed archive for "%s" is '
@@ -3153,11 +3228,18 @@ begin
     RequireRegistryManifestIdentity(APackage.Name, APackage.Version, Tree);
     ApplyIncludeExclude(Tree, ADep.IncludeGlobs, ADep.ExcludeGlobs);
     Rederived := HashTree(Tree);
+    Installed := HashTree(AInstalled);
     Difference := '';
-    if Rederived <> ALockHash then
-      Difference := 'tree hash ' + Rederived + ', lockfile ' + ALockHash
-    else
+    if (Rederived <> ALockHash) or (Installed <> Rederived) then
+    begin
       Difference := RegistryTreeDifference(Tree, AInstalled);
+      if Difference = '' then
+        Difference := 'tree hash ' + Rederived + ', installed ' + Installed
+          + ', lockfile ' + ALockHash
+      else
+        Difference := Difference + '; tree hash ' + Rederived
+          + ', lockfile ' + ALockHash;
+    end;
     if Difference <> '' then
       raise EVerifyError.CreateFmt(
         '[frozen] module tree of "%s" differs from the tree re-derived from '
@@ -3192,7 +3274,7 @@ var
   NormalizedDep: TDependency;
   ItemSourceIdentity: string;
   UnitDir, Archive, ArchiveHash, ResolvedURL, ChildManifestPath,
-    ManifestRelDir: string;
+    ManifestRelDir, LinkPath: string;
   ChildMan : TManifest;
   Package: TLWPTRegistryPackage;
   Member: TWorkspace;
@@ -3266,6 +3348,19 @@ begin
         + '(required by %s). Run `lwpt install` without --frozen to '
         + 'fetch, or restore the committed .lwpt/modules tree.',
         [Item.Dep.Name, UnitDir, Item.RequiredBy]);
+    { LWPT never installs links: extraction materializes archive links as
+      copies, and local copies read file links through and drop directory
+      links. A link here is invisible to the digest (directory links) or
+      reads bytes from outside the module, yet FPC would follow it, so it
+      fails for every source kind (ADR-0052). }
+    LinkPath := FindTreeLink(UnitDir);
+    if LinkPath <> '' then
+      raise EVerifyError.CreateFmt(
+        '[frozen] module tree of "%s" contains a link at %s/%s. %s never '
+        + 'installs links. Restore %s from version control, or run `%s '
+        + 'install --offline` to restore it from the locked archive or '
+        + 'source.', [Item.Dep.Name, UnitDir, LinkPath, PROGRAM_NAME,
+        UnitDir, PROGRAM_NAME]);
     WriteLn('  [frozen] ', Item.Dep.Name,
             '  (required by ', Item.RequiredBy, ')');
     { Archive metadata is recovered from the lockfile during verification. }
@@ -3360,7 +3455,8 @@ procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
   const APriorLock: TResolvedArray;
   const AObjectStore: TLWPTImmutableObjectStore;
   const AOffline, AAcceptMovedTags: Boolean;
-  const AConsumer: TLWPTRegistryConsumer; ALocked: TLockedRegistry);
+  const AConsumer: TLWPTRegistryConsumer; ALocked: TLockedRegistry;
+  const AUpgrade: Boolean);
 type
   TSelectionState = record
     Name, SourceIdentity, RefName, CommitSHA, RefKind, ReachableFrom: string;
@@ -3565,18 +3661,23 @@ var
     if FileExists(ProjectArchive) then
     begin
       ActualHash := 'sha256:' + SHA256File(ProjectArchive);
-      if ActualHash <> Entry.ArchiveHash then
+      if ActualHash = Entry.ArchiveHash then
+      begin
+        if not CopyFileContent(ProjectArchive, AArchive) then
+          raise EFetchError.CreateFmt(
+            '[offline] failed to stage committed archive for "%s"',
+            [ANode.Name]);
+        AArchiveHash := Entry.ArchiveHash;
+        WriteLn('  reused committed archive for ', ANode.Name);
+        Exit;
+      end;
+      { The upgrade may restore the exact archive from the per-user cache;
+        --offline keeps its byte-exact committed-archive rule. }
+      if not AUpgrade then
         raise EVerifyError.CreateFmt(
           '[offline] archive hash mismatch for "%s": disk=%s lockfile=%s. '
           + 'Restore the committed archive or run `lwpt install` online.',
           [ANode.Name, ActualHash, Entry.ArchiveHash]);
-      if not CopyFileContent(ProjectArchive, AArchive) then
-        raise EFetchError.CreateFmt(
-          '[offline] failed to stage committed archive for "%s"',
-          [ANode.Name]);
-      AArchiveHash := Entry.ArchiveHash;
-      WriteLn('  reused committed archive for ', ANode.Name);
-      Exit;
     end;
     Failure := omfObjectMissing;
     if AObjectStore <> nil then
@@ -3587,6 +3688,10 @@ var
           AArchiveHash := Entry.ArchiveHash;
           WriteLn('  reused verified archive for ', ANode.Name,
             ' from the per-user cache');
+          if AUpgrade then
+            WriteLn('repair: restoring the archive for "', ANode.Name,
+              '" at ', ProjectDisplayPath(AProjectRoot, ProjectArchive),
+              ' from the per-user cache');
           Exit;
         end;
       except
@@ -3595,6 +3700,9 @@ var
             '[offline] dependency archive cache failed for "%s": %s',
             [ANode.Name, E.Message]);
       end;
+    if AUpgrade then
+      raise ELockfileError.Create(SchemaUpgradeArchiveMessage(ANode.Name,
+        ProjectDisplayPath(AProjectRoot, ProjectArchive)));
     raise EFetchError.CreateFmt(
       '[offline] verified archive for "%s" is unavailable '
       + '(expected %s; cache result: %s). Restore the committed archive '
@@ -4400,6 +4508,39 @@ var
     end;
   end;
 
+  { The v3-to-v4 upgrade republishes every module from its anchor. A
+    committed module that differs from its re-derived tree (drift, or a
+    #352-style substitution the v3 hash could not see) is named here, before
+    it is replaced (ADR-0052 section 5, step 3). }
+  procedure ReportUpgradeDrift;
+  var
+    k: Integer;
+    Committed, Reason, LinkPath: string;
+  begin
+    for k := 0 to High(R.Nodes) do
+    begin
+      Committed := IncludeTrailingPathDelimiter(AModulesRoot) + R.Nodes[k].Name;
+      Reason := '';
+      if not DirectoryExists(Committed) then
+        Reason := 'is missing'
+      else
+        try
+          LinkPath := FindTreeLink(Committed);
+          if LinkPath <> '' then
+            Reason := 'contains a link at ' + LinkPath
+          else if HashTree(Committed) <> R.Nodes[k].Hash then
+            Reason := 'differs from the tree re-derived from its '
+              + 'archive or source';
+        except
+          on E: EVerifyError do Reason := 'cannot be hashed: ' + E.Message;
+        end;
+      if Reason <> '' then
+        WriteLn('repair: module "', R.Nodes[k].Name, '" at ',
+          ProjectDisplayPath(AProjectRoot, Committed), ' ', Reason,
+          '; replacing it with the re-derived tree');
+    end;
+  end;
+
   procedure PublishPlan;
   var
     k, w: Integer;
@@ -4795,8 +4936,10 @@ begin
     if AOffline then
     begin
       ResolutionToResolved(R, OfflineResolved);
-      VerifyOfflineAgainstLockfile(OfflineResolved, APriorLock);
+      VerifyOfflineAgainstLockfile(OfflineResolved, APriorLock,
+        not AUpgrade);
     end;
+    if AUpgrade then ReportUpgradeDrift;
 
     try
       { Checkpoint freshness is judged again immediately before the first
@@ -4997,7 +5140,7 @@ begin
 end;
 
 procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
-  const ALockEntries: array of TResolved);
+  const ALockEntries: array of TResolved; const ACheckTreeHash: Boolean);
 
   function LockedCommitIdentity(const AEntry: TResolved): string;
   var Kind: TVersionKind; Value: string;
@@ -5064,7 +5207,9 @@ begin
         '[offline] locked resolution identity changed for "%s". Run '
         + '`lwpt install` online to resolve the changed graph.',
         [AResolved[i].Name]);
-    if AResolved[i].Hash <> Lock.Hash then
+    { The v3-to-v4 upgrade never consults a v3 computedHash: it is the
+      value the #352 flaw lets a forged tree match (ADR-0052). }
+    if ACheckTreeHash and (AResolved[i].Hash <> Lock.Hash) then
       raise EVerifyError.CreateFmt(
         '[offline] tree hash mismatch for "%s": staged=%s lockfile=%s. '
         + 'The available source does not reconstruct the locked module tree.',
@@ -5261,6 +5406,23 @@ begin
     if ALeft[k] <> ARight[k] then Exit(False);
 end;
 
+{ The recorded accepted state is never behind the selection proof. }
+procedure LiftAcceptedToProof(var AMerged: TLWPTRegistryConsumerState;
+  const ATable: TLWPTRegistryLockTable);
+begin
+  if AMerged.State.Sequence >= ATable.Sequence then Exit;
+  AMerged.State.Origin := ATable.Identity;
+  AMerged.State.KeyId := ATable.KeyId;
+  AMerged.State.Sequence := ATable.Sequence;
+  AMerged.State.Snapshot := ATable.Snapshot;
+  AMerged.State.CheckpointHash := ATable.Checkpoint;
+  AMerged.State.PublishedAt := ATable.PublishedAt;
+  AMerged.State.ExpiresAt := ATable.ExpiresAt;
+  AMerged.State.ClockFloor := RegistryLaterTimestamp(AMerged.State.ClockFloor,
+    ATable.PublishedAt);
+  AMerged.Rotations := ATable.Rotations;
+end;
+
 { One per-origin table for every origin with selected packages. A selection
   proof and its documents are carried forward byte for byte unless the set
   of selected records changed, the pin changed, or the retained proof fails
@@ -5376,20 +5538,7 @@ begin
     LoadRegistryConsumerState(Identity, Session.Declaration.KeyId, UserState);
     Merged := MergeRegistryAcceptedStates(UserState, Session.Accepted);
     if HasOld then Merged := MergeRegistryAcceptedStates(OldTable.Accepted, Merged);
-    { The recorded accepted state is never behind the selection proof. }
-    if Merged.State.Sequence < Table.Sequence then
-    begin
-      Merged.State.Origin := Identity;
-      Merged.State.KeyId := Table.KeyId;
-      Merged.State.Sequence := Table.Sequence;
-      Merged.State.Snapshot := Table.Snapshot;
-      Merged.State.CheckpointHash := Table.Checkpoint;
-      Merged.State.PublishedAt := Table.PublishedAt;
-      Merged.State.ExpiresAt := Table.ExpiresAt;
-      Merged.State.ClockFloor := RegistryLaterTimestamp(Merged.State.ClockFloor,
-        Table.PublishedAt);
-      Merged.Rotations := Table.Rotations;
-    end;
+    LiftAcceptedToProof(Merged, Table);
     if not HasOld or (Table.Accepted.State.Sequence = 0) then
       Table.Accepted := Merged;
     n := Length(ATables);
@@ -5438,6 +5587,90 @@ begin
     AddRegistryProofDocument(Result, Selection.Snapshot);
     for n := 0 to High(Selection.Records) do
       AddRegistryProofDocument(Result, Selection.Records[n]);
+  end;
+end;
+
+{ The v3-to-v4 upgrade (ADR-0052): every origin's table and selection proof
+  are carried forward byte for byte; because the lock changes, each records
+  the merged accepted state of the v3 lock and per-user state (ADR-0051
+  decision 11). No contact is consulted. }
+function UpgradedRegistryLockTables(AConsumer: TLWPTRegistryConsumer;
+  ALocked: TLockedRegistry;
+  const ALock: TResolvedArray): TLWPTRegistryLockTableArray;
+var
+  k, n: Integer;
+  Table: TLWPTRegistryLockTable;
+  Claims: TLWPTRegistryLockedRecordArray;
+  Trust: TLWPTRegistryTrust;
+  UserState, Merged: TLWPTRegistryConsumerState;
+begin
+  Result := nil;
+  for k := 0 to High(AConsumer.LockTables) do
+  begin
+    Table := AConsumer.LockTables[k];
+    Claims := RegistryClaimsFor(ALock, Table.Identity);
+    if Length(Claims) = 0 then Continue;
+    Trust := ALocked.TrustFor(Table.Identity, Claims[0].Name);
+    UserState := Default(TLWPTRegistryConsumerState);
+    LoadRegistryConsumerState(Table.Identity, Trust.KeyId, UserState);
+    Merged := MergeRegistryAcceptedStates(Table.Accepted, UserState);
+    LiftAcceptedToProof(Merged, Table);
+    Table.Accepted := Merged;
+    n := Length(Result);
+    SetLength(Result, n + 1);
+    Result[n] := Table;
+  end;
+end;
+
+{ The upgrade's proof anchors, checked before anything is staged: every
+  document a v3 lock table references must be committed under its hash or,
+  when absent, available from the per-user document store. A missing or
+  corrupt one fails with the migration message naming its hash path. }
+procedure RequireUpgradeProofDocuments(AConsumer: TLWPTRegistryConsumer;
+  const ALock: TResolvedArray; const AArchivesRoot, AProjectRoot: string);
+var
+  k, n: Integer;
+  Table: TLWPTRegistryLockTable;
+  Claims: TLWPTRegistryLockedRecordArray;
+  Hashes: TStringArray;
+
+  procedure Add(const AHash: string);
+  begin
+    SetLength(Hashes, Length(Hashes) + 1);
+    Hashes[High(Hashes)] := AHash;
+  end;
+
+  procedure Require(const AName, AHash: string);
+  var Path: string;
+  begin
+    Path := RegistryProofPath(AArchivesRoot, AHash);
+    if FileExists(Path) then
+    begin
+      if 'sha256:' + SHA256File(Path) = AHash then Exit;
+    end
+    else if LoadRegistryStateDocument(RegistryStateRoot, AHash) <> nil then
+      Exit;
+    raise ELockfileError.Create(SchemaUpgradeProofMessage(AName,
+      ProjectDisplayPath(AProjectRoot, Path)));
+  end;
+
+begin
+  for k := 0 to High(AConsumer.LockTables) do
+  begin
+    Table := AConsumer.LockTables[k];
+    Claims := RegistryClaimsFor(ALock, Table.Identity);
+    if Length(Claims) = 0 then Continue;
+    Hashes := nil;
+    Add(Table.Checkpoint);
+    Add(Table.Signature);
+    Add(Table.Snapshot);
+    for n := 0 to High(Table.Rotations) do Add(Table.Rotations[n]);
+    for n := 0 to High(Hashes) do
+      if RegistryHashIsCanonical(Hashes[n]) then
+        Require(Claims[0].Name, Hashes[n]);
+    for n := 0 to High(Claims) do
+      if RegistryHashIsCanonical(Claims[n].RecordHash) then
+        Require(Claims[n].Name, Claims[n].RecordHash);
   end;
 end;
 
@@ -5665,7 +5898,7 @@ var
   ModulesRoot, ArchivesRoot, TmpRoot, CfgPath, LockPath, LockfilePath,
     ManifestPath, RollbackRoot, RecoveryFailures, RollbackFailures : string;
   i, j, k : Integer;
-  Frozen, Offline : Boolean;
+  Frozen, Offline, Upgrade : Boolean;
   FrozenLock: TResolved;
   LockFound: Boolean;
   LockedVersionKind: TVersionKind;
@@ -5689,7 +5922,10 @@ var
 begin
   Man := AContext.Manifest;
   Frozen := AMode = itmFrozenVerify;
-  Offline := AMode = itmOfflineMaterialize;
+  Upgrade := AMode = itmSchemaUpgrade;
+  { The upgrade restores exactly what --offline restores, from the same
+    network-free anchors, and then writes the v4 lock. }
+  Offline := (AMode = itmOfflineMaterialize) or Upgrade;
 
   ModulesRoot  := ResolveProjectPath(AContext.ProjectRoot, ResolveModulesDir(Man));
   ArchivesRoot := ResolveProjectPath(AContext.ProjectRoot, ResolveArchivesDir(Man));
@@ -5698,6 +5934,17 @@ begin
   LockPath     := ResolveProjectPath(AContext.ProjectRoot, INSTALL_LOCK);
   LockfilePath := ResolveProjectPath(AContext.ProjectRoot, LWPT.Core.LOCKFILE);
   ManifestPath := ResolveProjectPath(AContext.ProjectRoot, AContext.Path);
+
+  { The shared lock gate runs before the install lock, transaction recovery,
+    tmp cleanup, rollback retention, and any manifest write, so a refused
+    v3 lock leaves every file as it was (ADR-0052). Only the upgrade reads
+    v3. }
+  if not Upgrade then
+    RequireCurrentLockfileSchema(LockfilePath)
+  else if ReadLockfileSchemaVersion(LockfilePath) <> LOCKFILE_SCHEMA_V3 then
+    raise ELockfileError.CreateFmt(
+      'internal: the schema upgrade needs a schema-v3 %s at %s',
+      [LWPT.Core.LOCKFILE, LockfilePath]);
 
   Lock := TInstallLock.Create(LockPath);
   ObjectStore := nil;
@@ -5747,7 +5994,7 @@ begin
       for their orphan diff after WriteLock replaces it. }
     OldLock := nil;
     if FileExists(LockfilePath) then
-      OldLock := LoadLockfile(LockfilePath);
+      OldLock := LoadLockfile(LockfilePath, Upgrade);
     if Offline and not FileExists(LockfilePath) then
       raise ELockfileError.CreateFmt(
         '[offline] lockfile not found at %s. Run `lwpt install` online '
@@ -5757,15 +6004,21 @@ begin
       and the lock only: no contact is selected and no registry client or
       transport is constructed (ADR-0051). }
     Consumer := TLWPTRegistryConsumer.Create(Man,
-      LoadRegistryLockTables(LockfilePath), ArchivesRoot);
+      LoadRegistryLockTables(LockfilePath, Upgrade), ArchivesRoot);
     Consumer.NetworkFree := Frozen or Offline;
     AssignLockedRegistryIdentities(Consumer, Man, OldLock);
     if Frozen then
       Locked := TLockedRegistry.Create(Consumer, Man, OldLock, ArchivesRoot,
         '', '[frozen]')
+    else if Upgrade then
+      Locked := TLockedRegistry.Create(Consumer, Man, OldLock, ArchivesRoot,
+        RegistryStateRoot, '[repair]')
     else if Offline then
       Locked := TLockedRegistry.Create(Consumer, Man, OldLock, ArchivesRoot,
         RegistryStateRoot, '[offline]');
+    if Upgrade then
+      RequireUpgradeProofDocuments(Consumer, OldLock, ArchivesRoot,
+        AContext.ProjectRoot);
 
     if not Frozen then
       try
@@ -5788,10 +6041,21 @@ begin
     end
     else
     begin
-      ResolveGraphFixedPoint(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
-                             RollbackRoot, AContext.ProjectRoot,
-                             Man.Workspaces, OldLock, ObjectStore, Offline,
-                             AAcceptMovedTags, Consumer, Locked);
+      try
+        ResolveGraphFixedPoint(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
+                               RollbackRoot, AContext.ProjectRoot,
+                               Man.Workspaces, OldLock, ObjectStore, Offline,
+                               AAcceptMovedTags, Consumer, Locked, Upgrade);
+      except
+        { Agreement failures name the migration, not an online install that
+          would refuse the remaining v3 lock (ADR-0052 section 5). }
+        on E: EVerifyError do
+          if Upgrade then
+            raise ELockfileError.Create(
+              SchemaUpgradeAgreementMessage(E.Message))
+          else
+            raise;
+      end;
       PublicationPending := True;
     end;
     WriteLn('resolved ', Length(R.Nodes), ' packages, no conflicts.');
@@ -5935,12 +6199,22 @@ begin
 
     if Offline then
     begin
-      VerifyOfflineAgainstLockfile(Resolved, OldLock);
+      VerifyOfflineAgainstLockfile(Resolved, OldLock, not Upgrade);
       { Missing proof documents are restored from verified locked content
         with the modules and cfg; the lock stays byte-identical. }
       PublishRegistryProofs(ArchivesRoot, TmpRoot, RollbackRoot,
         LockedRegistryProofDocuments(Locked, Consumer, OldLock, ArchivesRoot,
           RegistryStateRoot), ProofsBackup, ProofsPublished);
+      { The upgrade is a real lock change: it writes `version = 4`, every
+        computedHash as a tree2 digest, and, by decision 11, every origin's
+        merged accepted state. Nothing else moves. }
+      if Upgrade then
+      begin
+        RegistryTables := UpgradedRegistryLockTables(Consumer, Locked,
+          OldLock);
+        LockChanged := True;
+        WriteLock(LockfilePath, TmpRoot, Resolved, RegistryTables);
+      end;
     end
     else
     begin
@@ -5960,7 +6234,8 @@ begin
         RegistryDocuments, ProofsBackup, ProofsPublished);
     end;
     {$IFDEF INSTALL_TESTING}
-    if (not Offline) and (TestSeamValue('FAIL_AFTER_LOCK_WRITE') = '1') then
+    if ((not Offline) or Upgrade)
+       and (TestSeamValue('FAIL_AFTER_LOCK_WRITE') = '1') then
     begin
       if TestSeamValue('CORRUPT_ROLLBACK_FOR') <> '' then
         for i := 0 to High(R.Nodes) do
@@ -5983,7 +6258,12 @@ begin
     end;
     {$ENDIF}
     WriteCfg(CfgPath, TmpRoot, Resolved, Man, AContext.ProjectRoot);
-    if Offline then
+    if Upgrade then
+      WriteLn('repair: upgraded ', LWPT.Core.LOCKFILE, ' from schema v',
+        LOCKFILE_SCHEMA_V3, ' to v', LOCKFILE_SCHEMA_VERSION, ' (',
+        Length(Resolved), ' packages, versions unchanged) and wrote ',
+        CfgPath, '; commit ', LWPT.Core.LOCKFILE)
+    else if Offline then
       WriteLn('[offline] restored ', Length(Resolved),
         ' packages and wrote ', CfgPath, '; ', LWPT.Core.LOCKFILE,
         ' was left unchanged')
@@ -6071,6 +6351,12 @@ end;
 function RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode; const AAcceptMovedTags: Boolean): TInstallTransactionResult;
 begin
   Result := RunInstallTransactionCore(AContext, AMode, nil, AAcceptMovedTags);
+end;
+
+procedure RequireProjectLockfileSchema(const AContext: TManifestContext);
+begin
+  RequireCurrentLockfileSchema(ResolveProjectPath(AContext.ProjectRoot,
+    LWPT.Core.LOCKFILE));
 end;
 
 procedure RecoverInterruptedInstall(const AContext: TManifestContext);
