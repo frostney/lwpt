@@ -1350,11 +1350,16 @@ begin
     + '  if not FileExists(' + PascalString(NestedTestStartedPath)
     + ') then Halt(2);'#10
     + '  Started := Now;'#10
-    + '  while (not FileExists(' + PascalString(PIDFile) + '))'#10
+    { Cancellation starts when this fixture fails, so it waits for the
+      compiler's completion marker, not its PID payload: a compiler stopped
+      between the two would otherwise never publish its PID. }
+    + '  while (not FileExists('
+    + PascalString(PIDFile + PayloadCompleteSuffix) + '))'#10
     + '    and ((Now - Started) * ' + IntToStr(SecondsPerDay) + ' < '
     + IntToStr(MarkerWaitCeilingSeconds) + ') do Sleep('
     + IntToStr(ProcessPollMilliseconds) + ');'#10
-    + '  if not FileExists(' + PascalString(PIDFile) + ') then Halt(3);'#10
+    + '  if not FileExists('
+    + PascalString(PIDFile + PayloadCompleteSuffix) + ') then Halt(3);'#10
     + '  Halt(1);'#10
     + 'end.'#10);
   WriteMarkerProgram('C.Pending.Test.pas', 'nested-pending-ran', 0);
@@ -1625,11 +1630,11 @@ begin
     ChildProcessHandle := Child.ProcessHandle;
     {$ENDIF}
     Started := Now;
-    while (not FileExists(Marker + '-descendant')) and Child.Running
+    while (not PayloadIsReadable(Marker + '-descendant')) and Child.Running
       and ((Now - Started) * SecondsPerDay
         < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    Expect<Boolean>(FileExists(Marker + '-descendant')).ToBe(True);
+    Expect<Boolean>(PayloadIsReadable(Marker + '-descendant')).ToBe(True);
 
     { Reap the direct child concurrently, as the production runner does. The
       process tree can then distinguish its delayed exit from a live member. }
@@ -1726,7 +1731,7 @@ begin
     Expect<string>(ManagedThread.ErrorMessage).ToBe('');
     Expect<Boolean>(ManagedProcess.Entered).ToBe(True);
     ManagedProcess.WaitOnExit;
-    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+    Expect<Boolean>(PayloadIsReadable(Marker)).ToBe(True);
   finally
     Blocker.Release;
     if BlockerThreadStarted then BlockerThread.WaitFor;
@@ -1767,7 +1772,7 @@ begin
     Expect<Boolean>(Child.Running).ToBe(False);
     Child.WaitOnExit;
     Expect<Integer>(Child.ExitStatus).ToBe(0);
-    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+    Expect<Boolean>(PayloadIsReadable(Marker)).ToBe(True);
 
     TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
       AcknowledgementDeadline);
@@ -2123,11 +2128,11 @@ begin
     ConfigureProcessEnvironment(Child, Environment);
     Child.Execute;
     Started := Now;
-    while (not FileExists(Marker)) and Child.Running
+    while (not PayloadIsReadable(Marker)) and Child.Running
       and ((Now - Started) * SecondsPerDay
         < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+    Expect<Boolean>(PayloadIsReadable(Marker)).ToBe(True);
     Expect<Int64>(ChannelFile.Size).ToBe(0);
   finally
     if Child.Running then Child.Terminate(1);
@@ -2174,11 +2179,11 @@ begin
     ConfigureProcessEnvironment(Child, Environment);
     Child.Execute;
     Started := Now;
-    while (not FileExists(Marker)) and Child.Running
+    while (not PayloadIsReadable(Marker)) and Child.Running
       and ((Now - Started) * SecondsPerDay
         < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    Expect<Boolean>(FileExists(Marker)).ToBe(True);
+    Expect<Boolean>(PayloadIsReadable(Marker)).ToBe(True);
     OpenFlags := FpFcntl(StatusPipe[0], F_GetFl);
     if (OpenFlags < 0)
        or (FpFcntl(StatusPipe[0], F_SetFl,
@@ -2574,7 +2579,7 @@ begin
     { This fixture needs only to register before a clean exit. Starting the
       production forwarding threads here races immediate process shutdown on
       Win32 and is unrelated to the already-empty Job Object contract. }
-    WriteTextFile(APIDFile, IntToStr(GetProcessID));
+    PublishReadablePayload(APIDFile, IntToStr(GetProcessID));
     Exit(0);
   end;
   PublishReadablePayload(APIDFile + '-descendant', IntToStr(GetProcessID));
@@ -2656,11 +2661,11 @@ begin
     ConfigureProcessEnvironment(Child, Environment);
     ChildTree.Execute;
     Started := Now;
-    while (not FileExists(APIDFile + '-descendant')) and Child.Running
+    while (not PayloadIsReadable(APIDFile + '-descendant')) and Child.Running
       and ((Now - Started) * SecondsPerDay
         < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    if not FileExists(APIDFile + '-descendant') then Exit(2);
+    if not PayloadIsReadable(APIDFile + '-descendant') then Exit(2);
     PublishReadablePayload(APIDFile + '-owner', IntToStr(GetProcessID));
     while Child.Running do Sleep(ProcessPollMilliseconds);
     Child.WaitOnExit;
@@ -2827,7 +2832,7 @@ begin
   if Mode = InheritedChannelProbeProxyMode then
   begin
     InstallProcessTreeSignalForwarding;
-    WriteTextFile(PIDFile, IntToStr(GetProcessID));
+    PublishReadablePayload(PIDFile, IntToStr(GetProcessID));
     Sleep(LongRunningFixtureMilliseconds);
     Exit(0);
   end;
@@ -2839,13 +2844,13 @@ begin
      or (Mode = FailedAcknowledgementCompilerProxyMode) then
   begin
     Started := Now;
-    while ((not FileExists(PIDFile + '-owner'))
-      or (not FileExists(PIDFile + '-descendant')))
+    while ((not PayloadIsReadable(PIDFile + '-owner'))
+      or (not PayloadIsReadable(PIDFile + '-descendant')))
       and ((Now - Started) * SecondsPerDay
         < ProcessStartupCeilingSeconds) do
       Sleep(ProcessPollMilliseconds);
-    if (not FileExists(PIDFile + '-owner'))
-       or (not FileExists(PIDFile + '-descendant')) then
+    if (not PayloadIsReadable(PIDFile + '-owner'))
+       or (not PayloadIsReadable(PIDFile + '-descendant')) then
     begin
       WriteLn(StdErr, 'acknowledgement owner startup barrier timed out');
       Exit(2);
