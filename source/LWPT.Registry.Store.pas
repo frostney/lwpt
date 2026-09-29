@@ -211,6 +211,11 @@ type
       const ANow: string);
     procedure RequireArchiveObject(const AArchiveHash: string;
       const AArchiveSize: Int64);
+    { Every publication-lease holder sweeps incoming/. ARequired commits
+      refuse with a retryable busy error when the guard times out; other
+      holders skip the sweep. }
+    procedure SweepIncoming(const AWait, ARequired: Boolean);
+    function ActiveCheckpointHash(const AState: TLWPTRegistryState): string;
   protected
     function RootPath(const ARelative: string): string;
     function TmpRoot: string;
@@ -2380,6 +2385,7 @@ begin
       VerifyState(State);
       if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
       ForceDirectories(TmpRoot);
+      SweepIncoming(True, False);
       RecoverDerivedState(State);
     end;
   finally
@@ -2881,6 +2887,9 @@ begin
     Lease := Coordinator.TryAcquire('registry-publication',
       'registry checkpoint renewal');
     if not Assigned(Lease) then Exit;
+    { A renewal holds the publication lease on a read path, so it sweeps
+      only when the staging guard is immediately free. }
+    SweepIncoming(False, False);
     State := ReadCurrentState(AProgress);
     VerifyState(State, AProgress);
     CheckpointText := Text(LoadResource(State.CheckpointPath, AProgress,
@@ -2978,6 +2987,7 @@ begin
     Lease := Coordinator.TryAcquire('registry-publication', 'registry signing key rotation');
     if Lease = nil then
       raise ELWPTRegistryError.CreateStable('publication_locked', 'another publication owns the origin');
+    SweepIncoming(True, False);
     State := ReadCurrentState;
     VerifyState(State);
     KeyID := StringValue(Text(LoadResource(State.CheckpointPath)), 'key_id');
@@ -3260,6 +3270,30 @@ begin
   end;
 end;
 
+procedure TLWPTRegistryStore.SweepIncoming(const AWait, ARequired: Boolean);
+var
+  Incoming: TLWPTRegistryIncoming;
+  Swept: Boolean;
+begin
+  if FConfig.Role <> rrOrigin then Exit;
+  Incoming := TLWPTRegistryIncoming.Create(FRoot);
+  try
+    Swept := Incoming.Sweep(AWait);
+  finally
+    Incoming.Free;
+  end;
+  if not Swept and ARequired then
+    raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+      'the upload staging guard is busy');
+end;
+
+function TLWPTRegistryStore.ActiveCheckpointHash(
+  const AState: TLWPTRegistryState): string;
+begin
+  Result := 'sha256:' + SHA256Hex(LoadResource(AState.CheckpointPath, nil,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+end;
+
 procedure TLWPTRegistryStore.Publish(
   const APublication: TLWPTRegistryPublication);
 var
@@ -3301,6 +3335,7 @@ begin
       staging abandoned by an earlier lease holder. }
     if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
     ForceDirectories(TmpRoot);
+    SweepIncoming(True, False);
     State := ReadCurrentState;
     VerifyState(State);
     RecoverDerivedState(State);
@@ -3388,7 +3423,11 @@ begin
   VersionEntries.Duplicates := dupError;
   try
     Lease := AcquirePublicationLease(Coordinator, 'registry remote publication');
-    Incoming.Sweep;
+    { A guard timeout refuses before anything changes, whether or not the
+      commit would need to adopt an object. }
+    if not Incoming.Sweep then
+      raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+        'the upload staging guard is busy');
     State := ReadCurrentState;
     VerifyState(State);
     RecoverDerivedState(State);
@@ -3407,6 +3446,7 @@ begin
       Result.RecordHash := ActiveHash;
       Result.RecordBytes := BytesOf(ActiveText);
       Result.Sequence := State.Sequence;
+      Result.CheckpointHash := ActiveCheckpointHash(State);
       Exit;
     end;
     if not TryISO8601ToDate(Candidate.PublishedAt, ClientTime, True)
@@ -3469,7 +3509,11 @@ begin
   VersionEntries.Duplicates := dupError;
   try
     Lease := AcquirePublicationLease(Coordinator, 'registry yank or restore');
-    Incoming.Sweep;
+    { A guard timeout refuses before anything changes, whether or not the
+      commit would need to adopt an object. }
+    if not Incoming.Sweep then
+      raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+        'the upload staging guard is busy');
     State := ReadCurrentState;
     VerifyState(State);
     RecoverDerivedState(State);
@@ -3488,6 +3532,7 @@ begin
       Result.RecordHash := ActiveHash;
       Result.RecordBytes := BytesOf(ActiveText);
       Result.Sequence := State.Sequence;
+      Result.CheckpointHash := ActiveCheckpointHash(State);
       Exit;
     end;
     { The replacement differs only in yanked and published_at; archive, size,

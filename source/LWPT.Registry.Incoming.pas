@@ -32,6 +32,7 @@ const
   { Completed, unreferenced uploads expire after this age. }
   RegistryIncomingExpirySeconds = 3600;
   REGISTRY_INCOMING_LEASE = 'registry-incoming';
+  REGISTRY_PUBLICATION_LEASE = 'registry-publication';
   REGISTRY_UPLOAD_LEASE_PREFIX = 'registry-upload:';
 
 type
@@ -89,8 +90,10 @@ type
       leaves a reservation behind. }
     function Admit(const ALength: Int64): TLWPTRegistryUpload;
     { Publication-lease holders only: reclaim abandoned reservations and
-      expire completed entries. Returns False when the guard was busy. }
-    function Sweep: Boolean;
+      expire completed entries. AWait selects the bounded two-second guard
+      wait; otherwise a busy guard is not waited for. Returns False when the
+      guard was busy. }
+    function Sweep(const AWait: Boolean = True): Boolean;
     function CompletedPath(const AHex: string): string;
     function ObjectPath(const AHex: string): string;
     { Publication-lease holders only: moves a completed, already rehashed
@@ -317,7 +320,7 @@ function TLWPTRegistryIncoming.Admit(const ALength: Int64): TLWPTRegistryUpload;
 var
   Charged: Int64;
   Entries: Integer;
-  Guard: TObject;
+  Guard, Publication: TObject;
   Lease: TLWPTProducerLease;
   UploadID, PartPath: string;
   Stream: TFileStream;
@@ -330,6 +333,18 @@ begin
     or IsDirSymlinkOrJunction(FCompletedRoot) then
     raise ELWPTRegistryError.CreateStable('registry_path_link',
       'registry paths cannot contain symbolic links or reparse points');
+  { Completed uploads expire only under the publication lease. When no
+    publication holds it, admission briefly becomes that holder, so expired
+    uploads cannot keep refusing admissions. The lease is only tried, and it
+    is released before the upload's own lease is taken, which keeps the
+    publication, upload, incoming order. }
+  Publication := FCoordinator.TryAcquireGuard(REGISTRY_PUBLICATION_LEASE);
+  if Assigned(Publication) then
+  try
+    Sweep(False);
+  finally
+    Publication.Free;
+  end;
   UploadID := NewUploadID;
   { The upload's own lease is taken before its reservation exists and before
     any other lease is held. }
@@ -381,7 +396,7 @@ begin
   SHA256Init(Result.FContext);
 end;
 
-function TLWPTRegistryIncoming.Sweep: Boolean;
+function TLWPTRegistryIncoming.Sweep(const AWait: Boolean): Boolean;
 var
   Guard: TObject;
   Expired: TStringList;
@@ -389,10 +404,16 @@ var
   Name: string;
   Cutoff, Stamp: TDateTime;
 begin
-  try
-    Guard := AcquireGuard;
-  except
-    on E: ELWPTRegistryBusy do Exit(False);
+  if AWait then
+    try
+      Guard := AcquireGuard;
+    except
+      on E: ELWPTRegistryBusy do Exit(False);
+    end
+  else
+  begin
+    Guard := FCoordinator.TryAcquireGuard(REGISTRY_INCOMING_LEASE);
+    if not Assigned(Guard) then Exit(False);
   end;
   Expired := TStringList.Create;
   try

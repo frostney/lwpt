@@ -58,6 +58,9 @@ type
     destructor Destroy; override;
     function BeginMutation(const AHead: TLWPTRegistryRequestHead;
       out AResponse: TLWPTRegistryHTTPResponse): TLWPTRegistryMutation; override;
+    function RefuseMalformed(const AMethod, APeer: string;
+      const AStatus: Integer; const AReason, ACode, AMessage: string):
+      TLWPTRegistryHTTPResponse; override;
     property Store: TLWPTRegistryStore read FStore;
   end;
 
@@ -324,6 +327,22 @@ begin
   if FStore.Config.Role = rrOrigin then WriteAudit(AAudit, AResponse, ACode);
 end;
 
+function TLWPTRegistryPublisher.RefuseMalformed(const AMethod, APeer: string;
+  const AStatus: Integer; const AReason, ACode, AMessage: string):
+  TLWPTRegistryHTTPResponse;
+var
+  Audit: TLWPTRegistryAuditRecord;
+begin
+  Audit := Default(TLWPTRegistryAuditRecord);
+  Audit.RequestID := NewRegistryRequestID;
+  Audit.ReceivedAt := RegistryTimestampNow;
+  Audit.Peer := APeer;
+  Audit.Method := RegistryAuditMethod(AMethod);
+  Audit.Route := REGISTRY_AUDIT_INVALID_ROUTE;
+  Result := Refuse(Audit, RegistryErrorResponse(AStatus, AReason, ACode,
+    AMessage, Audit.RequestID), ACode);
+end;
+
 function StrictLength(const AValue: string; out ALength: Int64): Boolean;
 var
   Character: Char;
@@ -386,7 +405,8 @@ begin
     path or query is never written. }
   Prefix := BasePath(FStore.Config.BaseURL);
   if (Pos('?', AHead.Target) = 0) and (Pos('#', AHead.Target) = 0)
-    and (Pos('%', AHead.Target) = 0) and (Pos('..', AHead.Target) = 0)
+    and (Pos('%', AHead.Target) = 0)
+    and not RegistryPathHasDotSegment(AHead.Target)
     and StartsStr(Prefix + '/v1/', AHead.Target) then
   begin
     APIPath := Copy(AHead.Target, Length(Prefix) + 1, MaxInt);

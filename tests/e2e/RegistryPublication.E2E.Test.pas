@@ -70,6 +70,7 @@ type
     procedure TestKilledPublicationKeepsTheOldHead;
     procedure TestKilledUploadIsReclaimedOnlyAfterItsLeaseIsFree;
     procedure TestTLSListenerReadsRequestBodies;
+    procedure TestExpiredUploadsAreReclaimedWhileServingAndAtRestart;
   end;
 
 constructor TRequestThread.Create(const APort: Word; const ATarget,
@@ -301,7 +302,7 @@ begin
   Expect<Integer>(Upload(Archive, 'none').Status).ToBe(405);
   Token := IssueToken(['--packages', 'e2e-*', '--actions', 'publish,yank',
     '--label', 'ci']);
-  Secret := Copy(Token, Length(PROGRAM_NAME + '_rt1_') + 32 + 2, MaxInt);
+  Secret := Copy(Token, Length(RegistryProgramName + '_rt1_') + 32 + 2, MaxInt);
   TokenID := Copy(Token, Length(RegistryProgramName + '_rt1_') + 1, 32);
   Expect<Boolean>(Pos('"publication-v1"', RawHTTPBodyText(RawHTTPRequest(FPort,
     'GET', '/v1/capabilities', [], nil, False))) > 0).ToBe(True);
@@ -461,13 +462,12 @@ begin
   finally
     Live.Free;
   end;
-  { The killed owner's reservation stays until an admission finds its lease
-    free, then it is reclaimed. }
+  { The killed owner's reservation stays until a publication-lease holder
+    finds its upload lease free: startup recovery reclaims it. }
   Expect<Integer>(PartFiles).ToBe(1);
   StartServe(LwptBinaryPath, []);
-  Expect<Integer>(PartFiles).ToBe(1);
-  Expect<Integer>(Upload(RawHTTPBytes('after restart'), Token).Status).ToBe(201);
   Expect<Integer>(PartFiles).ToBe(0);
+  Expect<Integer>(Upload(RawHTTPBytes('after restart'), Token).Status).ToBe(201);
 end;
 
 { Status code of one curl request against the TLS listener; curl trusts the
@@ -584,6 +584,30 @@ begin
   Expect<string>(CurlStatus([Base + '/v1/objects/sha256/' + Hex])).ToBe('200');
 end;
 
+procedure TRegistryPublicationE2E.TestExpiredUploadsAreReclaimedWhileServingAndAtRestart;
+const
+  BUDGET = Int64(1024) * 1024 * 1024;
+var
+  Token, Filler: string;
+begin
+  InitOrigin;
+  Token := IssueToken(['--packages', '*']);
+  StartServe(LwptBinaryPath, []);
+  Filler := FData + '/incoming/sha256/' + StringOfChar('c', 64);
+  CreateSparseFile(Filler, BUDGET - 10);
+  Expect<Integer>(Upload(RawHTTPBytes('over the budget'), Token).Status).ToBe(507);
+  { An abandoned completed upload older than one hour stops counting at the
+    next admission, with no publication in between. }
+  FileSetDate(Filler, DateTimeToFileDate(Now - 2 / 24));
+  Expect<Integer>(Upload(RawHTTPBytes('over the budget'), Token).Status).ToBe(201);
+  Expect<Boolean>(FileExists(Filler)).ToBe(False);
+  StopServe;
+  CreateSparseFile(Filler, BUDGET - 10);
+  FileSetDate(Filler, DateTimeToFileDate(Now - 2 / 24));
+  StartServe(LwptBinaryPath, []);
+  Expect<Boolean>(FileExists(Filler)).ToBe(False);
+end;
+
 procedure TRegistryPublicationE2E.SetupTests;
 begin
   Test('a CI token publishes to a running origin, then revocation applies',
@@ -595,6 +619,8 @@ begin
   Test('a killed upload is reclaimed only after its lease is free',
     TestKilledUploadIsReclaimedOnlyAfterItsLeaseIsFree);
   Test('the TLS listener reads request bodies', TestTLSListenerReadsRequestBodies);
+  Test('expired uploads are reclaimed while serving and at restart',
+    TestExpiredUploadsAreReclaimedWhileServingAndAtRestart);
 end;
 
 begin

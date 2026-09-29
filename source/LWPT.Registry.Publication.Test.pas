@@ -83,6 +83,9 @@ type
       const AIssuedAt: string = ''): string;
     function Sequence: Int64;
     function AuditText: string;
+    { Every audit record answering AStatus, concatenated. }
+    function AuditsWithStatus(const AStatus: Integer): TStringList;
+    function LatestCheckpointHash: string;
     function Fixture(const APath: string): TBytes;
     function HexFixture(const APath: string): TBytes;
     function WithoutRequestID(const AText: string): string;
@@ -113,6 +116,12 @@ type
     procedure TestReadersSeeOldOrNewHead;
     procedure TestPackageListReads;
     procedure TestAmendedConformanceCorpus;
+    procedure ExpectRetryAudits(const ACount: Integer; const ASequence: Int64);
+    procedure TestGuardTimeoutRefusesCommitsWithoutAdoption;
+    procedure TestExpiredUploadsFreeTheBudgetForAdmission;
+    procedure TestDoubleDotNamesRoute;
+    procedure TestMalformedMutationsAreAudited;
+    procedure TestSlowBodiesHitTheDeadline;
   end;
 
 constructor TServeThread.Create(AServer: TLWPTRegistryServer);
@@ -354,6 +363,33 @@ begin
   end;
 end;
 
+function TRegistryPublicationContract.AuditsWithStatus(
+  const AStatus: Integer): TStringList;
+var
+  Files: TStringList;
+  Path, Text: string;
+begin
+  Result := TStringList.Create;
+  Files := TStringList.Create;
+  try
+    CollectFiles(FRoot + '/audit', Files);
+    for Path in Files do
+    begin
+      if Pos('.staging', Path) > 0 then Continue;
+      Text := ReadBinaryFile(Path);
+      if Pos('status = ' + IntToStr(AStatus) + #10, Text) > 0 then
+        Result.Add(Text);
+    end;
+  finally
+    Files.Free;
+  end;
+end;
+
+function TRegistryPublicationContract.LatestCheckpointHash: string;
+begin
+  Result := SHA256BytesPrefixed(Get('/v1/checkpoints/latest.toml').Body);
+end;
+
 function TRegistryPublicationContract.Fixture(const APath: string): TBytes;
 begin
   Result := Bytes(ReadBinaryFile(FIXTURES + APath));
@@ -408,6 +444,7 @@ begin
   SetRegistryRateLimitsForTesting(0, 0);
   SetRegistryDependencyRefusalForTesting(True);
   SetRegistryPublicationBarrierForTesting('', '');
+  SetRegistryBodyDeadlineForTesting(0);
 end;
 
 procedure TRegistryPublicationContract.AfterAll;
@@ -514,6 +551,35 @@ begin
   Expect<string>(RawHTTPHeader(Fresh, 'Location'))
     .ToBe(RawHTTPHeader(First, 'Location'));
   Expect<Int64>(Sequence).ToBe(2);
+  ExpectRetryAudits(2, 2);
+end;
+
+procedure TRegistryPublicationContract.ExpectRetryAudits(const ACount: Integer;
+  const ASequence: Int64);
+var
+  Audits: TStringList;
+  Text, Checkpoint: string;
+  Records: Integer;
+begin
+  { Idempotent answers record the resulting head, like a new commit. }
+  Checkpoint := LatestCheckpointHash;
+  Audits := AuditsWithStatus(204);
+  try
+    Records := 0;
+    for Text in Audits do
+      if Pos('route = "/v1/packages/', Text) > 0 then
+      begin
+        Inc(Records);
+        Expect<Boolean>(Pos('sequence = ' + IntToStr(ASequence) + #10, Text) > 0)
+          .ToBe(True);
+        Expect<Boolean>(Pos('checkpoint = "' + Checkpoint + '"', Text) > 0)
+          .ToBe(True);
+        Expect<Boolean>(Pos('record = "sha256:', Text) > 0).ToBe(True);
+      end;
+    Expect<Integer>(Records).ToBe(ACount);
+  finally
+    Audits.Free;
+  end;
 end;
 
 procedure TRegistryPublicationContract.TestConflictingContentIsRejected;
@@ -590,7 +656,9 @@ procedure TRegistryPublicationContract.TestYankAndRestore;
 var
   Archive: TBytes;
   Published, Response: TRawHTTPResponse;
-  PublishOnly, OtherPackage, OriginalLocation, Body: string;
+  PublishOnly, OtherPackage, OriginalLocation, Body, Text: string;
+  Audits: TStringList;
+  Found: Boolean;
 begin
   StartOrigin('', '', RegistryTimestampNow);
   Archive := Bytes('lifecycle archive');
@@ -632,6 +700,24 @@ begin
   Expect<Integer>(Get(Copy(OriginalLocation, Length(FBase) + 1, MaxInt)).Status)
     .ToBe(200);
   Expect<Int64>(Sequence).ToBe(4);
+  { The repeated restore answered at the final head. }
+  Audits := AuditsWithStatus(204);
+  try
+    Found := False;
+    for Text in Audits do
+      if (Pos('action = "restore"', Text) > 0)
+        and (Pos('checkpoint = "' + LatestCheckpointHash + '"', Text) > 0)
+        and (Pos('sequence = 4' + #10, Text) > 0) then Found := True;
+    Expect<Boolean>(Found).ToBe(True);
+    Found := False;
+    for Text in Audits do
+      if (Pos('action = "yank"', Text) > 0)
+        and (Pos('checkpoint = "sha256:', Text) > 0)
+        and (Pos('sequence = 3' + #10, Text) > 0) then Found := True;
+    Expect<Boolean>(Found).ToBe(True);
+  finally
+    Audits.Free;
+  end;
 end;
 
 procedure TRegistryPublicationContract.TestAuthenticationFailures;
@@ -1081,9 +1167,12 @@ begin
 end;
 
 procedure TRegistryPublicationContract.TestAmendedConformanceCorpus;
+const
+  CORPUS_SNAPSHOT =
+    'sha256:8c5f75ccea53bd5af230b1a736ac21ac45b9c0aa805fce5958d2ff8ee27536f5';
 var
   Response: TRawHTTPResponse;
-  Page, Expected: string;
+  Page, Expected, Snapshot, Cursor: string;
 begin
   SetRegistryClockForTesting('2026-01-01T00:00:00Z');
   StartOrigin('https://registry.example.test/lwpt', '/lwpt', '2025-12-31T00:00:00Z',
@@ -1108,6 +1197,32 @@ begin
   Expected := ReadBinaryFile(FIXTURES + 'pages/packages.toml');
   Expect<string>(Copy(Page, Pos('items = ', Page), MaxInt))
     .ToBe(Copy(Expected, Pos('items = ', Expected), MaxInt));
+  { package-list-first-page and package-list-next-page: the corpus cursor is
+    bound to the corpus snapshot; this origin binds its own. }
+  Snapshot := Copy(Page, Pos('snapshot = "', Page) + 12, 71);
+  Expected := ReadBinaryFile(FIXTURES + 'pages/packages-first.toml');
+  Expect<Boolean>(Pos('next_cursor = "' + RegistryPackageCursor(
+    FStore.Config.Identity, CORPUS_SNAPSHOT, '', 'example-lib', '1.0.0') + '"',
+    Expected) > 0).ToBe(True);
+  Page := RawHTTPBodyText(Get('/v1/packages?limit=1'));
+  Expect<string>(Copy(Page, Pos('items = ', Page), Pos('next_cursor', Page)
+    - Pos('items = ', Page))).ToBe(Copy(Expected, Pos('items = ', Expected),
+    Pos('next_cursor', Expected) - Pos('items = ', Expected)));
+  Cursor := RegistryPackageCursor(FStore.Config.Identity, Snapshot, '',
+    'example-lib', '1.0.0');
+  Expect<Boolean>(Pos('next_cursor = "' + Cursor + '"', Page) > 0).ToBe(True);
+  Response := Get('/v1/packages?limit=1&cursor=' + RegistryQueryEncode(Cursor)
+    + '&snapshot=' + RegistryQueryEncode(Snapshot));
+  Expect<Integer>(Response.Status).ToBe(200);
+  Page := RawHTTPBodyText(Response);
+  Expected := ReadBinaryFile(FIXTURES + 'pages/packages-second.toml');
+  Expect<string>(Copy(Page, Pos('items = ', Page), MaxInt))
+    .ToBe(Copy(Expected, Pos('items = ', Expected), MaxInt));
+  { A cursor bound to another snapshot conflicts even at this snapshot. }
+  Response := Get('/v1/packages?limit=1&cursor=' + RegistryQueryEncode(
+    RegistryPackageCursor(FStore.Config.Identity, CORPUS_SNAPSHOT, '',
+    'example-lib', '1.0.0')) + '&snapshot=' + RegistryQueryEncode(Snapshot));
+  Expect<Integer>(Response.Status).ToBe(409);
   { package-identity-conflict: genuinely different content. }
   Response := Request('PUT', '/v1/packages/example-lib/1.1.0', FToken,
     Fixture('requests/package-identity-conflict.toml'));
@@ -1173,10 +1288,195 @@ begin
   Expect<Integer>(Request('DELETE', '/v1/packages/example-lib/1.1.0/yank', FToken,
     nil).Status).ToBe(204);
   { cursor-snapshot-conflict }
-  Response := Get('/v1/packages?cursor=example-lib%3A1.0.0&snapshot=sha256%3Ad2dde0cae212bc793c9a312e55198c65167876aa0722f8cfcbf2f38a5bf5796b');
+  Response := Get('/v1/packages?cursor=' + RegistryQueryEncode(
+    RegistryPackageCursor(FStore.Config.Identity, CORPUS_SNAPSHOT, '',
+    'example-lib', '1.0.0'))
+    + '&snapshot=sha256%3Ad2dde0cae212bc793c9a312e55198c65167876aa0722f8cfcbf2f38a5bf5796b');
   Expect<Integer>(Response.Status).ToBe(409);
   Expect<string>(WithoutRequestID(RawHTTPBodyText(Response)))
     .ToBe(WithoutRequestID(ReadBinaryFile(FIXTURES + 'errors/snapshot-conflict.toml')));
+end;
+
+procedure TRegistryPublicationContract.TestGuardTimeoutRefusesCommitsWithoutAdoption;
+var
+  Archive: TBytes;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Guard: TObject;
+  Response: TRawHTTPResponse;
+  Head: string;
+begin
+  StartOrigin('', '', RegistryTimestampNow);
+  Archive := Bytes('committed archive');
+  Expect<Integer>(Upload(Archive).Status).ToBe(201);
+  Expect<Integer>(Publish('held-lib', '1.0.0', Archive).Status).ToBe(201);
+  Head := LatestCheckpointHash;
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(FRoot + '/locks');
+  Guard := Coordinator.TryAcquireGuard(REGISTRY_INCOMING_LEASE);
+  try
+    Expect<Boolean>(Assigned(Guard)).ToBe(True);
+    { The object is already committed, so this commit needs no adoption. }
+    Response := Publish('held-lib', '2.0.0', Archive);
+    Expect<Integer>(Response.Status).ToBe(503);
+    Expect<Boolean>(RawHTTPHeader(Response, 'Retry-After') <> '').ToBe(True);
+    Response := Request('PUT', '/v1/packages/held-lib/1.0.0/yank', FToken, nil);
+    Expect<Integer>(Response.Status).ToBe(503);
+    Expect<Boolean>(RawHTTPHeader(Response, 'Retry-After') <> '').ToBe(True);
+    Expect<string>(LatestCheckpointHash).ToBe(Head);
+    Expect<Int64>(Sequence).ToBe(2);
+  finally
+    Guard.Free;
+    Coordinator.Free;
+  end;
+  Expect<Integer>(Publish('held-lib', '2.0.0', Archive).Status).ToBe(201);
+  Expect<Integer>(Request('PUT', '/v1/packages/held-lib/1.0.0/yank', FToken,
+    nil).Status).ToBe(201);
+end;
+
+procedure TRegistryPublicationContract.TestExpiredUploadsFreeTheBudgetForAdmission;
+var
+  Filler: string;
+begin
+  StartOrigin('', '', RegistryTimestampNow);
+  Filler := FRoot + '/incoming/sha256/' + StringOfChar('d', 64);
+  CreateSparseFile(Filler, RegistryIncomingBudgetBytes - 10);
+  Expect<Integer>(Upload(Bytes('over the budget')).Status).ToBe(507);
+  { Completed uploads older than one hour expire at the next admission,
+    without any publication or yank. }
+  FileSetDate(Filler, DateTimeToFileDate(Now - 2 / 24));
+  Expect<Integer>(Upload(Bytes('over the budget')).Status).ToBe(201);
+  Expect<Boolean>(FileExists(Filler)).ToBe(False);
+  { Recovery at startup expires them too. }
+  CreateSparseFile(Filler, 100);
+  FileSetDate(Filler, DateTimeToFileDate(Now - 2 / 24));
+  StopOrigin;
+  FStore := TLWPTRegistryStore.Create(FRoot);
+  Expect<Boolean>(FileExists(Filler)).ToBe(False);
+end;
+
+procedure TRegistryPublicationContract.TestDoubleDotNamesRoute;
+var
+  Archive: TBytes;
+  Response: TRawHTTPResponse;
+  Snapshot: string;
+begin
+  StartOrigin('', '', RegistryTimestampNow);
+  Expect<Boolean>(RegistryPackageNameIsCanonical('a..b')).ToBe(True);
+  Archive := Bytes('dotted archive');
+  Expect<Integer>(Upload(Archive).Status).ToBe(201);
+  Expect<Integer>(Publish('a..b', '1.0.0', Archive).Status).ToBe(201);
+  Expect<Integer>(Publish('a..b', '1.0.0', Archive).Status).ToBe(204);
+  Response := Get('/v1/packages/a..b');
+  Expect<Integer>(Response.Status).ToBe(200);
+  Expect<Boolean>(Pos('name = "a..b"', RawHTTPBodyText(Response)) > 0).ToBe(True);
+  Snapshot := InspectRegistryCheckpoint(Get('/v1/checkpoints/latest.toml').Body)
+    .Snapshot;
+  Expect<Integer>(Get('/v1/packages/a..b/1.0.0?snapshot='
+    + RegistryQueryEncode(Snapshot)).Status).ToBe(200);
+  Expect<Integer>(Request('PUT', '/v1/packages/a..b/1.0.0/yank', FToken,
+    nil).Status).ToBe(201);
+  Expect<Integer>(Request('DELETE', '/v1/packages/a..b/1.0.0/yank', FToken,
+    nil).Status).ToBe(201);
+  { Dot segments stay refused. }
+  Expect<Integer>(Get('/v1/../v1/capabilities').Status).ToBe(400);
+  Expect<Integer>(Get('/v1/packages/..').Status).ToBe(400);
+  Expect<Integer>(Request('PUT', '/v1/packages/../1.0.0', FToken,
+    Bytes('x')).Status).ToBe(404);
+end;
+
+procedure TRegistryPublicationContract.TestMalformedMutationsAreAudited;
+var
+  Connection: TRawHTTPConnection;
+  Response: TRawHTTPResponse;
+  Audits: TStringList;
+  Before: Integer;
+begin
+  StartOrigin('', '', RegistryTimestampNow);
+  Connection := TRawHTTPConnection.Create(FPort);
+  try
+    Connection.SendText('PUT /v1/objects/sha256/' + StringOfChar('a', 64)
+      + ' HTTP/1.1' + #13#10 + 'Authorization: Bearer ' + FToken + #13#10
+      + ' folded-' + FToken + #13#10 + 'Content-Length: 1' + #13#10#13#10 + 'x');
+    Response := Connection.ReadResponse(10000);
+  finally
+    Connection.Free;
+  end;
+  Expect<Integer>(Response.Status).ToBe(400);
+  Connection := TRawHTTPConnection.Create(FPort);
+  try
+    Connection.SendText('DELETE /v1/packages/x/1.0.0/yank HTTP/1.1' + #13#10
+      + 'X-Padding: ' + StringOfChar('p', 40 * 1024) + #13#10#13#10);
+    Response := Connection.ReadResponse(10000);
+  finally
+    Connection.Free;
+  end;
+  Expect<Integer>(Response.Status).ToBe(431);
+  Audits := AuditsWithStatus(400);
+  try
+    Expect<Integer>(Audits.Count).ToBe(1);
+    Expect<Boolean>(Pos('method = "PUT"', Audits[0]) > 0).ToBe(True);
+    Expect<Boolean>(Pos('route = "invalid"', Audits[0]) > 0).ToBe(True);
+    Expect<Boolean>(Pos('code = "invalid_request"', Audits[0]) > 0).ToBe(True);
+    Expect<Boolean>(Pos('request_id = "', Audits[0]) > 0).ToBe(True);
+    Expect<Boolean>(Pos(FToken, Audits[0]) = 0).ToBe(True);
+    Expect<Boolean>(Pos('folded', Audits[0]) = 0).ToBe(True);
+  finally
+    Audits.Free;
+  end;
+  Audits := AuditsWithStatus(431);
+  try
+    Expect<Integer>(Audits.Count).ToBe(1);
+    Expect<Boolean>(Pos('method = "DELETE"', Audits[0]) > 0).ToBe(True);
+    Expect<Boolean>(Pos('route = "invalid"', Audits[0]) > 0).ToBe(True);
+    Expect<Boolean>(Pos('ppppp', Audits[0]) = 0).ToBe(True);
+  finally
+    Audits.Free;
+  end;
+  { A malformed read is not a mutation and writes no audit record. }
+  Before := Length(AuditText);
+  Connection := TRawHTTPConnection.Create(FPort);
+  try
+    Connection.SendText('GET /v1/capabilities HTTP/1.1' + #13#10 + ' folded'
+      + #13#10#13#10);
+    Expect<Integer>(Connection.ReadResponse(10000).Status).ToBe(400);
+  finally
+    Connection.Free;
+  end;
+  Expect<Integer>(Length(AuditText)).ToBe(Before);
+end;
+
+procedure TRegistryPublicationContract.TestSlowBodiesHitTheDeadline;
+var
+  Connection: TRawHTTPConnection;
+  Response: TRawHTTPResponse;
+  Started: QWord;
+begin
+  StartOrigin('', '', RegistryTimestampNow);
+  SetRegistryBodyDeadlineForTesting(500);
+  try
+    Connection := TRawHTTPConnection.Create(FPort);
+    try
+      Connection.SendText('PUT /v1/objects/sha256/' + StringOfChar('b', 64)
+        + ' HTTP/1.1' + #13#10 + 'Authorization: Bearer ' + FToken + #13#10
+        + 'Content-Length: 4096' + #13#10#13#10 + 'slow');
+      Started := GetTickCount64;
+      Response := Connection.ReadResponse(10000);
+      { The server gives up after the body deadline (500 ms plus one second
+        for the started MiB) and closes without an answer. }
+      Expect<Integer>(Response.Status).ToBe(0);
+      Expect<Boolean>(GetTickCount64 - Started < 5000).ToBe(True);
+    finally
+      Connection.Free;
+    end;
+    Started := GetTickCount64;
+    while (Pos('code = "request_aborted"', AuditText) = 0)
+      and (GetTickCount64 - Started < 5000) do Sleep(20);
+    Expect<Boolean>(Pos('code = "request_aborted"', AuditText) > 0).ToBe(True);
+    Expect<Boolean>(FileExists(FRoot + '/incoming/sha256/' + StringOfChar('b', 64)))
+      .ToBe(False);
+    Expect<Integer>(Upload(Bytes('after the slow client')).Status).ToBe(201);
+  finally
+    SetRegistryBodyDeadlineForTesting(0);
+  end;
 end;
 
 procedure TRegistryPublicationContract.SetupTests;
@@ -1215,6 +1515,15 @@ begin
   Test('readers see the old or the new head', TestReadersSeeOldOrNewHead);
   Test('package lists bind cursors to accepted snapshots', TestPackageListReads);
   Test('the amended conformance corpus passes', TestAmendedConformanceCorpus);
+  Test('a staging guard timeout refuses commits that need no adoption',
+    TestGuardTimeoutRefusesCommitsWithoutAdoption);
+  Test('expired uploads free the budget at admission and at recovery',
+    TestExpiredUploadsFreeTheBudgetForAdmission);
+  Test('names with consecutive dots publish, list, yank, and restore',
+    TestDoubleDotNamesRoute);
+  Test('malformed mutating requests are audited without their input',
+    TestMalformedMutationsAreAudited);
+  Test('a slow body is cut off at its deadline', TestSlowBodiesHitTheDeadline);
 end;
 
 begin

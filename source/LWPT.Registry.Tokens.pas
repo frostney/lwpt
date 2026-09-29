@@ -81,6 +81,10 @@ function RegistryTokenDocument(const AToken: TLWPTRegistryToken): string;
 function ParseRegistryTokenDocument(const AText: string): TLWPTRegistryToken;
 { Canonical metadata line for registry verify; never includes the hash. }
 function RegistryTokenMetadata(const AToken: TLWPTRegistryToken): string;
+{$IFDEF REGISTRY_TESTING}
+{ Lowers the active-token cap; zero restores RegistryMaximumActiveTokens. }
+procedure SetRegistryMaximumActiveTokensForTesting(const ALimit: Integer);
+{$ENDIF}
 
 implementation
 
@@ -88,6 +92,7 @@ uses
   DateUtils,
   StrUtils,
 
+  LWPT.ProducerLease,
   LWPT.Registry.Crypto,
   LWPT.Registry.Filesystem,
   LWPT.Registry.Verification,
@@ -99,6 +104,26 @@ const
   TOKEN_SECRET_LENGTH = 43;
   MAX_TOKEN_DOCUMENT_BYTES = 64 * 1024;
   BASE64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  TOKEN_ISSUANCE_LEASE = 'registry-token-issuance';
+  TOKEN_ISSUANCE_WAIT_MILLISECONDS = 5000;
+
+{$IFDEF REGISTRY_TESTING}
+var
+  MaximumActiveTokensForTesting: Integer;
+
+procedure SetRegistryMaximumActiveTokensForTesting(const ALimit: Integer);
+begin
+  MaximumActiveTokensForTesting := ALimit;
+end;
+{$ENDIF}
+
+function MaximumActiveTokens: Integer;
+begin
+  Result := RegistryMaximumActiveTokens;
+  {$IFDEF REGISTRY_TESTING}
+  if MaximumActiveTokensForTesting > 0 then Result := MaximumActiveTokensForTesting;
+  {$ENDIF}
+end;
 
 function IsLowerHexText(const AValue: string; const ALength: Integer): Boolean;
 var
@@ -497,16 +522,21 @@ begin
   end;
 end;
 
+function CreateToken(const ARoot: string;
+  const AActions: TLWPTRegistryTokenActions; const AExpiresDays: Integer;
+  const ALabel, ANow: string; const ACreated: TDateTime;
+  var ARecord: TLWPTRegistryToken): string; forward;
+
 function IssueRegistryToken(const ARoot: string; const APatterns: array of string;
   const AActions: TLWPTRegistryTokenActions; const AExpiresDays: Integer;
   const ALabel, ANow: string; out ARecord: TLWPTRegistryToken): string;
 var
-  IDBytes: array[0..15] of Byte;
-  SecretBytes: array[0..31] of Byte;
-  Secret: string;
   Existing: TLWPTRegistryTokenArray;
   Index, Active: Integer;
   Created: TDateTime;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
+  Deadline: QWord;
 begin
   Result := '';
   ARecord := Default(TLWPTRegistryToken);
@@ -541,13 +571,46 @@ begin
     if ARecord.Patterns[Index] = ARecord.Patterns[Index - 1] then
       raise ELWPTRegistryError.CreateStable('invalid_configuration',
         '--packages entries must be unique');
-  Existing := ListRegistryTokens(ARoot);
-  Active := 0;
-  for Index := 0 to High(Existing) do
-    if RegistryTokenIsActive(Existing[Index], ANow) then Inc(Active);
-  if Active >= RegistryMaximumActiveTokens then
-    raise ELWPTRegistryError.CreateStable('token_limit_exceeded',
-      'the origin already has 1000 active tokens');
+  { Counting and creating form one step, serialized across processes, so
+    concurrent issuance cannot pass the active-token cap. }
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(
+    IncludeTrailingPathDelimiter(ExpandFileName(ARoot)) + 'locks');
+  Lease := nil;
+  try
+    Deadline := GetTickCount64 + TOKEN_ISSUANCE_WAIT_MILLISECONDS;
+    repeat
+      Lease := Coordinator.TryAcquire(TOKEN_ISSUANCE_LEASE,
+        'registry token issuance');
+      if Assigned(Lease) then Break;
+      if GetTickCount64 >= Deadline then
+        raise ELWPTRegistryError.CreateStable('token_issuance_locked',
+          'another process is issuing a token; retry');
+      Sleep(10);
+    until False;
+    Existing := ListRegistryTokens(ARoot);
+    Active := 0;
+    for Index := 0 to High(Existing) do
+      if RegistryTokenIsActive(Existing[Index], ANow) then Inc(Active);
+    if Active >= MaximumActiveTokens then
+      raise ELWPTRegistryError.CreateStable('token_limit_exceeded',
+        'the origin already has the maximum number of active tokens');
+    Result := CreateToken(ARoot, AActions, AExpiresDays, ALabel, ANow, Created,
+      ARecord);
+  finally
+    Lease.Free;
+    Coordinator.Free;
+  end;
+end;
+
+function CreateToken(const ARoot: string;
+  const AActions: TLWPTRegistryTokenActions; const AExpiresDays: Integer;
+  const ALabel, ANow: string; const ACreated: TDateTime;
+  var ARecord: TLWPTRegistryToken): string;
+var
+  IDBytes: array[0..15] of Byte;
+  SecretBytes: array[0..31] of Byte;
+  Secret: string;
+begin
   RegistryRandomBytes(IDBytes[0], SizeOf(IDBytes));
   RegistryRandomBytes(SecretBytes[0], SizeOf(SecretBytes));
   try
@@ -557,7 +620,7 @@ begin
     ARecord.Actions := AActions;
     ARecord.CreatedAt := ANow;
     ARecord.ExpiresAt := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
-      IncDay(Created, AExpiresDays));
+      IncDay(ACreated, AExpiresDays));
     ARecord.RevokedAt := '';
     ARecord.SecretHash := SecretHash(Secret);
     ForceDirectories(TokenDirectory(ARoot));

@@ -727,7 +727,16 @@ begin
   if ((HeaderEnd = 0) and (Length(FRequest) > MAX_REQUEST_BYTES))
     or (HeaderEnd > MAX_REQUEST_BYTES) then
   begin
-    Cancel;
+    FResponding := True;
+    FMethod := '';
+    try
+      SendPrepared(RegistryMalformedRequestResponse(FServer.FHandler,
+        string(FRequest), FPeer, 431, 'Request Header Fields Too Large',
+        'request_headers_too_large', 'request headers exceed 32 KiB'));
+    except
+      Cancel;
+    end;
+    FRequest := '';
     Exit;
   end;
   if HeaderEnd > 0 then
@@ -753,7 +762,12 @@ begin
   if not ParseRegistryRequestHead(Copy(string(FRequest), 1, AHeaderEnd - 1),
     FPeer, Head) then
   begin
-    Cancel;
+    FMethod := '';
+    Response := RegistryMalformedRequestResponse(FServer.FHandler,
+      string(FRequest), FPeer, 400, 'Bad Request', 'invalid_request',
+      'request line is invalid');
+    FRequest := '';
+    SendPrepared(Response);
     Exit;
   end;
   FMethod := Head.Method;

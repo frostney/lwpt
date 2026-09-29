@@ -20,6 +20,17 @@ const
   ISSUED_AT = '2026-08-23T10:00:00Z';
 
 type
+  TIssueThread = class(TThread)
+  private
+    FRoot: string;
+  protected
+    procedure Execute; override;
+  public
+    Issued: Boolean;
+    Failure: string;
+    constructor Create(const ARoot: string);
+  end;
+
   TRegistryTokenContract = class(TTestSuite)
   private
     FScratch: string;
@@ -37,7 +48,28 @@ type
     procedure TestRevocationIsImmediateAndIdempotent;
     procedure TestActiveTokenDiscovery;
     procedure TestTokensAreOriginOnly;
+    procedure TestConcurrentIssuanceRespectsTheCap;
   end;
+
+constructor TIssueThread.Create(const ARoot: string);
+begin
+  FRoot := ARoot;
+  FreeOnTerminate := False;
+  inherited Create(False);
+end;
+
+procedure TIssueThread.Execute;
+var
+  TokenRecord: TLWPTRegistryToken;
+begin
+  try
+    IssueRegistryToken(FRoot, ['demo'], [rtaPublish], 90, '', ISSUED_AT,
+      TokenRecord);
+    Issued := True;
+  except
+    on E: Exception do Failure := E.Message;
+  end;
+end;
 
 function TRegistryTokenContract.Origin: string;
 var
@@ -276,6 +308,43 @@ begin
   Expect<Boolean>(Pos('invalid_configuration:', Diagnostic) = 1).ToBe(True);
 end;
 
+procedure TRegistryTokenContract.TestConcurrentIssuanceRespectsTheCap;
+var
+  Threads: array[0..5] of TIssueThread;
+  TokenRecord: TLWPTRegistryToken;
+  Index, Issued, Refused, Active: Integer;
+  Tokens: TLWPTRegistryTokenArray;
+begin
+  SetRegistryMaximumActiveTokensForTesting(3);
+  try
+    IssueRegistryToken(Origin, ['demo'], [rtaPublish], 90, '', ISSUED_AT,
+      TokenRecord);
+    IssueRegistryToken(Origin, ['demo'], [rtaPublish], 90, '', ISSUED_AT,
+      TokenRecord);
+    for Index := 0 to High(Threads) do
+      Threads[Index] := TIssueThread.Create(Origin);
+    Issued := 0;
+    Refused := 0;
+    for Index := 0 to High(Threads) do
+    begin
+      Threads[Index].WaitFor;
+      if Threads[Index].Issued then Inc(Issued);
+      if Pos('token_limit_exceeded:', Threads[Index].Failure) = 1 then
+        Inc(Refused);
+      Threads[Index].Free;
+    end;
+    Expect<Integer>(Issued).ToBe(1);
+    Expect<Integer>(Refused).ToBe(5);
+    Tokens := ListRegistryTokens(Origin);
+    Active := 0;
+    for Index := 0 to High(Tokens) do
+      if RegistryTokenIsActive(Tokens[Index], ISSUED_AT) then Inc(Active);
+    Expect<Integer>(Active).ToBe(3);
+  finally
+    SetRegistryMaximumActiveTokensForTesting(0);
+  end;
+end;
+
 procedure TRegistryTokenContract.SetupTests;
 begin
   Test('tokens follow the prefixed identifier and secret grammar', TestTokenGrammar);
@@ -289,6 +358,8 @@ begin
   Test('publication is enabled only by an active token', TestActiveTokenDiscovery);
   Test('tokens require an initialized origin and a printable label',
     TestTokensAreOriginOnly);
+  Test('concurrent issuance cannot pass the active-token cap',
+    TestConcurrentIssuanceRespectsTheCap);
 end;
 
 begin

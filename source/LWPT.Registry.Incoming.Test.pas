@@ -489,12 +489,14 @@ begin
   try
     Old := StringOfChar('0', 64);
     Fresh := StringOfChar('9', 64);
+    { Admission sweeps expired entries itself when no publication runs, so
+      the expired entry is created after this admission. }
+    Upload := Incoming.Admit(5);
+    WriteAll(Upload, 'hello');
     AddCompleted(Old, 3);
     AddCompleted(Fresh, 3);
     FileSetDate(Incoming.CompletedPath(Old),
       DateTimeToFileDate(Now - 2 / 24));
-    Upload := Incoming.Admit(5);
-    WriteAll(Upload, 'hello');
     FHookPoint := 'expire';
     Sweeper := TSweepThread.Create(Incoming);
     Expect<Boolean>(FHookReached.WaitFor(10000) = wrSignaled)

@@ -76,3 +76,14 @@ Idempotency compares **content identity**: `archive`, `archive_size`, and
   corpus bytes regardless of when the run happens. `publish-package-created`
   declares dependencies, so an LWPT origin runs it with the ADR-0049
   decision-4 refusal lifted through its test seam.
+
+## Package-list cursors
+
+Cursors are opaque to clients and bound to one origin, snapshot, and listing
+scope. The corpus uses LWPT's form, `<name>:<version>:<binding>`, where the
+binding is the first 32 hexadecimal digits of the SHA-256 of the origin
+identity, snapshot hash, listing scope (empty for the collection, else the
+package name), and `<name>:<version>`, each followed by LF except the last.
+`package-list-next-page` continues `packages-first.toml`'s cursor at its own
+snapshot. `cursor-snapshot-conflict` presents that cursor with a different
+snapshot and expects `409 snapshot_conflict`.

@@ -72,6 +72,11 @@ type
     function BeginMutation(const AHead: TLWPTRegistryRequestHead;
       out AResponse: TLWPTRegistryHTTPResponse): TLWPTRegistryMutation;
       virtual; abstract;
+    { Answers and records a mutating request that failed before routing.
+      AMethod is already validated; nothing else of the request is kept. }
+    function RefuseMalformed(const AMethod, APeer: string;
+      const AStatus: Integer; const AReason, ACode, AMessage: string):
+      TLWPTRegistryHTTPResponse; virtual; abstract;
   end;
 
   TLWPTRegistryServer = class
@@ -108,6 +113,13 @@ function ParseRegistryRequestHead(const AText, APeer: string;
 function RegistryHeaderValues(const AHead: TLWPTRegistryRequestHead;
   const AName: string): TStringArray;
 function RegistryMethodIsRead(const AMethod: string): Boolean;
+{ True when a '/'-separated path has a '.' or '..' segment. Names such as
+  a..b are protocol-valid and are not dot segments. }
+function RegistryPathHasDotSegment(const APath: string): Boolean;
+{ The opaque package-list cursor after AName@AVersion, bound to the origin,
+  snapshot, and listing scope (empty for the collection). }
+function RegistryPackageCursor(const AIdentity, ASnapshot, AScope, AName,
+  AVersion: string): string;
 { Answers one request whose headers are complete. Reads go through
   RegistryHTTPResponse; everything else goes to AHandler, which may return
   a mutation that needs a body. }
@@ -116,6 +128,12 @@ function RegistryDispatch(AStore: TLWPTRegistryStore;
   const AHead: TLWPTRegistryRequestHead; AProgress: TSHA256Progress;
   out AMutation: TLWPTRegistryMutation): TLWPTRegistryHTTPResponse;
 function RegistryBodyDeadlineMilliseconds(const ABodyLength: Int64): QWord;
+{ The error for a request whose head could not be parsed or was too large.
+  A recognizable mutating method is answered and audited through AHandler;
+  only that method name is taken from ARaw. }
+function RegistryMalformedRequestResponse(AHandler: TLWPTRegistryMutationHandler;
+  const ARaw, APeer: string; const AStatus: Integer; const AReason, ACode,
+  AMessage: string): TLWPTRegistryHTTPResponse;
 function CreateRegistryMutationHandler(AStore: TLWPTRegistryStore):
   TLWPTRegistryMutationHandler;
 function RegistryResourceFailureResponse(const ADiagnostic: string):
@@ -125,6 +143,8 @@ function RegistryHTTPWireResponse(const AResponse: TLWPTRegistryHTTPResponse;
 function OpenRegistryHTTPResource(const AResponse: TLWPTRegistryHTTPResponse;
   AProgress: TSHA256Progress = nil): TStream;
 {$IFDEF REGISTRY_TESTING}
+{ Replaces the 30-second body deadline base; zero restores it. }
+procedure SetRegistryBodyDeadlineForTesting(const ABaseMilliseconds: QWord);
 function RegistryDeadlineTimeoutForTesting(const ADeadline,
   ANow: QWord): LongInt;
 function RegistryTLSShutdownStateIsTerminalForTesting(
@@ -148,6 +168,7 @@ uses
   {$IFDEF DARWIN}
   LWPT.Registry.Server.NetworkFramework,
   {$ENDIF}
+  LWPT.Registry.Audit,
   LWPT.Registry.Filesystem,
   LWPT.Registry.Publication,
   LWPT.Registry.Verification,
@@ -741,12 +762,19 @@ begin
     + #10 + APosition)), 1, 32);
 end;
 
+function RegistryPackageCursor(const AIdentity, ASnapshot, AScope, AName,
+  AVersion: string): string;
+begin
+  Result := AName + ':' + AVersion + ':' + PackageCursorBinding(AIdentity,
+    ASnapshot, AScope, AName + ':' + AVersion);
+end;
+
 function PackagePageResponse(AStore: TLWPTRegistryStore;
   AView: TLWPTRegistryReadView; const AName, AQuery: string;
   AProgress: TSHA256Progress): TLWPTRegistryHTTPResponse;
 var
   Parameters, Parts: TStringList;
-  Cursor, Snapshot, Body, NextCursor, Position: string;
+  Cursor, Snapshot, Body, NextCursor: string;
   Index: TLWPTRegistryPackageIndex;
   Reference: IInterface;
   Limit, Start, Item, Count: Integer;
@@ -787,6 +815,9 @@ begin
     end;
     if Snapshot = '' then Snapshot := AView.State.SnapshotHash;
     Index := AStore.PackageIndex(AView, Snapshot, AProgress, Reference);
+    if (Index = nil) and (Cursor <> '') then
+      Exit(ErrorResponse(409, 'Conflict', 'snapshot_conflict',
+        'cursor does not belong to the requested snapshot'));
     if Index = nil then
       Exit(ErrorResponse(409, 'Conflict', 'snapshot_conflict',
         'requested snapshot is not in accepted history'));
@@ -800,8 +831,8 @@ begin
     end;
     if Cursor <> '' then
     begin
-      if Parts[2] <> PackageCursorBinding(AStore.Config.Identity, Snapshot,
-        AName, Parts[0] + ':' + Parts[1]) then
+      if Cursor <> RegistryPackageCursor(AStore.Config.Identity, Snapshot,
+        AName, Parts[0], Parts[1]) then
         Exit(ErrorResponse(409, 'Conflict', 'snapshot_conflict',
           'cursor does not belong to the requested snapshot'));
       Start := Index.PositionAfter(Parts[0], Parts[1]);
@@ -820,10 +851,8 @@ begin
     begin
       if Count >= Limit then
       begin
-        Position := Index.Items[Item - 1].Name + ':'
-          + Index.Items[Item - 1].Version;
-        NextCursor := Position + ':' + PackageCursorBinding(
-          AStore.Config.Identity, Snapshot, AName, Position);
+        NextCursor := RegistryPackageCursor(AStore.Config.Identity, Snapshot,
+          AName, Index.Items[Item - 1].Name, Index.Items[Item - 1].Version);
         Break;
       end;
       if Count > 0 then Body := Body + ', ';
@@ -987,7 +1016,7 @@ begin
     and not StartsStr('/v1/packages/', APIPath) then
     Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target',
       'query is only supported for rotation and package pages'));
-  if (Pos('..', APIPath) > 0) or (Pos('%', APIPath) > 0) then
+  if RegistryPathHasDotSegment(APIPath) or (Pos('%', APIPath) > 0) then
     Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target',
       'request target is not canonical'));
   if APIPath = '/.well-known/' + PROGRAM_NAME + '-registry' then
@@ -1282,6 +1311,22 @@ begin
     end;
 end;
 
+function RegistryPathHasDotSegment(const APath: string): Boolean;
+var
+  Start, Index: Integer;
+  Segment: string;
+begin
+  Result := False;
+  Start := 1;
+  for Index := 1 to Length(APath) + 1 do
+    if (Index > Length(APath)) or (APath[Index] = '/') then
+    begin
+      Segment := Copy(APath, Start, Index - Start);
+      if (Segment = '.') or (Segment = '..') then Exit(True);
+      Start := Index + 1;
+    end;
+end;
+
 function RegistryMethodIsRead(const AMethod: string): Boolean;
 begin
   Result := SameText(AMethod, 'GET') or SameText(AMethod, 'HEAD');
@@ -1298,13 +1343,52 @@ begin
   AMutation := AHandler.BeginMutation(AHead, Result);
 end;
 
+{$IFDEF REGISTRY_TESTING}
+var
+  RegistryBodyDeadlineBaseForTesting: QWord;
+
+procedure SetRegistryBodyDeadlineForTesting(const ABaseMilliseconds: QWord);
+begin
+  RegistryBodyDeadlineBaseForTesting := ABaseMilliseconds;
+end;
+{$ENDIF}
+
 function RegistryBodyDeadlineMilliseconds(const ABodyLength: Int64): QWord;
 const
   MEBIBYTE = Int64(1024) * 1024;
 begin
   Result := RegistryBodyBaseDeadlineMilliseconds;
+  {$IFDEF REGISTRY_TESTING}
+  if RegistryBodyDeadlineBaseForTesting > 0 then
+    Result := RegistryBodyDeadlineBaseForTesting;
+  {$ENDIF}
   if ABodyLength > 0 then
     Inc(Result, QWord((ABodyLength + MEBIBYTE - 1) div MEBIBYTE) * 1000);
+end;
+
+function RegistryMalformedRequestResponse(AHandler: TLWPTRegistryMutationHandler;
+  const ARaw, APeer: string; const AStatus: Integer; const AReason, ACode,
+  AMessage: string): TLWPTRegistryHTTPResponse;
+var
+  Method: string;
+  Index: Integer;
+begin
+  Method := '';
+  for Index := 1 to Length(ARaw) do
+  begin
+    if ARaw[Index] = ' ' then Break;
+    if not (ARaw[Index] in ['A'..'Z']) or (Index > 16) then
+    begin
+      Method := '';
+      Break;
+    end;
+    Method := Method + ARaw[Index];
+  end;
+  if Assigned(AHandler) and (Method <> '') and not RegistryMethodIsRead(Method)
+    and (RegistryAuditMethod(Method) = Method) then
+    Exit(AHandler.RefuseMalformed(Method, APeer, AStatus, AReason, ACode,
+      AMessage));
+  Result := ErrorResponse(AStatus, AReason, ACode, AMessage);
 end;
 
 function CreateRegistryMutationHandler(AStore: TLWPTRegistryStore):
@@ -1563,16 +1647,17 @@ begin
         if ((HeaderEnd = 0) and (Length(Request) > MAX_REQUEST_HEADER_BYTES))
           or (HeaderEnd > MAX_REQUEST_HEADER_BYTES) then
         begin
-          Response := ErrorResponse(431, 'Request Header Fields Too Large',
-            'request_headers_too_large', 'request headers exceed 32 KiB');
+          Response := RegistryMalformedRequestResponse(FHandler, Request, FPeer,
+            431, 'Request Header Fields Too Large', 'request_headers_too_large',
+            'request headers exceed 32 KiB');
           SendAll(FSocket, RegistryHTTPWireResponse(Response, True), FDeadline);
           Exit;
         end;
       until HeaderEnd > 0;
       if not ParseRegistryRequestHead(Copy(Request, 1, HeaderEnd - 1), FPeer,
         Head) then
-        Response := ErrorResponse(400, 'Bad Request', 'invalid_request',
-          'request line is invalid')
+        Response := RegistryMalformedRequestResponse(FHandler, Request, FPeer,
+          400, 'Bad Request', 'invalid_request', 'request line is invalid')
       else
       begin
         Response := RegistryDispatch(FStore, FHandler, Head, CheckDeadline,
@@ -1723,7 +1808,7 @@ var
   Buffer: array[0..16383] of Byte;
   Connection: TTransportSecurityConnection;
   Count, HeaderEnd: Integer;
-  IncludeBody, BodyComplete: Boolean;
+  IncludeBody, BodyComplete, Oversized: Boolean;
   Request, RequestChunk, Leftover: string;
   Head: TLWPTRegistryRequestHead;
   Mutation: TLWPTRegistryMutation;
@@ -1755,6 +1840,7 @@ begin
     until (ResultState = tssDone)
       and (TransportSecurityPendingCiphertext(Connection) = 0);
     Request := '';
+    Oversized := False;
     repeat
       CheckDeadline;
       IOResult := TransportSecurityServerRead(Connection, Buffer, 4096);
@@ -1767,8 +1853,10 @@ begin
       HeaderEnd := Pos(#13#10#13#10, Request);
       if ((HeaderEnd = 0) and (Length(Request) > MAX_REQUEST_HEADER_BYTES))
         or (HeaderEnd > MAX_REQUEST_HEADER_BYTES) then
-        raise ELWPTRegistryError.CreateStable('request_headers_too_large',
-          'request headers exceed 32 KiB');
+      begin
+        Oversized := True;
+        Break;
+      end;
       if HeaderEnd > 0 then Break;
       case IOResult.State of
         tssDone:;
@@ -1779,9 +1867,16 @@ begin
           'TLS request read failed');
       end;
     until False;
-    if not ParseRegistryRequestHead(Copy(Request, 1, HeaderEnd - 1), FPeer,
-      Head) then Exit;
-    Response := RegistryDispatch(FStore, FHandler, Head, CheckDeadline,
+    Head := Default(TLWPTRegistryRequestHead);
+    if Oversized then
+      Response := RegistryMalformedRequestResponse(FHandler, Request, FPeer,
+        431, 'Request Header Fields Too Large', 'request_headers_too_large',
+        'request headers exceed 32 KiB')
+    else if not ParseRegistryRequestHead(Copy(Request, 1, HeaderEnd - 1), FPeer,
+      Head) then
+      Response := RegistryMalformedRequestResponse(FHandler, Request, FPeer,
+        400, 'Bad Request', 'invalid_request', 'request line is invalid')
+    else Response := RegistryDispatch(FStore, FHandler, Head, CheckDeadline,
       Mutation);
     if Assigned(Mutation) then
     begin
