@@ -56,6 +56,16 @@ type
     procedure TestLockTablesRoundTrip;
     procedure TestLockedSelectionVerifiesWithoutHistory;
     procedure TestLockedSelectionRejectsTampering;
+    procedure TestLockedSelectionRequiresValidSignature;
+    procedure TestConcurrentStateMergesAreMonotonic;
+  end;
+
+  TMergeThread = class(TThread)
+  protected
+    procedure Execute; override;
+  public
+    Root, Identity, KeyId, PublicKey, Error: string;
+    Sequence: Integer;
   end;
 
 procedure TRegistryConsumerTests.BeforeAll;
@@ -450,6 +460,94 @@ begin
   end;
 end;
 
+{ A canonical envelope with the right key id and payload hash but a wrong
+  signature must fail: only Ed25519 verification rejects it. }
+procedure TRegistryConsumerTests.TestLockedSelectionRequiresValidSignature;
+var
+  Synthetic: TSyntheticRegistry;
+  Selection: TLWPTRegistryLockedSelection;
+  Index, Position: Integer;
+  Message, Text: string;
+begin
+  Synthetic := TSyntheticRegistry.Create('https://packages.example.com');
+  try
+    Synthetic.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Index := Synthetic.Publish(RegistryStamp(-60), RegistryStamp(86400));
+    Selection := SelectionOf(Synthetic, Index, Synthetic.RecordHash('json', '1.0.0'));
+    Selection.Signature := Copy(Selection.Signature);
+    SetString(Text, PAnsiChar(@Selection.Signature[0]), Length(Selection.Signature));
+    Position := Pos('signature = "hex:', Text) + Length('signature = "hex:') + 10;
+    if Selection.Signature[Position - 1] = Ord('0') then
+      Selection.Signature[Position - 1] := Ord('1')
+    else Selection.Signature[Position - 1] := Ord('0');
+    Message := '';
+    try
+      VerifyRegistryLockedSelection(Selection, TrustOf(Synthetic),
+        SHA256BytesPrefixed(Selection.Checkpoint));
+    except
+      on E: Exception do Message := E.Message;
+    end;
+    Expect<Boolean>(Pos('signature_invalid', Message) > 0).ToBe(True);
+  finally
+    Synthetic.Free;
+  end;
+end;
+
+procedure TMergeThread.Execute;
+var State: TLWPTRegistryConsumerState;
+begin
+  try
+    State := Default(TLWPTRegistryConsumerState);
+    State.State.KeyId := KeyId;
+    State.State.PublicKey := PublicKey;
+    State.State.Sequence := Sequence;
+    State.State.Snapshot := 'sha256:' + StringOfChar('a', 62)
+      + LowerCase(Format('%.2x', [Sequence]));
+    State.State.CheckpointHash := 'sha256:' + StringOfChar('b', 62)
+      + LowerCase(Format('%.2x', [Sequence]));
+    State.State.PublishedAt := Format('2026-10-%.2dT00:00:00Z', [Sequence]);
+    State.State.ExpiresAt := Format('2026-10-%.2dT12:00:00Z', [Sequence]);
+    State.State.ClockFloor := State.State.PublishedAt;
+    MergeRegistryConsumerStateAt(Root, Identity, KeyId, State, nil);
+  except
+    on E: Exception do Error := E.Message;
+  end;
+end;
+
+procedure TRegistryConsumerTests.TestConcurrentStateMergesAreMonotonic;
+const
+  MERGE_WORKERS = 12;
+var
+  Threads: array[1..MERGE_WORKERS] of TMergeThread;
+  Index: Integer;
+  Loaded: TLWPTRegistryConsumerState;
+  Root: string;
+begin
+  Root := FScratch + '/concurrent-state';
+  for Index := 1 to MERGE_WORKERS do
+  begin
+    Threads[Index] := TMergeThread.Create(True);
+    Threads[Index].Root := Root;
+    Threads[Index].Identity := 'https://packages.example.com';
+    Threads[Index].KeyId := FKeyID;
+    Threads[Index].PublicKey := FPublicKey;
+    { A permutation of 1..MERGE_WORKERS that interleaves high and low. }
+    Threads[Index].Sequence := (Index * 5) mod MERGE_WORKERS + 1;
+  end;
+  for Index := 1 to MERGE_WORKERS do Threads[Index].Start;
+  for Index := 1 to MERGE_WORKERS do
+  begin
+    Threads[Index].WaitFor;
+    Expect<string>(Threads[Index].Error).ToBe('');
+    Threads[Index].Free;
+  end;
+  Expect<Boolean>(LoadRegistryConsumerStateAt(Root,
+    'https://packages.example.com', FKeyID, Loaded)).ToBe(True);
+  Expect<Int64>(Loaded.State.Sequence).ToBe(MERGE_WORKERS);
+  Expect<string>(Loaded.State.ClockFloor)
+    .ToBe(Format('2026-10-%.2dT00:00:00Z', [MERGE_WORKERS]));
+end;
+
 procedure TRegistryConsumerTests.SetupTests;
 begin
   Test('registry sources parse in bare and inline-table forms',
@@ -488,6 +586,10 @@ begin
     TestLockedSelectionVerifiesWithoutHistory);
   Test('a tampered locked selection fails verification',
     TestLockedSelectionRejectsTampering);
+  Test('a locked selection with a well-formed but invalid signature fails',
+    TestLockedSelectionRequiresValidSignature);
+  Test('concurrent per-user state merges keep the highest sequence and floor',
+    TestConcurrentStateMergesAreMonotonic);
 end;
 
 begin

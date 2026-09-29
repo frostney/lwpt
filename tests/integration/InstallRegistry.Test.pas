@@ -17,6 +17,8 @@ uses
   SysUtils,
 
   LWPT.Core,
+  LWPT.ProducerLease,
+  LWPT.Registry.Consumer,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
   Tests.RegistryConsumer,
@@ -40,6 +42,10 @@ type
       const AExtra: string = '');
     function Install(const ACase: string;
       const AArguments: array of string): TLwptResult;
+    function InstallWith(const ACase: string;
+      const AArguments, AEnvironment: array of string): TLwptResult;
+    function StateField(const ACase, AField: string): string;
+    procedure WriteMember(const ACase, AContent: string);
     function Declaration(const AAlias: string; ARegistry: TSyntheticRegistry;
       const AOrigin: string; const AMirrors: array of string;
       const AWithIdentity: Boolean = True): string;
@@ -106,6 +112,18 @@ type
     procedure TestReleaseBinaryRejectsLocalhostHTTP;
     procedure TestFrozenAndOfflineFailClosed;
     procedure TestPerUserStateIsSharedAndCorruptionNamed;
+    procedure TestWorkspaceOnlyBindingsSurviveSharedPin;
+    procedure TestTwoAliasesCannotShareAnOrigin;
+    procedure TestMemberIdentityConstrainsAdvertisedRoot;
+    procedure TestCheckpointPublishedDuringAcquisitionIsAccepted;
+    procedure TestCheckpointExpiringBeforePublicationFails;
+    procedure TestStateWriteFailureFailsUnchangedInstall;
+    procedure TestStateLeaseTimeoutFailsUnchangedInstall;
+    procedure TestLaggingPreRotationMirrorIsStale;
+    procedure TestDecision8RejectsForgedSignature;
+    procedure TestFirstInstallRollsBackAfterLockWrite;
+    procedure TestProofReplacementAndPruningRollBack;
+    procedure TestLockFloorNeverReachesPerUserState;
   end;
 
 function ReadText(const APath: string): string;
@@ -1279,6 +1297,461 @@ begin
   end;
 end;
 
+{ ---------------------------------------------------------------------------
+  Review follow-ups: identity binding, freshness, persistence, rotation,
+  locked-proof signatures, rollback, and floor isolation
+  --------------------------------------------------------------------------- }
+
+function TInstallRegistry.InstallWith(const ACase: string;
+  const AArguments, AEnvironment: array of string): TLwptResult;
+var Environment: array of string; Index: Integer;
+begin
+  SetLength(Environment, 2 + Length(AEnvironment));
+  Environment[0] := PROJECT_NAME + '_REGISTRY_STATE_DIR=' + ACase + '/state';
+  Environment[1] := PROJECT_NAME + '_CACHE_DIR=' + ACase + '/cache';
+  for Index := 0 to High(AEnvironment) do
+    Environment[2 + Index] := AEnvironment[Index];
+  Result := RunLwptTesting(AArguments, ACase + '/project', Environment);
+end;
+
+function TInstallRegistry.StateField(const ACase, AField: string): string;
+var Search: TSearchRec; Text: string; Start: Integer;
+begin
+  Result := '';
+  if FindFirst(ACase + '/state/origins/*.toml', faAnyFile, Search) <> 0 then Exit;
+  try
+    Text := ReadText(ACase + '/state/origins/' + Search.Name);
+  finally
+    FindClose(Search);
+  end;
+  Start := Pos(#10 + AField + ' = "', Text);
+  if Start = 0 then Exit;
+  Text := Copy(Text, Start + Length(AField) + 5, MaxInt);
+  Result := Copy(Text, 1, Pos('"', Text) - 1);
+end;
+
+procedure TInstallRegistry.WriteMember(const ACase, AContent: string);
+begin
+  ForceDirectories(ACase + '/project/packages/member/source');
+  WriteTextFile(ACase + '/project/packages/member/lwpt.toml',
+    '[package]'#10 + 'name = "member"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10 + AContent);
+end;
+
+procedure TInstallRegistry.TestWorkspaceOnlyBindingsSurviveSharedPin;
+var
+  First, Second, Third: TSyntheticRegistry;
+  FirstContact, SecondContact: TSyntheticContact;
+  CaseRoot, Before, Lock: string;
+begin
+  CaseRoot := NewCase('workspace-bindings');
+  First := NewRegistry(IDENTITY, FirstContact);
+  Second := NewRegistry(OTHER_IDENTITY, SecondContact);
+  Third := TSyntheticRegistry.Create('https://third.example.com');
+  try
+    First.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(First);
+    Second.AddPackage('util', '1.0.0', RegistryPackageArchive('util', '1.0.0'), []);
+    Window(Second);
+    Third.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(Third);
+    { Two identity-less aliases share one pin, and only a workspace member
+      declares registry dependencies. }
+    WriteMember(CaseRoot, '[dependencies]'#10 + 'json = "registry:corp/json"'#10
+      + 'util = "registry:oss/util"'#10);
+    WriteProject(CaseRoot,
+      Declaration('corp', First, FirstContact.BaseURL, [], False)
+      + Declaration('oss', Second, SecondContact.BaseURL, [], False), '',
+      '[workspaces]'#10 + 'include = ["packages/*"]'#10);
+    ExpectSuccess('shared pin baseline', Install(CaseRoot, ['install']));
+    Lock := LockText(CaseRoot);
+    Expect<string>(EntryField(Lock, 'json', 'registryOrigin')).ToBe(IDENTITY);
+    Expect<string>(EntryField(Lock, 'util', 'registryOrigin')).ToBe(OTHER_IDENTITY);
+    Before := Fingerprint(CaseRoot);
+    { A third origin under the same key is never a first discovery. }
+    FirstContact.Registry := Third;
+    ExpectFailure(Install(CaseRoot, ['install']), 'registry_identity_changed');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    { With no locked dependency binding the alias, two unclaimed tables under
+      its key are ambiguous: the install fails before any request. }
+    FirstContact.Registry := First;
+    WriteMember(CaseRoot, '[dependencies]'#10 + 'extra = "registry:corp/extra"'#10);
+    ExpectFailure(Install(CaseRoot, ['install']),
+      'records several origins pinned to the key of [registries.corp]');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  finally
+    FirstContact.Free;
+    SecondContact.Free;
+    Third.Free;
+    Second.Free;
+    First.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestTwoAliasesCannotShareAnOrigin;
+var
+  Registry: TSyntheticRegistry;
+  Origin, Copy: TSyntheticContact;
+  CaseRoot: string;
+begin
+  CaseRoot := NewCase('duplicate-identity');
+  Registry := NewRegistry(IDENTITY, Origin);
+  Copy := TSyntheticContact.Create(Registry, '/copy');
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Registry.AddPackage('util', '1.0.0', RegistryPackageArchive('util', '1.0.0'), []);
+    Window(Registry);
+    WriteProject(CaseRoot,
+      Declaration('corp', Registry, Origin.BaseURL, [], False)
+      + Declaration('copy', Registry, Copy.BaseURL, [], False),
+      'json = "registry:corp/json"'#10 + 'util = "registry:copy/util"'#10);
+    ExpectFailure(Install(CaseRoot, ['install']), 'both resolve to origin '
+      + IDENTITY);
+    Expect<Boolean>(FileExists(CaseRoot + '/project/lwpt.lock')).ToBe(False);
+  finally
+    Copy.Free;
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestMemberIdentityConstrainsAdvertisedRoot;
+var
+  Declared, Advertised: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot: string;
+begin
+  CaseRoot := NewCase('member-identity');
+  { The same pin signs both origins; the root's contact advertises one. }
+  Declared := TSyntheticRegistry.Create(IDENTITY);
+  Advertised := NewRegistry(OTHER_IDENTITY, Origin);
+  try
+    Advertised.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(Advertised);
+    WriteMember(CaseRoot, Declaration('corp', Declared, Origin.BaseURL, [])
+      + '[dependencies]'#10 + 'json = "registry:corp/json"'#10);
+    WriteProject(CaseRoot, Declaration('corp', Advertised, Origin.BaseURL, [], False),
+      '', '[workspaces]'#10 + 'include = ["packages/*"]'#10);
+    ExpectFailure(Install(CaseRoot, ['install']),
+      'workspace member "member" declares [registries.corp] with identity '
+      + IDENTITY);
+    Expect<Boolean>(FileExists(CaseRoot + '/project/lwpt.lock')).ToBe(False);
+    { The member naming the advertised identity agrees and installs. }
+    WriteMember(CaseRoot, Declaration('corp', Advertised, Origin.BaseURL, [])
+      + '[dependencies]'#10 + 'json = "registry:corp/json"'#10);
+    ExpectSuccess('member agrees', Install(CaseRoot, ['install']));
+  finally
+    Origin.Free;
+    Advertised.Free;
+    Declared.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestCheckpointPublishedDuringAcquisitionIsAccepted;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot: string;
+begin
+  CaseRoot := NewCase('published-during');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    { Published two seconds from now; discovery answers after four. }
+    Registry.Publish(RegistryStamp(2), RegistryStamp(DAY));
+    Origin.Delay('.well-known', 4000);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    ExpectSuccess('published during acquisition', Install(CaseRoot, ['install']));
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestCheckpointExpiringBeforePublicationFails;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Before: string;
+begin
+  CaseRoot := NewCase('expires-before-publication');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    { Fresh when verified, expired once the delayed archive arrives. }
+    Registry.Publish(RegistryStamp(-60), RegistryStamp(3));
+    Origin.Delay('/objects/', 5000);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    Before := Fingerprint(CaseRoot);
+    ExpectFailure(Install(CaseRoot, ['install']), 'before the install could publish');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestStateWriteFailureFailsUnchangedInstall;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Before: string;
+begin
+  CaseRoot := NewCase('state-write-failure');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Registry.Publish(RegistryStamp(-7200), RegistryStamp(6 * DAY));
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    ExpectSuccess('state baseline', Install(CaseRoot, ['install']));
+    { Acquisition advances without changing the selection: per-user state
+      is then the only record of sequence 2. }
+    Registry.AddPackage('other', '1.0.0', RegistryPackageArchive('other', '1.0.0'), []);
+    Window(Registry);
+    Before := Fingerprint(CaseRoot);
+    ExpectFailure(InstallWith(CaseRoot, ['install'],
+      [PROJECT_NAME + '_TEST_FAIL_REGISTRY_STATE_WRITE=1']),
+      'registry_state_not_persisted');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    Expect<Integer>(StateSequence(CaseRoot)).ToBe(1);
+    ExpectSuccess('state recovers', Install(CaseRoot, ['install']));
+    Expect<Integer>(StateSequence(CaseRoot)).ToBe(2);
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestStateLeaseTimeoutFailsUnchangedInstall;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Before: string;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
+begin
+  CaseRoot := NewCase('state-lease-timeout');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Registry.Publish(RegistryStamp(-7200), RegistryStamp(6 * DAY));
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    ExpectSuccess('lease baseline', Install(CaseRoot, ['install']));
+    Registry.AddPackage('other', '1.0.0', RegistryPackageArchive('other', '1.0.0'), []);
+    Window(Registry);
+    Before := Fingerprint(CaseRoot);
+    Coordinator := TLWPTProducerLeaseCoordinator.Create(CaseRoot + '/state/locks');
+    try
+      Lease := Coordinator.TryAcquire('registry-state:' + ExtractFileName(
+        RegistryStatePathAt(CaseRoot + '/state', IDENTITY, Registry.KeyID)),
+        'test holder');
+      Expect<Boolean>(Lease <> nil).ToBe(True);
+      try
+        ExpectFailure(InstallWith(CaseRoot, ['install'],
+          [PROJECT_NAME + '_TEST_REGISTRY_STATE_LEASE_MS=300']),
+          'registry_state_locked');
+      finally
+        Lease.Free;
+      end;
+    finally
+      Coordinator.Free;
+    end;
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    Expect<Integer>(StateSequence(CaseRoot)).ToBe(1);
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestLaggingPreRotationMirrorIsStale;
+var
+  Registry: TSyntheticRegistry;
+  Origin, Lagging: TSyntheticContact;
+  CaseRoot, Before: string;
+  Run: TLwptResult;
+begin
+  CaseRoot := NewCase('rotation-lagging');
+  Registry := NewRegistry(IDENTITY, Origin);
+  Lagging := TSyntheticContact.Create(Registry, '/lagging', 'mirror');
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Registry.Publish(RegistryStamp(-7200), RegistryStamp(6 * DAY));
+    Registry.Rotate(11);
+    Registry.AddPackage('util', '1.0.0', RegistryPackageArchive('util', '1.0.0'), []);
+    Window(Registry);
+    Expect<Boolean>(Registry.CurrentKeyID <> Registry.KeyID).ToBe(True);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    { Acquisition follows the rotation chain from the pin. }
+    ExpectSuccess('rotated origin', Install(CaseRoot, ['install']));
+    Expect<Boolean>(Pos('keyId = "' + Registry.CurrentKeyID + '"',
+      LockText(CaseRoot)) > 0).ToBe(True);
+    Before := LockText(CaseRoot);
+    { A lagging mirror serves the authentic pre-rotation checkpoint. }
+    Lagging.CheckpointIndex := 0;
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL,
+      [Lagging.BaseURL]), 'json = "registry:json"'#10);
+    Run := Install(CaseRoot, ['install']);
+    ExpectSuccess('lagging mirror with per-user chain', Run);
+    Expect<Boolean>(Pos(Lagging.BaseURL + ' is stale', Output(Run)) > 0).ToBe(True);
+    Expect<string>(LockText(CaseRoot)).ToBe(Before);
+    { Fresh CI: the committed proof supplies the accepted chain. }
+    RecursiveDelete(CaseRoot + '/state');
+    ForceDirectories(CaseRoot + '/state');
+    Run := Install(CaseRoot, ['install']);
+    ExpectSuccess('lagging mirror with committed chain', Run);
+    Expect<Boolean>(Pos(Lagging.BaseURL + ' is stale', Output(Run)) > 0).ToBe(True);
+    Expect<string>(LockText(CaseRoot)).ToBe(Before);
+  finally
+    Lagging.Free;
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestDecision8RejectsForgedSignature;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Lock, OldHash, NewHash, ProofRoot, Text, Before: string;
+  Bytes: TBytes;
+  Position: Integer;
+begin
+  CaseRoot := NewCase('forged-signature');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(Registry);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    ExpectSuccess('forged baseline', Install(CaseRoot, ['install']));
+    { Replace the committed signature envelope with a canonical one whose key
+      id and payload hash are right but whose signature is not, keeping the
+      proof file name and the lock's hash consistent. }
+    Lock := LockText(CaseRoot);
+    Text := Copy(Lock, Pos(#10'signature = "', Lock) + 14, MaxInt);
+    OldHash := Copy(Text, 1, Pos('"', Text) - 1);
+    ProofRoot := CaseRoot + '/project/.lwpt/archives/registry-proofs/sha256/';
+    Text := ReadText(ProofRoot + Copy(OldHash, 8, 64) + '.toml');
+    Position := Pos('signature = "hex:', Text) + Length('signature = "hex:') + 20;
+    if Text[Position] = '0' then Text[Position] := '1' else Text[Position] := '0';
+    Bytes := BytesOf(Text);
+    NewHash := SHA256BytesPrefixed(Bytes);
+    DeleteFile(ProofRoot + Copy(OldHash, 8, 64) + '.toml');
+    WriteTextFile(ProofRoot + Copy(NewHash, 8, 64) + '.toml', Text);
+    WriteTextFile(CaseRoot + '/project/lwpt.lock',
+      StringReplace(Lock, 'signature = "' + OldHash + '"',
+        'signature = "' + NewHash + '"', []));
+    Before := Fingerprint(CaseRoot);
+    Origin.Mode := scmFail;
+    ExpectFailure(Install(CaseRoot, ['install']), 'signature_invalid');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestFirstInstallRollsBackAfterLockWrite;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot: string;
+begin
+  CaseRoot := NewCase('rollback-first');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(Registry);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    ExpectFailure(InstallWith(CaseRoot, ['install'],
+      [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']),
+      'injected failure after lockfile publication');
+    Expect<Boolean>(FileExists(CaseRoot + '/project/lwpt.lock')).ToBe(False);
+    Expect<Boolean>(DirectoryExists(CaseRoot + '/project/.lwpt/modules/json'))
+      .ToBe(False);
+    Expect<Boolean>(DirectoryExists(
+      CaseRoot + '/project/.lwpt/archives/registry-proofs')).ToBe(False);
+    Expect<Boolean>(DirectoryExists(CaseRoot + '/state/origins')).ToBe(False);
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestProofReplacementAndPruningRollBack;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Before: string;
+begin
+  CaseRoot := NewCase('rollback-proofs');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Registry.Publish(RegistryStamp(-7200), RegistryStamp(6 * DAY));
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json@^1.0.0"'#10);
+    ExpectSuccess('rollback baseline', Install(CaseRoot, ['install']));
+    Before := Fingerprint(CaseRoot);
+    { A new selection replaces the proof set; the failure restores it. }
+    Registry.AddPackage('json', '1.1.0', RegistryPackageArchive('json', '1.1.0'), []);
+    Window(Registry);
+    ExpectFailure(InstallWith(CaseRoot, ['install'],
+      [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']),
+      'injected failure after lockfile publication');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    { Dropping the dependency prunes every proof; the failure restores them. }
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []), '');
+    ExpectFailure(InstallWith(CaseRoot, ['install'],
+      [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']),
+      'injected failure after lockfile publication');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestLockFloorNeverReachesPerUserState;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Lock, Published, Edited: string;
+begin
+  CaseRoot := NewCase('floor-isolation');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(Registry);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    ExpectSuccess('floor baseline', Install(CaseRoot, ['install']));
+    Published := StateField(CaseRoot, 'published_at');
+    Expect<string>(StateField(CaseRoot, 'clock_floor')).ToBe(Published);
+    { An unsigned lock floor later than anything signed, but not ahead of
+      the clock, stays project state. }
+    Edited := RegistryStamp(-5);
+    Lock := LockText(CaseRoot);
+    Lock := Copy(Lock, 1, Pos('clockFloor = "', Lock) + Length('clockFloor = "') - 1)
+      + Edited + '"'#10;
+    WriteTextFile(CaseRoot + '/project/lwpt.lock', Lock);
+    RecursiveDelete(CaseRoot + '/state');
+    ForceDirectories(CaseRoot + '/state');
+    ExpectSuccess('floor edited', Install(CaseRoot, ['install']));
+    Expect<string>(StateField(CaseRoot, 'clock_floor')).ToBe(Published);
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
 procedure TInstallRegistry.SetupTests;
 begin
   Test('#62: a dependency selects a protocol-v1 origin explicitly',
@@ -1353,6 +1826,29 @@ begin
     + 'a request', TestFrozenAndOfflineFailClosed);
   Test('per-user state is shared across projects and corruption names the '
     + 'file', TestPerUserStateIsSharedAndCorruptionNamed);
+  Test('decision 2: workspace-only bindings survive two origins sharing a '
+    + 'pin, and an ambiguous binding fails', TestWorkspaceOnlyBindingsSurviveSharedPin);
+  Test('two aliases cannot resolve to one origin', TestTwoAliasesCannotShareAnOrigin);
+  Test('a workspace member identity constrains an advertised root identity',
+    TestMemberIdentityConstrainsAdvertisedRoot);
+  Test('freshness: a checkpoint published during acquisition is accepted',
+    TestCheckpointPublishedDuringAcquisitionIsAccepted);
+  Test('freshness: a checkpoint expiring before publication changes nothing',
+    TestCheckpointExpiringBeforePublicationFails);
+  Test('decision 11: a per-user state write failure fails an unchanged install',
+    TestStateWriteFailureFailsUnchangedInstall);
+  Test('decision 11: a per-user state lease timeout fails an unchanged install',
+    TestStateLeaseTimeoutFailsUnchangedInstall);
+  Test('#55: a lagging pre-rotation contact is stale and fails over',
+    TestLaggingPreRotationMirrorIsStale);
+  Test('decision 8: a forged committed signature is never reused',
+    TestDecision8RejectsForgedSignature);
+  Test('rollback: a first install failing after the lock write leaves nothing',
+    TestFirstInstallRollsBackAfterLockWrite);
+  Test('rollback: proof replacement and pruning are restored on failure',
+    TestProofReplacementAndPruningRollBack);
+  Test('an unsigned lock floor never reaches per-user state',
+    TestLockFloorNeverReachesPerUserState);
 end;
 
 begin

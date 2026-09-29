@@ -26,10 +26,17 @@ type
     Checkpoint, Signature: TBytes;
   end;
 
+  TSyntheticRotation = record
+    Sequence: Integer;
+    Document, OldSignature, NewSignature: TBytes;
+  end;
+
   TSyntheticRegistry = class
   private
     FIdentity, FKeyID, FPublicKey, FHead: string;
+    FCurrentKeyID: string;
     FSeed: TLWPTEd25519Seed;
+    FRotations: TList<TSyntheticRotation>;
     FSequence: Integer;
     FDocuments: TDictionary<string, TBytes>;
     FActive: TDictionary<string, string>;
@@ -53,6 +60,11 @@ type
     function Publish(const APublishedAt, AExpiresAt: string): Integer;
     { Signs another checkpoint for the current sequence (a renewal). }
     function Renew(const APublishedAt, AExpiresAt: string): Integer;
+    { Rotates the signing key to one derived from ASeedByte, effective at
+      the next sequence, with both signatures and the new key record. }
+    procedure Rotate(const ASeedByte: Byte);
+    function RotationCount: Integer;
+    function Rotation(const AIndex: Integer): TSyntheticRotation;
     { Signs arbitrary checkpoint fields; used for equivocation. }
     function SignRaw(const ASequence: Integer; const ASnapshot, APublishedAt,
       AExpiresAt: string): Integer;
@@ -62,7 +74,9 @@ type
     function RecordHash(const AName, AVersion: string): string;
     function ArchiveHashOf(const AName, AVersion: string): string;
     property Identity: string read FIdentity;
+    { The initial key: the pin consumers declare. }
     property KeyID: string read FKeyID;
+    property CurrentKeyID: string read FCurrentKeyID;
     property PublicKey: string read FPublicKey;
     property Sequence: Integer read FSequence;
     property Head: string read FHead;
@@ -79,6 +93,7 @@ type
     FLock: TRTLCriticalSection;
     FOverrides: TDictionary<string, TBytes>;
     FMissing: TStringList;
+    FDelays: TStringList;
     function Handle(const ATarget: string; out AMediaType: string;
       out ABody: TBytes): Integer;
   public
@@ -97,6 +112,8 @@ type
     procedure Override(const APath: string; const ABody: TBytes);
     { Answers 404 for the v1-relative APath. }
     procedure Hide(const APath: string);
+    { Delays every response whose target contains AFragment. }
+    procedure Delay(const AFragment: string; const AMilliseconds: Integer);
     function Requests: Integer;
     function RequestedCount(const AFragment: string): Integer;
     property Registry: TSyntheticRegistry read FRegistry write FRegistry;
@@ -120,6 +137,11 @@ uses
 
 const
   DAY = 24 * 60 * 60;
+
+function BytesText(const ABytes: TBytes): string;
+begin
+  SetString(Result, PAnsiChar(@ABytes[0]), Length(ABytes));
+end;
 
 function RegistrySHA256(const ABytes: TBytes): string;
 begin
@@ -171,6 +193,8 @@ begin
   Move(PublicKey[0], Raw[0], SizeOf(PublicKey));
   FPublicKey := 'hex:' + BytesToHex(PublicKey, SizeOf(PublicKey));
   FKeyID := 'ed25519:' + SHA256Hex(Raw);
+  FCurrentKeyID := FKeyID;
+  FRotations := TList<TSyntheticRotation>.Create;
   FDocuments := TDictionary<string, TBytes>.Create;
   FActive := TDictionary<string, string>.Create;
   FRecords := TDictionary<string, string>.Create;
@@ -187,6 +211,7 @@ end;
 destructor TSyntheticRegistry.Destroy;
 begin
   FCheckpoints.Free;
+  FRotations.Free;
   FRecords.Free;
   FActive.Free;
   FDocuments.Free;
@@ -314,7 +339,7 @@ begin
     + 'snapshot = "' + ASnapshot + '"'#10
     + 'published_at = "' + APublishedAt + '"'#10
     + 'expires_at = "' + AExpiresAt + '"'#10
-    + 'key_id = "' + FKeyID + '"'#10);
+    + 'key_id = "' + FCurrentKeyID + '"'#10);
   Payload := Result.Checkpoint;
   Domain := BytesOf('LWPT-REGISTRY-CHECKPOINT-V1'#10);
   SetLength(Message, Length(Domain) + Length(Payload));
@@ -323,7 +348,7 @@ begin
   Ed25519Sign(Message, FSeed, Signature);
   Result.Signature := BytesOf('schema = "lwpt-registry-signature-v1"'#10
     + 'algorithm = "ed25519"'#10
-    + 'key_id = "' + FKeyID + '"'#10
+    + 'key_id = "' + FCurrentKeyID + '"'#10
     + 'payload = "' + RegistrySHA256(Payload) + '"'#10
     + 'signature = "hex:' + BytesToHex(Signature, SizeOf(Signature)) + '"'#10);
 end;
@@ -366,6 +391,80 @@ begin
   finally
     LeaveCriticalSection(FLock);
   end;
+end;
+
+function SignEnvelope(const ADomain: string; const APayload: TBytes;
+  const ASeed: TLWPTEd25519Seed; const AKeyID: string): TBytes;
+var Domain, Message: TBytes; Signature: TLWPTEd25519Signature;
+begin
+  Domain := BytesOf(ADomain + #10);
+  SetLength(Message, Length(Domain) + Length(APayload));
+  Move(Domain[0], Message[0], Length(Domain));
+  Move(APayload[0], Message[Length(Domain)], Length(APayload));
+  Ed25519Sign(Message, ASeed, Signature);
+  Result := BytesOf('schema = "lwpt-registry-signature-v1"'#10
+    + 'algorithm = "ed25519"'#10
+    + 'key_id = "' + AKeyID + '"'#10
+    + 'payload = "' + RegistrySHA256(APayload) + '"'#10
+    + 'signature = "hex:' + BytesToHex(Signature, SizeOf(Signature)) + '"'#10);
+end;
+
+procedure TSyntheticRegistry.Rotate(const ASeedByte: Byte);
+var
+  NewSeed: TLWPTEd25519Seed;
+  PublicKey: TLWPTEd25519PublicKey;
+  Raw: TBytes;
+  NewKeyID, NewPublicKey: string;
+  Entry: TSyntheticRotation;
+begin
+  EnterCriticalSection(FLock);
+  try
+    FillChar(NewSeed, SizeOf(NewSeed), ASeedByte);
+    Ed25519PublicKey(NewSeed, PublicKey);
+    SetLength(Raw, SizeOf(PublicKey));
+    Move(PublicKey[0], Raw[0], SizeOf(PublicKey));
+    NewPublicKey := 'hex:' + BytesToHex(PublicKey, SizeOf(PublicKey));
+    NewKeyID := 'ed25519:' + SHA256Hex(Raw);
+    Entry.Sequence := FSequence + 1;
+    Entry.Document := BytesOf('schema = "lwpt-registry-key-rotation-v1"'#10
+      + 'origin = "' + FIdentity + '"'#10
+      + 'from_key = "' + FCurrentKeyID + '"'#10
+      + 'to_key = "' + NewKeyID + '"'#10
+      + 'to_public_key = "' + NewPublicKey + '"'#10
+      + 'effective_sequence = ' + IntToStr(Entry.Sequence) + #10);
+    Entry.OldSignature := SignEnvelope('LWPT-REGISTRY-KEY-ROTATION-V1',
+      Entry.Document, FSeed, FCurrentKeyID);
+    Entry.NewSignature := SignEnvelope('LWPT-REGISTRY-KEY-ROTATION-V1',
+      Entry.Document, NewSeed, NewKeyID);
+    FDocuments.AddOrSetValue('keys/' + NewKeyID + '.toml', BytesOf(
+      'schema = "lwpt-registry-key-v1"'#10
+      + 'origin = "' + FIdentity + '"'#10
+      + 'key_id = "' + NewKeyID + '"'#10
+      + 'algorithm = "ed25519"'#10
+      + 'public_key = "' + NewPublicKey + '"'#10
+      + 'valid_from_sequence = ' + IntToStr(Entry.Sequence) + #10));
+    FDocuments.AddOrSetValue('rotations/' + IntToStr(Entry.Sequence) + '.toml',
+      Entry.Document);
+    FDocuments.AddOrSetValue('rotations/' + IntToStr(Entry.Sequence)
+      + '.old.sig.toml', Entry.OldSignature);
+    FDocuments.AddOrSetValue('rotations/' + IntToStr(Entry.Sequence)
+      + '.new.sig.toml', Entry.NewSignature);
+    FRotations.Add(Entry);
+    FSeed := NewSeed;
+    FCurrentKeyID := NewKeyID;
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+function TSyntheticRegistry.RotationCount: Integer;
+begin
+  Result := FRotations.Count;
+end;
+
+function TSyntheticRegistry.Rotation(const AIndex: Integer): TSyntheticRotation;
+begin
+  Result := FRotations[AIndex];
 end;
 
 function TSyntheticRegistry.Renew(const APublishedAt, AExpiresAt: string): Integer;
@@ -440,6 +539,7 @@ begin
   CheckpointIndex := -1;
   FOverrides := TDictionary<string, TBytes>.Create;
   FMissing := TStringList.Create;
+  FDelays := TStringList.Create;
   FServer := TRegistryTestServer.Create(nil, True);
   FServer.Handler := Handle;
   FServer.Start;
@@ -448,6 +548,7 @@ end;
 destructor TSyntheticContact.Destroy;
 begin
   FServer.Free;
+  FDelays.Free;
   FMissing.Free;
   FOverrides.Free;
   DoneCriticalSection(FLock);
@@ -474,6 +575,17 @@ begin
   EnterCriticalSection(FLock);
   try
     FMissing.Add(APath);
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+procedure TSyntheticContact.Delay(const AFragment: string;
+  const AMilliseconds: Integer);
+begin
+  EnterCriticalSection(FLock);
+  try
+    FDelays.Values[AFragment] := IntToStr(AMilliseconds);
   finally
     LeaveCriticalSection(FLock);
   end;
@@ -509,6 +621,14 @@ begin
     Exit('application/vnd.lwpt.registry-checkpoint+toml');
   if APath = 'capabilities' then
     Exit('application/vnd.lwpt.registry-capabilities+toml');
+  if Pos('rotations?', APath) = 1 then
+    Exit('application/vnd.lwpt.registry-rotation-page+toml');
+  if Pos('rotations/', APath) = 1 then
+  begin
+    if Pos('.sig.toml', APath) > 0 then
+      Exit('application/vnd.lwpt.registry-signature+toml');
+    Exit('application/vnd.lwpt.registry-key-rotation+toml');
+  end;
   Result := 'text/plain';
 end;
 
@@ -517,10 +637,22 @@ function TSyntheticContact.Handle(const ATarget: string; out AMediaType: string;
 var
   Relative, Origin, Base: string;
   Current: TSyntheticCheckpoint;
-  Protocol: Integer;
+  Protocol, Index, Wait, After, RotationIndex: Integer;
+  Items, Query: string;
+  Entry: TSyntheticRotation;
 begin
   ABody := nil;
   AMediaType := 'text/plain';
+  Wait := 0;
+  EnterCriticalSection(FLock);
+  try
+    for Index := 0 to FDelays.Count - 1 do
+      if Pos(FDelays.Names[Index], ATarget) > 0 then
+        Wait := StrToIntDef(FDelays.ValueFromIndex[Index], 0);
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+  if Wait > 0 then Sleep(Wait);
   EnterCriticalSection(FLock);
   try
     if (Mode = scmFail) or (FRegistry = nil) then Exit(503);
@@ -541,6 +673,9 @@ begin
         + 'api = "' + Base + '/v1"'#10
         + 'capabilities = "' + Base + '/v1/capabilities"'#10
         + 'checkpoint = "' + Base + '/v1/checkpoints/latest.toml"'#10);
+      if (FRegistry <> nil) and (FRegistry.RotationCount > 0) then
+        ABody := BytesOf(BytesText(ABody) + 'rotations = "' + Base
+          + '/v1/rotations"'#10);
       Exit(200);
     end;
     if Copy(ATarget, 1, Length(FPath) + 4) <> FPath + '/v1/' then Exit(404);
@@ -548,6 +683,45 @@ begin
     if FMissing.IndexOf(Relative) >= 0 then Exit(404);
     AMediaType := MediaFor(Relative);
     if FOverrides.TryGetValue(Relative, ABody) then Exit(200);
+    if (Relative = 'capabilities') and (FRegistry.RotationCount > 0) then
+    begin
+      ABody := BytesOf('schema = "lwpt-registry-capabilities-v1"'#10
+        + 'protocol = 1'#10
+        + 'hashes = ["sha256"]'#10
+        + 'signatures = ["ed25519"]'#10
+        + 'schemas = ["lwpt-registry-capabilities-v1", "lwpt-registry-checkpoint-v1", '
+        + '"lwpt-registry-discovery-v1", "lwpt-registry-error-v1", '
+        + '"lwpt-registry-key-rotation-v1", "lwpt-registry-key-v1", '
+        + '"lwpt-registry-package-v1", "lwpt-registry-rotation-page-v1", '
+        + '"lwpt-registry-signature-v1", "lwpt-registry-snapshot-v1"]'#10
+        + 'features = ["rotation-chain-v1", "snapshot-sync-v1"]'#10
+        + 'auth_schemes = []'#10
+        + 'max_page_size = 100'#10);
+      Exit(200);
+    end;
+    if Pos('rotations?', Relative) = 1 then
+    begin
+      Query := Copy(Relative, Pos('after=', Relative) + 6, MaxInt);
+      if Pos('&', Query) > 0 then Query := Copy(Query, 1, Pos('&', Query) - 1);
+      After := StrToIntDef(Query, 0);
+      Items := '';
+      for RotationIndex := 0 to FRegistry.RotationCount - 1 do
+      begin
+        Entry := FRegistry.Rotation(RotationIndex);
+        if Entry.Sequence <= After then Continue;
+        if Items <> '' then Items := Items + ', ';
+        Items := Items + '{ effective_sequence = ' + IntToStr(Entry.Sequence)
+          + ', rotation = "' + Base + '/v1/rotations/' + IntToStr(Entry.Sequence)
+          + '.toml", old_signature = "' + Base + '/v1/rotations/'
+          + IntToStr(Entry.Sequence) + '.old.sig.toml", new_signature = "'
+          + Base + '/v1/rotations/' + IntToStr(Entry.Sequence) + '.new.sig.toml" }';
+      end;
+      ABody := BytesOf('schema = "lwpt-registry-rotation-page-v1"'#10
+        + 'origin = "' + FRegistry.Identity + '"'#10
+        + 'items = [' + Items + ']'#10
+        + 'next_cursor = ""'#10);
+      Exit(200);
+    end;
     if Relative = 'capabilities' then
     begin
       ABody := BytesOf('schema = "lwpt-registry-capabilities-v1"'#10
