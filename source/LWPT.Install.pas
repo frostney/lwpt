@@ -2223,18 +2223,22 @@ procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
   const ALockEntries: array of TResolved;
   const ACheckTreeHash: Boolean); forward;
 
-{ The lock path as the user sees it: project-relative with '/' separators
-  when inside the project. }
+{ A path as the user sees it: project-relative inside the project, with '/'
+  separators on every platform. }
 function ProjectDisplayPath(const AProjectRoot, APath: string): string;
 var RootAbs, PathAbs: string;
 begin
   Result := APath;
-  if (AProjectRoot = '') or (APath = '') then Exit;
-  RootAbs := IncludeTrailingPathDelimiter(ExpandFileName(AProjectRoot));
-  PathAbs := ExpandFileName(APath);
-  if Copy(PathAbs, 1, Length(RootAbs)) = RootAbs then
-    Result := StringReplace(Copy(PathAbs, Length(RootAbs) + 1, MaxInt), '',
-      '/', [rfReplaceAll]);
+  if (AProjectRoot <> '') and (APath <> '') then
+  begin
+    RootAbs := IncludeTrailingPathDelimiter(ExpandFileName(AProjectRoot));
+    PathAbs := ExpandFileName(APath);
+    if Copy(PathAbs, 1, Length(RootAbs)) = RootAbs then
+      Result := Copy(PathAbs, Length(RootAbs) + 1, MaxInt);
+  end;
+  {$IFDEF MSWINDOWS}
+  Result := StringReplace(Result, '\', '/', [rfReplaceAll]);
+  {$ENDIF}
 end;
 
 const

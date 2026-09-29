@@ -884,6 +884,30 @@ begin
 end;
 {$ENDIF}
 
+{ Removes the flat fixture files of ADirectory by their UTF-16 names: the
+  ANSI-path WipeDir cannot name a file outside the code page on Windows. }
+procedure RemoveNamedFixtures(const ADirectory: string);
+{$IFDEF MSWINDOWS}
+var Find: THandle; Data: TWin32FindDataW; Name: UnicodeString;
+begin
+  Find := FindFirstFileW(PWideChar(UnicodeString(ADirectory) + '\*'), Data);
+  if Find = INVALID_HANDLE_VALUE then Exit;
+  try
+    repeat
+      Name := PWideChar(@Data.cFileName[0]);
+      if (Name = '.') or (Name = '..') then Continue;
+      if (Data.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+        DeleteFileW(PWideChar(UnicodeString(ADirectory) + '\' + Name));
+    until not FindNextFileW(Find, Data);
+  finally
+    Windows.FindClose(Find);
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
 function Utf16(const ACodeUnits: array of Word): UnicodeString;
 var i: Integer;
 begin
@@ -1040,17 +1064,25 @@ const
   {$ENDIF}
 begin
   ResetScratch;
-  WriteNamedFixture(FScratch, Utf16([Ord('s'), $00FC, $00DF, Ord('.'),
-    Ord('p'), Ord('a'), Ord('s')]), StringAsBytes('unit s;'#10));
-  ExpectDigests(LEGACY_SUSS,
-    '8398b468076302b8f9cf0a930f6e7d129f7201c6896bafabe2674385c7a25069');
+  try
+    WriteNamedFixture(FScratch, Utf16([Ord('s'), $00FC, $00DF, Ord('.'),
+      Ord('p'), Ord('a'), Ord('s')]), StringAsBytes('unit s;'#10));
+    ExpectDigests(LEGACY_SUSS,
+      '8398b468076302b8f9cf0a930f6e7d129f7201c6896bafabe2674385c7a25069');
+  finally
+    RemoveNamedFixtures(FScratch);
+  end;
   { U+1D518 is the surrogate pair D835 DD18: on Windows this exercises the
     pair's conversion to its four-byte UTF-8 form. }
   ResetScratch;
-  WriteNamedFixture(FScratch, Utf16([$D835, $DD18, Ord('.'), Ord('p'),
-    Ord('a'), Ord('s')]), StringAsBytes('unit u;'#10));
-  ExpectDigests(LEGACY_SUPPLEMENTARY,
-    '07c9aecdbc478349c8f2c275ff6e01717a166118cd2e2e8f1089b9be5486fe8a');
+  try
+    WriteNamedFixture(FScratch, Utf16([$D835, $DD18, Ord('.'), Ord('p'),
+      Ord('a'), Ord('s')]), StringAsBytes('unit u;'#10));
+    ExpectDigests(LEGACY_SUPPLEMENTARY,
+      '07c9aecdbc478349c8f2c275ff6e01717a166118cd2e2e8f1089b9be5486fe8a');
+  finally
+    RemoveNamedFixtures(FScratch);
+  end;
 end;
 
 procedure TTreeDigestV2.TestCaseCollisionVector;
@@ -1300,24 +1332,49 @@ begin
 end;
 
 procedure TTreeDigestV2.TestMalformedWindowsNamesFail;
+
+  { NTFS stores unpaired surrogates. Wine maps names onto a host
+    filesystem that cannot, so there only the conversion is checked. }
+  function RunningUnderWine: Boolean;
+  {$IFDEF MSWINDOWS}
+  var Module: HMODULE;
+  begin
+    Module := GetModuleHandle('ntdll.dll');
+    Result := (Module <> 0)
+      and (GetProcAddress(Module, 'wine_get_version') <> nil);
+  end;
+  {$ELSE}
+  begin
+    Result := False;
+  end;
+  {$ENDIF}
+
+  procedure Check(const ANames: array of UnicodeString; const AContains: string);
+  var k: Integer; UTF8: RawByteString;
+  begin
+    ResetScratch;
+    try
+      if RunningUnderWine then
+      begin
+        for k := 0 to High(ANames) do
+          Expect<Boolean>(StrictUTF16ToUTF8(ANames[k], UTF8)).ToBe(False);
+        Exit;
+      end;
+      for k := 0 to High(ANames) do
+        WriteNamedFixture(FScratch, ANames[k], StringAsBytes('x'));
+      ExpectDigestFailure(AContains);
+    finally
+      RemoveNamedFixtures(FScratch);
+    end;
+  end;
+
 begin
-  ResetScratch;
-  WriteNamedFixture(FScratch, Utf16([Ord('a'), $D800, Ord('.'), Ord('p')]),
-    StringAsBytes('x'));
-  ExpectDigestFailure('a\ud800.p');
-  ResetScratch;
-  WriteNamedFixture(FScratch, Utf16([Ord('a'), $DC00, Ord('.'), Ord('p')]),
-    StringAsBytes('x'));
-  ExpectDigestFailure('a\udc00.p');
-  ResetScratch;
-  WriteNamedFixture(FScratch, Utf16([Ord('a'), $DC00, $D800, Ord('.'),
-    Ord('p')]), StringAsBytes('x'));
-  ExpectDigestFailure('a\udc00\ud800.p');
+  Check([Utf16([Ord('a'), $D800, Ord('.'), Ord('p')])], 'a\ud800.p');
+  Check([Utf16([Ord('a'), $DC00, Ord('.'), Ord('p')])], 'a\udc00.p');
+  Check([Utf16([Ord('a'), $DC00, $D800, Ord('.'), Ord('p')])],
+    'a\udc00\ud800.p');
   { Two names that U+FFFD replacement would merge never yield a digest. }
-  ResetScratch;
-  WriteNamedFixture(FScratch, Utf16([Ord('m'), $D800]), StringAsBytes('x'));
-  WriteNamedFixture(FScratch, Utf16([Ord('m'), $DC00]), StringAsBytes('x'));
-  ExpectDigestFailure('m\ud');
+  Check([Utf16([Ord('m'), $D800]), Utf16([Ord('m'), $DC00])], 'm\ud');
 end;
 
 {$IFDEF UNIX}
