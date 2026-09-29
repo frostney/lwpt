@@ -2,18 +2,18 @@
 
 ## Status
 
-Proposed on 2026-09-29. Issue
-[#352](https://github.com/frostney/lwpt/issues/352). On 2026-09-29 the
-maintainer settled that #352 is fixed by a lockfile schema v4 with a framed
-tree digest. This record defines that digest, the v4 schema, and the
-migration from v3. It amends the AGENTS.md hard constraint that calls v3 "the
-last lockfile schema break in v1", and it amends
+Accepted on 2026-09-29 by the maintainer, who settled the four decisions at
+the end of this record. Issue
+[#352](https://github.com/frostney/lwpt/issues/352), milestone 0.8.0. The
+maintainer had already settled that #352 is fixed by a lockfile schema v4
+with a framed tree digest. This record defines that digest, the v4 schema,
+and the migration from v3. It amends the AGENTS.md hard constraint that calls
+v3 "the last lockfile schema break in v1", and it amends
 [ADR-0008](0008-lockfile-schema-v2-archive-hash.md),
 [ADR-0009](0009-source-syntax-and-tag-resolution.md), and
 [ADR-0051](0051-registry-dependency-sources.md) where they describe
 `computedHash` or rule out a v4. The implementation PR applies the amendments
-listed under "Rule amendments"; this record edits no other document. The
-choices that remain open are listed at the end, each with a recommendation.
+listed under "Rule amendments"; this record edits no other document.
 
 ## Executive Summary
 
@@ -29,11 +29,12 @@ choices that remain open are listed at the end, each with a recommendation.
 - Schema v4 changes two things: the `version = 4` header and the
   `computedHash` value format. Every other key, including ADR-0051's registry
   fields and per-origin tables, is unchanged.
-- Recommended v3 handling: install-class commands read a v3 lock and write
-  v4. `--frozen` and `--offline` refuse v3 with a migration hint and change
-  nothing. `lwpt repair` upgrades a v3 lock without network and without
-  moving versions: it re-derives every module from its archive or source
-  anchor, which the v3 `computedHash` cannot vouch for. v1 and v2 handling is
+- A v3 lock is a hard error, as v1 and v2 are. `install`, `add`, `remove`,
+  `update`, `outdated`, `--frozen`, and `--offline` refuse it, change
+  nothing, and point to `lwpt repair`. `lwpt repair` is the only command that
+  turns a v3 lock into v4. It works without network and without moving
+  versions: it re-derives every module from its archive or source anchor,
+  which the v3 `computedHash` cannot vouch for. v1 and v2 handling is
   unchanged.
 - Committed modules and archives do not change. A migration commit changes
   only `lwpt.lock`, unless a committed module had drifted from its archive,
@@ -106,9 +107,9 @@ failing to detect a tampered archive or extracted tree") as in scope.
   additive v3 changes.
 - An online non-frozen install selects the highest advertised tag that
   satisfies each range (ADR-0031). It reuses a locked selection only when
-  ref listing fails. Running `lwpt install` to upgrade therefore moves range
-  dependencies to their newest satisfying versions, as any online install
-  does. Deleting the lock does the same, and also discards
+  ref listing fails. Regenerating a lock with `lwpt install`, the v1 and v2
+  recovery, therefore needs network and moves range dependencies to their
+  newest satisfying versions. Deleting the lock first also discards
   `reachableFrom` proofs and ADR-0051's recorded accepted state.
 - `--offline` restores from the lock and leaves `lwpt.lock` byte-identical
   (#226, ADR-0051).
@@ -286,9 +287,9 @@ independently.
 - **ADR-0051.** Registry entries keep all their fields, and `archiveHash`
   still equals the signed record's `archive` digest. Decision 11 applies as
   written:
-  - Rewriting a v3 lock as v4 is a real lock change, so that write carries
-    every origin's merged accepted state.
-  - After the rewrite, installs that change nothing leave the lock
+  - `lwpt repair`'s v3-to-v4 upgrade is a real lock change, so that write
+    carries every origin's merged accepted state.
+  - After the upgrade, installs that change nothing leave the lock
     byte-identical. `tree2` is deterministic and identical across
     platforms, so a lock written on one OS does not churn on another.
   - ADR-0051's rejection of a v4 ("v3 stays the last schema break") was
@@ -324,30 +325,47 @@ independently.
   - Recovery by install or `lwpt repair` still accepts a sidecar that a
     pre-v4 binary wrote (`tree:sha256:<hex>`). It recomputes the legacy
     digest over the retained copy, so a transaction interrupted before an
-    upgrade can still be recovered after it.
+    upgrade can still be recovered after it. On a v3 lock, install refuses
+    before recovery (section 5), so `lwpt repair` is where such a
+    transaction is recovered.
   - This is the only remaining use of the legacy digest besides its pinned
     tests. The legacy function is renamed to say so and is not used for
     lock verification.
 
-### 5. Migration from v3 (recommended policy; see open decision 2)
+### 5. Migration from v3 (decisions 2 and 3)
+
+A v3 lock is a hard error, as v1 and v2 are, and `lwpt repair` is the only
+command that turns it into v4. Every lock reader refuses v3 through the
+shared version gate with one `ELockfileError` message:
+
+> `lwpt.lock` is schema v3, whose tree hash cannot detect a rearranged module
+> tree (ADR-0052). Run `lwpt repair` to upgrade it to v4 without network
+> access and without changing dependency versions, then commit `lwpt.lock`.
+> Deleting `lwpt.lock` and running `lwpt install` also works, but needs
+> network access and moves range dependencies to their newest matching
+> versions.
+
+The program name in the message comes from `PROGRAM_NAME` (ADR-0001).
 
 | Command | On a v3 lock |
 | --- | --- |
-| `lwpt install`, `add`, `remove`, `update` (online, not frozen) | Loads v3 as the prior lock and resolves as usual. The prior lock's archive hashes still anchor refetches, and a failed ref listing still reuses a locked selection. Writes v4. Versions may move exactly as in any online install. |
-| `lwpt install --frozen` | Fails before any verification with `ELockfileError`: "`lwpt.lock` is schema v3, whose tree hash cannot detect a rearranged module tree (ADR-0052). Run `lwpt repair` to upgrade it without network or version changes, or `lwpt install`, then commit `lwpt.lock`." Changes nothing. |
-| `lwpt install --offline` | Fails before staging with the same hint. Changes nothing, and the byte-identical promise holds. |
-| `lwpt repair` | After its existing steps (stale install lock, transaction recovery, sessions, retired images, workers, shared cache), upgrades a v3 lock without network or version changes, as below. A v4 lock is left alone. |
-| `lwpt outdated` | Reads v3 as well as v4. It is read-only and uses only `resolvedRef`. |
-| `lwpt build`, `lwpt test` | Do not read the lock's contents. The lock is part of their cache fingerprint, so the one-time rewrite causes one cache miss. |
+| `lwpt install`, `add`, `remove`, `update` | Refuse with the message. The gate runs before transaction recovery, tmp cleanup, rollback retention, and any manifest write, so the command changes nothing: `lwpt.toml`, the lock, the cfg, modules, archives, and proofs keep their bytes. There is no automatic upgrade. |
+| `lwpt install --frozen` | Refuses with the message before any verification. Changes nothing. It never verifies a legacy digest. |
+| `lwpt install --offline` | Refuses with the message before staging. Changes nothing, and the byte-identical promise holds. |
+| `lwpt outdated` | Refuses with the message, like every lock reader. |
+| `lwpt repair` | After its existing steps (stale install lock, transaction recovery, sessions, retired images, workers, shared cache), upgrades a v3 lock without network or version changes, as below. A v4 lock, or a project without a lock, is left alone. |
+| `lwpt build`, `lwpt test` | Do not read the lock's contents. The lock is part of their cache fingerprint, so the one-time upgrade causes one cache miss. |
 
-**`lwpt repair`'s upgrade** runs under the install lock as an install
-transaction (retention, rollback, `AtomicWriteText`):
+**`lwpt repair`'s upgrade** is the only reader that accepts a v3 lock. It
+runs under the install lock as an install transaction (retention, rollback,
+`AtomicWriteText`):
 
 1. **Check agreement.** The manifest and the v3 lock must agree as they must
    for `--offline`: source identity, constraint fingerprint, and a locked
    selection that still satisfies every requirement. If they disagree, the
-   command fails with "the manifest changed since the lock was written; run
-   `lwpt install`", and the lock stays v3.
+   command fails, and the lock stays v3. The message says to restore the
+   manifest the lock was written from, run `lwpt repair`, and then change
+   the manifest, or to delete the lock and run `lwpt install`.
 2. **Re-derive modules.** Each module is re-derived without network, from
    its anchor:
    - Git-host and URL modules come from the committed archive or the
@@ -370,21 +388,27 @@ transaction (retention, rollback, `AtomicWriteText`):
 5. **Handle failures.** A missing archive or proof fails with the
    `--offline` hint and rolls back, and the lock stays v3.
 
+After the upgrade, decision 11 holds: an install that changes nothing leaves
+the v4 lock byte-identical on every platform.
+
 **Downgrade resistance.** Rewriting a v4 lock to v3, with legacy digests
-that match a forged tree, gains nothing. `--frozen` refuses v3, and every
-upgrade path re-derives trees from their anchors rather than from the
-committed modules.
+that match a forged tree, gains nothing. Every command except `lwpt repair`
+refuses v3, and repair re-derives trees from their anchors rather than from
+the committed modules or the v3 `computedHash`.
 
 **Consumers.** GocciaScript (Path A, ADR-0017) and third parties migrate in
 one PR:
 
-1. Move the pinned `lwpt` binary to the release that ships v4.
-2. Run `lwpt repair`, or `lwpt install` when newer versions are wanted.
+1. Move the pinned `lwpt` binary to the release that ships v4 (0.8.0).
+2. Run `lwpt repair`. When newer dependency versions are wanted, run
+   `lwpt install` afterwards, or delete the lock and run `lwpt install`
+   instead.
 3. Commit `lwpt.lock`.
 
 After that PR, a binary older than v4 fails on the lock with the schema
 message, so CI and contributors move together. LWPT's own lock, which holds
-only `workspace:auto` entries, is upgraded in the implementation PR, and CI's
+only `workspace:auto` entries, is upgraded with `lwpt repair` in the
+implementation PR, and CI's
 `install --frozen` on all six targets is the dogfood check. The
 DEFINITION_OF_DONE rule for edited workspace packages is unchanged: rerun
 `lwpt install` and commit the lock.
@@ -406,7 +430,7 @@ The implementation PR applies these in the same change as the code.
   text below. It includes PR #351's registry clause; if #351 has not merged
   first, drop the clause beginning "for registry entries".
 
-  > - **`lwpt.lock` is machine-written, schema v4.** Never hand-edit. The schema records the verbatim manifest source string, the resolver's chosen ref (tag/SHA), the actual archive URL, the extracted tree's framed digest (`computedHash = "sha256-tree2:<hex>"`: per file, a length-prefixed UTF-8 path, the normalized content length, and the normalized content's SHA-256, in the cross-platform `TreeHashPathCompare` order, with CRLF→LF normalization for NUL-free files), and the cached-archive sha256. Registry entries add `registryOrigin` and `registryRecord`, and one `[registry."<identity>"]` table per origin records the pinned key id, the selection proof's checkpoint, and the recorded accepted state and clock floor; a byte-identical lock is never rewritten ([ADR-0051](./docs/adr/0051-registry-dependency-sources.md)). `--frozen` re-hashes the archive + tree, compares both to the stored hashes, and refuses any link inside an installed module; for registry entries, `--frozen` and `--offline` also verify the committed selection proof from the manifest pin, and `--frozen` re-derives the module tree from the proof-authenticated archive, because `computedHash` is unsigned. v1 and v2 lockfiles fail to load with a clear migration hint. A v3 lockfile is rewritten as v4 by `install`, `add`, `remove`, and `update`; `lwpt repair` upgrades it without network or version changes; `--frozen` and `--offline` refuse it with that hint. Corrupt lockfile → delete + re-run `lwpt install` to regenerate. See [ADR-0008](./docs/adr/0008-lockfile-schema-v2-archive-hash.md) (v1→v2 archiveHash split), [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md) (v2→v3 source-syntax refactor), and [ADR-0052](./docs/adr/0052-lockfile-schema-v4-framed-tree-digest.md) (v3→v4 framed tree digest). Any further schema break requires an ADR that ships a machine migration from the previous schema; "delete the lockfile and reinstall" is not a migration.
+  > - **`lwpt.lock` is machine-written, schema v4.** Never hand-edit. The schema records the verbatim manifest source string, the resolver's chosen ref (tag/SHA), the actual archive URL, the extracted tree's framed digest (`computedHash = "sha256-tree2:<hex>"`: per file, a length-prefixed UTF-8 path, the normalized content length, and the normalized content's SHA-256, in the cross-platform `TreeHashPathCompare` order, with CRLF→LF normalization for NUL-free files), and the cached-archive sha256. Registry entries add `registryOrigin` and `registryRecord`, and one `[registry."<identity>"]` table per origin records the pinned key id, the selection proof's checkpoint, and the recorded accepted state and clock floor; a byte-identical lock is never rewritten ([ADR-0051](./docs/adr/0051-registry-dependency-sources.md)). `--frozen` re-hashes the archive + tree, compares both to the stored hashes, and refuses any link inside an installed module; for registry entries, `--frozen` and `--offline` also verify the committed selection proof from the manifest pin, and `--frozen` re-derives the module tree from the proof-authenticated archive, because `computedHash` is unsigned. v1 and v2 lockfiles fail to load with a clear migration hint. A v3 lockfile is a hard error too: every command that reads the lock (`install`, `add`, `remove`, `update`, `outdated`, `--frozen`, `--offline`) refuses it and changes nothing, pointing to `lwpt repair`, the only command that upgrades v3 to v4 — without network and without changing dependency versions, by re-deriving every module from its archive or source and never trusting the v3 tree hash. Corrupt lockfile → delete + re-run `lwpt install` to regenerate. See [ADR-0008](./docs/adr/0008-lockfile-schema-v2-archive-hash.md) (v1→v2 archiveHash split), [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md) (v2→v3 source-syntax refactor), and [ADR-0052](./docs/adr/0052-lockfile-schema-v4-framed-tree-digest.md) (v3→v4 framed tree digest). Any further schema break requires an ADR that ships a machine migration from the previous schema; "delete the lockfile and reinstall" is not a migration.
 
 - **`docs/architecture.md`, "Lockfile schema".** Retitle the section v4.
   Update:
@@ -437,13 +461,12 @@ The implementation PR applies these in the same change as the code.
 | Invalid paths fail closed | On POSIX, a file name that is not well-formed UTF-8 fails the digest and the error names the escaped path. |
 | Inventory and links | A `CopyDirTree` copy of a tree with a file link and a directory link has the same `tree2` digest as the original, so rollback retention succeeds. `--frozen` fails, naming the path, for a file link, a directory link, and a dangling link inside an installed module. |
 | v4 writer and loader | An install writes `version = 4` and `sha256-tree2:` values. The lock round-trips. A v4 lock with one `sha256:` `computedHash` fails to load and names the entry. A `version = 5` lock fails with the "reads up to v4" message. The v1 and v2 hints are unchanged. |
-| Non-frozen installs upgrade v3 | A committed v3 fixture project is upgraded by `install`, `add`, `remove`, and `update`. A second install is byte-identical (decision 11). In a registry project, the upgrade write carries merged accepted state and the selection proof is carried forward byte for byte. |
-| `--frozen` and `--offline` refuse v3 | Each fails with the migration hint and zero transport requests. The lock, cfg, modules, archives, and proofs are byte-identical. |
-| `lwpt repair` upgrades without network and without moving versions | The fixture advertises a newer satisfying tag, and the transport seam records zero requests. Afterward: `resolvedRef` and `resolvedCommit` are unchanged; modules and archives are byte-identical; the lock diff contains only `version`, `computedHash`, and decision-11 accepted-state lines; `--frozen` passes. |
-| `lwpt repair` surfaces drift | A committed module altered by the #352 substitution under a v3 lock is replaced by the re-derived tree and named in the output. A missing archive fails with the `--offline` hint, rolls back, and leaves the lock v3. A manifest that disagrees with the lock fails with the `lwpt install` hint. |
-| Downgrade | A v4 lock rewritten as v3 with legacy digests of a forged tree fails `--frozen`, and `lwpt repair` replaces the forged tree. |
-| Legacy rollback sidecars | A pending transaction whose sidecar holds `tree:sha256:` is recovered by `install` and by `repair`. |
-| Read-only readers | `lwpt outdated` reports from v3 and v4 locks alike. |
+| Every command refuses v3 and changes nothing | Against a committed v3 fixture project (git-host, local, workspace, and registry entries, plus an interrupted transaction's rollback files): `install`, `add`, `remove`, `update`, `outdated`, `install --frozen`, and `install --offline` each fail with the `ELockfileError` message, which names `lwpt repair` and the delete-and-install alternative. The transport seam records zero requests. `lwpt.toml`, the lock, the cfg, modules, archives, proofs, and `.lwpt/tmp/` are byte-identical afterwards. |
+| `lwpt repair` upgrades without network and without moving versions | The fixture advertises a newer satisfying tag, and the transport seam records zero requests. Afterward: `resolvedRef` and `resolvedCommit` are unchanged; modules and archives are byte-identical; the lock diff contains only `version`, `computedHash`, and decision-11 accepted-state lines; `--frozen` passes. In a registry project, the selection proof is carried forward byte for byte. |
+| No churn after the upgrade (decision 11) | After `lwpt repair`, an online `install` with an unchanged selection and an `install --offline` both leave the v4 lock byte-identical. The same holds when the lock written on Linux is installed on the Windows and macOS legs. |
+| `lwpt repair` never trusts the v3 hash | A committed module altered by the #352 substitution under a v3 lock, with its `computedHash` recomputed to the matching legacy value, is replaced by the re-derived tree and named in the output. A missing archive fails with the `--offline` hint, rolls back, and leaves the lock v3. A manifest that disagrees with the lock fails with its hint and leaves the lock v3. A v4 lock is left untouched. |
+| Downgrade | A v4 lock rewritten as v3 with legacy digests of a forged tree is refused by `--frozen` and every other reader, and `lwpt repair` replaces the forged tree. |
+| Legacy rollback files | A pending transaction whose rollback file holds `tree:sha256:` is recovered by `lwpt repair` on a v3 lock, and by `install` once the lock is v4. |
 | Existing behavior | The existing install, offline, frozen, commit-pin, and registry suites pass after their expected `computedHash` values are updated. The only golden-lock differences are `version` and `computedHash`. |
 
 ## Considered options
@@ -462,10 +485,21 @@ The implementation PR applies these in the same change as the code.
   Links are handled by the `--frozen` refusal instead.
 - **A new sort order, such as plain ordinal.** Rejected. Framing makes any
   deterministic order sound, and a third order would add risk for no gain.
-- **`--frozen` verifies v3 with the legacy digest and warns.** Rejected as
-  the recommendation (it is option C of open decision 2). It keeps the
-  bypass open for any project that never upgrades, and a v4-to-v3 rewrite
-  would reopen it.
+- **Install-class commands upgrade a v3 lock automatically.** Rejected by
+  decision 2. An online install would upgrade and move range dependencies
+  in one step, so a schema migration could arrive with unreviewed version
+  changes.
+- **`--frozen` verifies v3 with the legacy digest and warns for a
+  transition release.** Rejected by decision 2. It keeps the bypass open
+  for any project that never upgrades, and a v4-to-v3 rewrite would reopen
+  it.
+- **`lwpt install --offline` writes v4 once.** Rejected by decision 3. It
+  breaks `--offline`'s documented promise that `lwpt.lock` stays
+  byte-identical.
+- **Delete the lock and run `lwpt install` as the only migration, as for
+  v1 and v2.** Rejected as the primary path by decision 3. It needs network,
+  moves every range dependency, and drops `reachableFrom` proofs and
+  registry accepted state. The hint still mentions it as an alternative.
 - **Record per-file digests in the lock.** Rejected. It would make locks
   much larger and churn them on every file change. The single root digest
   is enough to detect a change, and the per-file comparison can name the
@@ -480,71 +514,56 @@ The implementation PR applies these in the same change as the code.
   project's lock is v4.
 - Tree hashing uses memory proportional to the number of files, not the
   bytes in the tree.
-- Every project rewrites `lwpt.lock` once. Build and test caches miss once.
-  Binaries older than v4 cannot read a v4 lock.
-- Until a project upgrades, `--frozen` and `--offline` fail on its v3 lock.
-  CI jobs that upgrade the binary without the lock go red with the
-  migration hint.
+- Every project runs `lwpt repair` and commits `lwpt.lock` once. Build and
+  test caches miss once. Binaries older than v4 cannot read a v4 lock.
+- Until a project upgrades, every command that reads its lock fails with
+  the migration message. CI jobs that upgrade the binary without the lock go
+  red with that message, and nothing in the checkout changes.
+- `lwpt repair` gains a lock-writing step. It runs only on a v3 lock, under
+  the install lock and the install transaction's rollback.
 - Non-ASCII file names must be well-formed UTF-8 to be hashed. The
   Windows extractor's ANSI-code-page path handling is unchanged by this
   record, so non-ASCII names in dependencies stay unportable on Windows
   until the extraction side is fixed separately.
-- The legacy digest survives only to recover pre-upgrade rollback sidecars
-  and to pin its own tests.
+- The legacy digest survives only to recover pre-upgrade rollback files and
+  to pin its own tests.
 
-## Open decisions for the maintainer
+## Decisions
 
-1. **Milestone: 0.8.0 or 0.9.0.**
-   - **Option A, 0.8.0.**
-     - For: 0.8.0 is the release where registry lock entries first ship, so
-       they would never appear in a released v3 lock. Consumers adopting
-       the registry would rewrite their locks once, not twice. The
-       git-host, URL, and local `--frozen` bypass is a `SECURITY.md`
-       in-scope class, and 0.8.0 would close it.
-     - Against: it adds an implementation PR to a milestone with 5 open
-       issues. The registry path is already covered in 0.8.0, because
-       #351's `--frozen` compares registry trees file for file.
-   - **Option B, 0.9.0.**
-     - For: 0.8.0 ships sooner. 0.9.0's #169 (dependency patching) and #170
-       (`.lwptignore`) change what a module tree contains, so they could be
-       designed against the v4 digest.
-     - Against: 0.8.0 would ship registry entries in v3 locks, which then
-       migrate in 0.9.0. The non-registry `--frozen` bypass stays open for
-       one more release.
-   - **Recommendation: A, 0.8.0.** The fix is a contained change to
-     `LWPT.Core` and the lock loader. Shipping the registry on v4 avoids
-     one migration for every early adopter. It also closes a security-class
-     gap in the release that makes `--frozen` a registry trust boundary.
-2. **v3 handling policy.**
-   - **Option A, hard error everywhere, as for v1 and v2.** The hint says
-     to delete the lock and run `lwpt install`. The simplest code. However,
-     it needs network, moves every range dependency to its newest version,
-     and drops `reachableFrom` proofs and registry accepted state.
-   - **Option B, automatic upgrade** (section 5). Install-class commands
-     read v3 and write v4. `--frozen` and `--offline` refuse v3 with the
-     hint. `lwpt repair` upgrades without network or version changes.
-   - **Option C, like B, but `--frozen` verifies v3 with the legacy digest
-     and warns for one minor release.** It keeps CI green through the
-     transition. It also keeps the bypass open and exposed to a v4-to-v3
-     rewrite.
-   - **Recommendation: B.** It is the only option that closes the bypass on
-     upgrade without forcing dependency changes or network access.
-3. **Where the network-free, version-stable upgrade lives.** This applies
-   only under decision 2, option B.
-   - **Option A, `lwpt repair`** (section 5). Repair already recovers
-     toolkit state that an older or crashed binary left behind. It is
-     network-free, and it carries no byte-identical promise.
-   - **Option B, `lwpt install --offline` writes v4 once.** It reuses the
-     offline pipeline directly, but breaks `--offline`'s documented promise
-     that `lwpt.lock` stays byte-identical.
-   - **Option C, no dedicated path.** Only an online `lwpt install`
-     upgrades, and range dependencies move to their newest versions.
-   - **Recommendation: A.** Offline's promise stays intact, and every
-     project gets an upgrade that changes no dependency version.
-4. **Whether v4 is declared the last schema break in v1.**
-   - **Option A: declare it**, mirroring ADR-0009's wording.
-   - **Option B: make no "last" claim.** Require any later break to go
-     through an ADR that ships a machine migration from the previous schema
-     (the AGENTS.md text above).
-   - **Recommendation: B.** ADR-0009's claim did not hold. A rule about how
-     breaks happen protects consumers better than a promise that none will.
+The maintainer settled these on 2026-09-29. The sections above already
+apply them.
+
+1. **Milestone: 0.8.0.** 0.8.0 is the release where registry lock entries
+   first ship, so no released lock ever carries a registry entry under v3,
+   and registry adopters rewrite their locks once. It also closes the
+   git-host, URL, and local `--frozen` bypass, a `SECURITY.md` in-scope
+   class, in the release that makes `--frozen` a registry trust boundary.
+   Deferring to 0.9.0, so that #169 and #170 could be designed against the
+   new digest, was rejected: it would ship v3 registry locks and keep the
+   bypass open for another release.
+2. **A v3 lock is a hard error, as v1 and v2 are.** `install`, `add`,
+   `remove`, `update`, `outdated`, `--frozen`, and `--offline` refuse it and
+   change nothing. No command silently upgrades it. A schema migration is
+   then always a deliberate, reviewable step and never arrives bundled with
+   version changes from an online install. `--frozen` never verifies a
+   legacy digest, so neither an unupgraded project nor a v4-to-v3 rewrite
+   can reopen the bypass. The rejected options were automatic upgrade by
+   install-class commands and a transition release in which `--frozen`
+   verified v3 with a warning.
+3. **`lwpt repair` is the upgrade, and the only command that writes v4 from
+   a v3 lock.** It works without network and without changing dependency
+   versions. It re-derives every module from its archive, proof, or source
+   anchor, never trusting the v3 `computedHash`, and writes v4 through the
+   install transaction. The hard-error message points to it, and also says
+   that deleting the lock and running `lwpt install` works but needs network
+   and moves range dependencies. Repair already recovers state left by an
+   older or crashed binary, and it carries no byte-identical promise.
+   Writing v4 from `install --offline` was rejected because it would break
+   that command's byte-identical promise. After the upgrade, decision 11 of
+   ADR-0051 holds unchanged, and recovery keeps accepting rollback files
+   written with the legacy digest.
+4. **No "last break" claim.** v4 is not declared the last schema break in
+   v1. Instead, any further break requires an ADR that ships a machine
+   migration from the previous schema, as the AGENTS.md text above states.
+   ADR-0009's claim did not hold, and a rule about how breaks happen
+   protects consumers better than a promise that none will.
