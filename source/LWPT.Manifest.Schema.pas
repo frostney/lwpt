@@ -22,6 +22,8 @@ type
     mssDependencyEntry,
     mssSources,
     mssSourceEntry,
+    mssRegistries,
+    mssRegistryEntry,
     mssWorkspaces,
     mssBuild,
     mssBuildEntry,
@@ -58,6 +60,13 @@ type
     msfSourceEntry,
     msfSourceArchive,
     msfSourceGit,
+    msfRegistriesDefault,
+    msfRegistriesEntry,
+    msfRegistryIdentity,
+    msfRegistryKeyId,
+    msfRegistryPublicKey,
+    msfRegistryOrigin,
+    msfRegistryMirrors,
     msfWorkspaceInclude,
     msfWorkspaceExclude,
     msfBuildEntry,
@@ -219,6 +228,18 @@ const
       UnknownKeyPolicy: mukIgnore; FirstField: msfSourceArchive;
       LastField: msfSourceGit;
       Description: 'One custom Git-host source.'),
+    (Path: '[registries]'; TopLevelNames: 'registries'; Shape: 'table';
+      Scope: mscRootOnly;
+      InvalidPolicy: mipError; UnknownKeyPolicy: mukIgnore;
+      FirstField: msfRegistriesDefault; LastField: msfRegistriesEntry;
+      Description: 'Registry origins that `registry:` dependencies resolve '
+      + 'through (ADR-0051).'),
+    (Path: '[registries].<alias>'; TopLevelNames: ''; Shape: 'table';
+      Scope: mscRootOnly; InvalidPolicy: mipError;
+      UnknownKeyPolicy: mukError; FirstField: msfRegistryIdentity;
+      LastField: msfRegistryMirrors;
+      Description: 'One registry origin: identity, pinned root key, and '
+      + 'ordered contacts.'),
     (Path: '[workspaces]'; TopLevelNames: 'workspaces'; Shape: 'table';
       Scope: mscAllManifests;
       InvalidPolicy: mipIgnoreAsAbsent; UnknownKeyPolicy: mukIgnore;
@@ -330,7 +351,8 @@ const
       InvalidPolicy: mipDomainError;
       NonEmpty: True; Description: '`owner/repo` (GitHub), '
       + '`<host>:owner/repo` (built-in or custom host), an HTTPS tarball, '
-      + 'a local path, or `workspace:<version>`.'),
+      + 'a local path, `workspace:<version>`, or '
+      + '`registry:[<alias>/]<package>`.'),
     (Name: 'version'; ValueKind: mvkString; Requirement: mrOptional;
       DefaultValue: 'none'; Scope: mscAllManifests;
       InvalidPolicy: mipIgnoreAsAbsent; NonEmpty: False;
@@ -381,6 +403,34 @@ const
       InvalidPolicy: mipDomainError;
       NonEmpty: True; Description: 'HTTPS smart-HTTP template containing '
       + '{user} and {repository}.'),
+    (Name: 'default'; ValueKind: mvkString; Requirement: mrOptional;
+      DefaultValue: 'the only declared registry'; Scope: mscRootOnly;
+      InvalidPolicy: mipError; NonEmpty: True;
+      Description: 'Alias used by `registry:<package>`; the alias '
+      + '`default` is reserved.'),
+    (Name: '<alias>'; ValueKind: mvkTable; Requirement: mrOptional;
+      DefaultValue: ''; Scope: mscRootOnly; InvalidPolicy: mipError;
+      NonEmpty: False; Description: 'One registry declaration.'),
+    (Name: 'identity'; ValueKind: mvkString; Requirement: mrOptional;
+      DefaultValue: 'advertised by the contacts, then locked';
+      Scope: mscRootOnly; InvalidPolicy: mipError; NonEmpty: True;
+      Description: 'Canonical HTTPS origin identity.'),
+    (Name: 'key-id'; ValueKind: mvkString; Requirement: mrRequired;
+      DefaultValue: ''; Scope: mscRootOnly; InvalidPolicy: mipError;
+      NonEmpty: True; Description: 'Pinned Ed25519 root key id '
+      + '(`ed25519:<sha256 of the key>`).'),
+    (Name: 'public-key'; ValueKind: mvkString; Requirement: mrRequired;
+      DefaultValue: ''; Scope: mscRootOnly; InvalidPolicy: mipError;
+      NonEmpty: True; Description: 'Pinned Ed25519 root public key '
+      + '(`hex:<64 hex digits>`).'),
+    (Name: 'origin'; ValueKind: mvkString; Requirement: mrConditional;
+      DefaultValue: 'identity'; Scope: mscRootOnly; InvalidPolicy: mipError;
+      NonEmpty: True; Description: 'Origin contact URL; required when '
+      + 'identity is omitted.'),
+    (Name: 'mirrors'; ValueKind: mvkStringArray; Requirement: mrOptional;
+      DefaultValue: 'empty'; Scope: mscRootOnly; InvalidPolicy: mipError;
+      NonEmpty: True; Description: 'Mirror contact URLs, tried in order '
+      + 'before the origin.'),
     (Name: 'include'; ValueKind: mvkStringArray; Requirement: mrOptional;
       DefaultValue: 'empty'; Scope: mscAllManifests;
       InvalidPolicy: mipSkipInvalidItems; NonEmpty: False;
@@ -566,11 +616,11 @@ const
       NonEmpty: False; Description: 'Retired; use command and args.')
   );
 
-  RESERVED_TASK_NAMES: array[0..22] of string = (
+  RESERVED_TASK_NAMES: array[0..23] of string = (
     'install', 'add', 'remove', 'outdated', 'update', 'build', 'format',
     'test', 'repair', 'init', 'run', 'agents', 'health', 'duplication',
     'package', 'dependencies', 'sources', 'workspaces', 'version',
-    PROGRAM_NAME, 'analysis', 'compiler', 'generated');
+    PROGRAM_NAME, 'analysis', 'compiler', 'generated', 'registries');
 
 function ManifestSchemaSection(
   ASection: TLWPTManifestSchemaSection): TLWPTManifestSectionSpec;
@@ -827,6 +877,14 @@ begin
       if TomlIsTable(Pair.Value) then
         ValidateTableFields(Pair.Value, mssSourceEntry,
           'sources.' + Pair.Key, AIsRoot);
+
+  Node := ValidateSectionNode(ARoot, 'registries', mssRegistries, AIsRoot);
+  ValidateTableFields(Node, mssRegistries, 'registries', AIsRoot);
+  if TomlIsTable(Node) then
+    for Pair in Node.Children do
+      if TomlIsTable(Pair.Value) then
+        ValidateTableFields(Pair.Value, mssRegistryEntry,
+          'registries.' + Pair.Key, AIsRoot);
 
   Node := ValidateSectionNode(ARoot, 'dependencies', mssDependencies,
     AIsRoot);

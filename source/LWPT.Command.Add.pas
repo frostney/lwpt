@@ -26,6 +26,23 @@ uses
   amended graph and commits lwpt.toml + prunes orphans INSIDE the
   cross-process install lock. A failed resolve/fetch leaves the
   manifest byte-identical — see ADR-0019 §"Install-before-write". }
+{ A `registry:[<alias>/]<package>[@<version>]` spec names its dependency
+  key: the package (ADR-0051). Any other spec is returned unchanged so parse
+  errors keep naming it. }
+function RegistryPackageOfSpec(const ASpec: string): string;
+var Source: string; At, Slash: Integer;
+begin
+  Result := ASpec;
+  if Copy(ASpec, 1, Length(REGISTRY_SOURCE_PREFIX) + 1)
+     <> REGISTRY_SOURCE_PREFIX + ':' then Exit;
+  Source := ASpec;
+  At := LastDelimiter('@', Source);
+  if At > 0 then Source := Copy(Source, 1, At - 1);
+  Source := Copy(Source, Length(REGISTRY_SOURCE_PREFIX) + 2, MaxInt);
+  Slash := LastDelimiter('/', Source);
+  Result := Copy(Source, Slash + 1, MaxInt);
+end;
+
 procedure CmdAdd(const AManifestPath, ASpec, ANameOverride: string);
 var
   Ctx : TManifestContext;
@@ -41,7 +58,7 @@ begin
   { Pre-name the dep so parse errors read "dependency "<something>"";
     the real name may not be derivable until the parse succeeded. }
   if ANameOverride <> '' then Dep.Name := ANameOverride
-  else Dep.Name := ASpec;
+  else Dep.Name := RegistryPackageOfSpec(ASpec);
   ParseBareDepString(ASpec, Ctx.Manifest.CustomSources, Dep);
 
   if ANameOverride <> '' then Name := ANameOverride

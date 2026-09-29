@@ -201,6 +201,30 @@ function VerifyRegistryProof(const AProof: TLWPTRegistryProof;
   const ALimits: TLWPTRegistryVerificationLimits): TLWPTVerifiedRegistry;
 procedure VerifyRegistryArtifact(const APackage: TLWPTRegistryPackage;
   const AArchive: TStream; const AProgress: TSHA256Progress = nil);
+
+type
+  { The committed bytes of one consumer's selection proof (ADR-0051). }
+  TLWPTRegistryLockedSelection = record
+    Checkpoint, Signature, Snapshot: TBytes;
+    Rotations: TLWPTRegistryRotationProofArray;
+    Records: array of TBytes;
+  end;
+  TLWPTVerifiedRegistrySelection = record
+    Sequence: Int64;
+    KeyId, Snapshot, PublishedAt, ExpiresAt: string;
+    Packages: TLWPTRegistryPackageArray;
+  end;
+
+{ Network-free verification of a consumer's locked selection proof: the
+  checkpoint is the recorded one, its signature verifies under the key the
+  committed rotation chain reaches from the pin, the snapshot is the
+  checkpoint's, and every selected record is a member of that snapshot. It
+  walks no history and applies neither expiry nor the clock floor; the
+  caller compares the returned records with its lock (ADR-0051 decision 4). }
+function VerifyRegistryLockedSelection(
+  const ASelection: TLWPTRegistryLockedSelection;
+  const ATrust: TLWPTRegistryTrust;
+  const ACheckpointHash: string): TLWPTVerifiedRegistrySelection;
 {$IFDEF REGISTRY_TESTING}
 procedure SetRegistryVerificationLimitsForTesting(
   const ALimits: TLWPTRegistryVerificationLimits; const AEnabled: Boolean);
@@ -1658,6 +1682,93 @@ begin
   finally
     Verifier.Free;
   end;
+end;
+
+function VerifyRegistryLockedSelection(
+  const ASelection: TLWPTRegistryLockedSelection;
+  const ATrust: TLWPTRegistryTrust;
+  const ACheckpointHash: string): TLWPTVerifiedRegistrySelection;
+var
+  Checkpoint: TLWPTUntrustedRegistryCheckpoint;
+  Rotation: TLWPTUntrustedRegistryRotation;
+  KeyId, PublicKey: string;
+  LastEffectiveSequence: Int64;
+  Index, RecordIndex: Integer;
+  Root: TTOMLNode;
+  Members: TLWPTRegistryStringArray;
+  RecordHash: string;
+  Member: Boolean;
+begin
+  Result := Default(TLWPTVerifiedRegistrySelection);
+  if not RegistryURIIsCanonical(ATrust.Origin, True)
+    or not RegistryTrustRootIsValid(ATrust.KeyId, ATrust.PublicKey) then
+    raise ELWPTRegistryError.CreateStable('invalid_trust_root',
+      'origin identity or pinned root key is invalid');
+  if not RegistryHashIsCanonical(ACheckpointHash)
+    or (SHA256BytesPrefixed(ASelection.Checkpoint) <> ACheckpointHash) then
+    raise ELWPTRegistryError.CreateStable('locked_proof_state_mismatch',
+      'retained checkpoint bytes differ from the recorded checkpoint');
+  Checkpoint := InspectRegistryCheckpoint(ASelection.Checkpoint);
+  if Checkpoint.Origin <> ATrust.Origin then
+    raise ELWPTRegistryError.CreateStable('checkpoint_origin_mismatch',
+      'checkpoint names a different origin');
+  if Length(ASelection.Rotations) > DefaultRegistryVerificationLimits.Rotations then
+    raise ELWPTRegistryError.Create('proof_limit_exceeded: rotations');
+  KeyId := ATrust.KeyId;
+  PublicKey := ATrust.PublicKey;
+  LastEffectiveSequence := 1;
+  for Index := 0 to High(ASelection.Rotations) do
+  begin
+    Rotation := VerifyRegistryRotation(ASelection.Rotations[Index],
+      ATrust.Origin, KeyId, PublicKey, LastEffectiveSequence,
+      Checkpoint.Sequence);
+    KeyId := Rotation.ToKey;
+    PublicKey := Rotation.ToPublicKey;
+    LastEffectiveSequence := Rotation.EffectiveSequence;
+  end;
+  if Checkpoint.KeyId <> KeyId then
+    raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
+      'checkpoint key is not reached by the committed rotation chain');
+  VerifySignature(PROJECT_NAME + '-REGISTRY-CHECKPOINT-V1',
+    ASelection.Checkpoint, ParseSignature(RegistryBytesText(ASelection.Signature)),
+    KeyId, PublicKey);
+  if SHA256BytesPrefixed(ASelection.Snapshot) <> Checkpoint.Snapshot then
+    raise ELWPTRegistryError.CreateStable('snapshot_hash_mismatch',
+      'snapshot bytes do not match their hash');
+  Root := ParseCanonical(RegistryBytesText(ASelection.Snapshot),
+    PROGRAM_NAME + '-registry-snapshot-v1', ['schema', 'origin',
+      'sequence', 'published_at', 'previous', 'records']);
+  try
+    if (TomlStr(Root, 'origin', '') <> ATrust.Origin)
+      or (UnsignedField(Root, 'sequence') <> Checkpoint.Sequence) then
+      raise ELWPTRegistryError.CreateStable('snapshot_consistency_failed',
+        'snapshot does not belong to its checkpoint');
+    Members := NodeStringArray(Root, 'records');
+  finally
+    Root.Free;
+  end;
+  SetLength(Result.Packages, Length(ASelection.Records));
+  for Index := 0 to High(ASelection.Records) do
+  begin
+    RecordHash := SHA256BytesPrefixed(ASelection.Records[Index]);
+    Member := False;
+    for RecordIndex := 0 to High(Members) do
+      if Members[RecordIndex] = RecordHash then
+      begin
+        Member := True;
+        Break;
+      end;
+    if not Member then
+      raise ELWPTRegistryError.CreateStable('registry_record_not_in_snapshot',
+        'a selected record is not a member of the signed snapshot');
+    Result.Packages[Index] := ParseRegistryPackage(
+      RegistryBytesText(ASelection.Records[Index]), RecordHash, ATrust.Origin);
+  end;
+  Result.Sequence := Checkpoint.Sequence;
+  Result.KeyId := Checkpoint.KeyId;
+  Result.Snapshot := Checkpoint.Snapshot;
+  Result.PublishedAt := Checkpoint.PublishedAt;
+  Result.ExpiresAt := Checkpoint.ExpiresAt;
 end;
 
 procedure VerifyRegistryArtifact(const APackage: TLWPTRegistryPackage;
