@@ -8,7 +8,10 @@
   live threads, writes a diagnostic to standard error and replaces the exit
   code with ShutdownProbeFailureExitCode. On Linux it also counts the
   process's threads through /proc/self/task, so a thread that outlived its
-  owner's shutdown is caught independently of that owner's bookkeeping. }
+  owner's shutdown is caught independently of that owner's bookkeeping.
+  Only when every check passes does it write ShutdownProbeCleanMarker to
+  standard output: a process that ended before reaching the probe, such as
+  through an emergency exit that skips finalization, never prints it. }
 unit Tests.ShutdownProbe;
 
 {$mode delphi}{$H+}
@@ -22,6 +25,7 @@ type
 const
   ShutdownProbeFailureExitCode = 86;
   ShutdownProbeFailure = 'shutdown probe: threads outlived unit finalization';
+  ShutdownProbeCleanMarker = 'shutdown probe: clean';
 
 procedure ArmShutdownProbe(const ACheck: TShutdownProbeCheck);
 
@@ -67,6 +71,8 @@ begin
 end;
 
 procedure RunArmedCheck;
+var
+  Clean: Boolean;
 {$IFDEF LINUX}
 const
   TaskSettleAttempts = 200;
@@ -80,7 +86,8 @@ var
 begin
   if not Assigned(ArmedCheck) then Exit;
   Live := ArmedCheck();
-  if Live <> 0 then ReportLiveThreads(Live, 'by the armed check');
+  Clean := Live = 0;
+  if not Clean then ReportLiveThreads(Live, 'by the armed check');
   {$IFDEF LINUX}
   { A joined thread's task entry can outlast pthread_join by a moment; a
     thread that was never joined stays listed. }
@@ -94,8 +101,17 @@ begin
     Live := OtherOperatingSystemThreads;
     Inc(Attempt);
   end;
-  if Live <> 0 then ReportLiveThreads(Live, 'in /proc/self/task');
+  if Live <> 0 then
+  begin
+    Clean := False;
+    ReportLiveThreads(Live, 'in /proc/self/task');
+  end;
   {$ENDIF}
+  if Clean then
+  begin
+    WriteLn(Output, ShutdownProbeCleanMarker);
+    Flush(Output);
+  end;
 end;
 
 finalization

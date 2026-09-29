@@ -126,22 +126,42 @@ terminal status frame. A missing, failed, or late terminal frame escalates to
 leave pipe, registry, and Job Object work to that control thread.
 
 Forwarding threads never outlive the process-tree unit. Its finalization runs
-before the runtime units the threads rely on (Classes, SysUtils, the heap and
-thread-local storage) and stops every forwarder in order. First it sets a stop
-flag. It then waits until no handler is between its stop check and its wake-up.
-A handler that sees the flag gives the signal the disposition that forwarding
-displaced; on Windows it lets the default handler end the process with
-`STATUS_CONTROL_C_EXIT`. Next it wakes each forwarder: the Unix thread by a
-zero sentinel queued behind any signal already in the pipe, the console thread
-through its event (it forwards only when the handler has recorded a control
-event), and the inherited-control thread, which polls its pipe without
-blocking, by its terminated flag after one more read pass. Finally it joins
-each thread. A forwarder that has already committed to forwarding still ends
-the process itself, as before. If an idle forwarder does not stop within five
-seconds, the process ends at once with its chosen exit code instead of
-finalizing beside the live thread. Without this, a short-lived command that
-failed fast crashed or hung in runtime finalization while a forwarder was
-starting or blocked (#330).
+before the runtime units those threads rely on (Classes, SysUtils, the heap and
+thread-local storage), and it stops every forwarder in order.
+
+Handler admission and the stop request share one atomic word, which holds a
+stop flag and the count of handlers in flight. Each interlocked operation is
+bracketed by a full barrier, because FPC's AArch64 interlocked operations do
+not order memory on their own.
+
+1. Shutdown sets the stop flag and waits for the in-flight count to drain.
+   - A handler admitted before the flag queues its wake-up before it releases.
+   - A later Unix signal is re-raised with the default disposition, which is
+     what the forwarder would have done.
+   - A later Windows control event goes to the default handler, which ends the
+     process with `STATUS_CONTROL_C_EXIT`.
+   - If the count does not drain within five seconds, the process exits
+     immediately instead of queueing or closing anything.
+2. Shutdown wakes each forwarder without calling `TThread.Terminate`. In FPC,
+   `Terminate` stops a thread that has not started yet from ever running
+   `Execute`, which would drop a cancellation already accepted.
+   - The Unix thread is woken by a zero sentinel, queued behind any signal
+     already in the pipe.
+   - The console thread is woken through its event. It forwards whenever the
+     handler recorded a control event.
+   - The inherited-control thread polls its pipe without blocking. It makes
+     one more read pass after seeing the stop flag, so a waiting CANCEL frame
+     is still acknowledged.
+3. Shutdown joins each thread against a deadline. On Windows it waits for the
+   thread handle to be signalled; on Unix it waits for `Finished`, then joins.
+   - The deadline is five seconds for an idle forwarder, and thirty seconds for
+     one that has committed to forwarding. A committed forwarder ends the
+     process itself.
+   - Past the deadline, the process exits at once without blocking I/O.
+     Otherwise it would finalize the runtime beside a live thread.
+
+Without this, a short-lived command that failed fast crashed or hung during
+runtime finalization while a forwarder was starting or blocked (#330).
 
 The root fixes the descendant-reap deadline at 100 ms and the ancestor ACK
 deadline at 250 ms. Every level forwards those absolute `GetTickCount64`
