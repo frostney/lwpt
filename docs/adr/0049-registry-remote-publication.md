@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed. Amends [ADR-0043](0043-self-hosted-registry-origin.md), whose
+Accepted on 2026-09-29 by the maintainer, who settled the nine decisions at
+the end of this record. Amends [ADR-0043](0043-self-hosted-registry-origin.md), whose
 `registry` command family and origin store this extends, and records the
 publication decisions the [registry protocol](../registry-spec.md) leaves to
 the implementation. Issue [#54](https://github.com/frostney/lwpt/issues/54).
@@ -40,7 +41,9 @@ properties that a remote API cannot keep:
 
 The client side is also missing pieces. HTTPClient (0.6.0) has GET, HEAD, and
 POST but no PUT or DELETE. It cannot yet trust a private CA
-([#302](https://github.com/frostney/lwpt/issues/302)). LWPT has no tar writer.
+([#302](https://github.com/frostney/lwpt/issues/302)). LWPT has no tar writer
+and no zip reader. The installer's gzip decoder (`LWPT.Gzip`) has no
+expanded-size bound.
 
 Two sources differ on authentication. The registry epic
 ([#29](https://github.com/frostney/lwpt/issues/29)) mentions "signed,
@@ -59,7 +62,7 @@ vocabulary is added. This ADR is the approval the frozen-surface rule
 requires.
 
 ```text
-lwpt registry publish <archive.tar.gz> --origin <base-url>
+lwpt registry publish <archive.tar.gz|archive.zip> --origin <base-url>
     --key-id <ed25519:...> --public-key <hex:...> [--token-env <NAME>] [--silent]
 lwpt registry issue-token [--data-dir <path>] --packages <pattern[,pattern...]>
     [--actions publish[,yank]] [--expires-days <n>] [--label <text>] [--silent]
@@ -73,7 +76,8 @@ lwpt registry revoke-token [--data-dir <path>] --token-id <id> [--silent]
   holds the token and defaults to `LWPT_REGISTRY_TOKEN`, derived from
   `PROJECT_NAME`. This follows the `--tls-password-env` precedent. A token is
   never accepted as an option value. On success, stdout gets one line:
-  `published <name>@<version> to <origin> at sequence <n> (<record hash>)`,
+  `published <name>@<version> to <origin> at sequence <n> (archive <hash>,
+  record <hash>)`,
   or `already published …` for an idempotent retry. `--silent` keeps only that
   line. Failures exit 1 with `registry: <code>: <message>` on stderr.
 - `issue-token` and `revoke-token` are operator-local, like `rotate-key`. They
@@ -183,9 +187,11 @@ after the pointer is replaced, which means a lost `201` becomes a `204` on
 retry. The recovery rules from ADR-0043 are unchanged. Files ahead of the
 pointer are not proof, recovery removes numeric checkpoints ahead of it, and
 `.part` uploads left by a killed process are cleaned by the next lease holder.
-Records may now carry the dependency list that the client validated (see the
-open decisions). Commits are serialized: a second publisher waits for the
-lease or gets a retryable `503`.
+Until [#62](https://github.com/frostney/lwpt/issues/62) defines registry
+dependency sources, records keep `dependencies = []` (decision 4). The commit
+path still validates any canonical dependency list, so #62 needs no store
+change. Commits are serialized: a second publisher waits for the lease or
+gets a retryable `503`.
 
 ### Credentials and scope
 
@@ -205,6 +211,8 @@ constant time.
   followed by one trailing `*`, or `*` alone. Actions are `publish` (upload
   and record) and `yank` (yank and restore). An upload needs `publish` on any
   pattern, because objects are unscoped until a record references them.
+- Every token expires. `--expires-days` defaults to 90 and accepts 1 to 365.
+  No non-expiring form exists (decision 2).
 - The server reads the token file on every mutating request and caches
   nothing. Revocation (`revoke-token` atomically sets `revoked_at` and keeps
   the file) and expiry therefore take effect on the next request without a
@@ -257,7 +265,7 @@ ID and does not undo the publication.
   authority. HTTPClient connects over IPv4 only.
 - The destination comes only from the invoking user's command line. It never
   comes from project files, so ADR-0048's transitive-manifest threat does not
-  apply. Private addresses are allowed (see the open decisions).
+  apply. Private addresses are allowed (decision 6).
 - HTTPClient gains PUT and DELETE with byte bodies in a package minor
   release, with the package's own tests, including the Windows mock server.
   Private-CA trust comes from #302.
@@ -287,13 +295,151 @@ attempts, with exponential backoff capped by `Retry-After` and 60 seconds.
 
 ### Archive contract
 
-`publish` accepts a prebuilt gzip tar and scans it without extracting it. It
-applies the installer's traversal, link, path-length, and decompressed-size
-rules. The archive must have exactly one top-level directory, which the
-installer strips (`LWPT.Install.pas:1221-1233`). That directory must contain
-`lwpt.toml`, whose `[package] name` and `version` are the protocol-valid
-publication identity. The server never decompresses archives. It binds only
+The registry, mirrors, the protocol (`application/gzip` objects), and
+`lwpt install` keep exactly one archive format: gzip tar. `publish` chooses
+its input path from the leading bytes, not the file extension. Input starting
+with `1f 8b` is a tar.gz. Input starting with `PK\x03\x04` or `PK\x05\x06`
+is a zip. Anything else fails with `unsupported_archive`.
+
+- **tar.gz** is uploaded exactly as given. `publish` scans it without
+  extracting it. It applies the installer's traversal and link rules
+  (`LWPT.Install.pas:1301-1373`) and component limit (`:1485`, `:1540-1553`), plus the
+  1 GiB expanded bound defined below, which the installer's decoder lacks.
+  The archive must have exactly one top-level directory, which the installer
+  strips (`:1221-1233`). That directory must contain `lwpt.toml`, whose
+  `[package] name` and `version` are the protocol-valid publication identity.
+- **zip** is normalized on the client into one canonical tar.gz, described
+  in the next section. Only that tar.gz is uploaded, stored, hashed, and
+  served.
+
+For both formats, the identity checks and decision 4's dependency rule run
+on the resulting tree. The server never decompresses archives. It binds only
 the hash and size.
+
+### Zip normalization
+
+Normalization is a pure function of the zip bytes and the normalizer
+version. It uses no clock, locale, file-system metadata, environment, or
+network, and it writes no file: the input and output live in memory within
+the bounds below. It never touches project state. A failure happens before
+the token is read or any connection is made.
+
+**Container rules.** These rules keep every zip reader seeing the same
+entries, so nothing can hide in the archive:
+
+- The end-of-central-directory record must end exactly at the end of the
+  input, and its comment length must account for every trailing byte. The
+  comment is ignored.
+- Every disk-number field must be 0, and the entries on this disk must equal
+  the total. Multi-disk and split archives are rejected.
+- The central directory must end exactly where the end record begins. The
+  first local header must be at offset 0. The local records must fill
+  `[0, central-directory offset)` in central-directory order with no gaps,
+  overlaps, or prepended data, so self-extracting stubs and overlapping-entry
+  bombs are rejected.
+- Each local header must repeat its central entry's name bytes, method, and
+  flags. It must also repeat the CRC and sizes, unless data-descriptor mode
+  is used.
+- **ZIP64 is rejected**: its records, locator, `0xFFFF` or `0xFFFFFFFF`
+  sentinels, and extra field `0x0001`. Every bound below fits the classic
+  16- and 32-bit fields. Rejecting ZIP64 removes a second set of sizes that
+  could disagree with the first.
+- **Data descriptors are accepted** (flag bit 3). macOS Archive Utility and
+  Java write them, and they are safe under these rules. The central
+  directory's CRC and sizes are authoritative. The local CRC and sizes must
+  be zero or equal to the central ones. The 12-byte descriptor, or 16 bytes
+  with its optional signature, must follow the data, match the central
+  values, and count toward the no-gap fill. The 32-bit form is the only form
+  accepted.
+- The allowed methods are 0 (stored, where the compressed size must equal
+  the uncompressed size) and 8 (deflate). The allowed flags are bits 1 and 2
+  (deflate options), 3, and 11 (UTF-8). **Encryption is rejected**: flag
+  bits 0 and 6, AES method 99, and every other method or flag. Extra fields
+  must parse within their declared lengths and are otherwise ignored.
+- Each entry is inflated with `zinflate`. It must produce exactly its
+  declared size, and inflation stops one byte past that size. The entry's
+  CRC-32 must also match.
+
+**Entry rules.** These are the tar preflight's rules applied to each name,
+followed by rules that the canonical form needs:
+
+- The name must be strict UTF-8 with no control characters. `\` is read as
+  `/`, as the installer does.
+- The same rules reject empty, absolute (`/`, `\`, or a drive letter), and
+  `..` paths, and any component longer than 255 bytes.
+- `.` and empty components are rejected as well.
+- Duplicate names are rejected. Names that collide after ASCII case folding
+  are also rejected on every platform, so a package extracts the same way on
+  case-insensitive Windows and macOS.
+- Only regular files and directories are allowed. A directory name ends
+  with `/`, has size 0, and has CRC 0.
+- When the creating host is Unix (3), the file type in the upper 16 bits of
+  the external attributes must be regular, directory, or unset. Symlinks,
+  devices, FIFOs, and sockets are rejected. When the host is MS-DOS (0), the
+  directory bit must agree with the trailing slash, and volume labels are
+  rejected. External attributes from other hosts are ignored.
+
+**Package root.** The package root is the zip root when it contains
+`lwpt.toml`. Otherwise it is the zip's single top-level directory, and that
+directory must contain `lwpt.toml`. Any other layout is rejected. Output paths
+are `<name>-<version>/<path below the root>`, using the manifest identity.
+Every path must fit ustar's split at a `/` into a prefix of at most 155 bytes
+and a name of at most 100 bytes. At install time, the installer still checks
+the platform path limits (`:1470-1538`).
+
+**Canonical tar.gz.** The output is POSIX ustar with no GNU or pax
+extensions:
+
+- Every directory is emitted explicitly, including the root and parents the
+  zip only implies. Entries are sorted by the UTF-8 bytes of their path, and
+  a directory path ends with `/`.
+- Directories get mode `0755`. A file gets `0755` when the host is Unix and
+  its mode has any execute bit set, and `0644` otherwise.
+- uid and gid are 0. uname, gname, linkname, and the device fields are
+  empty. mtime is 0. The magic is `ustar\0` with version `00`, and the
+  checksum is standard.
+- The archive ends with two zero blocks and is padded to a multiple of
+  10,240 bytes.
+- The gzip layer has one member. Its header bytes are `1f 8b 08`, then FLG
+  0, MTIME 0, XFL 0, and OS 255. It is raw deflate from paszlib `zdeflate`
+  at level 9, window bits −15, memory level 8, and the default strategy.
+  Input is fed in fixed 64 KiB chunks with `Z_NO_FLUSH`, followed by one
+  `Z_FINISH`. CRC-32 and ISIZE close the member.
+
+Zip timestamps, comments, and extra fields are dropped. Entry order, entry
+compression, and timestamps therefore do not affect the output. Two zips that
+hold the same names, bytes, and execute bits produce the same tar.gz.
+
+**Bounds** (fixed; each fails with `archive_limit_exceeded`):
+
+- The zip may be at most 256 MiB.
+- It may have at most 10,000 central entries. The central-directory size
+  must be at least 46 bytes per declared entry, and this is checked before
+  anything is allocated.
+- The declared uncompressed sizes may total at most 1 GiB. This sum is
+  checked before anything is inflated, and each entry's actual size is
+  enforced as it inflates.
+- The canonical tar.gz must be at most 256 MiB. Generation stops once the
+  output passes that size.
+
+Peak memory is about the input size plus the output size plus fixed buffers.
+
+**Determinism is a compatibility contract.** Every retry of the same zip must
+yield the same tar.gz bytes, including on another platform or another LWPT
+version, or it would conflict with its own first publication. Golden
+fixtures pin the output hash on every release platform. Any change to the
+writer or to paszlib's deflate output fails those fixtures. Such a change is
+allowed only as a new, documented normalizer version.
+
+**Implementation constraint.** FPC's `zipper` is not built by LWPT's cross
+toolchain, so the zip reader is written in-tree on `zinflate` and `crc`, as
+`LWPT.Gzip` already is. The cross toolchain compiles paszlib's `zstream.pp`
+(`toolchain.yml:377-384`), and that unit's implementation uses `zdeflate`
+(`zstream.pp:120-122`). `zdeflate` is therefore already built for every
+target. The implementation PR adds it to the `require_unit` guards in
+`ci.yml` and `release.yml`, which assert only `zstream` today. The
+deterministic tar writer is written once. The directory-packing follow-up
+(decision 3) reuses it.
 
 ### Rule amendments
 
@@ -329,6 +475,11 @@ The implementation PR applies these amendments; this ADR does not.
 | Credentials scoped, never printed or persisted | Out-of-scope package returns 403. Revoked and expired tokens return 401. Every command's stdout and stderr, the audit files, the data directory (hash only), and the project tree are searched for the secret. `lwpt.lock` and `.lwpt/` stay unchanged. |
 | Deterministic limits and authentication | Missing or malformed token returns 401 with the challenge. 413 comes before the body is read. A missing length returns 400. The rate bounds, through `REGISTRY_TESTING` seams (ADR-0044), return 429 with `Retry-After`. The 507 budget and a lease busy past its wait each return their code. |
 | Localhost HTTP and remote HTTPS | The E2E matrix runs on every release platform, including both macOS transports. HTTPS uses `localhost-native-identity.p12`, and the client trusts the committed test root through #302 in the `lwpt-testing` build only. Plain HTTP to a non-localhost host fails before connecting. |
+| Zip normalization is deterministic | Golden fixtures produce the pinned tar.gz hash on every release platform. The same zip converted twice gives identical bytes. Zips that differ only in entry order, timestamps, stored versus deflate, data descriptors, or comments give the same bytes as each other. |
+| Zip features are rejected | Each fails locally with its stable code and no connection: encryption (bits 0 and 6, AES), ZIP64 in each form, multi-disk, unsupported methods and flags, prepended or trailing data, gaps, overlapping entries, local and central mismatch, a descriptor mismatch, and a bad CRC. |
+| Zip entries are rejected | Each fails locally: symlink, device, FIFO, socket, volume label, absolute and drive paths, `..`, `.`, empty components, a duplicate or ASCII case-colliding name, a component over 255 bytes, a path not fitting ustar, invalid UTF-8, and a missing or ambiguous `lwpt.toml` root. |
+| Zip limits are enforced | Inputs just over 256 MiB, 10,001 entries, and 1 GiB declared fail before inflation. An entry that inflates past its declared size fails at that byte. Output over 256 MiB fails. All fail with `archive_limit_exceeded`. |
+| A zip retry is idempotent | E2E: publishing a zip gives `201`. Publishing the same zip again gives `204` with the same archive hash. Uploading the tar.gz normalized from it also gives `204`. The project tree is unchanged, and a conversion failure against an unreachable origin makes no connection. |
 | Transparency (maintainer amendment) | Inclusion and consistency after `201`/`204`. A stale or downgraded checkpoint after commit fails. A tampered signature or snapshot fails even though the server returned `201`. Offline and frozen: `publish` has no offline mode, and `install --frozen`/`--offline` never contact the publication API. Consumer-side offline proofs stay with #62. |
 
 Unit tests cover token grammar, pattern matching, the content-identity
@@ -352,6 +503,18 @@ package-owned tests.
 - **Advertise publication from a new config field.** Rejected because it would
   change the origin configuration schema. Active tokens already express
   operator intent.
+- **Store and serve zips as a second archive format.** Rejected. Mirrors, the
+  protocol media type, the installer, and the content-addressed caches would
+  all need a second format. The same package could also get two identities.
+- **Gzip with stored deflate blocks only.** Rejected. This would make
+  determinism trivial without depending on paszlib's deflate output, but an
+  uncompressed tar reaches the 256 MiB object limit far sooner. Golden
+  fixtures pin the compressed output instead.
+- **Accept ZIP64 or reject data descriptors.** Rejected. Every bound fits the
+  classic fields, so ZIP64 would only add a second size field that could
+  disagree. Data descriptors are common and are safe once the central
+  directory is authoritative and the records must fill the archive without
+  gaps.
 - **Server-side archive inspection.** Rejected. It adds a decompression-bomb
   surface to a long-running process. The client validates the archive, and
   consumers extract under the installer's protections.
@@ -366,65 +529,47 @@ package-owned tests.
   grow until a retention design exists.
 - Behind a reverse proxy, per-peer rate bounds apply to the proxy address.
   Operators should rely on per-token bounds and their proxy's limits.
-- Implementation spans the store, three server transports, HTTPClient, and the
-  CLI. #302 is a delivery dependency for the HTTPS acceptance test.
+- Implementation spans the store, three server transports, HTTPClient, the
+  CLI, an in-tree zip reader, and a deterministic tar.gz writer. #302 is a
+  delivery dependency for the HTTPS acceptance test.
+- Zip input loses symlinks, timestamps, and all permission detail except the
+  execute bit. Packages that need more must publish a tar.gz.
+- The normalizer's output bytes are a compatibility contract. Upgrading FPC
+  or paszlib must keep the golden fixtures passing, or introduce a documented
+  normalizer version.
 
-## Open decisions for the maintainer
+## Decisions
 
-1. **Authentication scheme.**
-   - (a) Bearer tokens over verified TLS, as the protocol specifies.
-   - (b) Ed25519 publisher keys that sign each request, as #29's summary
-     describes.
-   - (c) Both.
+The maintainer settled these on 2026-09-29. All follow the recommendation
+except the third, which the maintainer widened to add zip input.
 
-   *Recommend (a)*, with (b) later as an additional scheme.
-2. **Token lifetime.**
-   - (a) Mandatory expiry, default 90 days, maximum 365.
-   - (b) Optional expiry.
-   - (c) Mandatory expiry of at most 30 days.
-
-   *Recommend (a).*
-3. **Publish input.**
-   - (a) A prebuilt `.tar.gz` only.
-   - (b) Also pack a directory deterministically, which needs a new tar
-     writer, inclusion rules, and possibly manifest schema.
-
-   *Recommend (a)*, with (b) as a follow-up issue.
-4. **Dependencies before #62.**
-   - (a) Refuse an archive whose `lwpt.toml` declares `[dependencies]`.
-   - (b) Publish `dependencies = []`, silently dropping them.
-   - (c) Block #54 on #62's registry source syntax.
-
-   *Recommend (a).*
-5. **Client credential source.**
-   - (a) Environment variable only (`--token-env`, default
-     `LWPT_REGISTRY_TOKEN`).
-   - (b) Also #313's user-level config, with tokens keyed by origin identity
-     and owner-only permissions checked.
-
-   *Recommend (a) now and (b) after #313 lands.* Never project files.
-6. **Private-network origins.**
-   - (a) Allowed, because the destination comes only from the invoking user's
-     command line.
-   - (b) Require #313's user-level host allowance.
-
-   *Recommend (a).* Run tasks can already execute arbitrary commands, so a
-   project gains nothing from naming an origin.
-7. **Private-CA trust and HTTPS E2E.**
-   - (a) Make #302 a delivery dependency and add no CLI trust option. The
-     system store serves production, and a test-only seam injects the
-     committed root.
-   - (b) Also add `--tls-ca-file` to `publish`, and later to `sync`.
-
-   *Recommend (a).*
-8. **Trust pin for `publish`.**
-   - (a) Required. Exit 0 only after inclusion and consistency are verified.
-   - (b) Optional. Without a pin, report the server's answer unverified.
-
-   *Recommend (a)*, which follows the transparency amendment.
-9. **Yank and restore client.**
-   - (a) Server endpoints and the `yank` action in #54, CLI in a follow-up.
-   - (b) Also add `registry yank` in #54.
-   - (c) Defer everything, which leaves `publication-v1` short of the corpus.
-
-   *Recommend (a).*
+1. **Authentication: Bearer tokens over verified TLS**, as the protocol
+   specifies. Replaying a captured idempotent PUT is harmless, and TLS
+   prevents capture. Ed25519-signed requests, which #29's summary mentions,
+   may be added later as a second `auth_schemes` entry.
+2. **Tokens always expire**: 90 days by default, at most 365. Mandatory
+   expiry limits how long a leaked CI secret is useful, and overlapping
+   validity keeps rotation disruption-free.
+3. **Publish input: a prebuilt `.tar.gz` or a `.zip`.** A zip is normalized
+   on the client into the one canonical, deterministic tar.gz. Registry,
+   mirror, protocol, and installer formats stay single, and retries stay
+   idempotent. Directory packing is a follow-up issue that reuses the tar
+   writer.
+4. **Archives whose `lwpt.toml` declares `[dependencies]` are refused** until
+   #62 defines registry dependency sources. Silently dropping dependencies
+   would publish packages that install incompletely.
+5. **Credentials come from an environment variable only** (`--token-env`,
+   default `LWPT_REGISTRY_TOKEN`). Tokens keyed by origin identity in #313's
+   user-level config, with owner-only permissions checked, may follow once
+   that file exists. Project files never hold credentials.
+6. **Private-network origins are allowed.** The destination comes only from
+   the invoking user's command line. Run tasks can already execute arbitrary
+   commands, so a project gains nothing from naming an origin.
+7. **#302 is a delivery dependency, and `publish` has no CLI trust option.**
+   The system trust store serves production. A test-only seam in the
+   `lwpt-testing` build injects the committed test root.
+8. **`publish` requires a trust pin.** It exits 0 only after inclusion and
+   consistency are verified, which applies the transparency amendment.
+9. **Yank and restore ship as server endpoints and the `yank` action in #54.**
+   Their CLI is a follow-up issue. `publication-v1` therefore conforms to the
+   corpus.

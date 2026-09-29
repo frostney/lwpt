@@ -69,7 +69,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0046](./adr/0046-skill-owned-delivery.md) | Delivery is skill-owned: the repository keeps the `delivery-admission` PR gate, manual and diagnostic `ci.yml` dispatch, and a full-CI run on every PR's exact head; supersedes [0032](./adr/0032-managed-delivery-state-and-proof.md) |
 | [0047](./adr/0047-commit-pins-must-be-reachable.md) | Commit-SHA pins must be full SHAs reachable from an advertised branch or tag, proven with a commits-only protocol v2 fetch; amends [0009](./adr/0009-source-syntax-and-tag-resolution.md) |
 | [0048](./adr/0048-git-host-fetch-trust.md) | Dependency fetches require HTTPS and declared hosts on every hop, refuse every non-globally-reachable address (classified in binary against the IANA registries), and treat locked tags and archives as immutable unless `--accept-moved-tags` |
-| [0049](./adr/0049-registry-remote-publication.md) | (Proposed.) Remote registry publication: `registry publish`, `issue-token`, and `revoke-token`, Bearer-scoped tokens, content-identity idempotency, lease-serialized commits, audit records, and post-publish inclusion and consistency verification; amends [0043](./adr/0043-self-hosted-registry-origin.md) |
+| [0049](./adr/0049-registry-remote-publication.md) | Remote registry publication: `registry publish` (tar.gz, or zip normalized to one deterministic tar.gz), `issue-token`, and `revoke-token`, expiring Bearer-scoped tokens, content-identity idempotency, lease-serialized commits, audit records, and post-publish inclusion and consistency verification; amends [0043](./adr/0043-self-hosted-registry-origin.md) |
 
 ## Spikes
 
