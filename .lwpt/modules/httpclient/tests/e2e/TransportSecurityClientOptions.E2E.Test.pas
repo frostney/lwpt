@@ -29,6 +29,7 @@ uses
   base64,
   HTTPClient,
   TestingPascalLibrary,
+  Tests.RetrievalRecorder,
   TransportSecurity;
 
 const
@@ -63,6 +64,9 @@ const
     never-routed TEST-NET-1 (192.0.2.1): a fetch would block for seconds. }
   UNREACHABLE_AIA_PKCS12_PATH =
     FIXTURES + 'localhost-unreachable-aia-identity.p12';
+  { The same shape, but the URLs point at the local retrieval recorder so a
+    fetch is observable. }
+  LOOPBACK_AIA_PKCS12_PATH = FIXTURES + 'localhost-loopback-aia-identity.p12';
   { Anchor-only evaluation is offline, so it must finish far inside any
     network retrieval timeout (15 s by default on Windows). }
   OFFLINE_VERIFICATION_BUDGET_MILLISECONDS = 8000;
@@ -120,6 +124,7 @@ type
     procedure TestAnchorsOnlyVerifiesConfiguredCA;
     procedure TestAnchorsOnlyRejectsUnrelatedCA;
     procedure TestAnchorsOnlyNeverFetchesUnreachableURLs;
+    procedure TestAnchorPassMakesNoObservableRetrieval;
     procedure TestSystemAndAnchorsVerifiesConfiguredCA;
     procedure TestSystemAndAnchorsRejectsUnrelatedCA;
     procedure TestPeerCertificateIsServerLeaf;
@@ -825,6 +830,50 @@ begin
   {$ENDIF}
 end;
 
+{ Observable retrieval over a real handshake: the server withholds the
+  intermediate and the leaf's AIA, OCSP, and CRL URLs point at the local
+  retrieval recorder. Anchors-only must reject it with zero requests. The
+  positive control is system plus anchors, whose second evaluation restores
+  Secure Transport's network fetching: on macOS the recorder then sees the
+  AIA fetch, so the endpoint demonstrably detects retrieval. OpenSSL never
+  fetches certificate URLs, so on Unix-not-Darwin both modes must show zero
+  requests and no positive control is possible. Windows runs this server-
+  less in TransportSecurity.Test (an SChannel server builds its own chain
+  and could fetch the URL itself). }
+procedure TTransportSecurityClientOptionsE2ETests.TestAnchorPassMakesNoObservableRetrieval;
+{$IFNDEF MSWINDOWS}
+var
+  ErrorMessage: string;
+  Peer: TBytes;
+  Recorder: TRetrievalRecorder;
+  Response: AnsiString;
+  Served: TServedConnection;
+{$ENDIF}
+begin
+  {$IFNDEF MSWINDOWS}
+  Recorder := TRetrievalRecorder.Create;
+  try
+    ErrorMessage := RunExchange(LOOPBACK_AIA_PKCS12_PATH, tsivPermissive,
+      'localhost', AnchorsOnly(TEST_ROOT_PATH), False, Response, Peer, Served);
+    Expect<Boolean>(Contains(ErrorMessage, 'verification')).ToBe(True);
+    Expect<string>(Recorder.Describe).ToBe('');
+    Expect<Integer>(Recorder.Requests).ToBe(0);
+
+    ErrorMessage := RunExchange(LOOPBACK_AIA_PKCS12_PATH, tsivPermissive,
+      'localhost', SystemAndAnchors(TEST_ROOT_PATH), False, Response, Peer,
+      Served);
+    Expect<Boolean>(ErrorMessage <> '').ToBe(True);
+    {$IFDEF DARWIN}
+    Expect<Boolean>(Recorder.Requests >= 1).ToBe(True);
+    {$ELSE}
+    Expect<Integer>(Recorder.Requests).ToBe(0);
+    {$ENDIF}
+  finally
+    Recorder.Free;
+  end;
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityClientOptionsE2ETests.TestSystemAndAnchorsVerifiesConfiguredCA;
 var
   Peer: TBytes;
@@ -1358,9 +1407,14 @@ begin
   Skip('anchors-only verification never fetches unreachable certificate URLs',
     TestAnchorsOnlyNeverFetchesUnreachableURLs,
     'covered server-less by TransportSecurity.Test on Windows');
+  Skip('the anchor pass makes no observable certificate retrieval',
+    TestAnchorPassMakesNoObservableRetrieval,
+    'covered server-less by TransportSecurity.Test on Windows');
   {$ELSE}
   Test('anchors-only verification never fetches unreachable certificate URLs',
     TestAnchorsOnlyNeverFetchesUnreachableURLs);
+  Test('the anchor pass makes no observable certificate retrieval',
+    TestAnchorPassMakesNoObservableRetrieval);
   {$ENDIF}
   Test('system-plus-anchors trust verifies the configured CA',
     TestSystemAndAnchorsVerifiesConfiguredCA);

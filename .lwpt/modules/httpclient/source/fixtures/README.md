@@ -92,6 +92,13 @@ openssl pkcs12 -export -inkey localhost-test-leaf-key.pem \
   -out localhost-unreachable-aia-identity.p12
 ```
 
+`localhost-loopback-aia-identity.p12` (passphrase `test-only`) has the same
+shape. Its leaf, `localhost-loopback-aia-leaf-cert.pem` (serial `0x7103`,
+`loopback-aia-leaf.cnf`), points the AIA, OCSP, and CRL URLs at
+`http://127.0.0.1:47931/`, the fixed port of the tests' retrieval recorder,
+so any fetch is counted. Regenerate it like the unreachable-AIA leaf with
+that configuration and serial.
+
 `localhost-multi-identity.p12` (passphrase `test-only`) carries two
 certificate-and-key identities, the test leaf and the test root, to pin the
 Windows rule that a bundle holds exactly one keyed certificate and that no

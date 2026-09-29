@@ -53,6 +53,9 @@ uses
   {$ENDIF}
   base64,
   TestingPascalLibrary,
+  {$IFDEF MSWINDOWS}
+  Tests.RetrievalRecorder,
+  {$ENDIF}
   TransportSecurity;
 
 const
@@ -117,6 +120,7 @@ type
     procedure TestInconsistentOptionsRejected;
     procedure TestNativeMaterialRejectedBeforeConnecting;
     procedure TestSChannelAnchorVerificationStaysOffline;
+    procedure TestSChannelAnchorPassMakesNoRetrieval;
   end;
 
   TTransportSecurityServerTests = class(TTestSuite)
@@ -5661,6 +5665,48 @@ begin
   {$ENDIF}
 end;
 
+{ Observable retrieval: the leaf's AIA, OCSP, and CRL URLs point at a local
+  recorder, and its intermediate is withheld. The offline anchor pass must
+  reject it with zero requests. The positive control is system plus
+  anchors: after the anchor pass fails, the current user's default engine
+  does fetch the AIA issuer, so the same recorder sees the request. If the
+  offline flags were removed from the anchor engine, the first evaluation
+  would fetch too and fail the zero-request assertion. }
+procedure TTransportSecurityClientOptionTests.TestSChannelAnchorPassMakesNoRetrieval;
+{$IFDEF MSWINDOWS}
+const
+  LOOPBACK_AIA_LEAF_PATH =
+    'packages/httpclient/source/fixtures/localhost-loopback-aia-leaf-cert.pem';
+var
+  ErrorMessage: string;
+  Leaf: TBytes;
+  Options: TTransportSecurityClientOptions;
+  Recorder: TRetrievalRecorder;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  Leaf := PEMCertificateDER(LOOPBACK_AIA_LEAF_PATH);
+  Options := AnchorOptions(LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH),
+    tstmAnchorsOnly);
+  Recorder := TRetrievalRecorder.Create;
+  try
+    ErrorMessage := TransportSecurityTestVerifyServerChain(Leaf, nil,
+      'localhost', Options);
+    Expect<Boolean>(Mentions(ErrorMessage, 'verification')).ToBe(True);
+    Expect<string>(Recorder.Describe).ToBe('');
+    Expect<Integer>(Recorder.Requests).ToBe(0);
+
+    Options.TrustMode := tstmSystemAndAnchors;
+    ErrorMessage := TransportSecurityTestVerifyServerChain(Leaf, nil,
+      'localhost', Options);
+    Expect<Boolean>(Mentions(ErrorMessage, 'verification')).ToBe(True);
+    Expect<Boolean>(Recorder.Requests >= 1).ToBe(True);
+  finally
+    Recorder.Free;
+  end;
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityClientOptionTests.SetupTests;
 begin
   Test('default client options select the option-less path',
@@ -5676,9 +5722,14 @@ begin
   {$IFDEF MSWINDOWS}
   Test('SChannel anchor verification never fetches certificate URLs',
     TestSChannelAnchorVerificationStaysOffline);
+  Test('SChannel anchor pass makes no retrieval that system evaluation makes',
+    TestSChannelAnchorPassMakesNoRetrieval);
   {$ELSE}
   Skip('SChannel anchor verification never fetches certificate URLs',
     TestSChannelAnchorVerificationStaysOffline,
+    'the SChannel chain engine is Windows-only');
+  Skip('SChannel anchor pass makes no retrieval that system evaluation makes',
+    TestSChannelAnchorPassMakesNoRetrieval,
     'the SChannel chain engine is Windows-only');
   {$ENDIF}
 end;

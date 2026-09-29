@@ -314,7 +314,8 @@ function TransportSecurityTestKeyContainerExists(
 { Runs the SChannel client's trust-anchor verification on ALeaf (DER) as
   if a server had sent it together with AIntermediates (PEM or DER, may be
   empty), without a handshake. Returns '' when the peer is accepted,
-  otherwise the verification error. Exists so the offline retrieval policy
+  otherwise the verification error. Compiled only without PRODUCTION (test
+  and development builds). Exists so the offline retrieval policy
   can be pinned without an SChannel server building its own chain. }
 function TransportSecurityTestVerifyServerChain(const ALeaf,
   AIntermediates: TBytes; const AHost: string;
