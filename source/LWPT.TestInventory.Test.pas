@@ -101,11 +101,11 @@ begin
       'packages/httpclient/source/HTTPClient.Test.pas', 'darwin', 'aarch64',
       Suites, Cases)).ToBe(True);
     Expect<Integer>(Suites).ToBe(5);
-    Expect<Integer>(Cases).ToBe(57);
+    Expect<Integer>(Cases).ToBe(63);
     Expect<Boolean>(Inventory.Resolve(
       'packages/httpclient/source/HTTPClient.Test.pas', 'windows', 'i386',
       Suites, Cases)).ToBe(True);
-    Expect<Integer>(Cases).ToBe(55);
+    Expect<Integer>(Cases).ToBe(61);
   finally
     Inventory.Free;
   end;
