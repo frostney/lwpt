@@ -22,7 +22,8 @@ while it publishes. As of `7561079`, the pieces below it already exist:
 | In-process `Publish`: lease, verify state, write object and record, build snapshot, commit checkpoint, replace the pointer, then the derived index | `source/LWPT.Registry.Store.pas:2934-3077` |
 | Shared checkpoint commit with history preflight | `Store.pas:2811-2843` |
 | One `registry-publication` producer lease ([ADR-0038](0038-local-producer-leases.md)) for publication, renewal, rotation, and recovery, taken with a non-blocking `TryAcquire` | `Store.pas:2965`, `2766`, `2863`, `2250` |
-| Readers capture the pointer under the generation lock | `Store.pas:2436-2445`, `2545-2570` |
+| An origin request reads the atomically replaced pointer once, without the generation lock, and verifies it | `Store.pas:2436-2445` |
+| A mirror request reads the pointer under the generation lock, so a delayed reader cannot replace a newer cached generation | `LWPT.Registry.Mirror.pas:953-968`; `Store.pas:2545-2570` |
 | Test barriers and failure points around checkpoint and activation | `Store.pas:241-247`, `3049-3071` |
 
 There is no remote publication path. `Publish` has only test callers
@@ -79,7 +80,7 @@ lwpt registry revoke-token [--data-dir <path>] --token-id <id> [--silent]
   `published <name>@<version> to <origin> at sequence <n> (archive <hash>,
   record <hash>)`,
   or `already published …` for an idempotent retry. `--silent` keeps only that
-  line. Failures exit 1 with `registry: <code>: <message>` on stderr.
+  line. Failures exit 1 with `registry: <code>: <local message>` on stderr.
 - `issue-token` and `revoke-token` are operator-local, like `rotate-key`. They
   run against the data directory while `serve` keeps running. `issue-token`
   prints the token once, as its only stdout line. On an origin, `registry
@@ -97,7 +98,7 @@ lwpt registry revoke-token [--data-dir <path>] --token-id <id> [--silent]
 ### Wire protocol
 
 The server implements the endpoints, status codes, and media types already
-pinned by the specification and the corpus. It advertises `package-list-v1`
+pinned by the specification and the corpus, as amended under "Rule amendments". It advertises `package-list-v1`
 on origins and mirrors, because pages derive from the captured read view.
 Origins additionally advertise `publication-v1` with `auth_schemes =
 ["bearer"]` while at least one active token exists. Otherwise they stay
@@ -107,19 +108,25 @@ read-only, exactly as today.
   `/v1/packages/<name>/<version>` are computed from the snapshot named by the
   `snapshot` parameter, or from the captured head on a first page. That
   snapshot must be in accepted history. Cursors bind the snapshot. A mismatch
-  returns `409 snapshot_conflict`, and `limit` is at most 100. Only these
-  routes accept a query, and they decode percent-encoding strictly.
+  returns `409 snapshot_conflict`, and `limit` is at most 100.
+- **Queries.** Queries are accepted on two kinds of route. `/v1/rotations`
+  keeps its existing `after`, `limit`, and `cursor` parameters, which
+  rotated-key discovery needs. The package routes above accept `limit`,
+  `cursor`, and `snapshot`, and they decode percent-encoding strictly. A query
+  on any other route is still `400 invalid_request_target`.
 - **Upload.** `PUT /v1/objects/sha256/<hex>` streams to
-  `incoming/<random>.part` while hashing, then moves to
+  `incoming/<upload-id>.part` while hashing, then moves to
   `incoming/sha256/<hex>`. A new object returns `201`. An object already
-  incoming or committed returns `204`, and a digest mismatch returns
-  `422 object_hash_mismatch`. Nothing under `incoming/` is served, since
-  serving is membership-based (ADR-0045). Uploads use `incoming/`, not `tmp/`,
-  so a concurrent commit or recovery cannot wipe them.
+  present under `incoming/` or `objects/` returns `204`, and a digest mismatch
+  returns `422 object_hash_mismatch`. Nothing under `incoming/` is served,
+  because serving is membership-based (ADR-0045). Uploads use `incoming/`,
+  not `tmp/`, so a concurrent commit or recovery cannot wipe them. Ownership
+  and accounting are defined under "Upload staging" below.
 - **Publish.** `PUT /v1/packages/<name>/<version>` carries a canonical package
   record whose name and version equal the path and whose origin equals the
-  configured identity, with `yanked = false`. When a record for that identity
-  is already active, the server compares **content identity**: `archive`,
+  configured identity, with `yanked = false`. A record with `yanked = true`
+  is `400 invalid_request`, because yanking goes only through the lifecycle
+  endpoints. When a record for that identity is already active, the server compares **content identity**: `archive`,
   `archive_size`, and `dependencies`, but not `published_at` or `yanked`.
   Equal content returns `204` with the active record, even if it is yanked.
   Different content returns `409 identity_conflict`. For a new version, the
@@ -128,9 +135,17 @@ read-only, exactly as today.
   If it is not, the server returns `424 failed_dependency`.
 - **Yank/restore.** `PUT` and `DELETE` on `/v1/packages/<name>/<version>/yank`
   work as specified and use the same commit path.
-- **Responses.** `201` and `204` carry
-  `Location: <base>/v1/records/sha256/<hex>.toml` for the active record.
-  Errors use `lwpt-registry-error-v1` with a per-request `request_id`.
+- **Responses.**
+  - Object uploads answer `201` or `204` with an empty body and
+    `ETag: "sha256:<hex>"`, and carry no `Location`. An object is not yet a
+    package record, and one object may serve several records.
+  - Record publication, yank, and restore answer `201` or `204` with
+    `Location: <base>/v1/records/sha256/<hex>.toml`. The location names the
+    record active for that identity once the request completes. A `201`
+    from yank or restore also returns that record as its body, as the spec
+    requires.
+  - Errors use `lwpt-registry-error-v1` with a per-request `request_id`.
+    Their `message` is fixed server text and never echoes request content.
 
 | Status | Code | Cause |
 | --- | --- | --- |
@@ -154,8 +169,8 @@ unchanged:
   (`LWPT.Registry.Mirror.pas:18`) and installer (`LWPT.Install.pas:165`)
   limits, so every published archive can be mirrored and installed.
 - A record body may be at most 64 KiB, and headers stay at 32 KiB.
-- Unreferenced uploads may total at most 1 GiB. The next lease holder deletes
-  uploads older than one hour.
+- Uploads not yet committed, including those in progress, may total at most
+  1 GiB across at most 1,000 entries (see "Upload staging").
 - At most two request bodies may be in flight. The body deadline is 30 seconds
   plus one second per MiB declared.
 - Each token may make 60 mutating requests per minute. Each peer address may
@@ -165,6 +180,47 @@ unchanged:
 Rate state is in memory and resets on restart. The server applies
 authentication, length, and concurrency checks after reading the headers and
 before reading the body.
+
+### Upload staging
+
+Uploads run outside the publication lease. Their ownership and accounting
+therefore rest on operating-system guards and on the directory itself, not
+on memory in one process.
+
+- **Reservation.** After the headers pass authentication and the length
+  check, the server takes the short-lived `registry-incoming` producer lease
+  (ADR-0038). It sums the lengths of every file under `incoming/`. When the
+  declared `Content-Length` still fits the 1 GiB and 1,000-entry budget, it
+  creates `incoming/<upload-id>.part` at exactly that length, then releases
+  the lease. The upload ID is 128 random bits. A file's length is its
+  reservation, so an in-progress upload counts in full from admission.
+  Concurrent admissions, whether in one process or several, are serialized
+  and cannot overcommit. An upload that does not fit gets
+  `507 storage_budget_exceeded` before any body byte is read.
+- **Ownership.** Each upload holds a per-upload producer lease keyed by its
+  upload ID from creation to completion. Liveness is the OS guard, so a
+  `.part` file is never deleted because of its age. The owner deletes its own
+  `.part` on failure, cancellation, digest mismatch, or when its bytes turn
+  out to be an existing object (`204`). Deleting the file releases the
+  reservation.
+- **Reclaiming.** An upload admission or a publication-lease holder may
+  delete another upload's `.part` only after acquiring that upload's lease,
+  which proves the owning process has exited.
+- **Completion.** A verified upload is renamed to `incoming/sha256/<hex>`,
+  keeping its length and therefore its charge. Completed entries are removed
+  only by a publication-lease holder, either when a commit moves them into
+  `objects/` or after one hour without a commit. A commit can therefore never
+  lose its object to cleanup. A record that arrives after cleanup gets `424`,
+  and the client uploads again once.
+- **Failed activation.** The commit moves the object into `objects/` under the
+  publication lease, before activation. If activation then does not happen,
+  the object stays in `objects/` without a reference. It is not served,
+  because serving is membership-based. It no longer counts against the
+  incoming budget. A re-upload of the same bytes answers `204`, and the retried
+  commit references the object in place. Each failed commit leaves at most one
+  such object, and ADR-0043's rule that objects accumulate until a retention
+  design exists covers it. The current `Publish` already leaves the same
+  residue on `identity_conflict`.
 
 ### Commit and atomicity
 
@@ -181,12 +237,35 @@ before reading the body.
 
 The snapshot and checkpoint take the server's clock, never the client's. A
 server clock earlier than the active checkpoint's `published_at` refuses to
-commit. Readers capture one pointer under the generation lock, so they see
-the old or the new signed head and never a mix. The response is sent only
-after the pointer is replaced, which means a lost `201` becomes a `204` on
-retry. The recovery rules from ADR-0043 are unchanged. Files ahead of the
-pointer are not proof, recovery removes numeric checkpoints ahead of it, and
-`.part` uploads left by a killed process are cleaned by the next lease holder.
+commit.
+
+Readers need no new mechanism. An origin request reads `state/current.toml`
+once (`CaptureReadView`, `Store.pas:2436-2445`) and does not take the
+generation lock. Atomic replacement gives it either the complete old
+document or the complete new one. Everything that document names is
+immutable and verified before it is served. Readers therefore see the old or
+the new signed head and never a mix. That existing origin behavior stays
+unchanged. The one read-side addition is the per-head package-list index. It
+follows the mirror pattern: the index is built under the generation lock and
+keyed by the pointer bytes (`LWPT.Registry.Mirror.pas:953-968`), so a delayed
+request cannot install a stale index.
+
+Activation failure follows the code as it stands:
+
+- A failure before the pointer is replaced, including the `checkpoint`
+  failure point (`Store.pas:3049-3051`), leaves the old head served. Numeric
+  checkpoints ahead of the pointer are not proof, and recovery removes them.
+  A retry commits at the same next sequence.
+- A failure after the pointer is replaced, such as the `activation` failure
+  point, which follows the replacement (`Store.pas:3068-3071`), leaves the
+  new head committed and served. Only the derived index is missing or stale.
+  Recovery rebuilds it from the active snapshot, as the existing test expects
+  (`LWPT.Registry.Store.Test.pas:800-826`). The request answers
+  `503 temporary_failure`, and the retry returns `204` with the `Location` of
+  the committed record.
+
+A `201` is sent only after the pointer is replaced, so a lost `201` also
+becomes a `204` on retry.
 Until [#62](https://github.com/frostney/lwpt/issues/62) defines registry
 dependency sources, records keep `dependencies = []` (decision 4). The commit
 path still validates any canonical dependency list, so #62 needs no store
@@ -220,13 +299,30 @@ constant time.
   revoking the old one. Validity periods may overlap. At most 1,000 active
   tokens are supported.
 - The client reads the named environment variable once, after validating the
-  transport, and wipes its buffer after the last request. A missing or
+  transport and the archive, and wipes its buffer after the last request. A missing or
   malformed token fails locally with `credential_missing` or
   `credential_invalid`, naming the variable but never the value. Tokens are
   never read from or written to `lwpt.toml`, `lwpt.lock`, `.lwpt/`, logs, or
-  diagnostics. Server error bodies are printed only as their code and
-  `request_id`, plus the message with control characters stripped and capped
-  at 512 bytes.
+  diagnostics.
+- **Client diagnostics are generated locally.** An origin or proxy can reflect
+  the bearer token in any printable field, and stripping control characters or
+  truncating does not remove it. `publish` therefore never prints a server
+  `message` or status text. It prints its own text, with only these
+  response-derived values:
+  - a `code` that matches `[a-z][a-z0-9_]{0,63}` and is one this ADR or the
+    protocol lists, and otherwise `unrecognized_error`;
+  - a `request_id` that matches `[0-9a-z]{1,64}`;
+  - hashes parsed from `Location` or `ETag` that match the protocol hash
+    grammar;
+  - the origin identity only after the pinned key has authenticated it.
+
+  As a second line of defense, every response-derived value is checked before
+  it is printed, and so is every HTTPClient exception message. This covers
+  the identity, every header value, and every TOML field. Any occurrence of
+  the full token or its secret part is replaced with `[redacted]`.
+- **Server diagnostics are generated locally too.** Server error `message`
+  fields and stderr lines are fixed text plus validated metadata. They never
+  include the raw request target, headers, or body.
 
 ### Audit records
 
@@ -236,7 +332,11 @@ Every mutating request writes one immutable file,
 
 - the request ID, receive and completion times, and the socket peer address
   (forwarded headers are not trusted);
-- the method and route;
+- the method and the **validated** route: its template (for example
+  `/v1/packages/{name}/{version}/yank`) plus parameters that have already
+  passed the name, version, or hash grammar. It is never the raw request
+  target. A target that fails routing is recorded as `route = "invalid"`,
+  so a token misplaced in a path or query is never written;
 - the verified token ID, or empty;
 - the action, name, version, and archive and record hashes;
 - the status and code;
@@ -313,7 +413,9 @@ is a zip. Anything else fails with `unsupported_archive`.
   served.
 
 For both formats, the identity checks and decision 4's dependency rule run
-on the resulting tree. The server never decompresses archives. It binds only
+on the resulting tree. A `[dependencies]` declaration fails with
+`unsupported_dependencies`. All archive validation finishes before the
+token is read or any connection is made. The server never decompresses archives. It binds only
 the hash and size.
 
 ### Zip normalization
@@ -356,9 +458,18 @@ entries, so nothing can hide in the archive:
   (deflate options), 3, and 11 (UTF-8). **Encryption is rejected**: flag
   bits 0 and 6, AES method 99, and every other method or flag. Extra fields
   must parse within their declared lengths and are otherwise ignored.
-- Each entry is inflated with `zinflate`. It must produce exactly its
-  declared size, and inflation stops one byte past that size. The entry's
-  CRC-32 must also match.
+- **Payload decoding** works on exactly the compressed slice the central
+  directory declares, from the data offset through the compressed size.
+  - Method 8 is inflated with `zinflate`. The stream must reach
+    `Z_STREAM_END` exactly when the slice is consumed (`avail_in = 0`) and
+    the output reaches the declared uncompressed size. Four cases are
+    rejected: a stream that ends early or is truncated (the slice is
+    exhausted before `Z_STREAM_END`); compressed bytes left after
+    `Z_STREAM_END`; output short of the declared size; and output past it,
+    where inflation stops one byte past the size.
+  - Method 0 is never passed to the inflater. It copies exactly the declared
+    bytes, and the compressed size must equal the uncompressed size.
+  - Both methods then require the CRC-32 to match.
 
 **Entry rules.** These are the tar preflight's rules applied to each name,
 followed by rules that the canonical form needs:
@@ -367,12 +478,28 @@ followed by rules that the canonical form needs:
   `/`, as the installer does.
 - The same rules reject empty, absolute (`/`, `\`, or a drive letter), and
   `..` paths, and any component longer than 255 bytes.
-- `.` and empty components are rejected as well.
-- Duplicate names are rejected. Names that collide after ASCII case folding
-  are also rejected on every platform, so a package extracts the same way on
-  case-insensitive Windows and macOS.
+- `.` and empty components are rejected as well. The single terminal `/`
+  that marks a directory entry is not a component. Consecutive slashes, as
+  in `a//`, and `/` on its own are rejected.
 - Only regular files and directories are allowed. A directory name ends
   with `/`, has size 0, and has CRC 0.
+
+**Namespace rules.** These are checked once over the whole normalized tree,
+after the package-root mapping below. The tree holds every explicit entry and
+every parent directory that an entry implies, because the tar writer emits
+those parents too:
+
+- No path may be both a file and a directory, whether explicit or implied. A
+  file `a` next to `a/b` is rejected, and so is a file `a` next to an entry
+  `a/`.
+- No file may be an ancestor of another entry.
+- Duplicate explicit names are rejected. An explicit directory entry that
+  matches an implied parent is accepted, because the paths are
+  byte-identical.
+- No two distinct paths in the tree may be equal after ASCII case folding.
+  This includes implied directories, so `A/x` and `a/y` collide through
+  `A/` and `a/`. The rule holds on every platform, so a package extracts the
+  same way on case-insensitive Windows and macOS.
 - When the creating host is Unix (3), the file type in the upper 16 bits of
   the external attributes must be regular, directory, or unset. Symlinks,
   devices, FIFOs, and sockets are rejected. When the host is MS-DOS (0), the
@@ -435,7 +562,7 @@ allowed only as a new, documented normalizer version.
 toolchain, so the zip reader is written in-tree on `zinflate` and `crc`, as
 `LWPT.Gzip` already is. The cross toolchain compiles paszlib's `zstream.pp`
 (`toolchain.yml:377-384`), and that unit's implementation uses `zdeflate`
-(`zstream.pp:120-122`). `zdeflate` is therefore already built for every
+(`zstream.pp:116` in FPC 3.2.2). `zdeflate` is therefore already built for every
 target. The implementation PR adds it to the `require_unit` guards in
 `ci.yml` and `release.yml`, which assert only `zstream` today. The
 deterministic tar writer is written once. The directory-packing follow-up
@@ -462,22 +589,49 @@ The implementation PR applies these amendments; this ADR does not.
   - List `method_not_allowed` (405), `payload_too_large` (413), and
     `storage_budget_exceeded` (507).
   - Replace ADR-0043's "package lists and remote publication remain #54".
+- **Conformance corpus** (`tests/fixtures/registry/v1/outcome-cases.toml`,
+  with the matching `endpoint-cases.toml` entries). The corpus changes with
+  the spec, because the new identity rules change what some existing cases
+  mean.
+  - `package-identity-conflict` currently sends
+    `records/ac8180e8….toml`. That record differs from the active 1.1.0 record
+    only in `yanked` and `published_at`, so under this ADR it is not a
+    content conflict. The case moves to a new request fixture for
+    `example-lib` 1.1.0 with a different `archive` and `archive_size`, which
+    is genuinely different content, and still expects
+    `409 identity_conflict`.
+  - A new case, `publish-yanked-record-rejected`, sends that same
+    `ac8180e8…` record and expects `400 invalid_request`: yanking through
+    publication is forbidden.
+  - A new case, `publish-timestamp-only-retry`, sends
+    `records/7802b04a….toml`. It matches the active `3ed9d3d8…` record
+    except for `published_at`, and it expects `204` with the `Location` of
+    the active record.
+  - Conformance runs of new-version publication (`publish-package-created`)
+    set the registry test clock (`SetRegistryClockForTesting`) to the
+    fixture's `published_at`, so the five-minute skew rule does not depend
+    on when the test runs.
 
 ### Test plan
 
 | Acceptance criterion | Evidence |
 | --- | --- |
 | A CI client publishes to a running origin | E2E: `registry init`, then `serve`, then `issue-token`, then `publish` over localhost HTTP. The server PID stays the same and served reads show the new head. |
-| Readers see the old or new head | E2E: a reader loop verifies every checkpoint, signature, and snapshot with the shared verifier while `publish` holds the publication barrier. Store test: `checkpoint` and `activation` failure points leave the old head. |
-| Crash mid-publish | E2E: kill `serve` at the barrier, restart, get the old head, retry, and get `201` at the same next sequence. Kill during an upload, and the `.part` file is reclaimed. |
+| Readers see the old or new head | E2E: a reader loop verifies every checkpoint, signature, and snapshot with the shared verifier while `publish` holds the publication barrier. Store test: the `checkpoint` failure point leaves the old head, and a retry commits at the same next sequence. The `activation` failure point, which comes after the pointer replacement, leaves the new head served and the index missing. Recovery rebuilds the index, and a retry returns `204` (extending `LWPT.Registry.Store.Test.pas:800-826`). |
+| Crash mid-publish | E2E: kill `serve` at the barrier, restart, get the old head, retry, and get `201` at the same next sequence. Kill during an upload: the `.part` file is reclaimed only after its upload lease is free. A live upload's `.part` survives a concurrent admission and commit. |
+| Upload accounting | Two admissions that would together exceed 1 GiB: exactly one proceeds and the other gets `507`. An in-progress upload counts at its declared length. A digest mismatch, an abort, or an existing object releases its reservation. An object moved into `objects/` before a failed activation is unserved, answers `204` on re-upload, and is referenced by the retried commit. |
 | Identical retry succeeds | Same archive, a fresh `published_at`, and a lost-response retry each return `204` with an unchanged sequence and exit 0. |
-| Conflicting content rejected | A different archive for an existing version returns `409 identity_conflict`, leaves the sequence unchanged, writes an audit record, and exits 1. |
-| Credentials scoped, never printed or persisted | Out-of-scope package returns 403. Revoked and expired tokens return 401. Every command's stdout and stderr, the audit files, the data directory (hash only), and the project tree are searched for the secret. `lwpt.lock` and `.lwpt/` stay unchanged. |
-| Deterministic limits and authentication | Missing or malformed token returns 401 with the challenge. 413 comes before the body is read. A missing length returns 400. The rate bounds, through `REGISTRY_TESTING` seams (ADR-0044), return 429 with `Retry-After`. The 507 budget and a lease busy past its wait each return their code. |
+| Conflicting content rejected | A different archive for an existing version returns `409 identity_conflict`, leaves the sequence unchanged, writes an audit record, and exits 1. The amended corpus cases pass: genuine-content `409`, yanked-record `400`, and timestamp-only `204`. |
+| Dependency-bearing archives refused (decision 4) | A tar.gz and a zip whose `lwpt.toml` declares `[dependencies]` each fail locally with `unsupported_dependencies`. A mock origin records no connection, and the token variable is never read. |
+| Yank and restore endpoints | A token without the `yank` action, or without a matching pattern, returns 403. Yanking an active version returns `201` with the new record body and `Location`. Repeating it returns `204`. Restoring returns `201`, and repeating that returns `204`. An absent version returns 404. Every replacement record keeps the archive, size, and dependencies. Only `yanked` and `published_at` change, and the old record stays retrievable by hash. |
+| Credentials scoped, never printed or persisted | Out-of-scope package returns 403. Revoked and expired tokens return 401. The secret is searched for in every command's stdout and stderr, the audit files, the data directory (hash only), and the project tree. The one exemption is `issue-token`'s single intended stdout line. `lwpt.lock` and `.lwpt/` stay unchanged. |
+| Responses echoing the credential | A mock origin reflects the `Authorization` value in its error `message`, `code`, `request_id`, status text, `Location`, `ETag`, `Retry-After`, discovery `origin`, and the text of a transport error. `publish` output never contains the token or its secret; an invalid `code` prints as `unrecognized_error`. A token sent in a request path or query on the server leaves `route = "invalid"` in the audit record and appears in no stderr line. |
+| Token expiry bounds | `issue-token` without `--expires-days` sets 90 days. 1 and 365 are accepted. 0, 366, and non-decimal values fail with `invalid_configuration`. A token presented after `expires_at` returns 401. |
+| Deterministic limits and authentication | A missing `--key-id` or `--public-key` fails with `invalid_configuration` before any connection. A missing or malformed token returns 401 with the challenge. 413 comes before the body is read. A missing length returns 400. The rate bounds, through `REGISTRY_TESTING` seams (ADR-0044), return 429 with `Retry-After`. The 507 budget and a lease busy past its wait each return their code. |
 | Localhost HTTP and remote HTTPS | The E2E matrix runs on every release platform, including both macOS transports. HTTPS uses `localhost-native-identity.p12`, and the client trusts the committed test root through #302 in the `lwpt-testing` build only. Plain HTTP to a non-localhost host fails before connecting. |
 | Zip normalization is deterministic | Golden fixtures produce the pinned tar.gz hash on every release platform. The same zip converted twice gives identical bytes. Zips that differ only in entry order, timestamps, stored versus deflate, data descriptors, or comments give the same bytes as each other. |
-| Zip features are rejected | Each fails locally with its stable code and no connection: encryption (bits 0 and 6, AES), ZIP64 in each form, multi-disk, unsupported methods and flags, prepended or trailing data, gaps, overlapping entries, local and central mismatch, a descriptor mismatch, and a bad CRC. |
-| Zip entries are rejected | Each fails locally: symlink, device, FIFO, socket, volume label, absolute and drive paths, `..`, `.`, empty components, a duplicate or ASCII case-colliding name, a component over 255 bytes, a path not fitting ustar, invalid UTF-8, and a missing or ambiguous `lwpt.toml` root. |
+| Zip features are rejected | Each fails locally with its stable code and no connection: encryption (bits 0 and 6, AES), ZIP64 in each form, multi-disk, unsupported methods and flags, prepended or trailing data, gaps, overlapping entries, local and central mismatch, a descriptor mismatch, and a bad CRC. Negative decoding fixtures: a truncated deflate stream, a stream ending before its slice is consumed, compressed bytes left after `Z_STREAM_END`, output short of or past the declared size, a stored entry whose sizes differ, and a stored entry with a bad CRC. |
+| Zip entries are rejected | Each fails locally: symlink, device, FIFO, socket, volume label, absolute and drive paths, `..`, `.`, empty components, `a//`, a lone `/`, a duplicate name, a component over 255 bytes, a path not fitting ustar, invalid UTF-8, and a missing or ambiguous `lwpt.toml` root. Namespace conflicts: file `a` with `a/b`, file `a` with entry `a/`, a case collision between explicit names, and one between implied directories (`A/x` with `a/y`). An explicit `a/` beside `a/b` is accepted. |
 | Zip limits are enforced | Inputs just over 256 MiB, 10,001 entries, and 1 GiB declared fail before inflation. An entry that inflates past its declared size fails at that byte. Output over 256 MiB fails. All fail with `archive_limit_exceeded`. |
 | A zip retry is idempotent | E2E: publishing a zip gives `201`. Publishing the same zip again gives `204` with the same archive hash. Uploading the tar.gz normalized from it also gives `204`. The project tree is unchanged, and a conversion failure against an unreachable origin makes no connection. |
 | Transparency (maintainer amendment) | Inclusion and consistency after `201`/`204`. A stale or downgraded checkpoint after commit fails. A tampered signature or snapshot fails even though the server returned `201`. Offline and frozen: `publish` has no offline mode, and `install --frozen`/`--offline` never contact the publication API. Consumer-side offline proofs stay with #62. |
