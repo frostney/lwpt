@@ -153,17 +153,28 @@ separated by `/`, and has no leading or trailing separator and no `.` or `..`
 component. The path is hashed as UTF-8 bytes:
 
 - On POSIX, the name bytes are used as the filesystem reports them.
-- On Windows, the UTF-16 names are converted to UTF-8. The conversion must
-  not go through the ANSI code page.
+- On Windows, the UTF-16 names are converted to UTF-8 strictly. The
+  conversion must not go through the ANSI code page, and it must reject
+  malformed UTF-16 rather than repair it: `WideCharToMultiByte(CP_UTF8,
+  WC_ERR_INVALID_CHARS, …)` or an equivalent validating conversion. An
+  unpaired high or low surrogate is an error and is never replaced with
+  U+FFFD. Replacement would map distinct names, such as one holding U+D800
+  and one holding U+DC00, to the same valid UTF-8 path, and validating the
+  output alone cannot detect that. A correctly paired surrogate, such as
+  U+1D518 (`35d8 18dd` in UTF-16LE), becomes its four-byte UTF-8 form
+  `f09d9498`.
 - A path that is not well-formed UTF-8, or that contains NUL, is an error
-  that names the path in escaped form. Such a tree cannot hash the same on
+  that names the path in escaped form. On Windows the same applies to a
+  name that is not well-formed UTF-16. Such a tree cannot hash the same on
   every platform, so the digest fails closed.
 - There is no Unicode normalization. Paths are hashed as stored.
 
 **Order.** `TreeHashPathCompare` applied to the UTF-8 path bytes, unchanged.
 Once entries are framed, any deterministic platform-independent order would
 work. Keeping the existing order avoids a third ordering and keeps diagnostics
-aligned with v3.
+aligned with v3. The comparator's ordinal tiebreak orders paths that differ
+only in ASCII case, such as `A.pas` before `a.pas`, whatever order the
+filesystem enumerates them in.
 
 **Per-file content digest.** For each file:
 
@@ -190,13 +201,19 @@ For example, a file `alpha.txt` holding `alpha` is the record
 `8ed3f6ad…2223f8`.
 
 **Why the encoding is unambiguous.** `magic` has a fixed length. Every
-record starts with a fixed-size header that gives the lengths of its only
+record starts with a fixed-size header that gives the length of its only
 variable-length field, and the rest of the record is fixed-size. A stream
 therefore decodes into exactly one sequence of `(path, size, digest)`
-records. Two trees with different sets of paths, or with the same paths but
-different normalized contents, produce different streams. Their digests can
-be equal only through a SHA-256 collision. Two contents that normalize to
-the same bytes, such as the CRLF and LF forms of one text, still share a
+records: the framing is injective over such sequences, and the record
+boundaries also fix the file count. It is not injective over file contents
+directly, because two equal-length contents that collide under the inner
+SHA-256 give identical records. The guarantee is therefore conditional:
+assuming SHA-256 is collision-resistant, equal tree digests imply equal
+covered trees, meaning the same paths with the same normalized contents. A
+collision would be needed at either layer, in a per-file digest or in the
+outer stream digest, to break it. Unlike v3, no collision-free
+rearrangement of bytes produces equal digests. Two contents that normalize
+to the same bytes, such as the CRLF and LF forms of one text, still share a
 digest, as they did in v3. `size` is redundant with `digest` for integrity.
 It costs eight bytes and states the content length that #352 asked the
 encoding to make explicit.
@@ -255,6 +272,19 @@ independently.
 | `cr.txt`=`a` CR `b` CR (lone CRs kept) | `62f79a9f6fe3a6805be13d8d9a6040422b06f6bf9c39e172693c0d52f4831f8c` | `6767b67a1459191651578f01c861b4e6b7681825da5449dbdb7087c74bb1b5eb` |
 | `empty.pas` with no bytes | `7de1b0d19b3467c2191240d86d4479c6635e73c0c30cb99f005e3213c45a17bb` | `86d302c47f0b9d1c94fd0385467be28c3d31fef8f03df93345c0203295b9df32` |
 | `süß.pas` (UTF-8 `73 c3bc c39f 2e706173`)=`unit s;` LF | `2ac8aeee577349918473caaebe1f3cd79a1cd83c749c1c2a0c80969a206b9616` | `8398b468076302b8f9cf0a930f6e7d129f7201c6896bafabe2674385c7a25069` |
+| Supplementary plane: U+1D518 followed by `.pas` (UTF-8 `f09d9498 2e706173`)=`unit u;` LF | `d4beb95e5f9d918a1a7beddc50331157c88d431063f5e3d3483520594ffa10bb` | `07c9aecdbc478349c8f2c275ff6e01717a166118cd2e2e8f1089b9be5486fe8a` |
+| Case collision: `A.pas`=`unit A;` LF and `a.pas`=`unit a;` LF, supplied in either enumeration order; the tiebreak puts `A.pas` first | `c179b461d81015e4bfdcaa89a916b3b84f473b00f4466ee5412f8cda08b39d37` | `ce003a228b9696df3a9f38e525a88fc8e295feb855f7850e9ac49a6615c4256a` |
+
+Without the ordinal tiebreak, `a.pas` could precede `A.pas`, and the
+case-collision tree would hash to `sha256-tree2:7a033516…4ea0a` instead. None
+of the other vectors would change, so only this row exercises the tiebreak.
+Default Windows and macOS filesystems cannot hold both names. The on-disk
+vector is therefore pinned on case-sensitive filesystems (the Linux legs).
+On every platform, the comparator is also tested directly on an in-memory
+path list supplied in both input orders, with no filesystem involved.
+
+Names with an unpaired surrogate have no vector: `tree2` rejects them, as
+described under "Paths".
 
 ### 3. Lockfile schema v4
 
@@ -385,8 +415,23 @@ runs under the install lock as an install transaction (retention, rollback,
    every `computedHash`, and, because the lock changes, each registry
    origin's recorded accepted state where per-user state had advanced
    (decision 11).
-5. **Handle failures.** A missing archive or proof fails with the
-   `--offline` hint and rolls back, and the lock stays v3.
+5. **Handle failures.** Any failure rolls the transaction back, and the
+   lock stays v3. The `--offline` hint does not fit here, because it
+   suggests an online `lwpt install`, which refuses the remaining v3 lock
+   and points back to repair. A missing anchor, or one whose hash does not
+   match, therefore fails with a migration-specific `ELockfileError`
+   message instead. For example, for an archive:
+
+   > `lwpt repair` cannot upgrade `lwpt.lock` from schema v3: the archive
+   > for "json" at `.lwpt/archives/json-1.3.0.tar.gz` is missing or does not
+   > match its locked `archiveHash`, and the per-user cache has no matching
+   > copy. Restore that exact archive, for example from version control,
+   > and run `lwpt repair` again. To give up the version-stable migration,
+   > delete `lwpt.lock` and run `lwpt install`; that needs network access
+   > and moves range dependencies to their newest matching versions.
+
+   A missing or corrupt registry proof document gets the same message,
+   naming the document's hash path instead of the archive.
 
 After the upgrade, decision 11 holds: an install that changes nothing leaves
 the v4 lock byte-identical on every platform.
@@ -430,7 +475,21 @@ The implementation PR applies these in the same change as the code.
   text below. It includes PR #351's registry clause; if #351 has not merged
   first, drop the clause beginning "for registry entries".
 
-  > - **`lwpt.lock` is machine-written, schema v4.** Never hand-edit. The schema records the verbatim manifest source string, the resolver's chosen ref (tag/SHA), the actual archive URL, the extracted tree's framed digest (`computedHash = "sha256-tree2:<hex>"`: per file, a length-prefixed UTF-8 path, the normalized content length, and the normalized content's SHA-256, in the cross-platform `TreeHashPathCompare` order, with CRLF→LF normalization for NUL-free files), and the cached-archive sha256. Registry entries add `registryOrigin` and `registryRecord`, and one `[registry."<identity>"]` table per origin records the pinned key id, the selection proof's checkpoint, and the recorded accepted state and clock floor; a byte-identical lock is never rewritten ([ADR-0051](./docs/adr/0051-registry-dependency-sources.md)). `--frozen` re-hashes the archive + tree, compares both to the stored hashes, and refuses any link inside an installed module; for registry entries, `--frozen` and `--offline` also verify the committed selection proof from the manifest pin, and `--frozen` re-derives the module tree from the proof-authenticated archive, because `computedHash` is unsigned. v1 and v2 lockfiles fail to load with a clear migration hint. A v3 lockfile is a hard error too: every command that reads the lock (`install`, `add`, `remove`, `update`, `outdated`, `--frozen`, `--offline`) refuses it and changes nothing, pointing to `lwpt repair`, the only command that upgrades v3 to v4 — without network and without changing dependency versions, by re-deriving every module from its archive or source and never trusting the v3 tree hash. Corrupt lockfile → delete + re-run `lwpt install` to regenerate. See [ADR-0008](./docs/adr/0008-lockfile-schema-v2-archive-hash.md) (v1→v2 archiveHash split), [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md) (v2→v3 source-syntax refactor), and [ADR-0052](./docs/adr/0052-lockfile-schema-v4-framed-tree-digest.md) (v3→v4 framed tree digest). Any further schema break requires an ADR that ships a machine migration from the previous schema; "delete the lockfile and reinstall" is not a migration.
+  > - **`lwpt.lock` is machine-written, schema v4.** Never hand-edit. The schema records the verbatim manifest source string, the resolver's chosen ref (tag/SHA), the actual archive URL, the extracted tree's framed digest (`computedHash = "sha256-tree2:<hex>"`: per file, a length-prefixed, strictly validated UTF-8 path (malformed UTF-16 names on Windows are rejected, never replaced), the normalized content length, and the normalized content's SHA-256, in the cross-platform `TreeHashPathCompare` order, with CRLF→LF normalization for NUL-free files), and the cached-archive sha256. Registry entries add `registryOrigin` and `registryRecord`, and one `[registry."<identity>"]` table per origin records the pinned key id, the selection proof's checkpoint, and the recorded accepted state and clock floor; a byte-identical lock is never rewritten ([ADR-0051](./docs/adr/0051-registry-dependency-sources.md)). `--frozen` re-hashes the archive + tree, compares both to the stored hashes, and refuses any link inside an installed module; for registry entries, `--frozen` and `--offline` also verify the committed selection proof from the manifest pin, and `--frozen` re-derives the module tree from the proof-authenticated archive, because `computedHash` is unsigned. v1 and v2 lockfiles fail to load with a clear migration hint. A v3 lockfile is a hard error too: every command that reads the lock (`install`, `add`, `remove`, `update`, `outdated`, `--frozen`, `--offline`) refuses it and changes nothing, pointing to `lwpt repair`, the only command that upgrades v3 to v4 — without network and without changing dependency versions, by re-deriving every module from its archive or source and never trusting the v3 tree hash. Corrupt lockfile → delete + re-run `lwpt install` to regenerate. See [ADR-0008](./docs/adr/0008-lockfile-schema-v2-archive-hash.md) (v1→v2 archiveHash split), [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md) (v2→v3 source-syntax refactor), and [ADR-0052](./docs/adr/0052-lockfile-schema-v4-framed-tree-digest.md) (v3→v4 framed tree digest). Any further schema break requires an ADR that ships a machine migration from the previous schema; "delete the lockfile and reinstall" is not a migration.
+
+- **AGENTS.md, Safety / Boundaries.** The bullet on committed state limits
+  changes to `.lwpt/modules/` and `.lwpt/archives/` to `lwpt install` and
+  its `add` and `remove` frontends. `lwpt repair`'s migration publishes
+  re-derived modules and can restore an archive from the per-user cache, so
+  add one sentence that permits exactly that case and nothing else:
+
+  > `lwpt repair` writes this state only to upgrade a schema-v3 lockfile to v4 ([ADR-0052](./docs/adr/0052-lockfile-schema-v4-framed-tree-digest.md)): through the install transaction, under the install lock, it re-derives each locked module from its verified archive, proof, or source and republishes the modules, archives, proofs, cfg, and lockfile. It never runs on a v4 lockfile and never resolves or fetches.
+
+- **`docs/quick-start.md`, "Recovery from a crashed install".** Replace
+  "Repair never touches `.lwpt/modules/`, `.lwpt/archives/`, or the last
+  successfully published build output." with:
+
+  > Repair never touches the last successfully published build output. It changes `.lwpt/modules/`, `.lwpt/archives/`, and `lwpt.lock` only when the lockfile is schema v3: it then upgrades the lockfile to v4 without network access and without changing dependency versions, re-deriving each module from its committed archive or source ([ADR-0052](./adr/0052-lockfile-schema-v4-framed-tree-digest.md)). Commit the resulting `lwpt.lock`.
 
 - **`docs/architecture.md`, "Lockfile schema".** Retitle the section v4.
   Update:
@@ -453,18 +512,19 @@ The implementation PR applies these in the same change as the code.
 
 | Criterion | Evidence |
 | --- | --- |
-| The digest matches the specification | `LWPT.Core.Test.pas` pins every vector in section 2 on all six targets. The Windows legs build the `süß.pas` fixture through the UTF-16 API. |
+| The digest matches the specification | `LWPT.Core.Test.pas` pins every vector in section 2 on all six targets, except that the on-disk case-collision vector is pinned on the Linux legs. The Windows legs build the `süß.pas` and U+1D518 fixtures through the UTF-16 API, so the supplementary-plane name exercises surrogate-pair conversion. |
+| The case tiebreak is pinned | On every target, a unit test sorts the in-memory list `a.pas`, `A.pas` and the list `A.pas`, `a.pas` with `TreeHashPathCompare`; both give `A.pas`, `a.pas`. On the Linux legs, the two-file tree hashes to the pinned `ce003a22…` whichever order it was created in. |
 | #352's substitution changes the digest | Unit test: the two trees from section 2 give equal legacy digests and different `tree2` digests. Integration, once for each source kind (local, workspace, git-host fixture, URL, registry): install the `json` package, apply the substitution in `.lwpt/modules/json`, and `--frozen` fails with a tree-hash mismatch while the lock and archives are byte-identical. |
 | Streaming equals the buffered definition | For sizes of chunk − 1, chunk, and chunk + 1: a CR as the last byte of a chunk followed by an LF, a CR at end of file, a NUL only in the last chunk after CRLFs in the first, and an empty file. Each per-file digest equals `SHA-256(NormalizeTreeHashContent(whole file))`. |
 | The tree is not buffered | Hashing a tree with one 64 MiB file raises peak heap use (FPC heap status) by less than 1 MiB. |
 | Cross-platform identity | The CRLF and LF trees give one digest, the fold-order vector holds on Windows, and CI's `install --frozen` passes on all six targets against the upgraded LWPT lock. |
-| Invalid paths fail closed | On POSIX, a file name that is not well-formed UTF-8 fails the digest and the error names the escaped path. |
+| Invalid paths fail closed | On POSIX, a file name that is not well-formed UTF-8 fails the digest, and the error names the escaped path. On Windows, names containing a lone high surrogate (U+D800), a lone low surrogate (U+DC00), or a reversed pair (U+DC00 U+D800) each fail the digest with an error naming the escaped UTF-16 name. A tree holding two such names that U+FFFD replacement would merge also fails, and never yields a digest. |
 | Inventory and links | A `CopyDirTree` copy of a tree with a file link and a directory link has the same `tree2` digest as the original, so rollback retention succeeds. `--frozen` fails, naming the path, for a file link, a directory link, and a dangling link inside an installed module. |
 | v4 writer and loader | An install writes `version = 4` and `sha256-tree2:` values. The lock round-trips. A v4 lock with one `sha256:` `computedHash` fails to load and names the entry. A `version = 5` lock fails with the "reads up to v4" message. The v1 and v2 hints are unchanged. |
 | Every command refuses v3 and changes nothing | Against a committed v3 fixture project (git-host, local, workspace, and registry entries, plus an interrupted transaction's rollback files): `install`, `add`, `remove`, `update`, `outdated`, `install --frozen`, and `install --offline` each fail with the `ELockfileError` message, which names `lwpt repair` and the delete-and-install alternative. The transport seam records zero requests. `lwpt.toml`, the lock, the cfg, modules, archives, proofs, and `.lwpt/tmp/` are byte-identical afterwards. |
 | `lwpt repair` upgrades without network and without moving versions | The fixture advertises a newer satisfying tag, and the transport seam records zero requests. Afterward: `resolvedRef` and `resolvedCommit` are unchanged; modules and archives are byte-identical; the lock diff contains only `version`, `computedHash`, and decision-11 accepted-state lines; `--frozen` passes. In a registry project, the selection proof is carried forward byte for byte. |
 | No churn after the upgrade (decision 11) | After `lwpt repair`, an online `install` with an unchanged selection and an `install --offline` both leave the v4 lock byte-identical. The same holds when the lock written on Linux is installed on the Windows and macOS legs. |
-| `lwpt repair` never trusts the v3 hash | A committed module altered by the #352 substitution under a v3 lock, with its `computedHash` recomputed to the matching legacy value, is replaced by the re-derived tree and named in the output. A missing archive fails with the `--offline` hint, rolls back, and leaves the lock v3. A manifest that disagrees with the lock fails with its hint and leaves the lock v3. A v4 lock is left untouched. |
+| `lwpt repair` never trusts the v3 hash | A committed module altered by the #352 substitution under a v3 lock, with its `computedHash` recomputed to the matching legacy value, is replaced by the re-derived tree and named in the output. A missing archive and an archive with a flipped byte, with no copy in the per-user cache, each fail with the migration-specific message from section 5. The test asserts the full text: the archive path, "run `lwpt repair` again", and the delete-and-install alternative with its network and version warning. A deleted registry proof document fails with the same message naming its hash path. Each failure rolls back and leaves the lock v3 and every other file byte-identical. A manifest that disagrees with the lock fails with its hint and leaves the lock v3. A v4 lock is left untouched. |
 | Downgrade | A v4 lock rewritten as v3 with legacy digests of a forged tree is refused by `--frozen` and every other reader, and `lwpt repair` replaces the forged tree. |
 | Legacy rollback files | A pending transaction whose rollback file holds `tree:sha256:` is recovered by `lwpt repair` on a v3 lock, and by `install` once the lock is v4. |
 | Existing behavior | The existing install, offline, frozen, commit-pin, and registry suites pass after their expected `computedHash` values are updated. The only golden-lock differences are `version` and `computedHash`. |
