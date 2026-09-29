@@ -120,22 +120,18 @@ uses
 
   HTTPClient,
   LWPT.ProducerLease,
+  LWPT.Registry.Client,
   LWPT.Registry.Filesystem,
   TOML;
 
 const
-  MirrorRequestTimeoutMilliseconds = 120 * 1000;
+  MirrorRequestTimeoutMilliseconds = RegistryRequestTimeoutMilliseconds;
   { Bounds one complete synchronization, including every metadata request and
     archive transfer. Each request uses the smaller remaining budget. }
   MirrorSynchronizationMilliseconds = 60 * 60 * 1000;
   MirrorAttemptPath = 'state/sync-attempt.toml';
   MaximumMirrorArchiveWorkers = 2;
-  { A checkpoint and its signature come from two mutable latest URLs. Retry
-    only while the checkpoint itself advances between the reads. }
-  MirrorCheckpointPairAttempts = 3;
   MirrorProofPrefix = 'proofs/sha256/';
-  MirrorLocalHTTPPrefix = 'http://localhost';
-  MirrorLoopbackAddress = '127.0.0.1';
   { Upper bound of one persisted attempt record, including a truncated error. }
   MirrorAttemptRecordBytes = 2048;
   MirrorAttemptErrorCharacters = 1024;
@@ -233,76 +229,24 @@ begin
     Length(APath) - Length(APrefix) - Length(ASuffix));
 end;
 
-{ The development exception for plain HTTP names exactly localhost. Connect to
-  the loopback address directly instead of trusting resolver configuration,
-  matching the listener, which binds localhost as 127.0.0.1. The URL keeps
-  its authority, so the Host header still names localhost. }
-function MirrorConnectAddress(const AURL: string): string;
-begin
-  Result := '';
-  if StartsStr(MirrorLocalHTTPPrefix, AURL)
-    and ((Length(AURL) = Length(MirrorLocalHTTPPrefix))
-      or (AURL[Length(MirrorLocalHTTPPrefix) + 1] in [':', '/', '?'])) then
-    Result := MirrorLoopbackAddress;
-end;
-
 {$IFDEF REGISTRY_TESTING}
 function RegistryMirrorConnectAddressForTesting(const AURL: string): string;
 begin
-  Result := MirrorConnectAddress(AURL);
+  Result := RegistryConnectAddress(AURL);
 end;
 {$ENDIF}
 
+{ The mirror has no destination policy beyond its configured upstream and
+  bounds every request by the remaining synchronization budget. }
 function GetDocument(const AURL, AMediaType: string;
   const AMaximumBytes: Int64; const ATimeoutMilliseconds: QWord): TBytes;
-var
-  Options: THTTPRequestOptions;
-  Headers: THTTPHeaders;
-  Response: THTTPResponse;
-  Header: THTTPHeader;
-  ContentType, CanonicalBase: string;
 begin
-  CanonicalBase := AURL;
-  if Pos('?', CanonicalBase) > 0 then
-    CanonicalBase := Copy(CanonicalBase, 1, Pos('?', CanonicalBase) - 1);
-  if not RegistryURIIsCanonical(CanonicalBase, True) or (Pos('#', AURL) > 0) then
-    raise ELWPTRegistryError.CreateStable('invalid_registry_uri', 'noncanonical request URI');
+  RequireRegistryRequestURI(AURL);
   if ATimeoutMilliseconds = 0 then
     raise ELWPTRegistryError.CreateStable('mirror_sync_deadline_exceeded',
       'synchronization exceeded its total time budget');
-  Options := DefaultHTTPRequestOptions;
-  Options.MaxResponseBodyBytes := AMaximumBytes;
-  Options.RequestTimeoutMilliseconds := ATimeoutMilliseconds;
-  { Discovery endpoints are scoped to the configured transport. Never follow
-    a redirect before checking its target's transport and scope. }
-  Options.MaximumRedirects := 0;
-  Options.ConnectAddress := MirrorConnectAddress(AURL);
-  SetLength(Headers, 1);
-  Headers[0].Name := 'Accept';
-  Headers[0].Value := AMediaType;
-  try
-    Response := HTTPGet(AURL, Headers, Options);
-  except
-    on E: EHTTPError do
-      raise ELWPTRegistryError.CreateStable('registry_transport_failed', E.Message);
-  end;
-  if Response.StatusCode <> 200 then
-    raise ELWPTRegistryError.CreateStable('registry_transport_failed',
-      'upstream returned HTTP ' + IntToStr(Response.StatusCode));
-  ContentType := '';
-  for Header in Response.Headers do
-  begin
-    if SameText(Header.Name, 'Content-Type') then ContentType := LowerCase(Trim(Header.Value));
-    if SameText(Header.Name, 'Content-Encoding') and (Header.Value <> '') then
-      raise ELWPTRegistryError.CreateStable('registry_content_encoding_forbidden',
-        'hashes require exact protocol bytes');
-  end;
-  if Pos(';', ContentType) > 0 then
-    ContentType := Trim(Copy(ContentType, 1, Pos(';', ContentType) - 1));
-  if ContentType <> AMediaType then
-    raise ELWPTRegistryError.CreateStable('registry_media_type_mismatch',
-      'upstream returned an unexpected media type');
-  Result := Response.Body;
+  Result := GetRegistryDocument(AURL, AMediaType, AMaximumBytes,
+    ATimeoutMilliseconds, Default(THTTPDestinationPolicy));
 end;
 
 constructor TLWPTMirrorArchiveWorker.Create(const AAPI: string;
@@ -771,15 +715,6 @@ begin
   if Assigned(Progress) then Progress;
 end;
 
-procedure RememberRetrieval(var AProof: TLWPTRegistryProof; const ABytes: TBytes);
-var
-  Index: Integer;
-begin
-  Index := Length(AProof.RetrievalDocuments);
-  SetLength(AProof.RetrievalDocuments, Index + 1);
-  AProof.RetrievalDocuments[Index] := ABytes;
-end;
-
 function TLWPTRegistryMirror.VerifyStateProof(const AState: TLWPTRegistryState;
   AProgress: TSHA256Progress): TLWPTVerifiedRegistry;
 var
@@ -810,7 +745,7 @@ var
     if SHA256BytesPrefixed(Result) <> AHash then
       raise ELWPTRegistryError.CreateStable('resource_hash_mismatch',
         'retained proof document does not match its accepted hash');
-    if AAuxiliary then RememberRetrieval(Proof, Result);
+    if AAuxiliary then RememberRegistryRetrieval(Proof, Result);
   end;
 begin
   Prefix := 'checkpoints/renewals/sha256/' + Copy(AState.CheckpointHash, 8, 64);
@@ -1036,80 +971,74 @@ begin
   end;
 end;
 
+type
+  { Mirror acquisition: requests share the synchronization budget, and each
+    accepted rotation is retained with its key record as it verifies. }
+  TLWPTMirrorAcquisition = class(TLWPTRegistryAcquisition)
+  protected
+    function Fetch(const AURL, AMediaType: string;
+      const AMaximumBytes: Int64): TBytes; override;
+    procedure RotationAccepted(const ARotation: TLWPTRegistryRotationProof;
+      const ASequence: Int64; const AKeyDocument: TBytes); override;
+  public
+    Mirror: TLWPTRegistryMirror;
+    Bindings: TLWPTRegistryRotationBindingArray;
+  end;
+
+function TLWPTMirrorAcquisition.Fetch(const AURL, AMediaType: string;
+  const AMaximumBytes: Int64): TBytes;
+begin
+  Result := GetDocument(AURL, AMediaType, AMaximumBytes,
+    Mirror.RemainingSynchronizationMilliseconds);
+end;
+
+procedure TLWPTMirrorAcquisition.RotationAccepted(
+  const ARotation: TLWPTRegistryRotationProof; const ASequence: Int64;
+  const AKeyDocument: TBytes);
+var
+  BindingIndex: Integer;
+begin
+  BindingIndex := Length(Bindings);
+  SetLength(Bindings, BindingIndex + 1);
+  Bindings[BindingIndex].Sequence := ASequence;
+  Bindings[BindingIndex].Document := SHA256BytesPrefixed(ARotation.Document);
+  Bindings[BindingIndex].OldSignature := SHA256BytesPrefixed(ARotation.OldSignature);
+  Bindings[BindingIndex].NewSignature := SHA256BytesPrefixed(ARotation.NewSignature);
+  Bindings[BindingIndex].KeyDocument := SHA256BytesPrefixed(AKeyDocument);
+  Mirror.WriteBudgeted(ProofPath(Bindings[BindingIndex].Document), ARotation.Document);
+  Mirror.WriteBudgeted(ProofPath(Bindings[BindingIndex].OldSignature), ARotation.OldSignature);
+  Mirror.WriteBudgeted(ProofPath(Bindings[BindingIndex].NewSignature), ARotation.NewSignature);
+  Mirror.WriteBudgeted(ProofPath(Bindings[BindingIndex].KeyDocument), AKeyDocument);
+end;
+
 procedure TLWPTRegistryMirror.Synchronize;
 var
   Coordinator: TLWPTProducerLeaseCoordinator;
   Lease: TLWPTProducerLease;
-  Discovery: TLWPTRegistryDiscovery;
-  Proof: TLWPTRegistryProof;
   Prior: TLWPTRegistryAcceptedState;
   Verified, PriorVerified: TLWPTVerifiedRegistry;
   Source: TLWPTMirrorDocumentSource;
   State: TLWPTRegistryState;
-  Document, KeyDocument, NextCheckpoint: TBytes;
-  HasRotations: Boolean;
+  Document: TBytes;
   Prefix: string;
   Budget: TLWPTRegistryMetadataBudget;
-  Hint: TLWPTUntrustedRegistryCheckpoint;
-  Rotation: TLWPTUntrustedRegistryRotation;
   RotationProof: TLWPTRegistryRotationProof;
-  KeyTrust: TLWPTRegistryTrust;
-  Bindings: TLWPTRegistryRotationBindingArray;
-  Page: TLWPTRegistryRotationPage;
-  PageItem: TLWPTRegistryRotationPageItem;
-  Cursors: TStringList;
-  PageSize, Index, PairAttempt: Integer;
-  AfterSequence, PreviousSequence, PinnedSequence: Int64;
-  CurrentKey, CurrentPublicKey, Cursor, PageURL, SignatureURL: string;
+  Acquisition: TLWPTMirrorAcquisition;
   AcceptedGeneration: TLWPTRegistryGeneration;
   AcceptedReference: IInterface;
   Binding: TLWPTRegistryRotationBinding;
-
-  function Control(const AURL, AKind: string; const AAuxiliary: Boolean = True): TBytes;
-  var
-    Allowance: Int64;
-  begin
-    Allowance := Budget.Allowance;
-    if Allowance > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then Allowance := MAX_REGISTRY_CONTROL_DOCUMENT_BYTES;
-    Result := GetDocument(AURL, 'application/vnd.' + PROGRAM_NAME + '.registry-' + AKind + '+toml',
-      Allowance, RemainingSynchronizationMilliseconds);
-    Budget.Account(Result);
-    if AAuxiliary then RememberRetrieval(Proof, Result);
-  end;
-
-  procedure RequireScope(const AURL: string);
-  begin
-    if not StartsStr(Config.UpstreamURL + '/', AURL)
-      or not RegistryEndpointSuffixIsUnambiguous(Copy(AURL, Length(Config.UpstreamURL) + 2, MaxInt)) then
-      raise ELWPTRegistryError.CreateStable('registry_discovery_scope_mismatch',
-        'discovery endpoint escapes or ambiguously encodes the configured transport');
-  end;
-
-  procedure Bind(const ARotation: TLWPTRegistryRotationProof; const ASequence: Int64;
-    const AKeyDocument: TBytes);
-  var
-    BindingIndex: Integer;
-  begin
-    BindingIndex := Length(Bindings);
-    SetLength(Bindings, BindingIndex + 1);
-    Bindings[BindingIndex].Sequence := ASequence;
-    Bindings[BindingIndex].Document := SHA256BytesPrefixed(ARotation.Document);
-    Bindings[BindingIndex].OldSignature := SHA256BytesPrefixed(ARotation.OldSignature);
-    Bindings[BindingIndex].NewSignature := SHA256BytesPrefixed(ARotation.NewSignature);
-    Bindings[BindingIndex].KeyDocument := SHA256BytesPrefixed(AKeyDocument);
-    WriteBudgeted(ProofPath(Bindings[BindingIndex].Document), ARotation.Document);
-    WriteBudgeted(ProofPath(Bindings[BindingIndex].OldSignature), ARotation.OldSignature);
-    WriteBudgeted(ProofPath(Bindings[BindingIndex].NewSignature), ARotation.NewSignature);
-    WriteBudgeted(ProofPath(Bindings[BindingIndex].KeyDocument), AKeyDocument);
-  end;
 begin
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
   Lease := nil;
   Source := nil;
   Budget := TLWPTRegistryMetadataBudget.Create(DefaultRegistryVerificationLimits);
-  Cursors := TStringList.Create;
-  Proof := Default(TLWPTRegistryProof);
-  Bindings := nil;
+  Acquisition := TLWPTMirrorAcquisition.Create(Budget);
+  Acquisition.Mirror := Self;
+  Acquisition.Contact := Config.UpstreamURL;
+  Acquisition.Identity := Config.Identity;
+  Acquisition.TrustKeyId := Config.TrustKeyID;
+  Acquisition.TrustPublicKey := Config.TrustPublicKey;
+  Acquisition.AlwaysFetchRootKey := True;
   AcceptedGeneration := nil;
   try
     Lease := Coordinator.TryAcquire('registry-publication', 'registry mirror synchronization');
@@ -1132,9 +1061,9 @@ begin
         Prior := Accepted(State, PriorVerified.Proof.Checkpoint);
         AcceptedGeneration := BuildGeneration('', State, PriorVerified);
         AcceptedReference := AcceptedGeneration;
-        Proof.Rotations := PriorVerified.Proof.Rotations;
-        Bindings := Copy(State.Rotations);
-        for RotationProof in Proof.Rotations do
+        Acquisition.Proof.Rotations := PriorVerified.Proof.Rotations;
+        Acquisition.Bindings := Copy(State.Rotations);
+        for RotationProof in Acquisition.Proof.Rotations do
         begin
           Budget.Account(RotationProof.Document);
           Budget.Account(RotationProof.OldSignature);
@@ -1147,131 +1076,22 @@ begin
           Document := LoadResource(ProofPath(Binding.KeyDocument),
             CheckSynchronizationDeadline, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
           Budget.Account(Document);
-          RememberRetrieval(Proof, Document);
+          RememberRegistryRetrieval(Acquisition.Proof, Document);
         end;
       end;
+      Acquisition.PriorSequence := Prior.Sequence;
       { A clock behind accepted state fails before any upstream request. }
       RequireRegistryClockAtFloor(RegistryTimestampNow,
         RegistryLaterTimestamp(Prior.ClockFloor, Prior.PublishedAt));
       PrepareStorageBudget(AcceptedGeneration);
-      Document := Control(Config.UpstreamURL + '/.well-known/' + PROGRAM_NAME + '-registry', 'discovery');
-      Discovery := ParseRegistryDiscovery(RegistryBytesText(Document));
-      if Discovery.Origin <> Config.Identity then
-        raise ELWPTRegistryError.CreateStable('registry_origin_mismatch', 'discovery changed the pinned identity');
-      if Discovery.BaseURL <> Config.UpstreamURL then
-        raise ELWPTRegistryError.CreateStable('registry_discovery_scope_mismatch', 'discovery changed the contact base');
-      RequireScope(Discovery.API);
-      RequireScope(Discovery.Capabilities);
-      RequireScope(Discovery.Checkpoint);
-      if Discovery.Rotations <> '' then RequireScope(Discovery.Rotations);
-      Document := Control(Discovery.Capabilities, 'capabilities');
-      PageSize := ValidateRegistryCapabilities(RegistryBytesText(Document), Discovery.RoleName, HasRotations);
-      if PageSize > RegistryRotationPageLimit then PageSize := RegistryRotationPageLimit;
-      if HasRotations <> (Discovery.Rotations <> '') then
-        raise ELWPTRegistryError.CreateStable('registry_rotation_capability_mismatch', 'inconsistent discovery capabilities');
-      SignatureURL := Copy(Discovery.Checkpoint, 1, Length(Discovery.Checkpoint) - 5) + '.sig.toml';
-      Proof.Checkpoint := Control(Discovery.Checkpoint, 'checkpoint', False);
-      PairAttempt := 1;
-      repeat
-        Proof.Signature := Control(SignatureURL, 'signature', False);
-        { A malformed envelope fails here, before any key or rotation request. }
-        if InspectRegistrySignaturePayload(Proof.Signature)
-          = SHA256BytesPrefixed(Proof.Checkpoint) then Break;
-        { Only a checkpoint that advanced between the reads is retried; a
-          stable or persistently inconsistent pair is rejected now. }
-        if PairAttempt >= MirrorCheckpointPairAttempts then
-          raise ELWPTRegistryError.CreateStable('signature_payload_mismatch',
-            'checkpoint and signature stayed inconsistent');
-        Inc(PairAttempt);
-        NextCheckpoint := Control(Discovery.Checkpoint, 'checkpoint', False);
-        if SHA256BytesPrefixed(NextCheckpoint) = SHA256BytesPrefixed(Proof.Checkpoint) then
-          raise ELWPTRegistryError.CreateStable('signature_payload_mismatch',
-            'signature names a different checkpoint');
-        Proof.Checkpoint := NextCheckpoint;
-      until False;
-      Hint := InspectRegistryCheckpoint(Proof.Checkpoint);
-      { Identity contradictions are decidable now; reject them before any key
-        record or rotation request. Cryptography still follows the chain. }
-      if Hint.Origin <> Config.Identity then
-        raise ELWPTRegistryError.CreateStable('checkpoint_origin_mismatch',
-          'checkpoint names a different origin');
-      if InspectRegistrySignatureKey(Proof.Signature) <> Hint.KeyId then
-        raise ELWPTRegistryError.CreateStable('signature_key_mismatch',
-          'signature names a different key than its checkpoint');
-      { The root key record's effective sequence is unsigned retrieval data.
-        It is bound to this attempt's state only, never to a fixed path. }
-      KeyDocument := Control(Discovery.API + '/keys/' + Config.TrustKeyID + '.toml', 'key');
-      PinnedSequence := ValidateRegistryKeyDocument(KeyDocument, Trust, Hint.Sequence);
-      CurrentKey := Config.TrustKeyID;
-      CurrentPublicKey := Config.TrustPublicKey;
-      AfterSequence := 0;
-      if PinnedSequence > 1 then AfterSequence := PinnedSequence;
-      if Length(Proof.Rotations) > 0 then
-      begin
-        Rotation := InspectRegistryRotation(Proof.Rotations[High(Proof.Rotations)].Document);
-        CurrentKey := Rotation.ToKey;
-        CurrentPublicKey := Rotation.ToPublicKey;
-        AfterSequence := Rotation.EffectiveSequence;
-      end;
-      PreviousSequence := AfterSequence;
-      Cursor := '';
-      { An older or equal checkpoint is authenticated by the accepted chain;
-        rotation retrieval only extends it forward. }
-      while (CurrentKey <> Hint.KeyId) and (Hint.Sequence > Prior.Sequence) do
-      begin
-        if not HasRotations then
-          raise ELWPTRegistryError.CreateStable('registry_key_rotation_incomplete',
-            'checkpoint key is untrusted and the upstream offers no rotation chain');
-        PageURL := Discovery.Rotations + '?after=' + IntToStr(AfterSequence)
-          + '&limit=' + IntToStr(PageSize);
-        if Cursor <> '' then PageURL := PageURL + '&cursor=' + RegistryQueryEncode(Cursor);
-        Document := Control(PageURL, 'rotation-page');
-        Page := ParseRegistryRotationPage(Document, Config.Identity, Discovery.API,
-          PreviousSequence, PageSize);
-        for PageItem in Page.Items do
-        begin
-          if (PageItem.EffectiveSequence > Hint.Sequence)
-            or (Length(Proof.Rotations) >= DefaultRegistryVerificationLimits.Rotations) then
-            raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
-              'rotation page exceeds the checkpoint or rotation limit');
-          RotationProof.Document := Control(PageItem.Rotation, 'key-rotation', False);
-          RotationProof.OldSignature := Control(PageItem.OldSignature, 'signature', False);
-          RotationProof.NewSignature := Control(PageItem.NewSignature, 'signature', False);
-          { Authenticate this transition before trusting its key or following
-            any further page item. }
-          Rotation := VerifyRegistryRotation(RotationProof, Config.Identity, CurrentKey,
-            CurrentPublicKey, PreviousSequence, Hint.Sequence);
-          if Rotation.EffectiveSequence <> PageItem.EffectiveSequence then
-            raise ELWPTRegistryError.CreateStable('rotation_chain_invalid',
-              'rotation page item names a different sequence');
-          KeyTrust.Origin := Config.Identity;
-          KeyTrust.KeyId := Rotation.ToKey;
-          KeyTrust.PublicKey := Rotation.ToPublicKey;
-          Document := Control(Discovery.API + '/keys/' + Rotation.ToKey + '.toml', 'key');
-          ValidateRegistryKeyDocument(Document, KeyTrust, Rotation.EffectiveSequence, True);
-          Index := Length(Proof.Rotations);
-          SetLength(Proof.Rotations, Index + 1);
-          Proof.Rotations[Index] := RotationProof;
-          Bind(RotationProof, Rotation.EffectiveSequence, Document);
-          CurrentKey := Rotation.ToKey;
-          CurrentPublicKey := Rotation.ToPublicKey;
-          PreviousSequence := Rotation.EffectiveSequence;
-          if CurrentKey = Hint.KeyId then Break;
-        end;
-        if CurrentKey = Hint.KeyId then Break;
-        if (Page.NextCursor = '') or (Cursors.IndexOf(Page.NextCursor) >= 0) then
-          raise ELWPTRegistryError.CreateStable('registry_key_rotation_incomplete',
-            'rotation pages end before the checkpoint key');
-        Cursors.Add(Page.NextCursor);
-        Cursor := Page.NextCursor;
-      end;
+      Acquisition.Acquire;
       Source := TLWPTMirrorDocumentSource.Create;
       Source.Store := Self;
-      Source.API := Discovery.API;
+      Source.API := Acquisition.Discovery.API;
       Source.Progress := CheckSynchronizationDeadline;
-      Verified := VerifyRegistryProof(Proof, Trust, Prior, RegistryTimestampNow,
+      Verified := VerifyRegistryProof(Acquisition.Proof, Trust, Prior, RegistryTimestampNow,
         rvmAcquire, Source, DefaultRegistryVerificationLimits);
-      TransferArchives(Discovery.API, Verified.Packages);
+      TransferArchives(Acquisition.Discovery.API, Verified.Packages);
       State := Default(TLWPTRegistryState);
       State.Role := rrMirror;
       State.Sequence := Verified.State.Sequence;
@@ -1279,15 +1099,15 @@ begin
       State.CheckpointHash := Verified.State.CheckpointHash;
       State.TrustKeyID := Verified.State.KeyId;
       State.TrustPublicKey := Verified.State.PublicKey;
-      State.TrustKeyDocument := SHA256BytesPrefixed(KeyDocument);
-      State.Rotations := Bindings;
+      State.TrustKeyDocument := SHA256BytesPrefixed(Acquisition.KeyDocument);
+      State.Rotations := Acquisition.Bindings;
       State.ClockFloor := Verified.State.ClockFloor;
       Prefix := 'checkpoints/renewals/sha256/' + Copy(State.CheckpointHash, 8, 64);
       State.CheckpointPath := Prefix + '.toml';
       State.SignaturePath := Prefix + '.sig.toml';
-      WriteBudgeted(State.CheckpointPath, Proof.Checkpoint);
-      WriteBudgeted(State.SignaturePath, Proof.Signature);
-      WriteBudgeted(ProofPath(State.TrustKeyDocument), KeyDocument);
+      WriteBudgeted(State.CheckpointPath, Acquisition.Proof.Checkpoint);
+      WriteBudgeted(State.SignaturePath, Acquisition.Proof.Signature);
+      WriteBudgeted(ProofPath(State.TrustKeyDocument), Acquisition.KeyDocument);
       { Verify the exact prospective state from disk, as serving and restart
         will, under the same limits. A head that could not be loaded again is
         never activated. The final clock check below follows this work. }
@@ -1329,7 +1149,7 @@ begin
   finally
     FSynchronizationDeadline := 0;
     AcceptedReference := nil;
-    Cursors.Free;
+    Acquisition.Free;
     Budget.Free;
     Source.Free;
     Lease.Free;

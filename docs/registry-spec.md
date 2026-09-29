@@ -514,6 +514,15 @@ The identifier MUST match the SHA-256 of the raw public key. Initial trust is
 established out of band by pinning an origin identity and key identifier/public
 key pair.
 
+A dependency consumer MAY instead pin only the key identifier/public key pair
+and take the origin identity its contacts advertise in discovery. The
+advertised identity is accepted only after a checkpoint that verifies through
+the pinned key names that same origin; the consumer then records it and MUST
+treat a later advertisement of a different identity as a failure, never as a
+replacement ([ADR-0051](./adr/0051-registry-dependency-sources.md)). Mirrors keep
+the configured-identity requirement: `registry init --role mirror` still
+requires an explicit origin identity with the key.
+
 Rotation records are immutable:
 
 ```toml
@@ -752,14 +761,18 @@ diagnostics are defined in [ADR-0045](adr/0045-verified-registry-mirror.md).
 
 For online acquisition, clients MUST try configured mirrors in declaration
 order, followed by the configured origin endpoint, stopping at the first
-successfully verified discovery and proof transaction. Each attempt MUST use
+successfully verified discovery and proof transaction. Contacts supplied by
+user configuration precede the mirrors a manifest declares; duplicates are
+tried once. Each attempt MUST use
 one contact with the same expected origin identity, configured trust root,
 and previously accepted per-origin history. Changing contact MUST NOT replace
 those trust inputs or change package identity.
 
 A request-layer failure MUST advance to the next configured contact when one
 remains. This includes HTTPClient exceptions, including HTTP framing, read,
-and response-body-limit errors, and non-2xx HTTP responses.
+and response-body-limit errors, and non-2xx HTTP responses. A consumer
+follows no redirects during acquisition: any 3xx response is a request-layer
+failure.
 
 A stale contact serves a correctly authenticated proof for the expected origin
 and trust root that is nevertheless unusable: its checkpoint has expired, its
@@ -790,9 +803,10 @@ select contacts or construct a network transport. They follow the retained
 identity and [locked-proof rules](#acquisition-and-locked-proof-verification),
 including their explicit expiry policy.
 
-This defines the client policy, not a claim that the mirror service ships an
-installer consumer. [Issue #62](https://github.com/frostney/lwpt/issues/62) owns
-dependency-consumer integration; its manifest syntax is outside this protocol.
+The dependency consumer that applies this policy, its manifest syntax, and
+its locked state are recorded in
+[ADR-0051](./adr/0051-registry-dependency-sources.md); the manifest syntax is
+outside this protocol.
 
 ## Errors and HTTP behavior
 
@@ -896,9 +910,11 @@ complete examples are the files under
 
 ## Implementation boundary
 
-This specification does not add a registry source kind, subcommand, storage
-engine, background daemon, or hosted service to LWPT. Those choices belong to
-the implementation issues under
+This specification does not itself define a manifest source kind; the
+`registry:` dependency source that consumes it is recorded in
+[ADR-0051](./adr/0051-registry-dependency-sources.md). Nor does it add a
+subcommand, storage engine, background daemon, or hosted service to LWPT.
+Those choices belong to the implementation issues under
 [#29](https://github.com/frostney/lwpt/issues/29).
 
 The implementation PR that chooses the executable interface, command shape,

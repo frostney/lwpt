@@ -1,5 +1,7 @@
 # Git-host fetch trust: destination policy and locked ref identity
 
+> **Amended by [ADR-0051](./0051-registry-dependency-sources.md):** registry contacts are destinations too. Each registry request allows only the contact's own host, requires HTTPS, refuses non-global addresses, and follows no redirects, so a 3xx is a request-layer failure that advances to the next contact. Manifest-declared contacts are public-only under the same address rule; plain `http://localhost` is accepted only by the `lwpt-testing` build ([ADR-0044](./0044-test-seams-only-in-test-builds.md)). Archives are fetched only from the contact that produced the verified proof and must hash to the signed record's `archive` digest.
+
 ## Executive Summary
 
 - Every dependency request uses HTTPS on every hop, may reach only the hosts

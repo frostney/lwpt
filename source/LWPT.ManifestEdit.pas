@@ -53,6 +53,8 @@ var
   i: Integer;
 begin
   Result := '';
+  { A registry dependency's key is its package name (ADR-0051). }
+  if ADep.SrcKind = skRegistry then Exit(ADep.SrcLocator);
   if not (ADep.SrcKind in [skGitHost, skLocal]) then Exit;
   L := ADep.SrcLocator;
   while (L <> '') and (L[Length(L)] in ['/', '\']) do

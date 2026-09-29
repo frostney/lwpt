@@ -1,4 +1,4 @@
-program LWPT.Registry.Client.Test;
+program LWPT.Registry.Publish.Test;
 
 { The publish client's local contract (ADR-0049): the diagnostic grammar
   and credential redaction, retry arithmetic, origin transport rules, the
@@ -16,7 +16,7 @@ uses
   SysUtils,
 
   LWPT.Core,
-  LWPT.Registry.Client,
+  LWPT.Registry.Publish,
   LWPT.Registry.Store,
   LWPT.Registry.Verification,
   TestingPascalLibrary,

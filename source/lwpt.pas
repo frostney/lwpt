@@ -62,7 +62,7 @@ uses
   LWPT.Core,
   LWPT.OutputRenderer,
   LWPT.ProcessTree,
-  LWPT.Registry.Client,
+  LWPT.Registry.Publish,
   LWPT.Registry.Store;
 
 const

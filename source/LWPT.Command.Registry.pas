@@ -47,7 +47,7 @@ uses
 
   LWPT.Core,
   LWPT.OutputRenderer,
-  LWPT.Registry.Client,
+  LWPT.Registry.Publish,
   LWPT.Registry.Mirror,
   LWPT.Registry.Server,
   LWPT.Registry.Store,

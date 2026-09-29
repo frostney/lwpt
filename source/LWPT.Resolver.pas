@@ -26,7 +26,25 @@ type
 
   EResolverConflict = class(Exception);
 
+  { One published registry version from a verified snapshot (ADR-0051). Key
+    is opaque to the resolver (the record hash). }
+  TResolverVersionCandidate = record
+    Version: string;
+    Key: string;
+    Yanked: Boolean;
+  end;
+  TResolverVersionCandidateArray = array of TResolverVersionCandidate;
+
 function RefCommitSHA(const ARef: TGitRef): string;
+{ The index of the highest candidate satisfying every requirement. Yanked
+  candidates are never newly selected, even by an exact version; one whose
+  version equals ALockedVersion stays selectable (ADR-0051 decision 7).
+  Ranges use Semver.Satisfies with DefaultSemverOptions, as git tags do. An
+  empty result raises EResolverConflict with the complete requirement set. }
+function SelectHighestVersion(const APackageName: string;
+  const ARequirements: TResolverRequirementArray;
+  const ACandidates: TResolverVersionCandidateArray;
+  const ALockedVersion: string): Integer;
 function SelectHighestRef(const APackageName: string;
   const ARequirements: TResolverRequirementArray;
   const ARefs: TGitRefArray): TResolverSelection;
@@ -119,6 +137,63 @@ begin
     if Result <> '' then Result := Result + LineEnding;
     Result := Result + '  ' + ARequirements[i].Requirer + ' wants "'
       + ARequirements[i].Spec + '"';
+  end;
+end;
+
+function SelectHighestVersion(const APackageName: string;
+  const ARequirements: TResolverRequirementArray;
+  const ACandidates: TResolverVersionCandidateArray;
+  const ALockedVersion: string): Integer;
+var
+  i, j: Integer;
+  Accepted, YankedExcluded: Boolean;
+  Version: string;
+begin
+  Result := -1;
+  YankedExcluded := False;
+  for i := 0 to High(ACandidates) do
+  begin
+    Version := ACandidates[i].Version;
+    if Valid(Version, DefaultSemverOptions) <> Version then Continue;
+    Accepted := True;
+    for j := 0 to High(ARequirements) do
+    begin
+      case ARequirements[j].Kind of
+        vkNone:;
+        vkSemverRange:
+          Accepted := Satisfies(Version, ARequirements[j].Spec,
+            DefaultSemverOptions);
+        vkSemverExact:
+          Accepted := Version = ARequirements[j].Spec;
+      else
+        Accepted := False;
+      end;
+      if not Accepted then Break;
+    end;
+    if not Accepted then Continue;
+    if ACandidates[i].Yanked and (Version <> ALockedVersion) then
+    begin
+      YankedExcluded := True;
+      Continue;
+    end;
+    if (Result < 0) or (Compare(Version, ACandidates[Result].Version,
+         DefaultSemverOptions) > 0) then
+      Result := i;
+  end;
+  if Result < 0 then
+  begin
+    if YankedExcluded then
+      raise EResolverConflict.Create(
+        'unresolvable version conflict on "' + APackageName + '":'
+        + LineEnding + RequirementLines(ARequirements)
+        + LineEnding + '  every published version satisfying every '
+        + 'constraint is yanked; yanked versions are never newly selected')
+    else
+      raise EResolverConflict.Create(
+        'unresolvable version conflict on "' + APackageName + '":'
+        + LineEnding + RequirementLines(ARequirements)
+        + LineEnding + '  no published registry version satisfies every '
+        + 'constraint');
   end;
 end;
 
