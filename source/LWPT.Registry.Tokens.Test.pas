@@ -155,7 +155,7 @@ var
 begin
   Token := IssueRegistryToken(Origin, ['zeta', 'alpha*'], [rtaYank, rtaPublish],
     30, 'release ci', ISSUED_AT, TokenRecord);
-  Secret := Copy(Token, LastDelimiter('_', Token) + 1, MaxInt);
+  Secret := Copy(Token, Length(PROGRAM_NAME + '_rt1_') + 32 + 2, MaxInt);
   Text := ReadBinaryFile(Origin + '/auth/tokens/' + TokenRecord.ID + '.toml');
   Expect<Boolean>(Pos(Secret, Text) = 0).ToBe(True);
   Expect<Boolean>(Pos(Token, Text) = 0).ToBe(True);

@@ -51,6 +51,7 @@ uses
   DynLibs,
   OpenSSL,
   {$ENDIF}
+  base64,
   TestingPascalLibrary,
   TransportSecurity;
 
@@ -85,6 +86,8 @@ const
     'packages/httpclient/source/fixtures/localhost-pathlen-identity.p12';
   SELF_SIGNED_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-self-signed-dev.p12';
+  MULTI_IDENTITY_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-multi-identity.p12';
   WRONG_PURPOSE_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-wrong-purpose-identity.p12';
   PKCS12_PASSPHRASE = 'test-only';
@@ -102,6 +105,19 @@ const
     'the raw in-memory SChannel loopback client is Windows-only';
 
 type
+  { Backend-neutral checks of the outbound client options record: no
+    sockets, no platform TLS work. The loopback E2E program covers the
+    per-backend behaviour. }
+  TTransportSecurityClientOptionTests = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestDefaultOptionsSelectOptionlessPath;
+    procedure TestAnchorEncodingsValidate;
+    procedure TestMalformedAnchorsRejected;
+    procedure TestInconsistentOptionsRejected;
+    procedure TestNativeMaterialRejectedBeforeConnecting;
+  end;
+
   TTransportSecurityServerTests = class(TTestSuite)
   private
     FServerBackendAvailable: Boolean;
@@ -121,6 +137,7 @@ type
     procedure TestEmptyAndUTF8Passphrases;
     procedure TestEmbeddedNULPassphraseRejected;
     procedure TestFatalHandshakePoisonsConnection;
+    procedure TestServerFailureReasonFollowsLatestHandshakeCall;
     procedure TestFatalShutdownPoisonsBeforeOutput;
     procedure TestInputFlowConfiguration;
     procedure TestInputFlowPrefixAdmissionAndCounters;
@@ -143,6 +160,7 @@ type
     procedure TestSChannelPeerCloseNotifyReportsPeerClosed;
     procedure TestSChannelProtocolCeilingFollowsOperatingSystem;
     procedure TestSChannelReloadRetainsPreviousKeyContainer;
+    procedure TestSChannelMultiIdentityLeavesNoKeyContainers;
     procedure TestSChannelPendingCiphertextPointerAndPartialConsumption;
     procedure TestSChannelWriteWantRetryRetainsPlaintext;
     procedure TestStaleErrorQueueIsCleared;
@@ -4051,6 +4069,94 @@ begin
   {$ENDIF}
 end;
 
+{ Complete non-TLS inputs fail the handshake on every non-Darwin backend.
+  The two requests differ so OpenSSL reports different reasons
+  ("http request" versus "https proxy request"); backends that report one
+  status for both still pin the ordering rules. }
+function FailServerHandshake(var AConnection: TTransportSecurityConnection;
+  const AInput: AnsiString): TTransportSecurityState;
+var
+  I: Integer;
+begin
+  if TransportSecurityFeedCiphertext(AConnection, @AInput[1],
+     Length(AInput)) <> Length(AInput) then
+    raise Exception.Create('invalid handshake input was not accepted');
+  Result := tssWantRead;
+  for I := 1 to 3 do
+  begin
+    Result := TransportSecurityServerHandshake(AConnection);
+    if Result <> tssWantRead then
+      Break;
+  end;
+end;
+
+procedure TTransportSecurityServerTests.TestServerFailureReasonFollowsLatestHandshakeCall;
+{$IFDEF TRANSPORT_SECURITY_SERVER}
+{$IFNDEF DARWIN}
+const
+  FIRST_INPUT = 'GET / HTTP/1.0'#13#10#13#10;
+  SECOND_INPUT = 'CONNECT localhost:443 HTTP/1.0'#13#10#13#10;
+var
+  Context: TTransportSecurityServerContext;
+  Expected, FirstReason: string;
+  First, Idle, Isolated, Second, Third: TTransportSecurityConnection;
+{$ENDIF}
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
+  {$IFNDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(First, SizeOf(First), 0);
+  FillChar(Idle, SizeOf(Idle), 0);
+  FillChar(Isolated, SizeOf(Isolated), 0);
+  FillChar(Second, SizeOf(Second), 0);
+  FillChar(Third, SizeOf(Third), 0);
+  try
+    { The reason the second input produces on its own. }
+    BeginTransportSecurityServer(Isolated, Context);
+    Expect<Integer>(Ord(FailServerHandshake(Isolated, SECOND_INPUT))).ToBe(
+      Ord(tssError));
+    Expected := TransportSecurityServerFailureReason;
+    Expect<Boolean>(Expected <> '').ToBe(True);
+
+    { Four connections interleaved on this one thread. }
+    BeginTransportSecurityServer(First, Context);
+    BeginTransportSecurityServer(Idle, Context);
+    BeginTransportSecurityServer(Second, Context);
+    BeginTransportSecurityServer(Third, Context);
+    Expect<string>(TransportSecurityServerFailureReason).ToBe('');
+
+    Expect<Integer>(Ord(FailServerHandshake(First, FIRST_INPUT))).ToBe(
+      Ord(tssError));
+    FirstReason := TransportSecurityServerFailureReason;
+    Expect<Boolean>(FirstReason <> '').ToBe(True);
+
+    { A later handshake call that makes progress clears the earlier
+      connection's failure instead of leaving it to be misattributed. }
+    Expect<Integer>(Ord(TransportSecurityServerHandshake(Idle))).ToBe(
+      Ord(tssWantRead));
+    Expect<string>(TransportSecurityServerFailureReason).ToBe('');
+
+    { Two failures in a row: the reason is the latest connection's own. }
+    Expect<Integer>(Ord(FailServerHandshake(Second, FIRST_INPUT))).ToBe(
+      Ord(tssError));
+    Expect<string>(TransportSecurityServerFailureReason).ToBe(FirstReason);
+    Expect<Integer>(Ord(FailServerHandshake(Third, SECOND_INPUT))).ToBe(
+      Ord(tssError));
+    Expect<string>(TransportSecurityServerFailureReason).ToBe(Expected);
+  finally
+    AbortTransportSecurityServer(First);
+    AbortTransportSecurityServer(Idle);
+    AbortTransportSecurityServer(Isolated);
+    AbortTransportSecurityServer(Second);
+    AbortTransportSecurityServer(Third);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityServerTests.TestFatalHandshakePoisonsConnection;
 {$IFDEF TRANSPORT_SECURITY_SERVER}
 {$IFNDEF DARWIN}
@@ -4907,6 +5013,67 @@ begin
   {$ENDIF}
 end;
 
+{ PFXImportCertStore persists one CNG container per keyed certificate. A
+  bundle with two identities must be rejected, and both containers deleted,
+  on the server path and on the client path alike (the client's pre-dial
+  check imports without persisting). }
+procedure TTransportSecurityServerTests.TestSChannelMultiIdentityLeavesNoKeyContainers;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Context: TTransportSecurityServerContext;
+  ErrorMessage: string;
+  I: Integer;
+  Names: TUnicodeStringArray;
+  Options: TTransportSecurityClientOptions;
+  SingleName: UnicodeString;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  try
+    SingleName := TransportSecurityTestServerKeyContainer(Context);
+    Expect<Boolean>(TransportSecurityTestKeyContainerExists(SingleName))
+      .ToBe(True);
+  finally
+    CloseTransportSecurityServerContext(Context);
+  end;
+  Expect<Boolean>(TransportSecurityTestKeyContainerExists(SingleName))
+    .ToBe(False);
+
+  Context := nil;
+  ErrorMessage := '';
+  try
+    Context := TTransportSecurityServerContext.Create(
+      MULTI_IDENTITY_PKCS12_PATH, PKCS12_PASSPHRASE, tsivPermissive);
+  except
+    on E: ETransportSecurityError do
+      ErrorMessage := E.Message;
+  end;
+  CloseTransportSecurityServerContext(Context);
+  Expect<Boolean>(Pos('exactly one certificate with a private key',
+    ErrorMessage) > 0).ToBe(True);
+  Names := TransportSecurityTestLastImportedKeyContainers;
+  Expect<Integer>(Length(Names)).ToBe(2);
+  for I := 0 to High(Names) do
+    Expect<Boolean>(TransportSecurityTestKeyContainerExists(Names[I]))
+      .ToBe(False);
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12 := LoadFixtureBytes(MULTI_IDENTITY_PKCS12_PATH);
+  Options.ClientPkcs12Passphrase := PKCS12_PASSPHRASE;
+  ErrorMessage := '';
+  try
+    ValidateTransportSecurityClientOptions(Options);
+  except
+    on E: ETransportSecurityError do
+      ErrorMessage := E.Message;
+  end;
+  Expect<Boolean>(Pos('exactly one certificate with a private key',
+    ErrorMessage) > 0).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityServerTests.ServerTest(const AName: string;
   const AMethod: TTestMethod);
 begin
@@ -4954,6 +5121,8 @@ begin
     DARWIN_SKIP_REASON);
   ServerTest('fatal handshake poisons connection',
     TestFatalHandshakePoisonsConnection);
+  Skip('server failure reason follows the latest handshake call',
+    TestServerFailureReasonFollowsLatestHandshakeCall, DARWIN_SKIP_REASON);
   ServerTest('PKCS#12 path loading refuses links in every component',
     TestPKCS12PathRefusesSymbolicLink);
   ServerTest('Active becomes true only after the server handshake',
@@ -5029,6 +5198,9 @@ begin
   Skip('SChannel reload retains the previous key container',
     TestSChannelReloadRetainsPreviousKeyContainer,
     DARWIN_SKIP_REASON);
+  Skip('SChannel multi-identity PKCS#12 leaves no key containers',
+    TestSChannelMultiIdentityLeavesNoKeyContainers,
+    DARWIN_SKIP_REASON);
   {$ELSE}
   FServerBackendAvailable := TransportSecurityServerBackendAvailable;
   Skip('Darwin Secure Transport server begins and aborts cleanly',
@@ -5069,6 +5241,8 @@ begin
     TestStrictIdentityAllowsLeafWithoutBasicConstraints);
   ServerTest('fatal handshake poisons connection',
     TestFatalHandshakePoisonsConnection);
+  ServerTest('server failure reason follows the latest handshake call',
+    TestServerFailureReasonFollowsLatestHandshakeCall);
   {$IFDEF MSWINDOWS}
   if not FServerBackendAvailable then
     ServerTest('PKCS#12 path loading refuses links in every component',
@@ -5197,6 +5371,8 @@ begin
     TestSChannelIdentityImportsIsolatedKeyContainers);
   ServerTest('SChannel reload retains the previous key container',
     TestSChannelReloadRetainsPreviousKeyContainer);
+  ServerTest('SChannel multi-identity PKCS#12 leaves no key containers',
+    TestSChannelMultiIdentityLeavesNoKeyContainers);
   {$ELSE}
   Skip('SChannel handshake round-trips plaintext and reuses the context',
     TestSChannelHandshakeRoundtripAndContextReuse,
@@ -5228,11 +5404,229 @@ begin
   Skip('SChannel reload retains the previous key container',
     TestSChannelReloadRetainsPreviousKeyContainer,
     SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel multi-identity PKCS#12 leaves no key containers',
+    TestSChannelMultiIdentityLeavesNoKeyContainers,
+    SCHANNEL_CLIENT_SKIP_REASON);
   {$ENDIF}
   {$ENDIF}
 end;
 
+{ ── client options ───────────────────────────────────────────────── }
+
+const
+  TEST_ROOT_CERTIFICATE_PATH =
+    'packages/httpclient/source/fixtures/test-root-cert.pem';
+  TEST_INTERMEDIATE_CERTIFICATE_PATH =
+    'packages/httpclient/source/fixtures/localhost-test-intermediate-cert.pem';
+
+function TextBytes(const AText: AnsiString): TBytes;
 begin
+  Result := nil;
+  SetLength(Result, Length(AText));
+  if Length(AText) > 0 then
+    Move(AText[1], Result[0], Length(AText));
+end;
+
+function JoinBytes(const AFirst, ASecond: TBytes): TBytes;
+begin
+  Result := nil;
+  SetLength(Result, Length(AFirst) + Length(ASecond));
+  if Length(AFirst) > 0 then
+    Move(AFirst[0], Result[0], Length(AFirst));
+  if Length(ASecond) > 0 then
+    Move(ASecond[0], Result[Length(AFirst)], Length(ASecond));
+end;
+
+function PEMCertificateDER(const APath: string): TBytes;
+const
+  PEM_BEGIN = '-----BEGIN CERTIFICATE-----';
+  PEM_END = '-----END CERTIFICATE-----';
+var
+  BodyEnd, BodyStart: Integer;
+  Raw: TBytes;
+  Text: AnsiString;
+begin
+  Raw := LoadFixtureBytes(APath);
+  SetString(Text, PAnsiChar(@Raw[0]), Length(Raw));
+  BodyStart := Pos(PEM_BEGIN, Text) + Length(PEM_BEGIN);
+  BodyEnd := Pos(PEM_END, Text);
+  Result := TextBytes(DecodeStringBase64(StringReplace(StringReplace(
+    Copy(Text, BodyStart, BodyEnd - BodyStart), #13, '', [rfReplaceAll]),
+    #10, '', [rfReplaceAll])));
+end;
+
+function AnchorOptions(const AAnchors: TBytes;
+  const AMode: TTransportSecurityTrustMode): TTransportSecurityClientOptions;
+begin
+  Result := DefaultTransportSecurityClientOptions;
+  Result.TrustAnchors := AAnchors;
+  Result.TrustMode := AMode;
+end;
+
+function ClientOptionsError(
+  const AOptions: TTransportSecurityClientOptions): string;
+begin
+  Result := '';
+  try
+    ValidateTransportSecurityClientOptions(AOptions);
+  except
+    on E: ETransportSecurityError do
+      Result := E.Message;
+  end;
+end;
+
+function Mentions(const AText, AFragment: string): Boolean;
+begin
+  Result := Pos(LowerCase(AFragment), LowerCase(AText)) > 0;
+end;
+
+procedure TTransportSecurityClientOptionTests.TestDefaultOptionsSelectOptionlessPath;
+var
+  Options: TTransportSecurityClientOptions;
+begin
+  Options := DefaultTransportSecurityClientOptions;
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(True);
+  Expect<string>(ClientOptionsError(Options)).ToBe('');
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.InsecureSkipVerify := True;
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(False);
+  Options := DefaultTransportSecurityClientOptions;
+  Options.TrustMode := tstmAnchorsOnly;
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(False);
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12 := TextBytes('x');
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(False);
+  Options := DefaultTransportSecurityClientOptions;
+  Options.TrustAnchors := LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH);
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(False);
+end;
+
+procedure TTransportSecurityClientOptionTests.TestAnchorEncodingsValidate;
+var
+  Bundle: TBytes;
+begin
+  Expect<string>(ClientOptionsError(AnchorOptions(
+    LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH), tstmAnchorsOnly))).ToBe('');
+  Bundle := JoinBytes(LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH),
+    LoadFixtureBytes(TEST_INTERMEDIATE_CERTIFICATE_PATH));
+  Expect<string>(ClientOptionsError(AnchorOptions(Bundle,
+    tstmSystemAndAnchors))).ToBe('');
+  Expect<string>(ClientOptionsError(AnchorOptions(
+    PEMCertificateDER(TEST_ROOT_CERTIFICATE_PATH), tstmAnchorsOnly))).ToBe('');
+end;
+
+procedure TTransportSecurityClientOptionTests.TestMalformedAnchorsRejected;
+var
+  Pem: AnsiString;
+  Raw: TBytes;
+begin
+  Raw := LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH);
+  SetString(Pem, PAnsiChar(@Raw[0]), Length(Raw));
+
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    TextBytes('not a certificate'), tstmAnchorsOnly)),
+    'neither PEM')).ToBe(True);
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    JoinBytes(PEMCertificateDER(TEST_ROOT_CERTIFICATE_PATH), TextBytes('x')),
+    tstmAnchorsOnly)), 'neither PEM')).ToBe(True);
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    TextBytes(Copy(Pem, 1, Pos('-----END', Pem) - 1)), tstmAnchorsOnly)),
+    'unterminated')).ToBe(True);
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    TextBytes(StringReplace(Pem, 'M', '*', [])), tstmAnchorsOnly)),
+    'not a valid PEM certificate')).ToBe(True);
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    TextBytes('-----BEGIN PRIVATE KEY-----'#10'AAAA'#10 +
+    '-----END PRIVATE KEY-----'#10), tstmAnchorsOnly)),
+    'no PEM CERTIFICATE')).ToBe(True);
+end;
+
+procedure TTransportSecurityClientOptionTests.TestInconsistentOptionsRejected;
+var
+  Oversized: TBytes;
+  Options: TTransportSecurityClientOptions;
+begin
+  Options := DefaultTransportSecurityClientOptions;
+  Options.TrustMode := tstmAnchorsOnly;
+  Expect<Boolean>(Mentions(ClientOptionsError(Options),
+    'requires at least one trust anchor')).ToBe(True);
+
+  Options := AnchorOptions(LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH),
+    tstmSystemAndAnchors);
+  Options.InsecureSkipVerify := True;
+  Expect<Boolean>(Mentions(ClientOptionsError(Options),
+    'InsecureSkipVerify cannot be combined')).ToBe(True);
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12Passphrase := 'secret';
+  Expect<Boolean>(Mentions(ClientOptionsError(Options),
+    'requires a client identity')).ToBe(True);
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12 := TextBytes('x');
+  Options.ClientPkcs12Passphrase := 'a'#0'b';
+  Expect<Boolean>(Mentions(ClientOptionsError(Options),
+    'embedded NUL')).ToBe(True);
+
+  Oversized := nil;
+  SetLength(Oversized, 4 * 1024 * 1024 + 1);
+  FillChar(Oversized[0], Length(Oversized), Ord('A'));
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(Oversized,
+    tstmAnchorsOnly)), '4 MiB')).ToBe(True);
+end;
+
+procedure TTransportSecurityClientOptionTests.TestNativeMaterialRejectedBeforeConnecting;
+const
+  CLIENT_IDENTITY_PATH =
+    'packages/httpclient/source/fixtures/client-identity.p12';
+var
+  Empty: TBytes;
+  Options: TTransportSecurityClientOptions;
+begin
+  { Structurally one DER SEQUENCE, but no certificate: only the platform
+    parser can reject it. }
+  Empty := nil;
+  SetLength(Empty, 2);
+  Empty[0] := $30;
+  Empty[1] := $00;
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(Empty,
+    tstmAnchorsOnly)), 'not a valid X.509 certificate')).ToBe(True);
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12 := LoadFixtureBytes(CLIENT_IDENTITY_PATH);
+  Options.ClientPkcs12Passphrase := PKCS12_PASSPHRASE;
+  Expect<string>(ClientOptionsError(Options)).ToBe('');
+
+  Options.ClientPkcs12Passphrase := 'not-the-passphrase';
+  Expect<Boolean>(Mentions(ClientOptionsError(Options), 'passphrase'))
+    .ToBe(True);
+
+  Options.ClientPkcs12Passphrase := PKCS12_PASSPHRASE;
+  SetLength(Options.ClientPkcs12, Length(Options.ClientPkcs12) div 2);
+  Expect<Boolean>(ClientOptionsError(Options) <> '').ToBe(True);
+
+  Options.ClientPkcs12 := TextBytes('not a PKCS#12 bundle');
+  Expect<Boolean>(ClientOptionsError(Options) <> '').ToBe(True);
+end;
+
+procedure TTransportSecurityClientOptionTests.SetupTests;
+begin
+  Test('default client options select the option-less path',
+    TestDefaultOptionsSelectOptionlessPath);
+  Test('PEM, PEM bundle, and DER trust anchors validate',
+    TestAnchorEncodingsValidate);
+  Test('malformed trust anchors are rejected before any connection',
+    TestMalformedAnchorsRejected);
+  Test('inconsistent client options are rejected',
+    TestInconsistentOptionsRejected);
+  Test('natively malformed anchors and identities are rejected before connecting',
+    TestNativeMaterialRejectedBeforeConnecting);
+end;
+
+begin
+  TestRunnerProgram.AddSuite(TTransportSecurityClientOptionTests.Create(
+    'TransportSecurity: client options'));
   TestRunnerProgram.AddSuite(TTransportSecurityServerTests.Create(
     'TransportSecurity: TLS server accept'));
   TestRunnerProgram.Run;

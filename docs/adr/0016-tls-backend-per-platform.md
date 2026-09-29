@@ -1,13 +1,15 @@
 # TLS backends follow each platform's native client stack
 
 > **Amended by [ADR-0024](./0024-openssl-server-tls-accept.md),
-> [ADR-0033](./0033-schannel-server-tls-accept-on-windows.md), and
-> [ADR-0043](./0043-self-hosted-registry-origin.md).** This ADR governs
+> [ADR-0033](./0033-schannel-server-tls-accept-on-windows.md),
+> [ADR-0043](./0043-self-hosted-registry-origin.md), and
+> [ADR-0050](./0050-outbound-tls-client-options.md).** This ADR governs
 > outbound clients. Server accept uses native SChannel on Windows,
 > socket-independent memory-BIO OpenSSL on Unix-not-Darwin, and public Secure
 > Transport at the HTTPClient seam on macOS. The registry prefers
 > Network.framework on macOS 26 and newer and uses Secure Transport on macOS
-> 15 and older.
+> 15 and older. Outbound clients may add trust anchors, present a client
+> certificate, or explicitly skip verification per ADR-0050.
 
 ## Executive Summary
 

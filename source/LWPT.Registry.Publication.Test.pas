@@ -865,7 +865,7 @@ begin
     nil).Status).ToBe(404);
   Expect<Integer>(Request('PUT', '/v1/objects/sha256/' + SHA256Hex(Archive)
     + '?token=' + FToken, FToken, Archive).Status).ToBe(400);
-  Secret := Copy(FToken, LastDelimiter('_', FToken) + 1, MaxInt);
+  Secret := Copy(FToken, Length(PROGRAM_NAME + '_rt1_') + 32 + 2, MaxInt);
   TokenID := Copy(FToken, Length(PROGRAM_NAME + '_rt1_') + 1, 32);
   Audits := AuditText;
   Expect<Boolean>(Pos(FToken, Audits) = 0).ToBe(True);

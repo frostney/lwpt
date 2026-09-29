@@ -301,7 +301,7 @@ begin
   Expect<Integer>(Upload(Archive, 'none').Status).ToBe(405);
   Token := IssueToken(['--packages', 'e2e-*', '--actions', 'publish,yank',
     '--label', 'ci']);
-  Secret := Copy(Token, LastDelimiter('_', Token) + 1, MaxInt);
+  Secret := Copy(Token, Length(PROGRAM_NAME + '_rt1_') + 32 + 2, MaxInt);
   TokenID := Copy(Token, Length(RegistryProgramName + '_rt1_') + 1, 32);
   Expect<Boolean>(Pos('"publication-v1"', RawHTTPBodyText(RawHTTPRequest(FPort,
     'GET', '/v1/capabilities', [], nil, False))) > 0).ToBe(True);

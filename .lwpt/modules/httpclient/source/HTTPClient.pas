@@ -14,7 +14,9 @@ unit HTTPClient;
 interface
 
 uses
-  SysUtils;
+  SysUtils,
+
+  TransportSecurity;
 
 type
   THTTPHeader = record
@@ -75,6 +77,15 @@ type
       the TLS server name; redirects dial their own hosts. Cannot be combined
       with an address policy. Empty dials the URL host as usual. }
     ConnectAddress: string;
+    { Outbound TLS client options (trust anchors, client identity, insecure
+      mode) for https hops to the request's own origin: the same scheme,
+      host, and port as the initial URL. A redirect to any other origin
+      connects with the default options (system trust, full verification,
+      no client certificate), so a client certificate, private trust
+      anchors, or an insecure exemption never follow a redirect off the
+      configured origin. The zero value is today's behaviour. Invalid
+      options fail before any connection is attempted. }
+    TLS: TTransportSecurityClientOptions;
   end;
 
   EHTTPError = class(Exception);
@@ -163,21 +174,21 @@ uses
   Sockets,
   {$IFDEF DARWIN}
   CTypes,
-  InitC,
+  InitC
   {$ELSE}
   {$IFDEF HTTPCLIENT_NATIVE_RESOLVER}
-  cNetDB,
+  cNetDB
   {$ELSE}
   { Preserve the existing resolver on other Unix targets until their native
     bindings have platform evidence; do not infer their addrinfo ABI. }
-  NetDB,
+  NetDB
   {$ENDIF}
   {$ENDIF}
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  WinSock2,
+  WinSock2
   {$ENDIF}
-  TransportSecurity;
+  ;
 
 const
   CRLF            = #13#10;
@@ -1823,6 +1834,21 @@ begin
     raise EHTTPError.Create('HTTP request timeout must be greater than zero');
   if AOptions.MaximumRedirects < 0 then
     raise EHTTPError.Create('HTTP maximum redirects must not be negative');
+  try
+    ValidateTransportSecurityClientOptions(AOptions.TLS);
+  except
+    on E: ETransportSecurityError do
+      raise EHTTPError.Create(E.Message);
+  end;
+end;
+
+{ True when AParsed names the same origin (scheme, host, port) as
+  AOrigin. Hosts compare case-insensitively, as HTTP origins do. }
+function IsSameHTTPOrigin(const AOrigin, AParsed: THTTPParsedURL): Boolean;
+begin
+  Result := (AOrigin.Scheme = AParsed.Scheme) and
+    SameText(AOrigin.Host, AParsed.Host) and
+    (AOrigin.Port = AParsed.Port);
 end;
 
 procedure ValidateRequestContentType(const AContentType: string);
@@ -1839,7 +1865,7 @@ function DoRequest(const AMethod, AURL: string;
   const AOptions: THTTPRequestOptions;
   const AMaxRedirects: Integer): THTTPResponse;
 var
-  Parsed: THTTPParsedURL;
+  Origin, Parsed: THTTPParsedURL;
   Sock: TSocket;
   Transport: TTransportSecurityConnection;
   Request: AnsiString;
@@ -1881,6 +1907,8 @@ begin
   begin
     CheckRequestDeadline(Deadline, AOptions.RequestTimeoutMilliseconds);
     Parsed := ParseHTTPURL(CurrentURL);
+    if Redirects = 0 then
+      Origin := Parsed;
     { Runs on every pass, so each redirect hop is checked exactly like the
       initial request before any connection is attempted. }
     DialTarget := ResolveAllowedDestination(AOptions.Destination, Parsed);
@@ -1900,9 +1928,17 @@ begin
       Sock := ConnectSocket(Parsed.Host, Parsed.Port, Deadline,
         AOptions.RequestTimeoutMilliseconds);
     try
+      { TLS options apply only to the configured origin; every other hop
+        uses the default, fully verified client. }
       if Parsed.Scheme = 'https' then
-        StartTransportSecurity(Transport, Sock, Parsed.Host, Deadline,
-          AOptions.RequestTimeoutMilliseconds);
+      begin
+        if IsSameHTTPOrigin(Origin, Parsed) then
+          StartTransportSecurity(Transport, Sock, Parsed.Host, AOptions.TLS,
+            Deadline, AOptions.RequestTimeoutMilliseconds)
+        else
+          StartTransportSecurity(Transport, Sock, Parsed.Host, Deadline,
+            AOptions.RequestTimeoutMilliseconds);
+      end;
 
       try
         // Build Host header value
@@ -2021,6 +2057,7 @@ begin
   Result.Destination.PrivateAddressPolicy := papAllow;
   Result.Destination.RequireHTTPS := False;
   Result.ConnectAddress := '';
+  Result.TLS := DefaultTransportSecurityClientOptions;
 end;
 
 function HTTPURLHost(const AURL: string): string;
