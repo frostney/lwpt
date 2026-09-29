@@ -1,10 +1,15 @@
 { Tests.TCPRelay -- a loopback TCP relay that counts connections.
 
-  Each accepted connection is joined to a new connection to the backend
-  port and bytes are copied both ways unchanged, so TLS passes through end
-  to end. Tests use the accept count to prove how many connections a client
-  made. Teardown shuts every socket down, so no copy thread outlives the
-  relay. }
+  Each accepted connection is joined to a new connection to the backend and
+  bytes are copied both ways unchanged, so TLS passes through end to end.
+  Tests use the accept count to prove how many connections a client made.
+
+  Every wait is bounded and cancellable: the accept loop polls its listener
+  in short slices, a backend connection must be established within
+  ConnectTimeoutMilliseconds (the client is closed otherwise), and teardown
+  first shuts every socket down, which ends every copy, and only then joins
+  the threads. No wake-up connection is needed, so teardown cannot depend on
+  allocating one. }
 unit Tests.TCPRelay;
 
 {$mode delphi}{$H+}
@@ -26,7 +31,8 @@ type
   private
     FListen: TSocket;
     FPort, FBackend: Word;
-    FAccepted: LongInt;
+    FBackendHost: string;
+    FAccepted, FFailedConnects: LongInt;
     FLock: TRTLCriticalSection;
     FSockets: array of TSocket;
     FPumps: TList;
@@ -34,14 +40,19 @@ type
     FWinSockStarted: Boolean;
     {$ENDIF}
     procedure Track(const ASocket: TSocket);
+    function ConnectBackend(out ASocket: TSocket): Boolean;
   protected
     procedure Execute; override;
   public
-    constructor Create(const ABackend: Word);
+    { Bound on establishing one backend connection. }
+    ConnectTimeoutMilliseconds: Cardinal;
+    constructor Create(const ABackend: Word; const ABackendHost: string = '127.0.0.1');
     destructor Destroy; override;
     property Port: Word read FPort;
     property Backend: Word read FBackend write FBackend;
     function Accepted: Integer;
+    { Backend connections that failed or timed out. }
+    function FailedConnects: Integer;
   end;
 
 implementation
@@ -52,6 +63,7 @@ uses
 {$ENDIF}
 
 const
+  POLL_MILLISECONDS = 50;
   {$IFDEF LINUX}
   RELAY_SEND_FLAGS = $4000; { MSG_NOSIGNAL }
   {$ELSE}
@@ -59,9 +71,6 @@ const
   {$ENDIF}
   {$IFDEF DARWIN}
   RELAY_SO_NOSIGPIPE = $1022;
-  {$ENDIF}
-  {$IFDEF UNIX}
-  RELAY_SHUT_RDWR = 2;
   {$ENDIF}
 
 type
@@ -83,22 +92,77 @@ begin
   {$ENDIF}
 end;
 
-procedure PrepareRelaySocket(const ASocket: TSocket);
+function NewRelaySocket: TSocket;
 {$IFDEF DARWIN}
 var
   Enabled: LongInt;
 {$ENDIF}
 begin
+  {$IFDEF UNIX}
+  Result := fpSocket(AF_INET, SOCK_STREAM, 0);
+  {$ELSE}
+  Result := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
+  {$ENDIF}
   {$IFDEF DARWIN}
-  Enabled := 1;
-  fpSetSockOpt(ASocket, SOL_SOCKET, RELAY_SO_NOSIGPIPE, @Enabled, SizeOf(Enabled));
+  if RelaySocketValid(Result) then
+  begin
+    Enabled := 1;
+    fpSetSockOpt(Result, SOL_SOCKET, RELAY_SO_NOSIGPIPE, @Enabled, SizeOf(Enabled));
+  end;
+  {$ENDIF}
+end;
+
+procedure SetRelayBlocking(const ASocket: TSocket; const ABlocking: Boolean);
+var
+  {$IFDEF UNIX}
+  Flags: LongInt;
+  {$ELSE}
+  Mode: u_long;
+  {$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Flags := fpFcntl(ASocket, F_GETFL, 0);
+  if ABlocking then Flags := Flags and not O_NONBLOCK
+  else Flags := Flags or O_NONBLOCK;
+  fpFcntl(ASocket, F_SETFL, Flags);
+  {$ELSE}
+  if ABlocking then Mode := 0 else Mode := 1;
+  WinSock2.ioctlsocket(ASocket, LongInt(FIONBIO), Mode);
+  {$ENDIF}
+end;
+
+{ Waits up to AMilliseconds for ASocket to become readable (AWrite False)
+  or writable (AWrite True). }
+function WaitRelaySocket(const ASocket: TSocket; const AWrite: Boolean;
+  const AMilliseconds: Cardinal): Boolean;
+var
+  {$IFDEF UNIX}
+  Sets: TFDSet;
+  Timeout: TTimeVal;
+  {$ELSE}
+  Sets: TFDSet;
+  Timeout: TTimeVal;
+  {$ENDIF}
+begin
+  Timeout.tv_sec := AMilliseconds div 1000;
+  Timeout.tv_usec := (AMilliseconds mod 1000) * 1000;
+  {$IFDEF UNIX}
+  fpFD_ZERO(Sets);
+  fpFD_SET(ASocket, Sets);
+  if AWrite then Result := fpSelect(ASocket + 1, nil, @Sets, nil, @Timeout) > 0
+  else Result := fpSelect(ASocket + 1, @Sets, nil, nil, @Timeout) > 0;
+  {$ELSE}
+  FD_ZERO(Sets);
+  FD_SET(ASocket, Sets);
+  if AWrite then Result := WinSock2.select(0, nil, @Sets, nil, @Timeout) > 0
+  else Result := WinSock2.select(0, @Sets, nil, nil, @Timeout) > 0;
   {$ENDIF}
 end;
 
 procedure ShutdownRelaySocket(const ASocket: TSocket);
 begin
   {$IFDEF UNIX}
-  fpShutdown(ASocket, RELAY_SHUT_RDWR);
+  fpShutdown(ASocket, 2);
   {$ELSE}
   WinSock2.shutdown(ASocket, SD_BOTH);
   {$ENDIF}
@@ -113,16 +177,17 @@ begin
   {$ENDIF}
 end;
 
-function LoopbackAddress(const APort: Word): {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
+function RelayAddress(const AHost: string;
+  const APort: Word): {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
 begin
   FillChar(Result, SizeOf(Result), 0);
   Result.sin_family := AF_INET;
   {$IFDEF UNIX}
   Result.sin_port := htons(APort);
-  Result.sin_addr := StrToNetAddr('127.0.0.1');
+  Result.sin_addr := StrToNetAddr(AHost);
   {$ELSE}
   Result.sin_port := WinSock2.htons(APort);
-  Result.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
+  Result.sin_addr.S_addr := WinSock2.inet_addr(PAnsiChar(AnsiString(AHost)));
   {$ENDIF}
 end;
 
@@ -166,7 +231,7 @@ begin
   {$ENDIF}
 end;
 
-constructor TTCPRelay.Create(const ABackend: Word);
+constructor TTCPRelay.Create(const ABackend: Word; const ABackendHost: string);
 var
   Address: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
   Length_: {$IFDEF UNIX}TSockLen{$ELSE}LongInt{$ENDIF};
@@ -175,6 +240,8 @@ var
   {$ENDIF}
 begin
   FBackend := ABackend;
+  FBackendHost := ABackendHost;
+  ConnectTimeoutMilliseconds := 5000;
   FreeOnTerminate := False;
   InitCriticalSection(FLock);
   FPumps := TList.Create;
@@ -182,13 +249,11 @@ begin
   if WSAStartup($0202, Data) <> 0 then
     raise Exception.Create('relay WSAStartup failed');
   FWinSockStarted := True;
-  FListen := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
-  {$ELSE}
-  FListen := fpSocket(AF_INET, SOCK_STREAM, 0);
   {$ENDIF}
+  FListen := NewRelaySocket;
   if not RelaySocketValid(FListen) then
     raise Exception.Create('relay socket failed');
-  Address := LoopbackAddress(0);
+  Address := RelayAddress('127.0.0.1', 0);
   Length_ := SizeOf(Address);
   {$IFDEF UNIX}
   if (fpBind(FListen, @Address, SizeOf(Address)) <> 0)
@@ -222,6 +287,52 @@ begin
   Result := InterlockedCompareExchange(FAccepted, 0, 0);
 end;
 
+function TTCPRelay.FailedConnects: Integer;
+begin
+  Result := InterlockedCompareExchange(FFailedConnects, 0, 0);
+end;
+
+{ A nonblocking connection, polled in short slices until it is
+  established, fails, times out, or the relay is terminated. }
+function TTCPRelay.ConnectBackend(out ASocket: TSocket): Boolean;
+var
+  Address: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
+  Started: QWord;
+  SocketError: LongInt;
+  ErrorLength: {$IFDEF UNIX}TSockLen{$ELSE}LongInt{$ENDIF};
+begin
+  Result := False;
+  ASocket := NewRelaySocket;
+  if not RelaySocketValid(ASocket) then Exit;
+  Track(ASocket);
+  SetRelayBlocking(ASocket, False);
+  Address := RelayAddress(FBackendHost, FBackend);
+  {$IFDEF UNIX}
+  fpConnect(ASocket, @Address, SizeOf(Address));
+  {$ELSE}
+  WinSock2.connect(ASocket, PSockAddr(@Address), SizeOf(Address));
+  {$ENDIF}
+  Started := GetTickCount64;
+  repeat
+    if Terminated then Exit;
+    if WaitRelaySocket(ASocket, True, POLL_MILLISECONDS) then
+    begin
+      SocketError := 0;
+      ErrorLength := SizeOf(SocketError);
+      {$IFDEF UNIX}
+      if fpGetSockOpt(ASocket, SOL_SOCKET, SO_ERROR, @SocketError, @ErrorLength) <> 0 then
+        Exit;
+      {$ELSE}
+      if WinSock2.getsockopt(ASocket, SOL_SOCKET, SO_ERROR, PChar(@SocketError),
+        ErrorLength) <> 0 then Exit;
+      {$ENDIF}
+      if SocketError <> 0 then Exit;
+      SetRelayBlocking(ASocket, True);
+      Exit(True);
+    end;
+  until GetTickCount64 - Started >= ConnectTimeoutMilliseconds;
+end;
+
 procedure TTCPRelay.Execute;
 var
   Client, Upstream: TSocket;
@@ -230,45 +341,20 @@ var
 begin
   while not Terminated do
   begin
+    if not WaitRelaySocket(FListen, False, POLL_MILLISECONDS) then Continue;
+    if Terminated then Break;
     Length_ := SizeOf(Address);
     {$IFDEF UNIX}
     Client := fpAccept(FListen, @Address, @Length_);
     {$ELSE}
     Client := WinSock2.accept(FListen, PSockAddr(@Address), @Length_);
     {$ENDIF}
-    if not RelaySocketValid(Client) then
-    begin
-      if Terminated then Break;
-      Sleep(1);
-      Continue;
-    end;
-    if Terminated then
-    begin
-      CloseRelaySocket(Client);
-      Break;
-    end;
+    if not RelaySocketValid(Client) then Continue;
     InterlockedIncrement(FAccepted);
     Track(Client);
-    PrepareRelaySocket(Client);
-    {$IFDEF UNIX}
-    Upstream := fpSocket(AF_INET, SOCK_STREAM, 0);
-    {$ELSE}
-    Upstream := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
-    {$ENDIF}
-    if not RelaySocketValid(Upstream) then
+    if not ConnectBackend(Upstream) then
     begin
-      ShutdownRelaySocket(Client);
-      Continue;
-    end;
-    Track(Upstream);
-    PrepareRelaySocket(Upstream);
-    Address := LoopbackAddress(FBackend);
-    {$IFDEF UNIX}
-    if fpConnect(Upstream, @Address, SizeOf(Address)) <> 0 then
-    {$ELSE}
-    if WinSock2.connect(Upstream, PSockAddr(@Address), SizeOf(Address)) <> 0 then
-    {$ENDIF}
-    begin
+      InterlockedIncrement(FFailedConnects);
       ShutdownRelaySocket(Client);
       Continue;
     end;
@@ -279,34 +365,21 @@ end;
 
 destructor TTCPRelay.Destroy;
 var
-  Wake: TSocket;
-  Address: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
   Index: Integer;
 begin
+  { Cancel first, then join: the accept loop and a pending backend
+    connection notice Terminated within one poll slice, and shut-down
+    sockets end every copy. }
   Terminate;
-  { Wake the blocking accept with one last connection. }
-  {$IFDEF UNIX}
-  Wake := fpSocket(AF_INET, SOCK_STREAM, 0);
-  {$ELSE}
-  Wake := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
-  {$ENDIF}
-  if RelaySocketValid(Wake) then
-  begin
-    Address := LoopbackAddress(FPort);
-    {$IFDEF UNIX}
-    fpConnect(Wake, @Address, SizeOf(Address));
-    {$ELSE}
-    WinSock2.connect(Wake, PSockAddr(@Address), SizeOf(Address));
-    {$ENDIF}
-    CloseRelaySocket(Wake);
-  end;
-  WaitFor;
   EnterCriticalSection(FLock);
   try
     for Index := 0 to High(FSockets) do ShutdownRelaySocket(FSockets[Index]);
   finally
     LeaveCriticalSection(FLock);
   end;
+  WaitFor;
+  { Sockets tracked after the first sweep, and the copies' own ends. }
+  for Index := 0 to High(FSockets) do ShutdownRelaySocket(FSockets[Index]);
   for Index := 0 to FPumps.Count - 1 do
   begin
     TRelayPump(FPumps[Index]).WaitFor;
