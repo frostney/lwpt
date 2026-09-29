@@ -55,6 +55,7 @@ program	*	source/LWPT.ManifestEdit.Test.pas	5	31
 program	*	source/LWPT.Observability.Test.pas	1	6
 program	*	source/LWPT.ObjectStore.Test.pas	1	14
 program	unix/*	source/LWPT.ObjectStore.Test.pas	1	15
+program	*	source/LWPT.Registry.Consumer.Test.pas	1	20
 program	*	source/LWPT.Registry.Crypto.Test.pas	1	6
 program	*	source/LWPT.Registry.Mirror.Test.pas	1	40
 program	*	source/LWPT.Registry.Store.Test.pas	1	45
@@ -65,7 +66,7 @@ program	*	source/LWPT.ProcessTree.Test.pas	1	5
 program	unix/*	source/LWPT.ProcessTree.Test.pas	2	18
 program	*	source/LWPT.ProducerLease.Test.pas	1	6
 program	unix/*	source/LWPT.ProducerLease.Test.pas	1	7
-program	*	source/LWPT.Resolver.Test.pas	1	7
+program	*	source/LWPT.Resolver.Test.pas	1	13
 program	*	source/LWPT.WorkerBudget.Test.pas	1	26
 program	darwin/*	source/LWPT.WorkerBudget.Test.pas	1	27
 program	linux/*	source/LWPT.WorkerBudget.Test.pas	1	27
@@ -96,6 +97,7 @@ program	*	tests/integration/Init.Test.pas	1	21
 program	*	tests/integration/InstallCommitPin.Test.pas	1	12
 program	*	tests/integration/InstallFetchFailure.Test.pas	4	24
 program	*	tests/integration/InstallGitGraph.Test.pas	1	31
+program	*	tests/integration/InstallRegistry.Test.pas	1	34
 program	*	tests/integration/InstallGraphConflict.Test.pas	1	20
 program	*	tests/integration/InstallLocalDiamond.Test.pas	2	10
 program	*	tests/integration/InstallNestedManifest.Test.pas	1	4
