@@ -7,8 +7,8 @@
   Every wait is bounded and cancellable: the listener is nonblocking and
   polled in short slices, so an accept whose readiness disappeared (a
   connection reset or taken before accept) returns at once instead of
-  blocking; accepted sockets are made blocking for the copies; a backend
-  connection must be established within
+  blocking; the copies poll nonblocking sockets in both directions; a
+  backend connection must be established within
   ConnectTimeoutMilliseconds (the client is closed otherwise), and teardown
   first shuts every socket down, which ends every copy, and only then joins
   the threads. No wake-up connection is needed, so teardown cannot depend on
@@ -35,7 +35,7 @@ type
     FListen: TSocket;
     FPort, FBackend: Word;
     FBackendHost: string;
-    FAccepted, FFailedConnects: LongInt;
+    FAccepted, FFailedConnects, FSendStalls: LongInt;
     FLock: TRTLCriticalSection;
     FSockets: array of TSocket;
     FPumps: TList;
@@ -63,6 +63,8 @@ type
     function Accepted: Integer;
     { Backend connections that failed or timed out. }
     function FailedConnects: Integer;
+    { Times a copy found its destination not accepting more bytes. }
+    function SendStalls: Integer;
   end;
 
 implementation
@@ -86,11 +88,12 @@ const
 type
   TRelayPump = class(TThread)
   private
+    FOwner: TTCPRelay;
     FFrom, FTo: TSocket;
   protected
     procedure Execute; override;
   public
-    constructor Create(const AFrom, ATo: TSocket);
+    constructor Create(AOwner: TTCPRelay; const AFrom, ATo: TSocket);
   end;
 
 function RelaySocketValid(const ASocket: TSocket): Boolean;
@@ -202,12 +205,26 @@ begin
   {$ENDIF}
 end;
 
-constructor TRelayPump.Create(const AFrom, ATo: TSocket);
+constructor TRelayPump.Create(AOwner: TTCPRelay; const AFrom, ATo: TSocket);
 begin
+  FOwner := AOwner;
   FFrom := AFrom;
   FTo := ATo;
   FreeOnTerminate := False;
   inherited Create(False);
+end;
+
+function RelayWouldBlock: Boolean;
+var
+  Code: Integer;
+begin
+  {$IFDEF UNIX}
+  Code := fpGetErrNo;
+  Result := (Code = ESysEAGAIN) or (Code = ESysEWOULDBLOCK) or (Code = ESysEINTR);
+  {$ELSE}
+  Code := WSAGetLastError;
+  Result := (Code = WSAEWOULDBLOCK) or (Code = WSAEINTR);
+  {$ENDIF}
 end;
 
 procedure TRelayPump.Execute;
@@ -215,10 +232,12 @@ var
   Buffer: array[0..16383] of Byte;
   Received, Sent, Offset: Integer;
 begin
+  { Both sockets are nonblocking and every wait is a short poll, so a
+    teardown's Terminate ends the copy whichever side stalls: a source
+    that never sends, or a destination that stops reading. Windows does not
+    wake a blocked call on a socket another thread shuts down, and Wine
+    defers the write shutdown until queued writes finish. }
   repeat
-    { Polled, so teardown ends a copy through Terminate on every platform:
-      Windows does not wake a receive blocked on a socket that another
-      thread shuts down. }
     if Terminated then Exit;
     if not WaitRelaySocket(FFrom, False, POLL_MILLISECONDS) then Continue;
     {$IFDEF UNIX}
@@ -226,15 +245,27 @@ begin
     {$ELSE}
     Received := WinSock2.recv(FFrom, Buffer[0], SizeOf(Buffer), 0);
     {$ENDIF}
+    if (Received < 0) and RelayWouldBlock then Continue;
     if Received <= 0 then Break;
     Offset := 0;
     while Offset < Received do
     begin
+      if Terminated then Exit;
+      if not WaitRelaySocket(FTo, True, POLL_MILLISECONDS) then
+      begin
+        InterlockedIncrement(FOwner.FSendStalls);
+        Continue;
+      end;
       {$IFDEF UNIX}
       Sent := fpSend(FTo, @Buffer[Offset], Received - Offset, RELAY_SEND_FLAGS);
       {$ELSE}
       Sent := WinSock2.send(FTo, Buffer[Offset], Received - Offset, 0);
       {$ENDIF}
+      if (Sent < 0) and RelayWouldBlock then
+      begin
+        InterlockedIncrement(FOwner.FSendStalls);
+        Continue;
+      end;
       if Sent <= 0 then Exit;
       Inc(Offset, Sent);
     end;
@@ -305,6 +336,11 @@ begin
   Result := InterlockedCompareExchange(FAccepted, 0, 0);
 end;
 
+function TTCPRelay.SendStalls: Integer;
+begin
+  Result := InterlockedCompareExchange(FSendStalls, 0, 0);
+end;
+
 function TTCPRelay.FailedConnects: Integer;
 begin
   Result := InterlockedCompareExchange(FFailedConnects, 0, 0);
@@ -345,7 +381,8 @@ begin
         ErrorLength) <> 0 then Exit;
       {$ENDIF}
       if SocketError <> 0 then Exit;
-      Exit(SetRelayBlocking(ASocket, True));
+      { Stays nonblocking for the polled copies. }
+      Exit(True);
     end;
   until GetTickCount64 - Started >= ConnectTimeoutMilliseconds;
 end;
@@ -371,9 +408,9 @@ begin
     if not RelaySocketValid(Client) then Continue;
     InterlockedIncrement(FAccepted);
     Track(Client);
-    { Some platforms (BSD, Windows) hand the listener's nonblocking mode to
-      accepted sockets; the copies block. }
-    if not SetRelayBlocking(Client, True) then
+    { The copies poll nonblocking sockets; set the mode explicitly, since
+      only some platforms (BSD, Windows) inherit it from the listener. }
+    if not SetRelayBlocking(Client, False) then
     begin
       ShutdownRelaySocket(Client);
       Continue;
@@ -384,8 +421,8 @@ begin
       ShutdownRelaySocket(Client);
       Continue;
     end;
-    FPumps.Add(TRelayPump.Create(Client, Upstream));
-    FPumps.Add(TRelayPump.Create(Upstream, Client));
+    FPumps.Add(TRelayPump.Create(Self, Client, Upstream));
+    FPumps.Add(TRelayPump.Create(Self, Upstream, Client));
   end;
 end;
 

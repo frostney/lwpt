@@ -10,6 +10,7 @@ program TCPRelay.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   Sockets,
   {$ENDIF}
   {$IFDEF MSWINDOWS}
@@ -39,6 +40,21 @@ type
     procedure TestStalledBackendConnectionIsBounded;
     procedure TestTeardownWhileCopiesAreBlocked;
     procedure TestReadinessThatDisappearsBeforeAccept;
+    procedure TestTeardownWithSaturatedOutput;
+  end;
+
+  { A backend that accepts one connection and sends as fast as it can,
+    polling a nonblocking socket so it stops on Terminate. }
+  TFlooder = class(TThread)
+  private
+    FListen, FClient: TSocket;
+    FPort: Word;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    property Port: Word read FPort;
   end;
 
   { Takes the pending connection off the relay's listener after the
@@ -169,6 +185,169 @@ begin
   end;
 end;
 
+function SocketValid(const ASocket: TSocket): Boolean;
+begin
+  {$IFDEF UNIX}
+  Result := ASocket >= 0;
+  {$ELSE}
+  Result := ASocket <> INVALID_SOCKET;
+  {$ENDIF}
+end;
+
+procedure CloseTestSocket(const ASocket: TSocket);
+begin
+  if not SocketValid(ASocket) then Exit;
+  {$IFDEF UNIX}
+  CloseSocket(ASocket);
+  {$ELSE}
+  WinSock2.closesocket(ASocket);
+  {$ENDIF}
+end;
+
+function PollSocket(const ASocket: TSocket; const AWrite: Boolean): Boolean;
+var
+  Sets: TFDSet;
+  Timeout: TTimeVal;
+begin
+  Timeout.tv_sec := 0;
+  Timeout.tv_usec := 50000;
+  {$IFDEF UNIX}
+  fpFD_ZERO(Sets);
+  fpFD_SET(ASocket, Sets);
+  if AWrite then Result := fpSelect(ASocket + 1, nil, @Sets, nil, @Timeout) > 0
+  else Result := fpSelect(ASocket + 1, @Sets, nil, nil, @Timeout) > 0;
+  {$ELSE}
+  FD_ZERO(Sets);
+  FD_SET(ASocket, Sets);
+  if AWrite then Result := WinSock2.select(0, nil, @Sets, nil, @Timeout) > 0
+  else Result := WinSock2.select(0, @Sets, nil, nil, @Timeout) > 0;
+  {$ENDIF}
+end;
+
+procedure SetNonblocking(const ASocket: TSocket);
+{$IFDEF MSWINDOWS}
+var
+  Mode: u_long;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  fpFcntl(ASocket, F_SETFL, fpFcntl(ASocket, F_GETFL, 0) or O_NONBLOCK);
+  {$ELSE}
+  Mode := 1;
+  WinSock2.ioctlsocket(ASocket, LongInt(FIONBIO), Mode);
+  {$ENDIF}
+end;
+
+constructor TFlooder.Create;
+var
+  Address: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
+  Length_: {$IFDEF UNIX}TSockLen{$ELSE}LongInt{$ENDIF};
+  {$IFDEF MSWINDOWS}
+  Data: TWSAData;
+  {$ENDIF}
+begin
+  FreeOnTerminate := False;
+  {$IFDEF MSWINDOWS}
+  if WSAStartup($0202, Data) <> 0 then
+    raise Exception.Create('flooder WSAStartup failed');
+  {$ENDIF}
+  {$IFDEF UNIX}
+  FClient := -1;
+  FListen := fpSocket(AF_INET, SOCK_STREAM, 0);
+  {$ELSE}
+  FClient := INVALID_SOCKET;
+  FListen := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
+  {$ENDIF}
+  FillChar(Address, SizeOf(Address), 0);
+  Address.sin_family := AF_INET;
+  Length_ := SizeOf(Address);
+  {$IFDEF UNIX}
+  Address.sin_addr := StrToNetAddr('127.0.0.1');
+  if (fpBind(FListen, @Address, SizeOf(Address)) <> 0)
+    or (fpListen(FListen, 4) <> 0)
+    or (fpGetSockName(FListen, @Address, @Length_) <> 0) then
+    raise Exception.Create('flooder listen failed');
+  FPort := ntohs(Address.sin_port);
+  {$ELSE}
+  Address.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
+  if (WinSock2.bind(FListen, PSockAddr(@Address), SizeOf(Address)) <> 0)
+    or (WinSock2.listen(FListen, 4) <> 0)
+    or (WinSock2.getsockname(FListen, Address, Length_) <> 0) then
+    raise Exception.Create('flooder listen failed');
+  FPort := WinSock2.ntohs(Address.sin_port);
+  {$ENDIF}
+  SetNonblocking(FListen);
+  inherited Create(False);
+end;
+
+procedure TFlooder.Execute;
+var
+  Chunk: array[0..65535] of Byte;
+  Sent: Integer;
+begin
+  FillChar(Chunk, SizeOf(Chunk), $5a);
+  while not Terminated and not SocketValid(FClient) do
+    if PollSocket(FListen, False) then
+    begin
+      {$IFDEF UNIX}
+      FClient := fpAccept(FListen, nil, nil);
+      {$ELSE}
+      FClient := WinSock2.accept(FListen, nil, nil);
+      {$ENDIF}
+      if SocketValid(FClient) then SetNonblocking(FClient);
+    end;
+  while not Terminated do
+  begin
+    if not PollSocket(FClient, True) then Continue;
+    {$IFDEF UNIX}
+    Sent := fpSend(FClient, @Chunk[0], SizeOf(Chunk), {$IFDEF LINUX}$4000{$ELSE}0{$ENDIF});
+    {$ELSE}
+    Sent := WinSock2.send(FClient, Chunk[0], SizeOf(Chunk), 0);
+    {$ENDIF}
+    if Sent = 0 then Exit;
+  end;
+end;
+
+destructor TFlooder.Destroy;
+begin
+  Terminate;
+  WaitFor;
+  CloseTestSocket(FClient);
+  CloseTestSocket(FListen);
+  {$IFDEF MSWINDOWS}
+  WSACleanup;
+  {$ENDIF}
+  inherited Destroy;
+end;
+
+procedure TTCPRelayTests.TestTeardownWithSaturatedOutput;
+var
+  Flooder: TFlooder;
+  Relay: TTCPRelay;
+  Client: TRawHTTPConnection;
+  Started: QWord;
+begin
+  { The backend floods and the client never reads: the copy toward the
+    client fills every buffer and finds its destination full. Teardown
+    must still end it at once. }
+  Flooder := TFlooder.Create;
+  try
+    Relay := TTCPRelay.Create(Flooder.Port);
+    Client := TRawHTTPConnection.Create(Relay.Port);
+    try
+      Started := GetTickCount64;
+      while (Relay.SendStalls = 0) and (GetTickCount64 - Started < 10000) do
+        Sleep(20);
+      Expect<Boolean>(Relay.SendStalls > 0).ToBe(True);
+      Expect<Boolean>(TimedFree(Relay) < TEARDOWN_BOUND_MILLISECONDS).ToBe(True);
+    finally
+      Client.Free;
+    end;
+  finally
+    Flooder.Free;
+  end;
+end;
+
 procedure TAcceptThief.Steal(ASender: TObject);
 var
   Relay: TTCPRelay;
@@ -229,6 +408,8 @@ begin
     TestTeardownWhileCopiesAreBlocked);
   Test('readiness that disappears before accept never blocks the relay',
     TestReadinessThatDisappearsBeforeAccept);
+  Test('teardown ends a copy whose destination stopped reading',
+    TestTeardownWithSaturatedOutput);
 end;
 
 begin
