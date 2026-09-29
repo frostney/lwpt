@@ -81,7 +81,11 @@ type
     FCoordinator: TLWPTProducerLeaseCoordinator;
     function AcquireGuard: TObject;
     procedure ReclaimUnderGuard;
-    procedure ScanUnderGuard(out ABytes: Int64; out AEntries: Integer);
+    procedure ScanUnderGuard(out ABytes: Int64; out AEntries: Integer;
+      out AExpiredBytes: Int64; out AExpiredEntries: Integer);
+    function TryAdmit(const ALength: Int64;
+      const AFinal: Boolean): TLWPTRegistryUpload;
+    procedure ExpireAsPublicationHolder;
   public
     constructor Create(const ARoot: string);
     destructor Destroy; override;
@@ -111,7 +115,9 @@ function RegistryUploadIDIsValid(const AValue: string): Boolean;
 type
   TRegistryIncomingHook = procedure(const APoint: string) of object;
 { Runs while the guard is held at 'admission-scan' (after incoming/sha256/,
-  before the root), 'reclaim', 'expire', 'complete', and 'adopt'. }
+  before the root), 'reclaim', 'expire', 'complete', and 'adopt'; and at
+  'expiry-owned' once admission owns the publication lease to remove
+  expired uploads, before it waits for the guard. }
 procedure SetRegistryIncomingHookForTesting(AHook: TRegistryIncomingHook);
 {$ENDIF}
 
@@ -270,11 +276,15 @@ begin
 end;
 
 procedure TLWPTRegistryIncoming.ScanUnderGuard(out ABytes: Int64;
-  out AEntries: Integer);
+  out AEntries: Integer; out AExpiredBytes: Int64;
+  out AExpiredEntries: Integer);
+var
+  Cutoff: TDateTime;
 
-  procedure ScanDirectory(const ADirectory: string);
+  procedure ScanDirectory(const ADirectory: string; const ACompleted: Boolean);
   var
     Search: TSearchRec;
+    Stamp: TDateTime;
   begin
     if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ADirectory) + '*',
       faAnyFile or faSymLink, Search) <> 0 then Exit;
@@ -285,6 +295,14 @@ procedure TLWPTRegistryIncoming.ScanUnderGuard(out ABytes: Int64;
           and ((Search.Attr and faSymLink) = 0) then Continue;
         Inc(ABytes, Int64(Search.Size));
         Inc(AEntries);
+        if ACompleted and IsLowerHex64(Search.Name)
+          and ((Search.Attr and faDirectory) = 0)
+          and FileAge(IncludeTrailingPathDelimiter(ADirectory) + Search.Name, Stamp)
+          and (Stamp < Cutoff) then
+        begin
+          Inc(AExpiredBytes, Int64(Search.Size));
+          Inc(AExpiredEntries);
+        end;
       until SysUtils.FindNext(Search) <> 0;
     finally
       SysUtils.FindClose(Search);
@@ -294,36 +312,70 @@ procedure TLWPTRegistryIncoming.ScanUnderGuard(out ABytes: Int64;
 begin
   ABytes := 0;
   AEntries := 0;
+  AExpiredBytes := 0;
+  AExpiredEntries := 0;
+  Cutoff := IncSecond(Now, -RegistryIncomingExpirySeconds);
   { Completed entries first, then reservations. Every transition between the
     two happens under the guard this scan holds, so none is missed. }
-  ScanDirectory(FCompletedRoot);
+  ScanDirectory(FCompletedRoot, True);
   {$IFDEF REGISTRY_TESTING}
   RunHook('admission-scan');
   {$ENDIF}
-  ScanDirectory(FIncomingRoot);
+  ScanDirectory(FIncomingRoot, False);
 end;
 
 procedure TLWPTRegistryIncoming.Usage(out ABytes: Int64;
   out AEntries: Integer);
 var
   Guard: TObject;
+  ExpiredBytes: Int64;
+  ExpiredEntries: Integer;
 begin
   Guard := AcquireGuard;
   try
-    ScanUnderGuard(ABytes, AEntries);
+    ScanUnderGuard(ABytes, AEntries, ExpiredBytes, ExpiredEntries);
   finally
     Guard.Free;
   end;
 end;
 
-function TLWPTRegistryIncoming.Admit(const ALength: Int64): TLWPTRegistryUpload;
+type
+  { Admission would fit once expired completed uploads are removed. }
+  ELWPTRegistryExpiredCharge = class(ELWPTRegistryIncomingFull);
+
+procedure TLWPTRegistryIncoming.ExpireAsPublicationHolder;
 var
-  Charged: Int64;
-  Entries: Integer;
-  Guard, Publication: TObject;
-  Lease: TLWPTProducerLease;
-  UploadID, PartPath: string;
-  Stream: TFileStream;
+  Deadline: QWord;
+  Publication: TObject;
+  Swept: Boolean;
+begin
+  { Completed uploads expire only under the publication lease. Admission
+    holds no lease here, so waiting for publication ownership and then for
+    the accounting guard keeps the publication-then-incoming order. Both
+    waits are bounded; a timeout is a retryable busy answer. }
+  Deadline := GetTickCount64 + RegistryPublicationLeaseWaitMilliseconds;
+  repeat
+    Publication := FCoordinator.TryAcquireGuard(REGISTRY_PUBLICATION_LEASE);
+    if Assigned(Publication) then Break;
+    if GetTickCount64 >= Deadline then
+      raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+        'expired uploads cannot be removed while another publication runs');
+    Sleep(10);
+  until False;
+  try
+    {$IFDEF REGISTRY_TESTING}
+    RunHook('expiry-owned');
+    {$ENDIF}
+    Swept := Sweep(True);
+  finally
+    Publication.Free;
+  end;
+  if not Swept then
+    raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+      'the upload staging guard is busy');
+end;
+
+function TLWPTRegistryIncoming.Admit(const ALength: Int64): TLWPTRegistryUpload;
 begin
   if (ALength < 0) or (ALength > RegistryMaximumArchiveBytes) then
     raise ELWPTRegistryError.CreateStable('payload_too_large',
@@ -333,18 +385,29 @@ begin
     or IsDirSymlinkOrJunction(FCompletedRoot) then
     raise ELWPTRegistryError.CreateStable('registry_path_link',
       'registry paths cannot contain symbolic links or reparse points');
-  { Completed uploads expire only under the publication lease. When no
-    publication holds it, admission briefly becomes that holder, so expired
-    uploads cannot keep refusing admissions. The lease is only tried, and it
-    is released before the upload's own lease is taken, which keeps the
-    publication, upload, incoming order. }
-  Publication := FCoordinator.TryAcquireGuard(REGISTRY_PUBLICATION_LEASE);
-  if Assigned(Publication) then
   try
-    Sweep(False);
-  finally
-    Publication.Free;
+    Result := TryAdmit(ALength, False);
+  except
+    on E: ELWPTRegistryExpiredCharge do
+    begin
+      { Capacity is held by expired uploads: remove them, then admit once
+        more. A second refusal is final. }
+      ExpireAsPublicationHolder;
+      Result := TryAdmit(ALength, True);
+    end;
   end;
+end;
+
+function TLWPTRegistryIncoming.TryAdmit(const ALength: Int64;
+  const AFinal: Boolean): TLWPTRegistryUpload;
+var
+  Charged, ExpiredBytes: Int64;
+  Entries, ExpiredEntries: Integer;
+  Guard: TObject;
+  Lease: TLWPTProducerLease;
+  UploadID, PartPath: string;
+  Stream: TFileStream;
+begin
   UploadID := NewUploadID;
   { The upload's own lease is taken before its reservation exists and before
     any other lease is held. }
@@ -359,11 +422,18 @@ begin
     Guard := AcquireGuard;
     try
       ReclaimUnderGuard;
-      ScanUnderGuard(Charged, Entries);
+      ScanUnderGuard(Charged, Entries, ExpiredBytes, ExpiredEntries);
       if (Entries + 1 > RegistryIncomingBudgetEntries)
         or (ALength > RegistryIncomingBudgetBytes - Charged) then
+      begin
+        if not AFinal and (ExpiredEntries > 0)
+          and (Entries - ExpiredEntries + 1 <= RegistryIncomingBudgetEntries)
+          and (ALength <= RegistryIncomingBudgetBytes - (Charged - ExpiredBytes)) then
+          raise ELWPTRegistryExpiredCharge.CreateStable('storage_budget_exceeded',
+            'expired uploads hold the budget');
         raise ELWPTRegistryIncomingFull.CreateStable('storage_budget_exceeded',
           'unreferenced uploads would exceed their budget');
+      end;
       Stream := TFileStream.Create(PartPath, fmCreate);
       try
         Stream.Size := ALength;

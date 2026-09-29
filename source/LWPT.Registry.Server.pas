@@ -128,6 +128,12 @@ function RegistryDispatch(AStore: TLWPTRegistryStore;
   const AHead: TLWPTRegistryRequestHead; AProgress: TSHA256Progress;
   out AMutation: TLWPTRegistryMutation): TLWPTRegistryHTTPResponse;
 function RegistryBodyDeadlineMilliseconds(const ABodyLength: Int64): QWord;
+function RegistryHeaderDeadlineMilliseconds: QWord;
+{ Audits a mutating request whose head never completed (peer EOF, a read
+  failure, or the header deadline). Only a recognizable method is kept, and
+  no response is sent. }
+procedure RegistryAuditIncompleteRequest(AHandler: TLWPTRegistryMutationHandler;
+  const ARaw, APeer: string; const ATimedOut: Boolean);
 { The error for a request whose head could not be parsed or was too large.
   A recognizable mutating method is answered and audited through AHandler;
   only that method name is taken from ARaw. }
@@ -145,6 +151,8 @@ function OpenRegistryHTTPResource(const AResponse: TLWPTRegistryHTTPResponse;
 {$IFDEF REGISTRY_TESTING}
 { Replaces the 30-second body deadline base; zero restores it. }
 procedure SetRegistryBodyDeadlineForTesting(const ABaseMilliseconds: QWord);
+{ Replaces the 10-second header deadline; zero restores it. }
+procedure SetRegistryHeaderDeadlineForTesting(const AMilliseconds: QWord);
 function RegistryDeadlineTimeoutForTesting(const ADeadline,
   ANow: QWord): LongInt;
 function RegistryTLSShutdownStateIsTerminalForTesting(
@@ -231,6 +239,10 @@ type
     FTLSCiphertextReceived: QWord;
     FDeadline: QWord;
     FDone: Boolean;
+    { Header bytes received before the head completed, kept only so an
+      incomplete mutating request can be audited by its method. }
+    FPartialHead: string;
+    FHeadHandled: Boolean;
     procedure CheckDeadline;
     procedure ExecutePlain;
     procedure ExecuteTLS;
@@ -1345,6 +1357,41 @@ end;
 
 {$IFDEF REGISTRY_TESTING}
 var
+  RegistryHeaderDeadlineForTesting: QWord;
+
+procedure SetRegistryHeaderDeadlineForTesting(const AMilliseconds: QWord);
+begin
+  RegistryHeaderDeadlineForTesting := AMilliseconds;
+end;
+{$ENDIF}
+
+function RegistryHeaderDeadlineMilliseconds: QWord;
+begin
+  Result := CLIENT_READ_TIMEOUT_MILLISECONDS;
+  {$IFDEF REGISTRY_TESTING}
+  if RegistryHeaderDeadlineForTesting > 0 then
+    Result := RegistryHeaderDeadlineForTesting;
+  {$ENDIF}
+end;
+
+procedure RegistryAuditIncompleteRequest(AHandler: TLWPTRegistryMutationHandler;
+  const ARaw, APeer: string; const ATimedOut: Boolean);
+begin
+  if ARaw = '' then Exit;
+  try
+    if ATimedOut then
+      RegistryMalformedRequestResponse(AHandler, ARaw, APeer, 408,
+        'Request Timeout', 'request_timeout',
+        'request headers did not arrive in time')
+    else RegistryMalformedRequestResponse(AHandler, ARaw, APeer, 400,
+      'Bad Request', 'invalid_request', 'request headers are incomplete');
+  except
+    { Auditing an abandoned connection never fails the listener. }
+  end;
+end;
+
+{$IFDEF REGISTRY_TESTING}
+var
   RegistryBodyDeadlineBaseForTesting: QWord;
 
 procedure SetRegistryBodyDeadlineForTesting(const ABaseMilliseconds: QWord);
@@ -1418,7 +1465,7 @@ begin
   FPeer := APeer;
   FTLSServerContext := ATLSServerContext;
   FTLSCiphertextReceived := 0;
-  FDeadline := GetTickCount64 + CLIENT_READ_TIMEOUT_MILLISECONDS;
+  FDeadline := GetTickCount64 + RegistryHeaderDeadlineMilliseconds;
   FDone := False;
 end;
 
@@ -1643,10 +1690,12 @@ begin
         if Received <= 0 then Exit;
         SetString(Chunk, PAnsiChar(@Buffer[0]), Received);
         Request := Request + Chunk;
+        FPartialHead := Copy(Request, 1, 32);
         HeaderEnd := Pos(#13#10#13#10, Request);
         if ((HeaderEnd = 0) and (Length(Request) > MAX_REQUEST_HEADER_BYTES))
           or (HeaderEnd > MAX_REQUEST_HEADER_BYTES) then
         begin
+          FHeadHandled := True;
           Response := RegistryMalformedRequestResponse(FHandler, Request, FPeer,
             431, 'Request Header Fields Too Large', 'request_headers_too_large',
             'request headers exceed 32 KiB');
@@ -1654,6 +1703,7 @@ begin
           Exit;
         end;
       until HeaderEnd > 0;
+      FHeadHandled := True;
       if not ParseRegistryRequestHead(Copy(Request, 1, HeaderEnd - 1), FPeer,
         Head) then
         Response := RegistryMalformedRequestResponse(FHandler, Request, FPeer,
@@ -1849,6 +1899,7 @@ begin
         SetString(RequestChunk, PAnsiChar(@Buffer[0]),
           IOResult.BytesProcessed);
         Request := Request + RequestChunk;
+        FPartialHead := Copy(Request, 1, 32);
       end;
       HeaderEnd := Pos(#13#10#13#10, Request);
       if ((HeaderEnd = 0) and (Length(Request) > MAX_REQUEST_HEADER_BYTES))
@@ -1868,6 +1919,7 @@ begin
       end;
     until False;
     Head := Default(TLWPTRegistryRequestHead);
+    FHeadHandled := True;
     if Oversized then
       Response := RegistryMalformedRequestResponse(FHandler, Request, FPeer,
         431, 'Request Header Fields Too Large', 'request_headers_too_large',
@@ -1976,6 +2028,12 @@ begin
   except
     { Connection-scoped protocol and I/O failures do not stop the listener. }
   end;
+  { A head that began but never completed: exactly one audit record for a
+    recognizable mutating method, whether or not a response can be sent. }
+  if not FHeadHandled then
+    RegistryAuditIncompleteRequest(FHandler, FPartialHead, FPeer,
+      GetTickCount64 >= FDeadline);
+  FPartialHead := '';
   RegistrySocketShutdown(FSocket);
   RegistrySocketClose(FSocket);
   FDone := True;

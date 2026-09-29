@@ -122,6 +122,7 @@ type
     procedure TestDoubleDotNamesRoute;
     procedure TestMalformedMutationsAreAudited;
     procedure TestSlowBodiesHitTheDeadline;
+    procedure TestIncompleteMutatingHeadsAreAudited;
   end;
 
 constructor TServeThread.Create(AServer: TLWPTRegistryServer);
@@ -445,6 +446,7 @@ begin
   SetRegistryDependencyRefusalForTesting(True);
   SetRegistryPublicationBarrierForTesting('', '');
   SetRegistryBodyDeadlineForTesting(0);
+  SetRegistryHeaderDeadlineForTesting(0);
 end;
 
 procedure TRegistryPublicationContract.AfterAll;
@@ -1479,6 +1481,88 @@ begin
   end;
 end;
 
+procedure TRegistryPublicationContract.TestIncompleteMutatingHeadsAreAudited;
+var
+  Connection: TRawHTTPConnection;
+  Audits: TStringList;
+  Started: QWord;
+
+  function WaitForAudits(const AStatus, ACount: Integer): TStringList;
+  begin
+    Started := GetTickCount64;
+    repeat
+      Result := AuditsWithStatus(AStatus);
+      if (Result.Count >= ACount) or (GetTickCount64 - Started > 8000) then Exit;
+      Result.Free;
+      Sleep(20);
+    until False;
+  end;
+
+begin
+  StartOrigin('', '', RegistryTimestampNow);
+  { The peer closes before the blank line that ends the head. }
+  Connection := TRawHTTPConnection.Create(FPort);
+  try
+    Connection.SendText('PUT /v1/packages/eof-lib/1.0.0 HTTP/1.1' + #13#10
+      + 'Authorization: Bearer ' + FToken + #13#10);
+  finally
+    Connection.Free;
+  end;
+  Audits := WaitForAudits(400, 1);
+  try
+    Expect<Integer>(Audits.Count).ToBe(1);
+    Expect<Boolean>(Pos('method = "PUT"', Audits[0]) > 0).ToBe(True);
+    Expect<Boolean>(Pos('route = "invalid"', Audits[0]) > 0).ToBe(True);
+    Expect<Boolean>(Pos('name = ""', Audits[0]) > 0).ToBe(True);
+    Expect<Boolean>(Pos(FToken, Audits[0]) = 0).ToBe(True);
+    Expect<Boolean>(Pos('eof-lib', Audits[0]) = 0).ToBe(True);
+  finally
+    Audits.Free;
+  end;
+  { The head stalls past its deadline. }
+  SetRegistryHeaderDeadlineForTesting(500);
+  try
+    Connection := TRawHTTPConnection.Create(FPort);
+    try
+      Connection.SendText('DELETE /v1/packages/slow-lib/1.0.0/yank HTTP/1.1'
+        + #13#10);
+      Audits := WaitForAudits(408, 1);
+      try
+        Expect<Integer>(Audits.Count).ToBe(1);
+        Expect<Boolean>(Pos('method = "DELETE"', Audits[0]) > 0).ToBe(True);
+        Expect<Boolean>(Pos('code = "request_timeout"', Audits[0]) > 0)
+          .ToBe(True);
+      finally
+        Audits.Free;
+      end;
+    finally
+      Connection.Free;
+    end;
+  finally
+    SetRegistryHeaderDeadlineForTesting(0);
+  end;
+  { Exactly once each, and an abandoned read writes nothing. }
+  Connection := TRawHTTPConnection.Create(FPort);
+  try
+    Connection.SendText('GET /v1/capabilities HTTP/1.1' + #13#10);
+  finally
+    Connection.Free;
+  end;
+  Sleep(300);
+  Audits := AuditsWithStatus(400);
+  try
+    Expect<Integer>(Audits.Count).ToBe(1);
+  finally
+    Audits.Free;
+  end;
+  Audits := AuditsWithStatus(408);
+  try
+    Expect<Integer>(Audits.Count).ToBe(1);
+  finally
+    Audits.Free;
+  end;
+end;
+
 procedure TRegistryPublicationContract.SetupTests;
 begin
   Test('a token holder uploads and publishes over HTTP', TestPublicationRoundTrip);
@@ -1524,6 +1608,8 @@ begin
   Test('malformed mutating requests are audited without their input',
     TestMalformedMutationsAreAudited);
   Test('a slow body is cut off at its deadline', TestSlowBodiesHitTheDeadline);
+  Test('incomplete mutating heads are audited once on EOF and deadline',
+    TestIncompleteMutatingHeadsAreAudited);
 end;
 
 begin

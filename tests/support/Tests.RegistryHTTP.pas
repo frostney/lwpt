@@ -15,7 +15,9 @@ uses
   {$IFDEF MSWINDOWS}
   WinSock2,
   {$ENDIF}
-  SysUtils;
+  SysUtils,
+
+  TransportSecurity;
 
 type
   TRawHTTPResponse = record
@@ -29,7 +31,11 @@ type
   private
     FSocket: {$IFDEF UNIX}TSocket{$ELSE}TSocket{$ENDIF};
     FOpen: Boolean;
+    FTLS: TTransportSecurityConnection;
+    FSecure: Boolean;
   public
+    { Wraps the connection in TLS without verifying the test identity. }
+    procedure StartTLS(const AHost: string);
     constructor Create(const APort: Word);
     destructor Destroy; override;
     procedure Send(const ABytes: TBytes);
@@ -125,10 +131,29 @@ begin
   inherited Destroy;
 end;
 
+procedure TRawHTTPConnection.StartTLS(const AHost: string);
+var
+  Options: TTransportSecurityClientOptions;
+begin
+  Options := DefaultTransportSecurityClientOptions;
+  Options.InsecureSkipVerify := True;
+  FillChar(FTLS, SizeOf(FTLS), 0);
+  StartTransportSecurity(FTLS, FSocket, AHost, Options);
+  FSecure := True;
+end;
+
 procedure TRawHTTPConnection.Close;
 begin
   if not FOpen then Exit;
   FOpen := False;
+  if FSecure then
+  begin
+    FSecure := False;
+    try
+      CloseTransportSecurity(FTLS);
+    except
+    end;
+  end;
   {$IFDEF UNIX}
   CloseSocket(FSocket);
   {$ELSE}
@@ -141,6 +166,17 @@ var
   Offset, Sent: Integer;
 begin
   Offset := 0;
+  if FSecure then
+  begin
+    while Offset < Length(ABytes) do
+    begin
+      Sent := TransportSecurityWrite(FTLS, @ABytes[Offset],
+        Length(ABytes) - Offset);
+      if Sent <= 0 then raise Exception.Create('raw HTTPS send failed');
+      Inc(Offset, Sent);
+    end;
+    Exit;
+  end;
   while Offset < Length(ABytes) do
   begin
     {$IFDEF UNIX}

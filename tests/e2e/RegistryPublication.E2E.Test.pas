@@ -59,6 +59,7 @@ type
       const AToken: string): TRawHTTPResponse;
     function LatestSequence: Integer;
     function PartFiles: Integer;
+    function IncompleteAudits: Integer;
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -523,6 +524,7 @@ var
   Stream: TFileStream;
   Started: QWord;
   Ready: Boolean;
+  Truncated: TRawHTTPConnection;
 begin
   FPort := FindAvailableRegistryTestPort;
   Base := 'https://localhost:' + IntToStr(FPort);
@@ -582,6 +584,41 @@ begin
     '-H', 'Authorization: Bearer ' + Token, Base + '/v1/packages/tls-lib/1.0.0']))
     .ToBe('204');
   Expect<string>(CurlStatus([Base + '/v1/objects/sha256/' + Hex])).ToBe('200');
+  { A mutating head cut off by the peer over TLS is audited exactly once. }
+  Truncated := TRawHTTPConnection.Create(FPort);
+  try
+    Truncated.StartTLS('localhost');
+    Truncated.SendText('PUT /v1/objects/sha256/' + Hex + ' HTTP/1.1' + #13#10
+      + 'Authorization: Bearer ' + Token + #13#10);
+  finally
+    Truncated.Free;
+  end;
+  Started := GetTickCount64;
+  while (IncompleteAudits = 0) and (GetTickCount64 - Started < 8000) do Sleep(20);
+  Sleep(200);
+  Expect<Integer>(IncompleteAudits).ToBe(1);
+end;
+
+function TRegistryPublicationE2E.IncompleteAudits: Integer;
+var
+  Files: TStringList;
+  Path, Text: string;
+begin
+  Result := 0;
+  Files := TStringList.Create;
+  try
+    CollectFiles(FData + '/audit', Files);
+    for Path in Files do
+    begin
+      if Pos('.staging', Path) > 0 then Continue;
+      Text := ReadBinaryFile(Path);
+      if (Pos('status = 400' + #10, Text) > 0)
+        and (Pos('method = "PUT"', Text) > 0)
+        and (Pos('route = "invalid"', Text) > 0) then Inc(Result);
+    end;
+  finally
+    Files.Free;
+  end;
 end;
 
 procedure TRegistryPublicationE2E.TestExpiredUploadsAreReclaimedWhileServingAndAtRestart;

@@ -677,6 +677,11 @@ end;
 
 destructor TNetworkFrameworkRegistryConnection.Destroy;
 begin
+  { A head that began but never completed (peer EOF, a receive error, or
+    the connection deadline) is audited once by its method alone. }
+  if not FResponding and not Assigned(FMutation) and (FRequest <> '') then
+    RegistryAuditIncompleteRequest(FServer.FHandler,
+      Copy(string(FRequest), 1, 32), FPeer, GetTickCount64 >= FDeadline);
   if Assigned(FMutation) then
   begin
     FMutation.Abort;

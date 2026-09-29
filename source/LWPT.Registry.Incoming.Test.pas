@@ -55,6 +55,21 @@ type
     constructor Create(AIncoming: TLWPTRegistryIncoming);
   end;
 
+  { Takes a guard as soon as it is free and holds it for a while. }
+  TGuardHolder = class(TThread)
+  private
+    FCoordinator: TLWPTProducerLeaseCoordinator;
+    FKey: string;
+    FHoldMilliseconds: Cardinal;
+  protected
+    procedure Execute; override;
+  public
+    Acquired: TEvent;
+    constructor Create(const ALocks, AKey: string;
+      const AHoldMilliseconds: Cardinal);
+    destructor Destroy; override;
+  end;
+
   TRegistryIncomingContract = class(TTestSuite)
   private
     FScratch: string;
@@ -66,6 +81,8 @@ type
     function PartCount: Integer;
     procedure WriteAll(AUpload: TLWPTRegistryUpload; const AText: string);
     function HexOf(const AText: string): string;
+    function AdmissionFailure(AIncoming: TLWPTRegistryIncoming;
+      const ALength: Int64): string;
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -80,7 +97,48 @@ type
     procedure TestGuardTimeoutLeavesAReclaimableReservation;
     procedure TestLiveUploadSurvivesReclamation;
     procedure TestExpiryAndAdoptionHoldTheGuard;
+    procedure TestExpiredChargeIsRemovedBeforeRefusing;
+    procedure TestContendedExpiryIsRetryable;
+    procedure TestLongPublicationIsRetryable;
+  private
+    FHolder: TGuardHolder;
+    procedure HoldGuardAtExpiry(const APoint: string);
   end;
+
+constructor TGuardHolder.Create(const ALocks, AKey: string;
+  const AHoldMilliseconds: Cardinal);
+begin
+  FCoordinator := TLWPTProducerLeaseCoordinator.Create(ALocks);
+  FKey := AKey;
+  FHoldMilliseconds := AHoldMilliseconds;
+  Acquired := TEvent.Create(nil, True, False, '');
+  FreeOnTerminate := False;
+  inherited Create(True);
+end;
+
+destructor TGuardHolder.Destroy;
+begin
+  Acquired.Free;
+  FCoordinator.Free;
+  inherited Destroy;
+end;
+
+procedure TGuardHolder.Execute;
+var
+  Guard: TObject;
+  Started: QWord;
+begin
+  Guard := nil;
+  Started := GetTickCount64;
+  while not Assigned(Guard) and (GetTickCount64 - Started < 10000) do
+  begin
+    Guard := FCoordinator.TryAcquireGuard(FKey);
+    if not Assigned(Guard) then Sleep(1);
+  end;
+  Acquired.SetEvent;
+  Sleep(FHoldMilliseconds);
+  Guard.Free;
+end;
 
 constructor TAdmissionThread.Create(AIncoming: TLWPTRegistryIncoming;
   const ALength: Int64);
@@ -533,6 +591,133 @@ begin
   end;
 end;
 
+procedure TRegistryIncomingContract.HoldGuardAtExpiry(const APoint: string);
+begin
+  { Admission now owns the publication lease; another operation takes the
+    accounting guard before admission's sweep can. }
+  if (APoint <> 'expiry-owned') or not Assigned(FHolder) then Exit;
+  FHolder.Start;
+  FHolder.Acquired.WaitFor(10000);
+end;
+
+procedure TRegistryIncomingContract.TestExpiredChargeIsRemovedBeforeRefusing;
+var
+  Incoming: TLWPTRegistryIncoming;
+  Upload: TLWPTRegistryUpload;
+  Filler: string;
+begin
+  Incoming := NewIncoming;
+  Upload := nil;
+  try
+    Filler := StringOfChar('e', 64);
+    AddCompleted(Filler, 1024 * MEBIBYTE - 10);
+    Expect<Boolean>(Pos('storage_budget_exceeded:', AdmissionFailure(Incoming,
+      100)) = 1).ToBe(True);
+    FileSetDate(Incoming.CompletedPath(Filler), DateTimeToFileDate(Now - 2 / 24));
+    { Another operation holds the accounting guard at admission and again
+      when admission removes the expired upload; both waits are bounded
+      and admission succeeds once each holder is done. }
+    FHolder := TGuardHolder.Create(FScratch + '/origin/locks',
+      REGISTRY_INCOMING_LEASE, 800);
+    SetRegistryIncomingHookForTesting(HoldGuardAtExpiry);
+    Upload := Incoming.Admit(100);
+    Expect<Boolean>(Assigned(Upload)).ToBe(True);
+    Expect<Boolean>(FileExists(Incoming.CompletedPath(Filler))).ToBe(False);
+  finally
+    SetRegistryIncomingHookForTesting(Hook);
+    if Assigned(FHolder) then
+    begin
+      if FHolder.Suspended then FHolder.Start;
+      FHolder.WaitFor;
+      FreeAndNil(FHolder);
+    end;
+    Upload.Free;
+    Incoming.Free;
+  end;
+end;
+
+procedure TRegistryIncomingContract.TestContendedExpiryIsRetryable;
+var
+  Incoming: TLWPTRegistryIncoming;
+  Filler, Diagnostic: string;
+begin
+  Incoming := NewIncoming;
+  try
+    Filler := StringOfChar('e', 64);
+    AddCompleted(Filler, 1024 * MEBIBYTE - 10);
+    FileSetDate(Incoming.CompletedPath(Filler), DateTimeToFileDate(Now - 2 / 24));
+    { The guard stays held past the two-second wait while admission tries to
+      remove expired uploads: a retryable refusal, never a 507. }
+    FHolder := TGuardHolder.Create(FScratch + '/origin/locks',
+      REGISTRY_INCOMING_LEASE, 3000);
+    SetRegistryIncomingHookForTesting(HoldGuardAtExpiry);
+    Diagnostic := AdmissionFailure(Incoming, 100);
+    Expect<Boolean>(Pos('temporary_failure:', Diagnostic) = 1).ToBe(True);
+    Expect<Boolean>(FileExists(Incoming.CompletedPath(Filler))).ToBe(True);
+    Expect<Integer>(PartCount).ToBe(0);
+    SetRegistryIncomingHookForTesting(Hook);
+    if FHolder.Suspended then FHolder.Start;
+    FHolder.WaitFor;
+    FreeAndNil(FHolder);
+    Expect<string>(AdmissionFailure(Incoming, 100)).ToBe('');
+    Expect<Boolean>(FileExists(Incoming.CompletedPath(Filler))).ToBe(False);
+  finally
+    SetRegistryIncomingHookForTesting(Hook);
+    if Assigned(FHolder) then
+    begin
+      if FHolder.Suspended then FHolder.Start;
+      FHolder.WaitFor;
+      FreeAndNil(FHolder);
+    end;
+    Incoming.Free;
+  end;
+end;
+
+procedure TRegistryIncomingContract.TestLongPublicationIsRetryable;
+var
+  Incoming: TLWPTRegistryIncoming;
+  Holder: TLWPTProducerLeaseCoordinator;
+  Publication: TObject;
+  Filler, Diagnostic: string;
+  Started: QWord;
+begin
+  Incoming := NewIncoming;
+  Holder := TLWPTProducerLeaseCoordinator.Create(FScratch + '/origin/locks');
+  Publication := nil;
+  try
+    Filler := StringOfChar('e', 64);
+    AddCompleted(Filler, 1024 * MEBIBYTE - 10);
+    FileSetDate(Incoming.CompletedPath(Filler), DateTimeToFileDate(Now - 2 / 24));
+    Publication := Holder.TryAcquireGuard(REGISTRY_PUBLICATION_LEASE);
+    Expect<Boolean>(Assigned(Publication)).ToBe(True);
+    Started := GetTickCount64;
+    Diagnostic := AdmissionFailure(Incoming, 100);
+    Expect<Boolean>(Pos('temporary_failure:', Diagnostic) = 1).ToBe(True);
+    Expect<Boolean>(GetTickCount64 - Started >= 4900).ToBe(True);
+    Expect<Integer>(PartCount).ToBe(0);
+    FreeAndNil(Publication);
+    Expect<string>(AdmissionFailure(Incoming, 100)).ToBe('');
+  finally
+    Publication.Free;
+    Holder.Free;
+    Incoming.Free;
+  end;
+end;
+
+function TRegistryIncomingContract.AdmissionFailure(
+  AIncoming: TLWPTRegistryIncoming; const ALength: Int64): string;
+var
+  Upload: TLWPTRegistryUpload;
+begin
+  Result := '';
+  try
+    Upload := AIncoming.Admit(ALength);
+    Upload.Free;
+  except
+    on E: Exception do Result := E.Message;
+  end;
+end;
+
 procedure TRegistryIncomingContract.SetupTests;
 begin
   Test('an in-progress upload counts at its declared length',
@@ -549,6 +734,12 @@ begin
     TestGuardTimeoutLeavesAReclaimableReservation);
   Test('a live upload survives reclamation', TestLiveUploadSurvivesReclamation);
   Test('expiry and adoption run under the guard', TestExpiryAndAdoptionHoldTheGuard);
+  Test('expired uploads are removed before admission refuses capacity',
+    TestExpiredChargeIsRemovedBeforeRefusing);
+  Test('contended expiry answers a retryable failure, not 507',
+    TestContendedExpiryIsRetryable);
+  Test('a publication held past its wait makes expiry retryable',
+    TestLongPublicationIsRetryable);
 end;
 
 begin
