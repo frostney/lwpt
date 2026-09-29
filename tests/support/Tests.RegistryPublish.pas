@@ -17,7 +17,8 @@ uses
   SysUtils,
 
   Tests.LwptSubprocess,
-  Tests.RegistryHTTP;
+  Tests.RegistryHTTP,
+  Tests.RegistryProcess;
 
 const
   PUBLISH_TLS_PASSWORD = 'test-only';
@@ -26,7 +27,7 @@ const
 type
   TPublishOrigin = class
   private
-    FScratch, FData, FBase, FKeyID, FPublicKey, FOutputs: string;
+    FScratch, FData, FBase, FHost, FKeyID, FPublicKey, FOutputs: string;
     FListenPort: Word;
     FHTTPS: Boolean;
     FServe: TProcess;
@@ -34,10 +35,12 @@ type
     function Environment: TStringArray;
   public
     { Runs `registry init`. ABasePort is advertised in the base URL (and so
-      in the origin identity); AListenPort is where `serve` listens. }
+      in the origin identity); AListenPort is where `serve` listens. AHost
+      names the base URL host: an HTTPS origin may use `127.0.0.1`, which
+      the TLS fixture also names. }
     constructor Create(const AScratch, AName: string; const ABasePort,
       AListenPort: Word; const AHTTPS: Boolean = False;
-      const AIdentity: string = '');
+      const AIdentity: string = ''; const AHost: string = 'localhost');
     { Copies another origin's token record here, so this origin accepts
       that token too. }
     procedure AdoptToken(ASource: TPublishOrigin; const AToken: string);
@@ -49,11 +52,21 @@ type
     { Rewrites the token record so it expired long ago. }
     procedure ExpireToken(const AToken: string);
     procedure Start(const ATesting: Boolean = False);
+    { Start with AEnvironment ("KEY=value") added to the child's
+      environment, e.g. a test-build seam. }
+    procedure StartWith(const ATesting: Boolean;
+      const AEnvironment: array of string);
     procedure Stop;
+    { Stops through the bounded helper and reports how the child ended. }
+    function StopGracefully: TRegistryStopResult;
+    { Terminates the server without a graceful shutdown: SIGKILL on Unix,
+      TerminateProcess on Windows. }
+    procedure Kill;
     function Request(const AMethod, ATarget: string; const AHeaders: array of string;
       const ABody: TBytes): TRawHTTPResponse;
     function LatestSequence: Integer;
     property Base: string read FBase;
+    property Host: string read FHost;
     property DataDirectory: string read FData;
     property KeyID: string read FKeyID;
     property PublicKey: string read FPublicKey;
@@ -88,9 +101,14 @@ function TestRootCertificatePath: string;
 implementation
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   HTTPClient,
   Tests.RegistryOrigin,
-  Tests.RegistryProcess,
   Tests.Scratch,
   Tests.TarSynth,
   Tests.ZipSynth,
@@ -287,7 +305,7 @@ end;
 
 constructor TPublishOrigin.Create(const AScratch, AName: string;
   const ABasePort, AListenPort: Word; const AHTTPS: Boolean;
-  const AIdentity: string);
+  const AIdentity, AHost: string);
 var
   Run: TLwptResult;
 begin
@@ -295,9 +313,10 @@ begin
   FScratch := AScratch;
   FData := AScratch + '/' + AName;
   FHTTPS := AHTTPS;
+  FHost := AHost;
   FListenPort := AListenPort;
-  if AHTTPS then FBase := 'https://localhost:' + IntToStr(ABasePort)
-  else FBase := 'http://localhost:' + IntToStr(ABasePort);
+  if AHTTPS then FBase := 'https://' + FHost + ':' + IntToStr(ABasePort)
+  else FBase := 'http://' + FHost + ':' + IntToStr(ABasePort);
   if AHTTPS then
     Run := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
       '--port', IntToStr(AListenPort), '--tls-pkcs12', TLSFixturePath,
@@ -458,7 +477,7 @@ begin
   Options.TLS.TrustMode := tstmAnchorsOnly;
   { The listener directly, so a relay on the advertised port counts only
     the client's connections. }
-  Response := HTTPGet('https://localhost:' + IntToStr(FListenPort) + ATarget,
+  Response := HTTPGet('https://' + FHost + ':' + IntToStr(FListenPort) + ATarget,
     nil, Options);
   Result := Default(TRawHTTPResponse);
   Result.Status := Response.StatusCode;
@@ -481,9 +500,17 @@ begin
 end;
 
 procedure TPublishOrigin.Start(const ATesting: Boolean);
+begin
+  StartWith(ATesting, []);
+end;
+
+procedure TPublishOrigin.StartWith(const ATesting: Boolean;
+  const AEnvironment: array of string);
 var
   Started: QWord;
   Ready: Boolean;
+  Variables: TStringArray;
+  Index: Integer;
 begin
   if FServe <> nil then raise Exception.Create('origin already serving');
   FServe := TProcess.Create(nil);
@@ -496,7 +523,13 @@ begin
     FServe.Parameters.Add('serve');
     FServe.Parameters.Add('--data-dir');
     FServe.Parameters.Add(FData);
-    if FHTTPS then ConfigureProcessEnvironment(FServe, Environment);
+    Variables := Environment;
+    for Index := 0 to High(AEnvironment) do
+    begin
+      SetLength(Variables, Length(Variables) + 1);
+      Variables[High(Variables)] := AEnvironment[Index];
+    end;
+    if Length(Variables) > 0 then ConfigureProcessEnvironment(FServe, Variables);
     BindRegistryChildToParent(FServe);
     FServe.Execute;
   except
@@ -522,18 +555,35 @@ begin
 end;
 
 procedure TPublishOrigin.Stop;
-var
-  Stopped: TRegistryStopResult;
 begin
+  StopGracefully;
+end;
+
+function TPublishOrigin.StopGracefully: TRegistryStopResult;
+begin
+  Result := Default(TRegistryStopResult);
+  Result.ExitStatus := -1;
+  Result.Stopped := True;
   if FServe = nil then Exit;
   try
     FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
       + DrainAvailableStream(FServe.Stderr, 65536);
   except
   end;
-  Stopped := StopRegistryProcess(FServe);
-  if not Stopped.Stopped then
+  Result := StopRegistryProcess(FServe);
+  if not Result.Stopped then
     WriteLn(StdErr, 'registry publish e2e cleanup: registry serve did not stop');
+end;
+
+procedure TPublishOrigin.Kill;
+begin
+  if FServe = nil then Exit;
+  {$IFDEF UNIX}
+  FpKill(FServe.ProcessID, SIGKILL);
+  {$ELSE}
+  TerminateProcess(FServe.Handle, 1);
+  {$ENDIF}
+  StopGracefully;
 end;
 
 end.
