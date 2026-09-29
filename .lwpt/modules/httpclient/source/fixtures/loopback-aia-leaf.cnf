@@ -1,0 +1,18 @@
+[req]
+distinguished_name = leaf_name
+prompt = no
+
+[leaf_name]
+CN = localhost
+
+# 127.0.0.1:47931 is the tests' retrieval recorder: it counts every fetch of
+# these URLs, so a test can prove an evaluation made none.
+[leaf_extensions]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+authorityInfoAccess = caIssuers;URI:http://127.0.0.1:47931/issuer.crt,OCSP;URI:http://127.0.0.1:47931/ocsp
+crlDistributionPoints = URI:http://127.0.0.1:47931/leaf.crl
