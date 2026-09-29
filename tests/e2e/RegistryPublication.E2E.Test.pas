@@ -1,0 +1,488 @@
+program RegistryPublication.E2E.Test;
+
+{ Black-box publication against a running `registry serve`: tokens issued
+  and revoked while the origin serves, uploads and records over localhost
+  HTTP, a publication killed at its activation barrier, an upload killed
+  mid-body, and credentials that never leave the one issue-token line. }
+
+{$mode delphi}{$H+}
+
+uses
+  {$IFDEF UNIX}
+  cthreads,
+  BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
+  Classes,
+  DateUtils,
+  Process,
+  SysUtils,
+
+  TestingPascalLibrary,
+  Tests.LwptSubprocess,
+  Tests.RegistryHTTP,
+  Tests.RegistryOrigin,
+  Tests.RegistryProcess,
+  Tests.Scratch;
+
+type
+  TRequestThread = class(TThread)
+  private
+    FPort: Word;
+    FTarget, FToken: string;
+    FBody: TBytes;
+  protected
+    procedure Execute; override;
+  public
+    Response: TRawHTTPResponse;
+    constructor Create(const APort: Word; const ATarget, AToken: string;
+      const ABody: TBytes);
+  end;
+
+  TRegistryPublicationE2E = class(TTestSuite)
+  private
+    FScratch, FData, FBase: string;
+    FPort: Word;
+    FServe: TProcess;
+    FOutputs: string;
+    procedure InitOrigin;
+    procedure StartServe(const ABinary: string; const AEnvironment: array of string);
+    procedure KillServe;
+    procedure StopServe;
+    function Run(const AArgs: array of string): TLwptResult;
+    function IssueToken(const AExtra: array of string): string;
+    function Upload(const AArchive: TBytes; const AToken: string): TRawHTTPResponse;
+    function RecordText(const AName, AVersion: string; const AArchive: TBytes): string;
+    function PublishRecord(const AName, AVersion: string; const AArchive: TBytes;
+      const AToken: string): TRawHTTPResponse;
+    function LatestSequence: Integer;
+    function PartFiles: Integer;
+  protected
+    procedure BeforeEach; override;
+    procedure AfterEach; override;
+    procedure AfterAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestPublishToARunningOrigin;
+    procedure TestTokenOptionsAndExpiryBounds;
+    procedure TestKilledPublicationKeepsTheOldHead;
+    procedure TestKilledUploadIsReclaimedOnlyAfterItsLeaseIsFree;
+  end;
+
+constructor TRequestThread.Create(const APort: Word; const ATarget,
+  AToken: string; const ABody: TBytes);
+begin
+  FPort := APort;
+  FTarget := ATarget;
+  FToken := AToken;
+  FBody := ABody;
+  FreeOnTerminate := False;
+  inherited Create(False);
+end;
+
+procedure TRequestThread.Execute;
+begin
+  try
+    Response := RawHTTPRequest(FPort, 'PUT', FTarget,
+      ['Authorization: Bearer ' + FToken], FBody, True, 20000);
+  except
+  end;
+end;
+
+function CurrentUTC: string;
+begin
+  Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
+    LocalTimeToUniversal(Now));
+end;
+
+procedure TRegistryPublicationE2E.InitOrigin;
+var
+  Result: TLwptResult;
+begin
+  FPort := FindAvailableRegistryTestPort;
+  FBase := 'http://localhost:' + IntToStr(FPort);
+  FData := FScratch + '/origin';
+  Result := Run(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
+    '--port', IntToStr(FPort)]);
+  Expect<Integer>(Result.ExitCode).ToBe(0);
+end;
+
+procedure TRegistryPublicationE2E.StartServe(const ABinary: string;
+  const AEnvironment: array of string);
+var
+  Started: QWord;
+  Ready: Boolean;
+begin
+  FServe := TProcess.Create(nil);
+  FServe.Executable := ABinary;
+  FServe.CurrentDirectory := FScratch;
+  FServe.Options := [poUsePipes];
+  FServe.Parameters.Add('registry');
+  FServe.Parameters.Add('serve');
+  FServe.Parameters.Add('--data-dir');
+  FServe.Parameters.Add(FData);
+  if Length(AEnvironment) > 0 then
+    ConfigureProcessEnvironment(FServe, AEnvironment);
+  FServe.Execute;
+  Started := GetTickCount64;
+  Ready := False;
+  repeat
+    FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
+      + DrainAvailableStream(FServe.Stderr, 65536);
+    try
+      Ready := RawHTTPRequest(FPort, 'GET', '/.well-known/' + RegistryProgramName
+        + '-registry', [], nil, False, 2000).Status = 200;
+    except
+      Ready := False;
+    end;
+    if Ready or not FServe.Running then Break;
+    Sleep(20);
+  until GetTickCount64 - Started > 10000;
+  if not Ready then
+    raise Exception.Create('registry serve did not become ready: ' + FOutputs);
+end;
+
+procedure TRegistryPublicationE2E.KillServe;
+begin
+  if FServe = nil then Exit;
+  {$IFDEF UNIX}
+  FpKill(FServe.ProcessID, SIGKILL);
+  {$ELSE}
+  TerminateProcess(FServe.Handle, 1);
+  {$ENDIF}
+  StopServe;
+end;
+
+procedure TRegistryPublicationE2E.StopServe;
+begin
+  if FServe = nil then Exit;
+  FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
+    + DrainAvailableStream(FServe.Stderr, 65536);
+  StopRegistryProcess(FServe);
+end;
+
+function TRegistryPublicationE2E.Run(const AArgs: array of string): TLwptResult;
+begin
+  Result := RunLwpt(AArgs, FScratch);
+  FOutputs := FOutputs + Result.Stdout + Result.Stderr;
+end;
+
+function TRegistryPublicationE2E.IssueToken(const AExtra: array of string): string;
+var
+  Arguments: array of string;
+  Index: Integer;
+  Result_: TLwptResult;
+begin
+  SetLength(Arguments, 4 + Length(AExtra));
+  Arguments[0] := 'registry';
+  Arguments[1] := 'issue-token';
+  Arguments[2] := '--data-dir';
+  Arguments[3] := FData;
+  for Index := 0 to High(AExtra) do Arguments[4 + Index] := AExtra[Index];
+  { The token line is the one intended output that may hold the secret. }
+  Result_ := RunLwpt(Arguments, FScratch);
+  FOutputs := FOutputs + Result_.Stderr;
+  Expect<Integer>(Result_.ExitCode).ToBe(0);
+  Result := Trim(Result_.Stdout);
+  Expect<Boolean>(Pos(#10, Result) = 0).ToBe(True);
+  Expect<Boolean>(Pos(RegistryProgramName + '_rt1_', Result) = 1).ToBe(True);
+end;
+
+function TRegistryPublicationE2E.Upload(const AArchive: TBytes;
+  const AToken: string): TRawHTTPResponse;
+begin
+  Result := RawHTTPRequest(FPort, 'PUT', '/v1/objects/sha256/'
+    + Copy(RegistryArtifactHash(AArchive), 8, 64),
+    ['Authorization: Bearer ' + AToken], AArchive);
+end;
+
+function TRegistryPublicationE2E.RecordText(const AName, AVersion: string;
+  const AArchive: TBytes): string;
+begin
+  Result := 'schema = "' + RegistryProgramName + '-registry-package-v1"' + #10
+    + 'origin = "' + FBase + '"' + #10
+    + 'name = "' + AName + '"' + #10
+    + 'version = "' + AVersion + '"' + #10
+    + 'archive = "' + RegistryArtifactHash(AArchive) + '"' + #10
+    + 'archive_size = ' + IntToStr(Length(AArchive)) + #10
+    + 'published_at = "' + CurrentUTC + '"' + #10
+    + 'yanked = false' + #10
+    + 'dependencies = []' + #10;
+end;
+
+function TRegistryPublicationE2E.PublishRecord(const AName, AVersion: string;
+  const AArchive: TBytes; const AToken: string): TRawHTTPResponse;
+begin
+  Result := RawHTTPRequest(FPort, 'PUT', '/v1/packages/' + AName + '/' + AVersion,
+    ['Authorization: Bearer ' + AToken],
+    RawHTTPBytes(RecordText(AName, AVersion, AArchive)));
+end;
+
+function TRegistryPublicationE2E.LatestSequence: Integer;
+var
+  Body: string;
+  Start: Integer;
+begin
+  Body := RawHTTPBodyText(RawHTTPRequest(FPort, 'GET',
+    '/v1/checkpoints/latest.toml', [], nil, False));
+  Start := Pos('sequence = ', Body);
+  Result := StrToIntDef(Trim(Copy(Body, Start + 11,
+    Pos(#10, Copy(Body, Start, MaxInt)) - 12)), -1);
+end;
+
+function TRegistryPublicationE2E.PartFiles: Integer;
+var
+  Search: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(FData + '/incoming/*.part', faAnyFile, Search) = 0 then
+  try
+    repeat
+      Inc(Result);
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+procedure TRegistryPublicationE2E.BeforeEach;
+begin
+  if FScratch <> '' then RecursiveDelete(FScratch);
+  FScratch := CreateScratchRoot('registry-publication-e2e');
+  FOutputs := '';
+  FServe := nil;
+end;
+
+procedure TRegistryPublicationE2E.AfterEach;
+begin
+  StopServe;
+end;
+
+procedure TRegistryPublicationE2E.AfterAll;
+begin
+  if FScratch <> '' then RecursiveDelete(FScratch);
+end;
+
+procedure CollectFiles(const ADirectory: string; AList: TStringList);
+var
+  Search: TSearchRec;
+begin
+  if FindFirst(IncludeTrailingPathDelimiter(ADirectory) + '*', faAnyFile,
+    Search) <> 0 then Exit;
+  try
+    repeat
+      if (Search.Name = '.') or (Search.Name = '..') then Continue;
+      if (Search.Attr and faDirectory) <> 0 then
+        CollectFiles(IncludeTrailingPathDelimiter(ADirectory) + Search.Name, AList)
+      else AList.Add(IncludeTrailingPathDelimiter(ADirectory) + Search.Name);
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+procedure TRegistryPublicationE2E.TestPublishToARunningOrigin;
+var
+  Token, Secret, TokenID, Path, Verify: string;
+  Archive: TBytes;
+  Response: TRawHTTPResponse;
+  PID: Integer;
+  Files: TStringList;
+  Revoke: TLwptResult;
+begin
+  InitOrigin;
+  StartServe(LwptBinaryPath, []);
+  PID := FServe.ProcessID;
+  { A read-only origin refuses mutation until a token exists. }
+  Archive := RawHTTPBytes('e2e archive bytes');
+  Expect<Integer>(Upload(Archive, 'none').Status).ToBe(405);
+  Token := IssueToken(['--packages', 'e2e-*', '--actions', 'publish,yank',
+    '--label', 'ci']);
+  Secret := Copy(Token, LastDelimiter('_', Token) + 1, MaxInt);
+  TokenID := Copy(Token, Length(RegistryProgramName + '_rt1_') + 1, 32);
+  Expect<Boolean>(Pos('"publication-v1"', RawHTTPBodyText(RawHTTPRequest(FPort,
+    'GET', '/v1/capabilities', [], nil, False))) > 0).ToBe(True);
+  Expect<Integer>(Upload(Archive, Token).Status).ToBe(201);
+  Response := PublishRecord('e2e-lib', '1.0.0', Archive, Token);
+  Expect<Integer>(Response.Status).ToBe(201);
+  Expect<Integer>(PublishRecord('e2e-lib', '1.0.0', Archive, Token).Status)
+    .ToBe(204);
+  Expect<Integer>(PublishRecord('other-lib', '1.0.0', Archive, Token).Status)
+    .ToBe(403);
+  Expect<Integer>(LatestSequence).ToBe(2);
+  Expect<Boolean>(Pos('name = "e2e-lib"', RawHTTPBodyText(RawHTTPRequest(FPort,
+    'GET', '/v1/packages', [], nil, False))) > 0).ToBe(True);
+  Expect<Integer>(RawHTTPRequest(FPort, 'GET', '/v1/objects/sha256/'
+    + Copy(RegistryArtifactHash(Archive), 8, 64), [], nil, False).Status).ToBe(200);
+  { Revocation takes effect on the next request without a restart. A second
+    token keeps the origin publication-enabled, so the revoked credential
+    gets the authentication challenge rather than 405. }
+  IssueToken(['--packages', 'unrelated']);
+  Revoke := Run(['registry', 'revoke-token', '--data-dir', FData, '--token-id',
+    TokenID]);
+  Expect<Integer>(Revoke.ExitCode).ToBe(0);
+  Response := Upload(Archive, Token);
+  Expect<Integer>(Response.Status).ToBe(401);
+  Expect<string>(RawHTTPHeader(Response, 'WWW-Authenticate')).ToBe('Bearer');
+  Expect<Boolean>(FServe.Running).ToBe(True);
+  Expect<Integer>(FServe.ProcessID).ToBe(PID);
+  Verify := Run(['registry', 'verify', '--data-dir', FData]).Stdout;
+  Expect<Boolean>(Pos('id = "' + TokenID + '"', Verify) > 0).ToBe(True);
+  Expect<Boolean>(Pos('label = "ci"', Verify) > 0).ToBe(True);
+  Path := Copy(Verify, Pos('id = "' + TokenID + '"', Verify), MaxInt);
+  Path := Copy(Path, 1, Pos(' }', Path));
+  Expect<Boolean>(Pos('revoked_at = "2', Path) > 0).ToBe(True);
+  Expect<Boolean>(Pos('secret', Verify) = 0).ToBe(True);
+  StopServe;
+  { The secret appears nowhere but the one issue-token line. }
+  Expect<Boolean>(Pos(Secret, FOutputs) = 0).ToBe(True);
+  Files := TStringList.Create;
+  try
+    CollectFiles(FScratch, Files);
+    for Path in Files do
+      Expect<Boolean>(Pos(Secret, ReadBinaryFile(Path)) = 0).ToBe(True);
+  finally
+    Files.Free;
+  end;
+  Expect<Boolean>(FileExists(FScratch + '/' + RegistryProgramName + '.lock'))
+    .ToBe(False);
+  Expect<Boolean>(DirectoryExists(FScratch + '/.' + RegistryProgramName))
+    .ToBe(False);
+end;
+
+procedure TRegistryPublicationE2E.TestTokenOptionsAndExpiryBounds;
+const
+  INVALID: array[0..4] of string = ('0', '366', 'abc', '+5', '05');
+var
+  Result_: TLwptResult;
+  Verify, Value: string;
+  Created, Expires: TDateTime;
+begin
+  InitOrigin;
+  IssueToken(['--packages', 'lib']);
+  Verify := Run(['registry', 'verify', '--data-dir', FData]).Stdout;
+  Value := Copy(Verify, Pos('created_at = "', Verify) + 14, 20);
+  Created := ISO8601ToDate(Value, True);
+  Value := Copy(Verify, Pos('expires_at = "', Verify) + 14, 20);
+  Expires := ISO8601ToDate(Value, True);
+  Expect<Int64>(DaysBetween(Created, Expires)).ToBe(90);
+  Expect<Boolean>(Pos('actions = ["publish"]', Verify) > 0).ToBe(True);
+  IssueToken(['--packages', 'lib', '--expires-days', '1']);
+  IssueToken(['--packages', 'lib', '--expires-days', '365']);
+  for Value in INVALID do
+  begin
+    Result_ := Run(['registry', 'issue-token', '--data-dir', FData, '--packages',
+      'lib', '--expires-days', Value]);
+    Expect<Integer>(Result_.ExitCode).ToBe(1);
+    Expect<Boolean>(Pos('invalid_configuration', Result_.Stderr) > 0).ToBe(True);
+    Expect<string>(Trim(Result_.Stdout)).ToBe('');
+  end;
+  Result_ := Run(['registry', 'issue-token', '--data-dir', FData]);
+  Expect<Boolean>(Pos('invalid_configuration', Result_.Stderr) > 0).ToBe(True);
+  Result_ := Run(['registry', 'issue-token', '--data-dir', FData, '--packages',
+    'lib', '--port', '1']);
+  Expect<Boolean>(Pos('invalid_configuration', Result_.Stderr) > 0).ToBe(True);
+  Result_ := Run(['registry', 'issue-token', '--data-dir', FData, '--packages',
+    'Bad Name']);
+  Expect<Boolean>(Pos('invalid_configuration', Result_.Stderr) > 0).ToBe(True);
+  Result_ := Run(['registry', 'revoke-token', '--data-dir', FData]);
+  Expect<Boolean>(Pos('invalid_configuration', Result_.Stderr) > 0).ToBe(True);
+  Result_ := Run(['registry', 'serve', '--data-dir', FData, '--packages', 'lib']);
+  Expect<Integer>(Result_.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('invalid_configuration', Result_.Stderr) > 0).ToBe(True);
+end;
+
+procedure TRegistryPublicationE2E.TestKilledPublicationKeepsTheOldHead;
+var
+  Token, Ready, Release: string;
+  Archive: TBytes;
+  Publisher: TRequestThread;
+  Started: QWord;
+begin
+  InitOrigin;
+  Token := IssueToken(['--packages', '*']);
+  Ready := FScratch + '/barrier-ready';
+  Release := FScratch + '/barrier-release';
+  StartServe(LwptTestingBinaryPath, [UpperCase(RegistryProgramName)
+    + '_TEST_REGISTRY_PUBLICATION_BARRIER=' + Ready + '|' + Release]);
+  Archive := RawHTTPBytes('killed publication archive');
+  Expect<Integer>(Upload(Archive, Token).Status).ToBe(201);
+  Publisher := TRequestThread.Create(FPort, '/v1/packages/killed-lib/1.0.0',
+    Token, RawHTTPBytes(RecordText('killed-lib', '1.0.0', Archive)));
+  try
+    Started := GetTickCount64;
+    while not FileExists(Ready) and (GetTickCount64 - Started < 10000) do
+      Sleep(10);
+    Expect<Boolean>(FileExists(Ready)).ToBe(True);
+    { Readers still see the old, complete head while the new checkpoint is
+      durable but not yet activated. }
+    Expect<Integer>(LatestSequence).ToBe(1);
+    KillServe;
+    Publisher.WaitFor;
+  finally
+    Publisher.Free;
+  end;
+  StartServe(LwptBinaryPath, []);
+  Expect<Integer>(LatestSequence).ToBe(1);
+  Expect<Integer>(PublishRecord('killed-lib', '1.0.0', Archive, Token).Status)
+    .ToBe(201);
+  Expect<Integer>(LatestSequence).ToBe(2);
+end;
+
+procedure TRegistryPublicationE2E.TestKilledUploadIsReclaimedOnlyAfterItsLeaseIsFree;
+var
+  Token: string;
+  Live: TRawHTTPConnection;
+  Archive, Other: TBytes;
+  Started: QWord;
+begin
+  InitOrigin;
+  Token := IssueToken(['--packages', '*']);
+  StartServe(LwptBinaryPath, []);
+  Archive := RawHTTPBytes(StringOfChar('p', 4096));
+  Live := TRawHTTPConnection.Create(FPort);
+  try
+    Live.SendText('PUT /v1/objects/sha256/' + Copy(RegistryArtifactHash(Archive),
+      8, 64) + ' HTTP/1.1' + #13#10 + 'Authorization: Bearer ' + Token + #13#10
+      + 'Content-Length: 4096' + #13#10#13#10 + StringOfChar('p', 1000));
+    Started := GetTickCount64;
+    while (PartFiles = 0) and (GetTickCount64 - Started < 5000) do Sleep(10);
+    Expect<Integer>(PartFiles).ToBe(1);
+    { A live upload survives a concurrent admission and commit. }
+    Other := RawHTTPBytes('concurrent archive');
+    Expect<Integer>(Upload(Other, Token).Status).ToBe(201);
+    Expect<Integer>(PublishRecord('concurrent-lib', '1.0.0', Other, Token).Status)
+      .ToBe(201);
+    Expect<Integer>(PartFiles).ToBe(1);
+    KillServe;
+  finally
+    Live.Free;
+  end;
+  { The killed owner's reservation stays until an admission finds its lease
+    free, then it is reclaimed. }
+  Expect<Integer>(PartFiles).ToBe(1);
+  StartServe(LwptBinaryPath, []);
+  Expect<Integer>(PartFiles).ToBe(1);
+  Expect<Integer>(Upload(RawHTTPBytes('after restart'), Token).Status).ToBe(201);
+  Expect<Integer>(PartFiles).ToBe(0);
+end;
+
+procedure TRegistryPublicationE2E.SetupTests;
+begin
+  Test('a CI token publishes to a running origin, then revocation applies',
+    TestPublishToARunningOrigin);
+  Test('token options and expiry bounds are validated by the CLI',
+    TestTokenOptionsAndExpiryBounds);
+  Test('a publication killed before activation keeps the old head',
+    TestKilledPublicationKeepsTheOldHead);
+  Test('a killed upload is reclaimed only after its lease is free',
+    TestKilledUploadIsReclaimedOnlyAfterItsLeaseIsFree);
+end;
+
+begin
+  TestRunnerProgram.AddSuite(TRegistryPublicationE2E.Create(
+    'registry publication e2e'));
+  TestRunnerProgram.Run;
+end.
