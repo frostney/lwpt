@@ -16,6 +16,7 @@ program InstallRegistryLocked.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
   SysUtils,
@@ -48,6 +49,14 @@ type
       const AWithIdentity: Boolean = True): string;
     function Run(const ACase: string;
       const AArguments: array of string): TLwptResult;
+    function RunWith(const ACase: string;
+      const AArguments, AEnvironment: array of string): TLwptResult;
+    { Points AVictim's lock entry, archive, and module at ASource's record,
+      archive, and tree, updating every unsigned hash to match. }
+    procedure Substitute(const ACase, AVictim, ASource: string);
+    function SubstitutionCase(const AName: string;
+      out AOther: TSyntheticRegistry; out AOtherOrigin: TSyntheticContact): string;
+    procedure SetArchivesReadOnly(const ACase: string; const AReadOnly: Boolean);
     function Journal(const ACase: string): string;
     function Fingerprint(const ACase: string): string;
     function ProjectFingerprint(const ACase: string): string;
@@ -108,6 +117,12 @@ type
     procedure TestOfflinePinChangeFails;
     procedure TestOfflineCoordinatedTamperFails;
     procedure TestOfflineForgedSignatureFails;
+    procedure TestRecordSubstitutionSameOriginFails;
+    procedure TestRecordSubstitutionAcrossOriginsFails;
+    procedure TestLayoutSubstitutionWithEqualTreeHashFails;
+    procedure TestFrozenLeavesArchiveStorageUntouched;
+    procedure TestRepeatedRotationHashesAreRefused;
+    procedure TestRotationCountIsBoundedBeforeReading;
   end;
 
 function ReadText(const APath: string): string;
@@ -223,6 +238,7 @@ begin
   FRegistry.AddPackage('json', '2.0.0', RegistryPackageArchive('json', '2.0.0'), []);
   FRegistry.AddPackage('extras', '1.0.0', RegistryPackageArchive('extras', '1.0.0'),
     []);
+  FRegistry.AddPackage('misc', '1.0.0', RegistryPackageArchive('misc', '1.0.0'), []);
   FRegistry.Publish(RegistryStamp(-120), RegistryStamp(6 * DAY));
   FBaseline := '';
 end;
@@ -276,6 +292,20 @@ begin
   Result := Result + 'key-id = "' + ARegistry.KeyID + '"'#10
     + 'public-key = "' + ARegistry.PublicKey + '"'#10
     + 'origin = "' + FOrigin.BaseURL + '"'#10;
+end;
+
+function TInstallRegistryLocked.RunWith(const ACase: string;
+  const AArguments, AEnvironment: array of string): TLwptResult;
+var Environment: array of string; Index: Integer;
+begin
+  SetLength(Environment, 3 + Length(AEnvironment));
+  Environment[0] := PROJECT_NAME + '_REGISTRY_STATE_DIR=' + ACase + '/state';
+  Environment[1] := PROJECT_NAME + '_CACHE_DIR=' + ACase + '/cache';
+  Environment[2] := PROJECT_NAME + '_TEST_REGISTRY_TRANSPORT_LOG=' + ACase
+    + '/transport.log';
+  for Index := 0 to High(AEnvironment) do
+    Environment[3 + Index] := AEnvironment[Index];
+  Result := RunLwptTesting(AArguments, ACase + '/project', Environment);
 end;
 
 function TInstallRegistryLocked.Run(const ACase: string;
@@ -876,6 +906,231 @@ begin
   RunDrift('offline-forged', ForgeSignature, 'signature_invalid', True);
 end;
 
+{ ---------------------------------------------------------------------------
+  Review regressions
+  --------------------------------------------------------------------------- }
+
+{ AText with AField of the [package.<AName>] entry set to AValue. }
+function WithEntryField(const AText, AName, AField, AValue: string): string;
+var Start, FieldStart, ValueEnd: Integer;
+begin
+  Start := Pos('[package.' + AName + ']', AText);
+  Expect<Boolean>(Start > 0).ToBe(True);
+  FieldStart := Pos(#10 + AField + ' = "', Copy(AText, Start, MaxInt));
+  Expect<Boolean>(FieldStart > 0).ToBe(True);
+  FieldStart := Start + FieldStart - 1 + Length(AField) + 5;
+  ValueEnd := FieldStart;
+  while AText[ValueEnd] <> '"' do Inc(ValueEnd);
+  Result := Copy(AText, 1, FieldStart - 1) + AValue
+    + Copy(AText, ValueEnd, MaxInt);
+end;
+
+procedure TInstallRegistryLocked.Substitute(const ACase, AVictim,
+  ASource: string);
+var Lock, Field: string;
+begin
+  Lock := LockText(ACase);
+  for Field in ['registryRecord', 'archiveHash', 'computedHash'] do
+    Lock := WithEntryField(Lock, AVictim, Field,
+      EntryField(Lock, ASource, Field));
+  WriteBytesToFile(ACase + '/project/lwpt.lock', BytesOf(Lock));
+  Expect<Boolean>(CopyFileContent(ACase + '/project/.lwpt/archives/' + ASource
+    + '-1.0.0.tar.gz', ACase + '/project/.lwpt/archives/' + AVictim
+    + '-1.0.0.tar.gz')).ToBe(True);
+  RecursiveDelete(ACase + '/project/.lwpt/modules/' + AVictim);
+  CopyTree(ACase + '/project/.lwpt/modules/' + ASource,
+    ACase + '/project/.lwpt/modules/' + AVictim);
+end;
+
+{ extras and misc from corp, tool from a second origin under another pin,
+  all without dependencies, installed online. }
+function TInstallRegistryLocked.SubstitutionCase(const AName: string;
+  out AOther: TSyntheticRegistry; out AOtherOrigin: TSyntheticContact): string;
+begin
+  Result := NewCase(AName);
+  AOther := TSyntheticRegistry.Create('https://other.example.com', 13);
+  AOtherOrigin := TSyntheticContact.Create(AOther, '/other');
+  AOther.AddPackage('tool', '1.0.0', RegistryPackageArchive('tool', '1.0.0'), []);
+  AOther.Publish(RegistryStamp(-120), RegistryStamp(6 * DAY));
+  WriteProject(Result, Declaration(FRegistry) + '[registries.oss]'#10
+    + 'identity = "' + AOther.Identity + '"'#10
+    + 'key-id = "' + AOther.KeyID + '"'#10
+    + 'public-key = "' + AOther.PublicKey + '"'#10
+    + 'origin = "' + AOtherOrigin.BaseURL + '"'#10
+    + '[registries]'#10 + 'default = "corp"'#10,
+    'extras = "registry:corp/extras@^1.0.0"'#10
+    + 'misc = "registry:corp/misc@^1.0.0"'#10
+    + 'tool = "registry:oss/tool@^1.0.0"'#10);
+  ExpectSuccess('substitution install', Run(Result, ['install']));
+  ExpectSuccess('substitution frozen baseline', Run(Result, ['install', '--frozen']));
+  DeleteFile(Result + '/transport.log');
+end;
+
+procedure TInstallRegistryLocked.TestRecordSubstitutionSameOriginFails;
+var
+  Other: TSyntheticRegistry;
+  OtherOrigin: TSyntheticContact;
+  CaseRoot, Before: string;
+begin
+  Other := nil;
+  OtherOrigin := nil;
+  try
+    CaseRoot := SubstitutionCase('substitute-same', Other, OtherOrigin);
+    { extras verifies first; misc then claims extras' record. }
+    Substitute(CaseRoot, 'misc', 'extras');
+    Before := Fingerprint(CaseRoot);
+    FOrigin.Mode := scmFail;
+    OtherOrigin.Mode := scmFail;
+    ExpectFailure(Run(CaseRoot, ['install', '--frozen']), 'locked_record_mismatch');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectFailure(Run(CaseRoot, ['install', '--offline']), 'locked_record_mismatch');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    Expect<string>(Journal(CaseRoot)).ToBe('');
+  finally
+    OtherOrigin.Free;
+    Other.Free;
+  end;
+end;
+
+procedure TInstallRegistryLocked.TestRecordSubstitutionAcrossOriginsFails;
+var
+  Other: TSyntheticRegistry;
+  OtherOrigin: TSyntheticContact;
+  CaseRoot, Before: string;
+begin
+  Other := nil;
+  OtherOrigin := nil;
+  try
+    CaseRoot := SubstitutionCase('substitute-cross', Other, OtherOrigin);
+    { tool, from another origin under another pin, claims corp's extras. }
+    Substitute(CaseRoot, 'tool', 'extras');
+    Before := Fingerprint(CaseRoot);
+    FOrigin.Mode := scmFail;
+    OtherOrigin.Mode := scmFail;
+    ExpectFailure(Run(CaseRoot, ['install', '--frozen']),
+      'committed selection proof for "tool"');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectFailure(Run(CaseRoot, ['install', '--offline']),
+      'committed selection proof for "tool"');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    Expect<string>(Journal(CaseRoot)).ToBe('');
+  finally
+    OtherOrigin.Free;
+    Other.Free;
+  end;
+end;
+
+procedure TInstallRegistryLocked.TestLayoutSubstitutionWithEqualTreeHashFails;
+var CaseRoot, Module, Original, TreeHash, Before: string; Split: Integer;
+begin
+  { HashTree folds "path LF contents" without framing, so emptying a unit and
+    adding a file named after its first line, holding the rest, keeps the
+    hash. Only an exact comparison with the authenticated extraction sees
+    the different layout. }
+  CaseRoot := Clone(Baseline, 'frozen-layout');
+  Module := CaseRoot + '/project/.lwpt/modules/json';
+  TreeHash := HashTree(Module);
+  Original := ReadText(Module + '/source/json.pas');
+  Split := Pos(#10, Original);
+  Expect<Boolean>(Split > 1).ToBe(True);
+  WriteBytesToFile(Module + '/source/json.pas', nil);
+  WriteBytesToFile(Module + '/' + Copy(Original, 1, Split - 1),
+    BytesOf(Copy(Original, Split + 1, MaxInt)));
+  Expect<string>(HashTree(Module)).ToBe(TreeHash);
+  Before := Fingerprint(CaseRoot);
+  FOrigin.Mode := scmFail;
+  ExpectFailure(Run(CaseRoot, ['install', '--frozen']),
+    'differs from the tree re-derived from its proof-authenticated archive');
+  Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  Expect<string>(Journal(CaseRoot)).ToBe('');
+end;
+
+procedure TInstallRegistryLocked.SetArchivesReadOnly(const ACase: string;
+  const AReadOnly: Boolean);
+var Entry: TSearchRec; Root: string;
+begin
+  Root := ACase + '/project/.lwpt/archives';
+  if FindFirst(Root + '/*.tar.gz', faAnyFile, Entry) = 0 then
+    try
+      repeat
+        if AReadOnly then FileSetAttr(Root + '/' + Entry.Name, faReadOnly)
+        else FileSetAttr(Root + '/' + Entry.Name, 0);
+      until FindNext(Entry) <> 0;
+    finally
+      FindClose(Entry);
+    end;
+  {$IFDEF UNIX}
+  if AReadOnly then FpChmod(Root, &555) else FpChmod(Root, &755);
+  {$ENDIF}
+end;
+
+procedure TInstallRegistryLocked.TestFrozenLeavesArchiveStorageUntouched;
+var CaseRoot, Sentinel, Before: string;
+begin
+  CaseRoot := Clone(Baseline, 'frozen-readonly');
+  { A file where a sibling intermediate tar would go must survive. }
+  Sentinel := CaseRoot + '/project/.lwpt/archives/json-1.0.0.tar.gz.tar';
+  WriteTextFile(Sentinel, 'sentinel'#10);
+  Before := Fingerprint(CaseRoot);
+  FOrigin.Mode := scmFail;
+  SetArchivesReadOnly(CaseRoot, True);
+  try
+    ExpectSuccess('frozen over read-only archives',
+      Run(CaseRoot, ['install', '--frozen']));
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    Expect<Boolean>(TmpHasFrozenScratch(CaseRoot + '/project')).ToBe(False);
+    { An extraction that fails after decompression cleans up its private
+      scratch and still writes nothing beside the archives. }
+    ExpectFailure(RunWith(CaseRoot, ['install', '--frozen'],
+      [PROJECT_NAME + '_TEST_FAIL_REGISTRY_REDERIVE=1']), 'extract');
+    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    Expect<Boolean>(TmpHasFrozenScratch(CaseRoot + '/project')).ToBe(False);
+    Expect<Boolean>(FileExists(CaseRoot
+      + '/project/.lwpt/archives/extras-1.0.0.tar.gz.tar')).ToBe(False);
+  finally
+    SetArchivesReadOnly(CaseRoot, False);
+  end;
+  Expect<string>(ReadText(Sentinel)).ToBe('sentinel'#10);
+  Expect<string>(Journal(CaseRoot)).ToBe('');
+end;
+
+procedure TInstallRegistryLocked.TestRepeatedRotationHashesAreRefused;
+var CaseRoot, Snapshot, Before: string;
+begin
+  { One committed document named three times: a repeat is refused before any
+    rotation document is read, so repeats cannot multiply allocation. }
+  CaseRoot := Clone(Baseline, 'rotation-repeat');
+  Snapshot := TableField(CaseRoot, 'snapshot');
+  EditLock(CaseRoot, #10'rotations = []', #10'rotations = ["' + Snapshot
+    + '", "' + Snapshot + '", "' + Snapshot + '"]');
+  Before := Fingerprint(CaseRoot);
+  FOrigin.Mode := scmFail;
+  ExpectFailure(Run(CaseRoot, ['install', '--frozen']), 'repeat');
+  ExpectFailure(Run(CaseRoot, ['install', '--offline']), 'repeat');
+  Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  Expect<string>(Journal(CaseRoot)).ToBe('');
+end;
+
+procedure TInstallRegistryLocked.TestRotationCountIsBoundedBeforeReading;
+var CaseRoot, Hashes, Before: string; Index: Integer;
+begin
+  { 1,001 rotations of distinct, absent documents: the count limit fails
+    first, so no document is looked up. }
+  CaseRoot := Clone(Baseline, 'rotation-count');
+  Hashes := '';
+  for Index := 1 to 3003 do
+  begin
+    if Hashes <> '' then Hashes := Hashes + ', ';
+    Hashes := Hashes + '"sha256:' + SHA256Hex(BytesOf(IntToStr(Index))) + '"';
+  end;
+  EditLock(CaseRoot, #10'rotations = []', #10'rotations = [' + Hashes + ']');
+  Before := Fingerprint(CaseRoot);
+  FOrigin.Mode := scmFail;
+  ExpectFailure(Run(CaseRoot, ['install', '--frozen']), 'proof_limit_exceeded');
+  Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  Expect<string>(Journal(CaseRoot)).ToBe('');
+end;
+
 procedure TInstallRegistryLocked.SetupTests;
 begin
   Test('the transport journal records an online install''s client and requests',
@@ -928,6 +1183,18 @@ begin
     TestOfflineCoordinatedTamperFails);
   Test('#226: --offline catches a forged signature with consistent hashes',
     TestOfflineForgedSignatureFails);
+  Test('review: a lock entry pointed at another package''s record fails',
+    TestRecordSubstitutionSameOriginFails);
+  Test('review: a lock entry pointed at another origin''s record fails',
+    TestRecordSubstitutionAcrossOriginsFails);
+  Test('review: a re-laid-out module with an equal tree hash fails --frozen',
+    TestLayoutSubstitutionWithEqualTreeHashFails);
+  Test('review: --frozen never writes beside committed archives, even on failure',
+    TestFrozenLeavesArchiveStorageUntouched);
+  Test('review: repeated rotation hashes in the lock are refused',
+    TestRepeatedRotationHashesAreRefused);
+  Test('review: an oversized rotation list is refused before any document is read',
+    TestRotationCountIsBoundedBeforeReading);
 end;
 
 begin

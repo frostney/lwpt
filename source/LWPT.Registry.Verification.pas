@@ -231,7 +231,7 @@ type
   { What a lock records for one origin's selection proof, and for each record
     of TLWPTRegistryLockedSelection.Records, in the same order. }
   TLWPTRegistryLockedClaims = record
-    Checkpoint, Signature, Snapshot, KeyId: string;
+    Checkpoint, Signature, Snapshot, KeyId, PublishedAt, ExpiresAt: string;
     Sequence: Int64;
     Records: TLWPTRegistryLockedRecordArray;
   end;
@@ -239,8 +239,8 @@ type
 { Network-free verification of a consumer's locked selection proof against
   the lock's claims: the checkpoint and signature bytes are the recorded ones,
   the signature verifies under the key the committed rotation chain reaches
-  from the pin, the checkpoint's sequence, key, and snapshot are the recorded
-  ones, the snapshot bytes are the checkpoint's, and every selected record is
+  from the pin, the checkpoint's sequence, key, snapshot, publication, and
+  expiry are the recorded ones, the snapshot bytes are the checkpoint's, and every selected record is
   a member of that snapshot whose origin, name, version, and archive equal
   the lock. It walks no history and applies neither expiry nor the clock
   floor (ADR-0051 decision 4). }
@@ -1758,7 +1758,9 @@ begin
   Checkpoint := InspectRegistryCheckpoint(ASelection.Checkpoint);
   if (Checkpoint.Sequence <> AClaims.Sequence)
     or (Checkpoint.KeyId <> AClaims.KeyId)
-    or (Checkpoint.Snapshot <> AClaims.Snapshot) then
+    or (Checkpoint.Snapshot <> AClaims.Snapshot)
+    or (Checkpoint.PublishedAt <> AClaims.PublishedAt)
+    or (Checkpoint.ExpiresAt <> AClaims.ExpiresAt) then
     raise ELWPTRegistryError.CreateStable('locked_proof_state_mismatch',
       'the retained checkpoint differs from the recorded selection proof');
   if Checkpoint.Origin <> ATrust.Origin then

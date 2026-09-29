@@ -209,6 +209,28 @@ function ReadLocalRegistryDocument(const AStateRoot, AArchivesRoot,
 function LoadRegistryRotationChain(const AStateRoot, AArchivesRoot: string;
   const AHashes: TStringArray; const ALimits: TLWPTRegistryVerificationLimits;
   out AChain: TLWPTRegistryRotationProofArray): Boolean;
+{ The bounded-loading policy for a rotation hash list, checked before any
+  document is read: complete triplets, at most ALimits.Rotations rotations,
+  canonical hashes, and no repeated hash. Raises proof_limit_exceeded or
+  registry_proof_corrupt. }
+procedure RequireBoundedRegistryRotationHashes(const AHashes: TStringArray;
+  const ALimits: TLWPTRegistryVerificationLimits);
+{ One document of a locked selection proof, read only when its size fits
+  AAllowance (checked before allocation; proof_limit_exceeded otherwise).
+  The committed file under AArchivesRoot must hash to its name
+  (registry_proof_corrupt), and a corrupt committed file is never read
+  around. Only when it is absent, and AStateRoot is not empty, does the
+  per-user document store supply it by hash (--offline). }
+function ReadLockedRegistryDocument(const AArchivesRoot, AStateRoot,
+  AHash: string; const AAllowance: Int64): TBytes;
+{ The committed bytes of ATable's selection proof and of ARecords, loaded
+  under the policy above within ALimits: rotation hashes are checked by
+  RequireBoundedRegistryRotationHashes, record hashes may not repeat, and
+  every document is charged to the per-document limit, the remaining total,
+  and the document count before it is allocated. }
+function LoadLockedRegistrySelection(const AArchivesRoot, AStateRoot: string;
+  const ATable: TLWPTRegistryLockTable; const ARecords: TStringArray;
+  const ALimits: TLWPTRegistryVerificationLimits): TLWPTRegistryLockedSelection;
 { The newer of two accepted states; the floor is the later of both. }
 function MergeRegistryAcceptedStates(const ALeft,
   ARight: TLWPTRegistryConsumerState): TLWPTRegistryConsumerState;
@@ -354,11 +376,43 @@ begin
       AHash, AMaximumBytes);
 end;
 
+procedure RequireBoundedRegistryRotationHashes(const AHashes: TStringArray;
+  const ALimits: TLWPTRegistryVerificationLimits);
+var
+  Seen: TStringList;
+  Index: Integer;
+begin
+  if (Length(AHashes) mod 3) <> 0 then
+    raise ELWPTRegistryError.CreateStable('registry_proof_corrupt',
+      'rotation hashes are incomplete: each rotation names three documents');
+  if Length(AHashes) div 3 > ALimits.Rotations then
+    raise ELWPTRegistryError.CreateStable('proof_limit_exceeded',
+      'the proof names ' + IntToStr(Length(AHashes) div 3) + ' rotations; '
+      + 'the limit is ' + IntToStr(ALimits.Rotations));
+  Seen := TStringList.Create;
+  try
+    Seen.Sorted := True;
+    Seen.CaseSensitive := True;
+    for Index := 0 to High(AHashes) do
+    begin
+      if not RegistryHashIsCanonical(AHashes[Index]) then
+        raise ELWPTRegistryError.CreateStable('registry_proof_corrupt',
+          'rotation hash "' + AHashes[Index] + '" is not canonical');
+      if Seen.IndexOf(AHashes[Index]) >= 0 then
+        raise ELWPTRegistryError.CreateStable('registry_proof_corrupt',
+          'rotation document ' + AHashes[Index] + ' is named more than once; '
+          + 'a repeated document is refused before it is read');
+      Seen.Add(AHashes[Index]);
+    end;
+  finally
+    Seen.Free;
+  end;
+end;
+
 function LoadRegistryRotationChain(const AStateRoot, AArchivesRoot: string;
   const AHashes: TStringArray; const ALimits: TLWPTRegistryVerificationLimits;
   out AChain: TLWPTRegistryRotationProofArray): Boolean;
 var
-  Seen: TStringList;
   Index, Count: Integer;
   Total: Int64;
   Parts: array[0..2] of TBytes;
@@ -366,23 +420,13 @@ var
 begin
   AChain := nil;
   Result := False;
-  if (Length(AHashes) = 0) or ((Length(AHashes) mod 3) <> 0) then
-    Exit(Length(AHashes) = 0);
-  Count := Length(AHashes) div 3;
-  if Count > ALimits.Rotations then Exit;
-  Seen := TStringList.Create;
+  if Length(AHashes) = 0 then Exit(True);
   try
-    Seen.Sorted := True;
-    Seen.CaseSensitive := True;
-    for Index := 0 to High(AHashes) do
-    begin
-      if not RegistryHashIsCanonical(AHashes[Index])
-         or (Seen.IndexOf(AHashes[Index]) >= 0) then Exit;
-      Seen.Add(AHashes[Index]);
-    end;
-  finally
-    Seen.Free;
+    RequireBoundedRegistryRotationHashes(AHashes, ALimits);
+  except
+    on E: ELWPTRegistryError do Exit;
   end;
+  Count := Length(AHashes) div 3;
   Total := 0;
   SetLength(AChain, Count);
   for Index := 0 to Count - 1 do
@@ -409,6 +453,102 @@ begin
     AChain[Index].NewSignature := Parts[2];
   end;
   Result := True;
+end;
+
+function ReadLockedRegistryDocument(const AArchivesRoot, AStateRoot,
+  AHash: string; const AAllowance: Int64): TBytes;
+var Path: string; Stream: TFileStream;
+begin
+  Result := nil;
+  if not RegistryHashIsCanonical(AHash) then
+    raise ELWPTRegistryError.CreateStable('registry_proof_missing',
+      'lock names an invalid proof document hash "' + AHash + '"');
+  if AAllowance < 1 then
+    raise ELWPTRegistryError.CreateStable('proof_limit_exceeded',
+      'the committed selection proof exceeds the verification byte budget');
+  Path := RegistryProofPath(AArchivesRoot, AHash);
+  if not FileExists(Path) then
+  begin
+    if AStateRoot <> '' then
+    begin
+      Result := ReadBoundedDocument(RegistryStateDocumentPath(AStateRoot,
+        AHash), AHash, AAllowance);
+      if Result <> nil then Exit;
+      raise ELWPTRegistryError.CreateStable('registry_proof_missing',
+        'committed proof document ' + Path + ' is missing, and the per-user '
+        + 'document store under ' + AStateRoot + ' has no verified copy '
+        + 'within the verification limits');
+    end;
+    raise ELWPTRegistryError.CreateStable('registry_proof_missing',
+      'committed proof document ' + Path + ' is missing');
+  end;
+  Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+  try
+    if Stream.Size > AAllowance then
+      raise ELWPTRegistryError.CreateStable('proof_limit_exceeded',
+        'committed proof document ' + Path + ' has ' + IntToStr(Stream.Size)
+        + ' bytes; the remaining verification budget is '
+        + IntToStr(AAllowance));
+    SetLength(Result, Stream.Size);
+    if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
+  finally
+    Stream.Free;
+  end;
+  if SHA256BytesPrefixed(Result) <> AHash then
+    raise ELWPTRegistryError.CreateStable('registry_proof_corrupt',
+      'committed proof document ' + Path + ' does not match its hash');
+end;
+
+function LoadLockedRegistrySelection(const AArchivesRoot, AStateRoot: string;
+  const ATable: TLWPTRegistryLockTable; const ARecords: TStringArray;
+  const ALimits: TLWPTRegistryVerificationLimits): TLWPTRegistryLockedSelection;
+var
+  Total: Int64;
+  Index: Integer;
+  Seen: TStringList;
+
+  function Next(const AHash: string): TBytes;
+  begin
+    Result := ReadLockedRegistryDocument(AArchivesRoot, AStateRoot, AHash,
+      Min64(ALimits.DocumentBytes, ALimits.TotalBytes - Total));
+    Inc(Total, Length(Result));
+  end;
+
+begin
+  Result := Default(TLWPTRegistryLockedSelection);
+  RequireBoundedRegistryRotationHashes(ATable.Rotations, ALimits);
+  if 3 + Length(ATable.Rotations) + Length(ARecords) > ALimits.Documents then
+    raise ELWPTRegistryError.CreateStable('proof_limit_exceeded',
+      'the committed selection proof names more than '
+      + IntToStr(ALimits.Documents) + ' documents');
+  Seen := TStringList.Create;
+  try
+    Seen.Sorted := True;
+    Seen.CaseSensitive := True;
+    for Index := 0 to High(ARecords) do
+    begin
+      if Seen.IndexOf(ARecords[Index]) >= 0 then
+        raise ELWPTRegistryError.CreateStable('registry_proof_corrupt',
+          'selected record ' + ARecords[Index] + ' is named more than once');
+      Seen.Add(ARecords[Index]);
+    end;
+  finally
+    Seen.Free;
+  end;
+  Total := 0;
+  Result.Checkpoint := Next(ATable.Checkpoint);
+  Result.Signature := Next(ATable.Signature);
+  Result.Snapshot := Next(ATable.Snapshot);
+  SetLength(Result.Rotations, Length(ATable.Rotations) div 3);
+  for Index := 0 to High(Result.Rotations) do
+  begin
+    Result.Rotations[Index].Document := Next(ATable.Rotations[3 * Index]);
+    Result.Rotations[Index].OldSignature := Next(ATable.Rotations[3 * Index + 1]);
+    Result.Rotations[Index].NewSignature := Next(ATable.Rotations[3 * Index + 2]);
+  end;
+  SetLength(Result.Records, Length(ARecords));
+  for Index := 0 to High(ARecords) do
+    Result.Records[Index] := Next(ARecords[Index]);
 end;
 
 function QuoteList(const AValues: TStringArray): string;
