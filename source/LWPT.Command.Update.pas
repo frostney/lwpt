@@ -37,6 +37,8 @@ var
   NeedManifestWrite: Boolean;
 begin
   Ctx := LoadManifestContext(AManifestPath);
+  { A v3 lock is refused before hooks or any other change (ADR-0052). }
+  RequireProjectLockfileSchema(Ctx);
   SetLength(Lock, 0);
   LockPath := IncludeTrailingPathDelimiter(Ctx.ProjectRoot) + LOCKFILE;
   if FileExists(LockPath) then

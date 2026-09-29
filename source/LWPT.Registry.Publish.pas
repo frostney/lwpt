@@ -5,8 +5,8 @@
   1. Local validation, before any credential or connection: the trust pin,
      the origin URL (https, or plain http for the exact host localhost),
      the token variable's name, and the archive (PreparePublicationArchive:
-     type detection, the tar.gz scan or zip normalization, and the
-     [dependencies] refusal).
+     type detection, the tar.gz scan or zip normalization, and the mapping
+     of its [dependencies] to record dependencies, ADR-0051 decision 10).
   2. The token is read from its environment variable, once.
   3. Discovery and capabilities (role origin, publication-v1, bearer), then
      the latest checkpoint verified from the pin: the "before" head.
@@ -37,7 +37,8 @@ uses
   SysUtils,
 
   LWPT.Core,
-  LWPT.Registry.Store;
+  LWPT.Registry.Store,
+  LWPT.Registry.Verification;
 
 const
   REGISTRY_DEFAULT_TOKEN_ENVIRONMENT = PROJECT_NAME + '_REGISTRY_TOKEN';
@@ -99,10 +100,17 @@ function RegistryPublishBackoffSeconds(const AAttempt,
 { The canonical origin URL; raises insecure_transport for plain http to any
   host but localhost, invalid_configuration for anything else invalid. }
 function CanonicalRegistryPublishOrigin(const AOrigin: string): string;
-{ The canonical package record the client publishes. }
+{ ADependencies, each naming its origin explicitly, in protocol order:
+  sorted by origin, name, then version bytes. }
+function SortRegistryDependencies(
+  const ADependencies: TLWPTRegistryDependencyArray): TLWPTRegistryDependencyArray;
+{ The canonical package record the client publishes. ADependencies name
+  their origins explicitly; one on AOrigin is written without it, and the
+  entries are written in protocol order. }
 function RegistryPublishRecordDocument(const AOrigin, AName, AVersion,
   AArchiveHash: string; const AArchiveSize: Int64;
-  const APublishedAt: string): string;
+  const APublishedAt: string;
+  const ADependencies: TLWPTRegistryDependencyArray): string;
 { The record hash named by a Location value that is exactly
   <AAPI>/records/sha256/<hex>.toml, or '' for anything else. }
 function RegistryRecordHashFromLocation(const ALocation, AAPI: string): string;
@@ -122,7 +130,6 @@ uses
   LWPT.ArchiveNormalize,
   LWPT.Registry.Client,
   LWPT.Registry.Tokens,
-  LWPT.Registry.Verification,
   TOML,
   TransportSecurity;
 
@@ -431,10 +438,56 @@ begin
       Exit(False);
 end;
 
+function DependencySortKey(const ADependency: TLWPTRegistryDependency): string;
+begin
+  Result := ADependency.Origin + #0 + ADependency.Name + #0 + ADependency.Version;
+end;
+
+function SortRegistryDependencies(
+  const ADependencies: TLWPTRegistryDependencyArray): TLWPTRegistryDependencyArray;
+var
+  Index, Position: Integer;
+  Current: TLWPTRegistryDependency;
+begin
+  Result := System.Copy(ADependencies, 0, Length(ADependencies));
+  { Insertion sort on byte order, the order the verifier requires. }
+  for Index := 1 to High(Result) do
+  begin
+    Current := Result[Index];
+    Position := Index - 1;
+    while (Position >= 0)
+      and (DependencySortKey(Result[Position]) > DependencySortKey(Current)) do
+    begin
+      Result[Position + 1] := Result[Position];
+      Dec(Position);
+    end;
+    Result[Position + 1] := Current;
+  end;
+end;
+
 function RegistryPublishRecordDocument(const AOrigin, AName, AVersion,
   AArchiveHash: string; const AArchiveSize: Int64;
-  const APublishedAt: string): string;
+  const APublishedAt: string;
+  const ADependencies: TLWPTRegistryDependencyArray): string;
+var
+  Sorted: TLWPTRegistryDependencyArray;
+  Line: string;
+  Index: Integer;
 begin
+  { ADR-0051 "Dependency-bearing publication": a dependency on the
+    publishing origin omits origin, and entries are in protocol order. }
+  Sorted := SortRegistryDependencies(ADependencies);
+  Line := 'dependencies = [';
+  for Index := 0 to High(Sorted) do
+  begin
+    if Index > 0 then Line := Line + ', ';
+    Line := Line + '{ ';
+    if Sorted[Index].Origin <> AOrigin then
+      Line := Line + 'origin = ' + RegistryTOMLQuote(Sorted[Index].Origin) + ', ';
+    Line := Line + 'name = ' + RegistryTOMLQuote(Sorted[Index].Name)
+      + ', version = ' + RegistryTOMLQuote(Sorted[Index].Version) + ' }';
+  end;
+  Line := Line + ']';
   Result := 'schema = ' + RegistryTOMLQuote(PROGRAM_NAME + '-registry-package-v1') + #10
     + 'origin = ' + RegistryTOMLQuote(AOrigin) + #10
     + 'name = ' + RegistryTOMLQuote(AName) + #10
@@ -443,9 +496,21 @@ begin
     + 'archive_size = ' + IntToStr(AArchiveSize) + #10
     + 'published_at = ' + RegistryTOMLQuote(APublishedAt) + #10
     + 'yanked = false' + #10
-    { ADR-0049 decision 4: dependency-bearing archives are refused before
-      this point, so every record publishes an empty list. }
-    + 'dependencies = []' + #10;
+    + Line + #10;
+end;
+
+{ True when the included record's dependencies, each with its effective
+  origin, are exactly the published ones in protocol order. }
+function SameRegistryDependencies(const AIncluded,
+  APublished: TLWPTRegistryDependencyArray): Boolean;
+var
+  Index: Integer;
+begin
+  Result := Length(AIncluded) = Length(APublished);
+  if not Result then Exit;
+  for Index := 0 to High(AIncluded) do
+    if DependencySortKey(AIncluded[Index]) <> DependencySortKey(APublished[Index]) then
+      Exit(False);
 end;
 
 function RegistryRecordHashFromLocation(const ALocation, AAPI: string): string;
@@ -1009,7 +1074,7 @@ begin
     Session.Upload(Prepared.Archive, Result.ArchiveHash);
     RecordBytes := BytesOf(RegistryPublishRecordDocument(Session.Trust.Origin,
       Result.Name, Result.Version, Result.ArchiveHash, Length(Prepared.Archive),
-      RegistryTimestampNow));
+      RegistryTimestampNow, Prepared.Manifest.Dependencies));
     Status := Session.PublishRecord(Result.Name, Result.Version, RecordBytes,
       RecordHash);
     if Status = 424 then
@@ -1030,7 +1095,8 @@ begin
     if (Package.Name <> Result.Name) or (Package.Version <> Result.Version)
       or (Package.ArchiveHash <> Result.ArchiveHash)
       or (Package.ArchiveSize <> Length(Prepared.Archive))
-      or (Length(Package.Dependencies) <> 0) then
+      or not SameRegistryDependencies(Package.Dependencies,
+        SortRegistryDependencies(Prepared.Manifest.Dependencies)) then
       Fail('publication_not_included',
         'the included record differs from the published identity or content');
     Result.Created := Status = 201;

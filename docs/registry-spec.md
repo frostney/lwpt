@@ -137,6 +137,12 @@ A package name is lowercase ASCII matching:
 
 A version is a canonical SemVer 2.0.0 version without a leading `v`.
 
+LWPT's dependency consumer installs only names without `.`, because a name is
+also a module directory and a dependency key, and `lwpt registry publish`
+refuses the rest ([ADR-0051](./adr/0051-registry-dependency-sources.md)
+decision 6). The protocol grammar itself is unchanged, so other clients and
+LWPT origins still accept such names.
+
 The stable identity is:
 
 ```text
@@ -297,9 +303,12 @@ dependencies = []
 ```
 
 `published_at` is an RFC 3339 UTC string with whole seconds. Dependency inline
-tables have field order `origin`, `name`, `version`; `origin` is omitted only
-for the record's own origin. Dependency entries are sorted by origin, name,
-then version bytes.
+tables have field order `origin`, `name`, `version`. `origin` is omitted
+exactly when the dependency is on the record's own origin: an explicit
+`origin` equal to the record's `origin` is not canonical, so every dependency
+has one encoding and one record hash. Dependency entries are sorted by
+effective origin (the record's own for an omitted `origin`), name, then
+version bytes.
 
 Dependency `version` values use a deliberately restricted canonical SemVer
 constraint grammar:
@@ -315,6 +324,13 @@ constraints are not protocol 1 canonical forms. This subset is accepted by
 LWPT's Semver package while remaining straightforward for independent
 implementations. A dependency omitting `origin` uses the record's origin;
 otherwise its origin is explicit and canonical.
+
+LWPT's `registry publish` derives `dependencies` from the archive
+`lwpt.toml`'s `registry:` dependencies, as
+[ADR-0051](./adr/0051-registry-dependency-sources.md) ("Dependency-bearing
+publication") specifies. A manifest dependency this list cannot express, such
+as another source kind or one with extraction filters, is refused before
+anything is uploaded, never dropped.
 
 Records are immutable. Yank status changes through the dedicated lifecycle
 operation below, which publishes a new record for the same package identity
@@ -684,7 +700,8 @@ identity, authorization, version ownership, archive hash, and archive size. The
 record's `name` and `version` MUST equal the path, its `origin` MUST equal the
 origin identity, and it MUST have `yanked = false`; yank state changes only
 through the lifecycle endpoints below, so a yanked record is `400
-invalid_request`.
+invalid_request`. A record MUST NOT depend on its own package identity, its own
+`name` at its own origin; such a record is `400 invalid_request`.
 
 A record's **immutable content** is its content identity: `archive`,
 `archive_size`, and `dependencies`. `published_at` and `yanked` are not part of

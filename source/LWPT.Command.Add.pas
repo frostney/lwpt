@@ -53,6 +53,8 @@ var
   i, Slot : Integer;
 begin
   Ctx := LoadManifestContext(AManifestPath);
+  { A v3 lock is refused before hooks or any other change (ADR-0052). }
+  RequireProjectLockfileSchema(Ctx);
 
   Dep := Default(TDependency);
   { Pre-name the dep so parse errors read "dependency "<something>"";

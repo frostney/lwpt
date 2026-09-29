@@ -309,6 +309,9 @@ procedure ParseDependencySourceCore(const ASource: string; const ACustomSources:
 procedure ParseDependencySource(const ASource: string; out AKind: TSourceKind; out AHost: THostKind; out ALocator: string);
 procedure ParseVersionSpec(const ASpec: string; out AKind: TVersionKind; out AValue: string);
 procedure ParseBareDepString(const ABare: string; const ACustomSources: TCustomSourceArray; var ADep: TDependency);
+{ The inline-table form of one [dependencies] entry; ADep.Name is the key.
+  Registry publication reuses both readers (ADR-0051 decision 10). }
+procedure ParseTableDep(ANode: TTOMLNode; const ACustomSources: TCustomSourceArray; var ADep: TDependency);
 function  ValidPackageName(const S: string): Boolean;
 { The consumer registry package grammar [a-z0-9][a-z0-9_-]{0,127}
   (ADR-0051 decision 6) and the alias grammar [a-z0-9][a-z0-9_-]{0,63}. }

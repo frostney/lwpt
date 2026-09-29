@@ -74,8 +74,9 @@ Idempotency compares **content identity**: `archive`, `archive_size`, and
   `published_at` (and to the yank and restore record times), so the
   five-minute skew rule and the server-assigned lifecycle times reproduce the
   corpus bytes regardless of when the run happens. `publish-package-created`
-  declares dependencies, so an LWPT origin runs it with the ADR-0049
-  decision-4 refusal lifted through its test seam.
+  declares dependencies on its own origin and on another; an LWPT origin
+  accepts it like any canonical record, because ADR-0051 decision 10 lifted
+  ADR-0049 decision 4.
 
 ## Package-list cursors
 

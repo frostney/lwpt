@@ -103,6 +103,11 @@ function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
 procedure EnsureCompilerPathBudget(const AUnitDirectory,
   AExecutableDirectory: string; ALongestBaseNameLength: Integer);
 function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
+{ Take the project's build-coordination lock, the session-root ledger lock
+  that every build's publication already shares across processes, threads
+  and relocated session roots, for a short project-wide critical section.
+  Free the result to release it. }
+function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
   ALockPath, AModulesPath: string;
@@ -1104,6 +1109,12 @@ function BuildSessionLedgerLockPath(const AProjectRoot: string): string;
 begin
   Result := RootedPath(AProjectRoot, BUILD_SESSIONS_DIR)
     + '/locks/session-roots.lock';
+end;
+
+function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
+begin
+  Result := TLWPTPublicationLock.Create(
+    BuildSessionLedgerLockPath(AProjectRoot));
 end;
 
 function BuildSessionsProjectRoot(const AProjectRoot,

@@ -23,6 +23,7 @@ uses
   Platform,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.PayloadHandoff,
   Tests.ProcessSupport,
   Tests.Scratch,
   Tests.SpawnGuardProbe;
@@ -144,7 +145,7 @@ begin
   {$IFDEF UNIX}
   FpSignal(SIGTERM, SignalHandler(SIG_IGN));
   {$ENDIF}
-  WriteTextFile(ParamStr(2), IntToStr(GetProcessID));
+  PublishReadablePayload(ParamStr(2), IntToStr(GetProcessID));
   Sleep(ProbeTimeoutSleepMilliseconds);
   Result := 0;
 end;
@@ -162,7 +163,7 @@ begin
     Grandchild.Parameters.Add(ProbeTimeoutGrandchildOption);
     Grandchild.Parameters.Add(AGrandchildPIDPath);
     Grandchild.Execute;
-    while not FileExists(AGrandchildPIDPath) and Grandchild.Running do
+    while not PayloadIsReadable(AGrandchildPIDPath) and Grandchild.Running do
       Sleep(ProcessPollMilliseconds);
     Sleep(ProbeTimeoutSleepMilliseconds);
   finally
@@ -583,14 +584,14 @@ begin
     if not Raised then
       WriteLn('PROBE-TIMEOUT TEST FAILURE: elapsed=', ElapsedMilliseconds,
         ' error="', ErrorMessage, '" pidFile=',
-        FileExists(GrandchildPIDPath));
+        PayloadIsReadable(GrandchildPIDPath));
     Expect<Boolean>(Raised).ToBe(True);
     Expect<Boolean>(ElapsedMilliseconds
       < QWord(TestProbeCompletionTimeoutSeconds * 1000)).ToBe(True);
-    Expect<Boolean>(FileExists(GrandchildPIDPath)).ToBe(True);
-    if FileExists(GrandchildPIDPath) then
+    Expect<Boolean>(PayloadIsReadable(GrandchildPIDPath)).ToBe(True);
+    if PayloadIsReadable(GrandchildPIDPath) then
     begin
-      GrandchildPID := StrToInt(Trim(ReadBinaryFile(GrandchildPIDPath)));
+      GrandchildPID := StrToInt(Trim(ReadPayloadText(GrandchildPIDPath)));
       Expect<Boolean>(ProcessIsRunning(GrandchildPID)).ToBe(False);
     end;
   finally
