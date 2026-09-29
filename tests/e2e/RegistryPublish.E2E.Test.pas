@@ -4,10 +4,11 @@ program RegistryPublish.E2E.Test;
   (ADR-0049): a tar.gz and a zip published over localhost HTTP and over
   HTTPS trusted through the test build's anchor seam, idempotent retries
   including the same zip twice and its normalized tar.gz, a content
-  conflict, authentication and scope failures, and local refusals (a
-  dependency-bearing archive, a missing trust pin, plain HTTP to another
-  host, a missing or malformed token) that make no connection and never
-  read the token first. The secret appears in no output. }
+  conflict, authentication and scope failures, and local refusals
+  (dependencies a record cannot carry, a package name consumers cannot
+  install, a missing trust pin, plain HTTP to another host, a missing or
+  malformed token) that make no connection and never read the token first.
+  The secret appears in no output. }
 
 {$mode delphi}{$H+}
 
@@ -354,10 +355,29 @@ end;
 procedure TRegistryPublishE2E.TestLocalRefusalsMakeNoConnectionAndReadNoToken;
 const
   MALFORMED = 'not-a-token-value';
+  { ADR-0051 "Dependency-bearing publication": each refused with its code,
+    as a tar.gz and as a zip. }
+  REFUSALS: array[0..5, 0..3] of string = (
+    ('unsupported-lib', 'git-host', '[dependencies]' + #10
+      + 'plain-lib = "owner/plain-lib@^1.0.0"' + #10, 'unsupported_dependencies'),
+    ('unsupported-lib', 'filter', '[registries.home]' + #10
+      + 'identity = "https://home.example.com"' + #10 + '[dependencies]' + #10
+      + 'plain-lib = { source = "registry:plain-lib", version = "^1.0.0", '
+      + 'include = ["source/**"] }' + #10, 'unsupported_dependencies'),
+    ('unsupported-lib', 'no-identity', '[registries.home]' + #10
+      + 'origin = "https://home.example.com"' + #10 + '[dependencies]' + #10
+      + 'plain-lib = "registry:plain-lib@^1.0.0"' + #10, 'unsupported_dependencies'),
+    ('unsupported-lib', 'constraint', '[registries.home]' + #10
+      + 'identity = "https://home.example.com"' + #10 + '[dependencies]' + #10
+      + 'plain-lib = "registry:plain-lib@>= 1.0.0"' + #10, 'unsupported_dependencies'),
+    ('unsupported-lib', 'workspace', '[dependencies]' + #10
+      + 'plain-lib = "workspace:^1.0.0"' + #10, 'unsupported_dependencies'),
+    ('dotted.lib', 'dotted-name', '', 'invalid_package_name'));
 var
   Listener: TRegistryTestServer;
-  Origin, Plain, DependentTar, DependentZip: string;
+  Origin, Plain, DependentTar, DependentZip, Refused: string;
   Run: TLwptResult;
+  Index: Integer;
 
   function Attempt(const AArchive, AOrigin, AKeyID, APublicKey,
     AToken: string): TLwptResult;
@@ -379,7 +399,7 @@ begin
       'dependent', '[dependencies]' + #10 + 'plain-lib = "local:../plain"' + #10));
     DependentZip := Archive('dependent.zip', PublishZip('dependent-lib', '1.0.0',
       'dependent', 0, '[dependencies]' + #10 + 'plain-lib = "local:../plain"' + #10));
-    { Decision 4: refused before the token is read, set or not. }
+    { A local source is refused before the token is read, set or not. }
     ExpectFailure(Attempt(DependentTar, Origin, FOrigin.KeyID, FOrigin.PublicKey, ''),
       'registry: unsupported_dependencies: ');
     ExpectFailure(Attempt(DependentTar, Origin, FOrigin.KeyID, FOrigin.PublicKey,
@@ -388,6 +408,17 @@ begin
       'registry: unsupported_dependencies: ');
     ExpectFailure(Attempt(DependentZip, Origin, FOrigin.KeyID, FOrigin.PublicKey,
       MALFORMED), 'registry: unsupported_dependencies: ');
+    for Index := 0 to High(REFUSALS) do
+    begin
+      Refused := Archive(REFUSALS[Index, 1] + '.tar.gz', PublishTarGz(
+        REFUSALS[Index, 0], '1.0.0', 'refused', REFUSALS[Index, 2]));
+      ExpectFailure(Attempt(Refused, Origin, FOrigin.KeyID, FOrigin.PublicKey,
+        MALFORMED), 'registry: ' + REFUSALS[Index, 3] + ': ');
+      Refused := Archive(REFUSALS[Index, 1] + '.zip', PublishZip(
+        REFUSALS[Index, 0], '1.0.0', 'refused', 0, REFUSALS[Index, 2]));
+      ExpectFailure(Attempt(Refused, Origin, FOrigin.KeyID, FOrigin.PublicKey,
+        MALFORMED), 'registry: ' + REFUSALS[Index, 3] + ': ');
+    end;
     { The trust pin is required. }
     ExpectFailure(Attempt(Plain, Origin, '', FOrigin.PublicKey, MALFORMED),
       'registry: invalid_configuration: publish requires the trust pin');
