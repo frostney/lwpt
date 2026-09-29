@@ -3,7 +3,8 @@
 ## Status
 
 Accepted on 2026-09-29 by the maintainer, who settled the ten decisions at
-the end of this record as recommended. Issue
+the end of this record as recommended, and added an eleventh on what the lock
+records about accepted state after review. Issue
 [#62](https://github.com/frostney/lwpt/issues/62). The implementation PR
 applies the amendments listed under "Rule amendments"; this record does not
 edit other documents. It completes the deferral recorded in
@@ -279,25 +280,41 @@ records (decision 3):
     inside the state directory.
   - Keying by the pin as well as the identity prevents a project with a
     stale pin from poisoning another project's state.
+  - This is the only record of the true high-water mark: the highest
+    accepted sequence and the highest `published_at` ever accepted.
 - **Project lock state.** The lock's per-origin table holds two separate
   things (see "Lockfile representation"):
   - the **selection proof**: the checkpoint that the current selection was
     verified against, backed by committed documents; and
-  - the **high-water state**: the highest accepted sequence with its
-    snapshot, checkpoint hash, key, and times, plus `clockFloor`, the
-    highest `published_at` ever accepted.
+  - the **recorded accepted state**: the merged accepted state, meaning
+    sequence, snapshot, checkpoint hash, key, times, and `clockFloor`,
+    captured the last time the lock changed (decision 11).
 
   They differ because acquisition can advance without changing the
   selection, and because a later checkpoint may carry an earlier
   `published_at` while the floor keeps the historical maximum
-  (`registry-spec.md:444-457`; `Verification.pas:1616`). On a machine with
-  no per-user state, such as fresh CI, the high-water state is the prior.
+  (`registry-spec.md:444-457`; `Verification.pas:1616`). The recorded
+  accepted state is not the highest state ever accepted: it lags whenever
+  acquisitions advance without any other lock change. On a machine with no
+  per-user state, such as fresh CI, it is the prior.
 - **Acquisition prior.** It is the newer of the per-user state and the
-  lock's high-water state, and the new head must extend both, as well as
-  the selection proof's snapshot. Each must lie on its verified history, or
-  the result is `checkpoint_equivocation`. The clock floor is the later of
-  the per-user `clock_floor` and the lock's `clockFloor`.
-- **What the lock can and cannot prove.** The high-water fields are
+  lock's recorded accepted state, and the new head must extend both, as
+  well as the selection proof's snapshot. Each must lie on its verified
+  history, or the result is `checkpoint_equivocation`. The clock floor is
+  the later of the per-user `clock_floor` and the lock's `clockFloor`.
+- **Fresh-CI limitation.** A machine with empty per-user state knows only
+  the lock's recorded accepted state. A stale or withholding contact can
+  therefore serve it any authentic checkpoint at or above the recorded
+  sequence, hiding publications newer than that checkpoint. The window is
+  bounded by the maximum checkpoint lifetime from
+  [#320](https://github.com/frostney/lwpt/issues/320): an accepted
+  checkpoint was published at most seven days plus five minutes of skew
+  before the machine's clock, and an older one is stale. The contact can
+  never downgrade below the recorded sequence, and can never cause a
+  selection below the locked one, because the new head must extend both the
+  recorded state and the selection proof. This is the protocol's bound for a
+  client without prior state.
+- **What the lock can and cannot prove.** The recorded accepted-state fields are
   unsigned, trusted project state, like the rest of the lock. Editing them
   can only weaken protection for that checkout or cause a denial of
   service; it cannot introduce trust, because keys must still be reached
@@ -441,36 +458,39 @@ signature = "sha256:..."
 publishedAt = "2026-09-29T00:00:00Z"
 expiresAt = "2026-10-06T00:00:00Z"
 rotations = ["sha256:...", "sha256:...", "sha256:..."]  # document, old, new per rotation
-acceptedSequence = 57                                   # high-water state
+acceptedSequence = 57                                   # recorded accepted state
 acceptedSnapshot = "sha256:..."
 acceptedCheckpoint = "sha256:..."
 acceptedKeyId = "ed25519:..."
 acceptedPublishedAt = "2026-10-20T00:00:00Z"
 acceptedExpiresAt = "2026-10-27T00:00:00Z"
 acceptedRotations = ["sha256:..."]
-clockFloor = "2026-10-20T00:00:00Z"                    # highest published_at accepted
+clockFloor = "2026-10-20T00:00:00Z"                    # floor at the last lock change
 ```
 
 The keys from `keyId` through `rotations` are the selection proof. The
-`accepted*` keys and `clockFloor` are the high-water state, with the same
-meaning as `TLWPTRegistryAcceptedState`. The high-water state is never
-behind the selection proof, and never moves backwards.
+`accepted*` keys and `clockFloor` are the recorded accepted state, with the
+same meaning as `TLWPTRegistryAcceptedState`, captured at the last lock
+change. It is never behind the selection proof and never moves backwards,
+but it may lag the per-user state, which alone carries the true high-water
+mark.
 
 - **When the selection proof changes.** An origin's selection proof and
   entries are carried forward byte for byte unless:
   - the set of selected records for that origin changes;
   - the pin changes; or
   - the retained proof fails verification.
-- **When the high-water state advances.** The transaction first computes
-  the new lock with every origin's high-water state unchanged. If that lock
-  differs from the old one in any byte, for any reason, it is written with
-  every origin's high-water state set to the merged maximum of the old
-  lock, the per-user state, and this install's acquisitions. If it is
-  byte-identical, the file is not written at all.
+- **When the recorded accepted state advances (decision 11).** The
+  transaction first computes the new lock with every origin's recorded
+  accepted state unchanged. If that lock differs from the old one in any
+  byte, for any reason, it is written with every origin's recorded accepted
+  state set to the merged maximum of the old lock, the per-user state, and
+  this install's acquisitions. If it is byte-identical, the file is not
+  written at all, even when acquisition advanced.
 
-  Checkpoint renewals alone therefore never rewrite the lock, while any
-  lock change carries the project's floor forward. Per-user state still
-  advances on every acquisition.
+  Acquisition progress and checkpoint renewals alone therefore never
+  rewrite the lock, while any lock change carries the project's floor
+  forward. Per-user state still advances on every acquisition.
 - **A yanked locked version.** When a locked version is yanked upstream and a
   re-record is needed, the entry takes the new record of the same identity.
   The archive and dependencies are the same, and `VerifyImmutablePackage`
@@ -726,7 +746,8 @@ lands, consumer tests seed origins through the in-process test publisher.
 | #226: manifest and lock drift fails | A changed range, alias identity, or pin. |
 | #226: lockfile byte-identical; normal and frozen unchanged | The lock hash is compared before and after, and the frozen and normal registry suites above pass. |
 | Per-user state | Two projects share an origin and the floor never decreases. Corrupt state fails and names the file. Two concurrent installs merge monotonically under the lease. |
-| Fresh-CI restoration of the high-water state | With an empty state directory, an online install uses the lock's `accepted*` state and `clockFloor` as the prior: a contact serving a checkpoint older than `acceptedSequence` is stale, a clock behind `clockFloor` aborts before any request, and a later checkpoint whose `published_at` is earlier than `clockFloor` leaves the floor unchanged. A renewal-only install leaves the lock byte-identical; an install that changes any lock byte advances every origin's high-water state to the merged maximum. |
+| Fresh-CI restoration of the recorded accepted state | With an empty state directory, an online install uses the lock's `accepted*` state and `clockFloor` as the prior: a contact serving a checkpoint older than `acceptedSequence` is stale, a clock behind `clockFloor` aborts before any request, and a later checkpoint whose `published_at` is earlier than `clockFloor` leaves the floor unchanged. An install that changes any lock byte advances every origin's recorded accepted state to the merged maximum. |
+| Unchanged selection, then empty-state restoration (decision 11) | Lock at sequence 42; an online install acquires sequence 57 with the selection unchanged: the lock stays byte-identical at 42 and the per-user state advances to 57. With the state directory then emptied, acquisition accepts an unexpired checkpoint at sequence 42 or above, including one below 57, and rejects one below 42 as stale; the selection never falls below the locked one. |
 | Where registry dependencies may be declared (decision 5) | A workspace member declaring `registry:corp/json` installs through the root's `[registries.corp]`; a member whose own `[registries.corp]` names a different identity or pin fails at load. A git-host, URL, or local dependency whose `lwpt.toml` declares a `registry:` dependency fails with the actionable error, and nothing is published. |
 | Publication refuses unsupported dependencies (requires #54) | Archives whose `lwpt.toml` declares a git-host dependency, a `registry:` dependency with `include` or `exclude`, a non-canonical constraint, or an alias without explicit `identity` each fail locally with `unsupported_dependencies` before any connection. A dependency-bearing archive without those issues publishes a record whose dependencies equal the mapped manifest. |
 | Limits | A `REGISTRY_TESTING` limits seam makes an acquisition exceed its documents or bytes limit; it fails with `proof_limit_exceeded` and changes nothing. |
@@ -792,8 +813,9 @@ lands, consumer tests seed origins through the in-process test publisher.
 
 ## Decisions
 
-The maintainer settled these on 2026-09-29, each as recommended. The
-sections above already apply them.
+The maintainer settled these on 2026-09-29: decisions 1 to 10 as
+recommended, and decision 11 after review. The sections above already apply
+them.
 
 1. **Syntax: `registry:<package>` and `registry:<alias>/<package>`.** One
    reserved prefix keeps the kind visible in the string, as ADR-0009
@@ -809,7 +831,7 @@ sections above already apply them.
    the lock.** Acquisition extends the newer and checks the floor against
    both. The lock alone gives no protection across projects on one machine,
    and per-user state alone gives none on fresh CI. The lock keeps its
-   high-water state and floor separately from the selection proof.
+   recorded accepted state and floor separately from the selection proof.
 4. **`--frozen` and `--offline` verify a committed inclusion proof from the
    manifest pin**, through `VerifyRegistryLockedSelection` and the
    specification amendment. This detects a pull request that consistently
@@ -848,3 +870,15 @@ sections above already apply them.
     `registry publish` is a prerequisite. Consumer end-to-end
     tests publish real dependency chains through `registry publish`, and one
     ADR owns the mapping from manifest sources to records.
+11. **The lock stays stable; it records accepted state only when it changes
+    for another reason.** Settled by the maintainer after review. The
+    lock's `accepted*` fields and `clockFloor` are the merged accepted state
+    captured at the last lock change, not the highest state ever accepted;
+    per-user state carries the true high-water mark. Acquisition progress
+    alone never rewrites the lock, so checkouts do not churn. The cost is
+    the fresh-CI limitation above: with empty per-user state, a stale
+    contact can withhold publications newer than the recorded state, within
+    the seven-day-plus-skew checkpoint lifetime, but can never downgrade
+    below the recorded sequence or the locked selection. Persisting every
+    acquisition advance into the lock was rejected because it would rewrite
+    the lock on every install that saw a new checkpoint.
