@@ -233,7 +233,7 @@ begin
   TwoPort := FindAvailableRegistryTestPort;
   if TwoPort = OnePort then TwoPort := FindAvailableRegistryTestPort;
   FTwo := TPublishOrigin.Create(FScratch, 'o2', TwoPort, TwoPort);
-  TwoIdentity := FTwo.Base;
+  TwoIdentity := FTwo.Identity;
   FOneToken := FOne.IssueToken(['--packages', '*']);
   FTwoToken := FTwo.IssueToken(['--packages', '*']);
   FOne.Start;
@@ -278,7 +278,8 @@ begin
     + 'origin = "' + FOne.Base + '"' + #10
     + '[registries.two]' + #10 + 'identity = "' + TwoIdentity + '"' + #10
     + 'key-id = "' + FTwo.KeyID + '"' + #10
-    + 'public-key = "' + FTwo.PublicKey + '"' + #10;
+    + 'public-key = "' + FTwo.PublicKey + '"' + #10
+    + 'origin = "' + FTwo.Base + '"' + #10;
   WriteBinaryFile(FProject + '/lwpt.toml', TextBytes('[package]' + #10
     + 'name = "consumer"' + #10 + 'version = "1.0.0"' + #10
     + 'units = ["source"]' + #10 + Registries + '[dependencies]' + #10
