@@ -125,6 +125,44 @@ terminal status frame. A missing, failed, or late terminal frame escalates to
 `TerminateJobObject`. Nested console callbacks acknowledge the broadcast but
 leave pipe, registry, and Job Object work to that control thread.
 
+Forwarding threads never outlive the process-tree unit. Its finalization runs
+before the runtime units those threads rely on (Classes, SysUtils, the heap and
+thread-local storage), and it stops every forwarder in order.
+
+Handler admission and the stop request share one atomic word, which holds a
+stop flag and the count of handlers in flight. Each interlocked operation is
+bracketed by a full barrier, because FPC's AArch64 interlocked operations do
+not order memory on their own.
+
+1. Shutdown sets the stop flag and waits for the in-flight count to drain.
+   - A handler admitted before the flag queues its wake-up before it releases.
+   - A later Unix signal is re-raised with the default disposition, which is
+     what the forwarder would have done.
+   - A later Windows control event goes to the default handler, which ends the
+     process with `STATUS_CONTROL_C_EXIT`.
+   - If the count does not drain within five seconds, the process exits
+     immediately instead of queueing or closing anything.
+2. Shutdown wakes each forwarder without calling `TThread.Terminate`. In FPC,
+   `Terminate` stops a thread that has not started yet from ever running
+   `Execute`, which would drop a cancellation already accepted.
+   - The Unix thread is woken by a zero sentinel, queued behind any signal
+     already in the pipe.
+   - The console thread is woken through its event. It forwards whenever the
+     handler recorded a control event.
+   - The inherited-control thread polls its pipe without blocking. It makes
+     one more read pass after seeing the stop flag, so a waiting CANCEL frame
+     is still acknowledged.
+3. Shutdown joins each thread against a deadline. On Windows it waits for the
+   thread handle to be signalled; on Unix it waits for `Finished`, then joins.
+   - The deadline is five seconds for an idle forwarder, and thirty seconds for
+     one that has committed to forwarding. A committed forwarder ends the
+     process itself.
+   - Past the deadline, the process exits at once without blocking I/O.
+     Otherwise it would finalize the runtime beside a live thread.
+
+Without this, a short-lived command that failed fast crashed or hung during
+runtime finalization while a forwarder was starting or blocked (#330).
+
 The root fixes the descendant-reap deadline at 100 ms and the ancestor ACK
 deadline at 250 ms. Every level forwards those absolute `GetTickCount64`
 values unchanged, so depth cannot restart either allowance. Each level fans
