@@ -1,0 +1,13 @@
+[req]
+distinguished_name = leaf_name
+prompt = no
+
+[leaf_name]
+CN = transport-security-test-client
+
+[leaf_extensions]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
