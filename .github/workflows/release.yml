@@ -208,7 +208,11 @@ jobs:
           for unit in process pipes; do
             require_unit "$FCL_DIR" "$unit"
           done
-          require_unit "$PASZLIB_DIR" zstream
+          # zdeflate backs the canonical tar.gz writer (ADR-0049); zinflate
+          # backs the gzip and zip readers.
+          for unit in zstream zdeflate zinflate; do
+            require_unit "$PASZLIB_DIR" "$unit"
+          done
           if [ ! -f "$PASZLIB_DIR/crc.ppu" ] && [ ! -f "$HASH_DIR/crc.ppu" ]; then
             echo "::error::Missing crc.ppu in paszlib/hash unit dirs for ${TARGET}"
             exit 1
