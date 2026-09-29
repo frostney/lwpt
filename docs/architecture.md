@@ -31,8 +31,17 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   `registry issue-token|revoke-token` manage hashed, scoped, expiring
   credentials, per [ADR-0049](./adr/0049-registry-remote-publication.md).
   `registry publish` is the client (`LWPT.Registry.Publish`, over the shared acquisition in `LWPT.Registry.Client`): it validates or
-  normalizes the archive and refuses declared dependencies before it reads
-  the token from its environment variable or connects, uploads to the one
+  normalizes the archive and maps its `lwpt.toml` dependencies to record
+  dependencies before it reads the token from its environment variable or
+  connects. Per [ADR-0051](./adr/0051-registry-dependency-sources.md)
+  decision 10, each must be a `registry:` source with a canonical constraint
+  and no `include` or `exclude` key, and its alias must resolve through the
+  archive manifest's own `[registries]` to an explicit canonical `identity`
+  (`https`, or `http://localhost` as `--origin` allows), and it must not name
+  the package itself on any origin; the record omits the
+  publishing origin and sorts entries in protocol order, and the package name
+  must use the consumer grammar. Anything else fails with
+  `unsupported_dependencies` or `invalid_package_name`. It uploads to the one
   origin named on its command line without following redirects, and exits
   0 only after verifying from the `--key-id`/`--public-key` pin that the new
   signed head extends the head it saw first and includes the published

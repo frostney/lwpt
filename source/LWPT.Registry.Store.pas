@@ -295,10 +295,6 @@ procedure RegistryWritePrivateFile(const ADestination, ATemporaryRoot: string;
   const ABytes: TBytes; const AReplace: Boolean);
 { The stable code prefix of an ELWPTRegistryError message. }
 function RegistryErrorCode(const AMessage: string): string;
-{ Decision 4 of ADR-0049: until registry dependency sources exist, a record
-  that declares dependencies is refused. Separate so it can be lifted. }
-function RegistryRecordDependenciesSupported(
-  const ADependencyCount: Integer): Boolean;
 function RegistryKeyStoragePath(const AKeyID: string): string;
 function RegistryTOMLQuote(const AValue: string): string;
 function RegistryTimestampNow: string;
@@ -331,9 +327,6 @@ procedure SetRegistryRecoveryBarrierForTesting(const AReadyPath,
   AReleasePath: string);
 { Overrides RegistryTimestampNow; an empty value restores the system clock. }
 procedure SetRegistryClockForTesting(const AValue: string);
-{ Disables the ADR-0049 decision-4 dependency refusal so protocol conformance
-  cases with dependency lists can exercise the commit path. }
-procedure SetRegistryDependencyRefusalForTesting(const AEnabled: Boolean);
 function RegistryHistoryBuildsForTesting: Integer;
 { Requests that had to wait for the generation lock. }
 function RegistryGenerationWaitsForTesting: Integer;
@@ -3086,25 +3079,6 @@ begin
       'active package record has no canonical dependency line');
 end;
 
-{$IFDEF REGISTRY_TESTING}
-var
-  RegistryDependencyRefusalDisabledForTesting: Boolean;
-
-procedure SetRegistryDependencyRefusalForTesting(const AEnabled: Boolean);
-begin
-  RegistryDependencyRefusalDisabledForTesting := not AEnabled;
-end;
-{$ENDIF}
-
-function RegistryRecordDependenciesSupported(
-  const ADependencyCount: Integer): Boolean;
-begin
-  {$IFDEF REGISTRY_TESTING}
-  if RegistryDependencyRefusalDisabledForTesting then Exit(True);
-  {$ENDIF}
-  Result := ADependencyCount = 0;
-end;
-
 function AcquirePublicationLease(ACoordinator: TLWPTProducerLeaseCoordinator;
   const ADescription: string): TLWPTProducerLease;
 var
@@ -3383,6 +3357,7 @@ var
   Lease: TLWPTProducerLease;
   Records, VersionEntries: TStringList;
   State: TLWPTRegistryState;
+  Index: Integer;
 begin
   Result := Default(TLWPTRegistryCommitResult);
   if FConfig.Role = rrMirror then
@@ -3407,9 +3382,11 @@ begin
   if Candidate.Yanked then
     raise ELWPTRegistryError.CreateStable('invalid_request',
       'yanked state changes only through the yank endpoints');
-  if not RegistryRecordDependenciesSupported(Length(Candidate.Dependencies)) then
-    raise ELWPTRegistryError.CreateStable('invalid_request',
-      'records that declare dependencies are not accepted yet');
+  for Index := 0 to High(Candidate.Dependencies) do
+    if (Candidate.Dependencies[Index].Origin = Candidate.Origin)
+      and (Candidate.Dependencies[Index].Name = Candidate.Name) then
+      raise ELWPTRegistryError.CreateStable('invalid_request',
+        'package record depends on its own package');
   Result.Name := Candidate.Name;
   Result.Version := Candidate.Version;
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));

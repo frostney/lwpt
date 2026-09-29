@@ -28,6 +28,7 @@ uses
   LWPT.Core,
   LWPT.Gzip,
   LWPT.Install,
+  LWPT.Registry.Verification,
   TestingPascalLibrary,
   Tests.Scratch,
   Tests.TarSynth,
@@ -76,7 +77,10 @@ type
   public
     procedure SetupTests; override;
     procedure TestRejectsInvalidIdentity;
-    procedure TestDependencyRefusalIsSeparable;
+    procedure TestRequiresConsumerPackageName;
+    procedure TestMapsRegistryDependencies;
+    procedure TestRefusesUnsupportedDependencies;
+    procedure TestSuggestsCanonicalConstraints;
   end;
 
   TNormalizeLimitSuite = class(TTestSuite)
@@ -372,7 +376,7 @@ begin
   Expect<Boolean>(Result.Kind = akZip).ToBe(True);
   Expect<string>(Result.Manifest.Name).ToBe('golden');
   Expect<string>(Result.Manifest.Version).ToBe('1.0.0');
-  Expect<Boolean>(Result.Manifest.DeclaresDependencies).ToBe(False);
+  Expect<Integer>(Length(Result.Manifest.Dependencies)).ToBe(0);
 end;
 
 procedure TNormalizeGoldenSuite.TestSynthesisedZipMatchesGolden;
@@ -942,6 +946,12 @@ begin
     .ToBe(ARCHIVE_INVALID);
 end;
 
+const
+  REGISTRIES = '[registries]'#10'default = "home"'#10
+    + '[registries.home]'#10'identity = "https://home.example.com"'#10
+    + '[registries.far]'#10'identity = "https://far.example.com"'#10
+    + 'key-id = "ed25519:00"'#10;
+
 function DependencyTarGz(const ADependencies: string): TBytes;
 begin
   Result := Gzip(BuildTar([
@@ -951,44 +961,197 @@ begin
       + ADependencies))]));
 end;
 
-procedure TNormalizeIdentitySuite.TestDependencyRefusalIsSeparable;
+{ The same manifest as a zip. }
+function DependencyZip(const ADependencies: string): TBytes;
+begin
+  Result := DemoZip([], '[package]'#10'name = "dep"'#10'version = "1.0.0"'#10
+    + ADependencies);
+end;
+
+function DependencyLine(const ADependency: TLWPTRegistryDependency): string;
+begin
+  Result := ADependency.Origin + ' ' + ADependency.Name + ' '
+    + ADependency.Version;
+end;
+
+procedure TNormalizeIdentitySuite.TestRequiresConsumerPackageName;
+begin
+  { ADR-0051 decision 6: protocol-valid, but not installable. }
+  Expect<string>(Rejection(DemoZip([],
+    '[package]'#10'name = "demo.lib"'#10'version = "1.0.0"'#10),
+    '[a-z0-9][a-z0-9_-]{0,127}')).ToBe(ARCHIVE_INVALID_PACKAGE_NAME);
+  Expect<string>(Rejection(Gzip(BuildTar([MakeRegularFileEntry(
+    'demo-1.0.0/lwpt.toml', TextBytes('[package]'#10'name = "demo.lib"'#10
+    + 'version = "1.0.0"'#10))])), 'consumers can install'))
+    .ToBe(ARCHIVE_INVALID_PACKAGE_NAME);
+  Expect<string>(Rejection(DemoZip([],
+    '[package]'#10'name = "demo_lib-2"'#10'version = "1.0.0"'#10), ''))
+    .ToBe('accepted');
+end;
+
+procedure TNormalizeIdentitySuite.TestMapsRegistryDependencies;
+const
+  DEPENDENCIES = REGISTRIES + '[dependencies]'#10
+    + 'json = "registry:json@^1.2.0"'#10
+    + 'http = "registry:far/http@>=2.0.0 <3.0.0 || 4.0.0"'#10
+    + 'util = { source = "registry:home/util", version = "~0.3.1" }'#10;
 var
-  Zip, TarGz: TBytes;
   Stream: TBytesStream;
   Manifest: TLWPTPublicationManifest;
+  Prepared: TLWPTPublicationArchive;
+  Input: TBytes;
+  Round: Integer;
 begin
-  Zip := DemoZip([], DEMO_MANIFEST
-    + '[dependencies]'#10'lib = "owner/lib@^1.0.0"'#10);
-  TarGz := DependencyTarGz(
-    '[dependencies]'#10'lib = "owner/lib@^1.0.0"'#10);
-  Expect<string>(Rejection(Zip, 'declares [dependencies]'))
-    .ToBe(ARCHIVE_UNSUPPORTED_DEPENDENCIES);
-  Expect<string>(Rejection(TarGz, 'declares [dependencies]'))
-    .ToBe(ARCHIVE_UNSUPPORTED_DEPENDENCIES);
-  { An empty table is still a declaration. }
-  Expect<string>(Rejection(DependencyTarGz('[dependencies]'#10),
-    'declares [dependencies]')).ToBe(ARCHIVE_UNSUPPORTED_DEPENDENCIES);
-  Expect<string>(Rejection(DependencyTarGz(''), '')).ToBe('accepted');
-  { The refusal is a policy step of its own: normalization and the scan
-    succeed and report the declaration. }
+  for Round := 0 to 1 do
+  begin
+    if Round = 0 then Input := DependencyTarGz(DEPENDENCIES)
+    else Input := DependencyZip(DEPENDENCIES);
+    Prepared := PreparePublicationArchive(Input);
+    { Declaration order, each with its explicit origin identity. }
+    Expect<Integer>(Length(Prepared.Manifest.Dependencies)).ToBe(3);
+    Expect<string>(DependencyLine(Prepared.Manifest.Dependencies[0]))
+      .ToBe('https://home.example.com json ^1.2.0');
+    Expect<string>(DependencyLine(Prepared.Manifest.Dependencies[1]))
+      .ToBe('https://far.example.com http >=2.0.0 <3.0.0 || 4.0.0');
+    Expect<string>(DependencyLine(Prepared.Manifest.Dependencies[2]))
+      .ToBe('https://home.example.com util ~0.3.1');
+  end;
+  { The scan and the normalizer both report the mapping. }
   Stream := TBytesStream.Create(nil);
   try
-    Manifest := NormalizeZipArchive(Zip, Stream, DefaultArchiveLimits);
-    Expect<Boolean>(Manifest.DeclaresDependencies).ToBe(True);
-    Expect<Boolean>(Stream.Size > 0).ToBe(True);
+    Manifest := NormalizeZipArchive(DependencyZip(DEPENDENCIES), Stream,
+      DefaultArchiveLimits);
+    Expect<Integer>(Length(Manifest.Dependencies)).ToBe(3);
+    Manifest := ScanTarGzipArchive(System.Copy(Stream.Bytes, 0, Stream.Size),
+      DefaultArchiveLimits);
+    Expect<Integer>(Length(Manifest.Dependencies)).ToBe(3);
   finally
     Stream.Free;
   end;
-  Manifest := ScanTarGzipArchive(TarGz, DefaultArchiveLimits);
-  Expect<Boolean>(Manifest.DeclaresDependencies).ToBe(True);
+  { One declared registry is the implied default; an empty table maps to
+    no dependencies. }
+  Manifest := ScanTarGzipArchive(DependencyTarGz('[registries.solo]'#10
+    + 'identity = "http://localhost:8080"'#10'[dependencies]'#10
+    + 'json = "registry:json@1.0.0"'#10), DefaultArchiveLimits);
+  Expect<string>(DependencyLine(Manifest.Dependencies[0]))
+    .ToBe('http://localhost:8080 json 1.0.0');
+  Manifest := ScanTarGzipArchive(DependencyTarGz('[dependencies]'#10),
+    DefaultArchiveLimits);
+  Expect<Integer>(Length(Manifest.Dependencies)).ToBe(0);
+end;
+
+procedure TNormalizeIdentitySuite.TestRefusesUnsupportedDependencies;
+
+  procedure Refused(const ADependencies, AFragment: string);
+  begin
+    Expect<string>(Rejection(DependencyTarGz(ADependencies), AFragment))
+      .ToBe(ARCHIVE_UNSUPPORTED_DEPENDENCIES);
+    Expect<string>(Rejection(DependencyZip(ADependencies), AFragment))
+      .ToBe(ARCHIVE_UNSUPPORTED_DEPENDENCIES);
+  end;
+
+begin
+  { Only registry: sources. }
+  Refused('[dependencies]'#10'lib = "owner/lib@^1.0.0"'#10,
+    'dependency "lib" is not a registry: source');
+  Refused('[dependencies]'#10'lib = "gitlab:owner/lib@^1.0.0"'#10,
+    'is not a registry: source');
+  Refused('[dependencies]'#10'lib = "https://example.com/lib.tar.gz"'#10,
+    'is not a registry: source');
+  Refused('[dependencies]'#10'lib = "local:../lib"'#10,
+    'is not a registry: source');
+  Refused('[dependencies]'#10'lib = "workspace:^1.0.0"'#10,
+    'is not a registry: source');
+  Refused('[dependencies]'#10'lib = { source = "owner/lib", version = "^1.0.0" }'#10,
+    'is not a registry: source');
+  Refused('[dependencies]'#10'lib = 7'#10, 'string or an inline table');
+  { No extraction filters, even empty ones. }
+  Refused(REGISTRIES + '[dependencies]'#10'json = { source = "registry:json", '
+    + 'version = "^1.0.0", include = ["source/**"] }'#10, 'include or exclude');
+  Refused(REGISTRIES + '[dependencies]'#10'json = { source = "registry:json", '
+    + 'version = "^1.0.0", exclude = [] }'#10, 'include or exclude');
+  { The consumer manifest rules. }
+  Refused(REGISTRIES + '[dependencies]'#10'other = "registry:json@^1.0.0"'#10,
+    'key must equal its package name');
+  Refused(REGISTRIES + '[dependencies]'#10'json = "registry:json@v1.0.0"'#10,
+    'SemVer without "v"');
+  Refused(REGISTRIES + '[dependencies]'#10'"json.lib" = "registry:json.lib@^1.0.0"'#10,
+    '[a-z0-9][a-z0-9_-]{0,127}');
+  Refused(REGISTRIES + '[dependencies]'#10'json = "registry:default/json@^1.0.0"'#10,
+    'must not be "default"');
+  Refused(REGISTRIES + '[dependencies]'#10'json = { source = "registry:json", '
+    + 'version = "^1.0.0", tag = "v1" }'#10, 'earlier manifest shape');
+  { Never on the package's own name, on its own origin or another. }
+  Refused(REGISTRIES + '[dependencies]'#10'dep = "registry:dep@^1.0.0"'#10,
+    'dependency "dep" names this package itself');
+  Refused(REGISTRIES + '[dependencies]'#10'dep = "registry:far/dep@^1.0.0"'#10,
+    'names this package itself');
+  { Canonical constraints only. }
+  Refused(REGISTRIES + '[dependencies]'#10'json = "registry:json"'#10,
+    'has no version constraint');
+  Refused(REGISTRIES + '[dependencies]'#10'json = "registry:json@>=1.0.0  <2.0.0"'#10,
+    'write ">=1.0.0 <2.0.0"');
+  Refused(REGISTRIES + '[dependencies]'#10'json = "registry:json@^1.2"'#10,
+    'comparators such as');
+  { Aliases resolve through this manifest's [registries] and need an
+    explicit identity. }
+  Refused('[dependencies]'#10'json = "registry:json@^1.0.0"'#10,
+    'needs a [registries] declaration');
+  Refused(REGISTRIES + '[dependencies]'#10'json = "registry:corp/json@^1.0.0"'#10,
+    'registry alias "corp" is not declared');
+  Refused('[registries.corp]'#10'origin = "https://corp.example.com"'#10
+    + '[dependencies]'#10'json = "registry:corp/json@^1.0.0"'#10,
+    'must declare identity explicitly');
+  Refused('[registries.a]'#10'identity = "https://a.example.com"'#10
+    + '[registries.b]'#10'identity = "https://b.example.com"'#10
+    + '[dependencies]'#10'json = "registry:json@^1.0.0"'#10,
+    'declares 2 registries without a default');
+  Refused('[registries]'#10'default = "none"'#10
+    + '[registries.a]'#10'identity = "https://a.example.com"'#10
+    + '[dependencies]'#10'json = "registry:json@^1.0.0"'#10,
+    'registry alias "none" is not declared');
+  Refused('[registries.a]'#10'identity = "https://A.example.com/"'#10
+    + '[dependencies]'#10'json = "registry:a/json@^1.0.0"'#10,
+    'is not a canonical https registry URI');
+  Refused('[registries.a]'#10'identity = "http://example.com"'#10
+    + '[dependencies]'#10'json = "registry:a/json@^1.0.0"'#10,
+    'is not a canonical https registry URI');
+  Refused('[registries.a]'#10'identity = "https://[::1]"'#10
+    + '[dependencies]'#10'json = "registry:a/json@^1.0.0"'#10,
+    'is not a canonical https registry URI');
+end;
+
+procedure TNormalizeIdentitySuite.TestSuggestsCanonicalConstraints;
+begin
+  Expect<string>(CanonicalConstraintSuggestion('>=1.0.0, <2.0.0'))
+    .ToBe('>=1.0.0 <2.0.0');
+  Expect<string>(CanonicalConstraintSuggestion('>= 1.0.0  < 2.0.0'))
+    .ToBe('>=1.0.0 <2.0.0');
+  Expect<string>(CanonicalConstraintSuggestion('^1.0.0||^2.0.0'))
+    .ToBe('^1.0.0 || ^2.0.0');
+  Expect<string>(CanonicalConstraintSuggestion('=1.2.3')).ToBe('1.2.3');
+  Expect<string>(CanonicalConstraintSuggestion(' ^ 1.2.3 ')).ToBe('^1.2.3');
+  { Already canonical, or no syntactic repair. }
+  Expect<string>(CanonicalConstraintSuggestion('^1.2.3')).ToBe('');
+  Expect<string>(CanonicalConstraintSuggestion('^1.2')).ToBe('');
+  Expect<string>(CanonicalConstraintSuggestion('1.x')).ToBe('');
+  Expect<string>(CanonicalConstraintSuggestion('*')).ToBe('');
+  Expect<string>(CanonicalConstraintSuggestion('>=')).ToBe('');
+  Expect<string>(CanonicalConstraintSuggestion('')).ToBe('');
 end;
 
 procedure TNormalizeIdentitySuite.SetupTests;
 begin
   Test('rejects a missing or protocol-invalid identity',
     TestRejectsInvalidIdentity);
-  Test('refuses [dependencies] as a separate policy step',
-    TestDependencyRefusalIsSeparable);
+  Test('requires the consumer package-name grammar',
+    TestRequiresConsumerPackageName);
+  Test('maps registry dependencies to explicit origin identities',
+    TestMapsRegistryDependencies);
+  Test('refuses dependencies a protocol 1 record cannot carry',
+    TestRefusesUnsupportedDependencies);
+  Test('names the canonical spelling of a repairable constraint',
+    TestSuggestsCanonicalConstraints);
 end;
 
 { ---- bounds ------------------------------------------------------------- }

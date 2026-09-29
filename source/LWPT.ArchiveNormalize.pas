@@ -25,11 +25,19 @@
     ustar.
 
   For both, lwpt.toml is bounded in bytes (from its declared size, before
-  it is decoded) and in TOML nodes, and its [package] name and version
-  must satisfy the registry protocol grammar. Refusing a manifest that declares
-  [dependencies] (ADR-0049 decision 4) is a separate policy step,
-  RejectDeclaredDependencies, applied by PreparePublicationArchive only, so
-  lifting it later removes one call.
+  it is decoded) and in TOML nodes. Its [package] version must be canonical
+  SemVer, and its name must use the consumer package grammar (ADR-0051
+  decision 6: 1 to 128 of [a-z0-9_-], starting with a letter or digit),
+  the protocol grammar without '.', so every published package can be
+  installed.
+
+  Its [dependencies] become the record's dependencies (ADR-0051,
+  "Dependency-bearing publication"; ADR-0049 decision 4 lifted). Every
+  entry must be a registry: source without include or exclude filters, with
+  a constraint already in the protocol's canonical grammar; its alias
+  resolves through the manifest's own [registries], which must name the
+  identity explicitly. A dependency on the package's own name is refused.
+  Anything else is unsupported_dependencies.
 
   Nothing here reads a clock, the environment, the network, or project
   state, or writes a file: input and output are caller-owned memory. }
@@ -44,7 +52,8 @@ uses
   SysUtils,
 
   LWPT.Archive,
-  LWPT.Core;
+  LWPT.Core,
+  LWPT.Registry.Verification;
 
 const
   PUBLICATION_MANIFEST_NAME = MANIFEST_FILE;
@@ -55,7 +64,10 @@ type
   TLWPTPublicationManifest = record
     Name: string;
     Version: string;
-    DeclaresDependencies: Boolean;
+    { [dependencies] mapped to record dependencies, in declaration order.
+      Each names its origin identity explicitly; the record writer omits
+      the publishing origin and sorts them in protocol order. }
+    Dependencies: TLWPTRegistryDependencyArray;
   end;
 
   TLWPTPublicationArchive = record
@@ -69,19 +81,21 @@ type
 { Classifies AInput by its leading bytes; raises unsupported_archive. }
 function DetectArchiveKind(const AInput: TBytes): TLWPTArchiveKind;
 
-{ Reads the publication identity from lwpt.toml content. Raises
-  archive_limit_exceeded past the manifest byte or TOML node budget,
-  invalid_archive when it does not parse, and invalid_package_name or
-  invalid_version when the identity is not protocol-valid. }
+{ Reads the publication identity and dependencies from lwpt.toml content.
+  Raises archive_limit_exceeded past the manifest byte or TOML node budget,
+  invalid_archive when it does not parse, invalid_package_name or
+  invalid_version when the identity is not valid, and
+  unsupported_dependencies when a dependency cannot become a record
+  dependency. }
 function InspectPublicationManifest(
   const AContent: TBytes): TLWPTPublicationManifest; overload;
 function InspectPublicationManifest(const AContent: TBytes;
   const ALimits: TLWPTArchiveLimits): TLWPTPublicationManifest; overload;
 
-{ ADR-0049 decision 4: refuses a manifest that declares [dependencies]
-  with unsupported_dependencies. }
-procedure RejectDeclaredDependencies(
-  const AManifest: TLWPTPublicationManifest);
+{ The canonical protocol spelling of AConstraint when whitespace, commas,
+  or a leading '=' are all that keep it from the canonical grammar, or ''
+  when there is none. }
+function CanonicalConstraintSuggestion(const AConstraint: string): string;
 
 { Validates a tar.gz for publication without extracting it. }
 function ScanTarGzipArchive(const AInput: TBytes;
@@ -93,8 +107,8 @@ function NormalizeZipArchive(const AInput: TBytes; const ATarget: TStream;
   const ALimits: TLWPTArchiveLimits): TLWPTPublicationManifest;
 
 { The publish client's entry point: detects the input type, validates or
-  normalizes it, and applies the dependency refusal, all before any
-  credential or connection is touched. }
+  normalizes it, and maps its dependencies, all before any credential or
+  connection is touched. }
 function PreparePublicationArchive(
   const AInput: TBytes): TLWPTPublicationArchive; overload;
 function PreparePublicationArchive(const AInput: TBytes;
@@ -106,7 +120,7 @@ uses
   Generics.Collections,
 
   LWPT.Gzip,
-  LWPT.Registry.Verification,
+  LWPT.Manifest,
   LWPT.TarWriter,
   LWPT.Zip,
   TOML;
@@ -145,6 +159,210 @@ begin
       PUBLICATION_MANIFEST_NAME + ' is %d bytes; the limit is %d',
       [ASize, ALimits.MaximumManifestBytes]);
 end;
+
+{ ---------------------------------------------------------------------------
+  Dependency mapping (ADR-0051, "Dependency-bearing publication")
+  --------------------------------------------------------------------------- }
+
+procedure RaiseUnsupportedDependency(const ADetail: string);
+begin
+  raise ELWPTArchiveError.CreateStable(ARCHIVE_UNSUPPORTED_DEPENDENCIES,
+    PUBLICATION_MANIFEST_NAME + ' ' + ADetail);
+end;
+
+function IsConstraintOperator(const AToken: string): Boolean;
+begin
+  Result := (AToken = '<') or (AToken = '<=') or (AToken = '>')
+    or (AToken = '>=') or (AToken = '=') or (AToken = '^') or (AToken = '~');
+end;
+
+{ One ' || ' arm: tokens split on white space, an operator token joined to
+  the version after it, and a lone '=' comparator dropped. }
+function NormalizeConstraintArm(const AArm: string): string;
+var
+  Tokens: TStringArray;
+  Token, Pending: string;
+begin
+  Result := '';
+  Pending := '';
+  Tokens := StringReplace(StringReplace(AArm, #9, ' ', [rfReplaceAll]), ',',
+    ' ', [rfReplaceAll]).Split([' '], TStringSplitOptions.ExcludeEmpty);
+  for Token in Tokens do
+    if IsConstraintOperator(Token) and (Pending = '') then
+      Pending := Token
+    else
+    begin
+      if Result <> '' then Result := Result + ' ';
+      Result := Result + Pending + Token;
+      Pending := '';
+    end;
+  if Pending <> '' then Exit('');
+  if (Length(Result) > 1) and (Result[1] = '=') and (Result[2] <> '=')
+     and (Pos(' ', Result) = 0) then
+    Delete(Result, 1, 1);
+end;
+
+function CanonicalConstraintSuggestion(const AConstraint: string): string;
+var
+  Arms: TStringArray;
+  Arm, Normalized: string;
+begin
+  Result := '';
+  Arms := StringReplace(AConstraint, '||', #0, [rfReplaceAll]).Split([#0]);
+  for Arm in Arms do
+  begin
+    Normalized := NormalizeConstraintArm(Arm);
+    if Normalized = '' then Exit('');
+    if Result <> '' then Result := Result + ' || ';
+    Result := Result + Normalized;
+  end;
+  if (Result = AConstraint) or not RegistryConstraintIsCanonical(Result) then
+    Result := '';
+end;
+
+{ The origin identity a registry dependency's alias names in the
+  publishing manifest's own [registries] (ADR-0051: "Aliases"). There is no
+  endpoint-advertised identity at publish time, so the declaration must
+  name it. }
+function PublicationDependencyOrigin(ARegistries: TTOMLNode;
+  const ADependency: TDependency): string;
+var
+  Alias: string;
+  Pair: TTOMLNodeMap.TKeyValuePair;
+  Entry, DefaultNode: TTOMLNode;
+  Count: Integer;
+begin
+  Alias := ADependency.RegistryAlias;
+  if not TomlIsTable(ARegistries) then
+    RaiseUnsupportedDependency('dependency "' + ADependency.Name + '": '
+      + ADependency.SrcOriginal + ' needs a [registries] declaration naming '
+      + 'its origin identity');
+  if Alias = '' then
+  begin
+    DefaultNode := TomlGet(ARegistries, REGISTRY_DEFAULT_KEY);
+    if TomlIsString(DefaultNode) then
+      Alias := DefaultNode.ScalarText
+    else if DefaultNode <> nil then
+      RaiseUnsupportedDependency('[registries] default must name a declared '
+        + 'registry alias')
+    else
+    begin
+      Count := 0;
+      for Pair in ARegistries.Children do
+        if TomlIsTable(Pair.Value) then
+        begin
+          Inc(Count);
+          Alias := Pair.Key;
+        end;
+      if Count <> 1 then
+        RaiseUnsupportedDependency('dependency "' + ADependency.Name + '": '
+          + ADependency.SrcOriginal + ' names no registry alias and [registries] '
+          + 'declares ' + IntToStr(Count) + ' registries without a default; '
+          + 'write registry:<alias>/' + ADependency.Name
+          + ' or set [registries] default');
+    end;
+  end;
+  Entry := TomlGet(ARegistries, Alias);
+  if (Alias = REGISTRY_DEFAULT_KEY) or not TomlIsTable(Entry) then
+    RaiseUnsupportedDependency('dependency "' + ADependency.Name + '": '
+      + 'registry alias "' + Alias + '" is not declared under [registries]');
+  Result := TomlStr(Entry, 'identity', '');
+  if Result = '' then
+    RaiseUnsupportedDependency('dependency "' + ADependency.Name + '": '
+      + '[registries.' + Alias + '] must declare identity explicitly; a '
+      + 'published record names its dependency''s origin identity, and there '
+      + 'is no advertised identity at publish time');
+  if not RegistryURIIsCanonical(Result, True) or (Pos('://[', Result) > 0) then
+    RaiseUnsupportedDependency('dependency "' + ADependency.Name + '": '
+      + '[registries.' + Alias + '] identity "' + Result + '" is not a '
+      + 'canonical https registry URI (plain http only for localhost; no '
+      + 'IPv6 literal)');
+end;
+
+{ ADR-0051 decision 10: [dependencies] as record dependencies. Entries are
+  read with the manifest's own dependency parser, so the key, alias,
+  package-name, and version rules are the ones consumers apply. }
+function MapPublicationDependencies(ARoot: TTOMLNode;
+  const APackageName: string): TLWPTRegistryDependencyArray;
+var
+  Dependencies, Node: TTOMLNode;
+  Pair: TTOMLNodeMap.TKeyValuePair;
+  Dependency: TDependency;
+  Source, Suggestion: string;
+  n: Integer;
+begin
+  Result := nil;
+  Dependencies := TomlGet(ARoot, 'dependencies');
+  if Dependencies = nil then Exit;
+  if not TomlIsTable(Dependencies) then
+    RaiseUnsupportedDependency('[dependencies] must be a table');
+  for Pair in Dependencies.Children do
+  begin
+    Node := Pair.Value;
+    if TomlIsString(Node) then
+      Source := Node.ScalarText
+    else if TomlIsTable(Node) then
+      Source := TomlStr(Node, 'source', '')
+    else
+      RaiseUnsupportedDependency('dependency "' + Pair.Key + '" must be a '
+        + 'string or an inline table');
+    if Copy(Source, 1, Length(REGISTRY_SOURCE_PREFIX) + 1)
+       <> REGISTRY_SOURCE_PREFIX + ':' then
+      RaiseUnsupportedDependency('dependency "' + Pair.Key + '" is not a '
+        + REGISTRY_SOURCE_PREFIX + ': source; a published package may depend '
+        + 'only on registry packages, because its record carries only an '
+        + 'origin, a name, and a version constraint');
+    if TomlIsTable(Node)
+       and ((TomlGet(Node, 'include') <> nil) or (TomlGet(Node, 'exclude') <> nil)) then
+      RaiseUnsupportedDependency('dependency "' + Pair.Key + '" declares '
+        + 'include or exclude; a protocol 1 record dependency cannot carry '
+        + 'extraction filters, so consumers would install it unfiltered');
+    Dependency := Default(TDependency);
+    Dependency.Name := Pair.Key;
+    try
+      if TomlIsString(Node) then
+        ParseBareDepString(Source, nil, Dependency)
+      else
+        ParseTableDep(Node, nil, Dependency);
+    except
+      on E: EManifestError do
+        RaiseUnsupportedDependency(E.Message);
+    end;
+    { Refused on every origin: on its own origin it is a cycle through one
+      identity, and on another it is a second package with this name,
+      which no graph can hold (one package per name). }
+    if Dependency.SrcLocator = APackageName then
+      RaiseUnsupportedDependency('dependency "' + Pair.Key + '" names this '
+        + 'package itself; a package cannot depend on its own name');
+    if Dependency.VersionSpec = '' then
+      RaiseUnsupportedDependency('dependency "' + Pair.Key + '" has no version '
+        + 'constraint; a record dependency needs one, for example ^1.0.0');
+    if not RegistryConstraintIsCanonical(Dependency.VersionSpec) then
+    begin
+      Suggestion := CanonicalConstraintSuggestion(Dependency.VersionSpec);
+      if Suggestion <> '' then
+        RaiseUnsupportedDependency('dependency "' + Pair.Key + '": constraint "'
+          + Dependency.VersionSpec + '" is not in the protocol''s canonical '
+          + 'grammar; write "' + Suggestion + '"')
+      else
+        RaiseUnsupportedDependency('dependency "' + Pair.Key + '": constraint "'
+          + Dependency.VersionSpec + '" is not in the protocol''s canonical '
+          + 'grammar: an exact version, ^ or ~ before a full version, '
+          + 'comparators such as ">=1.0.0 <2.0.0", or alternatives joined '
+          + 'by " || "');
+    end;
+    n := Length(Result);
+    SetLength(Result, n + 1);
+    Result[n].Origin := PublicationDependencyOrigin(TomlGet(ARoot, 'registries'),
+      Dependency);
+    Result[n].Name := Dependency.SrcLocator;
+    Result[n].Version := Dependency.VersionSpec;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Manifest inspection
+  --------------------------------------------------------------------------- }
 
 function InspectPublicationManifest(
   const AContent: TBytes): TLWPTPublicationManifest;
@@ -191,10 +409,12 @@ begin
       VersionNode := TomlGet(PackageNode, 'version');
     end;
     if not TomlIsString(NameNode)
-       or not RegistryPackageNameIsCanonical(NameNode.ScalarText) then
+       or not RegistryPackageNameIsCanonical(NameNode.ScalarText)
+       or not ValidRegistryPackageName(NameNode.ScalarText) then
       raise ELWPTArchiveError.CreateStable(ARCHIVE_INVALID_PACKAGE_NAME,
-        PUBLICATION_MANIFEST_NAME + ' [package] name is missing or not a '
-        + 'protocol-valid package name');
+        PUBLICATION_MANIFEST_NAME + ' [package] name is missing or does not '
+        + 'match [a-z0-9][a-z0-9_-]{0,127}, the package names consumers can '
+        + 'install');
     if not TomlIsString(VersionNode)
        or not RegistryVersionIsCanonical(VersionNode.ScalarText) then
       raise ELWPTArchiveError.CreateStable(ARCHIVE_INVALID_VERSION,
@@ -202,19 +422,10 @@ begin
         + 'canonical SemVer 2.0.0');
     Result.Name := NameNode.ScalarText;
     Result.Version := VersionNode.ScalarText;
-    Result.DeclaresDependencies := TomlGet(Root, 'dependencies') <> nil;
+    Result.Dependencies := MapPublicationDependencies(Root, Result.Name);
   finally
     Root.Free;
   end;
-end;
-
-procedure RejectDeclaredDependencies(
-  const AManifest: TLWPTPublicationManifest);
-begin
-  if AManifest.DeclaresDependencies then
-    raise ELWPTArchiveError.CreateStable(ARCHIVE_UNSUPPORTED_DEPENDENCIES,
-      PUBLICATION_MANIFEST_NAME + ' declares [dependencies]; registry '
-      + 'dependency sources are not defined yet');
 end;
 
 { ---------------------------------------------------------------------------
@@ -1172,7 +1383,6 @@ begin
   if Result.Kind = akTarGzip then
   begin
     Result.Manifest := ScanTarGzipArchive(AInput, ALimits);
-    RejectDeclaredDependencies(Result.Manifest);
     Result.Archive := AInput;
     Exit;
   end;
@@ -1180,7 +1390,6 @@ begin
   try
     Normalizer.Load;
     Result.Manifest := Normalizer.Manifest;
-    RejectDeclaredDependencies(Result.Manifest);
     Output := TBytesStream.Create(nil);
     try
       Normalizer.Write(Output);

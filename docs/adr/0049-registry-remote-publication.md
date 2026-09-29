@@ -1,5 +1,17 @@
 # Registry remote publication
 
+> **Amended by [ADR-0051](./0051-registry-dependency-sources.md):** decision 4
+> is lifted (ADR-0051 decision 10). An archive whose `lwpt.toml` declares
+> `[dependencies]` publishes under ADR-0051's "Dependency-bearing
+> publication": every entry must be a `registry:` source without `include`
+> or `exclude`, with a constraint already in the protocol's canonical
+> grammar, and its alias must resolve through the archive manifest's own
+> `[registries]` to an explicit `identity`. The record names that origin,
+> omits it for the publishing origin, and sorts entries in protocol order.
+> Anything else still fails locally with `unsupported_dependencies` before
+> the token is read or any connection is made. The archive contract also
+> requires the consumer package-name grammar (ADR-0051 decision 6).
+
 ## Status
 
 Accepted on 2026-09-29 by the maintainer, who settled the nine decisions at
@@ -312,10 +324,10 @@ Activation failure follows the code as it stands:
 
 A `201` is sent only after the pointer is replaced, so a lost `201` also
 becomes a `204` on retry.
-Until [#62](https://github.com/frostney/lwpt/issues/62) defines registry
-dependency sources, records keep `dependencies = []` (decision 4). The commit
-path still validates any canonical dependency list, so #62 needs no store
-change. Commits are serialized: a second publisher waits for the lease or
+Records carry the dependencies that `publish` maps from the archive manifest
+([ADR-0051](./0051-registry-dependency-sources.md) decision 10, which lifted
+decision 4). The commit path validates any canonical dependency list, so #62
+needed no store change. Commits are serialized: a second publisher waits for the lease or
 gets a retryable `503`.
 
 ### Credentials and scope
@@ -458,6 +470,9 @@ is a zip. Anything else fails with `unsupported_archive`.
   The archive must have exactly one top-level directory, which the installer
   strips (`:1221-1233`). That directory must contain `lwpt.toml`, whose
   `[package] name` and `version` are the protocol-valid publication identity.
+  The name must also match the consumer package grammar
+  `[a-z0-9][a-z0-9_-]{0,127}` (ADR-0051 decision 6), so every published
+  package can be installed; otherwise it fails with `invalid_package_name`.
   Exactly one entry may reach that manifest's extraction destination, and
   it must be a regular file. A second entry that expands to the same path
   (such as `./lwpt.toml`), a link or directory there, or a spelling that a
@@ -477,9 +492,9 @@ is a zip. Anything else fails with `unsupported_archive`.
   in the next section. Only that tar.gz is uploaded, stored, hashed, and
   served.
 
-For both formats, the identity checks and decision 4's dependency rule run
-on the resulting tree. A `[dependencies]` declaration fails with
-`unsupported_dependencies`. All archive validation finishes before the
+For both formats, the identity checks and ADR-0051's dependency mapping run
+on the resulting tree. A dependency that a protocol 1 record cannot carry
+fails with `unsupported_dependencies`. All archive validation finishes before the
 token is read or any connection is made. The server never decompresses archives. It binds only
 the hash and size.
 
@@ -696,7 +711,7 @@ The implementation PR applies these amendments; this ADR does not.
 | Upload accounting | Two admissions that would together exceed 1 GiB: exactly one proceeds and the other gets `507`. An in-progress upload counts at its declared length. A digest mismatch, an abort, or an existing object releases its reservation. An object moved into `objects/` before a failed activation is unserved, answers `204` on re-upload, and is referenced by the retried commit. |
 | Identical retry succeeds | Same archive, a fresh `published_at`, and a lost-response retry each return `204` with an unchanged sequence and exit 0. |
 | Conflicting content rejected | A different archive for an existing version returns `409 identity_conflict`, leaves the sequence unchanged, writes an audit record, and exits 1. The amended corpus cases pass: genuine-content `409`, yanked-record `400`, and timestamp-only `204`. |
-| Dependency-bearing archives refused (decision 4) | A tar.gz and a zip whose `lwpt.toml` declares `[dependencies]` each fail locally with `unsupported_dependencies`. A mock origin records no connection, and the token variable is never read. |
+| Unsupported dependencies refused (decision 4, as lifted by ADR-0051) | A tar.gz and a zip whose `lwpt.toml` declares a dependency a record cannot carry each fail locally with `unsupported_dependencies`. A mock origin records no connection, and the token variable is never read. |
 | Yank and restore endpoints | A token without the `yank` action, or without a matching pattern, returns 403. Yanking an active version returns `201` with the new record body and `Location`. Repeating it returns `204`. Restoring returns `201`, and repeating that returns `204`. An absent version returns 404. Every replacement record keeps the archive, size, and dependencies. Only `yanked` and `published_at` change, and the old record stays retrievable by hash. |
 | Credentials scoped, never printed or persisted | Out-of-scope package returns 403. Revoked and expired tokens return 401. The secret is searched for in every command's stdout and stderr, the audit files, the data directory (hash only), and the project tree. The one exemption is `issue-token`'s single intended stdout line. `lwpt.lock` and `.lwpt/` stay unchanged. |
 | Responses echoing the credential | A mock origin reflects the `Authorization` value in its error `message`, `code`, `request_id`, status text, `Location`, `ETag`, `Retry-After`, discovery `origin`, and the text of a transport error. `publish` output never contains the token or its secret; an invalid `code` prints as `unrecognized_error`. A token sent in a request path or query on the server leaves `route = "invalid"` in the audit record and appears in no stderr line. |
@@ -785,7 +800,8 @@ except the third, which the maintainer widened to add zip input.
    writer.
 4. **Archives whose `lwpt.toml` declares `[dependencies]` are refused** until
    #62 defines registry dependency sources. Silently dropping dependencies
-   would publish packages that install incompletely.
+   would publish packages that install incompletely. *Lifted by ADR-0051
+   decision 10.*
 5. **Credentials come from an environment variable only** (`--token-env`,
    default `LWPT_REGISTRY_TOKEN`). Tokens keyed by origin identity in #313's
    user-level config, with owner-only permissions checked, may follow once

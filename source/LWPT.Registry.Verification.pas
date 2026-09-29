@@ -169,6 +169,10 @@ function RegistryHashIsCanonical(const AValue: string): Boolean;
 function RegistryPackageNameIsCanonical(const AValue: string): Boolean;
 { Canonical SemVer 2.0.0 with no 'v' prefix. }
 function RegistryVersionIsCanonical(const AValue: string): Boolean;
+{ Protocol 1's canonical dependency constraint grammar: an exact version,
+  ^ or ~ before a version, space-separated comparators, or alternatives
+  joined by ' || '. }
+function RegistryConstraintIsCanonical(const AValue: string): Boolean;
 { RFC 3339 UTC with whole seconds and the Z suffix. }
 function RegistryTimestampIsCanonical(const AValue: string): Boolean;
 function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;
@@ -1061,6 +1065,11 @@ begin
         raise ELWPTRegistryError.CreateStable('invalid_registry_dependency',
           'package dependency is invalid');
       ExplicitOrigin := TomlStr(Item, 'origin', '');
+      { One encoding per dependency: its own origin is written by omission,
+        so record hashes and content identity stay unambiguous. }
+      if (ExplicitOrigin <> '') and (ExplicitOrigin = Result.Origin) then
+        raise ELWPTRegistryError.Create('non_canonical_document: a dependency '
+          + 'on the record''s own origin omits origin');
       if ExplicitOrigin = '' then
         Result.Dependencies[I].Origin := Result.Origin
       else

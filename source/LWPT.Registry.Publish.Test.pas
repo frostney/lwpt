@@ -2,9 +2,10 @@ program LWPT.Registry.Publish.Test;
 
 { The publish client's local contract (ADR-0049): the diagnostic grammar
   and credential redaction, retry arithmetic, origin transport rules, the
-  record it publishes, Location parsing, and the order of local refusals:
-  trust pin, transport, and archive validation (including the dependency
-  refusal) all fail before the token is read or any connection is made. }
+  record it publishes with its dependencies in protocol order, Location
+  parsing, and the order of local refusals: trust pin, transport, and
+  archive validation (including dependencies a record cannot carry) all
+  fail before the token is read or any connection is made. }
 
 {$mode delphi}{$H+}
 
@@ -34,6 +35,8 @@ const
   PIN_KEY_ID = 'ed25519:035fbd9c9aade687fd77c8da783d6ed29e20d10f52ca0a0e143d6602aa9135ae';
   PIN_PUBLIC_KEY = 'hex:154c2482652c8aa9b04b9e9d9bd4294593b6f5a0c850e583b440d5597cca1fa9';
   HASH_A = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  REGISTRY = '[registries.home]' + #10 + 'identity = "https://packages.example.com"'
+    + #10;
 
 type
   TRegistryClientContract = class(TTestSuite)
@@ -53,6 +56,7 @@ type
     procedure TestRetryAfterAndBackoff;
     procedure TestOriginTransportRules;
     procedure TestRecordDocumentIsCanonical;
+    procedure TestRecordDependenciesAreInProtocolOrder;
     procedure TestLocationNamesOneRecordBelowTheAPI;
     procedure TestTokenEnvironmentNames;
     procedure TestLocalRefusalsPrecedeCredentialsAndConnections;
@@ -261,7 +265,7 @@ var
   Package: TLWPTRegistryPackage;
 begin
   Document := RegistryPublishRecordDocument('https://packages.example.com',
-    'example-lib', '1.2.3', HASH_A, 261, '2026-09-29T12:00:00Z');
+    'example-lib', '1.2.3', HASH_A, 261, '2026-09-29T12:00:00Z', nil);
   Package := ParseRegistryPackage(Document,
     SHA256BytesPrefixed(BytesOf(Document)), 'https://packages.example.com');
   Expect<string>(Package.Name).ToBe('example-lib');
@@ -273,6 +277,49 @@ begin
   Expect<Integer>(Length(Package.Dependencies)).ToBe(0);
   { LF line endings on every platform: the hash is over exact bytes. }
   Expect<Boolean>(Pos(#13, Document) = 0).ToBe(True);
+  Expect<Boolean>(Pos('dependencies = []' + #10, Document) > 0).ToBe(True);
+end;
+
+procedure TRegistryClientContract.TestRecordDependenciesAreInProtocolOrder;
+const
+  HOME = 'https://packages.example.com';
+var
+  Dependencies: TLWPTRegistryDependencyArray;
+  Document: string;
+  Package: TLWPTRegistryPackage;
+
+  procedure Add(const AOrigin, AName, AVersion: string);
+  begin
+    SetLength(Dependencies, Length(Dependencies) + 1);
+    Dependencies[High(Dependencies)].Origin := AOrigin;
+    Dependencies[High(Dependencies)].Name := AName;
+    Dependencies[High(Dependencies)].Version := AVersion;
+  end;
+
+begin
+  Dependencies := nil;
+  { Declaration order; sorting uses each effective origin. }
+  Add('https://z.example.com', 'alpha', '^1.0.0');
+  Add(HOME, 'zeta', '1.0.0');
+  Add('http://localhost:8080', 'omega', '>=2.0.0 <3.0.0');
+  Add(HOME, 'beta', '~0.1.0 || ^1.0.0');
+  Document := RegistryPublishRecordDocument(HOME, 'example-lib', '1.2.3',
+    HASH_A, 261, '2026-09-29T12:00:00Z', Dependencies);
+  { The publishing origin is omitted; the rest name theirs. }
+  Expect<string>(Copy(Document, Pos('dependencies = ', Document), MaxInt))
+    .ToBe('dependencies = [{ origin = "http://localhost:8080", name = "omega", '
+      + 'version = ">=2.0.0 <3.0.0" }, { name = "beta", version = "~0.1.0 || '
+      + '^1.0.0" }, { name = "zeta", version = "1.0.0" }, { origin = '
+      + '"https://z.example.com", name = "alpha", version = "^1.0.0" }]' + #10);
+  { The verifier's canonical decoder accepts it unchanged. }
+  Package := ParseRegistryPackage(Document,
+    SHA256BytesPrefixed(BytesOf(Document)), HOME);
+  Expect<Integer>(Length(Package.Dependencies)).ToBe(4);
+  Expect<string>(Package.Dependencies[1].Origin).ToBe(HOME);
+  Expect<string>(Package.Dependencies[1].Name).ToBe('beta');
+  Expect<string>(SortRegistryDependencies(Dependencies)[3].Name).ToBe('alpha');
+  Expect<Integer>(Length(Dependencies)).ToBe(4);
+  Expect<string>(Dependencies[0].Name).ToBe('alpha');
 end;
 
 procedure TRegistryClientContract.TestLocationNamesOneRecordBelowTheAPI;
@@ -325,11 +372,21 @@ begin
       '[dependencies]' + #10 + 'plain = "local:../plain"' + #10));
     Unsupported := WriteArchive('unsupported.bin', TextBytes('not an archive'));
 
-    Expect<string>(Failure(Options(Dependent, Origin)))
-      .ToBe('unsupported_dependencies: lwpt.toml declares [dependencies]; registry '
-        + 'dependency sources are not defined yet');
+    Expect<string>(Copy(Failure(Options(Dependent, Origin)), 1, 80))
+      .ToBe('unsupported_dependencies: lwpt.toml dependency "plain" is not a '
+        + 'registry: source');
     Expect<string>(RegistryErrorCode(Failure(Options(DependentZip, Origin))))
       .ToBe('unsupported_dependencies');
+    Expect<string>(RegistryErrorCode(Failure(Options(WriteArchive('filtered.tar.gz',
+      PackageTarGz('dependent', '1.0.0', REGISTRY + '[dependencies]' + #10
+      + 'plain = { source = "registry:plain", version = "^1.0.0", '
+      + 'include = ["source/**"] }' + #10)), Origin)))).ToBe('unsupported_dependencies');
+    Expect<string>(RegistryErrorCode(Failure(Options(WriteArchive('self.tar.gz',
+      PackageTarGz('dependent', '1.0.0', REGISTRY + '[dependencies]' + #10
+      + 'dependent = "registry:dependent@^1.0.0"' + #10)), Origin))))
+      .ToBe('unsupported_dependencies');
+    Expect<string>(RegistryErrorCode(Failure(Options(WriteArchive('dotted.zip',
+      PackageZip('dotted.lib', '1.0.0', '')), Origin)))).ToBe('invalid_package_name');
     Expect<string>(RegistryErrorCode(Failure(Options(Unsupported, Origin))))
       .ToBe('unsupported_archive');
     Expect<string>(RegistryErrorCode(Failure(Options(FScratch + '/missing.tar.gz',
@@ -353,10 +410,14 @@ begin
     Request.TokenEnvironment := SAMPLE_TOKEN;
     Expect<string>(RegistryErrorCode(Failure(Request))).ToBe('invalid_configuration');
     { Only a valid archive reaches the credential, and a missing one still
-      fails before any connection. }
+      fails before any connection. A mapped registry dependency is valid. }
     Expect<string>(Failure(Options(Plain, Origin))).ToBe('credential_missing: '
       + 'environment variable ' + UpperCase(PROGRAM_NAME)
       + '_CLIENT_TEST_UNSET_TOKEN does not hold a registry token');
+    Expect<string>(RegistryErrorCode(Failure(Options(WriteArchive('mapped.zip',
+      PackageZip('dependent', '1.0.0', REGISTRY + '[dependencies]' + #10
+      + 'plain = "registry:plain@^1.0.0"' + #10)), Origin))))
+      .ToBe('credential_missing');
     Sleep(100);
     Expect<Integer>(Listener.AcceptedCount).ToBe(0);
   finally
@@ -373,8 +434,10 @@ begin
   Test('Retry-After and exponential backoff are bounded', TestRetryAfterAndBackoff);
   Test('origins need https except for the exact host localhost',
     TestOriginTransportRules);
-  Test('the published record is canonical with no dependencies',
+  Test('the published record is canonical',
     TestRecordDocumentIsCanonical);
+  Test('record dependencies omit the publishing origin and are in protocol order',
+    TestRecordDependenciesAreInProtocolOrder);
   Test('a Location names exactly one record below the API',
     TestLocationNamesOneRecordBelowTheAPI);
   Test('token variable names are validated, never read as tokens',
