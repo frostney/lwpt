@@ -173,7 +173,7 @@ class IntegratedWorkflowTests(unittest.TestCase):
     def test_runs_check_out_the_dispatched_head(self) -> None:
         workflow = read(".github/workflows/ci.yml")
         refs = re.findall(r"^          ref: (.+)$", workflow, re.MULTILINE)
-        self.assertEqual(["${{ github.sha }}", "${{ github.sha }}"], refs)
+        self.assertEqual(["${{ github.sha }}"] * 3, refs)
 
     def test_diagnostics_are_allow_listed_slices(self) -> None:
         workflow = read(".github/workflows/ci.yml")
@@ -697,6 +697,153 @@ class SchedulingDiagnosticTests(unittest.TestCase):
                 os.kill(child_pid, 0)
             with self.assertRaises(ProcessLookupError):
                 os.kill(grandchild_pid, 0)
+
+
+REGISTRY_EXAMPLE = "docs/examples/registry"
+REGISTRY_SMOKE = ".github/ci/registry-container/smoke.sh"
+
+
+class RegistryContainerTests(unittest.TestCase):
+    """The example registry image is documentation, and CI proves it works."""
+
+    def test_full_matrix_smokes_the_image_off_the_pr_gate(self) -> None:
+        workflow = read(".github/workflows/ci.yml")
+        job = workflow_job(workflow, "registry-container")
+        self.assertIn("      - validate-inputs\n      - build\n", job)
+        self.assertIn("    if: inputs.mode != 'diagnostic'\n", job)
+        self.assertIn("    runs-on: ubuntu-latest\n", job)
+        self.assertIn("    timeout-minutes: 15\n", job)
+        self.assertIn("          name: lwpt-x86_64-linux\n", job)
+        self.assertIn(
+            "timeout 780 .github/ci/registry-container/smoke.sh --binary build/lwpt", job
+        )
+        self.assertIn("        if: failure()\n", job)
+        self.assertIn("registry-container-artifacts", job)
+        # Expensive and Docker-bound: never part of the automatic PR gate.
+        pr_workflow = read(".github/workflows/pr.yml")
+        self.assertNotIn("registry-container", pr_workflow)
+        self.assertNotIn("docker build", pr_workflow)
+
+    def test_release_smokes_the_published_assets(self) -> None:
+        workflow = read(".github/workflows/release.yml")
+        job = workflow_job(workflow, "registry-container-smoke")
+        self.assertIn("    needs: publish\n", job)
+        self.assertIn("    timeout-minutes: 15\n", job)
+        self.assertIn("    permissions:\n      contents: read\n", job)
+        self.assertIn(
+            'timeout 780 .github/ci/registry-container/smoke.sh --release "${GITHUB_REF_NAME}"',
+            job,
+        )
+        self.assertIn("        if: failure()\n", job)
+
+    def test_matrix_keeps_failing_scratch_as_an_artifact(self) -> None:
+        job = workflow_job(read(".github/workflows/ci.yml"), "test")
+        step = job.split("      - name: Upload registry matrix scratch on failure\n", 1)[1]
+        step = step.split("      - name: ", 1)[0]
+        self.assertIn("        if: failure()\n", step)
+        self.assertIn("          path: build/tests/tmp/rmx-*\n", step)
+
+    def test_example_image_installs_a_pinned_release_and_builds_nothing(self) -> None:
+        dockerfile = read(f"{REGISTRY_EXAMPLE}/Dockerfile")
+        instructions = [
+            line for line in dockerfile.splitlines() if line and not line.startswith("#")
+        ]
+        text = "\n".join(instructions)
+        # A second build system is a Hard Constraint violation (ADR-0005).
+        for forbidden in ("fpc", "instantfpc", "bootstrap", "lwpt build", "COPY . ", "ADD . "):
+            self.assertNotIn(forbidden, text)
+        self.assertIn("releases/download", text)
+        self.assertIn('sha256sum --check --strict', text)
+        self.assertIn("ARG LWPT_SHA256_LINUX_X64", text)
+        self.assertIn("ARG LWPT_SHA256_LINUX_ARM64", text)
+        self.assertIn('test "$(/out/lwpt --version | head -n 1)" = "lwpt ${LWPT_VERSION}"', text)
+        # Non-root, root-owned read-only executables, and a data volume.
+        self.assertIn("USER 10001:10001", text)
+        self.assertIn("COPY --from=fetch --chmod=0555 /out/lwpt /usr/local/bin/lwpt", text)
+        self.assertIn('VOLUME ["/var/lib/lwpt-registry"]', text)
+        self.assertIn("STOPSIGNAL SIGTERM", text)
+        self.assertIn('CMD ["/usr/local/bin/lwpt-registry-healthcheck"]', text)
+        self.assertRegex(text, r'(?m)^ENTRYPOINT \["/usr/local/bin/lwpt-registry-entrypoint"\]$')
+        # No credentials, keys, or identities are baked into the image.
+        for secret in ("PASSWORD=", "TOKEN", ".p12", ".seed", "_rt1_"):
+            self.assertNotIn(secret, text)
+        entrypoint = read(f"{REGISTRY_EXAMPLE}/entrypoint.sh")
+        self.assertTrue(entrypoint.rstrip().endswith('exec /usr/local/bin/lwpt "$@"'))
+
+    def run_healthcheck(self, config: str, body: str, ca: str = "") -> tuple[int, list[str]]:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            data = root / "data"
+            data.mkdir()
+            (data / "registry.toml").write_text(config, encoding="utf-8")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            calls = root / "curl.args"
+            (root / "body").write_text(body, encoding="utf-8")
+            curl = bin_dir / "curl"
+            curl.write_text(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$@" > "{calls}"\n'
+                f'cat "{root / "body"}"\n',
+                encoding="utf-8",
+            )
+            curl.chmod(0o755)
+            env = {
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "LWPT_REGISTRY_DATA": str(data),
+            }
+            if ca:
+                env["LWPT_REGISTRY_HEALTH_CA"] = ca
+            outcome = subprocess.run(
+                ["sh", str(ROOT / REGISTRY_EXAMPLE / "healthcheck.sh")],
+                env=env, capture_output=True, text=True, timeout=10, check=False,
+            )
+            args = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+            return outcome.returncode, args
+
+    def test_healthcheck_probes_the_local_listener_under_the_base_url(self) -> None:
+        config = (
+            'schema = "lwpt-registry-origin-config-v1"\n'
+            'identity = "https://registry.example.com"\n'
+            'base_url = "https://registry.example.com"\n'
+            'listen_address = "0.0.0.0"\n'
+            "port = 8443\n"
+            'tls_pkcs12 = "/run/secrets/registry.p12"\n'
+            'tls_password_env = "LWPT_REGISTRY_TLS_PASSWORD"\n'
+        )
+        discovery = (
+            'schema = "lwpt-registry-discovery-v1"\nprotocol = 1\n'
+            'origin = "https://registry.example.com"\n'
+            'base_url = "https://registry.example.com"\n'
+        )
+        status, args = self.run_healthcheck(config, discovery, "/run/secrets/ca.pem")
+        self.assertEqual(0, status)
+        self.assertIn("::127.0.0.1:8443", args)
+        self.assertEqual("https://registry.example.com/.well-known/lwpt-registry", args[-1])
+        self.assertEqual("/run/secrets/ca.pem", args[args.index("--cacert") + 1])
+        # Another registry answering on the port is not this one.
+        other = discovery.replace("registry.example.com", "other.example.com")
+        self.assertNotEqual(0, self.run_healthcheck(config, other)[0])
+        # A specific listener address is probed directly.
+        _, args = self.run_healthcheck(
+            config.replace('"0.0.0.0"', '"10.0.0.5"'), discovery
+        )
+        self.assertIn("::10.0.0.5:8443", args)
+        self.assertNotIn("--cacert", args)
+        self.assertNotEqual(0, self.run_healthcheck("schema = \"x\"\n", discovery)[0])
+
+    def test_smoke_is_bounded_and_collects_artifacts(self) -> None:
+        script = read(REGISTRY_SMOKE)
+        self.assertIn("set -euo pipefail", script)
+        self.assertIn("trap cleanup EXIT", script)
+        self.assertIn("collect_artifacts", script)
+        for line in script.splitlines():
+            if re.search(r"\bdocker (run|build|stop|exec|logs|rm|volume|network)\b", line):
+                with self.subTest(line=line.strip()):
+                    self.assertRegex(line, r"timeout \d+ docker ")
+        # The smoke uses the example unchanged and proves the pin is enforced.
+        self.assertIn('CONTEXT="$REPO_ROOT/docs/examples/registry"', script)
+        self.assertIn("a wrong SHA-256 pin must fail the image build", script)
 
 
 class OrchestrationPolicyTests(unittest.TestCase):

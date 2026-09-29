@@ -43,6 +43,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 | InstantFPC | bundled with FPC | `instantfpc --help` |
 | Lefthook | 2.x | `lefthook version` |
 | git-cliff | Verify the installed release live | `git-cliff --version` |
+| Docker Engine with BuildKit | Not pinned; CI uses the GitHub-hosted `ubuntu-latest` engine and logs `docker version` | `docker version`. Used by the registry container smoke in CI ([`registry-deployment.md`](./registry-deployment.md)) and the local Win32 Wine helper. Building, testing, and using LWPT never require Docker. |
 | OpenSSL (Unix-not-Darwin only) | 3.x | `openssl version` on Unix. Windows and macOS never load it: both directions are SChannel / SecureTransport (per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md) and [ADR-0016](./adr/0016-tls-backend-per-platform.md)). The CI PE-import guard keeps Windows free of any OpenSSL linkage. |
 
 When you touch code that depends on the version, **verify it live, not from memory.** The Hard Constraint in `AGENTS.md` is explicit about this. If you bump a version, the new pin lives in this file and in the relevant CI workflow.

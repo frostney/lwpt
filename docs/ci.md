@@ -195,6 +195,33 @@ Both installers are SHA-256-pinned. The setup script fails unless the selected c
 
 Per [Q22=b](./adr/0014-packages-extraction.md), the runner side compiles tests at runtime via `lwpt test` rather than pre-compiling them on the cross-build stage. This exercises the full LWPT pipeline natively — including the resolver, the per-target cfg emitter, FPC's per-platform `{$IFDEF}` paths, and the install loop's symlink-vs-copy decision (junctions on Windows, symlinks on Unix).
 
+When a test step fails, the job uploads `registry-matrix-<target>`: the
+scratch directory that [`RegistryMatrix.E2E.Test.pas`](../tests/e2e/RegistryMatrix.E2E.Test.pas)
+keeps for a failing case, holding its data directories, consumer projects,
+and command log. The registries in it are loopback-only test registries with
+throwaway keys.
+
+**Registry container stage** (`registry-container`, `ubuntu-latest`, 15-minute
+ceiling, full matrix only, skipped in diagnostic mode): downloads the
+`lwpt-x86_64-linux` artefact and runs
+[`.github/ci/registry-container/smoke.sh`](../.github/ci/registry-container/smoke.sh)
+`--binary build/lwpt`. The script packages the binary exactly like a release
+archive, serves it on loopback, and builds the unchanged example image from
+[`docs/examples/registry/`](./examples/registry/). It first proves that a
+wrong SHA-256 pin fails the build. It then runs the registry as UID 10001 on
+a read-only root file system and waits for the image's health check. A
+`registry publish` from the runner commits while the server runs, the record
+and archive are read back, and a graceful stop is checked for exit status 0
+within the stop timeout. A replacement container on the same volume serves
+the same head and accepts the next publication, and the reverse-proxy example
+(nginx re-encrypting to the registry) serves the same protocol. Every Docker
+command is bounded by `timeout`. On failure, the job uploads
+`registry-container-smoke` with container logs, `docker inspect` output
+including health history, and data-volume listings, but never signing seeds
+or tokens. The stage stays off `pr.yml` because it needs Docker and image
+pulls. [`registry-deployment.md`](./registry-deployment.md) is the operator
+guide.
+
 ### `pr.yml` — pre-merge PR gate
 
 Mirrors GocciaScript's `pr.yml` shape, and is the only **automatic** pre-merge signal a PR sees (because `ci.yml` doesn't trigger on PRs); the required manual `ci.yml` run on the PR's exact head supplies the rest of the pre-merge coverage. The main `build-and-test` job is a single Ubuntu runner:
@@ -243,6 +270,12 @@ The pipeline runs:
    environment, packages each target as an archive, generates SHA-256
    checksums, extracts that tag's notes from the committed `CHANGELOG.md`, and
    creates the GitHub Release with all archives + the checksums file attached.
+4. **`install-smoke`** — runs `scripts/install.sh` against the published
+   release and checks the reported version.
+5. **`registry-container-smoke`** — builds the example registry image from
+   the published `linux-x64` archive, pinned to the digest in the release's
+   checksums file, and runs the same container smoke as `ci.yml` with the
+   released client.
 
 #### Release artefact naming
 

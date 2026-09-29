@@ -134,6 +134,11 @@ docker run --detach --name lwpt-registry --restart unless-stopped \
   lwpt-registry:<version>
 ```
 
+A read-only root needs a writable `/tmp`: `registry init` keeps its
+initialization lease in the temporary directory, and `--silent` journals
+output there. Because that lease is per container, run `init` and
+reconfiguration for one data directory from one container at a time.
+
 The server prints `registry <identity> listening at <base-url>` once it has
 bound its port. It writes diagnostics, such as a failed checkpoint renewal or
 audit write, to stderr with a request ID. There is no per-request access

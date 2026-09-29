@@ -553,6 +553,18 @@ jobs:
               --bail=0
           fi
 
+      # The registry matrix keeps a failing case's scratch directory (data
+      # directories, consumer projects, and command logs of loopback-only
+      # test registries with throwaway keys).
+      - name: Upload registry matrix scratch on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: registry-matrix-${{ matrix.target }}
+          path: build/tests/tmp/rmx-*
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: TLS diagnostic test
         if: inputs.mode == 'diagnostic' && inputs.diagnostic_selector == 'tls'
         run: |
@@ -577,3 +589,48 @@ jobs:
           LWPT_SCHEDULING_DIAGNOSTIC_SCOPE: ${{ inputs.diagnostic_selector }}
           LWPT_SCHEDULING_DIAGNOSTIC_POLL_COUNT: ${{ inputs.diagnostic_selector == 'default' && '84' || (inputs.diagnostic_target == 'x86_64-darwin' || inputs.diagnostic_target == 'aarch64-darwin') && '30' || '18' }}
         run: .github/ci/scheduling-diagnostic.sh
+
+  # Builds the example registry image (docs/examples/registry) from a
+  # release-shaped archive of the x86_64-linux binary under test and runs the
+  # container smoke: pinned-checksum install, non-root read-only runtime,
+  # health check, live publication from the runner, graceful stop and
+  # container replacement on the same volume, and the reverse-proxy example.
+  # Full matrix only; release.yml repeats it against the published assets.
+  registry-container:
+    needs:
+      - validate-inputs
+      - build
+    if: inputs.mode != 'diagnostic'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download lwpt artefact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lwpt-x86_64-linux
+          path: build/
+
+      - name: Registry container smoke
+        env:
+          ARTIFACTS: ${{ runner.temp }}/registry-container-artifacts
+        run: |
+          chmod +x build/lwpt
+          docker version
+          timeout 780 .github/ci/registry-container/smoke.sh --binary build/lwpt
+
+      - name: Upload registry container artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: registry-container-smoke
+          path: ${{ runner.temp }}/registry-container-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
