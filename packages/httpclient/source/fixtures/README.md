@@ -63,6 +63,35 @@ openssl pkcs12 -export -inkey client-leaf-key.pem -in client-leaf-cert.pem \
   -out client-identity.p12
 ```
 
+`localhost-unreachable-aia-identity.p12` (passphrase `test-only`) holds
+only `localhost-unreachable-aia-leaf-cert.pem`, a `serverAuth` leaf reusing
+the test leaf key and issued by `unreachable-aia-intermediate-cert.pem`
+(its own key, signed by the test root). The leaf's AIA issuer, OCSP, and
+CRL URLs point at `192.0.2.1` (TEST-NET-1, never routed), so an anchor
+evaluation that tried to fetch them would stall. It pins the offline anchor
+policy in ADR-0050:
+
+```sh
+openssl req -new -key unreachable-aia-intermediate-key.pem \
+  -config unreachable-aia-intermediate.cnf -out intermediate.csr
+openssl x509 -req -in intermediate.csr -CA test-root-cert.pem \
+  -CAkey test-root-key.pem -set_serial 0x7101 -days 3650 -sha256 \
+  -extfile unreachable-aia-intermediate.cnf \
+  -extensions intermediate_extensions \
+  -out unreachable-aia-intermediate-cert.pem
+openssl req -new -key localhost-test-leaf-key.pem \
+  -config unreachable-aia-leaf.cnf -out leaf.csr
+openssl x509 -req -in leaf.csr -CA unreachable-aia-intermediate-cert.pem \
+  -CAkey unreachable-aia-intermediate-key.pem -set_serial 0x7102 \
+  -days 3650 -sha256 -extfile unreachable-aia-leaf.cnf \
+  -extensions leaf_extensions -out localhost-unreachable-aia-leaf-cert.pem
+openssl pkcs12 -export -inkey localhost-test-leaf-key.pem \
+  -in localhost-unreachable-aia-leaf-cert.pem \
+  -name localhost-unreachable-aia -passout pass:test-only \
+  -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 \
+  -out localhost-unreachable-aia-identity.p12
+```
+
 `localhost-multi-identity.p12` (passphrase `test-only`) carries two
 certificate-and-key identities, the test leaf and the test root, to pin the
 Windows rule that a bundle holds exactly one keyed certificate and that no

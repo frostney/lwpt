@@ -311,6 +311,14 @@ function TransportSecurityTestLastImportedKeyContainers: TUnicodeStringArray;
 { Whether a user-scope CNG key container with this name still exists. }
 function TransportSecurityTestKeyContainerExists(
   const AContainerName: UnicodeString): Boolean;
+{ Runs the SChannel client's trust-anchor verification on ALeaf (DER) as
+  if a server had sent it together with AIntermediates (PEM or DER, may be
+  empty), without a handshake. Returns '' when the peer is accepted,
+  otherwise the verification error. Exists so the offline retrieval policy
+  can be pinned without an SChannel server building its own chain. }
+function TransportSecurityTestVerifyServerChain(const ALeaf,
+  AIntermediates: TBytes; const AHost: string;
+  const AOptions: TTransportSecurityClientOptions): string;
 {$ENDIF}
 {$ENDIF}
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
@@ -2024,20 +2032,36 @@ begin
        (SecTrustSetPolicies(Trust, Policy) <> ERR_SEC_SUCCESS) then
       raise ETransportSecurityError.Create(
         'Failed to configure the TLS server trust policy');
-    { Setting anchors implies anchors-only; the second call restores the
-      system anchors for tstmSystemAndAnchors. }
+    { The configured anchors are evaluated first, alone and offline: a
+      private anchor set needs no issuer or revocation fetch, and a URL in
+      a certificate must never stall the handshake (ADR-0050). System plus
+      anchors then re-evaluates with the system anchors and Secure
+      Transport's default network behaviour, as the option-less client
+      does. }
     if (SecTrustSetAnchorCertificates(Trust, AAnchors) <> ERR_SEC_SUCCESS) or
-       (SecTrustSetAnchorCertificatesOnly(Trust,
-        AOptions.TrustMode = tstmAnchorsOnly) <> ERR_SEC_SUCCESS) then
+       (SecTrustSetAnchorCertificatesOnly(Trust, True) <> ERR_SEC_SUCCESS) or
+       (SecTrustSetNetworkFetchAllowed(Trust, False) <> ERR_SEC_SUCCESS) then
       raise ETransportSecurityError.Create(
         'Failed to configure the TLS trust anchors');
-    if not SecTrustEvaluateWithError(Trust, ErrorReference) then
+    if SecTrustEvaluateWithError(Trust, ErrorReference) then
+      Exit;
+    if AOptions.TrustMode = tstmSystemAndAnchors then
     begin
       if ErrorReference <> nil then
-        raise ETransportSecurityError.CreateFmt('%s: %d',
-          [TLS_VERIFICATION_ERROR, Int64(CFErrorGetCode(ErrorReference))]);
-      raise ETransportSecurityError.Create(TLS_VERIFICATION_ERROR);
+        CFRelease(ErrorReference);
+      ErrorReference := nil;
+      if (SecTrustSetAnchorCertificatesOnly(Trust, False)
+         <> ERR_SEC_SUCCESS) or
+         (SecTrustSetNetworkFetchAllowed(Trust, True) <> ERR_SEC_SUCCESS) then
+        raise ETransportSecurityError.Create(
+          'Failed to configure the TLS system trust');
+      if SecTrustEvaluateWithError(Trust, ErrorReference) then
+        Exit;
     end;
+    if ErrorReference <> nil then
+      raise ETransportSecurityError.CreateFmt('%s: %d',
+        [TLS_VERIFICATION_ERROR, Int64(CFErrorGetCode(ErrorReference))]);
+    raise ETransportSecurityError.Create(TLS_VERIFICATION_ERROR);
   finally
     if ErrorReference <> nil then
       CFRelease(ErrorReference);
@@ -7247,10 +7271,11 @@ end;
 
   Trust anchors use SCH_CRED_MANUAL_CRED_VALIDATION, so SChannel completes the
   handshake without judging the server and VerifySChannelClientPeer runs the
-  chain and SSL policy itself. Anchors-only builds the chain in an engine
-  whose hExclusiveRoot is an in-memory store of the anchors. System plus
-  anchors is not one native evaluation on Windows: the default engine is
-  tried first and the exclusive-anchor engine second, and either success
+  chain and SSL policy itself. The anchors are evaluated first, offline, in
+  an engine whose hExclusiveRoot is an in-memory store of the anchors.
+  System plus anchors is not one native evaluation on Windows: when the
+  anchors do not accept the peer, the current user's default engine is
+  tried second with Windows' own retrieval behaviour, and either success
   accepts the peer. InsecureSkipVerify also uses manual validation and then
   skips the check. Without anchors or insecure mode SChannel's automatic
   validation stays in charge, exactly as without options. }
@@ -7470,17 +7495,27 @@ begin
      AReport.ElementCount, AReport.PeerStoreCount]);
 end;
 
-{ Chain evaluation in an engine whose only roots are AAnchors. With
-  ARequirePeerIntermediates the evaluation also fails unless every
-  intermediate the chain used arrived in the peer's own certificate
-  message, and AIA fetching is disabled. System stores are still searched,
-  so the check is observable rather than a quirk of engine restriction. }
+{ Chain evaluation in an engine whose only roots are AAnchors (ADR-0050).
+  A private anchor set is evaluated offline: the engine and the chain call
+  use cached URL retrieval only, fetch no issuer through AIA, and never
+  trigger the automatic root-store update, so an unreachable URL in a
+  certificate, or Windows Update being unreachable, can never stall the
+  handshake. The retrieval timeout is also bounded in case a platform
+  ignores the cache-only request. Revocation is not checked, exactly as in
+  the option-less SChannel client. With ARequirePeerIntermediates the
+  evaluation also fails unless every intermediate the chain used arrived in
+  the peer's own certificate message. System stores are still searched for
+  intermediates, so that check is explicit rather than a quirk of engine
+  restriction. }
 procedure SChannelEvaluateAnchorChain(const AAnchors: HCERTSTORE;
   const APeer: PCertContext; const AHost: string;
   const AServerAuthentication, ARequirePeerIntermediates: Boolean;
   out AReport: TSChannelChainReport);
 const
+  CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL = $00000004;
+  CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE = $00000100;
   CERT_CHAIN_DISABLE_AIA = $00002000;
+  ANCHOR_URL_RETRIEVAL_TIMEOUT_MILLISECONDS = 1000;
 var
   ChainFlags: LongWord;
   Config: TCertChainEngineConfig;
@@ -7489,9 +7524,10 @@ begin
   FillChar(Config, SizeOf(Config), 0);
   Config.cbSize := SizeOf(Config);
   Config.hExclusiveRoot := AAnchors;
-  ChainFlags := 0;
-  if ARequirePeerIntermediates then
-    ChainFlags := CERT_CHAIN_DISABLE_AIA;
+  Config.dwFlags := CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
+  Config.dwUrlRetrievalTimeout := ANCHOR_URL_RETRIEVAL_TIMEOUT_MILLISECONDS;
+  ChainFlags := CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL or
+    CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE or CERT_CHAIN_DISABLE_AIA;
   Engine := nil;
   if not CertCreateCertificateChainEngine(Config, Engine) or
      not Assigned(Engine) then
@@ -7517,12 +7553,33 @@ begin
   Result := Report.PolicyError;
 end;
 
+procedure VerifySChannelPeerCertificate(const APeer: PCertContext;
+  const AHost: string; const AOptions: TTransportSecurityClientOptions;
+  const AAnchorStore: Pointer);
+var
+  ErrorCode: LongWord;
+begin
+  if not Assigned(AAnchorStore) then
+    raise ETransportSecurityError.CreateFmt('%s: no trust anchors',
+      [TLS_VERIFICATION_ERROR]);
+  { The offline anchor evaluation runs first, so a server issued by a
+    configured anchor is accepted without any network work in either mode.
+    System plus anchors then falls back to the current user's default
+    engine, which keeps Windows' own retrieval behaviour (AIA and root
+    auto-update), exactly as the option-less client does. }
+  ErrorCode := SChannelAnchorPolicyError(AAnchorStore, APeer, AHost, True);
+  if (ErrorCode <> 0) and (AOptions.TrustMode = tstmSystemAndAnchors) then
+    ErrorCode := SChannelChainPolicyError(nil, APeer, AHost, True, 0);
+  if ErrorCode <> 0 then
+    raise ETransportSecurityError.CreateFmt('%s: %s',
+      [TLS_VERIFICATION_ERROR, SChannelStatusText(ErrorCode)]);
+end;
+
 procedure VerifySChannelClientPeer(const AContext: TSecHandle;
   const AHost: string; const AOptions: TTransportSecurityClientOptions;
   const AAnchorStore: Pointer);
 var
   Context: TSecHandle;
-  ErrorCode: LongWord;
   Peer: PCertContext;
 begin
   if AOptions.InsecureSkipVerify or not Assigned(AAnchorStore) then
@@ -7534,14 +7591,7 @@ begin
     raise ETransportSecurityError.CreateFmt(
       '%s: the server presented no certificate', [TLS_VERIFICATION_ERROR]);
   try
-    ErrorCode := 1;
-    if AOptions.TrustMode = tstmSystemAndAnchors then
-      ErrorCode := SChannelChainPolicyError(nil, Peer, AHost, True, 0);
-    if ErrorCode <> 0 then
-      ErrorCode := SChannelAnchorPolicyError(AAnchorStore, Peer, AHost, True);
-    if ErrorCode <> 0 then
-      raise ETransportSecurityError.CreateFmt('%s: %s',
-        [TLS_VERIFICATION_ERROR, SChannelStatusText(ErrorCode)]);
+    VerifySChannelPeerCertificate(Peer, AHost, AOptions, AAnchorStore);
   finally
     CertFreeCertificateContext(Peer);
   end;
@@ -9445,6 +9495,57 @@ begin
   SetLength(Result, Length(SChannelTestImportedKeyContainers));
   for I := 0 to High(Result) do
     Result[I] := SChannelTestImportedKeyContainers[I];
+end;
+
+function TransportSecurityTestVerifyServerChain(const ALeaf,
+  AIntermediates: TBytes; const AHost: string;
+  const AOptions: TTransportSecurityClientOptions): string;
+const
+  CERT_STORE_PROV_MEMORY = 2;
+  CERT_STORE_ADD_USE_EXISTING = 2;
+var
+  AnchorStore: HCERTSTORE;
+  I: Integer;
+  Intermediates: TTransportSecurityCertificateList;
+  PeerStore: HCERTSTORE;
+  Leaf: PCertContext;
+begin
+  Result := '';
+  AnchorStore := nil;
+  Leaf := nil;
+  PeerStore := CertOpenStore(PAnsiChar(PtrUInt(CERT_STORE_PROV_MEMORY)), 0,
+    0, 0, nil);
+  if not Assigned(PeerStore) then
+    raise ETransportSecurityError.Create(
+      'Failed to create the test peer store');
+  try
+    if (Length(ALeaf) = 0) or not CertAddEncodedCertificateToStore(PeerStore,
+       X509_ASN_ENCODING, @ALeaf[0], Length(ALeaf),
+       CERT_STORE_ADD_USE_EXISTING, @Leaf) then
+      raise ETransportSecurityError.Create(
+        'Test peer leaf is not a valid X.509 certificate');
+    Intermediates := ParseTransportSecurityTrustAnchors(AIntermediates);
+    for I := 0 to High(Intermediates) do
+      if not CertAddEncodedCertificateToStore(PeerStore, X509_ASN_ENCODING,
+        @Intermediates[I][0], Length(Intermediates[I]),
+        CERT_STORE_ADD_USE_EXISTING, nil) then
+        raise ETransportSecurityError.Create(
+          'Test peer intermediate is not a valid X.509 certificate');
+    if Length(AOptions.TrustAnchors) > 0 then
+      AnchorStore := CreateSChannelAnchorStore(AOptions.TrustAnchors);
+    try
+      VerifySChannelPeerCertificate(Leaf, AHost, AOptions, AnchorStore);
+    except
+      on E: ETransportSecurityError do
+        Result := E.Message;
+    end;
+  finally
+    if Assigned(Leaf) then
+      CertFreeCertificateContext(Leaf);
+    if Assigned(AnchorStore) then
+      CertCloseStore(AnchorStore, 0);
+    CertCloseStore(PeerStore, 0);
+  end;
 end;
 
 function TransportSecurityTestKeyContainerExists(

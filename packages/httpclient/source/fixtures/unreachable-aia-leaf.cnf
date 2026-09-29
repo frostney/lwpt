@@ -1,0 +1,18 @@
+[req]
+distinguished_name = leaf_name
+prompt = no
+
+[leaf_name]
+CN = localhost
+
+# 192.0.2.1 is TEST-NET-1 (RFC 5737): never routed, so any attempt to fetch
+# these URLs blocks until the fetcher's timeout instead of failing fast.
+[leaf_extensions]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+authorityInfoAccess = caIssuers;URI:http://192.0.2.1/unreachable-aia-intermediate.crt,OCSP;URI:http://192.0.2.1/ocsp
+crlDistributionPoints = URI:http://192.0.2.1/unreachable-aia.crl

@@ -59,6 +59,13 @@ const
   LIVE_HTTPS_URL = 'https://github.com/';
   TEST_ROOT_PATH = FIXTURES + 'test-root-cert.pem';
   UNRELATED_ROOT_PATH = FIXTURES + 'unrelated-root-cert.pem';
+  { A leaf served without its issuer, whose AIA, OCSP, and CRL URLs point at
+    never-routed TEST-NET-1 (192.0.2.1): a fetch would block for seconds. }
+  UNREACHABLE_AIA_PKCS12_PATH =
+    FIXTURES + 'localhost-unreachable-aia-identity.p12';
+  { Anchor-only evaluation is offline, so it must finish far inside any
+    network retrieval timeout (15 s by default on Windows). }
+  OFFLINE_VERIFICATION_BUDGET_MILLISECONDS = 8000;
   PKCS12_PASSPHRASE = 'test-only';
   MISMATCHED_HOST = 'mismatch.invalid';
   CLIENT_REQUEST = 'GET / HTTP/1.1'#13#10'Host: localhost'#13#10 +
@@ -112,6 +119,7 @@ type
     procedure SetupTests; override;
     procedure TestAnchorsOnlyVerifiesConfiguredCA;
     procedure TestAnchorsOnlyRejectsUnrelatedCA;
+    procedure TestAnchorsOnlyNeverFetchesUnreachableURLs;
     procedure TestSystemAndAnchorsVerifiesConfiguredCA;
     procedure TestSystemAndAnchorsRejectsUnrelatedCA;
     procedure TestPeerCertificateIsServerLeaf;
@@ -764,9 +772,13 @@ var
   Peer: TBytes;
   Response: AnsiString;
   Served: TServedConnection;
+  StartedAt: QWord;
 begin
+  StartedAt := GetTickCount64;
   Expect<string>(RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
     AnchorsOnly(TEST_ROOT_PATH), False, Response, Peer, Served)).ToBe('');
+  Expect<Boolean>(GetTickCount64 - StartedAt <
+    OFFLINE_VERIFICATION_BUDGET_MILLISECONDS).ToBe(True);
   Expect<string>(string(Response)).ToBe(OK_RESPONSE);
   Expect<Boolean>(Served.HandshakeSucceeded).ToBe(True);
   Expect<string>(Served.Error).ToBe('');
@@ -778,11 +790,39 @@ var
   Peer: TBytes;
   Response: AnsiString;
   Served: TServedConnection;
+  StartedAt: QWord;
 begin
+  StartedAt := GetTickCount64;
   ErrorMessage := RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
     AnchorsOnly(UNRELATED_ROOT_PATH), False, Response, Peer, Served);
   Expect<Boolean>(Contains(ErrorMessage, 'verification')).ToBe(True);
   Expect<string>(string(Response)).ToBe('');
+  Expect<Boolean>(GetTickCount64 - StartedAt <
+    OFFLINE_VERIFICATION_BUDGET_MILLISECONDS).ToBe(True);
+end;
+
+{ The client must reject the incomplete chain from the anchors alone,
+  without trying the unreachable issuer, OCSP, or CRL URLs. Windows runs the
+  equivalent check without a server (an SChannel server builds its own
+  chain for the leaf, so it could fetch the URL itself). }
+procedure TTransportSecurityClientOptionsE2ETests.TestAnchorsOnlyNeverFetchesUnreachableURLs;
+{$IFNDEF MSWINDOWS}
+var
+  ErrorMessage: string;
+  Peer: TBytes;
+  Response: AnsiString;
+  Served: TServedConnection;
+  StartedAt: QWord;
+{$ENDIF}
+begin
+  {$IFNDEF MSWINDOWS}
+  StartedAt := GetTickCount64;
+  ErrorMessage := RunExchange(UNREACHABLE_AIA_PKCS12_PATH, tsivPermissive,
+    'localhost', AnchorsOnly(TEST_ROOT_PATH), False, Response, Peer, Served);
+  Expect<Boolean>(Contains(ErrorMessage, 'verification')).ToBe(True);
+  Expect<Boolean>(GetTickCount64 - StartedAt <
+    OFFLINE_VERIFICATION_BUDGET_MILLISECONDS).ToBe(True);
+  {$ENDIF}
 end;
 
 procedure TTransportSecurityClientOptionsE2ETests.TestSystemAndAnchorsVerifiesConfiguredCA;
@@ -1314,6 +1354,14 @@ begin
     TestAnchorsOnlyVerifiesConfiguredCA);
   Test('anchors-only trust rejects an unrelated CA as a verification failure',
     TestAnchorsOnlyRejectsUnrelatedCA);
+  {$IFDEF MSWINDOWS}
+  Skip('anchors-only verification never fetches unreachable certificate URLs',
+    TestAnchorsOnlyNeverFetchesUnreachableURLs,
+    'covered server-less by TransportSecurity.Test on Windows');
+  {$ELSE}
+  Test('anchors-only verification never fetches unreachable certificate URLs',
+    TestAnchorsOnlyNeverFetchesUnreachableURLs);
+  {$ENDIF}
   Test('system-plus-anchors trust verifies the configured CA',
     TestSystemAndAnchorsVerifiesConfiguredCA);
   Test('system-plus-anchors trust still rejects an unrelated CA',
