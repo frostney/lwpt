@@ -17,6 +17,10 @@ uses
 
 const
   MANIFEST_DUPLICATION_DEFAULT_MINIMUM_TOKENS = 100;
+  { ADR-0051: the registry source prefix, and the [registries] key naming
+    the default alias (reserved as an alias). }
+  REGISTRY_SOURCE_PREFIX = 'registry';
+  REGISTRY_DEFAULT_KEY = 'default';
   MANIFEST_DUPLICATION_MINIMUM_TOKEN_FLOOR = 25;
 
 type
@@ -43,10 +47,17 @@ type
       skLocal   — a filesystem path; recursively copied into the
                   modules tree. No version resolution.
 
+      skRegistry — a package from an LWPT registry origin, selected from
+                  its signed snapshot (ADR-0051). SrcLocator is the
+                  package name; RegistryAlias names the root
+                  [registries] entry ('' for the default registry), and
+                  RegistryOrigin carries the explicit origin identity of
+                  a dependency taken from a signed record.
+
     The earlier skRelease + skHttp kinds are removed: release assets
     are reachable via the URL form; tag resolution via git smart-HTTP
     works against ALL git hosts uniformly. }
-  TSourceKind = (skGitHost, skURL, skLocal, skWorkspace);
+  TSourceKind = (skGitHost, skURL, skLocal, skWorkspace, skRegistry);
 
   { Git-host identity. The string-based design (rather than an enum)
     is what lets users declare custom hosts in [sources] without a
@@ -129,7 +140,24 @@ type
       becomes IncludeGlobs = ["src/foo/**"] under the new design). }
     IncludeGlobs : TStringArray;
     ExcludeGlobs : TStringArray;
+    { skRegistry only (ADR-0051): the alias of `registry:<alias>/<name>`,
+      and the origin identity of a dependency read from a signed record. }
+    RegistryAlias : string;
+    RegistryOrigin : string;
   end;
+
+  { One root [registries.<alias>] declaration (ADR-0051). Identity is ''
+    when the endpoint-advertised identity is accepted under the pin;
+    Origin is then required. Mirrors are tried in order before Origin. }
+  TLWPTRegistryDeclaration = record
+    Alias     : string;
+    Identity  : string;
+    KeyId     : string;
+    PublicKey : string;
+    Origin    : string;
+    Mirrors   : TStringArray;
+  end;
+  TLWPTRegistryDeclarationArray = array of TLWPTRegistryDeclaration;
 
 
   { A single lifecycle hook entry (ADR-0011). The command is
@@ -255,6 +283,12 @@ type
     WorkspaceIncludes   : array of string;
     WorkspaceExcludes   : array of string;
     Workspaces          : TWorkspaceArray;
+    { [registries] (ADR-0051). Root manifests validate every value; other
+      manifests keep a lenient copy only so a workspace member's aliases can
+      be compared with the root's. RegistryDefault is the explicit default
+      alias, or '' when none is declared. }
+    Registries          : TLWPTRegistryDeclarationArray;
+    RegistryDefault     : string;
   end;
 
   TManifestContext = record
@@ -276,6 +310,20 @@ procedure ParseDependencySource(const ASource: string; out AKind: TSourceKind; o
 procedure ParseVersionSpec(const ASpec: string; out AKind: TVersionKind; out AValue: string);
 procedure ParseBareDepString(const ABare: string; const ACustomSources: TCustomSourceArray; var ADep: TDependency);
 function  ValidPackageName(const S: string): Boolean;
+{ The consumer registry package grammar [a-z0-9][a-z0-9_-]{0,127}
+  (ADR-0051 decision 6) and the alias grammar [a-z0-9][a-z0-9_-]{0,63}. }
+function  ValidRegistryPackageName(const S: string): Boolean;
+function  ValidRegistryAlias(const S: string): Boolean;
+function  FindRegistryDeclaration(const ARegistries: TLWPTRegistryDeclarationArray;
+  const AAlias: string; out AOut: TLWPTRegistryDeclaration): Boolean;
+{ The alias a `registry:<name>` dependency uses: the explicit default, the
+  only declared registry, or an actionable EManifestError. }
+function  DefaultRegistryAlias(const AMan: TManifest;
+  const ADependencyName: string): string;
+{ The declared alias a registry dependency resolves through (explicit or
+  default), or an actionable EManifestError. }
+function  RegistryAliasFor(const AMan: TManifest;
+  const ADep: TDependency): string;
 function  LoadManifest(const APath: string): TManifest; overload;
 function  LoadManifest(const APath: string; AIsRoot: Boolean): TManifest; overload;
 function  LoadManifestSnapshot(const APath: string;
@@ -288,6 +336,7 @@ uses
   StrUtils,
 
   LWPT.Manifest.Schema,
+  LWPT.Registry.Verification,
   OrderedStringMap,
   Platform,
   Semver;
@@ -299,6 +348,7 @@ begin
     skURL     : Result := 'url';
     skLocal   : Result := 'local';
     skWorkspace : Result := 'workspace';
+    skRegistry  : Result := 'registry';
   end;
 end;
 
@@ -416,6 +466,55 @@ begin
         and (S[1] <> '/') and (S[Length(S)] <> '/');
 end;
 
+function ValidRegistryName(const S: string; const AMaximum: Integer): Boolean;
+var i: Integer;
+begin
+  Result := (Length(S) >= 1) and (Length(S) <= AMaximum)
+    and (S[1] in ['a'..'z', '0'..'9']);
+  if not Result then Exit;
+  for i := 2 to Length(S) do
+    if not (S[i] in ['a'..'z', '0'..'9', '_', '-']) then Exit(False);
+end;
+
+function ValidRegistryPackageName(const S: string): Boolean;
+begin
+  Result := ValidRegistryName(S, 128);
+end;
+
+function ValidRegistryAlias(const S: string): Boolean;
+begin
+  Result := ValidRegistryName(S, 64);
+end;
+
+{ registry:<package> or registry:<alias>/<package> (ADR-0051 decision 1).
+  ALocator receives the package, AAlias the alias or ''. }
+procedure ParseRegistryLocator(const ASource: string;
+  out ALocator, AAlias: string);
+var Rest: string; Slash: Integer;
+begin
+  Rest := Copy(ASource, Length(REGISTRY_SOURCE_PREFIX) + 2, MaxInt);
+  Slash := Pos('/', Rest);
+  if Slash > 0 then
+  begin
+    AAlias := Copy(Rest, 1, Slash - 1);
+    ALocator := Copy(Rest, Slash + 1, MaxInt);
+    if not ValidRegistryAlias(AAlias) or (AAlias = REGISTRY_DEFAULT_KEY) then
+      raise EManifestError.CreateFmt(
+        'registry source "%s": alias "%s" must match [a-z0-9][a-z0-9_-]{0,63} '
+        + 'and must not be "%s"', [ASource, AAlias, REGISTRY_DEFAULT_KEY]);
+  end
+  else
+  begin
+    AAlias := '';
+    ALocator := Rest;
+  end;
+  if not ValidRegistryPackageName(ALocator) then
+    raise EManifestError.CreateFmt(
+      'registry source "%s": package name "%s" must match '
+      + '[a-z0-9][a-z0-9_-]{0,127}; expected "registry:<package>" or '
+      + '"registry:<alias>/<package>"', [ASource, ALocator]);
+end;
+
 { Internal worker: parses a source string against the given custom-
   sources list. ACustomSources may be empty (no custom prefixes
   declared). APermissive controls what happens for an unknown prefix:
@@ -461,6 +560,11 @@ begin
     if Prefix = 'local' then
     begin
       AKind := skLocal; Exit;
+    end
+    else if Prefix = REGISTRY_SOURCE_PREFIX then
+    begin
+      ParseRegistryLocator(ASource, ALocator, AHostName);
+      AKind := skRegistry; Exit;
     end
     else if Prefix = 'workspace' then
     begin
@@ -517,7 +621,7 @@ begin
     else
       raise EManifestError.CreateFmt(
         'unknown source prefix "%s:" in "%s"; '
-        + 'expected gitlab:/bitbucket:/local:, a [sources.<name>] '
+        + 'expected gitlab:/bitbucket:/local:/registry:, a [sources.<name>] '
         + 'entry in lwpt.toml, or no prefix (default github)',
         [Prefix, ASource]);
   end;
@@ -696,6 +800,37 @@ begin
   end;
 end;
 
+{ A registry dependency's key is its package name, and its version is a
+  SemVer range or exact version without a leading v (ADR-0051). }
+function RegistrySpecHasVPrefix(const ASpec: string): Boolean;
+var i: Integer;
+begin
+  for i := 1 to Length(ASpec) do
+    if (ASpec[i] in ['v', 'V'])
+       and ((i = 1) or (ASpec[i - 1] in [' ', '^', '~', '<', '>', '=', '|'])) then
+      Exit(True);
+  Result := False;
+end;
+
+procedure ValidateRegistryDependency(var ADep: TDependency);
+begin
+  if ADep.SrcKind <> skRegistry then Exit;
+  ADep.RegistryAlias := ADep.SrcHostName;
+  ADep.SrcHostName := '';
+  if ADep.Name <> ADep.SrcLocator then
+    raise EManifestError.CreateFmt(
+      'dependency "%s": registry source "%s" names package "%s"; a registry '
+      + 'dependency''s key must equal its package name. Write %s = "%s"',
+      [ADep.Name, ADep.SrcOriginal, ADep.SrcLocator, ADep.SrcLocator,
+       ADep.SrcOriginal]);
+  if not (ADep.VersionKind in [vkNone, vkSemverRange, vkSemverExact])
+     or RegistrySpecHasVPrefix(ADep.VersionSpec) then
+    raise EManifestError.CreateFmt(
+      'dependency "%s": registry version "%s" is not a SemVer range or '
+      + 'exact version; registry versions are SemVer without "v" '
+      + '(for example ^1.2.0 or 1.2.3)', [ADep.Name, ADep.VersionSpec]);
+end;
+
 procedure ParseBareDepString(const ABare: string;
   const ACustomSources: TCustomSourceArray; var ADep: TDependency);
 var SrcStr, SpecStr: string;
@@ -711,6 +846,7 @@ begin
       + '("@%s" not allowed for local paths)',
       [ADep.Name, SrcStr, SpecStr]);
   NormalizeWorkspaceSource(ADep);
+  ValidateRegistryDependency(ADep);
 end;
 
 { Read an array-of-strings TOML field from an inline-table node into
@@ -833,6 +969,7 @@ begin
   ReadGlobArray(ANode, 'exclude', ADep.ExcludeGlobs);
   CanonicalizePathGlobs(ADep.IncludeGlobs);
   CanonicalizePathGlobs(ADep.ExcludeGlobs);
+  ValidateRegistryDependency(ADep);
 end;
 
 { ===========================================================================
@@ -1079,6 +1216,215 @@ begin
   end;
 end;
 
+
+function FindRegistryDeclaration(const ARegistries: TLWPTRegistryDeclarationArray;
+  const AAlias: string; out AOut: TLWPTRegistryDeclaration): Boolean;
+var i: Integer;
+begin
+  for i := 0 to High(ARegistries) do
+    if ARegistries[i].Alias = AAlias then
+    begin
+      AOut := ARegistries[i];
+      Exit(True);
+    end;
+  AOut := Default(TLWPTRegistryDeclaration);
+  Result := False;
+end;
+
+function DefaultRegistryAlias(const AMan: TManifest;
+  const ADependencyName: string): string;
+var Names: string; i: Integer;
+begin
+  if AMan.RegistryDefault <> '' then Exit(AMan.RegistryDefault);
+  if Length(AMan.Registries) = 1 then Exit(AMan.Registries[0].Alias);
+  if Length(AMan.Registries) = 0 then
+    raise EManifestError.CreateFmt(
+      '"%s" uses registry:%s but no registry is declared; add '
+      + '[registries.<alias>] with its identity and key to the root %s',
+      [ADependencyName, ADependencyName, MANIFEST_FILE]);
+  Names := '';
+  for i := 0 to High(AMan.Registries) do
+  begin
+    if Names <> '' then
+    begin
+      if i = High(AMan.Registries) then Names := Names + ' and '
+      else Names := Names + ', ';
+    end;
+    Names := Names + AMan.Registries[i].Alias;
+  end;
+  raise EManifestError.CreateFmt(
+    'registries %s are declared and no default is set; write '
+    + 'registry:<alias>/%s or set [registries] default',
+    [Names, ADependencyName]);
+end;
+
+function RegistryAliasFor(const AMan: TManifest;
+  const ADep: TDependency): string;
+var Declaration: TLWPTRegistryDeclaration;
+begin
+  if ADep.RegistryAlias = '' then
+    Exit(DefaultRegistryAlias(AMan, ADep.Name));
+  if not FindRegistryDeclaration(AMan.Registries, ADep.RegistryAlias,
+       Declaration) then
+    raise EManifestError.CreateFmt(
+      '"%s" uses %s but registry alias "%s" is not declared; add '
+      + '[registries.%s] with its identity and key to the root %s',
+      [ADep.Name, ADep.SrcOriginal, ADep.RegistryAlias, ADep.RegistryAlias,
+       MANIFEST_FILE]);
+  Result := ADep.RegistryAlias;
+end;
+
+{ A contact or identity URI: canonical, https, no bracketed IPv6 host.
+  Plain http://localhost is a test-build development exception only. }
+procedure ValidateRegistryURI(const AAlias, AField, AValue: string);
+var AllowLocalhost: Boolean;
+begin
+  {$IFDEF INSTALL_TESTING}
+  AllowLocalhost := True;
+  {$ELSE}
+  AllowLocalhost := False;
+  {$ENDIF}
+  if StartsWithStr(LowerCase(AValue), 'http://') then
+  begin
+    if not AllowLocalhost or not RegistryURIIsCanonical(AValue, True) then
+      raise EManifestError.CreateFmt(
+        'insecure_transport: [registries.%s] %s "%s" must use https',
+        [AAlias, AField, AValue]);
+  end
+  else if not RegistryURIIsCanonical(AValue, False) then
+    raise EManifestError.CreateFmt(
+      '[registries.%s] %s "%s" is not a canonical https registry URI '
+      + '(lowercase scheme and host, no default port, userinfo, query, '
+      + 'fragment, or trailing slash)', [AAlias, AField, AValue]);
+  if Pos('://[', AValue) > 0 then
+    raise EManifestError.CreateFmt(
+      '[registries.%s] %s "%s": IPv6 addresses are not supported; use a '
+      + 'DNS name or IPv4 address', [AAlias, AField, AValue]);
+end;
+
+{ [registries] (ADR-0051): an optional `default` alias and one table per
+  alias. Root manifests validate every value; any other manifest keeps a
+  lenient copy for the workspace-member consistency check only. }
+procedure ParseRegistries(ANode: TTOMLNode; AIsRoot: Boolean;
+  var AMan: TManifest);
+var
+  Pair: TTOMLNodeMap.TKeyValuePair;
+  Entry, Item: TTOMLNode;
+  Declaration: TLWPTRegistryDeclaration;
+  Contacts, Identities: TStringList;
+  i, j, n: Integer;
+
+  procedure AddContact(const AValue: string);
+  begin
+    if Contacts.IndexOf(AValue) >= 0 then
+      raise EManifestError.CreateFmt(
+        '[registries.%s] contact "%s" is listed more than once',
+        [Declaration.Alias, AValue]);
+    Contacts.Add(AValue);
+  end;
+
+begin
+  AMan.Registries := nil;
+  AMan.RegistryDefault := '';
+  if not TomlIsTable(ANode) then Exit;
+  Identities := TStringList.Create;
+  Contacts := TStringList.Create;
+  try
+    Identities.CaseSensitive := True;
+    Contacts.CaseSensitive := True;
+    for Pair in ANode.Children do
+    begin
+      if Pair.Key = REGISTRY_DEFAULT_KEY then
+      begin
+        if TomlIsString(Pair.Value) then
+          AMan.RegistryDefault := Pair.Value.ScalarText
+        else if AIsRoot then
+          raise EManifestError.Create(
+            '[registries] default must name a declared registry alias; the '
+            + 'alias "default" is reserved');
+        Continue;
+      end;
+      Entry := Pair.Value;
+      if not TomlIsTable(Entry) then
+      begin
+        if AIsRoot then
+          raise EManifestError.CreateFmt(
+            '[registries] %s must be a [registries.%s] table',
+            [Pair.Key, Pair.Key]);
+        Continue;
+      end;
+      Declaration := Default(TLWPTRegistryDeclaration);
+      Declaration.Alias := Pair.Key;
+      Declaration.Identity := TomlStr(Entry, 'identity', '');
+      Declaration.KeyId := TomlStr(Entry, 'key-id', '');
+      Declaration.PublicKey := TomlStr(Entry, 'public-key', '');
+      Declaration.Origin := TomlStr(Entry, 'origin', '');
+      Item := TomlGet(Entry, 'mirrors');
+      if TomlIsArray(Item) then
+        for i := 0 to Item.Items.Count - 1 do
+          if TomlIsString(Item.Items[i]) then
+          begin
+            n := Length(Declaration.Mirrors);
+            SetLength(Declaration.Mirrors, n + 1);
+            Declaration.Mirrors[n] := Item.Items[i].ScalarText;
+          end;
+      if Declaration.Origin = '' then Declaration.Origin := Declaration.Identity;
+      if AIsRoot then
+      begin
+        if not ValidRegistryAlias(Declaration.Alias) then
+          raise EManifestError.CreateFmt(
+            '[registries.%s] alias must match [a-z0-9][a-z0-9_-]{0,63}',
+            [Declaration.Alias]);
+        if (Declaration.KeyId = '') or (Declaration.PublicKey = '') then
+          raise EManifestError.CreateFmt(
+            '[registries.%s] needs its pinned root key: key-id = '
+            + '"ed25519:<64 hex digits>" and public-key = "hex:<64 hex '
+            + 'digits>". Nothing is trusted on first use.', [Declaration.Alias]);
+        if not RegistryTrustRootIsValid(Declaration.KeyId,
+             Declaration.PublicKey) then
+          raise EManifestError.CreateFmt(
+            '[registries.%s] key-id and public-key do not form a valid '
+            + 'Ed25519 pin (the key id must be the sha256 of the public key)',
+            [Declaration.Alias]);
+        if Declaration.Origin = '' then
+          raise EManifestError.CreateFmt(
+            '[registries.%s] needs an origin contact when identity is '
+            + 'omitted', [Declaration.Alias]);
+        Contacts.Clear;
+        if Declaration.Identity <> '' then
+        begin
+          ValidateRegistryURI(Declaration.Alias, 'identity',
+            Declaration.Identity);
+          if Identities.IndexOf(Declaration.Identity) >= 0 then
+            raise EManifestError.CreateFmt(
+              '[registries.%s] identity "%s" is already declared under '
+              + 'another alias', [Declaration.Alias, Declaration.Identity]);
+          Identities.Add(Declaration.Identity);
+        end;
+        for j := 0 to High(Declaration.Mirrors) do
+        begin
+          ValidateRegistryURI(Declaration.Alias, 'mirror',
+            Declaration.Mirrors[j]);
+          AddContact(Declaration.Mirrors[j]);
+        end;
+        ValidateRegistryURI(Declaration.Alias, 'origin', Declaration.Origin);
+        AddContact(Declaration.Origin);
+      end;
+      n := Length(AMan.Registries);
+      SetLength(AMan.Registries, n + 1);
+      AMan.Registries[n] := Declaration;
+    end;
+    if AIsRoot and (AMan.RegistryDefault <> '')
+       and not FindRegistryDeclaration(AMan.Registries, AMan.RegistryDefault,
+         Declaration) then
+      raise EManifestError.CreateFmt(
+        '[registries] default names undeclared registry "%s"',
+        [AMan.RegistryDefault]);
+  finally
+    Contacts.Free;
+    Identities.Free;
+  end;
+end;
 
 function ParseManifestContent(const APath, AContent: string;
   AIsRoot: Boolean): TManifest; forward;
@@ -1443,15 +1789,18 @@ begin
         { Reject names that would shadow the built-in prefixes; the
           built-ins win unconditionally to keep behavior predictable. }
         if (CS.Name = 'github') or (CS.Name = 'gitlab')
-           or (CS.Name = 'bitbucket') or (CS.Name = 'local') then
+           or (CS.Name = 'bitbucket') or (CS.Name = 'local')
+           or (CS.Name = REGISTRY_SOURCE_PREFIX) then
           raise EManifestError.CreateFmt(
             '[sources] %s: name shadows a built-in prefix '
-            + '(github / gitlab / bitbucket / local) and is rejected',
-            [CS.Name]);
+            + '(github / gitlab / bitbucket / local / registry) and is '
+            + 'rejected', [CS.Name]);
         n := Length(Result.CustomSources);
         SetLength(Result.CustomSources, n + 1);
         Result.CustomSources[n] := CS;
       end;
+
+    ParseRegistries(TomlGet(Root, 'registries'), AIsRoot, Result);
 
     { [dependencies] — each child is either a bare string in the
       ADR-0009 shorthand form `name = "<source>@<spec>"`, or an
@@ -1475,6 +1824,12 @@ begin
         SetLength(Result.Deps, j + 1);
         Result.Deps[j] := D;
       end;
+    { Root registry dependencies must name a declared registry now; members
+      and packages are resolved through the root during installation. }
+    if AIsRoot then
+      for j := 0 to High(Result.Deps) do
+        if Result.Deps[j].SrcKind = skRegistry then
+          RegistryAliasFor(Result, Result.Deps[j]);
 
     (* [build] — replaces the legacy [targets] section (ADR-0011 §
        "build-section rename"). Two recognised shapes:
