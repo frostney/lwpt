@@ -34,9 +34,6 @@ uses
   cthreads,
   BaseUnix,
   {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Windows,
-  {$ENDIF}
   Classes,
   Generics.Collections,
   Process,
@@ -269,7 +266,7 @@ begin
     {$IFDEF UNIX}
     FpKill(AProcess.ProcessID, SIGKILL);
     {$ELSE}
-    TerminateProcess(AProcess.Handle, 1);
+    AProcess.Terminate(1);
     {$ENDIF}
   end;
   StopRegistryProcess(AProcess);

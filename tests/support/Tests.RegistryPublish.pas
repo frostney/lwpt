@@ -111,9 +111,6 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Windows,
-  {$ENDIF}
   StrUtils,
 
   HTTPClient,
@@ -604,7 +601,8 @@ begin
   {$IFDEF UNIX}
   FpKill(FServe.ProcessID, SIGKILL);
   {$ELSE}
-  TerminateProcess(FServe.Handle, 1);
+  { TerminateProcess; the Windows unit would shadow SysUtils.FindClose. }
+  FServe.Terminate(1);
   {$ENDIF}
   StopGracefully;
 end;
