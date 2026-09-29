@@ -1,7 +1,7 @@
 unit HTTPClient;
 
 // Minimal HTTP/1.1 client built on raw BSD sockets.
-// Supports GET, HEAD, and POST over HTTP and HTTPS.
+// Supports GET, HEAD, POST, PUT, and DELETE over HTTP and HTTPS.
 // Cross-platform: Unix (macOS, Linux) and Windows.
 // Synchronous API with deadline-aware nonblocking socket I/O.
 
@@ -93,6 +93,10 @@ type
     the limit is known to be exceeded (a declared Content-Length, a chunk
     size, or the received bytes), before the excess is read. }
   EHTTPResponseTooLarge = class(EHTTPError);
+  { TLS refused the peer: its certificate chain, validity, purpose, or host
+    name failed verification (ETransportSecurityVerificationError). Unlike
+    other transport failures, retrying the same request cannot succeed. }
+  EHTTPTLSVerificationError = class(EHTTPError);
 
   {$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
   { Test-only select seam. Production code must leave this nil. The hook can
@@ -163,6 +167,25 @@ function HTTPPost(const AURL: string; const ABody: TBytes;
   const AContentType: string;
   const AHeaders: THTTPHeaders): THTTPResponse; overload;
 function HTTPPost(const AURL: string; const ABody: TBytes;
+  const AContentType: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse; overload;
+{ PUT and DELETE send their byte content through the same core as POST: an
+  exact Content-Length from the body, the caller's Content-Type, and no
+  caller-supplied framing headers. A 301, 302, 307, or 308 redirect keeps
+  the method and content (only POST is rewritten to GET on 301 and 302); a
+  303 retrieves the target with a bodyless GET. Every hop remains subject to
+  MaximumRedirects and the destination policy. An empty body still sends
+  Content-Length: 0. }
+function HTTPPut(const AURL: string; const ABody: TBytes;
+  const AContentType: string;
+  const AHeaders: THTTPHeaders): THTTPResponse; overload;
+function HTTPPut(const AURL: string; const ABody: TBytes;
+  const AContentType: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse; overload;
+function HTTPDelete(const AURL: string; const ABody: TBytes;
+  const AContentType: string;
+  const AHeaders: THTTPHeaders): THTTPResponse; overload;
+function HTTPDelete(const AURL: string; const ABody: TBytes;
   const AContentType: string; const AHeaders: THTTPHeaders;
   const AOptions: THTTPRequestOptions): THTTPResponse; overload;
 
@@ -2046,6 +2069,13 @@ end;
 // Public API
 // ---------------------------------------------------------------------------
 
+procedure RaiseTransportSecurityFailure(const AError: ETransportSecurityError);
+begin
+  if AError is ETransportSecurityVerificationError then
+    raise EHTTPTLSVerificationError.Create(AError.Message);
+  raise EHTTPError.Create(AError.Message);
+end;
+
 function DefaultHTTPRequestOptions: THTTPRequestOptions;
 begin
   Result.MaxResponseBodyBytes := DEFAULT_MAX_RESPONSE_BODY_BYTES;
@@ -2079,7 +2109,7 @@ begin
       AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
-      raise EHTTPError.Create(E.Message);
+      RaiseTransportSecurityFailure(E);
   end;
 end;
 
@@ -2097,7 +2127,7 @@ begin
       AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
-      raise EHTTPError.Create(E.Message);
+      RaiseTransportSecurityFailure(E);
   end;
 end;
 
@@ -2118,7 +2148,49 @@ begin
       AHeaders, AOptions, AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
-      raise EHTTPError.Create(E.Message);
+      RaiseTransportSecurityFailure(E);
+  end;
+end;
+
+function HTTPPut(const AURL: string; const ABody: TBytes;
+  const AContentType: string;
+  const AHeaders: THTTPHeaders): THTTPResponse;
+begin
+  Result := HTTPPut(AURL, ABody, AContentType, AHeaders,
+    DefaultHTTPRequestOptions);
+end;
+
+function HTTPPut(const AURL: string; const ABody: TBytes;
+  const AContentType: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
+begin
+  try
+    Result := DoRequest('PUT', AURL, ABody, AContentType, True,
+      AHeaders, AOptions, AOptions.MaximumRedirects);
+  except
+    on E: ETransportSecurityError do
+      RaiseTransportSecurityFailure(E);
+  end;
+end;
+
+function HTTPDelete(const AURL: string; const ABody: TBytes;
+  const AContentType: string;
+  const AHeaders: THTTPHeaders): THTTPResponse;
+begin
+  Result := HTTPDelete(AURL, ABody, AContentType, AHeaders,
+    DefaultHTTPRequestOptions);
+end;
+
+function HTTPDelete(const AURL: string; const ABody: TBytes;
+  const AContentType: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
+begin
+  try
+    Result := DoRequest('DELETE', AURL, ABody, AContentType, True,
+      AHeaders, AOptions, AOptions.MaximumRedirects);
+  except
+    on E: ETransportSecurityError do
+      RaiseTransportSecurityFailure(E);
   end;
 end;
 

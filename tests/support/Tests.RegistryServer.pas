@@ -38,6 +38,12 @@ type
     the serving thread and must be safe for concurrent calls. }
   TRegistryHTTPRouteHandler = function(const ATarget: string;
     out AMediaType: string; out ABody: TBytes): Integer of object;
+  { Optional raw responder. It receives the complete request, the head and
+    its Content-Length body, and returns the complete response bytes, so a
+    test can play any status line and headers or relay to another server.
+    It takes precedence over routes and Handler and runs on the serving
+    thread. }
+  TRegistryHTTPRawHandler = function(const ARequest: TBytes): TBytes of object;
 
   TRegistryTestServer = class
   private
@@ -53,6 +59,7 @@ type
     FConcurrent: Boolean;
     FClients: TList;
     FHandler: TRegistryHTTPRouteHandler;
+    FRawHandler: TRegistryHTTPRawHandler;
     FRequestLock: TRTLCriticalSection;
     FRequestedTargets, FRequestedHosts: TStringList;
     {$IFDEF MSWINDOWS}
@@ -75,6 +82,7 @@ type
     { Host header values in arrival order; the caller owns the list. }
     function RequestedHosts: TStringList;
     property Handler: TRegistryHTTPRouteHandler read FHandler write FHandler;
+    property RawHandler: TRegistryHTTPRawHandler read FRawHandler write FRawHandler;
     property Port: Word read FPort;
     property RequestCount: Integer read FRequestCount;
     property AcceptedCount: Integer read FAcceptedCount;
@@ -269,6 +277,59 @@ begin
     if Pos(CRLF + CRLF, Result) > 0 then Exit;
     if Length(Result) > 65536 then Exit('');
   until False;
+end;
+
+{ Completes a request whose head ARequest holds: reads the rest of its
+  Content-Length body, bounded in size and time. }
+function ReceiveBody(AOwner: TRegistryTestServer; const ASocket: TRegistryTestSocket;
+  const ARequest: string): TBytes;
+const
+  MAXIMUM_BODY_BYTES = 64 * 1024 * 1024;
+  BODY_TIMEOUT_MS = 20000;
+var
+  Buffer: array[0..65535] of Byte;
+  Received, HeaderEnd, LineStart, LineEnd: Integer;
+  Head, Line: string;
+  Declared, Total: Int64;
+  Started: QWord;
+begin
+  Result := BytesOf(ARequest);
+  HeaderEnd := Pos(CRLF + CRLF, ARequest);
+  if HeaderEnd = 0 then Exit;
+  Head := Copy(ARequest, 1, HeaderEnd + 1);
+  Declared := 0;
+  LineStart := Pos(CRLF, Head) + 2;
+  while LineStart < Length(Head) do
+  begin
+    LineEnd := Pos(CRLF, Copy(Head, LineStart, MaxInt));
+    if LineEnd = 0 then Break;
+    Line := Copy(Head, LineStart, LineEnd - 1);
+    if SameText(Copy(Line, 1, Length('Content-Length:')), 'Content-Length:') then
+      Declared := StrToInt64Def(Trim(Copy(Line, Length('Content-Length:') + 1,
+        MaxInt)), 0);
+    Inc(LineStart, LineEnd + 1);
+  end;
+  if (Declared <= 0) or (Declared > MAXIMUM_BODY_BYTES) then Exit;
+  Total := HeaderEnd + 3 + Declared;
+  Started := GetTickCount64;
+  while Length(Result) < Total do
+  begin
+    if AOwner.StopRequested or (GetTickCount64 - Started >= BODY_TIMEOUT_MS) then Exit;
+    {$IFDEF UNIX}
+    Received := fpRecv(ASocket, @Buffer[0], SizeOf(Buffer), 0);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    Received := WinSock2.recv(ASocket, PAnsiChar(@Buffer[0]), SizeOf(Buffer), 0);
+    {$ENDIF}
+    if (Received < 0) and RetrySocket then
+    begin
+      Sleep(1);
+      Continue;
+    end;
+    if Received <= 0 then Exit;
+    SetLength(Result, Length(Result) + Received);
+    Move(Buffer[0], Result[Length(Result) - Received], Received);
+  end;
 end;
 
 function RequestPath(const ARequest: string): string;
@@ -489,6 +550,18 @@ begin
     LeaveCriticalSection(FRequestLock);
   end;
   InterlockedIncrement(FRequestCount);
+  if Assigned(FRawHandler) then
+  begin
+    try
+      Response := FRawHandler(ReceiveBody(Self, AClient, Request));
+    except
+      on E: Exception do
+        Response := ResponseBytes(500, 'text/plain',
+          BytesOf('raw handler failed: ' + E.Message));
+    end;
+    SendBytes(Self, AClient, Response);
+    Exit;
+  end;
   for I := 0 to High(FRoutes) do
     if FRoutes[I].Path = Path then
     begin

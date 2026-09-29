@@ -92,6 +92,9 @@ end;
 constructor TRawHTTPConnection.Create(const APort: Word);
 var
   Address: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
+  {$IFDEF DARWIN}
+  Enabled: LongInt;
+  {$ENDIF}
 begin
   inherited Create;
   {$IFDEF MSWINDOWS}
@@ -102,6 +105,17 @@ begin
   {$ELSE}
   FSocket := fpSocket(AF_INET, SOCK_STREAM, 0);
   if FSocket < 0 then raise Exception.Create('raw HTTP socket failed');
+  {$IFDEF DARWIN}
+  { No MSG_NOSIGNAL on Darwin: a send to a peer that already closed must
+    fail with EPIPE instead of raising SIGPIPE. }
+  Enabled := 1;
+  if fpSetSockOpt(FSocket, SOL_SOCKET, $1022 { SO_NOSIGPIPE }, @Enabled,
+    SizeOf(Enabled)) <> 0 then
+  begin
+    CloseSocket(FSocket);
+    raise Exception.Create('raw HTTP socket could not suppress SIGPIPE');
+  end;
+  {$ENDIF}
   {$ENDIF}
   FillChar(Address, SizeOf(Address), 0);
   Address.sin_family := AF_INET;

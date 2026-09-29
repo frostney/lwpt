@@ -135,6 +135,7 @@ type
     procedure TestInsecureSkipVerifyAcceptsHostMismatch;
     procedure TestHostMismatchFailsVerification;
     procedure TestHTTPClientTrustsPrivateCA;
+    procedure TestHTTPClientClassifiesVerificationFailures;
     procedure TestHTTPClientSameOriginRedirectKeepsOptions;
     procedure TestHTTPClientCrossOriginRedirectDropsOptions;
     procedure TestHTTPClientRejectsInvalidOptionsBeforeConnecting;
@@ -1086,6 +1087,60 @@ begin
   end;
 end;
 
+{ The class HTTPGet raises for AURL against one loopback TLS server, or ''
+  on success. }
+function HTTPClientFailureClass(const AURL: string;
+  const ATLS: TTransportSecurityClientOptions): string;
+var
+  Server: TLoopbackTLSServer;
+begin
+  Result := '';
+  Server := TLoopbackTLSServer.Create(SERVER_PKCS12_PATH, tsivStrict,
+    [OK_RESPONSE]);
+  try
+    try
+      HTTPGet(StringReplace(AURL, '{port}', IntToStr(Server.Port), []), nil,
+        HTTPSOptions(ATLS));
+    except
+      on E: EHTTPError do
+        Result := E.ClassName;
+    end;
+    Server.Join;
+  finally
+    Server.Free;
+  end;
+end;
+
+procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientClassifiesVerificationFailures;
+var
+  Failure: string;
+  Listener: TSocket;
+  Port: Word;
+begin
+  { A refused peer is EHTTPTLSVerificationError on every backend: the
+    option-less client (the test PKI is in no system store), anchors from
+    another hierarchy, and a trusted chain for another host name. }
+  Expect<string>(HTTPClientFailureClass('https://localhost:{port}/',
+    DefaultTransportSecurityClientOptions)).ToBe('EHTTPTLSVerificationError');
+  Expect<string>(HTTPClientFailureClass('https://localhost:{port}/',
+    AnchorsOnly(UNRELATED_ROOT_PATH))).ToBe('EHTTPTLSVerificationError');
+  Expect<string>(HTTPClientFailureClass('https://' + MISMATCHED_HOST
+    + ':{port}/', AnchorsOnly(TEST_ROOT_PATH))).ToBe('EHTTPTLSVerificationError');
+  { Other transport failures stay plain EHTTPError: a port that was just
+    released refuses the connection. }
+  Listener := CreateLoopbackListener(Port);
+  CloseTestSocket(Listener);
+  Failure := '';
+  try
+    HTTPGet('https://localhost:' + IntToStr(Port) + '/', nil,
+      HTTPSOptions(AnchorsOnly(TEST_ROOT_PATH)));
+  except
+    on E: EHTTPError do
+      Failure := E.ClassName;
+  end;
+  Expect<string>(Failure).ToBe('EHTTPError');
+end;
+
 procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientSameOriginRedirectKeepsOptions;
 var
   Response: THTTPResponse;
@@ -1436,6 +1491,8 @@ begin
     TestHostMismatchFailsVerification);
   Test('HTTPClient trusts a private CA through request TLS options',
     TestHTTPClientTrustsPrivateCA);
+  Test('HTTPClient raises EHTTPTLSVerificationError only for a refused peer',
+    TestHTTPClientClassifiesVerificationFailures);
   Test('HTTPClient keeps TLS options across a same-origin redirect',
     TestHTTPClientSameOriginRedirectKeepsOptions);
   Test('HTTPClient drops TLS options on a cross-origin redirect',

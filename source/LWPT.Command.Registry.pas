@@ -27,6 +27,10 @@ function CmdRegistryRotateKey(const ADataDirectory, AExpectedKeyID: string): Int
 function CmdRegistryIssueToken(const ADataDirectory, APackages, AActions,
   AExpiresDays, ALabel: string): Integer;
 function CmdRegistryRevokeToken(const ADataDirectory, ATokenID: string): Integer;
+{ Publishes one archive to a remote origin (ADR-0049); the result line is
+  the command's only stdout line. }
+function CmdRegistryPublish(const AArchivePath, AOrigin, AKeyID, APublicKey,
+  ATokenEnvironment: string): Integer;
 
 implementation
 
@@ -43,6 +47,7 @@ uses
 
   LWPT.Core,
   LWPT.OutputRenderer,
+  LWPT.Registry.Publish,
   LWPT.Registry.Mirror,
   LWPT.Registry.Server,
   LWPT.Registry.Store,
@@ -250,7 +255,7 @@ begin
   Token := IssueRegistryToken(ADataDirectory, Patterns, Actions, Days, ALabel,
     CurrentTimestamp, TokenRecord);
   try
-    WriteCommandResultLine(Token);
+    WriteCommandOutcomeLine(Token);
   finally
     if Length(Token) > 0 then FillChar(Token[1], Length(Token), 0);
   end;
@@ -265,6 +270,20 @@ begin
   if RevokeRegistryToken(ADataDirectory, ATokenID, CurrentTimestamp) then
     WriteLn('revoked registry token ', ATokenID)
   else WriteLn('registry token ', ATokenID, ' was already revoked');
+  Result := 0;
+end;
+
+function CmdRegistryPublish(const AArchivePath, AOrigin, AKeyID, APublicKey,
+  ATokenEnvironment: string): Integer;
+var
+  Options: TLWPTRegistryPublishOptions;
+begin
+  Options.ArchivePath := AArchivePath;
+  Options.Origin := AOrigin;
+  Options.KeyID := AKeyID;
+  Options.PublicKey := APublicKey;
+  Options.TokenEnvironment := ATokenEnvironment;
+  WriteCommandOutcomeLine(PublishToRegistry(Options).Line);
   Result := 0;
 end;
 
