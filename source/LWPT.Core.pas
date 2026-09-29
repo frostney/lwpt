@@ -201,6 +201,22 @@ function  ObserveProcessHandleSetup(
   const AThreadID: TThreadID): TLWPTProcessHandleSetupFlags;
 {$ENDIF}
 
+type
+  TSHA256Digest = array[0..31] of Byte;
+  { Incremental SHA-256 state for callers that hash bytes as they arrive. }
+  TSHA256Context = record
+    State: array[0..7] of Cardinal;
+    Buffer: array[0..63] of Byte;
+    BufferLength: Integer;
+    TotalLength: QWord;
+  end;
+
+procedure SHA256Init(var AContext: TSHA256Context);
+procedure SHA256Update(var AContext: TSHA256Context; const AData;
+  const ACount: Integer);
+procedure SHA256Final(var AContext: TSHA256Context;
+  out ADigest: TSHA256Digest);
+function  SHA256DigestHex(const ADigest: TSHA256Digest): string;
 function  SHA256BytesPrefixed(const ABytes: TBytes): string;
 function  SHA256Hex(const AData: TBytes): string;
 function  SHA256Stream(AStream: TStream;
@@ -1912,15 +1928,6 @@ function SHA256BytesPrefixed(const ABytes: TBytes): string;
 begin
   Result := 'sha256:' + SHA256Hex(ABytes);
 end;
-
-type
-  TSHA256Digest = array[0..31] of Byte;
-  TSHA256Context = record
-    State: array[0..7] of Cardinal;
-    Buffer: array[0..63] of Byte;
-    BufferLength: Integer;
-    TotalLength: QWord;
-  end;
 
 { SHA-256 performs intentional modular arithmetic on 32-bit values
   (Cardinals): the compression loop's `temp1 := h + s1 + ch + K[t] + W[t]`

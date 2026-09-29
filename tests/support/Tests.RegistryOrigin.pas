@@ -191,6 +191,7 @@ begin
     Result.Parameters.Add('serve');
     Result.Parameters.Add('--data-dir');
     Result.Parameters.Add(ADataDirectory);
+    BindRegistryChildToParent(Result);
     try
       Result.Execute;
       Started := GetTickCount64;

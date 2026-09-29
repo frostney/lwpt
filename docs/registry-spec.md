@@ -597,7 +597,8 @@ the current canonical package record bytes with
 `application/vnd.lwpt.registry-package+toml`.
 
 The snapshot parameter is REQUIRED after the first collection or named-package
-page. The first response pins a snapshot and returns it in the page document.
+page, and names a snapshot in the server's accepted history; an unknown
+snapshot or a cursor from another snapshot is `409 snapshot_conflict`. The first response pins a snapshot and returns it in the page document.
 This prevents concurrent publication from duplicating or omitting entries
 between pages. Exact-version lookup also requires a snapshot so yank or restore
 cannot change the selected record during a reproducible operation.
@@ -634,7 +635,21 @@ Content-Type: application/gzip
 
 The origin hashes the complete body before admitting it. An existing identical
 object returns `204 No Content`; a new object returns `201 Created`; a mismatch
-returns `422 Unprocessable Content`. Partial uploads never become visible.
+returns `422 Unprocessable Content`. Partial uploads never become visible. Both
+success responses carry `ETag: "sha256:<hex>"` and no `Location`: an object is
+not a package record, and one object may serve several records.
+
+The request MUST carry an exact `Content-Length` and no `Transfer-Encoding` or
+`Content-Encoding`; otherwise the origin answers `400 invalid_request`. An
+origin applies authentication and its length, concurrency, and storage bounds
+before it reads the body, answering `413 payload_too_large` for a declared
+length over its limit and `507 storage_budget_exceeded` when unreferenced
+uploads would exceed their budget.
+
+A gzip tar archive has exactly one top-level directory. That directory holds
+the package's `lwpt.toml`, whose package name and version are the publication
+identity, and installers strip it on extraction. The origin never decompresses
+an archive; it binds only the hash and size.
 
 ### Publish a package record
 
@@ -645,14 +660,34 @@ Content-Type: application/vnd.lwpt.registry-package+toml
 ```
 
 The archive object MUST already exist. The origin validates canonical form,
-identity, authorization, version ownership, archive hash, and archive size.
+identity, authorization, version ownership, archive hash, and archive size. The
+record's `name` and `version` MUST equal the path, its `origin` MUST equal the
+origin identity, and it MUST have `yanked = false`; yank state changes only
+through the lifecycle endpoints below, so a yanked record is `400
+invalid_request`.
 
-Publication is idempotent:
+A record's **immutable content** is its content identity: `archive`,
+`archive_size`, and `dependencies`. `published_at` and `yanked` are not part of
+it. Publication is idempotent by content identity:
 
-- identical existing record: `204 No Content`;
+- a record whose content identity equals the active record for that package
+  identity, even a yanked one or one with a different `published_at`:
+  `204 No Content`;
 - newly accepted record and checkpoint: `201 Created`;
 - same identity with different immutable content: `409 Conflict`;
-- archive absent: `424 Failed Dependency`.
+- archive absent, or present with a different size: `424 Failed Dependency`.
+
+For a new version, `published_at` MUST be within five minutes of the origin's
+clock; otherwise the origin answers `400 invalid_request`. The origin assigns
+snapshot and checkpoint `published_at` from its own clock, never from the
+request, and refuses to commit (`503 temporary_failure`) while its clock is
+earlier than the active checkpoint's `published_at`.
+
+Record publication, yank, and restore answer `201` or `204` with
+`Location: <base-url>/v1/records/sha256/<hex>.toml`, naming the record active
+for that identity once the request completes. Publication requests MUST NOT
+follow redirects: a client that receives any `3xx` fails instead of sending its
+credential to a second authority.
 
 The origin stages the record, snapshot, and checkpoint privately, then exposes
 the new checkpoint only after every immutable resource is durable. Readers see
@@ -777,13 +812,20 @@ Stable codes include:
 - `authentication_required` (`401`);
 - `permission_denied` (`403`);
 - `not_found` (`404`);
+- `method_not_allowed` (`405`), including publication sent to a mirror or a
+  read-only origin;
 - `identity_conflict` (`409`);
 - `snapshot_conflict` (`409`);
+- `payload_too_large` (`413`);
 - `failed_dependency` (`424`);
 - `unsupported_protocol` (`426`);
 - `object_hash_mismatch` (`422`);
 - `rate_limited` (`429`);
-- `temporary_failure` (`503`).
+- `temporary_failure` (`503`);
+- `storage_budget_exceeded` (`507`).
+
+Error `message` fields are fixed server text. They never echo request content,
+so a credential misplaced in a path, header, or body is not reflected.
 
 Conformance clients also report stable local validation reasons:
 

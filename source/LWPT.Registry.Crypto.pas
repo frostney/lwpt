@@ -22,6 +22,9 @@ type
   TLWPTEd25519PublicKey = array[0..31] of Byte;
   TLWPTEd25519Signature = array[0..63] of Byte;
 
+{ Fills ABuffer with ACount bytes from the operating system's secure random
+  source. }
+procedure RegistryRandomBytes(out ABuffer; const ACount: Integer);
 procedure GenerateEd25519Seed(out ASeed: TLWPTEd25519Seed);
 procedure Ed25519PublicKey(const ASeed: TLWPTEd25519Seed;
   out APublicKey: TLWPTEd25519PublicKey);
@@ -145,24 +148,35 @@ begin
   Result := True;
 end;
 
-procedure GenerateEd25519Seed(out ASeed: TLWPTEd25519Seed);
+procedure RegistryRandomBytes(out ABuffer; const ACount: Integer);
 {$IFDEF UNIX}
 var
   Stream: TFileStream;
 {$ENDIF}
 begin
+  if ACount <= 0 then Exit;
   {$IFDEF UNIX}
   Stream := TFileStream.Create('/dev/urandom', fmOpenRead or fmShareDenyNone);
   try
-    Stream.ReadBuffer(ASeed[0], SizeOf(ASeed));
+    Stream.ReadBuffer(ABuffer, ACount);
   finally
     Stream.Free;
   end;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  if BCryptGenRandom(0, @ASeed[0], SizeOf(ASeed), $00000002) <> 0 then
-    raise ELWPTError.Create('registry_key_generation_failed: secure random source failed');
+  if BCryptGenRandom(0, @ABuffer, ACount, $00000002) <> 0 then
+    raise ELWPTError.Create('registry_random_failed: secure random source failed');
   {$ENDIF}
+end;
+
+procedure GenerateEd25519Seed(out ASeed: TLWPTEd25519Seed);
+begin
+  try
+    RegistryRandomBytes(ASeed[0], SizeOf(ASeed));
+  except
+    on E: ELWPTError do
+      raise ELWPTError.Create('registry_key_generation_failed: secure random source failed');
+  end;
 end;
 
 function RotateRight(const AValue: QWord; const ACount: Integer): QWord;

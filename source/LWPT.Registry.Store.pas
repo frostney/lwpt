@@ -30,6 +30,10 @@ const
   RegistryDefaultMirrorStoreBytes = Int64(32) * 1024 * 1024 * 1024;
   RegistryDefaultMirrorSyncBytes = Int64(8) * 1024 * 1024 * 1024;
   RegistryMinimumMirrorSyncBytes = Int64(1024) * 1024;
+  { Remote publication bounds (ADR-0049). }
+  RegistryMaximumRecordBytes = 64 * 1024;
+  RegistryPublicationLeaseWaitMilliseconds = 5000;
+  RegistryPublishedAtSkewSeconds = 300;
 
 type
   ELWPTRegistryError = class(ELWPTError)
@@ -87,6 +91,38 @@ type
   end;
 
   TLWPTRegistryStore = class;
+
+  TLWPTRegistryCommitOutcome = (rcoCreated, rcoExisting);
+
+  { The record active for an identity once a publication, yank, or restore
+    completes, and the head that serves it. }
+  TLWPTRegistryCommitResult = record
+    Outcome: TLWPTRegistryCommitOutcome;
+    Name, Version, ArchiveHash, RecordHash: string;
+    RecordBytes: TBytes;
+    Sequence: QWord;
+    CheckpointHash: string;
+  end;
+
+  TLWPTRegistryPackageListing = record
+    Name, Version, RecordHash: string;
+  end;
+  TLWPTRegistryPackageListingArray = array of TLWPTRegistryPackageListing;
+
+  { Package identities of one accepted snapshot, sorted by name bytes, then
+    SemVer precedence, then version bytes. Immutable once built. }
+  TLWPTRegistryPackageIndex = class(TInterfacedObject)
+  private
+    FSnapshot: string;
+    FItems: TLWPTRegistryPackageListingArray;
+  public
+    { Index of the first item after the name/version position, or -1 when
+      the position is absent. }
+    function PositionAfter(const AName, AVersion: string): Integer;
+    function FirstOfName(const AName: string): Integer;
+    property Snapshot: string read FSnapshot;
+    property Items: TLWPTRegistryPackageListingArray read FItems;
+  end;
 
   TLWPTRegistryServedResource = record
     StoredPath, Digest: string;
@@ -149,6 +185,9 @@ type
     FGenerationLock: TRTLCriticalSection;
     FHistory: TLWPTRegistryGeneration;
     FHistoryReference: IInterface;
+    FPackageIndexKeys: array of string;
+    FPackageIndexes: array of TLWPTRegistryPackageIndex;
+    FPackageIndexReferences: array of IInterface;
     function HashResource(const ARelative: string;
       AProgress: TSHA256Progress): string;
     procedure CommitCheckpoint(var AState: TLWPTRegistryState;
@@ -162,6 +201,21 @@ type
       AProgress: TSHA256Progress; out ACheckpointDigest,
       ASignatureDigest: string); overload;
     procedure RecoverDerivedState(const AState: TLWPTRegistryState);
+    procedure LoadHead(const AState: TLWPTRegistryState; const AName,
+      AVersion: string; ARecords, AVersionEntries: TStringList;
+      out AActiveHash, AActiveText: string);
+    function ActivateRecords(var AState: TLWPTRegistryState;
+      ARecords: TStrings; const AName: string; AVersionEntries: TStrings;
+      const ACommitTime: string): string;
+    procedure RequireCommitClock(const AState: TLWPTRegistryState;
+      const ANow: string);
+    procedure RequireArchiveObject(const AArchiveHash: string;
+      const AArchiveSize: Int64);
+    { Every publication-lease holder sweeps incoming/. ARequired commits
+      refuse with a retryable busy error when the guard times out; other
+      holders skip the sweep. }
+    procedure SweepIncoming(const AWait, ARequired: Boolean);
+    function ActiveCheckpointHash(const AState: TLWPTRegistryState): string;
   protected
     function RootPath(const ARelative: string): string;
     function TmpRoot: string;
@@ -210,7 +264,24 @@ type
     function LoadResource(const ARelative: string;
       AProgress: TSHA256Progress = nil;
       const AMaxBytes: Int64 = MAX_REGISTRY_RESOURCE_BYTES): TBytes;
+    { Trusted in-process publication of whole archive bytes. APublication's
+      time stamps the record, snapshot, and checkpoint. }
     procedure Publish(const APublication: TLWPTRegistryPublication);
+    { Remote publication of a canonical record whose archive was uploaded to
+      incoming/ or is already committed. The server clock stamps the snapshot
+      and checkpoint. Idempotent by content identity. }
+    function PublishRecord(const ARecordBytes: TBytes;
+      const AExpectedName: string = ''; const AExpectedVersion: string = ''):
+      TLWPTRegistryCommitResult;
+    { Yank (AYanked) or restore the active record of one identity. }
+    function SetYanked(const AName, AVersion: string;
+      const AYanked: Boolean): TLWPTRegistryCommitResult;
+    { The package index of ASnapshot when it is in AView's accepted history,
+      else nil. Indexes are built once per snapshot under the generation lock
+      and keyed by the immutable snapshot hash. }
+    function PackageIndex(AView: TLWPTRegistryReadView;
+      const ASnapshot: string; AProgress: TSHA256Progress;
+      out AReference: IInterface): TLWPTRegistryPackageIndex;
     procedure RotateKey(const AExpectedKeyID, APublishedAt: string);
     property Config: TLWPTRegistryConfig read FConfig;
     property Root: string read FRoot;
@@ -218,6 +289,16 @@ type
 
 function CanonicalRegistryURL(const AValue: string;
   const ARequireHTTPS: Boolean): string;
+{ Creates or, when AReplace, atomically replaces an owner-only file, staged
+  below ATemporaryRoot. }
+procedure RegistryWritePrivateFile(const ADestination, ATemporaryRoot: string;
+  const ABytes: TBytes; const AReplace: Boolean);
+{ The stable code prefix of an ELWPTRegistryError message. }
+function RegistryErrorCode(const AMessage: string): string;
+{ Decision 4 of ADR-0049: until registry dependency sources exist, a record
+  that declares dependencies is refused. Separate so it can be lifted. }
+function RegistryRecordDependenciesSupported(
+  const ADependencyCount: Integer): Boolean;
 function RegistryKeyStoragePath(const AKeyID: string): string;
 function RegistryTOMLQuote(const AValue: string): string;
 function RegistryTimestampNow: string;
@@ -233,18 +314,26 @@ function RegistryDarwinListenAddressSupportedForKernelMajor(
 {$IFDEF DARWIN}
 function RegistryDarwinKernelReleaseMajor: Cardinal;
 {$ENDIF}
+{$IF DEFINED(REGISTRY_TESTING) OR DEFINED(INSTALL_TESTING)}
+{ Pauses publication after its checkpoint is durable and before the pointer
+  is replaced: AReadyPath is written, then AReleasePath is awaited. The test
+  binary drives it from a spawned server to kill publication at that point. }
+procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
+  AReleasePath: string);
+{$ENDIF}
 {$IFDEF REGISTRY_TESTING}
 function RegistryDarwinKernelReleaseMajorForTesting(
   const ARelease: string): Cardinal;
 procedure SetRegistryDarwinKernelReleaseMajorForTesting(
   const AKernelMajor: Cardinal);
 procedure SetRegistryFailurePointForTesting(const APoint: string);
-procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
-  AReleasePath: string);
 procedure SetRegistryRecoveryBarrierForTesting(const AReadyPath,
   AReleasePath: string);
 { Overrides RegistryTimestampNow; an empty value restores the system clock. }
 procedure SetRegistryClockForTesting(const AValue: string);
+{ Disables the ADR-0049 decision-4 dependency refusal so protocol conformance
+  cases with dependency lists can exercise the commit path. }
+procedure SetRegistryDependencyRefusalForTesting(const AEnabled: Boolean);
 function RegistryHistoryBuildsForTesting: Integer;
 { Requests that had to wait for the generation lock. }
 function RegistryGenerationWaitsForTesting: Integer;
@@ -264,6 +353,7 @@ uses
 
   LWPT.ProducerLease,
   LWPT.Registry.Filesystem,
+  LWPT.Registry.Incoming,
   LWPT.Registry.Verification,
   Semver;
 
@@ -286,12 +376,22 @@ var
   RegistryHistoryBuilds: LongInt;
   RegistryGenerationWaits: LongInt;
   RegistryFailurePointForTesting: string;
-  RegistryPublicationReadyPathForTesting: string;
-  RegistryPublicationReleasePathForTesting: string;
   RegistryRecoveryReadyPathForTesting: string;
   RegistryRecoveryReleasePathForTesting: string;
   RegistryDarwinKernelMajorForTesting: Cardinal;
 procedure InjectRegistryFailure(const APoint: string); forward;
+{$ENDIF}
+{$IF DEFINED(REGISTRY_TESTING) OR DEFINED(INSTALL_TESTING)}
+var
+  RegistryPublicationReadyPathForTesting: string;
+  RegistryPublicationReleasePathForTesting: string;
+
+procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
+  AReleasePath: string);
+begin
+  RegistryPublicationReadyPathForTesting := AReadyPath;
+  RegistryPublicationReleasePathForTesting := AReleasePath;
+end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
@@ -358,8 +458,9 @@ begin
   end;
 end;
 
-procedure AtomicCreatePrivateBytes(const ADestination, ATemporaryRoot: string;
-  const ABytes: TBytes);
+procedure WritePrivateBytes(const ADestination, ATemporaryRoot: string;
+  const ABytes: TBytes; const AReplace: Boolean; const ACode,
+  ASubject: string);
 var
   Temporary: string;
   {$IFDEF UNIX}
@@ -375,32 +476,33 @@ var
 begin
   ValidateRegistryPath(ADestination);
   ValidateRegistryPath(ATemporaryRoot);
-  if FileExists(ADestination) or IsDirSymlinkOrJunction(ADestination) then
-    raise ELWPTRegistryError.CreateStable('private_key_exists',
-      'refusing to replace an existing registry signing seed');
+  if IsDirSymlinkOrJunction(ADestination)
+    or (not AReplace and FileExists(ADestination)) then
+    raise ELWPTRegistryError.CreateStable(ACode + '_exists',
+      'refusing to replace an existing ' + ASubject);
   ForceDirectories(ExtractFileDir(ADestination));
   ForceDirectories(ATemporaryRoot);
-  Temporary := MakeTmpPath(ATemporaryRoot, 'private-key');
+  Temporary := MakeTmpPath(ATemporaryRoot, 'private');
   {$IFDEF UNIX}
   Descriptor := FpOpen(PChar(Temporary), O_WRONLY or O_CREAT or O_EXCL,
     &600);
   if Descriptor < 0 then
-    raise ELWPTRegistryError.CreateStable('private_key_permissions',
-      'could not create private registry key staging with mode 0600');
+    raise ELWPTRegistryError.CreateStable(ACode + '_permissions',
+      'could not create private ' + ASubject + ' staging with mode 0600');
   try
     Offset := 0;
     while Offset < Length(ABytes) do
     begin
       Written := FpWrite(Descriptor, ABytes[Offset], Length(ABytes) - Offset);
       if Written <= 0 then
-        raise ELWPTRegistryError.CreateStable('private_key_write_failed',
-          'could not write the complete registry signing seed');
+        raise ELWPTRegistryError.CreateStable(ACode + '_write_failed',
+          'could not write the complete ' + ASubject);
       Inc(Offset, Written);
     end;
     if (FpChmod(Temporary, &600) <> 0) or (FpFStat(Descriptor, FileInfo) <> 0)
       or ((FileInfo.st_mode and &777) <> &600) or (CFSync(Descriptor) <> 0) then
-      raise ELWPTRegistryError.CreateStable('private_key_permissions',
-        'registry signing seed mode 0600 could not be guaranteed');
+      raise ELWPTRegistryError.CreateStable(ACode + '_permissions',
+        ASubject + ' mode 0600 could not be guaranteed');
   finally
     FpClose(Descriptor);
   end;
@@ -410,8 +512,8 @@ begin
   if not ConvertStringSecurityDescriptorToSecurityDescriptorW(
     PWideChar(UnicodeString(PRIVATE_FILE_SDDL)), SDDL_REVISION_1_LWPT,
     SecurityDescriptor, nil) then
-    raise ELWPTRegistryError.CreateStable('private_key_permissions',
-      'could not create the private registry key ACL');
+    raise ELWPTRegistryError.CreateStable(ACode + '_permissions',
+      'could not create the private ' + ASubject + ' ACL');
   try
     FillChar(SecurityAttributes, SizeOf(SecurityAttributes), 0);
     SecurityAttributes.nLength := SizeOf(SecurityAttributes);
@@ -420,18 +522,18 @@ begin
       GENERIC_WRITE, 0, @SecurityAttributes, CREATE_NEW,
       FILE_ATTRIBUTE_NORMAL or FILE_FLAG_WRITE_THROUGH, 0);
     if Handle = INVALID_HANDLE_VALUE then
-      raise ELWPTRegistryError.CreateStable('private_key_permissions',
-        'could not create private registry key staging with an owner-only ACL');
+      raise ELWPTRegistryError.CreateStable(ACode + '_permissions',
+        'could not create private ' + ASubject + ' staging with an owner-only ACL');
     try
       BytesWritten := 0;
       if (Length(ABytes) > 0) and (not Windows.WriteFile(Handle, ABytes[0],
         Length(ABytes), BytesWritten, nil) or
         (BytesWritten <> LongWord(Length(ABytes)))) then
-        raise ELWPTRegistryError.CreateStable('private_key_write_failed',
-          'could not write the complete registry signing seed');
+        raise ELWPTRegistryError.CreateStable(ACode + '_write_failed',
+          'could not write the complete ' + ASubject);
       if not Windows.FlushFileBuffers(Handle) then
-        raise ELWPTRegistryError.CreateStable('private_key_write_failed',
-          'could not commit the private registry signing seed');
+        raise ELWPTRegistryError.CreateStable(ACode + '_write_failed',
+          'could not commit the private ' + ASubject);
     finally
       Windows.CloseHandle(Handle);
     end;
@@ -441,12 +543,35 @@ begin
   {$ENDIF}
   try
     if not AtomicReplaceFile(Temporary, ADestination) then
-      raise ELWPTRegistryError.CreateStable('private_key_write_failed',
-        'could not atomically commit the private registry signing seed');
+      raise ELWPTRegistryError.CreateStable(ACode + '_write_failed',
+        'could not atomically commit the private ' + ASubject);
   except
     SysUtils.DeleteFile(Temporary);
     raise;
   end;
+end;
+
+procedure AtomicCreatePrivateBytes(const ADestination, ATemporaryRoot: string;
+  const ABytes: TBytes);
+begin
+  WritePrivateBytes(ADestination, ATemporaryRoot, ABytes, False,
+    'private_key', 'registry signing seed');
+end;
+
+procedure RegistryWritePrivateFile(const ADestination, ATemporaryRoot: string;
+  const ABytes: TBytes; const AReplace: Boolean);
+begin
+  WritePrivateBytes(ADestination, ATemporaryRoot, ABytes, AReplace,
+    'private_file', 'registry credential record');
+end;
+
+function RegistryErrorCode(const AMessage: string): string;
+var
+  Colon: Integer;
+begin
+  Colon := Pos(':', AMessage);
+  if Colon <= 1 then Exit('');
+  Result := Copy(AMessage, 1, Colon - 1);
 end;
 
 function PersistedTOMLQuote(const AValue: string): string;
@@ -1643,6 +1768,8 @@ end;
 
 destructor TLWPTRegistryStore.Destroy;
 begin
+  SetLength(FPackageIndexes, 0);
+  SetLength(FPackageIndexReferences, 0);
   FHistoryReference := nil;
   DoneCriticalSection(FGenerationLock);
   inherited Destroy;
@@ -2258,6 +2385,7 @@ begin
       VerifyState(State);
       if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
       ForceDirectories(TmpRoot);
+      SweepIncoming(True, False);
       RecoverDerivedState(State);
     end;
   finally
@@ -2705,13 +2833,6 @@ begin
   RegistryFailurePointForTesting := APoint;
 end;
 
-procedure SetRegistryPublicationBarrierForTesting(const AReadyPath,
-  AReleasePath: string);
-begin
-  RegistryPublicationReadyPathForTesting := AReadyPath;
-  RegistryPublicationReleasePathForTesting := AReleasePath;
-end;
-
 procedure SetRegistryRecoveryBarrierForTesting(const AReadyPath,
   AReleasePath: string);
 begin
@@ -2766,6 +2887,9 @@ begin
     Lease := Coordinator.TryAcquire('registry-publication',
       'registry checkpoint renewal');
     if not Assigned(Lease) then Exit;
+    { A renewal holds the publication lease on a read path, so it sweeps
+      only when the staging guard is immediately free. }
+    SweepIncoming(False, False);
     State := ReadCurrentState(AProgress);
     VerifyState(State, AProgress);
     CheckpointText := Text(LoadResource(State.CheckpointPath, AProgress,
@@ -2863,6 +2987,7 @@ begin
     Lease := Coordinator.TryAcquire('registry-publication', 'registry signing key rotation');
     if Lease = nil then
       raise ELWPTRegistryError.CreateStable('publication_locked', 'another publication owns the origin');
+    SweepIncoming(True, False);
     State := ReadCurrentState;
     VerifyState(State);
     KeyID := StringValue(Text(LoadResource(State.CheckpointPath)), 'key_id');
@@ -2931,21 +3056,255 @@ begin
   end;
 end;
 
+function RecordDocument(const AOrigin, AName, AVersion, AArchiveHash: string;
+  const AArchiveSize: Int64; const APublishedAt: string;
+  const AYanked: Boolean; const ADependenciesLine: string): string;
+const
+  YANKED_TEXT: array[Boolean] of string = ('false', 'true');
+begin
+  Result := 'schema = '
+    + PersistedTOMLQuote(PROGRAM_NAME + '-registry-package-v1') + #10
+    + 'origin = ' + PersistedTOMLQuote(AOrigin) + #10
+    + 'name = ' + PersistedTOMLQuote(AName) + #10
+    + 'version = ' + PersistedTOMLQuote(AVersion) + #10
+    + 'archive = ' + PersistedTOMLQuote(AArchiveHash) + #10
+    + 'archive_size = ' + IntToStr(AArchiveSize) + #10
+    + 'published_at = ' + PersistedTOMLQuote(APublishedAt) + #10
+    + 'yanked = ' + YANKED_TEXT[AYanked] + #10
+    + ADependenciesLine + #10;
+end;
+
+{ The final line of a canonical record: its exact dependency encoding. }
+function RecordDependenciesLine(const ARecordText: string): string;
+var
+  Body: string;
+begin
+  Body := Copy(ARecordText, 1, Length(ARecordText) - 1);
+  Result := Copy(Body, LastDelimiter(#10, Body) + 1, MaxInt);
+  if not StartsStr('dependencies = [', Result) then
+    raise ELWPTRegistryError.CreateStable('state_corrupt',
+      'active package record has no canonical dependency line');
+end;
+
+{$IFDEF REGISTRY_TESTING}
+var
+  RegistryDependencyRefusalDisabledForTesting: Boolean;
+
+procedure SetRegistryDependencyRefusalForTesting(const AEnabled: Boolean);
+begin
+  RegistryDependencyRefusalDisabledForTesting := not AEnabled;
+end;
+{$ENDIF}
+
+function RegistryRecordDependenciesSupported(
+  const ADependencyCount: Integer): Boolean;
+begin
+  {$IFDEF REGISTRY_TESTING}
+  if RegistryDependencyRefusalDisabledForTesting then Exit(True);
+  {$ENDIF}
+  Result := ADependencyCount = 0;
+end;
+
+function AcquirePublicationLease(ACoordinator: TLWPTProducerLeaseCoordinator;
+  const ADescription: string): TLWPTProducerLease;
+var
+  Deadline: QWord;
+begin
+  Deadline := GetTickCount64 + RegistryPublicationLeaseWaitMilliseconds;
+  repeat
+    Result := ACoordinator.TryAcquire('registry-publication', ADescription);
+    if Assigned(Result) then Exit;
+    if GetTickCount64 >= Deadline then
+      raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+        'another publication owns the origin');
+    Sleep(10);
+  until False;
+end;
+
+procedure TLWPTRegistryStore.LoadHead(const AState: TLWPTRegistryState;
+  const AName, AVersion: string; ARecords, AVersionEntries: TStringList;
+  out AActiveHash, AActiveText: string);
+var
+  Existing: TStringList;
+  RecordHash, RecordText: string;
+begin
+  AActiveHash := '';
+  AActiveText := '';
+  Existing := ReadSnapshotRecords(Text(LoadResource('snapshots/sha256/'
+    + Copy(AState.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml')));
+  try
+    ARecords.Assign(Existing);
+  finally
+    Existing.Free;
+  end;
+  for RecordHash in ARecords do
+  begin
+    if not IsSHA256(RecordHash) then
+      raise ELWPTRegistryError.CreateStable('state_corrupt',
+        'snapshot contains an invalid record hash');
+    RecordText := RegistryBytesText(LoadResource('records/sha256/'
+      + Copy(RecordHash, Length('sha256:') + 1, MaxInt) + '.toml'));
+    if SHA256BytesPrefixed(BytesOf(RecordText)) <> RecordHash then
+      raise ELWPTRegistryError.CreateStable('record_hash_mismatch',
+        'active package record bytes do not match their path');
+    if StringValue(RecordText, 'name') <> AName then Continue;
+    AVersionEntries.Add(StringValue(RecordText, 'version') + '=' + RecordHash);
+    if StringValue(RecordText, 'version') = AVersion then
+    begin
+      AActiveHash := RecordHash;
+      AActiveText := RecordText;
+    end;
+  end;
+end;
+
+function TLWPTRegistryStore.ActivateRecords(var AState: TLWPTRegistryState;
+  ARecords: TStrings; const AName: string; AVersionEntries: TStrings;
+  const ACommitTime: string): string;
+var
+  IndexPath, KeyID: string;
+  SeedBytes, Snapshot: TBytes;
+  IndexDocument: string;
+  Seed: TLWPTEd25519Seed;
+  {$IF DEFINED(REGISTRY_TESTING) OR DEFINED(INSTALL_TESTING)}
+  BarrierStartedAt: QWord;
+  {$ENDIF}
+begin
+  Snapshot := Bytes(SnapshotDocument(FConfig.Identity, AState.Sequence + 1,
+    ACommitTime, AState.SnapshotHash, ARecords));
+  IndexDocument := VersionIndexDocument(FConfig.Identity, AName,
+    AVersionEntries);
+  IndexPath := RootPath(RegistryIndexStoragePath(AName));
+  {
+    Immutable publication bytes are prepared first. Only current.toml
+    activates them; indexes are derived aliases and follow activation.
+  }
+  KeyID := StringValue(Text(LoadResource(AState.CheckpointPath)), 'key_id');
+  SeedBytes := LoadSeed(KeyID);
+  try
+    Move(SeedBytes[0], Seed[0], SizeOf(Seed));
+    CommitCheckpoint(AState, Snapshot, ACommitTime, KeyID, Seed);
+  finally
+    FillChar(Seed, SizeOf(Seed), 0);
+    if Length(SeedBytes) > 0 then FillChar(SeedBytes[0], Length(SeedBytes), 0);
+  end;
+  Result := 'sha256:' + SHA256Hex(LoadResource(AState.CheckpointPath, nil,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+  {$IFDEF REGISTRY_TESTING}
+  InjectRegistryFailure('checkpoint');
+  {$ENDIF}
+  {$IF DEFINED(REGISTRY_TESTING) OR DEFINED(INSTALL_TESTING)}
+  if RegistryPublicationReadyPathForTesting <> '' then
+  begin
+    AtomicWriteBytes(RegistryPublicationReadyPathForTesting, TmpRoot,
+      Bytes('ready' + #10));
+    BarrierStartedAt := GetTickCount64;
+    while not FileExists(RegistryPublicationReleasePathForTesting) do
+    begin
+      if GetTickCount64 - BarrierStartedAt >= 10000 then
+        raise ELWPTRegistryError.CreateStable('test_barrier_timeout',
+          'publication activation barrier timed out');
+      Sleep(10);
+    end;
+  end;
+  {$ENDIF}
+  AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
+    Bytes(RegistryStateDocument(AState)));
+  {$IFDEF REGISTRY_TESTING}
+  InjectRegistryFailure('activation');
+  {$ENDIF}
+  AtomicWriteBytes(IndexPath, TmpRoot, Bytes(IndexDocument));
+  { No additional commit follows the alias. A crash here is recovered by
+    rebuilding aliases from the authenticated active snapshot. }
+end;
+
+procedure TLWPTRegistryStore.RequireCommitClock(
+  const AState: TLWPTRegistryState; const ANow: string);
+var
+  ActivePublishedAt: string;
+begin
+  CheckpointExpiry(ANow);
+  ActivePublishedAt := StringValue(Text(LoadResource(AState.CheckpointPath,
+    nil, MAX_REGISTRY_CONTROL_DOCUMENT_BYTES)), 'published_at');
+  if ANow < ActivePublishedAt then
+    raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+      'the server clock is behind the active checkpoint');
+end;
+
+procedure TLWPTRegistryStore.RequireArchiveObject(const AArchiveHash: string;
+  const AArchiveSize: Int64);
+var
+  Incoming: TLWPTRegistryIncoming;
+  Hex, Relative, StoredPath: string;
+  Size: Int64;
+  FromIncoming: Boolean;
+begin
+  Hex := Copy(AArchiveHash, Length('sha256:') + 1, MaxInt);
+  Incoming := TLWPTRegistryIncoming.Create(FRoot);
+  try
+    FromIncoming := not FileExists(Incoming.ObjectPath(Hex));
+    if FromIncoming then
+    begin
+      if not FileExists(Incoming.CompletedPath(Hex)) then
+        raise ELWPTRegistryError.CreateStable('failed_dependency',
+          'referenced archive object is not present');
+      Relative := 'incoming/sha256/' + Hex;
+    end
+    else Relative := 'objects/sha256/' + Hex;
+    DescribeResource(Relative, StoredPath, Size);
+    if Size <> AArchiveSize then
+      raise ELWPTRegistryError.CreateStable('failed_dependency',
+        'referenced archive object has a different size');
+    { Completed entries leave incoming/ only under this publication lease, so
+      the rehashed entry is the one adopted below. }
+    if 'sha256:' + HashResource(Relative, nil) <> AArchiveHash then
+    begin
+      if FromIncoming then
+        raise ELWPTRegistryError.CreateStable('failed_dependency',
+          'referenced archive object failed verification');
+      raise ELWPTRegistryError.CreateStable('state_corrupt',
+        'committed archive object failed verification');
+    end;
+    if FromIncoming then Incoming.Adopt(Hex);
+  finally
+    Incoming.Free;
+  end;
+end;
+
+procedure TLWPTRegistryStore.SweepIncoming(const AWait, ARequired: Boolean);
+var
+  Incoming: TLWPTRegistryIncoming;
+  Swept: Boolean;
+begin
+  if FConfig.Role <> rrOrigin then Exit;
+  Incoming := TLWPTRegistryIncoming.Create(FRoot);
+  try
+    Swept := Incoming.Sweep(AWait);
+  finally
+    Incoming.Free;
+  end;
+  if not Swept and ARequired then
+    raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+      'the upload staging guard is busy');
+end;
+
+function TLWPTRegistryStore.ActiveCheckpointHash(
+  const AState: TLWPTRegistryState): string;
+begin
+  Result := 'sha256:' + SHA256Hex(LoadResource(AState.CheckpointPath, nil,
+    MAX_REGISTRY_CONTROL_DOCUMENT_BYTES));
+end;
+
 procedure TLWPTRegistryStore.Publish(
   const APublication: TLWPTRegistryPublication);
 var
   Character: Char;
-  ArchiveHash, ExistingRecordHash, IndexPath, KeyID, RecordHash: string;
-  RecordBytes, SeedBytes, Snapshot: TBytes;
-  ActiveRecordDocument, CurrentSnapshot, IndexDocument, RecordDocument: string;
+  ActiveHash, ActiveText, ArchiveHash, RecordHash: string;
+  RecordBytes: TBytes;
+  Active, Candidate: TLWPTRegistryPackage;
   Coordinator: TLWPTProducerLeaseCoordinator;
   Lease: TLWPTProducerLease;
   Records, VersionEntries: TStringList;
-  Seed: TLWPTEd25519Seed;
   State: TLWPTRegistryState;
-  {$IFDEF REGISTRY_TESTING}
-  BarrierStartedAt: QWord;
-  {$ENDIF}
 begin
   if FConfig.Role = rrMirror then
     raise ELWPTRegistryError.CreateStable('mirror_read_only',
@@ -2961,121 +3320,403 @@ begin
   CheckpointExpiry(APublication.PublishedAt);
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
   Lease := nil;
+  Records := TStringList.Create;
+  Records.Sorted := True;
+  Records.Duplicates := dupError;
+  VersionEntries := TStringList.Create;
+  VersionEntries.Sorted := True;
+  VersionEntries.Duplicates := dupError;
   try
     Lease := Coordinator.TryAcquire('registry-publication',
       'registry snapshot publication');
     if not Assigned(Lease) then
       raise ELWPTRegistryError.CreateStable('publication_locked', 'another publication owns the origin');
+    { Uploads stage under incoming/, never tmp/, so this wipe removes only
+      staging abandoned by an earlier lease holder. }
     if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
     ForceDirectories(TmpRoot);
+    SweepIncoming(True, False);
     State := ReadCurrentState;
     VerifyState(State);
     RecoverDerivedState(State);
     ArchiveHash := SHA256BytesPrefixed(APublication.Archive);
+    RecordBytes := Bytes(RecordDocument(FConfig.Identity, APublication.Name,
+      APublication.Version, ArchiveHash, Length(APublication.Archive),
+      APublication.PublishedAt, False, 'dependencies = []'));
+    RecordHash := SHA256BytesPrefixed(RecordBytes);
+    LoadHead(State, APublication.Name, APublication.Version, Records,
+      VersionEntries, ActiveHash, ActiveText);
+    if ActiveHash <> '' then
+    begin
+      Active := ParseRegistryPackage(ActiveText, ActiveHash, FConfig.Identity);
+      Candidate := ParseRegistryPackage(RegistryBytesText(RecordBytes),
+        RecordHash, FConfig.Identity);
+      if RegistryPackageContentEqual(Active, Candidate) then Exit;
+      raise ELWPTRegistryError.CreateStable('identity_conflict',
+        'package version is immutable: ' + APublication.Name + '@'
+        + APublication.Version);
+    end;
     WriteImmutable('objects/sha256/' + Copy(ArchiveHash,
       Length('sha256:') + 1, MaxInt), APublication.Archive);
-    RecordDocument := 'schema = '
-      + PersistedTOMLQuote(PROGRAM_NAME + '-registry-package-v1') + #10
-      + 'origin = ' + PersistedTOMLQuote(FConfig.Identity) + #10
-      + 'name = ' + PersistedTOMLQuote(APublication.Name) + #10
-      + 'version = ' + PersistedTOMLQuote(APublication.Version) + #10
-      + 'archive = ' + PersistedTOMLQuote(ArchiveHash) + #10
-      + 'archive_size = ' + IntToStr(Length(APublication.Archive)) + #10
-      + 'published_at = ' + PersistedTOMLQuote(APublication.PublishedAt) + #10
-      + 'yanked = false' + #10
-      + 'dependencies = []' + #10;
-    RecordBytes := Bytes(RecordDocument);
+    WriteImmutable('records/sha256/' + Copy(RecordHash,
+      Length('sha256:') + 1, MaxInt) + '.toml', RecordBytes);
+    VersionEntries.Add(APublication.Version + '=' + RecordHash);
+    Records.Add(RecordHash);
+    ActivateRecords(State, Records, APublication.Name, VersionEntries,
+      APublication.PublishedAt);
+  finally
+    VersionEntries.Free;
+    Records.Free;
+    Lease.Free;
+    Coordinator.Free;
+  end;
+end;
+
+function TLWPTRegistryStore.PublishRecord(const ARecordBytes: TBytes;
+  const AExpectedName, AExpectedVersion: string): TLWPTRegistryCommitResult;
+var
+  ActiveHash, ActiveText, CommitTime, RecordHash, RecordText: string;
+  Active, Candidate: TLWPTRegistryPackage;
+  ClientTime, ServerTime: TDateTime;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Incoming: TLWPTRegistryIncoming;
+  Lease: TLWPTProducerLease;
+  Records, VersionEntries: TStringList;
+  State: TLWPTRegistryState;
+begin
+  Result := Default(TLWPTRegistryCommitResult);
+  if FConfig.Role = rrMirror then
+    raise ELWPTRegistryError.CreateStable('method_not_allowed',
+      'mirrors do not accept publication');
+  if Length(ARecordBytes) > RegistryMaximumRecordBytes then
+    raise ELWPTRegistryError.CreateStable('payload_too_large',
+      'package record exceeds 64 KiB');
+  RecordText := RegistryBytesText(ARecordBytes);
+  RecordHash := SHA256BytesPrefixed(ARecordBytes);
+  try
+    Candidate := ParseRegistryPackage(RecordText, RecordHash, FConfig.Identity);
+  except
+    on E: ELWPTRegistryError do
+      raise ELWPTRegistryError.CreateStable('invalid_request',
+        'package record is not a canonical record for this origin');
+  end;
+  if ((AExpectedName <> '') and (Candidate.Name <> AExpectedName))
+    or ((AExpectedVersion <> '') and (Candidate.Version <> AExpectedVersion)) then
+    raise ELWPTRegistryError.CreateStable('invalid_request',
+      'package record identity differs from the request path');
+  if Candidate.Yanked then
+    raise ELWPTRegistryError.CreateStable('invalid_request',
+      'yanked state changes only through the yank endpoints');
+  if not RegistryRecordDependenciesSupported(Length(Candidate.Dependencies)) then
+    raise ELWPTRegistryError.CreateStable('invalid_request',
+      'records that declare dependencies are not accepted yet');
+  Result.Name := Candidate.Name;
+  Result.Version := Candidate.Version;
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
+  Incoming := TLWPTRegistryIncoming.Create(FRoot);
+  Lease := nil;
+  Records := TStringList.Create;
+  Records.Sorted := True;
+  Records.Duplicates := dupError;
+  VersionEntries := TStringList.Create;
+  VersionEntries.Sorted := True;
+  VersionEntries.Duplicates := dupError;
+  try
+    Lease := AcquirePublicationLease(Coordinator, 'registry remote publication');
+    { A guard timeout refuses before anything changes, whether or not the
+      commit would need to adopt an object. }
+    if not Incoming.Sweep then
+      raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+        'the upload staging guard is busy');
+    State := ReadCurrentState;
+    VerifyState(State);
+    RecoverDerivedState(State);
+    CommitTime := RegistryTimestampNow;
+    RequireCommitClock(State, CommitTime);
+    LoadHead(State, Candidate.Name, Candidate.Version, Records,
+      VersionEntries, ActiveHash, ActiveText);
+    if ActiveHash <> '' then
+    begin
+      Active := ParseRegistryPackage(ActiveText, ActiveHash, FConfig.Identity);
+      if not RegistryPackageContentEqual(Active, Candidate) then
+        raise ELWPTRegistryError.CreateStable('identity_conflict',
+          'package identity already has different immutable content');
+      Result.Outcome := rcoExisting;
+      Result.ArchiveHash := Active.ArchiveHash;
+      Result.RecordHash := ActiveHash;
+      Result.RecordBytes := BytesOf(ActiveText);
+      Result.Sequence := State.Sequence;
+      Result.CheckpointHash := ActiveCheckpointHash(State);
+      Exit;
+    end;
+    if not TryISO8601ToDate(Candidate.PublishedAt, ClientTime, True)
+      or not TryISO8601ToDate(CommitTime, ServerTime, True)
+      or (Abs(SecondsBetween(ClientTime, ServerTime))
+        > RegistryPublishedAtSkewSeconds) then
+      raise ELWPTRegistryError.CreateStable('invalid_request',
+        'published_at is outside the server clock window');
+    RequireArchiveObject(Candidate.ArchiveHash, Candidate.ArchiveSize);
+    WriteImmutable('records/sha256/' + Copy(RecordHash,
+      Length('sha256:') + 1, MaxInt) + '.toml', ARecordBytes);
+    VersionEntries.Add(Candidate.Version + '=' + RecordHash);
+    Records.Add(RecordHash);
+    Result.CheckpointHash := ActivateRecords(State, Records, Candidate.Name,
+      VersionEntries, CommitTime);
+    Result.Outcome := rcoCreated;
+    Result.ArchiveHash := Candidate.ArchiveHash;
+    Result.RecordHash := RecordHash;
+    Result.RecordBytes := Copy(ARecordBytes);
+    Result.Sequence := State.Sequence;
+  finally
+    VersionEntries.Free;
+    Records.Free;
+    Lease.Free;
+    Incoming.Free;
+    Coordinator.Free;
+  end;
+end;
+
+function TLWPTRegistryStore.SetYanked(const AName, AVersion: string;
+  const AYanked: Boolean): TLWPTRegistryCommitResult;
+var
+  ActiveHash, ActiveText, CommitTime, RecordHash: string;
+  Active: TLWPTRegistryPackage;
+  RecordBytes: TBytes;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Incoming: TLWPTRegistryIncoming;
+  Lease: TLWPTProducerLease;
+  Records, VersionEntries: TStringList;
+  State: TLWPTRegistryState;
+begin
+  Result := Default(TLWPTRegistryCommitResult);
+  Result.Name := AName;
+  Result.Version := AVersion;
+  if FConfig.Role = rrMirror then
+    raise ELWPTRegistryError.CreateStable('method_not_allowed',
+      'mirrors do not accept publication');
+  if not RegistryPackageNameIsCanonical(AName)
+    or not RegistryVersionIsCanonical(AVersion) then
+    raise ELWPTRegistryError.CreateStable('not_found',
+      'package version was not found');
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
+  Incoming := TLWPTRegistryIncoming.Create(FRoot);
+  Lease := nil;
+  Records := TStringList.Create;
+  Records.Sorted := True;
+  Records.Duplicates := dupError;
+  VersionEntries := TStringList.Create;
+  VersionEntries.Sorted := True;
+  VersionEntries.Duplicates := dupError;
+  try
+    Lease := AcquirePublicationLease(Coordinator, 'registry yank or restore');
+    { A guard timeout refuses before anything changes, whether or not the
+      commit would need to adopt an object. }
+    if not Incoming.Sweep then
+      raise ELWPTRegistryBusy.CreateStable('temporary_failure',
+        'the upload staging guard is busy');
+    State := ReadCurrentState;
+    VerifyState(State);
+    RecoverDerivedState(State);
+    CommitTime := RegistryTimestampNow;
+    RequireCommitClock(State, CommitTime);
+    LoadHead(State, AName, AVersion, Records, VersionEntries, ActiveHash,
+      ActiveText);
+    if ActiveHash = '' then
+      raise ELWPTRegistryError.CreateStable('not_found',
+        'package version was not found');
+    Active := ParseRegistryPackage(ActiveText, ActiveHash, FConfig.Identity);
+    Result.ArchiveHash := Active.ArchiveHash;
+    if Active.Yanked = AYanked then
+    begin
+      Result.Outcome := rcoExisting;
+      Result.RecordHash := ActiveHash;
+      Result.RecordBytes := BytesOf(ActiveText);
+      Result.Sequence := State.Sequence;
+      Result.CheckpointHash := ActiveCheckpointHash(State);
+      Exit;
+    end;
+    { The replacement differs only in yanked and published_at; archive, size,
+      and the exact dependency encoding are carried over. }
+    RecordBytes := Bytes(RecordDocument(FConfig.Identity, AName, AVersion,
+      Active.ArchiveHash, Active.ArchiveSize, CommitTime, AYanked,
+      RecordDependenciesLine(ActiveText)));
     RecordHash := SHA256BytesPrefixed(RecordBytes);
     WriteImmutable('records/sha256/' + Copy(RecordHash,
       Length('sha256:') + 1, MaxInt) + '.toml', RecordBytes);
-    CurrentSnapshot := Text(LoadResource('snapshots/sha256/'
-      + Copy(State.SnapshotHash, Length('sha256:') + 1, MaxInt) + '.toml'));
-    VersionEntries := TStringList.Create;
-    VersionEntries.Sorted := True;
-    VersionEntries.Duplicates := dupError;
-    VersionEntries.NameValueSeparator := '=';
-    Records := ReadSnapshotRecords(CurrentSnapshot);
-    try
-      for ExistingRecordHash in Records do
+    Records.Delete(Records.IndexOf(ActiveHash));
+    Records.Add(RecordHash);
+    VersionEntries.Delete(VersionEntries.IndexOf(AVersion + '=' + ActiveHash));
+    VersionEntries.Add(AVersion + '=' + RecordHash);
+    Result.CheckpointHash := ActivateRecords(State, Records, AName,
+      VersionEntries, CommitTime);
+    Result.Outcome := rcoCreated;
+    Result.RecordHash := RecordHash;
+    Result.RecordBytes := RecordBytes;
+    Result.Sequence := State.Sequence;
+  finally
+    VersionEntries.Free;
+    Records.Free;
+    Lease.Free;
+    Incoming.Free;
+    Coordinator.Free;
+  end;
+end;
+
+function CompareListings(const ALeft,
+  ARight: TLWPTRegistryPackageListing): Integer;
+begin
+  Result := CompareStr(ALeft.Name, ARight.Name);
+  if Result <> 0 then Exit;
+  Result := Semver.Compare(ALeft.Version, ARight.Version, DefaultSemverOptions);
+  if Result = 0 then Result := CompareStr(ALeft.Version, ARight.Version);
+end;
+
+procedure SortListings(var AItems: TLWPTRegistryPackageListingArray);
+var
+  Scratch: TLWPTRegistryPackageListingArray;
+
+  procedure MergeSort(const ALow, AHigh: Integer);
+  var
+    Middle, Left, Right, Target: Integer;
+  begin
+    if AHigh <= ALow then Exit;
+    Middle := ALow + (AHigh - ALow) div 2;
+    MergeSort(ALow, Middle);
+    MergeSort(Middle + 1, AHigh);
+    Left := ALow;
+    Right := Middle + 1;
+    Target := ALow;
+    while (Left <= Middle) and (Right <= AHigh) do
+    begin
+      if CompareListings(AItems[Left], AItems[Right]) <= 0 then
       begin
-        if not IsSHA256(ExistingRecordHash) then
-          raise ELWPTRegistryError.CreateStable('state_corrupt',
-            'snapshot contains an invalid record hash');
-        ActiveRecordDocument := Text(LoadResource('records/sha256/'
-          + Copy(ExistingRecordHash, Length('sha256:') + 1, MaxInt)
-          + '.toml'));
-        if SHA256BytesPrefixed(Bytes(ActiveRecordDocument))
-          <> ExistingRecordHash then
-          raise ELWPTRegistryError.CreateStable('record_hash_mismatch',
-            'active package record bytes do not match their path');
-        if StringValue(ActiveRecordDocument, 'name') = APublication.Name then
-        begin
-          VersionEntries.Add(StringValue(ActiveRecordDocument, 'version')
-            + '=' + ExistingRecordHash);
-          if StringValue(ActiveRecordDocument, 'version')
-            = APublication.Version then
-          begin
-            if ExistingRecordHash = RecordHash then Exit;
-            raise ELWPTRegistryError.CreateStable('identity_conflict',
-              'package version is immutable: ' + APublication.Name + '@'
-              + APublication.Version);
-          end;
-        end;
+        Scratch[Target] := AItems[Left];
+        Inc(Left);
+      end
+      else
+      begin
+        Scratch[Target] := AItems[Right];
+        Inc(Right);
       end;
-      VersionEntries.Add(APublication.Version + '=' + RecordHash);
-      Records.Add(RecordHash);
-      Snapshot := Bytes(SnapshotDocument(FConfig.Identity,
-        State.Sequence + 1, APublication.PublishedAt, State.SnapshotHash,
-        Records));
-      IndexDocument := VersionIndexDocument(FConfig.Identity,
-        APublication.Name, VersionEntries);
+      Inc(Target);
+    end;
+    while Left <= Middle do
+    begin
+      Scratch[Target] := AItems[Left];
+      Inc(Left);
+      Inc(Target);
+    end;
+    while Right <= AHigh do
+    begin
+      Scratch[Target] := AItems[Right];
+      Inc(Right);
+      Inc(Target);
+    end;
+    for Target := ALow to AHigh do AItems[Target] := Scratch[Target];
+  end;
+
+begin
+  SetLength(Scratch, Length(AItems));
+  MergeSort(0, High(AItems));
+end;
+
+function TLWPTRegistryPackageIndex.PositionAfter(const AName,
+  AVersion: string): Integer;
+var
+  Index: Integer;
+begin
+  for Index := 0 to High(FItems) do
+    if (FItems[Index].Name = AName) and (FItems[Index].Version = AVersion) then
+      Exit(Index + 1);
+  Result := -1;
+end;
+
+function TLWPTRegistryPackageIndex.FirstOfName(const AName: string): Integer;
+var
+  Index: Integer;
+begin
+  for Index := 0 to High(FItems) do
+    if FItems[Index].Name = AName then Exit(Index);
+  Result := -1;
+end;
+
+function TLWPTRegistryStore.PackageIndex(AView: TLWPTRegistryReadView;
+  const ASnapshot: string; AProgress: TSHA256Progress;
+  out AReference: IInterface): TLWPTRegistryPackageIndex;
+const
+  MAX_CACHED_PACKAGE_INDEXES = 8;
+var
+  Digest, RecordDigest, RecordHash, StoredPath: string;
+  RecordBytes, SnapshotBytes: TBytes;
+  Records: TStringList;
+  Index, Slot: Integer;
+  Package: TLWPTRegistryPackage;
+  Built: TLWPTRegistryPackageIndex;
+begin
+  Result := nil;
+  AReference := nil;
+  if not IsSHA256(ASnapshot) then Exit;
+  { Membership resolves before the generation lock, so an origin view loads
+    its shared history without re-entering the lock. }
+  if not AView.Resolve('snapshots/sha256/' + Copy(ASnapshot, 8, 64) + '.toml',
+    StoredPath, Digest, AProgress) then Exit;
+  EnterGeneration(AProgress);
+  try
+    for Slot := 0 to High(FPackageIndexKeys) do
+      if FPackageIndexKeys[Slot] = ASnapshot then
+      begin
+        AReference := FPackageIndexReferences[Slot];
+        Exit(FPackageIndexes[Slot]);
+      end;
+    SnapshotBytes := LoadResource(StoredPath, AProgress,
+      MAX_REGISTRY_CONTROL_DOCUMENT_BYTES * 4);
+    if SHA256BytesPrefixed(SnapshotBytes) <> ASnapshot then
+      raise ELWPTRegistryError.CreateStable('snapshot_hash_mismatch',
+        'stored snapshot bytes do not match their hash');
+    Built := TLWPTRegistryPackageIndex.Create;
+    AReference := Built;
+    Built.FSnapshot := ASnapshot;
+    Records := ReadSnapshotRecords(Text(SnapshotBytes));
+    try
+      SetLength(Built.FItems, Records.Count);
+      Index := 0;
+      for RecordHash in Records do
+      begin
+        if Assigned(AProgress) then AProgress;
+        if not IsSHA256(RecordHash) or not AView.Resolve('records/sha256/'
+          + Copy(RecordHash, 8, 64) + '.toml', StoredPath, RecordDigest,
+          AProgress) then
+          raise ELWPTRegistryError.CreateStable('state_corrupt',
+            'snapshot names a record outside accepted history');
+        RecordBytes := LoadResource(StoredPath, AProgress,
+          MAX_REGISTRY_CONTROL_DOCUMENT_BYTES);
+        Package := ParseRegistryPackage(RegistryBytesText(RecordBytes),
+          RecordHash, FConfig.Identity);
+        Built.FItems[Index].Name := Package.Name;
+        Built.FItems[Index].Version := Package.Version;
+        Built.FItems[Index].RecordHash := RecordHash;
+        Inc(Index);
+      end;
     finally
       Records.Free;
-      VersionEntries.Free;
     end;
-    IndexPath := RootPath(RegistryIndexStoragePath(APublication.Name));
-    {
-      Immutable publication bytes are prepared first. Only current.toml
-      activates them; indexes are derived aliases and follow activation.
-    }
-    KeyID := StringValue(Text(LoadResource(State.CheckpointPath)), 'key_id');
-    SeedBytes := LoadSeed(KeyID);
-    try
-      Move(SeedBytes[0], Seed[0], SizeOf(Seed));
-      CommitCheckpoint(State, Snapshot, APublication.PublishedAt, KeyID, Seed);
-    finally
-      FillChar(Seed, SizeOf(Seed), 0);
-      if Length(SeedBytes) > 0 then FillChar(SeedBytes[0], Length(SeedBytes), 0);
-    end;
-    {$IFDEF REGISTRY_TESTING}
-    InjectRegistryFailure('checkpoint');
-    {$ENDIF}
-    {$IFDEF REGISTRY_TESTING}
-    if RegistryPublicationReadyPathForTesting <> '' then
+    SortListings(Built.FItems);
+    if Length(FPackageIndexKeys) >= MAX_CACHED_PACKAGE_INDEXES then
     begin
-      AtomicWriteBytes(RegistryPublicationReadyPathForTesting, TmpRoot,
-        Bytes('ready' + #10));
-      BarrierStartedAt := GetTickCount64;
-      while not FileExists(RegistryPublicationReleasePathForTesting) do
-      begin
-        if GetTickCount64 - BarrierStartedAt >= 10000 then
-          raise ELWPTRegistryError.CreateStable('test_barrier_timeout',
-            'publication activation barrier timed out');
-        Sleep(10);
-      end;
+      SetLength(FPackageIndexKeys, 0);
+      SetLength(FPackageIndexes, 0);
+      SetLength(FPackageIndexReferences, 0);
     end;
-    {$ENDIF}
-    AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
-      Bytes(RegistryStateDocument(State)));
-    {$IFDEF REGISTRY_TESTING}
-    InjectRegistryFailure('activation');
-    {$ENDIF}
-    AtomicWriteBytes(IndexPath, TmpRoot, Bytes(IndexDocument));
-    { No additional commit follows the alias. A crash here is recovered by
-      rebuilding aliases from the authenticated active snapshot. }
+    Slot := Length(FPackageIndexKeys);
+    SetLength(FPackageIndexKeys, Slot + 1);
+    SetLength(FPackageIndexes, Slot + 1);
+    SetLength(FPackageIndexReferences, Slot + 1);
+    FPackageIndexKeys[Slot] := ASnapshot;
+    FPackageIndexes[Slot] := Built;
+    FPackageIndexReferences[Slot] := AReference;
+    Result := Built;
   finally
-    Lease.Free;
-    Coordinator.Free;
+    LeaveGeneration;
   end;
 end;
 

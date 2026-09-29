@@ -17,7 +17,7 @@ lwpt format    format uses-clauses + identifiers   [--check]
 lwpt duplication report manifest-scoped Pascal token clones   [--json]
 lwpt test      discover, compile and run *.Test.pas files   [--jobs N] [--bail N]
 lwpt repair    reclaim install, build-session, and worker-lease residue
-lwpt registry  run a self-hosted registry origin or verified mirror   <init|sync|verify|rotate-key|serve>
+lwpt registry  run a self-hosted registry origin or verified mirror   <init|sync|verify|rotate-key|issue-token|revoke-token|serve>
 lwpt run       invoke a user-declared run task (or alias a subcommand)
 lwpt health    report Pascal complexity and optional Git hotspots   [--json] [--hotspots]
 lwpt agents    write/verify the agent-facing command reference in AGENTS.md   [--check]
