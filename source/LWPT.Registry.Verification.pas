@@ -160,6 +160,11 @@ function ValidateRegistryCapabilities(const AContent, ARole: string;
 function RegistryURIIsCanonical(const AValue: string;
   const AAllowLocalhostHTTP: Boolean): Boolean;
 function RegistryHashIsCanonical(const AValue: string): Boolean;
+{ Protocol 1 package-name grammar: 1-128 bytes of [a-z0-9._-], starting
+  with a letter or digit. }
+function RegistryPackageNameIsCanonical(const AValue: string): Boolean;
+{ Canonical SemVer 2.0.0 with no 'v' prefix. }
+function RegistryVersionIsCanonical(const AValue: string): Boolean;
 { RFC 3339 UTC with whole seconds and the Z suffix. }
 function RegistryTimestampIsCanonical(const AValue: string): Boolean;
 function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;
@@ -379,6 +384,11 @@ begin
   for I := 2 to Length(AValue) do
     if not (AValue[I] in ['a'..'z', '0'..'9', '.', '_', '-']) then
       Exit(False);
+end;
+
+function RegistryVersionIsCanonical(const AValue: string): Boolean;
+begin
+  Result := IsCanonicalVersion(AValue);
 end;
 
 function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;

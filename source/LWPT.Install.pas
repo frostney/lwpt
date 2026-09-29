@@ -157,6 +157,7 @@ uses
   {$IFDEF UNIX} BaseUnix, {$ENDIF}
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
   HTTPClient,
+  LWPT.Archive,
   LWPT.FetchPolicy,
   LWPT.GitPack,
   LWPT.GitProtocol,
@@ -1231,45 +1232,9 @@ end;
   (e.g. GocciaScript-main/...); StripComponents=1 removes it so Dest holds
   the package contents directly, which keeps -Fu paths clean.
   =========================================================================== }
-function StripFirstComponent(const AName: string): string;
-var P: Integer;
-begin
-  Result := StringReplace(AName, '\', '/', [rfReplaceAll]);
-  P := Pos('/', Result);
-  if P > 0 then
-    Result := Copy(Result, P + 1, MaxInt)
-  else
-    Result := '';   { the top-level dir entry itself — skip }
-end;
-
-{ Parse an octal field from a tar header (NUL/space terminated). }
-function TarOctal(const ABlock: array of Byte; AOffset, ALen: Integer): Int64;
-var i: Integer; C: Byte;
-begin
-  Result := 0;
-  for i := AOffset to AOffset + ALen - 1 do
-  begin
-    C := ABlock[i];
-    if (C = 0) or (C = Ord(' ')) then
-    begin
-      if Result = 0 then Continue else Break;
-    end;
-    if (C >= Ord('0')) and (C <= Ord('7')) then
-      Result := (Result shl 3) or Int64(C - Ord('0'));
-  end;
-end;
-
-{ Read a NUL-terminated string from a tar header field. }
-function TarStr(const ABlock: array of Byte; AOffset, ALen: Integer): string;
-var i: Integer;
-begin
-  Result := '';
-  for i := AOffset to AOffset + ALen - 1 do
-  begin
-    if ABlock[i] = 0 then Break;
-    Result := Result + Chr(ABlock[i]);
-  end;
-end;
+{ StripFirstComponent, TarOctal, and TarStr live in LWPT.Archive, shared
+  with the publication archive scan (ADR-0049), so both read a tar header
+  the same way. }
 
 { ===========================================================================
   Archive extraction — gunzip (LWPT.Gzip) then a direct ustar/POSIX tar reader.
@@ -1307,15 +1272,6 @@ begin
     Result := '';   { outside the requested subsection — skip }
 end;
 
-function LooksLikeAbsoluteArchivePath(const APath: string): Boolean;
-begin
-  Result := (APath <> '') and ((APath[1] = '/') or (APath[1] = '\'));
-  if Result then Exit;
-  Result := (Length(APath) >= 2)
-        and (APath[1] in ['a'..'z', 'A'..'Z'])
-        and (APath[2] = ':');
-end;
-
 function PathIsInsideRoot(const ARoot, APath: string): Boolean;
 var
   Root, Candidate: string;
@@ -1329,22 +1285,8 @@ begin
   {$ENDIF}
 end;
 
-function ArchiveRelPathHasParentSegment(const ARelPath: string): Boolean;
-var
-  S, Part: string;
-  StartAt, i: Integer;
-begin
-  Result := False;
-  S := StringReplace(ARelPath, '\', '/', [rfReplaceAll]);
-  StartAt := 1;
-  for i := 1 to Length(S) + 1 do
-    if (i > Length(S)) or (S[i] = '/') then
-    begin
-      Part := Copy(S, StartAt, i - StartAt);
-      if Part = '..' then Exit(True);
-      StartAt := i + 1;
-    end;
-end;
+{ LooksLikeAbsoluteArchivePath and ArchiveRelPathHasParentSegment live in
+  LWPT.Archive, shared with the publication archive layer (ADR-0049). }
 
 function ResolveArchiveOutputPath(const ADest, ARelName: string): string;
 var
@@ -1491,7 +1433,7 @@ const
   ArchiveDirectoryPathLimit = MaxPathLen - 1;
   {$ENDIF}
   { NAME_MAX on Unix; the per-component limit on Windows. }
-  ArchiveNameComponentLimit = 255;
+  ArchiveNameComponentLimit = ARCHIVE_NAME_COMPONENT_LIMIT;
 
 function PlatformPathLength(const APath: string): Integer;
 begin
