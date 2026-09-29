@@ -745,13 +745,15 @@ begin
   Expect<Integer>(Response.Status).ToBe(400);
   Expect<Boolean>(Pos('code = "invalid_request"', RawHTTPBodyText(Response)) > 0)
     .ToBe(True);
-  { The same name on another origin is another package. }
+  { None of the idempotent, conflicting, or refused requests above moved the
+    head. }
+  Expect<string>(LatestCheckpointHash).ToBe(Head);
+  { The same name on another origin is another package, and publishes. }
   Expect<Integer>(PublishText('other-lib', '1.0.0', RecordText('other-lib',
     '1.0.0', Archive, RegistryTimestampNow, False,
     '[{ origin = "https://other.example.com", name = "other-lib", '
     + 'version = "^1.0.0" }]')).Status).ToBe(201);
-  Head := LatestCheckpointHash;
-  Expect<string>(LatestCheckpointHash).ToBe(Head);
+  Expect<Boolean>(LatestCheckpointHash <> Head).ToBe(True);
 end;
 
 procedure TRegistryPublicationContract.TestYankAndRestore;
