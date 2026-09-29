@@ -67,7 +67,7 @@ type
     FAttempted, FAcquired, FUnreachable: Boolean;
     FVerified: TLWPTVerifiedRegistry;
     FAPI, FContact, FFailures: string;
-    FAccepted: TLWPTRegistryConsumerState;
+    FAccepted, FUserAccepted: TLWPTRegistryConsumerState;
     FProofRotations: TLWPTRegistryRotationProofArray;
     FLockTables: TLWPTRegistryLockTableArray;
     function Contacts: TStringArray;
@@ -98,7 +98,12 @@ type
     property Unreachable: Boolean read FUnreachable;
     property Failures: string read FFailures;
     property Verified: TLWPTVerifiedRegistry read FVerified;
+    { The merged accepted state for the lock: per-user state, the lock's
+      recorded state, and this acquisition. }
     property Accepted: TLWPTRegistryConsumerState read FAccepted;
+    { What per-user state may absorb: its own prior and the authenticated
+      head only, never unsigned project state such as a lock's floor. }
+    property UserAccepted: TLWPTRegistryConsumerState read FUserAccepted;
     property ProofRotations: TLWPTRegistryRotationProofArray read FProofRotations;
     property Contact: string read FContact;
   end;
@@ -622,6 +627,7 @@ end;
 function TLWPTRegistrySession.Trust: TLWPTRegistryTrust;
 begin
   Result.Origin := FIdentity;
+  if Result.Origin = '' then Result.Origin := FLockedIdentity;
   Result.KeyId := FDeclaration.KeyId;
   Result.PublicKey := FDeclaration.PublicKey;
 end;
@@ -797,6 +803,10 @@ begin
     { The merged maximum carries the floor forward even when the head's own
       publication time is earlier than an accepted one. }
     FAccepted := MergeRegistryAcceptedStates(Prior, FAccepted);
+    FUserAccepted.State := Head.State;
+    FUserAccepted.State.ClockFloor := Head.State.PublishedAt;
+    FUserAccepted.Rotations := RegistryRotationHashes(Head.Proof.Rotations);
+    FUserAccepted := MergeRegistryAcceptedStates(UserState, FUserAccepted);
     FAPI := Acquisition.Discovery.API;
     FContact := AContact;
     FAcquired := True;

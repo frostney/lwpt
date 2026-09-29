@@ -5476,7 +5476,7 @@ begin
         if not RegistrySession.Acquired then Continue;
         try
           MergeRegistryConsumerState(RegistrySession.Identity,
-            RegistrySession.Declaration.KeyId, RegistrySession.Accepted);
+            RegistrySession.Declaration.KeyId, RegistrySession.UserAccepted);
         except
           on E: Exception do
             WriteLn(ErrOutput, 'warning: per-user registry state for ',
