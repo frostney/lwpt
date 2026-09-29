@@ -47,6 +47,13 @@ type
     FPort: Word;
     FServe: TProcess;
     FOutputs: string;
+    { A `registry serve` child in FScratch that, on Linux, cannot outlive
+      this test program even when the program is killed. }
+    function NewServeProcess(const ABinary: string;
+      const AEnvironment: array of string): TProcess;
+    { Removes a scratch root, retrying while exited children finish
+      releasing their handles; a failure is reported, never raised. }
+    procedure ReleaseScratch;
     procedure InitOrigin;
     procedure StartServe(const ABinary: string; const AEnvironment: array of string);
     procedure KillServe;
@@ -118,17 +125,7 @@ var
   Started: QWord;
   Ready: Boolean;
 begin
-  FServe := TProcess.Create(nil);
-  FServe.Executable := ABinary;
-  FServe.CurrentDirectory := FScratch;
-  FServe.Options := [poUsePipes];
-  FServe.Parameters.Add('registry');
-  FServe.Parameters.Add('serve');
-  FServe.Parameters.Add('--data-dir');
-  FServe.Parameters.Add(FData);
-  if Length(AEnvironment) > 0 then
-    ConfigureProcessEnvironment(FServe, AEnvironment);
-  FServe.Execute;
+  FServe := NewServeProcess(ABinary, AEnvironment);
   Started := GetTickCount64;
   Ready := False;
   repeat
@@ -147,6 +144,49 @@ begin
     raise Exception.Create('registry serve did not become ready: ' + FOutputs);
 end;
 
+function TRegistryPublicationE2E.NewServeProcess(const ABinary: string;
+  const AEnvironment: array of string): TProcess;
+begin
+  Result := TProcess.Create(nil);
+  try
+    Result.Executable := ABinary;
+    Result.CurrentDirectory := FScratch;
+    Result.Options := [poUsePipes];
+    Result.Parameters.Add('registry');
+    Result.Parameters.Add('serve');
+    Result.Parameters.Add('--data-dir');
+    Result.Parameters.Add(FData);
+    if Length(AEnvironment) > 0 then
+      ConfigureProcessEnvironment(Result, AEnvironment);
+    BindRegistryChildToParent(Result);
+    Result.Execute;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure TRegistryPublicationE2E.ReleaseScratch;
+var
+  Started: QWord;
+  Failure: string;
+begin
+  if FScratch = '' then Exit;
+  Started := GetTickCount64;
+  repeat
+    try
+      RecursiveDelete(FScratch);
+      FScratch := '';
+      Exit;
+    except
+      on E: Exception do Failure := E.Message;
+    end;
+    Sleep(50);
+  until GetTickCount64 - Started >= 10000;
+  WriteLn(StdErr, 'registry publication e2e cleanup: ', Failure);
+  FScratch := '';
+end;
+
 procedure TRegistryPublicationE2E.KillServe;
 begin
   if FServe = nil then Exit;
@@ -159,11 +199,21 @@ begin
 end;
 
 procedure TRegistryPublicationE2E.StopServe;
+var
+  Stopped: TRegistryStopResult;
 begin
   if FServe = nil then Exit;
-  FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
-    + DrainAvailableStream(FServe.Stderr, 65536);
-  StopRegistryProcess(FServe);
+  try
+    FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
+      + DrainAvailableStream(FServe.Stderr, 65536);
+  except
+  end;
+  { Bounded: SIGTERM or TerminateProcess, a grace period, then a forced
+    kill, and a wait for the signalled handle so the child no longer pins
+    its working directory. }
+  Stopped := StopRegistryProcess(FServe);
+  if not Stopped.Stopped then
+    WriteLn(StdErr, 'registry publication e2e cleanup: registry serve did not stop');
 end;
 
 function TRegistryPublicationE2E.Run(const AArgs: array of string): TLwptResult;
@@ -252,7 +302,7 @@ end;
 
 procedure TRegistryPublicationE2E.BeforeEach;
 begin
-  if FScratch <> '' then RecursiveDelete(FScratch);
+  ReleaseScratch;
   FScratch := CreateScratchRoot('registry-publication-e2e');
   FOutputs := '';
   FServe := nil;
@@ -265,7 +315,8 @@ end;
 
 procedure TRegistryPublicationE2E.AfterAll;
 begin
-  if FScratch <> '' then RecursiveDelete(FScratch);
+  StopServe;
+  ReleaseScratch;
 end;
 
 procedure CollectFiles(const ADirectory: string; AList: TStringList);
@@ -508,6 +559,10 @@ begin
       Sleep(10);
     end;
     Result := Trim(Result + DrainAvailableStream(ProcessInstance.Output, 4096));
+    { Windows reports the exit status before it releases the child's
+      handles; wait for the signalled handle before the scratch file curl
+      read can be removed. }
+    ProcessInstance.WaitOnExit;
   finally
     ProcessInstance.Free;
   end;
@@ -537,16 +592,8 @@ begin
     [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
   Expect<Integer>(Init.ExitCode).ToBe(0);
   Token := IssueToken(['--packages', 'tls-*']);
-  FServe := TProcess.Create(nil);
-  FServe.Executable := LwptBinaryPath;
-  FServe.CurrentDirectory := FScratch;
-  FServe.Options := [poUsePipes];
-  FServe.Parameters.Add('registry');
-  FServe.Parameters.Add('serve');
-  FServe.Parameters.Add('--data-dir');
-  FServe.Parameters.Add(FData);
-  ConfigureProcessEnvironment(FServe, [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
-  FServe.Execute;
+  FServe := NewServeProcess(LwptBinaryPath,
+    [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
   Started := GetTickCount64;
   repeat
     FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)

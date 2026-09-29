@@ -15,6 +15,11 @@ type
   end;
 
 { The listener allows ten seconds for connections, plus two for teardown. }
+{ Before Execute: on Linux the child receives SIGKILL when this test program
+  dies, so a killed test run leaves no orphaned registry server. Other
+  platforms rely on the fixture's own stop path. }
+procedure BindRegistryChildToParent(AProcess: TProcess);
+
 function StopRegistryProcess(var AProcess: TProcess;
   const AGraceMilliseconds: QWord = 12000;
   const AKillMilliseconds: QWord = 2000): TRegistryStopResult;
@@ -27,6 +32,38 @@ uses
   {$ELSE}
   Windows
   {$ENDIF};
+
+{$IFDEF LINUX}
+const
+  PR_SET_PDEATHSIG = 1;
+
+function prctl(AOption: LongInt; AArgument: PtrUInt): LongInt; cdecl;
+  external 'c' name 'prctl';
+{$ENDIF}
+
+type
+  TRegistryChildBinder = class
+  public
+    procedure ChildForked(ASender: TObject);
+  end;
+
+var
+  RegistryChildBinder: TRegistryChildBinder;
+
+procedure TRegistryChildBinder.ChildForked(ASender: TObject);
+begin
+  {$IFDEF LINUX}
+  { Runs in the forked child before exec. }
+  prctl(PR_SET_PDEATHSIG, SIGKILL);
+  {$ENDIF}
+end;
+
+procedure BindRegistryChildToParent(AProcess: TProcess);
+begin
+  {$IFDEF LINUX}
+  AProcess.OnForkEvent := RegistryChildBinder.ChildForked;
+  {$ENDIF}
+end;
 
 function WaitForRegistryExit(AProcess: TProcess;
   const ATimeoutMilliseconds: QWord): Boolean;
@@ -81,4 +118,9 @@ begin
   end;
 end;
 
+initialization
+  RegistryChildBinder := TRegistryChildBinder.Create;
+
+finalization
+  RegistryChildBinder.Free;
 end.

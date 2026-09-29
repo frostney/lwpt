@@ -969,7 +969,7 @@ begin
     RegistryOpts[13] := TStringOption.Create('max-sync-bytes',
       'Bytes one mirror synchronization may add (mirror init only; default: 8589934592)');
     RegistryOpts[14] := TStringOption.Create('packages',
-      'Comma-separated package names, name* prefixes, or * the token may use (issue-token only)');
+      'Comma-separated package names, `name*` prefixes, or `*` the token may use (issue-token only)');
     RegistryOpts[15] := TStringOption.Create('actions',
       'Token actions: publish, yank, or publish,yank (issue-token only; default: publish)');
     RegistryOpts[16] := TStringOption.Create('expires-days',
