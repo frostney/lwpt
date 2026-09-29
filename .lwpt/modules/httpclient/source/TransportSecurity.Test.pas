@@ -137,6 +137,7 @@ type
     procedure TestEmptyAndUTF8Passphrases;
     procedure TestEmbeddedNULPassphraseRejected;
     procedure TestFatalHandshakePoisonsConnection;
+    procedure TestServerFailureReasonFollowsLatestHandshakeCall;
     procedure TestFatalShutdownPoisonsBeforeOutput;
     procedure TestInputFlowConfiguration;
     procedure TestInputFlowPrefixAdmissionAndCounters;
@@ -4068,6 +4069,94 @@ begin
   {$ENDIF}
 end;
 
+{ Complete non-TLS inputs fail the handshake on every non-Darwin backend.
+  The two requests differ so OpenSSL reports different reasons
+  ("http request" versus "https proxy request"); backends that report one
+  status for both still pin the ordering rules. }
+function FailServerHandshake(var AConnection: TTransportSecurityConnection;
+  const AInput: AnsiString): TTransportSecurityState;
+var
+  I: Integer;
+begin
+  if TransportSecurityFeedCiphertext(AConnection, @AInput[1],
+     Length(AInput)) <> Length(AInput) then
+    raise Exception.Create('invalid handshake input was not accepted');
+  Result := tssWantRead;
+  for I := 1 to 3 do
+  begin
+    Result := TransportSecurityServerHandshake(AConnection);
+    if Result <> tssWantRead then
+      Break;
+  end;
+end;
+
+procedure TTransportSecurityServerTests.TestServerFailureReasonFollowsLatestHandshakeCall;
+{$IFDEF TRANSPORT_SECURITY_SERVER}
+{$IFNDEF DARWIN}
+const
+  FIRST_INPUT = 'GET / HTTP/1.0'#13#10#13#10;
+  SECOND_INPUT = 'CONNECT localhost:443 HTTP/1.0'#13#10#13#10;
+var
+  Context: TTransportSecurityServerContext;
+  Expected, FirstReason: string;
+  First, Idle, Isolated, Second, Third: TTransportSecurityConnection;
+{$ENDIF}
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SERVER}
+  {$IFNDEF DARWIN}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  FillChar(First, SizeOf(First), 0);
+  FillChar(Idle, SizeOf(Idle), 0);
+  FillChar(Isolated, SizeOf(Isolated), 0);
+  FillChar(Second, SizeOf(Second), 0);
+  FillChar(Third, SizeOf(Third), 0);
+  try
+    { The reason the second input produces on its own. }
+    BeginTransportSecurityServer(Isolated, Context);
+    Expect<Integer>(Ord(FailServerHandshake(Isolated, SECOND_INPUT))).ToBe(
+      Ord(tssError));
+    Expected := TransportSecurityServerFailureReason;
+    Expect<Boolean>(Expected <> '').ToBe(True);
+
+    { Four connections interleaved on this one thread. }
+    BeginTransportSecurityServer(First, Context);
+    BeginTransportSecurityServer(Idle, Context);
+    BeginTransportSecurityServer(Second, Context);
+    BeginTransportSecurityServer(Third, Context);
+    Expect<string>(TransportSecurityServerFailureReason).ToBe('');
+
+    Expect<Integer>(Ord(FailServerHandshake(First, FIRST_INPUT))).ToBe(
+      Ord(tssError));
+    FirstReason := TransportSecurityServerFailureReason;
+    Expect<Boolean>(FirstReason <> '').ToBe(True);
+
+    { A later handshake call that makes progress clears the earlier
+      connection's failure instead of leaving it to be misattributed. }
+    Expect<Integer>(Ord(TransportSecurityServerHandshake(Idle))).ToBe(
+      Ord(tssWantRead));
+    Expect<string>(TransportSecurityServerFailureReason).ToBe('');
+
+    { Two failures in a row: the reason is the latest connection's own. }
+    Expect<Integer>(Ord(FailServerHandshake(Second, FIRST_INPUT))).ToBe(
+      Ord(tssError));
+    Expect<string>(TransportSecurityServerFailureReason).ToBe(FirstReason);
+    Expect<Integer>(Ord(FailServerHandshake(Third, SECOND_INPUT))).ToBe(
+      Ord(tssError));
+    Expect<string>(TransportSecurityServerFailureReason).ToBe(Expected);
+  finally
+    AbortTransportSecurityServer(First);
+    AbortTransportSecurityServer(Idle);
+    AbortTransportSecurityServer(Isolated);
+    AbortTransportSecurityServer(Second);
+    AbortTransportSecurityServer(Third);
+    CloseTransportSecurityServerContext(Context);
+  end;
+  {$ENDIF}
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityServerTests.TestFatalHandshakePoisonsConnection;
 {$IFDEF TRANSPORT_SECURITY_SERVER}
 {$IFNDEF DARWIN}
@@ -5032,6 +5121,8 @@ begin
     DARWIN_SKIP_REASON);
   ServerTest('fatal handshake poisons connection',
     TestFatalHandshakePoisonsConnection);
+  Skip('server failure reason follows the latest handshake call',
+    TestServerFailureReasonFollowsLatestHandshakeCall, DARWIN_SKIP_REASON);
   ServerTest('PKCS#12 path loading refuses links in every component',
     TestPKCS12PathRefusesSymbolicLink);
   ServerTest('Active becomes true only after the server handshake',
@@ -5150,6 +5241,8 @@ begin
     TestStrictIdentityAllowsLeafWithoutBasicConstraints);
   ServerTest('fatal handshake poisons connection',
     TestFatalHandshakePoisonsConnection);
+  ServerTest('server failure reason follows the latest handshake call',
+    TestServerFailureReasonFollowsLatestHandshakeCall);
   {$IFDEF MSWINDOWS}
   if not FServerBackendAvailable then
     ServerTest('PKCS#12 path loading refuses links in every component',

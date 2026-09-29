@@ -203,11 +203,14 @@ function TransportSecurityClientOptionsAreDefault(
   it imports without persisting keys and requires exactly one identity. }
 procedure ValidateTransportSecurityClientOptions(
   const AOptions: TTransportSecurityClientOptions);
-{ Describes the most recent server-side handshake failure on the calling
-  thread (backend, stage, and native status where the backend exposes one),
-  or '' when none was recorded. Diagnostic text only: it never contains key
-  material, passphrases, or plaintext. Cleared by
-  BeginTransportSecurityServer. }
+{ Describes why the calling thread's most recent
+  TransportSecurityServerHandshake call failed (backend, stage, and native
+  status where the backend exposes one), or '' when that call made progress
+  or succeeded. Every handshake call and BeginTransportSecurityServer reset
+  it, so interleaved connections on one thread never see each other's
+  reason. Diagnostic text only, truncated to 480 characters and held in
+  fixed thread-local storage: it never contains key material, passphrases,
+  or plaintext. }
 function TransportSecurityServerFailureReason: string;
 { DER encoding of the peer's leaf certificate on an active client
   connection; empty when the connection is not an active client or the peer
@@ -511,17 +514,45 @@ begin
   end;
 end;
 
+const
+  SERVER_FAILURE_REASON_CAPACITY = 480;
+
+{ Unmanaged on purpose: FPC does not finalize managed threadvars when a
+  thread exits, so a string here would leak once per connection thread that
+  recorded a failure. Reasons are truncated to the fixed capacity. }
 threadvar
-  ServerFailureReason: string;
+  ServerFailureReasonText: array[0..SERVER_FAILURE_REASON_CAPACITY - 1] of
+    AnsiChar;
+  ServerFailureReasonLength: Integer;
 
 procedure RecordServerFailure(const AReason: string);
+var
+  Encoded: AnsiString;
+  Count: Integer;
 begin
-  ServerFailureReason := AReason;
+  Encoded := AnsiString(AReason);
+  Count := Length(Encoded);
+  if Count > SERVER_FAILURE_REASON_CAPACITY then
+    Count := SERVER_FAILURE_REASON_CAPACITY;
+  if Count > 0 then
+    Move(Encoded[1], ServerFailureReasonText[0], Count);
+  ServerFailureReasonLength := Count;
+end;
+
+procedure ClearServerFailure; inline;
+begin
+  ServerFailureReasonLength := 0;
 end;
 
 function TransportSecurityServerFailureReason: string;
+var
+  Text: AnsiString;
 begin
-  Result := ServerFailureReason;
+  Text := '';
+  if ServerFailureReasonLength > 0 then
+    SetString(Text, PAnsiChar(@ServerFailureReasonText[0]),
+      ServerFailureReasonLength);
+  Result := string(Text);
 end;
 
 { Client options: backend-neutral validation and trust-anchor decoding.
@@ -2554,6 +2585,7 @@ function HandshakeSecureTransportServer(
   var AConnection: TTransportSecurityConnection): TTransportSecurityState;
 var
   Data: TSecureTransportServerData;
+  SeamRejection: string;
   Status: OSStatus;
 begin
   Data := SecureTransportServerData(AConnection);
@@ -2563,6 +2595,7 @@ begin
     Exit(tssWantWrite);
   if Data.HandshakeDone then
     Exit(tssDone);
+  SeamRejection := '';
   Status := SSLHandshake(Data.Context);
   if Data.RequireClientCertificate and
      (Status = ERR_SSL_PEER_AUTH_COMPLETED) then
@@ -2572,8 +2605,8 @@ begin
     if not SecureTransportClientTrustAccepted(Data.Context,
        Data.ClientAnchorArray) then
     begin
-      RecordServerFailure('Secure Transport server test seam refused the ' +
-        'client certificate chain');
+      SeamRejection := 'Secure Transport server test seam refused the ' +
+        'client certificate chain';
       Status := ERR_SSL_CLOSED_ABORT;
     end
     else
@@ -2584,10 +2617,14 @@ begin
     Data.HandshakeDone := True;
     AConnection.Active := True;
   end
-  else if (Status <> ERR_SSL_WOULD_BLOCK) and
-          (TransportSecurityServerFailureReason = '') then
-    RecordServerFailure(Format('Secure Transport server handshake failed: ' +
-      'OSStatus %d', [Status]));
+  else if Status <> ERR_SSL_WOULD_BLOCK then
+  begin
+    if SeamRejection <> '' then
+      RecordServerFailure(SeamRejection)
+    else
+      RecordServerFailure(Format('Secure Transport server handshake ' +
+        'failed: OSStatus %d', [Status]));
+  end;
   Result := SecureTransportServerState(AConnection, Status, False);
 end;
 
@@ -4425,6 +4462,34 @@ begin
   end;
 end;
 
+type
+  TOpenSSLPeekError = function: PtrUInt; cdecl;
+  TOpenSSLReasonString = function(AError: PtrUInt): PAnsiChar; cdecl;
+
+{ The reason text of the oldest queued OpenSSL error, or 'no reason'. Reads
+  the queue without consuming it. }
+function OpenSSLFirstErrorReason: string;
+var
+  PeekError: TOpenSSLPeekError;
+  Reason: PAnsiChar;
+  ReasonString: TOpenSSLReasonString;
+  Code: PtrUInt;
+begin
+  Result := 'no reason';
+  PeekError := TOpenSSLPeekError(GetProcedureAddress(SSLUtilHandle,
+    'ERR_peek_error'));
+  ReasonString := TOpenSSLReasonString(GetProcedureAddress(SSLUtilHandle,
+    'ERR_reason_error_string'));
+  if not Assigned(PeekError) or not Assigned(ReasonString) then
+    Exit;
+  Code := PeekError();
+  if Code = 0 then
+    Exit;
+  Reason := ReasonString(Code);
+  if Assigned(Reason) then
+    Result := string(AnsiString(Reason));
+end;
+
 function HandshakeOpenSSLServer(
   var AConnection: TTransportSecurityConnection): TTransportSecurityState;
 var
@@ -4478,8 +4543,8 @@ begin
   if (ErrorCode <> SSL_ERROR_WANT_READ) and
      (ErrorCode <> SSL_ERROR_WANT_WRITE) then
     RecordServerFailure(Format('OpenSSL server handshake failed: SSL error ' +
-      '%d, peer verification result %d', [ErrorCode,
-      SSLGetVerifyResult(Data.SSL)]));
+      '%d (%s), peer verification result %d', [ErrorCode,
+      OpenSSLFirstErrorReason, SSLGetVerifyResult(Data.SSL)]));
   Result := OpenSSLServerErrorState(AConnection, Data, ErrorCode,
     osoHandshake);
 end;
@@ -8922,7 +8987,7 @@ procedure BeginTransportSecurityServer(
   var AConnection: TTransportSecurityConnection;
   const AContext: TTransportSecurityServerContext);
 begin
-  RecordServerFailure('');
+  ClearServerFailure;
   FillChar(AConnection, SizeOf(AConnection), 0);
   AConnection.Backend := TSB_NONE;
 
@@ -8947,6 +9012,10 @@ end;
 function TransportSecurityServerHandshake(
   var AConnection: TTransportSecurityConnection): TTransportSecurityState;
 begin
+  { Each handshake call reports only its own outcome: progress or success
+    clears whatever an earlier call, on this or another connection of the
+    same thread, recorded. }
+  ClearServerFailure;
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Result := HandshakeOpenSSLServer(AConnection);
   {$ENDIF}

@@ -60,10 +60,15 @@ function TransportSecurityServerFailureReason: string;
 SChannel client handshake failures name the stage and the last
 `SECURITY_STATUS` (hex and symbolic name), including whether SChannel
 reported `SEC_I_INCOMPLETE_CREDENTIALS` for a certificate request.
-`TransportSecurityServerFailureReason` describes the calling thread's most
-recent server-side handshake failure (the SChannel status or the OpenSSL
-error and peer-verification result) so feed/drain server owners can log why
-a handshake ended. Neither carries key material or plaintext.
+`TransportSecurityServerFailureReason` describes why the calling thread's
+latest `TransportSecurityServerHandshake` call failed (the SChannel status,
+the OpenSSL error with its reason and peer-verification result, or the
+Secure Transport status) so feed/drain server owners can log why a handshake
+ended. Each handshake call resets it, so a call that makes progress clears
+an earlier failure and interleaved connections on one thread never see each
+other's reason. It is held in fixed-size thread-local storage and truncated,
+because FPC does not finalize managed thread variables when a thread
+exits. Neither carries key material or plaintext.
 
 `ValidateTransportSecurityClientOptions` opens no socket and persists
 nothing, so callers can reject a bad configuration before connecting.
