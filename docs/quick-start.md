@@ -84,6 +84,9 @@ After bootstrap:
 ./build/lwpt repair             # recover project and shared-cache residue
 ./build/lwpt registry init      # initialize a self-hosted registry origin
 ./build/lwpt registry serve     # serve the origin in the foreground
+./build/lwpt registry issue-token --packages 'my-*'   # print a scoped, expiring publication token once
+./build/lwpt registry publish pkg.tar.gz --origin <url> --key-id <id> --public-key <key>
+                                # publish (token from LWPT_REGISTRY_TOKEN), then verify it from the pin
 ```
 
 [`build-system.md`](./build-system.md) covers each in depth.

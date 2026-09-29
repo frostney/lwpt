@@ -348,6 +348,14 @@ begin
   finally
     Listener.Free;
   end;
+  { An origin without an active token stays read-only and says so before
+    anything is uploaded. }
+  FOrigin.Start;
+  Run := RunPublish(Plain, FOrigin.Base, FOrigin.KeyID, FOrigin.PublicKey, '',
+    RegistryProgramName + '_rt1_' + StringOfChar('0', 32) + '_' + StringOfChar('A', 43),
+    FProject, [], []);
+  ExpectFailure(Run, 'registry: publication_not_supported: ');
+  Expect<Integer>(FOrigin.LatestSequence).ToBe(1);
   ExpectProjectUntouched;
 end;
 
@@ -396,7 +404,7 @@ begin
     TestConflictingContentIsRefused);
   Test('unknown, revoked, expired, and out-of-scope tokens are refused',
     TestAuthenticationAndScopeFailures);
-  Test('local refusals make no connection and never read the token first',
+  Test('local refusals make no connection and never read the token first; a read-only origin is refused',
     TestLocalRefusalsMakeNoConnectionAndReadNoToken);
   Test('HTTPS publication trusts the test root only in the test build',
     TestPublishesOverHTTPSWithTheTestRoot);

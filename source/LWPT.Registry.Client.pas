@@ -897,7 +897,15 @@ begin
   if not RegistryTokenEnvironmentNameIsValid(TokenEnvironment) then
     Fail('invalid_configuration', '--token-env must name an environment variable');
   Origin := CanonicalRegistryPublishOrigin(AOptions.Origin);
-  Prepared := PreparePublicationArchive(ReadArchiveFile(AOptions.ArchivePath));
+  try
+    Prepared := PreparePublicationArchive(ReadArchiveFile(AOptions.ArchivePath));
+  except
+    on E: ELWPTArchiveError do raise;
+    on E: ELWPTRegistryError do raise;
+    { Local input only, so its own description is safe to keep. }
+    on E: Exception do Fail(ARCHIVE_INVALID, 'the archive could not be read: '
+      + E.Message);
+  end;
   Result.Name := Prepared.Manifest.Name;
   Result.Version := Prepared.Manifest.Version;
   Result.ArchiveHash := SHA256BytesPrefixed(Prepared.Archive);
